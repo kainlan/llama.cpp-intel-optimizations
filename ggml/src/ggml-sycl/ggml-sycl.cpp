@@ -20994,8 +20994,9 @@ static bool ggml_sycl_mul_mat_tp_pre(const ggml_tensor * src0) {
 // Key: dst->data pointer (stable during graph execution)
 // Value: device 1 buffer pointer
 struct ggml_sycl_tp_column_parallel_output {
-    void * ptr  = nullptr;
-    size_t size = 0;
+    void *                  ptr  = nullptr;
+    size_t                  size = 0;
+    ggml_sycl::alloc_handle alloc{};
 };
 
 static std::unordered_map<const ggml_tensor *, ggml_sycl_tp_column_parallel_output> g_tp_column_parallel_outputs;
@@ -21671,7 +21672,9 @@ static void ggml_sycl_tp_clear_column_parallel_outputs(ggml_backend_sycl_context
     ggml_sycl_set_device(device);
     queue_ptr stream = ctx.stream(device, 0);
     for (auto & kv : g_tp_column_parallel_outputs) {
-        if (kv.second.ptr != nullptr) {
+        if (kv.second.alloc.ptr != nullptr) {
+            (void) ggml_sycl::unified_free(kv.second.alloc);
+        } else if (kv.second.ptr != nullptr) {
             ggml_sycl::unified_cache_sub_runtime_bytes(device, kv.second.size);
             sycl::free(kv.second.ptr, *stream);
         }
@@ -29428,12 +29431,12 @@ static bool ggml_sycl_mul_mat_tensor_split(ggml_backend_sycl_context & ctx,
                         (void) ggml_sycl::unified_free(s_second_out_dev_alloc);
                         s_second_out_dev_alloc = {};
                     } else {
-                        if (s_second_out_dev_sz > 0) {
-                            ggml_sycl::unified_cache_sub_runtime_bytes(sec_dev, s_second_out_dev_sz,
-                                                                       ggml_sycl::runtime_category::STAGING);
-                        }
-                        sycl::free(s_second_out_dev, *stream_second);
+                        // Legacy sycl::free path — dead code after migration to unified_alloc
+                        GGML_ASSERT(
+                            false &&
+                            "s_second_out_dev: legacy sycl::free path reached — alloc_handle should always be set");
                     }
+                    s_second_out_dev = nullptr;
                 }
                 ggml_sycl::alloc_request req{};
                 req.queue                          = stream_second;
@@ -34760,12 +34763,11 @@ cpu_fallback_fast:
                                 (void) ggml_sycl::unified_free(s_probe_dev_alloc);
                                 s_probe_dev_alloc = {};
                             } else {
-                                if (s_probe_sz > 0) {
-                                    ggml_sycl::unified_cache_sub_runtime_bytes(probe_dev, s_probe_sz,
-                                                                               ggml_sycl::runtime_category::STAGING);
-                                }
-                                sycl::free(s_probe_dev, *stream);
+                                GGML_ASSERT(
+                                    false &&
+                                    "s_probe_dev: legacy sycl::free path reached — alloc_handle should always be set");
                             }
+                            s_probe_dev = nullptr;
                         }
                         ggml_sycl::alloc_request req{};
                         req.queue                          = stream;
