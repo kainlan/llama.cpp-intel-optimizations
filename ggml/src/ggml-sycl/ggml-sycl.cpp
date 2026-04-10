@@ -5895,10 +5895,10 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
     }
 
     // Detect MoE expert tensors and store MoE hparams
-    g_moe_n_experts_total              = inventory->n_expert;
-    g_moe_n_experts_used               = inventory->n_expert_used;
-    g_placement_kv_info.n_expert_used  = inventory->n_expert_used;
-    g_moe_expert_total_bytes = 0;
+    g_moe_n_experts_total             = inventory->n_expert;
+    g_moe_n_experts_used              = inventory->n_expert_used;
+    g_placement_kv_info.n_expert_used = inventory->n_expert_used;
+    g_moe_expert_total_bytes          = 0;
     if (g_moe_n_experts_total > 0) {
         for (const auto & [name, size] : g_tensor_inventory) {
             // Expert tensors match patterns like "blk.N.ffn_up_exps.weight" or "blk.N.ffn_gate_exps.weight"
@@ -6435,8 +6435,7 @@ static ggml_sycl::mem_handle make_data_ptr_handle(const ggml_tensor * tensor, in
             return ggml_sycl::mem_handle::from_cache_id(key, device);
         }
     }
-    const bool on_device = (ptr != nullptr) &&
-                           (ggml_sycl_get_alloc_type(ptr) == sycl::usm::alloc::device);
+    const bool on_device = (ptr != nullptr) && (ggml_sycl_get_alloc_type(ptr) == sycl::usm::alloc::device);
     return ggml_sycl::mem_handle::from_direct(ptr, GGML_LAYOUT_AOS, on_device);
 }
 
@@ -6480,13 +6479,13 @@ static thread_local std::unordered_map<const ggml_tensor *, moe_ids_cache_entry>
 // redundant D2H copies and placement table lookups.
 // ---------------------------------------------------------------------------
 struct moe_layer_ids_cache_entry {
-    std::vector<int32_t> ids_host;  // Expert IDs (copied D2H once at GATE)
+    std::vector<int32_t>               ids_host;  // Expert IDs (copied D2H once at GATE)
     // Task 1E: Pre-resolved expert pointers from GATE, reused at UP/DOWN.
     // Avoids redundant placement table lookups, cache queries, and stats tracking.
     // mem_handle instead of void* so that resolve() auto-revalidates on cache eviction.
     // graph_epoch and ptrs_valid removed — cache is cleared each graph boundary, and
     // mem_handle::resolve() returns nullptr on eviction (auto-staleness via generation counter).
-    std::vector<ggml_sycl::mem_handle> expert_ptrs;                    // Resolved expert pointer handles (indexed by expert_id)
+    std::vector<ggml_sycl::mem_handle> expert_ptrs;  // Resolved expert pointer handles (indexed by expert_id)
     layout_mode                        ptrs_layout = GGML_LAYOUT_AOS;  // Layout used when pointers were cached
 
     // Task 1E: Cached expert partitioning from first sub-op for fusion path reuse.
@@ -18318,12 +18317,11 @@ ggml_backend_sycl_context::~ggml_backend_sycl_context() {
                     (void) ggml_sycl::unified_free(entry.device_alloc);
                     entry.device_alloc = {};
                 } else {
-                    ggml_sycl::unified_cache_sub_runtime_bytes(device, entry.device_bytes);
-                    try {
-                        ggml_sycl::alloc_registry::instance().unregister_alloc(entry.device_ids);
-                        sycl::free(entry.device_ids, *stream());
-                    } catch (...) {
-                    }
+                    // Legacy fallback in destructor — defensive cleanup only
+                    // All runtime allocations now populate device_alloc, so this path should be dead.
+                    GGML_ASSERT(
+                        false &&
+                        "MoE IDs destructor: legacy sycl::free path reached — device_alloc should always be set");
                 }
             }
             entry.device_ids   = nullptr;
@@ -18441,13 +18439,13 @@ void * ggml_backend_sycl_context::ensure_mmvq_host_staging(size_t needed, sycl::
     mmvq_host_staging_size = 0;
 
     ggml_sycl::alloc_request req{};
-    req.queue                                 = &queue;
-    req.device                                = device;
-    req.size                                  = needed;
-    req.intent.role                           = ggml_sycl::alloc_role::STAGING;
-    req.intent.category                       = ggml_sycl::runtime_category::STAGING;
-    req.intent.constraints.must_host_pinned  = true;
-    req.intent.constraints.use_pinned_pool   = true;
+    req.queue                               = &queue;
+    req.device                              = device;
+    req.size                                = needed;
+    req.intent.role                         = ggml_sycl::alloc_role::STAGING;
+    req.intent.category                     = ggml_sycl::runtime_category::STAGING;
+    req.intent.constraints.must_host_pinned = true;
+    req.intent.constraints.use_pinned_pool  = true;
     if (!ggml_sycl::unified_alloc(req, &mmvq_host_staging_alloc) || mmvq_host_staging_alloc.ptr == nullptr) {
         mmvq_host_staging_alloc = {};
         return nullptr;
@@ -19445,9 +19443,11 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
                         ggml_sycl::scoped_unified_alloc weights_fallback;
                         ggml_sycl::scoped_unified_alloc scales_fallback;
                         ggml_sycl::scoped_unified_alloc zp_fallback;
-                        void *   weights_dev = ggml_sycl::unified_cache_arena_alloc(ctx.device, weights_bytes);
-                        float *  scales_dev  = static_cast<float *>(ggml_sycl::unified_cache_arena_alloc(ctx.device, scales_bytes));
-                        int8_t * zp_dev      = static_cast<int8_t *>(ggml_sycl::unified_cache_arena_alloc(ctx.device, zp_bytes));
+                        void *  weights_dev = ggml_sycl::unified_cache_arena_alloc(ctx.device, weights_bytes);
+                        float * scales_dev =
+                            static_cast<float *>(ggml_sycl::unified_cache_arena_alloc(ctx.device, scales_bytes));
+                        int8_t * zp_dev =
+                            static_cast<int8_t *>(ggml_sycl::unified_cache_arena_alloc(ctx.device, zp_bytes));
                         if (!weights_dev || !scales_dev || !zp_dev) {
                             // Arena exhausted — fall back to unified_alloc
                             ggml_sycl::alloc_request dev_req{};
@@ -21200,28 +21200,25 @@ static void tp_device1_worker_thread_func() {
         const size_t  output_size           = N_out * work.batch * sizeof(float);
 
         // Use persistent FFN buffers (allocated once per layer, reused each token).
-        tp_ffn_compute_buffers * bufs =
-            ggml_sycl_tp_ensure_ffn_buffers(work.layer, device, stream, K_full_padded, N_hidden_shard_padded,
-                                            work.batch, N_out);
-        char *  input_q8_dev  = bufs ? bufs->input_q8_dev  : nullptr;
-        float * gate_out      = bufs ? bufs->gate_out      : nullptr;
-        float * up_out        = bufs ? bufs->up_out        : nullptr;
-        float * hidden_out    = bufs ? bufs->hidden_out    : nullptr;
-        char *  hidden_q8_dev = bufs ? bufs->hidden_q8_dev : nullptr;
-        float * partial_out   = bufs ? bufs->partial_out   : nullptr;
+        tp_ffn_compute_buffers * bufs = ggml_sycl_tp_ensure_ffn_buffers(work.layer, device, stream, K_full_padded,
+                                                                        N_hidden_shard_padded, work.batch, N_out);
+        char *                   input_q8_dev  = bufs ? bufs->input_q8_dev : nullptr;
+        float *                  gate_out      = bufs ? bufs->gate_out : nullptr;
+        float *                  up_out        = bufs ? bufs->up_out : nullptr;
+        float *                  hidden_out    = bufs ? bufs->hidden_out : nullptr;
+        char *                   hidden_q8_dev = bufs ? bufs->hidden_q8_dev : nullptr;
+        float *                  partial_out   = bufs ? bufs->partial_out : nullptr;
 
         ggml_sycl::alloc_handle result_alloc{};
-        const bool result_ok =
+        const bool              result_ok =
             ggml_sycl_tp_alloc_tmp(output_size, *stream, ggml_sycl::alloc_role::TP_TMP,
                                    ggml_sycl::runtime_category::HOST_COMPUTE, false, true, true, &result_alloc);
 
         float * result_buf = static_cast<float *>(result_alloc.ptr);
         if (g_ggml_sycl_tp_debug) {
-            fprintf(
-                stderr,
-                "SYCL TP WORKER: Buffers: input_q8=%p, gate=%p, up=%p, hidden=%p, partial=%p, result=%p\n",
-                (void *) input_q8_dev, (void *) gate_out, (void *) up_out, (void *) hidden_out, (void *) partial_out,
-                (void *) result_buf);
+            fprintf(stderr, "SYCL TP WORKER: Buffers: input_q8=%p, gate=%p, up=%p, hidden=%p, partial=%p, result=%p\n",
+                    (void *) input_q8_dev, (void *) gate_out, (void *) up_out, (void *) hidden_out,
+                    (void *) partial_out, (void *) result_buf);
         }
         if (!bufs || !input_q8_dev || !gate_out || !up_out || !hidden_out || !hidden_q8_dev || !partial_out ||
             !result_ok || !result_buf) {
@@ -22206,18 +22203,18 @@ void ggml_sycl_tp_launch_async_ffn(ggml_backend_sycl_context & ctx,
     const int64_t K_full_padded         = GGML_PAD(K_full, MATRIX_ROW_PADDING);
     const int64_t N_hidden_shard_padded = GGML_PAD(N_hidden_shard, MATRIX_ROW_PADDING);
 
-    const size_t hidden_size  = N_hidden_shard * batch * sizeof(float);
-    const size_t output_size  = N_out * batch * sizeof(float);
+    const size_t hidden_size = N_hidden_shard * batch * sizeof(float);
+    const size_t output_size = N_out * batch * sizeof(float);
 
     // Use persistent FFN buffers (allocated once per layer, reused each token).
     tp_ffn_compute_buffers * bufs =
         ggml_sycl_tp_ensure_ffn_buffers(layer, device, stream, K_full_padded, N_hidden_shard_padded, batch, N_out);
-    char *  input_q8_dev = bufs ? bufs->input_q8_dev : nullptr;
-    float * gate_out     = bufs ? bufs->gate_out     : nullptr;
-    float * up_out       = bufs ? bufs->up_out       : nullptr;
-    float * hidden_out   = bufs ? bufs->hidden_out   : nullptr;
+    char *  input_q8_dev  = bufs ? bufs->input_q8_dev : nullptr;
+    float * gate_out      = bufs ? bufs->gate_out : nullptr;
+    float * up_out        = bufs ? bufs->up_out : nullptr;
+    float * hidden_out    = bufs ? bufs->hidden_out : nullptr;
     char *  hidden_q8_dev = bufs ? bufs->hidden_q8_dev : nullptr;
-    float * partial_out   = bufs ? bufs->partial_out  : nullptr;
+    float * partial_out   = bufs ? bufs->partial_out : nullptr;
 
     // Allocate DEDICATED result buffer for this async job (not shared!).
     // Each layer needs its own buffer to avoid races between concurrent async jobs.
@@ -22226,8 +22223,8 @@ void ggml_sycl_tp_launch_async_ffn(ggml_backend_sycl_context & ctx,
         ggml_sycl_tp_alloc_tmp(output_size, *stream, ggml_sycl::alloc_role::TP_TMP,
                                ggml_sycl::runtime_category::HOST_COMPUTE, false, true, true, &result_alloc);
     float * result_buf = static_cast<float *>(result_alloc.ptr);
-    if (!bufs || !input_q8_dev || !gate_out || !up_out || !hidden_out || !hidden_q8_dev || !partial_out ||
-        !result_ok || !result_buf) {
+    if (!bufs || !input_q8_dev || !gate_out || !up_out || !hidden_out || !hidden_q8_dev || !partial_out || !result_ok ||
+        !result_buf) {
         GGML_SYCL_DEBUG("SYCL TP ASYNC: Buffer allocation failed for layer %d\n", layer);
         if (result_alloc.ptr != nullptr) {
             (void) ggml_sycl::unified_free(result_alloc);
@@ -23157,17 +23154,16 @@ static void ggml_sycl_mul_mat_tp_row_parallel_post(ggml_backend_sycl_context & c
                         const int64_t n_embd_q_shard_padded = GGML_PAD(n_embd_q_shard, MATRIX_ROW_PADDING);
 
                         // Pre-allocated buffers (fixed dimensions per layer, allocated once at warmup)
-                        tp_attn_compute_buffers * attn_bufs =
-                            ggml_sycl_tp_ensure_attn_buffers(layer, device, stream,
-                                                             n_embd, n_embd_q_shard, n_embd_k_shard, n_embd_v_shard,
-                                                             N_out, batch, /*kv_seq_len=*/0);
+                        tp_attn_compute_buffers * attn_bufs = ggml_sycl_tp_ensure_attn_buffers(
+                            layer, device, stream, n_embd, n_embd_q_shard, n_embd_k_shard, n_embd_v_shard, N_out, batch,
+                            /*kv_seq_len=*/0);
                         char *       input_q8_dev = attn_bufs ? attn_bufs->input_q8_dev : nullptr;
-                        float *      q_out        = attn_bufs ? attn_bufs->q_out        : nullptr;
-                        float *      k_out        = attn_bufs ? attn_bufs->k_out        : nullptr;
-                        float *      v_out        = attn_bufs ? attn_bufs->v_out        : nullptr;
-                        float *      attn_out     = attn_bufs ? attn_bufs->attn_out     : nullptr;
-                        char *       attn_q8_dev  = attn_bufs ? attn_bufs->attn_q8_dev  : nullptr;
-                        float *      partial_out  = attn_bufs ? attn_bufs->partial_out  : nullptr;
+                        float *      q_out        = attn_bufs ? attn_bufs->q_out : nullptr;
+                        float *      k_out        = attn_bufs ? attn_bufs->k_out : nullptr;
+                        float *      v_out        = attn_bufs ? attn_bufs->v_out : nullptr;
+                        float *      attn_out     = attn_bufs ? attn_bufs->attn_out : nullptr;
+                        char *       attn_q8_dev  = attn_bufs ? attn_bufs->attn_q8_dev : nullptr;
+                        float *      partial_out  = attn_bufs ? attn_bufs->partial_out : nullptr;
                         // Actual per-token sizes (batch may be smaller than batch_max in the buffer)
                         const size_t q_out_size   = (size_t) n_embd_q_shard * batch * sizeof(float);
                         const size_t k_out_size   = (size_t) n_embd_k_shard * batch * sizeof(float);
@@ -23175,8 +23171,7 @@ static void ggml_sycl_mul_mat_tp_row_parallel_post(ggml_backend_sycl_context & c
 
                         if (!attn_bufs || !input_q8_dev || !q_out || !k_out || !v_out || !attn_out || !attn_q8_dev ||
                             !partial_out) {
-                            fprintf(stderr, "SYCL TP: ERROR - failed to get attention buffers on device %d\n",
-                                    device);
+                            fprintf(stderr, "SYCL TP: ERROR - failed to get attention buffers on device %d\n", device);
                         } else {
                             // Step 1: Quantize attention input to Q8_1
                             // Use SoA quantizer if Q weight is reordered (Q/K/V share same quantization format)
@@ -23342,9 +23337,8 @@ static void ggml_sycl_mul_mat_tp_row_parallel_post(ggml_backend_sycl_context & c
 
                             // Grow-on-demand attention scores buffer [n_heads_q, n_query_tokens, kv_seq_len]
                             // kv_seq_len increases every token; ensure_attn_buffers grows capacity as needed.
-                            ggml_sycl_tp_ensure_attn_buffers(layer, device, stream,
-                                                             n_embd, n_embd_q_shard, n_embd_k_shard, n_embd_v_shard,
-                                                             N_out, batch, kv_seq_len);
+                            ggml_sycl_tp_ensure_attn_buffers(layer, device, stream, n_embd, n_embd_q_shard,
+                                                             n_embd_k_shard, n_embd_v_shard, N_out, batch, kv_seq_len);
                             float * attn_scores = attn_bufs ? attn_bufs->attn_scores : nullptr;
                             if (attn_scores && k_cache && v_cache && kv_seq_len > 0) {
                                 // Compute attention scores: Q @ K^T / sqrt(head_dim) with GQA
@@ -23693,7 +23687,8 @@ static void ggml_sycl_mul_mat_tp_row_parallel_post(ggml_backend_sycl_context & c
         ggml_sycl::scoped_unified_alloc src1_ddf_fallback;
         ggml_sycl::scoped_unified_alloc src1_ddq_fallback;
         ggml_sycl::scoped_unified_alloc partial_out_fallback;
-        float * src1_ddf_dev = static_cast<float *>(ggml_sycl::unified_cache_arena_alloc(device, src1_float_slice_size));
+        float *                         src1_ddf_dev =
+            static_cast<float *>(ggml_sycl::unified_cache_arena_alloc(device, src1_float_slice_size));
         char *  src1_ddq_dev = static_cast<char *>(ggml_sycl::unified_cache_arena_alloc(device, src1_q8_size));
         float * partial_out  = static_cast<float *>(ggml_sycl::unified_cache_arena_alloc(device, dst_size));
         if (!src1_ddf_dev || !src1_ddq_dev || !partial_out) {
@@ -26170,14 +26165,18 @@ const int32_t * ggml_sycl_get_moe_ids_device_ptr(ggml_backend_sycl_context & ctx
                     (void) ggml_sycl::unified_free(entry.device_alloc);
                     entry.device_alloc = {};
                 } else {
-                    ggml_sycl::unified_cache_sub_runtime_bytes(ctx.device, entry.device_bytes);
-                    ggml_sycl::alloc_registry::instance().unregister_alloc(entry.device_ids);
-                    sycl::free(entry.device_ids, *stream);
+                    // Legacy sycl::free path is dead code — all allocations now populate device_alloc
+                    GGML_ASSERT(false && "MoE IDs: legacy sycl::free path reached — device_alloc should always be set");
                 }
             }
-            entry.device_ids    = prealloc_ids;
-            entry.device_bytes  = ids_bytes;
-            entry.from_prealloc = true;
+            entry.device_ids          = prealloc_ids;
+            entry.device_bytes        = ids_bytes;
+            entry.from_prealloc       = true;
+            // Non-owning alloc_handle: points to the staging pool buffer.
+            // from_prealloc guards against unified_free of this handle.
+            entry.device_alloc.ptr    = prealloc_ids;
+            entry.device_alloc.size   = ids_bytes;
+            entry.device_alloc.device = ctx.device;
             GGML_SYCL_DEBUG("[MOE-IDS] Using pre-allocated staging buffer (%zu bytes)\n", ids_bytes);
         } else {
             // Fallback: runtime allocation
@@ -26186,9 +26185,8 @@ const int32_t * ggml_sycl_get_moe_ids_device_ptr(ggml_backend_sycl_context & ctx
                     (void) ggml_sycl::unified_free(entry.device_alloc);
                     entry.device_alloc = {};
                 } else {
-                    ggml_sycl::unified_cache_sub_runtime_bytes(ctx.device, entry.device_bytes);
-                    ggml_sycl::alloc_registry::instance().unregister_alloc(entry.device_ids);
-                    sycl::free(entry.device_ids, *stream);
+                    // Legacy sycl::free path is dead code — all allocations now populate device_alloc
+                    GGML_ASSERT(false && "MoE IDs: legacy sycl::free path reached — device_alloc should always be set");
                 }
             }
             ggml_sycl::alloc_request req{};
@@ -27170,14 +27168,17 @@ static bool graph_preload_moe_experts(ggml_backend_sycl_context & ctx, ggml_cgra
                             (void) ggml_sycl::unified_free(ids_entry.device_alloc);
                             ids_entry.device_alloc = {};
                         } else {
-                            ggml_sycl::unified_cache_sub_runtime_bytes(ctx.device, ids_entry.device_bytes);
-                            ggml_sycl::alloc_registry::instance().unregister_alloc(ids_entry.device_ids);
-                            sycl::free(ids_entry.device_ids, *ctx.stream());
+                            GGML_ASSERT(false &&
+                                        "MoE IDs: legacy sycl::free path reached — device_alloc should always be set");
                         }
                     }
-                    ids_entry.device_ids    = prealloc_ids;
-                    ids_entry.device_bytes  = ids_bytes;
-                    ids_entry.from_prealloc = true;
+                    ids_entry.device_ids          = prealloc_ids;
+                    ids_entry.device_bytes        = ids_bytes;
+                    ids_entry.from_prealloc       = true;
+                    // Non-owning alloc_handle: from_prealloc guards against unified_free
+                    ids_entry.device_alloc.ptr    = prealloc_ids;
+                    ids_entry.device_alloc.size   = ids_bytes;
+                    ids_entry.device_alloc.device = ctx.device;
                 } else {
                     // Fallback: runtime allocation
                     if (ids_entry.device_ids && !ids_entry.from_prealloc) {
@@ -27185,9 +27186,8 @@ static bool graph_preload_moe_experts(ggml_backend_sycl_context & ctx, ggml_cgra
                             (void) ggml_sycl::unified_free(ids_entry.device_alloc);
                             ids_entry.device_alloc = {};
                         } else {
-                            ggml_sycl::unified_cache_sub_runtime_bytes(ctx.device, ids_entry.device_bytes);
-                            ggml_sycl::alloc_registry::instance().unregister_alloc(ids_entry.device_ids);
-                            sycl::free(ids_entry.device_ids, *ctx.stream());
+                            GGML_ASSERT(false &&
+                                        "MoE IDs: legacy sycl::free path reached — device_alloc should always be set");
                         }
                     }
                     ggml_sycl::alloc_request req{};
@@ -33644,8 +33644,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     const int32_t * ids_data_f = nullptr;
                     {
                         auto layer_it = g_moe_layer_ids_cache.find(cur_layer_fast);
-                        if (layer_it != g_moe_layer_ids_cache.end() &&
-                            layer_it->second.ids_host.size() == ids_n_elem) {
+                        if (layer_it != g_moe_layer_ids_cache.end() && layer_it->second.ids_host.size() == ids_n_elem) {
                             ids_data_f = layer_it->second.ids_host.data();
                             GGML_SYCL_DEBUG("[MoE-P4] Reusing layer ID cache for layer %d\n", cur_layer_fast);
                         }
