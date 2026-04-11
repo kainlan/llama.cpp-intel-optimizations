@@ -1835,13 +1835,14 @@ struct staging_buffer_pool {
             if (hcache) {
                 if (hcache->host_zones_configured()) {
                     ptr = hcache->host_zone_alloc(ggml_sycl::host_zone_id::STAGING, needed, 64);
-                    // Zone allocation may return nullptr when:
-                    // 1) The allocation is larger than a single chunk (256 MB),
-                    //    since zones span multiple chunks but contiguous allocations
-                    //    cannot cross chunk boundaries.
-                    // 2) The STAGING zone is exhausted.
-                    // For case 1, fall back to runtime pinned allocation which
-                    // directly calls sycl::malloc_host (bypassing the pool).
+                    // Zone allocation returned nullptr — allocation spans chunk boundary
+                    // or STAGING zone is exhausted.  This should be rare if the planner
+                    // sized chunks correctly (see configure_zones chunk_size growth).
+                    // Fall back to runtime pinned allocation which directly calls
+                    // sycl::malloc_host (bypassing the pool).
+                    GGML_LOG_WARN(
+                        "[STAGING] zone_alloc failed for %zu bytes, falling back to runtime pinned allocation\n",
+                        needed);
                     if (!ptr) {
                         ptr       = hcache->allocate_pinned_runtime(needed, 64);
                         from_pool = (ptr != nullptr);

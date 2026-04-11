@@ -243,6 +243,21 @@ void pinned_chunk_pool::configure_zones(size_t weight_bytes,
     staging_bytes = align_up(staging_bytes, DEFAULT_ALIGNMENT);
     scratch_bytes = align_up(scratch_bytes, DEFAULT_ALIGNMENT);
 
+    // Step 1: Grow chunk_size if any zone needs contiguous allocations larger
+    // than a single chunk.  Contiguous allocations cannot cross chunk boundaries,
+    // so the chunk must be at least as large as the largest single allocation.
+    const size_t max_zone           = std::max({ weight_bytes, kv_bytes, staging_bytes, scratch_bytes });
+    // Individual allocations within a zone are typically much smaller than the
+    // zone itself, but the largest single contiguous allocation could approach
+    // the zone size.  Use a heuristic: if any zone exceeds 50% of chunk_size_,
+    // grow chunk_size to accommodate it (with 25% headroom for fragmentation).
+    const size_t min_chunk_for_zone = align_up(max_zone + max_zone / 4, DEFAULT_ALIGNMENT);
+    if (min_chunk_for_zone > chunk_size_) {
+        GGML_LOG_INFO("[HOST-ARENA] Growing chunk size from %.1f MB to %.1f MB for large contiguous allocations\n",
+                      chunk_size_ / (1024.0 * 1024.0), min_chunk_for_zone / (1024.0 * 1024.0));
+        chunk_size_ = min_chunk_for_zone;
+    }
+
     const size_t total_zone_bytes   = weight_bytes + kv_bytes + staging_bytes + scratch_bytes;
     auto         rebuild_flat_spans = [&]() {
         flat_spans_.clear();
