@@ -2157,7 +2157,6 @@ enum class alloc_hint : uint8_t {
 };
 
 // Classification of runtime (non-weight) VRAM reservations for diagnostics.
-// Used with unified_cache_add_runtime_bytes() to track where VRAM is consumed.
 enum class runtime_category : uint8_t {
     KV_CACHE     = 0,  // KV buffer allocations
     COMPUTE      = 1,  // Compute buffer pool + scratch
@@ -2459,9 +2458,7 @@ bool unified_cache_is_graph_compute_active();
 // Check if any device has pending deferred frees (cheap pre-flight for flush)
 bool unified_cache_has_pending_deferred_frees(int device);
 
-// Track runtime buffers that must not be evicted from VRAM (compute, KV, etc.)
-void   unified_cache_add_runtime_bytes(int device, size_t bytes, runtime_category cat = runtime_category::OTHER);
-void   unified_cache_sub_runtime_bytes(int device, size_t bytes, runtime_category cat = runtime_category::OTHER);
+// Query total runtime (non-weight) VRAM usage on a device via arena zones.
 size_t unified_cache_get_runtime_bytes(int device);
 
 // Query runtime bytes for a specific category on a device.
@@ -2761,6 +2758,10 @@ size_t unified_cache_compute_arena_used(int device_id);
 // Query KV arena zone capacity and usage.
 size_t unified_cache_kv_arena_capacity(int device_id);
 size_t unified_cache_kv_arena_used(int device_id);
+
+// Sum of zone_used(KV) + zone_used(ONEDNN) + zone_used(RUNTIME) + zone_used(SCRATCH).
+// Returns 0 when arena is inactive. Replaces g_runtime_reserved_bytes.
+size_t unified_cache_arena_non_weight_used(int device);
 
 // Sub-allocate from the arena's KV zone for per-layer KV cache placement.
 // Returns nullptr if arena is inactive or KV zone is exhausted.

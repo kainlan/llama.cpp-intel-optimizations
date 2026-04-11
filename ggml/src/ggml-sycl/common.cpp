@@ -592,7 +592,6 @@ void * ggml_sycl_host_malloc(size_t size) try {
     if (hcache) {
         void * ptr = hcache->allocate_pinned_runtime(size, 64);
         if (ptr) {
-            ggml_sycl::unified_cache_add_runtime_host_bytes(size);
             ggml_sycl::offload_stats_note_host_alloc("unified_cache_pinned_pool", size);
             ggml_sycl_alloc_trace_record("host", size, "unified_cache_pinned_pool");
             ggml_sycl::alloc_registry::instance().register_alloc(ptr, size, -1, ggml_sycl::alloc_type::HOST_PINNED);
@@ -639,11 +638,9 @@ void * ggml_sycl_host_malloc(size_t size) try {
         const sycl::context & tp_ctx       = g_tp_shared_queues[first_dev_id]->get_context();
 
         // Allocate host memory accessible from all TP devices (platform default context)
-        ggml_sycl::unified_cache_add_runtime_host_bytes(size);
         dpct::err0 err = CHECK_TRY_ERROR(ptr = sycl::malloc_host(size, tp_ctx));
 
         if (err != 0 || !ptr) {
-            ggml_sycl::unified_cache_sub_runtime_host_bytes(size);
             if (err != 0) {
                 GGML_LOG_ERROR("WARNING: failed to allocate %.2f MB of TP shared host memory\n",
                                size / 1024.0 / 1024.0);
@@ -664,7 +661,6 @@ void * ggml_sycl_host_malloc(size_t size) try {
     }
 
     // Non-TP mode: use default queue for host malloc.
-    ggml_sycl::unified_cache_add_runtime_host_bytes(size);
     dpct::err0 err = 0;
     {
         auto & queue = dpct::get_in_order_queue();
@@ -688,7 +684,6 @@ void * ggml_sycl_host_malloc(size_t size) try {
     }
 
     if (err != 0 || !ptr) {
-        ggml_sycl::unified_cache_sub_runtime_host_bytes(size);
         if (err == 0) {
             GGML_LOG_ERROR(
                 "[SYCL] sycl::malloc_host(%.1f GB) FAILED — returned null "
@@ -730,7 +725,6 @@ void ggml_sycl_host_free(void * ptr) try {
         }
     }
     if (alloc_size > 0) {
-        ggml_sycl::unified_cache_sub_runtime_host_bytes(alloc_size);
     }
     // MMAP memory: must use std::free, sycl::free would crash on non-USM pointers.
     if (is_mmap) {
@@ -893,11 +887,9 @@ void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> str
                     auto * hcache = ggml_sycl::try_get_host_cache();
                     if (hcache && extra->data_device_size[i] > 0) {
                         hcache->free_pinned_runtime(extra->data_device[i], extra->data_device_size[i]);
-                        ggml_sycl::unified_cache_sub_runtime_host_bytes(extra->data_device_size[i]);
                     }
                 } else if (extra->data_device_size[i] > 0) {
                     // Raw USM allocation
-                    ggml_sycl::unified_cache_sub_runtime_bytes(i, extra->data_device_size[i]);
                     SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(extra->data_device[i], *(streams[i]))));
                 }
             }
@@ -916,7 +908,6 @@ void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> str
                     extra->xmx_mxfp4_tiled_alloc[i] = {};
                 } else {
                     if (extra->xmx_mxfp4_tiled_size > 0) {
-                        ggml_sycl::unified_cache_sub_runtime_bytes(i, extra->xmx_mxfp4_tiled_size);
                     }
                     SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(extra->xmx_mxfp4_tiled[i], *(streams[i]))));
                 }
@@ -931,7 +922,6 @@ void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> str
                 extra->xmx_mxfp4_tiled_aos_staging_alloc[i] = {};
             } else {
                 if (extra->xmx_mxfp4_tiled_aos_staging_size[i] > 0) {
-                    ggml_sycl::unified_cache_sub_runtime_bytes(i, extra->xmx_mxfp4_tiled_aos_staging_size[i]);
                 }
                 SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(extra->xmx_mxfp4_tiled_aos_staging[i], *(streams[i]))));
             }
@@ -944,7 +934,6 @@ void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> str
             if (!extra->moe_expert_ptrs_from_prealloc[i]) {
                 ggml_sycl_set_device(i);
                 if (extra->moe_expert_ptrs_size[i] > 0) {
-                    ggml_sycl::unified_cache_sub_runtime_bytes(i, extra->moe_expert_ptrs_size[i]);
                 }
                 SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(extra->moe_expert_ptrs_device[i], *(streams[i]))));
             }
@@ -957,7 +946,6 @@ void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> str
         if (extra->moe_expert_ptrs_compact_device[i] != nullptr && streams.size() > 0) {
             ggml_sycl_set_device(i);
             if (extra->moe_expert_ptrs_compact_capacity[i] > 0) {
-                ggml_sycl::unified_cache_sub_runtime_bytes(i, extra->moe_expert_ptrs_compact_capacity[i]);
             }
             SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(extra->moe_expert_ptrs_compact_device[i], *(streams[i]))));
             extra->moe_expert_ptrs_compact_device[i]   = nullptr;
@@ -966,7 +954,6 @@ void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> str
         }
         if (extra->moe_expert_ptrs_missing_device[i] != nullptr && streams.size() > 0) {
             ggml_sycl_set_device(i);
-            ggml_sycl::unified_cache_sub_runtime_bytes(i, sizeof(int));
             SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(extra->moe_expert_ptrs_missing_device[i], *(streams[i]))));
             extra->moe_expert_ptrs_missing_device[i] = nullptr;
         }

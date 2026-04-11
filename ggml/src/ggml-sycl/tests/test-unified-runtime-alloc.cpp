@@ -77,7 +77,7 @@ static bool reserve_allocate_success_registers_pointer(sycl::queue & q) {
 static bool allocate_failure_rolls_back_budget(sycl::queue & q) {
     TEST_BEGIN("allocate_failure_rolls_back_budget");
     const int    device = 0;
-    const size_t before = unified_cache_get_runtime_bytes(device);
+    const size_t before = unified_cache_arena_non_weight_used(device);
 
     alloc_request req;
     req.queue                          = &q;
@@ -94,7 +94,7 @@ static bool allocate_failure_rolls_back_budget(sycl::queue & q) {
         TEST_PASS();
         return true;
     }
-    const size_t after = unified_cache_get_runtime_bytes(device);
+    const size_t after = unified_cache_arena_non_weight_used(device);
     TEST_ASSERT(before == after, "runtime bytes did not roll back after alloc failure");
     TEST_PASS();
     return true;

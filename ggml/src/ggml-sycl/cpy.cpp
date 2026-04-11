@@ -737,10 +737,8 @@ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) 
                 staged_src = (char *) ggml_sycl_host_malloc(nbytes);
                 staged_is_host = staged_src != nullptr;
             } else {
-                ggml_sycl::unified_cache_add_runtime_bytes(device, nbytes);
                 staged_src = (char *) ggml_sycl_malloc_shared(nbytes, *main_stream, "cpy_staging");
                 if (!staged_src) {
-                    ggml_sycl::unified_cache_sub_runtime_bytes(device, nbytes);
                 } else {
                     staged_is_shared = true;
                 }
@@ -856,7 +854,6 @@ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) 
             ggml_sycl_host_free(staged_src);
         } else {
             if (staged_is_shared) {
-                ggml_sycl::unified_cache_sub_runtime_bytes(device, ggml_nbytes(src0));
             }
             sycl::free(staged_src, query_ctx);
         }

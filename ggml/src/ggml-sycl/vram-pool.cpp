@@ -26,7 +26,6 @@ vram_pool::~vram_pool() {
     for (auto & [id, alloc] : allocations_) {
         if (alloc.ptr) {
             try {
-                ggml_sycl::unified_cache_sub_runtime_bytes(device_id_, alloc.size);
                 sycl::free(alloc.ptr, queue_);
             } catch (const sycl::exception & e) {
                 GGML_LOG_ERROR("[SYCL] Failed to free tensor_id %llu: %s\n", (unsigned long long) id, e.what());
@@ -82,16 +81,13 @@ void * vram_pool::allocate(size_t size, uint64_t tensor_id, size_t alignment) {
     // Allocate device memory
     void * ptr = nullptr;
     try {
-        ggml_sycl::unified_cache_add_runtime_bytes(device_id_, size);
         ptr = ggml_sycl_malloc_device_raw(size, queue_, "vram_pool");
     } catch (const sycl::exception & e) {
-        ggml_sycl::unified_cache_sub_runtime_bytes(device_id_, size);
         GGML_LOG_ERROR("[SYCL] VRAM allocation failed: %s\n", e.what());
         return nullptr;
     }
 
     if (!ptr) {
-        ggml_sycl::unified_cache_sub_runtime_bytes(device_id_, size);
         GGML_LOG_ERROR("[SYCL] malloc_device returned nullptr for size %zu\n", size);
         return nullptr;
     }
@@ -112,7 +108,6 @@ void vram_pool::deallocate(uint64_t tensor_id) {
     }
 
     try {
-        ggml_sycl::unified_cache_sub_runtime_bytes(device_id_, it->second.size);
         sycl::free(it->second.ptr, queue_);
     } catch (const sycl::exception & e) {
         GGML_LOG_ERROR("[SYCL] Failed to deallocate tensor_id %llu: %s\n", (unsigned long long) tensor_id, e.what());

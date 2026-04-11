@@ -24,11 +24,9 @@ dense_layer_scheduler::dense_layer_scheduler(sycl::queue & compute_queue, size_t
         GGML_LOG_ERROR("[SYCL] Failed to allocate dense scheduler VRAM slots (%.1f MB each)\n",
                        slot_size_ / (1024.0 * 1024.0));
         if (vram_slot_[0]) {
-            ggml_sycl::unified_cache_sub_runtime_bytes(device_id_, slot_size_);
             sycl::free(vram_slot_[0], compute_queue_);
         }
         if (vram_slot_[1]) {
-            ggml_sycl::unified_cache_sub_runtime_bytes(device_id_, slot_size_);
             sycl::free(vram_slot_[1], compute_queue_);
         }
         vram_slot_[0] = vram_slot_[1] = nullptr;
@@ -50,11 +48,9 @@ dense_layer_scheduler::~dense_layer_scheduler() {
 
     // Free VRAM slots
     if (vram_slot_[0]) {
-        ggml_sycl::unified_cache_sub_runtime_bytes(device_id_, slot_size_);
         sycl::free(vram_slot_[0], compute_queue_);
     }
     if (vram_slot_[1]) {
-        ggml_sycl::unified_cache_sub_runtime_bytes(device_id_, slot_size_);
         sycl::free(vram_slot_[1], compute_queue_);
     }
 

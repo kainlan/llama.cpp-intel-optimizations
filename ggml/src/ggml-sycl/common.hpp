@@ -1717,7 +1717,6 @@ inline void ggml_sycl_free_device_tracked_bytes(void * ptr, size_t bytes, sycl::
     }
     ggml_sycl::alloc_registry::instance().unregister_alloc(ptr);
     sycl::free(ptr, queue);
-    ggml_sycl::unified_cache_sub_runtime_bytes(ggml_sycl_get_device_id_from_queue(queue), bytes);
 }
 
 template <typename T>
@@ -1730,10 +1729,8 @@ template <typename T> inline void ggml_sycl_free_device_tracked_t(T * ptr, size_
 }
 
 inline void * ggml_sycl_malloc_host_tracked_bytes(size_t bytes, sycl::queue & queue, const char * tag) {
-    ggml_sycl::unified_cache_add_runtime_host_bytes(bytes);
     void * ptr = ggml_sycl_malloc_host(bytes, queue, tag);
     if (!ptr) {
-        ggml_sycl::unified_cache_sub_runtime_host_bytes(bytes);
     }
     return ptr;
 }
@@ -1744,7 +1741,6 @@ inline void ggml_sycl_free_host_tracked_bytes(void * ptr, size_t bytes, sycl::qu
     }
     ggml_sycl::alloc_registry::instance().unregister_alloc(ptr);
     sycl::free(ptr, queue);
-    ggml_sycl::unified_cache_sub_runtime_host_bytes(bytes);
 }
 
 template <typename T> inline T * ggml_sycl_malloc_host_tracked_t(size_t count, sycl::queue & queue, const char * tag) {
@@ -1791,7 +1787,6 @@ struct staging_buffer_pool {
         // OS reclaims all process memory at exit.
         size_t freed = total_bytes_.load(std::memory_order_relaxed);
         if (freed > 0 && !ggml_sycl::ggml_sycl_is_shutting_down()) {
-            ggml_sycl::unified_cache_sub_runtime_host_bytes(freed);
         }
     }
 
@@ -1872,7 +1867,6 @@ struct staging_buffer_pool {
         slots_.push_back(new_slot);
         total_bytes_.fetch_add(needed, std::memory_order_relaxed);
         // Track pinned host allocation against the unified cache host budget.
-        ggml_sycl::unified_cache_add_runtime_host_bytes(needed);
         return ptr;
     }
 
@@ -1930,7 +1924,6 @@ struct staging_buffer_pool {
         slots_.clear();
         total_bytes_.store(0, std::memory_order_relaxed);
         if (freed > 0) {
-            ggml_sycl::unified_cache_sub_runtime_host_bytes(freed);
         }
     }
 
@@ -3254,7 +3247,6 @@ struct ggml_backend_sycl_context {
                 bulk_size  = 0;
             } else if (bulk_ptr) {
                 // Legacy fallback
-                ggml_sycl::unified_cache_sub_runtime_bytes(device_id, bulk_size);
                 sycl::free(bulk_ptr, *stream);
                 bulk_ptr  = nullptr;
                 bulk_size = 0;
@@ -3262,7 +3254,6 @@ struct ggml_backend_sycl_context {
                 // Legacy per-buffer allocation
                 for (size_t i = 0; i < src1_ddq_buffers.size(); i++) {
                     if (src1_ddq_buffers[i]) {
-                        ggml_sycl::unified_cache_sub_runtime_bytes(device_id, src1_ddq_sizes[i]);
                         sycl::free(src1_ddq_buffers[i], *stream);
                     }
                 }
@@ -3397,47 +3388,36 @@ struct ggml_backend_sycl_context {
         void free_buffers(queue_ptr stream) {
             const int device_id = ggml_sycl_get_device_id_from_queue(*stream);
             if (tokens_f16_input) {
-                ggml_sycl::unified_cache_sub_runtime_bytes(device_id, bytes_tokens_f16_input());
                 sycl::free(tokens_f16_input, *stream);
             }
             if (tokens_sorted) {
-                ggml_sycl::unified_cache_sub_runtime_bytes(device_id, bytes_tokens_sorted());
                 sycl::free(tokens_sorted, *stream);
             }
             if (token_map) {
-                ggml_sycl::unified_cache_sub_runtime_bytes(device_id, bytes_token_map());
                 sycl::free(static_cast<void *>(token_map), *stream);
             }
             if (expert_counts) {
-                ggml_sycl::unified_cache_sub_runtime_bytes(device_id, bytes_expert_counts());
                 sycl::free(expert_counts, *stream);
             }
             if (expert_offsets) {
-                ggml_sycl::unified_cache_sub_runtime_bytes(device_id, bytes_expert_offsets());
                 sycl::free(expert_offsets, *stream);
             }
             if (expert_write_pos) {
-                ggml_sycl::unified_cache_sub_runtime_bytes(device_id, bytes_expert_write_pos());
                 sycl::free(expert_write_pos, *stream);
             }
             if (sorted_output) {
-                ggml_sycl::unified_cache_sub_runtime_bytes(device_id, bytes_sorted_output());
                 sycl::free(sorted_output, *stream);
             }
             if (q_tokens) {
-                ggml_sycl::unified_cache_sub_runtime_bytes(device_id, bytes_q_tokens());
                 sycl::free(q_tokens, *stream);
             }
             if (token_scales) {
-                ggml_sycl::unified_cache_sub_runtime_bytes(device_id, bytes_token_scales());
                 sycl::free(token_scales, *stream);
             }
             if (expert_scale_buf) {
-                ggml_sycl::unified_cache_sub_runtime_bytes(device_id, bytes_expert_scale_buf());
                 sycl::free(expert_scale_buf, *stream);
             }
             if (sorted_token_ids) {
-                ggml_sycl::unified_cache_sub_runtime_bytes(device_id, bytes_sorted_token_ids());
                 sycl::free(sorted_token_ids, *stream);
             }
             if (expert_tile_offsets) {
@@ -3445,7 +3425,6 @@ struct ggml_backend_sycl_context {
                     ggml_sycl::unified_free(tile_mapping_alloc[0]);
                     tile_mapping_alloc[0] = {};
                 } else {
-                    ggml_sycl::unified_cache_sub_runtime_bytes(device_id, (MAX_EXPERTS + 1) * sizeof(int32_t));
                     sycl::free(expert_tile_offsets, *stream);
                 }
             }
@@ -3454,7 +3433,6 @@ struct ggml_backend_sycl_context {
                     ggml_sycl::unified_free(tile_mapping_alloc[1]);
                     tile_mapping_alloc[1] = {};
                 } else {
-                    ggml_sycl::unified_cache_sub_runtime_bytes(device_id, sizeof(int32_t));
                     sycl::free(total_tiles, *stream);
                 }
             }

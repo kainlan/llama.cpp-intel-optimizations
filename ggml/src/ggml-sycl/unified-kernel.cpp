@@ -6848,8 +6848,6 @@ UnifiedKernel::~UnifiedKernel() {
     micro_graph_.reset();
     if (micro_tile_counters_) {
         if (micro_tile_counters_n_ > 0 && device_id_ >= 0) {
-            ggml_sycl::unified_cache_sub_runtime_bytes(device_id_, micro_tile_counters_n_ * sizeof(int),
-                                                       ggml_sycl::runtime_category::GRAPH);
         }
         device_free(micro_tile_counters_, queue_, arena_micro_tile_counters_);
         micro_tile_counters_       = nullptr;
@@ -6863,8 +6861,6 @@ UnifiedKernel::~UnifiedKernel() {
     }
     // Free MMVQ micro-graph Q8 and scratch buffers
     if (mmvq_q8_buf_size_ > 0 && device_id_ >= 0) {
-        ggml_sycl::unified_cache_sub_runtime_bytes(device_id_, 2 * mmvq_q8_buf_size_,
-                                                   ggml_sycl::runtime_category::GRAPH);
     }
     for (int i = 0; i < 2; i++) {
         if (mmvq_q8_bufs_[i]) {
@@ -6875,8 +6871,6 @@ UnifiedKernel::~UnifiedKernel() {
     mmvq_q8_buf_size_   = 0;
     arena_mmvq_q8_bufs_ = false;
     if (mmvq_gate_scratch_sz_ > 0 && device_id_ >= 0) {
-        ggml_sycl::unified_cache_sub_runtime_bytes(device_id_, 2 * mmvq_gate_scratch_sz_,
-                                                   ggml_sycl::runtime_category::GRAPH);
     }
     if (mmvq_gate_scratch_) {
         device_free(mmvq_gate_scratch_, queue_, arena_mmvq_gate_scratch_);
@@ -7072,7 +7066,6 @@ void UnifiedKernel::allocate_persistent_buffers(int hidden_dim, int intermediate
     // Track persistent buffers in cache budget (4 buffers + sync_block)
     const size_t total_bytes = 4 * required_size + 3 * sizeof(int);
     if (device_id_ >= 0) {
-        ggml_sycl::unified_cache_add_runtime_bytes(device_id_, total_bytes, ggml_sycl::runtime_category::GRAPH);
         runtime_tracked_bytes_ += total_bytes;
         GGML_SYCL_DEBUG("[UNIFIED-KERNEL] Tracked persistent buffers: %.1f MB on device %d\n",
                         total_bytes / (1024.0f * 1024.0f), device_id_);
@@ -7082,8 +7075,6 @@ void UnifiedKernel::allocate_persistent_buffers(int hidden_dim, int intermediate
 void UnifiedKernel::free_persistent_buffers() {
     // Untrack from cache budget before freeing
     if (runtime_tracked_bytes_ > 0 && device_id_ >= 0) {
-        ggml_sycl::unified_cache_sub_runtime_bytes(device_id_, runtime_tracked_bytes_,
-                                                   ggml_sycl::runtime_category::GRAPH);
         GGML_SYCL_DEBUG("[UNIFIED-KERNEL] Untracked persistent buffers: %.1f MB on device %d\n",
                         runtime_tracked_bytes_ / (1024.0f * 1024.0f), device_id_);
         runtime_tracked_bytes_ = 0;
@@ -7112,7 +7103,6 @@ void UnifiedKernel::free_persistent_buffers() {
     for (auto & slot : get_rows_slots_) {
         if (slot.ptr) {
             if (slot.size > 0 && device_id_ >= 0) {
-                ggml_sycl::unified_cache_sub_runtime_bytes(device_id_, slot.size, ggml_sycl::runtime_category::GRAPH);
             }
             device_free(slot.ptr, queue_, arena_get_rows_);
             slot.ptr  = nullptr;
@@ -7226,7 +7216,6 @@ void UnifiedKernel::build_dag(const std::vector<std::vector<int>> & successors, 
         // Untrack old DAG device bytes from budget
         if (dag_allocated_ && device_id_ >= 0) {
             const size_t old_dag_bytes = (3 * dag_pool_n_ops_ + 1) * sizeof(int);  // ready+claimed+done + completed
-            ggml_sycl::unified_cache_sub_runtime_bytes(device_id_, old_dag_bytes, ggml_sycl::runtime_category::GRAPH);
             runtime_tracked_bytes_ -= old_dag_bytes;
         }
         // Free old allocations
@@ -7281,7 +7270,6 @@ void UnifiedKernel::build_dag(const std::vector<std::vector<int>> & successors, 
         // Track new DAG device bytes (3 arrays of alloc_ops + 1 completed_count)
         if (device_id_ >= 0) {
             const size_t new_dag_bytes = (3 * alloc_ops + 1) * sizeof(int);
-            ggml_sycl::unified_cache_add_runtime_bytes(device_id_, new_dag_bytes, ggml_sycl::runtime_category::GRAPH);
             runtime_tracked_bytes_ += new_dag_bytes;
         }
     }
@@ -7693,7 +7681,6 @@ void UnifiedKernel::build_role_schedule(const std::vector<DeviceOperation> & hos
         // Track role schedule device bytes (sync_block is the only device allocation)
         if (device_id_ >= 0) {
             const size_t role_dev_bytes = total_ints * sizeof(int);
-            ggml_sycl::unified_cache_add_runtime_bytes(device_id_, role_dev_bytes, ggml_sycl::runtime_category::GRAPH);
             runtime_tracked_bytes_ += role_dev_bytes;
         }
 
@@ -8209,7 +8196,6 @@ void UnifiedKernel::add_temp_device_alloc(void * ptr, size_t bytes) {
         current_plan_->temp_device_allocs.push_back({ ptr, bytes });
         current_plan_->temp_device_alloc_bytes += bytes;
         if (device_id_ >= 0) {
-            ggml_sycl::unified_cache_add_runtime_bytes(device_id_, bytes, ggml_sycl::runtime_category::GRAPH);
         }
     }
 }
@@ -8234,8 +8220,6 @@ void UnifiedKernel::get_split_config(KernelSplitConfig & out) const {
 void UnifiedKernel::cancel_persistent() {
     if (current_plan_) {
         if (current_plan_->temp_device_alloc_bytes > 0 && device_id_ >= 0) {
-            ggml_sycl::unified_cache_sub_runtime_bytes(device_id_, current_plan_->temp_device_alloc_bytes,
-                                                       ggml_sycl::runtime_category::GRAPH);
         }
         for (auto & [ptr, sz] : current_plan_->temp_device_allocs) {
             auto hit = current_plan_->temp_device_alloc_handles.find(ptr);
@@ -8293,8 +8277,6 @@ void UnifiedKernel::begin_plan_update() {
     // Cancel any in-flight plan but DON'T free cached data
     if (current_plan_) {
         if (current_plan_->temp_device_alloc_bytes > 0 && device_id_ >= 0) {
-            ggml_sycl::unified_cache_sub_runtime_bytes(device_id_, current_plan_->temp_device_alloc_bytes,
-                                                       ggml_sycl::runtime_category::GRAPH);
         }
         for (auto & [ptr, sz] : current_plan_->temp_device_allocs) {
             auto hit = current_plan_->temp_device_alloc_handles.find(ptr);
@@ -8445,8 +8427,6 @@ void UnifiedKernel::invalidate_plan_cache() {
     orig_phase_offset_.clear();
     orig_phase_tiles_.clear();
     if (cached_temp_device_alloc_bytes_ > 0 && device_id_ >= 0) {
-        ggml_sycl::unified_cache_sub_runtime_bytes(device_id_, cached_temp_device_alloc_bytes_,
-                                                   ggml_sycl::runtime_category::GRAPH);
     }
     for (auto & [ptr, sz] : cached_temp_device_allocs_) {
         auto hit = cached_temp_device_alloc_handles_.find(ptr);
@@ -8499,7 +8479,6 @@ void * UnifiedKernel::get_rows_stable_ptr(int get_rows_index, size_t bytes) {
     if (slot.ptr) {
         device_free(slot.ptr, queue_, arena_get_rows_);
         if (slot.size > 0 && device_id_ >= 0) {
-            ggml_sycl::unified_cache_sub_runtime_bytes(device_id_, slot.size, ggml_sycl::runtime_category::GRAPH);
         }
     }
     bool arena_tmp = false;
@@ -8509,7 +8488,6 @@ void * UnifiedKernel::get_rows_stable_ptr(int get_rows_index, size_t bytes) {
     }
     slot.size = slot.ptr ? bytes : 0;
     if (slot.size > 0 && device_id_ >= 0) {
-        ggml_sycl::unified_cache_add_runtime_bytes(device_id_, slot.size, ggml_sycl::runtime_category::GRAPH);
     }
     return slot.ptr;
 }
@@ -8566,8 +8544,6 @@ void UnifiedKernel::build_scratch_pool() {
         scratch_pool_      = device_alloc_scratch(total_bytes, queue_, device_id_, arena_scratch_pool_);
         scratch_pool_size_ = scratch_pool_ ? total_bytes : 0;
         if (scratch_pool_size_ > 0 && device_id_ >= 0) {
-            ggml_sycl::unified_cache_add_runtime_bytes(device_id_, scratch_pool_size_,
-                                                       ggml_sycl::runtime_category::GRAPH);
         }
         // Re-initialize scratch_outputs_ after free_scratch_pool() cleared it
         scratch_outputs_.assign(n_ops, nullptr);
@@ -8715,8 +8691,6 @@ void UnifiedKernel::free_scratch_pool() {
     final_output_ggml_dst_ = nullptr;
     if (scratch_pool_) {
         if (scratch_pool_size_ > 0 && device_id_ >= 0) {
-            ggml_sycl::unified_cache_sub_runtime_bytes(device_id_, scratch_pool_size_,
-                                                       ggml_sycl::runtime_category::GRAPH);
         }
         device_free(scratch_pool_, queue_, arena_scratch_pool_);
         scratch_pool_       = nullptr;
@@ -9827,8 +9801,6 @@ void UnifiedKernel::record_micro_graph() {
     if (n_counters_needed > micro_tile_counters_n_) {
         // Untrack old allocation
         if (micro_tile_counters_n_ > 0 && device_id_ >= 0) {
-            ggml_sycl::unified_cache_sub_runtime_bytes(device_id_, micro_tile_counters_n_ * sizeof(int),
-                                                       ggml_sycl::runtime_category::GRAPH);
         }
         if (micro_tile_counters_) {
             device_free(micro_tile_counters_, queue_, arena_micro_tile_counters_);
@@ -9838,8 +9810,6 @@ void UnifiedKernel::record_micro_graph() {
         micro_tile_counters_n_ = n_counters_needed;
         // Track new allocation
         if (device_id_ >= 0) {
-            ggml_sycl::unified_cache_add_runtime_bytes(device_id_, n_counters_needed * sizeof(int),
-                                                       ggml_sycl::runtime_category::GRAPH);
         }
         // Zero counters once at allocation (generation starts at 0)
         queue_.memset(micro_tile_counters_, 0, n_counters_needed * sizeof(int)).wait();
@@ -9874,8 +9844,6 @@ void UnifiedKernel::record_micro_graph() {
         if (mmvq_q8_buf_size_ < q8_size) {
             // Untrack old allocations
             if (mmvq_q8_buf_size_ > 0 && device_id_ >= 0) {
-                ggml_sycl::unified_cache_sub_runtime_bytes(device_id_, 2 * mmvq_q8_buf_size_,
-                                                           ggml_sycl::runtime_category::GRAPH);
             }
             for (int i = 0; i < 2; i++) {
                 if (mmvq_q8_bufs_[i]) {
@@ -9890,7 +9858,6 @@ void UnifiedKernel::record_micro_graph() {
             mmvq_q8_buf_size_ = q8_size;
             // Track new allocations
             if (device_id_ >= 0) {
-                ggml_sycl::unified_cache_add_runtime_bytes(device_id_, 2 * q8_size, ggml_sycl::runtime_category::GRAPH);
             }
         }
 
@@ -9898,8 +9865,6 @@ void UnifiedKernel::record_micro_graph() {
         if (mmvq_gate_scratch_sz_ < gate_scratch_sz) {
             // Untrack old allocations
             if (mmvq_gate_scratch_sz_ > 0 && device_id_ >= 0) {
-                ggml_sycl::unified_cache_sub_runtime_bytes(device_id_, 2 * mmvq_gate_scratch_sz_,
-                                                           ggml_sycl::runtime_category::GRAPH);
             }
             if (mmvq_gate_scratch_) {
                 device_free(mmvq_gate_scratch_, queue_, arena_mmvq_gate_scratch_);
@@ -9914,8 +9879,6 @@ void UnifiedKernel::record_micro_graph() {
             mmvq_gate_scratch_sz_ = gate_scratch_sz;
             // Track new allocations
             if (device_id_ >= 0) {
-                ggml_sycl::unified_cache_add_runtime_bytes(device_id_, 2 * gate_scratch_sz,
-                                                           ggml_sycl::runtime_category::GRAPH);
             }
         }
     }
@@ -10352,8 +10315,6 @@ void UnifiedKernel::execute_persistent() {
 
     // Free non-cached temp allocs
     if (current_plan_->temp_device_alloc_bytes > 0 && device_id_ >= 0) {
-        ggml_sycl::unified_cache_sub_runtime_bytes(device_id_, current_plan_->temp_device_alloc_bytes,
-                                                   ggml_sycl::runtime_category::GRAPH);
     }
     for (auto & [ptr, sz] : current_plan_->temp_device_allocs) {
         auto hit = current_plan_->temp_device_alloc_handles.find(ptr);
@@ -10652,8 +10613,6 @@ void UnifiedKernel::execute_persistent_phased(phase_callback_t on_matmul_complet
 
     // Free non-cached temp allocs
     if (current_plan_->temp_device_alloc_bytes > 0 && device_id_ >= 0) {
-        ggml_sycl::unified_cache_sub_runtime_bytes(device_id_, current_plan_->temp_device_alloc_bytes,
-                                                   ggml_sycl::runtime_category::GRAPH);
     }
     for (auto & [ptr, sz] : current_plan_->temp_device_allocs) {
         auto hit = current_plan_->temp_device_alloc_handles.find(ptr);
@@ -11526,8 +11485,6 @@ void UnifiedKernel::launch_persistent_kernel(bool build_only) {
         if (n_light > 0 && n_final_phases > light_flags_size_) {
             // Untrack old allocation
             if (light_flags_size_ > 0 && device_id_ >= 0) {
-                ggml_sycl::unified_cache_sub_runtime_bytes(device_id_, light_flags_size_ * sizeof(int),
-                                                           ggml_sycl::runtime_category::GRAPH);
                 runtime_tracked_bytes_ -= light_flags_size_ * sizeof(int);
             }
             if (light_flags_) {
@@ -11540,7 +11497,6 @@ void UnifiedKernel::launch_persistent_kernel(bool build_only) {
             // Track new allocation
             if (device_id_ >= 0) {
                 const size_t light_bytes = alloc_size * sizeof(int);
-                ggml_sycl::unified_cache_add_runtime_bytes(device_id_, light_bytes, ggml_sycl::runtime_category::GRAPH);
                 runtime_tracked_bytes_ += light_bytes;
             }
         }
@@ -11972,8 +11928,6 @@ void UnifiedKernel::finalize_persistent() {
 
     // Free non-cached temp allocs
     if (current_plan_->temp_device_alloc_bytes > 0 && device_id_ >= 0) {
-        ggml_sycl::unified_cache_sub_runtime_bytes(device_id_, current_plan_->temp_device_alloc_bytes,
-                                                   ggml_sycl::runtime_category::GRAPH);
     }
     for (auto & [ptr, sz] : current_plan_->temp_device_allocs) {
         auto hit = current_plan_->temp_device_alloc_handles.find(ptr);

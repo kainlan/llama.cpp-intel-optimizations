@@ -462,8 +462,6 @@ ExpertPredictor::~ExpertPredictor() {
     if (scores_dev_ && scores_queue_ && !ggml_sycl_is_shutting_down()) {
         if (scores_dev_n_ > 0 && !scores_from_arena_) {
             int scores_device = ggml_sycl_get_device_id_from_queue(*scores_queue_);
-            unified_cache_sub_runtime_bytes(scores_device, scores_dev_n_ * sizeof(float),
-                                            runtime_category::EXPERT_CACHE);
         }
         if (!scores_from_arena_) {
             try {
@@ -818,8 +816,6 @@ std::vector<int> ExpertPredictor::predict_pregate(int           next_layer_idx,
         int scores_device = ggml_sycl_get_device_id_from_queue(compute_q);
         if (scores_dev_ && scores_queue_) {
             if (scores_dev_n_ > 0 && !scores_from_arena_) {
-                unified_cache_sub_runtime_bytes(scores_device, scores_dev_n_ * sizeof(float),
-                                                runtime_category::EXPERT_CACHE);
             }
             if (!scores_from_arena_) {
                 sycl::free(scores_dev_, *scores_queue_);
@@ -844,7 +840,6 @@ std::vector<int> ExpertPredictor::predict_pregate(int           next_layer_idx,
             return predict(next_layer_idx);
         }
         if (!scores_from_arena_) {
-            unified_cache_add_runtime_bytes(scores_device, M * sizeof(float), runtime_category::EXPERT_CACHE);
         }
     }
     float * scores_dev = scores_dev_;

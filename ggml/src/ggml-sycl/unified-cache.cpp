@@ -41,23 +41,21 @@ static int                                                     g_unified_cache_b
 static size_t                                                  g_unified_cache_host_budget = 0;  // 0 = auto-calc
 static int                                                     g_unified_cache_host_budget_pct = 90;
 static unified_cache_mode                                      g_cache_mode = unified_cache_mode::AUTO;
-static std::atomic<bool> g_cache_mode_locked{ false };   // Locked after first cache access
-static std::atomic<bool> g_sycl_shutting_down{ false };  // Set during shutdown to skip sycl::free()
-static std::array<std::atomic<size_t>, GGML_SYCL_MAX_DEVICES> g_runtime_reserved_bytes{};
-static std::array<std::atomic<size_t>, GGML_SYCL_MAX_DEVICES> g_runtime_reserved_baseline{};
-static std::atomic<size_t> g_runtime_cat_bytes[GGML_SYCL_MAX_DEVICES][static_cast<int>(runtime_category::COUNT)]{};
+static std::atomic<bool>   g_cache_mode_locked{ false };   // Locked after first cache access
+static std::atomic<bool>   g_sycl_shutting_down{ false };  // Set during shutdown to skip sycl::free()
+// VRAM runtime counters removed — arena zones (zone_used) are the single source of truth.
+// Host runtime counters retained until host-pool zone tracking is implemented.
 static std::atomic<size_t> g_runtime_reserved_host_bytes{};
 static std::atomic<size_t> g_runtime_host_cat_bytes[static_cast<int>(runtime_category::COUNT)]{};
-static std::array<std::atomic<size_t>, GGML_SYCL_MAX_DEVICES> g_runtime_managed_reserved_bytes{};
-static std::atomic<size_t>                                    g_runtime_managed_reserved_host_bytes{};
-static std::atomic<bool> g_atexit_registered{ false };  // Ensure atexit handler registered once
-static std::atomic<int>  g_host_cache_guard_errors{ 0 };
-static std::atomic<int>  g_host_cache_guard_enabled{ -1 };
-static constexpr size_t  k_host_cache_guard_bytes   = 64;
-static constexpr uint8_t k_host_cache_guard_pattern = 0xA5;
-static std::atomic<int>  g_cache_assert_enabled{ -1 };
-static std::atomic<int>  g_copy_trace_enabled{ -1 };
-static std::atomic<bool> g_graph_compute_active{ false };
+static std::atomic<size_t> g_runtime_managed_reserved_host_bytes{};
+static std::atomic<bool>   g_atexit_registered{ false };  // Ensure atexit handler registered once
+static std::atomic<int>    g_host_cache_guard_errors{ 0 };
+static std::atomic<int>    g_host_cache_guard_enabled{ -1 };
+static constexpr size_t    k_host_cache_guard_bytes   = 64;
+static constexpr uint8_t   k_host_cache_guard_pattern = 0xA5;
+static std::atomic<int>    g_cache_assert_enabled{ -1 };
+static std::atomic<int>    g_copy_trace_enabled{ -1 };
+static std::atomic<bool>   g_graph_compute_active{ false };
 
 static std::mutex            g_runtime_alloc_mutex;
 static std::atomic<uint64_t> g_runtime_alloc_id{ 1 };
@@ -200,19 +198,8 @@ static runtime_category category_from_role(alloc_role role) {
     }
 }
 
-static inline void unified_managed_add_device_bytes(int device, size_t bytes) {
-    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || bytes == 0) {
-        return;
-    }
-    g_runtime_managed_reserved_bytes[device].fetch_add(bytes, std::memory_order_relaxed);
-}
-
-static inline void unified_managed_sub_device_bytes(int device, size_t bytes) {
-    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || bytes == 0) {
-        return;
-    }
-    g_runtime_managed_reserved_bytes[device].fetch_sub(bytes, std::memory_order_relaxed);
-}
+// unified_managed_add/sub_device_bytes removed — arena zones are the single source of truth for VRAM.
+// Host managed bytes tracking retained until host-pool zone tracking is implemented.
 
 static inline void unified_managed_add_host_bytes(size_t bytes) {
     if (bytes == 0) {
@@ -6020,20 +6007,23 @@ static unified_cache * get_cache_shared(int effective_device) {
     return it->second.get();
 }
 
-static size_t runtime_reserved_bytes_nolock(int device_id) {
-    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+// Direct arena zone query — caller MUST hold g_cache_rw_mutex.
+// Accesses g_device_caches without re-acquiring the lock.
+static size_t arena_non_weight_used_locked(int device_id) {
+    auto it = g_device_caches.find(device_id);
+    if (it == g_device_caches.end() || !it->second || !it->second->arena_active()) {
         return 0;
     }
-    return g_runtime_reserved_bytes[device_id].load(std::memory_order_relaxed);
+    return it->second->zone_used(vram_zone_id::KV) + it->second->zone_used(vram_zone_id::ONEDNN) +
+           it->second->zone_used(vram_zone_id::RUNTIME) + it->second->zone_used(vram_zone_id::SCRATCH);
+}
+
+static size_t runtime_reserved_bytes_nolock(int device_id) {
+    return arena_non_weight_used_locked(device_id);
 }
 
 static size_t runtime_reserved_adjusted_nolock(int device_id) {
-    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
-        return 0;
-    }
-    const size_t total = g_runtime_reserved_bytes[device_id].load(std::memory_order_relaxed);
-    const size_t base  = g_runtime_reserved_baseline[device_id].load(std::memory_order_relaxed);
-    return total > base ? total - base : 0;
+    return arena_non_weight_used_locked(device_id);
 }
 
 static size_t runtime_reserved_host_bytes_nolock() {
@@ -6044,7 +6034,7 @@ static size_t runtime_reserved_host_bytes_nolock() {
 // deferred_reserved_out: if non-null, stores the reserved bytes that the
 // caller must apply via update_reserved_bytes() AFTER releasing g_cache_rw_mutex.
 // This prevents a deadlock: update_reserved_bytes() → recalc → layer streaming
-// → unified_cache_add_runtime_bytes() → tries to re-lock g_cache_rw_mutex.
+// → zone_alloc() → tries to re-lock g_cache_rw_mutex.
 // Optional device memory hints to avoid calling ggml_sycl_info() during
 // static init (which would deadlock on the static local guard).
 struct device_mem_hint {
@@ -6080,7 +6070,7 @@ static unified_cache * create_cache_for_device(int                     device_id
     }
 
     if (dma_reserve_bytes > 0) {
-        g_runtime_reserved_bytes[device_id].fetch_add(dma_reserve_bytes, std::memory_order_relaxed);
+        // DMA reserve is now tracked via arena zones — no separate counter needed.
         if (reserve_env_set) {
             GGML_SYCL_DEBUG("[UNIFIED-CACHE] Reserving %.1f MB for DMA staging (fixed)\n",
                             dma_reserve_bytes / (1024.0 * 1024.0));
@@ -6190,12 +6180,12 @@ static unified_cache * create_cache_for_device(int                     device_id
         // accounted for in the budget calculation — only NEW runtime
         // allocations after this point should reduce available cache space.
         const size_t reserved_total = runtime_reserved_bytes_nolock(device_id);
-        const size_t baseline       = reserved_total;
-        g_runtime_reserved_baseline[device_id].store(baseline, std::memory_order_relaxed);
+        // Baseline no longer stored separately — arena zones provide the single source of truth.
+        const size_t baseline       = 0;  // No baseline adjustment needed with arena zones.
         const size_t reserved_adjusted = runtime_reserved_adjusted_nolock(device_id);
         // Defer update_reserved_bytes to caller (after releasing g_cache_rw_mutex)
         // to avoid deadlock: update_reserved_bytes → recalc → layer streaming
-        // → unified_cache_add_runtime_bytes → re-lock g_cache_rw_mutex
+        // → zone_alloc → re-lock g_cache_rw_mutex
         if (deferred_reserved_out) {
             *deferred_reserved_out = reserved_adjusted;
         } else if (reserved_adjusted > 0) {
@@ -6470,15 +6460,8 @@ alloc_tier unified_select_tier(const alloc_request & req) {
 
 static bool unified_free_record(const runtime_alloc_record & rec) {
     bool ok = true;
-    if (rec.handle.tier == alloc_tier::DEVICE_VRAM) {
-        if (rec.handle.role != alloc_role::WEIGHT) {
-            unified_cache_sub_runtime_bytes(rec.handle.device, rec.handle.size, rec.handle.category);
-        }
-        unified_managed_sub_device_bytes(rec.handle.device, rec.handle.size);
-    } else if (rec.handle.tier == alloc_tier::HOST_PINNED || rec.handle.tier == alloc_tier::MMAP_TRACKED) {
-        unified_cache_sub_runtime_host_bytes(rec.handle.size);
-        unified_managed_sub_host_bytes(rec.handle.size);
-    }
+    // Arena zones handle their own accounting via zone_reset/zone_alloc.
+    // No separate counter bookkeeping needed.
 
     try {
         if (rec.handle.tier == alloc_tier::MMAP_TRACKED) {
@@ -6551,15 +6534,7 @@ static bool unified_free_record(const runtime_alloc_record & rec) {
     }
 
     if (!ok) {
-        if (rec.handle.tier == alloc_tier::DEVICE_VRAM) {
-            if (rec.handle.role != alloc_role::WEIGHT) {
-                unified_cache_add_runtime_bytes(rec.handle.device, rec.handle.size, rec.handle.category);
-            }
-            unified_managed_add_device_bytes(rec.handle.device, rec.handle.size);
-        } else if (rec.handle.tier == alloc_tier::HOST_PINNED || rec.handle.tier == alloc_tier::MMAP_TRACKED) {
-            unified_cache_add_runtime_host_bytes(rec.handle.size);
-            unified_managed_add_host_bytes(rec.handle.size);
-        }
+        // Arena zones handle accounting — no separate counter bookkeeping to restore on error.
     }
     return ok;
 }
@@ -6654,7 +6629,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
         // a subsequent memset/memcpy triggers DEVICE_LOST.
         if (req.device >= 0 && req.device < GGML_SYCL_MAX_DEVICES) {
             const size_t total_vram   = ggml_sycl_info().devices[req.device].total_vram;
-            const size_t runtime_vram = g_runtime_managed_reserved_bytes[req.device].load(std::memory_order_relaxed);
+            const size_t runtime_vram = unified_cache_arena_non_weight_used(req.device);
             // Include weight cache usage (SOA entries on device VRAM)
             size_t       cache_vram   = 0;
             auto *       cache        = get_unified_cache_for_device(req.device);
@@ -6678,15 +6653,13 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                     const size_t freed = cache->evict_and_flush(needed);
                     // Re-check after eviction
                     cache_vram         = cache->used();
-                    used_vram =
-                        g_runtime_managed_reserved_bytes[req.device].load(std::memory_order_relaxed) + cache_vram;
+                    used_vram          = unified_cache_arena_non_weight_used(req.device) + cache_vram;
                     if (freed > 0) {
                         GGML_LOG_INFO(
                             "[UNIFIED-ALLOC] Evicted %.1f MB, "
                             "used now=%.1f MB (cache=%.1f MB + runtime=%.1f MB)\n",
                             freed / (1024.0 * 1024.0), used_vram / (1024.0 * 1024.0), cache_vram / (1024.0 * 1024.0),
-                            g_runtime_managed_reserved_bytes[req.device].load(std::memory_order_relaxed) /
-                                (1024.0 * 1024.0));
+                            unified_cache_arena_non_weight_used(req.device) / (1024.0 * 1024.0));
                     }
                 }
                 if (total_vram > 0 && used_vram + alloc_size > total_vram) {
@@ -6790,16 +6763,9 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     // Weight buffers are the primary model data allocated by ggml framework;
     // they must NOT count against the cache budget (reserved_) because the
     // cache manages SOA/XMX layouts in the REMAINING VRAM after weights.
-    // We still track them in g_runtime_managed_reserved_bytes (overcommit guard).
-    if (reserve_device) {
-        if (req.intent.role != alloc_role::WEIGHT) {
-            unified_cache_add_runtime_bytes(req.device, alloc_size, cat);
-        }
-        unified_managed_add_device_bytes(req.device, alloc_size);
-    } else if (reserve_host) {
-        unified_cache_add_runtime_host_bytes(alloc_size);
-        unified_managed_add_host_bytes(alloc_size);
-    }
+    // Arena zones track non-weight allocations via zone_alloc/zone_reset.
+    // No separate counter bookkeeping needed — zones are the single source of truth.
+    // Weight allocations are excluded from runtime tracking (they live in the WEIGHT zone).
 
     runtime_alloc_record rec;
     rec.handle.ptr       = ptr;
@@ -6823,15 +6789,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
         if (g_runtime_alloc_registry.find(ptr) != g_runtime_alloc_registry.end()) {
             GGML_LOG_ERROR("[UNIFIED-ALLOC] duplicate pointer registration ptr=%p size=%zu tier=%s\n", ptr, alloc_size,
                            alloc_tier_name(tier));
-            if (reserve_device) {
-                if (req.intent.role != alloc_role::WEIGHT) {
-                    unified_cache_sub_runtime_bytes(req.device, alloc_size, cat);
-                }
-                unified_managed_sub_device_bytes(req.device, alloc_size);
-            } else if (reserve_host) {
-                unified_cache_sub_runtime_host_bytes(alloc_size);
-                unified_managed_sub_host_bytes(alloc_size);
-            }
+            // Arena zones handle their own accounting — no separate counter sub needed.
             if (uses_pinned_pool && !zone_managed) {
                 if (auto * hcache = try_get_host_cache()) {
                     hcache->free_pinned_runtime(ptr, alloc_size);
@@ -7231,7 +7189,7 @@ bool unified_alloc_validate_registry(int device, const char * where) {
         if (device >= 0 && d != device) {
             continue;
         }
-        const size_t tracked = g_runtime_managed_reserved_bytes[d].load(std::memory_order_relaxed);
+        const size_t tracked = unified_cache_arena_non_weight_used(d);
         const size_t reg     = registry_device[d];
         if (tracked != reg) {
             ok = false;
@@ -7239,7 +7197,7 @@ bool unified_alloc_validate_registry(int device, const char * where) {
                           where ? " at " : "", where ? where : "", d, tracked, reg);
         }
     }
-    const size_t tracked_host = g_runtime_managed_reserved_host_bytes.load(std::memory_order_relaxed);
+    const size_t tracked_host = g_runtime_reserved_host_bytes.load(std::memory_order_relaxed);
     if (tracked_host != registry_host) {
         ok = false;
         GGML_LOG_WARN("[UNIFIED-ALLOC] managed registry mismatch%s%s host tracked=%zu registry=%zu\n",
@@ -7268,78 +7226,40 @@ bool unified_cache_has_pending_deferred_frees(int device) {
     return cache->has_pending_deferred_frees();
 }
 
-void unified_cache_add_runtime_bytes(int device, size_t bytes, runtime_category cat) {
-    if (bytes == 0) {
-        return;
-    }
-    int effective_device = resolve_effective_device(device);
-    if (effective_device < 0) {
-        return;
-    }
-    // Atomic counter updates — no lock needed
-    const size_t new_total =
-        g_runtime_reserved_bytes[effective_device].fetch_add(bytes, std::memory_order_relaxed) + bytes;
-    g_runtime_cat_bytes[effective_device][static_cast<int>(cat)].fetch_add(bytes, std::memory_order_relaxed);
-    GGML_SYCL_DEBUG("[BUDGET] add dev=%d(eff=%d) +%.3f MB cat=%d total=%.1f MB\n", device, effective_device,
-                    bytes / (1024.0 * 1024.0), static_cast<int>(cat), new_total / (1024.0 * 1024.0));
-    // Look up cache under shared lock, call update_reserved_bytes outside lock
-    unified_cache * cache = get_cache_shared(effective_device);
-    if (cache) {
-        const size_t baseline = g_runtime_reserved_baseline[effective_device].load(std::memory_order_relaxed);
-        const size_t adjusted = new_total > baseline ? new_total - baseline : 0;
-        cache->update_reserved_bytes(adjusted);
-    }
-}
-
-void unified_cache_sub_runtime_bytes(int device, size_t bytes, runtime_category cat) {
-    if (bytes == 0) {
-        return;
-    }
-    int effective_device = resolve_effective_device(device);
-    if (effective_device < 0) {
-        return;
-    }
-    // Atomic saturating subtract via CAS loop — no lock needed
-    size_t cur = g_runtime_reserved_bytes[effective_device].load(std::memory_order_relaxed);
-    size_t next;
-    do {
-        next = cur > bytes ? cur - bytes : 0;
-    } while (!g_runtime_reserved_bytes[effective_device].compare_exchange_weak(cur, next, std::memory_order_relaxed,
-                                                                               std::memory_order_relaxed));
-    size_t cat_cur = g_runtime_cat_bytes[effective_device][static_cast<int>(cat)].load(std::memory_order_relaxed);
-    size_t cat_next;
-    do {
-        cat_next = cat_cur > bytes ? cat_cur - bytes : 0;
-    } while (!g_runtime_cat_bytes[effective_device][static_cast<int>(cat)].compare_exchange_weak(
-        cat_cur, cat_next, std::memory_order_relaxed, std::memory_order_relaxed));
-    // Look up cache under shared lock, call update_reserved_bytes outside lock
-    unified_cache * cache = get_cache_shared(effective_device);
-    if (cache) {
-        const size_t baseline = g_runtime_reserved_baseline[effective_device].load(std::memory_order_relaxed);
-        const size_t adjusted = next > baseline ? next - baseline : 0;
-        cache->update_reserved_bytes(adjusted);
-    }
-}
+// unified_cache_add/sub_runtime_bytes removed — arena zones are the single source of truth.
+// Zone_alloc/zone_reset handle accounting internally.
 
 size_t unified_cache_get_runtime_bytes(int device) {
-    // Pure atomic read — no lock needed
-    int effective_device = resolve_effective_device(device);
-    if (effective_device < 0) {
-        return 0;
-    }
-    return g_runtime_reserved_bytes[effective_device].load(std::memory_order_relaxed);
+    return unified_cache_arena_non_weight_used(device);
 }
 
 size_t unified_cache_get_runtime_bytes_by_category(int device, runtime_category cat) {
-    // Pure atomic read — no lock needed
-    int effective_device = resolve_effective_device(device);
-    if (effective_device < 0) {
+    // Per-category tracking replaced by zone-based queries.
+    // Note: not every runtime_category maps 1:1 to a zone; categories that
+    // previously shared counters are collapsed to the best-fit zone.
+    auto * cache = get_unified_cache_for_device(device);
+    if (!cache || !cache->arena_active()) {
         return 0;
     }
-    if (static_cast<int>(cat) >= static_cast<int>(runtime_category::COUNT)) {
-        return 0;
+    switch (cat) {
+        case runtime_category::KV_CACHE:
+            return cache->zone_used(vram_zone_id::KV);
+        case runtime_category::COMPUTE:
+            return cache->zone_used(vram_zone_id::RUNTIME);
+        case runtime_category::STAGING:
+            return cache->zone_used(vram_zone_id::SCRATCH);
+        case runtime_category::GRAPH:
+            return cache->zone_used(vram_zone_id::RUNTIME);
+        case runtime_category::HOST_COMPUTE:
+            return 0;  // Host memory — not tracked by VRAM zones
+        case runtime_category::EXPERT_CACHE:
+            return cache->zone_used(vram_zone_id::RUNTIME);
+        case runtime_category::OTHER:
+            return cache->zone_used(vram_zone_id::ONEDNN);
+        case runtime_category::COUNT:
+            return 0;  // Sentinel — not a real category
     }
-    return g_runtime_cat_bytes[effective_device][static_cast<int>(cat)].load(std::memory_order_relaxed);
+    return 0;
 }
 
 void unified_cache_add_runtime_host_bytes(size_t bytes) {
@@ -7400,7 +7320,7 @@ size_t unified_cache_available_for_compute(int device) {
     }
 
     // Use the unified total-available view that sums BOTH budget channels
-    // (weights from used_ + runtime from g_runtime_reserved_bytes).
+    // (weights from used_ + runtime from arena zone usage).
     // Previously this only checked cache->available_for_compute() which relies
     // on reserved_ being kept in sync via update_reserved_bytes() — a TOCTOU
     // gap that could let the compute pool over-allocate when weights consumed
@@ -7426,10 +7346,8 @@ size_t unified_cache_total_committed_bytes(int device) {
     if (effective_device < 0) {
         return 0;
     }
-    // Use baseline-adjusted runtime bytes: base_budget_ was computed from free
-    // VRAM at init, which already excluded pre-existing runtime allocations.
-    // Using raw g_runtime_reserved_bytes would double-count the baseline.
-    const size_t    runtime = runtime_reserved_adjusted_nolock(effective_device);
+    // Runtime bytes from arena zones: KV + ONEDNN + RUNTIME + SCRATCH usage.
+    const size_t    runtime = unified_cache_arena_non_weight_used(effective_device);
     unified_cache * cache   = get_cache_shared(effective_device);
     const size_t    weights = cache ? cache->weight_bytes() : 0;
     return runtime + weights;
@@ -7511,7 +7429,7 @@ void unified_cache_log_budget_summary(int device) {
     auto &       cache = *cache_ptr;
     const size_t base  = cache.base_budget();
     const size_t wt    = cache.weight_bytes();
-    const size_t rt    = g_runtime_reserved_bytes[effective_device].load(std::memory_order_relaxed);
+    const size_t rt    = unified_cache_arena_non_weight_used(effective_device);
     const size_t eff   = cache.budget();
     const size_t avl   = cache.available();
 
@@ -7549,24 +7467,28 @@ void unified_cache_log_budget_summary(int device) {
         committed / (1024.0f * 1024.0f), total_avl / (1024.0f * 1024.0f), eff / (1024.0f * 1024.0f),
         avl / (1024.0f * 1024.0f), avail_for_wt / (1024.0f * 1024.0f), budget_pct, exceeds ? "yes" : "no");
 
-    // Per-category runtime breakdown
+    // Per-category runtime breakdown from arena zones
     static const char * cat_names[] = { "KV_CACHE",     "COMPUTE",      "STAGING", "GRAPH",
                                         "HOST_COMPUTE", "EXPERT_CACHE", "OTHER" };
     GGML_LOG_INFO("[UNIFIED-CACHE] Runtime breakdown for device %d:\n", device);
-    for (int c = 0; c < static_cast<int>(runtime_category::COUNT); c++) {
-        const size_t cat_bytes = g_runtime_cat_bytes[effective_device][c].load(std::memory_order_relaxed);
-        if (cat_bytes > 0) {
-            GGML_LOG_INFO("  %-12s %8.1f MB\n", cat_names[c], cat_bytes / (1024.0f * 1024.0f));
-        }
+    auto * cat_cache = get_unified_cache_for_device(effective_device);
+    if (cat_cache && cat_cache->arena_active()) {
+        GGML_LOG_INFO("  %-12s %8.1f MB\n", "KV_ZONE", cat_cache->zone_used(vram_zone_id::KV) / (1024.0 * 1024.0));
+        GGML_LOG_INFO("  %-12s %8.1f MB\n", "ONEDNN_ZONE",
+                      cat_cache->zone_used(vram_zone_id::ONEDNN) / (1024.0 * 1024.0));
+        GGML_LOG_INFO("  %-12s %8.1f MB\n", "RUNTIME_ZONE",
+                      cat_cache->zone_used(vram_zone_id::RUNTIME) / (1024.0 * 1024.0));
+        GGML_LOG_INFO("  %-12s %8.1f MB\n", "SCRATCH_ZONE",
+                      cat_cache->zone_used(vram_zone_id::SCRATCH) / (1024.0 * 1024.0));
     }
-    // Show untagged delta (total - sum of categories)
+    // Legacy per-category counters removed — arena zones are the single source of truth.
     size_t cat_sum = 0;
-    for (int c = 0; c < static_cast<int>(runtime_category::COUNT); c++) {
-        cat_sum += g_runtime_cat_bytes[effective_device][c].load(std::memory_order_relaxed);
+    if (cat_cache && cat_cache->arena_active()) {
+        cat_sum = cat_cache->zone_used(vram_zone_id::KV) + cat_cache->zone_used(vram_zone_id::ONEDNN) +
+                  cat_cache->zone_used(vram_zone_id::RUNTIME) + cat_cache->zone_used(vram_zone_id::SCRATCH);
     }
     if (rt > cat_sum + (1024 * 1024)) {  // >1 MB untagged
-        GGML_LOG_INFO("  %-12s %8.1f MB (tracked outside categories)\n", "UNTAGGED",
-                      (rt - cat_sum) / (1024.0f * 1024.0f));
+        GGML_LOG_INFO("  %-12s %8.1f MB (tracked outside zones)\n", "UNTAGGED", (rt - cat_sum) / (1024.0f * 1024.0f));
     }
 
     // Validate accounting consistency:
@@ -9666,16 +9588,10 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
         zone_reset(vram_zone_id::KV);
         zone_reset(vram_zone_id::RUNTIME);
 
-        // Reset runtime_bytes counters — they accumulate across contexts
-        // and would inflate the planner's reserved_bytes estimate.
-        int dev = ggml_sycl_get_device_id_from_queue(queue);
-        if (dev >= 0 && dev < GGML_SYCL_MAX_DEVICES) {
-            g_runtime_reserved_bytes[dev].store(0, std::memory_order_relaxed);
-            g_runtime_reserved_baseline[dev].store(0, std::memory_order_relaxed);
-            for (int c = 0; c < static_cast<int>(runtime_category::COUNT); ++c) {
-                g_runtime_cat_bytes[dev][c].store(0, std::memory_order_relaxed);
-            }
-        }
+        // Arena zones are the single source of truth for runtime tracking.
+        // zone_reset() above already zeroes zone_used() for KV and RUNTIME.
+        // Legacy global counters (g_runtime_reserved_bytes, g_runtime_cat_bytes)
+        // are no longer maintained — they were redundant with arena zones.
         return true;
     }
 

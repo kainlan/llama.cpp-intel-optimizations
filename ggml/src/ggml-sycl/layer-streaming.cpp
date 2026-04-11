@@ -143,7 +143,6 @@ void layer_stream_manager::shutdown() {
         if (buffers_[i]) {
             alloc_registry::instance().unregister_alloc(buffers_[i]);
             if (device_id_ >= 0 && !buffers_from_arena_) {
-                unified_cache_sub_runtime_bytes(device_id_, buffer_size_, runtime_category::STAGING);
             }
             if (!buffers_from_arena_) {
                 sycl::free(buffers_[i], ctx_);

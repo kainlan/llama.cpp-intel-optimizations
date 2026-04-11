@@ -1580,9 +1580,7 @@ static void moe_prestage_popular_experts() {
                     temp_freed += expert_bytes;  // Each temp buf = expert_bytes
                 }
             }
-            if (temp_freed > 0) {
-                ggml_sycl::unified_cache_sub_runtime_bytes(device, temp_freed);
-            }
+            (void) temp_freed;
         }
 
         auto   t1       = std::chrono::high_resolution_clock::now();
@@ -1624,8 +1622,6 @@ static void moe_prestage_popular_experts() {
     // double-count: reserved_ + used_ both consuming budget.
     for (int d = 0; d < GGML_SYCL_MAX_DEVICES; d++) {
         if (g_moe_expert_vram_reserve[d] > 0) {
-            ggml_sycl::unified_cache_sub_runtime_bytes(d, g_moe_expert_vram_reserve[d],
-                                                       ggml_sycl::runtime_category::EXPERT_CACHE);
             GGML_LOG_INFO("[MOE-PRESTAGE] Released device %d upfront VRAM reserve: %.1f MB\n", d,
                           g_moe_expert_vram_reserve[d] / (1024.0 * 1024.0));
             g_moe_expert_vram_reserve[d] = 0;
@@ -6018,7 +6014,6 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
         sycl::queue & q = ggml_sycl_get_device(ctx->device).default_queue();
         if (mgr.allocate_buffers(q)) {
             // Register streaming buffer allocation with unified cache budget
-            ggml_sycl::unified_cache_add_runtime_bytes(ctx->device, mgr.allocated_bytes());
             GGML_LOG_INFO(
                 "[SYCL-BUDGET] Layer streaming enabled%s: %d layers, 2 x %.1f MB buffers (%.1f MB budgeted)\n",
                 streaming_forced ? " (forced)" : "", mgr.n_layers(), mgr.max_layer_size() / (1024.0 * 1024.0),
@@ -6045,13 +6040,7 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
         model_size_exceeds_budget && desired_headroom > base_headroom && !cpu_offload_available ?
             (desired_headroom - base_headroom) :
             0;
-    size_t & prev_extra = g_tiered_headroom_reserve[ctx->device];
-    if (desired_extra > prev_extra) {
-        ggml_sycl::unified_cache_add_runtime_bytes(ctx->device, desired_extra - prev_extra);
-    } else if (desired_extra < prev_extra) {
-        ggml_sycl::unified_cache_sub_runtime_bytes(ctx->device, prev_extra - desired_extra);
-    }
-    prev_extra = desired_extra;
+    g_tiered_headroom_reserve[ctx->device] = desired_extra;
     if (desired_extra > 0) {
         GGML_LOG_INFO("[SYCL] Tiered headroom reserve: %.1f MB (base headroom %.1f MB, total %.1f MB)\n",
                       desired_extra / (1024.0 * 1024.0), base_headroom / (1024.0 * 1024.0),
@@ -10011,7 +10000,6 @@ static sycl::event ggml_sycl_fill_reordered_gpu(sycl::queue &                   
             bool from_arena = false;
             temp_vram       = arena_device_alloc(src_size, dev_id, queue, from_arena);
             if (temp_vram && !from_arena) {
-                ggml_sycl::unified_cache_add_runtime_bytes(dev_id, src_size, ggml_sycl::runtime_category::OTHER);
             }
         } catch (const sycl::exception & e) {
             GGML_LOG_ERROR("[GPU-REORDER] temp VRAM alloc failed (%zu bytes): %s\n", src_size, e.what());
@@ -11899,7 +11887,7 @@ static void ggml_sycl_preload_model_weights() {
 
         // Register MoE expert VRAM reserve AFTER cache creation.
         // Must happen here (not in set_tensor_inventory) because the unified cache
-        // absorbs pre-existing g_runtime_reserved_bytes into its baseline at creation
+        // absorbs pre-existing arena zone usage into its baseline at creation
         // time — reserves registered before the cache is created have no effect on
         // available_for_compute().  The cache is now created (by direct_stage
         // calls above), so this reserve will properly reduce the budget seen by KV tiering.
@@ -11930,8 +11918,6 @@ static void ggml_sycl_preload_model_weights() {
                 // Cap at 40% of device cache budget
                 size_t device_reserve = std::min(raw_reserve, device_budget * 40 / 100);
                 if (device_reserve > 0) {
-                    ggml_sycl::unified_cache_add_runtime_bytes(d, device_reserve,
-                                                               ggml_sycl::runtime_category::EXPERT_CACHE);
                     g_moe_expert_vram_reserve[d] = device_reserve;
                 }
             }
@@ -18298,7 +18284,6 @@ struct ggml_sycl_pool_host : public ggml_sycl_pool {
             ggml_sycl_buffer & b = buffer_pool[i];
             if (b.ptr != nullptr) {
                 ggml_sycl::alloc_registry::instance().unregister_alloc(b.ptr);
-                ggml_sycl::unified_cache_sub_runtime_host_bytes(b.size);
                 SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(b.ptr, *qptr)));
                 b.ptr = nullptr;
                 pool_size -= b.size;
@@ -18337,10 +18322,8 @@ struct ggml_sycl_pool_host : public ggml_sycl_pool {
             return ptr;
         }
         void * ptr;
-        ggml_sycl::unified_cache_add_runtime_host_bytes(rounded_size);
         ptr = ggml_sycl_malloc_host(rounded_size, *qptr, "pool_host");
         if (!ptr) {
-            ggml_sycl::unified_cache_sub_runtime_host_bytes(rounded_size);
             GGML_LOG_ERROR("%s: can't allocate %lu Bytes of memory on host\n", __func__, rounded_size);
             return nullptr;
         }
@@ -18362,7 +18345,6 @@ struct ggml_sycl_pool_host : public ggml_sycl_pool {
             }
         }
         ggml_sycl::alloc_registry::instance().unregister_alloc(ptr);
-        ggml_sycl::unified_cache_sub_runtime_host_bytes(size);
         SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(ptr, *qptr)));
         pool_size -= size;
     }
@@ -21781,7 +21763,6 @@ static void ggml_sycl_tp_clear_column_parallel_outputs(ggml_backend_sycl_context
         if (kv.second.alloc.ptr != nullptr) {
             (void) ggml_sycl::unified_free(kv.second.alloc);
         } else if (kv.second.ptr != nullptr) {
-            ggml_sycl::unified_cache_sub_runtime_bytes(device, kv.second.size);
             sycl::free(kv.second.ptr, *stream);
         }
     }
@@ -31293,9 +31274,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
             // This triggers weight eviction if needed, freeing physical VRAM
             // so the pool allocator inside ggml_sycl_op_mul_mat_sycl can succeed.
             const size_t f16_bytes = src0->ne[0] * src0->ne[1] * sizeof(sycl::half);
-            ggml_sycl::unified_cache_add_runtime_bytes(ctx.device, f16_bytes, ggml_sycl::runtime_category::STAGING);
             ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_sycl, GGML_LAYOUT_AOS);
-            ggml_sycl::unified_cache_sub_runtime_bytes(ctx.device, f16_bytes, ggml_sycl::runtime_category::STAGING);
             return;
         }
         GGML_LOG_ERROR("[MUL_MAT] No eligible kernel variant for %s (type=%d)\n", src0->name ? src0->name : "?",

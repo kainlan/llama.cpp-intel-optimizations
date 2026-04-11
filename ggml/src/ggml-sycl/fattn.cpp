@@ -97,18 +97,12 @@ struct v2_auto_buffers {
 
     ~v2_auto_buffers() {
         if (block_table && alloc_queue) {
-            ggml_sycl::unified_cache_sub_runtime_bytes(ggml_sycl_get_device_id_from_queue(*alloc_queue),
-                                                       block_table_capacity * sizeof(int32_t));
             sycl::free(block_table, *alloc_queue);
         }
         if (seq_lens && alloc_queue) {
-            ggml_sycl::unified_cache_sub_runtime_bytes(ggml_sycl_get_device_id_from_queue(*alloc_queue),
-                                                       seq_lens_capacity * sizeof(int32_t));
             sycl::free(seq_lens, *alloc_queue);
         }
         if (temp_buf && alloc_queue) {
-            ggml_sycl::unified_cache_sub_runtime_bytes(ggml_sycl_get_device_id_from_queue(*alloc_queue),
-                                                       temp_buf_capacity);
             sycl::free(temp_buf, *alloc_queue);
         }
     }
@@ -158,7 +152,6 @@ struct tl_seq_id_buffers {
     void free_ptr(int32_t *& ptr, size_t bytes) {
         if (ptr && alloc_queue) {
             sycl::free(ptr, *alloc_queue);
-            ggml_sycl::unified_cache_sub_runtime_bytes(ggml_sycl_get_device_id_from_queue(*alloc_queue), bytes);
             ptr = nullptr;
             g_seq_id_buffer_allocs.fetch_sub(1);
         }
@@ -311,8 +304,6 @@ void ggml_sycl_v2_pre_allocate_buffers(ggml_backend_sycl_context & ctx, ggml_cgr
     if (!g_v2_auto.block_table || g_v2_auto.alloc_queue != ctx.stream() ||
         g_v2_auto.block_table_capacity < (size_t) block_table_size) {
         if (g_v2_auto.block_table && g_v2_auto.alloc_queue) {
-            ggml_sycl::unified_cache_sub_runtime_bytes(ggml_sycl_get_device_id_from_queue(*g_v2_auto.alloc_queue),
-                                                       g_v2_auto.block_table_capacity * sizeof(int32_t));
             sycl::free(g_v2_auto.block_table, *g_v2_auto.alloc_queue);
         }
         g_v2_auto.block_table =
@@ -325,8 +316,6 @@ void ggml_sycl_v2_pre_allocate_buffers(ggml_backend_sycl_context & ctx, ggml_cgr
     if (!g_v2_auto.seq_lens || g_v2_auto.alloc_queue != ctx.stream() ||
         g_v2_auto.seq_lens_capacity < (size_t) seq_lens_size) {
         if (g_v2_auto.seq_lens && g_v2_auto.alloc_queue) {
-            ggml_sycl::unified_cache_sub_runtime_bytes(ggml_sycl_get_device_id_from_queue(*g_v2_auto.alloc_queue),
-                                                       g_v2_auto.seq_lens_capacity * sizeof(int32_t));
             sycl::free(g_v2_auto.seq_lens, *g_v2_auto.alloc_queue);
         }
         g_v2_auto.seq_lens = ggml_sycl_malloc_device_t<int32_t>(seq_lens_size, *ctx.stream(), "fattn_seq_lens");
@@ -337,8 +326,6 @@ void ggml_sycl_v2_pre_allocate_buffers(ggml_backend_sycl_context & ctx, ggml_cgr
     // Pre-allocate temp buffer if needed
     if (!g_v2_auto.temp_buf || g_v2_auto.alloc_queue != ctx.stream() || g_v2_auto.temp_buf_capacity < temp_size) {
         if (g_v2_auto.temp_buf && g_v2_auto.alloc_queue) {
-            ggml_sycl::unified_cache_sub_runtime_bytes(ggml_sycl_get_device_id_from_queue(*g_v2_auto.alloc_queue),
-                                                       g_v2_auto.temp_buf_capacity);
             sycl::free(g_v2_auto.temp_buf, *g_v2_auto.alloc_queue);
         }
         g_v2_auto.temp_buf          = ggml_sycl_malloc_device_t<uint8_t>(temp_size, *ctx.stream(), "fattn_temp");
@@ -1132,7 +1119,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
         params.block_table        = (const int32_t *) ggml_sycl_get_data_ptr(block_table, device);
         params.seq_lens           = (const int32_t *) ggml_sycl_get_data_ptr(seq_lens_tensor, device);
 
-#if 0  // Debug output disabled
+#if 0  // Debug output disabled \
        // Print only once to avoid flooding output
         static bool paged_attn_info_shown = false;
         if (!paged_attn_info_shown) {
@@ -1284,9 +1271,6 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
 
             if (needs_realloc_block) {
                 if (g_v2_auto.block_table && g_v2_auto.alloc_queue) {
-                    ggml_sycl::unified_cache_sub_runtime_bytes(
-                        ggml_sycl_get_device_id_from_queue(*g_v2_auto.alloc_queue),
-                        g_v2_auto.block_table_capacity * sizeof(int32_t));
                     sycl::free(g_v2_auto.block_table, *g_v2_auto.alloc_queue);
                 }
                 g_v2_auto.block_table =
@@ -1295,9 +1279,6 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
             }
             if (needs_realloc_seq) {
                 if (g_v2_auto.seq_lens && g_v2_auto.alloc_queue) {
-                    ggml_sycl::unified_cache_sub_runtime_bytes(
-                        ggml_sycl_get_device_id_from_queue(*g_v2_auto.alloc_queue),
-                        g_v2_auto.seq_lens_capacity * sizeof(int32_t));
                     sycl::free(g_v2_auto.seq_lens, *g_v2_auto.alloc_queue);
                 }
                 g_v2_auto.seq_lens = ggml_sycl_malloc_device_t<int32_t>(seq_lens_size, *ctx.stream(), "fattn_seq_lens");
@@ -1339,8 +1320,6 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
                                   (g_v2_auto.alloc_queue != ctx.stream() || g_v2_auto.temp_buf_capacity < temp_size);
         if (needs_realloc_temp) {
             if (g_v2_auto.temp_buf && g_v2_auto.alloc_queue) {
-                ggml_sycl::unified_cache_sub_runtime_bytes(ggml_sycl_get_device_id_from_queue(*g_v2_auto.alloc_queue),
-                                                           g_v2_auto.temp_buf_capacity);
                 sycl::free(g_v2_auto.temp_buf, *g_v2_auto.alloc_queue);
             }
             g_v2_auto.temp_buf          = ggml_sycl_malloc_device_t<uint8_t>(temp_size, *ctx.stream(), "fattn_temp");

@@ -3238,7 +3238,6 @@ static bool ggml_sycl_moe_ensure_compact_storage(ggml_backend_sycl_context & ctx
             return false;
         }
         if (extra->moe_expert_ptrs_compact_device[ctx.device] != nullptr) {
-            ggml_sycl::unified_cache_sub_runtime_bytes(ctx.device, extra->moe_expert_ptrs_compact_capacity[ctx.device]);
             sycl::free(extra->moe_expert_ptrs_compact_device[ctx.device], *stream);
             extra->moe_expert_ptrs_compact_device[ctx.device]   = nullptr;
             extra->moe_expert_ptrs_compact_capacity[ctx.device] = 0;
