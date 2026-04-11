@@ -638,7 +638,8 @@ sycl::queue * ggml_sycl_get_cpu_queue();
 struct cpu_dispatch_buffers {
     std::vector<uint8_t> src1_q;      // Quantization buffer: max M * max_q_row_size
     std::vector<float>   accs;        // Accumulator buffer: reused as __m256* via reinterpret_cast
-    std::vector<float>   scratch_nk; // Weight dequantization buffer: max N * K
+    std::vector<float>   scratch_nk;  // Weight dequantization buffer: max N * K
+
     // Note: accs is reinterpreted as __m256 array. Since we only use _mm256_setzero_ps()
     // and array indexing (no aligned load/store), alignment is not critical.
 
@@ -3477,6 +3478,12 @@ struct ggml_backend_sycl_context {
     // Allocates on first call, grows if needed (rare after warmup).
     // Returns the staging pointer, or nullptr on allocation failure.
     void * ensure_mmvq_host_staging(size_t needed, sycl::queue & queue);
+
+    // Ensure readback_staging is at least `needed` bytes.
+    // Persistent host-pinned buffer for D2H readback (get_tensor, logits).
+    // Avoids per-call scoped_unified_alloc overhead on the inference path.
+    // Grows if needed; stabilizes after warmup.
+    void * ensure_readback_staging(size_t needed, sycl::queue & queue);
 
     // Reusable device buffer for BLAS fallback (MXFP4 -> F16 dequantization).
     // Allocated lazily on first BLAS fallback, registered with unified cache budget.

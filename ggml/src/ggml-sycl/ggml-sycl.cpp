@@ -9380,6 +9380,8 @@ struct ggml_backend_sycl_buffer_context {
     bool                    from_scratch_pool = false;  // Scratch pool-allocated: bump allocator, pool resets on reuse
     bool                    from_kv_zone      = false;  // KV zone-allocated: compute buffer overflow from RUNTIME
     ggml_sycl::alloc_handle managed_alloc{};
+    // Back-pointer to main SYCL context for accessing persistent staging buffers
+    ggml_backend_sycl_context *                                    sycl_ctx = nullptr;
     // Track both tensor and extra so we can null tensor->extra on reset
     std::vector<std::pair<ggml_tensor *, ggml_tensor_extra_gpu *>> tensor_extras;
     // TP compute buffer support: per-device pointers
@@ -9389,11 +9391,16 @@ struct ggml_backend_sycl_buffer_context {
     queue_ptr                                                      tp_streams[GGML_SYCL_MAX_DEVICES]  = { nullptr };
     ggml_sycl::alloc_handle                                        tp_allocs[GGML_SYCL_MAX_DEVICES]   = {};
 
-    ggml_backend_sycl_buffer_context(int device, void * dev_ptr, queue_ptr stream, size_t size_bytes) :
+    ggml_backend_sycl_buffer_context(int                         device,
+                                     void *                      dev_ptr,
+                                     queue_ptr                   stream,
+                                     size_t                      size_bytes,
+                                     ggml_backend_sycl_context * sycl_ctx_ptr = nullptr) :
         device(device),
         dev_ptr(dev_ptr),
         stream(stream),
         size_bytes(size_bytes),
+        sycl_ctx(sycl_ctx_ptr),
         supports_soa_reorder(ggml_sycl_info().devices[device].supports_soa_reorder) {
         check_allow_gpu_index(device);
         name = (GGML_SYCL_NAME + std::to_string(device));
@@ -12870,11 +12877,12 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
     std::exit(1);
 }
-static bool             ggml_sycl_readback_via_shared_kernel(sycl::queue & q,
-                                                             const void *  src_ptr,
-                                                             void *        dst_host,
-                                                             size_t        size,
-                                                             const char *  tag);
+static bool             ggml_sycl_readback_via_shared_kernel(sycl::queue &               q,
+                                                             const void *                src_ptr,
+                                                             void *                      dst_host,
+                                                             size_t                      size,
+                                                             const char *                tag,
+                                                             ggml_backend_sycl_context * sycl_ctx = nullptr);
 static std::atomic<int> g_sycl_force_kernel_readback[GGML_SYCL_MAX_DEVICES]           = {};
 static std::atomic<int> g_sycl_lowmem_kernel_readback_notified[GGML_SYCL_MAX_DEVICES] = {};
 static inline void      ggml_sycl_enable_device_kernel_readback(int          device,
@@ -13029,7 +13037,8 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
             GGML_LOG_ERROR("[SYCL] buffer_get_tensor force-shared pre-wait failed (%zu bytes): %s\n", size, e.what());
         }
         sycl::queue & readback_q = stream;
-        if (ggml_sycl_readback_via_shared_kernel(readback_q, src_ptr, data, size, "buffer_get_tensor_force_shared")) {
+        if (ggml_sycl_readback_via_shared_kernel(readback_q, src_ptr, data, size, "buffer_get_tensor_force_shared",
+                                                 ctx->sycl_ctx)) {
             GGML_LOG_INFO("[SYCL] buffer_get_tensor force-shared readback succeeded (%zu bytes)\n", size);
             return;
         }
@@ -13045,17 +13054,23 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
         if (!is_oom_submit) {
             // Probe alternate queue to distinguish queue-state vs pointer/context issues.
             try {
-                sycl::queue &            readback_q = stream;
-                ggml_sycl::alloc_request req{};
-                req.queue                               = &readback_q;
-                req.device                              = ctx->device;
-                req.size                                = size;
-                req.intent.role                         = ggml_sycl::alloc_role::STAGING;
-                req.intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
-                req.intent.constraints.must_host_pinned = true;
-                req.intent.constraints.use_pinned_pool  = true;
-                ggml_sycl::scoped_unified_alloc fallback_alloc(req);
-                void *                          fallback_staging = fallback_alloc.get();
+                sycl::queue & readback_q       = stream;
+                void *        fallback_staging = nullptr;
+                if (ctx->sycl_ctx) {
+                    fallback_staging = ctx->sycl_ctx->ensure_readback_staging(size, readback_q);
+                }
+                if (!fallback_staging) {
+                    ggml_sycl::alloc_request req{};
+                    req.queue                               = &readback_q;
+                    req.device                              = ctx->device;
+                    req.size                                = size;
+                    req.intent.role                         = ggml_sycl::alloc_role::STAGING;
+                    req.intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
+                    req.intent.constraints.must_host_pinned = true;
+                    req.intent.constraints.use_pinned_pool  = true;
+                    ggml_sycl::scoped_unified_alloc fallback_alloc(req);
+                    fallback_staging = fallback_alloc.get();
+                }
                 if (fallback_staging) {
                     sycl::event ev = readback_q.memcpy(fallback_staging, src_ptr, size);
                     ev.wait();
@@ -13074,7 +13089,7 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
         try {
             sycl::queue & readback_q = stream;
             if (ggml_sycl_readback_via_shared_kernel(readback_q, src_ptr, data, size,
-                                                     "buffer_get_tensor_shared_fallback")) {
+                                                     "buffer_get_tensor_shared_fallback", ctx->sycl_ctx)) {
                 GGML_LOG_INFO("[SYCL] buffer_get_tensor shared-kernel fallback succeeded (%zu bytes)\n", size);
                 return;
             }
@@ -13090,11 +13105,12 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
     std::exit(1);
 }
 
-static bool ggml_sycl_readback_via_shared_kernel(sycl::queue & q,
-                                                 const void *  src_ptr,
-                                                 void *        dst_host,
-                                                 size_t        size,
-                                                 const char *  tag) {
+static bool ggml_sycl_readback_via_shared_kernel(sycl::queue &               q,
+                                                 const void *                src_ptr,
+                                                 void *                      dst_host,
+                                                 size_t                      size,
+                                                 const char *                tag,
+                                                 ggml_backend_sycl_context * sycl_ctx) {
     if (size == 0) {
         return true;
     }
@@ -13131,15 +13147,22 @@ static bool ggml_sycl_readback_via_shared_kernel(sycl::queue & q,
     }
 
     ggml_sycl::alloc_request req{};
-    req.queue                               = &exec_q;
-    req.device                              = ggml_sycl_get_device_id_from_queue(exec_q);
-    req.size                                = size;
-    req.intent.role                         = ggml_sycl::alloc_role::STAGING;
-    req.intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
-    req.intent.constraints.must_host_pinned = true;
-    req.intent.constraints.use_pinned_pool  = true;
-    ggml_sycl::scoped_unified_alloc host_alloc(req);
-    void *                          host_stage = host_alloc.get();
+    req.queue                                  = &exec_q;
+    req.device                                 = ggml_sycl_get_device_id_from_queue(exec_q);
+    req.size                                   = size;
+    req.intent.role                            = ggml_sycl::alloc_role::STAGING;
+    req.intent.category                        = ggml_sycl::runtime_category::HOST_COMPUTE;
+    req.intent.constraints.must_host_pinned    = true;
+    req.intent.constraints.use_pinned_pool     = true;
+    void *                          host_stage = nullptr;
+    ggml_sycl::scoped_unified_alloc host_alloc;
+    if (sycl_ctx) {
+        host_stage = sycl_ctx->ensure_readback_staging(size, exec_q);
+    }
+    if (!host_stage) {
+        host_alloc.allocate(req);
+        host_stage = host_alloc.get();
+    }
     if (!host_stage) {
         if (s_shared_fallback_trace) {
             GGML_LOG_ERROR("[SYCL] %s: shared-fallback host-stage allocation failed (%zu bytes)\n", tag, size);
@@ -13558,15 +13581,16 @@ enum ggml_sycl_mem_policy {
 
 // sycl buffer type
 struct ggml_backend_sycl_buffer_type_context {
-    int                  device;
-    std::string          name;
-    ggml_sycl_mem_type   mem_type              = GGML_SYCL_MEM_DEVICE;
-    ggml_sycl_mem_policy mem_policy            = GGML_SYCL_MEM_POLICY_STATIC;
-    bool                 use_pinned_pool       = false;
-    bool                 allow_shared_fallback = true;
-    size_t               max_size_override     = 0;
+    int                         device;
+    std::string                 name;
+    ggml_sycl_mem_type          mem_type              = GGML_SYCL_MEM_DEVICE;
+    ggml_sycl_mem_policy        mem_policy            = GGML_SYCL_MEM_POLICY_STATIC;
+    bool                        use_pinned_pool       = false;
+    bool                        allow_shared_fallback = true;
+    size_t                      max_size_override     = 0;
     // each buffer type has its own stream
-    queue_ptr            stream                = nullptr;
+    queue_ptr                   stream                = nullptr;
+    ggml_backend_sycl_context * sycl_ctx              = nullptr;
 };
 
 static const char * ggml_backend_sycl_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
@@ -13651,8 +13675,8 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                 // Route through RUNTIME zone
                 void * ptr = cache->zone_alloc(ggml_sycl::vram_zone_id::RUNTIME, size);
                 if (ptr) {
-                    ggml_backend_sycl_buffer_context * ctx =
-                        new ggml_backend_sycl_buffer_context(buft_ctx->device, ptr, buft_ctx->stream, size);
+                    ggml_backend_sycl_buffer_context * ctx = new ggml_backend_sycl_buffer_context(
+                        buft_ctx->device, ptr, buft_ctx->stream, size, buft_ctx->sycl_ctx);
                     ctx->from_arena = true;  // Don't sycl::free this
                     GGML_SYCL_DEBUG("[SYCL] Arena RUNTIME zone alloc: %.1f MB (%s)\n", size / (1024.0 * 1024.0),
                                     buft_ctx->name.c_str());
@@ -13668,8 +13692,8 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                 if (alloc_role == ggml_sycl::alloc_role::COMPUTE) {
                     ptr = cache->zone_alloc(ggml_sycl::vram_zone_id::KV, size);
                     if (ptr) {
-                        ggml_backend_sycl_buffer_context * ctx =
-                            new ggml_backend_sycl_buffer_context(buft_ctx->device, ptr, buft_ctx->stream, size);
+                        ggml_backend_sycl_buffer_context * ctx = new ggml_backend_sycl_buffer_context(
+                            buft_ctx->device, ptr, buft_ctx->stream, size, buft_ctx->sycl_ctx);
                         ctx->from_arena   = true;
                         ctx->from_kv_zone = true;
                         GGML_LOG_INFO(
@@ -13680,8 +13704,8 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                     // KV zone also full — try scratch pool as last resort
                     ptr = cache->get_scratch(size);
                     if (ptr) {
-                        ggml_backend_sycl_buffer_context * ctx =
-                            new ggml_backend_sycl_buffer_context(buft_ctx->device, ptr, buft_ctx->stream, size);
+                        ggml_backend_sycl_buffer_context * ctx = new ggml_backend_sycl_buffer_context(
+                            buft_ctx->device, ptr, buft_ctx->stream, size, buft_ctx->sycl_ctx);
                         ctx->from_arena        = true;
                         ctx->from_scratch_pool = true;
                         GGML_LOG_INFO("[SYCL] Arena RUNTIME+KV full, using scratch pool: %.1f MB (%s)\n",
@@ -13692,8 +13716,8 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                     cache->reset_scratch_pool();
                     ptr = cache->get_scratch(size);
                     if (ptr) {
-                        ggml_backend_sycl_buffer_context * ctx =
-                            new ggml_backend_sycl_buffer_context(buft_ctx->device, ptr, buft_ctx->stream, size);
+                        ggml_backend_sycl_buffer_context * ctx = new ggml_backend_sycl_buffer_context(
+                            buft_ctx->device, ptr, buft_ctx->stream, size, buft_ctx->sycl_ctx);
                         ctx->from_arena        = true;
                         ctx->from_scratch_pool = true;
                         GGML_LOG_INFO("[SYCL] Scratch pool reset+retry: %.1f MB (%s)\n", size / (1024.0 * 1024.0),
@@ -13841,7 +13865,7 @@ alloc_succeeded:
         }
     }
     ggml_backend_sycl_buffer_context * ctx =
-        new ggml_backend_sycl_buffer_context(buft_ctx->device, dev_ptr, ctx_stream, size);
+        new ggml_backend_sycl_buffer_context(buft_ctx->device, dev_ptr, ctx_stream, size, buft_ctx->sycl_ctx);
     ctx->managed_alloc = main_alloc;
     // In TP mode, allocate device memory on ALL TP devices for compute buffers
 
@@ -14023,7 +14047,8 @@ ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(int device) {
                 /* .context  = */
                 new ggml_backend_sycl_buffer_type_context{ i, GGML_SYCL_NAME + std::to_string(i), GGML_SYCL_MEM_DEVICE,
 
-                                                          GGML_SYCL_MEM_POLICY_STATIC, false, true, 0, stream },
+                                                          GGML_SYCL_MEM_POLICY_STATIC, false, true, 0, stream,
+                                                          nullptr },
             };
         }
 
@@ -14052,7 +14077,7 @@ static ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(ggml_backend_syc
                 /* .context  = */
                 new ggml_backend_sycl_buffer_type_context{ i, GGML_SYCL_NAME + std::to_string(i), GGML_SYCL_MEM_DEVICE,
                                                           GGML_SYCL_MEM_POLICY_STATIC, false, true, 0,
-                                                          ctx->stream(i, 0) },
+                                                          ctx->stream(i, 0), ctx },
             };
         }
         ggml_backend_sycl_buffer_type_initialized = true;
@@ -17539,7 +17564,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_compute_buffer_alloc(ggml_ba
                         size);
 
         ggml_backend_sycl_buffer_context * ctx =
-            new ggml_backend_sycl_buffer_context(primary_device, shared_ptr, primary_stream, size);
+            new ggml_backend_sycl_buffer_context(primary_device, shared_ptr, primary_stream, size, nullptr);
         ctx->managed_alloc        = host_alloc;
         ctx->is_tp_compute_buffer = true;
         // In multi-process mode, we only have ONE device visible per process
@@ -17615,7 +17640,7 @@ ggml_backend_buffer_type_t ggml_backend_sycl_host_compute_buffer_type(int device
                 /* .context  = */
                 new ggml_backend_sycl_buffer_type_context{ i, GGML_SYCL_NAME "_Compute" + std::to_string(i),
                                                           GGML_SYCL_MEM_DEVICE, GGML_SYCL_MEM_POLICY_STATIC, false,
-                                                          true, 0, stream },
+                                                          true, 0, stream, nullptr },
             };
         }
         initialized = true;
@@ -17674,7 +17699,7 @@ ggml_backend_buffer_type_t ggml_backend_sycl_cpu_offload_compute_buffer_type(int
                 /* .context  = */
                 new ggml_backend_sycl_buffer_type_context{ i, GGML_SYCL_NAME "_CpuOffloadCompute" + std::to_string(i),
                                                           GGML_SYCL_MEM_HOST, GGML_SYCL_MEM_POLICY_STATIC, false, true,
-                                                          0, stream },
+                                                          0, stream, nullptr },
             };
         }
         initialized = true;
@@ -18448,6 +18473,34 @@ void * ggml_backend_sycl_context::ensure_mmvq_host_staging(size_t needed, sycl::
     mmvq_host_staging      = mmvq_host_staging_alloc.ptr;
     mmvq_host_staging_size = needed;
     return mmvq_host_staging;
+}
+
+void * ggml_backend_sycl_context::ensure_readback_staging(size_t needed, sycl::queue & queue) {
+    if (readback_staging && readback_staging_size >= needed) {
+        return readback_staging;
+    }
+    if (readback_staging_alloc.ptr) {
+        (void) ggml_sycl::unified_free(readback_staging_alloc);
+        readback_staging_alloc = {};
+    }
+    readback_staging      = nullptr;
+    readback_staging_size = 0;
+
+    ggml_sycl::alloc_request req{};
+    req.queue                               = &queue;
+    req.device                              = device;
+    req.size                                = needed;
+    req.intent.role                         = ggml_sycl::alloc_role::STAGING;
+    req.intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
+    req.intent.constraints.must_host_pinned = true;
+    req.intent.constraints.use_pinned_pool  = true;
+    if (!ggml_sycl::unified_alloc(req, &readback_staging_alloc) || readback_staging_alloc.ptr == nullptr) {
+        readback_staging_alloc = {};
+        return nullptr;
+    }
+    readback_staging      = readback_staging_alloc.ptr;
+    readback_staging_size = needed;
+    return readback_staging;
 }
 
 std::unique_ptr<ggml_sycl_pool> ggml_backend_sycl_context::new_pool_for_device(queue_ptr qptr, int device) {
