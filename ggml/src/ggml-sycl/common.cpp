@@ -1050,8 +1050,8 @@ void ggml_sycl_tp_cache_ffn_norm(int          layer,
         if (!ggml_sycl::unified_alloc(req, &entry.data_alloc)) {
             entry.data_alloc = {};
         }
-        entry.data      = entry.data_alloc.ptr;
-        int dev1        = g_sycl_tp_config.devices[1];
+        entry.data = entry.data_alloc.ptr;
+        int dev1   = g_sycl_tp_config.devices[1];
         ggml_sycl_set_device(dev1);
         queue_ptr stream1 = &ggml_sycl_get_device(dev1).default_queue();
         req.queue         = stream1;
@@ -1156,10 +1156,13 @@ void ggml_sycl_tp_clear_ffn_norm_cache(int layer) {
 
     auto it = g_tp_ffn_norm_cache.find(layer);
     if (it != g_tp_ffn_norm_cache.end()) {
-        // Free device memory (caller should ensure correct device is set)
-        if (it->second.data != nullptr) {
-            // Note: we don't free here to avoid device issues, just clear entry
-            // Memory will be reused on next cache
+        // Free device 0 allocation
+        if (it->second.data_alloc.ptr != nullptr) {
+            ggml_sycl::unified_free(it->second.data_alloc);
+        }
+        // Free device 1 allocation
+        if (it->second.data_dev1_alloc.ptr != nullptr) {
+            ggml_sycl::unified_free(it->second.data_dev1_alloc);
         }
         g_tp_ffn_norm_cache.erase(it);
     }

@@ -459,7 +459,10 @@ bool pinned_chunk_pool::grow_zone(host_zone_id zone, size_t additional_bytes) {
         return false;
     }
 
-    // Phase gate: reject zone growth during inference (PP/TG)
+    // Phase gate: early rejection without holding mutex.
+    // Note: this is a best-effort check — the phase could transition between
+    // this check and the actual grow() call below. grow_into() has its own
+    // GGML_SYCL_HOST_ALLOC_PHASE_GATE guard as defense-in-depth.
     const auto phase = ggml_sycl::offload_stats_phase();
     if (phase == ggml_sycl::offload_phase::PP || phase == ggml_sycl::offload_phase::TG) {
         GGML_LOG_WARN("[HOST-POOL] grow_zone(%s, %.1f MB) rejected during %s phase\n", host_zone_name(zone),
@@ -500,9 +503,8 @@ bool pinned_chunk_pool::grow_zone(host_zone_id zone, size_t additional_bytes) {
         return false;
     }
     if (new_chunks_added < chunks_needed) {
-        GGML_LOG_WARN(
-            "[HOST-POOL] grow_zone: partial growth %zu/%zu chunks for zone %zu\n",
-            new_chunks_added, chunks_needed, zi);
+        GGML_LOG_WARN("[HOST-POOL] grow_zone: partial growth %zu/%zu chunks for zone %zu\n", new_chunks_added,
+                      chunks_needed, zi);
     }
 
     // Extend the zone's span to include the new chunks
@@ -647,7 +649,7 @@ bool pinned_chunk_pool::grow_into(std::vector<chunk> & chunks, size_t min_size, 
     int                     mode = s_phase_gate.load(std::memory_order_relaxed);
     if (mode < 0) {
         const char * env = std::getenv("GGML_SYCL_HOST_ALLOC_PHASE_GATE");
-        mode             = (env != nullptr) ? std::atoi(env) : 0;
+        mode             = (env != nullptr) ? std::atoi(env) : 1;
         s_phase_gate.store(mode, std::memory_order_relaxed);
     }
     if (mode > 0) {

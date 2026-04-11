@@ -5309,7 +5309,7 @@ static void ggml_sycl_release_xmx_aos_staging(ggml_tensor_extra_gpu * extra, int
     if (!extra || !stream || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
         return;
     }
-    void * staging = extra->xmx_mxfp4_tiled_aos_staging[device];
+    void * staging = extra->xmx_staging_ptr(device);
     if (staging) {
         if (extra->xmx_mxfp4_tiled_aos_staging_alloc[device].ptr) {
             ggml_sycl::unified_free(extra->xmx_mxfp4_tiled_aos_staging_alloc[device]);
@@ -12690,7 +12690,7 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     // NOTE: If we have pre-converted XMX tiled weights, skip the upload path.
     // The tiled buffer is stored in extra->xmx_mxfp4_tiled[device] and will be
     // used directly by cache layout queries.
-    bool has_preconverted_tiled = (extra && extra->xmx_mxfp4_tiled[ctx->device] != nullptr);
+    bool has_preconverted_tiled = (extra && extra->xmx_tiled_ptr(ctx->device) != nullptr);
 
     // === Direct upload path (cache miss or cache disabled) ===
     if (has_preconverted_tiled) {
@@ -12702,14 +12702,14 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
             free(reorder_buf_raw ? reorder_buf_raw : reorder_buf);
         }
         extra->layout.mode        = GGML_LAYOUT_XMX_TILED;
-        extra->layout.data_ptr    = extra->xmx_mxfp4_tiled[ctx->device];
+        extra->layout.data_ptr    = extra->xmx_tiled_ptr(ctx->device);
         extra->layout.size        = extra->xmx_mxfp4_tiled_size;
         extra->layout.owns_memory = extra->xmx_mxfp4_tiled_owned[ctx->device];
         extra->layout.device_id   = ctx->device;
         extra->layout.qtype       = tensor->type;
         extra->layout.n_elements  = ggml_nelements(tensor);
         extra->layout.n_experts   = tensor->ne[2] > 0 ? tensor->ne[2] : 1;
-    } else if (reorder_buf && !(extra && extra->xmx_mxfp4_tiled[ctx->device])) {
+    } else if (reorder_buf && !(extra && extra->xmx_tiled_ptr(ctx->device))) {
         void *       dst_ptr        = (char *) tensor->data + offset;
         const size_t copy_size      = reorder_size;
         const size_t max_chunk_size = 256 * 1024 * 1024;
@@ -12732,7 +12732,7 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
         } else {
             free(reorder_buf_raw ? reorder_buf_raw : reorder_buf);
         }
-    } else if (extra && extra->xmx_mxfp4_tiled[ctx->device]) {
+    } else if (extra && extra->xmx_tiled_ptr(ctx->device)) {
         GGML_SYCL_DEBUG("[XMX] Skipping SoA upload for %s, using tiled buffer created in this call\n", tensor->name);
         if (reorder_from_pool && reorder_lease.valid) {
             (void) ggml_sycl::release_offload_buffer(reorder_lease);
@@ -25289,7 +25289,7 @@ static bool convert_tensor_layout(ggml_tensor * tensor,
 
         moe_xmx_fused::MXFPXMXLayoutInfo info        = moe_xmx_fused::MXFPXMXLayoutInfo::compute(out_dim, in_dim, cfg);
         const size_t                     tiled_bytes = info.total_bytes * static_cast<size_t>(n_experts);
-        if (extra->xmx_mxfp4_tiled[device_id] != nullptr) {
+        if (extra->xmx_tiled_ptr(device_id) != nullptr) {
             if (!extra->xmx_mxfp4_tiled_conversion_complete[device_id]) {
                 extra->xmx_mxfp4_tiled_conversion_evt[device_id].wait();
                 extra->xmx_mxfp4_tiled_conversion_complete[device_id] = true;
@@ -25297,7 +25297,7 @@ static bool convert_tensor_layout(ggml_tensor * tensor,
             }
             layout.mode = GGML_LAYOUT_XMX_TILED;
 
-            layout.data_ptr    = extra->xmx_mxfp4_tiled[device_id];
+            layout.data_ptr    = extra->xmx_tiled_ptr(device_id);
             layout.size        = tiled_bytes;
             layout.owns_memory = extra->xmx_mxfp4_tiled_owned[device_id];
             layout.device_id   = device_id;
@@ -25352,7 +25352,7 @@ static bool convert_tensor_layout(ggml_tensor * tensor,
         uint8_t *              host_staging      = nullptr;  // For non-device source
 
         if (aos_needs_staging) {
-            device_staging = static_cast<uint8_t *>(extra->xmx_mxfp4_tiled_aos_staging[device_id]);
+            device_staging = static_cast<uint8_t *>(extra->xmx_staging_ptr(device_id));
             if (device_staging && extra->xmx_mxfp4_tiled_aos_staging_size[device_id] < aos_expert_size) {
                 if (extra->xmx_mxfp4_tiled_aos_staging_alloc[device_id].ptr) {
                     ggml_sycl::unified_free(extra->xmx_mxfp4_tiled_aos_staging_alloc[device_id]);
@@ -25911,7 +25911,7 @@ static const void * const * moe_fusion_ensure_gpu0_ptrs(ggml_backend_sycl_contex
 
     // Ensure device-side table is allocated (uses pre-allocated if available)
     ggml_sycl_ensure_moe_ptr_table(extra, device, static_cast<int>(n_experts), q, table_index);
-    if (!extra->moe_expert_ptrs_device[device]) {
+    if (!extra->moe_ptrs_ptr(device)) {
         return nullptr;
     }
 
@@ -25939,9 +25939,9 @@ static const void * const * moe_fusion_ensure_gpu0_ptrs(ggml_backend_sycl_contex
     }
 
     // H2D copy of the pointer table
-    q.memcpy(extra->moe_expert_ptrs_device[device], host_ptrs.data(), host_ptrs.size() * sizeof(void *));
+    q.memcpy(extra->moe_ptrs_ptr(device), host_ptrs.data(), host_ptrs.size() * sizeof(void *));
 
-    return static_cast<const void * const *>(extra->moe_expert_ptrs_device[device]);
+    return static_cast<const void * const *>(extra->moe_ptrs_ptr(device));
 }
 
 static void ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,
@@ -25957,14 +25957,14 @@ static void ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,
     if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
         return;
     }
-    if (extra->moe_expert_ptrs_device[device] != nullptr && extra->moe_expert_ptrs_size[device] == bytes) {
+    if (extra->moe_ptrs_ptr(device) != nullptr && extra->moe_expert_ptrs_size[device] == bytes) {
         if (extra->moe_expert_ptrs_host[device].size() != count) {
             extra->moe_expert_ptrs_host[device].assign(count, nullptr);
         }
         return;
     }
     // Free old buffer (only if it was runtime-allocated, not pre-allocated)
-    if (extra->moe_expert_ptrs_device[device] != nullptr) {
+    if (extra->moe_ptrs_ptr(device) != nullptr) {
         if (!extra->moe_expert_ptrs_from_prealloc[device]) {
             if (extra->moe_expert_ptrs_alloc[device].ptr) {
                 (void) ggml_sycl::unified_free(extra->moe_expert_ptrs_alloc[device]);
@@ -26423,7 +26423,7 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
     if (!skip_device_copy) {
         ggml_sycl_ensure_moe_ptr_table(extra, device, n_experts, *stream, tbl_idx);
         GGML_SYCL_DEBUG("[MOE-PTR] ensure_moe_ptr_table done\n");
-        if (!extra->moe_expert_ptrs_device[device] ||
+        if (!extra->moe_ptrs_ptr(device) ||
             extra->moe_expert_ptrs_host[device].size() != static_cast<size_t>(n_experts)) {
             return false;
         }
@@ -26488,8 +26488,8 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
                             // this cache already chained fill events into its table_deps
                             // and submitted the ptr-table H2D on the same in-order stream.
                             // Subsequent UP/DOWN sub-ops are implicitly ordered after GATE.
-                            if (!skip_device_copy && extra->moe_expert_ptrs_device[device] != nullptr) {
-                                sycl::event ev = stream->memcpy(extra->moe_expert_ptrs_device[device], host_ptrs.data(),
+                            if (!skip_device_copy && extra->moe_ptrs_ptr(device) != nullptr) {
+                                sycl::event ev = stream->memcpy(extra->moe_ptrs_ptr(device), host_ptrs.data(),
                                                                 host_ptrs.size() * sizeof(void *));
                                 if (out_event) {
                                     *out_event = ev;
@@ -27015,20 +27015,18 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
         ggml_sycl_update_moe_hotset(cache, src0, extra, ids_host, n_experts, expert_layout_bytes, layout, layer_id,
                                     ctx.moe_layer_count);
     }
-    if (!skip_device_copy && extra->moe_expert_ptrs_device[device] != nullptr) {
+    if (!skip_device_copy && extra->moe_ptrs_ptr(device) != nullptr) {
         sycl::event table_event;
 
         // BCS/DMA queues are drained at the top of ggml_sycl_mul_mat_id, so
         // cross-queue event deps in table_deps are already satisfied.
         // Use depends_on for in-queue ordering of any remaining CCS events.
         if (!table_deps.empty()) {
-            table_event =
-                stream->memcpy(extra->moe_expert_ptrs_device[device], extra->moe_expert_ptrs_host[device].data(),
-                               extra->moe_expert_ptrs_host[device].size() * sizeof(void *), table_deps);
+            table_event = stream->memcpy(extra->moe_ptrs_ptr(device), extra->moe_expert_ptrs_host[device].data(),
+                                         extra->moe_expert_ptrs_host[device].size() * sizeof(void *), table_deps);
         } else {
-            table_event =
-                stream->memcpy(extra->moe_expert_ptrs_device[device], extra->moe_expert_ptrs_host[device].data(),
-                               extra->moe_expert_ptrs_host[device].size() * sizeof(void *));
+            table_event = stream->memcpy(extra->moe_ptrs_ptr(device), extra->moe_expert_ptrs_host[device].data(),
+                                         extra->moe_expert_ptrs_host[device].size() * sizeof(void *));
         }
         if (out_event) {
             *out_event = table_event;
@@ -27291,7 +27289,7 @@ static bool graph_preload_moe_experts(ggml_backend_sycl_context & ctx, ggml_cgra
         }
         sycl::event table_event;
         const bool  expect_table_event =
-            extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES && extra->moe_expert_ptrs_device[ctx.device];
+            extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES && extra->moe_ptrs_ptr(ctx.device);
 
         if (!ggml_sycl_update_moe_ptr_table(ctx, src0, ids, layout, &table_event, allow_all_experts, ids_override,
                                             /*skip_device_copy=*/false,
@@ -32061,7 +32059,7 @@ static bool try_xmx_sorted_moe(ggml_backend_sycl_context & ctx,
             expert_ptrs_host = src0_extra->moe_expert_ptrs_host[ctx.device].data();
         }
         if (src0_extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES) {
-            expert_ptrs_device = static_cast<const void * const *>(src0_extra->moe_expert_ptrs_device[ctx.device]);
+            expert_ptrs_device = static_cast<const void * const *>(src0_extra->moe_ptrs_ptr(ctx.device));
         }
         if (g_ggml_sycl_graph_recording) {
             if (!expert_ptrs_device || !expert_ptrs_host) {
@@ -34877,12 +34875,12 @@ cpu_fallback_fast:
                             host_ptrs[e] = s_probe_dev;
                         }
                         stream
-                            ->memcpy(probe_src0_extra->moe_expert_ptrs_device[ctx.device], host_ptrs.data(),
+                            ->memcpy(probe_src0_extra->moe_ptrs_ptr(ctx.device), host_ptrs.data(),
                                      host_ptrs.size() * sizeof(void *))
                             .wait();
 
                         const void * const * expert_ptrs_dev =
-                            static_cast<const void * const *>(probe_src0_extra->moe_expert_ptrs_device[ctx.device]);
+                            static_cast<const void * const *>(probe_src0_extra->moe_ptrs_ptr(ctx.device));
 
                         // Dispatch GPU MMVQ with timing
                         auto t_dispatch_0 = hrc_p::now();
@@ -36789,7 +36787,7 @@ cpu_fallback_fast:
                 // Get device pointer table
                 const void * const * expert_ptrs_dev = nullptr;
                 if (src0_extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES) {
-                    expert_ptrs_dev = static_cast<const void * const *>(src0_extra->moe_expert_ptrs_device[ctx.device]);
+                    expert_ptrs_dev = static_cast<const void * const *>(src0_extra->moe_ptrs_ptr(ctx.device));
                 }
 
                 bool batched_ok = false;
@@ -37073,7 +37071,7 @@ cpu_fallback_fast:
                 // Get device pointer table from extra
                 const void * const * expert_ptrs_dev = nullptr;
                 if (src0_extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES) {
-                    expert_ptrs_dev = static_cast<const void * const *>(src0_extra->moe_expert_ptrs_device[ctx.device]);
+                    expert_ptrs_dev = static_cast<const void * const *>(src0_extra->moe_ptrs_ptr(ctx.device));
                 }
 
                 if (expert_ptrs_dev) {

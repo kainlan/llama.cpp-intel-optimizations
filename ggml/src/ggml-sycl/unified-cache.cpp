@@ -10268,6 +10268,9 @@ static void populate_host_zone_sizing(placement_plan &                          
     {
         constexpr size_t k_dma_pipeline_depth = 2;  // Double-buffer (matches resolve_dma_defaults)
         plan.dma_staging_pool_bytes           = plan.max_tensor_bytes * k_dma_pipeline_depth;
+        GGML_LOG_INFO("[SYCL-PLAN] DMA staging pool: %.1f MB (%zu x max_tensor %.1f MB)\n",
+                      plan.dma_staging_pool_bytes / (1024.0 * 1024.0), k_dma_pipeline_depth,
+                      plan.max_tensor_bytes / (1024.0 * 1024.0));
     }
 
     // 8. oneDNN scratchpad: ONEDNN zone workspace for weight reorder + activation buffer.
