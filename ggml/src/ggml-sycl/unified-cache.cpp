@@ -566,15 +566,9 @@ static std::vector<std::pair<std::string, std::pair<uint64_t, uint64_t>>> offloa
     return rows;
 }
 
-void offload_stats_log_summary(const char * tag, int device) {
-    if (!offload_stats_enabled()) {
-        return;
-    }
-    const offload_stats_snapshot s          = offload_stats_get();
-    const offload_phase          phase      = offload_stats_current_phase();
-    const char *                 phase_name = offload_phase_name(phase);
-
-    // GGML_SYCL_ZERO_ALLOC_CHECK: 0=off, 1=warn (default), 2=abort
+// Standalone zero-alloc check — runs even when offload stats are disabled.
+// GGML_SYCL_ZERO_ALLOC_CHECK: 0=off, 1=warn (default), 2=abort
+void zero_alloc_check(const char * tag, int device) {
     static const int zero_alloc_mode = []() {
         const char * env = std::getenv("GGML_SYCL_ZERO_ALLOC_CHECK");
         if (env) {
@@ -582,18 +576,33 @@ void offload_stats_log_summary(const char * tag, int device) {
         }
         return 1;  // Default ON (warn mode)
     }();
-    if (zero_alloc_mode > 0 && (phase == offload_phase::PP || phase == offload_phase::TG)) {
-        const size_t runtime_bytes = unified_cache_get_runtime_bytes(device);
-        if (runtime_bytes > 0) {
-            GGML_LOG_WARN(
-                "[SYCL-ZERO-ALLOC-CHECK] %s: runtime allocation detected during %s phase: %.1f MB. "
-                "Expected zero new allocations during steady-state inference.\n",
-                tag ? tag : "graph", phase_name, runtime_bytes / (1024.0 * 1024.0));
-            if (zero_alloc_mode >= 2) {
-                GGML_ASSERT(false && "ZERO_ALLOC_CHECK: runtime allocation during inference");
-            }
+    if (zero_alloc_mode <= 0) {
+        return;
+    }
+    const offload_phase phase = offload_stats_current_phase();
+    if (phase != offload_phase::PP && phase != offload_phase::TG) {
+        return;
+    }
+    const size_t runtime_bytes = unified_cache_get_runtime_bytes(device);
+    if (runtime_bytes > 0) {
+        const char * phase_name = offload_phase_name(phase);
+        GGML_LOG_WARN(
+            "[SYCL-ZERO-ALLOC-CHECK] %s: runtime allocation detected during %s phase: %.1f MB. "
+            "Expected zero new allocations during steady-state inference.\n",
+            tag ? tag : "graph", phase_name, runtime_bytes / (1024.0 * 1024.0));
+        if (zero_alloc_mode >= 2) {
+            GGML_ASSERT(false && "ZERO_ALLOC_CHECK: runtime allocation during inference");
         }
     }
+}
+
+void offload_stats_log_summary(const char * tag, int device) {
+    if (!offload_stats_enabled()) {
+        return;
+    }
+    const offload_stats_snapshot s          = offload_stats_get();
+    const offload_phase          phase      = offload_stats_current_phase();
+    const char *                 phase_name = offload_phase_name(phase);
 
     fprintf(
         stderr,
@@ -6567,10 +6576,10 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     // Zone sub-allocations (arena_alloc, zone_alloc) are still permitted.
     {
         static std::atomic<int> s_phase_gate_mode{ -1 };
-        int mode = s_phase_gate_mode.load(std::memory_order_relaxed);
+        int                     mode = s_phase_gate_mode.load(std::memory_order_relaxed);
         if (mode < 0) {
             const char * env = std::getenv("GGML_SYCL_ALLOC_PHASE_GATE");
-            mode = (env != nullptr) ? std::atoi(env) : 0;  // Default OFF for now (0=off, 1=warn, 2=assert)
+            mode             = (env != nullptr) ? std::atoi(env) : 1;  // Default ON warn mode (0=off, 1=warn, 2=assert)
             s_phase_gate_mode.store(mode, std::memory_order_relaxed);
         }
         if (mode > 0) {
@@ -6580,8 +6589,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                     GGML_LOG_ERROR(
                         "[UNIFIED-ALLOC] PHASE GATE: unified_alloc() called during %s phase "
                         "(size=%zu, device=%d, role=%d). All memory must be pre-allocated.\n",
-                        offload_phase_name(phase), req_in.size, req_in.device,
-                        static_cast<int>(req_in.intent.role));
+                        offload_phase_name(phase), req_in.size, req_in.device, static_cast<int>(req_in.intent.role));
                     GGML_ASSERT(false && "unified_alloc called during PP/TG inference phase");
                 } else {
                     GGML_LOG_WARN(
@@ -8173,9 +8181,10 @@ bool unified_cache::reserve_reorder_temp(size_t size_bytes) {
     // Arena is not active — cannot allocate reorder temp buffer.
     // This is acceptable at early model-load before arena is configured;
     // the reorder path will be disabled for this invocation.
-    GGML_LOG_WARN("[UNIFIED-CACHE] reserve_reorder_temp: arena inactive, cannot allocate "
-                  "%.1f MB reorder temp buffer — reorder path disabled\n",
-                  size_bytes / (1024.0f * 1024.0f));
+    GGML_LOG_WARN(
+        "[UNIFIED-CACHE] reserve_reorder_temp: arena inactive, cannot allocate "
+        "%.1f MB reorder temp buffer — reorder path disabled\n",
+        size_bytes / (1024.0f * 1024.0f));
     return false;
 }
 
@@ -10137,8 +10146,7 @@ static void populate_host_zone_sizing(placement_plan &                          
         const int n_moe_layers = max_layer_id + 1;
 
         // 3a. Expert bias D2H: float32 bias per expert across all MoE layers, staged to host.
-        plan.expert_bias_bytes = static_cast<size_t>(n_experts) * sizeof(float) *
-                                 static_cast<size_t>(n_moe_layers);
+        plan.expert_bias_bytes = static_cast<size_t>(n_experts) * sizeof(float) * static_cast<size_t>(n_moe_layers);
 
         // 3b. MoE routing IDs: per-batch expert assignment buffer on device.
         //     n_expert rows × max_batch_tokens cols, each entry is int32_t.
@@ -10150,14 +10158,14 @@ static void populate_host_zone_sizing(placement_plan &                          
         //     for graph recording (fixed addresses required).
         //     MAX_EXPERTS (256) is used for the pre-allocation size regardless of n_experts.
         constexpr int k_max_experts_prealloc = 256;  // moe_tile_mapping_state::MAX_EXPERTS
-        plan.moe_expert_ptrs_bytes           = static_cast<size_t>(k_max_experts_prealloc) *
-                                               sizeof(void *) * static_cast<size_t>(n_moe_layers);
+        plan.moe_expert_ptrs_bytes =
+            static_cast<size_t>(k_max_experts_prealloc) * sizeof(void *) * static_cast<size_t>(n_moe_layers);
 
-        GGML_LOG_INFO("[SYCL-PLAN] MoE routing buffer sizing: n_experts=%d n_moe_layers=%d "
-                      "max_batch=%zu routing_ids=%.2f MB expert_ptrs=%.2f MB\n",
-                      n_experts, n_moe_layers, max_batch_tokens,
-                      plan.moe_routing_ids_bytes / (1024.0 * 1024.0),
-                      plan.moe_expert_ptrs_bytes / (1024.0 * 1024.0));
+        GGML_LOG_INFO(
+            "[SYCL-PLAN] MoE routing buffer sizing: n_experts=%d n_moe_layers=%d "
+            "max_batch=%zu routing_ids=%.2f MB expert_ptrs=%.2f MB\n",
+            n_experts, n_moe_layers, max_batch_tokens, plan.moe_routing_ids_bytes / (1024.0 * 1024.0),
+            plan.moe_expert_ptrs_bytes / (1024.0 * 1024.0));
     } else {
         plan.expert_bias_bytes     = 0;
         plan.moe_routing_ids_bytes = 0;
@@ -10172,8 +10180,7 @@ static void populate_host_zone_sizing(placement_plan &                          
     // 5. Graph metadata: layer classification vectors + MoE routing tables.
     //    Fixed 4 MB base + per-expert int entries per layer.
     constexpr size_t k_graph_metadata_base = 4ull * 1024ull * 1024ull;
-    plan.graph_metadata_bytes = k_graph_metadata_base +
-                                static_cast<size_t>(std::max(n_experts, 0)) * 32 * sizeof(int);
+    plan.graph_metadata_bytes = k_graph_metadata_base + static_cast<size_t>(std::max(n_experts, 0)) * 32 * sizeof(int);
 
     // 6. Tensor Parallelism buffer estimates (only when TP is active with >1 device).
     //    TP FFN compute buffers live on secondary device VRAM; sized conservatively from
@@ -10204,26 +10211,23 @@ static void populate_host_zone_sizing(placement_plan &                          
         // Float32 equivalent ≈ weight_bytes × (32 / QK4_0) = weight_bytes × 2 (for Q4_0).
         // Multiply by 4 to cover all intermediate buffers at max batch.
         constexpr int k_tp_ffn_float_scale = 8;  // float32_equiv × buffer_count
-        plan.tp_ffn_buffer_bytes = (max_ffn_weight_bytes > 0)
-                                       ? max_ffn_weight_bytes * k_tp_ffn_float_scale
-                                       : plan.max_tensor_bytes * k_tp_ffn_float_scale;
+        plan.tp_ffn_buffer_bytes           = (max_ffn_weight_bytes > 0) ? max_ffn_weight_bytes * k_tp_ffn_float_scale :
+                                                                          plan.max_tensor_bytes * k_tp_ffn_float_scale;
 
         // TP attention device buffers: QKV projections similarly sized.
         constexpr int k_tp_attn_float_scale = 4;
-        plan.tp_attn_buffer_bytes = (max_attn_weight_bytes > 0)
-                                        ? max_attn_weight_bytes * k_tp_attn_float_scale
-                                        : plan.max_tensor_bytes * k_tp_attn_float_scale;
+        plan.tp_attn_buffer_bytes = (max_attn_weight_bytes > 0) ? max_attn_weight_bytes * k_tp_attn_float_scale :
+                                                                  plan.max_tensor_bytes * k_tp_attn_float_scale;
 
         // TP host staging: single buffer for activation D2H/H2D copies.
         // Bounded by n_embd × max_batch × sizeof(float) ≤ k_tp_staging_headroom.
         plan.tp_staging_buffer_bytes = k_tp_staging_headroom;
 
-        GGML_LOG_INFO("[SYCL-PLAN] TP buffer sizing: world_size=%d "
-                      "ffn=%.1f MB attn=%.1f MB staging=%.1f MB\n",
-                      g_sycl_tp_config.world_size,
-                      plan.tp_ffn_buffer_bytes / (1024.0 * 1024.0),
-                      plan.tp_attn_buffer_bytes / (1024.0 * 1024.0),
-                      plan.tp_staging_buffer_bytes / (1024.0 * 1024.0));
+        GGML_LOG_INFO(
+            "[SYCL-PLAN] TP buffer sizing: world_size=%d "
+            "ffn=%.1f MB attn=%.1f MB staging=%.1f MB\n",
+            g_sycl_tp_config.world_size, plan.tp_ffn_buffer_bytes / (1024.0 * 1024.0),
+            plan.tp_attn_buffer_bytes / (1024.0 * 1024.0), plan.tp_staging_buffer_bytes / (1024.0 * 1024.0));
     } else {
         plan.tp_ffn_buffer_bytes     = 0;
         plan.tp_attn_buffer_bytes    = 0;
@@ -10246,7 +10250,7 @@ static void populate_host_zone_sizing(placement_plan &                          
     //    GGML_SYCL_FORCE_STREAMING enables streaming; planner uses a conservative per-model estimate.
     {
         constexpr size_t k_dma_pipeline_depth = 2;  // Double-buffer (matches resolve_dma_defaults)
-        plan.dma_staging_pool_bytes = plan.max_tensor_bytes * k_dma_pipeline_depth;
+        plan.dma_staging_pool_bytes           = plan.max_tensor_bytes * k_dma_pipeline_depth;
     }
 
     // 8. oneDNN scratchpad: ONEDNN zone workspace for weight reorder + activation buffer.
@@ -10257,10 +10261,10 @@ static void populate_host_zone_sizing(placement_plan &                          
 
     constexpr size_t k_onednn_zone_bytes = 256ull * 1024ull * 1024ull;
     if (plan.onednn_scratchpad_bytes > k_onednn_zone_bytes) {
-        GGML_LOG_WARN("[SYCL-PLAN] oneDNN scratchpad estimate (%.1f MB) exceeds zone (%.1f MB) — "
-                      "oneDNN may fall back to direct alloc\n",
-                      plan.onednn_scratchpad_bytes / (1024.0 * 1024.0),
-                      k_onednn_zone_bytes / (1024.0 * 1024.0));
+        GGML_LOG_WARN(
+            "[SYCL-PLAN] oneDNN scratchpad estimate (%.1f MB) exceeds zone (%.1f MB) — "
+            "oneDNN may fall back to direct alloc\n",
+            plan.onednn_scratchpad_bytes / (1024.0 * 1024.0), k_onednn_zone_bytes / (1024.0 * 1024.0));
     }
 
     // --- Host zone sizing (uses inference category fields computed above) ---
@@ -10270,9 +10274,8 @@ static void populate_host_zone_sizing(placement_plan &                          
     plan.host_zone_kv_bytes = std::max<size_t>(k_min_zone_bytes, plan.kv_host_bytes);
     // Staging zone: baseline (2x max tensor + headroom) plus expert bias D2H and TP staging.
     plan.host_zone_staging_bytes =
-        std::max<size_t>(k_min_zone_bytes,
-                         plan.max_tensor_bytes * 2 + k_tp_staging_headroom + plan.expert_bias_bytes +
-                             plan.tp_staging_buffer_bytes);
+        std::max<size_t>(k_min_zone_bytes, plan.max_tensor_bytes * 2 + k_tp_staging_headroom + plan.expert_bias_bytes +
+                                               plan.tp_staging_buffer_bytes);
     // SCRATCH zone: baseline (max_tensor + headroom) plus oneDNN reorder, MoE Q8_1 workspace,
     // MoE routing buffers (routing IDs + expert pointer tables), TP compute buffers, and
     // DMA staging pool (device double-buffer for weight streaming).
@@ -10284,11 +10287,9 @@ static void populate_host_zone_sizing(placement_plan &                          
     // Note: onednn_scratchpad_bytes goes to the ONEDNN zone (separate 256 MB allocation),
     // not counted here.
     plan.host_zone_scratch_bytes =
-        std::max<size_t>(k_min_zone_bytes,
-                         plan.max_tensor_bytes + k_scratch_headroom +
-                         plan.onednn_reorder_bytes + plan.moe_q8_workspace_bytes +
-                         plan.moe_vram_runtime_bytes + plan.tp_vram_runtime_bytes +
-                         plan.dma_staging_pool_bytes);
+        std::max<size_t>(k_min_zone_bytes, plan.max_tensor_bytes + k_scratch_headroom + plan.onednn_reorder_bytes +
+                                               plan.moe_q8_workspace_bytes + plan.moe_vram_runtime_bytes +
+                                               plan.tp_vram_runtime_bytes + plan.dma_staging_pool_bytes);
 }
 
 placement_plan compute_placement_plan(const std::vector<std::pair<std::string, size_t>> & tensor_inventory,

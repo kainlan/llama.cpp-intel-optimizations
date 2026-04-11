@@ -47815,6 +47815,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
         int  device;
 
         ~offload_stats_guard_t() {
+            ggml_sycl::zero_alloc_check("graph_compute", device);
             if (active) {
                 ggml_sycl::offload_stats_log_summary("graph_compute", device);
             }

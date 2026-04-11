@@ -140,7 +140,7 @@ struct placement_kv_info {
     uint32_t          n_ctx            = 0;
     bool              n_ctx_is_runtime = false;
     // MoE hyperparameters (0 for dense models)
-    int               n_expert_used    = 0;   // Top-k experts selected per token
+    int               n_expert_used    = 0;  // Top-k experts selected per token
     // SWA (Sliding Window Attention) — 0 means all layers use full attention
     uint32_t          n_swa            = 0;
     uint32_t          n_swa_layers     = 0;
@@ -2396,6 +2396,7 @@ void                   offload_stats_note_transition_wait(bool waited);
 void                   offload_stats_note_host_alloc(const char * tag, size_t bytes);
 offload_stats_snapshot offload_stats_get();
 void                   offload_stats_log_summary(const char * tag, int device);
+void                   zero_alloc_check(const char * tag, int device);
 
 class scoped_unified_alloc {
   public:
