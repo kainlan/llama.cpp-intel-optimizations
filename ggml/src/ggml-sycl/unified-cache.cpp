@@ -8976,7 +8976,7 @@ bool unified_cache::reserve_scratch_pool(size_t pool_bytes) {
     // Arena-owned pointers must NOT be sycl::free'd — free via TLSF zone_free instead.
     if (scratch_pool_ptr_) {
         if (arena_active() && vram_owns(scratch_pool_ptr_)) {
-            zone_free(vram_zone_id::SCRATCH, scratch_pool_ptr_);
+            zone_free(vram_zone_id::WEIGHT, scratch_pool_ptr_);
             scratch_pool_ptr_ = nullptr;
         } else {
             saturating_sub_used(scratch_pool_size_);
@@ -9814,6 +9814,9 @@ void * unified_cache::zone_alloc(vram_zone_id zone, size_t size, size_t align) {
 
     void * ptr = alloc->allocate(size, align);
     if (ptr) {
+        // NOTE: In shared-zone mode, z.used reflects the COMBINED KV+WEIGHT
+        // usage from the shared TLSF allocator, not per-zone deltas. Callers
+        // querying zone_used(WEIGHT) will see the total shared allocation.
         z.used.store(alloc->used(), std::memory_order_relaxed);
     }
     return ptr;

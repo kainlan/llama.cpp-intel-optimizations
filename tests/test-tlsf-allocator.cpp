@@ -38,8 +38,10 @@ struct test_arena {
     tlsf_allocator * alloc;
 
     explicit test_arena(size_t sz = ONE_MB) : size(sz) {
-        mem = std::malloc(sz);
-        REQUIRE(mem != nullptr && "malloc failed");
+        // Align to 256 bytes so that TLSF payloads (at HEADER_SIZE offset
+        // from arena base) are 256-byte aligned, matching GPU requirements.
+        mem = std::aligned_alloc(256, sz);
+        REQUIRE(mem != nullptr && "aligned_alloc failed");
         alloc = new tlsf_allocator(mem, sz);
     }
 
@@ -124,11 +126,11 @@ static void test_coalescing() {
     // just p1, and should equal the original available (minus header overhead)
     REQUIRE(avail_after2 > avail_after1 && "coalescing should increase available");
 
-    // All freed — available should be close to total minus header overhead
-    size_t total_avail = arena.alloc->available();
-    size_t overhead    = arena.size - total_avail;
-    REQUIRE(overhead == tlsf_allocator::header_overhead() && "all memory should be reclaimed after full free");
-    (void) overhead;
+    // All freed — used() should be zero and largest_free_block should
+    // recover to the full arena minus one header.
+    REQUIRE(arena.alloc->used() == 0 && "all memory should be reclaimed after full free");
+    REQUIRE(arena.alloc->largest_free_block() == arena.size - tlsf_allocator::header_overhead()
+            && "coalesced block should span entire arena minus header");
 
     std::cout << "test_coalescing: PASSED\n";
 }
@@ -153,12 +155,15 @@ static void test_reset() {
     arena.alloc->reset();
     REQUIRE(arena.alloc->used() == 0 && "used() must be 0 after reset");
 
-    // Should be able to allocate the full arena (minus header) again
+    // Should be able to allocate a large block after reset.
+    // Note: allocate() uses mapping_search() which rounds up to the next SL
+    // boundary, so requesting exactly largest_free_block() may search a class
+    // above the block's actual class. Use 90% of the largest block instead.
     size_t largest = arena.alloc->largest_free_block();
     REQUIRE(largest > 0 && "largest_free_block should be positive after reset");
 
-    void * big = arena.alloc->allocate(largest);
-    REQUIRE(big != nullptr && "should allocate largest block after reset");
+    void * big = arena.alloc->allocate(largest * 9 / 10);
+    REQUIRE(big != nullptr && "should allocate large block after reset");
     (void) big;
 
     std::cout << "test_reset: PASSED\n";
@@ -168,8 +173,9 @@ static void test_reset() {
 // 5. Allocation failure — request larger than available
 // ---------------------------------------------------------------------------
 static void test_alloc_failure() {
-    // Tiny arena
-    test_arena arena(512);  // Too small for even one block (needs header + 256)
+    // Tiny arena: needs HEADER_SIZE (256) + MIN_BLOCK_SIZE (256) = 512 for
+    // one block, so 256 bytes is too small.
+    test_arena arena(256);
 
     // No valid allocation should be possible
     void * p = arena.alloc->allocate(256);
@@ -185,21 +191,23 @@ static void test_alloc_failure() {
 static void test_exhaust_recycle() {
     test_arena arena;
 
-    // Determine largest block
+    // Determine largest block — use 90% to account for TLSF rounding in
+    // mapping_search(), which may search a size class above the block's class.
     size_t largest = arena.alloc->largest_free_block();
     REQUIRE(largest > 0);
+    size_t alloc_size = largest * 9 / 10;
 
-    // Allocate the largest block
-    void * p = arena.alloc->allocate(largest);
-    REQUIRE(p != nullptr && "largest block alloc should succeed");
+    // Allocate a large block
+    void * p = arena.alloc->allocate(alloc_size);
+    REQUIRE(p != nullptr && "large block alloc should succeed");
 
     // Now available should be reduced
     size_t avail_after = arena.alloc->available();
     REQUIRE(avail_after < arena.size && "available should decrease after large alloc");
     (void) avail_after;
 
-    // Try another large allocation — should fail (fragmented)
-    void * p2 = arena.alloc->allocate(largest);
+    // Try another large allocation — should fail
+    void * p2 = arena.alloc->allocate(alloc_size);
     // This may or may not succeed depending on remaining space, but it
     // exercises the failure path.
 
@@ -252,10 +260,9 @@ static void test_stress() {
     }
 
     // After freeing everything, verify all memory reclaimed
-    size_t total_avail = arena.alloc->available();
-    size_t overhead    = arena.size - total_avail;
-    REQUIRE(overhead == tlsf_allocator::header_overhead() && "all memory should be reclaimed after stress test");
-    (void) overhead;
+    REQUIRE(arena.alloc->used() == 0 && "all memory should be reclaimed after stress test");
+    REQUIRE(arena.alloc->largest_free_block() == arena.size - tlsf_allocator::header_overhead()
+            && "coalesced block should span entire arena minus header after stress test");
 
     std::cout << "test_stress: PASSED\n";
 }
@@ -323,10 +330,9 @@ static void test_no_leak() {
     }
 
     // After all alloc/free cycles, all memory should be reclaimed
-    size_t total_avail = arena.alloc->available();
-    size_t overhead    = arena.size - total_avail;
-    REQUIRE(overhead == tlsf_allocator::header_overhead() && "no memory leak after alloc/free cycles");
-    (void) overhead;
+    REQUIRE(arena.alloc->used() == 0 && "no memory leak after alloc/free cycles");
+    REQUIRE(arena.alloc->largest_free_block() == arena.size - tlsf_allocator::header_overhead()
+            && "full arena recovered after alloc/free cycles");
 
     std::cout << "test_no_leak: PASSED\n";
 }
@@ -354,7 +360,7 @@ static void test_splitting() {
             // Two 256-byte allocations with 256-byte alignment should be
             // at least 256 bytes apart
             size_t dist = a > b ? a - b : b - a;
-            assert(dist >= 256 && "allocations must not overlap");
+            REQUIRE(dist >= 256 && "allocations must not overlap");
             (void) dist;
         }
     }
