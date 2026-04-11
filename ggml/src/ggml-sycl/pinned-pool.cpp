@@ -442,6 +442,14 @@ bool pinned_chunk_pool::grow_zone(host_zone_id zone, size_t additional_bytes) {
         return false;
     }
 
+    // Phase gate: reject zone growth during inference (PP/TG)
+    const auto phase = ggml_sycl::offload_stats_phase();
+    if (phase == ggml_sycl::offload_phase::PP || phase == ggml_sycl::offload_phase::TG) {
+        GGML_LOG_WARN("[HOST-POOL] grow_zone(%s, %.1f MB) rejected during %s phase\n", host_zone_name(zone),
+                      additional_bytes / (1024.0 * 1024.0), ggml_sycl::offload_phase_name(phase));
+        return false;
+    }
+
     std::lock_guard<std::mutex> lock(mutex_);
 
     // Calculate how many chunks we need to add
@@ -612,6 +620,25 @@ bool pinned_chunk_pool::deallocate_from_chunks(std::vector<chunk> & chunks, void
 }
 
 bool pinned_chunk_pool::grow_into(std::vector<chunk> & chunks, size_t min_size, bool runtime_pool) {
+    // Phase gate: warn/assert when allocating chunks during inference
+    static std::atomic<int> s_phase_gate{ -1 };
+    int                     mode = s_phase_gate.load(std::memory_order_relaxed);
+    if (mode < 0) {
+        const char * env = std::getenv("GGML_SYCL_HOST_ALLOC_PHASE_GATE");
+        mode             = (env != nullptr) ? std::atoi(env) : 0;
+        s_phase_gate.store(mode, std::memory_order_relaxed);
+    }
+    if (mode > 0) {
+        const auto phase = ggml_sycl::offload_stats_phase();
+        if (phase == ggml_sycl::offload_phase::PP || phase == ggml_sycl::offload_phase::TG) {
+            GGML_LOG_WARN("[HOST-POOL] chunk allocation during %s phase — planner should pre-size (%zu bytes)\n",
+                          ggml_sycl::offload_phase_name(phase), min_size);
+            if (mode >= 2) {
+                GGML_ASSERT(false && "host pool chunk allocation during inference");
+            }
+        }
+    }
+
     void * ptr        = nullptr;
     // Use chunk_size_ as the default, but allow larger chunks when the
     // allocation exceeds chunk_size_ (e.g., 615 MB reorder buffers for
