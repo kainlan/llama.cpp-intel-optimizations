@@ -499,6 +499,11 @@ bool pinned_chunk_pool::grow_zone(host_zone_id zone, size_t additional_bytes) {
     if (new_chunks_added == 0) {
         return false;
     }
+    if (new_chunks_added < chunks_needed) {
+        GGML_LOG_WARN(
+            "[HOST-POOL] grow_zone: partial growth %zu/%zu chunks for zone %zu\n",
+            new_chunks_added, chunks_needed, zi);
+    }
 
     // Extend the zone's span to include the new chunks
     size_t additional_capacity = new_chunks_added * chunk_size_;
