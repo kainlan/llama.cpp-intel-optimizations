@@ -11,6 +11,7 @@
 #include "dpct/helper.hpp"
 #include "ggml-sycl.h"
 #include "pinned-pool.hpp"
+#include "tlsf-allocator.hpp"
 
 #include <atomic>
 #include <cmath>
@@ -61,20 +62,15 @@ enum class vram_zone_id : uint8_t {
     COUNT   = 5,
 };
 
-struct vram_free_block {
-    size_t offset;  // Offset from arena base
-    size_t size;
-};
-
 struct vram_zone {
     size_t              start = 0;  // Offset from arena base
     size_t              size  = 0;  // Total zone capacity
-    std::atomic<size_t> used{ 0 };  // Current allocation offset (bump pointer)
+    std::atomic<size_t> used{ 0 };  // Bytes currently allocated (from TLSF)
 
-    // Weight zone only: free-list for reclaimed eviction space.
-    // Sorted by offset for coalescing.
-    std::vector<vram_free_block> free_list;
-    std::mutex                   free_list_mutex;
+    // TLSF O(1) sub-allocator for this zone.
+    // Nullptr for WEIGHT zone in single-chunk mode (delegates to KV allocator).
+    std::unique_ptr<tlsf_allocator> allocator;
+    std::mutex                      alloc_mutex;  // Serialize concurrent alloc/free
 };
 
 // vram_arena functionality is merged into unified_cache — see arena_* methods.
@@ -1515,11 +1511,13 @@ class unified_cache {
     // Sub-allocate from a zone.
     void * zone_alloc(vram_zone_id zone, size_t size, size_t align = 256);
 
-    // Reset a zone's bump pointer.
-    void zone_reset(vram_zone_id zone);
+    // Free a sub-allocation from a zone (TLSF O(1) free with coalescing).
+    // ptr must have been returned by zone_alloc. No size parameter —
+    // TLSF recovers block size from the inline block_header.
+    void zone_free(vram_zone_id zone, void * ptr);
 
-    // Reclaim weight space.
-    void weight_reclaim(size_t offset, size_t size);
+    // Reset a zone (returns all memory to the pool as a single free block).
+    void zone_reset(vram_zone_id zone);
 
     // Check if a pointer belongs to the VRAM arena.
     bool vram_owns(const void * ptr) const;

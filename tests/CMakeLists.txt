@@ -1748,6 +1748,15 @@ if(GGML_SYCL)
     target_include_directories(test-tensor-classification PRIVATE ${PROJECT_SOURCE_DIR}/ggml/include)
     add_test(NAME test-tensor-classification COMMAND $<TARGET_FILE:test-tensor-classification>)
 
+    # TLSF allocator test (header-only, CPU-only, no SYCL runtime needed)
+    # Validates O(1) alloc/free, coalescing, reset, and stress on 1MB malloc region
+    add_executable(test-tlsf-allocator test-tlsf-allocator.cpp)
+    target_include_directories(test-tlsf-allocator PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/include
+        ${PROJECT_SOURCE_DIR}/ggml/src
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-sycl)
+    add_test(NAME test-tlsf-allocator COMMAND $<TARGET_FILE:test-tlsf-allocator>)
+
     # test-sycl-eviction-policy: Tests for priority-based LRU eviction policy
     # Part of unified memory management system (epic llama.cpp-v3n, task llama.cpp-2oy)
     add_executable(test-sycl-eviction-policy test-sycl-eviction-policy.cpp

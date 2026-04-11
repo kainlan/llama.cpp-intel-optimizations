@@ -4729,10 +4729,10 @@ size_t unified_cache::evict_one(size_t /* new_size */) {
             const bool is_arena = vram_owns(ptr);
             const bool is_pool  = !is_arena && layout_pool_ && layout_pool_->owns(ptr);
             if (is_arena) {
-                // Arena entries: reclaim space in weight zone free-list.
+                // Arena entries: free via TLSF zone_free.
                 size_t offset = ptr_to_offset(ptr);
                 if (offset != SIZE_MAX) {
-                    weight_reclaim(offset, entry_size);
+                    zone_free(vram_zone_id::WEIGHT, offset_to_ptr(offset));
                 }
                 // No budget adjustment — arena bytes stay in used_ until arena is destroyed.
             } else if (!is_pool) {
@@ -4814,7 +4814,7 @@ size_t unified_cache::finalize_evictions_locked() {
         if (is_arena) {
             size_t offset = ptr_to_offset(ptr);
             if (offset != SIZE_MAX) {
-                weight_reclaim(offset, entry_size);
+                zone_free(vram_zone_id::WEIGHT, offset_to_ptr(offset));
             }
         } else if (!is_pool) {
             enqueue_deferred_free(ptr, entry_size);
@@ -4846,7 +4846,7 @@ size_t unified_cache::finalize_evictions_locked() {
 size_t unified_cache::finalize_evictions() {
     // Poll in-flight async D2H evictions.  For each completed one:
     // 1. Adopt the host-pinned buffer into host_cache (preserves layout)
-    // 2. Reclaim VRAM (arena weight_reclaim or deferred free)
+    // 2. Reclaim VRAM (arena zone_free or deferred free)
     // 3. Remove entry from device cache
     if (evictions_in_flight_.load(std::memory_order_relaxed) == 0) {
         return 0;
@@ -8973,14 +8973,11 @@ bool unified_cache::reserve_scratch_pool(size_t pool_bytes) {
     }
 
     // Free existing pool if it exists but is too small.
-    // Arena-owned pointers must NOT be sycl::free'd — reclaim to the weight zone instead.
+    // Arena-owned pointers must NOT be sycl::free'd — free via TLSF zone_free instead.
     if (scratch_pool_ptr_) {
         if (arena_active() && vram_owns(scratch_pool_ptr_)) {
-            size_t offset = ptr_to_offset(scratch_pool_ptr_);
-            if (offset != SIZE_MAX) {
-                weight_reclaim(offset, scratch_pool_size_);
-            }
-            // Budget was charged to the arena's bulk reservation — don't sub from used_.
+            zone_free(vram_zone_id::SCRATCH, scratch_pool_ptr_);
+            scratch_pool_ptr_ = nullptr;
         } else {
             saturating_sub_used(scratch_pool_size_);
             try {
@@ -9675,6 +9672,19 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
                 "(scratch=%.1f, runtime=%.1f, oneDNN=%.1f, shared KV+weight=%.1f MB)\n",
                 alloc_size / (1024.0 * 1024.0), scratch_bytes / (1024.0 * 1024.0), runtime_bytes / (1024.0 * 1024.0),
                 onednn_bytes / (1024.0 * 1024.0), shared_bytes / (1024.0 * 1024.0));
+
+            // Initialize TLSF allocators per zone.
+            // Single-chunk: KV and WEIGHT share one allocator in KV zone.
+            for (int i = 0; i < static_cast<int>(vram_zone_id::COUNT); i++) {
+                auto & z = arena_zones_[i];
+                if (i == static_cast<int>(vram_zone_id::WEIGHT)) {
+                    // WEIGHT delegates to KV's allocator in single-chunk mode.
+                    z.allocator = nullptr;
+                } else if (z.size > 0) {
+                    z.allocator = std::make_unique<tlsf_allocator>(offset_to_ptr(z.start), z.size, 256);
+                }
+            }
+
             return true;
         }
     }
@@ -9764,6 +9774,15 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
         chunk0_size / (1024.0 * 1024.0), chunk1_size / (1024.0 * 1024.0), sz.size / (1024.0 * 1024.0),
         rz.size / (1024.0 * 1024.0), oz.size / (1024.0 * 1024.0), kz.size / (1024.0 * 1024.0),
         wz.size / (1024.0 * 1024.0));
+
+    // Initialize TLSF allocators per zone (2-chunk path).
+    for (int i = 0; i < static_cast<int>(vram_zone_id::COUNT); i++) {
+        auto & z = arena_zones_[i];
+        if (z.size > 0) {
+            z.allocator = std::make_unique<tlsf_allocator>(offset_to_ptr(z.start), z.size, 256);
+        }
+    }
+
     return true;
 }
 
@@ -9772,145 +9791,70 @@ void * unified_cache::zone_alloc(vram_zone_id zone, size_t size, size_t align) {
         return nullptr;
     }
 
-    auto & z = arena_zones_[static_cast<int>(zone)];
+    auto &           z     = arena_zones_[static_cast<int>(zone)];
+    tlsf_allocator * alloc = z.allocator.get();
+
+    // Shared zone delegation (single-chunk mode): WEIGHT delegates to KV allocator.
+    if (!alloc && zone == vram_zone_id::WEIGHT) {
+        alloc = arena_zones_[static_cast<int>(vram_zone_id::KV)].allocator.get();
+    }
+    if (!alloc) {
+        return nullptr;
+    }
 
     if (align == 0 || (align & (align - 1)) != 0) {
         align = 256;
     }
 
-    if (zone == vram_zone_id::WEIGHT) {
-        // Weight zone: bump-LEFT from end.
-        // Check free-list first (best-fit).
-        {
-            std::lock_guard<std::mutex> lock(z.free_list_mutex);
-            size_t                      best_idx   = SIZE_MAX;
-            size_t                      best_waste = SIZE_MAX;
-            for (size_t i = 0; i < z.free_list.size(); i++) {
-                auto & blk         = z.free_list[i];
-                size_t aligned_off = (blk.offset + align - 1) & ~(align - 1);
-                size_t avail       = (blk.offset + blk.size > aligned_off) ? (blk.offset + blk.size - aligned_off) : 0;
-                if (avail >= size) {
-                    size_t waste = avail - size;
-                    if (waste < best_waste) {
-                        best_waste = waste;
-                        best_idx   = i;
-                    }
-                }
-            }
-            if (best_idx != SIZE_MAX) {
-                auto & blk         = z.free_list[best_idx];
-                size_t aligned_off = (blk.offset + align - 1) & ~(align - 1);
-                void * ptr         = offset_to_ptr(aligned_off);
+    // Use KV zone's mutex for serialization in shared-zone mode.
+    std::mutex &                mtx = (!z.allocator && zone == vram_zone_id::WEIGHT) ?
+                                          arena_zones_[static_cast<int>(vram_zone_id::KV)].alloc_mutex :
+                                          z.alloc_mutex;
+    std::lock_guard<std::mutex> lock(mtx);
 
-                size_t used_end = aligned_off + size;
-                if (used_end >= blk.offset + blk.size) {
-                    if (aligned_off > blk.offset) {
-                        blk.size = aligned_off - blk.offset;
-                    } else {
-                        z.free_list.erase(z.free_list.begin() + static_cast<ptrdiff_t>(best_idx));
-                    }
-                } else {
-                    size_t remain_off  = used_end;
-                    size_t remain_size = (blk.offset + blk.size) - remain_off;
-                    if (aligned_off > blk.offset) {
-                        blk.size = aligned_off - blk.offset;
-                        z.free_list.push_back({ remain_off, remain_size });
-                    } else {
-                        blk.offset = remain_off;
-                        blk.size   = remain_size;
-                    }
-                }
-                return ptr;
-            }
-        }
-
-        // No free-list hit.  Bump-left from end of zone.
-        const size_t aligned_size = (size + align - 1) & ~(align - 1);
-
-        if (arena_n_chunks_ == 1) {
-            // Collision check: KV used + weight used must not exceed shared zone.
-            // Safe: KV allocation (context creation) and weight allocation (model load) never overlap in practice.
-            const auto & kz      = arena_zones_[static_cast<int>(vram_zone_id::KV)];
-            size_t       prev    = z.used.fetch_add(aligned_size, std::memory_order_relaxed);
-            size_t       kv_used = kz.used.load(std::memory_order_relaxed);
-            if (kv_used + prev + aligned_size > z.size) {
-                z.used.fetch_sub(aligned_size, std::memory_order_relaxed);
-                return nullptr;
-            }
-            size_t zone_end  = z.start + z.size;
-            size_t alloc_off = zone_end - prev - aligned_size;
-            alloc_off        = alloc_off & ~(align - 1);
-            return offset_to_ptr(alloc_off);
-        }
-
-        // 2-chunk: weight zone is standalone.
-        size_t prev = z.used.fetch_add(aligned_size, std::memory_order_relaxed);
-        if (prev + aligned_size > z.size) {
-            z.used.fetch_sub(aligned_size, std::memory_order_relaxed);
-            return nullptr;
-        }
-        size_t zone_end  = z.start + z.size;
-        size_t alloc_off = zone_end - prev - aligned_size;
-        alloc_off        = alloc_off & ~(align - 1);
-        return offset_to_ptr(alloc_off);
+    void * ptr = alloc->allocate(size, align);
+    if (ptr) {
+        z.used.store(alloc->used(), std::memory_order_relaxed);
     }
-
-    // Non-weight zones: bump-right from zone start.
-    const size_t aligned_size = (size + align - 1) & ~(align - 1);
-
-    if (zone == vram_zone_id::KV && arena_n_chunks_ == 1) {
-        // Collision check against weight zone.
-        const auto & wz          = arena_zones_[static_cast<int>(vram_zone_id::WEIGHT)];
-        size_t       prev        = z.used.fetch_add(aligned_size, std::memory_order_relaxed);
-        size_t       weight_used = wz.used.load(std::memory_order_relaxed);
-        if (prev + aligned_size + weight_used > z.size) {
-            z.used.fetch_sub(aligned_size, std::memory_order_relaxed);
-            return nullptr;
-        }
-        return offset_to_ptr(z.start + prev);
-    }
-
-    // Simple bump-right for scratch, runtime, and onednn zones.
-    size_t prev = z.used.fetch_add(aligned_size, std::memory_order_relaxed);
-    if (prev + aligned_size > z.size) {
-        z.used.fetch_sub(aligned_size, std::memory_order_relaxed);
-        GGML_SYCL_DEBUG("[ZONE-ALLOC] zone=%d FULL: need=%zu prev=%zu cap=%zu start=%zu\n", (int) zone, aligned_size,
-                        prev, z.size, z.start);
-        return nullptr;
-    }
-
-    return offset_to_ptr(z.start + prev);
+    return ptr;
 }
 
 void unified_cache::zone_reset(vram_zone_id zone) {
-    arena_zones_[static_cast<int>(zone)].used.store(0, std::memory_order_relaxed);
+    auto &                      z = arena_zones_[static_cast<int>(zone)];
+    std::lock_guard<std::mutex> lock(z.alloc_mutex);
+    if (z.allocator) {
+        z.allocator->reset();
+    }
+    z.used.store(0, std::memory_order_relaxed);
 }
 
-void unified_cache::weight_reclaim(size_t offset, size_t size) {
-    auto &                      wz = arena_zones_[static_cast<int>(vram_zone_id::WEIGHT)];
-    std::lock_guard<std::mutex> lock(wz.free_list_mutex);
-
-    // Insert sorted by offset, then coalesce adjacent blocks.
-    auto it = wz.free_list.begin();
-    while (it != wz.free_list.end() && it->offset < offset) {
-        ++it;
+void unified_cache::zone_free(vram_zone_id zone, void * ptr) {
+    if (!ptr || !arena_base_) {
+        return;
     }
-    it = wz.free_list.insert(it, { offset, size });
 
-    // Coalesce with next.
-    auto next = std::next(it);
-    if (next != wz.free_list.end() && it->offset + it->size == next->offset) {
-        it->size += next->size;
-        wz.free_list.erase(next);
-    }
-    // Coalesce with prev.
-    if (it != wz.free_list.begin()) {
-        auto prev_it = std::prev(it);
-        if (prev_it->offset + prev_it->size == it->offset) {
-            prev_it->size += it->size;
-            wz.free_list.erase(it);
+    auto &           z     = arena_zones_[static_cast<int>(zone)];
+    tlsf_allocator * alloc = z.allocator.get();
+
+    // Shared zone delegation (single-chunk mode).
+    if (!alloc && zone == vram_zone_id::WEIGHT) {
+        auto & kv = arena_zones_[static_cast<int>(vram_zone_id::KV)];
+        alloc     = kv.allocator.get();
+        if (!alloc) {
+            return;
         }
+        std::lock_guard<std::mutex> lock(kv.alloc_mutex);
+        alloc->free(ptr);
+        kv.used.store(alloc->used(), std::memory_order_relaxed);
+        return;
     }
+    if (!alloc) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(z.alloc_mutex);
+    alloc->free(ptr);
+    z.used.store(alloc->used(), std::memory_order_relaxed);
 }
 
 bool unified_cache::vram_owns(const void * ptr) const {
@@ -9976,14 +9920,24 @@ size_t unified_cache::zone_used(vram_zone_id zone) const {
 }
 
 size_t unified_cache::zone_available(vram_zone_id zone) const {
-    const auto & z    = arena_zones_[static_cast<int>(zone)];
-    size_t       used = z.used.load(std::memory_order_relaxed);
-    // In single-chunk mode, KV and WEIGHT share the same region.
-    // Available KV space = total - kv_used - weight_used.
-    if (zone == vram_zone_id::KV && arena_n_chunks_ == 1) {
-        size_t weight_used = arena_zones_[static_cast<int>(vram_zone_id::WEIGHT)].used.load(std::memory_order_relaxed);
-        return z.size > (used + weight_used) ? z.size - used - weight_used : 0;
+    const auto & z = arena_zones_[static_cast<int>(zone)];
+
+    // In single-chunk mode, WEIGHT delegates to KV's allocator.
+    if (arena_n_chunks_ == 1 && zone == vram_zone_id::WEIGHT) {
+        const auto & kv = arena_zones_[static_cast<int>(vram_zone_id::KV)];
+        if (kv.allocator) {
+            return kv.allocator->available();
+        }
+        return 0;
     }
+
+    // Zones with their own allocator.
+    if (z.allocator) {
+        return z.allocator->available();
+    }
+
+    // Fallback for zones without allocator (shouldn't happen after arena_reserve).
+    size_t used = z.used.load(std::memory_order_relaxed);
     return z.size > used ? z.size - used : 0;
 }
 
@@ -10004,10 +9958,12 @@ void unified_cache::arena_destroy() {
     arena_size_     = 0;
     arena_n_chunks_ = 0;
     for (int i = 0; i < static_cast<int>(vram_zone_id::COUNT); i++) {
-        arena_zones_[i].start = 0;
-        arena_zones_[i].size  = 0;
-        arena_zones_[i].used.store(0, std::memory_order_relaxed);
-        arena_zones_[i].free_list.clear();
+        auto &                      z = arena_zones_[i];
+        std::lock_guard<std::mutex> lock(z.alloc_mutex);
+        z.allocator.reset();  // unique_ptr::reset — destroys the TLSF allocator
+        z.start = 0;
+        z.size  = 0;
+        z.used.store(0, std::memory_order_relaxed);
     }
 }
 
@@ -10021,10 +9977,11 @@ void unified_cache::arena_abandon() {
     arena_size_     = 0;
     arena_n_chunks_ = 0;
     for (int i = 0; i < static_cast<int>(vram_zone_id::COUNT); i++) {
-        arena_zones_[i].start = 0;
-        arena_zones_[i].size  = 0;
-        arena_zones_[i].used.store(0, std::memory_order_relaxed);
-        arena_zones_[i].free_list.clear();
+        auto & z = arena_zones_[i];
+        z.allocator.reset();
+        z.start = 0;
+        z.size  = 0;
+        z.used.store(0, std::memory_order_relaxed);
     }
 }
 

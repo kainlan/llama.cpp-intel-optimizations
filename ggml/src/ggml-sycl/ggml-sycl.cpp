@@ -6755,7 +6755,10 @@ static void arena_device_free(void * ptr, size_t bytes, int device_id, sycl::que
         return;
     }
     if (from_arena) {
-        // Arena memory is freed by zone_reset, not individually.
+        auto * cache = ggml_sycl::get_unified_cache_for_device(device_id);
+        if (cache && cache->arena_active()) {
+            cache->zone_free(ggml_sycl::vram_zone_id::SCRATCH, ptr);
+        }
         return;
     }
     sycl::free(ptr, queue);
@@ -9405,8 +9408,14 @@ struct ggml_backend_sycl_buffer_context {
     ~ggml_backend_sycl_buffer_context() {
         // Arena allocations are sub-allocated from a single large block —
         // the arena owns the memory, so we must NOT free individual pointers.
-        if (from_arena) {
-            // Nothing to free — arena will reclaim on reset/destroy.
+        if (from_arena && dev_ptr) {
+            auto * cache = ggml_sycl::get_unified_cache_for_device(device);
+            if (cache && cache->arena_active()) {
+                auto zone_id = from_kv_zone     ? ggml_sycl::vram_zone_id::KV
+                             : from_scratch_pool ? ggml_sycl::vram_zone_id::SCRATCH
+                                                 : ggml_sycl::vram_zone_id::RUNTIME;
+                cache->zone_free(zone_id, dev_ptr);
+            }
         } else if (is_tp_compute_buffer) {
             // Free TP compute buffer pointers
             std::unordered_set<uint64_t> freed;
@@ -14152,30 +14161,20 @@ static void tiered_kv_buffer_free(ggml_backend_buffer_t buffer) {
         return;
     }
 
-    // Free per-layer allocations via unified_cache_deallocate.
-    // Arena-sourced layers (from_arena=true) are sub-allocations from the VRAM
-    // arena KV zone — they must NOT be freed individually.
-    bool has_arena_kv = false;
+    // Free per-layer allocations.
+    // Arena-sourced layers are freed individually via zone_free (TLSF coalesces
+    // adjacent blocks automatically).  Non-arena layers use unified_cache_deallocate.
     for (auto & la : ctx->layer_allocs) {
-        if (la.ptr && !la.from_arena) {
+        if (la.ptr && la.from_arena) {
+            auto * cache = ggml_sycl::get_unified_cache_for_device(ctx->device);
+            if (cache && cache->arena_active()) {
+                cache->zone_free(ggml_sycl::vram_zone_id::KV, la.ptr);
+            }
+        } else if (la.ptr) {
             ggml_sycl::unified_cache_deallocate(ctx->device, la.ptr, la.size,
                                                 ggml_sycl::unified_cache::alloc_lifetime::PERSISTENT);
-            la.ptr = nullptr;
         }
-        if (la.from_arena) {
-            has_arena_kv = true;
-        }
-    }
-
-    // Reset the arena KV zone so the next context can reuse the space.
-    // The KV zone uses bump allocation — individual frees aren't possible.
-    // Resetting the cursor to 0 reclaims all KV space without touching the
-    // WEIGHT zone (they share the arena but grow from opposite ends).
-    if (has_arena_kv) {
-        auto * cache = ggml_sycl::get_unified_cache_for_device(ctx->device);
-        if (cache && cache->arena_active()) {
-            cache->zone_reset(ggml_sycl::vram_zone_id::KV);
-        }
+        la.ptr = nullptr;
     }
 
     // Free the synthetic allocator base (plain aligned_alloc, NOT SYCL USM).
