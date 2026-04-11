@@ -461,12 +461,9 @@ struct pp_pipeline_state {
                     ggml_sycl::unified_free(scratch_alloc[b]);
                     scratch_alloc[b] = {};
                 } else if (scratch_buf[b]) {
-                    // Legacy fallback for pre-migration buffers
-                    if (scratch_size[b] > 0) {
-                        ggml_sycl::unified_cache_sub_runtime_bytes(device_id, scratch_size[b],
-                                                                   ggml_sycl::runtime_category::STAGING);
-                    }
-                    sycl::free(scratch_buf[b], *dma_queue);
+                    // Legacy fallback for pre-migration buffers — dead code after migration
+                    GGML_ASSERT(false &&
+                                "pipeline scratch_buf: legacy sycl::free path — scratch_alloc should always be set");
                 }
                 scratch_buf[b]  = nullptr;
                 scratch_size[b] = 0;
@@ -5318,9 +5315,9 @@ static void ggml_sycl_release_xmx_aos_staging(ggml_tensor_extra_gpu * extra, int
             ggml_sycl::unified_free(extra->xmx_mxfp4_tiled_aos_staging_alloc[device]);
             extra->xmx_mxfp4_tiled_aos_staging_alloc[device] = {};
         } else {
-            ggml_sycl::unified_cache_sub_runtime_bytes(device, extra->xmx_mxfp4_tiled_aos_staging_size[device]);
-            ggml_sycl::alloc_registry::instance().unregister_alloc(staging);
-            sycl::free(staging, *stream);
+            GGML_ASSERT(
+                false &&
+                "xmx_mxfp4_tiled_aos_staging: legacy sycl::free path reached — alloc_handle should always be set");
         }
         extra->xmx_mxfp4_tiled_aos_staging[device]      = nullptr;
         extra->xmx_mxfp4_tiled_aos_staging_size[device] = 0;
@@ -7635,11 +7632,12 @@ static void flush_prev_scatter_bufs() {
             (void) ggml_sycl::unified_free(pb.out_alloc);
         }
     } else {
+        // Legacy sycl::free path — dead code after migration to unified_alloc
         if (pb.act) {
-            sycl::free(pb.act, pb.ctx);
+            GGML_ASSERT(false && "pending_cpu_scatter.act: legacy sycl::free path — act_alloc should always be set");
         }
         if (pb.out) {
-            sycl::free(pb.out, pb.ctx);
+            GGML_ASSERT(false && "pending_cpu_scatter.out: legacy sycl::free path — out_alloc should always be set");
         }
     }
     pb.out       = nullptr;
@@ -7944,11 +7942,12 @@ static void flush_prev_cpu_pipeline_bufs() {
             (void) ggml_sycl::unified_free(pb.out_alloc);
         }
     } else {
+        // Legacy sycl::free path — dead code after migration to unified_alloc
         if (pb.act) {
-            sycl::free(pb.act, pb.ctx);
+            GGML_ASSERT(false && "cpu_pipeline.act: legacy sycl::free path — act_alloc should always be set");
         }
         if (pb.out) {
-            sycl::free(pb.out, pb.ctx);
+            GGML_ASSERT(false && "cpu_pipeline.out: legacy sycl::free path — out_alloc should always be set");
         }
     }
     pb.out       = nullptr;
@@ -18413,11 +18412,7 @@ void ggml_backend_sycl_context::free_staging_buffer() {
         (void) ggml_sycl::unified_free(staging_buffer_alloc_);
         staging_buffer_alloc_ = {};
     } else {
-        sycl::queue & q = *stream(staging_buffer_device_, 0);
-        ggml_sycl::alloc_registry::instance().unregister_alloc(staging_buffer_);
-        sycl::free(staging_buffer_, q);
-        ggml_sycl::unified_cache_sub_runtime_bytes(staging_buffer_device_, staging_buffer_size_,
-                                                   ggml_sycl::runtime_category::STAGING);
+        GGML_ASSERT(false && "staging_buffer_: legacy sycl::free path reached — alloc_handle should always be set");
     }
     GGML_LOG_INFO("[STAGING] Freed %zu MB staging buffer on device %d\n", staging_buffer_size_ / (1024 * 1024),
                   staging_buffer_device_);
@@ -25300,10 +25295,9 @@ static bool convert_tensor_layout(ggml_tensor * tensor,
                     ggml_sycl::unified_free(extra->xmx_mxfp4_tiled_aos_staging_alloc[device_id]);
                     extra->xmx_mxfp4_tiled_aos_staging_alloc[device_id] = {};
                 } else {
-                    ggml_sycl::unified_cache_sub_runtime_bytes(device_id,
-                                                               extra->xmx_mxfp4_tiled_aos_staging_size[device_id]);
-                    ggml_sycl::alloc_registry::instance().unregister_alloc(device_staging);
-                    sycl::free(device_staging, *stream);
+                    GGML_ASSERT(false &&
+                                "xmx_mxfp4_tiled_aos_staging (convert): legacy sycl::free path — alloc_handle should "
+                                "always be set");
                 }
                 device_staging = nullptr;
             }
@@ -25909,10 +25903,13 @@ static void ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,
     // Free old buffer (only if it was runtime-allocated, not pre-allocated)
     if (extra->moe_expert_ptrs_device[device] != nullptr) {
         if (!extra->moe_expert_ptrs_from_prealloc[device]) {
-            if (extra->moe_expert_ptrs_size[device] > 0) {
-                ggml_sycl::unified_cache_sub_runtime_bytes(device, extra->moe_expert_ptrs_size[device]);
+            if (extra->moe_expert_ptrs_alloc[device].ptr) {
+                (void) ggml_sycl::unified_free(extra->moe_expert_ptrs_alloc[device]);
+                extra->moe_expert_ptrs_alloc[device] = {};
+            } else {
+                GGML_ASSERT(false &&
+                            "moe_expert_ptrs: legacy sycl::free path reached — alloc_handle should always be set");
             }
-            sycl::free(extra->moe_expert_ptrs_device[device], queue);
         }
         extra->moe_expert_ptrs_device[device]        = nullptr;
         extra->moe_expert_ptrs_size[device]          = 0;
@@ -40584,13 +40581,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                         pipe.scratch_alloc[b] = {};
                         pipe.scratch_buf[b]   = nullptr;
                     } else if (pipe.scratch_buf[b]) {
-                        // Legacy fallback for pre-migration buffers
-                        if (pipe.scratch_size[b] > 0) {
-                            ggml_sycl::unified_cache_sub_runtime_bytes(pipe_dev, pipe.scratch_size[b],
-                                                                       ggml_sycl::runtime_category::STAGING);
-                        }
-                        sycl::free(pipe.scratch_buf[b], *pipe.dma_queue);
-                        pipe.scratch_buf[b] = nullptr;
+                        GGML_ASSERT(
+                            false &&
+                            "pipeline scratch_buf: legacy sycl::free path — scratch_alloc should always be set");
                     }
                     pipe.scratch_size[b] = 0;
 
