@@ -1288,13 +1288,18 @@ void ggml_sycl_pp_reset_stats();
 // FFN norm cache for TP: stores FFN norm output immediately after MUL to prevent buffer aliasing
 // The GGML scheduler may reuse the FFN norm buffer before TP can use it on device 1
 struct ffn_norm_cache_entry {
-    void *                  data;       // Cached FFN norm output on main device (device 0)
-    void *                  data_dev1;  // Copy on device 1 for its computation
+    // DEPRECATED: Use data_ptr()/data_dev1_ptr() accessors — these raw pointers are derived from alloc_handle
+    void *                  data;       // DEPRECATED: derived from data_alloc.ptr
+    void *                  data_dev1;  // DEPRECATED: derived from data_dev1_alloc.ptr
     int64_t                 ne0, ne1;   // Dimensions
     size_t                  size;       // Buffer size in bytes
     int                     pass_id;    // Which compute pass this cache is for (to detect staleness)
     ggml_sycl::alloc_handle data_alloc;
     ggml_sycl::alloc_handle data_dev1_alloc;
+
+    void * data_ptr() const { return data_alloc.ptr ? data_alloc.ptr : data; }
+
+    void * data_dev1_ptr() const { return data_dev1_alloc.ptr ? data_dev1_alloc.ptr : data_dev1; }
 };
 
 // Global FFN norm cache indexed by layer number
@@ -1318,10 +1323,13 @@ void ggml_sycl_tp_new_pass();
 // FFN input storage: stores the input to FFN column-parallel layers on device 1
 // This is needed so that row-parallel (ffn_down) can compute device 1's contribution
 struct ffn_input_storage {
-    void *                  data;      // Buffer on device 1
+    // DEPRECATED: Use data_ptr() accessor — raw pointer is derived from alloc.ptr
+    void *                  data;      // DEPRECATED: derived from alloc.ptr
     int64_t                 ne0, ne1;  // Dimensions
     size_t                  size;      // Buffer size
     ggml_sycl::alloc_handle alloc;
+
+    void * data_ptr() const { return alloc.ptr ? alloc.ptr : data; }
 };
 
 extern std::unordered_map<int, ffn_input_storage> g_tp_ffn_inputs;  // Key: layer number
@@ -1339,10 +1347,13 @@ extern std::mutex                               g_tp_ffn_weight_mutex;
 
 // Attention input storage: stores the input to attention column-parallel layers on device 1
 struct attn_input_storage {
-    void *                  data;      // Buffer on device 1
+    // DEPRECATED: Use data_ptr() accessor — raw pointer is derived from alloc.ptr
+    void *                  data;      // DEPRECATED: derived from alloc.ptr
     int64_t                 ne0, ne1;  // Dimensions
     size_t                  size;      // Buffer size
     ggml_sycl::alloc_handle alloc;
+
+    void * data_ptr() const { return alloc.ptr ? alloc.ptr : data; }
 };
 
 extern std::unordered_map<int, attn_input_storage> g_tp_attn_inputs;  // Key: layer number
@@ -1364,11 +1375,14 @@ extern std::mutex                                g_tp_attn_weight_mutex;
 struct tp_async_ffn_job {
     int                     layer;             // Layer number
     sycl::event             completion_event;  // Event signaling computation complete
-    float *                 result_buf;        // Result buffer (in pinned host memory)
-    int64_t                 ne0, ne1;          // Output dimensions [N_out, batch]
-    size_t                  result_size;       // Result buffer size in bytes
-    bool                    valid;             // Job is valid and pending
+    // DEPRECATED: Use result_ptr() or derive from result_alloc.ptr — typed convenience accessor derived from alloc
+    float *                 result_buf;   // DEPRECATED: derived from result_alloc.ptr via static_cast
+    int64_t                 ne0, ne1;     // Output dimensions [N_out, batch]
+    size_t                  result_size;  // Result buffer size in bytes
+    bool                    valid;        // Job is valid and pending
     ggml_sycl::alloc_handle result_alloc;
+
+    float * result_ptr() const { return result_alloc.ptr ? static_cast<float *>(result_alloc.ptr) : result_buf; }
 };
 
 extern std::unordered_map<int, tp_async_ffn_job> g_tp_async_ffn_jobs;  // Key: layer number
@@ -1378,11 +1392,14 @@ extern std::mutex                                g_tp_async_ffn_mutex;
 struct tp_async_attn_job {
     int                     layer;             // Layer number
     sycl::event             completion_event;  // Event signaling computation complete
-    float *                 result_buf;        // Result buffer (in pinned host memory)
-    int64_t                 ne0, ne1;          // Output dimensions
-    size_t                  result_size;       // Result buffer size in bytes
-    bool                    valid;             // Job is valid and pending
+    // DEPRECATED: Use result_ptr() or derive from result_alloc.ptr — typed convenience accessor derived from alloc
+    float *                 result_buf;   // DEPRECATED: derived from result_alloc.ptr via static_cast
+    int64_t                 ne0, ne1;     // Output dimensions
+    size_t                  result_size;  // Result buffer size in bytes
+    bool                    valid;        // Job is valid and pending
     ggml_sycl::alloc_handle result_alloc;
+
+    float * result_ptr() const { return result_alloc.ptr ? static_cast<float *>(result_alloc.ptr) : result_buf; }
 };
 
 extern std::unordered_map<int, tp_async_attn_job> g_tp_async_attn_jobs;  // Key: layer number
@@ -1605,10 +1622,13 @@ void ggml_sycl_tp_free_attn_buffers();
 // =============================================================================
 
 struct tp_host_staging_buffer {
-    float *                 buf;
+    // DEPRECATED: Use buf_ptr() accessor — typed convenience accessor derived from alloc.ptr
+    float *                 buf;  // DEPRECATED: derived from alloc.ptr via static_cast
     size_t                  size;
     size_t                  capacity;
     ggml_sycl::alloc_handle alloc;
+
+    float * buf_ptr() const { return alloc.ptr ? static_cast<float *>(alloc.ptr) : buf; }
 };
 
 extern tp_host_staging_buffer g_tp_host_staging;
@@ -2855,13 +2875,19 @@ struct ggml_backend_sycl_context {
     struct moe_ids_cache_entry {
         uint64_t                hash = 0;
         std::vector<int32_t>    host_ids;
-        void *                  device_ids   = nullptr;
+        // DEPRECATED: Use device_ids_ptr() accessor — derived from device_alloc.ptr
+        void *                  device_ids   = nullptr;  // DEPRECATED: derived from device_alloc.ptr
         size_t                  device_bytes = 0;
         ggml_sycl::alloc_handle device_alloc;
         ggml_sycl::alloc_handle staging_alloc;
-        void *                  staging_ids   = nullptr;  // Pinned host staging for non-USM sources
+        // DEPRECATED: Use staging_ids_ptr() accessor — derived from staging_alloc.ptr
+        void *                  staging_ids   = nullptr;  // DEPRECATED: derived from staging_alloc.ptr
         size_t                  staging_bytes = 0;
         bool                    from_prealloc = false;    // true if device_ids came from Phase 4 pre-allocation
+
+        void * device_ids_ptr() const { return device_alloc.ptr ? device_alloc.ptr : device_ids; }
+
+        void * staging_ids_ptr() const { return staging_alloc.ptr ? staging_alloc.ptr : staging_ids; }
     };
 
     std::unordered_map<const ggml_tensor *, moe_ids_cache_entry> moe_ids_cache;

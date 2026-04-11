@@ -1245,9 +1245,9 @@ void * ggml_sycl_tp_get_cached_ffn_norm(int layer, int device) {
     // Return appropriate buffer for device
     int main_device = g_sycl_tp_config.devices[0];
     if (device == main_device) {
-        return entry.data;
+        return entry.data_ptr();
     } else {
-        return entry.data_dev1;
+        return entry.data_dev1_ptr();
     }
 }
 
@@ -1577,15 +1577,15 @@ static void tp_attn_free_handles(tp_attn_compute_buffers & bufs) {
         ggml_sycl::unified_free(bufs.attn_scores_alloc);
         bufs.attn_scores_alloc = {};
     }
-    bufs.input_q8_dev  = nullptr;
-    bufs.q_out         = nullptr;
-    bufs.k_out         = nullptr;
-    bufs.v_out         = nullptr;
-    bufs.attn_out      = nullptr;
-    bufs.attn_q8_dev   = nullptr;
-    bufs.partial_out   = nullptr;
-    bufs.attn_scores   = nullptr;
-    bufs.allocated     = false;
+    bufs.input_q8_dev = nullptr;
+    bufs.q_out        = nullptr;
+    bufs.k_out        = nullptr;
+    bufs.v_out        = nullptr;
+    bufs.attn_out     = nullptr;
+    bufs.attn_q8_dev  = nullptr;
+    bufs.partial_out  = nullptr;
+    bufs.attn_scores  = nullptr;
+    bufs.allocated    = false;
 }
 
 tp_attn_compute_buffers * ggml_sycl_tp_ensure_attn_buffers(int       layer,
@@ -1611,10 +1611,10 @@ tp_attn_compute_buffers * ggml_sycl_tp_ensure_attn_buffers(int       layer,
     }
 
     // Compute padded dimensions
-    const int64_t q8_1_ts              = sizeof(block_q8_1);
-    const int64_t q8_1_bs              = QK8_1;
-    const int64_t new_n_embd_padded     = GGML_PAD(n_embd, MATRIX_ROW_PADDING);
-    const int64_t new_n_embd_q_padded   = GGML_PAD(n_embd_q_shard, MATRIX_ROW_PADDING);
+    const int64_t q8_1_ts             = sizeof(block_q8_1);
+    const int64_t q8_1_bs             = QK8_1;
+    const int64_t new_n_embd_padded   = GGML_PAD(n_embd, MATRIX_ROW_PADDING);
+    const int64_t new_n_embd_q_padded = GGML_PAD(n_embd_q_shard, MATRIX_ROW_PADDING);
 
     // Determine max batch with headroom
     const int64_t new_batch_max = std::max(batch, bufs->batch_max) + 16;
@@ -1623,12 +1623,9 @@ tp_attn_compute_buffers * ggml_sycl_tp_ensure_attn_buffers(int       layer,
     // Resize triggers when any dimension that affects buffer sizes grows.
     bool needs_alloc  = !bufs->allocated;
     bool needs_resize = bufs->allocated &&
-                        (new_n_embd_padded > bufs->n_embd_padded ||
-                         new_n_embd_q_padded > bufs->n_embd_q_shard_padded ||
-                         n_embd_k_shard > bufs->n_embd_k_shard ||
-                         n_embd_v_shard > bufs->n_embd_v_shard ||
-                         N_out > bufs->N_out ||
-                         batch > bufs->batch_max);
+                        (new_n_embd_padded > bufs->n_embd_padded || new_n_embd_q_padded > bufs->n_embd_q_shard_padded ||
+                         n_embd_k_shard > bufs->n_embd_k_shard || n_embd_v_shard > bufs->n_embd_v_shard ||
+                         N_out > bufs->N_out || batch > bufs->batch_max);
 
     if (needs_resize && bufs->allocated) {
         tp_attn_free_handles(*bufs);
@@ -1636,19 +1633,19 @@ tp_attn_compute_buffers * ggml_sycl_tp_ensure_attn_buffers(int       layer,
 
     if (needs_alloc || needs_resize) {
         // Use max of current and new (with headroom for batch)
-        const int64_t eff_n_embd_padded   = std::max(new_n_embd_padded, bufs->n_embd_padded);
-        const int64_t eff_q_padded        = std::max(new_n_embd_q_padded, bufs->n_embd_q_shard_padded);
-        const int64_t eff_k_shard         = std::max(n_embd_k_shard, bufs->n_embd_k_shard);
-        const int64_t eff_v_shard         = std::max(n_embd_v_shard, bufs->n_embd_v_shard);
-        const int64_t eff_N_out           = std::max(N_out, bufs->N_out);
-        const int64_t eff_q_shard         = std::max(n_embd_q_shard, bufs->n_embd_q_shard);
+        const int64_t eff_n_embd_padded = std::max(new_n_embd_padded, bufs->n_embd_padded);
+        const int64_t eff_q_padded      = std::max(new_n_embd_q_padded, bufs->n_embd_q_shard_padded);
+        const int64_t eff_k_shard       = std::max(n_embd_k_shard, bufs->n_embd_k_shard);
+        const int64_t eff_v_shard       = std::max(n_embd_v_shard, bufs->n_embd_v_shard);
+        const int64_t eff_N_out         = std::max(N_out, bufs->N_out);
+        const int64_t eff_q_shard       = std::max(n_embd_q_shard, bufs->n_embd_q_shard);
 
-        const size_t input_q8_size  = (size_t) new_batch_max * eff_n_embd_padded * q8_1_ts / q8_1_bs;
-        const size_t q_out_size     = (size_t) eff_q_shard * new_batch_max * sizeof(float);
-        const size_t k_out_size     = (size_t) eff_k_shard * new_batch_max * sizeof(float);
-        const size_t v_out_size     = (size_t) eff_v_shard * new_batch_max * sizeof(float);
-        const size_t attn_q8_size   = (size_t) new_batch_max * eff_q_padded * q8_1_ts / q8_1_bs;
-        const size_t partial_size   = (size_t) eff_N_out * new_batch_max * sizeof(float);
+        const size_t input_q8_size = (size_t) new_batch_max * eff_n_embd_padded * q8_1_ts / q8_1_bs;
+        const size_t q_out_size    = (size_t) eff_q_shard * new_batch_max * sizeof(float);
+        const size_t k_out_size    = (size_t) eff_k_shard * new_batch_max * sizeof(float);
+        const size_t v_out_size    = (size_t) eff_v_shard * new_batch_max * sizeof(float);
+        const size_t attn_q8_size  = (size_t) new_batch_max * eff_q_padded * q8_1_ts / q8_1_bs;
+        const size_t partial_size  = (size_t) eff_N_out * new_batch_max * sizeof(float);
 
         ggml_sycl::alloc_request req{};
         req.queue                          = stream;
@@ -1737,9 +1734,10 @@ tp_attn_compute_buffers * ggml_sycl_tp_ensure_attn_buffers(int       layer,
         bufs->allocated             = true;
         bufs->device_id             = device;
 
-        GGML_SYCL_DEBUG("SYCL TP: Allocated persistent attn buffers for layer %d "
-                        "(n_embd=%lld, q_shard=%lld, batch_max=%lld)\n",
-                        layer, (long long) eff_n_embd_padded, (long long) eff_q_shard, (long long) new_batch_max);
+        GGML_SYCL_DEBUG(
+            "SYCL TP: Allocated persistent attn buffers for layer %d "
+            "(n_embd=%lld, q_shard=%lld, batch_max=%lld)\n",
+            layer, (long long) eff_n_embd_padded, (long long) eff_q_shard, (long long) new_batch_max);
     }
 
     // Grow attn_scores buffer on demand (kv_seq_len increases every token).
@@ -1752,13 +1750,14 @@ tp_attn_compute_buffers * ggml_sycl_tp_ensure_attn_buffers(int       layer,
         // n_heads_q derived from q_shard / head_dim (128 hardcoded for Mistral; use q_shard as proxy)
         // Actual scores size = n_heads_q * batch * kv_seq_len * sizeof(float)
         // n_heads_q = n_embd_q_shard / 128
-        const int64_t n_heads_q    = bufs->n_embd_q_shard / 128;
-        const size_t  scores_needed = (size_t) n_heads_q * (size_t) bufs->batch_max * (size_t) kv_seq_len * sizeof(float);
+        const int64_t n_heads_q = bufs->n_embd_q_shard / 128;
+        const size_t  scores_needed =
+            (size_t) n_heads_q * (size_t) bufs->batch_max * (size_t) kv_seq_len * sizeof(float);
 
         if (scores_needed > bufs->attn_scores_size) {
             // Grow with 25% headroom over the requested kv_seq_len
-            const int64_t grow_kv  = kv_seq_len + kv_seq_len / 4;
-            const size_t  new_cap  = (size_t) n_heads_q * (size_t) bufs->batch_max * (size_t) grow_kv * sizeof(float);
+            const int64_t grow_kv = kv_seq_len + kv_seq_len / 4;
+            const size_t  new_cap = (size_t) n_heads_q * (size_t) bufs->batch_max * (size_t) grow_kv * sizeof(float);
 
             if (bufs->attn_scores_alloc.ptr) {
                 ggml_sycl::unified_free(bufs->attn_scores_alloc);
@@ -1776,14 +1775,14 @@ tp_attn_compute_buffers * ggml_sycl_tp_ensure_attn_buffers(int       layer,
             scores_req.intent.constraints.must_device = true;
 
             if (!ggml_sycl::unified_alloc(scores_req, &bufs->attn_scores_alloc) || !bufs->attn_scores_alloc.ptr) {
-                GGML_LOG_ERROR("SYCL TP: Failed to grow attn_scores for layer %d (kv_seq_len=%lld)\n",
-                               layer, (long long) kv_seq_len);
+                GGML_LOG_ERROR("SYCL TP: Failed to grow attn_scores for layer %d (kv_seq_len=%lld)\n", layer,
+                               (long long) kv_seq_len);
                 // Non-fatal: return bufs with attn_scores == nullptr; caller handles fallback
             } else {
                 bufs->attn_scores      = static_cast<float *>(bufs->attn_scores_alloc.ptr);
                 bufs->attn_scores_size = new_cap;
-                GGML_SYCL_DEBUG("SYCL TP: Grew attn_scores for layer %d to kv=%lld (%zu bytes)\n",
-                                layer, (long long) grow_kv, new_cap);
+                GGML_SYCL_DEBUG("SYCL TP: Grew attn_scores for layer %d to kv=%lld (%zu bytes)\n", layer,
+                                (long long) grow_kv, new_cap);
             }
         }
     }
@@ -1835,7 +1834,7 @@ float * ggml_sycl_tp_ensure_host_staging(size_t size, queue_ptr stream) {
     g_tp_host_staging.size     = size;
 
     GGML_SYCL_DEBUG("SYCL TP: Allocated persistent host staging buffer (%zu bytes)\n", new_capacity);
-    return g_tp_host_staging.buf;
+    return g_tp_host_staging.buf_ptr();
 }
 
 void ggml_sycl_tp_free_host_staging() {

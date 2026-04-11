@@ -21133,7 +21133,8 @@ static void ggml_sycl_tp_release_async_ffn_job(int layer) {
     if (it->second.result_alloc.ptr != nullptr) {
         (void) ggml_sycl::unified_free(it->second.result_alloc);
     } else if (it->second.result_buf != nullptr) {
-        ggml_sycl_host_free(it->second.result_buf);
+        // Legacy sycl::free path is dead code — result_buf is always derived from result_alloc.ptr
+        GGML_ASSERT(false && "tp_async_ffn_job: legacy host_free path reached — result_alloc should always be set");
     }
     g_tp_async_ffn_jobs.erase(it);
 }
@@ -21371,7 +21372,9 @@ static void tp_device1_worker_thread_func() {
             if (slot.result_alloc.ptr != nullptr) {
                 (void) ggml_sycl::unified_free(slot.result_alloc);
             } else if (slot.result_buf != nullptr) {
-                ggml_sycl_host_free(slot.result_buf);
+                // Legacy sycl::free path is dead code — result_buf is always derived from result_alloc.ptr
+                GGML_ASSERT(false &&
+                            "tp_async_ffn_job: legacy host_free path reached — result_alloc should always be set");
             }
             slot = { work.layer, result_buf, N_out, work.batch, output_size, true, result_alloc };
         }
@@ -21429,7 +21432,9 @@ void ggml_sycl_tp_worker_shutdown() {
             if (pair.second.result_alloc.ptr != nullptr) {
                 (void) ggml_sycl::unified_free(pair.second.result_alloc);
             } else if (pair.second.result_buf) {
-                ggml_sycl_host_free(pair.second.result_buf);
+                // Legacy sycl::free path is dead code — result_buf is always derived from result_alloc.ptr
+                GGML_ASSERT(false &&
+                            "tp_async_ffn_job: legacy host_free path reached — result_alloc should always be set");
             }
         }
         w.results.clear();
@@ -21482,7 +21487,8 @@ void ggml_sycl_tp_release_ffn_result(int layer) {
         if (it->second.result_alloc.ptr != nullptr) {
             (void) ggml_sycl::unified_free(it->second.result_alloc);
         } else if (it->second.result_buf) {
-            ggml_sycl_host_free(it->second.result_buf);
+            // Legacy sycl::free path is dead code — result_buf is always derived from result_alloc.ptr
+            GGML_ASSERT(false && "tp_async_ffn_job: legacy host_free path reached — result_alloc should always be set");
         }
         w.results.erase(it);
     }
@@ -21969,7 +21975,7 @@ static void ggml_sycl_mul_mat_tp_column_parallel_post(ggml_backend_sycl_context 
         {
             std::lock_guard<std::mutex> lock(g_tp_ffn_input_mutex);
             auto                        it = g_tp_ffn_inputs.find(layer);
-            if (it != g_tp_ffn_inputs.end() && it->second.data != nullptr) {
+            if (it != g_tp_ffn_inputs.end() && it->second.data_ptr() != nullptr) {
                 (void) ggml_sycl::unified_free(it->second.alloc);
             }
             g_tp_ffn_inputs[layer]   = { input_dev1, K, batch, src1_size, input_dev1_alloc };
@@ -22034,7 +22040,7 @@ static void ggml_sycl_mul_mat_tp_column_parallel_post(ggml_backend_sycl_context 
     } else {  // is_attn_q
         std::lock_guard<std::mutex> lock(g_tp_attn_input_mutex);
         auto                        it = g_tp_attn_inputs.find(layer);
-        if (it != g_tp_attn_inputs.end() && it->second.data != nullptr) {
+        if (it != g_tp_attn_inputs.end() && it->second.data_ptr() != nullptr) {
             (void) ggml_sycl::unified_free(it->second.alloc);
         }
         g_tp_attn_inputs[layer]   = { input_dev1, K, batch, src1_size, input_dev1_alloc };
@@ -22360,7 +22366,8 @@ void ggml_sycl_tp_launch_async_ffn(ggml_backend_sycl_context & ctx,
         if (slot.result_alloc.ptr != nullptr) {
             (void) ggml_sycl::unified_free(slot.result_alloc);
         } else if (slot.result_buf != nullptr) {
-            ggml_sycl_host_free(slot.result_buf);
+            // Legacy sycl::free path is dead code — result_buf is always derived from result_alloc.ptr
+            GGML_ASSERT(false && "tp_async_ffn_job: legacy host_free path reached — result_alloc should always be set");
         }
         slot = { layer, completion_event, result_buf, N_out, batch, output_size, true, result_alloc };
     }
@@ -22615,7 +22622,7 @@ static void ggml_sycl_mul_mat_tp_row_parallel_post(ggml_backend_sycl_context & c
                         layer, ffn_input.data, g_tp_ffn_inputs.size(), name);
             }
 
-            if (ffn_input.data != nullptr) {
+            if (ffn_input.data_ptr() != nullptr) {
                 static int ffn_found = 0;
                 if (g_ggml_sycl_tp_debug && ffn_found++ < 3) {
                     fprintf(stderr, "TP DEBUG: FFN input found for layer %d, data=%p\n", layer, ffn_input.data);
@@ -22713,7 +22720,7 @@ static void ggml_sycl_mul_mat_tp_row_parallel_post(ggml_backend_sycl_context & c
 
                             if (do_debug) {
                                 float in_sample[4];
-                                stream->memcpy(in_sample, ffn_input.data, 4 * sizeof(float)).wait();
+                                stream->memcpy(in_sample, ffn_input.data_ptr(), 4 * sizeof(float)).wait();
                                 fprintf(
                                     stderr,
                                     "TP DEBUG FFN input layer %d: input[0..3]=[%f,%f,%f,%f], K_full=%lld, batch=%lld\n",
@@ -22725,9 +22732,11 @@ static void ggml_sycl_mul_mat_tp_row_parallel_post(ggml_backend_sycl_context & c
                             const bool use_soa_ffn_input = ggml_sycl_layout_is_soa_or_coalesced(gate_extra);
                             if (use_soa_ffn_input) {
                                 quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
-                                    (const float *) ffn_input.data, input_q8_dev, K_full, batch, K_full_padded, stream);
+                                    (const float *) ffn_input.data_ptr(), input_q8_dev, K_full, batch, K_full_padded,
+                                    stream);
                             } else {
-                                quantize_row_q8_1_sycl<quantize_q8_1>((const float *) ffn_input.data, input_q8_dev,
+                                quantize_row_q8_1_sycl<quantize_q8_1>((const float *) ffn_input.data_ptr(),
+                                                                      input_q8_dev,
 
                                                                       K_full, batch, K_full_padded, stream);
                             }
@@ -23073,7 +23082,7 @@ static void ggml_sycl_mul_mat_tp_row_parallel_post(ggml_backend_sycl_context & c
                 fprintf(stderr, "TP DEBUG ATTN_OUTPUT decode: layer=%d attn_input.data=%p, map_size=%zu\n", layer,
                         attn_input.data, g_tp_attn_inputs.size());
             }
-            if (attn_input.data != nullptr) {
+            if (attn_input.data_ptr() != nullptr) {
                 static int attn_found = 0;
                 if (g_ggml_sycl_tp_debug && attn_found++ < 40) {
                     fprintf(stderr, "TP DEBUG: Attention input found for layer %d, data=%p\n", layer, attn_input.data);
@@ -23228,13 +23237,14 @@ static void ggml_sycl_mul_mat_tp_row_parallel_post(ggml_backend_sycl_context & c
                             // Use SoA quantizer if Q weight is reordered (Q/K/V share same quantization format)
                             const bool use_soa_attn_input = ggml_sycl_layout_is_soa_or_coalesced(q_extra);
                             if (use_soa_attn_input) {
-                                quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>((const float *) attn_input.data,
-                                                                                      input_q8_dev, n_embd, batch,
-                                                                                      n_embd_padded, stream);
+                                quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
+                                    (const float *) attn_input.data_ptr(), input_q8_dev, n_embd, batch, n_embd_padded,
+                                    stream);
 
                             } else {
-                                quantize_row_q8_1_sycl<quantize_q8_1>((const float *) attn_input.data, input_q8_dev,
-                                                                      n_embd, batch, n_embd_padded, stream);
+                                quantize_row_q8_1_sycl<quantize_q8_1>((const float *) attn_input.data_ptr(),
+                                                                      input_q8_dev, n_embd, batch, n_embd_padded,
+                                                                      stream);
                             }
                             stream->wait();
                             // Create temporary tensors with correct dimensions for MMVQ
