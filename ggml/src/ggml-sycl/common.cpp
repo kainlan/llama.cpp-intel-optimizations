@@ -1052,6 +1052,13 @@ void ggml_sycl_tp_cache_ffn_norm(int          layer,
         }
         entry.data      = entry.data_alloc.ptr;
         int dev1        = g_sycl_tp_config.devices[1];
+        ggml_sycl_set_device(dev1);
+        queue_ptr stream1 = &ggml_sycl_get_device(dev1).default_queue();
+        req.queue         = stream1;
+        req.device        = dev1;
+        if (!ggml_sycl::unified_alloc(req, &entry.data_dev1_alloc)) {
+            entry.data_dev1_alloc = {};
+        }
         entry.data_dev1 = entry.data_dev1_alloc.ptr;
         ggml_sycl_set_device(g_sycl_tp_config.devices[0]);
         if (!entry.data || !entry.data_dev1) {
