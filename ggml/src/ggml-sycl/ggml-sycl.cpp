@@ -9999,8 +9999,6 @@ static sycl::event ggml_sycl_fill_reordered_gpu(sycl::queue &                   
         try {
             bool from_arena = false;
             temp_vram       = arena_device_alloc(src_size, dev_id, queue, from_arena);
-            if (temp_vram && !from_arena) {
-            }
         } catch (const sycl::exception & e) {
             GGML_LOG_ERROR("[GPU-REORDER] temp VRAM alloc failed (%zu bytes): %s\n", src_size, e.what());
             if (staging) {
@@ -11887,10 +11885,11 @@ static void ggml_sycl_preload_model_weights() {
 
         // Register MoE expert VRAM reserve AFTER cache creation.
         // Must happen here (not in set_tensor_inventory) because the unified cache
-        // absorbs pre-existing arena zone usage into its baseline at creation
-        // time — reserves registered before the cache is created have no effect on
-        // available_for_compute().  The cache is now created (by direct_stage
-        // calls above), so this reserve will properly reduce the budget seen by KV tiering.
+        // absorbs pre-existing arena zone allocations into its baseline at
+        // creation time — reserves registered before the cache exists have no
+        // effect on available_for_compute().  The cache is now created (by
+        // direct_stage calls above), so this reserve will properly reduce the
+        // budget seen by KV tiering.
         if (g_moe_expert_total_bytes > 0 && g_moe_n_experts_total > 0 && g_model_n_layer > 0) {
             const size_t n_expert_tensors =
                 static_cast<size_t>(g_moe_n_experts_total) * static_cast<size_t>(g_model_n_layer);

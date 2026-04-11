@@ -6847,8 +6847,6 @@ UnifiedKernel::~UnifiedKernel() {
     // Free micro-graph resources
     micro_graph_.reset();
     if (micro_tile_counters_) {
-        if (micro_tile_counters_n_ > 0 && device_id_ >= 0) {
-        }
         device_free(micro_tile_counters_, queue_, arena_micro_tile_counters_);
         micro_tile_counters_       = nullptr;
         micro_tile_counters_n_     = 0;
@@ -6860,8 +6858,6 @@ UnifiedKernel::~UnifiedKernel() {
         pinned_pool_micro_gen_ = false;
     }
     // Free MMVQ micro-graph Q8 and scratch buffers
-    if (mmvq_q8_buf_size_ > 0 && device_id_ >= 0) {
-    }
     for (int i = 0; i < 2; i++) {
         if (mmvq_q8_bufs_[i]) {
             device_free(mmvq_q8_bufs_[i], queue_, arena_mmvq_q8_bufs_);
@@ -6870,8 +6866,6 @@ UnifiedKernel::~UnifiedKernel() {
     }
     mmvq_q8_buf_size_   = 0;
     arena_mmvq_q8_bufs_ = false;
-    if (mmvq_gate_scratch_sz_ > 0 && device_id_ >= 0) {
-    }
     if (mmvq_gate_scratch_) {
         device_free(mmvq_gate_scratch_, queue_, arena_mmvq_gate_scratch_);
         mmvq_gate_scratch_       = nullptr;
@@ -7102,8 +7096,6 @@ void UnifiedKernel::free_persistent_buffers() {
     }
     for (auto & slot : get_rows_slots_) {
         if (slot.ptr) {
-            if (slot.size > 0 && device_id_ >= 0) {
-            }
             device_free(slot.ptr, queue_, arena_get_rows_);
             slot.ptr  = nullptr;
             slot.size = 0;
@@ -8195,8 +8187,6 @@ void UnifiedKernel::add_temp_device_alloc(void * ptr, size_t bytes) {
     if (current_plan_ && ptr) {
         current_plan_->temp_device_allocs.push_back({ ptr, bytes });
         current_plan_->temp_device_alloc_bytes += bytes;
-        if (device_id_ >= 0) {
-        }
     }
 }
 
@@ -8219,8 +8209,6 @@ void UnifiedKernel::get_split_config(KernelSplitConfig & out) const {
 
 void UnifiedKernel::cancel_persistent() {
     if (current_plan_) {
-        if (current_plan_->temp_device_alloc_bytes > 0 && device_id_ >= 0) {
-        }
         for (auto & [ptr, sz] : current_plan_->temp_device_allocs) {
             auto hit = current_plan_->temp_device_alloc_handles.find(ptr);
             if (hit != current_plan_->temp_device_alloc_handles.end()) {
@@ -8276,8 +8264,6 @@ OperationType UnifiedKernel::plan_op_type(int op_idx) const {
 void UnifiedKernel::begin_plan_update() {
     // Cancel any in-flight plan but DON'T free cached data
     if (current_plan_) {
-        if (current_plan_->temp_device_alloc_bytes > 0 && device_id_ >= 0) {
-        }
         for (auto & [ptr, sz] : current_plan_->temp_device_allocs) {
             auto hit = current_plan_->temp_device_alloc_handles.find(ptr);
             if (hit != current_plan_->temp_device_alloc_handles.end()) {
@@ -8426,8 +8412,6 @@ void UnifiedKernel::invalidate_plan_cache() {
     orig_phase_entries_.clear();
     orig_phase_offset_.clear();
     orig_phase_tiles_.clear();
-    if (cached_temp_device_alloc_bytes_ > 0 && device_id_ >= 0) {
-    }
     for (auto & [ptr, sz] : cached_temp_device_allocs_) {
         auto hit = cached_temp_device_alloc_handles_.find(ptr);
         if (hit != cached_temp_device_alloc_handles_.end()) {
@@ -8478,8 +8462,6 @@ void * UnifiedKernel::get_rows_stable_ptr(int get_rows_index, size_t bytes) {
     // Free old buffer and untrack
     if (slot.ptr) {
         device_free(slot.ptr, queue_, arena_get_rows_);
-        if (slot.size > 0 && device_id_ >= 0) {
-        }
     }
     bool arena_tmp = false;
     slot.ptr       = device_alloc_scratch(bytes, queue_, device_id_, arena_tmp);
@@ -8487,8 +8469,6 @@ void * UnifiedKernel::get_rows_stable_ptr(int get_rows_index, size_t bytes) {
         arena_get_rows_ = true;
     }
     slot.size = slot.ptr ? bytes : 0;
-    if (slot.size > 0 && device_id_ >= 0) {
-    }
     return slot.ptr;
 }
 
@@ -8543,8 +8523,6 @@ void UnifiedKernel::build_scratch_pool() {
         free_scratch_pool();
         scratch_pool_      = device_alloc_scratch(total_bytes, queue_, device_id_, arena_scratch_pool_);
         scratch_pool_size_ = scratch_pool_ ? total_bytes : 0;
-        if (scratch_pool_size_ > 0 && device_id_ >= 0) {
-        }
         // Re-initialize scratch_outputs_ after free_scratch_pool() cleared it
         scratch_outputs_.assign(n_ops, nullptr);
     }
@@ -8690,8 +8668,6 @@ void UnifiedKernel::execute_deferred_copies() {
 void UnifiedKernel::free_scratch_pool() {
     final_output_ggml_dst_ = nullptr;
     if (scratch_pool_) {
-        if (scratch_pool_size_ > 0 && device_id_ >= 0) {
-        }
         device_free(scratch_pool_, queue_, arena_scratch_pool_);
         scratch_pool_       = nullptr;
         scratch_pool_size_  = 0;
@@ -9799,18 +9775,12 @@ void UnifiedKernel::record_micro_graph() {
     const int total_phase_ops   = host_phase_offset_.back();  // last offset = total entries
     const int n_counters_needed = n_phases + total_phase_ops + 16;
     if (n_counters_needed > micro_tile_counters_n_) {
-        // Untrack old allocation
-        if (micro_tile_counters_n_ > 0 && device_id_ >= 0) {
-        }
         if (micro_tile_counters_) {
             device_free(micro_tile_counters_, queue_, arena_micro_tile_counters_);
         }
         micro_tile_counters_ = static_cast<int *>(
             device_alloc_scratch(n_counters_needed * sizeof(int), queue_, device_id_, arena_micro_tile_counters_));
         micro_tile_counters_n_ = n_counters_needed;
-        // Track new allocation
-        if (device_id_ >= 0) {
-        }
         // Zero counters once at allocation (generation starts at 0)
         queue_.memset(micro_tile_counters_, 0, n_counters_needed * sizeof(int)).wait();
     }
@@ -9842,9 +9812,6 @@ void UnifiedKernel::record_micro_graph() {
         const size_t q8_size          = std::max(q8_hidden, q8_inter);
 
         if (mmvq_q8_buf_size_ < q8_size) {
-            // Untrack old allocations
-            if (mmvq_q8_buf_size_ > 0 && device_id_ >= 0) {
-            }
             for (int i = 0; i < 2; i++) {
                 if (mmvq_q8_bufs_[i]) {
                     device_free(mmvq_q8_bufs_[i], queue_, arena_mmvq_q8_bufs_);
@@ -9856,16 +9823,10 @@ void UnifiedKernel::record_micro_graph() {
                 }
             }
             mmvq_q8_buf_size_ = q8_size;
-            // Track new allocations
-            if (device_id_ >= 0) {
-            }
         }
 
         const size_t gate_scratch_sz = intermediate_dim * sizeof(float);
         if (mmvq_gate_scratch_sz_ < gate_scratch_sz) {
-            // Untrack old allocations
-            if (mmvq_gate_scratch_sz_ > 0 && device_id_ >= 0) {
-            }
             if (mmvq_gate_scratch_) {
                 device_free(mmvq_gate_scratch_, queue_, arena_mmvq_gate_scratch_);
             }
@@ -9877,9 +9838,6 @@ void UnifiedKernel::record_micro_graph() {
             mmvq_up_scratch_ =
                 static_cast<float *>(device_alloc_scratch(gate_scratch_sz, queue_, device_id_, arena_mmvq_up_scratch_));
             mmvq_gate_scratch_sz_ = gate_scratch_sz;
-            // Track new allocations
-            if (device_id_ >= 0) {
-            }
         }
     }
 
@@ -10314,8 +10272,6 @@ void UnifiedKernel::execute_persistent() {
     }
 
     // Free non-cached temp allocs
-    if (current_plan_->temp_device_alloc_bytes > 0 && device_id_ >= 0) {
-    }
     for (auto & [ptr, sz] : current_plan_->temp_device_allocs) {
         auto hit = current_plan_->temp_device_alloc_handles.find(ptr);
         if (hit != current_plan_->temp_device_alloc_handles.end()) {
@@ -10612,8 +10568,6 @@ void UnifiedKernel::execute_persistent_phased(phase_callback_t on_matmul_complet
     }
 
     // Free non-cached temp allocs
-    if (current_plan_->temp_device_alloc_bytes > 0 && device_id_ >= 0) {
-    }
     for (auto & [ptr, sz] : current_plan_->temp_device_allocs) {
         auto hit = current_plan_->temp_device_alloc_handles.find(ptr);
         if (hit != current_plan_->temp_device_alloc_handles.end()) {
@@ -11927,8 +11881,6 @@ void UnifiedKernel::finalize_persistent() {
     }
 
     // Free non-cached temp allocs
-    if (current_plan_->temp_device_alloc_bytes > 0 && device_id_ >= 0) {
-    }
     for (auto & [ptr, sz] : current_plan_->temp_device_allocs) {
         auto hit = current_plan_->temp_device_alloc_handles.find(ptr);
         if (hit != current_plan_->temp_device_alloc_handles.end()) {

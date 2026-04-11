@@ -1119,7 +1119,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
         params.block_table        = (const int32_t *) ggml_sycl_get_data_ptr(block_table, device);
         params.seq_lens           = (const int32_t *) ggml_sycl_get_data_ptr(seq_lens_tensor, device);
 
-#if 0  // Debug output disabled \
+#if 0  // Debug output disabled
        // Print only once to avoid flooding output
         static bool paged_attn_info_shown = false;
         if (!paged_attn_info_shown) {

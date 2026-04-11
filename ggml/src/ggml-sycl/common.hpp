@@ -1730,8 +1730,6 @@ template <typename T> inline void ggml_sycl_free_device_tracked_t(T * ptr, size_
 
 inline void * ggml_sycl_malloc_host_tracked_bytes(size_t bytes, sycl::queue & queue, const char * tag) {
     void * ptr = ggml_sycl_malloc_host(bytes, queue, tag);
-    if (!ptr) {
-    }
     return ptr;
 }
 
@@ -1782,12 +1780,8 @@ struct staging_buffer_pool {
         // The pool is a Meyers singleton — its destructor runs during static
         // destruction.  At that point sycl::free() is unsafe (the SYCL
         // runtime may already be torn down).  Normal cleanup happens via
-        // shutdown() called from ggml_backend_sycl_free().  The destructor
-        // only subtracts the host budget to keep accounting consistent; the
-        // OS reclaims all process memory at exit.
-        size_t freed = total_bytes_.load(std::memory_order_relaxed);
-        if (freed > 0 && !ggml_sycl::ggml_sycl_is_shutting_down()) {
-        }
+        // shutdown() called from ggml_backend_sycl_free().  The OS reclaims
+        // all process memory at exit.
     }
 
     // Acquire a pinned host buffer of at least `needed` bytes.
@@ -1911,7 +1905,6 @@ struct staging_buffer_pool {
     // owns their lifetime and reclaims them on destruction.
     void shutdown(sycl::queue & queue) {
         std::lock_guard<std::mutex> lock(mutex_);
-        size_t                      freed = total_bytes_.load(std::memory_order_relaxed);
         for (auto & s : slots_) {
             if (s.ptr) {
                 ggml_sycl::alloc_registry::instance().unregister_alloc(s.ptr);
@@ -1923,8 +1916,6 @@ struct staging_buffer_pool {
         }
         slots_.clear();
         total_bytes_.store(0, std::memory_order_relaxed);
-        if (freed > 0) {
-        }
     }
 
     size_t total_bytes() const { return total_bytes_.load(std::memory_order_relaxed); }

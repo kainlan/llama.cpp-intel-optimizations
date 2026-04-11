@@ -2760,7 +2760,7 @@ size_t unified_cache_kv_arena_capacity(int device_id);
 size_t unified_cache_kv_arena_used(int device_id);
 
 // Sum of zone_used(KV) + zone_used(ONEDNN) + zone_used(RUNTIME) + zone_used(SCRATCH).
-// Returns 0 when arena is inactive. Replaces g_runtime_reserved_bytes.
+// Returns 0 when arena is inactive.
 size_t unified_cache_arena_non_weight_used(int device);
 
 // Sub-allocate from the arena's KV zone for per-layer KV cache placement.

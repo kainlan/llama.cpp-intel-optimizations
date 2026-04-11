@@ -815,8 +815,6 @@ std::vector<int> ExpertPredictor::predict_pregate(int           next_layer_idx,
     if (!scores_dev_ || scores_dev_n_ < M) {
         int scores_device = ggml_sycl_get_device_id_from_queue(compute_q);
         if (scores_dev_ && scores_queue_) {
-            if (scores_dev_n_ > 0 && !scores_from_arena_) {
-            }
             if (!scores_from_arena_) {
                 sycl::free(scores_dev_, *scores_queue_);
             }
@@ -838,8 +836,6 @@ std::vector<int> ExpertPredictor::predict_pregate(int           next_layer_idx,
             scores_dev_n_ = 0;
             GGML_LOG_WARN("[EXPERT-PREDICT] Failed to allocate device scores buffer, falling back to heuristic\n");
             return predict(next_layer_idx);
-        }
-        if (!scores_from_arena_) {
         }
     }
     float * scores_dev = scores_dev_;

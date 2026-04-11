@@ -5616,6 +5616,13 @@ bool unified_cache::validate() const {
     return ok;
 }
 
+// NOTE (792vn.5 cleanup): Arena zones now handle VRAM partitioning for runtime
+// allocations (KV, oneDNN, scratch).  Dynamic budget pressure from runtime
+// allocations is handled by the overcommit guard in unified_cache_total_committed_bytes()
+// rather than by shrinking the weight cache budget via this method.  Callers that
+// previously used g_runtime_reserved_bytes to drive update_reserved_bytes() have been
+// removed.  The method is retained for the host cache path (host runtime tracking)
+// and deferred-reserve patterns during cache creation.
 void unified_cache::update_reserved_bytes(size_t reserved_bytes) {
     size_t effective_budget = 0;
     {
@@ -7262,6 +7269,13 @@ size_t unified_cache_get_runtime_bytes_by_category(int device, runtime_category 
     return 0;
 }
 
+// Host runtime tracking: add/sub callers were removed as part of 792vn.5 cleanup
+// (device-side tracking moved to arena zones).  These host counter functions are
+// retained until the host arena gets zone infrastructure equivalent to the device
+// arena.  With no callers, the counters effectively stay at zero — host budget
+// tracking is disabled.
+// TODO: implement host arena zone tracking, then delete these three functions
+//       (add_runtime_host_bytes, sub_runtime_host_bytes, get_runtime_host_bytes).
 void unified_cache_add_runtime_host_bytes(size_t bytes) {
     if (bytes == 0) {
         return;
@@ -7321,10 +7335,9 @@ size_t unified_cache_available_for_compute(int device) {
 
     // Use the unified total-available view that sums BOTH budget channels
     // (weights from used_ + runtime from arena zone usage).
-    // Previously this only checked cache->available_for_compute() which relies
-    // on reserved_ being kept in sync via update_reserved_bytes() — a TOCTOU
-    // gap that could let the compute pool over-allocate when weights consumed
-    // VRAM between the last update_reserved_bytes call and this query.
+    // Arena zones are the single source of truth for runtime tracking —
+    // zone_used() values are always current, eliminating the TOCTOU gap
+    // that existed when reserved_ was driven by global counters.
     //
     // We still query live VRAM as a safety cap: if the driver reports less free
     // memory than the budget says, use the lower value.
@@ -7548,8 +7561,7 @@ bool unified_cache_is_budget_exceeded(int device) {
     }
     // Check the unified view: total committed (weights + runtime) > base budget.
     // The per-cache is_budget_exceeded() only checks used_ > budget_ which can
-    // miss over-allocation when runtime_bytes grew since the last
-    // update_reserved_bytes() call.
+    // miss over-allocation when arena zone usage grew after weight placement.
     const size_t committed = unified_cache_total_committed_bytes(device);
     const size_t base      = cache->base_budget();
     return cache->is_budget_exceeded() || committed > base;
@@ -9590,8 +9602,6 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
 
         // Arena zones are the single source of truth for runtime tracking.
         // zone_reset() above already zeroes zone_used() for KV and RUNTIME.
-        // Legacy global counters (g_runtime_reserved_bytes, g_runtime_cat_bytes)
-        // are no longer maintained — they were redundant with arena zones.
         return true;
     }
 
