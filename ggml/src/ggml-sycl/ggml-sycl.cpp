@@ -23857,20 +23857,23 @@ static void ggml_sycl_mul_mat_tp_row_parallel_post(ggml_backend_sycl_context & c
 
             stream->memcpy(host_buf, partial_out, dst_size).wait();
             ggml_sycl_set_device(main_device);
-            ggml_sycl::scoped_unified_alloc temp_add_alloc;
+            float * temp_add = static_cast<float *>(ggml_sycl::unified_cache_arena_alloc(main_device, dst_size));
+            ggml_sycl::scoped_unified_alloc temp_add_fallback;
             ggml_sycl::alloc_request        temp_req{};
             temp_req.queue                          = main_stream;
             temp_req.size                           = dst_size;
             temp_req.intent.role                    = ggml_sycl::alloc_role::TP_TMP;
             temp_req.intent.category                = ggml_sycl::runtime_category::COMPUTE;
             temp_req.intent.constraints.must_device = true;
-            const bool temp_add_ok                  = temp_add_alloc.allocate(temp_req);
-            float *    temp_add                     = static_cast<float *>(temp_add_alloc.get());
-            if (!temp_add_ok || !temp_add) {
-                GGML_LOG_ERROR("SYCL TP: ERROR - failed to allocate temp_add buffer (%zu bytes)\n", dst_size);
-                ggml_sycl_set_device(device);
-                ggml_sycl_set_device(main_device);
-                continue;
+            if (!temp_add) {
+                const bool temp_add_ok = temp_add_fallback.allocate(temp_req);
+                temp_add               = static_cast<float *>(temp_add_fallback.get());
+                if (!temp_add_ok || !temp_add) {
+                    GGML_LOG_ERROR("SYCL TP: ERROR - failed to allocate temp_add buffer (%zu bytes)\n", dst_size);
+                    ggml_sycl_set_device(device);
+                    ggml_sycl_set_device(main_device);
+                    continue;
+                }
             }
 
             main_stream->memcpy(temp_add, host_buf, dst_size).wait();
@@ -26796,6 +26799,15 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
             // zero-copy via host storage (USM host-pinned, GPU-accessible via PCIe).
             // Do NOT call blocking staging here — it blocks on malloc + CPU reorder.
             // The background prestage system will populate the cache for future tokens.
+            if (plan_active) {
+                static std::atomic<int> plan_miss_log{ 0 };
+                if (plan_miss_log.fetch_add(1, std::memory_order_relaxed) < 5) {
+                    GGML_LOG_WARN(
+                        "[MOE-PTR] T1 plan violation: expert %ld cache miss for %s — "
+                        "should be pre-placed by preload_model_weights\n",
+                        (long) e, src0->name ? src0->name : "?");
+                }
+            }
             GGML_SYCL_DEBUG("[OPT-FUSED] Expert %ld cache MISS, using AOS zero-copy (non-blocking)\n", (long) e);
             stats_miss++;
             continue;
@@ -35596,6 +35608,31 @@ cpu_fallback_fast:
     // and would give wrong results.  Fall through to the standard per-expert GPU dispatch.
     const bool   moe_hybrid_active =
         (moe_hybrid_val != 0) && use_expert_cache && (ne12 == 1) && (ne11 == 1) && cpu_type_ok;
+    // T4: Enable hybrid CPU dispatch when the placement plan routes any expert to host.
+    // This ensures CPU dispatch activates even when GGML_SYCL_MOE_HYBRID=0 if the
+    // planner decided some experts should be host-pinned (e.g., MoE models that
+    // don't fit entirely in VRAM).
+    bool plan_has_cpu_experts = false;
+    if (has_placement_plan && src0->name && src0->name[0] != '\0') {
+        const std::string tname(src0->name);
+        const int64_t     n_exp      = src0->ne[2] > 0 ? src0->ne[2] : 1;
+        auto &            route_plan = route_cache->get_placement_plan();
+        for (int64_t e = 0; e < n_exp; ++e) {
+            if (!route_plan.expert_on_device(tname, static_cast<int>(e), ctx.device)) {
+                plan_has_cpu_experts = true;
+                break;
+            }
+        }
+    }
+    const bool plan_hybrid = plan_has_cpu_experts && cpu_type_ok;
+    if (plan_hybrid && !moe_hybrid_active) {
+        static std::atomic<int> plan_hybrid_log{ 0 };
+        if (plan_hybrid_log.fetch_add(1, std::memory_order_relaxed) < 3) {
+            GGML_LOG_INFO("[MOE-HYBRID] Placement plan routes experts to host — enabling CPU dispatch for %s\n",
+                          src0->name ? src0->name : "?");
+        }
+    }
+    const bool moe_hybrid_with_plan      = moe_hybrid_active || plan_hybrid;
     const bool route_host_experts_to_cpu = use_expert_cache;
 
     // Expert cache stages data in the requested layout via direct_stage_expert.
@@ -35614,7 +35651,7 @@ cpu_fallback_fast:
         if (!ggml_sycl_update_moe_ptr_table(
                 ctx, src0, ids, route_layout, nullptr, /*allow_all_experts=*/false, ids_override, host_only_ptr_table,
                 /*force_cache_aos=*/need_force_aos,
-                /*skip_cpu_routed_experts=*/moe_hybrid_active || route_host_experts_to_cpu)) {
+                /*skip_cpu_routed_experts=*/moe_hybrid_with_plan || route_host_experts_to_cpu)) {
             // SOA/COALESCED staging failed (cache miss). Fall back to AOS which
             // uses direct pointer arithmetic from USM-accessible host storage.
             if (route_layout != GGML_LAYOUT_AOS) {
@@ -35626,7 +35663,7 @@ cpu_fallback_fast:
                         ctx, src0, ids, route_layout, nullptr,
                         /*allow_all_experts=*/false, ids_override, host_only_ptr_table,
                         /*force_cache_aos=*/need_force_aos,
-                        /*skip_cpu_routed_experts=*/moe_hybrid_active || route_host_experts_to_cpu)) {
+                        /*skip_cpu_routed_experts=*/moe_hybrid_with_plan || route_host_experts_to_cpu)) {
                     GGML_LOG_ERROR("[MoE] Failed to update expert pointer table (AOS fallback) for %s\n", src0->name);
                 } else if (src0_extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES) {
                     const auto & host_ptrs = src0_extra->moe_expert_ptrs_host[ctx.device];
@@ -35653,7 +35690,7 @@ cpu_fallback_fast:
     // The warmup system (g_moe_warmup) requires 32 tokens — too late for short benchmarks.
     {
         static std::atomic<bool> first_pass_staged{ false };
-        if (use_expert_cache && !first_pass_staged.load(std::memory_order_acquire)) {
+        if (use_expert_cache && !has_placement_plan && !first_pass_staged.load(std::memory_order_acquire)) {
             const char * name = src0->name ? src0->name : "";
             if (strstr(name, "ffn_down")) {
                 auto &    seq_map      = g_moe_layer_seq[ctx.device];
@@ -35728,10 +35765,10 @@ cpu_fallback_fast:
             src0->ne[1]);                 // N per-expert rows (for name-based key)
 
         GGML_SYCL_DEBUG(
-            "[MOE-PRESTAGE] Layer %d: %d unique experts, %d device-ready, %d host-ready (threshold=%d, "
+            "[MOE-PRESTAGE] Layer %d: %d unique experts, n_gpu=%d, n_cpu=%d, n_miss=%d (threshold=%d, "
             "n_experts=%ld)\n",
-            layer_id, prestage_res.n_unique, prestage_res.n_staged, prestage_res.n_pinned, max_blind_threshold,
-            (long) n_experts);
+            layer_id, prestage_res.n_unique, prestage_res.n_gpu, prestage_res.n_cpu, prestage_res.n_miss,
+            max_blind_threshold, (long) n_experts);
     }
 
     char * src0_original = use_expert_cache ? (char *) src0_host_storage : (char *) src0_layout_base;
@@ -35836,25 +35873,26 @@ cpu_fallback_fast:
         cpu_tg_val = cpu_expert_tg_mode.load(std::memory_order_acquire);
     }
 
-    // Auto-detect: enable CPU expert TG when moe_hybrid is active
-    // (moe_hybrid_active already requires ne12 == 1, use_expert_cache, cpu_type_ok)
-    const bool cpu_expert_tg_active = moe_hybrid_active && (cpu_tg_val == 1 || cpu_tg_val == -2);
+    // Auto-detect: enable CPU expert TG when moe_hybrid is active (with plan awareness)
+    // (moe_hybrid_with_plan extends moe_hybrid_active with plan-based host routing)
+    const bool cpu_expert_tg_active = moe_hybrid_with_plan && (cpu_tg_val == 1 || cpu_tg_val == -2);
 
     if (ne12 == 1) {
         // ---------------------------------------------------------------
         // Hybrid dispatch: partition experts into GPU (staged) + CPU (miss)
         // ---------------------------------------------------------------
-        GGML_SYCL_DEBUG("[MoE-HYBRID] ne12=%ld hybrid_active=%d cpu_tg=%d expert_cache=%d\n", (long) ne12,
-                        moe_hybrid_active ? 1 : 0, cpu_expert_tg_active ? 1 : 0, use_expert_cache ? 1 : 0);
+        GGML_SYCL_DEBUG("[MoE-HYBRID] ne12=%ld hybrid_active=%d plan_hybrid=%d cpu_tg=%d expert_cache=%d\n",
+                        (long) ne12, moe_hybrid_active ? 1 : 0, plan_hybrid ? 1 : 0, cpu_expert_tg_active ? 1 : 0,
+                        use_expert_cache ? 1 : 0);
         {
             static std::atomic<int> hybrid_gate_log{ 0 };
             if (hybrid_gate_log.fetch_add(1, std::memory_order_relaxed) < 1) {
-                fprintf(stderr, "[MOE-HYBRID-GATE] ne12=1: hybrid=%d cpu_tg=%d cache=%d type=%d\n",
-                        moe_hybrid_active ? 1 : 0, cpu_expert_tg_active ? 1 : 0, use_expert_cache ? 1 : 0,
-                        (int) src0->type);
+                fprintf(stderr, "[MOE-HYBRID-GATE] ne12=1: hybrid=%d plan=%d cpu_tg=%d cache=%d type=%d\n",
+                        moe_hybrid_active ? 1 : 0, plan_hybrid ? 1 : 0, cpu_expert_tg_active ? 1 : 0,
+                        use_expert_cache ? 1 : 0, (int) src0->type);
             }
         }
-        if (moe_hybrid_active) {
+        if (moe_hybrid_with_plan) {
             // Hybrid dispatch uses host sync (future.get, stream.wait) which
             // is incompatible with SYCL graph recording.
             ctx.moe_graphs_disabled_once = true;
@@ -37281,12 +37319,10 @@ cpu_fallback_fast:
                 return;
             }
 
-            const size_t                    n_rows = rows.size();
-            const int64_t                   K      = ne00;
-            const int64_t                   N      = ne01;
-            ggml_sycl::scoped_unified_alloc act_alloc;
-            ggml_sycl::scoped_unified_alloc out_alloc;
-            ggml_sycl::alloc_request        act_req{};
+            const size_t             n_rows = rows.size();
+            const int64_t            K      = ne00;
+            const int64_t            N      = ne01;
+            ggml_sycl::alloc_request act_req{};
             act_req.queue                               = stream;
             act_req.device                              = ctx.device;
             act_req.size                                = n_rows * static_cast<size_t>(K) * sizeof(float);
@@ -37298,13 +37334,26 @@ cpu_fallback_fast:
             out_req.size                                = n_rows * static_cast<size_t>(N) * sizeof(float);
             out_req.intent.cohort_id                    = "moe_pp_cpu_out";
 
-            if (!act_alloc.allocate(act_req) || !out_alloc.allocate(out_req)) {
-                GGML_LOG_ERROR("[MoE] Failed planner PP CPU alloc for %s expert=%d rows=%zu\n",
-                               src0->name ? src0->name : "?", expert_id, n_rows);
-                return;
+            float * act_pinned = static_cast<float *>(ggml_sycl::unified_cache_arena_alloc(ctx.device, act_req.size));
+            float * out_pinned = static_cast<float *>(ggml_sycl::unified_cache_arena_alloc(ctx.device, out_req.size));
+            ggml_sycl::scoped_unified_alloc act_fallback;
+            ggml_sycl::scoped_unified_alloc out_fallback;
+            if (!act_pinned) {
+                if (!act_fallback.allocate(act_req)) {
+                    GGML_LOG_ERROR("[MoE] Failed planner PP CPU alloc for %s expert=%d rows=%zu\n",
+                                   src0->name ? src0->name : "?", expert_id, n_rows);
+                    return;
+                }
+                act_pinned = static_cast<float *>(act_fallback.get());
             }
-            float * act_pinned = static_cast<float *>(act_alloc.get());
-            float * out_pinned = static_cast<float *>(out_alloc.get());
+            if (!out_pinned) {
+                if (!out_fallback.allocate(out_req)) {
+                    GGML_LOG_ERROR("[MoE] Failed planner PP CPU alloc for %s expert=%d rows=%zu\n",
+                                   src0->name ? src0->name : "?", expert_id, n_rows);
+                    return;
+                }
+                out_pinned = static_cast<float *>(out_fallback.get());
+            }
             std::memset(out_pinned, 0, n_rows * static_cast<size_t>(N) * sizeof(float));
 
             std::vector<sycl::event> d2h_events;

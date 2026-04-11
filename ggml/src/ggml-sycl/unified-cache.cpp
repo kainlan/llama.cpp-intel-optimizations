@@ -7908,32 +7908,36 @@ prestage_result prestage_routed_experts(void *          queue_ptr,
         GGML_LAYOUT_COALESCED,
         GGML_LAYOUT_XMX_TILED,
     };
-    int unresolved = 0;
     for (int32_t expert_id : unique_experts) {
         ggml_sycl_cache_id key =
             make_expert_cache_id(tensor_name, cache_uuid, model_id, expert_id, tensor_type, ne0, ne1);
 
-        bool resolved = false;
+        bool device_resolved = false;
         for (ggml_layout_mode layout : pin_layouts) {
             if (cache->lookup(key, layout)) {
                 cache->pin(key, layout);
-                result.n_staged++;
-                resolved = true;
+                device_resolved = true;
                 break;
             }
         }
 
-        if (resolved) {
+        if (device_resolved) {
+            result.n_gpu++;
+            result.n_staged++;
+            result.expert_locations[expert_id] = cache_location::DEVICE;
             continue;
         }
 
         if (const weight_entry * host_entry = cache->lookup_expert(key);
             host_entry && host_entry->ptr && host_entry->location != cache_location::DEVICE) {
+            result.n_cpu++;
             result.n_pinned++;
+            result.expert_locations[expert_id] = host_entry->location;
             continue;
         }
 
-        unresolved++;
+        result.n_miss++;
+        result.expert_locations[expert_id] = cache_location::DEVICE;  // default fallback
         GGML_LOG_WARN("[PRESTAGE] Layer %d expert %d unresolved during lookup-only prestage\n", layer_id, expert_id);
     }
 
@@ -7942,10 +7946,10 @@ prestage_result prestage_routed_experts(void *          queue_ptr,
     GGML_UNUSED(expert_stride);
     GGML_UNUSED(expert_size);
 
-    result.success = (unresolved == 0);
+    result.success = (result.n_miss == 0);
 
-    GGML_SYCL_DEBUG("[PRESTAGE] Layer %d: Completed - device_ready=%d, host_ready=%d, unique=%d, unresolved=%d\n",
-                    layer_id, result.n_staged, result.n_pinned, result.n_unique, unresolved);
+    GGML_SYCL_DEBUG("[PRESTAGE] Layer %d: Completed - n_gpu=%d, n_cpu=%d, n_miss=%d, unique=%d\n", layer_id,
+                    result.n_gpu, result.n_cpu, result.n_miss, result.n_unique);
 
     return result;
 }

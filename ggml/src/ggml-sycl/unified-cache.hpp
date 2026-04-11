@@ -2623,11 +2623,15 @@ void unpin_all_experts();
 
 // Result of pre-staging operation
 struct prestage_result {
-    int                      n_staged;        // Number of experts actually staged (not already cached)
-    int                      n_pinned;        // Number of experts pinned (includes already-cached)
-    int                      n_unique;        // Number of unique experts in input
-    bool                     success;         // True if all staging/pinning succeeded
-    std::vector<sycl::event> staging_events;  // Async H2D fill events (empty if all hits or sync path)
+    int                                         n_staged = 0;  // DEPRECATED use n_gpu
+    int                                         n_pinned = 0;  // DEPRECATED use n_gpu
+    int                                         n_unique = 0;
+    bool                                        success  = false;
+    std::vector<sycl::event>                    staging_events;
+    int                                         n_gpu  = 0;
+    int                                         n_cpu  = 0;
+    int                                         n_miss = 0;
+    std::unordered_map<int32_t, cache_location> expert_locations;
 };
 
 // Pre-stage only the experts identified by routing indices.
