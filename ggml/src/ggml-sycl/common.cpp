@@ -1020,36 +1020,6 @@ void ggml_sycl_tp_cache_ffn_norm(int          layer,
 
     // Reallocate if size changed
     if (entry.size != size) {
-        // DEBUG: Check L31 weight BEFORE any free/realloc
-        {
-            uintptr_t l31_weight_addr = 0xffffd5575d400000ULL;
-
-            struct {
-                uint16_t d_bits;
-                uint8_t  qs[16];
-            } wblk;
-
-            try {
-                stream->memcpy(&wblk, (void *) l31_weight_addr, sizeof(wblk)).wait();
-                uint16_t   d_raw = wblk.d_bits;
-                sycl::half d_half;
-                memcpy(&d_half, &d_raw, sizeof(sycl::half));
-                float d_f = static_cast<float>(d_half);
-                if (g_ggml_sycl_tp_debug && (d_f > 100.0f || std::isnan(d_f))) {
-                    fprintf(stderr, "TP DEBUG FFN_NORM_CACHE layer %d: BEFORE realloc, L31 weight CORRUPTED d=%f\n",
-                            layer, d_f);
-                } else if (g_ggml_sycl_tp_debug) {
-                    static int before_dbg = 0;
-                    if (before_dbg++ < 5) {
-                        fprintf(stderr, "TP DEBUG FFN_NORM_CACHE layer %d: BEFORE realloc, L31 weight OK d=%f\n", layer,
-                                d_f);
-                    }
-                }
-            } catch (...) {
-                // Ignore errors if address is invalid
-            }
-        }
-
         if (entry.data != nullptr) {
             if (g_ggml_sycl_tp_debug) {
                 fprintf(stderr, "TP DEBUG FFN_NORM_CACHE layer %d: freeing old cache at %p\n", layer, entry.data);
@@ -1080,15 +1050,8 @@ void ggml_sycl_tp_cache_ffn_norm(int          layer,
         if (!ggml_sycl::unified_alloc(req, &entry.data_alloc)) {
             entry.data_alloc = {};
         }
-        entry.data = entry.data_alloc.ptr;
-        int dev1   = g_sycl_tp_config.devices[1];
-        ggml_sycl_set_device(dev1);
-        queue_ptr stream1 = &ggml_sycl_get_device(dev1).default_queue();
-        req.queue         = stream1;
-        req.device        = dev1;
-        if (!ggml_sycl::unified_alloc(req, &entry.data_dev1_alloc)) {
-            entry.data_dev1_alloc = {};
-        }
+        entry.data      = entry.data_alloc.ptr;
+        int dev1        = g_sycl_tp_config.devices[1];
         entry.data_dev1 = entry.data_dev1_alloc.ptr;
         ggml_sycl_set_device(g_sycl_tp_config.devices[0]);
         if (!entry.data || !entry.data_dev1) {
@@ -1107,80 +1070,10 @@ void ggml_sycl_tp_cache_ffn_norm(int          layer,
             entry.size = 0;
             return;
         }
-
-        // DEBUG: Check if allocation overlaps with L31 FFN gate weight
-        if (g_ggml_sycl_tp_debug && (layer == 31 || layer == 0)) {
-            uintptr_t l31_weight_addr = 0xffffd5575d400000ULL;
-            uintptr_t l31_weight_end  = l31_weight_addr + 16515072;  // shard size
-            uintptr_t cache_start     = (uintptr_t) entry.data;
-            uintptr_t cache_end       = cache_start + size;
-            bool      overlap         = (cache_start < l31_weight_end && cache_end > l31_weight_addr);
-            fprintf(stderr, "TP DEBUG FFN_NORM_CACHE layer %d: alloc=%p size=%zu overlap_with_L31_weight=%d\n", layer,
-                    entry.data, size, overlap);
-            if (overlap) {
-                fprintf(stderr, "TP DEBUG FFN_NORM_CACHE OVERLAP! cache=[%p,%p) weight=[0x%llx,0x%llx)\n",
-                        (void *) cache_start, (void *) cache_end, (unsigned long long) l31_weight_addr,
-                        (unsigned long long) l31_weight_end);
-            }
-        }
-
-        // DEBUG: Check L31 weight AFTER realloc
-        {
-            uintptr_t l31_weight_addr = 0xffffd5575d400000ULL;
-
-            struct {
-                uint16_t d_bits;
-                uint8_t  qs[16];
-            } wblk;
-
-            try {
-                stream->memcpy(&wblk, (void *) l31_weight_addr, sizeof(wblk)).wait();
-                uint16_t   d_raw = wblk.d_bits;
-                sycl::half d_half;
-                memcpy(&d_half, &d_raw, sizeof(sycl::half));
-                float d_f = static_cast<float>(d_half);
-                if (g_ggml_sycl_tp_debug && (d_f > 100.0f || std::isnan(d_f))) {
-                    fprintf(stderr, "TP DEBUG FFN_NORM_CACHE layer %d: AFTER realloc, L31 weight CORRUPTED d=%f\n",
-                            layer, d_f);
-                } else if (g_ggml_sycl_tp_debug) {
-                    static int after_dbg = 0;
-                    if (after_dbg++ < 5) {
-                        fprintf(stderr, "TP DEBUG FFN_NORM_CACHE layer %d: AFTER realloc, L31 weight OK d=%f\n", layer,
-                                d_f);
-                    }
-                }
-            } catch (...) {
-                // Ignore errors if address is invalid
-            }
-        }
     }
 
     // Copy current FFN norm output to cache (in-order queue, no CPU wait needed yet)
     stream->memcpy(entry.data, data, size);
-
-    // DEBUG: Check L31 weight AFTER cache copy
-    if (g_ggml_sycl_tp_debug && (layer == 31 || layer == 0)) {
-        stream->wait();  // Debug path only: sync for validation
-        uintptr_t l31_weight_addr = 0xffffd5575d400000ULL;
-
-        struct {
-            uint16_t d_bits;
-            uint8_t  qs[16];
-        } wblk;
-
-        try {
-            stream->memcpy(&wblk, (void *) l31_weight_addr, sizeof(wblk)).wait();
-            uint16_t   d_raw = wblk.d_bits;
-            sycl::half d_half;
-            memcpy(&d_half, &d_raw, sizeof(sycl::half));
-            float d_f = static_cast<float>(d_half);
-            if (d_f > 100.0f || std::isnan(d_f)) {
-                fprintf(stderr, "TP DEBUG FFN_NORM_CACHE layer %d: AFTER cache copy, L31 weight CORRUPTED d=%f\n",
-                        layer, d_f);
-            }
-        } catch (...) {
-        }
-    }
 
     // Also copy to device 1's buffer (via host staging).
     // D2H on stream (in-order, depends on prior memcpy above).

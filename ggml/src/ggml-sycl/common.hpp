@@ -1835,15 +1835,13 @@ struct staging_buffer_pool {
             if (hcache) {
                 if (hcache->host_zones_configured()) {
                     ptr = hcache->host_zone_alloc(ggml_sycl::host_zone_id::STAGING, needed, 64);
-                    // Zone allocation returned nullptr — allocation spans chunk boundary
-                    // or STAGING zone is exhausted.  This should be rare if the planner
-                    // sized chunks correctly (see configure_zones chunk_size growth).
-                    // Fall back to runtime pinned allocation which directly calls
-                    // sycl::malloc_host (bypassing the pool).
-                    GGML_LOG_WARN(
-                        "[STAGING] zone_alloc failed for %zu bytes, falling back to runtime pinned allocation\n",
-                        needed);
+                    // Zone allocation returns nullptr when the allocation spans a chunk
+                    // boundary or the STAGING zone is exhausted.  Fall back to runtime
+                    // pinned allocation (sycl::malloc_host bypassing the pool).
                     if (!ptr) {
+                        GGML_LOG_WARN(
+                            "[STAGING] zone_alloc failed for %zu bytes, falling back to runtime pinned allocation\n",
+                            needed);
                         ptr       = hcache->allocate_pinned_runtime(needed, 64);
                         from_pool = (ptr != nullptr);
                     } else {
@@ -3443,12 +3441,22 @@ struct ggml_backend_sycl_context {
                 sycl::free(sorted_token_ids, *stream);
             }
             if (expert_tile_offsets) {
-                ggml_sycl::unified_cache_sub_runtime_bytes(device_id, (MAX_EXPERTS + 1) * sizeof(int32_t));
-                sycl::free(expert_tile_offsets, *stream);
+                if (tile_mapping_alloc[0].ptr) {
+                    ggml_sycl::unified_free(tile_mapping_alloc[0]);
+                    tile_mapping_alloc[0] = {};
+                } else {
+                    ggml_sycl::unified_cache_sub_runtime_bytes(device_id, (MAX_EXPERTS + 1) * sizeof(int32_t));
+                    sycl::free(expert_tile_offsets, *stream);
+                }
             }
             if (total_tiles) {
-                ggml_sycl::unified_cache_sub_runtime_bytes(device_id, sizeof(int32_t));
-                sycl::free(total_tiles, *stream);
+                if (tile_mapping_alloc[1].ptr) {
+                    ggml_sycl::unified_free(tile_mapping_alloc[1]);
+                    tile_mapping_alloc[1] = {};
+                } else {
+                    ggml_sycl::unified_cache_sub_runtime_bytes(device_id, sizeof(int32_t));
+                    sycl::free(total_tiles, *stream);
+                }
             }
 
             tokens_f16_input    = nullptr;

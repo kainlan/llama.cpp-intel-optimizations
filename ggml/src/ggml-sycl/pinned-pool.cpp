@@ -411,6 +411,7 @@ void pinned_chunk_pool::zone_reset(host_zone_id zone) {
     if (zi >= static_cast<size_t>(host_zone_id::COUNT) || !zones_configured_) {
         return;
     }
+    std::lock_guard<std::mutex> lock(mutex_);
     zones_[zi].used.store(0, std::memory_order_relaxed);
     if (host_zone_debug_enabled()) {
         GGML_LOG_INFO("[HOST-ZONE] reset zone=%s\n", host_zone_name(zone));
@@ -422,8 +423,9 @@ void pinned_chunk_pool::zone_rollback(host_zone_id zone, size_t saved_used) {
     if (zi >= static_cast<size_t>(host_zone_id::COUNT) || !zones_configured_) {
         return;
     }
-    auto & z   = zones_[zi];
-    size_t cur = z.used.load(std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto &                      z   = zones_[zi];
+    size_t                      cur = z.used.load(std::memory_order_relaxed);
     if (saved_used > cur) {
         GGML_LOG_WARN("[HOST-ZONE] rollback zone=%s: saved_used=%zu > current_used=%zu, skipping\n",
                       host_zone_name(zone), saved_used, cur);

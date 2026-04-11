@@ -1515,9 +1515,8 @@ static void convert_q4_0_to_coalesced_sycl(void * data, const int ncols, const i
 
     stream->submit([&](sycl::handler & cgh) {
         cgh.depends_on(convert_event);
-        cgh.host_task([temp, total_bytes, stream]() {
-            ggml_sycl_free_device_tracked_bytes(temp, total_bytes, *stream);
-        });
+        cgh.host_task(
+            [temp, total_bytes, stream]() { ggml_sycl_free_device_tracked_bytes(temp, total_bytes, *stream); });
     });
 }
 
@@ -1548,8 +1547,8 @@ bool convert_tensor_to_coalesced(const ggml_tensor * tensor, dpct::queue_ptr str
         return true;  // Already done
     }
 
-    const int64_t ncols = tensor->ne[0];
-    const int64_t nrows = ggml_nrows(tensor);
+    const int64_t ncols     = tensor->ne[0];
+    const int64_t nrows     = ggml_nrows(tensor);
     int           device_id = -1;
     SYCL_CHECK(CHECK_TRY_ERROR(device_id = get_current_device_id()));
     void * tensor_ptr = ggml_sycl_resolve_tensor_ptr(tensor, device_id);
@@ -1872,9 +1871,8 @@ static void convert_q8_0_to_coalesced_sycl(void * data, const int ncols, const i
 
     stream->submit([&](sycl::handler & cgh) {
         cgh.depends_on(convert_event);
-        cgh.host_task([temp, total_bytes, stream]() {
-            ggml_sycl_free_device_tracked_bytes(temp, total_bytes, *stream);
-        });
+        cgh.host_task(
+            [temp, total_bytes, stream]() { ggml_sycl_free_device_tracked_bytes(temp, total_bytes, *stream); });
     });
 }
 
@@ -2100,9 +2098,8 @@ static void convert_mxfp4_to_coalesced_sycl(void * data, const int ncols, const 
 
     stream->submit([&](sycl::handler & cgh) {
         cgh.depends_on(convert_event);
-        cgh.host_task([temp, total_bytes, stream]() {
-            ggml_sycl_free_device_tracked_bytes(temp, total_bytes, *stream);
-        });
+        cgh.host_task(
+            [temp, total_bytes, stream]() { ggml_sycl_free_device_tracked_bytes(temp, total_bytes, *stream); });
     });
 }
 
@@ -2225,7 +2222,7 @@ static void convert_q6_k_to_coalesced_sycl(void * data, const int ncols, const i
 
     // Allocate temp buffer for in-place conversion
     const int runtime_device = ggml_sycl_get_device_id_from_queue(*stream);
-    uint8_t * temp = (uint8_t *) ggml_sycl_malloc_device(total_quant_bytes, *stream, "mmvq_quant_temp");
+    uint8_t * temp           = (uint8_t *) ggml_sycl_malloc_device(total_quant_bytes, *stream, "mmvq_quant_temp");
     GGML_ASSERT(temp != nullptr);
 
     // Copy current data to temp
@@ -2247,9 +2244,8 @@ static void convert_q6_k_to_coalesced_sycl(void * data, const int ncols, const i
 
     stream->submit([&](sycl::handler & cgh) {
         cgh.depends_on(convert_event);
-        cgh.host_task([temp, stream, runtime_device, total_quant_bytes]() {
-            ggml_sycl::unified_cache_sub_runtime_bytes(runtime_device, total_quant_bytes);
-            sycl::free(temp, *stream);
+        cgh.host_task([temp, stream, total_quant_bytes]() {
+            ggml_sycl_free_device_tracked_bytes(temp, total_quant_bytes, *stream);
         });
     });
 }
@@ -2297,12 +2293,7 @@ static void coalesced_mul_mat_vec_mxfp4_q8_1_sycl(const void *    vx,
 }
 
 // Public wrapper for coalesced MXFP4 MMVQ kernel (used by direct dispatch in ggml-sycl.cpp)
-void mmvq_submit_mxfp4_coalesced(sycl::queue & q,
-                                  const void * vx,
-                                  const void * vy,
-                                  float *      dst,
-                                  int          ncols,
-                                  int          nrows) {
+void mmvq_submit_mxfp4_coalesced(sycl::queue & q, const void * vx, const void * vy, float * dst, int ncols, int nrows) {
     coalesced_mul_mat_vec_mxfp4_q8_1_sycl(vx, vy, dst, ncols, nrows, &q);
 }
 
@@ -3227,10 +3218,10 @@ static void mul_mat_vec_mxfp4_q8_1_coalesced_id_kernel(
                 const sycl::int2 dq1 = get_int_from_table_16(v1, kvalues_mxfp4);
 
                 const int y_offset = half * 8;
-                const int u0 = get_int_from_int8_aligned(y_qs + y_base_offset, y_offset / 4);
-                const int u1 = get_int_from_int8_aligned(y_qs + y_base_offset, y_offset / 4 + 4);
-                const int u2 = get_int_from_int8_aligned(y_qs + y_base_offset, y_offset / 4 + 1);
-                const int u3 = get_int_from_int8_aligned(y_qs + y_base_offset, y_offset / 4 + 5);
+                const int u0       = get_int_from_int8_aligned(y_qs + y_base_offset, y_offset / 4);
+                const int u1       = get_int_from_int8_aligned(y_qs + y_base_offset, y_offset / 4 + 4);
+                const int u2       = get_int_from_int8_aligned(y_qs + y_base_offset, y_offset / 4 + 1);
+                const int u3       = get_int_from_int8_aligned(y_qs + y_base_offset, y_offset / 4 + 5);
 
                 int sumi = 0;
                 sumi     = ggml_sycl_dp4a(dq0.x(), u0, sumi);
@@ -3536,7 +3527,7 @@ void ggml_sycl_moe_pre_allocate_buffers(ggml_backend_sycl_context & ctx, ggml_cg
 
     // Calculate buffer size for SoA layout: [qs: ne10 bytes][ds: (ne10/QK8_1) * sizeof(half2)]
     const int64_t ne10_padded   = GGML_PAD(max_ne10, QK8_1);
-    const int64_t q8_1_qs_size  = ne10_padded;  // One byte per quantized value
+    const int64_t q8_1_qs_size  = ne10_padded;                                  // One byte per quantized value
     const int64_t q8_1_ds_size  = (ne10_padded / QK8_1) * sizeof(sycl::half2);  // Scales
     const int64_t q8_1_row_size = q8_1_qs_size + q8_1_ds_size;
     const size_t  buffer_size   = max_src1_rows * q8_1_row_size;
@@ -3554,8 +3545,10 @@ void ggml_sycl_moe_pre_allocate_buffers(ggml_backend_sycl_context & ctx, ggml_cg
         ctx.moe_buffers.q8_1_sizes[i]   = buffer_size;
 
         if (!ctx.moe_buffers.q8_1_buffers[i]) {
-            GGML_LOG_ERROR("[MOE-GRAPH] Failed to allocate Q8_1 buffer %d from scratch pool "
-                           "(pool exhausted or not reserved)\n", i);
+            GGML_LOG_ERROR(
+                "[MOE-GRAPH] Failed to allocate Q8_1 buffer %d from scratch pool "
+                "(pool exhausted or not reserved)\n",
+                i);
             // Scratch pool allocations are not individually freed — just abort.
             ctx.moe_buffers.q8_1_buffers.clear();
             ctx.moe_buffers.q8_1_sizes.clear();
@@ -3586,20 +3579,18 @@ void ggml_sycl_moe_pre_allocate_buffers(ggml_backend_sycl_context & ctx, ggml_cg
 // table with a safe dummy pointer so the kernel writes *something* to
 // those dst slots.  The CPU path overwrites those slots afterwards.
 // ---------------------------------------------------------------------------
-bool mmvq_moe_batched_dispatch(
-    ggml_backend_sycl_context & ctx,
-    const ggml_tensor *         src0,
-    const ggml_tensor *         src1,
-    ggml_tensor *               dst,
-    const void * const *        expert_ptrs_device,
-    const int32_t *             gpu_expert_ids,
-    const int64_t *             gpu_iid1s,
-    const int64_t *             gpu_ids,
-    int                         n_gpu_entries,
-    int                         n_experts,
-    int64_t                     n_ids,
-    layout_mode                 layout) {
-
+bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context & ctx,
+                               const ggml_tensor *         src0,
+                               const ggml_tensor *         src1,
+                               ggml_tensor *               dst,
+                               const void * const *        expert_ptrs_device,
+                               const int32_t *             gpu_expert_ids,
+                               const int64_t *             gpu_iid1s,
+                               const int64_t *             gpu_ids,
+                               int                         n_gpu_entries,
+                               int                         n_experts,
+                               int64_t                     n_ids,
+                               layout_mode                 layout) {
     if (n_gpu_entries <= 0 || !expert_ptrs_device) {
         return false;
     }
@@ -3629,8 +3620,7 @@ bool mmvq_moe_batched_dispatch(
     const float * src1_d = static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(src1, ctx.device));
     float *       dst_d  = static_cast<float *>(ggml_sycl_resolve_tensor_ptr(dst, ctx.device));
     if (!src1_d || !dst_d) {
-        GGML_SYCL_DEBUG("[MMVQ] Missing resolved ptrs for batched MoE dispatch (%s)\n",
-                        src0->name ? src0->name : "?");
+        GGML_SYCL_DEBUG("[MMVQ] Missing resolved ptrs for batched MoE dispatch (%s)\n", src0->name ? src0->name : "?");
         return false;
     }
 
@@ -3641,13 +3631,10 @@ bool mmvq_moe_batched_dispatch(
     // Use SoA quantizer if weights are in reordered layout (both SoA and COALESCED kernels expect SoA Y)
     const bool y_soa = (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED);
     if (y_soa) {
-        quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
-            src1_d, (char *) q8_1_buffer, ne10, total_src1_rows,
-            ne10_padded, stream);
+        quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(src1_d, (char *) q8_1_buffer, ne10, total_src1_rows,
+                                                              ne10_padded, stream);
     } else {
-        quantize_row_q8_1_sycl<quantize_q8_1>(
-            src1_d, (char *) q8_1_buffer, ne10, total_src1_rows,
-            ne10_padded, stream);
+        quantize_row_q8_1_sycl<quantize_q8_1>(src1_d, (char *) q8_1_buffer, ne10, total_src1_rows, ne10_padded, stream);
     }
 
     // --- Build compact pointer table for batched dispatch ---
@@ -3705,84 +3692,68 @@ bool mmvq_moe_batched_dispatch(
 
     switch (src0->type) {
         case GGML_TYPE_Q4_0:
-            mul_mat_vec_q4_0_q8_1_id_sycl(
-                nullptr,              // vx (unused with expert_ptrs)
-                expert_ptrs_device,   // expert pointer table
-                q8_1_buffer, dst_d, ids_device,
-                ne00,                 // ncols
-                ne01,                 // nrows_per_expert
-                total_batches, n_ids, num_tokens, ne11,
-                stride_expert_x,
-                ids_nb0, ids_nb1,     // ids strides
-                q8_nb11, q8_nb12,     // Q8_1 strides
-                nb1, nb2,             // dst strides
-                stream);
+            mul_mat_vec_q4_0_q8_1_id_sycl(nullptr,             // vx (unused with expert_ptrs)
+                                          expert_ptrs_device,  // expert pointer table
+                                          q8_1_buffer, dst_d, ids_device,
+                                          ne00,                // ncols
+                                          ne01,                // nrows_per_expert
+                                          total_batches, n_ids, num_tokens, ne11, stride_expert_x, ids_nb0,
+                                          ids_nb1,             // ids strides
+                                          q8_nb11, q8_nb12,    // Q8_1 strides
+                                          nb1, nb2,            // dst strides
+                                          stream);
             break;
         case GGML_TYPE_Q8_0:
-            mul_mat_vec_q8_0_q8_1_id_sycl(
-                nullptr,
-                expert_ptrs_device,
-                q8_1_buffer, dst_d, ids_device,
-                ne00, ne01,
-                total_batches, n_ids, num_tokens, ne11,
-                stride_expert_x,
-                ids_nb0, ids_nb1,
-                q8_nb11, q8_nb12,
-                nb1, nb2,
-                stream);
+            mul_mat_vec_q8_0_q8_1_id_sycl(nullptr, expert_ptrs_device, q8_1_buffer, dst_d, ids_device, ne00, ne01,
+                                          total_batches, n_ids, num_tokens, ne11, stride_expert_x, ids_nb0, ids_nb1,
+                                          q8_nb11, q8_nb12, nb1, nb2, stream);
             break;
         case GGML_TYPE_MXFP4:
             if (layout == GGML_LAYOUT_COALESCED) {
-                coalesced_mul_mat_vec_mxfp4_q8_1_id_sycl(
-                    nullptr,              // vx (unused with expert_ptrs)
-                    expert_ptrs_device,
-                    q8_1_buffer, dst_d, ids_device,
-                    ne00,                 // ncols (MXFP4)
-                    ne10,                 // ncols_y (Q8_1 row size for SoA ds offset)
-                    ne01,                 // nrows_per_expert
-                    ne02,                 // num_experts
-                    total_batches, n_ids, num_tokens, ne11,
-                    ids_nb0, ids_nb1,     // ids strides
-                    q8_nb11, q8_nb12,     // Q8_1 strides
-                    nb1, nb2,             // dst strides
-                    stream);
+                coalesced_mul_mat_vec_mxfp4_q8_1_id_sycl(nullptr,           // vx (unused with expert_ptrs)
+                                                         expert_ptrs_device, q8_1_buffer, dst_d, ids_device,
+                                                         ne00,              // ncols (MXFP4)
+                                                         ne10,              // ncols_y (Q8_1 row size for SoA ds offset)
+                                                         ne01,              // nrows_per_expert
+                                                         ne02,              // num_experts
+                                                         total_batches, n_ids, num_tokens, ne11, ids_nb0,
+                                                         ids_nb1,           // ids strides
+                                                         q8_nb11, q8_nb12,  // Q8_1 strides
+                                                         nb1, nb2,          // dst strides
+                                                         stream);
             } else if (layout == GGML_LAYOUT_SOA) {
-                reorder_mul_mat_vec_mxfp4_q8_1_id_sycl(
-                    nullptr,              // vx (unused with expert_ptrs)
-                    expert_ptrs_device,
-                    q8_1_buffer, dst_d, ids_device,
-                    ne00,                 // ncols (MXFP4)
-                    ne10,                 // ncols_y (Q8_1 row size for SoA ds offset)
-                    ne01,                 // nrows_per_expert
-                    ne02,                 // num_experts
-                    total_batches, n_ids, num_tokens, ne11,
-                    ids_nb0, ids_nb1,     // ids strides
-                    q8_nb11, q8_nb12,     // Q8_1 strides
-                    nb1, nb2,             // dst strides
-                    stream);
+                reorder_mul_mat_vec_mxfp4_q8_1_id_sycl(nullptr,           // vx (unused with expert_ptrs)
+                                                       expert_ptrs_device, q8_1_buffer, dst_d, ids_device,
+                                                       ne00,              // ncols (MXFP4)
+                                                       ne10,              // ncols_y (Q8_1 row size for SoA ds offset)
+                                                       ne01,              // nrows_per_expert
+                                                       ne02,              // num_experts
+                                                       total_batches, n_ids, num_tokens, ne11, ids_nb0,
+                                                       ids_nb1,           // ids strides
+                                                       q8_nb11, q8_nb12,  // Q8_1 strides
+                                                       nb1, nb2,          // dst strides
+                                                       stream);
             } else {
                 // AOS layout
-                mul_mat_vec_mxfp4_q8_1_id_sycl(
-                    nullptr,              // vx (unused with expert_ptrs)
-                    expert_ptrs_device,
-                    q8_1_buffer, dst_d, ids_device,
-                    ne00,                 // ncols
-                    ne01,                 // nrows_per_expert
-                    total_batches, n_ids, num_tokens, ne11,
-                    stride_expert_x,
-                    ids_nb0, ids_nb1,     // ids strides
-                    q8_nb11, q8_nb12,     // Q8_1 strides
-                    nb1, nb2,             // dst strides
-                    stream);
+                mul_mat_vec_mxfp4_q8_1_id_sycl(nullptr,           // vx (unused with expert_ptrs)
+                                               expert_ptrs_device, q8_1_buffer, dst_d, ids_device,
+                                               ne00,              // ncols
+                                               ne01,              // nrows_per_expert
+                                               total_batches, n_ids, num_tokens, ne11, stride_expert_x, ids_nb0,
+                                               ids_nb1,           // ids strides
+                                               q8_nb11, q8_nb12,  // Q8_1 strides
+                                               nb1, nb2,          // dst strides
+                                               stream);
             }
             break;
         default:
             return false;
     }
 
-    GGML_SYCL_DEBUG("[MOE-BATCHED] Dispatched %d GPU experts in single kernel "
-                    "(type=%d, total_batches=%lld)\n",
-                    n_gpu_entries, src0->type, (long long) total_batches);
+    GGML_SYCL_DEBUG(
+        "[MOE-BATCHED] Dispatched %d GPU experts in single kernel "
+        "(type=%d, total_batches=%lld)\n",
+        n_gpu_entries, src0->type, (long long) total_batches);
     return true;
 }
 
@@ -3792,8 +3763,8 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                                 const ggml_tensor *         ids,
                                 ggml_tensor *               dst,
                                 const layout_mode *         forced_layout) {
-    GGML_SYCL_DEBUG("[MMVQ-ENTRY] src0=%s type=%d forced_layout=%d\n",
-                    src0->name ? src0->name : "?", src0->type, forced_layout ? (int)*forced_layout : -1);
+    GGML_SYCL_DEBUG("[MMVQ-ENTRY] src0=%s type=%d forced_layout=%d\n", src0->name ? src0->name : "?", src0->type,
+                    forced_layout ? (int) *forced_layout : -1);
     // Early batch size check — route large PP batches to the per-expert batched
     // GEMM path (host-side routing → oneDNN/MMQ) instead of MMVQ vec_dot.
     //
@@ -3821,7 +3792,7 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
     //           N=0: always batched; N=9999: always MMVQ.
     static int64_t MMVQ_MOE_MAX_BATCH_OVERRIDE = []() -> int64_t {
         const char * env = std::getenv("GGML_SYCL_MMVQ_MOE_PP");
-        return env ? std::atoi(env) : -1;  // -1 = use adaptive
+        return env ? std::atoi(env) : -1;    // -1 = use adaptive
     }();
     const int64_t batch_size = src1->ne[2];  // ne12 - number of tokens
     {
@@ -3833,19 +3804,19 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
             // Read the threshold once (matches the value in ggml_sycl_mul_mat).
             static int64_t onednn_pp_thr = []() -> int64_t {
                 const char * env = std::getenv("GGML_SYCL_ONEDNN_PP_MIN_BATCH");
-                int v = env ? std::atoi(env) : 16;
+                int          v   = env ? std::atoi(env) : 16;
                 return v > 0 ? v : 16;
             }();
             const int64_t n_experts = src0->ne[2];
             const int64_t top_k     = ids->ne[0];
-            effective_threshold = (top_k > 0) ? (n_experts * onednn_pp_thr / top_k) : 1;
+            effective_threshold     = (top_k > 0) ? (n_experts * onednn_pp_thr / top_k) : 1;
             if (effective_threshold < 1) {
                 effective_threshold = 1;
             }
         }
         // Log the computed threshold once per model configuration
         {
-            static std::atomic<int> threshold_logged{0};
+            static std::atomic<int> threshold_logged{ 0 };
             if (threshold_logged.fetch_add(1, std::memory_order_relaxed) == 0) {
                 GGML_LOG_INFO("[MMVQ-MoE] PP batch threshold = %ld (n_experts=%ld top_k=%ld%s)\n",
                               (long) effective_threshold, (long) src0->ne[2], (long) ids->ne[0],
@@ -3853,14 +3824,14 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
             }
         }
         if (batch_size > effective_threshold) {
-            GGML_SYCL_DEBUG("[MMVQ] Batch %ld > threshold %ld, routing to batched GEMM path\n",
-                            (long) batch_size, (long) effective_threshold);
+            GGML_SYCL_DEBUG("[MMVQ] Batch %ld > threshold %ld, routing to batched GEMM path\n", (long) batch_size,
+                            (long) effective_threshold);
             return false;
         }
     }
-    const auto *      src0_extra         = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+    const auto *      src0_extra   = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
     // Detect host-resident weights including SYCL HOST_PINNED buffers
-    bool              host_weights       = ggml_sycl_is_host_resident_weight(src0, ctx.stream());
+    bool              host_weights = ggml_sycl_is_host_resident_weight(src0, ctx.stream());
     const layout_mode layout =
         forced_layout ? *forced_layout : ggml_sycl_select_moe_mmvq_layout(src0, ctx.device, host_weights);
     // For MXFP4 MoE: allow SOA/Coalesced dispatch even when base tensor is AOS.
@@ -3892,7 +3863,7 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
         }
         if (effective != layout && allow_aos_fallback) {
             GGML_SYCL_DEBUG("[MMVQ] Using AoS fallback for %s (effective=%d)\n", src0->name ? src0->name : "?",
-            (int) effective);
+                            (int) effective);
         }
     }
     if ((src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0) && layout != GGML_LAYOUT_AOS) {
@@ -3936,8 +3907,8 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
             return false;  // Fall back to host routing for other types
     }
 
-    const queue_ptr stream = ctx.stream();
-    auto *          route_cache = ggml_sycl::get_unified_cache(*stream);
+    const queue_ptr stream                = ctx.stream();
+    auto *          route_cache           = ggml_sycl::get_unified_cache(*stream);
     const bool      placement_plan_active = route_cache && route_cache->has_placement_plan();
     if (placement_plan_active && use_ptr_table) {
         GGML_SYCL_DEBUG("[MMVQ] Placement-plan pointer-table path disabled for %s; falling back to hybrid dispatch\n",
@@ -3996,7 +3967,7 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
             const bool allow_all_experts = false;
             // force_cache_aos=true ensures experts are staged to GPU memory even for AoS layout
             // This is critical for mmap'd weights which cannot be accessed directly by GPU kernels
-            GGML_SYCL_DEBUG("[MMVQ] About to call ggml_sycl_update_moe_ptr_table layout=%d\n", (int)layout);
+            GGML_SYCL_DEBUG("[MMVQ] About to call ggml_sycl_update_moe_ptr_table layout=%d\n", (int) layout);
             if (!ggml_sycl_update_moe_ptr_table(ctx, src0, ids, layout, &table_event, allow_all_experts, nullptr,
                                                 /*skip_device_copy=*/false,
                                                 /*force_cache_aos=*/host_weights,
@@ -4009,7 +3980,7 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
             if (src0_extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES) {
                 expert_ptrs = static_cast<const void * const *>(src0_extra->moe_expert_ptrs_device[ctx.device]);
                 if (placement_plan_active) {
-                    const auto & host_ptrs = src0_extra->moe_expert_ptrs_host[ctx.device];
+                    const auto & host_ptrs  = src0_extra->moe_expert_ptrs_host[ctx.device];
                     bool         mixed_ptrs = false;
                     for (const void * ptr : host_ptrs) {
                         if (ptr && ggml_sycl_get_alloc_type(ptr) != sycl::usm::alloc::device) {
@@ -4030,7 +4001,7 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                 GGML_SYCL_DEBUG("[MMVQ] Missing expert pointer table for %s\n", src0->name);
                 return false;
             }
-            GGML_SYCL_DEBUG("[MMVQ] expert_ptrs=%p\n", (void*)expert_ptrs);
+            GGML_SYCL_DEBUG("[MMVQ] expert_ptrs=%p\n", (void *) expert_ptrs);
         }
     }
 
@@ -4038,8 +4009,8 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
     if (!use_ptr_table) {
         auto resolved = ggml_sycl_resolve(src0, ctx.device);
         if (!resolved) {
-            GGML_SYCL_DEBUG("[MMVQ] resolve_weight failed for %s (layout=%d)\n",
-                            src0->name ? src0->name : "?", (int) layout);
+            GGML_SYCL_DEBUG("[MMVQ] resolve_weight failed for %s (layout=%d)\n", src0->name ? src0->name : "?",
+                            (int) layout);
             return false;
         }
         src0_d = resolved.ptr;
@@ -4204,8 +4175,9 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                 const bool x_is_coalesced = (layout == GGML_LAYOUT_COALESCED);
                 const bool x_is_reordered = x_is_soa || x_is_coalesced;
 
-                GGML_SYCL_DEBUG("[MMVQ-MXFP4] ENTER: layout=%d use_ptr_table=%d host_weights=%d src0_d=%p dispatch_ptrs=%p\n",
-                                (int)layout, use_ptr_table, host_weights, src0_d, (void*)dispatch_ptrs);
+                GGML_SYCL_DEBUG(
+                    "[MMVQ-MXFP4] ENTER: layout=%d use_ptr_table=%d host_weights=%d src0_d=%p dispatch_ptrs=%p\n",
+                    (int) layout, use_ptr_table, host_weights, src0_d, (void *) dispatch_ptrs);
                 GGML_SYCL_DEBUG("[MMVQ-MXFP4] X: is_soa=%d is_coalesced=%d is_reordered=%d extra=%p tensor=%s\n",
                                 x_is_soa, x_is_coalesced, x_is_reordered, extra, src0->name ? src0->name : "null");
 
@@ -4221,7 +4193,7 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                     // or AOS host pointers.  Fall back to AOS dispatch in that case.
                     if (use_ptr_table && host_weights && src0_extra) {
                         const auto & host_ptrs = src0_extra->moe_expert_ptrs_host[ctx.device];
-                        bool ptrs_ok = true;
+                        bool         ptrs_ok   = true;
                         for (size_t ep = 0; ep < host_ptrs.size() && ptrs_ok; ep++) {
                             if (!host_ptrs[ep]) {
                                 continue;  // null = expert not active this token
@@ -4232,7 +4204,8 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                             }
                         }
                         if (!ptrs_ok) {
-                            GGML_SYCL_DEBUG("[MMVQ-MXFP4] SOA dispatch rejected: non-device expert ptrs, falling back\n");
+                            GGML_SYCL_DEBUG(
+                                "[MMVQ-MXFP4] SOA dispatch rejected: non-device expert ptrs, falling back\n");
                             return false;  // Fall back to AOS dispatch
                         }
                     }
@@ -4279,8 +4252,9 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                     }
 
                     if (x_is_coalesced) {
-                        GGML_SYCL_DEBUG("[MMVQ-MXFP4-Coalesced] X=Coalesced Y=SoA ne00=%lld ne10=%lld ne01=%lld ne02=%lld\n",
-                                        (long long) ne00, (long long) ne10, (long long) ne01, (long long) ne02);
+                        GGML_SYCL_DEBUG(
+                            "[MMVQ-MXFP4-Coalesced] X=Coalesced Y=SoA ne00=%lld ne10=%lld ne01=%lld ne02=%lld\n",
+                            (long long) ne00, (long long) ne10, (long long) ne01, (long long) ne02);
                         coalesced_mul_mat_vec_mxfp4_q8_1_id_sycl(src0_d, dispatch_ptrs, q8_1_buffer, dst_d,
                                                                  dispatch_ids,
                                                                  ne00,     // ncols (MXFP4)
@@ -4306,17 +4280,20 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                                 dispatch_ids ? ggml_sycl_get_alloc_type(dispatch_ids) : sycl::usm::alloc::unknown;
                             auto ptrs_alloc =
                                 dispatch_ptrs ? ggml_sycl_get_alloc_type(dispatch_ptrs) : sycl::usm::alloc::unknown;
-                            GGML_SYCL_DEBUG("[MMVQ-USM-CHECK] q8=%d dst=%d ids=%d ptrs=%d dispatch_ids=%p ids_d=%p (0=host,1=dev,2=shared,3=unknown)\n",
-                                            (int)q8_alloc, (int)dst_alloc, (int)ids_alloc, (int)ptrs_alloc,
-                                            (void*)dispatch_ids, (void*)ids_d);
+                            GGML_SYCL_DEBUG(
+                                "[MMVQ-USM-CHECK] q8=%d dst=%d ids=%d ptrs=%d dispatch_ids=%p ids_d=%p "
+                                "(0=host,1=dev,2=shared,3=unknown)\n",
+                                (int) q8_alloc, (int) dst_alloc, (int) ids_alloc, (int) ptrs_alloc,
+                                (void *) dispatch_ids, (void *) ids_d);
 
                             // Check expert pointers inside the table (first few)
                             if (dispatch_ptrs && src0_extra) {
                                 const auto & host_ptrs = src0_extra->moe_expert_ptrs_host[ctx.device];
-                                for (size_t e = 0; e < std::min(host_ptrs.size(), (size_t)4); ++e) {
-                                    void * eptr = host_ptrs[e];
+                                for (size_t e = 0; e < std::min(host_ptrs.size(), (size_t) 4); ++e) {
+                                    void * eptr   = host_ptrs[e];
                                     auto   ealloc = eptr ? ggml_sycl_get_alloc_type(eptr) : sycl::usm::alloc::unknown;
-                                    GGML_SYCL_DEBUG("[MMVQ-USM-CHECK] expert[%zu]=%p alloc=%d\n", e, eptr, (int)ealloc);
+                                    GGML_SYCL_DEBUG("[MMVQ-USM-CHECK] expert[%zu]=%p alloc=%d\n", e, eptr,
+                                                    (int) ealloc);
                                 }
                             }
                         }
@@ -4377,8 +4354,8 @@ struct mmvq_stream_ctx {
     mmvq_stream_segment segments[4]          = {};
     // Persistent host-pinned staging buffer (owned by ggml_backend_sycl_context).
     // Non-null: reuse across DMA calls without sycl::malloc_host per token.
-    void *          host_staging         = nullptr;
-    size_t          host_staging_size    = 0;
+    void *              host_staging         = nullptr;
+    size_t              host_staging_size    = 0;
     // Track the last DMA event that used host_staging so we can wait before
     // overwriting (required when copy_fn is called multiple times per tensor).
     mutable sycl::event prev_staging_evt     = {};
@@ -4912,7 +4889,7 @@ static sycl::event mmvq_stream_copy(sycl::queue &                    queue,
 
     const sycl::usm::alloc src_alloc = ggml_sycl_get_alloc_type(ctx->src_base);
     if (src_alloc != sycl::usm::alloc::device) {
-        uint8_t * host_slice = nullptr;
+        uint8_t * host_slice     = nullptr;
         bool      use_persistent = (ctx->host_staging != nullptr && ctx->host_staging_size >= slice_bytes);
         if (use_persistent) {
             // Wait for the previous DMA that used this staging buffer to complete
@@ -4923,8 +4900,8 @@ static sycl::event mmvq_stream_copy(sycl::queue &                    queue,
             }
             host_slice = static_cast<uint8_t *>(ctx->host_staging);
         } else {
-            host_slice = static_cast<uint8_t *>(
-                ggml_sycl_malloc_host_tracked_bytes(slice_bytes, queue, "mmvq:host_stage"));
+            host_slice =
+                static_cast<uint8_t *>(ggml_sycl_malloc_host_tracked_bytes(slice_bytes, queue, "mmvq:host_stage"));
             if (!host_slice) {
                 throw sycl::exception(sycl::make_error_code(sycl::errc::memory_allocation),
                                       "MMVQ stream: host staging allocation failed");
@@ -4957,9 +4934,9 @@ static sycl::event mmvq_stream_copy(sycl::queue &                    queue,
         return evt;
     }
 
-    size_t                      dst_offset = 0;
-    std::vector<sycl::event>    cur_deps   = deps;
-    sycl::event                last_evt;
+    size_t                   dst_offset = 0;
+    std::vector<sycl::event> cur_deps   = deps;
+    sycl::event              last_evt;
 
     for (int i = 0; i < ctx->segment_count; ++i) {
         const auto & seg   = ctx->segments[i];
@@ -4969,7 +4946,7 @@ static sycl::event mmvq_stream_copy(sycl::queue &                    queue,
         }
         const uint8_t * src = ctx->src_base + seg.src_base + src_row * seg.bytes_per_row;
         void *          dst = static_cast<uint8_t *>(device_slice) + dst_offset;
-        last_evt = queue.memcpy(dst, src, bytes, cur_deps);
+        last_evt            = queue.memcpy(dst, src, bytes, cur_deps);
         cur_deps.assign(1, last_evt);
         dst_offset += bytes;
     }
@@ -4998,26 +4975,13 @@ static sycl::event mmvq_stream_slice(sycl::queue &                    queue,
     const size_t row_count = slice_bytes / ctx->row_total_bytes;
     float *      dst_ptr   = ctx->dst_dd_i + row_start;
 
-    const void * layout_ptr = (ctx->mmvq_mode == reorder_mode::SOA || ctx->mmvq_mode == reorder_mode::COALESCED)
-                                  ? device_slice
-                                  : nullptr;
+    const void * layout_ptr =
+        (ctx->mmvq_mode == reorder_mode::SOA || ctx->mmvq_mode == reorder_mode::COALESCED) ? device_slice : nullptr;
 
-    ggml_sycl_mmvq_dispatch(ctx->src0,
-                            static_cast<const char *>(device_slice),
-                            layout_ptr,
-                            ctx->mmvq_mode,
-                            ctx->device_id,
-                            ctx->ne00,
-                            static_cast<int64_t>(row_count),
-                            ctx->ne10,
-                            0,
-                            static_cast<int64_t>(row_count),
-                            ctx->src1_ncols,
-                            ctx->src1_padded_col_size,
-                            ctx->src1_ddq_i,
-                            dst_ptr,
-                            ctx->dst_row_stride,
-                            &queue);
+    ggml_sycl_mmvq_dispatch(ctx->src0, static_cast<const char *>(device_slice), layout_ptr, ctx->mmvq_mode,
+                            ctx->device_id, ctx->ne00, static_cast<int64_t>(row_count), ctx->ne10, 0,
+                            static_cast<int64_t>(row_count), ctx->src1_ncols, ctx->src1_padded_col_size,
+                            ctx->src1_ddq_i, dst_ptr, ctx->dst_row_stride, &queue);
 
     return ggml_sycl_submit_marker<ggml_sycl_mmvq_marker_kernel>(queue);
 }
@@ -5034,13 +4998,13 @@ class mmvq_persistent_q6_k_tag;
 class mmvq_persistent_quantize_tag;
 
 void mmvq_submit_q4_0_soa(sycl::queue & q,
-                           const void * weights_soa,
-                           const void * y_q8_soa,
-                           float *      dst,
-                           int          ncols,
-                           int          nrows,
-                           int          total_nrows,
-                           int          row_low) {
+                          const void *  weights_soa,
+                          const void *  y_q8_soa,
+                          float *       dst,
+                          int           ncols,
+                          int           nrows,
+                          int           total_nrows,
+                          int           row_low) {
     GGML_ASSERT(ncols % QK4_0 == 0);
     const int        block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y);
     constexpr size_t num_subgroups = 16;
@@ -5052,20 +5016,20 @@ void mmvq_submit_q4_0_soa(sycl::queue & q,
         cgh.parallel_for<mmvq_persistent_q4_0_tag>(
             sycl::nd_range<3>(global_size, workgroup_size),
             [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q4_0>>(
-                    weights_soa, y_q8_soa, dst, ncols, nrows, total_nrows, row_low, nd_item);
+                mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q4_0>>(weights_soa, y_q8_soa, dst, ncols, nrows,
+                                                                              total_nrows, row_low, nd_item);
             });
     });
 }
 
 void mmvq_submit_q6_k_soa(sycl::queue & q,
-                            const void * weights_soa,
-                            const void * y_q8_soa,
-                            float *      dst,
-                            int          ncols,
-                            int          nrows,
-                            int          total_nrows,
-                            int          row_low) {
+                          const void *  weights_soa,
+                          const void *  y_q8_soa,
+                          float *       dst,
+                          int           ncols,
+                          int           nrows,
+                          int           total_nrows,
+                          int           row_low) {
     GGML_ASSERT(ncols % QK_K == 0);
     const int        block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y);
     constexpr size_t num_subgroups = 16;
@@ -5077,8 +5041,8 @@ void mmvq_submit_q6_k_soa(sycl::queue & q,
         cgh.parallel_for<mmvq_persistent_q6_k_tag>(
             sycl::nd_range<3>(global_size, workgroup_size),
             [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K>>(
-                    weights_soa, y_q8_soa, dst, ncols, nrows, total_nrows, row_low, nd_item);
+                mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K>>(weights_soa, y_q8_soa, dst, ncols, nrows,
+                                                                              total_nrows, row_low, nd_item);
             });
     });
 }
@@ -5086,13 +5050,13 @@ void mmvq_submit_q6_k_soa(sycl::queue & q,
 class mmvq_persistent_mxfp4_tag;
 
 void mmvq_submit_mxfp4_soa(sycl::queue & q,
-                            const void * weights_soa,
-                            const void * y_q8_soa,
-                            float *      dst,
-                            int          ncols,
-                            int          nrows,
-                            int          total_nrows,
-                            int          row_low) {
+                           const void *  weights_soa,
+                           const void *  y_q8_soa,
+                           float *       dst,
+                           int           ncols,
+                           int           nrows,
+                           int           total_nrows,
+                           int           row_low) {
     GGML_ASSERT(ncols % QK_MXFP4 == 0);
     const int        block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y);
     constexpr size_t num_subgroups = 16;
@@ -5104,22 +5068,19 @@ void mmvq_submit_mxfp4_soa(sycl::queue & q,
         cgh.parallel_for<mmvq_persistent_mxfp4_tag>(
             sycl::nd_range<3>(global_size, workgroup_size),
             [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_MXFP4>>(
-                    weights_soa, y_q8_soa, dst, ncols, nrows, total_nrows, row_low, nd_item);
+                mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_MXFP4>>(weights_soa, y_q8_soa, dst, ncols, nrows,
+                                                                               total_nrows, row_low, nd_item);
             });
     });
 }
 
-void mmvq_submit_quantize_q8_1_soa(sycl::queue & q,
-                                     const float * x,
-                                     void *        y_q8_soa,
-                                     int           ncols) {
+void mmvq_submit_quantize_q8_1_soa(sycl::queue & q, const float * x, void * y_q8_soa, int ncols) {
     // Single-row quantization (M=1 for TG).
     // Uses quantize_and_reorder_q8_1_soa to produce SOA layout:
     //   quants at [0, ncols), ds at [ncols, ncols + ncols/QK8_1 * 4)
-    const int ky          = 1;
-    const int kx_padded   = ncols;  // No padding for M=1
-    const int num_blocks  = ky * (ncols / QK8_1);
+    const int  ky           = 1;
+    const int  kx_padded    = ncols;  // No padding for M=1
+    const int  num_blocks   = ky * (ncols / QK8_1);
     const auto local_range  = std::size_t(WARP_SIZE);
     const auto global_range = num_blocks * local_range;
 
@@ -5150,11 +5111,10 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx,
     // Check tiered dispatch for weight tensor (debug only)
     if (g_ggml_sycl_debug && src0->name && g_tiered_enabled.load(std::memory_order_relaxed)) {
         ggml_sycl::memory_tier tier;
-        bool in_inventory = false;
-        void * cached_ptr = get_cached_tensor_ptr(src0->name, &tier, &in_inventory);
+        bool                   in_inventory = false;
+        void *                 cached_ptr   = get_cached_tensor_ptr(src0->name, &tier, &in_inventory);
         if (cached_ptr != nullptr) {
-            GGML_SYCL_DEBUG("[SYCL] mmvq tiered hit: %s (tier=%d)\n",
-                          src0->name, static_cast<int>(tier));
+            GGML_SYCL_DEBUG("[SYCL] mmvq tiered hit: %s (tier=%d)\n", src0->name, static_cast<int>(tier));
         } else if (in_inventory) {
             GGML_SYCL_DEBUG("[SYCL] mmvq tiered pending: %s\n", src0->name);
         }
@@ -5187,27 +5147,26 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx,
                         src0->name ? src0->name : "?", (int) layout);
         mmvq_mode = reorder_mode::NONE;
     }
-    const layout_mode dispatch_layout =
-        (mmvq_mode == reorder_mode::NONE) ? GGML_LAYOUT_AOS : layout;
-    const void * dispatch_base =
+    const layout_mode dispatch_layout = (mmvq_mode == reorder_mode::NONE) ? GGML_LAYOUT_AOS : layout;
+    const void *      dispatch_base =
         (mmvq_mode == reorder_mode::SOA || mmvq_mode == reorder_mode::COALESCED) ? layout_base : nullptr;
-    const char * dispatch_ptr   = src0_dd_i;
+    const char *  dispatch_ptr   = src0_dd_i;
     const int64_t dst_row_stride = dst->ne[0];
 
     mmvq_stream_ctx stream_ctx{};
-    const bool      custom_copy = mmvq_build_stream_segments(src0, dispatch_layout, ne00, ne01, stream_ctx);
-    stream_ctx.device_id          = device_id;
-    stream_ctx.src0               = src0;
-    stream_ctx.src1_ddq_i         = src1_ddq_i;
-    stream_ctx.dst_dd_i           = dst_dd_i;
-    stream_ctx.dst_row_stride     = dst_row_stride;
-    stream_ctx.ne00               = ne00;
-    stream_ctx.ne10               = ne10;
-    stream_ctx.src1_ncols         = src1_ncols;
+    const bool      custom_copy     = mmvq_build_stream_segments(src0, dispatch_layout, ne00, ne01, stream_ctx);
+    stream_ctx.device_id            = device_id;
+    stream_ctx.src0                 = src0;
+    stream_ctx.src1_ddq_i           = src1_ddq_i;
+    stream_ctx.dst_dd_i             = dst_dd_i;
+    stream_ctx.dst_row_stride       = dst_row_stride;
+    stream_ctx.ne00                 = ne00;
+    stream_ctx.ne10                 = ne10;
+    stream_ctx.src1_ncols           = src1_ncols;
     stream_ctx.src1_padded_col_size = src1_padded_col_size;
-    stream_ctx.row_base           = row_low;
-    stream_ctx.mmvq_mode          = mmvq_mode;
-    stream_ctx.layout             = dispatch_layout;
+    stream_ctx.row_base             = row_low;
+    stream_ctx.mmvq_mode            = mmvq_mode;
+    stream_ctx.layout               = dispatch_layout;
 
     auto infer_location = [&](const void * ptr) -> ggml_sycl::cache_location {
         if (!ptr) {
@@ -5225,9 +5184,9 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx,
 
     ggml_sycl::unified_cache * cache =
         ggml_sycl::unified_cache_enabled() ? ggml_sycl::get_unified_cache(*stream) : nullptr;
-    ggml_sycl_cache_id         cache_key =
+    ggml_sycl_cache_id cache_key =
         cache ? ggml_backend_sycl_get_weight_cache_key(src0, device_id) : ggml_sycl_cache_id{};
-    ggml_sycl::cache_ptr_view  view{};
+    ggml_sycl::cache_ptr_view view{};
     if (cache && cache_key.valid) {
         view = cache->get_view(cache_key, dispatch_layout);
     }
@@ -5252,7 +5211,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx,
         // Pre-wire persistent host staging so copy_fn avoids per-call sycl::malloc_host.
         // Grow only if the pre-resolved slice is larger than the current buffer.
         if (custom_copy && slice_bytes > 0) {
-            void * stg = ctx.ensure_mmvq_host_staging(slice_bytes, *stream);
+            void * stg                   = ctx.ensure_mmvq_host_staging(slice_bytes, *stream);
             stream_ctx.host_staging      = stg;
             stream_ctx.host_staging_size = stg ? slice_bytes : 0;
         }
@@ -5284,22 +5243,8 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx,
         return;
     }
 
-    ggml_sycl_mmvq_dispatch(src0,
-                            dispatch_ptr,
-                            dispatch_base,
-                            mmvq_mode,
-                            device_id,
-                            ne00,
-                            ne01,
-                            ne10,
-                            row_low,
-                            row_high,
-                            src1_ncols,
-                            src1_padded_col_size,
-                            src1_ddq_i,
-                            dst_dd_i,
-                            dst_row_stride,
-                            stream);
+    ggml_sycl_mmvq_dispatch(src0, dispatch_ptr, dispatch_base, mmvq_mode, device_id, ne00, ne01, ne10, row_low,
+                            row_high, src1_ncols, src1_padded_col_size, src1_ddq_i, dst_dd_i, dst_row_stride, stream);
     GGML_UNUSED(src1);
     GGML_UNUSED(src1_ddf_i);
     GGML_UNUSED(ctx);
@@ -5324,21 +5269,21 @@ bool ggml_sycl_mmvq_bench_launch(const mmvq_bench_args & args, std::vector<sycl:
         return false;
     }
 
-    reorder_mode mmvq_mode = reorder_mode::NONE;
+    reorder_mode mmvq_mode   = reorder_mode::NONE;
     const void * layout_base = nullptr;
     switch (args.layout) {
         case GGML_LAYOUT_AOS:
             mmvq_mode = reorder_mode::NONE;
             break;
         case GGML_LAYOUT_SOA:
-            mmvq_mode = reorder_mode::SOA;
+            mmvq_mode   = reorder_mode::SOA;
             layout_base = args.layout_base;
             if (!layout_base) {
                 return false;
             }
             break;
         case GGML_LAYOUT_COALESCED:
-            mmvq_mode = reorder_mode::COALESCED;
+            mmvq_mode   = reorder_mode::COALESCED;
             layout_base = args.layout_base;
             if (!layout_base) {
                 return false;
@@ -5354,28 +5299,16 @@ bool ggml_sycl_mmvq_bench_launch(const mmvq_bench_args & args, std::vector<sycl:
     }
 
     ggml_tensor fake{};
-    fake.type = args.weight_type;
+    fake.type    = args.weight_type;
     fake.name[0] = '\0';
 
     // MMVQ kernels do not currently surface per-kernel events; ignore events.
     (void) events;
 
-    ggml_sycl_mmvq_dispatch(&fake,
-                            static_cast<const char *>(args.weights),
-                            layout_base,
-                            mmvq_mode,
-                            device_id,
-                            args.ncols,
-                            args.nrows,
-                            args.ncols,
-                            args.row_low,
-                            args.row_high,
-                            args.batch,
-                            args.src1_padded_col_size,
-                            static_cast<const char *>(args.activations),
-                            args.output,
-                            args.dst_row_stride,
-                            args.stream);
+    ggml_sycl_mmvq_dispatch(&fake, static_cast<const char *>(args.weights), layout_base, mmvq_mode, device_id,
+                            args.ncols, args.nrows, args.ncols, args.row_low, args.row_high, args.batch,
+                            args.src1_padded_col_size, static_cast<const char *>(args.activations), args.output,
+                            args.dst_row_stride, args.stream);
     return true;
 }
 

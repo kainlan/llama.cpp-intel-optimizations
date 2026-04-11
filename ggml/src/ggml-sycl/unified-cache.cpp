@@ -583,13 +583,30 @@ void zero_alloc_check(const char * tag, int device) {
     if (phase != offload_phase::PP && phase != offload_phase::TG) {
         return;
     }
+
     const size_t runtime_bytes = unified_cache_get_runtime_bytes(device);
-    if (runtime_bytes > 0) {
+
+    // Baseline snapshot: captured once on first PP/TG check.
+    // All pre-existing runtime allocations (KV cache, graph buffers, etc.)
+    // are expected and should not trigger warnings.
+    static std::atomic<size_t> s_baseline{ 0 };
+    static std::atomic<bool>   s_baseline_set{ false };
+    if (!s_baseline_set.load(std::memory_order_relaxed)) {
+        s_baseline.store(runtime_bytes, std::memory_order_relaxed);
+        s_baseline_set.store(true, std::memory_order_relaxed);
+        return;  // First call — just record baseline
+    }
+
+    const size_t baseline = s_baseline.load(std::memory_order_relaxed);
+    if (runtime_bytes > baseline) {
+        const size_t delta      = runtime_bytes - baseline;
         const char * phase_name = offload_phase_name(phase);
         GGML_LOG_WARN(
-            "[SYCL-ZERO-ALLOC-CHECK] %s: runtime allocation detected during %s phase: %.1f MB. "
+            "[SYCL-ZERO-ALLOC-CHECK] %s: runtime allocation detected during %s phase: +%.1f MB "
+            "(total %.1f MB, baseline %.1f MB). "
             "Expected zero new allocations during steady-state inference.\n",
-            tag ? tag : "graph", phase_name, runtime_bytes / (1024.0 * 1024.0));
+            tag ? tag : "graph", phase_name, delta / (1024.0 * 1024.0), runtime_bytes / (1024.0 * 1024.0),
+            baseline / (1024.0 * 1024.0));
         if (zero_alloc_mode >= 2) {
             GGML_ASSERT(false && "ZERO_ALLOC_CHECK: runtime allocation during inference");
         }
