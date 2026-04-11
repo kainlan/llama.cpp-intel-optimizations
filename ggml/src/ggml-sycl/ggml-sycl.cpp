@@ -6755,10 +6755,10 @@ static void arena_device_free(void * ptr, size_t bytes, int device_id, sycl::que
         return;
     }
     if (from_arena) {
-        auto * cache = ggml_sycl::get_unified_cache_for_device(device_id);
-        if (cache && cache->arena_active()) {
-            cache->zone_free(ggml_sycl::vram_zone_id::SCRATCH, ptr);
-        }
+        // Compute-arena allocations use a separate bump allocator (arena_alloc)
+        // that resets at each graph_compute call via arena_reset(). Individual
+        // frees use watermark reclaim (arena_free), not TLSF zone_free.
+        ggml_sycl::unified_cache_arena_free(device_id, ptr, bytes);
         return;
     }
     sycl::free(ptr, queue);
