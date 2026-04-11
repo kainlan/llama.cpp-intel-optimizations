@@ -5,8 +5,8 @@
 //
 
 #include "fattn.hpp"
-#include "common.hpp"
 
+#include "common.hpp"
 #include "fattn-debug.hpp"
 #include "fattn-esimd-f16.hpp"
 #include "fattn-mma-f16.hpp"
@@ -315,7 +315,8 @@ void ggml_sycl_v2_pre_allocate_buffers(ggml_backend_sycl_context & ctx, ggml_cgr
                                                        g_v2_auto.block_table_capacity * sizeof(int32_t));
             sycl::free(g_v2_auto.block_table, *g_v2_auto.alloc_queue);
         }
-        g_v2_auto.block_table          = ggml_sycl_malloc_device_t<int32_t>(block_table_size, *ctx.stream(), "fattn_block_table");
+        g_v2_auto.block_table =
+            ggml_sycl_malloc_device_t<int32_t>(block_table_size, *ctx.stream(), "fattn_block_table");
         g_v2_auto.block_table_capacity = block_table_size;
         GGML_SYCL_DEBUG("[V2-PREALLOC] block_table allocated: %d elements\n", block_table_size);
     }
@@ -328,7 +329,7 @@ void ggml_sycl_v2_pre_allocate_buffers(ggml_backend_sycl_context & ctx, ggml_cgr
                                                        g_v2_auto.seq_lens_capacity * sizeof(int32_t));
             sycl::free(g_v2_auto.seq_lens, *g_v2_auto.alloc_queue);
         }
-        g_v2_auto.seq_lens          = ggml_sycl_malloc_device_t<int32_t>(seq_lens_size, *ctx.stream(), "fattn_seq_lens");
+        g_v2_auto.seq_lens = ggml_sycl_malloc_device_t<int32_t>(seq_lens_size, *ctx.stream(), "fattn_seq_lens");
         g_v2_auto.seq_lens_capacity = seq_lens_size;
         GGML_SYCL_DEBUG("[V2-PREALLOC] seq_lens allocated: %d elements\n", seq_lens_size);
     }
@@ -405,8 +406,8 @@ static void init_kv_fp8_config() {
 //
 // Enabled by default. Disable with: GGML_SYCL_FA_ESIMD=0
 
-static bool g_sycl_fa_esimd_enabled     = false;
-static bool g_sycl_fa_esimd_initialized = false;
+static bool g_sycl_fa_esimd_enabled           = false;
+static bool g_sycl_fa_esimd_initialized       = false;
 static bool g_sycl_fa_safe_decode_initialized = false;
 static bool g_sycl_fa_safe_decode_enabled     = true;
 
@@ -435,7 +436,7 @@ static void init_fa_safe_decode_config() {
         return;
     }
     g_sycl_fa_safe_decode_initialized = true;
-    const char * env = std::getenv("GGML_SYCL_FA_SAFE_DECODE");
+    const char * env                  = std::getenv("GGML_SYCL_FA_SAFE_DECODE");
     if (env && (strcmp(env, "0") == 0 || strcmp(env, "false") == 0)) {
         g_sycl_fa_safe_decode_enabled = false;
     }
@@ -757,8 +758,8 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
 
     // Runtime kernel selection based on GPU capabilities
     // Check if the device has XMX (Intel matrix extension) support
-    sycl::device dev     = stream->get_device();
-    bool         use_xmx = gpu_has_xmx(dev);
+    sycl::device dev         = stream->get_device();
+    bool         use_xmx     = gpu_has_xmx(dev);
     const bool   safe_decode = g_sycl_fa_safe_decode_enabled && ne01 <= 1;
     if (safe_decode) {
         use_xmx = false;
@@ -932,7 +933,6 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     params.sinks     = sinks ? static_cast<const char *>(ggml_sycl_resolve_tensor_ptr(sinks, device)) : nullptr;
     params.dst       = safe_dst.resolve_as<float>();
 
-
     params.scale         = scale;
     params.max_bias      = max_bias;
     params.m0            = m0;
@@ -1026,7 +1026,9 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
                     if (ggml_sycl_get_alloc_type(ptr) != sycl::usm::alloc::device) {
                         return static_cast<const int32_t *>(ptr);
                     }
-                } catch (...) {}
+                } catch (...) {
+                    GGML_LOG_WARN("[SYCL] resolve_host_seq_ids: alloc type query failed, falling back to host data\n");
+                }
             }
             return static_cast<const int32_t *>(ggml_sycl_host_data(tensor));
         };
@@ -1130,8 +1132,8 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
         params.block_table        = (const int32_t *) ggml_sycl_get_data_ptr(block_table, device);
         params.seq_lens           = (const int32_t *) ggml_sycl_get_data_ptr(seq_lens_tensor, device);
 
-#if 0  // Debug output disabled
-        // Print only once to avoid flooding output
+#if 0  // Debug output disabled \
+       // Print only once to avoid flooding output
         static bool paged_attn_info_shown = false;
         if (!paged_attn_info_shown) {
             fprintf(stderr, "[SYCL] PagedAttention enabled: block_size=%d, max_blocks=%d\n",
@@ -1287,7 +1289,8 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
                         g_v2_auto.block_table_capacity * sizeof(int32_t));
                     sycl::free(g_v2_auto.block_table, *g_v2_auto.alloc_queue);
                 }
-                g_v2_auto.block_table          = ggml_sycl_malloc_device_t<int32_t>(block_table_size, *ctx.stream(), "fattn_block_table");
+                g_v2_auto.block_table =
+                    ggml_sycl_malloc_device_t<int32_t>(block_table_size, *ctx.stream(), "fattn_block_table");
                 g_v2_auto.block_table_capacity = block_table_size;
             }
             if (needs_realloc_seq) {
@@ -1297,7 +1300,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
                         g_v2_auto.seq_lens_capacity * sizeof(int32_t));
                     sycl::free(g_v2_auto.seq_lens, *g_v2_auto.alloc_queue);
                 }
-                g_v2_auto.seq_lens          = ggml_sycl_malloc_device_t<int32_t>(seq_lens_size, *ctx.stream(), "fattn_seq_lens");
+                g_v2_auto.seq_lens = ggml_sycl_malloc_device_t<int32_t>(seq_lens_size, *ctx.stream(), "fattn_seq_lens");
                 g_v2_auto.seq_lens_capacity = seq_lens_size;
             }
             if (needs_realloc_block || needs_realloc_seq) {
@@ -1336,9 +1339,8 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
                                   (g_v2_auto.alloc_queue != ctx.stream() || g_v2_auto.temp_buf_capacity < temp_size);
         if (needs_realloc_temp) {
             if (g_v2_auto.temp_buf && g_v2_auto.alloc_queue) {
-                ggml_sycl::unified_cache_sub_runtime_bytes(
-                    ggml_sycl_get_device_id_from_queue(*g_v2_auto.alloc_queue),
-                    g_v2_auto.temp_buf_capacity);
+                ggml_sycl::unified_cache_sub_runtime_bytes(ggml_sycl_get_device_id_from_queue(*g_v2_auto.alloc_queue),
+                                                           g_v2_auto.temp_buf_capacity);
                 sycl::free(g_v2_auto.temp_buf, *g_v2_auto.alloc_queue);
             }
             g_v2_auto.temp_buf          = ggml_sycl_malloc_device_t<uint8_t>(temp_size, *ctx.stream(), "fattn_temp");

@@ -2151,6 +2151,13 @@ static void ggml_sycl_configure_host_zones_for_plan(ggml_sycl::unified_cache * c
     hcache->configure_host_zones(plan.host_zone_weight_bytes, kv_zone_bytes, plan.host_zone_staging_bytes,
                                  scratch_zone_bytes);
 
+    // Pre-allocate runtime pool to prevent lazy growth during inference.
+    // Covers oneDNN reorder scratch + DMA staging; prevents HOST_ALLOC_PHASE_GATE warnings.
+    const size_t runtime_bytes = plan.onednn_scratchpad_bytes + plan.dma_staging_pool_bytes;
+    if (runtime_bytes > 0) {
+        hcache->pre_allocate_runtime_chunks(runtime_bytes);
+    }
+
     if (hcache->host_zones_configured()) {
         GGML_LOG_INFO("[HOST-ARENA] Zones configured: WEIGHT=%.1f MB KV=%.1f MB STAGING=%.1f MB SCRATCH=%.1f MB\n",
                       plan.host_zone_weight_bytes / (1024.0 * 1024.0), kv_zone_bytes / (1024.0 * 1024.0),

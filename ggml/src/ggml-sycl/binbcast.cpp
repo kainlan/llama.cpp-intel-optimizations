@@ -46,16 +46,13 @@ static sycl::event ggml_sycl_submit_binbcast_event(sycl::queue & q, ggml_sycl_bi
     if (g_ggml_sycl_graph_recording) {
         g_sycl_extra_submit_count_during_recording.fetch_add(1, std::memory_order_relaxed);
     }
-    if (mode == ggml_sycl_binbcast_event_mode::BARRIER &&
-        q.has_property<sycl::property::queue::in_order>()) {
+    if (mode == ggml_sycl_binbcast_event_mode::BARRIER && q.has_property<sycl::property::queue::in_order>()) {
         mode = ggml_sycl_binbcast_event_mode::SAFE;
     }
     if (mode == ggml_sycl_binbcast_event_mode::BARRIER) {
         return q.ext_oneapi_submit_barrier();
     }
-    return q.submit([&](sycl::handler & cgh) {
-        cgh.single_task<ggml_sycl_binbcast_unpin_event_kernel>([] {});
-    });
+    return q.submit([&](sycl::handler & cgh) { cgh.single_task<ggml_sycl_binbcast_unpin_event_kernel>([] {}); });
 }
 
 static inline const char * ggml_sycl_layout_mode_name(ggml_layout_mode mode) {
@@ -77,8 +74,14 @@ static inline const char * ggml_sycl_layout_mode_name(ggml_layout_mode mode) {
     }
 }
 
-static inline size_t ggml_sycl_max_end_bytes(int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, size_t nb0,
-                                             size_t nb1, size_t nb2, size_t nb3) {
+static inline size_t ggml_sycl_max_end_bytes(int64_t ne0,
+                                             int64_t ne1,
+                                             int64_t ne2,
+                                             int64_t ne3,
+                                             size_t  nb0,
+                                             size_t  nb1,
+                                             size_t  nb2,
+                                             size_t  nb3) {
     if (ne0 <= 0 || ne1 <= 0 || ne2 <= 0 || ne3 <= 0) {
         return 0;
     }
@@ -130,8 +133,8 @@ static void ggml_sycl_debug_dump_tensor(const char * tag, const ggml_tensor * t)
             "data=%p view_src=%s view_offs=%zu layout_mode=%s layout_ptr=%p layout_size=%zu\n",
             tag, t->name, ggml_type_name(t->type), (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2],
             (long long) t->ne[3], t->nb[0], t->nb[1], t->nb[2], t->nb[3], ggml_is_contiguous(t),
-            const_cast<void *>(ggml_sycl_host_data(t)),
-            t->view_src ? t->view_src->name : "none", t->view_offs, layout_mode, layout_ptr, layout_size);
+            const_cast<void *>(ggml_sycl_host_data(t)), t->view_src ? t->view_src->name : "none", t->view_offs,
+            layout_mode, layout_ptr, layout_size);
 }
 
 static void ggml_sycl_debug_check_tensor_ptr(const char * tag, const ggml_tensor * t) {
@@ -144,15 +147,14 @@ static void ggml_sycl_debug_check_tensor_ptr(const char * tag, const ggml_tensor
     if (!base || size == 0) {
         return;
     }
-    const uintptr_t base_u = reinterpret_cast<uintptr_t>(base);
-    const uintptr_t data_u = reinterpret_cast<uintptr_t>(tensor_data);
-    const size_t    need   = ggml_nbytes(t);
+    const uintptr_t base_u   = reinterpret_cast<uintptr_t>(base);
+    const uintptr_t data_u   = reinterpret_cast<uintptr_t>(tensor_data);
+    const size_t    need     = ggml_nbytes(t);
     const bool      in_range = data_u >= base_u && (data_u + need) <= (base_u + size);
     if (!in_range) {
         const char * buft = ggml_backend_buft_name(ggml_backend_buffer_get_type(t->buffer));
-        fprintf(stderr,
-                "[SYCL-ADD-DBG] %s pointer out of range: data=%p need=%zu base=%p size=%zu buft=%s\n",
-                tag, tensor_data, need, base, size, buft ? buft : "(null)");
+        fprintf(stderr, "[SYCL-ADD-DBG] %s pointer out of range: data=%p need=%zu base=%p size=%zu buft=%s\n", tag,
+                tensor_data, need, base, size, buft ? buft : "(null)");
     }
 }
 
@@ -479,18 +481,20 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
     void *    src0_d = ggml_sycl_resolve_tensor_ptr(src0, device);
     void *    src1_d = ggml_sycl_resolve_tensor_ptr(src1, device);
     void *    dst_d  = ggml_sycl_resolve_tensor_ptr(dst, device);
-    GGML_SYCL_DEBUG("[BINBCAST-PTR] src0=%s src0_host=%p src0_d=%p\n",
-                    src0 ? src0->name : "(null)", src0 ? const_cast<void *>(ggml_sycl_host_data(src0)) : nullptr, src0_d);
-    GGML_SYCL_DEBUG("[BINBCAST-PTR] src1=%s src1_host=%p src1_d=%p\n",
-                    src1 ? src1->name : "(null)", src1 ? const_cast<void *>(ggml_sycl_host_data(src1)) : nullptr, src1_d);
+    GGML_SYCL_DEBUG("[BINBCAST-PTR] src0=%s src0_host=%p src0_d=%p\n", src0 ? src0->name : "(null)",
+                    src0 ? const_cast<void *>(ggml_sycl_host_data(src0)) : nullptr, src0_d);
+    GGML_SYCL_DEBUG("[BINBCAST-PTR] src1=%s src1_host=%p src1_d=%p\n", src1 ? src1->name : "(null)",
+                    src1 ? const_cast<void *>(ggml_sycl_host_data(src1)) : nullptr, src1_d);
 
     ggml_sycl::unified_cache * cache = nullptr;
+
     struct inflight_pin {
         ggml_sycl_cache_id key;
         ggml_layout_mode   layout;
         bool               keep_pinned;
     };
-    inflight_pin pins[2] = {};
+
+    inflight_pin pins[2]   = {};
     int          pin_count = 0;
 
     auto is_graph_pinned = [&](const ggml_sycl_cache_id & key, ggml_layout_mode layout) -> bool {
@@ -524,11 +528,8 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
             return;
         }
         cache->pin(key, layout->mode);
-        GGML_SYCL_DEBUG("[SYCL-BINBCAST] pin tensor=%s model=%llu name_hash=0x%llx layout=%d\n",
-                        tensor->name,
-                        (unsigned long long) key.model_id,
-                        (unsigned long long) key.name_hash,
-                        (int) layout->mode);
+        GGML_SYCL_DEBUG("[SYCL-BINBCAST] pin tensor=%s model=%llu name_hash=0x%llx layout=%d\n", tensor->name,
+                        (unsigned long long) key.model_id, (unsigned long long) key.name_hash, (int) layout->mode);
         if (pin_count < 2) {
             pins[pin_count++] = { key, layout->mode, is_graph_pinned(key, layout->mode) };
         }
@@ -567,8 +568,8 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
         try {
             const auto mode = ggml_sycl_get_binbcast_event_mode();
             if (g_ggml_sycl_debug) {
-                GGML_LOG_INFO("[SYCL-BINBCAST] unpin event mode=%s pins=%d\n",
-                              ggml_sycl_binbcast_event_mode_name(mode), pin_count);
+                GGML_LOG_INFO("[SYCL-BINBCAST] unpin event mode=%s pins=%d\n", ggml_sycl_binbcast_event_mode_name(mode),
+                              pin_count);
             }
             sycl::event done_event = ggml_sycl_submit_binbcast_event(*main_stream, mode);
             for (int i = 0; i < pin_count; ++i) {
@@ -588,10 +589,10 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
 
 inline void ggml_sycl_op_add(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
     if (g_ggml_sycl_debug) {
-        const ggml_tensor * src0 = dst.src(0).raw();
-        const ggml_tensor * src1 = dst.src(1).raw();
+        const ggml_tensor * src0    = dst.src(0).raw();
+        const ggml_tensor * src1    = dst.src(1).raw();
         const ggml_tensor * raw_dst = dst.raw();
-        const ggml_tensor * dst = raw_dst;
+        const ggml_tensor * dst     = raw_dst;  // NOLINT: shadows param; needed by GGML_TENSOR_BINARY_OP_LOCALS
         GGML_TENSOR_BINARY_OP_LOCALS
         ggml_sycl_debug_dump_tensor("ADD src0", src0);
         ggml_sycl_debug_dump_tensor("ADD src1", src1);
@@ -609,32 +610,33 @@ inline void ggml_sycl_op_add(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_te
             GGML_LOG_ERROR(
                 "[SYCL-ADD-DBG] OOB access detected: src0=%s need=%zu avail=%zu, src1=%s need=%zu avail=%zu, "
                 "dst=%s need=%zu avail=%zu\n",
-                src0->name, src0_need, src0_avail, src1->name, src1_need, src1_avail, raw_dst->name, dst_need, dst_avail);
+                src0->name, src0_need, src0_avail, src1->name, src1_need, src1_avail, raw_dst->name, dst_need,
+                dst_avail);
             GGML_ABORT("SYCL ADD OOB bounds");
         }
     }
-    ggml_sycl_op_bin_bcast<bin_bcast_sycl<op_add>>(
-        ctx, dst.src(0).raw(), dst.src(1).raw(), const_cast<ggml_tensor *>(dst.raw()));
+    ggml_sycl_op_bin_bcast<bin_bcast_sycl<op_add>>(ctx, dst.src(0).raw(), dst.src(1).raw(),
+                                                   const_cast<ggml_tensor *>(dst.raw()));
 }
 
 inline void ggml_sycl_op_sub(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
-    ggml_sycl_op_bin_bcast<bin_bcast_sycl<op_sub>>(
-        ctx, dst.src(0).raw(), dst.src(1).raw(), const_cast<ggml_tensor *>(dst.raw()));
+    ggml_sycl_op_bin_bcast<bin_bcast_sycl<op_sub>>(ctx, dst.src(0).raw(), dst.src(1).raw(),
+                                                   const_cast<ggml_tensor *>(dst.raw()));
 }
 
 inline void ggml_sycl_op_mul(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
-    ggml_sycl_op_bin_bcast<bin_bcast_sycl<op_mul>>(
-        ctx, dst.src(0).raw(), dst.src(1).raw(), const_cast<ggml_tensor *>(dst.raw()));
+    ggml_sycl_op_bin_bcast<bin_bcast_sycl<op_mul>>(ctx, dst.src(0).raw(), dst.src(1).raw(),
+                                                   const_cast<ggml_tensor *>(dst.raw()));
 }
 
 inline void ggml_sycl_op_div(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
-    ggml_sycl_op_bin_bcast<bin_bcast_sycl<op_div>>(
-        ctx, dst.src(0).raw(), dst.src(1).raw(), const_cast<ggml_tensor *>(dst.raw()));
+    ggml_sycl_op_bin_bcast<bin_bcast_sycl<op_div>>(ctx, dst.src(0).raw(), dst.src(1).raw(),
+                                                   const_cast<ggml_tensor *>(dst.raw()));
 }
 
 inline void ggml_sycl_op_repeat(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
-    ggml_sycl_op_bin_bcast<bin_bcast_sycl<op_repeat>>(
-        ctx, dst.raw(), dst.src(0).raw(), const_cast<ggml_tensor *>(dst.raw()));
+    ggml_sycl_op_bin_bcast<bin_bcast_sycl<op_repeat>>(ctx, dst.raw(), dst.src(0).raw(),
+                                                      const_cast<ggml_tensor *>(dst.raw()));
 }
 
 void ggml_sycl_add(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
@@ -649,19 +651,19 @@ void ggml_sycl_sub(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) 
 
 void ggml_sycl_mul(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst.raw(), /*num_src=*/2);
-    const ggml_tensor * raw_dst = dst.raw();
+    const ggml_tensor *  raw_dst = dst.raw();
 
     if (g_ggml_sycl_debug) {
-        const ggml_tensor * src0 = raw_dst ? raw_dst->src[0] : nullptr;
-        const ggml_tensor * src1 = raw_dst ? raw_dst->src[1] : nullptr;
-        const bool is_result_norm = raw_dst && strcmp(raw_dst->name, "result_norm") == 0;
-        const bool is_output_norm = src1 && strcmp(src1->name, "output_norm.weight") == 0;
+        const ggml_tensor * src0           = raw_dst ? raw_dst->src[0] : nullptr;
+        const ggml_tensor * src1           = raw_dst ? raw_dst->src[1] : nullptr;
+        const bool          is_result_norm = raw_dst && strcmp(raw_dst->name, "result_norm") == 0;
+        const bool          is_output_norm = src1 && strcmp(src1->name, "output_norm.weight") == 0;
 
         if (is_result_norm || is_output_norm) {
-            const int   device   = ctx.device;
-            void *      src0_ptr = src0 ? ggml_sycl_get_layout_ptr(src0, device) : nullptr;
-            void *      src1_ptr = src1 ? ggml_sycl_get_layout_ptr(src1, device) : nullptr;
-            void *      dst_ptr  = raw_dst ? ggml_sycl_get_data_ptr(raw_dst, device) : nullptr;
+            const int    device      = ctx.device;
+            void *       src0_ptr    = src0 ? ggml_sycl_get_layout_ptr(src0, device) : nullptr;
+            void *       src1_ptr    = src1 ? ggml_sycl_get_layout_ptr(src1, device) : nullptr;
+            void *       dst_ptr     = raw_dst ? ggml_sycl_get_data_ptr(raw_dst, device) : nullptr;
             const char * src0_layout = (src0 && src0->layout) ? ggml_sycl_layout_mode_name(src0->layout->mode) : "none";
             const char * src1_layout = (src1 && src1->layout) ? ggml_sycl_layout_mode_name(src1->layout->mode) : "none";
 
@@ -669,9 +671,8 @@ void ggml_sycl_mul(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) 
                     "[SYCL-MUL-DBG] device=%d graph_recording=%d dst=%s src0=%s src1=%s src0_ptr=%p src1_ptr=%p "
                     "dst_ptr=%p src0_layout=%s src1_layout=%s last_graph_event=%d has_barrier=%d",
                     device, g_ggml_sycl_graph_recording ? 1 : 0, raw_dst ? raw_dst->name : "null",
-                    src0 ? src0->name : "null",
-                    src1 ? src1->name : "null", src0_ptr, src1_ptr, dst_ptr, src0_layout, src1_layout,
-                    ctx.last_graph_event.has_value() ? 1 : 0,
+                    src0 ? src0->name : "null", src1 ? src1->name : "null", src0_ptr, src1_ptr, dst_ptr, src0_layout,
+                    src1_layout, ctx.last_graph_event.has_value() ? 1 : 0,
                     (ctx.has_pending_barrier && ctx.barrier_event.has_value()) ? 1 : 0);
 #ifdef GGML_SYCL_GRAPH
             fprintf(stderr, " exec_graph=%d graph_nodes=%d graph_decode=%d\n", ctx.exec_graph ? 1 : 0,
@@ -735,8 +736,8 @@ static void k_add1(const T * __restrict__ src0,
 void ggml_sycl_add1(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst.raw(), /*num_src=*/2);
 
-    const ggml_tensor * src0 = dst.src(0).raw();
-    const ggml_tensor * src1 = dst.src(1).raw();
+    const ggml_tensor * src0    = dst.src(0).raw();
+    const ggml_tensor * src1    = dst.src(1).raw();
     const ggml_tensor * raw_dst = dst.raw();
 
     GGML_ASSERT(ggml_nelements(src1) == 1);

@@ -232,6 +232,41 @@ size_t pinned_chunk_pool::pre_allocate_all(size_t model_weight_bytes) {
     return pre_allocate(total_need);
 }
 
+size_t pinned_chunk_pool::pre_allocate_runtime_chunks(size_t total_bytes) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (total_bytes == 0) {
+        return 0;
+    }
+
+    size_t current_free = 0;
+    for (const auto & c : runtime_chunks_) {
+        if (c.used + chunk_size_ <= c.size) {
+            current_free += c.size - c.used;
+        }
+    }
+    if (current_free >= total_bytes) {
+        GGML_LOG_INFO("[SYCL] Pinned pool pre_allocate_runtime: already have %.1f MB free (need %.1f MB)\n",
+                      current_free / (1024.0 * 1024.0), total_bytes / (1024.0 * 1024.0));
+        return 0;
+    }
+
+    size_t       need          = total_bytes - current_free;
+    const size_t chunks_needed = (need + chunk_size_ - 1) / chunk_size_;
+    size_t       chunks_grown  = 0;
+
+    for (size_t i = 0; i < chunks_needed; ++i) {
+        if (!grow_into(runtime_chunks_, chunk_size_, true)) {
+            GGML_LOG_WARN("[SYCL] Pinned pool pre_allocate_runtime: grow failed at chunk %zu/%zu\n", chunks_grown,
+                          chunks_needed);
+            break;
+        }
+        ++chunks_grown;
+    }
+    GGML_LOG_INFO("[SYCL] Pinned pool pre_allocate_runtime: grew %zu chunks for %.1f MB (total need %.1f MB)\n",
+                  chunks_grown, chunks_grown * chunk_size_ / (1024.0 * 1024.0), total_bytes / (1024.0 * 1024.0));
+    return chunks_grown;
+}
+
 void pinned_chunk_pool::configure_zones(size_t weight_bytes,
                                         size_t kv_bytes,
                                         size_t staging_bytes,

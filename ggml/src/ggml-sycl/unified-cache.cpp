@@ -1640,6 +1640,13 @@ size_t host_cache::pre_allocate_all(size_t model_weight_bytes) {
     return pinned_pool_->pre_allocate_all(model_weight_bytes);
 }
 
+size_t host_cache::pre_allocate_runtime_chunks(size_t total_bytes) {
+    if (!pinned_pool_) {
+        return 0;
+    }
+    return pinned_pool_->pre_allocate_runtime_chunks(total_bytes);
+}
+
 void * host_cache::ensure_cached_alloc(const ggml_sycl_cache_id &    key_id,
                                        const void *                  src_ptr,
                                        size_t                        src_size,

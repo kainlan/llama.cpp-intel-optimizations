@@ -103,6 +103,11 @@ class pinned_chunk_pool {
     // Returns the number of new chunks allocated.
     size_t pre_allocate_all(size_t model_weight_bytes);
 
+    // Pre-allocate runtime pool chunks to hold total_bytes without lazy growth.
+    // Call after placement plan is computed and before first inference pass.
+    // Returns the number of chunks actually allocated.
+    size_t pre_allocate_runtime_chunks(size_t total_bytes);
+
     // Configure logical zones across the pool's free capacity.
     // Must be called after pre-allocation and before any zone_alloc().
     void configure_zones(size_t weight_bytes, size_t kv_bytes, size_t staging_bytes, size_t scratch_bytes);

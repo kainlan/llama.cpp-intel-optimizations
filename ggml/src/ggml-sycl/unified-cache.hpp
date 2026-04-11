@@ -799,6 +799,10 @@ class host_cache {
     // Ensures zero sycl::malloc_host calls during inference.
     size_t pre_allocate_all(size_t model_weight_bytes);
 
+    // Pre-allocate runtime pool chunks to prevent lazy growth during inference.
+    // Call after placement plan is computed with total runtime bytes needed.
+    size_t pre_allocate_runtime_chunks(size_t total_bytes);
+
     host_cache(const host_cache &)             = delete;
     host_cache & operator=(const host_cache &) = delete;
     host_cache(host_cache &&)                  = delete;
