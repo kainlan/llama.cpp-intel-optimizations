@@ -13908,17 +13908,6 @@ alloc_succeeded:
                     ctx->tp_streams[dev_id]  = tp_queue;
                     ctx->tp_allocs[dev_id]   = tp_alloc;
 
-                    // DEBUG: Check if allocation overlaps with L31 FFN gate weight region
-                    uintptr_t l31_weight_addr = 0xffffd5575d400000ULL;
-                    uintptr_t alloc_start     = (uintptr_t) ptr;
-                    uintptr_t alloc_end       = alloc_start + size;
-                    if (dev_id == 0 && alloc_start <= l31_weight_addr && alloc_end > l31_weight_addr) {
-                        fprintf(stderr,
-                                "TP DEBUG ALLOC OVERLAP (compute)! device=%d ptr=%p size=%zu overlaps L31 weight at "
-                                "0x%llx\n",
-
-                                dev_id, ptr, size, (unsigned long long) l31_weight_addr);
-                    }
                     GGML_SYCL_DEBUG("TP: Allocated compute buffer %zu bytes on device %d at %p\n", size, dev_id, ptr);
                 } else {
                     GGML_LOG_ERROR("TP: Failed to allocate compute buffer on device %d\n", dev_id);
@@ -21841,19 +21830,7 @@ static void ggml_sycl_mul_mat_tp_column_parallel_post(ggml_backend_sycl_context 
                 (long long) batch, sample[0], sample[1], sample[2], sample[3], has_nan);
     }
     ggml_sycl_set_device(device);
-    queue_ptr  stream                 = ctx.stream(device, 0);
-    // DEBUG: Check L31 weight BEFORE malloc_device for input staging
-    static int staging_pre_malloc_dbg = 0;
-    bool       check_staging = (g_ggml_sycl_tp_debug && layer == 31 && is_ffn_gate && staging_pre_malloc_dbg < 3);
-    if (check_staging) {
-        uintptr_t l31_weight_addr = 0xffffd5575d400000ULL;
-        queue_ptr dev0_stream     = ctx.stream(main_device, 0);
-        uint8_t   weight_bytes[18];
-        dev0_stream->memcpy(weight_bytes, (void *) l31_weight_addr, 18).wait();
-        uint16_t d_raw = weight_bytes[0] | (weight_bytes[1] << 8);
-        float    d_f   = ggml_fp16_to_fp32(d_raw);
-        fprintf(stderr, "TP DEBUG L31 STAGING PRE-MALLOC: weight d=%f %s\n", d_f, (d_f > 100.0f) ? "CORRUPTED" : "OK");
-    }
+    queue_ptr               stream = ctx.stream(device, 0);
     // Allocate on device 1
     ggml_sycl::alloc_handle input_dev1_alloc{};
     const bool              input_dev1_ok =
@@ -21861,18 +21838,6 @@ static void ggml_sycl_mul_mat_tp_column_parallel_post(ggml_backend_sycl_context 
                                true, false, false, &input_dev1_alloc);
     float * input_dev1 = static_cast<float *>(input_dev1_alloc.ptr);
 
-    // DEBUG: Check L31 weight AFTER malloc_device and print allocated address
-    if (check_staging) {
-        uintptr_t l31_weight_addr = 0xffffd5575d400000ULL;
-        queue_ptr dev0_stream     = ctx.stream(main_device, 0);
-        uint8_t   weight_bytes[18];
-        dev0_stream->memcpy(weight_bytes, (void *) l31_weight_addr, 18).wait();
-        uint16_t d_raw = weight_bytes[0] | (weight_bytes[1] << 8);
-        float    d_f   = ggml_fp16_to_fp32(d_raw);
-        fprintf(stderr, "TP DEBUG L31 STAGING POST-MALLOC: weight d=%f, input_dev1=%p %s\n", d_f, (void *) input_dev1,
-                (d_f > 100.0f) ? "CORRUPTED" : "OK");
-        staging_pre_malloc_dbg++;
-    }
     if (!input_dev1_ok || !input_dev1) {
         GGML_LOG_ERROR("SYCL TP: ERROR - failed to allocate %s input on device %d\n", is_ffn_gate ? "FFN" : "attention",
                        device);
@@ -21890,19 +21855,6 @@ static void ggml_sycl_mul_mat_tp_column_parallel_post(ggml_backend_sycl_context 
         (void) ggml_sycl::unified_free(input_dev1_alloc);
         return;
     }
-    // DEBUG: Check after malloc_host
-
-    static int staging_step_dbg = 0;
-    bool       trace_staging    = (g_ggml_sycl_tp_debug && layer == 31 && is_ffn_gate && staging_step_dbg < 1);
-    if (trace_staging) {
-        uintptr_t l31_weight_addr = 0xffffd5575d400000ULL;
-        uint8_t   weight_bytes[18];
-        main_stream->memcpy(weight_bytes, (void *) l31_weight_addr, 18).wait();
-        uint16_t d_raw = weight_bytes[0] | (weight_bytes[1] << 8);
-        float    d_f   = ggml_fp16_to_fp32(d_raw);
-        fprintf(stderr, "TP DEBUG L31 STAGING STEP1 (after host malloc): weight d=%f %s\n", d_f,
-                (d_f > 100.0f) ? "CORRUPTED" : "OK");
-    }
     // For FFN gate: try to use cached FFN norm (prevents buffer aliasing issues)
     // The GGML scheduler may reuse the ffn_norm buffer before we can read it
     void * cached_ffn_norm = nullptr;
@@ -21914,16 +21866,6 @@ static void ggml_sycl_mul_mat_tp_column_parallel_post(ggml_backend_sycl_context 
             // IMPORTANT: Use device-specific pointer for TP mode!
             void * src1_ptr = ggml_sycl_get_data_ptr(src1, main_device);
             main_stream->memcpy(host_buf, src1_ptr, src1_size).wait();
-        }
-        // DEBUG: Check after memcpy to host_buf
-        if (trace_staging) {
-            uintptr_t l31_weight_addr = 0xffffd5575d400000ULL;
-            uint8_t   weight_bytes[18];
-            main_stream->memcpy(weight_bytes, (void *) l31_weight_addr, 18).wait();
-            uint16_t d_raw = weight_bytes[0] | (weight_bytes[1] << 8);
-            float    d_f   = ggml_fp16_to_fp32(d_raw);
-            fprintf(stderr, "TP DEBUG L31 STAGING STEP2 (after host memcpy): weight d=%f %s\n", d_f,
-                    (d_f > 100.0f) ? "CORRUPTED" : "OK");
         }
         // DEBUG: Check FFN input at storage time for batch=1 (disabled - TP working)
 
@@ -21945,37 +21887,9 @@ static void ggml_sycl_mul_mat_tp_column_parallel_post(ggml_backend_sycl_context 
     stream = ctx.stream(device, 0);
     stream->memcpy(input_dev1, host_buf, src1_size).wait();
 
-    // DEBUG: Check after memcpy to device 1
-    if (trace_staging) {
-        ggml_sycl_set_device(main_device);
-        queue_ptr dev0_stream     = ctx.stream(main_device, 0);
-        uintptr_t l31_weight_addr = 0xffffd5575d400000ULL;
-        uint8_t   weight_bytes[18];
-        dev0_stream->memcpy(weight_bytes, (void *) l31_weight_addr, 18).wait();
-        uint16_t d_raw = weight_bytes[0] | (weight_bytes[1] << 8);
-
-        float d_f = ggml_fp16_to_fp32(d_raw);
-        fprintf(stderr, "TP DEBUG L31 STAGING STEP3 (after dev1 memcpy): weight d=%f %s\n", d_f,
-                (d_f > 100.0f) ? "CORRUPTED" : "OK");
-        ggml_sycl_set_device(device);
-    }
     // OPTIMIZATION: Don't free host_buf - it's a persistent staging buffer
     // managed by ggml_sycl_tp_ensure_host_staging()
     // sycl::free(host_buf, *main_stream);
-    // DEBUG: Check after host buffer free
-    if (trace_staging) {
-        ggml_sycl_set_device(main_device);
-        queue_ptr dev0_stream     = ctx.stream(main_device, 0);
-        uintptr_t l31_weight_addr = 0xffffd5575d400000ULL;
-        uint8_t   weight_bytes[18];
-        dev0_stream->memcpy(weight_bytes, (void *) l31_weight_addr, 18).wait();
-        uint16_t d_raw = weight_bytes[0] | (weight_bytes[1] << 8);
-        float    d_f   = ggml_fp16_to_fp32(d_raw);
-        fprintf(stderr, "TP DEBUG L31 STAGING STEP4 (after host free): weight d=%f %s\n", d_f,
-                (d_f > 100.0f) ? "CORRUPTED" : "OK");
-        staging_step_dbg++;
-        ggml_sycl_set_device(device);
-    }
     // Store for later use by row-parallel layer
     if (is_ffn_gate) {
         // Store the input
@@ -22590,29 +22504,6 @@ static void ggml_sycl_mul_mat_tp_row_parallel_post(ggml_backend_sycl_context & c
             }
 
             // SYNC PATH: No async result, compute synchronously
-            // DEBUG: Check L31 weight at START of FFN processing for layer 31 (limited)
-            static int l31_start_dbg = 0;
-
-            if (g_ggml_sycl_tp_debug && layer == 31 && l31_start_dbg++ < 3) {
-                uintptr_t l31_weight_addr = 0xffffd5575d400000ULL;
-                queue_ptr main_stream     = ctx.stream();
-
-                struct {
-                    uint16_t d_bits;
-                    uint8_t  qs[16];
-                } wblk;
-
-                try {
-                    main_stream->memcpy(&wblk, (void *) l31_weight_addr, sizeof(wblk)).wait();
-                    uint16_t   d_raw = wblk.d_bits;
-                    sycl::half d_half;
-                    memcpy(&d_half, &d_raw, sizeof(sycl::half));
-                    float d_f = static_cast<float>(d_half);
-                    fprintf(stderr, "TP DEBUG FFN_START layer 31: L31 weight d=%f %s\n", d_f,
-                            (d_f > 100.0f || std::isnan(d_f)) ? "CORRUPTED" : "OK");
-                } catch (...) {
-                }
-            }
             ffn_input_storage ffn_input = {};
             {
                 std::lock_guard<std::mutex> lock(g_tp_ffn_input_mutex);
@@ -22998,38 +22889,6 @@ static void ggml_sycl_mul_mat_tp_row_parallel_post(ggml_backend_sycl_context & c
                             }
                             // OPTIMIZATION: No cleanup needed - using persistent buffers
                             // Buffers are pre-allocated in ggml_sycl_tp_ensure_ffn_buffers()
-
-                            // and freed only at program exit via ggml_sycl_tp_free_ffn_buffers()
-                            // DEBUG: Check if L31 FFN processing corrupted the weight
-
-                            if (layer == 31) {
-                                ggml_sycl_set_device(main_device);
-                                queue_ptr main_stream     = ctx.stream();
-                                uintptr_t l31_weight_addr = 0xffffd5575d400000ULL;
-
-                                struct {
-                                    uint16_t d_bits;
-                                    uint8_t  qs[16];
-                                } wblk;
-
-                                try {
-                                    main_stream->memcpy(&wblk, (void *) l31_weight_addr, sizeof(wblk)).wait();
-                                    uint16_t   d_raw = wblk.d_bits;
-                                    sycl::half d_half;
-                                    memcpy(&d_half, &d_raw, sizeof(sycl::half));
-                                    float d_f = static_cast<float>(d_half);
-                                    if (g_ggml_sycl_tp_debug && (d_f > 100.0f || std::isnan(d_f))) {
-                                        fprintf(stderr, "TP DEBUG FFN_CLEANUP layer 31: L31 weight CORRUPTED d=%f\n",
-                                                d_f);
-                                    } else if (g_ggml_sycl_tp_debug) {
-                                        static int cleanup_dbg = 0;
-                                        if (cleanup_dbg++ < 3) {
-                                            fprintf(stderr, "TP DEBUG FFN_CLEANUP layer 31: L31 weight OK d=%f\n", d_f);
-                                        }
-                                    }
-                                } catch (...) {
-                                }
-                            }
                         }
                     }
                     // Restore main device context
@@ -35612,16 +35471,25 @@ cpu_fallback_fast:
     // This ensures CPU dispatch activates even when GGML_SYCL_MOE_HYBRID=0 if the
     // planner decided some experts should be host-pinned (e.g., MoE models that
     // don't fit entirely in VRAM).
-    bool plan_has_cpu_experts = false;
+    // Cache per-tensor: placement plan is static after model load, so the result
+    // doesn't change between invocations for the same tensor.
+    static std::unordered_map<std::string, bool> plan_has_cpu_cache;
+    bool                                         plan_has_cpu_experts = false;
     if (has_placement_plan && src0->name && src0->name[0] != '\0') {
         const std::string tname(src0->name);
-        const int64_t     n_exp      = src0->ne[2] > 0 ? src0->ne[2] : 1;
-        auto &            route_plan = route_cache->get_placement_plan();
-        for (int64_t e = 0; e < n_exp; ++e) {
-            if (!route_plan.expert_on_device(tname, static_cast<int>(e), ctx.device)) {
-                plan_has_cpu_experts = true;
-                break;
+        auto              it = plan_has_cpu_cache.find(tname);
+        if (it != plan_has_cpu_cache.end()) {
+            plan_has_cpu_experts = it->second;
+        } else {
+            const int64_t n_exp      = src0->ne[2] > 0 ? src0->ne[2] : 1;
+            auto &        route_plan = route_cache->get_placement_plan();
+            for (int64_t e = 0; e < n_exp; ++e) {
+                if (!route_plan.expert_on_device(tname, static_cast<int>(e), ctx.device)) {
+                    plan_has_cpu_experts = true;
+                    break;
+                }
             }
+            plan_has_cpu_cache[tname] = plan_has_cpu_experts;
         }
     }
     const bool plan_hybrid = plan_has_cpu_experts && cpu_type_ok;
@@ -41795,31 +41663,6 @@ gpu_dispatch:
     // MoE per-phase profiling: end token timing
     if (g_moe_profile_enabled) {
         g_moe_profile.end_token();
-    }
-
-    // DEBUG: Check L31 weight at END of graph compute (disabled - TP working correctly)
-    static int end_pass_dbg = 0;
-    if (end_pass_dbg++ < 0 && g_sycl_tp_config.enabled && g_sycl_tp_config.world_size > 1) {
-        uintptr_t l31_weight_addr = 0xffffd5575d400000ULL;
-        try {
-            ggml_sycl_set_device(g_sycl_tp_config.devices[0]);
-            queue_ptr stream = &dpct::get_current_device().default_queue();
-
-            struct {
-                uint16_t d_bits;
-                uint8_t  qs[16];
-            } wblk;
-
-            stream->memcpy(&wblk, (void *) l31_weight_addr, sizeof(wblk)).wait();
-            uint16_t   d_raw = wblk.d_bits;
-            sycl::half d_half;
-            memcpy(&d_half, &d_raw, sizeof(sycl::half));
-            float d_f = static_cast<float>(d_half);
-            fprintf(stderr, "TP DEBUG END_PASS: L31 weight d=%f %s\n", d_f,
-                    (d_f > 100.0f || std::isnan(d_f)) ? "CORRUPTED" : "OK");
-        } catch (...) {
-            fprintf(stderr, "TP DEBUG END_PASS: L31 weight check failed\n");
-        }
     }
 }
 

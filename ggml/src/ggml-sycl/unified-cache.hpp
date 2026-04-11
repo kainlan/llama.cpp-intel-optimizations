@@ -601,6 +601,7 @@ enum class cache_location {
     DEVICE,
     HOST_PINNED,
     HOST_MMAP,
+    UNKNOWN,  // Sentinel: entry exists but location is unresolved (cache miss)
 };
 
 // XMX layout metadata carried with cache entries/results
@@ -2623,8 +2624,6 @@ void unpin_all_experts();
 
 // Result of pre-staging operation
 struct prestage_result {
-    int                                         n_staged = 0;  // DEPRECATED use n_gpu
-    int                                         n_pinned = 0;  // DEPRECATED use n_gpu
     int                                         n_unique = 0;
     bool                                        success  = false;
     std::vector<sycl::event>                    staging_events;
@@ -2651,7 +2650,7 @@ struct prestage_result {
 //   device_id:       Device ID for cache lookup
 //
 // Returns: prestage_result with counts and success status.
-// `n_staged` counts device-ready experts found in cache; `n_pinned` counts host-ready
+// `n_gpu` counts device-ready experts found in cache; `n_cpu` counts host-ready
 // experts found in the host expert registry.
 prestage_result prestage_routed_experts(void *          queue,
                                         const int32_t * expert_ids,

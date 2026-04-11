@@ -7860,8 +7860,6 @@ prestage_result prestage_routed_experts(void *          queue_ptr,
                                         int64_t         ne0,
                                         int64_t         ne1) {
     prestage_result result{};
-    result.n_staged = 0;
-    result.n_pinned = 0;
     result.n_unique = 0;
     result.success  = false;
 
@@ -7923,21 +7921,17 @@ prestage_result prestage_routed_experts(void *          queue_ptr,
 
         if (device_resolved) {
             result.n_gpu++;
-            result.n_staged++;
-            result.expert_locations[expert_id] = cache_location::DEVICE;
             continue;
         }
 
         if (const weight_entry * host_entry = cache->lookup_expert(key);
             host_entry && host_entry->ptr && host_entry->location != cache_location::DEVICE) {
             result.n_cpu++;
-            result.n_pinned++;
-            result.expert_locations[expert_id] = host_entry->location;
             continue;
         }
 
         result.n_miss++;
-        result.expert_locations[expert_id] = cache_location::DEVICE;  // default fallback
+        result.expert_locations[expert_id] = cache_location::UNKNOWN;
         GGML_LOG_WARN("[PRESTAGE] Layer %d expert %d unresolved during lookup-only prestage\n", layer_id, expert_id);
     }
 
