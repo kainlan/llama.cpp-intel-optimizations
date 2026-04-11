@@ -2011,6 +2011,22 @@ struct ggml_tensor_extra_gpu {
         }
     }
 
+    // Accessor: resolve xmx_mxfp4_tiled via alloc_handle, fall back to raw pointer.
+    void * xmx_tiled_ptr(int dev) const {
+        return xmx_mxfp4_tiled_alloc[dev].ptr ? xmx_mxfp4_tiled_alloc[dev].ptr : xmx_mxfp4_tiled[dev];
+    }
+
+    // Accessor: resolve xmx_mxfp4_tiled_aos_staging via alloc_handle, fall back to raw pointer.
+    void * xmx_staging_ptr(int dev) const {
+        return xmx_mxfp4_tiled_aos_staging_alloc[dev].ptr ? xmx_mxfp4_tiled_aos_staging_alloc[dev].ptr :
+                                                            xmx_mxfp4_tiled_aos_staging[dev];
+    }
+
+    // Accessor: resolve moe_expert_ptrs_device via alloc_handle, fall back to raw pointer.
+    void * moe_ptrs_ptr(int dev) const {
+        return moe_expert_ptrs_alloc[dev].ptr ? moe_expert_ptrs_alloc[dev].ptr : moe_expert_ptrs_device[dev];
+    }
+
     dpct::event_ptr  events[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS];  // events for synchronizing multiple GPUs
     optimize_feature optimized_feature = {};  // Must have = {} to ensure default member initializers apply
 
@@ -2032,12 +2048,14 @@ struct ggml_tensor_extra_gpu {
     int     tp_world_size     = 1;      // Total number of ranks
 
     // XMX tile-aligned MXFP4 layout (cached at first use)
+    // DEPRECATED: use xmx_tiled_ptr() instead of xmx_mxfp4_tiled[dev] directly
     void *                  xmx_mxfp4_tiled[GGML_SYCL_MAX_DEVICES]       = { nullptr };
     size_t                  xmx_mxfp4_tiled_size                         = 0;
     bool                    xmx_mxfp4_tiled_owned[GGML_SYCL_MAX_DEVICES] = { false };
     ggml_sycl::alloc_handle xmx_mxfp4_tiled_alloc[GGML_SYCL_MAX_DEVICES];
 
     // Temporary AoS staging for MXFP4 tiled conversion (host -> device)
+    // DEPRECATED: use xmx_staging_ptr() instead of xmx_mxfp4_tiled_aos_staging[dev] directly
     void *                  xmx_mxfp4_tiled_aos_staging[GGML_SYCL_MAX_DEVICES]      = { nullptr };
     size_t                  xmx_mxfp4_tiled_aos_staging_size[GGML_SYCL_MAX_DEVICES] = { 0 };
     ggml_sycl::alloc_handle xmx_mxfp4_tiled_aos_staging_alloc[GGML_SYCL_MAX_DEVICES];
@@ -2054,6 +2072,7 @@ struct ggml_tensor_extra_gpu {
     int moe_expert_id = -1;
 
     // MoE expert pointer table (device + host staging) for per-expert layout access
+    // DEPRECATED: use moe_ptrs_ptr() instead of moe_expert_ptrs_device[dev] directly
     void *                  moe_expert_ptrs_device[GGML_SYCL_MAX_DEVICES] = { nullptr };
     size_t                  moe_expert_ptrs_size[GGML_SYCL_MAX_DEVICES]   = { 0 };
     ggml_sycl::alloc_handle moe_expert_ptrs_alloc[GGML_SYCL_MAX_DEVICES];
