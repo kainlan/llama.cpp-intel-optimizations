@@ -9241,6 +9241,15 @@ size_t unified_cache_kv_arena_used(int device_id) {
     return cache->zone_used(vram_zone_id::KV);
 }
 
+size_t unified_cache_arena_non_weight_used(int device) {
+    auto * cache = get_unified_cache_for_device(device);
+    if (!cache || !cache->arena_active()) {
+        return 0;
+    }
+    return cache->zone_used(vram_zone_id::KV) + cache->zone_used(vram_zone_id::ONEDNN) +
+           cache->zone_used(vram_zone_id::RUNTIME) + cache->zone_used(vram_zone_id::SCRATCH);
+}
+
 void * unified_cache_kv_arena_alloc(int device_id, size_t size) {
     auto * cache = get_unified_cache_for_device(device_id);
     if (!cache || !cache->arena_active()) {
@@ -9650,7 +9659,24 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
                                   size_t        onednn_bytes,
                                   size_t        runtime_bytes) {
     if (arena_base_) {
-        return true;  // Already reserved.
+        // Same model, new context — reset ephemeral zones so KV/runtime
+        // space from the previous context is reclaimable.  Weight zone is
+        // untouched (weights persist across contexts).  SCRATCH resets at
+        // graph_compute start via arena_reset().
+        zone_reset(vram_zone_id::KV);
+        zone_reset(vram_zone_id::RUNTIME);
+
+        // Reset runtime_bytes counters — they accumulate across contexts
+        // and would inflate the planner's reserved_bytes estimate.
+        int dev = ggml_sycl_get_device_id_from_queue(queue);
+        if (dev >= 0 && dev < GGML_SYCL_MAX_DEVICES) {
+            g_runtime_reserved_bytes[dev].store(0, std::memory_order_relaxed);
+            g_runtime_reserved_baseline[dev].store(0, std::memory_order_relaxed);
+            for (int c = 0; c < static_cast<int>(runtime_category::COUNT); ++c) {
+                g_runtime_cat_bytes[dev][c].store(0, std::memory_order_relaxed);
+            }
+        }
+        return true;
     }
 
     arena_queue_ = &queue;

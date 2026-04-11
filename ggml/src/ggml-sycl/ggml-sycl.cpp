@@ -13679,8 +13679,16 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
             // zone.  The ggml buffer just needs a device-resident address.
             const bool should_use_runtime = !is_kv_buft && effective_mem_type == GGML_SYCL_MEM_DEVICE;
             if (should_use_runtime) {
-                // Route through RUNTIME zone
+                // Route through RUNTIME zone.  If zone_alloc fails, the zone
+                // likely has stale allocations from a previous context (compute
+                // buffers are arena-backed and their destructors don't free zone
+                // space).  Reset the zone and retry — safe because compute buffers
+                // are context-scoped and the old context is destroyed by this point.
                 void * ptr = cache->zone_alloc(ggml_sycl::vram_zone_id::RUNTIME, size);
+                if (!ptr) {
+                    cache->zone_reset(ggml_sycl::vram_zone_id::RUNTIME);
+                    ptr = cache->zone_alloc(ggml_sycl::vram_zone_id::RUNTIME, size);
+                }
                 if (ptr) {
                     ggml_backend_sycl_buffer_context * ctx = new ggml_backend_sycl_buffer_context(
                         buft_ctx->device, ptr, buft_ctx->stream, size, buft_ctx->sycl_ctx);
@@ -13740,8 +13748,14 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                               size / (1024.0 * 1024.0), buft_ctx->name.c_str());
             }
             if (is_kv_buft) {
-                // KV allocation: use zone_available which accounts for weight usage in shared zone
-                const size_t kv_avail = cache->zone_available(ggml_sycl::vram_zone_id::KV);
+                // KV allocation: use zone_available which accounts for weight usage in shared zone.
+                // Reset KV zone first — previous context's KV is dead (arena-backed
+                // buffer destructors don't free zone space).
+                size_t kv_avail = cache->zone_available(ggml_sycl::vram_zone_id::KV);
+                if (size > kv_avail) {
+                    cache->zone_reset(ggml_sycl::vram_zone_id::KV);
+                    kv_avail = cache->zone_available(ggml_sycl::vram_zone_id::KV);
+                }
                 if (size <= kv_avail) {
                     // KV fits in arena — let the existing KV allocation path handle it
                     effective_mem_type = GGML_SYCL_MEM_DEVICE;
@@ -17475,12 +17489,40 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggm
         alloc = {};
     }
     void * ptr = alloc.ptr;
+    if (ptr == nullptr && hcache && hcache->host_zones_configured()) {
+        // Host zone likely full from a previous context.  Reset ephemeral
+        // zones and retry — safe because the old context is destroyed.
+        GGML_LOG_WARN("[SYCL] Host buffer alloc failed (%.1f MB), resetting host zones and retrying\n",
+                      size / (1024.0 * 1024.0));
+        ggml_sycl::unified_cache_host_zone_reset(ggml_sycl::host_zone_id::STAGING);
+        ggml_sycl::unified_cache_host_zone_reset(ggml_sycl::host_zone_id::SCRATCH);
+        alloc = {};
+        if (ggml_sycl::unified_alloc(req, &alloc)) {
+            ptr = alloc.ptr;
+        }
+    }
+    if (ptr == nullptr) {
+        // Last resort: bypass zone system entirely and try raw sycl::malloc_host
+        GGML_LOG_WARN("[SYCL] Host zone retry failed, attempting raw sycl::malloc_host (%.1f MB)\n",
+                      size / (1024.0 * 1024.0));
+        try {
+            ptr = sycl::malloc_host(size, *req.queue);
+        } catch (...) {
+            ptr = nullptr;
+        }
+    }
     if (ptr == nullptr) {
         GGML_LOG_ERROR(
             "[SYCL] FATAL: host buffer alloc (%.1f MB) failed — cannot allocate host buffer. "
             "All host buffers must be USM-pinned for GPU DMA access.\n",
             size / (1024.0f * 1024.0f));
         return nullptr;
+    }
+    if (!alloc.ptr) {
+        // Raw sycl::malloc_host path — create a minimal alloc_handle for cleanup
+        alloc.ptr    = ptr;
+        alloc.size   = size;
+        alloc.device = req.device;
     }
     GGML_SYCL_DEBUG("[SYCL] Host buffer alloc: %.1f MB via unified-cache\n", size / (1024.0f * 1024.0f));
 
