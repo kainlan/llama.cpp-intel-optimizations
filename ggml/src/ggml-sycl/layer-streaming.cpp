@@ -90,37 +90,27 @@ bool layer_stream_manager::allocate_buffers(sycl::queue & queue) {
 
     device_id_ = ggml_sycl_get_device_id_from_queue(queue);
 
-    buffers_from_arena_ = false;
     for (int i = 0; i < 2; i++) {
-        // Try VRAM arena weight zone first (persistent, not reset between tokens)
-        if (vram_arena_enabled() && device_id_ >= 0) {
-            void * ptr = unified_cache_arena_alloc(device_id_, buffer_size_);
-            if (ptr) {
-                buffers_[i] = ptr;
-                buffers_from_arena_ = true;
-            }
-        }
-        if (!buffers_[i]) {
-            buffers_[i] = ggml_sycl_malloc_device(buffer_size_, queue, "layer_stream_buf");
-            buffers_from_arena_ = false;
-        }
-        if (buffers_[i]) {
-            alloc_registry::instance().register_alloc(buffers_[i], buffer_size_,
-                                                      device_id_, alloc_type::DEVICE);
-        }
-        if (!buffers_[i]) {
+        // Allocate via unified_allocate (tries arena WEIGHT zone first, then sycl::malloc_device).
+        alloc_request req{};
+        req.queue                          = &queue;
+        req.device                         = device_id_;
+        req.size                           = buffer_size_;
+        req.intent.role                    = alloc_role::WEIGHT;
+        req.intent.category                = runtime_category::OTHER;
+        req.intent.constraints.must_device = true;
+        if (!unified_alloc(req, &buffer_allocs_[i]) || !buffer_allocs_[i].ptr) {
             GGML_LOG_ERROR("[LAYER-STREAM] Failed to allocate buffer %d (%.1f MB)\n",
                            i, buffer_size_ / (1024.0 * 1024.0));
             // Clean up buffer 0 if buffer 1 failed
-            if (i == 1 && buffers_[0]) {
-                alloc_registry::instance().unregister_alloc(buffers_[0]);
-                if (!buffers_from_arena_) {
-                    sycl::free(buffers_[0], queue);
-                }
+            if (i == 1 && buffer_allocs_[0].ptr) {
+                (void) unified_free(buffer_allocs_[0]);
+                buffer_allocs_[0] = {};
                 buffers_[0] = nullptr;
             }
             return false;
         }
+        buffers_[i]       = buffer_allocs_[i].ptr;
         loaded_layers_[i] = -1;
     }
 
@@ -140,19 +130,14 @@ void layer_stream_manager::shutdown() {
     }
 
     for (int i = 0; i < 2; i++) {
-        if (buffers_[i]) {
-            alloc_registry::instance().unregister_alloc(buffers_[i]);
-            if (device_id_ >= 0 && !buffers_from_arena_) {
-            }
-            if (!buffers_from_arena_) {
-                sycl::free(buffers_[i], ctx_);
-            }
-            buffers_[i] = nullptr;
+        if (buffer_allocs_[i].ptr) {
+            (void) unified_free(buffer_allocs_[i]);
+            buffer_allocs_[i] = {};
         }
+        buffers_[i]       = nullptr;
         loaded_layers_[i] = -1;
     }
-    buffer_size_        = 0;
-    buffers_from_arena_ = false;
+    buffer_size_ = 0;
 }
 
 void layer_stream_manager::register_host_ptr(

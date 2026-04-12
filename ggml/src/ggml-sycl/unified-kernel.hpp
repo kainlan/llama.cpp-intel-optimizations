@@ -3026,38 +3026,34 @@ private:
     float * mmvq_up_scratch_      = nullptr;
     size_t  mmvq_gate_scratch_sz_ = 0;
 
-    // Arena routing flags — when true, pointer came from the pinned pool / VRAM arena
-    // and must NOT be sycl::free'd individually. Only active when vram_arena_enabled().
-    bool pinned_pool_dag_       = false;  // dag_state_ host-pinned buffers
-    bool pinned_pool_phase_     = false;  // phase_schedule_ host-pinned buffers
-    bool pinned_pool_role_      = false;  // role_schedule_ host-pinned buffers
-    bool pinned_pool_micro_gen_ = false;  // micro_generation_ host-pinned counter
-    bool pinned_pool_ops_       = false;  // d_ops_pool_ host-pinned ops table
-
-    // VRAM arena routing flags for device allocations.
-    // When true, the allocation came from the VRAM arena and must NOT be sycl::free'd.
-    bool arena_persistent_bufs_     = false;  // persistent_buffers_[4] + sync_block_
-    bool arena_dag_device_          = false;  // dag_state_ device buffers (ready_counter, tile_claimed, tiles_done, completed_count)
-    bool arena_scratch_pool_        = false;  // scratch_pool_
-    bool arena_get_rows_            = false;  // get_rows_slots_ device buffers
-    bool arena_role_sync_           = false;  // role_schedule_.sync_flags block
-    bool arena_micro_tile_counters_ = false;  // micro_tile_counters_
-    bool arena_mmvq_q8_bufs_        = false;  // mmvq_q8_bufs_[2]
-    bool arena_mmvq_gate_scratch_   = false;  // mmvq_gate_scratch_
-    bool arena_mmvq_up_scratch_     = false;  // mmvq_up_scratch_
-    bool arena_light_flags_         = false;  // light_flags_
-
-    // Size tracking for pinned pool deallocation (need exact sizes for free)
-    size_t pinned_dag_successor_offset_bytes_ = 0;
-    size_t pinned_dag_successor_list_bytes_   = 0;
-    size_t pinned_dag_n_tiles_bytes_          = 0;
-    size_t pinned_phase_entries_bytes_        = 0;
-    size_t pinned_phase_offset_bytes_         = 0;
-    size_t pinned_phase_tiles_bytes_          = 0;
-    size_t pinned_phase_type_bytes_           = 0;
-    size_t pinned_role_elem_bytes_            = 0;
-    size_t pinned_role_matmul_bytes_          = 0;
-    size_t pinned_ops_pool_bytes_             = 0;
+    // Allocation handles — replace from_arena/from_pool routing booleans.
+    // unified_free(handle) dispatches to zone_free (TLSF), pool free, or sycl::free.
+    // An empty handle (ptr==nullptr) is a no-op in unified_free.
+    alloc_handle persistent_buf_allocs_[4] = {};    // persistent_buffers_[4]
+    alloc_handle sync_block_alloc_         = {};    // sync_block_ (3 ints)
+    alloc_handle dag_ready_counter_alloc_  = {};    // dag_state_.ready_counter
+    alloc_handle dag_tile_claimed_alloc_   = {};    // dag_state_.tile_claimed
+    alloc_handle dag_tiles_done_alloc_     = {};    // dag_state_.tiles_done
+    alloc_handle dag_completed_alloc_      = {};    // dag_state_.completed_count
+    alloc_handle dag_successor_off_alloc_  = {};    // dag_state_.successor_offset (pinned)
+    alloc_handle dag_successor_list_alloc_ = {};    // dag_state_.successor_list (pinned)
+    alloc_handle dag_n_tiles_alloc_        = {};    // dag_state_.n_tiles (pinned)
+    alloc_handle scratch_pool_alloc_       = {};    // scratch_pool_
+    alloc_handle get_rows_alloc_           = {};    // get_rows_slots_ (per-slot, shared handle)
+    alloc_handle role_sync_alloc_          = {};    // role_schedule_.sync_flags
+    alloc_handle role_elem_alloc_          = {};    // role_schedule_.elem_segments (pinned)
+    alloc_handle role_matmul_alloc_        = {};    // role_schedule_.matmul_segments (pinned)
+    alloc_handle micro_tile_counters_alloc_= {};    // micro_tile_counters_
+    alloc_handle micro_gen_alloc_          = {};    // micro_generation_ (pinned)
+    alloc_handle mmvq_q8_buf_allocs_[2]   = {};    // mmvq_q8_bufs_[2]
+    alloc_handle mmvq_gate_scratch_alloc_  = {};    // mmvq_gate_scratch_
+    alloc_handle mmvq_up_scratch_alloc_    = {};    // mmvq_up_scratch_
+    alloc_handle light_flags_alloc_        = {};    // light_flags_
+    alloc_handle phase_entries_alloc_      = {};    // phase_schedule_.entries (pinned)
+    alloc_handle phase_offset_alloc_       = {};    // phase_schedule_.phase_offset (pinned)
+    alloc_handle phase_tiles_alloc_        = {};    // phase_schedule_.phase_tiles (pinned)
+    alloc_handle phase_type_alloc_         = {};    // phase_schedule_.phase_type (pinned)
+    alloc_handle ops_pool_alloc_           = {};    // d_ops_pool_ (pinned)
 };
 
 }  // namespace ggml_sycl

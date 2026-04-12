@@ -1162,6 +1162,7 @@ struct ggml_sycl_tp_quant_comm_buffers {
     float *                 host_result;                        // Host buffer for FP32 result
     size_t                  capacity;                           // Current allocation size (elements)
     bool                    allocated;
+    // Use .as_mem_handle() for read/resolve access; unified_free(alloc_handle) for ownership
     ggml_sycl::alloc_handle dev_q_alloc[GGML_SYCL_MAX_DEVICES];
     ggml_sycl::alloc_handle dev_minmax_alloc[GGML_SYCL_MAX_DEVICES];
     ggml_sycl::alloc_handle host_q0_alloc;
@@ -1207,6 +1208,7 @@ struct ggml_sycl_pp_config {
     // Inter-stage buffers (malloc_shared for Intel Arc without P2P)
     void *                  stage_output_buf[GGML_SYCL_MAX_DEVICES] = { nullptr };
     size_t                  stage_output_size                       = 0;  // Current buffer size per stage
+    // Use .as_mem_handle() for read/resolve access; unified_free(alloc_handle) for ownership
     ggml_sycl::alloc_handle stage_output_alloc[GGML_SYCL_MAX_DEVICES];
 
     // Synchronization events for pipelining
@@ -1294,6 +1296,7 @@ struct ffn_norm_cache_entry {
     int64_t                 ne0, ne1;   // Dimensions
     size_t                  size;       // Buffer size in bytes
     int                     pass_id;    // Which compute pass this cache is for (to detect staleness)
+    // Use .as_mem_handle() for read/resolve access; unified_free(alloc_handle) for ownership
     ggml_sycl::alloc_handle data_alloc;
     ggml_sycl::alloc_handle data_dev1_alloc;
 
@@ -1509,6 +1512,7 @@ struct tp_ffn_compute_buffers {
     int device_id;
 
     // Managed allocation handles
+    // Use .as_mem_handle() for read/resolve access; unified_free(alloc_handle) for ownership
     ggml_sycl::alloc_handle input_q8_alloc;
     ggml_sycl::alloc_handle gate_out_alloc;
     ggml_sycl::alloc_handle up_out_alloc;
@@ -1585,6 +1589,7 @@ struct tp_attn_compute_buffers {
     int device_id;
 
     // Managed allocation handles
+    // Use .as_mem_handle() for read/resolve access; unified_free(alloc_handle) for ownership
     ggml_sycl::alloc_handle input_q8_alloc;
     ggml_sycl::alloc_handle q_out_alloc;
     ggml_sycl::alloc_handle k_out_alloc;
@@ -2942,8 +2947,9 @@ struct ggml_backend_sycl_context {
         ggml_sycl_pool_alloc<uint8_t> *                             current    = nullptr;
         // Arena-backed scratchpad (ONEDNN zone): persistent allocation that
         // avoids pool_leg pressure on the SCRATCH zone.
-        void *                                                      arena_ptr  = nullptr;
-        size_t                                                      arena_size = 0;
+        // Use arena_alloc.as_mem_handle() for read/resolve access;
+        // zone_reset(ONEDNN) for reclaim (arena_alloc.zone_managed == true).
+        ggml_sycl::alloc_handle                                     arena_alloc{};
     };
 
     dnnl::stream stream_dnnl(int device, int _stream) {
@@ -2997,19 +3003,22 @@ struct ggml_backend_sycl_context {
             auto * cache = ggml_sycl::get_unified_cache_for_device(device);
             if (cache && cache->arena_active()) {
                 // Reuse existing arena allocation if large enough.
-                if (entry.arena_ptr && entry.arena_size >= scratchpad_size) {
-                    return dnnl::memory(scratchpad_md, eng, entry.arena_ptr);
+                if (entry.arena_alloc.ptr && entry.arena_alloc.size >= scratchpad_size) {
+                    return dnnl::memory(scratchpad_md, eng, entry.arena_alloc.ptr);
                 }
                 // Need larger allocation — reset ONEDNN zone and re-allocate.
-                if (entry.arena_ptr) {
+                if (entry.arena_alloc.ptr) {
                     cache->zone_reset(ggml_sycl::vram_zone_id::ONEDNN);
-                    entry.arena_ptr  = nullptr;
-                    entry.arena_size = 0;
+                    entry.arena_alloc = {};
                 }
                 void * ptr = cache->zone_alloc(ggml_sycl::vram_zone_id::ONEDNN, scratchpad_size);
                 if (ptr) {
-                    entry.arena_ptr  = ptr;
-                    entry.arena_size = scratchpad_size;
+                    entry.arena_alloc.ptr          = ptr;
+                    entry.arena_alloc.size         = scratchpad_size;
+                    entry.arena_alloc.device       = device;
+                    entry.arena_alloc.tier         = ggml_sycl::alloc_tier::DEVICE_VRAM;
+                    entry.arena_alloc.zone_managed = true;
+                    entry.arena_alloc.vram_zone    = ggml_sycl::vram_zone_id::ONEDNN;
                     return dnnl::memory(scratchpad_md, eng, ptr);
                 }
                 // ONEDNN zone full — fall through to pool_leg path.
@@ -3048,19 +3057,22 @@ struct ggml_backend_sycl_context {
         if (ggml_sycl::vram_arena_enabled()) {
             auto * cache = ggml_sycl::get_unified_cache_for_device(device);
             if (cache && cache->arena_active()) {
-                if (entry.arena_ptr && entry.arena_size >= size) {
+                if (entry.arena_alloc.ptr && entry.arena_alloc.size >= size) {
                     return;  // Already large enough.
                 }
-                if (entry.arena_ptr) {
+                if (entry.arena_alloc.ptr) {
                     cache->zone_reset(ggml_sycl::vram_zone_id::ONEDNN);
-                    entry.arena_ptr  = nullptr;
-                    entry.arena_size = 0;
+                    entry.arena_alloc = {};
                 }
                 GGML_SYCL_DEBUG("[SYCL-GRAPH] Pre-allocating scratchpad from ONEDNN zone: %zu bytes\n", size);
                 void * ptr = cache->zone_alloc(ggml_sycl::vram_zone_id::ONEDNN, size);
                 if (ptr) {
-                    entry.arena_ptr  = ptr;
-                    entry.arena_size = size;
+                    entry.arena_alloc.ptr          = ptr;
+                    entry.arena_alloc.size         = size;
+                    entry.arena_alloc.device       = device;
+                    entry.arena_alloc.tier         = ggml_sycl::alloc_tier::DEVICE_VRAM;
+                    entry.arena_alloc.zone_managed = true;
+                    entry.arena_alloc.vram_zone    = ggml_sycl::vram_zone_id::ONEDNN;
                     return;
                 }
                 // Fall through to pool_leg path.

@@ -251,12 +251,12 @@ void * ComputeBufferManager::allocate_new_buffer(size_t size) {
     req.intent.category                = ggml_sycl::runtime_category::COMPUTE;
     req.intent.constraints.must_device = true;
 
-    ggml_sycl::alloc_handle handle;
-    if (!ggml_sycl::unified_alloc(req, &handle)) {
+    ggml_sycl::mem_handle h = ggml_sycl::unified_allocate(req);
+    if (!h.valid()) {
         fprintf(stderr, "[ComputeBufferManager] allocation failed for %zu bytes\n", size);
         return nullptr;
     }
-    return handle.ptr;
+    return h.resolve().ptr;
 }
 
 void ComputeBufferManager::grow_scratch(size_t new_size) {

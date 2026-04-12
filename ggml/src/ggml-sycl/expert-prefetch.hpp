@@ -33,6 +33,7 @@
 #include "ggml.h"
 #include "ggml-sycl.h"
 #include "expert-key.hpp"
+#include "unified-cache.hpp"
 
 namespace ggml_sycl {
 
@@ -359,10 +360,10 @@ class ExpertPredictor {
 
     // Pre-allocated device buffer for predict_pregate() GEMV output scores.
     // Avoids sycl::malloc_device/free per call (3 calls per MoE dispatch with 3-layer lookahead).
-    float *      scores_dev_    = nullptr;
-    int          scores_dev_n_  = 0;       // Number of floats allocated
-    sycl::queue * scores_queue_ = nullptr;  // Queue used for allocation (for deallocation)
-    bool         scores_from_arena_ = false;  // True if allocated from VRAM arena
+    float *               scores_dev_   = nullptr;
+    int                   scores_dev_n_ = 0;     // Number of floats allocated
+    sycl::queue *         scores_queue_ = nullptr;
+    ggml_sycl::alloc_handle scores_alloc_{};     // Owns the device buffer; unified_free on resize/dtor
 
     // Rolling accuracy stats (last ACCURACY_WINDOW predictions).
     static constexpr int ACCURACY_WINDOW = 100;

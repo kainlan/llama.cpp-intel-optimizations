@@ -457,23 +457,14 @@ void ExpertPrefetcher::preload_experts(int layer_idx, const std::vector<int> & e
 // ============================================================================
 
 ExpertPredictor::~ExpertPredictor() {
-    // Free pre-allocated device scores buffer.
-    // Skip during static destruction (SYCL context may be invalid).
-    if (scores_dev_ && scores_queue_ && !ggml_sycl_is_shutting_down()) {
-        if (scores_dev_n_ > 0 && !scores_from_arena_) {
-            int scores_device = ggml_sycl_get_device_id_from_queue(*scores_queue_);
-        }
-        if (!scores_from_arena_) {
-            try {
-                sycl::free(scores_dev_, *scores_queue_);
-            } catch (...) {
-                // SYCL runtime may be partially torn down
-            }
-        }
+    // Free pre-allocated device scores buffer via unified_free (handles arena + non-arena).
+    if (scores_alloc_.ptr && !ggml_sycl_is_shutting_down()) {
+        (void) ggml_sycl::unified_free(scores_alloc_);
     }
-    scores_dev_        = nullptr;
-    scores_dev_n_      = 0;
-    scores_from_arena_ = false;
+    scores_alloc_  = {};
+    scores_dev_    = nullptr;
+    scores_dev_n_  = 0;
+    scores_queue_  = nullptr;
 }
 
 void ExpertPredictor::init(int n_layers, int n_experts, int n_experts_used) {
@@ -814,21 +805,24 @@ std::vector<int> ExpertPredictor::predict_pregate(int           next_layer_idx,
     // This avoids sycl::malloc_device/free per call (3 calls with 3-layer lookahead).
     if (!scores_dev_ || scores_dev_n_ < M) {
         int scores_device = ggml_sycl_get_device_id_from_queue(compute_q);
-        if (scores_dev_ && scores_queue_) {
-            if (!scores_from_arena_) {
-                sycl::free(scores_dev_, *scores_queue_);
-            }
+        // Free previous allocation (unified_free handles arena + non-arena).
+        if (scores_alloc_.ptr) {
+            (void) ggml_sycl::unified_free(scores_alloc_);
+            scores_alloc_ = {};
+            scores_dev_   = nullptr;
         }
-        scores_from_arena_ = false;
-        if (vram_arena_enabled() && scores_device >= 0) {
-            void * ptr = unified_cache_arena_alloc(scores_device, M * sizeof(float));
-            if (ptr) {
-                scores_dev_        = static_cast<float *>(ptr);
-                scores_from_arena_ = true;
+        // Allocate via unified_allocate (tries arena first, falls back to sycl::malloc_device).
+        {
+            ggml_sycl::alloc_request req{};
+            req.queue                          = &compute_q;
+            req.device                         = scores_device;
+            req.size                           = M * sizeof(float);
+            req.intent.role                    = ggml_sycl::alloc_role::COMPUTE;
+            req.intent.category                = ggml_sycl::runtime_category::COMPUTE;
+            req.intent.constraints.must_device = true;
+            if (ggml_sycl::unified_alloc(req, &scores_alloc_) && scores_alloc_.ptr) {
+                scores_dev_ = static_cast<float *>(scores_alloc_.ptr);
             }
-        }
-        if (!scores_from_arena_) {
-            scores_dev_ = static_cast<float *>(ggml_sycl_malloc_device(M * sizeof(float), compute_q, "scores_dev"));
         }
         scores_dev_n_ = M;
         scores_queue_ = &compute_q;

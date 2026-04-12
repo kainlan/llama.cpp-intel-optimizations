@@ -16,6 +16,7 @@
 #include <sycl/sycl.hpp>
 
 #include "ggml.h"
+#include "unified-cache.hpp"
 
 namespace ggml_sycl {
 
@@ -118,12 +119,12 @@ class layer_stream_manager {
     std::unordered_map<std::string, std::pair<int, size_t>> name_to_location_;  // name -> (layer_id, weight_idx)
 
     // Double buffers
-    void *        buffers_[2]       = {nullptr, nullptr};
-    size_t        buffer_size_      = 0;
-    int           loaded_layers_[2] = {-1, -1};  // Which layer is in each buffer (-1 = empty)
-    int           device_id_        = -1;         // Device ID for VRAM budget tracking
-    bool          buffers_from_arena_ = false;    // True if allocated from VRAM arena
-    sycl::context ctx_;              // Stored at allocation time for sycl::free()
+    void *                    buffers_[2]       = {nullptr, nullptr};
+    ggml_sycl::alloc_handle   buffer_allocs_[2] = {};   // Owns each buffer; unified_free on shutdown
+    size_t                    buffer_size_      = 0;
+    int                       loaded_layers_[2] = {-1, -1};
+    int                       device_id_        = -1;
+    sycl::context             ctx_;
 
     // Async prefetch state
     int         prefetch_target_layer_ = -1;

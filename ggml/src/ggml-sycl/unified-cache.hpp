@@ -36,6 +36,9 @@
 
 namespace ggml_sycl {
 
+// Forward declaration to avoid circular includes.
+class mem_handle;
+
 // Forward declaration — needed by unified_cache::process_deferred_frees_public()
 bool unified_cache_is_graph_compute_active();
 
@@ -1496,6 +1499,10 @@ class unified_cache {
     // made on this queue's context, e.g. GPU-side reorder temp buffers).
     sycl::queue & get_queue() { return queue_; }
 
+    // Memset/memcpy operations that dispatch to GPU or CPU based on handle location.
+    void memset(const mem_handle & h, int value, size_t size, sycl::queue & stream);
+    void memcpy(const mem_handle & dst, const mem_handle & src, size_t size, sycl::queue & stream);
+
     // === Arena methods (merged from vram_arena) ===
 
     // Reserve VRAM arena using 1- or 2-chunk allocation.
@@ -2234,10 +2241,14 @@ enum class offload_buffer_role : uint8_t {
 };
 
 struct alloc_constraints {
-    bool must_device                = false;
-    bool must_host_pinned           = false;
-    bool prefer_same_tier_as_cohort = false;
-    bool use_pinned_pool            = false;
+    bool         must_device                = false;
+    bool         must_host_pinned           = false;
+    bool         prefer_same_tier_as_cohort = false;
+    bool         use_pinned_pool            = false;
+    // When arena is active and prefer_vram_zone != COUNT, unified_alloc routes
+    // through that VRAM zone (zone_alloc) instead of raw device malloc.
+    // unified_free then calls zone_free(vram_zone, ptr) for explicit TLSF reclaim.
+    vram_zone_id prefer_vram_zone           = vram_zone_id::COUNT;
 };
 
 struct alloc_intent {
@@ -2263,11 +2274,26 @@ struct alloc_handle {
     runtime_category category = runtime_category::OTHER;
     uint64_t         alloc_id = 0;
 
+    // Zone routing fields — set by unified_alloc when the allocation is routed
+    // through a zone sub-allocator instead of a raw sycl::malloc call.
+    // unified_free() uses these to dispatch the correct reclaim path:
+    //   zone_managed=true, vram_zone!=COUNT → cache->zone_free(vram_zone, ptr) [TLSF reclaim]
+    //   zone_managed=true, host_zone!=COUNT → host zone bump, no-op free (freed by zone_reset)
+    //   zone_managed=false                  → registry lookup → sycl::free or pinned_pool free
+    bool         zone_managed = false;
+    vram_zone_id vram_zone    = vram_zone_id::COUNT;
+    host_zone_id host_zone    = host_zone_id::COUNT;
+
     // Internal tracking for segmented allocations.
     // When a single allocation request exceeds the chunk size, multiple segments
     // are allocated internally. The caller only sees ptr (first segment), but
     // unified_free() uses all_segments to release all internal segments.
     std::vector<buffer_segment> all_segments;
+
+    // Returns a DIRECT mem_handle view over this allocation.
+    // The handle carries no ownership — unified_free(alloc_handle) must still
+    // be called when the memory is no longer needed.
+    mem_handle as_mem_handle() const;
 };
 
 struct offload_buffer_request {
@@ -2286,6 +2312,9 @@ struct offload_buffer_lease {
 };
 
 bool       unified_alloc(const alloc_request & req, alloc_handle * out);
+// New: returns mem_handle (auto-validating smart pointer). Existing callers
+// continue to use unified_alloc(); callers migrate incrementally in T4/T5.
+mem_handle unified_allocate(const alloc_request & req);
 bool       unified_free(const alloc_handle & handle);
 bool       unified_free_ptr(void * ptr, int expected_device = -1);
 bool       unified_lookup(void * ptr, alloc_handle * out);
@@ -2443,6 +2472,10 @@ class scoped_unified_alloc {
     void * get() const { return handle_.ptr; }
 
     const alloc_handle & handle() const { return handle_; }
+
+    // Returns a mem_handle view over the current allocation.
+    // The returned handle is DIRECT (stable within the current graph).
+    mem_handle as_mem_handle() const;
 
     alloc_handle release() {
         alloc_handle out = handle_;

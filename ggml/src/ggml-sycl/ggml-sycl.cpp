@@ -131,6 +131,7 @@ static dnnl::memory::data_type ggml_sycl_onednn_dtype(ggml_type type);
 #include "ggml-sycl/tensor-types.hpp"
 #include "ggml-sycl/unified-cache.hpp"
 #include "ggml-sycl/vmem-kv.hpp"
+#include "mem-handle.hpp"
 #include "ggml.h"
 
 static bool g_sycl_loaded          = false;
@@ -311,6 +312,7 @@ struct fp16_weight_cache {
     size_t                  slab_offset    = 0;
     bool                    slab_ready     = false;
     int                     slab_device_id = -1;
+    // Use .as_mem_handle() for read/resolve access; unified_free(alloc_handle) for ownership
     ggml_sycl::alloc_handle slab_alloc;
 
     std::once_flag init_flag_;
@@ -2697,7 +2699,12 @@ struct managed_host_pinned_buffer {
 
         bytes = needed_bytes;
         if (zero_init) {
-            std::memset(handle.ptr, 0, needed_bytes);
+            // Use cache-aware dispatch: routes to stream.memset for device memory,
+            // std::memset for host-pinned. Correct even if tier changes.
+            auto mh = handle.as_mem_handle();
+            auto r  = mh.resolve();
+            if (r.on_device) { q.memset(r.ptr, 0, needed_bytes); }
+            else { std::memset(r.ptr, 0, needed_bytes); }
         }
         return true;
     }
@@ -2739,7 +2746,12 @@ static bool allocate_managed_host_pinned(sycl::queue &               q,
     }
 
     if (zero_init) {
-        std::memset(out->ptr, 0, bytes);
+        // Use cache-aware dispatch: routes to stream.memset for device memory,
+        // std::memset for host-pinned. Correct even if tier changes.
+        auto mh = out->as_mem_handle();
+        auto r  = mh.resolve();
+        if (r.on_device) { q.memset(r.ptr, 0, bytes); }
+        else { std::memset(r.ptr, 0, bytes); }
     }
     return true;
 }
@@ -6593,6 +6605,7 @@ struct pending_cpu_scatter {
     std::future<void>       future;      // CPU compute completion
     float *                 out_pinned;  // Output buffer to scatter from
     float *                 act_pinned;  // Activation buffer (for deferred release)
+    // Use .as_mem_handle() for read/resolve access; unified_free(alloc_handle) for ownership
     ggml_sycl::alloc_handle out_alloc;
     ggml_sycl::alloc_handle act_alloc;
     sycl::queue *           stream;    // GPU queue for H2D copies
@@ -6740,35 +6753,39 @@ static void arena_pinned_free(void * ptr, size_t bytes, sycl::queue & queue, boo
 }
 
 // Device allocation through VRAM arena compute zone when available.
-static void * arena_device_alloc(size_t bytes, int device_id, sycl::queue & queue, bool & from_arena) {
-    from_arena = false;
+// Returns alloc_handle — call unified_free(handle) to release.
+// Arena-backed handles have zone_managed=true (freed by arena_reset, unified_free is a no-op).
+// Fallback device handles have zone_managed=false (freed via sycl::free).
+static ggml_sycl::alloc_handle arena_device_alloc(size_t bytes, int device_id, sycl::queue & queue) {
     if (bytes == 0) {
-        return nullptr;
+        return {};
     }
     if (ggml_sycl::vram_arena_enabled() && device_id >= 0) {
         void * ptr = ggml_sycl::unified_cache_arena_alloc(device_id, bytes);
         if (ptr) {
-            from_arena = true;
-            return ptr;
+            ggml_sycl::alloc_handle h{};
+            h.ptr          = ptr;
+            h.size         = bytes;
+            h.device       = device_id;
+            h.tier         = ggml_sycl::alloc_tier::DEVICE_VRAM;
+            h.zone_managed = true;
+            h.vram_zone    = ggml_sycl::vram_zone_id::COUNT;  // bump-arena, freed by arena_reset
+            return h;
         }
     }
-    return ggml_sycl_malloc_device(bytes, queue, "arena_device_alloc_fallback");
-}
-
-static void arena_device_free(void * ptr, size_t bytes, int device_id, sycl::queue & queue, bool from_arena) {
-    if (!ptr) {
-        return;
+    ggml_sycl::alloc_request req{};
+    req.queue                          = &queue;
+    req.device                         = device_id;
+    req.size                           = bytes;
+    req.intent.role                    = ggml_sycl::alloc_role::COMPUTE;
+    req.intent.category                = ggml_sycl::runtime_category::COMPUTE;
+    req.intent.constraints.must_device = true;
+    ggml_sycl::alloc_handle h{};
+    ggml_sycl::unified_alloc(req, &h);
+    if (!h.ptr) {
+        GGML_LOG_WARN("[arena_device_alloc] device fallback failed for %zu bytes\n", bytes);
     }
-    if (from_arena) {
-        // Compute-arena allocations use a separate bump allocator (arena_alloc)
-        // that resets at each graph_compute call via arena_reset(). Individual
-        // frees use watermark reclaim (arena_free), not TLSF zone_free.
-        ggml_sycl::unified_cache_arena_free(device_id, ptr, bytes);
-        return;
-    }
-    sycl::free(ptr, queue);
-    (void) bytes;
-    (void) device_id;
+    return h;
 }
 
 enum moe_fusion_phase : int {
@@ -7884,6 +7901,7 @@ struct pending_cpu_pipeline {
     std::future<void>       future;
     float *                 out_pinned;
     float *                 act_pinned;
+    // Use .as_mem_handle() for read/resolve access; unified_free(alloc_handle) for ownership
     ggml_sycl::alloc_handle out_alloc;
     ggml_sycl::alloc_handle act_alloc;
     sycl::queue *           stream;
@@ -9380,9 +9398,8 @@ struct ggml_backend_sycl_buffer_context {
     std::string             name;
     bool                    supports_soa_reorder;       // Device capability (not tensor state)
     size_t                  size_bytes        = 0;
-    bool                    from_arena        = false;  // Arena-allocated: skip sycl::free
-    bool                    from_scratch_pool = false;  // Scratch pool-allocated: bump allocator, pool resets on reuse
-    bool                    from_kv_zone      = false;  // KV zone-allocated: compute buffer overflow from RUNTIME
+    // Use .as_mem_handle() for read/resolve access; unified_free(alloc_handle) for ownership
+    // Zone routing is encoded in managed_alloc.zone_managed/vram_zone/host_zone.
     ggml_sycl::alloc_handle managed_alloc{};
     // Back-pointer to main SYCL context for accessing persistent staging buffers
     ggml_backend_sycl_context *                                    sycl_ctx = nullptr;
@@ -9393,6 +9410,7 @@ struct ggml_backend_sycl_buffer_context {
     bool                                                           is_tp_compute_buffer               = false;
     void *                                                         tp_dev_ptrs[GGML_SYCL_MAX_DEVICES] = { nullptr };
     queue_ptr                                                      tp_streams[GGML_SYCL_MAX_DEVICES]  = { nullptr };
+    // Use .as_mem_handle() for read/resolve access; unified_free(alloc_handle) for ownership
     ggml_sycl::alloc_handle                                        tp_allocs[GGML_SYCL_MAX_DEVICES]   = {};
 
     ggml_backend_sycl_buffer_context(int                         device,
@@ -9411,16 +9429,10 @@ struct ggml_backend_sycl_buffer_context {
     }
 
     ~ggml_backend_sycl_buffer_context() {
-        // Arena allocations are sub-allocated from a single large block —
-        // the arena owns the memory, so we must NOT free individual pointers.
-        if (from_arena && dev_ptr) {
-            auto * cache = ggml_sycl::get_unified_cache_for_device(device);
-            if (cache && cache->arena_active()) {
-                auto zone_id = from_kv_zone     ? ggml_sycl::vram_zone_id::KV
-                             : from_scratch_pool ? ggml_sycl::vram_zone_id::SCRATCH
-                                                 : ggml_sycl::vram_zone_id::RUNTIME;
-                cache->zone_free(zone_id, dev_ptr);
-            }
+        // Zone-managed allocations: unified_free() routes to zone_free or no-op
+        // based on managed_alloc.zone_managed/vram_zone/host_zone.
+        if (managed_alloc.zone_managed && managed_alloc.ptr != nullptr) {
+            (void) ggml_sycl::unified_free(managed_alloc);
         } else if (is_tp_compute_buffer) {
             // Free TP compute buffer pointers
             std::unordered_set<uint64_t> freed;
@@ -10010,9 +10022,9 @@ static sycl::event ggml_sycl_fill_reordered_gpu(sycl::queue &                   
         temp_vram = ctx->prealloc_temp;
     } else {
         const int dev_id = ggml_sycl_get_device_id_from_queue(queue);
+        ggml_sycl::alloc_handle temp_vram_h{};
         try {
-            bool from_arena = false;
-            temp_vram       = arena_device_alloc(src_size, dev_id, queue, from_arena);
+            temp_vram_h = arena_device_alloc(src_size, dev_id, queue);
         } catch (const sycl::exception & e) {
             GGML_LOG_ERROR("[GPU-REORDER] temp VRAM alloc failed (%zu bytes): %s\n", src_size, e.what());
             if (staging) {
@@ -10020,6 +10032,7 @@ static sycl::event ggml_sycl_fill_reordered_gpu(sycl::queue &                   
             }
             return queue.ext_oneapi_submit_barrier(deps);
         }
+        temp_vram = temp_vram_h.ptr;
         if (!temp_vram) {
             GGML_LOG_ERROR("[GPU-REORDER] temp VRAM alloc returned null (%zu bytes)\n", src_size);
             if (staging) {
@@ -10027,9 +10040,10 @@ static sycl::event ggml_sycl_fill_reordered_gpu(sycl::queue &                   
             }
             return queue.ext_oneapi_submit_barrier(deps);
         }
-        // Track dynamically allocated temp buffer for deferred free
-        // (arena-owned buffers are freed by zone_reset, not individually)
-        if (ctx->temp_bufs && !ggml_sycl::unified_cache_arena_owns(dev_id, temp_vram)) {
+        // Track dynamically allocated temp buffer for deferred free via alloc_handle.
+        // Arena-owned handles (zone_managed=true, vram_zone==COUNT) are freed by arena_reset —
+        // unified_free is a no-op for them. Non-arena handles are freed via sycl::free.
+        if (ctx->temp_bufs && !temp_vram_h.zone_managed) {
             ctx->temp_bufs->push_back(temp_vram);
         }
     }
@@ -11694,10 +11708,15 @@ static void ggml_sycl_preload_model_weights() {
                                 ggml_sycl_cache_id host_key = ggml_backend_sycl_get_weight_cache_key(tensor, device);
                                 if (host_key.valid) {
                                     const size_t nbytes     = ggml_nbytes(tensor);
-                                    auto *       hcache_ptr = ggml_sycl::try_get_host_cache();
-                                    void *       arena_ptr  = hcache_ptr ? hcache_ptr->host_zone_alloc(
-                                                                        ggml_sycl::host_zone_id::WEIGHT, nbytes, 256) :
-                                                                           nullptr;
+                                    ggml_sycl::alloc_request dn_req{};
+                                    dn_req.device                              = device;
+                                    dn_req.size                                = nbytes;
+                                    dn_req.intent.role                         = ggml_sycl::alloc_role::WEIGHT;
+                                    dn_req.intent.category                     = ggml_sycl::runtime_category::OTHER;
+                                    dn_req.intent.constraints.must_host_pinned = true;
+                                    ggml_sycl::alloc_handle dn_h{};
+                                    (void) ggml_sycl::unified_alloc(dn_req, &dn_h);
+                                    void * arena_ptr = dn_h.ptr;
                                     if (arena_ptr) {
                                         std::memcpy(arena_ptr, tensor->data, nbytes);
                                         cache->register_host_weight(host_key, arena_ptr, nbytes, GGML_LAYOUT_AOS);
@@ -13683,15 +13702,23 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                 // buffers are arena-backed and their destructors don't free zone
                 // space).  Reset the zone and retry — safe because compute buffers
                 // are context-scoped and the old context is destroyed by this point.
-                void * ptr = cache->zone_alloc(ggml_sycl::vram_zone_id::RUNTIME, size);
-                if (!ptr) {
+                ggml_sycl::alloc_request runtime_req{};
+                runtime_req.device                                = buft_ctx->device;
+                runtime_req.size                                  = size;
+                runtime_req.intent.role                           = ggml_sycl::alloc_role::COMPUTE;
+                runtime_req.intent.category                       = ggml_sycl::runtime_category::COMPUTE;
+                runtime_req.intent.constraints.must_device        = true;
+                runtime_req.intent.constraints.prefer_vram_zone   = ggml_sycl::vram_zone_id::RUNTIME;
+                ggml_sycl::alloc_handle runtime_h{};
+                if (!ggml_sycl::unified_alloc(runtime_req, &runtime_h) || !runtime_h.ptr) {
+                    // RUNTIME zone full — reset and retry once
                     cache->zone_reset(ggml_sycl::vram_zone_id::RUNTIME);
-                    ptr = cache->zone_alloc(ggml_sycl::vram_zone_id::RUNTIME, size);
+                    ggml_sycl::unified_alloc(runtime_req, &runtime_h);
                 }
-                if (ptr) {
+                if (runtime_h.ptr) {
                     ggml_backend_sycl_buffer_context * ctx = new ggml_backend_sycl_buffer_context(
-                        buft_ctx->device, ptr, buft_ctx->stream, size, buft_ctx->sycl_ctx);
-                    ctx->from_arena = true;  // Don't sycl::free this
+                        buft_ctx->device, runtime_h.ptr, buft_ctx->stream, size, buft_ctx->sycl_ctx);
+                    ctx->managed_alloc = runtime_h;
                     GGML_SYCL_DEBUG("[SYCL] Arena RUNTIME zone alloc: %.1f MB (%s)\n", size / (1024.0 * 1024.0),
                                     buft_ctx->name.c_str());
                     return ggml_backend_buffer_init(buft, ggml_backend_sycl_buffer_interface, ctx, size);
@@ -13704,36 +13731,55 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                 // context lifetime (allocated during graph_reserve), so they
                 // won't fragment or leak between inference steps.
                 if (alloc_role == ggml_sycl::alloc_role::COMPUTE) {
-                    ptr = cache->zone_alloc(ggml_sycl::vram_zone_id::KV, size);
-                    if (ptr) {
+                    ggml_sycl::alloc_request kv_req{};
+                    kv_req.device                              = buft_ctx->device;
+                    kv_req.size                                = size;
+                    kv_req.intent.role                         = ggml_sycl::alloc_role::COMPUTE;
+                    kv_req.intent.category                     = ggml_sycl::runtime_category::COMPUTE;
+                    kv_req.intent.constraints.must_device      = true;
+                    kv_req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::KV;
+                    ggml_sycl::alloc_handle kv_h{};
+                    ggml_sycl::unified_alloc(kv_req, &kv_h);
+                    if (kv_h.ptr) {
                         ggml_backend_sycl_buffer_context * ctx = new ggml_backend_sycl_buffer_context(
-                            buft_ctx->device, ptr, buft_ctx->stream, size, buft_ctx->sycl_ctx);
-                        ctx->from_arena   = true;
-                        ctx->from_kv_zone = true;
+                            buft_ctx->device, kv_h.ptr, buft_ctx->stream, size, buft_ctx->sycl_ctx);
+                        ctx->managed_alloc = kv_h;
                         GGML_LOG_INFO(
                             "[SYCL] Arena RUNTIME zone full, compute buffer (%.1f MB) allocated from KV zone (%s)\n",
                             size / (1024.0 * 1024.0), buft_ctx->name.c_str());
                         return ggml_backend_buffer_init(buft, ggml_backend_sycl_buffer_interface, ctx, size);
                     }
                     // KV zone also full — try scratch pool as last resort
-                    ptr = cache->get_scratch(size);
-                    if (ptr) {
+                    void * scratch_ptr = cache->get_scratch(size);
+                    if (scratch_ptr) {
                         ggml_backend_sycl_buffer_context * ctx = new ggml_backend_sycl_buffer_context(
-                            buft_ctx->device, ptr, buft_ctx->stream, size, buft_ctx->sycl_ctx);
-                        ctx->from_arena        = true;
-                        ctx->from_scratch_pool = true;
+                            buft_ctx->device, scratch_ptr, buft_ctx->stream, size, buft_ctx->sycl_ctx);
+                        // Scratch pool uses bump allocator: encode as zone_managed SCRATCH handle.
+                        // unified_free() will call zone_free(SCRATCH, ptr) via zone_managed routing.
+                        ggml_sycl::alloc_handle scratch_h{};
+                        scratch_h.ptr          = scratch_ptr;
+                        scratch_h.size         = size;
+                        scratch_h.device       = buft_ctx->device;
+                        scratch_h.zone_managed = true;
+                        scratch_h.vram_zone    = ggml_sycl::vram_zone_id::SCRATCH;
+                        ctx->managed_alloc     = scratch_h;
                         GGML_LOG_INFO("[SYCL] Arena RUNTIME+KV full, using scratch pool: %.1f MB (%s)\n",
                                       size / (1024.0 * 1024.0), buft_ctx->name.c_str());
                         return ggml_backend_buffer_init(buft, ggml_backend_sycl_buffer_interface, ctx, size);
                     }
                     // Scratch pool exhausted — reset and retry once
                     cache->reset_scratch_pool();
-                    ptr = cache->get_scratch(size);
-                    if (ptr) {
+                    scratch_ptr = cache->get_scratch(size);
+                    if (scratch_ptr) {
                         ggml_backend_sycl_buffer_context * ctx = new ggml_backend_sycl_buffer_context(
-                            buft_ctx->device, ptr, buft_ctx->stream, size, buft_ctx->sycl_ctx);
-                        ctx->from_arena        = true;
-                        ctx->from_scratch_pool = true;
+                            buft_ctx->device, scratch_ptr, buft_ctx->stream, size, buft_ctx->sycl_ctx);
+                        ggml_sycl::alloc_handle scratch_h{};
+                        scratch_h.ptr          = scratch_ptr;
+                        scratch_h.size         = size;
+                        scratch_h.device       = buft_ctx->device;
+                        scratch_h.zone_managed = true;
+                        scratch_h.vram_zone    = ggml_sycl::vram_zone_id::SCRATCH;
+                        ctx->managed_alloc     = scratch_h;
                         GGML_LOG_INFO("[SYCL] Scratch pool reset+retry: %.1f MB (%s)\n", size / (1024.0 * 1024.0),
                                       buft_ctx->name.c_str());
                         return ggml_backend_buffer_init(buft, ggml_backend_sycl_buffer_interface, ctx, size);
@@ -14102,10 +14148,12 @@ static ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(ggml_backend_syc
 // This avoids the monolithic multi-GB sycl::malloc_device that fails with
 // UR_RESULT_ERROR_OUT_OF_RESOURCES when VRAM is fragmented (n_ctx >= 10240).
 struct kv_layer_alloc {
-    void * ptr        = nullptr;  // Device VRAM or host-pinned pointer
-    size_t size       = 0;        // Bytes allocated for this layer
-    bool   on_device  = false;    // true = VRAM, false = host-pinned
-    bool   from_arena = false;    // true = sub-allocated from arena KV zone (do NOT free individually)
+    void *                  ptr      = nullptr;  // Device VRAM or host-pinned pointer
+    size_t                  size     = 0;        // Bytes allocated for this layer
+    bool                    on_device = false;   // true = VRAM, false = host-pinned
+    // When zone_h.ptr != nullptr, this layer was allocated via unified_alloc with
+    // prefer_vram_zone=KV. unified_free(zone_h) calls zone_free(KV) for TLSF reclaim.
+    ggml_sycl::alloc_handle zone_h{};
 };
 
 struct tiered_kv_buffer_context {
@@ -14170,11 +14218,9 @@ static void tiered_kv_buffer_free(ggml_backend_buffer_t buffer) {
     // Arena-sourced layers are freed individually via zone_free (TLSF coalesces
     // adjacent blocks automatically).  Non-arena layers use unified_cache_deallocate.
     for (auto & la : ctx->layer_allocs) {
-        if (la.ptr && la.from_arena) {
-            auto * cache = ggml_sycl::get_unified_cache_for_device(ctx->device);
-            if (cache && cache->arena_active()) {
-                cache->zone_free(ggml_sycl::vram_zone_id::KV, la.ptr);
-            }
+        if (la.ptr && la.zone_h.ptr) {
+            // Zone-managed KV layer: unified_free calls zone_free(KV) via vram_zone routing.
+            (void) ggml_sycl::unified_free(la.zone_h);
         } else if (la.ptr) {
             ggml_sycl::unified_cache_deallocate(ctx->device, la.ptr, la.size,
                                                 ggml_sycl::unified_cache::alloc_lifetime::PERSISTENT);
@@ -14626,7 +14672,7 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
                 vmem_layer_allocs[l].ptr        = ptr;
                 vmem_layer_allocs[l].size       = layer_sz;
                 vmem_layer_allocs[l].on_device  = true;
-                vmem_layer_allocs[l].from_arena = true;  // do NOT free individually
+                // vmem_layer_allocs[l].zone_h is empty — vmem pool handles destruction, no unified_free needed
                 vmem_offset += layer_sz;
             }
 
@@ -14691,12 +14737,20 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
             // P5: Prefer arena KV zone for device layers — avoids individual
             // sycl::malloc_device calls during context creation.
             if (arena_kv_active) {
-                void * arena_ptr = ggml_sycl::unified_cache_kv_arena_alloc(device, layer_size);
-                if (arena_ptr) {
-                    layer_allocs[l].ptr        = arena_ptr;
-                    layer_allocs[l].size       = layer_size;
-                    layer_allocs[l].on_device  = true;
-                    layer_allocs[l].from_arena = true;
+                ggml_sycl::alloc_request kv_layer_req{};
+                kv_layer_req.device                              = device;
+                kv_layer_req.size                                = layer_size;
+                kv_layer_req.intent.role                         = ggml_sycl::alloc_role::KV;
+                kv_layer_req.intent.category                     = ggml_sycl::runtime_category::KV_CACHE;
+                kv_layer_req.intent.constraints.must_device      = true;
+                kv_layer_req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::KV;
+                ggml_sycl::alloc_handle kv_layer_h{};
+                ggml_sycl::unified_alloc(kv_layer_req, &kv_layer_h);
+                if (kv_layer_h.ptr) {
+                    layer_allocs[l].ptr       = kv_layer_h.ptr;
+                    layer_allocs[l].size      = layer_size;
+                    layer_allocs[l].on_device = true;
+                    layer_allocs[l].zone_h    = kv_layer_h;
                     total_device += layer_size;
                     n_device_layers++;
                     continue;
@@ -14747,7 +14801,7 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
             GGML_LOG_ERROR("[KV-TIER] Device %d: failed to allocate layer %u (%zu bytes)\n", device, l, layer_size);
             // Clean up already-allocated layers (skip arena-sourced ones).
             for (uint32_t j = 0; j < l; j++) {
-                if (layer_allocs[j].ptr && !layer_allocs[j].from_arena) {
+                if (layer_allocs[j].ptr && !layer_allocs[j].zone_h.ptr) {
                     ggml_sycl::unified_cache_deallocate(device, layer_allocs[j].ptr, layer_allocs[j].size,
                                                         ggml_sycl::unified_cache::alloc_lifetime::PERSISTENT);
                 }
@@ -14810,7 +14864,7 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
             GGML_LOG_ERROR("[KV-TIER] Device %d: failed to allocate %zu bytes for allocator base\n", device,
                            alloc_padded);
             for (auto & la : layer_allocs) {
-                if (la.ptr && !la.from_arena) {
+                if (la.ptr && !la.zone_h.ptr) {
                     ggml_sycl::unified_cache_deallocate(device, la.ptr, la.size,
                                                         ggml_sycl::unified_cache::alloc_lifetime::PERSISTENT);
                 }
@@ -14852,16 +14906,16 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
         GGML_LOG_INFO("[KV-TIER] alloc_base=%p size=%zu (range %p-%p)\n", alloc_base, size, (void *) ab_start,
                       (void *) ab_end);
         for (uint32_t l = 0; l < std::min(n_layers, 4u); l++) {
-            GGML_LOG_INFO("[KV-TIER] layer_allocs[%u]: ptr=%p size=%zu on_device=%d from_arena=%d\n", l,
+            GGML_LOG_INFO("[KV-TIER] layer_allocs[%u]: ptr=%p size=%zu on_device=%d zone_managed=%d\n", l,
                           layer_allocs[l].ptr, layer_allocs[l].size, (int) layer_allocs[l].on_device,
-                          (int) layer_allocs[l].from_arena);
+                          (int)(layer_allocs[l].zone_h.ptr != nullptr));
         }
     }
 
     // Count arena-sourced layers for logging.
     uint32_t n_arena_layers = 0;
     for (const auto & la : layer_allocs) {
-        if (la.from_arena) {
+        if (la.zone_h.ptr) {
             n_arena_layers++;
         }
     }
@@ -19508,34 +19562,23 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
                         const size_t                    weights_bytes = packed.s4.size();
                         const size_t                    scales_bytes  = packed.scales.size() * sizeof(float);
                         const size_t                    zp_bytes      = packed.zero_points.size() * sizeof(int8_t);
-                        // Arena bump-allocate staging buffers (freed automatically at arena_reset).
-                        // Fall back to scoped_unified_alloc when arena is unavailable.
-                        ggml_sycl::scoped_unified_alloc weights_fallback;
-                        ggml_sycl::scoped_unified_alloc scales_fallback;
-                        ggml_sycl::scoped_unified_alloc zp_fallback;
-                        void *  weights_dev = ggml_sycl::unified_cache_arena_alloc(ctx.device, weights_bytes);
-                        float * scales_dev =
-                            static_cast<float *>(ggml_sycl::unified_cache_arena_alloc(ctx.device, scales_bytes));
-                        int8_t * zp_dev =
-                            static_cast<int8_t *>(ggml_sycl::unified_cache_arena_alloc(ctx.device, zp_bytes));
-                        if (!weights_dev || !scales_dev || !zp_dev) {
-                            // Arena exhausted — fall back to unified_alloc
-                            ggml_sycl::alloc_request dev_req{};
-                            dev_req.queue                          = stream;
-                            dev_req.device                         = ctx.device;
-                            dev_req.intent.role                    = ggml_sycl::alloc_role::COMPUTE;
-                            dev_req.intent.category                = ggml_sycl::runtime_category::COMPUTE;
-                            dev_req.intent.constraints.must_device = true;
-                            dev_req.size                           = weights_bytes;
-                            (void) weights_fallback.allocate(dev_req);
-                            dev_req.size = scales_bytes;
-                            (void) scales_fallback.allocate(dev_req);
-                            dev_req.size = zp_bytes;
-                            (void) zp_fallback.allocate(dev_req);
-                            weights_dev = weights_fallback.get();
-                            scales_dev  = static_cast<float *>(scales_fallback.get());
-                            zp_dev      = static_cast<int8_t *>(zp_fallback.get());
-                        }
+                        // Allocate staging buffers via unified_allocate (arena-first, then sycl::malloc_device).
+                        ggml_sycl::alloc_request dev_req{};
+                        dev_req.queue                          = stream;
+                        dev_req.device                         = ctx.device;
+                        dev_req.intent.role                    = ggml_sycl::alloc_role::COMPUTE;
+                        dev_req.intent.category                = ggml_sycl::runtime_category::COMPUTE;
+                        dev_req.intent.constraints.must_device = true;
+                        dev_req.size                           = weights_bytes;
+                        ggml_sycl::alloc_handle weights_h, scales_h, zp_h;
+                        (void) ggml_sycl::unified_alloc(dev_req, &weights_h);
+                        dev_req.size = scales_bytes;
+                        (void) ggml_sycl::unified_alloc(dev_req, &scales_h);
+                        dev_req.size = zp_bytes;
+                        (void) ggml_sycl::unified_alloc(dev_req, &zp_h);
+                        void *   weights_dev = weights_h.ptr;
+                        float *  scales_dev  = static_cast<float *>(scales_h.ptr);
+                        int8_t * zp_dev      = static_cast<int8_t *>(zp_h.ptr);
                         if (weights_dev && scales_dev && zp_dev) {
                             stream->memcpy(weights_dev, packed.s4.data(), weights_bytes);
                             stream->memcpy(scales_dev, packed.scales.data(), scales_bytes);
@@ -21066,6 +21109,7 @@ static bool ggml_sycl_mul_mat_tp_pre(const ggml_tensor * src0) {
 struct ggml_sycl_tp_column_parallel_output {
     void *                  ptr  = nullptr;
     size_t                  size = 0;
+    // Use .as_mem_handle() for read/resolve access; unified_free(alloc_handle) for ownership
     ggml_sycl::alloc_handle alloc{};
 };
 
@@ -21527,6 +21571,7 @@ struct dev1_kv_cache_entry {
     int64_t                 n_heads_kv;   // Number of KV heads per device
     int64_t                 head_dim;     // Dimension per head
     queue_ptr               stream;       // Device 1 stream for cache operations
+    // Use .as_mem_handle() for read/resolve access; unified_free(alloc_handle) for ownership
     ggml_sycl::alloc_handle k_alloc;
     ggml_sycl::alloc_handle v_alloc;
 };
@@ -23634,32 +23679,23 @@ static void ggml_sycl_mul_mat_tp_row_parallel_post(ggml_backend_sycl_context & c
         const size_t total_bytes           = src1_float_slice_size + src1_q8_size + dst_size;
         ggml_sycl_set_device(device);
         queue_ptr                       stream = ctx.stream(device, 0);
-        // Arena bump-allocate buffers on target device (freed automatically at arena_reset).
-        // Fall back to scoped_unified_alloc when arena is unavailable.
-        ggml_sycl::scoped_unified_alloc src1_ddf_fallback;
-        ggml_sycl::scoped_unified_alloc src1_ddq_fallback;
-        ggml_sycl::scoped_unified_alloc partial_out_fallback;
-        float *                         src1_ddf_dev =
-            static_cast<float *>(ggml_sycl::unified_cache_arena_alloc(device, src1_float_slice_size));
-        char *  src1_ddq_dev = static_cast<char *>(ggml_sycl::unified_cache_arena_alloc(device, src1_q8_size));
-        float * partial_out  = static_cast<float *>(ggml_sycl::unified_cache_arena_alloc(device, dst_size));
-        if (!src1_ddf_dev || !src1_ddq_dev || !partial_out) {
-            // Arena exhausted — fall back to unified_alloc
-            ggml_sycl::alloc_request row_req{};
-            row_req.queue                          = stream;
-            row_req.intent.role                    = ggml_sycl::alloc_role::TP_TMP;
-            row_req.intent.category                = ggml_sycl::runtime_category::COMPUTE;
-            row_req.intent.constraints.must_device = true;
-            row_req.size                           = src1_float_slice_size;
-            (void) src1_ddf_fallback.allocate(row_req);
-            row_req.size = src1_q8_size;
-            (void) src1_ddq_fallback.allocate(row_req);
-            row_req.size = dst_size;
-            (void) partial_out_fallback.allocate(row_req);
-            src1_ddf_dev = static_cast<float *>(src1_ddf_fallback.get());
-            src1_ddq_dev = static_cast<char *>(src1_ddq_fallback.get());
-            partial_out  = static_cast<float *>(partial_out_fallback.get());
-        }
+        // Allocate TP temp buffers via unified_allocate (arena-first, then sycl::malloc_device).
+        ggml_sycl::alloc_request row_req{};
+        row_req.queue                          = stream;
+        row_req.device                         = device;
+        row_req.intent.role                    = ggml_sycl::alloc_role::TP_TMP;
+        row_req.intent.category                = ggml_sycl::runtime_category::COMPUTE;
+        row_req.intent.constraints.must_device = true;
+        row_req.size                           = src1_float_slice_size;
+        ggml_sycl::alloc_handle src1_ddf_h, src1_ddq_h, partial_out_h;
+        (void) ggml_sycl::unified_alloc(row_req, &src1_ddf_h);
+        row_req.size = src1_q8_size;
+        (void) ggml_sycl::unified_alloc(row_req, &src1_ddq_h);
+        row_req.size = dst_size;
+        (void) ggml_sycl::unified_alloc(row_req, &partial_out_h);
+        float * src1_ddf_dev = static_cast<float *>(src1_ddf_h.ptr);
+        char *  src1_ddq_dev = static_cast<char *>(src1_ddq_h.ptr);
+        float * partial_out  = static_cast<float *>(partial_out_h.ptr);
         if (!src1_ddf_dev || !src1_ddq_dev || !partial_out) {
             fprintf(stderr, "SYCL TP: ERROR - failed to allocate temp buffers on device %d\n", device);
             ggml_sycl_set_device(main_device);
@@ -23741,23 +23777,21 @@ static void ggml_sycl_mul_mat_tp_row_parallel_post(ggml_backend_sycl_context & c
 
             stream->memcpy(host_buf, partial_out, dst_size).wait();
             ggml_sycl_set_device(main_device);
-            float * temp_add = static_cast<float *>(ggml_sycl::unified_cache_arena_alloc(main_device, dst_size));
-            ggml_sycl::scoped_unified_alloc temp_add_fallback;
-            ggml_sycl::alloc_request        temp_req{};
+            ggml_sycl::alloc_request temp_req{};
             temp_req.queue                          = main_stream;
+            temp_req.device                         = main_device;
             temp_req.size                           = dst_size;
             temp_req.intent.role                    = ggml_sycl::alloc_role::TP_TMP;
             temp_req.intent.category                = ggml_sycl::runtime_category::COMPUTE;
             temp_req.intent.constraints.must_device = true;
+            ggml_sycl::alloc_handle temp_add_h{};
+            (void) ggml_sycl::unified_alloc(temp_req, &temp_add_h);
+            float * temp_add = static_cast<float *>(temp_add_h.ptr);
             if (!temp_add) {
-                const bool temp_add_ok = temp_add_fallback.allocate(temp_req);
-                temp_add               = static_cast<float *>(temp_add_fallback.get());
-                if (!temp_add_ok || !temp_add) {
-                    GGML_LOG_ERROR("SYCL TP: ERROR - failed to allocate temp_add buffer (%zu bytes)\n", dst_size);
-                    ggml_sycl_set_device(device);
-                    ggml_sycl_set_device(main_device);
-                    continue;
-                }
+                GGML_LOG_ERROR("SYCL TP: ERROR - failed to allocate temp_add buffer (%zu bytes)\n", dst_size);
+                ggml_sycl_set_device(device);
+                ggml_sycl_set_device(main_device);
+                continue;
             }
 
             main_stream->memcpy(temp_add, host_buf, dst_size).wait();
@@ -37236,33 +37270,19 @@ cpu_fallback_fast:
             out_req.intent.cohort_id                    = "moe_pp_cpu_out";
 
             // CPU expert dispatch needs HOST-PINNED memory (CPU-accessible).
-            // unified_cache_arena_alloc returns VRAM (device) pointers — wrong for CPU memset/compute.
-            float * act_pinned = static_cast<float *>(
-                ggml_sycl::unified_cache_host_zone_alloc(ggml_sycl::host_zone_id::SCRATCH, act_req.size));
-            float * out_pinned = static_cast<float *>(
-                ggml_sycl::unified_cache_host_zone_alloc(ggml_sycl::host_zone_id::SCRATCH, out_req.size));
-            ggml_sycl::scoped_unified_alloc act_fallback;
-            ggml_sycl::scoped_unified_alloc out_fallback;
-            if (!act_pinned) {
-                if (!act_fallback.allocate(act_req)) {
-                    GGML_ABORT("[MoE] Failed host-pinned alloc for CPU expert activation: %s expert=%d rows=%zu size=%zu\n"
-                               "The unified cache host zone system must have enough capacity for CPU expert dispatch.\n"
-                               "Check host zone sizing in populate_host_zone_sizing().",
-                               src0->name ? src0->name : "?", expert_id, n_rows, act_req.size);
-                }
-                act_pinned = static_cast<float *>(act_fallback.get());
-                GGML_ASSERT(act_pinned != nullptr && "scoped_unified_alloc returned success but ptr is null");
+            // T4: unified_allocate() routes to host zone then falls back via unified_alloc().
+            // act_req/out_req already have must_host_pinned=true set above.
+            ggml_sycl::mem_handle act_handle = ggml_sycl::unified_allocate(act_req);
+            ggml_sycl::mem_handle out_handle = ggml_sycl::unified_allocate(out_req);
+            auto act_r = act_handle.resolve();
+            auto out_r = out_handle.resolve();
+            if (!act_r || !out_r) {
+                GGML_ABORT("[MoE] Failed host-pinned alloc for CPU expert act/out: %s expert=%d rows=%zu\n"
+                           "Ensure host zone has enough capacity (populate_host_zone_sizing).",
+                           src0->name ? src0->name : "?", expert_id, n_rows);
             }
-            if (!out_pinned) {
-                if (!out_fallback.allocate(out_req)) {
-                    GGML_ABORT("[MoE] Failed host-pinned alloc for CPU expert output: %s expert=%d rows=%zu size=%zu\n"
-                               "The unified cache host zone system must have enough capacity for CPU expert dispatch.\n"
-                               "Check host zone sizing in populate_host_zone_sizing().",
-                               src0->name ? src0->name : "?", expert_id, n_rows, out_req.size);
-                }
-                out_pinned = static_cast<float *>(out_fallback.get());
-                GGML_ASSERT(out_pinned != nullptr && "scoped_unified_alloc returned success but ptr is null");
-            }
+            float * act_pinned = static_cast<float *>(act_r.ptr);
+            float * out_pinned = static_cast<float *>(out_r.ptr);
             std::memset(out_pinned, 0, n_rows * static_cast<size_t>(N) * sizeof(float));
 
             std::vector<sycl::event> d2h_events;

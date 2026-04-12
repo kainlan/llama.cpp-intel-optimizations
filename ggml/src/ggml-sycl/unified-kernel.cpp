@@ -4291,98 +4291,82 @@ namespace ggml_sycl {
 // =============================================================================
 // Arena-Routed Allocation Helpers
 // =============================================================================
-// When GGML_SYCL_VRAM_ARENA=1, host-pinned allocations route through the
-// pinned_chunk_pool (via host_cache).  When arena is OFF, fall back to direct
-// sycl::malloc_host.  Callers set from_pool so the matching free routes correctly.
+// All helpers return alloc_handle. Callers call unified_free(handle) instead of
+// tracking from_pool/from_arena booleans. unified_free routes:
+//   - vram_zone != COUNT: zone_free(vram_zone, ptr) for TLSF reclaim
+//   - zone_managed host: freed by zone reset (no-op in unified_free)
+//   - raw device/host: sycl::free via registered record
 
-static void * pinned_alloc(size_t bytes, sycl::queue & queue, bool & from_pool) {
-    from_pool = false;
+// Host-pinned allocation for persistent kernel data structures.
+// Routes through host SCRATCH zone when configured, runtime pool otherwise.
+// unified_free(handle) is a no-op for zone-managed host allocations (freed by zone reset).
+static alloc_handle pinned_alloc(size_t bytes, sycl::queue & queue, int device_id) {
     if (bytes == 0) {
-        return nullptr;
+        return {};
     }
-    auto * hcache = try_get_host_cache();
-    if (hcache) {
-        if (hcache->host_zones_configured()) {
-            void * ptr = hcache->host_zone_alloc(host_zone_id::SCRATCH, bytes, 64);
-            if (ptr) {
-                from_pool = true;
-                return ptr;
-            }
-        } else if (vram_arena_enabled()) {
-            void * ptr = hcache->allocate_pinned_runtime(bytes, 64);
-            if (ptr) {
-                from_pool = true;
-                return ptr;
-            }
-        }
+    alloc_request req{};
+    req.queue                          = &queue;
+    req.device                         = device_id;
+    req.size                           = bytes;
+    req.intent.role                    = alloc_role::COMPUTE;
+    req.intent.category                = runtime_category::COMPUTE;
+    req.intent.constraints.must_host_pinned = true;
+    alloc_handle h{};
+    if (unified_alloc(req, &h) && h.ptr) {
+        return h;
     }
-    // No pool available and arena is not active — fail gracefully.
-    // Callers (persistent kernel setup) will handle nullptr by disabling
-    // the persistent kernel path and routing to CPU dispatch.
-    GGML_LOG_WARN("[UNIFIED-KERNEL] pinned_alloc: no host pool available for %zu bytes, "
+    GGML_LOG_WARN("[UNIFIED-KERNEL] pinned_alloc: allocation failed for %zu bytes, "
                   "persistent kernel disabled\n", bytes);
-    return nullptr;
+    return {};
 }
 
-static void pinned_free(void * ptr, size_t bytes, sycl::queue & queue, bool from_pool) {
-    if (!ptr) {
-        return;
-    }
-    if (from_pool) {
-        auto * hcache = try_get_host_cache();
-        if (hcache && !hcache->host_zones_configured()) {
-            hcache->free_pinned_runtime(ptr, bytes);
-            return;
-        }
-        return;
-    }
-    sycl::free(ptr, queue);
-}
-
-// Arena-routed device memory allocation helpers.
-// Persistent allocs go to the WEIGHT zone (not reset between tokens).
-// Scratch allocs go to the SCRATCH zone (reset between tokens).
-// When arena is OFF, both fall back to sycl::malloc_device.
-// Callers set from_arena so the matching free routes correctly.
-
-static void * device_alloc_persistent(size_t bytes, sycl::queue & queue, int device_id, bool & from_arena) {
-    from_arena = false;
+// Device allocation for persistent kernel state (not reset between tokens).
+// Routes through WEIGHT zone when arena is active; falls back to malloc_device.
+static alloc_handle device_alloc_persistent(size_t bytes, sycl::queue & queue, int device_id) {
     if (bytes == 0) {
-        return nullptr;
+        return {};
     }
-    if (vram_arena_enabled() && device_id >= 0) {
-        void * ptr = unified_cache_arena_alloc_weight(device_id, bytes);
-        if (ptr) {
-            from_arena = true;
-            return ptr;
-        }
+    alloc_request req{};
+    req.queue                                 = &queue;
+    req.device                                = device_id;
+    req.size                                  = bytes;
+    req.intent.role                           = alloc_role::COMPUTE;
+    req.intent.category                       = runtime_category::COMPUTE;
+    req.intent.constraints.must_device        = true;
+    req.intent.constraints.prefer_vram_zone   = vram_zone_id::WEIGHT;
+    alloc_handle h{};
+    if (unified_alloc(req, &h) && h.ptr) {
+        return h;
     }
-    return ggml_sycl_malloc_device(bytes, queue, "uk_persistent");
+    // Zone routing failed — fall back to raw device allocation.
+    req.intent.constraints.prefer_vram_zone = vram_zone_id::COUNT;
+    unified_alloc(req, &h);
+    return h;
 }
 
-static void * device_alloc_scratch(size_t bytes, sycl::queue & queue, int device_id, bool & from_arena) {
-    from_arena = false;
+// Device allocation for per-token scratch (reset by arena_reset between tokens).
+// Routes through SCRATCH zone when arena active; falls back to malloc_device.
+// unified_free(handle) calls zone_free(SCRATCH) for TLSF reclaim when zone-managed.
+static alloc_handle device_alloc_scratch(size_t bytes, sycl::queue & queue, int device_id) {
     if (bytes == 0) {
-        return nullptr;
+        return {};
     }
-    if (vram_arena_enabled() && device_id >= 0) {
-        void * ptr = unified_cache_arena_alloc(device_id, bytes);
-        if (ptr) {
-            from_arena = true;
-            return ptr;
-        }
+    alloc_request req{};
+    req.queue                                 = &queue;
+    req.device                                = device_id;
+    req.size                                  = bytes;
+    req.intent.role                           = alloc_role::COMPUTE;
+    req.intent.category                       = runtime_category::COMPUTE;
+    req.intent.constraints.must_device        = true;
+    req.intent.constraints.prefer_vram_zone   = vram_zone_id::SCRATCH;
+    alloc_handle h{};
+    if (unified_alloc(req, &h) && h.ptr) {
+        return h;
     }
-    return ggml_sycl_malloc_device(bytes, queue, "uk_scratch");
-}
-
-static void device_free(void * ptr, sycl::queue & queue, bool from_arena) {
-    if (!ptr) {
-        return;
-    }
-    if (from_arena) {
-        return;  // Arena memory freed when arena is destroyed
-    }
-    sycl::free(ptr, queue);
+    // Zone routing failed — fall back to raw device allocation.
+    req.intent.constraints.prefer_vram_zone = vram_zone_id::COUNT;
+    unified_alloc(req, &h);
+    return h;
 }
 
 static const char * persistent_op_type_name(OperationType type) {
@@ -6847,34 +6831,34 @@ UnifiedKernel::~UnifiedKernel() {
     // Free micro-graph resources
     micro_graph_.reset();
     if (micro_tile_counters_) {
-        device_free(micro_tile_counters_, queue_, arena_micro_tile_counters_);
+        (void) unified_free(micro_tile_counters_alloc_);
+        micro_tile_counters_alloc_ = {};
         micro_tile_counters_       = nullptr;
         micro_tile_counters_n_     = 0;
-        arena_micro_tile_counters_ = false;
     }
     if (micro_generation_) {
-        pinned_free(micro_generation_, sizeof(int), queue_, pinned_pool_micro_gen_);
-        micro_generation_      = nullptr;
-        pinned_pool_micro_gen_ = false;
+        (void) unified_free(micro_gen_alloc_);
+        micro_gen_alloc_  = {};
+        micro_generation_ = nullptr;
     }
     // Free MMVQ micro-graph Q8 and scratch buffers
     for (int i = 0; i < 2; i++) {
         if (mmvq_q8_bufs_[i]) {
-            device_free(mmvq_q8_bufs_[i], queue_, arena_mmvq_q8_bufs_);
-            mmvq_q8_bufs_[i] = nullptr;
+            (void) unified_free(mmvq_q8_buf_allocs_[i]);
+            mmvq_q8_buf_allocs_[i] = {};
+            mmvq_q8_bufs_[i]       = nullptr;
         }
     }
-    mmvq_q8_buf_size_   = 0;
-    arena_mmvq_q8_bufs_ = false;
+    mmvq_q8_buf_size_ = 0;
     if (mmvq_gate_scratch_) {
-        device_free(mmvq_gate_scratch_, queue_, arena_mmvq_gate_scratch_);
+        (void) unified_free(mmvq_gate_scratch_alloc_);
+        mmvq_gate_scratch_alloc_ = {};
         mmvq_gate_scratch_       = nullptr;
-        arena_mmvq_gate_scratch_ = false;
     }
     if (mmvq_up_scratch_) {
-        device_free(mmvq_up_scratch_, queue_, arena_mmvq_up_scratch_);
+        (void) unified_free(mmvq_up_scratch_alloc_);
+        mmvq_up_scratch_alloc_ = {};
         mmvq_up_scratch_       = nullptr;
-        arena_mmvq_up_scratch_ = false;
     }
     mmvq_gate_scratch_sz_ = 0;
 }
@@ -7034,21 +7018,14 @@ void UnifiedKernel::allocate_persistent_buffers(int hidden_dim, int intermediate
 
     free_persistent_buffers();
 
-    arena_persistent_bufs_ = false;
     for (int i = 0; i < 4; i++) {
-        bool arena_i           = false;
-        persistent_buffers_[i] = device_alloc_persistent(required_size, queue_, device_id_, arena_i);
-        if (arena_i) {
-            arena_persistent_bufs_ = true;
-        }
+        persistent_buf_allocs_[i] = device_alloc_persistent(required_size, queue_, device_id_);
+        persistent_buffers_[i]    = static_cast<void *>(persistent_buf_allocs_[i].ptr);
     }
 
     if (!sync_block_) {
-        bool arena_sync = false;
-        sync_block_     = static_cast<int *>(device_alloc_persistent(3 * sizeof(int), queue_, device_id_, arena_sync));
-        if (arena_sync) {
-            arena_persistent_bufs_ = true;
-        }
+        sync_block_alloc_ = device_alloc_persistent(3 * sizeof(int), queue_, device_id_);
+        sync_block_       = static_cast<int *>(sync_block_alloc_.ptr);
     }
     tile_counter_    = sync_block_;
     barrier_counter_ = sync_block_ + 1;
@@ -7076,107 +7053,120 @@ void UnifiedKernel::free_persistent_buffers() {
 
     for (int i = 0; i < 4; i++) {
         if (persistent_buffers_[i]) {
-            device_free(persistent_buffers_[i], queue_, arena_persistent_bufs_);
-            persistent_buffers_[i] = nullptr;
+            (void) unified_free(persistent_buf_allocs_[i]);
+            persistent_buf_allocs_[i] = {};
+            persistent_buffers_[i]    = nullptr;
         }
     }
     if (sync_block_) {
-        device_free(sync_block_, queue_, arena_persistent_bufs_);
-        sync_block_ = nullptr;
+        (void) unified_free(sync_block_alloc_);
+        sync_block_alloc_ = {};
+        sync_block_       = nullptr;
     }
-    arena_persistent_bufs_ = false;
-    tile_counter_          = nullptr;
-    barrier_counter_       = nullptr;
-    barrier_sense_         = nullptr;
+    tile_counter_   = nullptr;
+    barrier_counter_= nullptr;
+    barrier_sense_  = nullptr;
     if (d_ops_pool_) {
-        pinned_free(d_ops_pool_, pinned_ops_pool_bytes_, queue_, pinned_pool_ops_);
+        (void) unified_free(ops_pool_alloc_);
+        ops_pool_alloc_  = {};
         d_ops_pool_      = nullptr;
         d_ops_pool_size_ = 0;
-        pinned_pool_ops_ = false;
     }
-    for (auto & slot : get_rows_slots_) {
+    for (size_t _i = 0; _i < get_rows_slots_.size(); _i++) {
+        auto & slot = get_rows_slots_[_i];
         if (slot.ptr) {
-            device_free(slot.ptr, queue_, arena_get_rows_);
+            // get_rows slots share a single alloc_handle (get_rows_alloc_) only
+            // when arena-backed; non-arena slots use slot.ptr directly.
             slot.ptr  = nullptr;
             slot.size = 0;
         }
     }
+    if (get_rows_alloc_.ptr) {
+        (void) unified_free(get_rows_alloc_);
+        get_rows_alloc_ = {};
+    }
     get_rows_slots_.clear();
-    arena_get_rows_ = false;
     // Free scratch output pool
     free_scratch_pool();
     // Free DAG allocations
     if (dag_allocated_) {
         if (dag_state_.ready_counter) {
-            device_free(dag_state_.ready_counter, queue_, arena_dag_device_);
+            (void) unified_free(dag_ready_counter_alloc_);
+            dag_ready_counter_alloc_ = {};
         }
         if (dag_state_.tile_claimed) {
-            device_free(dag_state_.tile_claimed, queue_, arena_dag_device_);
+            (void) unified_free(dag_tile_claimed_alloc_);
+            dag_tile_claimed_alloc_ = {};
         }
         if (dag_state_.tiles_done) {
-            device_free(dag_state_.tiles_done, queue_, arena_dag_device_);
+            (void) unified_free(dag_tiles_done_alloc_);
+            dag_tiles_done_alloc_ = {};
         }
         if (dag_state_.successor_offset) {
-            pinned_free(dag_state_.successor_offset, pinned_dag_successor_offset_bytes_, queue_, pinned_pool_dag_);
+            (void) unified_free(dag_successor_off_alloc_);
+            dag_successor_off_alloc_ = {};
         }
         if (dag_state_.successor_list) {
-            pinned_free(dag_state_.successor_list, pinned_dag_successor_list_bytes_, queue_, pinned_pool_dag_);
+            (void) unified_free(dag_successor_list_alloc_);
+            dag_successor_list_alloc_ = {};
         }
         if (dag_state_.n_tiles) {
-            pinned_free(dag_state_.n_tiles, pinned_dag_n_tiles_bytes_, queue_, pinned_pool_dag_);
+            (void) unified_free(dag_n_tiles_alloc_);
+            dag_n_tiles_alloc_ = {};
         }
         if (dag_state_.completed_count) {
-            device_free(dag_state_.completed_count, queue_, arena_dag_device_);
+            (void) unified_free(dag_completed_alloc_);
+            dag_completed_alloc_ = {};
         }
         dag_state_        = {};
         dag_allocated_    = false;
         dag_pool_n_ops_   = 0;
         dag_pool_n_edges_ = 0;
-        pinned_pool_dag_  = false;
-        arena_dag_device_ = false;
     }
     // Free phase schedule allocations
     if (phase_allocated_) {
         if (phase_schedule_.entries) {
-            pinned_free(phase_schedule_.entries, pinned_phase_entries_bytes_, queue_, pinned_pool_phase_);
+            (void) unified_free(phase_entries_alloc_);
+            phase_entries_alloc_ = {};
         }
         if (phase_schedule_.phase_offset) {
-            pinned_free(phase_schedule_.phase_offset, pinned_phase_offset_bytes_, queue_, pinned_pool_phase_);
+            (void) unified_free(phase_offset_alloc_);
+            phase_offset_alloc_ = {};
         }
         if (phase_schedule_.phase_tiles) {
-            pinned_free(phase_schedule_.phase_tiles, pinned_phase_tiles_bytes_, queue_, pinned_pool_phase_);
+            (void) unified_free(phase_tiles_alloc_);
+            phase_tiles_alloc_ = {};
         }
         if (phase_schedule_.phase_type) {
-            pinned_free(phase_schedule_.phase_type, pinned_phase_type_bytes_, queue_, pinned_pool_phase_);
+            (void) unified_free(phase_type_alloc_);
+            phase_type_alloc_ = {};
         }
 
         phase_schedule_      = {};
         phase_allocated_     = false;
         phase_pool_n_ops_    = 0;
         phase_pool_n_phases_ = 0;
-        pinned_pool_phase_   = false;
     }
     // Free light barrier flags
     if (light_flags_) {
-        device_free(light_flags_, queue_, arena_light_flags_);
+        (void) unified_free(light_flags_alloc_);
+        light_flags_alloc_ = {};
         light_flags_       = nullptr;
         light_flags_size_  = 0;
-        arena_light_flags_ = false;
     }
     // Free role schedule allocations
     if (role_allocated_) {
         if (role_schedule_.elem_segments) {
-            pinned_free(const_cast<RoleSegment *>(role_schedule_.elem_segments), pinned_role_elem_bytes_, queue_,
-                        pinned_pool_role_);
+            (void) unified_free(role_elem_alloc_);
+            role_elem_alloc_ = {};
         }
         if (role_schedule_.matmul_segments) {
-            pinned_free(const_cast<RoleSegment *>(role_schedule_.matmul_segments), pinned_role_matmul_bytes_, queue_,
-                        pinned_pool_role_);
+            (void) unified_free(role_matmul_alloc_);
+            role_matmul_alloc_ = {};
         }
-        // sync_flags is the base of a single contiguous allocation that includes
-        // role_tile_counter, elem_barrier_cnt/sense, mm_barrier_cnt/sense
         if (role_schedule_.sync_flags) {
-            device_free(role_schedule_.sync_flags, queue_, arena_role_sync_);
+            (void) unified_free(role_sync_alloc_);
+            role_sync_alloc_ = {};
         }
 
         role_schedule_      = {};
@@ -7184,8 +7174,6 @@ void UnifiedKernel::free_persistent_buffers() {
         role_pool_n_elem_   = 0;
         role_pool_n_matmul_ = 0;
         role_pool_n_sync_   = 0;
-        pinned_pool_role_   = false;
-        arena_role_sync_    = false;
     }
     invalidate_plan_cache();
     host_ops_               = {};  // Release heap memory (invalidate_plan_cache only clears, keeps capacity)
@@ -7212,51 +7200,44 @@ void UnifiedKernel::build_dag(const std::vector<std::vector<int>> & successors, 
         }
         // Free old allocations
         if (dag_allocated_) {
-            device_free(dag_state_.ready_counter, queue_, arena_dag_device_);
-            device_free(dag_state_.tile_claimed, queue_, arena_dag_device_);
-            device_free(dag_state_.tiles_done, queue_, arena_dag_device_);
-            pinned_free(dag_state_.successor_offset, pinned_dag_successor_offset_bytes_, queue_, pinned_pool_dag_);
-            pinned_free(dag_state_.successor_list, pinned_dag_successor_list_bytes_, queue_, pinned_pool_dag_);
-            pinned_free(dag_state_.n_tiles, pinned_dag_n_tiles_bytes_, queue_, pinned_pool_dag_);
-            device_free(dag_state_.completed_count, queue_, arena_dag_device_);
-            arena_dag_device_ = false;
+            (void) unified_free(dag_ready_counter_alloc_);
+            (void) unified_free(dag_tile_claimed_alloc_);
+            (void) unified_free(dag_tiles_done_alloc_);
+            (void) unified_free(dag_successor_off_alloc_);
+            (void) unified_free(dag_successor_list_alloc_);
+            (void) unified_free(dag_n_tiles_alloc_);
+            (void) unified_free(dag_completed_alloc_);
+            dag_ready_counter_alloc_  = {};
+            dag_tile_claimed_alloc_   = {};
+            dag_tiles_done_alloc_     = {};
+            dag_successor_off_alloc_  = {};
+            dag_successor_list_alloc_ = {};
+            dag_n_tiles_alloc_        = {};
+            dag_completed_alloc_      = {};
         }
         // Allocate new with some headroom
         const int alloc_ops   = n_ops + 64;
         const int alloc_edges = n_edges + 128;
-        bool      arena_tmp   = false;
-        dag_state_.ready_counter =
-            static_cast<int *>(device_alloc_persistent(alloc_ops * sizeof(int), queue_, device_id_, arena_tmp));
-        arena_dag_device_ = arena_tmp;
-        dag_state_.tile_claimed =
-            static_cast<int *>(device_alloc_persistent(alloc_ops * sizeof(int), queue_, device_id_, arena_tmp));
-        if (arena_tmp) {
-            arena_dag_device_ = true;
-        }
-        dag_state_.tiles_done =
-            static_cast<int *>(device_alloc_persistent(alloc_ops * sizeof(int), queue_, device_id_, arena_tmp));
-        if (arena_tmp) {
-            arena_dag_device_ = true;
-        }
-        pinned_dag_successor_offset_bytes_ = (alloc_ops + 1) * sizeof(int);
-        pinned_dag_successor_list_bytes_   = std::max(alloc_edges, 1) * sizeof(int);
-        pinned_dag_n_tiles_bytes_          = alloc_ops * sizeof(int);
-        dag_state_.successor_offset =
-            static_cast<int *>(pinned_alloc(pinned_dag_successor_offset_bytes_, queue_, pinned_pool_dag_));
-        dag_state_.successor_list =
-            static_cast<int *>(pinned_alloc(pinned_dag_successor_list_bytes_, queue_, pinned_pool_dag_));
-        dag_state_.n_tiles = static_cast<int *>(pinned_alloc(pinned_dag_n_tiles_bytes_, queue_, pinned_pool_dag_));
+        dag_ready_counter_alloc_  = device_alloc_persistent(alloc_ops * sizeof(int), queue_, device_id_);
+        dag_state_.ready_counter  = static_cast<int *>(dag_ready_counter_alloc_.ptr);
+        dag_tile_claimed_alloc_   = device_alloc_persistent(alloc_ops * sizeof(int), queue_, device_id_);
+        dag_state_.tile_claimed   = static_cast<int *>(dag_tile_claimed_alloc_.ptr);
+        dag_tiles_done_alloc_     = device_alloc_persistent(alloc_ops * sizeof(int), queue_, device_id_);
+        dag_state_.tiles_done     = static_cast<int *>(dag_tiles_done_alloc_.ptr);
+        dag_successor_off_alloc_  = pinned_alloc((alloc_ops + 1) * sizeof(int), queue_, device_id_);
+        dag_state_.successor_offset = static_cast<int *>(dag_successor_off_alloc_.ptr);
+        dag_successor_list_alloc_ = pinned_alloc(std::max(alloc_edges, 1) * sizeof(int), queue_, device_id_);
+        dag_state_.successor_list = static_cast<int *>(dag_successor_list_alloc_.ptr);
+        dag_n_tiles_alloc_        = pinned_alloc(alloc_ops * sizeof(int), queue_, device_id_);
+        dag_state_.n_tiles        = static_cast<int *>(dag_n_tiles_alloc_.ptr);
         if (!dag_state_.successor_offset || !dag_state_.successor_list || !dag_state_.n_tiles) {
-            GGML_LOG_WARN("[PERSISTENT-TG] DAG pinned_alloc failed — persistent DAG kernel disabled\n");
+            GGML_LOG_WARN("[PERSISTENT-TG] DAG pinned_alloc failed \u2014 persistent DAG kernel disabled\n");
             dag_pool_n_ops_   = 0;
             dag_pool_n_edges_ = 0;
             return;
         }
-        dag_state_.completed_count =
-            static_cast<int *>(device_alloc_persistent(1 * sizeof(int), queue_, device_id_, arena_tmp));
-        if (arena_tmp) {
-            arena_dag_device_ = true;
-        }
+        dag_completed_alloc_      = device_alloc_persistent(1 * sizeof(int), queue_, device_id_);
+        dag_state_.completed_count = static_cast<int *>(dag_completed_alloc_.ptr);
         dag_pool_n_ops_   = alloc_ops;
         dag_pool_n_edges_ = alloc_edges;
         // Track new DAG device bytes (3 arrays of alloc_ops + 1 completed_count)
@@ -7394,29 +7375,29 @@ void UnifiedKernel::build_phase_schedule(const std::vector<std::vector<int>> & s
     // Allocate host-pinned arrays (grow-on-demand; kernel reads via PCIe zero-copy)
     if (n_ops > phase_pool_n_ops_ || n_phases > phase_pool_n_phases_) {
         if (phase_allocated_) {
-            pinned_free(phase_schedule_.entries, pinned_phase_entries_bytes_, queue_, pinned_pool_phase_);
-            pinned_free(phase_schedule_.phase_offset, pinned_phase_offset_bytes_, queue_, pinned_pool_phase_);
-            pinned_free(phase_schedule_.phase_tiles, pinned_phase_tiles_bytes_, queue_, pinned_pool_phase_);
+            (void) unified_free(phase_entries_alloc_);  phase_entries_alloc_ = {};
+            (void) unified_free(phase_offset_alloc_);   phase_offset_alloc_  = {};
+            (void) unified_free(phase_tiles_alloc_);    phase_tiles_alloc_   = {};
             if (phase_schedule_.phase_type) {
-                pinned_free(phase_schedule_.phase_type, pinned_phase_type_bytes_, queue_, pinned_pool_phase_);
+                (void) unified_free(phase_type_alloc_); phase_type_alloc_ = {};
             }
         }
-        const int alloc_ops         = n_ops + 64;
-        const int alloc_phases      = n_phases + 16;
-        pinned_phase_entries_bytes_ = alloc_ops * sizeof(DevicePhaseEntry);
-        pinned_phase_offset_bytes_  = (alloc_phases + 1) * sizeof(int);
-        pinned_phase_tiles_bytes_   = alloc_phases * sizeof(int);
-        pinned_phase_type_bytes_    = alloc_phases * sizeof(int);
-        phase_schedule_.entries =
-            static_cast<DevicePhaseEntry *>(pinned_alloc(pinned_phase_entries_bytes_, queue_, pinned_pool_phase_));
-        phase_schedule_.phase_offset =
-            static_cast<int *>(pinned_alloc(pinned_phase_offset_bytes_, queue_, pinned_pool_phase_));
-        phase_schedule_.phase_tiles =
-            static_cast<int *>(pinned_alloc(pinned_phase_tiles_bytes_, queue_, pinned_pool_phase_));
-        phase_schedule_.phase_type =
-            static_cast<int *>(pinned_alloc(pinned_phase_type_bytes_, queue_, pinned_pool_phase_));
+        const int    alloc_ops              = n_ops + 64;
+        const int    alloc_phases           = n_phases + 16;
+        const size_t phase_entries_bytes    = alloc_ops * sizeof(DevicePhaseEntry);
+        const size_t phase_offset_bytes     = (alloc_phases + 1) * sizeof(int);
+        const size_t phase_tiles_bytes      = alloc_phases * sizeof(int);
+        const size_t phase_type_bytes       = alloc_phases * sizeof(int);
+        phase_entries_alloc_     = pinned_alloc(phase_entries_bytes, queue_, device_id_);
+        phase_offset_alloc_      = pinned_alloc(phase_offset_bytes, queue_, device_id_);
+        phase_tiles_alloc_       = pinned_alloc(phase_tiles_bytes, queue_, device_id_);
+        phase_type_alloc_        = pinned_alloc(phase_type_bytes, queue_, device_id_);
+        phase_schedule_.entries      = static_cast<DevicePhaseEntry *>(phase_entries_alloc_.ptr);
+        phase_schedule_.phase_offset = static_cast<int *>(phase_offset_alloc_.ptr);
+        phase_schedule_.phase_tiles  = static_cast<int *>(phase_tiles_alloc_.ptr);
+        phase_schedule_.phase_type   = static_cast<int *>(phase_type_alloc_.ptr);
         if (!phase_schedule_.entries || !phase_schedule_.phase_offset || !phase_schedule_.phase_tiles || !phase_schedule_.phase_type) {
-            GGML_LOG_WARN("[PERSISTENT-TG] Phase pinned_alloc failed — persistent phase kernel disabled\n");
+            GGML_LOG_WARN("[PERSISTENT-TG] Phase pinned_alloc failed \u2014 persistent phase kernel disabled\n");
             phase_pool_n_ops_    = 0;
             phase_pool_n_phases_ = 0;
             return;
@@ -7625,34 +7606,31 @@ void UnifiedKernel::build_role_schedule(const std::vector<DeviceOperation> & hos
         // Free old allocations
         if (role_allocated_) {
             if (role_schedule_.elem_segments) {
-                pinned_free(const_cast<RoleSegment *>(role_schedule_.elem_segments), pinned_role_elem_bytes_, queue_,
-                            pinned_pool_role_);
+                (void) unified_free(role_elem_alloc_);  role_elem_alloc_ = {};
             }
             if (role_schedule_.matmul_segments) {
-                pinned_free(const_cast<RoleSegment *>(role_schedule_.matmul_segments), pinned_role_matmul_bytes_,
-                            queue_, pinned_pool_role_);
+                (void) unified_free(role_matmul_alloc_);  role_matmul_alloc_ = {};
             }
             // sync_flags is the base of a single contiguous device allocation;
             // role_tile_counter and barrier counters are offsets within it.
             if (role_schedule_.sync_flags) {
-                device_free(role_schedule_.sync_flags, queue_, arena_role_sync_);
+                (void) unified_free(role_sync_alloc_);  role_sync_alloc_ = {};
             }
-            arena_role_sync_ = false;
             // Barrier counters are within the sync_flags allocation (contiguous block)
             // Actually let's use a single allocation for all sync ints
         }
 
         // Allocate segments
-        const int alloc_elem   = n_elem_segs + 16;
-        const int alloc_matmul = n_matmul_segs + 16;
-        const int alloc_sync   = std::max(n_sync, 1) + 8;
+        const int    alloc_elem          = n_elem_segs + 16;
+        const int    alloc_matmul        = n_matmul_segs + 16;
+        const int    alloc_sync          = std::max(n_sync, 1) + 8;
+        const size_t role_elem_bytes     = alloc_elem * sizeof(RoleSegment);
+        const size_t role_matmul_bytes   = alloc_matmul * sizeof(RoleSegment);
 
-        pinned_role_elem_bytes_   = alloc_elem * sizeof(RoleSegment);
-        pinned_role_matmul_bytes_ = alloc_matmul * sizeof(RoleSegment);
-        role_schedule_.elem_segments =
-            static_cast<RoleSegment *>(pinned_alloc(pinned_role_elem_bytes_, queue_, pinned_pool_role_));
-        role_schedule_.matmul_segments =
-            static_cast<RoleSegment *>(pinned_alloc(pinned_role_matmul_bytes_, queue_, pinned_pool_role_));
+        role_elem_alloc_   = pinned_alloc(role_elem_bytes, queue_, device_id_);
+        role_matmul_alloc_ = pinned_alloc(role_matmul_bytes, queue_, device_id_);
+        role_schedule_.elem_segments    = static_cast<RoleSegment *>(role_elem_alloc_.ptr);
+        role_schedule_.matmul_segments  = static_cast<RoleSegment *>(role_matmul_alloc_.ptr);
 
         // Single allocation for all sync/counter/barrier ints.
         // Each atomic counter/sense pair is padded to 64 bytes (16 ints) to avoid
@@ -7661,8 +7639,8 @@ void UnifiedKernel::build_role_schedule(const std::vector<DeviceOperation> & hos
         // and barrier malfunction with 3+ elementwise WGs.
         constexpr int CL_INTS    = 16;                            // 64 bytes / 4 bytes per int
         const int     total_ints = alloc_sync * 2 + CL_INTS * 5;  // sync_flags + 5 padded slots
-        int *         sync_block =
-            static_cast<int *>(device_alloc_persistent(total_ints * sizeof(int), queue_, device_id_, arena_role_sync_));
+        role_sync_alloc_  = device_alloc_persistent(total_ints * sizeof(int), queue_, device_id_);
+        int * sync_block  = static_cast<int *>(role_sync_alloc_.ptr);
         role_schedule_.sync_flags         = sync_block;                                 // [0..2*alloc_sync)
         role_schedule_.role_tile_counter  = sync_block + alloc_sync * 2;                // CL-aligned slot 0
         role_schedule_.elem_barrier_cnt   = sync_block + alloc_sync * 2 + CL_INTS;      // CL-aligned slot 1
@@ -8461,14 +8439,12 @@ void * UnifiedKernel::get_rows_stable_ptr(int get_rows_index, size_t bytes) {
     }
     // Free old buffer and untrack
     if (slot.ptr) {
-        device_free(slot.ptr, queue_, arena_get_rows_);
+        (void) unified_free(get_rows_alloc_);
+        get_rows_alloc_ = {};
     }
-    bool arena_tmp = false;
-    slot.ptr       = device_alloc_scratch(bytes, queue_, device_id_, arena_tmp);
-    if (arena_tmp) {
-        arena_get_rows_ = true;
-    }
-    slot.size = slot.ptr ? bytes : 0;
+    get_rows_alloc_ = device_alloc_scratch(bytes, queue_, device_id_);
+    slot.ptr        = get_rows_alloc_.ptr;
+    slot.size       = slot.ptr ? bytes : 0;
     return slot.ptr;
 }
 
@@ -8521,8 +8497,9 @@ void UnifiedKernel::build_scratch_pool() {
     // Phase 2: grow-on-demand allocation
     if (total_bytes > scratch_pool_size_ || !scratch_pool_) {
         free_scratch_pool();
-        scratch_pool_      = device_alloc_scratch(total_bytes, queue_, device_id_, arena_scratch_pool_);
-        scratch_pool_size_ = scratch_pool_ ? total_bytes : 0;
+        scratch_pool_alloc_ = device_alloc_scratch(total_bytes, queue_, device_id_);
+        scratch_pool_       = scratch_pool_alloc_.ptr;
+        scratch_pool_size_  = scratch_pool_ ? total_bytes : 0;
         // Re-initialize scratch_outputs_ after free_scratch_pool() cleared it
         scratch_outputs_.assign(n_ops, nullptr);
     }
@@ -8668,10 +8645,10 @@ void UnifiedKernel::execute_deferred_copies() {
 void UnifiedKernel::free_scratch_pool() {
     final_output_ggml_dst_ = nullptr;
     if (scratch_pool_) {
-        device_free(scratch_pool_, queue_, arena_scratch_pool_);
+        (void) unified_free(scratch_pool_alloc_);
+        scratch_pool_alloc_ = {};
         scratch_pool_       = nullptr;
         scratch_pool_size_  = 0;
-        arena_scratch_pool_ = false;
     }
     scratch_outputs_.clear();
 }
@@ -9776,11 +9753,12 @@ void UnifiedKernel::record_micro_graph() {
     const int n_counters_needed = n_phases + total_phase_ops + 16;
     if (n_counters_needed > micro_tile_counters_n_) {
         if (micro_tile_counters_) {
-            device_free(micro_tile_counters_, queue_, arena_micro_tile_counters_);
+            (void) unified_free(micro_tile_counters_alloc_);
+            micro_tile_counters_alloc_ = {};
         }
-        micro_tile_counters_ = static_cast<int *>(
-            device_alloc_scratch(n_counters_needed * sizeof(int), queue_, device_id_, arena_micro_tile_counters_));
-        micro_tile_counters_n_ = n_counters_needed;
+        micro_tile_counters_alloc_ = device_alloc_scratch(n_counters_needed * sizeof(int), queue_, device_id_);
+        micro_tile_counters_       = static_cast<int *>(micro_tile_counters_alloc_.ptr);
+        micro_tile_counters_n_     = n_counters_needed;
         // Zero counters once at allocation (generation starts at 0)
         queue_.memset(micro_tile_counters_, 0, n_counters_needed * sizeof(int)).wait();
     }
@@ -9790,8 +9768,11 @@ void UnifiedKernel::record_micro_graph() {
     // zeroing all tile counters before each graph replay, we increment the
     // generation and kernels compute their tile range as [gen*n_tiles, (gen+1)*n_tiles).
     if (!micro_generation_) {
-        micro_generation_  = static_cast<int *>(pinned_alloc(sizeof(int), queue_, pinned_pool_micro_gen_));
-        *micro_generation_ = -1;  // First ++generation yields 0, matching zeroed counters
+        micro_gen_alloc_   = pinned_alloc(sizeof(int), queue_, device_id_);
+        micro_generation_  = static_cast<int *>(micro_gen_alloc_.ptr);
+        if (micro_generation_) {
+            *micro_generation_ = -1;  // First ++generation yields 0, matching zeroed counters
+        }
     }
 
     // ── SLM size (same logic as launch_persistent_kernel) ──
@@ -9814,13 +9795,11 @@ void UnifiedKernel::record_micro_graph() {
         if (mmvq_q8_buf_size_ < q8_size) {
             for (int i = 0; i < 2; i++) {
                 if (mmvq_q8_bufs_[i]) {
-                    device_free(mmvq_q8_bufs_[i], queue_, arena_mmvq_q8_bufs_);
+                    (void) unified_free(mmvq_q8_buf_allocs_[i]);
+                    mmvq_q8_buf_allocs_[i] = {};
                 }
-                bool arena_tmp   = false;
-                mmvq_q8_bufs_[i] = device_alloc_scratch(q8_size, queue_, device_id_, arena_tmp);
-                if (arena_tmp) {
-                    arena_mmvq_q8_bufs_ = true;
-                }
+                mmvq_q8_buf_allocs_[i] = device_alloc_scratch(q8_size, queue_, device_id_);
+                mmvq_q8_bufs_[i]       = mmvq_q8_buf_allocs_[i].ptr;
             }
             mmvq_q8_buf_size_ = q8_size;
         }
@@ -9828,16 +9807,18 @@ void UnifiedKernel::record_micro_graph() {
         const size_t gate_scratch_sz = intermediate_dim * sizeof(float);
         if (mmvq_gate_scratch_sz_ < gate_scratch_sz) {
             if (mmvq_gate_scratch_) {
-                device_free(mmvq_gate_scratch_, queue_, arena_mmvq_gate_scratch_);
+                (void) unified_free(mmvq_gate_scratch_alloc_);
+                mmvq_gate_scratch_alloc_ = {};
             }
             if (mmvq_up_scratch_) {
-                device_free(mmvq_up_scratch_, queue_, arena_mmvq_up_scratch_);
+                (void) unified_free(mmvq_up_scratch_alloc_);
+                mmvq_up_scratch_alloc_ = {};
             }
-            mmvq_gate_scratch_ = static_cast<float *>(
-                device_alloc_scratch(gate_scratch_sz, queue_, device_id_, arena_mmvq_gate_scratch_));
-            mmvq_up_scratch_ =
-                static_cast<float *>(device_alloc_scratch(gate_scratch_sz, queue_, device_id_, arena_mmvq_up_scratch_));
-            mmvq_gate_scratch_sz_ = gate_scratch_sz;
+            mmvq_gate_scratch_alloc_ = device_alloc_scratch(gate_scratch_sz, queue_, device_id_);
+            mmvq_up_scratch_alloc_   = device_alloc_scratch(gate_scratch_sz, queue_, device_id_);
+            mmvq_gate_scratch_       = static_cast<float *>(mmvq_gate_scratch_alloc_.ptr);
+            mmvq_up_scratch_         = static_cast<float *>(mmvq_up_scratch_alloc_.ptr);
+            mmvq_gate_scratch_sz_    = gate_scratch_sz;
         }
     }
 
@@ -10474,11 +10455,13 @@ void UnifiedKernel::execute_persistent_phased(phase_callback_t on_matmul_complet
         // Copy phase operations to host-pinned pool (kernel reads via PCIe zero-copy)
         if (phase.count > d_ops_pool_size_) {
             if (d_ops_pool_) {
-                pinned_free(d_ops_pool_, pinned_ops_pool_bytes_, queue_, pinned_pool_ops_);
+                (void) unified_free(ops_pool_alloc_);
+                ops_pool_alloc_ = {};
             }
-            pinned_ops_pool_bytes_ = phase.count * sizeof(DeviceOperation);
-            d_ops_pool_            = pinned_alloc(pinned_ops_pool_bytes_, queue_, pinned_pool_ops_);
-            d_ops_pool_size_       = d_ops_pool_ ? phase.count : 0;
+            const size_t ops_pool_bytes = phase.count * sizeof(DeviceOperation);
+            ops_pool_alloc_ = pinned_alloc(ops_pool_bytes, queue_, device_id_);
+            d_ops_pool_     = ops_pool_alloc_.ptr;
+            d_ops_pool_size_ = d_ops_pool_ ? phase.count : 0;
         }
         DeviceOperation * d_ops = static_cast<DeviceOperation *>(d_ops_pool_);
         std::memcpy(d_ops, &host_ops[phase.start], phase.count * sizeof(DeviceOperation));
@@ -11183,26 +11166,26 @@ void UnifiedKernel::launch_persistent_kernel(bool build_only) {
         const int final_n_ops    = phase_schedule_.total_ops;
         if (final_n_ops > phase_pool_n_ops_ || final_n_phases > phase_pool_n_phases_) {
             // Grow host-pinned arrays (rare: only if fusion increased beyond initial allocation)
-            pinned_free(phase_schedule_.entries, pinned_phase_entries_bytes_, queue_, pinned_pool_phase_);
-            pinned_free(phase_schedule_.phase_offset, pinned_phase_offset_bytes_, queue_, pinned_pool_phase_);
-            pinned_free(phase_schedule_.phase_tiles, pinned_phase_tiles_bytes_, queue_, pinned_pool_phase_);
+            (void) unified_free(phase_entries_alloc_);  phase_entries_alloc_ = {};
+            (void) unified_free(phase_offset_alloc_);   phase_offset_alloc_  = {};
+            (void) unified_free(phase_tiles_alloc_);    phase_tiles_alloc_   = {};
             if (phase_schedule_.phase_type) {
-                pinned_free(phase_schedule_.phase_type, pinned_phase_type_bytes_, queue_, pinned_pool_phase_);
+                (void) unified_free(phase_type_alloc_); phase_type_alloc_ = {};
             }
-            const int alloc_ops         = final_n_ops + 64;
-            const int alloc_phases      = final_n_phases + 16;
-            pinned_phase_entries_bytes_ = alloc_ops * sizeof(DevicePhaseEntry);
-            pinned_phase_offset_bytes_  = (alloc_phases + 1) * sizeof(int);
-            pinned_phase_tiles_bytes_   = alloc_phases * sizeof(int);
-            pinned_phase_type_bytes_    = alloc_phases * sizeof(int);
-            phase_schedule_.entries =
-                static_cast<DevicePhaseEntry *>(pinned_alloc(pinned_phase_entries_bytes_, queue_, pinned_pool_phase_));
-            phase_schedule_.phase_offset =
-                static_cast<int *>(pinned_alloc(pinned_phase_offset_bytes_, queue_, pinned_pool_phase_));
-            phase_schedule_.phase_tiles =
-                static_cast<int *>(pinned_alloc(pinned_phase_tiles_bytes_, queue_, pinned_pool_phase_));
-            phase_schedule_.phase_type =
-                static_cast<int *>(pinned_alloc(pinned_phase_type_bytes_, queue_, pinned_pool_phase_));
+            const int    alloc_ops           = final_n_ops + 64;
+            const int    alloc_phases        = final_n_phases + 16;
+            const size_t phase_entries_bytes = alloc_ops * sizeof(DevicePhaseEntry);
+            const size_t phase_offset_bytes  = (alloc_phases + 1) * sizeof(int);
+            const size_t phase_tiles_bytes   = alloc_phases * sizeof(int);
+            const size_t phase_type_bytes    = alloc_phases * sizeof(int);
+            phase_entries_alloc_ = pinned_alloc(phase_entries_bytes, queue_, device_id_);
+            phase_offset_alloc_  = pinned_alloc(phase_offset_bytes, queue_, device_id_);
+            phase_tiles_alloc_   = pinned_alloc(phase_tiles_bytes, queue_, device_id_);
+            phase_type_alloc_    = pinned_alloc(phase_type_bytes, queue_, device_id_);
+            phase_schedule_.entries      = static_cast<DevicePhaseEntry *>(phase_entries_alloc_.ptr);
+            phase_schedule_.phase_offset = static_cast<int *>(phase_offset_alloc_.ptr);
+            phase_schedule_.phase_tiles  = static_cast<int *>(phase_tiles_alloc_.ptr);
+            phase_schedule_.phase_type   = static_cast<int *>(phase_type_alloc_.ptr);
             phase_pool_n_ops_    = alloc_ops;
             phase_pool_n_phases_ = alloc_phases;
         }
@@ -11223,11 +11206,13 @@ void UnifiedKernel::launch_persistent_kernel(bool build_only) {
     const int n_ops_device = static_cast<int>(host_ops_.size());
     if (n_ops_device > d_ops_pool_size_) {
         if (d_ops_pool_) {
-            pinned_free(d_ops_pool_, pinned_ops_pool_bytes_, queue_, pinned_pool_ops_);
+            (void) unified_free(ops_pool_alloc_);
+            ops_pool_alloc_ = {};
         }
-        pinned_ops_pool_bytes_ = n_ops_device * sizeof(DeviceOperation);
-        d_ops_pool_            = pinned_alloc(pinned_ops_pool_bytes_, queue_, pinned_pool_ops_);
-        d_ops_pool_size_       = d_ops_pool_ ? n_ops_device : 0;
+        const size_t ops_pool_bytes = n_ops_device * sizeof(DeviceOperation);
+        ops_pool_alloc_ = pinned_alloc(ops_pool_bytes, queue_, device_id_);
+        d_ops_pool_     = ops_pool_alloc_.ptr;
+        d_ops_pool_size_ = d_ops_pool_ ? n_ops_device : 0;
     }
     DeviceOperation * d_ops = static_cast<DeviceOperation *>(d_ops_pool_);
     std::memcpy(d_ops, host_ops_.data(), host_ops_.size() * sizeof(DeviceOperation));
@@ -11442,11 +11427,12 @@ void UnifiedKernel::launch_persistent_kernel(bool build_only) {
                 runtime_tracked_bytes_ -= light_flags_size_ * sizeof(int);
             }
             if (light_flags_) {
-                device_free(light_flags_, queue_, arena_light_flags_);
+                (void) unified_free(light_flags_alloc_);
+                light_flags_alloc_ = {};
             }
             const int alloc_size = n_final_phases + 16;
-            light_flags_         = static_cast<int *>(
-                device_alloc_persistent(alloc_size * sizeof(int), queue_, device_id_, arena_light_flags_));
+            light_flags_alloc_   = device_alloc_persistent(alloc_size * sizeof(int), queue_, device_id_);
+            light_flags_         = static_cast<int *>(light_flags_alloc_.ptr);
             light_flags_size_ = alloc_size;
             // Track new allocation
             if (device_id_ >= 0) {
@@ -11594,10 +11580,9 @@ void UnifiedKernel::launch_persistent_kernel(bool build_only) {
                 continue;
             }
 
-            bool              profile_from_pool   = false;
-            size_t            profile_alloc_bytes = ops_by_type[idx].size() * sizeof(DeviceOperation);
-            DeviceOperation * d_ops_subset =
-                static_cast<DeviceOperation *>(pinned_alloc(profile_alloc_bytes, queue_, profile_from_pool));
+            const size_t      profile_alloc_bytes = ops_by_type[idx].size() * sizeof(DeviceOperation);
+            alloc_handle      profile_alloc       = pinned_alloc(profile_alloc_bytes, queue_, device_id_);
+            DeviceOperation * d_ops_subset        = static_cast<DeviceOperation *>(profile_alloc.ptr);
             if (!d_ops_subset) {
                 GGML_LOG_WARN("[PERSISTENT-TG] execute profile: alloc failed for op=%s\n",
                               persistent_op_type_name(static_cast<OperationType>(idx)));
@@ -11616,7 +11601,7 @@ void UnifiedKernel::launch_persistent_kernel(bool build_only) {
                 persistent_op_type_name(static_cast<OperationType>(idx)), ops_by_type[idx].size(), tiles_by_type[idx],
                 avg_ms, total_ms);
 
-            pinned_free(d_ops_subset, profile_alloc_bytes, queue_, profile_from_pool);
+            (void) unified_free(profile_alloc);
         }
     }
 
@@ -11797,11 +11782,13 @@ void UnifiedKernel::launch_persistent_kernel_async() {
     const int n_ops_device = static_cast<int>(host_ops.size());
     if (n_ops_device > d_ops_pool_size_) {
         if (d_ops_pool_) {
-            pinned_free(d_ops_pool_, pinned_ops_pool_bytes_, queue_, pinned_pool_ops_);
+            (void) unified_free(ops_pool_alloc_);
+            ops_pool_alloc_ = {};
         }
-        pinned_ops_pool_bytes_ = n_ops_device * sizeof(DeviceOperation);
-        d_ops_pool_            = pinned_alloc(pinned_ops_pool_bytes_, queue_, pinned_pool_ops_);
-        d_ops_pool_size_       = d_ops_pool_ ? n_ops_device : 0;
+        const size_t ops_pool_bytes = n_ops_device * sizeof(DeviceOperation);
+        ops_pool_alloc_ = pinned_alloc(ops_pool_bytes, queue_, device_id_);
+        d_ops_pool_     = ops_pool_alloc_.ptr;
+        d_ops_pool_size_ = d_ops_pool_ ? n_ops_device : 0;
     }
     DeviceOperation * d_ops = static_cast<DeviceOperation *>(d_ops_pool_);
     std::memcpy(d_ops, host_ops.data(), host_ops.size() * sizeof(DeviceOperation));

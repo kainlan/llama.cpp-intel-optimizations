@@ -65,7 +65,8 @@ struct runtime_alloc_record {
     sycl::queue * queue            = nullptr;
     bool          uses_pinned_pool = false;
     bool          zone_managed     = false;
-    bool          from_arena       = false;  // True if sub-allocated from arena (KV zone)
+    bool          from_arena       = false;  // True if sub-allocated from arena (KV/RUNTIME/etc zone)
+    vram_zone_id  vram_zone        = vram_zone_id::COUNT;  // Non-COUNT: zone_free on unified_free
     std::string   cohort_id;
 };
 
@@ -6464,9 +6465,23 @@ static bool unified_free_record(const runtime_alloc_record & rec) {
         if (rec.handle.tier == alloc_tier::MMAP_TRACKED) {
             return true;
         }
-        // Arena sub-allocations (KV zone) are freed when the arena is destroyed,
-        // not individually.  Just remove the tracking record.
+        // Zone-managed allocations: route through handle.zone_managed fields.
+        // VRAM TLSF zones (zone_managed=true, vram_zone!=COUNT): call zone_free() for O(1) reclaim.
+        // Host bump zones (zone_managed=true, host_zone!=COUNT): no-op — freed by host_zone_reset().
+        // Bump-arena device allocations (from_arena=true, vram_zone==COUNT): freed by arena_reset().
+        if (rec.handle.zone_managed) {
+            if (rec.handle.vram_zone != vram_zone_id::COUNT) {
+                auto * cache = get_unified_cache_for_device(rec.handle.device);
+                if (cache && cache->arena_active()) {
+                    cache->zone_free(rec.handle.vram_zone, rec.handle.ptr);
+                }
+            }
+            // host_zone != COUNT: host zone bump alloc — freed by host_zone_reset(), no-op here.
+            return true;
+        }
         if (rec.from_arena) {
+            // Legacy: bump-arena allocation without zone routing.
+            // Freed by arena_reset() — no individual free needed.
             return true;
         }
 
@@ -6669,15 +6684,35 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 }
             }
         }
+        // prefer_vram_zone: explicit zone routing for RUNTIME/SCRATCH/ONEDNN/KV zones.
+        // Caller sets alloc_constraints::prefer_vram_zone to request a specific TLSF zone.
+        // unified_free() calls cache->zone_free(vram_zone, ptr) for TLSF reclaim.
+        if (req.intent.constraints.prefer_vram_zone != vram_zone_id::COUNT && vram_arena_enabled()) {
+            auto * cache = get_unified_cache_for_device(req.device);
+            if (cache && cache->arena_active()) {
+                const vram_zone_id zid = req.intent.constraints.prefer_vram_zone;
+                ptr                    = cache->zone_alloc(zid, alloc_size);
+                if (ptr) {
+                    from_arena         = true;
+                    out->zone_managed  = true;
+                    out->vram_zone     = zid;
+                    GGML_SYCL_DEBUG("[UNIFIED-ALLOC] zone alloc: dev=%d zone=%d size=%.1f MB ptr=%p\n", req.device,
+                                    static_cast<int>(zid), alloc_size / (1024.0 * 1024.0), ptr);
+                }
+                // If zone is full, fall through to raw device malloc below.
+            }
+        }
         // P5: Route KV allocations through the arena's KV zone when active.
         // This co-locates KV cache with weights in the same pre-allocated VRAM block,
         // eliminating separate sycl::malloc_device calls during context creation.
-        if (req.intent.role == alloc_role::KV && vram_arena_enabled()) {
+        if (!ptr && req.intent.role == alloc_role::KV && vram_arena_enabled()) {
             auto * cache = get_unified_cache_for_device(req.device);
             if (cache && cache->arena_active()) {
                 ptr = cache->zone_alloc(vram_zone_id::KV, alloc_size);
                 if (ptr) {
-                    from_arena = true;
+                    from_arena        = true;
+                    out->zone_managed = true;
+                    out->vram_zone    = vram_zone_id::KV;
                     GGML_SYCL_DEBUG("[UNIFIED-ALLOC] KV arena alloc: dev=%d size=%.1f MB ptr=%p\n", req.device,
                                     alloc_size / (1024.0 * 1024.0), ptr);
                 } else {
@@ -6729,6 +6764,16 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                     out->all_segments = std::move(segs.segments);
                 }
                 zone_managed = (ptr != nullptr);
+                if (zone_managed) {
+                    out->zone_managed = true;
+                    host_zone_id hz = host_zone_id::STAGING;
+                    if (kv_spill_to_host || req.intent.role == alloc_role::KV) {
+                        hz = host_zone_id::KV;
+                    } else if (req.intent.role == alloc_role::WEIGHT) {
+                        hz = host_zone_id::WEIGHT;
+                    }
+                    out->host_zone = hz;
+                }
             } else {
                 // Fallback: direct runtime allocation (may fail for large requests)
                 ptr = hcache->allocate_pinned_runtime(alloc_size, pinned_chunk_pool::DEFAULT_ALIGNMENT);
@@ -6772,11 +6817,15 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     rec.handle.role      = req.intent.role;
     rec.handle.category  = cat;
     rec.handle.alloc_id  = g_runtime_alloc_id.fetch_add(1, std::memory_order_relaxed);
+    rec.handle.vram_zone    = out->vram_zone;   // Propagate zone routing set by zone_alloc paths above
+    rec.handle.zone_managed = out->zone_managed;
+    rec.handle.host_zone    = out->host_zone;
     // all_segments is already populated by the segmented allocation path above
     rec.queue            = req.queue;
     rec.uses_pinned_pool = uses_pinned_pool;
     rec.zone_managed     = zone_managed;
     rec.from_arena       = from_arena;
+    rec.vram_zone        = out->vram_zone;
     if (req.intent.cohort_id && req.intent.cohort_id[0] != '\0') {
         rec.cohort_id = req.intent.cohort_id;
     }
@@ -6982,6 +7031,31 @@ void offload_buffer_pool_trim(int device) {
     for (const alloc_handle & h : free_list) {
         (void) unified_free(h);
     }
+}
+
+mem_handle unified_allocate(const alloc_request & req) {
+    alloc_handle handle;
+    if (!unified_alloc(req, &handle) || !handle.ptr) {
+        return mem_handle{};
+    }
+    bool on_device = (handle.tier == alloc_tier::DEVICE_VRAM);
+    return mem_handle::from_direct(handle.ptr, GGML_LAYOUT_AOS, on_device);
+}
+
+mem_handle scoped_unified_alloc::as_mem_handle() const {
+    if (!handle_.ptr) {
+        return mem_handle{};
+    }
+    bool on_device = (handle_.tier == alloc_tier::DEVICE_VRAM);
+    return mem_handle::from_direct(handle_.ptr, GGML_LAYOUT_AOS, on_device);
+}
+
+mem_handle alloc_handle::as_mem_handle() const {
+    if (!ptr) {
+        return mem_handle{};
+    }
+    bool on_device = (tier == alloc_tier::DEVICE_VRAM);
+    return mem_handle::from_direct(ptr, GGML_LAYOUT_AOS, on_device);
 }
 
 bool unified_lookup(void * ptr, alloc_handle * out) {
@@ -10958,6 +11032,29 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                   plan.vram_budget / (1024.0 * 1024.0));
 
     return plan;
+}
+
+void unified_cache::memset(const mem_handle & h, int value, size_t size, sycl::queue & stream) {
+    auto r = h.resolve();
+    GGML_ASSERT(r && "memset on unresolved handle");
+    if (r.on_device) {
+        stream.memset(r.ptr, value, size);
+    } else {
+        std::memset(r.ptr, value, size);
+    }
+}
+
+void unified_cache::memcpy(const mem_handle & dst, const mem_handle & src,
+                           size_t size, sycl::queue & stream) {
+    auto d = dst.resolve();
+    auto s = src.resolve();
+    GGML_ASSERT(d && s && "memcpy on unresolved handle");
+
+    if (d.on_device || s.on_device) {
+        stream.memcpy(d.ptr, s.ptr, size);  // SYCL handles D2D / H2D / D2H transparently
+    } else {
+        std::memcpy(d.ptr, s.ptr, size);    // H2H: avoid queue submission overhead
+    }
 }
 
 }  // namespace ggml_sycl
