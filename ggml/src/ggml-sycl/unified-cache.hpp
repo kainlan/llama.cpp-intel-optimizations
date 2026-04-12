@@ -766,6 +766,10 @@ struct host_cache_entry {
     cache_layout_xmx_info xmx_info     = {};
 };
 
+// Forward declarations needed for friend function signatures inside host_cache/unified_cache.
+struct alloc_request;
+struct alloc_handle;
+
 // Host cache for canonical layouts (pinned-first, mmap alias fallback)
 class host_cache {
   public:
@@ -775,11 +779,8 @@ class host_cache {
     void * allocate_pinned_runtime(size_t size, size_t alignment = 64);
     [[deprecated("use host_zone_reset() or zone-managed lifetime instead")]] void free_pinned_runtime(void * ptr,
                                                                                                       size_t size);
-    // Allocate from a specific host zone. Returns a segmented_buffer.
-    segmented_buffer host_zone_alloc_segmented(host_zone_id zone, size_t size, size_t alignment = 64);
-    // Legacy wrapper: returns first segment's pointer. For large allocations, use host_zone_alloc_segmented().
-    [[deprecated("use host_zone_alloc_segmented() for large allocations")]] void *
-           host_zone_alloc(host_zone_id zone, size_t size, size_t alignment = 64);
+    // (host_zone_alloc / host_zone_alloc_segmented are private — use
+    //  unified_cache_host_zone_alloc free function)
     void   host_zone_reset(host_zone_id zone);
     size_t host_zone_used(host_zone_id zone) const;
     size_t host_zone_capacity(host_zone_id zone) const;
@@ -898,6 +899,16 @@ class host_cache {
     void update_reserved_bytes(size_t reserved_bytes);
 
   private:
+    // Allocate from a specific host zone. Returns a segmented_buffer.
+    segmented_buffer host_zone_alloc_segmented(host_zone_id zone, size_t size, size_t alignment = 64);
+    // Legacy wrapper: returns first segment's pointer. For large allocations, use host_zone_alloc_segmented().
+    void * host_zone_alloc(host_zone_id zone, size_t size, size_t alignment = 64);
+
+    // Friends: unified_cache member functions and internal alloc routines need host zone access.
+    friend class unified_cache;
+    friend bool         unified_alloc(const alloc_request & req_in, alloc_handle * out);
+    friend void *       unified_cache_host_zone_alloc(host_zone_id zone, size_t size, size_t alignment);
+
     size_t evict_one();
     float  compute_score(const host_cache_entry & entry) const;
     void   free_entry(host_cache_entry & entry);
@@ -1522,16 +1533,8 @@ class unified_cache {
     // Total arena size.
     size_t arena_total_size() const { return arena_size_; }
 
-    // Sub-allocate from a zone.
-    void * zone_alloc(vram_zone_id zone, size_t size, size_t align = 256);
-
-    // Free a sub-allocation from a zone (TLSF O(1) free with coalescing).
-    // ptr must have been returned by zone_alloc. No size parameter —
-    // TLSF recovers block size from the inline block_header.
-    void zone_free(vram_zone_id zone, void * ptr);
-
-    // Reset a zone (returns all memory to the pool as a single free block).
-    void zone_reset(vram_zone_id zone);
+    // (zone_alloc / zone_free / zone_reset are private — use
+    //  unified_cache_zone_alloc / unified_cache_zone_reset free functions)
 
     // Check if a pointer belongs to the VRAM arena.
     bool vram_owns(const void * ptr) const;
@@ -1825,6 +1828,27 @@ class unified_cache {
     size_t available_budget() const { return available(); }
 
   private:
+    // Sub-allocate from a zone.
+    void * zone_alloc(vram_zone_id zone, size_t size, size_t align = 256);
+
+    // Free a sub-allocation from a zone (TLSF O(1) free with coalescing).
+    // ptr must have been returned by zone_alloc. No size parameter —
+    // TLSF recovers block size from the inline block_header.
+    void zone_free(vram_zone_id zone, void * ptr);
+
+    // Reset a zone (returns all memory to the pool as a single free block).
+    void zone_reset(vram_zone_id zone);
+
+    // Friends: internal implementation functions that need zone access.
+    // Consumer code must use unified_cache_zone_alloc / unified_allocate instead.
+    friend bool         unified_alloc(const alloc_request & req_in, alloc_handle * out);
+    friend void *       unified_cache_arena_alloc_weight(int device_id, size_t size);
+    friend void *       unified_cache_kv_arena_alloc(int device_id, size_t size);
+    friend void *       unified_cache_zone_alloc(int device_id, vram_zone_id zone, size_t size, size_t align);
+    friend void         unified_cache_zone_free(int device_id, vram_zone_id zone, void * ptr);
+    friend void         unified_cache_zone_reset(int device_id, vram_zone_id zone);
+    friend void *       device_pool_arena_alloc(unified_cache * cache, size_t size, size_t align);
+
     // Evict lowest-scoring entry to make room for new_size bytes
     // Returns true if eviction succeeded, false if all entries are pinned
     size_t evict_one(size_t new_size);
@@ -2819,8 +2843,18 @@ void   unified_cache_reset_scratch_pool(int device_id);
 // Called after the ggml scheduler is created and compute buffer sizes are known.
 void unified_cache_grow_host_scratch_zone(size_t additional_bytes);
 
-void * unified_cache_host_zone_alloc(host_zone_id zone, size_t size);
+void * unified_cache_host_zone_alloc(host_zone_id zone, size_t size, size_t alignment = 64);
 void   unified_cache_host_zone_reset(host_zone_id zone);
+
+// Sub-allocate from a VRAM zone (ONEDNN, RUNTIME, KV scratchpads).
+// Returns nullptr if the zone is full or the arena is inactive.
+void * unified_cache_zone_alloc(int device_id, vram_zone_id zone, size_t size, size_t align = 256);
+
+// Free a sub-allocation from a VRAM zone (TLSF reclaim).
+void   unified_cache_zone_free(int device_id, vram_zone_id zone, void * ptr);
+
+// Reset a VRAM zone (TLSF coalescing reset — all sub-allocations become free).
+void   unified_cache_zone_reset(int device_id, vram_zone_id zone);
 size_t unified_cache_host_zone_used(host_zone_id zone);
 size_t unified_cache_host_zone_capacity(host_zone_id zone);
 
@@ -2917,6 +2951,14 @@ direct_stage_result unified_cache_direct_stage_expert(int                  devic
 const weight_entry * unified_cache_lookup_weight(int device_id, ggml_sycl_cache_id key);
 
 const weight_entry * unified_cache_lookup_expert(int device_id, ggml_sycl_cache_id key);
+
+// === Raw allocation primitives (unified-cache.cpp owns all sycl::malloc_* calls) ===
+// These are the ONLY functions allowed to call sycl::malloc_device/host/shared.
+// All other code must route through these or the higher-level unified_alloc/unified_cache_allocate.
+void * unified_cache_raw_malloc_device(size_t size, const sycl::queue & queue);
+void * unified_cache_raw_malloc_host(size_t size, const sycl::queue & queue);
+void * unified_cache_raw_malloc_host(size_t size, const sycl::context & ctx);
+void * unified_cache_raw_malloc_shared(size_t size, const sycl::queue & queue);
 
 // === Shutdown API ===
 

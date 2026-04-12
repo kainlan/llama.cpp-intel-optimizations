@@ -6471,10 +6471,7 @@ static bool unified_free_record(const runtime_alloc_record & rec) {
         // Bump-arena device allocations (from_arena=true, vram_zone==COUNT): freed by arena_reset().
         if (rec.handle.zone_managed) {
             if (rec.handle.vram_zone != vram_zone_id::COUNT) {
-                auto * cache = get_unified_cache_for_device(rec.handle.device);
-                if (cache && cache->arena_active()) {
-                    cache->zone_free(rec.handle.vram_zone, rec.handle.ptr);
-                }
+                unified_cache_zone_free(rec.handle.device, rec.handle.vram_zone, rec.handle.ptr);
             }
             // host_zone != COUNT: host zone bump alloc — freed by host_zone_reset(), no-op here.
             return true;
@@ -8697,6 +8694,50 @@ const weight_entry * unified_cache_lookup_expert(int device_id, ggml_sycl_cache_
     return cache->lookup_expert(key);
 }
 
+// === Raw allocation primitives — only place in the codebase that calls sycl::malloc_* ===
+// All consumer code must route through these functions (or higher-level cache APIs).
+// unified-cache.cpp and pinned-pool.cpp are the sole owners of sycl::malloc_* calls.
+
+void * unified_cache_raw_malloc_device(size_t size, const sycl::queue & queue) {
+    void * ptr = nullptr;
+    try {
+        ptr = sycl::malloc_device(size, queue);
+    } catch (...) {
+        return nullptr;
+    }
+    return ptr;
+}
+
+void * unified_cache_raw_malloc_host(size_t size, const sycl::queue & queue) {
+    void * ptr = nullptr;
+    try {
+        ptr = sycl::malloc_host(size, queue);
+    } catch (...) {
+        return nullptr;
+    }
+    return ptr;
+}
+
+void * unified_cache_raw_malloc_host(size_t size, const sycl::context & ctx) {
+    void * ptr = nullptr;
+    try {
+        ptr = sycl::malloc_host(size, ctx);
+    } catch (...) {
+        return nullptr;
+    }
+    return ptr;
+}
+
+void * unified_cache_raw_malloc_shared(size_t size, const sycl::queue & queue) {
+    void * ptr = nullptr;
+    try {
+        ptr = sycl::malloc_shared(size, queue);
+    } catch (...) {
+        return nullptr;
+    }
+    return ptr;
+}
+
 void shutdown_unified_cache() {
     // Set shutdown flag FIRST so destructors skip sycl::free() calls
     g_sycl_shutting_down.store(true);
@@ -9386,12 +9427,34 @@ void unified_cache_grow_host_scratch_zone(size_t additional_bytes) {
     }
 }
 
-void * unified_cache_host_zone_alloc(host_zone_id zone, size_t size) {
+void * unified_cache_host_zone_alloc(host_zone_id zone, size_t size, size_t alignment) {
     auto * hcache = try_get_host_cache();
     if (!hcache) {
         return nullptr;
     }
-    return hcache->host_zone_alloc(zone, size, pinned_chunk_pool::DEFAULT_ALIGNMENT);
+    return hcache->host_zone_alloc(zone, size, alignment);
+}
+
+void * unified_cache_zone_alloc(int device_id, vram_zone_id zone, size_t size, size_t align) {
+    auto * cache = get_unified_cache_for_device(device_id);
+    if (!cache) {
+        return nullptr;
+    }
+    return cache->zone_alloc(zone, size, align);
+}
+
+void unified_cache_zone_reset(int device_id, vram_zone_id zone) {
+    auto * cache = get_unified_cache_for_device(device_id);
+    if (cache) {
+        cache->zone_reset(zone);
+    }
+}
+
+void unified_cache_zone_free(int device_id, vram_zone_id zone, void * ptr) {
+    auto * cache = get_unified_cache_for_device(device_id);
+    if (cache) {
+        cache->zone_free(zone, ptr);
+    }
 }
 
 void unified_cache_host_zone_reset(host_zone_id zone) {

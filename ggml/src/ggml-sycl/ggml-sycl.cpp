@@ -6700,17 +6700,15 @@ struct cpu_dispatch_result {
 // =============================================================================
 // Arena-Routed Allocation Helpers (local to ggml-sycl.cpp)
 // =============================================================================
-// Mirror of the helpers in unified-kernel.cpp, but keep ownership under
-// unified_cache so helper code never owns raw SYCL allocation lifetimes.
-static std::mutex                                          g_arena_pinned_alloc_mutex;
-static std::unordered_map<void *, ggml_sycl::alloc_handle> g_arena_pinned_allocs;
+// All helpers return alloc_handle. Callers call unified_free(handle) instead of
+// tracking from_pool/from_arena booleans.
 
-static void * arena_pinned_alloc(size_t bytes, sycl::queue & queue, bool & from_pool) {
-    from_pool = false;
+// Host-pinned allocation for fused MoE output buffers.
+// Returns alloc_handle — call unified_free(handle) to release.
+static ggml_sycl::alloc_handle arena_pinned_alloc(size_t bytes, sycl::queue & queue) {
     if (bytes == 0) {
-        return nullptr;
+        return {};
     }
-
     ggml_sycl::alloc_request req{};
     req.queue                               = &queue;
     req.device                              = ggml_sycl_get_device_id_from_queue(queue);
@@ -6721,35 +6719,10 @@ static void * arena_pinned_alloc(size_t bytes, sycl::queue & queue, bool & from_
     req.intent.constraints.use_pinned_pool  = false;
     ggml_sycl::alloc_handle handle{};
     if (!ggml_sycl::unified_alloc(req, &handle) || !handle.ptr) {
-        return nullptr;
+        GGML_LOG_WARN("[arena_pinned_alloc] pinned allocation failed for %zu bytes\n", bytes);
+        return {};
     }
-    {
-        std::lock_guard<std::mutex> lock(g_arena_pinned_alloc_mutex);
-        g_arena_pinned_allocs[handle.ptr] = handle;
-    }
-    from_pool = true;
-    return handle.ptr;
-}
-
-static void arena_pinned_free(void * ptr, size_t bytes, sycl::queue & queue, bool from_pool) {
-    GGML_UNUSED(bytes);
-    GGML_UNUSED(queue);
-    GGML_UNUSED(from_pool);
-    if (!ptr) {
-        return;
-    }
-    ggml_sycl::alloc_handle handle{};
-    {
-        std::lock_guard<std::mutex> lock(g_arena_pinned_alloc_mutex);
-        auto                        it = g_arena_pinned_allocs.find(ptr);
-        if (it != g_arena_pinned_allocs.end()) {
-            handle = it->second;
-            g_arena_pinned_allocs.erase(it);
-        }
-    }
-    if (handle.ptr) {
-        (void) ggml_sycl::unified_free(handle);
-    }
+    return handle;
 }
 
 // Device allocation through VRAM arena compute zone when available.
@@ -6816,11 +6789,10 @@ struct moe_fusion_state {
     int             layer_id = -1;             // Layer number for matching
 
     // Fused output buffer
-    float *       fused_output    = nullptr;  // Pinned buffer: SiLU(gate*act) * (up*act)
-    sycl::queue * fused_q         = nullptr;  // Queue that owns fused_output
-    size_t        fused_cap       = 0;        // Capacity of fused_output in floats
-    size_t        fused_bytes     = 0;        // Allocation size in bytes (for pinned pool free)
-    bool          fused_from_pool = false;    // True if allocated from pinned pool
+    float *                 fused_output = nullptr;  // Pinned buffer: SiLU(gate*act) * (up*act)
+    size_t                  fused_cap    = 0;        // Capacity of fused_output in floats
+    // Use fused_alloc.as_mem_handle() for read/resolve; unified_free(fused_alloc) for ownership
+    ggml_sycl::alloc_handle fused_alloc{};
 
     // Expert routing — resolved ONCE on first arrival, reused for up and down
     std::vector<size_t> cpu_indices;  // CPU-dispatched expert indices
@@ -6853,8 +6825,8 @@ struct moe_fusion_state {
     }
 
     ~moe_fusion_state() {
-        if (fused_output && fused_q) {
-            arena_pinned_free(fused_output, fused_bytes, *fused_q, fused_from_pool);
+        if (fused_alloc.ptr) {
+            (void) ggml_sycl::unified_free(fused_alloc);
         }
     }
 
@@ -6862,13 +6834,15 @@ struct moe_fusion_state {
         if (n <= fused_cap) {
             return;
         }
-        if (fused_output) {
-            arena_pinned_free(fused_output, fused_bytes, q, fused_from_pool);
+        if (fused_alloc.ptr) {
+            (void) ggml_sycl::unified_free(fused_alloc);
+            fused_output = nullptr;
+            fused_alloc  = {};
         }
-        fused_bytes  = n * sizeof(float);
-        fused_output = static_cast<float *>(arena_pinned_alloc(fused_bytes, q, fused_from_pool));
-        fused_cap    = n;
-        fused_q      = &q;
+        const size_t bytes = n * sizeof(float);
+        fused_alloc        = arena_pinned_alloc(bytes, q);
+        fused_output       = static_cast<float *>(fused_alloc.ptr);
+        fused_cap          = fused_alloc.ptr ? n : 0;
     }
 
     // Convenience: check if fused output is ready (used by GLU/ADD_ID skip guards)
@@ -11337,7 +11311,7 @@ static bool ggml_sycl_preload_moe_experts(const ggml_tensor * src0, int device, 
             !cache->get_placement_plan().expert_on_device(tname, static_cast<int>(e), device)) {
             auto * hcache = ggml_sycl::try_get_host_cache();
             void * host_ptr =
-                hcache ? hcache->host_zone_alloc(ggml_sycl::host_zone_id::WEIGHT, expert_size, 256) : nullptr;
+                hcache ? ggml_sycl::unified_cache_host_zone_alloc(ggml_sycl::host_zone_id::WEIGHT, expert_size, 256) : nullptr;
             if (!host_ptr) {
                 failed++;
                 GGML_LOG_WARN("[MODEL-PRELOAD] Failed host-zone alloc for %s[%lld] (%zu bytes)\n", tname.c_str(),
@@ -11637,8 +11611,8 @@ static void ggml_sycl_preload_model_weights() {
                                 if (expert_aos) {
                                     auto * hcache_ptr = ggml_sycl::try_get_host_cache();
                                     void * arena_ptr  = hcache_ptr ?
-                                                            hcache_ptr->host_zone_alloc(ggml_sycl::host_zone_id::WEIGHT,
-                                                                                        expert_size, 256) :
+                                                            ggml_sycl::unified_cache_host_zone_alloc(ggml_sycl::host_zone_id::WEIGHT,
+                                                                                                     expert_size, 256) :
                                                             nullptr;
                                     if (arena_ptr) {
                                         std::memcpy(arena_ptr, expert_aos, expert_size);
@@ -13712,7 +13686,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                 ggml_sycl::alloc_handle runtime_h{};
                 if (!ggml_sycl::unified_alloc(runtime_req, &runtime_h) || !runtime_h.ptr) {
                     // RUNTIME zone full — reset and retry once
-                    cache->zone_reset(ggml_sycl::vram_zone_id::RUNTIME);
+                    ggml_sycl::unified_cache_zone_reset(buft_ctx->device, ggml_sycl::vram_zone_id::RUNTIME);
                     ggml_sycl::unified_alloc(runtime_req, &runtime_h);
                 }
                 if (runtime_h.ptr) {
@@ -13798,7 +13772,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                 // buffer destructors don't free zone space).
                 size_t kv_avail = cache->zone_available(ggml_sycl::vram_zone_id::KV);
                 if (size > kv_avail) {
-                    cache->zone_reset(ggml_sycl::vram_zone_id::KV);
+                    ggml_sycl::unified_cache_zone_reset(buft_ctx->device, ggml_sycl::vram_zone_id::KV);
                     kv_avail = cache->zone_available(ggml_sycl::vram_zone_id::KV);
                 }
                 if (size <= kv_avail) {
@@ -17956,14 +17930,9 @@ void ggml_sycl_note_direct_allocation(const char * api, size_t size, const char 
 // Raw device allocation — no budget tracking, used internally by unified_alloc
 // and the unified cache itself (which manages its own budget via used_).
 void * ggml_sycl_malloc_device_raw(size_t size, const sycl::queue & queue, const char * tag) {
-    void * ptr = nullptr;
-    try {
-        ptr = sycl::malloc_device(size, queue);
-    } catch (const sycl::exception & e) {
-        GGML_SYCL_DEBUG("[SYCL] malloc_device failed (%zu bytes, %s): %s\n", size, tag ? tag : "unknown", e.what());
-        return nullptr;
-    } catch (const std::exception & e) {
-        GGML_SYCL_DEBUG("[SYCL] malloc_device failed (%zu bytes, %s): %s\n", size, tag ? tag : "unknown", e.what());
+    void * ptr = ggml_sycl::unified_cache_raw_malloc_device(size, queue);
+    if (!ptr) {
+        GGML_SYCL_DEBUG("[SYCL] malloc_device failed (%zu bytes, %s)\n", size, tag ? tag : "unknown");
         return nullptr;
     }
     if (ptr != nullptr) {
@@ -18051,22 +18020,15 @@ void * ggml_sycl_malloc_host(size_t size, const sycl::queue & queue, const char 
     // Verified: 60 GB pinned works fine on Xe2/BMG (test-sycl-pinned-memory).
     // The GGTT overflow hypothesis was disproven — modern Intel GPUs use
     // per-process page tables, not a fixed-size GGTT for USM allocations.
-    void * ptr = nullptr;
-    try {
-        ptr = sycl::malloc_host(size, queue);
-    } catch (const sycl::exception & e) {
-        GGML_LOG_WARN("[SYCL] malloc_host failed (%zu bytes, %s): %s\n", size, tag ? tag : "unknown", e.what());
-        return nullptr;
-    } catch (const std::exception & e) {
-        GGML_LOG_WARN("[SYCL] malloc_host failed (%zu bytes, %s): %s\n", size, tag ? tag : "unknown", e.what());
+    void * ptr = ggml_sycl::unified_cache_raw_malloc_host(size, queue);
+    if (!ptr) {
+        GGML_LOG_WARN("[SYCL] malloc_host failed (%zu bytes, %s)\n", size, tag ? tag : "unknown");
         return nullptr;
     }
-    if (ptr != nullptr) {
-        g_total_host_pinned_bytes.fetch_add(size, std::memory_order_relaxed);
-        ggml_sycl::alloc_registry::instance().register_alloc(ptr, size, -1, ggml_sycl::alloc_type::HOST_PINNED);
-        ggml_sycl_alloc_trace_record("host", size, tag);
-        ggml_sycl::offload_stats_note_host_alloc(tag ? tag : "malloc_host", size);
-    }
+    g_total_host_pinned_bytes.fetch_add(size, std::memory_order_relaxed);
+    ggml_sycl::alloc_registry::instance().register_alloc(ptr, size, -1, ggml_sycl::alloc_type::HOST_PINNED);
+    ggml_sycl_alloc_trace_record("host", size, tag);
+    ggml_sycl::offload_stats_note_host_alloc(tag ? tag : "malloc_host", size);
     return ptr;
 }
 
@@ -18076,42 +18038,28 @@ void * ggml_sycl_malloc_host(size_t size, const sycl::context & ctx, const char 
     // async operations (e.g. prestage/inference DMA).  The queue-based overload
     // of sycl::malloc_host may internally synchronise the queue on Level Zero,
     // causing a hang.  Using the context directly side-steps this entirely.
-    void * ptr = nullptr;
-    try {
-        ptr = sycl::malloc_host(size, ctx);
-    } catch (const sycl::exception & e) {
-        GGML_LOG_WARN("[SYCL] malloc_host(ctx) failed (%zu bytes, %s): %s\n", size, tag ? tag : "unknown", e.what());
-        return nullptr;
-    } catch (const std::exception & e) {
-        GGML_LOG_WARN("[SYCL] malloc_host(ctx) failed (%zu bytes, %s): %s\n", size, tag ? tag : "unknown", e.what());
+    void * ptr = ggml_sycl::unified_cache_raw_malloc_host(size, ctx);
+    if (!ptr) {
+        GGML_LOG_WARN("[SYCL] malloc_host(ctx) failed (%zu bytes, %s)\n", size, tag ? tag : "unknown");
         return nullptr;
     }
-    if (ptr != nullptr) {
-        g_total_host_pinned_bytes.fetch_add(size, std::memory_order_relaxed);
-        ggml_sycl::alloc_registry::instance().register_alloc(ptr, size, -1, ggml_sycl::alloc_type::HOST_PINNED);
-        ggml_sycl_alloc_trace_record("host", size, tag);
-        ggml_sycl::offload_stats_note_host_alloc(tag ? tag : "malloc_host", size);
-    }
+    g_total_host_pinned_bytes.fetch_add(size, std::memory_order_relaxed);
+    ggml_sycl::alloc_registry::instance().register_alloc(ptr, size, -1, ggml_sycl::alloc_type::HOST_PINNED);
+    ggml_sycl_alloc_trace_record("host", size, tag);
+    ggml_sycl::offload_stats_note_host_alloc(tag ? tag : "malloc_host", size);
     return ptr;
 }
 
 void * ggml_sycl_malloc_shared(size_t size, const sycl::queue & queue, const char * tag) {
     ggml_sycl_note_direct_allocation("ggml_sycl_malloc_shared", size, tag);
-    void * ptr = nullptr;
-    try {
-        ptr = sycl::malloc_shared(size, queue);
-    } catch (const sycl::exception & e) {
-        GGML_SYCL_DEBUG("[SYCL] malloc_shared failed (%zu bytes, %s): %s\n", size, tag ? tag : "unknown", e.what());
-        return nullptr;
-    } catch (const std::exception & e) {
-        GGML_SYCL_DEBUG("[SYCL] malloc_shared failed (%zu bytes, %s): %s\n", size, tag ? tag : "unknown", e.what());
+    void * ptr = ggml_sycl::unified_cache_raw_malloc_shared(size, queue);
+    if (!ptr) {
+        GGML_SYCL_DEBUG("[SYCL] malloc_shared failed (%zu bytes, %s)\n", size, tag ? tag : "unknown");
         return nullptr;
     }
-    if (ptr != nullptr) {
-        int dev_id = ggml_sycl_get_device_id_from_queue(const_cast<sycl::queue &>(queue));
-        ggml_sycl::alloc_registry::instance().register_alloc(ptr, size, dev_id, ggml_sycl::alloc_type::SHARED);
-        ggml_sycl_alloc_trace_record("shared", size, tag);
-    }
+    int dev_id = ggml_sycl_get_device_id_from_queue(const_cast<sycl::queue &>(queue));
+    ggml_sycl::alloc_registry::instance().register_alloc(ptr, size, dev_id, ggml_sycl::alloc_type::SHARED);
+    ggml_sycl_alloc_trace_record("shared", size, tag);
     return ptr;
 }
 
@@ -45206,8 +45154,8 @@ full_build:
                     }
                     if (capture_rms) {
                         const size_t total_floats = static_cast<size_t>(rms_dim) * 2u;
-                        float *      dbg          = sycl::malloc_shared<float>(total_floats, *q);
-                        int *        flag         = sycl::malloc_shared<int>(1, *q);
+                        float *      dbg          = static_cast<float *>(ggml_sycl_malloc_shared(total_floats * sizeof(float), *q, "ptg_rms_dbg"));
+                        int *        flag         = static_cast<int *>(ggml_sycl_malloc_shared(sizeof(int), *q, "ptg_rms_flag"));
                         if (dbg && flag) {
                             std::fill_n(dbg, total_floats, 0.0f);
                             *flag                           = 0;
@@ -45506,8 +45454,8 @@ full_build:
 
                     if (g_persistent_matmul_dbg.enabled && !g_persistent_matmul_dbg.captured && matmul_dbg_match &&
                         M == 1 && N > 0) {
-                        float * dbg  = sycl::malloc_shared<float>((size_t) N, *q);
-                        int *   flag = sycl::malloc_shared<int>(1, *q);
+                        float * dbg  = static_cast<float *>(ggml_sycl_malloc_shared((size_t) N * sizeof(float), *q, "ptg_matmul_dbg"));
+                        int *   flag = static_cast<int *>(ggml_sycl_malloc_shared(sizeof(int), *q, "ptg_matmul_flag"));
                         if (dbg && flag) {
                             std::fill_n(dbg, (size_t) N, 0.0f);
                             *flag                              = 0;
@@ -46337,7 +46285,7 @@ full_build:
                                     GGML_LOG_WARN("[PERSISTENT-TG] ATTN debug buffer too large: %zu floats\n",
                                                   total_floats);
                                 } else {
-                                    float * dbg = sycl::malloc_shared<float>(total_floats, *q);
+                                    float * dbg = static_cast<float *>(ggml_sycl_malloc_shared(total_floats * sizeof(float), *q, "ptg_attn_dbg"));
                                     if (dbg) {
                                         std::fill_n(dbg, total_floats, 0.0f);
                                         g_persistent_attn_dbg.captured     = true;
@@ -46517,7 +46465,7 @@ full_build:
 
                         if (std::getenv("GGML_SYCL_PERSISTENT_TG_VALIDATE_SET_ROWS") != nullptr) {
                             constexpr int k_sample = 8;
-                            float *       dbg      = sycl::malloc_shared<float>(2 * k_sample + 1, *q);
+                            float *       dbg      = static_cast<float *>(ggml_sycl_malloc_shared((2 * k_sample + 1) * sizeof(float), *q, "ptg_set_rows_dbg"));
                             if (dbg) {
                                 std::fill_n(dbg, 2 * k_sample + 1, 0.0f);
                                 g_persistent_set_rows_dbg.debug_ptr   = dbg;
@@ -46731,7 +46679,7 @@ full_build:
     }
     if (g_sycl_tg_trace_hash && ops_added > 0) {
         const size_t max_ops = (size_t) ops_added;
-        uint64_t *   dbg     = sycl::malloc_shared<uint64_t>(max_ops, *q);
+        uint64_t *   dbg     = static_cast<uint64_t *>(ggml_sycl_malloc_shared(max_ops * sizeof(uint64_t), *q, "ptg_hash_dbg"));
         if (dbg) {
             std::fill_n(dbg, max_ops, 0ull);
             g_persistent_debug_hash_ptr = dbg;

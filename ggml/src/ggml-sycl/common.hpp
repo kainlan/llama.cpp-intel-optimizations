@@ -1828,7 +1828,7 @@ struct staging_buffer_pool {
             auto * hcache = ggml_sycl::try_get_host_cache();
             if (hcache) {
                 if (hcache->host_zones_configured()) {
-                    ptr = hcache->host_zone_alloc(ggml_sycl::host_zone_id::STAGING, needed, 64);
+                    ptr = ggml_sycl::unified_cache_host_zone_alloc(ggml_sycl::host_zone_id::STAGING, needed, 64);
                     // Zone allocation returns nullptr when the allocation spans a chunk
                     // boundary or the STAGING zone is exhausted.  Fall back to runtime
                     // pinned allocation (sycl::malloc_host bypassing the pool).
@@ -3008,10 +3008,10 @@ struct ggml_backend_sycl_context {
                 }
                 // Need larger allocation — reset ONEDNN zone and re-allocate.
                 if (entry.arena_alloc.ptr) {
-                    cache->zone_reset(ggml_sycl::vram_zone_id::ONEDNN);
+                    ggml_sycl::unified_cache_zone_reset(device, ggml_sycl::vram_zone_id::ONEDNN);
                     entry.arena_alloc = {};
                 }
-                void * ptr = cache->zone_alloc(ggml_sycl::vram_zone_id::ONEDNN, scratchpad_size);
+                void * ptr = ggml_sycl::unified_cache_zone_alloc(device, ggml_sycl::vram_zone_id::ONEDNN, scratchpad_size);
                 if (ptr) {
                     entry.arena_alloc.ptr          = ptr;
                     entry.arena_alloc.size         = scratchpad_size;
@@ -3061,11 +3061,11 @@ struct ggml_backend_sycl_context {
                     return;  // Already large enough.
                 }
                 if (entry.arena_alloc.ptr) {
-                    cache->zone_reset(ggml_sycl::vram_zone_id::ONEDNN);
+                    ggml_sycl::unified_cache_zone_reset(device, ggml_sycl::vram_zone_id::ONEDNN);
                     entry.arena_alloc = {};
                 }
                 GGML_SYCL_DEBUG("[SYCL-GRAPH] Pre-allocating scratchpad from ONEDNN zone: %zu bytes\n", size);
-                void * ptr = cache->zone_alloc(ggml_sycl::vram_zone_id::ONEDNN, size);
+                void * ptr = ggml_sycl::unified_cache_zone_alloc(device, ggml_sycl::vram_zone_id::ONEDNN, size);
                 if (ptr) {
                     entry.arena_alloc.ptr          = ptr;
                     entry.arena_alloc.size         = size;

@@ -638,16 +638,10 @@ void * ggml_sycl_host_malloc(size_t size) try {
         const sycl::context & tp_ctx       = g_tp_shared_queues[first_dev_id]->get_context();
 
         // Allocate host memory accessible from all TP devices (platform default context)
-        dpct::err0 err = CHECK_TRY_ERROR(ptr = sycl::malloc_host(size, tp_ctx));
-
-        if (err != 0 || !ptr) {
-            if (err != 0) {
-                GGML_LOG_ERROR("WARNING: failed to allocate %.2f MB of TP shared host memory\n",
-                               size / 1024.0 / 1024.0);
-            } else {
-                GGML_LOG_ERROR("[SYCL] sycl::malloc_host(%.1f GB) FAILED — returned null (TP path)\n",
-                               size / (1024.0 * 1024.0 * 1024.0));
-            }
+        ptr = ggml_sycl::unified_cache_raw_malloc_host(size, tp_ctx);
+        if (!ptr) {
+            GGML_LOG_ERROR("[SYCL] sycl::malloc_host(%.1f GB) FAILED — returned null (TP path)\n",
+                           size / (1024.0 * 1024.0 * 1024.0));
             return nullptr;
         }
         ggml_sycl::offload_stats_note_host_alloc("tp_shared_host", size);
@@ -661,35 +655,16 @@ void * ggml_sycl_host_malloc(size_t size) try {
     }
 
     // Non-TP mode: use default queue for host malloc.
-    dpct::err0 err = 0;
     {
         auto & queue = dpct::get_in_order_queue();
-        try {
-            ptr = sycl::malloc_host(size, queue);
-        } catch (const sycl::exception & e) {
-            GGML_LOG_ERROR(
-                "[SYCL] sycl::malloc_host(%.1f GB) FAILED: %s "
-                "(try: sudo modprobe -r xe && sudo modprobe xe)\n",
-                size / (1024.0 * 1024.0 * 1024.0), e.what());
-            ptr = nullptr;
-            err = 1;
-        } catch (...) {
-            GGML_LOG_ERROR(
-                "[SYCL] sycl::malloc_host(%.1f GB) FAILED with unknown exception "
-                "(try: sudo modprobe -r xe && sudo modprobe xe)\n",
-                size / (1024.0 * 1024.0 * 1024.0));
-            ptr = nullptr;
-            err = 1;
-        }
+        ptr = ggml_sycl::unified_cache_raw_malloc_host(size, queue);
     }
 
-    if (err != 0 || !ptr) {
-        if (err == 0) {
-            GGML_LOG_ERROR(
-                "[SYCL] sycl::malloc_host(%.1f GB) FAILED — returned null "
-                "(try: sudo modprobe -r xe && sudo modprobe xe)\n",
-                size / (1024.0 * 1024.0 * 1024.0));
-        }
+    if (!ptr) {
+        GGML_LOG_ERROR(
+            "[SYCL] sycl::malloc_host(%.1f GB) FAILED — returned null "
+            "(try: sudo modprobe -r xe && sudo modprobe xe)\n",
+            size / (1024.0 * 1024.0 * 1024.0));
         return nullptr;
     }
     ggml_sycl::offload_stats_note_host_alloc("host_malloc", size);
