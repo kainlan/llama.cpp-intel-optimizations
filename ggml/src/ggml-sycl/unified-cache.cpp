@@ -9681,7 +9681,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
                     // WEIGHT delegates to KV's allocator in single-chunk mode.
                     z.allocator = nullptr;
                 } else if (z.size > 0) {
-                    z.allocator = std::make_unique<tlsf_allocator>(offset_to_ptr(z.start), z.size, 256);
+                    z.allocator = std::make_unique<tlsf_allocator>(z.size);
                 }
             }
 
@@ -9779,7 +9779,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     for (int i = 0; i < static_cast<int>(vram_zone_id::COUNT); i++) {
         auto & z = arena_zones_[i];
         if (z.size > 0) {
-            z.allocator = std::make_unique<tlsf_allocator>(offset_to_ptr(z.start), z.size, 256);
+            z.allocator = std::make_unique<tlsf_allocator>(z.size);
         }
     }
 
@@ -9812,14 +9812,13 @@ void * unified_cache::zone_alloc(vram_zone_id zone, size_t size, size_t align) {
                                           z.alloc_mutex;
     std::lock_guard<std::mutex> lock(mtx);
 
-    void * ptr = alloc->allocate(size, align);
-    if (ptr) {
-        // NOTE: In shared-zone mode, z.used reflects the COMBINED KV+WEIGHT
-        // usage from the shared TLSF allocator, not per-zone deltas. Callers
-        // querying zone_used(WEIGHT) will see the total shared allocation.
+    // TLSF returns OFFSET into the managed region; convert to device pointer.
+    size_t offset = alloc->allocate(size, align);
+    if (offset != SIZE_MAX) {
         z.used.store(alloc->used(), std::memory_order_relaxed);
+        return offset_to_ptr(z.start + offset);
     }
-    return ptr;
+    return nullptr;
 }
 
 void unified_cache::zone_reset(vram_zone_id zone) {
@@ -9846,8 +9845,14 @@ void unified_cache::zone_free(vram_zone_id zone, void * ptr) {
         if (!alloc) {
             return;
         }
+        // Convert device pointer to zone-relative offset for TLSF.
+        size_t arena_offset = ptr_to_offset(ptr);
+        if (arena_offset == SIZE_MAX || arena_offset < kv.start || arena_offset >= kv.start + kv.size) {
+            return;
+        }
+        size_t                      zone_offset = arena_offset - kv.start;
         std::lock_guard<std::mutex> lock(kv.alloc_mutex);
-        alloc->free(ptr);
+        alloc->free(zone_offset);
         kv.used.store(alloc->used(), std::memory_order_relaxed);
         return;
     }
@@ -9855,8 +9860,15 @@ void unified_cache::zone_free(vram_zone_id zone, void * ptr) {
         return;
     }
 
+    // Convert device pointer to zone-relative offset for TLSF.
+    size_t arena_offset = ptr_to_offset(ptr);
+    if (arena_offset == SIZE_MAX || arena_offset < z.start || arena_offset >= z.start + z.size) {
+        return;
+    }
+    size_t zone_offset = arena_offset - z.start;
+
     std::lock_guard<std::mutex> lock(z.alloc_mutex);
-    alloc->free(ptr);
+    alloc->free(zone_offset);
     z.used.store(alloc->used(), std::memory_order_relaxed);
 }
 
