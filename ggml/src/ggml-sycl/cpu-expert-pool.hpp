@@ -88,6 +88,7 @@ private:
     size_t       act_stride_   = 0;  // floats per expert activation
     size_t       out_stride_   = 0;  // floats per expert output
     size_t       max_experts_  = 0;
+    // Use .as_mem_handle() for read/resolve access; unified_free(alloc_handle) for ownership
     alloc_handle ring_alloc_;        // Single unified_alloc for all ring buffers
 };
 

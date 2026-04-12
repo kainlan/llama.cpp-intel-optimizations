@@ -1828,7 +1828,13 @@ struct staging_buffer_pool {
             auto * hcache = ggml_sycl::try_get_host_cache();
             if (hcache) {
                 if (hcache->host_zones_configured()) {
-                    ptr = ggml_sycl::unified_cache_host_zone_alloc(ggml_sycl::host_zone_id::STAGING, needed, 64);
+                    ggml_sycl::alloc_request _stg_req{};
+                    _stg_req.queue                               = &queue;
+                    _stg_req.size                                = needed;
+                    _stg_req.intent.role                         = ggml_sycl::alloc_role::STAGING;
+                    _stg_req.intent.constraints.must_host_pinned = true;
+                    _stg_req.intent.constraints.use_pinned_pool  = true;
+                    ptr = ggml_sycl::unified_allocate(_stg_req).resolve().ptr;
                     // Zone allocation returns nullptr when the allocation spans a chunk
                     // boundary or the STAGING zone is exhausted.  Fall back to runtime
                     // pinned allocation (sycl::malloc_host bypassing the pool).

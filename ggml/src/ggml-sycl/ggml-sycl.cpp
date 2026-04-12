@@ -6734,7 +6734,8 @@ static ggml_sycl::alloc_handle arena_device_alloc(size_t bytes, int device_id, s
         return {};
     }
     if (ggml_sycl::vram_arena_enabled() && device_id >= 0) {
-        void * ptr = ggml_sycl::unified_cache_arena_alloc(device_id, bytes);
+        auto * cache = ggml_sycl::get_unified_cache_for_device(device_id);
+        void * ptr   = (cache && cache->arena_active()) ? cache->arena_alloc(bytes) : nullptr;
         if (ptr) {
             ggml_sycl::alloc_handle h{};
             h.ptr          = ptr;
@@ -11310,8 +11311,13 @@ static bool ggml_sycl_preload_moe_experts(const ggml_tensor * src0, int device, 
         if (cache->has_placement_plan() && !tname.empty() &&
             !cache->get_placement_plan().expert_on_device(tname, static_cast<int>(e), device)) {
             auto * hcache = ggml_sycl::try_get_host_cache();
-            void * host_ptr =
-                hcache ? ggml_sycl::unified_cache_host_zone_alloc(ggml_sycl::host_zone_id::WEIGHT, expert_size, 256) : nullptr;
+            ggml_sycl::alloc_request _host_req2{};
+            _host_req2.device                               = device;
+            _host_req2.size                                 = expert_size;
+            _host_req2.intent.role                          = ggml_sycl::alloc_role::EXPERT_STAGING;
+            _host_req2.intent.constraints.must_host_pinned  = true;
+            _host_req2.intent.constraints.use_pinned_pool   = true;
+            void * host_ptr = ggml_sycl::unified_allocate(_host_req2).resolve().ptr;
             if (!host_ptr) {
                 failed++;
                 GGML_LOG_WARN("[MODEL-PRELOAD] Failed host-zone alloc for %s[%lld] (%zu bytes)\n", tname.c_str(),
@@ -11610,10 +11616,13 @@ static void ggml_sycl_preload_model_weights() {
                                     static_cast<const uint8_t *>(tensor->data) + e * expert_size;
                                 if (expert_aos) {
                                     auto * hcache_ptr = ggml_sycl::try_get_host_cache();
-                                    void * arena_ptr  = hcache_ptr ?
-                                                            ggml_sycl::unified_cache_host_zone_alloc(ggml_sycl::host_zone_id::WEIGHT,
-                                                                                                     expert_size, 256) :
-                                                            nullptr;
+                                    ggml_sycl::alloc_request _host_req3{};
+                                    _host_req3.device                               = device;
+                                    _host_req3.size                                 = expert_size;
+                                    _host_req3.intent.role                          = ggml_sycl::alloc_role::EXPERT_STAGING;
+                                    _host_req3.intent.constraints.must_host_pinned  = true;
+                                    _host_req3.intent.constraints.use_pinned_pool   = true;
+                                    void * arena_ptr = ggml_sycl::unified_allocate(_host_req3).resolve().ptr;
                                     if (arena_ptr) {
                                         std::memcpy(arena_ptr, expert_aos, expert_size);
                                         ggml_sycl_cache_id key =
@@ -18132,7 +18141,8 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         // LIFO reclaim in arena_free() keeps the bump pointer tight — each
         // op's scratch is reclaimed before the next op allocates.
         if (arena_mode_) {
-            void * ptr = ggml_sycl::unified_cache_arena_alloc(device, rounded_size);
+            auto * cache = ggml_sycl::get_unified_cache_for_device(device);
+            void * ptr   = (cache && cache->arena_active()) ? cache->arena_alloc(rounded_size) : nullptr;
             if (ptr) {
                 *actual_size = rounded_size;
                 return ptr;
@@ -18189,10 +18199,13 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         void * ptr;
 
         // Try the pre-reserved compute arena first.
-        ptr = ggml_sycl::unified_cache_arena_alloc(device, rounded_size);
-        if (ptr) {
-            *actual_size = rounded_size;
-            return ptr;
+        {
+            auto * cache = ggml_sycl::get_unified_cache_for_device(device);
+            ptr = (cache && cache->arena_active()) ? cache->arena_alloc(rounded_size) : nullptr;
+            if (ptr) {
+                *actual_size = rounded_size;
+                return ptr;
+            }
         }
         // Arena full or not reserved — fall back to unified cache.
         // When VRAM is available, this returns device memory.  When VRAM is

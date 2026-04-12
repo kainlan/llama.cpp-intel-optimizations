@@ -153,6 +153,7 @@ class ComputeBufferManager {
     void *             scratch_ptr_      = nullptr;
     size_t             scratch_size_     = 0;  // Last requested size
     size_t             scratch_capacity_ = 0;  // Actual allocated size
+    // Use .as_mem_handle() for read/resolve access; unified_free(alloc_handle) for ownership
     alloc_handle       scratch_handle_{};
     mutable std::mutex scratch_mutex_;
 

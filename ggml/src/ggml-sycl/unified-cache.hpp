@@ -2798,6 +2798,7 @@ bool unified_cache_reserve_compute_arena(int device_id, size_t arena_bytes);
 
 // Try to sub-allocate from the compute arena.
 // Returns nullptr if arena is not reserved or has insufficient space.
+[[deprecated("use unified_allocate() with prefer_vram_zone=SCRATCH instead")]]
 void * unified_cache_arena_alloc(int device_id, size_t size);
 
 // LIFO reclaim: if ptr was the last bump allocation, rewind the bump pointer.
@@ -2843,6 +2844,7 @@ void   unified_cache_reset_scratch_pool(int device_id);
 // Called after the ggml scheduler is created and compute buffer sizes are known.
 void unified_cache_grow_host_scratch_zone(size_t additional_bytes);
 
+[[deprecated("use unified_allocate() with must_host_pinned + use_pinned_pool instead")]]
 void * unified_cache_host_zone_alloc(host_zone_id zone, size_t size, size_t alignment = 64);
 void   unified_cache_host_zone_reset(host_zone_id zone);
 
