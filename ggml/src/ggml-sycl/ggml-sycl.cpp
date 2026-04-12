@@ -37234,25 +37234,33 @@ cpu_fallback_fast:
             out_req.size                                = n_rows * static_cast<size_t>(N) * sizeof(float);
             out_req.intent.cohort_id                    = "moe_pp_cpu_out";
 
-            float * act_pinned = static_cast<float *>(ggml_sycl::unified_cache_arena_alloc(ctx.device, act_req.size));
-            float * out_pinned = static_cast<float *>(ggml_sycl::unified_cache_arena_alloc(ctx.device, out_req.size));
+            // CPU expert dispatch needs HOST-PINNED memory (CPU-accessible).
+            // unified_cache_arena_alloc returns VRAM (device) pointers — wrong for CPU memset/compute.
+            float * act_pinned = static_cast<float *>(
+                ggml_sycl::unified_cache_host_zone_alloc(ggml_sycl::host_zone_id::SCRATCH, act_req.size));
+            float * out_pinned = static_cast<float *>(
+                ggml_sycl::unified_cache_host_zone_alloc(ggml_sycl::host_zone_id::SCRATCH, out_req.size));
             ggml_sycl::scoped_unified_alloc act_fallback;
             ggml_sycl::scoped_unified_alloc out_fallback;
             if (!act_pinned) {
                 if (!act_fallback.allocate(act_req)) {
-                    GGML_LOG_ERROR("[MoE] Failed planner PP CPU alloc for %s expert=%d rows=%zu\n",
-                                   src0->name ? src0->name : "?", expert_id, n_rows);
-                    return;
+                    GGML_ABORT("[MoE] Failed host-pinned alloc for CPU expert activation: %s expert=%d rows=%zu size=%zu\n"
+                               "The unified cache host zone system must have enough capacity for CPU expert dispatch.\n"
+                               "Check host zone sizing in populate_host_zone_sizing().",
+                               src0->name ? src0->name : "?", expert_id, n_rows, act_req.size);
                 }
                 act_pinned = static_cast<float *>(act_fallback.get());
+                GGML_ASSERT(act_pinned != nullptr && "scoped_unified_alloc returned success but ptr is null");
             }
             if (!out_pinned) {
                 if (!out_fallback.allocate(out_req)) {
-                    GGML_LOG_ERROR("[MoE] Failed planner PP CPU alloc for %s expert=%d rows=%zu\n",
-                                   src0->name ? src0->name : "?", expert_id, n_rows);
-                    return;
+                    GGML_ABORT("[MoE] Failed host-pinned alloc for CPU expert output: %s expert=%d rows=%zu size=%zu\n"
+                               "The unified cache host zone system must have enough capacity for CPU expert dispatch.\n"
+                               "Check host zone sizing in populate_host_zone_sizing().",
+                               src0->name ? src0->name : "?", expert_id, n_rows, out_req.size);
                 }
                 out_pinned = static_cast<float *>(out_fallback.get());
+                GGML_ASSERT(out_pinned != nullptr && "scoped_unified_alloc returned success but ptr is null");
             }
             std::memset(out_pinned, 0, n_rows * static_cast<size_t>(N) * sizeof(float));
 
