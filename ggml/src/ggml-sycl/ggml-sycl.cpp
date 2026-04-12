@@ -5878,6 +5878,7 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
     g_placement_kv_info.n_embd_k_gqa = inventory->n_embd_k_gqa;
     g_placement_kv_info.n_embd_v_gqa = inventory->n_embd_v_gqa;
     g_placement_kv_info.n_ctx        = inventory->n_ctx;
+    g_placement_kv_info.n_ubatch     = inventory->n_ubatch;
     g_placement_kv_info.n_swa        = inventory->n_swa;
     g_placement_kv_info.n_swa_layers = inventory->n_swa_layers;
     // Copy per-layer SWA mask for heterogeneous KV cost charging.

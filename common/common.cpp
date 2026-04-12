@@ -1693,6 +1693,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
     mparams.lazy_moe        = params.lazy_moe;
+    mparams.n_ctx_hint      = params.n_ctx;     // Pass runtime -c to GPU planner
+    mparams.n_ubatch_hint   = params.n_ubatch;  // Pass runtime n_ubatch for SWA KV sizing
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;

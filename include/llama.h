@@ -318,6 +318,15 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool lazy_moe;        // keep MoE expert weights in host memory, cache to GPU on-demand
+
+        // Runtime context size hint for GPU memory planning.
+        // When non-zero, the SYCL backend uses this instead of n_ctx_train
+        // to size KV cache allocations during model loading. This enables
+        // accurate VRAM budget planning before the context is created.
+        // Set these to llama_context_params.n_ctx / n_ubatch for optimal GPU memory usage.
+        // 0 = use model defaults (n_ctx_train / 512, conservative).
+        uint32_t n_ctx_hint;
+        uint32_t n_ubatch_hint;
     };
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations

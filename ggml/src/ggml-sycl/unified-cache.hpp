@@ -134,6 +134,7 @@ struct placement_kv_info {
     uint32_t          n_embd_k_gqa     = 0;
     uint32_t          n_embd_v_gqa     = 0;
     uint32_t          n_ctx            = 0;
+    uint32_t          n_ubatch         = 512;  // Physical batch size (for SWA KV sizing)
     bool              n_ctx_is_runtime = false;
     // MoE hyperparameters (0 for dense models)
     int               n_expert_used    = 0;  // Top-k experts selected per token
@@ -171,8 +172,12 @@ struct placement_kv_info {
         if (!valid() || n_swa == 0) {
             return 0;
         }
-        const uint32_t swa_ctx = std::min(n_ctx, n_swa);
-        return static_cast<size_t>(swa_ctx) * static_cast<size_t>(n_embd_k_gqa + n_embd_v_gqa) * sizeof(ggml_fp16_t);
+        // Must match the actual SWA KV size from llama_kv_cache_iswa:
+        //   size_swa = GGML_PAD(min(kv_size, n_swa * n_seq_max + n_ubatch), 256)
+        // with n_seq_max=1. n_ubatch from model params (runtime hint).
+        // Tensor per layer: K=[n_embd_k_gqa, size_swa] + V=[n_embd_v_gqa, size_swa], both fp16.
+        const uint32_t swa_cells = ((std::min(n_ctx, n_swa + n_ubatch) + 255) / 256) * 256;
+        return static_cast<size_t>(swa_cells) * static_cast<size_t>(n_embd_k_gqa + n_embd_v_gqa) * sizeof(ggml_fp16_t);
     }
 };
 

@@ -159,6 +159,7 @@ struct ggml_sycl_tensor_inventory {
     uint32_t                       n_embd_k_gqa;  // Key embedding dim (GQA-adjusted), per layer
     uint32_t                       n_embd_v_gqa;  // Value embedding dim (GQA-adjusted), per layer
     uint32_t                       n_ctx;         // Context size (tokens)
+    uint32_t                       n_ubatch;      // Physical batch size (for SWA KV sizing)
     // SWA (Sliding Window Attention) info for models with heterogeneous attention
     uint32_t                       n_swa;              // Sliding window size (0 = no SWA)
     uint32_t                       n_swa_layers;       // Number of SWA layers (0 = all full-attn)
