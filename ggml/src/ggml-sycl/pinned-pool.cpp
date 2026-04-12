@@ -46,9 +46,8 @@ size_t resolve_chunk_size() {
     const char * env = std::getenv("GGML_SYCL_PINNED_CHUNK_MB");
     if (!env || env[0] == '\0') {
         size_t chunk = pinned_chunk_pool::CHUNK_SIZE;
-        // Keep default chunks moderate to avoid sudden multi-GB pinned allocations
-        // when only small host-staging/fallback buffers are needed.
-        chunk        = std::min<size_t>(chunk, 256ull * 1024ull * 1024ull);
+        // Use the default chunk size (2 GB). Chunks must be large enough to
+        // hold individual weight tensors (MoE experts can be 2+ GB each).
         return chunk;
     }
 
