@@ -111,40 +111,45 @@ void kv_tier_manager::get_region_sizes(size_t total_bytes, size_t & hot_bytes, s
         cold_bytes = 0;
         return;
     }
-    // Use per-layer vector when available (non-contiguous support)
+    // Use per-layer vector when available (non-contiguous / heterogeneous support)
     if (!layer_on_device_.empty()) {
-        uint32_t device_count = 0;
-        for (bool v : layer_on_device_) {
-            if (v) {
-                device_count++;
+        size_t sum_device = 0;
+        size_t sum_host   = 0;
+        for (uint32_t l = 0; l < total_layers_; l++) {
+            const size_t layer_sz = kv_layer_size(l);
+            if (l < layer_on_device_.size() && layer_on_device_[l]) {
+                sum_device += layer_sz;
+            } else {
+                sum_host += layer_sz;
             }
         }
-        hot_bytes  = std::min(static_cast<size_t>(device_count) * kv_per_layer_, total_bytes);
-        cold_bytes = total_bytes - hot_bytes;
+        hot_bytes  = std::min(sum_device, total_bytes);
+        cold_bytes = total_bytes > hot_bytes ? total_bytes - hot_bytes : 0;
         return;
     }
-    // Fallback: contiguous hot_layers_ count
+    // Fallback: contiguous hot_layers_ count with uniform size
     hot_bytes  = std::min(static_cast<size_t>(hot_layers_) * kv_per_layer_, total_bytes);
     cold_bytes = total_bytes - hot_bytes;
 }
 
 std::vector<layer_region> kv_tier_manager::compute_region_layout(size_t total_bytes) const {
     GGML_UNUSED(total_bytes);
-    const size_t aligned_per_layer = (kv_per_layer_ + 511) & ~size_t(511);
 
     std::vector<layer_region> regions(total_layers_);
     size_t                    device_offset = 0;
     size_t                    host_offset   = 0;
     for (uint32_t l = 0; l < total_layers_; l++) {
+        const size_t raw_size     = kv_layer_size(l);
+        const size_t aligned_size = (raw_size + 511) & ~size_t(511);
         regions[l].layer_id  = l;
-        regions[l].size      = aligned_per_layer;
+        regions[l].size      = aligned_size;
         regions[l].on_device = is_hot(l);
         if (regions[l].on_device) {
             regions[l].offset = device_offset;
-            device_offset += aligned_per_layer;
+            device_offset += aligned_size;
         } else {
             regions[l].offset = host_offset;
-            host_offset += aligned_per_layer;
+            host_offset += aligned_size;
         }
     }
     return regions;
@@ -277,7 +282,10 @@ void kv_tier_manager::configure_from_plan(int                    device,
         }
     }
 
+    // Build per-layer placement and heterogeneous KV sizes.
+    // Full-attention layers use plan.kv_per_layer; SWA layers use plan.kv_per_swa_layer.
     layer_on_device_.assign(n_layers, false);
+    per_layer_kv_bytes_.resize(n_layers, kv_per_layer_);
     hot_layers_ = 0;
     for (uint32_t l = 0; l < n_layers; ++l) {
         const bool on_device = plan.get_kv_device(static_cast<int>(l)) == device;
@@ -285,12 +293,25 @@ void kv_tier_manager::configure_from_plan(int                    device,
         if (on_device) {
             hot_layers_++;
         }
+        // Assign heterogeneous per-layer size when SWA info is available.
+        if (plan.kv_per_swa_layer > 0 && !plan.swa_layer_mask.empty()) {
+            const bool is_swa      = l < plan.swa_layer_mask.size() && plan.swa_layer_mask[l];
+            per_layer_kv_bytes_[l] = is_swa ? plan.kv_per_swa_layer : kv_per_layer_;
+        }
     }
 
     active_ = (hot_layers_ < total_layers_);
 
-    const size_t dev_bytes  = total_layers_ > 0 ? total_bytes * hot_layers_ / total_layers_ : 0;
-    const size_t host_bytes = total_bytes > dev_bytes ? total_bytes - dev_bytes : 0;
+    // Compute byte totals using heterogeneous per-layer sizes.
+    size_t dev_bytes  = 0;
+    size_t host_bytes = 0;
+    for (uint32_t l = 0; l < n_layers; ++l) {
+        if (layer_on_device_[l]) {
+            dev_bytes += per_layer_kv_bytes_[l];
+        } else {
+            host_bytes += per_layer_kv_bytes_[l];
+        }
+    }
     GGML_LOG_INFO(
         "[KV-TIER] Plan-driven: %u/%u layers on device "
         "(planner_n_ctx=%u, %.1f MB device, %.1f MB host)\n",

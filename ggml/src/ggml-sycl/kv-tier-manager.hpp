@@ -55,6 +55,16 @@ class kv_tier_manager {
 
     size_t kv_per_layer() const { return kv_per_layer_; }
 
+    // Per-layer KV byte size.  Returns the heterogeneous per-layer size when
+    // configure_from_plan() populated per_layer_kv_bytes_; falls back to the
+    // uniform kv_per_layer_ otherwise.
+    size_t kv_layer_size(uint32_t layer_id) const {
+        if (layer_id < per_layer_kv_bytes_.size()) {
+            return per_layer_kv_bytes_[layer_id];
+        }
+        return kv_per_layer_;
+    }
+
     // Returns true if the given layer should be placed in device VRAM (hot).
     // Supports non-contiguous placement when configure_with_weights() was used.
     bool is_hot(uint32_t layer_id) const;
@@ -90,7 +100,8 @@ class kv_tier_manager {
     uint32_t          hot_layers_   = 0;
     uint32_t          total_layers_ = 0;
     size_t            kv_per_layer_ = 0;
-    std::vector<bool> layer_on_device_;  // Per-layer: true = VRAM, false = host
+    std::vector<bool>   layer_on_device_;    // Per-layer: true = VRAM, false = host
+    std::vector<size_t> per_layer_kv_bytes_; // Per-layer KV byte size (heterogeneous)
 };
 
 // Per-device singleton accessor

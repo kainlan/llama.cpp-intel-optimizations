@@ -190,6 +190,8 @@ struct placement_plan {
     int                          device_id;          // Primary device (single-device) or -1 (multi-device)
     bool                         multi_device;       // True if plan spans multiple GPUs
     size_t                       kv_per_layer             = 0;
+    size_t                       kv_per_swa_layer         = 0;
+    std::vector<bool>            swa_layer_mask;           // swa_layer_mask[l] == true → SWA layer
     uint32_t                     planner_n_ctx            = 0;
     bool                         planner_n_ctx_is_runtime = false;
     size_t                       host_zone_weight_bytes   = 0;

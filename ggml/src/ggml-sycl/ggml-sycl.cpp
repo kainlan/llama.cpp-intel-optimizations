@@ -14549,11 +14549,15 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
     }
 
     uint32_t planned_device_layers = 0;
+    size_t   planned_kv_device     = 0;
     for (const auto & region : layout) {
-        planned_device_layers += region.on_device ? 1u : 0u;
+        if (region.on_device) {
+            planned_device_layers++;
+            planned_kv_device += region.size;
+        }
     }
+    planned_kv_device              = std::min<size_t>(planned_kv_device, size);
     const uint32_t planned_host_layers = n_layers > planned_device_layers ? n_layers - planned_device_layers : 0;
-    const size_t planned_kv_device = std::min<size_t>(size, static_cast<size_t>(planned_device_layers) * kv_per_layer);
     const size_t planned_kv_host   = size > planned_kv_device ? size - planned_kv_device : 0;
     ggml_sycl_log_load_summary(device, planned_kv_device, planned_kv_host, planned_device_layers, planned_host_layers,
                                "planned");
@@ -14598,24 +14602,31 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
         ggml_sycl::vmem_kv_available(*buft_ctx->stream)) {
         auto         vmem       = std::make_unique<ggml_sycl::vmem_kv_pool>();
         // Reserve for the larger of: requested size vs actual per-layer total
-        // (per-layer alignment can push total above size).
-        const size_t vmem_total = std::max(size, static_cast<size_t>(n_layers) * aligned_per_layer);
+        // (per-layer alignment can push total above size; heterogeneous layers
+        // may have different sizes so we sum them explicitly).
+        size_t vmem_total_layers = 0;
+        for (uint32_t l = 0; l < n_layers; l++) {
+            vmem_total_layers += (l < layout.size()) ? layout[l].size : aligned_per_layer;
+        }
+        const size_t vmem_total = std::max(size, vmem_total_layers);
         if (vmem->init(*buft_ctx->stream, vmem_total)) {
             // Map physical pages for each layer (demand-paged)
             bool                        all_mapped = true;
             std::vector<kv_layer_alloc> vmem_layer_allocs(n_layers);
+            size_t                      vmem_offset = 0;
             for (uint32_t l = 0; l < n_layers; l++) {
-                size_t layer_offset = l * aligned_per_layer;
-                void * ptr          = vmem->map_layer(layer_offset, aligned_per_layer, true);
+                const size_t layer_sz = (l < layout.size()) ? layout[l].size : aligned_per_layer;
+                void * ptr            = vmem->map_layer(vmem_offset, layer_sz, true);
                 if (!ptr) {
                     GGML_LOG_WARN("[KV-TIER] vmem map_layer failed at layer %u, falling back\n", l);
                     all_mapped = false;
                     break;
                 }
                 vmem_layer_allocs[l].ptr        = ptr;
-                vmem_layer_allocs[l].size       = aligned_per_layer;
+                vmem_layer_allocs[l].size       = layer_sz;
                 vmem_layer_allocs[l].on_device  = true;
                 vmem_layer_allocs[l].from_arena = true;  // do NOT free individually
+                vmem_offset += layer_sz;
             }
 
             if (all_mapped) {
@@ -14669,7 +14680,9 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
         ggml_sycl::vram_arena_enabled() && ggml_sycl::unified_cache_kv_arena_capacity(device) > 0;
 
     for (uint32_t l = 0; l < n_layers; l++) {
-        const size_t layer_size = aligned_per_layer;
+        // Use the per-layer size from the region layout — heterogeneous for
+        // models with SWA layers (SWA layers are much smaller than full-attn).
+        const size_t layer_size = (l < layout.size()) ? layout[l].size : aligned_per_layer;
         char         tag[64];
         snprintf(tag, sizeof(tag), "kv_tier:layer_%u", l);
 
@@ -37021,13 +37034,18 @@ cpu_fallback_fast:
                                 expert_ptr = static_cast<const char *>(src0_layout_base) + i02 * expert_size;
                             }
 
-                            if (route_host_experts_to_cpu && expert_ptr &&
+                            // Route to CPU when the pointer is non-device (host-pinned or
+                            // host-resident) regardless of whether route_host_experts_to_cpu is
+                            // set — the GPU cannot access sycl::malloc_host pointers as src0.
+                            const bool route_to_cpu_batched =
+                                route_host_experts_to_cpu || (!use_expert_cache && host_weights);
+                            if (route_to_cpu_batched && expert_ptr &&
                                 !ggml_sycl::ggml_sycl_is_device_expert_ptr(expert_ptr)) {
                                 cpu_entries.push_back({ iid1, id, i02, nullptr, 0 });
                                 continue;
                             }
 
-                            if (route_host_experts_to_cpu && !expert_ptr) {
+                            if (route_to_cpu_batched && !expert_ptr) {
                                 cpu_entries.push_back({ iid1, id, i02, nullptr, 0 });
                                 continue;
                             }
@@ -37082,13 +37100,18 @@ cpu_fallback_fast:
                             expert_ptr = static_cast<const char *>(src0_layout_base) + i02 * expert_size;
                         }
 
-                        if (route_host_experts_to_cpu && expert_ptr &&
+                        // Route to CPU when the pointer is non-device (host-pinned or
+                        // host-resident) regardless of whether route_host_experts_to_cpu is
+                        // set — the GPU cannot access sycl::malloc_host pointers as src0.
+                        const bool route_to_cpu_fallback =
+                            route_host_experts_to_cpu || (!use_expert_cache && host_weights);
+                        if (route_to_cpu_fallback && expert_ptr &&
                             !ggml_sycl::ggml_sycl_is_device_expert_ptr(expert_ptr)) {
                             cpu_entries.push_back({ i12, id, i02, nullptr, 0 });
                             continue;
                         }
 
-                        if (route_host_experts_to_cpu && !expert_ptr) {
+                        if (route_to_cpu_fallback && !expert_ptr) {
                             cpu_entries.push_back({ i12, id, i02, nullptr, 0 });
                             continue;
                         }
@@ -37289,7 +37312,7 @@ cpu_fallback_fast:
                         continue;
                     }
                     num_src1_rows++;
-                    if (plan_host_routing) {
+                    if (plan_host_routing || host_weights) {
                         matched_rows.emplace_back(iid1, id);
                     }
                 }
@@ -37306,8 +37329,15 @@ cpu_fallback_fast:
                 expert_ptr = static_cast<const char *>(src0_layout_base) + i02 * expert_size;
             }
 
+            // Route to CPU when: the expert cache explicitly places this expert on host
+            // (route_host_experts_to_cpu), OR when weights are host-resident pinned memory
+            // and not managed by the expert cache (e.g. sycl::malloc_host buffers from a
+            // host-pinned model load).  In the latter case expert_ptr points into
+            // src0_layout_base which is host-accessible — passing it to a GPU kernel
+            // causes a segfault (see task llama.cpp-792vn.14.3).
             const bool cpu_host_expert =
-                route_host_experts_to_cpu && (!expert_ptr || !ggml_sycl::ggml_sycl_is_device_expert_ptr(expert_ptr));
+                (route_host_experts_to_cpu || (!use_expert_cache && host_weights)) &&
+                (!expert_ptr || !ggml_sycl::ggml_sycl_is_device_expert_ptr(expert_ptr));
             if (cpu_host_expert) {
                 const void * host_weight = expert_ptr;
                 if (!host_weight) {

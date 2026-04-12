@@ -10247,6 +10247,8 @@ placement_plan compute_placement_plan(const std::vector<std::pair<std::string, s
     plan.kv_vram_bytes            = 0;
     plan.kv_host_bytes            = 0;
     plan.kv_per_layer             = kv_info.kv_bytes_per_layer();
+    plan.kv_per_swa_layer         = kv_info.kv_bytes_per_swa_layer();
+    plan.swa_layer_mask           = kv_info.swa_layer_mask;
     plan.planner_n_ctx            = kv_info.n_ctx;
     plan.planner_n_ctx_is_runtime = kv_info.n_ctx_is_runtime;
 
@@ -10391,13 +10393,15 @@ placement_plan compute_placement_plan(const std::vector<std::pair<std::string, s
 
     for (const auto & [layer_id, indices] : dense_layer_indices) {
         const size_t weight_bytes = layer_weight_bytes[layer_id];
-        // Charge uniform KV cost for all attention layers.  Although SWA layers
-        // theoretically need less context, the KV allocator creates per-layer
-        // slots of equal size (total_bytes / n_layers) and the tier manager's
-        // configure_from_plan uses plan.kv_per_layer uniformly.  Charging SWA
-        // layers at a lower rate causes the plan to overcommit VRAM, leading to
-        // divergences where layers planned for device end up on host.
-        const size_t kv_cost      = layer_has_attention[layer_id] ? plan.kv_per_layer : 0;
+        // Charge each attention layer at its actual KV cost: SWA layers only
+        // need min(n_ctx, n_swa) tokens of KV (typically ~8 MB at 4096 tokens)
+        // while full-attention layers need the full per-layer allocation (~256 MB
+        // at 131K context).  TLSF supports heterogeneous slot sizes so the old
+        // uniform-charging workaround is no longer needed.
+        const size_t kv_cost      = layer_has_attention[layer_id]
+            ? (kv_info.is_swa_layer(layer_id) ? kv_info.kv_bytes_per_swa_layer()
+                                               : plan.kv_per_layer)
+            : 0;
         const size_t total_cost   = weight_bytes + kv_cost;
         const bool   on_device    = total_cost <= remaining;
         const int    target       = on_device ? device_id : -1;
@@ -10491,7 +10495,7 @@ placement_plan compute_placement_plan(const std::vector<std::pair<std::string, s
             const size_t weight_bytes = layer_weight_bytes[layer_id];
             const bool   has_attn     = layer_has_attention[layer_id];
             const bool   is_swa       = has_attn && kv_info.is_swa_layer(layer_id);
-            const size_t kv_bytes     = has_attn ? plan.kv_per_layer : 0;
+            const size_t kv_bytes     = has_attn ? (is_swa ? kv_info.kv_bytes_per_swa_layer() : plan.kv_per_layer) : 0;
             const char * kv_label     = has_attn ? (is_swa ? "swa" : "full") : "none";
             const int    dense_target = plan.get_layer_device(layer_id);
             const int    kv_target    = plan.get_kv_device(layer_id);
@@ -10507,10 +10511,10 @@ placement_plan compute_placement_plan(const std::vector<std::pair<std::string, s
     // KV breakdown summary for heterogeneous attention
     if (kv_info.n_swa_layers > 0) {
         GGML_LOG_INFO(
-            "[PLACEMENT] KV breakdown: full_attn=%u layers, swa=%u layers "
-            "(charged uniformly at %.1f MB/layer, theoretical swa=%.1f MB/layer)\n",
-            kv_info.n_full_attn_layers(), kv_info.n_swa_layers, plan.kv_per_layer / (1024.0 * 1024.0),
-            kv_info.kv_bytes_per_swa_layer() / (1024.0 * 1024.0));
+            "[PLACEMENT] KV breakdown: full_attn=%u layers at %.1f MB/layer, "
+            "swa=%u layers at %.1f MB/layer (heterogeneous charging)\n",
+            kv_info.n_full_attn_layers(), plan.kv_per_layer / (1024.0 * 1024.0),
+            kv_info.n_swa_layers, kv_info.kv_bytes_per_swa_layer() / (1024.0 * 1024.0));
     }
     // Log MoE expert placement breakdown if per-expert entries exist
     {
@@ -10607,6 +10611,8 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     plan.kv_host_bytes            = 0;
     plan.vram_budget              = 0;
     plan.kv_per_layer             = kv_info.kv_bytes_per_layer();
+    plan.kv_per_swa_layer         = kv_info.kv_bytes_per_swa_layer();
+    plan.swa_layer_mask           = kv_info.swa_layer_mask;
     plan.planner_n_ctx            = kv_info.n_ctx;
     plan.planner_n_ctx_is_runtime = kv_info.n_ctx_is_runtime;
 
@@ -10791,9 +10797,12 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         }
 
         const size_t weight_bytes = layer_weight_bytes[layer_id];
-        // Charge uniform KV cost for all attention layers (see single-device
-        // comment above — the allocator sizes slots uniformly).
-        const size_t kv_cost      = layer_has_attention[layer_id] ? plan.kv_per_layer : 0;
+        // Charge each attention layer at its actual KV cost (SWA vs full-attn).
+        // TLSF supports heterogeneous slot sizes — see single-device path for details.
+        const size_t kv_cost      = layer_has_attention[layer_id]
+            ? (kv_info.is_swa_layer(layer_id) ? kv_info.kv_bytes_per_swa_layer()
+                                               : plan.kv_per_layer)
+            : 0;
         const size_t total_cost   = weight_bytes + kv_cost;
         if (target_dev_idx >= 0 && static_cast<size_t>(target_dev_idx) < n_devs &&
             remaining[target_dev_idx] < total_cost) {
@@ -10932,10 +10941,10 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     // KV breakdown summary for heterogeneous attention
     if (kv_info.n_swa_layers > 0) {
         GGML_LOG_INFO(
-            "[PLACEMENT-MULTI] KV breakdown: full_attn=%u layers, swa=%u layers "
-            "(charged uniformly at %.1f MB/layer, theoretical swa=%.1f MB/layer)\n",
-            kv_info.n_full_attn_layers(), kv_info.n_swa_layers, plan.kv_per_layer / (1024.0 * 1024.0),
-            kv_info.kv_bytes_per_swa_layer() / (1024.0 * 1024.0));
+            "[PLACEMENT-MULTI] KV breakdown: full_attn=%u layers at %.1f MB/layer, "
+            "swa=%u layers at %.1f MB/layer (heterogeneous charging)\n",
+            kv_info.n_full_attn_layers(), plan.kv_per_layer / (1024.0 * 1024.0),
+            kv_info.n_swa_layers, kv_info.kv_bytes_per_swa_layer() / (1024.0 * 1024.0));
     }
     GGML_LOG_INFO(
         "[PLACEMENT-MULTI] KV sizing: n_layer=%u n_embd_k_gqa=%u n_embd_v_gqa=%u n_ctx=%u (%s) kv_per_layer=%.1f MB\n",
