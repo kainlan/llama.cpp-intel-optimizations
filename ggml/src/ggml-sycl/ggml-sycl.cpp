@@ -2135,8 +2135,12 @@ static void ggml_sycl_configure_host_zones_for_plan(ggml_sycl::unified_cache * c
     const auto &     plan             = cache->get_placement_plan();
     constexpr size_t min_kv_zone      = 64ull * 1024ull * 1024ull;
     constexpr size_t scratch_headroom = 32ull * 1024ull * 1024ull;
-    const size_t     kv_zone_bytes =
-        std::max(plan.host_zone_kv_bytes, std::max(min_kv_zone, hcache->pinned_pool_budget() / 10));
+    // KV is co-located with attention weights via the plan. If a layer's attention
+    // weights are on host, its KV goes on host too. plan.kv_host_bytes reflects this.
+    // Use the plan's value, but also compute from actual context size as a floor:
+    // layers with host-resident attention weights need kv_per_layer * n_host_kv_layers
+    // of host KV. The plan already accounts for this, so use it directly.
+    const size_t     kv_zone_bytes = std::max(plan.host_zone_kv_bytes, min_kv_zone);
     const size_t scratch_zone_bytes = std::max(
         plan.host_zone_scratch_bytes, cache->onednn_weights_scratch_size() + cache->onednn_activations_scratch_size() +
                                           plan.max_tensor_bytes + scratch_headroom);
@@ -17473,40 +17477,12 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggm
         alloc = {};
     }
     void * ptr = alloc.ptr;
-    if (ptr == nullptr && hcache && hcache->host_zones_configured()) {
-        // Host zone likely full from a previous context.  Reset ephemeral
-        // zones and retry — safe because the old context is destroyed.
-        GGML_LOG_WARN("[SYCL] Host buffer alloc failed (%.1f MB), resetting host zones and retrying\n",
-                      size / (1024.0 * 1024.0));
-        ggml_sycl::unified_cache_host_zone_reset(ggml_sycl::host_zone_id::STAGING);
-        ggml_sycl::unified_cache_host_zone_reset(ggml_sycl::host_zone_id::SCRATCH);
-        alloc = {};
-        if (ggml_sycl::unified_alloc(req, &alloc)) {
-            ptr = alloc.ptr;
-        }
-    }
-    if (ptr == nullptr) {
-        // Last resort: bypass zone system entirely and try raw sycl::malloc_host
-        GGML_LOG_WARN("[SYCL] Host zone retry failed, attempting raw sycl::malloc_host (%.1f MB)\n",
-                      size / (1024.0 * 1024.0));
-        try {
-            ptr = sycl::malloc_host(size, *req.queue);
-        } catch (...) {
-            ptr = nullptr;
-        }
-    }
     if (ptr == nullptr) {
         GGML_LOG_ERROR(
             "[SYCL] FATAL: host buffer alloc (%.1f MB) failed — cannot allocate host buffer. "
             "All host buffers must be USM-pinned for GPU DMA access.\n",
             size / (1024.0f * 1024.0f));
         return nullptr;
-    }
-    if (!alloc.ptr) {
-        // Raw sycl::malloc_host path — create a minimal alloc_handle for cleanup
-        alloc.ptr    = ptr;
-        alloc.size   = size;
-        alloc.device = req.device;
     }
     GGML_SYCL_DEBUG("[SYCL] Host buffer alloc: %.1f MB via unified-cache\n", size / (1024.0f * 1024.0f));
 

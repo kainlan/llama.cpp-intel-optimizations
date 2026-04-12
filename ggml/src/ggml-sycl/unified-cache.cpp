@@ -1535,28 +1535,18 @@ segmented_buffer host_cache::host_zone_alloc_segmented(host_zone_id zone, size_t
 }
 
 void * host_cache::host_zone_alloc(host_zone_id zone, size_t size, size_t alignment) {
-    // Save the zone's current used offset so we can roll back if the
-    // allocation spans multiple segments (non-contiguous).  Rolling back
-    // to the saved position preserves earlier allocations in the zone,
-    // unlike zone_reset() which would corrupt them.
-    const size_t saved_used = pinned_pool_ ? pinned_pool_->zone_used(zone) : 0;
-
     segmented_buffer buf = host_zone_alloc_segmented(zone, size, alignment);
     if (buf.segments.empty()) {
         return nullptr;
     }
-    // Contiguous allocations (single pointer) require all data in one segment.
-    // If the allocation crossed a chunk boundary, it was split into multiple
-    // segments — the first segment alone is insufficient for DMA/copy operations
-    // that need contiguous memory.  Return nullptr so callers fall back to
-    // runtime allocation for large contiguous buffers.
+    // With TLSF, all zone allocations are contiguous within a single chunk
+    // (TLSF never spans chunks). Keep the check as a safety guard.
     if (buf.segments.size() > 1) {
-        // Multi-segment: the zone bump pointer was already advanced.
-        // For contiguous-only callers, this allocation is unusable.
-        // Roll back to saved position instead of resetting the entire zone
-        // to avoid corrupting earlier allocations (especially in WEIGHT zone).
-        if (pinned_pool_ && pinned_pool_->zones_configured()) {
-            pinned_pool_->zone_rollback(zone, saved_used);
+        // Should never happen with TLSF. Free each segment and return nullptr.
+        if (pinned_pool_) {
+            for (auto & seg : buf.segments) {
+                pinned_pool_->zone_free(zone, seg.ptr);
+            }
         }
         return nullptr;
     }
