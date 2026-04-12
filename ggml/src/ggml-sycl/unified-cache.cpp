@@ -1075,6 +1075,15 @@ unified_cache::unified_cache(sycl::queue & queue, size_t budget_bytes, size_t st
         }
     }
 
+    // Host arena: allocate pinned host memory via 2GB chunks to bypass Level Zero's
+    // ~11GB per-allocation limit. Cap at 128 GB for 120B-class models.
+    {
+        const size_t pinned_cap    = size_t(128) << 30;
+        const size_t pinned_budget = std::min(budget_bytes, pinned_cap);
+        host_arena_                = std::make_unique<pinned_chunk_pool>(queue_, pinned_budget);
+        GGML_LOG_INFO("[HOST-ARENA] Created with %.1f GB budget\n", pinned_budget / (1024.0 * 1024.0 * 1024.0));
+    }
+
     // Ensure unordered_map has buckets before any find() calls.
     entries_.rehash(1);
     id_to_key_.rehash(1);
@@ -1437,18 +1446,7 @@ host_cache::host_cache(sycl::queue & queue, size_t budget_bytes) :
         std::atexit(unified_cache_atexit_handler);
     }
 
-    // Create pinned pool with capped budget.
-    // Without the cap, the pool inherits the full host memory budget (~227 GB)
-    // and grows unboundedly during MoE warmup profiling. Cap at 128 GB for 120B-class
-    // models: ~60GB weights + ~16GB expert SOA cache + buffer headroom. For smaller
-    // models, std::min ensures we don't waste memory.
-    const size_t pinned_cap    = size_t(128) << 30;  // 128 GB
-    const size_t pinned_budget = std::min(budget_bytes, pinned_cap);
-    GGML_SYCL_DEBUG("[UNIFIED-CACHE] DEBUG: Creating pinned pool\n");
-    pinned_pool_ = std::make_unique<pinned_chunk_pool>(queue_, pinned_budget);
-    GGML_LOG_INFO("[SYCL] Pinned chunk pool created with %.1f GB budget\n", pinned_budget / (1024.0 * 1024.0 * 1024.0));
-
-    GGML_SYCL_DEBUG("[UNIFIED-CACHE] Host cache initialized: budget=%.1f MB (using pinned pool)\n",
+    GGML_SYCL_DEBUG("[UNIFIED-CACHE] Host cache initialized: budget=%.1f MB (arena owned by unified_cache)\n",
                     budget_ / (1024.0f * 1024.0f));
     GGML_SYCL_DEBUG("[UNIFIED-CACHE] DEBUG: host_cache constructor finished\n");
 
@@ -1480,22 +1478,12 @@ void host_cache::update_reserved_bytes(size_t reserved_bytes) {
 
 host_cache::~host_cache() {
     if (g_sycl_shutting_down.load()) {
-        // During SYCL shutdown, we can't safely free memory
-        // Release the pool without calling its destructor (which would try sycl::free)
-        // This intentionally leaks memory during shutdown to avoid crashes
-        if (pinned_pool_) {
-            (void) pinned_pool_.release();  // Leak the pool to avoid sycl::free during shutdown
-        }
         return;
     }
 
     try {
         (void) queue_.get_context();
     } catch (...) {
-        // Context already destroyed - can't safely free memory
-        if (pinned_pool_) {
-            (void) pinned_pool_.release();  // Leak to avoid crash
-        }
         return;
     }
 
@@ -1503,126 +1491,112 @@ host_cache::~host_cache() {
         free_entry(pair.second);
     }
     entries_.clear();
-    // pinned_pool_ will be destroyed normally here (its destructor calls sycl::free)
+    // host_arena_ is owned by unified_cache — not freed here
 }
 
 void * host_cache::allocate_pinned_runtime(size_t size, size_t alignment) {
-    if (!pinned_pool_) {
-        return nullptr;
+    // Delegate to unified_cache host_arena (T8a refactoring)
+    if (auto * cache = get_unified_cache_for_device(ggml_sycl_get_device_id_from_queue(queue_))) {
+        return cache->allocate_pinned_runtime(size, alignment);
     }
-    // Use the runtime chunk pool (separate from zone-managed chunks) so that
-    // large contiguous allocations (e.g., 615 MB reorder buffers) don't
-    // conflict with the zone layout.  Runtime chunks are not part of any
-    // zone and can be larger than the 256 MB zone chunk size.
-    return pinned_pool_->allocate_runtime(size, alignment);
+    return nullptr;
 }
 
 void host_cache::free_pinned_runtime(void * ptr, size_t size) {
-    if (!pinned_pool_ || !ptr || size == 0) {
-        return;
+    if (auto * cache = get_unified_cache_for_device(ggml_sycl_get_device_id_from_queue(queue_))) {
+        cache->free_pinned_runtime(ptr, size);
     }
-    pinned_pool_->deallocate(ptr, size);
 }
 
 segmented_buffer host_cache::host_zone_alloc_segmented(host_zone_id zone, size_t size, size_t alignment) {
-    if (!pinned_pool_) {
-        return {};
+    if (auto * cache = get_unified_cache_for_device(ggml_sycl_get_device_id_from_queue(queue_))) {
+        return cache->host_zone_alloc_segmented(zone, size, alignment);
     }
-    if (!pinned_pool_->zones_configured()) {
-        // Fallback to runtime segmented allocation if zones not configured
-        return pinned_pool_->allocate_segmented(size, alignment);
-    }
-    return pinned_pool_->zone_alloc_segmented(zone, size, alignment);
+    return {};
 }
 
 void * host_cache::host_zone_alloc(host_zone_id zone, size_t size, size_t alignment) {
-    segmented_buffer buf = host_zone_alloc_segmented(zone, size, alignment);
-    if (buf.segments.empty()) {
-        return nullptr;
+    if (auto * cache = get_unified_cache_for_device(ggml_sycl_get_device_id_from_queue(queue_))) {
+        return cache->host_zone_alloc(zone, size, alignment);
     }
-    // With TLSF, all zone allocations are contiguous within a single chunk
-    // (TLSF never spans chunks). Keep the check as a safety guard.
-    if (buf.segments.size() > 1) {
-        // Should never happen with TLSF. Free each segment and return nullptr.
-        if (pinned_pool_) {
-            for (auto & seg : buf.segments) {
-                pinned_pool_->zone_free(zone, seg.ptr);
-            }
-        }
-        return nullptr;
-    }
-    return buf.segments[0].ptr;
+    return nullptr;
 }
 
 void host_cache::host_zone_reset(host_zone_id zone) {
-    if (!pinned_pool_ || !pinned_pool_->zones_configured()) {
-        return;
+    if (auto * cache = get_unified_cache_for_device(ggml_sycl_get_device_id_from_queue(queue_))) {
+        cache->host_zone_reset(zone);
     }
-    GGML_ASSERT(zone != host_zone_id::WEIGHT && "WEIGHT host zone must not be reset");
-    pinned_pool_->zone_reset(zone);
 }
 
 size_t host_cache::host_zone_used(host_zone_id zone) const {
-    if (!pinned_pool_ || !pinned_pool_->zones_configured()) {
-        return 0;
+    if (auto * cache = get_unified_cache_for_device(ggml_sycl_get_device_id_from_queue(queue_))) {
+        return cache->host_zone_used(zone);
     }
-    return pinned_pool_->zone_used(zone);
+    return 0;
 }
 
 size_t host_cache::host_zone_capacity(host_zone_id zone) const {
-    if (!pinned_pool_ || !pinned_pool_->zones_configured()) {
-        return 0;
+    if (auto * cache = get_unified_cache_for_device(ggml_sycl_get_device_id_from_queue(queue_))) {
+        return cache->host_zone_capacity(zone);
     }
-    return pinned_pool_->zone_capacity(zone);
+    return 0;
 }
 
 void host_cache::configure_host_zones(size_t weight_bytes,
                                       size_t kv_bytes,
                                       size_t staging_bytes,
                                       size_t scratch_bytes) {
-    GGML_ASSERT(pinned_pool_ && "pinned pool must exist before configuring host zones");
-    pinned_pool_->configure_zones(weight_bytes, kv_bytes, staging_bytes, scratch_bytes);
+    if (auto * cache = get_unified_cache_for_device(ggml_sycl_get_device_id_from_queue(queue_))) {
+        cache->configure_host_zones(weight_bytes, kv_bytes, staging_bytes, scratch_bytes);
+    }
 }
 
 bool host_cache::host_zones_configured() const {
-    return pinned_pool_ && pinned_pool_->zones_configured();
+    if (auto * cache = get_unified_cache_for_device(ggml_sycl_get_device_id_from_queue(queue_))) {
+        return cache->host_zones_configured();
+    }
+    return false;
 }
 
 void host_cache::grow_scratch_zone(size_t additional_bytes) {
-    if (!pinned_pool_ || !pinned_pool_->zones_configured() || additional_bytes == 0) {
-        return;
+    if (auto * cache = get_unified_cache_for_device(ggml_sycl_get_device_id_from_queue(queue_))) {
+        cache->grow_scratch_zone(additional_bytes);
     }
-    pinned_pool_->grow_zone(host_zone_id::SCRATCH, additional_bytes);
-    GGML_LOG_INFO("[HOST-ARENA] SCRATCH zone grown by %.1f MB for compute buffers\n",
-                  additional_bytes / (1024.0 * 1024.0));
 }
 
 bool host_cache::contains_pinned(const void * ptr) const {
-    if (!pinned_pool_ || !ptr) {
-        return false;
+    if (auto * cache = get_unified_cache_for_device(ggml_sycl_get_device_id_from_queue(queue_))) {
+        return cache->contains_pinned(ptr);
     }
-    return pinned_pool_->contains(ptr);
+    return false;
 }
 
 size_t host_cache::pre_allocate_pinned(size_t total_bytes) {
-    if (!pinned_pool_) {
-        return 0;
+    if (auto * cache = get_unified_cache_for_device(ggml_sycl_get_device_id_from_queue(queue_))) {
+        return cache->pre_allocate_pinned(total_bytes);
     }
-    return pinned_pool_->pre_allocate(total_bytes);
+    return 0;
 }
 
 size_t host_cache::pre_allocate_all(size_t model_weight_bytes) {
-    if (!pinned_pool_) {
-        return 0;
+    if (auto * cache = get_unified_cache_for_device(ggml_sycl_get_device_id_from_queue(queue_))) {
+        return cache->pre_allocate_all(model_weight_bytes);
     }
-    return pinned_pool_->pre_allocate_all(model_weight_bytes);
+    return 0;
 }
 
 size_t host_cache::pre_allocate_runtime_chunks(size_t total_bytes) {
-    if (!pinned_pool_) {
-        return 0;
+    if (auto * cache = get_unified_cache_for_device(ggml_sycl_get_device_id_from_queue(queue_))) {
+        return cache->pre_allocate_runtime_chunks(total_bytes);
     }
-    return pinned_pool_->pre_allocate_runtime_chunks(total_bytes);
+    return 0;
+}
+
+size_t host_cache::pinned_pool_budget() const {
+    if (auto * cache = get_unified_cache_for_device(ggml_sycl_get_device_id_from_queue(queue_))) {
+        return cache->pinned_pool_budget();
+    }
+    return 0;
 }
 
 void * host_cache::ensure_cached_alloc(const ggml_sycl_cache_id &    key_id,
@@ -1754,8 +1728,9 @@ void * host_cache::ensure_cached_alloc(const ggml_sycl_cache_id &    key_id,
                     new_ptr = host_zone_alloc(host_zone_id::WEIGHT, alloc_size, pinned_chunk_pool::DEFAULT_ALIGNMENT);
                     pooled_alloc = (new_ptr != nullptr);
                     zone_managed = pooled_alloc;
-                } else if (pinned_pool_) {
-                    new_ptr      = pinned_pool_->allocate(alloc_size);
+                } else {
+                    // Zones not configured: fall back to runtime pinned allocation from unified_cache host_arena.
+                    new_ptr      = allocate_pinned_runtime(alloc_size, pinned_chunk_pool::DEFAULT_ALIGNMENT);
                     pooled_alloc = (new_ptr != nullptr);
                 }
             }
@@ -1915,8 +1890,9 @@ void * host_cache::ensure_cached_alloc(const ggml_sycl_cache_id &    key_id,
             host_ptr     = host_zone_alloc(host_zone_id::WEIGHT, alloc_size, pinned_chunk_pool::DEFAULT_ALIGNMENT);
             pooled_alloc = (host_ptr != nullptr);
             zone_managed = pooled_alloc;
-        } else if (pinned_pool_) {
-            host_ptr     = pinned_pool_->allocate(alloc_size);
+        } else {
+            // Zones not configured: fall back to runtime pinned allocation from unified_cache host_arena.
+            host_ptr     = allocate_pinned_runtime(alloc_size, pinned_chunk_pool::DEFAULT_ALIGNMENT);
             pooled_alloc = (host_ptr != nullptr);
         }
     }
@@ -2428,8 +2404,8 @@ void host_cache::free_entry(host_cache_entry & entry) {
             // Zone-managed host allocations are reclaimed only by zone reset or
             // pool destruction. Their space stays consumed for the model lifetime.
         } else if (entry.pinned_alloc) {
-            // Return to pinned pool
-            pinned_pool_->deallocate(entry.host_ptr, entry.size + entry.guard_size);
+            // Return to host_arena (owned by unified_cache)
+            free_pinned_runtime(entry.host_ptr, entry.size + entry.guard_size);
         } else {
             GGML_SYCL_DEBUG("[UNIFIED-CACHE] Freeing non-pinned host cache entry (unexpected)\n");
             std::free(entry.host_ptr);
@@ -8771,6 +8747,118 @@ size_t unified_cache::available_device() const {
         return 0;
     }
     return free_mem - VRAM_SAFETY_MARGIN;
+}
+
+// --- Host arena methods (moved from host_cache) ---
+
+void * unified_cache::allocate_pinned_runtime(size_t size, size_t alignment) {
+    if (!host_arena_ || !size) {
+        return nullptr;
+    }
+    return host_arena_->allocate_runtime(size, alignment);
+}
+
+void unified_cache::free_pinned_runtime(void * ptr, size_t size) {
+    if (!host_arena_ || !ptr || size == 0) {
+        return;
+    }
+    host_arena_->deallocate(ptr, size);
+}
+
+void unified_cache::host_zone_reset(host_zone_id zone) {
+    if (!host_arena_ || !host_arena_->zones_configured()) {
+        return;
+    }
+    GGML_ASSERT(zone != host_zone_id::WEIGHT && "WEIGHT host zone must not be reset");
+    host_arena_->zone_reset(zone);
+}
+
+size_t unified_cache::host_zone_used(host_zone_id zone) const {
+    if (!host_arena_ || !host_arena_->zones_configured()) {
+        return 0;
+    }
+    return host_arena_->zone_used(zone);
+}
+
+size_t unified_cache::host_zone_capacity(host_zone_id zone) const {
+    if (!host_arena_ || !host_arena_->zones_configured()) {
+        return 0;
+    }
+    return host_arena_->zone_capacity(zone);
+}
+
+void unified_cache::configure_host_zones(size_t weight_bytes, size_t kv_bytes, size_t staging_bytes, size_t scratch_bytes) {
+    if (!host_arena_) {
+        return;
+    }
+    host_arena_->configure_zones(weight_bytes, kv_bytes, staging_bytes, scratch_bytes);
+}
+
+bool unified_cache::host_zones_configured() const {
+    return host_arena_ && host_arena_->zones_configured();
+}
+
+void unified_cache::grow_scratch_zone(size_t additional_bytes) {
+    if (!host_arena_ || !host_arena_->zones_configured() || additional_bytes == 0) {
+        return;
+    }
+    host_arena_->grow_zone(host_zone_id::SCRATCH, additional_bytes);
+    GGML_LOG_INFO("[HOST-ARENA] SCRATCH zone grown by %.1f MB for compute buffers\n",
+                  additional_bytes / (1024.0 * 1024.0));
+}
+
+bool unified_cache::contains_pinned(const void * ptr) const {
+    if (!host_arena_ || !ptr) {
+        return false;
+    }
+    return host_arena_->contains(ptr);
+}
+
+size_t unified_cache::pre_allocate_pinned(size_t total_bytes) {
+    if (!host_arena_) {
+        return 0;
+    }
+    return host_arena_->pre_allocate(total_bytes);
+}
+
+size_t unified_cache::pre_allocate_all(size_t model_weight_bytes) {
+    if (!host_arena_) {
+        return 0;
+    }
+    return host_arena_->pre_allocate_all(model_weight_bytes);
+}
+
+size_t unified_cache::pre_allocate_runtime_chunks(size_t total_bytes) {
+    if (!host_arena_) {
+        return 0;
+    }
+    return host_arena_->pre_allocate_runtime_chunks(total_bytes);
+}
+
+segmented_buffer unified_cache::host_zone_alloc_segmented(host_zone_id zone, size_t size, size_t alignment) {
+    if (!host_arena_) {
+        return {};
+    }
+    if (!host_arena_->zones_configured()) {
+        return host_arena_->allocate_segmented(size, alignment);
+    }
+    return host_arena_->zone_alloc_segmented(zone, size, alignment);
+}
+
+void * unified_cache::host_zone_alloc(host_zone_id zone, size_t size, size_t alignment) {
+    segmented_buffer buf = host_zone_alloc_segmented(zone, size, alignment);
+    if (buf.segments.empty()) {
+        return nullptr;
+    }
+    if (buf.segments.size() > 1) {
+        // Should never happen with TLSF (all zone allocations are contiguous within a chunk).
+        // Free each segment and return nullptr as a safety guard.
+        for (auto & seg : buf.segments) {
+            host_arena_->zone_free(zone, seg.ptr);
+        }
+        return nullptr;
+    }
+    return buf.segments[0].ptr;
 }
 
 // --- unified_cache::allocate() ---

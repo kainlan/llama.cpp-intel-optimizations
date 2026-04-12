@@ -2129,8 +2129,7 @@ static void ggml_sycl_configure_host_zones_for_plan(ggml_sycl::unified_cache * c
         return;
     }
 
-    auto * hcache = ggml_sycl::try_get_host_cache();
-    if (!hcache || hcache->host_zones_configured()) {
+    if (cache->host_zones_configured()) {
         return;
     }
 
@@ -2149,18 +2148,18 @@ static void ggml_sycl_configure_host_zones_for_plan(ggml_sycl::unified_cache * c
     const size_t total_host_needed =
         plan.host_zone_weight_bytes + kv_zone_bytes + plan.host_zone_staging_bytes + scratch_zone_bytes;
 
-    hcache->pre_allocate_pinned(total_host_needed);
-    hcache->configure_host_zones(plan.host_zone_weight_bytes, kv_zone_bytes, plan.host_zone_staging_bytes,
-                                 scratch_zone_bytes);
+    cache->pre_allocate_pinned(total_host_needed);
+    cache->configure_host_zones(plan.host_zone_weight_bytes, kv_zone_bytes, plan.host_zone_staging_bytes,
+                                scratch_zone_bytes);
 
     // Pre-allocate runtime pool to prevent lazy growth during inference.
     // Covers oneDNN reorder scratch + DMA staging; prevents HOST_ALLOC_PHASE_GATE warnings.
     const size_t runtime_bytes = plan.onednn_scratchpad_bytes + plan.dma_staging_pool_bytes;
     if (runtime_bytes > 0) {
-        hcache->pre_allocate_runtime_chunks(runtime_bytes);
+        cache->pre_allocate_runtime_chunks(runtime_bytes);
     }
 
-    if (hcache->host_zones_configured()) {
+    if (cache->host_zones_configured()) {
         GGML_LOG_INFO("[HOST-ARENA] Zones configured: WEIGHT=%.1f MB KV=%.1f MB STAGING=%.1f MB SCRATCH=%.1f MB\n",
                       plan.host_zone_weight_bytes / (1024.0 * 1024.0), kv_zone_bytes / (1024.0 * 1024.0),
                       plan.host_zone_staging_bytes / (1024.0 * 1024.0), scratch_zone_bytes / (1024.0 * 1024.0));
@@ -4107,15 +4106,15 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
     // of a 120B MoE model's CPU expert dispatch.
     // -----------------------------------------------------------------------
     {
-        auto * hcache = ggml_sycl::get_host_cache_for_device(device);
-        if (hcache) {
+        auto * cache = ggml_sycl::get_unified_cache_for_device(device);
+        if (cache) {
             const size_t estimated_working_set =
                 static_cast<size_t>(n_experts_used > 0 ? n_experts_used : 4) * expert_weight_bytes * 2  // double-buffer
                 * static_cast<size_t>(n_moe_layers > 0 ? std::min(n_moe_layers, 8) : 1);
             // At least 2 GB to handle burst demand without runtime malloc_host
             const size_t min_pre_alloc   = static_cast<size_t>(2ULL * 1024ULL * 1024ULL * 1024ULL);
             const size_t pre_alloc_bytes = std::max(estimated_working_set, min_pre_alloc);
-            const size_t chunks_grown    = hcache->pre_allocate_pinned(pre_alloc_bytes);
+            const size_t chunks_grown    = cache->pre_allocate_pinned(pre_alloc_bytes);
             if (chunks_grown > 0) {
                 GGML_LOG_INFO("[MOE-HYBRID] Pre-allocated %zu pinned chunks for %.1f MB working set\n", chunks_grown,
                               pre_alloc_bytes / (1024.0 * 1024.0));
@@ -6091,9 +6090,9 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
     // for SOA conversion temporaries, staging buffers, and runtime allocations.
     // -----------------------------------------------------------------------
     {
-        auto * hcache = ggml_sycl::get_host_cache_for_device(ctx->device);
-        if (hcache) {
-            const size_t chunks_grown = hcache->pre_allocate_all(g_tensor_inventory_total_size);
+        auto * cache = ggml_sycl::get_unified_cache_for_device(ctx->device);
+        if (cache) {
+            const size_t chunks_grown = cache->pre_allocate_all(g_tensor_inventory_total_size);
             if (chunks_grown > 0) {
                 GGML_LOG_INFO(
                     "[SYCL] Host-pinned pre-allocate: %zu chunks for full model "
@@ -17453,9 +17452,9 @@ static size_t ggml_backend_sycl_host_buffer_type_get_max_size(ggml_backend_buffe
     // When host zones are configured, return the SCRATCH zone capacity as max chunk.
     // This makes ggml-alloc split host compute buffers into chunks that fit within
     // the pre-planned SCRATCH zone, instead of requesting one giant host buffer.
-    auto * hcache = ggml_sycl::try_get_host_cache();
-    if (hcache && hcache->host_zones_configured()) {
-        size_t scratch_avail = hcache->host_zone_capacity(ggml_sycl::host_zone_id::SCRATCH);
+    auto * cache = ggml_sycl::get_unified_cache_for_device(get_current_device_id());
+    if (cache && cache->host_zones_configured()) {
+        size_t scratch_avail = cache->host_zone_capacity(ggml_sycl::host_zone_id::SCRATCH);
         if (scratch_avail > 0) {
             const size_t chunk_cap = ggml_backend_sycl_host_buffer_type_chunk_cap();
             return std::min(scratch_avail, chunk_cap);
@@ -17521,8 +17520,8 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggm
     // When host zones are configured, route through the zone system so allocations
     // are tracked and budgeted. Model weights go to WEIGHT zone, compute buffers
     // go to SCRATCH zone. When zones are not configured, use the pinned pool runtime.
-    auto * hcache                           = ggml_sycl::try_get_host_cache();
-    req.intent.constraints.use_pinned_pool  = (hcache && hcache->host_zones_configured());
+    auto * sycl_cache                       = ggml_sycl::get_unified_cache_for_device(req.device);
+    req.intent.constraints.use_pinned_pool  = (sycl_cache && sycl_cache->host_zones_configured());
     ggml_sycl::alloc_handle alloc{};
     if (!ggml_sycl::unified_alloc(req, &alloc)) {
         alloc = {};

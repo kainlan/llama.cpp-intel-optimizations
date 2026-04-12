@@ -792,7 +792,7 @@ class host_cache {
     // compute buffer sizes are known (from ggml_backend_sched_get_buffer_size).
     void grow_scratch_zone(size_t additional_bytes);
 
-    size_t pinned_pool_budget() const { return pinned_pool_ ? pinned_pool_->budget() : 0; }
+    size_t pinned_pool_budget() const;
 
     // Check if a pointer belongs to the pinned pool (for free routing).
     bool contains_pinned(const void * ptr) const;
@@ -937,9 +937,8 @@ class host_cache {
     std::atomic<size_t>  used_{ 0 };
     std::atomic<int64_t> time_{ 0 };
 
-    // Pinned memory pool (replaces direct malloc_host calls)
-    // Uses 8GB chunks to bypass Intel Level Zero's ~11GB per-allocation limit
-    std::unique_ptr<pinned_chunk_pool> pinned_pool_;
+   // Pointer to parent unified_cache that owns the host arena.
+    unified_cache * parent_cache_ = nullptr;
 
     std::unordered_map<unified_cache_key,
                        host_cache_entry,
@@ -1827,6 +1826,24 @@ class unified_cache {
     // Budget headroom: budget_ - used_ (what the cache thinks is available).
     size_t available_budget() const { return available(); }
 
+    void *           allocate_pinned_runtime(size_t size, size_t alignment = 64);
+    void             free_pinned_runtime(void * ptr, size_t size);
+    void             host_zone_reset(host_zone_id zone);
+    size_t           host_zone_used(host_zone_id zone) const;
+    size_t           host_zone_capacity(host_zone_id zone) const;
+    void             configure_host_zones(size_t weight_bytes, size_t kv_bytes, size_t staging_bytes,
+                                          size_t scratch_bytes);
+    bool             host_zones_configured() const;
+    void             grow_scratch_zone(size_t additional_bytes);
+    size_t           pinned_pool_budget() const { return host_arena_ ? host_arena_->budget() : 0; }
+    bool             contains_pinned(const void * ptr) const;
+    size_t           pre_allocate_pinned(size_t total_bytes);
+    size_t           pre_allocate_all(size_t model_weight_bytes);
+    size_t           pre_allocate_runtime_chunks(size_t total_bytes);
+    // Host zone allocation (replaces host_cache private methods — now owned by unified_cache).
+    segmented_buffer host_zone_alloc_segmented(host_zone_id zone, size_t size, size_t alignment = 64);
+    void *           host_zone_alloc(host_zone_id zone, size_t size, size_t alignment = 64);
+
   private:
     // Sub-allocate from a zone.
     void * zone_alloc(vram_zone_id zone, size_t size, size_t align = 256);
@@ -2137,6 +2154,11 @@ class unified_cache {
 
     mutable std::shared_mutex           rw_mutex_;
     mutable std::condition_variable_any entry_cv_;
+
+    // Host memory arena (moved from host_cache as pinned_chunk_pool).
+    // Bypasses Intel Level Zero's ~11GB per-allocation limit via 2GB chunks.
+    // Initialized with capped budget (128 GB) to prevent unbounded growth.
+    std::unique_ptr<pinned_chunk_pool> host_arena_;
 };
 
 // === Cache Mode ===
