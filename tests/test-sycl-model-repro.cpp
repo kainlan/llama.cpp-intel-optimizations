@@ -1,4 +1,4 @@
-// Minimal SYCL model load + decode repro harness for host_cache crashes.
+// Minimal SYCL model load + decode repro harness for cache crashes.
 //
 // Usage:
 //   LLAMA_SYCL_TEST_MODEL=/path/to/model.gguf ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-sycl-model-repro

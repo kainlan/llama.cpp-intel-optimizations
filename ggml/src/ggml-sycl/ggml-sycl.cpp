@@ -4099,7 +4099,7 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
 
     // -----------------------------------------------------------------------
     // Pre-allocate pinned host memory chunks so that inference-time allocations
-    // in the host_cache never call sycl::malloc_host (which blocks the Level
+    // in the host arena never call sycl::malloc_host (which blocks the Level
     // Zero driver when the device has pending operations, causing MoE hangs).
     // Estimate: top-K experts * expert_size * 2 (double-buffer) per MoE layer,
     // plus generous headroom.  Allocate at least 2 GB to cover the working set
@@ -5214,13 +5214,8 @@ void ggml_backend_sycl_set_model_loading(bool loading) {
             // Reclaim host-pinned memory from previous model's weight entries.
             // Must happen before release_host_weight_extras to free pinned pool
             // space for the new model's host buffers.
-            auto * hcache = ggml_sycl::try_get_host_cache();
-            if (hcache) {
-                size_t freed = hcache->evict_all_weights();
-                if (freed > 0) {
-                    GGML_LOG_INFO("[HOST-CACHE] Evicted %.1f MB from previous model\n", freed / (1024.0 * 1024.0));
-                }
-            }
+            // Host weight entries are managed by unified_cache; old model
+            // entries are cleared when unified_cache evicts or arena resets.
 
             ggml_sycl_release_host_weight_extras(ggml_sycl_host_weight_release_mode::registry_only);
 
@@ -5623,7 +5618,6 @@ ggml_sycl_cache_id ggml_backend_sycl_get_weight_cache_key(const ggml_tensor * te
     std::string  guard_where = "weight_cache_key:";
     guard_where += name;
 
-    (void) ggml_sycl::host_cache_guard_check_all(device_id, guard_where.c_str());
     (void) weight_cache_guard_check_all(guard_where.c_str());
 
     ggml_tensor_extra_gpu * extra =
@@ -11121,65 +11115,6 @@ static void ggml_sycl_drop_all_weight_cache_entries(ggml_sycl::unified_cache * c
     }
 }
 
-static void ggml_sycl_drop_non_target_host_entries(ggml_sycl::host_cache * cache,
-
-                                                   const ggml_sycl_cache_id &  key_id,
-                                                   ggml_sycl::cache_entry_type type,
-                                                   int                         layer_id,
-
-                                                   int              expert_id,
-                                                   ggml_layout_mode target) {
-    if (!cache || !key_id.valid) {
-        return;
-    }
-    const ggml_layout_mode layouts[] = {
-        GGML_LAYOUT_AOS,
-        GGML_LAYOUT_SOA,
-        GGML_LAYOUT_COALESCED,
-        GGML_LAYOUT_XMX_TILED,
-        GGML_LAYOUT_XMX_GEMM_TILED,
-        GGML_LAYOUT_ONEDNN_PACKED,
-        GGML_LAYOUT_ONEDNN_WOQ,
-    };
-    for (ggml_layout_mode mode : layouts) {
-        if (mode == target) {
-            continue;
-        }
-        if (!cache->is_cached(key_id, type, layer_id, expert_id, mode)) {
-            continue;
-        }
-        GGML_SYCL_DEBUG("[UNIFIED-CACHE] drop host layout=%s model=%llu name_hash=0x%llx target=%s\n",
-                        ggml_sycl_layout_mode_name(mode), (unsigned long long) key_id.model_id,
-                        (unsigned long long) key_id.name_hash, ggml_sycl_layout_mode_name(target));
-
-        cache->remove(key_id, type, layer_id, expert_id, mode);
-    }
-}
-
-static void ggml_sycl_drop_all_host_weight_entries(ggml_sycl::host_cache * cache, const ggml_sycl_cache_id & key_id) {
-    if (!cache || !key_id.valid) {
-        return;
-    }
-    const ggml_layout_mode layouts[] = {
-        GGML_LAYOUT_AOS,
-        GGML_LAYOUT_SOA,
-        GGML_LAYOUT_COALESCED,
-        GGML_LAYOUT_XMX_TILED,
-        GGML_LAYOUT_XMX_GEMM_TILED,
-        GGML_LAYOUT_ONEDNN_PACKED,
-        GGML_LAYOUT_ONEDNN_WOQ,
-    };
-    for (ggml_layout_mode mode : layouts) {
-        if (!cache->is_cached(key_id, ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, mode)) {
-            continue;
-        }
-        GGML_SYCL_DEBUG("[UNIFIED-CACHE] drop host layout=%s model=%llu name_hash=0x%llx (invalidate)\n",
-                        ggml_sycl_layout_mode_name(mode), (unsigned long long) key_id.model_id,
-                        (unsigned long long) key_id.name_hash);
-        cache->remove(key_id, ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, mode);
-    }
-}
-
 static void ggml_sycl_drop_non_target_expert_entries(ggml_sycl::unified_cache * cache,
                                                      const ggml_sycl_cache_id & key_id,
                                                      int                        layer_id,
@@ -11309,7 +11244,6 @@ static bool ggml_sycl_preload_moe_experts(const ggml_tensor * src0, int device, 
 
         if (cache->has_placement_plan() && !tname.empty() &&
             !cache->get_placement_plan().expert_on_device(tname, static_cast<int>(e), device)) {
-            auto * hcache = ggml_sycl::try_get_host_cache();
             ggml_sycl::alloc_request _host_req2{};
             _host_req2.device                               = device;
             _host_req2.size                                 = expert_size;
@@ -11614,7 +11548,6 @@ static void ggml_sycl_preload_model_weights() {
                                 const uint8_t * expert_aos =
                                     static_cast<const uint8_t *>(tensor->data) + e * expert_size;
                                 if (expert_aos) {
-                                    auto * hcache_ptr = ggml_sycl::try_get_host_cache();
                                     ggml_sycl::alloc_request _host_req3{};
                                     _host_req3.device                               = device;
                                     _host_req3.size                                 = expert_size;
@@ -12112,12 +12045,6 @@ void * ggml_sycl_get_weight_layout_ptr(const ggml_tensor * tensor, int device, l
     }
     sycl::queue &              q          = ggml_sycl_get_device(device).default_queue();
     ggml_sycl::unified_cache * cache      = ggml_sycl::get_unified_cache(q);
-    // Defer get_host_cache() to avoid acquiring g_cache_rw_mutex eagerly.
-    // During 120B MoE inference, g_cache_rw_mutex can be held by MoE prestage or
-    // runtime budget updates when this function is called for dense weight
-    // MUL_MAT dispatch.  host_cache is only needed when request_prefer_host
-    // is true (host placement path), so resolve it lazily.
-    ggml_sycl::host_cache *    host_cache = nullptr;
     ggml_sycl_cache_id         cache_key  = ggml_backend_sycl_get_weight_cache_key(tensor, device);
 
     const void *     src_ptr   = tensor->data;
@@ -12276,68 +12203,52 @@ void * ggml_sycl_get_weight_layout_ptr(const ggml_tensor * tensor, int device, l
     bool                      host_needs_fill  = false;
     bool                      host_pinned      = false;
     ggml_sycl::cache_location host_location    = ggml_sycl::cache_location::HOST_MMAP;
-    // Lazily resolve host_cache only when host placement is actually needed.
-    if (!src_is_device && request_prefer_host) {
-        if (!host_cache) {
-            host_cache = ggml_sycl::get_host_cache(q);
-        }
-    }
-    if (host_cache && !src_is_device && request_prefer_host) {
-        void * host_ptr = host_cache->ensure_cached_alloc(
-            cache_key, src_ptr, src_size, dst_size, ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, resolved, false,
-            &host_needs_fill, &host_pinned, &host_location, &xmx_info);
+    // Host placement: allocate directly from unified_cache host zone.
+    if (cache && !src_is_device && request_prefer_host) {
+        void * host_ptr = cache->host_zone_alloc(ggml_sycl::host_zone_id::WEIGHT, dst_size, 256);
         if (host_ptr) {
-            if (host_needs_fill) {
-                if (resolved == GGML_LAYOUT_AOS) {
+            host_needs_fill = true;
+            host_pinned     = true;
+            host_location   = ggml_sycl::cache_location::HOST_PINNED;
+
+            if (resolved == GGML_LAYOUT_AOS) {
+                std::memcpy(host_ptr, src_ptr, std::min(dst_size, src_size));
+                if (dst_size > src_size) {
+                    std::memset(static_cast<char *>(host_ptr) + src_size, 0, dst_size - src_size);
+                }
+            } else if (resolved == GGML_LAYOUT_XMX_TILED) {
+                if (!ggml_sycl_fill_xmx_tiled_host(q, host_ptr, dst_size, src_ptr, src_size, tiled_ctx, {})) {
+                    host_ptr = nullptr;
+                }
+            } else {
+                reorder_ctx.type          = tensor->type;
+                reorder_ctx.ncols         = tensor->ne[0];
+                reorder_ctx.nrows         = ggml_nrows(tensor);
+                reorder_ctx.nbytes        = src_size;
+                reorder_ctx.dst_bytes     = dst_size;
+                reorder_ctx.layout        = resolved;
+                reorder_ctx.src_is_device = false;
+                reorder_ctx.device_id     = device;
+                const bool ok             = ggml_sycl_reorder_weight_cpu(host_ptr, src_ptr, reorder_ctx);
+                GGML_ASSERT(ok && "reorder_weight_cpu failed in host placement path — layout validation bug");
+                if (!ok) {
                     std::memcpy(host_ptr, src_ptr, std::min(dst_size, src_size));
-                    if (dst_size > src_size) {
-                        std::memset(static_cast<char *>(host_ptr) + src_size, 0, dst_size - src_size);
-                    }
-                } else if (resolved == GGML_LAYOUT_XMX_TILED) {
-                    if (!ggml_sycl_fill_xmx_tiled_host(q, host_ptr, dst_size, src_ptr, src_size, tiled_ctx, {})) {
-                        host_cache->remove(cache_key, ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, resolved);
-                        host_ptr = nullptr;
-                    }
-                } else {
-                    reorder_ctx.type          = tensor->type;
-                    reorder_ctx.ncols         = tensor->ne[0];
-                    reorder_ctx.nrows         = ggml_nrows(tensor);
-                    reorder_ctx.nbytes        = src_size;
-                    reorder_ctx.dst_bytes     = dst_size;
-                    reorder_ctx.layout        = resolved;
-                    reorder_ctx.src_is_device = false;
-                    reorder_ctx.device_id     = device;
-                    const bool ok             = ggml_sycl_reorder_weight_cpu(host_ptr, src_ptr, reorder_ctx);
-                    GGML_ASSERT(ok && "reorder_weight_cpu failed in host cache path — layout validation bug");
-                    if (!ok) {
-                        // Unreachable after assert, kept for non-assert builds
-                        std::memcpy(host_ptr, src_ptr, std::min(dst_size, src_size));
-                    }
-                    if (dst_size > src_size) {
-                        std::memset(static_cast<char *>(host_ptr) + src_size, 0, dst_size - src_size);
-                    }
+                }
+                if (dst_size > src_size) {
+                    std::memset(static_cast<char *>(host_ptr) + src_size, 0, dst_size - src_size);
                 }
             }
-            if (host_ptr &&
-                !host_cache->check_guard(cache_key, ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, resolved)) {
-                GGML_ABORT("host_cache guard corruption detected");
-            }
-        }
 
-        if (host_ptr) {
-            used_host_layout = true;
-            ggml_sycl_drop_non_target_host_entries(host_cache, cache_key, ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1,
-                                                   -1, resolved);
-            if (g_ggml_sycl_debug >= 2 || copy_trace) {
-                GGML_LOG_INFO(
-                    "[SYCL] layout host src: tensor=%s model=%llu name_hash=0x%llx layout=%d host_ptr=%p host_loc=%d "
-                    "pinned=%d needs_fill=%d\n",
-                    tensor->name ? tensor->name : "unknown", (unsigned long long) cache_key.model_id,
-                    (unsigned long long) cache_key.name_hash, (int) resolved, host_ptr, (int) host_location,
-                    host_pinned ? 1 : 0, host_needs_fill ? 1 : 0);
-                const uintptr_t host_addr = reinterpret_cast<uintptr_t>(host_ptr);
-                GGML_LOG_INFO("[SYCL] layout host align: ptr=%p align64=%zu align4096=%zu\n", host_ptr,
-                              static_cast<size_t>(host_addr % 64), static_cast<size_t>(host_addr % 4096));
+            if (host_ptr) {
+                used_host_layout = true;
+                if (g_ggml_sycl_debug >= 2 || copy_trace) {
+                    GGML_LOG_INFO(
+                        "[SYCL] layout host src: tensor=%s model=%llu name_hash=0x%llx layout=%d host_ptr=%p "
+                        "host_loc=%d pinned=%d\n",
+                        tensor->name ? tensor->name : "unknown", (unsigned long long) cache_key.model_id,
+                        (unsigned long long) cache_key.name_hash, (int) resolved, host_ptr, (int) host_location,
+                        host_pinned ? 1 : 0);
+                }
             }
         }
     }
@@ -12478,9 +12389,6 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
                 ggml_sycl_drop_all_weight_cache_entries(cache, cache_key);
             }
 
-            if (ggml_sycl::host_cache * host_cache = ggml_sycl::get_host_cache(*stream)) {
-                ggml_sycl_drop_all_host_weight_entries(host_cache, cache_key);
-            }
         }
     }
     if (is_weight_buffer && offset == 0 && size > 0) {

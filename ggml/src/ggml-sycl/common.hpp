@@ -1821,13 +1821,13 @@ struct staging_buffer_pool {
 
         // No suitable slot — allocate from the pre-allocated pinned chunk pool
         // so that NO sycl::malloc_host occurs during inference.
-        // Use try_get_host_cache() (lock-free) to avoid deadlocks.
         void * ptr       = nullptr;
         bool   from_pool = false;
         {
-            auto * hcache = ggml_sycl::try_get_host_cache();
-            if (hcache) {
-                if (hcache->host_zones_configured()) {
+            auto * ucache = ggml_sycl::get_unified_cache_for_device(
+                ggml_sycl_get_device_id_from_queue(queue));
+            if (ucache) {
+                if (ucache->host_zones_configured()) {
                     ggml_sycl::alloc_request _stg_req{};
                     _stg_req.queue                               = &queue;
                     _stg_req.size                                = needed;
@@ -1842,13 +1842,13 @@ struct staging_buffer_pool {
                         GGML_LOG_WARN(
                             "[STAGING] zone_alloc failed for %zu bytes, falling back to runtime pinned allocation\n",
                             needed);
-                        ptr       = hcache->allocate_pinned_runtime(needed, 64);
+                        ptr       = ucache->allocate_pinned_runtime(needed, 64);
                         from_pool = (ptr != nullptr);
                     } else {
                         from_pool = true;
                     }
                 } else {
-                    ptr       = hcache->allocate_pinned_runtime(needed, 64);
+                    ptr       = ucache->allocate_pinned_runtime(needed, 64);
                     from_pool = (ptr != nullptr);
                 }
             }

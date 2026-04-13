@@ -439,21 +439,19 @@ static bool test_three_tier_memory_flow() {
         return false;
     }
 
-    // Check that host cache is available
-    ggml_sycl::host_cache * hcache = ggml_sycl::get_host_cache_for_device(0);
-    if (!hcache) {
-        printf("  SKIP: host cache not available (optional tier)\n");
+    // Check that host arena is available via unified cache
+    ggml_sycl::unified_cache * ucache = ggml_sycl::get_unified_cache_for_device(0);
+    if (!ucache) {
+        printf("  SKIP: unified cache not available\n");
         return true;
     }
-
-    // Verify host cache has budget
-    size_t host_budget = hcache->budget();
+    size_t host_budget = ucache->pinned_pool_budget();
     if (host_budget == 0) {
-        printf("  SKIP: host cache has 0 budget\n");
+        printf("  SKIP: host arena has 0 budget\n");
         return true;
     }
 
-    printf("  Host cache budget: %zu MB\n", host_budget / (1024*1024));
+    printf("  Host arena budget: %zu MB\n", host_budget / (1024*1024));
     printf("  PASS: three-tier memory system available\n");
     return true;
 }

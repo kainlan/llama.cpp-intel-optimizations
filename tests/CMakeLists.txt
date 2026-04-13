@@ -881,17 +881,6 @@ if(GGML_SYCL)
     install(TARGETS test-pinned-probe RUNTIME)
 endif()
 
-# test-iommu-dma-stress: opt-in pinned-host DMA stress test (can crash GPU driver)
-if(GGML_SYCL)
-    add_executable(test-iommu-dma-stress test-iommu-dma-stress.cpp)
-    target_link_libraries(test-iommu-dma-stress PRIVATE ggml ggml-cpu)
-    target_include_directories(test-iommu-dma-stress PRIVATE
-        ${PROJECT_SOURCE_DIR}/ggml/include
-        ${PROJECT_SOURCE_DIR}/ggml/src)
-    target_compile_options(test-iommu-dma-stress PRIVATE "-fsycl" "-Wno-narrowing")
-    target_link_options(test-iommu-dma-stress PRIVATE "-fsycl")
-    install(TARGETS test-iommu-dma-stress RUNTIME)
-endif()
 
 # test-unified-cache-bugs: regression tests for unified cache bug fixes
 if(GGML_SYCL)
@@ -920,33 +909,6 @@ if(GGML_SYCL)
     add_test(NAME test-unified-cache-integrity COMMAND $<TARGET_FILE:test-unified-cache-integrity>)
 endif()
 
-# test-host-cache-stress: stress host_cache map + guard checks under heavy layout caching
-if(GGML_SYCL)
-    add_executable(test-host-cache-stress test-host-cache-stress.cpp)
-    target_link_libraries(test-host-cache-stress PRIVATE ggml ggml-cpu)
-    target_include_directories(test-host-cache-stress PRIVATE
-        ${PROJECT_SOURCE_DIR}/ggml/include
-        ${PROJECT_SOURCE_DIR}/ggml/src)
-    target_compile_definitions(test-host-cache-stress PRIVATE GGML_SYCL_WARP_SIZE=32)
-    target_compile_options(test-host-cache-stress PRIVATE "-fsycl" "-Wno-narrowing")
-    target_link_options(test-host-cache-stress PRIVATE "-fsycl")
-    install(TARGETS test-host-cache-stress RUNTIME)
-    add_test(NAME test-host-cache-stress COMMAND $<TARGET_FILE:test-host-cache-stress>)
-endif()
-
-# test-host-cache-layout-rehash: stress ggml_sycl_get_weight_layout_ptr insertion path
-if(GGML_SYCL)
-    add_executable(test-host-cache-layout-rehash test-host-cache-layout-rehash.cpp)
-    target_link_libraries(test-host-cache-layout-rehash PRIVATE ggml ggml-cpu)
-    target_include_directories(test-host-cache-layout-rehash PRIVATE
-        ${PROJECT_SOURCE_DIR}/ggml/include
-        ${PROJECT_SOURCE_DIR}/ggml/src)
-    target_compile_definitions(test-host-cache-layout-rehash PRIVATE GGML_SYCL_WARP_SIZE=32)
-    target_compile_options(test-host-cache-layout-rehash PRIVATE "-fsycl" "-Wno-narrowing")
-    target_link_options(test-host-cache-layout-rehash PRIVATE "-fsycl")
-    install(TARGETS test-host-cache-layout-rehash RUNTIME)
-    add_test(NAME test-host-cache-layout-rehash COMMAND $<TARGET_FILE:test-host-cache-layout-rehash>)
-endif()
 
 # test-layout-bytes: validate layout-specific byte sizes
 if(GGML_SYCL)
@@ -976,18 +938,6 @@ if(GGML_SYCL)
     add_test(NAME test-unified-cache-unpin-event COMMAND $<TARGET_FILE:test-unified-cache-unpin-event>)
 endif()
 
-# test-host-cache-guard: verifies host cache guard detects overruns
-if(GGML_SYCL)
-    add_executable(test-host-cache-guard test-host-cache-guard.cpp)
-    target_link_libraries(test-host-cache-guard PRIVATE ggml ggml-cpu)
-    target_include_directories(test-host-cache-guard PRIVATE
-        ${PROJECT_SOURCE_DIR}/ggml/include
-        ${PROJECT_SOURCE_DIR}/ggml/src)
-    target_compile_options(test-host-cache-guard PRIVATE "-fsycl" "-Wno-narrowing")
-    target_link_options(test-host-cache-guard PRIVATE "-fsycl")
-    install(TARGETS test-host-cache-guard RUNTIME)
-    add_test(NAME test-host-cache-guard COMMAND $<TARGET_FILE:test-host-cache-guard>)
-endif()
 
 # test-unified-cache-concurrent: concurrency stress tests for unified cache
 if(GGML_SYCL)
@@ -1467,18 +1417,6 @@ if(GGML_SYCL)
     install(TARGETS test-sycl-moe-expert-parallelism RUNTIME)
     add_test(NAME test-sycl-moe-expert-parallelism COMMAND $<TARGET_FILE:test-sycl-moe-expert-parallelism>)
 
-    # test-sycl-weight-cache-guard: stress weight cache guard + host reorders.
-    add_executable(test-sycl-weight-cache-guard test-sycl-weight-cache-guard.cpp)
-    target_link_libraries(test-sycl-weight-cache-guard PRIVATE ggml)
-    target_include_directories(test-sycl-weight-cache-guard PRIVATE
-        ${PROJECT_SOURCE_DIR}/ggml/include
-        ${PROJECT_SOURCE_DIR}/ggml/src
-        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-sycl)
-    target_compile_options(test-sycl-weight-cache-guard PRIVATE "-fsycl" "-Wno-narrowing")
-    target_link_options(test-sycl-weight-cache-guard PRIVATE "-fsycl")
-    install(TARGETS test-sycl-weight-cache-guard RUNTIME)
-    add_test(NAME test-sycl-weight-cache-guard COMMAND $<TARGET_FILE:test-sycl-weight-cache-guard>)
-
     # test-sycl-tensor-usage: validates tensor usage inference by name.
     add_executable(test-sycl-tensor-usage test-sycl-tensor-usage.cpp)
     target_link_libraries(test-sycl-tensor-usage PRIVATE ggml)
@@ -1653,18 +1591,6 @@ if(GGML_SYCL)
     target_link_options(test-sycl-soa PRIVATE "-fsycl")
     install(TARGETS test-sycl-soa RUNTIME)
     add_test(NAME test-sycl-soa COMMAND $<TARGET_FILE:test-sycl-soa>)
-
-    # test-pinned-chunk-pool: Tests for 8GB chunked pinned host memory allocator
-    # Part of tiered memory architecture for MoE models
-    add_executable(test-pinned-chunk-pool test-pinned-chunk-pool.cpp)
-    target_link_libraries(test-pinned-chunk-pool PRIVATE ggml)
-    target_include_directories(test-pinned-chunk-pool PRIVATE
-        ${PROJECT_SOURCE_DIR}/ggml/include
-        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-sycl)
-    target_compile_options(test-pinned-chunk-pool PRIVATE "-fsycl" "-Wno-narrowing")
-    target_link_options(test-pinned-chunk-pool PRIVATE "-fsycl")
-    install(TARGETS test-pinned-chunk-pool RUNTIME)
-    add_test(NAME test-pinned-chunk-pool COMMAND $<TARGET_FILE:test-pinned-chunk-pool>)
 
     # test-sycl-chunk-manager: Unit tests for sub-tensor streaming chunk abstraction
     # Part of unified memory management system (epic llama.cpp-v3n, task llama.cpp-4ye)

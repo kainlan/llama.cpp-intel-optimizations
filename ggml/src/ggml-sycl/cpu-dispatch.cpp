@@ -2325,7 +2325,7 @@ static void staging_begin_op() {
 
 // Get host-accessible pointer for a tensor.
 // If tensor is in host-accessible memory, returns original pointer.
-// For weight tensors: tries host_cache first (AOS data, no device copy needed).
+// For weight tensors: tries unified cache first (AOS data, no device copy needed).
 // For activations/compute tensors: copies device→host via staging (event-based).
 //
 // out_event: if non-null, set to the memcpy event that must complete before
@@ -2406,17 +2406,9 @@ static void * get_host_ptr(const ggml_tensor * t,
                     }
                 }
 
-                // Try host_cache (pinned AOS copies of device-resident weights).
-                auto * hcache = ggml_sycl::get_host_cache_for_device(device);
-                if (hcache) {
-                    int    layer_id  = ggml_sycl::extract_layer_id(t->name);
-                    int    expert_id = ggml_sycl::extract_expert_id(t->name);
-                    void * hp        = hcache->get(key, ggml_sycl::cache_entry_type::DENSE_WEIGHT, layer_id, expert_id,
-                                                   GGML_LAYOUT_AOS);
-                    if (hp) {
-                        return hp;
-                    }
-                }
+                // Host-pinned AOS weight data is managed by unified_cache.
+                // If the unified cache view above didn't find it, fall through
+                // to mmap or staging path below.
             }
         }
 

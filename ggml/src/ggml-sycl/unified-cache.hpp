@@ -744,210 +744,9 @@ struct unified_cache_entry {
     // NOTE: Reorder state is tracked in tensor->extra->optimized_feature, not here
 };
 
-// Host cache entry (canonical layouts in host memory)
-struct host_cache_entry {
-    void *                host_ptr     = nullptr;
-    const void *          src_ptr      = nullptr;
-    uint64_t              content_hash = 0;
-    size_t                size         = 0;
-    size_t                guard_size   = 0;
-    cache_entry_type      type         = cache_entry_type::DENSE_WEIGHT;
-    int                   layer_id     = -1;
-    int                   expert_id    = -1;
-    ggml_layout_mode      layout       = GGML_LAYOUT_AOS;
-    uint32_t              access_count = 0;
-    int64_t               last_access  = 0;
-    bool                  pinned       = false;
-    bool                  owns_ptr     = true;
-    bool                  pinned_alloc = false;  // true if allocated via sycl::malloc_host
-    bool                  zone_managed = false;
-    host_zone_id          zone         = host_zone_id::COUNT;
-    cache_location        location     = cache_location::HOST_PINNED;
-    cache_layout_xmx_info xmx_info     = {};
-};
-
-// Forward declarations needed for friend function signatures inside host_cache/unified_cache.
+// Forward declarations needed for friend function signatures inside unified_cache.
 struct alloc_request;
 struct alloc_handle;
-
-// Host cache for canonical layouts (pinned-first, mmap alias fallback)
-class host_cache {
-  public:
-    host_cache(sycl::queue & queue, size_t budget_bytes);
-    ~host_cache();
-
-    void * allocate_pinned_runtime(size_t size, size_t alignment = 64);
-    [[deprecated("use host_zone_reset() or zone-managed lifetime instead")]] void free_pinned_runtime(void * ptr,
-                                                                                                      size_t size);
-    // (host_zone_alloc / host_zone_alloc_segmented are private — use
-    //  unified_cache_host_zone_alloc free function)
-    void   host_zone_reset(host_zone_id zone);
-    size_t host_zone_used(host_zone_id zone) const;
-    size_t host_zone_capacity(host_zone_id zone) const;
-    void   configure_host_zones(size_t weight_bytes, size_t kv_bytes, size_t staging_bytes, size_t scratch_bytes);
-    bool   host_zones_configured() const;
-
-    // Grow the SCRATCH zone to accommodate compute buffer needs discovered
-    // after the ggml scheduler is created.  This is called when the actual
-    // compute buffer sizes are known (from ggml_backend_sched_get_buffer_size).
-    void grow_scratch_zone(size_t additional_bytes);
-
-    size_t pinned_pool_budget() const;
-
-    // Check if a pointer belongs to the pinned pool (for free routing).
-    bool contains_pinned(const void * ptr) const;
-
-    // Pre-allocate pinned chunks so that inference-time allocate() never
-    // triggers sycl::malloc_host (which blocks the Level Zero driver).
-    // Call at init time after MoE prestage completes.
-    size_t pre_allocate_pinned(size_t total_bytes);
-
-    // Pre-allocate ALL pinned memory for the full model weight set.
-    // Called once after model header is parsed (tensor count + sizes known).
-    // Ensures zero sycl::malloc_host calls during inference.
-    size_t pre_allocate_all(size_t model_weight_bytes);
-
-    // Pre-allocate runtime pool chunks to prevent lazy growth during inference.
-    // Call after placement plan is computed with total runtime bytes needed.
-    size_t pre_allocate_runtime_chunks(size_t total_bytes);
-
-    host_cache(const host_cache &)             = delete;
-    host_cache & operator=(const host_cache &) = delete;
-    host_cache(host_cache &&)                  = delete;
-    host_cache & operator=(host_cache &&)      = delete;
-
-    void * ensure_cached_alloc(const ggml_sycl_cache_id &    key,
-                               const void *                  src_ptr,
-                               size_t                        src_size,
-                               size_t                        dst_size,
-                               cache_entry_type              type,
-                               int                           layer_id,
-                               int                           expert_id,
-                               ggml_layout_mode              layout,
-                               bool                          validate_content,
-                               bool *                        needs_fill,
-                               bool *                        pinned_alloc_out,
-                               cache_location *              location_out,
-                               const cache_layout_xmx_info * xmx_info);
-
-    bool           is_cached(const ggml_sycl_cache_id & key,
-                             cache_entry_type           type,
-                             int                        layer_id,
-                             int                        expert_id,
-                             ggml_layout_mode           layout) const;
-    void *         get(const ggml_sycl_cache_id & key,
-                       cache_entry_type           type,
-                       int                        layer_id,
-                       int                        expert_id,
-                       ggml_layout_mode           layout);
-    cache_location get_location(const ggml_sycl_cache_id & key,
-                                cache_entry_type           type,
-                                int                        layer_id,
-                                int                        expert_id,
-                                ggml_layout_mode           layout) const;
-    bool           check_guard(const ggml_sycl_cache_id & key,
-                               cache_entry_type           type,
-                               int                        layer_id,
-                               int                        expert_id,
-                               ggml_layout_mode           layout) const;
-    bool           check_all_guards(const char * where);
-    void           remove(const ggml_sycl_cache_id & key,
-                          cache_entry_type           type,
-                          int                        layer_id,
-                          int                        expert_id,
-                          ggml_layout_mode           layout);
-
-    // Adopt a pre-filled host-pinned buffer from async D2H eviction.
-    // The buffer was allocated via sycl::malloc_host and already contains
-    // the transformed layout data copied from device.  The host_cache takes
-    // ownership of the pointer (will free it on eviction/destruction).
-    bool adopt_evicted(const ggml_sycl_cache_id &    key_id,
-                       void *                        host_ptr,
-                       size_t                        size,
-                       cache_entry_type              type,
-                       int                           layer_id,
-                       int                           expert_id,
-                       ggml_layout_mode              layout,
-                       const cache_layout_xmx_info * xmx_info = nullptr);
-
-    void pin(const ggml_sycl_cache_id & key,
-             cache_entry_type           type,
-             int                        layer_id,
-             int                        expert_id,
-             ggml_layout_mode           layout);
-    void unpin(const ggml_sycl_cache_id & key,
-               cache_entry_type           type,
-               int                        layer_id,
-               int                        expert_id,
-               ggml_layout_mode           layout);
-    void unpin_all();
-
-    size_t used() const { return used_.load(); }
-
-    size_t budget() const { return budget_; }
-
-    bool is_budget_exceeded() const { return budget_exceeded_; }
-
-    size_t evict(size_t bytes_needed);
-
-    // Evict all weight entries (DENSE_WEIGHT and MOE_EXPERT) from the host cache.
-    // Called during new model load to reclaim pinned pool space from the previous model.
-    // Returns total bytes freed.
-    size_t evict_all_weights();
-
-    // Reserve non-cache runtime buffers (compute, KV, etc.)
-    void update_reserved_bytes(size_t reserved_bytes);
-
-  private:
-    // Allocate from a specific host zone. Returns a segmented_buffer.
-    segmented_buffer host_zone_alloc_segmented(host_zone_id zone, size_t size, size_t alignment = 64);
-    // Legacy wrapper: returns first segment's pointer. For large allocations, use host_zone_alloc_segmented().
-    void * host_zone_alloc(host_zone_id zone, size_t size, size_t alignment = 64);
-
-    // Friends: unified_cache member functions and internal alloc routines need host zone access.
-    friend class unified_cache;
-    friend bool         unified_alloc(const alloc_request & req_in, alloc_handle * out);
-    friend void *       unified_cache_host_zone_alloc(host_zone_id zone, size_t size, size_t alignment);
-
-    size_t evict_one();
-    float  compute_score(const host_cache_entry & entry) const;
-    void   free_entry(host_cache_entry & entry);
-
-    // Saturating subtract from used_ to prevent underflow to SIZE_MAX.
-    // Logs a warning if underflow is detected, then clamps to 0.
-    void saturating_sub_used(size_t bytes) {
-        size_t prev = used_.load(std::memory_order_relaxed);
-        for (;;) {
-            const size_t next = (prev >= bytes) ? (prev - bytes) : 0;
-            if (used_.compare_exchange_weak(prev, next, std::memory_order_relaxed)) {
-                if (prev < bytes) {
-                    fprintf(stderr, "[HOST-CACHE] used_ underflow prevented: prev=%zu sub=%zu clamped to 0\n", prev,
-                            bytes);
-                }
-                return;
-            }
-        }
-    }
-
-    sycl::queue &        queue_;
-    size_t               budget_          = 0;
-    size_t               base_budget_     = 0;
-    size_t               reserved_        = 0;
-    bool                 budget_exceeded_ = false;
-    std::atomic<size_t>  used_{ 0 };
-    std::atomic<int64_t> time_{ 0 };
-
-    std::unordered_map<unified_cache_key,
-                       host_cache_entry,
-                       unified_cache_key_hash,
-                       std::equal_to<unified_cache_key>,
-                       detail::cache_guard_allocator<std::pair<const unified_cache_key, host_cache_entry>>>
-        entries_;
-
-    static constexpr float DECAY_ALPHA = 0.01f;
-
-    mutable std::mutex mutex_;
-};
 
 // Weight set for a transformer layer (for bulk pinning)
 // Supports standard dense transformer architecture with attention + FFN blocks.
@@ -1358,18 +1157,16 @@ class unified_cache {
     // --- Async DMA eviction (P7) ---
 
     // Poll in-flight D2H evictions and finalize completed ones.
-    // Reclaims arena/device space, removes device entry, host_cache entry
-    // now holds the preserved layout data.  Call at safe sync points
+    // Reclaims arena/device space, removes device entry.
+    // Call at safe sync points
     // (between graph_compute calls, after queue drain).
     // Returns number of entries finalized.
     size_t finalize_evictions();
     size_t finalize_evictions_locked();  // Caller must hold rw_mutex_ (unique)
 
-    // Re-promote a weight from host cache back to device VRAM.
-    // Looks up the key in host_cache; if found with preserved layout,
-    // issues async H2D copy via DMA queue.  Returns device pointer
-    // on success (entry transitions to IN_PROGRESS with ready_event),
-    // or nullptr if host data not available or VRAM insufficient.
+    // Re-promote a weight back to device VRAM.
+    // With plan-driven placement, re-promotion is handled by the
+    // normal ensure_cached path (re-reads from mmap).  Returns nullptr.
     void * promote_to_device(const unified_cache_key & key, size_t size);
 
     // === Stats ===
@@ -1837,7 +1634,7 @@ class unified_cache {
     size_t           pre_allocate_pinned(size_t total_bytes);
     size_t           pre_allocate_all(size_t model_weight_bytes);
     size_t           pre_allocate_runtime_chunks(size_t total_bytes);
-    // Host zone allocation (replaces host_cache private methods — now owned by unified_cache).
+    // Host zone allocation (owned by unified_cache).
     segmented_buffer host_zone_alloc_segmented(host_zone_id zone, size_t size, size_t alignment = 64);
     void *           host_zone_alloc(host_zone_id zone, size_t size, size_t alignment = 64);
 
@@ -2152,7 +1949,7 @@ class unified_cache {
     mutable std::shared_mutex           rw_mutex_;
     mutable std::condition_variable_any entry_cv_;
 
-    // Host memory arena (moved from host_cache as pinned_chunk_pool).
+    // Host memory arena (pinned_chunk_pool).
     // Bypasses Intel Level Zero's ~11GB per-allocation limit via 2GB chunks.
     // Initialized with capped budget (128 GB) to prevent unbounded growth.
     std::unique_ptr<pinned_chunk_pool> host_arena_;
@@ -2628,17 +2425,6 @@ size_t compute_moe_effective_weight_bytes(size_t total_weight_bytes,
                                           int    n_expert,
                                           int    n_expert_used);
 
-// Host cache accessors (canonical layouts in host memory)
-host_cache * get_host_cache(sycl::queue & queue);
-host_cache * get_host_cache_for_device(int device_id);
-
-// Lock-free fast path: returns host_cache if already created, nullptr otherwise.
-// Never creates the cache, never acquires exclusive locks. Safe to call from
-// any context including inside malloc_host tracked paths.
-host_cache * try_get_host_cache();
-int          host_cache_guard_error_count();
-void         host_cache_guard_reset();
-bool         host_cache_guard_check_all(int device_id, const char * where);
 
 // === OneDNN FP16 Scratch Buffer API ===
 // Reserve pre-allocated scratch buffers for oneDNN FP16 prompt processing.

@@ -307,14 +307,13 @@ static bool test_vram_to_host_eviction() {
         return false;
     }
 
-    // Check if host cache is available
-    ggml_sycl::host_cache * hcache = ggml_sycl::get_host_cache_for_device(0);
-    if (!hcache) {
-        printf("  SKIP: host cache not available\n");
+    // Check if host arena is available via unified cache
+    if (cache->pinned_pool_budget() == 0) {
+        printf("  SKIP: host arena not available\n");
         return true;
     }
 
-    // The unified cache already supports tiering through the direct staging API
+    // The unified cache supports tiering through the direct staging API
     // and the host_resident flag in cache entries. This test verifies the
     // behavior exists.
 

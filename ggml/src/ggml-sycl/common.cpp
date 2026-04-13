@@ -588,9 +588,9 @@ void * ggml_sycl_host_malloc(size_t size) try {
 
     // mubmt.5: Try unified-cache pinned pool first to avoid direct sycl::malloc_host churn.
     // The pinned_chunk_pool uses 8GB chunks to bypass Level Zero's ~11GB per-allocation limit.
-    auto * hcache = ggml_sycl::try_get_host_cache();
-    if (hcache) {
-        void * ptr = hcache->allocate_pinned_runtime(size, 64);
+    auto * ucache = ggml_sycl::get_unified_cache_for_device(0);
+    if (ucache) {
+        void * ptr = ucache->allocate_pinned_runtime(size, 64);
         if (ptr) {
             ggml_sycl::offload_stats_note_host_alloc("unified_cache_pinned_pool", size);
             ggml_sycl_alloc_trace_record("host", size, "unified_cache_pinned_pool");
@@ -856,10 +856,10 @@ void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> str
                 // Check if this is a pool allocation (via alloc_registry)
                 const auto * reg = ggml_sycl::alloc_registry::instance().lookup(extra->data_device[i]);
                 if (reg && reg->type == ggml_sycl::alloc_type::HOST_PINNED) {
-                    // Pool allocation - return to pool via host_cache
-                    auto * hcache = ggml_sycl::try_get_host_cache();
-                    if (hcache && extra->data_device_size[i] > 0) {
-                        hcache->free_pinned_runtime(extra->data_device[i], extra->data_device_size[i]);
+                    // Pool allocation - return to pool via unified_cache
+                    auto * ucache = ggml_sycl::get_unified_cache_for_device(i);
+                    if (ucache && extra->data_device_size[i] > 0) {
+                        ucache->free_pinned_runtime(extra->data_device[i], extra->data_device_size[i]);
                     }
                 } else if (extra->data_device_size[i] > 0) {
                     // Raw USM allocation
