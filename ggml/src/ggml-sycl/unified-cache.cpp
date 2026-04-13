@@ -4376,8 +4376,8 @@ bool unified_cache::validate() const {
 // allocations is handled by the overcommit guard in unified_cache_total_committed_bytes()
 // rather than by shrinking the weight cache budget via this method.  Callers that
 // previously used g_runtime_reserved_bytes to drive update_reserved_bytes() have been
-// removed.  The method is retained for the host cache path (host runtime tracking)
-// and deferred-reserve patterns during cache creation.
+// removed.  The method is retained for unified_cache deferred-reserve patterns
+// during cache creation.
 void unified_cache::update_reserved_bytes(size_t reserved_bytes) {
     size_t effective_budget = 0;
     {
