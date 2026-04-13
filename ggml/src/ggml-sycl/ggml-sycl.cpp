@@ -2173,23 +2173,43 @@ static bool ggml_sycl_is_device_expert_ptr(const void * ptr) {
     return ptr && ggml_sycl_get_alloc_type(ptr) == sycl::usm::alloc::device;
 }
 
-static const void * ggml_sycl_resolve_host_expert_ptr(const ggml_tensor * src0,
-                                                      int                 device,
-                                                      int                 expert_id,
-                                                      const void *        fallback) {
+struct expert_resolve_result {
+    const void * ptr;
+    bool         is_host;   // true = safe for CPU vec_dot
+};
+
+static expert_resolve_result ggml_sycl_resolve_expert_ptr(
+    const ggml_tensor * src0, int device, int expert_id) {
     auto * extra = static_cast<ggml_tensor_extra_gpu *>(src0 ? src0->extra : nullptr);
-    if (src0 && extra) {
-        ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
-        ggml_sycl_cache_id         key   = ggml_sycl_get_moe_expert_cache_key(src0, extra, expert_id);
-        if (cache && key.valid) {
-            if (const ggml_sycl::weight_entry * entry = cache->lookup_expert(key);
-                entry && entry->ptr && entry->location != ggml_sycl::cache_location::DEVICE) {
-                return entry->ptr;
-            }
+    if (!src0 || !extra) {
+        return {nullptr, false};
+    }
+
+    // 1. Try unified cache lookup
+    unified_cache * cache = get_unified_cache_for_device(device);
+    ggml_sycl_cache_id key = ggml_sycl_get_moe_expert_cache_key(src0, extra, expert_id);
+    if (cache && key.valid) {
+        if (const weight_entry * entry = cache->lookup_expert(key);
+            entry && entry->ptr) {
+            bool host = (entry->location != cache_location::DEVICE);
+            return {entry->ptr, host};
         }
     }
 
-    return fallback;
+    // 2. Cache miss -- check tensor buffer type
+    if (src0->buffer && ggml_backend_buffer_is_host(src0->buffer)) {
+        const size_t expert_offset = static_cast<size_t>(expert_id) * src0->nb[2];
+        return {static_cast<const char *>(src0->data) + expert_offset, true};
+    }
+
+    // 3. Device-resident, not in cache -- return device pointer, mark NOT host
+    void * dev_ptr = extra->data_device_ptr(device);
+    if (dev_ptr) {
+        const size_t expert_offset = static_cast<size_t>(expert_id) * src0->nb[2];
+        return {static_cast<const char *>(dev_ptr) + expert_offset, false};
+    }
+
+    return {nullptr, false};
 }
 
 bool moe_get_expert_stage_info(int layer_idx, int expert_idx, int device_id, expert_stage_info & out) {
@@ -2936,22 +2956,15 @@ static void moe_compute_gate_norm_placement(ggml_cgraph * cgraph, int device) {
         // Gate weights are f32, typically in host or unified memory.
         const float * gate_data = nullptr;
 
-        // Check if data is host-accessible
-        sycl::usm::alloc atype = sycl::usm::alloc::unknown;
-        try {
-            atype = ggml_sycl_get_alloc_type(gate.tensor->data);
-        } catch (...) {
-            // get_alloc_type may throw if context is invalid
-        }
-
-        if (atype == sycl::usm::alloc::device) {
+        // Check if data is host-accessible via buffer type
+        if (!gate.tensor->buffer || !ggml_backend_buffer_is_host(gate.tensor->buffer)) {
             // Data is in device VRAM — cannot read from host.
             // This shouldn't happen for gate_inp (usually f32 in host memory).
             GGML_LOG_WARN("[MOE-GATE-NORM] Gate tensor blk.%d is device-only, skipping\n", gate.block_num);
             continue;
         }
 
-        // Host or shared memory — directly accessible
+        // Host buffer — directly accessible
         gate_data = static_cast<const float *>(gate.tensor->data);
         if (!gate_data) {
             continue;
@@ -4073,11 +4086,16 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
                 }
 
                 gate_up_pair pair;
-                pair.up_data                            = up_info.tensor->data;
+                // Only store up_data if it's host-accessible (safe for CPU vec_dot).
+                // Device-resident tensor data must not be dereferenced from host.
+                const bool up_host_accessible = up_info.tensor->buffer &&
+                                                ggml_backend_buffer_is_host(up_info.tensor->buffer);
+                pair.up_data                            = up_host_accessible ? up_info.tensor->data : nullptr;
                 pair.nb02                               = up_info.tensor->nb[2];
                 pair.type                               = up_info.tensor->type;
                 pair.K                                  = up_info.tensor->ne[0];
                 pair.N                                  = up_info.tensor->ne[1];
+                // Map key: tensor->data as opaque identifier (not dereferenced)
                 g_gate_up_pairs[gate_info.tensor->data] = pair;
                 n_pairs++;
                 break;  // One up per gate
@@ -11234,10 +11252,21 @@ static bool ggml_sycl_preload_moe_experts(const ggml_tensor * src0, int device, 
 
     size_t            failed = 0;
     const std::string tname(src0->name ? src0->name : "");
+    const bool        src0_host_accessible = src0->buffer && ggml_backend_buffer_is_host(src0->buffer);
     for (int64_t e = 0; e < n_experts; ++e) {
-        const uint8_t *    expert_aos = static_cast<const uint8_t *>(src0->data) + e * expert_size;
-        ggml_sycl_cache_id key        = ggml_sycl_get_moe_expert_cache_key(src0, extra, static_cast<int>(e));
-        if (!expert_aos || !key.valid) {
+        ggml_sycl_cache_id key = ggml_sycl_get_moe_expert_cache_key(src0, extra, static_cast<int>(e));
+        if (!key.valid) {
+            failed++;
+            continue;
+        }
+
+        // Skip host staging for device-resident experts — they are already on device.
+        if (!src0_host_accessible) {
+            continue;
+        }
+
+        const uint8_t * expert_aos = static_cast<const uint8_t *>(src0->data) + e * expert_size;
+        if (!expert_aos) {
             failed++;
             continue;
         }
@@ -11538,6 +11567,8 @@ static void ggml_sycl_preload_model_weights() {
 #endif
                     }
 
+                    const bool tensor_host_accessible = tensor->buffer && ggml_backend_buffer_is_host(tensor->buffer);
+
                     bool any_cached = false;
                     for (int64_t e = 0; e < n_experts; ++e) {
                         // P4: Check placement plan — host-planned experts are staged
@@ -11545,6 +11576,10 @@ static void ggml_sycl_preload_model_weights() {
                         if (have_plan) {
                             if (!cache->get_placement_plan().expert_on_device(tname, static_cast<int>(e), device)) {
                                 // Expert is host-planned: copy mmap data into host arena.
+                                // Skip if tensor data is device-resident (already on device).
+                                if (!tensor_host_accessible) {
+                                    continue;
+                                }
                                 const uint8_t * expert_aos =
                                     static_cast<const uint8_t *>(tensor->data) + e * expert_size;
                                 if (expert_aos) {
@@ -11571,6 +11606,11 @@ static void ggml_sycl_preload_model_weights() {
                                 }
                                 continue;
                             }
+                        }
+
+                        // Skip device-resident experts — already on device, no host staging needed.
+                        if (!tensor_host_accessible) {
+                            continue;
                         }
 
                         const uint8_t *    expert_aos = static_cast<const uint8_t *>(tensor->data) + e * expert_size;
@@ -33750,9 +33790,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         std::future<void> first_cpu_future;
                         bool              first_cpu_pending = false;
                         const size_t      n_cpu_first       = fusion.cpu_indices.size();
+                        size_t            n_valid_first     = 0;
 
                         // Persistent task storage for async CPU dispatch (must outlive future)
                         static thread_local std::vector<cpu_expert_task> tl_first_tasks;
+                        static thread_local std::vector<size_t>          valid_fi_first;
 
                         static thread_local managed_host_pinned_buffer tl_first_out;
                         const int64_t                                  N_first = ne01;
@@ -33770,30 +33812,41 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             fusion.wait_act_d2h();
 
                             tl_first_tasks.resize(n_cpu_first);
+                            valid_fi_first.resize(n_cpu_first);
                             for (size_t fi = 0; fi < n_cpu_first; fi++) {
                                 const size_t  ci  = fusion.cpu_indices[fi];
                                 const int32_t eid = fusion.ids_data[ci];
-                                tl_first_tasks[fi].weight_host =
-                                    static_cast<const char *>(src0_host_storage) + static_cast<size_t>(eid) * nb02;
-                                tl_first_tasks[fi].act_host = fusion.act_host;
-                                tl_first_tasks[fi].output_host =
-                                    tl_first_out.as<float>() + fi * static_cast<size_t>(N_first);
-                                tl_first_tasks[fi].type = fusion.type;
-                                tl_first_tasks[fi].K    = fusion.K;
-                                tl_first_tasks[fi].N    = static_cast<int>(N_first);
+                                auto resolved = ggml_sycl::ggml_sycl_resolve_expert_ptr(
+                                    src0, ctx.device, static_cast<int>(eid));
+                                if (!resolved.ptr || !resolved.is_host) {
+                                    // Expert is device-resident -- skip CPU dispatch.
+                                    continue;
+                                }
+                                tl_first_tasks[n_valid_first].weight_host = resolved.ptr;
+                                tl_first_tasks[n_valid_first].act_host = fusion.act_host;
+                                tl_first_tasks[n_valid_first].output_host =
+                                    tl_first_out.as<float>() + n_valid_first * static_cast<size_t>(N_first);
+                                tl_first_tasks[n_valid_first].type = fusion.type;
+                                tl_first_tasks[n_valid_first].K    = fusion.K;
+                                tl_first_tasks[n_valid_first].N    = static_cast<int>(N_first);
+                                valid_fi_first[n_valid_first] = fi;
+                                n_valid_first++;
                             }
+                            tl_first_tasks.resize(n_valid_first);
+                            valid_fi_first.resize(n_valid_first);
                             // Submit async — GPU dispatches below run in parallel
                             auto * tasks_ptr = tl_first_tasks.data();
-                            int    n_tasks   = static_cast<int>(n_cpu_first);
+                            int    n_tasks   = static_cast<int>(n_valid_first);
                             auto & cpu_pool  = g_cpu_expert_pools[ctx.device];
-                            if (cpu_pool.is_active()) {
+                            if (n_tasks > 0 && cpu_pool.is_active()) {
                                 first_cpu_future = cpu_pool.submit_batch(tasks_ptr, n_tasks);
-                            } else {
+                                first_cpu_pending = true;
+                            } else if (n_tasks > 0) {
                                 first_cpu_future = std::async(std::launch::async, [tasks_ptr, n_tasks]() {
                                     ggml_sycl_cpu_expert_mul_mat_batched(tasks_ptr, n_tasks);
                                 });
+                                first_cpu_pending = true;
                             }
-                            first_cpu_pending = true;
                         }
 
                         // Dispatch secondary GPU experts for this sub-tensor
@@ -33857,16 +33910,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             first_cpu_future.get();
 
                             if (g_moe_profile_enabled) {
-                                g_moe_profile.moe_compute_done(static_cast<int>(n_cpu_first), 0);
+                                g_moe_profile.moe_compute_done(static_cast<int>(n_valid_first), 0);
                             }
 
-                            for (size_t fi = 0; fi < n_cpu_first; fi++) {
+                            for (size_t i = 0; i < n_valid_first; i++) {
+                                const size_t  fi   = valid_fi_first[i];
                                 const size_t  ci   = fusion.cpu_indices[fi];
                                 const int64_t iid1 = static_cast<int64_t>(ci / static_cast<size_t>(n_ids_f));
                                 const int64_t id   = static_cast<int64_t>(ci % static_cast<size_t>(n_ids_f));
                                 char *        slot = dst_device_base + id * nb1 + iid1 * nb2;
                                 tl_pending_scatter.push_back(
-                                    stream->memcpy(slot, tl_first_out.as<float>() + fi * static_cast<size_t>(N_first),
+                                    stream->memcpy(slot, tl_first_out.as<float>() + i * static_cast<size_t>(N_first),
                                                    static_cast<size_t>(N_first) * sizeof(float)));
                             }
                         }
@@ -33968,21 +34022,32 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         dt = heap_dt.data();
                     }
 
+                    size_t n_valid_d = 0;
+                    // Track original cpu_indices for valid entries (needed for scatter)
+                    static thread_local std::vector<size_t> valid_ci_d;
+                    valid_ci_d.resize(n_cpu_d);
                     for (size_t fi = 0; fi < n_cpu_d; fi++) {
                         const size_t  ci  = fusion.cpu_indices[fi];
                         const int32_t eid = fusion.ids_data[ci];
-                        dt[fi].weight_host =
-                            static_cast<const char *>(src0_host_storage) + static_cast<size_t>(eid) * nb02;
-                        dt[fi].act_host    = fusion.fused_output + fi * static_cast<size_t>(fusion.N_gate);
-                        dt[fi].output_host = tl_down_out.as<float>() + fi * static_cast<size_t>(N_d);
+                        auto resolved = ggml_sycl::ggml_sycl_resolve_expert_ptr(
+                            src0, ctx.device, static_cast<int>(eid));
+                        if (!resolved.ptr || !resolved.is_host) {
+                            // Expert is device-resident -- skip CPU dispatch.
+                            continue;
+                        }
+                        dt[n_valid_d].weight_host = resolved.ptr;
+                        dt[n_valid_d].act_host    = fusion.fused_output + fi * static_cast<size_t>(fusion.N_gate);
+                        dt[n_valid_d].output_host = tl_down_out.as<float>() + n_valid_d * static_cast<size_t>(N_d);
                         if (fusion.down_bias_data) {
-                            dt[fi].bias =
+                            dt[n_valid_d].bias =
                                 reinterpret_cast<const float *>(reinterpret_cast<const char *>(fusion.down_bias_data) +
                                                                 static_cast<size_t>(eid) * fusion.bias_nb);
                         }
-                        dt[fi].type = src0->type;
-                        dt[fi].K    = static_cast<int>(K_d);
-                        dt[fi].N    = static_cast<int>(N_d);
+                        dt[n_valid_d].type = src0->type;
+                        dt[n_valid_d].K    = static_cast<int>(K_d);
+                        dt[n_valid_d].N    = static_cast<int>(N_d);
+                        valid_ci_d[n_valid_d] = ci;
+                        n_valid_d++;
                     }
 
                     if (g_moe_profile_enabled) {
@@ -33991,7 +34056,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
                     char *                   dst_d = dst_device_base;
                     std::vector<sycl::event> down_events;
-                    down_events.reserve(n_cpu_d + 8);
+                    down_events.reserve(n_valid_d + 8);
 
                     // Dispatch secondary GPU experts for DOWN
                     if (!fusion.sec_indices.empty()) {
@@ -34046,16 +34111,16 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     }
 
                     // CPU down mul_mat -- defer for overlap with subsequent GPU ops
-                    if (n_cpu_d > 0) {
+                    if (n_valid_d > 0) {
                         const bool use_cpu_pipeline = ggml_sycl_pipeline_cpu_enabled();
                         auto & target_tasks = use_cpu_pipeline ? g_pending_cpu_pipeline.tasks : g_pending_scatter.tasks;
                         target_tasks.clear();
-                        target_tasks.reserve(n_cpu_d);
-                        for (size_t fi = 0; fi < n_cpu_d; fi++) {
+                        target_tasks.reserve(n_valid_d);
+                        for (size_t fi = 0; fi < n_valid_d; fi++) {
                             target_tasks.push_back(dt[fi]);
                         }
                         auto *            tasks_ptr = target_tasks.data();
-                        int               n_tasks   = static_cast<int>(n_cpu_d);
+                        int               n_tasks   = static_cast<int>(n_valid_d);
                         auto &            cpu_pool  = g_cpu_expert_pools[ctx.device];
                         std::future<void> fut;
                         if (cpu_pool.is_active()) {
@@ -34067,9 +34132,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         }
                         if (use_cpu_pipeline) {
                             g_pending_cpu_pipeline.entries.clear();
-                            g_pending_cpu_pipeline.entries.reserve(n_cpu_d);
-                            for (size_t fi = 0; fi < n_cpu_d; fi++) {
-                                const size_t  ci   = fusion.cpu_indices[fi];
+                            g_pending_cpu_pipeline.entries.reserve(n_valid_d);
+                            for (size_t fi = 0; fi < n_valid_d; fi++) {
+                                const size_t  ci   = valid_ci_d[fi];
                                 const int64_t iid1 = static_cast<int64_t>(ci / static_cast<size_t>(n_ids_d));
                                 const int64_t id   = static_cast<int64_t>(ci % static_cast<size_t>(n_ids_d));
                                 char *        slot = dst_d + id * nb1 + iid1 * nb2;
@@ -34090,9 +34155,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             g_pending_cpu_pipeline.layer_id     = cur_layer_fast;
                         } else {
                             g_pending_scatter.entries.clear();
-                            g_pending_scatter.entries.reserve(n_cpu_d);
-                            for (size_t fi = 0; fi < n_cpu_d; fi++) {
-                                const size_t  ci   = fusion.cpu_indices[fi];
+                            g_pending_scatter.entries.reserve(n_valid_d);
+                            for (size_t fi = 0; fi < n_valid_d; fi++) {
+                                const size_t  ci   = valid_ci_d[fi];
                                 const int64_t iid1 = static_cast<int64_t>(ci / static_cast<size_t>(n_ids_d));
                                 const int64_t id   = static_cast<int64_t>(ci % static_cast<size_t>(n_ids_d));
                                 char *        slot = dst_d + id * nb1 + iid1 * nb2;
@@ -34116,7 +34181,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     }
 
                     if (g_moe_profile_enabled) {
-                        g_moe_profile.moe_compute_done(static_cast<int>(n_cpu_d), 0);
+                        g_moe_profile.moe_compute_done(static_cast<int>(n_valid_d), 0);
                     }
 
                     {
@@ -34134,7 +34199,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     static std::atomic<int> flog_down{ 0 };
                     if (flog_down.fetch_add(1, std::memory_order_relaxed) < 3) {
                         GGML_LOG_INFO("[CPU-TG-P4] Down fused for layer %d, %zu CPU + %zu sec + %zu GPU0\n",
-                                      cur_layer_fast, n_cpu_d, fusion.sec_indices.size(),
+                                      cur_layer_fast, n_valid_d, fusion.sec_indices.size(),
                                       fusion.gpu0_cached_indices.size());
                     }
                     moe_fusion_erase(cur_layer_fast);
@@ -34567,9 +34632,29 @@ cpu_fallback_fast:
                     }
                 }
 
-                tasks_ptr[n_tasks].weight_host = ggml_sycl::ggml_sycl_resolve_host_expert_ptr(
-                    src0, ctx.device, expert_id,
-                    static_cast<const char *>(src0_host_storage) + static_cast<size_t>(expert_id) * nb02);
+                {
+                    auto resolved = ggml_sycl::ggml_sycl_resolve_expert_ptr(src0, ctx.device, expert_id);
+                    if (!resolved.ptr || !resolved.is_host) {
+                        // Expert is device-resident -- route to GPU0 dispatch instead of CPU.
+                        if (n_gpu0 >= STACK_GPU0 && heap_g0_eids.empty()) {
+                            heap_g0_eids.resize(n_cpu);
+                            heap_g0_iid1s.resize(n_cpu);
+                            heap_g0_ids.resize(n_cpu);
+                            memcpy(heap_g0_eids.data(), stack_g0_eids, STACK_GPU0 * sizeof(int32_t));
+                            memcpy(heap_g0_iid1s.data(), stack_g0_iid1s, STACK_GPU0 * sizeof(int64_t));
+                            memcpy(heap_g0_ids.data(), stack_g0_ids, STACK_GPU0 * sizeof(int64_t));
+                            g0_eids  = heap_g0_eids.data();
+                            g0_iid1s = heap_g0_iid1s.data();
+                            g0_ids   = heap_g0_ids.data();
+                        }
+                        g0_eids[n_gpu0]  = expert_id;
+                        g0_iid1s[n_gpu0] = static_cast<int64_t>(ci / static_cast<size_t>(n_ids_f));
+                        g0_ids[n_gpu0]   = static_cast<int64_t>(ci % static_cast<size_t>(n_ids_f));
+                        n_gpu0++;
+                        continue;
+                    }
+                    tasks_ptr[n_tasks].weight_host = resolved.ptr;
+                }
                 tasks_ptr[n_tasks].act_host    = act_host_ptr;
                 tasks_ptr[n_tasks].output_host = out_ptr;
                 tasks_ptr[n_tasks].type        = src0->type;
@@ -34841,11 +34926,16 @@ cpu_fallback_fast:
                 // add to task array so they are included in the batched CPU call below.
                 if (!cpu_fallback_fast.empty()) {
                     for (const auto & e : cpu_fallback_fast) {
+                        auto resolved = ggml_sycl::ggml_sycl_resolve_expert_ptr(
+                            src0, ctx.device, e.expert_id);
+                        if (!resolved.ptr || !resolved.is_host) {
+                            // Expert is device-resident -- skip CPU dispatch.
+                            continue;
+                        }
                         const size_t ci_fb =
                             static_cast<size_t>(e.iid1) * static_cast<size_t>(n_ids_f) + static_cast<size_t>(e.id);
                         float * out_fb = tl_out_pinned.as<float>() + ci_fb * static_cast<size_t>(N);
-                        tasks_ptr[n_tasks].weight_host =
-                            static_cast<const char *>(src0_host_storage) + static_cast<size_t>(e.expert_id) * nb02;
+                        tasks_ptr[n_tasks].weight_host = resolved.ptr;
                         tasks_ptr[n_tasks].act_host    = act_host_ptr;
                         tasks_ptr[n_tasks].output_host = out_fb;
                         tasks_ptr[n_tasks].type        = src0->type;
@@ -35878,9 +35968,14 @@ cpu_fallback_fast:
                         }
                     }
                     if (!host_weight) {
-                        host_weight = ggml_sycl::ggml_sycl_resolve_host_expert_ptr(
-                            src0, ctx.device, entry.expert_id,
-                            static_cast<const char *>(src0_host_storage) + static_cast<size_t>(entry.expert_id) * nb02);
+                        auto resolved = ggml_sycl::ggml_sycl_resolve_expert_ptr(src0, ctx.device, entry.expert_id);
+                        if (resolved.ptr && resolved.is_host) {
+                            host_weight = resolved.ptr;
+                        }
+                    }
+                    if (!host_weight) {
+                        // Expert is device-resident -- skip CPU dispatch (safety guard).
+                        continue;
                     }
 
                     cpu_expert_task t;
@@ -36868,9 +36963,14 @@ cpu_fallback_fast:
                         }
                     }
                     if (!host_weight) {
-                        host_weight = ggml_sycl::ggml_sycl_resolve_host_expert_ptr(
-                            src0, ctx.device, entry.expert_id,
-                            static_cast<const char *>(src0_host_storage) + static_cast<size_t>(entry.expert_id) * nb02);
+                        auto resolved = ggml_sycl::ggml_sycl_resolve_expert_ptr(src0, ctx.device, entry.expert_id);
+                        if (resolved.ptr && resolved.is_host) {
+                            host_weight = resolved.ptr;
+                        }
+                    }
+                    if (!host_weight) {
+                        // Expert is device-resident -- skip CPU dispatch (safety guard).
+                        continue;
                     }
 
                     cpu_expert_task task;
@@ -37248,12 +37348,18 @@ cpu_fallback_fast:
             if (cpu_host_expert) {
                 const void * host_weight = expert_ptr;
                 if (!host_weight) {
-                    host_weight = ggml_sycl::ggml_sycl_resolve_host_expert_ptr(
-                        src0, ctx.device, static_cast<int>(i02),
-                        static_cast<const char *>(src0_host_storage) + static_cast<size_t>(i02) * nb02);
+                    auto resolved = ggml_sycl::ggml_sycl_resolve_expert_ptr(
+                        src0, ctx.device, static_cast<int>(i02));
+                    if (resolved.ptr && resolved.is_host) {
+                        host_weight = resolved.ptr;
+                    }
                 }
-                dispatch_host_expert_rows(static_cast<int32_t>(i02), matched_rows, host_weight);
-                continue;
+                if (!host_weight) {
+                    // Expert is device-resident -- fall through to GPU dispatch below.
+                } else {
+                    dispatch_host_expert_rows(static_cast<int32_t>(i02), matched_rows, host_weight);
+                    continue;
+                }
             }
 
             ggml_sycl_pool_alloc<int> dev_cur_src1_row(ctx.pool(), 1);
