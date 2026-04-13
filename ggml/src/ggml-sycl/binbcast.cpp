@@ -1,4 +1,5 @@
 #include "binbcast.hpp"
+#include "dnnl-ops.hpp"
 
 #include "ggml.h"
 
@@ -682,6 +683,42 @@ void ggml_sycl_mul(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) 
 #endif
         }
     }
+
+    // oneDNN fast path for PP row-broadcast MUL (e.g. RMSNorm weight scaling).
+    // Conditions: F32, contiguous on dim0, src1 broadcasts along batch dim, batch >= 128.
+    static const bool use_dnnl_mul = [] {
+        const char * env = getenv("GGML_SYCL_ONEDNN_MUL");
+        return env == nullptr || std::string(env) != "0";
+    }();
+
+#if GGML_SYCL_DNNL
+    if (use_dnnl_mul) {
+        const auto & src0 = dst.src(0);
+        const auto & src1 = dst.src(1);
+
+        const bool is_f32     = src0.type() == GGML_TYPE_F32 && src1.type() == GGML_TYPE_F32;
+        const bool contiguous = src0.nb(0) == sizeof(float) && src1.nb(0) == sizeof(float);
+        const bool row_bcast  = src1.ne(1) == 1 && src1.ne(2) == 1 && src1.ne(3) == 1
+                              && src0.ne(0) == src1.ne(0);
+        const int64_t batch   = src0.ne(1) * src0.ne(2) * src0.ne(3);
+
+        if (is_f32 && contiguous && row_bcast && batch >= 128) {
+            const float * src0_ptr = src0.resolve_as<const float>();
+            const float * src1_ptr = src1.resolve_as<const float>();
+            float *       dst_ptr  = dst.resolve_as<float>();
+            auto          q        = ctx.stream();
+
+            DnnlBinaryWrapper::binary_broadcast_row(
+                ctx, DnnlBinaryWrapper::op::MUL,
+                src0_ptr, src1_ptr, dst_ptr,
+                batch, src0.ne(0),
+                DnnlBinaryWrapper::dt::f32, q);
+            return;
+        }
+    }
+#else
+    (void) use_dnnl_mul;
+#endif
 
     ggml_sycl_op_mul(ctx, dst);
 

@@ -55,12 +55,17 @@ public:
         dnnl::primitive_attr attr;
         attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
 
-        // Apply pre-softmax scale if not 1.0
+        // Pre-scale: oneDNN softmax has no built-in pre-op, so when scale != 1.0
+        // we write scaled input into dst via SYCL kernel, then softmax in-place.
+        const void * softmax_src = src;
         if (scale != 1.0f) {
-            // Scale input before softmax using eltwise linear: y = scale * x
-            dnnl::post_ops po;
-            // Note: oneDNN softmax doesn't support pre-ops, so we may need
-            // to apply scale separately if needed
+            const int64_t n = batch * features;
+            const float * src_f = static_cast<const float *>(src);
+            float *       dst_f = static_cast<float *>(dst);
+            q->parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
+                dst_f[i] = src_f[i] * scale;
+            });
+            softmax_src = dst;  // softmax reads from pre-scaled dst (in-place)
         }
 
         auto softmax_pd = dnnl::softmax_forward::primitive_desc(
@@ -68,7 +73,7 @@ public:
             dnnl::algorithm::softmax_accurate,
             src_md, dst_md, 1, attr);  // axis = 1 (features dimension)
 
-        auto src_mem = dnnl::memory(src_md, eng, const_cast<void*>(src));
+        auto src_mem = dnnl::memory(src_md, eng, const_cast<void *>(softmax_src));
         auto dst_mem = dnnl::memory(dst_md, eng, dst);
 
         auto scratchpad_md = softmax_pd.scratchpad_desc();
@@ -285,6 +290,62 @@ public:
         args.insert({DNNL_ARG_SRC_0, src0_mem});
         args.insert({DNNL_ARG_SRC_1, src1_mem});
         args.insert({DNNL_ARG_DST, dst_mem});
+        args.insert({DNNL_ARG_SCRATCHPAD, scratchpad_mem});
+
+        binary_prim.execute(stream, args);
+    }
+
+    // Broadcast binary op: src0=[batch, features], src1=[1, features] (row vector broadcast)
+    // oneDNN handles broadcasting natively via memory descriptors.
+    static void binary_broadcast_row(
+        ggml_backend_sycl_context & ctx,
+        op operation,
+        const void * src0,    // [batch, features] matrix
+        const void * src1,    // [1, features] row vector (broadcast along batch dim)
+        void * dst,           // [batch, features] output
+        int64_t batch,        // number of rows
+        int64_t features,     // row width
+        dt data_type,
+        const queue_ptr & q)
+    {
+        auto stream = ctx.stream_dnnl(q);
+        auto eng    = ctx.engine_dnnl(q);
+
+        // src0 and dst: [batch, features]
+        dnnl::memory::dims src0_dims = {batch, features};
+        auto src0_md = dnnl::memory::desc(src0_dims, data_type, tag::ab);
+
+        // src1: [1, features] — oneDNN broadcasts across batch dim
+        dnnl::memory::dims src1_dims = {1, features};
+        auto src1_md = dnnl::memory::desc(src1_dims, data_type, tag::ab);
+
+        // dst: same shape as src0
+        auto dst_md = dnnl::memory::desc(src0_dims, data_type, tag::ab);
+
+        dnnl::primitive_attr attr;
+        attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+
+        alg algorithm = to_dnnl_algorithm(operation);
+
+        auto binary_pd = dnnl::binary::primitive_desc(
+            eng, algorithm, src0_md, src1_md, dst_md, attr);
+
+        auto src0_mem = dnnl::memory(src0_md, eng, const_cast<void *>(src0));
+        auto src1_mem = dnnl::memory(src1_md, eng, const_cast<void *>(src1));
+        auto dst_mem  = dnnl::memory(dst_md,  eng, dst);
+
+        auto scratchpad_md  = binary_pd.scratchpad_desc();
+        auto scratchpad_mem = ctx.get_scratchpad_mem(scratchpad_md, eng, q);
+        if (scratchpad_mem.get(true) == nullptr && scratchpad_md.get_size() > 0) {
+            throw std::runtime_error("oneDNN scratchpad allocation failed");
+        }
+
+        auto binary_prim = dnnl::binary(binary_pd);
+
+        std::unordered_map<int, dnnl::memory> args;
+        args.insert({DNNL_ARG_SRC_0,    src0_mem});
+        args.insert({DNNL_ARG_SRC_1,    src1_mem});
+        args.insert({DNNL_ARG_DST,      dst_mem});
         args.insert({DNNL_ARG_SCRATCHPAD, scratchpad_mem});
 
         binary_prim.execute(stream, args);

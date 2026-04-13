@@ -48725,6 +48725,7 @@ normal_dispatch:
     GGML_SYCL_DEBUG("[SYCL-GRAPH] call #%d: use_sycl_graph=%d, async_mem=%d, n_nodes=%d, has_exec_graph=%d\n",
                     graph_call_count, use_sycl_graph, g_ggml_sycl_use_async_mem_op, cgraph->n_nodes,
                     sycl_ctx->exec_graph ? 1 : 0);
+
     // Check if graphs were disabled due to MoE preload failure (persists until model reload)
     if (sycl_ctx->moe_graphs_disabled) {
         GGML_SYCL_DEBUG("[SYCL-GRAPH] graphs disabled due to MoE preload failure\n");
@@ -48756,6 +48757,95 @@ normal_dispatch:
             logged_once = true;
         }
         use_sycl_graph = false;
+    }
+
+    // ---- Diagnostic: log once why use_sycl_graph is disabled during TG ----
+    // This block runs after all overrides so it sees the final use_sycl_graph value.
+    if (!use_sycl_graph && cached_is_decode) {
+        static std::atomic<bool> diag_prefix_logged{ false };
+        static std::atomic<bool> diag_disable_graph_logged{ false };
+        static std::atomic<bool> diag_multithreaded_logged{ false };
+        static std::atomic<bool> diag_graphs_disabled_logged{ false };
+        static std::atomic<bool> diag_tp_logged{ false };
+        static std::atomic<bool> diag_placement_host_logged{ false };
+        static std::atomic<bool> diag_moe_graphs_disabled_logged{ false };
+        static std::atomic<bool> diag_split_logged{ false };
+        static std::atomic<bool> diag_compat_logged{ false };
+
+        if (gpu_prefix_end >= 0 && !diag_prefix_logged.exchange(true)) {
+            GGML_LOG_INFO("[GRAPH-DIAG] TG graph DISABLED: cpu-offload prefix mode (gpu_prefix_end=%d)\n", gpu_prefix_end);
+        }
+        if (g_ggml_sycl_disable_graph && !diag_disable_graph_logged.exchange(true)) {
+            GGML_LOG_INFO("[GRAPH-DIAG] TG graph DISABLED: GGML_SYCL_DISABLE_GRAPH=1\n");
+        }
+        if (g_sycl_graph_multithreaded.load(std::memory_order_relaxed) && !diag_multithreaded_logged.exchange(true)) {
+            GGML_LOG_INFO("[GRAPH-DIAG] TG graph DISABLED: multithreaded graph compute detected\n");
+        }
+        if (sycl_ctx->graphs_disabled && !diag_graphs_disabled_logged.exchange(true)) {
+            GGML_LOG_INFO("[GRAPH-DIAG] TG graph DISABLED: graphs_disabled (recording exception fired)\n");
+        }
+        if ((g_sycl_tp_config.enabled && g_sycl_tp_config.world_size > 1) && !diag_tp_logged.exchange(true)) {
+            GGML_LOG_INFO("[GRAPH-DIAG] TG graph DISABLED: tensor-parallel mode active\n");
+        }
+        if (g_has_placement_plan && ggml_sycl_graph_has_host_inputs(cgraph) && !diag_placement_host_logged.exchange(true)) {
+            GGML_LOG_INFO("[GRAPH-DIAG] TG graph DISABLED: placement plan + host intermediates in decode graph\n");
+        }
+        if (sycl_ctx->moe_graphs_disabled && !diag_moe_graphs_disabled_logged.exchange(true)) {
+            GGML_LOG_INFO("[GRAPH-DIAG] TG graph DISABLED: moe_graphs_disabled (MoE preload failure)\n");
+        }
+        if (g_split_config.enabled && !diag_split_logged.exchange(true)) {
+            GGML_LOG_INFO("[GRAPH-DIAG] TG graph DISABLED: tensor split active (multi-device overlap preferred)\n");
+        }
+        // If none of the explicit reasons match, check_graph_compatibility() returned false.
+        if (!sycl_ctx->exec_graph && !sycl_ctx->graphs_disabled && !g_ggml_sycl_disable_graph
+                && !g_sycl_graph_multithreaded.load(std::memory_order_relaxed)
+                && !(g_sycl_tp_config.enabled && g_sycl_tp_config.world_size > 1)
+                && !g_split_config.enabled && gpu_prefix_end < 0
+                && !(g_has_placement_plan && ggml_sycl_graph_has_host_inputs(cgraph))
+                && !sycl_ctx->moe_graphs_disabled
+                && !diag_compat_logged.exchange(true)) {
+            GGML_LOG_INFO("[GRAPH-DIAG] TG graph DISABLED: check_graph_compatibility() returned false\n");
+        }
+    }
+
+    // ---- Diagnostic counters: track record / replay / fallback per phase ----
+    // Logged every 100 graph_compute calls unconditionally (not GGML_SYCL_DEBUG-gated).
+    {
+        static std::atomic<int> graph_record_count{ 0 };
+        static std::atomic<int> graph_replay_count{ 0 };
+        static std::atomic<int> graph_fallback_count{ 0 };
+        static std::atomic<int> graph_tg_record_count{ 0 };
+        static std::atomic<int> graph_tg_replay_count{ 0 };
+        static std::atomic<int> graph_tg_fallback_count{ 0 };
+
+        if (use_sycl_graph && !sycl_ctx->exec_graph) {
+            graph_record_count.fetch_add(1, std::memory_order_relaxed);
+            if (cached_is_decode) graph_tg_record_count.fetch_add(1, std::memory_order_relaxed);
+        } else if (use_sycl_graph && sycl_ctx->exec_graph) {
+            graph_replay_count.fetch_add(1, std::memory_order_relaxed);
+            if (cached_is_decode) graph_tg_replay_count.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            graph_fallback_count.fetch_add(1, std::memory_order_relaxed);
+            if (cached_is_decode) graph_tg_fallback_count.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        const int call_num = graph_call_count;  // already incremented above
+        if (call_num % 100 == 0) {
+            GGML_LOG_INFO(
+                "[GRAPH-DIAG] call#%d total: record=%d replay=%d fallback=%d | "
+                "TG: record=%d replay=%d fallback=%d | "
+                "phase=%s use_graph=%d has_exec=%d\n",
+                call_num,
+                graph_record_count.load(std::memory_order_relaxed),
+                graph_replay_count.load(std::memory_order_relaxed),
+                graph_fallback_count.load(std::memory_order_relaxed),
+                graph_tg_record_count.load(std::memory_order_relaxed),
+                graph_tg_replay_count.load(std::memory_order_relaxed),
+                graph_tg_fallback_count.load(std::memory_order_relaxed),
+                cached_is_decode ? "TG" : "PP",
+                use_sycl_graph ? 1 : 0,
+                sycl_ctx->exec_graph ? 1 : 0);
+        }
     }
 
     if (use_sycl_graph) {

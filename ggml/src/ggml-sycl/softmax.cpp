@@ -1,4 +1,5 @@
 #include "softmax.hpp"
+#include "dnnl-ops.hpp"
 #include <cstdint>
 #include <utility>
 #include <cmath>
@@ -353,6 +354,27 @@ void ggml_sycl_op_soft_max(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tens
     params.max_bias = max_bias;
     params.m0 = m0;
     params.m1 = m1;
+
+    // oneDNN fast path: pure softmax without mask or ALiBi, opt-in via env var
+    static const bool use_dnnl_softmax = [] {
+        const char * env = getenv("GGML_SYCL_ONEDNN_SOFTMAX");
+        return env != nullptr && std::string(env) == "1";
+    }();
+
+#if GGML_SYCL_DNNL
+    if (use_dnnl_softmax && !src1_d && max_bias == 0.0f && nrows_x >= 128) {
+        DnnlSoftmaxWrapper::softmax(
+            ctx, src0_d, dst_d,
+            nrows_x,                              // batch = total rows
+            ne00,                                 // features = softmax axis
+            scale,                                // pre-softmax scale (e.g. 1/sqrt(d_head))
+            DnnlSoftmaxWrapper::to_dt<float>(),
+            stream);
+        return;
+    }
+#else
+    (void) use_dnnl_softmax;
+#endif
 
     if (use_f16) {
         soft_max_f32_sycl(src0_d, (const sycl::half *)src1_d,
