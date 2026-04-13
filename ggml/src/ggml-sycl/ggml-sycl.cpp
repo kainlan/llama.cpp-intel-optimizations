@@ -1171,12 +1171,20 @@ static bool ggml_sycl_graph_has_host_inputs(const ggml_cgraph * cgraph) {
         return false;
     };
 
+    static bool logged_first = false;
+
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
         if (!node) {
             continue;
         }
         if (is_host_tensor(node)) {
+            if (!logged_first) {
+                logged_first = true;
+                GGML_LOG_INFO("[GRAPH-DIAG] host tensor found: node[%d] name='%s' op=%s buffer=%s\n",
+                              i, node->name, ggml_op_name(node->op),
+                              node->buffer ? ggml_backend_buffer_name(node->buffer) : "null");
+            }
             return true;
         }
         for (int s = 0; s < GGML_MAX_SRC; ++s) {
@@ -1185,6 +1193,12 @@ static bool ggml_sycl_graph_has_host_inputs(const ggml_cgraph * cgraph) {
                 break;
             }
             if (is_host_tensor(src)) {
+                if (!logged_first) {
+                    logged_first = true;
+                    GGML_LOG_INFO("[GRAPH-DIAG] host tensor found: node[%d].src[%d] name='%s' op=%s buffer=%s\n",
+                                  i, s, src->name, ggml_op_name(src->op),
+                                  src->buffer ? ggml_backend_buffer_name(src->buffer) : "null");
+                }
                 return true;
             }
         }
@@ -6186,6 +6200,13 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
                 GGML_SYCL_DEBUG("[SYCL] Early plan store for device %d\n", d);
             }
         }
+        // NOTE: g_has_placement_plan intentionally left true here.
+        // The graph-replay guard (g_has_placement_plan && graph_has_host_inputs)
+        // protects against replaying graphs with host-resident leaf inputs
+        // (e.g. token IDs) whose DATA changes between iterations.  SYCL graph
+        // replay bakes the first iteration's data flow — autoregressive TG
+        // needs input token + KV position updates between replays, which the
+        // current recording infrastructure doesn't support.
     }
 
     GGML_LOG_INFO(
