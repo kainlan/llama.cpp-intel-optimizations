@@ -937,8 +937,6 @@ class host_cache {
     std::atomic<size_t>  used_{ 0 };
     std::atomic<int64_t> time_{ 0 };
 
-   // Pointer to parent unified_cache that owns the host arena.
-    unified_cache * parent_cache_ = nullptr;
 
     std::unordered_map<unified_cache_key,
                        host_cache_entry,
