@@ -5412,6 +5412,10 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                     ptr               = segs.segments[0].ptr;
                     // Store all segments in the handle for proper cleanup
                     out->all_segments = std::move(segs.segments);
+                    uses_pinned_pool  = true;
+                    zone_managed      = true;
+                    out->zone_managed = true;
+                    out->host_zone    = host_zone_id::STAGING;
                 }
             } else if (ucache->host_zones_configured()) {
                 host_zone_id zone = host_zone_id::STAGING;
@@ -7431,6 +7435,21 @@ void unified_cache::host_zone_reset(host_zone_id zone) {
         return;
     }
     GGML_ASSERT(zone != host_zone_id::WEIGHT && "WEIGHT host zone must not be reset");
+
+    // Purge registry entries that belong to this host zone.  Without this,
+    // zone_reset() recycles TLSF addresses while the registry still maps them,
+    // causing duplicate-pointer rejection on retry.
+    {
+        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+        for (auto it = g_runtime_alloc_registry.begin(); it != g_runtime_alloc_registry.end(); ) {
+            if (it->second.handle.host_zone == zone) {
+                it = g_runtime_alloc_registry.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
     host_arena_->zone_reset(zone);
 }
 
@@ -8470,6 +8489,14 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
         zone_reset(vram_zone_id::KV);
         zone_reset(vram_zone_id::RUNTIME);
 
+        // Host zones: reset KV and STAGING so host-pinned buffers from the
+        // previous context (output buffer, KV spill) are reclaimable.
+        // WEIGHT is persistent, SCRATCH resets at graph_compute.
+        // Use host_zone_reset() (not host_arena_->zone_reset()) to also
+        // purge the registry of stale host zone entries.
+        host_zone_reset(host_zone_id::KV);
+        host_zone_reset(host_zone_id::STAGING);
+
         // Arena zones are the single source of truth for runtime tracking.
         // zone_reset() above already zeroes zone_used() for KV and RUNTIME.
         return true;
@@ -8697,6 +8724,25 @@ void * unified_cache::zone_alloc(vram_zone_id zone, size_t size, size_t align) {
 void unified_cache::zone_reset(vram_zone_id zone) {
     auto &                      z = arena_zones_[static_cast<int>(zone)];
     std::lock_guard<std::mutex> lock(z.alloc_mutex);
+
+    // Purge registry entries whose pointer falls within this zone's address
+    // range.  Without this, TLSF reset recycles addresses while the registry
+    // still maps them, causing duplicate-pointer rejection on the next
+    // unified_alloc() that gets a recycled address.
+    if (arena_base_ && z.size > 0) {
+        const uintptr_t zone_lo = reinterpret_cast<uintptr_t>(arena_base_) + z.start;
+        const uintptr_t zone_hi = zone_lo + z.size;
+        std::lock_guard<std::mutex> reg_lock(g_runtime_alloc_mutex);
+        for (auto it = g_runtime_alloc_registry.begin(); it != g_runtime_alloc_registry.end(); ) {
+            const uintptr_t p = reinterpret_cast<uintptr_t>(it->first);
+            if (p >= zone_lo && p < zone_hi) {
+                it = g_runtime_alloc_registry.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
     if (z.allocator) {
         z.allocator->reset();
     }

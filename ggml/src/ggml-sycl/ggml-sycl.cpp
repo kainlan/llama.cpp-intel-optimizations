@@ -17435,6 +17435,16 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggm
         alloc = {};
     }
     void * ptr = alloc.ptr;
+    if (ptr == nullptr && sycl_cache && sycl_cache->host_zones_configured()) {
+        // Host zone full from previous context — reset ephemeral zones and retry.
+        // This mirrors the device RUNTIME zone retry at ggml_backend_sycl_buffer_type_alloc_buffer.
+        ggml_sycl::unified_cache_host_zone_reset(ggml_sycl::host_zone_id::STAGING);
+        ggml_sycl::unified_cache_host_zone_reset(ggml_sycl::host_zone_id::KV);
+        alloc = {};
+        if (ggml_sycl::unified_alloc(req, &alloc)) {
+            ptr = alloc.ptr;
+        }
+    }
     if (ptr == nullptr) {
         GGML_LOG_ERROR(
             "[SYCL] FATAL: host buffer alloc (%.1f MB) failed — cannot allocate host buffer. "
