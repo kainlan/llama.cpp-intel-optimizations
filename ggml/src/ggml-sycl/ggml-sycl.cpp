@@ -37986,6 +37986,36 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
         return false;
     }
 
+    // Per-op dispatch overhead profiling: GGML_SYCL_DISPATCH_TIMING=1
+    // Breaks down host-side time BEFORE the kernel launches.
+    // Does NOT sync GPU — measures pure host dispatch overhead.
+    // Mode 3: also traces .wait() calls that fire during inference.
+    static const int dispatch_timing_mode = [] {
+        const char * env = std::getenv("GGML_SYCL_DISPATCH_TIMING");
+        return env ? std::atoi(env) : 0;
+    }();
+    struct dispatch_timer {
+        bool                                             enabled;
+        std::chrono::high_resolution_clock::time_point   t_enter;
+        double                                           flush_us   = 0;
+        double                                           cpu_check_us = 0;
+        double                                           resolve_us = 0;
+        double                                           switch_us  = 0;
+
+        void mark_enter()   { if (enabled) t_enter = std::chrono::high_resolution_clock::now(); }
+        double elapsed_us() {
+            auto now = std::chrono::high_resolution_clock::now();
+            double us = std::chrono::duration<double, std::micro>(now - t_enter).count();
+            t_enter = now;
+            return us;
+        }
+    };
+    dispatch_timer dt{ .enabled = dispatch_timing_mode > 0 };
+    if (dt.enabled) { dt.mark_enter(); }
+
+    // Wait tracing: mode=2 prints per-op host time which exposes hidden .wait() calls
+    // (any op taking >>1us of host time without queue sync has an internal wait)
+
     // Selective flush: only flush deferred CPU scatter if this op
     // consumes the pending scatter's output tensor.  This preserves
     // the expert deferral window — cold CPU experts from layer N
@@ -37995,6 +38025,8 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
     flush_pending_cpu_scatter_if_consumed(dst);
     flush_pending_secondary_scatter_if_consumed(dst);
     flush_pending_cpu_pipeline_if_consumed(dst);
+
+    if (dt.enabled) { dt.flush_us = dt.elapsed_us(); }
 
     // Debug: trace operations in multi-process mode
     if (g_sycl_tp_config.is_multiprocess && g_ggml_sycl_tp_debug) {
@@ -38037,6 +38069,7 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
     // If CPU path doesn't support this op, fall through to GPU dispatch.
     // Hybrid dispatch: lightweight activation-only ops (SCALE, etc.) stay on GPU
     // even for CPU-bound layers — the GPU kernel is cheaper than a D2H/H2D roundtrip.
+    if (dt.enabled) { dt.cpu_check_us = dt.elapsed_us(); }
     if (should_dispatch_to_cpu(ctx, dst) && !(ggml_sycl_hybrid_dispatch_enabled() && should_force_gpu_dispatch(dst))) {
         if (ggml_sycl_compute_forward_cpu(ctx, dst)) {
             return true;
@@ -38063,7 +38096,9 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
     if (!g_pending_merges.empty() && dst->op != GGML_OP_MUL_MAT) {
         split_merge_drain();
     }
+    if (dt.enabled) { dt.resolve_us = dt.elapsed_us(); }
     ggml_sycl::sycl_tensor safe_dst(dst, ctx.device);
+    if (dt.enabled) { dt.switch_us = dt.elapsed_us(); }
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_sycl_argmax(ctx, safe_dst);
@@ -38401,6 +38436,50 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
 
     dump_non_fa_attention_tensor(ctx, dst);
 #endif
+
+    // Dispatch overhead accumulation
+    if (dt.enabled) {
+        double kernel_us = dt.elapsed_us();  // Time in the switch (kernel submission)
+        static thread_local struct {
+            double flush_us = 0, cpu_check_us = 0, resolve_us = 0, switch_us = 0, kernel_us = 0;
+            int    count = 0, graphs = 0;
+        } acc;
+        acc.flush_us     += dt.flush_us;
+        acc.cpu_check_us += dt.cpu_check_us;
+        acc.resolve_us   += dt.resolve_us;
+        acc.switch_us    += dt.switch_us;
+        acc.kernel_us    += kernel_us;
+        acc.count++;
+
+        // Print per-op detail in verbose mode
+        if (dispatch_timing_mode >= 2) {
+            fprintf(stderr, "[DISPATCH] %5.0f/%5.0f/%5.0f/%5.0f/%5.0f us  flush/tp_check/resolve/wrap/kernel  %-20s %s\n",
+                    dt.flush_us, dt.cpu_check_us, dt.resolve_us, dt.switch_us, kernel_us,
+                    ggml_op_name(dst->op), dst->name ? dst->name : "");
+        }
+
+        // Summary every 1000 ops (roughly per graph for TG)
+        if (acc.count % 1200 == 0) {
+            acc.graphs++;
+            if (acc.graphs > 2 && (acc.graphs % 5) == 3) {
+                double total = acc.flush_us + acc.cpu_check_us + acc.resolve_us + acc.switch_us + acc.kernel_us;
+                fprintf(stderr, "\n[DISPATCH-TIMING] === %d ops, %.1f ms total host time ===\n", acc.count, total / 1000.0);
+                fprintf(stderr, "[DISPATCH-TIMING]   flush:     %7.0f us (%5.1f%%)  %.1f us/op\n",
+                        acc.flush_us, 100.0 * acc.flush_us / total, acc.flush_us / acc.count);
+                fprintf(stderr, "[DISPATCH-TIMING]   tp_check:  %7.0f us (%5.1f%%)  %.1f us/op\n",
+                        acc.cpu_check_us, 100.0 * acc.cpu_check_us / total, acc.cpu_check_us / acc.count);
+                fprintf(stderr, "[DISPATCH-TIMING]   resolve:   %7.0f us (%5.1f%%)  %.1f us/op\n",
+                        acc.resolve_us, 100.0 * acc.resolve_us / total, acc.resolve_us / acc.count);
+                fprintf(stderr, "[DISPATCH-TIMING]   wrap:      %7.0f us (%5.1f%%)  %.1f us/op\n",
+                        acc.switch_us, 100.0 * acc.switch_us / total, acc.switch_us / acc.count);
+                fprintf(stderr, "[DISPATCH-TIMING]   kernel:    %7.0f us (%5.1f%%)  %.1f us/op\n",
+                        acc.kernel_us, 100.0 * acc.kernel_us / total, acc.kernel_us / acc.count);
+                fprintf(stderr, "\n");
+                acc = {};
+            }
+        }
+    }
+
     return true;
 
 } catch (const dnnl::error & e) {
@@ -41295,7 +41374,66 @@ gpu_dispatch:
             GGML_ASSERT(false && "graph recording active but recording pointers are null");
         }
 #endif
+        // Per-op timing: GGML_SYCL_OP_TIMING=1 forces queue sync after each op
+        // to measure GPU execution time.  Destroys pipeline parallelism — use
+        // only for profiling, never in production.
+        static const int op_timing_mode = [] {
+            const char * env = std::getenv("GGML_SYCL_OP_TIMING");
+            return env ? std::atoi(env) : 0;
+        }();
+
+        std::chrono::high_resolution_clock::time_point t_op_start;
+        if (op_timing_mode) {
+            sycl_ctx->stream()->wait();
+            t_op_start = std::chrono::high_resolution_clock::now();
+        }
+
         bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
+
+        if (op_timing_mode) {
+            sycl_ctx->stream()->wait();
+            auto   t_op_end = std::chrono::high_resolution_clock::now();
+            double op_ms    = std::chrono::duration<double, std::milli>(t_op_end - t_op_start).count();
+
+            // Accumulate per-op-type statistics
+            static thread_local std::unordered_map<int, std::pair<double, int>> op_stats;
+            static thread_local int                                             op_graph_count = 0;
+            auto & [total_ms, count] = op_stats[node->op];
+            total_ms += op_ms;
+            count++;
+
+            // Print per-op detail in verbose mode (GGML_SYCL_OP_TIMING=2)
+            if (op_timing_mode >= 2) {
+                fprintf(stderr, "[OP-TIME] %6.3f ms  %-20s %s\n", op_ms, ggml_op_name(node->op),
+                        node->name ? node->name : "");
+            }
+
+            // Dump summary at end of graph (last node)
+            if (i == cgraph->n_nodes - 1) {
+                op_graph_count++;
+                // Skip first 2 graphs (warmup), then print every 5th
+                if (op_graph_count > 2 && (op_graph_count % 5) == 3) {
+                    double graph_total = 0;
+                    for (auto & [op, stats] : op_stats) {
+                        graph_total += stats.first;
+                    }
+                    fprintf(stderr, "\n[OP-TIMING] === Graph %d summary (%.1f ms total) ===\n",
+                            op_graph_count, graph_total);
+                    // Sort by total time descending
+                    std::vector<std::pair<int, std::pair<double, int>>> sorted(op_stats.begin(), op_stats.end());
+                    std::sort(sorted.begin(), sorted.end(),
+                              [](auto & a, auto & b) { return a.second.first > b.second.first; });
+                    for (auto & [op, stats] : sorted) {
+                        fprintf(stderr, "[OP-TIMING]   %6.1f ms (%5.1f%%)  %-20s  x%d  (%.3f ms/call)\n",
+                                stats.first, 100.0 * stats.first / graph_total,
+                                ggml_op_name((ggml_op) op), stats.second,
+                                stats.first / stats.second);
+                    }
+                    fprintf(stderr, "\n");
+                    op_stats.clear();
+                }
+            }
+        }
 
         if (!ok) {
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));

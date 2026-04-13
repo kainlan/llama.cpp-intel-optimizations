@@ -2041,6 +2041,12 @@ struct ggml_tensor_extra_gpu {
         return moe_expert_ptrs_alloc[dev].ptr ? moe_expert_ptrs_alloc[dev].ptr : moe_expert_ptrs_device[dev];
     }
 
+    // Cached layout pointer resolution — avoids repeated string hashing, mutex
+    // acquisition, and hash map lookups in get_layout_ptr_impl() on the hot path.
+    // Populated on first resolve; invalidated by setting resolved_gen to 0 on eviction.
+    void *   resolved_ptr[GGML_SYCL_MAX_DEVICES] = { nullptr };
+    uint32_t resolved_gen[GGML_SYCL_MAX_DEVICES] = { 0 };        // generation counter
+
     dpct::event_ptr  events[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS];  // events for synchronizing multiple GPUs
     optimize_feature optimized_feature = {};  // Must have = {} to ensure default member initializers apply
 
@@ -2333,9 +2339,30 @@ inline void ggml_sycl_set_host_data(ggml_tensor * tensor, void * ptr) {
 
 // Internal: layout resolution for weight tensors.  Use ggml_sycl_resolve_tensor_ptr
 // instead of calling this directly.
+// Global generation counter — incremented on cache eviction or layout change.
+// Compared against extra->resolved_gen to detect stale cached pointers.
+inline std::atomic<uint32_t> & ggml_sycl_resolve_generation() {
+    static std::atomic<uint32_t> gen{ 1 };  // starts at 1 so 0 means "never resolved"
+    return gen;
+}
+inline void ggml_sycl_invalidate_resolve_cache() {
+    ggml_sycl_resolve_generation().fetch_add(1, std::memory_order_release);
+}
+
 inline void * ggml_sycl_get_layout_ptr_impl(const ggml_tensor * tensor, int device) {
     if (tensor == nullptr) {
         return nullptr;
+    }
+
+    // Fast path: return cached resolved pointer if still valid.
+    // This avoids all string hashing, mutex locks, and hash map lookups
+    // on the hot path (every weight tensor, every op, every token).
+    if (tensor->extra != nullptr && device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
+        auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
+        uint32_t current_gen = ggml_sycl_resolve_generation().load(std::memory_order_acquire);
+        if (extra->resolved_ptr[device] != nullptr && extra->resolved_gen[device] == current_gen) {
+            return extra->resolved_ptr[device];
+        }
     }
 
     if (const char * dbg = std::getenv("GGML_SYCL_LAYOUT_PTR_DEBUG")) {
@@ -2371,6 +2398,16 @@ inline void * ggml_sycl_get_layout_ptr_impl(const ggml_tensor * tensor, int devi
         }
     }
 
+    // Helper: cache the resolved pointer on extra before returning.
+    auto cache_and_return = [&](void * ptr) -> void * {
+        if (ptr && tensor->extra && device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
+            auto * extra = static_cast<ggml_tensor_extra_gpu *>(const_cast<ggml_tensor *>(tensor)->extra);
+            extra->resolved_ptr[device] = ptr;
+            extra->resolved_gen[device] = ggml_sycl_resolve_generation().load(std::memory_order_acquire);
+        }
+        return ptr;
+    };
+
     const bool host_weights =
         ggml_sycl_tensor_is_weight(tensor) && tensor->buffer && ggml_backend_buffer_is_host(tensor->buffer);
     const bool device_weights =
@@ -2389,7 +2426,7 @@ inline void * ggml_sycl_get_layout_ptr_impl(const ggml_tensor * tensor, int devi
                     if (host_weights) {
                         ggml_sycl_layout_ptr_stat(ggml_sycl_layout_ptr_event::HOST_CACHE_TARGET_HIT);
                     }
-                    return fast_ptr;
+                    return cache_and_return(fast_ptr);
                 }
             }
         }
@@ -2399,7 +2436,7 @@ inline void * ggml_sycl_get_layout_ptr_impl(const ggml_tensor * tensor, int devi
                 void * streamed = ggml_sycl::layer_streaming_get_weight_ptr(device, tensor->name);
                 if (streamed) {
                     ggml_sycl_layout_ptr_stat(ggml_sycl_layout_ptr_event::HOST_CACHE_DATA_FALLBACK);
-                    return streamed;
+                    return cache_and_return(streamed);
                 }
             }
             const ggml_tensor_layout * layout = ggml_sycl_get_layout_info(tensor);
@@ -2409,13 +2446,13 @@ inline void * ggml_sycl_get_layout_ptr_impl(const ggml_tensor * tensor, int devi
                         ggml_sycl_cache_id cache_key = ggml_backend_sycl_get_weight_cache_key(tensor, device);
                         if (cache_key.valid && cache->is_cached(cache_key, layout->mode)) {
                             ggml_sycl_layout_ptr_stat(ggml_sycl_layout_ptr_event::HOST_CACHE_LAYOUT_FALLBACK);
-                            return ggml_tensor_get_layout_ptr(tensor);
+                            return cache_and_return(ggml_tensor_get_layout_ptr(tensor));
                         }
                     }
                 }
             }
             ggml_sycl_layout_ptr_stat(ggml_sycl_layout_ptr_event::HOST_CACHE_DATA_FALLBACK);
-            return ggml_sycl_get_data_ptr(tensor, device);
+            return cache_and_return(ggml_sycl_get_data_ptr(tensor, device));
         }
     }
 
@@ -2431,11 +2468,11 @@ inline void * ggml_sycl_get_layout_ptr_impl(const ggml_tensor * tensor, int devi
     if (layout != nullptr && layout->data_ptr != nullptr && layout_cached) {
         if ((layout->device_id < 0 || layout->device_id == device) &&
             (!ggml_sycl_tensor_is_weight(tensor) || layout->mode == target)) {
-            return ggml_tensor_get_layout_ptr(tensor);
+            return cache_and_return(ggml_tensor_get_layout_ptr(tensor));
         }
     }
 
-    return ggml_sycl_get_data_ptr(tensor, device);
+    return cache_and_return(ggml_sycl_get_data_ptr(tensor, device));
 }
 
 #include "sycl-tensor.hpp"

@@ -3391,6 +3391,10 @@ size_t unified_cache::evict_and_flush(size_t bytes_needed) {
         return 0;
     }
 
+    // Invalidate per-tensor resolved pointer cache — evicted weights have
+    // stale device pointers.  The generation bump forces re-resolution.
+    ggml_sycl_invalidate_resolve_cache();
+
     // Phase 2: wait on the queue so all pending operations complete, making
     //          the deferred frees eligible for processing.
     try {

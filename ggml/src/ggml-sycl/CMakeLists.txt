@@ -952,3 +952,24 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         TIMEOUT 300
     )
 endif()
+
+# Standalone oneDNN vs SYCL kernel microbenchmark
+if (GGML_SYCL_DNNL)
+    add_executable(bench-dnnl-ops
+        tests/bench-dnnl-ops.cpp
+    )
+    target_include_directories(bench-dnnl-ops PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    )
+    target_compile_options(bench-dnnl-ops PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(bench-dnnl-ops PRIVATE "-fsycl")
+    target_compile_definitions(bench-dnnl-ops PRIVATE
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(bench-dnnl-ops PRIVATE DNNL::dnnl)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(bench-dnnl-ops PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+endif()
