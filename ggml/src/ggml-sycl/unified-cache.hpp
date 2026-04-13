@@ -937,7 +937,6 @@ class host_cache {
     std::atomic<size_t>  used_{ 0 };
     std::atomic<int64_t> time_{ 0 };
 
-
     std::unordered_map<unified_cache_key,
                        host_cache_entry,
                        unified_cache_key_hash,
