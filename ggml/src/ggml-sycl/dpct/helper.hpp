@@ -129,6 +129,10 @@ inline auto get_onemath_backend(sycl::queue& queue)
 }
 #endif // GGML_SYCL_HAS_ONEAPI_MATH
 
+#ifdef GGML_SYCL_GRAPH
+extern thread_local bool g_ggml_sycl_graph_recording;
+#endif
+
 namespace dpct
 {
     typedef sycl::queue *queue_ptr;
@@ -1574,6 +1578,30 @@ namespace dpct
         {
             if (!size)
                 return sycl::event{};
+            // During SYCL graph recording, use kernel-based copy instead of queue.memcpy.
+            // L0 Mutable Command List (exec_graph->update()) cannot patch memcpy nodes,
+            // only kernel nodes. This ensures re-recorded graphs can be updated in-place.
+#ifdef GGML_SYCL_GRAPH
+            if (::g_ggml_sycl_graph_recording) {
+                const size_t n_i32 = size / sizeof(int32_t);
+                const size_t tail  = size % sizeof(int32_t);
+                auto * dst = static_cast<int32_t *>(to_ptr);
+                auto * src = static_cast<const int32_t *>(from_ptr);
+                if (n_i32 > 0) {
+                    q.parallel_for(sycl::range<1>(n_i32), dep_events, [=](sycl::id<1> i) {
+                        dst[i] = src[i];
+                    });
+                }
+                if (tail > 0) {
+                    auto * dst_c = static_cast<char *>(to_ptr) + n_i32 * sizeof(int32_t);
+                    auto * src_c = static_cast<const char *>(from_ptr) + n_i32 * sizeof(int32_t);
+                    q.parallel_for(sycl::range<1>(tail), [=](sycl::id<1> i) {
+                        dst_c[i] = src_c[i];
+                    });
+                }
+                return sycl::event{};
+            }
+#endif
             return q.memcpy(to_ptr, from_ptr, size, dep_events);
             GGML_UNUSED(direction);
         }

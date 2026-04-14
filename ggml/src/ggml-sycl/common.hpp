@@ -143,6 +143,7 @@ extern thread_local bool g_ggml_sycl_graph_recording;
 extern std::atomic<int>  g_ggml_sycl_graph_recording_depth;
 extern std::atomic<int>  g_sycl_submit_count_during_recording;        // DIAG: operation dispatches during recording
 extern std::atomic<int>  g_sycl_extra_submit_count_during_recording;  // DIAG: extra markers/events during recording
+void ggml_sycl_trace_memcpy_during_recording(const char * caller, size_t bytes);
 int                      ggml_sycl_graph_inflight_count();
 
 inline bool ggml_sycl_graph_recording_active() {
@@ -2216,10 +2217,18 @@ inline void ggml_sycl_refresh_cached_input_ptr(void * dst, const void * src, siz
     if (dst == nullptr || src == nullptr || bytes == 0) {
         return;
     }
+    // During graph recording, do NOT submit memcpy to refresh INPUT data.
+    // graph_prestage_leaf_tensors already copied the data before recording
+    // started, and submitting queue.memcpy() during recording creates a
+    // memcpy node in the SYCL graph which exec_graph->update() rejects
+    // ("memcpy nodes are not supported for update").
+    if (ggml_sycl_graph_recording_active()) {
+        return;
+    }
     sycl::queue &    q     = ggml_sycl_get_device(device).default_queue();
     sycl::usm::alloc alloc = ggml_sycl_get_alloc_type(dst);
     if (alloc == sycl::usm::alloc::device) {
-        const bool avoid_wait = ggml_sycl_graph_recording_active() || ggml_sycl_graph_inflight_count() > 0;
+        const bool avoid_wait = ggml_sycl_graph_inflight_count() > 0;
         if (avoid_wait) {
             q.memcpy(dst, src, bytes);
         } else {

@@ -170,6 +170,21 @@ const void * g_graph_diag_src1_tensor_data  = nullptr;   // tensor->data at reco
 int          g_graph_diag_src1_device       = -1;
 static int   g_graph_diag_replay_count      = 0;
 
+// Memcpy trace: count and log memcpy calls during graph recording
+static std::atomic<int> g_graph_memcpy_count_during_recording{ 0 };
+void ggml_sycl_trace_memcpy_during_recording(const char * caller, size_t bytes) {
+    if (!g_ggml_sycl_graph_recording) return;
+    int n = g_graph_memcpy_count_during_recording.fetch_add(1, std::memory_order_relaxed);
+    fprintf(stderr, "[GRAPH-MEMCPY] #%d during recording: %s (%zu bytes)\n", n, caller, bytes);
+}
+
+// Broad memcpy detection: call from ggml_sycl_compute_forward before each op
+static int g_graph_compute_forward_memcpy_node_idx = -1;
+void ggml_sycl_trace_op_during_recording(const char * op_name, int node_idx) {
+    if (!g_ggml_sycl_graph_recording) return;
+    g_graph_compute_forward_memcpy_node_idx = node_idx;
+}
+
 // Graph input staging: maps tensor name → stable device pointer during graph recording.
 // Populated by graph_prestage_leaf_tensors for INPUT tensors.
 // Consulted by ggml_sycl_get_data_ptr_slow to return stable pointers during recording.
@@ -403,6 +418,7 @@ struct fp16_weight_cache {
         }
         sycl::half * buf = reinterpret_cast<sycl::half *>(slab_ptr + slab_offset);
         // Async copy on in-order queue: completes before next kernel reads scratch
+        ggml_sycl_trace_memcpy_during_recording("ggml-sycl.cpp:scratch_pool_fill", bytes);
         queue.memcpy(buf, src, bytes);
         entries[name_hash] = { buf };
         slab_offset += aligned_bytes;
@@ -19418,8 +19434,33 @@ static dpct::err0 ggml_sycl_cpy_tensor_2d(void *                     dst,
     if (nb0 == ts && nb1 == ts * ne0 / bs) {
         // GGML_SYCL_DEBUG("stream->memcpy: dst_ptr=%p, x=%p, size=%lu\n", dst_ptr, x, i1_diff * nb1);
         // return CHECK_TRY_ERROR(stream->memcpy(dst_ptr, x, i1_diff * nb1));
-        return CHECK_TRY_ERROR(dpct::async_dpct_memcpy(dst_ptr, x, i1_diff * nb1, kind, *stream));
+        const size_t nbytes = static_cast<size_t>(i1_diff * nb1);
+        // During graph recording, use kernel-based copy to avoid memcpy nodes.
+        // L0 Mutable Command List cannot update memcpy nodes, only kernel nodes.
+        if (g_ggml_sycl_graph_recording) {
+            const char * src_k = x;
+            char *       dst_k = dst_ptr;
+            const size_t n_i32 = nbytes / sizeof(int32_t);
+            stream->parallel_for(sycl::range<1>(n_i32), [=](sycl::id<1> i) {
+                reinterpret_cast<int32_t *>(dst_k)[i] = reinterpret_cast<const int32_t *>(src_k)[i];
+            });
+            return 0;
+        }
+        return CHECK_TRY_ERROR(dpct::async_dpct_memcpy(dst_ptr, x, nbytes, kind, *stream));
     } else if (nb0 == ts) {
+        // 2D strided copy: rows are contiguous but with stride gaps
+        if (g_ggml_sycl_graph_recording) {
+            const int64_t row_size = ts * ne0 / bs;
+            for (int64_t i1 = 0; i1 < i1_diff; i1++) {
+                const char * src_row = x + i1 * nb1;
+                char *       dst_row = dst_ptr + i1 * row_size;
+                const size_t n_i32   = static_cast<size_t>(row_size) / sizeof(int32_t);
+                stream->parallel_for(sycl::range<1>(n_i32), [=](sycl::id<1> i) {
+                    reinterpret_cast<int32_t *>(dst_row)[i] = reinterpret_cast<const int32_t *>(src_row)[i];
+                });
+            }
+            return 0;
+        }
         return CHECK_TRY_ERROR(
             dpct::async_dpct_memcpy(dst_ptr, ts * ne0 / bs, x, nb1, ts * ne0 / bs, i1_diff, kind, *stream));
     } else {
@@ -19427,6 +19468,17 @@ static dpct::err0 ggml_sycl_cpy_tensor_2d(void *                     dst,
             const void * rx = (const void *) ((const char *) x + i1 * nb1);
 
             void *     rd = (void *) (dst_ptr + i1 * ts * ne0 / bs);
+            if (g_ggml_sycl_graph_recording) {
+                // Kernel-based strided element copy during graph recording
+                const size_t row_bytes = static_cast<size_t>(ts * ne0 / bs);
+                const size_t n_i32     = row_bytes / sizeof(int32_t);
+                const char * src_r     = (const char *) rx;
+                char *       dst_r     = (char *) rd;
+                stream->parallel_for(sycl::range<1>(n_i32), [=](sycl::id<1> i) {
+                    reinterpret_cast<int32_t *>(dst_r)[i] = reinterpret_cast<const int32_t *>(src_r)[i];
+                });
+                continue;
+            }
             // pretend the row is a matrix with cols=1
             dpct::err0 r  = CHECK_TRY_ERROR(dpct::async_dpct_memcpy(rd, ts / bs, rx, nb0, ts / bs, ne0, kind, *stream));
             /*
@@ -20796,8 +20848,15 @@ static bool ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
                         float * dhf_dst_i = (float *) ((char *) dst_off_device + i02 * nb2 + i03 * nb3);
                         GGML_ASSERT(dst->nb[1] == ne0 * sizeof(float));
                         dhf_dst_i += src1_col_0 * ne0;
-                        sycl::event copy_evt = stream->memcpy(dhf_dst_i, dst_dd_i, src1_ncols * ne0 * sizeof(float));
-                        if (!g_ggml_sycl_graph_recording) {
+                        const size_t copy_bytes = src1_ncols * ne0 * sizeof(float);
+                        if (g_ggml_sycl_graph_recording) {
+                            // Kernel copy to avoid memcpy graph node
+                            const size_t n_f32 = copy_bytes / sizeof(float);
+                            stream->parallel_for(sycl::range<1>(n_f32), [=](sycl::id<1> idx) {
+                                dhf_dst_i[idx] = reinterpret_cast<const float *>(dst_dd_i)[idx];
+                            });
+                        } else {
+                            sycl::event copy_evt = stream->memcpy(dhf_dst_i, dst_dd_i, copy_bytes);
                             SYCL_CHECK(CHECK_TRY_ERROR(copy_evt.wait()));
                         }
                     }
@@ -38152,6 +38211,7 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
     if (dt.enabled) { dt.resolve_us = dt.elapsed_us(); }
     ggml_sycl::sycl_tensor safe_dst(dst, ctx.device);
     if (dt.enabled) { dt.switch_us = dt.elapsed_us(); }
+
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_sycl_argmax(ctx, safe_dst);
@@ -38476,7 +38536,6 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
             break;
         case GGML_OP_FLASH_ATTN_EXT:
             ggml_sycl_flash_attn_ext(ctx, safe_dst);
-
             break;
         case GGML_OP_ALL_REDUCE_SUM:
             ggml_sycl_all_reduce_sum(ctx, dst);
@@ -49312,8 +49371,15 @@ normal_dispatch:
                 g_recording_graph_ptr       = &model_sycl_graph;
                 g_recording_queue_ptr       = sycl_ctx->stream();
                 model_sycl_graph.begin_recording(*(sycl_ctx->stream()));
+                g_graph_memcpy_count_during_recording.store(0, std::memory_order_relaxed);
                 compute_impl();
                 model_sycl_graph.end_recording();
+                {
+                    int mc = g_graph_memcpy_count_during_recording.load(std::memory_order_relaxed);
+                    if (mc > 0) {
+                        fprintf(stderr, "[GRAPH-MEMCPY] Total memcpy nodes during recording: %d\n", mc);
+                    }
+                }
                 g_recording_graph_ptr       = nullptr;
                 g_recording_queue_ptr       = nullptr;
                 g_ggml_sycl_graph_recording = false;
@@ -49443,11 +49509,18 @@ normal_dispatch:
                 g_recording_graph_ptr       = &model_sycl_graph;
                 g_recording_queue_ptr       = sycl_ctx->stream();
                 g_graph_diag_recorded_src1_ptr = nullptr;  // Reset so first GET_ROWS is captured
+                g_graph_memcpy_count_during_recording.store(0, std::memory_order_relaxed);
                 model_sycl_graph.begin_recording(*(sycl_ctx->stream()));
                 GGML_SYCL_DEBUG("[SYCL-GRAPH-DEBUG] calling compute_impl...\n");
                 compute_impl();
                 GGML_SYCL_DEBUG("[SYCL-GRAPH-DEBUG] end_recording...\n");
                 model_sycl_graph.end_recording();
+                {
+                    int mc = g_graph_memcpy_count_during_recording.load(std::memory_order_relaxed);
+                    if (mc > 0) {
+                        fprintf(stderr, "[GRAPH-MEMCPY] Total memcpy nodes during first recording: %d\n", mc);
+                    }
+                }
                 g_recording_graph_ptr = nullptr;
                 g_recording_queue_ptr = nullptr;
                 GGML_SYCL_DEBUG("[GRAPH-DIAG] barriers: %d  ops_dispatched: %d  extra_submits: %d  nodes: %d\n",

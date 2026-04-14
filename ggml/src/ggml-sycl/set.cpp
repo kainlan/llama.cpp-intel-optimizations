@@ -53,8 +53,10 @@ void ggml_sycl_op_set(ggml_backend_sycl_context& ctx, ggml_sycl::sycl_tensor dst
     queue_ptr stream = ctx.stream();
 
     // Copy src0 to dst if not inplace
-    if (!inplace)
+    if (!inplace) {
+        ggml_sycl_trace_memcpy_during_recording("set.cpp:initial_copy", dst.nbytes());
         stream->memcpy(dst_ptr, src0_ptr, dst.nbytes());
+    }
 
     const int64_t ne[4] = {src1.ne(0), src1.ne(1), src1.ne(2), src1.ne(3)};
     const int64_t src_nb[3] = {src1.nb(1)/sizeof(float), src1.nb(2)/sizeof(float), src1.nb(3)/sizeof(float)};
