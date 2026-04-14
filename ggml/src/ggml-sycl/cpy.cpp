@@ -757,7 +757,7 @@ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) 
     if ((src0->type == src1->type) && (ggml_is_contiguous(src0) && ggml_is_contiguous(src1))) {
         GGML_SYCL_DEBUG("[CPY device=%d] memcpy path: %p -> %p (%zu bytes)\n", device, (void*)src0_ddc, (void*)src1_ddc, ggml_nbytes(src0));
         ggml_sycl_trace_memcpy_during_recording("cpy.cpp:contiguous_copy", ggml_nbytes(src0));
-        main_stream->memcpy(src1_ddc, src0_ddc, ggml_nbytes(src0));
+        ggml_sycl_graph_safe_memcpy(*main_stream, src1_ddc, src0_ddc, ggml_nbytes(src0));
         GGML_SYCL_DEBUG("[CPY device=%d] memcpy submitted\n", device);
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
         ggml_cpy_f32_f32_sycl(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10,

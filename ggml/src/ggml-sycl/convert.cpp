@@ -547,7 +547,7 @@ void reorder_q4_0_aos_to_coalesced_sycl(const void *    src,
 
     // Always use a temp buffer to support in-place conversion safely
     uint8_t *   temp       = ggml_sycl_malloc_device_tracked_t<uint8_t>(total_bytes, *stream, "convert_temp");
-    sycl::event copy_event = stream->memcpy(temp, src, total_bytes);
+    sycl::event copy_event = ggml_sycl_graph_safe_memcpy(*stream, temp, src, total_bytes);
 
     sycl::event convert_event = stream->submit([&](sycl::handler & cgh) {
         cgh.depends_on(copy_event);
@@ -629,7 +629,7 @@ void reorder_q8_0_aos_to_coalesced_sycl(const void *    src,
     const size_t total_bytes    = total_blocks * sizeof(block_q8_0);
 
     uint8_t *   temp       = ggml_sycl_malloc_device_tracked_t<uint8_t>(total_bytes, *stream, "convert_temp");
-    sycl::event copy_event = stream->memcpy(temp, src, total_bytes);
+    sycl::event copy_event = ggml_sycl_graph_safe_memcpy(*stream, temp, src, total_bytes);
 
     sycl::event convert_event = stream->submit([&](sycl::handler & cgh) {
         cgh.depends_on(copy_event);
@@ -709,7 +709,7 @@ void reorder_mxfp4_aos_to_coalesced_sycl(const void *    src,
     const size_t total_bytes    = total_blocks * sizeof(block_mxfp4);
 
     uint8_t *   temp       = ggml_sycl_malloc_device_tracked_t<uint8_t>(total_bytes, *stream, "convert_temp");
-    sycl::event copy_event = stream->memcpy(temp, src, total_bytes);
+    sycl::event copy_event = ggml_sycl_graph_safe_memcpy(*stream, temp, src, total_bytes);
 
     sycl::event convert_event = stream->submit([&](sycl::handler & cgh) {
         cgh.depends_on(copy_event);
@@ -813,7 +813,7 @@ void reorder_q6_k_aos_to_coalesced_sycl(const void *    src,
     const size_t total_bytes    = total_blocks * sizeof(block_q6_K);
 
     uint8_t *   temp       = ggml_sycl_malloc_device_tracked_t<uint8_t>(total_bytes, *stream, "convert_temp");
-    sycl::event copy_event = stream->memcpy(temp, src, total_bytes);
+    sycl::event copy_event = ggml_sycl_graph_safe_memcpy(*stream, temp, src, total_bytes);
 
     sycl::event convert_event = stream->submit([&](sycl::handler & cgh) {
         cgh.depends_on(copy_event);

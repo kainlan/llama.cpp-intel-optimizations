@@ -146,6 +146,31 @@ extern std::atomic<int>  g_sycl_extra_submit_count_during_recording;  // DIAG: e
 void ggml_sycl_trace_memcpy_during_recording(const char * caller, size_t bytes);
 int                      ggml_sycl_graph_inflight_count();
 
+// Graph-safe memcpy: uses kernel-based copy during SYCL graph recording
+// to avoid memcpy nodes that L0 Mutable Command List cannot update.
+// Outside recording, falls through to queue.memcpy for optimal DMA performance.
+// ALL queue memcpy calls in op dispatch code should use this instead of raw queue.memcpy.
+inline sycl::event ggml_sycl_graph_safe_memcpy(sycl::queue & q, void * dst, const void * src, size_t nbytes) {
+#ifdef GGML_SYCL_GRAPH
+    if (g_ggml_sycl_graph_recording && nbytes > 0) {
+        const size_t n_i32 = nbytes / sizeof(int32_t);
+        auto *       d     = static_cast<int32_t *>(dst);
+        const auto * s     = static_cast<const int32_t *>(src);
+        if (n_i32 > 0) {
+            q.parallel_for(sycl::range<1>(n_i32), [=](sycl::id<1> i) { d[i] = s[i]; });
+        }
+        const size_t tail = nbytes % sizeof(int32_t);
+        if (tail > 0) {
+            auto *       dc = static_cast<char *>(dst) + n_i32 * sizeof(int32_t);
+            const auto * sc = static_cast<const char *>(src) + n_i32 * sizeof(int32_t);
+            q.parallel_for(sycl::range<1>(tail), [=](sycl::id<1> i) { dc[i] = sc[i]; });
+        }
+        return sycl::event{};
+    }
+#endif
+    return q.memcpy(dst, src, nbytes);
+}
+
 inline bool ggml_sycl_graph_recording_active() {
     return g_ggml_sycl_graph_recording || g_ggml_sycl_graph_recording_depth.load(std::memory_order_acquire) > 0;
 }

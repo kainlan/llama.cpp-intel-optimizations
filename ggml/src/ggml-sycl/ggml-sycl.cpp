@@ -419,7 +419,7 @@ struct fp16_weight_cache {
         sycl::half * buf = reinterpret_cast<sycl::half *>(slab_ptr + slab_offset);
         // Async copy on in-order queue: completes before next kernel reads scratch
         ggml_sycl_trace_memcpy_during_recording("ggml-sycl.cpp:scratch_pool_fill", bytes);
-        queue.memcpy(buf, src, bytes);
+        ggml_sycl_graph_safe_memcpy(queue, buf, src, bytes);
         entries[name_hash] = { buf };
         slab_offset += aligned_bytes;
         total_bytes += bytes;
@@ -49362,6 +49362,8 @@ normal_dispatch:
 
                 // Pre-stage leaf tensors (ensures input data is on device before recording)
                 graph_prestage_leaf_tensors(sycl_ctx, cgraph);
+                // Refresh input tensor data (token IDs etc.) on stable device staging
+                graph_refresh_input_tensors(sycl_ctx, cgraph);
 
                 // Clear stale eviction guard (same reason as first-time recording path)
                 ggml_sycl::unified_cache_set_graph_compute_active(false);
@@ -49385,9 +49387,13 @@ normal_dispatch:
                 g_ggml_sycl_graph_recording = false;
                 g_ggml_sycl_graph_recording_depth.fetch_sub(1, std::memory_order_acq_rel);
 
-                // Update existing executable graph with fresh recording
-                sycl_ctx->exec_graph->update(model_sycl_graph);
-                GGML_SYCL_DEBUG("[SYCL-GRAPH] update success\n");
+                // Re-finalize: L0 Mutable Command List cannot update() when the
+                // runtime inserts implicit memcpy nodes (e.g. for USM argument
+                // staging).  Re-finalize is more expensive than update() but
+                // still faster than per-kernel-launch overhead.
+                auto exec_graph = model_sycl_graph.finalize();
+                sycl_ctx->exec_graph =
+                    std::make_unique<sycl_ex::command_graph<sycl_ex::graph_state::executable>>(exec_graph);
 
                 graph_executed = true;
                 sycl_ctx->stream()->ext_oneapi_graph(*(sycl_ctx->exec_graph));
@@ -49396,7 +49402,7 @@ normal_dispatch:
                 g_recording_graph_ptr       = nullptr;
                 g_recording_queue_ptr       = nullptr;
                 g_ggml_sycl_graph_recording_depth.fetch_sub(1, std::memory_order_acq_rel);
-                GGML_LOG_ERROR("[SYCL-GRAPH] re-record+update failed: %s, re-finalizing\n", exc.what());
+                GGML_LOG_ERROR("[SYCL-GRAPH] re-record+re-finalize failed: %s, falling back\n", exc.what());
                 // Invalidate and force re-record on next call
                 sycl_ctx->exec_graph.reset();
                 sycl_ctx->exec_graph_n_nodes = 0;

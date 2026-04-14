@@ -362,7 +362,7 @@ void ggml_sycl_op_soft_max(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tens
     }();
 
 #if GGML_SYCL_DNNL
-    if (use_dnnl_softmax && !src1_d && max_bias == 0.0f && nrows_x >= 128) {
+    if (use_dnnl_softmax && !src1_d && max_bias == 0.0f && nrows_x >= 128 && !g_ggml_sycl_graph_recording) {
         DnnlSoftmaxWrapper::softmax(
             ctx, src0_d, dst_d,
             nrows_x,                              // batch = total rows

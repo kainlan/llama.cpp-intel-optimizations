@@ -692,7 +692,7 @@ void ggml_sycl_mul(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) 
     }();
 
 #if GGML_SYCL_DNNL
-    if (use_dnnl_mul) {
+    if (use_dnnl_mul && !g_ggml_sycl_graph_recording) {
         const auto & src0 = dst.src(0);
         const auto & src1 = dst.src(1);
 
@@ -791,7 +791,10 @@ void ggml_sycl_add1(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst)
         // Category C: synchronous wait required — CPU reads scalar from device
         // to pass as a captured kernel argument in the parallel_for below.
         float scalar;
-        stream->memcpy(&scalar, ggml_sycl_get_data_ptr(src1, device), sizeof(float)).wait();
+        ggml_sycl_graph_safe_memcpy(*stream, &scalar, ggml_sycl_get_data_ptr(src1, device), sizeof(float));
+        if (!g_ggml_sycl_graph_recording) {
+            stream->wait();
+        }
 
         const int block_size = 256;
         const int num_blocks = (n + block_size - 1) / block_size;
@@ -806,7 +809,10 @@ void ggml_sycl_add1(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst)
         // Category C: synchronous wait required — CPU reads scalar from device
         // to pass as a captured kernel argument in the parallel_for below.
         float scalar_f32;
-        stream->memcpy(&scalar_f32, ggml_sycl_get_data_ptr(src1, device), sizeof(float)).wait();
+        ggml_sycl_graph_safe_memcpy(*stream, &scalar_f32, ggml_sycl_get_data_ptr(src1, device), sizeof(float));
+        if (!g_ggml_sycl_graph_recording) {
+            stream->wait();
+        }
         sycl::half scalar = sycl::half(scalar_f32);
 
         const int block_size = 256;
@@ -822,7 +828,10 @@ void ggml_sycl_add1(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst)
         // Category C: synchronous wait required — CPU reads scalar from device
         // to pass as a captured kernel argument in the parallel_for below.
         sycl::half scalar;
-        stream->memcpy(&scalar, ggml_sycl_get_data_ptr(src1, device), sizeof(sycl::half)).wait();
+        ggml_sycl_graph_safe_memcpy(*stream, &scalar, ggml_sycl_get_data_ptr(src1, device), sizeof(sycl::half));
+        if (!g_ggml_sycl_graph_recording) {
+            stream->wait();
+        }
 
         const int block_size = 256;
         const int num_blocks = (n + block_size - 1) / block_size;

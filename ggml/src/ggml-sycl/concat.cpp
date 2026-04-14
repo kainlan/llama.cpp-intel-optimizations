@@ -174,8 +174,11 @@ void concat_impl_sycl(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor ds
             const size_t size0 = src0.nbytes();
             const size_t size1 = src1.nbytes();
 
-            SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(dst_d, src0_d, size0).wait()));
-            SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(dst_d + size0 / type_size, src1_d, size1).wait()));
+            SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_graph_safe_memcpy(*stream, dst_d, src0_d, size0)));
+            SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_graph_safe_memcpy(*stream, dst_d + size0 / type_size, src1_d, size1)));
+            if (!g_ggml_sycl_graph_recording) {
+                stream->wait();
+            }
         }
     } else {
         concat_T_sycl_non_cont<T>(stream, static_cast<const char *>(src0.resolve_ptr()),

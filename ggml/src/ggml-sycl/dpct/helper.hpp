@@ -2272,6 +2272,12 @@ namespace dpct
     {
         if (!size)
             return sycl::event{};
+#ifdef GGML_SYCL_GRAPH
+        if (::g_ggml_sycl_graph_recording) {
+            // Delegate to the guarded detail:: version to use kernel-based copy
+            return detail::dpct_memcpy(q, to_ptr, from_ptr, size, direction, dep_events);
+        }
+#endif
         return q.memcpy(to_ptr, from_ptr, size, dep_events);
         GGML_UNUSED(direction);
     }

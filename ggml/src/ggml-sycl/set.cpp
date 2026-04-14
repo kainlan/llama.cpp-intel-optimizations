@@ -55,7 +55,7 @@ void ggml_sycl_op_set(ggml_backend_sycl_context& ctx, ggml_sycl::sycl_tensor dst
     // Copy src0 to dst if not inplace
     if (!inplace) {
         ggml_sycl_trace_memcpy_during_recording("set.cpp:initial_copy", dst.nbytes());
-        stream->memcpy(dst_ptr, src0_ptr, dst.nbytes());
+        ggml_sycl_graph_safe_memcpy(*stream, dst_ptr, src0_ptr, dst.nbytes());
     }
 
     const int64_t ne[4] = {src1.ne(0), src1.ne(1), src1.ne(2), src1.ne(3)};

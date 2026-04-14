@@ -1060,9 +1060,9 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
             // Copy from host (USM) to device using the correct host pointers
             // Note: In-order queue ensures memcpy completes before subsequent kernel launch
             ggml_sycl_trace_memcpy_during_recording("fattn.cpp:q_seq_ids", q_size);
-            stream->memcpy(tl_buffers.q_seq_ids_dev, host_q_ptr, q_size);
+            ggml_sycl_graph_safe_memcpy(*stream, tl_buffers.q_seq_ids_dev, host_q_ptr, q_size);
             ggml_sycl_trace_memcpy_during_recording("fattn.cpp:kv_seq_ids", kv_size);
-            stream->memcpy(tl_buffers.kv_seq_ids_dev, host_kv_ptr, kv_size);
+            ggml_sycl_graph_safe_memcpy(*stream, tl_buffers.kv_seq_ids_dev, host_kv_ptr, kv_size);
 
             params.q_seq_ids  = tl_buffers.q_seq_ids_dev;
             params.kv_seq_ids = tl_buffers.kv_seq_ids_dev;
@@ -1093,9 +1093,9 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
                 // Copy offsets to device
                 // Note: In-order queue ensures memcpy completes before subsequent kernel launch
                 ggml_sycl_trace_memcpy_during_recording("fattn.cpp:seq_q_offsets", offsets_size);
-                stream->memcpy(tl_buffers.seq_q_offsets_dev, tl_seq_q_offsets.data(), offsets_size);
+                ggml_sycl_graph_safe_memcpy(*stream, tl_buffers.seq_q_offsets_dev, tl_seq_q_offsets.data(), offsets_size);
                 ggml_sycl_trace_memcpy_during_recording("fattn.cpp:seq_kv_offsets", offsets_size);
-                stream->memcpy(tl_buffers.seq_kv_offsets_dev, tl_seq_kv_offsets.data(), offsets_size);
+                ggml_sycl_graph_safe_memcpy(*stream, tl_buffers.seq_kv_offsets_dev, tl_seq_kv_offsets.data(), offsets_size);
 
                 // Set params for kernel to use sequence boundary optimization
                 params.n_seqs         = n_seqs;
