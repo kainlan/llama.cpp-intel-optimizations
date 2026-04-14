@@ -2254,7 +2254,10 @@ inline void * ggml_sycl_get_data_ptr(const ggml_tensor * tensor, int device) {
     // Per-layer KV allocations and unified_cache_allocate results are always
     // registered here.  This avoids the slow path's sycl::get_pointer_type()
     // which can fail for cross-context device pointers.
-    if (tensor->data != nullptr) {
+    // Skip fast path 2 for INPUT tensors ONLY when graph input staging is active.
+    // During graph recording/replay, the slow path redirects to a stable device buffer
+    // (tensor->data may move between iterations). Outside recording, use fast path as normal.
+    if (tensor->data != nullptr && !((tensor->flags & GGML_TENSOR_FLAG_INPUT) && g_ggml_sycl_graph_recording)) {
         const auto * info = ggml_sycl::alloc_registry::instance().lookup(tensor->data);
         if (info && (info->type == ggml_sycl::alloc_type::DEVICE || info->type == ggml_sycl::alloc_type::HOST_PINNED)) {
             return tensor->data;
@@ -3210,6 +3213,58 @@ struct ggml_backend_sycl_context {
     // from tensor->data to resolved_ptr, avoiding expensive get_pointer_type() driver calls.
     std::vector<void *>        cached_input_dev_ptrs;
     bool                       input_tensors_cached = false;
+
+    // Stable device staging for graph replay INPUT tensors.
+    // The ggml allocator may reassign tensor->data between iterations, but L0 graph
+    // replay bakes USM pointers at finalize time. This map provides stable device
+    // addresses: allocated once during recording, refreshed via H2D memcpy before replay.
+    // Key: tensor name (stable across iterations). Value: {device_ptr, capacity}.
+    struct graph_input_staging_entry {
+        void * device_ptr = nullptr;
+        size_t capacity   = 0;
+    };
+    std::unordered_map<std::string, graph_input_staging_entry> graph_input_staging;
+
+    // Look up or create a stable device staging buffer for an INPUT tensor.
+    // Returns a device pointer that persists across graph iterations.
+    void * graph_input_stage(const char * name, const void * host_data, size_t nbytes, sycl::queue & q) {
+        auto it = graph_input_staging.find(name);
+        if (it != graph_input_staging.end() && it->second.capacity >= nbytes) {
+            // Reuse existing buffer — sync copy to ensure data is ready
+            q.memcpy(it->second.device_ptr, host_data, nbytes).wait();
+            return it->second.device_ptr;
+        }
+        // Allocate new device buffer
+        if (it != graph_input_staging.end() && it->second.device_ptr) {
+            ggml_sycl::alloc_registry::instance().unregister_alloc(it->second.device_ptr);
+            sycl::free(it->second.device_ptr, q);
+        }
+        void * dev_ptr = nullptr;
+        try {
+            dev_ptr = sycl::malloc_device(nbytes, q);
+        } catch (...) {
+            return nullptr;
+        }
+        if (!dev_ptr) { return nullptr; }
+        // Register so alloc_registry knows this is device memory
+        int dev_id = -1;
+        try { dev_id = ggml_sycl_get_device_id_from_queue(q); } catch (...) {}
+        ggml_sycl::alloc_registry::instance().register_alloc(dev_ptr, nbytes, dev_id, ggml_sycl::alloc_type::DEVICE);
+        // Sync copy to ensure data is ready before recording
+        q.memcpy(dev_ptr, host_data, nbytes).wait();
+        graph_input_staging[name] = { dev_ptr, nbytes };
+        return dev_ptr;
+    }
+
+    void graph_input_staging_clear(sycl::queue & q) {
+        for (auto & [name, entry] : graph_input_staging) {
+            if (entry.device_ptr) {
+                ggml_sycl::alloc_registry::instance().unregister_alloc(entry.device_ptr);
+                sycl::free(entry.device_ptr, q);
+            }
+        }
+        graph_input_staging.clear();
+    }
 
     // Pre-allocated buffers for MoE graph recording
     // MUL_MAT_ID needs Q8_1 quantization buffers which cannot be allocated during graph recording
