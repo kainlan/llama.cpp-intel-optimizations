@@ -2549,7 +2549,8 @@ inline ggml_sycl::unified_cache::weight_ptr_result ggml_sycl_resolve_weight(cons
 // === Unified tensor resolution (P13) ===
 // Single entry point for ALL tensor types: weights, KV cache, activations, dst.
 // Returns resolved_ptr with pointer, layout mode, and device/host flag.
-//   - Weights: queries unified cache for best layout (SOA/COALESCED/AOS)
+//   - Weights: O(1) via data_handle smart pointer (generation-checked),
+//              falls back to cache lookup only if handle is empty
 //   - Non-weights: data_device_ptr fast path + alloc_registry lookup
 // O(1) hot path.  Safe at graph build time (no SYCL runtime locks).
 inline ggml_sycl::resolved_ptr ggml_sycl_resolve(const ggml_tensor * tensor, int device) {
@@ -2558,8 +2559,37 @@ inline ggml_sycl::resolved_ptr ggml_sycl_resolve(const ggml_tensor * tensor, int
         return result;
     }
 
-    // Weight tensors: try unified cache for best layout
+    // Weight tensors: try smart handle first (O(1) fast path), then cache lookup fallback
     if (ggml_sycl_tensor_is_weight(tensor) && ggml_sycl::unified_cache_enabled()) {
+        // Fast path: use data_handle[device].resolve() — O(1) generation-checked.
+        // data_handle is set as a WEIGHT handle during S1-PRELOAD (from_cache_id),
+        // or as a DIRECT handle by set_data_device() for non-weight init paths.
+        // The WEIGHT handle's resolve() compares cached generation vs global and
+        // returns the cached pointer without any hash map lookup (~3 ns hot path).
+        if (tensor->extra != nullptr && device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
+            auto * extra    = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
+            auto   resolved = extra->data_handle[device].resolve();
+            if (resolved) {
+                // Validate COALESCED compatibility — some tensors have dimension
+                // constraints that prevent COALESCED layout usage.
+                if (resolved.layout == GGML_LAYOUT_COALESCED && !ggml_sycl_layout_supports_coalesced(tensor)) {
+                    // Fall through to slow path for SOA fallback lookup
+                    GGML_SYCL_DEBUG("[RESOLVE] handle returned COALESCED but tensor '%s' incompatible, "
+                                    "falling through to cache lookup\n", tensor->name ? tensor->name : "?");
+                } else {
+                    return resolved;
+                }
+            } else {
+                GGML_SYCL_DEBUG("[RESOLVE] data_handle empty for weight tensor '%s' device %d, "
+                                "falling through to cache lookup\n", tensor->name ? tensor->name : "?", device);
+            }
+        }
+
+        // Slow path fallback: full cache lookup (string hashing + hash map).
+        // This path is hit when:
+        //   1. data_handle was never populated (tensor missed S1-PRELOAD)
+        //   2. COALESCED layout incompatible, need SOA fallback lookup
+        //   3. extra is null (shouldn't happen for weight tensors)
         auto * cache = ggml_sycl::get_unified_cache_for_device(device);
         if (cache) {
             ggml_sycl_cache_id key = ggml_backend_sycl_get_weight_cache_key(tensor, device);
