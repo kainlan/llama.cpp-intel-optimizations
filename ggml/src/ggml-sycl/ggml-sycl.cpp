@@ -37893,6 +37893,7 @@ static thread_local int            g_preclassified_size      = 0;
 
 static bool ggml_sycl_op_is_moe_routing_subgraph(const ggml_tensor * op);
 static bool ggml_sycl_op_is_host_gate_activation_chain(const ggml_tensor * op, int device);
+static bool ggml_sycl_tensor_depends_on_planned_host_weight(const ggml_tensor * tensor, int device, int depth);
 
 struct cpu_batch_threshold_config {
     int pp = 4;
@@ -50361,24 +50362,14 @@ static bool ggml_sycl_op_is_moe_routing_subgraph(const ggml_tensor * op) {
     }
 }
 
-static bool ggml_sycl_tensor_has_host_gate_activation_hint(const ggml_tensor * tensor, int depth = 0) {
-    if (!tensor || depth > 2) {
-        return false;
-    }
-
-    if (tensor->name[0] != '\0' &&
-        (strstr(tensor->name, "ffn_inp") != nullptr || strstr(tensor->name, "attn_post_norm") != nullptr)) {
-        return true;
-    }
-
-    for (int s = 0; s < GGML_MAX_SRC && tensor->src[s] != nullptr; ++s) {
-        if (ggml_sycl_tensor_has_host_gate_activation_hint(tensor->src[s], depth + 1)) {
-            return true;
-        }
-    }
-
-    return false;
-}
+// Removed: ggml_sycl_tensor_has_host_gate_activation_hint()
+// The old implementation used hard-coded tensor name checks (strstr("ffn_inp"))
+// to guess if an op was part of a MoE gate activation chain. This was fragile
+// and incorrectly matched dense models like Mistral 7B, routing their FFN norm
+// MUL ops to CPU with D2H/H2D staging — a 17% PP regression.
+//
+// Replaced by ggml_sycl_tensor_depends_on_planned_host_weight() which queries
+// the placement planner (the actual source of truth for data residency).
 
 static bool ggml_sycl_layer_has_host_gate_weight(int layer_id, int device) {
     if (layer_id < 0 || device < 0) {
@@ -50405,12 +50396,20 @@ static bool ggml_sycl_op_is_host_gate_activation_chain(const ggml_tensor * op, i
         return false;
     }
 
+    // Only consider lightweight activation ops (ADD, MUL, NORM, RMS_NORM)
+    // that sit between host-dispatched MUL_MATs.  These should run on CPU
+    // to avoid unnecessary D2H→H2D roundtrips when their source data is
+    // already host-resident from a preceding host-dispatched MUL_MAT.
+    //
+    // Uses the placement planner as the source of truth for data residency
+    // instead of fragile tensor name matching (the old strstr("ffn_inp")
+    // approach incorrectly matched dense models).
     switch (op->op) {
         case GGML_OP_ADD:
         case GGML_OP_MUL:
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
-            return ggml_sycl_tensor_has_host_gate_activation_hint(op);
+            return ggml_sycl_tensor_depends_on_planned_host_weight(op, device, 0);
         default:
             return false;
     }
