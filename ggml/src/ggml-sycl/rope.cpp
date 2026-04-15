@@ -410,13 +410,13 @@ inline void ggml_sycl_op_rope(ggml_backend_sycl_context & ctx, ggml_tensor *dst)
 
     // Use device-specific data pointers for TP support
     const int device = ctx.device;
-    void * src0_d = ggml_sycl_get_data_ptr(dst->src[0], device);
-    void * dst_d  = ggml_sycl_get_data_ptr(dst, device);
-    const int32_t * pos = (const int32_t *) ggml_sycl_get_data_ptr(dst->src[1], device);
+    void * src0_d = ggml_sycl_resolve_tensor_ptr(dst->src[0], device);
+    void * dst_d  = ggml_sycl_resolve_tensor_ptr(dst, device);
+    const int32_t * pos = (const int32_t *) ggml_sycl_resolve_tensor_ptr(dst->src[1], device);
 
     const float * freq_factors = nullptr;
     if (dst->src[2] != nullptr) {
-        freq_factors = (const float *) ggml_sycl_get_data_ptr(dst->src[2], device);
+        freq_factors = (const float *) ggml_sycl_resolve_tensor_ptr(dst->src[2], device);
     }
 
     rope_corr_dims corr_dims;

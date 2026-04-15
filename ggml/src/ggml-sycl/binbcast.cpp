@@ -690,11 +690,13 @@ void ggml_sycl_mul(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) 
         }
     }
 
-    // oneDNN fast path for PP row-broadcast MUL (e.g. RMSNorm weight scaling).
-    // Conditions: F32, contiguous on dim0, src1 broadcasts along batch dim, batch >= 128.
+    // oneDNN path for PP row-broadcast MUL — disabled by default.
+    // oneDNN's after_exec_hook syncs GPU after each execute(), costing
+    // 0.134ms/call vs 0.059ms for the SYCL kernel (2.3x overhead from sync).
+    // Enable with GGML_SYCL_ONEDNN_MUL=1 for testing.
     static const bool use_dnnl_mul = [] {
         const char * env = getenv("GGML_SYCL_ONEDNN_MUL");
-        return env == nullptr || std::string(env) != "0";
+        return env != nullptr && std::string(env) != "0";
     }();
 
 #if GGML_SYCL_DNNL
