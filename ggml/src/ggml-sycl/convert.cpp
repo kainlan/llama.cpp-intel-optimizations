@@ -1046,6 +1046,26 @@ void dequantize_row_q4_0_coalesced_to_fp16_rowmajor(const void *    src,
     dequantize_row_q4_0_sycl_coalesced_rowmajor(src, dst, blocks_per_row, nrows, stream);
 }
 
+// SOA→row-major FP16 dequant for oneDNN PP path.
+// SOA has sequential qs reads (no tile interleaving) — much faster than COALESCED.
+void dequantize_row_q4_0_soa_to_fp16_rowmajor(const void *    src,
+                                               sycl::half *    dst,
+                                               int             blocks_per_row,
+                                               int             nrows,
+                                               dpct::queue_ptr stream) {
+    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+
+    const int total_blocks = nrows * blocks_per_row;
+    constexpr int WG_SIZE  = 256;
+    const int     n_wgs    = (total_blocks + WG_SIZE - 1) / WG_SIZE;
+
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, n_wgs * WG_SIZE), sycl::range<3>(1, 1, WG_SIZE)),
+        [=](sycl::nd_item<3> item) {
+            dequantize_block_q4_0_soa_rowmajor(src, dst, blocks_per_row, nrows, item);
+        });
+}
+
 // Host function to launch Q4_0 Coalesced to SoA conversion
 void reorder_q4_0_coalesced_to_soa_sycl(const void *    src,
                                         void *          dst,  // SoA format: [all qs bytes][all d values]

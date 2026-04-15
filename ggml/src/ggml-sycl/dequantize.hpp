@@ -360,6 +360,44 @@ static void dequantize_block_q4_0_coalesced_rowmajor(const void * __restrict__ v
     }
 }
 
+// SOA→row-major FP16 dequant for oneDNN PP path.
+// SOA layout: [all qs bytes contiguous][all d values contiguous]
+// qs for block b: vx + b * (QK4_0/2)
+// d  for block b: vx + total_qs_bytes + b * sizeof(half)
+// Output: row-major FP16 (row r, col c → y[r * cols + c])
+template<typename dst_t>
+static void dequantize_block_q4_0_soa_rowmajor(const void * __restrict__ vx, dst_t * __restrict__ yy,
+                                                const int blocks_per_row, const int nrows,
+                                                const sycl::nd_item<3> & item) {
+    const int global_id  = item.get_global_id(2);
+    const int total_blocks = nrows * blocks_per_row;
+
+    if (global_id >= total_blocks) {
+        return;
+    }
+
+    const int row       = global_id / blocks_per_row;
+    const int block_idx = global_id % blocks_per_row;
+
+    // SOA: qs are sequential per block
+    const auto * qs = (const uint8_t *) vx + (int64_t) global_id * (QK4_0 / 2);
+
+    // SOA: scales after ALL qs bytes
+    const int64_t total_qs_bytes = (int64_t) total_blocks * (QK4_0 / 2);
+    const auto *  s_ptr = (const sycl::half *) ((const uint8_t *) vx + total_qs_bytes) + global_id;
+    const float   d     = float(*s_ptr);
+
+    // Output: row-major
+    dst_t * y_ptr = yy + (int64_t) row * blocks_per_row * QK4_0 + block_idx * QK4_0;
+
+    #pragma unroll
+    for (int l = 0; l < QK4_0 / 2; ++l) {
+        int vq      = qs[l];
+        y_ptr[l + 0]  = d * ((vq & 0xF) - 8);
+        y_ptr[l + 16] = d * ((vq >> 4) - 8);
+    }
+}
+
 template<typename dst_t>
 static void dequantize_block_q4_1(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t nb32,
                                   const sycl::nd_item<3> &item_ct1) {
