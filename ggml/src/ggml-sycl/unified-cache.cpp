@@ -5262,8 +5262,15 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
             s_phase_gate_mode.store(mode, std::memory_order_relaxed);
         }
         if (mode > 0) {
+            // Exempt host-pinned allocations from the phase gate.
+            // All host-pinned memory comes from pre-allocated pinned pool chunks
+            // (sycl::malloc_host is never called during inference).  Staging of
+            // INPUT leaf tensors, CPU dispatch D2H buffers, and offload scratch
+            // all route through here — they're pool sub-allocations, not new
+            // driver allocations.
+            const bool is_pool_suballoc = req_in.intent.constraints.must_host_pinned;
             const offload_phase phase = offload_stats_phase();
-            if (phase == offload_phase::PP || phase == offload_phase::TG) {
+            if (!is_pool_suballoc && (phase == offload_phase::PP || phase == offload_phase::TG)) {
                 if (mode >= 2) {
                     GGML_LOG_ERROR(
                         "[UNIFIED-ALLOC] PHASE GATE: unified_alloc() called during %s phase "
@@ -5576,6 +5583,7 @@ bool acquire_offload_buffer(const offload_buffer_request & req_in, offload_buffe
             case offload_buffer_role::STAGING_DST:
             case offload_buffer_role::RETAINED_SCRATCH:
                 areq.intent.constraints.must_host_pinned = true;
+                areq.intent.constraints.use_pinned_pool  = true;
                 break;
             default:
                 break;
