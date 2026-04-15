@@ -123,8 +123,9 @@ static bool read_layout_bytes(const ggml_tensor * tensor,
                               layout_mode         layout,
                               std::vector<uint8_t> & out,
                               const char **       out_source = nullptr) {
-    const char * source = nullptr;
-    void *       layout_ptr = ggml_sycl_get_layout_ptr_for(tensor, device, layout, &source);
+    auto         resolved   = ggml_sycl_resolve(tensor, device);
+    void *       layout_ptr = (resolved && resolved.layout == layout) ? resolved.ptr : nullptr;
+    const char * source     = layout_ptr ? "resolved" : (resolved ? "wrong_layout" : "not_found");
     if (!layout_ptr) {
         if (out_source) {
             *out_source = source;

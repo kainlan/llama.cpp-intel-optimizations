@@ -552,7 +552,7 @@ static bool test_layout_ptr_eviction_guard(int device_id) {
 
     cache->remove(key, ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS);
 
-    void * resolved_ptr = ggml_sycl_get_layout_ptr(weight, device_id);
+    void * resolved_ptr = ggml_sycl_resolve_tensor_ptr(weight, device_id);
     if (resolved_ptr != weight->data) {
         delete extra;
         ggml_backend_buffer_free(weight_buffer);

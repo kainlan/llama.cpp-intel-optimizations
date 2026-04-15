@@ -1738,7 +1738,7 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tens
                 ggml_backend_buffer_is_host(storage->buffer)) {
                 aos_base = ggml_sycl_host_data(storage);
             } else {
-                aos_base = ggml_sycl_get_layout_ptr(storage, device);
+                aos_base = ggml_sycl_resolve_tensor_ptr(storage, device);
             }
         }
         src0_d = aos_base ? (const char *) aos_base + view_offset : nullptr;

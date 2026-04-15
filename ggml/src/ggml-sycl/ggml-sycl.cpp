@@ -31631,9 +31631,9 @@ static bool ggml_sycl_mul_mat_id_fused(ggml_backend_sycl_context & ctx,
         stream->ext_oneapi_submit_barrier({ ids_copy_event });
     }
     // Note: host_weights (src0 in host buffer) is NOT an automatic disqualifier.
-    // ggml_sycl_get_layout_ptr_for() resolves through the unified cache and returns
+    // ggml_sycl_resolve_tensor_ptr() resolves through the unified cache and returns
     // a device USM pointer when weights are cached in VRAM.  If no device copy exists
-    // (cache miss), get_layout_ptr_for returns nullptr and we fall back below.
+    // (cache miss), resolve_tensor_ptr returns nullptr and we fall back below.
 
     auto *            src0_extra = (ggml_tensor_extra_gpu *) src0->extra;
     const layout_mode layout     = get_effective_layout_mode(src0_extra);

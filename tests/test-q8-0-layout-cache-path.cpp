@@ -139,10 +139,11 @@ int main() {
     ggml_backend_tensor_set(weight, weight_data.data(), 0, weight_data.size() * sizeof(block_q8_0_test));
     ggml_backend_tensor_set(input, input_data.data(), 0, input_data.size() * sizeof(float));
 
-    const char * source = nullptr;
-    void * layout_ptr = ggml_sycl_get_layout_ptr_for(weight, 0, GGML_LAYOUT_SOA, &source);
+    auto         resolved   = ggml_sycl_resolve(weight, 0);
+    void *       layout_ptr = (resolved && resolved.layout == GGML_LAYOUT_SOA) ? resolved.ptr : nullptr;
+    const char * source     = layout_ptr ? "resolved_soa" : (resolved ? "wrong_layout" : "not_found");
     if (!layout_ptr) {
-        fprintf(stderr, "Failed to resolve SoA layout pointer (source=%s)\n", source ? source : "null");
+        fprintf(stderr, "Failed to resolve SoA layout pointer (source=%s)\n", source);
         ggml_backend_buffer_free(weight_buf);
         ggml_backend_buffer_free(input_buf);
         ggml_backend_buffer_free(output_buf);

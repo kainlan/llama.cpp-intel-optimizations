@@ -369,7 +369,7 @@ static void ggml_sycl_mul_mat_vec_rmsnorm(
     // Phase 2: Fused MMVQ with SLM-cached normalization
     const int device = ctx.device;
     const float * f32_input  = (const float *) ggml_sycl_get_data_ptr(x, device);
-    const float * gamma_data = (const float *) ggml_sycl_get_layout_ptr(gamma, device);
+    const float * gamma_data = (const float *) ggml_sycl_resolve_tensor_ptr(gamma, device);
     float * dst_data         = (float *) ggml_sycl_get_data_ptr(dst, device);
     auto W_resolved = ggml_sycl_resolve(W, device);
     if (!W_resolved || W_resolved.layout != GGML_LAYOUT_AOS) {

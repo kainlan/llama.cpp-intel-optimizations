@@ -2537,7 +2537,7 @@ static void dequantize_mul_mat_vec_q6_k(const void * __restrict__ vx, const floa
 }
 
 // Q4_0 SoA dispatch function - uses soa_base (full tensor) + row_low for correct slicing
-// vx: storage tensor base pointer from ggml_sycl_get_layout_ptr()
+// vx: storage tensor base pointer from ggml_sycl_resolve_tensor_ptr()
 // d_offset: pre-calculated byte offset from vx to scale values (using storage tensor dimensions)
 // row_low: starting row for this slice (relative to storage tensor)
 static void dequantize_mul_mat_vec_q4_0_sycl_reorder(const void *vx, const dfloat *y,
@@ -2595,7 +2595,7 @@ static void dequantize_mul_mat_vec_q4_0_sycl_reorder(const void *vx, const dfloa
 }
 
 // Q8_0 SoA dispatch function - uses soa_base (full tensor) + row_low for correct slicing
-// vx: storage tensor base pointer from ggml_sycl_get_layout_ptr()
+// vx: storage tensor base pointer from ggml_sycl_resolve_tensor_ptr()
 // d_offset: pre-calculated byte offset from vx to scale values (using storage tensor dimensions)
 // row_low: starting row for this slice (relative to storage tensor)
 static void dequantize_mul_mat_vec_q8_0_sycl_reorder(const void *vx, const dfloat *y,

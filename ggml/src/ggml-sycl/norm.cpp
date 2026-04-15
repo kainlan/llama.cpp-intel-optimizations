@@ -1240,7 +1240,7 @@ void ggml_sycl_op_rms_norm_fused(ggml_backend_sycl_context & ctx, ggml_tensor * 
     GGML_ASSERT(mul_src != nullptr);
 
     // Use layout-aware pointer for weight tensors to ensure unified cache staging.
-    const float * mul_dd = static_cast<const float *>(ggml_sycl_get_layout_ptr(mul_src, ctx.device));
+    const float * mul_dd = static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(mul_src, ctx.device));
 
     // Get mul weights dimensions and strides
     const int mul_ncols = mul_src->ne[0];
@@ -1323,7 +1323,7 @@ void ggml_sycl_op_rms_norm_fused_add(ggml_backend_sycl_context & ctx, ggml_tenso
     GGML_ASSERT(mul_src != nullptr);
 
     // Use layout-aware pointer for weight tensors to ensure unified cache staging.
-    const float * mul_dd = static_cast<const float *>(ggml_sycl_get_layout_ptr(mul_src, ctx.device));
+    const float * mul_dd = static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(mul_src, ctx.device));
 
     // Get mul weights dimensions and strides
     const int mul_ncols = mul_src->ne[0];
@@ -1346,7 +1346,7 @@ void ggml_sycl_op_rms_norm_fused_add(ggml_backend_sycl_context & ctx, ggml_tenso
     GGML_ASSERT(add_src != nullptr);
 
     // Use layout-aware pointer for weight tensors to ensure unified cache staging.
-    const float * add_dd = static_cast<const float *>(ggml_sycl_get_layout_ptr(add_src, ctx.device));
+    const float * add_dd = static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(add_src, ctx.device));
 
     // Get add tensor dimensions and strides
     const int add_ncols = add_src->ne[0];

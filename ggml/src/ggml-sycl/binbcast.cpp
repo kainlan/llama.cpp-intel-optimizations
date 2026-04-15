@@ -668,8 +668,8 @@ void ggml_sycl_mul(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) 
 
         if (is_result_norm || is_output_norm) {
             const int    device      = ctx.device;
-            void *       src0_ptr    = src0 ? ggml_sycl_get_layout_ptr(src0, device) : nullptr;
-            void *       src1_ptr    = src1 ? ggml_sycl_get_layout_ptr(src1, device) : nullptr;
+            void *       src0_ptr    = src0 ? ggml_sycl_resolve_tensor_ptr(src0, device) : nullptr;
+            void *       src1_ptr    = src1 ? ggml_sycl_resolve_tensor_ptr(src1, device) : nullptr;
             void *       dst_ptr     = raw_dst ? ggml_sycl_get_data_ptr(raw_dst, device) : nullptr;
             const char * src0_layout = (src0 && src0->layout) ? ggml_sycl_layout_mode_name(src0->layout->mode) : "none";
             const char * src1_layout = (src1 && src1->layout) ? ggml_sycl_layout_mode_name(src1->layout->mode) : "none";
