@@ -2284,16 +2284,22 @@ inline void * ggml_sycl_get_data_ptr(const ggml_tensor * tensor, int device) {
             return ptr;
         }
     }
-    // Fast path 2: check alloc_registry for device/host-pinned pointers.
-    // Per-layer KV allocations and unified_cache_allocate results are always
-    // registered here.  This avoids the slow path's sycl::get_pointer_type()
-    // which can fail for cross-context device pointers.
-    // Skip fast path 2 for INPUT tensors ONLY when graph input staging is active.
-    // During graph recording/replay, the slow path redirects to a stable device buffer
-    // (tensor->data may move between iterations). Outside recording, use fast path as normal.
+    // Fast path 2: for tensors with tensor->data that's already a USM pointer
+    // (compute buffers in the VRAM arena), return it directly.  The ggml allocator
+    // sets tensor->data to a device pointer via ggml_backend_tensor_alloc_offset()
+    // which calls get_base() + offset.  Arena-backed buffers always have stable bases.
+    // Skip for INPUT tensors during graph recording (staging redirect needed).
     if (tensor->data != nullptr && !((tensor->flags & GGML_TENSOR_FLAG_INPUT) && g_ggml_sycl_graph_recording)) {
         const auto * info = ggml_sycl::alloc_registry::instance().lookup(tensor->data);
         if (info && (info->type == ggml_sycl::alloc_type::DEVICE || info->type == ggml_sycl::alloc_type::HOST_PINNED)) {
+            // Populate handle for future fast path in resolve_tensor_ptr
+            if (tensor->extra != nullptr) {
+                auto * extra = static_cast<ggml_tensor_extra_gpu *>(const_cast<ggml_tensor *>(tensor)->extra);
+                if (!extra->data_handle[device].valid()) {
+                    bool on_device = (info->type == ggml_sycl::alloc_type::DEVICE);
+                    extra->set_data_device(device, tensor->data, GGML_LAYOUT_AOS, on_device);
+                }
+            }
             return tensor->data;
         }
     }
@@ -2325,13 +2331,20 @@ inline void * ggml_sycl_resolve_tensor_ptr(const ggml_tensor * tensor, int devic
     if (tensor == nullptr) {
         return nullptr;
     }
-    // Non-weight tensors (KV cache, activations, etc): use get_data_ptr which
-    // handles per-layer KV device pointers, alloc_registry lookups, and
-    // host-pinned zero-copy pointers.
+    // Fast path: smart handle resolve.  data_handle is populated during
+    // S1-PRELOAD (weights via from_cache_id) and set_data_device (non-weights
+    // via from_direct).  resolve() checks a generation counter in ~3ns.
+    if (tensor->extra != nullptr && device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
+        auto * extra    = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
+        auto   resolved = extra->data_handle[device].resolve();
+        if (resolved) {
+            return resolved.ptr;
+        }
+    }
+    // Slow path: full resolution chain (alloc_registry, cache lookup, staging).
     if (!ggml_sycl_tensor_is_weight(tensor)) {
         return ggml_sycl_get_data_ptr(tensor, device);
     }
-    // Weight tensors: fall through to layout resolution below.
     return ggml_sycl_get_layout_ptr_impl(tensor, device);
 }
 
