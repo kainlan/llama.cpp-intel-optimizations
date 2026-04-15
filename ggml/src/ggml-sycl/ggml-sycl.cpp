@@ -13556,6 +13556,24 @@ static void ggml_backend_sycl_buffer_reset(ggml_backend_buffer_t buffer) {
         return;
     }
 
+    // Compute buffers (usage == COMPUTE) are reset by the ggml allocator at the
+    // start of every graph allocation (ggml_gallocr_alloc_graph -> vbuffer_reset).
+    // However, init_tensor is NOT called again after the first allocation because
+    // tensor->buffer remains set.  Destroying the extras here would wipe the
+    // data_handle that init_tensor populated, forcing every tensor through the
+    // expensive get_data_ptr_slow path (alloc_registry lookup, driver round-trips).
+    //
+    // Since the buffer has a stable base (STABLE_BASE cap), tensor->data pointers
+    // are stable across resets and the DIRECT handles remain valid.  Preserve them.
+    //
+    // Weight buffers (usage == WEIGHTS) are never reset by the allocator.
+    if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        GGML_SYCL_DEBUG("[SOA-DEBUG] buffer_reset: PRESERVING %zu extras for compute buffer=%p\n",
+                        ((ggml_backend_sycl_buffer_context *) buffer->context)->tensor_extras.size(),
+                        (void *) buffer);
+        return;
+    }
+
     ggml_backend_sycl_buffer_context * ctx = (ggml_backend_sycl_buffer_context *) buffer->context;
     if (ctx != nullptr) {
         GGML_SYCL_DEBUG("[SOA-DEBUG] buffer_reset: freeing %zu extras (buffer=%p)\n", ctx->tensor_extras.size(),
