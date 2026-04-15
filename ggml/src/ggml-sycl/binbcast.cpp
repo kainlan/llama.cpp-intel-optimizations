@@ -536,8 +536,14 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
         }
     };
 
-    maybe_pin_cached(src0);
-    maybe_pin_cached(src1);
+    // Skip per-op pin/unpin when the planner is authoritative and the eviction
+    // guard is active.  Weight placement is guaranteed, eviction is blocked.
+    const bool skip_pin = ggml_sycl_planner_authoritative_residency_active(device) &&
+                          ggml_sycl::unified_cache_is_graph_compute_active();
+    if (!skip_pin) {
+        maybe_pin_cached(src0);
+        maybe_pin_cached(src1);
+    }
 
     if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         op()((const float *) src0_d, (const float *) src1_d, (float *) dst_d, ne00, ne01, ne02, ne03, ne10, ne11, ne12,

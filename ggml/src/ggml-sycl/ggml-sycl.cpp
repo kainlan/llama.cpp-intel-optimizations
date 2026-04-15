@@ -20783,7 +20783,15 @@ static bool ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
                     ggml_sycl_cache_id         cache_key   = {};
                     bool                       pinned      = false;
                     bool                       keep_pinned = false;
-                    if (!g_ggml_sycl_graph_recording && ggml_backend_sycl_weights_evictable() &&
+                    // Skip per-op pin/unpin when the placement planner is authoritative
+                    // and the eviction guard is active.  The planner guarantees weight
+                    // placement and the guard prevents eviction during graph execution.
+                    // Without this, every MUL_MAT creates a pin + unpin_on_event +
+                    // empty kernel submission — 289 extra L0 events per PP graph.
+                    const bool skip_pin = ggml_sycl_planner_authoritative_residency_active(ctx.device) &&
+                                          ggml_sycl::unified_cache_is_graph_compute_active();
+                    if (!skip_pin &&
+                        !g_ggml_sycl_graph_recording && ggml_backend_sycl_weights_evictable() &&
                         ggml_sycl_tensor_is_weight(src0) && ggml_sycl::unified_cache_enabled()) {
                         cache = ggml_sycl::get_unified_cache(*stream);
                         if (cache) {
