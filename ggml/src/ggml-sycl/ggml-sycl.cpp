@@ -3428,7 +3428,7 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
                     auto & dev_d = ggml_sycl_get_gpu_device(gpu_d);
                     // Create IOQ with device 0's context for cross-device event compat.
                     g_secondary_queues[gpu_d] =
-                        new sycl::queue(shared_ctx, dev_d, sycl::property_list{ sycl::property::queue::in_order{} });
+                        new sycl::queue(shared_ctx, dev_d, default_queue_properties());
                     ggml_sycl::unified_cache_register_for_queue(gpu_d, *g_secondary_queues[gpu_d]);
                     n_early_ok++;
                     GGML_LOG_INFO("[MOE-MULTI-GPU] Device %d registered: %s (dpct_id=%d)\n", gpu_d,
@@ -8161,7 +8161,7 @@ static sycl::queue * get_pipeline_copy_queue(int device) {
     // depends_on() works on Level Zero (events require matching ze_context).
     g_pipeline_copy_queue[device] =
         new sycl::queue(dev0.default_queue().get_context(), dev.default_queue().get_device(),
-                        sycl::property_list{ sycl::property::queue::in_order{} });
+                        default_queue_properties());
     static std::atomic<int> log_count{ 0 };
     if (log_count.fetch_add(1, std::memory_order_relaxed) < 2) {
         GGML_LOG_INFO("[PIPELINE-MOE] Created dedicated copy queue for device %d\n", device);
@@ -13148,7 +13148,7 @@ static bool ggml_sycl_readback_via_shared_kernel(sycl::queue &               q,
     sycl::queue exec_q            = q;
     bool        using_fresh_queue = false;
     try {
-        exec_q = sycl::queue(q.get_context(), q.get_device(), sycl::property_list{ sycl::property::queue::in_order() });
+        exec_q = sycl::queue(q.get_context(), q.get_device(), default_queue_properties());
         using_fresh_queue = true;
     } catch (const sycl::exception & e) {
         if (s_shared_fallback_trace) {
@@ -13568,6 +13568,8 @@ static void ggml_backend_sycl_buffer_reset(ggml_backend_buffer_t buffer) {
     //
     // Weight buffers (usage == WEIGHTS) are never reset by the allocator.
     if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        GGML_ASSERT(ggml_backend_buffer_has_stable_base(buffer) &&
+                    "COMPUTE buffer_reset skip requires STABLE_BASE: tensor->data pointers must be stable");
         GGML_SYCL_DEBUG("[SOA-DEBUG] buffer_reset: PRESERVING %zu extras for compute buffer=%p\n",
                         ((ggml_backend_sycl_buffer_context *) buffer->context)->tensor_extras.size(),
                         (void *) buffer);
@@ -13593,6 +13595,15 @@ static void ggml_backend_sycl_buffer_reset(ggml_backend_buffer_t buffer) {
     }
 }
 
+static uint32_t ggml_backend_sycl_buffer_get_caps(ggml_backend_buffer_t buffer) {
+    GGML_UNUSED(buffer);
+    // Arena-backed SYCL buffers always have a stable base address: the arena
+    // base pointer is set once at allocation time and never remapped.
+    // This allows the ggml allocator to embed absolute device pointers into
+    // tensor->data and lets buffer_reset skip extra re-population.
+    return GGML_BACKEND_BUFFER_CAP_STABLE_BASE;
+}
+
 static const ggml_backend_buffer_i ggml_backend_sycl_buffer_interface = {
 
     /* .free_buffer     = */ ggml_backend_sycl_buffer_free_buffer,
@@ -13606,6 +13617,7 @@ static const ggml_backend_buffer_i ggml_backend_sycl_buffer_interface = {
     /* .clear           = */ ggml_backend_sycl_buffer_clear,
 
     /* .reset           = */ ggml_backend_sycl_buffer_reset,
+    /* .get_caps        = */ ggml_backend_sycl_buffer_get_caps,
 
 };
 
@@ -20788,10 +20800,10 @@ static bool ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
                     // placement and the guard prevents eviction during graph execution.
                     // Without this, every MUL_MAT creates a pin + unpin_on_event +
                     // empty kernel submission — 289 extra L0 events per PP graph.
-                    const bool skip_pin = ggml_sycl_planner_authoritative_residency_active(ctx.device) &&
-                                          ggml_sycl::unified_cache_is_graph_compute_active();
+                    // Also skip during graph recording (pin ops are not graph-safe).
+                    const bool skip_pin = ggml_sycl_should_skip_pin_unpin(ctx.device);
                     if (!skip_pin &&
-                        !g_ggml_sycl_graph_recording && ggml_backend_sycl_weights_evictable() &&
+                        ggml_backend_sycl_weights_evictable() &&
                         ggml_sycl_tensor_is_weight(src0) && ggml_sycl::unified_cache_enabled()) {
                         cache = ggml_sycl::get_unified_cache(*stream);
                         if (cache) {
@@ -21290,7 +21302,7 @@ static void tp_device1_worker_thread_func() {
     sycl::device         dev          = ggml_sycl_get_device(device);
     static sycl::queue * worker_queue = nullptr;
     if (!worker_queue) {
-        worker_queue = new sycl::queue(dev, sycl::property_list{ sycl::property::queue::in_order() });
+        worker_queue = new sycl::queue(dev, default_queue_properties());
     }
     queue_ptr stream = worker_queue;
 
@@ -50472,9 +50484,22 @@ static bool ggml_sycl_op_is_host_gate_activation_chain(const ggml_tensor * op, i
 }
 
 static bool ggml_sycl_tensor_depends_on_planned_host_weight(const ggml_tensor * tensor, int device, int depth = 0) {
+    // Memoize visited tensors to avoid redundant graph traversals.
+    // Cleared at the top-level call (depth == 0) so each per-op query gets a
+    // fresh set without allocating/freeing across the per-graph call sequence.
+    thread_local std::unordered_set<const ggml_tensor *> visited;
+    if (depth == 0) {
+        visited.clear();
+    }
+
     if (!tensor || device < 0 || depth > 8) {
         return false;
     }
+
+    if (visited.count(tensor)) {
+        return false;
+    }
+    visited.insert(tensor);
 
     if ((tensor->op == GGML_OP_MUL_MAT || tensor->op == GGML_OP_MUL_MAT_ID) && tensor->src[0] != nullptr &&
         ggml_sycl_weight_executes_on_host(tensor->src[0], device)) {

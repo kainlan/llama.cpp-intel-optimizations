@@ -537,9 +537,8 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
     };
 
     // Skip per-op pin/unpin when the planner is authoritative and the eviction
-    // guard is active.  Weight placement is guaranteed, eviction is blocked.
-    const bool skip_pin = ggml_sycl_planner_authoritative_residency_active(device) &&
-                          ggml_sycl::unified_cache_is_graph_compute_active();
+    // guard is active, or during graph recording (pin ops are not graph-safe).
+    const bool skip_pin = ggml_sycl_should_skip_pin_unpin(device);
     if (!skip_pin) {
         maybe_pin_cached(src0);
         maybe_pin_cached(src1);

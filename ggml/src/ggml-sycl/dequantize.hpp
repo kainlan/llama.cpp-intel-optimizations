@@ -369,8 +369,8 @@ template<typename dst_t>
 static void dequantize_block_q4_0_soa_rowmajor(const void * __restrict__ vx, dst_t * __restrict__ yy,
                                                 const int blocks_per_row, const int nrows,
                                                 const sycl::nd_item<3> & item) {
-    const int global_id  = item.get_global_id(2);
-    const int total_blocks = nrows * blocks_per_row;
+    const int     global_id    = item.get_global_id(2);
+    const int64_t total_blocks = (int64_t) nrows * blocks_per_row;
 
     if (global_id >= total_blocks) {
         return;
@@ -383,7 +383,7 @@ static void dequantize_block_q4_0_soa_rowmajor(const void * __restrict__ vx, dst
     const auto * qs = (const uint8_t *) vx + (int64_t) global_id * (QK4_0 / 2);
 
     // SOA: scales after ALL qs bytes
-    const int64_t total_qs_bytes = (int64_t) total_blocks * (QK4_0 / 2);
+    const int64_t total_qs_bytes = total_blocks * (QK4_0 / 2);
     const auto *  s_ptr = (const sycl::half *) ((const uint8_t *) vx + total_qs_bytes) + global_id;
     const float   d     = float(*s_ptr);
 

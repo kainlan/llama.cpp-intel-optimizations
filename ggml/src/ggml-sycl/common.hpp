@@ -2292,9 +2292,10 @@ inline void * ggml_sycl_get_data_ptr(const ggml_tensor * tensor, int device) {
     if (tensor->data != nullptr && !((tensor->flags & GGML_TENSOR_FLAG_INPUT) && g_ggml_sycl_graph_recording)) {
         const auto * info = ggml_sycl::alloc_registry::instance().lookup(tensor->data);
         if (info && (info->type == ggml_sycl::alloc_type::DEVICE || info->type == ggml_sycl::alloc_type::HOST_PINNED)) {
-            // Populate handle for future fast path in resolve_tensor_ptr
+            // Populate handle for future fast path in resolve_tensor_ptr.
+            // extra is a void* member; cast directly without stripping const from tensor.
             if (tensor->extra != nullptr) {
-                auto * extra = static_cast<ggml_tensor_extra_gpu *>(const_cast<ggml_tensor *>(tensor)->extra);
+                auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
                 if (!extra->data_handle[device].valid()) {
                     bool on_device = (info->type == ggml_sycl::alloc_type::DEVICE);
                     extra->set_data_device(device, tensor->data, GGML_LAYOUT_AOS, on_device);
@@ -3812,5 +3813,23 @@ static __dpct_inline__ float ggml_sycl_e8m0_to_fp32(uint8_t x) {
 void ggml_sycl_watchdog_start();
 void ggml_sycl_watchdog_stop();
 void ggml_sycl_watchdog_heartbeat();
+
+// Standard property list for all directly-created GPU in-order queues.
+// Includes enable_profiling to activate counter-based events on L0 (~15% TG speedup).
+// Use this for every `new sycl::queue(...)` call that targets a GPU device.
+inline sycl::property_list default_queue_properties() {
+    return sycl::property_list{ sycl::property::queue::in_order{},
+                                sycl::property::queue::enable_profiling{} };
+}
+
+// Combined pin/unpin skip guard: returns true when per-op pin/unpin should be
+// skipped because the placement planner is authoritative AND the eviction guard
+// is active (SYCL graph compute in progress).  Combining both conditions into
+// one helper ensures ggml-sycl.cpp and binbcast.cpp stay in sync.
+inline bool ggml_sycl_should_skip_pin_unpin(int device) {
+    return g_ggml_sycl_graph_recording ||
+           (ggml_sycl_planner_authoritative_residency_active(device) &&
+            ggml_sycl::unified_cache_is_graph_compute_active());
+}
 
 #endif  // GGML_SYCL_COMMON_HPP

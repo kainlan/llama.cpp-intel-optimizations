@@ -90,7 +90,11 @@ public:
     resolved_ptr resolve() const;
 
     // True if this handle has ever been successfully resolved.
-    bool valid() const { return cached_.ptr != nullptr || kind_ == mem_handle_kind::DIRECT; }
+    // A handle is valid iff it has a resolved pointer; the kind check was previously
+    // included to allow DIRECT handles with nullptr but DIRECT handles must always
+    // have an explicit non-null pointer, so the kind check was incorrect for
+    // default-constructed handles (kind_==DIRECT, ptr==nullptr → falsely valid).
+    bool valid() const { return cached_.ptr != nullptr; }
 
     // Access the cache key (only meaningful for WEIGHT handles).
     const unified_cache_key & key() const { return key_; }
