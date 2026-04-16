@@ -164,11 +164,8 @@ static std::atomic<int> g_sycl_barrier_count_during_recording{ 0 };  // DIAG: ba
 std::atomic<int>        g_sycl_submit_count_during_recording{ 0 };   // DIAG: operation dispatches during recording
 std::atomic<int>        g_sycl_extra_submit_count_during_recording{ 0 };  // DIAG: extra markers/events during recording
 
-// Graph replay diagnostic: capture what pointer GET_ROWS resolved for src1 during recording
-void *       g_graph_diag_recorded_src1_ptr = nullptr;   // pointer baked into L0 command graph
-const void * g_graph_diag_src1_tensor_data  = nullptr;   // tensor->data at recording time
-int          g_graph_diag_src1_device       = -1;
-static int   g_graph_diag_replay_count      = 0;
+// Graph replay diagnostic variables removed — the memcpy().wait() calls they
+// performed on the graph queue between refresh and replay corrupted L0 state.
 
 // Memcpy trace: count and log memcpy calls during graph recording
 static std::atomic<int> g_graph_memcpy_count_during_recording{ 0 };
@@ -1188,12 +1185,6 @@ static bool ggml_sycl_graph_has_host_inputs(const ggml_cgraph * cgraph) {
 
     auto is_host_tensor = [](const ggml_tensor * tensor) -> bool {
         if (!tensor) {
-            return false;
-        }
-        // INPUT tensors in SYCL_Host buffer (malloc_host = USM pinned) are safe for
-        // graph replay: set_tensor writes fresh data to the same stable malloc_host
-        // address, and L0 graph replay re-reads from USM pointers correctly.
-        if (tensor->flags & GGML_TENSOR_FLAG_INPUT) {
             return false;
         }
         if (!ggml_sycl_tensor_is_weight(tensor) && tensor->buffer && ggml_backend_buffer_is_host(tensor->buffer)) {
@@ -8405,17 +8396,11 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
     const bool is_input_tensor = (tensor->flags & GGML_TENSOR_FLAG_INPUT) != 0;
     const bool tp_enabled      = g_sycl_tp_config.enabled && g_sycl_tp_config.world_size > 1;
 
-    // Graph replay INPUT staging: if this INPUT tensor has a stable device staging buffer,
-    // return it instead of tensor->data. This ensures the graph kernel captures the stable
-    // device pointer that persists across iterations (tensor->data may move).
-    if (is_input_tensor && tensor->name && tensor->name[0] != '\0') {
-        std::lock_guard<std::mutex> lock(g_graph_input_staged_mutex);
-        auto it = g_graph_input_staged_ptrs.find(tensor->name);
-        if (it != g_graph_input_staged_ptrs.end() && it->second != nullptr) {
-            g_data_ptr_cache[tensor] = ggml_sycl::mem_handle::from_direct(it->second, GGML_LAYOUT_AOS, true);
-            return it->second;
-        }
-    }
+    // Graph replay INPUT staging DISABLED: INPUT tensors use stable malloc_host
+    // addresses.  set_tensor writes new data to the same address, so L0 graph
+    // replay sees updated data without needing a separate device staging buffer.
+    // The redirect here caused a queue mismatch (staging refresh on default_queue
+    // vs graph replay on sycl_ctx->stream()) that produced stale input data.
 
     if (tensor->name[0] != '\0' && g_tiered_enabled.load(std::memory_order_relaxed)) {
         sycl::usm::alloc alloc      = sycl::usm::alloc::unknown;
@@ -42952,35 +42937,11 @@ static void graph_refresh_input_tensors(ggml_backend_sycl_context * ctx, const g
     // differs from tensor->data, avoiding expensive sycl::get_pointer_type() driver calls
     // (~1.15ms each). For tensors where resolved_ptr == tensor->data, set_tensor_async
     // already copied the data so no additional work is needed.
-    // Fast path: refresh stable device staging for INPUT tensors.
-    if (!ctx->graph_input_staging.empty()) {
-        sycl::queue &                       q = ggml_sycl_get_device(ctx->device).default_queue();
-        int                                 copy_count = 0;
-        std::unordered_set<std::string>     refreshed;
-        auto refresh_tensor = [&](ggml_tensor * tensor) {
-            if (!tensor || !tensor->data || !tensor->name || !(tensor->flags & GGML_TENSOR_FLAG_INPUT)) return;
-            if (refreshed.count(tensor->name)) return;
-            auto it = ctx->graph_input_staging.find(tensor->name);
-            if (it != ctx->graph_input_staging.end() && it->second.device_ptr) {
-                q.memcpy(it->second.device_ptr, tensor->data, std::min(ggml_nbytes(tensor), it->second.capacity));
-                refreshed.insert(tensor->name);
-                copy_count++;
-            }
-        };
-        for (int i = 0; i < cgraph->n_leafs; ++i) refresh_tensor(cgraph->leafs[i]);
-        for (int i = 0; i < cgraph->n_nodes; ++i) {
-            if (!cgraph->nodes[i]) continue;
-            for (int s = 0; s < GGML_MAX_SRC; ++s) refresh_tensor(cgraph->nodes[i]->src[s]);
-        }
-        // Ensure all H2D copies complete before graph replay
-        q.wait();
-        if (copy_count > 0 || g_graph_diag_replay_count < 3) {
-            fprintf(stderr, "[GRAPH-REFRESH] refreshed %d INPUT tensors via stable staging "
-                    "(staging_map=%zu, leafs=%d, nodes=%d)\n",
-                    copy_count, ctx->graph_input_staging.size(), cgraph->n_leafs, cgraph->n_nodes);
-        }
-        return;
-    }
+    // INPUT tensor staging refresh DISABLED: INPUT tensors use stable malloc_host
+    // addresses that L0 graph replay reads directly.  The staging fast path that
+    // copied to device buffers and returned early was removed because its refresh
+    // used default_queue() while graph replay ran on sycl_ctx->stream(), causing
+    // a data race that produced stale input tokens.
 
     // Legacy path: use pre-cached input tensor list.
     if (ctx->input_tensors_cached && !ctx->cached_input_tensors.empty()) {
@@ -49481,43 +49442,6 @@ normal_dispatch:
 
             graph_refresh_input_tensors(sycl_ctx, cgraph);
 
-            // Graph replay diagnostic: verify data at recorded pointer before replay
-            if (g_graph_diag_recorded_src1_ptr && g_graph_diag_replay_count < 5) {
-                sycl::queue & gq = *(sycl_ctx->stream());
-
-                // Read 1: what the graph queue sees (no extra sync)
-                int32_t graph_queue_token = -1;
-                gq.memcpy(&graph_queue_token, g_graph_diag_recorded_src1_ptr, sizeof(int32_t)).wait();
-
-                // Find current inp_tokens tensor to compare
-                const ggml_tensor * inp_tok = nullptr;
-                for (int i = 0; i < cgraph->n_nodes && !inp_tok; i++) {
-                    for (int s = 0; s < GGML_MAX_SRC; s++) {
-                        const ggml_tensor * src = cgraph->nodes[i] ? cgraph->nodes[i]->src[s] : nullptr;
-                        if (src && (src->flags & GGML_TENSOR_FLAG_INPUT) && src->type == GGML_TYPE_I32) {
-                            inp_tok = src;
-                            break;
-                        }
-                    }
-                }
-
-                int32_t current_tensor_token = -1;
-                bool    ptr_changed          = false;
-                if (inp_tok) {
-                    ptr_changed = (inp_tok->data != g_graph_diag_src1_tensor_data);
-                    // Read from current tensor->data
-                    gq.memcpy(&current_tensor_token, inp_tok->data, sizeof(int32_t)).wait();
-                }
-
-                fprintf(stderr,
-                        "[GRAPH-SPY] REPLAY #%d: recorded_ptr=%p token_at_recorded=%d | "
-                        "tensor->data=%p token_at_tensor=%d | ptr_moved=%d same_data=%d\n",
-                        g_graph_diag_replay_count, g_graph_diag_recorded_src1_ptr, graph_queue_token,
-                        inp_tok ? inp_tok->data : nullptr, current_tensor_token, ptr_changed ? 1 : 0,
-                        graph_queue_token == current_tensor_token ? 1 : 0);
-                g_graph_diag_replay_count++;
-            }
-
             graph_executed = true;
             sycl_ctx->stream()->ext_oneapi_graph(*(sycl_ctx->exec_graph));
 
@@ -49579,7 +49503,6 @@ normal_dispatch:
                 g_ggml_sycl_graph_recording = true;  // Mark recording state
                 g_recording_graph_ptr       = &model_sycl_graph;
                 g_recording_queue_ptr       = sycl_ctx->stream();
-                g_graph_diag_recorded_src1_ptr = nullptr;  // Reset so first GET_ROWS is captured
                 g_graph_memcpy_count_during_recording.store(0, std::memory_order_relaxed);
                 model_sycl_graph.begin_recording(*(sycl_ctx->stream()));
                 GGML_SYCL_DEBUG("[SYCL-GRAPH-DEBUG] calling compute_impl...\n");
@@ -49621,20 +49544,6 @@ normal_dispatch:
 
                 graph_executed = true;
                 sycl_ctx->stream()->ext_oneapi_graph(*(sycl_ctx->exec_graph));
-
-                // Graph replay diagnostic: log recording-time state
-                if (g_graph_diag_recorded_src1_ptr) {
-                    sycl_ctx->stream()->wait();
-                    int32_t recorded_token = -1;
-                    sycl_ctx->stream()
-                        ->memcpy(&recorded_token, g_graph_diag_recorded_src1_ptr, sizeof(int32_t))
-                        .wait();
-                    fprintf(stderr,
-                            "[GRAPH-SPY] RECORDED: src1_ptr=%p token=%d name=%s (this is the baseline)\n",
-                            g_graph_diag_recorded_src1_ptr, recorded_token,
-                            g_graph_diag_src1_tensor_data ? "leaf_2" : "?");
-                    g_graph_diag_replay_count = 0;
-                }
 
                 GGML_SYCL_DEBUG("[SYCL-GRAPH] execute done\n");
             } catch (const sycl::exception & exc) {

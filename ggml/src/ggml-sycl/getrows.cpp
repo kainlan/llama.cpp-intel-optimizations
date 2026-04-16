@@ -1779,23 +1779,6 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tens
     src1_i32 = (const int32_t *) ggml_sycl_get_data_ptr(dst->src[1], device);
     dst_d    = (float *) ggml_sycl_get_data_ptr(dst, device);
 
-    // Graph replay diagnostic: record what pointer was captured during recording
-    // Only capture the FIRST GET_ROWS (leaf_2 = token IDs), not subsequent ones
-    if (g_ggml_sycl_graph_recording) {
-        extern void *       g_graph_diag_recorded_src1_ptr;
-        extern const void * g_graph_diag_src1_tensor_data;
-        extern int          g_graph_diag_src1_device;
-        if (g_graph_diag_recorded_src1_ptr == nullptr) {
-            g_graph_diag_recorded_src1_ptr = (void *) src1_i32;
-            g_graph_diag_src1_tensor_data  = dst->src[1]->data;
-            g_graph_diag_src1_device       = device;
-        }
-        fprintf(stderr, "[GRAPH-SPY] RECORDING GET_ROWS: src1_ptr=%p tensor->data=%p same=%d name=%s\n",
-                (void *) src1_i32, dst->src[1]->data,
-                (void *) src1_i32 == dst->src[1]->data,
-                dst->src[1]->name ? dst->src[1]->name : "?");
-    }
-
     if (ggml_sycl_get_rows_trace_enabled()) {
         size_t free_mem  = 0;
         size_t total_mem = 0;

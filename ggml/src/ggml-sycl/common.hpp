@@ -2288,8 +2288,8 @@ inline void * ggml_sycl_get_data_ptr(const ggml_tensor * tensor, int device) {
     // (compute buffers in the VRAM arena), return it directly.  The ggml allocator
     // sets tensor->data to a device pointer via ggml_backend_tensor_alloc_offset()
     // which calls get_base() + offset.  Arena-backed buffers always have stable bases.
-    // Skip for INPUT tensors during graph recording (staging redirect needed).
-    if (tensor->data != nullptr && !((tensor->flags & GGML_TENSOR_FLAG_INPUT) && g_ggml_sycl_graph_recording)) {
+    // INPUT tensors use stable malloc_host addresses — no staging redirect needed.
+    if (tensor->data != nullptr) {
         const auto * info = ggml_sycl::alloc_registry::instance().lookup(tensor->data);
         if (info && (info->type == ggml_sycl::alloc_type::DEVICE || info->type == ggml_sycl::alloc_type::HOST_PINNED)) {
             // Populate handle for future fast path in resolve_tensor_ptr.
