@@ -35560,7 +35560,7 @@ cpu_fallback_fast:
         g_moe_profile.moe_dispatch_path(0, 0, 0, 1);
     }
     if (!early_cpu_expert_tg) {
-        GGML_LOG_INFO("[MoE] Falling back to host-side routing for type %d\n", src0->type);
+        GGML_SYCL_DEBUG("[MoE] Falling back to host-side routing for type %d\n", src0->type);
     }
     // Host-side routing requires synchronization which is incompatible with graph recording.
 
