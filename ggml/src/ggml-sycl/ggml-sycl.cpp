@@ -35391,57 +35391,6 @@ cpu_fallback_fast:
         }
     }
 
-    // ---------------------------------------------------------------
-    // Early computation of cpu_expert_tg for hybrid dispatch.
-    // Must be computed BEFORE GPU dispatch paths (XMX sorted, ESIMD, MMVQ)
-    // which would otherwise intercept the op and return early.
-    // ---------------------------------------------------------------
-    bool host_resident_moe_weights = ggml_sycl_is_host_resident_weight(src0, ctx.stream());
-    if (!host_resident_moe_weights && src0->extra) {
-        auto resolved = ggml_sycl_resolve(src0, ctx.device);
-        if (resolved && !resolved.on_device) {
-            host_resident_moe_weights = true;
-        }
-    }
-    bool early_cpu_expert_tg = false;
-    if (ne12 == 1) {
-        // Check if weights are host-resident using the comprehensive check
-        bool hw = host_resident_moe_weights;
-        if (hw) {
-            // Check env var
-            static std::atomic<int> cpu_expert_tg_early{ -1 };
-            int                     etv = cpu_expert_tg_early.load(std::memory_order_acquire);
-            if (etv < 0) {
-                const char * env = getenv("GGML_SYCL_CPU_EXPERT_TG");
-                int          nv  = env ? std::atoi(env) : -2;  // -2 = auto
-                cpu_expert_tg_early.compare_exchange_strong(etv, nv, std::memory_order_release,
-                                                            std::memory_order_acquire);
-                etv = cpu_expert_tg_early.load(std::memory_order_acquire);
-            }
-            // Check MOE_HYBRID env
-            static std::atomic<int> moe_hybrid_early{ -1 };
-            int                     mhv = moe_hybrid_early.load(std::memory_order_acquire);
-            if (mhv < 0) {
-                const char * env = getenv("GGML_SYCL_MOE_HYBRID");
-                int          nv  = env ? atoi(env) : 1;
-                moe_hybrid_early.compare_exchange_strong(mhv, nv, std::memory_order_release, std::memory_order_acquire);
-                mhv = moe_hybrid_early.load(std::memory_order_acquire);
-            }
-            const auto * ct     = ggml_get_type_traits_cpu(src0->type);
-            bool         ct_ok  = ct && ct->vec_dot;
-            // ne11==1 guard: when ne11>1, each expert slot has a distinct activation
-            // row and the CPU TG path cannot handle it (it assumes shared activation).
-            early_cpu_expert_tg = (mhv != 0) && ct_ok && (etv == 1 || etv == -2) && (ne11 == 1);
-            if (early_cpu_expert_tg) {
-                static std::atomic<int> log_count{ 0 };
-                if (log_count.fetch_add(1, std::memory_order_relaxed) < 3) {
-                    GGML_LOG_INFO("[CPU-TG] Hybrid dispatch active for %s (host-resident MoE weights)\n",
-                                  src0->name ? src0->name : "?");
-                }
-            }
-        }
-    }
-
     // Priority order (kernel-first selection):
     // XMX sorted -> fused ESIMD -> MMVQ (coalesced/SoA/AoS) -> host routing.
     // When multi-GPU MoE is active, some experts in the GPU0 pointer table may be
@@ -35449,10 +35398,9 @@ cpu_fallback_fast:
     // The MMVQ compact list builder detects nullptr entries and returns false,
     // which triggers fallback to hybrid dispatch (GPU0 MMVQ + CPU for misses).
     //
-    // When early_cpu_expert_tg is true, skip GPU dispatch paths entirely and
-    // fall through to the host routing section for hybrid CPU/GPU dispatch.
-    const bool skip_gpu_moe_fast_paths = host_resident_moe_weights && ne12 > 1;
-    if (!early_cpu_expert_tg && !skip_gpu_moe_fast_paths) {
+    // GPU paths are attempted unconditionally; per-expert try_* calls return false
+    // when experts are not on device and the code falls through to host routing.
+    {
         if (xmx_layout_allowed() && try_xmx_sorted_moe(ctx, src0, src1, ids, dst)) {
             GGML_SYCL_DEBUG("[MoE] XMX sorted dispatch successful for type %d\n", src0->type);
             if (g_moe_pp_profile_enabled) {
@@ -35551,17 +35499,11 @@ cpu_fallback_fast:
             return;
         }
         GGML_SYCL_DEBUG("[MoE] All MMVQ layouts failed, falling back to host routing\n");
-    }  // end if (!early_cpu_expert_tg && !skip_gpu_moe_fast_paths)
-    if (skip_gpu_moe_fast_paths) {
-        GGML_SYCL_DEBUG("[MoE] Skipping GPU MMVQ/XMX fast paths for host-resident batched experts: %s\n",
-                        src0->name ? src0->name : "?");
-    }
+    }  // end GPU fast-paths block
     if (g_moe_pp_profile_enabled) {
         g_moe_profile.moe_dispatch_path(0, 0, 0, 1);
     }
-    if (!early_cpu_expert_tg) {
-        GGML_SYCL_DEBUG("[MoE] Falling back to host-side routing for type %d\n", src0->type);
-    }
+    GGML_SYCL_DEBUG("[MoE] Falling back to host-side routing for type %d\n", src0->type);
     // Host-side routing requires synchronization which is incompatible with graph recording.
 
     // If we reach here during graph recording, throw so the outer handler can
