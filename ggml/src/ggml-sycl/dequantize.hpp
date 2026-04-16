@@ -333,30 +333,56 @@ static void dequantize_block_q4_0_coalesced_rowmajor(const void * __restrict__ v
     const int64_t total_quants_bytes = (int64_t) nrows * row_quants_bytes;
     const int64_t tile_qs_base       = (int64_t) row * row_quants_bytes + (int64_t) tile * QS_BYTES_PER_TILE;
 
-    uint8_t qs_buf[BYTES_PER_BLOCK];
+    // Vectorized qs load: 4 × uint32_t reads (4 bytes each = 16 bytes total per block)
+    uint32_t qs_words[WORDS_PER_BLOCK];
 #pragma unroll
     for (int w = 0; w < WORDS_PER_BLOCK; w++) {
         const int64_t src_offset = tile_qs_base + w * WORD_PLANE_STRIDE + block_in_tile * 4;
-        const uint8_t * src = (const uint8_t *) vx + src_offset;
-#pragma unroll
-        for (int b = 0; b < 4; b++) {
-            qs_buf[w * 4 + b] = src[b];
-        }
+        qs_words[w] = *reinterpret_cast<const uint32_t *>((const uint8_t *) vx + src_offset);
     }
 
     // --- Scale: contiguous after ALL quants, in global block order ---
     const int64_t global_block = (int64_t) row * blocks_per_row + block_idx;
     const auto *  s_ptr        = (const sycl::half *) ((const uint8_t *) vx + total_quants_bytes) + global_block;
-    const float   d            = float(*s_ptr);
+    const sycl::half d_h       = *s_ptr;
+    const float      d         = float(d_h);
+    const float      dm        = d * -8.0f;  // bias: d * (nibble - 8) = d*nibble + dm
 
-    // --- Output: row-major FP16 ---
+    // --- Output: row-major FP16 via half8 stores ---
     dst_t * y_ptr = yy + (int64_t) row * blocks_per_row * QK4_0 + block_idx * QK4_0;
 
+    // Each uint32_t holds 4 nibble-pairs: low nibbles → y[0..15], high nibbles → y[16..31]
+    // Use FMA: d * nibble + dm  to avoid integer subtraction (compiler can fuse with float ops)
 #pragma unroll
-    for (int l = 0; l < QK4_0 / 2; ++l) {
-        int vq      = qs_buf[l];
-        y_ptr[l + 0]  = d * ((vq & 0xF) - 8);
-        y_ptr[l + 16] = d * ((vq >> 4) - 8);
+    for (int w = 0; w < 2; w++) {
+        const uint32_t wa = qs_words[w * 2 + 0];
+        const uint32_t wb = qs_words[w * 2 + 1];
+        // Low nibbles from wa/wb → y[w*8 .. w*8+7]
+        sycl::vec<float, 8> lo_f(
+            sycl::fma(d, float( wa        & 0xF), dm),
+            sycl::fma(d, float((wa >>  8) & 0xF), dm),
+            sycl::fma(d, float((wa >> 16) & 0xF), dm),
+            sycl::fma(d, float((wa >> 24) & 0xF), dm),
+            sycl::fma(d, float( wb        & 0xF), dm),
+            sycl::fma(d, float((wb >>  8) & 0xF), dm),
+            sycl::fma(d, float((wb >> 16) & 0xF), dm),
+            sycl::fma(d, float((wb >> 24) & 0xF), dm)
+        );
+        // High nibbles from wa/wb → y[16+w*8 .. 16+w*8+7]
+        sycl::vec<float, 8> hi_f(
+            sycl::fma(d, float((wa >>  4) & 0xF), dm),
+            sycl::fma(d, float((wa >> 12) & 0xF), dm),
+            sycl::fma(d, float((wa >> 20) & 0xF), dm),
+            sycl::fma(d, float((wa >> 28) & 0xF), dm),
+            sycl::fma(d, float((wb >>  4) & 0xF), dm),
+            sycl::fma(d, float((wb >> 12) & 0xF), dm),
+            sycl::fma(d, float((wb >> 20) & 0xF), dm),
+            sycl::fma(d, float((wb >> 28) & 0xF), dm)
+        );
+        auto lo_h = lo_f.convert<sycl::half, sycl::rounding_mode::automatic>();
+        auto hi_h = hi_f.convert<sycl::half, sycl::rounding_mode::automatic>();
+        *reinterpret_cast<sycl::vec<sycl::half, 8> *>(y_ptr + w * 8)      = lo_h;
+        *reinterpret_cast<sycl::vec<sycl::half, 8> *>(y_ptr + 16 + w * 8) = hi_h;
     }
 }
 
@@ -386,15 +412,41 @@ static void dequantize_block_q4_0_soa_rowmajor(const void * __restrict__ vx, dst
     const int64_t total_qs_bytes = total_blocks * (QK4_0 / 2);
     const auto *  s_ptr = (const sycl::half *) ((const uint8_t *) vx + total_qs_bytes) + global_id;
     const float   d     = float(*s_ptr);
+    const float   dm    = d * -8.0f;  // bias: d * (nibble - 8) = d*nibble + dm
 
     // Output: row-major
     dst_t * y_ptr = yy + (int64_t) row * blocks_per_row * QK4_0 + block_idx * QK4_0;
 
-    #pragma unroll
-    for (int l = 0; l < QK4_0 / 2; ++l) {
-        int vq      = qs[l];
-        y_ptr[l + 0]  = d * ((vq & 0xF) - 8);
-        y_ptr[l + 16] = d * ((vq >> 4) - 8);
+    // Vectorized: 4 × uint32_t loads + 4 × half8 stores (2 lo + 2 hi, 8 halves each)
+    const uint32_t * qs32 = reinterpret_cast<const uint32_t *>(qs);
+#pragma unroll
+    for (int w = 0; w < 2; w++) {
+        const uint32_t wa = qs32[w * 2 + 0];
+        const uint32_t wb = qs32[w * 2 + 1];
+        sycl::vec<float, 8> lo_f(
+            sycl::fma(d, float( wa        & 0xF), dm),
+            sycl::fma(d, float((wa >>  8) & 0xF), dm),
+            sycl::fma(d, float((wa >> 16) & 0xF), dm),
+            sycl::fma(d, float((wa >> 24) & 0xF), dm),
+            sycl::fma(d, float( wb        & 0xF), dm),
+            sycl::fma(d, float((wb >>  8) & 0xF), dm),
+            sycl::fma(d, float((wb >> 16) & 0xF), dm),
+            sycl::fma(d, float((wb >> 24) & 0xF), dm)
+        );
+        sycl::vec<float, 8> hi_f(
+            sycl::fma(d, float((wa >>  4) & 0xF), dm),
+            sycl::fma(d, float((wa >> 12) & 0xF), dm),
+            sycl::fma(d, float((wa >> 20) & 0xF), dm),
+            sycl::fma(d, float((wa >> 28) & 0xF), dm),
+            sycl::fma(d, float((wb >>  4) & 0xF), dm),
+            sycl::fma(d, float((wb >> 12) & 0xF), dm),
+            sycl::fma(d, float((wb >> 20) & 0xF), dm),
+            sycl::fma(d, float((wb >> 28) & 0xF), dm)
+        );
+        auto lo_h = lo_f.convert<sycl::half, sycl::rounding_mode::automatic>();
+        auto hi_h = hi_f.convert<sycl::half, sycl::rounding_mode::automatic>();
+        *reinterpret_cast<sycl::vec<sycl::half, 8> *>(y_ptr + w * 8)      = lo_h;
+        *reinterpret_cast<sycl::vec<sycl::half, 8> *>(y_ptr + 16 + w * 8) = hi_h;
     }
 }
 
