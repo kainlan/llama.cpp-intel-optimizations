@@ -651,13 +651,18 @@ struct pp_pipeline_state {
 };
 
 static bool pp_pipeline_env_enabled() {
+    // Default OFF pending correctness fix: PP pipeline path currently produces
+    // wrong tokens (e.g. the canonical "1, 2, 3, 4, 5," prompt emits "###..."
+    // instead of "6, 7, 8, 9, 10"). Throughput went up but output was garbage.
+    // Opt in with GGML_SYCL_PP_PIPELINE=1 only for PP-throughput experiments.
     static int val = -1;
     if (val < 0) {
         const char * env = std::getenv("GGML_SYCL_PP_PIPELINE");
-        val              = (env == nullptr || std::atoi(env) != 0) ? 1 : 0;
+        val              = (env && std::atoi(env) != 0) ? 1 : 0;
         if (val) {
-            GGML_LOG_INFO("[SYCL] PP pipeline: double-buffered dequant prefetch ENABLED%s\n",
-                          env == nullptr ? " (default)" : "");
+            GGML_LOG_WARN(
+                "[SYCL] PP pipeline: double-buffered dequant prefetch ENABLED "
+                "(opt-in, KNOWN CORRECTNESS BUG — see llama.cpp beads tracker)\n");
         }
     }
     return val != 0;

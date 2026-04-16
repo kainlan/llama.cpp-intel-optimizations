@@ -203,7 +203,7 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench ...
 
 | Metric | tok/s | Notes |
 |--------|-------|-------|
-| PP512 (Level 0, all VRAM) | ~1770 | oneDNN FP16 path for M>=16 with double-buffered PP pipeline prefetch |
+| PP512 (Level 0, all VRAM) | ~1480 | oneDNN FP16 path for M>=16 (PP pipeline disabled pending correctness fix) |
 | TG128 (Level 0, all VRAM) | ~81 | MMVQ fast-path with SOA layout + graph replay + SCRATCH TLSF zone |
 | TG128 (no graph) | ~70 | MMVQ fast-path alone (graph adds ~13%) |
 | PP512 (Level 3, 30% budget) | ~269 | 15/33 GPU layers, rest on CPU |
@@ -222,8 +222,12 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench ...
 | `GGML_SYCL_TG_FAST=0` | ON | Disable MMVQ fast-path bypass (slower TG) |
 | `GGML_SYCL_DISABLE_GRAPH=1` | OFF | Disable SYCL graph replay (minimal TG impact ~3%, mainly helps PP) |
 | `GGML_SYCL_ONEDNN_PP=0` | ON | Disable oneDNN for prompt processing |
-| `GGML_SYCL_PP_PIPELINE=0` | ON | Disable double-buffered FP16 weight dequant prefetch (PP path, ~19% PP impact) |
 | `GGML_SYCL_UNIFIED_FORCE_LEGACY=1` | OFF | Force legacy kernel dispatch (bypass unified kernel) |
+
+**Experimental (opt-in, off by default)**:
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `GGML_SYCL_PP_PIPELINE=1` | OFF | Enable double-buffered FP16 weight dequant prefetch. **CURRENTLY BROKEN** — produces garbage tokens (e.g. `###...` for the `1, 2, 3, 4, 5,` canonical prompt). Tracked in beads; do not enable for correctness-sensitive runs. |
 
 **Kernel dispatch tuning**:
 | Variable | Effect |
