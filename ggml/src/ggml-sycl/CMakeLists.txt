@@ -163,6 +163,16 @@ if (GGML_SYCL_TARGET STREQUAL "INTEL")
         endif()
     endif()
 
+    # Link TBB when available. cpu-dispatch.cpp uses oneapi::tbb::parallel_for
+    # under a __has_include gate, so if the headers are visible at compile time
+    # the library must be visible at link time or BFD fails the shared-object
+    # link with undefined-reference errors on the tbb::detail::r1 runtime.
+    find_package(TBB QUIET)
+    if(TBB_FOUND)
+        target_link_libraries(ggml-sycl PRIVATE TBB::tbb)
+        message(STATUS "Found TBB for ggml-sycl CPU dispatch: ${TBB_DIR}")
+    endif()
+
     # Optional MKL fallback for Intel targets
     if(GGML_SYCL_USE_MKL_FALLBACK)
         find_package(MKL QUIET)
