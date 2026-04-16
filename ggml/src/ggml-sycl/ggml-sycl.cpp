@@ -118,6 +118,147 @@ static sycl::event  ggml_sycl_submit_queue_sync_event(sycl::queue & q);
 #if GGML_SYCL_DNNL
 static dnnl::memory::data_type ggml_sycl_onednn_dtype(ggml_type type);
 #endif
+
+namespace {
+
+struct pp_scratch_op_stats {
+    uint64_t node_visits         = 0;
+    uint64_t pool_alloc_calls    = 0;
+    uint64_t pool_free_calls     = 0;
+    uint64_t pool_alloc_failures = 0;
+    uint64_t pool_alloc_bytes    = 0;
+    uint64_t pool_free_bytes     = 0;
+    uint64_t device_alloc_calls  = 0;
+    uint64_t device_alloc_bytes  = 0;
+};
+
+struct pp_scratch_profile_state {
+    bool                              active             = false;
+    ggml_op                           current_op         = GGML_OP_NONE;
+    const char *                      current_node_name  = nullptr;
+    std::unordered_map<int, pp_scratch_op_stats> by_op;
+    pp_scratch_op_stats               out_of_op;
+};
+
+thread_local pp_scratch_profile_state t_pp_scratch_profile;
+
+static bool pp_scratch_profile_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_ARENA_PP_PROFILE");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static void pp_scratch_profile_begin(bool is_prompt_phase) {
+    t_pp_scratch_profile = {};
+    t_pp_scratch_profile.active = pp_scratch_profile_enabled() && is_prompt_phase;
+}
+
+static void pp_scratch_profile_set_current_op(ggml_op op, const char * node_name) {
+    if (!t_pp_scratch_profile.active) {
+        return;
+    }
+    t_pp_scratch_profile.current_op        = op;
+    t_pp_scratch_profile.current_node_name = node_name;
+    t_pp_scratch_profile.by_op[static_cast<int>(op)].node_visits++;
+}
+
+static void pp_scratch_profile_clear_current_op() {
+    if (!t_pp_scratch_profile.active) {
+        return;
+    }
+    t_pp_scratch_profile.current_op        = GGML_OP_NONE;
+    t_pp_scratch_profile.current_node_name = nullptr;
+}
+
+static pp_scratch_op_stats & pp_scratch_profile_current_bucket() {
+    if (!t_pp_scratch_profile.active || t_pp_scratch_profile.current_op == GGML_OP_NONE) {
+        return t_pp_scratch_profile.out_of_op;
+    }
+    return t_pp_scratch_profile.by_op[static_cast<int>(t_pp_scratch_profile.current_op)];
+}
+
+static void pp_scratch_profile_note_pool_alloc(size_t bytes, bool ok) {
+    if (!t_pp_scratch_profile.active) {
+        return;
+    }
+    auto & bucket = pp_scratch_profile_current_bucket();
+    bucket.pool_alloc_calls++;
+    bucket.pool_alloc_bytes += bytes;
+    if (!ok) {
+        bucket.pool_alloc_failures++;
+    }
+}
+
+static void pp_scratch_profile_note_pool_free(size_t bytes) {
+    if (!t_pp_scratch_profile.active) {
+        return;
+    }
+    auto & bucket = pp_scratch_profile_current_bucket();
+    bucket.pool_free_calls++;
+    bucket.pool_free_bytes += bytes;
+}
+
+static void pp_scratch_profile_note_device_alloc(size_t bytes) {
+    if (!t_pp_scratch_profile.active) {
+        return;
+    }
+    auto & bucket = pp_scratch_profile_current_bucket();
+    bucket.device_alloc_calls++;
+    bucket.device_alloc_bytes += bytes;
+}
+
+static void pp_scratch_profile_end() {
+    pp_scratch_profile_state stats = t_pp_scratch_profile;
+    t_pp_scratch_profile           = {};
+
+    if (!stats.active) {
+        return;
+    }
+
+    std::vector<std::pair<int, pp_scratch_op_stats>> sorted(stats.by_op.begin(), stats.by_op.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto & a, const auto & b) {
+        const uint64_t a_bytes = a.second.pool_alloc_bytes + a.second.device_alloc_bytes;
+        const uint64_t b_bytes = b.second.pool_alloc_bytes + b.second.device_alloc_bytes;
+        if (a_bytes != b_bytes) {
+            return a_bytes > b_bytes;
+        }
+        return a.second.pool_alloc_calls > b.second.pool_alloc_calls;
+    });
+
+    fprintf(stderr, "[ARENA-PP-OPS]");
+    int printed = 0;
+    for (const auto & [op_i, bucket] : sorted) {
+        const uint64_t total_bytes = bucket.pool_alloc_bytes + bucket.device_alloc_bytes;
+        if (total_bytes == 0) {
+            continue;
+        }
+        fprintf(stderr,
+                " %s:visits=%llu pool=%llu/%llu pool_mb=%.1f device=%llu device_mb=%.1f",
+                ggml_op_name(static_cast<ggml_op>(op_i)),
+                (unsigned long long) bucket.node_visits,
+                (unsigned long long) bucket.pool_alloc_calls,
+                (unsigned long long) bucket.pool_free_calls,
+                bucket.pool_alloc_bytes / (1024.0 * 1024.0),
+                (unsigned long long) bucket.device_alloc_calls,
+                bucket.device_alloc_bytes / (1024.0 * 1024.0));
+        if (++printed >= 6) {
+            break;
+        }
+    }
+    if (stats.out_of_op.pool_alloc_calls || stats.out_of_op.device_alloc_calls) {
+        fprintf(stderr,
+                " out_of_op:pool=%llu pool_mb=%.1f device=%llu device_mb=%.1f",
+                (unsigned long long) stats.out_of_op.pool_alloc_calls,
+                stats.out_of_op.pool_alloc_bytes / (1024.0 * 1024.0),
+                (unsigned long long) stats.out_of_op.device_alloc_calls,
+                stats.out_of_op.device_alloc_bytes / (1024.0 * 1024.0));
+    }
+    fprintf(stderr, "\n");
+}
+
+}  // namespace
 #include "ggml-sycl/dispatch.hpp"
 #include "ggml-sycl/ggml-sycl-bench.hpp"
 #include "ggml-sycl/gpu-sampler.hpp"
@@ -450,10 +591,11 @@ static fp16_weight_cache g_fp16_cache;
 // ============================================================================
 // PP Pipeline: Double-buffered PCIe pipelining for oneDNN FP16 weight prefetch
 // ============================================================================
-// When GGML_SYCL_PP_PIPELINE=1, overlaps the dequant (PCIe read + FP16 convert)
+// By default, overlaps the dequant (PCIe read + FP16 convert)
 // of the next weight matrix with the GEMM of the current weight matrix.
 // Two scratch buffers alternate: while GEMM runs on buffer A, dequant for the
 // next MUL_MAT fills buffer B on a separate in-order DMA queue.
+// Set GGML_SYCL_PP_PIPELINE=0 to disable this overlap path.
 //
 // Pre-scan: at graph_compute start, build a schedule of oneDNN-PP-eligible
 // MUL_MAT nodes. During execution, the pipeline uses this schedule for
@@ -512,9 +654,10 @@ static bool pp_pipeline_env_enabled() {
     static int val = -1;
     if (val < 0) {
         const char * env = std::getenv("GGML_SYCL_PP_PIPELINE");
-        val              = (env && std::atoi(env) != 0) ? 1 : 0;
+        val              = (env == nullptr || std::atoi(env) != 0) ? 1 : 0;
         if (val) {
-            GGML_LOG_INFO("[SYCL] PP pipeline: double-buffered PCIe prefetch ENABLED\n");
+            GGML_LOG_INFO("[SYCL] PP pipeline: double-buffered dequant prefetch ENABLED%s\n",
+                          env == nullptr ? " (default)" : "");
         }
     }
     return val != 0;
@@ -2194,7 +2337,8 @@ static void ggml_sycl_configure_host_zones_for_plan(ggml_sycl::unified_cache * c
 
     // Pre-allocate runtime pool to prevent lazy growth during inference.
     // Covers oneDNN reorder scratch + DMA staging; prevents HOST_ALLOC_PHASE_GATE warnings.
-    const size_t runtime_bytes = plan.onednn_scratchpad_bytes + plan.dma_staging_pool_bytes;
+    const size_t runtime_bytes =
+        plan.onednn_scratchpad_bytes + plan.dma_staging_pool_bytes + plan.pp_pipeline_scratch_bytes;
     if (runtime_bytes > 0) {
         cache->pre_allocate_runtime_chunks(runtime_bytes);
     }
@@ -5862,6 +6006,7 @@ static std::mutex                                  g_tensor_inventory_mutex;
 static std::vector<std::pair<std::string, size_t>> g_tensor_inventory;
 static std::unordered_map<std::string, size_t>     g_tensor_inventory_index;  // name -> index for O(1) lookup
 static size_t                                      g_tensor_inventory_total_size = 0;
+static size_t                                      g_tensor_inventory_pp_pipeline_scratch_bytes = 0;
 static int                                         g_tensor_inventory_device     = 0;
 static size_t                                      g_moe_expert_total_bytes      = 0;
 static int                                         g_moe_n_experts_total         = 0;
@@ -5921,6 +6066,7 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
     g_tensor_inventory_index.clear();
 
     g_tensor_inventory_total_size = 0;
+    g_tensor_inventory_pp_pipeline_scratch_bytes = 0;
     g_tensor_inventory_device     = ctx->device;
     // Store tensor inventory with O(1) lookup index
     g_tensor_inventory.reserve(inventory->count);
@@ -5934,6 +6080,14 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
             g_tensor_inventory_total_size += inventory->tensors[i].size;
         }
     }
+    {
+        const char * env = std::getenv("GGML_SYCL_PP_PIPELINE");
+        const bool   pp_pipeline_enabled = (env == nullptr || std::atoi(env) != 0);
+        g_tensor_inventory_pp_pipeline_scratch_bytes =
+            pp_pipeline_enabled ? inventory->pp_pipeline_scratch_bytes : 0;
+    }
+    ggml_sycl::unified_cache_set_planned_pp_pipeline_scratch_bytes(ctx->device,
+                                                                   g_tensor_inventory_pp_pipeline_scratch_bytes);
 
     // Store model hparams for KV tiering
     g_model_n_layer                  = inventory->n_layer;
@@ -6783,14 +6937,15 @@ static ggml_sycl::alloc_handle arena_pinned_alloc(size_t bytes, sycl::queue & qu
     return handle;
 }
 
-// Device allocation through VRAM arena compute zone when available.
+// Device allocation through the VRAM arena SCRATCH zone when available.
 // Returns alloc_handle — call unified_free(handle) to release.
-// Arena-backed handles have zone_managed=true (freed by arena_reset, unified_free is a no-op).
+// Arena-backed handles have zone_managed=true (freed by zone_free through unified_free()).
 // Fallback device handles have zone_managed=false (freed via sycl::free).
 static ggml_sycl::alloc_handle arena_device_alloc(size_t bytes, int device_id, sycl::queue & queue) {
     if (bytes == 0) {
         return {};
     }
+    pp_scratch_profile_note_device_alloc(bytes);
     if (ggml_sycl::vram_arena_enabled() && device_id >= 0) {
         auto * cache = ggml_sycl::get_unified_cache_for_device(device_id);
         void * ptr   = (cache && cache->arena_active()) ? cache->arena_alloc(bytes) : nullptr;
@@ -6801,7 +6956,7 @@ static ggml_sycl::alloc_handle arena_device_alloc(size_t bytes, int device_id, s
             h.device       = device_id;
             h.tier         = ggml_sycl::alloc_tier::DEVICE_VRAM;
             h.zone_managed = true;
-            h.vram_zone    = ggml_sycl::vram_zone_id::COUNT;  // bump-arena, freed by arena_reset
+            h.vram_zone    = ggml_sycl::vram_zone_id::SCRATCH;
             return h;
         }
     }
@@ -18176,14 +18331,13 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         const size_t rounded_size = ggml_sycl_pool_round_size(size);
 
         // --- VRAM arena fast path ---
-        // When the VRAM arena is active, ALL compute scratch comes from the
-        // compute arena's bump allocator.  No free list, no malloc_device.
-        // The arena resets between graph_compute calls.
-        // LIFO reclaim in arena_free() keeps the bump pointer tight — each
-        // op's scratch is reclaimed before the next op allocates.
+        // When the VRAM arena is active, compute scratch comes from the
+        // compute arena's SCRATCH TLSF zone. No free list, no malloc_device.
+        // The zone resets between graph_compute calls.
         if (arena_mode_) {
             auto * cache = ggml_sycl::get_unified_cache_for_device(device);
             void * ptr   = (cache && cache->arena_active()) ? cache->arena_alloc(rounded_size) : nullptr;
+            pp_scratch_profile_note_pool_alloc(rounded_size, ptr != nullptr);
             if (ptr) {
                 *actual_size = rounded_size;
                 return ptr;
@@ -18275,12 +18429,11 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
     }
 
     void free(void * ptr, size_t size) override {
-        // Arena pointers are ephemeral — they reset between graph_compute calls.
-        // When arena_mode_ is active, attempt LIFO reclaim: if this pointer was
-        // the last bump allocation, rewind the bump pointer to reclaim space.
-        // Non-LIFO frees are no-ops (space reclaimed at arena_reset).
+        // Arena pointers are ephemeral — the SCRATCH zone resets between
+        // graph_compute calls, and individual frees return blocks to TLSF.
         if (arena_mode_) {
             if (ggml_sycl::unified_cache_arena_owns(device, ptr)) {
+                pp_scratch_profile_note_pool_free(size);
                 ggml_sycl::unified_cache_arena_free(device, ptr, size);
             }
             return;
@@ -40841,10 +40994,12 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 
                     // Allocate new buffer (mubmt.12)
                     ggml_sycl::alloc_request req{};
-                    req.queue       = pipe.dma_queue.get();
-                    req.device      = pipe_dev;
-                    req.size        = max_weight_bytes;
-                    req.intent.role = ggml_sycl::alloc_role::STAGING;
+                    req.queue                                    = pipe.dma_queue.get();
+                    req.device                                   = pipe_dev;
+                    req.size                                     = max_weight_bytes;
+                    req.intent.role                              = ggml_sycl::alloc_role::STAGING;
+                    req.intent.category                          = ggml_sycl::runtime_category::STAGING;
+                    req.intent.constraints.prefer_vram_zone      = ggml_sycl::vram_zone_id::RUNTIME;
                     if (!ggml_sycl::unified_alloc(req, &pipe.scratch_alloc[b]) || !pipe.scratch_alloc[b].ptr) {
                         GGML_LOG_WARN("[SYCL] PP pipeline: scratch buf[%d] alloc failed (%.1f MB)\n", b,
                                       max_weight_bytes / (1024.0 * 1024.0));
@@ -40883,6 +41038,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
         GGML_SYCL_DEBUG("op=%d name=%s\n", node->op, node->name ? node->name : "(null)");
+        struct pp_scratch_node_scope {
+            ~pp_scratch_node_scope() { pp_scratch_profile_clear_current_op(); }
+        } pp_scratch_node_scope_guard;
+        pp_scratch_profile_set_current_op(node->op, node->name ? node->name : nullptr);
         // Debug: trace each node in multi-process mode
         if (g_sycl_tp_config.is_multiprocess && g_ggml_sycl_tp_debug) {
             static int node_trace = 0;
@@ -48162,6 +48321,33 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
 
     ggml_sycl_set_main_device(sycl_ctx->device);
 
+    // Phase detection: always recompute — n_nodes is the same for PP and TG
+    // when GPU prefix mode truncates the graph, so caching by n_nodes alone
+    // returns stale PP phase during TG, causing graph replay with wrong shapes.
+    // This scan is O(1) in practice (finds first MUL_MAT in the graph).
+    // Computed BEFORE arena reset so per-PP profiling can include reset cost.
+    bool cached_is_decode = false;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT && cgraph->nodes[i]->src[1]) {
+            cached_is_decode = (cgraph->nodes[i]->src[1]->ne[1] == 1);
+            break;
+        }
+    }
+    ggml_sycl::offload_stats_set_phase(cached_is_decode ? ggml_sycl::offload_phase::TG : ggml_sycl::offload_phase::PP);
+    const bool arena_pp_profile_active = ggml_sycl::arena_pp_profile_begin(sycl_ctx->device, !cached_is_decode);
+    pp_scratch_profile_begin(!cached_is_decode);
+    struct arena_pp_profile_guard_t {
+        bool active;
+        int  device;
+
+        ~arena_pp_profile_guard_t() {
+            pp_scratch_profile_end();
+            if (active) {
+                ggml_sycl::arena_pp_profile_end("graph_compute", device);
+            }
+        }
+    } arena_pp_profile_guard{ arena_pp_profile_active, sycl_ctx ? sycl_ctx->device : -1 };
+
     // One-shot VRAM diagnostic: log per-device memory state on first graph_compute.
     // Helps diagnose VRAM exhaustion issues in multi-GPU configurations.
     {
@@ -48268,20 +48454,6 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
         compute_impl();
     };
     GGML_SYCL_DEBUG("[DEBUG-GRAPH-COMPUTE] Lambda created\n");
-
-    // Phase detection: always recompute — n_nodes is the same for PP and TG
-    // when GPU prefix mode truncates the graph, so caching by n_nodes alone
-    // returns stale PP phase during TG, causing graph replay with wrong shapes.
-    // This scan is O(1) in practice (finds first MUL_MAT in the graph).
-    // Computed BEFORE persistent_eligible so we can include phase in the cache key.
-    bool cached_is_decode = false;
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT && cgraph->nodes[i]->src[1]) {
-            cached_is_decode = (cgraph->nodes[i]->src[1]->ne[1] == 1);
-            break;
-        }
-    }
-    ggml_sycl::offload_stats_set_phase(cached_is_decode ? ggml_sycl::offload_phase::TG : ggml_sycl::offload_phase::PP);
 
     // PP→TG transition: force-fire warmup completion if it hasn't triggered yet.
     // During PP, the fused MoE kernel records expert activations.  If PP ends

@@ -47,6 +47,7 @@ static std::atomic<bool>   g_sycl_shutting_down{ false };  // Set during shutdow
 static std::atomic<size_t> g_runtime_reserved_host_bytes{};
 static std::atomic<size_t> g_runtime_host_cat_bytes[static_cast<int>(runtime_category::COUNT)]{};
 static std::atomic<size_t> g_runtime_managed_reserved_host_bytes{};
+static std::atomic<size_t> g_planned_pp_pipeline_scratch_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<bool>   g_atexit_registered{ false };  // Ensure atexit handler registered once
 static std::atomic<int>    g_cache_assert_enabled{ -1 };
 static std::atomic<int>    g_copy_trace_enabled{ -1 };
@@ -118,6 +119,20 @@ static std::atomic<uint64_t> g_offload_cross_domain_transfer_count_pp{ 0 };
 static std::atomic<uint64_t> g_offload_cross_domain_transfer_count_tg{ 0 };
 static std::atomic<uint64_t> g_offload_transfer_bytes_h2d{ 0 };
 static std::atomic<uint64_t> g_offload_transfer_bytes_d2h{ 0 };
+
+void unified_cache_set_planned_pp_pipeline_scratch_bytes(int device_id, size_t bytes) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    g_planned_pp_pipeline_scratch_bytes[device_id].store(bytes, std::memory_order_release);
+}
+
+size_t unified_cache_get_planned_pp_pipeline_scratch_bytes(int device_id) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return g_planned_pp_pipeline_scratch_bytes[device_id].load(std::memory_order_acquire);
+}
 static std::atomic<uint64_t> g_offload_transfer_bytes_h2d_pp{ 0 };
 static std::atomic<uint64_t> g_offload_transfer_bytes_h2d_tg{ 0 };
 static std::atomic<uint64_t> g_offload_transfer_bytes_d2h_pp{ 0 };
@@ -672,6 +687,274 @@ void offload_stats_log_summary(const char * tag, int device) {
     }
 }
 
+namespace {
+
+using arena_profile_clock = std::chrono::high_resolution_clock;
+
+struct arena_pp_profile_state {
+    bool active = false;
+    int  device = -1;
+
+    arena_profile_clock::time_point graph_start{};
+
+    std::array<uint64_t, static_cast<size_t>(vram_zone_id::COUNT)> zone_alloc_calls{};
+    std::array<uint64_t, static_cast<size_t>(vram_zone_id::COUNT)> zone_alloc_failures{};
+    std::array<uint64_t, static_cast<size_t>(vram_zone_id::COUNT)> zone_alloc_bytes{};
+    std::array<double, static_cast<size_t>(vram_zone_id::COUNT)>   zone_alloc_us{};
+    std::array<uint64_t, static_cast<size_t>(vram_zone_id::COUNT)> zone_free_calls{};
+    std::array<double, static_cast<size_t>(vram_zone_id::COUNT)>   zone_free_us{};
+
+    std::array<uint64_t, static_cast<size_t>(vram_zone_id::COUNT)> zone_reset_calls{};
+    std::array<double, static_cast<size_t>(vram_zone_id::COUNT)>   zone_reset_us{};
+
+    std::array<size_t, static_cast<size_t>(vram_zone_id::COUNT)> zone_used_begin{};
+    std::array<size_t, static_cast<size_t>(vram_zone_id::COUNT)> zone_used_end{};
+    std::array<size_t, static_cast<size_t>(vram_zone_id::COUNT)> zone_used_peak{};
+    std::array<size_t, static_cast<size_t>(vram_zone_id::COUNT)> zone_capacity{};
+    std::array<size_t, static_cast<size_t>(vram_zone_id::COUNT)> zone_largest_free_begin{};
+    std::array<size_t, static_cast<size_t>(vram_zone_id::COUNT)> zone_largest_free_end{};
+    std::array<size_t, static_cast<size_t>(vram_zone_id::COUNT)> zone_largest_free_min{};
+
+    uint64_t compute_arena_alloc_calls = 0;
+    uint64_t compute_arena_alloc_fail  = 0;
+    uint64_t compute_arena_alloc_bytes = 0;
+    double   compute_arena_alloc_us    = 0.0;
+    uint64_t compute_arena_reset_calls = 0;
+    double   compute_arena_reset_us    = 0.0;
+    size_t   compute_arena_used_begin  = 0;
+    size_t   compute_arena_used_end    = 0;
+    size_t   compute_arena_capacity    = 0;
+
+    uint64_t onednn_reserve_calls        = 0;
+    uint64_t onednn_reserve_reuse_hits   = 0;
+    uint64_t onednn_reserve_arena_hits   = 0;
+    uint64_t onednn_reserve_direct_hits  = 0;
+    uint64_t onednn_reserve_failures     = 0;
+    uint64_t onednn_reserve_weights_req  = 0;
+    uint64_t onednn_reserve_acts_req     = 0;
+    double   onednn_reserve_us           = 0.0;
+
+    uint64_t onednn_get_calls            = 0;
+    uint64_t onednn_get_failures         = 0;
+    uint64_t onednn_get_weights_req      = 0;
+    uint64_t onednn_get_acts_req         = 0;
+    double   onednn_get_us               = 0.0;
+};
+
+thread_local arena_pp_profile_state t_arena_pp_profile;
+
+static const char * arena_zone_name(vram_zone_id zone) {
+    switch (zone) {
+        case vram_zone_id::KV:      return "kv";
+        case vram_zone_id::WEIGHT:  return "weight";
+        case vram_zone_id::ONEDNN:  return "onednn";
+        case vram_zone_id::RUNTIME: return "runtime";
+        case vram_zone_id::SCRATCH: return "scratch";
+        case vram_zone_id::COUNT:   break;
+    }
+    return "unknown";
+}
+
+static double arena_profile_elapsed_us(const arena_profile_clock::time_point & start) {
+    return std::chrono::duration<double, std::micro>(arena_profile_clock::now() - start).count();
+}
+
+static void arena_pp_profile_snapshot_zones(unified_cache * cache,
+                                            std::array<size_t, static_cast<size_t>(vram_zone_id::COUNT)> & used_out,
+                                            std::array<size_t, static_cast<size_t>(vram_zone_id::COUNT)> & cap_out) {
+    if (!cache || !cache->arena_active()) {
+        used_out.fill(0);
+        cap_out.fill(0);
+        return;
+    }
+    for (size_t i = 0; i < static_cast<size_t>(vram_zone_id::COUNT); ++i) {
+        const auto zid = static_cast<vram_zone_id>(i);
+        used_out[i]    = cache->zone_used(zid);
+        cap_out[i]     = cache->zone_capacity(zid);
+    }
+}
+
+}  // namespace
+
+bool arena_pp_profile_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_ARENA_PP_PROFILE");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+bool arena_pp_profile_active() {
+    return t_arena_pp_profile.active;
+}
+
+bool arena_pp_profile_begin(int device, bool is_prompt_phase) {
+    t_arena_pp_profile = {};
+
+    if (!arena_pp_profile_enabled() || !is_prompt_phase) {
+        return false;
+    }
+
+    unified_cache * cache = get_unified_cache_for_device(device);
+    if (!cache || !cache->arena_active()) {
+        return false;
+    }
+
+    t_arena_pp_profile.active      = true;
+    t_arena_pp_profile.device      = device;
+    t_arena_pp_profile.graph_start = arena_profile_clock::now();
+    arena_pp_profile_snapshot_zones(cache, t_arena_pp_profile.zone_used_begin, t_arena_pp_profile.zone_capacity);
+    for (size_t i = 0; i < static_cast<size_t>(vram_zone_id::COUNT); ++i) {
+        const auto zid = static_cast<vram_zone_id>(i);
+        t_arena_pp_profile.zone_used_peak[i]         = t_arena_pp_profile.zone_used_begin[i];
+        t_arena_pp_profile.zone_largest_free_begin[i] = cache->zone_largest_free(zid);
+        t_arena_pp_profile.zone_largest_free_min[i]   = t_arena_pp_profile.zone_largest_free_begin[i];
+    }
+    t_arena_pp_profile.compute_arena_used_begin = cache->compute_arena_used();
+    t_arena_pp_profile.compute_arena_capacity   = cache->compute_arena_capacity();
+    return true;
+}
+
+void arena_pp_profile_end(const char * tag, int device) {
+    arena_pp_profile_state stats = t_arena_pp_profile;
+    t_arena_pp_profile           = {};
+
+    if (!stats.active || stats.device != device) {
+        return;
+    }
+
+    unified_cache * cache = get_unified_cache_for_device(device);
+    arena_pp_profile_snapshot_zones(cache, stats.zone_used_end, stats.zone_capacity);
+    if (cache) {
+        for (size_t i = 0; i < static_cast<size_t>(vram_zone_id::COUNT); ++i) {
+            stats.zone_largest_free_end[i] = cache->zone_largest_free(static_cast<vram_zone_id>(i));
+        }
+        stats.compute_arena_used_end = cache->compute_arena_used();
+        stats.compute_arena_capacity = cache->compute_arena_capacity();
+    }
+
+    const double total_ms = std::chrono::duration<double, std::milli>(arena_profile_clock::now() - stats.graph_start).count();
+    const char * onednn_source = cache ? cache->onednn_scratch_source_name() : "unavailable";
+
+    fprintf(stderr,
+            "[ARENA-PP] tag=%s device=%d total_ms=%.3f onednn_source=%s compute_arena_mb=%.1f->%.1f/%.1f "
+            "kv_mb=%.1f->%.1f/%0.1f onednn_mb=%.1f->%.1f/%0.1f runtime_mb=%.1f->%.1f/%0.1f scratch_mb=%.1f->%.1f/%0.1f\n",
+            tag ? tag : "graph_compute", device, total_ms, onednn_source,
+            stats.compute_arena_used_begin / (1024.0 * 1024.0),
+            stats.compute_arena_used_end / (1024.0 * 1024.0),
+            stats.compute_arena_capacity / (1024.0 * 1024.0),
+            stats.zone_used_begin[static_cast<size_t>(vram_zone_id::KV)] / (1024.0 * 1024.0),
+            stats.zone_used_end[static_cast<size_t>(vram_zone_id::KV)] / (1024.0 * 1024.0),
+            stats.zone_capacity[static_cast<size_t>(vram_zone_id::KV)] / (1024.0 * 1024.0),
+            stats.zone_used_begin[static_cast<size_t>(vram_zone_id::ONEDNN)] / (1024.0 * 1024.0),
+            stats.zone_used_end[static_cast<size_t>(vram_zone_id::ONEDNN)] / (1024.0 * 1024.0),
+            stats.zone_capacity[static_cast<size_t>(vram_zone_id::ONEDNN)] / (1024.0 * 1024.0),
+            stats.zone_used_begin[static_cast<size_t>(vram_zone_id::RUNTIME)] / (1024.0 * 1024.0),
+            stats.zone_used_end[static_cast<size_t>(vram_zone_id::RUNTIME)] / (1024.0 * 1024.0),
+            stats.zone_capacity[static_cast<size_t>(vram_zone_id::RUNTIME)] / (1024.0 * 1024.0),
+            stats.zone_used_begin[static_cast<size_t>(vram_zone_id::SCRATCH)] / (1024.0 * 1024.0),
+            stats.zone_used_end[static_cast<size_t>(vram_zone_id::SCRATCH)] / (1024.0 * 1024.0),
+            stats.zone_capacity[static_cast<size_t>(vram_zone_id::SCRATCH)] / (1024.0 * 1024.0));
+
+    fprintf(stderr, "[ARENA-PP-ZONE]");
+    for (size_t i = 0; i < static_cast<size_t>(vram_zone_id::COUNT); ++i) {
+        const auto zid = static_cast<vram_zone_id>(i);
+        fprintf(stderr,
+                " %s_calls=%llu %s_fail=%llu %s_mb=%.1f %s_ms=%.3f %s_frees=%llu %s_free_ms=%.3f "
+                "%s_resets=%llu %s_reset_ms=%.3f",
+                arena_zone_name(zid), (unsigned long long) stats.zone_alloc_calls[i],
+                arena_zone_name(zid), (unsigned long long) stats.zone_alloc_failures[i],
+                arena_zone_name(zid), stats.zone_alloc_bytes[i] / (1024.0 * 1024.0),
+                arena_zone_name(zid), stats.zone_alloc_us[i] / 1000.0,
+                arena_zone_name(zid), (unsigned long long) stats.zone_free_calls[i],
+                arena_zone_name(zid), stats.zone_free_us[i] / 1000.0,
+                arena_zone_name(zid), (unsigned long long) stats.zone_reset_calls[i],
+                arena_zone_name(zid), stats.zone_reset_us[i] / 1000.0);
+    }
+    fprintf(stderr, "\n");
+
+    const size_t scratch_idx = static_cast<size_t>(vram_zone_id::SCRATCH);
+    fprintf(stderr,
+            "[ARENA-PP-SCRATCH] peak_live_mb=%.1f largest_free_mb=%.1f->%.1f min_largest_free_mb=%.1f "
+            "alloc_free_ratio=%.2f req_to_peak_ratio=%.2f\n",
+            stats.zone_used_peak[scratch_idx] / (1024.0 * 1024.0),
+            stats.zone_largest_free_begin[scratch_idx] / (1024.0 * 1024.0),
+            stats.zone_largest_free_end[scratch_idx] / (1024.0 * 1024.0),
+            stats.zone_largest_free_min[scratch_idx] / (1024.0 * 1024.0),
+            stats.zone_free_calls[scratch_idx] ?
+                static_cast<double>(stats.zone_alloc_calls[scratch_idx]) /
+                    static_cast<double>(stats.zone_free_calls[scratch_idx]) :
+                0.0,
+            stats.zone_used_peak[scratch_idx] ?
+                static_cast<double>(stats.zone_alloc_bytes[scratch_idx]) /
+                    static_cast<double>(stats.zone_used_peak[scratch_idx]) :
+                0.0);
+
+    fprintf(stderr,
+            "[ARENA-PP-COMPUTE] alloc_calls=%llu alloc_fail=%llu alloc_mb=%.1f alloc_ms=%.3f "
+            "reset_calls=%llu reset_ms=%.3f\n",
+            (unsigned long long) stats.compute_arena_alloc_calls,
+            (unsigned long long) stats.compute_arena_alloc_fail,
+            stats.compute_arena_alloc_bytes / (1024.0 * 1024.0),
+            stats.compute_arena_alloc_us / 1000.0,
+            (unsigned long long) stats.compute_arena_reset_calls,
+            stats.compute_arena_reset_us / 1000.0);
+
+    fprintf(stderr,
+            "[ARENA-PP-ONEDNN] reserve_calls=%llu reserve_reuse=%llu reserve_arena=%llu reserve_direct=%llu "
+            "reserve_fail=%llu reserve_req_mb=%.1f/%.1f reserve_ms=%.3f "
+            "get_calls=%llu get_fail=%llu get_req_mb=%.1f/%.1f get_ms=%.3f\n",
+            (unsigned long long) stats.onednn_reserve_calls,
+            (unsigned long long) stats.onednn_reserve_reuse_hits,
+            (unsigned long long) stats.onednn_reserve_arena_hits,
+            (unsigned long long) stats.onednn_reserve_direct_hits,
+            (unsigned long long) stats.onednn_reserve_failures,
+            stats.onednn_reserve_weights_req / (1024.0 * 1024.0),
+            stats.onednn_reserve_acts_req / (1024.0 * 1024.0),
+            stats.onednn_reserve_us / 1000.0,
+            (unsigned long long) stats.onednn_get_calls,
+            (unsigned long long) stats.onednn_get_failures,
+            stats.onednn_get_weights_req / (1024.0 * 1024.0),
+            stats.onednn_get_acts_req / (1024.0 * 1024.0),
+            stats.onednn_get_us / 1000.0);
+}
+
+void arena_pp_profile_note_onednn_reserve(size_t weights_size, size_t activations_size, bool reused, bool arena_attempted,
+                                          bool arena_success, bool direct_attempted, bool ok, double elapsed_us) {
+    if (!t_arena_pp_profile.active) {
+        return;
+    }
+    t_arena_pp_profile.onednn_reserve_calls++;
+    t_arena_pp_profile.onednn_reserve_weights_req += weights_size;
+    t_arena_pp_profile.onednn_reserve_acts_req += activations_size;
+    t_arena_pp_profile.onednn_reserve_us += elapsed_us;
+    if (reused) {
+        t_arena_pp_profile.onednn_reserve_reuse_hits++;
+    }
+    if (arena_attempted && arena_success) {
+        t_arena_pp_profile.onednn_reserve_arena_hits++;
+    }
+    if (direct_attempted && ok) {
+        t_arena_pp_profile.onednn_reserve_direct_hits++;
+    }
+    if (!ok) {
+        t_arena_pp_profile.onednn_reserve_failures++;
+    }
+}
+
+void arena_pp_profile_note_onednn_get(size_t weights_needed, size_t activations_needed, bool ok, double elapsed_us) {
+    if (!t_arena_pp_profile.active) {
+        return;
+    }
+    t_arena_pp_profile.onednn_get_calls++;
+    t_arena_pp_profile.onednn_get_weights_req += weights_needed;
+    t_arena_pp_profile.onednn_get_acts_req += activations_needed;
+    t_arena_pp_profile.onednn_get_us += elapsed_us;
+    if (!ok) {
+        t_arena_pp_profile.onednn_get_failures++;
+    }
+}
+
 static bool parse_env_mb_value(const char * name, size_t & out_mb) {
     const char * env = std::getenv(name);
     if (!env || env[0] == '\0') {
@@ -902,6 +1185,12 @@ unified_cache::unified_cache(sycl::queue & queue, size_t budget_bytes, size_t st
         size_t runtime_zone = 512 * 1024 * 1024;
         if (const char * env = std::getenv("GGML_SYCL_RUNTIME_ARENA_MB")) {
             runtime_zone = static_cast<size_t>(std::max(0, std::atoi(env))) * 1024 * 1024;
+        }
+        const size_t planned_pp_pipeline = unified_cache_get_planned_pp_pipeline_scratch_bytes(dev_id);
+        if (planned_pp_pipeline > 0 && runtime_zone < planned_pp_pipeline) {
+            runtime_zone = planned_pp_pipeline;
+            GGML_LOG_INFO("[UNIFIED-CACHE] Runtime zone raised to %.1f MB for PP pipeline scratch planning\n",
+                          runtime_zone / (1024.0 * 1024.0));
         }
 
         if (arena_reserve(queue_, budget_bytes, max_alloc, scratch_zone, onednn_zone, runtime_zone)) {
@@ -4902,17 +5191,19 @@ static unified_cache * create_cache_for_device(int                     device_id
             budget_capped_to_free = true;
         }
 
-        // Reserve headroom for compute scratch (FP16 dequant buffers for oneDNN
-        // attention GEMM, kernel temporaries, etc.).  Without this, models that
-        // barely fit in VRAM fill it completely with weights, leaving zero space
-        // for compute scratch → GGML_ABORT in batched mul_mat.
-        constexpr size_t compute_scratch_headroom = 512ull * 1024ull * 1024ull;
-        if (budget > compute_scratch_headroom) {
-            budget -= compute_scratch_headroom;
+        // Reserve generic device slack outside the unified cache. This is not
+        // the PP pipeline budget; that is modeled explicitly in the placement
+        // plan and reserved inside the arena's RUNTIME zone. This coarse
+        // cushion covers other out-of-cache runtime consumers such as driver
+        // overhead, transient kernel temporaries, and allocations that still
+        // bypass zone management.
+        constexpr size_t device_runtime_slack_headroom = 512ull * 1024ull * 1024ull;
+        if (budget > device_runtime_slack_headroom) {
+            budget -= device_runtime_slack_headroom;
             GGML_LOG_INFO(
-                "[UNIFIED-CACHE] Compute scratch headroom: %.0f MB reserved "
+                "[UNIFIED-CACHE] Generic device slack headroom: %.0f MB reserved "
                 "(weight budget=%.1f MB)\n",
-                compute_scratch_headroom / (1024.0 * 1024.0), budget / (1024.0 * 1024.0));
+                device_runtime_slack_headroom / (1024.0 * 1024.0), budget / (1024.0 * 1024.0));
         }
 
         // Leave additional headroom for KV cache and ggml compute buffers.
@@ -4923,7 +5214,7 @@ static unified_cache * create_cache_for_device(int                     device_id
         // the cache, so we must reserve headroom.
         if (!vram_arena_enabled()) {
             constexpr size_t kv_compute_headroom = 2048ull * 1024ull * 1024ull;
-            if (budget > kv_compute_headroom + compute_scratch_headroom) {
+            if (budget > kv_compute_headroom + device_runtime_slack_headroom) {
                 budget -= kv_compute_headroom;
                 GGML_LOG_INFO("[UNIFIED-CACHE] KV+compute headroom: %.0f MB reserved\n",
                               kv_compute_headroom / (1024.0 * 1024.0));
@@ -6651,16 +6942,32 @@ void unpin_routed_experts(const int32_t * expert_ids,
 // === OneDNN FP16 Scratch Buffer Implementation ===
 
 bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activations_size) {
+    const bool profile_active = arena_pp_profile_active();
+    const auto t0             = profile_active ? arena_profile_clock::now() : arena_profile_clock::time_point{};
+    bool       reused         = false;
+    bool       arena_attempt  = false;
+    bool       arena_success  = false;
+    bool       direct_attempt = false;
+    auto finish = [&](bool ok) {
+        if (profile_active) {
+            arena_pp_profile_note_onednn_reserve(weights_size, activations_size, reused, arena_attempt, arena_success,
+                                                 direct_attempt, ok, arena_profile_elapsed_us(t0));
+        }
+        return ok;
+    };
+
     std::lock_guard<std::mutex> lock(onednn_scratch_mutex_);
 
     // Already reserved with sufficient size?
     if (onednn_weights_scratch_ && onednn_activations_scratch_ && onednn_weights_scratch_size_ >= weights_size &&
         onednn_activations_scratch_size_ >= activations_size) {
-        return true;
+        reused = true;
+        return finish(true);
     }
 
     // VRAM arena path: sub-allocate from the oneDNN zone.
     if (arena_active()) {
+        arena_attempt = true;
         const size_t total_needed = weights_size + activations_size;
         size_t       zone_cap     = zone_capacity(vram_zone_id::ONEDNN);
         if (total_needed <= zone_cap) {
@@ -6674,10 +6981,11 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
                 onednn_weights_scratch_size_     = weights_size;
                 onednn_activations_scratch_      = a;
                 onednn_activations_scratch_size_ = activations_size;
+                arena_success                    = true;
                 // Budget already charged when arena was reserved.
                 GGML_LOG_INFO("[UNIFIED-CACHE] oneDNN scratch from arena: weights=%.1f MB, activations=%.1f MB\n",
                               weights_size / (1024.0f * 1024.0f), activations_size / (1024.0f * 1024.0f));
-                return true;
+                return finish(true);
             }
             // Reset zone on partial failure.
             zone_reset(vram_zone_id::ONEDNN);
@@ -6687,6 +6995,7 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
             "falling back to direct alloc\n",
             total_needed / (1024.0f * 1024.0f), zone_cap / (1024.0f * 1024.0f));
     }
+    direct_attempt = true;
 
     // Free existing if resizing — subtract old sizes from budget first
     const size_t old_total = onednn_weights_scratch_size_ + onednn_activations_scratch_size_;
@@ -6733,7 +7042,7 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         if (!onednn_weights_scratch_) {
             GGML_LOG_WARN("[UNIFIED-CACHE] Arena ONEDNN zone full for weights scratch (%.1f MB)\n",
                           weights_size / (1024.0f * 1024.0f));
-            return false;
+            return finish(false);
         }
         onednn_weights_scratch_size_ = weights_size;
     } else {
@@ -6742,14 +7051,14 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
             if (!onednn_weights_scratch_) {
                 GGML_SYCL_DEBUG("[UNIFIED-CACHE] Failed to allocate oneDNN weights scratch (%.1f MB)\n",
                                 weights_size / (1024.0f * 1024.0f));
-                return false;
+                return finish(false);
             }
             alloc_registry::instance().register_alloc(onednn_weights_scratch_, weights_size,
                                                       ggml_sycl_get_device_id_from_queue(queue_), alloc_type::DEVICE);
             onednn_weights_scratch_size_ = weights_size;
         } catch (const sycl::exception & e) {
             GGML_SYCL_DEBUG("[UNIFIED-CACHE] oneDNN weights scratch allocation failed: %s\n", e.what());
-            return false;
+            return finish(false);
         }
     }
 
@@ -6762,7 +7071,7 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
             // Cleanup weights (arena-owned, just null the pointer — no sycl::free)
             onednn_weights_scratch_      = nullptr;
             onednn_weights_scratch_size_ = 0;
-            return false;
+            return finish(false);
         }
         onednn_activations_scratch_size_ = activations_size;
     } else {
@@ -6776,7 +7085,7 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
                 sycl::free(onednn_weights_scratch_, queue_);
                 onednn_weights_scratch_      = nullptr;
                 onednn_weights_scratch_size_ = 0;
-                return false;
+                return finish(false);
             }
             alloc_registry::instance().register_alloc(onednn_activations_scratch_, activations_size,
                                                       ggml_sycl_get_device_id_from_queue(queue_), alloc_type::DEVICE);
@@ -6786,7 +7095,7 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
             sycl::free(onednn_weights_scratch_, queue_);
             onednn_weights_scratch_      = nullptr;
             onednn_weights_scratch_size_ = 0;
-            return false;
+            return finish(false);
         }
     }
 
@@ -6797,7 +7106,7 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
 
     GGML_SYCL_DEBUG("[UNIFIED-CACHE] Reserved oneDNN scratch: weights=%.1f MB, activations=%.1f MB\n",
                     weights_size / (1024.0f * 1024.0f), activations_size / (1024.0f * 1024.0f));
-    return true;
+    return finish(true);
 }
 
 bool unified_cache::get_onednn_scratch(size_t weights_needed, size_t activations_needed, onednn_scratch_buffers & out) {
@@ -6874,9 +7183,14 @@ bool unified_cache_reserve_onednn_scratch(int device_id, size_t weights_size, si
 onednn_scratch_result unified_cache_get_onednn_scratch(int    device_id,
                                                        size_t weights_needed,
                                                        size_t activations_needed) {
+    const bool profile_active = arena_pp_profile_active();
+    const auto t0             = profile_active ? arena_profile_clock::now() : arena_profile_clock::time_point{};
     onednn_scratch_result result;
     unified_cache *       cache = get_unified_cache_for_device(device_id);
     if (!cache) {
+        if (profile_active) {
+            arena_pp_profile_note_onednn_get(weights_needed, activations_needed, false, arena_profile_elapsed_us(t0));
+        }
         return result;
     }
 
@@ -6885,6 +7199,9 @@ onednn_scratch_result unified_cache_get_onednn_scratch(int    device_id,
 
     unified_cache::onednn_scratch_buffers buffers;
     if (!cache->get_onednn_scratch(weights_needed, activations_needed, buffers)) {
+        if (profile_active) {
+            arena_pp_profile_note_onednn_get(weights_needed, activations_needed, false, arena_profile_elapsed_us(t0));
+        }
         return result;
     }
 
@@ -6897,6 +7214,9 @@ onednn_scratch_result unified_cache_get_onednn_scratch(int    device_id,
     result.weights     = buffers.weights;
     result.activations = buffers.activations;
     result.ok          = true;
+    if (profile_active) {
+        arena_pp_profile_note_onednn_get(weights_needed, activations_needed, true, arena_profile_elapsed_us(t0));
+    }
     return result;
 }
 
@@ -7700,9 +8020,10 @@ void unified_cache::deallocate(void * ptr, size_t size, alloc_lifetime lifetime)
 }
 
 // --- Compute Arena ---
-// Pre-reserved VRAM bump allocator for compute scratch buffers.
-// Single sycl::malloc_device allocation, bump-allocated during graph_compute,
-// reset between invocations.  Must be called BEFORE S1-PRELOAD.
+// Pre-reserved VRAM region for compute scratch buffers.
+// In VRAM arena mode this aliases the SCRATCH TLSF zone. Outside arena mode,
+// it falls back to the legacy single-allocation bump allocator.
+// Must be called BEFORE S1-PRELOAD.
 
 bool unified_cache::reserve_compute_arena(size_t arena_bytes) {
     if (compute_arena_ptr_ && compute_arena_size_ >= arena_bytes) {
@@ -7782,22 +8103,54 @@ void * unified_cache::arena_alloc(size_t size) {
         return nullptr;
     }
 
+    const bool profile_active = arena_pp_profile_active();
+    const auto t0             = profile_active ? arena_profile_clock::now() : arena_profile_clock::time_point{};
+    const size_t aligned      = (size + 255) & ~size_t(255);
+
+    if (arena_active()) {
+        void * ptr = zone_alloc(vram_zone_id::SCRATCH, aligned, 256);
+        if (profile_active) {
+            t_arena_pp_profile.compute_arena_alloc_calls++;
+            t_arena_pp_profile.compute_arena_alloc_bytes += aligned;
+            if (!ptr) {
+                t_arena_pp_profile.compute_arena_alloc_fail++;
+            }
+            t_arena_pp_profile.compute_arena_alloc_us += arena_profile_elapsed_us(t0);
+        }
+        return ptr;
+    }
+
     // Align to 256 bytes for GPU coalescing.
-    const size_t aligned = (size + 255) & ~size_t(255);
 
     // Atomic bump allocator — lock-free.
     size_t off = compute_arena_off_.fetch_add(aligned, std::memory_order_relaxed);
     if (off + aligned > compute_arena_size_) {
         // Arena exhausted — roll back.
         compute_arena_off_.fetch_sub(aligned, std::memory_order_relaxed);
+        if (profile_active) {
+            t_arena_pp_profile.compute_arena_alloc_calls++;
+            t_arena_pp_profile.compute_arena_alloc_fail++;
+            t_arena_pp_profile.compute_arena_alloc_bytes += aligned;
+            t_arena_pp_profile.compute_arena_alloc_us += arena_profile_elapsed_us(t0);
+        }
         return nullptr;
     }
 
+    if (profile_active) {
+        t_arena_pp_profile.compute_arena_alloc_calls++;
+        t_arena_pp_profile.compute_arena_alloc_bytes += aligned;
+        t_arena_pp_profile.compute_arena_alloc_us += arena_profile_elapsed_us(t0);
+    }
     return static_cast<uint8_t *>(compute_arena_ptr_) + off;
 }
 
 void unified_cache::arena_free(void * ptr, size_t size) {
     if (!compute_arena_ptr_ || !ptr) {
+        return;
+    }
+
+    if (arena_active()) {
+        zone_free(vram_zone_id::SCRATCH, ptr);
         return;
     }
 
@@ -7826,7 +8179,21 @@ void unified_cache::arena_free(void * ptr, size_t size) {
 }
 
 void unified_cache::arena_reset() {
+    const bool profile_active = arena_pp_profile_active();
+    const auto t0             = profile_active ? arena_profile_clock::now() : arena_profile_clock::time_point{};
+    if (arena_active()) {
+        zone_reset(vram_zone_id::SCRATCH);
+        if (profile_active) {
+            t_arena_pp_profile.compute_arena_reset_calls++;
+            t_arena_pp_profile.compute_arena_reset_us += arena_profile_elapsed_us(t0);
+        }
+        return;
+    }
     compute_arena_off_.store(0, std::memory_order_relaxed);
+    if (profile_active) {
+        t_arena_pp_profile.compute_arena_reset_calls++;
+        t_arena_pp_profile.compute_arena_reset_us += arena_profile_elapsed_us(t0);
+    }
 }
 
 bool unified_cache::arena_owns(const void * ptr) const {
@@ -7843,6 +8210,9 @@ size_t unified_cache::compute_arena_capacity() const {
 }
 
 size_t unified_cache::compute_arena_used() const {
+    if (arena_active()) {
+        return zone_used(vram_zone_id::SCRATCH);
+    }
     return compute_arena_off_.load(std::memory_order_relaxed);
 }
 
@@ -8703,6 +9073,9 @@ void * unified_cache::zone_alloc(vram_zone_id zone, size_t size, size_t align) {
         return nullptr;
     }
 
+    const bool profile_active = arena_pp_profile_active();
+    const auto t0             = profile_active ? arena_profile_clock::now() : arena_profile_clock::time_point{};
+
     auto &           z     = arena_zones_[static_cast<int>(zone)];
     tlsf_allocator * alloc = z.allocator.get();
 
@@ -8727,13 +9100,36 @@ void * unified_cache::zone_alloc(vram_zone_id zone, size_t size, size_t align) {
     // TLSF returns OFFSET into the managed region; convert to device pointer.
     size_t offset = alloc->allocate(size, align);
     if (offset != SIZE_MAX) {
-        z.used.store(alloc->used(), std::memory_order_relaxed);
+        const size_t current_used         = alloc->used();
+        const size_t current_largest_free = alloc->largest_free_block();
+        z.used.store(current_used, std::memory_order_relaxed);
+        if (profile_active) {
+            const size_t idx = static_cast<size_t>(zone);
+            t_arena_pp_profile.zone_alloc_calls[idx]++;
+            t_arena_pp_profile.zone_alloc_bytes[idx] += size;
+            t_arena_pp_profile.zone_alloc_us[idx] += arena_profile_elapsed_us(t0);
+            t_arena_pp_profile.zone_used_peak[idx] =
+                std::max(t_arena_pp_profile.zone_used_peak[idx], current_used);
+            t_arena_pp_profile.zone_largest_free_min[idx] =
+                std::min(t_arena_pp_profile.zone_largest_free_min[idx], current_largest_free);
+        }
         return offset_to_ptr(z.start + offset);
+    }
+    if (profile_active) {
+        const size_t idx = static_cast<size_t>(zone);
+        t_arena_pp_profile.zone_alloc_calls[idx]++;
+        t_arena_pp_profile.zone_alloc_failures[idx]++;
+        t_arena_pp_profile.zone_alloc_bytes[idx] += size;
+        t_arena_pp_profile.zone_alloc_us[idx] += arena_profile_elapsed_us(t0);
+        t_arena_pp_profile.zone_largest_free_min[idx] =
+            std::min(t_arena_pp_profile.zone_largest_free_min[idx], alloc->largest_free_block());
     }
     return nullptr;
 }
 
 void unified_cache::zone_reset(vram_zone_id zone) {
+    const bool profile_active = arena_pp_profile_active();
+    const auto t0             = profile_active ? arena_profile_clock::now() : arena_profile_clock::time_point{};
     auto &                      z = arena_zones_[static_cast<int>(zone)];
     std::lock_guard<std::mutex> lock(z.alloc_mutex);
 
@@ -8759,12 +9155,20 @@ void unified_cache::zone_reset(vram_zone_id zone) {
         z.allocator->reset();
     }
     z.used.store(0, std::memory_order_relaxed);
+    if (profile_active) {
+        const size_t idx = static_cast<size_t>(zone);
+        t_arena_pp_profile.zone_reset_calls[idx]++;
+        t_arena_pp_profile.zone_reset_us[idx] += arena_profile_elapsed_us(t0);
+    }
 }
 
 void unified_cache::zone_free(vram_zone_id zone, void * ptr) {
     if (!ptr || !arena_base_) {
         return;
     }
+
+    const bool profile_active = arena_pp_profile_active();
+    const auto t0             = profile_active ? arena_profile_clock::now() : arena_profile_clock::time_point{};
 
     auto &           z     = arena_zones_[static_cast<int>(zone)];
     tlsf_allocator * alloc = z.allocator.get();
@@ -8785,6 +9189,11 @@ void unified_cache::zone_free(vram_zone_id zone, void * ptr) {
         std::lock_guard<std::mutex> lock(kv.alloc_mutex);
         alloc->free(zone_offset);
         kv.used.store(alloc->used(), std::memory_order_relaxed);
+        if (profile_active) {
+            const size_t idx = static_cast<size_t>(zone);
+            t_arena_pp_profile.zone_free_calls[idx]++;
+            t_arena_pp_profile.zone_free_us[idx] += arena_profile_elapsed_us(t0);
+        }
         return;
     }
     if (!alloc) {
@@ -8801,6 +9210,11 @@ void unified_cache::zone_free(vram_zone_id zone, void * ptr) {
     std::lock_guard<std::mutex> lock(z.alloc_mutex);
     alloc->free(zone_offset);
     z.used.store(alloc->used(), std::memory_order_relaxed);
+    if (profile_active) {
+        const size_t idx = static_cast<size_t>(zone);
+        t_arena_pp_profile.zone_free_calls[idx]++;
+        t_arena_pp_profile.zone_free_us[idx] += arena_profile_elapsed_us(t0);
+    }
 }
 
 bool unified_cache::vram_owns(const void * ptr) const {
@@ -8885,6 +9299,24 @@ size_t unified_cache::zone_available(vram_zone_id zone) const {
     // Fallback for zones without allocator (shouldn't happen after arena_reserve).
     size_t used = z.used.load(std::memory_order_relaxed);
     return z.size > used ? z.size - used : 0;
+}
+
+size_t unified_cache::zone_largest_free(vram_zone_id zone) const {
+    const auto & z = arena_zones_[static_cast<int>(zone)];
+
+    if (arena_n_chunks_ == 1 && zone == vram_zone_id::WEIGHT) {
+        const auto & kv = arena_zones_[static_cast<int>(vram_zone_id::KV)];
+        if (kv.allocator) {
+            return kv.allocator->largest_free_block();
+        }
+        return 0;
+    }
+
+    if (z.allocator) {
+        return z.allocator->largest_free_block();
+    }
+
+    return zone_available(zone);
 }
 
 void unified_cache::arena_destroy() {
@@ -9139,6 +9571,13 @@ static void populate_host_zone_sizing(placement_plan &                          
     //    The ONEDNN zone is pre-sized at 256 MB; this estimate validates the zone is adequate.
     plan.onednn_scratchpad_bytes = plan.max_tensor_bytes * 2;
 
+    // 9. PP pipeline scratch: double-buffered FP16 weight staging for prompt-processing
+    //    dequant prefetch. This is computed exactly at inventory collection time and
+    //    plumbed through as an explicit planner field so the RUNTIME zone accounts for it.
+    if (plan.pp_pipeline_scratch_bytes > 0) {
+        GGML_LOG_INFO("[SYCL-PLAN] PP pipeline scratch: %.1f MB\n", plan.pp_pipeline_scratch_bytes / (1024.0 * 1024.0));
+    }
+
     constexpr size_t k_onednn_zone_bytes = 256ull * 1024ull * 1024ull;
     if (plan.onednn_scratchpad_bytes > k_onednn_zone_bytes) {
         GGML_LOG_WARN(
@@ -9192,6 +9631,7 @@ placement_plan compute_placement_plan(const std::vector<std::pair<std::string, s
     plan.swa_layer_mask           = kv_info.swa_layer_mask;
     plan.planner_n_ctx            = kv_info.n_ctx;
     plan.planner_n_ctx_is_runtime = kv_info.n_ctx_is_runtime;
+    plan.pp_pipeline_scratch_bytes = unified_cache_get_planned_pp_pipeline_scratch_bytes(device_id);
 
     std::map<int, bool>   layer_has_attention;
     std::map<int, size_t> layer_weight_bytes;
@@ -9556,6 +9996,10 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     plan.swa_layer_mask           = kv_info.swa_layer_mask;
     plan.planner_n_ctx            = kv_info.n_ctx;
     plan.planner_n_ctx_is_runtime = kv_info.n_ctx_is_runtime;
+    for (const auto & db : device_budgets) {
+        plan.pp_pipeline_scratch_bytes = std::max(plan.pp_pipeline_scratch_bytes,
+                                                  unified_cache_get_planned_pp_pipeline_scratch_bytes(db.device_id));
+    }
 
     std::map<int, bool>   layer_has_attention;
     std::map<int, size_t> layer_weight_bytes;

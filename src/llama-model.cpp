@@ -8589,6 +8589,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
         std::vector<ggml_sycl_tensor_info> sycl_tensors;
         size_t                             total_size = 0;
+        size_t                             max_pp_pipeline_weight_bytes = 0;
 
         // Iterate over contexts to collect tensor inventory.
         // Include SYCL device and SYCL host buffer types (S1 puts weights on
@@ -8604,6 +8605,11 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 if (ggml_nbytes(t) > 0) {
                     sycl_tensors.push_back({ ggml_get_name(t), ggml_nbytes(t) });
                     total_size += ggml_nbytes(t);
+                    if (ggml_is_quantized(t->type)) {
+                        const size_t fp16_bytes =
+                            static_cast<size_t>(ggml_nelements(t)) * sizeof(ggml_fp16_t);
+                        max_pp_pipeline_weight_bytes = std::max(max_pp_pipeline_weight_bytes, fp16_bytes);
+                    }
                 }
             }
         }
@@ -8614,6 +8620,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             inventory.tensors       = sycl_tensors.data();
             inventory.count         = sycl_tensors.size();
             inventory.total_size    = total_size;
+            inventory.pp_pipeline_scratch_bytes = max_pp_pipeline_weight_bytes * 2;
             inventory.n_expert      = hparams.n_expert;
             inventory.n_expert_used = hparams.n_expert_used;
             inventory.n_layer       = hparams.n_layer;

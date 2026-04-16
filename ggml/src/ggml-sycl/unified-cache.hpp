@@ -228,6 +228,10 @@ struct placement_plan {
     // oneDNN scratchpad: workspace for matmul weight reorder (weights) + activation buffer.
     // Sized as max_tensor_bytes × 2. Must fit within the ONEDNN zone (default 256 MB).
     size_t onednn_scratchpad_bytes = 0;  // Zone: ONEDNN (device VRAM)
+    // PP pipeline scratch: double-buffered FP16 weight staging for prompt-processing
+    // dequant prefetch. Computed from the largest quantized weight tensor as
+    // 2 x (n_elements * sizeof(fp16)). Lives in the RUNTIME zone.
+    size_t pp_pipeline_scratch_bytes = 0;  // Zone: RUNTIME (device VRAM)
     // CPU quantization temp buffers: pre-allocated by T1 cpu_dispatch_buffers.
     size_t cpu_quant_buffer_bytes  = 0;  // Zone: HOST (system heap)
     // Graph metadata: layer classification vectors and MoE routing tables.
@@ -395,6 +399,9 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                                          multi_gpu_mode                                      mode,
                                          const placement_kv_info &                           kv_info,
                                          int                                                 n_experts = 0);
+
+void   unified_cache_set_planned_pp_pipeline_scratch_bytes(int device_id, size_t bytes);
+size_t unified_cache_get_planned_pp_pipeline_scratch_bytes(int device_id);
 
 // Parse GGML_SYCL_MULTI_GPU_MODE env var.
 // Returns HYBRID for MoE models, LAYER for dense-only, unless overridden.
@@ -1345,6 +1352,7 @@ class unified_cache {
     size_t zone_capacity(vram_zone_id zone) const;
     size_t zone_used(vram_zone_id zone) const;
     size_t zone_available(vram_zone_id zone) const;
+    size_t zone_largest_free(vram_zone_id zone) const;
 
     const vram_zone & get_zone(vram_zone_id zone) const { return arena_zones_[static_cast<int>(zone)]; }
 
@@ -1549,27 +1557,27 @@ class unified_cache {
     void deallocate(void * ptr, size_t size, alloc_lifetime lifetime);
 
     // === Compute Arena ===
-    // Pre-reserved VRAM bump allocator for compute scratch buffers.
+    // Pre-reserved VRAM region for compute scratch buffers.
     // Reserved BEFORE S1-PRELOAD so weights cannot consume all VRAM.
-    // arena_alloc() bump-allocates from the arena; arena_reset() resets the
-    // bump pointer between graph_compute calls so the VRAM is reused each token.
+    // When the VRAM arena is active, arena_alloc()/arena_free()/arena_reset()
+    // route through the SCRATCH TLSF zone. Outside arena mode, the legacy
+    // bump allocator is still used as a fallback.
     // pool_leg does NOT cache arena pointers — they are ephemeral per graph.
     //
     // arena_bytes: total VRAM to reserve for compute scratch.
     // Returns true if reservation succeeded.
     bool reserve_compute_arena(size_t arena_bytes);
 
-    // Try to sub-allocate from the compute arena (bump pointer, 256-byte aligned).
+    // Try to sub-allocate from the compute arena (256-byte aligned).
     // Returns nullptr if arena is not reserved or has insufficient space.
     void * arena_alloc(size_t size);
 
-    // Watermark reclaim: if ptr+size sits at the current arena top, rewind the
-    // bump pointer.  Handles cascading LIFO frees (e.g. multiple pool_alloc
-    // destructors firing in reverse order within a single graph op).
-    // Non-watermark frees are no-ops (space reclaimed at arena_reset).
+    // Release a compute-arena allocation.
+    // In VRAM arena mode, this returns the block to the SCRATCH TLSF zone.
+    // Outside arena mode, the legacy bump allocator only supports LIFO reclaim.
     void arena_free(void * ptr, size_t size);
 
-    // Reset the arena bump pointer to 0 (call between graph_compute invocations).
+    // Reset compute scratch state between graph_compute invocations.
     void arena_reset();
 
     // Check if a pointer belongs to the compute arena.
@@ -2276,6 +2284,16 @@ offload_stats_snapshot offload_stats_get();
 void                   offload_stats_log_summary(const char * tag, int device);
 void                   zero_alloc_check(const char * tag, int device);
 
+bool                   arena_pp_profile_enabled();
+bool                   arena_pp_profile_active();
+bool                   arena_pp_profile_begin(int device, bool is_prompt_phase);
+void                   arena_pp_profile_end(const char * tag, int device);
+void                   arena_pp_profile_note_onednn_reserve(size_t weights_size, size_t activations_size, bool reused,
+                                                            bool arena_attempted, bool arena_success,
+                                                            bool direct_attempted, bool ok, double elapsed_us);
+void                   arena_pp_profile_note_onednn_get(size_t weights_needed, size_t activations_needed, bool ok,
+                                                        double elapsed_us);
+
 class scoped_unified_alloc {
   public:
     scoped_unified_alloc() = default;
@@ -2606,14 +2624,14 @@ bool unified_cache_reserve_compute_arena(int device_id, size_t arena_bytes);
 [[deprecated("use unified_allocate() with prefer_vram_zone=SCRATCH instead")]]
 void * unified_cache_arena_alloc(int device_id, size_t size);
 
-// LIFO reclaim: if ptr was the last bump allocation, rewind the bump pointer.
+// Release a compute-arena allocation.
 void unified_cache_arena_free(int device_id, void * ptr, size_t size);
 
 // Sub-allocate from the weight zone (persistent, NOT reset between tokens).
 // Use for kernel infrastructure that persists for model lifetime.
 void * unified_cache_arena_alloc_weight(int device_id, size_t size);
 
-// Reset the arena bump pointer (call between graph_compute invocations).
+// Reset compute scratch state (call between graph_compute invocations).
 void unified_cache_arena_reset(int device_id);
 
 // Check if a pointer belongs to the compute arena.
