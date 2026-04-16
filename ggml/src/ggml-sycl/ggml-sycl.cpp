@@ -589,6 +589,50 @@ struct fp16_weight_cache {
 static fp16_weight_cache g_fp16_cache;
 
 // ============================================================================
+// PP split timing: GGML_SYCL_PP_SPLIT_TIMING=1 → per-op split of dequant vs
+// activations-cast vs oneDNN GEMM wall time on the oneDNN FP16 PP path.
+// Diagnostic only — queue-sync'd timing destroys any parallelism; read the
+// ratios, not the absolute numbers.
+// ============================================================================
+static bool pp_split_timing_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_PP_SPLIT_TIMING");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+struct pp_split_timing {
+    uint64_t n_ops         = 0;
+    double   us_dequant_w  = 0;  // weight dequant (Q4_0 → FP16)
+    double   us_cache_hit  = 0;  // FP16 cache hit ops (dequant skipped)
+    double   us_dequant_a  = 0;  // activation cast (FP32 → FP16)
+    double   us_gemm       = 0;  // oneDNN FP16 GEMM
+    uint64_t n_cache_hits  = 0;
+    uint64_t n_cache_miss  = 0;
+};
+
+static thread_local pp_split_timing g_pp_split_timing;
+
+static void pp_split_timing_dump_if_due(int period = 500) {
+    if (!pp_split_timing_enabled()) {
+        return;
+    }
+    auto & t = g_pp_split_timing;
+    if (t.n_ops == 0 || (t.n_ops % period) != 0) {
+        return;
+    }
+    const double total = t.us_dequant_w + t.us_cache_hit + t.us_dequant_a + t.us_gemm;
+    fprintf(stderr,
+            "[PP-SPLIT] n=%llu (hits=%llu miss=%llu) total=%.1f ms  weight_dequant=%.1f ms (%.1f%%)  "
+            "cache_hit_dequant=%.1f ms (%.1f%%)  act_cast=%.1f ms (%.1f%%)  gemm=%.1f ms (%.1f%%)\n",
+            (unsigned long long) t.n_ops, (unsigned long long) t.n_cache_hits, (unsigned long long) t.n_cache_miss,
+            total / 1000.0, t.us_dequant_w / 1000.0, 100.0 * t.us_dequant_w / total, t.us_cache_hit / 1000.0,
+            100.0 * t.us_cache_hit / total, t.us_dequant_a / 1000.0, 100.0 * t.us_dequant_a / total, t.us_gemm / 1000.0,
+            100.0 * t.us_gemm / total);
+}
+
+// ============================================================================
 // PP Pipeline: Double-buffered PCIe pipelining for oneDNN FP16 weight prefetch
 // ============================================================================
 // By default, overlaps the dequant (PCIe read + FP16 convert)
@@ -31010,6 +31054,13 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                                         bool               fp16_cache_hit   = false;
                                         bool               pp_pipeline_hit  = false;
 
+                                        // PP split timing: bracket the whole dequant-weights section
+                                        const bool split_timing = pp_split_timing_enabled();
+                                        auto       t_section0   = std::chrono::high_resolution_clock::now();
+                                        if (split_timing) {
+                                            ctx.stream()->wait();
+                                            t_section0 = std::chrono::high_resolution_clock::now();
+                                        }
                                         // PP Pipeline: check if prefetched dequant matches
                                         auto & pipe = g_pp_pipeline;
                                         if (pipe.enabled && pipe.prefetch_buf >= 0 && pipe.prefetch_src0 == src0_data &&
@@ -31086,16 +31137,47 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                                             fp16_weights_ptr = weights_scratch;
                                         }
 
+                                        // End of dequant-weights section
+                                        if (split_timing) {
+                                            ctx.stream()->wait();
+                                            const auto   t_section1 = std::chrono::high_resolution_clock::now();
+                                            const double us =
+                                                std::chrono::duration<double, std::micro>(t_section1 - t_section0)
+                                                    .count();
+                                            if (fp16_cache_hit || pp_pipeline_hit) {
+                                                g_pp_split_timing.us_cache_hit += us;
+                                                g_pp_split_timing.n_cache_hits++;
+                                            } else {
+                                                g_pp_split_timing.us_dequant_w += us;
+                                                g_pp_split_timing.n_cache_miss++;
+                                            }
+                                        }
                                         // Convert activations (F32) to FP16
                                         const to_fp16_sycl_t f32_to_fp16 = ggml_get_to_fp16_sycl(GGML_TYPE_F32, dst);
                                         if (f32_to_fp16) {
+                                            auto t_act0 = std::chrono::high_resolution_clock::now();
+                                            if (split_timing) {
+                                                ctx.stream()->wait();
+                                                t_act0 = std::chrono::high_resolution_clock::now();
+                                            }
                                             f32_to_fp16(src1_data, activations_scratch, src1_elems, ctx.stream());
+                                            if (split_timing) {
+                                                ctx.stream()->wait();
+                                                const auto   t_act1 = std::chrono::high_resolution_clock::now();
+                                                g_pp_split_timing.us_dequant_a +=
+                                                    std::chrono::duration<double, std::micro>(t_act1 - t_act0).count();
+                                            }
 
                                             // OneDNN FP16 GEMM: C[M,N] = A[M,K] * B[K,N]^T
                                             // A = src1 (activations) [M, K]
                                             // B = src0 (weights) [N, K] - needs transpose
                                             // C = dst [M, N]
                                             // Use row_gemm which handles the transpose correctly
+                                            auto t_gemm0 = std::chrono::high_resolution_clock::now();
+                                            if (split_timing) {
+                                                ctx.stream()->wait();
+                                                t_gemm0 = std::chrono::high_resolution_clock::now();
+                                            }
                                             try {
                                                 DnnlGemmWrapper::row_gemm(
                                                     ctx,
@@ -31113,6 +31195,14 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                                                     "[SYCL] oneDNN PP failed, falling back to unified kernel: %s\n",
                                                     e.what());
                                                 used_onednn_fp16 = false;
+                                            }
+                                            if (split_timing) {
+                                                ctx.stream()->wait();
+                                                const auto   t_gemm1 = std::chrono::high_resolution_clock::now();
+                                                g_pp_split_timing.us_gemm +=
+                                                    std::chrono::duration<double, std::micro>(t_gemm1 - t_gemm0).count();
+                                                g_pp_split_timing.n_ops++;
+                                                pp_split_timing_dump_if_due();
                                             }
                                             GGML_SYCL_DEBUG(
                                                 "[UNIFIED] OneDNN FP16: M=%lld K=%lld N=%lld type=%d "
