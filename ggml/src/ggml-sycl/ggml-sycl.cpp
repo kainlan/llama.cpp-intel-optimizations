@@ -35550,12 +35550,12 @@ cpu_fallback_fast:
             GGML_SYCL_DEBUG("[MoE] GPU-side MMVQ (AoS) dispatch successful for type %d\n", src0->type);
             return;
         }
+        GGML_SYCL_DEBUG("[MoE] All MMVQ layouts failed, falling back to host routing\n");
     }  // end if (!early_cpu_expert_tg && !skip_gpu_moe_fast_paths)
     if (skip_gpu_moe_fast_paths) {
         GGML_SYCL_DEBUG("[MoE] Skipping GPU MMVQ/XMX fast paths for host-resident batched experts: %s\n",
                         src0->name ? src0->name : "?");
     }
-    GGML_SYCL_DEBUG("[MoE] All MMVQ layouts failed, falling back to host routing\n");
     if (g_moe_pp_profile_enabled) {
         g_moe_profile.moe_dispatch_path(0, 0, 0, 1);
     }
