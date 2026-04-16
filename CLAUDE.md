@@ -227,7 +227,7 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench ...
 **Experimental (opt-in, off by default)**:
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `GGML_SYCL_PP_PIPELINE=1` | OFF | Enable double-buffered FP16 weight dequant prefetch. **CURRENTLY BROKEN** — produces garbage tokens (e.g. `###...` for the `1, 2, 3, 4, 5,` canonical prompt). Tracked in beads; do not enable for correctness-sensitive runs. |
+| `GGML_SYCL_PP_PIPELINE=1` | OFF | Enable double-buffered FP16 weight dequant prefetch. Correct after the layout-mismatch fix, but provides no measured throughput gain on Arc B580 (dequant + GEMM compete for the same compute engine — overlap doesn't materialize). Left opt-in for future overlap research. |
 
 **Kernel dispatch tuning**:
 | Variable | Effect |

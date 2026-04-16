@@ -608,11 +608,18 @@ struct pp_pipeline_entry {
     int64_t        n_elems      = 0;        // N * K elements to dequant
     size_t         weight_bytes = 0;        // n_elems * sizeof(half)
     layout_mode    layout       = GGML_LAYOUT_AOS;
+    // oneDNN-GEMM expects row-major FP16. For COALESCED Q4_0, the generic
+    // to_fp16 dispatch emits tile-interleaved output — wrong layout for GEMM.
+    // When these dims are set, use dequantize_row_q4_0_coalesced_to_fp16_rowmajor
+    // instead to match the consumption-site selection in the oneDNN PP branch.
+    bool           use_coalesced_rowmajor = false;
+    int            blocks_per_row         = 0;  // K / QK4_0
+    int            nrows                  = 0;  // N
 };
 
 struct pp_pipeline_state {
     bool                           enabled = false;
-    std::unique_ptr<sycl::queue>   dma_queue;  // In-order queue for async dequant (OOQ cross-queue deps broken on L0)
+    std::unique_ptr<sycl::queue>   dma_queue;  // In-order queue for async dequant (same context/device as ctx.stream())
     void *                         scratch_buf[2]   = { nullptr, nullptr };  // Double-buffered weights
     ggml_sycl::alloc_handle        scratch_alloc[2] = {};                    // Owning handles (mubmt.12)
     size_t                         scratch_size[2]  = { 0, 0 };
@@ -651,18 +658,21 @@ struct pp_pipeline_state {
 };
 
 static bool pp_pipeline_env_enabled() {
-    // Default OFF pending correctness fix: PP pipeline path currently produces
-    // wrong tokens (e.g. the canonical "1, 2, 3, 4, 5," prompt emits "###..."
-    // instead of "6, 7, 8, 9, 10"). Throughput went up but output was garbage.
-    // Opt in with GGML_SYCL_PP_PIPELINE=1 only for PP-throughput experiments.
+    // Default OFF: pipeline is correct but provides no measured throughput
+    // gain on Arc B580 — the dequant and GEMM compete for the same compute
+    // engine, so the theoretical dequant-vs-GEMM overlap doesn't materialize.
+    // Earlier "+19.6% PP" result was fake: the pre-scan picked the generic
+    // to_fp16 dispatch for COALESCED Q4_0 (tile-interleaved output) while the
+    // GEMM consumer expects row-major FP16. The wrong-layout dequant kernel
+    // is cheaper, so throughput went up while output became garbage. That
+    // selection is now synchronized with the consumption site, so output is
+    // correct — but no free lunch. Left opt-in for future overlap research.
     static int val = -1;
     if (val < 0) {
         const char * env = std::getenv("GGML_SYCL_PP_PIPELINE");
         val              = (env && std::atoi(env) != 0) ? 1 : 0;
         if (val) {
-            GGML_LOG_WARN(
-                "[SYCL] PP pipeline: double-buffered dequant prefetch ENABLED "
-                "(opt-in, KNOWN CORRECTNESS BUG — see llama.cpp beads tracker)\n");
+            GGML_LOG_INFO("[SYCL] PP pipeline: double-buffered dequant prefetch ENABLED (opt-in)\n");
         }
     }
     return val != 0;
@@ -685,11 +695,18 @@ static bool pp_pipeline_submit_prefetch(pp_pipeline_state & pipe, int buf_idx) {
     if (entry.weight_bytes > pipe.scratch_size[buf_idx]) {
         return false;
     }
-    // Submit dequant kernel on the in-order DMA queue
+    // Submit dequant kernel on the in-order DMA queue. For COALESCED Q4_0,
+    // the oneDNN GEMM path requires row-major FP16 (not the tile-interleaved
+    // default from the generic to_fp16 dispatch). This selection must mirror
+    // the consumption-site logic in the oneDNN PP branch exactly, or the
+    // GEMM reads data in the wrong layout and produces garbage.
     sycl::half * dst = static_cast<sycl::half *>(pipe.scratch_buf[buf_idx]);
-    entry.dequant_fn(entry.src0_data, dst, entry.n_elems, pipe.dma_queue.get());
-    // Completion tracked via dma_queue->wait() at consumption time
-    // (ext_oneapi_submit_barrier can corrupt L0 event state — avoid it)
+    if (entry.use_coalesced_rowmajor) {
+        dequantize_row_q4_0_coalesced_to_fp16_rowmajor(entry.src0_data, dst, entry.blocks_per_row, entry.nrows,
+                                                       pipe.dma_queue.get());
+    } else {
+        entry.dequant_fn(entry.src0_data, dst, entry.n_elems, pipe.dma_queue.get());
+    }
     pipe.prefetch_buf   = buf_idx;
     pipe.prefetch_src0  = entry.src0_data;
     pipe.prefetch_elems = entry.n_elems;
@@ -30997,7 +31014,11 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                                         auto & pipe = g_pp_pipeline;
                                         if (pipe.enabled && pipe.prefetch_buf >= 0 && pipe.prefetch_src0 == src0_data &&
                                             pipe.prefetch_elems == (int64_t) src0_elems) {
-                                            // Wait for prefetch dequant to complete on DMA queue
+                                            // Wait for prefetch dequant to complete. Host-side wait is
+                                            // sufficient: the scratch buffer is on the same context and
+                                            // device as ctx.stream(), and L0 flushes the dequant writes
+                                            // to memory before wait() returns, so the subsequent GEMM
+                                            // submission sees the committed data.
                                             pipe.dma_queue->wait();
                                             fp16_weights_ptr =
                                                 static_cast<const sycl::half *>(pipe.scratch_buf[pipe.prefetch_buf]);
@@ -40902,6 +40923,15 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             entry.n_elems      = n_elems;
             entry.weight_bytes = wt_bytes;
             entry.layout       = resolved.layout;
+            // oneDNN GEMM consumes row-major FP16 weights. For COALESCED Q4_0
+            // the generic to_fp16 dispatch emits tile-interleaved data — mirror
+            // the consumption-site special case so the scratch buffer matches
+            // what the GEMM expects.
+            if (resolved.layout == GGML_LAYOUT_COALESCED && src0->type == GGML_TYPE_Q4_0) {
+                entry.use_coalesced_rowmajor = true;
+                entry.blocks_per_row         = static_cast<int>(K / QK4_0);
+                entry.nrows                  = static_cast<int>(N);
+            }
             pipe.schedule.push_back(entry);
         }
 
