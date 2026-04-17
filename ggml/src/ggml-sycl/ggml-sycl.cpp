@@ -49890,6 +49890,24 @@ normal_dispatch:
     record_completion(graph_executed);
     if (phase_timing) { fprintf(stderr, "[PHASE] record_completion: %.3f ms\n", phase_ms()); }
     ggml_sycl_watchdog_heartbeat();
+
+    // (W1) Drain the SYCL queue before returning control to the ggml backend
+    // scheduler. The scheduler's split-input sync (ggml-backend.cpp:1750-1763)
+    // only synchronizes the CONSUMER backend — it relies on the implicit
+    // contract that once graph_compute returns, the producer's outputs are
+    // visible to any subsequent reader. For async SYCL queues (both in-order
+    // and out-of-order) this contract was violated: record_completion skips
+    // the barrier submit on in-order queues, and graph_compute returned
+    // GGML_STATUS_SUCCESS while kernels were still in flight. When a CPU
+    // split consumed a tensor produced by a prior SYCL split (MoE topk ids
+    // into CPU ADD_ID, tracked at llama.cpp-4oi3i), the CPU saw partially
+    // written data via the shared SYCL_Host buffer.
+    try {
+        sycl_ctx->stream()->wait();
+    } catch (const sycl::exception & exc) {
+        GGML_LOG_ERROR("[SYCL] graph_compute exit wait failed: %s\n", exc.what());
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 
