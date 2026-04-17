@@ -1,0 +1,66 @@
+# MXFP4 Coverage Audit — SYCL CPU Dispatch
+
+**Date:** 2026-04-17 · **Track B Task 3** (`llama.cpp-rrmz6`) · **Scope:** `ggml/src/ggml-sycl/`
+Part of the MXFP4 compute-parity epic per `docs/plans/2026-04-17-mxfp4-compute-parity.md`.
+
+## 1. CPU touchpoints in `cpu-dispatch.cpp`
+
+| Line | Purpose | MoE/dense | Status |
+|------|---------|-----------|--------|
+| 521  | PP staging row dispatch: VNNI 16/8/4-row MXFP4 kernels (`simd_mxfp4_q8_0_{16,8,4}row`) + AVX2 4-row fallback (`simd_mul_mat_mxfp4_q8_0_4row`) | both (weight-type dispatched) | OK — CPU fast-path |
+| 880-977 | MoE multi-activation GEMM: `expert_groups` grouped by `weight_host` pointer; tiled via `simd_mxfp4_1row_4act_tile` (AVX2 TILE_BLK=16); remainder via `vec_dot` (946, 961) | MoE only | OK — shared-weight optimization |
+| 1134-1200 | MoE chunked single-expert path: `simd_mxfp4_q8_0_{16,8,4}row` with bias add; AVX2 `simd_mul_mat_mxfp4_q8_0_4row` fallback (remainder via vec_dot) | MoE only | OK — per-expert row tiling |
+| 2880-3510 | SIMD kernel implementations: `simd_mul_mat_mxfp4_q8_0_4row`, `simd_mxfp4_q8_0_{8,16}row`, `simd_mxfp4_q8_0_4row_tile`, `simd_mxfp4_1row_4act_tile`, `simd_mxfp4_q8_0_4row_vnni`, `simd_mxfp4_q8_0_4row_tile_vnni` | neutral (kernels) | OK — `block_mxfp4` typedefs, `nb = K/QK_MXFP4` |
+| 3770-3899 | `cpu_mul_mat` generic entrypoint — MXFP4 reaches `use_vec_dot` (M<=4) path via `ggml_get_type_traits_cpu(MXFP4)->vec_dot`; for M>4, oneDNN GEMM after dequant to F32 via `type_traits->to_float` (5963 fallback) | dense (MoE goes via `ggml_sycl_cpu_expert_mul_mat*`) | OK — both TG and PP flows handled |
+| 4750-4756 | `cpu_tensor_is_moe_routing_chain` — matches `ffn_gate_inp`, `ffn_moe_{logits,probs,topk,weights}`; forces synchronous CPU dispatch in MoE routing chain when planner-authoritative | MoE only | Neutral — doesn't gate MXFP4 specifically |
+| 5963 | `ggml_sycl_cpu_pp_gemm` weight-type PP dispatch: VNNI 16/8/4-row or AVX2 4-row fallback | dense PP | OK — mirrors line-521 path |
+| 6076-6111 | `ggml_sycl_compute_forward_cpu` op switch — dispatches to `cpu_mul_mat`, `cpu_rms_norm`, `cpu_add`, `cpu_mul`, `cpu_unary`, `cpu_glu`, `cpu_argsort`, `cpu_top_k`, `cpu_get_rows`, `cpu_soft_max`, `cpu_norm`, `cpu_scale`, `cpu_cpy`, `cpu_rope`. No MXFP4-specific branches needed — NORM/SILU/CPY/ROPE/ADD/MUL operate on F32/F16 activations | both | OK — MXFP4 only affects MUL_MAT weight reads |
+
+**Block-size correctness:** CPU kernels use `QK_MXFP4` (= 32 elements) consistently via `nb = K/QK_MXFP4` and `block_mxfp4 *` typedefs (2880, 2948, 3008, 3066, 3171, 3259). No hardcoded 18-byte Q4_0 or 34-byte Q4_K byte counts. `ggml_row_size(type, K)` is used everywhere for stride computation (898, 998, 3853, 5910, 6050). Activation staging operates on F32 byte counts only — MXFP4 block size does not leak into staging.
+
+## 2. Dispatch gates in `ggml-sycl.cpp`
+
+| Gate | Line | Condition | MXFP4 effect | Wedge-risk? |
+|------|------|-----------|--------------|-------------|
+| MXFP4-direct unified-kernel route | **30029** | `src0->type == MXFP4 && !src0_planned_host && (src0_on_device \|\| src0_data_gpu_accessible) && should_use_unified(...)` | Routes to unified GPU kernel for any MXFP4 MUL_MAT whose data pointer is USM-device OR USM-host (pinned) | **YES — primary wedge trigger.** `src0_data_gpu_accessible` accepts `usm::alloc::host` (line 30027-30028), so an mmap'd-then-pinned MXFP4 expert not in the placement plan (`planned_residency::UNKNOWN`) returns `!src0_planned_host=true` and routes to GPU. With 12 GB model + 12 GB VRAM under `VRAM_BUDGET_PCT=30`, this submits a kernel against a host pointer the GuC cannot satisfy. |
+| CPU host-mat TG route | 30241-30293 | `!cpu_host_mat_disabled && !src0_on_device && (!all_weights_host \|\| src0_planned_host) && batch==1 && ggml_is_quantized(src0->type)` | For TG, copies weights via host `vec_dot` — MXFP4 reaches this if and only if the 30029 gate declined first | MITIGATION — but unreachable when 30029 fires first |
+| CPU PP batched GEMM | 30303-30396 | `cpu_pp_enabled && M_pp >= CPU_PP_MIN_BATCH && is_host_resident_weight && to_float` | PP-mode host compute path; correctly uses `ggml_sycl_cpu_pp_gemm` for MXFP4 | OK — but opt-in (`GGML_SYCL_CPU_PP=1`), so disabled by default; MXFP4 falls through to `cpu_mul_mat` PP path via `should_dispatch_to_cpu` |
+| TG fast-path guard | 30411-30418 | `!tg_fast_disabled && src0_gpu_accessible && batch==1 && is_quantized && !tp_enabled` | `src0_gpu_accessible = src0_on_device \|\| (!planner_active && all_weights_host && !src0_planned_host)` — planner-authoritative mode correctly gates host weights out | OK under planner; escape hatch in legacy S1 bypasses (see sub-gate below) |
+| `mmvq_moe_batched_dispatch` `force_cache_aos` | **mmvq.cpp:3856** | `host_weights ? force_cache_aos=true` in `ggml_sycl_update_moe_ptr_table` | If host_weights, forces per-expert STAGING into device memory via unified cache | **YES — secondary wedge trigger.** Under VRAM pressure (budget=30), the staging allocation either fails or evicts something; `ggml_sycl_xmx_moe` has the same gate at 32330-32332. If this path proceeds on partially-staged weights, the kernel can dispatch against pointers that are still host (stale `moe_expert_ptrs_device[]`). This is the `llama.cpp-azll` "gpu0=1 instead of gpu0=4" scenario — staged-but-not-registered. |
+| XMX MoE host-weight path | 32251-32334 | `host_weights && !unified_cache_enabled()` → fallback; otherwise `force_cache_aos=host_weights` and `skip_cpu_routed_experts=host_weights` | Host MXFP4 experts get staged; planner-routed host experts skipped | Partial — relies on staging succeeding; no fallback-to-CPU when staging exhausts budget |
+| XMX MoE expert-ptr non-device check | 32385-32389 | `src0_layout_alloc != usm::alloc::device` → return false (MMVQ fallback) | Present for the non-ptr-table path; ptr-table path at 32365-32378 flags `ptr_table_all_device=false` but does NOT abort — it still returns true and proceeds | **YES — tertiary wedge trigger.** If any expert pointer is non-device (host fallback slot), `ptr_table_all_device` is set false but XMX still submits; the kernel reads a host USM pointer from within a persistent threadgroup, which manifests the `guc_id=6` scheduler hang. |
+| Fused MoE ESIMD | 37539-37576 | `!use_expert_cache && src0_layout_aos && ne12 <= FUSED_MOE_MAX_BATCH && type==MXFP4` | OK — bails when `use_expert_cache` (host-resident) is true | OK — correctly skips host path |
+| `supports_op` MXFP4 MoE n==1 carve-out | 50163 | `a_type==MXFP4 && b->ne[1]>1 && b->ne[2]<=1` → false | Test-only: reports MXFP4 MoE unsupported for test-backend-ops shape | OK — inference always has ne11==1 |
+| `should_dispatch_to_cpu` (core gate) | 38199-38331 | Uses placement plan `layer_device`, `resolve_allocation`, and `is_host_resident_weight` fallback (38279); batch-threshold cost model (38320-38326) | Correctly routes host-resident MXFP4 layers to CPU when `layer_id` found and classified. BUT: relies on a valid layer_id extracted from `src0->name` via `extract_layer_id` (38252). If MXFP4 weight is per-expert slice tensor from `mul_mat_id`, the name may not match `blk.N.*` pattern and the function returns false → falls through to GPU dispatch → hits 30029 wedge gate. | **YES — quaternary wedge trigger.** Per-expert MoE slice tensors may not get a layer_id, so the gate short-circuits at line 38253-38255 returning `false`, allowing GPU dispatch for host-resident experts. |
+
+## 3. Identified gaps (inputs for Task 4)
+
+1. **Gate 30029 does not exclude `usm::alloc::host` pointers when `!src0_planned_host`.** The predicate treats host-pinned USM as equivalent to device memory for MXFP4 routing. For planner-UNKNOWN residency (mmap'd experts not in the plan), this allows a GPU kernel submission against a host pointer that is only *readable* via PCIe zero-copy — the unified XMX kernel's persistent-threadgroup access pattern can exceed PCIe latency budgets and wedges the GuC. **Fix:** tighten to `src0_on_device` only when `!src0_planned_host`, or explicitly check `src0_data_alloc == usm::alloc::device`.
+
+2. **`force_cache_aos=host_weights` under VRAM pressure has no pressure check** (mmvq.cpp:3856, ggml-sycl.cpp:32331). When `VRAM_BUDGET_PCT=30` leaves no headroom for expert staging, `ggml_sycl_update_moe_ptr_table` may produce a mixed device/host pointer table (caught at 3866-3881 for mmvq.cpp, but NOT caught in the XMX MoE path at 32365-32378 — the loop only sets a flag without bailing). **Fix:** XMX MoE must bail (return false to fall back to MMVQ or CPU) when `ptr_table_all_device=false`, OR the MMVQ path's early-bail at 3796-3799 (`placement_plan_active && use_ptr_table`) should extend to cover `!planner_active && host_weights && mixed_ptrs`.
+
+3. **`should_dispatch_to_cpu` short-circuits on unparseable names** (38253-38255). Per-expert MoE slice tensors from `mul_mat_id` may not match the `blk.N.*` layer ID extraction. **Fix:** add a weight-buffer fallback — when `layer_id < 0` but `is_host_resident_weight(src0, ctx.stream())` returns true, return true and let `cpu_mul_mat` handle it. This is the general "host-resident MXFP4 → CPU" safety net.
+
+4. **No CPU-path fallback in `ggml_sycl_xmx_moe` when expert staging fails.** The failure modes (32334, 32355, 32388) all return false, which cascades back to MMVQ. But MMVQ's `force_cache_aos` is the same staging path — double-failure leaves GPU dispatch with a broken ptr table. **Fix:** if staging fails in XMX MoE for MXFP4 with host weights and `cpu_offload_available()`, route the MUL_MAT_ID through `ggml_sycl_cpu_expert_mul_mat_batched` (already exists in `cpu-dispatch.cpp`).
+
+## 4. Cross-references with existing tasks
+
+- **`llama.cpp-90e2`** — "Enable CPU expert dispatch in multi-GPU mode — gate conditions blocking MXFP4 CPU path". **Overlaps Gap 3 and Gap 4.** T4's fix to `should_dispatch_to_cpu` + CPU fallback in XMX MoE is a strict subset of 90e2's scope. Recommend: T4 lands the minimal-viable gate fix; 90e2 stays open for the broader multi-GPU expert dispatch design.
+- **`llama.cpp-azll`** — "Fix expert residency detection — prestage COALESCED not SOA for MXFP4". **Overlaps Gap 2** (layout-mismatch between prestage and `is_expert_resident` lookup). azll is the correctness fix for when staging DOES proceed; our Gap 2 addresses what happens when staging FAILS. Complementary, not duplicated.
+- **`llama.cpp-217r`** — "MXFP4 GPU MMVQ kernel for single-expert TG dispatch". **Out of scope for T4.** This task adds a NEW GPU path; T4 removes paths that incorrectly select the current GPU path for host weights.
+- **`llama.cpp-792vn`** — EPIC (closed). Historical context: zero-alloc planner-driven inference. The planner-authoritative gate (`planner_active`) is in place; the gap is that MXFP4 mmap'd experts default to `UNKNOWN` residency (not HOST), bypassing the planner's CPU-dispatch rules.
+
+## 5. Wedge root-cause hypothesis (for Task 5)
+
+**Primary hypothesis:** Gate 30029 (`MXFP4-direct`) routes an mmap'd MXFP4 expert with `usm::alloc::host` data pointer to the unified XMX kernel. The kernel launches a persistent threadgroup that reads via PCIe zero-copy; under GPT-OSS 20B's 32-expert-per-layer dispatch volume, the GuC scheduler watchdog fires because kernel execution exceeds the per-submission time budget (host memory reads are ~10x slower than VRAM). The `guc_id=6` hang and kworker blockage are symptoms of the GuC declaring the kernel unresponsive.
+
+**Secondary hypothesis:** Even if Gate 30029 is tightened, `ggml_sycl_xmx_moe` at line 32331 (`force_cache_aos=host_weights=true`) will still try to stage host MXFP4 experts into VRAM. Under budget=30, staging fails midway, leaving `moe_expert_ptrs_device[]` with a mix of device and host entries. The loop at 32367-32378 DETECTS this (`ptr_table_all_device=false`) but does not abort — it proceeds with kernel dispatch using the mixed table, same GuC-hang outcome.
+
+**Confidence:** High that one or both of these is the 20B wedge. T4's gate fixes address both paths. T5 should verify by:
+1. Running GPT-OSS 20B with `VRAM_BUDGET_PCT=30` and `timeout 60` *before* T4 → expect wedge.
+2. After T4 → expect either clean CPU dispatch (Gap 3 fix routes host MXFP4 to `cpu_mul_mat`) or clean MMVQ/CPU fallback (Gap 4 fix bails XMX MoE on mixed ptr table).
+3. If wedge persists, add targeted trace at both 30029 and 32375 to identify which path is still firing.
+
+---
+
+**Summary:** 4 gaps, 4 wedge-risk gates, primary trigger at `ggml-sycl.cpp:30029`. T4 should make minimal gate changes at these 4 sites; T5 will validate + mop up any residual. No changes in `cpu-dispatch.cpp` itself are needed — the CPU path is complete for MXFP4 at dense, MoE-multi-act, and MoE-chunked flows, and `ggml_sycl_compute_forward_cpu` dispatches all other ops via type-generic handlers.
