@@ -3712,8 +3712,161 @@ static void xmx_detail_dump_if_due(int period = 500) {
 }
 
 // =============================================================================
+// Phase B tile override (XMX-RESIZE [llama.cpp-gnfqa])
+// =============================================================================
+// Env-gated override of the unified XMX kernel's per-WG tile. All three of
+// GGML_SYCL_XMX_TILE_M / _TILE_N / _TILE_K must be set together. Constraints:
+//   TILE_M % XMX_TILE_M == 0, TILE_N % XMX_TILE_N == 0, TILE_K % XMX_TILE_K == 0
+//   (TILE_M / XMX_TILE_M) * (TILE_N / XMX_TILE_N) in {1, 4, 8, 16, 32}
+// The (1,4,8,16,32) gate matches the set of specialized template instantiations
+// the dispatcher below actually emits. Invalid triples fall back to baseline
+// with a one-time stderr warning so bad env vars don't silently regress perf.
+// Default (unset): baseline 8x16x32. Production default is unchanged.
+
+struct xmx_tile_override {
+    int  tile_m;
+    int  tile_n;
+    int  tile_k;
+    bool valid;  // false -> fall back to baseline
+};
+
+static xmx_tile_override get_xmx_tile_override() {
+    static const xmx_tile_override cached = []() {
+        xmx_tile_override o{ 8, 16, 32, false };
+        const char *      em = std::getenv("GGML_SYCL_XMX_TILE_M");
+        const char *      en = std::getenv("GGML_SYCL_XMX_TILE_N");
+        const char *      ek = std::getenv("GGML_SYCL_XMX_TILE_K");
+        if (!em || !en || !ek) {
+            return o;
+        }
+        const int tm = std::atoi(em);
+        const int tn = std::atoi(en);
+        const int tk = std::atoi(ek);
+        if (tm <= 0 || tn <= 0 || tk <= 0 || (tm % XMX_TILE_M) != 0 || (tn % XMX_TILE_N) != 0 ||
+            (tk % XMX_TILE_K) != 0) {
+            fprintf(stderr,
+                    "[XMX-RESIZE] GGML_SYCL_XMX_TILE_{M,N,K}=(%d,%d,%d) invalid "
+                    "(need positive multiples of (%d,%d,%d)); using baseline 8x16x32\n",
+                    tm, tn, tk, XMX_TILE_M, XMX_TILE_N, XMX_TILE_K);
+            return o;
+        }
+        const int num_output_tiles = (tm / XMX_TILE_M) * (tn / XMX_TILE_N);
+        if (num_output_tiles != 1 && num_output_tiles != 4 && num_output_tiles != 8 && num_output_tiles != 16 &&
+            num_output_tiles != 32) {
+            fprintf(stderr,
+                    "[XMX-RESIZE] GGML_SYCL_XMX_TILE_{M,N,K}=(%d,%d,%d) yields %d sub-tiles "
+                    "(supported: 1/4/8/16/32); using baseline 8x16x32\n",
+                    tm, tn, tk, num_output_tiles);
+            return o;
+        }
+        o.tile_m                = tm;
+        o.tile_n                = tn;
+        o.tile_k                = tk;
+        o.valid                 = true;
+        static bool logged_once = false;
+        if (!logged_once) {
+            logged_once = true;
+            fprintf(stderr, "[XMX-RESIZE] tile override active: %dx%dx%d (%d sub-tiles, WG=%d)\n", tm, tn, tk,
+                    num_output_tiles, num_output_tiles * XMX_SUBGROUP_SIZE);
+            fflush(stderr);
+        }
+        return o;
+    }();
+    return cached;
+}
+
+// =============================================================================
 // Kernel Launcher
 // =============================================================================
+
+// XMX kernel dispatch helper for Phase B tile experiments.
+// Templated on (TM, TN, TK) — emits both production-path submit and the
+// GGML_SYCL_XMX_DETAIL 3-kernel timing sequence using this tile size, so
+// instrumentation and production dispatch share a single tile-selection site.
+// Each instantiation forcibly instantiates the xmx_kernel_impl /
+// xmx_slm_only_kernel_impl templates for (TM, TN, TK) and gives unique
+// mangled kernel class names via the template class tags.
+#if GGML_SYCL_XMX_JOINT_MATRIX_AVAILABLE
+template <int TM, int TN, int TK> static void dispatch_xmx_kernel(sycl::queue & q, const UnifiedKernelArgs & args) {
+    constexpr int num_output_tiles = (TM / XMX_TILE_M) * (TN / XMX_TILE_N);
+    constexpr int xmx_wg_m         = 1;
+    constexpr int xmx_wg_n         = num_output_tiles * XMX_SUBGROUP_SIZE;
+
+    const int xmx_grid_m = (static_cast<int>(args.M) + TM - 1) / TM;
+    const int xmx_grid_n = (static_cast<int>(args.N) + TN - 1) / TN;
+
+    sycl::nd_range<2> xmx_range(sycl::range<2>(xmx_grid_m * xmx_wg_m, xmx_grid_n * xmx_wg_n),
+                                sycl::range<2>(xmx_wg_m, xmx_wg_n));
+
+    if (xmx_detail_enabled()) {
+        static bool logged_once = false;
+        if (!logged_once) {
+            logged_once = true;
+            fprintf(stderr,
+                    "[XMX-DETAIL] instrumentation active: M=%lld N=%lld K=%lld grid=(%d,%d) tile=(%d,%d,%d) WG=%d\n",
+                    static_cast<long long>(args.M), static_cast<long long>(args.N), static_cast<long long>(args.K),
+                    xmx_grid_m, xmx_grid_n, TM, TN, TK, xmx_wg_n);
+            fflush(stderr);
+        }
+        auto wait_and_clock = [&]() {
+            q.wait();
+            return std::chrono::high_resolution_clock::now();
+        };
+
+        // 1. Real kernel
+        auto t0 = wait_and_clock();
+        q.submit([&](sycl::handler & cgh) {
+            sycl::local_accessor<sycl::half, 1> slm_w(TN * TK, cgh);
+            sycl::local_accessor<sycl::half, 1> slm_a(TM * TK, cgh);
+            sycl::local_accessor<float, 1>      slm_acc_out(XMX_TILE_M * XMX_TILE_N, cgh);
+            cgh.parallel_for<unified_matmul_xmx_kernel_detail_name<TM, TN, TK>>(
+                xmx_range, [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(XMX_SUBGROUP_SIZE)]] {
+                    unified_matmul_xmx_kernel_impl<TM, TN, TK>(item, args, slm_w, slm_a, slm_acc_out);
+                });
+        });
+        auto t1 = wait_and_clock();
+
+        // 2. Empty kernel (launch+barrier baseline)
+        q.submit([&](sycl::handler & cgh) {
+            cgh.parallel_for<unified_matmul_xmx_empty_kernel_name<TM, TN, TK>>(
+                xmx_range,
+                [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(XMX_SUBGROUP_SIZE)]] { (void) item; });
+        });
+        auto t2 = wait_and_clock();
+
+        // 3. SLM-load-only kernel (same dequant + SLM stores, no XMX compute)
+        q.submit([&](sycl::handler & cgh) {
+            sycl::local_accessor<sycl::half, 1> slm_w(TN * TK, cgh);
+            sycl::local_accessor<sycl::half, 1> slm_a(TM * TK, cgh);
+            cgh.parallel_for<unified_matmul_xmx_slm_only_kernel_name<TM, TN, TK>>(
+                xmx_range, [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(XMX_SUBGROUP_SIZE)]] {
+                    unified_matmul_xmx_slm_only_kernel_impl<TM, TN, TK>(item, args, slm_w, slm_a);
+                });
+        });
+        auto t3 = wait_and_clock();
+
+        auto & s = g_xmx_detail_stats;
+        s.n_ops++;
+        s.us_total += std::chrono::duration<double, std::micro>(t1 - t0).count();
+        s.us_launch += std::chrono::duration<double, std::micro>(t2 - t1).count();
+        s.us_slm_total += std::chrono::duration<double, std::micro>(t3 - t2).count();
+        s.sum_wg += static_cast<uint64_t>(xmx_grid_m) * static_cast<uint64_t>(xmx_grid_n);
+        xmx_detail_dump_if_due();
+        return;
+    }
+
+    // Production path
+    q.submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<sycl::half, 1> slm_w(TN * TK, cgh);
+        sycl::local_accessor<sycl::half, 1> slm_a(TM * TK, cgh);
+        sycl::local_accessor<float, 1>      slm_acc_out(XMX_TILE_M * XMX_TILE_N, cgh);
+        cgh.parallel_for<unified_matmul_xmx_kernel_name<TM, TN, TK>>(
+            xmx_range, [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(XMX_SUBGROUP_SIZE)]] {
+                unified_matmul_xmx_kernel_impl<TM, TN, TK>(item, args, slm_w, slm_a, slm_acc_out);
+            });
+    });
+}
+#endif  // GGML_SYCL_XMX_JOINT_MATRIX_AVAILABLE
 
 void launch_unified_matmul(sycl::queue & q, const UnifiedKernelArgs & args_in) {
     // Make a mutable copy of args to set prefetch_depth from host configuration
@@ -3815,103 +3968,55 @@ void launch_unified_matmul(sycl::queue & q, const UnifiedKernelArgs & args_in) {
     // Set GGML_SYCL_SKIP_JM=1 to skip joint_matrix and use cooperative ESIMD instead
     static const bool skip_joint_matrix = (std::getenv("GGML_SYCL_SKIP_JM") != nullptr);
     if (use_xmx_path && selected_path != KernelPath::ESIMD_LARGE_TILE && !skip_joint_matrix) {
-        // XMX path uses fixed tile sizes aligned to XMX dimensions
-        constexpr int XMX_TM = 8;   // Must be multiple of XMX_TILE_M=8
-        constexpr int XMX_TN = 16;  // Must be multiple of XMX_TILE_N=16
-        constexpr int XMX_TK = 32;  // Must be multiple of XMX_TILE_K=16
-
-        const int xmx_grid_m = (static_cast<int>(args.M) + XMX_TM - 1) / XMX_TM;
-        const int xmx_grid_n = (static_cast<int>(args.N) + XMX_TN - 1) / XMX_TN;
         if (ggml_sycl_unified_debug_enabled()) {
-            fprintf(stderr, "[unified-kernel] XMX path: M=%lld N=%lld K=%lld grid=(%d,%d)\n",
-                    static_cast<long long>(args.M), static_cast<long long>(args.N), static_cast<long long>(args.K),
-                    xmx_grid_m, xmx_grid_n);
+            fprintf(stderr, "[unified-kernel] XMX path: M=%lld N=%lld K=%lld\n", static_cast<long long>(args.M),
+                    static_cast<long long>(args.N), static_cast<long long>(args.K));
             fflush(stderr);
         }
 
-        // Work-group size: 1 sub-group (16 threads)
-        // Each work-group handles one XMX tile (8x16 output)
-        constexpr int xmx_wg_m = 1;
-        constexpr int xmx_wg_n = XMX_SUBGROUP_SIZE;
+        // Select tile size. Default is baseline 8x16x32 (production, unchanged).
+        // GGML_SYCL_XMX_TILE_{M,N,K} env vars override for Phase B tile experiments.
+        // Every selected tile has a matching dispatch_xmx_kernel<TM,TN,TK> instantiation
+        // in the ladder below. sub-tiles = (TM/8)*(TN/16); supported set: {1,4,8,16,32}.
+        const xmx_tile_override ov = get_xmx_tile_override();
 
-        sycl::nd_range<2> xmx_range(sycl::range<2>(xmx_grid_m * xmx_wg_m, xmx_grid_n * xmx_wg_n),
-                                    sycl::range<2>(xmx_wg_m, xmx_wg_n));
-
-        // --- Phase A instrumentation path (GGML_SYCL_XMX_DETAIL=1) -----------
-        // Runs the real kernel + empty kernel + SLM-only kernel back-to-back on
-        // the same nd_range to split per-op wall time into launch / SLM-load /
-        // joint_matrix_mad buckets. Diagnostic only — queue-sync'd timing kills
-        // all overlap, so read the ratios, not absolute numbers.
-        if (xmx_detail_enabled()) {
-            static bool logged_once = false;
-            if (!logged_once) {
-                logged_once = true;
-                fprintf(stderr, "[XMX-DETAIL] instrumentation active: M=%lld N=%lld K=%lld grid=(%d,%d) tile=(%d,%d,%d)\n",
-                        static_cast<long long>(args.M), static_cast<long long>(args.N), static_cast<long long>(args.K),
-                        xmx_grid_m, xmx_grid_n, XMX_TM, XMX_TN, XMX_TK);
-                fflush(stderr);
-            }
-            auto wait_and_clock = [&]() {
-                q.wait();
-                return std::chrono::high_resolution_clock::now();
-            };
-
-            // 1. Real kernel
-            auto t0 = wait_and_clock();
-            q.submit([&](sycl::handler & cgh) {
-                sycl::local_accessor<sycl::half, 1> slm_w(XMX_TN * XMX_TK, cgh);
-                sycl::local_accessor<sycl::half, 1> slm_a(XMX_TM * XMX_TK, cgh);
-                sycl::local_accessor<float, 1>      slm_acc_out(XMX_TILE_M * XMX_TILE_N, cgh);
-                cgh.parallel_for<unified_matmul_xmx_kernel_detail_name<XMX_TM, XMX_TN, XMX_TK>>(
-                    xmx_range, [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(XMX_SUBGROUP_SIZE)]] {
-                        unified_matmul_xmx_kernel_impl<XMX_TM, XMX_TN, XMX_TK>(item, args, slm_w, slm_a, slm_acc_out);
-                    });
-            });
-            auto t1 = wait_and_clock();
-
-            // 2. Empty kernel with identical nd_range (launch+barrier baseline)
-            q.submit([&](sycl::handler & cgh) {
-                cgh.parallel_for<unified_matmul_xmx_empty_kernel_name<XMX_TM, XMX_TN, XMX_TK>>(
-                    xmx_range, [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(XMX_SUBGROUP_SIZE)]] {
-                        (void) item;
-                    });
-            });
-            auto t2 = wait_and_clock();
-
-            // 3. SLM-load-only kernel (same dequant + SLM stores, no XMX compute)
-            q.submit([&](sycl::handler & cgh) {
-                sycl::local_accessor<sycl::half, 1> slm_w(XMX_TN * XMX_TK, cgh);
-                sycl::local_accessor<sycl::half, 1> slm_a(XMX_TM * XMX_TK, cgh);
-                cgh.parallel_for<unified_matmul_xmx_slm_only_kernel_name<XMX_TM, XMX_TN, XMX_TK>>(
-                    xmx_range, [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(XMX_SUBGROUP_SIZE)]] {
-                        unified_matmul_xmx_slm_only_kernel_impl<XMX_TM, XMX_TN, XMX_TK>(item, args, slm_w, slm_a);
-                    });
-            });
-            auto t3 = wait_and_clock();
-
-            auto & s = g_xmx_detail_stats;
-            s.n_ops++;
-            s.us_total += std::chrono::duration<double, std::micro>(t1 - t0).count();
-            s.us_launch += std::chrono::duration<double, std::micro>(t2 - t1).count();
-            s.us_slm_total += std::chrono::duration<double, std::micro>(t3 - t2).count();
-            s.sum_wg += static_cast<uint64_t>(xmx_grid_m) * static_cast<uint64_t>(xmx_grid_n);
-            xmx_detail_dump_if_due();
+        if (!ov.valid) {
+            // Baseline: 8x16x32 (1 sub-tile, WG=16 threads)
+            dispatch_xmx_kernel<8, 16, 32>(q, args);
             return;
         }
 
-        // --- Production path (no instrumentation) ---------------------------
-        q.submit([&](sycl::handler & cgh) {
-            // Allocate SLM for half-precision data
-            sycl::local_accessor<sycl::half, 1> slm_w(XMX_TN * XMX_TK, cgh);  // Weights
-            sycl::local_accessor<sycl::half, 1> slm_a(XMX_TM * XMX_TK, cgh);  // Activations
-            // Float SLM for boundary case accumulator output
-            sycl::local_accessor<float, 1>      slm_acc_out(XMX_TILE_M * XMX_TILE_N, cgh);
+        // 4 sub-tiles (WG=64)
+        if (ov.tile_m == 16 && ov.tile_n == 32 && ov.tile_k == 32) {
+            dispatch_xmx_kernel<16, 32, 32>(q, args);
+            return;
+        }
+        // 8 sub-tiles (WG=128)
+        if (ov.tile_m == 32 && ov.tile_n == 32 && ov.tile_k == 32) {
+            dispatch_xmx_kernel<32, 32, 32>(q, args);
+            return;
+        }
+        // 16 sub-tiles (WG=256)
+        if (ov.tile_m == 32 && ov.tile_n == 64 && ov.tile_k == 32) {
+            dispatch_xmx_kernel<32, 64, 32>(q, args);
+            return;
+        }
+        // 32 sub-tiles (WG=512)
+        if (ov.tile_m == 64 && ov.tile_n == 64 && ov.tile_k == 32) {
+            dispatch_xmx_kernel<64, 64, 32>(q, args);
+            return;
+        }
 
-            cgh.parallel_for<unified_matmul_xmx_kernel_name<XMX_TM, XMX_TN, XMX_TK>>(
-                xmx_range, [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(XMX_SUBGROUP_SIZE)]] {
-                    unified_matmul_xmx_kernel_impl<XMX_TM, XMX_TN, XMX_TK>(item, args, slm_w, slm_a, slm_acc_out);
-                });
-        });
+        // Requested triple passed validation but has no matching ladder entry
+        // (e.g. non-TK=32 combos). Fall back to baseline with a one-time warning.
+        static bool unsupported_logged = false;
+        if (!unsupported_logged) {
+            unsupported_logged = true;
+            fprintf(stderr, "[XMX-RESIZE] tile %dx%dx%d has no dispatch entry; using baseline 8x16x32\n", ov.tile_m,
+                    ov.tile_n, ov.tile_k);
+            fflush(stderr);
+        }
+        dispatch_xmx_kernel<8, 16, 32>(q, args);
         return;
     }
 #endif  // GGML_SYCL_XMX_JOINT_MATRIX_AVAILABLE
