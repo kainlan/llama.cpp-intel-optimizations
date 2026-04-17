@@ -987,8 +987,8 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
 inline bool BenchmarkHarness::run_unified(const BenchmarkConfig & config,
                                           sycl::queue & queue,
                                           BenchmarkOutput & out) {
-    if (config.quant_type != GGML_TYPE_Q4_0) {
-        out.error = "Unified kernel benchmark supports Q4_0 only.";
+    if (config.quant_type != GGML_TYPE_Q4_0 && config.quant_type != GGML_TYPE_MXFP4) {
+        out.error = "Unified kernel benchmark supports Q4_0 and MXFP4 only.";
         return false;
     }
     if (config.memory_mode == MemoryMode::BUFFER) {
@@ -999,8 +999,11 @@ inline bool BenchmarkHarness::run_unified(const BenchmarkConfig & config,
         out.error = "Invalid dimensions.";
         return false;
     }
-    if (config.dim_k % QK4_0 != 0) {
-        out.error = "Unified kernel requires K divisible by QK4_0.";
+    // Block size is 32 for both Q4_0 (QK4_0) and MXFP4 (QK_MXFP4) — a single
+    // runtime query via ggml_blck_size keeps the gate quant-type-agnostic.
+    const int64_t block_size = ggml_blck_size(config.quant_type);
+    if (block_size <= 0 || config.dim_k % block_size != 0) {
+        out.error = "Unified kernel requires K divisible by the quant block size.";
         return false;
     }
 
