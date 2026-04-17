@@ -30024,8 +30024,6 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
     const bool             src0_on_device    = !ggml_sycl_is_host_resident_weight(src0, ctx.stream());
     const sycl::usm::alloc src0_data_alloc =
         src0_storage ? ggml_sycl_get_alloc_type(src0_storage) : sycl::usm::alloc::unknown;
-    const bool src0_data_gpu_accessible =
-        (src0_data_alloc == sycl::usm::alloc::device || src0_data_alloc == sycl::usm::alloc::host);
     // T4 Gap 1: for MXFP4-direct dispatch, host-pinned (usm::alloc::host) source data is
     // NOT safe — the unified XMX kernel's persistent-threadgroup access pattern exceeds
     // PCIe zero-copy latency budgets under high expert volume (GPT-OSS 20B: 32 experts ×
@@ -32388,10 +32386,12 @@ static bool try_xmx_sorted_moe(ggml_backend_sycl_context & ctx,
     // ggml_sycl_update_moe_ptr_table(force_cache_aos=host_weights) may only
     // partially stage experts into device memory, leaving a mixed device/host
     // ptr table. The fused paths below already gate on ptr_table_all_device
-    // (32783, 32930), but the non-fused per-expert loop's stream_dma path is
-    // only safe when a unified cache is available — fail cleanly back to the
-    // MMVQ / CPU-expert fallback chain when host_weights has produced a mixed
-    // table, rather than proceeding with a partially-staged dispatch.
+    // (see the `(!use_ptr_table || ptr_table_all_device)` checks in the fused
+    // Q8_0 SoA and fused MXFP4 SoA dispatch guards later in this function),
+    // but the non-fused per-expert loop's stream_dma path is only safe when a
+    // unified cache is available — fail cleanly back to the MMVQ / CPU-expert
+    // fallback chain when host_weights has produced a mixed table, rather than
+    // proceeding with a partially-staged dispatch.
     if (use_ptr_table && !ptr_table_all_device && host_weights) {
         GGML_SYCL_DEBUG(
             "[XMX MoE] Mixed device/host expert pointers for %s under host_weights; "
@@ -38276,11 +38276,15 @@ static bool should_dispatch_to_cpu(ggml_backend_sycl_context & ctx, const ggml_t
             // T4 Gap 3: name-less / per-expert slice tensors from mul_mat_id may
             // not match the "blk.N.*" pattern. Before returning false, honor the
             // weight buffer's host flag so host-resident MXFP4 experts route to
-            // CPU instead of falling through to GPU dispatch (the 30029 wedge
-            // trigger). Option (b) from the T3 audit: defer classification for
-            // these ops — skip g_layer_classified[] entirely (no synthetic
-            // layer_id slot) and let the caller flush per-op. Safe because
-            // name-less MoE slice dispatches are a rare hot-path occurrence.
+            // CPU instead of falling through to GPU dispatch (the MXFP4-direct
+            // wedge trigger in ggml_sycl_mul_mat). Option (b) from the T3 audit:
+            // defer classification for these ops — skip g_layer_classified[]
+            // entirely (no synthetic layer_id slot) and let the caller flush
+            // per-op. Safe because name-less MoE slice dispatches are a rare
+            // hot-path occurrence. Use ggml_backend_buffer_is_host(buffer) (a
+            // buffer-type flag check) rather than is_host_resident_weight(...,
+            // ctx.stream()) to avoid a USM driver round-trip (~0.7 ms per
+            // query) which would dominate MUL_MAT_ID per-expert dispatch costs.
             if (src0->buffer && ggml_backend_buffer_is_host(src0->buffer)) {
                 g_last_dispatch_query  = dst;
                 g_last_dispatch_result = true;
