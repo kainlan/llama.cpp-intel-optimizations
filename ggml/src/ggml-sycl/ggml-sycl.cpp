@@ -30986,8 +30986,20 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                                 onednn_pp_checked = true;
                             }
 
+                            // Phase-0 measurement gate: GGML_SYCL_SKIP_ONEDNN_Q4_0=1 forces
+                            // Q4_0 PP to bypass oneDNN and fall through to the unified XMX
+                            // kernel's fused dequant+GEMM path. Used to A/B measure
+                            // unified-XMX Q4_0 PP perf against oneDNN without disabling
+                            // oneDNN globally (which triggers an unrelated rms_norm crash).
+                            static bool skip_onednn_q4_0 = []() {
+                                const char * env = std::getenv("GGML_SYCL_SKIP_ONEDNN_Q4_0");
+                                return env && std::atoi(env) != 0;
+                            }();
+                            const bool skip_for_q4_0 = skip_onednn_q4_0 && src0->type == GGML_TYPE_Q4_0;
+
                             bool used_onednn_fp16 = false;
-                            if (onednn_pp_enabled && M >= onednn_pp_threshold && ggml_is_quantized(src0->type) &&
+                            if (!skip_for_q4_0 &&
+                                onednn_pp_enabled && M >= onednn_pp_threshold && ggml_is_quantized(src0->type) &&
                                 ggml_is_contiguous(src0)) {
                                 // Get dequantization function matching the actual data layout.
                                 // When src0 is in a reordered layout (SOA), use the
