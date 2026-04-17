@@ -1,6 +1,7 @@
 #include "convert.hpp"
 #include "common.hpp"
 
+#include "convert-esimd.hpp"
 #include "dequantize.hpp"
 #include "presets.hpp"
 
@@ -10,6 +11,20 @@
 #        define GGML_SYCL_HAS_BF16
 #    endif
 #endif
+
+// GGML_SYCL_ESIMD_DEQUANT=1 → enable ESIMD dequant (default OFF — standard SYCL
+// auto-vectorizes to the same SIMD width as ESIMD for this memory-bound kernel,
+// so the explicit ESIMD path does not win on Arc B580.  The env var exists for
+// A/B comparison and future tuning.)
+static bool g_esimd_dequant_enabled = []() {
+    const char * env = std::getenv("GGML_SYCL_ESIMD_DEQUANT");
+    if (env && env[0] == '1') {
+#if GGML_SYCL_ESIMD_DEQUANT_AVAILABLE
+        return true;
+#endif
+    }
+    return false;
+}();
 
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static void dequantize_block(const void * __restrict__ vx,
@@ -1038,21 +1053,34 @@ static void reorder_q4_0_coalesced_to_soa_kernel(const uint8_t * __restrict__ sr
 }
 
 // Public wrapper: COALESCED Q4_0 → row-major FP16 (for oneDNN PP)
+// Dispatches to ESIMD kernel when available (and GGML_SYCL_ESIMD_DEQUANT != 0),
+// otherwise falls back to standard-SYCL implementation.
 void dequantize_row_q4_0_coalesced_to_fp16_rowmajor(const void *    src,
                                                      sycl::half *    dst,
                                                      int             blocks_per_row,
                                                      int             nrows,
                                                      dpct::queue_ptr stream) {
+    if (g_esimd_dequant_enabled) {
+        dequantize_row_q4_0_coalesced_to_fp16_rowmajor_esimd(src, dst, blocks_per_row, nrows, stream);
+        return;
+    }
     dequantize_row_q4_0_sycl_coalesced_rowmajor(src, dst, blocks_per_row, nrows, stream);
 }
 
 // SOA→row-major FP16 dequant for oneDNN PP path.
 // SOA has sequential qs reads (no tile interleaving) — much faster than COALESCED.
+// Dispatches to ESIMD kernel when available (and GGML_SYCL_ESIMD_DEQUANT != 0),
+// otherwise falls back to standard-SYCL implementation.
 void dequantize_row_q4_0_soa_to_fp16_rowmajor(const void *    src,
                                                sycl::half *    dst,
                                                int             blocks_per_row,
                                                int             nrows,
                                                dpct::queue_ptr stream) {
+    if (g_esimd_dequant_enabled) {
+        dequantize_row_q4_0_soa_to_fp16_rowmajor_esimd(src, dst, blocks_per_row, nrows, stream);
+        return;
+    }
+
     dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
 
     const int total_blocks = nrows * blocks_per_row;
