@@ -432,6 +432,177 @@ SYCL_EXTERNAL inline sycl::half dequant_q4_0_half_soa(const uint8_t *    qs_base
     return static_cast<sycl::half>(qs_val - 8) * d;
 }
 
+// -----------------------------------------------------------------------------
+// Phase C: Block-granular vectorized Q4_0 dequant for SLM fill
+// -----------------------------------------------------------------------------
+// XMX-RESIZE [llama.cpp-gnfqa] Phase C.
+// Dequantize one full Q4_0 block (32 elems) from a 16-byte qs pointer and a
+// half scale into a 32-element row of SLM. Matches the technique proven in
+// commit 5a43cc2f3 (standalone dequant kernel): 4 × uint32_t qs loads +
+// float FMA with bias dm = d * -8 + 4 × half8 stores.
+//
+// Compared to 32 calls to `dequant_q4_0_half`, this does ~10x fewer
+// instructions per block: 4 word loads vs 32 byte loads, 1 bias compute vs
+// 32 `(v-8)` integer ops, 32 FMAs packed into 2 half8 groups vs 32 scalar
+// multiplies, and 4 half8 stores vs 32 half stores.
+//
+// Output order inside `slm_row` matches the same layout that per-element
+// `dequant_q4_0_half(&blk, i)` produces: element `i` for i in 0..15 uses
+// the low nibble of qs[i]; for i in 16..31 uses the high nibble of qs[i-16].
+// This is the canonical Q4_0 per-block unpack that the XMX kernel consumes.
+//
+// NOTE: we do not require `slm_row` to be naturally aligned for half8 writes
+// because slm_weights[n_off * TILE_K] is 16-byte aligned when TILE_K is a
+// multiple of 8 (our tiles always use TILE_K ≥ 32). Each half8 write covers
+// 16 bytes and lands at offsets {0, 8, 16, 24} * sizeof(half) — all 16-byte
+// aligned from the slm_row base.
+// `qs` MUST be 4-byte aligned (SOA qs buffers are; AOS block_q4_0_unified->qs is
+// 2-byte aligned — use `dequant_q4_0_block_half8_unaligned` for that case).
+SYCL_EXTERNAL inline void dequant_q4_0_block_half8(const uint8_t *  qs,
+                                                   sycl::half       d_h,
+                                                   sycl::half *     slm_row) {
+    const uint32_t * qs32 = reinterpret_cast<const uint32_t *>(qs);
+    const uint32_t   w0   = qs32[0];
+    const uint32_t   w1   = qs32[1];
+    const uint32_t   w2   = qs32[2];
+    const uint32_t   w3   = qs32[3];
+
+    const float d  = float(d_h);
+    const float dm = d * -8.0f;  // bias: d * (nibble - 8) = d * nibble + dm
+
+    // Low nibbles: indices 0..15 come from qs[0..15] (= words 0..1 then 2..3 packed)
+    // Specifically, per 5a43cc2f3 unpack order:
+    //   y[0..7]  <- low nibbles of (w0 high-to-low byte, w1 high-to-low byte)
+    //   y[8..15] <- low nibbles of (w2, w3)
+    //   y[16..23] <- high nibbles of (w0, w1)
+    //   y[24..31] <- high nibbles of (w2, w3)
+    sycl::vec<float, 8> lo0_f(sycl::fma(d, float( w0        & 0xF), dm),
+                              sycl::fma(d, float((w0 >>  8) & 0xF), dm),
+                              sycl::fma(d, float((w0 >> 16) & 0xF), dm),
+                              sycl::fma(d, float((w0 >> 24) & 0xF), dm),
+                              sycl::fma(d, float( w1        & 0xF), dm),
+                              sycl::fma(d, float((w1 >>  8) & 0xF), dm),
+                              sycl::fma(d, float((w1 >> 16) & 0xF), dm),
+                              sycl::fma(d, float((w1 >> 24) & 0xF), dm));
+    sycl::vec<float, 8> lo1_f(sycl::fma(d, float( w2        & 0xF), dm),
+                              sycl::fma(d, float((w2 >>  8) & 0xF), dm),
+                              sycl::fma(d, float((w2 >> 16) & 0xF), dm),
+                              sycl::fma(d, float((w2 >> 24) & 0xF), dm),
+                              sycl::fma(d, float( w3        & 0xF), dm),
+                              sycl::fma(d, float((w3 >>  8) & 0xF), dm),
+                              sycl::fma(d, float((w3 >> 16) & 0xF), dm),
+                              sycl::fma(d, float((w3 >> 24) & 0xF), dm));
+    sycl::vec<float, 8> hi0_f(sycl::fma(d, float((w0 >>  4) & 0xF), dm),
+                              sycl::fma(d, float((w0 >> 12) & 0xF), dm),
+                              sycl::fma(d, float((w0 >> 20) & 0xF), dm),
+                              sycl::fma(d, float((w0 >> 28) & 0xF), dm),
+                              sycl::fma(d, float((w1 >>  4) & 0xF), dm),
+                              sycl::fma(d, float((w1 >> 12) & 0xF), dm),
+                              sycl::fma(d, float((w1 >> 20) & 0xF), dm),
+                              sycl::fma(d, float((w1 >> 28) & 0xF), dm));
+    sycl::vec<float, 8> hi1_f(sycl::fma(d, float((w2 >>  4) & 0xF), dm),
+                              sycl::fma(d, float((w2 >> 12) & 0xF), dm),
+                              sycl::fma(d, float((w2 >> 20) & 0xF), dm),
+                              sycl::fma(d, float((w2 >> 28) & 0xF), dm),
+                              sycl::fma(d, float((w3 >>  4) & 0xF), dm),
+                              sycl::fma(d, float((w3 >> 12) & 0xF), dm),
+                              sycl::fma(d, float((w3 >> 20) & 0xF), dm),
+                              sycl::fma(d, float((w3 >> 28) & 0xF), dm));
+
+    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 0)  =
+        lo0_f.convert<sycl::half, sycl::rounding_mode::automatic>();
+    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 8)  =
+        lo1_f.convert<sycl::half, sycl::rounding_mode::automatic>();
+    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 16) =
+        hi0_f.convert<sycl::half, sycl::rounding_mode::automatic>();
+    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 24) =
+        hi1_f.convert<sycl::half, sycl::rounding_mode::automatic>();
+}
+
+// Unaligned-safe variant: builds uint32 words from pairs of uint16 loads.
+// `qs` MAY be as coarse as 2-byte aligned (AOS block_q4_0_unified->qs sits at
+// struct offset 2, half-aligned, NOT 4-byte aligned). Using the same SPIRV
+// path the compiler uses for `memcpy(&u32, qs, 4)`: two aligned u16 reads then
+// shift+or. Measured on Arc B580: benchmark validation passes with this path
+// (unlike a raw uint32 load which corrupts output for AOS weights).
+SYCL_EXTERNAL inline void dequant_q4_0_block_half8_unaligned(const uint8_t * qs,
+                                                             sycl::half      d_h,
+                                                             sycl::half *    slm_row) {
+    const uint16_t * qs16 = reinterpret_cast<const uint16_t *>(qs);
+    auto mk_u32 = [](uint16_t lo, uint16_t hi) -> uint32_t {
+        return uint32_t(lo) | (uint32_t(hi) << 16);
+    };
+    const uint32_t w0 = mk_u32(qs16[0], qs16[1]);
+    const uint32_t w1 = mk_u32(qs16[2], qs16[3]);
+    const uint32_t w2 = mk_u32(qs16[4], qs16[5]);
+    const uint32_t w3 = mk_u32(qs16[6], qs16[7]);
+
+    const float d  = float(d_h);
+    const float dm = d * -8.0f;
+
+    sycl::vec<float, 8> lo0_f(sycl::fma(d, float( w0        & 0xF), dm),
+                              sycl::fma(d, float((w0 >>  8) & 0xF), dm),
+                              sycl::fma(d, float((w0 >> 16) & 0xF), dm),
+                              sycl::fma(d, float((w0 >> 24) & 0xF), dm),
+                              sycl::fma(d, float( w1        & 0xF), dm),
+                              sycl::fma(d, float((w1 >>  8) & 0xF), dm),
+                              sycl::fma(d, float((w1 >> 16) & 0xF), dm),
+                              sycl::fma(d, float((w1 >> 24) & 0xF), dm));
+    sycl::vec<float, 8> lo1_f(sycl::fma(d, float( w2        & 0xF), dm),
+                              sycl::fma(d, float((w2 >>  8) & 0xF), dm),
+                              sycl::fma(d, float((w2 >> 16) & 0xF), dm),
+                              sycl::fma(d, float((w2 >> 24) & 0xF), dm),
+                              sycl::fma(d, float( w3        & 0xF), dm),
+                              sycl::fma(d, float((w3 >>  8) & 0xF), dm),
+                              sycl::fma(d, float((w3 >> 16) & 0xF), dm),
+                              sycl::fma(d, float((w3 >> 24) & 0xF), dm));
+    sycl::vec<float, 8> hi0_f(sycl::fma(d, float((w0 >>  4) & 0xF), dm),
+                              sycl::fma(d, float((w0 >> 12) & 0xF), dm),
+                              sycl::fma(d, float((w0 >> 20) & 0xF), dm),
+                              sycl::fma(d, float((w0 >> 28) & 0xF), dm),
+                              sycl::fma(d, float((w1 >>  4) & 0xF), dm),
+                              sycl::fma(d, float((w1 >> 12) & 0xF), dm),
+                              sycl::fma(d, float((w1 >> 20) & 0xF), dm),
+                              sycl::fma(d, float((w1 >> 28) & 0xF), dm));
+    sycl::vec<float, 8> hi1_f(sycl::fma(d, float((w2 >>  4) & 0xF), dm),
+                              sycl::fma(d, float((w2 >> 12) & 0xF), dm),
+                              sycl::fma(d, float((w2 >> 20) & 0xF), dm),
+                              sycl::fma(d, float((w2 >> 28) & 0xF), dm),
+                              sycl::fma(d, float((w3 >>  4) & 0xF), dm),
+                              sycl::fma(d, float((w3 >> 12) & 0xF), dm),
+                              sycl::fma(d, float((w3 >> 20) & 0xF), dm),
+                              sycl::fma(d, float((w3 >> 28) & 0xF), dm));
+
+    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 0)  =
+        lo0_f.convert<sycl::half, sycl::rounding_mode::automatic>();
+    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 8)  =
+        lo1_f.convert<sycl::half, sycl::rounding_mode::automatic>();
+    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 16) =
+        hi0_f.convert<sycl::half, sycl::rounding_mode::automatic>();
+    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 24) =
+        hi1_f.convert<sycl::half, sycl::rounding_mode::automatic>();
+}
+
+// AOS wrapper: block_q4_0_unified = { half d; uint8_t qs[16]; }
+// `blk->qs` is at struct offset 2 (half-aligned), so use the unaligned variant.
+SYCL_EXTERNAL inline void dequant_q4_0_block_half8_aos(const block_q4_0_unified * blk,
+                                                       sycl::half *               slm_row) {
+    dequant_q4_0_block_half8_unaligned(blk->qs, blk->d, slm_row);
+}
+
+// SOA wrapper: separate qs_base (16 bytes/block) and d_base (half/block)
+SYCL_EXTERNAL inline void dequant_q4_0_block_half8_soa(const uint8_t *    qs_base,
+                                                       const sycl::half * d_base,
+                                                       int64_t            row,
+                                                       int                k_blocks,
+                                                       int                block_idx,
+                                                       sycl::half *       slm_row) {
+    const int          row_qs_bytes = k_blocks * 16;
+    const uint8_t *    qs           = qs_base + row * row_qs_bytes + block_idx * 16;
+    const sycl::half   d            = d_base[row * k_blocks + block_idx];
+    dequant_q4_0_block_half8(qs, d, slm_row);
+}
+
 // =============================================================================
 // XMX Kernel Class Names
 // =============================================================================
@@ -565,35 +736,69 @@ SYCL_EXTERNAL void unified_matmul_xmx_kernel_impl(sycl::nd_item<2>              
         const int     k_len   = static_cast<int>(k_end - k_start);
 
         // ==== Cooperative Load: All threads load data to SLM ====
-        // Load weights [TILE_N x TILE_K], but only up to k_len valid K elements
-        for (int idx = local_linear; idx < TILE_N * TILE_K; idx += local_total) {
-            const int     n_off    = idx / TILE_K;
-            const int     k_off    = idx % TILE_K;
-            const int64_t n_global = n_start + n_off;
+        // Phase C vectorized path: for Q4_0 with TILE_K a multiple of UNIFIED_QK4_0,
+        // iterate over full Q4_0 blocks (32 elems each) instead of per-element.
+        // One call to `dequant_q4_0_block_half8` replaces 32 scalar dequants.
+        // MXFP4 keeps the per-element path.
+        constexpr bool TILE_K_ALIGNED = (TILE_K % UNIFIED_QK4_0) == 0;
+        constexpr int  BLOCKS_PER_ROW = TILE_K_ALIGNED ? (TILE_K / UNIFIED_QK4_0) : 0;
+        constexpr int  BLOCKS_IN_TILE = TILE_N * BLOCKS_PER_ROW;
 
-            sycl::half w = sycl::half(0.0f);
-            // Load only valid N/K combinations:
-            // - n_off < TILE_N (always true due to loop structure)
-            // - n_global < args.N (boundary check on N)
-            // - k_off < k_len (only load actual K data for this tile)
-            if (n_global < args.N && k_off < k_len) {
-                const int64_t k_global     = k_start + k_off;
-                const int     block_in_row = static_cast<int>(k_global / UNIFIED_QK4_0);
-                const int     idx_in_block = static_cast<int>(k_global % UNIFIED_QK4_0);
-                if (use_soa && !is_mxfp4) {
-                    // SoA layout: separate qs and d arrays (Q4_0 only)
-                    w = dequant_q4_0_half_soa(qs_base, d_base, n_global, k_blocks_per_row, block_in_row, idx_in_block);
-                } else if (is_mxfp4) {
-                    // MXFP4: AoS layout with 17-byte blocks
-                    const int block_idx = static_cast<int>(n_global * k_blocks_per_row + block_in_row);
-                    w                   = dequant_mxfp4_half(&weights_mx[block_idx], idx_in_block);
+        if (!is_mxfp4 && TILE_K_ALIGNED && k_len == TILE_K) {
+            // Fast path: full K-tile (no partial K boundary). Common case — Mistral
+            // Q4_0 has K divisible by TILE_K (both 32 and bigger tile configs).
+            // Each thread processes entire 32-elem Q4_0 blocks.
+            for (int blk_idx = local_linear; blk_idx < BLOCKS_IN_TILE; blk_idx += local_total) {
+                const int     n_off    = blk_idx / BLOCKS_PER_ROW;
+                const int     kb_off   = blk_idx % BLOCKS_PER_ROW;  // which K-block within this n_row
+                const int64_t n_global = n_start + n_off;
+                const int     block_in_row_local = static_cast<int>(k_start / UNIFIED_QK4_0) + kb_off;
+
+                sycl::half * slm_row = &slm_weights[n_off * TILE_K + kb_off * UNIFIED_QK4_0];
+
+                if (n_global < args.N) {
+                    if (use_soa) {
+                        dequant_q4_0_block_half8_soa(qs_base, d_base, n_global, k_blocks_per_row,
+                                                     block_in_row_local, slm_row);
+                    } else {
+                        const int64_t block_idx = n_global * k_blocks_per_row + block_in_row_local;
+                        dequant_q4_0_block_half8_aos(&weights_q4[block_idx], slm_row);
+                    }
                 } else {
-                    // Q4_0 AoS layout: contiguous block_q4_0_unified structs
-                    const int block_idx = static_cast<int>(n_global * k_blocks_per_row + block_in_row);
-                    w                   = dequant_q4_0_half(&weights_q4[block_idx], idx_in_block);
+                    // N-boundary padding: zero the 32-elem row slice.
+                    sycl::vec<sycl::half, 8> zero{ sycl::half(0.0f) };
+                    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 0)  = zero;
+                    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 8)  = zero;
+                    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 16) = zero;
+                    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 24) = zero;
                 }
             }
-            slm_weights[n_off * TILE_K + k_off] = w;
+        } else {
+            // Fallback: MXFP4 or partial K boundary or non-aligned TILE_K.
+            // Per-element scalar dequant matches the original semantics exactly.
+            for (int idx = local_linear; idx < TILE_N * TILE_K; idx += local_total) {
+                const int     n_off    = idx / TILE_K;
+                const int     k_off    = idx % TILE_K;
+                const int64_t n_global = n_start + n_off;
+
+                sycl::half w = sycl::half(0.0f);
+                if (n_global < args.N && k_off < k_len) {
+                    const int64_t k_global     = k_start + k_off;
+                    const int     block_in_row = static_cast<int>(k_global / UNIFIED_QK4_0);
+                    const int     idx_in_block = static_cast<int>(k_global % UNIFIED_QK4_0);
+                    if (use_soa && !is_mxfp4) {
+                        w = dequant_q4_0_half_soa(qs_base, d_base, n_global, k_blocks_per_row, block_in_row,
+                                                  idx_in_block);
+                    } else if (is_mxfp4) {
+                        const int block_idx = static_cast<int>(n_global * k_blocks_per_row + block_in_row);
+                        w                   = dequant_mxfp4_half(&weights_mx[block_idx], idx_in_block);
+                    } else {
+                        const int block_idx = static_cast<int>(n_global * k_blocks_per_row + block_in_row);
+                        w                   = dequant_q4_0_half(&weights_q4[block_idx], idx_in_block);
+                    }
+                }
+                slm_weights[n_off * TILE_K + k_off] = w;
+            }
         }
 
         // Load activations [TILE_M x TILE_K], but only up to k_len valid K elements
@@ -745,28 +950,60 @@ SYCL_EXTERNAL void unified_matmul_xmx_slm_only_kernel_impl(sycl::nd_item<2>     
         const int64_t k_end   = sycl::min(k_start + TILE_K, args.K);
         const int     k_len   = static_cast<int>(k_end - k_start);
 
-        // Weight dequant + SLM store — identical to real kernel
-        for (int idx = local_linear; idx < TILE_N * TILE_K; idx += local_total) {
-            const int     n_off    = idx / TILE_K;
-            const int     k_off    = idx % TILE_K;
-            const int64_t n_global = n_start + n_off;
+        // Weight dequant + SLM store — identical to real kernel (Phase C vectorized)
+        constexpr bool TILE_K_ALIGNED = (TILE_K % UNIFIED_QK4_0) == 0;
+        constexpr int  BLOCKS_PER_ROW = TILE_K_ALIGNED ? (TILE_K / UNIFIED_QK4_0) : 0;
+        constexpr int  BLOCKS_IN_TILE = TILE_N * BLOCKS_PER_ROW;
 
-            sycl::half w = sycl::half(0.0f);
-            if (n_global < args.N && k_off < k_len) {
-                const int64_t k_global     = k_start + k_off;
-                const int     block_in_row = static_cast<int>(k_global / UNIFIED_QK4_0);
-                const int     idx_in_block = static_cast<int>(k_global % UNIFIED_QK4_0);
-                if (use_soa && !is_mxfp4) {
-                    w = dequant_q4_0_half_soa(qs_base, d_base, n_global, k_blocks_per_row, block_in_row, idx_in_block);
-                } else if (is_mxfp4) {
-                    const int block_idx = static_cast<int>(n_global * k_blocks_per_row + block_in_row);
-                    w                   = dequant_mxfp4_half(&weights_mx[block_idx], idx_in_block);
+        if (!is_mxfp4 && TILE_K_ALIGNED && k_len == TILE_K) {
+            for (int blk_idx = local_linear; blk_idx < BLOCKS_IN_TILE; blk_idx += local_total) {
+                const int     n_off    = blk_idx / BLOCKS_PER_ROW;
+                const int     kb_off   = blk_idx % BLOCKS_PER_ROW;
+                const int64_t n_global = n_start + n_off;
+                const int     block_in_row_local = static_cast<int>(k_start / UNIFIED_QK4_0) + kb_off;
+
+                sycl::half * slm_row = &slm_weights[n_off * TILE_K + kb_off * UNIFIED_QK4_0];
+
+                if (n_global < args.N) {
+                    if (use_soa) {
+                        dequant_q4_0_block_half8_soa(qs_base, d_base, n_global, k_blocks_per_row,
+                                                     block_in_row_local, slm_row);
+                    } else {
+                        const int64_t block_idx = n_global * k_blocks_per_row + block_in_row_local;
+                        dequant_q4_0_block_half8_aos(&weights_q4[block_idx], slm_row);
+                    }
                 } else {
-                    const int block_idx = static_cast<int>(n_global * k_blocks_per_row + block_in_row);
-                    w                   = dequant_q4_0_half(&weights_q4[block_idx], idx_in_block);
+                    sycl::vec<sycl::half, 8> zero{ sycl::half(0.0f) };
+                    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 0)  = zero;
+                    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 8)  = zero;
+                    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 16) = zero;
+                    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 24) = zero;
                 }
             }
-            slm_weights[n_off * TILE_K + k_off] = w;
+        } else {
+            for (int idx = local_linear; idx < TILE_N * TILE_K; idx += local_total) {
+                const int     n_off    = idx / TILE_K;
+                const int     k_off    = idx % TILE_K;
+                const int64_t n_global = n_start + n_off;
+
+                sycl::half w = sycl::half(0.0f);
+                if (n_global < args.N && k_off < k_len) {
+                    const int64_t k_global     = k_start + k_off;
+                    const int     block_in_row = static_cast<int>(k_global / UNIFIED_QK4_0);
+                    const int     idx_in_block = static_cast<int>(k_global % UNIFIED_QK4_0);
+                    if (use_soa && !is_mxfp4) {
+                        w = dequant_q4_0_half_soa(qs_base, d_base, n_global, k_blocks_per_row, block_in_row,
+                                                  idx_in_block);
+                    } else if (is_mxfp4) {
+                        const int block_idx = static_cast<int>(n_global * k_blocks_per_row + block_in_row);
+                        w                   = dequant_mxfp4_half(&weights_mx[block_idx], idx_in_block);
+                    } else {
+                        const int block_idx = static_cast<int>(n_global * k_blocks_per_row + block_in_row);
+                        w                   = dequant_q4_0_half(&weights_q4[block_idx], idx_in_block);
+                    }
+                }
+                slm_weights[n_off * TILE_K + k_off] = w;
+            }
         }
 
         for (int idx = local_linear; idx < TILE_M * TILE_K; idx += local_total) {
