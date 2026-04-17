@@ -1929,6 +1929,10 @@ SYCL_EXTERNAL inline void dequant_mxfp4_block_half8(const uint8_t * qs,
                                                     sycl::half *    slm_row) {
     const float scale = e8m0_to_float_half(e);
 
+    // Note: plain multiply (no `-8` bias like Q4_0's `d*nibble + dm` FMA form).
+    // MXFP4's signed LUT embeds the offset, so the natural expression is
+    // `kvalue * scale`. The compiler is free to fuse if the target ISA
+    // benefits; revisit in T2 if a perf gap vs Q4_0 is measurable.
     const uint32_t * qs32 = reinterpret_cast<const uint32_t *>(qs);
     const uint32_t   w0   = qs32[0];
     const uint32_t   w1   = qs32[1];

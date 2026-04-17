@@ -2,7 +2,7 @@
 // Test: MXFP4 vectorized per-block dequantization equivalence
 //
 // Verifies that dequant_mxfp4_block_half8 (vectorized 32-element
-// per-block helper in unified-kernel.cpp) matches the scalar
+// per-block helper in unified-kernel.hpp) matches the scalar
 // reference dequant_mxfp4_half byte-exact, across all 256 qs byte
 // patterns x 8 representative E8M0 exponents.
 //
@@ -30,6 +30,9 @@
 // the device-side dequant_mxfp4_half at unified-kernel.cpp:388. We keep
 // this inline in the test so any divergence in the canonical nibble
 // order is caught locally.
+// TODO: cross-check directly against dequant_mxfp4_half
+// (unified-kernel.cpp:388) once host-callable; today this test relies on
+// ref_scalar mirroring the scalar device helper's logic.
 static void ref_scalar(uint8_t e, const uint8_t * qs, sycl::half out[32]) {
     const float scale = ggml_sycl_unified::e8m0_to_float_half(e);
     for (int i = 0; i < 32; ++i) {
