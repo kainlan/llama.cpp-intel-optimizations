@@ -438,6 +438,14 @@ SYCL_EXTERNAL inline sycl::half dequant_q4_0_half_soa(const uint8_t *    qs_base
 
 #if GGML_SYCL_XMX_JOINT_MATRIX_AVAILABLE
 template <int TILE_M, int TILE_N, int TILE_K> class unified_matmul_xmx_kernel_name;
+// Phase A instrumentation companion kernels (XMX-RESIZE [llama.cpp-gnfqa])
+// SLM-only: same dequant+SLM load as the real kernel, no joint_matrix compute.
+// Empty:    same nd_range as the real kernel, empty body. Isolates launch cost.
+// Detail:   distinct class tag for the real kernel when timing path is active,
+//           so both call sites get distinct mangled names in the same TU.
+template <int TILE_M, int TILE_N, int TILE_K> class unified_matmul_xmx_slm_only_kernel_name;
+template <int TILE_M, int TILE_N, int TILE_K> class unified_matmul_xmx_empty_kernel_name;
+template <int TILE_M, int TILE_N, int TILE_K> class unified_matmul_xmx_kernel_detail_name;
 #endif
 
 // =============================================================================
@@ -687,6 +695,108 @@ SYCL_EXTERNAL void unified_matmul_xmx_kernel_impl(sycl::nd_item<2>              
                     }
                 }
             }
+        }
+    }
+}
+
+// =============================================================================
+// Phase A instrumentation: SLM-load-only variant (XMX-RESIZE llama.cpp-gnfqa)
+// =============================================================================
+// Matches `unified_matmul_xmx_kernel_impl` load phase exactly: same K-tile loop,
+// same dequant paths, same SLM layout, same per-K-tile barrier. Skips only the
+// joint_matrix_load / joint_matrix_mad / joint_matrix_store. A lane-0 anti-DCE
+// read of slm_weights[0] (conditional on an unreachable sentinel) prevents the
+// compiler from eliding the SLM stores. Used only when GGML_SYCL_XMX_DETAIL=1.
+template <int TILE_M, int TILE_N, int TILE_K>
+SYCL_EXTERNAL void unified_matmul_xmx_slm_only_kernel_impl(sycl::nd_item<2>                    item,
+                                                           const UnifiedKernelArgs             args,
+                                                           sycl::local_accessor<sycl::half, 1> slm_weights,
+                                                           sycl::local_accessor<sycl::half, 1> slm_activations) {
+    const int tile_row = item.get_group(0);
+    const int tile_col = item.get_group(1);
+
+    const int local_row      = item.get_local_id(0);
+    const int local_col      = item.get_local_id(1);
+    const int local_size_row = item.get_local_range(0);
+    const int local_size_col = item.get_local_range(1);
+    const int local_linear   = local_row * local_size_col + local_col;
+    const int local_total    = local_size_row * local_size_col;
+
+    const int64_t m_start = tile_row * TILE_M;
+    const int64_t n_start = tile_col * TILE_N;
+
+    const int k_tiles          = (args.K + TILE_K - 1) / TILE_K;
+    const int k_blocks_per_row = args.K / UNIFIED_QK4_0;
+
+    const bool is_mxfp4 = (args.quant_type == QUANT_TYPE_MXFP4);
+
+    const block_q4_0_unified *  weights_q4 = static_cast<const block_q4_0_unified *>(args.weights);
+    const block_mxfp4_unified * weights_mx = static_cast<const block_mxfp4_unified *>(args.weights);
+
+    const bool         use_soa      = (args.layout == LayoutMode::SOA);
+    const int64_t      total_blocks = args.N * k_blocks_per_row;
+    const int64_t      d_offset     = total_blocks * (UNIFIED_QK4_0 / 2);
+    const uint8_t *    qs_base      = static_cast<const uint8_t *>(args.weights);
+    const sycl::half * d_base =
+        reinterpret_cast<const sycl::half *>(static_cast<const char *>(args.weights) + d_offset);
+
+    for (int kt = 0; kt < k_tiles; kt++) {
+        const int64_t k_start = kt * TILE_K;
+        const int64_t k_end   = sycl::min(k_start + TILE_K, args.K);
+        const int     k_len   = static_cast<int>(k_end - k_start);
+
+        // Weight dequant + SLM store — identical to real kernel
+        for (int idx = local_linear; idx < TILE_N * TILE_K; idx += local_total) {
+            const int     n_off    = idx / TILE_K;
+            const int     k_off    = idx % TILE_K;
+            const int64_t n_global = n_start + n_off;
+
+            sycl::half w = sycl::half(0.0f);
+            if (n_global < args.N && k_off < k_len) {
+                const int64_t k_global     = k_start + k_off;
+                const int     block_in_row = static_cast<int>(k_global / UNIFIED_QK4_0);
+                const int     idx_in_block = static_cast<int>(k_global % UNIFIED_QK4_0);
+                if (use_soa && !is_mxfp4) {
+                    w = dequant_q4_0_half_soa(qs_base, d_base, n_global, k_blocks_per_row, block_in_row, idx_in_block);
+                } else if (is_mxfp4) {
+                    const int block_idx = static_cast<int>(n_global * k_blocks_per_row + block_in_row);
+                    w                   = dequant_mxfp4_half(&weights_mx[block_idx], idx_in_block);
+                } else {
+                    const int block_idx = static_cast<int>(n_global * k_blocks_per_row + block_in_row);
+                    w                   = dequant_q4_0_half(&weights_q4[block_idx], idx_in_block);
+                }
+            }
+            slm_weights[n_off * TILE_K + k_off] = w;
+        }
+
+        for (int idx = local_linear; idx < TILE_M * TILE_K; idx += local_total) {
+            const int     m_off    = idx / TILE_K;
+            const int     k_off    = idx % TILE_K;
+            const int64_t m_global = m_start + m_off;
+
+            sycl::half a = sycl::half(0.0f);
+            if (m_global < args.M && k_off < k_len) {
+                const int64_t k_global = k_start + k_off;
+                a                      = static_cast<sycl::half>(args.activations[m_global * args.K + k_global]);
+            }
+            slm_activations[m_off * TILE_K + k_off] = a;
+        }
+
+        item.barrier(sycl::access::fence_space::local_space);
+
+        if (kt + 1 < k_tiles) {
+            item.barrier(sycl::access::fence_space::local_space);
+        }
+    }
+
+    // Anti-DCE: prevent compiler from eliding SLM stores. Condition is never true
+    // at runtime (dequant never produces NaN for valid Q4_0/MXFP4 blocks), but the
+    // compiler can't prove it, so the SLM reads and loop body must be preserved.
+    if (local_linear == 0 && sycl::isnan(static_cast<float>(slm_weights[0] + slm_activations[0]))) {
+        const int64_t m_global_base = m_start;
+        const int64_t n_global_base = n_start;
+        if (m_global_base < args.M && n_global_base < args.N) {
+            args.output[m_global_base * args.N + n_global_base] = 0.0f;
         }
     }
 }
@@ -3549,6 +3659,59 @@ void unified_matmul_kernel_impl(sycl::nd_item<2>               item,
 }
 
 // =============================================================================
+// Phase A instrumentation: XMX per-op launch / SLM-load / joint_matrix_mad split
+// =============================================================================
+// Gated by GGML_SYCL_XMX_DETAIL=1 — zero cost when unset (static const bool read
+// once). When enabled, the XMX dispatch runs the real kernel, an empty kernel
+// with the same nd_range (launch+barrier baseline), and an SLM-load-only variant
+// (same dequant + SLM stores, no joint_matrix). Each bracketed with q.wait() so
+// the wall-clock captures device time; queue-sync destroys all overlap, so this
+// is for relative-ratio measurement only — absolute numbers are inflated.
+//
+// Buckets (per MUL_MAT):
+//   launch_us  = empty-kernel wall time (launch + barrier + exit)
+//   slm_us     = slm-only wall time − launch_us
+//   mad_us     = real wall time − slm-only wall time
+//   total_us   = real wall time
+static bool xmx_detail_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_XMX_DETAIL");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+struct xmx_detail_stats {
+    uint64_t n_ops         = 0;
+    double   us_total      = 0;  // real kernel wall time
+    double   us_launch     = 0;  // empty kernel wall time
+    double   us_slm_total  = 0;  // slm-only wall time (includes launch)
+    uint64_t sum_wg        = 0;  // cumulative work-group count (grid_m * grid_n)
+};
+
+static thread_local xmx_detail_stats g_xmx_detail_stats;
+
+static void xmx_detail_dump_if_due(int period = 500) {
+    if (!xmx_detail_enabled()) {
+        return;
+    }
+    auto & t = g_xmx_detail_stats;
+    if (t.n_ops == 0 || (t.n_ops % period) != 0) {
+        return;
+    }
+    const double us_slm_only = t.us_slm_total - t.us_launch;  // dequant + SLM stores only
+    const double us_mad      = t.us_total - t.us_slm_total;   // joint_matrix_load + mad + store
+    const double denom       = t.us_total > 0 ? t.us_total : 1.0;
+    fprintf(stderr,
+            "[XMX-DETAIL] n=%llu wg/op=%.0f  total=%.1f ms  launch=%.1f ms (%.1f%%)  "
+            "slm_load=%.1f ms (%.1f%%)  joint_matrix=%.1f ms (%.1f%%)\n",
+            (unsigned long long) t.n_ops, (double) t.sum_wg / (double) t.n_ops, t.us_total / 1000.0,
+            t.us_launch / 1000.0, 100.0 * t.us_launch / denom, us_slm_only / 1000.0, 100.0 * us_slm_only / denom,
+            us_mad / 1000.0, 100.0 * us_mad / denom);
+    fflush(stderr);
+}
+
+// =============================================================================
 // Kernel Launcher
 // =============================================================================
 
@@ -3671,6 +3834,72 @@ void launch_unified_matmul(sycl::queue & q, const UnifiedKernelArgs & args_in) {
         constexpr int xmx_wg_m = 1;
         constexpr int xmx_wg_n = XMX_SUBGROUP_SIZE;
 
+        sycl::nd_range<2> xmx_range(sycl::range<2>(xmx_grid_m * xmx_wg_m, xmx_grid_n * xmx_wg_n),
+                                    sycl::range<2>(xmx_wg_m, xmx_wg_n));
+
+        // --- Phase A instrumentation path (GGML_SYCL_XMX_DETAIL=1) -----------
+        // Runs the real kernel + empty kernel + SLM-only kernel back-to-back on
+        // the same nd_range to split per-op wall time into launch / SLM-load /
+        // joint_matrix_mad buckets. Diagnostic only — queue-sync'd timing kills
+        // all overlap, so read the ratios, not absolute numbers.
+        if (xmx_detail_enabled()) {
+            static bool logged_once = false;
+            if (!logged_once) {
+                logged_once = true;
+                fprintf(stderr, "[XMX-DETAIL] instrumentation active: M=%lld N=%lld K=%lld grid=(%d,%d) tile=(%d,%d,%d)\n",
+                        static_cast<long long>(args.M), static_cast<long long>(args.N), static_cast<long long>(args.K),
+                        xmx_grid_m, xmx_grid_n, XMX_TM, XMX_TN, XMX_TK);
+                fflush(stderr);
+            }
+            auto wait_and_clock = [&]() {
+                q.wait();
+                return std::chrono::high_resolution_clock::now();
+            };
+
+            // 1. Real kernel
+            auto t0 = wait_and_clock();
+            q.submit([&](sycl::handler & cgh) {
+                sycl::local_accessor<sycl::half, 1> slm_w(XMX_TN * XMX_TK, cgh);
+                sycl::local_accessor<sycl::half, 1> slm_a(XMX_TM * XMX_TK, cgh);
+                sycl::local_accessor<float, 1>      slm_acc_out(XMX_TILE_M * XMX_TILE_N, cgh);
+                cgh.parallel_for<unified_matmul_xmx_kernel_detail_name<XMX_TM, XMX_TN, XMX_TK>>(
+                    xmx_range, [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(XMX_SUBGROUP_SIZE)]] {
+                        unified_matmul_xmx_kernel_impl<XMX_TM, XMX_TN, XMX_TK>(item, args, slm_w, slm_a, slm_acc_out);
+                    });
+            });
+            auto t1 = wait_and_clock();
+
+            // 2. Empty kernel with identical nd_range (launch+barrier baseline)
+            q.submit([&](sycl::handler & cgh) {
+                cgh.parallel_for<unified_matmul_xmx_empty_kernel_name<XMX_TM, XMX_TN, XMX_TK>>(
+                    xmx_range, [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(XMX_SUBGROUP_SIZE)]] {
+                        (void) item;
+                    });
+            });
+            auto t2 = wait_and_clock();
+
+            // 3. SLM-load-only kernel (same dequant + SLM stores, no XMX compute)
+            q.submit([&](sycl::handler & cgh) {
+                sycl::local_accessor<sycl::half, 1> slm_w(XMX_TN * XMX_TK, cgh);
+                sycl::local_accessor<sycl::half, 1> slm_a(XMX_TM * XMX_TK, cgh);
+                cgh.parallel_for<unified_matmul_xmx_slm_only_kernel_name<XMX_TM, XMX_TN, XMX_TK>>(
+                    xmx_range, [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(XMX_SUBGROUP_SIZE)]] {
+                        unified_matmul_xmx_slm_only_kernel_impl<XMX_TM, XMX_TN, XMX_TK>(item, args, slm_w, slm_a);
+                    });
+            });
+            auto t3 = wait_and_clock();
+
+            auto & s = g_xmx_detail_stats;
+            s.n_ops++;
+            s.us_total += std::chrono::duration<double, std::micro>(t1 - t0).count();
+            s.us_launch += std::chrono::duration<double, std::micro>(t2 - t1).count();
+            s.us_slm_total += std::chrono::duration<double, std::micro>(t3 - t2).count();
+            s.sum_wg += static_cast<uint64_t>(xmx_grid_m) * static_cast<uint64_t>(xmx_grid_n);
+            xmx_detail_dump_if_due();
+            return;
+        }
+
+        // --- Production path (no instrumentation) ---------------------------
         q.submit([&](sycl::handler & cgh) {
             // Allocate SLM for half-precision data
             sycl::local_accessor<sycl::half, 1> slm_w(XMX_TN * XMX_TK, cgh);  // Weights
@@ -3678,11 +3907,8 @@ void launch_unified_matmul(sycl::queue & q, const UnifiedKernelArgs & args_in) {
             // Float SLM for boundary case accumulator output
             sycl::local_accessor<float, 1>      slm_acc_out(XMX_TILE_M * XMX_TILE_N, cgh);
 
-            sycl::nd_range<2> range(sycl::range<2>(xmx_grid_m * xmx_wg_m, xmx_grid_n * xmx_wg_n),
-                                    sycl::range<2>(xmx_wg_m, xmx_wg_n));
-
             cgh.parallel_for<unified_matmul_xmx_kernel_name<XMX_TM, XMX_TN, XMX_TK>>(
-                range, [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(XMX_SUBGROUP_SIZE)]] {
+                xmx_range, [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(XMX_SUBGROUP_SIZE)]] {
                     unified_matmul_xmx_kernel_impl<XMX_TM, XMX_TN, XMX_TK>(item, args, slm_w, slm_a, slm_acc_out);
                 });
         });
