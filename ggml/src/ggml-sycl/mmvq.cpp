@@ -3862,7 +3862,12 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
             has_table_event = true;
             if (src0_extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES) {
                 expert_ptrs = static_cast<const void * const *>(src0_extra->moe_expert_ptrs_device[ctx.device]);
-                if (placement_plan_active) {
+                // T4 Gap 2a: previously gated on placement_plan_active only; the
+                // planner-inactive + host_weights + mixed-ptrs triangle (e.g. VRAM
+                // budget exhaustion with mmap'd MXFP4 experts) also needs to bail
+                // so the caller can retry with CPU dispatch. Fire whenever the
+                // pointer table is mixed, regardless of planner state.
+                if (placement_plan_active || host_weights) {
                     const auto & host_ptrs  = src0_extra->moe_expert_ptrs_host[ctx.device];
                     bool         mixed_ptrs = false;
                     for (const void * ptr : host_ptrs) {
@@ -3873,9 +3878,10 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                     }
                     if (mixed_ptrs) {
                         GGML_SYCL_DEBUG(
-                            "[MMVQ] Placement-plan host-routed experts present for %s; "
-                            "falling back from MMVQ to hybrid dispatch\n",
-                            src0->name ? src0->name : "?");
+                            "[MMVQ] Mixed device/host expert pointers for %s (plan=%d host=%d); "
+                            "falling back to hybrid dispatch\n",
+                            src0->name ? src0->name : "?", placement_plan_active ? 1 : 0,
+                            host_weights ? 1 : 0);
                         return false;
                     }
                 }
