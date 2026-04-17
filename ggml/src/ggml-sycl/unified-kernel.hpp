@@ -1904,23 +1904,29 @@ SYCL_EXTERNAL inline void dequant_mxfp4_to_half(const block_mxfp4_unified * bloc
 
 
 /**
- * Vectorized per-block MXFP4 dequantization to SLM row.
+ * Reference (4-byte-aligned) variant of the vectorized per-block MXFP4
+ * dequant helper. Mirrors the Q4_0 helper dequant_q4_0_block_half8 in
+ * unified-kernel.cpp — 4x raw uint32_t qs loads + 16-entry LUT
+ * (kvalues_mxfp4_unified) + 4x sycl::vec<half, 8> stores. MXFP4 uses
+ * the signed int8 LUT directly (no `-8` bias like Q4_0), so the
+ * compiler unrolls the 32-entry lookup into predicate-free vector
+ * constant materialization.
  *
- * Dequants one 32-element MXFP4 block (1 byte E8M0 `e` + 16 bytes `qs`
- * packed as 32 E2M1 nibbles) into a contiguous 32-half SLM row using
- * 4x uint32_t packed qs loads + 16-entry LUT (kvalues_mxfp4_unified) +
- * 4x sycl::vec<half, 8> stores.
- *
- * Mirrors the Q4_0 helper dequant_q4_0_block_half8 in unified-kernel.cpp.
- * MXFP4 uses a signed int8 LUT rather than arithmetic (nibble - 8), so
- * the LUT is looked up per lane; the compiler unrolls the 32-entry
- * scalar path into predicate-free vector constant materialization.
+ * Scope: reference implementation for host-side equivalence tests
+ * (test-mxfp4-vector-dequant) and any future caller that can guarantee
+ * 4-byte-aligned qs. Kernel code paths MUST NOT call this directly —
+ * block_mxfp4_unified is 17 bytes { uint8_t e; uint8_t qs[16]; }, so
+ * in a contiguous block array `qs` rotates through {1, 2, 3, 0} mod 4
+ * alignment and raw uint32_t loads are undefined on SPIR-V / SYCL
+ * devices at <4-byte alignment. Use dequant_mxfp4_block_half8_unaligned
+ * (or the _aos wrapper) for kernel AOS paths — it covers the same
+ * semantics via memcpy-based 32-bit word assembly.
  *
  * Output layout (matches scalar dequant_mxfp4_half):
  *   slm_row[0..15]  = kvalues[qs[0..15] & 0x0F] * scale   (low nibbles)
  *   slm_row[16..31] = kvalues[qs[0..15] >> 4  ] * scale   (high nibbles)
  *
- * @param qs      Pointer to 16 packed qs bytes.
+ * @param qs      Pointer to 16 packed qs bytes (MUST be 4-byte aligned).
  * @param e       E8M0 shared exponent.
  * @param slm_row Pointer to 32 contiguous halves to fill.
  */
@@ -1992,18 +1998,28 @@ SYCL_EXTERNAL inline void dequant_mxfp4_block_half8(const uint8_t * qs,
 }
 
 /**
- * Unaligned-safe variant of dequant_mxfp4_block_half8.
+ * Unaligned-safe variant of dequant_mxfp4_block_half8 — kernel-path AOS
+ * helper. Same output and semantics as the reference `_core` above;
+ * differs only in how the four 32-bit qs words are assembled.
  *
- * block_mxfp4_unified = { uint8_t e; uint8_t qs[16]; } — block is 17 bytes, so
- * in a contiguous array of blocks `block->qs` rotates through {1, 2, 3, 0}
- * mod 4 alignment every four blocks. A raw `uint32_t` load is undefined at
- * 1-byte alignment on SPIRV / SYCL devices, so we use `memcpy` to assemble
- * the four 32-bit words. The compiler lowers `memcpy(&u32, p, 4)` to the
- * native unaligned-load instruction sequence (byte-wise on Arc, as for the
- * Q4_0 _unaligned helper).
+ * Rationale: block_mxfp4_unified = { uint8_t e; uint8_t qs[16]; } — in
+ * a contiguous block array `block->qs` rotates through {1, 2, 3, 0}
+ * mod 4 alignment every four blocks. Raw `uint32_t` loads are UB at
+ * <4-byte alignment on SPIR-V / SYCL devices, so we use `memcpy` to
+ * assemble each word. The compiler lowers `memcpy(&u32, p, 4)` to the
+ * native unaligned-load sequence (byte-wise on Arc).
  *
- * This variant MUST be used whenever the source `qs` pointer cannot be
- * assumed 4-byte aligned — which is the case for every AOS MXFP4 block.
+ * This diverges from the Q4_0 `_unaligned` helper at
+ * unified-kernel.cpp:528 only in the primitive used: Q4_0's struct
+ * `{ ggml_half d; uint8_t qs[16]; }` places qs at offset 2 (uint16-
+ * aligned), so it can use paired `uint16_t` reads + shift/or. MXFP4's
+ * offset 1 is not even uint16-aligned, so the smallest safe unit is
+ * a byte-wise memcpy. Same intent (safe unaligned qs load), different
+ * primitives dictated by the distinct struct layouts.
+ *
+ * This variant MUST be used on any AOS MXFP4 qs pointer. The `_core`
+ * helper above is the reference-only companion that assumes aligned
+ * qs — see its doc-comment for the scope split.
  */
 SYCL_EXTERNAL inline void dequant_mxfp4_block_half8_unaligned(const uint8_t * qs,
                                                               uint8_t         e,
