@@ -725,7 +725,22 @@ struct layout_policy {
 
         // Attention/FFN weights: COALESCED for best TG performance (tile-based warp-aligned access).
         // Types that don't support coalesced fall through to the default SOA path below.
+        //
+        // Phase E (XMX-RESIZE): when GGML_SYCL_SKIP_ONEDNN_Q4_0=1 is set, Q4_0 PP
+        // is routed through the unified XMX kernel which expects SOA or AOS weights
+        // (no COALESCED support). Force SOA for Q4_0 ATTENTION/FFN weights so the
+        // unified kernel dispatch guard at ggml-sycl.cpp:31236 does not skip them.
+        // TG path still works via MMVQ/DMMV SOA kernels (~77 t/s, slightly under
+        // COALESCED's 81 t/s — acceptable cost for unlocking unified XMX PP).
+        static int skip_onednn_q4_0_cached = -1;
+        if (skip_onednn_q4_0_cached < 0) {
+            const char * env        = std::getenv("GGML_SYCL_SKIP_ONEDNN_Q4_0");
+            skip_onednn_q4_0_cached = (env && std::atoi(env) != 0) ? 1 : 0;
+        }
         if (usage == tensor_usage::ATTENTION_WEIGHT || usage == tensor_usage::FFN_WEIGHT) {
+            if (skip_onednn_q4_0_cached && qtype == GGML_TYPE_Q4_0) {
+                return GGML_LAYOUT_SOA;
+            }
             if (is_coalesced_supported(qtype)) {
                 return GGML_LAYOUT_COALESCED;
             }

@@ -11992,7 +11992,19 @@ static void ggml_sycl_preload_model_weights() {
                     // function handles AOS→COALESCED in a single pass.
                     // Types that support SOA but not COALESCED (e.g. Q4_K) get SOA.
                     // Non-quantized types (f32, f16) get AOS (norm/embedding weights).
+                    //
+                    // Phase E (XMX-RESIZE): when GGML_SYCL_SKIP_ONEDNN_Q4_0=1 is set,
+                    // skip COALESCED for Q4_0 so the unified XMX kernel (which only
+                    // handles SOA/AOS) can dispatch Q4_0 PP ops. SOA is the fallback.
+                    static int skip_onednn_q4_0_preload = -1;
+                    if (skip_onednn_q4_0_preload < 0) {
+                        const char * env         = std::getenv("GGML_SYCL_SKIP_ONEDNN_Q4_0");
+                        skip_onednn_q4_0_preload = (env && std::atoi(env) != 0) ? 1 : 0;
+                    }
+                    const bool skip_coalesced_for_q4_0 =
+                        skip_onednn_q4_0_preload && tensor->type == GGML_TYPE_Q4_0;
                     const bool use_coalesced =
+                        !skip_coalesced_for_q4_0 &&
                         ggml_is_quantized(tensor->type) && is_coalesced_supported(tensor->type) &&
                         ggml_sycl_supports_reorder_mmvq(tensor->type) && ggml_sycl_layout_supports_coalesced(tensor);
                     const bool use_soa = !use_coalesced && ggml_is_quantized(tensor->type) &&
