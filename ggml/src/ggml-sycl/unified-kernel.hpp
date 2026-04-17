@@ -1902,6 +1902,100 @@ SYCL_EXTERNAL inline void dequant_mxfp4_to_half(const block_mxfp4_unified * bloc
     }
 }
 
+
+/**
+ * Vectorized per-block MXFP4 dequantization to SLM row.
+ *
+ * Dequants one 32-element MXFP4 block (1 byte E8M0 `e` + 16 bytes `qs`
+ * packed as 32 E2M1 nibbles) into a contiguous 32-half SLM row using
+ * 4x uint32_t packed qs loads + 16-entry LUT (kvalues_mxfp4_unified) +
+ * 4x sycl::vec<half, 8> stores.
+ *
+ * Mirrors the Q4_0 helper dequant_q4_0_block_half8 in unified-kernel.cpp.
+ * MXFP4 uses a signed int8 LUT rather than arithmetic (nibble - 8), so
+ * the LUT is looked up per lane; the compiler unrolls the 32-entry
+ * scalar path into predicate-free vector constant materialization.
+ *
+ * Output layout (matches scalar dequant_mxfp4_half):
+ *   slm_row[0..15]  = kvalues[qs[0..15] & 0x0F] * scale   (low nibbles)
+ *   slm_row[16..31] = kvalues[qs[0..15] >> 4  ] * scale   (high nibbles)
+ *
+ * @param qs      Pointer to 16 packed qs bytes.
+ * @param e       E8M0 shared exponent.
+ * @param slm_row Pointer to 32 contiguous halves to fill.
+ */
+SYCL_EXTERNAL inline void dequant_mxfp4_block_half8(const uint8_t * qs,
+                                                    uint8_t         e,
+                                                    sycl::half *    slm_row) {
+    const float scale = e8m0_to_float_half(e);
+
+    const uint32_t * qs32 = reinterpret_cast<const uint32_t *>(qs);
+    const uint32_t   w0   = qs32[0];
+    const uint32_t   w1   = qs32[1];
+    const uint32_t   w2   = qs32[2];
+    const uint32_t   w3   = qs32[3];
+
+    // Low nibbles: slm_row[0..15] = kvalues[qs[i] & 0x0F] * scale
+    //   w0 packs qs[0..3], w1 packs qs[4..7], w2 packs qs[8..11], w3 packs qs[12..15].
+    //   Byte i of word w is (w >> (8*i)) & 0xFF; low nibble is (w >> (8*i)) & 0x0F.
+    sycl::vec<float, 8> lo0_f(
+        static_cast<float>(kvalues_mxfp4_unified[ w0        & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w0 >>  8) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w0 >> 16) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w0 >> 24) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[ w1        & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w1 >>  8) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w1 >> 16) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w1 >> 24) & 0xF]) * scale);
+    sycl::vec<float, 8> lo1_f(
+        static_cast<float>(kvalues_mxfp4_unified[ w2        & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w2 >>  8) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w2 >> 16) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w2 >> 24) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[ w3        & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w3 >>  8) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w3 >> 16) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w3 >> 24) & 0xF]) * scale);
+
+    // High nibbles: slm_row[16..31] = kvalues[qs[i] >> 4] * scale
+    sycl::vec<float, 8> hi0_f(
+        static_cast<float>(kvalues_mxfp4_unified[(w0 >>  4) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w0 >> 12) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w0 >> 20) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w0 >> 28) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w1 >>  4) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w1 >> 12) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w1 >> 20) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w1 >> 28) & 0xF]) * scale);
+    sycl::vec<float, 8> hi1_f(
+        static_cast<float>(kvalues_mxfp4_unified[(w2 >>  4) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w2 >> 12) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w2 >> 20) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w2 >> 28) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w3 >>  4) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w3 >> 12) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w3 >> 20) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w3 >> 28) & 0xF]) * scale);
+
+    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row +  0) =
+        lo0_f.convert<sycl::half, sycl::rounding_mode::automatic>();
+    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row +  8) =
+        lo1_f.convert<sycl::half, sycl::rounding_mode::automatic>();
+    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 16) =
+        hi0_f.convert<sycl::half, sycl::rounding_mode::automatic>();
+    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 24) =
+        hi1_f.convert<sycl::half, sycl::rounding_mode::automatic>();
+}
+
+/**
+ * AOS wrapper around dequant_mxfp4_block_half8 — unpacks block->e and
+ * block->qs and forwards to the core helper.
+ */
+SYCL_EXTERNAL inline void dequant_mxfp4_block_half8_aos(const block_mxfp4_unified * block,
+                                                        sycl::half *                slm_row) {
+    dequant_mxfp4_block_half8(block->qs, block->e, slm_row);
+}
+
 /**
  * Load weights from AOS (Array of Structures) layout.
  *

@@ -562,8 +562,31 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
     endif()
     add_test(NAME moe-mxfp4-dp4a COMMAND test-moe-mxfp4-dp4a)
 
+    # Test: MXFP4 vectorized per-block dequant equivalence (Track A Task 1)
+    # Host-only: compares dequant_mxfp4_block_half8 to the scalar
+    # dequant_mxfp4_half byte-exact across 256 qs patterns x 8 exponents.
+    add_executable(test-mxfp4-vector-dequant
+        tests/test-mxfp4-vector-dequant.cpp
+    )
+    target_include_directories(test-mxfp4-vector-dequant PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    )
+    target_compile_options(test-mxfp4-vector-dequant PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_link_options(test-mxfp4-vector-dequant PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_compile_definitions(test-mxfp4-vector-dequant PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+        XMX_TEST_STANDALONE=1
+    )
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-mxfp4-vector-dequant PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME mxfp4-vector-dequant COMMAND test-mxfp4-vector-dequant)
+
     # Set test properties
-    set_tests_properties(xmx-hardware-detect xmx-esimd-basic xmx-moe-mxfp4 moe-mxfp4-dp4a PROPERTIES
+    set_tests_properties(xmx-hardware-detect xmx-esimd-basic xmx-moe-mxfp4 moe-mxfp4-dp4a mxfp4-vector-dequant PROPERTIES
         LABELS "sycl;xmx"
         TIMEOUT 120
     )
