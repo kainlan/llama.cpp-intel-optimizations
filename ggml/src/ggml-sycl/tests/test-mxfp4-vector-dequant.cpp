@@ -67,10 +67,12 @@ int main() {
 
             sycl::half ref[32];
             sycl::half vec_core[32];
+            sycl::half vec_unaligned[32];
             sycl::half vec_aos[32];
 
             ref_scalar(e, qs, ref);
             ggml_sycl_unified::dequant_mxfp4_block_half8(qs, e, vec_core);
+            ggml_sycl_unified::dequant_mxfp4_block_half8_unaligned(qs, e, vec_unaligned);
 
             ggml_sycl_unified::block_mxfp4_unified block;
             block.e = e;
@@ -80,19 +82,19 @@ int main() {
             for (int i = 0; i < 32; ++i) {
                 uint16_t ref_bits;
                 uint16_t core_bits;
+                uint16_t unaligned_bits;
                 uint16_t aos_bits;
                 std::memcpy(&ref_bits, &ref[i], sizeof(uint16_t));
                 std::memcpy(&core_bits, &vec_core[i], sizeof(uint16_t));
+                std::memcpy(&unaligned_bits, &vec_unaligned[i], sizeof(uint16_t));
                 std::memcpy(&aos_bits, &vec_aos[i], sizeof(uint16_t));
-                if (ref_bits != core_bits || ref_bits != aos_bits) {
+                if (ref_bits != core_bits || ref_bits != unaligned_bits || ref_bits != aos_bits) {
                     if (failures < 16) {
                         fprintf(stderr,
                                 "mismatch e=0x%02X byte_val=%d elem=%d "
-                                "ref=0x%04X (%.6f) core=0x%04X (%.6f) aos=0x%04X (%.6f)\n",
+                                "ref=0x%04X core=0x%04X unaligned=0x%04X aos=0x%04X\n",
                                 e, byte_val, i,
-                                ref_bits, static_cast<float>(ref[i]),
-                                core_bits, static_cast<float>(vec_core[i]),
-                                aos_bits, static_cast<float>(vec_aos[i]));
+                                ref_bits, core_bits, unaligned_bits, aos_bits);
                     }
                     ++failures;
                 }
@@ -101,7 +103,7 @@ int main() {
     }
 
     if (failures == 0) {
-        printf("OK: 256x8 qs x e combinations match byte-exact (core + aos)\n");
+        printf("OK: 256x8 qs x e combinations match byte-exact (core + unaligned + aos)\n");
         return 0;
     }
 

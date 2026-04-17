@@ -736,18 +736,20 @@ SYCL_EXTERNAL void unified_matmul_xmx_kernel_impl(sycl::nd_item<2>              
         const int     k_len   = static_cast<int>(k_end - k_start);
 
         // ==== Cooperative Load: All threads load data to SLM ====
-        // Phase C vectorized path: for Q4_0 with TILE_K a multiple of UNIFIED_QK4_0,
-        // iterate over full Q4_0 blocks (32 elems each) instead of per-element.
-        // One call to `dequant_q4_0_block_half8` replaces 32 scalar dequants.
-        // MXFP4 keeps the per-element path.
+        // Phase C vectorized path: for Q4_0 and MXFP4 with TILE_K a multiple
+        // of UNIFIED_QK4_0 (== UNIFIED_QK_MXFP4 == 32), iterate over full
+        // 32-elem blocks instead of per-element. One call to
+        // dequant_*_block_half8 replaces 32 scalar dequants.
+        // MXFP4 follows the Q4_0 pattern using dequant_mxfp4_block_half8_aos
+        // (MXFP4 is always AOS — SOA path is Q4_0-only by design).
         constexpr bool TILE_K_ALIGNED = (TILE_K % UNIFIED_QK4_0) == 0;
         constexpr int  BLOCKS_PER_ROW = TILE_K_ALIGNED ? (TILE_K / UNIFIED_QK4_0) : 0;
         constexpr int  BLOCKS_IN_TILE = TILE_N * BLOCKS_PER_ROW;
 
-        if (!is_mxfp4 && TILE_K_ALIGNED && k_len == TILE_K) {
-            // Fast path: full K-tile (no partial K boundary). Common case — Mistral
-            // Q4_0 has K divisible by TILE_K (both 32 and bigger tile configs).
-            // Each thread processes entire 32-elem Q4_0 blocks.
+        if (TILE_K_ALIGNED && k_len == TILE_K) {
+            // Fast path: full K-tile (no partial K boundary). Common case —
+            // Mistral Q4_0 and GPT-OSS 20B MXFP4 both have K divisible by 32.
+            // Each thread processes entire 32-elem blocks.
             for (int blk_idx = local_linear; blk_idx < BLOCKS_IN_TILE; blk_idx += local_total) {
                 const int     n_off    = blk_idx / BLOCKS_PER_ROW;
                 const int     kb_off   = blk_idx % BLOCKS_PER_ROW;  // which K-block within this n_row
@@ -757,7 +759,10 @@ SYCL_EXTERNAL void unified_matmul_xmx_kernel_impl(sycl::nd_item<2>              
                 sycl::half * slm_row = &slm_weights[n_off * TILE_K + kb_off * UNIFIED_QK4_0];
 
                 if (n_global < args.N) {
-                    if (use_soa) {
+                    if (is_mxfp4) {
+                        const int64_t block_idx = n_global * k_blocks_per_row + block_in_row_local;
+                        dequant_mxfp4_block_half8_aos(&weights_mx[block_idx], slm_row);
+                    } else if (use_soa) {
                         dequant_q4_0_block_half8_soa(qs_base, d_base, n_global, k_blocks_per_row,
                                                      block_in_row_local, slm_row);
                     } else {
@@ -774,7 +779,7 @@ SYCL_EXTERNAL void unified_matmul_xmx_kernel_impl(sycl::nd_item<2>              
                 }
             }
         } else {
-            // Fallback: MXFP4 or partial K boundary or non-aligned TILE_K.
+            // Fallback: partial K boundary or non-aligned TILE_K.
             // Per-element scalar dequant matches the original semantics exactly.
             for (int idx = local_linear; idx < TILE_N * TILE_K; idx += local_total) {
                 const int     n_off    = idx / TILE_K;
@@ -955,7 +960,7 @@ SYCL_EXTERNAL void unified_matmul_xmx_slm_only_kernel_impl(sycl::nd_item<2>     
         constexpr int  BLOCKS_PER_ROW = TILE_K_ALIGNED ? (TILE_K / UNIFIED_QK4_0) : 0;
         constexpr int  BLOCKS_IN_TILE = TILE_N * BLOCKS_PER_ROW;
 
-        if (!is_mxfp4 && TILE_K_ALIGNED && k_len == TILE_K) {
+        if (TILE_K_ALIGNED && k_len == TILE_K) {
             for (int blk_idx = local_linear; blk_idx < BLOCKS_IN_TILE; blk_idx += local_total) {
                 const int     n_off    = blk_idx / BLOCKS_PER_ROW;
                 const int     kb_off   = blk_idx % BLOCKS_PER_ROW;
@@ -965,7 +970,10 @@ SYCL_EXTERNAL void unified_matmul_xmx_slm_only_kernel_impl(sycl::nd_item<2>     
                 sycl::half * slm_row = &slm_weights[n_off * TILE_K + kb_off * UNIFIED_QK4_0];
 
                 if (n_global < args.N) {
-                    if (use_soa) {
+                    if (is_mxfp4) {
+                        const int64_t block_idx = n_global * k_blocks_per_row + block_in_row_local;
+                        dequant_mxfp4_block_half8_aos(&weights_mx[block_idx], slm_row);
+                    } else if (use_soa) {
                         dequant_q4_0_block_half8_soa(qs_base, d_base, n_global, k_blocks_per_row,
                                                      block_in_row_local, slm_row);
                     } else {

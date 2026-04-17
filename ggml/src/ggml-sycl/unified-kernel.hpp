@@ -1992,12 +1992,92 @@ SYCL_EXTERNAL inline void dequant_mxfp4_block_half8(const uint8_t * qs,
 }
 
 /**
- * AOS wrapper around dequant_mxfp4_block_half8 — unpacks block->e and
- * block->qs and forwards to the core helper.
+ * Unaligned-safe variant of dequant_mxfp4_block_half8.
+ *
+ * block_mxfp4_unified = { uint8_t e; uint8_t qs[16]; } — block is 17 bytes, so
+ * in a contiguous array of blocks `block->qs` rotates through {1, 2, 3, 0}
+ * mod 4 alignment every four blocks. A raw `uint32_t` load is undefined at
+ * 1-byte alignment on SPIRV / SYCL devices, so we use `memcpy` to assemble
+ * the four 32-bit words. The compiler lowers `memcpy(&u32, p, 4)` to the
+ * native unaligned-load instruction sequence (byte-wise on Arc, as for the
+ * Q4_0 _unaligned helper).
+ *
+ * This variant MUST be used whenever the source `qs` pointer cannot be
+ * assumed 4-byte aligned — which is the case for every AOS MXFP4 block.
+ */
+SYCL_EXTERNAL inline void dequant_mxfp4_block_half8_unaligned(const uint8_t * qs,
+                                                              uint8_t         e,
+                                                              sycl::half *    slm_row) {
+    const float scale = e8m0_to_float_half(e);
+
+    uint32_t w0;
+    uint32_t w1;
+    uint32_t w2;
+    uint32_t w3;
+    std::memcpy(&w0, qs +  0, sizeof(uint32_t));
+    std::memcpy(&w1, qs +  4, sizeof(uint32_t));
+    std::memcpy(&w2, qs +  8, sizeof(uint32_t));
+    std::memcpy(&w3, qs + 12, sizeof(uint32_t));
+
+    sycl::vec<float, 8> lo0_f(
+        static_cast<float>(kvalues_mxfp4_unified[ w0        & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w0 >>  8) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w0 >> 16) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w0 >> 24) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[ w1        & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w1 >>  8) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w1 >> 16) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w1 >> 24) & 0xF]) * scale);
+    sycl::vec<float, 8> lo1_f(
+        static_cast<float>(kvalues_mxfp4_unified[ w2        & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w2 >>  8) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w2 >> 16) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w2 >> 24) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[ w3        & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w3 >>  8) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w3 >> 16) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w3 >> 24) & 0xF]) * scale);
+
+    sycl::vec<float, 8> hi0_f(
+        static_cast<float>(kvalues_mxfp4_unified[(w0 >>  4) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w0 >> 12) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w0 >> 20) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w0 >> 28) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w1 >>  4) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w1 >> 12) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w1 >> 20) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w1 >> 28) & 0xF]) * scale);
+    sycl::vec<float, 8> hi1_f(
+        static_cast<float>(kvalues_mxfp4_unified[(w2 >>  4) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w2 >> 12) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w2 >> 20) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w2 >> 28) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w3 >>  4) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w3 >> 12) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w3 >> 20) & 0xF]) * scale,
+        static_cast<float>(kvalues_mxfp4_unified[(w3 >> 28) & 0xF]) * scale);
+
+    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row +  0) =
+        lo0_f.convert<sycl::half, sycl::rounding_mode::automatic>();
+    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row +  8) =
+        lo1_f.convert<sycl::half, sycl::rounding_mode::automatic>();
+    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 16) =
+        hi0_f.convert<sycl::half, sycl::rounding_mode::automatic>();
+    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 24) =
+        hi1_f.convert<sycl::half, sycl::rounding_mode::automatic>();
+}
+
+/**
+ * AOS wrapper around dequant_mxfp4_block_half8_unaligned.
+ *
+ * block_mxfp4_unified = { uint8_t e; uint8_t qs[16]; } — `block->qs` is at
+ * struct offset 1 (byte-aligned only), so we route through the _unaligned
+ * variant. Matches the Q4_0 AOS wrapper pattern (dequant_q4_0_block_half8_aos
+ * → dequant_q4_0_block_half8_unaligned) in unified-kernel.cpp:588.
  */
 SYCL_EXTERNAL inline void dequant_mxfp4_block_half8_aos(const block_mxfp4_unified * block,
                                                         sycl::half *                slm_row) {
-    dequant_mxfp4_block_half8(block->qs, block->e, slm_row);
+    dequant_mxfp4_block_half8_unaligned(block->qs, block->e, slm_row);
 }
 
 /**
