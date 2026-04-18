@@ -903,6 +903,36 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         TIMEOUT 120
     )
 
+    # mem_handle eviction-lifecycle tests (RESEARCH-A4, llama.cpp-2jmzn)
+    # Verifies cache_generation bumps + entry removal across sync and async
+    # eviction paths. Companion to llama.cpp-goegc.1.
+    add_executable(test-mem-handle-eviction
+        tests/test-mem-handle-eviction.cpp
+        unified-cache.cpp
+        pinned-pool.cpp
+        mem-handle.cpp
+    )
+    target_include_directories(test-mem-handle-eviction PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    )
+    target_compile_options(test-mem-handle-eviction PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_link_options(test-mem-handle-eviction PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_compile_definitions(test-mem-handle-eviction PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-mem-handle-eviction PRIVATE ggml-base ggml)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-mem-handle-eviction PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME mem-handle-eviction COMMAND test-mem-handle-eviction)
+    set_tests_properties(mem-handle-eviction PROPERTIES
+        LABELS "sycl;cache;mem-handle;eviction;tdd"
+        TIMEOUT 120
+    )
+
     # Test 18: UnifiedKernel Operation Tests (TDD)
     # Tests RMS norm and SiLU mul operations for persistent kernel
     add_executable(test-sycl-runtime-alloc
