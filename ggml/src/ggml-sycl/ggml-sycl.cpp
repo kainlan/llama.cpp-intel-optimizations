@@ -6282,6 +6282,20 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
                     "GPU driver wedge is possible; monitor for hangs.\n",
                     pressure_pct);
             }
+
+            if (pressure_ratio > 0.90 && is_moe_model && budget_pct_set && !cpu_offload_set && !allow_redline) {
+                GGML_LOG_WARN(
+                    "ggml-sycl: %.1f%% VRAM pressure on MoE model; redline check skipped "
+                    "because GGML_SYCL_VRAM_BUDGET_PCT is set (assuming explicit budget sizing).\n",
+                    pressure_pct);
+            }
+
+            if (pressure_ratio > 0.90 && is_moe_model && cpu_offload_set && !allow_redline) {
+                GGML_LOG_WARN(
+                    "ggml-sycl: %.1f%% VRAM pressure on MoE model; redline check skipped "
+                    "because GGML_SYCL_CPU_OFFLOAD=1 is set (experts run on CPU).\n",
+                    pressure_pct);
+            }
         }
     }
 
