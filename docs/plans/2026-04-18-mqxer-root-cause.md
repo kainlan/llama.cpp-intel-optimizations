@@ -285,21 +285,30 @@ libdnnl.so.3.9`. Without `setvars.sh`, it falls back to
 sourced setvars, so runtime = v3.9 and the source tree cloned at
 `/Apps/oneDNN` (v3.9 tag) matches 1:1.
 
-Verified by reading oneDNN v3.9 source at `/Apps/oneDNN`:
+Verified by reading oneDNN v3.9 source at `/Apps/oneDNN` (all paths
+below are under that checkout):
 
-- `src/common/gemm.cpp:97-110` — `dnnl_sgemm` calls `cpu::extended_sgemm`
-  synchronously and returns the status after completion.
-- `src/cpu/gemm/gemm.cpp:106-150` `extended_sgemm` → either calls
-  CBLAS (synchronous) or `gemm_driver` (x86-64 path).
-- `src/cpu/x64/gemm/gemm_driver.cpp:2045-2092` `gemm_driver` → builds
-  args and calls `gemm_threading_driver` synchronously.
-- `src/cpu/x64/gemm/gemm_driver.cpp:1911` `parallel(nthr_spawn, [&]{...})`
-  — this is a fork-join call. With OpenMP (our runtime, via libiomp5,
-  confirmed by ldd on llama-bench), `parallel()` expands to
-  `#pragma omp parallel num_threads(nthr)` at
-  `src/common/dnnl_thread.hpp:290`, which is a barrier/join region.
-  All OMP workers complete their closure before the parallel region
-  exits.
+- `/Apps/oneDNN/src/common/gemm.cpp:97-110` — `dnnl_sgemm` calls
+  `cpu::extended_sgemm` synchronously and returns the status after
+  completion.
+- `/Apps/oneDNN/src/cpu/gemm/gemm.cpp:106-150` `extended_sgemm` →
+  either calls CBLAS (synchronous) or `gemm_driver` (x86-64 path).
+- `/Apps/oneDNN/src/cpu/x64/gemm/gemm_driver.cpp:2045-2092`
+  `gemm_driver` → builds args and calls `gemm_threading_driver`
+  synchronously.
+- `/Apps/oneDNN/src/cpu/x64/gemm/gemm_driver.cpp:1911`
+  `parallel(nthr_spawn, [&]{...})` — this is a fork-join call.
+- **Build-config check**: the runtime libdnnl our repro loads is
+  `/opt/intel/oneapi/dnnl/2025.3/lib/libdnnl.so.3.9`. `ldd
+  llama-bench` under the canonical setvars-sourced environment
+  shows `libiomp5.so` linked (Intel's LLVM OpenMP), confirming
+  `DNNL_CPU_RUNTIME=OMP` for that build. This rules out any
+  alternate runtime (TBB/THREADPOOL/SEQ) that `dnnl_thread.hpp`'s
+  `#if` guards would steer into.
+- With OMP, `parallel()` expands to `#pragma omp parallel
+  num_threads(nthr)` at `/Apps/oneDNN/src/common/dnnl_thread.hpp:290`,
+  which is a barrier/join region. All OMP workers complete their
+  closure before the parallel region exits.
 
 So dnnl_sgemm cannot leave OMP workers in flight past its return.
 My A0 theory ("workers still running when submitter rotates staging")
@@ -343,12 +352,21 @@ into the user's address space via the DRM driver.
 
 Cross-reference with A0's instrumented pointer capture: many of the
 `weight_f32` addresses from `[A0-DEBUG]` lines fall WITHIN this DRM
-VMA range, e.g.:
+VMA range, e.g. (NOTE: the `info proc mappings` dump was captured in
+a **different process** than A0's `[A0-DEBUG]` pointer trace, so ASLR
+makes exact per-pointer VMA containment non-deterministic across runs.
+The cross-reference below should be read as "same allocation CLASS —
+DRM-backed SYCL host-USM" rather than "this exact pointer was in this
+exact VMA"):
 
-- `0x7ff7ca208a80` (logged weight_f32) — in range
-- `0x7ff79427d980` — in range
-- `0x7ff75e2f2880` — in range
-- `0x7ff7cb9fbf00` (fault) — in range
+- `0x7ff7ca208a80` (logged weight_f32) — equivalent DRM-backed class
+- `0x7ff79427d980` — equivalent DRM-backed class
+- `0x7ff75e2f2880` — equivalent DRM-backed class
+- `0x7ff7cb9fbf00` (fault) — in this run's DRM VMA
+
+A0d's retrofit run captured BOTH the `[A0D-*]` pointer events AND
+the `info proc mappings` within the **same pid** — see the A0d
+follow-up section below for the in-process-confirmed match.
 
 These weight pointers are NOT plain mmap'd GGUF file bytes. They are
 **SYCL host-USM allocations** handed back by the unified cache via
@@ -588,4 +606,104 @@ finishes before the next graph starts.
 
 - `llama.cpp-bhp87` (A0d): completed with culprit site + fix sketch.
 - `llama.cpp-mqxer`: updated with exact line number + fix pattern.
+
+## A0d retrofit — 2026-04-18 late afternoon
+
+Re-ran A0d with two additions per team-lead's polish:
+- 4th instrumentation site: `[A0D-FREE-PREFETCH]` at
+  `expert-prefetch.cpp:461-462` and `:809-811` covering both
+  `unified_free(scores_alloc_)` paths.
+- `info proc mappings` captured inside gdb in the **same pid** as
+  the `[A0D-*]` events, so the VMA match is deterministic rather
+  than ASLR-speculative (Minor 4).
+
+### Result: culprit site + line numbers refined
+
+Retrofit instrumented build exit, 65 sgemm + 268 zone-reset + 0
+deferred + 0 prefetch events. Captured maps were in the same pid
+as the events. Same-pid fault lookup:
+
+```
+[A0D-FAULT-LOOKUP] rdx=0x7ff7cbd63f00 r13=0x7ff7cbd58b00
+[A0D-FAULT-LOOKUP] RDX in VMA: 0x00007ff7cbd4f000 0x00007ff7cbe00000
+                   0xb1000  0x0  ---s  /dev/zero (deleted)
+[A0D-FAULT-LOOKUP] R13 in VMA: (same VMA)
+```
+
+**New observation**: the fault VMA in this run is `/dev/zero
+(deleted)` with permissions `---s` (no read, no write, no exec,
+shared). `error 4` read → immediate SIGSEGV because no read
+permission. Different VMA CLASS from A0c's `/dev/dri/renderD129`
+finding, but both are **SYCL host-USM shared mappings whose
+backing was torn down while still VMA-listed**. ASLR + the
+moment the mmap teardown caught relative to the fault determine
+which class we observe; the corrective action is identical.
+
+### A0d fix — line numbers on HEAD
+
+A0d initially cited `ggml-sycl.cpp:40709-40710` for the STAGING +
+SCRATCH reset pair. On current HEAD the exact lines are
+**`40708-40709`** (line numbers drift with small edits above that
+point; team-lead's quality re-review caught this). The anchor-
+robust reference:
+
+> `ggml_backend_sycl_graph_compute` entry, the two
+> `unified_cache_host_zone_reset(...)` calls immediately after
+> `ggml_sycl_moe_layer_ids_cache_new_graph()` and
+> `unified_cache_reset_scratch_pool()`.
+
+### A0d fix — batched-mode coverage caveat
+
+Proposed fix drains `g_cpu_chain_event` before the zone resets.
+That event is set by `cpu_submit_async()` (cpu-dispatch.cpp:253)
+— the **async-mode** CPU dispatch path. The **batched-mode** path
+(cpu-dispatch.cpp:4197-4204) runs dnnl_sgemm directly inside the
+caller's batched outer host_task on `gpu_q` and does NOT update
+`g_cpu_chain_event`. A reader might ask why the fix doesn't cover
+batched.
+
+Answer (quality reviewer's clarification, recorded here for the
+implementer): batched-mode host_tasks are implicitly covered by
+`gpu_q` in-order semantics — the next graph's first GPU op on
+`gpu_q` serialises after the batched outer host_task, and the
+graph_compute_impl entry itself is reached only after the prior
+graph's final SYCL work completes. The **legacy sync path** at
+cpu-dispatch.cpp:4219-4228 already calls `cpu_wait_chain_event`
+before run_mul_mat, so it is also safe.
+
+Only the async-mode code path needs the explicit drain. The fix
+site (graph_compute_impl entry) is the natural choke point —
+draining once there is cheaper than per-op event tracking, and
+correctness-equivalent for the async path that creates the race.
+
+Recommended comment to include at the fix site:
+
+```cpp
+// Drain any in-flight async-mode CPU dispatch before resetting the
+// host bump zones.  cpu_submit_async writes g_cpu_chain_event per
+// call (cpu-dispatch.cpp:253); its host_task holds pointers into
+// STAGING/SCRATCH that would be invalidated by the reset.  The
+// batched- and legacy-sync paths are covered by gpu_q in-order
+// semantics / cpu_wait_chain_event respectively.
+if (ggml_sycl_cpu_chain_event_valid()) {
+    ggml_sycl_cpu_chain_event_wait();
+}
+```
+
+### Calibration note
+
+Per team-lead's forward-looking feedback: A0 → A0b → A0c each
+proposed a fix shape before verifying the underlying theory; A0c
+had to correct A0b; A0d had to refine A0c's "DRM-backed UAF"
+to "host_zone_reset racing with async host_task specifically."
+Applying the calibration discipline here: A0d's "host_zone_reset
+at graph start is the culprit" is **CONFIRMED** by the 333-event
+instrumentation correlation with SIGSEGV. The specific VMA class
+of the fault page (/dev/dri vs /dev/zero) is **observation-only**
+— not a claim that the fix depends on.
+
+### A0d-v2 evidence files (ephemeral — tmpfs)
+
+- `/tmp/a0d-v2/gdb.txt` — gdb script with in-process maps lookup
+- `/tmp/a0d-v2/run.log` — 333 + `[A0D-FAULT-LOOKUP]` entries
 
