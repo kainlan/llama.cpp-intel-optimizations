@@ -297,6 +297,7 @@ GGML_SYCL_PERSISTENT_TG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
 | `GGML_SYCL_NAN_CHECK=1` | Enable NaN detection in outputs |
 | `GGML_SYCL_VALIDATE=1` | Enable A/B validation between kernel paths |
 | `GGML_SYCL_GRAPH_RERECORD=1` | Use graph re-record instead of replay (very slow, diagnostic only) |
+| `GGML_SYCL_OP_TIMEOUT_MS=<N>` | Abort with diagnostic if no inference progress for N ms (default 30000, set to 0 to disable). Fires before the xe driver's 10s GT-reset cascade. Effective detection latency is `timeout + ~500 ms`. |
 
 **Note**: There are 100+ additional debug/tuning env vars (GGML_SYCL_*). Search with `grep -r 'getenv("GGML_SYCL' ggml/src/ggml-sycl/` to find them all.
 
