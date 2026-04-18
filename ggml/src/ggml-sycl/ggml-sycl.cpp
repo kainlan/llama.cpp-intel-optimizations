@@ -6238,19 +6238,23 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
         vram_budget = vram_budget_base - base_headroom;
     }
 
-    // WEDGE-T1: Refuse to run MoE models at >90% VRAM pressure without an
+    // WEDGE-T1: Refuse to run MoE models at redline VRAM pressure without an
     // opt-in or an explicit CPU-offload mitigation. Running GPT-OSS 20B (12.0 GB)
     // on 11.6 GB of VRAM previously triggered a cascading BCS fault wedge that
     // required a reboot to recover. Bailing out here is before any VRAM
     // allocation happens, so no driver state is perturbed.
     //
-    // Bypass conditions (any one allows the run to proceed):
-    //   1. GGML_SYCL_CPU_OFFLOAD=1      — experts run on CPU, no GPU eviction pressure
-    //   2. GGML_SYCL_VRAM_BUDGET_PCT=N  — user has explicitly sized the VRAM budget;
+    // Bypass priority (highest first, exactly one branch fires per process):
+    //   1. GGML_SYCL_ALLOW_REDLINE=1    — explicit opt-in to the unsafe regime
+    //   2. GGML_SYCL_CPU_OFFLOAD=1      — experts run on CPU, no GPU eviction pressure
+    //   3. GGML_SYCL_VRAM_BUDGET_PCT=N  — user has explicitly sized the VRAM budget;
     //                                      low values force weights to host via the
     //                                      unified cache, avoiding the wedge pattern
-    //   3. GGML_SYCL_ALLOW_REDLINE=1    — explicit opt-in to the unsafe regime
+    //   (otherwise)                    → GGML_LOG_ERROR + GGML_ABORT
     {
+        // 10% margin below OOM for MoE expert eviction churn
+        constexpr double redline_threshold = 0.90;
+
         const bool   is_moe_model      = g_moe_n_experts_total > 0;
         const char * env_allow_redline = std::getenv("GGML_SYCL_ALLOW_REDLINE");
         const bool   allow_redline     = env_allow_redline != nullptr && std::atoi(env_allow_redline) != 0;
@@ -6262,39 +6266,44 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
                 static_cast<double>(g_tensor_inventory_total_size) / static_cast<double>(vram_budget);
             const double pressure_pct = pressure_ratio * 100.0;
 
-            if (pressure_ratio > 0.90 && is_moe_model && !cpu_offload_set && !budget_pct_set && !allow_redline) {
-                GGML_LOG_ERROR(
-                    "ggml-sycl: refusing to run — VRAM pressure %.1f%% exceeds safe threshold (90%%) for MoE model.\n"
-                    "This configuration previously caused GPU driver wedges under eviction backpressure.\n"
-                    "\n"
-                    "Mitigations (pick one):\n"
-                    "  - export GGML_SYCL_VRAM_BUDGET_PCT=60     # reduce VRAM budget, weights move to host\n"
-                    "  - export GGML_SYCL_CPU_OFFLOAD=1          # enable CPU expert offload path\n"
-                    "  - export GGML_SYCL_ALLOW_REDLINE=1        # opt-in to unsafe regime (your own risk)\n",
-                    pressure_pct);
-                GGML_ABORT("ggml-sycl: refusing to run MoE model at %.1f%% VRAM pressure (see log above)",
-                           pressure_pct);
-            }
-
-            if (pressure_ratio > 0.90 && is_moe_model && allow_redline) {
-                GGML_LOG_WARN(
-                    "ggml-sycl: GGML_SYCL_ALLOW_REDLINE=1 set — proceeding at %.1f%% VRAM pressure (MoE). "
-                    "GPU driver wedge is possible; monitor for hangs.\n",
-                    pressure_pct);
-            }
-
-            if (pressure_ratio > 0.90 && is_moe_model && budget_pct_set && !cpu_offload_set && !allow_redline) {
-                GGML_LOG_WARN(
-                    "ggml-sycl: %.1f%% VRAM pressure on MoE model; redline check skipped "
-                    "because GGML_SYCL_VRAM_BUDGET_PCT is set (assuming explicit budget sizing).\n",
-                    pressure_pct);
-            }
-
-            if (pressure_ratio > 0.90 && is_moe_model && cpu_offload_set && !allow_redline) {
-                GGML_LOG_WARN(
-                    "ggml-sycl: %.1f%% VRAM pressure on MoE model; redline check skipped "
-                    "because GGML_SYCL_CPU_OFFLOAD=1 is set (experts run on CPU).\n",
-                    pressure_pct);
+            if (pressure_ratio > redline_threshold && is_moe_model) {
+                // set_tensor_inventory is called once per device in a loop at
+                // llama-model.cpp:8646. Gate the log/abort so multi-GPU systems
+                // don't emit duplicate banners and so the abort path fires once.
+                static bool warned = false;
+                if (!warned) {
+                    warned = true;
+                    if (allow_redline) {
+                        GGML_LOG_WARN(
+                            "ggml-sycl: GGML_SYCL_ALLOW_REDLINE=1 set — proceeding at %.1f%% VRAM pressure (MoE). "
+                            "GPU driver wedge is possible; monitor for hangs.\n",
+                            pressure_pct);
+                    } else if (cpu_offload_set) {
+                        GGML_LOG_WARN(
+                            "ggml-sycl: %.1f%% VRAM pressure on MoE model; redline check skipped "
+                            "because GGML_SYCL_CPU_OFFLOAD=1 is set (experts run on CPU).\n",
+                            pressure_pct);
+                    } else if (budget_pct_set) {
+                        GGML_LOG_WARN(
+                            "ggml-sycl: %.1f%% VRAM pressure on MoE model; redline check skipped "
+                            "because GGML_SYCL_VRAM_BUDGET_PCT is set (assuming explicit budget sizing).\n",
+                            pressure_pct);
+                    } else {
+                        GGML_LOG_ERROR(
+                            "ggml-sycl: refusing to run — VRAM pressure %.1f%% exceeds safe threshold (90%%) for MoE "
+                            "model.\n"
+                            "This configuration previously caused GPU driver wedges under eviction backpressure.\n"
+                            "\n"
+                            "Mitigations (pick one):\n"
+                            "  - export GGML_SYCL_VRAM_BUDGET_PCT=60     # reduce VRAM budget, weights move to host\n"
+                            "  - export GGML_SYCL_CPU_OFFLOAD=1          # enable CPU expert offload path\n"
+                            "  - export GGML_SYCL_ALLOW_REDLINE=1        # opt-in to unsafe regime (at your own "
+                            "risk)\n",
+                            pressure_pct);
+                        GGML_ABORT("ggml-sycl: refusing to run MoE model at %.1f%% VRAM pressure (see log above)",
+                                   pressure_pct);
+                    }
+                }
             }
         }
     }

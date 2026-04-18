@@ -271,7 +271,7 @@ GGML_SYCL_PERSISTENT_TG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
 **Memory budget and pressure hierarchy**:
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `GGML_SYCL_VRAM_BUDGET_PCT=N` | 90 | VRAM budget as % of total (triggers CPU offload when model exceeds) |
+| `GGML_SYCL_VRAM_BUDGET_PCT=N` | 90 | VRAM budget as % of total (triggers CPU offload when model exceeds). Setting this env var also bypasses the MoE redline abort — see "Safety checks" below. |
 | `GGML_SYCL_KV_HOST=1` | OFF | Force KV cache to host pinned memory (Level 1 offload) |
 | `GGML_SYCL_KV_HOT_LAYERS=N` | auto | Hot layer count for per-layer KV hot/cold tiering |
 | `GGML_SYCL_KV_HOT_PCT=N` | auto | Hot window as % of total KV buffer |
@@ -279,6 +279,18 @@ GGML_SYCL_PERSISTENT_TG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
 | `GGML_SYCL_HOST_COMPUTE=1` | OFF | Use host-pinned compute buffers (eliminates staging for CPU-dispatched layers) |
 | `GGML_SYCL_PIPELINE_MOE=1` | OFF | Pipeline multi-GPU MoE: overlap B50 expert compute with GPU0 attention via background scatter thread |
 | `GGML_SYCL_PIPELINE_CPU=1` | OFF | Pipeline CPU expert compute with GPU attention across MoE layers: CPU experts from layer N run during layer N+1 attention |
+
+**Safety checks** (startup refusals to prevent GPU driver wedges):
+
+At model-load time, ggml-sycl aborts before any VRAM allocation if a MoE model would run at >90% VRAM pressure (`model_size / vram_budget > 0.90` AND `hparams.n_expert > 0`). The default GPT-OSS 20B config on Arc B580 previously caused a cascading BCS page-fault wedge that required a reboot. The check is skipped — with a `GGML_LOG_WARN` — when any one of these env vars is set:
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `GGML_SYCL_ALLOW_REDLINE=1` | OFF | Explicit opt-in to the redline regime. Emits a warning and proceeds; GPU wedge is possible. |
+| `GGML_SYCL_CPU_OFFLOAD=1` | OFF | Bypasses redline (experts run on CPU, no eviction pressure). Note: also requires `ONEAPI_DEVICE_SELECTOR="level_zero:0;opencl:cpu"`. |
+| `GGML_SYCL_VRAM_BUDGET_PCT=N` | unset | Bypasses redline (presence of the env var is treated as explicit budget sizing). Low values force weights to host via the unified cache. |
+
+Non-MoE dense models (`n_expert == 0`) never trigger the refusal even at 100% pressure — the wedge pattern is MoE-specific (expert eviction churn under VRAM backpressure).
 
 **Cache and memory**:
 | Variable | Effect |
