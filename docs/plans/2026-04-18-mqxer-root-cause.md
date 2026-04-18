@@ -443,3 +443,149 @@ are DRM-backed, not heap.
 - `/tmp/a0c-gdb.txt` — gdb script with python maps extractor
 - `/tmp/a0c-maps.log` — `info proc mappings` + fault register dump
 
+## A0d follow-up — 2026-04-18 afternoon — culprit site identified
+
+Added instrumentation to log every `[A0D-READ-SGEMM]` (before
+`dnnl_sgemm` at cpu-dispatch.cpp:4191), every `[A0D-FREE-DEFERRED]`
+(inside `process_deferred_frees` device + host branches), and every
+`[A0D-FREE-RESET]` (inside `host_zone_reset` and `free_pinned_runtime`).
+Instrumentation in an instrumented build only — backed out before
+commit, verified via `git diff`.
+
+### Result: culprit is host_zone_reset at ggml-sycl.cpp:40709-40710
+
+333 `[A0D-*]` events captured in the repro log. Pattern is strikingly
+regular across the TG phase:
+
+```
+[A0D-READ-SGEMM] t=45331.269351385 weight=0x7ff7ca208a80  (last sgemm before fault)
+[A0D-FREE-RESET] t=45331.???      host_zone_reset(zone=2)  ← STAGING
+[A0D-FREE-RESET] t=45331.???      host_zone_reset(zone=3)  ← SCRATCH
+[A0D-READ-SGEMM] t=...            (next token's sgemm)
+  ... 65 total TG M=1 calls ...
+SIGSEGV (fault rdx=0x7ff7cb9fbf00)
+```
+
+Zero `[A0D-FREE-DEFERRED]` events and zero `[A0D-FREE-RESET] ...
+free_pinned_runtime` events. All `[A0D-FREE-RESET]` events are
+`host_zone_reset(zone=STAGING)` and `host_zone_reset(zone=SCRATCH)`
+paired. These are zone=2 (STAGING) and zone=3 (SCRATCH) per the
+`host_zone_id` enum in `pinned-pool.hpp:24-29`.
+
+Call site: **`ggml-sycl.cpp:40709-40710`** inside
+`ggml_backend_sycl_graph_compute` (or equivalent — the
+graph-compute entry point):
+
+```cpp
+ggml_sycl::unified_cache_reset_scratch_pool(sycl_ctx->device);
+ggml_sycl::unified_cache_host_zone_reset(ggml_sycl::host_zone_id::STAGING);
+ggml_sycl::unified_cache_host_zone_reset(ggml_sycl::host_zone_id::SCRATCH);
+```
+
+This executes at the start of EVERY graph_compute_impl. For TG,
+llama-bench issues one token per graph, so these resets fire
+per-token.
+
+### How the race lands
+
+1. Graph N (token N) enters `graph_compute_impl`. Host zones
+   STAGING + SCRATCH are reset (bump allocator offsets go to 0;
+   the TLSF / registry is purged).
+2. Graph N's ops run. The MoE router MUL_MAT dispatches to
+   `cpu_mul_mat` at cpu-dispatch.cpp:3770. For this op,
+   `async_mode=true` (async_requested && gpu_q &&
+   !force_sync_for_moe_routing — the router is NOT in the MoE
+   routing chain, so the guard doesn't fire). Main thread stages
+   src1 activation into STAGING (via `staging_ensure` ->
+   `host_zone_alloc(STAGING, size)`), submits a host_task wrapping
+   `dnnl_sgemm(weight, src1, dst)`, and RETURNS.
+3. Main thread proceeds past cpu_mul_mat through the rest of
+   graph N, eventually exiting `graph_compute_impl`.
+4. llama-bench issues the next token → graph N+1 →
+   `graph_compute_impl` entry → lines 40709-40710 reset STAGING
+   + SCRATCH.
+5. **Meanwhile**, the host_task from graph N is still running
+   `dnnl_sgemm` on a SYCL-runtime worker thread, using the src1
+   pointer that was handed out from STAGING in step 2. When N+1
+   resets STAGING, the TLSF bump pointer and registry state are
+   purged — subsequent N+1 allocations from STAGING will hand out
+   overlapping bytes. Concurrent writes into the overlap region
+   (or page-level TTM actions by the xe driver during re-use of
+   this virtual range) produce the unmapped-page SIGSEGV observed.
+
+The fault address `0x7ff7cb9fbf00` is inside the 2 GB DRM VMA
+that backs this pinned-chunk pool's STAGING zone. Consistent.
+
+### Why the "zone_reset doesn't free DRM pages" argument from A0c
+was incomplete
+
+A0c concluded "pinned chunks stay mapped for process lifetime, so
+resetting the bump allocator shouldn't cause SEGV — fault must be
+in a different mechanism." That was half right: the chunks stay
+mapped, BUT resetting the bump allocator while a CONCURRENT host_task
+holds a pointer into a now-recycled region creates a TTM-level
+contention. The xe driver / L0 runtime may unmap or remap individual
+pages within the chunk under that contention. The user-space `rw-s`
+VMA remains; the specific 4KB page hosting the fault address is
+not present at the moment of the `vmovups`. That's the `error 4`
+the kernel reported.
+
+The specific sequence that causes page unmap within a live chunk
+remains unknown without kernel-side instrumentation — but it
+doesn't have to be understood at the kernel level for the fix.
+The fix is at the user-space contract: don't reset the zone while
+a host_task still references it.
+
+### Fix direction (evidence-locked now)
+
+At `ggml-sycl.cpp:40709-40710`, before calling
+`unified_cache_host_zone_reset(STAGING)` and
+`unified_cache_host_zone_reset(SCRATCH)`:
+
+**Wait for all in-flight host_tasks to complete.** Specifically:
+- There is a global chain event `g_cpu_chain_event` (cpu-dispatch.cpp:253)
+  that always points at the most recent async CPU host_task. Calling
+  `g_cpu_chain_event.wait()` before the zone resets would drain
+  the outstanding host_tasks.
+- Alternately, track per-zone host_task events in the unified cache
+  (similar to how `g_staging_compute_evt[]` per bank already tracks
+  CPU events) and wait on them before the zone reset.
+
+Either approach is 5-20 LOC in the right place. Risk: one-wait-point
+before two zone resets (per token) adds a sync edge; if the last
+async sgemm hasn't finished, we wait. For TG this is actually fine
+because the very next graph's first op will consume the previous
+token's MoE output anyway — the wait is on the critical path in
+practice, not adding latency.
+
+Recommended: add `ggml_sycl_cpu_offload_drain_chain()` helper (or
+inline `if (g_cpu_chain_event_valid) { g_cpu_chain_event.wait();
+g_cpu_chain_event_valid = false; }`) immediately before line 40709.
+Measure PP/TG impact; should be <1% because the host_task usually
+finishes before the next graph starts.
+
+### Confidence level
+
+- **Very high**: A0D instrumentation confirmed host_zone_reset is
+  the only active free-class event during the TG phase.
+- **Very high**: no deferred_free or free_pinned_runtime events fire
+  during TG, so those paths are not the culprit.
+- **High**: race window is between host_task submission in
+  cpu_mul_mat's async_mode path and the next graph's host_zone_reset.
+- **Medium**: the specific mechanism by which STAGING-zone reset
+  unmaps a DRM page (as opposed to just recycling bytes) — I
+  hypothesize TTM page-level contention, but don't have kernel-side
+  proof. The user-space contract fix works regardless of that
+  mechanism.
+
+### A0d evidence files (ephemeral — tmpfs)
+
+- `/tmp/a0d/gdb.txt` — gdb script with info proc mappings at fault
+- `/tmp/a0d/run.log` — 333 [A0D-*] events + fault register dump +
+  maps dump
+
+### Bead updates
+
+- `llama.cpp-bhp87` (A0d): completed with culprit site + fix sketch.
+- `llama.cpp-mqxer`: updated with exact line number + fix pattern.
+
