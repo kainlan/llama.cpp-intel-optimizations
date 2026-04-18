@@ -197,9 +197,9 @@ struct placement_plan {
     size_t                       vram_budget;        // VRAM budget used for planning (primary device)
     int                          device_id;          // Primary device (single-device) or -1 (multi-device)
     bool                         multi_device;       // True if plan spans multiple GPUs
-    size_t                       kv_per_layer             = 0;
-    size_t                       kv_per_swa_layer         = 0;
-    std::vector<bool>            swa_layer_mask;           // swa_layer_mask[l] == true → SWA layer
+    size_t                       kv_per_layer     = 0;
+    size_t                       kv_per_swa_layer = 0;
+    std::vector<bool>            swa_layer_mask;  // swa_layer_mask[l] == true → SWA layer
     uint32_t                     planner_n_ctx            = 0;
     bool                         planner_n_ctx_is_runtime = false;
     size_t                       host_zone_weight_bytes   = 0;
@@ -210,32 +210,32 @@ struct placement_plan {
 
     // --- Inference memory categories (computed by populate_host_zone_sizing) ---
     // oneDNN reorder: one temp buffer (max weight tensor size) reused per layer.
-    size_t onednn_reorder_bytes    = 0;  // Zone: SCRATCH (device VRAM)
+    size_t onednn_reorder_bytes      = 0;  // Zone: SCRATCH (device VRAM)
     // MoE Q8_1 workspace: quantized activations for batched expert dispatch.
-    size_t moe_q8_workspace_bytes  = 0;  // Zone: SCRATCH (device VRAM)
+    size_t moe_q8_workspace_bytes    = 0;  // Zone: SCRATCH (device VRAM)
     // Expert bias D2H copy: float bias tensors staged to host for gate computation.
-    size_t expert_bias_bytes       = 0;  // Zone: STAGING (host pinned)
+    size_t expert_bias_bytes         = 0;  // Zone: STAGING (host pinned)
     // MoE routing: per-batch expert ID staging buffer (n_expert * max_batch_tokens * sizeof(int32_t)).
-    size_t moe_routing_ids_bytes   = 0;  // Zone: RUNTIME (device VRAM)
+    size_t moe_routing_ids_bytes     = 0;  // Zone: RUNTIME (device VRAM)
     // MoE expert pointer tables: void* per expert per MoE layer (MAX_EXPERTS * n_moe_layers * sizeof(void*)).
-    size_t moe_expert_ptrs_bytes   = 0;  // Zone: RUNTIME (device VRAM)
+    size_t moe_expert_ptrs_bytes     = 0;  // Zone: RUNTIME (device VRAM)
     // Combined VRAM RUNTIME reservation for MoE routing buffers (routing_ids + expert_ptrs).
     // 0 when model has no MoE layers.
-    size_t moe_vram_runtime_bytes  = 0;  // Zone: RUNTIME (device VRAM)
+    size_t moe_vram_runtime_bytes    = 0;  // Zone: RUNTIME (device VRAM)
     // DMA staging pool: device-resident double-buffer for host→device weight streaming.
     // Sized as max_tensor_bytes × k_dma_pipeline_depth (2 buffers). 0 when streaming disabled.
-    size_t dma_staging_pool_bytes  = 0;  // Zone: RUNTIME (device VRAM)
+    size_t dma_staging_pool_bytes    = 0;  // Zone: RUNTIME (device VRAM)
     // oneDNN scratchpad: workspace for matmul weight reorder (weights) + activation buffer.
     // Sized as max_tensor_bytes × 2. Must fit within the ONEDNN zone (default 256 MB).
-    size_t onednn_scratchpad_bytes = 0;  // Zone: ONEDNN (device VRAM)
+    size_t onednn_scratchpad_bytes   = 0;  // Zone: ONEDNN (device VRAM)
     // PP pipeline scratch: double-buffered FP16 weight staging for prompt-processing
     // dequant prefetch. Computed from the largest quantized weight tensor as
     // 2 x (n_elements * sizeof(fp16)). Lives in the RUNTIME zone.
     size_t pp_pipeline_scratch_bytes = 0;  // Zone: RUNTIME (device VRAM)
     // CPU quantization temp buffers: pre-allocated by T1 cpu_dispatch_buffers.
-    size_t cpu_quant_buffer_bytes  = 0;  // Zone: HOST (system heap)
+    size_t cpu_quant_buffer_bytes    = 0;  // Zone: HOST (system heap)
     // Graph metadata: layer classification vectors and MoE routing tables.
-    size_t graph_metadata_bytes    = 0;  // Zone: HOST (system heap)
+    size_t graph_metadata_bytes      = 0;  // Zone: HOST (system heap)
 
     // --- Tensor Parallelism buffer estimates (0 when TP is disabled) ---
     // Per-layer FFN compute buffers on secondary TP devices (device VRAM).
@@ -1628,16 +1628,18 @@ class unified_cache {
     // Budget headroom: budget_ - used_ (what the cache thinks is available).
     size_t available_budget() const { return available(); }
 
-    void *           allocate_pinned_runtime(size_t size, size_t alignment = 64);
-    void             free_pinned_runtime(void * ptr, size_t size);
-    void             host_zone_reset(host_zone_id zone);
-    size_t           host_zone_used(host_zone_id zone) const;
-    size_t           host_zone_capacity(host_zone_id zone) const;
-    void             configure_host_zones(size_t weight_bytes, size_t kv_bytes, size_t staging_bytes,
-                                          size_t scratch_bytes);
-    bool             host_zones_configured() const;
-    void             grow_scratch_zone(size_t additional_bytes);
-    size_t           pinned_pool_budget() const { return host_arena_ ? host_arena_->budget() : 0; }
+    void * allocate_pinned_runtime(size_t size, size_t alignment = 64);
+    void   free_pinned_runtime(void * ptr, size_t size);
+    void   host_zone_reset(host_zone_id zone);
+    void   host_zone_free(host_zone_id zone, void * ptr);
+    size_t host_zone_used(host_zone_id zone) const;
+    size_t host_zone_capacity(host_zone_id zone) const;
+    void   configure_host_zones(size_t weight_bytes, size_t kv_bytes, size_t staging_bytes, size_t scratch_bytes);
+    bool   host_zones_configured() const;
+    void   grow_scratch_zone(size_t additional_bytes);
+
+    size_t pinned_pool_budget() const { return host_arena_ ? host_arena_->budget() : 0; }
+
     bool             contains_pinned(const void * ptr) const;
     size_t           pre_allocate_pinned(size_t total_bytes);
     size_t           pre_allocate_all(size_t model_weight_bytes);
@@ -1660,13 +1662,13 @@ class unified_cache {
 
     // Friends: internal implementation functions that need zone access.
     // Consumer code must use unified_cache_zone_alloc / unified_allocate instead.
-    friend bool         unified_alloc(const alloc_request & req_in, alloc_handle * out);
-    friend void *       unified_cache_arena_alloc_weight(int device_id, size_t size);
-    friend void *       unified_cache_kv_arena_alloc(int device_id, size_t size);
-    friend void *       unified_cache_zone_alloc(int device_id, vram_zone_id zone, size_t size, size_t align);
-    friend void         unified_cache_zone_free(int device_id, vram_zone_id zone, void * ptr);
-    friend void         unified_cache_zone_reset(int device_id, vram_zone_id zone);
-    friend void *       device_pool_arena_alloc(unified_cache * cache, size_t size, size_t align);
+    friend bool   unified_alloc(const alloc_request & req_in, alloc_handle * out);
+    friend void * unified_cache_arena_alloc_weight(int device_id, size_t size);
+    friend void * unified_cache_kv_arena_alloc(int device_id, size_t size);
+    friend void * unified_cache_zone_alloc(int device_id, vram_zone_id zone, size_t size, size_t align);
+    friend void   unified_cache_zone_free(int device_id, vram_zone_id zone, void * ptr);
+    friend void   unified_cache_zone_reset(int device_id, vram_zone_id zone);
+    friend void * device_pool_arena_alloc(unified_cache * cache, size_t size, size_t align);
 
     // Evict lowest-scoring entry to make room for new_size bytes
     // Returns true if eviction succeeded, false if all entries are pinned
@@ -2126,7 +2128,8 @@ struct alloc_handle {
     // through a zone sub-allocator instead of a raw sycl::malloc call.
     // unified_free() uses these to dispatch the correct reclaim path:
     //   zone_managed=true, vram_zone!=COUNT → cache->zone_free(vram_zone, ptr) [TLSF reclaim]
-    //   zone_managed=true, host_zone!=COUNT → host zone bump, no-op free (freed by zone_reset)
+    //   zone_managed=true, host_zone==WEIGHT → cache->host_zone_free(WEIGHT, ptr) [TLSF reclaim]
+    //   zone_managed=true, host_zone==SCRATCH|STAGING|KV → reset-only (freed by host_zone_reset)
     //   zone_managed=false                  → registry lookup → sycl::free or pinned_pool free
     bool         zone_managed = false;
     vram_zone_id vram_zone    = vram_zone_id::COUNT;
@@ -2284,15 +2287,19 @@ offload_stats_snapshot offload_stats_get();
 void                   offload_stats_log_summary(const char * tag, int device);
 void                   zero_alloc_check(const char * tag, int device);
 
-bool                   arena_pp_profile_enabled();
-bool                   arena_pp_profile_active();
-bool                   arena_pp_profile_begin(int device, bool is_prompt_phase);
-void                   arena_pp_profile_end(const char * tag, int device);
-void                   arena_pp_profile_note_onednn_reserve(size_t weights_size, size_t activations_size, bool reused,
-                                                            bool arena_attempted, bool arena_success,
-                                                            bool direct_attempted, bool ok, double elapsed_us);
-void                   arena_pp_profile_note_onednn_get(size_t weights_needed, size_t activations_needed, bool ok,
-                                                        double elapsed_us);
+bool arena_pp_profile_enabled();
+bool arena_pp_profile_active();
+bool arena_pp_profile_begin(int device, bool is_prompt_phase);
+void arena_pp_profile_end(const char * tag, int device);
+void arena_pp_profile_note_onednn_reserve(size_t weights_size,
+                                          size_t activations_size,
+                                          bool   reused,
+                                          bool   arena_attempted,
+                                          bool   arena_success,
+                                          bool   direct_attempted,
+                                          bool   ok,
+                                          double elapsed_us);
+void arena_pp_profile_note_onednn_get(size_t weights_needed, size_t activations_needed, bool ok, double elapsed_us);
 
 class scoped_unified_alloc {
   public:
@@ -2442,7 +2449,6 @@ size_t compute_moe_effective_weight_bytes(size_t total_weight_bytes,
                                           size_t expert_total_bytes,
                                           int    n_expert,
                                           int    n_expert_used);
-
 
 // === OneDNN FP16 Scratch Buffer API ===
 // Reserve pre-allocated scratch buffers for oneDNN FP16 prompt processing.
@@ -2621,8 +2627,9 @@ bool unified_cache_reserve_compute_arena(int device_id, size_t arena_bytes);
 
 // Try to sub-allocate from the compute arena.
 // Returns nullptr if arena is not reserved or has insufficient space.
-[[deprecated("use unified_allocate() with prefer_vram_zone=SCRATCH instead")]]
-void * unified_cache_arena_alloc(int device_id, size_t size);
+[[deprecated("use unified_allocate() with prefer_vram_zone=SCRATCH instead")]] void * unified_cache_arena_alloc(
+    int    device_id,
+    size_t size);
 
 // Release a compute-arena allocation.
 void unified_cache_arena_free(int device_id, void * ptr, size_t size);
@@ -2667,16 +2674,16 @@ void   unified_cache_reset_scratch_pool(int device_id);
 // Called after the ggml scheduler is created and compute buffer sizes are known.
 void unified_cache_grow_host_scratch_zone(size_t additional_bytes);
 
-[[deprecated("use unified_allocate() with must_host_pinned + use_pinned_pool instead")]]
-void * unified_cache_host_zone_alloc(host_zone_id zone, size_t size, size_t alignment = 64);
-void   unified_cache_host_zone_reset(host_zone_id zone);
+[[deprecated("use unified_allocate() with must_host_pinned + use_pinned_pool instead")]] void *
+     unified_cache_host_zone_alloc(host_zone_id zone, size_t size, size_t alignment = 64);
+void unified_cache_host_zone_reset(host_zone_id zone);
 
 // Sub-allocate from a VRAM zone (ONEDNN, RUNTIME, KV scratchpads).
 // Returns nullptr if the zone is full or the arena is inactive.
 void * unified_cache_zone_alloc(int device_id, vram_zone_id zone, size_t size, size_t align = 256);
 
 // Free a sub-allocation from a VRAM zone (TLSF reclaim).
-void   unified_cache_zone_free(int device_id, vram_zone_id zone, void * ptr);
+void unified_cache_zone_free(int device_id, vram_zone_id zone, void * ptr);
 
 // Reset a VRAM zone (TLSF coalescing reset — all sub-allocations become free).
 void   unified_cache_zone_reset(int device_id, vram_zone_id zone);
