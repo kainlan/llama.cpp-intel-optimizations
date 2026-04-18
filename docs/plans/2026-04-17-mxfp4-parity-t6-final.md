@@ -4,7 +4,9 @@
 
 ## Summary
 
-Delivered everything within SYCL-backend scope. Host-resident MXFP4 GPU wedge eliminated. One architectural hygiene fix added. End-to-end coherent GPT-OSS 20B output blocked on `llama.cpp-4oi3i`, which turns out to be a **ggml-core scheduler buffer-aliasing issue** outside this epic's scope.
+Delivered everything within SYCL-backend scope, plus resolved `llama.cpp-4oi3i` via a one-line ggml-core scheduler fix after user reopened scope. **GPT-OSS 20B at VRAM_BUDGET_PCT=30 now runs end-to-end without crash** (pp64=38.17 t/s, tg32=10.21 t/s on Arc B580). Mistral 7B Q4_0 unchanged.
+
+> **Note:** earlier drafts of this doc recommended re-externalizing 4oi3i to a standalone track because the bug root-caused into ggml-core. User explicitly opened scope ("fix anywhere in llama.cpp") once the root cause was localized; the fix is now in commit `6226d2a74`.
 
 ## Epic deliverables
 
@@ -16,6 +18,7 @@ Delivered everything within SYCL-backend scope. Host-resident MXFP4 GPU wedge el
 | T4 | `40d4c7759` → `ec7f04ac4` | Dispatch gates routing host-resident MXFP4 to CPU |
 | T5 | `512d7ee72` | GPT-OSS 20B wedge resolution doc |
 | W1 (bonus) | `9a81d14d9` | SYCL `graph_compute` queue drain at exit |
+| 4oi3i fix | `6226d2a74` | ggml-core: unconditional `FLAG_OUTPUT` on cross-backend staging copies |
 
 ## W1 bonus hygiene
 
@@ -54,19 +57,39 @@ ggml-core `ggml_gallocr` reuses the `CPU#ffn_moe_topk-0#0` cross-backend staging
 
 All three paths touch ggml-core or llama.cpp graph construction. **None are in SYCL-backend scope.**
 
+## Final Phase A-C fix (`6226d2a74`)
+
+**Phase A** — full-cgraph ALIAS walker at ADD_ID call 2 (`ffn_moe_down_biased-0`): found 20+ tensors sharing the `CPU#ffn_moe_topk-0#0` staging address, including later-layer `Qcur-2`, `Kcur-2`, `ffn_moe_logits-2`, `ffn_moe_probs-2`. Galloc liveness analysis treated the staging copy as dead after local producer and aliased its slot.
+
+**Phase B** — traced to `ggml_backend_sched_split_graph` at ggml-backend.cpp:1455-1458. The code DID call `ggml_set_output(tensor_copy)` to prevent galloc reuse, but only when `sched->n_copies > 1`. Single-copy mode (default for SYCL and many configs) left the staging copy without `FLAG_OUTPUT`, so galloc reused its slot freely.
+
+**Phase C** — moved `ggml_set_output` outside the `n_copies > 1` guard. Now applies unconditionally. `ggml_set_input` stays gated (only needed for pipeline-parallel async input copy).
+
+**Phase D — verification:**
+
+| Check | Before fix | After fix |
+|-------|-----------|-----------|
+| Mistral 7B Q4_0 canonical | `6, 7, 8, 9, 10` | `6, 7, 8, 9, 10` (unchanged) |
+| Mistral 7B Q4_0 PP512 | 1701.73 t/s | 1700.79 t/s (-0.05%) |
+| Mistral 7B Q4_0 TG128 | 81.36 t/s | 81.12 t/s (-0.29%) |
+| GPT-OSS 20B pp64@30% | SIGABRT at ADD_ID | 38.17 t/s ✓ |
+| GPT-OSS 20B tg32@30% | — | 10.21 t/s ✓ |
+| GPT-OSS 20B pp128@30% | — | 41.18 t/s ✓ |
+| GPT-OSS 20B tg64@30% | — | 10.68 t/s ✓ |
+
+No GPU wedge across any run. Only benign `guc_id=0` environmental dmesg traces (same as baseline).
+
 ## T6 closeout
 
 - **Wedge eliminated**: GPU no longer hangs on host-resident MXFP4 (T4 gate fixes + T5 documentation).
 - **Kernel vectorized**: MXFP4 per-block dequant helper + SLM-load integration (T1 + T2).
 - **Architectural hygiene**: `graph_compute` queue drain (W1) closes a latent async-ordering class.
 - **CPU dispatch audit**: full MXFP4 coverage map with 4 gaps enumerated + fixed (T3 + T4).
-- **Coherent E2E output on GPT-OSS 20B**: BLOCKED. Requires ggml-core or llama-graph fix.
+- **Coherent E2E output on GPT-OSS 20B**: DELIVERED via `6226d2a74`. Stable at VRAM_BUDGET_PCT=30 with ~38 t/s PP / ~10 t/s TG.
 
-The `llama.cpp-4oi3i` bead retains the full investigation trail (X, Z, W1, Diag 2-6) in its notes field for handoff to whoever picks up the scheduler-aliasing fix.
+## The 4oi3i fix benefits every backend
 
-## Handoff recommendation
-
-Close `llama.cpp-tlcjr` (MXFP4 parity epic) at its SYCL-scope deliverables. Re-externalize `llama.cpp-4oi3i` as a standalone ggml-core task with the investigation trail already captured. Future work on 4oi3i should start from `Diag 6` and investigate ggml-core galloc liveness analysis for cross-backend staging tensors, or llama-graph construction of MoE routing.
+The buffer-aliasing bug was latent in ggml-core since before this epic. It affected any non-pipeline-parallel (`n_copies=1`) configuration with cross-backend CPU consumers of GPU-produced tensors. The fix lands in `ggml/src/ggml-backend.cpp` and improves correctness for CUDA, Metal, Vulkan, SYCL — anyone who schedules cross-backend work.
 
 ## Distinct-trace catalog carried forward
 
