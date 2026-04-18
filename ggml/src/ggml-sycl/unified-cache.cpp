@@ -3912,6 +3912,7 @@ size_t unified_cache::evict_one(size_t /* new_size */) {
         entries_.erase(it);
 
         // Bump generation so all mem_handles see that pointers may have moved.
+        // Coverage: see tests/test-mem-handle-eviction.cpp.
         cache_generation_bump();
 
         GGML_SYCL_DEBUG(
@@ -3985,6 +3986,8 @@ size_t unified_cache::finalize_evictions_locked() {
     }
 
     if (!finalized_keys.empty()) {
+        // Async-evict equivalent of the sync bump in evict_one.
+        // Coverage: see tests/test-mem-handle-eviction.cpp (async case).
         cache_generation_bump();
     }
 

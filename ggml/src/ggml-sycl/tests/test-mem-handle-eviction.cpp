@@ -12,10 +12,28 @@
 //   (3) Re-insertion after eviction produces a fresh lookup result.
 //
 // Companion to llama.cpp-goegc.1 ("stale pointer after eviction"): this test
-// confirms the generation-bump + entry-removal mitigations hold for the
-// specific scenarios above.  It does NOT prove the goegc.1 kernel-argument-
-// buffer race is closed — that race is about in-flight kernels with a ptr
-// baked into their arg buffer, which is orthogonal to mem_handle.resolve().
+// covers the PRIMARY goegc.1 failure mode — key-based lookup returning null
+// for an evicted key rather than a stale device pointer.  The kernel-args-
+// in-flight variant (a kernel already submitted with an evicted VRAM ptr
+// baked into its arg buffer) is the residual concern and needs its own
+// test when goegc.1's fix lands.
+//
+// Notes for future modifiers:
+//
+//   * Budget is 16 MB per test, not 1 MB.  The unified_cache's VRAM arena
+//     reserves ~1 GB of minimum zones (scratch+runtime+oneDNN) up-front,
+//     so very small budgets push entries to host-pinned where the evict
+//     path is quieter and the test loses coverage.  16 MB is large enough
+//     that `malloc_device_raw` at unified-cache.cpp:1852 is exercised and
+//     the entries land on device.
+//
+//   * After `cache.ensure_cached()`, entries start in state IN_PROGRESS
+//     (unified-cache.cpp:1908) while the H2D copy event drains.
+//     `get_weight_ptr()` / `try_get_cached_fast()` reject non-READY
+//     entries, but `cache.get()` (unified-cache.cpp:2353) transitions the
+//     state on observing a complete event.  Tests that need stable
+//     lookup must call `q.wait()` + `cache.get(key, layout)` after
+//     ensure_cached before asserting on other lookups.
 //
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
@@ -253,9 +271,14 @@ static bool test_async_eviction_finalize_bumps_gen(sycl::queue & q) {
 
     const uint64_t gen_before = ggml_sycl::cache_generation();
 
-    // Evict.  SOA layout is the qualifying condition for async_evict in evict_one;
-    // whether sync or async path is taken, the generation must bump by the time
-    // finalize_evictions returns.
+    // Evict.  SOA layout is the qualifying condition for async_evict in evict_one
+    // (unified-cache.cpp:3829-3830: has_transformed_layout && async_evict_enabled_).
+    // The default constructor enables async_evict unless GGML_SYCL_ASYNC_EVICT=0.
+    // If the env var disables it, this test falls through to the sync path and
+    // still passes (gen bumps at unified-cache.cpp:3915 instead of :3988) —
+    // acceptable but reduces coverage of the async path specifically.  We do
+    // not assert on the mode chosen because neither unified_cache nor async_evict
+    // exposes a public getter for the runtime mode.
     (void) cache.evict(entry_bytes * 2);
 
     // Allow any in-flight DMA to complete before finalizing. The cache submits
