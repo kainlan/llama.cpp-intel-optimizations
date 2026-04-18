@@ -274,6 +274,17 @@ Two corrections + one major discovery.
 
 ### Correction 1: dnnl_sgemm IS synchronous (A0b/A0c confirmed via source)
 
+Runtime libdnnl version reconciliation (from A0b quality-review polish):
+the canonical repro command sources `/opt/intel/oneapi/setvars.sh`,
+which prepends `/opt/intel/oneapi/dnnl/2025.3/lib` to
+`LD_LIBRARY_PATH`. With that sourced,
+`ldd $(which llama-bench) | grep libdnnl` shows
+`libdnnl.so.3 → /opt/intel/oneapi/dnnl/2025.3/lib/libdnnl.so.3 →
+libdnnl.so.3.9`. Without `setvars.sh`, it falls back to
+`/usr/local/lib/libdnnl.so.3 → libdnnl.so.3.11`. Our repro always
+sourced setvars, so runtime = v3.9 and the source tree cloned at
+`/Apps/oneDNN` (v3.9 tag) matches 1:1.
+
 Verified by reading oneDNN v3.9 source at `/Apps/oneDNN`:
 
 - `src/common/gemm.cpp:97-110` — `dnnl_sgemm` calls `cpu::extended_sgemm`
