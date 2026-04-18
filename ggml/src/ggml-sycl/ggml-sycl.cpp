@@ -282,6 +282,10 @@ int         g_ggml_sycl_debug_sync = 0;
 int g_ggml_sycl_tp_debug         = 0;  // Tensor Parallelism debug output (GGML_SYCL_TP_DEBUG env var)
 int g_ggml_sycl_tp_async_ffn     = 0;  // Async FFN pipelining (DISABLED - causes hangs)
 int g_ggml_sycl_disable_graph    = 0;
+// Safe mode: after every submit via ggml_sycl_compute_forward, drain the
+// queue so errors surface synchronously at the op that caused them. Opt-in
+// via GGML_SYCL_SAFE_MODE=1; expect 2-3x slowdown. Implies disable_graph.
+int g_ggml_sycl_safe_mode        = 0;
 int g_ggml_sycl_disable_dnn      = 0;
 int g_ggml_sycl_prioritize_dmmv  = 0;
 int g_ggml_sycl_use_async_mem_op = 0;
@@ -9533,6 +9537,15 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_debug_sync       = get_sycl_env("GGML_SYCL_DEBUG_SYNC", 0);
         g_ggml_sycl_tp_debug         = get_sycl_env("GGML_SYCL_TP_DEBUG", 0);
         g_ggml_sycl_disable_graph    = get_sycl_env("GGML_SYCL_DISABLE_GRAPH", 0);
+        g_ggml_sycl_safe_mode        = get_sycl_env("GGML_SYCL_SAFE_MODE", 0);
+        // Safe mode forces per-op queue drains (see ggml_sycl_compute_forward),
+        // which makes graph replay meaningless — the graph is submitted as a
+        // single unit and a "drain after every op" promise cannot be honored.
+        // Implying disable_graph keeps the semantics consistent: each op is
+        // dispatched directly and waited on before the next submits.
+        if (g_ggml_sycl_safe_mode && !g_ggml_sycl_disable_graph) {
+            g_ggml_sycl_disable_graph = 1;
+        }
         g_ggml_sycl_disable_dnn      = get_sycl_env("GGML_SYCL_DISABLE_DNN", 0);
         g_ggml_sycl_prioritize_dmmv  = get_sycl_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
         g_ggml_sycl_kqv_force_simple = get_sycl_env("GGML_SYCL_KQV_FORCE_SIMPLE", 0);
@@ -9553,6 +9566,10 @@ static void ggml_check_sycl() try {
 #else
         GGML_LOG_INFO("  GGML_SYCL_DISABLE_GRAPH: graph disabled by compile flag\n");
 #endif
+        if (g_ggml_sycl_safe_mode) {
+            GGML_LOG_INFO("[SYCL] Safe mode enabled — queue drained after every op "
+                          "(expect 2-3x slowdown, graph replay disabled).\n");
+        }
 #if GGML_SYCL_DNNL
         GGML_LOG_INFO("  GGML_SYCL_DISABLE_DNN: %d\n", g_ggml_sycl_disable_dnn);
 #else
@@ -38888,6 +38905,16 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
                 acc = {};
             }
         }
+    }
+
+    // WEDGE-T4: GGML_SYCL_SAFE_MODE drains the stream after every op so a
+    // SYCL exception thrown by the just-submitted work surfaces here, one
+    // op away from the cause, rather than at a later op or at process
+    // shutdown. Graph replay is forced off during env parsing (see
+    // ggml_check_sycl) because draining a recorded graph per-op is
+    // meaningless — graphs submit as a single unit.
+    if (g_ggml_sycl_safe_mode) {
+        ctx.stream()->wait();
     }
 
     return true;
