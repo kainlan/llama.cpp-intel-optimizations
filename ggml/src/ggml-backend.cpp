@@ -1452,9 +1452,18 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             for (int c = 0; c < sched->n_copies; c++) {
                                 struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
                                 ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
+                                // Mark as OUTPUT unconditionally: the scheduler later consumes this
+                                // staging copy via split->inputs[], but those uses are NOT expressed
+                                // as direct graph edges, so ggml-alloc's liveness analysis doesn't
+                                // see them. Without FLAG_OUTPUT, galloc aliases the storage with
+                                // later intermediates and GPU kernels overwrite staged data before
+                                // downstream CPU splits read it. Previously this flag was only set
+                                // for sched->n_copies > 1; the single-copy case (default for many
+                                // backends, e.g. SYCL) had a latent aliasing bug.
+                                // See llama.cpp-4oi3i for the diagnostic trail.
+                                ggml_set_output(tensor_copy);
                                 if (sched->n_copies > 1) {
                                     ggml_set_input(tensor_copy);
-                                    ggml_set_output(tensor_copy);  // prevent ggml-alloc from overwriting the tensor
                                 }
                                 tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
                                 SET_CAUSE(tensor_copy, "4.cpy");
