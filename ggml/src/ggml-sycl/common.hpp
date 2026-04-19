@@ -2786,6 +2786,24 @@ inline bool ggml_sycl_planner_authoritative_residency_active(int device) {
     return cache != nullptr && cache->has_placement_plan();
 }
 
+// Returns true if `tensor` is a weight AND currently VRAM-resident on
+// `device`.  Queries the smart-pointer resolve path (generation-checked
+// WEIGHT handle → unified cache fallback) — does NOT allocate, promote,
+// or trigger any cache load.  Safe on both graph-build and per-op
+// dispatch paths.
+//
+// This is the "smart pointer at dispatch time" query that the dispatcher
+// consults to decide whether the weight's current residency permits GPU
+// dispatch, overriding any host-routed placement *policy* when the bytes
+// are in fact in VRAM.
+inline bool ggml_sycl_weight_is_currently_device_resident(const ggml_tensor * tensor, int device) {
+    if (!tensor || device < 0 || !ggml_sycl_tensor_is_weight(tensor)) {
+        return false;
+    }
+    auto resolved = ggml_sycl_resolve(tensor, device);
+    return resolved.ptr != nullptr && resolved.on_device;
+}
+
 namespace sycl_ex = sycl::ext::oneapi::experimental;
 
 struct ggml_backend_sycl_context {

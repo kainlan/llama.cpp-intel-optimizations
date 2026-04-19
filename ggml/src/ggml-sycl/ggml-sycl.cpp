@@ -38355,9 +38355,25 @@ static bool should_dispatch_to_cpu(ggml_backend_sycl_context & ctx, const ggml_t
 
     if (ggml_sycl_planner_authoritative_residency_active(ctx.device) &&
         (ggml_sycl_op_is_moe_routing_subgraph(dst) || ggml_sycl_op_is_host_gate_activation_chain(dst, ctx.device))) {
-        g_last_dispatch_query  = dst;
-        g_last_dispatch_result = true;
-        return true;
+        // User directive: the smart pointer is the source of truth for weight
+        // placement.  If the MUL_MAT weight is currently VRAM-resident (e.g.
+        // S1-PRELOAD into device VRAM), dispatch to GPU regardless of the
+        // routing-subgraph policy preference — that heuristic expresses a
+        // "would prefer CPU locality" signal, not a placement fact.
+        //
+        // Activation-chain ops (ADD/MUL/NORM/RMS_NORM matched by
+        // is_host_gate_activation_chain) do not read a weight in src[0];
+        // they are guarded by their own planned-host-weight dependency walk
+        // and remain subject to the heuristic — the gate only applies when
+        // the op is a MUL_MAT with a weight source.
+        const bool weight_on_vram = dst->op == GGML_OP_MUL_MAT &&
+                                    ggml_sycl_weight_is_currently_device_resident(dst->src[0], ctx.device);
+        if (!weight_on_vram) {
+            g_last_dispatch_query  = dst;
+            g_last_dispatch_result = true;
+            return true;
+        }
+        // Fall through: weight is on device, let the GPU path handle it.
     }
 
     // Fast path: use pre-classified flags from classify_cpu_layer_blocks()
@@ -40371,8 +40387,17 @@ static void classify_cpu_layer_blocks(ggml_backend_sycl_context & ctx,
         if (ggml_sycl_planner_authoritative_residency_active(ctx.device) &&
             (ggml_sycl_op_is_moe_routing_subgraph(node) ||
              ggml_sycl_op_is_host_gate_activation_chain(node, ctx.device))) {
-            node_cpu_flags[i] = 1;
-            continue;
+            // Smart-pointer gate: when the MUL_MAT weight is currently
+            // VRAM-resident, do NOT pre-classify as CPU.  The routing-
+            // subgraph heuristic is a policy preference; actual placement
+            // (the smart pointer) wins.  See g0jrj rootcause §3-A.
+            const bool weight_on_vram = node->op == GGML_OP_MUL_MAT &&
+                                        ggml_sycl_weight_is_currently_device_resident(node->src[0], ctx.device);
+            if (!weight_on_vram) {
+                node_cpu_flags[i] = 1;
+                continue;
+            }
+            // Fall through to main classification (will land on GPU).
         }
 
         // View ops: inherit from previous non-noop node
@@ -40491,10 +40516,18 @@ static void classify_cpu_layer_blocks(ggml_backend_sycl_context & ctx,
                 }
                 const bool plan_forced_cpu = layer_id >= 0 && layer_id < (int) g_layer_plan_forced.size() &&
                                              g_layer_plan_forced[layer_id] && g_layer_on_cpu[layer_id];
+                // Smart-pointer gate (see g0jrj rootcause §3-A): do not
+                // keep a MoE-routing-chain MUL_MAT as CPU-routed when its
+                // weight is currently VRAM-resident.  PP graphs reset CPU
+                // flags globally; this re-assertion must honor the same
+                // actual-placement override as Phase 2.
                 const bool keep_host_gate_chain = ggml_sycl_planner_authoritative_residency_active(ctx.device) &&
                                                   node != nullptr &&
                                                   (ggml_sycl_op_is_moe_routing_subgraph(node) ||
-                                                   ggml_sycl_op_is_host_gate_activation_chain(node, ctx.device));
+                                                   ggml_sycl_op_is_host_gate_activation_chain(node, ctx.device)) &&
+                                                  !(node->op == GGML_OP_MUL_MAT &&
+                                                    ggml_sycl_weight_is_currently_device_resident(node->src[0],
+                                                                                                  ctx.device));
                 if (!plan_forced_cpu && !keep_host_gate_chain) {
                     node_cpu_flags[i] = 0;
                 }
@@ -40513,8 +40546,18 @@ static void classify_cpu_layer_blocks(ggml_backend_sycl_context & ctx,
             if (!node) {
                 continue;
             }
-            const bool needs_cpu_inputs = ggml_sycl_op_is_host_gate_activation_chain(node, ctx.device) ||
-                                          (ggml_sycl_op_is_moe_routing_subgraph(node) && node->op == GGML_OP_MUL_MAT);
+            // Smart-pointer gate (see g0jrj rootcause §3-A): a routing
+            // MUL_MAT whose weight is currently VRAM-resident does NOT need
+            // its producer chain routed to CPU — the MUL_MAT itself lands
+            // on GPU, so keeping its producers on CPU would reintroduce a
+            // D2H/H2D roundtrip with no benefit.
+            const bool routing_mul_mat_on_vram = node->op == GGML_OP_MUL_MAT &&
+                                                 ggml_sycl_op_is_moe_routing_subgraph(node) &&
+                                                 ggml_sycl_weight_is_currently_device_resident(node->src[0], ctx.device);
+            const bool needs_cpu_inputs = !routing_mul_mat_on_vram &&
+                                          (ggml_sycl_op_is_host_gate_activation_chain(node, ctx.device) ||
+                                           (ggml_sycl_op_is_moe_routing_subgraph(node) &&
+                                            node->op == GGML_OP_MUL_MAT));
             if (!needs_cpu_inputs) {
                 continue;
             }
