@@ -84,6 +84,21 @@ public:
     // query the cache.
     static mem_handle from_weight(const unified_cache_key & key, int device);
 
+    // Create a WEIGHT handle whose lease has already been acquired by the
+    // caller (via unified_cache::acquire_weight_lease).  The caller transfers
+    // ownership of the in_use_count bump to the new mem_handle — do NOT
+    // decrement it yourself.  Used by cpu-dispatch.cpp get_host_ptr() to
+    // package the lease returned by acquire_weight_lease into a handle
+    // whose dtor releases automatically (llama.cpp-vtf7f).
+    //
+    // `entry` may be nullptr for S1-PRELOAD direct entries (no refcount).
+    static mem_handle from_weight_lease(const ggml_sycl_cache_id & key_id,
+                                        int                        device,
+                                        void *                     ptr,
+                                        ggml_layout_mode           layout,
+                                        bool                       on_device,
+                                        unified_cache_entry *      entry);
+
     // Create a WEIGHT handle from a bare cache ID + device.
     // Convenience factory for callers that have ggml_sycl_cache_id (e.g.
     // layer_weight_set fields) rather than a full unified_cache_key.

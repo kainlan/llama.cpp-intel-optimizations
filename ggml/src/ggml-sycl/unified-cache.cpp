@@ -3040,13 +3040,18 @@ unified_cache::weight_ptr_lease_result unified_cache::acquire_weight_lease(
     // entries live for the lifetime of the host arena and are not evicted
     // individually).  mem_handle receives ptr with entry == nullptr; its dtor
     // will correctly skip the release.
+    //
+    // on_device reflects the stored location: HOST_PINNED direct entries are
+    // host-accessible (PCIe zero-copy), DEVICE direct entries are GPU VRAM.
+    // Callers of acquire_weight_lease() that want a host-accessible pointer
+    // (cpu_mul_mat → DNNL) must check on_device=false.
     {
         std::shared_lock<std::shared_mutex> dlock(direct_stage_mutex_);
         auto                                it = direct_weight_entries_.find(key);
         if (it != direct_weight_entries_.end() && it->second.ptr) {
             result.ptr       = it->second.ptr;
             result.layout    = it->second.layout;
-            result.on_device = true;
+            result.on_device = (it->second.location == cache_location::DEVICE);
             result.entry     = nullptr;
             return result;
         }

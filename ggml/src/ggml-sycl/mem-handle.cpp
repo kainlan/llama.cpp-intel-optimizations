@@ -35,6 +35,29 @@ mem_handle mem_handle::from_weight(const unified_cache_key & key, int device) {
     return h;
 }
 
+// llama.cpp-vtf7f: package a pre-acquired lease into a mem_handle.  The
+// caller has already incremented entry->in_use_count via
+// unified_cache::acquire_weight_lease — ownership of that increment is
+// transferred to the new handle, whose dtor will release exactly once.
+mem_handle mem_handle::from_weight_lease(const ggml_sycl_cache_id & key_id,
+                                         int                        device,
+                                         void *                     ptr,
+                                         ggml_layout_mode           layout,
+                                         bool                       on_device,
+                                         unified_cache_entry *      entry) {
+    mem_handle h;
+    h.kind_   = mem_handle_kind::WEIGHT;
+    h.device_ = device;
+    h.key_.type      = cache_entry_type::DENSE_WEIGHT;
+    h.key_.id        = key_id;
+    h.key_.layer_id  = -1;
+    h.key_.expert_id = -1;
+    h.gen_           = cache_generation();  // Fresh — no slow-path re-query
+    h.cached_        = { ptr, layout, on_device };
+    h.leased_entry_  = entry;  // ownership of the refcount bump transferred
+    return h;
+}
+
 mem_handle mem_handle::from_cache_id(const ggml_sycl_cache_id & id, int device) {
     unified_cache_key key;
     key.type       = cache_entry_type::DENSE_WEIGHT;

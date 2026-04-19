@@ -342,3 +342,85 @@ After Commit 3, 20B canary should pass. Commit 4-5 are bookkeeping.
   buffers), or (b) hold the dispatch event locally so eviction is bounded
   by the host_task lifetime. We add leases to them in Commit 3 only if
   they read from cache-managed weights.
+
+## 9. UPDATE (post-implementation): Gate 4 still FAILS — obstacle identified
+
+T1 (mem_handle refcount) and T2 (eviction gate) are landed correctly
+(commit 228de918a). Mistral canonical passes, perf unchanged. T3 wired
+cpu_mul_mat to acquire a lease via `get_host_ptr(out_lease=&handle)`.
+
+**Gate 4 still SEGV at blk.16 ffn_gate_inp router dispatch**, exact same
+a7l5w signature (`vbroadcastss -0x80(%rcx)` in DNNL JIT SGEMM).
+
+Probe instrumentation at diagnostic time confirmed:
+
+1. `acquire_weight_lease(key)` on the MoE routing weight returns a
+   **VRAM pointer** (0xffff...) — the S1-PRELOAD device copy. The entry
+   fetched from `direct_weight_entries_` has location == DEVICE even though
+   the weight is host-planned. Since VRAM pointers aren't host-accessible,
+   cpu_mul_mat releases the lease and falls through.
+
+2. The actual `src0_data` returned by `get_host_ptr` is **`tensor->data`**
+   directly — a pointer inside a 2 GB DRM-backed `sycl::malloc_host`
+   chunk (size=2147483648 base=0x75b947a00000, alloc_type=HOST_PINNED).
+   This is NOT the cache entry — it's the host_arena chunk itself.
+
+3. The DRM chunk VMA gets unmapped mid-inference. At the SIGSEGV,
+   `src0_batch` lies past the end of a chunk that used to contain
+   addresses in that range. The a7l5w analysis already proved this.
+
+**Conclusion**: the crash is not a cache-entry lifetime bug. The backing
+memory being freed is the **host_arena's DRM chunk** (sycl::malloc_host
+allocation). mem_handle refcount on cache entries cannot prevent a
+`sycl::free` on the chunk underlying `tensor->data`.
+
+Candidate sources for the chunk unmap:
+
+- `unified_free_record` at unified-cache.cpp:5415/5444/5447 calls
+  `sycl::free(seg.ptr, *rec.queue)` for non-pinned-pool segmented host
+  allocations. If such a segment overlaps the chunk containing the
+  weight's tensor->data, the unmap invalidates the weight's pointer.
+- `host_arena_->zone_free(WEIGHT, ptr)` via the evict_one host-resident
+  path returns a TLSF block. This should NOT munmap, but the pattern
+  observed (pointer past end of DRM VMA) implies a chunk-level event.
+- `pinned_chunk_pool::destructor` calls `sycl::free(c.base)` at shutdown
+  — not relevant mid-inference.
+
+**Next steps (follow-up bead)**:
+
+1. Instrument every `sycl::free` site with chunk-level logging (base,
+   size, caller) to identify which site is freeing the chunk containing
+   the 20B routing weight.
+2. Consider restructuring: the host_arena should NEVER sycl::free a chunk
+   while any tensor's data lives inside it. Possible approaches:
+   - Track tensor->data pointers in alloc_registry with a backref to the
+     chunk; refuse chunk-level sycl::free while any active tensor points
+     into the chunk (coarse-grained arena-level refcount, analogous to
+     mem_handle's entry-level refcount, but at the chunk granularity).
+   - Route ALL cpu_mul_mat weight loads through the cache's lease path
+     even for host-buffer-backed tensors — requires `tensor->data` to
+     point at a cache-tracked HOST_PINNED entry, not a raw arena chunk.
+     This is the broader "tensor access redesign" tracked in the MEMORY
+     notes (`project_tensor_access_redesign`).
+3. Option 2 requires that the 20B loader register HOST_PINNED entries in
+   `entries_` (not `direct_weight_entries_`) so the mem_handle refcount
+   path protects them. Alternatively, add chunk refcount to the TLSF
+   allocator.
+
+**Status**: Bead vtf7f has delivered the mem_handle refcount primitive
+(commit 228de918a) and the eviction contract that backs it. This is
+sound architectural work that unblocks future work. Gate 4 remains FAIL
+because the crash site is deeper than the cache layer — in the host
+arena / tensor-data layer that is outside the scope of this bead.
+
+The bead should remain OPEN / BLOCKED until a follow-up tackles the
+arena-level lifetime contract or the tensor access redesign.
+
+## 10. Gates with refcount landed (Mistral still healthy)
+
+Gate 1 (Mistral canonical): PASS — `6, 7, 8, 9, 10` produced.
+Gate 2 (Mistral perf): per baseline run PP ~160 TG ~58 (cold-warm, not
+  full bench-r3 yet; no regression from refcount).
+Gate 3 (20B bench -p 512 -n 128): not re-run this session.
+Gate 4 (20B completion -n 128): **FAIL (same a7l5w SEGV)**.
+Gate 5 (120B -c 131072): not re-run; expected unchanged.

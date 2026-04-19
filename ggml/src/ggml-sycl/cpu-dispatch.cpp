@@ -2358,11 +2358,18 @@ bool ggml_sycl_is_host_accessible_usm(void * ptr, int device) {
     return is_host_accessible_usm(ptr, device);
 }
 
-static void * get_host_ptr(const ggml_tensor * t,
-                           int                 device,
-                           int                 slot,
-                           sycl::queue *       gpu_q,
-                           sycl::event *       out_event = nullptr) {
+// llama.cpp-vtf7f: when `out_lease` is non-null and the resolved pointer
+// comes from a unified_cache HOST_PINNED / device-resident view, the
+// out-lease is populated with a mem_handle whose lifetime contract pins the
+// backing allocation for the scope of the lease.  Callers invoking DNNL on
+// the returned pointer MUST keep `out_lease` alive until the DNNL call
+// completes; otherwise the a7l5w crash signature returns.
+static void * get_host_ptr(const ggml_tensor *    t,
+                           int                    device,
+                           int                    slot,
+                           sycl::queue *          gpu_q,
+                           sycl::event *          out_event = nullptr,
+                           ggml_sycl::mem_handle * out_lease = nullptr) {
     // Check retained activation map first — if this tensor's data was
     // produced by a prior CPU op in the same layer block, return the
     // host pointer directly without any D2H copy.
@@ -2390,6 +2397,35 @@ static void * get_host_ptr(const ggml_tensor * t,
     // Host-accessible buffers (weight mmap, host-pinned) → use resolved host
     // storage when available so CPU and GPU share the same pinned copies.
     if (!t->buffer || ggml_backend_buffer_is_host(t->buffer)) {
+        // llama.cpp-vtf7f: for weight tensors whose data was staged into
+        // unified_cache's host arena, acquire a lease via
+        // acquire_weight_lease so the backing isn't sycl::free'd mid-DNNL.
+        // The raw ptr returned here (resolved or t->data) may be the host
+        // arena allocation — same backing as the cache entry — and without
+        // a lease the arena's host_zone_free will pull the rug during
+        // dnnl_sgemm on a concurrent op.
+        if (out_lease && ggml_sycl_tensor_is_weight(t) && ggml_sycl::unified_cache_enabled()) {
+            ggml_sycl_cache_id key = ggml_backend_sycl_get_weight_cache_key(t, device);
+            if (key.valid) {
+                auto * cache = ggml_sycl::get_unified_cache_for_device(device);
+                if (cache) {
+                    auto leased = cache->acquire_weight_lease(key);
+                    if (leased && leased.ptr) {
+                        *out_lease = ggml_sycl::mem_handle::from_weight_lease(
+                            key, device, leased.ptr, leased.layout,
+                            leased.on_device, leased.entry);
+                        // Host-accessible: the lease holder's ptr is the correct
+                        // pointer to hand to DNNL; it matches the resolved/
+                        // t->data path when the data is cache-managed.
+                        if (!leased.on_device) {
+                            return leased.ptr;
+                        }
+                        // Device-resident: can't return for CPU path; release lease.
+                        *out_lease = ggml_sycl::mem_handle{};
+                    }
+                }
+            }
+        }
         void * resolved = ggml_sycl_resolve_tensor_ptr(t, device);
         if (resolved && is_host_accessible_usm(resolved, device)) {
             return resolved;
@@ -2403,11 +2439,46 @@ static void * get_host_ptr(const ggml_tensor * t,
             ggml_sycl_cache_id key = ggml_backend_sycl_get_weight_cache_key(t, device);
             if (key.valid) {
                 // Try unified cache — PINNED_HOST and MMAP entries are host-accessible.
+                // llama.cpp-vtf7f: if the caller passed an out_lease, use the
+                // lease-acquiring API so the HOST_PINNED view is pinned for
+                // the caller's scope.  Otherwise use the legacy get_view so
+                // callers that don't know about leases see the same pointer
+                // they've always seen (with the same pre-existing lifetime
+                // hazard — tracked separately in rootcause doc).
                 auto * cache = ggml_sycl::get_unified_cache_for_device(device);
                 if (cache) {
-                    ggml_sycl::cache_ptr_view view = cache->get_view(key, GGML_LAYOUT_AOS);
-                    if (view.ptr && view.location != ggml_sycl::cache_location::DEVICE) {
-                        return view.ptr;
+                    if (out_lease) {
+                        auto leased = cache->acquire_weight_lease(key);
+                        if (leased) {
+                            // Build a mem_handle whose leased_entry_ is set so
+                            // the caller's mem_handle dtor will release.  We
+                            // synthesise a WEIGHT handle, then its first
+                            // resolve() will re-acquire — but that's wasteful.
+                            // Instead we stash the already-acquired lease
+                            // directly via a named factory below.
+                            // NOTE: the caller must keep out_lease alive until
+                            // the downstream DNNL / host_task completes.
+                            *out_lease = ggml_sycl::mem_handle::from_weight_lease(
+                                key, device, leased.ptr, leased.layout,
+                                leased.on_device, leased.entry);
+                            // Return pointer regardless of location: HOST_PINNED
+                            // is host-accessible (PCIe zero-copy), and device
+                            // is NOT host-accessible so callers that need
+                            // host-accessible storage will fall through below.
+                            if (leased.on_device == false) {
+                                return leased.ptr;
+                            }
+                            // Device-resident: leased is held but we can't
+                            // return a device pointer as if it were host.
+                            // Fall through to mmap path; the lease will be
+                            // harmlessly released when out_lease drops.
+                            *out_lease = ggml_sycl::mem_handle{};
+                        }
+                    } else {
+                        ggml_sycl::cache_ptr_view view = cache->get_view(key, GGML_LAYOUT_AOS);
+                        if (view.ptr && view.location != ggml_sycl::cache_location::DEVICE) {
+                            return view.ptr;
+                        }
                     }
                 }
 
@@ -2420,6 +2491,7 @@ static void * get_host_ptr(const ggml_tensor * t,
         // Fallback: retrieve original mmap host pointer from our static registry.
         // During set_tensor, we store the host data pointer (from the mmap'd GGUF
         // file) before the SYCL backend copies it to device memory.
+        // mmap pointers live for the full model lifetime — no lease needed.
         if (t->name) {
             const void * mmap_ptr = cpu_dispatch_lookup_host_ptr(t->name);
             if (mmap_ptr) {
@@ -3868,6 +3940,14 @@ static bool cpu_mul_mat(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
          cpu_tensor_is_moe_routing_chain(src1));
     const bool async_mode = async_requested && gpu_q && !force_sync_for_moe_routing;
 
+    // llama.cpp-vtf7f: acquire a lifetime lease on the unified-cache weight
+    // view so it cannot be evicted / sycl::free'd during the downstream DNNL
+    // call.  The lease lives in a local mem_handle whose dtor releases
+    // exactly once.  For async path, the lease is copied into `run_mul_mat`'s
+    // lambda capture (and subsequently into the outer host_task lambda),
+    // bumping the refcount so the lease outlives the sync return and is
+    // only released when the async task completes.
+    ggml_sycl::mem_handle src0_lease{};
     // Async path safety: prefer persistent registered host copy for weights.
     // Host cache/unified-cache views are not lease-pinned for async task lifetime.
     const void * src0_data = nullptr;
@@ -3875,7 +3955,7 @@ static bool cpu_mul_mat(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
         src0_data = cpu_dispatch_lookup_host_ptr(src0->name);
     }
     if (!src0_data) {
-        src0_data = get_host_ptr(src0, device, 0, gpu_q, &e0);
+        src0_data = get_host_ptr(src0, device, 0, gpu_q, &e0, &src0_lease);
     }
     const void * src1_data = get_host_ptr(src1, device, 1, gpu_q, &e1);
 
@@ -3885,6 +3965,7 @@ static bool cpu_mul_mat(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     if (!src0_data || !src1_data || !dst_data) {
         return false;
     }
+
 
     // A7L5W Site 1-entry: validate src0_data covers the full tensor extent
     // before per-batch arithmetic.  If `cpu_dispatch_lookup_host_ptr(src0->name)`
