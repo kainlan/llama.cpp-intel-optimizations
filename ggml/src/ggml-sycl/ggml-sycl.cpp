@@ -11678,24 +11678,11 @@ static bool ggml_sycl_preload_moe_experts(const ggml_tensor * src0, int device, 
 
         if (cache->has_placement_plan() && !tname.empty() &&
             !cache->get_placement_plan().expert_on_device(tname, static_cast<int>(e), device)) {
-            ggml_sycl::alloc_request _host_req2{};
-            _host_req2.device                               = device;
-            _host_req2.size                                 = expert_size;
-            // Use WEIGHT role — these are permanent host-resident expert copies that
-            // must not be recycled by STAGING zone resets.
-            _host_req2.intent.role                          = ggml_sycl::alloc_role::WEIGHT;
-            _host_req2.intent.constraints.must_host_pinned  = true;
-            _host_req2.intent.constraints.use_pinned_pool   = true;
-            void * host_ptr = ggml_sycl::unified_allocate(_host_req2).resolve().ptr;
-            if (!host_ptr) {
-                failed++;
-                GGML_LOG_WARN("[MODEL-PRELOAD] Failed host-zone alloc for %s[%lld] (%zu bytes)\n", tname.c_str(),
-                              (long long) e, expert_size);
-                continue;
-            }
-
-            std::memcpy(host_ptr, expert_aos, expert_size);
-            cache->register_host_expert(key, host_ptr, expert_size, GGML_LAYOUT_AOS);
+            // expert_aos already lives in the model's host-pinned buffer
+            // (allocated by ggml_backend_sycl_host_buffer_type_alloc_buffer at model load).
+            // Register in-place — no second allocation, no memcpy.
+            cache->register_host_expert(key, const_cast<void *>(static_cast<const void *>(expert_aos)),
+                                        expert_size, GGML_LAYOUT_AOS);
             host_registered++;
             continue;
         }
