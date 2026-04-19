@@ -20,6 +20,38 @@
 
 namespace ggml_sycl {
 
+// Copy-preserving atomic u32 adapter.  std::atomic<uint32_t> is non-copyable,
+// but std::vector<chunk> grows via push_back which may internally move.
+// For chunk.lease_count (llama.cpp-dyhdl), the invariant is that vector growth
+// only happens under mutex_ at chunk-creation time, when lease_count is 0, so
+// the "copy the value across a move" semantic is correct by construction.
+//
+// This mirrors the copyable_atomic_u32 pattern in unified-cache.hpp (vtf7f);
+// we duplicate it here to avoid a cyclic include (unified-cache.hpp already
+// depends on pinned-pool.hpp).
+struct pool_atomic_u32 {
+    std::atomic<uint32_t> v{ 0 };
+
+    pool_atomic_u32() = default;
+    pool_atomic_u32(const pool_atomic_u32 & o) :
+        v(o.v.load(std::memory_order_relaxed)) {}
+    pool_atomic_u32(pool_atomic_u32 && o) noexcept :
+        v(o.v.load(std::memory_order_relaxed)) {}
+    pool_atomic_u32 & operator=(const pool_atomic_u32 & o) {
+        v.store(o.v.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        return *this;
+    }
+    pool_atomic_u32 & operator=(pool_atomic_u32 && o) noexcept {
+        v.store(o.v.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        return *this;
+    }
+
+    uint32_t fetch_add(uint32_t n) { return v.fetch_add(n, std::memory_order_acq_rel); }
+    uint32_t fetch_sub(uint32_t n) { return v.fetch_sub(n, std::memory_order_acq_rel); }
+    uint32_t load() const          { return v.load(std::memory_order_acquire); }
+    void     store(uint32_t x)     { v.store(x, std::memory_order_release); }
+};
+
 // Host memory zone identifiers. Mirrors the VRAM arena zoning model.
 enum class host_zone_id : uint8_t {
     WEIGHT  = 0,
@@ -164,12 +196,59 @@ class pinned_chunk_pool {
     size_t allocated() const;  // Total bytes allocated (in chunks)
     size_t chunk_count() const;
 
+    // === Chunk lease API (llama.cpp-dyhdl) ===
+    // Reference-count a chunk while any mem_handle holds a raw pointer
+    // derived from it.  Defense-in-depth beneath the vtf7f cache_entry
+    // refcount: cache_entry refcount prevents cache-layer invalidation;
+    // chunk lease prevents arena-layer munmap / sycl::free.
+    //
+    // Chunk indices are opaque u64s encoding (pool_kind, slot) so callers
+    // don't need to know whether the pointer came from chunks_ or
+    // runtime_chunks_. INVALID_CHUNK_HANDLE (returned on lookup miss) is
+    // safe to pass to release_chunk_lease (no-op).
+
+    static constexpr uint64_t INVALID_CHUNK_HANDLE = UINT64_MAX;
+
+    // Find the chunk containing `ptr`. Returns INVALID_CHUNK_HANDLE if not
+    // owned by this pool.  Does NOT bump the refcount — use
+    // acquire_chunk_lease when the caller wants lifetime protection.
+    uint64_t find_chunk_handle(const void * ptr) const;
+
+    // Acquire a lease on the chunk containing `ptr`. Returns
+    // INVALID_CHUNK_HANDLE if the pointer is not in any chunk (caller
+    // treats as "no protection needed"). On success, bumps the chunk's
+    // lease_count; caller MUST call release_chunk_lease(handle) exactly once.
+    uint64_t acquire_chunk_lease(const void * ptr);
+
+    // Release a lease previously acquired via acquire_chunk_lease.
+    // No-op when handle == INVALID_CHUNK_HANDLE.
+    void release_chunk_lease(uint64_t handle);
+
+    // True while any lease is held on the given chunk.  Destruction-time
+    // gate in ~pinned_chunk_pool waits for this to return false before
+    // sycl::free'ing the chunk.
+    bool chunk_has_leases(uint64_t handle) const;
+
   private:
     struct chunk {
         void *                          base;       // malloc_host result
         size_t                          size;       // Chunk capacity in bytes
         std::unique_ptr<tlsf_allocator> allocator;  // Per-chunk TLSF for runtime/pre-zone allocs
+        pool_atomic_u32                 lease_count;  // llama.cpp-dyhdl: live raw-ptr refs
     };
+
+    // Encoding of uint64_t chunk handles:
+    //   bit 63     — 0 for base chunks (chunks_), 1 for runtime (runtime_chunks_)
+    //   bits 62..0 — slot index
+    static constexpr uint64_t CHUNK_KIND_RUNTIME_BIT = 1ULL << 63;
+
+    static uint64_t encode_chunk_handle(bool runtime, size_t idx) {
+        return (runtime ? CHUNK_KIND_RUNTIME_BIT : 0ULL) | static_cast<uint64_t>(idx);
+    }
+
+    // Safe 5-second wait for lease_count -> 0 before chunk free.  ASSERTs
+    // with chunk details on timeout rather than spinning forever.
+    void wait_for_chunk_drain_or_assert(const chunk & c, const char * ctx) const;
 
     // Mapping from logical address space position to a specific chunk region.
     struct flat_span_info {

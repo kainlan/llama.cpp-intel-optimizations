@@ -1409,6 +1409,19 @@ class unified_cache {
     // Number of chunks (1 if single alloc, 2 if split).
     int chunk_count() const { return arena_n_chunks_; }
 
+    // === Arena chunk lease API (llama.cpp-dyhdl) ===
+    // Reference-count VRAM arena chunks while any mem_handle holds a raw
+    // pointer derived from them.  Complementary to the vtf7f cache_entry
+    // refcount: cache_entry prevents cache-layer invalidation; chunk lease
+    // prevents sycl::free of the underlying VRAM allocation.
+    //
+    // Returns -1 when the pointer is not owned by the arena (safe no-op on
+    // release).  Otherwise returns the chunk index (0 or 1).
+    int  arena_find_chunk(const void * ptr) const;
+    int  arena_acquire_chunk_lease(const void * ptr);
+    void arena_release_chunk_lease(int chunk_idx);
+    bool arena_chunk_has_leases(int chunk_idx) const;
+
     // Destroy arena (free all chunks).
     void arena_destroy();
 
@@ -1848,8 +1861,9 @@ class unified_cache {
     size_t arena_size_ = 0;
 
     struct arena_chunk {
-        void * ptr  = nullptr;
-        size_t size = 0;
+        void *              ptr  = nullptr;
+        size_t              size = 0;
+        copyable_atomic_u32 lease_count;  // llama.cpp-dyhdl: live raw-ptr refs
     };
 
     arena_chunk   arena_chunks_[2] = {};

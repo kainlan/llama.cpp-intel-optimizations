@@ -12,9 +12,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cinttypes>
 #include <cstdlib>
 #include <future>
 #include <memory>
+#include <thread>
 
 namespace ggml_sycl {
 namespace {
@@ -108,13 +110,19 @@ pinned_chunk_pool::~pinned_chunk_pool() {
     std::lock_guard<std::mutex> lock(mutex_);
     size_t                      chunk_count = chunks_.size() + runtime_chunks_.size();
 
+    // llama.cpp-dyhdl: wait for all chunk leases to drain before sycl::free.
+    // If a lease is still held at destruction, a downstream caller holds a
+    // raw pointer into this chunk and will SEGV on any subsequent use.
+    // Assert-with-detail after 5 s rather than spin forever.
     for (auto & c : chunks_) {
         if (c.base) {
+            wait_for_chunk_drain_or_assert(c, "pinned-base");
             sycl::free(c.base, queue_);
         }
     }
     for (auto & c : runtime_chunks_) {
         if (c.base) {
+            wait_for_chunk_drain_or_assert(c, "pinned-runtime");
             sycl::free(c.base, queue_);
         }
     }
@@ -805,7 +813,12 @@ bool pinned_chunk_pool::grow_into(std::vector<chunk> & chunks, size_t min_size, 
     }
 
     auto alloc = std::make_unique<tlsf_allocator>(chunk_size);
-    chunks.push_back({ ptr, chunk_size, std::move(alloc) });
+    // Note: chunk contains pool_atomic_u32 lease_count — default-construct it in place.
+    chunks.emplace_back();
+    chunks.back().base        = ptr;
+    chunks.back().size        = chunk_size;
+    chunks.back().allocator   = std::move(alloc);
+    // lease_count default-initializes to 0.
     total_allocated_ += chunk_size;
 
     GGML_LOG_INFO("[SYCL] Allocated pinned %s chunk %zu (size=%.1f MB, total=%.1f GB)\n",
@@ -813,6 +826,122 @@ bool pinned_chunk_pool::grow_into(std::vector<chunk> & chunks, size_t min_size, 
                   total_allocated_ / (1024.0 * 1024.0 * 1024.0));
 
     return true;
+}
+
+// === Chunk lease API (llama.cpp-dyhdl) ===
+//
+// Raw-pointer handouts from this pool (e.g. tensor->data = chunk.base + off)
+// outlive any per-allocation handle lifetime.  Without a refcount at the chunk
+// layer, a chunk can in principle be sycl::free'd while a tensor still holds
+// a derived raw pointer — this is the vtf7f §9 crash class.  Lease acquire
+// bumps a per-chunk atomic; the destruction gate waits for the count to drop
+// to 0 before freeing.  Non-pool pointers return INVALID_CHUNK_HANDLE which
+// is a safe no-op on release — callers treat it as "no protection needed."
+
+uint64_t pinned_chunk_pool::find_chunk_handle(const void * ptr) const {
+    if (!ptr) {
+        return INVALID_CHUNK_HANDLE;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    const char *                p = static_cast<const char *>(ptr);
+    for (size_t i = 0; i < chunks_.size(); ++i) {
+        const char * base = static_cast<const char *>(chunks_[i].base);
+        if (base && p >= base && p < base + chunks_[i].size) {
+            return encode_chunk_handle(false, i);
+        }
+    }
+    for (size_t i = 0; i < runtime_chunks_.size(); ++i) {
+        const char * base = static_cast<const char *>(runtime_chunks_[i].base);
+        if (base && p >= base && p < base + runtime_chunks_[i].size) {
+            return encode_chunk_handle(true, i);
+        }
+    }
+    return INVALID_CHUNK_HANDLE;
+}
+
+uint64_t pinned_chunk_pool::acquire_chunk_lease(const void * ptr) {
+    if (!ptr) {
+        return INVALID_CHUNK_HANDLE;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    const char *                p = static_cast<const char *>(ptr);
+    for (size_t i = 0; i < chunks_.size(); ++i) {
+        const char * base = static_cast<const char *>(chunks_[i].base);
+        if (base && p >= base && p < base + chunks_[i].size) {
+            chunks_[i].lease_count.fetch_add(1);
+            return encode_chunk_handle(false, i);
+        }
+    }
+    for (size_t i = 0; i < runtime_chunks_.size(); ++i) {
+        const char * base = static_cast<const char *>(runtime_chunks_[i].base);
+        if (base && p >= base && p < base + runtime_chunks_[i].size) {
+            runtime_chunks_[i].lease_count.fetch_add(1);
+            return encode_chunk_handle(true, i);
+        }
+    }
+    return INVALID_CHUNK_HANDLE;
+}
+
+void pinned_chunk_pool::release_chunk_lease(uint64_t handle) {
+    if (handle == INVALID_CHUNK_HANDLE) {
+        return;
+    }
+    const bool   is_runtime = (handle & CHUNK_KIND_RUNTIME_BIT) != 0;
+    const size_t idx        = static_cast<size_t>(handle & ~CHUNK_KIND_RUNTIME_BIT);
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto & vec = is_runtime ? runtime_chunks_ : chunks_;
+    if (idx >= vec.size()) {
+        GGML_LOG_ERROR("[PINNED-POOL] release_chunk_lease: invalid handle=0x%" PRIx64 " (idx=%zu, size=%zu)\n", handle,
+                       idx, vec.size());
+        return;
+    }
+    const uint32_t prev = vec[idx].lease_count.fetch_sub(1);
+    if (prev == 0) {
+        GGML_LOG_ERROR("[PINNED-POOL] release_chunk_lease: underflow on chunk idx=%zu runtime=%d\n", idx, is_runtime);
+        // Restore to avoid wrap-around.
+        vec[idx].lease_count.fetch_add(1);
+    }
+}
+
+bool pinned_chunk_pool::chunk_has_leases(uint64_t handle) const {
+    if (handle == INVALID_CHUNK_HANDLE) {
+        return false;
+    }
+    const bool   is_runtime = (handle & CHUNK_KIND_RUNTIME_BIT) != 0;
+    const size_t idx        = static_cast<size_t>(handle & ~CHUNK_KIND_RUNTIME_BIT);
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto & vec        = is_runtime ? runtime_chunks_ : chunks_;
+    if (idx >= vec.size()) {
+        return false;
+    }
+    return vec[idx].lease_count.load() > 0;
+}
+
+void pinned_chunk_pool::wait_for_chunk_drain_or_assert(const chunk & c, const char * ctx) const {
+    // Caller (destructor) already holds mutex_.  We read lease_count
+    // lock-free — writers (acquire/release) acquire the mutex before
+    // mutating the vector, but the atomic count itself is observable
+    // without the lock.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    uint32_t   outstanding = c.lease_count.load();
+    if (outstanding == 0) {
+        return;
+    }
+    GGML_LOG_WARN("[PINNED-POOL] %s chunk %p size=%.1f MB has %u outstanding lease(s) at destruction, waiting ≤5s\n",
+                  ctx, c.base, c.size / (1024.0 * 1024.0), outstanding);
+    while ((outstanding = c.lease_count.load()) > 0) {
+        if (std::chrono::steady_clock::now() > deadline) {
+            GGML_LOG_ERROR(
+                "[PINNED-POOL] %s chunk %p size=%.1f MB still has %u outstanding lease(s) after 5s — aborting to "
+                "surface the bug (llama.cpp-dyhdl)\n",
+                ctx, c.base, c.size / (1024.0 * 1024.0), outstanding);
+            std::fflush(stderr);
+            GGML_ASSERT(false && "pinned chunk freed while leases outstanding (dyhdl timeout)");
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
 }
 
 }  // namespace ggml_sycl

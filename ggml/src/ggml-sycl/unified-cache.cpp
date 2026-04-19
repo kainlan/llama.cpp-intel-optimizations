@@ -9572,6 +9572,28 @@ void unified_cache::arena_destroy() {
     }
     for (int i = 0; i < arena_n_chunks_; i++) {
         if (arena_chunks_[i].ptr) {
+            // llama.cpp-dyhdl: wait for chunk leases to drain before sycl::free.
+            // A lease outstanding at destruction means a downstream caller holds
+            // a raw pointer into this chunk — assert-with-detail after 5 s rather
+            // than SEGV silently after free.
+            const auto deadline    = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            uint32_t   outstanding = arena_chunks_[i].lease_count.load();
+            if (outstanding > 0) {
+                GGML_LOG_WARN(
+                    "[VRAM-ARENA] chunk %p size=%.1f MB has %u outstanding lease(s) at arena_destroy, waiting ≤5s\n",
+                    arena_chunks_[i].ptr, arena_chunks_[i].size / (1024.0 * 1024.0), outstanding);
+                while ((outstanding = arena_chunks_[i].lease_count.load()) > 0) {
+                    if (std::chrono::steady_clock::now() > deadline) {
+                        GGML_LOG_ERROR(
+                            "[VRAM-ARENA] chunk %p size=%.1f MB still has %u outstanding lease(s) after 5s — "
+                            "aborting (llama.cpp-dyhdl)\n",
+                            arena_chunks_[i].ptr, arena_chunks_[i].size / (1024.0 * 1024.0), outstanding);
+                        std::fflush(stderr);
+                        GGML_ASSERT(false && "VRAM arena chunk freed while leases outstanding (dyhdl timeout)");
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
             try {
                 sycl::free(arena_chunks_[i].ptr, *arena_queue_);
             } catch (...) {
@@ -9590,6 +9612,49 @@ void unified_cache::arena_destroy() {
         z.size  = 0;
         z.used.store(0, std::memory_order_relaxed);
     }
+}
+
+// === Arena chunk lease API (llama.cpp-dyhdl) ===
+
+int unified_cache::arena_find_chunk(const void * ptr) const {
+    if (!ptr) {
+        return -1;
+    }
+    const char * p = static_cast<const char *>(ptr);
+    for (int i = 0; i < arena_n_chunks_; ++i) {
+        const char * base = static_cast<const char *>(arena_chunks_[i].ptr);
+        if (base && p >= base && p < base + arena_chunks_[i].size) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+int unified_cache::arena_acquire_chunk_lease(const void * ptr) {
+    const int idx = arena_find_chunk(ptr);
+    if (idx < 0) {
+        return -1;
+    }
+    arena_chunks_[idx].lease_count.fetch_add(1);
+    return idx;
+}
+
+void unified_cache::arena_release_chunk_lease(int chunk_idx) {
+    if (chunk_idx < 0 || chunk_idx >= arena_n_chunks_) {
+        return;
+    }
+    const uint32_t prev = arena_chunks_[chunk_idx].lease_count.fetch_sub(1);
+    if (prev == 0) {
+        GGML_LOG_ERROR("[VRAM-ARENA] arena_release_chunk_lease: underflow on chunk idx=%d\n", chunk_idx);
+        arena_chunks_[chunk_idx].lease_count.fetch_add(1);
+    }
+}
+
+bool unified_cache::arena_chunk_has_leases(int chunk_idx) const {
+    if (chunk_idx < 0 || chunk_idx >= arena_n_chunks_) {
+        return false;
+    }
+    return arena_chunks_[chunk_idx].lease_count.load() > 0;
 }
 
 void unified_cache::arena_abandon() {
