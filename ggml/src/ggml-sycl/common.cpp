@@ -37,11 +37,11 @@ static bool ggml_sycl_layout_ptr_stats_enabled() {
     return enabled;
 }
 
-static std::atomic<uint64_t> g_layout_ptr_host_cache_target_hit{ 0 };
-static std::atomic<uint64_t> g_layout_ptr_host_cache_aos_hit{ 0 };
-static std::atomic<uint64_t> g_layout_ptr_host_cache_layout_fallback{ 0 };
-static std::atomic<uint64_t> g_layout_ptr_host_cache_data_fallback{ 0 };
-static std::atomic<uint64_t> g_layout_ptr_host_cache_miss{ 0 };
+static std::atomic<uint64_t> g_layout_ptr_host_arena_target_hit{ 0 };
+static std::atomic<uint64_t> g_layout_ptr_host_arena_aos_hit{ 0 };
+static std::atomic<uint64_t> g_layout_ptr_host_arena_layout_fallback{ 0 };
+static std::atomic<uint64_t> g_layout_ptr_host_arena_data_fallback{ 0 };
+static std::atomic<uint64_t> g_layout_ptr_host_arena_miss{ 0 };
 
 static std::mutex                         g_sycl_host_alloc_mutex;
 static std::unordered_map<void *, size_t> g_sycl_host_alloc_sizes;
@@ -80,19 +80,19 @@ void ggml_sycl_layout_ptr_stat(ggml_sycl_layout_ptr_event event) {
 
     switch (event) {
         case ggml_sycl_layout_ptr_event::HOST_CACHE_TARGET_HIT:
-            g_layout_ptr_host_cache_target_hit.fetch_add(1, std::memory_order_relaxed);
+            g_layout_ptr_host_arena_target_hit.fetch_add(1, std::memory_order_relaxed);
             break;
         case ggml_sycl_layout_ptr_event::HOST_CACHE_AOS_HIT:
-            g_layout_ptr_host_cache_aos_hit.fetch_add(1, std::memory_order_relaxed);
+            g_layout_ptr_host_arena_aos_hit.fetch_add(1, std::memory_order_relaxed);
             break;
         case ggml_sycl_layout_ptr_event::HOST_CACHE_LAYOUT_FALLBACK:
-            g_layout_ptr_host_cache_layout_fallback.fetch_add(1, std::memory_order_relaxed);
+            g_layout_ptr_host_arena_layout_fallback.fetch_add(1, std::memory_order_relaxed);
             break;
         case ggml_sycl_layout_ptr_event::HOST_CACHE_DATA_FALLBACK:
-            g_layout_ptr_host_cache_data_fallback.fetch_add(1, std::memory_order_relaxed);
+            g_layout_ptr_host_arena_data_fallback.fetch_add(1, std::memory_order_relaxed);
             break;
         case ggml_sycl_layout_ptr_event::HOST_CACHE_MISS:
-            g_layout_ptr_host_cache_miss.fetch_add(1, std::memory_order_relaxed);
+            g_layout_ptr_host_arena_miss.fetch_add(1, std::memory_order_relaxed);
             break;
     }
 }
@@ -103,12 +103,12 @@ void ggml_sycl_layout_ptr_stats_dump() {
     }
 
     fprintf(stderr,
-            "[LAYOUT-PTR] host_cached target_hit=%llu aos_hit=%llu layout_fallback=%llu data_fallback=%llu miss=%llu\n",
-            static_cast<unsigned long long>(g_layout_ptr_host_cache_target_hit.load(std::memory_order_relaxed)),
-            static_cast<unsigned long long>(g_layout_ptr_host_cache_aos_hit.load(std::memory_order_relaxed)),
-            static_cast<unsigned long long>(g_layout_ptr_host_cache_layout_fallback.load(std::memory_order_relaxed)),
-            static_cast<unsigned long long>(g_layout_ptr_host_cache_data_fallback.load(std::memory_order_relaxed)),
-            static_cast<unsigned long long>(g_layout_ptr_host_cache_miss.load(std::memory_order_relaxed)));
+            "[LAYOUT-PTR] host_arena target_hit=%llu aos_hit=%llu layout_fallback=%llu data_fallback=%llu miss=%llu\n",
+            static_cast<unsigned long long>(g_layout_ptr_host_arena_target_hit.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_layout_ptr_host_arena_aos_hit.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_layout_ptr_host_arena_layout_fallback.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_layout_ptr_host_arena_data_fallback.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_layout_ptr_host_arena_miss.load(std::memory_order_relaxed)));
 }
 
 int get_current_device_id() {
@@ -550,8 +550,7 @@ static std::atomic<bool>    g_watchdog_active{ false };
 static std::thread          g_watchdog_thread;
 
 static inline int64_t ggml_sycl_watchdog_now_ns() {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-               std::chrono::steady_clock::now().time_since_epoch())
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
         .count();
 }
 
@@ -566,9 +565,9 @@ static void watchdog_thread_fn(int64_t timeout_ms) {
         if (!g_watchdog_active.load(std::memory_order_acquire)) {
             break;
         }
-        const int64_t last     = g_watchdog_last_tick_ns.load(std::memory_order_relaxed);
-        const int64_t now      = ggml_sycl_watchdog_now_ns();
-        const int64_t elapsed  = now - last;
+        const int64_t last    = g_watchdog_last_tick_ns.load(std::memory_order_relaxed);
+        const int64_t now     = ggml_sycl_watchdog_now_ns();
+        const int64_t elapsed = now - last;
         if (elapsed > timeout_ns) {
             const long long elapsed_ms = (long long) (elapsed / watchdog_ns_per_ms);
             int             n_devices  = 0;
@@ -601,10 +600,10 @@ static int64_t ggml_sycl_parse_op_timeout_ms() {
     if (env == nullptr || env[0] == '\0') {
         return watchdog_default_timeout_ms;
     }
-    char *      end       = nullptr;
-    const long long value = std::strtoll(env, &end, 10);
+    char *          end     = nullptr;
+    const long long value   = std::strtoll(env, &end, 10);
     // Invalid if strtoll consumed nothing, or trailing non-whitespace remains.
-    bool invalid = (end == env);
+    bool            invalid = (end == env);
     if (!invalid) {
         for (const char * p = end; *p != '\0'; ++p) {
             if (*p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') {
@@ -614,15 +613,17 @@ static int64_t ggml_sycl_parse_op_timeout_ms() {
         }
     }
     if (invalid) {
-        GGML_LOG_WARN("[SYCL] GGML_SYCL_OP_TIMEOUT_MS=\"%s\" is not a valid integer; "
-                      "using default %lld ms\n",
-                      env, (long long) watchdog_default_timeout_ms);
+        GGML_LOG_WARN(
+            "[SYCL] GGML_SYCL_OP_TIMEOUT_MS=\"%s\" is not a valid integer; "
+            "using default %lld ms\n",
+            env, (long long) watchdog_default_timeout_ms);
         return watchdog_default_timeout_ms;
     }
     if (value < 0) {
-        GGML_LOG_WARN("[SYCL] GGML_SYCL_OP_TIMEOUT_MS=%lld is negative; "
-                      "using default %lld ms (set to 0 to explicitly disable)\n",
-                      value, (long long) watchdog_default_timeout_ms);
+        GGML_LOG_WARN(
+            "[SYCL] GGML_SYCL_OP_TIMEOUT_MS=%lld is negative; "
+            "using default %lld ms (set to 0 to explicitly disable)\n",
+            value, (long long) watchdog_default_timeout_ms);
         return watchdog_default_timeout_ms;
     }
     return (int64_t) value;
@@ -639,8 +640,8 @@ void ggml_sycl_watchdog_start() {
         started = true;
         return;
     }
-    GGML_LOG_INFO("[SYCL] Watchdog started (GGML_SYCL_OP_TIMEOUT_MS=%lld, poll=%lld ms)\n",
-                  (long long) timeout_ms, (long long) watchdog_poll_ms);
+    GGML_LOG_INFO("[SYCL] Watchdog started (GGML_SYCL_OP_TIMEOUT_MS=%lld, poll=%lld ms)\n", (long long) timeout_ms,
+                  (long long) watchdog_poll_ms);
     g_watchdog_last_tick_ns.store(ggml_sycl_watchdog_now_ns(), std::memory_order_relaxed);
     g_watchdog_active.store(true, std::memory_order_release);
     g_watchdog_thread = std::thread(watchdog_thread_fn, timeout_ms);
@@ -661,7 +662,7 @@ void * ggml_sycl_host_malloc(size_t size) try {
     // The pinned_chunk_pool uses 8GB chunks to bypass Level Zero's ~11GB per-allocation limit.
     auto * ucache = ggml_sycl::get_unified_cache_for_device(0);
     if (ucache) {
-        void * ptr = ucache->allocate_pinned_runtime(size, 64);
+        void * ptr = ucache->host_pool_alloc(size, 64);
         if (ptr) {
             ggml_sycl::offload_stats_note_host_alloc("unified_cache_pinned_pool", size);
             ggml_sycl_alloc_trace_record("host", size, "unified_cache_pinned_pool");
@@ -728,7 +729,7 @@ void * ggml_sycl_host_malloc(size_t size) try {
     // Non-TP mode: use default queue for host malloc.
     {
         auto & queue = dpct::get_in_order_queue();
-        ptr = ggml_sycl::unified_cache_raw_malloc_host(size, queue);
+        ptr          = ggml_sycl::unified_cache_raw_malloc_host(size, queue);
     }
 
     if (!ptr) {
@@ -930,7 +931,7 @@ void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> str
                     // Pool allocation - return to pool via unified_cache
                     auto * ucache = ggml_sycl::get_unified_cache_for_device(i);
                     if (ucache && extra->data_device_size[i] > 0) {
-                        ucache->free_pinned_runtime(extra->data_device[i], extra->data_device_size[i]);
+                        ucache->host_pool_free(extra->data_device[i], extra->data_device_size[i]);
                     }
                 } else if (extra->data_device_size[i] > 0) {
                     // Raw USM allocation

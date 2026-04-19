@@ -902,19 +902,6 @@ class unified_cache {
                          int                        expert_id        = -1,
                          ggml_layout_mode           layout           = GGML_LAYOUT_AOS,
                          bool                       validate_content = false);
-    // Allocate cache entry without copying data (caller will fill device_ptr).
-    // Uses src_ptr/src_size only for content hash and change detection.
-    void * ensure_cached_alloc(const ggml_sycl_cache_id & key,
-                               const void *               src_ptr,
-                               size_t                     src_size,
-                               size_t                     alloc_size,
-                               cache_entry_type           type,
-                               int                        layer_id,
-                               int                        expert_id,
-                               ggml_layout_mode           layout,
-                               bool                       validate_content,
-                               bool *                     needs_fill);
-
     // === Direct Staging API ===
     // Simple arena allocate + fill + register.  No state machine.
 
@@ -1628,8 +1615,8 @@ class unified_cache {
     // Budget headroom: budget_ - used_ (what the cache thinks is available).
     size_t available_budget() const { return available(); }
 
-    void * allocate_pinned_runtime(size_t size, size_t alignment = 64);
-    void   free_pinned_runtime(void * ptr, size_t size);
+    void * host_pool_alloc(size_t size, size_t alignment = 64);
+    void   host_pool_free(void * ptr, size_t size);
     void   host_zone_reset(host_zone_id zone);
     void   host_zone_free(host_zone_id zone, void * ptr);
     size_t host_zone_used(host_zone_id zone) const;
@@ -1641,7 +1628,7 @@ class unified_cache {
     size_t pinned_pool_budget() const { return host_arena_ ? host_arena_->budget() : 0; }
 
     bool             contains_pinned(const void * ptr) const;
-    size_t           pre_allocate_pinned(size_t total_bytes);
+    size_t           host_pool_preallocate(size_t total_bytes);
     size_t           pre_allocate_all(size_t model_weight_bytes);
     size_t           pre_allocate_runtime_chunks(size_t total_bytes);
     // Host zone allocation (owned by unified_cache).

@@ -2401,7 +2401,7 @@ static void ggml_sycl_configure_host_zones_for_plan(ggml_sycl::unified_cache * c
     const size_t total_host_needed =
         plan.host_zone_weight_bytes + kv_zone_bytes + plan.host_zone_staging_bytes + scratch_zone_bytes;
 
-    cache->pre_allocate_pinned(total_host_needed);
+    cache->host_pool_preallocate(total_host_needed);
     cache->configure_host_zones(plan.host_zone_weight_bytes, kv_zone_bytes, plan.host_zone_staging_bytes,
                                 scratch_zone_bytes);
 
@@ -4386,7 +4386,7 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
             // At least 2 GB to handle burst demand without runtime malloc_host
             const size_t min_pre_alloc   = static_cast<size_t>(2ULL * 1024ULL * 1024ULL * 1024ULL);
             const size_t pre_alloc_bytes = std::max(estimated_working_set, min_pre_alloc);
-            const size_t chunks_grown    = cache->pre_allocate_pinned(pre_alloc_bytes);
+            const size_t chunks_grown    = cache->host_pool_preallocate(pre_alloc_bytes);
             if (chunks_grown > 0) {
                 GGML_LOG_INFO("[MOE-HYBRID] Pre-allocated %zu pinned chunks for %.1f MB working set\n", chunks_grown,
                               pre_alloc_bytes / (1024.0 * 1024.0));
@@ -11568,7 +11568,9 @@ static bool ggml_sycl_preload_moe_experts(const ggml_tensor * src0, int device, 
             ggml_sycl::alloc_request _host_req2{};
             _host_req2.device                               = device;
             _host_req2.size                                 = expert_size;
-            _host_req2.intent.role                          = ggml_sycl::alloc_role::EXPERT_STAGING;
+            // Use WEIGHT role — these are permanent host-resident expert copies that
+            // must not be recycled by STAGING zone resets.
+            _host_req2.intent.role                          = ggml_sycl::alloc_role::WEIGHT;
             _host_req2.intent.constraints.must_host_pinned  = true;
             _host_req2.intent.constraints.use_pinned_pool   = true;
             void * host_ptr = ggml_sycl::unified_allocate(_host_req2).resolve().ptr;
@@ -11789,11 +11791,17 @@ static void ggml_sycl_preload_model_weights() {
             // This partitions the pre-allocated pinned pool into persistent and
             // resettable host zones so inference uses bump/reset only.
             ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache);
+            GGML_LOG_INFO("[S1-PRELOAD-DBG] zone configured, starting main loop with %zu items\n", indices.size());
 
             // Submit all H2D copies for this device without waiting
+            size_t s1_loop_iter = 0;
             for (size_t idx : indices) {
+                ++s1_loop_iter;
                 const auto & item   = items[idx];
                 const auto * tensor = item.tensor;
+                if (!tensor) { GGML_LOG_ERROR("[S1-PRELOAD-DBG] iter %zu idx=%zu: null tensor\n", s1_loop_iter, idx); continue; }
+                GGML_LOG_INFO("[S1-PRELOAD-DBG] iter=%zu idx=%zu name=%s is_moe=%d\n",
+                              s1_loop_iter, idx, tensor->name ? tensor->name : "(null)", (int)item.is_moe);
 
                 if (item.is_moe) {
                     // MoE: submit all expert copies asynchronously
@@ -11878,11 +11886,30 @@ static void ggml_sycl_preload_model_weights() {
                                     ggml_sycl::alloc_request _host_req3{};
                                     _host_req3.device                               = device;
                                     _host_req3.size                                 = expert_size;
-                                    _host_req3.intent.role                          = ggml_sycl::alloc_role::EXPERT_STAGING;
+                                    // Use WEIGHT role so these permanent host-resident expert copies
+                                    // are placed in the WEIGHT zone, not the ephemeral STAGING zone.
+                                    // STAGING zone resets would recycle these pages mid-inference.
+                                    _host_req3.intent.role                          = ggml_sycl::alloc_role::WEIGHT;
                                     _host_req3.intent.constraints.must_host_pinned  = true;
                                     _host_req3.intent.constraints.use_pinned_pool   = true;
-                                    void * arena_ptr = ggml_sycl::unified_allocate(_host_req3).resolve().ptr;
+                                    ggml_sycl::alloc_handle _handle3{};
+                                    if (!ggml_sycl::unified_alloc(_host_req3, &_handle3)) {
+                                        _handle3 = {};
+                                    }
+                                    void * arena_ptr = _handle3.ptr;
+                                    // Safety check: segmented allocations may have first segment < expert_size
+                                    const size_t seg0_size = (!_handle3.all_segments.empty()) ?
+                                                             _handle3.all_segments[0].size : (arena_ptr ? expert_size : 0);
+                                    if (arena_ptr && seg0_size < (size_t)expert_size) {
+                                        GGML_LOG_ERROR("[S1-PRELOAD-DBG] segmented expert alloc! seg0=%zu expert=%zu segs=%zu\n",
+                                                       seg0_size, (size_t)expert_size, _handle3.all_segments.size());
+                                        arena_ptr = nullptr;  // Don't memcpy into partial segment
+                                    }
                                     if (arena_ptr) {
+                                        GGML_LOG_INFO("[S1-PRELOAD-DBG2] memcpy dst=%p src=%p size=%zu seg0=%zu segs=%zu\n",
+                                                      arena_ptr, expert_aos, (size_t)expert_size,
+                                                      (!_handle3.all_segments.empty()) ? _handle3.all_segments[0].size : 0,
+                                                      _handle3.all_segments.size());
                                         std::memcpy(arena_ptr, expert_aos, expert_size);
                                         ggml_sycl_cache_id key =
                                             ggml_sycl_get_moe_expert_cache_key(tensor, extra, static_cast<int>(e));
@@ -26186,14 +26213,17 @@ static void ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,
     if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
         return;
     }
-    if (extra->moe_ptrs_ptr(device) != nullptr && extra->moe_expert_ptrs_size[device] == bytes) {
+    // Use raw accessor: ensure_moe_ptr_table manages the allocation lifecycle and must
+    // bypass the validity flag (which only guards dispatch-side consumers).
+    if (extra->moe_ptrs_ptr_raw(device) != nullptr && extra->moe_expert_ptrs_size[device] == bytes) {
         if (extra->moe_expert_ptrs_host[device].size() != count) {
             extra->moe_expert_ptrs_host[device].assign(count, nullptr);
         }
+        extra->moe_device_table_valid[device] = true;
         return;
     }
     // Free old buffer (only if it was runtime-allocated, not pre-allocated)
-    if (extra->moe_ptrs_ptr(device) != nullptr) {
+    if (extra->moe_ptrs_ptr_raw(device) != nullptr) {
         if (!extra->moe_expert_ptrs_from_prealloc[device]) {
             if (extra->moe_expert_ptrs_alloc[device].ptr) {
                 (void) ggml_sycl::unified_free(extra->moe_expert_ptrs_alloc[device]);
@@ -26218,6 +26248,7 @@ static void ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,
                 extra->moe_expert_ptrs_device[device]        = prealloc;
                 extra->moe_expert_ptrs_size[device]          = bytes;
                 extra->moe_expert_ptrs_from_prealloc[device] = true;
+                extra->moe_device_table_valid[device]        = true;
                 extra->moe_expert_ptrs_host[device].assign(count, nullptr);
                 GGML_SYCL_DEBUG("[MOE] Using pre-allocated table %d for device %d (%zu bytes)\n", table_index, device,
                                 bytes);
@@ -26242,10 +26273,11 @@ static void ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,
         GGML_LOG_ERROR("[MOE] Failed to allocate expert pointer table (%zu bytes)\n", count * sizeof(void *));
         return;
     }
-    extra->moe_expert_ptrs_device[device] = table;
+    extra->moe_expert_ptrs_device[device]        = table;
     queue.memset(table, 0, bytes);
     extra->moe_expert_ptrs_size[device]          = bytes;
     extra->moe_expert_ptrs_from_prealloc[device] = false;
+    extra->moe_device_table_valid[device]        = true;
     extra->moe_expert_ptrs_host[device].assign(count, nullptr);
 }
 
@@ -26660,6 +26692,8 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
         if (extra->moe_expert_ptrs_host[device].size() != static_cast<size_t>(n_experts)) {
             extra->moe_expert_ptrs_host[device].assign(static_cast<size_t>(n_experts), nullptr);
         }
+        // Invalidate stale device table so GPU kernels won't dereference evicted pointers.
+        extra->moe_device_table_valid[device] = false;
         GGML_SYCL_DEBUG("[MOE-PTR] Host-only pointer table mode for %s; skipping device table allocation\n",
                         src0->name ? src0->name : "?");
     }
@@ -36186,14 +36220,6 @@ cpu_fallback_fast:
         GGML_SYCL_DEBUG("[MoE-HYBRID] ne12=%ld hybrid_active=%d plan_hybrid=%d cpu_tg=%d expert_cache=%d\n",
                         (long) ne12, moe_hybrid_active ? 1 : 0, plan_hybrid ? 1 : 0, cpu_expert_tg_active ? 1 : 0,
                         use_expert_cache ? 1 : 0);
-        {
-            static std::atomic<int> hybrid_gate_log{ 0 };
-            if (hybrid_gate_log.fetch_add(1, std::memory_order_relaxed) < 1) {
-                fprintf(stderr, "[MOE-HYBRID-GATE] ne12=1: hybrid=%d plan=%d cpu_tg=%d cache=%d type=%d\n",
-                        moe_hybrid_active ? 1 : 0, plan_hybrid ? 1 : 0, cpu_expert_tg_active ? 1 : 0,
-                        use_expert_cache ? 1 : 0, (int) src0->type);
-            }
-        }
         if (moe_hybrid_with_plan) {
             // Hybrid dispatch uses host sync (future.get, stream.wait) which
             // is incompatible with SYCL graph recording.
@@ -40702,6 +40728,23 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     ggml_sycl_cpu_quant_cache_new_graph();
     ggml_sycl_moe_ids_cache_new_graph();
     ggml_sycl_moe_layer_ids_cache_new_graph();
+
+    // WEDGE-48330: drain any outstanding async CPU host_task dnnl_sgemm chain
+    // BEFORE resetting STAGING/SCRATCH zones.  A prior graph's host_task may
+    // still be reading from STAGING via DRM-backed host-USM pointers; if we
+    // reset the zone while the host_task worker is mid-read, the DRM page
+    // gets unmapped under it and faults.  See docs/plans/2026-04-18-mqxer-root-cause.md
+    // for the full evidence arc (A0-A0d).
+    //
+    // Batched-mode dnnl_sgemm host_tasks are covered by gpu_q in-order semantics
+    // (they run inside the caller's batched outer host_task).  Legacy sync path
+    // already calls cpu_wait_chain_event before compute.  This drain covers the
+    // async-mode host_task path specifically.
+    ggml_sycl_cpu_staging_drain();
+    // Release cached staging buffer leases BEFORE zone reset.  The staging
+    // buffers are sub-allocated from the host STAGING TLSF zone; zone_reset
+    // recycles the physical memory, leaving any surviving entry.ptr dangling.
+    ggml_sycl_cpu_staging_release();
 
     // Reset the scratch pool bump allocator so scratch allocations from the
     // previous graph are returned to the pool.

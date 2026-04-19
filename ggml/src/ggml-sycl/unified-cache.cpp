@@ -1643,8 +1643,6 @@ static const char * usm_alloc_name(sycl::usm::alloc alloc) {
     }
 }
 
-// host_cache class deleted (T8b) — unified_cache owns all weight tracking.
-
 void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
                                     const void *               src_ptr,
                                     size_t                     size,
@@ -1939,193 +1937,6 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
                     type == cache_entry_type::DENSE_WEIGHT ? "dense" : "expert",
                     is_host_resident ? " (host-resident)" : "", size / (1024.0f * 1024.0f),
                     used_.load() / (1024.0f * 1024.0f), budget_ / (1024.0f * 1024.0f));
-
-    return device_ptr;
-}
-
-void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
-                                          const void *               src_ptr,
-                                          size_t                     src_size,
-                                          size_t                     alloc_size,
-                                          cache_entry_type           type,
-                                          int                        layer_id,
-                                          int                        expert_id,
-                                          ggml_layout_mode           layout,
-                                          bool                       validate_content,
-                                          bool *                     needs_fill) {
-    if (needs_fill) {
-        *needs_fill = true;
-    }
-    if (!key_id.valid || !src_ptr || src_size == 0 || alloc_size == 0) {
-        return nullptr;
-    }
-
-    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
-    if (!g_graph_compute_active.load(std::memory_order_acquire)) {
-        process_deferred_frees();
-    }
-
-    unified_cache_key key{ type, key_id, layer_id, expert_id };
-    const uint64_t    new_hash = compute_content_hash(src_ptr, src_size);
-
-    auto it = entries_.find(key);
-    if (it != entries_.end()) {
-        auto id_it = id_to_key_.find(key_id);
-        if (id_it == id_to_key_.end()) {
-            id_to_key_.emplace(key_id, key);
-        } else if (!(id_it->second == key)) {
-            GGML_LOG_ERROR("[UNIFIED-CACHE] identity collision in ensure_cached_alloc model=%llu name_hash=0x%llx\n",
-                           (unsigned long long) key_id.model_id, (unsigned long long) key_id.name_hash);
-            if (cache_assert_enabled()) {
-                GGML_ABORT("unified_cache id_to_key mismatch");
-            }
-        }
-        if (it->second.layout != layout) {
-            if (it->second.pinned) {
-                GGML_SYCL_DEBUG(
-                    "[UNIFIED-CACHE] layout switch: unpinning model=%llu name_hash=0x%llx have=%d want=%d\n",
-                    (unsigned long long) key_id.model_id, (unsigned long long) key_id.name_hash,
-                    (int) it->second.layout, (int) layout);
-                it->second.pinned = false;
-            }
-            void * stale_ptr      = it->second.device_ptr;
-            size_t stale_size     = it->second.size;
-            bool   stale_host_res = it->second.host_resident;
-            entries_.erase(it);
-            it = entries_.end();
-            if (!stale_host_res && stale_ptr && stale_size > 0) {
-                enqueue_deferred_free(stale_ptr, stale_size);
-            }
-        }
-        if (it == entries_.end()) {
-            // Fall through to allocation path below
-        } else {
-            bool need_realloc = (alloc_size != it->second.size);
-            bool content_changed =
-                validate_content || (it->second.src_ptr != src_ptr) || (it->second.content_hash != new_hash);
-
-            if (need_realloc) {
-                const bool   was_pinned = it->second.pinned;
-                const size_t old_size   = it->second.size;
-                it->second.pinned       = true;
-                // Ensure space for new allocation
-                while (used_.load() - old_size + alloc_size > budget_) {
-                    if (evict_one(alloc_size) == 0) {
-                        GGML_SYCL_DEBUG("[UNIFIED-CACHE] Cannot evict for alloc (used=%.1f MB, need=%.1f MB)\n",
-                                        used_.load() / (1024.0f * 1024.0f), alloc_size / (1024.0f * 1024.0f));
-                        it->second.pinned = was_pinned;
-                        if (needs_fill) {
-                            *needs_fill = false;
-                        }
-                        return nullptr;
-                    }
-                }
-
-                void * new_device_ptr = nullptr;
-                try {
-                    new_device_ptr = ggml_sycl_malloc_device_raw(alloc_size, queue_, "unified_cache:alloc");
-                } catch (const sycl::exception & e) {
-                    GGML_LOG_ERROR("[UNIFIED-CACHE] alloc malloc_device failed: %s\n", e.what());
-                    it->second.pinned = was_pinned;
-                    if (needs_fill) {
-                        *needs_fill = false;
-                    }
-                    return nullptr;
-                }
-
-                if (!new_device_ptr) {
-                    GGML_LOG_ERROR("[UNIFIED-CACHE] alloc malloc_device returned nullptr\n");
-                    it->second.pinned = was_pinned;
-                    if (needs_fill) {
-                        *needs_fill = false;
-                    }
-                    return nullptr;
-                }
-                it->second.pinned = was_pinned;
-
-                // Free old buffer after new allocation succeeds
-                enqueue_deferred_free(it->second.device_ptr, it->second.size);
-
-                it->second.device_ptr = new_device_ptr;
-                it->second.size       = alloc_size;
-                if (alloc_size > old_size) {
-                    used_.fetch_add(alloc_size - old_size, std::memory_order_relaxed);
-                } else if (old_size > alloc_size) {
-                    saturating_sub_used(old_size - alloc_size);
-                }
-                content_changed = true;
-            }
-
-            it->second.src_ptr      = src_ptr;
-            it->second.content_hash = new_hash;
-            it->second.access_count++;
-            it->second.last_access     = time_++;
-            it->second.state           = cache_entry_state::READY;
-            it->second.has_ready_event = false;
-
-            if (needs_fill) {
-                *needs_fill = need_realloc || content_changed;
-            }
-            return it->second.device_ptr;
-        }
-    }
-
-    // Need to allocate new entry
-    while (used_.load() + alloc_size > budget_) {
-        if (evict_one(alloc_size) == 0) {
-            GGML_SYCL_DEBUG("[UNIFIED-CACHE] Cannot evict for alloc (used=%.1f MB, need=%.1f MB)\n",
-                            used_.load() / (1024.0f * 1024.0f), alloc_size / (1024.0f * 1024.0f));
-            return nullptr;
-        }
-    }
-
-    void * device_ptr = nullptr;
-    try {
-        device_ptr = ggml_sycl_malloc_device_raw(alloc_size, queue_, "unified_cache:alloc");
-    } catch (const sycl::exception & e) {
-        GGML_LOG_ERROR("[UNIFIED-CACHE] alloc malloc_device failed: %s\n", e.what());
-        return nullptr;
-    }
-
-    if (!device_ptr) {
-        GGML_LOG_ERROR("[UNIFIED-CACHE] alloc malloc_device returned nullptr\n");
-        return nullptr;
-    }
-
-    unified_cache_entry entry{};
-    entry.device_ptr      = device_ptr;
-    entry.src_ptr         = src_ptr;
-    entry.content_hash    = new_hash;
-    entry.size            = alloc_size;
-    entry.type            = type;
-    entry.layer_id        = layer_id;
-    entry.expert_id       = expert_id;
-    entry.layout          = layout;
-    entry.access_count    = 1;
-    entry.last_access     = time_++;
-    entry.pinned          = false;
-    entry.hot             = false;
-    entry.state           = cache_entry_state::READY;
-    entry.has_ready_event = false;
-    entry.host_resident   = false;
-    entry.location        = cache_location::DEVICE;
-
-    entries_[key] = entry;
-    auto id_it    = id_to_key_.find(key_id);
-    if (id_it == id_to_key_.end()) {
-        id_to_key_.emplace(key_id, key);
-    } else if (!(id_it->second == key)) {
-        GGML_LOG_ERROR("[UNIFIED-CACHE] identity collision on insert model=%llu name_hash=0x%llx\n",
-                       (unsigned long long) key_id.model_id, (unsigned long long) key_id.name_hash);
-        if (cache_assert_enabled()) {
-            GGML_ABORT("unified_cache id_to_key mismatch");
-        }
-    }
-    used_.fetch_add(alloc_size, std::memory_order_relaxed);
-
-    if (needs_fill) {
-        *needs_fill = true;
-    }
 
     return device_ptr;
 }
@@ -3834,7 +3645,7 @@ size_t unified_cache::evict_one(size_t /* new_size */) {
                 // P7: Async D2H eviction — preserve transformed layout in host-pinned memory.
                 // Use pre-allocated pinned pool (zero runtime sycl::malloc_host).
                 void * host_dst = host_zones_configured() ? host_zone_alloc(host_zone_id::WEIGHT, entry_size, 64) :
-                                                            allocate_pinned_runtime(entry_size, 64);
+                                                            host_pool_alloc(entry_size, 64);
 
                 if (host_dst) {
                     // Issue async D2H copy via DMA queue
@@ -3846,7 +3657,7 @@ size_t unified_cache::evict_one(size_t /* new_size */) {
                         if (host_zones_configured()) {
                             host_zone_free(host_zone_id::WEIGHT, host_dst);
                         } else {
-                            free_pinned_runtime(host_dst, entry_size);
+                            host_pool_free(host_dst, entry_size);
                         }
                         host_dst = nullptr;
                     }
@@ -3910,7 +3721,7 @@ size_t unified_cache::evict_one(size_t /* new_size */) {
             if (host_zones_configured()) {
                 host_zone_free(host_zone_id::WEIGHT, ptr);
             } else {
-                free_pinned_runtime(ptr, entry_size);
+                host_pool_free(ptr, entry_size);
             }
         }
 
@@ -3961,7 +3772,7 @@ size_t unified_cache::finalize_evictions_locked() {
             if (host_zones_configured()) {
                 host_zone_free(host_zone_id::WEIGHT, entry.eviction_host_ptr);
             } else {
-                free_pinned_runtime(entry.eviction_host_ptr, entry.size);
+                host_pool_free(entry.eviction_host_ptr, entry.size);
             }
         }
 
@@ -4106,15 +3917,15 @@ sycl::event unified_cache::copy_to_device(void * dst, const void * src, size_t s
         // No staging buffer — this should not happen since staging_ is always
         // pre-allocated in the constructor.  Fall back to host_arena pinned pool
         // to avoid runtime sycl::malloc_host.
-        void * temp = host_zones_configured() ? host_zone_alloc(host_zone_id::SCRATCH, size, 64) :
-                                                allocate_pinned_runtime(size, 64);
+        void * temp =
+            host_zones_configured() ? host_zone_alloc(host_zone_id::SCRATCH, size, 64) : host_pool_alloc(size, 64);
         if (temp) {
             std::memcpy(temp, src, size);
             sycl::event evt = queue_.memcpy(dst, temp, size);
             // Must wait before freeing temp buffer back to pool
             evt.wait();
             if (!host_zones_configured()) {
-                free_pinned_runtime(temp, size);
+                host_pool_free(temp, size);
             }
             return sycl::event{};
         } else {
@@ -5479,7 +5290,7 @@ static bool unified_free_record(const runtime_alloc_record & rec) {
                 if (cache) {
                     for (const auto & seg : rec.handle.all_segments) {
                         if (!rec.zone_managed) {
-                            cache->free_pinned_runtime(seg.ptr, seg.size);
+                            cache->host_pool_free(seg.ptr, seg.size);
                         }
                         // Zone-managed segments are reclaimed by zone reset or pool destruction
                     }
@@ -5511,7 +5322,7 @@ static bool unified_free_record(const runtime_alloc_record & rec) {
         if (rec.uses_pinned_pool) {
             if (!rec.zone_managed) {
                 if (auto * cache = get_unified_cache_for_device(rec.handle.device)) {
-                    cache->free_pinned_runtime(rec.handle.ptr, rec.handle.size);
+                    cache->host_pool_free(rec.handle.ptr, rec.handle.size);
                 }
             }
             // Zone-managed host allocations are reclaimed by zone reset or pool
@@ -5734,10 +5545,20 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
         // Always try the pre-allocated pinned chunk pool first (lock-free path).
         if (auto * ucache = get_unified_cache_for_device(req.device)) {
             if (req.intent.constraints.use_pinned_pool) {
+                // Route to the correct host zone based on role.  KV spills go to KV
+                // zone; permanent weight data (WEIGHT role) goes to WEIGHT zone so it
+                // is never recycled by STAGING zone resets; everything else (ephemeral
+                // per-graph activation staging) stays in STAGING.
+                host_zone_id pool_zone = host_zone_id::STAGING;
+                if (kv_spill_to_host || req.intent.role == alloc_role::KV) {
+                    pool_zone = host_zone_id::KV;
+                } else if (req.intent.role == alloc_role::WEIGHT) {
+                    pool_zone = host_zone_id::WEIGHT;
+                }
                 // Use segmented allocation for large requests - transparently handles
                 // allocations larger than the chunk size (8GB).
-                segmented_buffer segs = ucache->host_zone_alloc_segmented(host_zone_id::STAGING, alloc_size,
-                                                                          pinned_chunk_pool::DEFAULT_ALIGNMENT);
+                segmented_buffer segs =
+                    ucache->host_zone_alloc_segmented(pool_zone, alloc_size, pinned_chunk_pool::DEFAULT_ALIGNMENT);
                 if (!segs.segments.empty()) {
                     ptr               = segs.segments[0].ptr;
                     // Store all segments in the handle for proper cleanup
@@ -5745,7 +5566,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                     uses_pinned_pool  = true;
                     zone_managed      = true;
                     out->zone_managed = true;
-                    out->host_zone    = host_zone_id::STAGING;
+                    out->host_zone    = pool_zone;
                 }
             } else if (ucache->host_zones_configured()) {
                 host_zone_id zone = host_zone_id::STAGING;
@@ -5774,14 +5595,17 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 }
             } else {
                 // Fallback: direct runtime allocation (may fail for large requests)
-                ptr = ucache->allocate_pinned_runtime(alloc_size, pinned_chunk_pool::DEFAULT_ALIGNMENT);
+                ptr = ucache->host_pool_alloc(alloc_size, pinned_chunk_pool::DEFAULT_ALIGNMENT);
             }
             uses_pinned_pool = (ptr != nullptr);
         }
         if (!ptr) {
-            // Fallback to malloc_host for model loading only.
-            // Inference allocations MUST go through the zone system.
-            // This fallback will be removed once all inference paths use zones.
+            // When host zones are configured, a WEIGHT zone miss means the zone is
+            // intentionally sized and the caller should skip this allocation (e.g.
+            // S1-PRELOAD will leave the expert un-registered and the inference path
+            // will fetch it on-demand).  Falling back to sycl::malloc_host here
+            // causes memory pressure that can evict mmap-backed tensor pages and
+            // trigger SIGSEGV in the preload memcpy.
             if (req.intent.role == alloc_role::WEIGHT) {
                 ptr = ggml_sycl_malloc_host(alloc_size, *req.queue, "unified_alloc:weight");
             } else {
@@ -5818,7 +5642,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     rec.handle.vram_zone    = out->vram_zone;  // Propagate zone routing set by zone_alloc paths above
     rec.handle.zone_managed = out->zone_managed;
     rec.handle.host_zone    = out->host_zone;
-    // all_segments is already populated by the segmented allocation path above
+    rec.handle.all_segments = std::move(out->all_segments);  // Preserve segments from zone alloc path
     rec.queue               = req.queue;
     rec.uses_pinned_pool    = uses_pinned_pool;
     rec.zone_managed        = zone_managed;
@@ -5836,7 +5660,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
             // Arena zones handle their own accounting — no separate counter sub needed.
             if (uses_pinned_pool && !zone_managed) {
                 if (auto * ucache = get_unified_cache_for_device(req.device)) {
-                    ucache->free_pinned_runtime(ptr, alloc_size);
+                    ucache->host_pool_free(ptr, alloc_size);
                 }
             } else if (uses_pinned_pool) {
                 // Zone-managed host allocations are released by zone reset.
@@ -7776,14 +7600,14 @@ size_t unified_cache::available_device() const {
 
 // --- Host arena methods ---
 
-void * unified_cache::allocate_pinned_runtime(size_t size, size_t alignment) {
+void * unified_cache::host_pool_alloc(size_t size, size_t alignment) {
     if (!host_arena_ || !size) {
         return nullptr;
     }
     return host_arena_->allocate_runtime(size, alignment);
 }
 
-void unified_cache::free_pinned_runtime(void * ptr, size_t size) {
+void unified_cache::host_pool_free(void * ptr, size_t size) {
     if (!host_arena_ || !ptr || size == 0) {
         return;
     }
@@ -7806,6 +7630,29 @@ void unified_cache::host_zone_reset(host_zone_id zone) {
                 it = g_runtime_alloc_registry.erase(it);
             } else {
                 ++it;
+            }
+        }
+    }
+
+    // Purge offload pool entries whose backing memory came from this host zone.
+    // The offload pool caches (slot registry + free list) hold raw pointers into
+    // the TLSF arena.  zone_reset() recycles that memory, so any surviving pool
+    // entry becomes a dangling pointer.  Purge before zone_reset so that the
+    // next acquire_offload_buffer() allocates fresh memory from the reset zone.
+    {
+        std::lock_guard<std::mutex> lock(g_offload_pool_mutex);
+        for (auto it = g_offload_pool_slots.begin(); it != g_offload_pool_slots.end();) {
+            if (it->second.handle.host_zone == zone) {
+                it = g_offload_pool_slots.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        // Rebuild free list from surviving slots to remove stale pointers.
+        g_offload_pool_free.clear();
+        for (const auto & kv : g_offload_pool_slots) {
+            if (!kv.second.in_use) {
+                g_offload_pool_free[kv.second.key].push_back(kv.first);
             }
         }
     }
@@ -7864,7 +7711,7 @@ bool unified_cache::contains_pinned(const void * ptr) const {
     return host_arena_->contains(ptr);
 }
 
-size_t unified_cache::pre_allocate_pinned(size_t total_bytes) {
+size_t unified_cache::host_pool_preallocate(size_t total_bytes) {
     if (!host_arena_) {
         return 0;
     }
@@ -7988,7 +7835,7 @@ unified_cache::vram_alloc_result unified_cache::allocate(size_t size, alloc_life
         zone = host_zone_id::STAGING;
         ptr  = host_zone_alloc(zone, size, pinned_chunk_pool::DEFAULT_ALIGNMENT);
     } else {
-        ptr = allocate_pinned_runtime(size, pinned_chunk_pool::DEFAULT_ALIGNMENT);
+        ptr = host_pool_alloc(size, pinned_chunk_pool::DEFAULT_ALIGNMENT);
     }
     uses_pinned_pool = (ptr != nullptr);
     if (!ptr) {
@@ -8047,7 +7894,7 @@ void unified_cache::deallocate(void * ptr, size_t size, alloc_lifetime lifetime)
     try {
         if (!entry.on_device && entry.uses_pinned_pool) {
             if (entry.host_zone == host_zone_id::COUNT) {
-                free_pinned_runtime(ptr, entry.size);
+                host_pool_free(ptr, entry.size);
             }
             return;
         }
@@ -10274,6 +10121,17 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         const int target    = commit_bytes(target_dev_idx, entry.dst_size, 0);
         entry.on_device     = target >= 0;
         entry.target_device = target;
+    }
+
+    // The multi-device plan places all KV on-device (kv_host_bytes = 0) because it
+    // assumes all GPUs are available. At runtime ONEAPI_DEVICE_SELECTOR may restrict
+    // execution to a single device, causing KV to spill to host. Size the KV zone
+    // conservatively: the full KV footprint across all layers, so the host zone is
+    // always large enough regardless of runtime GPU availability.
+    if (plan.kv_host_bytes == 0 && kv_info.valid()) {
+        const size_t total_kv = kv_info.n_full_attn_layers() * kv_info.kv_bytes_per_layer() +
+                                kv_info.n_swa_layers * kv_info.kv_bytes_per_swa_layer();
+        plan.kv_host_bytes = total_kv;
     }
 
     populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
