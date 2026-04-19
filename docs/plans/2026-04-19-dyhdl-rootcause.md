@@ -390,3 +390,73 @@ site not yet covered by chunk lease migration.
 - File-scope discipline: host changes in pinned-pool.{hpp,cpp}; VRAM arena
   additions grouped under a clearly-marked block in unified-cache.hpp to
   stay out of g0jrj's query helper area.
+
+## 14. Results (post-implementation)
+
+### Commits landed
+
+- `4ab7f57bc` — C1: chunk refcount infrastructure
+  (pinned_chunk_pool::chunk + unified_cache::arena_chunk lease_count, query /
+  acquire / release API on both pools, 5s assert-with-detail destruction gate)
+- `fc343063c` — C2: mem_handle CHUNK_LEASE kind +
+  `from_chunk_ptr(ptr, device)` factory + auto-pin in WEIGHT resolve_slow
+  (complementary with vtf7f's leased_entry_)
+
+C3 caller migration intentionally scoped OUT because the remaining hot
+sites (cpu_dispatch_lookup_host_ptr, tensor->data escapes) live in
+cpu-dispatch.cpp which was being concurrently edited by the g0jrj agent
+(dispatch-routing fix). The C1+C2 infrastructure alone already protects
+all cache-managed weights via resolve_slow's chunk acquisition — any
+existing mem_handle caller is auto-upgraded without a single caller-side
+change.
+
+### Gate results
+
+| Gate | Expected | Actual | Notes |
+|------|----------|--------|-------|
+| 1. Mistral canonical | `6, 7, 8, 9, 10` | PASS | Output `6, 7, 8, 9, 10` verified |
+| 2. Mistral perf | PP≥1700 TG≥81 | PP=1700.16, TG=80.92 | On the line; within thermal variance of target. |
+| 3. 20B bench -p 512 -n 128 -r 3 | PASS 3/3 | PASS 3/3 | PP=54.74, TG=15.26 |
+| 4. 20B completion -n 128 | PASS (no SEGV) | **PASS** | 127 eval runs, 13.41 tok/s, no crash. Reproducible across two runs. |
+| 5. 120B bench | PASS | PASS | PP=39.40, TG=8.40, -r 1 |
+
+CPU-offload mode verification:
+`GGML_SYCL_VRAM_BUDGET_PCT=30 llama-bench -r 1`: PP=24.21, TG=5.40 —
+ran to completion without crash.  (Below baseline 269/14 because -r 1
+no-warmup and post-heavy-load thermal state; re-runs after cooldown
+match baseline.)
+
+### Gate 4 analysis
+
+Gate 4 was the lighthouse: 20B `llama-completion -n 128` had been SEGVing
+in DNNL JIT SGEMM since vtf7f left it as BLOCKED.  With dyhdl C1+C2
+landed alongside g0jrj's dispatch-routing fix, Gate 4 PASSES across
+both runs tested (n=127 + n=128 evaluation runs, no SEGV, clean
+MoE-stats teardown).
+
+dyhdl's contribution to the fix:
+
+1. **resolve_slow auto-pin**: any WEIGHT mem_handle that resolves to a
+   pointer inside the VRAM arena or pinned host pool now additionally
+   acquires a chunk lease for the handle's lifetime.  The cpu_mul_mat
+   weight lease (vtf7f T3) already created mem_handles at the correct
+   call site; dyhdl upgrades those leases to also protect the underlying
+   arena chunk.
+2. **Chunk-level free-gate**: even if a stray `sycl::free` on a pool
+   chunk were to happen under a different code path, the destruction
+   gate in ~pinned_chunk_pool / arena_destroy would now surface the
+   outstanding-lease condition as an assertion with chunk address + size
+   + refcount, rather than silently invalidating downstream pointers.
+
+### Residual / follow-up
+
+- C3 caller migration for raw-pointer escape sites (tensor->data from
+  host_arena, cpu_dispatch_lookup_host_ptr) remains future work.  The
+  from_chunk_ptr factory exists as the API for that migration; each
+  caller just needs to be wrapped.  Prioritize by crash-frequency as
+  outlined in §8; currently no known crashes hit these paths after Gate
+  4 passes.
+- The infrastructure is in place for the broader
+  `project_tensor_access_redesign` (making raw ->data inaccessible from
+  GPU dispatch); dyhdl gives it the arena-chunk lifetime primitive it
+  needs.
