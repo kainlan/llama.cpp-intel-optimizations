@@ -7711,7 +7711,7 @@ bool unified_cache::contains_pinned(const void * ptr) const {
     return host_arena_->contains(ptr);
 }
 
-size_t unified_cache::host_pool_preallocate(size_t total_bytes) {
+size_t unified_cache::pre_allocate_host_pool(size_t total_bytes) {
     if (!host_arena_) {
         return 0;
     }

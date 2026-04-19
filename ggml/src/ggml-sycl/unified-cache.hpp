@@ -1628,7 +1628,7 @@ class unified_cache {
     size_t pinned_pool_budget() const { return host_arena_ ? host_arena_->budget() : 0; }
 
     bool             contains_pinned(const void * ptr) const;
-    size_t           host_pool_preallocate(size_t total_bytes);
+    size_t           pre_allocate_host_pool(size_t total_bytes);
     size_t           pre_allocate_all(size_t model_weight_bytes);
     size_t           pre_allocate_runtime_chunks(size_t total_bytes);
     // Host zone allocation (owned by unified_cache).

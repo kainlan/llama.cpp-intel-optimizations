@@ -2401,7 +2401,10 @@ static void ggml_sycl_configure_host_zones_for_plan(ggml_sycl::unified_cache * c
     const size_t total_host_needed =
         plan.host_zone_weight_bytes + kv_zone_bytes + plan.host_zone_staging_bytes + scratch_zone_bytes;
 
-    cache->host_pool_preallocate(total_host_needed);
+    // Zone-config preflight: grow the pinned-pool to total capacity before configure_host_zones()
+    // carves it into sub-zones. Without this, the first zone alloc triggers incremental chunk growth
+    // mid-inference (HOST_ALLOC_PHASE_GATE warnings) instead of upfront at model load.
+    cache->pre_allocate_host_pool(total_host_needed);
     cache->configure_host_zones(plan.host_zone_weight_bytes, kv_zone_bytes, plan.host_zone_staging_bytes,
                                 scratch_zone_bytes);
 
@@ -4386,7 +4389,10 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
             // At least 2 GB to handle burst demand without runtime malloc_host
             const size_t min_pre_alloc   = static_cast<size_t>(2ULL * 1024ULL * 1024ULL * 1024ULL);
             const size_t pre_alloc_bytes = std::max(estimated_working_set, min_pre_alloc);
-            const size_t chunks_grown    = cache->host_pool_preallocate(pre_alloc_bytes);
+            // 120B MoE safety net: pre-grow the pinned pool to the estimated expert working set
+            // (double-buffered, up to 8 MoE layers, 2 GB floor) so runtime malloc_host never
+            // stalls mid-token on bulk expert weight demand.
+            const size_t chunks_grown    = cache->pre_allocate_host_pool(pre_alloc_bytes);
             if (chunks_grown > 0) {
                 GGML_LOG_INFO("[MOE-HYBRID] Pre-allocated %zu pinned chunks for %.1f MB working set\n", chunks_grown,
                               pre_alloc_bytes / (1024.0 * 1024.0));
