@@ -51,9 +51,13 @@ public:
     // Shut down all workers and free ring buffer memory.
     void shutdown();
 
-    // Submit a batch of CPU expert tasks. Returns a future for synchronization.
-    // The caller must ensure tasks remain valid until the future completes.
-    std::future<void> submit_batch(const cpu_expert_task * tasks, int n_tasks);
+    // Submit a batch of CPU expert tasks. Takes ownership of the tasks
+    // vector; storage is kept alive inside the worker lambda for the
+    // entire lifetime of the computation and is freed when the future
+    // completes. This closes a UAF where a raw pointer into caller-owned
+    // storage was retained by the worker lambda while the caller
+    // overwrote / moved / destroyed the backing vector.
+    std::future<void> submit_batch(std::vector<cpu_expert_task> tasks);
 
     // Ring buffer: acquire a staging slot for up to max_experts_ experts.
     struct StagingSlot {

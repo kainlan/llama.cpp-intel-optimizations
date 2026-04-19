@@ -6907,9 +6907,11 @@ struct pending_cpu_scatter {
 
     std::vector<scatter_entry> entries;
 
-    // CPU task array: must outlive the async CPU compute future.
-    // submit_batch / std::async capture a raw pointer to tasks.data(),
-    // so the vector must remain alive until future.get() completes.
+    // Legacy field, retained for ABI stability and backward compatibility
+    // with paths that only use its clear()-on-flush semantics.  As of the
+    // skgik fix, the CPU expert task storage lives inside the worker's
+    // lambda (submit_batch takes the vector by value and moves it in), so
+    // this field is never populated during a live submission.
     std::vector<cpu_expert_task> tasks;
 
     int  device_id;     // Device index for pool release
@@ -34371,17 +34373,23 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             }
                             tl_first_tasks.resize(n_valid_first);
                             valid_fi_first.resize(n_valid_first);
-                            // Submit async — GPU dispatches below run in parallel
-                            auto * tasks_ptr = tl_first_tasks.data();
-                            int    n_tasks   = static_cast<int>(n_valid_first);
-                            auto & cpu_pool  = g_cpu_expert_pools[ctx.device];
+                            // Submit async — GPU dispatches below run in parallel.
+                            // Transfer ownership of the tasks vector into the
+                            // worker (lambda or CpuExpertPool) so that storage
+                            // outlives the worker's reads even if this scope
+                            // unwinds or tl_first_tasks is resized next token.
+                            int                          n_tasks = static_cast<int>(n_valid_first);
+                            auto &                       cpu_pool = g_cpu_expert_pools[ctx.device];
+                            std::vector<cpu_expert_task> submit_tasks(tl_first_tasks.begin(), tl_first_tasks.end());
                             if (n_tasks > 0 && cpu_pool.is_active()) {
-                                first_cpu_future = cpu_pool.submit_batch(tasks_ptr, n_tasks);
+                                first_cpu_future  = cpu_pool.submit_batch(std::move(submit_tasks));
                                 first_cpu_pending = true;
                             } else if (n_tasks > 0) {
-                                first_cpu_future = std::async(std::launch::async, [tasks_ptr, n_tasks]() {
-                                    ggml_sycl_cpu_expert_mul_mat_batched(tasks_ptr, n_tasks);
-                                });
+                                first_cpu_future =
+                                    std::async(std::launch::async, [tasks = std::move(submit_tasks)]() mutable {
+                                        ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(),
+                                                                              static_cast<int>(tasks.size()));
+                                    });
                                 first_cpu_pending = true;
                             }
                         }
@@ -34647,24 +34655,27 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         }
                     }
 
-                    // CPU down mul_mat -- defer for overlap with subsequent GPU ops
+                    // CPU down mul_mat -- defer for overlap with subsequent GPU ops.
+                    // Ownership model: the task vector is constructed locally and
+                    // moved into the worker (lambda or CpuExpertPool).  The worker
+                    // owns the storage until the future completes, so the old
+                    // pending_scatter / pending_cpu_pipeline state can be
+                    // overwritten below without racing against the prior worker.
                     if (n_valid_d > 0) {
                         const bool use_cpu_pipeline = ggml_sycl_pipeline_cpu_enabled();
-                        auto & target_tasks = use_cpu_pipeline ? g_pending_cpu_pipeline.tasks : g_pending_scatter.tasks;
-                        target_tasks.clear();
-                        target_tasks.reserve(n_valid_d);
+                        std::vector<cpu_expert_task> batch_tasks;
+                        batch_tasks.reserve(n_valid_d);
                         for (size_t fi = 0; fi < n_valid_d; fi++) {
-                            target_tasks.push_back(dt[fi]);
+                            batch_tasks.push_back(dt[fi]);
                         }
-                        auto *            tasks_ptr = target_tasks.data();
-                        int               n_tasks   = static_cast<int>(n_valid_d);
-                        auto &            cpu_pool  = g_cpu_expert_pools[ctx.device];
+                        auto &            cpu_pool = g_cpu_expert_pools[ctx.device];
                         std::future<void> fut;
                         if (cpu_pool.is_active()) {
-                            fut = cpu_pool.submit_batch(tasks_ptr, n_tasks);
+                            fut = cpu_pool.submit_batch(std::move(batch_tasks));
                         } else {
-                            fut = std::async(std::launch::async, [tasks_ptr, n_tasks]() {
-                                ggml_sycl_cpu_expert_mul_mat_batched(tasks_ptr, n_tasks);
+                            fut = std::async(std::launch::async, [tasks = std::move(batch_tasks)]() mutable {
+                                ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(),
+                                                                      static_cast<int>(tasks.size()));
                             });
                         }
                         if (use_cpu_pipeline) {
@@ -36424,11 +36435,14 @@ cpu_fallback_fast:
                 }
 
                 // Build CPU tasks from mmap host weight pointers.
-                // Tasks are stored in the result struct to keep the array
-                // alive until flush — submit_batch captures a raw pointer.
+                // Ownership model: tasks are built in a local vector and moved
+                // into the worker (CpuExpertPool or std::async lambda), which
+                // owns the storage until the future completes.  The
+                // cpu_dispatch_result::tasks field is no longer load-bearing
+                // for the in-flight worker lifetime.
                 GGML_ASSERT(use_expert_cache && "CPU dispatch requires host-accessible weights");
-                result.tasks.clear();
-                result.tasks.reserve(n_cpu);
+                std::vector<cpu_expert_task> batch_tasks;
+                batch_tasks.reserve(n_cpu);
                 for (size_t ci = 0; ci < n_cpu; ci++) {
                     const auto & entry       = entries[ci];
                     const void * host_weight = nullptr;
@@ -36462,7 +36476,7 @@ cpu_fallback_fast:
                     t.type        = src0->type;
                     t.K           = static_cast<int>(K);
                     t.N           = static_cast<int>(N);
-                    result.tasks.push_back(t);
+                    batch_tasks.push_back(t);
                 }
 
                 // Wait for deferred activation D2H before CPU tasks read it.
@@ -36472,16 +36486,15 @@ cpu_fallback_fast:
                     act_deferred_evt.wait();
                 }
 
-                // Submit to CPU thread pool
-                auto * tasks_ptr = result.tasks.data();
-                int    n_tasks   = static_cast<int>(result.tasks.size());
-                auto & cpu_pool  = g_cpu_expert_pools[ctx.device];
-
+                // Submit to CPU thread pool — move the tasks vector into
+                // the worker so storage outlives every possible caller action.
+                auto & cpu_pool = g_cpu_expert_pools[ctx.device];
                 if (cpu_pool.is_active()) {
-                    result.future = cpu_pool.submit_batch(tasks_ptr, n_tasks);
+                    result.future = cpu_pool.submit_batch(std::move(batch_tasks));
                 } else {
-                    result.future = std::async(std::launch::async, [tasks_ptr, n_tasks]() {
-                        ggml_sycl_cpu_expert_mul_mat_batched(tasks_ptr, n_tasks);
+                    result.future = std::async(std::launch::async, [tasks = std::move(batch_tasks)]() mutable {
+                        ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(),
+                                                              static_cast<int>(tasks.size()));
                     });
                 }
 
@@ -36509,11 +36522,12 @@ cpu_fallback_fast:
 
             // Apply a cpu_dispatch_result to g_pending_scatter.  MUST be
             // called on the main thread (g_pending_scatter is thread_local).
+            // Task storage is owned by r.future's worker lambda, not by
+            // g_pending_scatter, so no vector move is needed here.
             auto apply_cpu_result_to_scatter = [&](cpu_dispatch_result & r) {
                 if (!r.valid) {
                     return;
                 }
-                g_pending_scatter.tasks        = std::move(r.tasks);
                 g_pending_scatter.future       = std::move(r.future);
                 g_pending_scatter.out_pinned   = r.out_pinned;
                 g_pending_scatter.act_pinned   = r.act_pinned;
@@ -36530,11 +36544,12 @@ cpu_fallback_fast:
             };
 
             // Apply CPU dispatch result to pipeline (cross-layer overlap).
+            // Task storage is owned by r.future's worker lambda, not by
+            // g_pending_cpu_pipeline, so no vector move is needed here.
             auto apply_cpu_result_to_pipeline = [&](cpu_dispatch_result & r) {
                 if (!r.valid) {
                     return;
                 }
-                g_pending_cpu_pipeline.tasks        = std::move(r.tasks);
                 g_pending_cpu_pipeline.future       = std::move(r.future);
                 g_pending_cpu_pipeline.out_pinned   = r.out_pinned;
                 g_pending_cpu_pipeline.act_pinned   = r.act_pinned;
@@ -37419,8 +37434,12 @@ cpu_fallback_fast:
                 }
                 sycl::event::wait(copy_events);
 
-                g_pending_scatter.tasks.clear();
-                g_pending_scatter.tasks.reserve(n_cpu);
+                // Build tasks into a local vector; ownership transfers into
+                // the worker (CpuExpertPool lambda or std::async lambda).
+                // g_pending_scatter.tasks is no longer load-bearing for the
+                // worker lifetime — the worker's lambda keeps its own copy.
+                std::vector<cpu_expert_task> batch_tasks;
+                batch_tasks.reserve(n_cpu);
                 g_pending_scatter.entries.clear();
                 g_pending_scatter.entries.reserve(n_cpu);
 
@@ -37451,7 +37470,7 @@ cpu_fallback_fast:
                     task.type        = src0->type;
                     task.K           = static_cast<int>(K);
                     task.N           = static_cast<int>(N);
-                    g_pending_scatter.tasks.push_back(task);
+                    batch_tasks.push_back(task);
 
                     const int64_t i1    = entry.id;
                     const int64_t i2    = entry.iid1;
@@ -37459,15 +37478,15 @@ cpu_fallback_fast:
                     g_pending_scatter.entries.push_back({ dst_d, static_cast<int>(N) });
                 }
 
-                auto * tasks_ptr = g_pending_scatter.tasks.data();
-                int    n_tasks   = static_cast<int>(g_pending_scatter.tasks.size());
-                auto & cpu_pool  = g_cpu_expert_pools[ctx.device];
+                auto & cpu_pool = g_cpu_expert_pools[ctx.device];
                 if (cpu_pool.is_active()) {
-                    g_pending_scatter.future = cpu_pool.submit_batch(tasks_ptr, n_tasks);
+                    g_pending_scatter.future = cpu_pool.submit_batch(std::move(batch_tasks));
                 } else {
-                    g_pending_scatter.future = std::async(std::launch::async, [tasks_ptr, n_tasks]() {
-                        ggml_sycl_cpu_expert_mul_mat_batched(tasks_ptr, n_tasks);
-                    });
+                    g_pending_scatter.future =
+                        std::async(std::launch::async, [tasks = std::move(batch_tasks)]() mutable {
+                            ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(),
+                                                                  static_cast<int>(tasks.size()));
+                        });
                 }
 
                 g_pending_scatter.out_pinned   = out_pinned;
@@ -37758,13 +37777,14 @@ cpu_fallback_fast:
                 tasks.push_back(task);
             }
 
-            auto * tasks_ptr = tasks.data();
-            int    n_tasks   = static_cast<int>(tasks.size());
-            auto & cpu_pool  = g_cpu_expert_pools[ctx.device];
+            auto & cpu_pool = g_cpu_expert_pools[ctx.device];
             if (cpu_pool.is_active()) {
-                cpu_pool.submit_batch(tasks_ptr, n_tasks).get();
+                // Synchronous submission: move the vector in, then block on
+                // the returned future.  The worker owns the storage; this
+                // scope does not.
+                cpu_pool.submit_batch(std::move(tasks)).get();
             } else {
-                ggml_sycl_cpu_expert_mul_mat_batched(tasks_ptr, n_tasks);
+                ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), static_cast<int>(tasks.size()));
             }
 
             std::vector<sycl::event> h2d_events;
@@ -40804,6 +40824,25 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     // already calls cpu_wait_chain_event before compute.  This drain covers the
     // async-mode host_task path specifically.
     ggml_sycl_cpu_staging_drain();
+
+    // A0f / skgik: drain any in-flight CpuExpertPool futures before
+    // resetting STAGING/SCRATCH zones.  The TBB workers in the pool
+    // dereference act_host / output_host pointers that alias into the
+    // STAGING zone (fusion.act_host, tl_first_out, tl_down_out, etc.).
+    // If zone_reset fires while a worker is still running, the TLSF
+    // bump resets the backing DRM page and the worker's next
+    // vbroadcastss / vfmadd231ps faults in an unmapped gap — the crash
+    // signature documented in llama.cpp-skgik.  A0d's staging drain
+    // only covers the async host_task chain; A0e's future drain only
+    // fires under VRAM pressure.  This drain closes the graph-boundary
+    // window unconditionally.
+    if (g_pending_scatter.future.valid()) {
+        try { g_pending_scatter.future.wait(); } catch (...) {}
+    }
+    if (g_pending_cpu_pipeline.future.valid()) {
+        try { g_pending_cpu_pipeline.future.wait(); } catch (...) {}
+    }
+
     // Release cached staging buffer leases BEFORE zone reset.  The staging
     // buffers are sub-allocated from the host STAGING TLSF zone; zone_reset
     // recycles the physical memory, leaving any surviving entry.ptr dangling.

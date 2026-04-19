@@ -125,15 +125,21 @@ void CpuExpertPool::worker_thread() {
     }
 }
 
-std::future<void> CpuExpertPool::submit_batch(const cpu_expert_task * tasks,
-                                               int n_tasks) {
+std::future<void> CpuExpertPool::submit_batch(std::vector<cpu_expert_task> tasks) {
     auto promise = std::make_shared<std::promise<void>>();
     auto future  = promise->get_future();
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        work_queue_.push([tasks, n_tasks, promise]() {
-            ggml_sycl_cpu_expert_mul_mat_batched(tasks, n_tasks);
+        // Move the tasks vector into the lambda so that storage is owned
+        // by the worker for the entire computation.  Prior to this fix,
+        // a raw pointer was captured and the caller remained responsible
+        // for keeping the backing vector alive — a contract that was
+        // violated by several call sites, producing a UAF in the TBB
+        // arena (simd_mxfp4_q8_0_16row reading a stale weight_host).
+        work_queue_.push([tasks = std::move(tasks), promise]() mutable {
+            ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(),
+                                                  static_cast<int>(tasks.size()));
             promise->set_value();
         });
     }
