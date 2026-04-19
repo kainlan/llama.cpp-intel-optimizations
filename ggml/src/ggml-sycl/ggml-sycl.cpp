@@ -63,6 +63,7 @@
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
 #include "ggml-sycl.h"
+#include "ggml-sycl/a7l5w-probe.hpp"
 #include "ggml-sycl/add-id.hpp"
 #include "ggml-sycl/alloc-registry.hpp"
 #include "ggml-sycl/backend.hpp"
@@ -14651,6 +14652,16 @@ static enum ggml_status tiered_kv_buffer_init_tensor(ggml_backend_buffer_t buffe
                     "off_in_layer=%zu + nbytes=%zu > la.size=%zu\n",
                     name, offset_within_layer, ggml_nbytes(tensor), la.size);
             }
+
+            // A7L5W Site 4: hard assertion on the remapped pointer covering the
+            // tensor.  Without this, the overflow only emits a log line and
+            // execution continues with an OOB pointer.  Under the A7L5W
+            // compile flag we want the process to abort at the site of the
+            // bad pointer construction, not downstream in a JIT kernel.
+            GGML_SYCL_A7L5W_ASSERT_TENSOR("kv_remap/per_layer",
+                                         tensor,
+                                         tensor->data,
+                                         ggml_nbytes(tensor));
 
             return GGML_STATUS_SUCCESS;
         }
@@ -30474,6 +30485,14 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                         // dst batch offset: dst is contiguous F32 [N, M, ne12, ne13]
                         float * dst_batch = tl_dst_host.data() + (i13 * ne12 + i12) * M * N;
 
+                        // A7L5W Site 2-caller: verify per-batch src0 slab stays
+                        // in the registered weight allocation.
+                        GGML_SYCL_A7L5W_ASSERT_TENSOR("cpu_pp_caller/src0_batch",
+                                                     src0,
+                                                     src0_batch,
+                                                     static_cast<std::size_t>(N) *
+                                                         static_cast<std::size_t>(nb01));
+
                         // Quantized vec_dot GEMM via cpu-dispatch wrapper
                         gemm_ok = ggml_sycl_cpu_pp_gemm(src0->type, src0_batch, N, K, src1_batch, M, dst_batch, ldc);
                     }
@@ -37763,6 +37782,17 @@ cpu_fallback_fast:
                                                     static_cast<size_t>(K) * sizeof(float)));
             }
             sycl::event::wait(d2h_events);
+
+            // A7L5W MoE: validate the single-expert slab covers the row-stride
+            // extent that ggml_sycl_cpu_vec_dot_rows will dereference.
+            {
+                const std::size_t expert_row_bytes = ggml_row_size(src0->type, static_cast<int>(K));
+                const std::size_t expert_slab_bytes = static_cast<std::size_t>(N) * expert_row_bytes;
+                GGML_SYCL_A7L5W_ASSERT_PTR("moe_host_expert/weight_host",
+                                          src0 && src0->name ? src0->name : "(moe_expert)",
+                                          host_weight_ptr,
+                                          expert_slab_bytes);
+            }
 
             std::vector<cpu_expert_task> tasks;
             tasks.reserve(n_rows);

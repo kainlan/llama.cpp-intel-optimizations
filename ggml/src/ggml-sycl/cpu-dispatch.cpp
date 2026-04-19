@@ -24,6 +24,7 @@
 
 #include "cpu-dispatch.hpp"
 
+#include "a7l5w-probe.hpp"
 #include "common.hpp"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -254,6 +255,10 @@ static sycl::event cpu_submit_async(sycl::queue * cpu_q, const std::vector<sycl:
         g_cpu_chain_event_valid  = true;
         g_cpu_chain_on_cpu_queue = submit_on_cpu_queue;
         staging_track_cpu_event(evt);
+#if GGML_SYCL_A7L5W_INSTRUMENT
+        std::fprintf(stderr, "[A7L5W-SUBMIT] async host_task submitted on %s queue\n",
+                     submit_on_cpu_queue ? "CPU" : "GPU");
+#endif
     } else {
         offload_wait_event(evt, offload_wait_reason::FALLBACK);
         g_cpu_chain_event_valid = false;
@@ -2658,6 +2663,10 @@ static void * get_retained_or_staging_output(ggml_tensor * dst, int device, sycl
 
 // Wait for all pending staging events (call at boundary sync points).
 void ggml_sycl_cpu_staging_drain() {
+#if GGML_SYCL_A7L5W_INSTRUMENT
+    std::fprintf(stderr, "[A7L5W-DRAIN] staging_drain entry chain_valid=%d\n",
+                 g_cpu_chain_event_valid ? 1 : 0);
+#endif
     cpu_wait_chain_event();
     for (int b = 0; b < STAGING_BANKS; ++b) {
         if (g_staging_flush_pending[b]) {
@@ -3792,6 +3801,21 @@ static bool cpu_mul_mat(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     GGML_UNUSED(dst);
     return false;
 #else
+#if GGML_SYCL_A7L5W_INSTRUMENT
+    {
+        static std::atomic<int> a7l5w_entry_log_count{ 0 };
+        if (a7l5w_entry_log_count.fetch_add(1, std::memory_order_relaxed) < 5) {
+            std::fprintf(stderr,
+                         "[A7L5W-ENTRY] cpu_mul_mat src0=%s (type=%d) src1=%s (type=%d) dst=%s (type=%d)\n",
+                         dst->src[0] && dst->src[0]->name ? dst->src[0]->name : "?",
+                         dst->src[0] ? (int) dst->src[0]->type : -1,
+                         dst->src[1] && dst->src[1]->name ? dst->src[1]->name : "?",
+                         dst->src[1] ? (int) dst->src[1]->type : -1,
+                         dst && dst->name ? dst->name : "?",
+                         dst ? (int) dst->type : -1);
+        }
+    }
+#endif
     const ggml_tensor * src0 = dst->src[0];  // weights
     const ggml_tensor * src1 = dst->src[1];  // activations
 
@@ -3862,6 +3886,16 @@ static bool cpu_mul_mat(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
         return false;
     }
 
+    // A7L5W Site 1-entry: validate src0_data covers the full tensor extent
+    // before per-batch arithmetic.  If `cpu_dispatch_lookup_host_ptr(src0->name)`
+    // returned a pointer whose registered size is smaller than the full
+    // ne00*ne01*ne02*ne03 extent, the per-batch (i02*nb02 + i03*nb03) indexing
+    // will later produce an OOB pointer.
+    GGML_SYCL_A7L5W_ASSERT_TENSOR("cpu_mul_mat/src0_entry",
+                                 src0,
+                                 src0_data,
+                                 ggml_nbytes(src0));
+
     // Batch dimensions (broadcast src0 if ne02/ne03 < ne12/ne13)
     const int64_t ne02 = src0->ne[2];
     const int64_t ne03 = src0->ne[3];
@@ -3888,6 +3922,20 @@ static bool cpu_mul_mat(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const bool   use_vec_dot = (M <= 4 && cpu_traits && cpu_traits->vec_dot);
 
     auto run_mul_mat = [=]() {
+#if GGML_SYCL_A7L5W_INSTRUMENT
+        {
+            static std::atomic<int> a7l5w_rmm_log_count{ 0 };
+            if (a7l5w_rmm_log_count.fetch_add(1, std::memory_order_relaxed) < 10) {
+                std::fprintf(stderr,
+                             "[A7L5W-RUN] run_mul_mat src0=%s (type=%d f32=%d q=%d) M=%lld N=%lld K=%lld\n",
+                             src0 && src0->name ? src0->name : "?",
+                             src0 ? (int) src0->type : -1,
+                             src0_f32 ? 1 : 0,
+                             src0_quantized ? 1 : 0,
+                             (long long) M, (long long) N, (long long) K);
+            }
+        }
+#endif
         ggml_from_float_t    from_float_fn = nullptr;
         size_t               q_row_size    = 0;
         // Pre-allocated buffer via g_cpu_dispatch_buffers.src1_q
@@ -4192,6 +4240,19 @@ static bool cpu_mul_mat(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
 #endif
                     }
                 } else {
+#if GGML_SYCL_A7L5W_INSTRUMENT
+                    {
+                        std::fprintf(stderr,
+                                     "[A7L5W-GEMM] GEMM fallback entered src0=%s type=%d M=%lld N=%lld K=%lld "
+                                     "i12=%lld i13=%lld src0_batch=%p src1_batch=%p dst_batch=%p\n",
+                                     src0 && src0->name ? src0->name : "?",
+                                     src0 ? (int) src0->type : -1,
+                                     (long long) M, (long long) N, (long long) K,
+                                     (long long) i12, (long long) i13,
+                                     (void *) src0_batch, (void *) src1_batch, (void *) dst_batch);
+                        std::fflush(stderr);
+                    }
+#endif
                     // GEMM fallback: dequantize weights to F32, then dnnl_sgemm
                     const float * weight_f32;
                     dnnl_dim_t    weight_ld = K;
@@ -4200,6 +4261,15 @@ static bool cpu_mul_mat(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
                         weight_f32 = reinterpret_cast<const float *>(src0_batch);
                         weight_ld  = static_cast<dnnl_dim_t>(nb01 / sizeof(float));
                     } else {
+                        // A7L5W Site 1a: validate the per-batch src0 slab before
+                        // we dequantize N*K bytes from it.  `src0_batch` is
+                        // `src0_data + i02*nb02 + i03*nb03`; if `src0_data` is
+                        // registered in alloc_registry, the slab [N*nb01] must
+                        // fit within the registered allocation.
+                        GGML_SYCL_A7L5W_ASSERT_TENSOR("cpu_mul_mat/dequant_in",
+                                                     src0,
+                                                     src0_batch,
+                                                     static_cast<std::size_t>(N) * static_cast<std::size_t>(nb01));
                         for (dnnl_dim_t row = 0; row < N; row++) {
                             const void * row_data = src0_batch + row * nb01;
                             type_traits->to_float(row_data, src0_f32_buf + row * K, K);
@@ -4207,6 +4277,32 @@ static bool cpu_mul_mat(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
                         weight_f32 = src0_f32_buf;
                     }
 
+                    // A7L5W Site 1: validate the A-matrix pointer that DNNL's
+                    // JIT F32 GEMM will broadcast/load from.  For the F32 path
+                    // this points into src0_data + batch offset; for the dequant
+                    // path this points into a thread-local scratch buffer.
+                    // Extent: N rows of K floats, row stride = weight_ld floats.
+                    {
+                        const std::size_t weight_bytes =
+                            static_cast<std::size_t>(N) *
+                            static_cast<std::size_t>(weight_ld) *
+                            sizeof(float);
+                        GGML_SYCL_A7L5W_ASSERT_PTR("cpu_mul_mat/dnnl_sgemm_A",
+                                                  src0 && src0->name ? src0->name : "(cpu_mul_mat_A)",
+                                                  weight_f32,
+                                                  weight_bytes);
+                    }
+                    // Same check for src1 (B matrix) and dst (C matrix).
+                    GGML_SYCL_A7L5W_ASSERT_PTR("cpu_mul_mat/dnnl_sgemm_B",
+                                              src1 && src1->name ? src1->name : "(cpu_mul_mat_B)",
+                                              src1_batch,
+                                              static_cast<std::size_t>(M) *
+                                                  static_cast<std::size_t>(K) * sizeof(float));
+                    GGML_SYCL_A7L5W_ASSERT_PTR("cpu_mul_mat/dnnl_sgemm_C",
+                                              dst && dst->name ? dst->name : "(cpu_mul_mat_C)",
+                                              dst_batch,
+                                              static_cast<std::size_t>(M) *
+                                                  static_cast<std::size_t>(ldc) * sizeof(float));
                     dnnl_sgemm('T', 'N', N, M, K, 1.0f, weight_f32, weight_ld, src1_batch, K, 0.0f, dst_batch, ldc);
                 }
             }
@@ -6064,11 +6160,33 @@ bool ggml_sycl_cpu_pp_gemm(ggml_type weight_type,
         const size_t buf_size = static_cast<size_t>(N) * K;
         GGML_ASSERT(buf_size <= g_cpu_dispatch_buffers.scratch_nk.size());
 
+        // A7L5W Site 2a: validate the per-expert weight slab before dequant.
+        // `weight_bytes` is `weight_host + i02*nb02 + i03*nb03` from the caller
+        // in ggml-sycl.cpp:30478 — if the caller's `weight_host` (= src0->data)
+        // does not back the full expert stack, the per-batch offset may land
+        // past the registered allocation.
+        GGML_SYCL_A7L5W_ASSERT_PTR("cpu_pp_gemm/dequant_in",
+                                  "(cpu_pp_gemm_weight)",
+                                  weight_bytes,
+                                  static_cast<std::size_t>(N) * static_cast<std::size_t>(nb01));
         for (int64_t row = 0; row < N; row++) {
             const void * row_data = weight_bytes + row * nb01;
             type_traits->to_float(row_data, g_cpu_dispatch_buffers.scratch_nk.data() + row * K, K);
         }
 
+        // A7L5W Site 2: validate A/B/C pointers passed into DNNL's CPU JIT GEMM.
+        GGML_SYCL_A7L5W_ASSERT_PTR("cpu_pp_gemm/dnnl_sgemm_A",
+                                  "(cpu_pp_gemm_A)",
+                                  g_cpu_dispatch_buffers.scratch_nk.data(),
+                                  static_cast<std::size_t>(N) * static_cast<std::size_t>(K) * sizeof(float));
+        GGML_SYCL_A7L5W_ASSERT_PTR("cpu_pp_gemm/dnnl_sgemm_B",
+                                  "(cpu_pp_gemm_B)",
+                                  src1_host,
+                                  static_cast<std::size_t>(M) * static_cast<std::size_t>(K) * sizeof(float));
+        GGML_SYCL_A7L5W_ASSERT_PTR("cpu_pp_gemm/dnnl_sgemm_C",
+                                  "(cpu_pp_gemm_C)",
+                                  dst_host,
+                                  static_cast<std::size_t>(M) * static_cast<std::size_t>(ldc) * sizeof(float));
         dnnl_status_t status = dnnl_sgemm('T', 'N',
                                            static_cast<dnnl_dim_t>(N),
                                            static_cast<dnnl_dim_t>(M),
