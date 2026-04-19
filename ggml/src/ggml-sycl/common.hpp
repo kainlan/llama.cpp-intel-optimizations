@@ -1955,6 +1955,10 @@ struct staging_buffer_pool {
     // Slots from the pinned_chunk_pool are NOT freed individually — the pool
     // owns their lifetime and reclaims them on destruction.
     void shutdown(sycl::queue & queue) {
+        // Drain pending BCS DMA events without holding the mutex, to avoid
+        // deadlock with concurrent release() calls.
+        drain_all();
+
         std::lock_guard<std::mutex> lock(mutex_);
         for (auto & s : slots_) {
             if (s.ptr) {
@@ -1967,6 +1971,36 @@ struct staging_buffer_pool {
         }
         slots_.clear();
         total_bytes_.store(0, std::memory_order_relaxed);
+    }
+
+    // Wait for all pending async DMA events before a zone reset can safely
+    // recycle the underlying memory.  Must be called before host_zone_reset().
+    //
+    // IMPORTANT: releases the mutex before each event.wait() to avoid
+    // deadlocking with release() calls from concurrent CPU worker threads.
+    void drain_all() {
+        for (;;) {
+            sycl::event ev;
+            bool        found = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                for (auto & s : slots_) {
+                    if (s.has_pending_event) {
+                        ev                = s.pending_event;
+                        s.has_pending_event = false;
+                        found             = true;
+                        break;
+                    }
+                }
+            }
+            if (!found) {
+                break;
+            }
+            try {
+                ev.wait();
+            } catch (...) {
+            }
+        }
     }
 
     size_t total_bytes() const { return total_bytes_.load(std::memory_order_relaxed); }

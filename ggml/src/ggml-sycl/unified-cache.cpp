@@ -7598,6 +7598,189 @@ size_t unified_cache::available_device() const {
     return free_mem - VRAM_SAFETY_MARGIN;
 }
 
+// --- Deprecated shim: ensure_cached_alloc ---
+// Restored verbatim from pre-kcru9 deletion to keep test suite building.
+// New code must use unified_alloc() instead.
+
+void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
+                                          const void *               src_ptr,
+                                          size_t                     src_size,
+                                          size_t                     alloc_size,
+                                          cache_entry_type           type,
+                                          int                        layer_id,
+                                          int                        expert_id,
+                                          ggml_layout_mode           layout,
+                                          bool                       validate_content,
+                                          bool *                     needs_fill) {
+    if (needs_fill) {
+        *needs_fill = true;
+    }
+    if (!key_id.valid || !src_ptr || src_size == 0 || alloc_size == 0) {
+        return nullptr;
+    }
+
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+    if (!g_graph_compute_active.load(std::memory_order_acquire)) {
+        process_deferred_frees();
+    }
+
+    unified_cache_key key{ type, key_id, layer_id, expert_id };
+    const uint64_t    new_hash = compute_content_hash(src_ptr, src_size);
+
+    auto it = entries_.find(key);
+    if (it != entries_.end()) {
+        auto id_it = id_to_key_.find(key_id);
+        if (id_it == id_to_key_.end()) {
+            id_to_key_.emplace(key_id, key);
+        } else if (!(id_it->second == key)) {
+            GGML_LOG_ERROR("[UNIFIED-CACHE] identity collision in ensure_cached_alloc model=%llu name_hash=0x%llx\n",
+                           (unsigned long long) key_id.model_id, (unsigned long long) key_id.name_hash);
+            if (cache_assert_enabled()) {
+                GGML_ABORT("unified_cache id_to_key mismatch");
+            }
+        }
+        if (it->second.layout != layout) {
+            if (it->second.pinned) {
+                GGML_SYCL_DEBUG(
+                    "[UNIFIED-CACHE] layout switch: unpinning model=%llu name_hash=0x%llx have=%d want=%d\n",
+                    (unsigned long long) key_id.model_id, (unsigned long long) key_id.name_hash,
+                    (int) it->second.layout, (int) layout);
+                it->second.pinned = false;
+            }
+            void * stale_ptr      = it->second.device_ptr;
+            size_t stale_size     = it->second.size;
+            bool   stale_host_res = it->second.host_resident;
+            entries_.erase(it);
+            it = entries_.end();
+            if (!stale_host_res && stale_ptr && stale_size > 0) {
+                enqueue_deferred_free(stale_ptr, stale_size);
+            }
+        }
+        if (it == entries_.end()) {
+            // Fall through to allocation path below
+        } else {
+            bool need_realloc    = (alloc_size != it->second.size);
+            bool content_changed = validate_content || (it->second.src_ptr != src_ptr) ||
+                                   (it->second.content_hash != new_hash);
+
+            if (need_realloc) {
+                const bool   was_pinned = it->second.pinned;
+                const size_t old_size   = it->second.size;
+                it->second.pinned       = true;
+                while (used_.load() - old_size + alloc_size > budget_) {
+                    if (evict_one(alloc_size) == 0) {
+                        GGML_SYCL_DEBUG("[UNIFIED-CACHE] Cannot evict for alloc (used=%.1f MB, need=%.1f MB)\n",
+                                        used_.load() / (1024.0f * 1024.0f), alloc_size / (1024.0f * 1024.0f));
+                        it->second.pinned = was_pinned;
+                        if (needs_fill) {
+                            *needs_fill = false;
+                        }
+                        return nullptr;
+                    }
+                }
+
+                void * new_device_ptr = nullptr;
+                try {
+                    new_device_ptr = ggml_sycl_malloc_device_raw(alloc_size, queue_, "unified_cache:alloc");
+                } catch (const sycl::exception & e) {
+                    GGML_LOG_ERROR("[UNIFIED-CACHE] alloc malloc_device failed: %s\n", e.what());
+                    it->second.pinned = was_pinned;
+                    if (needs_fill) {
+                        *needs_fill = false;
+                    }
+                    return nullptr;
+                }
+                if (!new_device_ptr) {
+                    GGML_LOG_ERROR("[UNIFIED-CACHE] alloc malloc_device returned nullptr\n");
+                    it->second.pinned = was_pinned;
+                    if (needs_fill) {
+                        *needs_fill = false;
+                    }
+                    return nullptr;
+                }
+                it->second.pinned = was_pinned;
+                enqueue_deferred_free(it->second.device_ptr, it->second.size);
+                it->second.device_ptr = new_device_ptr;
+                it->second.size       = alloc_size;
+                if (alloc_size > old_size) {
+                    used_.fetch_add(alloc_size - old_size, std::memory_order_relaxed);
+                } else if (old_size > alloc_size) {
+                    saturating_sub_used(old_size - alloc_size);
+                }
+                content_changed = true;
+            }
+
+            it->second.src_ptr         = src_ptr;
+            it->second.content_hash    = new_hash;
+            it->second.access_count++;
+            it->second.last_access     = time_++;
+            it->second.state           = cache_entry_state::READY;
+            it->second.has_ready_event = false;
+
+            if (needs_fill) {
+                *needs_fill = need_realloc || content_changed;
+            }
+            return it->second.device_ptr;
+        }
+    }
+
+    while (used_.load() + alloc_size > budget_) {
+        if (evict_one(alloc_size) == 0) {
+            GGML_SYCL_DEBUG("[UNIFIED-CACHE] Cannot evict for alloc (used=%.1f MB, need=%.1f MB)\n",
+                            used_.load() / (1024.0f * 1024.0f), alloc_size / (1024.0f * 1024.0f));
+            return nullptr;
+        }
+    }
+
+    void * device_ptr = nullptr;
+    try {
+        device_ptr = ggml_sycl_malloc_device_raw(alloc_size, queue_, "unified_cache:alloc");
+    } catch (const sycl::exception & e) {
+        GGML_LOG_ERROR("[UNIFIED-CACHE] alloc malloc_device failed: %s\n", e.what());
+        return nullptr;
+    }
+    if (!device_ptr) {
+        GGML_LOG_ERROR("[UNIFIED-CACHE] alloc malloc_device returned nullptr\n");
+        return nullptr;
+    }
+
+    unified_cache_entry entry{};
+    entry.device_ptr      = device_ptr;
+    entry.src_ptr         = src_ptr;
+    entry.content_hash    = new_hash;
+    entry.size            = alloc_size;
+    entry.type            = type;
+    entry.layer_id        = layer_id;
+    entry.expert_id       = expert_id;
+    entry.layout          = layout;
+    entry.access_count    = 1;
+    entry.last_access     = time_++;
+    entry.pinned          = false;
+    entry.hot             = false;
+    entry.state           = cache_entry_state::READY;
+    entry.has_ready_event = false;
+    entry.host_resident   = false;
+    entry.location        = cache_location::DEVICE;
+
+    entries_[key] = entry;
+    auto id_it    = id_to_key_.find(key_id);
+    if (id_it == id_to_key_.end()) {
+        id_to_key_.emplace(key_id, key);
+    } else if (!(id_it->second == key)) {
+        GGML_LOG_ERROR("[UNIFIED-CACHE] identity collision on insert model=%llu name_hash=0x%llx\n",
+                       (unsigned long long) key_id.model_id, (unsigned long long) key_id.name_hash);
+        if (cache_assert_enabled()) {
+            GGML_ABORT("unified_cache id_to_key mismatch");
+        }
+    }
+    used_.fetch_add(alloc_size, std::memory_order_relaxed);
+
+    if (needs_fill) {
+        *needs_fill = true;
+    }
+    return device_ptr;
+}
+
 // --- Host arena methods ---
 
 void * unified_cache::host_pool_alloc(size_t size, size_t alignment) {

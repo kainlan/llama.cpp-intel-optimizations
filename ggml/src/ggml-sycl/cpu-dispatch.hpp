@@ -24,6 +24,10 @@ void ggml_sycl_cpu_quant_cache_new_graph();
 // Drain any pending async staging events (call at boundary sync points).
 void ggml_sycl_cpu_staging_drain();
 
+// Release all g_cpu_staging buffer leases back to the offload pool.
+// Must be called before host_zone_reset(STAGING) to prevent dangling pointers.
+void ggml_sycl_cpu_staging_release();
+
 // Clear persistent staging cache for leaf tensors.
 // Call on graph shape change (new token count changes masks).
 void ggml_sycl_cpu_staging_cache_clear();

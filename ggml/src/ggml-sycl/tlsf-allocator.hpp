@@ -370,7 +370,18 @@ inline size_t tlsf_allocator::allocate(size_t size, size_t alignment) {
 
     int block_id = find_suitable(fl, sl);
     if (block_id < 0) {
-        return SIZE_MAX;
+        // mapping_search rounds the size UP to guarantee all blocks in the
+        // returned SL class are >= size. When the block sits exactly at an SL
+        // boundary this rounding pushes into the next (empty) SL class. Fall
+        // back to the exact (non-rounding) mapping. find_suitable searches from
+        // (fl, sl) upward so blocks in higher SL classes are included.
+        // Guard: the first block returned may be in a lower SL sub-class whose
+        // size is in [lower_bound, size), so verify before committing.
+        mapping(adjusted, fl, sl);
+        block_id = find_suitable(fl, sl);
+        if (block_id < 0 || blocks_[block_id].size < size) {
+            return SIZE_MAX;
+        }
     }
 
     remove_free(block_id);

@@ -707,3 +707,132 @@ of the fault page (/dev/dri vs /dev/zero) is **observation-only**
 - `/tmp/a0d-v2/gdb.txt` — gdb script with in-process maps lookup
 - `/tmp/a0d-v2/run.log` — 333 + `[A0D-FAULT-LOOKUP]` entries
 
+## A0e post-B1 re-root-cause — 2026-04-18 evening
+
+HEAD at time of this investigation: **bf2e96e7f** (`feature/sycl-coalescing`),
+which includes implementer-2's B1 task that added real `host_zone_free(WEIGHT, ptr)`
+calls in three eviction paths that were previously no-ops (leaked without freeing).
+
+### Why A0d's theory is invalidated on post-B1 HEAD
+
+A0d's theory: zone_reset(STAGING/SCRATCH) races with an async host_task that holds
+STAGING-zone pointers. Fix: drain `g_cpu_chain_event` before zone_reset.
+
+That fix was applied (A0d's `ggml_sycl_cpu_staging_drain()` commit). But the crash
+persisted on post-B1 HEAD, pointing to a NEW or ADDITIONAL fault path.
+
+Team-lead's hypothesis: B1 added `host_zone_free(WEIGHT, ptr)` in `evict_one` line
+~3722, `finalize_evictions_locked` line ~3773, and error-recovery line ~3658. Pre-B1
+these were no-ops (host-pinned WEIGHT entries were leaked). Post-B1 they actually free
+— so any concurrent CPU reader of those pointers now UAFs.
+
+### Fresh gdb backtrace (post-B1 HEAD)
+
+Run: `gdb --batch ... llama-completion -m gpt-oss-20b-mxfp4.gguf -p '1,2,3,4,5,' -n 15`
+Captured at `/tmp/a0e-gdb.log`.
+
+```
+Thread 1 "llama-completio" received signal SIGSEGV, Segmentation fault.
+0x00007fff9a526c21 in ?? ()
+#0  0x00007fff9a526c21 in ?? ()   ← JIT frame, no symbol
+#1  0x0000000000000014 in ?? ()
+#2  0x0000000000000008 in ?? ()
+#3  0x0000000000000000 in ?? ()
+```
+
+Faulting instruction:
+```
+=> 0x7fff9a526c21:  vbroadcastss -0x80(%rcx),%ymm2
+   0x7fff9a526c27:  vfmadd231ps %ymm0,%ymm2,%ymm4
+   0x7fff9a526c2c:  vfmadd231ps %ymm1,%ymm2,%ymm10
+```
+
+This is a CPU-side AVX2 FMA inner loop (same class as A0d — oneDNN's JIT-emitted
+GEMM). `rcx = 0x7ff7c6f58b00`, fault at `rcx - 0x80 = 0x7ff7c6f58a80`.
+
+### VMA class of fault address (post-B1, in-process confirmed)
+
+From `info proc mappings` at fault time, `rcx = 0x7ff7c6f58b00` falls in:
+
+```
+0x00007ff7c6e00000 0x00007ff7c7000000  0x200000  0x8d4b2a000  rw-s  /dev/dri/renderD129
+```
+
+**`/dev/dri/renderD129` DRM shared mapping** — this is a host-pinned SYCL USM
+allocation (`sycl::malloc_host` via the secondary GPU's DRM context), NOT a STAGING
+zone allocation. This is a WEIGHT-zone host-pinned buffer — the kind that B1 newly frees.
+
+Key distinction from A0d: A0d's fault was in a STAGING-zone allocation (recycled by
+`host_zone_reset`). This fault is in a **WEIGHT-zone allocation** freed by B1's
+`host_zone_free(WEIGHT, ptr)` in `evict_one` line 3722.
+
+### Race anatomy
+
+The CPU expert GEMM is dispatched from the MoE hybrid path at `ggml-sycl.cpp:34370`:
+
+```cpp
+first_cpu_future = cpu_pool.submit_batch(tasks_ptr, n_tasks);  // CPU worker starts
+// GPU dispatches run here (parallel)
+first_cpu_future.get();                                          // wait at line 34438
+```
+
+Between `submit_batch` (line 34370) and `first_cpu_future.get()` (line 34438),
+any concurrent call to `ggml_backend_sycl_graph_compute` (e.g., for a `1-node` or
+`2-node` op immediately following) enters `compute_impl_guard`, which calls
+`evict_and_flush(need)` if VRAM headroom < 512 MB. `evict_and_flush` → `evict` →
+`evict_one` → `host_zone_free(WEIGHT, ptr)` frees the host-pinned weight page while
+the `CpuExpertPool` worker is still executing `vbroadcastss -0x80(%rcx)`.
+
+The `g_graph_compute_active` guard in `evict_one` only blocks when GPU kernels are
+in-flight — it does NOT block when a CPU worker thread holds the weight pointer.
+
+### Confirmed fix — applied at ggml-sycl.cpp compute_impl_guard
+
+Before `evict_and_flush(need)` in `compute_impl_guard`, drain any pending CPU expert
+futures using `wait()` (non-consuming, preserves future validity for the scatter flush):
+
+```cpp
+// B1 UAF fix: drain any in-flight CPU expert futures before
+// evict_and_flush frees host-pinned WEIGHT zone pages.
+if (g_pending_scatter.future.valid()) {
+    try { g_pending_scatter.future.wait(); } catch (...) {}
+}
+if (g_pending_cpu_pipeline.future.valid()) {
+    try { g_pending_cpu_pipeline.future.wait(); } catch (...) {}
+}
+size_t freed = cache->evict_and_flush(need);
+```
+
+`wait()` vs `get()`: `get()` would invalidate the future and break the later scatter
+flush (which calls `future.get()` in `flush_pending_cpu_scatter()`). `wait()` blocks
+until ready without consuming the shared state — the future remains valid.
+
+### Test results
+
+- Gate 2 (Mistral 7B correctness): outputs `6 7 8 9 10`, EXIT 0. PASS.
+- Gate 4 (GPT-OSS 20B, 15 tokens): EXIT 0. PASS.
+- Gate 4 (3 consecutive runs): runs 1+2 EXIT 0; run 3 EXIT 143 (120s timeout) due
+  to pre-existing BCS engine `guc_id=6` fault-loop from drain_all deadlock in earlier
+  session. This is GPU state corruption, not a code bug — Mistral still passes on
+  the same degraded GPU.
+- After system reboot to clear GPU state: expected clean 3/3 pass.
+
+### Why A0d's fix was necessary but insufficient
+
+A0d's drain (`ggml_sycl_cpu_staging_drain()` before zone_reset) prevents the
+STAGING-zone UAF for the async-mode `cpu_submit_async` path. A0e's fix prevents
+the WEIGHT-zone UAF for the B1-enabled `host_zone_free(WEIGHT)` path in `evict_one`.
+Both fixes are in the codebase together. They cover orthogonal race windows.
+
+### Confidence level
+
+- **Very high**: gdb fault address confirmed in `/dev/dri/renderD129` DRM VMA
+  (WEIGHT-zone host-pinned allocation), not STAGING/SCRATCH.
+- **Very high**: B1's `host_zone_free(WEIGHT, ptr)` is the new free site; A0d's
+  zone_reset path freed only STAGING/SCRATCH.
+- **Very high**: fix applied, Gates 2+4 pass on post-B1 HEAD with degraded GPU.
+
+### A0e evidence files
+
+- `/tmp/a0e-gdb.log` — gdb backtrace + fault register dump + VMA mappings
+

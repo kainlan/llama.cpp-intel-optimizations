@@ -10,6 +10,7 @@
 #include "ggml-impl.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <future>
@@ -384,6 +385,8 @@ segmented_buffer pinned_chunk_pool::zone_alloc_segmented(host_zone_id zone, size
         if (cur_used + size > z.size) {
             return {};
         }
+    } else {
+        return {};
     }
 
     const size_t tlsf_align = std::max(alignment, (size_t) 256);
@@ -412,10 +415,14 @@ segmented_buffer pinned_chunk_pool::zone_alloc_segmented(host_zone_id zone, size
             continue;
         }
 
+        // The rounded-up try_size may exceed remaining (e.g. remaining=100,
+        // tlsf_align=256 → try_size=256).  Record only the bytes we need from
+        // this segment so remaining -= consume never underflows.
+        const size_t consume = std::min(try_size, remaining);
         void * ptr = static_cast<uint8_t *>(chunks_[zcs.chunk_idx].base) + zcs.zone_start + offset;
-        result.segments.push_back({ ptr, try_size });
-        result.total_size += try_size;
-        remaining -= try_size;
+        result.segments.push_back({ ptr, consume });
+        result.total_size += consume;
+        remaining -= consume;
     }
 
     if (remaining > 0) {

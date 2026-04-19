@@ -1629,6 +1629,19 @@ class unified_cache {
 
     bool             contains_pinned(const void * ptr) const;
     size_t           pre_allocate_host_pool(size_t total_bytes);
+
+    // Deprecated shim — tests written against the old API. Migrate callers to unified_alloc().
+    [[deprecated("use unified_alloc()")]]
+    void * ensure_cached_alloc(const ggml_sycl_cache_id & key,
+                               const void *               src_ptr,
+                               size_t                     src_size,
+                               size_t                     alloc_size,
+                               cache_entry_type           type,
+                               int                        layer_id,
+                               int                        expert_id,
+                               ggml_layout_mode           layout,
+                               bool                       validate_content,
+                               bool *                     needs_fill);
     size_t           pre_allocate_all(size_t model_weight_bytes);
     size_t           pre_allocate_runtime_chunks(size_t total_bytes);
     // Host zone allocation (owned by unified_cache).

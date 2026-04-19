@@ -10742,19 +10742,24 @@ static sycl::event ggml_sycl_fill_reordered_host(sycl::queue &                  
     void * reorder_buf     = nullptr;
     void * reorder_buf_raw = nullptr;
     size_t reorder_guard   = 0;
+    // icpx SIMD vectorization of reorder_*_cpu loops can generate stores at
+    // r8 - 0xd0 (208 bytes) before the nominal buffer start on the first
+    // iteration.  Always reserve at least 256 bytes of pre-padding so these
+    // stores land in allocated memory rather than unmapped pages.
+    constexpr size_t k_pre_guard = 256;
     try {
         if (ggml_sycl_reorder_guard_enabled()) {
             reorder_guard = k_reorder_guard_bytes;
         }
-        const size_t alloc_size = dst_size + (reorder_guard * 2);
+        const size_t alloc_size = dst_size + k_pre_guard + (reorder_guard * 2);
         reorder_buf_raw         = ggml_sycl_staging_pool().acquire(alloc_size, queue);
         if (reorder_buf_raw && reorder_guard > 0) {
-            std::memset(reorder_buf_raw, k_reorder_guard_pattern, reorder_guard);
+            std::memset(static_cast<uint8_t *>(reorder_buf_raw) + k_pre_guard, k_reorder_guard_pattern, reorder_guard);
 
-            std::memset(static_cast<uint8_t *>(reorder_buf_raw) + reorder_guard + dst_size, k_reorder_guard_pattern,
-                        reorder_guard);
+            std::memset(static_cast<uint8_t *>(reorder_buf_raw) + k_pre_guard + reorder_guard + dst_size,
+                        k_reorder_guard_pattern, reorder_guard);
         }
-        reorder_buf = reorder_buf_raw ? static_cast<uint8_t *>(reorder_buf_raw) + reorder_guard : nullptr;
+        reorder_buf = reorder_buf_raw ? static_cast<uint8_t *>(reorder_buf_raw) + k_pre_guard + reorder_guard : nullptr;
     } catch (const sycl::exception & e) {
         GGML_LOG_ERROR("[UNIFIED-CACHE] reorder buffer alloc failed (%zu bytes): %s\n", dst_size, e.what());
     }
@@ -10782,7 +10787,8 @@ static sycl::event ggml_sycl_fill_reordered_host(sycl::queue &                  
     if (dst_size > src_size) {
         std::memset(static_cast<char *>(reorder_buf) + src_size, 0, dst_size - src_size);
     }
-    if (!ggml_sycl_check_reorder_guard_dual(reorder_buf_raw, dst_size, reorder_guard, "fill_reordered_host", nullptr)) {
+    if (!ggml_sycl_check_reorder_guard_dual(static_cast<uint8_t *>(reorder_buf_raw) + k_pre_guard, dst_size,
+                                            reorder_guard, "fill_reordered_host", nullptr)) {
         GGML_ABORT("reorder guard corrupted");
     }
     if (host_src) {
@@ -11797,7 +11803,6 @@ static void ggml_sycl_preload_model_weights() {
             // This partitions the pre-allocated pinned pool into persistent and
             // resettable host zones so inference uses bump/reset only.
             ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache);
-            GGML_LOG_INFO("[S1-PRELOAD-DBG] zone configured, starting main loop with %zu items\n", indices.size());
 
             // Submit all H2D copies for this device without waiting
             size_t s1_loop_iter = 0;
@@ -11805,9 +11810,7 @@ static void ggml_sycl_preload_model_weights() {
                 ++s1_loop_iter;
                 const auto & item   = items[idx];
                 const auto * tensor = item.tensor;
-                if (!tensor) { GGML_LOG_ERROR("[S1-PRELOAD-DBG] iter %zu idx=%zu: null tensor\n", s1_loop_iter, idx); continue; }
-                GGML_LOG_INFO("[S1-PRELOAD-DBG] iter=%zu idx=%zu name=%s is_moe=%d\n",
-                              s1_loop_iter, idx, tensor->name ? tensor->name : "(null)", (int)item.is_moe);
+                if (!tensor) { continue; }
 
                 if (item.is_moe) {
                     // MoE: submit all expert copies asynchronously
@@ -11907,15 +11910,9 @@ static void ggml_sycl_preload_model_weights() {
                                     const size_t seg0_size = (!_handle3.all_segments.empty()) ?
                                                              _handle3.all_segments[0].size : (arena_ptr ? expert_size : 0);
                                     if (arena_ptr && seg0_size < (size_t)expert_size) {
-                                        GGML_LOG_ERROR("[S1-PRELOAD-DBG] segmented expert alloc! seg0=%zu expert=%zu segs=%zu\n",
-                                                       seg0_size, (size_t)expert_size, _handle3.all_segments.size());
                                         arena_ptr = nullptr;  // Don't memcpy into partial segment
                                     }
                                     if (arena_ptr) {
-                                        GGML_LOG_INFO("[S1-PRELOAD-DBG2] memcpy dst=%p src=%p size=%zu seg0=%zu segs=%zu\n",
-                                                      arena_ptr, expert_aos, (size_t)expert_size,
-                                                      (!_handle3.all_segments.empty()) ? _handle3.all_segments[0].size : 0,
-                                                      _handle3.all_segments.size());
                                         std::memcpy(arena_ptr, expert_aos, expert_size);
                                         ggml_sycl_cache_id key =
                                             ggml_sycl_get_moe_expert_cache_key(tensor, extra, static_cast<int>(e));
@@ -12053,11 +12050,18 @@ static void ggml_sycl_preload_model_weights() {
                     }
                     const bool skip_coalesced_for_q4_0 =
                         skip_onednn_q4_0_preload && tensor->type == GGML_TYPE_Q4_0;
+                    // Non-contiguous tensors (e.g. views with nb[0] != type_size or
+                    // nb[1] != row_size) have strided layouts that reorder functions
+                    // don't handle — they assume tightly packed AOS.  Skip reorder.
+                    const bool is_contiguous =
+                        tensor->nb[0] == ggml_type_size(tensor->type) &&
+                        tensor->nb[1] == ggml_row_size(tensor->type, tensor->ne[0]);
                     const bool use_coalesced =
+                        is_contiguous &&
                         !skip_coalesced_for_q4_0 &&
                         ggml_is_quantized(tensor->type) && is_coalesced_supported(tensor->type) &&
                         ggml_sycl_supports_reorder_mmvq(tensor->type) && ggml_sycl_layout_supports_coalesced(tensor);
-                    const bool use_soa = !use_coalesced && ggml_is_quantized(tensor->type) &&
+                    const bool use_soa = is_contiguous && !use_coalesced && ggml_is_quantized(tensor->type) &&
                                          ggml_sycl_supports_reorder_mmvq(tensor->type);
                     layout_mode preload_layout = use_coalesced ? GGML_LAYOUT_COALESCED :
                                                  use_soa       ? GGML_LAYOUT_SOA :
@@ -39097,12 +39101,18 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     // is called for temporary backends during model loading.  The worker
     // thread is a global resource tied to split config; it self-terminates
     // via static destructor at program exit.
-    // Shut down CpuExpertPool and PinnedBufferPool instances while the
-    // unified cache and SYCL context are still alive.  Both pools use
-    // unified_alloc for their buffers; if we leave this to the static
-    // destructor, the unified cache statics may already be destroyed → SIGSEGV.
+    // Shut down ExpertPrefetcher, CpuExpertPool and PinnedBufferPool instances
+    // while the unified cache and SYCL context are still alive.  All pools use
+    // unified_alloc for their VRAM buffers; if we leave this to the static
+    // destructor, the unified cache statics may already be destroyed → SIGSEGV
+    // or BCS CAT error (in-flight DMA targeting freed VRAM).
     // shutdown() is idempotent and a no-op for pools that were never started.
     for (int d = 0; d < GGML_SYCL_MAX_DEVICES; d++) {
+        // ExpertPrefetcher must be shut down first: cancel_all() waits for
+        // in-flight BCS DMAs whose destinations are VRAM owned by the unified
+        // cache.  Shutting down here — while VRAM is still mapped — prevents
+        // BCS CAT errors and OpenMP worker crashes in the static destructor.
+        g_expert_prefetchers[d].shutdown();
         g_cpu_expert_pools[d].shutdown();
         g_pinned_buffer_pools[d].shutdown();
     }
@@ -40681,6 +40691,19 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                                   free_vram / (1024.0 * 1024.0), total_vram / (1024.0 * 1024.0),
                                   (total_vram - free_vram) / (1024.0 * 1024.0));
                     if (free_vram < min_scratch_headroom) {
+                        // B1 UAF fix: drain any in-flight CPU expert futures before
+                        // evict_and_flush frees host-pinned WEIGHT zone pages.
+                        // evict_one → host_zone_free(WEIGHT, ptr) will munmap the
+                        // pages while a CpuExpertPool worker may still be reading
+                        // them via vbroadcastss/vfmadd231ps → SIGSEGV.
+                        // Use wait() not get() to block without consuming the future
+                        // (get() invalidates it; the scatter flush still needs it).
+                        if (g_pending_scatter.future.valid()) {
+                            try { g_pending_scatter.future.wait(); } catch (...) {}
+                        }
+                        if (g_pending_cpu_pipeline.future.valid()) {
+                            try { g_pending_cpu_pipeline.future.wait(); } catch (...) {}
+                        }
                         size_t need  = min_scratch_headroom - free_vram;
                         size_t freed = cache->evict_and_flush(need);
                         GGML_LOG_INFO("[GRAPH-COMPUTE] Pre-eviction: needed %.1f MB, freed %.1f MB\n",
@@ -40751,6 +40774,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     // buffers are sub-allocated from the host STAGING TLSF zone; zone_reset
     // recycles the physical memory, leaving any surviving entry.ptr dangling.
     ggml_sycl_cpu_staging_release();
+    // Drain all pending BCS DMA events in the global staging buffer pool.
+    // BCS H2D copies for MoE expert uploads are submitted asynchronously;
+    // if host_zone_reset(STAGING) fires before the BCS engine finishes,
+    // the DRM unmaps the page under the in-flight DMA → FaultLevel=4.
+    ggml_sycl_staging_pool().drain_all();
 
     // Reset the scratch pool bump allocator so scratch allocations from the
     // previous graph are returned to the pool.

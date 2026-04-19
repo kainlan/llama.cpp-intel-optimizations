@@ -2671,6 +2671,25 @@ void ggml_sycl_cpu_staging_drain() {
     }
 }
 
+// Release all staging buffer leases back to the offload pool and clear cached
+// pointers.  Must be called before host_zone_reset(STAGING) — the staging
+// buffers are sub-allocated from the host STAGING TLSF zone, and zone_reset
+// recycles the physical memory.  Any cached entry.ptr that survives a zone
+// reset becomes a dangling pointer, causing SIGSEGV on the next memcpy.
+void ggml_sycl_cpu_staging_release() {
+    for (int b = 0; b < STAGING_BANKS; ++b) {
+        for (int s = 0; s < STAGING_SLOTS_PER_BANK; ++s) {
+            auto & entry = g_cpu_staging[b][s];
+            if (entry.ptr) {
+                (void) ggml_sycl::release_offload_buffer(entry.lease);
+                entry.lease = {};
+                entry.ptr   = nullptr;
+                entry.cap   = 0;
+            }
+        }
+    }
+}
+
 // Thread count hint for CPU vec_dot path.
 // GGML_SYCL_CPU_THREADS=1 forces serial execution.
 static int ggml_sycl_cpu_threads_hint() {
