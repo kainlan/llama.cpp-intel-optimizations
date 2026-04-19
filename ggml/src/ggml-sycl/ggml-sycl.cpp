@@ -40909,11 +40909,18 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     // only covers the async host_task chain; A0e's future drain only
     // fires under VRAM pressure.  This drain closes the graph-boundary
     // window unconditionally.
+    // wait() blocks until ready but leaves the future valid() with the
+    // lambda's captured task vector alive.  If the next graph has no
+    // MUL_MAT_ID (so flush_pending_cpu_scatter / flush_pending_cpu_pipeline
+    // is never called), the lambda would linger with stale weight_host
+    // pointers until thread exit.  Reset after wait to consume.
     if (g_pending_scatter.future.valid()) {
         try { g_pending_scatter.future.wait(); } catch (...) {}
+        g_pending_scatter.future = {};
     }
     if (g_pending_cpu_pipeline.future.valid()) {
         try { g_pending_cpu_pipeline.future.wait(); } catch (...) {}
+        g_pending_cpu_pipeline.future = {};
     }
 
     // Release cached staging buffer leases BEFORE zone reset.  The staging
