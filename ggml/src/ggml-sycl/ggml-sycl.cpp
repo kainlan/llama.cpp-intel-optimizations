@@ -2432,16 +2432,33 @@ static bool ggml_sycl_is_device_expert_ptr(const void * ptr) {
 }
 
 struct expert_resolve_result {
-    const void * ptr;
-    bool         is_host;   // true = safe for CPU vec_dot
+    const void *          ptr     = nullptr;
+    bool                  is_host = false;  // true = safe for CPU vec_dot
+    ggml_sycl::mem_handle lease{};           // llama.cpp-0k543: chunk lease for ptr when host-resident
 };
 
 static expert_resolve_result ggml_sycl_resolve_expert_ptr(
     const ggml_tensor * src0, int device, int expert_id) {
     auto * extra = static_cast<ggml_tensor_extra_gpu *>(src0 ? src0->extra : nullptr);
     if (!src0 || !extra) {
-        return {nullptr, false};
+        return {};
     }
+
+    // llama.cpp-0k543: when ptr lands on a host-arena chunk (unified cache
+    // HOST_PINNED expert, or host-arena-backed GGUF load), wrap it in a
+    // CHUNK_LEASE handle so the backing chunk cannot be sycl::free'd while
+    // the caller still holds the raw pointer.  For non-arena pointers
+    // (mmap-backed GGUF, plain device USM, external allocations) the
+    // factory degrades to DIRECT — no lease is attached, which is correct
+    // for those lifetimes.
+    auto make_host_result = [device](const void * p) -> expert_resolve_result {
+        expert_resolve_result r{};
+        r.ptr     = p;
+        r.is_host = true;
+        r.lease   = ggml_sycl::mem_handle::from_chunk_ptr(const_cast<void *>(p), device,
+                                                          GGML_LAYOUT_AOS, false);
+        return r;
+    };
 
     // 1. Try unified cache lookup
     unified_cache * cache = get_unified_cache_for_device(device);
@@ -2450,24 +2467,35 @@ static expert_resolve_result ggml_sycl_resolve_expert_ptr(
         if (const weight_entry * entry = cache->lookup_expert(key);
             entry && entry->ptr) {
             bool host = (entry->location != cache_location::DEVICE);
-            return {entry->ptr, host};
+            if (host) {
+                return make_host_result(entry->ptr);
+            }
+            // Device-resident: caller routes to GPU, no lease needed on the
+            // device VRAM pointer (CPU dispatch skips is_host==false paths).
+            expert_resolve_result r{};
+            r.ptr     = entry->ptr;
+            r.is_host = false;
+            return r;
         }
     }
 
     // 2. Cache miss -- check tensor buffer type
     if (src0->buffer && ggml_backend_buffer_is_host(src0->buffer)) {
         const size_t expert_offset = static_cast<size_t>(expert_id) * src0->nb[2];
-        return {static_cast<const char *>(src0->data) + expert_offset, true};
+        return make_host_result(static_cast<const char *>(src0->data) + expert_offset);
     }
 
     // 3. Device-resident, not in cache -- return device pointer, mark NOT host
     void * dev_ptr = extra->data_device_ptr(device);
     if (dev_ptr) {
         const size_t expert_offset = static_cast<size_t>(expert_id) * src0->nb[2];
-        return {static_cast<const char *>(dev_ptr) + expert_offset, false};
+        expert_resolve_result r{};
+        r.ptr     = static_cast<const char *>(dev_ptr) + expert_offset;
+        r.is_host = false;
+        return r;
     }
 
-    return {nullptr, false};
+    return {};
 }
 
 bool moe_get_expert_stage_info(int layer_idx, int expert_idx, int device_id, expert_stage_info & out) {
@@ -14458,6 +14486,17 @@ struct kv_layer_alloc {
     // When zone_h.ptr != nullptr, this layer was allocated via unified_alloc with
     // prefer_vram_zone=KV. unified_free(zone_h) calls zone_free(KV) for TLSF reclaim.
     ggml_sycl::alloc_handle zone_h{};
+    // llama.cpp-0k543 (C3 Category C): context-lifetime chunk lease covering
+    // this layer's backing arena chunk.  tiered_kv_buffer_init_tensor rewrites
+    // each KV tensor->data as la.ptr + offset_within_layer; those raw
+    // pointers live for the tensor's entire ggml-graph lifetime.  Holding a
+    // chunk lease here gates mid-session munmap of the KV arena chunk
+    // regardless of how many tensors point into it.  Released when
+    // tiered_kv_buffer_free clears this kv_layer_alloc (before the per-layer
+    // unified_free / unified_cache_deallocate on la.ptr).  For non-arena
+    // allocations (mmap-backed, external malloc) the handle degrades to
+    // DIRECT and holds no refcount.
+    ggml_sycl::mem_handle   chunk_lease{};
 };
 
 struct tiered_kv_buffer_context {
@@ -15121,6 +15160,24 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
                 }
             }
             return nullptr;
+        }
+    }
+
+    // llama.cpp-0k543 (C3 Category C): acquire a context-lifetime chunk lease
+    // on each per-layer KV allocation.  tiered_kv_buffer_init_tensor will
+    // rewrite every KV tensor->data to la.ptr + offset_within_layer and those
+    // pointers live for the tensor's entire ggml-graph lifetime.  Holding a
+    // chunk lease on la.ptr prevents the backing arena chunk (VRAM or host
+    // pinned pool) from being sycl::free'd while any KV tensor still points
+    // into it.  For non-arena pointers (mmap / external malloc) from_chunk_ptr
+    // degrades to a DIRECT no-op — nothing to refcount, nothing to release.
+    // Leases are released when tiered_kv_buffer_free destroys each
+    // kv_layer_alloc, which runs before the corresponding unified_free /
+    // unified_cache_deallocate on la.ptr.
+    for (uint32_t l = 0; l < n_layers; ++l) {
+        if (layer_allocs[l].ptr) {
+            layer_allocs[l].chunk_lease = ggml_sycl::mem_handle::from_chunk_ptr(
+                layer_allocs[l].ptr, device, GGML_LAYOUT_AOS, layer_allocs[l].on_device);
         }
     }
 
@@ -34387,6 +34444,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 tl_first_tasks[n_valid_first].type = fusion.type;
                                 tl_first_tasks[n_valid_first].K    = fusion.K;
                                 tl_first_tasks[n_valid_first].N    = static_cast<int>(N_first);
+                                // llama.cpp-0k543: transfer chunk lease into the task so it
+                                // survives into the async worker via std::move below.
+                                tl_first_tasks[n_valid_first].weight_lease = std::move(resolved.lease);
                                 valid_fi_first[n_valid_first] = fi;
                                 n_valid_first++;
                             }
@@ -34397,9 +34457,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             // worker (lambda or CpuExpertPool) so that storage
                             // outlives the worker's reads even if this scope
                             // unwinds or tl_first_tasks is resized next token.
+                            // llama.cpp-0k543: move-construct submit_tasks so each
+                            // cpu_expert_task's weight_lease transfers ownership without
+                            // bumping/decrementing the chunk refcount.
                             int                          n_tasks = static_cast<int>(n_valid_first);
                             auto &                       cpu_pool = g_cpu_expert_pools[ctx.device];
-                            std::vector<cpu_expert_task> submit_tasks(tl_first_tasks.begin(), tl_first_tasks.end());
+                            std::vector<cpu_expert_task> submit_tasks(
+                                std::make_move_iterator(tl_first_tasks.begin()),
+                                std::make_move_iterator(tl_first_tasks.end()));
+                            tl_first_tasks.clear();
                             if (n_tasks > 0 && cpu_pool.is_active()) {
                                 first_cpu_future  = cpu_pool.submit_batch(std::move(submit_tasks));
                                 first_cpu_pending = true;
@@ -34610,6 +34676,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         dt[n_valid_d].type = src0->type;
                         dt[n_valid_d].K    = static_cast<int>(K_d);
                         dt[n_valid_d].N    = static_cast<int>(N_d);
+                        // llama.cpp-0k543: transfer chunk lease into the task; moved
+                        // into batch_tasks below and survives async worker lifetime.
+                        dt[n_valid_d].weight_lease = std::move(resolved.lease);
                         valid_ci_d[n_valid_d] = ci;
                         n_valid_d++;
                     }
@@ -34685,7 +34754,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         std::vector<cpu_expert_task> batch_tasks;
                         batch_tasks.reserve(n_valid_d);
                         for (size_t fi = 0; fi < n_valid_d; fi++) {
-                            batch_tasks.push_back(dt[fi]);
+                            // llama.cpp-0k543: move-construct so weight_lease
+                            // transfers into batch_tasks without refcount churn.
+                            batch_tasks.push_back(std::move(dt[fi]));
                         }
                         auto &            cpu_pool = g_cpu_expert_pools[ctx.device];
                         std::future<void> fut;
@@ -35220,7 +35291,11 @@ cpu_fallback_fast:
                         n_gpu0++;
                         continue;
                     }
-                    tasks_ptr[n_tasks].weight_host = resolved.ptr;
+                    tasks_ptr[n_tasks].weight_host  = resolved.ptr;
+                    // llama.cpp-0k543: pin arena chunk for the SYNC batched call.
+                    // Defence-in-depth against a concurrent evictor — the cache
+                    // lock is released between lookup_expert and the dispatch.
+                    tasks_ptr[n_tasks].weight_lease = std::move(resolved.lease);
                 }
                 tasks_ptr[n_tasks].act_host    = act_host_ptr;
                 tasks_ptr[n_tasks].output_host = out_ptr;
@@ -35502,12 +35577,14 @@ cpu_fallback_fast:
                         const size_t ci_fb =
                             static_cast<size_t>(e.iid1) * static_cast<size_t>(n_ids_f) + static_cast<size_t>(e.id);
                         float * out_fb = tl_out_pinned.as<float>() + ci_fb * static_cast<size_t>(N);
-                        tasks_ptr[n_tasks].weight_host = resolved.ptr;
-                        tasks_ptr[n_tasks].act_host    = act_host_ptr;
-                        tasks_ptr[n_tasks].output_host = out_fb;
-                        tasks_ptr[n_tasks].type        = src0->type;
-                        tasks_ptr[n_tasks].K           = static_cast<int>(K);
-                        tasks_ptr[n_tasks].N           = static_cast<int>(N);
+                        tasks_ptr[n_tasks].weight_host  = resolved.ptr;
+                        tasks_ptr[n_tasks].act_host     = act_host_ptr;
+                        tasks_ptr[n_tasks].output_host  = out_fb;
+                        tasks_ptr[n_tasks].type         = src0->type;
+                        tasks_ptr[n_tasks].K            = static_cast<int>(K);
+                        tasks_ptr[n_tasks].N            = static_cast<int>(N);
+                        // llama.cpp-0k543: chunk lease for synchronous batched call.
+                        tasks_ptr[n_tasks].weight_lease = std::move(resolved.lease);
                         n_tasks++;
                     }
                 }
@@ -36463,18 +36540,24 @@ cpu_fallback_fast:
                 std::vector<cpu_expert_task> batch_tasks;
                 batch_tasks.reserve(n_cpu);
                 for (size_t ci = 0; ci < n_cpu; ci++) {
-                    const auto & entry       = entries[ci];
-                    const void * host_weight = nullptr;
+                    const auto &          entry       = entries[ci];
+                    const void *          host_weight = nullptr;
+                    ggml_sycl::mem_handle host_lease{};  // llama.cpp-0k543
                     if (expert_ptrs_host && entry.expert_id >= 0 && entry.expert_id < n_as) {
                         const void * candidate = expert_ptrs_host[entry.expert_id];
                         if (candidate && !ggml_sycl::ggml_sycl_is_device_expert_ptr(candidate)) {
                             host_weight = candidate;
+                            // Acquire chunk lease: protects candidate if it lives in the
+                            // host arena.  No-op (DIRECT) for mmap / external pointers.
+                            host_lease = ggml_sycl::mem_handle::from_chunk_ptr(
+                                const_cast<void *>(candidate), ctx.device, GGML_LAYOUT_AOS, false);
                         }
                     }
                     if (!host_weight) {
                         auto resolved = ggml_sycl::ggml_sycl_resolve_expert_ptr(src0, ctx.device, entry.expert_id);
                         if (resolved.ptr && resolved.is_host) {
                             host_weight = resolved.ptr;
+                            host_lease  = std::move(resolved.lease);
                         }
                     }
                     if (!host_weight) {
@@ -36495,7 +36578,8 @@ cpu_fallback_fast:
                     t.type        = src0->type;
                     t.K           = static_cast<int>(K);
                     t.N           = static_cast<int>(N);
-                    batch_tasks.push_back(t);
+                    t.weight_lease = std::move(host_lease);  // llama.cpp-0k543
+                    batch_tasks.push_back(std::move(t));
                 }
 
                 // Wait for deferred activation D2H before CPU tasks read it.
@@ -37463,18 +37547,22 @@ cpu_fallback_fast:
                 g_pending_scatter.entries.reserve(n_cpu);
 
                 for (size_t ci = 0; ci < n_cpu; ++ci) {
-                    const auto & entry       = entries[ci];
-                    const void * host_weight = nullptr;
+                    const auto &          entry       = entries[ci];
+                    const void *          host_weight = nullptr;
+                    ggml_sycl::mem_handle host_lease{};  // llama.cpp-0k543
                     if (expert_ptrs_host && entry.expert_id >= 0 && entry.expert_id < n_as) {
                         const void * candidate = expert_ptrs_host[entry.expert_id];
                         if (candidate && !ggml_sycl::ggml_sycl_is_device_expert_ptr(candidate)) {
                             host_weight = candidate;
+                            host_lease  = ggml_sycl::mem_handle::from_chunk_ptr(
+                                const_cast<void *>(candidate), ctx.device, GGML_LAYOUT_AOS, false);
                         }
                     }
                     if (!host_weight) {
                         auto resolved = ggml_sycl::ggml_sycl_resolve_expert_ptr(src0, ctx.device, entry.expert_id);
                         if (resolved.ptr && resolved.is_host) {
                             host_weight = resolved.ptr;
+                            host_lease  = std::move(resolved.lease);
                         }
                     }
                     if (!host_weight) {
@@ -37489,7 +37577,8 @@ cpu_fallback_fast:
                     task.type        = src0->type;
                     task.K           = static_cast<int>(K);
                     task.N           = static_cast<int>(N);
-                    batch_tasks.push_back(task);
+                    task.weight_lease = std::move(host_lease);  // llama.cpp-0k543
+                    batch_tasks.push_back(std::move(task));
 
                     const int64_t i1    = entry.id;
                     const int64_t i2    = entry.iid1;
@@ -37735,8 +37824,13 @@ cpu_fallback_fast:
         src1_row.data = src1_contiguous.get();
 
         dst_row.data                   = dst_contiguous.get();
+        // llama.cpp-0k543: the caller passes a mem_handle that pins the host
+        // arena chunk backing host_weight_ptr (if any).  The handle is moved
+        // into each cpu_expert_task so the lease survives into the pool
+        // worker and is released when the task vector is destroyed.
         auto dispatch_host_expert_rows = [&](int32_t expert_id, const std::vector<std::pair<int64_t, int64_t>> & rows,
-                                             const void * host_weight_ptr) {
+                                             const void * host_weight_ptr,
+                                             ggml_sycl::mem_handle host_weight_lease) {
             if (rows.empty()) {
                 return;
             }
@@ -37804,7 +37898,15 @@ cpu_fallback_fast:
                 task.type        = src0->type;
                 task.K           = static_cast<int>(K);
                 task.N           = static_cast<int>(N);
-                tasks.push_back(task);
+                // llama.cpp-0k543: only the first task carries the chunk lease —
+                // all tasks share the same weight_host, so one refcount bump is
+                // sufficient for the batch.  The lease transfers into the pool
+                // worker via move and releases when the worker's task vector is
+                // destroyed.
+                if (ri == 0) {
+                    task.weight_lease = std::move(host_weight_lease);
+                }
+                tasks.push_back(std::move(task));
             }
 
             auto & cpu_pool = g_cpu_expert_pools[ctx.device];
@@ -37867,18 +37969,26 @@ cpu_fallback_fast:
                 (route_host_experts_to_cpu || (!use_expert_cache && host_weights)) &&
                 (!expert_ptr || !ggml_sycl::ggml_sycl_is_device_expert_ptr(expert_ptr));
             if (cpu_host_expert) {
-                const void * host_weight = expert_ptr;
+                const void *          host_weight = expert_ptr;
+                ggml_sycl::mem_handle host_weight_lease{};  // llama.cpp-0k543
+                if (host_weight) {
+                    // expert_ptr path: acquire chunk lease (DIRECT no-op for mmap).
+                    host_weight_lease = ggml_sycl::mem_handle::from_chunk_ptr(
+                        const_cast<void *>(host_weight), ctx.device, GGML_LAYOUT_AOS, false);
+                }
                 if (!host_weight) {
                     auto resolved = ggml_sycl::ggml_sycl_resolve_expert_ptr(
                         src0, ctx.device, static_cast<int>(i02));
                     if (resolved.ptr && resolved.is_host) {
-                        host_weight = resolved.ptr;
+                        host_weight       = resolved.ptr;
+                        host_weight_lease = std::move(resolved.lease);
                     }
                 }
                 if (!host_weight) {
                     // Expert is device-resident -- fall through to GPU dispatch below.
                 } else {
-                    dispatch_host_expert_rows(static_cast<int32_t>(i02), matched_rows, host_weight);
+                    dispatch_host_expert_rows(static_cast<int32_t>(i02), matched_rows, host_weight,
+                                              std::move(host_weight_lease));
                     continue;
                 }
             }

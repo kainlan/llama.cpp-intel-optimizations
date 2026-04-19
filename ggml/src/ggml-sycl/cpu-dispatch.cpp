@@ -2492,9 +2492,20 @@ static void * get_host_ptr(const ggml_tensor *    t,
         // During set_tensor, we store the host data pointer (from the mmap'd GGUF
         // file) before the SYCL backend copies it to device memory.
         // mmap pointers live for the full model lifetime — no lease needed.
+        //
+        // llama.cpp-0k543: if the caller passed an out_lease and the registry
+        // pointer happens to fall inside a host-arena chunk (rare — the
+        // registry primarily holds mmap and aligned_alloc pointers), acquire
+        // a chunk lease via from_chunk_ptr.  Degrades to DIRECT (no-op) for
+        // non-arena pointers, preserving existing behaviour for the common
+        // mmap case.
         if (t->name) {
             const void * mmap_ptr = cpu_dispatch_lookup_host_ptr(t->name);
             if (mmap_ptr) {
+                if (out_lease) {
+                    *out_lease = ggml_sycl::mem_handle::from_chunk_ptr(
+                        const_cast<void *>(mmap_ptr), device, GGML_LAYOUT_AOS, false);
+                }
                 return const_cast<void *>(mmap_ptr);
             }
         }
@@ -3953,6 +3964,17 @@ static bool cpu_mul_mat(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const void * src0_data = nullptr;
     if (async_mode) {
         src0_data = cpu_dispatch_lookup_host_ptr(src0->name);
+        // llama.cpp-0k543: wrap the registry pointer in a CHUNK_LEASE handle.
+        // Most registry entries are mmap-backed (process-lifetime) or
+        // aligned_alloc'd (registry-lifetime) — from_chunk_ptr falls back to
+        // DIRECT for those, a safe no-op.  When a caller has registered a
+        // pointer that happens to live inside a pinned-pool chunk, the
+        // handle acquires a chunk lease that travels into run_mul_mat's
+        // lambda capture and survives the host_task submission.
+        if (src0_data) {
+            src0_lease = ggml_sycl::mem_handle::from_chunk_ptr(
+                const_cast<void *>(src0_data), device, GGML_LAYOUT_AOS, false);
+        }
     }
     if (!src0_data) {
         src0_data = get_host_ptr(src0, device, 0, gpu_q, &e0, &src0_lease);

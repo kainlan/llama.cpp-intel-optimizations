@@ -104,17 +104,26 @@ bool   ggml_sycl_batched_mode_active();
 // ---------------------------------------------------------------------------
 
 // Describes a single expert's matmul work for CPU dispatch.
-// weight_host is a raw pointer into host RAM (e.g. mmap'd GGUF file).
-// act_host is the activation vector (float, length K).
-// output_host receives the result (float, length N).
+// weight_host is a raw pointer into host RAM (e.g. mmap'd GGUF file or a
+// host-pinned arena chunk).  act_host is the activation vector (float,
+// length K).  output_host receives the result (float, length N).
+//
+// llama.cpp-0k543 (C3): weight_lease is a mem_handle that pins the
+// underlying arena chunk (if any) for the lifetime of the task.  When
+// this task is moved into a CpuExpertPool worker lambda via std::move,
+// the handle's move constructor transfers the chunk lease to the worker
+// so weight_host cannot be evicted / sycl::free'd mid-compute.  For
+// non-arena pointers (mmap-backed, external malloc), the handle is a
+// DIRECT no-op — pointers with lifetimes we don't manage need no refcount.
 struct cpu_expert_task {
-    const void *  weight_host;   // Expert weight data in host RAM (quantized)
-    const float * act_host;      // Activation vector (float32, length K)
-    float *       output_host;   // Output buffer (float32, length N)
-    const float * bias = nullptr; // Optional bias vector (float32, length N)
-    ggml_type     type;          // Weight quant type (Q4_0, Q8_0, Q6_K, etc.)
-    int           K;             // Input dimension (columns per weight row)
-    int           N;             // Output rows (expert output dimension)
+    const void *           weight_host;   // Expert weight data in host RAM (quantized)
+    const float *          act_host;      // Activation vector (float32, length K)
+    float *                output_host;   // Output buffer (float32, length N)
+    const float *          bias = nullptr; // Optional bias vector (float32, length N)
+    ggml_type              type;          // Weight quant type (Q4_0, Q8_0, Q6_K, etc.)
+    int                    K;             // Input dimension (columns per weight row)
+    int                    N;             // Output rows (expert output dimension)
+    ggml_sycl::mem_handle  weight_lease{}; // llama.cpp-0k543: arena chunk lease for weight_host
 };
 
 // Compute one expert's matmul on CPU, reading weights directly from host RAM.
