@@ -57,8 +57,6 @@ class sycl_tensor {
         return tensor_ ? static_cast<ggml_tensor_extra_gpu *>(tensor_->extra) : nullptr;
     }
 
-    const ggml_tensor * tensor() const { return tensor_; }
-
     void * resolve_ptr() const { return tensor_ ? ggml_sycl_resolve_tensor_ptr(tensor_, device_) : nullptr; }
 
     template <typename T> T * resolve_as() const {

@@ -7601,6 +7601,8 @@ size_t unified_cache::available_device() const {
 // --- Deprecated shim: ensure_cached_alloc ---
 // Restored verbatim from pre-kcru9 deletion to keep test suite building.
 // New code must use unified_alloc() instead.
+// TODO: Port test suite (tests/test-sycl-unified-cache*, ~40 call sites across 5 files) to
+// unified_alloc(), then delete this shim. Tracked in bd: llama.cpp-og9dt.
 
 void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
                                           const void *               src_ptr,

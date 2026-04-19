@@ -40698,6 +40698,14 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                         // them via vbroadcastss/vfmadd231ps → SIGSEGV.
                         // Use wait() not get() to block without consuming the future
                         // (get() invalidates it; the scatter flush still needs it).
+                        //
+                        // Only this evict_and_flush site needs the drain. The other call
+                        // site (mul_mat_batched recovery at ~line 30928) runs from inside
+                        // an exception handler AFTER wait_and_throw() has drained the GPU
+                        // queue; by that point no new CPU expert futures can be launched
+                        // because the graph is being aborted. The recovery loop itself
+                        // does not re-dispatch CPU experts, so no live future can alias
+                        // a freed WEIGHT page.
                         if (g_pending_scatter.future.valid()) {
                             try { g_pending_scatter.future.wait(); } catch (...) {}
                         }
