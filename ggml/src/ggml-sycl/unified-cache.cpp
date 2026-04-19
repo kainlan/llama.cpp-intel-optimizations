@@ -9657,6 +9657,21 @@ bool unified_cache::arena_chunk_has_leases(int chunk_idx) const {
     return arena_chunks_[chunk_idx].lease_count.load() > 0;
 }
 
+// llama.cpp-dyhdl: host pinned-pool chunk lease pass-through.
+uint64_t unified_cache::host_acquire_chunk_lease(const void * ptr) {
+    if (!host_arena_) {
+        return pinned_chunk_pool::INVALID_CHUNK_HANDLE;
+    }
+    return host_arena_->acquire_chunk_lease(ptr);
+}
+
+void unified_cache::host_release_chunk_lease(uint64_t handle) {
+    if (!host_arena_ || handle == pinned_chunk_pool::INVALID_CHUNK_HANDLE) {
+        return;
+    }
+    host_arena_->release_chunk_lease(handle);
+}
+
 void unified_cache::arena_abandon() {
     // Null everything without calling sycl::free — used during shutdown
     // when the SYCL context is already invalid.

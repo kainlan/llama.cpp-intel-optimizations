@@ -54,6 +54,11 @@ enum class mem_handle_kind : uint8_t {
     ARENA_RUNTIME  = 2,  // Handle into RUNTIME zone (ggml compute buffers)
     ARENA_SCRATCH  = 3,  // Handle into SCRATCH zone (pool_leg per-op scratch)
     ARENA_ONEDNN   = 4,  // Handle into ONEDNN zone (oneDNN scratchpad)
+    CHUNK_LEASE    = 5,  // Raw pointer + arena chunk lease (llama.cpp-dyhdl).
+                         // Protects pointers derived from host or VRAM arena
+                         // chunks (e.g. tensor->data from host_arena) against
+                         // sycl::free of the underlying chunk while this
+                         // handle is alive.
 };
 
 // Forward declaration: the backing cache_entry type whose in_use_count we
@@ -114,6 +119,24 @@ public:
     //   RUNTIME -> ARENA_RUNTIME, SCRATCH -> ARENA_SCRATCH, ONEDNN -> ARENA_ONEDNN.
     static mem_handle from_arena_zone(int zone_id, size_t offset, size_t size,
                                       int device_id, uint64_t generation);
+
+    // llama.cpp-dyhdl: create a handle from a raw pointer whose arena-chunk
+    // ownership should be reference-counted for the handle's lifetime.
+    //
+    // Resolution order:
+    //   1. Query unified_cache on `device`: if ptr is in the VRAM arena,
+    //      bump that chunk's lease and return a CHUNK_LEASE handle.
+    //   2. Else query the cache's host_arena: if ptr is in a pinned chunk,
+    //      bump that chunk's lease and return a CHUNK_LEASE handle.
+    //   3. Else return a DIRECT handle (no protection — the pointer is not
+    //      in any known arena chunk, so there's nothing to refcount).
+    //
+    // Callers MUST keep the returned handle alive across any use of `ptr`
+    // that survives into another thread / queue submit / future.  The
+    // destructor releases the chunk lease exactly once.
+    static mem_handle from_chunk_ptr(void * ptr, int device,
+                                     ggml_layout_mode layout    = GGML_LAYOUT_AOS,
+                                     bool             on_device = false);
 
     // Resolve the current pointer.  Hot path (~3 ns):
     //   if (kind == DIRECT || gen_ == cache_generation())
@@ -192,6 +215,27 @@ private:
     // MUST NOT erase entries with in_use_count > 0, which is the contract
     // enforced in unified_cache::evict_one / remove / evict_and_flush.
     mutable unified_cache_entry * leased_entry_ = nullptr;
+
+    // llama.cpp-dyhdl: chunk-level lease backref.  Defense-in-depth beneath
+    // the cache_entry refcount: this stops the underlying arena chunk from
+    // being sycl::free'd while any mem_handle holds a pointer derived from it.
+    //
+    // Source encoding:
+    //   0 = none (no chunk lease held — DIRECT handle, or ptr not in any arena)
+    //   1 = host pinned_chunk_pool (handle stored in host_chunk_handle_)
+    //   2 = VRAM arena (handle stored in vram_chunk_idx_)
+    //
+    // Populated:
+    //   - by from_chunk_ptr() for raw-pointer escape migration
+    //   - by resolve_slow() for WEIGHT handles, so cached weights auto-pin
+    //     their chunk (belt + suspenders alongside leased_entry_ refcount)
+    //
+    // A CHUNK_LEASE-kind handle stores its protected raw ptr in cached_.ptr;
+    // resolve() returns cached_ directly (never re-queries the cache).
+    mutable uint8_t  chunk_source_      = 0;
+    mutable uint64_t host_chunk_handle_ = UINT64_MAX;  // pinned_chunk_pool::INVALID_CHUNK_HANDLE
+    mutable int32_t  vram_chunk_idx_    = -1;
+    mutable int32_t  chunk_device_      = -1;
 };
 
 // === layer_weight_handles ===

@@ -1422,6 +1422,12 @@ class unified_cache {
     void arena_release_chunk_lease(int chunk_idx);
     bool arena_chunk_has_leases(int chunk_idx) const;
 
+    // Host pinned-pool chunk lease API (dyhdl) — routes through host_arena_.
+    // Returns pinned_chunk_pool::INVALID_CHUNK_HANDLE (UINT64_MAX) on miss.
+    // Safe to call even when host_arena_ is null (returns miss).
+    uint64_t host_acquire_chunk_lease(const void * ptr);
+    void     host_release_chunk_lease(uint64_t handle);
+
     // Destroy arena (free all chunks).
     void arena_destroy();
 

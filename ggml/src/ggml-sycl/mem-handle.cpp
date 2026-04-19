@@ -3,6 +3,7 @@
 
 #include "mem-handle.hpp"
 
+#include "pinned-pool.hpp"    // pinned_chunk_pool chunk-lease API (dyhdl)
 #include "unified-cache.hpp"  // get_unified_cache_for_device, unified_cache
 
 #include <atomic>
@@ -101,11 +102,61 @@ mem_handle mem_handle::from_arena_zone(int zone_id, size_t offset, size_t size,
     return h;
 }
 
+// llama.cpp-dyhdl: wrap a raw pointer in a handle that refcounts the owning
+// arena chunk for the lifetime of the returned mem_handle.  Falls back to a
+// plain DIRECT handle (no refcount) if the pointer is not in any known
+// arena chunk — which is the correct behavior for, e.g., mmap-backed
+// weights, graph compute buffers, or other non-arena allocations.
+mem_handle mem_handle::from_chunk_ptr(void * ptr, int device, ggml_layout_mode layout, bool on_device) {
+    mem_handle h;
+    h.device_  = device;
+    h.cached_  = { ptr, layout, on_device };
+    h.gen_     = 0;
+
+    if (ptr == nullptr) {
+        h.kind_ = mem_handle_kind::DIRECT;
+        return h;
+    }
+
+    unified_cache * cache = get_unified_cache_for_device(device);
+    if (cache) {
+        // Priority 1: VRAM arena (pointer is device-resident).
+        const int vram_idx = cache->arena_acquire_chunk_lease(ptr);
+        if (vram_idx >= 0) {
+            h.kind_              = mem_handle_kind::CHUNK_LEASE;
+            h.chunk_source_      = 2;
+            h.chunk_device_      = device;
+            h.vram_chunk_idx_    = vram_idx;
+            h.host_chunk_handle_ = UINT64_MAX;
+            return h;
+        }
+
+        // Priority 2: host pinned_chunk_pool.
+        const uint64_t host_handle = cache->host_acquire_chunk_lease(ptr);
+        if (host_handle != pinned_chunk_pool::INVALID_CHUNK_HANDLE) {
+            h.kind_              = mem_handle_kind::CHUNK_LEASE;
+            h.chunk_source_      = 1;
+            h.chunk_device_      = device;
+            h.host_chunk_handle_ = host_handle;
+            h.vram_chunk_idx_    = -1;
+            return h;
+        }
+    }
+
+    // Not in any known arena — downgrade to raw DIRECT.  This is correct:
+    // the pointer belongs to an allocation whose lifetime we don't manage
+    // (mmap, external malloc, etc.), so there's nothing to refcount.
+    h.kind_ = mem_handle_kind::DIRECT;
+    return h;
+}
+
 // === resolve ===
 
 resolved_ptr mem_handle::resolve() const {
-    // DIRECT handles are never stale.
-    if (kind_ == mem_handle_kind::DIRECT) {
+    // DIRECT and CHUNK_LEASE handles are never stale — they wrap a raw
+    // pointer that is kept alive by either the caller's lifetime (DIRECT)
+    // or by the chunk lease refcount (CHUNK_LEASE, dyhdl).
+    if (kind_ == mem_handle_kind::DIRECT || kind_ == mem_handle_kind::CHUNK_LEASE) {
         return cached_;
     }
 
@@ -173,6 +224,28 @@ resolved_ptr mem_handle::resolve_slow() const {
     cached_        = { result.ptr, result.layout, result.on_device };
     gen_           = cache_generation();
     leased_entry_  = result.entry;  // may be nullptr for S1-PRELOAD direct entries
+
+    // llama.cpp-dyhdl: also pin the underlying arena chunk.  Belt + suspenders
+    // alongside the cache_entry lease: entry refcount prevents cache-layer
+    // eviction, chunk refcount prevents arena-layer munmap.  If the resolved
+    // ptr is not in any known arena (e.g. mmap-backed S1-PRELOAD direct
+    // entries), chunk_source_ stays 0 and dtor is a no-op.
+    const int vram_idx = cache->arena_acquire_chunk_lease(cached_.ptr);
+    if (vram_idx >= 0) {
+        chunk_source_      = 2;
+        chunk_device_      = device_;
+        vram_chunk_idx_    = vram_idx;
+        host_chunk_handle_ = UINT64_MAX;
+    } else {
+        const uint64_t host_handle = cache->host_acquire_chunk_lease(cached_.ptr);
+        if (host_handle != pinned_chunk_pool::INVALID_CHUNK_HANDLE) {
+            chunk_source_      = 1;
+            chunk_device_      = device_;
+            host_chunk_handle_ = host_handle;
+            vram_chunk_idx_    = -1;
+        }
+    }
+
     return cached_;
 }
 
@@ -189,12 +262,64 @@ void mem_handle::release_lease() noexcept {
         leased_entry_->in_use_count.fetch_sub(1);
         leased_entry_ = nullptr;
     }
+
+    // llama.cpp-dyhdl: release chunk-level lease if held.  Chunk leases are
+    // orthogonal to cache_entry leases — a WEIGHT handle may hold both
+    // (cache_entry + its backing arena chunk), a CHUNK_LEASE handle holds
+    // only the chunk.
+    if (chunk_source_ != 0 && chunk_device_ >= 0) {
+        unified_cache * cache = get_unified_cache_for_device(chunk_device_);
+        if (cache) {
+            if (chunk_source_ == 1) {
+                cache->host_release_chunk_lease(host_chunk_handle_);
+            } else if (chunk_source_ == 2) {
+                cache->arena_release_chunk_lease(vram_chunk_idx_);
+            }
+        }
+        chunk_source_      = 0;
+        host_chunk_handle_ = UINT64_MAX;  // pinned_chunk_pool::INVALID_CHUNK_HANDLE
+        vram_chunk_idx_    = -1;
+        chunk_device_      = -1;
+    }
 }
 
 // === destructor / copy / move ===
 
 mem_handle::~mem_handle() {
     release_lease();
+}
+
+// llama.cpp-dyhdl helper: re-acquire a chunk lease when a handle is copied.
+// Acquires via the pool API rather than bumping the atomic directly — keeps
+// all count mutations behind the pool's API and correctly handles the case
+// where the pool has been destroyed between the original acquisition and
+// the copy (returns a null handle, chunk_source_ gets zeroed below).
+static void bump_chunk_lease_for_copy(uint8_t       chunk_source,
+                                      int           chunk_device,
+                                      const void *  ptr,
+                                      uint64_t &    out_host_handle,
+                                      int32_t &     out_vram_idx) {
+    if (chunk_source == 0 || chunk_device < 0 || ptr == nullptr) {
+        out_host_handle = UINT64_MAX;
+        out_vram_idx    = -1;
+        return;
+    }
+    unified_cache * cache = get_unified_cache_for_device(chunk_device);
+    if (!cache) {
+        out_host_handle = UINT64_MAX;
+        out_vram_idx    = -1;
+        return;
+    }
+    if (chunk_source == 1) {
+        out_host_handle = cache->host_acquire_chunk_lease(ptr);
+        out_vram_idx    = -1;
+    } else if (chunk_source == 2) {
+        out_host_handle = UINT64_MAX;
+        out_vram_idx    = cache->arena_acquire_chunk_lease(ptr);
+    } else {
+        out_host_handle = UINT64_MAX;
+        out_vram_idx    = -1;
+    }
 }
 
 mem_handle::mem_handle(const mem_handle & other) :
@@ -207,11 +332,26 @@ mem_handle::mem_handle(const mem_handle & other) :
     arena_gen_(other.arena_gen_),
     gen_(other.gen_),
     cached_(other.cached_),
-    leased_entry_(other.leased_entry_) {
-    // Bump the lease refcount so each handle independently keeps the entry
-    // alive.  fetch_add on copyable_atomic_u32 is lock-free.
+    leased_entry_(other.leased_entry_),
+    chunk_source_(other.chunk_source_),
+    host_chunk_handle_(UINT64_MAX),
+    vram_chunk_idx_(-1),
+    chunk_device_(other.chunk_device_) {
+    // Bump the cache_entry lease refcount so each handle independently keeps
+    // the entry alive.  fetch_add on copyable_atomic_u32 is lock-free.
     if (leased_entry_) {
         leased_entry_->in_use_count.fetch_add(1);
+    }
+    // llama.cpp-dyhdl: independently acquire a chunk lease for the copy.
+    bump_chunk_lease_for_copy(chunk_source_, chunk_device_, cached_.ptr,
+                              host_chunk_handle_, vram_chunk_idx_);
+    if (chunk_source_ == 1 && host_chunk_handle_ == UINT64_MAX) {
+        chunk_source_ = 0;
+        chunk_device_ = -1;
+    }
+    if (chunk_source_ == 2 && vram_chunk_idx_ < 0) {
+        chunk_source_ = 0;
+        chunk_device_ = -1;
     }
 }
 
@@ -225,31 +365,53 @@ mem_handle::mem_handle(mem_handle && other) noexcept :
     arena_gen_(other.arena_gen_),
     gen_(other.gen_),
     cached_(other.cached_),
-    leased_entry_(other.leased_entry_) {
+    leased_entry_(other.leased_entry_),
+    chunk_source_(other.chunk_source_),
+    host_chunk_handle_(other.host_chunk_handle_),
+    vram_chunk_idx_(other.vram_chunk_idx_),
+    chunk_device_(other.chunk_device_) {
     // Transfer ownership — no refcount change.  Null `other` so its dtor
-    // does not release our lease.
-    other.leased_entry_ = nullptr;
+    // does not release our leases.
+    other.leased_entry_      = nullptr;
+    other.chunk_source_      = 0;
+    other.host_chunk_handle_ = UINT64_MAX;
+    other.vram_chunk_idx_    = -1;
+    other.chunk_device_      = -1;
 }
 
 mem_handle & mem_handle::operator=(const mem_handle & other) {
     if (this == &other) {
         return *this;
     }
-    // Decrement old lease (if any) before we adopt the new target.
+    // Decrement old leases (entry + chunk) before we adopt the new target.
     release_lease();
 
-    kind_         = other.kind_;
-    device_       = other.device_;
-    key_          = other.key_;
-    zone_id_      = other.zone_id_;
-    offset_       = other.offset_;
-    size_         = other.size_;
-    arena_gen_    = other.arena_gen_;
-    gen_          = other.gen_;
-    cached_       = other.cached_;
-    leased_entry_ = other.leased_entry_;
+    kind_              = other.kind_;
+    device_            = other.device_;
+    key_               = other.key_;
+    zone_id_           = other.zone_id_;
+    offset_            = other.offset_;
+    size_              = other.size_;
+    arena_gen_         = other.arena_gen_;
+    gen_               = other.gen_;
+    cached_            = other.cached_;
+    leased_entry_      = other.leased_entry_;
+    chunk_source_      = other.chunk_source_;
+    chunk_device_      = other.chunk_device_;
+    host_chunk_handle_ = UINT64_MAX;
+    vram_chunk_idx_    = -1;
     if (leased_entry_) {
         leased_entry_->in_use_count.fetch_add(1);
+    }
+    bump_chunk_lease_for_copy(chunk_source_, chunk_device_, cached_.ptr,
+                              host_chunk_handle_, vram_chunk_idx_);
+    if (chunk_source_ == 1 && host_chunk_handle_ == UINT64_MAX) {
+        chunk_source_ = 0;
+        chunk_device_ = -1;
+    }
+    if (chunk_source_ == 2 && vram_chunk_idx_ < 0) {
+        chunk_source_ = 0;
+        chunk_device_ = -1;
     }
     return *this;
 }
@@ -260,17 +422,25 @@ mem_handle & mem_handle::operator=(mem_handle && other) noexcept {
     }
     release_lease();
 
-    kind_               = other.kind_;
-    device_             = other.device_;
-    key_                = other.key_;
-    zone_id_            = other.zone_id_;
-    offset_             = other.offset_;
-    size_               = other.size_;
-    arena_gen_          = other.arena_gen_;
-    gen_                = other.gen_;
-    cached_             = other.cached_;
-    leased_entry_       = other.leased_entry_;
-    other.leased_entry_ = nullptr;
+    kind_                = other.kind_;
+    device_              = other.device_;
+    key_                 = other.key_;
+    zone_id_             = other.zone_id_;
+    offset_              = other.offset_;
+    size_                = other.size_;
+    arena_gen_           = other.arena_gen_;
+    gen_                 = other.gen_;
+    cached_              = other.cached_;
+    leased_entry_        = other.leased_entry_;
+    chunk_source_        = other.chunk_source_;
+    host_chunk_handle_   = other.host_chunk_handle_;
+    vram_chunk_idx_      = other.vram_chunk_idx_;
+    chunk_device_        = other.chunk_device_;
+    other.leased_entry_      = nullptr;
+    other.chunk_source_      = 0;
+    other.host_chunk_handle_ = UINT64_MAX;
+    other.vram_chunk_idx_    = -1;
+    other.chunk_device_      = -1;
     return *this;
 }
 
