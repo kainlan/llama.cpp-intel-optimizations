@@ -27,6 +27,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <condition_variable>
+#include <cstdarg>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -1191,6 +1192,62 @@ static bool                             g_expert_popularity_initialized = false;
 
 static int64_t make_popularity_key(int layer_id, int expert_id) {
     return (int64_t(layer_id) << 32) | int64_t(uint32_t(expert_id));
+}
+
+// llama.cpp-n04bq — compile-gated probe for the "plan vs dispatch" invariant
+// audit.  Default OFF.  Enabled with GGML_SYCL_N04BQ_PROBE=1 at runtime.  We
+// only log for blk.16 to keep output tractable.  Scope kept tight: no
+// control-flow changes, only fprintf.
+static bool n04bq_probe_enabled() {
+    static std::atomic<int> cached{ -1 };
+    int                     v = cached.load(std::memory_order_acquire);
+    if (v < 0) {
+        const char * env = std::getenv("GGML_SYCL_N04BQ_PROBE");
+        v                = (env && std::atoi(env) != 0) ? 1 : 0;
+        cached.store(v, std::memory_order_release);
+    }
+    return v != 0;
+}
+
+// Log once per (tag, tensor_name, expert_id) triple to avoid flooding.
+__attribute__((format(printf, 4, 5)))
+static void n04bq_probe_log(const char * tag, const char * tname, int expert_id,
+                            const char * fmt, ...) {
+    if (!n04bq_probe_enabled() || !tname) {
+        return;
+    }
+    if (!strstr(tname, "blk.16.")) {
+        return;
+    }
+    struct key_t {
+        std::string tag;
+        std::string tname;
+        int         expert_id;
+        bool        operator==(const key_t & o) const {
+            return tag == o.tag && tname == o.tname && expert_id == o.expert_id;
+        }
+    };
+    struct key_hash {
+        size_t operator()(const key_t & k) const {
+            return std::hash<std::string>()(k.tag) ^ std::hash<std::string>()(k.tname) ^
+                   std::hash<int>()(k.expert_id);
+        }
+    };
+    static std::mutex                          logged_mtx;
+    static std::unordered_set<key_t, key_hash> logged;
+    key_t k{ tag ? std::string(tag) : std::string(), std::string(tname), expert_id };
+    {
+        std::lock_guard<std::mutex> lk(logged_mtx);
+        if (!logged.insert(k).second) {
+            return;
+        }
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(stderr, "[N04BQ] %s tensor=%s eid=%d ", tag, tname, expert_id);
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    va_end(ap);
 }
 
 namespace ggml_sycl {
@@ -2468,10 +2525,15 @@ static expert_resolve_result ggml_sycl_resolve_expert_ptr(
             entry && entry->ptr) {
             bool host = (entry->location != cache_location::DEVICE);
             if (host) {
+                n04bq_probe_log("resolve/cache-host", src0->name, expert_id,
+                                "loc=%d ptr=%p size=%zu",
+                                (int) entry->location, entry->ptr, entry->size);
                 return make_host_result(entry->ptr);
             }
             // Device-resident: caller routes to GPU, no lease needed on the
             // device VRAM pointer (CPU dispatch skips is_host==false paths).
+            n04bq_probe_log("resolve/cache-device", src0->name, expert_id,
+                            "ptr=%p size=%zu", entry->ptr, entry->size);
             expert_resolve_result r{};
             r.ptr     = entry->ptr;
             r.is_host = false;
@@ -2482,19 +2544,27 @@ static expert_resolve_result ggml_sycl_resolve_expert_ptr(
     // 2. Cache miss -- check tensor buffer type
     if (src0->buffer && ggml_backend_buffer_is_host(src0->buffer)) {
         const size_t expert_offset = static_cast<size_t>(expert_id) * src0->nb[2];
-        return make_host_result(static_cast<const char *>(src0->data) + expert_offset);
+        const void * fallback_ptr  = static_cast<const char *>(src0->data) + expert_offset;
+        n04bq_probe_log("resolve/fallback-buffer-host", src0->name, expert_id,
+                        "tensor_data=%p expert_offset=%zu fallback_ptr=%p src0->nb[2]=%zu",
+                        src0->data, expert_offset, fallback_ptr, src0->nb[2]);
+        return make_host_result(fallback_ptr);
     }
 
     // 3. Device-resident, not in cache -- return device pointer, mark NOT host
     void * dev_ptr = extra->data_device_ptr(device);
     if (dev_ptr) {
         const size_t expert_offset = static_cast<size_t>(expert_id) * src0->nb[2];
+        n04bq_probe_log("resolve/fallback-device", src0->name, expert_id,
+                        "dev_base=%p expert_offset=%zu",
+                        dev_ptr, expert_offset);
         expert_resolve_result r{};
         r.ptr     = static_cast<const char *>(dev_ptr) + expert_offset;
         r.is_host = false;
         return r;
     }
 
+    n04bq_probe_log("resolve/nothing", src0->name, expert_id, "returning empty result");
     return {};
 }
 
@@ -11951,6 +12021,15 @@ static void ggml_sycl_preload_model_weights() {
                                             cache->register_host_expert(key, arena_ptr, expert_size, GGML_LAYOUT_AOS);
                                             GGML_SYCL_DEBUG("[S1-PRELOAD] host-arena expert %s[%ld] %.1f KB\n",
                                                             tname.c_str(), (long) e, expert_size / 1024.0f);
+                                            // llama.cpp-n04bq probe: capture arena ptr
+                                            // + source AOS addr so we can confirm the
+                                            // copy landed where the plan intended.
+                                            n04bq_probe_log("s1-preload/host-expert", tensor->name,
+                                                            static_cast<int>(e),
+                                                            "arena_ptr=%p expert_aos=%p expert_size=%zu "
+                                                            "tensor_data=%p",
+                                                            arena_ptr, expert_aos, expert_size,
+                                                            tensor ? tensor->data : nullptr);
                                             any_cached = true;
                                             weight_host_bytes[device] += expert_size;
                                             weight_host_count[device]++;
@@ -27151,6 +27230,11 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
                 }
                 GGML_SYCL_DEBUG("[OPT-FUSED] Expert %ld cache HIT (fast path), ptr=%p in_progress=%d\n", (long) e,
                                 cached_ptr, has_fill_evt);
+                // llama.cpp-n04bq: probe USM-path cache hit
+                n04bq_probe_log("update_moe_ptr_table/usm-hit", src0->name,
+                                static_cast<int>(e),
+                                "cached_ptr=%p layout=%d in_progress=%d",
+                                cached_ptr, (int) layout, has_fill_evt ? 1 : 0);
                 continue;
             }
             // Cache miss: fully non-blocking path. Leave pointer as nullptr so
@@ -27168,6 +27252,24 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
                 }
             }
             GGML_SYCL_DEBUG("[OPT-FUSED] Expert %ld cache MISS, using AOS zero-copy (non-blocking)\n", (long) e);
+            // llama.cpp-n04bq: USM-path cache miss + check direct_expert_entries_
+            // (host-pinned arena) for an entry.  NOTE: historically this branch
+            // does NOT consult direct_expert_entries_ at all — it just increments
+            // stats_miss and continues with extra->moe_expert_ptrs_host[e]==nullptr.
+            // For host-planned experts, this leaves the entry nullptr and the
+            // downstream dispatch falls back to resolve_expert_ptr().
+            if (n04bq_probe_enabled()) {
+                const ggml_sycl::weight_entry * he_peek = cache->lookup_expert(expert_cache_key);
+                n04bq_probe_log("update_moe_ptr_table/usm-miss", src0->name,
+                                static_cast<int>(e),
+                                "requested_layout=%d direct_expert_entries_peek_ptr=%p "
+                                "peek_location=%d plan_active=%d skip_cpu=%d",
+                                (int) layout,
+                                he_peek ? he_peek->ptr : nullptr,
+                                he_peek ? (int) he_peek->location : -1,
+                                plan_active ? 1 : 0,
+                                skip_cpu_routed_experts ? 1 : 0);
+            }
             stats_miss++;
             continue;
         }
@@ -27221,6 +27323,12 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
                 cached_ptr =
                     cache->try_get_cached_with_event(expert_cache_key, GGML_LAYOUT_AOS, &fill_evt, &has_fill_evt);
             }
+            // llama.cpp-n04bq probe: log what the lookup cascade returned for
+            // this expert — this path runs when src0 is NOT USM-accessible.
+            n04bq_probe_log("update_moe_ptr_table/non-usm", src0->name,
+                            static_cast<int>(e),
+                            "cached_ptr=%p skip_cpu_routed=%d layout=%d",
+                            cached_ptr, skip_cpu_routed_experts ? 1 : 0, (int) layout);
 
             if (cached_ptr) {
                 extra->moe_expert_ptrs_host[device][static_cast<size_t>(e)] = cached_ptr;
@@ -34010,6 +34118,42 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         src0->name);
         call_count++;
     }
+    // llama.cpp-n04bq: trace each distinct blk.16 tensor hit once.
+    if (src0 && src0->name && strstr(src0->name, "blk.16.") && n04bq_probe_enabled()) {
+        static std::mutex              mtx;
+        static std::unordered_set<std::string> seen;
+        std::lock_guard<std::mutex>    lk(mtx);
+        if (seen.insert(src0->name).second) {
+            fprintf(stderr, "[N04BQ] mul_mat_id/trace tensor=%s type=%d ne12=%lld\n",
+                    src0->name, (int) src0->type, (long long) src0->ne[2]);
+        }
+    }
+    // llama.cpp-n04bq: probe entry metadata for blk.16 MoE MUL_MAT_ID.  Captures
+    // tensor->data, tensor->buffer type, and whether extra has data_device set.
+    if (src0 && src0->name && strstr(src0->name, "blk.16.") && n04bq_probe_enabled()) {
+        const char * buft_name = "(no-buft)";
+        if (src0->buffer && src0->buffer->buft && src0->buffer->buft->iface.get_name) {
+            buft_name = src0->buffer->buft->iface.get_name(src0->buffer->buft);
+        }
+        const bool is_host_buf = src0->buffer && ggml_backend_buffer_is_host(src0->buffer);
+        auto *     src0_extra_probe = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
+        void *     dev_probe        = src0_extra_probe ? src0_extra_probe->data_device_ptr(ctx.device) : nullptr;
+        n04bq_probe_log("mul_mat_id/entry", src0->name, -1,
+                        "type=%d data=%p buft=%s is_host_buf=%d extra_dev_ptr=%p "
+                        "ne=[%lld,%lld,%lld,%lld] nb02=%zu",
+                        (int) src0->type, src0->data, buft_name, is_host_buf ? 1 : 0,
+                        dev_probe,
+                        (long long) src0->ne[0], (long long) src0->ne[1],
+                        (long long) src0->ne[2], (long long) src0->ne[3], src0->nb[2]);
+        // Also check arena_registry classification of src0->data
+        if (src0->data) {
+            auto loc = ggml_sycl::query_location(src0->data, ctx.device);
+            n04bq_probe_log("mul_mat_id/src0-data-classify", src0->name, -1,
+                            "tier=%d from_arena=%d zone=%d role=%d device=%d",
+                            (int) loc.tier, loc.from_arena ? 1 : 0,
+                            (int) loc.zone, (int) loc.role, loc.device);
+        }
+    }
     // Ensure src0 has ggml_tensor_extra_gpu.  Host-resident weight tensors
     // (e.g., from test-backend-ops) may not have extra because the host buffer
     // type doesn't call ggml_backend_sycl_buffer_init_tensor and the
@@ -34433,6 +34577,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 const int32_t eid = fusion.ids_data[ci];
                                 auto resolved = ggml_sycl::ggml_sycl_resolve_expert_ptr(
                                     src0, ctx.device, static_cast<int>(eid));
+                                n04bq_probe_log("moe_fusion/first-task", src0->name, eid,
+                                                "resolved.ptr=%p resolved.is_host=%d act_host=%p "
+                                                "first_is_gate=%d",
+                                                resolved.ptr, resolved.is_host ? 1 : 0,
+                                                fusion.act_host, fusion.first_is_gate ? 1 : 0);
                                 if (!resolved.ptr || !resolved.is_host) {
                                     // Expert is device-resident -- skip CPU dispatch.
                                     continue;
@@ -34661,6 +34810,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         const int32_t eid = fusion.ids_data[ci];
                         auto resolved = ggml_sycl::ggml_sycl_resolve_expert_ptr(
                             src0, ctx.device, static_cast<int>(eid));
+                        n04bq_probe_log("moe_fusion/down-task", src0->name, eid,
+                                        "resolved.ptr=%p resolved.is_host=%d fused_output=%p",
+                                        resolved.ptr, resolved.is_host ? 1 : 0,
+                                        fusion.fused_output);
                         if (!resolved.ptr || !resolved.is_host) {
                             // Expert is device-resident -- skip CPU dispatch.
                             continue;
@@ -35272,6 +35425,12 @@ cpu_fallback_fast:
 
                 {
                     auto resolved = ggml_sycl::ggml_sycl_resolve_expert_ptr(src0, ctx.device, expert_id);
+                    n04bq_probe_log("cpu-tg-fast/task", src0->name, expert_id,
+                                    "resolved.ptr=%p resolved.is_host=%d act_host_ptr=%p "
+                                    "out_ptr=%p K=%lld N=%lld",
+                                    resolved.ptr, resolved.is_host ? 1 : 0,
+                                    act_host_ptr, out_ptr,
+                                    (long long) K, (long long) N);
                     if (!resolved.ptr || !resolved.is_host) {
                         // Expert is device-resident -- route to GPU0 dispatch instead of CPU.
                         if (n_gpu0 >= STACK_GPU0 && heap_g0_eids.empty()) {
@@ -36543,8 +36702,12 @@ cpu_fallback_fast:
                     const auto &          entry       = entries[ci];
                     const void *          host_weight = nullptr;
                     ggml_sycl::mem_handle host_lease{};  // llama.cpp-0k543
+                    const void *          candidate_ptr = nullptr;
+                    bool                  candidate_is_device = false;
                     if (expert_ptrs_host && entry.expert_id >= 0 && entry.expert_id < n_as) {
                         const void * candidate = expert_ptrs_host[entry.expert_id];
+                        candidate_ptr = candidate;
+                        candidate_is_device = candidate && ggml_sycl::ggml_sycl_is_device_expert_ptr(candidate);
                         if (candidate && !ggml_sycl::ggml_sycl_is_device_expert_ptr(candidate)) {
                             host_weight = candidate;
                             // Acquire chunk lease: protects candidate if it lives in the
@@ -36560,6 +36723,15 @@ cpu_fallback_fast:
                             host_lease  = std::move(resolved.lease);
                         }
                     }
+                    // llama.cpp-n04bq probe: log the source of truth for each host
+                    // expert pointer at CPU-dispatch time.  Include src0->data so we
+                    // can correlate against the raw tensor-data path.
+                    n04bq_probe_log("dispatch_cpu_compute", src0->name, entry.expert_id,
+                                    "expert_ptrs_host[e]=%p (is_dev=%d) host_weight=%p "
+                                    "src0->data=%p src0_host_storage=%p nb02=%zu",
+                                    candidate_ptr, candidate_is_device ? 1 : 0,
+                                    host_weight, src0 ? src0->data : nullptr,
+                                    src0_host_storage, nb02);
                     if (!host_weight) {
                         // Expert is device-resident -- skip CPU dispatch (safety guard).
                         continue;
@@ -37834,6 +38006,11 @@ cpu_fallback_fast:
             if (rows.empty()) {
                 return;
             }
+            // llama.cpp-n04bq probe: log host_weight_ptr for PP-path host expert.
+            n04bq_probe_log("dispatch_host_expert_rows", src0->name, expert_id,
+                            "host_weight_ptr=%p n_rows=%zu src0->data=%p src0_host_storage=%p",
+                            host_weight_ptr, rows.size(), src0 ? src0->data : nullptr,
+                            src0_host_storage);
 
             const size_t             n_rows = rows.size();
             const int64_t            K      = ne00;
@@ -38458,6 +38635,26 @@ static int ggml_sycl_cpu_batch_threshold_for_tensor(const ggml_tensor * dst) {
 // This ensures ALL ops in a CPU-bound layer run on CPU, avoiding
 // activation transfers between CPU and GPU within a single layer.
 static bool should_dispatch_to_cpu(ggml_backend_sycl_context & ctx, const ggml_tensor * dst) {
+    // llama.cpp-n04bq: probe every call for blk.16 MUL_MAT_ID.  Records the
+    // dispatch decision source (preclassified/memo/runtime) and result.
+    auto n04bq_probe_ret = [&](bool r, const char * source) -> bool {
+        if (n04bq_probe_enabled() && dst && dst->name &&
+            strstr(dst->name, "-16") != nullptr &&
+            (dst->op == GGML_OP_MUL_MAT_ID || dst->op == GGML_OP_MUL_MAT)) {
+            static std::mutex mtx;
+            static std::unordered_set<std::string> seen;
+            std::string key = std::string(dst->name) + "/" + source;
+            std::lock_guard<std::mutex> lk(mtx);
+            if (seen.insert(key).second) {
+                const ggml_tensor * src0 = dst->src ? dst->src[0] : nullptr;
+                const char * src0_name = src0 ? src0->name : "(null)";
+                fprintf(stderr, "[N04BQ] should_dispatch_to_cpu dst=%s op=%s src0=%s source=%s result=%d\n",
+                        dst->name, ggml_op_name(dst->op), src0_name, source, r ? 1 : 0);
+            }
+        }
+        return r;
+    };
+
     // Memoize: boundary sync in graph_compute_impl queries once per node,
     // then compute_forward queries again for the same node — return cached result.
     static thread_local const ggml_tensor * g_last_dispatch_query  = nullptr;
@@ -38481,7 +38678,7 @@ static bool should_dispatch_to_cpu(ggml_backend_sycl_context & ctx, const ggml_t
         if (!weight_on_vram) {
             g_last_dispatch_query  = dst;
             g_last_dispatch_result = true;
-            return true;
+            return n04bq_probe_ret(true, "authoritative-residency");
         }
         // Fall through: weight is on device, let the GPU path handle it.
     }
@@ -38492,11 +38689,11 @@ static bool should_dispatch_to_cpu(ggml_backend_sycl_context & ctx, const ggml_t
         // Update memoization cache so compute_forward re-query hits it
         g_last_dispatch_query  = dst;
         g_last_dispatch_result = result;
-        return result;
+        return n04bq_probe_ret(result, "preclassified");
     }
 
     if (dst == g_last_dispatch_query) {
-        return g_last_dispatch_result;
+        return n04bq_probe_ret(g_last_dispatch_result, "memoized");
     }
 
     // Only dispatch when CPU offload is available
@@ -38621,7 +38818,7 @@ static bool should_dispatch_to_cpu(ggml_backend_sycl_context & ctx, const ggml_t
 
     g_last_dispatch_query  = dst;
     g_last_dispatch_result = result;
-    return result;
+    return n04bq_probe_ret(result, "runtime");
 }
 
 // Hybrid dispatch: keep lightweight activation-only ops on GPU even for CPU layers.
@@ -51184,39 +51381,65 @@ static bool ggml_sycl_op_is_planned_on_host(const ggml_tensor * op, int device) 
         return false;
     }
 
+    // llama.cpp-n04bq: trace layer-plan classification for blk.16 tensors.
+    auto n04bq_tr_final = [&](bool ret, const char * reason) -> bool {
+        if (n04bq_probe_enabled() && op) {
+            const ggml_tensor * s0 = op->src ? op->src[0] : nullptr;
+            const bool blk16_match =
+                (op->name && (strstr(op->name, "-16") || strstr(op->name, "blk.16."))) ||
+                (s0 && s0->name && strstr(s0->name, "blk.16."));
+            if (blk16_match) {
+                static std::mutex mtx;
+                static std::unordered_set<std::string> seen;
+                std::string key = std::string(op->name ? op->name : "(nn)") + "|" +
+                                  ggml_op_name(op->op) + "|" + reason;
+                std::lock_guard<std::mutex> lk(mtx);
+                if (seen.insert(key).second) {
+                    fprintf(stderr, "[N04BQ] planned_on_host op_name=%s op=%s result=%d reason=%s src0=%s\n",
+                            op->name ? op->name : "(null)",
+                            ggml_op_name(op->op), ret ? 1 : 0, reason,
+                            s0 && s0->name ? s0->name : "(null)");
+                }
+            }
+        }
+        return ret;
+    };
+
     if ((op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) && op->src[0] != nullptr &&
         ggml_sycl_weight_executes_on_host(op->src[0], device)) {
-        return true;
+        return n04bq_tr_final(true, "weight_executes_on_host");
     }
 
     if (ggml_sycl_layer_plan_applies_to_op(op)) {
         for (int s = 0; s < GGML_MAX_SRC && op->src[s] != nullptr; ++s) {
             if (ggml_sycl_weight_executes_on_host(op->src[s], device)) {
-                return true;
+                return n04bq_tr_final(true, "layer_plan_src_host");
             }
         }
     }
 
     if ((op->op == GGML_OP_ADD_ID || op->op == GGML_OP_GLU) &&
         ggml_sycl_tensor_depends_on_planned_host_weight(op, device)) {
-        return true;
+        return n04bq_tr_final(true, "addid_glu_depends_host");
     }
 
     auto * cache = ggml_sycl::get_unified_cache_for_device(device);
     if (!cache || !cache->has_placement_plan()) {
-        return false;
+        return n04bq_tr_final(false, "no_plan");
     }
 
     if (!ggml_sycl_layer_plan_applies_to_op(op)) {
-        return false;
+        return n04bq_tr_final(false, "layer_plan_not_applicable");
     }
 
     const int layer_id = ggml_sycl_extract_planned_layer_id(op);
     if (layer_id < 0) {
-        return false;
+        return n04bq_tr_final(false, "no_layer_id");
     }
 
-    return cache->get_placement_plan().get_layer_device(layer_id) < 0;
+    const int layer_dev = cache->get_placement_plan().get_layer_device(layer_id);
+    const bool ret = layer_dev < 0;
+    return n04bq_tr_final(ret, ret ? "layer_device<0" : "layer_device>=0");
 }
 
 static bool ggml_backend_sycl_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
