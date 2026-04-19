@@ -3793,11 +3793,14 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
     const queue_ptr stream                = ctx.stream();
     auto *          route_cache           = ggml_sycl::get_unified_cache(*stream);
     const bool      placement_plan_active = route_cache && route_cache->has_placement_plan();
-    if (placement_plan_active && use_ptr_table) {
-        GGML_SYCL_DEBUG("[MMVQ] Placement-plan pointer-table path disabled for %s; falling back to hybrid dispatch\n",
-                        src0->name ? src0->name : "?");
-        return false;
-    }
+    // Previously returned false here when (placement_plan_active && use_ptr_table).
+    // The mixed-ptr check at ~3870-3886 is the architecturally correct gate: it
+    // inspects actual expert pointer residency after ggml_sycl_update_moe_ptr_table
+    // builds the table (with skip_cpu_routed_experts already honoring the plan),
+    // and falls back only when pointers are actually mixed — not merely because
+    // a plan exists.  Blanket-disabling MMVQ under a plan forced every 20B MoE
+    // MUL_MAT_ID through the hybrid dispatch_cpu_compute path, which had
+    // task-construction bugs (l144i diagnostic) producing garbled output.
 
     // Quantize src1 to Q8_1 format - need to handle all rows (ne11 * ne12)
     const int64_t ne10_padded   = GGML_PAD(ne10, QK8_1);
