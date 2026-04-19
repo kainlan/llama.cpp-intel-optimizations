@@ -720,6 +720,42 @@ struct unified_cache_key_hash {
     }
 };
 
+// std::atomic<uint32_t> is non-copyable, but `unified_cache_entry` is used
+// throughout the cache via copy-assignment into `entries_[key] = entry`.  Wrap
+// the lease refcount in a copy-preserving adapter so the surrounding struct
+// stays copyable.  The value of the counter is carried across copies (which
+// only ever happen at fresh-insert sites where the count is 0).  Lock-free
+// reads/updates use acquire/release so a writer racing with an evictor's
+// `load()` from under the unique rw_mutex_ sees the reader's bump.
+//
+// Invariant (mem_handle lifetime): as long as any mem_handle's `leased_entry_`
+// points at an entry, its `in_use_count > 0`.  Eviction paths MUST check
+// `in_use_count.load(acquire) == 0` before erasing the entry; otherwise the
+// handle's pointer dangles and subsequent resolve() / DNNL dispatch faults
+// (llama.cpp-vtf7f / a7l5w crash signature).
+struct copyable_atomic_u32 {
+    std::atomic<uint32_t> v{ 0 };
+
+    copyable_atomic_u32() = default;
+    copyable_atomic_u32(const copyable_atomic_u32 & o) :
+        v(o.v.load(std::memory_order_relaxed)) {}
+    copyable_atomic_u32(copyable_atomic_u32 && o) noexcept :
+        v(o.v.load(std::memory_order_relaxed)) {}
+    copyable_atomic_u32 & operator=(const copyable_atomic_u32 & o) {
+        v.store(o.v.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        return *this;
+    }
+    copyable_atomic_u32 & operator=(copyable_atomic_u32 && o) noexcept {
+        v.store(o.v.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        return *this;
+    }
+
+    uint32_t fetch_add(uint32_t n) { return v.fetch_add(n, std::memory_order_acq_rel); }
+    uint32_t fetch_sub(uint32_t n) { return v.fetch_sub(n, std::memory_order_acq_rel); }
+    uint32_t load() const          { return v.load(std::memory_order_acquire); }
+    void     store(uint32_t x)     { v.store(x, std::memory_order_release); }
+};
+
 // Metadata for a cached entry
 struct unified_cache_entry {
     void *                device_ptr;               // GPU memory pointer (or host memory if host_resident)
@@ -748,6 +784,13 @@ struct unified_cache_entry {
     sycl::event           eviction_event;                // D2H copy completion event
     bool                  has_eviction_event = false;    // True if eviction_event is valid
     void *                eviction_host_ptr  = nullptr;  // Host-pinned destination for D2H copy
+    // Lifetime refcount (llama.cpp-vtf7f): bumped by mem_handle lease,
+    // decremented by mem_handle release.  Eviction paths skip entries with
+    // `in_use_count > 0`.  The counter is reset to 0 when the entry is
+    // overwritten at fresh-insert sites (always safe because those sites
+    // replace a just-erased / never-existed key; any attempt to overwrite a
+    // leased entry would be a bug, asserted separately in eviction paths).
+    copyable_atomic_u32   in_use_count;
     // NOTE: Reorder state is tracked in tensor->extra->optimized_feature, not here
 };
 
@@ -832,6 +875,26 @@ class unified_cache {
     // Fast O(1) weight lookup.  Tries the entry for this key regardless of layout.
     // Returns the first READY entry found.  Does NOT create entries or trigger staging.
     weight_ptr_result get_weight_ptr(const ggml_sycl_cache_id & key);
+
+    // Layout-agnostic weight pointer lookup that ALSO pins the lease refcount
+    // on the underlying cache entry.  Returns entry pointer in `entry` for the
+    // caller (mem_handle) to release on destruction.  The caller MUST release
+    // by calling `entry->in_use_count.fetch_sub(1)` exactly once — otherwise
+    // the entry cannot be evicted, memory pressure will grow, and eviction
+    // will start failing.  If the result is falsy (ptr == nullptr), no lease
+    // was acquired and `entry == nullptr`.
+    //
+    // This is the refcount-safe entry point for mem_handle::resolve_slow().
+    // See llama.cpp-vtf7f rootcause for the lifetime contract.
+    struct weight_ptr_lease_result {
+        void *                ptr       = nullptr;
+        ggml_layout_mode      layout    = GGML_LAYOUT_AOS;
+        bool                  on_device = false;
+        unified_cache_entry * entry     = nullptr;  // opaque handle for lease release
+
+        explicit operator bool() const { return ptr != nullptr; }
+    };
+    weight_ptr_lease_result acquire_weight_lease(const ggml_sycl_cache_id & key);
 
     // --- Decomposed cache operations (no queue ops during inference) ---
 

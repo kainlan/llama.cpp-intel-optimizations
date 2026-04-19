@@ -2294,7 +2294,19 @@ void * unified_cache::allocate_slot(const ggml_sycl_cache_id & key,
             // treat them as a mismatch so a real device allocation is made.
             return entry.device_ptr;
         }
-        // Layout/size mismatch or HOST_MMAP — evict old entry
+        // Layout/size mismatch or HOST_MMAP — evict old entry.
+        // llama.cpp-vtf7f: refuse to erase an entry that any mem_handle
+        // leases.  Returning nullptr forces the caller to retry later when
+        // the lease is released (same semantics as the existing OOM fallback
+        // for pinned entries).
+        const uint32_t alloc_slot_leases = entry.in_use_count.load();
+        if (alloc_slot_leases > 0) {
+            GGML_LOG_WARN(
+                "[UNIFIED-CACHE] allocate_slot refused reclaim: model=%llu name_hash=0x%llx "
+                "in_use=%u (returning nullptr so caller retries)\n",
+                (unsigned long long) key.model_id, (unsigned long long) key.name_hash, alloc_slot_leases);
+            return nullptr;
+        }
         if (entry.device_ptr && !entry.host_resident) {
             if (!entry.pool_allocated) {
                 enqueue_deferred_free(entry.device_ptr, entry.size);
@@ -2797,7 +2809,7 @@ size_t unified_cache::evict_coldest_expert_group(const std::unordered_map<int64_
     size_t   coldest_total_bytes = 0;
 
     auto get_entry_info = [&](const ggml_sycl_cache_id & key) -> std::tuple<bool, uint32_t, int64_t, size_t, bool> {
-        // Returns: (found, access_count, last_access, size, pinned)
+        // Returns: (found, access_count, last_access, size, pinned_or_leased)
         if (!key.valid) {
             return { false, 0, 0, 0, false };
         }
@@ -2811,7 +2823,13 @@ size_t unified_cache::evict_coldest_expert_group(const std::unordered_map<int64_
             return { false, 0, 0, 0, false };
         }
         const auto & e = entry_it->second;
-        return { true, e.access_count, e.last_access, e.size, e.pinned };
+        // llama.cpp-vtf7f: treat live mem_handle leases as pinned for the
+        // purposes of group eviction.  evict_expert_group() below issues
+        // per-tensor remove() which itself refuses on in_use_count > 0, so
+        // this is defence-in-depth — without it, the scoring loop might
+        // select a leased group only to have the actual remove() skip.
+        const bool held = e.pinned || e.in_use_count.load() > 0;
+        return { true, e.access_count, e.last_access, e.size, held };
     };
 
     for (const auto & [gkey, grp] : expert_groups) {
@@ -2971,6 +2989,71 @@ unified_cache::weight_ptr_result unified_cache::get_weight_ptr(const ggml_sycl_c
     return result;
 }
 
+// Lease-acquiring variant of get_weight_ptr — bumps in_use_count on the
+// resolved entry while holding shared_lock.  Eviction paths take the unique
+// lock (writer), so the increment is safely visible to a subsequent eviction
+// scan.  Caller (mem_handle) MUST release via entry->in_use_count.fetch_sub(1).
+//
+// direct_weight_entries_ (S1-PRELOAD) is NOT refcounted — those entries live
+// for the duration of the host arena and are never individually evicted.  If
+// the result comes from direct_weight_entries_, entry == nullptr, meaning the
+// caller has no lease obligation (and no lifetime protection against an
+// arena-wide teardown, which only happens at model unload).
+unified_cache::weight_ptr_lease_result unified_cache::acquire_weight_lease(
+    const ggml_sycl_cache_id & key) {
+    weight_ptr_lease_result result{};
+    if (!key.valid) {
+        return result;
+    }
+    static const ggml_layout_mode       try_layouts[] = { GGML_LAYOUT_COALESCED, GGML_LAYOUT_SOA, GGML_LAYOUT_AOS };
+    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+    for (auto layout : try_layouts) {
+        unified_cache_key ckey{ cache_entry_type::DENSE_WEIGHT, key, -1, -1 };
+        auto              entry_it = entries_.find(ckey);
+        if (entry_it == entries_.end()) {
+            continue;
+        }
+        auto & entry = entry_it->second;
+        if (entry.state != cache_entry_state::READY) {
+            continue;
+        }
+        if (!entry.device_ptr) {
+            continue;
+        }
+        // HOST_MMAP entries hold raw mmap pointers — not GPU-accessible; same
+        // filter as get_weight_ptr so mem_handle semantics are consistent.
+        if (entry.location == cache_location::HOST_MMAP) {
+            continue;
+        }
+        // Bump the lease refcount under shared_lock.  Visible to any evictor
+        // that later acquires the unique_lock (acq_rel ordering).
+        entry.in_use_count.fetch_add(1);
+        result.ptr       = entry.device_ptr;
+        result.layout    = entry.layout;
+        result.on_device = !entry.host_resident;
+        result.entry     = &entry;  // pointer stable across unordered_map inserts
+        return result;
+    }
+    lock.unlock();
+
+    // Fallback: S1-PRELOAD direct_weight_entries_ (no refcount needed — these
+    // entries live for the lifetime of the host arena and are not evicted
+    // individually).  mem_handle receives ptr with entry == nullptr; its dtor
+    // will correctly skip the release.
+    {
+        std::shared_lock<std::shared_mutex> dlock(direct_stage_mutex_);
+        auto                                it = direct_weight_entries_.find(key);
+        if (it != direct_weight_entries_.end() && it->second.ptr) {
+            result.ptr       = it->second.ptr;
+            result.layout    = it->second.layout;
+            result.on_device = true;
+            result.entry     = nullptr;
+            return result;
+        }
+    }
+    return result;
+}
+
 sycl::queue & unified_cache::get_dma_queue() {
     // Return dedicated DMA queue if available, otherwise fall back to compute queue
     if (dma_queue_) {
@@ -3063,6 +3146,19 @@ void unified_cache::remove(const ggml_sycl_cache_id & key_id,
     if (it->second.state == cache_entry_state::IN_PROGRESS) {
         GGML_SYCL_DEBUG("[UNIFIED-CACHE] remove skipped: entry in progress model=%llu name_hash=0x%llx\n",
                         (unsigned long long) key_id.model_id, (unsigned long long) key_id.name_hash);
+        return;
+    }
+
+    // llama.cpp-vtf7f: refuse to remove an entry that any mem_handle leases.
+    // remove() is typically called for dead weights / cache eviction; a live
+    // lease at this moment implies the caller is about to dereference a
+    // pointer we are about to free.  Log loudly and skip.
+    const uint32_t remove_leases = it->second.in_use_count.load();
+    if (remove_leases > 0) {
+        GGML_LOG_WARN(
+            "[UNIFIED-CACHE] remove refused: model=%llu name_hash=0x%llx layout=%d in_use=%u (entry kept)\n",
+            (unsigned long long) key_id.model_id, (unsigned long long) key_id.name_hash,
+            (int) it->second.layout, remove_leases);
         return;
     }
 
@@ -3583,6 +3679,18 @@ size_t unified_cache::evict_one(size_t /* new_size */) {
             GGML_SYCL_DEBUG("[UNIFIED-CACHE] evict skip: model=%llu name_hash=0x%llx layout=%d pinned size=%zu\n",
                             (unsigned long long) pair.first.id.model_id, (unsigned long long) pair.first.id.name_hash,
                             (int) entry.layout, entry.size);
+            continue;
+        }
+        // llama.cpp-vtf7f: skip entries with outstanding mem_handle leases.
+        // A live lease means a DNNL call / kernel submit / CPU dispatch is
+        // using entry.device_ptr right now; freeing would dangle the pointer.
+        // Acquire-ordered load pairs with the reader's fetch_add under the
+        // shared rw_mutex_, so we see every prior lease increment.
+        const uint32_t entry_leases = entry.in_use_count.load();
+        if (entry_leases > 0) {
+            GGML_SYCL_DEBUG("[UNIFIED-CACHE] evict skip: model=%llu name_hash=0x%llx layout=%d in_use=%u size=%zu\n",
+                            (unsigned long long) pair.first.id.model_id, (unsigned long long) pair.first.id.name_hash,
+                            (int) entry.layout, entry_leases, entry.size);
             continue;
         }
 
@@ -7673,20 +7781,35 @@ void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
             }
         }
         if (it->second.layout != layout) {
-            if (it->second.pinned) {
-                GGML_SYCL_DEBUG(
-                    "[UNIFIED-CACHE] layout switch: unpinning model=%llu name_hash=0x%llx have=%d want=%d\n",
+            // llama.cpp-vtf7f: if any mem_handle leases this entry, its
+            // caller (mmvq/mmq/dnnl/etc.) is mid-use.  Returning the
+            // existing pointer under the old layout is safe (caller already
+            // committed to it); erasing and switching layouts would dangle
+            // that pointer.  Fall through to "same layout" handling below.
+            const uint32_t ensure_leases = it->second.in_use_count.load();
+            if (ensure_leases > 0) {
+                GGML_LOG_WARN(
+                    "[UNIFIED-CACHE] ensure_cached_alloc: layout switch refused "
+                    "model=%llu name_hash=0x%llx in_use=%u have=%d want=%d (reusing old layout)\n",
                     (unsigned long long) key_id.model_id, (unsigned long long) key_id.name_hash,
-                    (int) it->second.layout, (int) layout);
-                it->second.pinned = false;
-            }
-            void * stale_ptr      = it->second.device_ptr;
-            size_t stale_size     = it->second.size;
-            bool   stale_host_res = it->second.host_resident;
-            entries_.erase(it);
-            it = entries_.end();
-            if (!stale_host_res && stale_ptr && stale_size > 0) {
-                enqueue_deferred_free(stale_ptr, stale_size);
+                    ensure_leases, (int) it->second.layout, (int) layout);
+                // Fall through: use existing entry as-is under its current layout.
+            } else {
+                if (it->second.pinned) {
+                    GGML_SYCL_DEBUG(
+                        "[UNIFIED-CACHE] layout switch: unpinning model=%llu name_hash=0x%llx have=%d want=%d\n",
+                        (unsigned long long) key_id.model_id, (unsigned long long) key_id.name_hash,
+                        (int) it->second.layout, (int) layout);
+                    it->second.pinned = false;
+                }
+                void * stale_ptr      = it->second.device_ptr;
+                size_t stale_size     = it->second.size;
+                bool   stale_host_res = it->second.host_resident;
+                entries_.erase(it);
+                it = entries_.end();
+                if (!stale_host_res && stale_ptr && stale_size > 0) {
+                    enqueue_deferred_free(stale_ptr, stale_size);
+                }
             }
         }
         if (it == entries_.end()) {

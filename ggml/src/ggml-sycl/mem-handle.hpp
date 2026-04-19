@@ -56,10 +56,28 @@ enum class mem_handle_kind : uint8_t {
     ARENA_ONEDNN   = 4,  // Handle into ONEDNN zone (oneDNN scratchpad)
 };
 
+// Forward declaration: the backing cache_entry type whose in_use_count we
+// hold a lease on.  Full definition in unified-cache.hpp.
+struct unified_cache_entry;
+
 class mem_handle {
 public:
     // Create an invalid handle.
     mem_handle() = default;
+
+    // Destructor: if this handle holds a WEIGHT lease on a cache entry,
+    // decrement that entry's in_use_count.  Dtor is the only release point;
+    // after `~mem_handle` returns, the underlying cache entry may be evicted
+    // on the next eviction scan.
+    ~mem_handle();
+
+    // Copy / move: maintain the lease refcount correctly.  A copy bumps the
+    // target entry's count (so two handles each hold an independent lease);
+    // a move transfers ownership (net refcount unchanged).
+    mem_handle(const mem_handle & other);
+    mem_handle(mem_handle && other) noexcept;
+    mem_handle & operator=(const mem_handle & other);
+    mem_handle & operator=(mem_handle && other) noexcept;
 
     // Create a WEIGHT handle from a cache key + device.
     // The handle starts with gen_ = 0 (stale), so the first resolve() will
@@ -127,6 +145,11 @@ private:
     // Slow path for arena handles: resolve base + offset from arena.
     resolved_ptr resolve_arena() const;
 
+    // Release any held lease on the backing cache entry.  Called from dtor,
+    // copy-assign, and move-assign before transitioning to a new state.
+    // No-op if no lease is held.
+    void release_lease() noexcept;
+
     mem_handle_kind    kind_   = mem_handle_kind::DIRECT;
     int                device_ = 0;
     unified_cache_key  key_    = {};
@@ -141,6 +164,19 @@ private:
     // pointer) but updates the cache as a side effect.
     mutable uint64_t     gen_    = 0;
     mutable resolved_ptr cached_ = {};
+
+    // Lease-protected backing entry pointer (llama.cpp-vtf7f).  When non-null,
+    // this handle has incremented the entry's in_use_count, guaranteeing the
+    // backing allocation cannot be sycl::free'd or evicted until the handle
+    // is destroyed.  Only WEIGHT-kind handles acquire leases — DIRECT and
+    // ARENA_* handles ignore this field.
+    //
+    // Pointer stability: std::unordered_map guarantees pointers to elements
+    // remain valid across insert/rehash operations (C++17 §26.2.7); erase
+    // only invalidates pointers to the erased element.  Eviction paths
+    // MUST NOT erase entries with in_use_count > 0, which is the contract
+    // enforced in unified_cache::evict_one / remove / evict_and_flush.
+    mutable unified_cache_entry * leased_entry_ = nullptr;
 };
 
 // === layer_weight_handles ===

@@ -107,8 +107,16 @@ resolved_ptr mem_handle::resolve() const {
 }
 
 // === resolve_slow ===
-// Re-query the unified cache.  Called ~0-3 times per inference run (only on
-// generation mismatch, which means an eviction/promotion just happened).
+// Re-query the unified cache and acquire a lease on the resolved entry.
+// Called ~0-3 times per inference run (only on generation mismatch, which
+// means an eviction/promotion just happened) — or on the first resolve of
+// a newly-constructed handle.
+//
+// Lifetime contract (llama.cpp-vtf7f): while this handle is alive and holds
+// a lease (leased_entry_ != nullptr), the backing cache entry cannot be
+// evicted or freed.  On generation mismatch we MUST release the old lease
+// before acquiring a new one — otherwise two handles exist on the same
+// entry instance, and leak tracking breaks.
 
 resolved_ptr mem_handle::resolve_slow() const {
     unified_cache * cache = get_unified_cache_for_device(device_);
@@ -116,16 +124,131 @@ resolved_ptr mem_handle::resolve_slow() const {
         return {};
     }
 
-    // get_weight_ptr returns weight_ptr_result with: ptr, layout, on_device
-    auto result = cache->get_weight_ptr(key_.id);
+    // Release any prior lease on the old entry — after an eviction, the old
+    // entry is already gone from entries_, but our leased_entry_ pointer
+    // would be dangling (the evictor wouldn't have erased it because we held
+    // the lease; but on regen-bump-by-different-reason — e.g. promote_to_device —
+    // the old entry could legitimately be gone).  Releasing is safe: we
+    // decrement and then forget the pointer.  If the pointer is stale, the
+    // fetch_sub still operates on a valid atomic (our lease kept the entry
+    // alive), and subsequent eviction will see count=0 and erase it.
+    //
+    // release_lease is idempotent and handles the nullptr case.
+    const_cast<mem_handle *>(this)->release_lease();
+
+    // Acquire under shared_lock; visible to any future evictor via acq_rel
+    // ordering on the in_use_count atomic.
+    auto result = cache->acquire_weight_lease(key_.id);
     if (!result) {
+        // No cache hit; leave handle unpinned.
+        cached_        = {};
+        gen_           = cache_generation();
+        leased_entry_  = nullptr;
         return {};
     }
 
-    // Update cached state
-    cached_ = { result.ptr, result.layout, result.on_device };
-    gen_    = cache_generation();
+    cached_        = { result.ptr, result.layout, result.on_device };
+    gen_           = cache_generation();
+    leased_entry_  = result.entry;  // may be nullptr for S1-PRELOAD direct entries
     return cached_;
+}
+
+// === release_lease ===
+// Decrement the backing entry's in_use_count if we're currently leasing one.
+// Safe to call from any context; no lock acquired.  After this call,
+// leased_entry_ is nulled so the dtor / next release is idempotent.
+
+void mem_handle::release_lease() noexcept {
+    if (leased_entry_) {
+        // fetch_sub on copyable_atomic_u32::v.  The entry is guaranteed to
+        // still exist (our lease held it); after this decrement the entry
+        // may be evicted, but we never dereference the pointer again.
+        leased_entry_->in_use_count.fetch_sub(1);
+        leased_entry_ = nullptr;
+    }
+}
+
+// === destructor / copy / move ===
+
+mem_handle::~mem_handle() {
+    release_lease();
+}
+
+mem_handle::mem_handle(const mem_handle & other) :
+    kind_(other.kind_),
+    device_(other.device_),
+    key_(other.key_),
+    zone_id_(other.zone_id_),
+    offset_(other.offset_),
+    size_(other.size_),
+    arena_gen_(other.arena_gen_),
+    gen_(other.gen_),
+    cached_(other.cached_),
+    leased_entry_(other.leased_entry_) {
+    // Bump the lease refcount so each handle independently keeps the entry
+    // alive.  fetch_add on copyable_atomic_u32 is lock-free.
+    if (leased_entry_) {
+        leased_entry_->in_use_count.fetch_add(1);
+    }
+}
+
+mem_handle::mem_handle(mem_handle && other) noexcept :
+    kind_(other.kind_),
+    device_(other.device_),
+    key_(other.key_),
+    zone_id_(other.zone_id_),
+    offset_(other.offset_),
+    size_(other.size_),
+    arena_gen_(other.arena_gen_),
+    gen_(other.gen_),
+    cached_(other.cached_),
+    leased_entry_(other.leased_entry_) {
+    // Transfer ownership — no refcount change.  Null `other` so its dtor
+    // does not release our lease.
+    other.leased_entry_ = nullptr;
+}
+
+mem_handle & mem_handle::operator=(const mem_handle & other) {
+    if (this == &other) {
+        return *this;
+    }
+    // Decrement old lease (if any) before we adopt the new target.
+    release_lease();
+
+    kind_         = other.kind_;
+    device_       = other.device_;
+    key_          = other.key_;
+    zone_id_      = other.zone_id_;
+    offset_       = other.offset_;
+    size_         = other.size_;
+    arena_gen_    = other.arena_gen_;
+    gen_          = other.gen_;
+    cached_       = other.cached_;
+    leased_entry_ = other.leased_entry_;
+    if (leased_entry_) {
+        leased_entry_->in_use_count.fetch_add(1);
+    }
+    return *this;
+}
+
+mem_handle & mem_handle::operator=(mem_handle && other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+    release_lease();
+
+    kind_               = other.kind_;
+    device_             = other.device_;
+    key_                = other.key_;
+    zone_id_            = other.zone_id_;
+    offset_             = other.offset_;
+    size_               = other.size_;
+    arena_gen_          = other.arena_gen_;
+    gen_                = other.gen_;
+    cached_             = other.cached_;
+    leased_entry_       = other.leased_entry_;
+    other.leased_entry_ = nullptr;
+    return *this;
 }
 
 // === resolve_arena ===
