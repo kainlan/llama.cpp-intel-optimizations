@@ -34229,6 +34229,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                           src0->name && strstr(src0->name, "ffn_down") != nullptr;
 
     if (ne12 == 1 || fusion_down_continuation) {
+        // When an EXPERT_STAGING ensure() fails under arena starvation (e.g.
+        // test-backend-ops fixture budget, or runtime host-zone fragmentation),
+        // the CPU-TG / moe-fusion fast-paths cannot complete. Earlier revisions
+        // returned early here, leaving `dst` uninitialized and producing
+        // garbage output. Instead, we erase any fusion state, set this flag,
+        // and `goto cpu_tg_fallthrough` to continue into the standard GPU
+        // fast-path cascade (line 35918+) and finally the unfused hybrid
+        // dispatch (line 36518+), which uses the pool-backed
+        // `dispatch_cpu_compute` lambda and does not require an
+        // EXPERT_STAGING pinned-zone allocation to succeed.
+        bool                    cpu_tg_alloc_failed = false;
         static std::atomic<int> cpu_expert_tg_mode_fast{ -1 };
         int                     cpu_tg_val_fast = cpu_expert_tg_mode_fast.load(std::memory_order_acquire);
         if (cpu_tg_val_fast < 0) {
@@ -34384,10 +34395,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         const size_t act_bytes = static_cast<size_t>(K_f) * sizeof(float);
                         if (!tl_first_act.ensure(*stream, ctx.device, act_bytes, ggml_sycl::alloc_role::EXPERT_STAGING,
                                                  ggml_sycl::runtime_category::HOST_COMPUTE, "moe_fusion_first_act")) {
-                            GGML_LOG_ERROR("[MOE-P4] Failed host activation staging alloc for layer %d\n",
+                            GGML_LOG_ERROR("[MOE-P4] Failed host activation staging alloc for layer %d; "
+                                           "falling through to unfused dispatch\n",
                                            cur_layer_fast);
                             moe_fusion_erase(cur_layer_fast);
-                            return;
+                            cpu_tg_alloc_failed = true;
+                            goto cpu_tg_fallthrough;
                         }
                         fusion.act_d2h_event   = stream->memcpy(tl_first_act.as<float>(), src1_device_base, act_bytes);
                         fusion.act_d2h_pending = true;
@@ -34563,10 +34576,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                     *stream, ctx.device, n_cpu_first * static_cast<size_t>(N_first) * sizeof(float),
                                     ggml_sycl::alloc_role::EXPERT_STAGING, ggml_sycl::runtime_category::HOST_COMPUTE,
                                     "moe_fusion_first_out", true)) {
-                                GGML_LOG_ERROR("[MOE-P4] Failed host output staging alloc for layer %d\n",
+                                GGML_LOG_ERROR("[MOE-P4] Failed host output staging alloc for layer %d; "
+                                               "falling through to unfused dispatch\n",
                                                cur_layer_fast);
                                 moe_fusion_erase(cur_layer_fast);
-                                return;
+                                cpu_tg_alloc_failed = true;
+                                goto cpu_tg_fallthrough;
                             }
                             fusion.wait_act_d2h();
 
@@ -34787,9 +34802,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     if (!tl_down_out.ensure(*stream, ctx.device, n_cpu_d * static_cast<size_t>(N_d) * sizeof(float),
                                             ggml_sycl::alloc_role::EXPERT_STAGING,
                                             ggml_sycl::runtime_category::HOST_COMPUTE, "moe_fusion_down_out", true)) {
-                        GGML_LOG_ERROR("[MOE-P4] Failed down host output staging alloc for layer %d\n", cur_layer_fast);
+                        GGML_LOG_ERROR("[MOE-P4] Failed down host output staging alloc for layer %d; "
+                                       "falling through to unfused dispatch\n",
+                                       cur_layer_fast);
                         moe_fusion_erase(cur_layer_fast);
-                        return;
+                        cpu_tg_alloc_failed = true;
+                        goto cpu_tg_fallthrough;
                     }
 
                     constexpr size_t             STACK_D = 16;
@@ -35139,8 +35157,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 if (!tl_act_pinned.ensure(*stream, ctx.device, act_floats * sizeof(float),
                                           ggml_sycl::alloc_role::EXPERT_STAGING,
                                           ggml_sycl::runtime_category::HOST_COMPUTE, "moe_cpu_tg_act")) {
-                    GGML_LOG_ERROR("[CPU-TG] Failed activation staging alloc for %s\n", src0->name ? src0->name : "?");
-                    return;
+                    GGML_LOG_ERROR("[CPU-TG] Failed activation staging alloc for %s; "
+                                   "falling through to unfused dispatch\n",
+                                   src0->name ? src0->name : "?");
+                    cpu_tg_alloc_failed = true;
+                    goto cpu_tg_fallthrough;
                 }
                 act_d2h_evt = stream->memcpy(tl_act_pinned.as<float>(), src1_device_base, act_floats * sizeof(float));
                 act_d2h_pending = true;
@@ -35162,8 +35183,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             if (!tl_out_pinned.ensure(*stream, ctx.device, out_floats * sizeof(float),
                                       ggml_sycl::alloc_role::EXPERT_STAGING, ggml_sycl::runtime_category::HOST_COMPUTE,
                                       "moe_cpu_tg_out", true)) {
-                GGML_LOG_ERROR("[CPU-TG] Failed output staging alloc for %s\n", src0->name ? src0->name : "?");
-                return;
+                GGML_LOG_ERROR("[CPU-TG] Failed output staging alloc for %s; "
+                               "falling through to unfused dispatch\n",
+                               src0->name ? src0->name : "?");
+                cpu_tg_alloc_failed = true;
+                goto cpu_tg_fallthrough;
             }
 
             // --- Smart expert reduction: skip low-probability experts ---
@@ -35903,6 +35927,23 @@ cpu_fallback_fast:
             }
 
             return;
+        }
+        // Control flow reaches here either because the CPU-TG gate was not
+        // taken (host weights absent, etc.) or because an EXPERT_STAGING
+        // allocation failed and the CPU-TG path erased its fusion state and
+        // jumped here. In both cases, continue into the GPU fast-path cascade
+        // below; the unfused hybrid dispatch at ~line 36518 is the correctness
+        // baseline for ne12==1 MUL_MAT_ID when host weights are in play and is
+        // reachable via pool-backed allocations that do not share the
+        // pinned-zone constraint path.
+    cpu_tg_fallthrough:
+        if (cpu_tg_alloc_failed) {
+            static std::atomic<int> fallthrough_log{ 0 };
+            if (fallthrough_log.fetch_add(1, std::memory_order_relaxed) < 3) {
+                GGML_LOG_WARN("[CPU-TG] EXPERT_STAGING alloc failed; falling through "
+                              "to unfused dispatch for %s\n",
+                              src0->name ? src0->name : "?");
+            }
         }
     }
 
