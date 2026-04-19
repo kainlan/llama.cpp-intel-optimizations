@@ -17768,23 +17768,49 @@ static size_t ggml_backend_sycl_host_buffer_type_chunk_cap() {
 }
 
 static size_t ggml_backend_sycl_host_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
-    // When host zones are configured, return the SCRATCH zone capacity as max chunk.
-    // This makes ggml-alloc split host compute buffers into chunks that fit within
-    // the pre-planned SCRATCH zone, instead of requesting one giant host buffer.
+    const size_t chunk_cap = ggml_backend_sycl_host_buffer_type_chunk_cap();
+
+    // When host zones are configured, report the largest single-chunk
+    // contiguous free block in whichever zone `alloc_buffer` will route this
+    // buffer to.  ggml-alloc uses this value to split a large requested
+    // buffer into a sequence of chunk-sized buffers.  Reporting
+    // zone_capacity (total aggregate size) instead of
+    // largest-contiguous-free-block is incorrect: aggregate size can span
+    // multiple non-contiguous `sycl::malloc_host` chunks, and the underlying
+    // allocator cannot hand out a cross-chunk pointer that is virtually
+    // contiguous.  Returning aggregate size previously caused ggml-alloc to
+    // request a buffer the allocator silently fragmented, after which
+    // `tensor->data = base + offset` for tensors past the first chunk's end
+    // landed in the unmapped gap between chunks — manifesting as SIGSEGV in
+    // CPU-backend `mul_mat_id`'s output memcpy (bug llama.cpp-lj6p0).
     auto * cache = ggml_sycl::get_unified_cache_for_device(get_current_device_id());
     if (cache && cache->host_zones_configured()) {
-        size_t scratch_avail = cache->host_zone_capacity(ggml_sycl::host_zone_id::SCRATCH);
-        if (scratch_avail > 0) {
-            const size_t chunk_cap = ggml_backend_sycl_host_buffer_type_chunk_cap();
-            return std::min(scratch_avail, chunk_cap);
+        // Mirror the zone-selection logic in `alloc_buffer`:
+        //   in_model_load || weights_evictable → WEIGHT
+        //   otherwise → STAGING
+        const bool in_model_load     = g_sycl_in_model_load.load(std::memory_order_acquire);
+        const bool weights_evictable = ggml_backend_sycl_weights_evictable();
+        const ggml_sycl::host_zone_id target_zone =
+            (in_model_load || weights_evictable) ? ggml_sycl::host_zone_id::WEIGHT
+                                                 : ggml_sycl::host_zone_id::STAGING;
+        size_t largest = cache->host_zone_largest_free_block(target_zone);
+        // Floor: unified_alloc will grow the zone on fragmentation, so as long
+        // as zone capacity still has room we can at least advertise one chunk
+        // worth.  If even a chunk-sized growth is blocked by the pool budget
+        // the subsequent alloc will return false and the caller falls back to
+        // the non-pooled `sycl::malloc_host` path.
+        if (largest < chunk_cap) {
+            largest = std::min(chunk_cap,
+                               std::max(largest,
+                                        static_cast<size_t>(ggml_sycl::pinned_chunk_pool::CHUNK_SIZE)));
         }
+        return std::min(largest, chunk_cap);
     }
 
     // Use host_max_alloc_size based on the minimum maxMemAllocSize across active
     // SYCL compute devices.  ggml's tensor allocator chunks weight buffers into
     // pieces of at most this size, each allocated via sycl::malloc_host.
     const size_t host_max  = ggml_sycl_get_host_max_alloc_size();
-    const size_t chunk_cap = ggml_backend_sycl_host_buffer_type_chunk_cap();
     if (host_max > 0) {
         return std::min(host_max, chunk_cap);
     }

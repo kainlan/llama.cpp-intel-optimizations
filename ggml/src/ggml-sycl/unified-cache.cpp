@@ -5544,57 +5544,88 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     if (!ptr && (tier == alloc_tier::HOST_PINNED || kv_spill_to_host)) {
         // Always try the pre-allocated pinned chunk pool first (lock-free path).
         if (auto * ucache = get_unified_cache_for_device(req.device)) {
-            if (req.intent.constraints.use_pinned_pool) {
-                // Route to the correct host zone based on role.  KV spills go to KV
-                // zone; permanent weight data (WEIGHT role) goes to WEIGHT zone so it
-                // is never recycled by STAGING zone resets; everything else (ephemeral
-                // per-graph activation staging) stays in STAGING.
-                host_zone_id pool_zone = host_zone_id::STAGING;
+            // Route to the correct host zone based on role.  KV spills go to KV
+            // zone; permanent weight data (WEIGHT role) goes to WEIGHT zone so
+            // it is never recycled by STAGING zone resets; everything else
+            // (ephemeral per-graph activation staging) stays in STAGING.
+            auto select_zone = [&]() {
                 if (kv_spill_to_host || req.intent.role == alloc_role::KV) {
-                    pool_zone = host_zone_id::KV;
-                } else if (req.intent.role == alloc_role::WEIGHT) {
-                    pool_zone = host_zone_id::WEIGHT;
+                    return host_zone_id::KV;
                 }
-                // Use segmented allocation for large requests - transparently handles
-                // allocations larger than the chunk size (8GB).
-                segmented_buffer segs =
-                    ucache->host_zone_alloc_segmented(pool_zone, alloc_size, pinned_chunk_pool::DEFAULT_ALIGNMENT);
-                if (!segs.segments.empty()) {
-                    ptr               = segs.segments[0].ptr;
-                    // Store all segments in the handle for proper cleanup
-                    out->all_segments = std::move(segs.segments);
+                if (req.intent.role == alloc_role::WEIGHT) {
+                    return host_zone_id::WEIGHT;
+                }
+                return host_zone_id::STAGING;
+            };
+            // CRITICAL: unified_alloc() must return a pointer whose [ptr, ptr+size)
+            // is fully mapped and contiguous in the process address space.
+            // `sycl::malloc_host` chunks are NOT guaranteed to be adjacent in
+            // virtual memory (Linux DRM render-node mappings get whatever
+            // addresses the kernel picks, with mmap guard pages in between).
+            // `pinned_chunk_pool::zone_alloc_segmented` can therefore return
+            // a vector of non-contiguous segments that span multiple chunks.
+            //
+            // Returning only segments[0].ptr while pretending the full
+            // alloc_size is contiguous (as the previous code did) silently
+            // fragments the address space: the caller writes to
+            // base + offset and lands in the unmapped gap between chunks,
+            // which manifests as CPU-backend SIGSEGV during mul_mat_id.
+            //
+            // Fix: use the single-segment-contiguous `zone_alloc`. If the
+            // zone cannot satisfy the request contiguously, grow the zone by
+            // one chunk (or more, capped by budget) and retry. If growth is
+            // blocked (phase gate or budget exhausted), fail cleanly so the
+            // caller can fall back through the sycl::malloc_host path below.
+            auto try_zone_alloc_contiguous = [&](host_zone_id zone) -> void * {
+                if (!ucache->host_zones_configured() && req.intent.constraints.use_pinned_pool) {
+                    // Zones not yet configured (pre-configure model-load path):
+                    // fall through to host_pool_alloc below.
+                    return nullptr;
+                }
+                void * p = ucache->host_zone_alloc(zone, alloc_size, pinned_chunk_pool::DEFAULT_ALIGNMENT);
+                if (p) {
+                    return p;
+                }
+                // Fragmentation path: the zone has enough aggregate free bytes
+                // somewhere (possibly across multiple chunks) but no single
+                // chunk has `alloc_size` contiguous. Grow the zone by at least
+                // one chunk to add a fresh TLSF arena whose `largest_free_block`
+                // covers the request, then retry.
+                const size_t largest = ucache->host_zone_largest_free_block(zone);
+                if (largest >= alloc_size) {
+                    // There IS a single-chunk free block big enough, but the
+                    // first-attempt allocation lost to a race or alignment
+                    // detail. Do not grow — return failure so the caller
+                    // surfaces the real error.
+                    return nullptr;
+                }
+                const size_t need = alloc_size - largest + pinned_chunk_pool::DEFAULT_ALIGNMENT;
+                if (!ucache->host_zone_grow(zone, need)) {
+                    return nullptr;
+                }
+                return ucache->host_zone_alloc(zone, alloc_size, pinned_chunk_pool::DEFAULT_ALIGNMENT);
+            };
+            if (req.intent.constraints.use_pinned_pool) {
+                host_zone_id pool_zone = select_zone();
+                ptr                    = try_zone_alloc_contiguous(pool_zone);
+                if (ptr) {
                     uses_pinned_pool  = true;
                     zone_managed      = true;
                     out->zone_managed = true;
                     out->host_zone    = pool_zone;
                 }
             } else if (ucache->host_zones_configured()) {
-                host_zone_id zone = host_zone_id::STAGING;
-                if (kv_spill_to_host || req.intent.role == alloc_role::KV) {
-                    zone = host_zone_id::KV;
-                } else if (req.intent.role == alloc_role::WEIGHT) {
-                    zone = host_zone_id::WEIGHT;
-                }
-                // Use segmented allocation for zone-managed allocations
-                segmented_buffer segs =
-                    ucache->host_zone_alloc_segmented(zone, alloc_size, pinned_chunk_pool::DEFAULT_ALIGNMENT);
-                if (!segs.segments.empty()) {
-                    ptr               = segs.segments[0].ptr;
-                    out->all_segments = std::move(segs.segments);
-                }
-                zone_managed = (ptr != nullptr);
+                host_zone_id zone = select_zone();
+                ptr               = try_zone_alloc_contiguous(zone);
+                zone_managed      = (ptr != nullptr);
                 if (zone_managed) {
                     out->zone_managed = true;
-                    host_zone_id hz   = host_zone_id::STAGING;
-                    if (kv_spill_to_host || req.intent.role == alloc_role::KV) {
-                        hz = host_zone_id::KV;
-                    } else if (req.intent.role == alloc_role::WEIGHT) {
-                        hz = host_zone_id::WEIGHT;
-                    }
-                    out->host_zone = hz;
+                    out->host_zone    = zone;
                 }
             } else {
-                // Fallback: direct runtime allocation (may fail for large requests)
+                // Zones not configured: direct runtime allocation.  host_pool_alloc
+                // is itself backed by a single-chunk TLSF and returns nullptr
+                // rather than spanning chunks.
                 ptr = ucache->host_pool_alloc(alloc_size, pinned_chunk_pool::DEFAULT_ALIGNMENT);
             }
             uses_pinned_pool = (ptr != nullptr);
@@ -7866,6 +7897,20 @@ size_t unified_cache::host_zone_capacity(host_zone_id zone) const {
     return host_arena_->zone_capacity(zone);
 }
 
+size_t unified_cache::host_zone_largest_free_block(host_zone_id zone) const {
+    if (!host_arena_ || !host_arena_->zones_configured()) {
+        return 0;
+    }
+    return host_arena_->zone_largest_free_block(zone);
+}
+
+bool unified_cache::host_zone_grow(host_zone_id zone, size_t additional_bytes) {
+    if (!host_arena_ || !host_arena_->zones_configured() || additional_bytes == 0) {
+        return false;
+    }
+    return host_arena_->grow_zone(zone, additional_bytes);
+}
+
 void unified_cache::configure_host_zones(size_t weight_bytes,
                                          size_t kv_bytes,
                                          size_t staging_bytes,
@@ -8688,6 +8733,11 @@ size_t unified_cache_host_zone_used(host_zone_id zone) {
 size_t unified_cache_host_zone_capacity(host_zone_id zone) {
     auto * cache = get_unified_cache_for_device(resolve_effective_device(0));
     return cache ? cache->host_zone_capacity(zone) : 0;
+}
+
+size_t unified_cache_host_zone_largest_free_block(host_zone_id zone) {
+    auto * cache = get_unified_cache_for_device(resolve_effective_device(0));
+    return cache ? cache->host_zone_largest_free_block(zone) : 0;
 }
 
 unified_cache::vram_alloc_result unified_cache_allocate_expert(int device_id, size_t size) {

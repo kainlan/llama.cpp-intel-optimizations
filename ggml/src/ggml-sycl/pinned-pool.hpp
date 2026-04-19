@@ -142,6 +142,12 @@ class pinned_chunk_pool {
     size_t zone_used(host_zone_id zone) const;
     size_t zone_capacity(host_zone_id zone) const;
 
+    // Largest single-chunk contiguous free block currently available in `zone`.
+    // Callers that need a contiguous pointer (cannot consume a fragmented
+    // multi-segment allocation) use this to decide how large a single
+    // allocation they can safely request.
+    size_t zone_largest_free_block(host_zone_id zone) const;
+
     // Grow a zone by allocating additional chunks and extending the zone's span.
     // Used when compute buffer needs exceed the initially planned SCRATCH zone.
     // Returns true if the zone was successfully grown.

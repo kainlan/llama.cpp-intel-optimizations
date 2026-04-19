@@ -1621,6 +1621,14 @@ class unified_cache {
     void   host_zone_free(host_zone_id zone, void * ptr);
     size_t host_zone_used(host_zone_id zone) const;
     size_t host_zone_capacity(host_zone_id zone) const;
+    // Largest single-chunk contiguous free block in `zone`. Used by callers
+    // that must hand out a contiguous pointer (the SYCL host buffer type)
+    // and therefore cannot consume a fragmented multi-segment allocation.
+    size_t host_zone_largest_free_block(host_zone_id zone) const;
+    // Grow the given host zone by `additional_bytes`. Returns false when the
+    // phase gate or pool budget blocks growth. Callers should treat a false
+    // return as a hard failure and fall back to non-pinned allocation.
+    bool   host_zone_grow(host_zone_id zone, size_t additional_bytes);
     void   configure_host_zones(size_t weight_bytes, size_t kv_bytes, size_t staging_bytes, size_t scratch_bytes);
     bool   host_zones_configured() const;
     void   grow_scratch_zone(size_t additional_bytes);
@@ -2689,6 +2697,7 @@ void unified_cache_zone_free(int device_id, vram_zone_id zone, void * ptr);
 void   unified_cache_zone_reset(int device_id, vram_zone_id zone);
 size_t unified_cache_host_zone_used(host_zone_id zone);
 size_t unified_cache_host_zone_capacity(host_zone_id zone);
+size_t unified_cache_host_zone_largest_free_block(host_zone_id zone);
 
 // Allocate from expert budget (or host fallback).
 unified_cache::vram_alloc_result unified_cache_allocate_expert(int device_id, size_t size);

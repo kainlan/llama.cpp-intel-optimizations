@@ -520,6 +520,28 @@ size_t pinned_chunk_pool::zone_capacity(host_zone_id zone) const {
     return zones_[zi].size;
 }
 
+// Return the largest single-chunk contiguous free block currently available in
+// the given zone.  Used by callers that must hand out a contiguous pointer and
+// therefore cannot consume a cross-chunk (fragmented) allocation.
+size_t pinned_chunk_pool::zone_largest_free_block(host_zone_id zone) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const size_t zi = static_cast<size_t>(zone);
+    if (zi >= static_cast<size_t>(host_zone_id::COUNT) || !zones_configured_) {
+        return 0;
+    }
+    size_t largest = 0;
+    for (const auto & zcs : zone_allocators_[zi]) {
+        if (!zcs.allocator) {
+            continue;
+        }
+        const size_t block = zcs.allocator->largest_free_block();
+        if (block > largest) {
+            largest = block;
+        }
+    }
+    return largest;
+}
+
 bool pinned_chunk_pool::grow_zone(host_zone_id zone, size_t additional_bytes) {
     const size_t zi = static_cast<size_t>(zone);
     if (zi >= static_cast<size_t>(host_zone_id::COUNT) || !zones_configured_) {
