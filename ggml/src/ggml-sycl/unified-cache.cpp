@@ -9178,12 +9178,30 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     void * ptr        = nullptr;
     size_t alloc_size = budget_bytes;
 
+    // Minimum shared (KV+WEIGHT) zone that is worth carving out.  Below this
+    // the arena is useless for weight/KV storage and only aliases the tail
+    // zones on top of each other — see nryi9 rootcause.  Refuse to reserve;
+    // caller falls back to per-entry allocation via the existing path at
+    // unified_cache::unified_cache() (log line "[VRAM-ARENA] Failed on
+    // device %d, falling back to per-entry allocation").
+    constexpr size_t k_min_shared_bytes = 16ull * 1024ull * 1024ull;  // 16 MB
+
     if (alloc_size <= max_alloc_size) {
-        try {
-            ptr = sycl::malloc_device(alloc_size, queue);
-        } catch (const sycl::exception & e) {
-            GGML_LOG_WARN("[VRAM-ARENA] Single alloc (%.1f MB) failed: %s\n", alloc_size / (1024.0 * 1024.0), e.what());
-            ptr = nullptr;
+        const size_t tail_bytes = onednn_bytes + runtime_bytes + scratch_bytes;
+        if (alloc_size < tail_bytes + k_min_shared_bytes) {
+            GGML_LOG_WARN(
+                "[VRAM-ARENA] Insufficient budget for single-chunk arena: "
+                "%.1f MB < tail %.1f MB + min shared %.1f MB; refusing reservation\n",
+                alloc_size / (1024.0 * 1024.0), tail_bytes / (1024.0 * 1024.0),
+                k_min_shared_bytes / (1024.0 * 1024.0));
+        } else {
+            try {
+                ptr = sycl::malloc_device(alloc_size, queue);
+            } catch (const sycl::exception & e) {
+                GGML_LOG_WARN("[VRAM-ARENA] Single alloc (%.1f MB) failed: %s\n", alloc_size / (1024.0 * 1024.0),
+                              e.what());
+                ptr = nullptr;
+            }
         }
         if (ptr) {
             alloc_registry::instance().register_alloc(ptr, alloc_size, dev_id, alloc_type::DEVICE);
@@ -9201,8 +9219,12 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
             // sub-allocations within large sycl::malloc_device chunks.
             // oneDNN's dnnl_memory_create validates USM pointer type and
             // rejects 'unknown' pointers.
-            const size_t tail_bytes   = onednn_bytes + runtime_bytes + scratch_bytes;
-            const size_t shared_bytes = alloc_size > tail_bytes ? alloc_size - tail_bytes : 0;
+            //
+            // Invariant: alloc_size >= tail_bytes + k_min_shared_bytes
+            // (verified above) so shared_bytes > 0 here — there is no
+            // silent zero-sized KV+WEIGHT zone.
+            const size_t tail_bytes_final = onednn_bytes + runtime_bytes + scratch_bytes;
+            const size_t shared_bytes     = alloc_size - tail_bytes_final;
 
             auto & kz = arena_zones_[static_cast<int>(vram_zone_id::KV)];
             kz.start  = 0;
@@ -9260,6 +9282,24 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
                       chunk0_size / (1024.0 * 1024.0), chunk1_size / (1024.0 * 1024.0),
                       max_alloc_size / (1024.0 * 1024.0));
         return false;
+    }
+
+    // Refuse if the inner shared zone (chunk0 - tail) or the weight chunk
+    // would fall below the minimum viable size.  See nryi9 rootcause:
+    // a zero-width shared zone silently aliases tail zones and causes
+    // downstream DEVICE_LOST when weights have nowhere to live.
+    {
+        const size_t tail_bytes   = onednn_bytes + runtime_bytes + scratch_bytes;
+        const size_t kv_size_est  = chunk0_size > tail_bytes ? chunk0_size - tail_bytes : 0;
+        if (kv_size_est < k_min_shared_bytes || chunk1_size < k_min_shared_bytes) {
+            GGML_LOG_WARN(
+                "[VRAM-ARENA] Insufficient budget for 2-chunk arena: "
+                "chunk0 shared zone would be %.1f MB (need %.1f), "
+                "chunk1 (weight) would be %.1f MB (need %.1f); refusing reservation\n",
+                kv_size_est / (1024.0 * 1024.0), k_min_shared_bytes / (1024.0 * 1024.0),
+                chunk1_size / (1024.0 * 1024.0), k_min_shared_bytes / (1024.0 * 1024.0));
+            return false;
+        }
     }
 
     void * p0 = nullptr;
