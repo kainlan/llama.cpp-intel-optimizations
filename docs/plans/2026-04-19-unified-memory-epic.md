@@ -214,19 +214,60 @@ from the per-expert cache/plan query.
 **Non-goal for this phase**: other legacy booleans (`host_weights_fast`, `cpu_expert_tg_active`)
 stay for now — they can be folded into a follow-up phase once Phase 3 pattern is validated.
 
-### Phase 4 — Extend chunk-lease to registered-in-place entries
+### Phase 4 — Lease discipline at every pointer-assignment / pointer-free point
+
+**Architectural principle** (per user): SYCL backend owns the allocations AND the refcount;
+other backends get lifetime protection implicitly by the refcount held while the memory is
+"in use" (assigned to a tensor). Two complementary hook points:
+
+#### 4a — Buffer-level lease (protects CPU-backend reads for tensor lifetime)
+
+**File**: `ggml/src/ggml-sycl/ggml-sycl.cpp:17981-18053` (`ggml_backend_sycl_host_buffer_type`
+callbacks)
+
+The buffer already tracks the `alloc_handle` in `sycl_host_buf_ctx { ptr, size, alloc }`.
+Add a `mem_handle buffer_lease` field that holds a lease on the allocation for the entire
+buffer lifetime:
+
+- `alloc_buffer` (line 17999): after `unified_alloc` succeeds, call
+  `buffer_lease = mem_handle::from_chunk_ptr(ptr, device, GGML_LAYOUT_AOS, false)`.
+  If lease is DIRECT (path D — malloc_host fallback), use
+  `acquire_weight_lease(buffer_key)` instead (requires synthesizing a buffer-level cache
+  key; see design below).
+- `free_buffer` (line 17981): the `buffer_lease` field destructor runs automatically when
+  `delete ctx` executes. That releases the lease, allowing `unified_free` to actually
+  reclaim the memory.
+
+Result: while any `ggml_backend_buffer_t` holds the allocation (i.e., while any tensor is
+using `tensor->data` from it), the lease refcount is > 0 and eviction cannot free the
+memory. Protects CPU-backend reads without any CPU-backend awareness — the buffer IS the
+CPU backend's view of the memory.
+
+#### 4b — Per-entry lease on register_host_expert (defense in depth for async tasks)
 
 **File**: `ggml/src/ggml-sycl/unified-cache.cpp` — `register_host_expert` impl
 
 For entries registered without copy (Phase 2-3), acquire a `from_chunk_ptr` chunk lease on
-the registered pointer and store it in the `weight_entry`. Release at `unregister_host_expert`
-/ entry eviction. This ensures async tasks holding `from_chunk_ptr(ptr)` see a nonzero
-chunk refcount.
+the per-expert pointer, stored in the `weight_entry`. Release at `unregister_host_expert`
+/ entry eviction. This adds per-entry refcount on top of 4a's buffer-level lease.
 
-If Phase 1 audit showed `use_pinned_pool=true` routes outside `pinned_chunk_pool`, acquire
-an entry-level lease via `acquire_weight_lease(key)` instead.
+Path D fallback: if `from_chunk_ptr` returns DIRECT, use `acquire_weight_lease(key)`
+instead (per P1 audit §9 Q1 union strategy).
 
-**Gate**: `GGML_SYCL_A7L5W_INSTRUMENT=1` canary — 0 probe aborts; 20B -n 30.
+**Cumulative refcount** on the allocation = 1 (buffer lease, 4a) + N (per-expert entries,
+4b). Memory survives as long as ANY of these is held. CPU-backend reads are safe for the
+whole buffer lifetime. In-flight SYCL async tasks are safe for the entry lifetime.
+
+#### 4c — Eviction guard assert (concrete guard rail)
+
+In `evict_one` (or the WEIGHT-entry eviction site), assert that the target entry's lease
+refcount is zero before calling `unified_free`. If a WEIGHT-zone entry has lease > 0, log
+with full context (entry key, refcount value, caller pattern) and either skip the eviction
+or assert-with-detail. Any future drift that would silently free in-use memory surfaces
+loudly.
+
+**Gate**: `GGML_SYCL_A7L5W_INSTRUMENT=1` canary — 0 probe aborts on 20B -n 30. Runtime
+evict_one calls: non-zero lease refcount never reaches `unified_free`.
 
 ### Phase 5 — Remove dead `_host_req2` code path and update comments
 
