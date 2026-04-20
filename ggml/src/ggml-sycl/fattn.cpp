@@ -16,6 +16,7 @@
 #include "fattn-vec.hpp"
 #include "fattn-xmx-f16.hpp"
 #include "kv-cache-quant.hpp"
+#include "l144i-probe.hpp"
 #include "sycl-profiling.hpp"
 
 #include <atomic>
@@ -876,6 +877,34 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     const ggml_tensor * sinks      = dst->src[4];  // Attention sinks tensor (may be null)
     const ggml_tensor * q_seq_ids  = dst->src[5];  // Sequence IDs for query tokens (may be null)
     const ggml_tensor * kv_seq_ids = dst->src[6];  // Sequence IDs for KV positions (may be null)
+
+    // l144i probe: stage all inputs to fattn and log their hashes to isolate race.
+    // Proved (2026-04-20): Q/K/V/mask/sinks are bit-identical across runs; fattn
+    // OUTPUT differs.  Non-determinism is INSIDE the XMX kernel (not input staging).
+    if (::ggml_sycl::l144i::enabled() && ctx.stream() && dst && dst->name[0]) {
+        auto probe = [&](const char * site, const ggml_tensor * t) {
+            if (!t) return;
+            void * ptr = ggml_sycl_resolve_tensor_ptr(const_cast<ggml_tensor *>(t), ctx.device);
+            if (!ptr) return;
+            const std::size_t bytes = static_cast<std::size_t>(ggml_nbytes(t));
+            if (bytes == 0 || bytes > 16u * 1024u * 1024u) return;
+            std::vector<char> buf(bytes);
+            ctx.stream()->memcpy(buf.data(), ptr, bytes).wait();
+            if (t->type == GGML_TYPE_F32) {
+                GGML_SYCL_L144I_PROBE_FLOATS(site, t->name[0] ? t->name : "?", -1, -1,
+                                             reinterpret_cast<const float *>(buf.data()),
+                                             bytes / sizeof(float));
+            } else {
+                GGML_SYCL_L144I_PROBE_BYTES(site, t->name[0] ? t->name : "?", -1, -1,
+                                            buf.data(), bytes);
+            }
+        };
+        probe("fa/src0_Q", Q);
+        probe("fa/src1_K", K);
+        probe("fa/src2_V", V);
+        probe("fa/src3_mask", mask);
+        probe("fa/src4_sinks", sinks);
+    }
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32 || Q->type == GGML_TYPE_F16);
     GGML_ASSERT(K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_F8_E4M3);  // FP16 or FP8 KV cache
