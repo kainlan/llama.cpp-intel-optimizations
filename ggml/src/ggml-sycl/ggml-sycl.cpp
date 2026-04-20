@@ -36168,26 +36168,14 @@ cpu_fallback_fast:
     // This ensures CPU dispatch activates even when GGML_SYCL_MOE_HYBRID=0 if the
     // planner decided some experts should be host-pinned (e.g., MoE models that
     // don't fit entirely in VRAM).
-    // Cache per-tensor: placement plan is static after model load, so the result
-    // doesn't change between invocations for the same tensor.
-    static std::unordered_map<std::string, bool> plan_has_cpu_cache;
-    bool                                         plan_has_cpu_experts = false;
-    if (has_placement_plan && src0->name && src0->name[0] != '\0') {
+    // Direct query: placement_plan::expert_index_ is an O(1) hash map — no caller-side
+    // static cache is needed.  The static plan_has_cpu_cache map was eliminated in P6
+    // (llama.cpp-0q7dv) in favour of unified_cache::moe_tensor_has_host_experts().
+    bool plan_has_cpu_experts = false;
+    if (has_placement_plan && route_cache && src0->name && src0->name[0] != '\0') {
         const std::string tname(src0->name);
-        auto              it = plan_has_cpu_cache.find(tname);
-        if (it != plan_has_cpu_cache.end()) {
-            plan_has_cpu_experts = it->second;
-        } else {
-            const int64_t n_exp      = src0->ne[2] > 0 ? src0->ne[2] : 1;
-            auto &        route_plan = route_cache->get_placement_plan();
-            for (int64_t e = 0; e < n_exp; ++e) {
-                if (!route_plan.expert_on_device(tname, static_cast<int>(e), ctx.device)) {
-                    plan_has_cpu_experts = true;
-                    break;
-                }
-            }
-            plan_has_cpu_cache[tname] = plan_has_cpu_experts;
-        }
+        const int64_t     n_exp = src0->ne[2] > 0 ? src0->ne[2] : 1;
+        plan_has_cpu_experts    = route_cache->moe_tensor_has_host_experts(tname, n_exp, ctx.device);
     }
     const bool plan_hybrid = plan_has_cpu_experts && cpu_type_ok;
     if (plan_hybrid && !moe_hybrid_active) {

@@ -340,6 +340,19 @@ struct placement_plan {
         return true;
     }
 
+    // Returns true if any expert of the given MoE tensor is planned for host (not device).
+    // Replaces the static plan_has_cpu_cache map in ggml_sycl_mul_mat_id: the expert_index_
+    // already provides O(1) per-expert lookup, so a separate memoization layer is redundant.
+    // device_id: if >= 0, checks residency for that specific device; -1 checks any device.
+    bool has_host_experts(const std::string & tensor_name, int64_t n_experts, int device_id = -1) const {
+        for (int64_t e = 0; e < n_experts; ++e) {
+            if (!expert_on_device(tensor_name, static_cast<int>(e), device_id)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // Build the name->index lookup after entries are populated.
     void build_index() {
         name_index_.clear();
@@ -1361,6 +1374,17 @@ class unified_cache {
     }
 
     bool has_placement_plan() const { return has_placement_plan_; }
+
+    // Returns true if any expert of a MoE tensor is planned for host memory on device_id.
+    // Replaces ad-hoc static cache maps in dispatch code: placement_plan::expert_index_ is
+    // already O(1) per lookup, so no caller-side memoization is needed.
+    bool moe_tensor_has_host_experts(const std::string & tensor_name, int64_t n_experts,
+                                     int device_id = -1) const {
+        if (!has_placement_plan_) {
+            return false;  // No plan → all experts are device-resident (default)
+        }
+        return placement_plan_.has_host_experts(tensor_name, n_experts, device_id);
+    }
 
     const placement_plan & get_placement_plan() const { return placement_plan_; }
 
