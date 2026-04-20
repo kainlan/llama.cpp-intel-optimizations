@@ -65,6 +65,7 @@
 #include "ggml-impl.h"
 #include "ggml-sycl.h"
 #include "ggml-sycl/a7l5w-probe.hpp"
+#include "ggml-sycl/l144i-probe.hpp"
 #include "ggml-sycl/add-id.hpp"
 #include "ggml-sycl/alloc-registry.hpp"
 #include "ggml-sycl/backend.hpp"
@@ -33969,6 +33970,34 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
+    // llama.cpp-l144i probe: stage src1 activation to host and hash.  Runs only
+    // when GGML_SYCL_L144I_PROBE=1 (default OFF — probe cost is 1 D2H memcpy +
+    // queue drain per MUL_MAT_ID).  Catches non-determinism introduced by prior
+    // ops: if the hash differs across runs for the same (layer, tensor, idx)
+    // triple, the race is UPSTREAM of MUL_MAT_ID entry.
+    if (::ggml_sycl::l144i::enabled() && src1 && ctx.stream()) {
+        const void * src1_resolved = ggml_sycl_resolve_tensor_ptr(src1, ctx.device);
+        int layer_probe = src0 && src0->name ? parse_layer_id_from_name(src0->name) : -1;
+        if (src1_resolved) {
+            const std::size_t bytes_probe = static_cast<std::size_t>(ggml_nbytes(src1));
+            std::vector<char> probe_buf(bytes_probe);
+            ctx.stream()->memcpy(probe_buf.data(), src1_resolved, bytes_probe).wait();
+            if (src1->type == GGML_TYPE_F32) {
+                GGML_SYCL_L144I_PROBE_FLOATS("mmi/src1_entry",
+                                               src0 ? src0->name : "(null)",
+                                               -1, layer_probe,
+                                               reinterpret_cast<const float *>(probe_buf.data()),
+                                               bytes_probe / sizeof(float));
+            } else {
+                GGML_SYCL_L144I_PROBE_BYTES("mmi/src1_entry",
+                                              src0 ? src0->name : "(null)",
+                                              -1, layer_probe,
+                                              probe_buf.data(),
+                                              bytes_probe);
+            }
+        }
+    }
+
     // MoE profiling: instrument entry with layer ID from tensor name
     if (g_moe_profile_enabled) {
         const int prof_layer = parse_layer_id_from_name(src0->name ? src0->name : "");
@@ -35671,7 +35700,23 @@ cpu_fallback_fast:
                     act_d2h_evt.wait();
                     act_d2h_pending = false;
                 }
+                // llama.cpp-l144i probe: hash the activation AND per-expert weight
+                // pointers BEFORE compute to correlate non-determinism sources.
+                GGML_SYCL_L144I_PROBE_FLOATS("cputg/act_before_compute",
+                                              src0->name, -1, layer_id_fast,
+                                              act_host_ptr, static_cast<size_t>(K));
+                for (int ti = 0; ti < n_tasks; ti++) {
+                    GGML_SYCL_L144I_PROBE_SCALAR("cputg/task_ptrs",
+                                                   src0->name, -1, layer_id_fast,
+                                                   "weight_host",
+                                                   (long long) tasks_ptr[ti].weight_host);
+                }
                 ggml_sycl_cpu_expert_mul_mat_batched(tasks_ptr, n_tasks);
+                // llama.cpp-l144i probe: hash the CPU compute output before scatter.
+                GGML_SYCL_L144I_PROBE_FLOATS("cputg/out_after_compute",
+                                              src0->name, -1, layer_id_fast,
+                                              tl_out_pinned.as<float>(),
+                                              n_cpu * static_cast<size_t>(N));
 
                 // Renormalize non-skipped expert outputs so the downstream
                 // weighted sum preserves the original magnitude.
@@ -39265,6 +39310,34 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
     // meaningless — graphs submit as a single unit.
     if (g_ggml_sycl_safe_mode) {
         ctx.stream()->wait();
+    }
+
+    // llama.cpp-l144i probe: at compute_forward EXIT, stage dst device bytes
+    // and log hash.  Drains the stream to ensure the kernel wrote the bytes
+    // we are about to read.  Gate-only — default OFF.
+    if (::ggml_sycl::l144i::enabled() && dst && ctx.stream()) {
+        void * dst_resolved = ggml_sycl_resolve_tensor_ptr(dst, ctx.device);
+        if (dst_resolved) {
+            const std::size_t bytes_probe = static_cast<std::size_t>(ggml_nbytes(dst));
+            if (bytes_probe > 0 && bytes_probe <= 16u * 1024u * 1024u) {
+                std::vector<char> probe_buf(bytes_probe);
+                ctx.stream()->memcpy(probe_buf.data(), dst_resolved, bytes_probe).wait();
+                int layer_probe = dst->name[0] ? parse_layer_id_from_name(dst->name) : -1;
+                if (dst->type == GGML_TYPE_F32) {
+                    GGML_SYCL_L144I_PROBE_FLOATS("cf/dst_exit",
+                                                   dst->name[0] ? dst->name : ggml_op_name(dst->op),
+                                                   -1, layer_probe,
+                                                   reinterpret_cast<const float *>(probe_buf.data()),
+                                                   bytes_probe / sizeof(float));
+                } else {
+                    GGML_SYCL_L144I_PROBE_BYTES("cf/dst_exit",
+                                                  dst->name[0] ? dst->name : ggml_op_name(dst->op),
+                                                  -1, layer_probe,
+                                                  probe_buf.data(),
+                                                  bytes_probe);
+                }
+            }
+        }
     }
 
     return true;
