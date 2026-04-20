@@ -672,6 +672,14 @@ struct weight_entry {
     size_t           size     = 0;
     ggml_layout_mode layout   = GGML_LAYOUT_AOS;
     cache_location   location = cache_location::DEVICE;
+    // llama.cpp-pxvih 4b: per-entry chunk lease (defense in depth).
+    // Holds a CHUNK_LEASE mem_handle for the underlying pinned-pool chunk so
+    // the chunk cannot be sycl::free'd while any host expert entry references
+    // memory within it.  Stacks with the buffer-level lease from 4a.
+    // unique_ptr used to avoid a circular include (mem_handle is forward-
+    // declared here; full type available in unified-cache.cpp via mem-handle.hpp).
+    // nullptr for DEVICE-location entries or mmap-backed pointers (DIRECT).
+    std::unique_ptr<mem_handle> entry_lease;
 };
 
 struct direct_stage_result {

@@ -1987,7 +1987,7 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
     // 4. Store in lookup table (keyed by full cache_id for collision safety)
     {
         std::unique_lock<std::shared_mutex> lock(direct_stage_mutex_);
-        direct_weight_entries_[key] = weight_entry{ ptr, dst_size, layout, cache_location::DEVICE };
+        direct_weight_entries_[key] = weight_entry{ ptr, dst_size, layout, cache_location::DEVICE, nullptr };
     }
 
     result.ptr   = ptr;
@@ -2050,7 +2050,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
 
         {
             std::unique_lock<std::shared_mutex> lock(direct_stage_mutex_);
-            direct_expert_entries_[key] = weight_entry{ host_ptr, src_size, GGML_LAYOUT_AOS, loc };
+            direct_expert_entries_[key] = weight_entry{ host_ptr, src_size, GGML_LAYOUT_AOS, loc, nullptr };
         }
         result.ptr = host_ptr;
         result.ok  = true;
@@ -2077,7 +2077,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
     // 4. Store in lookup table (keyed by full cache_id for collision safety)
     {
         std::unique_lock<std::shared_mutex> lock(direct_stage_mutex_);
-        direct_expert_entries_[key] = weight_entry{ ptr, dst_size, layout, cache_location::DEVICE };
+        direct_expert_entries_[key] = weight_entry{ ptr, dst_size, layout, cache_location::DEVICE, nullptr };
     }
 
     result.ptr   = ptr;
@@ -2106,12 +2106,23 @@ const weight_entry * unified_cache::lookup_expert(ggml_sycl_cache_id key) const 
 
 void unified_cache::register_host_expert(ggml_sycl_cache_id key, void * ptr, size_t size, ggml_layout_mode layout) {
     std::unique_lock<std::shared_mutex> lock(direct_stage_mutex_);
-    direct_expert_entries_[key] = weight_entry{ ptr, size, layout, cache_location::HOST_PINNED };
+    weight_entry entry{ ptr, size, layout, cache_location::HOST_PINNED, nullptr };
+    // llama.cpp-pxvih 4b: per-entry chunk lease (defense in depth).
+    // Acquire a CHUNK_LEASE on the pinned-pool chunk containing `ptr` so that
+    // the chunk cannot be sycl::free'd while this expert entry is registered.
+    // from_chunk_ptr returns DIRECT (no-op) for mmap/external pointers that
+    // are not inside any arena chunk — correct, since those are never pool-freed.
+    // The lease stacks with the buffer-level lease from 4a: eviction requires
+    // both the buffer refcount and all per-entry refcounts to reach zero.
+    const int dev = ggml_sycl_get_device_id_from_queue(queue_);
+    entry.entry_lease = std::make_unique<mem_handle>(
+        mem_handle::from_chunk_ptr(ptr, dev, GGML_LAYOUT_AOS, false));
+    direct_expert_entries_[key] = std::move(entry);
 }
 
 void unified_cache::register_host_weight(ggml_sycl_cache_id key, void * ptr, size_t size, ggml_layout_mode layout) {
     std::unique_lock<std::shared_mutex> lock(direct_stage_mutex_);
-    direct_weight_entries_[key] = weight_entry{ ptr, size, layout, cache_location::HOST_PINNED };
+    direct_weight_entries_[key] = weight_entry{ ptr, size, layout, cache_location::HOST_PINNED, nullptr };
 }
 
 bool unified_cache::is_cached(const ggml_sycl_cache_id & key_id, ggml_layout_mode layout) const {
@@ -3742,6 +3753,25 @@ size_t unified_cache::evict_one(size_t /* new_size */) {
     size_t evicted_bytes = 0;
     auto   it            = entries_.find(evict_key);
     if (it != entries_.end()) {
+        // llama.cpp-pxvih 4c: eviction guard assert.
+        // The scan loop above already skips entries with in_use_count > 0, so
+        // reaching here with a live lease is a bug — it means an evictor path
+        // bypassed the scan (e.g. via a direct erase) or a lease was acquired
+        // without holding rw_mutex_.  Log with full detail and skip instead of
+        // silently producing a UAF.
+        const uint32_t live_leases = it->second.in_use_count.load();
+        if (live_leases > 0) {
+            GGML_LOG_ERROR(
+                "[UNIFIED-CACHE] BUG: evict_one reached free path with live leases "
+                "(model=%llu name_hash=0x%llx layout=%d in_use=%u size=%zu) — "
+                "skipping to prevent UAF.  This is a bug; please report.\n",
+                (unsigned long long) evict_key.id.model_id, (unsigned long long) evict_key.id.name_hash,
+                (int) it->second.layout, live_leases, it->second.size);
+            GGML_ASSERT(live_leases == 0 &&
+                        "evict_one: attempted to free a WEIGHT entry with outstanding mem_handle leases");
+            return 0;  // Unreachable if GGML_ASSERT aborts; fallback if asserts disabled.
+        }
+
         size_t entry_size    = it->second.size;
         void * ptr           = it->second.device_ptr;
         bool   host_resident = it->second.host_resident;

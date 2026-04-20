@@ -17864,6 +17864,16 @@ struct sycl_host_buf_ctx {
     void *                  ptr;
     size_t                  size;
     ggml_sycl::alloc_handle alloc;
+    // llama.cpp-pxvih 4a: buffer-level chunk lease.  Held for the entire
+    // lifetime of this buffer object, released in free_buffer before
+    // unified_free.  Prevents the underlying pinned-pool chunk from being
+    // sycl::free'd while any tensor->data pointer derived from this buffer
+    // is still live (e.g. while CPU-backend ops read host expert weights).
+    // from_chunk_ptr returns CHUNK_LEASE for pool-backed paths (A/B/C) and
+    // a no-op DIRECT handle for direct sycl::malloc_host (path D) — both
+    // cases are safe: path D memory is owned exclusively by alloc and freed
+    // by unified_free below.
+    ggml_sycl::mem_handle   buffer_lease;
 };
 
 static void ggml_backend_sycl_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
@@ -17928,9 +17938,17 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggm
     }
     GGML_SYCL_DEBUG("[SYCL] Host buffer alloc: %.1f MB via unified-cache\n", size / (1024.0f * 1024.0f));
 
+    // llama.cpp-pxvih 4a: acquire buffer-level chunk lease so the backing
+    // pinned-pool chunk cannot be sycl::free'd while this buffer is alive.
+    // from_chunk_ptr returns CHUNK_LEASE for pool paths (A/B/C) and a no-op
+    // DIRECT handle for path D (direct sycl::malloc_host), which is correct —
+    // path D memory is owned exclusively by `alloc` and is freed by unified_free.
+    ggml_sycl::mem_handle buffer_lease =
+        ggml_sycl::mem_handle::from_chunk_ptr(ptr, req.device, GGML_LAYOUT_AOS, false);
+
     // Use the wrapper struct as buffer context so free_buffer knows which
     // deallocation path to take.  Override get_base to extract the raw pointer.
-    auto *                ctx    = new sycl_host_buf_ctx{ ptr, size, alloc };
+    auto * ctx = new sycl_host_buf_ctx{ ptr, size, alloc, std::move(buffer_lease) };
     ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
 
     buffer->buft              = buft;
