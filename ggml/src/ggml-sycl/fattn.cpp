@@ -752,6 +752,15 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
     if (safe_decode) {
         use_xmx = false;
     }
+    {
+        static const bool force_no_xmx = []() {
+            const char * env = std::getenv("GGML_SYCL_FA_NO_XMX");
+            return env && std::atoi(env) != 0;
+        }();
+        if (force_no_xmx) {
+            use_xmx = false;
+        }
+    }
 
     // ESIMD kernel dispatch (uses explicit SIMD operations)
     // - Single query (ne01 <= 1): +7% speedup for decode on Mistral 7B
