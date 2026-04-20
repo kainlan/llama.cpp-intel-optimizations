@@ -17865,14 +17865,15 @@ struct sycl_host_buf_ctx {
     size_t                  size;
     ggml_sycl::alloc_handle alloc;
     // llama.cpp-pxvih 4a: buffer-level chunk lease.  Held for the entire
-    // lifetime of this buffer object, released in free_buffer before
-    // unified_free.  Prevents the underlying pinned-pool chunk from being
-    // sycl::free'd while any tensor->data pointer derived from this buffer
-    // is still live (e.g. while CPU-backend ops read host expert weights).
+    // lifetime of this buffer object.  Prevents the underlying pinned-pool
+    // chunk from being sycl::free'd while any tensor->data pointer derived
+    // from this buffer is still live (e.g. while CPU-backend ops read host
+    // expert weights).  free_buffer calls unified_free(alloc) first, then
+    // delete ctx, which destructs buffer_lease and drops the refcount.
     // from_chunk_ptr returns CHUNK_LEASE for pool-backed paths (A/B/C) and
     // a no-op DIRECT handle for direct sycl::malloc_host (path D) — both
     // cases are safe: path D memory is owned exclusively by alloc and freed
-    // by unified_free below.
+    // by unified_free.
     ggml_sycl::mem_handle   buffer_lease;
 };
 
