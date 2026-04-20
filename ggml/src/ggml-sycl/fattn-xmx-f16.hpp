@@ -100,6 +100,18 @@ inline int64_t paged_kv_offset(
 // Debug flag - set to 1 to enable debug output
 #define FATTN_XMX_DEBUG 0
 
+// l144i kernel-printf diagnostic gate (bead: llama.cpp-l144i).
+// When enabled, one (sg=0, thread=0) slot of work-group 0 prints the first
+// 16 halfs of tile_S and tile_V fed into the Phase 4 joint_matrix_mad and
+// the first 8 floats of mat_SV stored back to SV_acc.  Two identical runs
+// that diverge only in MAD output prove joint_matrix_mad is non-deterministic
+// on Intel Arc B580 for this shape.
+// Compile-time only: -DGGML_SYCL_L144I_KPRINT=1 at build time.
+// Default OFF.  Adds zero cost when OFF.
+#ifndef GGML_SYCL_L144I_KPRINT
+#define GGML_SYCL_L144I_KPRINT 0
+#endif
+
 // Intel Arc XMX tile dimensions (verified working)
 constexpr int XMX_TM = 8;    // Tile rows (queries per XMX op)
 constexpr int XMX_TN = 16;   // Tile cols (KV positions per XMX op)
@@ -1022,6 +1034,45 @@ static void flash_attn_xmx_f16_kernel(
                     &tile_V[k_start * V_STRIDE + d_start]),
                 V_STRIDE);
 
+#if GGML_SYCL_L144I_KPRINT
+            // l144i diagnostic: pre-MAD input dump for the canonical (work_id=0,
+            // sg lane 0, work-group 0, first iter) slot.  Reads the exact SLM
+            // memory that joint_matrix_load consumed — any run-to-run difference
+            // here means the race is UPSTREAM of Phase 4.  Identical values in
+            // two runs while the Post-MAD hash differs → joint_matrix_mad itself
+            // is non-deterministic.
+            if (head == 0 && work_id == 0 && sg.get_local_linear_id() == 0 &&
+                ic0 == 0 && kv_start == kv_loop_start) {
+                // First row of tile_S (Q-row 0, all 16 K-reduction lanes).
+                const sycl::half * s_row = &tile_S[0 * S_STRIDE + k_start];
+                // First row of tile_V (K-reduction row 0, first 16 D lanes).
+                const sycl::half * v_row = &tile_V[k_start * V_STRIDE + d_start];
+                sycl::ext::oneapi::experimental::printf(
+                    "[L144I-K] PRE-MAD ic0=%d kv_start=%d work_id=%d d_start=%d k_start=%d "
+                    "tile_S[0..15]=%.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f "
+                    "%.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f "
+                    "tile_V[0..15]=%.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f "
+                    "%.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
+                    ic0, kv_start, work_id, d_start, k_start,
+                    (double)(float)s_row[0],  (double)(float)s_row[1],
+                    (double)(float)s_row[2],  (double)(float)s_row[3],
+                    (double)(float)s_row[4],  (double)(float)s_row[5],
+                    (double)(float)s_row[6],  (double)(float)s_row[7],
+                    (double)(float)s_row[8],  (double)(float)s_row[9],
+                    (double)(float)s_row[10], (double)(float)s_row[11],
+                    (double)(float)s_row[12], (double)(float)s_row[13],
+                    (double)(float)s_row[14], (double)(float)s_row[15],
+                    (double)(float)v_row[0],  (double)(float)v_row[1],
+                    (double)(float)v_row[2],  (double)(float)v_row[3],
+                    (double)(float)v_row[4],  (double)(float)v_row[5],
+                    (double)(float)v_row[6],  (double)(float)v_row[7],
+                    (double)(float)v_row[8],  (double)(float)v_row[9],
+                    (double)(float)v_row[10], (double)(float)v_row[11],
+                    (double)(float)v_row[12], (double)(float)v_row[13],
+                    (double)(float)v_row[14], (double)(float)v_row[15]);
+            }
+#endif
+
             // Compute: SV = S @ V
             sycl_xmx::joint_matrix_mad(sg, mat_SV, mat_S, mat_V, mat_SV);
 
@@ -1033,6 +1084,24 @@ static void flash_attn_xmx_f16_kernel(
                     sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
                         &SV_acc[partial_offset + d_start]),
                     D, sycl_xmx::layout::row_major);
+#if GGML_SYCL_L144I_KPRINT
+                // l144i diagnostic: post-MAD output dump.  A sub-group barrier
+                // ensures the joint_matrix_store to SLM has completed before any
+                // lane reads back.  Reading from the canonical slot (work_id=0,
+                // sg lane 0, first iter).  If PRE-MAD inputs matched run-to-run
+                // but these floats differ → joint_matrix_mad is non-deterministic.
+                sycl::group_barrier(sg);
+                if (head == 0 && work_id == 0 && sg.get_local_linear_id() == 0 &&
+                    ic0 == 0 && kv_start == kv_loop_start) {
+                    const float * sv = &SV_acc[partial_offset + d_start];
+                    sycl::ext::oneapi::experimental::printf(
+                        "[L144I-K] POST-MAD ic0=%d kv_start=%d work_id=%d d_start=%d k_start=%d "
+                        "SV_acc[0..7]=%.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+                        ic0, kv_start, work_id, d_start, k_start,
+                        (double)sv[0], (double)sv[1], (double)sv[2], (double)sv[3],
+                        (double)sv[4], (double)sv[5], (double)sv[6], (double)sv[7]);
+                }
+#endif
             } else {
                 // No reduction needed - each sub-group handles full K reduction
                 // This path is taken when D_TILES >= XMX_N_SG (D >= 512, unlikely)
@@ -1041,6 +1110,19 @@ static void flash_attn_xmx_f16_kernel(
                     sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
                         &SV_acc[d_start]),
                     D, sycl_xmx::layout::row_major);
+#if GGML_SYCL_L144I_KPRINT
+                sycl::group_barrier(sg);
+                if (head == 0 && work_id == 0 && sg.get_local_linear_id() == 0 &&
+                    ic0 == 0 && kv_start == kv_loop_start) {
+                    const float * sv = &SV_acc[d_start];
+                    sycl::ext::oneapi::experimental::printf(
+                        "[L144I-K] POST-MAD-NR ic0=%d kv_start=%d work_id=%d d_start=%d k_start=%d "
+                        "SV_acc[0..7]=%.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+                        ic0, kv_start, work_id, d_start, k_start,
+                        (double)sv[0], (double)sv[1], (double)sv[2], (double)sv[3],
+                        (double)sv[4], (double)sv[5], (double)sv[6], (double)sv[7]);
+                }
+#endif
             }
         }
 
