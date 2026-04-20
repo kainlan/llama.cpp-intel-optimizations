@@ -51085,8 +51085,6 @@ static int ggml_sycl_extract_planned_layer_id(const ggml_tensor * op) {
     return -1;
 }
 
-static bool ggml_sycl_weight_executes_on_host(const ggml_tensor * tensor, int device);
-
 static bool ggml_sycl_tensor_has_moe_routing_hint(const ggml_tensor * tensor, int depth = 0) {
     if (!tensor || depth > 2) {
         return false;
