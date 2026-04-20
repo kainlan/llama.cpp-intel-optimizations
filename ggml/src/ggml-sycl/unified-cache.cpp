@@ -2315,8 +2315,10 @@ void * unified_cache::allocate_slot(const ggml_sycl_cache_id & key,
         entries_.erase(it);
     }
 
-    // Check VRAM budget and evict if needed
-    const bool skip_pool     = ggml_backend_sycl_all_weights_host();
+    // Check VRAM budget and evict if needed.
+    // Skip the legacy layout_pool_ when the cache has a placement plan: the arena manages
+    // all VRAM allocations in that mode, making pool sub-allocation redundant.
+    const bool skip_pool     = has_placement_plan();
     bool       is_pool_alloc = false;
     void *     device_ptr    = nullptr;
 

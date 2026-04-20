@@ -912,10 +912,10 @@ struct moe_warmup_state {
     void init(int nl, int ne) {
         n_layers  = std::min(nl, MOE_MAX_LAYERS);
         n_experts = std::min(ne, MOE_MAX_EXPERTS);
-        // S1 mode (all weights on host): default to gate norms instead of
-        // inference-based profiling.  Gate norms take ~100-200ms vs 5-10s
-        // for synthetic inference, with comparable cache hit rates.
-        if (ggml_backend_sycl_all_weights_host()) {
+        // Unified cache path: default to gate norms instead of inference-based profiling.
+        // Gate norms take ~100-200ms vs 5-10s for synthetic inference, with comparable
+        // cache hit rates. Skip inference profiling when unified cache manages placement.
+        if (ggml_sycl::unified_cache_enabled()) {
             warmup_tokens = 0;  // Use gate norms, skip inference profiling
         }
         // Read env var for warmup token count (0 = skip warmup, use gate norms).
@@ -1569,22 +1569,20 @@ static void moe_prestage_popular_experts() {
     }
 
     // Phase 1: Pre-stage popular experts to GPU0 VRAM.
-    // In S1 mode (all_weights_host), the S1-PRELOAD fills VRAM with AOS copies of
-    // dense weights — available_for_compute() may return 0.  But these AOS entries
-    // are evictable: the cache does LRU eviction internally.  Use total
-    // managed cache capacity MINUS a compute reserve as the budget so hot SOA experts
-    // can replace cold AOS entries while leaving room for compute buffers, KV cache,
-    // and other runtime allocations that will be reserved after prestage.
+    // S1-PRELOAD fills VRAM with AOS copies of dense weights —
+    // available_for_compute() may return 0.  But these AOS entries are evictable:
+    // the cache does LRU eviction internally.  Use total managed cache capacity MINUS
+    // a compute reserve as the budget so hot SOA experts can replace cold AOS entries
+    // while leaving room for compute buffers, KV cache, and other runtime allocations
+    // that will be reserved after prestage.
     // Without this reserve, prestage fills ALL VRAM and later runtime reservations
     // trigger "Budget exceeded" when update_reserved_bytes shrinks the budget.
-    // For non-S1 mode, use the conservative available_for_compute() budget.
-    const int                  device    = 0;
-    ggml_sycl::unified_cache * cache     = ggml_sycl::get_unified_cache_for_device(device);
-    const bool                 s1_active = ggml_backend_sycl_all_weights_host();
+    const int                  device = 0;
+    ggml_sycl::unified_cache * cache  = ggml_sycl::get_unified_cache_for_device(device);
     size_t                     avail;
-    if (s1_active && cache) {
-        // S1 mode: AOS entries are evictable — use total managed capacity minus
-        // compute reserve and runtime reservations (KV cache, compute buffers).
+    if (cache) {
+        // AOS entries are evictable — use total managed capacity minus compute reserve
+        // and runtime reservations (KV cache, compute buffers).
         // Runtime bytes include device-side KV cache which must not be evicted.
         cache->unpin_experts();
         const size_t total_managed = ggml_sycl::unified_cache_total_managed(device);
@@ -1595,7 +1593,7 @@ static void moe_prestage_popular_experts() {
         const size_t total_reserve   = compute_reserve + runtime_bytes;
         avail                        = (total_managed > total_reserve) ? total_managed - total_reserve : 0;
         GGML_LOG_INFO(
-            "[MOE-PRESTAGE] S1 mode: total_managed=%zu MB, compute_reserve=%zu MB, "
+            "[MOE-PRESTAGE] total_managed=%zu MB, compute_reserve=%zu MB, "
             "runtime_reserved=%zu MB, prestage budget=%zu MB (evictable AOS entries)\n",
             total_managed >> 20, compute_reserve >> 20, runtime_bytes >> 20, avail >> 20);
     } else {
@@ -3168,6 +3166,8 @@ static uint64_t ggml_sycl_assign_cache_uuid(ggml_tensor_extra_gpu * extra);
 static bool ggml_sycl_is_device_vram_buffer(const ggml_tensor * t);
 // Forward declaration: check if tensor's weights are host-resident (defined after buffer context struct).
 static bool ggml_sycl_is_host_resident_weight(const ggml_tensor * src0, sycl::queue * stream);
+// Forward declaration: check if weight executes on host rather than GPU (defined in dispatch section).
+static bool ggml_sycl_weight_executes_on_host(const ggml_tensor * tensor, int device);
 // Forward declaration: check if blind preload should be skipped (defined in MoE preload section).
 bool        ggml_sycl_should_skip_blind_preload(int64_t n_experts);
 
@@ -4154,12 +4154,11 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
     // Expert 0 tends to be most frequently activated, so preloading low-index
     // experts gives good coverage even without runtime frequency data.
     //
-    // S1 mode skip: when all weights are host-pinned, S1-PRELOAD already cached
-    // entire MoE tensors as AOS in VRAM.  Per-expert SOA conversion here would
-    // take 10+ minutes for large MoE models (e.g. 120B with 13824 experts).
+    // Skip when unified cache is active: S1-PRELOAD already cached entire MoE tensors
+    // as AOS in VRAM.  Per-expert SOA conversion here would take 10+ minutes for large
+    // MoE models (e.g. 120B with 13824 experts).
     // The per-op dispatch converts AOS→SOA on-demand for activated experts.
-    const bool skip_phase3 = ggml_backend_sycl_all_weights_host();
-    if (device == 0 && n_experts_per_layer > 0 && !skip_phase3) {
+    if (device == 0 && n_experts_per_layer > 0 && !ggml_sycl::unified_cache_enabled()) {
         // Collect unique layer IDs from expert_list.
         std::map<int, std::vector<int>> layer_experts;  // sorted by layer ID for deterministic order
         for (const auto & info : expert_list) {
@@ -4184,8 +4183,8 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
             }
         }
         GGML_LOG_INFO("[MOE-HYBRID] Phase 3: GPU0 expert pre-loading complete (via unified cache)\n");
-    } else if (skip_phase3) {
-        GGML_LOG_INFO("[MOE-HYBRID] Phase 3: skipped — S1 mode already cached dense weights as AOS in VRAM\n");
+    } else if (ggml_sycl::unified_cache_enabled()) {
+        GGML_LOG_INFO("[MOE-HYBRID] Phase 3: skipped — unified cache already staged dense weights as AOS in VRAM\n");
     }
 
     // Initialize ExpertPredictor using top-K detected from graph ids tensor.
@@ -5571,9 +5570,6 @@ static std::unordered_map<
     weight_cache_allocator<std::pair<const ggml_sycl_weight_tensor_key, ggml_sycl_weight_tensor_cache_entry>>>
     g_sycl_weight_tensor_cache;
 
-// Forward declaration — full definition with API functions below.
-static std::atomic<bool> g_all_weights_host{ false };
-
 void ggml_backend_sycl_set_model_loading(bool loading) {
     // Depth counter tracks nesting of load_tensors → load_all_data.
     // S1 mode: only clear registry at outermost entry, only preload at outermost exit.
@@ -5586,8 +5582,9 @@ void ggml_backend_sycl_set_model_loading(bool loading) {
         const int depth = g_model_load_depth.fetch_add(1, std::memory_order_acq_rel);
         g_sycl_in_model_load.store(true, std::memory_order_release);
         ggml_sycl::offload_stats_set_phase(ggml_sycl::offload_phase::LOAD);
-        // S1: only clear on outermost entry.  Non-S1: always clear.
-        if (depth == 0 || !g_all_weights_host.load(std::memory_order_acquire)) {
+        // Only clear at outermost entry — preserve host weight registrations from
+        // load_tensors across load_all_data (nested calls increment depth).
+        if (depth == 0) {
             // Reclaim host-pinned memory from previous model's weight entries.
             // Must happen before release_host_weight_extras to free pinned pool
             // space for the new model's host buffers.
@@ -5613,8 +5610,8 @@ void ggml_backend_sycl_set_model_loading(bool loading) {
     if (prev <= 1) {
         g_model_load_depth.store(0, std::memory_order_release);  // safety clamp
     }
-    // S1: only preload on outermost exit.  Non-S1: always preload.
-    if (prev <= 1 || !g_all_weights_host.load(std::memory_order_acquire)) {
+    // Only preload on outermost exit — S1-PRELOAD runs once after all tensors are registered.
+    if (prev <= 1) {
         g_sycl_in_model_load.store(false, std::memory_order_release);
         ggml_sycl::offload_stats_set_phase(ggml_sycl::offload_phase::UNKNOWN);
 
@@ -5740,22 +5737,9 @@ bool ggml_backend_sycl_weights_evictable(void) {
         return false;
     }
 
-    // Auto mode: enable eviction only when S1 all-weights-host is active
-    // (host-pinned weights need cache-managed VRAM uploads with potential eviction).
-    // For models that fit in VRAM without S1, eviction is not needed.
-    return ggml_backend_sycl_all_weights_host();
-}
-
-// --- S1: All-weights-host mode API ---
-void ggml_backend_sycl_set_all_weights_host(void) {
-    if (g_all_weights_host.exchange(true, std::memory_order_acq_rel)) {
-        return;  // already set
-    }
-    GGML_LOG_INFO("[SYCL] all-weights-host mode: unified cache manages all VRAM uploads\n");
-}
-
-bool ggml_backend_sycl_all_weights_host(void) {
-    return g_all_weights_host.load(std::memory_order_acquire);
+    // Auto mode: enable eviction when unified cache is active.
+    // The cache manages VRAM placement for all weights; eviction is always needed.
+    return ggml_sycl::unified_cache_enabled();
 }
 
 // --- MoE expert split tracking ---
@@ -11743,13 +11727,11 @@ static void ggml_sycl_preload_model_weights() {
 
     ggml_sycl_reset_load_summary();
 
-    const bool s1_mode = g_all_weights_host.load(std::memory_order_acquire);
-
-    // S1 mode: async bulk preload with AOS layout.
+    // Async bulk preload with AOS layout.
     // All H2D copies are submitted without waiting, then a single queue.wait()
     // at the end completes all transfers.  This reduces preload time from
     // O(n * latency) to O(total_bytes / bandwidth) — e.g. 10 min → seconds.
-    if (s1_mode) {
+    {
         size_t                                    dense_cached      = 0;
         size_t                                    dense_failed      = 0;
         size_t                                    dense_host_placed = 0;  // P4: weights kept on host per placement plan
@@ -12355,87 +12337,6 @@ static void ggml_sycl_preload_model_weights() {
         }
         return;
     }
-
-    // Non-S1 path: original serial preload behavior
-    size_t dense_cached  = 0;
-    size_t dense_failed  = 0;
-    size_t moe_cached    = 0;
-    size_t moe_failed    = 0;
-    auto   preload_dense = [&](const ggml_tensor * tensor, int device) {
-        if (!tensor || !tensor->data) {
-            return false;
-        }
-        const tensor_usage usage  = ggml_sycl_get_tensor_usage(tensor);
-        layout_mode        target = layout_policy::get_with_override(tensor->type, usage, device);
-        target                    = ggml_sycl_adjust_layout_for_tensor(tensor, target, device);
-        if (target != GGML_LAYOUT_AOS && target != GGML_LAYOUT_ONEDNN_PACKED && target != GGML_LAYOUT_ONEDNN_WOQ &&
-            !ggml_sycl_reorder_enabled()) {
-            target = GGML_LAYOUT_AOS;
-        }
-        // Non-S1: prefer_host=true (original behavior) to avoid VRAM pressure during preload.
-        void * cached = ggml_sycl_get_weight_layout_ptr(tensor, device, target, true);
-        return cached != nullptr;
-    };
-    // Pass 1: dense weights (non-MoE)
-    for (const auto * tensor : weights) {
-        if (!tensor || !tensor->buffer || !tensor->data) {
-            continue;
-        }
-        // Defensive check: validate tensor looks reasonable (catch use-after-free)
-        if (tensor->type > GGML_TYPE_COUNT || tensor->ne[0] <= 0 || tensor->ne[1] <= 0) {
-            GGML_SYCL_DEBUG("[SYCL] preload_model_weights: skipping invalid tensor %p\n", (const void *) tensor);
-            continue;
-        }
-        const tensor_usage usage = ggml_sycl_get_tensor_usage(tensor);
-        if (usage == tensor_usage::MOE_EXPERT_WEIGHT) {
-            continue;
-        }
-        auto *    extra  = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
-        const int device = extra ? extra->layout.device_id : 0;
-        if (preload_dense(tensor, device)) {
-            dense_cached++;
-        } else {
-            dense_failed++;
-        }
-    }
-    // Pass 2: MoE experts
-    for (const auto * tensor : weights) {
-        if (!tensor || !tensor->buffer || !tensor->data) {
-            continue;
-        }
-        if (tensor->type > GGML_TYPE_COUNT || tensor->ne[0] <= 0 || tensor->ne[1] <= 0) {
-            continue;
-        }
-
-        const tensor_usage usage = ggml_sycl_get_tensor_usage(tensor);
-        if (usage != tensor_usage::MOE_EXPERT_WEIGHT) {
-            continue;
-        }
-        auto *    extra  = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
-        const int device = extra ? extra->layout.device_id : 0;
-
-        // Non-S1: use full layout selection (original behavior)
-        bool host_weights = tensor->buffer && ggml_backend_buffer_is_host(tensor->buffer);
-        if (!host_weights) {
-            const auto alloc = ggml_sycl_get_alloc_type(tensor->data);
-            host_weights     = (alloc != sycl::usm::alloc::device);
-        }
-
-        layout_mode target = ggml_sycl_select_moe_graph_layout(tensor, device, host_weights);
-        target             = ggml_sycl_adjust_layout_for_tensor(tensor, target, device);
-        if (target != GGML_LAYOUT_AOS && target != GGML_LAYOUT_ONEDNN_PACKED && target != GGML_LAYOUT_ONEDNN_WOQ &&
-            !ggml_sycl_reorder_enabled()) {
-            target = GGML_LAYOUT_AOS;
-        }
-        if (ggml_sycl_preload_moe_experts(tensor, device, target)) {
-            moe_cached++;
-        } else {
-            moe_failed++;
-        }
-    }
-
-    GGML_LOG_INFO("[S1-PRELOAD] dense cached=%zu failed=%zu, moe cached=%zu failed=%zu\n", dense_cached, dense_failed,
-                  moe_cached, moe_failed);
 }
 
 static bool ggml_sycl_xmx_gemm_tiled_tile_bytes(const ggml_tensor * tensor,
@@ -20798,10 +20699,10 @@ static bool ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
                     dev[i].src0_layout_ptr_source = "unified_cache_resolve";
                     src0_layout                   = resolved.layout;
                     exc_ctx.src0_layout           = resolved.layout;
-                } else if (resolved && resolved.ptr && !resolved.on_device && ggml_backend_sycl_all_weights_host() &&
+                } else if (resolved && resolved.ptr && !resolved.on_device &&
                            !ggml_sycl_planner_authoritative_residency_active(i) &&
                            !ggml_sycl_weight_is_planned_on_host(src0, i) && src0_layout == GGML_LAYOUT_AOS) {
-                    // S1 zero-copy fallback: weight is host-pinned USM but not
+                    // Zero-copy fallback: weight is host-pinned USM but not
                     // cached in VRAM (e.g. output.weight too large for cache).
                     // Host-pinned memory (sycl::malloc_host) is GPU-accessible
                     // via PCIe zero-copy — use it directly for AOS MMVQ.
@@ -27576,8 +27477,8 @@ static bool graph_preload_moe_experts(ggml_backend_sycl_context & ctx, ggml_cgra
 
     // Placement-plan model load already materializes MoE experts in VRAM or host-pinned
     // memory. Graph preload only needs pointer-table refresh, not new runtime copies.
-    if (ggml_backend_sycl_all_weights_host()) {
-        GGML_SYCL_DEBUG("[GRAPH-PRELOAD] S1 mode: skipping MoE expert preload (host-pinned zero-copy)\n");
+    if (ggml_sycl_planner_authoritative_residency_active(ctx.device)) {
+        GGML_SYCL_DEBUG("[GRAPH-PRELOAD] Planner active: skipping MoE expert preload (S1-PRELOAD handled it)\n");
         return true;
     }
     static std::atomic<int> routing_prestage_enabled{ -1 };
@@ -27881,40 +27782,29 @@ static bool graph_preload_weights(ggml_backend_sycl_context & ctx, ggml_cgraph *
                 GGML_LOG_ERROR("[GRAPH-PRELOAD-WEIGHTS] missing cache key for %s\n", src->name);
                 return false;
             }
+            // TG decode uses COALESCED/SOA (matching S1-PRELOAD), PP uses AOS (oneDNN).
+            // is_cached_any check below doesn't use target, but the preload loop does.
             layout_mode target = GGML_LAYOUT_AOS;
-            if (ggml_backend_sycl_all_weights_host()) {
-                // S1: TG decode uses COALESCED/SOA (matching S1-PRELOAD), PP uses AOS (oneDNN).
-                // is_cached_any check below doesn't use target, but the preload loop does.
-                if (is_decode && ggml_is_quantized(src->type) && ggml_sycl_supports_reorder_mmvq(src->type)) {
-                    if (is_coalesced_supported(src->type) && ggml_sycl_layout_supports_coalesced(src)) {
-                        target = GGML_LAYOUT_COALESCED;
-                    } else {
-                        target = GGML_LAYOUT_SOA;
-                    }
+            if (is_decode && ggml_is_quantized(src->type) && ggml_sycl_supports_reorder_mmvq(src->type)) {
+                if (is_coalesced_supported(src->type) && ggml_sycl_layout_supports_coalesced(src)) {
+                    target = GGML_LAYOUT_COALESCED;
                 } else {
-                    // Default is AOS for non-decode (PP/warmup), but if S1-PRELOAD
-                    // already cached this weight with a higher-priority layout
-                    // (COALESCED or SOA), use that instead.  Requesting AOS when
-                    // COALESCED is cached triggers a layout mismatch eviction in
-                    // staging, which fails with DEVICE_LOST when a
-                    // VRAM arena has consumed all device memory.
-                    target               = GGML_LAYOUT_AOS;
-                    auto * preload_cache = ggml_sycl::get_unified_cache_for_device(ctx.device);
-                    if (preload_cache && cache_key.valid) {
-                        auto wpr = preload_cache->get_weight_ptr(cache_key);
-                        if (wpr && wpr.layout != GGML_LAYOUT_AOS) {
-                            target = wpr.layout;
-                        }
-                    }
+                    target = GGML_LAYOUT_SOA;
                 }
             } else {
-                // Use resolved layout from unified cache (single source of truth).
-                auto resolved = ggml_sycl_resolve(src, ctx.device);
-                if (resolved) {
-                    target = static_cast<layout_mode>(resolved.layout);
-                } else {
-                    // No cache entry yet — use policy-derived layout.
-                    target = ggml_sycl_adjust_layout_for_tensor(src, target, ctx.device);
+                // Default is AOS for non-decode (PP/warmup), but if S1-PRELOAD
+                // already cached this weight with a higher-priority layout
+                // (COALESCED or SOA), use that instead.  Requesting AOS when
+                // COALESCED is cached triggers a layout mismatch eviction in
+                // staging, which fails with DEVICE_LOST when a
+                // VRAM arena has consumed all device memory.
+                target               = GGML_LAYOUT_AOS;
+                auto * preload_cache = ggml_sycl::get_unified_cache_for_device(ctx.device);
+                if (preload_cache && cache_key.valid) {
+                    auto wpr = preload_cache->get_weight_ptr(cache_key);
+                    if (wpr && wpr.layout != GGML_LAYOUT_AOS) {
+                        target = wpr.layout;
+                    }
                 }
             }
             auto it = target_layouts.find(cache_key);
@@ -27979,33 +27869,26 @@ static bool graph_preload_weights(ggml_backend_sycl_context & ctx, ggml_cgraph *
         // Try to evict to make room.
         cache->evict(missing_bytes - cache->available());
         if (cache->available() < missing_bytes) {
-            if (ggml_backend_sycl_all_weights_host()) {
-                // S1 mode: host-pinned pointers are stable (sycl::malloc_host doesn't move),
-                // so graph recording/replay can use them as fallback for uncached weights.
-                // But graph replay with host-pinned is slower than per-op dispatch with
-                // on-demand SOA caching. Only do partial preload when most weights are
-                // already cached — the few host-pinned fallbacks won't hurt much.
-                const size_t total_bytes   = cached_bytes + missing_bytes;
-                const bool   mostly_cached = total_bytes > 0 && cached_bytes > (total_bytes * 9 / 10);
-                if (mostly_cached) {
-                    GGML_LOG_INFO(
-                        "[GRAPH-PRELOAD-WEIGHTS] S1 mode: %.1f MB exceed %.1f MB cache, "
-                        "partial preload (%.0f%% cached, host-pinned fallback for remainder)\n",
-                        missing_bytes / (1024.0f * 1024.0f), cache->available() / (1024.0f * 1024.0f),
-                        100.0 * cached_bytes / total_bytes);
-                    // Fall through to partial preload loop below.
-                } else {
-                    GGML_LOG_INFO(
-                        "[GRAPH-PRELOAD-WEIGHTS] S1 mode: %.1f MB exceed %.1f MB cache "
-                        "(%.0f%% cached), using per-op dispatch with on-demand SOA\n",
-                        missing_bytes / (1024.0f * 1024.0f), cache->available() / (1024.0f * 1024.0f),
-                        100.0 * cached_bytes / total_bytes);
-                    return false;
-                }
+            // Host-pinned pointers are stable (sycl::malloc_host doesn't move),
+            // so graph recording/replay can use them as fallback for uncached weights.
+            // But graph replay with host-pinned is slower than per-op dispatch with
+            // on-demand SOA caching. Only do partial preload when most weights are
+            // already cached — the few host-pinned fallbacks won't hurt much.
+            const size_t total_bytes   = cached_bytes + missing_bytes;
+            const bool   mostly_cached = total_bytes > 0 && cached_bytes > (total_bytes * 9 / 10);
+            if (mostly_cached) {
+                GGML_LOG_INFO(
+                    "[GRAPH-PRELOAD-WEIGHTS] %.1f MB exceed %.1f MB cache, "
+                    "partial preload (%.0f%% cached, host-pinned fallback for remainder)\n",
+                    missing_bytes / (1024.0f * 1024.0f), cache->available() / (1024.0f * 1024.0f),
+                    100.0 * cached_bytes / total_bytes);
+                // Fall through to partial preload loop below.
             } else {
-                GGML_LOG_WARN("[GRAPH-PRELOAD-WEIGHTS] Insufficient cache space: need %.1f MB, have %.1f MB\n",
-                              missing_bytes / (1024.0f * 1024.0f), cache->available() / (1024.0f * 1024.0f));
-                ctx.weight_streaming_graphs_disabled = true;
+                GGML_LOG_INFO(
+                    "[GRAPH-PRELOAD-WEIGHTS] %.1f MB exceed %.1f MB cache "
+                    "(%.0f%% cached), using per-op dispatch with on-demand SOA\n",
+                    missing_bytes / (1024.0f * 1024.0f), cache->available() / (1024.0f * 1024.0f),
+                    100.0 * cached_bytes / total_bytes);
                 return false;
             }
         }
@@ -28024,13 +27907,8 @@ static bool graph_preload_weights(ggml_backend_sycl_context & ctx, ggml_cgraph *
             ctx.graph_pinned_entries.emplace_back(cache_key, target);
             loaded++;
         } else {
-            if (ggml_backend_sycl_all_weights_host()) {
-                // S1: skip this weight; per-op dispatch will use host-pinned AOS
-                continue;
-            }
-            GGML_LOG_WARN("[GRAPH-PRELOAD-WEIGHTS] Failed to cache weight: %s\n", weight->name);
-            ctx.weight_streaming_graphs_disabled = true;
-            return false;
+            // Skip uncached weight; per-op dispatch will use host-pinned AOS fallback.
+            continue;
         }
     }
     GGML_SYCL_DEBUG("[GRAPH-PRELOAD-WEIGHTS] Pre-loaded and pinned %zu weights\n", loaded);
@@ -30505,7 +30383,10 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
         // host pointers (DEVICE_LOST).  Also enabled via GGML_SYCL_CPU_HOST_MAT=1.
         // Skip in S1 mode: weights are host-pinned USM (GPU-accessible), and the
         // unified cache creates VRAM SOA copies for fast GPU dispatch.
-        if (!cpu_host_mat_disabled && !src0_on_device && (!ggml_backend_sycl_all_weights_host() || src0_planned_host) &&
+        // Only use CPU host-mat for placement-plan host weights: GPU cannot access
+        // non-USM host pointers (DEVICE_LOST). Weights in S1 unified cache are
+        // host-pinned USM (GPU-accessible) so GPU dispatch is preferred.
+        if (!cpu_host_mat_disabled && !src0_on_device && src0_planned_host &&
             src1->ne[1] == 1 &&               // batch=1 (TG only)
             ggml_is_quantized(src0->type) &&  // quantized weights
             src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -30674,10 +30555,10 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
             return env && std::atoi(env) == 0;
         }();
         const bool planner_active = ggml_sycl_planner_authoritative_residency_active(ctx.device);
-        // Planner-authoritative mode only allows TG fast-path on device-resident
-        // weights. Legacy S1 keeps the host-pinned zero-copy escape hatch.
-        const bool src0_gpu_accessible =
-            src0_on_device || (!planner_active && ggml_backend_sycl_all_weights_host() && !src0_planned_host);
+        // Planner-authoritative mode only allows TG fast-path on device-resident weights.
+        // Without planner, host-pinned USM weights (non-planned-host) are GPU-accessible
+        // via PCIe zero-copy for the MMVQ fast-path.
+        const bool src0_gpu_accessible = src0_on_device || (!planner_active && !src0_planned_host);
         if (!tg_fast_disabled && src0_gpu_accessible && src1->ne[1] == 1 && !fast_split &&
             ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
             !(g_sycl_tp_config.enabled && g_sycl_tp_config.world_size > 1)) {
@@ -32133,11 +32014,10 @@ static bool ggml_sycl_mul_mat_id_fused(ggml_backend_sycl_context & ctx,
     if (fused_moe_disabled) {
         return false;  // Disabled by environment variable
     }
-    // In S1 mode, expert weights live in host-pinned memory.  The fused ESIMD
-    // kernel requires the entire MoE tensor contiguously in device VRAM.
-    // Attempting to cache a 500+ MB tensor on-demand here triggers eviction
-    // loops that hang graph_compute.  Bail out -- per-expert MMVQ handles S1.
-    if (ggml_backend_sycl_all_weights_host()) {
+    // The fused ESIMD kernel requires the entire MoE tensor contiguously in device VRAM.
+    // When expert weights are host-resident, attempting to cache a 500+ MB tensor on-demand
+    // triggers eviction loops that hang graph_compute.  Bail out — per-expert MMVQ handles it.
+    if (ggml_sycl_weight_executes_on_host(src0, ctx.device)) {
         if (g_moe_pp_profile_enabled) {
             g_moe_profile.moe_dispatch_path(1, 0, 0, 0);
         }
