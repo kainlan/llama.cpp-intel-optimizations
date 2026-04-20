@@ -4,3 +4,8 @@
 ggml-common.h
 **/*.swp
 !peg-parser
+!sycl-canary
+sycl-canary/device-info
+sycl-canary/dpas
+sycl-canary/subgroup-reduce
+sycl-canary/onednn-sdpa-fusion
