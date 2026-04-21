@@ -8,6 +8,7 @@
 #define GGML_SYCL_FATTN_HPP
 
 #include "common.hpp"
+#include "fattn-common.hpp"
 
 // Check if flash attention is supported for the given tensor configuration
 bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst);
@@ -19,5 +20,14 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
 // This ensures V2 dispatch works during graph recording (malloc/free forbidden during recording).
 // Should be called before graph recording starts.
 void ggml_sycl_v2_pre_allocate_buffers(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph);
+
+#if GGML_SYCL_DNNL
+// Check whether a flash_attn_ext call is eligible for the oneDNN graph SDPA path.
+bool ggml_sycl_flash_attn_ext_onednn_eligible(const fattn_params & params,
+                                               int                   H_q,
+                                               int                   H_kv,
+                                               bool                  kv_is_fp8,
+                                               bool                  multi_seq);
+#endif
 
 #endif // GGML_SYCL_FATTN_HPP

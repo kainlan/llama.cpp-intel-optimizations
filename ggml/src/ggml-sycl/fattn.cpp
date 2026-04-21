@@ -9,12 +9,15 @@
 #include "common.hpp"
 #include "fattn-debug.hpp"
 #include "fattn-esimd-f16.hpp"
-#include "fattn-mma-f16.hpp"
+#include "fattn-tile-f16.hpp"
 #include "fattn-mma.hpp"
+#include "fattn-onednn.hpp"
 #include "fattn-v2-esimd.hpp"
 #include "fattn-v2-partition.hpp"
 #include "fattn-vec.hpp"
+#include "fattn-vec-f16.hpp"
 #include "fattn-xmx-f16.hpp"
+#include "fattn-xmx-f16-v2.hpp"
 #include "kv-cache-quant.hpp"
 #include "l144i-probe.hpp"
 #include "sycl-profiling.hpp"
@@ -419,6 +422,28 @@ static void init_fa_esimd_config() {
     }
 }
 
+// =============================================================================
+// oneDNN graph SDPA path configuration (Phase 3)
+// =============================================================================
+// Routes eligible models (no sinks, no softcap, f16 KV) through oneDNN graph SDPA.
+// Enabled by default. Disable with: GGML_SYCL_FA_ONEDNN=0
+#if GGML_SYCL_DNNL
+static bool g_sycl_fa_onednn_enabled     = true;
+static bool g_sycl_fa_onednn_initialized = false;
+
+static void init_fa_onednn_config() {
+    if (g_sycl_fa_onednn_initialized) {
+        return;
+    }
+    g_sycl_fa_onednn_initialized = true;
+    const char * env = std::getenv("GGML_SYCL_FA_ONEDNN");
+    if (env && (strcmp(env, "0") == 0 || strcmp(env, "false") == 0)) {
+        g_sycl_fa_onednn_enabled = false;
+        fprintf(stderr, "[SYCL] oneDNN SDPA path disabled (GGML_SYCL_FA_ONEDNN=0)\n");
+    }
+}
+#endif  // GGML_SYCL_DNNL
+
 static void init_fa_safe_decode_config() {
     if (g_sycl_fa_safe_decode_initialized) {
         return;
@@ -788,39 +813,94 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
         LAUNCHER<D, NCOLS, true, Q_type>(params, stream);  \
     }
 
-    // Dispatch to appropriate kernel based on GPU capabilities
+    // VEC path: deterministic-by-construction TG fast path (zero SLM, register-only).
+    // ncols == 1 covers TG; D <= 256 covers gpt-oss-20b (D=64), Mistral/Llama (D=128), Gemma (D=256).
+    // This path IS the deterministic default for TG — safe_decode uses the scalar MMA fallback
+    // only when GGML_SYCL_FA_SAFE_DECODE is explicitly left at default (true).
+    // VEC replaces BOTH the racy XMX (ne01=1 wastes 7/8 tile) and the safe_decode scalar default.
+    if (!params.kv_is_fp8 && ne01 <= 1 && D <= 256) {
+        GGML_SYCL_KTRACE("fattn_vec_f16", " D=%d ncols=1 ne01=%d", D, ne01);
+        DISPATCH_NCOLS(1, launch_fattn_vec_f16);
+        return;
+    }
+
+#if GGML_SYCL_DNNL
+    // oneDNN graph SDPA path: fused MatMul→Divide→Add→SoftMax→MatMul on Xe2.
+    // Eligible: no sinks, no softcap, f16 KV, D ≤ 512, not multi-seq.
+    // Ineligible: gpt-oss-20b (sinks+softcap), Gemma-2 (softcap), FP8 KV.
+    // Dispatched BEFORE XMX/TILE so PP benefits from oneDNN's fused kernel.
+    // Falls back to kernel path if oneDNN compile fails or during graph recording.
+    if (!safe_decode && g_sycl_fa_onednn_enabled) {
+        const bool multi_seq = (params.n_seqs > 1);
+        if (ggml_sycl_flash_attn_ext_onednn_eligible(params,
+                                                     params.ne02,   // H_q
+                                                     params.ne12,   // H_kv
+                                                     params.kv_is_fp8,
+                                                     multi_seq)) {
+            GGML_SYCL_KTRACE("fattn_onednn", " D=%d ne01=%d ne11=%d H_q=%d H_kv=%d",
+                             D, ne01, params.ne11, params.ne02, params.ne12);
+            if (ggml_sycl_flash_attn_ext_onednn(ctx, params)) {
+                return;
+            }
+            // Fall through to kernel path on failure
+        }
+    }
+#endif  // GGML_SYCL_DNNL
+
+    // Dispatch to appropriate kernel based on GPU capabilities.
+    // Default: XMX-v2 (fattn-xmx-f16-v2.hpp) — no SLM aliasing, deterministic.
+    // GGML_SYCL_FA_XMX_V1=1: fallback to broken v1 kernel for A/B comparison only.
     if (use_xmx) {
-        // XMX kernel - uses Intel joint_matrix for Q@K^T and S@V acceleration
-        // Note: Even for single query, XMX kernel is faster than vector kernel
-        // because XMX hardware throughput exceeds scalar operations despite
-        // 7/8 of tiles being "wasted" in the 8x8 joint_matrix operations
-        if (ne01 <= 1) {
-            GGML_SYCL_KTRACE("fattn_xmx_f16", " D=%d ncols=1 ne01=%d", D, ne01);
-            DISPATCH_NCOLS(1, launch_fattn_xmx_f16);
-        } else if (ne01 <= 2) {
-            GGML_SYCL_KTRACE("fattn_xmx_f16", " D=%d ncols=2 ne01=%d", D, ne01);
-            DISPATCH_NCOLS(2, launch_fattn_xmx_f16);
-        } else if (ne01 <= 4) {
-            GGML_SYCL_KTRACE("fattn_xmx_f16", " D=%d ncols=4 ne01=%d", D, ne01);
-            DISPATCH_NCOLS(4, launch_fattn_xmx_f16);
+        static const bool force_xmx_v1 = []() {
+            const char * env = std::getenv("GGML_SYCL_FA_XMX_V1");
+            return env && std::atoi(env) != 0;
+        }();
+
+        if (force_xmx_v1) {
+            // v1 kernel — kept for A/B regression; produces non-deterministic output on gpt-oss-20b
+            if (ne01 <= 1) {
+                GGML_SYCL_KTRACE("fattn_xmx_v1_f16", " D=%d ncols=1 ne01=%d", D, ne01);
+                DISPATCH_NCOLS(1, launch_fattn_xmx_f16);
+            } else if (ne01 <= 2) {
+                GGML_SYCL_KTRACE("fattn_xmx_v1_f16", " D=%d ncols=2 ne01=%d", D, ne01);
+                DISPATCH_NCOLS(2, launch_fattn_xmx_f16);
+            } else if (ne01 <= 4) {
+                GGML_SYCL_KTRACE("fattn_xmx_v1_f16", " D=%d ncols=4 ne01=%d", D, ne01);
+                DISPATCH_NCOLS(4, launch_fattn_xmx_f16);
+            } else {
+                GGML_SYCL_KTRACE("fattn_xmx_v1_f16", " D=%d ncols=8 ne01=%d", D, ne01);
+                DISPATCH_NCOLS(8, launch_fattn_xmx_f16);
+            }
         } else {
-            GGML_SYCL_KTRACE("fattn_xmx_f16", " D=%d ncols=8 ne01=%d", D, ne01);
-            DISPATCH_NCOLS(8, launch_fattn_xmx_f16);
+            // v2 kernel — structurally correct, no SLM aliasing, deterministic
+            if (ne01 <= 1) {
+                GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=1 ne01=%d", D, ne01);
+                DISPATCH_NCOLS(1, launch_fattn_xmx_v2_f16);
+            } else if (ne01 <= 2) {
+                GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=2 ne01=%d", D, ne01);
+                DISPATCH_NCOLS(2, launch_fattn_xmx_v2_f16);
+            } else if (ne01 <= 4) {
+                GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=4 ne01=%d", D, ne01);
+                DISPATCH_NCOLS(4, launch_fattn_xmx_v2_f16);
+            } else {
+                GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=8 ne01=%d", D, ne01);
+                DISPATCH_NCOLS(8, launch_fattn_xmx_v2_f16);
+            }
         }
     } else {
-        // MMA F16 kernel - scalar fallback for non-XMX GPUs
+        // TILE F16 kernel - scalar-SLM-tile fallback for safe_decode / non-XMX GPUs
         if (ne01 <= 1) {
-            GGML_SYCL_KTRACE("fattn_mma_f16", " D=%d ncols=1 ne01=%d", D, ne01);
-            DISPATCH_NCOLS(1, launch_fattn_mma_f16);
+            GGML_SYCL_KTRACE("fattn_tile_f16", " D=%d ncols=1 ne01=%d", D, ne01);
+            DISPATCH_NCOLS(1, launch_fattn_tile_f16);
         } else if (ne01 <= 2) {
-            GGML_SYCL_KTRACE("fattn_mma_f16", " D=%d ncols=2 ne01=%d", D, ne01);
-            DISPATCH_NCOLS(2, launch_fattn_mma_f16);
+            GGML_SYCL_KTRACE("fattn_tile_f16", " D=%d ncols=2 ne01=%d", D, ne01);
+            DISPATCH_NCOLS(2, launch_fattn_tile_f16);
         } else if (ne01 <= 4) {
-            GGML_SYCL_KTRACE("fattn_mma_f16", " D=%d ncols=4 ne01=%d", D, ne01);
-            DISPATCH_NCOLS(4, launch_fattn_mma_f16);
+            GGML_SYCL_KTRACE("fattn_tile_f16", " D=%d ncols=4 ne01=%d", D, ne01);
+            DISPATCH_NCOLS(4, launch_fattn_tile_f16);
         } else {
-            GGML_SYCL_KTRACE("fattn_mma_f16", " D=%d ncols=8 ne01=%d", D, ne01);
-            DISPATCH_NCOLS(8, launch_fattn_mma_f16);
+            GGML_SYCL_KTRACE("fattn_tile_f16", " D=%d ncols=8 ne01=%d", D, ne01);
+            DISPATCH_NCOLS(8, launch_fattn_tile_f16);
         }
     }
 
@@ -837,6 +917,9 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     init_kv_fp8_config();
     init_fa_esimd_config();
     init_fa_safe_decode_config();
+#if GGML_SYCL_DNNL
+    init_fa_onednn_config();
+#endif
 
     const ggml_tensor * dst = safe_dst.raw();
     auto                Q_t = safe_dst.src(0);
