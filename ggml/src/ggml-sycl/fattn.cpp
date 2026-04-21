@@ -930,6 +930,7 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
     }
     if (!use_xmx) {
         // TILE F16 kernel - scalar-SLM-tile fallback for safe_decode / non-XMX GPUs
+        //                  / v2 SLM-fit failure (see v2_dispatched flip above).
         if (ne01 <= 1) {
             GGML_SYCL_KTRACE("fattn_tile_f16", " D=%d ncols=1 ne01=%d", D, ne01);
             DISPATCH_NCOLS(1, launch_fattn_tile_f16);
