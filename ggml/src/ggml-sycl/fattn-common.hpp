@@ -71,6 +71,15 @@ struct fattn_params {
     const char * sinks;  // Attention sinks tensor (src[4])
     float * dst;
 
+    // Source tensor element types — required by the oneDNN SDPA path so it can
+    // build logical_tensor descriptors with the correct data_type and element
+    // strides (nb* fields are in bytes). Mask in particular may be f16 (when
+    // cparams.flash_attn is set → ggml_cast to GGML_TYPE_F16) or f32.
+    ggml_type Q_type;
+    ggml_type K_type;
+    ggml_type V_type;
+    ggml_type mask_type;
+
     float scale;
     float max_bias;
     float m0;

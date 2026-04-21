@@ -8,18 +8,18 @@
 
 #if GGML_SYCL_DNNL
 
-#include "fattn-common.hpp"
-#include "common.hpp"
+#    include "common.hpp"
+#    include "fattn-common.hpp"
 
-#include <cstdio>
-#include <mutex>
+#    include <cstdio>
+#    include <mutex>
 
 using namespace dnnl::graph;
-using lt         = logical_tensor;
-using layout_t   = lt::layout_type;
-using dim_t      = lt::dim;
-using dims_t     = lt::dims;
-using dt         = lt::data_type;
+using lt       = logical_tensor;
+using layout_t = lt::layout_type;
+using dim_t    = lt::dim;
+using dims_t   = lt::dims;
+using dt       = lt::data_type;
 
 // Per-context SDPA cache.  Stored via a raw pointer inside ggml_backend_sycl_context
 // to avoid pulling graph headers into common.hpp.  Created on first use, freed at
@@ -46,20 +46,51 @@ void ggml_sycl_sdpa_cache_destroy(void * ptr) {
 // Eligibility gate
 // -------------------------------------------------------------------
 bool ggml_sycl_flash_attn_ext_onednn_eligible(const fattn_params & params,
-                                               int                   H_q,
-                                               int                   H_kv,
-                                               bool                  kv_is_fp8,
-                                               bool                  multi_seq) {
-    if (params.sinks)              return false;  // attention sinks unsupported
-    if (params.logit_softcap != 0) return false;  // softcap unsupported
-    if (kv_is_fp8)                 return false;  // FP8 KV unsupported
-    if (multi_seq)                 return false;  // multi-seq unsupported
-    if (params.ne00 > 512)         return false;  // D > 512 unsupported
-    if (params.ne11 <= 0)          return false;  // empty KV
+                                              int                  H_q,
+                                              int                  H_kv,
+                                              bool                 kv_is_fp8,
+                                              bool                 multi_seq) {
+    if (params.sinks) {
+        return false;  // attention sinks unsupported
+    }
+    if (params.logit_softcap != 0) {
+        return false;  // softcap unsupported
+    }
+    if (kv_is_fp8) {
+        return false;  // FP8 KV unsupported
+    }
+    if (multi_seq) {
+        return false;  // multi-seq unsupported
+    }
+    if (params.ne00 > 512) {
+        return false;  // D > 512 unsupported
+    }
+    if (params.ne11 <= 0) {
+        return false;  // empty KV
+    }
     // Only use for PP (ncols >= 8): TG (ncols=1-7) has unstable ne11 per step,
     // causing excessive JIT recompilation that dominates latency.
-    if (params.ne01 < 8)           return false;
-    (void)H_q; (void)H_kv;
+    if (params.ne01 < 8) {
+        return false;
+    }
+    // The compiled partition is built with Q/K/V dtypes taken from params.*_type.
+    // Scale and scratch buffer sizing assumes f16 Q (sizeof(half) scale slot),
+    // and the existing path only supports f16 KV. Restrict to the well-tested
+    // combination until the scale buffer is generalized.
+    if (params.Q_type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (params.K_type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (params.V_type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (params.mask && params.mask_type != GGML_TYPE_F16 && params.mask_type != GGML_TYPE_F32) {
+        return false;
+    }
+    (void) H_q;
+    (void) H_kv;
     return true;
 }
 
@@ -77,151 +108,182 @@ bool ggml_sycl_flash_attn_ext_onednn_eligible(const fattn_params & params,
 //                              K/V are 5-D (batch, H_kv, 1, S, D).
 // The same pointer is used — only the logical_tensor dims/strides differ.
 struct build_result {
-    std::vector<lt> in_ports;
-    std::vector<lt> out_ports;
+    std::vector<lt>                 in_ports;
+    std::vector<lt>                 out_ports;
     dnnl::graph::compiled_partition cp;
 };
 
-static build_result build_and_compile_sdpa(const sdpa_shape_key & key,
-                                            const dnnl::engine &    eng) {
-    const int batch  = 1;
-    const int D      = key.D;
-    const int ncols  = key.ncols;
-    const int ne11   = key.ne11;
-    const int H_q    = key.H_q;
-    const int H_kv   = key.H_kv;
-    const int N_rep  = (H_kv > 0) ? (H_q / H_kv) : 1;
+static build_result build_and_compile_sdpa(const sdpa_shape_key & key, const dnnl::engine & eng) {
+    const int  batch  = 1;
+    const int  D      = key.D;
+    const int  ncols  = key.ncols;
+    const int  ne11   = key.ne11;
+    const int  H_q    = key.H_q;
+    const int  H_kv   = key.H_kv;
+    const int  N_rep  = (H_kv > 0) ? (H_q / H_kv) : 1;
     const bool is_gqa = key.is_gqa;
+
+    // Element-size lookup for the source types stored in the key.
+    const size_t q_esz = ggml_type_size(static_cast<ggml_type>(key.Q_type));
+    const size_t k_esz = ggml_type_size(static_cast<ggml_type>(key.K_type));
+    const size_t v_esz = ggml_type_size(static_cast<ggml_type>(key.V_type));
+    const size_t m_esz = key.has_mask ? ggml_type_size(static_cast<ggml_type>(key.mask_type)) : 1;
+
+    // Map ggml_type -> oneDNN data_type for sources.
+    auto to_dnnl_dt = [](int ggml_t) -> dt {
+        switch (static_cast<ggml_type>(ggml_t)) {
+            case GGML_TYPE_F16:
+                return dt::f16;
+            case GGML_TYPE_F32:
+                return dt::f32;
+            default:
+                throw std::runtime_error("oneDNN SDPA: unsupported ggml_type for source tensor");
+        }
+    };
+
+    const dt q_dt    = to_dnnl_dt(key.Q_type);
+    const dt k_dt    = to_dnnl_dt(key.K_type);
+    const dt v_dt    = to_dnnl_dt(key.V_type);
+    const dt mask_dt = key.has_mask ? to_dnnl_dt(key.mask_type) : dt::f32;
 
     // Logical tensor IDs must be unique across the entire graph.
     size_t id = 0;
 
     // ---- Q / K / V shapes -------------------------------------------------
-    // ggml layout: K[ne10=D, ne11=S, ne12=H_kv, ne13=batch] (row-major)
-    // oneDNN wants (batch, H, S, D) contiguous — same memory, transposed dim interpretation.
-    // We express this via strides derived from the ggml row-major layout.
+    // Strides for the source tensors come from the ggml tensor byte strides
+    // (key.*_nb*) divided by element size. This is correct under arbitrary
+    // ggml layouts including non-contiguous / permuted sources where the
+    // hardcoded contiguous-stride formula would read garbage.
     //
-    // ggml strides (element units, elem_size = sizeof(half)):
-    //   stride[0] = 1           (D dimension — innermost)
-    //   stride[1] = D           (S dimension)
-    //   stride[2] = D * ne11    (H dimension)
-    //   stride[3] = D*ne11*H_kv (batch)
-    //
-    // oneDNN logical dims: (batch=1, H, S, D) → strides (D*S*H, D*S, D, 1)
-    // This maps to: dim0=batch→stride[3], dim1=H→stride[2], dim2=S→stride[1], dim3=D→stride[0]
-    // which equals the ggml layout strides exactly.
+    // ggml byte strides: nb[0]=elem_size, nb[1]=row stride, nb[2]=head stride,
+    //                    nb[3]=batch stride. We use nb[1..3]; the innermost
+    //                    element stride is always 1 element.
 
     dims_t q_dims, k_dims, v_dims, score_dims, out_dims;
     dims_t q_strides, k_strides, v_strides, score_strides, out_strides;
 
+    // Element strides from ggml tensor nb (bytes) / element size.
+    const dim_t q_s1 = static_cast<dim_t>(key.q_nb1 / (int64_t) q_esz);  // stride along Q rows (ncols dim)
+    const dim_t q_s2 = static_cast<dim_t>(key.q_nb2 / (int64_t) q_esz);  // stride along Q heads
+    const dim_t q_s3 = static_cast<dim_t>(key.q_nb3 / (int64_t) q_esz);  // stride along Q batch
+
+    const dim_t k_s1 = static_cast<dim_t>(key.k_nb1 / (int64_t) k_esz);
+    const dim_t k_s2 = static_cast<dim_t>(key.k_nb2 / (int64_t) k_esz);
+    const dim_t k_s3 = static_cast<dim_t>(key.k_nb3 / (int64_t) k_esz);
+
+    const dim_t v_s1 = static_cast<dim_t>(key.v_nb1 / (int64_t) v_esz);
+    const dim_t v_s2 = static_cast<dim_t>(key.v_nb2 / (int64_t) v_esz);
+    const dim_t v_s3 = static_cast<dim_t>(key.v_nb3 / (int64_t) v_esz);
+
+    // Output is a dense f32 buffer in params.dst laid out as (batch, H_q, ncols, D).
     if (!is_gqa) {
         // 4-D non-GQA: (batch, H, S, D)
-        q_dims     = {batch, H_q,  ncols, D};
-        k_dims     = {batch, H_kv, ne11,  D};
-        v_dims     = {batch, H_kv, ne11,  D};
-        score_dims = {batch, H_q,  ncols, ne11};
-        out_dims   = {batch, H_q,  ncols, D};
+        q_dims     = { batch, H_q, ncols, D };
+        k_dims     = { batch, H_kv, ne11, D };
+        v_dims     = { batch, H_kv, ne11, D };
+        score_dims = { batch, H_q, ncols, ne11 };
+        out_dims   = { batch, H_q, ncols, D };
 
-        // Strides for (batch, H, S, D) contiguous → (H*S*D, S*D, D, 1)
-        q_strides     = {H_q  * ncols * D,  ncols * D,  D,    1};
-        k_strides     = {H_kv * ne11  * D,  ne11  * D,  D,    1};
-        v_strides     = {H_kv * ne11  * D,  ne11  * D,  D,    1};
-        score_strides = {H_q  * ncols * ne11, ncols * ne11, ne11, 1};
-        out_strides   = {H_q  * ncols * D,  ncols * D,  D,    1};
+        // Q logical dims are (batch, H, ncols, D) mapped from ggml Q[D, ncols, H, batch]
+        // dim0=batch <- nb3, dim1=H <- nb2, dim2=ncols <- nb1, dim3=D <- elem stride 1
+        q_strides = { q_s3, q_s2, q_s1, 1 };
+        k_strides = { k_s3, k_s2, k_s1, 1 };
+        v_strides = { v_s3, v_s2, v_s1, 1 };
+
+        // Score and output remain contiguous intermediates/dense dst.
+        score_strides = { H_q * ncols * ne11, ncols * ne11, ne11, 1 };
+        out_strides   = { H_q * ncols * D, ncols * D, D, 1 };
     } else {
         // 5-D GQA: Q=(batch, H_kv, N_rep, ncols, D), K/V=(batch, H_kv, 1, ne11, D)
-        q_dims     = {batch, H_kv, N_rep, ncols, D};
-        k_dims     = {batch, H_kv, 1,     ne11,  D};
-        v_dims     = {batch, H_kv, 1,     ne11,  D};
-        score_dims = {batch, H_kv, N_rep, ncols, ne11};
-        out_dims   = {batch, H_kv, N_rep, ncols, D};
+        q_dims     = { batch, H_kv, N_rep, ncols, D };
+        k_dims     = { batch, H_kv, 1, ne11, D };
+        v_dims     = { batch, H_kv, 1, ne11, D };
+        score_dims = { batch, H_kv, N_rep, ncols, ne11 };
+        out_dims   = { batch, H_kv, N_rep, ncols, D };
 
-        // Q strides: innermost D, then ncols*D per N_rep step, H_kv*N_rep*ncols*D per batch
-        // Q is stored as (batch=1, H_q, ncols, D) in ggml.
-        // We reinterpret as (1, H_kv, N_rep, ncols, D) — same memory.
-        // stride[4]=1, stride[3]=D, stride[2]=ncols*D, stride[1]=N_rep*ncols*D, stride[0]=H_kv*N_rep*ncols*D
-        q_strides = {
-            (dim_t)(H_kv * N_rep * ncols * D),
-            (dim_t)(N_rep * ncols * D),
-            (dim_t)(ncols * D),
-            (dim_t)(D),
-            (dim_t)(1)
-        };
+        // Q is laid out in ggml as (D, ncols, H_q, batch) with H_q = H_kv * N_rep.
+        // We reinterpret the H_q axis as (H_kv, N_rep) with head index
+        //   h_q = kv_head * N_rep + rep
+        // Stride along kv_head = N_rep * (stride along h_q) = N_rep * q_s2
+        // Stride along rep     = q_s2
+        q_strides = { q_s3, static_cast<dim_t>((int64_t) N_rep * q_s2), q_s2, q_s1, 1 };
 
-        // K/V strides: (1, H_kv, 1, ne11, D) — K[ne10=D, ne11=S, ne12=H_kv, ne13=1]
-        // dim5=1, dim4=D, dim3=ne11*D, dim2=ne11*D (head_rep stride = same as KV head stride),
-        // dim1=ne11*D, dim0=H_kv*ne11*D
-        k_strides = {
-            (dim_t)(H_kv * ne11 * D),
-            (dim_t)(ne11 * D),
-            (dim_t)(ne11 * D),  // head_rep=1 → same stride as kv_head
-            (dim_t)(D),
-            (dim_t)(1)
-        };
-        v_strides = k_strides;
+        // K/V: ggml layout (D, ne11, H_kv, batch). The N_rep axis in the 5-D
+        // view is broadcast — we express it with a zero-ish stride by reusing
+        // the kv_head stride, since all N_rep reps share the same KV slice.
+        k_strides = { k_s3, k_s2,
+                      k_s2,  // N_rep axis == 1 → same stride as kv_head (broadcast)
+                      k_s1, 1 };
+        v_strides = { v_s3, v_s2, v_s2, v_s1, 1 };
 
-        score_strides = {
-            (dim_t)(H_kv * N_rep * ncols * ne11),
-            (dim_t)(N_rep * ncols * ne11),
-            (dim_t)(ncols * ne11),
-            (dim_t)(ne11),
-            (dim_t)(1)
-        };
-        out_strides = q_strides;
+        score_strides = { (dim_t) (H_kv * N_rep * ncols * ne11), (dim_t) (N_rep * ncols * ne11), (dim_t) (ncols * ne11),
+                          (dim_t) (ne11), (dim_t) (1) };
+        // Dense f32 output layout (batch, H_q, ncols, D) viewed 5-D:
+        // (batch, H_kv, N_rep, ncols, D) with h_q = kv_head*N_rep + rep
+        out_strides   = { (dim_t) (H_kv * N_rep * ncols * D), (dim_t) (N_rep * ncols * D), (dim_t) (ncols * D),
+                          (dim_t) (D), (dim_t) (1) };
     }
 
-    // ---- Scale tensor (scalar f16) ----------------------------------------
-    const dims_t scale_dims    = {1};
-    const dims_t scale_strides = {1};
+    // ---- Scale tensor (scalar, same dtype as Q) ---------------------------
+    const dims_t scale_dims    = { 1 };
+    const dims_t scale_strides = { 1 };
 
     // ---- Mask tensor -------------------------------------------------------
-    // llama.cpp mask shape: (ne30=ne11, ne31=ncols, ne32=H_q_or_1, ne33=batch)
-    // oneDNN Add broadcasts — we use (batch, 1, ncols, ne11) or 5-D equivalent.
+    // ggml mask shape: (ne30=ne11, ne31=ncols_padded, ne32=H_or_1, ne33=batch).
+    // The row dimension is padded (GGML_KQ_MASK_PAD) so the physical row stride
+    // nb31 is != ncols*elem_size. Use the real tensor byte strides.
+    const dim_t m_s1 = key.has_mask ? static_cast<dim_t>(key.m_nb1 / (int64_t) m_esz) : 1;
+    const dim_t m_s2 = key.has_mask ? static_cast<dim_t>(key.m_nb2 / (int64_t) m_esz) : 1;
+    const dim_t m_s3 = key.has_mask ? static_cast<dim_t>(key.m_nb3 / (int64_t) m_esz) : 1;
+
     dims_t mask_dims, mask_strides;
     if (!is_gqa) {
-        mask_dims    = {batch, 1, ncols, ne11};
-        mask_strides = {ncols * ne11, ncols * ne11, ne11, 1};
+        // (batch, heads_broadcast=1, ncols, ne11). Broadcast along head axis
+        // by using the batch stride (mask has no per-head dim for non-GQA ATM).
+        mask_dims    = { batch, 1, ncols, ne11 };
+        mask_strides = { m_s3, m_s3, m_s1, 1 };
     } else {
-        mask_dims    = {batch, 1, 1, ncols, ne11};
-        mask_strides = {ncols * ne11, ncols * ne11, ncols * ne11, ne11, 1};
+        // (batch, H_kv=1, N_rep=1, ncols, ne11): same broadcast trick — both
+        // head axes have extent 1, so stride is irrelevant beyond being valid.
+        mask_dims    = { batch, 1, 1, ncols, ne11 };
+        mask_strides = { m_s3, m_s3, m_s3, m_s1, 1 };
     }
 
     // ---- Build logical tensors --------------------------------------------
-    // Constructor: (id, dtype, dims, strides) — no layout_type arg for strided path
-    lt lt_q     (id++, dt::f16, q_dims,     q_strides);
-    lt lt_k     (id++, dt::f16, k_dims,     k_strides);
-    lt lt_scale (id++, dt::f16, scale_dims, scale_strides);
-    lt lt_v     (id++, dt::f16, v_dims,     v_strides);
+    lt lt_q(id++, q_dt, q_dims, q_strides);
+    lt lt_k(id++, k_dt, k_dims, k_strides);
+    lt lt_scale(id++, q_dt, scale_dims, scale_strides);
+    lt lt_v(id++, v_dt, v_dims, v_strides);
 
     // Intermediate f32 tensors
-    lt lt_score   (id++, dt::f32, score_dims, score_strides);
-    lt lt_scaled  (id++, dt::f32, score_dims, score_strides);
-    lt lt_masked  (id++, dt::f32, score_dims, score_strides);
-    lt lt_probs   (id++, dt::f16, score_dims, score_strides);
-    // Output is f32 to directly feed into params.dst (avoids intermediate f16 buffer + cast).
-    lt lt_out     (id++, dt::f32, out_dims,   out_strides);
+    lt lt_score(id++, dt::f32, score_dims, score_strides);
+    lt lt_scaled(id++, dt::f32, score_dims, score_strides);
+    lt lt_masked(id++, dt::f32, score_dims, score_strides);
+    lt lt_probs(id++, q_dt, score_dims, score_strides);
+    // Output is f32 directly into params.dst (no intermediate f16 buffer + cast).
+    lt lt_out(id++, dt::f32, out_dims, out_strides);
 
     // ---- Ops ---------------------------------------------------------------
     op bmm1(id++, op::kind::MatMul, "bmm1");
     bmm1.set_attr<bool>(op::attr::transpose_b, true);
-    bmm1.add_inputs({lt_q, lt_k});
-    bmm1.add_outputs({lt_score});
+    bmm1.add_inputs({ lt_q, lt_k });
+    bmm1.add_outputs({ lt_score });
 
     // params.scale = 1/sqrt(D) — multiply (not divide) to get scaled scores
     op div_op(id++, op::kind::Multiply, "scale_mul");
-    div_op.add_inputs({lt_score, lt_scale});
-    div_op.add_outputs({lt_scaled});
+    div_op.add_inputs({ lt_score, lt_scale });
+    div_op.add_outputs({ lt_scaled });
 
     // mask_add and softmax inputs depend on whether mask is present
-    lt   lt_sfmx_in = lt_scaled;
+    lt              lt_sfmx_in = lt_scaled;
     std::vector<lt> mask_lts;
-    op * add_op_ptr = nullptr;
-    op   add_op_storage(id++, op::kind::Add, "mask_add");
+    op *            add_op_ptr = nullptr;
+    op              add_op_storage(id++, op::kind::Add, "mask_add");
 
     if (key.has_mask) {
-        lt lt_mask(id++, dt::f32, mask_dims, mask_strides);  // mask is f32 in ggml
-        add_op_storage.add_inputs({lt_scaled, lt_mask});
-        add_op_storage.add_outputs({lt_masked});
+        lt lt_mask(id++, mask_dt, mask_dims, mask_strides);
+        add_op_storage.add_inputs({ lt_scaled, lt_mask });
+        add_op_storage.add_outputs({ lt_masked });
         add_op_ptr = &add_op_storage;
         lt_sfmx_in = lt_masked;
         mask_lts.push_back(lt_mask);
@@ -229,12 +291,12 @@ static build_result build_and_compile_sdpa(const sdpa_shape_key & key,
 
     op sfmx(id++, op::kind::SoftMax, "softmax");
     sfmx.set_attr<int64_t>(op::attr::axis, -1);
-    sfmx.add_inputs({lt_sfmx_in});
-    sfmx.add_outputs({lt_probs});
+    sfmx.add_inputs({ lt_sfmx_in });
+    sfmx.add_outputs({ lt_probs });
 
     op bmm2(id++, op::kind::MatMul, "bmm2");
-    bmm2.add_inputs({lt_probs, lt_v});
-    bmm2.add_outputs({lt_out});
+    bmm2.add_inputs({ lt_probs, lt_v });
+    bmm2.add_outputs({ lt_out });
 
     // ---- Graph ---------------------------------------------------------------
     dnnl::graph::graph sdpa_graph(dnnl::engine::kind::gpu);
@@ -275,8 +337,7 @@ static build_result build_and_compile_sdpa(const sdpa_shape_key & key,
 // -------------------------------------------------------------------
 // Main dispatch entry
 // -------------------------------------------------------------------
-bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx,
-                                      const fattn_params &          params) {
+bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fattn_params & params) {
     dpct::queue_ptr stream = ctx.stream();
 
     const int H_q  = params.ne02;
@@ -290,7 +351,7 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx,
     // Fast check via VA range: Intel Arc device USM is allocated in the high GPU VA space
     // (addresses >= 0x800000000000) while host-pinned USM uses normal user-space VAs.
     // This avoids the expensive sycl::get_pointer_type() call (which syncs the L0 driver).
-    static constexpr uintptr_t kDeviceVAThreshold = (uintptr_t)1 << 47;  // ~128 TB
+    static constexpr uintptr_t kDeviceVAThreshold = (uintptr_t) 1 << 47;  // ~128 TB
     if (reinterpret_cast<uintptr_t>(params.K) < kDeviceVAThreshold) {
         return false;  // K is host/mmap — skip oneDNN (falls back to XMX/TILE kernel)
     }
@@ -304,6 +365,24 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx,
     key.H_kv      = H_kv;
     key.has_mask  = (params.mask != nullptr);
     key.is_gqa    = (H_q != H_kv);
+
+    key.Q_type    = (int) params.Q_type;
+    key.K_type    = (int) params.K_type;
+    key.V_type    = (int) params.V_type;
+    key.mask_type = (int) params.mask_type;
+
+    key.q_nb1 = params.nb01;
+    key.q_nb2 = params.nb02;
+    key.q_nb3 = params.nb03;
+    key.k_nb1 = params.nb11;
+    key.k_nb2 = params.nb12;
+    key.k_nb3 = params.nb13;
+    key.v_nb1 = params.nb21;
+    key.v_nb2 = params.nb22;
+    key.v_nb3 = params.nb23;
+    key.m_nb1 = key.has_mask ? params.nb31 : 0;
+    key.m_nb2 = key.has_mask ? params.nb32 : 0;
+    key.m_nb3 = key.has_mask ? params.nb33 : 0;
 
     sdpa_partition_cache * cache = get_or_create_cache(ctx);
 
@@ -319,7 +398,7 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx,
     sdpa_compiled_entry * entry = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_sdpa_cache_mutex);
-        auto it = cache->hits.find(key);
+        auto                        it = cache->hits.find(key);
         if (it != cache->hits.end()) {
             entry = &it->second;
         }
@@ -332,15 +411,15 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx,
             build_result r = build_and_compile_sdpa(key, eng);
             {
                 std::lock_guard<std::mutex> lock(g_sdpa_cache_mutex);
-                auto & e  = cache->hits[key];
-                e.cp        = std::move(r.cp);
-                e.in_ports  = std::move(r.in_ports);
-                e.out_ports = std::move(r.out_ports);
-                entry = &cache->hits[key];
+                auto &                      e = cache->hits[key];
+                e.cp                          = std::move(r.cp);
+                e.in_ports                    = std::move(r.in_ports);
+                e.out_ports                   = std::move(r.out_ports);
+                entry                         = &cache->hits[key];
             }
         } catch (std::exception & e) {
-            fprintf(stderr, "[SYCL] oneDNN SDPA compile failed for D=%d ncols=%d ne11=%d H_q=%d H_kv=%d: %s\n",
-                    D, params.ne01, params.ne11, H_q, H_kv, e.what());
+            fprintf(stderr, "[SYCL] oneDNN SDPA compile failed for D=%d ncols=%d ne11=%d H_q=%d H_kv=%d: %s\n", D,
+                    params.ne01, params.ne11, H_q, H_kv, e.what());
             std::lock_guard<std::mutex> lock(g_sdpa_cache_mutex);
             cache->negative[key] = true;
             return false;
@@ -360,8 +439,8 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx,
     // so it must be USM-accessible.  Allocate once as sycl::malloc_host (pinned,
     // GPU-accessible via PCIe zero-copy) and reuse across calls.
     if (!cache->scale_usm) {
-        cache->usm_queue  = stream;
-        cache->scale_usm  = static_cast<sycl::half *>(sycl::malloc_host(sizeof(sycl::half), *stream));
+        cache->usm_queue = stream;
+        cache->scale_usm = static_cast<sycl::half *>(sycl::malloc_host(sizeof(sycl::half), *stream));
         GGML_ASSERT(cache->scale_usm && "oneDNN SDPA: failed to allocate USM scale buffer");
     }
     *cache->scale_usm = static_cast<sycl::half>(params.scale);
@@ -378,8 +457,8 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx,
 
     dnnl::graph::tensor t_mask;
     if (key.has_mask) {
-        t_mask = dnnl::graph::tensor(in_ports[port_idx++], eng,
-                                     const_cast<void *>(static_cast<const void *>(params.mask)));
+        t_mask =
+            dnnl::graph::tensor(in_ports[port_idx++], eng, const_cast<void *>(static_cast<const void *>(params.mask)));
     }
 
     // V pointer: same element layout as K
@@ -398,7 +477,7 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx,
     }
     in_tensors.push_back(t_v);
 
-    std::vector<dnnl::graph::tensor> out_tensors = {t_out};
+    std::vector<dnnl::graph::tensor> out_tensors = { t_out };
 
     // ---- Execute via SYCL interop API ----------------------------------------
     // Use sycl_interop::execute (not the member execute) so oneDNN properly
@@ -407,8 +486,7 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx,
     // for SYCL streams, causing temporary_scratchpad_t destructor throws.
     try {
         dnnl::stream dnnl_stream = ctx.stream_dnnl(stream);
-        dnnl::graph::sycl_interop::execute(entry->cp, dnnl_stream,
-                                           in_tensors, out_tensors);
+        dnnl::graph::sycl_interop::execute(entry->cp, dnnl_stream, in_tensors, out_tensors);
     } catch (std::exception & e) {
         fprintf(stderr, "[SYCL] oneDNN SDPA execute failed: %s\n", e.what());
         return false;

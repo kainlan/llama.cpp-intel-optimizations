@@ -1041,6 +1041,13 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     params.sinks     = sinks ? static_cast<const char *>(ggml_sycl_resolve_tensor_ptr(sinks, device)) : nullptr;
     params.dst       = safe_dst.resolve_as<float>();
 
+    // Source tensor types — consumers (e.g. oneDNN SDPA) need these to size byte
+    // strides correctly and to build logical tensors with the right data_type.
+    params.Q_type    = Q->type;
+    params.K_type    = K->type;
+    params.V_type    = V->type;
+    params.mask_type = mask ? mask->type : GGML_TYPE_F32;
+
     params.scale         = scale;
     params.max_bias      = max_bias;
     params.m0            = m0;
