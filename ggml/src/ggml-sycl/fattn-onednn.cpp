@@ -41,9 +41,17 @@ static sdpa_partition_cache * get_or_create_cache(ggml_backend_sycl_context & ct
 
 void ggml_sycl_sdpa_cache_destroy(void * ptr) {
     auto * cache = static_cast<sdpa_partition_cache *>(ptr);
-    // No lock needed: destroy is called at backend teardown after all inflight
-    // FA dispatches complete. shared_ptr semantics inside `hits` guarantee any
-    // concurrent-inflight entry holders keep their entry alive past cache delete.
+    // Two separate safety claims at play here:
+    //   1. The CACHE (this object) is never destroyed concurrently with an
+    //      inflight FA dispatch — ggml's backend-teardown contract runs
+    //      after all pending graph work has drained. That is what makes
+    //      destroying `cache` from here safe without a lock on `cache->m`.
+    //   2. Entries in `cache->hits` (shared_ptr<sdpa_compiled_entry>) are
+    //      separately shielded: any dispatch call that observed an entry
+    //      holds its own shared_ptr across the unlock, so the entry
+    //      outlives the map even if the map or cache were mutated. That
+    //      property is used by the dispatch entry, NOT by this destroy —
+    //      it is not what makes `delete cache` below legal.
     if (cache->scale_usm && cache->usm_queue) {
         sycl::free(cache->scale_usm, *cache->usm_queue);
     }
@@ -435,7 +443,10 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
     // meaningfully more complex for a one-time cost.
     std::shared_ptr<sdpa_compiled_entry> entry;
     {
-        std::unique_lock<std::mutex> lock(cache->m);
+        // lock_guard, not unique_lock: we never unlock manually, move, or wait
+        // on a condition_variable. lock_guard is lighter (no owns_lock flag)
+        // and makes the "scope-bound lock" intent explicit.
+        std::lock_guard<std::mutex> lock(cache->m);
 
         // Negative cache — previous compile for this shape failed; fall through fast.
         if (cache->negative.count(key)) {

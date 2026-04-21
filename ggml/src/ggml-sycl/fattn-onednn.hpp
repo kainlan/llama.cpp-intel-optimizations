@@ -106,18 +106,24 @@ struct sdpa_compiled_entry {
 // Stored as a pointer on ggml_backend_sycl_context so the header doesn't
 // need to pull in all graph headers downstream.
 //
-// Concurrency contract:
-// - `m` is a per-cache mutex — serialises all reads/writes of `hits`, `negative`,
-//   `scale_usm`, and `usm_queue`. One mutex per ggml_backend_sycl_context gives
-//   lock-free cross-device dispatch on multi-GPU systems.
-// - `hits` stores `std::shared_ptr<sdpa_compiled_entry>` rather than the entry
-//   inline. This gives stable pointers across map rehashes AND lets callers
-//   release the cache lock before they touch the entry (shared_ptr ownership
-//   keeps the entry alive even if the cache is destroyed concurrently).
-// - `scale_usm` is allocated under `m` via a double-checked pattern in the
-//   dispatch entry point.
+// Concurrency contract (two distinct safety properties):
+// - Entry lifetime: `hits` stores `std::shared_ptr<sdpa_compiled_entry>`. The
+//   dispatch entry copies the shared_ptr under `m`, then unlocks. The entry
+//   survives any subsequent map rehash/erase because the copied shared_ptr
+//   holds the last reference as needed. This is how callers safely touch
+//   `in_ports` / `out_ports` / `cp` after releasing the lock.
+// - Cache lifetime: the `sdpa_partition_cache` itself (containing `m`,
+//   `hits`, `scale_usm`, `usm_queue`) is NOT kept alive by shared_ptr.
+//   It relies on ggml's backend-teardown contract — no FA dispatch is in
+//   flight when `ggml_sycl_sdpa_cache_destroy` is called. shared_ptr on
+//   entries does not, by itself, make destroying the cache concurrently
+//   with a dispatch safe; the teardown contract is what makes it safe.
+// - `m` serialises all reads/writes of `hits`, `negative`, `scale_usm`, and
+//   `usm_queue`. One mutex per ggml_backend_sycl_context gives lock-free
+//   cross-device dispatch on multi-GPU systems.
+// - `scale_usm` is allocated under `m` on first use in the dispatch entry.
 struct sdpa_partition_cache {
-    mutable std::mutex                                                                            m;
+    std::mutex                                                                                    m;
     std::unordered_map<sdpa_shape_key, std::shared_ptr<sdpa_compiled_entry>, sdpa_shape_key_hash> hits;
     std::unordered_map<sdpa_shape_key, bool, sdpa_shape_key_hash>                                 negative;
     // USM host-pinned buffer for the scalar scale value.
