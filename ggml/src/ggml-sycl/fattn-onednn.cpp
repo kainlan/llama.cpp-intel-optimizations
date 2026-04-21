@@ -21,13 +21,18 @@ using dim_t    = lt::dim;
 using dims_t   = lt::dims;
 using dt       = lt::data_type;
 
-// Per-context SDPA cache.  Stored via a raw pointer inside ggml_backend_sycl_context
-// to avoid pulling graph headers into common.hpp.  Created on first use, freed at
+// Per-context SDPA cache. Stored via a raw pointer inside ggml_backend_sycl_context
+// to avoid pulling graph headers into common.hpp. Created on first use, freed at
 // context teardown via ggml_sycl_sdpa_cache_destroy().
-static std::mutex g_sdpa_cache_mutex;
+//
+// This global mutex guards ONLY the cache allocation race (first call on a given
+// context). Once the cache exists, all further accesses use the per-cache
+// `cache->m` — so multi-GPU workloads with one cache per context do not serialise
+// across devices.
+static std::mutex g_sdpa_cache_init_mutex;
 
 static sdpa_partition_cache * get_or_create_cache(ggml_backend_sycl_context & ctx) {
-    std::lock_guard<std::mutex> lock(g_sdpa_cache_mutex);
+    std::lock_guard<std::mutex> lock(g_sdpa_cache_init_mutex);
     if (!ctx.sdpa_cache) {
         ctx.sdpa_cache = new sdpa_partition_cache();
     }
@@ -36,6 +41,9 @@ static sdpa_partition_cache * get_or_create_cache(ggml_backend_sycl_context & ct
 
 void ggml_sycl_sdpa_cache_destroy(void * ptr) {
     auto * cache = static_cast<sdpa_partition_cache *>(ptr);
+    // No lock needed: destroy is called at backend teardown after all inflight
+    // FA dispatches complete. shared_ptr semantics inside `hits` guarantee any
+    // concurrent-inflight entry holders keep their entry alive past cache delete.
     if (cache->scale_usm && cache->usm_queue) {
         sycl::free(cache->scale_usm, *cache->usm_queue);
     }
@@ -399,45 +407,73 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
 
     sdpa_partition_cache * cache = get_or_create_cache(ctx);
 
-    // Fast-path: negative cache (compile previously failed for this shape)
+    // ------------------------------------------------------------------
+    // Cache lookup + (if needed) compile — all under the per-cache mutex.
+    // ------------------------------------------------------------------
+    // We hold `cache->m` across the JIT compile in the miss path. This:
+    //   - closes the TOCTOU window where two threads racing the same shape
+    //     both compile, one insert wins, the other insert leaks work.
+    //   - prevents rehashing/erasing `cache->hits` while another thread is
+    //     still holding a reference to an entry (combined with shared_ptr
+    //     ownership below, even a stray erase on the reader side would be
+    //     safe, but we don't need to rely on that).
+    //
+    // Downside: other shape keys block during a slow compile. In practice
+    // there are only a handful of unique shapes per workload (they warm the
+    // cache during the first few prefill calls) so this serialisation is
+    // bounded and amortised. The alternative (per-key promise/future) is
+    // meaningfully more complex for a one-time cost.
+    std::shared_ptr<sdpa_compiled_entry> entry;
     {
-        std::lock_guard<std::mutex> lock(g_sdpa_cache_mutex);
+        std::unique_lock<std::mutex> lock(cache->m);
+
+        // Negative cache — previous compile for this shape failed; fall through fast.
         if (cache->negative.count(key)) {
             return false;
         }
-    }
 
-    // Get or compile partition
-    sdpa_compiled_entry * entry = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(g_sdpa_cache_mutex);
-        auto                        it = cache->hits.find(key);
+        auto it = cache->hits.find(key);
         if (it != cache->hits.end()) {
-            entry = &it->second;
-        }
-    }
-
-    if (!entry) {
-        // Cache miss — compile (can be slow on first call, fast after JIT cache warms)
-        dnnl::engine eng = ctx.engine_dnnl(stream);
-        try {
-            build_result r = build_and_compile_sdpa(key, eng);
-            {
-                std::lock_guard<std::mutex> lock(g_sdpa_cache_mutex);
-                auto &                      e = cache->hits[key];
-                e.cp                          = std::move(r.cp);
-                e.in_ports                    = std::move(r.in_ports);
-                e.out_ports                   = std::move(r.out_ports);
-                entry                         = &cache->hits[key];
+            entry = it->second;  // shared_ptr copy; keeps the entry alive past unlock.
+        } else {
+            // Cache miss — compile while holding the lock. oneDNN JIT is slow
+            // (10-100ms) only on the first call for a new shape; subsequent
+            // calls hit the fast-path above.
+            dnnl::engine eng = ctx.engine_dnnl(stream);
+            try {
+                build_result r   = build_and_compile_sdpa(key, eng);
+                auto         ent = std::make_shared<sdpa_compiled_entry>();
+                ent->cp          = std::move(r.cp);
+                ent->in_ports    = std::move(r.in_ports);
+                ent->out_ports   = std::move(r.out_ports);
+                // Store under the key, retain our own shared_ptr copy for use
+                // below (entry survives any future cache mutation).
+                cache->hits[key] = ent;
+                entry            = std::move(ent);
+            } catch (std::exception & e) {
+                fprintf(stderr, "[SYCL] oneDNN SDPA compile failed for D=%d ncols=%d ne11=%d H_q=%d H_kv=%d: %s\n", D,
+                        params.ne01, params.ne11, H_q, H_kv, e.what());
+                cache->negative[key] = true;
+                return false;
             }
-        } catch (std::exception & e) {
-            fprintf(stderr, "[SYCL] oneDNN SDPA compile failed for D=%d ncols=%d ne11=%d H_q=%d H_kv=%d: %s\n", D,
-                    params.ne01, params.ne11, H_q, H_kv, e.what());
-            std::lock_guard<std::mutex> lock(g_sdpa_cache_mutex);
-            cache->negative[key] = true;
-            return false;
+        }
+
+        // Scale is a scalar f16. oneDNN SYCL execute reads it from the GPU side,
+        // so it must be USM-accessible. Allocate once as sycl::malloc_host (pinned,
+        // GPU-accessible via PCIe zero-copy) and reuse across calls. Allocation
+        // happens under the same lock to avoid a double-alloc race on first use.
+        if (!cache->scale_usm) {
+            cache->usm_queue = stream;
+            cache->scale_usm = static_cast<sycl::half *>(sycl::malloc_host(sizeof(sycl::half), *stream));
+            GGML_ASSERT(cache->scale_usm && "oneDNN SDPA: failed to allocate USM scale buffer");
         }
     }
+    // ------------------------------------------------------------------
+    // Lock released. `entry` is a shared_ptr — the compiled partition and
+    // port lists live as long as this local. `cache->scale_usm` is stable
+    // (set-once, never replaced), so reading it without the lock is safe
+    // once we observed it non-null above.
+    // ------------------------------------------------------------------
 
     // oneDNN graph execute is NOT compatible with SYCL command graph recording.
     // Follow the same pattern as DnnlMatMulWrapper in dnnl-ops.hpp: skip during recording.
@@ -448,20 +484,19 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
     // ---- Wrap USM pointers as dnnl::graph::tensor ----------------------------
     dnnl::engine eng = ctx.engine_dnnl(stream);
 
-    // Scale is a scalar f16.  oneDNN SYCL execute reads it from the GPU side,
-    // so it must be USM-accessible.  Allocate once as sycl::malloc_host (pinned,
-    // GPU-accessible via PCIe zero-copy) and reuse across calls.
-    if (!cache->scale_usm) {
-        cache->usm_queue = stream;
-        cache->scale_usm = static_cast<sycl::half *>(sycl::malloc_host(sizeof(sycl::half), *stream));
-        GGML_ASSERT(cache->scale_usm && "oneDNN SDPA: failed to allocate USM scale buffer");
-    }
-    // We now build the graph with op::kind::Divide (to match oneDNN's canonical
-    // SDPA pattern), so the scalar must be the DIVISOR. ggml supplies
+    // We build the graph with op::kind::Divide (to match oneDNN's canonical
+    // SDPA pattern), so the scalar is the DIVISOR. ggml supplies
     // params.scale = 1/sqrt(D); invert it here to get sqrt(D) for the divide.
     // Guard against the (very unlikely) params.scale == 0 case with a passthrough
     // of 1.0 — upstream never feeds zero scale to flash-attn, but the div-by-zero
     // would be catastrophic if it happened.
+    //
+    // Note: scale_usm is per-cache (one per context), not per-shape. Concurrent
+    // callers on the same context race on this write, but each call races only
+    // with itself by the time its execute runs (the value is read on the GPU
+    // side as part of the submitted graph). If this ever becomes a real race
+    // under concurrent-caller workloads, the fix is per-shape scale storage;
+    // today the single-caller-per-context invariant makes it benign.
     const float divisor = (params.scale != 0.0f) ? (1.0f / params.scale) : 1.0f;
     *cache->scale_usm   = static_cast<sycl::half>(divisor);
 

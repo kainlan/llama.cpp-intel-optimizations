@@ -17,6 +17,8 @@
 #    include "oneapi/dnnl/dnnl_sycl.hpp"
 
 #    include <functional>
+#    include <memory>
+#    include <mutex>
 #    include <unordered_map>
 
 // Cache key for oneDNN graph compiled_partition.
@@ -102,14 +104,26 @@ struct sdpa_compiled_entry {
 // SDPA compiled_partition cache owned by backend context (one per device).
 // Stored as a pointer on ggml_backend_sycl_context so the header doesn't
 // need to pull in all graph headers downstream.
+//
+// Concurrency contract:
+// - `m` is a per-cache mutex — serialises all reads/writes of `hits`, `negative`,
+//   `scale_usm`, and `usm_queue`. One mutex per ggml_backend_sycl_context gives
+//   lock-free cross-device dispatch on multi-GPU systems.
+// - `hits` stores `std::shared_ptr<sdpa_compiled_entry>` rather than the entry
+//   inline. This gives stable pointers across map rehashes AND lets callers
+//   release the cache lock before they touch the entry (shared_ptr ownership
+//   keeps the entry alive even if the cache is destroyed concurrently).
+// - `scale_usm` is allocated under `m` via a double-checked pattern in the
+//   dispatch entry point.
 struct sdpa_partition_cache {
-    std::unordered_map<sdpa_shape_key, sdpa_compiled_entry, sdpa_shape_key_hash> hits;
-    std::unordered_map<sdpa_shape_key, bool, sdpa_shape_key_hash>                negative;
+    mutable std::mutex                                                                            m;
+    std::unordered_map<sdpa_shape_key, std::shared_ptr<sdpa_compiled_entry>, sdpa_shape_key_hash> hits;
+    std::unordered_map<sdpa_shape_key, bool, sdpa_shape_key_hash>                                 negative;
     // USM host-pinned buffer for the scalar scale value.
     // Allocated once on first use; GPU-accessible via PCIe zero-copy.
     // Must be freed with sycl::free(scale_usm, *usm_queue) at destruction.
-    sycl::half *                                                                 scale_usm = nullptr;
-    sycl::queue *                                                                usm_queue = nullptr;
+    sycl::half *                                                                                  scale_usm = nullptr;
+    sycl::queue *                                                                                 usm_queue = nullptr;
 };
 
 // Check whether the current op is eligible for the oneDNN graph SDPA path.
