@@ -120,9 +120,8 @@ struct variant_info {
 //   { 16, 16, 16, 16 } — ncols>=16 path, matches `16x16x16 fp16→fp32`
 //
 // Triple-brace init: std::array<T, N> wraps a single-element C-array; the outer
-// pair opens the array, the inner opens the C-array, and the innermost opens
-// the variant_info aggregate. Matches the only other std::array usage in the
-// backend.
+// pair opens the array, the middle opens the C-array, and the innermost opens
+// the variant_info aggregate.
 static constexpr std::array<variant_info, 1> fattn_xmx_v2_variants = { { { 8, 16, 16, 8 } } };
 
 static_assert(fattn_xmx_v2_variants[0].tm == 8 && fattn_xmx_v2_variants[0].tk == 16 &&
