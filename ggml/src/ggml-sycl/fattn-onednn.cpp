@@ -241,7 +241,6 @@ static build_result build_and_compile_sdpa(const sdpa_shape_key & key, const dnn
     // The row dimension is padded (GGML_KQ_MASK_PAD) so the physical row stride
     // nb31 is != ncols*elem_size. Use the real tensor byte strides.
     const dim_t m_s1 = key.has_mask ? static_cast<dim_t>(key.m_nb1 / (int64_t) m_esz) : 1;
-    const dim_t m_s2 = key.has_mask ? static_cast<dim_t>(key.m_nb2 / (int64_t) m_esz) : 1;
     const dim_t m_s3 = key.has_mask ? static_cast<dim_t>(key.m_nb3 / (int64_t) m_esz) : 1;
 
     dims_t mask_dims, mask_strides;
