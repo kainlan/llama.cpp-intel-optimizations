@@ -11,6 +11,7 @@
 #    include "common.hpp"
 #    include "fattn-common.hpp"
 
+#    include <atomic>
 #    include <cstdio>
 #    include <mutex>
 
@@ -91,6 +92,18 @@ bool ggml_sycl_flash_attn_ext_onednn_eligible(const fattn_params & params,
     }
     (void) H_q;
     (void) H_kv;
+    // Temporary diagnostic (remove once Fix A+B is validated on GPU):
+    // log the first three gate hits so we can see which (ne01, ne11, mask)
+    // shapes actually reach the oneDNN path from a real workload.
+    static std::atomic<int> dbg_counter{ 0 };
+    int                     n = dbg_counter.fetch_add(1);
+    if (n < 3) {
+        fprintf(stderr,
+                "[SYCL oneDNN] eligible=true  call#%d  ne01=%d  ne11=%d  D=%d  H_q=%d  H_kv=%d  has_mask=%d  "
+                "mask_type=%d\n",
+                n, params.ne01, params.ne11, params.ne00, (int) params.ne02, (int) params.ne12, params.mask ? 1 : 0,
+                params.mask ? (int) params.mask_type : -1);
+    }
     return true;
 }
 
@@ -269,8 +282,15 @@ static build_result build_and_compile_sdpa(const sdpa_shape_key & key, const dnn
     bmm1.add_inputs({ lt_q, lt_k });
     bmm1.add_outputs({ lt_score });
 
-    // params.scale = 1/sqrt(D) — multiply (not divide) to get scaled scores
-    op div_op(id++, op::kind::Multiply, "scale_mul");
+    // oneDNN's SDPA pattern matcher is canonical — it matches MatMul → Divide,
+    // NOT MatMul → Multiply (even though they are mathematically equivalent with
+    // the reciprocal scalar). Using Multiply here splits the fused SDPA partition
+    // and pushes execution onto a slower, less-tested path that has been observed
+    // to produce garbled output on Mistral 7B. See
+    // /opt/intel/oneapi/dnnl/.../examples/{gqa,sdpa}.cpp for the reference
+    // canonical pattern. The scalar written at execute time compensates by
+    // storing sqrt(D) (i.e. 1/params.scale) instead of params.scale.
+    op div_op(id++, op::kind::Divide, "scale_div");
     div_op.add_inputs({ lt_score, lt_scale });
     div_op.add_outputs({ lt_scaled });
 
@@ -291,6 +311,12 @@ static build_result build_and_compile_sdpa(const sdpa_shape_key & key, const dnn
 
     op sfmx(id++, op::kind::SoftMax, "softmax");
     sfmx.set_attr<int64_t>(op::attr::axis, -1);
+    // "inf_as_zero": for rows where every input is -inf (e.g. a causal mask
+    // row with no attended KV positions), treat the output as all-zero
+    // instead of NaN. Matches the reference oneDNN SDPA examples and is
+    // required to get correct behaviour on masked prefill rows; without it
+    // NaNs propagate from masked rows into bmm2 and scramble the output.
+    sfmx.set_attr<std::string>(op::attr::mode, "inf_as_zero");
     sfmx.add_inputs({ lt_sfmx_in });
     sfmx.add_outputs({ lt_probs });
 
@@ -443,7 +469,14 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
         cache->scale_usm = static_cast<sycl::half *>(sycl::malloc_host(sizeof(sycl::half), *stream));
         GGML_ASSERT(cache->scale_usm && "oneDNN SDPA: failed to allocate USM scale buffer");
     }
-    *cache->scale_usm = static_cast<sycl::half>(params.scale);
+    // We now build the graph with op::kind::Divide (to match oneDNN's canonical
+    // SDPA pattern), so the scalar must be the DIVISOR. ggml supplies
+    // params.scale = 1/sqrt(D); invert it here to get sqrt(D) for the divide.
+    // Guard against the (very unlikely) params.scale == 0 case with a passthrough
+    // of 1.0 — upstream never feeds zero scale to flash-attn, but the div-by-zero
+    // would be catastrophic if it happened.
+    const float divisor = (params.scale != 0.0f) ? (1.0f / params.scale) : 1.0f;
+    *cache->scale_usm   = static_cast<sycl::half>(divisor);
 
     const auto & in_ports  = entry->in_ports;
     const auto & out_ports = entry->out_ports;
