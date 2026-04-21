@@ -442,7 +442,10 @@ static void init_fa_onednn_config() {
         return;
     }
     g_sycl_fa_onednn_initialized = true;
-    const char * env             = std::getenv("GGML_SYCL_FA_ONEDNN");
+#ifdef GGML_SYCL_F16
+    fprintf(stderr, "[SYCL] GGML_SYCL_F16 build: attention Q/accumulators are f16\n");
+#endif
+    const char * env = std::getenv("GGML_SYCL_FA_ONEDNN");
     if (env && (strcmp(env, "0") == 0 || strcmp(env, "false") == 0)) {
         g_sycl_fa_onednn_enabled = false;
         fprintf(stderr, "[SYCL] oneDNN SDPA path disabled (GGML_SYCL_FA_ONEDNN=0)\n");

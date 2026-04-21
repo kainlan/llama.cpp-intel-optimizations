@@ -243,6 +243,10 @@ if (GGML_SYCL_F16)
         message(WARNING "AMD target does not entirely support FP16 in the SYCL backend.")
     endif()
     add_compile_definitions(GGML_SYCL_F16)
+    # Propagate to the ggml target (PUBLIC) so consumers like src/llama-graph.cpp
+    # see GGML_SYCL_F16 when they include ggml-sycl.h and can cast Q at graph-build
+    # time via GGML_SYCL_FATTN_Q_TYPE.
+    target_compile_definitions(ggml PUBLIC GGML_SYCL_F16)
 endif()
 
 if (GGML_SYCL_TARGET STREQUAL "INTEL")

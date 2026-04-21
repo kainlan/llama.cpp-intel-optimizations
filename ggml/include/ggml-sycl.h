@@ -12,6 +12,18 @@
 #define GGML_SYCL_NAME        "SYCL"
 #define GGML_SYCL_MAX_DEVICES 48
 
+// Attention Q/accumulator dtype for the SYCL FLASH_ATTN_EXT path.
+// Mirrors the `afloat`/`afloat2` typedef block in ggml/src/ggml-sycl/common.hpp:
+// when the SYCL backend is built with GGML_SYCL_F16 the attention path expects
+// an f16 Q input; otherwise it expects f32. Exposed here (pure C header) so
+// src/llama-graph.cpp can cast Q at graph-build time without pulling a SYCL
+// translation unit header.
+#ifdef GGML_SYCL_F16
+#    define GGML_SYCL_FATTN_Q_TYPE GGML_TYPE_F16
+#else
+#    define GGML_SYCL_FATTN_Q_TYPE GGML_TYPE_F32
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif

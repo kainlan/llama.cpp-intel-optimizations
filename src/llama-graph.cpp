@@ -1709,6 +1709,19 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_transpose(ctx0, v);
         }
 
+#ifdef GGML_USE_SYCL
+        // Q cast to the dtype expected by the SYCL flash-attention dispatcher.
+        // The macro is declared in ggml-sycl.h and resolves to f16 under the
+        // SYCL-F16 build, f32 otherwise. ggml_cast is a no-op when the type
+        // already matches.
+        {
+            const enum ggml_type sycl_q_type = (enum ggml_type) GGML_SYCL_FATTN_Q_TYPE;
+            if (q->type != sycl_q_type) {
+                q = ggml_cast(ctx0, q, sycl_q_type);
+            }
+        }
+#endif
+
         // this can happen when KV cache is not used (e.g. an embedding model with non-causal attn)
         if (k->type == GGML_TYPE_F32) {
             k = ggml_cast(ctx0, k, GGML_TYPE_F16);

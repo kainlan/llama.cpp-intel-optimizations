@@ -475,9 +475,17 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
     const int     this_sg_q_tile = sg_id % SG_ROWS_PER_Q;  // which Q-tile this SG covers
     const int     sg_q_base      = this_sg_q_tile * TM;
 
-    float VKQ[TM][D_TILES];  // [query_slot_in_tile][D_tile]
-    float KQ_max[TM];
-    float KQ_sum[TM];
+    // Per-lane accumulator. `afloat` is `sycl::half` under GGML_SYCL_F16 and
+    // `float` otherwise (typedef in ggml-sycl/common.hpp). `KQ_max` / `KQ_sum`
+    // stay in full float: online-softmax state is precision-critical (the
+    // exp(max_old - max_new) rescale cancels rapidly if the running max is
+    // rounded to half), and the FTZ bit manipulation further down assumes a
+    // 32-bit scale_old. `VKQ` is the downstream V-weighted sum and tolerates
+    // half precision under GGML_SYCL_F16 because it is driven by softmax
+    // probabilities that already live in a narrow dynamic range.
+    afloat VKQ[TM][D_TILES];  // [query_slot_in_tile][D_tile]
+    float  KQ_max[TM];
+    float  KQ_sum[TM];
 
 #    pragma unroll
     for (int r = 0; r < TM; ++r) {
@@ -485,7 +493,7 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
         KQ_sum[r] = 0.0f;
 #    pragma unroll
         for (int t = 0; t < D_TILES; ++t) {
-            VKQ[r][t] = 0.0f;
+            VKQ[r][t] = afloat(0.0f);
         }
     }
 
@@ -627,9 +635,13 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
                 scale_bits *= static_cast<uint32_t>(KQ_max_diff >= SOFTMAX_FTZ_THRESHOLD);
                 __builtin_memcpy(&scale_old, &scale_bits, sizeof(float));
 
+                // VKQ lives in `afloat` (half under GGML_SYCL_F16). Apply the
+                // rescale through an explicit narrow cast so the half*=float
+                // mixed-mode multiply is readable and not silently implicit.
+                const afloat scale_old_a = afloat(scale_old);
 #    pragma unroll
                 for (int t = 0; t < D_TILES; ++t) {
-                    VKQ[r][t] *= scale_old;
+                    VKQ[r][t] *= scale_old_a;
                 }
                 KQ_sum[r] *= scale_old;
                 KQ_max[r] = new_max;
@@ -718,9 +730,10 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
             KQ_sum[r]               = KQ_sum[r] * scale_old + sink_weight;
             KQ_max[r]               = new_max;
 
+            const afloat scale_old_a = afloat(scale_old);
 #    pragma unroll
             for (int t = 0; t < D_TILES; ++t) {
-                VKQ[r][t] *= scale_old;
+                VKQ[r][t] *= scale_old_a;
             }
         }
     }
@@ -735,13 +748,16 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
             continue;
         }
 
+        // KQ_sum stays in float (softmax denominator precision); VKQ is `afloat`
+        // under GGML_SYCL_F16, so the final multiply promotes to float for the
+        // f32 dst_row write expected by the public FA contract.
         const float inv_sum = (KQ_sum[r] > 0.0f) ? (1.0f / KQ_sum[r]) : 0.0f;
         float *     dst_row = dst + (int64_t) D * (head + ne02 * (q_abs + ne01 * sequence));
 
 #    pragma unroll
         for (int t = 0; t < D_TILES; ++t) {
             const int   d   = t * TN + lane;
-            const float val = VKQ[r][t] * inv_sum;
+            const float val = (float) VKQ[r][t] * inv_sum;
             dst_row[d]      = sycl::isfinite(val) ? val : 0.0f;
         }
     }

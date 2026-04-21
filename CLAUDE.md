@@ -13,11 +13,17 @@ source /opt/intel/oneapi/setvars.sh --force
 ```bash
 source /opt/intel/oneapi/setvars.sh --force
 cmake -B build -G Ninja -DGGML_SYCL=ON -DGGML_SYCL_TARGET=INTEL \
-  -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
+  -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DGGML_SYCL_F16=ON
 ninja -C build -j $(nproc)
 ```
 
 **Build time**: ~10 minutes with ccache, ~25 minutes without.
+
+**`-DGGML_SYCL_F16=ON`** enables 16-bit float arithmetic throughout the SYCL backend:
+- **dmmv dequant** (active today): `dfloat`/`dfloat2` typedef at `ggml/src/ggml-sycl/common.hpp:363` pivots to `sycl::half`/`sycl::half2` under the flag.
+- **Attention path** (via bead `llama.cpp-mgx69` — gates Q f16 cast and `afloat` accumulator typedef in `fattn-xmx-f16-v2.hpp`; unlocks oneDNN SDPA eligibility on Mistral once the bead lands).
+
+Precision tradeoff: ~4 mantissa bits vs f32. Declare OFF only for precision-sensitive models (phi-2 per `ggml/include/ggml.h:1294` comment, or similar).
 
 ### Ninja vs Make
 Prefer Ninja (`-G Ninja`) for:

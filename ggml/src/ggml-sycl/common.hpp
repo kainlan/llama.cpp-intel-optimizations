@@ -368,6 +368,16 @@ typedef float        dfloat;  // dequantize float
 typedef sycl::float2 dfloat2;
 #endif  // GGML_SYCL_F16
 
+#ifdef GGML_SYCL_F16
+typedef sycl::half  afloat;  // attention float (Q input, SLM tiles, per-lane accumulators)
+typedef sycl::half2 afloat2;
+#    define GGML_SYCL_FATTN_Q_TYPE GGML_TYPE_F16
+#else
+typedef float        afloat;
+typedef sycl::float2 afloat2;
+#    define GGML_SYCL_FATTN_Q_TYPE GGML_TYPE_F32
+#endif  // GGML_SYCL_F16
+
 #define MMVQ_MAX_BATCH_SIZE 8
 
 // Multi-row MMVQ kernel configuration
