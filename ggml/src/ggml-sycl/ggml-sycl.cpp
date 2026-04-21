@@ -18772,6 +18772,11 @@ void ggml_sycl::L2PrefetchManagerDeleter::operator()(ggml_sycl::L2PrefetchManage
     delete ptr;
 }
 
+#if GGML_SYCL_DNNL
+// Forward declaration — implemented in fattn-onednn.cpp
+void ggml_sycl_sdpa_cache_destroy(void * ptr);
+#endif
+
 void ggml_sycl::UnifiedKernelDeleter::operator()(ggml_sycl::UnifiedKernel * ptr) const {
     delete ptr;
 }
@@ -18831,6 +18836,13 @@ ggml_backend_sycl_context::~ggml_backend_sycl_context() {
         free_staging_buffer();
     } catch (...) {
     }
+
+#if GGML_SYCL_DNNL
+    if (sdpa_cache) {
+        ggml_sycl_sdpa_cache_destroy(sdpa_cache);
+        sdpa_cache = nullptr;
+    }
+#endif
 }
 
 std::pair<void *, size_t> ggml_backend_sycl_context::get_staging_buffer(size_t needed_bytes, sycl::queue & queue) {

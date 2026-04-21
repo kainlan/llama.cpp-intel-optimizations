@@ -2846,6 +2846,11 @@ struct ggml_backend_sycl_context {
     // Lazy-initialized on first persistent dispatch to avoid allocation when unused
     std::unique_ptr<ggml_sycl::UnifiedKernel, ggml_sycl::UnifiedKernelDeleter> unified_kernel;
 
+    // oneDNN graph SDPA compiled_partition cache (Phase 3 — fattn-onednn.cpp).
+    // Opaque pointer (sdpa_partition_cache*) to avoid pulling graph headers here.
+    // Freed via ggml_sycl_sdpa_cache_destroy() in the destructor.
+    void * sdpa_cache = nullptr;
+
     queue_ptr qptrs[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS] = { { nullptr } };
 
     explicit ggml_backend_sycl_context(int device) :
