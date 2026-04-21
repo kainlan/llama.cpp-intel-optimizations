@@ -11,6 +11,7 @@
 #    include "common.hpp"
 #    include "fattn-common.hpp"
 
+#    include <cmath>
 #    include <cstdio>
 #    include <mutex>
 
@@ -52,9 +53,8 @@ void ggml_sycl_sdpa_cache_destroy(void * ptr) {
     //      outlives the map even if the map or cache were mutated. That
     //      property is used by the dispatch entry, NOT by this destroy —
     //      it is not what makes `delete cache` below legal.
-    if (cache->scale_usm && cache->usm_queue) {
-        sycl::free(cache->scale_usm, *cache->usm_queue);
-    }
+    // Per-entry USM scratch (`scale_usm`) is freed by sdpa_compiled_entry's
+    // destructor when the last shared_ptr drops during `delete cache`.
     delete cache;
 }
 
@@ -123,13 +123,56 @@ bool ggml_sycl_flash_attn_ext_onednn_eligible(const fattn_params & params,
 // For GQA     (H_q != H_kv): Q is 5-D (batch, H_kv, N_rep, S, D);
 //                              K/V are 5-D (batch, H_kv, 1, S, D).
 // The same pointer is used — only the logical_tensor dims/strides differ.
+// RAII wrapper for build output. Owns `scale_usm` until the caller transfers
+// it into `sdpa_compiled_entry` (by nulling out these fields). If any
+// exception fires between build_and_compile_sdpa returning and the transfer
+// completing (e.g. std::make_shared bad_alloc), the destructor frees the
+// buffer instead of leaking.
 struct build_result {
     std::vector<lt>                 in_ports;
     std::vector<lt>                 out_ports;
     dnnl::graph::compiled_partition cp;
+    sycl::half *                    scale_usm = nullptr;
+    sycl::queue *                   usm_queue = nullptr;
+
+    build_result()                                 = default;
+    build_result(const build_result &)             = delete;
+    build_result & operator=(const build_result &) = delete;
+
+    build_result(build_result && o) noexcept :
+        in_ports(std::move(o.in_ports)),
+        out_ports(std::move(o.out_ports)),
+        cp(std::move(o.cp)),
+        scale_usm(o.scale_usm),
+        usm_queue(o.usm_queue) {
+        o.scale_usm = nullptr;
+        o.usm_queue = nullptr;
+    }
+
+    build_result & operator=(build_result && o) noexcept {
+        if (this != &o) {
+            if (scale_usm && usm_queue) {
+                sycl::free(scale_usm, *usm_queue);
+            }
+            in_ports    = std::move(o.in_ports);
+            out_ports   = std::move(o.out_ports);
+            cp          = std::move(o.cp);
+            scale_usm   = o.scale_usm;
+            usm_queue   = o.usm_queue;
+            o.scale_usm = nullptr;
+            o.usm_queue = nullptr;
+        }
+        return *this;
+    }
+
+    ~build_result() {
+        if (scale_usm && usm_queue) {
+            sycl::free(scale_usm, *usm_queue);
+        }
+    }
 };
 
-static build_result build_and_compile_sdpa(const sdpa_shape_key & key, const dnnl::engine & eng) {
+static build_result build_and_compile_sdpa(const sdpa_shape_key & key, const dnnl::engine & eng, sycl::queue * stream) {
     const int  batch  = 1;
     const int  D      = key.D;
     const int  ncols  = key.ncols;
@@ -366,10 +409,25 @@ static build_result build_and_compile_sdpa(const sdpa_shape_key & key, const dnn
 
     auto cp = parts[0].compile(in_ports, out_ports, eng);
 
+    // Allocate + populate the per-shape scalar divisor. Allocating here
+    // (inside build_and_compile_sdpa, which the caller invokes under the
+    // cache mutex) means the buffer is published as part of the entry only
+    // after it is fully initialised — no write-site remains on the execute
+    // path. The value is derived from `key.D`, not from any per-call scale
+    // input: the oneDNN SDPA path requires scale == 1/sqrt(D) (enforced by
+    // a runtime assertion at dispatch), so the divisor sqrt(D) is shape-
+    // determined and a single buffer per compiled partition is correct for
+    // all calls that reuse the partition.
+    sycl::half * scale_usm = static_cast<sycl::half *>(sycl::malloc_host(sizeof(sycl::half), *stream));
+    GGML_ASSERT(scale_usm && "oneDNN SDPA: failed to allocate USM scale buffer");
+    *scale_usm = static_cast<sycl::half>(sqrtf(static_cast<float>(key.D)));
+
     build_result r;
     r.in_ports  = std::move(in_ports);
     r.out_ports = std::move(out_ports);
     r.cp        = std::move(cp);
+    r.scale_usm = scale_usm;
+    r.usm_queue = stream;
     return r;
 }
 
@@ -471,11 +529,19 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
             // calls hit the fast-path above.
             dnnl::engine eng = ctx.engine_dnnl(stream);
             try {
-                build_result r   = build_and_compile_sdpa(key, eng);
+                build_result r   = build_and_compile_sdpa(key, eng, stream);
                 auto         ent = std::make_shared<sdpa_compiled_entry>();
                 ent->cp          = std::move(r.cp);
                 ent->in_ports    = std::move(r.in_ports);
                 ent->out_ports   = std::move(r.out_ports);
+                // Transfer per-shape USM scratch ownership to the entry. The
+                // entry's destructor frees it when the last shared_ptr drops
+                // (cache teardown). Nulling r's fields prevents the build_result
+                // destructor from double-freeing on scope exit.
+                ent->scale_usm   = r.scale_usm;
+                ent->usm_queue   = r.usm_queue;
+                r.scale_usm      = nullptr;
+                r.usm_queue      = nullptr;
                 // Store under the key, retain our own shared_ptr copy for use
                 // below (entry survives any future cache mutation).
                 cache->hits[key] = ent;
@@ -487,22 +553,13 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
                 return false;
             }
         }
-
-        // Scale is a scalar f16. oneDNN SYCL execute reads it from the GPU side,
-        // so it must be USM-accessible. Allocate once as sycl::malloc_host (pinned,
-        // GPU-accessible via PCIe zero-copy) and reuse across calls. Allocation
-        // happens under the same lock to avoid a double-alloc race on first use.
-        if (!cache->scale_usm) {
-            cache->usm_queue = stream;
-            cache->scale_usm = static_cast<sycl::half *>(sycl::malloc_host(sizeof(sycl::half), *stream));
-            GGML_ASSERT(cache->scale_usm && "oneDNN SDPA: failed to allocate USM scale buffer");
-        }
     }
     // ------------------------------------------------------------------
-    // Lock released. `entry` is a shared_ptr — the compiled partition and
-    // port lists live as long as this local. `cache->scale_usm` is stable
-    // (set-once, never replaced), so reading it without the lock is safe
-    // once we observed it non-null above.
+    // Lock released. `entry` is a shared_ptr — the compiled partition,
+    // port lists, and per-shape `scale_usm` live as long as this local.
+    // `scale_usm` was populated exactly once inside build_and_compile_sdpa
+    // (under the cache mutex) and is never written again; the execute
+    // path only READS it. No race.
     // ------------------------------------------------------------------
 
     // oneDNN graph execute is NOT compatible with SYCL command graph recording.
@@ -515,20 +572,26 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
     dnnl::engine eng = ctx.engine_dnnl(stream);
 
     // We build the graph with op::kind::Divide (to match oneDNN's canonical
-    // SDPA pattern), so the scalar is the DIVISOR. ggml supplies
-    // params.scale = 1/sqrt(D); invert it here to get sqrt(D) for the divide.
-    // Guard against the (very unlikely) params.scale == 0 case with a passthrough
-    // of 1.0 — upstream never feeds zero scale to flash-attn, but the div-by-zero
-    // would be catastrophic if it happened.
+    // SDPA pattern), so the scalar is the DIVISOR. The value stored in
+    // `entry->scale_usm` is sqrt(D), pre-computed from `key.D` at partition
+    // compile time. This path ASSERTS the invariant that ggml supplies
+    // params.scale == 1/sqrt(D); any future model that deviates from it
+    // needs a different fattn path (e.g. per-op scalar input) and should
+    // fail loudly here rather than silently producing wrong outputs.
     //
-    // Note: scale_usm is per-cache (one per context), not per-shape. Concurrent
-    // callers on the same context race on this write, but each call races only
-    // with itself by the time its execute runs (the value is read on the GPU
-    // side as part of the submitted graph). If this ever becomes a real race
-    // under concurrent-caller workloads, the fix is per-shape scale storage;
-    // today the single-caller-per-context invariant makes it benign.
-    const float divisor = (params.scale != 0.0f) ? (1.0f / params.scale) : 1.0f;
-    *cache->scale_usm   = static_cast<sycl::half>(divisor);
+    // Epsilon: sqrt(D) for our target Ds (64, 128, 256) has clean f32 bits
+    // and narrowing to f16 drifts by <= ~1e-3. 1e-3 on the f32 comparison
+    // is both tight enough to catch a wrong formula (e.g. 1/D instead of
+    // 1/sqrt(D)) and loose enough to tolerate f16 rounding plus any tiny
+    // ULP-level differences in how the upstream computes 1/sqrt(D).
+    if (params.scale == 0.0f) {
+        return false;  // zero scale would divide-by-zero; upstream never sends this
+    }
+    const float inv_scale  = 1.0f / params.scale;
+    const float sqrt_D     = sqrtf(static_cast<float>(D));
+    const float scale_diff = std::fabs(inv_scale - sqrt_D);
+    GGML_ASSERT(scale_diff < 1e-3f &&
+                "oneDNN SDPA: params.scale deviates from 1/sqrt(D) — model needs a different fattn path");
 
     const auto & in_ports  = entry->in_ports;
     const auto & out_ports = entry->out_ports;
@@ -538,7 +601,7 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
 
     dnnl::graph::tensor t_q(in_ports[port_idx++], eng, const_cast<void *>(static_cast<const void *>(params.Q)));
     dnnl::graph::tensor t_k(in_ports[port_idx++], eng, const_cast<void *>(static_cast<const void *>(params.K)));
-    dnnl::graph::tensor t_scale(in_ports[port_idx++], eng, cache->scale_usm);
+    dnnl::graph::tensor t_scale(in_ports[port_idx++], eng, entry->scale_usm);
 
     dnnl::graph::tensor t_mask;
     if (key.has_mask) {

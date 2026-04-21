@@ -95,11 +95,40 @@ struct sdpa_shape_key_hash {
     }
 };
 
-// Per-shape cache entry: compiled_partition + port lists for execution.
+// Per-shape cache entry: compiled_partition + port lists + a per-shape USM
+// scratch for the scalar Divide op.
+//
+// `scale_usm` is a sycl::half scalar buffer (sycl::malloc_host, pinned +
+// GPU-accessible via PCIe zero-copy). It is allocated AND populated exactly
+// once inside build_and_compile_sdpa() — which runs under the cache mutex —
+// so the execute path only READS it; there is no WRITE race.
+//
+// The value stored is the divisor sqrt(D) derived from `key.D` at compile
+// time. A runtime assertion at dispatch verifies that 1/params.scale matches
+// sqrt(key.D) within a tight epsilon, so any future model that does NOT
+// follow the 1/sqrt(D) convention fails loudly instead of silently producing
+// wrong outputs.
+//
+// `usm_queue` is a non-owning pointer to the sycl::queue used for allocation;
+// it is valid for the full lifetime of the entry because the queue is owned
+// by the global device registry (ggml_sycl_get_device()), which outlives
+// every backend context.
 struct sdpa_compiled_entry {
     dnnl::graph::compiled_partition          cp;
     std::vector<dnnl::graph::logical_tensor> in_ports;
     std::vector<dnnl::graph::logical_tensor> out_ports;
+    sycl::half *                             scale_usm = nullptr;
+    sycl::queue *                            usm_queue = nullptr;
+
+    sdpa_compiled_entry()                                        = default;
+    sdpa_compiled_entry(const sdpa_compiled_entry &)             = delete;
+    sdpa_compiled_entry & operator=(const sdpa_compiled_entry &) = delete;
+
+    ~sdpa_compiled_entry() {
+        if (scale_usm && usm_queue) {
+            sycl::free(scale_usm, *usm_queue);
+        }
+    }
 };
 
 // SDPA compiled_partition cache owned by backend context (one per device).
@@ -111,26 +140,22 @@ struct sdpa_compiled_entry {
 //   dispatch entry copies the shared_ptr under `m`, then unlocks. The entry
 //   survives any subsequent map rehash/erase because the copied shared_ptr
 //   holds the last reference as needed. This is how callers safely touch
-//   `in_ports` / `out_ports` / `cp` after releasing the lock.
-// - Cache lifetime: the `sdpa_partition_cache` itself (containing `m`,
-//   `hits`, `scale_usm`, `usm_queue`) is NOT kept alive by shared_ptr.
-//   It relies on ggml's backend-teardown contract — no FA dispatch is in
-//   flight when `ggml_sycl_sdpa_cache_destroy` is called. shared_ptr on
-//   entries does not, by itself, make destroying the cache concurrently
-//   with a dispatch safe; the teardown contract is what makes it safe.
-// - `m` serialises all reads/writes of `hits`, `negative`, `scale_usm`, and
-//   `usm_queue`. One mutex per ggml_backend_sycl_context gives lock-free
-//   cross-device dispatch on multi-GPU systems.
-// - `scale_usm` is allocated under `m` on first use in the dispatch entry.
+//   `in_ports` / `out_ports` / `cp` / `scale_usm` after releasing the lock.
+// - Cache lifetime: the `sdpa_partition_cache` itself is NOT kept alive by
+//   shared_ptr. It relies on ggml's backend-teardown contract — no FA
+//   dispatch is in flight when `ggml_sycl_sdpa_cache_destroy` is called.
+//   shared_ptr on entries does not, by itself, make destroying the cache
+//   concurrently with a dispatch safe; the teardown contract is what makes
+//   it safe.
+// - `m` serialises all reads/writes of `hits` and `negative`. One mutex per
+//   ggml_backend_sycl_context gives lock-free cross-device dispatch on
+//   multi-GPU systems. scale_usm is no longer on the cache — it moved to
+//   `sdpa_compiled_entry` (per-shape, set-once), so no write-site remains
+//   on the execute path.
 struct sdpa_partition_cache {
     std::mutex                                                                                    m;
     std::unordered_map<sdpa_shape_key, std::shared_ptr<sdpa_compiled_entry>, sdpa_shape_key_hash> hits;
     std::unordered_map<sdpa_shape_key, bool, sdpa_shape_key_hash>                                 negative;
-    // USM host-pinned buffer for the scalar scale value.
-    // Allocated once on first use; GPU-accessible via PCIe zero-copy.
-    // Must be freed with sycl::free(scale_usm, *usm_queue) at destruction.
-    sycl::half *                                                                                  scale_usm = nullptr;
-    sycl::queue *                                                                                 usm_queue = nullptr;
 };
 
 // Check whether the current op is eligible for the oneDNN graph SDPA path.
