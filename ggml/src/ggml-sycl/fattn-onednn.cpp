@@ -238,22 +238,33 @@ static build_result build_and_compile_sdpa(const sdpa_shape_key & key, const dnn
 
     // ---- Mask tensor -------------------------------------------------------
     // ggml mask shape: (ne30=ne11, ne31=ncols_padded, ne32=H_or_1, ne33=batch).
-    // The row dimension is padded (GGML_KQ_MASK_PAD) so the physical row stride
-    // nb31 is != ncols*elem_size. Use the real tensor byte strides.
+    // The row (ncols) dimension is padded (GGML_KQ_MASK_PAD) so the physical
+    // row stride nb31 is != ncols*elem_size — use the real tensor byte stride.
+    //
+    // We only derive m_s1 (element stride along the ncols axis). A per-head
+    // stride m_s2 was intentionally dropped: the oneDNN logical_tensor dims
+    // we emit have extent 1 on every head axis (ggml carries a non-per-head
+    // mask with ne32=1, which is the only shape this dispatch path serves),
+    // and the canonical oneDNN expression for a broadcast/extent-1 dim is
+    // stride = 0 (see /opt/intel/oneapi/dnnl/2025.3/share/doc/dnnl/examples/
+    // {gqa,sdpa}.cpp which use layout_type::strided + the natural dense
+    // extent-1 stride). oneDNN never multiplies an extent-1 dim by its
+    // stride when computing offsets, so a non-zero stride in those slots
+    // reads the same memory; we still prefer 0 for intent clarity.
+    //
+    // Verified on Mistral-7B Q4_0 on Arc B580 (level_zero:0, seed 42 temp 0):
+    // stride=0 in the head-axis slots produces the canonical
+    // `6, 7, 8, 9, 10` smoke output.
     const dim_t m_s1 = key.has_mask ? static_cast<dim_t>(key.m_nb1 / (int64_t) m_esz) : 1;
-    const dim_t m_s3 = key.has_mask ? static_cast<dim_t>(key.m_nb3 / (int64_t) m_esz) : 1;
 
     dims_t mask_dims, mask_strides;
     if (!is_gqa) {
-        // (batch, heads_broadcast=1, ncols, ne11). Broadcast along head axis
-        // by using the batch stride (mask has no per-head dim for non-GQA ATM).
         mask_dims    = { batch, 1, ncols, ne11 };
-        mask_strides = { m_s3, m_s3, m_s1, 1 };
+        mask_strides = { 0, 0, m_s1, 1 };
     } else {
-        // (batch, H_kv=1, N_rep=1, ncols, ne11): same broadcast trick — both
-        // head axes have extent 1, so stride is irrelevant beyond being valid.
+        // 5-D GQA view: both head axes (H_kv, N_rep) have extent 1.
         mask_dims    = { batch, 1, 1, ncols, ne11 };
-        mask_strides = { m_s3, m_s3, m_s3, m_s1, 1 };
+        mask_strides = { 0, 0, 0, m_s1, 1 };
     }
 
     // ---- Build logical tensors --------------------------------------------

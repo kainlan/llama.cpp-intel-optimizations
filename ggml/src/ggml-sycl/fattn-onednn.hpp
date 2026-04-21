@@ -16,6 +16,7 @@
 #    include "oneapi/dnnl/dnnl_graph_sycl.hpp"
 #    include "oneapi/dnnl/dnnl_sycl.hpp"
 
+#    include <cstdint>
 #    include <functional>
 #    include <memory>
 #    include <mutex>
