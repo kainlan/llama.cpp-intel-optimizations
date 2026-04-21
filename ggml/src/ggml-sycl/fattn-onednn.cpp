@@ -74,6 +74,21 @@ bool ggml_sycl_flash_attn_ext_onednn_eligible(const fattn_params & params,
     if (params.ne01 < 8) {
         return false;
     }
+    // Temporary diagnostic (removed in follow-up cleanup commit): log the first
+    // three calls that reach this point so we can see which (Q_type, K_type,
+    // V_type, mask_type) tuples the dtype gate below is rejecting. Placed
+    // BEFORE the Q/K/V dtype checks so we see the real tensor dtypes.
+    {
+        static std::atomic<int> gate_dbg{ 0 };
+        int                     n = gate_dbg.fetch_add(1);
+        if (n < 3) {
+            fprintf(stderr,
+                    "[SYCL oneDNN] gate-trace call#%d  ne01=%d  Q_type=%d  K_type=%d  V_type=%d  has_mask=%d  "
+                    "mask_type=%d\n",
+                    n, params.ne01, (int) params.Q_type, (int) params.K_type, (int) params.V_type, params.mask ? 1 : 0,
+                    params.mask ? (int) params.mask_type : -1);
+        }
+    }
     // The compiled partition is built with Q/K/V dtypes taken from params.*_type.
     // Scale and scratch buffer sizing assumes f16 Q (sizeof(half) scale slot),
     // and the existing path only supports f16 KV. Restrict to the well-tested
