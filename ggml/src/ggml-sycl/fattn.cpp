@@ -9,15 +9,15 @@
 #include "common.hpp"
 #include "fattn-debug.hpp"
 #include "fattn-esimd-f16.hpp"
-#include "fattn-tile-f16.hpp"
 #include "fattn-mma.hpp"
 #include "fattn-onednn.hpp"
+#include "fattn-tile-f16.hpp"
 #include "fattn-v2-esimd.hpp"
 #include "fattn-v2-partition.hpp"
-#include "fattn-vec.hpp"
 #include "fattn-vec-f16.hpp"
-#include "fattn-xmx-f16.hpp"
+#include "fattn-vec.hpp"
 #include "fattn-xmx-f16-v2.hpp"
+#include "fattn-xmx-f16.hpp"
 #include "kv-cache-quant.hpp"
 #include "l144i-probe.hpp"
 #include "sycl-profiling.hpp"
@@ -27,6 +27,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+
+// Non-inline forwarder — ggml-sycl.cpp's ~ggml_backend_sycl_context() calls this
+// without including fattn-xmx-f16-v2.hpp (which drags the SYCL matrix extension).
+void ggml_sycl_fattn_xmx_v2_cache_destroy(void * ptr) {
+    fattn_xmx_v2_cache_destroy_inline(ptr);
+}
 
 // Kernel names for VTune profiling
 class fattn_v2_fill_block_table_kernel;
@@ -436,7 +442,7 @@ static void init_fa_onednn_config() {
         return;
     }
     g_sycl_fa_onednn_initialized = true;
-    const char * env = std::getenv("GGML_SYCL_FA_ONEDNN");
+    const char * env             = std::getenv("GGML_SYCL_FA_ONEDNN");
     if (env && (strcmp(env, "0") == 0 || strcmp(env, "false") == 0)) {
         g_sycl_fa_onednn_enabled = false;
         fprintf(stderr, "[SYCL] oneDNN SDPA path disabled (GGML_SYCL_FA_ONEDNN=0)\n");
@@ -813,6 +819,15 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
         LAUNCHER<D, NCOLS, true, Q_type>(params, stream);  \
     }
 
+// Same, but the launcher also takes `ctx` first (used by XMX-v2 for per-context
+// matrix_combinations picker + SLM-fit cache — see fattn-xmx-f16-v2.hpp).
+#define DISPATCH_NCOLS_CTX(NCOLS, LAUNCHER)                     \
+    if (logit_softcap == 0.0f) {                                \
+        LAUNCHER<D, NCOLS, false, Q_type>(ctx, params, stream); \
+    } else {                                                    \
+        LAUNCHER<D, NCOLS, true, Q_type>(ctx, params, stream);  \
+    }
+
     // VEC path: deterministic-by-construction TG fast path (zero SLM, register-only).
     // ncols == 1 covers TG; D <= 256 covers gpt-oss-20b (D=64), Mistral/Llama (D=128), Gemma (D=256).
     // This path IS the deterministic default for TG — safe_decode uses the scalar MMA fallback
@@ -833,12 +848,11 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
     if (!safe_decode && g_sycl_fa_onednn_enabled) {
         const bool multi_seq = (params.n_seqs > 1);
         if (ggml_sycl_flash_attn_ext_onednn_eligible(params,
-                                                     params.ne02,   // H_q
-                                                     params.ne12,   // H_kv
-                                                     params.kv_is_fp8,
-                                                     multi_seq)) {
-            GGML_SYCL_KTRACE("fattn_onednn", " D=%d ne01=%d ne11=%d H_q=%d H_kv=%d",
-                             D, ne01, params.ne11, params.ne02, params.ne12);
+                                                     params.ne02,  // H_q
+                                                     params.ne12,  // H_kv
+                                                     params.kv_is_fp8, multi_seq)) {
+            GGML_SYCL_KTRACE("fattn_onednn", " D=%d ne01=%d ne11=%d H_q=%d H_kv=%d", D, ne01, params.ne11, params.ne02,
+                             params.ne12);
             if (ggml_sycl_flash_attn_ext_onednn(ctx, params)) {
                 return;
             }
@@ -875,16 +889,16 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
             // v2 kernel — structurally correct, no SLM aliasing, deterministic
             if (ne01 <= 1) {
                 GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=1 ne01=%d", D, ne01);
-                DISPATCH_NCOLS(1, launch_fattn_xmx_v2_f16);
+                DISPATCH_NCOLS_CTX(1, launch_fattn_xmx_v2_f16);
             } else if (ne01 <= 2) {
                 GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=2 ne01=%d", D, ne01);
-                DISPATCH_NCOLS(2, launch_fattn_xmx_v2_f16);
+                DISPATCH_NCOLS_CTX(2, launch_fattn_xmx_v2_f16);
             } else if (ne01 <= 4) {
                 GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=4 ne01=%d", D, ne01);
-                DISPATCH_NCOLS(4, launch_fattn_xmx_v2_f16);
+                DISPATCH_NCOLS_CTX(4, launch_fattn_xmx_v2_f16);
             } else {
                 GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=8 ne01=%d", D, ne01);
-                DISPATCH_NCOLS(8, launch_fattn_xmx_v2_f16);
+                DISPATCH_NCOLS_CTX(8, launch_fattn_xmx_v2_f16);
             }
         }
     } else {
@@ -905,6 +919,7 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
     }
 
 #undef DISPATCH_NCOLS
+#undef DISPATCH_NCOLS_CTX
 }
 
 // Main flash attention entry point
@@ -975,20 +990,24 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     // OUTPUT differs.  Non-determinism is INSIDE the XMX kernel (not input staging).
     if (::ggml_sycl::l144i::enabled() && ctx.stream() && dst && dst->name[0]) {
         auto probe = [&](const char * site, const ggml_tensor * t) {
-            if (!t) return;
+            if (!t) {
+                return;
+            }
             void * ptr = ggml_sycl_resolve_tensor_ptr(const_cast<ggml_tensor *>(t), ctx.device);
-            if (!ptr) return;
+            if (!ptr) {
+                return;
+            }
             const std::size_t bytes = static_cast<std::size_t>(ggml_nbytes(t));
-            if (bytes == 0 || bytes > 16u * 1024u * 1024u) return;
+            if (bytes == 0 || bytes > 16u * 1024u * 1024u) {
+                return;
+            }
             std::vector<char> buf(bytes);
             ctx.stream()->memcpy(buf.data(), ptr, bytes).wait();
             if (t->type == GGML_TYPE_F32) {
                 GGML_SYCL_L144I_PROBE_FLOATS(site, t->name[0] ? t->name : "?", -1, -1,
-                                             reinterpret_cast<const float *>(buf.data()),
-                                             bytes / sizeof(float));
+                                             reinterpret_cast<const float *>(buf.data()), bytes / sizeof(float));
             } else {
-                GGML_SYCL_L144I_PROBE_BYTES(site, t->name[0] ? t->name : "?", -1, -1,
-                                            buf.data(), bytes);
+                GGML_SYCL_L144I_PROBE_BYTES(site, t->name[0] ? t->name : "?", -1, -1, buf.data(), bytes);
             }
         };
         probe("fa/src0_Q", Q);
@@ -1221,9 +1240,11 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
                 // Copy offsets to device
                 // Note: In-order queue ensures memcpy completes before subsequent kernel launch
                 ggml_sycl_trace_memcpy_during_recording("fattn.cpp:seq_q_offsets", offsets_size);
-                ggml_sycl_graph_safe_memcpy(*stream, tl_buffers.seq_q_offsets_dev, tl_seq_q_offsets.data(), offsets_size);
+                ggml_sycl_graph_safe_memcpy(*stream, tl_buffers.seq_q_offsets_dev, tl_seq_q_offsets.data(),
+                                            offsets_size);
                 ggml_sycl_trace_memcpy_during_recording("fattn.cpp:seq_kv_offsets", offsets_size);
-                ggml_sycl_graph_safe_memcpy(*stream, tl_buffers.seq_kv_offsets_dev, tl_seq_kv_offsets.data(), offsets_size);
+                ggml_sycl_graph_safe_memcpy(*stream, tl_buffers.seq_kv_offsets_dev, tl_seq_kv_offsets.data(),
+                                            offsets_size);
 
                 // Set params for kernel to use sequence boundary optimization
                 params.n_seqs         = n_seqs;
@@ -1251,7 +1272,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
         params.block_table        = (const int32_t *) ggml_sycl_get_data_ptr(block_table, device);
         params.seq_lens           = (const int32_t *) ggml_sycl_get_data_ptr(seq_lens_tensor, device);
 
-#if 0  // Debug output disabled
+#if 0  // Debug output disabled \
        // Print only once to avoid flooding output
         static bool paged_attn_info_shown = false;
         if (!paged_attn_info_shown) {

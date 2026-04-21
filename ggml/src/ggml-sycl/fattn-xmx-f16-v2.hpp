@@ -46,6 +46,7 @@
 #include <array>
 #include <cfloat>
 #include <cstdint>
+#include <cstdio>
 #include <mutex>
 #include <sycl/sycl.hpp>
 #include <vector>
@@ -243,13 +244,68 @@ inline std::size_t fattn_xmx_v2_pick_variant_for_device(const sycl::device & dev
     return (best_score > 0) ? best_idx : 0;
 }
 
-// Cached picker — evaluate once per process today. `llama.cpp-0sres` replaces
-// this with a thread-safe per-device cache.
-inline std::size_t fattn_xmx_v2_pick_variant_cached(const sycl::device & dev) {
-    static std::once_flag once;
-    static std::size_t    cached_idx = 0;
-    std::call_once(once, [&]() { cached_idx = fattn_xmx_v2_pick_variant_for_device(dev); });
-    return cached_idx;
+// Per-context cache: variant pick + SLM-fit decision, cached per ggml_backend_sycl_context.
+// Mirrors the sdpa_cache pattern in fattn-onednn.cpp — opaque void* in ctx, freed via
+// ggml_sycl_fattn_xmx_v2_cache_destroy() in ~ggml_backend_sycl_context().
+//
+// "Per-context" is functionally "per-device" today because llama.cpp creates one
+// context per device. If that ever changes, each context still gets its own cache
+// (correct but duplicative).
+struct fattn_xmx_v2_device_cache {
+    std::once_flag once;
+    std::size_t    variant_idx    = 0;
+    size_t         slm_size_bytes = 0;
+    bool           slm_ok         = false;
+};
+
+// Bytes of SLM required for the fallback leaf's worst case (D=256, ncols=8).
+// fattn_v2_slm<D, ncols>::TOTAL is in sycl::half units, so multiply by sizeof(half).
+static constexpr size_t fattn_xmx_v2_required_slm_bytes() {
+    constexpr size_t D_max     = 256;
+    constexpr size_t ncols_max = 8;
+    constexpr size_t halves    = ncols_max * D_max + 2 * XMX_V2_BATCH_KV * D_max + ncols_max * XMX_V2_BATCH_KV;
+    return halves * sizeof(sycl::half);
+}
+
+inline fattn_xmx_v2_device_cache * fattn_xmx_v2_get_or_create_cache(ggml_backend_sycl_context & ctx) {
+    static std::mutex           cache_mutex;
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    if (!ctx.fattn_xmx_v2_cache) {
+        ctx.fattn_xmx_v2_cache = new fattn_xmx_v2_device_cache();
+    }
+    return static_cast<fattn_xmx_v2_device_cache *>(ctx.fattn_xmx_v2_cache);
+}
+
+// Inline destroy helper. Called by the non-inline ggml_sycl_fattn_xmx_v2_cache_destroy
+// in fattn.cpp, which is forward-declared from ggml-sycl.cpp for the ctx destructor.
+inline void fattn_xmx_v2_cache_destroy_inline(void * ptr) {
+    delete static_cast<fattn_xmx_v2_device_cache *>(ptr);
+}
+
+// Cached picker — one-shot init per context. Queries matrix_combinations + SLM size,
+// logs one INFO line, and stores the decision. Subsequent calls are lock-free reads.
+inline std::size_t fattn_xmx_v2_pick_variant_cached(ggml_backend_sycl_context & ctx, const sycl::device & dev) {
+    auto * cache = fattn_xmx_v2_get_or_create_cache(ctx);
+    std::call_once(cache->once, [&]() {
+        cache->variant_idx    = fattn_xmx_v2_pick_variant_for_device(dev);
+        cache->slm_size_bytes = dev.get_info<sycl::info::device::local_mem_size>();
+
+        const size_t required_bytes = fattn_xmx_v2_required_slm_bytes();
+        cache->slm_ok               = (cache->slm_size_bytes >= required_bytes);
+
+        std::fprintf(
+            stderr,
+            "[fattn-xmx-v2] device %d: local_mem=%zu KB, required=%zu B for (D=256,ncols=8), variant=%zu, slm_ok=%d\n",
+            ctx.device, cache->slm_size_bytes / 1024, required_bytes, cache->variant_idx, cache->slm_ok ? 1 : 0);
+
+        if (!cache->slm_ok) {
+            std::fprintf(stderr,
+                         "[fattn-xmx-v2] device %d: ERROR — worst-case SLM %zu B exceeds device local_mem %zu B; "
+                         "XMX-v2 will fall back to the (8,16,16) leaf with best-effort correctness.\n",
+                         ctx.device, required_bytes, cache->slm_size_bytes);
+        }
+    });
+    return cache->variant_idx;
 }
 
 // =============================================================================
@@ -731,8 +787,8 @@ static void launch_fattn_xmx_v2_f16_leaf(const fattn_params & params, dpct::queu
 // =============================================================================
 
 template <int D, int ncols, bool use_logit_softcap, typename Q_type, bool kv_is_fp8 = false>
-void launch_fattn_xmx_v2_f16(const fattn_params & params, dpct::queue_ptr stream) {
-    const std::size_t variant_idx = fattn_xmx_v2_pick_variant_cached(stream->get_device());
+void launch_fattn_xmx_v2_f16(ggml_backend_sycl_context & ctx, const fattn_params & params, dpct::queue_ptr stream) {
+    const std::size_t variant_idx = fattn_xmx_v2_pick_variant_cached(ctx, stream->get_device());
 
     switch (variant_idx) {
         // case 0 is the validated fallback leaf. When adding future variants
@@ -756,13 +812,17 @@ inline bool fattn_xmx_v2_f16_available() {
 #else   // !SYCL_XMX_V2_AVAILABLE
 
 template <int D, int ncols, bool use_logit_softcap, typename Q_type, bool kv_is_fp8 = false>
-void launch_fattn_xmx_v2_f16(const fattn_params &, dpct::queue_ptr) {
+void launch_fattn_xmx_v2_f16(ggml_backend_sycl_context &, const fattn_params &, dpct::queue_ptr) {
     GGML_ABORT("XMX v2 not available at compile time");
 }
 
 inline bool fattn_xmx_v2_f16_available() {
     return false;
 }
+
+// No-op destroy for the compile-disabled path — the ctx destructor still calls
+// ggml_sycl_fattn_xmx_v2_cache_destroy unconditionally.
+inline void fattn_xmx_v2_cache_destroy_inline(void *) {}
 
 #endif  // SYCL_XMX_V2_AVAILABLE
 

@@ -1986,9 +1986,9 @@ struct staging_buffer_pool {
                 std::lock_guard<std::mutex> lock(mutex_);
                 for (auto & s : slots_) {
                     if (s.has_pending_event) {
-                        ev                = s.pending_event;
+                        ev                  = s.pending_event;
                         s.has_pending_event = false;
-                        found             = true;
+                        found               = true;
                         break;
                     }
                 }
@@ -2850,6 +2850,12 @@ struct ggml_backend_sycl_context {
     // Opaque pointer (sdpa_partition_cache*) to avoid pulling graph headers here.
     // Freed via ggml_sycl_sdpa_cache_destroy() in the destructor.
     void * sdpa_cache = nullptr;
+
+    // XMX-v2 flash-attention per-context cache (Phase 4 — fattn-xmx-f16-v2.hpp).
+    // Opaque pointer (fattn_xmx_v2_device_cache*); stores the matrix_combinations
+    // picker result + local_mem_size fit check. Freed via fattn_xmx_v2_cache_destroy()
+    // in the destructor.
+    void * fattn_xmx_v2_cache = nullptr;
 
     queue_ptr qptrs[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS] = { { nullptr } };
 
