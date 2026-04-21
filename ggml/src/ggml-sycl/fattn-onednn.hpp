@@ -134,11 +134,16 @@ struct sdpa_partition_cache {
 };
 
 // Check whether the current op is eligible for the oneDNN graph SDPA path.
-// Returns true when: no sinks, no softcap, f16 K/V/mask, f16 Q, D <= 512,
-// ncols >= 8 (PP batch), not multi-seq, and all of Q/K/V are device USM.
-// Caller must additionally check !g_sycl_paged_v2_enabled and
-// g_sycl_fa_onednn_enabled (both are global init-time flags that this
-// function cannot see directly).
+// Eligibility returns true when: no sinks, no softcap, no FP8 KV, f16 Q/K/V
+// (and if mask is present, f16 or f32 mask), D <= 512, ncols >= 8 (PP batch),
+// not multi-seq. Device-USM-ness of Q/K/V is NOT checked here — that
+// rejection happens one level later inside ggml_sycl_flash_attn_ext_onednn
+// via the kDeviceVAThreshold guards, because the buffers can move between
+// host-pinned and device between eligibility and dispatch under
+// GGML_SYCL_HOST_COMPUTE / GGML_SYCL_KV_HOST.
+// Caller must additionally check: !safe_decode, g_sycl_fa_onednn_enabled,
+// !g_sycl_paged_v2_enabled (all three are file-scope / template-local flags
+// that this function cannot see directly).
 bool ggml_sycl_flash_attn_ext_onednn_eligible(const fattn_params & params,
                                               int                  H_q,
                                               int                  H_kv,
