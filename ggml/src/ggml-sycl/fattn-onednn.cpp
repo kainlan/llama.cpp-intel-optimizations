@@ -383,16 +383,25 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
     const int H_kv = params.ne12;
     const int D    = params.ne00;
 
-    // oneDNN graph SYCL execute requires device USM for all input tensors.
-    // K and V may be host-pinned (sycl::malloc_host) during warmup or when
-    // weights are host-resident. Skip oneDNN in that case.
+    // oneDNN graph SYCL execute requires device USM for ALL input tensors.
+    // Any of Q, K, V may be host-pinned (sycl::malloc_host) under
+    // GGML_SYCL_HOST_COMPUTE, GGML_SYCL_KV_HOST, host-resident weight
+    // streaming, or warmup; skip oneDNN in any of those cases and fall
+    // back to the XMX/TILE kernel which tolerates mixed host/device inputs.
     //
-    // Fast check via VA range: Intel Arc device USM is allocated in the high GPU VA space
-    // (addresses >= 0x800000000000) while host-pinned USM uses normal user-space VAs.
-    // This avoids the expensive sycl::get_pointer_type() call (which syncs the L0 driver).
+    // Fast check via VA range: Intel Arc device USM is allocated in the high
+    // GPU VA space (addresses >= 0x800000000000) while host-pinned USM uses
+    // normal user-space VAs. This avoids the expensive sycl::get_pointer_type()
+    // call which syncs the L0 driver.
     static constexpr uintptr_t kDeviceVAThreshold = (uintptr_t) 1 << 47;  // ~128 TB
+    if (reinterpret_cast<uintptr_t>(params.Q) < kDeviceVAThreshold) {
+        return false;                                                     // Q is host/mmap — skip oneDNN
+    }
     if (reinterpret_cast<uintptr_t>(params.K) < kDeviceVAThreshold) {
-        return false;  // K is host/mmap — skip oneDNN (falls back to XMX/TILE kernel)
+        return false;  // K is host/mmap — skip oneDNN
+    }
+    if (reinterpret_cast<uintptr_t>(params.V) < kDeviceVAThreshold) {
+        return false;  // V is host/mmap — skip oneDNN
     }
 
     sdpa_shape_key key;

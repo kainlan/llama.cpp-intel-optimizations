@@ -134,8 +134,11 @@ struct sdpa_partition_cache {
 };
 
 // Check whether the current op is eligible for the oneDNN graph SDPA path.
-// Returns true when: no sinks, no softcap, f16 KV, D <= 512, not multi-seq.
-// Caller must additionally check !paged_v2 and g_sycl_fa_onednn_enabled.
+// Returns true when: no sinks, no softcap, f16 K/V/mask, f16 Q, D <= 512,
+// ncols >= 8 (PP batch), not multi-seq, and all of Q/K/V are device USM.
+// Caller must additionally check !g_sycl_paged_v2_enabled and
+// g_sycl_fa_onednn_enabled (both are global init-time flags that this
+// function cannot see directly).
 bool ggml_sycl_flash_attn_ext_onednn_eligible(const fattn_params & params,
                                               int                  H_q,
                                               int                  H_kv,
