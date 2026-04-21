@@ -118,6 +118,11 @@ struct variant_info {
 // an array entry — follow-up tasks will add them):
 //   { 1, 64, 16, 1 }   — ncols=1 TG fast path, matches `1x16x64 fp16→fp32`
 //   { 16, 16, 16, 16 } — ncols>=16 path, matches `16x16x16 fp16→fp32`
+//
+// Triple-brace init: std::array<T, N> wraps a single-element C-array; the outer
+// pair opens the array, the inner opens the C-array, and the innermost opens
+// the variant_info aggregate. Matches the only other std::array usage in the
+// backend.
 static constexpr std::array<variant_info, 1> fattn_xmx_v2_variants = { { { 8, 16, 16, 8 } } };
 
 static_assert(fattn_xmx_v2_variants[0].tm == 8 && fattn_xmx_v2_variants[0].tk == 16 &&
@@ -134,6 +139,11 @@ static constexpr int XMX_V2_ELEMS_PER_LANE = fattn_xmx_v2_variants[0].elems_per_
 
 static_assert(XMX_V2_BATCH_KV % XMX_V2_TK == 0, "BATCH_KV must be divisible by fallback TK");
 static_assert(XMX_V2_BATCH_KV % XMX_V2_TN == 0, "BATCH_KV must be divisible by fallback TN");
+
+// Pin the column-striped lane-ownership invariant. If a future variant switches
+// to a different accumulator fragment layout (e.g. row-striped for TM=1), its
+// `elems_per_lane` will differ and this assert should be relaxed per-variant.
+static_assert(XMX_V2_ELEMS_PER_LANE == 8, "Fallback leaf's column-striped layout owns 8 floats per lane (TM=8)");
 
 // =============================================================================
 // Runtime matrix_combinations query + variant picker
@@ -155,7 +165,14 @@ static_assert(XMX_V2_BATCH_KV % XMX_V2_TN == 0, "BATCH_KV must be divisible by f
 
 // Query the matrix_combinations list in a noexcept-ish wrapper. Returns empty
 // vector on any failure path (non-XMX device, driver bug, exception).
-inline std::vector<sycl_xmx::combination> fattn_xmx_v2_query_combinations(const sycl::device & dev) {
+//
+// The inner `#if SYCL_EXT_ONEAPI_MATRIX_VERSION >= 1` sits inside an outer
+// `#if SYCL_XMX_V2_AVAILABLE` that gates on `<sycl/ext/oneapi/matrix/matrix.hpp>`
+// being present. The two are deliberately separate: the header can be present
+// while the `matrix_combinations` info query is only surfaced in version ≥ 1.
+// Without the inner guard, a toolchain that ships the header without the query
+// would fail to compile.
+inline std::vector<sycl_xmx::combination> fattn_xmx_v2_query_combinations(const sycl::device & dev) noexcept {
     std::vector<sycl_xmx::combination> out;
 #    if defined(SYCL_EXT_ONEAPI_MATRIX_VERSION) && SYCL_EXT_ONEAPI_MATRIX_VERSION >= 1
     if (!dev.has(sycl::aspect::ext_intel_matrix)) {
@@ -182,7 +199,7 @@ inline std::vector<sycl_xmx::combination> fattn_xmx_v2_query_combinations(const 
 //     with max_msize >= tm so the lane-ownership fragment exists at that M)
 //
 // Scoring: larger TM wins (better XMX utilization). Extendable later.
-inline int fattn_xmx_v2_score_variant_for_combo(const variant_info & v, const sycl_xmx::combination & c) {
+inline int fattn_xmx_v2_score_variant_for_combo(const variant_info & v, const sycl_xmx::combination & c) noexcept {
 #    if defined(SYCL_EXT_ONEAPI_MATRIX_VERSION) && SYCL_EXT_ONEAPI_MATRIX_VERSION >= 1
     using sycl_xmx::matrix_type;
     if (c.atype != matrix_type::fp16 || c.btype != matrix_type::fp16 || c.ctype != matrix_type::fp32 ||
@@ -221,7 +238,7 @@ inline int fattn_xmx_v2_score_variant_for_combo(const variant_info & v, const sy
 
 // Pick the best variant index for this device. Returns 0 (fallback) on any
 // ambiguous / query-failed path.
-inline std::size_t fattn_xmx_v2_pick_variant_for_device(const sycl::device & dev) {
+inline std::size_t fattn_xmx_v2_pick_variant_for_device(const sycl::device & dev) noexcept {
     const auto combos = fattn_xmx_v2_query_combinations(dev);
     if (combos.empty()) {
         return 0;  // fallback leaf
@@ -782,23 +799,35 @@ static void launch_fattn_xmx_v2_f16_leaf(const fattn_params & params, dpct::queu
 
 // =============================================================================
 // Public launcher — resolves the runtime-picked variant index to a compile-time
-// leaf specialization and dispatches. Signature is unchanged from the previous
-// hardcoded-tile kernel so `fattn.cpp:878-887` keeps working.
+// leaf specialization and dispatches. Returns true if the kernel was launched,
+// false if the caller must fall back (e.g. device SLM cannot fit the fallback
+// leaf's worst case). Mirrors the bool-return pattern of
+// ggml_sycl_flash_attn_ext_onednn() so fattn.cpp can use the same
+// `if (launcher(...)) return;` idiom.
 // =============================================================================
 
 template <int D, int ncols, bool use_logit_softcap, typename Q_type, bool kv_is_fp8 = false>
-void launch_fattn_xmx_v2_f16(ggml_backend_sycl_context & ctx, const fattn_params & params, dpct::queue_ptr stream) {
+bool launch_fattn_xmx_v2_f16(ggml_backend_sycl_context & ctx, const fattn_params & params, dpct::queue_ptr stream) {
     const std::size_t variant_idx = fattn_xmx_v2_pick_variant_cached(ctx, stream->get_device());
 
+    // SLM-fit gate: if the fallback leaf's worst case doesn't fit this device's
+    // local_mem_size, bail to caller-level fallback (TILE path). Logged once at
+    // cache init so there's a paper trail in stderr.
+    const auto * cache = static_cast<const fattn_xmx_v2_device_cache *>(ctx.fattn_xmx_v2_cache);
+    if (cache && !cache->slm_ok) {
+        return false;
+    }
+
     switch (variant_idx) {
-        // case 0 is the validated fallback leaf. When adding future variants
-        // append a case here and an entry in `fattn_xmx_v2_variants[]`.
-        case 0:
+        // When adding future variants, append a case here and an entry in
+        // `fattn_xmx_v2_variants[]`. The `default` catches both the fallback-leaf
+        // selection and any unrecognized future index (defensive).
         default:
             launch_fattn_xmx_v2_f16_leaf<D, ncols, use_logit_softcap, Q_type, kv_is_fp8,
                                          /*TM=*/8, /*TK=*/16, /*TN=*/16>(params, stream);
             break;
     }
+    return true;
 }
 
 // =============================================================================
@@ -812,8 +841,9 @@ inline bool fattn_xmx_v2_f16_available() {
 #else   // !SYCL_XMX_V2_AVAILABLE
 
 template <int D, int ncols, bool use_logit_softcap, typename Q_type, bool kv_is_fp8 = false>
-void launch_fattn_xmx_v2_f16(ggml_backend_sycl_context &, const fattn_params &, dpct::queue_ptr) {
+bool launch_fattn_xmx_v2_f16(ggml_backend_sycl_context &, const fattn_params &, dpct::queue_ptr) {
     GGML_ABORT("XMX v2 not available at compile time");
+    return false;
 }
 
 inline bool fattn_xmx_v2_f16_available() {

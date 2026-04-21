@@ -447,6 +447,17 @@ static void init_fa_onednn_config() {
         g_sycl_fa_onednn_enabled = false;
         fprintf(stderr, "[SYCL] oneDNN SDPA path disabled (GGML_SYCL_FA_ONEDNN=0)\n");
     }
+    // FA_NO_XMX=1 is an ergonomic escape hatch users reach for when XMX
+    // produces wrong output (e.g. during an XMX-kernel correctness regression).
+    // oneDNN's fused SDPA internally dispatches to DPAS / XMX on Xe2, so
+    // leaving it enabled defeats the user's intent. Force-disable oneDNN
+    // whenever FA_NO_XMX is set, independent of the FA_ONEDNN gate so the
+    // user doesn't have to unset two env vars for one behaviour.
+    const char * no_xmx_env = std::getenv("GGML_SYCL_FA_NO_XMX");
+    if (g_sycl_fa_onednn_enabled && no_xmx_env && std::atoi(no_xmx_env) != 0) {
+        g_sycl_fa_onednn_enabled = false;
+        fprintf(stderr, "[SYCL] oneDNN SDPA path disabled (GGML_SYCL_FA_NO_XMX=1 implies oneDNN-off)\n");
+    }
 }
 #endif  // GGML_SYCL_DNNL
 
@@ -819,13 +830,16 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
         LAUNCHER<D, NCOLS, true, Q_type>(params, stream);  \
     }
 
-// Same, but the launcher also takes `ctx` first (used by XMX-v2 for per-context
-// matrix_combinations picker + SLM-fit cache — see fattn-xmx-f16-v2.hpp).
-#define DISPATCH_NCOLS_CTX(NCOLS, LAUNCHER)                     \
-    if (logit_softcap == 0.0f) {                                \
-        LAUNCHER<D, NCOLS, false, Q_type>(ctx, params, stream); \
-    } else {                                                    \
-        LAUNCHER<D, NCOLS, true, Q_type>(ctx, params, stream);  \
+// Same, but the launcher also takes `ctx` first and returns bool (used by XMX-v2
+// — see fattn-xmx-f16-v2.hpp). Assigns the result to `v2_dispatched` so the
+// caller can fall through to TILE when the launcher returns false (e.g. SLM too
+// small for the fallback leaf). Matches the ggml_sycl_flash_attn_ext_onednn
+// pattern at fattn-onednn.cpp.
+#define DISPATCH_NCOLS_CTX(NCOLS, LAUNCHER)                                     \
+    if (logit_softcap == 0.0f) {                                                \
+        v2_dispatched = LAUNCHER<D, NCOLS, false, Q_type>(ctx, params, stream); \
+    } else {                                                                    \
+        v2_dispatched = LAUNCHER<D, NCOLS, true, Q_type>(ctx, params, stream);  \
     }
 
     // VEC path: deterministic-by-construction TG fast path (zero SLM, register-only).
@@ -841,11 +855,16 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
 
 #if GGML_SYCL_DNNL
     // oneDNN graph SDPA path: fused MatMul→Divide→Add→SoftMax→MatMul on Xe2.
-    // Eligible: no sinks, no softcap, f16 KV, D ≤ 512, not multi-seq.
+    // Eligible: no sinks, no softcap, f16 KV, D ≤ 512, not multi-seq, not
+    // paged-v2. The paged-v2 block layout stores K/V as
+    // [D, block_size, n_blocks] rather than the contiguous [D, n_kv] that
+    // the oneDNN graph expects; dispatching oneDNN on a paged-v2 context
+    // would read the wrong memory. Paged-v2 keeps its own dispatch path
+    // below and must win before the oneDNN branch considers the op.
     // Ineligible: gpt-oss-20b (sinks+softcap), Gemma-2 (softcap), FP8 KV.
     // Dispatched BEFORE XMX/TILE so PP benefits from oneDNN's fused kernel.
     // Falls back to kernel path if oneDNN compile fails or during graph recording.
-    if (!safe_decode && g_sycl_fa_onednn_enabled) {
+    if (!safe_decode && g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled) {
         const bool multi_seq = (params.n_seqs > 1);
         if (ggml_sycl_flash_attn_ext_onednn_eligible(params,
                                                      params.ne02,  // H_q
@@ -886,7 +905,11 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
                 DISPATCH_NCOLS(8, launch_fattn_xmx_f16);
             }
         } else {
-            // v2 kernel — structurally correct, no SLM aliasing, deterministic
+            // v2 kernel — structurally correct, no SLM aliasing, deterministic.
+            // Returns false if the fallback leaf's worst-case SLM exceeds the
+            // device's local_mem_size; we flip use_xmx so the TILE block below
+            // picks up the dispatch. The block below is gated on `!use_xmx`.
+            bool v2_dispatched = false;
             if (ne01 <= 1) {
                 GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=1 ne01=%d", D, ne01);
                 DISPATCH_NCOLS_CTX(1, launch_fattn_xmx_v2_f16);
@@ -900,8 +923,12 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
                 GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=8 ne01=%d", D, ne01);
                 DISPATCH_NCOLS_CTX(8, launch_fattn_xmx_v2_f16);
             }
+            if (!v2_dispatched) {
+                use_xmx = false;
+            }
         }
-    } else {
+    }
+    if (!use_xmx) {
         // TILE F16 kernel - scalar-SLM-tile fallback for safe_decode / non-XMX GPUs
         if (ne01 <= 1) {
             GGML_SYCL_KTRACE("fattn_tile_f16", " D=%d ncols=1 ne01=%d", D, ne01);
