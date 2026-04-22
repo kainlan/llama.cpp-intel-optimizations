@@ -14301,20 +14301,35 @@ static size_t ggml_backend_sycl_buffer_type_get_max_size(ggml_backend_buffer_typ
     // buffer path can satisfy in a single allocation.  ggml-alloc uses this
     // value (`max_chunk_size`) to split the scheduler's peak-working-set
     // request into up to GGML_VBUFFER_MAX_CHUNKS=16 chunks, each allocated
-    // through a separate `alloc_buffer` call.  Each chunk routes through
-    // the RUNTIME zone first (see `should_use_runtime` in alloc_buffer)
-    // and falls back to the shared KV zone when RUNTIME is exhausted,
-    // matching the unified-cache architectural principle that arena zones
-    // are the single source of truth for serving capacity.
+    // through a separate `alloc_buffer` call.
+    //
+    // The three-level fallback chain in `alloc_buffer` for compute-role
+    // allocations is RUNTIME -> KV -> SCRATCH (see lines ~14030-14088):
+    //   1. RUNTIME zone first (see `should_use_runtime`).
+    //   2. When RUNTIME is full and the request is a compute buffer, fall
+    //      back to the shared KV zone.
+    //   3. When KV also full, fall back to the SCRATCH bump pool.
+    // The per-chunk ceiling is therefore max(RUNTIME, KV, SCRATCH); any
+    // of these zones can satisfy a chunk, so the largest one bounds the
+    // chunk size.  Omitting SCRATCH caused get_max_size to underestimate
+    // capacity on configurations where SCRATCH is the largest zone,
+    // which pushes ggml-alloc to produce more chunks than necessary.
     //
     // Previously a hardcoded 2 GB cap ignored the actual arena
     // configuration.  We now query the real zone capacities so chunks are
-    // sized to what the arena can actually serve.  max(RUNTIME, KV) is the
-    // right choice because alloc_buffer tries RUNTIME first but spills to
-    // the larger shared KV zone when RUNTIME is full; the KV zone is
-    // therefore the true upper bound for a single compute-buffer
-    // allocation.  The value is still capped at the Level Zero safe
-    // per-allocation limit (typically ~2 GB) to stay within driver limits.
+    // sized to what the arena can actually serve.  The value is still
+    // capped at the Level Zero safe per-allocation limit (typically ~2 GB)
+    // to stay within driver limits.
+    //
+    // Why zone_capacity (not zone_largest_free_block) on the VRAM side:
+    // VRAM zones are bump-allocated and always contiguous, so
+    // zone_capacity is the correct ceiling for a single allocation.  The
+    // host path (ggml_backend_sycl_host_buffer_type_get_max_size at
+    // line ~17834) uses zone_largest_free_block instead because host
+    // zones are segmented across multiple `sycl::malloc_host` chunks and
+    // cannot hand out a virtually contiguous pointer across chunk
+    // boundaries (bug llama.cpp-lj6p0).  Do not unify without first
+    // preserving the host-path distinction. (llama.cpp-w1rxh MIN-6)
     //
     // Edge cases:
     //   - safe_alloc == 0 (probe failed): fall back to max_alloc_size.
@@ -14335,9 +14350,13 @@ static size_t ggml_backend_sycl_buffer_type_get_max_size(ggml_backend_buffer_typ
             if (safe_alloc == 0) {
                 safe_alloc = ggml_sycl_info().devices[ctx->device].max_alloc_size;
             }
+            // The compute-buffer alloc chain is RUNTIME -> KV -> SCRATCH;
+            // include SCRATCH so the largest-fallback zone actually
+            // bounds the chunk size. (llama.cpp-w1rxh IMP-3)
             const size_t runtime_cap = cache->zone_capacity(ggml_sycl::vram_zone_id::RUNTIME);
             const size_t kv_cap      = cache->zone_capacity(ggml_sycl::vram_zone_id::KV);
-            size_t       zone_cap    = std::max(runtime_cap, kv_cap);
+            const size_t scratch_cap = cache->zone_capacity(ggml_sycl::vram_zone_id::SCRATCH);
+            size_t       zone_cap    = std::max({ runtime_cap, kv_cap, scratch_cap });
             if (zone_cap == 0) {
                 zone_cap = max_chunk;
             }
