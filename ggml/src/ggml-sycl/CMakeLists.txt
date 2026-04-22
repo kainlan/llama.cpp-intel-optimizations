@@ -242,10 +242,14 @@ if (GGML_SYCL_F16)
     if (GGML_SYCL_TARGET STREQUAL "AMD")
         message(WARNING "AMD target does not entirely support FP16 in the SYCL backend.")
     endif()
+    # The directory-scoped add_compile_definitions reaches ggml-sycl's own TUs
+    # (this CMakeLists builds the ggml-sycl backend library). The target-scoped
+    # PUBLIC definition on `ggml` propagates the flag to every consumer that
+    # links ggml — notably src/llama-graph.cpp, which needs it to cast Q at
+    # graph-build time via GGML_SYCL_FATTN_Q_TYPE (declared in ggml-sycl.h).
+    # Both are required: the first scope serves ggml-sycl code, the second
+    # scope serves llama code. They are not redundant.
     add_compile_definitions(GGML_SYCL_F16)
-    # Propagate to the ggml target (PUBLIC) so consumers like src/llama-graph.cpp
-    # see GGML_SYCL_F16 when they include ggml-sycl.h and can cast Q at graph-build
-    # time via GGML_SYCL_FATTN_Q_TYPE.
     target_compile_definitions(ggml PUBLIC GGML_SYCL_F16)
 endif()
 

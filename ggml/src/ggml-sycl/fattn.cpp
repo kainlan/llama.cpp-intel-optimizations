@@ -442,9 +442,6 @@ static void init_fa_onednn_config() {
         return;
     }
     g_sycl_fa_onednn_initialized = true;
-#ifdef GGML_SYCL_F16
-    fprintf(stderr, "[SYCL] GGML_SYCL_F16 build: attention Q/accumulators are f16\n");
-#endif
     const char * env = std::getenv("GGML_SYCL_FA_ONEDNN");
     if (env && (strcmp(env, "0") == 0 || strcmp(env, "false") == 0)) {
         g_sycl_fa_onednn_enabled = false;
@@ -999,6 +996,18 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     init_fa_safe_decode_config();
 #if GGML_SYCL_DNNL
     init_fa_onednn_config();
+#endif
+
+    // One-shot build-flag announcement — independent of oneDNN so builds with
+    // GGML_SYCL_F16=ON + GGML_SYCL_DNN=OFF still see it.
+#ifdef GGML_SYCL_F16
+    {
+        static bool s_f16_banner_logged = false;
+        if (!s_f16_banner_logged) {
+            s_f16_banner_logged = true;
+            fprintf(stderr, "[SYCL] GGML_SYCL_F16 build: attention Q/accumulators are f16\n");
+        }
+    }
 #endif
 
     const ggml_tensor * dst = safe_dst.raw();
