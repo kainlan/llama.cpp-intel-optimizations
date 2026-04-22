@@ -14295,27 +14295,57 @@ static size_t ggml_backend_sycl_buffer_type_get_max_size(ggml_backend_buffer_typ
         return 0;
     }
 
-    // When the VRAM arena is active, return a chunk-sized limit that ggml-alloc
-    // will use to split compute buffers into multiple smaller chunks.
-    // This is a PER-CHUNK limit, not a total capacity limit.  The RUNTIME zone
-    // in the arena may be smaller than this value — alloc_buffer handles the
-    // case where a chunk doesn't fit in the RUNTIME zone by falling through
-    // to the shared KV/WEIGHT zone or device allocation.
-    // Use the Level Zero per-allocation limit (safe_max_alloc_size) capped at
-    // 2 GB to avoid giant single allocations that the driver rejects.
+    // llama.cpp-w1rxh: arena-aware per-chunk limit.
+    //
+    // When the VRAM arena is active, report the largest zone the compute-
+    // buffer path can satisfy in a single allocation.  ggml-alloc uses this
+    // value (`max_chunk_size`) to split the scheduler's peak-working-set
+    // request into up to GGML_VBUFFER_MAX_CHUNKS=16 chunks, each allocated
+    // through a separate `alloc_buffer` call.  Each chunk routes through
+    // the RUNTIME zone first (see `should_use_runtime` in alloc_buffer)
+    // and falls back to the shared KV zone when RUNTIME is exhausted,
+    // matching the unified-cache architectural principle that arena zones
+    // are the single source of truth for serving capacity.
+    //
+    // Previously a hardcoded 2 GB cap ignored the actual arena
+    // configuration.  We now query the real zone capacities so chunks are
+    // sized to what the arena can actually serve.  max(RUNTIME, KV) is the
+    // right choice because alloc_buffer tries RUNTIME first but spills to
+    // the larger shared KV zone when RUNTIME is full; the KV zone is
+    // therefore the true upper bound for a single compute-buffer
+    // allocation.  The value is still capped at the Level Zero safe
+    // per-allocation limit (typically ~2 GB) to stay within driver limits.
+    //
+    // Edge cases:
+    //   - safe_alloc == 0 (probe failed): fall back to max_alloc_size.
+    //   - zone_cap == 0 (arena not fully configured): fall back to cap.
+    //
+    // Note: this fix alone cannot split a single tensor that is larger
+    // than a zone.  The specific GPT-OSS 20B "kq = softmax(Q @ K^T)" case
+    // at n_ctx=131072 used to produce a 16 GB intermediate, but that has
+    // been resolved by the FLASH_ATTN_EXT placement fix in llama.cpp-15li2
+    // (f877c91d4) which keeps attention on-device instead of materialising
+    // the full score matrix.  The general scheduler-aware zone sizing
+    // work continues in llama.cpp-8gz7y.
     if (ggml_sycl::vram_arena_enabled()) {
         auto * cache = ggml_sycl::get_unified_cache_for_device(ctx->device);
         if (cache && cache->arena_active()) {
-            constexpr size_t max_chunk  = 2ULL * 1024 * 1024 * 1024;  // 2 GB
+            constexpr size_t max_chunk  = 2ULL * 1024 * 1024 * 1024;  // 2 GB safe L0 cap
             size_t           safe_alloc = ggml_sycl_info().devices[ctx->device].safe_max_alloc_size;
-            if (safe_alloc > 0) {
-                return std::min(safe_alloc, max_chunk);
+            if (safe_alloc == 0) {
+                safe_alloc = ggml_sycl_info().devices[ctx->device].max_alloc_size;
             }
-            size_t hw_limit = ggml_sycl_info().devices[ctx->device].max_alloc_size;
-            if (hw_limit > 0) {
-                return std::min(hw_limit, max_chunk);
+            const size_t runtime_cap = cache->zone_capacity(ggml_sycl::vram_zone_id::RUNTIME);
+            const size_t kv_cap      = cache->zone_capacity(ggml_sycl::vram_zone_id::KV);
+            size_t       zone_cap    = std::max(runtime_cap, kv_cap);
+            if (zone_cap == 0) {
+                zone_cap = max_chunk;
             }
-            return max_chunk;
+            size_t chunk = std::min(zone_cap, max_chunk);
+            if (safe_alloc > 0 && chunk > safe_alloc) {
+                chunk = safe_alloc;
+            }
+            return chunk;
         }
     }
 
