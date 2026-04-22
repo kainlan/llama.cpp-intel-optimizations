@@ -191,6 +191,141 @@ struct tl_seq_id_buffers {
 
 static thread_local tl_seq_id_buffers g_tl_seq_buffers;
 
+// =============================================================================
+// llama.cpp-15li2 CRIT-1: per-op staging for FA weight sources (attn_sinks).
+// =============================================================================
+// GPT-OSS adds a per-layer `attn_sinks` weight tensor
+// (src/llama-model.cpp:8082) that flows into FLASH_ATTN_EXT as src[4].  When
+// the placement planner puts a GPT-OSS layer's dense weights on host (e.g.
+// GGML_SYCL_VRAM_BUDGET_PCT=30), `attn_sinks` is host-resident.  The FA
+// dispatch (below) resolves src[4] via ggml_sycl_resolve_tensor_ptr and
+// passes the pointer straight to the XMX kernel as `params.sinks`.
+//
+// Host-pinned USM (sycl::malloc_host, which is what the host arena uses for
+// weights) is GPU-addressable via PCIe zero-copy, so the invariant usually
+// holds.  But a future change that puts any FA weight source in non-USM
+// memory (e.g. a plain malloc fallback) would crash the kernel with a GPU
+// page fault, and the layer-plan-based dispatch cannot see it.
+//
+// Belt-and-braces fix: at FA kernel submission time, if any weight-rooted
+// src pointer resolves to something other than `sycl::usm::alloc::device`,
+// stage a temporary device copy.  Host-pinned USM (alloc::host) could be
+// used directly via PCIe, but explicitly staging to device gives the XMX
+// kernel uniform fast-path memory access and eliminates the hazard
+// entirely.
+//
+// Implementation: thread-local reusable device staging buffer (pattern
+// mirrors g_tl_seq_buffers).  Memcpy happens on the inference stream, so
+// it is correctly ordered before the FA kernel that reads it (in-order
+// queue) without an explicit barrier.
+struct tl_fattn_weight_stage {
+    void *        sinks_dev      = nullptr;
+    size_t        sinks_capacity = 0;
+    void *        mask_dev       = nullptr;
+    size_t        mask_capacity  = 0;
+    sycl::queue * alloc_queue    = nullptr;
+
+    tl_fattn_weight_stage() { register_fattn_atexit(); }
+
+    ~tl_fattn_weight_stage() { free_all(); }
+
+    void free_all() {
+        if (g_fattn_shutting_down.load(std::memory_order_acquire)) {
+            return;
+        }
+        if (sinks_dev && alloc_queue) {
+            sycl::free(sinks_dev, *alloc_queue);
+            sinks_dev      = nullptr;
+            sinks_capacity = 0;
+        }
+        if (mask_dev && alloc_queue) {
+            sycl::free(mask_dev, *alloc_queue);
+            mask_dev      = nullptr;
+            mask_capacity = 0;
+        }
+    }
+};
+
+static thread_local tl_fattn_weight_stage g_tl_fattn_weight_stage;
+
+// Returns a device-addressable pointer for `src` on `stream`.  If the
+// resolved pointer is already sycl::usm::alloc::device, returns it as-is.
+// Otherwise copies the tensor's bytes into the thread-local device staging
+// buffer `slot` (growing it if needed) and returns the staged pointer.
+//
+// Returns nullptr on allocation failure; caller may fall back to the
+// zero-copy host-pinned pointer (which is GPU-accessible but slower).
+//
+// `slot_ptr` / `slot_capacity` reference the staging-buffer slot to reuse
+// across calls (one slot per tensor role).
+static const char * ggml_sycl_fattn_stage_weight_src(const ggml_tensor * src, int device, sycl::queue * stream,
+                                                     const char * role, void *& slot_ptr, size_t & slot_capacity) {
+    if (!src || !stream) {
+        return nullptr;
+    }
+    void * resolved = ggml_sycl_resolve_tensor_ptr(const_cast<ggml_tensor *>(src), device);
+    if (!resolved) {
+        return nullptr;
+    }
+    // Fast path: already on device — pass through.
+    sycl::usm::alloc alloc_kind = sycl::usm::alloc::unknown;
+    try {
+        alloc_kind = ggml_sycl_get_alloc_type(resolved);
+    } catch (...) {
+        // Query failure: treat as unknown; fall through to staging.
+    }
+    if (alloc_kind == sycl::usm::alloc::device) {
+        return static_cast<const char *>(resolved);
+    }
+
+    const size_t bytes = static_cast<size_t>(ggml_nbytes(src));
+    if (bytes == 0) {
+        return static_cast<const char *>(resolved);
+    }
+
+    // Stage: grow the slot if needed, then memcpy on the inference stream.
+    auto & stage = g_tl_fattn_weight_stage;
+    if (stage.alloc_queue && stage.alloc_queue != stream) {
+        // Queue changed (unlikely during steady-state inference): free both
+        // slots and reallocate on the new queue.
+        stage.free_all();
+    }
+    stage.alloc_queue = stream;
+
+    if (bytes > slot_capacity) {
+        if (slot_ptr) {
+            sycl::free(slot_ptr, *stream);
+            slot_ptr      = nullptr;
+            slot_capacity = 0;
+        }
+        slot_ptr = ggml_sycl_malloc_device(bytes, *stream, "fattn_weight_stage");
+        if (!slot_ptr) {
+            static bool warned = false;
+            if (!warned) {
+                GGML_LOG_WARN("[SYCL] fattn weight staging: failed to allocate %zu bytes for %s; "
+                              "falling back to host-pinned zero-copy (may be slower)\n",
+                              bytes, role);
+                warned = true;
+            }
+            return static_cast<const char *>(resolved);  // Host-pinned USM, still GPU-readable.
+        }
+        slot_capacity = bytes;
+    }
+
+    // In-order queue ensures this memcpy completes before the FA kernel
+    // submission that follows.  Tiny copy (attn_sinks is n_head * f32 =
+    // 256 B for GPT-OSS 20B), so cost is dominated by submission overhead
+    // not bandwidth.
+    stream->memcpy(slot_ptr, resolved, bytes);
+
+    static std::atomic<int> staged_log_left{ 8 };
+    if (staged_log_left.fetch_sub(1) > 0) {
+        GGML_LOG_INFO("[SYCL] fattn staged weight-source '%s' (%s, %zu B) from alloc_kind=%d to device\n",
+                      src->name[0] ? src->name : "?", role, bytes, static_cast<int>(alloc_kind));
+    }
+    return static_cast<const char *>(slot_ptr);
+}
+
 // Test hooks for verifying thread-local cleanup.
 extern "C" int ggml_sycl_test_seq_id_buffer_instances() {
     return g_seq_id_buffer_instances.load();
@@ -1130,8 +1265,23 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     params.Q         = static_cast<const char *>(Q_t.resolve_ptr());
     params.K         = static_cast<const char *>(K_t.resolve_ptr());
     params.V         = static_cast<const char *>(V_t.resolve_ptr());
-    params.mask      = mask ? static_cast<const char *>(ggml_sycl_resolve_tensor_ptr(mask, device)) : nullptr;
-    params.sinks     = sinks ? static_cast<const char *>(ggml_sycl_resolve_tensor_ptr(sinks, device)) : nullptr;
+    // llama.cpp-15li2 CRIT-1: FA's src[4] (`sinks`) is a per-layer WEIGHT
+    // for GPT-OSS; with host-planned layers it resolves to host-pinned
+    // USM.  Stage to device if the resolved pointer is not
+    // sycl::usm::alloc::device.  `mask` is defensively staged as well
+    // even though today it is always a per-batch activation — if a
+    // future model makes its mask weight-planned, this will keep working.
+    sycl::queue * stream_ptr = ctx.stream();
+    params.mask              = mask ? ggml_sycl_fattn_stage_weight_src(
+                                          mask, device, stream_ptr, "mask",
+                                          g_tl_fattn_weight_stage.mask_dev,
+                                          g_tl_fattn_weight_stage.mask_capacity)
+                                    : nullptr;
+    params.sinks             = sinks ? ggml_sycl_fattn_stage_weight_src(
+                                          sinks, device, stream_ptr, "attn_sinks",
+                                          g_tl_fattn_weight_stage.sinks_dev,
+                                          g_tl_fattn_weight_stage.sinks_capacity)
+                                     : nullptr;
     params.dst       = safe_dst.resolve_as<float>();
 
     // Source tensor types — consumers (e.g. oneDNN SDPA) need these to size byte

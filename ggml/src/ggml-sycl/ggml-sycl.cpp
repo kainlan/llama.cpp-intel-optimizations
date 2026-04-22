@@ -51483,15 +51483,28 @@ static bool ggml_sycl_layer_plan_applies_to_op(const ggml_tensor * op) {
         case GGML_OP_SET_ROWS:
         case GGML_OP_SET_ROWS_PAGED:
             return false;
-        // Flash attention runs on activations (Q) + KV cache; it has no weight
-        // sources, so the dense-weight layer plan doesn't apply.  Routing FA by
-        // the dense-weight placement forces it to CPU whenever a layer's dense
-        // weights are planned on host (e.g. GPT-OSS 20B at reduced VRAM budget),
-        // producing a backend mismatch that disables FA globally.  FA then falls
+        // Flash attention is excluded from the dense-weight layer plan:
+        //   src[0] (Q) is an activation.
+        //   src[1], src[2] (K, V) are views over the KV cache -- placement
+        //       is tracked separately via get_kv_device(), not the weight
+        //       plan.
+        //   src[3] (mask) is a per-batch activation today.
+        //   src[4] (sinks, GPT-OSS only) IS a per-layer weight tensor.
+        //       When a layer's dense weights are host-planned (e.g.
+        //       GGML_SYCL_VRAM_BUDGET_PCT=30 on GPT-OSS 20B), attn_sinks is
+        //       host-pinned too.  The FA dispatch handles this via a
+        //       targeted per-op staging step
+        //       (ggml_sycl_fattn_stage_weight_src in fattn.cpp) rather than
+        //       through the layer plan -- staging is cheap (256 B for
+        //       GPT-OSS 20B) and avoids routing all of FA to CPU just
+        //       because one small weight source is host-resident.
+        //   src[5], src[6] (seq_ids) are activations.
+        // Routing FA by the dense-weight plan would force it to CPU
+        // whenever a layer's dense weights are host-resident, producing a
+        // backend mismatch that disables FA globally; FA would then fall
         // back to materialising the full Q.Kt score matrix (16 GB at
-        // n_ctx=131072), which cannot fit the runtime zone.  KV cache residency
-        // is tracked separately (get_kv_device) and is the relevant question
-        // for FA placement.  (llama.cpp-15li2)
+        // n_ctx=131072 for GPT-OSS 20B), which cannot fit the runtime
+        // zone.  (llama.cpp-15li2, MIN-5)
         case GGML_OP_FLASH_ATTN_EXT:
             return false;
         default:
