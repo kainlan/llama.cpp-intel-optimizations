@@ -13996,6 +13996,49 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
             // zone.  The ggml buffer just needs a device-resident address.
             const bool should_use_runtime = !is_kv_buft && effective_mem_type == GGML_SYCL_MEM_DEVICE;
             if (should_use_runtime) {
+                // === Fail-fast guard (llama.cpp-ioua6) ===
+                // If the request size exceeds EVERY fallback zone's total
+                // capacity under the current VRAM budget, the allocator chain
+                // (RUNTIME → KV → SCRATCH → host-pinned) is doomed.  The legacy
+                // host-pinned path will grow the pinned pool by many GB trying
+                // to satisfy this, fail with malloc_host, and surface as
+                // "graph_reserve: failed to allocate compute buffers" after
+                // tens of seconds of futile growth attempts.
+                //
+                // Non-MoE weight tensors are chunked by ggml to fit individual
+                // buffer-type limits, so a real weight alloc never exceeds the
+                // arena.  A request that does exceed it is either a scheduler
+                // compute buffer sized from the default context, or an
+                // unanticipated huge tensor.  In either case, fail fast with a
+                // user-actionable error instead of burning minutes on host-pool
+                // growth that cannot succeed.
+                //
+                // NOTE: this is a defensive band-aid; the architectural fix is
+                // tracked in llama.cpp-8gz7y (scheduler-aware zone sizing via
+                // two-phase graph_reserve, depends on llama.cpp-w1rxh and
+                // llama.cpp-tyoc2).
+                {
+                    const size_t cap_runtime = cache->zone_capacity(ggml_sycl::vram_zone_id::RUNTIME);
+                    const size_t cap_kv      = cache->zone_capacity(ggml_sycl::vram_zone_id::KV);
+                    const size_t cap_scratch = cache->zone_capacity(ggml_sycl::vram_zone_id::SCRATCH);
+                    const size_t cap_max     = std::max({ cap_runtime, cap_kv, cap_scratch });
+                    if (size > cap_max) {
+                        const char * env_pct_raw = std::getenv("GGML_SYCL_VRAM_BUDGET_PCT");
+                        const int    budget_pct  =
+                            env_pct_raw ? std::max(1, std::min(100, std::atoi(env_pct_raw))) : 90;
+                        GGML_LOG_ERROR(
+                            "[SYCL] compute buffer allocation (%.2f GB) exceeds all zone capacities under "
+                            "GGML_SYCL_VRAM_BUDGET_PCT=%d (RUNTIME=%.0f MB, shared=%.0f MB, SCRATCH=%.0f MB). "
+                            "Three options:\n"
+                            "  (a) raise GGML_SYCL_VRAM_BUDGET_PCT (e.g. =100)\n"
+                            "  (b) reduce context (-c 512 for a quick smoke test; -c 1024 for reasonable use)\n"
+                            "  (c) wait for llama.cpp-8gz7y (scheduler-aware zone sizing) to land\n",
+                            size / (1024.0 * 1024.0 * 1024.0), budget_pct,
+                            cap_runtime / (1024.0 * 1024.0), cap_kv / (1024.0 * 1024.0),
+                            cap_scratch / (1024.0 * 1024.0));
+                        return nullptr;
+                    }
+                }
                 // Route through RUNTIME zone.  If zone_alloc fails, the zone
                 // likely has stale allocations from a previous context (compute
                 // buffers are arena-backed and their destructors don't free zone
