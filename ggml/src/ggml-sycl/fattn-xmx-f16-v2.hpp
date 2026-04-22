@@ -383,7 +383,15 @@ inline sycl::half fp8_e4m3_to_half_v2(uint8_t bits) {
 // leaves land with matching lane-ownership math.
 // =============================================================================
 
-template <int D, int ncols, bool use_logit_softcap, typename Q_type, bool kv_is_fp8, int TM, int TK, int TN>
+template <int D,
+          int ncols,
+          bool use_logit_softcap,
+          typename Q_type,
+          typename Acc_t,
+          bool kv_is_fp8,
+          int TM,
+          int TK,
+          int TN>
 static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
                                               const char * __restrict__ K_base,
                                               const char * __restrict__ V_base,
@@ -475,17 +483,17 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
     const int     this_sg_q_tile = sg_id % SG_ROWS_PER_Q;  // which Q-tile this SG covers
     const int     sg_q_base      = this_sg_q_tile * TM;
 
-    // Per-lane accumulator. `afloat` is `sycl::half` under GGML_SYCL_F16 and
-    // `float` otherwise (typedef in ggml-sycl/common.hpp). `KQ_max` / `KQ_sum`
-    // stay in full float: online-softmax state is precision-critical (the
+    // Per-lane accumulator. `Acc_t` is a template parameter set by the
+    // dispatcher: `float` on GGML_PREC_F32 (matches CUDA's KQ_acc_t=float
+    // branch) and `afloat` on GGML_PREC_DEFAULT (picks up the SYCL-F16 build
+    // flag — see ggml-sycl/common.hpp). `KQ_max` / `KQ_sum` stay in full
+    // float: online-softmax state is precision-critical (the
     // exp(max_old - max_new) rescale cancels rapidly if the running max is
     // rounded to half), and the FTZ bit manipulation further down assumes a
-    // 32-bit scale_old. `VKQ` is the downstream V-weighted sum and tolerates
-    // half precision under GGML_SYCL_F16 because it is driven by softmax
-    // probabilities that already live in a narrow dynamic range.
-    afloat VKQ[TM][D_TILES];  // [query_slot_in_tile][D_tile]
-    float  KQ_max[TM];
-    float  KQ_sum[TM];
+    // 32-bit scale_old.
+    Acc_t VKQ[TM][D_TILES];  // [query_slot_in_tile][D_tile]
+    float KQ_max[TM];
+    float KQ_sum[TM];
 
 #    pragma unroll
     for (int r = 0; r < TM; ++r) {
@@ -493,7 +501,7 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
         KQ_sum[r] = 0.0f;
 #    pragma unroll
         for (int t = 0; t < D_TILES; ++t) {
-            VKQ[r][t] = afloat(0.0f);
+            VKQ[r][t] = Acc_t(0.0f);
         }
     }
 
@@ -635,10 +643,10 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
                 scale_bits *= static_cast<uint32_t>(KQ_max_diff >= SOFTMAX_FTZ_THRESHOLD);
                 __builtin_memcpy(&scale_old, &scale_bits, sizeof(float));
 
-                // VKQ lives in `afloat` (half under GGML_SYCL_F16). Apply the
-                // rescale through an explicit narrow cast so the half*=float
-                // mixed-mode multiply is readable and not silently implicit.
-                const afloat scale_old_a = afloat(scale_old);
+                // VKQ lives in `Acc_t` (half under GGML_SYCL_F16+PREC_DEFAULT,
+                // float on PREC_F32). Apply the rescale through an explicit
+                // narrowing cast so the mixed-mode multiply stays readable.
+                const Acc_t scale_old_a = Acc_t(scale_old);
 #    pragma unroll
                 for (int t = 0; t < D_TILES; ++t) {
                     VKQ[r][t] *= scale_old_a;
@@ -730,7 +738,7 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
             KQ_sum[r]               = KQ_sum[r] * scale_old + sink_weight;
             KQ_max[r]               = new_max;
 
-            const afloat scale_old_a = afloat(scale_old);
+            const Acc_t scale_old_a = Acc_t(scale_old);
 #    pragma unroll
             for (int t = 0; t < D_TILES; ++t) {
                 VKQ[r][t] *= scale_old_a;
@@ -748,9 +756,10 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
             continue;
         }
 
-        // KQ_sum stays in float (softmax denominator precision); VKQ is `afloat`
-        // under GGML_SYCL_F16, so the final multiply promotes to float for the
-        // f32 dst_row write expected by the public FA contract.
+        // KQ_sum stays in float (softmax denominator precision); VKQ is `Acc_t`
+        // (half under GGML_SYCL_F16+PREC_DEFAULT, float under PREC_F32), so the
+        // final multiply promotes to float for the f32 dst_row write expected
+        // by the public FA contract.
         const float inv_sum = (KQ_sum[r] > 0.0f) ? (1.0f / KQ_sum[r]) : 0.0f;
         float *     dst_row = dst + (int64_t) D * (head + ne02 * (q_abs + ne01 * sequence));
 
@@ -767,7 +776,15 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
 // Leaf launch helper — one instantiation per compile-time variant.
 // =============================================================================
 
-template <int D, int ncols, bool use_logit_softcap, typename Q_type, bool kv_is_fp8, int TM, int TK, int TN>
+template <int D,
+          int ncols,
+          bool use_logit_softcap,
+          typename Q_type,
+          typename Acc_t,
+          bool kv_is_fp8,
+          int TM,
+          int TK,
+          int TN>
 static void launch_fattn_xmx_v2_f16_leaf(const fattn_params & params, dpct::queue_ptr stream) {
     using slm_layout = fattn_v2_slm<D, ncols>;
 
@@ -804,7 +821,7 @@ static void launch_fattn_xmx_v2_f16_leaf(const fattn_params & params, dpct::queu
         cgh.parallel_for(
             sycl::nd_range<3>(grid * block, block),
             [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(XMX_V2_SG)]] {
-                flash_attn_xmx_v2_f16_kernel_leaf<D, ncols, use_logit_softcap, Q_type, kv_is_fp8, TM, TK, TN>(
+                flash_attn_xmx_v2_f16_kernel_leaf<D, ncols, use_logit_softcap, Q_type, Acc_t, kv_is_fp8, TM, TK, TN>(
                     Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, dst_ptr, scale_v, max_bias, m0, m1, n_head_log2, logit_sc,
                     ne01, ne02, nb01, nb02, nb03, ne11, ne12, nb11, nb12, nb13, nb21, nb22, nb23, ne30, ne32, ne33,
                     nb31, nb32, nb33, item, slm.get_multi_ptr<sycl::access::decorated::no>().get());
@@ -821,7 +838,7 @@ static void launch_fattn_xmx_v2_f16_leaf(const fattn_params & params, dpct::queu
 // `if (launcher(...)) return;` idiom.
 // =============================================================================
 
-template <int D, int ncols, bool use_logit_softcap, typename Q_type, bool kv_is_fp8 = false>
+template <int D, int ncols, bool use_logit_softcap, typename Q_type, typename Acc_t, bool kv_is_fp8 = false>
 bool launch_fattn_xmx_v2_f16(ggml_backend_sycl_context & ctx, const fattn_params & params, dpct::queue_ptr stream) {
     const std::size_t variant_idx = fattn_xmx_v2_pick_variant_cached(ctx, stream->get_device());
 
@@ -838,7 +855,7 @@ bool launch_fattn_xmx_v2_f16(ggml_backend_sycl_context & ctx, const fattn_params
         // `fattn_xmx_v2_variants[]`. The `default` catches both the fallback-leaf
         // selection and any unrecognized future index (defensive).
         default:
-            launch_fattn_xmx_v2_f16_leaf<D, ncols, use_logit_softcap, Q_type, kv_is_fp8,
+            launch_fattn_xmx_v2_f16_leaf<D, ncols, use_logit_softcap, Q_type, Acc_t, kv_is_fp8,
                                          /*TM=*/8, /*TK=*/16, /*TN=*/16>(params, stream);
             break;
     }
@@ -855,7 +872,7 @@ inline bool fattn_xmx_v2_f16_available() {
 
 #else   // !SYCL_XMX_V2_AVAILABLE
 
-template <int D, int ncols, bool use_logit_softcap, typename Q_type, bool kv_is_fp8 = false>
+template <int D, int ncols, bool use_logit_softcap, typename Q_type, typename Acc_t, bool kv_is_fp8 = false>
 bool launch_fattn_xmx_v2_f16(ggml_backend_sycl_context &, const fattn_params &, dpct::queue_ptr) {
     GGML_ABORT("XMX v2 not available at compile time");
     return false;

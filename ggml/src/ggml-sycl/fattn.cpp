@@ -837,12 +837,14 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
 // — see fattn-xmx-f16-v2.hpp). Assigns the result to `v2_dispatched` so the
 // caller can fall through to TILE when the launcher returns false (e.g. SLM too
 // small for the fallback leaf). Matches the ggml_sycl_flash_attn_ext_onednn
-// pattern at fattn-onednn.cpp.
-#define DISPATCH_NCOLS_CTX(NCOLS, LAUNCHER)                                     \
-    if (logit_softcap == 0.0f) {                                                \
-        v2_dispatched = LAUNCHER<D, NCOLS, false, Q_type>(ctx, params, stream); \
-    } else {                                                                    \
-        v2_dispatched = LAUNCHER<D, NCOLS, true, Q_type>(ctx, params, stream);  \
+// pattern at fattn-onednn.cpp. Takes an explicit accumulator type parameter so
+// the prec-hint (GGML_PREC_F32 vs GGML_PREC_DEFAULT) routes to the matching
+// kernel specialization — see the `params.prec` branch below.
+#define DISPATCH_NCOLS_CTX_ACC(NCOLS, LAUNCHER, ACC_T)                                    \
+    if (logit_softcap == 0.0f) {                                                          \
+        v2_dispatched = LAUNCHER<D, NCOLS, false, Q_type, ACC_T>(ctx, params, stream);    \
+    } else {                                                                              \
+        v2_dispatched = LAUNCHER<D, NCOLS, true, Q_type, ACC_T>(ctx, params, stream);     \
     }
 
     // VEC path: deterministic-by-construction TG fast path (zero SLM, register-only).
@@ -867,7 +869,15 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
     // Ineligible: gpt-oss-20b (sinks+softcap), Gemma-2 (softcap), FP8 KV.
     // Dispatched BEFORE XMX/TILE so PP benefits from oneDNN's fused kernel.
     // Falls back to kernel path if oneDNN compile fails or during graph recording.
-    if (!safe_decode && g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled) {
+    // oneDNN SDPA path has no prec-hint wiring today (see llama.cpp-0kpp3); its
+    // internal accumulator follows oneDNN's primitive choice, which on Xe2
+    // reduces to f16 under the GGML_SYCL_F16 build path. Skip oneDNN when the
+    // caller explicitly requested PREC_F32 so the XMX-v2 kernel (which DOES
+    // respect the hint via Acc_t=float) takes over. This is a correctness
+    // guardrail — a future task can extend oneDNN with its own f32-accum
+    // dispatch to regain PP throughput under PREC_F32.
+    const bool skip_onednn_for_prec_f32 = (params.prec == GGML_PREC_F32);
+    if (!safe_decode && g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled && !skip_onednn_for_prec_f32) {
         const bool multi_seq = (params.n_seqs > 1);
         if (ggml_sycl_flash_attn_ext_onednn_eligible(params,
                                                      params.ne02,  // H_q
@@ -912,19 +922,43 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
             // Returns false if the fallback leaf's worst-case SLM exceeds the
             // device's local_mem_size; we flip use_xmx so the TILE block below
             // picks up the dispatch. The block below is gated on `!use_xmx`.
-            bool v2_dispatched = false;
+            //
+            // Prec-hint dispatch (llama.cpp-0kpp3): PREC_F32 forces a float
+            // accumulator (matches test-backend-ops's tight NMSE gate and
+            // llama-graph.cpp's unconditional PREC_F32 pin). PREC_DEFAULT picks
+            // up the build-time `afloat` typedef — half under GGML_SYCL_F16,
+            // float otherwise. Mirrors CUDA's pattern at
+            // ggml/src/ggml-cuda/fattn-wmma-f16.cu:541.
+            bool        v2_dispatched = false;
+            const bool  use_f32_acc   = (params.prec == GGML_PREC_F32);
             if (ne01 <= 1) {
-                GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=1 ne01=%d", D, ne01);
-                DISPATCH_NCOLS_CTX(1, launch_fattn_xmx_v2_f16);
+                GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=1 ne01=%d prec=%d", D, ne01, (int) params.prec);
+                if (use_f32_acc) {
+                    DISPATCH_NCOLS_CTX_ACC(1, launch_fattn_xmx_v2_f16, float);
+                } else {
+                    DISPATCH_NCOLS_CTX_ACC(1, launch_fattn_xmx_v2_f16, afloat);
+                }
             } else if (ne01 <= 2) {
-                GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=2 ne01=%d", D, ne01);
-                DISPATCH_NCOLS_CTX(2, launch_fattn_xmx_v2_f16);
+                GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=2 ne01=%d prec=%d", D, ne01, (int) params.prec);
+                if (use_f32_acc) {
+                    DISPATCH_NCOLS_CTX_ACC(2, launch_fattn_xmx_v2_f16, float);
+                } else {
+                    DISPATCH_NCOLS_CTX_ACC(2, launch_fattn_xmx_v2_f16, afloat);
+                }
             } else if (ne01 <= 4) {
-                GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=4 ne01=%d", D, ne01);
-                DISPATCH_NCOLS_CTX(4, launch_fattn_xmx_v2_f16);
+                GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=4 ne01=%d prec=%d", D, ne01, (int) params.prec);
+                if (use_f32_acc) {
+                    DISPATCH_NCOLS_CTX_ACC(4, launch_fattn_xmx_v2_f16, float);
+                } else {
+                    DISPATCH_NCOLS_CTX_ACC(4, launch_fattn_xmx_v2_f16, afloat);
+                }
             } else {
-                GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=8 ne01=%d", D, ne01);
-                DISPATCH_NCOLS_CTX(8, launch_fattn_xmx_v2_f16);
+                GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=8 ne01=%d prec=%d", D, ne01, (int) params.prec);
+                if (use_f32_acc) {
+                    DISPATCH_NCOLS_CTX_ACC(8, launch_fattn_xmx_v2_f16, float);
+                } else {
+                    DISPATCH_NCOLS_CTX_ACC(8, launch_fattn_xmx_v2_f16, afloat);
+                }
             }
             if (!v2_dispatched) {
                 use_xmx = false;
@@ -950,7 +984,7 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
     }
 
 #undef DISPATCH_NCOLS
-#undef DISPATCH_NCOLS_CTX
+#undef DISPATCH_NCOLS_CTX_ACC
 }
 
 // Main flash attention entry point
@@ -1104,6 +1138,12 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     params.m1            = m1;
     params.n_head_log2   = n_head_log2;
     params.logit_softcap = logit_softcap;
+
+    // Per-op precision hint. test-backend-ops sets PREC_F32 on every case via
+    // ggml_flash_attn_ext_set_prec; llama-graph.cpp:1726 pins PREC_F32
+    // unconditionally for the SYCL/CUDA paths. The XMX-v2 dispatcher reads
+    // this to force a float-accumulator specialization on PREC_F32.
+    params.prec = ggml_flash_attn_ext_get_prec(dst);
 
     // Q dimensions: [batch, n_heads, n_queries, head_dim]
     params.ne00 = Q->ne[0];  // head_dim
