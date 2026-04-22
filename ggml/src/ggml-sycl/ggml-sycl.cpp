@@ -51385,6 +51385,17 @@ static bool ggml_sycl_layer_plan_applies_to_op(const ggml_tensor * op) {
         case GGML_OP_SET_ROWS:
         case GGML_OP_SET_ROWS_PAGED:
             return false;
+        // Flash attention runs on activations (Q) + KV cache; it has no weight
+        // sources, so the dense-weight layer plan doesn't apply.  Routing FA by
+        // the dense-weight placement forces it to CPU whenever a layer's dense
+        // weights are planned on host (e.g. GPT-OSS 20B at reduced VRAM budget),
+        // producing a backend mismatch that disables FA globally.  FA then falls
+        // back to materialising the full Q.Kt score matrix (16 GB at
+        // n_ctx=131072), which cannot fit the runtime zone.  KV cache residency
+        // is tracked separately (get_kv_device) and is the relevant question
+        // for FA placement.  (llama.cpp-15li2)
+        case GGML_OP_FLASH_ATTN_EXT:
+            return false;
         default:
             return true;
     }
