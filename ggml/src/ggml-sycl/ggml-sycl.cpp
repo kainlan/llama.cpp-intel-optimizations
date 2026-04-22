@@ -18180,9 +18180,58 @@ static bool ggml_backend_sycl_cpu_offload_compute_is_host(ggml_backend_buffer_ty
 }
 
 static size_t ggml_backend_sycl_cpu_offload_compute_get_max_size(ggml_backend_buffer_type_t buft) {
-    // Host-pinned memory is limited by system RAM, not VRAM.
-    // Reuse the device max-alloc query which respects unified cache headroom.
-    return ggml_backend_sycl_buffer_type_get_max_size(buft);
+    // llama.cpp-15li2 CRIT-2: host-pinned memory is limited by system
+    // host-zone configuration, not VRAM zones.
+    //
+    // This buffer type reports is_host=true and allocates through the
+    // host-pinned path (sycl::malloc_host).  Previously this function
+    // delegated to ggml_backend_sycl_buffer_type_get_max_size(), which
+    // after w1rxh returns max(RUNTIME, KV, SCRATCH) of VRAM zones capped
+    // at 2 GB.  Those are VRAM zone capacities — using them as the
+    // per-chunk ceiling for a HOST allocation is category-wrong (wrong
+    // memory domain entirely).  It happened to produce a reasonable
+    // number by coincidence (2 GB cap), but a future change to the VRAM
+    // zone sizing would silently alter the host chunk ceiling.
+    //
+    // Mirror the main host buffer type's logic
+    // (ggml_backend_sycl_host_buffer_type_get_max_size at line ~17834):
+    //   - If host zones are configured, return the largest contiguous
+    //     free block in the STAGING zone (CPU-offload activations are
+    //     staging-category, not weights).  Host zones are segmented
+    //     across multiple malloc_host chunks, so largest-free-block is
+    //     the correct ceiling (bug llama.cpp-lj6p0 context).
+    //   - Otherwise fall back to the host max-alloc size, which is
+    //     derived from minimum maxMemAllocSize across active SYCL
+    //     devices.
+    const size_t chunk_cap = ggml_backend_sycl_host_buffer_type_chunk_cap();
+
+    auto * cache = ggml_sycl::get_unified_cache_for_device(get_current_device_id());
+    if (cache && cache->host_zones_configured()) {
+        // CPU-offload compute buffers carry per-batch activations, not
+        // weights: always route through the STAGING zone.
+        size_t largest = cache->host_zone_largest_free_block(ggml_sycl::host_zone_id::STAGING);
+        if (largest < chunk_cap) {
+            // Floor: host_zone_alloc can grow the zone on fragmentation,
+            // so as long as zone capacity has room we advertise at least
+            // one chunk worth.  If even a chunk-sized growth is blocked
+            // the caller falls back to direct sycl::malloc_host.
+            largest =
+                std::min(chunk_cap, std::max(largest, static_cast<size_t>(ggml_sycl::pinned_chunk_pool::CHUNK_SIZE)));
+        }
+        return std::min(largest, chunk_cap);
+    }
+
+    const size_t host_max = ggml_sycl_get_host_max_alloc_size();
+    if (host_max > 0) {
+        return std::min(host_max, chunk_cap);
+    }
+    const int    device_id = get_current_device_id();
+    const size_t safe_max  = ggml_sycl_get_safe_max_alloc_size(device_id);
+    if (safe_max > 0) {
+        return std::min(safe_max, chunk_cap);
+    }
+    return chunk_cap;
+    GGML_UNUSED(buft);
 }
 
 static const ggml_backend_buffer_type_i ggml_backend_sycl_cpu_offload_compute_buffer_type_interface = {
