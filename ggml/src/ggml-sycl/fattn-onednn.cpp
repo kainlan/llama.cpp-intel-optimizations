@@ -579,11 +579,15 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
     // needs a different fattn path (e.g. per-op scalar input) and should
     // fail loudly here rather than silently producing wrong outputs.
     //
-    // Epsilon: sqrt(D) for our target Ds (64, 128, 256) has clean f32 bits
-    // and narrowing to f16 drifts by <= ~1e-3. 1e-3 on the f32 comparison
-    // is both tight enough to catch a wrong formula (e.g. 1/D instead of
-    // 1/sqrt(D)) and loose enough to tolerate f16 rounding plus any tiny
-    // ULP-level differences in how the upstream computes 1/sqrt(D).
+    // Epsilon rationale: this assertion compares two f32 values
+    // (`inv_scale = 1.0f/params.scale` and `sqrt_D = sqrtf(D)`). Drift
+    // between them for a legitimate 1/sqrt(D) scale comes from reciprocal
+    // rounding at ULP level (~1e-6 at target Ds 64/128/256), well below
+    // 1e-3f. Wrong-formula bugs produce macroscopic diffs that this
+    // tolerance catches easily (e.g. 1/D vs 1/sqrt(D) differ by ~11 at
+    // D=128). The f16 narrowing happens elsewhere — at the STORE of
+    // `*scale_usm` in build_and_compile_sdpa — and is separate from this
+    // comparison.
     if (params.scale == 0.0f) {
         return false;  // zero scale would divide-by-zero; upstream never sends this
     }
