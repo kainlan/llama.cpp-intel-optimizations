@@ -51,6 +51,11 @@
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
 
+// Scales every test case's max_err() threshold. Default 1.0 keeps CI behavior
+// bit-identical; raise (e.g. --nmse-tolerance-mult 100) to accept known
+// minor precision drift from backends that use reduced-precision intermediates.
+static double g_nmse_tolerance_mult = 1.0;
+
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     size_t nels = ggml_nelements(tensor);
     std::vector<float> data(nels);
@@ -1444,8 +1449,9 @@ struct test_case {
             }
 
             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
-            if (err > ud->tc->max_err()) {
-                printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err());
+            const double tol = ud->tc->max_err() * g_nmse_tolerance_mult;
+            if (err > tol) {
+                printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, tol);
                 //for (int i = 0; i < (int) f1.size(); i++) {
                 //    printf("%5d %9.6f %9.6f, diff = %9.6f\n", i, f1[i], f2[i], f1[i] - f2[i]);
                 //}
@@ -8535,6 +8541,7 @@ static void usage(char ** argv) {
     printf("    op names for -o are as given by ggml_op_desc() (e.g. ADD, MUL_MAT, etc),\n");
     printf("        optionally including the full test case string (e.g. \"ADD(type=f16,ne=[1,1,8,1],nr=[1,1,1,1],nf=1)\")\n");
     printf("    --output specifies output format (default: console, options: console, sql, csv)\n");
+    printf("    --nmse-tolerance-mult <N> scales every test case's NMSE threshold by N (default 1.0)\n");
     printf("    --list-ops lists all available GGML operations\n");
     printf("    --show-coverage shows test coverage\n");
 }
@@ -8582,6 +8589,20 @@ int main(int argc, char ** argv) {
                     usage(argv);
                     return 1;
                 }
+            } else {
+                usage(argv);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--nmse-tolerance-mult") == 0) {
+            if (i + 1 < argc) {
+                char * endp = nullptr;
+                const double v = strtod(argv[++i], &endp);
+                if (endp == argv[i] || v <= 0.0) {
+                    fprintf(stderr, "invalid --nmse-tolerance-mult value: %s\n", argv[i]);
+                    usage(argv);
+                    return 1;
+                }
+                g_nmse_tolerance_mult = v;
             } else {
                 usage(argv);
                 return 1;
