@@ -35,10 +35,10 @@
 // no variant matches, we fall back to the (M=8, K=16, N=16) leaf which is validated
 // on B580 and B50 today.
 //
-// TASK llama.cpp-1a038 — runtime matrix_combinations query, single (8,16,16) leaf.
-// The variant array is sized for N>1 so adding future leaves (e.g. TM=1/TK=64 TG
-// fast path, tracked as a follow-up task) is a one-line array entry plus the leaf
-// specialization. See `fattn_xmx_v2_variants[]` below.
+// Implemented by llama.cpp-1a038 (closed): runtime matrix_combinations query
+// with a single (8,16,16) leaf active today. The variant array is sized for
+// N>1 so adding future leaves (e.g. TM=1/TK=64 TG fast path) is a one-line
+// array entry plus the leaf specialization. See `fattn_xmx_v2_variants[]` below.
 // =============================================================================
 
 #include "fattn-common.hpp"
@@ -78,7 +78,11 @@ static constexpr int XMX_V2_N_SG     = XMX_V2_NTHREADS / XMX_V2_SG;  // 32
 // KV batch size — number of KV rows processed per outer-loop iteration.
 // SLM budget: (ncols*D + 2*BATCH_KV*D + ncols*BATCH_KV) * sizeof(half).
 // For ncols=8, D=128, BATCH_KV=32: (8+64)*128*2 + 8*32*2 = 18432 + 512 = 18944 bytes — within 64 KB.
-// Follow-up task `llama.cpp-0sres` will compute this per-device from queried local_mem_size.
+// llama.cpp-0sres (closed) added the runtime SLM-fit check in
+// `fattn_xmx_v2_pick_variant_cached`: if the fixed BATCH_KV overflows the device's
+// reported local_mem_size for the requested shape, the picker returns use_xmx=false
+// and the dispatcher falls back to the TILE kernel. BATCH_KV itself remains a
+// compile-time constant; only the gate is runtime.
 static constexpr int XMX_V2_BATCH_KV = 32;  // must be divisible by every variant's TK and TN
 
 // =============================================================================
@@ -147,8 +151,9 @@ static_assert(XMX_V2_ELEMS_PER_LANE == 8, "Fallback leaf's column-striped layout
 // =============================================================================
 // Runtime matrix_combinations query + variant picker
 //
-// Called on first use (or once globally today — the per-device cache wiring is
-// the NEXT task `llama.cpp-0sres`). Queries the device's reported
+// Called on first use per ggml_backend_sycl_context via `fattn_xmx_v2_pick_variant_cached`
+// (per-context cache wired in llama.cpp-0sres, closed — one cache entry per device
+// since each sycl context binds to a single device). Queries the device's reported
 // `matrix_combinations`, scores each variant in `fattn_xmx_v2_variants` against
 // every reported combo, and returns the winning variant index. Returns 0 (the
 // fallback leaf) if:
@@ -156,10 +161,10 @@ static_assert(XMX_V2_ELEMS_PER_LANE == 8, "Fallback leaf's column-striped layout
 //   - no combo matches any variant (zero score)
 //   - the matrix extension is not available at compile time
 //
-// TODO(llama.cpp-0sres): replace the single static cache with a per-device cache
-// keyed on device id. Heterogeneous configs (e.g. B580 + iGPU Xe-LPG) may resolve
-// to different variants per device. The static cache below is correct for the
-// single-device case that ships today.
+// llama.cpp-0sres (closed) promoted the single static cache to a per-context
+// `fattn_xmx_v2_device_cache` (see struct below). `fattn_xmx_v2_pick_variant_cached`
+// keys on ggml_backend_sycl_context, so heterogeneous configs (B580 + iGPU Xe-LPG)
+// resolve independently per device.
 // =============================================================================
 
 // Query the matrix_combinations list in a noexcept-ish wrapper. Returns empty
