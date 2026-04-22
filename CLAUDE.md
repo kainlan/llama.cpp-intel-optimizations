@@ -209,7 +209,7 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench ...
 
 | Metric | tok/s | Notes |
 |--------|-------|-------|
-| PP512 (Level 0, all VRAM) | ~1480 | oneDNN FP16 path for M>=16 (PP pipeline disabled pending correctness fix) |
+| PP512 (Level 0, all VRAM) | ~1700 | oneDNN SDPA graph (fattn-xmx-v2 + 5-D GQA) with F16 attention path (GGML_SYCL_F16=ON) |
 | TG128 (Level 0, all VRAM) | ~81 | MMVQ fast-path with SOA layout + graph replay + SCRATCH TLSF zone |
 | TG128 (no graph) | ~70 | MMVQ fast-path alone (graph adds ~13%) |
 | PP512 (Level 3, 30% budget) | ~269 | 15/33 GPU layers, rest on CPU |
