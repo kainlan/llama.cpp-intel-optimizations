@@ -4,7 +4,8 @@
 
 #pragma once
 
-#include <cassert>
+#include "ggml.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -65,7 +66,7 @@ inline std::string json_escape(const std::string & s) {
 // Write a human-readable findings document.
 inline void write_markdown(const findings & f, const std::string & out_path) {
     std::ofstream out(out_path);
-    assert(out.is_open() && "findings markdown file open failed");
+    GGML_ASSERT(out.is_open() && "findings markdown file open failed");
     out << "# " << f.canary_id << " — " << status_str(f.result) << "\n\n";
     out << "**Summary**: " << f.summary << "\n\n";
     out << "**Recommendation**: " << f.recommendation << "\n\n";
@@ -79,7 +80,7 @@ inline void write_markdown(const findings & f, const std::string & out_path) {
 // Write a machine-readable JSON document (no external deps — hand-rolled).
 inline void write_json(const findings & f, const std::string & out_path) {
     std::ofstream out(out_path);
-    assert(out.is_open() && "findings json file open failed");
+    GGML_ASSERT(out.is_open() && "findings json file open failed");
     out << "{\n";
     out << "  \"canary_id\": \""      << json_escape(f.canary_id)      << "\",\n";
     out << "  \"result\": \""         << status_str(f.result)          << "\",\n";
