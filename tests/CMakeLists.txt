@@ -375,6 +375,34 @@ target_include_directories(test-layout-scheduler PRIVATE
 install(TARGETS test-layout-scheduler RUNTIME)
 add_test(NAME test-layout-scheduler COMMAND $<TARGET_FILE:test-layout-scheduler>)
 
+# Pre-flight canaries for the unified memory planner (llama.cpp-3h5gm).
+# Each validates an assumption the planner's design depends on. See
+# docs/plans/2026-04-22-planner-canaries-implementation.md.
+
+if (GGML_SYCL)
+    add_executable(test-planner-canary-skeleton-determinism
+                   test-planner-canary-skeleton-determinism.cpp)
+    target_link_libraries(test-planner-canary-skeleton-determinism
+                          PRIVATE llama common)
+    target_include_directories(test-planner-canary-skeleton-determinism
+                               PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-sycl)
+
+    add_executable(test-planner-canary-pp-tg-union
+                   test-planner-canary-pp-tg-union.cpp)
+    target_link_libraries(test-planner-canary-pp-tg-union
+                          PRIVATE llama common)
+
+    add_executable(test-planner-canary-cpy-visibility
+                   test-planner-canary-cpy-visibility.cpp)
+    target_link_libraries(test-planner-canary-cpy-visibility
+                          PRIVATE llama common)
+
+    add_executable(test-planner-canary-direct-load
+                   test-planner-canary-direct-load.cpp)
+    target_link_libraries(test-planner-canary-direct-load
+                          PRIVATE llama common)
+endif()
+
 # test-ab-validation: unit tests for A/B validation mode infrastructure
 # Part of unified kernel auto-tuning (epic llama.cpp-a3t, task llama.cpp-6hp.21)
 # Pure C++ test (no SYCL required), tests validation utilities for comparing kernel outputs

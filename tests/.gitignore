@@ -5,6 +5,9 @@ ggml-common.h
 **/*.swp
 !peg-parser
 !sycl-canary
+!data
+!data/planner-canaries
+!data/planner-canaries/**
 sycl-canary/device-info
 sycl-canary/dpas
 sycl-canary/subgroup-reduce
