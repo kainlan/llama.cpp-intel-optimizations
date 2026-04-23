@@ -4,12 +4,11 @@
 
 #pragma once
 
-#include <chrono>
+#include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
-#include <sstream>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace planner_canary {
@@ -36,9 +35,37 @@ struct findings {
                                  // "switch-to-plan-B", "C2-keying-change-needed", etc.
 };
 
+// Minimal JSON string escape: handles the RFC 8259 mandatory escapes plus
+// control chars below 0x20 as \u00XX. Does not attempt UTF-8 surrogate
+// splitting — inputs are ASCII/UTF-8 and any multi-byte UTF-8 sequences are
+// passed through verbatim, which is valid per RFC 8259.
+inline std::string json_escape(const std::string & s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if ((unsigned char) c < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char) c);
+                    out += buf;
+                } else {
+                    out += c;
+                }
+        }
+    }
+    return out;
+}
+
 // Write a human-readable findings document.
 inline void write_markdown(const findings & f, const std::string & out_path) {
     std::ofstream out(out_path);
+    assert(out.is_open() && "findings markdown file open failed");
     out << "# " << f.canary_id << " — " << status_str(f.result) << "\n\n";
     out << "**Summary**: " << f.summary << "\n\n";
     out << "**Recommendation**: " << f.recommendation << "\n\n";
@@ -46,19 +73,22 @@ inline void write_markdown(const findings & f, const std::string & out_path) {
     for (const auto & p : f.kv) {
         out << "- **" << p.first << "**: " << p.second << "\n";
     }
+    out << "\n";
 }
 
 // Write a machine-readable JSON document (no external deps — hand-rolled).
 inline void write_json(const findings & f, const std::string & out_path) {
     std::ofstream out(out_path);
+    assert(out.is_open() && "findings json file open failed");
     out << "{\n";
-    out << "  \"canary_id\": \"" << f.canary_id << "\",\n";
-    out << "  \"result\": \"" << status_str(f.result) << "\",\n";
-    out << "  \"summary\": \"" << f.summary << "\",\n";
-    out << "  \"recommendation\": \"" << f.recommendation << "\",\n";
+    out << "  \"canary_id\": \""      << json_escape(f.canary_id)      << "\",\n";
+    out << "  \"result\": \""         << status_str(f.result)          << "\",\n";
+    out << "  \"summary\": \""        << json_escape(f.summary)        << "\",\n";
+    out << "  \"recommendation\": \"" << json_escape(f.recommendation) << "\",\n";
     out << "  \"evidence\": {\n";
     for (size_t i = 0; i < f.kv.size(); ++i) {
-        out << "    \"" << f.kv[i].first << "\": \"" << f.kv[i].second << "\"";
+        out << "    \"" << json_escape(f.kv[i].first) << "\": \""
+                        << json_escape(f.kv[i].second) << "\"";
         if (i + 1 < f.kv.size()) out << ",";
         out << "\n";
     }

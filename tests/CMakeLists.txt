@@ -378,6 +378,10 @@ add_test(NAME test-layout-scheduler COMMAND $<TARGET_FILE:test-layout-scheduler>
 # Pre-flight canaries for the unified memory planner (llama.cpp-3h5gm).
 # Each validates an assumption the planner's design depends on. See
 # docs/plans/2026-04-22-planner-canaries-implementation.md.
+#
+# Not wired into ctest: these canaries require specific GGUF model files at
+# absolute paths (/Storage/GenAI/models/...) and must run with explicit
+# ONEAPI_DEVICE_SELECTOR=level_zero:0. Invoke manually per the canary plan.
 
 if (GGML_SYCL)
     add_executable(test-planner-canary-skeleton-determinism
@@ -386,21 +390,25 @@ if (GGML_SYCL)
                           PRIVATE llama common)
     target_include_directories(test-planner-canary-skeleton-determinism
                                PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-sycl)
+    install(TARGETS test-planner-canary-skeleton-determinism RUNTIME)
 
     add_executable(test-planner-canary-pp-tg-union
                    test-planner-canary-pp-tg-union.cpp)
     target_link_libraries(test-planner-canary-pp-tg-union
                           PRIVATE llama common)
+    install(TARGETS test-planner-canary-pp-tg-union RUNTIME)
 
     add_executable(test-planner-canary-cpy-visibility
                    test-planner-canary-cpy-visibility.cpp)
     target_link_libraries(test-planner-canary-cpy-visibility
                           PRIVATE llama common)
+    install(TARGETS test-planner-canary-cpy-visibility RUNTIME)
 
     add_executable(test-planner-canary-direct-load
                    test-planner-canary-direct-load.cpp)
     target_link_libraries(test-planner-canary-direct-load
                           PRIVATE llama common)
+    install(TARGETS test-planner-canary-direct-load RUNTIME)
 endif()
 
 # test-ab-validation: unit tests for A/B validation mode infrastructure
