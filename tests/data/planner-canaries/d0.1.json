@@ -1,0 +1,22 @@
+{
+  "canary_id": "D0.1",
+  "result": "INCONCLUSIVE",
+  "summary": "Canary cannot complete today: llama_model_load_from_file hangs during the SYCL S1-PRELOAD weight stage before any determinism measurement can run.",
+  "recommendation": "blocked_on_m09zb - rerun after E1 lands",
+  "evidence": {
+    "reason": "blocked_on_m09zb",
+    "hang_location": "ggml/src/ggml-sycl/common.hpp:1863",
+    "function": "staging_buffer_pool::acquire",
+    "caller_api": "llama_model_load_from_file via ggml_sycl_preload_model_weights",
+    "involves_llama_api": "yes",
+    "involves_unified_cache": "yes",
+    "involves_staging_pool": "yes",
+    "same_L0_signature_as_m09zb": "yes",
+    "exit_code": "124",
+    "canary_builds": "yes",
+    "canary_runs_to_completion": "no",
+    "findings_written_by_canary": "no",
+    "resumes_when": "E1 lands (bead llama.cpp-m09zb)",
+    "what_this_would_test_when_unblocked": "determinism of llama_state_get_size across (a) two identical sequential context creations and (b) pre vs post a single-token decode on one context; Mistral 7B Q4_0 and optional GPT-OSS 20B at n_ctx=4096"
+  }
+}

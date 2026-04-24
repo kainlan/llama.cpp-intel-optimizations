@@ -224,11 +224,13 @@ test that touches `llama_init_from_model` OR issues a user-facing
 
 ### Canary results (interim, pre-E1)
 
+> Consolidated final tally and unlock decisions: see [Canary results (2026-04-24)](#canary-results-2026-04-24) below, and the aggregated [`summary.md`](data/planner-canaries/summary.md).
+
 | Canary | Status | Notes |
 |---|---|---|
 | D0.1 — skeleton determinism | INCONCLUSIVE (blocked by m09zb) | Binary builds; execution wedges in `llama_model_load_from_file` before any determinism measurement can complete. Resumes once E1 lands. |
 | D0.2 — PP + TG graph union | PASS (commit `3ba255e`) | Mistral 7B: 13 op types. GPT-OSS 20B: 17 op types — MoE adds `ADD_ID, ARGSORT, MUL_MAT_ID, SOFT_MAX`. PP == TG on both models → A3a can size from a single shape (the double-reserve strategy is not needed for either of these models). |
-| D0.3 — post-split CPY visibility | Not run (blocked by m09zb) | Requires multi-device context init, which hits the same wedge on first device's model load. |
+| D0.3 — post-split CPY visibility | INCONCLUSIVE (commit `7d2c1b4`) | Host has 1 visible SYCL device (B50 disabled per `feedback_disable_b50.md`). Cross-device CPY scenario unavailable; rerun requires ≥2 safely-usable devices AND E1. |
 | D0.4 — direct-weight-load mechanics | INCONCLUSIVE (commit `e594db1`) | Canary uses only `ggml-backend` APIs (no llama, no unified_cache, no staging pool). Builds clean. Runtime wedges on the first `ggml_backend_tensor_set` at `ggml_backend_sycl_buffer_set_tensor` (`ggml-sycl.cpp:12685`) with the same L0 hang signature as m09zb. **This proves m09zb is not staging-pool-specific** — it is a general L0 `event.wait()` issue (see "Example B" above). Resumes once E1 lands. |
 
 When E1 lands, rerun all four canaries. Acceptance for closing D0 is the
@@ -911,6 +913,23 @@ dump diagnostic available.
 Plan-vs-reality audit at inference end. Regression suite across Mistral
 7B / 20B (FA on) / 120B / various VRAM_BUDGET_PCT. Epic close when the
 suite is green.
+
+## Canary results (2026-04-24)
+
+Summary: [`docs/plans/data/planner-canaries/summary.md`](data/planner-canaries/summary.md)
+
+| Canary | Result | Design impact |
+|---|---|---|
+| D0.1 skeleton determinism | INCONCLUSIVE | blocked on E1; mini-context `graph_reserve` mechanics unverified until the L0 wedge is fixed |
+| D0.2 PP + TG union | PASS | A3a can size zones from a single shape; Mistral 7B (13 ops) and GPT-OSS 20B (17 ops) both produce PP == TG |
+| D0.3 post-split CPY visibility | INCONCLUSIVE | single SYCL device visible on this host (B50 disabled); multi-device CPY naming unverified |
+| D0.4 direct-weight-load mechanics | INCONCLUSIVE | blocked on E1; hang at `ggml-sycl.cpp:12685` proves m09zb is an L0 DirectSubmission non-flush, not a staging-pool-specific bug — scope broadening already folded into E1's acceptance |
+
+Design changes below incorporate the canary findings. Track A is
+**partially blocked**: A3a's sizing direction (D0.2) is validated, but
+A3a's core mini-context mechanics (D0.1), A7's direct-load path (D0.4),
+and C2's multi-device CPY keys (D0.3) remain blocked on E1 (and on host
+policy for D0.3). See the summary file for per-bead unlock decisions.
 
 ## Acceptance criteria (epic-level)
 
