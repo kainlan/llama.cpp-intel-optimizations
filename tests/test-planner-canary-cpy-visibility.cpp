@@ -65,8 +65,10 @@ static bool op_snapshot_cb(struct ggml_tensor * t, bool ask, void * /*user*/) {
     if (!ask) {
         return true;  // proceed with compute on the eval-pass
     }
+    // Skip leaf nodes (op == GGML_OP_NONE) and null tensors — they're stable too
+    // but the question is "does the OP-id sequence match" and leaves are noise.
     if (t == nullptr || t->op == GGML_OP_NONE) {
-        return false;  // don't sync, no useful op to record
+        return false;
     }
     // ggml_tensor::name is a fixed-size char array, always present;
     // empty when ggml has not assigned a debug name to the node.
