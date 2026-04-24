@@ -113,7 +113,7 @@ the over-allocation at step 4.
 | `llama.cpp-8gz7y` | Query ggml scheduler for actual compute buffer sizes in planner | open | **Superseded by A3a+A4** (mini-context + `graph_reserve(no_alloc=true)` replaces the scheduler-query approach). Close as superseded when A3a+A4 land. |
 | `llama.cpp-w1rxh` | Set `max_buffer_size` on compute buffer type to arena zone capacity | closed | Landed 2026-04-22 (commit a60dc806a); structural cleanup that works under either design. Kept. |
 | `llama.cpp-tyoc2` | Wire host compute buffer chunks through SCRATCH zone | open | Phase 2 — host-side compute buffer routing |
-| `llama.cpp-01mcl` | Remove `must_device=true` for compute buffers | open | Phase 2 — lets compute buffer chunks live host-pinned for ops the plan dispatches to CPU (see D14, deprecate-layer-streaming directive 2026-04-22). |
+| `llama.cpp-01mcl` | Remove `must_device=true` for compute buffers | open | Phase 2 — lets compute buffer chunks live host-pinned for ops the plan dispatches to CPU (see D14 — `GGML_SYCL_FORCE_STREAMING` is deprecated, 2026-04-22 directive). |
 | `llama.cpp-ioua6` | Fail-fast when compute buffer exceeds all zones | closed (reverted, restore TBD) | Becomes a no-op under this plan; defense-in-depth only |
 | `llama.cpp-6bdmc` | EPIC: Unified memory placement planner (sibling) | open | **Superseded by this epic.** Design doc `2026-04-22-unified-memory-planner-design.md` content absorbed below (see "Consolidated from 6bdmc" sections). Close when this epic's Track A lands. |
 
@@ -578,8 +578,8 @@ consistent with real demand:
    reservation, which shouldn't happen under the `cparams.n_ctx <=
    model_params.n_ctx` validation), spill to host-pinned compute zone.
    *(The host-pinned spillover step is deprecated by the 2026-04-22
-   directive — overflow ops now dispatch to CPU instead. See §VRAM-
-   insufficient policy banner and D14.)*
+   directive — overflow ops now dispatch to CPU instead. See the
+   deprecation banner inside §VRAM-insufficient policy and D14.)*
 6. Per-op scratch from `plan.compute.per_op_scratch_peak` in SCRATCH zone.
 
 **At context destroy:**
@@ -609,8 +609,9 @@ user's context. Policy:
   MOE_DOWN > MOE_UP > MOE_GATE_PROJ`)
 - Anything that doesn't fit VRAM goes to **host-pinned arena**
 - KV cache tiers per-layer (hot layers on device, cold layers on host)
-- Compute buffer spills to host-pinned if RUNTIME zone can't hold it
-  *(deprecated 2026-04-22 directive — see banner above and D14)*
+- Compute buffer spills to host-pinned if RUNTIME zone can't hold it.
+  *(Deprecated by the 2026-04-22 directive — see the deprecation banner
+  above this bullet list and D14.)*
 - **Never** silently shrink `n_ctx`, `n_batch`, `n_ubatch`, or any user
   parameter
 - Only failure mode: **plan concludes it cannot fit even with full host
@@ -618,10 +619,14 @@ user's context. Policy:
   ("requested n_ctx=131072 needs 42 GB across VRAM + host-pinned, available
   is 38 GB")
 
-**Compute-buffer-on-host is loud.** *(deprecated 2026-04-22 directive —
-see banner above and D14; preserved for historical context.)* If the
-compute buffer spills to host-pinned, the GEMMs for that context run
-over PCIe at host-pinned speeds — typically 10–50× slower than VRAM.
+**Compute-buffer-on-host is loud.**
+
+*Deprecated by the 2026-04-22 directive — see the deprecation banner
+above this paragraph and D14. Preserved verbatim for historical context
+until the policy paragraph is rewritten in a follow-up commit.*
+
+If the compute buffer spills to host-pinned, the GEMMs for that context
+run over PCIe at host-pinned speeds — typically 10–50× slower than VRAM.
 This is correct but easy to mistake for a mystery perf regression.
 Policy:
 
@@ -779,8 +784,8 @@ weights avoids the PCIe copy entirely; streaming pays the copy cost on
 every layer access. Under the unified plan, host-overflow weights are
 handled by the planner's dispatch decision (`plan.ops[op].preferred_device
 = CPU`), which is strictly better than streaming. (This supersedes the
-older "host-pinned compute spillover" framing in the §VRAM-insufficient
-policy section — see the deprecation banner there. 2026-04-22 directive.)
+older "host-pinned compute spillover" framing — see the deprecation
+banner inside §VRAM-insufficient policy above (2026-04-22 directive).)
 
 ### D15 — Mini-context owns its own backends
 
