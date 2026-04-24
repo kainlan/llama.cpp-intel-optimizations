@@ -1858,9 +1858,14 @@ struct staging_buffer_pool {
         if (best_idx != SIZE_MAX) {
             auto & best = slots_[best_idx];
             // Wait for any pending async copy before reusing the buffer.
+            // Use wait_and_throw() (event-level) rather than bare wait() so
+            // async errors propagate as sycl::exception. The empty-waitlist
+            // ext_oneapi_submit_barrier() form must NOT be used here — it
+            // triggers xe_guc_submit kernel-job timeout + GT-reset on Arc
+            // B580 (per E1 RCA, docs/plans/data/e1-rca/findings.md).
             if (best.has_pending_event) {
                 try {
-                    best.pending_event.wait();
+                    best.pending_event.wait_and_throw();
                 } catch (...) {
                     // Event may be invalid after device reset — safe to ignore.
                 }
@@ -2007,7 +2012,7 @@ struct staging_buffer_pool {
                 break;
             }
             try {
-                ev.wait();
+                ev.wait_and_throw();
             } catch (...) {
             }
         }

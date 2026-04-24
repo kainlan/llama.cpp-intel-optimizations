@@ -153,3 +153,42 @@ Verified working in `probe-barrier-deps.cpp`. Submit time 38 ms, event wait
 - `docs/plans/data/e1-rca/findings.md` -- this document
 - `docs/plans/data/e1-rca/driver-log.txt` -- xe/drm kernel-WARNING capture
 - `docs/plans/data/e1-rca/env-dump.txt` -- toolchain + driver versions
+
+## Fix Attempt #1 (Task 9, 2026-04-24): event.wait() -> event.wait_and_throw()
+
+**Status: applied, did NOT clear m09zb. Broader-envelope investigation needed.**
+
+Surgical 1-line replacement in `staging_buffer_pool::acquire()` (common.hpp:1863)
+and `staging_buffer_pool::drain_all()` (common.hpp:2010): `event.wait()` ->
+`event.wait_and_throw()`. Same wait semantics; async errors propagate as
+sycl::exception instead of being silently swallowed.
+
+Rationale: this RCA's "Step 3 -- confirmed safe fallback" recommendation. The
+producer queue handle is not stored on the slot, so the event-level
+wait_and_throw is the most surgical interpretation of "wait_and_throw on the
+producing queue". A `q.wait_and_throw()` on the consumer queue (the only one
+acquire() has access to) would be too broad and could stall unrelated work.
+
+Verification:
+- Build: `ninja -C build llama-completion test-planner-canary-direct-load` --
+  succeeded. (Note: `tests/test-pinned-chunk-pool.cpp` has pre-existing
+  breakage referencing removed unified_cache::{allocate,free}_pinned_runtime
+  methods -- unrelated to this fix; flagged for separate cleanup.)
+- llama-completion (Mistral 7B Q4_0, single context): TIMEOUT after 120 s.
+  Last stderr line: `[HOST-ARENA] Zones configured: WEIGHT=0.0 MB KV=64.0 MB
+  STAGING=221.1 MB SCRATCH=442.2 MB` -- identical signature to the originally
+  documented m09zb wedge.
+- D0.4 canary (`test-planner-canary-direct-load`): TIMEOUT after 120 s. Last
+  stderr line: `[SYCL] Allocated pinned runtime chunk 1 (size=2048.0 MB,
+  total=2.0 GB)` -- wedges in `ggml_backend_sycl_buffer_set_tensor` per the
+  bead's documented signature.
+
+Confirms the Task 4 hypothesis: bare async-H2D + event.wait() is not the
+trigger pattern. The wedge is something else in the SYCL backend init/post-
+init path. The fix is left in place because it's a strict improvement (errors
+propagate properly) but is NOT the m09zb fix.
+
+Recommended next investigation (per Step 1 in the conclusion above): build a
+broader-envelope repro on top of `ggml_backend_sycl_init` -- this is the
+smallest envelope that includes per-stream queue setup, oneDNN init, and the
+unified-cache initialization that bare-SYCL skipped.
