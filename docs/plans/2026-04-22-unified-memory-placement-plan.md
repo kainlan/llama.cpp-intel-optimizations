@@ -113,7 +113,7 @@ the over-allocation at step 4.
 | `llama.cpp-8gz7y` | Query ggml scheduler for actual compute buffer sizes in planner | open | **Superseded by A3a+A4** (mini-context + `graph_reserve(no_alloc=true)` replaces the scheduler-query approach). Close as superseded when A3a+A4 land. |
 | `llama.cpp-w1rxh` | Set `max_buffer_size` on compute buffer type to arena zone capacity | closed | Landed 2026-04-22 (commit a60dc806a); structural cleanup that works under either design. Kept. |
 | `llama.cpp-tyoc2` | Wire host compute buffer chunks through SCRATCH zone | open | Phase 2 — host-side compute buffer routing |
-| `llama.cpp-01mcl` | Remove `must_device=true` for compute buffers | open | Phase 2 — enables host-pinned compute when VRAM can't host |
+| `llama.cpp-01mcl` | Remove `must_device=true` for compute buffers | open | Phase 2 — lets compute buffer chunks live host-pinned for ops the plan dispatches to CPU (see D14, deprecate-layer-streaming directive 2026-04-22). |
 | `llama.cpp-ioua6` | Fail-fast when compute buffer exceeds all zones | closed (reverted, restore TBD) | Becomes a no-op under this plan; defense-in-depth only |
 | `llama.cpp-6bdmc` | EPIC: Unified memory placement planner (sibling) | open | **Superseded by this epic.** Design doc `2026-04-22-unified-memory-planner-design.md` content absorbed below (see "Consolidated from 6bdmc" sections). Close when this epic's Track A lands. |
 
@@ -369,7 +369,8 @@ decoding (draft + target) works as a free side-effect.
 │       - Build the real graph for cparams                │
 │       - graph_reserve(no_alloc=true) → actual size      │
 │       - Allocate compute buffer within RUNTIME zone     │
-│         (spills to host-pinned if it doesn't fit)       │
+│         (spills to host-pinned if it doesn't fit;       │
+│          deprecated 2026-04-22 — see D14)               │
 │       - Assign every op a plan.ops[op_name] entry       │
 │   3. graph_reserve(no_alloc=false) consumes the         │
 │      pre-reserved compute memory                        │
@@ -576,6 +577,9 @@ consistent with real demand:
    If it doesn't fit (because this context's demand > the max-context
    reservation, which shouldn't happen under the `cparams.n_ctx <=
    model_params.n_ctx` validation), spill to host-pinned compute zone.
+   *(The host-pinned spillover step is deprecated by the 2026-04-22
+   directive — overflow ops now dispatch to CPU instead. See §VRAM-
+   insufficient policy banner and D14.)*
 6. Per-op scratch from `plan.compute.per_op_scratch_peak` in SCRATCH zone.
 
 **At context destroy:**
@@ -587,6 +591,17 @@ consistent with real demand:
 
 ### VRAM-insufficient policy
 
+> **Note (2026-04-22 directive):** the "compute buffer spills to host-pinned"
+> bullet and the "Compute-buffer-on-host is loud" paragraph below describe
+> the *original* policy in which the GPU continued to drive PCIe-resident
+> GEMMs once VRAM ran out. That fallback is **deprecated** in favor of
+> CPU dispatch via `plan.ops[op].preferred_device = CPU` (see D14).
+> The host-pinned arena still holds *weights* for ops dispatched to CPU
+> (which is fast — the CPU reads from host directly), but the compute
+> buffer no longer hosts GEMMs that the GPU would then drive over PCIe.
+> Text retained verbatim for historical context until the policy paragraph
+> is rewritten in a follow-up commit.
+
 The point of the plan is to handle this correctly without shrinking the
 user's context. Policy:
 
@@ -595,6 +610,7 @@ user's context. Policy:
 - Anything that doesn't fit VRAM goes to **host-pinned arena**
 - KV cache tiers per-layer (hot layers on device, cold layers on host)
 - Compute buffer spills to host-pinned if RUNTIME zone can't hold it
+  *(deprecated 2026-04-22 directive — see banner above and D14)*
 - **Never** silently shrink `n_ctx`, `n_batch`, `n_ubatch`, or any user
   parameter
 - Only failure mode: **plan concludes it cannot fit even with full host
@@ -602,10 +618,12 @@ user's context. Policy:
   ("requested n_ctx=131072 needs 42 GB across VRAM + host-pinned, available
   is 38 GB")
 
-**Compute-buffer-on-host is loud.** If the compute buffer spills to
-host-pinned, the GEMMs for that context run over PCIe at host-pinned
-speeds — typically 10–50× slower than VRAM. This is correct but easy
-to mistake for a mystery perf regression. Policy:
+**Compute-buffer-on-host is loud.** *(deprecated 2026-04-22 directive —
+see banner above and D14; preserved for historical context.)* If the
+compute buffer spills to host-pinned, the GEMMs for that context run
+over PCIe at host-pinned speeds — typically 10–50× slower than VRAM.
+This is correct but easy to mistake for a mystery perf regression.
+Policy:
 
 - **WARN at plan time** with projected perf impact, using the planner's
   own per-op compute estimate:
@@ -753,16 +771,16 @@ Env vars override the autonomous split when set:
 ### D14 — `GGML_SYCL_FORCE_STREAMING` is deprecated
 
 Runtime weight-streaming contradicts "plan is authoritative." The mode is
-removed by Track C3 alongside `layer_plan_applies_to_op`. Users on
-memory-constrained hardware rely on host-pinned overflow (VRAM-greedy +
-host overflow is the default).
+removed by Track C3 alongside `layer_plan_applies_to_op`.
 
 Justification beyond design purity: streaming is **slower** than running
 the cold layers on CPU for inference. CPU compute on host-resident
 weights avoids the PCIe copy entirely; streaming pays the copy cost on
 every layer access. Under the unified plan, host-overflow weights are
 handled by the planner's dispatch decision (`plan.ops[op].preferred_device
-= CPU`), which is strictly better than streaming.
+= CPU`), which is strictly better than streaming. (This supersedes the
+older "host-pinned compute spillover" framing in the §VRAM-insufficient
+policy section — see the deprecation banner there. 2026-04-22 directive.)
 
 ### D15 — Mini-context owns its own backends
 
