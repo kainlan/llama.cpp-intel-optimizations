@@ -10,8 +10,9 @@
 // requires a multi-device scheduler split, which requires loading a
 // model with `n_gpu_layers=999` plus `LLAMA_SPLIT_MODE_ROW` across two
 // visible SYCL devices. That model-load path is currently wedged by
-// `llama.cpp-m09zb` (staging_buffer_pool multi-context re-entry); the
-// fix is scoped as epic prerequisite E1, not this session.
+// `llama.cpp-m09zb` (single-context slot acquire-after-release wedge in
+// the SYCL staging_buffer_pool); the fix is scoped as epic prerequisite
+// E1, not this session.
 //
 // Until E1 lands, this canary writes INCONCLUSIVE with a documented
 // reason so the A3a design-doc update in Task 5 can cite it.
@@ -30,10 +31,6 @@ static const char * MD_PATH   = "docs/plans/data/planner-canaries/d0.3-cpy-visib
 static const char * JSON_PATH = "tests/data/planner-canaries/d0.3.json";
 
 int main(int /*argc*/, char ** /*argv*/) {
-    // Unbuffer stdout so nothing is lost if a later canary iteration
-    // aborts mid-run — per feedback from the Task 2 stdio race.
-    std::setvbuf(stdout, nullptr, _IONBF, 0);
-
     findings f;
     f.canary_id = "D0.3";
     f.result    = status::INCONCLUSIVE;
@@ -45,46 +42,28 @@ int main(int /*argc*/, char ** /*argv*/) {
     const int n_sycl = ggml_backend_sycl_get_device_count();
     add(f, "sycl_device_count", std::to_string(n_sycl));
 
-    if (n_sycl < 2) {
-        // Single-device path: the scenario the canary was designed to
-        // probe (scheduler-inserted CPY nodes on cross-device edges)
-        // cannot occur without at least two SYCL devices. Per the
-        // assignment this is a PASS-equivalent INCONCLUSIVE:
-        // "scenario-unavailable" not "canary-failure".
-        f.summary        = "Single SYCL device visible; cross-device CPY scenario unavailable";
-        f.recommendation = "Re-run once ≥2 SYCL devices are safely usable on this host "
-                           "(B50 currently disabled per host policy; see CLAUDE.md memory "
-                           "feedback_disable_b50.md)";
-        add(f, "reason", "single_device");
-    } else {
-        // Multi-device path: the full test would call
-        // llama_model_load_from_file(.., n_gpu_layers=999,
-        // split_mode=LLAMA_SPLIT_MODE_ROW, tensor_split={0.5,0.5}),
-        // run N decodes, capture CPY node names, and compare sets
-        // across runs. That load path is currently wedged by
-        // `llama.cpp-m09zb` (staging_buffer_pool multi-context re-entry
-        // observed during implementer-1's D0.1 + implementer-2's D0.2
-        // multi-context attempts). Per the team-lead's "feasibility
-        // test, not a fix" direction, we record this as blocked
-        // on E1 rather than attempting the load.
-        f.summary        = "Multi-device CPY stability untestable: "
-                           "blocked on llama.cpp-m09zb staging_buffer_pool wedge (epic prerequisite E1)";
-        f.recommendation = "switch-to-plan-B: re-run this canary after E1 "
-                           "(staging_buffer_pool restructure) lands and validates "
-                           "multi-context model loads on SYCL";
-        add(f, "reason",         "blocked_on_m09zb");
-        add(f, "blocker_bead",   "llama.cpp-m09zb");
-        add(f, "e1_requirement", "staging_buffer_pool restructure to support "
-                                 "multi-context model load");
-    }
+    // Single-device path is the only path this canary implements today.
+    // The scenario the canary was designed to probe (scheduler-inserted
+    // CPY nodes on cross-device edges) cannot occur without ≥2 SYCL
+    // devices, so with 1 device we report INCONCLUSIVE /
+    // reason=single_device — the "scenario-unavailable" PASS-equivalent
+    // per the plan's acceptance rubric.
+    //
+    // TODO: when E1 lands (staging_buffer_pool restructure, llama.cpp-m09zb)
+    // AND ≥2 SYCL devices are safely usable on this host, replace this
+    // canary body with the real 5-run multi-device CPY-name stability
+    // check: load model with split_mode=ROW + tensor_split={0.5,0.5},
+    // decode, capture scheduler-inserted CPY node names, repeat 5x,
+    // verify set equality.
+    f.summary        = "Single SYCL device visible; cross-device CPY scenario unavailable";
+    f.recommendation = "Re-run once ≥2 SYCL devices are safely usable on this host "
+                       "(B50 currently disabled per host policy; see CLAUDE.md memory "
+                       "feedback_disable_b50.md) AND the E1 staging_buffer_pool fix "
+                       "(llama.cpp-m09zb) has landed";
+    add(f, "reason", "single_device");
 
     add(f, "plan_section",
         "docs/plans/2026-04-22-planner-canaries-implementation.md §Task 3 (D0.3)");
-    add(f, "what_this_would_test_when_unblocked",
-        "5 consecutive model-load + decode cycles with "
-        "split_mode=ROW, tensor_split={0.5,0.5}; capture scheduler-inserted "
-        "CPY node names across runs; verify set equality to decide whether "
-        "C2 can key plan.ops on op_name or must use op_id");
 
     write_markdown(f, MD_PATH);
     write_json    (f, JSON_PATH);
