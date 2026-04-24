@@ -3,14 +3,20 @@
 // same model, collects op sets from each, verifies the union covers every
 // op that either will execute. Ops are collected by installing an eval
 // callback on the scheduler (llama_context_params::cb_eval) which ggml
-// calls for every node *before* the per-split compute pass, so the entire
-// op set is captured even if compute itself later aborts.
+// calls for every node in a split *before* that split's compute call
+// (see ggml-backend.cpp:1928-1959).
+//
+// Completeness caveat: the scheduler iterates splits sequentially. If
+// split N's compute aborts, splits N+1..K never fire their ask=true
+// callbacks, so the op set captured under abort is best-effort and may
+// be partial — NOT a complete enumeration. PASS therefore requires
+// BOTH shapes to produce op sets at or above MIN_EXPECTED_OPS (below);
+// a near-empty result from a very-early abort surfaces as FAIL.
 //
 // Execution model:
-//   * Parent process ("driver"): reads any existing partial findings
-//     from tests/data/planner-canaries/d0.2.json, fork+execs itself
-//     repeatedly as --worker <model> <shape> children, merges each
-//     child's stdout op list into findings, writes final result.
+//   * Parent process ("driver"): fork+execs itself repeatedly as
+//     --worker <model> <shape> children, merges each child's stdout
+//     op list into findings, writes final result.
 //   * Worker process: loads one model, creates one context at the given
 //     shape, runs one decode, prints the collected op names to stdout
 //     as "OPS: <comma-separated>" (plus ASK_CALLS: <n>), then exits.
@@ -18,9 +24,8 @@
 //
 // The two-phase design survives backend abort()s during decode (e.g.
 // CPU vec_dot_f16 isnan assertion when flash attention softmax produces
-// NaN on a BOS-only prompt, or SYCL DEVICE_LOST on a wedged GPU). The
-// op set captured before the abort is still printed by the worker because
-// cb_eval runs for every node *before* that split's compute call.
+// NaN on a BOS-only prompt, or SYCL DEVICE_LOST on a wedged GPU) —
+// subject to the completeness caveat above.
 
 #include "test-planner-canary-common.hpp"
 #include "llama.h"
@@ -44,6 +49,13 @@ using namespace planner_canary;
 static const char * MD_PATH   = "docs/plans/data/planner-canaries/d0.2-pp-tg-union.md";
 static const char * JSON_PATH = "tests/data/planner-canaries/d0.2.json";
 
+// Minimum unique ggml_op types we expect any real llama decode graph to
+// produce. A real decode emits at least MUL_MAT, ADD, RMS_NORM, GET_ROWS,
+// and typically CPY/PERMUTE/RESHAPE — well above 5. Anything below this
+// threshold means the worker aborted before even the first split's ask
+// loop completed, and the reported "op set" isn't usable for A3a.
+static constexpr size_t MIN_EXPECTED_OPS = 5;
+
 // ============================================================
 // Worker mode (--worker <model_path> <shape>)
 // ============================================================
@@ -54,7 +66,12 @@ struct collect_ctx {
 };
 
 // Worker-global pointer so the signal handler can spill the partial op
-// set to stdout on abort.
+// set to stdout on abort. Reads of this pointer + g_worker_payload from
+// the handler are not strictly async-signal-safe (raw pointer load +
+// std::string::data()/size()); we accept that best-effort trade because
+// the alternative is losing the partial op set entirely when a backend
+// abort()s mid-decode. On x86-64 with sequentially-consistent loads of
+// aligned pointers this works in practice, but it is NOT portable.
 static collect_ctx * g_worker_ctx = nullptr;
 
 // Pre-rendered stdout payload. We build this incrementally from
@@ -62,7 +79,12 @@ static collect_ctx * g_worker_ctx = nullptr;
 // that's already in memory — no STL allocations, no stdio buffering
 // races with whatever was in flight when the signal fired.
 static std::string g_worker_payload;
-static bool        g_worker_spilled = false;  // idempotent guard
+
+// Idempotent guard so the handler doesn't double-spill if a second
+// signal (e.g. re-raise) fires before the default disposition takes
+// over. volatile sig_atomic_t is the C/C++ standard-sanctioned type
+// for flags shared between a program and its signal handlers.
+static volatile sig_atomic_t g_worker_spilled = 0;
 
 static void worker_rebuild_payload(collect_ctx * ctx) {
     std::ostringstream oss;
@@ -79,16 +101,23 @@ static void worker_rebuild_payload(collect_ctx * ctx) {
 }
 
 static void worker_spill_and_die(int sig) {
-    if (!g_worker_spilled && g_worker_ctx) {
-        g_worker_spilled = true;
+    if (g_worker_spilled == 0 && g_worker_ctx != nullptr) {
+        g_worker_spilled = 1;
         // Write the pre-rendered payload (OPS + ASK_CALLS lines) plus
         // a CRASHED line. write(2) is async-signal-safe; printf is not.
+        // Reads of g_worker_payload.data()/size() here are best-effort,
+        // see the note at the g_worker_ctx declaration above.
         (void)write(STDOUT_FILENO, g_worker_payload.data(), g_worker_payload.size());
         char tail[32];
         int n = std::snprintf(tail, sizeof(tail), "CRASHED: %d\n", sig);
         if (n > 0) (void)write(STDOUT_FILENO, tail, (size_t)n);
     }
-    std::signal(sig, SIG_DFL);
+    // Restore the default disposition and re-raise so the OS still
+    // records the crash properly (core dump, exit status, etc.).
+    struct sigaction sa_dfl = {};
+    sa_dfl.sa_handler = SIG_DFL;
+    sigemptyset(&sa_dfl.sa_mask);
+    sigaction(sig, &sa_dfl, nullptr);
     std::raise(sig);
 }
 
@@ -103,21 +132,41 @@ static bool op_collect_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         auto inserted = ctx->ops.insert(ggml_op_name(t->op));
         new_op = inserted.second;
     }
-    // Refresh the crash-handler payload whenever the op set changes
-    // (to include the newly-seen op) or every 64 asks (to keep the
-    // ask_calls counter close to current). The new-op path is the
-    // only one that affects the canary's PASS/FAIL rubric; the counter
-    // is just diagnostic.
-    if (new_op || (ctx->ask_calls & 63) == 0) {
+    // Refresh the crash-handler payload ONLY when a new op is seen.
+    // Each rebuild reassigns g_worker_payload, which involves
+    // dealloc/alloc of its underlying buffer — during that window any
+    // concurrent signal's write() of .data()/.size() sees a transient
+    // tear. Rebuilding on every call (or on a 64-ask heartbeat) widens
+    // that tear window for no functional benefit: ask_calls is purely
+    // diagnostic, and the OPS list (what A3a actually reads) only
+    // changes when new_op is true.
+    if (new_op) {
         worker_rebuild_payload(ctx);
     }
     return false;
 }
 
+static void install_crash_handler(int sig) {
+    // sigaction is the POSIX-robust API; std::signal semantics vary
+    // across platforms (BSD-like vs SysV-like auto-reset).
+    struct sigaction sa = {};
+    sa.sa_handler = worker_spill_and_die;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags   = SA_RESTART;
+    sigaction(sig, &sa, nullptr);
+}
+
+static void uninstall_crash_handler(int sig) {
+    struct sigaction sa_dfl = {};
+    sa_dfl.sa_handler = SIG_DFL;
+    sigemptyset(&sa_dfl.sa_mask);
+    sigaction(sig, &sa_dfl, nullptr);
+}
+
 static int run_worker(const char * model_path, const char * shape) {
-    std::signal(SIGABRT, worker_spill_and_die);
-    std::signal(SIGSEGV, worker_spill_and_die);
-    std::signal(SIGFPE,  worker_spill_and_die);
+    install_crash_handler(SIGABRT);
+    install_crash_handler(SIGSEGV);
+    install_crash_handler(SIGFPE);
 
     llama_backend_init();
 
@@ -173,12 +222,15 @@ static int run_worker(const char * model_path, const char * shape) {
     // Disarm the crash-spill handlers so a later SIGABRT in llama_free
     // doesn't duplicate our stdout output.
     g_worker_ctx = nullptr;
-    std::signal(SIGABRT, SIG_DFL);
-    std::signal(SIGSEGV, SIG_DFL);
-    std::signal(SIGFPE,  SIG_DFL);
+    uninstall_crash_handler(SIGABRT);
+    uninstall_crash_handler(SIGSEGV);
+    uninstall_crash_handler(SIGFPE);
 
     // Normal path: decode has reached a point where cb_eval ran for
-    // every node. Print ops to stdout for the driver.
+    // every node. Print ops to stdout for the driver. Omit the CRASHED
+    // line entirely on success so the driver's parser treats its absence
+    // as "not crashed" (r.crashed defaults to false) — cleaner than
+    // emitting CRASHED: 0 which the parser then has to special-case.
     std::fprintf(stdout, "ASK_CALLS: %zu\n", cc.ask_calls);
     std::fprintf(stdout, "OPS: ");
     bool first = true;
@@ -188,7 +240,6 @@ static int run_worker(const char * model_path, const char * shape) {
         first = false;
     }
     std::fprintf(stdout, "\n");
-    std::fprintf(stdout, "CRASHED: 0\n");
     std::fflush(stdout);
 
     llama_batch_free(batch);
@@ -294,9 +345,11 @@ static std::string join_set(const std::set<std::string> & s) {
     return oss.str();
 }
 
+// Use the full path as the evidence key so two models that share a
+// basename (e.g. /a/mistral-7b.gguf vs /b/mistral-7b.gguf) don't
+// collide when both are loaded in the same run.
 static std::string model_label(const std::string & path) {
-    auto slash = path.find_last_of('/');
-    return slash == std::string::npos ? path : path.substr(slash + 1);
+    return path;
 }
 
 static int run_driver(const char * self_path) {
@@ -320,8 +373,10 @@ static int run_driver(const char * self_path) {
         return 0;
     }
 
-    bool any_collection_empty = false;
-    bool any_shape_specific   = false;
+    bool any_collection_empty   = false;  // any shape produced zero ops
+    bool any_below_floor        = false;  // any shape produced < MIN_EXPECTED_OPS
+    bool any_no_data_after_crash = false; // worker crashed and spilled zero ops
+    bool any_shape_specific     = false;
 
     for (const auto & mp : models) {
         const std::string label = model_label(mp);
@@ -357,21 +412,41 @@ static int run_driver(const char * self_path) {
         if (pp.ops.empty() || tg.ops.empty()) {
             any_collection_empty = true;
         }
+        if (pp.ops.size() < MIN_EXPECTED_OPS || tg.ops.size() < MIN_EXPECTED_OPS) {
+            any_below_floor = true;
+        }
+        if ((pp.crashed && pp.ops.empty()) || (tg.crashed && tg.ops.empty())) {
+            any_no_data_after_crash = true;
+        }
         if (!pp_only.empty() || !tg_only.empty()) {
             any_shape_specific = true;
         }
     }
 
     // Result rubric:
-    //   INCONCLUSIVE: a worker crashed AND produced no ops (no usable data).
-    //   FAIL: ops collected but one set ended up empty for some reason.
-    //   PASS: both PP and TG op sets were enumerated. A3a must run
-    //         graph_reserve at BOTH shapes iff any model has a non-empty
-    //         pp_only or tg_only.
-    if (any_collection_empty) {
+    //   INCONCLUSIVE: a worker crashed AND produced zero ops — no usable
+    //                 data to reason about.
+    //   FAIL: ops collected but below the real-decode floor
+    //                 (MIN_EXPECTED_OPS). This catches "compute aborted
+    //                 very early, so the ask-pass only covered a few
+    //                 scheduler prologue nodes" — the reported op set
+    //                 isn't a trustworthy enumeration.
+    //   FAIL: either shape reported zero ops for a non-crash reason.
+    //   PASS: both PP and TG op sets were enumerated at or above the
+    //                 floor. A3a must run graph_reserve at BOTH shapes
+    //                 iff any model has a non-empty pp_only or tg_only.
+    if (any_no_data_after_crash) {
+        f.result         = status::INCONCLUSIVE;
+        f.summary        = "Worker aborted before any ops were captured; nothing usable to report";
+        f.recommendation = "Investigate worker stderr for the abort cause; re-run once resolved";
+    } else if (any_collection_empty) {
         f.result         = status::FAIL;
         f.summary        = "Op collection failed for one or both shapes";
         f.recommendation = "Repair the op-collection helper before A3a proceeds";
+    } else if (any_below_floor) {
+        f.result         = status::FAIL;
+        f.summary        = "Captured op set below MIN_EXPECTED_OPS floor; compute aborted before the graph's ask-pass covered real decode nodes";
+        f.recommendation = "Re-run after fixing the worker abort path; current op sets are not a complete enumeration";
     } else {
         f.result = status::PASS;
         if (any_shape_specific) {
