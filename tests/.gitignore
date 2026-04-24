@@ -5,6 +5,7 @@ ggml-common.h
 **/*.swp
 !peg-parser
 !sycl-canary
+!e1-rca
 !data
 !data/planner-canaries
 !data/planner-canaries/**
@@ -12,3 +13,7 @@ sycl-canary/device-info
 sycl-canary/dpas
 sycl-canary/subgroup-reduce
 sycl-canary/onednn-sdpa-fusion
+e1-rca/minimal-repro
+e1-rca/repro-with-compute
+e1-rca/probe-barrier-bug
+e1-rca/probe-barrier-deps
