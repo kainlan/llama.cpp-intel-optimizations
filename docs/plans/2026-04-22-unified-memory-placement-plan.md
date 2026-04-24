@@ -170,7 +170,7 @@ DirectSubmission (not yet on the BCS hardware ring). `event.wait()`
 enters an L0 `sched_yield` spin while holding the pool's `mutex_`. The
 DirectSubmission controller thread is asleep in `pthread_cond_wait` and
 doesn't flush the batch. On Arc B580 + oneAPI 2025.3 + the xe-driver
-stack used here, this is reproducible in ~7 seconds on every cold load
+stack used here, this is reproducible in ~7 s on every cold load
 of Mistral 7B Q4_0 with `n_gpu_layers=999`.
 
 **Violated assumption**: `staging_buffer_pool::acquire()` assumes
@@ -188,8 +188,8 @@ test that touches `llama_init_from_model`.
 
 | Canary | Status | Notes |
 |---|---|---|
-| D0.1 — skeleton determinism | INCONCLUSIVE (blocked by m09zb) | Binary builds; run wedges in `llama_model_load_from_file` before any determinism measurement can complete. Resumes once E1 lands. |
-| D0.2 — PP + TG graph union | Partial (blocked by m09zb) | PP ubatch=max capture succeeded on Mistral 7B, 13 op types observed: `ADD, CPY, FLASH_ATTN_EXT, GET_ROWS, GLU, MUL, MUL_MAT, PERMUTE, RESHAPE, RMS_NORM, ROPE, SET_ROWS, VIEW`. TG ubatch=1 capture and the union walk blocked by m09zb when the canary constructs the TG context. |
+| D0.1 — skeleton determinism | INCONCLUSIVE (blocked by m09zb) | Binary builds; execution wedges in `llama_model_load_from_file` before any determinism measurement can complete. Resumes once E1 lands. |
+| D0.2 — PP + TG graph union | PASS (commit `3ba255e`) | Mistral 7B: 13 op types. GPT-OSS 20B: 17 op types — MoE adds `ADD_ID, ARGSORT, MUL_MAT_ID, SOFT_MAX`. PP == TG on both models → A3a can size from a single shape (the double-reserve strategy is not needed for either of these models). |
 | D0.3 — post-split CPY visibility | Not run (blocked by m09zb) | Requires multi-device context init, which hits the same wedge on first device's model load. |
 | D0.4 — direct-weight-load mechanics | Not run (blocked by m09zb) | Would reuse the same `unified_cache_direct_stage_weight` → `fill_reordered_host` path that wedges. |
 
@@ -760,7 +760,7 @@ E1 before starting Tracks A/B/C.
 
 | Task | Summary | Acceptance |
 |---|---|---|
-| E1 | Restructure `staging_buffer_pool` to delegate back-pressure to the SYCL in-order queue instead of per-slot `pending_event` + mutex wait. Callers own the event chain: `acquire()` returns a slot unconditionally; the next H2D submission gets the slot's last `copy_event` as a `depends_on` dep. Remove `has_pending_event` / `pending_event` from `slot`. `release(ptr, evt)` becomes `release(ptr)` + a caller-owned event map (or simply a caller-side `std::deque<event>` per queue). ~200 LoC. Aligned with D10 ("weight plan process-scoped, compute plan per-context") — the pool stops holding cross-context state. Bead: `llama.cpp-m09zb`. | No mutex held across any `event.wait()`; D0.1 canary (both sequential and two-context variants) loads Mistral 7B cleanly in under 60s; `ninja -C build` + full ctest green; no new env var; zero perf regression on `llama-bench Mistral7B-Q4_0 PP512/TG128` baseline (±3%) |
+| E1 | Restructure `staging_buffer_pool` to delegate back-pressure to the SYCL in-order queue instead of per-slot `pending_event` + mutex wait. Callers own the event chain: `acquire()` returns a slot unconditionally; the next H2D submission gets the slot's last `copy_event` as a `depends_on` dep. Remove `has_pending_event` / `pending_event` from `slot`. `release(ptr, evt)` becomes `release(ptr)` + a caller-owned event map (or simply a caller-side `std::deque<event>` per queue). ~200 LoC. Aligned with D10 ("weight plan process-scoped, compute plan per-context"). Bead: `llama.cpp-m09zb`. | No mutex held across any `event.wait()`; D0.1 canary (stub from Task 0 currently; full impl when E1 lands) loads Mistral 7B cleanly in under 60 s; `ninja -C build` + full ctest green; no new env var; zero perf regression on `llama-bench Mistral7B-Q4_0 PP512/TG128` baseline (±3%) |
 
 ### Track A — Extend llama_model_params + plan schema (`llama.cpp-8gz7y` dependency)
 
@@ -810,7 +810,8 @@ E1 before starting Tracks A/B/C.
 E1 ─┬─→ A1 → A2 → A3 → A3a → A3b → A4 → A5 → A6 → A7
     │                                             \
     │                                              → C1 → C2 → C3
-    └─→ B1 → B2 → B3 ____________________________/
+    ├─→ B1 → B2 → B3 ____________________________/
+    └─→ D0.1, D0.2, D0.3, D0.4
 
 D1 can land after A3b (plan.compute populated + FA resolved)
 D2 requires A7 + C2
@@ -836,6 +837,12 @@ canary except pure static-analysis work.
 No fallback flag. The plan is a hard migration: new code replaces old;
 regression suite (D3) is the quality gate. If the regression suite fails
 for a known case, the fix is the plan, not the escape hatch.
+
+**Phase 0 — SYCL prerequisite (E1):**
+Land the `staging_buffer_pool` restructure (bead `llama.cpp-m09zb`) so
+that `llama_model_load_from_file` no longer wedges during S1-PRELOAD on
+GPU-offloaded models. Gates every subsequent phase — none of Phases 1–5
+can be validated (or even exercised by the D0 canaries) until E1 is in.
 
 **Phase 1 — API + plumbing (A1 + A2 + B1):**
 Extend `llama_model_params`; update every in-tree caller; change
