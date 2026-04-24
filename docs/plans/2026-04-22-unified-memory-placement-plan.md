@@ -129,22 +129,26 @@ and sequences them.
 
 ### Known issues exposed by pre-flight canaries (bead `llama.cpp-m09zb`)
 
-The Track D0 canaries (D0.1, D0.2) exposed a P0 wedge in the SYCL backend
-that blocks any canary or test which constructs a `llama_context` on a
-GPU-offloaded model. Originally suspected to be a multi-context ownership
-bug; gdb backtrace proves it is a **single-context** hang during
-S1-PRELOAD, independent of how many `llama_context`s exist.
+The Track D0 canaries exposed a P0 wedge in the SYCL backend. Initial
+RCA (Task 6) pinned it to `staging_buffer_pool::acquire()` during
+S1-PRELOAD. Subsequent D0.4 evidence broadens the scope: **the
+underlying bug is an L0 DirectSubmission non-flush affecting any
+`event.wait()` post-init** under oneAPI 2025.3 + the xe driver on
+Arc B580. The same hang signature reproduces via a call path that does
+not touch the staging pool, does not hold a mutex across the wait, and
+does not involve the preload loop. The staging pool's mutex-hold pattern
+is one amplifier, not the root cause.
 
-**Symptom**: `llama_model_load_from_file` hangs indefinitely (`EXIT=124`
-under `timeout`). `strace` shows only the external SIGTERM — no abort, no
-SIGSEGV, no assert. Main thread spins in `sched_yield`.
+**Symptom (all callsites)**: main thread spins in `sched_yield` inside
+`L0::EventImp::queryStatus` via `sycl::event_impl::wait`. Only
+`NEO::DirectSubmissionController::controlDirectSubmissionsState` lives
+alongside, and it is in `pthread_cond_wait` — idle, not flushing the
+batch. `strace` shows only the external SIGTERM at `timeout`; no abort,
+no SIGSEGV, no assert. `EXIT=124`.
 
-**Location**: `ggml/src/ggml-sycl/common.hpp:1863` —
-`staging_buffer_pool::acquire()` → `best.pending_event.wait()` on a slot
-released by an earlier `release(ptr, evt)` call. Held `mutex_` during the
-wait.
+#### Example A — preload path (original m09zb RCA, Task 6)
 
-**Call chain** (gdb, top frames):
+D0.1 triggers this. Call chain (gdb, top frames):
 
 ```
 #7  staging_buffer_pool::acquire          (common.hpp:1863)
@@ -156,22 +160,16 @@ wait.
 #13 llama_model_load_from_file_impl
 ```
 
-The only other running thread is
-`NEO::DirectSubmissionController::controlDirectSubmissionsState` in
-`pthread_cond_wait` — idle.
-
-**Root cause**: two independent back-pressure mechanisms collide during
-`ggml_sycl_preload_model_weights`'s 16-deep sliding-window (`s1_in_flight`
-at `ggml-sycl.cpp:11867`). Each `fill_reordered_host` call performs
-`staging_pool.release(reorder_buf_raw, copy_event)` (`ggml-sycl.cpp:10929`),
-installing the in-flight H2D event on a slot. A subsequent `acquire()`
-best-fit picks an older slot whose `copy_event` is still batched in L0
-DirectSubmission (not yet on the BCS hardware ring). `event.wait()`
-enters an L0 `sched_yield` spin while holding the pool's `mutex_`. The
-DirectSubmission controller thread is asleep in `pthread_cond_wait` and
-doesn't flush the batch. On Arc B580 + oneAPI 2025.3 + the xe-driver
-stack used here, this is reproducible in ~7 s on every cold load
-of Mistral 7B Q4_0 with `n_gpu_layers=999`.
+**Amplifier analysis** (still accurate for this call path): two
+independent back-pressure mechanisms collide during the 16-deep
+sliding-window `s1_in_flight` at `ggml-sycl.cpp:11867`. Each
+`fill_reordered_host` call performs `staging_pool.release(reorder_buf_raw,
+copy_event)` at `ggml-sycl.cpp:10929`, installing the in-flight H2D
+event on a slot. A subsequent `acquire()` best-fit picks an older slot
+whose `copy_event` is still batched in L0 DirectSubmission (not yet on
+the BCS hardware ring). `event.wait()` enters an L0 `sched_yield` spin
+while holding the pool's `mutex_`. Reproducible in ~7 s on every cold
+load of Mistral 7B Q4_0 with `n_gpu_layers=999`.
 
 **Violated assumption**: `staging_buffer_pool::acquire()` assumes
 `pending_event`s recorded via `release(ptr, evt)` are "close to
@@ -181,8 +179,40 @@ preload path's submission pattern. Notably, `drain_all()` in the same
 class at `common.hpp:1991` already uses the correct drop-mutex pattern
 (see its explicit comment).
 
+#### Example B — direct tensor_set path (D0.4 finding)
+
+D0.4 triggers this. The canary uses only `ggml-backend` APIs (no llama
+API, no unified_cache, no staging_buffer_pool). Call chain (gdb, top
+frames):
+
+```
+#6  sycl::_V1::detail::event_impl::wait                                   libsycl.so
+#7  ggml_backend_sycl_buffer_set_tensor    (ggml/src/ggml-sycl/ggml-sycl.cpp:12685)
+#8  main                                    (canary, ggml_backend_tensor_set call)
+```
+
+Same L0 `sched_yield` + idle controller signature. Wedges within 10 s of
+the first `ggml_backend_tensor_set`. Distinguishing facts:
+
+- No staging pool involved.
+- No mutex held across `event.wait()`.
+- No preload loop.
+- Single synchronous `stream->memcpy(..., data, size).wait()` inside the
+  SYCL backend.
+
+**Implication**: the fix must address the underlying L0 DirectSubmission
+non-flush, not just the staging-pool amplifier pattern. Candidate
+approaches include (1) periodic `ext_oneapi_submit_barrier({})` nudges
+on the relevant queues before user-facing `event.wait()`s, (2)
+investigation of whether `flushCommands`/`executeCommandLists` invocation
+from our queue submissions reliably wakes
+`NEO::DirectSubmissionController`, and (3) oneAPI/xe-driver
+version-matrix check (the combination here is known to change behavior
+across compute-runtime revisions).
+
 **Mitigation**: Track E below (task E1). Gates every canary in D0 and any
-test that touches `llama_init_from_model`.
+test that touches `llama_init_from_model` OR issues a user-facing
+`event.wait()` against the SYCL backend on Arc B580 + oneAPI 2025.3.
 
 ### Canary results (interim, pre-E1)
 
@@ -191,7 +221,7 @@ test that touches `llama_init_from_model`.
 | D0.1 — skeleton determinism | INCONCLUSIVE (blocked by m09zb) | Binary builds; execution wedges in `llama_model_load_from_file` before any determinism measurement can complete. Resumes once E1 lands. |
 | D0.2 — PP + TG graph union | PASS (commit `3ba255e`) | Mistral 7B: 13 op types. GPT-OSS 20B: 17 op types — MoE adds `ADD_ID, ARGSORT, MUL_MAT_ID, SOFT_MAX`. PP == TG on both models → A3a can size from a single shape (the double-reserve strategy is not needed for either of these models). |
 | D0.3 — post-split CPY visibility | Not run (blocked by m09zb) | Requires multi-device context init, which hits the same wedge on first device's model load. |
-| D0.4 — direct-weight-load mechanics | Not run (blocked by m09zb) | Would reuse the same `unified_cache_direct_stage_weight` → `fill_reordered_host` path that wedges. |
+| D0.4 — direct-weight-load mechanics | INCONCLUSIVE (commit `e594db1`) | Canary uses only `ggml-backend` APIs (no llama, no unified_cache, no staging pool). Builds clean. Runtime wedges on the first `ggml_backend_tensor_set` at `ggml_backend_sycl_buffer_set_tensor` (`ggml-sycl.cpp:12685`) with the same L0 hang signature as m09zb. **This proves m09zb is not staging-pool-specific** — it is a general L0 `event.wait()` issue (see "Example B" above). Resumes once E1 lands. |
 
 When E1 lands, rerun all four canaries. Acceptance for closing D0 is the
 outcome of each canary (PASS / FAIL / INCONCLUSIVE with rationale), not
@@ -754,13 +784,17 @@ a plan entry" assertion in §"Op-level placement consultation".
 
 Exposed by Track D0 canaries. Every other track creates a
 `llama_context` (or a mini-context, or multiple per-shape reserves) on a
-GPU-offloaded model — all of which currently wedge on the
-`staging_buffer_pool` issue documented under "Known issues" above. Land
-E1 before starting Tracks A/B/C.
+GPU-offloaded model, or otherwise issues a user-facing `event.wait()`
+against the SYCL backend — all of which currently wedge on the L0
+DirectSubmission non-flush issue documented under "Known issues" above.
+The bug manifests in multiple callsites (preload path and direct
+`ggml_backend_tensor_set` path; see Examples A and B), so the fix must
+address the underlying L0 interaction, not just the staging pool's
+mutex-hold pattern. Land E1 before starting Tracks A/B/C.
 
 | Task | Summary | Acceptance |
 |---|---|---|
-| E1 | Restructure `staging_buffer_pool` to delegate back-pressure to the SYCL in-order queue instead of per-slot `pending_event` + mutex wait. Callers own the event chain: `acquire()` returns a slot unconditionally; the next H2D submission gets the slot's last `copy_event` as a `depends_on` dep. Remove `has_pending_event` / `pending_event` from `slot`. `release(ptr, evt)` becomes `release(ptr)` + a caller-owned event map (or simply a caller-side `std::deque<event>` per queue). ~200 LoC. Aligned with D10 ("weight plan process-scoped, compute plan per-context"). Bead: `llama.cpp-m09zb`. | No mutex held across any `event.wait()`; D0.1 canary (stub from Task 0 currently; full impl when E1 lands) loads Mistral 7B cleanly in under 60 s; `ninja -C build` + full ctest green; no new env var; zero perf regression on `llama-bench Mistral7B-Q4_0 PP512/TG128` baseline (±3%) |
+| E1 | Address the L0 DirectSubmission non-flush that wedges any post-init `event.wait()`. Primary direction: restructure `staging_buffer_pool` to delegate back-pressure to the SYCL in-order queue instead of per-slot `pending_event` + mutex wait. Callers own the event chain: `acquire()` returns a slot unconditionally; the next H2D submission gets the slot's last `copy_event` as a `depends_on` dep. Remove `has_pending_event` / `pending_event` from `slot`. `release(ptr, evt)` becomes `release(ptr)` + a caller-owned event map (or simply a caller-side `std::deque<event>` per queue). Since D0.4 shows the hang reproduces without the staging pool, the fix must ALSO address the broader L0 flush path (e.g., periodic `ext_oneapi_submit_barrier({})` nudge, or a compute-runtime version pin). ~200 LoC in the pool restructure plus smaller changes elsewhere. Aligned with D10 ("weight plan process-scoped, compute plan per-context"). Bead: `llama.cpp-m09zb`. | No mutex held across any `event.wait()`; **D0.1 canary** (stub from Task 0 currently; full impl when E1 lands) loads Mistral 7B cleanly in under 60 s; **D0.4 canary** (direct mmap → device `ggml_backend_tensor_set`) completes within 60 s with byte-identical readback; `ninja -C build` + full ctest green; no new env var; zero perf regression on `llama-bench Mistral7B-Q4_0 PP512/TG128` baseline (±3%) |
 
 ### Track A — Extend llama_model_params + plan schema (`llama.cpp-8gz7y` dependency)
 
