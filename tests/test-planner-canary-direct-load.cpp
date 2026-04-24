@@ -33,7 +33,7 @@ int main(int /*argc*/, char ** /*argv*/) {
     f.summary   = "Not run";
 
     const std::string md_path   = "docs/plans/data/planner-canaries/d0.4-direct-load.md";
-    const std::string json_path = "tests/data/planner-canaries/d0.4-direct-load.json";
+    const std::string json_path = "tests/data/planner-canaries/d0.4.json";
 
     // We don't need a real GGUF tensor extraction -- any mmap'd file with
     // known bytes works as a "raw weight slice" stand-in. Use a 4 KB slice

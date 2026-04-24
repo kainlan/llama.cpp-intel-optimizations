@@ -960,7 +960,7 @@ suite is green.
 | FA auto-detection timing regression for existing models | Track D3 regression suite includes FA auto-detection on Mistral (should resolve ON) and 20B (should resolve ON post-15li2); same result as current late-detection |
 | Multi-context creates different compute plans simultaneously | Each `llama_context` owns its own compute plan; weight plan on the `llama_model` is shared. Tested in D3 regression. |
 | No fallback means a regression blocks everybody | Mitigation is strict D3 regression suite coverage before epic-close; if regression hits in practice we fix the plan, not roll back. This is by design per user directive. |
-| `staging_buffer_pool` wedges under S1-PRELOAD on cold model load (bead `llama.cpp-m09zb`) | Fix via task E1 before starting Track A. Scope is ~200 LoC in `ggml/src/ggml-sycl/common.hpp` + release callsites in `ggml-sycl.cpp`. Reproduces in ~7 s on every cold Mistral 7B load on Arc B580 today — cannot be deferred. |
+| L0 DirectSubmission non-flush wedges `event.wait()` post-backend-init (bead `llama.cpp-m09zb`) | Fix via task E1 before starting Track A. Primary direction: restructure `staging_buffer_pool` to own caller-side event chains (~200 LoC in `ggml/src/ggml-sycl/common.hpp`). Secondary direction: address the underlying L0 flush path — see Known-issues Implication block for three candidate approaches. Reproduces in ~7 s on cold Mistral 7B load via the preload path AND via direct `ggml_backend_tensor_set` (D0.4 witness). |
 
 ## References
 
