@@ -409,6 +409,14 @@ if (GGML_SYCL)
     target_link_libraries(test-planner-canary-direct-load
                           PRIVATE llama common)
     install(TARGETS test-planner-canary-direct-load RUNTIME)
+
+    # E1 RCA broader-envelope repro: stage-by-stage isolation of where
+    # ggml_backend_sycl_init leaves the queue in a wedge-prone state.
+    add_executable(e1-broader-envelope
+                   e1-rca/broader-envelope-repro.cpp)
+    target_link_libraries(e1-broader-envelope
+                          PRIVATE ggml)
+    install(TARGETS e1-broader-envelope RUNTIME)
 endif()
 
 # test-ab-validation: unit tests for A/B validation mode infrastructure

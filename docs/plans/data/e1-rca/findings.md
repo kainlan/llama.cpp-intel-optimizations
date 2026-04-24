@@ -181,3 +181,134 @@ Recommended next investigation (per Step 1 in the conclusion above): build a
 broader-envelope repro on top of `ggml_backend_sycl_init` -- this is the
 smallest envelope that includes per-stream queue setup, oneDNN init, and the
 unified-cache initialization that bare-SYCL skipped.
+
+## Step 1: Broader-Envelope Investigation (Task 10, 2026-04-24)
+
+**Status: trigger isolated. m09zb is NOT in the staging-pool acquire path.**
+**The wedge is in the very first H2D submission on a freshly-initialized
+SYCL backend stream.**
+
+### Stage-by-stage bisection
+
+`tests/e1-rca/broader-envelope-repro.cpp` runs ggml + ggml-sycl (no llama.cpp)
+at progressively wider envelopes around `ggml_backend_sycl_init`. Each STAGE
+runs to completion or times out; the first to timeout is the trigger. Tested
+on Arc B580, level_zero:0, with the Task 9 `event.wait_and_throw` fix already
+applied at common.hpp:1863.
+
+| STAGE | Description | Wall time | Result |
+|-------|-------------|-----------|--------|
+| `init-only` | `ggml_backend_sycl_init(0)` then `ggml_backend_free` | 11 s init, 0.2 s free | PASS |
+| `init-wait` | init, then `ggml_backend_synchronize(backend)` (drains all queues via `queues_wait_and_throw`) | 11 s init, 0.22 s sync, 115 us free | PASS |
+| `init-alloc` | init, then `ggml_backend_alloc_ctx_tensors_from_buft` for one 4 KB F16 tensor | 11 s init, 63 us alloc | PASS |
+| `init-set` (default GLOBAL drain) | init + alloc + `ggml_backend_tensor_set` 4 KB | wedges inside `set_tensor` (>30 s) | FAIL |
+| `init-stream-set` (`SET_TENSOR_STREAM_FENCE=1`) | init + alloc + `ggml_backend_tensor_set` 4 KB | wedges inside `set_tensor` (>30 s) | FAIL |
+
+### Findings
+
+1. **Backend init alone does NOT leave the queue stuck.** `init-wait` proves
+   that `queues_wait_and_throw()` over all `_queues` populated by init returns
+   in ~220 ms.
+2. **Allocating a device tensor does NOT cause submissions to get stuck.**
+   `init-alloc` returns in 63 us with no queue activity.
+3. **The wedge is in the FIRST H2D copy** issued via the buffer's stream
+   inside `ggml_backend_sycl_buffer_set_tensor`. Both sync modes (GLOBAL
+   `queues_wait_and_throw` at ggml-sycl.cpp:12746 and STREAM_FENCE
+   `stream->wait_and_throw()` at 12750) wedge.
+4. **The pre-`set_tensor` GLOBAL drain (12746) is NOT the trigger.** STREAM
+   sync is narrower (just one queue) and still wedges. So the wedge is
+   downstream of the sync-mode dispatch.
+
+### Code path that wedges
+
+For an F16 4 KB tensor with `dst_host_accessible == false` (device buffer),
+`ggml_backend_sycl_buffer_set_tensor` falls into the staged-upload branch
+(ggml-sycl.cpp:~12990-13100):
+
+```cpp
+ggml_sycl::offload_buffer_lease stage_lease{};
+acquire_offload_buffer(req, &stage_lease);   // first call -> grow_into 2 GB chunk
+char * stage_ptr = static_cast<char *>(stage_lease.handle.ptr);
+memcpy(stage_ptr, data, 4096);               // host->host copy
+// THIS is the wedge:
+auto err = CHECK_TRY_ERROR(
+    (*stream).memcpy(tensor->data, stage_ptr, 4096).wait());
+```
+
+The `(*stream).memcpy(...).wait()` never returns. This is the same class of
+failure as the original m09zb signature ("post-init event.wait() never
+returns") but at a different code site than Task 9 patched -- the staging
+pool's `acquire()` is never reached because the FIRST set_tensor call fails
+before any reuse can happen.
+
+### Why Task 4's bare-SYCL minimal-repro didn't reproduce
+
+`tests/e1-rca/minimal-repro.cpp` constructs its own `sycl::queue{gpu_selector_v,
+in_order{}}` -- a freshly created queue with NO prior backend state.
+`ggml_backend_sycl_init` does substantially more: it brings up dpct's device
+manager, creates a `sycl::context` shared across queues, runs the
+`ggml_backend_probe_max_alloc_size` binary search (14 successive
+malloc_device/free cycles up to 11.6 GB on Arc B580), queries XMX caps, and
+populates the device's `_queues` array. SOMETHING in that init sequence
+leaves the L0 driver in a state where the next H2D copy submitted on a
+backend-managed queue does not flush.
+
+### Why Task 9's fix didn't clear m09zb
+
+Task 9 replaced `event.wait()` with `event.wait_and_throw()` in
+`staging_buffer_pool::acquire` (common.hpp:1863). That code path is only
+reached when reusing a previously-released slot. The wedge fires on the
+FIRST set_tensor's *initial* H2D, before any slot has been released. The
+staging pool's acquire is well outside the trigger envelope.
+
+### Hypotheses for the actual trigger (priority order)
+
+1. **(H1) Probe state.** `ggml_backend_probe_max_alloc_size` does 14 binary-
+   search malloc_device/free cycles up to 11.6 GB. The L0 USM allocator
+   keeps freed allocations in a pool; the post-probe state may leave the
+   default queue's command list in a state that doesn't flush the next
+   submission. Disabling the probe (or running with a tiny probe upper
+   bound) would test this.
+2. **(H2) DPCT context vs. plain SYCL context.** dpct's `dev_mgr` constructs
+   queues differently from `sycl::queue{gpu_selector_v}`. Possible:
+   `enable_exception_handler` flag, async-handler installation, or implicit
+   context ordering effects.
+3. **(H3) BCS queue creation.** `[UNIFIED-CACHE] Created BCS queue for H2D
+   copy pipelining` happens in init. The presence of a separate BCS queue
+   alongside the default IOQ may interact poorly with the L0 driver's
+   DirectSubmission.
+4. **(H4) Pinned chunk allocation.** The first `acquire_offload_buffer`
+   triggers `grow_into` -> `sycl::malloc_host` of a 2 GB chunk. The L0 driver
+   has to set up GGTT mappings for this; the `(*stream).memcpy(... stage_ptr ...)`
+   immediately after may hit unmapped host pages.
+
+### Concrete next step
+
+Add two more STAGEs to `broader-envelope-repro.cpp`:
+- `STAGE=init-no-probe` -- env-disable the probe in `ggml_backend_probe_max_alloc_size`
+   (would need a new env hook in ggml-sycl.cpp). If this PASSes set_tensor,
+   H1 is confirmed.
+- `STAGE=init-set-prefilled-stage` -- pre-allocate stage_ptr from `malloc_host`
+   on a *fresh* sycl::queue (not the backend's), then submit `stream->memcpy`
+   with that ptr. If this PASSes, H4 is confirmed. If it still wedges,
+   the trigger is in the backend stream itself, independent of stage memory.
+
+Both probes are 30-60 minutes of work each. Filing as recommended follow-ups.
+
+### Recommended E1 fix shape (revised, post-Task-10)
+
+The Task 9 fix at common.hpp:1863 is keep-but-not-fixing-m09zb. The actual
+fix needs to live in ONE of:
+
+- `ggml_backend_sycl_buffer_set_tensor` -- if the first H2D wedge is
+  reproducible, replace `(*stream).memcpy(...).wait()` at line ~13076 with a
+  no-stream copy path (CPU memcpy when dst is host-accessible already exists;
+  extend it or use a fresh `sycl::queue` from the context for the FIRST
+  set_tensor only).
+- The init path -- if H1 confirms, gate the probe behind an env or shrink
+  its upper bound to avoid leaving the L0 driver in the bad state.
+- DPCT helper -- if H2 confirms, switch backend queues to a plain
+  `sycl::queue` constructor instead of `dpct::device_ext::create_queue`.
+
+None of these are 1-line surgical fixes; all need the further-bisection
+described above before committing.
