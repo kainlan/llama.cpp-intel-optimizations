@@ -72,8 +72,11 @@ int main() {
     const int        wait_period    = env_int("WAIT_PERIOD", 8);
 
     const char * mit_str = "none";
-    if (mit == mitigation::barrier)        mit_str = "barrier";
-    if (mit == mitigation::wait_and_throw) mit_str = "wait_and_throw";
+    switch (mit) {
+        case mitigation::none:           mit_str = "none";           break;
+        case mitigation::barrier:        mit_str = "barrier";        break;
+        case mitigation::wait_and_throw: mit_str = "wait_and_throw"; break;
+    }
     std::fprintf(stderr,
                  "[repro] mitigation=%s barrier_period=%d wait_period=%d\n",
                  mit_str, barrier_period, wait_period);
@@ -128,6 +131,8 @@ int main() {
                     std::fprintf(stderr,
                                  "[repro] WEDGE detected: chunk=%d wait_us=%ld threshold=%ld\n",
                                  i, wait_us, WEDGE_US);
+                    // UB-on-paper: free with in-flight ops, but process exits
+                    // immediately so it's harmless. Acceptable for a wedge probe.
                     sycl::free(host, q);
                     sycl::free(dev,  q);
                     return 1;

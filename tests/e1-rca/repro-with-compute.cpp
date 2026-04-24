@@ -48,11 +48,11 @@ int main() {
                  n_warmup_kernels, n_streams);
 
     try {
-        sycl::context shared{sycl::device{sycl::gpu_selector_v}};
+        sycl::device dev_obj{sycl::gpu_selector_v};
+        sycl::context shared{dev_obj};
         std::vector<queue> qs;
         for (int i = 0; i < n_streams; ++i) {
-            qs.emplace_back(shared, sycl::gpu_selector_v,
-                            sycl::property::queue::in_order{});
+            qs.emplace_back(shared, dev_obj, sycl::property::queue::in_order{});
         }
         queue & q0 = qs[0];
         queue & q1 = qs[n_streams > 1 ? 1 : 0];
@@ -107,6 +107,10 @@ int main() {
                     std::fprintf(stderr,
                                  "[repro-cmp] WEDGE: chunk=%d wait=%ld us\n",
                                  i, wait_us);
+                    // Drain every queue before free to match the success-path
+                    // teardown at the bottom of main; otherwise q1's allocations
+                    // can leak when n_streams > 1.
+                    for (auto & q : qs) q.wait_and_throw();
                     sycl::free(host, q0);
                     sycl::free(dev,  q0);
                     return 1;

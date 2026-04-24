@@ -22,6 +22,11 @@ int main() {
         constexpr size_t N = 64ULL * 1024ULL * 1024ULL;
         char * host = sycl::malloc_host<char>(N, q);
         char * dev  = sycl::malloc_device<char>(N, q);
+        if (!host || !dev) {
+            std::fprintf(stderr, "[probe-deps] alloc failed (host=%p dev=%p)\n",
+                         (void *) host, (void *) dev);
+            return 2;
+        }
         std::memset(host, 0xA5, N);
 
         sycl::event e_cp = q.memcpy(dev, host, N);

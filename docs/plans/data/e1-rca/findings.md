@@ -39,8 +39,8 @@ Full env dump: `env-dump.txt`. xe/drm kernel log excerpt: `driver-log.txt`.
 | baseline (rerun, post-recovery) | `minimal-repro.cpp` | `MITIGATION=none` | Same as baseline | 0 | Confirms B580 recovered after GT-reset |
 | baseline + `ZE_SERIALIZE=1` | `minimal-repro.cpp` | env override | All 64 chunks completed; same timing | 0 | Driver-level ENQUEUE serialize doesn't change behavior |
 | baseline + `ZE_SERIALIZE=2` | `minimal-repro.cpp` | env override | Same as ZE=1 | 0 | Driver-level COMPLETION serialize doesn't change behavior |
-| **submit_barrier mitigation** | `minimal-repro.cpp` | `MITIGATION=barrier` | `ext_oneapi_submit_barrier()` every 4 chunks -> **HANG** at chunk submit | 124 | Triggers GT-reset; see kernel-WARNING below |
-| **wait_and_throw mitigation** | `minimal-repro.cpp` | `MITIGATION=wait` | `q.wait_and_throw()` every 8 chunks -> all events already complete; max wait 10 us total | 0 | Effective if needed, but baseline doesn't need it |
+| submit_barrier mitigation | `minimal-repro.cpp` | `MITIGATION=barrier` | `ext_oneapi_submit_barrier()` every 4 chunks -> HANG at chunk submit | 124 | Triggers GT-reset; see kernel-WARNING below |
+| wait_and_throw mitigation | `minimal-repro.cpp` | `MITIGATION=wait` | `q.wait_and_throw()` every 8 chunks -> all events already complete; max wait 10 us total | 0 | Effective if needed, but baseline doesn't need it |
 | barrier-bug isolation (empty waitlist) | `probe-barrier-bug.cpp` | none | One H2D copy + bare `submit_barrier()` -> barrier submit takes 26 ms, then **HANG** before printing copy.wait | 124 | Confirms the bug is in the empty-waitlist barrier path, not in any specific timing |
 | barrier with explicit deps | `probe-barrier-deps.cpp` | none | One H2D copy + `submit_barrier({e_cp})` -> barrier submit 38 ms, wait 73 us | 0 | Non-empty waitlist works fine |
 
@@ -104,7 +104,7 @@ This is the smallest envelope that includes the SYCL backend's per-stream queue 
 - oneAPI DPC++: 2025.3.3
 
 ### Repro
-`tests/e1-rca/probe-barrier-bug.cpp` (~45 lines).
+`tests/e1-rca/probe-barrier-bug.cpp` (~70 lines).
 
 ```cpp
 sycl::queue q{sycl::gpu_selector_v, sycl::property::queue::in_order{}};
@@ -142,17 +142,6 @@ Verified working in `probe-barrier-deps.cpp`. Submit time 38 ms, event wait
 - `tests/e1-rca/probe-barrier-deps.cpp`
 - `docs/plans/data/e1-rca/driver-log.txt`
 - `docs/plans/data/e1-rca/env-dump.txt`
-
-## Files Produced By This Task
-
-- `tests/e1-rca/minimal-repro.cpp` -- primary repro (does NOT trigger m09zb)
-- `tests/e1-rca/repro-with-compute.cpp` -- extended repro with warmup kernels and dual queues (does NOT trigger m09zb either; not run to completion because the device was wedged from a prior barrier test)
-- `tests/e1-rca/probe-barrier-bug.cpp` -- isolates the empty-waitlist barrier bug
-- `tests/e1-rca/probe-barrier-deps.cpp` -- confirms non-empty-waitlist works
-- `tests/e1-rca/build.sh` -- icpx build wrapper (mirror of tests/sycl-canary/build.sh)
-- `docs/plans/data/e1-rca/findings.md` -- this document
-- `docs/plans/data/e1-rca/driver-log.txt` -- xe/drm kernel-WARNING capture
-- `docs/plans/data/e1-rca/env-dump.txt` -- toolchain + driver versions
 
 ## Fix Attempt #1 (Task 9, 2026-04-24): event.wait() -> event.wait_and_throw()
 
