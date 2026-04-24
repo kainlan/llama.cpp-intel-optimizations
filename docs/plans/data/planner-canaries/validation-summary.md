@@ -21,7 +21,7 @@ broader-envelope finding (Task 10) that was queued to resolve E1.
 | 1 | C2's `plan.ops` keying on op_id is stable across repeated `graph_reserve`                                         | HIGH     | Task 1 / D0.3 | PASS (`607fca77e`)           | **validated**                       |
 | 2 | A3a's "single-shape sizing suffices" generalizes beyond Mistral 7B + GPT-OSS 20B                                  | HIGH     | Task 2 / D0.2 | PASS (`a3e0f29b7`)           | **partially validated** — Mistral-dense + GPT-OSS-MoE families only; SWA + state-space architectures absent locally, untested |
 | 3 | Plan doc reflects the 2026-04-22 deprecate-layer-streaming directive consistently                                 | MEDIUM   | Task 3       | PASS (`6f7968833`, polished `209303892`) | **validated** — all 7 stale references annotated or rewritten; CPU-dispatch is now the canonical answer |
-| 4 | E1 / m09zb root cause identified, mitigation chosen                                                                | HIGH     | Task 4 / Task 10 | PARTIAL — minimal-repro PASS, broader-envelope FAIL (`3cffaae9f`, `33e05fa36`) | **partially validated** — bare async-H2D + event.wait() refuted as the trigger pattern; trigger isolated to first H2D in `ggml_backend_sycl_buffer_set_tensor` after `ggml_backend_sycl_init`. 4 ranked hypotheses, 2 next-step probes outlined. Root cause not yet pinned. |
+| 4 | E1 / m09zb root cause identified, mitigation chosen                                                                | HIGH     | Task 4 / Task 10 | PARTIAL — minimal-repro PASS, broader-envelope FAIL (`3cffaae9f` initial RCA, `33e05fa36` broader-envelope finding) | **partially validated** — bare async-H2D + event.wait() refuted as the trigger pattern; trigger isolated to first H2D in `ggml_backend_sycl_buffer_set_tensor` after `ggml_backend_sycl_init`. 4 ranked hypotheses, 2 next-step probes outlined. Root cause not yet pinned. |
 | 5 | A3a's mini-context + A3b's FA auto-detection produce sizes/decisions byte-identical to a real context              | HIGH     | Task 5       | NOT RUN — blocked by E1         | **still blocked** — re-run once E1 unblocks GPU model load |
 | 6 | A7's direct mmap → device `ggml_backend_tensor_set` achieves byte-exact readback within 60 s                       | HIGH     | Task 6 / D0.4 re-run | NOT RUN — blocked by E1   | **still blocked** — D0.4 binary already exists; remains INCONCLUSIVE pending E1 |
 | 7 | Weight priority order `NORM_EMBED > ATTENTION > FFN > MOE_DOWN > MOE_UP > MOE_GATE_PROJ` outperforms alternatives  | MEDIUM   | Task 7       | NOT RUN — blocked by E1 (model load wedge under `VRAM_BUDGET_PCT=30`) | **still blocked** |
@@ -148,7 +148,8 @@ blocked on E1 (5, 6, 7).
 ### Task 8 — This summary
 - **Status**: this document. Main plan canary-results section
   already updated under Task 2's commit (`a3e0f29b7`) for D0.2 and
-  D0.3 row updates.
+  D0.3 row updates (D0.3 row later split into D0.3a multi-device-CPY
+  + D0.3b op-id-stability at `16306e2bd` per Task 2 polish).
 
 ## E1 acceptance refinement
 
@@ -198,7 +199,7 @@ in this commit):
 
 | Track A item | Bead | Pre-validation status | Post-validation status |
 |---|---|---|---|
-| A3 (split into weight_plan + compute_plan) | `llama.cpp-...` | OPEN | OPEN — no validation gate; structural change only |
+| A3 (split into weight_plan + compute_plan) | (no dedicated bead — tracked under parent epic `llama.cpp-3h5gm`) | OPEN | OPEN — no validation gate; structural change only |
 | A3a (mini-context infrastructure) | `llama.cpp-dyeyy` | OPEN, gated on D0.1 | **STILL BLOCKED on E1**. Sizing direction unblocked by D0.2 (Task 2); mini-context mechanics still need D0.1 (currently INCONCLUSIVE). |
 | A3b (FA auto-detect in skeleton graph) | open | gated on Task 5 | **STILL BLOCKED on E1**. |
 | A4 (arena zone sizing from weight_plan) | open | gated on A3, A3a | structurally OK to start once A3a is unblocked. |
