@@ -312,3 +312,52 @@ fix needs to live in ONE of:
 
 None of these are 1-line surgical fixes; all need the further-bisection
 described above before committing.
+
+## Step 2: H1/H4 Bisection Probes (Task 11, 2026-04-24)
+
+**Status: H1 CONFIRMED. The 14-step alloc probe in `ggml_backend_sycl_init` is the m09zb trigger.**
+
+### Two new STAGEs added to broader-envelope-repro.cpp
+
+| STAGE | What it tests | Hypothesis |
+|-------|---------------|------------|
+| `init-no-probe` | Same as `init-set` but exports `GGML_SYCL_E1_RCA_DISABLE_ALLOC_PROBE=1` BEFORE calling `ggml_backend_sycl_init`. The env-gate (added in ggml-sycl.cpp:~9345 for RCA only, default OFF) skips `ggml_backend_probe_max_alloc_size`. PASS confirms H1. | H1: alloc probe state |
+| `init-set-prefilled-stage` | After init + alloc, submits a 4 KB H2D on a FRESH `sycl::queue{gpu_selector_v, in_order{}}` BEFORE `ggml_backend_tensor_set`. PASS confirms H4. | H4: GGTT mapping / first-H2D priming |
+
+### Results
+
+| STAGE | Wall time | Result | Interpretation |
+|-------|-----------|--------|----------------|
+| `init-no-probe` (run 1) | init=1.1 s, set_tensor=224 ms, readback PASS | **PASS** | H1 confirmed: probe is the trigger |
+| `init-no-probe` (run 2, reproducibility) | set_tensor=225 ms, readback PASS | **PASS** | reproducible |
+| `init-set-prefilled-stage` | wedges in `warmup_h2d_fresh_queue` (>60 s) | **FAIL** | H4 refuted — but see below |
+| `init-set` (baseline rerun) | wedges as before (>30 s) | FAIL | confirms baseline still reproduces |
+
+### Findings
+
+1. **H1 CONFIRMED.** Skipping the binary-search alloc probe in `ggml_backend_sycl_init` makes set_tensor work. The probe — 14 successive `malloc_device` / `free` cycles binary-searching from `max_alloc_size` (~11.6 GB) down to a "safe" size — leaves the L0 driver in a state where the next H2D copy submitted on **any** queue does not flush.
+2. **H4 refuted but with a stronger corollary.** The warmup H2D on a fresh `sycl::queue{gpu_selector_v, in_order{}}` ALSO wedges after init runs the probe. So the wedge is **not** specific to backend-managed queues. Once the probe has run, no queue on the device can complete an H2D. The bad state is at the L0 driver / device level.
+3. **Init time is 10x faster without the probe.** `init=11.0 s` (with probe) vs `init=1.1 s` (without). The probe alone is ~10 s of init time on Arc B580 — itself notable.
+4. **Probe accuracy is preserved by the existing fallback.** When `safe_alloc == 0` (probe skipped or probe failed), the code already falls back to `floor(probe_upper * safety_margin)` = 95% of `max_alloc_size`. With the probe disabled, `safe_max_alloc_size` was reported as 11024.9 MB vs 11024.8 MB with the probe — within 0.1 MB. The probe's binary search is finding essentially the same answer the simple multiplication produces.
+
+### Recommended E1 fix shape (post-Task 11)
+
+**Primary direction: replace the binary-search alloc probe with `floor(max_alloc_size * 0.95)`.**
+
+The probe is 14 expensive malloc_device/free cycles with a known-bad side effect (m09zb), and produces a result that's within ~100 KB of the trivial calculation. Replacing it removes ~10 s of init time AND clears m09zb in one change.
+
+Alternative: keep the probe but reset/recover the L0 state after it. The post-probe stack pattern (`malloc_device` allocations linger in the L0 USM pool) suggests an explicit pool drain or a `queue.wait_and_throw()` followed by `sycl::context` re-init might recover the state. This is more invasive and less predictable; recommend the primary direction unless the probe is empirically known to produce a more accurate cap on hardware where 95% is wrong.
+
+The earlier fix-shape candidates are deprecated by this finding:
+- (A) "Use a fresh sycl::queue for first set_tensor H2D" -- refuted by `init-set-prefilled-stage` failure. Fresh queues wedge too.
+- (C) "Switch dpct to plain SYCL queue construction" -- not relevant; the wedge is at the device/driver level, not the queue construction path.
+
+### Code changes added by Task 11
+
+1. **ggml-sycl.cpp env-gate** (RCA-only, default OFF): `GGML_SYCL_E1_RCA_DISABLE_ALLOC_PROBE=1` skips the probe and uses the simple-multiplication fallback. Left in place because it's the same control the fix would use; production behavior unchanged when env not set.
+2. **broader-envelope-repro.cpp**: two new STAGEs (`init-no-probe`, `init-set-prefilled-stage`) and a `<sycl/sycl.hpp>` include for the fresh-queue warmup.
+3. **CMake**: `e1-broader-envelope` now compiles with `-fsycl` (was previously linking ggml only — sycl::queue usage requires the SYCL frontend).
+
+### Recommended Task 12 (the actual E1 fix)
+
+Replace the probe call site at ggml-sycl.cpp:~9345 with the trivial 95% calculation, behind the same env-gate so it can be reverted for diagnostics. Verify against the same two probes used in Task 9: model load + D0.4 canary should both PASS. Phase C unblocks.

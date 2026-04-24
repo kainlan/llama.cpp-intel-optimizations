@@ -22,6 +22,20 @@
 //   STAGE=init-stream-set init, alloc, then ONLY stream wait + memcpy via
 //                         the buffer's stream (skip queues_wait_and_throw).
 //
+// Step-2 probes (Task 11):
+//   STAGE=init-no-probe  same as init-set but exports
+//                        GGML_SYCL_E1_RCA_DISABLE_ALLOC_PROBE=1 BEFORE init,
+//                        skipping the 14-step binary-search alloc probe in
+//                        ggml_backend_sycl_init.  PASS => H1 confirmed
+//                        (probe leaves L0 in the wedge-prone state).
+//   STAGE=init-set-prefilled-stage  init + alloc, then a "warmup" H2D on a
+//                        FRESH sycl::queue (gpu_selector_v, in_order, fresh
+//                        context) BEFORE invoking ggml_backend_tensor_set.
+//                        PASS => H4 (first H2D anywhere on the device primes
+//                        L0 state and unblocks subsequent backend memcpy).
+//                        FAIL => trigger is in the backend stream itself,
+//                        independent of "first H2D" priming.
+//
 // Each stage prints elapsed wall time per step. If a stage runs cleanly under
 // 60 s, the prior stage list does NOT trigger the wedge. The first stage to
 // time out (exit 124) is the trigger.
@@ -30,6 +44,8 @@
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
 #include "ggml.h"
+
+#include <sycl/sycl.hpp>
 
 #include <chrono>
 #include <cstdio>
@@ -62,6 +78,13 @@ void timed(const char * label, Fn && fn) {
 int main() {
     const std::string stage = stage_env();
     std::fprintf(stderr, "[broader] STAGE=%s\n", stage.c_str());
+
+    // STAGE=init-no-probe: must export BEFORE backend init so the env-gate
+    // in ggml_backend_sycl_init's per-device probe loop sees it. The gate
+    // itself lives in ggml-sycl.cpp:~9345 (RCA-only, default OFF).
+    if (stage == "init-no-probe") {
+        setenv("GGML_SYCL_E1_RCA_DISABLE_ALLOC_PROBE", "1", 1);
+    }
 
     ggml_backend_t backend = nullptr;
     timed("init", [&] { backend = ggml_backend_sycl_init(0); });
@@ -113,13 +136,43 @@ int main() {
         return 0;
     }
 
-    if (stage == "init-set" || stage == "init-stream-set") {
+    if (stage == "init-set" || stage == "init-stream-set" || stage == "init-no-probe" ||
+        stage == "init-set-prefilled-stage") {
         // The default sync mode is GLOBAL (queues_wait_and_throw).  For the
         // -stream-set variant, force STREAM_FENCE so set_tensor does
         // stream->wait_and_throw() instead.  For init-set, leave default.
         if (stage == "init-stream-set") {
             setenv("GGML_SYCL_SET_TENSOR_STREAM_FENCE", "1", 1);
         }
+
+        // init-set-prefilled-stage: BEFORE the backend's first set_tensor,
+        // submit and complete a 4 KB H2D on a FRESH sycl::queue we construct
+        // here (gpu_selector_v, in_order, distinct context). If the wedge is
+        // gated by "the very first H2D anywhere on the device hasn't been
+        // primed", this should clear it. If the wedge is intrinsic to the
+        // backend-managed stream, this won't help.
+        if (stage == "init-set-prefilled-stage") {
+            timed("warmup_h2d_fresh_queue", [&] {
+                try {
+                    sycl::queue wq{ sycl::gpu_selector_v, sycl::property::queue::in_order{} };
+                    constexpr size_t WBYTES = 4096;
+                    char *           wh     = sycl::malloc_host<char>(WBYTES, wq);
+                    char *           wd     = sycl::malloc_device<char>(WBYTES, wq);
+                    if (wh && wd) {
+                        std::memset(wh, 0x5A, WBYTES);
+                        wq.memcpy(wd, wh, WBYTES).wait();
+                        sycl::free(wd, wq);
+                        sycl::free(wh, wq);
+                    } else {
+                        std::fprintf(stderr, "[broader] warmup alloc failed (wh=%p wd=%p)\n",
+                                     (void *) wh, (void *) wd);
+                    }
+                } catch (const sycl::exception & e) {
+                    std::fprintf(stderr, "[broader] warmup SYCL exception: %s\n", e.what());
+                }
+            });
+        }
+
         std::vector<uint8_t> src(TEST_BYTES, 0xA5);
         timed("set_tensor", [&] { ggml_backend_tensor_set(t, src.data(), 0, TEST_BYTES); });
         std::vector<uint8_t> dst(TEST_BYTES, 0);

@@ -412,8 +412,12 @@ if (GGML_SYCL)
 
     # E1 RCA broader-envelope repro: stage-by-stage isolation of where
     # ggml_backend_sycl_init leaves the queue in a wedge-prone state.
+    # Step-2 stages (init-no-probe, init-set-prefilled-stage) use sycl::queue
+    # directly for a warmup H2D — needs -fsycl on compile + link.
     add_executable(e1-broader-envelope
                    e1-rca/broader-envelope-repro.cpp)
+    target_compile_options(e1-broader-envelope PRIVATE "-fsycl")
+    target_link_options(e1-broader-envelope PRIVATE "-fsycl")
     target_link_libraries(e1-broader-envelope
                           PRIVATE ggml)
     install(TARGETS e1-broader-envelope RUNTIME)

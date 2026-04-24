@@ -9342,7 +9342,17 @@ static ggml_sycl_device_info ggml_sycl_init() {
         const double                           safety_margin = 0.95;
         ggml_backend_sycl_probe_buffer_context probe_ctx{ i, &(device_i.default_queue()) };
         ggml_backend_buffer_type probe_buft{ ggml_backend_sycl_probe_buffer_type_interface, nullptr, &probe_ctx };
-        size_t safe_alloc = ggml_backend_probe_max_alloc_size(&probe_buft, probe_upper, safety_margin);
+        // E1 RCA env-gate: setting GGML_SYCL_E1_RCA_DISABLE_ALLOC_PROBE=1 skips
+        // the binary-search probe so we can test whether it leaves the L0
+        // driver in the m09zb-trigger state. RCA-only — leave OFF in normal
+        // builds (skipping the probe loses safe_max_alloc_size accuracy).
+        size_t safe_alloc = 0;
+        const char * e1_skip = std::getenv("GGML_SYCL_E1_RCA_DISABLE_ALLOC_PROBE");
+        if (e1_skip && e1_skip[0] == '1') {
+            GGML_LOG_WARN("[SYCL] E1 RCA: alloc probe disabled via env\n");
+        } else {
+            safe_alloc = ggml_backend_probe_max_alloc_size(&probe_buft, probe_upper, safety_margin);
+        }
         if (safe_alloc == 0) {
             safe_alloc = (size_t) std::floor((double) probe_upper * safety_margin);
         }
