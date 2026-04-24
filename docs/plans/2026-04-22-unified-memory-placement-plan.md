@@ -186,13 +186,21 @@ API, no unified_cache, no staging_buffer_pool). Call chain (gdb, top
 frames):
 
 ```
+#0  sched_yield                                                           libc
+#1  L0::EventImp<unsigned long>::queryStatus                              libze_intel_gpu.so
+#2  L0::EventImp<unsigned long>::hostSynchronize                          libze_intel_gpu.so
+#3  ur::level_zero::urEventWait                                           libur_adapter_level_zero_v2.so
+#4  urEventWait                                                           libur_loader.so
+#5  sycl::_V1::detail::event_impl::waitInternal                           libsycl.so
 #6  sycl::_V1::detail::event_impl::wait                                   libsycl.so
 #7  ggml_backend_sycl_buffer_set_tensor    (ggml/src/ggml-sycl/ggml-sycl.cpp:12685)
 #8  main                                    (canary, ggml_backend_tensor_set call)
 ```
 
-Same L0 `sched_yield` + idle controller signature. Wedges within 10 s of
-the first `ggml_backend_tensor_set`. Distinguishing facts:
+Same L0 `sched_yield` + idle controller signature as Example A. The hang
+appears within ~10 s of the first `ggml_backend_tensor_set`; the
+`timeout 120 s` wrapper then kills the hung process. Distinguishing
+facts from Example A:
 
 - No staging pool involved.
 - No mutex held across `event.wait()`.
@@ -794,7 +802,7 @@ mutex-hold pattern. Land E1 before starting Tracks A/B/C.
 
 | Task | Summary | Acceptance |
 |---|---|---|
-| E1 | Address the L0 DirectSubmission non-flush that wedges any post-init `event.wait()`. Primary direction: restructure `staging_buffer_pool` to delegate back-pressure to the SYCL in-order queue instead of per-slot `pending_event` + mutex wait. Callers own the event chain: `acquire()` returns a slot unconditionally; the next H2D submission gets the slot's last `copy_event` as a `depends_on` dep. Remove `has_pending_event` / `pending_event` from `slot`. `release(ptr, evt)` becomes `release(ptr)` + a caller-owned event map (or simply a caller-side `std::deque<event>` per queue). Since D0.4 shows the hang reproduces without the staging pool, the fix must ALSO address the broader L0 flush path (e.g., periodic `ext_oneapi_submit_barrier({})` nudge, or a compute-runtime version pin). ~200 LoC in the pool restructure plus smaller changes elsewhere. Aligned with D10 ("weight plan process-scoped, compute plan per-context"). Bead: `llama.cpp-m09zb`. | No mutex held across any `event.wait()`; **D0.1 canary** (stub from Task 0 currently; full impl when E1 lands) loads Mistral 7B cleanly in under 60 s; **D0.4 canary** (direct mmap → device `ggml_backend_tensor_set`) completes within 60 s with byte-identical readback; `ninja -C build` + full ctest green; no new env var; zero perf regression on `llama-bench Mistral7B-Q4_0 PP512/TG128` baseline (±3%) |
+| E1 | Address the L0 DirectSubmission non-flush that wedges any post-init `event.wait()`. Primary direction: restructure `staging_buffer_pool` to delegate back-pressure to the SYCL in-order queue instead of per-slot `pending_event` + mutex wait. Callers own the event chain: `acquire()` returns a slot unconditionally; the next H2D submission gets the slot's last `copy_event` as a `depends_on` dep. Remove `has_pending_event` / `pending_event` from `slot`. `release(ptr, evt)` becomes `release(ptr)` + a caller-owned event map (or simply a caller-side `std::deque<event>` per queue). Since D0.4 shows the hang reproduces without the staging pool, the fix must *also* address the broader L0 flush path (e.g., periodic `ext_oneapi_submit_barrier({})` nudge, or a compute-runtime version pin). ~200 LoC in the pool restructure plus smaller changes elsewhere. Aligned with D10 ("weight plan process-scoped, compute plan per-context"). Bead: `llama.cpp-m09zb`. | No mutex held across any `event.wait()`; **D0.1 canary** (stub from Task 0 currently; full impl when E1 lands) loads Mistral 7B cleanly in under 60 s; **D0.4 canary** (direct mmap → device `ggml_backend_tensor_set`) completes within 60 s with byte-identical readback; `ninja -C build` + full ctest green; no new env var; zero perf regression on `llama-bench Mistral7B-Q4_0 PP512/TG128` baseline (±3%) |
 
 ### Track A — Extend llama_model_params + plan schema (`llama.cpp-8gz7y` dependency)
 

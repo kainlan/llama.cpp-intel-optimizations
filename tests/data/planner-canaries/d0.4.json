@@ -18,6 +18,6 @@
     "canary_runs_to_completion": "no",
     "findings_written_by_canary": "no",
     "resumes_when": "E1 lands (bead llama.cpp-m09zb)",
-    "what_this_would_test_when_unblocked": "direct mmap->device tensor_set with byte-identical readback, one copy, measure direct_copy_us"
+    "what_this_would_test_when_unblocked": "direct mmap->device tensor_set with byte-identical readback, one call, measure tensor_set_us (includes queue submit + sync)"
   }
 }

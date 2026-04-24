@@ -60,7 +60,11 @@ int main(int /*argc*/, char ** /*argv*/) {
     }
 
     const size_t TEST_SIZE   = 4096;
-    const size_t TEST_OFFSET = static_cast<size_t>(st.st_size) > (1024 * 1024) ? (1024 * 1024) : 0;
+    // Ensure at least TEST_SIZE bytes are readable starting at TEST_OFFSET.
+    // Without the +TEST_SIZE guard, a file sized (1 MiB, 1 MiB + TEST_SIZE)
+    // would read past the mmap and SIGBUS on touch.
+    const size_t TEST_OFFSET =
+        static_cast<size_t>(st.st_size) > (1024 * 1024 + TEST_SIZE) ? (1024 * 1024) : 0;
 
     void * mmap_base = mmap(nullptr, static_cast<size_t>(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0);
     if (mmap_base == MAP_FAILED) {
@@ -73,7 +77,9 @@ int main(int /*argc*/, char ** /*argv*/) {
     }
     const uint8_t * src_bytes = static_cast<const uint8_t *>(mmap_base) + TEST_OFFSET;
 
-    // Set up a SYCL backend on device 0.
+    // Device 0 is the only usable target on this host (B50 disabled per
+    // CLAUDE.md feedback_disable_b50.md); expand if multi-device testing
+    // becomes feasible.
     ggml_backend_t backend = ggml_backend_sycl_init(0);
     if (!backend) {
         f.result  = status::FAIL;
@@ -122,13 +128,14 @@ int main(int /*argc*/, char ** /*argv*/) {
         return 1;
     }
 
-    // The measurement: one ggml_backend_tensor_set call from mmap'd src to
-    // pre-allocated device tensor. Time it.
+    // The measurement: one ggml_backend_tensor_set call including queue
+    // submit + sync. Not raw DMA; the backend may stage, reorder, or add
+    // synchronization beyond the copy itself.
     using clock = std::chrono::steady_clock;
     const auto t_start = clock::now();
     ggml_backend_tensor_set(t, src_bytes, 0, TEST_SIZE);
     const auto t_end   = clock::now();
-    const auto direct_copy_us =
+    const auto tensor_set_us =
         std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count();
 
     // Read back and byte-compare against the source.
@@ -140,7 +147,7 @@ int main(int /*argc*/, char ** /*argv*/) {
     add(f, "test_offset_in_file",   std::to_string(TEST_OFFSET));
     add(f, "bytes_transferred",     std::to_string(TEST_SIZE));
     add(f, "readback_matches_src",  bytes_match ? "YES" : "NO");
-    add(f, "direct_copy_us",        std::to_string(direct_copy_us));
+    add(f, "tensor_set_us",        std::to_string(tensor_set_us));
 
     if (bytes_match) {
         f.result         = status::PASS;
