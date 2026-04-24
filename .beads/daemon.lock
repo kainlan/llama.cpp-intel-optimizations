@@ -1,7 +1,7 @@
 {
-  "pid": 198246,
-  "parent_pid": 198220,
+  "pid": 156495,
+  "parent_pid": 156475,
   "database": "/Apps/llama.cpp/.beads/beads.db",
   "version": "0.49.6",
-  "started_at": "2026-04-12T03:35:33.503428138Z"
+  "started_at": "2026-04-22T14:43:26.998995019Z"
 }
