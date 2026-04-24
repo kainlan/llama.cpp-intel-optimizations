@@ -51,24 +51,27 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <vector>
 
 namespace {
-using clock_t = std::chrono::steady_clock;
+using wallclock = std::chrono::steady_clock;
 
 const char * stage_env() {
     const char * s = std::getenv("STAGE");
     return s ? s : "init-only";
 }
 
-template <typename Fn>
-void timed(const char * label, Fn && fn) {
-    auto t0 = clock_t::now();
+// Tiny helper around std::function to avoid the perfect-forwarding template
+// (CLAUDE.md: minimize templates).  Each STAGE wraps its body in this, so a
+// single allocation per stage is fine.
+void timed(const char * label, const std::function<void()> & fn) {
+    auto t0 = wallclock::now();
     std::fprintf(stderr, "[broader] %s: BEGIN\n", label);
     std::fflush(stderr);
     fn();
-    auto t1 = clock_t::now();
+    auto t1 = wallclock::now();
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
     std::fprintf(stderr, "[broader] %s: END %ld us\n", label, us);
     std::fflush(stderr);
@@ -83,7 +86,7 @@ int main() {
     // in ggml_backend_sycl_init's per-device probe loop sees it. The gate
     // itself lives in ggml-sycl.cpp:~9345 (RCA-only, default OFF).
     if (stage == "init-no-probe") {
-        setenv("GGML_SYCL_E1_RCA_DISABLE_ALLOC_PROBE", "1", 1);
+        setenv("GGML_SYCL_E1_RCA_DISABLE_ALLOC_PROBE", "1", /* overwrite */ 1);
     }
 
     ggml_backend_t backend = nullptr;
@@ -142,7 +145,7 @@ int main() {
         // -stream-set variant, force STREAM_FENCE so set_tensor does
         // stream->wait_and_throw() instead.  For init-set, leave default.
         if (stage == "init-stream-set") {
-            setenv("GGML_SYCL_SET_TENSOR_STREAM_FENCE", "1", 1);
+            setenv("GGML_SYCL_SET_TENSOR_STREAM_FENCE", "1", /* overwrite */ 1);
         }
 
         // init-set-prefilled-stage: BEFORE the backend's first set_tensor,
