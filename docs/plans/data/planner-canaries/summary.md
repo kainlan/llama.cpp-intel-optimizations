@@ -30,8 +30,9 @@ Epic: `llama.cpp-3h5gm` (Unified Memory Placement Planning)
   Migration plan now starts with Phase 0 (E1) before the original
   Phase 1; (c) Known-issues section documents both callsites (Example
   A preload, Example B tensor_set) and the three candidate fix
-  directions. All already landed across commits `ebbaee052`,
-  `46f4a225f`, `fd2b016b7`, `d9a193e80`, and related.
+  directions. Landed across commits `ebbaee052`, `46f4a225f`,
+  `fd2b016b7`, `eac575ab7`, `d9a193e80`, and the D0.1 canary lean-out
+  `c791d9e27`.
 
 - **D0.3 (INCONCLUSIVE)**: no design change required. Multi-device
   policy (§D13) stands as authored; re-validation depends on host

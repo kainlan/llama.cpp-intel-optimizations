@@ -61,7 +61,7 @@ int main(int /*argc*/, char ** /*argv*/) {
                        "corroborating witness that the bug is not "
                        "staging-pool-specific";
 
-    add(f, "reason",                "blocked_on_m09zb");
+    add(f, "reason",                 "blocked_on_m09zb");
     add(f, "blocker_bead",           "llama.cpp-m09zb");
     add(f, "hang_location",          "ggml/src/ggml-sycl/common.hpp:1863");
     add(f, "hang_function",          "staging_buffer_pool::acquire");

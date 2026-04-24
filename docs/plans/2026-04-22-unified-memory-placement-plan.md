@@ -925,11 +925,13 @@ Summary: [`docs/plans/data/planner-canaries/summary.md`](data/planner-canaries/s
 | D0.3 post-split CPY visibility | INCONCLUSIVE | single SYCL device visible on this host (B50 disabled); multi-device CPY naming unverified |
 | D0.4 direct-weight-load mechanics | INCONCLUSIVE | blocked on E1; hang at `ggml-sycl.cpp:12685` proves m09zb is an L0 DirectSubmission non-flush, not a staging-pool-specific bug — scope broadening already folded into E1's acceptance |
 
-Design changes below incorporate the canary findings. Track A is
-**partially blocked**: A3a's sizing direction (D0.2) is validated, but
-A3a's core mini-context mechanics (D0.1), A7's direct-load path (D0.4),
-and C2's multi-device CPY keys (D0.3) remain blocked on E1 (and on host
-policy for D0.3). See the summary file for per-bead unlock decisions.
+The design changes in the preceding sections (Known issues, Track E,
+Migration plan Phase 0, E1 acceptance) already incorporate the canary
+findings. Track A is **partially blocked**: A3a's sizing direction
+(D0.2) is validated, but A3a's core mini-context mechanics (D0.1),
+A7's direct-load path (D0.4), and C2's multi-device CPY keys (D0.3)
+remain blocked on E1 (and on host policy for D0.3). See the summary
+file for per-bead unlock decisions.
 
 ## Acceptance criteria (epic-level)
 
