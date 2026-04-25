@@ -224,11 +224,13 @@ unified-memory-plan critical path.
 
 ## Open follow-ups (final session-end state, 2026-04-24)
 
-The five backend bugs below all gate full inference on Mistral 7B /
-GPT-OSS 20B at canonical contexts (`VRAM_BUDGET_PCT=30`,
-`n_ctx=4096`). None gate the planner-validation epic at the
-design level — Phase A/B and Tasks 5/6 are all PASS. These are
-backend-implementation issues filed for future-session work.
+Three layered VRAM-arena bugs (P1) + one A3a-spinoff (P2) + two
+doc-hygiene follow-ups remain. The three P1 bugs gate full inference
+on Mistral 7B / GPT-OSS 20B at canonical contexts
+(`VRAM_BUDGET_PCT=30`, `n_ctx=4096`). None gate the planner-
+validation epic at the design level — Phase A/B and Tasks 5/6 are
+all PASS. These are backend-implementation + doc-hygiene issues
+filed for future-session work.
 
 ### Layered VRAM-arena bugs (P1, filed by Closeout A)
 
