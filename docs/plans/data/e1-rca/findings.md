@@ -504,3 +504,127 @@ allocations are contiguous sub-ranges of one arena alloc.
   the standing conclusion. The real conclusion is: m09zb proper is fixed,
   one sibling wedge remains as a tracked P1 follow-up, Phase C is NOT
   blocked on it.
+
+
+## Step 5: Three-blocker synthesis (post-Task-17 closeout, 2026-04-24)
+
+**Status: m09zb is upstream-fixed; Phase C is NOT blocked at the
+canary level (Tasks 5 + 6 PASS today). Inference under default
+contexts on Mistral 7B / GPT-OSS 20B remains gated on a *layered*
+VRAM arena issue with three walls discovered in sequence as each
+prior wall was peeled away.**
+
+The arena chunk allocation path is the common substrate. Each wall
+is a distinct symptom; all three need to land for a default-context
+inference run to clear cleanly.
+
+### Wall 0 (FIXED): alloc-probe wedge — m09zb
+
+- **Symptom**: stock libze 1.14.37020 over-promises
+  `safe_max_alloc_size` (11024 MB), accepts oversized allocations,
+  L0 driver cannot flush them, first H2D after init hangs.
+- **Resolution**: patched compute-runtime
+  (`/Apps/compute-runtime` branch `fix/combined-26.09`,
+  libze_intel_gpu.so 1.14.37435) reports the correct ceiling
+  (1593 MB on Arc B580) and rejects oversized allocs at submit
+  time. Installed as system default 2026-04-24 via `dpkg-divert` +
+  `ldconfig`.
+- **Beads**: `llama.cpp-m09zb` (closed), `llama.cpp-zpp9k` (closed
+  — D0.4 PASS).
+- **Documented in**: Step 4 above.
+
+### Wall 1 (NEW, BLOCKING): `graph_reserve` OOM — err 39 from arena chunk
+
+- **Symptom**: with the alloc probe fixed, the next failure is in
+  the planner's arena reservation pass. The unified-cache arena
+  policy requests a single chunk wider than the patched libze's
+  1593 MB single-alloc cap; libze rejects with err 39 (out-of-
+  memory) at the chunk allocation point, surfacing through
+  `graph_reserve` as a buffer-allocation failure.
+- **Why it didn't surface earlier**: stock libze's
+  oversized-alloc-then-wedge masked it — control never reached the
+  arena reservation step on stock, because m09zb fired first.
+- **Fix shape**: chunk the arena's VRAM zones across multiple
+  sub-1.5-GB allocations; the ggml `vbuffer` chunking infrastructure
+  (`llama.cpp-w1rxh`, closed 2026-04-22) already supports this on
+  the compute-buffer side. Extend to the WEIGHT and KV zones.
+- **Bead**: `llama.cpp-khcc0` (P1, OPEN, filed by Closeout A) —
+  "[ggml-sycl] graph_reserve OOM under patched runtime (err 39,
+  arena chunk > 1.5 GB cap)".
+
+### Wall 2 (already filed): KV-clear per-layer memset wedge — `llama.cpp-zhzbp`
+
+- **Symptom**: `tiered_kv_buffer_clear` at `ggml-sycl.cpp:14802`
+  iterates 32 transformer layers × 2 (k+v) calling
+  `stream->memset(la.ptr, value, la.size).wait()`. One of the early
+  per-layer memsets hangs even at 2 MiB. Not size-dependent;
+  bisected across n_ctx ∈ {512, 2048, 8192, 16384, default}.
+- **Why "second wall"**: this fires after Wall 1 is fixed, on the
+  KV-clear pass that runs once the KV buffer has been allocated.
+  Under stock libze, control never reached this pass; under the
+  alloc-probe-only fix, Wall 1 fires before this. So the natural
+  order of discovery is m09zb → Wall 1 → Wall 2.
+- **Documented in**: Step 4 above + bead `llama.cpp-zhzbp` (open).
+- **Closeout A amendment**: zhzbp's bead description was updated in
+  Closeout A to call out the layered-walls relationship explicitly.
+
+### Wall 3 (NEW, BLOCKING): GET_ROWS OOR — err 40 from arena overcommit
+
+- **Symptom**: with Walls 1 + 2 hypothetically fixed, the next
+  failure is in graph compute. The GET_ROWS op (token embedding
+  lookup, runs first in the graph) requests a transient activation
+  buffer that exceeds the remaining arena capacity after weights +
+  KV claim their share. libze returns err 40 (out-of-resources, not
+  out-of-memory) at the activation allocation point.
+- **Why "third wall"**: only reachable after Walls 1 + 2 are past;
+  the arena's runtime-zone budget was sized assuming there'd be
+  more headroom than the post-weight-and-KV residual actually
+  provides. This is an *overcommit* problem, not an oversized-alloc
+  problem.
+- **Fix shape**: tighten the arena's RUNTIME-zone reservation in
+  the planner so per-graph activation allocations are bounded by
+  observed peak from the mini-context (Task 5). Task 5 already
+  produces the necessary signal (`backend_buf_exp_size`); the
+  arena planner needs to consume it as the runtime ceiling, not a
+  hint.
+- **Bead**: `llama.cpp-w2ptt` (P1, OPEN, filed by Closeout A) —
+  "[ggml-sycl] GET_ROWS OOR (err 40) after full arena reservation —
+  runtime alloc starvation".
+
+### Why three walls became visible only now
+
+Stock libze (1.14.37020) accepted any allocation request and silently
+wedged the first downstream H2D. That single failure mode masked all
+three arena-policy bugs because control flow never reached them. The
+patched libze (1.14.37435) enforces the real ceiling, so each
+arena-policy bug now surfaces as a distinct, diagnosable error code:
+
+| Wall | Pre-patch behavior | Post-patch error | Reachable? |
+|------|--------------------|------------------|------------|
+| 0 (alloc probe / m09zb) | wedge in first H2D | n/a (fixed by patch) | always (now bypassed) |
+| 1 (graph_reserve OOM) | masked by wall 0 | err 39 at chunk alloc | yes |
+| 2 (KV-clear wedge / zhzbp) | masked by wall 1 | per-layer memset hang | yes if wall 1 chunked |
+| 3 (GET_ROWS OOR) | masked by walls 1+2 | err 40 at activation alloc | yes if walls 1+2 fixed |
+
+Closeout A's primary contribution is filing walls 1 + 3 as new beads
++ amending zhzbp (wall 2) to describe the layered relationship.
+
+### What this means for the planner-validation epic
+
+- **Phase A (Tasks 1, 2, 3)**: COMPLETE.
+- **Phase B (Task 4)**: COMPLETE; m09zb resolved.
+- **Phase C / Task 5 (mini-context + FA)**: PASS (commit
+  `333df7379`). The mini-context approach does not exercise inference,
+  so walls 1-3 don't gate it. A3a + A3b mechanistically validated.
+- **Phase C / Task 6 (D0.4 direct-load)**: PASS under patched runtime
+  (`tensor_set_us = 282422`). D0.4 doesn't allocate the arena, so
+  walls 1-3 don't gate it.
+- **Phase C / Task 7 (priority benchmark)**: DEFERRED. The benchmark
+  loads the full inference path on Mistral 7B at
+  `VRAM_BUDGET_PCT=30`, which traverses all four walls. Cannot run
+  until walls 1 + 2 + 3 land. Not a planner-design issue; a
+  backend-implementation issue.
+
+The planner design itself (A3a, A3b, A7, C2 in Track A; B-track
+arena scaffolding) is concretely unblocked at the design-validation
+level. The remaining backend work is execution, not redesign.

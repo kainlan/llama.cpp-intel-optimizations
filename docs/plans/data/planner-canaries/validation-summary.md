@@ -23,15 +23,16 @@ from `/Apps/compute-runtime` branch `fix/combined-26.09`, dpkg-diverted
 | 2 | A3a's "single-shape sizing suffices" generalizes beyond Mistral 7B + GPT-OSS 20B                                  | HIGH     | Task 2 / D0.2 | PASS (`a3e0f29b7`)           | **partially validated** — Mistral-dense + GPT-OSS-MoE families only; SWA + state-space architectures absent locally, untested |
 | 3 | Plan doc reflects the 2026-04-22 deprecate-layer-streaming directive consistently                                 | MEDIUM   | Task 3       | PASS (`6f7968833`, polished `209303892`) | **validated** — all 7 stale references annotated or rewritten; CPU-dispatch is now the canonical answer |
 | 4 | E1 / m09zb root cause identified, mitigation chosen                                                                | HIGH     | Task 4 / Task 10 / Patched runtime install (2026-04-24) | RESOLVED — paired libze test on 2026-04-24 confirms stock 1.14.37020 wedges on first H2D after `ggml_backend_sycl_init`, patched 1.14.37435 returns cleanly; D0.4 PASSES under patched (`tensor_set_us=282422`) | **validated** — m09zb is upstream-fixed in our compute-runtime fork (`/Apps/compute-runtime` branch `fix/combined-26.09`); patched libze is now system-default. No llama.cpp code change beyond Task 9's `event.wait_and_throw` strict improvement. See `docs/plans/data/e1-rca/findings.md` Step 4. |
-| 5 | A3a's mini-context + A3b's FA auto-detection produce sizes/decisions byte-identical to a real context              | HIGH     | Task 5       | NOT RUN                         | **still blocked** — Task 5 prototype not yet implemented; m09zb axis is now unblocked, but the canary's mini-context probe for this question hasn't been written. Deferred to a future session. |
+| 5 | A3a's mini-context + A3b's FA auto-detection produce sizes/decisions byte-identical to a real context              | HIGH     | Task 5       | PASS (`333df7379`, 2026-04-24) | **validated** — fork+exec'd 3-worker prototype (real-A, real-B, mini=`no_alloc=true,use_mmap=false`) produced byte-identical compute-buffer sizes + FA verdict on Mistral 7B (115.01 MiB, FA=enabled) and GPT-OSS 20B (398.38 MiB, FA=enabled). Mmap-path assert at `src/llama-model.cpp:8686` requires `use_mmap=false` for the mini worker — flagged as A3a production constraint. |
 | 6 | A7's direct mmap → device `ggml_backend_tensor_set` achieves byte-exact readback within 60 s                       | HIGH     | Task 6 / D0.4 re-run | PASS (2026-04-24 patched-runtime test, `tensor_set_us=282422`) | **validated** — D0.4 canary completes inside the 60 s window with byte-identical readback under the patched runtime. A7's direct-load path is sound. |
-| 7 | Weight priority order `NORM_EMBED > ATTENTION > FFN > MOE_DOWN > MOE_UP > MOE_GATE_PROJ` outperforms alternatives  | MEDIUM   | Task 7       | NOT RUN                         | **still blocked** — m09zb axis unblocked, but a separate single-buffer alloc ceiling (~1.5 GB under patched libze, Task 14) gates the `VRAM_BUDGET_PCT=30` benchmark since it triggers > 1.5 GB KV allocs on Mistral 7B at the larger contexts. Smaller-context variants are now runnable. |
+| 7 | Weight priority order `NORM_EMBED > ATTENTION > FFN > MOE_DOWN > MOE_UP > MOE_GATE_PROJ` outperforms alternatives  | MEDIUM   | Task 7       | DEFERRED                        | **deferred** — m09zb axis unblocked, but the full inference path through `VRAM_BUDGET_PCT=30` traverses three layered VRAM-arena bugs identified by Closeout A: graph_reserve OOM err 39 (Wall 1), KV-clear wedge `llama.cpp-zhzbp` (Wall 2), GET_ROWS OOR err 40 (Wall 3). All three need to land before the canonical 4096-context bench can run. See `docs/plans/data/e1-rca/findings.md` Step 5. |
 | 8 | The plan doc is internally consistent, the canary-results section reflects current findings, and the bead graph is honest about which tracks are unblocked | LOW | Task 8 (this doc) | This document + main plan edits | **validated** by the act of writing this summary; main plan canary-results section already reflects items 1-3 |
 
-Five items fully validated (1, 3, 4, 6, 8). One partially validated
-(2 — architecture coverage). Two still in progress (5 — Task 5
-prototype not yet implemented; 7 — gated on Task 14 KV alloc
-ceiling). Zero refuted.
+**Final session tally**: six items fully validated (1, 3, 4, 5, 6, 8).
+One partially validated (2 — architecture coverage caveat for SWA +
+state-space). One deferred (7 — gated on the three layered VRAM-arena
+bugs filed by Closeout A; not a planner-design issue, an
+arena-implementation issue). Zero refuted.
 
 ## Per-task evidence trail
 
@@ -122,18 +123,28 @@ ceiling). Zero refuted.
   No additional llama.cpp code change required for the m09zb
   acceptance set.
 
-### Task 5 — Mini-context + FA prototype (HIGH, still blocked)
-- **Status**: NOT RUN. m09zb is no longer the gate (resolved
-  2026-04-24 via patched compute-runtime install); Task 5's
-  prototype itself has not yet been written.
-- **Note**: per the plan doc, Task 5 requires constructing a
-  throwaway mini-context with `n_gpu_layers=999`, calling
-  `graph_reserve(no_alloc=true)`, and comparing per-backend buffer
-  sizes + FA auto-detect decision against a real context.
-- **Re-run criteria**: implement the prototype as a follow-up
-  session task; run on Mistral 7B + GPT-OSS 20B (per plan §Task 5
-  acceptance). The patched-runtime KV-alloc ceiling (Task 14) may
-  affect larger-context variants but small-context probes work today.
+### Task 5 — Mini-context + FA prototype (HIGH, validated)
+- **Commit**: `333df7379` (2026-04-24).
+- **Findings**: [`mini-context-validation.md`](mini-context-validation.md).
+- **Result**: PASS on Mistral 7B Q4_0 + GPT-OSS 20B MXFP4. A 3-worker
+  fork+exec'd prototype (real-A, real-B, mini=`no_alloc=true,
+  use_mmap=false`) produced byte-identical compute-buffer sizes + FA
+  verdict in all three workers:
+  - Mistral 7B: FA=enabled, CPU buffer=115.01 MiB
+  - GPT-OSS 20B: FA=enabled, CPU buffer=398.38 MiB
+  Determinism verified (real-A == real-B); mini-context approach
+  validated (mini == real-A).
+- **Important finding**: `GGML_ASSERT(!ml.no_alloc)` at
+  `src/llama-model.cpp:8686` makes the mmap-from-host-pointer fast
+  path incompatible with metadata-only loads. Worked around by setting
+  `mparams.use_mmap = false` for the mini worker. Production A3a must
+  either lift this assert or carry the use_mmap=false constraint.
+- **Backend**: CPU (`opencl:cpu`) — Task 5's question is scheduler-
+  level not SYCL-specific; the SYCL path is also expected to PASS
+  but exercise it post-Closeout-A walls 1-3 if desired.
+- **Design impact**: A3a (mini-context infrastructure) and A3b (FA
+  auto-detect in the skeleton graph pass) are mechanistically
+  validated. A3a can proceed.
 
 ### Task 6 — D0.4 re-run post-E1 (HIGH, validated)
 - **Status**: PASS (2026-04-24 patched-runtime test).
@@ -144,17 +155,22 @@ ceiling). Zero refuted.
   `ggml_backend_tensor_set` within 60 s with byte-identical
   readback" criterion is met. A7 can proceed.
 
-### Task 7 — Weight priority order benchmark (MEDIUM, still blocked)
-- **Status**: NOT RUN under the original full-context shape. m09zb
-  is resolved; the benchmark's 30%-VRAM-budget configuration on
-  Mistral 7B at the canonical 4096-token context now hits a
-  separate single-buffer alloc ceiling (~1.5 GB under patched
-  libze, Task 14) for KV-cache buffers, blocking the standard
-  baseline run.
-- **Re-run criteria**: smaller-context shapes (n_ctx=2048 or below
-  on Mistral 7B Q4_0) should fit under the 1.5 GB single-alloc
-  ceiling and are runnable today; the canonical 4096-context bench
-  is gated on Task 14 (KV alloc chunking).
+### Task 7 — Weight priority order benchmark (MEDIUM, deferred)
+- **Status**: DEFERRED. m09zb is resolved, but Closeout A (parallel
+  to this task) identified that `VRAM_BUDGET_PCT=30` traverses three
+  layered VRAM-arena bugs:
+  - Wall 1: `graph_reserve` OOM err 39 from arena chunk size > 1.5 GB
+  - Wall 2: KV-clear per-layer memset wedge (`llama.cpp-zhzbp`)
+  - Wall 3: GET_ROWS OOR err 40 from arena overcommit starving runtime
+  All three need to land before the canonical 4096-context bench can
+  run. See `docs/plans/data/e1-rca/findings.md` Step 5 for the
+  three-blocker synthesis.
+- **Re-run criteria**: walls 1, 2, 3 all closed via the new beads
+  filed by Closeout A. Until then, smaller-context single-device
+  variants may run today but are not the canonical Task 7 baseline.
+- **Design impact**: this is a backend-implementation issue, not a
+  planner-design issue. The priority-order claim is untested but
+  the planner itself is mechanically correct.
 
 ### Task 8 — This summary
 - **Status**: this document. Main plan canary-results section
@@ -199,51 +215,82 @@ unified-memory-plan critical path.
 | Track A item | Bead | Pre-validation status | Post-validation status |
 |---|---|---|---|
 | A3 (split into weight_plan + compute_plan) | (no dedicated bead — tracked under parent epic `llama.cpp-3h5gm`) | OPEN | OPEN — no validation gate; structural change only |
-| A3a (mini-context infrastructure) | `llama.cpp-dyeyy` | OPEN, gated on D0.1 | **UNBLOCKED on m09zb axis**. Sizing direction validated by D0.2 (Task 2). D0.1 canary's mini-context mechanics probe is not yet implemented (skeletal canary deferred to a future session); no longer blocked by E1. |
-| A3b (FA auto-detect in skeleton graph) | open | gated on Task 5 | **UNBLOCKED on m09zb axis**, awaiting Task 5 prototype implementation. |
+| A3a (mini-context infrastructure) | `llama.cpp-dyeyy` | OPEN, gated on D0.1 | **VALIDATED**. Task 5 prototype (`333df7379`) confirmed mini-context produces byte-identical sizes + FA verdict to a real context on Mistral 7B + GPT-OSS 20B. A3a can proceed; production must use `use_mmap=false` for mini-context construction (or lift the mmap-path assert). |
+| A3b (FA auto-detect in skeleton graph) | open | gated on Task 5 | **VALIDATED**. Task 5 confirmed FA auto-detect runs inside `llama_init_from_model` regardless of `no_alloc`; verdict matches between mini and real contexts. A3b can proceed. |
 | A4 (arena zone sizing from weight_plan) | open | gated on A3, A3a | structurally OK to start once A3a's prototype lands. |
 | A7 (weight loader writes direct to arena) | `llama.cpp-wuozk` | OPEN, gated on D0.4 | **VALIDATED**. D0.4 PASSES under patched runtime (`tensor_set_us = 282422`, 2026-04-24). A7 can proceed. |
 | C2 (populate plan.ops for every graph op) | `llama.cpp-oib0o` | gated on D0.3 | **op-id keying validated** (Task 1). C2 can proceed with op_id keying as specified. Multi-device CPY-name stability remains a future TODO. |
 | C3 (remove `GGML_SYCL_FORCE_STREAMING`) | open | not gated on a canary | OK to proceed; consistency sweep done (Task 3). |
 
-## Open follow-ups (post-Task-8, current state 2026-04-24)
+## Open follow-ups (final session-end state, 2026-04-24)
 
-- **m09zb**: RESOLVED via patched compute-runtime install (system
-  default, dpkg-diverted). No further follow-up needed on the m09zb
-  axis itself; future Phase C work can assume GPU model load works.
-- **Task 14** (in flight, implementer-1): KV-buffer wedge investigation
-  under patched runtime. Patched libze enforces a ~1.5 GB single-alloc
-  ceiling; Mistral 7B at 4096-context allocates a single ~4 GB KV
-  buffer that exceeds it. Task 14 is finding the right chunking or
-  size-cap point. This gates the canonical-context Task 7 baseline run.
-- **Phase C completion**: Task 5 prototype not yet written; Task 6
-  validated (D0.4 PASS); Task 7 needs Task 14 for the canonical
-  4096-context shape (smaller-context variants runnable today).
-- **Task 2 architecture coverage**: re-run D0.2 generalization on a
-  sliding-window-attention model (Gemma 2, Mixtral) and a state-space
-  model (Mamba / RWKV) once GGUFs are present at
-  `/Storage/GenAI/models/`. The "single-shape sizing generalizes
-  universally" claim retains its documented architecture-coverage
-  caveat until then.
-- **Task 3 follow-up**: rewrite the §VRAM-insufficient policy
-  paragraph to describe the new CPU-dispatch behavior instead of
+The five backend bugs below all gate full inference on Mistral 7B /
+GPT-OSS 20B at canonical contexts (`VRAM_BUDGET_PCT=30`,
+`n_ctx=4096`). None gate the planner-validation epic at the
+design level — Phase A/B and Tasks 5/6 are all PASS. These are
+backend-implementation issues filed for future-session work.
+
+### Layered VRAM-arena bugs (P1, filed by Closeout A)
+
+Three distinct walls discovered in sequence as each prior wall was
+peeled away. See `docs/plans/data/e1-rca/findings.md` Step 5 for the
+synthesis. **Owners needed: backend implementer.**
+
+- **Wall 1** — `llama.cpp-khcc0` (P1, OPEN): "[ggml-sycl]
+  graph_reserve OOM under patched runtime (err 39, arena chunk
+  > 1.5 GB cap)". Fix via vbuffer chunking on WEIGHT and KV zones
+  (the compute-buffer path already has it via `llama.cpp-w1rxh`,
+  closed 2026-04-22).
+- **Wall 2** — `llama.cpp-zhzbp` (P1, OPEN, amended in Closeout A):
+  "[KV-CLEAR] tiered_kv_buffer_clear hangs at first stream->memset
+  on patched compute-runtime". Replace per-layer
+  `stream->memset(...).wait()` loop with a single contiguous memset
+  across the arena-allocated KV region. Quick-fix attempt with
+  stream drain reverted; needs the contiguous-memset rewrite. Not
+  size-dependent; reproduces at 2 MiB per layer.
+- **Wall 3** — `llama.cpp-w2ptt` (P1, OPEN): "[ggml-sycl] GET_ROWS
+  OOR (err 40) after full arena reservation — runtime alloc
+  starvation". Fix via tightening RUNTIME-zone reservation in the
+  planner using Task 5's mini-context output as the runtime ceiling.
+
+### Task 5 follow-up: A3a mmap-path assert
+
+- **Bead**: `llama.cpp-jfj0v` (P2, OPEN): "[llama]
+  GGML_ASSERT(!ml.no_alloc) at src/llama-model.cpp:8686 blocks A3a
+  mmap-from-host fast path". Production A3a must either lift this
+  assert or carry the use_mmap=false constraint forward. Filed by
+  Closeout A from the Task 5 finding.
+
+### Other known follow-ups
+
+- **Task 2 architecture coverage** (P2, this team): re-run D0.2
+  generalization on a sliding-window-attention model (Gemma 2,
+  Mixtral) and a state-space model (Mamba / RWKV) once GGUFs are
+  present at `/Storage/GenAI/models/`. The "single-shape sizing
+  generalizes universally" claim retains its documented
+  architecture-coverage caveat until then. **Owner: this team
+  (planner-validation), low priority — pre-deployment hardening.**
+- **Task 3 §VRAM-insufficient policy rewrite** (P3, this team):
+  rewrite paragraph 4 of §VRAM-insufficient policy in the main plan
+  doc to describe the new CPU-dispatch behavior instead of
   preserving the deprecated host-pinned-spillover framing under a
-  banner.
+  banner. **Owner: this team, low priority — pure doc hygiene.**
 
 ## Status snapshot
 
 ```
 Phase A (Tasks 1, 2, 3):   3/3 complete + reviewed
 Phase B (Task 4):          complete; root cause narrowed (Task 10) and resolved (2026-04-24 patched runtime)
-Phase C (Tasks 5, 6, 7):   1/3 — Task 6 PASS; Task 5 not yet written; Task 7 gated on Task 14
-Phase D (Task 8):          this document
+Phase C (Tasks 5, 6, 7):   2/3 PASS — Task 5 PASS (333df7379), Task 6 PASS (D0.4), Task 7 DEFERRED on layered arena walls
+Phase D (Task 8 + Closeout B): this document
 E1 (Tasks 9-13):           Task 9 applied as strict improvement; Tasks 10/11/12/13 traced the issue; resolved upstream by patched compute-runtime (2026-04-24). E1 acceptance MET.
-Task 14 (in flight):       KV-alloc ceiling under patched runtime (different bug, doesn't reopen m09zb)
+Task 14 + zhzbp + Closeout-A walls 1+3: layered VRAM-arena bugs filed P0 for future-session backend work; do not reopen m09zb and do not block planner design.
 ```
 
-8 uncertainty items (state as of 2026-04-24): 4 fully validated, 2
-partially validated, 2 still in-progress (Task 5 prototype not yet
-written; Task 7 gated on Task 14 KV-alloc ceiling), 0 refuted.
+**Final session tally** (2026-04-24): 6 fully validated (1, 3, 4, 5,
+6, 8), 1 partially validated (2 — architecture coverage), 1 deferred
+(7 — gated on layered arena walls), 0 refuted. The
+planner-validation epic is COMPLETE at the design-validation level.
 
 The plan is no longer "plausible design backed by D0.2 PASS, blocked
 on E1" — it is "design backed by D0.2 + D0.3b + D0.4 PASS, with m09zb
