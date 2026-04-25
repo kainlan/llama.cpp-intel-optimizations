@@ -410,6 +410,12 @@ if (GGML_SYCL)
                           PRIVATE llama common)
     install(TARGETS test-planner-canary-direct-load RUNTIME)
 
+    add_executable(test-mini-context-prototype
+                   mini-context-prototype.cpp)
+    target_link_libraries(test-mini-context-prototype
+                          PRIVATE llama common)
+    install(TARGETS test-mini-context-prototype RUNTIME)
+
     # E1 RCA broader-envelope repro: stage-by-stage isolation of where
     # ggml_backend_sycl_init leaves the queue in a wedge-prone state.
     # Step-2 stages (init-no-probe, init-set-prefilled-stage) use sycl::queue
