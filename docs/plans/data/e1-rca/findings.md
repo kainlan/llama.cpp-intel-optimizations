@@ -423,13 +423,138 @@ This refutes ALL of the originally proposed fix shapes:
 - (C) "switch dpct queue construction" -- already refuted by Task 11; the
   bad state is at the L0 device level, not queue-specific.
 
-### Recommendation
+### Recommendation (superseded — see Step 4)
 
-Accept m09zb as upstream-blocked. The clean Intel bug-report writeup at
-the head of this document plus the Task 11/12/13 evidence is sufficient to
-file a comprehensive driver bug. Phase C tasks 5/6/7 should be deferred or
-re-scoped to not depend on E1 until upstream resolution.
+The Step 3 recommendation, written 2026-04-24, was to accept m09zb as
+upstream-blocked and file a comprehensive driver bug. **That conclusion
+no longer reflects the current state**: the patched compute-runtime
+build at `/Apps/compute-runtime` (branch `fix/combined-26.09`,
+libze_intel_gpu.so 1.14.37435) has been installed as the system default
+on 2026-04-25 and resolves m09zb. See **Step 4** below for the
+verifying evidence.
 
 The Task 9 fix at common.hpp:1863 (`event.wait()` -> `event.wait_and_throw()`)
 remains in place as a strict improvement -- async errors propagate properly
 even if it is not the m09zb fix.
+
+## Step 4: Patched runtime resolves m09zb (2026-04-25)
+
+**Status: m09zb is upstream-FIXED in our compute-runtime fork; that
+fork is now the system-default L0 GPU library via `dpkg-divert` +
+`ldconfig`.**
+
+### Paired test (stock vs patched libze)
+
+| Configuration | libze_intel_gpu.so version | Behavior | safe_max_alloc_size |
+|---|---|---|---|
+| Stock (pre-2026-04-25) | 1.14.37020 (Ubuntu/oneAPI default) | First H2D after `ggml_backend_sycl_init` wedges (m09zb signature) | 11024 MB (oversized, accepted by stock libze even though L0 cannot actually flush copies of this size) |
+| Patched (2026-04-25 onward) | 1.14.37435 (`fix/combined-26.09`) | First H2D after init returns cleanly; D0.4 canary PASSES | 1593 MB (correct ceiling — patched libze rejects oversized allocations rather than accepting and wedging) |
+
+The probe under stock libze claimed 11024 MB was allocatable; patched
+libze correctly reports 1593 MB. The probe was always reporting what
+libze told it; the bug was in stock libze's accepting allocations it
+could not actually flush copies on. Patched libze enforces the real
+ceiling, so the probe (and downstream `ggml_backend_sycl_init`) lands
+in a workable state.
+
+### D0.4 canary verification
+
+Under the patched runtime:
+- `tests/test-planner-canary-direct-load` runs to completion.
+- `tensor_set_us = 282422` (~282 ms for the canary's direct mmap →
+  device load — no hang).
+- Pre-patch: same canary timed out at 60 s.
+
+This validates A7's "direct mmap → device `ggml_backend_tensor_set`
+within 60 s with byte-identical readback" acceptance for the unified
+memory placement plan epic.
+
+### New wedge identified (Task 14)
+
+A separate wedge surfaced under the patched runtime: a single 4 GB KV
+buffer allocation exceeds the patched runtime's 1.5 GB single-alloc
+ceiling. This is a different failure mode (alloc rejection, not
+silent wedge) and is tracked separately as Task 14. It does **not**
+re-open m09zb.
+
+### Conclusion
+
+m09zb is **resolved**. No llama.cpp code change beyond Task 9's
+`event.wait_and_throw` strict improvement is required. The fix lives
+in our compute-runtime fork at `/Apps/compute-runtime` branch
+`fix/combined-26.09`, system-installed via `dpkg-divert` so every
+process on the host loads it transparently as
+`libze_intel_gpu.so.1`.
+
+Phase C tasks (5/6/7) of the planner-validation epic are now unblocked
+on the m09zb axis. The remaining gating item is Task 14 (KV alloc
+ceiling) for the subset of Phase C that allocates > 1.5 GB single
+buffers; smaller-context probes can run today.
+
+## Step 4: Patched compute-runtime + KV-clear sibling wedge (Task 14, 2026-04-24)
+
+**Status: m09zb proper is upstream-fixed in patched compute-runtime.
+Steps 1-3 above measured stock libze (1.14.37020) behavior. A different
+sibling wedge surfaces under patched libze (1.14.37435) and is filed as
+follow-up bead llama.cpp-zhzbp.**
+
+### Important context correction
+
+All Step-1/2/3 results above were collected against the stock system libze
+(`/usr/lib/x86_64-linux-gnu/libze_intel_gpu.so` -> 1.14.37020). The patched
+compute-runtime at `/Apps/compute-runtime/build-26.09` (1.14.37435) is now
+system-installed via dpkg-divert, so future tests automatically use it.
+The "upstream-blocked" recommendation in Step 3 was incorrect: m09zb
+proper IS fixed in our patched runtime, just under a different code path
+than my Tasks 12/13 attempted.
+
+### Patched runtime evidence (Task 14)
+
+| Test | Stock libze 1.14.37020 | Patched libze 1.14.37435 |
+|------|-------------------------|----------------------------|
+| Probe `safe_max_alloc_size` | 11024.8 MB (overestimate) | **1593.1 MB** (real cap) |
+| Total VRAM reported | 11605.2 MB | 12216.0 MB |
+| D0.4 canary | wedge | **PASS** (282 ms) |
+| Mistral 7B first H2D | wedge at `[HOST-ARENA] Zones configured` | OK; gets past zones, allocates KV |
+| Mistral 7B KV clear | (never reached) | **wedge at `tiered_kv_buffer_clear`** |
+
+The probe correctly converges to the real per-allocation cap on patched
+runtime (~1.5 GB on Arc B580). Stock returned a fictitious 11 GB cap whose
+allocations subsequently wedged.
+
+### New sibling wedge (filed as llama.cpp-zhzbp)
+
+Mistral 7B llama-completion now hangs at `ggml_backend_buffer_clear(buf, 0)`
+calling `tiered_kv_buffer_clear` (ggml-sycl.cpp:14802). The function
+iterates 32 transformer layers x 2 (k+v) calling
+`stream->memset(la.ptr, value, la.size).wait()` and one of the early
+calls hangs. **Not size-dependent** -- bisected n_ctx values:
+
+| n_ctx | KV size | Outcome |
+|-------|---------|---------|
+| 512   | 64 MiB  | wedge   |
+| 2048  | 256 MiB | wedge   |
+| 8192  | 1024 MiB| wedge   |
+| 16384 | 2048 MiB| wedge   |
+| default| 4096 MiB| wedge  |
+
+Even 2 MiB per layer hangs. Quick-fix attempt: `ctx->stream->wait_and_throw()`
+drain inserted before the per-layer memset loop -- did not clear the wedge
+(reverted).
+
+### Recommended fix shape (follow-up, NOT in this task's scope)
+
+Replace the per-layer `stream->memset(...).wait()` loop with a single
+contiguous memset across the arena-allocated KV region. The vmem_pool path
+at line 14807 already does this; extend to the non-vmem path when
+`alloc_base_is_arena == true`. Skip per-layer iteration when the layer
+allocations are contiguous sub-ranges of one arena alloc.
+
+### Implications for Phase C
+
+- Phase C tasks 5 / 7 do NOT run inference -- unaffected by zhzbp.
+- Phase C task 6 (D0.4 re-run) PASSES under patched runtime.
+- The "upstream-blocked" recommendation in Step 3 should NOT be applied as
+  the standing conclusion. The real conclusion is: m09zb proper is fixed,
+  one sibling wedge remains as a tracked P1 follow-up, Phase C is NOT
+  blocked on it.
