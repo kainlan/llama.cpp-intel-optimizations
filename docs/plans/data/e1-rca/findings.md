@@ -361,3 +361,75 @@ The earlier fix-shape candidates are deprecated by this finding:
 ### Recommended Task 12 (the actual E1 fix)
 
 Replace the probe call site at ggml-sycl.cpp:~9345 with the trivial 95% calculation, behind the same env-gate so it can be reverted for diagnostics. Verify against the same two probes used in Task 9: model load + D0.4 canary should both PASS. Phase C unblocks.
+
+## Step 3: Task 12 + Task 13 Negative Results (2026-04-24)
+
+**Status: Task 11 fix-shape recommendation REFUTED. The probe is not safely
+removable on this driver. Phase C remains gated; treating as upstream bug.**
+
+### Task 12 attempt: replace probe with `floor(probe_upper * 0.95)`
+
+Implemented exactly as Task 11 recommended: skip
+`ggml_backend_probe_max_alloc_size`, set `safe_alloc =
+floor(probe_upper * 0.95)`. Built clean. Validated:
+
+- `test-planner-canary-direct-load` (D0.4): **PASS** -- m09zb cleared,
+  tensor_set_us=223376 (~223 ms), readback ✓.
+- `llama-completion -m mistral-7b-v0.1.Q4_0.gguf -p '1, 2, 3, 4, 5,'
+  -n 15 --seed 42 --temp 0`: **FAIL** -- exit 134, aborted with
+  `level_zero backend failed with error: 40 (UR_RESULT_ERROR_OUT_OF_RESOURCES)`
+  inside `ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>` at
+  ggml-sycl.cpp:21339 on the FIRST graph compute, before producing any
+  tokens. Reproducible across multiple runs.
+
+The simple substitution clears m09zb on D0.4 but breaks Mistral 7B
+inference. Trade was NET-NEGATIVE -- swapping a documented P0 (m09zb wedge)
+for an undocumented P0 (Mistral 7B SIGABRT). Reverted; not committed.
+
+### Task 13 bisection: one-shot warmup at varying sizes
+
+Hypothesis: the probe's side effect was implicitly priming the L0 USM pool;
+a single alloc/free at `safe_alloc` would prime it without the 14-step
+binary-search trigger envelope.  Implemented and bisected with the
+`GGML_SYCL_E1_WARMUP_BYTES` env override:
+
+| Warmup size | m09zb wedge? | OOR at first MUL_MAT? | Mistral 7B outcome |
+|-------------|--------------|------------------------|---------------------|
+| 256 MB      | NO           | YES                    | SIGABRT (exit 134)  |
+| 512 MB      | NO           | YES                    | SIGABRT (exit 134)  |
+| 768 MB      | NO           | YES                    | SIGABRT (exit 134)  |
+| 1024 MB     | NO           | YES                    | SIGABRT (exit 134)  |
+| **1536 MB** | **YES**      | n/a (wedged earlier)   | TIMEOUT (exit 124)  |
+| 2 GB        | YES          | n/a                    | TIMEOUT             |
+| 4 / 6 / 8 GB| YES          | n/a                    | TIMEOUT             |
+| 11024 MB (Task 12 size) | YES | n/a                | TIMEOUT             |
+
+### Critical conclusion
+
+**There is no warmup size on Arc B580 + xe + oneAPI 2025.3 that satisfies
+both constraints simultaneously.**
+
+- The wedge threshold lives between 1024 MB and 1536 MB.  Below that, m09zb
+  does not fire.
+- The runtime-priming threshold lives somewhere above 1024 MB.  Below that,
+  the runtime hits OUT_OF_RESOURCES on the first MUL_MAT compute.
+- These thresholds **do not overlap**.  Empty window.
+
+This refutes ALL of the originally proposed fix shapes:
+- (A) "fresh sycl::queue for first set_tensor H2D" -- already refuted by
+  Task 10's `init-set-prefilled-stage` FAIL.
+- (B) "gate or shrink the alloc probe" -- the simple replacement (Task 12)
+  causes OOR; the warmup workaround (Task 13) cannot prime without wedging.
+- (C) "switch dpct queue construction" -- already refuted by Task 11; the
+  bad state is at the L0 device level, not queue-specific.
+
+### Recommendation
+
+Accept m09zb as upstream-blocked. The clean Intel bug-report writeup at
+the head of this document plus the Task 11/12/13 evidence is sufficient to
+file a comprehensive driver bug. Phase C tasks 5/6/7 should be deferred or
+re-scoped to not depend on E1 until upstream resolution.
+
+The Task 9 fix at common.hpp:1863 (`event.wait()` -> `event.wait_and_throw()`)
+remains in place as a strict improvement -- async errors propagate properly
+even if it is not the m09zb fix.
