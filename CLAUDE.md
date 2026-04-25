@@ -188,6 +188,20 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-backend-ops
 ```
 
+### Patched compute-runtime (system default as of 2026-04-25)
+
+The system `libze_intel_gpu.so.1` is the **patched** build at `/Apps/compute-runtime/build-26.09/bin/libze_intel_gpu.so.1.14.37435` (branch `fix/combined-26.09`). Installed via `dpkg-divert` so apt won't overwrite. The stock 1.14.37020 is preserved at `/usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1.14.37020.stock`.
+
+The patched runtime fixes the **m09zb wedge** (`event.wait()` post-init hang during alloc-probe). Reverting to stock will reintroduce that wedge. To revert if needed:
+
+```bash
+sudo dpkg-divert --rename --remove /usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1.14.37020
+sudo ln -sf libze_intel_gpu.so.1.14.37020 /usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1
+sudo ldconfig
+```
+
+The patched runtime correctly enforces per-allocation hardware caps (~1.5 GB on Arc B580), so the alloc probe in `ggml_sycl_init` returns a smaller `safe_max_alloc_size` (~1593 MB) than stock. **Hardcoding `floor(max * 0.95)` is not a substitute for the probe** — stock libze accepted oversize allocs that wedged at runtime; patched libze correctly fails them, and the probe converges on the real cap.
+
 ### SYCL Device Selection (Critical!)
 
 **WARNING**: On multi-GPU systems, you MUST explicitly select a single device. Without this, llama.cpp uses all visible GPUs and the unified kernel will **hang indefinitely**.

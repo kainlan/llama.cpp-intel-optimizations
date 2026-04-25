@@ -1,23 +1,12 @@
 {
   "canary_id": "D0.4",
-  "result": "INCONCLUSIVE",
-  "summary": "Canary cannot complete today: runtime execution wedges in ggml_backend_sycl_buffer_set_tensor (L0 event.wait hang) at the first ggml_backend_tensor_set call.",
-  "recommendation": "blocked_on_m09zb - rerun after E1 lands",
+  "result": "PASS",
+  "summary": "Direct mmap -> device tensor transfer works in one ggml_backend_tensor_set call",
+  "recommendation": "A7 can use ggml_backend_tensor_set for direct weight load; no host-pinned intermediate needed",
   "evidence": {
-    "reason": "blocked_on_m09zb",
-    "hang_location": "ggml/src/ggml-sycl/ggml-sycl.cpp:12685",
-    "function": "ggml_backend_sycl_buffer_set_tensor",
-    "caller_api": "ggml_backend_tensor_set",
-    "involves_llama_api": "no",
-    "involves_unified_cache": "no",
-    "involves_staging_pool": "no",
-    "same_L0_signature_as_m09zb": "yes",
-    "timeout_seconds_before_SIGTERM": "120",
-    "exit_code": "124",
-    "canary_builds": "yes",
-    "canary_runs_to_completion": "no",
-    "findings_written_by_canary": "no",
-    "resumes_when": "E1 lands (bead llama.cpp-m09zb)",
-    "what_this_would_test_when_unblocked": "direct mmap->device tensor_set with byte-identical readback, one call, measure tensor_set_us (includes queue submit + sync)"
+    "test_offset_in_file": "1048576",
+    "bytes_transferred": "4096",
+    "readback_matches_src": "YES",
+    "tensor_set_us": "282422"
   }
 }
