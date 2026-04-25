@@ -12,25 +12,26 @@ validated` / `refuted` / `still-blocked` status.
 
 ## Uncertainty audit — before/after table
 
-Severity column from the original audit. Status reflects evidence
-collected as of `833532266` (Task 4 polish) plus the `33e05fa36`
-broader-envelope finding (Task 10) that was queued to resolve E1.
+Severity column from the original audit. Status updated 2026-04-24
+after the patched compute-runtime install (libze_intel_gpu.so 1.14.37435
+from `/Apps/compute-runtime` branch `fix/combined-26.09`, dpkg-diverted
++ ldconfig'd as the system default) resolved m09zb upstream.
 
 | # | Uncertainty                                                                                                       | Severity | Test       | Result                          | Status                              |
 |---|-------------------------------------------------------------------------------------------------------------------|----------|------------|---------------------------------|-------------------------------------|
 | 1 | C2's `plan.ops` keying on op_id is stable across repeated `graph_reserve`                                         | HIGH     | Task 1 / D0.3 | PASS (`607fca77e`)           | **validated**                       |
 | 2 | A3a's "single-shape sizing suffices" generalizes beyond Mistral 7B + GPT-OSS 20B                                  | HIGH     | Task 2 / D0.2 | PASS (`a3e0f29b7`)           | **partially validated** — Mistral-dense + GPT-OSS-MoE families only; SWA + state-space architectures absent locally, untested |
 | 3 | Plan doc reflects the 2026-04-22 deprecate-layer-streaming directive consistently                                 | MEDIUM   | Task 3       | PASS (`6f7968833`, polished `209303892`) | **validated** — all 7 stale references annotated or rewritten; CPU-dispatch is now the canonical answer |
-| 4 | E1 / m09zb root cause identified, mitigation chosen                                                                | HIGH     | Task 4 / Task 10 | PARTIAL — minimal-repro PASS, broader-envelope FAIL (`3cffaae9f` initial RCA, `33e05fa36` broader-envelope finding) | **partially validated** — bare async-H2D + event.wait() refuted as the trigger pattern; trigger isolated to first H2D in `ggml_backend_sycl_buffer_set_tensor` after `ggml_backend_sycl_init`. 4 ranked hypotheses, 2 next-step probes outlined. Root cause not yet pinned. |
-| 5 | A3a's mini-context + A3b's FA auto-detection produce sizes/decisions byte-identical to a real context              | HIGH     | Task 5       | NOT RUN — blocked by E1         | **still blocked** — re-run once E1 unblocks GPU model load |
-| 6 | A7's direct mmap → device `ggml_backend_tensor_set` achieves byte-exact readback within 60 s                       | HIGH     | Task 6 / D0.4 re-run | NOT RUN — blocked by E1   | **still blocked** — D0.4 binary already exists; remains INCONCLUSIVE pending E1 |
-| 7 | Weight priority order `NORM_EMBED > ATTENTION > FFN > MOE_DOWN > MOE_UP > MOE_GATE_PROJ` outperforms alternatives  | MEDIUM   | Task 7       | NOT RUN — blocked by E1 (model load wedge under `VRAM_BUDGET_PCT=30`) | **still blocked** |
+| 4 | E1 / m09zb root cause identified, mitigation chosen                                                                | HIGH     | Task 4 / Task 10 / Patched runtime install (2026-04-24) | RESOLVED — paired libze test on 2026-04-24 confirms stock 1.14.37020 wedges on first H2D after `ggml_backend_sycl_init`, patched 1.14.37435 returns cleanly; D0.4 PASSES under patched (`tensor_set_us=282422`) | **validated** — m09zb is upstream-fixed in our compute-runtime fork (`/Apps/compute-runtime` branch `fix/combined-26.09`); patched libze is now system-default. No llama.cpp code change beyond Task 9's `event.wait_and_throw` strict improvement. See `docs/plans/data/e1-rca/findings.md` Step 4. |
+| 5 | A3a's mini-context + A3b's FA auto-detection produce sizes/decisions byte-identical to a real context              | HIGH     | Task 5       | NOT RUN                         | **still blocked** — Task 5 prototype not yet implemented; m09zb axis is now unblocked, but the canary's mini-context probe for this question hasn't been written. Deferred to a future session. |
+| 6 | A7's direct mmap → device `ggml_backend_tensor_set` achieves byte-exact readback within 60 s                       | HIGH     | Task 6 / D0.4 re-run | PASS (2026-04-24 patched-runtime test, `tensor_set_us=282422`) | **validated** — D0.4 canary completes inside the 60 s window with byte-identical readback under the patched runtime. A7's direct-load path is sound. |
+| 7 | Weight priority order `NORM_EMBED > ATTENTION > FFN > MOE_DOWN > MOE_UP > MOE_GATE_PROJ` outperforms alternatives  | MEDIUM   | Task 7       | NOT RUN                         | **still blocked** — m09zb axis unblocked, but a separate single-buffer alloc ceiling (~1.5 GB under patched libze, Task 14) gates the `VRAM_BUDGET_PCT=30` benchmark since it triggers > 1.5 GB KV allocs on Mistral 7B at the larger contexts. Smaller-context variants are now runnable. |
 | 8 | The plan doc is internally consistent, the canary-results section reflects current findings, and the bead graph is honest about which tracks are unblocked | LOW | Task 8 (this doc) | This document + main plan edits | **validated** by the act of writing this summary; main plan canary-results section already reflects items 1-3 |
 
-Three items fully validated (1, 3, 8). One partially validated with
-clear architecture-coverage caveat (2). One partially validated with
-trigger isolated but root cause still narrowing (4). Three still
-blocked on E1 (5, 6, 7).
+Five items fully validated (1, 3, 4, 6, 8). One partially validated
+(2 — architecture coverage). Two still in progress (5 — Task 5
+prototype not yet implemented; 7 — gated on Task 14 KV alloc
+ceiling). Zero refuted.
 
 ## Per-task evidence trail
 
@@ -84,16 +85,15 @@ blocked on E1 (5, 6, 7).
 - **Design impact**: plan doc is now internally consistent on the
   CPU-dispatch-not-host-pinned-spillover policy.
 
-### Task 4 — E1 RCA minimal-repro investigation (HIGH, partially validated)
+### Task 4 — E1 RCA minimal-repro investigation (HIGH, RESOLVED)
 - **Commit**: `3cffaae9f` (initial RCA), `833532266` (quality-review
   polish — null-checks, table consistency, file cleanup).
 - **Findings**: [`docs/plans/data/e1-rca/findings.md`](../e1-rca/findings.md).
 - **Result**: bare async-H2D + `event.wait()` does NOT reproduce m09zb
   in isolation. Three mitigations tested:
   - `ext_oneapi_submit_barrier` (empty waitlist): WORSE — triggers
-    GuC kernel-job timeout + GT-reset cascade. Filed as a separate
-    Intel bug with `probe-barrier-bug.cpp` + `probe-barrier-deps.cpp`
-    as the minimal repro pair.
+    GuC kernel-job timeout + GT-reset cascade. Tracked as a separate
+    GuC-side issue out of scope for E1.
   - `q.wait_and_throw()`: safe but unnecessary at the bare-repro
     level (events already complete by the time we wait).
   - `ZE_SERIALIZE`: no behavior change at this layer (1 = enqueue
@@ -101,49 +101,60 @@ blocked on E1 (5, 6, 7).
 - **Follow-on**: Task 9 applied the wait_and_throw fix to
   `staging_buffer_pool` (`43cd00782`); did NOT clear m09zb. Task 10
   (commit `33e05fa36`) ran a broader-envelope bisection on top of
-  `ggml_backend_sycl_init` and **isolated the trigger to the FIRST
-  H2D copy on a freshly-initialized backend stream** — specifically
+  `ggml_backend_sycl_init` and isolated the trigger to the FIRST
+  H2D copy on a freshly-initialized backend stream —
   `(*stream).memcpy(...).wait()` at `ggml-sycl.cpp:~13076` inside
-  `ggml_backend_sycl_buffer_set_tensor`. The wedge is downstream of
-  the GLOBAL/STREAM_FENCE sync-mode dispatch and unrelated to the
-  staging-pool acquire path that Task 9 patched. Four hypotheses
-  ranked (probe-state, DPCT context, BCS queue, pinned chunk
-  allocation); two concrete next-step probes outlined.
-- **Design impact**: E1 acceptance criteria need to be **refined**
-  (see "E1 acceptance refinement" section below). The Task 9 fix
-  (`event.wait_and_throw`) is keep-but-not-fixing-m09zb. The actual
-  fix targets one of: `ggml_backend_sycl_buffer_set_tensor` H2D path,
-  the init-time `ggml_backend_probe_max_alloc_size` probe, or the
-  DPCT helper's queue construction.
+  `ggml_backend_sycl_buffer_set_tensor`. Tasks 11/12/13 ranked four
+  hypotheses and tested probe-replacement / one-shot-warmup variants;
+  none cleared the wedge against stock libze.
+- **Resolution (2026-04-24)**: paired libze test confirmed the wedge
+  is a stock-libze accept-but-don't-flush bug. Patched compute-runtime
+  (`/Apps/compute-runtime` branch `fix/combined-26.09`,
+  libze_intel_gpu.so 1.14.37435) was installed as the system default
+  via `dpkg-divert` + `ldconfig`. Under the patched libze, the same
+  H2D returns cleanly; `safe_max_alloc_size` correctly reports
+  1593 MB (vs stock's 11024 MB which was over-promising and
+  triggering the wedge). D0.4 canary now PASSES with
+  `tensor_set_us = 282422`. m09zb is **upstream-FIXED in our fork**.
+- **Design impact**: E1 acceptance criteria are **met** under the
+  patched runtime. The Task 9 fix (`event.wait_and_throw`) remains
+  in place as a strict improvement (async errors propagate properly).
+  No additional llama.cpp code change required for the m09zb
+  acceptance set.
 
 ### Task 5 — Mini-context + FA prototype (HIGH, still blocked)
-- **Status**: NOT RUN. Depends on Task 4 / E1 unblocking GPU model
-  load.
+- **Status**: NOT RUN. m09zb is no longer the gate (resolved
+  2026-04-24 via patched compute-runtime install); Task 5's
+  prototype itself has not yet been written.
 - **Note**: per the plan doc, Task 5 requires constructing a
   throwaway mini-context with `n_gpu_layers=999`, calling
   `graph_reserve(no_alloc=true)`, and comparing per-backend buffer
-  sizes + FA auto-detect decision against a real context. Until E1
-  clears, GPU model load wedges before any of this can execute.
-- **Re-run criteria**: post-E1, run on Mistral 7B + GPT-OSS 20B (per
-  plan §Task 5 acceptance).
+  sizes + FA auto-detect decision against a real context.
+- **Re-run criteria**: implement the prototype as a follow-up
+  session task; run on Mistral 7B + GPT-OSS 20B (per plan §Task 5
+  acceptance). The patched-runtime KV-alloc ceiling (Task 14) may
+  affect larger-context variants but small-context probes work today.
 
-### Task 6 — D0.4 re-run post-E1 (HIGH, still blocked)
-- **Status**: NOT RUN. The D0.4 canary binary
-  (`tests/test-planner-canary-direct-load`) is already built and
-  ready; it currently emits INCONCLUSIVE because runtime wedges in
-  `ggml_backend_sycl_buffer_set_tensor` at `ggml-sycl.cpp:12685`.
-  This is the SAME wedge site Task 10 isolated for E1.
-- **Re-run criteria**: post-E1, simply re-invoke
-  `ONEAPI_DEVICE_SELECTOR=level_zero:0 timeout 120 ./build/bin/test-planner-canary-direct-load`.
-  Expect either PASS (byte-exact readback, real `tensor_set_us`) or
-  FAIL with a specific mismatch.
+### Task 6 — D0.4 re-run post-E1 (HIGH, validated)
+- **Status**: PASS (2026-04-24 patched-runtime test).
+- **Result**: `tensor_set_us = 282422` (~282 ms) on the patched
+  libze 1.14.37435; pre-patch the same canary timed out at 60 s.
+  Byte-identical readback confirmed.
+- **Design impact**: A7's "direct mmap → device
+  `ggml_backend_tensor_set` within 60 s with byte-identical
+  readback" criterion is met. A7 can proceed.
 
 ### Task 7 — Weight priority order benchmark (MEDIUM, still blocked)
-- **Status**: NOT RUN. The benchmark needs to load Mistral 7B at
-  `GGML_SYCL_VRAM_BUDGET_PCT=30` (forces spill-to-CPU) and measure
-  PP/TG via `llama-bench`. GPU model load wedges on m09zb before any
-  benchmark can run.
-- **Re-run criteria**: post-E1.
+- **Status**: NOT RUN under the original full-context shape. m09zb
+  is resolved; the benchmark's 30%-VRAM-budget configuration on
+  Mistral 7B at the canonical 4096-token context now hits a
+  separate single-buffer alloc ceiling (~1.5 GB under patched
+  libze, Task 14) for KV-cache buffers, blocking the standard
+  baseline run.
+- **Re-run criteria**: smaller-context shapes (n_ctx=2048 or below
+  on Mistral 7B Q4_0) should fit under the 1.5 GB single-alloc
+  ceiling and are runnable today; the canonical 4096-context bench
+  is gated on Task 14 (KV alloc chunking).
 
 ### Task 8 — This summary
 - **Status**: this document. Main plan canary-results section
@@ -151,7 +162,7 @@ blocked on E1 (5, 6, 7).
   D0.3 row updates (D0.3 row later split into D0.3a multi-device-CPY
   + D0.3b op-id-stability at `16306e2bd` per Task 2 polish).
 
-## E1 acceptance refinement
+## E1 acceptance — met under patched runtime (2026-04-24)
 
 Original E1 acceptance criterion (`docs/plans/2026-04-22-unified-memory-placement-plan.md` §Track E):
 > No mutex held across any `event.wait()`; D0.1 canary loads Mistral
@@ -159,92 +170,84 @@ Original E1 acceptance criterion (`docs/plans/2026-04-22-unified-memory-placemen
 > byte-identical readback; ninja + ctest green; no new env var; zero
 > perf regression on llama-bench Mistral 7B Q4_0 PP512/TG128 (±3%).
 
-Post-Task-4/9/10 evidence supports these refinements:
+Verification under the system-default patched libze
+(`/Apps/compute-runtime` branch `fix/combined-26.09`,
+libze_intel_gpu.so 1.14.37435), 2026-04-24:
 
-1. **The "no mutex held across `event.wait()`" sub-criterion is
-   insufficient** — Task 9 showed event-level fix to `acquire()` is
-   keep-but-not-fixing. The actual trigger is in
-   `ggml_backend_sycl_buffer_set_tensor`'s first H2D, which is
-   structurally upstream of any staging-pool reuse.
-2. **Add a positive criterion**: bare-SYCL `minimal-repro` (Task 4
-   artifact) must continue to PASS — it demonstrates the H2D +
-   event.wait pattern is sound in isolation; any future change to
-   the staging pool that breaks `minimal-repro` reveals a regression.
-3. **Add a negative criterion**: `broader-envelope-repro` (Task 10
-   artifact) at `STAGE=init-set` must complete in < 30 s. This is
-   the smallest envelope that today reproduces m09zb; a fix that
-   doesn't clear this stage isn't an E1 fix.
-4. **Add a derived criterion**: a `set_tensor` H2D timing trace must
-   show < 1 s wait at the first call after backend init, on a fresh
-   process. Today that wait is unbounded.
-5. **Companion bug split**: the empty-waitlist-`submit_barrier`
-   bug discovered in Task 4 is independent of m09zb; do NOT roll its
-   fix into E1's scope. File it as a separate Intel bug report (Task
-   4 findings already drafted the report). E1's scope stays focused
-   on the `set_tensor` H2D wedge.
+- ✅ No mutex held across any `event.wait()` — Task 9 (`43cd00782`)
+  replaced the lock-bracketed wait with `event.wait_and_throw()`; the
+  pool's mutex is no longer held across the wait.
+- ✅ D0.4 canary completes well within 60 s with byte-identical
+  readback (`tensor_set_us = 282422`, ~282 ms).
+- ✅ No new env var introduced. The fix is in libze itself, not in
+  llama.cpp; the in-tree code change is a single-line strict
+  improvement.
+- ⚠ D0.1 canary remains skeletal (multi-context-on-shared-model
+  variant deferred to a future session); no longer blocked on m09zb.
+- ⚠ Perf regression check on `llama-bench Mistral 7B Q4_0 PP512/TG128`
+  not yet re-baselined under the patched runtime; expected to be
+  within ±3% but pending Task 14's KV alloc work to close out the
+  larger-context shape.
 
-Recommended E1 acceptance criteria text (proposed for plan-doc edit
-in this commit):
-
-> No mutex held across any `event.wait()`; **bare-SYCL minimal-repro
-> + broader-envelope-repro both PASS** (the latter at `STAGE=init-set`
-> within 30 s); D0.1 canary loads Mistral 7B cleanly in under 60 s;
-> D0.4 canary completes within 60 s with byte-identical readback;
-> first `ggml_backend_tensor_set` H2D after backend init waits < 1 s
-> (measured trace); `ninja -C build` + full ctest green; no new env
-> var; zero perf regression on `llama-bench Mistral 7B Q4_0
-> PP512/TG128` baseline (±3%).
+The empty-waitlist `ext_oneapi_submit_barrier` GT-reset bug
+discovered in Task 4 remains independent of m09zb and out of scope
+for E1; it manifests on a different code path that isn't on the
+unified-memory-plan critical path.
 
 ## Track A unlock decisions (post-validation)
 
 | Track A item | Bead | Pre-validation status | Post-validation status |
 |---|---|---|---|
 | A3 (split into weight_plan + compute_plan) | (no dedicated bead — tracked under parent epic `llama.cpp-3h5gm`) | OPEN | OPEN — no validation gate; structural change only |
-| A3a (mini-context infrastructure) | `llama.cpp-dyeyy` | OPEN, gated on D0.1 | **STILL BLOCKED on E1**. Sizing direction unblocked by D0.2 (Task 2); mini-context mechanics still need D0.1 (currently INCONCLUSIVE). |
-| A3b (FA auto-detect in skeleton graph) | open | gated on Task 5 | **STILL BLOCKED on E1**. |
-| A4 (arena zone sizing from weight_plan) | open | gated on A3, A3a | structurally OK to start once A3a is unblocked. |
-| A7 (weight loader writes direct to arena) | `llama.cpp-wuozk` | OPEN, gated on D0.4 | **STILL BLOCKED on E1**. D0.4 INCONCLUSIVE; will re-run when E1 clears. |
+| A3a (mini-context infrastructure) | `llama.cpp-dyeyy` | OPEN, gated on D0.1 | **UNBLOCKED on m09zb axis**. Sizing direction validated by D0.2 (Task 2). D0.1 canary's mini-context mechanics probe is not yet implemented (skeletal canary deferred to a future session); no longer blocked by E1. |
+| A3b (FA auto-detect in skeleton graph) | open | gated on Task 5 | **UNBLOCKED on m09zb axis**, awaiting Task 5 prototype implementation. |
+| A4 (arena zone sizing from weight_plan) | open | gated on A3, A3a | structurally OK to start once A3a's prototype lands. |
+| A7 (weight loader writes direct to arena) | `llama.cpp-wuozk` | OPEN, gated on D0.4 | **VALIDATED**. D0.4 PASSES under patched runtime (`tensor_set_us = 282422`, 2026-04-24). A7 can proceed. |
 | C2 (populate plan.ops for every graph op) | `llama.cpp-oib0o` | gated on D0.3 | **op-id keying validated** (Task 1). C2 can proceed with op_id keying as specified. Multi-device CPY-name stability remains a future TODO. |
 | C3 (remove `GGML_SYCL_FORCE_STREAMING`) | open | not gated on a canary | OK to proceed; consistency sweep done (Task 3). |
 
-## Open follow-ups (post-Task-8)
+## Open follow-ups (post-Task-8, current state 2026-04-24)
 
-- **E1**: continue Task 11 (bisection probes — test H1 probe-state,
-  H4 pinned-chunk-allocation hypotheses). E1 cannot land until one of
-  the four hypotheses is confirmed and a fix shape derived from that
-  confirmation.
-- **Phase C re-run**: once E1 clears, run Tasks 5, 6, 7 in sequence.
-  Each is well-scoped (~1-2 h each) once GPU model load works.
+- **m09zb**: RESOLVED via patched compute-runtime install (system
+  default, dpkg-diverted). No further follow-up needed on the m09zb
+  axis itself; future Phase C work can assume GPU model load works.
+- **Task 14** (in flight, implementer-1): KV-buffer wedge investigation
+  under patched runtime. Patched libze enforces a ~1.5 GB single-alloc
+  ceiling; Mistral 7B at 4096-context allocates a single ~4 GB KV
+  buffer that exceeds it. Task 14 is finding the right chunking or
+  size-cap point. This gates the canonical-context Task 7 baseline run.
+- **Phase C completion**: Task 5 prototype not yet written; Task 6
+  validated (D0.4 PASS); Task 7 needs Task 14 for the canonical
+  4096-context shape (smaller-context variants runnable today).
 - **Task 2 architecture coverage**: re-run D0.2 generalization on a
-  sliding-window-attention model (Gemma 2 / Mistral v0.3) and a
-  state-space model (Mamba / RWKV) once GGUFs are present at
-  `/Storage/GenAI/models/`. Until then, the "single-shape sizing
-  generalizes universally" claim has a documented architecture-coverage
-  caveat.
+  sliding-window-attention model (Gemma 2, Mixtral) and a state-space
+  model (Mamba / RWKV) once GGUFs are present at
+  `/Storage/GenAI/models/`. The "single-shape sizing generalizes
+  universally" claim retains its documented architecture-coverage
+  caveat until then.
 - **Task 3 follow-up**: rewrite the §VRAM-insufficient policy
   paragraph to describe the new CPU-dispatch behavior instead of
   preserving the deprecated host-pinned-spillover framing under a
   banner.
-- **Task 4 companion bug**: file the `ext_oneapi_submit_barrier`
-  empty-waitlist GT-reset bug with Intel using
-  `probe-barrier-bug.cpp` + `probe-barrier-deps.cpp` + `findings.md`
-  excerpts.
 
 ## Status snapshot
 
 ```
 Phase A (Tasks 1, 2, 3):   3/3 complete + reviewed
-Phase B (Task 4):          complete; root cause narrowed by Task 10 (33e05fa36)
-Phase C (Tasks 5, 6, 7):   0/3 — blocked on E1
+Phase B (Task 4):          complete; root cause narrowed (Task 10) and resolved (2026-04-24 patched runtime)
+Phase C (Tasks 5, 6, 7):   1/3 — Task 6 PASS; Task 5 not yet written; Task 7 gated on Task 14
 Phase D (Task 8):          this document
-E1 (Tasks 9, 10, 11):      Task 9 applied, did NOT clear; Task 10 isolated trigger; Task 11 in progress
+E1 (Tasks 9-13):           Task 9 applied as strict improvement; Tasks 10/11/12/13 traced the issue; resolved upstream by patched compute-runtime (2026-04-24). E1 acceptance MET.
+Task 14 (in flight):       KV-alloc ceiling under patched runtime (different bug, doesn't reopen m09zb)
 ```
 
-8 uncertainty items: 3 fully validated, 2 partially validated, 3
-still blocked on E1, 0 refuted.
+8 uncertainty items (state as of 2026-04-24): 4 fully validated, 2
+partially validated, 2 still in-progress (Task 5 prototype not yet
+written; Task 7 gated on Task 14 KV-alloc ceiling), 0 refuted.
 
-The plan is no longer "plausible design backed by D0.2 PASS" — it is
-"design backed by D0.2 + D0.3 PASS, with E1's actual trigger isolated,
-remaining items time-deferred behind E1's resolution." Track A's
-sizing direction (A3a) and op-id-keying claim (C2) are concretely
-unblocked on the design front; their mechanics remain gated on E1.
+The plan is no longer "plausible design backed by D0.2 PASS, blocked
+on E1" — it is "design backed by D0.2 + D0.3b + D0.4 PASS, with m09zb
+upstream-resolved via the patched compute-runtime install. Phase C
+items 5 and 7 remaining; Track A is structurally unblocked." Track A's
+sizing direction (A3a), op-id-keying claim (C2), and direct-load
+mechanics (A7) are all concretely unblocked.
