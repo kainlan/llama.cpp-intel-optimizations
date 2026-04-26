@@ -14809,6 +14809,24 @@ static void tiered_kv_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) 
         return;
     }
 
+    // llama.cpp-zhzbp: when alloc_base is the contiguous arena KV zone
+    // covering all on-device layers (n_host_layers == 0 && arena_kv_active),
+    // mirror the vmem branch above with a single memset + one .wait().  The
+    // per-layer loop below would issue 32+ stream->memset(...).wait() calls
+    // back-to-back; under patched libze 1.14.37435 the second-or-later
+    // .wait() in that loop wedges (size-independent: 64 MiB through 4 GiB
+    // all hang).  alloc_base_is_arena is set in tiered_kv_buft_alloc_buffer
+    // (assignment site at ggml-sycl.cpp:15364) only when every layer is
+    // sourced from the contiguous arena KV zone (gate also requires
+    // n_arena_layers == n_layers, so per-layer sycl::malloc_device fallbacks
+    // under VRAM pressure correctly drop to the per-layer loop below), so a
+    // single device memset across [alloc_base, alloc_base + alloc_base_size)
+    // is safe.
+    if (ctx->alloc_base_is_arena) {
+        SYCL_CHECK(CHECK_TRY_ERROR(ctx->stream->memset(ctx->alloc_base, value, ctx->alloc_base_size).wait()));
+        return;
+    }
+
     // Clear each per-layer allocation individually.
     // Device layers use GPU queue memset; host layers use CPU memset.
     for (auto & la : ctx->layer_allocs) {
@@ -15237,6 +15255,21 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
 
     layout = mgr.compute_region_layout(size);
 
+    // Count arena-sourced layers up front so the alloc_base_is_arena gate can
+    // require *every* layer be in the arena KV zone — see llama.cpp-zhzbp:
+    // tiered_kv_buffer_clear() relies on alloc_base_is_arena to do a single
+    // contiguous device memset across [alloc_base, alloc_base + alloc_base_size),
+    // which is only safe if all layers actually live in that span.  Under VRAM
+    // pressure n_device_layers can equal n_layers while some layers are
+    // per-layer sycl::malloc_device fallbacks rather than arena sub-allocations
+    // (zone_h.ptr is null in that case).
+    uint32_t n_arena_layers = 0;
+    for (const auto & la : layer_allocs) {
+        if (la.zone_h.ptr) {
+            n_arena_layers++;
+        }
+    }
+
     // When ALL layers are on device from contiguous arena KV zone, use the
     // first layer's arena pointer as alloc_base — no synthetic base needed.
     // This eliminates init_tensor remapping and ensures tensors (including
@@ -15246,7 +15279,7 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
     void *       alloc_base          = nullptr;
     bool         alloc_base_is_arena = false;
 
-    if (arena_kv_active && n_host_layers == 0 && n_device_layers == n_layers) {
+    if (arena_kv_active && n_host_layers == 0 && n_device_layers == n_layers && n_arena_layers == n_layers) {
         // All layers are contiguous in arena KV zone — use first layer's ptr
         alloc_base          = layer_allocs[0].ptr;
         alloc_base_is_arena = true;
@@ -15306,13 +15339,8 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
         }
     }
 
-    // Count arena-sourced layers for logging.
-    uint32_t n_arena_layers = 0;
-    for (const auto & la : layer_allocs) {
-        if (la.zone_h.ptr) {
-            n_arena_layers++;
-        }
-    }
+    // n_arena_layers was hoisted above (used by the alloc_base_is_arena gate);
+    // reused here for the placement summary log line.
 
     // Log placement summary
     if (n_device_layers == 0) {
