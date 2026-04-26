@@ -20,7 +20,7 @@ from `/Apps/compute-runtime` branch `fix/combined-26.09`, dpkg-diverted
 | # | Uncertainty                                                                                                       | Severity | Test       | Result                          | Status                              |
 |---|-------------------------------------------------------------------------------------------------------------------|----------|------------|---------------------------------|-------------------------------------|
 | 1 | C2's `plan.ops` keying on op_id is stable across repeated `graph_reserve`                                         | HIGH     | Task 1 / D0.3 | PASS (`607fca77e`)           | **validated**                       |
-| 2 | A3a's "single-shape sizing suffices" generalizes beyond Mistral 7B + GPT-OSS 20B                                  | HIGH     | Task 2 / D0.2 | PASS (`a3e0f29b7`)           | **partially validated** — Mistral-dense + GPT-OSS-MoE families only; SWA + state-space architectures absent locally, untested |
+| 2 | A3a's "single-shape sizing suffices" generalizes beyond Mistral 7B + GPT-OSS 20B                                  | HIGH     | Task 2 / D0.2 | PASS for tested families; state-space open | **partially validated** — Mistral dense/full-attention + GPT-OSS active SWA+MoE validated; state-space absent locally and untested, and SYCL lacks `GGML_OP_SSM_SCAN` support/routing for Mamba/Plamo2 graphs |
 | 3 | Plan doc reflects the 2026-04-22 deprecate-layer-streaming directive consistently                                 | MEDIUM   | Task 3       | PASS (`6f7968833`, polished `209303892`) | **validated** — all 7 stale references annotated or rewritten; CPU-dispatch is now the canonical answer |
 | 4 | E1 / m09zb root cause identified, mitigation chosen                                                                | HIGH     | Task 4 / Task 10 / Patched runtime install (2026-04-24) | RESOLVED — paired libze test on 2026-04-24 confirms stock 1.14.37020 wedges on first H2D after `ggml_backend_sycl_init`, patched 1.14.37435 returns cleanly; D0.4 PASSES under patched (`tensor_set_us=282422`) | **validated** — m09zb is upstream-fixed in our compute-runtime fork (`/Apps/compute-runtime` branch `fix/combined-26.09`); patched libze is now system-default. No llama.cpp code change beyond Task 9's `event.wait_and_throw` strict improvement. See `docs/plans/data/e1-rca/findings.md` Step 4. |
 | 5 | A3a's mini-context + A3b's FA auto-detection produce sizes/decisions byte-identical to a real context              | HIGH     | Task 5       | PASS (`333df7379`, 2026-04-24) | **validated** — fork+exec'd 3-worker prototype (real-A, real-B, mini=`no_alloc=true,use_mmap=false`) produced byte-identical compute-buffer sizes + FA verdict on Mistral 7B (115.01 MiB, FA=enabled) and GPT-OSS 20B (398.38 MiB, FA=enabled). Mmap-path assert at `src/llama-model.cpp:8686` requires `use_mmap=false` for the mini worker — flagged as A3a production constraint. |
@@ -28,11 +28,17 @@ from `/Apps/compute-runtime` branch `fix/combined-26.09`, dpkg-diverted
 | 7 | Weight priority order `NORM_EMBED > ATTENTION > FFN > MOE_DOWN > MOE_UP > MOE_GATE_PROJ` outperforms alternatives  | MEDIUM   | Task 7       | DEFERRED                        | **deferred** — m09zb axis unblocked, but the full inference path through `VRAM_BUDGET_PCT=30` traverses three layered VRAM-arena bugs identified by Closeout A: graph_reserve OOM err 39 (Wall 1), KV-clear wedge `llama.cpp-zhzbp` (Wall 2), GET_ROWS OOR err 40 (Wall 3). All three need to land before the canonical 4096-context bench can run. See `docs/plans/data/e1-rca/findings.md` Step 5. |
 | 8 | The plan doc is internally consistent, the canary-results section reflects current findings, and the bead graph is honest about which tracks are unblocked | LOW | Task 8 (this doc) | This document + main plan edits | **validated** by the act of writing this summary; main plan canary-results section already reflects items 1-3 |
 
-**Final session tally**: six items fully validated (1, 3, 4, 5, 6, 8).
-One partially validated (2 — architecture coverage caveat for SWA +
-state-space). One deferred (7 — gated on the three layered VRAM-arena
-bugs filed by Closeout A; not a planner-design issue, an
-arena-implementation issue). Zero refuted.
+**2026-04-25 correction**: item 2 remains partially validated, but the
+state-space caveat is stronger than "no local fixture": SYCL has no
+`GGML_OP_SSM_SCAN` support/routing while Mamba/Plamo2 graphs emit
+`ggml_ssm_scan`. D0.1 had stale proof artifacts that have since been replaced.
+D0.3a now has current multi-device evidence and changes the C2 contract:
+scheduler transfers are stable copy-edge tensors, not `GGML_OP_CPY` nodes.
+
+**Final session tally**: dense/full-attention and GPT-OSS active SWA+MoE sizing
+are validated; state-space, scheduler-transfer implementation, priority
+benchmark, CPU-dispatch-vs-streaming policy, and unified-cache-only ownership
+remain open proof/work areas.
 
 ## Per-task evidence trail
 
@@ -45,30 +51,35 @@ arena-implementation issue). Zero refuted.
   1031-node sequences, every (op_id, op_type, name) triple
   byte-identical across runs.
 - **Design impact**: C2 (`llama.cpp-oib0o`) can proceed with op_id
-  keying as specified. The original multi-device CPY-name scope is
-  preserved as a `todo_multidevice` evidence key in the canary
-  findings — still requires ≥2 SYCL devices safely usable on this
-  host (B50 disabled per `feedback_disable_b50.md`) AND E1 to land
-  before re-run.
+  keying for single-device graph ops. D0.3a refutes the old multi-device
+  CPY-node assumption: the synthetic two-GPU scheduler proof exposes
+  stable split-input copy-edge tensors (`SYCL1#...#0`) but no
+  `GGML_OP_CPY` nodes. C2 must plan scheduler transfer edges explicitly.
+  See [`d0.3-cpy-visibility.md`](d0.3-cpy-visibility.md) and
+  [`d0.3a-multidevice-cpy-visibility.md`](d0.3a-multidevice-cpy-visibility.md).
 
 ### Task 2 — D0.2 multi-model generalization (HIGH, partially validated)
 - **Commit**: `a3e0f29b7`.
 - **Findings**: [`d0.2-generalization.md`](d0.2-generalization.md).
 - **Result**: PASS across all 5 locally-runnable variants. Mistral 7B
   Q4_0 / Q2_K / Q3_K_M / Q4_K_M / Q8_0 all produce a 13-op set with
-  PP == TG; GPT-OSS 20B baseline reproduces with the 17-op MoE-extended
-  set. Quantization format does NOT perturb op enumeration (expected
+  PP == TG; GPT-OSS 20B baseline reproduces with the 17-op active
+  SWA+MoE-extended set. Quantization format does NOT perturb op enumeration (expected
   — dequant is internal to MUL_MAT, not a separate op).
 - **Architecture-coverage caveat**: `/Storage/GenAI/models/` has only
-  Mistral 7B v0.1 (dense, Llama-style) and GPT-OSS (MoE) families. No
-  Llama 3.x, Qwen 2.x, Gemma, or state-space models locally. The
-  "single-shape sizing suffices" claim is empirically supported on
-  dense + MoE; sliding-window-attention and state-space architectures
-  remain a documented blind spot.
+  Mistral 7B v0.1 (dense/full-attention, `n_swa=0`) and GPT-OSS 20B
+  (active alternating SWA + MoE: `sliding_window=128`, `n_swa=128`,
+  12 SWA layers + 12 non-SWA layers) as runnable architecture families.
+  No Llama 3.x, Qwen 2.x, Gemma, Mixtral, Mamba, RWKV, or other
+  state-space models are locally available. The "single-shape sizing
+  suffices" claim is empirically supported on dense/full-attention and
+  active SWA+MoE; state-space remains the important documented blind
+  spot. A second non-GPT-OSS SWA family is useful hardening, not a
+  total SWA absence.
 - **Design impact**: A3a (`llama.cpp-dyeyy`) sizing direction is
   validated for the architecture surface tested; D16's "PP + TG graph
   union sizing" remains future-proofing. A pre-deployment re-run on a
-  SWA + state-space model is still recommended before declaring the
+  state-space model is still recommended before declaring the
   single-shape claim universally applicable.
 
 ### Task 3 — Deprecate-layer-streaming policy audit (MEDIUM, validated)
@@ -198,8 +209,8 @@ libze_intel_gpu.so 1.14.37435), 2026-04-24:
 - ✅ No new env var introduced. The fix is in libze itself, not in
   llama.cpp; the in-tree code change is a single-line strict
   improvement.
-- ⚠ D0.1 canary remains skeletal (multi-context-on-shared-model
-  variant deferred to a future session); no longer blocked on m09zb.
+- ✅ D0.1 canary rerun on 2026-04-25 with the real/mini reserve
+  protocol; Mistral 7B dense and GPT-OSS 20B active SWA+MoE both passed.
 - ⚠ Perf regression check on `llama-bench Mistral 7B Q4_0 PP512/TG128`
   not yet re-baselined under the patched runtime; expected to be
   within ±3% but pending Task 14's KV alloc work to close out the
@@ -215,11 +226,11 @@ unified-memory-plan critical path.
 | Track A item | Bead | Pre-validation status | Post-validation status |
 |---|---|---|---|
 | A3 (split into weight_plan + compute_plan) | (no dedicated bead — tracked under parent epic `llama.cpp-3h5gm`) | OPEN | OPEN — no validation gate; structural change only |
-| A3a (mini-context infrastructure) | `llama.cpp-dyeyy` | OPEN, gated on D0.1 | **VALIDATED**. Task 5 prototype (`333df7379`) confirmed mini-context produces byte-identical sizes + FA verdict to a real context on Mistral 7B + GPT-OSS 20B. A3a can proceed; production must use `use_mmap=false` for mini-context construction (or lift the mmap-path assert). |
+| A3a (mini-context infrastructure) | `llama.cpp-dyeyy` | OPEN, gated on D0.1 | **VALIDATED**. Task 5 prototype (`333df7379`) confirmed mini-context produces byte-identical sizes + FA verdict to a real context on Mistral 7B + GPT-OSS 20B; the canonical D0.1 canary was replaced and rerun successfully on 2026-04-25. A3a can proceed for tested dense/SWA+MoE families; production must use `use_mmap=false` for mini-context construction (or lift the mmap-path assert). |
 | A3b (FA auto-detect in skeleton graph) | open | gated on Task 5 | **VALIDATED**. Task 5 confirmed FA auto-detect runs inside `llama_init_from_model` regardless of `no_alloc`; verdict matches between mini and real contexts. A3b can proceed. |
 | A4 (arena zone sizing from weight_plan) | open | gated on A3, A3a | structurally OK to start once A3a's prototype lands. |
 | A7 (weight loader writes direct to arena) | `llama.cpp-wuozk` | OPEN, gated on D0.4 | **VALIDATED**. D0.4 PASSES under patched runtime (`tensor_set_us = 282422`, 2026-04-24). A7 can proceed. |
-| C2 (populate plan.ops for every graph op) | `llama.cpp-oib0o` | gated on D0.3 | **op-id keying validated** (Task 1). C2 can proceed with op_id keying as specified. Multi-device CPY-name stability remains a future TODO. |
+| C2 (populate plan.ops / transfer edges) | `llama.cpp-oib0o` | gated on D0.3 | **op-id keying validated** for single-device graph ops. **Contract corrected** for multi-device transfer planning: D0.3a shows scheduler copies are stable split-input copy-edge tensors, not `GGML_OP_CPY` nodes. C2 can proceed only if it consumes scheduler transfer-edge metadata; update/close `llama.cpp-bkvc9` with that corrected assertion. |
 | C3 (remove `GGML_SYCL_FORCE_STREAMING`) | open | not gated on a canary | OK to proceed; consistency sweep done (Task 3). |
 
 ## Open follow-ups (final session-end state, 2026-04-24)
@@ -266,12 +277,14 @@ synthesis. **Owners needed: backend implementer.**
 ### Other known follow-ups
 
 - **Task 2 architecture coverage** (P2, this team): re-run D0.2
-  generalization on a sliding-window-attention model (Gemma 2,
-  Mixtral) and a state-space model (Mamba / RWKV) once GGUFs are
-  present at `/Storage/GenAI/models/`. The "single-shape sizing
-  generalizes universally" claim retains its documented
-  architecture-coverage caveat until then. **Owner: this team
-  (planner-validation), low priority — pre-deployment hardening.**
+  generalization on a state-space model (Mamba / RWKV / SSM) once a
+  GGUF is present at `/Storage/GenAI/models/`. GPT-OSS 20B provides
+  active SWA+MoE coverage (`sliding_window=128`, `n_swa=128`), so an
+  independent SWA family such as Gemma 2 or Mixtral is useful hardening
+  but no longer the primary gap. The "single-shape sizing generalizes
+  universally" claim retains its documented state-space caveat until
+  then. **Owner: this team (planner-validation), low priority —
+  pre-deployment hardening.**
 - **Task 3 §VRAM-insufficient policy rewrite** (P3, this team):
   rewrite paragraph 4 of §VRAM-insufficient policy in the main plan
   doc to describe the new CPU-dispatch behavior instead of

@@ -194,6 +194,11 @@ llama_build_and_test(test-chat-template.cpp)
 llama_build_and_test(test-json-partial.cpp)
 llama_build_and_test(test-log.cpp)
 llama_build_and_test(test-sycl-model-shapes.cpp)
+
+add_executable(test-placement-envelope-canary test-placement-envelope-canary.cpp)
+target_link_libraries(test-placement-envelope-canary PRIVATE llama)
+install(TARGETS test-placement-envelope-canary RUNTIME)
+
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp
@@ -402,6 +407,8 @@ if (GGML_SYCL)
                    test-planner-canary-cpy-visibility.cpp)
     target_link_libraries(test-planner-canary-cpy-visibility
                           PRIVATE llama common)
+    target_include_directories(test-planner-canary-cpy-visibility
+                               PRIVATE ${CMAKE_SOURCE_DIR}/src)
     install(TARGETS test-planner-canary-cpy-visibility RUNTIME)
 
     add_executable(test-planner-canary-direct-load

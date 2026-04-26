@@ -8,63 +8,57 @@ Epic: `llama.cpp-3h5gm` (Unified Memory Placement Planning)
 
 | ID | Bead | Result | Gates | Notes |
 |----|------|--------|-------|-------|
-| D0.1 | `llama.cpp-wca8b` | INCONCLUSIVE | A3a (`llama.cpp-dyeyy`) | Canary wedges in `llama_model_load_from_file` → S1-PRELOAD → `staging_buffer_pool::acquire` (`common.hpp:1863`). Blocked on E1 (`llama.cpp-m09zb`). See [d0.1-skeleton-determinism.md](d0.1-skeleton-determinism.md). |
-| D0.2 | `llama.cpp-ge7rc` | PASS | A3a (`llama.cpp-dyeyy`) | PP and TG produce identical op sets on both Mistral 7B (13 ops) and GPT-OSS 20B (17 ops, MoE adds `ADD_ID`, `ARGSORT`, `MUL_MAT_ID`, `SOFT_MAX`). Single-shape reserve suffices. See [d0.2-pp-tg-union.md](d0.2-pp-tg-union.md). |
-| D0.3 | `llama.cpp-5binh` | INCONCLUSIVE | C2 (`llama.cpp-oib0o`) | Only 1 SYCL device visible on this host (B50 disabled per `feedback_disable_b50.md`). Cross-device CPY scenario cannot be exercised. Rerun required once ≥2 devices are safely usable AND E1 lands. See [d0.3-cpy-visibility.md](d0.3-cpy-visibility.md). |
-| D0.4 | `llama.cpp-zpp9k` | INCONCLUSIVE | A7 (`llama.cpp-wuozk`) | Canary uses only `ggml-backend` APIs (no llama, no unified_cache, no staging pool). Runtime wedges on the first `ggml_backend_tensor_set` at `ggml-sycl.cpp:12685` with the same L0 hang signature as m09zb — proves m09zb is an L0 DirectSubmission non-flush, not a staging-pool-specific bug. Blocked on E1. See [d0.4-direct-load.md](d0.4-direct-load.md). |
+| D0.1 | `llama.cpp-wca8b` + superseding `llama.cpp-2t09r` | PASS (2026-04-25 rerun) | A3a (`llama.cpp-dyeyy`) | The stale `blocked_on_m09zb` placeholder was replaced by a real orchestrator over `test-mini-context-prototype`. Mistral 7B dense and GPT-OSS 20B active SWA+MoE both returned exit 0 for real-A / real-B / mini reserve comparison. See [d0.1-skeleton-determinism.md](d0.1-skeleton-determinism.md). |
+| D0.2 | `llama.cpp-ge7rc` | PASS for tested families; STATE-SPACE OPEN | A3a (`llama.cpp-dyeyy`) | PP and TG produce identical op sets on Mistral dense/full-attention and GPT-OSS active SWA+MoE. State-space remains open because no local fixture exists and SYCL lacks `GGML_OP_SSM_SCAN` support/routing even though Mamba/Plamo2 graphs emit `ggml_ssm_scan`. See [d0.2-pp-tg-union.md](d0.2-pp-tg-union.md) and [d0.2-architecture-coverage-2026-04-25.md](d0.2-architecture-coverage-2026-04-25.md). |
+| D0.3 | `llama.cpp-5binh` + `llama.cpp-bkvc9` | SINGLE-DEVICE PASS / MULTI-DEVICE DESIGN CORRECTION | C2 (`llama.cpp-oib0o`) | CPU op-id stability is validated. D0.3a synthetic two-GPU scheduler proof records stable scheduler copy-edge tensors but `0` `GGML_OP_CPY` nodes, so C2 must plan scheduler split-input copy edges instead of synthetic CPY graph nodes. See [d0.3-cpy-visibility.md](d0.3-cpy-visibility.md) and [d0.3a-multidevice-cpy-visibility.md](d0.3a-multidevice-cpy-visibility.md). |
+| D0.4 | `llama.cpp-zpp9k` | PASS (2026-04-24 patched runtime) | A7 (`llama.cpp-wuozk`) | Canary uses only `ggml-backend` APIs (no llama, no unified_cache, no staging pool). Under patched libze 1.14.37435 it completes with byte-identical readback in `tensor_set_us=282422`, validating direct-load mechanics. See [d0.4-direct-load.md](d0.4-direct-load.md). |
 
 ## Design-doc updates required
 
-- **D0.2 (PASS)**: validated. A3a can size zones from a single shape
+- **D0.2 (PASS)**: validated for the local dense/full-attention and
+  active SWA + MoE families. A3a can size zones from a single shape
   (ubatch=max OR ubatch=1; they produce identical op sets on every
   tested model). The design doc's §D16 "PP + TG graph union sizing"
   does not need to be re-derived for Mistral 7B or GPT-OSS 20B — but
   the canary's value is now as an ongoing invariant check if a future
-  model adds shape-dependent ops. No design change required.
+  model adds shape-dependent ops. State-space remains unvalidated until
+  a Mamba/RWKV/SSM GGUF fixture exists locally.
 
-- **D0.1 / D0.4 (INCONCLUSIVE)**: blocked on the L0 DirectSubmission
-  non-flush captured as bead `llama.cpp-m09zb` and tracked as plan-doc
-  Track E task E1. Design changes made outside this task's commit
-  scope but directly triggered by these canaries: (a) Track E added
-  with task E1 as a hard prerequisite to all other Tracks; (b)
-  Migration plan now starts with Phase 0 (E1) before the original
-  Phase 1; (c) Known-issues section documents both callsites (Example
-  A preload, Example B tensor_set) and the three candidate fix
-  directions. Landed across commits `ebbaee052`, `46f4a225f`,
-  `fd2b016b7`, `eac575ab7`, `d9a193e80`, and the D0.1 canary lean-out
-  `c791d9e27`.
+- **D0.1 (PASS) / D0.4 (PASS under patched runtime)**: E1's original
+  L0 DirectSubmission non-flush blocker is resolved by the patched
+  compute-runtime. D0.1 was rerun on 2026-04-25 using the real/mini
+  protocol and now backs A3a for the tested dense and active SWA+MoE
+  fixtures. D0.4 completed under patched libze and backs A7 direct-load
+  mechanics.
 
-- **D0.3 (INCONCLUSIVE)**: no design change required. Multi-device
-  policy (§D13) stands as authored; re-validation depends on host
-  policy, not on the canary or the plan.
+- **D0.3 (PARTIAL / CORRECTED)**: C2's single-device op-id keying is
+  validated. D0.3a proves multi-device scheduler transfers are stable
+  copy-edge tensors (`SYCL1#...#0`) with `GGML_OP_NONE`, not
+  `GGML_OP_CPY` graph nodes. C2 must consume scheduler transfer-edge
+  metadata.
 
 ## Track A unlock decisions
 
-- **A3a** (`llama.cpp-dyeyy`): **partially unlocked**. D0.2 confirmed
-  single-shape sizing is sound; A3a can proceed on the sizing
-  question. The mini-context/`graph_reserve` mechanics themselves (D0.1
-  gate) remain unverified pending E1. Recommend treating A3a as
-  "design-blocked-on-E1, design-unblocked-on-sizing" until E1 lands
-  and D0.1 can be re-run.
-- **C2** (`llama.cpp-oib0o`): **BLOCKED**. D0.3 INCONCLUSIVE —
-  multi-device CPY behavior unverified on this host; rerun when a
-  second safely-usable SYCL device is available AND E1 lands.
-- **A7** (`llama.cpp-wuozk`): **BLOCKED**. D0.4 INCONCLUSIVE — direct
-  `ggml_backend_tensor_set` path wedges today; must wait on E1.
+- **A3a** (`llama.cpp-dyeyy`): **unlocked for tested families**. D0.1
+  now runs the real/mini reserve protocol, and D0.2 confirmed
+  single-shape sizing is sound for Mistral dense/full-attention and
+  GPT-OSS active SWA+MoE. State-space remains outside this unlock until
+  `GGML_OP_SSM_SCAN` support and a fixture exist.
+- **C2** (`llama.cpp-oib0o`): **PARTIAL / CONTRACT CHANGE**.
+  Single-device op-id keying is valid. Multi-device transfers must be
+  represented from scheduler copy-edge metadata, not CPY nodes; follow-up:
+  `llama.cpp-bkvc9`.
+- **A7** (`llama.cpp-wuozk`): **VALIDATED**. D0.4 PASS under patched
+  runtime proves direct `ggml_backend_tensor_set` load mechanics.
 
 ## Open follow-ups
 
-- **E1** (`llama.cpp-m09zb`, P0): restructure `staging_buffer_pool` +
-  address broader L0 flush path. Acceptance includes both D0.1 AND
-  D0.4 canaries completing cleanly. Blocking follow-up.
-- **D0.3 host capacity**: once B50 can be re-enabled without tripping
-  the PM-underflow cascade (`feedback_disable_b50.md`), rerun D0.3 as
-  a 2-device scenario. Secondary follow-up.
-- **D0.1 canary structure decision**: current source uses sequential
-  create-destroy-recreate (avoiding the earlier-hypothesized
-  multi-context crash). The `D0_1_PROBE_MULTICONTEXT=1` guarded probe
-  should be re-exercised post-E1 to confirm whether a second real bug
-  exists at that level, or whether E1 also resolves it.
+- **E1** (`llama.cpp-m09zb`, P0): resolved by patched compute-runtime;
+  D0.1 and D0.4 now have current completion evidence.
+- **D0.3a real multi-device canary** (`llama.cpp-bkvc9`): harness now
+  proves a design correction: stable scheduler copy-edge tensors exist,
+  but no `GGML_OP_CPY` nodes are emitted for this cross-backend transfer
+  path. Update C2 and close this with the corrected contract.
 - **Multi-shape observation**: D0.2's finding that PP and TG produce
   identical op sets suggests §D16's "double-reserve" scheme may be a
   future-proofing measure rather than an active requirement. If E1

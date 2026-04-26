@@ -1,15 +1,15 @@
 {
   "canary_id": "D0.1",
-  "result": "INCONCLUSIVE",
-  "summary": "Canary cannot complete today: llama_model_load_from_file wedges in the SYCL S1-PRELOAD weight stage before any determinism measurement can run (bead llama.cpp-m09zb)",
-  "recommendation": "Re-run once the E1 staging_buffer_pool fix + broader L0 flush work (llama.cpp-m09zb) has landed; D0.4 is the corroborating witness that the bug is not staging-pool-specific",
+  "result": "PASS",
+  "summary": "Real/mini graph_reserve signals match for all available D0.1 model fixtures",
+  "recommendation": "A3a mini-context sizing remains validated for the tested dense and active SWA+MoE fixtures",
   "evidence": {
-    "reason": "blocked_on_m09zb",
-    "blocker_bead": "llama.cpp-m09zb",
-    "hang_location": "ggml/src/ggml-sycl/common.hpp:1863",
-    "hang_function": "staging_buffer_pool::acquire",
-    "caller_api": "llama_model_load_from_file via ggml_sycl_preload_model_weights",
-    "corroborating_witness": "D0.4 - ggml_backend_sycl_buffer_set_tensor at ggml-sycl.cpp:12685",
-    "plan_section": "docs/plans/2026-04-22-planner-canaries-implementation.md §Task 1 (D0.1)"
+    "proof_binary": "./build/bin/test-mini-context-prototype",
+    "mistral_dense_path": "/Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf",
+    "mistral_dense_exit": "0",
+    "gptoss_swa_moe_path": "/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf",
+    "gptoss_swa_moe_exit": "0",
+    "proof_protocol": "test-mini-context-prototype real-A/real-B/mini comparison",
+    "plan_section": "docs/plans/2026-04-22-unified-memory-placement-plan.md D0.1"
   }
 }

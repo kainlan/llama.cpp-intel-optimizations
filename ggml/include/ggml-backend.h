@@ -345,6 +345,9 @@ extern "C" {
 
     // Split graph without allocating it
     GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+    // Debug/inspection only: returns the scheduler-owned split graph from the last reserve/split.
+    // The pointer is invalidated by the next scheduler reset, split, reserve, alloc, or free.
+    GGML_API const struct ggml_cgraph * ggml_backend_sched_get_debug_graph(ggml_backend_sched_t sched);
 
     // Allocate and compute graph on the backend scheduler
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success

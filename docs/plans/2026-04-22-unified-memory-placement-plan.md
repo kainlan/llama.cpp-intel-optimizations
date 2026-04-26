@@ -80,7 +80,8 @@ placement_plan {
 - **KV + WEIGHT**: share a region; sized from the plan at model load
 - **ONEDNN**: fixed 256 MB; fine
 - **RUNTIME**: sized from the plan's MoE/DMA/PP fields at context creation
-- **SCRATCH**: sized *empirically* via `reserve_scratch_pool()` / `reserve_compute_arena()` after `graph_reserve()` returns real demand
+- **SCRATCH**: graph/token scratch sized from the placement envelope and reset at graph boundaries
+- **HOST_COMPUTE / HOST_RUNTIME**: context/slot-lifetime host-pinned compute buffers, reserved from the placement envelope and returned on context/slot teardown
 
 ### Timeline today (half-migrated)
 
@@ -112,7 +113,7 @@ the over-allocation at step 4.
 | `llama.cpp-mubmt` | EPIC: unified_cache sole owner of SYCL memory | open | Residency-handle infrastructure this plan assumes |
 | `llama.cpp-8gz7y` | Query ggml scheduler for actual compute buffer sizes in planner | open | **Superseded by A3a+A4** (mini-context + `graph_reserve(no_alloc=true)` replaces the scheduler-query approach). Close as superseded when A3a+A4 land. |
 | `llama.cpp-w1rxh` | Set `max_buffer_size` on compute buffer type to arena zone capacity | closed | Landed 2026-04-22 (commit a60dc806a); structural cleanup that works under either design. Kept. |
-| `llama.cpp-tyoc2` | Wire host compute buffer chunks through SCRATCH zone | open | Phase 2 — host-side compute buffer routing |
+| `llama.cpp-tyoc2` | Wire host compute buffer chunks through the unified-cache host compute arena | open | Phase 2 — host-side compute buffer routing; long-term target is context/slot-lifetime `HOST_COMPUTE`, not graph-reset `SCRATCH` |
 | `llama.cpp-01mcl` | Remove `must_device=true` for compute buffers | open | Phase 2 — lets compute buffer chunks live host-pinned for ops the plan dispatches to CPU (see D14 — `GGML_SYCL_FORCE_STREAMING` is deprecated, 2026-04-22 directive). |
 | `llama.cpp-ioua6` | Fail-fast when compute buffer exceeds all zones | closed (reverted, restore TBD) | Becomes a no-op under this plan; defense-in-depth only |
 | `llama.cpp-6bdmc` | EPIC: Unified memory placement planner (sibling) | open | **Superseded by this epic.** Design doc `2026-04-22-unified-memory-planner-design.md` content absorbed below (see "Consolidated from 6bdmc" sections). Close when this epic's Track A lands. |
@@ -228,9 +229,9 @@ test that touches `llama_init_from_model` OR issues a user-facing
 
 | Canary | Status | Notes |
 |---|---|---|
-| D0.1 — skeleton determinism | INCONCLUSIVE (blocked by m09zb) | Binary builds; execution wedges in `llama_model_load_from_file` before any determinism measurement can complete. Resumes once E1 lands. |
-| D0.2 — PP + TG graph union | PASS (commit `3ba255e`) | Mistral 7B: 13 op types. GPT-OSS 20B: 17 op types — MoE adds `ADD_ID, ARGSORT, MUL_MAT_ID, SOFT_MAX`. PP == TG on both models → A3a can size from a single shape (the double-reserve strategy is not needed for either of these models). Generalized 2026-04-24 to 4 additional Mistral 7B quantization variants (Q2_K, Q3_K_M, Q4_K_M, Q8_0) — all 13 ops, PP==TG on each (`docs/plans/data/planner-canaries/d0.2-generalization.md`); architecture-coverage caveat: only Mistral-dense + GPT-OSS-MoE families locally available. |
-| D0.3a — post-split CPY visibility (multi-device) | INCONCLUSIVE | Host has 1 visible SYCL device (B50 disabled per `feedback_disable_b50.md`); cross-device CPY scenario unavailable. Rerun requires ≥2 safely-usable devices AND E1. |
+| D0.1 — skeleton determinism | PASS (2026-04-25 rerun) | `test-planner-canary-skeleton-determinism` now invokes `test-mini-context-prototype`; Mistral 7B dense and GPT-OSS 20B active SWA+MoE both pass the real-A / real-B / mini reserve comparison. Supersedes stale `blocked_on_m09zb` artifact. Follow-up bead `llama.cpp-2t09r` closes this correction. |
+| D0.2 — PP + TG graph union | PASS for tested families; STATE-SPACE OPEN | Mistral 7B dense/full-attention: 13 op types. GPT-OSS 20B active SWA+MoE: 17 op types — MoE adds `ADD_ID, ARGSORT, MUL_MAT_ID, SOFT_MAX`; metadata has `sliding_window=128` and runtime reports `n_swa=128`. PP == TG on both models → A3a can size from a single shape for these families. Generalized 2026-04-24 to 4 additional Mistral 7B quantization variants. 2026-04-25 deeper audit: state-space has no local fixture and SYCL lacks `GGML_OP_SSM_SCAN` dispatch even though Mamba/Plamo2 graphs emit `ggml_ssm_scan`; follow-ups: `llama.cpp-3h5gm.4` and `llama.cpp-xwnkf`. |
+| D0.3a — post-split CPY visibility (multi-device) | FAIL / DESIGN CORRECTION | Synthetic two-GPU scheduler proof (`D0_3_MULTIDEVICE=1 GGML_SYCL_SPLIT_RATIO=50,50`) records `run0_copies=1`, stable scheduler copy-edge tensors (`SYCL1#d0_3a_input_a#0`, `SYCL1#d0_3a_input_b#0`), and `run0_cpy_nodes=0`. Cross-backend transfers are visible as scheduler split-input copy edges, not `GGML_OP_CPY` graph nodes. C2 must consume scheduler copy-edge metadata instead of assuming synthetic CPY ops. Follow-up remains open: `llama.cpp-bkvc9`. |
 | D0.3b — op-id stability (single-device) | PASS (commit `607fca77`) | 5 repeated `graph_reserve` calls on Mistral 7B produced byte-identical (op_id, op_type, name) sequences (CPU backend, sidesteps m09zb). The load-bearing claim for C2 is validated — C2 can safely key on op_id. |
 | D0.4 — direct-weight-load mechanics | PASS (2026-04-24, patched-runtime test) | Canary uses only `ggml-backend` APIs (no llama, no unified_cache, no staging pool). Pre-patch the runtime wedged on the first `ggml_backend_tensor_set` at `ggml_backend_sycl_buffer_set_tensor` (`ggml-sycl.cpp:12685` outer / L~13076 inner) with the same L0 hang signature as m09zb. Under the patched compute-runtime (libze 1.14.37435 system-default) the canary completes in `tensor_set_us = 282422` (~282 ms). Validates A7's direct-load mechanics. |
 
@@ -275,54 +276,67 @@ struct op_demand {
 };
 ```
 
-### Two-stage planning: weights once, compute per context
+### Two-stage planning: weights once, capacity envelope at load, compute per context/slot
 
-Weights are shared across contexts; compute buffers are per-context. The
-plan reflects that:
+Weights are shared across contexts/sessions; KV and compute demand are
+per-context or per-slot. The plan reflects that split. Model load does
+**not** receive "this user's context"; it receives a **placement envelope**:
+the maximum aggregate shape this loaded model is expected to serve without
+reloading.
 
 - **Weight plan** — computed once per model, at `llama_model_load_from_file`
-  time. Decides placement for every weight + KV cache capacity + MoE expert
-  residency + fixed infrastructure (oneDNN scratchpad, DMA pool, etc.).
-  Sized to hold the **maximum** context the user declared via
-  `model_params.n_ctx`.
-- **Compute plan** — computed per context, at `llama_init_from_model` time.
-  Decides placement for the compute buffer, per-op scratch, and per-op
-  routing. Fits within the zones the weight plan already reserved.
+  time from model metadata + the declared placement envelope. Decides
+  placement for every weight + MoE expert residency + fixed infrastructure
+  (oneDNN scratchpad, DMA pool, etc.) and reserves arena capacity for the
+  envelope's maximum aggregate KV + compute demand.
+- **Context/slot compute plan** — computed per `llama_context` or per
+  server slot/session at creation/activation time. Decides actual KV
+  allocation, compute buffer allocation, per-op scratch, and per-op routing
+  for the requested shape. Fits within the capacity reserved by the weight
+  plan's placement envelope.
 
 **Weights are written directly to their planned addresses as they come off
-disk**; the compute plan allocates from zones the weight plan reserved; at
-no point do weights move.
+disk**; context/slot plans allocate from unified-cache arenas that the
+placement envelope reserved; at no point do weights move.
 
-#### Motivating case: multi-context (e.g., `llama-server --parallel N`)
+#### Motivating case: multi-user agent teams
 
-The weight/compute split exists specifically to serve **multiple
-concurrent `llama_context` instances sharing one `llama_model`**. The
-canonical example is `llama-server --parallel N`: N chat slots, each its
-own `llama_context` with its own KV + compute buffer + per-op routing,
-all reading from one shared set of weight arenas. Other cases (persistent
-chat + ephemeral embedding on the same model; warmup context + hot
-context) fall out of the same shape.
+The weight/envelope/compute split exists specifically to serve **many
+logical sessions against one loaded model**. The preferred long-term server
+shape for teams of agents is one loaded model plus an aggregate placement
+envelope, with many logical sequences/slots planned independently inside
+that envelope. Separate `llama_context` instances are still supported when
+isolation or different runtime parameters require them, but they consume
+from the same declared capacity instead of implicitly expanding it.
 
-The `model_params.n_ctx` invariant follows: it is the **maximum context
-any future context will ever request from this model**. The weight plan
-reserves the RUNTIME zone for that max; each context's compute plan
-allocates within it. A6 errors at context creation if `cparams.n_ctx >
-model_params.n_ctx`. For `llama-server`, the server computes
-`model_params.n_ctx = ctx_per_slot * n_parallel` (or similar) before
-creating any slots.
+The envelope invariant follows: model load must know the **maximum aggregate
+capacity** it is allowed to reserve. For `llama-server --parallel N`, that
+means something like:
+
+```
+placement_envelope.max_ctx_per_slot = ctx_per_slot
+placement_envelope.max_active_slots = n_parallel
+placement_envelope.total_kv_tokens  = ctx_per_slot * n_parallel
+placement_envelope.max_ubatch       = parsed -ub / scheduler policy
+placement_envelope.flash_attn_type  = requested FA policy
+```
+
+A6 errors at context/slot creation if a requested shape exceeds the
+declared envelope. If a deployment wants arbitrary future users with larger
+contexts, it must load the model with a larger envelope or reload/replan.
 
 **Ownership and lifecycle (binding):**
-- `llama_model` owns `std::unique_ptr<weight_plan>`, immutable after load,
-  freed in model free.
-- `llama_context` owns `std::unique_ptr<compute_plan>`, freed in context
-  dtor. Compute plan holds `const weight_plan *` (non-owning); model must
-  outlive every context (enforce by ref count on the shared model or
-  explicit assert in context dtor).
+- `unified_cache` owns the long-lived placement-plan instance for the active
+  model/envelope, immutable after model load until model unload/reload.
+- `llama_context` or server slot/session owns the short-lived compute-plan
+  instance for its actual requested shape. Compute plans hold a non-owning
+  pointer/reference to the active placement envelope; the model/cache must
+  outlive every context/slot plan.
 - Weight arenas are shared read-only across contexts; no synchronization
   needed on the weight path.
 
-**Concurrent `llama_init_from_model`:** Shared `weight_plan` is read-only
-(safe). Per-context `graph_reserve` touches ggml-alloc state that is
+**Concurrent context/slot creation:** Shared weight/envelope plan is
+read-only (safe). Per-context `graph_reserve` touches ggml-alloc state that is
 **not known to be re-entrant**. Track D adds a validation test that
 exercises N parallel `llama_init_from_model` calls and verifies plan
 determinism + no data races under TSAN. Until that test is green,
@@ -337,9 +351,9 @@ decoding (draft + target) works as a free side-effect.
 ┌─────────────────────────────────────────────────────────┐
 │ Caller (llama-cli, llama-completion, llama-server, ...):│
 │   - Parse CLI: -c, -b, -ub, --flash-attn, etc.          │
-│   - Populate llama_model_params with context shape      │
-│     (treat model_params.n_ctx as "max context I'll      │
-│      ever request from this model")                     │
+│   - Populate llama_model_params placement envelope      │
+│     (max ctx per slot, max active slots/sequences,      │
+│      total KV tokens, ubatch, FA policy, budget)        │
 └─────────────────────────────────────────────────────────┘
                            │
                            ▼
@@ -348,12 +362,12 @@ decoding (draft + target) works as a free side-effect.
 │   1. Open GGUF, build tensor metadata (no data copy)    │
 │   2. Build skeleton graph using metadata tensors        │
 │   3. graph_reserve(no_alloc=true) → real compute buffer │
-│      demand for model_params.n_ctx (the MAX context)    │
+│      demand for the declared placement envelope         │
 │   4. compute_weight_plan(metadata, model_params, budget │
 │                          + compute_demand_from_step_3)  │
-│       - weights + KV capacity + MoE experts             │
+│       - weights + aggregate KV capacity + MoE experts   │
 │       - infrastructure buffers                          │
-│       - RUNTIME zone capacity = max compute buffer need │
+│       - RUNTIME zone capacity = envelope compute peak   │
 │   5. Reserve VRAM arena zones from weight plan          │
 │   6. Stream weight DATA directly into planned addresses │
 │      (mmap / DMA straight to the weight_plan.entries[i] │
@@ -363,16 +377,14 @@ decoding (draft + target) works as a free side-effect.
                            ▼
 ┌─────────────────────────────────────────────────────────┐
 │ llama_init_from_model(model, cparams):                  │
-│   1. Validate cparams.n_ctx <= model_params.n_ctx       │
-│      (error if user asks for bigger context than the    │
-│       model was loaded for)                             │
-│   2. compute_compute_plan(model.weight_plan, cparams)   │
+│   1. Validate requested context/slot shape fits the     │
+│      loaded placement envelope                          │
+│   2. compute_compute_plan(active_envelope, cparams)     │
 │       - Build the real graph for cparams                │
 │       - graph_reserve(no_alloc=true) → actual size      │
 │       - Allocate compute buffer within RUNTIME zone     │
-│         (spills to host-pinned if it doesn't fit;       │
-│          deprecated 2026-04-22 — see D14)               │
-│       - Assign every op a plan.ops[op_name] entry       │
+│         reserved by the placement envelope              │
+│       - Assign every op a plan.ops[op_id] entry         │
 │   3. graph_reserve(no_alloc=false) consumes the         │
 │      pre-reserved compute memory                        │
 └─────────────────────────────────────────────────────────┘
@@ -398,8 +410,8 @@ repo get updated in the same PR.
   and the declaration at `ggml-sycl.h:190`
 - **Delete** `placement_plan::planner_n_ctx_is_runtime` flag
 - **Delete** `update_placement_plan_runtime_n_ctx()` on `unified_cache`
-- **Inline** the plan call at model load to use `model_params.n_ctx` directly
-  instead of `inventory->n_ctx` (model's trained max)
+- **Inline** the plan call at model load to use the placement envelope from
+  `llama_model_params` instead of `inventory->n_ctx` (model's trained max)
 
 ### Direct placement mechanics
 
@@ -454,8 +466,9 @@ mini-context** whose sole purpose is to host the skeleton graph + call
 `graph_reserve`:
 
 1. Open the GGUF header, build tensor metadata (shape only, no data yet)
-2. Construct an ephemeral `llama_context_params`-like shape from
-   `model_params.n_ctx` / `n_ubatch` / `flash_attn_type`
+2. Construct an ephemeral `llama_context_params`-like shape from the
+   placement envelope (`n_ctx` / total KV tokens, `n_ubatch`,
+   `n_seq_max` / active slots, `flash_attn_type`)
 3. Spin up a minimal scheduler + call `llama_build_graph()` with the
    metadata tensors; resolve `flash_attn=auto` during this pass (see
    below)
@@ -550,8 +563,9 @@ NORM_EMBED  > ATTENTION  > FFN  > MOE_DOWN  > MOE_UP  > MOE_GATE_PROJ
 Rationale: norm/embed are tiny and touched every token; attention is
 bandwidth-critical hot path; FFN is the bulk of dense compute; MoE
 experts are routed per-token and the DOWN projection dominates
-activation flow. Overflow spills to host-pinned arena in the same
-priority order (hottest goes to VRAM, coldest spills first).
+activation flow. Weight/KV overflow lands in the host-pinned arena in the
+same priority order (hottest goes to VRAM, coldest host-resident data is
+routed to CPU first).
 
 This matches the existing `placement_priority` enum in the weight
 bin-packer; the plan formalizes the order as part of the spec.
@@ -563,9 +577,9 @@ consistent with real demand:
 
 **At model load (weight plan):**
 1. **Reserve** all VRAM zones from weight plan sizes — WEIGHT, KV, ONEDNN,
-   RUNTIME (sized for `model_params.n_ctx` max), SCRATCH.
+   RUNTIME (sized for the placement envelope), SCRATCH.
 2. **Reserve** host-pinned arena zones for weight overflow + KV overflow +
-   compute overflow.
+   CPU-dispatched weight/KV overflow + runtime headroom.
 3. **Fixed infrastructure buffers** (MoE tables, DMA pool, PP prefetch)
    allocated from their planned zones.
 4. **Weight data written** directly into planned arena offsets:
@@ -575,72 +589,75 @@ consistent with real demand:
 
 **At context creation (compute plan):**
 5. Compute buffer allocated within the RUNTIME zone reserved at step 1.
-   If it doesn't fit (because this context's demand > the max-context
-   reservation, which shouldn't happen under the `cparams.n_ctx <=
-   model_params.n_ctx` validation), spill to host-pinned compute zone.
-   *(The host-pinned spillover step is deprecated by the 2026-04-22
-   directive — overflow ops now dispatch to CPU instead. See the
-   deprecation banner inside §VRAM-insufficient policy and D14.)*
-6. Per-op scratch from `plan.compute.per_op_scratch_peak` in SCRATCH zone.
+   If it doesn't fit, the requested context/slot exceeds the loaded
+   placement envelope or the planner under-reserved; fail clearly at
+   context/slot creation rather than silently shrinking user parameters.
+6. Context/slot-lifetime host compute buffers allocate from a dedicated
+   host `HOST_COMPUTE` / `HOST_RUNTIME` arena class, not from graph-reset
+   `HOST_SCRATCH`. This arena is reserved once from the placement envelope.
+7. Per-op graph scratch from `plan.compute.per_op_scratch_peak` allocates
+   from SCRATCH and is reset at graph boundaries.
 
 **At context destroy:**
-7. Compute buffer + per-op scratch allocations freed via the zone's TLSF
-   free-list; the RUNTIME zone's capacity itself is **not** released.
-   Subsequent `llama_context` creation re-allocates from the same RUNTIME
-   zone — concurrent contexts share the pre-reserved capacity first-come-
-   first-served (see D11).
+8. Context/slot-lifetime compute allocations are returned to the owning
+   context/slot arena, either by per-allocation TLSF free or by a per-context
+   arena reset. The zone capacity itself is **not** released.
+   Subsequent `llama_context` or slot/session creation re-allocates from the
+   same reserved capacity under the declared envelope (see D11).
+
+**Two-layer host compute fix (binding, from D0.6 failure):**
+- **Capacity layer:** replace additive
+  `unified_cache_grow_host_scratch_zone(total_bytes)` semantics with
+  reserve/admission semantics. The operation should be
+  `reserve_host_compute_capacity(required_bytes)`: if the loaded envelope
+  already reserved enough capacity, do nothing; if not, grow only during
+  load/warmup until A6 admission is enforced; after A6, reject over-envelope
+  requests instead of growing.
+- **Lifetime layer:** split context/slot-lifetime host compute buffers from
+  graph-reset host scratch. `HOST_SCRATCH` and `HOST_STAGING` may stay
+  reset-scope for per-graph temporary data. Context compute buffers must use
+  `HOST_COMPUTE` / `HOST_RUNTIME` and return memory on context/slot teardown,
+  preferably via per-context arena reset for cheap agent-slot teardown.
 
 ### VRAM-insufficient policy
-
-> **Note (2026-04-22 directive):** the "compute buffer spills to host-pinned"
-> bullet and the "Compute-buffer-on-host is loud" paragraph below describe
-> the *original* policy in which the GPU continued to drive PCIe-resident
-> GEMMs once VRAM ran out. That fallback is **deprecated** in favor of
-> CPU dispatch via `plan.ops[op].preferred_device = CPU` (see D14).
-> The host-pinned arena still holds *weights* for ops dispatched to CPU
-> (which is fast — the CPU reads from host directly), but the compute
-> buffer no longer hosts GEMMs that the GPU would then drive over PCIe.
-> Text retained verbatim for historical context until the policy paragraph
-> is rewritten in a follow-up commit.
 
 The point of the plan is to handle this correctly without shrinking the
 user's context. Policy:
 
 - Fill VRAM greedily in priority order (`NORM_EMBED > ATTENTION > FFN >
   MOE_DOWN > MOE_UP > MOE_GATE_PROJ`)
-- Anything that doesn't fit VRAM goes to **host-pinned arena**
-- KV cache tiers per-layer (hot layers on device, cold layers on host)
-- Compute buffer spills to host-pinned if RUNTIME zone can't hold it.
-  *(Deprecated by the 2026-04-22 directive — see the deprecation banner
-  above this bullet list and D14.)*
+- Weight/KV data that doesn't fit VRAM goes to **host-pinned arena** and the
+  op router dispatches affected ops to CPU when CPU-on-host is faster and
+  safer than GPU streaming over PCIe.
+- KV cache tiers per-layer or per-slot according to the envelope (hot layers
+  / hot slots on device, cold capacity on host).
+- Compute buffers do **not** spill to host-pinned for GPU-driven GEMMs.
+  They allocate from the pre-reserved RUNTIME zone sized by the envelope.
+  If the envelope cannot host the requested compute plan, context/slot
+  creation fails with a clear error or the op plan chooses CPU dispatch for
+  host-resident work.
 - **Never** silently shrink `n_ctx`, `n_batch`, `n_ubatch`, or any user
   parameter
 - Only failure mode: **plan concludes it cannot fit even with full host
-  overflow** → hard error at model-load time with a clear message
-  ("requested n_ctx=131072 needs 42 GB across VRAM + host-pinned, available
-  is 38 GB")
+  overflow / CPU dispatch** → hard error at model-load time with a clear
+  message ("requested envelope total_kv_tokens=131072, active_slots=8 needs
+  42 GB across VRAM + host-pinned, available is 38 GB")
 
-**Compute-buffer-on-host is loud.**
+**CPU-dispatch fallback is loud.**
 
-*Deprecated by the 2026-04-22 directive — see the deprecation banner
-above this paragraph and D14. Preserved verbatim for historical context
-until the policy paragraph is rewritten in a follow-up commit.*
-
-If the compute buffer spills to host-pinned, the GEMMs for that context
-run over PCIe at host-pinned speeds — typically 10–50× slower than VRAM.
-This is correct but easy to mistake for a mystery perf regression.
-Policy:
+If the planner places hot work on CPU because the data is host-resident, the
+model remains correct but may be much slower than an all-VRAM plan. Policy:
 
 - **WARN at plan time** with projected perf impact, using the planner's
   own per-op compute estimate:
-  > *compute buffer 4.2 GB spilled to host-pinned; projected TG impact
-  > 71 → ~12 tok/s. Raise `GGML_SYCL_VRAM_BUDGET_PCT` (currently 30) or
-  > lower `-c` to restore VRAM-resident compute.*
+  > *12 FFN/MoE ops planned for CPU because their weights/KV are host-resident;
+  > projected TG impact 71 → ~12 tok/s. Raise `GGML_SYCL_VRAM_BUDGET_PCT`
+  > (currently 30), reduce the placement envelope, or add VRAM to restore
+  > VRAM-resident compute.*
 - **Default**: proceed with warning.
-- **Opt-in strict mode**: `GGML_SYCL_FAIL_ON_COMPUTE_HOST=1` → fail at
-  plan time instead of warning. This is **not** a fallback flag (doesn't
-  disable the plan), just a policy knob for users who'd rather fail than
-  silently slow.
+- **Opt-in strict mode**: future policy knob can fail at plan time instead of
+  warning. It must not disable the planner; it only changes whether slow CPU
+  placement is accepted.
 
 The plan encodes the VRAM-greedy + host-overflow policy as its
 fundamental contract; this is not a fallback, it is the plan.
@@ -663,23 +680,26 @@ output governs every allocation from that point forward — including where
 the weights land as they're read from GGUF. There is never a phase where
 weights exist in a temporary buffer awaiting relocation.
 
-### D3 — Context params are model-params inputs on our fork
+### D3 — Placement envelope is a model-load input on our fork
 
 `llama_model_params` is extended with `n_ctx`, `n_ubatch`, `n_seq_max`,
-`flash_attn_type` so the planner has every input it needs at model load.
-This is a public-API change; we own this fork and don't merge upstream,
-so it's acceptable. Every in-tree caller is updated in the same PR.
+`flash_attn_type`, and any follow-on concurrency fields needed to express the
+placement envelope (for example max active slots / total KV tokens). These
+are **capacity inputs**, not "the current user's context." The planner uses
+them to reserve enough arena capacity at model load; each context/slot still
+gets a separate compute plan for its actual shape. This is a public-API
+change; we own this fork and don't merge upstream, so it's acceptable. Every
+in-tree caller is updated in the same PR.
 
 ### D4 — Compute buffer is graph-queried at both stages
 
 `graph_reserve(no_alloc=true)` is ggml's authoritative sizing pass, and
 we run it twice: at model load (inside a throwaway mini-context with
-`model_params.n_ctx` = max, to size the RUNTIME zone capacity) and at
-each `llama_init_from_model` (normal context, `cparams.n_ctx` = this
-context's actual size, to compute the per-context compute plan). Using
-ggml's real sizing at both points eliminates drift. The mini-context
-is strictly ephemeral — constructed, queried, destroyed inside the
-planner call.
+the placement envelope's max/aggregate shape, to size arena capacity) and at
+each `llama_init_from_model` or server-slot activation (normal graph,
+actual context/slot shape, to compute that plan). Using ggml's real sizing at
+both points eliminates drift. The mini-context is strictly ephemeral —
+constructed, queried, destroyed inside the planner call.
 
 ### D5 — Flash attention auto-detection moves to model load
 
@@ -715,13 +735,14 @@ plus the relocation work described in Track A. `8gz7y` is superseded by
 A3a+A4 and closes when Track A lands. This document is the *why*; those
 beads are the *how*. One PR per task, each individually deployable.
 
-### D10 — One model per process
+### D10 — One active placement domain per process
 
-The plan assumes a single `llama_model` lives in a process at any time.
-This is the realistic case for llama-cli, llama-completion, llama-server,
-and every other in-tree caller. The weight plan is therefore
-**process-scoped**, stored on the process-wide `unified_cache`, not on
-the `llama_model` struct.
+This plan targets one active placement domain per process: one loaded model,
+one unified-cache arena set, and one immutable placement envelope. This is
+the realistic case for llama-cli, llama-completion, llama-server, and
+agent-team deployments that share one serving model. The weight/envelope plan
+is therefore **process-scoped**, stored on the process-wide `unified_cache`,
+not independently owned by each `llama_context`.
 
 Speculative decoding (draft model + target model) would need two
 weight arenas. It is deferred as future work; when it lands, it extends
@@ -730,27 +751,30 @@ The compute plan stays per-context either way.
 
 ### D11 — Compute plan + RUNTIME zone lifecycle
 
-- RUNTIME zone capacity is set **once** at model load, sized for the
-  `model_params.n_ctx` peak of a single context.
-- Each `llama_context`'s compute plan allocates from the RUNTIME zone at
-  context creation.
+- RUNTIME zone capacity is set **once** at model load, sized for the declared
+  placement envelope: max actual graph shape plus the configured
+  concurrency/slot policy.
+- Each `llama_context` or server slot/session compute plan allocates from the
+  RUNTIME zone when that context/slot becomes active.
 - On `llama_context_free`, the compute plan's allocations return to the
   RUNTIME zone via TLSF free. The plan struct itself is destroyed with
   the context.
-- Concurrent contexts on the same device **share** the RUNTIME zone on a
-  first-come-first-served basis. If context B's compute plan cannot fit
-  because context A has already allocated most of RUNTIME, context B's
-  creation fails with a clear error. This is by design; the alternative
-  (reserve N× RUNTIME for N concurrent contexts) over-allocates for the
-  common single-context case.
+- Concurrent contexts/slots share the RUNTIME zone only up to the declared
+  envelope. If the server admits more active sessions or larger contexts than
+  the envelope, creation/activation fails with a clear "reload with a larger
+  placement envelope" error. This avoids surprise first-come-first-served
+  starvation while still allowing single-context deployments to choose a small
+  envelope.
 
-### D12 — `n_ctx` default when user doesn't pass `-c`
+### D12 — Placement envelope default when user doesn't pass `-c`
 
-If the user doesn't pass `-c`, `llama_model_params.n_ctx` defaults to the
-model's trained maximum (e.g., GPT-OSS 20B's 131072). The planner honors
-that number; if the resulting plan is infeasible for the current VRAM +
-host-pinned budget, load fails fast with a clear message listing the
-shortfall and suggesting `-c <smaller>` as the remediation.
+If the user doesn't pass `-c`, the placement envelope defaults to the model's
+trained maximum for a single active slot/context (e.g., GPT-OSS 20B's 131072)
+and the caller's configured parallelism for total KV capacity. The planner
+honors that envelope; if it is infeasible for the current VRAM + host-pinned
+budget, load fails fast with a clear message listing the shortfall and
+suggesting a smaller `-c`, fewer active slots, or a lower parallelism setting
+as the remediation.
 
 Rationale: respecting the model default is the principled behavior and
 matches current llama.cpp semantics. Silently capping the context
@@ -834,14 +858,14 @@ mutex-hold pattern. Land E1 before starting Tracks A/B/C.
 
 | Task | Summary | Acceptance |
 |---|---|---|
-| A1 | Add `n_ctx`, `n_ubatch`, `n_seq_max`, `flash_attn_type` to `llama_model_params`; update every in-tree caller (`common/common.cpp`, `llama-cli`, `llama-completion`, `llama-server`, examples) to populate from their CLI args before `llama_model_load_from_file` | Build clean; all callers compile; model load sees the right `n_ctx` via the new fields |
-| A2 | Extend `compute_placement_plan()` signature to consume `model_params` in addition to `kv_info`; stop using `inventory->n_ctx` | Plan decisions reflect user's `-c` value at load time; `GGML_SYCL_DEBUG=1` log confirms correct `n_ctx` |
-| A3 | Split the struct: `weight_plan` (model-scope) + `compute_plan` (context-scope). Keep `placement_plan` as the shared backing type; add a lifecycle for the per-context part | Two `compute_plan` instances coexist for two contexts sharing a model; weight_plan is read-only after model load |
-| A3a | Build the throwaway mini-context infrastructure: construct-from-`model_params`, build skeleton graph, run `graph_reserve(no_alloc=true)`, tear down | Mini-context creation/teardown leaks no memory (verified by stress test); `graph_reserve` returns authoritative sizes. **Validation status (2026-04-24)**: sizing direction unblocked by D0.2 generalization (single-shape sizing validated across 5 model variants); m09zb axis cleared via patched compute-runtime so mini-context mechanics can now be exercised on GPU — Task 5 prototype not yet written. |
-| A3b | Move FA auto-detection into the skeleton graph pass; store `effective_flash_attn` on the model | `cparams.flash_attn_type = auto` at context creation inherits the model's resolved value; `cparams.flash_attn_type = on` errors if `effective_flash_attn == off`. **Validation status (2026-04-24)**: m09zb axis cleared (patched compute-runtime); awaits Task 5 (mini-context prototype) implementation. |
-| A4 | Arena zone sizing consumes `weight_plan` at reservation time; compute-plan allocations happen within the RUNTIME zone reserved in step A3 | Zones sized correctly the first time; no post-hoc `reserve_scratch_pool` / re-reserve path; model-load reserves RUNTIME for max context, compute plan per context allocates within it |
+| A1 | Add placement-envelope fields to `llama_model_params`: `n_ctx` / max ctx per slot, `n_ubatch`, `n_seq_max` / max active sequences or slots, `flash_attn_type`, and any needed aggregate-capacity helper fields; update every in-tree caller (`common/common.cpp`, `llama-cli`, `llama-completion`, `llama-server`, examples) to populate the envelope before `llama_model_load_from_file` | Build clean; all callers compile; model load sees the declared capacity envelope. This is not a per-user context object. |
+| A2 | Extend `compute_placement_plan()` signature to consume the placement envelope in addition to `kv_info`; stop using `inventory->n_ctx` | Plan decisions reflect the caller's declared max/aggregate capacity (e.g. `-c`, `--parallel`, `-ub`) instead of the model's trained maximum unless that is the chosen default; `GGML_SYCL_DEBUG=1` log confirms the envelope |
+| A3 | Split the struct into two `placement_plan` instances: a process-scoped weight/envelope plan on `unified_cache` and a context/slot-scoped compute plan. Keep `placement_plan` as the shared backing type; add lifecycle for the short-lived compute part | Multiple compute plans can coexist within the loaded envelope; the unified-cache weight/envelope plan is read-only after model load |
+| A3a | Build the throwaway mini-context infrastructure from the placement envelope: construct max/aggregate skeleton graph, run `graph_reserve(no_alloc=true)`, tear down | Mini-context creation/teardown leaks no memory; `graph_reserve` returns authoritative sizes. **Validation status (2026-04-24)**: VALIDATED by Task 5 prototype (`333df7379`) on Mistral 7B + GPT-OSS 20B; production must use `use_mmap=false` or fix `jfj0v`'s mmap/no_alloc assert. |
+| A3b | Move FA auto-detection into the skeleton graph pass; store `effective_flash_attn` on the active model/envelope plan | `cparams.flash_attn_type = auto` at context creation inherits the model's resolved value; `cparams.flash_attn_type = on` errors if `effective_flash_attn == off`. **Validation status (2026-04-24)**: VALIDATED by Task 5 prototype; A3b can proceed. |
+| A4 | Arena zone sizing consumes the weight/envelope plan at reservation time; context/slot compute plans allocate within pre-reserved RUNTIME/KV/SCRATCH capacity | Zones sized correctly on first reservation; no post-hoc `reserve_scratch_pool` / re-reserve path; model load reserves capacity for the declared envelope, and each actual context/slot plan allocates within it |
 | A5 | Delete orphan runtime-update path: `ggml_backend_sycl_set_runtime_n_ctx()`, header declaration, `planner_n_ctx_is_runtime` flag, `update_placement_plan_runtime_n_ctx()` | `grep -rn` confirms all three symbols removed; builds clean |
-| A6 | `llama_init_from_model` validates cparams consistency with weight_plan's assumptions; emit an error if `cparams.n_ctx > model_params.n_ctx` or `cparams.flash_attn_type` contradicts `effective_flash_attn` | Mismatched cparams surface as a clear error; matching cparams are a no-op |
+| A6 | `llama_init_from_model` / server slot activation validates requested shape against the loaded placement envelope; emit an error if a context/slot exceeds max ctx, max active slots/sequences, ubatch, or `effective_flash_attn` assumptions | Mismatched requests surface as clear "reload with a larger placement envelope" errors; matching requests are a no-op |
 | A7 | Weight loader writes directly to `arena_base + plan.entries[i].offset` (VRAM) or `pinned_base + plan.entries[i].offset` (host-pinned). Delete the S1-PRELOAD staging path | No intermediate bounce buffer in the load path; mmap → arena is one copy. **Validation status (2026-04-24)**: VALIDATED. D0.4 PASSES under the patched compute-runtime (system-default libze 1.14.37435), `tensor_set_us = 282422`. A7 can proceed. |
 
 ### Track B — Buffer type `get_max_size` (prerequisites to Track C)
@@ -849,7 +873,7 @@ mutex-hold pattern. Land E1 before starting Tracks A/B/C.
 | Task | Summary | Acceptance |
 |---|---|---|
 | B1 | `llama.cpp-w1rxh` — buffer type reports zone size, not L0 max alloc | `ggml_vbuffer` chunks compute buffer across zone limits |
-| B2 | `llama.cpp-tyoc2` — host compute buffer chunks route through SCRATCH zone | Host-compute path available for CPU-backed experts/activations |
+| B2 | `llama.cpp-tyoc2` — host compute buffer chunks route through unified-cache host compute arena | Host-compute path available for CPU-backed experts/activations without abusing graph-reset SCRATCH |
 | B3 | `llama.cpp-01mcl` — drop `must_device=true` on compute buffer | Compute buffer can legally live host-pinned when plan directs |
 
 ### Track C — Op-level routing
@@ -857,17 +881,21 @@ mutex-hold pattern. Land E1 before starting Tracks A/B/C.
 | Task | Summary | Acceptance |
 |---|---|---|
 | C1 | Add per-source dependency check (`sources_needing_weights`, `sources_in_kv`) to op router | Replaces `layer_plan_applies_to_op` switch with data-driven dispatch |
-| C2 | Populate `plan.ops` for **every** op in the post-scheduler-split graph (MUL_MAT, MUL_MAT_ID, FLASH_ATTN_EXT, synthetic CPY, etc.) with per-op preferred device | Per-op log line shows plan decision at first dispatch; CPY entries visible in plan dump; no change in Mistral output. **Validation status (2026-04-24)**: op-id keying validated by D0.3 single-device check (Task 1, `607fca77e`) — 5 repeated `graph_reserve` calls produce byte-identical (op_id, op_type, name) sequences. C2 can proceed with op_id keying as specified; multi-device CPY-name stability remains a future TODO (requires ≥2 SYCL devices safely usable + E1). |
+| C2 | Populate `plan.ops` for **every** executable graph op and every scheduler transfer edge (MUL_MAT, MUL_MAT_ID, FLASH_ATTN_EXT, scheduler split-input copy edges, etc.) with per-op/per-edge preferred device | Per-op/per-edge log at first dispatch shows plan decision; transfer-edge entries visible in plan dump; no change in Mistral output. **Validation status (2026-04-26)**: op-id keying validated by D0.3 single-device check (Task 1, `607fca77e`). D0.3a refuted the old "synthetic CPY node" assumption: multi-device scheduler copies appear as stable copy-edge tensors (`SYCL1#...#0`) with `GGML_OP_NONE`, not `GGML_OP_CPY`. C2 must consume scheduler split/copy metadata, not only graph nodes. |
 | C3 | Remove `layer_plan_applies_to_op`, `depends_on_planned_host_weight`, `g_tl_fattn_weight_stage` (FA per-op stage from llama.cpp-15li2), and `GGML_SYCL_FORCE_STREAMING` | grep for each symbol returns zero hits in src; behavior preserved via `plan.ops` |
 
 ### Track D — Validation, observability, + pre-flight canaries
 
 | Task | Summary | Acceptance |
 |---|---|---|
-| D0.1 | **Canary (gates A3a)**: skeleton graph validity — build metadata-only graph for Mistral 7B + GPT-OSS 20B, call `graph_reserve(no_alloc=true)`, compare to a real-context reserve on same params | Sizes bit-identical → A3a approach validated. Divergent → switch to plan B (mmap-backed mini-context); document decision |
-| D0.2 | **Canary (gates A3a)**: PP + TG graph union — reserve at `max_ubatch` vs `ubatch=1`, verify every op produced by either shape appears in the union walk | Union is complete; A3a's double-reserve strategy validated |
-| D0.3 | **Canary (gates C2)**: post-split CPY visibility — force `GGML_SYCL_SPLIT_RATIO` multi-device, call `graph_reserve`, walk the post-split graph, confirm CPY nodes have stable deterministic names | CPY names stable across runs; `plan.ops` can key on them |
+| D0.1 | **Canary (gates A3a)**: skeleton graph validity — build metadata-only graph for Mistral 7B + GPT-OSS 20B, call `graph_reserve(no_alloc=true)`, compare to a real-context reserve on same params | **PASS (2026-04-25)**: canary now runs the Task 5 real/mini protocol through `test-mini-context-prototype`. Mistral 7B dense and GPT-OSS 20B active SWA+MoE both returned exit 0. A3a is backed for those tested families; state-space remains covered by D0.2/SSM follow-ups. |
+| D0.2 | **Canary (gates A3a)**: PP + TG graph union — reserve at `max_ubatch` vs `ubatch=1`, verify every op produced by either shape appears in the union walk | PASS for dense/full-attention and GPT-OSS active SWA+MoE. State-space remains open because no fixture exists and SYCL lacks `GGML_OP_SSM_SCAN` support/routing. Follow-ups: `llama.cpp-3h5gm.4`, `llama.cpp-xwnkf`. |
+| D0.3 | **Canary (gates C2)**: scheduler op/transfer visibility — force `GGML_SYCL_SPLIT_RATIO` multi-device, split a cross-backend graph, and record transfer representation across repeated reserves | Single-device op-id stability is validated. Multi-device D0.3a now proves the old CPY-node premise is false: the scheduler reports copy slots and stable split-input copy tensors, but no `GGML_OP_CPY` nodes. C2 must plan transfer edges from scheduler metadata. Follow-up remains open: `llama.cpp-bkvc9` to update the implementation contract and close the canary with the corrected assertion. |
 | D0.4 | **Canary (gates A7)**: direct-weight-load mechanics — prototype one tensor loaded from mmap bytes directly into `arena_base + offset` via `ggml_backend_tensor_set` | One-copy load verified on both Mistral 7B and GPT-OSS 20B; A7 proceeds on existing API |
+| D0.5 | **Validation (gates A1/A2 semantics)**: placement-envelope model for multi-user serving — verify the long-term shape is one loaded model with max slot/sequence/KV/ubatch capacity, not one model-load plan per user context | **SHAPE PASS / ADMISSION FAIL (2026-04-25)**: `test-placement-envelope-canary` validates context geometry for split KV + unified KV, but over-envelope context creation succeeds (`envelope_ctx=1024`, requested `n_ctx=2048`). A6 must enforce the loaded envelope. Findings: `docs/plans/data/placement-envelope-validation/d0.5-d0.6-placement-envelope-canary.md`. |
+| D0.6 | **Canary (gates D11 claims)**: repeated/concurrent context or slot compute-plan creation/destruction inside one placement envelope | **FAIL (2026-04-25)**: canary repeated context create/destroy grows host pinned/SCRATCH arena by 2 GiB chunks for ~30-36 MiB compute-buffer requests. Root fix is two-layer: reserve/admit host compute capacity instead of additive growth, and split context-lifetime `HOST_COMPUTE` from graph-reset `HOST_SCRATCH`. Follow-up: `llama.cpp-3h5gm.1`. |
+| D0.7 | **Audit (gates unified-cache ownership goal)**: enumerate remaining SYCL direct allocations and raw `tensor->data` bypasses | **OPEN / NOT YET TRUE (2026-04-25)**: deeper scan found 183 non-comment `sycl::malloc_*` / `sycl::free` lines outside tests/docs, 94 even after excluding allocator internals/common wrappers, 76 `ggml_sycl_malloc_*`/raw wrapper call lines, 228 non-comment `tensor->data` lines, and 20 `data_device[]` lines. Runtime guard evidence also catches `kv_tier:migrate` calling `ggml_sycl_malloc_host(queue)` outside unified_cache, and KV planned-host layers materializing as device. Follow-ups: `llama.cpp-3h5gm.3`, `.5`, `.6`, `.7`. Findings: `docs/plans/data/placement-envelope-validation/d0.7-ownership-audit.md`. |
+| D0.8 | **Benchmark (gates D14 policy claim)**: CPU dispatch for host-resident weights vs GPU streaming over PCIe | **BLOCKED/UNPROVEN (2026-04-25)**: Q8_0 MMVQ/MMQ streaming benchmark paths hit Level Zero `DEVICE_LOST`/`OUT_OF_DEVICE_MEMORY`; `test-sycl-cpu-dispatch` fails correctness checks and aborts at `cpu-dispatch.cpp:462` (`q_row_size <= g_cpu_dispatch_buffers.src1_q.size()`). C3 must not delete streaming controls until dense + MoE data backs CPU dispatch or D14 is revised. Follow-up: `llama.cpp-3h5gm.2`. Findings: `docs/plans/data/placement-envelope-validation/d0.8-benchmark-attempt.md`. |
 | D1 | Plan dump diagnostic: `GGML_SYCL_PLAN_DUMP=1` prints full plan at context creation | Single-screen summary including compute.* fields; byte-deterministic across runs with same inputs |
 | D2 | Plan-reality audit at inference end: compare plan vs actual allocation | Mismatch ≥ 5% logged as WARN, > 20% as ERROR |
 | D3 | Regression suite: Mistral 7B Q4_0 + GPT-OSS 20B (FA on) + GPT-OSS 120B at `VRAM_BUDGET_PCT` ∈ {100, 50, 30} | All pass with plan dump showing zero mismatches; canonical outputs unchanged |
@@ -884,7 +912,7 @@ E1 ─┬─→ A1 → A2 → A3 → A3a → A3b → A4 → A5 → A6 → A7
 D1 can land after A3b (plan.compute populated + FA resolved)
 D2 requires A7 + C2
 D3 is epic-close gate
-D0.1, D0.2, D0.3, D0.4 can re-run once E1 lands (they currently INCONCLUSIVE / blocked)
+D0.1 and D0.4 have current PASS evidence under the patched runtime; D0.2 remains state-space-open; D0.3 remains multi-device-CPY-open.
 ```
 
 E1 gates every task that constructs a `llama_context` on a GPU-offloaded
@@ -913,15 +941,17 @@ GPU-offloaded models. Gates every subsequent phase — none of Phases 1–5
 can be validated (or even exercised by the D0 canaries) until E1 is in.
 
 **Phase 1 — API + plumbing (A1 + A2 + B1):**
-Extend `llama_model_params`; update every in-tree caller; change
-`compute_placement_plan()` signature to consume `model_params`; land
-buffer-type `get_max_size` chunking. No behavior change yet.
+Extend `llama_model_params` with the placement envelope; update every
+in-tree caller to populate the envelope; change `compute_placement_plan()`
+signature to consume that envelope; land buffer-type `get_max_size`
+chunking. No behavior change yet.
 
 **Phase 2 — Weight plan is real (A3 + A3a + A3b + A4):**
-Split struct into weight_plan (model-scope) + compute_plan (context-scope).
-Build throwaway mini-context + skeleton graph for `graph_reserve(no_alloc=true)`
-at model load. Move FA auto-detection into this pass. Arena zones sized
-from authoritative graph_reserve output.
+Split into long-lived process-scoped weight/envelope plan + short-lived
+context/slot compute plans. Build throwaway mini-context + skeleton graph
+for `graph_reserve(no_alloc=true)` at model load from the declared envelope.
+Move FA auto-detection into this pass. Arena zones sized from authoritative
+graph_reserve output.
 
 **Phase 3 — Direct placement + cleanup (A5 + A6 + A7):**
 Weight loader writes directly to arena offsets; delete S1-PRELOAD staging.
@@ -944,39 +974,45 @@ Summary: [`docs/plans/data/planner-canaries/summary.md`](data/planner-canaries/s
 
 | Canary | Result | Design impact |
 |---|---|---|
-| D0.1 skeleton determinism | INCONCLUSIVE | blocked on E1; mini-context `graph_reserve` mechanics unverified until the L0 wedge is fixed |
-| D0.2 PP + TG union | PASS | A3a can size zones from a single shape; Mistral 7B (13 ops) and GPT-OSS 20B (17 ops) both produce PP == TG. Generalized 2026-04-24 to 4 additional Mistral 7B quantization variants (Q2_K, Q3_K_M, Q4_K_M, Q8_0) — all 13 ops, PP==TG on each (`docs/plans/data/planner-canaries/d0.2-generalization.md`); architecture-coverage caveat: only Mistral-dense + GPT-OSS-MoE families locally available. |
-| D0.3a post-split CPY visibility (multi-device) | INCONCLUSIVE | Single device visible (B50 disabled per `feedback_disable_b50.md`); cross-device CPY scenario unavailable. Rerun requires ≥2 safely-usable devices AND E1. |
+| D0.1 skeleton determinism | PASS (2026-04-25) | Canonical canary now invokes `test-mini-context-prototype`; Mistral 7B dense and GPT-OSS 20B active SWA+MoE both pass real-A / real-B / mini reserve comparison. A3a mini-context sizing is backed for those tested families. |
+| D0.2 PP + TG union | PASS for tested families; STATE-SPACE OPEN | A3a can size zones from a single shape for tested families; Mistral 7B dense/full-attention and GPT-OSS active SWA+MoE both produce PP == TG. State-space remains open because no fixture exists and SYCL lacks `GGML_OP_SSM_SCAN` support/routing for Mamba/Plamo2 graphs (`docs/plans/data/planner-canaries/d0.2-architecture-coverage-2026-04-25.md`). |
+| D0.3a post-split CPY visibility (multi-device) | FAIL / DESIGN CORRECTION | Synthetic two-GPU scheduler proof records `copies=1`, stable scheduler copy-edge tensors, and `cpy_nodes=0`. Cross-backend transfers are not `GGML_OP_CPY` graph nodes in this scheduler path. C2 must plan scheduler copy edges explicitly. Follow-up: `llama.cpp-bkvc9`. |
 | D0.3b op-id stability (single-device) | PASS | 5 repeated `graph_reserve` calls produce byte-identical (op_id, op_type, name) sequences — C2 can safely key on op_id. |
 | D0.4 direct-weight-load mechanics | PASS (2026-04-24, patched-runtime test) | Pre-patch the wedge was at `ggml-sycl.cpp:12685` outer / L~13076 inner (Task 10 narrowed). The patched compute-runtime (`/Apps/compute-runtime` branch `fix/combined-26.09`, libze 1.14.37435 dpkg-diverted as system default) clears the wedge: D0.4 completes in `tensor_set_us = 282422` (~282 ms). m09zb is upstream-fixed in our compute-runtime fork. A7 mechanics validated. |
+| D0.5 placement-envelope semantics | SHAPE PASS / ADMISSION FAIL | `test-placement-envelope-canary` proves context-side geometry for split KV and unified KV, but `--expect-over-reject` fails because an over-envelope context succeeds. Findings: `docs/plans/data/placement-envelope-validation/d0.5-d0.6-placement-envelope-canary.md`. |
+| D0.6 context/slot compute-plan concurrency | FAIL | Smoke concurrency did not crash, but repeated create/destroy grows host pinned/SCRATCH zones monotonically. This fails the lifecycle part of D0.6 until teardown/reuse semantics are fixed in `llama.cpp-3h5gm.1`. |
+| D0.7 unified-cache ownership audit | OPEN / NOT YET TRUE | Deeper production scan found 183 non-comment `sycl::malloc_*` / `sycl::free` lines outside tests/docs, 94 outside allocator internals/common wrappers, 76 wrapper/raw-allocator call lines, 228 `tensor->data` lines, and 20 `data_device[]` lines. Many are legitimate boundaries, but inference-adjacent allocation owners and raw pointer bypasses remain. Cleanup/classification is tracked by `llama.cpp-3h5gm.3`; enforcement/logical-boundary work is tracked by `llama.cpp-3h5gm.5`, `llama.cpp-3h5gm.6`, and `llama.cpp-3h5gm.7`. Findings: `docs/plans/data/placement-envelope-validation/d0.7-ownership-audit.md`. |
+| D0.8 CPU-dispatch-vs-streaming benchmark | BLOCKED/UNPROVEN | Streaming benchmark attempts fail with Level Zero DEVICE_LOST/OOM even at small sizes. CPU dispatch also fails correctness checks and aborts at `cpu-dispatch.cpp:462` due insufficient preallocated activation quant buffer. CPU-dispatch policy is not benchmark-backed and C3 deletion remains gated; proof-harness repair is tracked by `llama.cpp-3h5gm.2`. Findings: `docs/plans/data/placement-envelope-validation/d0.8-benchmark-attempt.md`. |
 
-**Validation summary (final session-end state, 2026-04-24)**: see [`docs/plans/data/planner-canaries/validation-summary.md`](data/planner-canaries/validation-summary.md) for the consolidated 8-item before/after table. **Final tally**: six items fully validated (op-id stability, single-shape sizing within tested architectures, layer-streaming policy consistency, m09zb resolved upstream, D0.4 PASS, mini-context + FA prototype PASS via Task 5 commit `333df7379`), one partially validated (Task 2 architecture coverage caveat for SWA + state-space), one deferred (Task 7 priority benchmark, gated on the three layered VRAM-arena beads filed by Closeout A — `llama.cpp-khcc0`, `llama.cpp-zhzbp`, `llama.cpp-w2ptt`). Zero refuted.
+**Validation summary (final session-end state, 2026-04-24; architecture correction/proof updates 2026-04-25/26)**: see [`docs/plans/data/planner-canaries/validation-summary.md`](data/planner-canaries/validation-summary.md) for the consolidated before/after table. **Current tally**: A3a mini-context sizing is validated for tested dense/full-attention and active SWA+MoE fixtures; D0.1 now has current PASS evidence; D0.4 PASS validates direct-load mechanics under patched runtime; C2 op-id keying is validated for single-device graphs. Still open/corrected: state-space (`SSM_SCAN` support + fixture), multi-device transfer planning (D0.3a proves scheduler copy edges, not CPY nodes), CPU-dispatch-vs-streaming policy, and unified-cache-only ownership.
 
 The design changes in the preceding sections (Known issues, Track E,
 Migration plan Phase 0, E1 acceptance) already incorporate the canary
-findings. **Final state of Track A**: A3a sizing direction (D0.2) +
-A3a/A3b mini-context mechanics (Task 5) validated; A7 direct-load
-(D0.4) validated; C2 op-id keying (D0.3b) validated. C2's
-multi-device CPY-name scope (D0.3a) remains INCONCLUSIVE on
-host-policy grounds (B50 disabled). The planner-validation epic is
-COMPLETE at the design-validation level. The remaining gates on
-canonical-context inference are backend-implementation walls
-(`khcc0`, `zhzbp`, `w2ptt`) — not planner-design issues. See the
-summary file's "Open follow-ups" section for the full bead +
-priority + owner list.
+findings. **Current Track A state**: A3a sizing direction (D0.2) +
+A3a/A3b mini-context mechanics (Task 5 + D0.1 rerun) validated for
+tested dense/SWA+MoE families; A7 direct-load (D0.4) validated; C2
+op-id keying (D0.3b) validated for single-device graphs. C2's
+multi-device transfer scope (D0.3a) now has a corrected contract:
+scheduler copy edges are stable, but they are not `GGML_OP_CPY` nodes. The
+remaining gates on canonical-context inference are backend
+implementation walls (`khcc0`, `zhzbp`, `w2ptt`) plus the D0.6/D0.7
+ownership/lifecycle fixes. See the summary file's "Open follow-ups"
+section for the full bead + priority + owner list.
 
 ## Acceptance criteria (epic-level)
 
 - [ ] `placement_plan` contains a populated `compute` field for every
   `llama_context` created on a SYCL backend
-- [ ] `compute_placement_plan()` is called exactly once per model, at
-  `llama_model_load_from_file`, and reads `n_ctx` / `n_ubatch` / etc. from
-  the extended `llama_model_params`
+- [ ] `compute_placement_plan()` is called exactly once per loaded placement
+  domain, at `llama_model_load_from_file`, and reads the placement envelope
+  (`n_ctx`, total KV/sequence capacity, `n_ubatch`, FA policy, etc.) from the
+  extended `llama_model_params`
 - [ ] `ggml_backend_sycl_set_runtime_n_ctx()`, `planner_n_ctx_is_runtime`,
   and `update_placement_plan_runtime_n_ctx()` are deleted (plus the header
   declaration)
-- [ ] Plan `n_ctx` equals the user-specified `-c` value (not the model's
-  trained maximum) — verifiable via `GGML_SYCL_PLAN_DUMP=1`
+- [ ] Plan envelope equals the caller-declared serving envelope (for example
+  `-c`, `--parallel`, `-ub`, FA policy) rather than blindly using the model's
+  trained maximum — verifiable via `GGML_SYCL_PLAN_DUMP=1`
 - [ ] Weights are written directly into their planned zones as they're read
   from GGUF — no relocation copy exists in the load path
 - [ ] `llama_init_from_model` contains no plan-mutating calls (only
@@ -987,6 +1023,16 @@ priority + owner list.
 - [ ] `GGML_SYCL_VRAM_BUDGET_PCT=30` + default context succeeds for Mistral 7B,
   GPT-OSS 20B, and (where the chain allows) GPT-OSS 120B without touching the
   `ioua6` fail-fast path
+- [ ] D0.5 runtime admission canary verifies one loaded model can serve
+  multiple slots/sequences inside the declared placement envelope and rejects
+  over-envelope requests deterministically
+- [ ] D0.6 stress/TSAN canary verifies repeated/concurrent context or slot
+  compute-plan creation/destruction has no races and returns arena allocations
+  to unified_cache
+- [ ] D0.7 ownership audit has no unclassified SYCL inference hot-path
+  allocation bypasses or raw-pointer dispatch bypasses
+- [ ] D0.8 benchmark either backs the CPU-dispatch-over-streaming policy or
+  the policy is revised before C3 deletes streaming paths
 - [ ] Per-op routing produces the same kernel dispatch as today for Mistral 7B
   canonical and 20B canonical (byte-identical output)
 - [ ] `GGML_SYCL_PLAN_DUMP=1` produces a plan summary readable in under 30
@@ -1001,8 +1047,9 @@ priority + owner list.
 - CUDA / Metal / Vulkan port of the unified plan (SYCL-only for now; other
   backends can adopt the pattern later)
 - Runtime re-planning (D3 explicitly rejects this)
-- Multi-context planning (one `placement_plan` per `llama_context`; contexts
-  don't share plan state)
+- Runtime rebalancing across multiple loaded models (this plan targets one
+  active placement domain; speculative/draft models need a future model-id
+  partition)
 - NUMA-aware host placement (all host allocations go to the same pinned pool)
 - Graph caching across contexts (liveness is per-context)
 - Replacing ggml's scheduler (we consume it, not replace it)
@@ -1015,11 +1062,11 @@ priority + owner list.
 | `llama_model_params` API change breaks external callers of this fork | We own this fork; update all in-tree callers in the same PR; external users of the fork must adopt |
 | Per-op routing regresses an edge case | Regression surfaces in Track D3 canary suite → fix forward in same PR set. No `GGML_SYCL_UNIFIED_PLAN=0` escape hatch (see D8). |
 | Multi-GPU tensor split needs per-device plans | Plan is already per-device via `per_device_bytes[]`; audit for gaps during Track A |
-| `cparams.n_ctx > model_params.n_ctx` | A6 validates and errors at context creation; caller fix is to set `model_params.n_ctx` to the maximum they'll ever ask for |
+| Requested context/slot exceeds the placement envelope | A6 validates and errors at context/slot creation; caller fix is to reload with a larger envelope or admit fewer/lower-context sessions |
 | S1-PRELOAD path overlaps with direct placement | Delete S1-PRELOAD — its role (stage to host-pinned, then stream to device) is replaced by "mmap → arena is one copy." Done in Phase 3 (task A7). |
 | Throwaway mini-context leaks resources | Explicit teardown in the planner call + stress test in Track D3; ASAN CI run validates zero leaks across 100 model loads |
 | FA auto-detection timing regression for existing models | Track D3 regression suite includes FA auto-detection on Mistral (should resolve ON) and 20B (should resolve ON post-15li2); same result as current late-detection |
-| Multi-context creates different compute plans simultaneously | Each `llama_context` owns its own compute plan; weight plan on the `llama_model` is shared. Tested in D3 regression. |
+| Multi-user slots or contexts create different compute plans simultaneously | Each active slot/context owns its own compute plan; the process-scoped weight/envelope plan is shared read-only. Dedicated D0.5/D0.6 validation gates cover admission and concurrency before this is treated as proven. |
 | No fallback means a regression blocks everybody | Mitigation is strict D3 regression suite coverage before epic-close; if regression hits in practice we fix the plan, not roll back. This is by design per user directive. |
 | L0 DirectSubmission non-flush wedges `event.wait()` post-backend-init (bead `llama.cpp-m09zb`) | Fix via task E1 before starting Track A. Primary direction: restructure `staging_buffer_pool` to own caller-side event chains (~200 LoC in `ggml/src/ggml-sycl/common.hpp`). Secondary direction: address the underlying L0 flush path — see Known-issues Implication block for three candidate approaches. Reproduces in ~7 s on cold Mistral 7B load via the preload path AND via direct `ggml_backend_tensor_set` (D0.4 witness). |
 
