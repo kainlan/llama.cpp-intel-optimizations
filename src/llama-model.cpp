@@ -8682,8 +8682,13 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         bool is_default_buft                = buft == ggml_backend_dev_buffer_type(dev);
 
         std::vector<ggml_backend_buffer_ptr> bufs;
-        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
-            GGML_ASSERT(!ml.no_alloc);
+        // When no_alloc is set, the caller wants buffer placeholders only (e.g. a
+        // throwaway mini-context for graph_reserve sizing). Skip the mmap-from-host
+        // fast path and fall through to the dummy-buffer branch below — that path
+        // already produces a zero-size buffer for each tensor, satisfying the
+        // no_alloc contract without materializing real backend buffers over the
+        // mmap region. See bead llama.cpp-jfj0v.
+        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft && !ml.no_alloc) {
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
                 // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer,

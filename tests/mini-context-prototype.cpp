@@ -157,10 +157,11 @@ static int run_worker(const char * model_path, const char * mode) {
 
     if (std::strcmp(mode, "mini") == 0) {
         mparams.no_alloc = true;
-        // The mmap path asserts !no_alloc (llama-model.cpp:8686). Disable
-        // mmap so the metadata-only load path is taken instead.
-        mparams.use_mmap = false;
-        std::fprintf(stderr, "[worker %s] no_alloc=true, use_mmap=false (mini-context, metadata-only)\n", mode);
+        // mmap+no_alloc is now supported (bead llama.cpp-jfj0v): the loader
+        // routes the combination through the dummy-buffer path, so the mmap
+        // region exists for the real context but the mini-context allocates
+        // no backend buffers over it. Leave use_mmap at its default (true).
+        std::fprintf(stderr, "[worker %s] no_alloc=true, use_mmap=default (mini-context, metadata-only)\n", mode);
     } else {
         std::fprintf(stderr, "[worker %s] no_alloc=false (real context)\n", mode);
     }
