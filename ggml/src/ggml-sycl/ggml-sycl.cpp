@@ -9323,39 +9323,49 @@ static ggml_sycl_device_info ggml_sycl_init() {
         if (mem_err != 0 || free_vram == 0) {
             free_vram = device_vram;
         }
-        // Save pre-probe free VRAM.  The alloc probe below does binary-search
-        // malloc_device/free cycles whose freed memory lingers in the L0 USM
-        // pool, making subsequent get_memory_info() report artificially low
-        // free_mem.  This pre-probe snapshot is the ground truth.
         info.devices[i].free_vram_at_init = free_vram;
 
-        // Pre-initialize unified cache for this device before the probe.
-        // The probe allocation routes through unified_cache_allocate, which
-        // needs the cache to exist.  Pass device memory info directly to avoid
-        // ggml_sycl_info() reentry deadlock (we're inside that static init).
+        // Pre-initialize unified cache for this device.  Pass device memory
+        // info directly to avoid ggml_sycl_info() reentry deadlock (we're
+        // inside that static init).
         ggml_sycl::get_unified_cache_for_device(i, free_vram, device_vram, free_vram);
 
+        // Compute safe_max_alloc_size from the L0-advertised max_mem_alloc_size
+        // with a 5% safety margin.
+        //
+        // Historically this used a binary-search alloc-probe via
+        // ggml_backend_probe_max_alloc_size() to refine the cap.  The probe
+        // would do sycl::malloc_device(N)/sycl::free(ptr) cycles to find the
+        // largest size the runtime would actually accept.  However, on Arc
+        // B580 with patched libze 1.14.37435 the L0 driver's USM pool retains
+        // freed allocations internally — even though sycl::free returns
+        // SUCCESS, the physical VRAM is not released back to free space.
+        // Several GB of probed-then-freed allocations end up cached in the
+        // pool, which on a 12 GB device leaves only ~1.9 GB free for the rest
+        // of inference.  When the kernel-launch path then needs a small
+        // device-USM allocation (kernel arg buffer), it gets
+        // ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY (surfaced as SYCL exception
+        // with int 40 / UR_RESULT_ERROR_OUT_OF_RESOURCES in the error text).
+        //
+        // f9d565096 already established that the raw L0-advertised
+        // max_mem_alloc_size is the correct cap on patched libze (the
+        // single-chunk arena reservation succeeds at that size).  Skip the
+        // probe entirely and trust the L0 query plus the safety margin.
+        //
+        // NOTE: On stock libze 1.14.37020 the probe was historically the
+        // safety mechanism for the silent-oversize-alloc-wedge mode (stock
+        // accepts allocs that hang at runtime).  Reverting to stock without
+        // restoring the probe will reintroduce that wedge.  Patched libze
+        // 1.14.37435 fails oversized allocs cleanly, so the direct formula
+        // is safe on the supported config.
+        //
+        // See bead llama.cpp-w2ptt for the full investigation trace.
         size_t probe_upper = info.devices[i].max_alloc_size;
         if (free_vram > 0 && free_vram < probe_upper) {
             probe_upper = free_vram;
         }
-        const double                           safety_margin = 0.95;
-        ggml_backend_sycl_probe_buffer_context probe_ctx{ i, &(device_i.default_queue()) };
-        ggml_backend_buffer_type probe_buft{ ggml_backend_sycl_probe_buffer_type_interface, nullptr, &probe_ctx };
-        // E1 RCA env-gate: setting GGML_SYCL_E1_RCA_DISABLE_ALLOC_PROBE=1 skips
-        // the binary-search probe so we can test whether it leaves the L0
-        // driver in the m09zb-trigger state. RCA-only — leave OFF in normal
-        // builds (skipping the probe loses safe_max_alloc_size accuracy).
-        size_t safe_alloc = 0;
-        const char * e1_skip = std::getenv("GGML_SYCL_E1_RCA_DISABLE_ALLOC_PROBE");
-        if (e1_skip && e1_skip[0] == '1') {
-            GGML_LOG_WARN("[SYCL] E1 RCA: alloc probe disabled via env\n");
-        } else {
-            safe_alloc = ggml_backend_probe_max_alloc_size(&probe_buft, probe_upper, safety_margin);
-        }
-        if (safe_alloc == 0) {
-            safe_alloc = (size_t) std::floor((double) probe_upper * safety_margin);
-        }
+        const double safety_margin   = 0.95;
+        size_t       safe_alloc      = (size_t) std::floor((double) probe_upper * safety_margin);
 
         info.devices[i].safe_max_alloc_size = safe_alloc;
         GGML_LOG_INFO("[SYCL] Device %d alloc caps: raw=%.1f MB, safe=%.1f MB\n", i,

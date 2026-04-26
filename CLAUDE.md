@@ -200,7 +200,7 @@ sudo ln -sf libze_intel_gpu.so.1.14.37020 /usr/lib/x86_64-linux-gnu/libze_intel_
 sudo ldconfig
 ```
 
-The patched runtime correctly enforces per-allocation hardware caps (~1.5 GB on Arc B580), so the alloc probe in `ggml_sycl_init` returns a smaller `safe_max_alloc_size` (~1593 MB) than stock. **Hardcoding `floor(max * 0.95)` is not a substitute for the probe** — stock libze accepted oversize allocs that wedged at runtime; patched libze correctly fails them, and the probe converges on the real cap.
+The patched runtime correctly enforces per-allocation hardware caps (~1.5 GB on Arc B580). Historically the alloc probe in `ggml_sycl_init` did a binary-search of `sycl::malloc_device`/`sycl::free` to converge on `safe_max_alloc_size` (~1593 MB observed) — but on patched libze 1.14.37435 every freed probe chunk lingers in the L0 USM pool's internal cache, eating residual VRAM and surfacing later as `ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` at first kernel launch (mislabeled as `UR_RESULT_ERROR_OUT_OF_RESOURCES` / `40` in SYCL exception text). Commit `28ef6cea1` removed the probe and switched to `safe_max_alloc_size = floor(max_mem_alloc_size * 0.95)` directly — empirically validated against the bench gate (PP512 ≥ 1700, TG128 ≥ 80) on patched libze. **Reverting to stock libze 1.14.37020 without restoring the probe will reintroduce the original silent-oversize-alloc-wedge mode** that the probe was designed to defend against — stock historically accepted oversized allocs that hung at runtime, while patched libze 1.14.37435 fails them cleanly so the direct formula is safe on the supported config.
 
 ### SYCL Device Selection (Critical!)
 
