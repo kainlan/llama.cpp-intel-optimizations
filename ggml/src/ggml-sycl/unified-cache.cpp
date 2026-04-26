@@ -1096,7 +1096,11 @@ bool ggml_sycl_is_shutting_down() {
     return g_sycl_shutting_down.load(std::memory_order_acquire);
 }
 
-unified_cache::unified_cache(sycl::queue & queue, size_t budget_bytes, size_t staging_size, size_t dma_reserved_bytes) :
+unified_cache::unified_cache(sycl::queue & queue,
+                             size_t        budget_bytes,
+                             size_t        staging_size,
+                             size_t        dma_reserved_bytes,
+                             size_t        device_total_vram) :
     queue_(queue),
     budget_(budget_bytes),
     base_budget_(budget_bytes),
@@ -1164,8 +1168,16 @@ unified_cache::unified_cache(sycl::queue & queue, size_t budget_bytes, size_t st
 
     // VRAM Arena: pre-allocate a single VRAM block when GGML_SYCL_VRAM_ARENA=1.
     if (vram_arena_enabled()) {
-        const int dev_id    = ggml_sycl_get_device_id_from_queue(queue_);
-        size_t    max_alloc = queue_.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+        const int dev_id = ggml_sycl_get_device_id_from_queue(queue_);
+        // Per-allocation cap = the runtime's reported max_mem_alloc_size from
+        // the L0 device query.  This is what the runtime actually accepts;
+        // the alloc-probe `safe_max_alloc_size` (in ggml_sycl_info) saturates
+        // at a smaller value (~1.5 GB on Arc B580 + patched libze 1.14.37435),
+        // but that's the probe's stop-condition, NOT a hard runtime cap.
+        // Empirical: 5825 + 4660 MB chunks succeed on this hardware.  Using
+        // the probe value here would manufacture artificial caps that force
+        // unnecessary chunking on post-init paths.
+        const size_t max_alloc = queue_.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
 
         // Default zone sizes.  Scratch arena default is 256 MB.
         size_t       scratch_zone = 256 * 1024 * 1024;
@@ -1194,7 +1206,8 @@ unified_cache::unified_cache(sycl::queue & queue, size_t budget_bytes, size_t st
                           runtime_zone / (1024.0 * 1024.0));
         }
 
-        if (arena_reserve(queue_, budget_bytes, max_alloc, scratch_zone, onednn_zone, runtime_zone)) {
+        if (arena_reserve(queue_, budget_bytes, max_alloc, scratch_zone, onednn_zone, runtime_zone,
+                          device_total_vram)) {
             // Point compute_arena at the arena's SCRATCH zone immediately so
             // pool_leg can route through it.  Without this, pool_leg falls back
             // to sycl::malloc_device which can return low-VA pointers that the
@@ -5198,8 +5211,18 @@ static unified_cache * create_cache_for_device(int                     device_id
     }
 
     const size_t staging_bytes = resolve_host_staging_bytes();
+    // Total VRAM for arena_reserve's runtime-headroom calculation.  Sourced
+    // from the hint when supplied (mid ggml_sycl_init() — calling
+    // ggml_backend_sycl_get_device_memory() there would reenter
+    // ggml_sycl_info() and deadlock), otherwise queried directly.
+    size_t total_vram_for_ctor = hint ? hint->total_mem : size_t(0);
+    if (total_vram_for_ctor == 0) {
+        size_t free_unused = 0;
+        ggml_backend_sycl_get_device_memory(device_id, &free_unused, &total_vram_for_ctor);
+    }
     try {
-        g_device_caches[device_id]  = std::make_unique<unified_cache>(queue, budget, staging_bytes, dma_reserve_bytes);
+        g_device_caches[device_id]  = std::make_unique<unified_cache>(
+            queue, budget, staging_bytes, dma_reserve_bytes, total_vram_for_ctor);
         // Always baseline pre-existing runtime reservations so they don't
         // eat into the cache's weight budget.  Allocations that existed before
         // cache creation (DMA pre-reserve, probe residuals) are already
@@ -7636,7 +7659,8 @@ unified_cache * unified_cache_register_for_queue(int device_id, sycl::queue & qu
 
     const size_t staging_bytes = 16 * 1024 * 1024;  // 16 MB staging for secondary device
     try {
-        g_device_caches[device_id] = std::make_unique<unified_cache>(queue, budget, staging_bytes, 0);
+        g_device_caches[device_id] =
+            std::make_unique<unified_cache>(queue, budget, staging_bytes, 0, total);
         return g_device_caches[device_id].get();
     } catch (const sycl::exception & e) {
         GGML_LOG_ERROR("[UNIFIED-CACHE] Failed to register device %d: %s\n", device_id, e.what());
@@ -9142,7 +9166,8 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
                                   size_t        max_alloc_size,
                                   size_t        scratch_bytes,
                                   size_t        onednn_bytes,
-                                  size_t        runtime_bytes) {
+                                  size_t        runtime_bytes,
+                                  size_t        device_total_vram) {
     if (arena_base_) {
         // Same model, new context — reset ephemeral zones so KV/runtime
         // space from the previous context is reclaimable.  Weight zone is
@@ -9172,11 +9197,52 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     runtime_bytes = (runtime_bytes + 255) & ~size_t(255);
 
     // Try single-chunk first.  All zones share one contiguous allocation.
-    // Falls back to 2-chunk (compute+oneDNN vs weights) if single alloc fails.
+    // Falls back to N-chunk (tail zones in last chunk, weights spread across
+    // earlier chunks) if a single allocation would exceed the runtime's
+    // per-allocation cap (~1.5 GB on Arc B580 under patched libze 1.14.37435).
     int dev_id = ggml_sycl_get_device_id_from_queue(queue);
 
     void * ptr        = nullptr;
     size_t alloc_size = budget_bytes;
+
+    // Per-chunk cap used ONLY for N-chunk piece sizing (single-chunk attempt
+    // below is unconditional — let the runtime tell us if it doesn't fit).
+    // Use the L0-advertised `max_mem_alloc_size` directly: that is the size
+    // the runtime promises to accept.  No artificial safety margin — empirical
+    // evidence (master HEAD on patched libze 1.14.37435) shows allocations up
+    // to the cap succeed, and trimming the value here would manufacture
+    // unnecessary chunking on hardware with high reported caps.
+    const size_t per_chunk_cap = max_alloc_size;
+
+    // Cap upfront reservation so non-arena runtime allocations (transient
+    // ggml compute outputs, DMA staging, planner-side mallocs) still fit in
+    // residual VRAM (bead llama.cpp-w2ptt: oversubscribed arenas leave
+    // <2 GB free and graph-compute ops fail with err 40 / OUT_OF_RESOURCES on
+    // Mistral 7B GET_ROWS).  Caller passes total VRAM rather than us probing
+    // because this routine may run inside ggml_sycl_init() static init,
+    // where ggml_backend_sycl_get_device_memory() would reenter
+    // ggml_sycl_info() and deadlock.  Caller passes 0 to opt out of the cap
+    // entirely (e.g. mid-init paths where the live VRAM query would deadlock
+    // and no hint was supplied) — in that case we trust the caller's budget
+    // and skip the headroom subtraction.
+    if (device_total_vram > 0) {
+        const size_t runtime_headroom =
+            std::max<size_t>(2ull * 1024ull * 1024ull * 1024ull, device_total_vram / 6);
+        if (device_total_vram > runtime_headroom) {
+            const size_t arena_cap = device_total_vram - runtime_headroom;
+            if (alloc_size > arena_cap) {
+                const size_t prev_alloc = alloc_size;
+                alloc_size              = arena_cap;
+                GGML_LOG_INFO("[VRAM-ARENA] Capping arena at %.1f MB (was %.1f MB) to leave %.0f MB headroom for runtime allocs\n",
+                              alloc_size / (1024.0 * 1024.0), prev_alloc / (1024.0 * 1024.0),
+                              runtime_headroom / (1024.0 * 1024.0));
+            }
+        }
+    } else {
+        GGML_SYCL_DEBUG("[VRAM-ARENA] device_total_vram=0, skipping runtime-headroom cap "
+                        "(arena reserved at full budget %.1f MB)\n",
+                        alloc_size / (1024.0 * 1024.0));
+    }
 
     // Minimum shared (KV+WEIGHT) zone that is worth carving out.  Below this
     // the arena is useless for weight/KV storage and only aliases the tail
@@ -9186,7 +9252,11 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     // device %d, falling back to per-entry allocation").
     constexpr size_t k_min_shared_bytes = 16ull * 1024ull * 1024ull;  // 16 MB
 
-    if (alloc_size <= max_alloc_size) {
+    // Always try single-chunk first.  per_chunk_cap is the L0-advertised
+    // max_mem_alloc_size; the runtime promises to accept up to that, so a
+    // single-shot attempt is the right default.  Fall through to N-chunk
+    // only if the single allocation actually fails.
+    {
         const size_t tail_bytes = onednn_bytes + runtime_bytes + scratch_bytes;
         if (alloc_size < tail_bytes + k_min_shared_bytes) {
             GGML_LOG_WARN(
@@ -9206,10 +9276,10 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
         if (ptr) {
             alloc_registry::instance().register_alloc(ptr, alloc_size, dev_id, alloc_type::DEVICE);
 
-            arena_chunks_[0] = { ptr, alloc_size };
-            arena_n_chunks_  = 1;
-            arena_base_      = ptr;
-            arena_size_      = alloc_size;
+            arena_chunks_.clear();
+            arena_chunks_.push_back({ ptr, alloc_size });
+            arena_base_ = ptr;
+            arena_size_ = alloc_size;
 
             // Single-chunk zone layout:
             //   [KV→ ...free... ←WEIGHT] [ONEDNN] [RUNTIME] [SCRATCH]
@@ -9273,74 +9343,151 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
         }
     }
 
-    // Fallback: 2-chunk split (50% + 40% of budget).
-    const size_t chunk0_size = (budget_bytes * 50) / 100;
-    const size_t chunk1_size = (budget_bytes * 40) / 100;
+    // NOTE: this fallback only fires when the single-chunk sycl::malloc_device
+    // above actually fails (returned nullptr or threw).  On Arc B580 + patched
+    // libze 1.14.37435 the single alloc currently always succeeds and this
+    // fallback is dormant.  Activates on any GPU/runtime combo that enforces
+    // a real per-allocation cap below the budget (stock libze with under-
+    // reporting drivers, smaller GPUs, or future drivers that fail oversized
+    // allocs cleanly).
+    // N-chunk fallback.  Layout invariant: tail zones (oneDNN, RUNTIME,
+    // SCRATCH) live entirely in the LAST chunk so they remain contiguous.
+    // The single-chunk path documents why: oneDNN's dnnl_memory_create
+    // rejects USM pointers whose sycl::get_pointer_type() returns 'unknown',
+    // and the compute-runtime returns 'unknown' for low-offset sub-allocs
+    // within large malloc_device chunks.  Keeping the tail zones at the END
+    // of the LAST chunk reproduces the working single-chunk layout for those
+    // zones while letting weights overflow into earlier chunks.
+    //
+    // Plan:
+    //   - last chunk: KV zone (head) + ONEDNN + RUNTIME + SCRATCH (tail).
+    //     Sized at min(per_chunk_cap, kv_share + tail_bytes).
+    //   - chunks [0..N-2]: WEIGHT zone, each sized at per_chunk_cap, total
+    //     summing to alloc_size - last_chunk_size.
+    //
+    // Rationale for "tail-last": logical offset 0 maps to chunks[0] (the
+    // first weight chunk), preserving the single-chunk invariant that the
+    // WEIGHT zone starts at offset 0 from the layout pool's perspective.
+    const size_t tail_bytes = onednn_bytes + runtime_bytes + scratch_bytes;
 
-    if (chunk0_size > max_alloc_size || chunk1_size > max_alloc_size) {
-        GGML_LOG_WARN("[VRAM-ARENA] 2-chunk sizes (%.1f + %.1f MB) exceed max_alloc (%.1f MB)\n",
-                      chunk0_size / (1024.0 * 1024.0), chunk1_size / (1024.0 * 1024.0),
-                      max_alloc_size / (1024.0 * 1024.0));
+    // Pick the last (tail) chunk size: at most per_chunk_cap, at least
+    // tail_bytes + k_min_shared_bytes (so KV has a sane carve-out).  If the
+    // total budget is smaller than that, refuse — single-chunk path would
+    // already have caught this case via its own min-shared check.
+    const size_t tail_chunk_min  = tail_bytes + k_min_shared_bytes;
+    if (per_chunk_cap < tail_chunk_min) {
+        GGML_LOG_WARN(
+            "[VRAM-ARENA] Per-chunk cap %.1f MB too small to hold tail zones (%.1f MB) + min KV (%.1f MB); "
+            "refusing reservation\n",
+            per_chunk_cap / (1024.0 * 1024.0), tail_bytes / (1024.0 * 1024.0),
+            k_min_shared_bytes / (1024.0 * 1024.0));
         return false;
     }
 
-    // Refuse if the inner shared zone (chunk0 - tail) or the weight chunk
-    // would fall below the minimum viable size.  See nryi9 rootcause:
-    // a zero-width shared zone silently aliases tail zones and causes
-    // downstream DEVICE_LOST when weights have nowhere to live.
+    // Want as much KV in the tail chunk as the cap allows; any leftover
+    // becomes weight chunks.  Aim for tail = per_chunk_cap when the budget
+    // is large enough, else what budget allows.
+    size_t last_chunk_size = std::min<size_t>(per_chunk_cap, alloc_size);
+    if (last_chunk_size < tail_chunk_min) {
+        GGML_LOG_WARN(
+            "[VRAM-ARENA] Insufficient budget for N-chunk arena: total %.1f MB < tail %.1f MB + min KV %.1f MB; "
+            "refusing reservation\n",
+            alloc_size / (1024.0 * 1024.0), tail_bytes / (1024.0 * 1024.0),
+            k_min_shared_bytes / (1024.0 * 1024.0));
+        return false;
+    }
+
+    const size_t weight_total = alloc_size - last_chunk_size;
+    if (weight_total == 0) {
+        // alloc_size fit in one chunk but the single-chunk path couldn't allocate it.
+        // The N-chunk path would just retry the same alloc — refuse instead.
+        GGML_LOG_WARN(
+            "[VRAM-ARENA] N-chunk path reached with single-chunk-sized budget %.1f MB after single alloc failure; "
+            "refusing reservation\n",
+            alloc_size / (1024.0 * 1024.0));
+        return false;
+    }
+    if (weight_total < k_min_shared_bytes) {
+        GGML_LOG_WARN(
+            "[VRAM-ARENA] Insufficient budget for N-chunk arena: weight total %.1f MB < min %.1f MB; "
+            "refusing reservation\n",
+            weight_total / (1024.0 * 1024.0), k_min_shared_bytes / (1024.0 * 1024.0));
+        return false;
+    }
+
+    // Plan weight chunk sizes: each ≤ per_chunk_cap; final sliver picks up the remainder.
+    std::vector<size_t> chunk_sizes;
     {
-        const size_t tail_bytes   = onednn_bytes + runtime_bytes + scratch_bytes;
-        const size_t kv_size_est  = chunk0_size > tail_bytes ? chunk0_size - tail_bytes : 0;
-        if (kv_size_est < k_min_shared_bytes || chunk1_size < k_min_shared_bytes) {
-            GGML_LOG_WARN(
-                "[VRAM-ARENA] Insufficient budget for 2-chunk arena: "
-                "chunk0 shared zone would be %.1f MB (need %.1f), "
-                "chunk1 (weight) would be %.1f MB (need %.1f); refusing reservation\n",
-                kv_size_est / (1024.0 * 1024.0), k_min_shared_bytes / (1024.0 * 1024.0),
-                chunk1_size / (1024.0 * 1024.0), k_min_shared_bytes / (1024.0 * 1024.0));
-            return false;
+        size_t remaining = weight_total;
+        while (remaining > per_chunk_cap) {
+            chunk_sizes.push_back(per_chunk_cap);
+            remaining -= per_chunk_cap;
+        }
+        if (remaining > 0) {
+            chunk_sizes.push_back(remaining);
         }
     }
+    chunk_sizes.push_back(last_chunk_size);  // tail chunk last
 
-    void * p0 = nullptr;
-    void * p1 = nullptr;
-    try {
-        p0 = sycl::malloc_device(chunk0_size, queue);
-    } catch (...) {
-        p0 = nullptr;
-    }
-    if (!p0) {
-        GGML_LOG_WARN("[VRAM-ARENA] 2-chunk: chunk0 (%.1f MB) failed\n", chunk0_size / (1024.0 * 1024.0));
-        return false;
-    }
-    alloc_registry::instance().register_alloc(p0, chunk0_size, dev_id, alloc_type::DEVICE);
-    try {
-        p1 = sycl::malloc_device(chunk1_size, queue);
-    } catch (...) {
-        p1 = nullptr;
-    }
-    if (!p1) {
-        alloc_registry::instance().unregister_alloc(p0);
-        sycl::free(p0, queue);
-        GGML_LOG_WARN("[VRAM-ARENA] 2-chunk: chunk1 (%.1f MB) failed\n", chunk1_size / (1024.0 * 1024.0));
-        return false;
-    }
-    alloc_registry::instance().register_alloc(p1, chunk1_size, dev_id, alloc_type::DEVICE);
+    GGML_LOG_INFO("[VRAM-ARENA] Reserving N-chunk arena: %zu chunks, %.1f MB total (per-chunk cap %.1f MB)\n",
+                  chunk_sizes.size(), alloc_size / (1024.0 * 1024.0), per_chunk_cap / (1024.0 * 1024.0));
 
-    // chunk0: scratch+runtime+oneDNN+KV, chunk1: weights
-    arena_chunks_[0] = { p0, chunk0_size };
-    arena_chunks_[1] = { p1, chunk1_size };
-    arena_n_chunks_  = 2;
-    arena_base_      = p0;
-    arena_size_      = chunk0_size + chunk1_size;
+    // Allocate chunks; on any failure, free the ones already reserved.
+    arena_chunks_.clear();
+    arena_chunks_.reserve(chunk_sizes.size());
+    for (size_t i = 0; i < chunk_sizes.size(); ++i) {
+        void * p = nullptr;
+        try {
+            p = sycl::malloc_device(chunk_sizes[i], queue);
+        } catch (const sycl::exception & e) {
+            GGML_LOG_WARN("[VRAM-ARENA] N-chunk: chunk %zu (%.1f MB) failed: %s\n", i,
+                          chunk_sizes[i] / (1024.0 * 1024.0), e.what());
+            p = nullptr;
+        } catch (...) {
+            p = nullptr;
+        }
+        if (!p) {
+            GGML_LOG_WARN("[VRAM-ARENA] N-chunk: chunk %zu (%.1f MB) failed\n", i,
+                          chunk_sizes[i] / (1024.0 * 1024.0));
+            // Roll back any successful allocs.  Log on free failure so a
+            // silently leaked chunk leaves a breadcrumb in the operator log.
+            for (size_t j = 0; j < arena_chunks_.size(); ++j) {
+                auto & c = arena_chunks_[j];
+                if (c.ptr) {
+                    alloc_registry::instance().unregister_alloc(c.ptr);
+                    try {
+                        sycl::free(c.ptr, queue);
+                    } catch (const sycl::exception & e) {
+                        GGML_LOG_WARN("[VRAM-ARENA] N-chunk rollback: free of chunk %zu failed (leaking): %s\n",
+                                      j, e.what());
+                    } catch (...) {
+                        GGML_LOG_WARN("[VRAM-ARENA] N-chunk rollback: free of chunk %zu failed (leaking)\n", j);
+                    }
+                }
+            }
+            arena_chunks_.clear();
+            return false;
+        }
+        alloc_registry::instance().register_alloc(p, chunk_sizes[i], dev_id, alloc_type::DEVICE);
+        arena_chunks_.push_back({ p, chunk_sizes[i] });
+    }
 
-    // Layout zones within 2-chunk arena:
-    // chunk0: [KV zone] [oneDNN zone] [RUNTIME zone] [SCRATCH zone]
-    // chunk1: [Weight zone — entire chunk]
-    const size_t fixed_tail = onednn_bytes + runtime_bytes + scratch_bytes;
-    const size_t kv_size    = chunk0_size > fixed_tail ? chunk0_size - fixed_tail : 0;
+    arena_base_ = arena_chunks_.front().ptr;
+    arena_size_ = alloc_size;
 
-    size_t off = 0;
+    // Logical-offset layout (cumulative across chunks; offset_to_ptr/ptr_to_offset translate):
+    //   [WEIGHT (chunks 0..N-2, weight_total bytes)]
+    //   [KV (head of last chunk, up to last_chunk_size - tail_bytes bytes;
+    //        0 if tail consumes the chunk — guarded above by tail_chunk_min)]
+    //   [ONEDNN] [RUNTIME] [SCRATCH] (tail of last chunk)
+    auto & wz = arena_zones_[static_cast<int>(vram_zone_id::WEIGHT)];
+    wz.start  = 0;
+    wz.size   = weight_total;
+    wz.used.store(0, std::memory_order_relaxed);
+
+    const size_t kv_size = last_chunk_size > tail_bytes ? last_chunk_size - tail_bytes : 0;
+
+    size_t off = weight_total;
     auto & kz  = arena_zones_[static_cast<int>(vram_zone_id::KV)];
     kz.start   = off;
     kz.size    = kv_size;
@@ -9349,37 +9496,51 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
 
     auto & oz = arena_zones_[static_cast<int>(vram_zone_id::ONEDNN)];
     oz.start  = off;
-    oz.size   = std::min(onednn_bytes, chunk0_size - off);
+    oz.size   = onednn_bytes;
     oz.used.store(0, std::memory_order_relaxed);
     off += oz.size;
 
     auto & rz = arena_zones_[static_cast<int>(vram_zone_id::RUNTIME)];
     rz.start  = off;
-    rz.size   = std::min(runtime_bytes, chunk0_size > off ? chunk0_size - off : size_t(0));
+    rz.size   = runtime_bytes;
     rz.used.store(0, std::memory_order_relaxed);
     off += rz.size;
 
     auto & sz = arena_zones_[static_cast<int>(vram_zone_id::SCRATCH)];
     sz.start  = off;
-    sz.size   = std::min(scratch_bytes, chunk0_size > off ? chunk0_size - off : size_t(0));
+    sz.size   = scratch_bytes;
     sz.used.store(0, std::memory_order_relaxed);
 
-    // Weight zone occupies all of chunk1.
-    auto & wz = arena_zones_[static_cast<int>(vram_zone_id::WEIGHT)];
-    wz.start  = chunk0_size;  // Logical offset at chunk boundary
-    wz.size   = chunk1_size;
-    wz.used.store(0, std::memory_order_relaxed);
-
     GGML_LOG_INFO(
-        "[VRAM-ARENA] Reserved 2-chunk: %.1f + %.1f MB "
-        "(scratch=%.1f, runtime=%.1f, oneDNN=%.1f, KV=%.1f, weight=%.1f MB)\n",
-        chunk0_size / (1024.0 * 1024.0), chunk1_size / (1024.0 * 1024.0), sz.size / (1024.0 * 1024.0),
-        rz.size / (1024.0 * 1024.0), oz.size / (1024.0 * 1024.0), kz.size / (1024.0 * 1024.0),
-        wz.size / (1024.0 * 1024.0));
+        "[VRAM-ARENA] Reserved %zu chunks, %.1f MB total "
+        "(weight=%.1f, KV=%.1f, oneDNN=%.1f, runtime=%.1f, scratch=%.1f MB)\n",
+        arena_chunks_.size(), alloc_size / (1024.0 * 1024.0), wz.size / (1024.0 * 1024.0), kz.size / (1024.0 * 1024.0),
+        oz.size / (1024.0 * 1024.0), rz.size / (1024.0 * 1024.0), sz.size / (1024.0 * 1024.0));
 
-    // Initialize TLSF allocators per zone (2-chunk path).
+    // Initialize TLSF allocators (N-chunk path).
+    //   - WEIGHT spans chunks 0..N-2 — one TLSF per physical weight chunk so
+    //     no allocation crosses a chunk boundary.  z.allocator is left null;
+    //     zone_alloc/zone_free walk weight_chunk_allocators_ instead.
+    //   - KV/ONEDNN/RUNTIME/SCRATCH all live entirely in the last (tail)
+    //     chunk — one TLSF each over their zone size, as before.
+    weight_chunk_allocators_.clear();
+    {
+        size_t logical = 0;
+        for (int i = 0; i + 1 < static_cast<int>(arena_chunks_.size()); ++i) {
+            weight_chunk_alloc wca;
+            wca.chunk_idx     = i;
+            wca.logical_start = logical;
+            wca.allocator     = std::make_unique<tlsf_allocator>(arena_chunks_[i].size);
+            weight_chunk_allocators_.push_back(std::move(wca));
+            logical += arena_chunks_[i].size;
+        }
+    }
     for (int i = 0; i < static_cast<int>(vram_zone_id::COUNT); i++) {
         auto & z = arena_zones_[i];
+        if (i == static_cast<int>(vram_zone_id::WEIGHT)) {
+            z.allocator = nullptr;  // routed through weight_chunk_allocators_
+            continue;
+        }
         if (z.size > 0) {
             z.allocator = std::make_unique<tlsf_allocator>(z.size);
         }
@@ -9396,7 +9557,60 @@ void * unified_cache::zone_alloc(vram_zone_id zone, size_t size, size_t align) {
     const bool profile_active = arena_pp_profile_active();
     const auto t0             = profile_active ? arena_profile_clock::now() : arena_profile_clock::time_point{};
 
-    auto &           z     = arena_zones_[static_cast<int>(zone)];
+    auto & z = arena_zones_[static_cast<int>(zone)];
+
+    if (align == 0 || (align & (align - 1)) != 0) {
+        align = 256;
+    }
+
+    // N-chunk WEIGHT path: try each per-chunk allocator in turn.  A single
+    // weight allocation must not cross a chunk boundary because each chunk
+    // is its own sycl::malloc_device USM allocation; first-fit walking
+    // gives any one chunk's TLSF the chance to satisfy the request.
+    //
+    // Single mutex across the per-chunk walk: intentional simplicity for the
+    // dormant N-chunk path.  Per-chunk mutexes would scale better but pay no
+    // dividend until a config actually triggers N>=2.
+    if (zone == vram_zone_id::WEIGHT && !weight_chunk_allocators_.empty()) {
+        std::lock_guard<std::mutex> lock(z.alloc_mutex);
+        for (auto & wca : weight_chunk_allocators_) {
+            const size_t before = wca.allocator->used();
+            const size_t offset = wca.allocator->allocate(size, align);
+            if (offset == SIZE_MAX) {
+                continue;
+            }
+            // Incremental aggregate: alloc/free both update z.used under
+            // z.alloc_mutex so there's no race window.  Use the TLSF
+            // before/after delta (rather than `size`) so we account for
+            // alignment + block-header overhead consistently with what
+            // tlsf_allocator::used() reports.
+            const size_t after      = wca.allocator->used();
+            const size_t delta      = after - before;
+            const size_t total_used =
+                z.used.fetch_add(delta, std::memory_order_relaxed) + delta;
+            if (profile_active) {
+                const size_t idx = static_cast<size_t>(zone);
+                t_arena_pp_profile.zone_alloc_calls[idx]++;
+                t_arena_pp_profile.zone_alloc_bytes[idx] += size;
+                t_arena_pp_profile.zone_alloc_us[idx] += arena_profile_elapsed_us(t0);
+                t_arena_pp_profile.zone_used_peak[idx] =
+                    std::max(t_arena_pp_profile.zone_used_peak[idx], total_used);
+                t_arena_pp_profile.zone_largest_free_min[idx] =
+                    std::min(t_arena_pp_profile.zone_largest_free_min[idx],
+                             wca.allocator->largest_free_block());
+            }
+            return offset_to_ptr(wca.logical_start + offset);
+        }
+        if (profile_active) {
+            const size_t idx = static_cast<size_t>(zone);
+            t_arena_pp_profile.zone_alloc_calls[idx]++;
+            t_arena_pp_profile.zone_alloc_failures[idx]++;
+            t_arena_pp_profile.zone_alloc_bytes[idx] += size;
+            t_arena_pp_profile.zone_alloc_us[idx] += arena_profile_elapsed_us(t0);
+        }
+        return nullptr;
+    }
+
     tlsf_allocator * alloc = z.allocator.get();
 
     // Shared zone delegation (single-chunk mode): WEIGHT delegates to KV allocator.
@@ -9405,10 +9619,6 @@ void * unified_cache::zone_alloc(vram_zone_id zone, size_t size, size_t align) {
     }
     if (!alloc) {
         return nullptr;
-    }
-
-    if (align == 0 || (align & (align - 1)) != 0) {
-        align = 256;
     }
 
     // Use KV zone's mutex for serialization in shared-zone mode.
@@ -9456,21 +9666,50 @@ void unified_cache::zone_reset(vram_zone_id zone) {
     // range.  Without this, TLSF reset recycles addresses while the registry
     // still maps them, causing duplicate-pointer rejection on the next
     // unified_alloc() that gets a recycled address.
+    //
+    // KV/ONEDNN/RUNTIME/SCRATCH all live in a SINGLE physical chunk (the tail
+    // chunk in N-chunk mode, or the only chunk in single-chunk mode), so the
+    // zone's address range is one contiguous span starting at offset_to_ptr(z.start).
+    // WEIGHT in N-chunk mode is the only zone that spans multiple physical
+    // chunks; zone_reset is never called on WEIGHT in production paths but
+    // handle it correctly anyway.
     if (arena_base_ && z.size > 0) {
-        const uintptr_t             zone_lo = reinterpret_cast<uintptr_t>(arena_base_) + z.start;
-        const uintptr_t             zone_hi = zone_lo + z.size;
         std::lock_guard<std::mutex> reg_lock(g_runtime_alloc_mutex);
-        for (auto it = g_runtime_alloc_registry.begin(); it != g_runtime_alloc_registry.end();) {
-            const uintptr_t p = reinterpret_cast<uintptr_t>(it->first);
-            if (p >= zone_lo && p < zone_hi) {
-                it = g_runtime_alloc_registry.erase(it);
-            } else {
-                ++it;
+        if (zone == vram_zone_id::WEIGHT && !weight_chunk_allocators_.empty()) {
+            // Walk each weight chunk's physical range.
+            for (const auto & wca : weight_chunk_allocators_) {
+                const auto      cbase = reinterpret_cast<uintptr_t>(arena_chunks_[wca.chunk_idx].ptr);
+                const uintptr_t lo    = cbase;
+                const uintptr_t hi    = cbase + arena_chunks_[wca.chunk_idx].size;
+                for (auto it = g_runtime_alloc_registry.begin(); it != g_runtime_alloc_registry.end();) {
+                    const uintptr_t p = reinterpret_cast<uintptr_t>(it->first);
+                    if (p >= lo && p < hi) {
+                        it = g_runtime_alloc_registry.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+        } else {
+            const auto      base    = reinterpret_cast<uintptr_t>(offset_to_ptr(z.start));
+            const uintptr_t zone_lo = base;
+            const uintptr_t zone_hi = base + z.size;
+            for (auto it = g_runtime_alloc_registry.begin(); it != g_runtime_alloc_registry.end();) {
+                const uintptr_t p = reinterpret_cast<uintptr_t>(it->first);
+                if (p >= zone_lo && p < zone_hi) {
+                    it = g_runtime_alloc_registry.erase(it);
+                } else {
+                    ++it;
+                }
             }
         }
     }
 
-    if (z.allocator) {
+    if (zone == vram_zone_id::WEIGHT && !weight_chunk_allocators_.empty()) {
+        for (auto & wca : weight_chunk_allocators_) {
+            wca.allocator->reset();
+        }
+    } else if (z.allocator) {
         z.allocator->reset();
     }
     z.used.store(0, std::memory_order_relaxed);
@@ -9489,7 +9728,42 @@ void unified_cache::zone_free(vram_zone_id zone, void * ptr) {
     const bool profile_active = arena_pp_profile_active();
     const auto t0             = profile_active ? arena_profile_clock::now() : arena_profile_clock::time_point{};
 
-    auto &           z     = arena_zones_[static_cast<int>(zone)];
+    auto & z = arena_zones_[static_cast<int>(zone)];
+
+    // N-chunk WEIGHT path: route the free to the per-chunk allocator that owns ptr.
+    if (zone == vram_zone_id::WEIGHT && !weight_chunk_allocators_.empty()) {
+        const int chunk_idx = arena_find_chunk(ptr);
+        if (chunk_idx < 0) {
+            return;
+        }
+        weight_chunk_alloc * target = nullptr;
+        for (auto & wca : weight_chunk_allocators_) {
+            if (wca.chunk_idx == chunk_idx) {
+                target = &wca;
+                break;
+            }
+        }
+        if (!target) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(z.alloc_mutex);
+        const auto   chunk_base = reinterpret_cast<uintptr_t>(arena_chunks_[chunk_idx].ptr);
+        const auto   p          = reinterpret_cast<uintptr_t>(ptr);
+        const size_t chunk_off  = static_cast<size_t>(p - chunk_base);
+        const size_t before     = target->allocator->used();
+        target->allocator->free(chunk_off);
+        // Incremental aggregate: see matching fetch_add comment in zone_alloc.
+        const size_t after = target->allocator->used();
+        const size_t delta = before - after;
+        z.used.fetch_sub(delta, std::memory_order_relaxed);
+        if (profile_active) {
+            const size_t idx = static_cast<size_t>(zone);
+            t_arena_pp_profile.zone_free_calls[idx]++;
+            t_arena_pp_profile.zone_free_us[idx] += arena_profile_elapsed_us(t0);
+        }
+        return;
+    }
+
     tlsf_allocator * alloc = z.allocator.get();
 
     // Shared zone delegation (single-chunk mode).
@@ -9540,10 +9814,10 @@ bool unified_cache::vram_owns(const void * ptr) const {
     if (!arena_base_ || !ptr) {
         return false;
     }
-    for (int i = 0; i < arena_n_chunks_; i++) {
-        auto base = reinterpret_cast<uintptr_t>(arena_chunks_[i].ptr);
+    for (const auto & c : arena_chunks_) {
+        auto base = reinterpret_cast<uintptr_t>(c.ptr);
         auto p    = reinterpret_cast<uintptr_t>(ptr);
-        if (p >= base && p < base + arena_chunks_[i].size) {
+        if (p >= base && p < base + c.size) {
             return true;
         }
     }
@@ -9566,28 +9840,27 @@ size_t unified_cache::ptr_to_offset(const void * ptr) const {
     if (!ptr) {
         return SIZE_MAX;
     }
-    for (int i = 0; i < arena_n_chunks_; i++) {
-        auto base = reinterpret_cast<uintptr_t>(arena_chunks_[i].ptr);
+    size_t logical_base = 0;
+    for (const auto & c : arena_chunks_) {
+        auto base = reinterpret_cast<uintptr_t>(c.ptr);
         auto p    = reinterpret_cast<uintptr_t>(ptr);
-        if (p >= base && p < base + arena_chunks_[i].size) {
-            if (i == 0) {
-                return static_cast<size_t>(p - base);
-            }
-            return arena_chunks_[0].size + static_cast<size_t>(p - base);
+        if (p >= base && p < base + c.size) {
+            return logical_base + static_cast<size_t>(p - base);
         }
+        logical_base += c.size;
     }
     return SIZE_MAX;
 }
 
 void * unified_cache::offset_to_ptr(size_t offset) const {
-    if (arena_n_chunks_ == 1) {
-        return static_cast<uint8_t *>(arena_base_) + offset;
+    size_t logical_base = 0;
+    for (const auto & c : arena_chunks_) {
+        if (offset < logical_base + c.size) {
+            return static_cast<uint8_t *>(c.ptr) + (offset - logical_base);
+        }
+        logical_base += c.size;
     }
-    if (offset < arena_chunks_[0].size) {
-        return static_cast<uint8_t *>(arena_chunks_[0].ptr) + offset;
-    }
-    size_t chunk1_off = offset - arena_chunks_[0].size;
-    return static_cast<uint8_t *>(arena_chunks_[1].ptr) + chunk1_off;
+    return nullptr;
 }
 
 size_t unified_cache::zone_capacity(vram_zone_id zone) const {
@@ -9602,12 +9875,21 @@ size_t unified_cache::zone_available(vram_zone_id zone) const {
     const auto & z = arena_zones_[static_cast<int>(zone)];
 
     // In single-chunk mode, WEIGHT delegates to KV's allocator.
-    if (arena_n_chunks_ == 1 && zone == vram_zone_id::WEIGHT) {
+    if (arena_chunks_.size() == 1 && zone == vram_zone_id::WEIGHT) {
         const auto & kv = arena_zones_[static_cast<int>(vram_zone_id::KV)];
         if (kv.allocator) {
             return kv.allocator->available();
         }
         return 0;
+    }
+
+    // N-chunk WEIGHT: sum across per-chunk allocators.
+    if (zone == vram_zone_id::WEIGHT && !weight_chunk_allocators_.empty()) {
+        size_t total = 0;
+        for (const auto & wca : weight_chunk_allocators_) {
+            total += wca.allocator->available();
+        }
+        return total;
     }
 
     // Zones with their own allocator.
@@ -9623,12 +9905,23 @@ size_t unified_cache::zone_available(vram_zone_id zone) const {
 size_t unified_cache::zone_largest_free(vram_zone_id zone) const {
     const auto & z = arena_zones_[static_cast<int>(zone)];
 
-    if (arena_n_chunks_ == 1 && zone == vram_zone_id::WEIGHT) {
+    if (arena_chunks_.size() == 1 && zone == vram_zone_id::WEIGHT) {
         const auto & kv = arena_zones_[static_cast<int>(vram_zone_id::KV)];
         if (kv.allocator) {
             return kv.allocator->largest_free_block();
         }
         return 0;
+    }
+
+    // N-chunk WEIGHT: max across per-chunk allocators (a single alloc cannot
+    // span chunks, so the largest fittable size is the largest single chunk's
+    // largest free block).
+    if (zone == vram_zone_id::WEIGHT && !weight_chunk_allocators_.empty()) {
+        size_t best = 0;
+        for (const auto & wca : weight_chunk_allocators_) {
+            best = std::max(best, wca.allocator->largest_free_block());
+        }
+        return best;
     }
 
     if (z.allocator) {
@@ -9642,24 +9935,24 @@ void unified_cache::arena_destroy() {
     if (!arena_queue_) {
         return;
     }
-    for (int i = 0; i < arena_n_chunks_; i++) {
-        if (arena_chunks_[i].ptr) {
+    for (auto & c : arena_chunks_) {
+        if (c.ptr) {
             // llama.cpp-dyhdl: wait for chunk leases to drain before sycl::free.
             // A lease outstanding at destruction means a downstream caller holds
             // a raw pointer into this chunk — assert-with-detail after 5 s rather
             // than SEGV silently after free.
             const auto deadline    = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-            uint32_t   outstanding = arena_chunks_[i].lease_count.load();
+            uint32_t   outstanding = c.lease_count.load();
             if (outstanding > 0) {
                 GGML_LOG_WARN(
                     "[VRAM-ARENA] chunk %p size=%.1f MB has %u outstanding lease(s) at arena_destroy, waiting ≤5s\n",
-                    arena_chunks_[i].ptr, arena_chunks_[i].size / (1024.0 * 1024.0), outstanding);
-                while ((outstanding = arena_chunks_[i].lease_count.load()) > 0) {
+                    c.ptr, c.size / (1024.0 * 1024.0), outstanding);
+                while ((outstanding = c.lease_count.load()) > 0) {
                     if (std::chrono::steady_clock::now() > deadline) {
                         GGML_LOG_ERROR(
                             "[VRAM-ARENA] chunk %p size=%.1f MB still has %u outstanding lease(s) after 5s — "
                             "aborting (llama.cpp-dyhdl)\n",
-                            arena_chunks_[i].ptr, arena_chunks_[i].size / (1024.0 * 1024.0), outstanding);
+                            c.ptr, c.size / (1024.0 * 1024.0), outstanding);
                         std::fflush(stderr);
                         GGML_ASSERT(false && "VRAM arena chunk freed while leases outstanding (dyhdl timeout)");
                     }
@@ -9667,15 +9960,15 @@ void unified_cache::arena_destroy() {
                 }
             }
             try {
-                sycl::free(arena_chunks_[i].ptr, *arena_queue_);
+                sycl::free(c.ptr, *arena_queue_);
             } catch (...) {
             }
-            arena_chunks_[i] = {};
         }
     }
-    arena_base_     = nullptr;
-    arena_size_     = 0;
-    arena_n_chunks_ = 0;
+    weight_chunk_allocators_.clear();
+    arena_chunks_.clear();
+    arena_base_ = nullptr;
+    arena_size_ = 0;
     for (int i = 0; i < static_cast<int>(vram_zone_id::COUNT); i++) {
         auto &                      z = arena_zones_[i];
         std::lock_guard<std::mutex> lock(z.alloc_mutex);
@@ -9693,10 +9986,10 @@ int unified_cache::arena_find_chunk(const void * ptr) const {
         return -1;
     }
     const char * p = static_cast<const char *>(ptr);
-    for (int i = 0; i < arena_n_chunks_; ++i) {
+    for (size_t i = 0; i < arena_chunks_.size(); ++i) {
         const char * base = static_cast<const char *>(arena_chunks_[i].ptr);
         if (base && p >= base && p < base + arena_chunks_[i].size) {
-            return i;
+            return static_cast<int>(i);
         }
     }
     return -1;
@@ -9712,7 +10005,7 @@ int unified_cache::arena_acquire_chunk_lease(const void * ptr) {
 }
 
 void unified_cache::arena_release_chunk_lease(int chunk_idx) {
-    if (chunk_idx < 0 || chunk_idx >= arena_n_chunks_) {
+    if (chunk_idx < 0 || chunk_idx >= static_cast<int>(arena_chunks_.size())) {
         return;
     }
     const uint32_t prev = arena_chunks_[chunk_idx].lease_count.fetch_sub(1);
@@ -9723,7 +10016,7 @@ void unified_cache::arena_release_chunk_lease(int chunk_idx) {
 }
 
 bool unified_cache::arena_chunk_has_leases(int chunk_idx) const {
-    if (chunk_idx < 0 || chunk_idx >= arena_n_chunks_) {
+    if (chunk_idx < 0 || chunk_idx >= static_cast<int>(arena_chunks_.size())) {
         return false;
     }
     return arena_chunks_[chunk_idx].lease_count.load() > 0;
@@ -9747,12 +10040,10 @@ void unified_cache::host_release_chunk_lease(uint64_t handle) {
 void unified_cache::arena_abandon() {
     // Null everything without calling sycl::free — used during shutdown
     // when the SYCL context is already invalid.
-    for (int i = 0; i < arena_n_chunks_; i++) {
-        arena_chunks_[i] = {};
-    }
-    arena_base_     = nullptr;
-    arena_size_     = 0;
-    arena_n_chunks_ = 0;
+    weight_chunk_allocators_.clear();
+    arena_chunks_.clear();
+    arena_base_ = nullptr;
+    arena_size_ = 0;
     for (int i = 0; i < static_cast<int>(vram_zone_id::COUNT); i++) {
         auto & z = arena_zones_[i];
         z.allocator.reset();

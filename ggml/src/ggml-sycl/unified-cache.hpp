@@ -870,10 +870,21 @@ class unified_cache {
     // Initialize with SYCL queue and memory budget
     // budget_bytes: total GPU memory for caching (dense + MoE combined)
     // staging_size: pinned host staging buffer size (default 64MB)
+    // device_total_vram: total VRAM bytes for the device, forwarded directly
+    //   to arena_reserve() to compute the runtime headroom (see
+    //   llama.cpp-w2ptt).  Passed in by the caller because
+    //   `ggml_backend_sycl_get_device_memory()` dereferences
+    //   `ggml_sycl_info()`, which deadlocks if invoked while the cache is
+    //   being constructed mid `ggml_sycl_init()` static init.  Pass 0 to opt
+    //   out of the headroom cap entirely (the arena will be reserved at the
+    //   caller's full budget).  Not stored as a member: the value is only
+    //   meaningful at arena-reservation time and storing it would silently
+    //   capture a stale value if arena_reserve were ever called post-init.
     unified_cache(sycl::queue & queue,
                   size_t        budget_bytes,
                   size_t        staging_size       = 64 * 1024 * 1024,
-                  size_t        dma_reserved_bytes = 0);
+                  size_t        dma_reserved_bytes = 0,
+                  size_t        device_total_vram  = 0);
     ~unified_cache();
 
     // Non-copyable, non-movable
@@ -1398,13 +1409,17 @@ class unified_cache {
 
     // === Arena methods (merged from vram_arena) ===
 
-    // Reserve VRAM arena using 1- or 2-chunk allocation.
+    // Reserve VRAM arena using 1- or N-chunk allocation.  device_total_vram
+    // is passed by the caller because the ctor may run inside ggml_sycl_init()
+    // static init, where dereferencing ggml_sycl_info() to query total VRAM
+    // would deadlock.  Pass 0 to fall back to "size by budget alone".
     bool arena_reserve(sycl::queue & queue,
                        size_t        budget_bytes,
                        size_t        max_alloc_size,
                        size_t        scratch_bytes,
                        size_t        onednn_bytes,
-                       size_t        runtime_bytes);
+                       size_t        runtime_bytes,
+                       size_t        device_total_vram);
 
     // Is arena active?
     bool arena_active() const { return arena_base_ != nullptr; }
@@ -1438,8 +1453,11 @@ class unified_cache {
 
     const vram_zone & get_zone(vram_zone_id zone) const { return arena_zones_[static_cast<int>(zone)]; }
 
-    // Number of chunks (1 if single alloc, 2 if split).
-    int chunk_count() const { return arena_n_chunks_; }
+    // Number of chunks.  Usually 1 (a single sycl::malloc_device covers the
+    // budget); >1 only on systems where the runtime enforces a hard
+    // per-allocation cap below the budget and the single-chunk attempt
+    // fails (e.g. stock libze on smaller GPUs).
+    int chunk_count() const { return static_cast<int>(arena_chunks_.size()); }
 
     // === Arena chunk lease API (llama.cpp-dyhdl) ===
     // Reference-count VRAM arena chunks while any mem_handle holds a raw
@@ -1448,7 +1466,7 @@ class unified_cache {
     // prevents sycl::free of the underlying VRAM allocation.
     //
     // Returns -1 when the pointer is not owned by the arena (safe no-op on
-    // release).  Otherwise returns the chunk index (0 or 1).
+    // release).  Otherwise returns the chunk index (0..N-1).
     int  arena_find_chunk(const void * ptr) const;
     int  arena_acquire_chunk_lease(const void * ptr);
     void arena_release_chunk_lease(int chunk_idx);
@@ -1904,10 +1922,31 @@ class unified_cache {
         copyable_atomic_u32 lease_count;  // llama.cpp-dyhdl: live raw-ptr refs
     };
 
-    arena_chunk   arena_chunks_[2] = {};
-    int           arena_n_chunks_  = 0;
-    sycl::queue * arena_queue_     = nullptr;
-    vram_zone     arena_zones_[static_cast<int>(vram_zone_id::COUNT)];
+    // N-chunk arena: each chunk capped at the runtime's per-allocation limit
+    // so the patched libze (~1.5 GB on Arc B580) does not reject the alloc.
+    std::vector<arena_chunk>        arena_chunks_;
+    sycl::queue *                   arena_queue_ = nullptr;
+
+    // Per-physical-chunk TLSF allocators for the WEIGHT zone in N-chunk mode.
+    // A weight tensor must not span a chunk boundary (each chunk is its own
+    // sycl::malloc_device USM allocation), so we use one TLSF allocator per
+    // weight-bearing chunk and try each in turn on alloc.
+    //
+    // Empty in single-chunk mode — WEIGHT then has no allocator of its own
+    // and delegates to the KV allocator via the shared-zone pattern (see
+    // zone_alloc()).
+    //
+    // Invariant: chunk_idx is always < arena_chunks_.size() - 1; the last
+    // chunk holds tail zones (KV/ONEDNN/RUNTIME/SCRATCH), never WEIGHT.
+    // chunk_idx is `int` to match arena_find_chunk()'s return type and the
+    // arena lease API (which uses -1 as a not-owned sentinel).
+    struct weight_chunk_alloc {
+        int                             chunk_idx     = 0;     // index into arena_chunks_
+        size_t                          logical_start = 0;     // cumulative offset of this chunk
+        std::unique_ptr<tlsf_allocator> allocator;
+    };
+    std::vector<weight_chunk_alloc> weight_chunk_allocators_;
+    vram_zone                       arena_zones_[static_cast<int>(vram_zone_id::COUNT)];
 
     // Arena generation counter: incremented when the arena is destroyed/recreated.
     // mem_handle arena handles store the generation at creation time; on resolve(),
