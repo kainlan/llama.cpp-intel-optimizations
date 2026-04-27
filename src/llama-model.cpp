@@ -3266,6 +3266,80 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     struct sycl_tensor_load_guard {
         ~sycl_tensor_load_guard() { ggml_backend_sycl_set_model_loading(false); }
     } tensor_load_guard;
+
+    // PLACE-4: Compute the SYCL placement plan EARLY — before per-tensor
+    // create_tensor calls — by walking ml.weights_map.  This makes
+    // g_placement_plan populated by the time create_tensor needs it for
+    // per-tensor buft selection.  The late ggml_backend_sycl_set_tensor_inventory
+    // call further down (around line 8650) idempotently re-runs all phases
+    // including layer-streaming setup that depends on g_sycl_host_weight_extras
+    // populated during create_tensor.
+    //
+    // Skip during fit_params measurement probes (no_alloc) to mirror the late
+    // path's gate and avoid polluting global state.
+    std::vector<ggml_sycl_tensor_info> sycl_early_tensors;
+    if (!ml.no_alloc && !ml.weights_map.empty()) {
+        sycl_early_tensors.reserve(ml.weights_map.size());
+        size_t total_size                   = 0;
+        size_t max_pp_pipeline_weight_bytes = 0;
+        for (const auto & [name, weight] : ml.weights_map) {
+            ggml_tensor * t = weight.tensor;
+            if (t == nullptr) {
+                continue;
+            }
+            const size_t nbytes = ggml_nbytes(t);
+            if (nbytes == 0) {
+                continue;
+            }
+            sycl_early_tensors.push_back({ ggml_get_name(t), nbytes });
+            total_size += nbytes;
+            if (ggml_is_quantized(t->type)) {
+                const size_t fp16_bytes = static_cast<size_t>(ggml_nelements(t)) * sizeof(ggml_fp16_t);
+                max_pp_pipeline_weight_bytes = std::max(max_pp_pipeline_weight_bytes, fp16_bytes);
+            }
+        }
+        if (!sycl_early_tensors.empty()) {
+            ggml_sycl_tensor_inventory inventory       = {};
+            inventory.tensors                          = sycl_early_tensors.data();
+            inventory.count                            = sycl_early_tensors.size();
+            inventory.total_size                       = total_size;
+            inventory.pp_pipeline_scratch_bytes        = max_pp_pipeline_weight_bytes * 2;
+            inventory.n_expert                         = hparams.n_expert;
+            inventory.n_expert_used                    = hparams.n_expert_used;
+            inventory.n_layer                          = hparams.n_layer;
+            inventory.n_embd_k_gqa                     = hparams.n_embd_k_gqa();
+            inventory.n_embd_v_gqa                     = hparams.n_embd_v_gqa();
+            inventory.n_ctx                            = (params.n_ctx > 0) ? params.n_ctx : hparams.n_ctx_train;
+            inventory.n_ubatch                         = (params.n_ubatch > 0) ? params.n_ubatch : 512;
+            inventory.n_swa                            = hparams.n_swa;
+            inventory.n_swa_layers                     = 0;
+            for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                if (hparams.is_swa(il)) {
+                    inventory.n_swa_layers++;
+                }
+            }
+            inventory.swa_layer_mask       = hparams.swa_layers.data();
+            inventory.swa_layer_mask_count = hparams.n_layer;
+
+            ggml_sycl_placement_envelope envelope = {};
+            envelope.n_ctx                        = params.n_ctx;
+            envelope.n_ubatch                     = params.n_ubatch;
+            envelope.n_seq_max                    = params.n_seq_max;
+            envelope.flash_attn_type              = static_cast<int32_t>(params.flash_attn_type);
+
+            for (int i = 0; i < ggml_backend_sycl_get_device_count(); i++) {
+                ggml_backend_t sycl_backend = ggml_backend_sycl_init(i);
+                if (sycl_backend) {
+                    ggml_backend_sycl_set_placement_envelope(sycl_backend, &envelope);
+                    ggml_backend_sycl_compute_placement_plan_early(sycl_backend, &inventory);
+                    ggml_backend_free(sycl_backend);
+                }
+            }
+            LLAMA_LOG_INFO(
+                "%s: SYCL early placement plan: %zu weights, %.2f GB (computed pre-create_tensor)\n",
+                __func__, sycl_early_tensors.size(), total_size / (1024.0 * 1024.0 * 1024.0));
+        }
+    }
 #endif
 
     const auto & split_mode   = params.split_mode;
