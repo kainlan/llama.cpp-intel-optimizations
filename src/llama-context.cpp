@@ -2919,6 +2919,22 @@ llama_context * llama_init_from_model(
                 __func__, params.n_seq_max, mparams.n_seq_max);
             return nullptr;
         }
+        // flash_attn_type is non-symmetric: only (envelope=DISABLED,
+        // request=ENABLED) is invalid. The model was loaded without FA
+        // buffers, so the per-context request to enable FA cannot be
+        // honored. Every other combination is acceptable — envelope=AUTO
+        // or ENABLED accepts any request, and envelope=DISABLED accepts
+        // request=DISABLED or AUTO.
+        if (mparams.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED &&
+            params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED) {
+            LLAMA_LOG_ERROR(
+                "%s: requested flash_attn_type=%s is incompatible with placement-envelope flash_attn_type=%s "
+                "declared at model load; reload the model with flash_attn_type=enabled or auto, or request "
+                "flash_attn_type=disabled\n",
+                __func__, llama_flash_attn_type_name(params.flash_attn_type),
+                llama_flash_attn_type_name(mparams.flash_attn_type));
+            return nullptr;
+        }
     }
 
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && model->arch == LLM_ARCH_GROK) {

@@ -20,13 +20,14 @@ struct options {
     int         threads            = 2;
     bool        probe_over         = false;
     bool        expect_over_reject = false;
+    bool        expect_fa_mismatch = false;
 };
 
 static void usage(const char * argv0) {
     std::fprintf(stderr,
                  "usage: %s --model MODEL [--ctx N] [--ubatch N] [--seq-max N]\n"
                  "          [--over-ctx N] [--ngl N] [--iterations N] [--threads N]\n"
-                 "          [--probe-over] [--expect-over-reject]\n",
+                 "          [--probe-over] [--expect-over-reject] [--expect-fa-mismatch]\n",
                  argv0);
 }
 
@@ -116,6 +117,8 @@ static bool parse_args(int argc, char ** argv, options & opt) {
         } else if (std::strcmp(arg, "--expect-over-reject") == 0) {
             opt.probe_over         = true;
             opt.expect_over_reject = true;
+        } else if (std::strcmp(arg, "--expect-fa-mismatch") == 0) {
+            opt.expect_fa_mismatch = true;
         } else if (std::strcmp(arg, "--help") == 0 || std::strcmp(arg, "-h") == 0) {
             usage(argv[0]);
             std::exit(0);
@@ -199,6 +202,78 @@ static bool create_check_destroy(llama_model * model,
     return ok;
 }
 
+// Exercise the flash_attn_type compatibility check at context-create.
+// Loads the model with a specific envelope flash_attn_type, then attempts
+// each (envelope, request) cell from the spec table and verifies the one
+// reject case rejects while every accept case succeeds. The function loads
+// and frees its own llama_model so the per-envelope mparams don't bleed
+// into other canary modes.
+static bool fa_probe(const options &       opt,
+                     llama_flash_attn_type env_fa,
+                     llama_flash_attn_type req_fa,
+                     bool                  expect_accept) {
+    llama_model_params mparams = llama_model_default_params();
+    mparams.n_gpu_layers       = opt.ngl;
+    mparams.n_ctx              = opt.envelope_ctx;
+    mparams.n_ubatch           = opt.ubatch;
+    mparams.n_seq_max          = opt.seq_max;
+    mparams.flash_attn_type    = env_fa;
+
+    llama_model * model = llama_model_load_from_file(opt.model.c_str(), mparams);
+    if (!model) {
+        std::fprintf(stderr, "FAIL: fa_probe model load failed (env=%s)\n", llama_flash_attn_type_name(env_fa));
+        return false;
+    }
+
+    llama_context_params cparams = make_context_params(opt.envelope_ctx, opt.seq_max, opt.ubatch, false);
+    cparams.flash_attn_type      = req_fa;
+
+    llama_context * ctx      = llama_init_from_model(model, cparams);
+    const bool      accepted = (ctx != nullptr);
+    bool            cell_ok  = (accepted == expect_accept);
+
+    std::printf("fa probe: env=%-8s req=%-8s -> %s (expected %s)%s\n", llama_flash_attn_type_name(env_fa),
+                llama_flash_attn_type_name(req_fa), accepted ? "accept" : "reject", expect_accept ? "accept" : "reject",
+                cell_ok ? "" : " *FAIL*");
+
+    if (ctx) {
+        llama_free(ctx);
+    }
+    llama_model_free(model);
+    return cell_ok;
+}
+
+static bool fa_mismatch_suite(const options & opt) {
+    bool ok = true;
+
+    // The spec table — exhaustively enumerate the cells so every regression
+    // direction (over-reject, under-reject) is caught.
+    struct cell {
+        llama_flash_attn_type env;
+        llama_flash_attn_type req;
+        bool                  accept;
+    };
+
+    const cell cells[] = {
+        // env=AUTO accepts any request.
+        { LLAMA_FLASH_ATTN_TYPE_AUTO,     LLAMA_FLASH_ATTN_TYPE_AUTO,     true  },
+        { LLAMA_FLASH_ATTN_TYPE_AUTO,     LLAMA_FLASH_ATTN_TYPE_DISABLED, true  },
+        { LLAMA_FLASH_ATTN_TYPE_AUTO,     LLAMA_FLASH_ATTN_TYPE_ENABLED,  true  },
+        // env=DISABLED accepts only DISABLED + AUTO; rejects ENABLED.
+        { LLAMA_FLASH_ATTN_TYPE_DISABLED, LLAMA_FLASH_ATTN_TYPE_AUTO,     true  },
+        { LLAMA_FLASH_ATTN_TYPE_DISABLED, LLAMA_FLASH_ATTN_TYPE_DISABLED, true  },
+        { LLAMA_FLASH_ATTN_TYPE_DISABLED, LLAMA_FLASH_ATTN_TYPE_ENABLED,  false },
+        // env=ENABLED accepts any request.
+        { LLAMA_FLASH_ATTN_TYPE_ENABLED,  LLAMA_FLASH_ATTN_TYPE_AUTO,     true  },
+        { LLAMA_FLASH_ATTN_TYPE_ENABLED,  LLAMA_FLASH_ATTN_TYPE_DISABLED, true  },
+        { LLAMA_FLASH_ATTN_TYPE_ENABLED,  LLAMA_FLASH_ATTN_TYPE_ENABLED,  true  },
+    };
+    for (const auto & c : cells) {
+        ok = fa_probe(opt, c.env, c.req, c.accept) && ok;
+    }
+    return ok;
+}
+
 int main(int argc, char ** argv) {
     options opt;
     if (!parse_args(argc, argv, opt)) {
@@ -207,6 +282,21 @@ int main(int argc, char ** argv) {
     }
 
     llama_backend_init();
+
+    if (opt.expect_fa_mismatch) {
+        std::printf(
+            "placement envelope canary: model=%s mode=expect-fa-mismatch envelope_ctx=%u ubatch=%u seq_max=%u "
+            "ngl=%d\n",
+            opt.model.c_str(), opt.envelope_ctx, opt.ubatch, opt.seq_max, opt.ngl);
+        const bool ok = fa_mismatch_suite(opt);
+        llama_backend_free();
+        if (!ok) {
+            std::fprintf(stderr, "placement envelope canary: FAIL\n");
+            return 1;
+        }
+        std::printf("placement envelope canary: PASS\n");
+        return 0;
+    }
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers       = opt.ngl;
