@@ -40,6 +40,9 @@ std::vector<std::string> mistral7b_tensor_names(int n_layer) {
     names.push_back("token_embd.weight");
     names.push_back("output_norm.weight");
     names.push_back("output.weight");
+    // token_types.weight ships with some Mistral 7B GGUFs (input token-type IDs);
+    // it has no role in placement so it must classify as MISC.
+    names.push_back("token_types.weight");
 
     for (int i = 0; i < n_layer; ++i) {
         const std::string p = "blk." + std::to_string(i) + ".";
@@ -146,22 +149,34 @@ std::vector<std::string> deepseek2_tensor_names(int n_layer) {
 bool check_arch(const char *                     arch_name,
                 const std::vector<std::string> & names,
                 const std::set<std::string> &    expected_misc) {
-    int n_unexpected = 0;
+    std::set<std::string> actual_misc;
+    int                   n_unexpected = 0;
     for (const auto & n : names) {
         const llama_tensor_classification c = llama_tensor_classify(n.c_str());
         if (c.cls != LLAMA_TENSOR_CLASS_MISC) {
             continue;
         }
+        actual_misc.insert(n);
         if (expected_misc.count(n) > 0) {
             continue;
         }
         fprintf(stderr, "FAIL: %s: unexpected MISC for tensor '%s'\n", arch_name, n.c_str());
         ++n_unexpected;
     }
-    if (n_unexpected == 0) {
-        printf("OK: %s: all %zu tensors classified (no unexpected MISC)\n", arch_name, names.size());
+    int n_missing = 0;
+    for (const auto & e : expected_misc) {
+        if (actual_misc.count(e) > 0) {
+            continue;
+        }
+        fprintf(stderr, "FAIL: %s: expected MISC tensor '%s' was not classified MISC (or missing from input list)\n",
+                arch_name, e.c_str());
+        ++n_missing;
     }
-    return n_unexpected == 0;
+    if (n_unexpected == 0 && n_missing == 0) {
+        printf("OK: %s: all %zu tensors classified (MISC set matches exactly: %zu)\n", arch_name, names.size(),
+               expected_misc.size());
+    }
+    return n_unexpected == 0 && n_missing == 0;
 }
 
 // Independent layer-index extraction check: every per-layer tensor in the
@@ -260,6 +275,9 @@ int main() {
         { "blk.0.foo_bar.weight",             LLAMA_TENSOR_CLASS_MISC,              -1  },
         { "totally_unknown",                  LLAMA_TENSOR_CLASS_MISC,              -1  },
         { "blk.notanumber.attn_q.weight",     LLAMA_TENSOR_CLASS_MISC,              -1  },
+        // Layer-index edge cases: empty index between dots, and negative index.
+        { "blk..attn_q.weight",               LLAMA_TENSOR_CLASS_MISC,              -1  },
+        { "blk.-1.attn_q.weight",             LLAMA_TENSOR_CLASS_MISC,              -1  },
     };
 
     for (const auto & c : cases) {
@@ -279,7 +297,8 @@ int main() {
     bool ok = true;
     {
         const auto names = mistral7b_tensor_names(32);
-        ok &= check_arch("Mistral 7B (LLAMA, 32 layers)", names, /*expected_misc*/ {});
+        ok &= check_arch("Mistral 7B (LLAMA, 32 layers)", names,
+                         /*expected_misc*/ { "token_types.weight" });
         ok &= check_layer_indices("Mistral 7B", names);
     }
     {
