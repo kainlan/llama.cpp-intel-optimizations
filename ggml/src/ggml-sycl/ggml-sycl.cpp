@@ -6703,6 +6703,31 @@ bool ggml_backend_sycl_is_tiered_enabled(ggml_backend_t backend) {
     return g_tiered_enabled.load(std::memory_order_relaxed);
 }
 
+int ggml_backend_sycl_planned_target_device(const char * tensor_name) {
+    if (!tensor_name) {
+        return GGML_SYCL_PLANNED_NO_PLAN;
+    }
+    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    if (!g_has_placement_plan) {
+        return GGML_SYCL_PLANNED_NO_PLAN;
+    }
+    if (!g_placement_plan.has_dense_entry(tensor_name)) {
+        return GGML_SYCL_PLANNED_NO_PLAN;
+    }
+    return g_placement_plan.get_target_device(tensor_name);
+}
+
+ggml_backend_buffer_type_t ggml_backend_sycl_planned_buft(const char * tensor_name) {
+    const int dev = ggml_backend_sycl_planned_target_device(tensor_name);
+    if (dev == GGML_SYCL_PLANNED_NO_PLAN) {
+        return nullptr;
+    }
+    if (dev < 0) {
+        return ggml_backend_sycl_host_buffer_type();
+    }
+    return ggml_backend_sycl_buffer_type(dev);
+}
+
 // ggml_backend_sycl_model_exceeds_vram removed — unified non-blocking cache
 // handles all model sizes.  Inference callers use the non-blocking try_get_cached_with_event path
 // which returns FAILED on cache miss instead of blocking.  Dense weights are pinned

@@ -9,6 +9,8 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 
+#include <limits.h>
+
 #define GGML_SYCL_NAME        "SYCL"
 #define GGML_SYCL_MAX_DEVICES 48
 
@@ -205,6 +207,27 @@ GGML_BACKEND_API void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t     
 GGML_BACKEND_API void ggml_backend_sycl_compute_placement_plan_early(
     ggml_backend_t                            backend,
     const struct ggml_sycl_tensor_inventory * inventory);
+
+// Sentinel returned by ggml_backend_sycl_planned_target_device when no plan
+// applies to the queried tensor (no plan computed, or no entry for the name).
+// Distinct from -1 which is a valid "host" placement.
+#define GGML_SYCL_PLANNED_NO_PLAN INT_MIN
+
+// Query the planned target device for a weight tensor by name.
+//   - GGML_SYCL_PLANNED_NO_PLAN: no plan applies (caller should fall through
+//     to the default buft selection).
+//   - -1: planned for host (CPU/host-pinned).
+//   - >= 0: planned for SYCL device with that index.
+//
+// Looks up against the dense-weight index of the active placement_plan.  MoE
+// expert entries are not name-indexed and are not returned by this query;
+// they continue to use the per-expert dispatch path.
+GGML_BACKEND_API int ggml_backend_sycl_planned_target_device(const char * tensor_name);
+
+// Convenience wrapper: returns the buft for the planned location, or NULL
+// when no plan applies.  Callers that prefer a buft over a device id should
+// use this directly.
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_planned_buft(const char * tensor_name);
 
 // Set the placement envelope (snapshot of llama_model_params capacity inputs)
 // for this backend.  Must be called at model load alongside set_tensor_inventory.
