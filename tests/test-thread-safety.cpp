@@ -3,17 +3,58 @@
 // - Creates n_parallel (--parallel) contexts per model
 // - Runs inference in parallel on each context
 
-#include <array>
-#include <thread>
-#include <vector>
-#include <atomic>
-#include "llama.h"
 #include "arg.h"
 #include "common.h"
+#include "llama.h"
 #include "log.h"
 #include "sampling.h"
 
+#include <array>
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <thread>
+#include <vector>
+
+static bool argv_has_model_arg(int argc, char ** argv) {
+    static const char * const model_args[] = {
+        "-m", "--model", "-mu", "--model-url", "-hf", "-hfr", "--hf-repo", "-hff", "--hf-file", "-dr", "--docker-repo",
+    };
+    for (int i = 1; i < argc; ++i) {
+        for (const char * a : model_args) {
+            if (std::strcmp(argv[i], a) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 int main(int argc, char ** argv) {
+    std::vector<char *> argv_owned;
+    std::string         env_model_arg;
+    if (!argv_has_model_arg(argc, argv)) {
+        const char * env_model = std::getenv("LLAMACPP_TEST_MODELFILE");
+        if (!env_model || std::strlen(env_model) == 0) {
+            fprintf(
+                stderr,
+                "\033[33mWARNING: No model file provided. Skipping this test. "
+                "Set LLAMACPP_TEST_MODELFILE=<gguf_model_path> to silence this warning and run this test.\n\033[0m");
+            return 0;
+        }
+        env_model_arg = env_model;
+        argv_owned.reserve(argc + 2);
+        argv_owned.push_back(argv[0]);
+        argv_owned.push_back(const_cast<char *>("--model"));
+        argv_owned.push_back(env_model_arg.data());
+        for (int i = 1; i < argc; ++i) {
+            argv_owned.push_back(argv[i]);
+        }
+        argc = (int) argv_owned.size();
+        argv = argv_owned.data();
+    }
+
     common_params params;
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
