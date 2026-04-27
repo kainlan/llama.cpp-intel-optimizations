@@ -197,6 +197,15 @@ struct ggml_sycl_placement_envelope {
 GGML_BACKEND_API void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t                            backend,
                                                              const struct ggml_sycl_tensor_inventory * inventory);
 
+// Compute the placement plan EARLY — before per-tensor create_tensor calls.
+// Allows create_tensor's per-tensor buft selection to consult the plan.
+// Skips late-only side effects (layer-streaming setup, host-pinned pre-allocate)
+// that depend on state populated by create_tensor; those still run when
+// ggml_backend_sycl_set_tensor_inventory is called later.  Idempotent.
+GGML_BACKEND_API void ggml_backend_sycl_compute_placement_plan_early(
+    ggml_backend_t                            backend,
+    const struct ggml_sycl_tensor_inventory * inventory);
+
 // Set the placement envelope (snapshot of llama_model_params capacity inputs)
 // for this backend.  Must be called at model load alongside set_tensor_inventory.
 // The setter copies into a file-static; the caller's struct does not need to

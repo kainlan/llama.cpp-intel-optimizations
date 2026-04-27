@@ -6225,24 +6225,18 @@ static size_t get_system_memory_bytes() {
 #endif
 }
 
-void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_sycl_tensor_inventory * inventory) {
-    if (!backend || !inventory || (inventory->count > 0 && !inventory->tensors)) {
-        return;
-    }
-    ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *) backend->context;
-    if (!ctx) {
-        return;
-    }
-
-    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
-    // Clear existing inventory and index
+// Phase A helper: populate inventory + KV + MoE globals from the inventory
+// snapshot.  Idempotent — safe to call from both the early pre-create_tensor
+// entry point and the late set_tensor_inventory entry.  Caller must hold
+// g_tensor_inventory_mutex.
+static void populate_inventory_globals(ggml_backend_sycl_context *         ctx,
+                                       const ggml_sycl_tensor_inventory * inventory) {
     g_tensor_inventory.clear();
     g_tensor_inventory_index.clear();
 
     g_tensor_inventory_total_size                = 0;
     g_tensor_inventory_pp_pipeline_scratch_bytes = 0;
     g_tensor_inventory_device                    = ctx->device;
-    // Store tensor inventory with O(1) lookup index
     g_tensor_inventory.reserve(inventory->count);
     g_tensor_inventory_index.reserve(inventory->count);
     for (size_t i = 0; i < inventory->count; i++) {
@@ -6262,7 +6256,6 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
     ggml_sycl::unified_cache_set_planned_pp_pipeline_scratch_bytes(ctx->device,
                                                                    g_tensor_inventory_pp_pipeline_scratch_bytes);
 
-    // Store model hparams for KV tiering
     g_model_n_layer                  = inventory->n_layer;
     g_placement_kv_info.n_layer      = inventory->n_layer;
     g_placement_kv_info.n_embd_k_gqa = inventory->n_embd_k_gqa;
@@ -6271,15 +6264,12 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
     g_placement_kv_info.n_ubatch     = inventory->n_ubatch;
     g_placement_kv_info.n_swa        = inventory->n_swa;
     g_placement_kv_info.n_swa_layers = inventory->n_swa_layers;
-    // Copy per-layer SWA mask for heterogeneous KV cost charging.
     if (inventory->swa_layer_mask != nullptr && inventory->swa_layer_mask_count > 0) {
         g_placement_kv_info.swa_layer_mask.assign(inventory->swa_layer_mask,
                                                   inventory->swa_layer_mask + inventory->swa_layer_mask_count);
     } else {
         g_placement_kv_info.swa_layer_mask.clear();
     }
-    // Current phase uses a conservative planner contract: model inventory
-    // provides train-context sizing unless a runtime override is added later.
     g_placement_kv_info.n_ctx_is_runtime = false;
     if (g_placement_kv_info.valid()) {
         GGML_LOG_INFO(
@@ -6289,14 +6279,12 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
             g_placement_kv_info.kv_bytes_per_layer() / (1024.0 * 1024.0));
     }
 
-    // Detect MoE expert tensors and store MoE hparams
     g_moe_n_experts_total             = inventory->n_expert;
     g_moe_n_experts_used              = inventory->n_expert_used;
     g_placement_kv_info.n_expert_used = inventory->n_expert_used;
     g_moe_expert_total_bytes          = 0;
     if (g_moe_n_experts_total > 0) {
         for (const auto & [name, size] : g_tensor_inventory) {
-            // Expert tensors match patterns like "blk.N.ffn_up_exps.weight" or "blk.N.ffn_gate_exps.weight"
             if (name.find("_exps") != std::string::npos) {
                 g_moe_expert_total_bytes += size;
             }
@@ -6306,34 +6294,25 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
                           g_moe_n_experts_total, g_moe_n_experts_used, g_moe_expert_total_bytes / (1024.0 * 1024.0));
         }
     }
-
-    // NOTE: MoE expert VRAM reserve is registered in ggml_sycl_preload_model_weights()
-    // AFTER the unified cache is created.  Registering here (before cache creation)
-    // gets absorbed into the cache's runtime_reserved_baseline and has no effect
-    // on available_for_compute().
+    // MoE expert VRAM reserve is registered later in ggml_sycl_preload_model_weights()
+    // after the unified cache is created.  Registering here would be absorbed into
+    // runtime_reserved_baseline and have no effect on available_for_compute().
     g_moe_expert_vram_reserve.fill(0);
+}
 
-    // Check if tiered mode should be enabled based on VRAM budget
+// Phase B helper: pure VRAM budget computation.  Returns vram_budget,
+// budget_pct, base_mem, free_mem via out-params.
+static void compute_vram_budget_for_plan(ggml_backend_sycl_context * ctx,
+                                         size_t &                    vram_budget_out,
+                                         int &                       budget_pct_out,
+                                         size_t &                    base_mem_out,
+                                         size_t &                    free_mem_out) {
     size_t free_mem = 0, total_mem = 0;
-
     ggml_backend_sycl_get_device_memory(ctx->device, &free_mem, &total_mem);
-
-    // Use total VRAM as base for budget calculation (not free_mem which depends on allocation order)
-    // This matches how unified_cache calculates its budget
-    const size_t base_mem = total_mem > 0 ? total_mem : free_mem;
-
-    // Calculate already-allocated memory (KV cache, compute buffers, etc.)
-    // This is the difference between total and free at this point
-    const size_t already_allocated = base_mem > free_mem ? base_mem - free_mem : 0;
-
-    // No artificial headroom — the unified cache manages all memory and
-    // subsystems (compute scratch, KV cache) fall back to host-pinned
-    // when VRAM is full.  The free_mem cap in the cache constructor
-    // already handles the real constraint (actual free VRAM at startup).
+    const size_t base_mem      = total_mem > 0 ? total_mem : free_mem;
     const size_t base_headroom = 0;
 
-    // Apply GGML_SYCL_VRAM_BUDGET_PCT if set (same env var as unified cache and get_memory)
-    int          budget_pct     = 100;  // Default: 100% — unified cache owns all VRAM
+    int          budget_pct     = 100;
     const char * env_budget_pct = std::getenv("GGML_SYCL_VRAM_BUDGET_PCT");
     if (env_budget_pct) {
         budget_pct = std::max(1, std::min(100, std::atoi(env_budget_pct)));
@@ -6345,20 +6324,144 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
         vram_budget = vram_budget_base - base_headroom;
     }
 
-    // Enable tiered mode when unified cache is active (needed to upload weights to VRAM).
-    // Always enabled so the cache can manage VRAM placement for all model sizes.
-    // For MoE models, compute effective weight size (only active experts needed in VRAM)
-    // for display/budget purposes.
+    g_tiered_enabled.store(ggml_sycl::unified_cache_enabled(), std::memory_order_relaxed);
+
+    vram_budget_out = vram_budget;
+    budget_pct_out  = budget_pct;
+    base_mem_out    = base_mem;
+    free_mem_out    = free_mem;
+}
+
+// Phase C helper: run compute_placement_plan (single- or multi-device) and
+// store the plan into per-device unified caches.  Idempotent — replaces any
+// previous plan.  Caller must hold g_tensor_inventory_mutex.
+static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx,
+                                                 size_t                      vram_budget,
+                                                 int                         budget_pct) {
+    if (!ggml_sycl::vram_arena_enabled()) {
+        g_has_placement_plan = false;
+        return;
+    }
+    const bool   is_moe = g_moe_n_experts_total > 0;
+    const auto & info   = ggml_sycl_info();
+    if (info.total_gpu_count >= 2 && ggml_backend_sycl_moe_multi_gpu_requested()) {
+        // P4.5: Multi-device placement
+        std::vector<ggml_sycl::device_budget> budgets;
+        budgets.reserve(info.total_gpu_count);
+        for (int d = 0; d < info.total_gpu_count; d++) {
+            size_t dev_free = 0, dev_total = 0;
+            ggml_backend_sycl_get_device_memory(d, &dev_free, &dev_total);
+            size_t dev_budget = static_cast<size_t>(dev_total * (static_cast<double>(budget_pct) / 100.0));
+            budgets.push_back({ d, dev_budget, dev_total });
+        }
+        const auto                           gpu_mode = ggml_sycl::get_multi_gpu_mode(is_moe);
+        const ggml_sycl_placement_envelope * envelope_arg =
+            g_placement_envelope_set ? &g_placement_envelope : nullptr;
+        g_placement_plan = ggml_sycl::compute_multi_device_plan(
+            budgets, g_tensor_inventory, static_cast<int>(g_model_n_layer), gpu_mode, g_placement_kv_info,
+            envelope_arg, g_moe_n_experts_total);
+        g_has_placement_plan = true;
+        GGML_LOG_INFO(
+            "[SYCL] Multi-device placement plan computed: %zu entries, "
+            "%.1f MB device + %.1f MB host (%d GPUs)\n",
+            g_placement_plan.entries.size(), g_placement_plan.vram_bytes / (1024.0 * 1024.0),
+            g_placement_plan.host_bytes / (1024.0 * 1024.0), info.total_gpu_count);
+    } else {
+        // P4: Single-device placement.  Use the actual arena shared zone size as
+        // the budget — the arena subtracts zone overheads internally so the
+        // planner doesn't need to guess.
+        size_t plan_budget = vram_budget;
+        auto * cache       = ggml_sycl::get_unified_cache_for_device(ctx->device);
+        if (cache && cache->arena_active()) {
+            const size_t arena_total   = cache->arena_total_size();
+            const size_t zone_overhead = cache->zone_capacity(ggml_sycl::vram_zone_id::SCRATCH) +
+                                         cache->zone_capacity(ggml_sycl::vram_zone_id::ONEDNN) +
+                                         cache->zone_capacity(ggml_sycl::vram_zone_id::RUNTIME);
+            plan_budget = arena_total > zone_overhead ? arena_total - zone_overhead : 0;
+            GGML_LOG_INFO(
+                "[SYCL] Plan budget tied to arena: %.1f MB shared zone "
+                "(arena=%.1f MB - zones=%.1f MB)\n",
+                plan_budget / (1024.0 * 1024.0), arena_total / (1024.0 * 1024.0),
+                zone_overhead / (1024.0 * 1024.0));
+        }
+        const ggml_sycl_placement_envelope * envelope_arg =
+            g_placement_envelope_set ? &g_placement_envelope : nullptr;
+        g_placement_plan = ggml_sycl::compute_placement_plan(
+            g_tensor_inventory, plan_budget, ctx->device, g_placement_kv_info, envelope_arg, g_moe_n_experts_total);
+        g_has_placement_plan = true;
+        GGML_LOG_INFO(
+            "[SYCL] Placement plan computed: %zu entries, "
+            "%.1f MB device + %.1f MB host\n",
+            g_placement_plan.entries.size(), g_placement_plan.vram_bytes / (1024.0 * 1024.0),
+            g_placement_plan.host_bytes / (1024.0 * 1024.0));
+    }
+
+    // Store plan in per-device caches so the KV tier manager sees it before
+    // KV init.  The graph-replay guard (g_has_placement_plan &&
+    // graph_has_host_inputs) protects against replaying graphs with
+    // host-resident leaf inputs whose data changes between iterations.
+    if (g_has_placement_plan) {
+        for (int d = 0; d < ggml_sycl_info().total_gpu_count; d++) {
+            auto * cache = ggml_sycl::get_unified_cache_for_device(d);
+            if (cache && !cache->has_placement_plan()) {
+                cache->set_placement_plan(ggml_sycl::placement_plan(g_placement_plan));
+                GGML_SYCL_DEBUG("[SYCL] Early plan store for device %d\n", d);
+            }
+        }
+    }
+}
+
+// Compute placement plan early — before create_tensor in the llama loader.
+// Populates inventory globals and runs the planner so create_tensor's
+// per-tensor buft selection can consult g_placement_plan.  Skips the
+// late-only side effects (layer-streaming setup, host-pinned pre-allocate,
+// headroom reserve) that depend on state populated by create_tensor.
+void ggml_backend_sycl_compute_placement_plan_early(ggml_backend_t                            backend,
+                                                    const ggml_sycl_tensor_inventory * inventory) {
+    if (!backend || !inventory || (inventory->count > 0 && !inventory->tensors)) {
+        return;
+    }
+    ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *) backend->context;
+    if (!ctx) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    populate_inventory_globals(ctx, inventory);
+    size_t vram_budget = 0, base_mem = 0, free_mem = 0;
+    int    budget_pct = 0;
+    compute_vram_budget_for_plan(ctx, vram_budget, budget_pct, base_mem, free_mem);
+    compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct);
+}
+
+void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_sycl_tensor_inventory * inventory) {
+    if (!backend || !inventory || (inventory->count > 0 && !inventory->tensors)) {
+        return;
+    }
+    ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *) backend->context;
+    if (!ctx) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+
+    // Phase A: inventory + KV + MoE globals.  Idempotent against a prior
+    // ggml_backend_sycl_compute_placement_plan_early() call with the same
+    // inventory snapshot.
+    populate_inventory_globals(ctx, inventory);
+
+    // Phase B: VRAM budget computation.
+    size_t vram_budget = 0, base_mem = 0, free_mem = 0;
+    int    budget_pct = 0;
+    compute_vram_budget_for_plan(ctx, vram_budget, budget_pct, base_mem, free_mem);
+
+    // Diagnostic banner: report the same numbers Phase C will use to pack
+    // the plan, plus the layer-streaming / pre-allocate decisions taken below.
+    const size_t base_headroom        = 0;
+    const size_t already_allocated    = base_mem > free_mem ? base_mem - free_mem : 0;
+    const size_t vram_budget_base     = static_cast<size_t>(base_mem * (static_cast<double>(budget_pct) / 100.0));
     const size_t effective_model_size = ggml_sycl::compute_moe_effective_weight_bytes(
         g_tensor_inventory_total_size, g_moe_expert_total_bytes, g_moe_n_experts_total, g_moe_n_experts_used);
-    // Unified non-blocking cache: no model_exceeds_vram branching.
-    // All inference callers use the non-blocking try_get_cached_with_event path.
-    // Dense weights are pinned after S1-PRELOAD; MoE experts use LRU eviction.
-    //
-    // Subtract arena zone overhead (SCRATCH, ONEDNN, RUNTIME) from the weight
-    // budget comparison.  Without this, a model that barely fits raw VRAM
-    // (e.g. 11.5 GB on 11.6 GB) appears to fit, but the ~1 GB of arena zones
-    // leaves only ~10.6 GB for weights — the placement plan never triggers.
     size_t arena_zone_overhead = 0;
     if (ggml_sycl::vram_arena_enabled()) {
         auto * cache = ggml_sycl::get_unified_cache_for_device(ctx->device);
@@ -6370,10 +6473,6 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
     }
     const size_t weight_budget             = vram_budget > arena_zone_overhead ? vram_budget - arena_zone_overhead : 0;
     const bool   model_size_exceeds_budget = g_tensor_inventory_total_size > weight_budget;
-    // Write-once at startup — relaxed ordering is sufficient because callers
-    // are sequenced after model load (no cross-thread visibility requirement).
-    g_tiered_enabled.store(ggml_sycl::unified_cache_enabled(), std::memory_order_relaxed);
-
     GGML_LOG_INFO(
         "[SYCL-BUDGET] budget_pct=%d%%, vram_budget=%.1f MB (free=%.1f MB), "
         "arena_zones=%.1f MB, weight_budget=%.1f MB, "
@@ -6386,12 +6485,10 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
     // 1. Model exceeds effective VRAM budget (auto-activation for non-MoE dense models)
     // 2. User forces streaming via GGML_SYCL_FORCE_STREAMING=1 (testing/override)
     // Layer streaming provides a device-side copy for GPU kernels that need weights.
+    // Stays in the late path because g_sycl_host_weight_extras is populated by create_tensor.
     const char * force_stream          = std::getenv("GGML_SYCL_FORCE_STREAMING");
     const bool   streaming_forced      = force_stream && std::atoi(force_stream) == 1;
     const bool   cpu_offload_available = ggml_sycl_cpu_offload_enabled() && ggml_sycl_info().has_cpu_device;
-    // MoE models handle expert weight streaming via their own dispatch path
-    // (expert placement table + on-demand cache). Don't activate layer streaming
-    // for MoE — it would waste VRAM on streaming buffers that MoE doesn't use.
     const bool   is_moe                = g_moe_n_experts_total > 0;
     if ((model_size_exceeds_budget && !is_moe) || streaming_forced) {
         auto & mgr = ggml_sycl::get_layer_stream_manager(ctx->device);
@@ -6408,7 +6505,6 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
         }
         sycl::queue & q = ggml_sycl_get_device(ctx->device).default_queue();
         if (mgr.allocate_buffers(q)) {
-            // Register streaming buffer allocation with unified cache budget
             GGML_LOG_INFO(
                 "[SYCL-BUDGET] Layer streaming enabled%s: %d layers, 2 x %.1f MB buffers (%.1f MB budgeted)\n",
                 streaming_forced ? " (forced)" : "", mgr.n_layers(), mgr.max_layer_size() / (1024.0 * 1024.0),
@@ -6418,7 +6514,6 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
         }
     }
 
-    // Diagnostic logging for VRAM budget calculation debugging
     GGML_LOG_INFO("[SYCL-BUDGET] base_mem=%.1f MB, already_allocated=%.1f MB, headroom=%.1f MB\n",
                   base_mem / (1024.0 * 1024.0), already_allocated / (1024.0 * 1024.0),
                   base_headroom / (1024.0 * 1024.0));
@@ -6441,7 +6536,6 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
                       desired_extra / (1024.0 * 1024.0), base_headroom / (1024.0 * 1024.0),
                       base_mem / (1024.0 * 1024.0));
     }
-    // VRAM budget breakdown by category priority
     {
         const double MB                = 1024.0 * 1024.0;
         const size_t dense_weights     = g_tensor_inventory_total_size - g_moe_expert_total_bytes;
@@ -6462,12 +6556,10 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
                       scratch_remaining / MB);
     }
 
-    // -----------------------------------------------------------------------
     // Pre-allocate host-pinned memory for the full model working set so that
     // NO sycl::malloc_host calls occur during inference.  The model size is
-    // now known from the tensor inventory; pre_allocate_all adds 20% headroom
-    // for SOA conversion temporaries, staging buffers, and runtime allocations.
-    // -----------------------------------------------------------------------
+    // known from the tensor inventory; pre_allocate_all adds 20% headroom for
+    // SOA conversion temporaries, staging buffers, and runtime allocations.
     {
         auto * cache = ggml_sycl::get_unified_cache_for_device(ctx->device);
         if (cache) {
@@ -6481,90 +6573,9 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
         }
     }
 
-    // P4/P4.5: Always compute placement plan when VRAM arena is active.
-    // Small models: everything assigned to device.  Large models: spill to host.
-    // Single GPU: P4 Unsloth-priority bin-packing.
-    // Multi-GPU: P4.5 hybrid parallelism (layer split + expert distribution).
-    if (ggml_sycl::vram_arena_enabled()) {
-        const auto & info = ggml_sycl_info();
-        if (info.total_gpu_count >= 2 && ggml_backend_sycl_moe_multi_gpu_requested()) {
-            // P4.5: Multi-device placement
-            std::vector<ggml_sycl::device_budget> budgets;
-            budgets.reserve(info.total_gpu_count);
-            for (int d = 0; d < info.total_gpu_count; d++) {
-                size_t dev_free = 0, dev_total = 0;
-                ggml_backend_sycl_get_device_memory(d, &dev_free, &dev_total);
-                size_t dev_budget = static_cast<size_t>(dev_total * (static_cast<double>(budget_pct) / 100.0));
-                budgets.push_back({ d, dev_budget, dev_total });
-            }
-            const auto gpu_mode = ggml_sycl::get_multi_gpu_mode(is_moe);
-            const ggml_sycl_placement_envelope * envelope_arg =
-                g_placement_envelope_set ? &g_placement_envelope : nullptr;
-            g_placement_plan = ggml_sycl::compute_multi_device_plan(
-                budgets, g_tensor_inventory, static_cast<int>(g_model_n_layer), gpu_mode, g_placement_kv_info,
-                envelope_arg, g_moe_n_experts_total);
-            g_has_placement_plan = true;
-            GGML_LOG_INFO(
-                "[SYCL] Multi-device placement plan computed: %zu entries, "
-                "%.1f MB device + %.1f MB host (%d GPUs)\n",
-                g_placement_plan.entries.size(), g_placement_plan.vram_bytes / (1024.0 * 1024.0),
-                g_placement_plan.host_bytes / (1024.0 * 1024.0), info.total_gpu_count);
-        } else {
-            // P4: Single-device placement (with per-expert MoE splitting)
-            // Use the actual arena shared zone size as the budget — this is the
-            // real space available for weights + KV.  The arena subtracts zone
-            // overheads internally, so the planner doesn't need to guess.
-            size_t plan_budget = vram_budget;
-            if (ggml_sycl::vram_arena_enabled()) {
-                auto * cache = ggml_sycl::get_unified_cache_for_device(ctx->device);
-                if (cache && cache->arena_active()) {
-                    // Shared zone = arena total - (scratch + oneDNN + runtime)
-                    const size_t arena_total   = cache->arena_total_size();
-                    const size_t zone_overhead = cache->zone_capacity(ggml_sycl::vram_zone_id::SCRATCH) +
-                                                 cache->zone_capacity(ggml_sycl::vram_zone_id::ONEDNN) +
-                                                 cache->zone_capacity(ggml_sycl::vram_zone_id::RUNTIME);
-                    plan_budget = arena_total > zone_overhead ? arena_total - zone_overhead : 0;
-                    GGML_LOG_INFO(
-                        "[SYCL] Plan budget tied to arena: %.1f MB shared zone "
-                        "(arena=%.1f MB - zones=%.1f MB)\n",
-                        plan_budget / (1024.0 * 1024.0), arena_total / (1024.0 * 1024.0),
-                        zone_overhead / (1024.0 * 1024.0));
-                }
-            }
-            const ggml_sycl_placement_envelope * envelope_arg =
-                g_placement_envelope_set ? &g_placement_envelope : nullptr;
-            g_placement_plan = ggml_sycl::compute_placement_plan(
-                g_tensor_inventory, plan_budget, ctx->device, g_placement_kv_info, envelope_arg, g_moe_n_experts_total);
-            g_has_placement_plan = true;
-            GGML_LOG_INFO(
-                "[SYCL] Placement plan computed: %zu entries, "
-                "%.1f MB device + %.1f MB host\n",
-                g_placement_plan.entries.size(), g_placement_plan.vram_bytes / (1024.0 * 1024.0),
-                g_placement_plan.host_bytes / (1024.0 * 1024.0));
-        }
-    } else {
-        g_has_placement_plan = false;
-    }
-
-    // Store plan in cache immediately so KV tier manager can use it.
-    // Previously stored in preload_model_weights() which runs AFTER KV init,
-    // causing the plan-driven KV path to be skipped.
-    if (g_has_placement_plan) {
-        for (int d = 0; d < ggml_sycl_info().total_gpu_count; d++) {
-            auto * cache = ggml_sycl::get_unified_cache_for_device(d);
-            if (cache && !cache->has_placement_plan()) {
-                cache->set_placement_plan(ggml_sycl::placement_plan(g_placement_plan));
-                GGML_SYCL_DEBUG("[SYCL] Early plan store for device %d\n", d);
-            }
-        }
-        // NOTE: g_has_placement_plan intentionally left true here.
-        // The graph-replay guard (g_has_placement_plan && graph_has_host_inputs)
-        // protects against replaying graphs with host-resident leaf inputs
-        // (e.g. token IDs) whose DATA changes between iterations.  SYCL graph
-        // replay bakes the first iteration's data flow — autoregressive TG
-        // needs input token + KV position updates between replays, which the
-        // current recording infrastructure doesn't support.
-    }
+    // Phase C: compute placement plan + store to per-device caches.
+    // Idempotent against a prior early call with the same inventory.
+    compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct);
 
     GGML_LOG_INFO(
         "[SYCL] Tensor inventory set: %zu tensors, %.2f GB total "
