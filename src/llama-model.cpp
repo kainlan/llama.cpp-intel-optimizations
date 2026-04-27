@@ -8616,11 +8616,11 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             inventory.n_layer       = hparams.n_layer;
             inventory.n_embd_k_gqa  = hparams.n_embd_k_gqa();
             inventory.n_embd_v_gqa  = hparams.n_embd_v_gqa();
-            // Use runtime context hint if provided (from -c flag), otherwise
-            // fall back to model's training context (conservative estimate).
-            inventory.n_ctx    = (params.n_ctx_hint > 0)    ? params.n_ctx_hint    : hparams.n_ctx_train;
-            inventory.n_ubatch = (params.n_ubatch_hint > 0) ? params.n_ubatch_hint : 512;
-            inventory.n_swa    = hparams.n_swa;
+            // Use placement-envelope n_ctx/n_ubatch if provided (from -c / -ub),
+            // otherwise fall back to model's training context (conservative estimate).
+            inventory.n_ctx         = (params.n_ctx    > 0) ? params.n_ctx    : hparams.n_ctx_train;
+            inventory.n_ubatch      = (params.n_ubatch > 0) ? params.n_ubatch : 512;
+            inventory.n_swa         = hparams.n_swa;
             inventory.n_swa_layers  = 0;
             for (uint32_t il = 0; il < hparams.n_layer; ++il) {
                 if (hparams.is_swa(il)) {
@@ -9804,8 +9804,10 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/false,
         /*.no_alloc                    =*/false,
         /*.lazy_moe                    =*/false,
-        /*.n_ctx_hint                  =*/0,
-        /*.n_ubatch_hint               =*/0,
+        /*.n_ctx                       =*/0,
+        /*.n_ubatch                    =*/0,
+        /*.n_seq_max                   =*/1,
+        /*.flash_attn_type             =*/LLAMA_FLASH_ATTN_TYPE_AUTO,
     };
 
     return result;

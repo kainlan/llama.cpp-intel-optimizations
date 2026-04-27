@@ -1693,8 +1693,12 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
     mparams.lazy_moe        = params.lazy_moe;
-    mparams.n_ctx_hint      = params.n_ctx;     // Pass runtime -c to GPU planner
-    mparams.n_ubatch_hint   = params.n_ubatch;  // Pass runtime n_ubatch for SWA KV sizing
+    // Placement envelope: declared aggregate shape this loaded model must serve.
+    // Mirrored from common_params and llama_context_params for the GPU planner.
+    mparams.n_ctx           = params.n_ctx;
+    mparams.n_ubatch        = params.n_ubatch;
+    mparams.n_seq_max       = params.n_parallel;
+    mparams.flash_attn_type = params.flash_attn_type;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;

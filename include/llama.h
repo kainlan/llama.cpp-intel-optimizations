@@ -319,14 +319,17 @@ extern "C" {
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool lazy_moe;        // keep MoE expert weights in host memory, cache to GPU on-demand
 
-        // Runtime context size hint for GPU memory planning.
-        // When non-zero, the SYCL backend uses this instead of n_ctx_train
-        // to size KV cache allocations during model loading. This enables
-        // accurate VRAM budget planning before the context is created.
-        // Set these to llama_context_params.n_ctx / n_ubatch for optimal GPU memory usage.
-        // 0 = use model defaults (n_ctx_train / 512, conservative).
-        uint32_t n_ctx_hint;
-        uint32_t n_ubatch_hint;
+        // Placement envelope: declared maximum aggregate shape this loaded
+        // model is expected to serve without reload. Drives the weight/KV/
+        // compute placement plan that the GPU backend builds at model load.
+        // Capacity inputs (not "this user's context"): each per-context or
+        // per-slot compute plan still allocates within the envelope.
+        // Mirror these from the corresponding llama_context_params fields.
+        // 0 = use model defaults (n_ctx_train, ubatch=512, conservative).
+        uint32_t                   n_ctx;            // max ctx per slot
+        uint32_t                   n_ubatch;         // physical maximum batch size
+        uint32_t                   n_seq_max;        // max active sequences / slots
+        enum llama_flash_attn_type flash_attn_type;  // FA policy for the envelope
     };
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations

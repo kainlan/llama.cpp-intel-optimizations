@@ -210,8 +210,8 @@ int main(int argc, char ** argv) {
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers       = opt.ngl;
-    mparams.n_ctx_hint         = opt.envelope_ctx;
-    mparams.n_ubatch_hint      = opt.ubatch;
+    mparams.n_ctx              = opt.envelope_ctx;
+    mparams.n_ubatch           = opt.ubatch;
 
     std::printf("placement envelope canary: model=%s envelope_ctx=%u ubatch=%u seq_max=%u ngl=%d\n", opt.model.c_str(),
                 opt.envelope_ctx, opt.ubatch, opt.seq_max, opt.ngl);
