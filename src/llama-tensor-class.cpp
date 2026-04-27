@@ -136,30 +136,33 @@ std::string strip_layout_suffix(const std::string & role) {
 
 }  // namespace
 
+// Note: called once per tensor at model load (not per token), so the few
+// per-call string allocations below are intentional simplicity. If this ever
+// becomes a hot path, switch to std::string_view + heterogeneous lookup.
 llama_tensor_classification llama_tensor_classify(const char * name) {
     llama_tensor_classification result = { LLAMA_TENSOR_CLASS_MISC, -1 };
     if (name == nullptr) {
         return result;
     }
 
-    const std::string full = name;
+    const std::string s = name;
 
-    if (full.rfind("blk.", 0) == 0) {
+    if (s.rfind("blk.", 0) == 0) {
         // Per-layer: "blk.<N>.<role>[.<suffix>]"
         const std::size_t layer_start = 4;  // after "blk."
-        const std::size_t layer_end   = full.find('.', layer_start);
+        const std::size_t layer_end   = s.find('.', layer_start);
         if (layer_end == std::string::npos) {
             return result;
         }
 
-        const std::string layer_str = full.substr(layer_start, layer_end - layer_start);
+        const std::string layer_str = s.substr(layer_start, layer_end - layer_start);
         char *            end_ptr   = nullptr;
         const long        layer_val = std::strtol(layer_str.c_str(), &end_ptr, 10);
         if (end_ptr == layer_str.c_str() || *end_ptr != '\0' || layer_val < 0) {
             return result;
         }
 
-        const std::string role = strip_layout_suffix(full.substr(layer_end + 1));
+        const std::string role = strip_layout_suffix(s.substr(layer_end + 1));
         const auto &      map  = per_layer_map();
         const auto        it   = map.find(role);
         if (it != map.end()) {
@@ -170,7 +173,7 @@ llama_tensor_classification llama_tensor_classify(const char * name) {
     }
 
     // Top-level (non per-layer).
-    const std::string role = strip_layout_suffix(full);
+    const std::string role = strip_layout_suffix(s);
     const auto &      map  = top_level_map();
     const auto        it   = map.find(role);
     if (it != map.end()) {
@@ -183,6 +186,7 @@ llama_tensor_classification llama_tensor_classify(const ggml_tensor * tensor) {
     if (tensor == nullptr) {
         return { LLAMA_TENSOR_CLASS_MISC, -1 };
     }
+    // tensor->name is char[64], never null — empty string falls through to MISC.
     return llama_tensor_classify(tensor->name);
 }
 

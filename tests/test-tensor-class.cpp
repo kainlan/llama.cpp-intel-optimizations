@@ -191,7 +191,17 @@ bool check_layer_indices(const char * arch_name, const std::vector<std::string> 
         if (end == std::string::npos) {
             continue;
         }
-        const int                         expected = std::atoi(n.substr(4, end - 4).c_str());
+        // Mirror the impl's strtol+end-ptr validation rather than atoi: this
+        // sweep enumerates synthetic names and a malformed entry should fail
+        // the test loudly, not silently parse to 0.
+        const std::string layer_str = n.substr(4, end - 4);
+        char *            end_ptr   = nullptr;
+        const long        layer_val = std::strtol(layer_str.c_str(), &end_ptr, 10);
+        if (end_ptr == layer_str.c_str() || *end_ptr != '\0' || layer_val < 0) {
+            fprintf(stderr, "FAIL: %s: malformed synthetic name '%s' (layer-extract failed)\n", arch_name, n.c_str());
+            std::abort();
+        }
+        const int                         expected = static_cast<int>(layer_val);
         const llama_tensor_classification c        = llama_tensor_classify(n.c_str());
         if (c.cls == LLAMA_TENSOR_CLASS_MISC) {
             continue;
