@@ -66,8 +66,19 @@ memory**. It manages five named zones:
 | `RUNTIME` | Compute buffers, MoE pools, TP buffers | Per model load; some per-token |
 | `SCRATCH` | Per-token scratch; reset between tokens | Token-scoped |
 
-Plus a host-pinned zone (`HOST`) for CPU-accessible buffers managed via
-`unified_cache_host_zone_alloc` / `unified_cache_zone_alloc`.
+Plus a host-pinned tier managed by `host_zone_id` (`pinned-pool.hpp:56`), which
+has four named zones distinct from `vram_zone_id`:
+
+| Zone (`host_zone_id`) | Purpose |
+|---|---|
+| `WEIGHT` | Host-resident model weights (overflow from VRAM) |
+| `KV` | KV cache host fallback |
+| `STAGING` | DMA staging / expert bias D2H |
+| `SCRATCH` | Host-side quantization / CPU compute scratch |
+
+Host-pinned allocations use `unified_cache_host_zone_alloc(host_zone_id zone, ...)` /
+`unified_cache_zone_alloc`. The `→ Zone: HOST` shorthand in §1.1 refers to any of
+these four `host_zone_id` zones.
 
 **What the unified cache does NOT own:**
 - Placement decisions (the planner owns those).
@@ -118,7 +129,7 @@ and its `mem_handle` operands, it selects and invokes the correct kernel
 reads placement decisions from the planner, resolves pointers from handles, and
 allocates nothing.
 
-**Current entry point:** `ggml_sycl_compute_forward` in `ggml/src/ggml-sycl/ggml-sycl.cpp:39001`
+**Current entry point:** `ggml_sycl_compute_forward` in `ggml/src/ggml-sycl/ggml-sycl.cpp:39002`
 **Current MUL_MAT entry point:** `ggml_sycl::ggml_sycl_mul_mat_unified` in `ggml/src/ggml-sycl/dispatch.hpp:418`
 **Kernel selector:** `ggml_sycl::select_kernel_type` in `ggml/src/ggml-sycl/dispatch.hpp:186`
 
@@ -138,9 +149,14 @@ sycl::event dispatch_op(
     ggml_op                        op,
     std::span<const mem_handle>    srcs,
     const mem_handle &             dst,
-    const OperationContext &       ctx,
+    const OperationContext &       ctx,  // see note below
     std::span<const sycl::event>   deps);
 ```
+
+*Note on `OperationContext`:* Two independent definitions exist today —
+`op-context.hpp:32` and `dispatch.hpp:353`. T8 (`llama.cpp-32dg8.9`) must
+disambiguate (either unify them or pick one canonical definition) before this
+target API can be implemented.
 
 The router determines residency from `handle.resolve().on_device` and `handle.device()`,
 selects the kernel, and returns an event — without the caller performing any
@@ -162,9 +178,9 @@ these or be migrated (see §9 for temporary allowlisted sites):
 |---|---|---|
 | `unified_alloc(req, out)` | Primary allocator; routes by zone/tier | `bool` + `alloc_handle` |
 | `unified_allocate(req)` | Handle-returning wrapper around `unified_alloc` | `mem_handle` |
-| `unified_cache_allocate(size, device, ...)` | Bulk weight slot allocator | internal |
+| `unified_cache_allocate(device, size, category, queue)` | Bulk weight/arena slot allocator | `unified_alloc_result` (`unified-cache.hpp:2374`) |
 | `unified_cache_zone_alloc(zone, size, ...)` | Named zone allocation | `void *` |
-| `unified_cache_host_zone_alloc(size, align)` | Host-pinned zone allocation | `void *` |
+| `unified_cache_host_zone_alloc(zone, size, align)` | **Deprecated** — host-pinned zone allocation; migrate to `unified_allocate()` with `must_host_pinned` + `use_pinned_pool` | `void *` |
 | `unified_cache_arena_alloc` | **Deprecated** — migrate to `unified_allocate(..., prefer_vram_zone=SCRATCH)` | `void *` |
 | `unified_cache_raw_malloc_device(size, queue)` | Raw `sycl::malloc_device` wrapper — call only from inside `unified_cache` internals | `void *` |
 | `unified_cache_raw_malloc_host(size, queue/ctx)` | Raw `sycl::malloc_host` wrapper — call only from inside `unified_cache` internals | `void *` |
@@ -186,7 +202,7 @@ Only the following functions may hand out resolved raw pointers from a handle:
 | Function | When to use |
 |---|---|
 | `mem_handle::resolve()` | Normal dispatch: returns `resolved_ptr{ptr, layout, on_device}` |
-| `unified_lookup(key, device, out)` | Look up a weight by cache key without holding a handle |
+| `unified_lookup(void * ptr, alloc_handle * out)` | Reverse-look up an allocation by raw pointer (`unified-cache.hpp:2345`) |
 | `unified_cache::memset(h, val, size, queue)` | Fill memory behind a handle (void, no event returned — **deprecated API shape**; see §6) |
 | `unified_cache::memcpy(dst, src, size, queue)` | Copy between handles (void, no event returned — **deprecated API shape**; see §6) |
 
@@ -352,7 +368,7 @@ pending migration. Each entry names the owning bead and deletion criteria.
 
 ### 9.1 Direct SYCL allocation sites (non-`unified_cache` internals)
 
-The full inventory (545 raw SYCL alloc patterns in `ggml/src/ggml-sycl`) is being
+The full inventory (711 `malloc_device|malloc_host|malloc_shared` hits across `ggml/src/ggml-sycl/`, per `grep -rE 'malloc_device|malloc_host|malloc_shared'`) is being
 built as part of `llama.cpp-32dg8.15.14`. Until that inventory is complete, sites
 are grouped by subsystem:
 
@@ -370,9 +386,11 @@ are grouped by subsystem:
 
 ### 9.2 Host-residency predicates (caller-side "is on host?" checks)
 
-78 sites in `ggml/src/ggml-sycl` branch on `ggml_backend_buffer_is_host`,
+129 sites across `ggml/src/ggml-sycl/` branch on `ggml_backend_buffer_is_host`,
 `ggml_sycl_is_host_resident_weight`, `ggml_sycl_weight_is_planned_on_host`, or
-`has_placement_plan`. These are temporarily allowed; migration to handle-based
+`has_placement_plan` (101 in `ggml-sycl.cpp` alone; per
+`grep -rn 'ggml_backend_buffer_is_host|ggml_sycl_is_host_resident|ggml_sycl_weight_is_planned_on_host|has_placement_plan\b'`).
+These are temporarily allowed; migration to handle-based
 dispatch is tracked in:
 
 | Owner bead | Scope |
@@ -383,8 +401,10 @@ dispatch is tracked in:
 
 ### 9.3 `unified_cache_enabled()` / `weights_evictable()` branches
 
-54 sites branch on `unified_cache_enabled()` or equivalent guards. These are
-temporarily allowed as the optional-cache mode is removed:
+52 sites branch on `unified_cache_enabled()` or `unified_cache_active()` equivalent
+guards (excluding `unified-cache.hpp` and `unified-cache.cpp` themselves; per
+`grep -rn 'unified_cache_enabled|unified_cache_active' ggml/src/ggml-sycl/`).
+These are temporarily allowed as the optional-cache mode is removed:
 
 | Owner bead | Action |
 |---|---|
