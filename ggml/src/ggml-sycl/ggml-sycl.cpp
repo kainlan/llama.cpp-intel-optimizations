@@ -14219,40 +14219,6 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
     req.intent.constraints.use_pinned_pool  = buft_ctx->use_pinned_pool;
     req.intent.constraints.must_host_pinned = (effective_mem_type == GGML_SYCL_MEM_HOST);
 
-    // Force host-pinned for MoE model weight buffers when total model exceeds VRAM.
-    // Expert AOS data in device VRAM is dead weight -- GPU only reads SOA from cache.
-    // Placing the model buffer in host-pinned frees ~10 GB VRAM for the expert SOA cache.
-    // Note: the budget check uses effective (active-expert) size which may be < VRAM
-    // even when the total model is much larger.  Use raw inventory size for this check.
-    // The first weight buffer that individually fits in VRAM is allowed on device to avoid
-    // exhausting GPU page-table entries from mapping all 60+ GB as host-pinned.  Subsequent
-    // buffers that would overflow VRAM go directly to host-pinned, skipping the doomed
-    // device alloc attempt that the existing retry path would catch anyway.
-    if (effective_mem_type == GGML_SYCL_MEM_DEVICE && alloc_role == ggml_sycl::alloc_role::WEIGHT &&
-        g_moe_n_experts_total > 0 &&
-        g_tensor_inventory_total_size > ggml_sycl_get_safe_max_alloc_size(buft_ctx->device)) {
-        static std::atomic<size_t> g_moe_vram_weight_bytes{ 0 };
-        const size_t               already = g_moe_vram_weight_bytes.load(std::memory_order_acquire);
-        const size_t               safe    = ggml_sycl_get_safe_max_alloc_size(buft_ctx->device);
-        if (already + size > safe) {
-            // Would overflow VRAM -- route to host-pinned directly.
-            GGML_LOG_INFO(
-                "[SYCL] MoE model exceeds VRAM: routing weight buffer (%.1f MB) "
-                "to host-pinned for expert SOA cache architecture\n",
-                size / (1024.0 * 1024.0));
-            req.intent.constraints.must_host_pinned = true;
-            req.intent.constraints.must_device      = false;
-            effective_mem_type                      = GGML_SYCL_MEM_HOST;  // Skip the device-alloc block below
-        } else {
-            // First buffer(s) fit in VRAM -- let device-alloc succeed.
-            g_moe_vram_weight_bytes.fetch_add(size, std::memory_order_acq_rel);
-            GGML_LOG_INFO(
-                "[SYCL] MoE model: weight buffer (%.1f MB) fits in VRAM "
-                "(%.1f / %.1f MB used)\n",
-                size / (1024.0 * 1024.0), (already + size) / (1024.0 * 1024.0), safe / (1024.0 * 1024.0));
-        }
-    }
-
     if (effective_mem_type == GGML_SYCL_MEM_DEVICE) {
         const size_t safe_alloc = ggml_sycl_get_safe_max_alloc_size(buft_ctx->device);
         if (safe_alloc > 0 && size > safe_alloc) {
