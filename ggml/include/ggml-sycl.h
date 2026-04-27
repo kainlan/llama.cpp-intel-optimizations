@@ -177,11 +177,33 @@ struct ggml_sycl_tensor_inventory {
     uint32_t                       swa_layer_mask_count; // Length of swa_layer_mask (must == n_layer)
 };
 
+// SYCL-side projection of the four placement-envelope fields the llama
+// layer carries on llama_model_params.  Populated by the llama layer at
+// model load and snapshotted into a SYCL file-static; the planner reads
+// it directly so the envelope's source attribution is explicit (no
+// derivation through the inventory snapshot).  flash_attn_type mirrors
+// the llama_flash_attn_type enum as a stable int32 to keep this header
+// free of cross-layer includes.
+struct ggml_sycl_placement_envelope {
+    uint32_t n_ctx;            // per-slot ctx ceiling; 0 = use model default
+    uint32_t n_ubatch;         // ubatch ceiling; 0 = use 512 default
+    uint32_t n_seq_max;        // max active sequences / slots; default 1
+    int32_t  flash_attn_type;  // -1 = AUTO, 0 = DISABLED, 1 = ENABLED
+};
+
 // Set tensor inventory for tiered memory placement.
 // Must be called after model metadata parsing, before tensor allocation.
 // This enables automatic VRAM/host placement based on tensor priority.
 GGML_BACKEND_API void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t                            backend,
                                                              const struct ggml_sycl_tensor_inventory * inventory);
+
+// Set the placement envelope (snapshot of llama_model_params capacity inputs)
+// for this backend.  Must be called at model load alongside set_tensor_inventory.
+// The setter copies into a file-static; the caller's struct does not need to
+// outlive the call.  Passing NULL clears the envelope (planner falls back to
+// inventory-derived sizing).
+GGML_BACKEND_API void ggml_backend_sycl_set_placement_envelope(ggml_backend_t                              backend,
+                                                               const struct ggml_sycl_placement_envelope * envelope);
 
 // Update the planner metadata with the runtime context size for the current
 // inference context. This does not retroactively re-place already loaded

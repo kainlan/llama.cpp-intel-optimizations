@@ -10305,7 +10305,16 @@ placement_plan compute_placement_plan(const std::vector<std::pair<std::string, s
                                       size_t                                              vram_budget,
                                       int                                                 device_id,
                                       const placement_kv_info &                           kv_info,
+                                      const ggml_sycl_placement_envelope *                envelope,
                                       int                                                 n_experts) {
+    if (envelope != nullptr) {
+        const char * fa_name = (envelope->flash_attn_type < 0)  ? "AUTO" :
+                               (envelope->flash_attn_type == 0) ? "DISABLED" :
+                                                                  "ENABLED";
+        GGML_LOG_INFO(
+            "[PLACEMENT] envelope (from sycl-snapshot): n_ctx=%u n_ubatch=%u n_seq_max=%u flash_attn_type=%s\n",
+            envelope->n_ctx, envelope->n_ubatch, envelope->n_seq_max, fa_name);
+    }
     placement_plan plan;
     plan.vram_budget               = vram_budget;
     plan.device_id                 = device_id;
@@ -10661,12 +10670,13 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                                          int                                                 n_layers,
                                          multi_gpu_mode                                      mode,
                                          const placement_kv_info &                           kv_info,
+                                         const ggml_sycl_placement_envelope *                envelope,
                                          int                                                 n_experts) {
     // Single device: delegate to existing P4 path
     if (device_budgets.size() <= 1) {
         const int    dev    = device_budgets.empty() ? 0 : device_budgets[0].device_id;
         const size_t budget = device_budgets.empty() ? 0 : device_budgets[0].vram_budget;
-        return compute_placement_plan(tensor_inventory, budget, dev, kv_info, n_experts);
+        return compute_placement_plan(tensor_inventory, budget, dev, kv_info, envelope, n_experts);
     }
 
     const size_t n_devs = device_budgets.size();

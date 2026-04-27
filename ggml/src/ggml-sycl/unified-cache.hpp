@@ -388,10 +388,21 @@ struct placement_plan {
 // Sorts by (priority ASC, layer_id ASC, dst_size DESC, expert_id ASC)
 // and greedily packs into VRAM.  The mapping from tensor_usage to
 // placement_priority is in unified-cache.cpp (requires common.hpp types).
+// `envelope` is the authoritative source of the four declared
+// llama_model_params capacity inputs (n_ctx / n_ubatch / n_seq_max /
+// flash_attn_type), populated by the llama layer at model load via
+// ggml_backend_sycl_set_placement_envelope().  May be NULL when the
+// caller never set an envelope (legacy / test paths); the planner then
+// falls back to inventory-derived sizing through `kv_info` only.
+// Numeric KV cost still flows through `kv_info`, but `envelope` lets the
+// planner annotate its log output with explicit source attribution and
+// is the entry point for future planner decisions that need the raw
+// envelope (n_seq_max, flash_attn_type) rather than the derived snapshot.
 placement_plan compute_placement_plan(const std::vector<std::pair<std::string, size_t>> & tensor_inventory,
                                       size_t                                              vram_budget,
                                       int                                                 device_id,
                                       const placement_kv_info &                           kv_info,
+                                      const ggml_sycl_placement_envelope *                envelope,
                                       int                                                 n_experts = 0);
 
 // P4.5: Compute multi-device placement plan for hybrid parallelism.
@@ -411,6 +422,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                                          int                                                 n_layers,
                                          multi_gpu_mode                                      mode,
                                          const placement_kv_info &                           kv_info,
+                                         const ggml_sycl_placement_envelope *                envelope,
                                          int                                                 n_experts = 0);
 
 void   unified_cache_set_planned_pp_pipeline_scratch_bytes(int device_id, size_t bytes);

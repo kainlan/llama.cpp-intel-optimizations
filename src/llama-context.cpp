@@ -2891,6 +2891,36 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
+    // Placement-envelope admission: every per-context request must fit inside
+    // the capacity envelope declared at model load (llama_model_params).  Zero
+    // sentinels on n_ctx / n_ubatch mean "no caller-declared envelope" —
+    // skip the corresponding check.  n_seq_max has no zero sentinel; the
+    // model_default value is 1.
+    {
+        const llama_model_params & mparams = model->params;
+        if (mparams.n_ctx > 0 && params.n_ctx > mparams.n_ctx) {
+            LLAMA_LOG_ERROR(
+                "%s: requested n_ctx=%u exceeds placement-envelope n_ctx=%u declared at model load; "
+                "reload the model with a larger envelope or request a smaller context\n",
+                __func__, params.n_ctx, mparams.n_ctx);
+            return nullptr;
+        }
+        if (mparams.n_ubatch > 0 && params.n_ubatch > mparams.n_ubatch) {
+            LLAMA_LOG_ERROR(
+                "%s: requested n_ubatch=%u exceeds placement-envelope n_ubatch=%u declared at model load; "
+                "reload the model with a larger envelope or request a smaller ubatch\n",
+                __func__, params.n_ubatch, mparams.n_ubatch);
+            return nullptr;
+        }
+        if (params.n_seq_max > mparams.n_seq_max) {
+            LLAMA_LOG_ERROR(
+                "%s: requested n_seq_max=%u exceeds placement-envelope n_seq_max=%u declared at model load; "
+                "reload the model with a larger envelope or request fewer parallel sequences\n",
+                __func__, params.n_seq_max, mparams.n_seq_max);
+            return nullptr;
+        }
+    }
+
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && model->arch == LLM_ARCH_GROK) {
         LLAMA_LOG_WARN("%s: flash_attn is not compatible with Grok - forcing off\n", __func__);
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;

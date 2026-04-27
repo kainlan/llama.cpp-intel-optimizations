@@ -8632,10 +8632,24 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             inventory.swa_layer_mask       = hparams.swa_layers.data();
             inventory.swa_layer_mask_count = hparams.n_layer;
 
-            // Set inventory for each SYCL backend device BEFORE allocation
+            // Snapshot the placement envelope (the four llama_model_params capacity
+            // inputs) so the SYCL planner has authoritative source attribution for
+            // n_ctx/n_ubatch/n_seq_max/flash_attn_type, distinct from the derived
+            // KV-sizing snapshot the inventory carries.
+            ggml_sycl_placement_envelope envelope = {};
+            envelope.n_ctx                        = params.n_ctx;
+            envelope.n_ubatch                     = params.n_ubatch;
+            envelope.n_seq_max                    = params.n_seq_max;
+            envelope.flash_attn_type              = (int32_t) params.flash_attn_type;
+
+            // Set envelope BEFORE inventory: set_tensor_inventory triggers
+            // compute_placement_plan, which reads the envelope.  Inverted order
+            // would have the planner see g_placement_envelope_set=false and
+            // skip the source-attributed envelope log line.
             for (int i = 0; i < ggml_backend_sycl_get_device_count(); i++) {
                 ggml_backend_t sycl_backend = ggml_backend_sycl_init(i);
                 if (sycl_backend) {
+                    ggml_backend_sycl_set_placement_envelope(sycl_backend, &envelope);
                     ggml_backend_sycl_set_tensor_inventory(sycl_backend, &inventory);
                     ggml_backend_free(sycl_backend);
                 }

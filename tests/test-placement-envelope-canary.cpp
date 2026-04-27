@@ -212,6 +212,7 @@ int main(int argc, char ** argv) {
     mparams.n_gpu_layers       = opt.ngl;
     mparams.n_ctx              = opt.envelope_ctx;
     mparams.n_ubatch           = opt.ubatch;
+    mparams.n_seq_max          = opt.seq_max;
 
     std::printf("placement envelope canary: model=%s envelope_ctx=%u ubatch=%u seq_max=%u ngl=%d\n", opt.model.c_str(),
                 opt.envelope_ctx, opt.ubatch, opt.seq_max, opt.ngl);

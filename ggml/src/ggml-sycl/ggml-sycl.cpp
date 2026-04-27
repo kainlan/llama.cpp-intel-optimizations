@@ -6176,6 +6176,17 @@ static int                                         g_moe_n_experts_total        
 static int                                         g_moe_n_experts_used                         = 0;
 static uint32_t                                    g_model_n_layer                              = 0;
 static ggml_sycl::placement_kv_info                g_placement_kv_info{};
+// Authoritative placement-envelope source: snapshot of llama_model_params
+// capacity inputs at model load (n_ctx / n_ubatch / n_seq_max / flash_attn_type),
+// populated through ggml_backend_sycl_set_placement_envelope().  Keep this
+// distinct from g_placement_kv_info, which is the derived per-layer KV
+// sizing snapshot — a future maintainer chasing "where did this n_ctx come
+// from" reads g_placement_envelope, not g_placement_kv_info.
+// g_placement_envelope_set distinguishes "explicitly populated" from
+// "all-zero default" so the planner only annotates the source when it has
+// real envelope data to attribute.
+static ggml_sycl_placement_envelope                g_placement_envelope{};
+static bool                                        g_placement_envelope_set = false;
 std::atomic<bool>                                  g_tiered_enabled{ false };
 
 // P4: Priority-based static placement plan (computed in set_tensor_inventory,
@@ -6487,9 +6498,11 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
                 budgets.push_back({ d, dev_budget, dev_total });
             }
             const auto gpu_mode = ggml_sycl::get_multi_gpu_mode(is_moe);
-            g_placement_plan =
-                ggml_sycl::compute_multi_device_plan(budgets, g_tensor_inventory, static_cast<int>(g_model_n_layer),
-                                                     gpu_mode, g_placement_kv_info, g_moe_n_experts_total);
+            const ggml_sycl_placement_envelope * envelope_arg =
+                g_placement_envelope_set ? &g_placement_envelope : nullptr;
+            g_placement_plan = ggml_sycl::compute_multi_device_plan(
+                budgets, g_tensor_inventory, static_cast<int>(g_model_n_layer), gpu_mode, g_placement_kv_info,
+                envelope_arg, g_moe_n_experts_total);
             g_has_placement_plan = true;
             GGML_LOG_INFO(
                 "[SYCL] Multi-device placement plan computed: %zu entries, "
@@ -6518,8 +6531,10 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
                         zone_overhead / (1024.0 * 1024.0));
                 }
             }
-            g_placement_plan     = ggml_sycl::compute_placement_plan(g_tensor_inventory, plan_budget, ctx->device,
-                                                                     g_placement_kv_info, g_moe_n_experts_total);
+            const ggml_sycl_placement_envelope * envelope_arg =
+                g_placement_envelope_set ? &g_placement_envelope : nullptr;
+            g_placement_plan = ggml_sycl::compute_placement_plan(
+                g_tensor_inventory, plan_budget, ctx->device, g_placement_kv_info, envelope_arg, g_moe_n_experts_total);
             g_has_placement_plan = true;
             GGML_LOG_INFO(
                 "[SYCL] Placement plan computed: %zu entries, "
@@ -6557,6 +6572,25 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
         g_tensor_inventory.size(), g_tensor_inventory_total_size / (1024.0 * 1024.0 * 1024.0),
         free_mem / (1024.0 * 1024.0 * 1024.0),
         g_tiered_enabled.load(std::memory_order_relaxed) ? "enabled" : "disabled");
+}
+
+void ggml_backend_sycl_set_placement_envelope(ggml_backend_t backend, const ggml_sycl_placement_envelope * envelope) {
+    if (!backend) {
+        return;
+    }
+    ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *) backend->context;
+    if (!ctx) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    if (envelope == nullptr) {
+        g_placement_envelope     = ggml_sycl_placement_envelope{};
+        g_placement_envelope_set = false;
+        return;
+    }
+    g_placement_envelope     = *envelope;
+    g_placement_envelope_set = true;
 }
 
 void ggml_backend_sycl_set_runtime_n_ctx(ggml_backend_t backend, uint32_t n_ctx) {
