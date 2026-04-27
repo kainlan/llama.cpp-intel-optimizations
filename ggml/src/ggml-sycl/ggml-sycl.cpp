@@ -15237,22 +15237,39 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
             }
         }
 
-        // Host allocation path (cold layers, or device alloc failed completely).
-        auto result = ggml_sycl::unified_cache_allocate(device, layer_size,
-                                                        ggml_sycl::unified_cache::alloc_lifetime::PERSISTENT, tag);
-        if (result.ptr) {
-            layer_allocs[l].ptr       = result.ptr;
+        // Host allocation path: planner-says-host layers, or layout-says-host
+        // (cold tier).  Use unified_alloc with must_host_pinned=true so the
+        // allocator deterministically routes through the HOST arena's KV zone
+        // (alloc_role::KV → host_zone_id::KV in select_zone() at
+        // unified-cache.cpp:5719).  The bare unified_cache_allocate shorthand
+        // tries DEVICE FIRST and only falls back to host on budget exhaustion,
+        // which silently put planner-says-host layers on device whenever VRAM
+        // had headroom (cxc59 root cause).
+        ggml_sycl::alloc_request kv_host_req{};
+        kv_host_req.device                              = device;
+        kv_host_req.size                                = layer_size;
+        kv_host_req.intent.role                         = ggml_sycl::alloc_role::KV;
+        kv_host_req.intent.category                     = ggml_sycl::runtime_category::KV_CACHE;
+        kv_host_req.intent.constraints.must_host_pinned = true;
+        kv_host_req.intent.constraints.use_pinned_pool  = true;
+        ggml_sycl::alloc_handle kv_host_h{};
+        if (ggml_sycl::unified_alloc(kv_host_req, &kv_host_h) && kv_host_h.ptr) {
+            layer_allocs[l].ptr       = kv_host_h.ptr;
             layer_allocs[l].size      = layer_size;
-            layer_allocs[l].on_device = result.on_device;
-            if (result.on_device) {
-                total_device += layer_size;
-                n_device_layers++;
-            } else {
-                total_host += layer_size;
-                n_host_layers++;
-            }
+            layer_allocs[l].on_device = false;
+            layer_allocs[l].zone_h    = kv_host_h;
+            total_host += layer_size;
+            n_host_layers++;
         } else {
-            GGML_LOG_ERROR("[KV-TIER] Device %d: failed to allocate layer %u (%zu bytes)\n", device, l, layer_size);
+            // Hard-fail: must_host_pinned for planner-says-host KV layer must
+            // succeed (no silent fallback to device, per the architectural
+            // directive that the unified cache must honor the placement plan).
+            // If this fires, the host arena KV zone is exhausted — see bead
+            // llama.cpp-vlc46 (chunked-fragmentation + TLSF early-check overcount).
+            GGML_LOG_ERROR(
+                "[KV-TIER] Device %d: failed to allocate KV layer %u (%zu bytes) via host arena KV zone — "
+                "zone capacity exhausted (see bead llama.cpp-vlc46)\n",
+                device, l, layer_size);
             // Clean up already-allocated layers (skip arena-sourced ones).
             for (uint32_t j = 0; j < l; j++) {
                 if (layer_allocs[j].ptr && !layer_allocs[j].zone_h.ptr) {
