@@ -1,6 +1,7 @@
 #include "llama-tensor-fitter.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 
@@ -8,15 +9,23 @@ namespace {
 
 // Format a byte count as MB to one decimal place into a fixed-size buffer.
 // Avoids std::format / iostream overhead in the err_msg path.
+// SIZE_MAX is the unbounded-tier sentinel (caller passes it for an mmap
+// spill tier); rendering it as a 17-digit MB count is technically correct
+// but useless to a human chasing a diagnostic — emit "unbounded" instead.
 std::string format_mb(size_t bytes) {
+    if (bytes == SIZE_MAX) {
+        return "unbounded";
+    }
     char buf[32];
     std::snprintf(buf, sizeof(buf), "%.1f MB", static_cast<double>(bytes) / (1024.0 * 1024.0));
     return buf;
 }
 
-// The non-P0 sort key. Within priority class, earlier layers go first
-// (MoE-Infinity hot-half convention), larger tensors first as a
-// fragmentation-reducing tie-breaker, then name ASC for determinism.
+// Total-order comparator for non-P0 tensors (P0 is pre-placed at the call
+// site; this orders the remaining P1/P2/P3 deterministically). Within a
+// priority class, earlier layers go first (MoE-Infinity hot-half
+// convention), larger tensors first as a fragmentation-reducing
+// tie-breaker, then name ASC for stable determinism on ties.
 bool sort_non_p0(const llama_tensor_placement_input & a, const llama_tensor_placement_input & b) {
     if (a.priority != b.priority) {
         return static_cast<int>(a.priority) < static_cast<int>(b.priority);

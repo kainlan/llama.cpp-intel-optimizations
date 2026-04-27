@@ -218,4 +218,4 @@ blk.23.ffn_gate_inp.weight|FFN_GATE_INP|23|P0|1048576|device
 blk.23.ffn_gate_exps.weight|FFN_MOE_GATE_EXPS|23|P2|134217728|host
 blk.23.ffn_up_exps.weight|FFN_MOE_UP_EXPS|23|P2|134217728|host
 blk.23.ffn_down_exps.weight|FFN_MOE_DOWN_EXPS|23|P2|134217728|host
-# per-tier: device(used=5688524800,residual=41418752,n=176) host(used=5771362304,residual=18446744067938189311,n=43)
+# per-tier: device(used=5688524800,residual=41418752,n=176) host(used=5771362304,residual=unbounded,n=43)

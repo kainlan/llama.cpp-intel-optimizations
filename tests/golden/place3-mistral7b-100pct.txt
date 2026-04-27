@@ -290,4 +290,4 @@ blk.31.ffn_gate.weight|FFN_DENSE_GATE|31|P0|33554432|device
 blk.31.ffn_down.weight|FFN_DENSE_DOWN|31|P0|33554432|device
 blk.31.ffn_up.weight|FFN_DENSE_UP|31|P0|33554432|device
 blk.31.ffn_norm.weight|FFN_NORM|31|P0|1048576|device
-# per-tier: device(used=5571084288,residual=0,n=291) host(used=0,residual=18446744073709551615,n=0)
+# per-tier: device(used=5571084288,residual=0,n=291) host(used=0,residual=unbounded,n=0)

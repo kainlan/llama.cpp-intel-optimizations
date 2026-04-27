@@ -13,10 +13,12 @@
 #include "../src/llama-tensor-class.h"
 #include "../src/llama-tensor-fitter.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -339,32 +341,70 @@ void test_half_experts(fail_log & log) {
     check(log, n_dev_p1 == 8 && n_host_p1 == 0 && n_host_p2 == 8, "half-experts: hot on device, cold on host");
 }
 
-// Determinism: shuffling inputs produces the same placements (by name).
+// Determinism: shuffling a 50-tensor input across many seeded permutations
+// must produce byte-identical placement decisions.  The earlier 3-element
+// rotation was a smoke check; this guards against tie-breaking chains that
+// extend past 4 elements, std::sort stability assumptions that fail on
+// larger fixtures, and any non-deterministic iteration order leaking into
+// the algorithm.
 void test_determinism(fail_log & log) {
-    std::vector<llama_tensor_placement_input> inputs_a = {
-        { "a", LLAMA_TENSOR_CLASS_ATTN_Q,            0, LLAMA_TENSOR_PRIORITY_P0, 10  },
-        { "b", LLAMA_TENSOR_CLASS_FFN_MOE_DOWN_EXPS, 0, LLAMA_TENSOR_PRIORITY_P1, 100 },
-        { "c", LLAMA_TENSOR_CLASS_FFN_MOE_DOWN_EXPS, 1, LLAMA_TENSOR_PRIORITY_P1, 100 },
+    // Build a baseline: 50 tensors mixing P0 / P1 / P2, varied layers + bytes.
+    std::vector<llama_tensor_placement_input> baseline;
+    for (int i = 0; i < 10; ++i) {
+        baseline.push_back({ "p0_" + std::to_string(i), LLAMA_TENSOR_CLASS_ATTN_Q, i, LLAMA_TENSOR_PRIORITY_P0,
+                             100 + static_cast<size_t>(i) });
+    }
+    for (int i = 0; i < 20; ++i) {
+        // P1 with deliberate bytes-tie pairs at adjacent layers, exercising
+        // the (priority, layer, bytes DESC, name) tie-breaker chain.
+        baseline.push_back({ "p1_" + std::to_string(i), LLAMA_TENSOR_CLASS_FFN_MOE_DOWN_EXPS, i / 2,
+                             LLAMA_TENSOR_PRIORITY_P1, 200 + static_cast<size_t>(i % 3) });
+    }
+    for (int i = 0; i < 20; ++i) {
+        baseline.push_back({ "p2_" + std::to_string(i), LLAMA_TENSOR_CLASS_FFN_MOE_DOWN_EXPS, 10 + i / 2,
+                             LLAMA_TENSOR_PRIORITY_P2, 200 + static_cast<size_t>(i % 3) });
+    }
+
+    const std::vector<llama_placement_tier> tiers = {
+        { "device", 5000                    },
+        { "host",   static_cast<size_t>(-1) }
     };
-    std::vector<llama_tensor_placement_input> inputs_b = { inputs_a[2], inputs_a[0], inputs_a[1] };
-    auto                                      out_a    = llama_tensor_fit(inputs_a, {
-                                                { "d", 110  },
-                                                { "h", 1000 }
-    });
-    auto                                      out_b    = llama_tensor_fit(inputs_b, {
-                                                { "d", 110  },
-                                                { "h", 1000 }
-    });
-    check(log, out_a.has_value() && out_b.has_value(), "determinism: both succeed");
-    if (!out_a.has_value() || !out_b.has_value()) {
+
+    auto baseline_out = llama_tensor_fit(baseline, tiers);
+    check(log, baseline_out.has_value(), "determinism: baseline succeeds");
+    if (!baseline_out.has_value()) {
         return;
     }
-    bool same = (out_a->placements.size() == out_b->placements.size());
-    for (size_t i = 0; same && i < out_a->placements.size(); ++i) {
-        same = (out_a->placements[i].name == out_b->placements[i].name) &&
-               (out_a->placements[i].tier_name == out_b->placements[i].tier_name);
+    // Build a stable comparison key: (name -> tier_name) — the only
+    // observable assignment that should be permutation-invariant.
+    auto build_key = [](const llama_tensor_placement_summary & s) {
+        std::vector<std::pair<std::string, std::string>> kv;
+        kv.reserve(s.placements.size());
+        for (const auto & p : s.placements) {
+            kv.emplace_back(p.name, p.tier_name);
+        }
+        std::sort(kv.begin(), kv.end());
+        return kv;
+    };
+    const auto baseline_key = build_key(*baseline_out);
+
+    // 10 fixed-seed shuffles — each must yield the same (name, tier) mapping.
+    std::mt19937 rng(42);
+    bool         all_match = true;
+    for (int i = 0; i < 10; ++i) {
+        std::vector<llama_tensor_placement_input> shuffled = baseline;
+        std::shuffle(shuffled.begin(), shuffled.end(), rng);
+        auto out = llama_tensor_fit(shuffled, tiers);
+        if (!out.has_value()) {
+            all_match = false;
+            break;
+        }
+        if (build_key(*out) != baseline_key) {
+            all_match = false;
+            break;
+        }
     }
-    check(log, same, "determinism: same placement order regardless of input order");
+    check(log, all_match, "determinism: 10 shuffles of 50 tensors all match baseline (name -> tier mapping)");
 }
 
 // --- Golden harness --------------------------------------------------------
@@ -407,11 +447,18 @@ std::string render_golden(const char * label, const std::vector<std::string> & n
         oss << in.name << '|' << llama_tensor_class_name(in.cls) << '|' << in.layer_idx << '|'
             << llama_tensor_priority_name(in.priority) << '|' << in.bytes << '|' << assigned[i] << '\n';
     }
-    // Per-tier summary footer for at-a-glance visibility.
+    // Per-tier summary footer for at-a-glance visibility.  An unbounded
+    // mmap-spill tier (caller passed SIZE_MAX as budget) renders its
+    // residual as "unbounded" rather than the raw 17-digit byte count
+    // the math produces; the human reading the golden cares about the
+    // semantic, not the integer.
+    auto fmt_residual = [](size_t budget, size_t residual) {
+        return budget == static_cast<size_t>(-1) ? std::string("unbounded") : std::to_string(residual);
+    };
     oss << "# per-tier:";
     for (const auto & ts : out->per_tier) {
-        oss << " " << ts.tier_name << "(used=" << ts.used_bytes << ",residual=" << ts.residual_bytes
-            << ",n=" << ts.n_tensors << ")";
+        oss << " " << ts.tier_name << "(used=" << ts.used_bytes
+            << ",residual=" << fmt_residual(ts.budget_bytes, ts.residual_bytes) << ",n=" << ts.n_tensors << ")";
     }
     oss << '\n';
     return oss.str();
