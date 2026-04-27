@@ -256,16 +256,6 @@ def find_function(repo: Path, relpath: str, line_no: int):
     return ("(none)", "")
 
 
-def _strip_inline_comment(body: str) -> str:
-    """Return the code portion of `body` with any `// ...` trailing comment
-    removed.  Naive (does not handle `//` inside string literals), but
-    sufficient for the SYCL backend code which doesn't use `//` in strings."""
-    idx = body.find("//")
-    if idx < 0:
-        return body
-    return body[:idx]
-
-
 _DATA_TOKEN_RE = re.compile(r"->data\b|data_device\[")
 
 
