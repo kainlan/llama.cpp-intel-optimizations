@@ -65,6 +65,7 @@ ALLOWLIST_FUNCTIONS = {
     "ggml_backend_sycl_buffer_init_tensor",
     "ggml_backend_sycl_buffer_clear",
     "ggml_backend_sycl_buffer_cpy_tensor",
+    "ggml_backend_sycl_buffer_memset_tensor",      # buffer-type memset_tensor callback
     "ggml_backend_sycl_buffer_set_base",
     "ggml_backend_sycl_buffer_get_base",
     "ggml_backend_sycl_buffer_reset",
@@ -83,11 +84,47 @@ ALLOWLIST_FUNCTIONS = {
     "graph_prestage_leaf_tensors",
     "graph_refresh_input_tensors",
     "ggml_backend_sycl_pp_set_chunked_prefill",
+    # Public copy/transfer boundary APIs (operate on raw host/device pointers
+    # by spec; the boundary is the API itself, not the resolver).
+    "ggml_backend_sycl_copy_device_to_tensor",     # public sync copy boundary
+    "ggml_backend_sycl_copy_tensor_to_buffer",     # public sync copy boundary
+    "ggml_backend_sycl_memcpy_d2h",                # public D2H sync API
+    "ggml_backend_sycl_set_tensor_async",          # public async set_tensor API (raw stream memcpy on tensor->data)
+    "ggml_backend_sycl_get_tensor_async",          # public async get_tensor API (raw stream memcpy on tensor->data)
+    "ggml_backend_sycl_cpy_tensor_async",          # public async copy API (D2D between two tensors)
+    "ggml_sycl_cpy_tensor_2d",                     # per-buffer-type dispatcher (host branch raw-ok)
+    # Layout-info initializer (one-time per-tensor boundary).
+    "ggml_sycl_init_layout_info",                  # extra->layout init helper; sets data_ptr from tensor->data
+    "convert_tensor_layout",                       # layout conversion primitive (raw AOS source by spec)
+    # Tiered KV buffer callbacks.
+    "tiered_kv_buffer_set_tensor",                 # tiered_kv buffer set_tensor callback
+    "tiered_kv_buffer_get_tensor",                 # tiered_kv buffer get_tensor callback
+    "tiered_kv_buffer_memset_tensor",              # tiered_kv buffer memset_tensor callback
+    # Sampling / verification boundary — operates on raw logits pointer by spec.
+    # Functions perform explicit wait()/sync semantics before raw read.
+    "ggml_backend_sycl_sample_token_idx",          # sampler reads logits_tensor->data directly
+    "ggml_backend_sycl_sample_token_full",         # same
+    "ggml_backend_sycl_sample_token_async",        # same
+    "ggml_backend_sycl_sample_token_to_device",    # same
+    "ggml_backend_sycl_sample_token_to_device_full",  # same
+    "ggml_backend_sycl_verify_speculative",        # speculative verify, same family ("use tensor->data directly")
+    "ggml_backend_sycl_verify_speculative_with_tokens",  # same family, explicit wait() on three queues
+    # Top-level graph dispatch.  Reads raw `bias_tensor->data` for one-time
+    # call_once capture into `g_moe_expert_biases` host buffers.  The captured
+    # pointer is consumed by `ggml_sycl_get_alloc_type` to discriminate
+    # host/device sources — pre-resolving destroys that classification.
+    "ggml_backend_sycl_graph_compute_impl",
+    # Hot mul_mat dispatcher; multiple branches read raw ptrs by buffer-type
+    # contract.  The `!dst_on_device` host-destination branch in particular
+    # is a STRICT correctness ALLOWLIST — the resolver would return a device
+    # pointer where the consumer needs a host pointer for D2H staging memcpy.
+    "ggml_sycl_op_mul_mat",
     # Debug printers / dump helpers
     "ggml_sycl_log_tensor_alloc",
     "ggml_sycl_dump_tensor",
     "ggml_sycl_debug_dump_tensor_meta",
     "debug_check_tensor_ptr",
+    "dump_non_fa_attention_tensor",                # debug dump utility (D2H for stderr print)
     # Tensor-extra accessors / weight-identity registration
     "ggml_sycl_register_host_weight_tensor",
     "ggml_sycl_register_weight_identity",
@@ -99,20 +136,50 @@ ALLOWLIST_FUNCTIONS = {
     "ggml_sycl_preload_model_weights",
     "ggml_sycl_preload_moe_experts",
     "ggml_sycl_get_weight_layout_ptr",
+    # MoE init/scan boundaries — null-checks and ptr-classification BEFORE
+    # the resolver runs.  These are pre-resolver scans; any ptr they store
+    # for later use is classified MIGRATE_LEASE separately.
+    "moe_compute_gate_norm_placement",             # graph-scan, null-guards only (raw ptr stored elsewhere → LEASE)
+    "moe_hybrid_init_once",                        # one-time gate/up pair init, classifier pre-resolver
+    # Reorder primitives — operate on raw ggml storage to produce SOA layout.
+    "reorder_data_internal_",                      # internal-only reorder (raw src0->data is the input by spec)
+    "reorder_tensor_to_soa",                       # public reorder API; sets layout.data_ptr boundary
     # Cleanup / free / lifecycle boundary
     "release_extra_gpu",
     "ggml_sycl_free_host_tracked_t",
     "ggml_backend_sycl_free",
 }
 
+# Names of debug/log macro-or-function calls.  When the reference line is
+# inside a multi-line invocation of one of these (open paren on a recent
+# prior line, not yet closed), the reference is ALLOWLIST_DEBUG even if
+# its own line doesn't contain the call name itself.
+DEBUG_CALL_NAMES = (
+    "fprintf",
+    "printf",
+    "GGML_LOG_DEBUG",
+    "GGML_LOG_INFO",
+    "GGML_LOG_WARN",
+    "GGML_LOG_ERROR",
+    "GGML_SYCL_DEBUG",
+    "n04bq_probe_log",
+)
 DEBUG_PATTERNS = re.compile(
-    r"GGML_LOG_(DEBUG|INFO|WARN|ERROR)|GGML_SYCL_DEBUG|fprintf\s*\(\s*stderr|printf\s*\(|stderr,",
+    r"GGML_LOG_(DEBUG|INFO|WARN|ERROR)|GGML_SYCL_DEBUG|fprintf\s*\(\s*stderr|printf\s*\(|stderr,|n04bq_probe_log\s*\(",
 )
 COMMENT_RE = re.compile(r"^\s*//")
 FUNC_DEF_RE = re.compile(
-    r"^[\w:&\*\s<>,]+?\s+([\w:]+)\s*\([^;{}]*\)\s*(?:->\s*\w+\s*)?\s*\{?\s*$"
+    r"^[\w:&\*\s<>,]+?\s+([\w:]+)\s*\([^;{}]*\)"
+    r"\s*(?:->\s*[\w:&\*\s<>,]+?\s*|const\s*|noexcept\s*|try\s*)*\{?\s*$"
 )
 MEMBER_DEF_RE = re.compile(r"\b([\w:]+)\s*::\s*([\w]+)\s*\([^;{}]*\)\s*\{?\s*$")
+# Multi-line function signatures end the first line with an unclosed `(` and
+# a parameter that lacks a closing `)` — match the function name on lines
+# whose only content after the return-type prefix is `name(`.
+FUNC_DEF_OPEN_RE = re.compile(
+    r"^(?:static\s+|inline\s+|extern\s+|template\s*<[^>]*>\s*)*"
+    r"[\w:&\*\s<>,]+?\s+([\w:]+)\s*\([^;{}]*$"
+)
 
 
 def repo_root() -> Path:
@@ -149,32 +216,169 @@ def collect_refs(repo: Path):
     return refs
 
 
-def find_function(repo: Path, relpath: str, line_no: int):
+_FILE_CACHE: dict = {}
+
+
+def _load_lines(repo: Path, relpath: str):
+    cached = _FILE_CACHE.get(relpath)
+    if cached is not None:
+        return cached
     try:
         lines = (repo / relpath).read_text(errors="replace").splitlines()
     except Exception:
+        lines = None
+    _FILE_CACHE[relpath] = lines
+    return lines
+
+
+def find_function(repo: Path, relpath: str, line_no: int):
+    lines = _load_lines(repo, relpath)
+    if lines is None:
         return ("(unknown)", "")
     if line_no > len(lines):
         return ("(out-of-range)", "")
     for i in range(line_no - 1, max(line_no - 800, -1), -1):
         ln = lines[i]
-        # Skip indented lines that aren't class-member or static defs.
-        if ln.startswith((" ", "\t")) and not ln.lstrip().startswith(("ggml_", "static")):
-            continue
-        m = FUNC_DEF_RE.match(ln)
-        if m:
-            return (m.group(1), ln.strip())
+        # Function definitions live at column 0 — any leading whitespace
+        # means we're looking at a body statement (call, expression).
+        if ln and not ln[0].isspace():
+            m = FUNC_DEF_RE.match(ln)
+            if m:
+                return (m.group(1), ln.strip())
+            m3 = FUNC_DEF_OPEN_RE.match(ln)
+            if m3:
+                return (m3.group(1), ln.strip())
+        # Class member definitions are typically also at column 0, but
+        # search-style match handles a few historical cases.
         m2 = MEMBER_DEF_RE.search(ln)
-        if m2:
+        if m2 and not ln[0:1].isspace():
             return (m2.group(2), ln.strip())
     return ("(none)", "")
+
+
+def _strip_inline_comment(body: str) -> str:
+    """Return the code portion of `body` with any `// ...` trailing comment
+    removed.  Naive (does not handle `//` inside string literals), but
+    sufficient for the SYCL backend code which doesn't use `//` in strings."""
+    idx = body.find("//")
+    if idx < 0:
+        return body
+    return body[:idx]
+
+
+_DATA_TOKEN_RE = re.compile(r"->data\b|data_device\[")
+
+
+def _is_match_in_inline_comment(body: str) -> bool:
+    """The `git grep` patterns can hit a code line that contains `// ... ->data ...`
+    as a trailing comment after real code.  If every match is past `//`, the
+    line is comment-only for our purposes."""
+    idx = body.find("//")
+    if idx < 0:
+        return False
+    return all(m.start() >= idx for m in _DATA_TOKEN_RE.finditer(body))
+
+
+def _inside_open_debug_call(repo: Path, relpath: str, line_no: int, lookback: int = 12) -> bool:
+    """Check whether `line_no` is a continuation of a multi-line debug call
+    (fprintf/printf/GGML_LOG_*/GGML_SYCL_DEBUG/n04bq_probe_log) whose open
+    paren is on a recent prior line and not yet closed by `line_no - 1`."""
+    lines = _load_lines(repo, relpath)
+    if lines is None:
+        return False
+    start = max(0, line_no - 1 - lookback)
+    # Walk every prior line within the lookback window and re-balance parens
+    # cumulatively.  When a line opens a debug call (`fprintf(stderr,...`,
+    # `n04bq_probe_log(...`, ...) and the paren depth stays positive through
+    # the line just before the reference line, the reference is a
+    # continuation argument of that call.
+    depth = 0
+    debug_call_active = False
+    for i in range(start, line_no - 1):
+        ln = lines[i]
+        # Detect a debug-call name appearing while not already inside a debug call.
+        if not debug_call_active:
+            for name in DEBUG_CALL_NAMES:
+                if ln.find(name + "(") >= 0:
+                    debug_call_active = True
+                    break
+        for ch in ln:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth <= 0:
+                    depth = 0
+                    debug_call_active = False
+    return debug_call_active and depth > 0
+
+
+_DEBUG_TOKEN_RE = re.compile(
+    r"\b(?:[A-Za-z_][A-Za-z_0-9]*_debug|debug_[A-Za-z_0-9]*"
+    r"|GGML_SYCL_DEBUG|n04bq_probe_(?:log_)?enabled)\b",
+    re.IGNORECASE,
+)
+_IF_LINE_RE = re.compile(r"\bif\s*\(")
+
+
+def _line_is_debug_guard(ln: str) -> bool:
+    """An `if` line is a debug-only guard if its condition references a
+    `_debug` flag, `debug_*` token, GGML_SYCL_DEBUG macro, or
+    `n04bq_probe_enabled` / `n04bq_probe_log_enabled` predicate.  Tolerates
+    embedded parens (e.g., `strstr(src0->name, "blk.16.")` inside the
+    condition) by matching the token anywhere on the same line as the `if`."""
+    if not _IF_LINE_RE.search(ln):
+        return False
+    return bool(_DEBUG_TOKEN_RE.search(ln))
+
+
+def _is_inside_debug_guard(repo: Path, relpath: str, line_no: int, lookback: int = 25) -> bool:
+    """A `tensor->data` read inside a brace block whose opening `if`
+    condition references a `_debug` flag (e.g., `g_ggml_sycl_tp_debug`,
+    `n04bq_probe_log_enabled()`) is itself debug instrumentation.  Walk
+    backwards looking for the nearest enclosing `if (...debug...)` whose
+    `{` opens a brace block that hasn't yet closed by `line_no - 1`.
+    Brace-balance from the candidate `if` line forward to confirm the
+    reference line is still inside the guarded block."""
+    lines = _load_lines(repo, relpath)
+    if lines is None:
+        return False
+    start = max(0, line_no - 1 - lookback)
+    for i in range(line_no - 2, start - 1, -1):
+        ln = lines[i]
+        if not _line_is_debug_guard(ln):
+            continue
+        # Found a candidate `if (..._debug...)`.  Brace-balance from this
+        # line forward to confirm `line_no - 1` is still inside its block.
+        depth = 0
+        opened = False
+        for j in range(i, line_no):
+            for ch in lines[j]:
+                if ch == "{":
+                    depth += 1
+                    opened = True
+                elif ch == "}":
+                    depth -= 1
+            if opened and depth <= 0 and j < line_no - 1:
+                # Block closed before reference line; this candidate doesn't apply.
+                opened = False
+                break
+        if opened and depth > 0:
+            return True
+    return False
 
 
 def classify(repo: Path, relpath: str, line_no: int, body: str):
     body = body.rstrip("\n")
     if COMMENT_RE.match(body):
         return ("ALLOWLIST_COMMENT", "")
+    if _is_match_in_inline_comment(body):
+        return ("ALLOWLIST_COMMENT", "")
     if DEBUG_PATTERNS.search(body):
+        return ("ALLOWLIST_DEBUG", "")
+    if _inside_open_debug_call(repo, relpath, line_no):
+        return ("ALLOWLIST_DEBUG", "")
+    if _is_inside_debug_guard(repo, relpath, line_no):
         return ("ALLOWLIST_DEBUG", "")
     func, _ = find_function(repo, relpath, line_no)
     if func in ALLOWLIST_FUNCTIONS:
