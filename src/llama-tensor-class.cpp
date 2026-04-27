@@ -241,3 +241,92 @@ const char * llama_tensor_class_name(llama_tensor_class cls) {
     }
     return "UNKNOWN";
 }
+
+// PLACE-2 priority policy.
+//
+// Tier rationale (input to PLACE-3 greedy budget fitter):
+//   P0 — every-token hot path, must be device-resident. Includes attention
+//        projections (Q/K/V/O/QKV) and norms, MoE router, shared experts
+//        (DeepSeek-style: shared experts run for every token, not gated by
+//        the router), dense FFN (in dense or hybrid layers), output unembed
+//        (full-vocab matmul each token), token + position embeddings, and
+//        all *_NORM tensors. PLACE-3 hard-errors if P0 alone exceeds budget.
+//   P1 — hot-half MoE expert weights (layer index < n_layers / 2). MoE-Infinity
+//        (arXiv 2401.14361) and the HF llama.cpp MoE offload guide both report
+//        skewed expert hit rates concentrated in earlier layers, so the early
+//        half is a higher-value VRAM target than the late half.
+//   P2 — cold-half MoE expert weights (layer index >= n_layers / 2). Compete
+//        for VRAM after P0 + P1 are placed.
+//   P3 — overflow from P1/P2 fitting (assigned by PLACE-3, not by this
+//        function). PLACE-2 never returns P3.
+//
+// MISC -> P0: unknown roles default to "pin to device". A future quant adds
+// a tensor we don't recognize, we'd rather see PLACE-3's hard-error if it
+// blows the budget (a loud, actionable failure) than silently demote it to
+// host and tank perf for what may turn out to be a hot tensor. Loud failure
+// beats silent slowdown for the unknown-tensor case.
+//
+// POSITION_EMBD -> P0: only present on legacy arches without RoPE (GPT-2,
+// some BERT variants); when present it's small and hot — same bucket as norms.
+//
+// L/2 split convention: integer division (floor). For odd n_layers (e.g. 33),
+// boundary = 16, so P1 = [0,16) covers 16 layers and P2 = [16,33) covers 17.
+// The asymmetry is at most one layer; floor is chosen for idiom simplicity,
+// not for any hot-tier coverage argument.
+llama_tensor_priority llama_tensor_priority_for(llama_tensor_class cls, int layer_idx, int n_layers) {
+    switch (cls) {
+        // Every-token hot path. All P0.
+        case LLAMA_TENSOR_CLASS_ATTN_Q:
+        case LLAMA_TENSOR_CLASS_ATTN_K:
+        case LLAMA_TENSOR_CLASS_ATTN_V:
+        case LLAMA_TENSOR_CLASS_ATTN_O:
+        case LLAMA_TENSOR_CLASS_ATTN_QKV:
+        case LLAMA_TENSOR_CLASS_ATTN_NORM:
+        case LLAMA_TENSOR_CLASS_FFN_GATE_INP:
+        case LLAMA_TENSOR_CLASS_FFN_DENSE_GATE:
+        case LLAMA_TENSOR_CLASS_FFN_DENSE_UP:
+        case LLAMA_TENSOR_CLASS_FFN_DENSE_DOWN:
+        case LLAMA_TENSOR_CLASS_FFN_SHARED_GATE:
+        case LLAMA_TENSOR_CLASS_FFN_SHARED_UP:
+        case LLAMA_TENSOR_CLASS_FFN_SHARED_DOWN:
+        case LLAMA_TENSOR_CLASS_FFN_NORM:
+        case LLAMA_TENSOR_CLASS_EMBD_TOKEN:
+        case LLAMA_TENSOR_CLASS_EMBD_OUTPUT:
+        case LLAMA_TENSOR_CLASS_OUTPUT_NORM:
+        case LLAMA_TENSOR_CLASS_POSITION_EMBD:
+        case LLAMA_TENSOR_CLASS_MISC:
+            return LLAMA_TENSOR_PRIORITY_P0;
+
+        // Routed-expert weights: hot half (P1) vs cold half (P2) by layer.
+        case LLAMA_TENSOR_CLASS_FFN_MOE_GATE_EXPS:
+        case LLAMA_TENSOR_CLASS_FFN_MOE_UP_EXPS:
+        case LLAMA_TENSOR_CLASS_FFN_MOE_DOWN_EXPS:
+            // Defensive: a routed-expert tensor without a per-layer index or
+            // without a sane n_layers is a classifier or caller bug. Bucket
+            // as P2 (cold) so it doesn't quietly squat in the hot tier.
+            if (layer_idx < 0 || n_layers <= 0) {
+                return LLAMA_TENSOR_PRIORITY_P2;
+            }
+            return (layer_idx < n_layers / 2) ? LLAMA_TENSOR_PRIORITY_P1 : LLAMA_TENSOR_PRIORITY_P2;
+
+        case LLAMA_TENSOR_CLASS_COUNT:
+            break;
+    }
+    return LLAMA_TENSOR_PRIORITY_P0;
+}
+
+const char * llama_tensor_priority_name(llama_tensor_priority prio) {
+    switch (prio) {
+        case LLAMA_TENSOR_PRIORITY_P0:
+            return "P0";
+        case LLAMA_TENSOR_PRIORITY_P1:
+            return "P1";
+        case LLAMA_TENSOR_PRIORITY_P2:
+            return "P2";
+        case LLAMA_TENSOR_PRIORITY_P3:
+            return "P3";
+        case LLAMA_TENSOR_PRIORITY_COUNT:
+            break;
+    }
+    return "UNKNOWN";
+}

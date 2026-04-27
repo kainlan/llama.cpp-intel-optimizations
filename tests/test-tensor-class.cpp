@@ -1,10 +1,17 @@
-// Unit tests for the tensor-name classifier (PLACE-1, llama.cpp-i7hhs).
+// Unit tests for the tensor-name classifier (PLACE-1) and priority policy
+// (PLACE-2). Golden files live in tests/golden/place2-*.txt; the test
+// program receives their paths via argv[1..] (any order) — set PLACE2_REGEN=1
+// in env to overwrite the golden files from the live output instead of
+// diffing.
 
 #include "../src/llama-tensor-class.h"
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -218,9 +225,135 @@ bool check_layer_indices(const char * arch_name, const std::vector<std::string> 
     return n_failed == 0;
 }
 
+// --- PLACE-2 priority policy: helpers ---------------------------------------
+
+struct prio_case {
+    llama_tensor_class    cls;
+    int                   layer_idx;
+    int                   n_layers;
+    llama_tensor_priority expected;
+};
+
+void check_prio(fail_log & log, const prio_case & c) {
+    const llama_tensor_priority got = llama_tensor_priority_for(c.cls, c.layer_idx, c.n_layers);
+    if (got == c.expected) {
+        return;
+    }
+    fprintf(stderr, "FAIL: prio(%s, layer=%d, n=%d) -> got %s, expected %s\n", llama_tensor_class_name(c.cls),
+            c.layer_idx, c.n_layers, llama_tensor_priority_name(got), llama_tensor_priority_name(c.expected));
+    ++log.n_failures;
+}
+
+// Render the (name | class | layer | tier) golden text for one arch by
+// classifying every name and applying the priority policy. layer_idx is the
+// classifier's output (-1 for non per-layer tensors) — the policy gets
+// layer_idx + n_layers exactly as a real caller would supply them.
+std::string render_golden(const std::vector<std::string> & names, int n_layers) {
+    std::ostringstream oss;
+    oss << "# name|class|layer|tier  (PLACE-2 golden, n_layers=" << n_layers << ")\n";
+    for (const auto & n : names) {
+        const llama_tensor_classification c    = llama_tensor_classify(n.c_str());
+        const llama_tensor_priority       prio = llama_tensor_priority_for(c.cls, c.layer_idx, n_layers);
+        oss << n << '|' << llama_tensor_class_name(c.cls) << '|' << c.layer_idx << '|'
+            << llama_tensor_priority_name(prio) << '\n';
+    }
+    return oss.str();
+}
+
+bool read_file(const std::string & path, std::string & out) {
+    std::ifstream in(path);
+    if (!in.is_open()) {
+        return false;
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    out = ss.str();
+    return true;
+}
+
+bool write_file(const std::string & path, const std::string & content) {
+    std::ofstream out(path);
+    if (!out.is_open()) {
+        return false;
+    }
+    out << content;
+    return out.good();
+}
+
+// Compare actual vs expected line-by-line; on mismatch, print the first few
+// diverging lines with line numbers so the developer can fix the policy
+// or refresh the golden file (PLACE2_REGEN=1).
+bool diff_golden(const char * label, const std::string & path, const std::string & actual) {
+    if (std::getenv("PLACE2_REGEN") != nullptr) {
+        if (!write_file(path, actual)) {
+            fprintf(stderr, "FAIL: %s: could not write golden file '%s'\n", label, path.c_str());
+            return false;
+        }
+        printf("REGEN: %s: wrote %zu bytes to '%s'\n", label, actual.size(), path.c_str());
+        return true;
+    }
+
+    std::string expected;
+    if (!read_file(path, expected)) {
+        fprintf(stderr, "FAIL: %s: could not read golden file '%s' (run with PLACE2_REGEN=1 to bootstrap)\n", label,
+                path.c_str());
+        return false;
+    }
+
+    if (expected == actual) {
+        printf("OK: %s: golden matches '%s'\n", label, path.c_str());
+        return true;
+    }
+
+    fprintf(stderr, "FAIL: %s: golden mismatch vs '%s'\n", label, path.c_str());
+    std::istringstream a_in(actual);
+    std::istringstream e_in(expected);
+    std::string        a_line;
+    std::string        e_line;
+    int                lineno   = 0;
+    int                printed  = 0;
+    const int          max_show = 10;
+    while (printed < max_show) {
+        const bool a_ok = static_cast<bool>(std::getline(a_in, a_line));
+        const bool e_ok = static_cast<bool>(std::getline(e_in, e_line));
+        ++lineno;
+        if (!a_ok && !e_ok) {
+            break;
+        }
+        if (!a_ok) {
+            fprintf(stderr, "  line %d:\n    actual:   <missing>\n    expected: %s\n", lineno, e_line.c_str());
+            ++printed;
+            continue;
+        }
+        if (!e_ok) {
+            fprintf(stderr, "  line %d:\n    actual:   %s\n    expected: <missing>\n", lineno, a_line.c_str());
+            ++printed;
+            continue;
+        }
+        if (a_line != e_line) {
+            fprintf(stderr, "  line %d:\n    actual:   %s\n    expected: %s\n", lineno, a_line.c_str(), e_line.c_str());
+            ++printed;
+        }
+    }
+    fprintf(stderr, "  (rerun with PLACE2_REGEN=1 to overwrite the golden file from current output)\n");
+    return false;
+}
+
+// Pick the argv entry whose basename contains needle. argv has no defined
+// order in the CMake call site; we match by substring so adding more golden
+// files later doesn't require argv reshuffling.
+const char * find_arg(int argc, char ** argv, const char * needle) {
+    for (int i = 1; i < argc; ++i) {
+        if (std::strstr(argv[i], needle) != nullptr) {
+            return argv[i];
+        }
+    }
+    return nullptr;
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char ** argv) {
     fail_log log;
 
     // --- Direct unit cases ---------------------------------------------------
@@ -325,6 +458,69 @@ int main() {
         const auto names = deepseek2_tensor_names(60);
         ok &= check_arch("DeepSeek-V2 (synthetic, 60 layers)", names, /*expected_misc*/ {});
         ok &= check_layer_indices("DeepSeek-V2", names);
+    }
+
+    // --- PLACE-2 priority unit cases ----------------------------------------
+    // Every class should map to its expected tier across two representative
+    // n_layers (24 like GPT-OSS, 32 like Mistral). Routed-expert classes are
+    // additionally exercised at the L/2 boundary and across odd n_layers (33)
+    // to lock the floor convention.
+    const prio_case prio_cases[] = {
+        // P0 classes — tier independent of layer/n_layers.
+        { LLAMA_TENSOR_CLASS_ATTN_Q,            0,  32, LLAMA_TENSOR_PRIORITY_P0 },
+        { LLAMA_TENSOR_CLASS_ATTN_K,            0,  32, LLAMA_TENSOR_PRIORITY_P0 },
+        { LLAMA_TENSOR_CLASS_ATTN_V,            0,  32, LLAMA_TENSOR_PRIORITY_P0 },
+        { LLAMA_TENSOR_CLASS_ATTN_O,            0,  32, LLAMA_TENSOR_PRIORITY_P0 },
+        { LLAMA_TENSOR_CLASS_ATTN_QKV,          0,  32, LLAMA_TENSOR_PRIORITY_P0 },
+        { LLAMA_TENSOR_CLASS_ATTN_NORM,         0,  32, LLAMA_TENSOR_PRIORITY_P0 },
+        { LLAMA_TENSOR_CLASS_FFN_GATE_INP,      0,  32, LLAMA_TENSOR_PRIORITY_P0 },
+        { LLAMA_TENSOR_CLASS_FFN_DENSE_GATE,    0,  32, LLAMA_TENSOR_PRIORITY_P0 },
+        { LLAMA_TENSOR_CLASS_FFN_DENSE_UP,      0,  32, LLAMA_TENSOR_PRIORITY_P0 },
+        { LLAMA_TENSOR_CLASS_FFN_DENSE_DOWN,    0,  32, LLAMA_TENSOR_PRIORITY_P0 },
+        { LLAMA_TENSOR_CLASS_FFN_SHARED_GATE,   0,  32, LLAMA_TENSOR_PRIORITY_P0 },
+        { LLAMA_TENSOR_CLASS_FFN_SHARED_UP,     0,  32, LLAMA_TENSOR_PRIORITY_P0 },
+        { LLAMA_TENSOR_CLASS_FFN_SHARED_DOWN,   0,  32, LLAMA_TENSOR_PRIORITY_P0 },
+        { LLAMA_TENSOR_CLASS_FFN_NORM,          0,  32, LLAMA_TENSOR_PRIORITY_P0 },
+        { LLAMA_TENSOR_CLASS_EMBD_TOKEN,        -1, 0,  LLAMA_TENSOR_PRIORITY_P0 },
+        { LLAMA_TENSOR_CLASS_EMBD_OUTPUT,       -1, 0,  LLAMA_TENSOR_PRIORITY_P0 },
+        { LLAMA_TENSOR_CLASS_OUTPUT_NORM,       -1, 0,  LLAMA_TENSOR_PRIORITY_P0 },
+        { LLAMA_TENSOR_CLASS_POSITION_EMBD,     -1, 0,  LLAMA_TENSOR_PRIORITY_P0 },
+        { LLAMA_TENSOR_CLASS_MISC,              0,  32, LLAMA_TENSOR_PRIORITY_P0 },
+
+        // Routed experts at n_layers=24 (boundary=12).
+        { LLAMA_TENSOR_CLASS_FFN_MOE_GATE_EXPS, 0,  24, LLAMA_TENSOR_PRIORITY_P1 },
+        { LLAMA_TENSOR_CLASS_FFN_MOE_UP_EXPS,   11, 24, LLAMA_TENSOR_PRIORITY_P1 },
+        { LLAMA_TENSOR_CLASS_FFN_MOE_DOWN_EXPS, 12, 24, LLAMA_TENSOR_PRIORITY_P2 }, // boundary -> P2
+        { LLAMA_TENSOR_CLASS_FFN_MOE_GATE_EXPS, 23, 24, LLAMA_TENSOR_PRIORITY_P2 },
+
+        // Routed experts at n_layers=32 (boundary=16).
+        { LLAMA_TENSOR_CLASS_FFN_MOE_GATE_EXPS, 0,  32, LLAMA_TENSOR_PRIORITY_P1 },
+        { LLAMA_TENSOR_CLASS_FFN_MOE_UP_EXPS,   15, 32, LLAMA_TENSOR_PRIORITY_P1 },
+        { LLAMA_TENSOR_CLASS_FFN_MOE_DOWN_EXPS, 16, 32, LLAMA_TENSOR_PRIORITY_P2 }, // boundary -> P2
+        { LLAMA_TENSOR_CLASS_FFN_MOE_GATE_EXPS, 31, 32, LLAMA_TENSOR_PRIORITY_P2 },
+
+        // Odd n_layers=33 (boundary=16): P1 covers 16 layers, P2 covers 17.
+        { LLAMA_TENSOR_CLASS_FFN_MOE_GATE_EXPS, 15, 33, LLAMA_TENSOR_PRIORITY_P1 },
+        { LLAMA_TENSOR_CLASS_FFN_MOE_GATE_EXPS, 16, 33, LLAMA_TENSOR_PRIORITY_P2 },
+
+        // Defensive: routed-expert with bogus inputs should bucket cold (P2).
+        { LLAMA_TENSOR_CLASS_FFN_MOE_GATE_EXPS, -1, 32, LLAMA_TENSOR_PRIORITY_P2 },
+        { LLAMA_TENSOR_CLASS_FFN_MOE_GATE_EXPS, 0,  0,  LLAMA_TENSOR_PRIORITY_P2 },
+    };
+    for (const auto & c : prio_cases) {
+        check_prio(log, c);
+    }
+
+    // --- PLACE-2 golden diff -------------------------------------------------
+    const char * mistral_path = find_arg(argc, argv, "place2-mistral7b");
+    const char * gptoss_path  = find_arg(argc, argv, "place2-gpt-oss-20b");
+    if (mistral_path == nullptr || gptoss_path == nullptr) {
+        fprintf(stderr, "FAIL: golden file paths missing from argv (mistral=%s, gpt-oss=%s)\n",
+                mistral_path ? mistral_path : "<null>", gptoss_path ? gptoss_path : "<null>");
+        ok = false;
+    } else {
+        ok &= diff_golden("Mistral 7B golden", mistral_path, render_golden(mistral7b_tensor_names(32), 32));
+        ok &= diff_golden("GPT-OSS 20B golden", gptoss_path, render_golden(gpt_oss_tensor_names(24), 24));
     }
 
     if (log.n_failures != 0 || !ok) {

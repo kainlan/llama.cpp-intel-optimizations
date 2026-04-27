@@ -194,7 +194,9 @@ llama_build_and_test(test-chat-template.cpp)
 llama_build_and_test(test-json-partial.cpp)
 llama_build_and_test(test-log.cpp)
 llama_build_and_test(test-sycl-model-shapes.cpp)
-llama_build_and_test(test-tensor-class.cpp)
+llama_build_and_test(test-tensor-class.cpp
+    ARGS ${CMAKE_CURRENT_SOURCE_DIR}/golden/place2-mistral7b.txt
+         ${CMAKE_CURRENT_SOURCE_DIR}/golden/place2-gpt-oss-20b.txt)
 set_property(TEST test-tensor-class PROPERTY
     ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:$ENV{LD_LIBRARY_PATH}")
 
