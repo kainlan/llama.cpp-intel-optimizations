@@ -200,16 +200,6 @@ llama_build_and_test(test-tensor-class.cpp
 set_property(TEST test-tensor-class PROPERTY
     ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:$ENV{LD_LIBRARY_PATH}")
 
-llama_build_and_test(test-tensor-fitter.cpp
-    ARGS ${CMAKE_CURRENT_SOURCE_DIR}/golden/place3-mistral7b-100pct.txt
-         ${CMAKE_CURRENT_SOURCE_DIR}/golden/place3-mistral7b-50pct.txt
-         ${CMAKE_CURRENT_SOURCE_DIR}/golden/place3-mistral7b-30pct.txt
-         ${CMAKE_CURRENT_SOURCE_DIR}/golden/place3-gpt-oss-20b-100pct.txt
-         ${CMAKE_CURRENT_SOURCE_DIR}/golden/place3-gpt-oss-20b-50pct.txt
-         ${CMAKE_CURRENT_SOURCE_DIR}/golden/place3-gpt-oss-20b-30pct.txt)
-set_property(TEST test-tensor-fitter PROPERTY
-    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:$ENV{LD_LIBRARY_PATH}")
-
 add_executable(test-placement-envelope-canary test-placement-envelope-canary.cpp)
 target_link_libraries(test-placement-envelope-canary PRIVATE llama)
 install(TARGETS test-placement-envelope-canary RUNTIME)

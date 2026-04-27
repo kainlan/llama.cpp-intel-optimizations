@@ -1,2 +1,0 @@
-# name|class|layer|prio|bytes|tier  (PLACE-3 golden, Mistral 7B 30%, n_layers=32, budget=30% of 5571084288 bytes = 1671325286 bytes)
-# fit_failed: llama_tensor_fit: P0 tensors total 5313.0 MB exceeds tier 'device' budget 1593.9 MB (model is too large for the fastest tier regardless of policy)

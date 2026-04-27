@@ -35,7 +35,6 @@ add_library(llama
             llama-quant.cpp
             llama-sampling.cpp
             llama-tensor-class.cpp
-            llama-tensor-fitter.cpp
             llama-vocab.cpp
             unicode-data.cpp
             unicode.cpp
