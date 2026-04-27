@@ -72,7 +72,8 @@ inline tensor_class classify_tensor(const char * name) {
     }
 
     // Output head (priority 0)
-    if (strstr(name, "lm_head") || strstr(name, "output.weight")) {
+    // Anchor "output." at start of name so we don't capture "blk.N.attn_output.weight".
+    if (strstr(name, "lm_head") || strncmp(name, "output.", 7) == 0) {
         return tensor_class::OUTPUT;
     }
 
@@ -86,6 +87,11 @@ inline tensor_class classify_tensor(const char * name) {
         return tensor_class::ROUTER;
     }
 
+    // Norms (priority 4) — must precede attn_/ffn_ so "attn_norm"/"ffn_norm" don't get caught there.
+    if (strstr(name, "_norm")) {
+        return tensor_class::NORM;
+    }
+
     // Attention (priority 1)
     if (strstr(name, "attn_")) {
         return tensor_class::ATTENTION;
@@ -94,11 +100,6 @@ inline tensor_class classify_tensor(const char * name) {
     // Dense FFN (priority 2)
     if (strstr(name, "ffn_")) {
         return tensor_class::FFN;
-    }
-
-    // Norms (priority 4)
-    if (strstr(name, "_norm")) {
-        return tensor_class::NORM;
     }
 
 #if GGML_SYCL_DEBUG
