@@ -298,15 +298,14 @@ llama_tensor_priority llama_tensor_priority_for(llama_tensor_class cls, int laye
             return LLAMA_TENSOR_PRIORITY_P0;
 
         // Routed-expert weights: hot half (P1) vs cold half (P2) by layer.
+        // Precondition: routed experts are always per-layer (PLACE-1 only emits
+        // FFN_MOE_*_EXPS for blk.<N>.<role>) and a loaded model always has
+        // n_layers > 0. Asserting at the violation site is louder than silent
+        // re-bucketing, matching the MISC -> P0 rationale above.
         case LLAMA_TENSOR_CLASS_FFN_MOE_GATE_EXPS:
         case LLAMA_TENSOR_CLASS_FFN_MOE_UP_EXPS:
         case LLAMA_TENSOR_CLASS_FFN_MOE_DOWN_EXPS:
-            // Defensive: a routed-expert tensor without a per-layer index or
-            // without a sane n_layers is a classifier or caller bug. Bucket
-            // as P2 (cold) so it doesn't quietly squat in the hot tier.
-            if (layer_idx < 0 || n_layers <= 0) {
-                return LLAMA_TENSOR_PRIORITY_P2;
-            }
+            GGML_ASSERT(layer_idx >= 0 && n_layers > 0);
             return (layer_idx < n_layers / 2) ? LLAMA_TENSOR_PRIORITY_P1 : LLAMA_TENSOR_PRIORITY_P2;
 
         case LLAMA_TENSOR_CLASS_COUNT:

@@ -502,10 +502,6 @@ int main(int argc, char ** argv) {
         // Odd n_layers=33 (boundary=16): P1 covers 16 layers, P2 covers 17.
         { LLAMA_TENSOR_CLASS_FFN_MOE_GATE_EXPS, 15, 33, LLAMA_TENSOR_PRIORITY_P1 },
         { LLAMA_TENSOR_CLASS_FFN_MOE_GATE_EXPS, 16, 33, LLAMA_TENSOR_PRIORITY_P2 },
-
-        // Defensive: routed-expert with bogus inputs should bucket cold (P2).
-        { LLAMA_TENSOR_CLASS_FFN_MOE_GATE_EXPS, -1, 32, LLAMA_TENSOR_PRIORITY_P2 },
-        { LLAMA_TENSOR_CLASS_FFN_MOE_GATE_EXPS, 0,  0,  LLAMA_TENSOR_PRIORITY_P2 },
     };
     for (const auto & c : prio_cases) {
         check_prio(log, c);
