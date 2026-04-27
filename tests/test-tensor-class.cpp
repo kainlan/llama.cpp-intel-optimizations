@@ -284,7 +284,10 @@ bool write_file(const std::string & path, const std::string & content) {
 // diverging lines with line numbers so the developer can fix the policy
 // or refresh the golden file (PLACE2_REGEN=1).
 bool diff_golden(const char * label, const std::string & path, const std::string & actual) {
-    if (std::getenv("PLACE2_REGEN") != nullptr) {
+    // Treat PLACE2_REGEN as truthy only when set to a non-empty, non-"0" value
+    // so PLACE2_REGEN=0 disables regen as a user would expect.
+    const char * regen_env = std::getenv("PLACE2_REGEN");
+    if (regen_env != nullptr && regen_env[0] != '\0' && regen_env[0] != '0') {
         if (!write_file(path, actual)) {
             fprintf(stderr, "FAIL: %s: could not write golden file '%s'\n", label, path.c_str());
             return false;

@@ -274,6 +274,11 @@ const char * llama_tensor_class_name(llama_tensor_class cls) {
 // The asymmetry is at most one layer; floor is chosen for idiom simplicity,
 // not for any hot-tier coverage argument.
 llama_tensor_priority llama_tensor_priority_for(llama_tensor_class cls, int layer_idx, int n_layers) {
+    // Forces a compile error if a future contributor extends llama_tensor_class
+    // without explicitly assigning the new value a placement tier here. Bump
+    // both the enum and this assert together.
+    static_assert(LLAMA_TENSOR_CLASS_COUNT == 22,
+                  "Adding a tensor class? Update llama_tensor_priority_for to assign it a tier explicitly.");
     switch (cls) {
         // Every-token hot path. All P0.
         case LLAMA_TENSOR_CLASS_ATTN_Q:
