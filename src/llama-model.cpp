@@ -8640,7 +8640,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             envelope.n_ctx                        = params.n_ctx;
             envelope.n_ubatch                     = params.n_ubatch;
             envelope.n_seq_max                    = params.n_seq_max;
-            envelope.flash_attn_type              = (int32_t) params.flash_attn_type;
+            envelope.flash_attn_type              = static_cast<int32_t>(params.flash_attn_type);
 
             // Set envelope BEFORE inventory: set_tensor_inventory triggers
             // compute_placement_plan, which reads the envelope.  Inverted order

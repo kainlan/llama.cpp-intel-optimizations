@@ -10301,6 +10301,24 @@ static void populate_host_zone_sizing(placement_plan &                          
                                                plan.tp_vram_runtime_bytes + plan.dma_staging_pool_bytes);
 }
 
+// Maps the int32 flash_attn_type encoding on ggml_sycl_placement_envelope
+// (mirror of the llama_flash_attn_type enum, see ggml-sycl.h declaration)
+// to a printable name for the [PLACEMENT] envelope log line.  Single source
+// of truth: any new enum values must extend both this switch and the field
+// comment in ggml-sycl.h in lockstep.
+static const char * placement_envelope_fa_name(int32_t t) {
+    switch (t) {
+        case -1:
+            return "AUTO";
+        case 0:
+            return "DISABLED";
+        case 1:
+            return "ENABLED";
+        default:
+            return "UNKNOWN";
+    }
+}
+
 placement_plan compute_placement_plan(const std::vector<std::pair<std::string, size_t>> & tensor_inventory,
                                       size_t                                              vram_budget,
                                       int                                                 device_id,
@@ -10308,12 +10326,10 @@ placement_plan compute_placement_plan(const std::vector<std::pair<std::string, s
                                       const ggml_sycl_placement_envelope *                envelope,
                                       int                                                 n_experts) {
     if (envelope != nullptr) {
-        const char * fa_name = (envelope->flash_attn_type < 0)  ? "AUTO" :
-                               (envelope->flash_attn_type == 0) ? "DISABLED" :
-                                                                  "ENABLED";
         GGML_LOG_INFO(
             "[PLACEMENT] envelope (from sycl-snapshot): n_ctx=%u n_ubatch=%u n_seq_max=%u flash_attn_type=%s\n",
-            envelope->n_ctx, envelope->n_ubatch, envelope->n_seq_max, fa_name);
+            envelope->n_ctx, envelope->n_ubatch, envelope->n_seq_max,
+            placement_envelope_fa_name(envelope->flash_attn_type));
     }
     placement_plan plan;
     plan.vram_budget               = vram_budget;
