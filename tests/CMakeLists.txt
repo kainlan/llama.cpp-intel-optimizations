@@ -194,6 +194,9 @@ llama_build_and_test(test-chat-template.cpp)
 llama_build_and_test(test-json-partial.cpp)
 llama_build_and_test(test-log.cpp)
 llama_build_and_test(test-sycl-model-shapes.cpp)
+llama_build_and_test(test-tensor-class.cpp)
+set_property(TEST test-tensor-class PROPERTY
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:$ENV{LD_LIBRARY_PATH}")
 
 add_executable(test-placement-envelope-canary test-placement-envelope-canary.cpp)
 target_link_libraries(test-placement-envelope-canary PRIVATE llama)

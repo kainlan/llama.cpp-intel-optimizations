@@ -1,0 +1,239 @@
+#include "llama-tensor-class.h"
+
+#include "ggml.h"
+
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <unordered_map>
+
+// The classifier accepts canonical ggml/llama.cpp tensor names of the form:
+//   <top>                        e.g. "output", "token_embd", "output_norm"
+//   <top>.<suffix>               e.g. "output.weight", "token_embd.weight"
+//   blk.<N>.<role>               e.g. "blk.3.attn_norm"
+//   blk.<N>.<role>.<suffix>      e.g. "blk.3.attn_q.weight", "blk.0.attn_q.bias"
+//
+// The trailing suffix (typically "weight" or "bias") is a layout detail; the
+// role drives the placement class. Bias tensors classify identically to their
+// matching weight tensor.
+
+namespace {
+
+struct role_entry {
+    const char *       role;
+    llama_tensor_class cls;
+};
+
+// Top-level (non per-layer) roles.
+const role_entry k_top_level[] = {
+    { "token_embd",      LLAMA_TENSOR_CLASS_EMBD_TOKEN    },
+    { "token_embd_norm", LLAMA_TENSOR_CLASS_EMBD_TOKEN    },
+    { "output",          LLAMA_TENSOR_CLASS_EMBD_OUTPUT   },
+    { "output_norm",     LLAMA_TENSOR_CLASS_OUTPUT_NORM   },
+    { "position_embd",   LLAMA_TENSOR_CLASS_POSITION_EMBD },
+    { "pos_embd",        LLAMA_TENSOR_CLASS_POSITION_EMBD },
+};
+
+// Per-layer roles (occur after "blk.<N>.").
+const role_entry k_per_layer[] = {
+    // Attention projections.
+    { "attn_q",              LLAMA_TENSOR_CLASS_ATTN_Q            },
+    { "attn_q_a",            LLAMA_TENSOR_CLASS_ATTN_Q            },
+    { "attn_q_b",            LLAMA_TENSOR_CLASS_ATTN_Q            },
+    { "attn_k",              LLAMA_TENSOR_CLASS_ATTN_K            },
+    { "attn_k_b",            LLAMA_TENSOR_CLASS_ATTN_K            },
+    { "attn_v",              LLAMA_TENSOR_CLASS_ATTN_V            },
+    { "attn_v_b",            LLAMA_TENSOR_CLASS_ATTN_V            },
+    { "attn_kv_a_mqa",       LLAMA_TENSOR_CLASS_ATTN_K            },
+    { "attn_kv_b",           LLAMA_TENSOR_CLASS_ATTN_K            },
+    { "attn_output",         LLAMA_TENSOR_CLASS_ATTN_O            },
+    { "attn_gate",           LLAMA_TENSOR_CLASS_ATTN_O            },
+    { "attn_qkv",            LLAMA_TENSOR_CLASS_ATTN_QKV          },
+
+    // Attention norms / sinks (small, hot, attention-path).
+    { "attn_norm",           LLAMA_TENSOR_CLASS_ATTN_NORM         },
+    { "attn_norm_2",         LLAMA_TENSOR_CLASS_ATTN_NORM         },
+    { "attn_q_norm",         LLAMA_TENSOR_CLASS_ATTN_NORM         },
+    { "attn_k_norm",         LLAMA_TENSOR_CLASS_ATTN_NORM         },
+    { "attn_q_a_norm",       LLAMA_TENSOR_CLASS_ATTN_NORM         },
+    { "attn_kv_a_norm",      LLAMA_TENSOR_CLASS_ATTN_NORM         },
+    { "attn_output_norm",    LLAMA_TENSOR_CLASS_ATTN_NORM         },
+    { "attn_post_norm",      LLAMA_TENSOR_CLASS_ATTN_NORM         },
+    { "post_attention_norm", LLAMA_TENSOR_CLASS_ATTN_NORM         },
+    { "attn_sub_norm",       LLAMA_TENSOR_CLASS_ATTN_NORM         },
+    { "attn_sinks",          LLAMA_TENSOR_CLASS_ATTN_NORM         },
+
+    // Dense FFN per layer.
+    { "ffn_gate",            LLAMA_TENSOR_CLASS_FFN_DENSE_GATE    },
+    { "ffn_up",              LLAMA_TENSOR_CLASS_FFN_DENSE_UP      },
+    { "ffn_down",            LLAMA_TENSOR_CLASS_FFN_DENSE_DOWN    },
+
+    // FFN norms.
+    { "ffn_norm",            LLAMA_TENSOR_CLASS_FFN_NORM          },
+    { "ffn_norm_exps",       LLAMA_TENSOR_CLASS_FFN_NORM          },
+    { "ffn_post_norm",       LLAMA_TENSOR_CLASS_FFN_NORM          },
+    { "post_ffw_norm",       LLAMA_TENSOR_CLASS_FFN_NORM          },
+    { "ffn_sub_norm",        LLAMA_TENSOR_CLASS_FFN_NORM          },
+    { "layer_output_norm",   LLAMA_TENSOR_CLASS_FFN_NORM          },
+
+    // MoE router and bias.
+    { "ffn_gate_inp",        LLAMA_TENSOR_CLASS_FFN_GATE_INP      },
+    { "ffn_gate_inp_shexp",  LLAMA_TENSOR_CLASS_FFN_GATE_INP      },
+    { "exp_probs_b",         LLAMA_TENSOR_CLASS_FFN_GATE_INP      },
+
+    // MoE merged-expert weights.
+    { "ffn_gate_exps",       LLAMA_TENSOR_CLASS_FFN_MOE_GATE_EXPS },
+    { "ffn_up_exps",         LLAMA_TENSOR_CLASS_FFN_MOE_UP_EXPS   },
+    { "ffn_down_exps",       LLAMA_TENSOR_CLASS_FFN_MOE_DOWN_EXPS },
+    // Channel-major split (Grove MoE) — same logical role as the merged variant.
+    { "ffn_gate_chexps",     LLAMA_TENSOR_CLASS_FFN_MOE_GATE_EXPS },
+    { "ffn_up_chexps",       LLAMA_TENSOR_CLASS_FFN_MOE_UP_EXPS   },
+    { "ffn_down_chexps",     LLAMA_TENSOR_CLASS_FFN_MOE_DOWN_EXPS },
+
+    // DeepSeek-style shared experts.
+    { "ffn_gate_shexp",      LLAMA_TENSOR_CLASS_FFN_SHARED_GATE   },
+    { "ffn_up_shexp",        LLAMA_TENSOR_CLASS_FFN_SHARED_UP     },
+    { "ffn_down_shexp",      LLAMA_TENSOR_CLASS_FFN_SHARED_DOWN   },
+};
+
+const std::unordered_map<std::string, llama_tensor_class> & top_level_map() {
+    static const auto map = [] {
+        std::unordered_map<std::string, llama_tensor_class> m;
+        for (const auto & e : k_top_level) {
+            m.emplace(e.role, e.cls);
+        }
+        return m;
+    }();
+    return map;
+}
+
+const std::unordered_map<std::string, llama_tensor_class> & per_layer_map() {
+    static const auto map = [] {
+        std::unordered_map<std::string, llama_tensor_class> m;
+        for (const auto & e : k_per_layer) {
+            m.emplace(e.role, e.cls);
+        }
+        return m;
+    }();
+    return map;
+}
+
+// Strip a trailing ".<suffix>" if it is one of the known layout suffixes.
+// Only "weight" and "bias" are stripped; an unknown trailing token is kept
+// so it participates in the role lookup (and therefore lands in MISC if
+// unrecognized, surfacing the new tensor name to the operator).
+std::string strip_layout_suffix(const std::string & role) {
+    const std::size_t dot = role.rfind('.');
+    if (dot == std::string::npos) {
+        return role;
+    }
+    const std::string suffix = role.substr(dot + 1);
+    if (suffix == "weight" || suffix == "bias") {
+        return role.substr(0, dot);
+    }
+    return role;
+}
+
+}  // namespace
+
+llama_tensor_classification llama_tensor_classify(const char * name) {
+    llama_tensor_classification result = { LLAMA_TENSOR_CLASS_MISC, -1 };
+    if (name == nullptr) {
+        return result;
+    }
+
+    const std::string full = name;
+
+    if (full.rfind("blk.", 0) == 0) {
+        // Per-layer: "blk.<N>.<role>[.<suffix>]"
+        const std::size_t layer_start = 4;  // after "blk."
+        const std::size_t layer_end   = full.find('.', layer_start);
+        if (layer_end == std::string::npos) {
+            return result;
+        }
+
+        const std::string layer_str = full.substr(layer_start, layer_end - layer_start);
+        char *            end_ptr   = nullptr;
+        const long        layer_val = std::strtol(layer_str.c_str(), &end_ptr, 10);
+        if (end_ptr == layer_str.c_str() || *end_ptr != '\0' || layer_val < 0) {
+            return result;
+        }
+
+        const std::string role = strip_layout_suffix(full.substr(layer_end + 1));
+        const auto &      map  = per_layer_map();
+        const auto        it   = map.find(role);
+        if (it != map.end()) {
+            result.cls       = it->second;
+            result.layer_idx = static_cast<int>(layer_val);
+        }
+        return result;
+    }
+
+    // Top-level (non per-layer).
+    const std::string role = strip_layout_suffix(full);
+    const auto &      map  = top_level_map();
+    const auto        it   = map.find(role);
+    if (it != map.end()) {
+        result.cls = it->second;
+    }
+    return result;
+}
+
+llama_tensor_classification llama_tensor_classify(const ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return { LLAMA_TENSOR_CLASS_MISC, -1 };
+    }
+    return llama_tensor_classify(tensor->name);
+}
+
+const char * llama_tensor_class_name(llama_tensor_class cls) {
+    switch (cls) {
+        case LLAMA_TENSOR_CLASS_MISC:
+            return "MISC";
+        case LLAMA_TENSOR_CLASS_ATTN_Q:
+            return "ATTN_Q";
+        case LLAMA_TENSOR_CLASS_ATTN_K:
+            return "ATTN_K";
+        case LLAMA_TENSOR_CLASS_ATTN_V:
+            return "ATTN_V";
+        case LLAMA_TENSOR_CLASS_ATTN_O:
+            return "ATTN_O";
+        case LLAMA_TENSOR_CLASS_ATTN_QKV:
+            return "ATTN_QKV";
+        case LLAMA_TENSOR_CLASS_ATTN_NORM:
+            return "ATTN_NORM";
+        case LLAMA_TENSOR_CLASS_FFN_GATE_INP:
+            return "FFN_GATE_INP";
+        case LLAMA_TENSOR_CLASS_FFN_DENSE_GATE:
+            return "FFN_DENSE_GATE";
+        case LLAMA_TENSOR_CLASS_FFN_DENSE_UP:
+            return "FFN_DENSE_UP";
+        case LLAMA_TENSOR_CLASS_FFN_DENSE_DOWN:
+            return "FFN_DENSE_DOWN";
+        case LLAMA_TENSOR_CLASS_FFN_MOE_GATE_EXPS:
+            return "FFN_MOE_GATE_EXPS";
+        case LLAMA_TENSOR_CLASS_FFN_MOE_UP_EXPS:
+            return "FFN_MOE_UP_EXPS";
+        case LLAMA_TENSOR_CLASS_FFN_MOE_DOWN_EXPS:
+            return "FFN_MOE_DOWN_EXPS";
+        case LLAMA_TENSOR_CLASS_FFN_SHARED_GATE:
+            return "FFN_SHARED_GATE";
+        case LLAMA_TENSOR_CLASS_FFN_SHARED_UP:
+            return "FFN_SHARED_UP";
+        case LLAMA_TENSOR_CLASS_FFN_SHARED_DOWN:
+            return "FFN_SHARED_DOWN";
+        case LLAMA_TENSOR_CLASS_FFN_NORM:
+            return "FFN_NORM";
+        case LLAMA_TENSOR_CLASS_EMBD_TOKEN:
+            return "EMBD_TOKEN";
+        case LLAMA_TENSOR_CLASS_EMBD_OUTPUT:
+            return "EMBD_OUTPUT";
+        case LLAMA_TENSOR_CLASS_OUTPUT_NORM:
+            return "OUTPUT_NORM";
+        case LLAMA_TENSOR_CLASS_POSITION_EMBD:
+            return "POSITION_EMBD";
+        case LLAMA_TENSOR_CLASS_COUNT:
+            break;
+    }
+    return "UNKNOWN";
+}
