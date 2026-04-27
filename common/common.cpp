@@ -1697,7 +1697,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     // Mirrored from common_params and llama_context_params for the GPU planner.
     mparams.n_ctx           = params.n_ctx;
     mparams.n_ubatch        = params.n_ubatch;
-    mparams.n_seq_max       = params.n_parallel;
+    mparams.n_seq_max       = params.n_parallel;  // CLI --parallel / -np
     mparams.flash_attn_type = params.flash_attn_type;
 
     if (params.kv_overrides.empty()) {

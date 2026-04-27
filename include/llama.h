@@ -325,11 +325,11 @@ extern "C" {
         // Capacity inputs (not "this user's context"): each per-context or
         // per-slot compute plan still allocates within the envelope.
         // Mirror these from the corresponding llama_context_params fields.
-        // 0 = use model defaults (n_ctx_train, ubatch=512, conservative).
-        uint32_t                   n_ctx;            // max ctx per slot
-        uint32_t                   n_ubatch;         // physical maximum batch size
-        uint32_t                   n_seq_max;        // max active sequences / slots
-        enum llama_flash_attn_type flash_attn_type;  // FA policy for the envelope
+        // Aggregate KV demand follows from n_ctx * n_seq_max.
+        uint32_t                   n_ctx;            // per-slot ctx ceiling within the envelope; 0 = use n_ctx_train
+        uint32_t                   n_ubatch;         // physical maximum batch size; 0 = use 512
+        uint32_t                   n_seq_max;        // max active sequences / slots (no sentinel; default 1 = single-sequence)
+        enum llama_flash_attn_type flash_attn_type;  // FA policy; LLAMA_FLASH_ATTN_TYPE_AUTO = backend chooses
     };
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
