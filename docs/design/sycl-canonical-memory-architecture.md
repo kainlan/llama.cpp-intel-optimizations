@@ -72,8 +72,8 @@ Plus a host-pinned zone (`HOST`) for CPU-accessible buffers managed via
 **What the unified cache does NOT own:**
 - Placement decisions (the planner owns those).
 - Kernel dispatch logic (the dispatch router owns that).
-- Memory allocated inside tests (see §6).
-- ggml buffer allocations at the public `ggml_backend` API boundary (see §6).
+- Memory allocated inside tests (see §7).
+- ggml buffer allocations at the public `ggml_backend` API boundary (see §7).
 
 ### 1.3 `mem_handle` (`ggml_sycl::mem_handle`)
 
@@ -108,12 +108,50 @@ the cache.
 - SYCL event dependencies — handles are value types. Event tracking belongs at the
   call site (see §3).
 
+### 1.4 Dispatch Router
+
+**Current entry point:** `ggml_sycl_compute_forward` in `ggml/src/ggml-sycl/ggml-sycl.cpp:39001`
+**Current MUL_MAT entry point:** `ggml_sycl::ggml_sycl_mul_mat_unified` in `ggml/src/ggml-sycl/dispatch.hpp:418`
+**Kernel selector:** `ggml_sycl::select_kernel_type` in `ggml/src/ggml-sycl/dispatch.hpp:186`
+
+The dispatch router is the component that, given an op and its operands, selects
+and invokes the correct kernel (XMX / ESIMD / MMVQ / MMQ / DMMV / CPU / oneDNN).
+
+**Current shape:** `ggml_sycl_compute_forward` dispatches by `ggml_op` enum and
+calls into per-op helpers. Those helpers currently branch on caller-side host/device
+predicates (`ggml_backend_buffer_is_host`, `ggml_sycl_is_host_resident_weight`,
+`has_placement_plan`) to choose between GPU and CPU paths. This is the legacy
+pattern that T8 replaces.
+
+**Target shape (TBD — tracked in `llama.cpp-32dg8.9`):** A canonical router whose
+inputs are `ggml_op`, `mem_handle` operands, op metadata, device ID, and SYCL event
+dependencies. Its signature shape is:
+
+```cpp
+// Target API — not yet implemented (llama.cpp-32dg8.9)
+sycl::event dispatch_op(
+    ggml_op                        op,
+    std::span<const mem_handle>    srcs,
+    const mem_handle &             dst,
+    const OperationContext &       ctx,
+    std::span<const sycl::event>   deps);
+```
+
+The router determines residency from `handle.resolve().on_device` and `handle.device()`,
+selects the kernel, and returns an event — without the caller performing any
+host/device predicate check.
+
+**What the dispatch router does NOT own:**
+- Placement decisions (the planner owns those).
+- Allocation (the unified cache owns that).
+- Pointer resolution (the handle owns that).
+
 ---
 
 ## 2. Allocator Entry Points (Allowlist)
 
 Only the following functions may allocate SYCL memory. All other code must call
-these or be migrated (see §7 for temporary allowlisted sites):
+these or be migrated (see §8 for temporary allowlisted sites):
 
 | Function | Purpose | Returns |
 |---|---|---|
@@ -323,7 +361,7 @@ are grouped by subsystem:
 | `fused-moe-esimd.hpp`, `gpu-sampler.hpp` | ~10 | `llama.cpp-32dg8.6` | Migrate to `unified_allocate` |
 | `ggml-sycl.cpp` MoE + TP paths | ~30 | `llama.cpp-32dg8.6` | Migrate to planner + `unified_allocate` |
 | `unified-cache.cpp` internals | all | — | Allowed permanently as raw-malloc gateway |
-| Test files under `tests/` | all | — | Allowed permanently (see §6) |
+| Test files under `tests/` | all | — | Allowed permanently (see §7) |
 
 ### 8.2 Host-residency predicates (caller-side "is on host?" checks)
 
@@ -372,17 +410,26 @@ temporarily allowed but must be audited for multi-GPU callers:
 | `llama.cpp-32dg8.6` | T5 — Unified cache as sole allocator | §1.2, §2, §8.1 |
 | `llama.cpp-32dg8.7` | T6 — Expand `mem_handle` into universal handle | §1.3, §3, §8.4 |
 | `llama.cpp-32dg8.8` | T7 — Canonical `mem_handle` memory operations | §5.2 |
-| `llama.cpp-32dg8.9` | T8 — Unified dispatch router over `mem_handle` operands | §1.1, §3, §8.2 |
+| `llama.cpp-32dg8.9` | T8 — Unified dispatch router over `mem_handle` operands | §1.4, §3, §8.2 |
 | `llama.cpp-32dg8.10` | T9 — Migrate op call sites off raw residency checks | §8.2 |
 | `llama.cpp-32dg8.11` | T10 — Multi-GPU validation | §6.2, §8.1 |
 | `llama.cpp-32dg8.12` | T11 — Multi-user / multi-context validation | §4.3, §6.3 |
 | `llama.cpp-32dg8.13` | T12 — Final audit gates | all |
 | `llama.cpp-32dg8.15` | PROOF gate | §1–§8 (all proof P1–P8 invariants) |
-| `llama.cpp-32dg8.15.10` | P1-FIX — model vs context ownership | §4.1, §4.2, §4.3 |
+| `llama.cpp-32dg8.15.1` | P1 — Prove model-scoped vs context-scoped memory ownership | §4.1, §4.2, §4.3 |
+| `llama.cpp-32dg8.15.2` | P2 — Prove multi-GPU `mem_handle` ownership and wrong-device behavior | §1.3, §6.2, §8.4 |
+| `llama.cpp-32dg8.15.3` | P3 — Prove in-flight `mem_handle` lease lifetime through SYCL events | §1.3, §3 |
+| `llama.cpp-32dg8.15.4` | P4 — Prototype canonical `mem_handle` memory operations | §5.2 |
+| `llama.cpp-32dg8.15.5` | P5 — Audit every SYCL allocation site before sole-allocator migration | §2, §8.1 |
+| `llama.cpp-32dg8.15.6` | P6 — Prove dispatch-router shape with MUL_MAT and MUL_MAT_ID | §1.4, §3, §8.2 |
+| `llama.cpp-32dg8.15.7` | P7 — Prove planner can predict runtime and scratch allocation demand | §1.1, §4, §5 |
+| `llama.cpp-32dg8.15.8` | P8 — Prove host-resident fallback coverage for spilled subgraphs | §8.2 |
+| `llama.cpp-32dg8.15.9` | P9 — Make 32dg8 implementation beads junior-ready | all |
+| `llama.cpp-32dg8.15.10` | P1-FIX — model vs context ownership fixes | §4.1, §4.2, §4.3 |
 | `llama.cpp-32dg8.15.11` | P2-FIX — `mem_handle` device identity | §1.3, §6.2, §8.4 |
 | `llama.cpp-32dg8.15.12` | P3-FIX — in-flight handle lease lifetime | §1.3, §3 |
 | `llama.cpp-32dg8.15.13` | P4-FIX — canonical event-returning memory ops | §5.2 |
 | `llama.cpp-32dg8.15.14` | P5-FIX — allocation site inventory | §2, §8.1 |
-| `llama.cpp-32dg8.15.15` | P6-FIX — dispatch router vertical slice | §1.1, §3, §8.2 |
+| `llama.cpp-32dg8.15.15` | P6-FIX — dispatch router vertical slice | §1.4, §3, §8.2 |
 | `llama.cpp-32dg8.15.16` | P7-FIX — plan-vs-actual auditor | §1.1, §4, §5 |
 | `llama.cpp-32dg8.15.17` | P8-FIX — host fallback coverage matrix | §8.2 |
