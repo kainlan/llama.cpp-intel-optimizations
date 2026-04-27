@@ -6396,6 +6396,30 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
             g_placement_plan.host_bytes / (1024.0 * 1024.0));
     }
 
+    // PLACE-4 G1 (llama.cpp-2egrd polish): single-line summary of plan-driven
+    // weight placement.  Surfaces the per-tensor verdict at plan-computation
+    // time so log readers don't need to cross-reference the more verbose
+    // [LOAD-SUMMARY] line that prints later.  This is the architecturally-correct
+    // "device buffer size" measurement for PLACE-4 — ggml's per-buft tallocr
+    // line ("model buffer size = NN MiB") reports SYCL_Host for the whole model
+    // because weights load via mmap-backed host buft regardless of where the
+    // unified cache stages them.
+    if (g_has_placement_plan) {
+        size_t device_bytes = 0, host_bytes = 0;
+        size_t device_count = 0, host_count = 0;
+        for (const auto & entry : g_placement_plan.entries) {
+            if (entry.on_device) {
+                device_bytes += entry.dst_size;
+                device_count++;
+            } else {
+                host_bytes += entry.dst_size;
+                host_count++;
+            }
+        }
+        GGML_LOG_INFO("[PLACE-4] device weight zone: %.1f MB (%zu tensors), host arena: %.1f MB (%zu tensors)\n",
+                      device_bytes / (1024.0 * 1024.0), device_count, host_bytes / (1024.0 * 1024.0), host_count);
+    }
+
     // Store plan in per-device caches so the KV tier manager sees it before
     // KV init.  The graph-replay guard (g_has_placement_plan &&
     // graph_has_host_inputs) protects against replaying graphs with
@@ -6717,16 +6741,6 @@ int ggml_backend_sycl_planned_target_device(const char * tensor_name) {
     return g_placement_plan.get_target_device(tensor_name);
 }
 
-ggml_backend_buffer_type_t ggml_backend_sycl_planned_buft(const char * tensor_name) {
-    const int dev = ggml_backend_sycl_planned_target_device(tensor_name);
-    if (dev == GGML_SYCL_PLANNED_NO_PLAN) {
-        return nullptr;
-    }
-    if (dev < 0) {
-        return ggml_backend_sycl_host_buffer_type();
-    }
-    return ggml_backend_sycl_buffer_type(dev);
-}
 
 // ggml_backend_sycl_model_exceeds_vram removed — unified non-blocking cache
 // handles all model sizes.  Inference callers use the non-blocking try_get_cached_with_event path

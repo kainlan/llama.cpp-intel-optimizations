@@ -224,11 +224,6 @@ GGML_BACKEND_API void ggml_backend_sycl_compute_placement_plan_early(
 // they continue to use the per-expert dispatch path.
 GGML_BACKEND_API int ggml_backend_sycl_planned_target_device(const char * tensor_name);
 
-// Convenience wrapper: returns the buft for the planned location, or NULL
-// when no plan applies.  Callers that prefer a buft over a device id should
-// use this directly.
-GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_planned_buft(const char * tensor_name);
-
 // Set the placement envelope (snapshot of llama_model_params capacity inputs)
 // for this backend.  Must be called at model load alongside set_tensor_inventory.
 // The setter copies into a file-static; the caller's struct does not need to
