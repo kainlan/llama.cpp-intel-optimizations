@@ -135,6 +135,10 @@ static bool parse_args(int argc, char ** argv, options & opt) {
     if (opt.over_ctx <= opt.envelope_ctx) {
         opt.over_ctx = opt.envelope_ctx + 256;
     }
+    if (opt.expect_fa_mismatch && opt.probe_over) {
+        std::fprintf(stderr, "--expect-fa-mismatch and --probe-over/--expect-over-reject are mutually exclusive\n");
+        return false;
+    }
     return true;
 }
 
@@ -221,11 +225,16 @@ static bool fa_probe(const options &       opt,
 
     llama_model * model = llama_model_load_from_file(opt.model.c_str(), mparams);
     if (!model) {
-        std::fprintf(stderr, "FAIL: fa_probe model load failed (env=%s)\n", llama_flash_attn_type_name(env_fa));
+        std::fprintf(stderr, "FAIL: fa_probe model load failed (env=%s req=%s)\n", llama_flash_attn_type_name(env_fa),
+                     llama_flash_attn_type_name(req_fa));
         return false;
     }
 
     llama_context_params cparams = make_context_params(opt.envelope_ctx, opt.seq_max, opt.ubatch, false);
+    // make_context_params doesn't set flash_attn_type — this override is the
+    // authoritative per-cell source. If make_context_params ever starts
+    // setting flash_attn_type, this override must still apply LAST or the
+    // cell sweep silently exercises the wrong cells.
     cparams.flash_attn_type      = req_fa;
 
     llama_context * ctx      = llama_init_from_model(model, cparams);
