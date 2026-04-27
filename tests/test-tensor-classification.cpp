@@ -42,6 +42,8 @@ void test_tensor_classification() {
     // Norms (priority 4)
     assert(classify_tensor("blk.0.attn_norm.weight") == tensor_class::NORM);
     assert(classify_tensor("blk.0.ffn_norm.weight") == tensor_class::NORM);
+    assert(classify_tensor("blk.0.attn_q_norm.weight") == tensor_class::NORM);
+    assert(classify_tensor("blk.0.attn_k_norm.weight") == tensor_class::NORM);
     assert(classify_tensor("output_norm.weight") == tensor_class::NORM);
 
     // Other
