@@ -179,7 +179,7 @@ these or be migrated (see §9 for temporary allowlisted sites):
 | `unified_alloc(req, out)` | Primary allocator; routes by zone/tier | `bool` + `alloc_handle` |
 | `unified_allocate(req)` | Handle-returning wrapper around `unified_alloc` | `mem_handle` |
 | `unified_cache_allocate(device, size, category, queue)` | Bulk weight/arena slot allocator | `unified_alloc_result` (`unified-cache.hpp:2374`) |
-| `unified_cache_zone_alloc(zone, size, ...)` | Named zone allocation | `void *` |
+| `unified_cache_zone_alloc(device_id, zone, size, align = 256)` | Named VRAM zone allocation (`unified-cache.hpp:2856`) | `void *` |
 | `unified_cache_host_zone_alloc(zone, size, align)` | **Deprecated** — host-pinned zone allocation; migrate to `unified_allocate()` with `must_host_pinned` + `use_pinned_pool` | `void *` |
 | `unified_cache_arena_alloc` | **Deprecated** — migrate to `unified_allocate(..., prefer_vram_zone=SCRATCH)` | `void *` |
 | `unified_cache_raw_malloc_device(size, queue)` | Raw `sycl::malloc_device` wrapper — call only from inside `unified_cache` internals | `void *` |
@@ -191,7 +191,7 @@ never be called outside `unified-cache.cpp`. All other files must use the wrappe
 above.
 
 **Deallocation:** `unified_free(handle)`, `unified_free_ptr(ptr, device)`,
-`unified_cache_zone_free(zone, ptr)`, `unified_cache_arena_free(ptr)` (deprecated).
+`unified_cache_zone_free(device_id, zone, ptr)`, `unified_cache_arena_free(device_id, ptr, size)` (deprecated).
 
 ---
 
