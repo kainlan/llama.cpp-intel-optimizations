@@ -2108,7 +2108,7 @@ struct ggml_tensor_extra_gpu {
     void set_data_device(int dev, void * ptr, ggml_layout_mode layout = GGML_LAYOUT_AOS, bool on_device = true) {
         data_device[dev] = ptr;
         if (ptr) {
-            data_handle[dev] = ggml_sycl::mem_handle::from_direct(ptr, layout, on_device);
+            data_handle[dev] = ggml_sycl::mem_handle::from_direct(ptr, layout, on_device, dev);
         } else {
             data_handle[dev] = ggml_sycl::mem_handle{};
         }

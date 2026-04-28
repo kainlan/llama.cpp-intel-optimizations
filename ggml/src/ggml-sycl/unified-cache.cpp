@@ -6061,7 +6061,8 @@ mem_handle unified_allocate(const alloc_request & req) {
         return mem_handle{};
     }
     bool on_device = (handle.tier == alloc_tier::DEVICE_VRAM);
-    return mem_handle::from_direct(handle.ptr, GGML_LAYOUT_AOS, on_device);
+    int  dev       = on_device ? handle.device : mem_handle::HOST_DEVICE;
+    return mem_handle::from_direct(handle.ptr, GGML_LAYOUT_AOS, on_device, dev);
 }
 
 mem_handle scoped_unified_alloc::as_mem_handle() const {
@@ -6069,7 +6070,8 @@ mem_handle scoped_unified_alloc::as_mem_handle() const {
         return mem_handle{};
     }
     bool on_device = (handle_.tier == alloc_tier::DEVICE_VRAM);
-    return mem_handle::from_direct(handle_.ptr, GGML_LAYOUT_AOS, on_device);
+    int  dev       = on_device ? handle_.device : mem_handle::HOST_DEVICE;
+    return mem_handle::from_direct(handle_.ptr, GGML_LAYOUT_AOS, on_device, dev);
 }
 
 mem_handle alloc_handle::as_mem_handle() const {
@@ -6077,7 +6079,8 @@ mem_handle alloc_handle::as_mem_handle() const {
         return mem_handle{};
     }
     bool on_device = (tier == alloc_tier::DEVICE_VRAM);
-    return mem_handle::from_direct(ptr, GGML_LAYOUT_AOS, on_device);
+    int  dev       = on_device ? device : mem_handle::HOST_DEVICE;
+    return mem_handle::from_direct(ptr, GGML_LAYOUT_AOS, on_device, dev);
 }
 
 bool unified_lookup(void * ptr, alloc_handle * out) {

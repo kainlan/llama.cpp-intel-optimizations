@@ -68,10 +68,10 @@ mem_handle mem_handle::from_cache_id(const ggml_sycl_cache_id & id, int device) 
     return from_weight(key, device);
 }
 
-mem_handle mem_handle::from_direct(void * ptr, ggml_layout_mode layout, bool on_device) {
+mem_handle mem_handle::from_direct(void * ptr, ggml_layout_mode layout, bool on_device, int device_id) {
     mem_handle h;
     h.kind_   = mem_handle_kind::DIRECT;
-    h.device_ = 0;
+    h.device_ = device_id;
     h.key_    = {};
     h.gen_    = 0;
     h.cached_ = { ptr, layout, on_device };
@@ -178,6 +178,23 @@ resolved_ptr mem_handle::resolve() const {
     }
 
     return resolve_slow();
+}
+
+// === resolve(device_id) — device-checking overload ===
+// Validates that the handle's owning device matches the caller's device before
+// returning the resolved pointer.  Policy: explicit fail — return null and log.
+// HOST_DEVICE (-1) handles always pass (host-pinned pointers are device-agnostic).
+
+resolved_ptr mem_handle::resolve(int device_id) const {
+    // Host handles (device_ == HOST_DEVICE) are accessible from any device.
+    if (device_ != HOST_DEVICE && device_ != device_id) {
+        GGML_LOG_WARN(
+            "mem_handle::resolve(device_id=%d): wrong-device access — handle owns "
+            "device %d (kind=%d). Returning null.\n",
+            device_id, device_, static_cast<int>(kind_));
+        return {};
+    }
+    return resolve();
 }
 
 // === resolve_slow ===

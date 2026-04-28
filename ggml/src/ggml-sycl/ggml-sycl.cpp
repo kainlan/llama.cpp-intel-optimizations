@@ -6904,7 +6904,8 @@ static ggml_sycl::mem_handle make_data_ptr_handle(const ggml_tensor * tensor, in
         }
     }
     const bool on_device = (ptr != nullptr) && (ggml_sycl_get_alloc_type(ptr) == sycl::usm::alloc::device);
-    return ggml_sycl::mem_handle::from_direct(ptr, GGML_LAYOUT_AOS, on_device);
+    const int  dev       = on_device ? device : ggml_sycl::mem_handle::HOST_DEVICE;
+    return ggml_sycl::mem_handle::from_direct(ptr, GGML_LAYOUT_AOS, on_device, dev);
 }
 
 // ---------------------------------------------------------------------------
@@ -8850,7 +8851,7 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
                 GGML_SYCL_DEBUG(
                     "ggml_sycl_get_data_ptr_slow: tensor=%s, device=%d, resolved via view_src %s + offset %td = %p\n",
                     tensor->name, device, base->name, offset, result);
-                g_data_ptr_cache[tensor] = ggml_sycl::mem_handle::from_direct(result, GGML_LAYOUT_AOS, true);
+                g_data_ptr_cache[tensor] = ggml_sycl::mem_handle::from_direct(result, GGML_LAYOUT_AOS, true, device);
                 return result;
             }
         }
@@ -8879,7 +8880,7 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
                         "ggml_sycl_get_data_ptr_slow: tensor=%s, device=%d, resolved via view_src base USM + offset "
                         "%td = %p\n",
                         tensor->name, device, offset, result);
-                    g_data_ptr_cache[tensor] = ggml_sycl::mem_handle::from_direct(result, GGML_LAYOUT_AOS, true);
+                    g_data_ptr_cache[tensor] = ggml_sycl::mem_handle::from_direct(result, GGML_LAYOUT_AOS, true, device);
                     return result;
                 }
             }
@@ -8898,7 +8899,8 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
         }
         if (alloc_info && alloc_info->type == ggml_sycl::alloc_type::HOST_PINNED) {
             // Host-pinned is GPU-accessible via PCIe zero-copy — return directly
-            g_data_ptr_cache[tensor] = ggml_sycl::mem_handle::from_direct(tensor->data, GGML_LAYOUT_AOS, false);
+            g_data_ptr_cache[tensor] = ggml_sycl::mem_handle::from_direct(tensor->data, GGML_LAYOUT_AOS, false,
+                                                                           ggml_sycl::mem_handle::HOST_DEVICE);
             return tensor->data;
         }
 
@@ -8948,7 +8950,7 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
                 void * streamed = ggml_sycl::layer_streaming_get_weight_ptr(device, tensor->name);
                 if (streamed) {
                     GGML_LOG_DEBUG("get_data_ptr_slow: %s from layer stream buffer\n", tensor->name);
-                    g_data_ptr_cache[tensor] = ggml_sycl::mem_handle::from_direct(streamed, GGML_LAYOUT_AOS, true);
+                    g_data_ptr_cache[tensor] = ggml_sycl::mem_handle::from_direct(streamed, GGML_LAYOUT_AOS, true, device);
                     return streamed;
                 }
             }
@@ -8963,7 +8965,7 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
                     "ggml_sycl_get_data_ptr_slow: tensor=%s, device=%d, staged non-device %p -> %p (%zu bytes, "
                     "type=%d)\n",
                     tensor->name, device, tensor->data, staged, nbytes, (int) ptr_type);
-                g_data_ptr_cache[tensor] = ggml_sycl::mem_handle::from_direct(staged, GGML_LAYOUT_AOS, true);
+                g_data_ptr_cache[tensor] = ggml_sycl::mem_handle::from_direct(staged, GGML_LAYOUT_AOS, true, device);
                 return staged;
             }
             GGML_SYCL_DEBUG(
@@ -8975,7 +8977,8 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
 
     GGML_SYCL_DEBUG("ggml_sycl_get_data_ptr_slow: tensor=%s, device=%d, using tensor->data=%p\n", tensor->name, device,
                     tensor->data);
-    g_data_ptr_cache[tensor] = ggml_sycl::mem_handle::from_direct(tensor->data, GGML_LAYOUT_AOS, false);
+    g_data_ptr_cache[tensor] = ggml_sycl::mem_handle::from_direct(tensor->data, GGML_LAYOUT_AOS, false,
+                                                                   ggml_sycl::mem_handle::HOST_DEVICE);
     return tensor->data;
 }
 
@@ -27661,7 +27664,7 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
             auto & entry = g_moe_layer_ids_cache[blk_id];
             entry.expert_ptrs.resize(host_ptrs.size());
             for (size_t ei = 0; ei < host_ptrs.size(); ++ei) {
-                entry.expert_ptrs[ei] = ggml_sycl::mem_handle::from_direct(host_ptrs[ei], layout, true);
+                entry.expert_ptrs[ei] = ggml_sycl::mem_handle::from_direct(host_ptrs[ei], layout, true, device);
             }
             entry.ptrs_layout = layout;
             GGML_SYCL_DEBUG("[MOE-PTR-1E] Cached %zu expert ptrs for layer %d (misses=0, layout=%d)\n",

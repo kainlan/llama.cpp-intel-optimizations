@@ -109,9 +109,18 @@ public:
     // layer_weight_set fields) rather than a full unified_cache_key.
     static mem_handle from_cache_id(const ggml_sycl_cache_id & id, int device);
 
+    // Sentinel for host pointers where device ownership is not applicable.
+    // Pass as device_id to from_direct() for host-pinned or CPU-resident pointers.
+    static constexpr int HOST_DEVICE = -1;
+
     // Create a DIRECT handle from a raw pointer.
+    // device_id: owning SYCL device index, or HOST_DEVICE (-1) for host-pinned /
+    //   CPU-resident pointers that are not owned by any specific GPU device.
+    // resolve() checks that the calling queue's device matches device_id (when
+    //   device_id >= 0) and returns null with a diagnostic on mismatch.
     // resolve() always returns this pointer without checking the cache.
-    static mem_handle from_direct(void * ptr, ggml_layout_mode layout, bool on_device);
+    static mem_handle from_direct(void * ptr, ggml_layout_mode layout, bool on_device,
+                                  int device_id = HOST_DEVICE);
 
     // Create an arena zone handle.
     // zone_id maps to vram_zone_id (KV=0, WEIGHT=1, ONEDNN=2, RUNTIME=3, SCRATCH=4).
@@ -137,6 +146,12 @@ public:
     static mem_handle from_chunk_ptr(void * ptr, int device,
                                      ggml_layout_mode layout    = GGML_LAYOUT_AOS,
                                      bool             on_device = false);
+
+    // Resolve with explicit device check.  Returns null resolved_ptr and logs a
+    // diagnostic if device_id does not match this handle's device_ (when device_
+    // is >= 0).  HOST_DEVICE (-1) handles always pass.  Use this overload from
+    // any dispatch path that knows which device it is submitting work to.
+    resolved_ptr resolve(int device_id) const;
 
     // Resolve the current pointer.  Hot path (~3 ns):
     //   if (kind == DIRECT || gen_ == cache_generation())

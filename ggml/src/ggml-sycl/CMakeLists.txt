@@ -941,6 +941,35 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         TIMEOUT 120
     )
 
+    # Test: mem_handle device identity and wrong-device resolution (llama.cpp-32dg8.15.11)
+    # Single-GPU: tests 1–4 run; multi-device tests skip gracefully.
+    add_executable(test-mem-handle-wrong-device
+        tests/test-mem-handle-wrong-device.cpp
+        unified-cache.cpp
+        pinned-pool.cpp
+        mem-handle.cpp
+    )
+    target_include_directories(test-mem-handle-wrong-device PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    )
+    target_compile_options(test-mem-handle-wrong-device PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_link_options(test-mem-handle-wrong-device PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_compile_definitions(test-mem-handle-wrong-device PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-mem-handle-wrong-device PRIVATE ggml-base ggml)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-mem-handle-wrong-device PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME mem-handle-wrong-device COMMAND test-mem-handle-wrong-device)
+    set_tests_properties(mem-handle-wrong-device PROPERTIES
+        LABELS "sycl;cache;mem-handle;device-identity;tdd"
+        TIMEOUT 120
+    )
+
     # Test 18: UnifiedKernel Operation Tests (TDD)
     # Tests RMS norm and SiLU mul operations for persistent kernel
     add_executable(test-sycl-runtime-alloc
