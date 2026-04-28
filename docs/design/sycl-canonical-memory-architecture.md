@@ -467,14 +467,10 @@ chunk while an earlier proof chunk is unresolved.
 
 | Chunk | Beads | Scope | Checkpoint |
 |---|---|---|---|
-| C1 | `32dg8.15.10`, `32dg8.12` | Prove and harden model/context ownership | `test-thread-safety` with one loaded model, multiple contexts, SYCL GPU selected |
-| C2 | `32dg8.15.12`, `32dg8.15.13`, `32dg8.8` | Event-bound handle leases and canonical copy/fill helpers | Unit tests for H2H, H2D, D2H, same-device D2D, cross-device staged D2D |
-| C3 | `32dg8.15.15`, `32dg8.9` | Dispatch-router vertical slice for `MUL_MAT` and `MUL_MAT_ID` | Mistral dense and GPT-OSS MoE decode with no caller-side residency predicates in the slice |
-| C4 | `32dg8.15.16`, `32dg8.5` | Planner predicts runtime, scratch, staging, oneDNN, KV, and host fallback bytes | Plan-vs-actual auditor reports no unplanned allocation class |
-| C5 | `32dg8.2`, `32dg8.3`, `32dg8.4` | Remove legacy preload and optional-cache paths | Grep audit shows no production use of `g_sycl_host_weight_extras`, `weights_evictable`, or optional unified-cache mode |
-| C6 | `32dg8.6`, `32dg8.7` | Migrate allocator and handle coverage by subsystem | Allocation inventory decreases monotonically; each subsystem has focused tests |
-| C7 | `32dg8.10`, `32dg8.11`, `32dg8.12` | Migrate remaining op call sites and validate multi-GPU/multi-user flows | Single-GPU, dual-GPU, and server-slot tests pass with the same contract |
-| C8 | `32dg8.13` | Final audit gate | Raw allocator and raw residency grep allowlists are empty or explicitly justified |
+| C1 | `32dg8.16`, `32dg8.1`, `32dg8.15` and proof children | Proof gate and junior-ready foundation | All proof tasks close with evidence or concrete fix beads; `test-thread-safety` GPU smoke proof recorded |
+| C2 | `32dg8.17`, `32dg8.2`-`32dg8.6` | Planner and unified-cache allocator migration | Preload, placement, and allocation decisions flow through planner plus unified cache; legacy optional paths are gone |
+| C3 | `32dg8.18`, `32dg8.7`-`32dg8.10` | `mem_handle` operations and dispatch router migration | Common memory operations use event-returning handle helpers; migrated ops dispatch from handles |
+| C4 | `32dg8.19`, `32dg8.11`-`32dg8.13` | Multi-GPU, multi-user, and final audit gates | Single-GPU, dual-GPU, server-slot, and final grep/audit gates pass |
 
 ### 11.1 C1 Bounded Proof Result
 
