@@ -11,12 +11,12 @@
 | **internal**  |  49   | Inside `unified-cache.cpp`, `vram-pool.cpp`, `pinned-pool.cpp`, `device-pool.hpp`, or `ggml-sycl.cpp` allocator wrapper definitions — these ARE the canonical allocator internals |
 | **migrate**   |  61   | Production caller sites that must be migrated to `unified_allocate` / `unified_cache_zone_alloc` in Wave 5 |
 | **allowlist** |   6   | Production sites temporarily kept as-is with explicit deletion criteria |
-| **test**      | 298   | Test files under `tests/` — permanently exempt per §8 (includes `test-mem-handle-wrong-device.cpp` added by P2-FIX) |
+| **test**      | 296   | Test files under `tests/` — permanently exempt per §8 |
 | **delete**    |   0   | No dead-code sites found |
-| **non-call**  | 133   | Comments, string literals, forward declarations, macro definitions, enum value comments — not allocation sites. See Appendix A for full enumeration. |
+| **non-call**  | 135   | Comments, string literals, forward declarations, macro definitions, enum value comments — not allocation sites. See Appendix A for full enumeration. |
 
 **Total grep hits (non-blank): 547**
-*(298 test + 49 internal + 61 migrate + 6 allowlist + 133 non-call hits)*
+*(296 test + 49 internal + 61 migrate + 6 allowlist + 135 non-call hits)*
 
 All production caller sites (migrate + allowlist) = **67 sites** across 17 files.
 
@@ -98,15 +98,15 @@ These are sub-allocator pool implementations that wrap `ggml_sycl_malloc_device_
 
 ## Group 5 — `ggml-sycl.cpp` allocator wrapper definitions
 
-Lines 18558–18679 of `ggml-sycl.cpp` contain the implementations of the `ggml_sycl_malloc_device`, `ggml_sycl_malloc_device_raw`, `ggml_sycl_malloc_host`, and `ggml_sycl_malloc_shared` wrapper functions themselves. These are the canonical entry points in `common.hpp`/`ggml-sycl.cpp` — they are the wrapper implementations, not callers.
+Lines 18561–18683 of `ggml-sycl.cpp` contain the implementations of the `ggml_sycl_malloc_device`, `ggml_sycl_malloc_device_raw`, `ggml_sycl_malloc_host`, and `ggml_sycl_malloc_shared` wrapper functions themselves. These are the canonical entry points in `common.hpp`/`ggml-sycl.cpp` — they are the wrapper implementations, not callers.
 
 | # | File | Line | Function | Phase | Purpose | Current API | Desired Category | Migrate or Allowlist | Owner Bead |
 |---|------|------|----------|-------|---------|-------------|------------------|----------------------|------------|
-| 28 | `ggml-sycl.cpp` | 18558 | `ggml_sycl_malloc_device_raw` def | — | Function definition | `ggml_sycl_malloc_device_raw` | stays raw | internal | — |
-| 29 | `ggml-sycl.cpp` | 18585/18589/18637 | `ggml_sycl_malloc_device` def | — | Function definition (re-entrancy guard) | `ggml_sycl_malloc_device_raw` | stays raw | internal | — |
-| 30 | `ggml-sycl.cpp` | 18643/18644 | `ggml_sycl_malloc_host` def (queue) | — | Function definition | (wrapper) | stays raw | internal | — |
-| 31 | `ggml-sycl.cpp` | 18661/18662 | `ggml_sycl_malloc_host` def (ctx) | — | Function definition | (wrapper) | stays raw | internal | — |
-| 32 | `ggml-sycl.cpp` | 18679/18680 | `ggml_sycl_malloc_shared` def | — | Function definition | (wrapper) | stays raw | internal | — |
+| 28 | `ggml-sycl.cpp` | 18561 | `ggml_sycl_malloc_device_raw` def | — | Function definition | `ggml_sycl_malloc_device_raw` | stays raw | internal | — |
+| 29 | `ggml-sycl.cpp` | 18588/18592/18640 | `ggml_sycl_malloc_device` def | — | Function definition (re-entrancy guard) | `ggml_sycl_malloc_device_raw` | stays raw | internal | — |
+| 30 | `ggml-sycl.cpp` | 18646/18647 | `ggml_sycl_malloc_host` def (queue) | — | Function definition | (wrapper) | stays raw | internal | — |
+| 31 | `ggml-sycl.cpp` | 18664/18665 | `ggml_sycl_malloc_host` def (ctx) | — | Function definition | (wrapper) | stays raw | internal | — |
+| 32 | `ggml-sycl.cpp` | 18682/18683 | `ggml_sycl_malloc_shared` def | — | Function definition | (wrapper) | stays raw | internal | — |
 
 ---
 
@@ -370,13 +370,13 @@ These are production call sites in `ggml-sycl.cpp` that are NOT part of the allo
 
 All allocations in `tests/` are permanently exempt per §8 of the contract. They include 10 test files:
 
-| Test file | Approx. sites | Note |
-|-----------|--------------|-------|
-| `tests/test-graph-replay.cpp` | 12 | Graph replay micro-tests |
+| Test file | Sites | Note |
+|-----------|-------|-------|
+| `tests/test-graph-replay.cpp` | 11 | Graph replay micro-tests |
 | `tests/test-unified-kernel.cpp` | 15 | Unified kernel tests |
 | `tests/test-esimd-prefetch.cpp` | 24 | ESIMD prefetch perf tests |
 | `tests/test-moe-mxfp4-dp4a.cpp` | 3 | MoE MXFP4 test |
-| `tests/test-xmx-optimization.cpp` | 18 | XMX optimization tests |
+| `tests/test-xmx-optimization.cpp` | 16 | XMX optimization tests |
 | `tests/test-xmx-esimd-q4-gemm.cpp` | 12 | XMX ESIMD q4 gemm tests |
 | `tests/test-graph-replay-chain.cpp` | 20 | Graph replay chain tests |
 | `tests/bench-dnnl-ops.cpp` | 14 | oneDNN bench |
@@ -384,12 +384,13 @@ All allocations in `tests/` are permanently exempt per §8 of the contract. They
 | `tests/test-unified-kernel-ops.cpp` | 12 | Unified kernel ops tests |
 | `tests/test-unified-cache-fast-path.cpp` | 1 | Unified cache fast-path test |
 | `tests/test-xmx-esimd-basic.cpp` | 12 | XMX ESIMD basic tests |
-| `tests/test-xmx-dpas-basic.cpp` | 18 | XMX DPAS basic tests |
-| `tests/test-esimd-vectorized-dequant.cpp` | 14 | ESIMD vectorized dequant tests |
-| `tests/test-mem-handle-eviction.cpp` | 3 | mem_handle eviction tests |
-| `tests/test-unified-kernel-persistent.cpp` | ~110 | Persistent kernel tests |
+| `tests/test-xmx-dpas-basic.cpp` | 21 | XMX DPAS basic tests |
+| `tests/test-esimd-vectorized-dequant.cpp` | 16 | ESIMD vectorized dequant tests |
+| `tests/test-mem-handle-eviction.cpp` | 5 | mem_handle eviction tests |
+| `tests/test-unified-kernel-persistent.cpp` | 105 | Persistent kernel tests |
+| `tests/test-mem-handle-wrong-device.cpp` | 0 | mem_handle device-identity tests (P2-FIX; no direct malloc calls) |
 
-Total test sites: **298** (allowlisted permanently, §8; includes `test-mem-handle-wrong-device.cpp` added by P2-FIX).
+Total test sites: **296** (allowlisted permanently, §8).
 
 ---
 
@@ -607,6 +608,6 @@ These are the grep hits that match the search pattern but are NOT allocation cal
 
 **Total enumerated: 105 non-call hits** (88 comments, 3 enum-value annotations, 6 function/template definitions in wrapper layer, 2 macro definitions, 3 string literals).
 
-*Note: The summary count of 133 was computed as 547 − 116 production call sites (49 internal + 61 migrate + 6 allowlist) − 298 test = 133. The discrepancy with the 105 enumerated here arises because several internal rows (rows 29–32) cover multi-grep-hit lines inside the allocator wrapper function bodies; those lines are counted as "internal" production rows, not as non-call hits, but were included in the 133 subtraction. This appendix enumerates every non-production, non-test hit confirmed by current grep and is the authoritative list.*
+*Note: The summary count of 135 was computed as 547 − 116 production call sites (49 internal + 61 migrate + 6 allowlist) − 296 test = 135. The discrepancy with the 105 enumerated here arises because several internal rows (rows 29–32) cover multi-grep-hit lines inside the allocator wrapper function bodies; those lines are counted as "internal" production rows, not as non-call hits, but were included in the 135 subtraction. This appendix enumerates every non-production, non-test hit confirmed by current grep and is the authoritative list.*
 
 7. **Contract §9.1 count discrepancy** — the contract §9.1 cites "711 raw alloc patterns" using `grep -rE 'malloc_device|malloc_host|malloc_shared'`. The more restrictive grep used for this inventory (`sycl::malloc_(device|host|shared)|ggml_sycl_malloc_*|malloc_device_raw`) finds 545 total lines. The difference is because the broader grep matches comments, documentation strings, and variable names containing these substrings (e.g., `"sycl::malloc_host` appears in hundreds of comment lines in `ggml-sycl.cpp`). The production caller count (67 sites) is the authoritative figure for the migration backlog.
