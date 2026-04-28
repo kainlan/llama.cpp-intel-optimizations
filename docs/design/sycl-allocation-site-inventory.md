@@ -1,0 +1,419 @@
+# SYCL Allocation-Site Inventory
+
+*Generated 2026-04-27 for bead `llama.cpp-32dg8.15.14` (P5-FIX). Audit-only — no migrations performed.*
+
+---
+
+## Summary
+
+| Category      | Count | Description |
+|---------------|-------|-------------|
+| **internal**  |  49   | Inside `unified-cache.cpp`, `vram-pool.cpp`, `pinned-pool.cpp`, `device-pool.hpp`, or `ggml-sycl.cpp` allocator wrapper definitions — these ARE the canonical allocator internals |
+| **migrate**   |  61   | Production caller sites that must be migrated to `unified_allocate` / `unified_cache_zone_alloc` in Wave 5 |
+| **allowlist** |   6   | Production sites temporarily kept as-is with explicit deletion criteria |
+| **test**      | 283   | Test files under `tests/` — permanently exempt per §8 |
+| **delete**    |   0   | No dead-code sites found |
+
+**Total grep hits (non-blank): 545**
+*(283 test + 49 internal + 61 migrate + 6 allowlist + 146 comment/declaration-only hits not counted as production sites)*
+
+All production caller sites (migrate + allowlist) = **67 sites** across 17 files.
+
+---
+
+## Column definitions
+
+| Column | Values |
+|--------|--------|
+| **Phase** | `model_load`, `context_init`, `graph_compute`, `kv_setup`, `staging`, `oneDNN`, `test`, `unknown` |
+| **Purpose** | Short text describing what the allocation is for |
+| **Current API** | The raw allocator function called |
+| **Desired Category** | Target `unified_allocate` / `unified_cache_*_alloc` call form, or "stays raw" if internal |
+| **Migrate or Allowlist** | `migrate` = Wave 5 target; `allowlist` = temporarily kept (deletion criteria given); `internal` = inside unified-cache itself |
+| **Owner Bead** | Bead owning the migration |
+
+*Note: Line numbers are 1-based as returned by grep.*
+
+---
+
+## Group 1 — `unified-cache.cpp` internals
+
+These are allocations INSIDE the canonical allocator. They are the raw-malloc gateway permitted by §3.
+
+| # | File | Line | Function | Phase | Purpose | Current API | Desired Category | Migrate or Allowlist | Owner Bead |
+|---|------|------|----------|-------|---------|-------------|------------------|----------------------|------------|
+| 1 | `unified-cache.cpp` | 1118 | copy_stage prealloc | model_load | Expert staging buffer | `ggml_sycl_malloc_host` | stays raw | internal | — |
+| 2 | `unified-cache.cpp` | 1146 | copy_stage slot prealloc | model_load | Per-slot expert staging | `ggml_sycl_malloc_host` | stays raw | internal | — |
+| 3 | `unified-cache.cpp` | 1744 | realloc weight entry | graph_compute | Weight cache realloc on eviction | `ggml_sycl_malloc_device_raw` | stays raw | internal | — |
+| 4 | `unified-cache.cpp` | 1864 | alloc weight entry | model_load | Weight cache device alloc | `ggml_sycl_malloc_device_raw` | stays raw | internal | — |
+| 5 | `unified-cache.cpp` | 2399 | slot alloc | model_load | Chunked weight slot device alloc | `ggml_sycl_malloc_device_raw` | stays raw | internal | — |
+| 6 | `unified-cache.cpp` | 5704 | `unified_alloc` device path | unknown | Primary device alloc path | `ggml_sycl_malloc_device_raw` | stays raw | internal | — |
+| 7 | `unified-cache.cpp` | 5809 | `unified_alloc` host weight fallback | model_load | Host-pinned weight fallback | `ggml_sycl_malloc_host` | stays raw | internal | — |
+| 8 | `unified-cache.cpp` | 7101 | oneDNN weights scratch (no arena) | context_init | oneDNN FP16 weight scratch | `sycl::malloc_device` | stays raw (arena-bypass path) | internal | — |
+| 9 | `unified-cache.cpp` | 7130 | oneDNN activations scratch (no arena) | context_init | oneDNN FP16 activations scratch | `sycl::malloc_device` | stays raw (arena-bypass path) | internal | — |
+| 10 | `unified-cache.cpp` | 7344 | persistent scratch (no arena) | context_init | Named persistent scratch (no arena) | `sycl::malloc_device` | stays raw | internal | — |
+| 11 | `unified-cache.cpp` | 7532 | partial rows buffer | graph_compute | Partial-row GEMM temp buffer | `ggml_sycl_malloc_device_raw` | stays raw | internal | — |
+| 12 | `unified-cache.cpp` | 7727–7730 | `unified_cache_raw_malloc_device` | unknown | Raw device alloc gateway | `sycl::malloc_device` | stays raw | internal | — |
+| 13 | `unified-cache.cpp` | 7737–7740 | `unified_cache_raw_malloc_host` (queue) | unknown | Raw host alloc gateway (queue) | `sycl::malloc_host` | stays raw | internal | — |
+| 14 | `unified-cache.cpp` | 7747–7750 | `unified_cache_raw_malloc_host` (ctx) | unknown | Raw host alloc gateway (ctx) | `sycl::malloc_host` | stays raw | internal | — |
+| 15 | `unified-cache.cpp` | 7757–7760 | `unified_cache_raw_malloc_shared` | unknown | Raw shared alloc gateway | `sycl::malloc_shared` | stays raw | internal | — |
+| 16 | `unified-cache.cpp` | 7901 | zone alloc (realloc) | unknown | VRAM zone realloc entry | `ggml_sycl_malloc_device_raw` | stays raw | internal | — |
+| 17 | `unified-cache.cpp` | 7954 | zone alloc | unknown | VRAM zone primary alloc | `ggml_sycl_malloc_device_raw` | stays raw | internal | — |
+| 18 | `unified-cache.cpp` | 8224 | `unified_cache_zone_alloc` device | unknown | Named zone device alloc entry | `ggml_sycl_malloc_device_raw` | stays raw | internal | — |
+| 19 | `unified-cache.cpp` | 8259 | `unified_cache_zone_alloc` host | unknown | Named zone host alloc entry | `ggml_sycl_malloc_host` | stays raw | internal | — |
+| 20 | `unified-cache.cpp` | 8377 | compute arena reservation | context_init | Contiguous VRAM arena block | `sycl::malloc_device` | stays raw | internal | — |
+| 21 | `unified-cache.cpp` | 9269 | VRAM arena single-chunk | context_init | Single-chunk VRAM arena | `sycl::malloc_device` | stays raw | internal | — |
+| 22 | `unified-cache.cpp` | 9441 | VRAM arena N-chunk | context_init | Multi-chunk VRAM arena fallback | `sycl::malloc_device` | stays raw | internal | — |
+
+---
+
+## Group 2 — `vram-pool.cpp` internals
+
+| # | File | Line | Function | Phase | Purpose | Current API | Desired Category | Migrate or Allowlist | Owner Bead |
+|---|------|------|----------|-------|---------|-------------|------------------|----------------------|------------|
+| 23 | `vram-pool.cpp` | 84 | vram pool chunk alloc | context_init | Backing chunk for VRAM pool | `ggml_sycl_malloc_device_raw` | stays raw | internal | — |
+
+---
+
+## Group 3 — `pinned-pool.cpp` internals
+
+| # | File | Line | Function | Phase | Purpose | Current API | Desired Category | Migrate or Allowlist | Owner Bead |
+|---|------|------|----------|-------|---------|-------------|------------------|----------------------|------------|
+| 24 | `pinned-pool.cpp` | 770 | pinned pool chunk alloc (host_task) | context_init | Pinned chunk via host_task | `ggml_sycl_malloc_host` | stays raw | internal | — |
+| 25 | `pinned-pool.cpp` | 794 | pinned pool chunk alloc (queue) | context_init | Pinned chunk via queue ctx | `ggml_sycl_malloc_host` | stays raw | internal | — |
+
+---
+
+## Group 4 — `device-pool.hpp` internals
+
+These are sub-allocator pool implementations that wrap `ggml_sycl_malloc_device_raw`.
+
+| # | File | Line | Function | Phase | Purpose | Current API | Desired Category | Migrate or Allowlist | Owner Bead |
+|---|------|------|----------|-------|---------|-------------|------------------|----------------------|------------|
+| 26 | `device-pool.hpp` | 182 | `layout_pool` chunk alloc | unknown | Layout-pool backing chunk | `ggml_sycl_malloc_device_raw` | stays raw | internal | — |
+| 27 | `device-pool.hpp` | 297 | `layout_pool` pre-grow | unknown | Layout-pool pre-grow backing | `ggml_sycl_malloc_device_raw` | stays raw | internal | — |
+
+---
+
+## Group 5 — `ggml-sycl.cpp` allocator wrapper definitions
+
+Lines 18558–18679 of `ggml-sycl.cpp` contain the implementations of the `ggml_sycl_malloc_device`, `ggml_sycl_malloc_device_raw`, `ggml_sycl_malloc_host`, and `ggml_sycl_malloc_shared` wrapper functions themselves. These are the canonical entry points in `common.hpp`/`ggml-sycl.cpp` — they are the wrapper implementations, not callers.
+
+| # | File | Line | Function | Phase | Purpose | Current API | Desired Category | Migrate or Allowlist | Owner Bead |
+|---|------|------|----------|-------|---------|-------------|------------------|----------------------|------------|
+| 28 | `ggml-sycl.cpp` | 18558 | `ggml_sycl_malloc_device_raw` def | — | Function definition | `ggml_sycl_malloc_device_raw` | stays raw | internal | — |
+| 29 | `ggml-sycl.cpp` | 18585/18589/18637 | `ggml_sycl_malloc_device` def | — | Function definition (re-entrancy guard) | `ggml_sycl_malloc_device_raw` | stays raw | internal | — |
+| 30 | `ggml-sycl.cpp` | 18643/18644 | `ggml_sycl_malloc_host` def (queue) | — | Function definition | (wrapper) | stays raw | internal | — |
+| 31 | `ggml-sycl.cpp` | 18661/18662 | `ggml_sycl_malloc_host` def (ctx) | — | Function definition | (wrapper) | stays raw | internal | — |
+| 32 | `ggml-sycl.cpp` | 18679/18680 | `ggml_sycl_malloc_shared` def | — | Function definition | (wrapper) | stays raw | internal | — |
+
+---
+
+## Group 6 — `common.hpp` — template/inline allocator wrappers and one production caller
+
+Lines 1753–1817 of `common.hpp` are template wrapper definitions (`ggml_sycl_malloc_device_t`, `ggml_sycl_malloc_device_tracked_bytes`, etc.) — these are part of the wrapper layer, not production callers. One line (3183) is a production caller inside a graph input staging helper.
+
+| # | File | Line | Function | Phase | Purpose | Current API | Desired Category | Migrate or Allowlist | Owner Bead |
+|---|------|------|----------|-------|---------|-------------|------------------|----------------------|------------|
+| 33 | `common.hpp` | 1713 | `ggml_sycl_malloc_device` decl | — | Forward declaration | — | — | internal | — |
+| 34 | `common.hpp` | 1716–1719 | `ggml_sycl_malloc_device_raw`, `_host`, `_shared` decls | — | Forward declarations | — | — | internal | — |
+| 35 | `common.hpp` | 1753–1815 | Template wrapper defs | — | Typed/tracked wrappers | `ggml_sycl_malloc_device` | stays raw | internal | — |
+| 36 | `common.hpp` | 3183 | graph input staging `dev_ptr` | graph_compute | Device staging buffer for graph INPUT tensors | `sycl::malloc_device` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+
+---
+
+## Group 7 — `dpct/helper.hpp`
+
+The `dpct/` directory contains Intel DPCT migration helpers. These call `sycl::malloc_device` / `sycl::malloc_shared` in low-level memory management utilities that are part of the DPCT runtime layer, not the SYCL backend itself.
+
+| # | File | Line | Function | Phase | Purpose | Current API | Desired Category | Migrate or Allowlist | Owner Bead |
+|---|------|------|----------|-------|---------|-------------|------------------|----------------------|------------|
+| 37 | `dpct/helper.hpp` | 1463 | `dpct_malloc` | unknown | DPCT pitched/device malloc utility | `sycl::malloc_device` | stays raw (DPCT layer) | allowlist | — |
+| 38 | `dpct/helper.hpp` | 3060 | `device_memory::allocate_device` (shared) | unknown | DPCT shared USM for device_memory | `sycl::malloc_shared` | stays raw (DPCT layer) | allowlist | — |
+| 39 | `dpct/helper.hpp` | 3066 | `device_memory::allocate_device` (device) | unknown | DPCT device USM for device_memory | `sycl::malloc_device` | stays raw (DPCT layer) | allowlist | — |
+
+*Deletion criteria: allowlisted permanently while DPCT helper layer is in use. If DPCT layer is removed, delete these. Tracked under §8 — DPCT is an ABI shim, not a backend allocator.*
+
+---
+
+## Group 8 — `common.cpp` — `ggml_sycl_host_malloc`
+
+`ggml_sycl_host_malloc` in `common.cpp` is called from the public `ggml_backend` tensor-allocation path (§8 of contract) and routes via `unified_cache_raw_malloc_host`. This is the ggml buffer-type boundary entry point.
+
+| # | File | Line | Function | Phase | Purpose | Current API | Desired Category | Migrate or Allowlist | Owner Bead |
+|---|------|------|----------|-------|---------|-------------|------------------|----------------------|------------|
+| 40 | `common.cpp` | ~715 | `ggml_sycl_host_malloc` TP path | model_load | Host pinned for TP shared memory | `unified_cache_raw_malloc_host` | stays raw (ggml buffer boundary §8) | allowlist | — |
+| 41 | `common.cpp` | ~737 | `ggml_sycl_host_malloc` non-TP path | model_load | Host pinned for weight tensors | `unified_cache_raw_malloc_host` | stays raw (ggml buffer boundary §8) | allowlist | — |
+
+*Deletion criteria: allowlisted permanently as the `ggml_backend` buffer API boundary entry point per §8 of contract.*
+
+---
+
+## Group 9 — `dense-scheduler.cpp`
+
+| # | File | Line | Function | Phase | Purpose | Current API | Desired Category | Migrate or Allowlist | Owner Bead |
+|---|------|------|----------|-------|---------|-------------|------------------|----------------------|------------|
+| 42 | `dense-scheduler.cpp` | 20 | scheduler ctor | context_init | VRAM slot 0 for dense scheduler | `ggml_sycl_malloc_device` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+| 43 | `dense-scheduler.cpp` | 21 | scheduler ctor | context_init | VRAM slot 1 for dense scheduler | `ggml_sycl_malloc_device` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+
+---
+
+## Group 10 — `mmvq.cpp`
+
+| # | File | Line | Function | Phase | Purpose | Current API | Desired Category | Migrate or Allowlist | Owner Bead |
+|---|------|------|----------|-------|---------|-------------|------------------|----------------------|------------|
+| 44 | `mmvq.cpp` | 1381 | `mmvq_q4_coalesce` | graph_compute | Temp coalescing buffer for Q4 MMVQ | `ggml_sycl_malloc_device_tracked_t` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 45 | `mmvq.cpp` | 1738 | MMVQ dispatch | graph_compute | Temp compute buffer for MMVQ | `ggml_sycl_malloc_device_tracked_t` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 46 | `mmvq.cpp` | 1967 | MMVQ dispatch variant | graph_compute | Temp compute buffer for MMVQ | `ggml_sycl_malloc_device_tracked_t` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 47 | `mmvq.cpp` | 2109 | MMVQ quant temp | graph_compute | Quant temp buffer | `ggml_sycl_malloc_device` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 48 | `mmvq.cpp` | 3246 | MMVQ compact buffer | graph_compute | Compact output buffer | `ggml_sycl_malloc_device` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 49 | `mmvq.cpp` | 3260 | MMVQ missing counter | graph_compute | Missing-row counter | `ggml_sycl_malloc_device_t` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 50 | `mmvq.cpp` | 4796 | MMVQ host staging | staging | Host staging for DMA slice | `ggml_sycl_malloc_host_tracked_bytes` | `unified_cache_host_zone_alloc(STAGING, ...)` | migrate | `llama.cpp-32dg8.6` |
+
+---
+
+## Group 11 — `mmq.cpp`
+
+| # | File | Line | Function | Phase | Purpose | Current API | Desired Category | Migrate or Allowlist | Owner Bead |
+|---|------|------|----------|-------|---------|-------------|------------------|----------------------|------------|
+| 51 | `mmq.cpp` | 236 | `mmq_get_work_counter` | context_init | Persistent work counter per device | `ggml_sycl_malloc_device_tracked_t` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+| 52 | `mmq.cpp` | 6728 | MMQ host staging | staging | Host staging for DMA slice | `ggml_sycl_malloc_host_tracked_bytes` | `unified_cache_host_zone_alloc(STAGING, ...)` | migrate | `llama.cpp-32dg8.6` |
+
+---
+
+## Group 12 — `mmq_xmx.cpp`
+
+These are in a test function `xmx_test_kernel` called at startup to verify XMX correctness — but the function is in `mmq_xmx.cpp` (production code), not under `tests/`.
+
+| # | File | Line | Function | Phase | Purpose | Current API | Desired Category | Migrate or Allowlist | Owner Bead |
+|---|------|------|----------|-------|---------|-------------|------------------|----------------------|------------|
+| 53 | `mmq_xmx.cpp` | 4130 | `xmx_test_kernel` | context_init | XMX test matrix A | `ggml_sycl_malloc_device_tracked_t` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 54 | `mmq_xmx.cpp` | 4131 | `xmx_test_kernel` | context_init | XMX test matrix B | `ggml_sycl_malloc_device_tracked_t` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 55 | `mmq_xmx.cpp` | 4132 | `xmx_test_kernel` | context_init | XMX test matrix C | `ggml_sycl_malloc_device_tracked_t` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+
+---
+
+## Group 13 — `convert.cpp`
+
+| # | File | Line | Function | Phase | Purpose | Current API | Desired Category | Migrate or Allowlist | Owner Bead |
+|---|------|------|----------|-------|---------|-------------|------------------|----------------------|------------|
+| 56 | `convert.cpp` | 564 | convert dispatch | graph_compute | Temp convert buffer | `ggml_sycl_malloc_device_tracked_t` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 57 | `convert.cpp` | 646 | convert dispatch variant 2 | graph_compute | Temp convert buffer | `ggml_sycl_malloc_device_tracked_t` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 58 | `convert.cpp` | 726 | convert dispatch variant 3 | graph_compute | Temp convert buffer | `ggml_sycl_malloc_device_tracked_t` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 59 | `convert.cpp` | 830 | convert dispatch variant 4 | graph_compute | Temp convert buffer | `ggml_sycl_malloc_device_tracked_t` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+
+---
+
+## Group 14 — `dmmv.cpp`
+
+| # | File | Line | Function | Phase | Purpose | Current API | Desired Category | Migrate or Allowlist | Owner Bead |
+|---|------|------|----------|-------|---------|-------------|------------------|----------------------|------------|
+| 60 | `dmmv.cpp` | 2747 | dmmv debug buffer | graph_compute | Debug float buffer (debug build only) | `ggml_sycl_malloc_device_tracked_t` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 61 | `dmmv.cpp` | 3417 | dmmv host staging | staging | Host staging for DMA slice | `ggml_sycl_malloc_host_tracked_bytes` | `unified_cache_host_zone_alloc(STAGING, ...)` | migrate | `llama.cpp-32dg8.6` |
+
+---
+
+## Group 15 — `getrows.cpp`
+
+| # | File | Line | Function | Phase | Purpose | Current API | Desired Category | Migrate or Allowlist | Owner Bead |
+|---|------|------|----------|-------|---------|-------------|------------------|----------------------|------------|
+| 62 | `getrows.cpp` | 1577 | get_rows host staging | staging | Host staging for DMA slice | `ggml_sycl_malloc_host_tracked_bytes` | `unified_cache_host_zone_alloc(STAGING, ...)` | migrate | `llama.cpp-32dg8.6` |
+
+---
+
+## Group 16 — `cpy.cpp`
+
+| # | File | Line | Function | Phase | Purpose | Current API | Desired Category | Migrate or Allowlist | Owner Bead |
+|---|------|------|----------|-------|---------|-------------|------------------|----------------------|------------|
+| 63 | `cpy.cpp` | 740 | cpy staging | staging | Shared USM staging buffer for CPY | `ggml_sycl_malloc_shared` | `unified_allocate(..., STAGING zone)` | migrate | `llama.cpp-32dg8.6` |
+
+---
+
+## Group 17 — `kv-offload.cpp`
+
+| # | File | Line | Function | Phase | Purpose | Current API | Desired Category | Migrate or Allowlist | Owner Bead |
+|---|------|------|----------|-------|---------|-------------|------------------|----------------------|------------|
+| 64 | `kv-offload.cpp` | 443 | KV host block alloc | kv_setup | Host-pinned KV offload block | `ggml_sycl_malloc_host_tracked_bytes` | `unified_cache_host_zone_alloc(KV, ...)` | migrate | `llama.cpp-32dg8.5` |
+
+---
+
+## Group 18 — `ccl-comm.cpp`
+
+| # | File | Line | Function | Phase | Purpose | Current API | Desired Category | Migrate or Allowlist | Owner Bead |
+|---|------|------|----------|-------|---------|-------------|------------------|----------------------|------------|
+| 65 | `ccl-comm.cpp` | 332 | allreduce staging | graph_compute | Shared USM staging for CCL allreduce | `ggml_sycl_malloc_shared_t` | `unified_allocate(..., STAGING zone)` | migrate | `llama.cpp-32dg8.11` |
+
+---
+
+## Group 19 — `fused-moe-esimd.hpp`
+
+| # | File | Line | Function | Phase | Purpose | Current API | Desired Category | Migrate or Allowlist | Owner Bead |
+|---|------|------|----------|-------|---------|-------------|------------------|----------------------|------------|
+| 66 | `fused-moe-esimd.hpp` | 770 | fused MoE ESIMD persistent Q8 | graph_compute | Persistent Q8 buffer for fused MoE ESIMD | `ggml_sycl_malloc_device` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+| 67 | `fused-moe-esimd.hpp` | 950 | fused MoE ESIMD Q8 (fused path) | graph_compute | Q8 buffer for fused path | `ggml_sycl_malloc_device` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+
+---
+
+## Group 20 — `gpu-sampler.hpp`
+
+| # | File | Line | Function | Phase | Purpose | Current API | Desired Category | Migrate or Allowlist | Owner Bead |
+|---|------|------|----------|-------|---------|-------------|------------------|----------------------|------------|
+| 68 | `gpu-sampler.hpp` | 19 | gpu sampler alloc | graph_compute | GPU sampler typed allocation | `ggml_sycl_malloc_device_tracked_t` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+
+---
+
+## Group 21 — `cont-batching.hpp`
+
+| # | File | Line | Function | Phase | Purpose | Current API | Desired Category | Migrate or Allowlist | Owner Bead |
+|---|------|------|----------|-------|---------|-------------|------------------|----------------------|------------|
+| 69 | `cont-batching.hpp` | 21 | continuous batching alloc | graph_compute | Per-batch typed device allocation | `ggml_sycl_malloc_device_t` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+
+---
+
+## Group 22 — `fattn.cpp`
+
+| # | File | Line | Function | Phase | Purpose | Current API | Desired Category | Migrate or Allowlist | Owner Bead |
+|---|------|------|----------|-------|---------|-------------|------------------|----------------------|------------|
+| 70 | `fattn.cpp` | 171 | block table alloc (seq_id_buffer pool) | graph_compute | Flash-attn block table per stream | `ggml_sycl_malloc_device_t` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+| 71 | `fattn.cpp` | 301 | fattn weight staging slot | graph_compute | Per-weight staging slot for fattn | `ggml_sycl_malloc_device` | `unified_allocate(..., STAGING zone)` | migrate | `llama.cpp-32dg8.6` |
+| 72 | `fattn.cpp` | 455 | `g_v2_auto.block_table` | context_init | Pre-alloc block table for V2 auto | `ggml_sycl_malloc_device_t` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+| 73 | `fattn.cpp` | 466 | `g_v2_auto.seq_lens` | context_init | Pre-alloc seq lens for V2 auto | `ggml_sycl_malloc_device_t` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+| 74 | `fattn.cpp` | 476 | `g_v2_auto.temp_buf` | context_init | Pre-alloc temp buf for V2 auto | `ggml_sycl_malloc_device_t` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 75 | `fattn.cpp` | 1660 | `g_v2_auto.block_table` (lazy) | graph_compute | Lazy block table realloc | `ggml_sycl_malloc_device_t` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+| 76 | `fattn.cpp` | 1667 | `g_v2_auto.seq_lens` (lazy) | graph_compute | Lazy seq lens realloc | `ggml_sycl_malloc_device_t` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+| 77 | `fattn.cpp` | 1708 | `g_v2_auto.temp_buf` (lazy) | graph_compute | Lazy temp buf realloc | `ggml_sycl_malloc_device_t` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+
+---
+
+## Group 23 — `fattn-onednn.cpp`
+
+| # | File | Line | Function | Phase | Purpose | Current API | Desired Category | Migrate or Allowlist | Owner Bead |
+|---|------|------|----------|-------|---------|-------------|------------------|----------------------|------------|
+| 78 | `fattn-onednn.cpp` | 421 | oneDNN SDPA scale USM | oneDNN | USM scalar for oneDNN SDPA scale | `sycl::malloc_host` | `unified_cache_host_zone_alloc(ONEDNN, ...)` | migrate | `llama.cpp-32dg8.6` |
+
+---
+
+## Group 24 — `persistent-tg-kernel.cpp`
+
+| # | File | Line | Function | Phase | Purpose | Current API | Desired Category | Migrate or Allowlist | Owner Bead |
+|---|------|------|----------|-------|---------|-------------|------------------|----------------------|------------|
+| 79 | `persistent-tg-kernel.cpp` | 304 | PTG layer weights | context_init | Device copy of per-layer weights for persistent TG | `ggml_sycl_malloc_device` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+
+---
+
+## Group 25 — `unified-kernel.cpp`
+
+| # | File | Line | Function | Phase | Purpose | Current API | Desired Category | Migrate or Allowlist | Owner Bead |
+|---|------|------|----------|-------|---------|-------------|------------------|----------------------|------------|
+| 80 | `unified-kernel.cpp` | 9255 | graph bench dummy buffer | context_init | Dummy device buffer for graph bench warmup | `ggml_sycl_malloc_device` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+
+---
+
+## Group 26 — `set_rows.cpp`
+
+| # | File | Line | Function | Phase | Purpose | Current API | Desired Category | Migrate or Allowlist | Owner Bead |
+|---|------|------|----------|-------|---------|-------------|------------------|----------------------|------------|
+| 81 | `set_rows.cpp` | 323 | set_rows debug buffer | graph_compute | Debug host buffer (debug build only) | `ggml_sycl_malloc_host_tracked_bytes` | `unified_cache_host_zone_alloc(SCRATCH, ...)` | migrate | `llama.cpp-32dg8.6` |
+
+---
+
+## Group 27 — `ggml-sycl.cpp` production callers
+
+These are production call sites in `ggml-sycl.cpp` that are NOT part of the allocator wrapper definitions (Groups 4–5 above).
+
+| # | File | Line | Function | Phase | Purpose | Current API | Desired Category | Migrate or Allowlist | Owner Bead |
+|---|------|------|----------|-------|---------|-------------|------------------|----------------------|------------|
+| 82 | `ggml-sycl.cpp` | 9109 | `ggml_backend_sycl_probe_buffer_type_alloc_buffer` | model_load | Probe buffer for ggml_sycl_init (raw needed: unified_cache not yet initialized) | `ggml_sycl_malloc_device_raw` | stays raw (pre-init) | allowlist | — |
+| 83 | `ggml-sycl.cpp` | 11489 | XMX tiled fill | graph_compute | Temp device buffer for XMX tiled fill | `ggml_sycl_malloc_device_tracked_t` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 84 | `ggml-sycl.cpp` | 14906 | KV tier migration fallback | kv_setup | Host-pinned fallback when device KV layer fails | `ggml_sycl_malloc_host` | `unified_cache_host_zone_alloc(KV, ...)` | migrate | `llama.cpp-32dg8.5` |
+| 85 | `ggml-sycl.cpp` | 17367 | speculative verify logits | graph_compute | GPU logits buffer for speculative verification | `ggml_sycl_malloc_device_tracked_t` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 86 | `ggml-sycl.cpp` | 17580 | multi-seq batch indices | graph_compute | Device batch indices for multi-seq sampler | `ggml_sycl_malloc_device_tracked_t` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 87 | `ggml-sycl.cpp` | 17583 | multi-seq seq IDs | graph_compute | Device seq IDs for multi-seq sampler | `ggml_sycl_malloc_device_tracked_t` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 88 | `ggml-sycl.cpp` | 18943 | buffer pool host fallback | context_init | Host-pinned buffer from scratch pool (non-cached) | `ggml_sycl_malloc_host` | `unified_cache_host_zone_alloc(SCRATCH, ...)` | migrate | `llama.cpp-32dg8.6` |
+| 89 | `ggml-sycl.cpp` | 22743 | TP col src1 float | graph_compute | TP column float buffer | `ggml_sycl_malloc_device_tracked_bytes` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+| 90 | `ggml-sycl.cpp` | 22745 | TP col src1 Q8 | graph_compute | TP column Q8 buffer | `ggml_sycl_malloc_device_tracked_bytes` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+| 91 | `ggml-sycl.cpp` | 22747 | TP col output | graph_compute | TP column output buffer | `ggml_sycl_malloc_device_tracked_bytes` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+| 92 | `ggml-sycl.cpp` | 32845 | MoE tokens_sorted (non-graph path) | graph_compute | Sorted token buffer for MoE XMX dispatch | `ggml_sycl_malloc_device_tracked_bytes` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 93 | `ggml-sycl.cpp` | 32849 | MoE token_map (non-graph path) | graph_compute | Token mapping table for MoE | `ggml_sycl_malloc_device_tracked_bytes` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 94 | `ggml-sycl.cpp` | 32858 | MoE sorted_token_ids (non-graph path) | graph_compute | Sorted token IDs for MXFP4 MoE | `ggml_sycl_malloc_device_tracked_bytes` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 95 | `ggml-sycl.cpp` | 32862 | MoE expert_counts (non-graph path) | graph_compute | Expert counts buffer for MoE | `ggml_sycl_malloc_device_tracked_bytes` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 96 | `ggml-sycl.cpp` | 32866 | MoE expert_offsets (non-graph path) | graph_compute | Expert offsets buffer for MoE | `ggml_sycl_malloc_device_tracked_bytes` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 97 | `ggml-sycl.cpp` | 32869 | MoE sorted_output (non-graph path) | graph_compute | Sorted output buffer for MoE | `ggml_sycl_malloc_device_tracked_bytes` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 98 | `ggml-sycl.cpp` | 32918 | MoE expert_write_pos (non-graph path) | graph_compute | Expert write-position counters | `ggml_sycl_malloc_device_tracked_bytes` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 99 | `ggml-sycl.cpp` | 32956 | MoE expert_scales (non-graph path) | graph_compute | Expert Q8_0 scale buffer | `ggml_sycl_malloc_device_tracked_bytes` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 100 | `ggml-sycl.cpp` | 33018 | MoE q_tokens (non-graph path) | graph_compute | Q8 tokens buffer for MoE | `ggml_sycl_malloc_device_tracked_bytes` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 101 | `ggml-sycl.cpp` | 33022 | MoE token_scales (non-graph path) | graph_compute | Token scale buffer for MoE | `ggml_sycl_malloc_device_tracked_bytes` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 102 | `ggml-sycl.cpp` | 33052 | MoE tokens_f16_input (non-graph path) | graph_compute | FP16 input token buffer for MoE | `ggml_sycl_malloc_device_tracked_bytes` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 103 | `ggml-sycl.cpp` | 43744 | MoE graph tokens_f16 | context_init | Pre-alloc tokens_f16 for MoE graph | `ggml_sycl_malloc_device_t` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+| 104 | `ggml-sycl.cpp` | 43746 | MoE graph tokens_sorted | context_init | Pre-alloc tokens_sorted for MoE graph | `ggml_sycl_malloc_device_t` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+| 105 | `ggml-sycl.cpp` | 43747 | MoE graph token_map | context_init | Pre-alloc token_map for MoE graph | `ggml_sycl_malloc_device_t` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+| 106 | `ggml-sycl.cpp` | 43748 | MoE graph expert_counts | context_init | Pre-alloc expert_counts for MoE graph | `ggml_sycl_malloc_device_t` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+| 107 | `ggml-sycl.cpp` | 43749 | MoE graph expert_offsets | context_init | Pre-alloc expert_offsets for MoE graph | `ggml_sycl_malloc_device_t` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+| 108 | `ggml-sycl.cpp` | 43750 | MoE graph expert_write_pos | context_init | Pre-alloc expert_write_pos for MoE graph | `ggml_sycl_malloc_device_t` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+| 109 | `ggml-sycl.cpp` | 43752 | MoE graph sorted_output | context_init | Pre-alloc sorted_output for MoE graph | `ggml_sycl_malloc_device_t` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+| 110 | `ggml-sycl.cpp` | 43753 | MoE graph q_tokens | context_init | Pre-alloc Q8 token buffer for MoE graph | `ggml_sycl_malloc_device_t` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+| 111 | `ggml-sycl.cpp` | 43755 | MoE graph token_scales | context_init | Pre-alloc token scales for MoE graph | `ggml_sycl_malloc_device_t` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+| 112 | `ggml-sycl.cpp` | 43757 | MoE graph expert_scales | context_init | Pre-alloc expert scales for MoE graph | `ggml_sycl_malloc_device_t` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+| 113 | `ggml-sycl.cpp` | 43759 | MoE graph sorted_token_ids | context_init | Pre-alloc sorted_token_ids for MoE graph | `ggml_sycl_malloc_device_t` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+| 114 | `ggml-sycl.cpp` | 46575 | PTG RMS debug buffer | graph_compute | Debug shared USM for PTG RMS kernel | `ggml_sycl_malloc_shared` | (debug only, remove with debug code) | migrate | `llama.cpp-32dg8.6` |
+| 115 | `ggml-sycl.cpp` | 46576 | PTG RMS flag | graph_compute | Debug flag for PTG RMS kernel | `ggml_sycl_malloc_shared` | (debug only, remove with debug code) | migrate | `llama.cpp-32dg8.6` |
+| 116 | `ggml-sycl.cpp` | 46876 | PTG matmul debug buffer | graph_compute | Debug shared USM for PTG matmul kernel | `ggml_sycl_malloc_shared` | (debug only, remove with debug code) | migrate | `llama.cpp-32dg8.6` |
+| 117 | `ggml-sycl.cpp` | 46877 | PTG matmul flag | graph_compute | Debug flag for PTG matmul kernel | `ggml_sycl_malloc_shared` | (debug only, remove with debug code) | migrate | `llama.cpp-32dg8.6` |
+| 118 | `ggml-sycl.cpp` | 47708 | PTG attention debug buffer | graph_compute | Debug shared USM for PTG attention kernel | `ggml_sycl_malloc_shared` | (debug only, remove with debug code) | migrate | `llama.cpp-32dg8.6` |
+| 119 | `ggml-sycl.cpp` | 47889 | PTG set_rows debug buffer | graph_compute | Debug shared USM for PTG set_rows kernel | `ggml_sycl_malloc_shared` | (debug only, remove with debug code) | migrate | `llama.cpp-32dg8.6` |
+| 120 | `ggml-sycl.cpp` | 48104 | PTG hash debug buffer | graph_compute | Debug shared USM for PTG hash check | `ggml_sycl_malloc_shared` | (debug only, remove with debug code) | migrate | `llama.cpp-32dg8.6` |
+
+---
+
+## Group 28 — Test files (`tests/`)
+
+All allocations in `tests/` are permanently exempt per §8 of the contract. They include 10 test files:
+
+| Test file | Approx. sites | Note |
+|-----------|--------------|-------|
+| `tests/test-graph-replay.cpp` | 12 | Graph replay micro-tests |
+| `tests/test-unified-kernel.cpp` | 15 | Unified kernel tests |
+| `tests/test-esimd-prefetch.cpp` | 24 | ESIMD prefetch perf tests |
+| `tests/test-moe-mxfp4-dp4a.cpp` | 3 | MoE MXFP4 test |
+| `tests/test-xmx-optimization.cpp` | 18 | XMX optimization tests |
+| `tests/test-xmx-esimd-q4-gemm.cpp` | 12 | XMX ESIMD q4 gemm tests |
+| `tests/test-graph-replay-chain.cpp` | 20 | Graph replay chain tests |
+| `tests/bench-dnnl-ops.cpp` | 14 | oneDNN bench |
+| `tests/test-xmx-compute.cpp` | 9 | XMX compute tests |
+| `tests/test-unified-kernel-ops.cpp` | 12 | Unified kernel ops tests |
+| `tests/test-unified-cache-fast-path.cpp` | 1 | Unified cache fast-path test |
+| `tests/test-xmx-esimd-basic.cpp` | 12 | XMX ESIMD basic tests |
+| `tests/test-xmx-dpas-basic.cpp` | 18 | XMX DPAS basic tests |
+| `tests/test-esimd-vectorized-dequant.cpp` | 14 | ESIMD vectorized dequant tests |
+| `tests/test-mem-handle-eviction.cpp` | 3 | mem_handle eviction tests |
+| `tests/test-unified-kernel-persistent.cpp` | ~110 | Persistent kernel tests |
+
+Total test sites: **~283** (allowlisted permanently, §8).
+
+---
+
+## Allowlist summary with deletion criteria
+
+| # | File | Lines | Deletion criteria |
+|---|------|-------|-------------------|
+| 37 | `dpct/helper.hpp` | 1463, 3060, 3066 | Delete if/when DPCT helper layer is removed from the backend |
+| 40–41 | `common.cpp` | ~715, ~737 | Allowlisted permanently — `ggml_backend` buffer API boundary (§8), cannot be unified_allocate |
+| 82 | `ggml-sycl.cpp` | 9109 | Allowlisted permanently — pre-init probe runs before `unified_cache` is constructed; `ggml_sycl_malloc_device_raw` is the correct call here |
+
+---
+
+## Notes and surprises
+
+1. **`ggml-sycl.cpp:9109` (probe buffer)** — this call is inside `ggml_backend_sycl_probe_buffer_type_alloc_buffer`, which runs during `ggml_sycl_init()` before the unified cache is initialized. Using `unified_allocate` here would deadlock on the static-init mutex. This is a legitimate permanent allowlist (see §9.1 precedent for "probe buffer is a raw site").
+
+2. **`common.cpp` `ggml_sycl_host_malloc`** — these two sites go through `unified_cache_raw_malloc_host`, which IS the canonical raw gateway. However they are reached via the ggml `buffer_type` API boundary (§8), so they are correctly allowlisted. They are NOT violations of the contract.
+
+3. **`dpct/helper.hpp`** — these three sites are inside the Intel DPCT compatibility shim, not the SYCL backend proper. They were flagged by the grep because they call `sycl::malloc_device`/`sycl::malloc_shared` directly, but DPCT is an ABI adaptation layer outside the contract's scope (similar to "non-SYCL backends" in §8.3).
+
+4. **`mmq_xmx.cpp` test function** — `xmx_test_kernel` is at line 4130 in production code (not under `tests/`). It performs a correctness self-test at startup. The three allocations should be migrated to SCRATCH zone or removed in favor of a test fixture.
+
+5. **PTG debug buffers** — seven `ggml_sycl_malloc_shared` calls in `ggml-sycl.cpp` lines 46575–48104 are inside `#ifdef`/debug-path persistent TG kernel debug code. These allocate `shared` USM (migrating memory) solely for debug output. They should be removed along with the surrounding debug code rather than migrated.
+
+6. **MoE graph pre-alloc (context_init)** — lines 43744–43759 in `ggml-sycl.cpp` are the MoE graph buffer pre-allocation function (`init_moe_graph_buffers` or equivalent). These 11 allocations are `context_init` phase and should map to `RUNTIME zone` in the unified cache.
+
+7. **Contract §9.1 count discrepancy** — the contract §9.1 cites "711 raw alloc patterns" using `grep -rE 'malloc_device|malloc_host|malloc_shared'`. The more restrictive grep used for this inventory (`sycl::malloc_(device|host|shared)|ggml_sycl_malloc_*|malloc_device_raw`) finds 545 total lines. The difference is because the broader grep matches comments, documentation strings, and variable names containing these substrings (e.g., `"sycl::malloc_host` appears in hundreds of comment lines in `ggml-sycl.cpp`). The production caller count (67 sites) is the authoritative figure for the migration backlog.
