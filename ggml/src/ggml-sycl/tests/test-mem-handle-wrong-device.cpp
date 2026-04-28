@@ -13,8 +13,9 @@
 //       resolve(1)==null (multi-GPU only).
 //   (6) [Multi-GPU only] WEIGHT handle wrong-device resolve returns null.
 //
-// Single-GPU systems: case (5) runs the CHUNK_LEASE tripwire but skips the wrong-device
-// resolve(1) check via inline NOTE.  Case (6) is skipped entirely.
+// No-GPU systems: device-backed cases skip before touching unified cache. Single-GPU
+// systems: case (5) runs the CHUNK_LEASE tripwire but skips the wrong-device resolve(1)
+// check via inline NOTE.  Case (6) is skipped entirely.
 //
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
@@ -198,6 +199,10 @@ static bool test_host_device_handle_resolves_from_any_device(int n_gpu_devices) 
 // =============================================================================
 static bool test_chunk_lease_tripwire_and_wrong_device_resolve(int n_gpu_devices) {
     TEST_BEGIN("chunk_lease_tripwire_and_wrong_device_resolve");
+
+    if (n_gpu_devices == 0) {
+        TEST_SKIP("no GPU devices available");
+    }
 
     // Allocate a small buffer through the global cache's pinned host pool.
     // unified_cache_host_zone_alloc → host_zone_alloc → host_arena_->allocate_segmented
