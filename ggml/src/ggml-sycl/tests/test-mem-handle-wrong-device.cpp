@@ -13,7 +13,8 @@
 //       resolve(1)==null (multi-GPU only).
 //   (6) [Multi-GPU only] WEIGHT handle wrong-device resolve returns null.
 //
-// Single-GPU systems: cases (5) and (6) are skipped with a clear message.
+// Single-GPU systems: case (5) runs the CHUNK_LEASE tripwire but skips the wrong-device
+// resolve(1) check via inline NOTE.  Case (6) is skipped entirely.
 //
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
