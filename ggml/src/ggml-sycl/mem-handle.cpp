@@ -68,10 +68,10 @@ mem_handle mem_handle::from_cache_id(const ggml_sycl_cache_id & id, int device) 
     return from_weight(key, device);
 }
 
-mem_handle mem_handle::from_direct(void * ptr, ggml_layout_mode layout, bool on_device, int device_id) {
+mem_handle mem_handle::from_direct(void * ptr, ggml_layout_mode layout, bool on_device, int device) {
     mem_handle h;
     h.kind_   = mem_handle_kind::DIRECT;
-    h.device_ = device_id;
+    h.device_ = device;
     h.key_    = {};
     h.gen_    = 0;
     h.cached_ = { ptr, layout, on_device };
@@ -79,7 +79,7 @@ mem_handle mem_handle::from_direct(void * ptr, ggml_layout_mode layout, bool on_
 }
 
 mem_handle mem_handle::from_arena_zone(int zone_id, size_t offset, size_t size,
-                                       int device_id, uint64_t generation) {
+                                       int device, uint64_t generation) {
     mem_handle h;
     // Map zone_id to the appropriate arena handle kind.
     // vram_zone_id: KV=0, WEIGHT=1, ONEDNN=2, RUNTIME=3, SCRATCH=4
@@ -92,7 +92,7 @@ mem_handle mem_handle::from_arena_zone(int zone_id, size_t offset, size_t size,
             h.kind_ = mem_handle_kind::ARENA_RUNTIME;
             break;
     }
-    h.device_    = device_id;
+    h.device_    = device;
     h.zone_id_   = zone_id;
     h.offset_    = offset;
     h.size_      = size;

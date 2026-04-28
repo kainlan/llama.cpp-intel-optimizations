@@ -316,10 +316,9 @@ forms above with the understanding that they are scheduled for replacement.
   `per_device_vram`, `layer_device`, `expert_device`, `kv_device` maps.
 - Each `placement_entry` has `target_device` set explicitly. No entry may have
   `target_device = -1` unless placement is `HOST`.
-- A `mem_handle` created by `from_direct(...)` currently sets `device_ = 0`
-  unconditionally — this is a known gap (`llama.cpp-32dg8.15.11`). Callers
-  using `from_direct` in multi-GPU contexts must pass the correct device until
-  the fix lands.
+- As of bead `llama.cpp-32dg8.15.11`, `from_direct` requires an explicit `device`
+  parameter (defaulting to `HOST_DEVICE = -1`); device-resident handles must pass
+  their owning device, host pointers pass `HOST_DEVICE`.
 - Cross-device transfers use explicit BCS memcpy (OOQ) between device-pinned
   buffers. Hardware P2P is not supported on current Arc hardware; all transfers
   stage via host.

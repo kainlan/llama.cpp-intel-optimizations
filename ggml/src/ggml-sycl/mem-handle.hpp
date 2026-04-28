@@ -110,24 +110,24 @@ public:
     static mem_handle from_cache_id(const ggml_sycl_cache_id & id, int device);
 
     // Sentinel for host pointers where device ownership is not applicable.
-    // Pass as device_id to from_direct() for host-pinned or CPU-resident pointers.
+    // Pass as device to from_direct() for host-pinned or CPU-resident pointers.
     static constexpr int HOST_DEVICE = -1;
 
     // Create a DIRECT handle from a raw pointer.
-    // device_id: owning SYCL device index, or HOST_DEVICE (-1) for host-pinned /
+    // device: owning SYCL device index, or HOST_DEVICE (-1) for host-pinned /
     //   CPU-resident pointers that are not owned by any specific GPU device.
-    // resolve() checks that the calling queue's device matches device_id (when
-    //   device_id >= 0) and returns null with a diagnostic on mismatch.
-    // resolve() always returns this pointer without checking the cache.
+    // resolve(device_id) checks that the caller's device matches device (when device >= 0)
+    //   and returns null with a diagnostic on mismatch.
+    // The zero-arg resolve() always returns this pointer without any device or cache check.
     static mem_handle from_direct(void * ptr, ggml_layout_mode layout, bool on_device,
-                                  int device_id = HOST_DEVICE);
+                                  int device = HOST_DEVICE);
 
     // Create an arena zone handle.
     // zone_id maps to vram_zone_id (KV=0, WEIGHT=1, ONEDNN=2, RUNTIME=3, SCRATCH=4).
     // The handle kind is derived from zone_id:
     //   RUNTIME -> ARENA_RUNTIME, SCRATCH -> ARENA_SCRATCH, ONEDNN -> ARENA_ONEDNN.
     static mem_handle from_arena_zone(int zone_id, size_t offset, size_t size,
-                                      int device_id, uint64_t generation);
+                                      int device, uint64_t generation);
 
     // llama.cpp-dyhdl: create a handle from a raw pointer whose arena-chunk
     // ownership should be reference-counted for the handle's lifetime.
@@ -204,7 +204,7 @@ private:
     void release_lease() noexcept;
 
     mem_handle_kind    kind_   = mem_handle_kind::DIRECT;
-    int                device_ = 0;
+    int                device_ = HOST_DEVICE;
     unified_cache_key  key_    = {};
 
     // Arena-specific fields (only used for ARENA_* kinds).

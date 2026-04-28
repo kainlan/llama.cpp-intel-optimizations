@@ -8,8 +8,9 @@
 //   (2) resolve(device_id) on same-device DIRECT handle returns the pointer.
 //   (3) resolve(device_id) on wrong-device DIRECT handle returns null (explicit fail).
 //   (4) HOST_DEVICE handles resolve successfully from any device (host-agnostic).
-//   (5) [Multi-GPU only] Real CHUNK_LEASE handle via unified_cache_host_zone_alloc(SCRATCH)
-//       into global cache's pinned pool; kind() == CHUNK_LEASE tripwire; wrong-device null.
+//   (5) Real CHUNK_LEASE handle via unified_cache_host_zone_alloc(SCRATCH) into global
+//       cache's pinned pool; kind()==CHUNK_LEASE tripwire (all systems); wrong-device
+//       resolve(1)==null (multi-GPU only).
 //   (6) [Multi-GPU only] WEIGHT handle wrong-device resolve returns null.
 //
 // Single-GPU systems: cases (5) and (6) are skipped with a clear message.
@@ -137,9 +138,13 @@ static bool test_wrong_device_direct_resolve_fails(int n_gpu_devices) {
     ggml_sycl::mem_handle h = ggml_sycl::mem_handle::from_direct(ptr, GGML_LAYOUT_AOS, true, 0);
     TEST_ASSERT(h.device() == 0, "handle device must be 0");
 
+    // Same-device resolve must pass before testing wrong-device failure
+    ggml_sycl::resolved_ptr r0 = h.resolve(0);
+    TEST_ASSERT(r0.ptr == ptr, "same-device DIRECT resolve must return the ptr");
+
     // Resolve from device 1 — must fail (return null)
-    ggml_sycl::resolved_ptr r = h.resolve(1);
-    TEST_ASSERT(r.ptr == nullptr, "wrong-device DIRECT resolve must return null ptr");
+    ggml_sycl::resolved_ptr r1 = h.resolve(1);
+    TEST_ASSERT(r1.ptr == nullptr, "wrong-device DIRECT resolve must return null ptr");
 
     TEST_PASS();
     return true;
@@ -190,8 +195,8 @@ static bool test_host_device_handle_resolves_from_any_device(int n_gpu_devices) 
 // any future DIRECT fallthrough is caught immediately rather than silently
 // re-testing the wrong-device policy on the same path as test 3.
 // =============================================================================
-static bool test_wrong_device_chunk_lease_fails(int n_gpu_devices) {
-    TEST_BEGIN("wrong_device_chunk_lease_resolve_fails");
+static bool test_chunk_lease_tripwire_and_wrong_device_resolve(int n_gpu_devices) {
+    TEST_BEGIN("chunk_lease_tripwire_and_wrong_device_resolve");
 
     // Allocate a small buffer through the global cache's pinned host pool.
     // unified_cache_host_zone_alloc → host_zone_alloc → host_arena_->allocate_segmented
@@ -322,7 +327,7 @@ int main(int argc, char ** argv) {
     all_passed &= test_same_device_direct_resolve_passes();
     all_passed &= test_wrong_device_direct_resolve_fails(n_gpu_devices);
     all_passed &= test_host_device_handle_resolves_from_any_device(n_gpu_devices);
-    all_passed &= test_wrong_device_chunk_lease_fails(n_gpu_devices);
+    all_passed &= test_chunk_lease_tripwire_and_wrong_device_resolve(n_gpu_devices);
     all_passed &= test_wrong_device_weight_handle_fails(n_gpu_devices);
 
     fprintf(stderr, "-------------------------------------------------\n");
