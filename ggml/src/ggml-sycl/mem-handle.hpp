@@ -6,9 +6,10 @@
 
 #pragma once
 
-#include <cstdint>
-
 #include "unified-cache.hpp"  // unified_cache_key, ggml_layout_mode
+
+#include <cstdint>
+#include <vector>
 
 namespace ggml_sycl {
 
@@ -49,16 +50,16 @@ struct resolved_ptr {
 //         Used for scratch/KV/staging buffers that are never moved by the cache.
 
 enum class mem_handle_kind : uint8_t {
-    WEIGHT         = 0,  // Cache-managed, generation-checked
-    DIRECT         = 1,  // Raw pointer, never stale
-    ARENA_RUNTIME  = 2,  // Handle into RUNTIME zone (ggml compute buffers)
-    ARENA_SCRATCH  = 3,  // Handle into SCRATCH zone (pool_leg per-op scratch)
-    ARENA_ONEDNN   = 4,  // Handle into ONEDNN zone (oneDNN scratchpad)
-    CHUNK_LEASE    = 5,  // Raw pointer + arena chunk lease (llama.cpp-dyhdl).
-                         // Protects pointers derived from host or VRAM arena
-                         // chunks (e.g. tensor->data from host_arena) against
-                         // sycl::free of the underlying chunk while this
-                         // handle is alive.
+    WEIGHT        = 0,  // Cache-managed, generation-checked
+    DIRECT        = 1,  // Raw pointer, never stale
+    ARENA_RUNTIME = 2,  // Handle into RUNTIME zone (ggml compute buffers)
+    ARENA_SCRATCH = 3,  // Handle into SCRATCH zone (pool_leg per-op scratch)
+    ARENA_ONEDNN  = 4,  // Handle into ONEDNN zone (oneDNN scratchpad)
+    CHUNK_LEASE   = 5,  // Raw pointer + arena chunk lease (llama.cpp-dyhdl).
+                        // Protects pointers derived from host or VRAM arena
+                        // chunks (e.g. tensor->data from host_arena) against
+                        // sycl::free of the underlying chunk while this
+                        // handle is alive.
 };
 
 // Forward declaration: the backing cache_entry type whose in_use_count we
@@ -66,7 +67,7 @@ enum class mem_handle_kind : uint8_t {
 struct unified_cache_entry;
 
 class mem_handle {
-public:
+  public:
     // Create an invalid handle.
     mem_handle() = default;
 
@@ -119,15 +120,13 @@ public:
     // resolve(device_id) checks that the caller's device matches device (when device >= 0)
     //   and returns null with a diagnostic on mismatch.
     // The zero-arg resolve() always returns this pointer without any device or cache check.
-    static mem_handle from_direct(void * ptr, ggml_layout_mode layout, bool on_device,
-                                  int device = HOST_DEVICE);
+    static mem_handle from_direct(void * ptr, ggml_layout_mode layout, bool on_device, int device = HOST_DEVICE);
 
     // Create an arena zone handle.
     // zone_id maps to vram_zone_id (KV=0, WEIGHT=1, ONEDNN=2, RUNTIME=3, SCRATCH=4).
     // The handle kind is derived from zone_id:
     //   RUNTIME -> ARENA_RUNTIME, SCRATCH -> ARENA_SCRATCH, ONEDNN -> ARENA_ONEDNN.
-    static mem_handle from_arena_zone(int zone_id, size_t offset, size_t size,
-                                      int device, uint64_t generation);
+    static mem_handle from_arena_zone(int zone_id, size_t offset, size_t size, int device, uint64_t generation);
 
     // llama.cpp-dyhdl: create a handle from a raw pointer whose arena-chunk
     // ownership should be reference-counted for the handle's lifetime.
@@ -143,7 +142,8 @@ public:
     // Callers MUST keep the returned handle alive across any use of `ptr`
     // that survives into another thread / queue submit / future.  The
     // destructor releases the chunk lease exactly once.
-    static mem_handle from_chunk_ptr(void * ptr, int device,
+    static mem_handle from_chunk_ptr(void *           ptr,
+                                     int              device,
                                      ggml_layout_mode layout    = GGML_LAYOUT_AOS,
                                      bool             on_device = false);
 
@@ -180,18 +180,18 @@ public:
     bool is_weight() const { return kind_ == mem_handle_kind::WEIGHT; }
 
     // True if this is any arena-backed handle.
-    bool is_arena() const {
-        return kind_ >= mem_handle_kind::ARENA_RUNTIME &&
-               kind_ <= mem_handle_kind::ARENA_ONEDNN;
-    }
+    bool is_arena() const { return kind_ >= mem_handle_kind::ARENA_RUNTIME && kind_ <= mem_handle_kind::ARENA_ONEDNN; }
 
     // Arena-specific accessors (meaningful only for arena handles).
-    int      zone_id()    const { return zone_id_; }
-    size_t   offset()     const { return offset_; }
-    size_t   size()       const { return size_; }
+    int zone_id() const { return zone_id_; }
+
+    size_t offset() const { return offset_; }
+
+    size_t size() const { return size_; }
+
     uint64_t generation() const { return arena_gen_; }
 
-private:
+  private:
     // Slow path: re-query the unified cache for the current pointer.
     resolved_ptr resolve_slow() const;
 
@@ -203,15 +203,15 @@ private:
     // No-op if no lease is held.
     void release_lease() noexcept;
 
-    mem_handle_kind    kind_   = mem_handle_kind::DIRECT;
-    int                device_ = HOST_DEVICE;
-    unified_cache_key  key_    = {};
+    mem_handle_kind   kind_   = mem_handle_kind::DIRECT;
+    int               device_ = HOST_DEVICE;
+    unified_cache_key key_    = {};
 
     // Arena-specific fields (only used for ARENA_* kinds).
-    int      zone_id_   = 0;       // Which zone (maps to vram_zone_id)
-    size_t   offset_    = 0;       // Offset within the zone
-    size_t   size_      = 0;       // Allocation size
-    uint64_t arena_gen_ = 0;       // Arena generation (for invalidation)
+    int      zone_id_   = 0;  // Which zone (maps to vram_zone_id)
+    size_t   offset_    = 0;  // Offset within the zone
+    size_t   size_      = 0;  // Allocation size
+    uint64_t arena_gen_ = 0;  // Arena generation (for invalidation)
 
     // Mutable because resolve() is logically const (returns the current
     // pointer) but updates the cache as a side effect.
@@ -284,5 +284,11 @@ struct layer_weight_handles {
 // constructs mem_handle per weight.  Returns false if the layer has not
 // been prefetched.
 bool build_layer_handles(int device, int layer_id, layer_weight_handles & out);
+
+// Keep handle leases alive until submitted SYCL work completes.  This bridges
+// the gap between C++ handle lifetime and asynchronous queue lifetime: callers
+// may pass temporary handles to a queue operation, then release their local
+// copies while the submitted event still depends on the backing pointer.
+void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event event);
 
 }  // namespace ggml_sycl

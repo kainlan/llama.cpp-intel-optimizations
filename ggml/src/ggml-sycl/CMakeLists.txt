@@ -966,6 +966,31 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         TIMEOUT 120
     )
 
+    # Test: canonical event-returning mem_handle memory operations (llama.cpp-32dg8.15.13)
+    add_executable(test-mem-ops
+        tests/test-mem-ops.cpp
+    )
+    target_include_directories(test-mem-ops PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
+    )
+    target_compile_definitions(test-mem-ops PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-mem-ops PRIVATE ggml-base ggml ggml-sycl)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-mem-ops PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME mem-ops COMMAND test-mem-ops)
+    set_tests_properties(mem-ops PROPERTIES
+        LABELS "sycl;cache;mem-handle;memory-ops;tdd"
+        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        TIMEOUT 120
+    )
+
     # Test 18: UnifiedKernel Operation Tests (TDD)
     # Tests RMS norm and SiLU mul operations for persistent kernel
     add_executable(test-sycl-runtime-alloc

@@ -13,6 +13,7 @@
 #include "ggml-sycl.h"
 #include "kv-tier-manager.hpp"
 #include "mem-handle.hpp"
+#include "mem-ops.hpp"
 
 #include <algorithm>
 #include <array>
@@ -11076,25 +11077,11 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
 }
 
 void unified_cache::memset(const mem_handle & h, int value, size_t size, sycl::queue & stream) {
-    auto r = h.resolve();
-    GGML_ASSERT(r && "memset on unresolved handle");
-    if (r.on_device) {
-        stream.memset(r.ptr, value, size);
-    } else {
-        std::memset(r.ptr, value, size);
-    }
+    mem_fill(h, value, size, stream);
 }
 
 void unified_cache::memcpy(const mem_handle & dst, const mem_handle & src, size_t size, sycl::queue & stream) {
-    auto d = dst.resolve();
-    auto s = src.resolve();
-    GGML_ASSERT(d && s && "memcpy on unresolved handle");
-
-    if (d.on_device || s.on_device) {
-        stream.memcpy(d.ptr, s.ptr, size);  // SYCL handles D2D / H2D / D2H transparently
-    } else {
-        std::memcpy(d.ptr, s.ptr, size);    // H2H: avoid queue submission overhead
-    }
+    mem_copy(dst, src, size, stream);
 }
 
 }  // namespace ggml_sycl

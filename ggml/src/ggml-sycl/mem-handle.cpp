@@ -7,6 +7,9 @@
 #include "unified-cache.hpp"  // get_unified_cache_for_device, unified_cache
 
 #include <atomic>
+#include <exception>
+#include <thread>
+#include <utility>
 
 namespace ggml_sycl {
 
@@ -47,24 +50,24 @@ mem_handle mem_handle::from_weight_lease(const ggml_sycl_cache_id & key_id,
                                          bool                       on_device,
                                          unified_cache_entry *      entry) {
     mem_handle h;
-    h.kind_   = mem_handle_kind::WEIGHT;
-    h.device_ = device;
+    h.kind_          = mem_handle_kind::WEIGHT;
+    h.device_        = device;
     h.key_.type      = cache_entry_type::DENSE_WEIGHT;
     h.key_.id        = key_id;
     h.key_.layer_id  = -1;
     h.key_.expert_id = -1;
     h.gen_           = cache_generation();  // Fresh — no slow-path re-query
     h.cached_        = { ptr, layout, on_device };
-    h.leased_entry_  = entry;  // ownership of the refcount bump transferred
+    h.leased_entry_  = entry;               // ownership of the refcount bump transferred
     return h;
 }
 
 mem_handle mem_handle::from_cache_id(const ggml_sycl_cache_id & id, int device) {
     unified_cache_key key;
-    key.type       = cache_entry_type::DENSE_WEIGHT;
-    key.id         = id;
-    key.layer_id   = -1;
-    key.expert_id  = -1;
+    key.type      = cache_entry_type::DENSE_WEIGHT;
+    key.id        = id;
+    key.layer_id  = -1;
+    key.expert_id = -1;
     return from_weight(key, device);
 }
 
@@ -78,17 +81,23 @@ mem_handle mem_handle::from_direct(void * ptr, ggml_layout_mode layout, bool on_
     return h;
 }
 
-mem_handle mem_handle::from_arena_zone(int zone_id, size_t offset, size_t size,
-                                       int device, uint64_t generation) {
+mem_handle mem_handle::from_arena_zone(int zone_id, size_t offset, size_t size, int device, uint64_t generation) {
     mem_handle h;
     // Map zone_id to the appropriate arena handle kind.
     // vram_zone_id: KV=0, WEIGHT=1, ONEDNN=2, RUNTIME=3, SCRATCH=4
     switch (zone_id) {
-        case static_cast<int>(vram_zone_id::RUNTIME): h.kind_ = mem_handle_kind::ARENA_RUNTIME; break;
-        case static_cast<int>(vram_zone_id::SCRATCH): h.kind_ = mem_handle_kind::ARENA_SCRATCH; break;
-        case static_cast<int>(vram_zone_id::ONEDNN):  h.kind_ = mem_handle_kind::ARENA_ONEDNN;  break;
+        case static_cast<int>(vram_zone_id::RUNTIME):
+            h.kind_ = mem_handle_kind::ARENA_RUNTIME;
+            break;
+        case static_cast<int>(vram_zone_id::SCRATCH):
+            h.kind_ = mem_handle_kind::ARENA_SCRATCH;
+            break;
+        case static_cast<int>(vram_zone_id::ONEDNN):
+            h.kind_ = mem_handle_kind::ARENA_ONEDNN;
+            break;
         default:
-            GGML_LOG_WARN("[MEM-HANDLE] from_arena_zone: unexpected zone_id %d, defaulting to ARENA_RUNTIME\n", zone_id);
+            GGML_LOG_WARN("[MEM-HANDLE] from_arena_zone: unexpected zone_id %d, defaulting to ARENA_RUNTIME\n",
+                          zone_id);
             h.kind_ = mem_handle_kind::ARENA_RUNTIME;
             break;
     }
@@ -109,9 +118,9 @@ mem_handle mem_handle::from_arena_zone(int zone_id, size_t offset, size_t size,
 // weights, graph compute buffers, or other non-arena allocations.
 mem_handle mem_handle::from_chunk_ptr(void * ptr, int device, ggml_layout_mode layout, bool on_device) {
     mem_handle h;
-    h.device_  = device;
-    h.cached_  = { ptr, layout, on_device };
-    h.gen_     = 0;
+    h.device_ = device;
+    h.cached_ = { ptr, layout, on_device };
+    h.gen_    = 0;
 
     if (ptr == nullptr) {
         h.kind_ = mem_handle_kind::DIRECT;
@@ -161,8 +170,7 @@ resolved_ptr mem_handle::resolve() const {
     }
 
     // Arena handles: check arena generation, then resolve base + offset.
-    if (kind_ >= mem_handle_kind::ARENA_RUNTIME &&
-        kind_ <= mem_handle_kind::ARENA_ONEDNN) {
+    if (kind_ >= mem_handle_kind::ARENA_RUNTIME && kind_ <= mem_handle_kind::ARENA_ONEDNN) {
         // If we have a cached pointer and the generation hasn't changed,
         // return immediately.
         if (cached_.ptr != nullptr && gen_ == arena_gen_) {
@@ -232,15 +240,15 @@ resolved_ptr mem_handle::resolve_slow() const {
     auto result = cache->acquire_weight_lease(key_.id);
     if (!result) {
         // No cache hit; leave handle unpinned.
-        cached_        = {};
-        gen_           = cache_generation();
-        leased_entry_  = nullptr;
+        cached_       = {};
+        gen_          = cache_generation();
+        leased_entry_ = nullptr;
         return {};
     }
 
-    cached_        = { result.ptr, result.layout, result.on_device };
-    gen_           = cache_generation();
-    leased_entry_  = result.entry;  // may be nullptr for S1-PRELOAD direct entries
+    cached_       = { result.ptr, result.layout, result.on_device };
+    gen_          = cache_generation();
+    leased_entry_ = result.entry;  // may be nullptr for S1-PRELOAD direct entries
 
     // llama.cpp-dyhdl: also pin the underlying arena chunk.  Belt + suspenders
     // alongside the cache_entry lease: entry refcount prevents cache-layer
@@ -311,11 +319,11 @@ mem_handle::~mem_handle() {
 // all count mutations behind the pool's API and correctly handles the case
 // where the pool has been destroyed between the original acquisition and
 // the copy (returns a null handle, chunk_source_ gets zeroed below).
-static void bump_chunk_lease_for_copy(uint8_t       chunk_source,
-                                      int           chunk_device,
-                                      const void *  ptr,
-                                      uint64_t &    out_host_handle,
-                                      int32_t &     out_vram_idx) {
+static void bump_chunk_lease_for_copy(uint8_t      chunk_source,
+                                      int          chunk_device,
+                                      const void * ptr,
+                                      uint64_t &   out_host_handle,
+                                      int32_t &    out_vram_idx) {
     if (chunk_source == 0 || chunk_device < 0 || ptr == nullptr) {
         out_host_handle = UINT64_MAX;
         out_vram_idx    = -1;
@@ -360,8 +368,7 @@ mem_handle::mem_handle(const mem_handle & other) :
         leased_entry_->in_use_count.fetch_add(1);
     }
     // llama.cpp-dyhdl: independently acquire a chunk lease for the copy.
-    bump_chunk_lease_for_copy(chunk_source_, chunk_device_, cached_.ptr,
-                              host_chunk_handle_, vram_chunk_idx_);
+    bump_chunk_lease_for_copy(chunk_source_, chunk_device_, cached_.ptr, host_chunk_handle_, vram_chunk_idx_);
     if (chunk_source_ == 1 && host_chunk_handle_ == UINT64_MAX) {
         chunk_source_ = 0;
         chunk_device_ = -1;
@@ -420,8 +427,7 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
     if (leased_entry_) {
         leased_entry_->in_use_count.fetch_add(1);
     }
-    bump_chunk_lease_for_copy(chunk_source_, chunk_device_, cached_.ptr,
-                              host_chunk_handle_, vram_chunk_idx_);
+    bump_chunk_lease_for_copy(chunk_source_, chunk_device_, cached_.ptr, host_chunk_handle_, vram_chunk_idx_);
     if (chunk_source_ == 1 && host_chunk_handle_ == UINT64_MAX) {
         chunk_source_ = 0;
         chunk_device_ = -1;
@@ -439,20 +445,20 @@ mem_handle & mem_handle::operator=(mem_handle && other) noexcept {
     }
     release_lease();
 
-    kind_                = other.kind_;
-    device_              = other.device_;
-    key_                 = other.key_;
-    zone_id_             = other.zone_id_;
-    offset_              = other.offset_;
-    size_                = other.size_;
-    arena_gen_           = other.arena_gen_;
-    gen_                 = other.gen_;
-    cached_              = other.cached_;
-    leased_entry_        = other.leased_entry_;
-    chunk_source_        = other.chunk_source_;
-    host_chunk_handle_   = other.host_chunk_handle_;
-    vram_chunk_idx_      = other.vram_chunk_idx_;
-    chunk_device_        = other.chunk_device_;
+    kind_                    = other.kind_;
+    device_                  = other.device_;
+    key_                     = other.key_;
+    zone_id_                 = other.zone_id_;
+    offset_                  = other.offset_;
+    size_                    = other.size_;
+    arena_gen_               = other.arena_gen_;
+    gen_                     = other.gen_;
+    cached_                  = other.cached_;
+    leased_entry_            = other.leased_entry_;
+    chunk_source_            = other.chunk_source_;
+    host_chunk_handle_       = other.host_chunk_handle_;
+    vram_chunk_idx_          = other.vram_chunk_idx_;
+    chunk_device_            = other.chunk_device_;
     other.leased_entry_      = nullptr;
     other.chunk_source_      = 0;
     other.host_chunk_handle_ = UINT64_MAX;
@@ -511,8 +517,8 @@ bool layer_weight_handles::resolve_all(layer_weight_pointers & out) const {
     auto r_up_proj   = up_proj.resolve();
     auto r_down_proj = down_proj.resolve();
 
-    if (!r_attn_norm || !r_q_proj || !r_k_proj || !r_v_proj || !r_o_proj ||
-        !r_ffn_norm  || !r_gate_proj || !r_up_proj || !r_down_proj) {
+    if (!r_attn_norm || !r_q_proj || !r_k_proj || !r_v_proj || !r_o_proj || !r_ffn_norm || !r_gate_proj || !r_up_proj ||
+        !r_down_proj) {
         return false;
     }
 
@@ -527,8 +533,8 @@ bool layer_weight_handles::resolve_all(layer_weight_pointers & out) const {
     out.down_proj = r_down_proj.ptr;
 
     // Optional fused weights — resolve if handle is valid
-    auto r_qkv     = attn_qkv_proj.resolve();
-    auto r_gate_up = ffn_gate_up_proj.resolve();
+    auto r_qkv           = attn_qkv_proj.resolve();
+    auto r_gate_up       = ffn_gate_up_proj.resolve();
     out.attn_qkv_proj    = r_qkv ? r_qkv.ptr : nullptr;
     out.ffn_gate_up_proj = r_gate_up ? r_gate_up.ptr : nullptr;
 
@@ -573,6 +579,24 @@ bool build_layer_handles(int device, int layer_id, layer_weight_handles & out) {
 
     out = layer_weight_handles::from_weight_set(ws, device);
     return true;
+}
+
+void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event event) {
+    if (handles.empty()) {
+        return;
+    }
+
+    std::thread([handles = std::move(handles), event = std::move(event)]() mutable {
+        try {
+            event.wait_and_throw();
+        } catch (const std::exception & e) {
+            GGML_LOG_ERROR("[MEM-HANDLE] event-bound lease wait failed: %s\n", e.what());
+        } catch (...) {
+            GGML_LOG_ERROR("[MEM-HANDLE] event-bound lease wait failed with unknown exception\n");
+        }
+        // `handles` is destroyed here, releasing cache-entry and chunk leases
+        // after dependent SYCL work has completed.
+    }).detach();
 }
 
 }  // namespace ggml_sycl
