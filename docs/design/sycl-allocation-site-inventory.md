@@ -13,10 +13,10 @@
 | **allowlist** |   6   | Production sites temporarily kept as-is with explicit deletion criteria |
 | **test**      | 296   | Test files under `tests/` — permanently exempt per §8 |
 | **delete**    |   0   | No dead-code sites found |
-| **non-call**  | 135   | Comments, string literals, forward declarations, macro definitions, enum value comments — not allocation sites. See Appendix A for full enumeration. |
+| **non-call**  | 133   | Comments, string literals, forward declarations, macro definitions, enum value comments — not allocation sites. See Appendix A for full enumeration. |
 
-**Total grep hits (non-blank): 547**
-*(296 test + 49 internal + 61 migrate + 6 allowlist + 135 non-call hits)*
+**Total grep hits (non-blank): 545**
+*(296 test + 49 internal + 61 migrate + 6 allowlist + 133 non-call hits)*
 
 All production caller sites (migrate + allowlist) = **67 sites** across 17 files.
 
@@ -608,6 +608,6 @@ These are the grep hits that match the search pattern but are NOT allocation cal
 
 **Total enumerated: 105 non-call hits** (88 comments, 3 enum-value annotations, 6 function/template definitions in wrapper layer, 2 macro definitions, 3 string literals).
 
-*Note: The summary count of 135 was computed as 547 − 116 production call sites (49 internal + 61 migrate + 6 allowlist) − 296 test = 135. The discrepancy with the 105 enumerated here arises because several internal rows (rows 29–32) cover multi-grep-hit lines inside the allocator wrapper function bodies; those lines are counted as "internal" production rows, not as non-call hits, but were included in the 135 subtraction. This appendix enumerates every non-production, non-test hit confirmed by current grep and is the authoritative list.*
+*Note: The summary count of 133 was computed as 545 − 49 − 61 − 6 − 296 = 133 (total minus internal, migrate, allowlist, and test hits). The discrepancy with the 105 enumerated here arises because several internal rows (rows 29–32) cover multi-grep-hit lines inside the allocator wrapper function bodies; those lines are counted as "internal" production rows, not as non-call hits, but were included in the 133 subtraction. This appendix enumerates every non-production, non-test hit confirmed by current grep and is the authoritative list.*
 
 7. **Contract §9.1 count discrepancy** — the contract §9.1 cites "711 raw alloc patterns" using `grep -rE 'malloc_device|malloc_host|malloc_shared'`. The more restrictive grep used for this inventory (`sycl::malloc_(device|host|shared)|ggml_sycl_malloc_*|malloc_device_raw`) finds 545 total lines. The difference is because the broader grep matches comments, documentation strings, and variable names containing these substrings (e.g., `"sycl::malloc_host` appears in hundreds of comment lines in `ggml-sycl.cpp`). The production caller count (67 sites) is the authoritative figure for the migration backlog.
