@@ -26,9 +26,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <sycl/sycl.hpp>
 #include <vector>
 
+#include "../common.hpp"
 #include "../mem-handle.hpp"
 #include "../unified-cache.hpp"
 #include "ggml-backend.h"
@@ -303,15 +303,10 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "(llama.cpp-32dg8.15.11 — P2-FIX)\n");
     fprintf(stderr, "=================================================\n");
 
-    // Count available GPU devices
-    int n_gpu_devices = 0;
-    try {
-        auto devs     = sycl::device::get_devices(sycl::info::device_type::gpu);
-        n_gpu_devices = static_cast<int>(devs.size());
-    } catch (...) {
-        n_gpu_devices = 0;
-    }
-    fprintf(stderr, "GPU devices available: %d\n", n_gpu_devices);
+    const auto & sycl_info = ggml_sycl_info();
+    const int    n_gpu_devices = sycl_info.total_gpu_count;
+    fprintf(stderr, "GPU devices available: %d physical, %d scheduler-visible\n",
+            n_gpu_devices, sycl_info.device_count);
     if (n_gpu_devices < 2) {
         fprintf(stderr, "NOTE: fewer than 2 GPU devices — multi-device tests will be skipped\n");
     }
@@ -320,7 +315,7 @@ int main(int argc, char ** argv) {
     // Initialize SYCL backend for device 0 so g_device_caches[0] is populated.
     // Test 5 needs unified_cache_host_zone_alloc which queries the global registry.
     // The backend object can be freed immediately; the g_device_caches entry persists.
-    if (n_gpu_devices > 0) {
+    if (sycl_info.device_count > 0) {
         ggml_backend_t backend = ggml_backend_sycl_init(0);
         if (backend) {
             ggml_backend_free(backend);

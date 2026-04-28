@@ -945,28 +945,24 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
     # Single-GPU: tests 1–4 run; multi-device tests skip gracefully.
     add_executable(test-mem-handle-wrong-device
         tests/test-mem-handle-wrong-device.cpp
-        unified-cache.cpp
-        pinned-pool.cpp
-        mem-handle.cpp
     )
     target_include_directories(test-mem-handle-wrong-device PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/..
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
     )
-    target_compile_options(test-mem-handle-wrong-device PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    target_link_options(test-mem-handle-wrong-device PRIVATE ${XMX_TEST_SYCL_OPTIONS})
     target_compile_definitions(test-mem-handle-wrong-device PRIVATE
         GGML_SYCL_WARP_SIZE=32
         GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
     )
-    target_link_libraries(test-mem-handle-wrong-device PRIVATE ggml-base ggml)
-    if (IntelSYCL_FOUND)
-        target_link_libraries(test-mem-handle-wrong-device PRIVATE IntelSYCL::SYCL_CXX)
-    endif()
+    target_link_libraries(test-mem-handle-wrong-device PRIVATE ggml-base ggml ggml-sycl)
     add_test(NAME mem-handle-wrong-device COMMAND test-mem-handle-wrong-device)
     set_tests_properties(mem-handle-wrong-device PROPERTIES
         LABELS "sycl;cache;mem-handle;device-identity;tdd"
+        # setvars.sh puts compiler/lib before redist/lib on this workstation,
+        # but the backend-visible Level Zero devices are exposed via redist/lib.
+        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
         TIMEOUT 120
     )
 
