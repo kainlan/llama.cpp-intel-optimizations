@@ -8,7 +8,8 @@
 //   (2) resolve(device_id) on same-device DIRECT handle returns the pointer.
 //   (3) resolve(device_id) on wrong-device DIRECT handle returns null (explicit fail).
 //   (4) HOST_DEVICE handles resolve successfully from any device (host-agnostic).
-//   (5) [Multi-GPU only] Same checks for CHUNK_LEASE handles using from_chunk_ptr.
+//   (5) [Multi-GPU only] Real CHUNK_LEASE handle (via ensure_cached into global cache)
+//       wrong-device resolve returns null; kind() == CHUNK_LEASE tripwire asserted.
 //   (6) [Multi-GPU only] WEIGHT handle wrong-device resolve returns null.
 //
 // Single-GPU systems: cases (5) and (6) are skipped with a clear message.
@@ -176,8 +177,11 @@ static bool test_host_device_handle_resolves_from_any_device(int n_gpu_devices) 
 // =============================================================================
 // Test 5: wrong-device CHUNK_LEASE resolve returns null (multi-GPU)
 //
-// from_chunk_ptr on a device-0-allocated pointer should produce a handle with
-// device_ == 0 (either CHUNK_LEASE or DIRECT). Resolving it from device 1 must fail.
+// Inserts a weight entry into the GLOBAL unified_cache for device 0 (the one
+// from_chunk_ptr actually queries via get_unified_cache_for_device).  The
+// resolved pointer lives inside that cache's VRAM arena or host pinned pool,
+// so from_chunk_ptr produces a real CHUNK_LEASE handle (not DIRECT fallthrough).
+// Tripwire: assert kind() == CHUNK_LEASE before testing wrong-device resolve.
 // =============================================================================
 static bool test_wrong_device_chunk_lease_fails(int n_gpu_devices) {
     TEST_BEGIN("wrong_device_chunk_lease_resolve_fails");
@@ -186,37 +190,73 @@ static bool test_wrong_device_chunk_lease_fails(int n_gpu_devices) {
         TEST_SKIP("fewer than 2 GPU devices available");
     }
 
-    // We need a device-0 SYCL queue and a pointer that is in device-0's arena.
-    // Use a minimal unified_cache to get a device pointer.
-    std::vector<sycl::device> devs = sycl::device::get_devices(sycl::info::device_type::gpu);
-    if ((int) devs.size() < 2) {
-        TEST_SKIP("fewer than 2 SYCL GPU devices enumerated");
+    // Trigger global cache creation for device 0.
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(0);
+    if (!cache) {
+        TEST_SKIP("get_unified_cache_for_device(0) returned null");
     }
 
-    sycl::queue q0(devs[0], sycl::property::queue::in_order{});
+    // Allocate a small host-pinned staging buffer and insert a weight entry into
+    // the global cache.  ensure_cached performs an H2D copy into the cache's
+    // VRAM arena (or host pinned pool on host-fallback systems), so the resolved
+    // ptr lives inside an arena chunk known to arena_acquire_chunk_lease /
+    // host_acquire_chunk_lease.
+    constexpr size_t entry_bytes = 4 * 1024;
+    void * src_host = sycl::malloc_host(entry_bytes, cache->get_dma_queue());
+    if (!src_host) {
+        TEST_SKIP("sycl::malloc_host failed for staging buffer");
+    }
+    std::memset(src_host, 0xCD, entry_bytes);
 
-    constexpr size_t bytes  = 4096;
-    constexpr size_t budget = 16 * 1024 * 1024;
-    ggml_sycl::unified_cache cache(q0, budget);
-
-    void * dev_ptr = sycl::malloc_device(bytes, q0);
-    if (!dev_ptr) {
-        TEST_SKIP("sycl::malloc_device failed on device 0");
+    ggml_sycl_cache_id key = {};
+    key.valid              = true;
+    key.model_id           = 77777;
+    key.aux_id             = 5;
+    key.nbytes             = entry_bytes;
+    key.name_hash          = key.model_id ^ key.aux_id;
+    key.type               = GGML_TYPE_F32;
+    key.tp_world_size      = 1;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        key.ne[i]           = (i == 0) ? static_cast<int64_t>(entry_bytes / sizeof(float)) : 1;
+        key.tp_local_ne[i]  = key.ne[i];
+        key.tp_offset_ne[i] = 0;
     }
 
-    // from_chunk_ptr will produce a DIRECT or CHUNK_LEASE handle with device 0
-    ggml_sycl::mem_handle h = ggml_sycl::mem_handle::from_chunk_ptr(dev_ptr, 0, GGML_LAYOUT_AOS, true);
+    void * cached_ptr = cache->ensure_cached(key, src_host, entry_bytes,
+                                             ggml_sycl::cache_entry_type::DENSE_WEIGHT,
+                                             -1, -1, GGML_LAYOUT_AOS, false);
+    if (!cached_ptr) {
+        sycl::free(src_host, cache->get_dma_queue());
+        TEST_SKIP("ensure_cached returned null (cache full or device unavailable)");
+    }
+
+    // Drain H2D and drive entry to READY state.
+    cache->get_dma_queue().wait();
+    void * ready_ptr = cache->get(key, GGML_LAYOUT_AOS);
+    if (!ready_ptr) {
+        sycl::free(src_host, cache->get_dma_queue());
+        TEST_SKIP("cache.get() returned null after ensure_cached (entry not READY)");
+    }
+
+    // from_chunk_ptr must now find ready_ptr inside the global cache's arena or
+    // host pool, producing a CHUNK_LEASE handle — not a DIRECT fallthrough.
+    ggml_sycl::mem_handle h = ggml_sycl::mem_handle::from_chunk_ptr(ready_ptr, 0, GGML_LAYOUT_AOS, true);
     TEST_ASSERT(h.device() == 0, "from_chunk_ptr handle must carry device 0");
 
-    // Resolve from device 0 — must succeed
+    // Tripwire: if this fires the test silently fell back to DIRECT (wrong-device
+    // policy still works but CHUNK_LEASE path is not being exercised).
+    TEST_ASSERT(h.kind() == ggml_sycl::mem_handle_kind::CHUNK_LEASE,
+                "from_chunk_ptr must produce CHUNK_LEASE for ptr inside global cache arena");
+
+    // Same-device resolve must return the pointer.
     ggml_sycl::resolved_ptr r0 = h.resolve(0);
-    TEST_ASSERT(r0.ptr == dev_ptr, "same-device CHUNK/DIRECT resolve must return the ptr");
+    TEST_ASSERT(r0.ptr == ready_ptr, "same-device CHUNK_LEASE resolve must return the ptr");
 
-    // Resolve from device 1 — must fail
+    // Wrong-device resolve must return null (explicit-fail policy).
     ggml_sycl::resolved_ptr r1 = h.resolve(1);
-    TEST_ASSERT(r1.ptr == nullptr, "wrong-device CHUNK/DIRECT resolve must return null");
+    TEST_ASSERT(r1.ptr == nullptr, "wrong-device CHUNK_LEASE resolve must return null");
 
-    sycl::free(dev_ptr, q0);
+    sycl::free(src_host, cache->get_dma_queue());
     TEST_PASS();
     return true;
 }
