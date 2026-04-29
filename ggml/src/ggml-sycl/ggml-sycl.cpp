@@ -641,6 +641,160 @@ static void pp_split_timing_dump_if_due(int period = 500) {
             100.0 * t.us_gemm / total);
 }
 
+static void pp_split_timing_dump_and_reset(const char * reason) {
+    if (!pp_split_timing_enabled()) {
+        return;
+    }
+    auto & t = g_pp_split_timing;
+    if (t.n_ops == 0) {
+        return;
+    }
+    const double total = t.us_dequant_w + t.us_cache_hit + t.us_dequant_a + t.us_gemm;
+    fprintf(stderr,
+            "[PP-SPLIT] summary reason=%s n=%llu (hits=%llu miss=%llu) total=%.1f ms  weight_dequant=%.1f ms "
+            "(%.1f%%)  cache_hit_dequant=%.1f ms (%.1f%%)  act_cast=%.1f ms (%.1f%%)  gemm=%.1f ms (%.1f%%)\n",
+            reason ? reason : "graph", (unsigned long long) t.n_ops, (unsigned long long) t.n_cache_hits,
+            (unsigned long long) t.n_cache_miss, total / 1000.0, t.us_dequant_w / 1000.0,
+            total > 0.0 ? 100.0 * t.us_dequant_w / total : 0.0, t.us_cache_hit / 1000.0,
+            total > 0.0 ? 100.0 * t.us_cache_hit / total : 0.0, t.us_dequant_a / 1000.0,
+            total > 0.0 ? 100.0 * t.us_dequant_a / total : 0.0, t.us_gemm / 1000.0,
+            total > 0.0 ? 100.0 * t.us_gemm / total : 0.0);
+    t = {};
+}
+
+// ============================================================================
+// PP dequant benchmark: GGML_SYCL_DEQUANT_BENCH=1
+// Aggregates the exact transient weight dequant work feeding oneDNN PP.
+// Diagnostic only: queue-synchronized timing is intentionally not on by default.
+// ============================================================================
+static bool pp_dequant_bench_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_DEQUANT_BENCH");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+struct pp_dequant_bench_key {
+    std::string      tensor_name;
+    ggml_type        type = GGML_TYPE_COUNT;
+    ggml_layout_mode layout = GGML_LAYOUT_AOS;
+    int64_t          n = 0;
+    int64_t          k = 0;
+    int              device = -1;
+    bool             coalesced_rowmajor = false;
+
+    bool operator==(const pp_dequant_bench_key & other) const {
+        return tensor_name == other.tensor_name && type == other.type && layout == other.layout && n == other.n &&
+               k == other.k && device == other.device && coalesced_rowmajor == other.coalesced_rowmajor;
+    }
+};
+
+struct pp_dequant_bench_key_hash {
+    size_t operator()(const pp_dequant_bench_key & key) const {
+        size_t h = std::hash<std::string>()(key.tensor_name);
+        auto mix = [&h](uint64_t v) {
+            h ^= std::hash<uint64_t>()(v) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        };
+        mix(static_cast<uint64_t>(key.type));
+        mix(static_cast<uint64_t>(key.layout));
+        mix(static_cast<uint64_t>(key.n));
+        mix(static_cast<uint64_t>(key.k));
+        mix(static_cast<uint64_t>(key.device));
+        mix(key.coalesced_rowmajor ? 1 : 0);
+        return h;
+    }
+};
+
+struct pp_dequant_bench_stat {
+    uint64_t calls = 0;
+    double   us = 0.0;
+    uint64_t bytes_read = 0;
+    uint64_t bytes_written = 0;
+};
+
+static thread_local std::unordered_map<pp_dequant_bench_key, pp_dequant_bench_stat, pp_dequant_bench_key_hash>
+    g_pp_dequant_bench_stats;
+
+static size_t pp_dequant_q4_0_layout_bytes(int64_t n, int64_t k) {
+    const size_t blocks = static_cast<size_t>(n) * static_cast<size_t>(k / QK4_0);
+    return blocks * (QK4_0 / 2 + sizeof(sycl::half));
+}
+
+static void pp_dequant_bench_record(const ggml_tensor * src0,
+                                    ggml_layout_mode    layout,
+                                    int64_t             n,
+                                    int64_t             k,
+                                    int                 device,
+                                    bool                coalesced_rowmajor,
+                                    uint64_t            bytes_read,
+                                    uint64_t            bytes_written,
+                                    double              us) {
+    if (!pp_dequant_bench_enabled()) {
+        return;
+    }
+
+    pp_dequant_bench_key key;
+    key.tensor_name        = (src0 && src0->name) ? src0->name : "(unnamed)";
+    key.type               = src0 ? src0->type : GGML_TYPE_COUNT;
+    key.layout             = layout;
+    key.n                  = n;
+    key.k                  = k;
+    key.device             = device;
+    key.coalesced_rowmajor = coalesced_rowmajor;
+
+    auto & stat = g_pp_dequant_bench_stats[key];
+    stat.calls++;
+    stat.us += us;
+    stat.bytes_read += bytes_read;
+    stat.bytes_written += bytes_written;
+}
+
+static void pp_dequant_bench_dump_and_reset(const char * reason) {
+    if (!pp_dequant_bench_enabled() || g_pp_dequant_bench_stats.empty()) {
+        return;
+    }
+
+    struct row {
+        pp_dequant_bench_key  key;
+        pp_dequant_bench_stat stat;
+    };
+    std::vector<row> rows;
+    rows.reserve(g_pp_dequant_bench_stats.size());
+    for (const auto & kv : g_pp_dequant_bench_stats) {
+        rows.push_back({ kv.first, kv.second });
+    }
+    std::sort(rows.begin(), rows.end(), [](const row & a, const row & b) { return a.stat.us > b.stat.us; });
+
+    double   total_us = 0.0;
+    uint64_t total_calls = 0;
+    uint64_t total_read = 0;
+    uint64_t total_written = 0;
+    for (const auto & r : rows) {
+        total_us += r.stat.us;
+        total_calls += r.stat.calls;
+        total_read += r.stat.bytes_read;
+        total_written += r.stat.bytes_written;
+    }
+
+    fprintf(stderr,
+            "[PP-DEQUANT-BENCH] summary reason=%s unique=%zu calls=%llu total=%.3f ms read=%.2f MB write=%.2f MB\n",
+            reason ? reason : "graph", rows.size(), (unsigned long long) total_calls, total_us / 1000.0,
+            total_read / (1024.0 * 1024.0), total_written / (1024.0 * 1024.0));
+    const size_t max_rows = std::min<size_t>(rows.size(), 64);
+    for (size_t i = 0; i < max_rows; ++i) {
+        const auto & r = rows[i];
+        fprintf(stderr,
+                "[PP-DEQUANT-BENCH] %02zu tensor=%s type=%s layout=%s N=%lld K=%lld device=%d rowmajor=%d calls=%llu "
+                "time=%.3f ms avg=%.3f us read=%.2f MB write=%.2f MB\n",
+                i, r.key.tensor_name.c_str(), ggml_type_name(r.key.type), ggml_sycl_layout_mode_name(r.key.layout),
+                (long long) r.key.n, (long long) r.key.k, r.key.device, r.key.coalesced_rowmajor ? 1 : 0,
+                (unsigned long long) r.stat.calls, r.stat.us / 1000.0, r.stat.us / std::max<uint64_t>(1, r.stat.calls),
+                r.stat.bytes_read / (1024.0 * 1024.0), r.stat.bytes_written / (1024.0 * 1024.0));
+    }
+    g_pp_dequant_bench_stats.clear();
+}
+
 // ============================================================================
 // PP Pipeline: Double-buffered PCIe pipelining for oneDNN FP16 weight prefetch
 // ============================================================================
@@ -31421,12 +31575,35 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                                 // row-major FP16 for oneDNN.
                                 auto dequant_weights_to_fp16 = [&](const void * data, sycl::half * out, size_t n_elems,
                                                                    dpct::queue_ptr q) {
+                                    const bool dequant_bench = pp_dequant_bench_enabled();
+                                    auto       t0            = std::chrono::high_resolution_clock::now();
+                                    if (dequant_bench) {
+                                        q->wait();
+                                        t0 = std::chrono::high_resolution_clock::now();
+                                    }
                                     if (src0_is_coalesced && src0->type == GGML_TYPE_Q4_0) {
                                         const int bpr = static_cast<int>(K / QK4_0);
                                         const int nr  = static_cast<int>(N);
                                         dequantize_row_q4_0_coalesced_to_fp16_rowmajor(data, out, bpr, nr, q);
                                     } else {
                                         dequant_to_fp16(data, out, n_elems, q);
+                                    }
+                                    if (dequant_bench) {
+                                        q->wait();
+                                        const auto   t1 = std::chrono::high_resolution_clock::now();
+                                        const double us =
+                                            std::chrono::duration<double, std::micro>(t1 - t0).count();
+                                        const bool is_coalesced_q4_rowmajor =
+                                            src0_is_coalesced && src0->type == GGML_TYPE_Q4_0;
+                                        const uint64_t bytes_read =
+                                            is_coalesced_q4_rowmajor ?
+                                                static_cast<uint64_t>(pp_dequant_q4_0_layout_bytes(N, K)) :
+                                                static_cast<uint64_t>(ggml_nbytes(src0));
+                                        const uint64_t bytes_written =
+                                            static_cast<uint64_t>(n_elems * sizeof(sycl::half));
+                                        pp_dequant_bench_record(src0, requested_layout, N, K, ctx.device,
+                                                                 is_coalesced_q4_rowmajor, bytes_read, bytes_written,
+                                                                 us);
                                     }
                                 };
 
@@ -43051,6 +43228,8 @@ gpu_dispatch:
         pipe.reset_graph();
     }
 #endif
+    pp_split_timing_dump_and_reset("graph_compute_impl");
+    pp_dequant_bench_dump_and_reset("graph_compute_impl");
 
     // GPU completion probe: measure how long the GPU still needs after dispatch loop ends
     {
