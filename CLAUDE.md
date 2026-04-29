@@ -4,17 +4,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build Commands (Intel SYCL)
 
-**IMPORTANT**: Always source oneAPI before building or running:
+**IMPORTANT**: Always source oneAPI before running the binaries (the build script handles sourcing for builds):
 ```bash
 source /opt/intel/oneapi/setvars.sh --force
 ```
 
 ### Build
 ```bash
-source /opt/intel/oneapi/setvars.sh --force
-cmake -B build -G Ninja -DGGML_SYCL=ON -DGGML_SYCL_TARGET=INTEL \
-  -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DGGML_SYCL_F16=ON
-ninja -C build -j $(nproc)
+./scripts/sycl-build.sh
+```
+
+The script sources oneAPI, runs `cmake -G Ninja` with all required flags
+(`-DGGML_SYCL_F16=ON`, `-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON`,
+`-DCMAKE_INSTALL_RPATH='$ORIGIN'`, ccache integration when available),
+and invokes ninja. Output goes to `build/bin/`. The `$ORIGIN` install
+RPATH lets the binaries find their colocated `lib*.so.0` without
+setting `LD_LIBRARY_PATH`.
+
+Common flags:
+```bash
+./scripts/sycl-build.sh                           # incremental build
+./scripts/sycl-build.sh llama-bench               # build a single target
+./scripts/sycl-build.sh -r                        # force CMake reconfigure
+./scripts/sycl-build.sh -c                        # clean (rm build/) and rebuild
 ```
 
 **Build time**: ~10 minutes with ccache, ~25 minutes without.
@@ -26,14 +38,11 @@ ninja -C build -j $(nproc)
 Precision tradeoff: ~4 mantissa bits vs f32. Declare OFF only for precision-sensitive models (phi-2 per `ggml/include/ggml.h:1294` comment, or similar).
 
 ### Ninja vs Make
-Prefer Ninja (`-G Ninja`) for:
+The script always uses Ninja (`-G Ninja`). Reasons:
 - **Correct header dependency tracking**: Changes to `.hpp` files reliably trigger recompilation
 - **Faster no-op builds**: 1.5s vs 73s for Make on large projects
 
-**Warning**: Cannot switch generators in existing build directory:
-```bash
-rm -rf build && cmake -B build -G Ninja [options]
-```
+If a `build/` was created with a different generator, run `./scripts/sycl-build.sh -c` to wipe and reconfigure.
 
 ### Running Tests
 ```bash
@@ -326,7 +335,7 @@ GGML_SYCL_PERSISTENT_TG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
 
 ### Before Submitting PRs
 1. Format code: `git clang-format` (preferred) or `clang-format-19 -i <files>`
-2. Build: `ninja -C build`
+2. Build: `./scripts/sycl-build.sh`
 3. Test: `ctest --test-dir build --output-on-failure`
 4. For ggml changes: Run `test-backend-ops` on multiple backends
 5. Verify performance: `llama-bench` and `llama-perplexity` should not regress
