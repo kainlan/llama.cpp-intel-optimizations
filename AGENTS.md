@@ -1,62 +1,58 @@
 # AGENTS.md
 
-Machine-specific configuration and SYCL development context for this workstation.
-For general llama.cpp guidance, see CLAUDE.md.
+Agent-facing workstation guidance for this repository. This file mirrors the
+current machine-specific facts in `CLAUDE.md`; when the two conflict,
+`CLAUDE.md` is the source of truth and `AGENTS.md` should be updated.
 
-## SYCL Build (Recommended for Intel GPU Development)
+## Build Commands (Intel SYCL)
 
-Use the build script for reliable, single-pass compilation:
+Always source oneAPI before running SYCL binaries. The build script handles
+sourcing for builds:
 
 ```bash
-# Full build (handles oneAPI sourcing, Ninja, ccache automatically)
-./scripts/sycl-build.sh
-
-# Build specific target
-./scripts/sycl-build.sh llama-completion
-
-# Force reconfigure (after CMakeLists.txt changes)
-./scripts/sycl-build.sh -r
-
-# Clean build (from scratch)
-./scripts/sycl-build.sh -c
-
-# Quick incremental rebuild after editing a file
-./scripts/quick-rebuild.sh mmq.cpp llama-completion
-```
-
-**Why use the script instead of raw cmake:**
-- Sources oneAPI automatically
-- Uses Ninja (better dependency tracking than Make)
-- Uses ccache for faster rebuilds
-- Auto-detects when CMake reconfigure is needed
-- Handles generator switching (Make → Ninja) cleanly
-
-### Standard Build (CPU-only)
-```bash
-cmake -B build
-cmake --build build --config Release -j $(nproc)
-```
-
-### Backend-Specific Builds
-```bash
-# CUDA
-cmake -B build -DGGML_CUDA=ON
-cmake --build build --config Release -j $(nproc)
-
-# Metal (macOS)
-cmake -B build -DGGML_METAL=ON
-cmake --build build --config Release -j $(nproc)
-
-# SYCL (Intel) - Manual method (prefer ./scripts/sycl-build.sh instead)
 source /opt/intel/oneapi/setvars.sh --force
-cmake -G Ninja -B build -DGGML_SYCL=ON -DGGML_SYCL_TARGET=INTEL \
-  -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
-  -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-cmake --build build --config Release -j $(nproc)
+```
+
+### Build
+
+Use the build script for SYCL work:
+
+```bash
+./scripts/sycl-build.sh
+```
+
+The script sources oneAPI, configures Ninja, enables required SYCL flags
+including `-DGGML_SYCL_F16=ON`, sets `$ORIGIN` RPATH so `build/bin` binaries can
+find colocated shared libraries, and outputs to `build/bin/`.
+
+Common flags:
+
+```bash
+./scripts/sycl-build.sh                           # incremental build
+./scripts/sycl-build.sh llama-bench               # build a single target
+./scripts/sycl-build.sh -r                        # force CMake reconfigure
+./scripts/sycl-build.sh -c                        # clean rm build/ and rebuild
+```
+
+Build time is roughly 10 minutes with ccache and 25 minutes without.
+
+`-DGGML_SYCL_F16=ON` enables 16-bit float arithmetic throughout the SYCL backend.
+It is active for dmmv dequant today and is required for the current fast Mistral
+attention path. Declare it off only for precision-sensitive models.
+
+### Ninja
+
+The script always uses Ninja. It gives correct header dependency tracking and
+fast no-op builds. If `build/` was created with another generator, run:
+
+```bash
+./scripts/sycl-build.sh -c
 ```
 
 ### Running Tests
+
 ```bash
+source /opt/intel/oneapi/setvars.sh --force
 ctest --test-dir build --output-on-failure -j $(nproc)
 
 # Run a single test by name
@@ -64,224 +60,315 @@ ctest --test-dir build -R <test-name> -V
 ```
 
 ### Code Formatting
-```bash
-# Format staged C++ files before committing (Ubuntu uses versioned binary)
-clang-format-19 -i <file.cpp>
 
-# Check if formatting would change files (dry-run)
+```bash
+# Preferred: format only staged changes
+git clang-format
+
+# Format specific files
+clang-format-19 -i <file.cpp>
 clang-format-19 --dry-run -Werror <file.cpp>
 ```
 
 ## Project Architecture
 
 ### Core Directories
-- **`src/`**: Main llama library (`llama.cpp`, `llama-*.cpp`)
-- **`include/llama.h`**: Public C API header (~2000 lines)
-- **`ggml/`**: Core tensor library (vendored ggml framework)
-- **`common/`**: Shared utility code for examples
-- **`examples/`** and **`tools/`**: 40+ CLI tools
-- **`tests/`**: CTest integration
 
-### Key Binaries (in `build/bin/`)
-- **`llama-cli`**: Interactive chat/inference
-- **`llama-completion`**: Non-interactive text completion (use for scripted tests)
-- **`llama-server`**: OpenAI-compatible HTTP server
-- **`llama-bench`**: Performance benchmarking
-- **`llama-quantize`**: Model quantization
+- `src/`: main llama library
+- `include/llama.h`: public C API header
+- `ggml/`: core tensor library
+- `common/`: shared utility code for examples
+- `examples/` and `tools/`: CLI tools
+- `tests/`: CTest integration
 
-### Backend Structure (`ggml/src/`)
-- **`ggml-cpu/`**: CPU backend (AVX/NEON/RVV)
-- **`ggml-cuda/`**: NVIDIA CUDA kernels
-- **`ggml-metal/`**: Apple Metal shaders
-- **`ggml-sycl/`**: Intel SYCL backend
-- **`ggml-vulkan/`**: Vulkan compute shaders
+### Key Binaries
 
-## Development Workflow
+Binaries are in `build/bin/`:
 
-### Subagent Model Selection
-When dispatching subagents via the Task tool:
-- **Implementation tasks**: Use `model: "opus"` for code writing, debugging, and complex implementation
-- **Review tasks**: Use `model: "opus"` for spec compliance and code quality reviews
-- **Exploration/search tasks**: Default model (sonnet) is fine for quick lookups
+- `llama-cli`: interactive chat/inference
+- `llama-completion`: non-interactive text completion
+- `llama-server`: OpenAI-compatible HTTP server
+- `llama-bench`: performance benchmarking
+- `llama-quantize`: model quantization
+- `llama-perplexity`: model evaluation
 
-Example:
+### Backend Structure
+
+- `ggml/src/ggml-cpu/`: CPU backend
+- `ggml/src/ggml-cuda/`: NVIDIA CUDA backend
+- `ggml/src/ggml-metal/`: Apple Metal backend
+- `ggml/src/ggml-sycl/`: Intel SYCL backend
+- `ggml/src/ggml-vulkan/`: Vulkan backend
+
+Key SYCL files:
+
+- `ggml-sycl.cpp`: main backend, graph compute, mul_mat dispatch, buffer ops
+- `unified-kernel.cpp/hpp`: unified MUL_MAT kernel with XMX/ESIMD/MMVQ dispatch
+- `unified-cache.cpp/hpp`: tiered weight cache
+- `common.hpp/cpp`: shared types, `extra_gpu`, layout policy, device management
+- `mmvq.cpp`: matrix-vector quantized kernels for batch=1 TG fast path
+- `mmq.cpp`: matrix-matrix quantized kernels
+- `fattn.cpp`: flash attention implementation
+- `dispatch.hpp`: kernel dispatch policy
+- `quants.hpp`: SOA block offset calculations
+
+## ggml Conventions
+
+Matrix multiplication is unconventional: `C = ggml_mul_mat(ctx, A, B)` computes:
+
+```text
+C^T = A * B^T  <=>  C = B * A^T
 ```
-Task tool with model: "opus" for implementing features
+
+Tensor storage:
+
+- Tensors store data in row-major order
+- Dimension 0 is columns
+- Dimension 1 is rows
+- Dimension 2 is matrices
+
+Naming and style:
+
+- Use `snake_case`
+- Optimize for longest common prefix
+- Prefer `<class>_<method>` names
+- Enum values are uppercase and prefixed with the enum name
+- Use `struct foo {}` rather than `typedef struct foo {} foo`
+- Avoid new third-party dependencies
+- Keep STL usage simple
+- Formatting is 4 spaces, brackets on same line, `void * ptr`, `int & a`
+- File names are lowercase with dashes for C/C++ and underscores for Python
+
+## Local Environment
+
+### Models
+
+Models are stored in `/Storage/GenAI/models/`.
+
+Default benchmark model:
+
+```text
+/Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf
 ```
 
-### Test-Driven Development
-1. Write unit tests to reproduce bugs or validate features
-2. Tests should exercise actual production code paths
-3. Verify with reference models before claiming fixes work
+Other useful local models:
+
+- `mistral-7b-v0.1.Q4_K_M.gguf`
+- `mistral-7b-v0.1.Q8_0.gguf`
+- `gpt-oss-20b-mxfp4.gguf`
+- `gpt-oss-120b-mxfp4-*.gguf`
 
 ### Verification Commands
+
+Use these as the default quick gates on this workstation:
+
 ```bash
-# Non-interactive completion (deterministic output for testing)
-ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion \
-  -m /path/to/model.gguf -ngl 99 --flash-attn on \
+source /opt/intel/oneapi/setvars.sh --force
+
+# Deterministic correctness check. Expected output starts:
+# 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
+  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
-# Expected: "1, 2, 3, 4, 5, 6, 7, 8, 9, 10"
 
-# Benchmark
-./build/bin/llama-bench -m model.gguf -p 512 -n 128 -ngl 99 -fa 0,1
+# PP512 and TG128 benchmark
+ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
+  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128
+
+# Backend operations after modifying ggml operators
+ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-backend-ops
 ```
 
-## Profiling (Intel SYCL / Xe)
+If binaries fail to load colocated libraries, use:
 
-### VTune GPU Offload
-Force a specific SYCL device (logical index from `llama-bench --list-devices`):
 ```bash
-GGML_SYCL_DEVICE=0  # B580
+export LD_LIBRARY_PATH="/Apps/llama.cpp/build/bin:$LD_LIBRARY_PATH"
 ```
 
-Prereqs for xe driver systems (B580/B50):
+### SYCL Device Selection
+
+On multi-GPU systems, explicitly select a single device. Without this, llama.cpp
+may use all visible GPUs and the unified kernel can hang.
+
+This workstation has 3 GPUs: Arc B580 device 0, Arc Pro B50 device 1, and iGPU
+device 2.
+
 ```bash
-# Allow GPU profiling
-echo 'dev.xe.observation_paranoid=0' | sudo tee /etc/sysctl.d/90-intel-xe-vtune.conf
-sudo sysctl --system
-
-# Metrics Discovery (VTune depends on libigdmd)
-sudo ln -sf /usr/lib/x86_64-linux-gnu/libigdmd.so.1 /usr/lib/x86_64-linux-gnu/libigdmd.so
+sycl-ls
+ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench ...
 ```
 
-Collect GPU offload profile:
+`GGML_SYCL_VISIBLE_DEVICES=0` is not sufficient for the unified cache. Use
+`ONEAPI_DEVICE_SELECTOR`.
+
+### Patched compute-runtime
+
+The system `libze_intel_gpu.so.1` is the patched build at:
+
+```text
+/Apps/compute-runtime/build-26.09/bin/libze_intel_gpu.so.1.14.37435
+```
+
+It is installed via `dpkg-divert`; stock `1.14.37020` is preserved. The patched
+runtime fixes the m09zb `event.wait()` post-init hang during alloc-probe and
+cleanly enforces per-allocation hardware caps on Arc B580.
+
+Do not casually revert this runtime. Reverting to stock without restoring the old
+allocation probe can reintroduce silent oversized allocation hangs.
+
+### Performance Expectations
+
+Mistral 7B Q4_0 on Arc B580:
+
+| Metric | Expected tok/s | Notes |
+|--------|----------------|-------|
+| PP512, all VRAM | ~1700 | oneDNN SDPA graph / f16 attention path |
+| TG128, all VRAM | ~81 | MMVQ fast path, SOA layout, graph replay |
+| TG128, no graph | ~70 | MMVQ fast path alone |
+| PP512, Level 3 30% budget | ~269 | partial GPU offload |
+| TG128, Level 3 30% budget | ~14 | CPU offload |
+| PP512 legacy | ~159 | `GGML_SYCL_UNIFIED_FORCE_LEGACY=1` |
+| TG128 3-device | ~27 | `GGML_SYCL_SPLIT_RATIO="60,32,8"` |
+
+## SYCL Environment Variables
+
+Performance-critical defaults:
+
+| Variable | Default behavior |
+|----------|------------------|
+| `GGML_SYCL_UNIFIED_SOA=0` | Disable SOA layout; default is ON |
+| `GGML_SYCL_TG_FAST=0` | Disable MMVQ fast path; default is ON |
+| `GGML_SYCL_DISABLE_GRAPH=1` | Disable graph replay; default is OFF |
+| `GGML_SYCL_ONEDNN_PP=0` | Disable oneDNN prompt processing; default is ON |
+| `GGML_SYCL_UNIFIED_FORCE_LEGACY=1` | Force legacy dispatch; default is OFF |
+
+Experimental:
+
+| Variable | Default behavior |
+|----------|------------------|
+| `GGML_SYCL_PP_PIPELINE=1` | Enable double-buffered FP16 dequant prefetch; default is OFF |
+| `GGML_SYCL_PERSISTENT_TG=1` | Enable persistent TG kernel; default is OFF |
+| `GGML_SYCL_PERSISTENT_TG_PHASE=0` | Disable phase scheduling |
+| `GGML_SYCL_PERSISTENT_TG_DAG=0` | Disable DAG scheduling |
+| `GGML_SYCL_PERSISTENT_SPLIT=1` | Enable persistent split kernel |
+
+Kernel dispatch tuning:
+
+| Variable | Effect |
+|----------|--------|
+| `GGML_SYCL_FORCE_MMVQ=1` | Force MMVQ kernels |
+| `GGML_SYCL_FORCE_ESIMD=1` | Force ESIMD kernels |
+| `GGML_SYCL_FORCE_MMQ=1` | Force MMQ kernels |
+| `GGML_SYCL_FORCE_DMMV=1` | Force DMMV kernels |
+| `GGML_SYCL_ESIMD_MIN_BATCH=N` | Minimum batch size for ESIMD |
+| `GGML_SYCL_ONEDNN_PP_MIN_BATCH=N` | Minimum batch for oneDNN PP |
+| `GGML_SYCL_BATCH_EXPERTS=0` | Disable batched expert launches |
+
+Memory and pressure:
+
+| Variable | Effect |
+|----------|--------|
+| `GGML_SYCL_VRAM_BUDGET_PCT=N` | VRAM budget percent |
+| `GGML_SYCL_KV_HOST=1` | Force KV cache to pinned host memory |
+| `GGML_SYCL_KV_HOT_LAYERS=N` | Hot KV layer count |
+| `GGML_SYCL_KV_HOT_PCT=N` | Hot KV window percent |
+| `GGML_SYCL_FORCE_STREAMING=1` | Enable weight streaming |
+| `GGML_SYCL_HOST_COMPUTE=1` | Use host-pinned compute buffers |
+| `GGML_SYCL_UNIFIED_CACHE=0` | Disable unified cache |
+| `GGML_SYCL_UNIFIED_CACHE_MODE=<mode>` | auto, device, host, mmap |
+| `GGML_SYCL_NO_PINNED=1` | Disable pinned host memory |
+| `GGML_SYCL_WEIGHTS_EVICTABLE=1` | Allow weight eviction |
+| `GGML_SYCL_MEM_BUDGET=<MB>` | Set VRAM budget in MB |
+
+Debugging:
+
+| Variable | Effect |
+|----------|--------|
+| `GGML_SYCL_DEBUG=1` | Detailed kernel logging; very noisy |
+| `GGML_SYCL_UNIFIED_DEBUG=1` | Debug unified kernel dispatch |
+| `GGML_SYCL_NAN_CHECK=1` | Enable NaN detection |
+| `GGML_SYCL_VALIDATE=1` | A/B validation between kernel paths |
+| `GGML_SYCL_GRAPH_RERECORD=1` | Diagnostic graph re-record path |
+| `GGML_SYCL_OP_TIMEOUT_MS=<N>` | Abort if no inference progress for N ms |
+| `GGML_SYCL_SAFE_MODE=1` | Drain queue after every op; slow diagnostic mode |
+| `GGML_SYCL_LAYOUT_OVERRIDE=<mode>` | Force `aos`, `soa`, `coalesced`, or `xmx_tiled` |
+
+There are many additional `GGML_SYCL_*` variables. Search with:
+
+```bash
+rg 'getenv\("GGML_SYCL' ggml/src/ggml-sycl/
+```
+
+## Profiling
+
+VTune GPU offload example:
+
 ```bash
 source /opt/intel/oneapi/setvars.sh --force
 GGML_SYCL_DEVICE=0 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
 vtune -collect gpu-offload -knob enable-stack-collection=true \
   -result-dir /tmp/vtune_b580_llama \
-  -- ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 64 -n 8 --tg-batch 4 -ngl 99 -fa 1
+  -- ./build/bin/llama-bench \
+    -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 64 -n 8 --tg-batch 4 -ngl 99 -fa 1
 ```
 
-If multiple GPUs are present, pin VTune to the B580 by BDF and enable API tracing:
-```bash
-vtune -collect gpu-hotspots -knob target-gpu=0:3:0.0 -knob collect-programming-api=true \
-  -result-dir /tmp/vtune_b580_hotspots \
-  -- ./build-sycl/bin/llama-bench ...
-```
+If VTune only shows memcpy tasks, use PTI and UR tracers for kernel time and
+launch shapes. See `CLAUDE.md` for the full tracer setup.
 
-Build-time profiling flags are now controlled by CMake:
-```bash
-# Disabled by default for toolchain stability; enable explicitly when collecting VTune line info
--DGGML_SYCL_PROFILING_DEBUG=ON
-```
+## CI and Validation
 
-To verify unified-cache layout materialization at load time:
-```bash
-GGML_SYCL_LAYOUT_SUMMARY=1 GGML_SYCL_DEBUG=1 ./build-sycl/bin/llama-bench ...
-```
+Before submitting PRs:
 
-For higher XMX occupancy during decode, increase generation batch size in the bench:
-```bash
-./build/bin/llama-bench ... -n 128 --tg-batch 4
-```
+1. Format code with `git clang-format`
+2. Build with `./scripts/sycl-build.sh`
+3. Run `ctest --test-dir build --output-on-failure`
+4. For ggml operator changes, run `test-backend-ops`
+5. Verify `llama-bench` and `llama-perplexity` do not regress where relevant
 
-If VTune shows only memcpy tasks, use PTI + UR tracers (kernel time + launch shapes):
-```bash
-# PTI summary (kernel time + memcpy bytes)
-g++ -shared -fPIC /tmp/pti_trace_summary.cpp \
-  -I/opt/intel/oneapi/pti/0.16/include -L/opt/intel/oneapi/pti/0.16/lib \
-  -lpti_view -Wl,-rpath,/opt/intel/oneapi/pti/0.16/lib \
-  -o /tmp/libpti_trace_summary.so
-
-# UR launch tracer (global/local sizes + arg signature)
-cat >/tmp/ur_launch_trace.map <<'MAP'
-LIBUR_LOADER_0.12 {
-    global:
-        urEnqueueKernelLaunch;
-        urKernelSetArgValue;
-        urKernelSetArgPointer;
-        urKernelSetArgMemObj;
-        urKernelSetArgLocal;
-    local:
-        *;
-};
-MAP
-g++ -shared -fPIC /tmp/ur_launch_trace.cpp -ldl \
-  -I/opt/intel/oneapi/redist/include \
-  -Wl,--version-script=/tmp/ur_launch_trace.map \
-  -o /tmp/libur_launch_trace.so
-
-LD_PRELOAD=/tmp/libpti_trace_summary.so:/tmp/libur_launch_trace.so \
-ZE_ENABLE_TRACING_LAYER=1 ZET_ENABLE_PROGRAM_INSTRUMENTATION=1 ZET_ENABLE_METRICS=1 \
-SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=0 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
-./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 64 -n 8 -ngl 99 -fa 1 \
-  2> /tmp/pti_ur_trace_b580.log
-```
-
-### Python Environment
-```bash
-source .venv/bin/activate  # Use project venv for Python tools
-```
+Add `ggml-ci` to a commit message to trigger extended CI workloads.
 
 ## Professional Engineering Standards
 
-**Spinach Rule**: When you detect a visible flaw the user may not see (wrong assumption, hidden risk, flawed logic), correction is mandatory. Do not optimize for agreement.
+Spinach Rule: when you detect a visible flaw the user may not see, correction is
+mandatory. Do not optimize for agreement.
 
-- Challenge assumptions directly: "There's spinach here: this approach has X risk because..."
-- Question unclear requirements before implementing
-- Identify performance trade-offs and security implications
-- Never fake progress or simulate certainty
+- Challenge wrong assumptions directly
+- Question unclear requirements before implementing risky changes
+- Identify performance and security trade-offs
+- Never fake progress or certainty
 
-## Documentation Index
+## Documentation
 
-- **Build Details**: `docs/build.md`
-- **Backend SYCL**: `docs/backend/SYCL.md`
-- **Development**: `docs/development/`
-
-## Local Environment (Intel SYCL)
-
-### GPU Selection
-- **Single GPU**: `ONEAPI_DEVICE_SELECTOR=level_zero:1`
-- **Dual GPU**: `ONEAPI_DEVICE_SELECTOR="level_zero:0;level_zero:1"`
-
-### Model Paths
-Models in `/Storage/GenAI/models/`:
-- **Mistral 7B Q4**: `mistral-7b-v0.1.Q4_0.gguf` (fast testing)
-- **Mistral 7B Q6_K**: `mistral-7b-v0.1.Q6_K.gguf` (pure Q6_K testing)
-- **GPT-OSS 20B Q8**: `gpt-oss-20b-Q8_0.gguf` (MoE model)
-
-### SYCL Environment Variables
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `GGML_SYCL_DISABLE_GRAPH` | 0 | Disable SYCL command graphs |
-| `GGML_SYCL_DEBUG` | 0 | Debug output level (0-2) |
-| `GGML_SYCL_LAYOUT_OVERRIDE` | (unset) | Force weight layout for debugging: `aos`, `soa`, `coalesced`, `xmx_tiled` |
-
-### SYCL Layout Overrides (Debug)
-Use `GGML_SYCL_LAYOUT_OVERRIDE` to force a specific layout. `aos` disables reordering.
-
-```bash
-# Default: auto layout selection (no override)
-ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
-  -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -ngl 99
-
-# Force AoS (no reorder):
-GGML_SYCL_LAYOUT_OVERRIDE=aos ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench ...
-```
+- `docs/build.md`
+- `docs/backend/SYCL.md`
+- `docs/development/HOWTO-add-model.md`
+- `CONTRIBUTING.md`
+- `.github/copilot-instructions.md`
 
 ## Landing the Plane (Session Completion)
 
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+When ending a work session, complete all steps below. Work is not complete until
+`git push` succeeds.
 
-**MANDATORY WORKFLOW:**
+1. File issues for remaining work
+2. Run quality gates if code changed
+3. Update issue status
+4. Push to remote:
 
-1. **File issues for remaining work** - Create issues for anything that needs follow-up
-2. **Run quality gates** (if code changed) - Tests, linters, builds
-3. **Update issue status** - Close finished work, update in-progress items
-4. **PUSH TO REMOTE** - This is MANDATORY:
-   ```bash
-   git pull --rebase
-   bd sync
-   git push
-   git status  # MUST show "up to date with origin"
-   ```
-5. **Clean up** - Clear stashes, prune remote branches
-6. **Verify** - All changes committed AND pushed
-7. **Hand off** - Provide context for next session
+```bash
+git pull --rebase
+bd sync
+git push
+git status
+```
 
-**CRITICAL RULES:**
-- Work is NOT complete until `git push` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds
+5. Clean up stale stashes or branches where appropriate
+6. Verify all intended changes are committed and pushed
+7. Hand off remaining context
+
+Critical rules:
+
+- Work is not complete until `git push` succeeds
+- Do not stop with local-only committed work
+- Do not say "ready to push when you are"; push the branch
+- If push fails, resolve and retry
