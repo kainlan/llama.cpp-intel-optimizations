@@ -6163,6 +6163,7 @@ ggml_sycl_cache_id ggml_backend_sycl_get_tensor_cache_key(const ggml_tensor * te
 }
 
 static bool ggml_sycl_layout_override_active(layout_mode & override_layout);
+static bool ggml_sycl_can_use_layout_for_kernel(const ggml_tensor * tensor, layout_mode layout, int device);
 
 // Tensor inventory storage for tiered memory placement
 static std::mutex                                  g_tensor_inventory_mutex;
@@ -12223,6 +12224,9 @@ static void ggml_sycl_preload_model_weights() {
 
                     const size_t src_size = ggml_nbytes(tensor);
 
+                    layout_mode preload_override     = GGML_LAYOUT_AOS;
+                    const bool  has_preload_override = ggml_sycl_layout_override_active(preload_override);
+
                     // S1-PRELOAD: upload COALESCED directly for quantized types
                     // that support it (Q4_0, Q8_0, Q6_K, MXFP4).  COALESCED is
                     // the preferred TG layout — tile-based warp-aligned access
@@ -12254,6 +12258,9 @@ static void ggml_sycl_preload_model_weights() {
                     layout_mode preload_layout = use_coalesced ? GGML_LAYOUT_COALESCED :
                                                  use_soa       ? GGML_LAYOUT_SOA :
                                                                  GGML_LAYOUT_AOS;
+                    if (has_preload_override && ggml_sycl_can_use_layout_for_kernel(tensor, preload_override, device)) {
+                        preload_layout = preload_override;
+                    }
                     // Respect the same layout constraints that inference dispatch
                     // enforces.  Without this, S1-PRELOAD stores COALESCED but
                     // dispatch downgrades to AOS (unified kernel requires AOS
@@ -12263,7 +12270,7 @@ static void ggml_sycl_preload_model_weights() {
                     size_t dst_size            = src_size;
 
                     ggml_sycl_reorder_fill_ctx reorder_ctx{};
-                    if (use_coalesced || use_soa) {
+                    if (preload_layout == GGML_LAYOUT_COALESCED || preload_layout == GGML_LAYOUT_SOA) {
                         dst_size = ggml_sycl_layout_bytes_for_dims(tensor->type, tensor->ne[0], ggml_nrows(tensor),
                                                                    preload_layout, device);
                         if (dst_size == 0) {
@@ -28961,6 +28968,13 @@ MatmulDecision UnifiedMatmulOrchestrator::select(const ggml_tensor *            
         return decision;
     }
 
+    layout_mode override_layout = GGML_LAYOUT_AOS;
+    bool        has_override    = ggml_sycl_layout_override_active(override_layout);
+    if (!has_override && forced_layout) {
+        override_layout = *forced_layout;
+        has_override    = true;
+    }
+
     const bool unified_enabled = allow_unified && ggml_sycl_unified_dispatch_enabled() &&
                                  ggml_sycl::is_unified_kernel_enabled_for_device(ctx_.device) &&
                                  ggml_sycl::should_use_unified(src0->type);
@@ -28974,7 +28988,9 @@ MatmulDecision UnifiedMatmulOrchestrator::select(const ggml_tensor *            
                                        ggml_sycl_supports_reorder_mmvq(src0->type);
             decision.valid   = true;
             decision.backend = MatmulBackend::UnifiedKernel;
-            if (use_reordered && is_coalesced_supported(src0->type)) {
+            if (has_override && ggml_sycl_can_use_layout_for_kernel(src0, override_layout, ctx_.device)) {
+                decision.layout = override_layout;
+            } else if (use_reordered && is_coalesced_supported(src0->type)) {
                 decision.layout = GGML_LAYOUT_COALESCED;
             } else if (use_reordered) {
                 decision.layout = GGML_LAYOUT_SOA;
@@ -28983,13 +28999,6 @@ MatmulDecision UnifiedMatmulOrchestrator::select(const ggml_tensor *            
             }
             return decision;
         }
-    }
-
-    layout_mode override_layout = GGML_LAYOUT_AOS;
-    bool        has_override    = ggml_sycl_layout_override_active(override_layout);
-    if (!has_override && forced_layout) {
-        override_layout = *forced_layout;
-        has_override    = true;
     }
 
     // Use resolve().layout to determine the materialized layout — no finalization gate needed.
