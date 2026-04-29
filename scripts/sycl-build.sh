@@ -6,12 +6,12 @@ usage() {
     cat <<'EOF'
 Usage: ./scripts/sycl-build.sh [options] [target] [-- <extra build args>]
 
-Configure and build the SYCL backend with Ninja in build-sycl/.
+Configure and build the SYCL backend with Ninja in build/.
 
 Options:
   -r, --reconfigure       Force CMake reconfigure before building
-  -c, --clean             Remove build-sycl/ and configure from scratch
-  -B, --build-dir <dir>   Override build directory (default: build-sycl)
+  -c, --clean             Remove build/ and configure from scratch
+  -B, --build-dir <dir>   Override build directory (default: build)
   -h, --help              Show this help
 
 Examples:
@@ -25,7 +25,7 @@ EOF
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-BUILD_DIR="${ROOT_DIR}/build-sycl"
+BUILD_DIR="${ROOT_DIR}/build"
 
 force_reconfigure=0
 clean_build=0
@@ -143,6 +143,8 @@ configure_args=(
     -DGGML_SYCL=ON
     -DGGML_SYCL_TARGET=INTEL
     -DGGML_SYCL_ONECCL=ON
+    -DGGML_SYCL_F16=ON
+    -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
     -DCMAKE_C_COMPILER=icx
     -DCMAKE_CXX_COMPILER=icpx
 )
