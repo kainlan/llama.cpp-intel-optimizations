@@ -49,6 +49,7 @@
 #if !defined(_WIN32)
 #    include <dlfcn.h>
 #    include <sys/mman.h>
+#    include <sys/stat.h>
 #    include <unistd.h>
 #endif
 #include <map>
@@ -38717,29 +38718,160 @@ static void ggml_sycl_set_main_device(const int main_device) try {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
     std::exit(1);
 }
-// Debug: Dump tensor values for NON-FA attention path comparison
-#define NON_FA_DEBUG_DUMP 0
-#if NON_FA_DEBUG_DUMP
-#    include <cstring>
+static bool ggml_sycl_non_fa_attn_dump_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_NON_FA_ATTN_DUMP");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static int ggml_sycl_non_fa_attn_dump_call_limit() {
+    static const int limit = [] {
+        const char * env = std::getenv("GGML_SYCL_NON_FA_ATTN_DUMP_CALLS");
+        if (!env || !*env) {
+            return 4;
+        }
+        return std::max(1, std::atoi(env));
+    }();
+    return limit;
+}
+
+static size_t ggml_sycl_non_fa_attn_dump_sample_elems() {
+    static const size_t elems = [] {
+        const char * env = std::getenv("GGML_SYCL_NON_FA_ATTN_DUMP_ELEMS");
+        if (!env || !*env) {
+            return (size_t) 4096;
+        }
+        char *              end = nullptr;
+        const unsigned long val = std::strtoul(env, &end, 10);
+        if (!end || end == env || val == 0) {
+            return (size_t) 4096;
+        }
+        return (size_t) val;
+    }();
+    return elems;
+}
+
+static const char * ggml_sycl_non_fa_attn_dump_dir() {
+    const char * env = std::getenv("GGML_SYCL_NON_FA_ATTN_DUMP_DIR");
+    return (env && *env) ? env : "/tmp/fa_debug";
+}
+
+static uint64_t ggml_sycl_fnv1a_bytes(const uint8_t * data, size_t n) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; ++i) {
+        h ^= (uint64_t) data[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static bool ggml_sycl_env_list_matches(const char * env, const char * value) {
+    if (!env || !*env || !value || !*value) {
+        return false;
+    }
+
+    const char * cur = env;
+    while (*cur) {
+        while (*cur == ',' || std::isspace(static_cast<unsigned char>(*cur))) {
+            cur++;
+        }
+        const char * end = cur;
+        while (*end && *end != ',') {
+            end++;
+        }
+        const char * token_end = end;
+        while (token_end > cur && std::isspace(static_cast<unsigned char>(token_end[-1]))) {
+            token_end--;
+        }
+        if (token_end > cur) {
+            const size_t n = (size_t) (token_end - cur);
+            if ((std::strlen(value) == n && std::strncmp(value, cur, n) == 0) || std::strncmp(value, cur, n) == 0) {
+                return true;
+            }
+        }
+        cur = end;
+    }
+    return false;
+}
+
+static bool ggml_sycl_selective_debug_sync_enabled(const ggml_tensor * node) {
+    if (!node) {
+        return false;
+    }
+
+    const char * ops = std::getenv("GGML_SYCL_DEBUG_SYNC_OPS");
+    if (ggml_sycl_env_list_matches(ops, ggml_op_name(node->op))) {
+        return true;
+    }
+
+    const char * names = std::getenv("GGML_SYCL_DEBUG_SYNC_NAMES");
+    return ggml_sycl_env_list_matches(names, node->name);
+}
+
+static bool ggml_sycl_non_fa_attn_sync_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_NON_FA_ATTN_SYNC");
+        return !env || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_sycl_graph_has_non_fa_attn(const ggml_cgraph * cgraph) {
+    if (!cgraph) {
+        return false;
+    }
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (!node || node->op != GGML_OP_SOFT_MAX) {
+            continue;
+        }
+
+        const char * name = node->name;
+        if (name && std::strncmp(name, "kq_soft_max", 11) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool ggml_sycl_needs_non_fa_attn_sync(const ggml_tensor * node, bool graph_has_non_fa_attn) {
+    if (!graph_has_non_fa_attn || !ggml_sycl_non_fa_attn_sync_enabled() || !node) {
+        return false;
+    }
+
+    // The non-FA attention chain can otherwise race across kq -> kq_soft_max -> kqv
+    // on Level Zero after decode graph capture is disabled by planner-host inputs.
+    const char * name = node->name;
+    if (!name) {
+        return false;
+    }
+    return std::strncmp(name, "kqv", 3) == 0;
+}
 
 static void dump_non_fa_attention_tensor(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst) {
-    // Only dump for specific tensor names related to attention
+    if (!ggml_sycl_non_fa_attn_dump_enabled()) {
+        return;
+    }
 
-    // Key tensors: "kq", "kq_soft_max", "kqv" for non-FA path
-    // Also dump "fattn" for FA path comparison
+    // Key tensors: "kq", "kq_soft_max", "kqv" for non-FA path.
+    // Also dump "fattn" for FA path comparison.
     const char * name = dst->name;
     if (!name || name[0] == '\0') {
         return;
     }
-    // Check if this is an attention-related tensor
-    bool is_kq          = (strncmp(name, "kq", 2) == 0 && name[2] != 'v');  // kq but not kqv
-    bool is_kq_soft_max = (strncmp(name, "kq_soft_max", 11) == 0);
-    bool is_kqv         = (strncmp(name, "kqv", 3) == 0 && name[3] != '_');
-    bool is_fattn       = (strncmp(name, "fattn", 5) == 0);
+
+    const bool is_kq_soft_max = (strncmp(name, "kq_soft_max", 11) == 0);
+    const bool is_kqv         = (strncmp(name, "kqv", 3) == 0 && name[3] != '_');
+    const bool is_fattn       = (strncmp(name, "fattn", 5) == 0);
+    const bool is_kq          = (strncmp(name, "kq", 2) == 0 && !is_kqv && !is_kq_soft_max);
     if (!is_kq && !is_kq_soft_max && !is_kqv && !is_fattn) {
         return;
     }
-    // Static call counter for each tensor type
+
     static int kq_count          = 0;
     static int kq_soft_max_count = 0;
     static int kqv_count         = 0;
@@ -38754,113 +38886,108 @@ static void dump_non_fa_attention_tensor(ggml_backend_sycl_context & ctx, struct
     } else if (is_fattn) {
         call_num = ++fattn_count;
     }
-    // Only dump first 50 calls of each type
-    if (call_num > 50) {
+
+    if (call_num > ggml_sycl_non_fa_attn_dump_call_limit()) {
         return;
     }
-    // Wait for computation to complete
-    ctx.stream()->wait();
-    // Get tensor info
+
     const int64_t ne0 = dst->ne[0];
     const int64_t ne1 = dst->ne[1];
-
-    const int64_t ne2            = dst->ne[2];
-    const int64_t ne3            = dst->ne[3];
-    const size_t  total_elements = ne0 * ne1 * ne2 * ne3;
-    // Only dump F32 tensors for now
-    if (dst->type != GGML_TYPE_F32) {
-        fprintf(stderr, "\n[NON-FA-DEBUG] %s call=%d type=%d (not F32, skipping dump)\n", name, call_num, dst->type);
+    const int64_t ne2 = dst->ne[2];
+    const int64_t ne3 = dst->ne[3];
+    if (ne0 <= 0 || ne1 <= 0 || ne2 <= 0 || ne3 <= 0) {
         return;
     }
-    fprintf(stderr, "\n[NON-FA-DEBUG] %s call=%d shape=[%lld,%lld,%lld,%lld] total=%zu\n", name, call_num,
-            (long long) ne0, (long long) ne1, (long long) ne2, (long long) ne3, total_elements);
 
-    // Copy data to host
-    std::vector<float> host_data(total_elements);
-    ctx.stream()->memcpy(host_data.data(), dst->data, total_elements * sizeof(float)).wait();
-    // Print summary statistics
-    float min_val = host_data[0], max_val = host_data[0], sum = 0;
-    for (size_t i = 0; i < total_elements; i++) {
-        float v = host_data[i];
-        if (v < min_val) {
-            min_val = v;
-        }
-        if (v > max_val) {
-            max_val = v;
-        }
+    if (dst->type != GGML_TYPE_F32) {
+        GGML_LOG_INFO("[NON-FA-ATTN] name=%s call=%d op=%s type=%d skipped_non_f32\n", name, call_num,
+                      ggml_op_name(dst->op), (int) dst->type);
+        return;
+    }
 
+    if (!ggml_is_contiguous(dst) || ggml_is_permuted(dst)) {
+        GGML_LOG_INFO(
+            "[NON-FA-ATTN] name=%s call=%d op=%s type=%d ne=[%lld,%lld,%lld,%lld] nb=[%lld,%lld,%lld,%lld] "
+            "skipped_noncontig\n",
+            name, call_num, ggml_op_name(dst->op), (int) dst->type, (long long) ne0, (long long) ne1, (long long) ne2,
+            (long long) ne3, (long long) dst->nb[0], (long long) dst->nb[1], (long long) dst->nb[2],
+            (long long) dst->nb[3]);
+        return;
+    }
+
+    const size_t total_elements = (size_t) ne0 * (size_t) ne1 * (size_t) ne2 * (size_t) ne3;
+    const size_t sample_elems   = std::min(total_elements, ggml_sycl_non_fa_attn_dump_sample_elems());
+    if (sample_elems == 0) {
+        return;
+    }
+
+    ctx.stream()->wait();
+    std::vector<float> host_data(sample_elems);
+    ctx.stream()->memcpy(host_data.data(), dst->data, sample_elems * sizeof(float)).wait();
+
+    float  min_val = host_data[0];
+    float  max_val = host_data[0];
+    double sum     = 0.0;
+    int    n_nan   = 0;
+    int    n_inf   = 0;
+    for (size_t i = 0; i < sample_elems; i++) {
+        const float v = host_data[i];
+        if (std::isnan(v)) {
+            n_nan++;
+            continue;
+        }
+        if (std::isinf(v)) {
+            n_inf++;
+            continue;
+        }
+        min_val = std::min(min_val, v);
+        max_val = std::max(max_val, v);
         sum += v;
     }
-    fprintf(stderr, "  Stats: min=%.6f max=%.6f mean=%.6f\n", min_val, max_val, sum / total_elements);
-    // Print first few values for each dimension
-    if (is_kqv || is_fattn) {
-        // For attention output: [D][n_heads][n_queries][batch] or similar
-        // Print first 8 values for first few heads
-        fprintf(stderr, "  Output (first 8 values per head, first query):\n");
-        for (int h = 0; h < std::min((int) ne2, 8); h++) {
-            fprintf(stderr, "    h=%2d: [", h);
-            for (int d = 0; d < std::min((int) ne0, 8); d++) {
-                // Assuming layout [D][n_queries][n_heads][batch] -> index = d + ne0*(q + ne1*(h + ne2*b))
-                size_t idx = d + ne0 * (0 + ne1 * h);  // first query
-                fprintf(stderr, "%.6f%s", host_data[idx], d < 7 ? ", " : "");
-            }
-            fprintf(stderr, "]\n");
-        }
-        // Print a few higher heads
 
-        for (int h : { 8, 16, 32, 63 }) {
-            if (h < (int) ne2) {
-                fprintf(stderr, "    h=%2d: [", h);
-                for (int d = 0; d < std::min((int) ne0, 8); d++) {
-                    size_t idx = d + ne0 * (0 + ne1 * h);
-                    fprintf(stderr, "%.6f%s", host_data[idx], d < 7 ? ", " : "");
-                }
-                fprintf(stderr, "]\n");
-            }
-        }
-    } else if (is_kq_soft_max) {
-        // For attention weights: [n_kv][n_queries][n_heads][batch]
-        // Print attention weights for first query of first few heads
-        fprintf(stderr, "  Attention weights (first 16 KV positions, first query):\n");
-        for (int h = 0; h < std::min((int) ne2, 4); h++) {
-            fprintf(stderr, "    h=%2d: [", h);
-            for (int kv = 0; kv < std::min((int) ne0, 16); kv++) {
-                size_t idx = kv + ne0 * (0 + ne1 * h);
-                fprintf(stderr, "%.4f%s", host_data[idx], kv < 15 ? ", " : "");
-            }
-            fprintf(stderr, "]\n");
-        }
-    }
-    // Write full dump to file
-    char filename[256];
-    snprintf(filename, sizeof(filename), "/tmp/fa_debug/nonfa_%s_call%03d.txt",
+    const uint64_t hash =
+        ggml_sycl_fnv1a_bytes(reinterpret_cast<const uint8_t *>(host_data.data()), sample_elems * sizeof(float));
+
+#if !defined(_WIN32)
+    mkdir(ggml_sycl_non_fa_attn_dump_dir(), 0777);
+#endif
+    char filename[512];
+    snprintf(filename, sizeof(filename), "%s/%s_call%03d.bin", ggml_sycl_non_fa_attn_dump_dir(),
              is_kq ? "kq" : (is_kq_soft_max ? "kq_softmax" : (is_kqv ? "kqv" : "fattn")), call_num);
-    FILE * f = fopen(filename, "w");
-
+    FILE * f = fopen(filename, "wb");
     if (f) {
-        fprintf(f, "# Tensor: %s call=%d shape=[%lld,%lld,%lld,%lld]\n", name, call_num, (long long) ne0,
-                (long long) ne1, (long long) ne2, (long long) ne3);
-
-        fprintf(f, "# Strides: nb=[%zu,%zu,%zu,%zu]\n", dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
-        fprintf(f, "\n=== DATA ===\n");
-        // Write all data organized by dimensions
-        for (int64_t i3 = 0; i3 < ne3; i3++) {
-            for (int64_t i2 = 0; i2 < ne2; i2++) {
-                for (int64_t i1 = 0; i1 < ne1; i1++) {
-                    fprintf(f, "[b=%lld,h=%lld,q=%lld]: ", (long long) i3, (long long) i2, (long long) i1);
-                    for (int64_t i0 = 0; i0 < ne0; i0++) {
-                        size_t idx = i0 + ne0 * (i1 + ne1 * (i2 + ne2 * i3));
-                        fprintf(f, "%.6f ", host_data[idx]);
-                    }
-                    fprintf(f, "\n");
-                }
-            }
-        }
+        const int32_t meta[] = { (int32_t) dst->op, (int32_t) dst->type, (int32_t) call_num };
+        fwrite(meta, sizeof(meta), 1, f);
+        const int64_t shape[] = { ne0, ne1, ne2, ne3 };
+        fwrite(shape, sizeof(shape), 1, f);
+        const uint64_t counts[] = { (uint64_t) total_elements, (uint64_t) sample_elems };
+        fwrite(counts, sizeof(counts), 1, f);
+        fwrite(host_data.data(), sizeof(float), sample_elems, f);
         fclose(f);
-        fprintf(stderr, "  [Wrote full dump to %s]\n", filename);
+    }
+
+    GGML_LOG_INFO(
+        "[NON-FA-ATTN] name=%s call=%d op=%s ne=[%lld,%lld,%lld,%lld] nb=[%lld,%lld,%lld,%lld] elems=%zu "
+        "sample=%zu min=%g max=%g mean=%g nan=%d inf=%d hash=%016llx file=%s\n",
+        name, call_num, ggml_op_name(dst->op), (long long) ne0, (long long) ne1, (long long) ne2, (long long) ne3,
+        (long long) dst->nb[0], (long long) dst->nb[1], (long long) dst->nb[2], (long long) dst->nb[3],
+        total_elements, sample_elems, min_val, max_val, sum / (double) sample_elems, n_nan, n_inf,
+        (unsigned long long) hash, f ? filename : "(not-written)");
+
+    const int rows_to_print = (is_kq_soft_max || is_kqv || is_fattn) ? std::min<int>((int) ne2, 4) : 1;
+    for (int row = 0; row < rows_to_print; ++row) {
+        const size_t base = (size_t) ne0 * (size_t) ne1 * (size_t) row;
+        if (base >= sample_elems) {
+            break;
+        }
+        fprintf(stderr, "[NON-FA-ATTN-SAMPLE] name=%s call=%d plane=%d values=", name, call_num, row);
+        const int n_print = std::min<int>((int) ne0, 8);
+        for (int i = 0; i < n_print && base + (size_t) i < sample_elems; ++i) {
+            fprintf(stderr, "%s%.7g", i == 0 ? "" : ",", host_data[base + (size_t) i]);
+        }
+        fprintf(stderr, "\n");
     }
 }
-#endif
 
 // Build the layer device map from tensor inventory.
 // Initializes g_layer_on_cpu vector sized by max layer.
@@ -39655,11 +39782,7 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
         default:
             return false;
     }
-#if NON_FA_DEBUG_DUMP
-    // Dump attention-related tensors after computation
-
     dump_non_fa_attention_tensor(ctx, dst);
-#endif
 
     // Dispatch overhead accumulation
     if (dt.enabled) {
@@ -42121,6 +42244,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     }
 #endif  // GGML_SYCL_DNNL
 
+    const bool graph_has_non_fa_attn = ggml_sycl_graph_has_non_fa_attn(cgraph);
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         GGML_SYCL_DEBUG("[DEBUG-IMPL] Node %d/%d: ", i, cgraph->n_nodes);
         g_preclassified_node_idx = i;
@@ -43076,7 +43201,17 @@ gpu_dispatch:
                 }
             }
         }
-        if (g_ggml_sycl_debug_sync && !ggml_sycl_graph_recording_active()) {
+        if (ggml_sycl_needs_non_fa_attn_sync(node, graph_has_non_fa_attn) && !ggml_sycl_graph_recording_active()) {
+            try {
+                sycl_ctx->stream(sycl_ctx->device, 0)->ext_oneapi_submit_barrier();
+            } catch (const sycl::exception & e) {
+                GGML_LOG_ERROR("[SYCL] non-FA attention barrier failed after node %d (%s): %s\n", i,
+                               node->name ? node->name : "(null)", e.what());
+                std::abort();
+            }
+        }
+        if ((g_ggml_sycl_debug_sync || ggml_sycl_selective_debug_sync_enabled(node)) &&
+            !ggml_sycl_graph_recording_active()) {
             try {
                 queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
                 stream->wait_and_throw();
