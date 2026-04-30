@@ -1001,14 +1001,15 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
     // Ineligible: gpt-oss-20b (sinks+softcap), Gemma-2 (softcap), FP8 KV.
     // Dispatched BEFORE XMX/TILE so PP benefits from oneDNN's fused kernel.
     // Falls back to kernel path if oneDNN compile fails or during graph recording.
-    // oneDNN SDPA path has no prec-hint wiring today (see llama.cpp-0kpp3); its
-    // internal accumulator follows oneDNN's primitive choice, which on Xe2
-    // reduces to f16 under the GGML_SYCL_F16 build path. Skip oneDNN when the
-    // caller explicitly requested PREC_F32 so the XMX-v2 kernel (which DOES
-    // respect the hint via Acc_t=float) takes over. This is a correctness
-    // guardrail — a future task can extend oneDNN with its own f32-accum
-    // dispatch to regain PP throughput under PREC_F32.
-    const bool skip_onednn_for_prec_f32 = (params.prec == GGML_PREC_F32);
+    // oneDNN SDPA has no explicit ggml PREC_F32 accumulator contract today.
+    // Keep PREC_F32 on the deterministic XMX-v2 path by default; allow explicit
+    // oneDNN proof runs because it is the likely PP performance target once its
+    // numerical/stride behavior is fixed for llama graphs.
+    static const bool allow_onednn_prec_f32 = [] {
+        const char * env = std::getenv("GGML_SYCL_FA_ONEDNN_ALLOW_PREC_F32");
+        return env && std::atoi(env) != 0;
+    }();
+    const bool skip_onednn_for_prec_f32 = (params.prec == GGML_PREC_F32 && !allow_onednn_prec_f32);
     if (!safe_decode && g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled && !skip_onednn_for_prec_f32) {
         const bool multi_seq = (params.n_seqs > 1);
         if (ggml_sycl_flash_attn_ext_onednn_eligible(params,
@@ -1033,9 +1034,19 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
             const char * env = std::getenv("GGML_SYCL_FA_XMX_V1");
             return env && std::atoi(env) != 0;
         }();
+        static const bool disable_xmx_v1_pp = []() {
+            const char * env = std::getenv("GGML_SYCL_FA_XMX_V1_PP");
+            return env && std::atoi(env) == 0;
+        }();
+        const bool simple_pp_xmx_v1 =
+            !disable_xmx_v1_pp && ne01 >= 8 && D == 128 && params.sinks == nullptr && params.logit_softcap == 0.0f &&
+            !params.kv_is_fp8;
 
-        if (force_xmx_v1) {
-            // v1 kernel — kept for A/B regression; produces non-deterministic output on gpt-oss-20b
+        if (force_xmx_v1 || simple_pp_xmx_v1) {
+            // v1 kernel — kept for A/B regression and used for simple D=128 PP
+            // FA shapes where v2's small tile is much slower. Do not use this
+            // for sink/softcap/FP8/TG cases that motivated the deterministic v2
+            // default.
             if (ne01 <= 1) {
                 GGML_SYCL_KTRACE("fattn_xmx_v1_f16", " D=%d ncols=1 ne01=%d", D, ne01);
                 DISPATCH_NCOLS(1, launch_fattn_xmx_f16);
