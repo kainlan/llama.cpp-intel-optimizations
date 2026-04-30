@@ -1080,18 +1080,25 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
                     DISPATCH_NCOLS_CTX_ACC(2, launch_fattn_xmx_v2_f16, afloat);
                 }
             } else if (ne01 <= 4) {
-                GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=4 ne01=%d prec=%d", D, ne01, (int) params.prec);
-                if (use_f32_acc) {
-                    DISPATCH_NCOLS_CTX_ACC(4, launch_fattn_xmx_v2_f16, float);
-                } else {
-                    DISPATCH_NCOLS_CTX_ACC(4, launch_fattn_xmx_v2_f16, afloat);
-                }
-            } else {
                 GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=8 ne01=%d prec=%d", D, ne01, (int) params.prec);
                 if (use_f32_acc) {
                     DISPATCH_NCOLS_CTX_ACC(8, launch_fattn_xmx_v2_f16, float);
                 } else {
                     DISPATCH_NCOLS_CTX_ACC(8, launch_fattn_xmx_v2_f16, afloat);
+                }
+            } else if (ne01 <= 16) {
+                GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=16 ne01=%d prec=%d", D, ne01, (int) params.prec);
+                if (use_f32_acc) {
+                    DISPATCH_NCOLS_CTX_ACC(16, launch_fattn_xmx_v2_f16, float);
+                } else {
+                    DISPATCH_NCOLS_CTX_ACC(16, launch_fattn_xmx_v2_f16, afloat);
+                }
+            } else {
+                GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=16 ne01=%d prec=%d", D, ne01, (int) params.prec);
+                if (use_f32_acc) {
+                    DISPATCH_NCOLS_CTX_ACC(16, launch_fattn_xmx_v2_f16, float);
+                } else {
+                    DISPATCH_NCOLS_CTX_ACC(16, launch_fattn_xmx_v2_f16, afloat);
                 }
             }
             if (!v2_dispatched) {

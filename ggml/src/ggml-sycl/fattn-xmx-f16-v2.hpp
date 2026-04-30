@@ -118,15 +118,15 @@ struct variant_info {
 
 // Leaf 0: (8, 16, 16) — always available, validated on Xe2 (B580, B50).
 // Matches matrix_combinations entry `0x16x16 max=8x0x0` with fp16 A/B and fp32 C/D.
-// Future leaf candidates (each requires its own kernel specialization, NOT just
-// an array entry — follow-up tasks will add them):
-//   { 1, 64, 16, 1 }   — ncols=1 TG fast path, matches `1x16x64 fp16→fp32`
-//   { 16, 16, 16, 16 } — ncols>=16 path, matches `16x16x16 fp16→fp32`
+//
+// Leaf 1: (16, 16, 16) — ncols>=16 path, matches `16x16x16 fp16→fp32`
+//   SLM for D=128, nc=16: Q=4096 + K=4096 + V=4096 + S=512 = 12800 halves = 25 KB
+//   Fits B580's 128 KB SLM for nc<=8; for nc>8 uses nc=16 SLM budget.
 //
 // Triple-brace init: std::array<T, N> wraps a single-element C-array; the outer
 // pair opens the array, the middle opens the C-array, and the innermost opens
 // the variant_info aggregate.
-static constexpr std::array<variant_info, 1> fattn_xmx_v2_variants = { { { 8, 16, 16, 8 } } };
+static constexpr std::array<variant_info, 2> fattn_xmx_v2_variants = { { { 8, 16, 16, 8 }, { 16, 16, 16, 16 } } };
 
 static_assert(fattn_xmx_v2_variants[0].tm == 8 && fattn_xmx_v2_variants[0].tk == 16 &&
                   fattn_xmx_v2_variants[0].tn == 16,
@@ -279,11 +279,12 @@ struct fattn_xmx_v2_device_cache {
     bool           slm_ok         = false;
 };
 
-// Bytes of SLM required for the fallback leaf's worst case (D=256, ncols=8).
+// Bytes of SLM required for the fallback leaf's worst case (D=256, NCOLS=16).
 // fattn_v2_slm<D, ncols>::TOTAL is in sycl::half units, so multiply by sizeof(half).
+// NCOLS=16 covers all PP shapes (nc<=16 dispatches as NCOLS=16, nc>16 clips to NCOLS=16).
 static constexpr size_t fattn_xmx_v2_required_slm_bytes() {
     constexpr size_t D_max     = 256;
-    constexpr size_t ncols_max = 8;
+    constexpr size_t ncols_max = 16;
     constexpr size_t halves    = ncols_max * D_max + 2 * XMX_V2_BATCH_KV * D_max + ncols_max * XMX_V2_BATCH_KV;
     return halves * sizeof(sycl::half);
 }
@@ -430,8 +431,9 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
                                               int64_t                  nb33,
                                               const sycl::nd_item<3> & item,
                                               sycl::half *             slm) {
-    static_assert(TM == XMX_V2_TM && TK == XMX_V2_TK && TN == XMX_V2_TN,
-                  "Only the (8,16,16) fallback leaf body is implemented today. "
+    static_assert((TM == XMX_V2_TM && TK == XMX_V2_TK && TN == XMX_V2_TN) ||
+                  (TM == 16 && TK == XMX_V2_TK && TN == XMX_V2_TN),
+                  "Only (8,16,16) and (16,16,16) fallback leaf bodies are implemented. "
                   "Follow-up tasks must add kernel specializations for other leaves.");
     static_assert(D % TK == 0, "D must be divisible by TK");
     static_assert(ncols % TM == 0 || ncols < TM, "ncols must be <= TM or a multiple of TM");
@@ -856,9 +858,11 @@ bool launch_fattn_xmx_v2_f16(ggml_backend_sycl_context & ctx, const fattn_params
     }
 
     switch (variant_idx) {
-        // When adding future variants, append a case here and an entry in
-        // `fattn_xmx_v2_variants[]`. The `default` catches both the fallback-leaf
-        // selection and any unrecognized future index (defensive).
+        // variant 1: (16, 16, 16) — larger tile for better XMX utilization
+        case 1:
+            launch_fattn_xmx_v2_f16_leaf<D, ncols, use_logit_softcap, Q_type, Acc_t, kv_is_fp8,
+                                         /*TM=*/16, /*TK=*/16, /*TN=*/16>(params, stream);
+            break;
         default:
             launch_fattn_xmx_v2_f16_leaf<D, ncols, use_logit_softcap, Q_type, Acc_t, kv_is_fp8,
                                          /*TM=*/8, /*TK=*/16, /*TN=*/16>(params, stream);
