@@ -62,10 +62,19 @@ void ggml_sycl_sdpa_cache_destroy(void * ptr) {
 // Eligibility gate
 // -------------------------------------------------------------------
 bool ggml_sycl_flash_attn_ext_onednn_eligible(const fattn_params & params,
-                                              int                  H_q,
-                                              int                  H_kv,
-                                              bool                 kv_is_fp8,
-                                              bool                 multi_seq) {
+                                                int                  H_q,
+                                                int                  H_kv,
+                                                bool                 kv_is_fp8,
+                                                bool                 multi_seq) {
+    // Default threshold is 8 to avoid excessive JIT recompilation during TG.
+    // GGML_SYCL_FA_ONEDNN_MIN_NCOLS=0 disables the threshold (all batch sizes).
+    static const int onednn_min_ncols = []() {
+        const char *e = std::getenv("GGML_SYCL_FA_ONEDNN_MIN_NCOLS");
+        return e ? std::atoi(e) : 8;
+    }();
+    if (params.ne01 < onednn_min_ncols) {
+        return false;
+    }
     if (params.sinks) {
         return false;  // attention sinks unsupported
     }
@@ -84,10 +93,14 @@ bool ggml_sycl_flash_attn_ext_onednn_eligible(const fattn_params & params,
     if (params.ne11 <= 0) {
         return false;  // empty KV
     }
-    // Only use for PP (ncols >= 8): TG (ncols=1-7) has unstable ne11 per step,
-    // causing excessive JIT recompilation that dominates latency.
-    if (params.ne01 < 8) {
-        return false;
+    if (H_q != H_kv) {
+        const int d_val = (int) params.ne00;
+        if ((int) (params.nb11 / (int64_t)sizeof(sycl::half)) != d_val) {
+            return false;
+        }
+        if ((int) (params.nb01 / (int64_t)sizeof(sycl::half)) != d_val) {
+            return false;
+        }
     }
     // The compiled partition is built with Q/K/V dtypes taken from params.*_type.
     // Scale and scratch buffer sizing assumes f16 Q (sizeof(half) scale slot),
@@ -627,16 +640,11 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
     if (key.has_mask) {
         in_tensors.push_back(t_mask);
     }
-    in_tensors.push_back(t_v);
+   in_tensors.push_back(t_v);
 
     std::vector<dnnl::graph::tensor> out_tensors = { t_out };
 
-    // ---- Execute via SYCL interop API ----------------------------------------
-    // Use sycl_interop::execute (not the member execute) so oneDNN properly
-    // integrates with the SYCL queue's dependency chain and returns a SYCL event.
-    // The member execute() uses the generic C API which may not sequence correctly
-    // for SYCL streams, causing temporary_scratchpad_t destructor throws.
-    try {
+  try {
         dnnl::stream dnnl_stream = ctx.stream_dnnl(stream);
         dnnl::graph::sycl_interop::execute(entry->cp, dnnl_stream, in_tensors, out_tensors);
     } catch (std::exception & e) {

@@ -1000,24 +1000,15 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
     // below and must win before the oneDNN branch considers the op.
     // Ineligible: gpt-oss-20b (sinks+softcap), Gemma-2 (softcap), FP8 KV.
     // Dispatched BEFORE XMX/TILE so PP benefits from oneDNN's fused kernel.
-    // Falls back to kernel path if oneDNN compile fails or during graph recording.
-    // oneDNN SDPA has no explicit ggml PREC_F32 accumulator contract today.
-    // Keep PREC_F32 on the deterministic XMX-v2 path by default; allow explicit
-    // oneDNN proof runs because it is the likely PP performance target once its
-    // numerical/stride behavior is fixed for llama graphs.
-    static const bool allow_onednn_prec_f32 = [] {
-        const char * env = std::getenv("GGML_SYCL_FA_ONEDNN_ALLOW_PREC_F32");
-        return env && std::atoi(env) != 0;
-    }();
-    const bool skip_onednn_for_prec_f32 = (params.prec == GGML_PREC_F32 && !allow_onednn_prec_f32);
-    if (!safe_decode && g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled && !skip_onednn_for_prec_f32) {
+// Falls back to kernel path if oneDNN compile fails or during graph recording.
+   if (!safe_decode && g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled) {
         const bool multi_seq = (params.n_seqs > 1);
         if (ggml_sycl_flash_attn_ext_onednn_eligible(params,
                                                      params.ne02,  // H_q
                                                      params.ne12,  // H_kv
                                                      params.kv_is_fp8, multi_seq)) {
             GGML_SYCL_KTRACE("fattn_onednn", " D=%d ne01=%d ne11=%d H_q=%d H_kv=%d", D, ne01, params.ne11, params.ne02,
-                             params.ne12);
+                              params.ne12);
             if (ggml_sycl_flash_attn_ext_onednn(ctx, params)) {
                 return;
             }
@@ -1132,10 +1123,9 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
 
 // Main flash attention entry point
 void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor safe_dst) {
-    GGML_SYCL_PROFILE_SCOPE_FA("flash_attn");
-    // Initialize configuration on first call
-#if GGML_SYCL_FA_V2_ENABLED
-    init_paged_v2_config();
+     GGML_SYCL_PROFILE_SCOPE_FA("flash_attn");
+     // Initialize configuration on first call
+     #if GGML_SYCL_FA_V2_ENABLED
 #endif
     init_kv_fp8_config();
     init_fa_esimd_config();
