@@ -93,12 +93,15 @@ bool ggml_sycl_flash_attn_ext_onednn_eligible(const fattn_params & params,
     if (params.ne11 <= 0) {
         return false;  // empty KV
     }
-    if (H_q != H_kv) {
-        const int d_val = (int) params.ne00;
-        if ((int) (params.nb11 / (int64_t)sizeof(sycl::half)) != d_val) {
-            return false;
-        }
-        if ((int) (params.nb01 / (int64_t)sizeof(sycl::half)) != d_val) {
+    // GQA contiguity: K must be contiguous in nc-D plane (nc == D).
+    //   K nc-stride in elements = params.nb11 / sizeof(half).
+    //   oneDNN 4-D strided layout only works when nc == D (Q and K share
+    //   contiguous rows).  When nc != D the strided strides can't express
+    //   the actual GGML layout → oneDNN reads wrong memory → bad output.
+    {
+        int nc_elK = (int)(params.nb11 / sizeof(sycl::half));
+        int d_val  = (int)params.ne00;
+        if (nc_elK != d_val) {
             return false;
         }
     }
