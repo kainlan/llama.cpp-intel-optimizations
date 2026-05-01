@@ -912,6 +912,71 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
     return true;
 }
 
+// =============================================================================
+// Shape-aware FA dispatch table (5edo8.5)
+// =============================================================================
+
+enum class fattn_result : int {
+    vec,
+    esimd,
+    onednn,
+    xmx_v1,
+    xmx_v2_tm8,
+    xmx_v2_tm16,
+    tile,
+    fallback
+};
+
+struct fattn_dispatch_key {
+    int D;
+    int ne01;       // query count (ncols after bucketing)
+    int ncols;      // compile-time bucket selected by caller
+    int ne11;       // KV length
+    int H_q;
+    int H_kv;
+    bool has_mask;
+    bool has_sinks;
+    float logit_softcap;
+    bool kv_is_fp8;
+    bool paged_v2;
+    int  prec;  // GGML_PREC_* value
+    int  xmx_variant_capable;  // 0=tm8, 1=tm16 supported, -1=unknown
+};
+
+struct fattn_dispatch_result {
+    fattn_result path;
+    const char * reason;
+};
+
+static fattn_dispatch_result fattn_pick_dispatch(const fattn_dispatch_key & key) noexcept {
+    // Env overrides: GGML_SYCL_FA_FORCE_PATH overrides all shape-based selection
+    const char *force = std::getenv("GGML_SYCL_FA_FORCE_PATH");
+    if (force) {
+        if (strcmp(force, "vec") == 0)             return {fattn_result::vec,       "FA_FORCE_PATH=vec"};
+        if (strcmp(force, "esimd") == 0)           return {fattn_result::esimd,     "FA_FORCE_PATH=esimd"};
+        if (strcmp(force, "onednn") == 0)          return {fattn_result::onednn,    "FA_FORCE_PATH=onednn"};
+        if (strcmp(force, "xmx-v1") == 0)          return {fattn_result::xmx_v1,    "FA_FORCE_PATH=xmx-v1"};
+        if (strcmp(force, "xmx-v2-tm8") == 0)      return {fattn_result::xmx_v2_tm8, "FA_FORCE_PATH=xmx-v2-tm8"};
+        if (strcmp(force, "xmx-v2-tm16") == 0)     return {fattn_result::xmx_v2_tm16, "FA_FORCE_PATH=xmx-v2-tm16"};
+        if (strcmp(force, "tile") == 0)                    return {fattn_result::tile,      "FA_FORCE_PATH=tile"};
+    }
+
+    // TG decode (single token): VEC is fastest and safest for nc<=1
+    if (key.ne01 <= 1) {
+        return {fattn_result::vec, "TG single-token: VEC fastest + safest"};
+    }
+    // oneDNN: retired for GQA nc≠D; opt-in via GGML_SYCL_FA_ONEDNN_ALLOW
+    if (std::getenv("GGML_SYCL_FA_ONEDNN_ALLOW")) {
+        return {fattn_result::onednn, "oneDNN opt-in via GGML_SYCL_FA_ONEDNN_ALLOW"};
+    }
+    // XMX-v2 TM=16: only for large PP shapes (ncmls>=16, D>=128, no-GQA)
+    if (key.H_q == key.H_kv && key.ncols >= 16 && key.D >= 128 && key.xmx_variant_capable >= 1) {
+        return {fattn_result::xmx_v2_tm16, "PP large: XMX-v2 TM=16"};
+    }
+    // Default conservative: XMX-v2 TM=8
+    return {fattn_result::xmx_v2_tm8, "PP default: XMX-v2 TM=8 (conservative)"};
+}
+
 // Dispatcher that selects appropriate kernel based on head dimension and GPU capabilities
 template <int D, typename Q_type>
 static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & ctx, const fattn_params & params) {
