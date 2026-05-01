@@ -50309,13 +50309,22 @@ normal_dispatch:
                          !sycl_ctx->graphs_disabled && check_graph_compatibility(*sycl_ctx, cgraph) &&
                          !(g_sycl_tp_config.enabled && g_sycl_tp_config.world_size > 1);
     }
-    if (use_sycl_graph && cached_is_decode && g_has_placement_plan && ggml_sycl_graph_has_host_inputs(cgraph)) {
+   if (use_sycl_graph && cached_is_decode && g_has_placement_plan && ggml_sycl_graph_has_host_inputs(cgraph)) {
         static std::atomic<bool> logged{ false };
-        if (!logged.exchange(true, std::memory_order_acq_rel)) {
+        bool enable_decode_graph_host_inputs = getenv("GGML_SYCL_ENABLE_DECODE_GRAPH_HOST_INPUTS") != nullptr;
+        bool host_input_debug = getenv("GGML_SYCL_GRAPH_HOST_INPUT_DEBUG") != nullptr;
+
+        if (host_input_debug && !logged.exchange(true, std::memory_order_acq_rel)) {
             GGML_LOG_INFO(
-                "[SYCL-GRAPH] Disabled for decode graphs with planner-host intermediates; using direct dispatch\n");
+                "[SYCL-GRAPH] Decode has host inputs: guard=%s, opt-in=%s, dispatch=%s\n",
+                enable_decode_graph_host_inputs ? "ALLOWED (opt-in)" : "BLOCKED (default)",
+                enable_decode_graph_host_inputs ? "true" : "false",
+                enable_decode_graph_host_inputs ? "graph replay" : "direct dispatch");
         }
-        use_sycl_graph = false;
+
+        if (!enable_decode_graph_host_inputs) {
+            use_sycl_graph = false;
+        }
     }
     // Graph debug output (controlled by GGML_SYCL_DEBUG)
     static int graph_call_count = 0;

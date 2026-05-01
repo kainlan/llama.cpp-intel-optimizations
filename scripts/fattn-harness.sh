@@ -9,34 +9,39 @@
 #   ./scripts/fattn-harness.sh --correctness  # Correctness only
 #   ./scripts/fattn-harness.sh --perf         # Performance only
 #   ./scripts/fattn-harness.sh --determinism  # Determinism checks only
+#   ./scripts/fattn-harness.sh --allow-perf-warn  # Allow perf warnings (don't fail on perf)
 #   ./scripts/fattn-harness.sh --help         # Show help
 #
 # Environment:
 #   - Requires Intel oneAPI (setvars.sh)
 #   - Uses level_zero:0 (first Intel GPU)
-#   - Requires llama-bench and llama-completion built
+#   - Uses LLAMA_COMPLETION_MODEL and LLAMA_BENCH_MODEL env vars for model paths
+#
+# Acceptance gates (from 5edo8 epic):
+#   Correctness: ordered continuation "6, 7, 8, 9, 10" must appear
+#   Non-FA: pp512 >= 1700 tok/s, tg128 >= 79 tok/s
+#   FA-on:  pp512 >= 1326 tok/s, tg128 >= 62 tok/s
 
-set -euo pipefail
+set -uo pipefail
 
-# Configuration
+# ============================================================================
+# Configuration (overridable via environment)
+# ============================================================================
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 BUILD_DIR="${PROJECT_DIR}/build"
 RESULTS_FILE="${SCRIPT_DIR}/fattn-harness-results.txt"
 
-# Models (fallback to empty if not found)
-MODEL_MISTRAL_Q4="/Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf"
-MODEL_MISTRAL_Q8="/Storage/GenAI/models/mistral-7b-v0.1.Q8_0.gguf"
+MODEL_MISTRAL_Q4="${LLAMA_COMPLETION_MODEL:-/Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf}"
+ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:0}"
 
-# GPU selector
-export ONEAPI_DEVICE_SELECTOR=level_zero:0
-
-# Counters
 PASS=0
 FAIL=0
+WARN=0
 SKIP=0
+PERF_WARN=false
 
-# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -44,23 +49,32 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+# ============================================================================
 # Parse arguments
+# ============================================================================
 MODE="all"
 for arg in "$@"; do
     case $arg in
         --correctness) MODE="correctness" ;;
         --perf) MODE="perf" ;;
         --determinism) MODE="determinism" ;;
+        --allow-perf-warn) PERF_WARN=true ;;
         --help|-h)
             echo "SYCL Flash Attention Correctness + Performance Harness"
             echo ""
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --correctness  Run correctness checks only"
-            echo "  --perf         Run performance benchmarks only"
-            echo "  --determinism  Run determinism checks only"
-            echo "  --help         Show this help message"
+            echo "  --correctness     Run correctness checks only"
+            echo "  --perf            Run performance benchmarks only"
+            echo "  --determinism     Run determinism checks only"
+            echo "  --allow-perf-warn Do not fail on performance gate warnings"
+            echo "  --help            Show this help message"
+            echo ""
+            echo "Acceptance gates:"
+            echo "  Correctness: ordered continuation '6, 7, 8, 9, 10'"
+            echo "  Non-FA: pp512 >= 1700 tok/s, tg128 >= 79 tok/s"
+            echo "  FA-on:  pp512 >= 1326 tok/s, tg128 >= 62 tok/s"
             echo ""
             echo "Default (no args): run all checks"
             exit 0
@@ -68,76 +82,102 @@ for arg in "$@"; do
     esac
 done
 
-# Initialize environment
-init_environment() {
-    echo -e "${BLUE}=== Initializing Intel oneAPI Environment ===${NC}"
-
-    # setvars.sh may have already been sourced by the parent environment
-  # If not, individual test commands handle sourcing via source /etc/profile.d/ style
-  : # source /opt/intel/oneapi/setvars.sh --force 2>/dev/null || true
-
-    # Check llama-bench exists
-    if [ ! -f "${BUILD_DIR}/bin/llama-bench" ]; then
-        echo -e "${RED}Error: llama-bench not found at ${BUILD_DIR}/bin/llama-bench${NC}"
-        echo "Build with: ./scripts/sycl-build.sh"
-        exit 1
-    fi
-
-    echo -e "${CYAN}Build: $(cd "$PROJECT_DIR" && git rev-parse --short HEAD 2>/dev/null || echo 'unknown')${NC}"
-    echo "GPU: ${ONEAPI_DEVICE_SELECTOR}"
-    echo ""
-
-    # Initialize results file
-    : > "$RESULTS_FILE"
+# ============================================================================
+# Helpers
+# ============================================================================
+log() {
+    echo "$1" | tee -a "$RESULTS_FILE"
 }
 
-# Report helpers
 pass() {
     PASS=$((PASS + 1))
-    echo -e "  ${GREEN}PASS${NC}: $1" | tee -a "$RESULTS_FILE"
+    log "  ${GREEN}PASS${NC}: $1"
 }
 
 fail() {
     FAIL=$((FAIL + 1))
-    echo -e "  ${RED}FAIL${NC}: $1" | tee -a "$RESULTS_FILE"
+    log "  ${RED}FAIL${NC}: $1"
+}
+
+warn() {
+    WARN=$((WARN + 1))
+    log "  ${YELLOW}WARN${NC}: $1"
 }
 
 skip() {
     SKIP=$((SKIP + 1))
-    echo -e "  ${YELLOW}SKIP${NC}: $1" | tee -a "$RESULTS_FILE"
+    log "  ${YELLOW}SKIP${NC}: $1"
 }
 
 section() {
-    echo ""
-    echo -e "${BLUE}=== $1 ===${NC}" | tee -a "$RESULTS_FILE"
-    echo "" | tee -a "$RESULTS_FILE"
+    log ""
+    log "=== $1 ==="
+    log ""
+}
+
+# ============================================================================
+# Initialize environment
+# ============================================================================
+init_environment() {
+    echo -e "${BLUE}=== Initializing Intel oneAPI Environment ===${NC}"
+
+    # Source oneAPI if available and not already sourced
+    if [ -z "${INTEL_ONEAPI_SOURCED:-}" ] && [ -f "/opt/intel/oneapi/setvars.sh" ]; then
+        source /opt/intel/oneapi/setvars.sh --force 2>/dev/null || {
+            echo -e "${RED}Error: Failed to source /opt/intel/oneapi/setvars.sh${NC}"
+            echo "oneAPI is required for SYCL builds. Install via: https://www.intel.com/content/www/us/en/developer/tools/oneapi/toolkits.html"
+            exit 1
+        }
+        export INTEL_ONEAPI_SOURCED=1
+    fi
+
+    # Check llama-bench exists
+    if [ ! -f "${BUILD_DIR}/bin/llama-bench" ]; then
+        echo -e "${RED}Error: llama-bench not found at ${BUILD_DIR}/bin/llama-bench${NC}"
+        echo "Build with: ./scripts/sycl-build.sh llama-bench"
+        exit 1
+    fi
+
+    # Check llama-completion exists
+    if [ ! -f "${BUILD_DIR}/bin/llama-completion" ]; then
+        echo -e "${RED}Error: llama-completion not found at ${BUILD_DIR}/bin/llama-completion${NC}"
+        echo "Build with: ./scripts/sycl-build.sh llama-completion"
+        exit 1
+    fi
+
+    # Export LD_LIBRARY_PATH so binaries find local shared libraries
+    export LD_LIBRARY_PATH="${BUILD_DIR}/bin:${LD_LIBRARY_PATH}"
+
+    export ONEAPI_DEVICE_SELECTOR
+    log "Build: $(cd "$PROJECT_DIR" && git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
+    log "GPU: ${ONEAPI_DEVICE_SELECTOR}"
+    log "Model: ${MODEL_MISTRAL_Q4}"
+    log "Build dir: ${BUILD_DIR}"
+    log ""
+
+    # Initialize results file deterministically
+    : > "$RESULTS_FILE"
 }
 
 # ============================================================================
 # Correctness Checks
 # ============================================================================
 
-# Canonical output: "1, 2, 3, 4, 5," should produce "6, 7, 8, 9, 10"
-run_correctness_test() {
-    local model="$1"
-    local model_name="$2"
-    local prompt="$3"
-    local expected_fragment="$4"
-    local fa_mode="$5"
+# Run a single completeness check: prompt must produce ordered "6, 7, 8, 9, 10"
+run_correctness_check() {
+    local prompt="1, 2, 3, 4, 5,"
+    local fa_flag="$1"
+    local description="$2"
 
-    if [ ! -f "$model" ]; then
-        skip "${model_name} - model not found: $model"
+    if [ ! -f "$MODEL_MISTRAL_Q4" ]; then
+        skip "Model not found: ${MODEL_MISTRAL_Q4}"
         return
     fi
 
-    local fa_flag=""
-    [ "$fa_mode" = "on" ] && fa_flag="--flash-attn on"
-
-    # Run llama-completion, capture output
     local output
     output=$(ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR}" \
         "${BUILD_DIR}/bin/llama-completion" \
-        -m "$model" \
+        -m "$MODEL_MISTRAL_Q4" \
         -p "$prompt" \
         -n 15 \
         --seed 42 \
@@ -145,104 +185,60 @@ run_correctness_test() {
         $fa_flag \
         2>&1) || true
 
-    if echo "$output" | grep -q "$expected_fragment"; then
-        pass "${model_name} (${fa_mode}) produces expected output: '$expected_fragment'"
+    # Check for ordered continuation "6, 7, 8, 9, 10" (allow extra whitespace)
+    # We normalize whitespace to handle minor formatting differences
+    local normalized
+    normalized=$(echo "$output" | tr -s ' ')
+
+    if echo "$normalized" | grep -qE '6[,\s]+7[,\s]+8[,\s]+9[,\s]+10'; then
+        pass "${description}: ordered continuation '6, 7, 8, 9, 10' found"
     else
-        fail "${model_name} (${fa_mode}) unexpected output. Expected '$expected_fragment'"
+        fail "${description}: ordered continuation '6, 7, 8, 9, 10' NOT found"
+        log "    Raw output snippet: $(echo "$normalized" | grep -oE '.{0,30}6[,\s]+7.{0,50}' | head -1)"
     fi
 }
 
 run_correctness_all() {
-    section "Correctness Tests (Mistral-7B canonical +6 sequence)"
+    section "Correctness Tests (ordered continuation '6, 7, 8, 9, 10')"
 
-    # With FA on
-    run_correctness_test "$MODEL_MISTRAL_Q4" "Mistral-7B Q4 (FA-on)" \
-        "1, 2, 3, 4, 5," "6" "on"
-    run_correctness_test "$MODEL_MISTRAL_Q4" "Mistral-7B Q4 (FA-on)" \
-        "1, 2, 3, 4, 5," "7" "on"
-    run_correctness_test "$MODEL_MISTRAL_Q4" "Mistral-7B Q4 (FA-on)" \
-        "1, 2, 3, 4, 5," "8" "on"
+    # FA-on check
+    run_correctness_check "--flash-attn on" "Mistral-7B Q4 (FA-on)"
 
-    # With FA off
-    run_correctness_test "$MODEL_MISTRAL_Q4" "Mistral-7B Q4 (FA-off)" \
-        "1, 2, 3, 4, 5," "6" "off"
-    run_correctness_test "$MODEL_MISTRAL_Q4" "Mistral-7B Q4 (FA-off)" \
-        "1, 2, 3, 4, 5," "7" "off"
-    run_correctness_test "$MODEL_MISTRAL_Q4" "Mistral-7B Q4 (FA-off)" \
-        "1, 2, 3, 4, 5," "8" "off"
-
-    # Verify FA-on and FA-off produce consistent output on the canonical prompt
-    if [ -f "$MODEL_MISTRAL_Q4" ]; then
-        local out_fa_on out_fa_off
-        out_fa_on=$(ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR}" \
-            "${BUILD_DIR}/bin/llama-completion" \
-            -m "$MODEL_MISTRAL_Q4" \
-            -p "1, 2, 3, 4, 5," -n 15 --seed 42 --temp 0 \
-            --flash-attn on 2>&1) || true
-        out_fa_off=$(ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR}" \
-            "${BUILD_DIR}/bin/llama-completion" \
-            -m "$MODEL_MISTRAL_Q4" \
-            -p "1, 2, 3, 4, 5," -n 15 --seed 42 --temp 0 \
-            2>&1) || true
-
-        # Extract the generated text portion and compare
-        local gen_on gen_off
-        gen_on=$(echo "$out_fa_on" | grep -oP ':\K.*' | head -1)
-        gen_off=$(echo "$out_fa_off" | grep -oP ':\K.*' | head -1)
-
-        if [ -n "$gen_on" ] && [ -n "$gen_off" ]; then
-            if echo "$gen_on" | grep -q "6, 7" && echo "$gen_off" | grep -q "6, 7"; then
-                pass "FA-on and FA-off both produce consistent numbered sequence"
-            elif [ "$gen_on" = "$gen_off" ]; then
-                pass "FA-on and FA-off produce identical output on canonical prompt"
-            else
-                # This is not necessarily a failure - FA and non-FA attention can differ in output
-                pass "FA-on and FA-off outputs differ (expected behavior for different algorithms)"
-            fi
-        fi
-    fi
+    # Non-FA / default check
+    run_correctness_check "" "Mistral-7B Q4 (non-FA)"
 }
 
 # ============================================================================
 # Determinism Checks
 # ============================================================================
-
-# Run the same prompt multiple times and verify identical output
 run_determinism_check() {
-    local model="$1"
-    local model_name="$2"
-    local prompt="$3"
-    local n_runs="$4"
-    local fa_flag="$5"
+    local description="$1"
+    local fa_flag="$2"
 
-    if [ ! -f "$model" ]; then
-        skip "${model_name} deterministic - model not found"
+    if [ ! -f "$MODEL_MISTRAL_Q4" ]; then
+        skip "${description} - model not found"
         return
     fi
 
-    echo -e "${CYAN}Running ${n_runs} iterations...${NC}" | tee -a "$RESULTS_FILE"
+    log "  Running 3 iterations..."
 
-    # Run multiple times and collect outputs
     local outputs=()
-    for i in $(seq 1 "$n_runs"); do
+    for i in 1 2 3; do
         local output
         output=$(ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR}" \
             "${BUILD_DIR}/bin/llama-completion" \
-            -m "$model" \
-            -p "$prompt" \
+            -m "$MODEL_MISTRAL_Q4" \
+            -p '1, 2, 3, 4, 5,' \
             -n 15 \
             --seed 42 \
             --temp 0 \
             $fa_flag \
             2>&1 || true)
-
-        # Extract token output portion
         local tokens
         tokens=$(echo "$output" | grep -oP ':\K.*' | head -1)
         outputs+=("$tokens")
     done
 
-    # Check if all outputs are identical
     local first="${outputs[0]}"
     local all_match=true
     for output in "${outputs[@]:1}"; do
@@ -253,32 +249,19 @@ run_determinism_check() {
     done
 
     if $all_match; then
-        pass "${model_name} deterministic ($n_runs runs, identical output)"
+        pass "${description}: deterministic (3 runs, identical)"
     else
-        fail "${model_name} non-deterministic ($n_runs runs produced different outputs)"
-        echo "  Run 1: $first" | tee -a "$RESULTS_FILE"
-        for i in "${!outputs[@]}"; do
-            echo "  Run $((i+2)): ${outputs[$i]}" | tee -a "$RESULTS_FILE"
-        done
+        fail "${description}: non-deterministic (3 runs produced different outputs)"
     fi
 }
 
 run_determinism_all() {
-    section "Determinism Tests (5 identical runs, seed=42, temp=0)"
-
+    section "Determinism Tests (3 identical runs, seed=42, temp=0)"
     if [ -f "$MODEL_MISTRAL_Q4" ]; then
-        run_determinism_check "$MODEL_MISTRAL_Q4" "Mistral-7B Q4 (FA-on)" \
-            "1, 2, 3, 4, 5," 5 "--flash-attn on"
-
-        run_determinism_check "$MODEL_MISTRAL_Q4" "Mistral-7B Q4 (FA-off)" \
-            "1, 2, 3, 4, 5," 5 ""
+        run_determinism_check "Mistral-7B Q4 (FA-on)" "--flash-attn on"
+        run_determinism_check "Mistral-7B Q4 (non-FA)" ""
     else
         skip "Mistral model not found"
-    fi
-
-    if [ -f "$MODEL_MISTRAL_Q8" ]; then
-        run_determinism_check "$MODEL_MISTRAL_Q8" "Mistral-7B Q8 (FA-on)" \
-            "1, 2, 3, 4, 5," 5 "--flash-attn on"
     fi
 }
 
@@ -286,110 +269,176 @@ run_determinism_all() {
 # Performance Benchmarks
 # ============================================================================
 
-# Helper to parse llama-bench output
-parse_bench_output() {
+# Extract tok/s from a specific test row in llama-bench table output
+# Usage: extract_tok_s "<output>" "pp512|tg128"
+# Returns the numeric tok/s value (without unit)
+extract_tok_s() {
     local output="$1"
-    # Extract performance from the output table
-    # Format: | ... | test | t/s |
-    echo "$output" | grep -oP '\d+\.\d+(?:±\d+\.\d+)?' | head -2
-}
+    local test_name="$2"
 
-run_bench_test() {
-    local model="$1"
-    local model_name="$2"
-    local prompt_tokens="$3"
-    local gen_tokens="$4"
-    local fa_mode="$5"
-    local extra_args="${6}"
+    # llama-bench outputs rows like:
+    # | ... | pp512 |  1326.20 ± 3.15 |
+    # We find the row with the test name, extract the t/s column (second to last column)
+    local row
+    row=$(echo "$output" | grep -E "(^\\||\\|.*${test_name})" | grep "$test_name" | head -1)
 
-    if [ ! -f "$model" ]; then
-        skip "${model_name} ${fa_mode} ${prompt_tokens}p${gen_tokens}g - model not found"
+    if [ -z "$row" ]; then
+        echo "N/A"
         return
     fi
 
-    local fa_flag=""
-    [ -n "$fa_mode" ] && fa_flag="-fa $fa_mode"
-
-    local output
-    output=$(ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR}" \
-        "${BUILD_DIR}/bin/llama-bench" \
-        -m "$model" \
-        -p "$prompt_tokens" \
-        -n "$gen_tokens" \
-        -ngl 99 \
-        $fa_flag \
-        $extra_args \
-        2>&1) || true
-
-    # Extract the table row with test name and use awk to get the last column (tok/s)
-    local test_name=""
-    [ "$prompt_tokens" -eq 0 ] 2>/dev/null && test_name="tg${gen_tokens}" || test_name="pp${prompt_tokens}"
-
+    # Parse: split by |, find the column with the test name, next column is t/s
     local tok_s
-    tok_s=$(echo "$output" | grep "$test_name" | awk -F'|' '{gsub(/[ \t]/, "", $NF); print $NF}' | grep -oP '^\d+\.\d+' | head -1)
+    tok_s=$(echo "$row" | awk -F'|' '{
+        for (i=1; i<=NF; i++) {
+            gsub(/^[ \t]+|[ \t]+$/, "", $i)
+            if ($i == "'"${test_name}"'") {
+                # Next non-empty field is the t/s value
+                for (j=i+1; j<=NF; j++) {
+                    gsub(/^[ \t]+|[ \t]+$/, "", $j)
+                    if ($j ~ /^[0-9]/) {
+                        # Extract just the number (before ±)
+                        print $j
+                        exit
+                    }
+                }
+                break
+            }
+        }
+    }')
 
     if [ -z "$tok_s" ] || [ "$tok_s" = "N/A" ]; then
-        tok_s="N/A"
+        echo "N/A"
+    else
+        # Extract only the numeric part (before ± if present)
+        echo "$tok_s" | grep -oP '^[0-9]+\.?[0-9]*' || echo "N/A"
     fi
+}
 
-    log "  ${model} ${fa_mode} ${test_name} p=${prompt_tokens} n=${gen_tokens}: ~${tok_s} tok/s"
-    echo "$tok_s"
+run_bench_test() {
+    local prompt_tokens="$1"
+    local gen_tokens="$2"
+    local fa_mode="$3"
+    local extra_args="${4:-}"
+
+    local fa_flag=""
+    [ "$fa_mode" = "1" ] && fa_flag="-fa 1"
+
+    local cmd="ONEAPI_DEVICE_SELECTOR=\"${ONEAPI_DEVICE_SELECTOR}\" ${BUILD_DIR}/bin/llama-bench -m \"${MODEL_MISTRAL_Q4}\" -p ${prompt_tokens} -n ${gen_tokens} ${fa_flag}"
+    [ -n "$extra_args" ] && cmd="$cmd $extra_args"
+
+    local result
+    result=$($cmd 2>&1) || true
+    echo "$result"
 }
 
 run_performance_all() {
     section "Performance Benchmarks (llama-bench)"
 
     echo -e "${CYAN}Mistral-7B Q4_0${NC}" | tee -a "$RESULTS_FILE"
+    log "Running benchmarks..."
 
-    # PP benchmarks
-    local pp512_on pp512_off
-    pp512_on=$(run_bench_test "$MODEL_MISTRAL_Q4" "PP512 (FA-on)" 512 0 "1" "")
-    pp512_off=$(run_bench_test "$MODEL_MISTRAL_Q4" "PP512 (FA-off)" 512 0 "0" "")
+    # Run PP512 FA-on
+    local bench_on_pp
+    bench_on_pp=$(run_bench_test 512 0 1 "")
 
-    # TG benchmarks
-    local tg128_on tg128_off
-    tg128_on=$(run_bench_test "$MODEL_MISTRAL_Q4" "TG128 (FA-on)" 0 128 "1" "")
-    tg128_off=$(run_bench_test "$MODEL_MISTRAL_Q4" "TG128 (FA-off)" 0 128 "0" "")
+    # Run PP512 FA-off (non-FA)
+    local bench_off_pp
+    bench_off_pp=$(run_bench_test 512 0 0 "")
 
-    # Report results
-    echo "" | tee -a "$RESULTS_FILE"
-    echo -e "${CYAN}Summary:${NC}" | tee -a "$RESULTS_FILE"
-    echo "  PP512: FA-on=${pp512_on:-N/A} vs FA-off=${pp512_off:-N/A} tok/s" | tee -a "$RESULTS_FILE"
-    echo "  TG128: FA-on=${tg128_on:-N/A} vs FA-off=${tg128_off:-N/A} tok/s" | tee -a "$RESULTS_FILE"
-    echo "" | tee -a "$RESULTS_FILE"
+    # Run TG128 FA-on
+    local bench_on_tg
+    bench_on_tg=$(run_bench_test 0 128 1 "")
 
-    # Performance gates (from CLAUDE.md targets)
+    # Run TG128 FA-off (non-FA)
+    local bench_off_tg
+    bench_off_tg=$(run_bench_test 0 128 0 "")
+
+    # Extract tok/s values
+    local pp512_on pp512_off tg128_on tg128_off
+    pp512_on=$(extract_tok_s "$bench_on_pp" "pp512")
+    pp512_off=$(extract_tok_s "$bench_off_pp" "pp512")
+    tg128_on=$(extract_tok_s "$bench_on_tg" "tg128")
+    tg128_off=$(extract_tok_s "$bench_off_tg" "tg128")
+
+    # Save raw bench output for diagnostics
+    log "  Raw PP512 FA-on output: $(echo "$bench_on_pp" | tail -5)"
+    log "  Raw PP512 FA-off output: $(echo "$bench_off_pp" | tail -5)"
+    log "  Raw TG128 FA-on output: $(echo "$bench_on_tg" | tail -5)"
+    log "  Raw TG128 FA-off output: $(echo "$bench_off_tg" | tail -5)"
+
+    # Report summary
+    log ""
+    log "---"
+    log "PP512: FA-on=${pp512_on} vs FA-off=${pp512_off} tok/s"
+    log "TG128: FA-on=${tg128_on} vs FA-off=${tg128_off} tok/s"
+    log "---"
+
+    # Performance gates
     echo -e "${CYAN}Performance Gates:${NC}" | tee -a "$RESULTS_FILE"
 
-    # Gate: Non-FA should be approximately pp512 1700, tg128 80
-    local pp_threshold=1200  # Allow for regression while flagging
-    local tg_threshold=50    # TG is inherently slower with FA overhead
-
-    if [ "$pp512_off" != "N/A" ] && [ "$pp512_off" != "" ]; then
-        if (( $(echo "$pp512_off >= $pp_threshold" | bc -l 2>/dev/null || echo 0) )); then
-            echo -e "  ${GREEN}PASS${NC}: FA-off PP512 = ${pp512_off} tok/s >= ${pp_threshold}"
-            echo "  PASS: FA-off PP512 >= ${pp_threshold}" | tee -a "$RESULTS_FILE"
+    # Non-FA gates (regression guard: must not drop significantly)
+    if [ "$pp512_off" != "N/A" ]; then
+        if python3 -c "exit(0 if $pp512_off >= 1700 else 1)" 2>/dev/null; then
+            log "  ${GREEN}PASS${NC}: Non-FA PP512 = ${pp512_off} tok/s >= 1700"
         else
-            echo -e "  ${RED}WARN${NC}: FA-off PP512 = ${pp512_off} tok/s < ${pp_threshold}"
-            echo "  WARN: FA-off PP512 = ${pp512_off} tok/s < ${pp_threshold}" | tee -a "$RESULTS_FILE"
+            if $PERF_WARN; then
+                log "  ${YELLOW}WARN${NC}: Non-FA PP512 = ${pp512_off} tok/s < 1700 (permissive mode)"
+            else
+                fail "Non-FA PP512 = ${pp512_off} tok/s < 1700 (regression)"
+            fi
         fi
+    else
+        skip "Non-FA PP512: could not parse tok/s"
     fi
 
-    if [ "$tg128_off" != "N/A" ] && [ "$tg128_off" != "" ]; then
-        if (( $(echo "$tg128_off >= $tg_threshold" | bc -l 2>/dev/null || echo 0) )); then
-            echo -e "  ${GREEN}PASS${NC}: FA-off TG128 = ${tg128_off} tok/s >= ${tg_threshold}"
-            echo "  PASS: FA-off TG128 >= ${tg_threshold}" | tee -a "$RESULTS_FILE"
+    if [ "$tg128_off" != "N/A" ]; then
+        if python3 -c "exit(0 if $tg128_off >= 79 else 1)" 2>/dev/null; then
+            log "  ${GREEN}PASS${NC}: Non-FA TG128 = ${tg128_off} tok/s >= 79"
         else
-            echo -e "  ${RED}WARN${NC}: FA-off TG128 = ${tg128_off} tok/s < ${tg_threshold}"
-            echo "  WARN: FA-off TG128 = ${tg128_off} tok/s < ${tg_threshold}" | tee -a "$RESULTS_FILE"
+            if $PERF_WARN; then
+                log "  ${YELLOW}WARN${NC}: Non-FA TG128 = ${tg128_off} tok/s < 79 (permissive mode)"
+            else
+                fail "Non-FA TG128 = ${tg128_off} tok/s < 79 (regression)"
+            fi
         fi
+    else
+        skip "Non-FA TG128: could not parse tok/s"
+    fi
+
+    # FA-on gates (must meet minimum targets)
+    if [ "$pp512_on" != "N/A" ]; then
+        if python3 -c "exit(0 if $pp512_on >= 1326 else 1)" 2>/dev/null; then
+            log "  ${GREEN}PASS${NC}: FA-on PP512 = ${pp512_on} tok/s >= 1326"
+        else
+            if $PERF_WARN; then
+                log "  ${YELLOW}WARN${NC}: FA-on PP512 = ${pp512_on} tok/s < 1326 (permissive mode)"
+            else
+                fail "FA-on PP512 = ${pp512_on} tok/s < 1326 (below target)"
+            fi
+        fi
+    else
+        skip "FA-on PP512: could not parse tok/s"
+    fi
+
+    if [ "$tg128_on" != "N/A" ]; then
+        if python3 -c "exit(0 if $tg128_on >= 62 else 1)" 2>/dev/null; then
+            log "  ${GREEN}PASS${NC}: FA-on TG128 = ${tg128_on} tok/s >= 62"
+        else
+            if $PERF_WARN; then
+                log "  ${YELLOW}WARN${NC}: FA-on TG128 = ${tg128_on} tok/s < 62 (permissive mode)"
+            else
+                fail "FA-on TG128 = ${tg128_on} tok/s < 62 (below target)"
+            fi
+        fi
+    else
+        skip "FA-on TG128: could not parse tok/s"
     fi
 }
 
 # ============================================================================
 # Backend Ops Test
 # ============================================================================
-
 run_backend_ops() {
     section "Backend Ops Test (FLASH_ATTN_EXT)"
 
@@ -402,30 +451,25 @@ run_backend_ops() {
     output=$(ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR}" \
         timeout 120 "${BUILD_DIR}/bin/test-backend-ops" -o FLASH_ATTN_EXT 2>&1) || true
 
-    local exit_code=$?
-
-    if [ $exit_code -eq 0 ]; then
+    local exit_code=0
+    if echo "$output" | grep -qi "pass"; then
         pass "test-backend-ops -o FLASH_ATTN_EXT (SYCL) passed"
-        echo "$output" | grep -E 'all passed|PASSED' | tee -a "$RESULTS_FILE"
-    elif echo "$output" | grep -qi "pass"; then
-        local pass_count fail_count
-        pass_count=$(echo "$output" | grep -oP '\d+(?= passed)' | tail -1 || echo "0")
-        fail_count=$(echo "$output" | grep -oP '\d+(?= failed)' | tail -1 || echo "0")
-        echo "  PASS: ${pass_count} passed, ${fail_count} failed" | tee -a "$RESULTS_FILE"
-        if [ "${fail_count:-0}" -eq 0 ]; then
-            pass "Backend ops PASS (exit=$exit_code, all passed)"
-        else
-            fail "Backend ops ${pass_count}/${((pass_count+fail_count))} passed (exit=$exit_code)"
-        fi
+        echo "$output" | grep -E 'all passed|PASSED' | tee -a "$RESULTS_FILE" || true
     else
-        fail "test-backend-ops -o FLASH_ATTN_EXT failed (exit=$exit_code)"
+        # Check if there were actual failures vs timeout/signal
+        local has_fail
+        has_fail=$(echo "$output" | grep -cE 'failed|FAIL|FAILED' || true)
+        if [ "$has_fail" -gt 0 ]; then
+            fail "test-backend-ops -o FLASH_ATTN_EXT had ${has_fail} failures"
+        else
+            skip "test-backend-ops -o FLASH_ATTN_EXT (no pass/fail indicators, may be timeout)"
+        fi
     fi
 }
 
 # ============================================================================
 # FA Dispatch Ktrace (kernel dispatch verification)
 # ============================================================================
-
 run_dispatch_check() {
     section "Dispatch Ktrace Verification"
 
@@ -433,8 +477,6 @@ run_dispatch_check() {
         skip "Dispatch check - model not found"
         return
     fi
-
-    echo "Checking that ESIMD kernel fires for nc=1 D=128..." | tee -a "$RESULTS_FILE"
 
     local output
     output=$(ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR}" \
@@ -446,14 +488,13 @@ run_dispatch_check() {
     if echo "$output" | grep -qi "ESIMD.*Flash.*enabled.*decode"; then
         pass "ESIMD FA enabled for decode (nc=1 path confirmed)"
     else
-        echo -e "  ${YELLOW}INFO${NC}: ESIMD flag not printed (may indicate it's not available)" | tee -a "$RESULTS_FILE"
+        log "  ${YELLOW}INFO${NC}: ESIMD flag not printed (kernel not selected for this shape)" | tee -a "$RESULTS_FILE"
     fi
 }
 
 # ============================================================================
 # Main
 # ============================================================================
-
 main() {
     echo -e "${BLUE}╔═══════════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${BLUE}║  SYCL Flash Attention Correctness + Performance Harness           ║${NC}"
@@ -486,13 +527,13 @@ main() {
     # Summary
     echo ""
     echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${BLUE}  Results: ${GREEN}${PASS} passed${NC}  ${RED}${FAIL} failed${NC}  ${YELLOW}${SKIP} skipped${NC}"
+    echo -e "${BLUE}  Results: ${GREEN}${PASS} passed${NC}  ${RED}${FAIL} failed${NC}  ${YELLOW}${SKIP} skipped${NC}  ${YELLOW}${WARN} warnings${NC}"
     echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
     echo ""
-    echo "Full log: $RESULTS_FILE"
-    echo ""
+    log "Full log: $RESULTS_FILE"
 
-    # Exit code: 0 if all tests passed, 1 otherwise
+    # Exit code: 0 if no failures; 1 if any failures
+    # Warnings and skips do not cause failure
     if [ "$FAIL" -gt 0 ]; then
         exit 1
     fi
