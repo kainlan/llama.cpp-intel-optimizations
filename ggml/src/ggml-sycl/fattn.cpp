@@ -1004,7 +1004,101 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
         }
     }
 
-    // ESIMD kernel dispatch (uses explicit SIMD operations)
+    // ---- Debug trace: print selected path, suppressed after first 32 invocations ----
+    // Dispatch selection trace (≤32). Logs kernel path + shape for debugging.
+    static std::atomic<int>  fattn_dispatch_debug_count  = 0;
+    static std::atomic<int>  fattn_dispatch_debug_printed = 0;
+    int  dispatch_debug_counter = fattn_dispatch_debug_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    int  debug_limit             = std::getenv("GGML_SYCL_FATTN_DISPATCH_DEBUG_LIMIT") ? std::atoi(std::getenv("GGML_SYCL_FATTN_DISPATCH_DEBUG_LIMIT")) : 32;
+    if (dispatch_debug_counter <= debug_limit) {
+        const char *selected =
+            safe_decode ? "(safe)"
+                        : ne01 <= 1 ? "ne1=1"
+                                    : ne01 <= 2 ? "ne1<=2"
+                                                : ne01 <= 4 ? "ne1<=4" : ne01 <= 16 ? "ne1<=16" : "ne1>16";
+        fprintf(stderr, "[SYCL] fattn dispatch [%d/%d] D=%d %s xmx=%d %s\n",
+                dispatch_debug_counter, debug_limit, D, selected, (int) use_xmx,
+                safe_decode ? "safe_decode" : "");
+    }
+
+      // ---- GGML_SYCL_FA_FORCE_PATH: override all shape-based kernel selection ----
+    {
+        const char *force = std::getenv("GGML_SYCL_FA_FORCE_PATH");
+        if (force) {
+            // Inlined DISPATCH_NCOLS equivalent for softcap-aware dispatch
+            #define FORCE_DISPATCH(NCOLS, LAUNCHER)                                             \
+                if (logit_softcap == 0.0f) { LAUNCHER<D, NCOLS, false, Q_type>(params, stream); } \
+                else { LAUNCHER<D, NCOLS, true, Q_type>(params, stream); }
+            // Inlined DISPATCH_NCOLS_CTX_ACC equivalent
+            #define FORCE_DISPATCH_CTX(NCOLS, LAUNCHER, ACC_T)                                  \
+                if (logit_softcap == 0.0f) { v2_dispatched = LAUNCHER<D, NCOLS, false, Q_type, ACC_T>(ctx, params, stream); } \
+                else { v2_dispatched = LAUNCHER<D, NCOLS, true, Q_type, ACC_T>(ctx, params, stream); }
+
+            if (strcmp(force, "vec") == 0 && !params.kv_is_fp8 && ne01 <= 1 && D <= 256) {
+                GGML_SYCL_KTRACE("fattn FORCE=vec", " D=%d ncols=1 ne01=%d", D, ne01);
+                FORCE_DISPATCH(1, launch_fattn_vec_f16);
+                return;
+            }
+            if (strcmp(force, "onednn") == 0 && g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled) {
+                GGML_SYCL_KTRACE("fattn FORCE=onednn", " D=%d ne01=%d ne11=%d", D, ne01, params.ne11);
+                if (ggml_sycl_flash_attn_ext_onednn(ctx, params)) {
+                    return;
+                }
+            }
+            if (strcmp(force, "xmx-v1") == 0) {
+                // v1 kernel — kept for A/B comparison only — use GGML_SYCL_FA_XMX_V1 instead
+                GGML_SYCL_KTRACE("fattn FORCE=xmx-v1", " D=%d ncols=%d ne01=%d", D, 8, ne01);
+                FORCE_DISPATCH(8, launch_fattn_xmx_f16);
+                return;
+            }
+            if (strcmp(force, "xmx-v2-tm16") == 0 || strcmp(force, "xmx-v2-tm8") == 0) {
+                // Force v2 kernel with explicit TM variant (handled dynamically inside v2)
+                GGML_SYCL_KTRACE("fattn FORCE=xmx-v2", " D=%d ncols=%d %s", D, 8, force + 10);
+                bool        v2_dispatched = false;
+                const bool  use_f32_acc   = (params.prec == GGML_PREC_F32);
+                GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=8 ne01=%d prec=%d %s", D, ne01, (int) params.prec, force + 10);
+                if (use_f32_acc) {
+                    FORCE_DISPATCH_CTX(8, launch_fattn_xmx_v2_f16, float);
+                } else {
+                    FORCE_DISPATCH_CTX(8, launch_fattn_xmx_v2_f16, afloat);
+                }
+                if (!v2_dispatched) {
+                    GGML_SYCL_KTRACE("fattn FORCE=xmx-v2 fallback TILE", " D=%d ncols=%d ne01=%d", D, 8, ne01);
+                    FORCE_DISPATCH(8, launch_fattn_tile_f16);
+                }
+                return;
+            }
+            if (strcmp(force, "esimd") == 0 && g_sycl_fa_esimd_enabled && fattn_esimd_f16_available()) {
+                GGML_SYCL_KTRACE("fattn FORCE=esimd", " D=%d ne01=%d", D, ne01);
+                fattn_esimd_f16<D, Q_type>(params, *stream);
+                return;
+            }
+            if (strcmp(force, "tile") == 0) {
+                GGML_SYCL_KTRACE("fattn FORCE=tile", " D=%d ncols=%d ne01=%d", D, 8, ne01);
+                FORCE_DISPATCH(8, launch_fattn_tile_f16);
+                return;
+            }
+            fprintf(stderr, "[SYCL] fattn: unknown GGML_SYCL_FA_FORCE_PATH=%s, falling through\n", force);
+        }
+    }
+
+// Helper macro to dispatch softcap — defined here so FA_FORCE_PATH override can use it
+#define DISPATCH_NCOLS(NCOLS, LAUNCHER)                    \
+    if (logit_softcap == 0.0f) {                           \
+        LAUNCHER<D, NCOLS, false, Q_type>(params, stream); \
+    } else {                                               \
+        LAUNCHER<D, NCOLS, true, Q_type>(params, stream);  \
+    }
+
+// Same but launcher takes `ctx` first and returns bool (XMX-v2 pattern).
+#define DISPATCH_NCOLS_CTX_ACC(NCOLS, LAUNCHER, ACC_T)                                    \
+    if (logit_softcap == 0.0f) {                                                          \
+        v2_dispatched = LAUNCHER<D, NCOLS, false, Q_type, ACC_T>(ctx, params, stream);    \
+    } else {                                                                              \
+        v2_dispatched = LAUNCHER<D, NCOLS, true, Q_type, ACC_T>(ctx, params, stream);     \
+    }
+
+    // ---- ESIMD kernel dispatch (uses explicit SIMD operations) ----
     // - Single query (ne01 <= 1): +7% speedup for decode on Mistral 7B
     // - Batched queries (ne01 <= 8): Only for D=64 due to SLM constraints
     if (!safe_decode && g_sycl_fa_esimd_enabled && fattn_esimd_f16_available()) {
@@ -1020,28 +1114,6 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
             fattn_esimd_f16_batched<D, Q_type>(params, *stream);
             return;
         }
-    }
-
-// Helper macro to dispatch based on softcap
-#define DISPATCH_NCOLS(NCOLS, LAUNCHER)                    \
-    if (logit_softcap == 0.0f) {                           \
-        LAUNCHER<D, NCOLS, false, Q_type>(params, stream); \
-    } else {                                               \
-        LAUNCHER<D, NCOLS, true, Q_type>(params, stream);  \
-    }
-
-// Same, but the launcher also takes `ctx` first and returns bool (used by XMX-v2
-// — see fattn-xmx-f16-v2.hpp). Assigns the result to `v2_dispatched` so the
-// caller can fall through to TILE when the launcher returns false (e.g. SLM too
-// small for the fallback leaf). Matches the ggml_sycl_flash_attn_ext_onednn
-// pattern at fattn-onednn.cpp. Takes an explicit accumulator type parameter so
-// the prec-hint (GGML_PREC_F32 vs GGML_PREC_DEFAULT) routes to the matching
-// kernel specialization — see the `params.prec` branch below.
-#define DISPATCH_NCOLS_CTX_ACC(NCOLS, LAUNCHER, ACC_T)                                    \
-    if (logit_softcap == 0.0f) {                                                          \
-        v2_dispatched = LAUNCHER<D, NCOLS, false, Q_type, ACC_T>(ctx, params, stream);    \
-    } else {                                                                              \
-        v2_dispatched = LAUNCHER<D, NCOLS, true, Q_type, ACC_T>(ctx, params, stream);     \
     }
 
     // VEC path: deterministic-by-construction TG fast path (zero SLM, register-only).
