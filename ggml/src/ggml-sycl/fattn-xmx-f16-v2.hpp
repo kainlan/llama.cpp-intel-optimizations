@@ -240,6 +240,51 @@ inline int fattn_xmx_v2_score_variant_for_combo(const variant_info & v, const sy
 #    endif
 }
 
+// Shape-aware variant selector for XMX-v2.
+// Returns 0 (fallback TM=8) for shapes that should not use TM=16:
+//   - TG/small ncols: ne01 <= 1 or ncols <= 8 (TM=16 over-provisioned)
+//   - Small D: D < 128 (not enough elements per tile for TM=16 benefit)
+// Returns 1 (TM=16) for PP shapes with ncols >= 16 and D >= 128,
+//   only when the device matrix extension supports (16,16,16).
+//
+// Env override: GGML_SYCL_FA_XMX_V2_VARIANT=0 forces TM=8, =1 forces TM=16,
+// =auto (default) uses shape-aware selection.
+inline std::size_t fattn_xmx_v2_pick_variant_for_shape(const sycl::device & dev, int D, int ncols, int ne01) noexcept {
+    // Env override takes priority: 0=TM8, 1=TM16, anything else=auto
+    const char *var_env = std::getenv("GGML_SYCL_FA_XMX_V2_VARIANT");
+    if (var_env) {
+        int requested = std::atoi(var_env);
+        if (requested == 0 || requested == 1) {
+            return static_cast<std::size_t>(requested);
+        }
+        // "auto" via numeric parse -> fall through to shape-aware
+    }
+
+    // Shape guard: don't use TM=16 for small shapes.
+    // TG (ncol=1) or small batches (< 16 queries) → TM=8 is strictly better.
+    // Small D (< 128) doesn't benefit from wider tiles.
+    if (ne01 <= 1 || ncols < 16 || D < 128) {
+        return 0;
+    }
+
+    // Delegate to device-wide matrix_combinations query for TM=16 support.
+    const auto combos = fattn_xmx_v2_query_combinations(dev);
+    for (const auto & c : combos) {
+        using sycl_xmx::matrix_type;
+        if (c.atype == matrix_type::fp16 && c.btype == matrix_type::fp16 &&
+            c.ctype == matrix_type::fp32 && c.dtype == matrix_type::fp32 &&
+            (int) c.nsize == 16 && (int) c.ksize == 16) {
+            const bool m_is_range = (c.msize == 0);
+            const int m_fixed = (int) c.msize;
+            const int m_max   = (int) c.max_msize;
+            if (m_is_range ? m_max >= 16 : m_fixed == 16) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 // Pick the best variant index for this device. Returns 0 (fallback) on any
 // ambiguous / query-failed path.
 inline std::size_t fattn_xmx_v2_pick_variant_for_device(const sycl::device & dev) noexcept {
@@ -847,7 +892,8 @@ static void launch_fattn_xmx_v2_f16_leaf(const fattn_params & params, dpct::queu
 
 template <int D, int ncols, bool use_logit_softcap, typename Q_type, typename Acc_t, bool kv_is_fp8 = false>
 bool launch_fattn_xmx_v2_f16(ggml_backend_sycl_context & ctx, const fattn_params & params, dpct::queue_ptr stream) {
-    const std::size_t variant_idx = fattn_xmx_v2_pick_variant_cached(ctx, stream->get_device());
+    const std::size_t variant_idx = fattn_xmx_v2_pick_variant_for_shape(
+        stream->get_device(), D, ncols, params.ne01);
 
     // SLM-fit gate: if the fallback leaf's worst case doesn't fit this device's
     // local_mem_size, bail to caller-level fallback (TILE path). Logged once at
