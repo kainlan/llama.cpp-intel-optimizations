@@ -992,15 +992,18 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
 
 #if GGML_SYCL_DNNL
     // oneDNN graph SDPA path: fused MatMul→Divide→Add→SoftMax→MatMul on Xe2.
-    // Eligible: no sinks, no softcap, f16 KV, D ≤ 512, not multi-seq, not
-    // paged-v2. The paged-v2 block layout stores K/V as
-    // [D, block_size, n_blocks] rather than the contiguous [D, n_kv] that
-    // the oneDNN graph expects; dispatching oneDNN on a paged-v2 context
-    // would read the wrong memory. Paged-v2 keeps its own dispatch path
+    // Retired by default for Mistral-like GQA shapes (nc≠D) since oneDNN's
+    // 4-D strided layout cannot represent non-contiguous nc-D K planes.
+    // Eligible for non-GQA and nc==D shapes.
+    // Opt-in: GGML_SYCL_FA_ONEDNN_ALLOW=1 bypasses the nc==D gate for A/B
+    // testing; output correctness not guaranteed for non-contiguous shapes.
+    // Other eligibility: no sinks, no softcap, f16 KV, D ≤ 512, not multi-
+    // seq, not paged-v2, not safe_decode. The paged-v2 block layout stores
+    // K/V as [D, block_size, n_blocks] rather than the contiguous [D, n_kv]
+    // that the oneDNN graph expects. Paged-v2 keeps its own dispatch path
     // below and must win before the oneDNN branch considers the op.
     // Ineligible: gpt-oss-20b (sinks+softcap), Gemma-2 (softcap), FP8 KV.
-    // Dispatched BEFORE XMX/TILE so PP benefits from oneDNN's fused kernel.
-// Falls back to kernel path if oneDNN compile fails or during graph recording.
+    // Falls back to kernel path if oneDNN compile fails or during graph recording.
    if (!safe_decode && g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled) {
         const bool multi_seq = (params.n_seqs > 1);
         if (ggml_sycl_flash_attn_ext_onednn_eligible(params,

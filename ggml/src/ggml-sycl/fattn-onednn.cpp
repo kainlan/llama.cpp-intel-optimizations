@@ -98,11 +98,23 @@ bool ggml_sycl_flash_attn_ext_onednn_eligible(const fattn_params & params,
     //   oneDNN 4-D strided layout only works when nc == D (Q and K share
     //   contiguous rows).  When nc != D the strided strides can't express
     //   the actual GGML layout → oneDNN reads wrong memory → bad output.
+    //
+    // Retired for Mistral PP512 (nc=512, D=128): oneDNN is blocked by default
+    // for non-contiguous nc-D shapes. GGML_SYCL_FA_ONEDNN_ALLOW=1 re-enables
+    // it as an opt-in debug knob for A/B testing; the default path falls
+    // through to XMX-v2 which reaches comparable PP performance.
     {
         int nc_elK = (int)(params.nb11 / sizeof(sycl::half));
         int d_val  = (int)params.ne00;
         if (nc_elK != d_val) {
-            return false;
+            if (getenv("GGML_SYCL_FA_ONEDNN_ALLOW")) {
+                fprintf(stderr,
+                        "[SYCL] oneDNN SDPA: nc!=D contiguity gate bypassed by GGML_SYCL_FA_ONEDNN_ALLOW=1 "
+                        "(shape: nc_stride=%d D=%d — may produce incorrect output)\n",
+                        nc_elK, d_val);
+            } else {
+                return false;
+            }
         }
     }
     // The compiled partition is built with Q/K/V dtypes taken from params.*_type.
