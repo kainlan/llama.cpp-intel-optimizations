@@ -185,16 +185,24 @@ run_correctness_check() {
         $fa_flag \
         2>&1) || true
 
-    # Check for ordered continuation "6, 7, 8, 9, 10" (allow extra whitespace)
-    # We normalize whitespace to handle minor formatting differences
-    local normalized
-    normalized=$(echo "$output" | tr -s ' ')
+    # Strip everything from '[' onwards on each line (removes [GRAPH-COMPUTE],
+    # [TOKEN-TIMING], [GRAPH-DIAG] etc.), then join lines and check for the
+    # ordered continuation. This handles tokens that are interleaved with
+    # diagnostic output like "6[GRAPH-COMPUTE] device 0:...".
+    local tokens
+    # Strip everything from '[' onwards (removes [GRAPH-COMPUTE], [TOKEN-TIMING] etc.)
+    # Then filter out metadata lines and join remaining tokens.
+    tokens=$(printf '%s\n' "$output" \
+        | sed 's/\[.*//;s/ *$//' \
+        | grep -vE '^\s*$|generate:|perf_print|^main|build:|^sampler|^print_info|llama_model|load:|Running|Found|SYCL |^KV |VRAM-|HOST-|PLACEMENT|UNIFIED-|GRAPH-|MOE-|TOKEN-|LOAD-SUMMARY|place' \
+        | paste -sd '' - \
+        | sed 's/^,\s*//')
 
-    if echo "$normalized" | grep -qE '6[,\s]+7[,\s]+8[,\s]+9[,\s]+10'; then
+    if echo "$tokens" | grep -qE ',? *6,? *7,? *8,? *9,? *10'; then
         pass "${description}: ordered continuation '6, 7, 8, 9, 10' found"
     else
         fail "${description}: ordered continuation '6, 7, 8, 9, 10' NOT found"
-        log "    Raw output snippet: $(echo "$normalized" | grep -oE '.{0,30}6[,\s]+7.{0,50}' | head -1)"
+        log "    Tokens near 6-10: $(echo "$check_result" | grep -oE '.{0,30}6.{0,20}' | head -1)"
     fi
 }
 
