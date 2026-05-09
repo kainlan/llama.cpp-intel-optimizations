@@ -10628,20 +10628,36 @@ placement_plan compute_placement_plan(const std::vector<std::pair<std::string, s
         }
     }
 
-    // MoE expert entries are managed by the MoE hybrid cache (moe_hybrid_init_once),
-    // which has its own budget separate from the dense weight VRAM budget.  The hybrid
-    // cache uses the full managed memory (unified_cache_total_managed) rather than the
-    // weight-only remaining budget.  Marking experts as host-resident here causes
-    // ggml_sycl_moe_tensor_all_experts_on_host() to reject MUL_MAT_ID from the SYCL
-    // backend at graph-build time, routing all expert compute to CPU and producing
-    // garbage output.  For single-device plans, all experts default to the device;
-    // the hybrid cache will handle actual staging lazily.
+    // MoE expert entries: budget-aware placement.
+    //
+    // The MoE hybrid cache (moe_hybrid_init_once) manages expert staging
+    // lazily via its own VRAM budget, NOT the planner's dense weight budget.
+    // However, the planner must still account for expert VRAM to avoid
+    // overcommitting the GPU.  When experts fit within remaining VRAM,
+    // mark them on_device; when they don't, spill to host.
+    //
+    // Spilling experts to host is safe because:
+    //  1. ggml_sycl_moe_tensor_all_experts_on_host() only rejects MUL_MAT_ID
+    //     when ALL experts of a tensor are on host — partial spill still
+    //     routes to GPU.
+    //  2. The CPU dispatch dead zone fix (src0_host_storage fallback) ensures
+    //     host-resident experts are computed correctly on CPU.
+    //  3. The hybrid cache will lazily upload on_device experts to VRAM
+    //     during inference; host experts are served from host memory.
     for (size_t idx : moe_indices) {
         auto & entry = plan.entries[idx];
-        entry.on_device     = true;
-        entry.target_device = device_id;
-        plan.weight_vram_bytes += entry.dst_size;
-        plan.vram_bytes += entry.dst_size;
+        if (entry.dst_size <= remaining) {
+            entry.on_device     = true;
+            entry.target_device = device_id;
+            remaining -= entry.dst_size;
+            plan.weight_vram_bytes += entry.dst_size;
+            plan.vram_bytes += entry.dst_size;
+        } else {
+            entry.on_device     = false;
+            entry.target_device = -1;
+            plan.weight_host_bytes += entry.dst_size;
+            plan.host_bytes += entry.dst_size;
+        }
     }
 
     populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
