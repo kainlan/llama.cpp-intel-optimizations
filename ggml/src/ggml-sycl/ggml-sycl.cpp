@@ -3985,9 +3985,21 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
         }
 
         // --- Phase 2: distribute experts to secondary GPUs --------------------
-        // Upload experts to secondary device VRAM (using direct_stage_expert).
-        // Experts placed here override Phase 1's GPU0 assignment with an explicit
-        // device_ptr on the secondary GPU.  Remaining experts stay on GPU0 (cache-resolved).
+        // Two strategies, selected by unified cache planner availability:
+        //
+        // PLANNER-DRIVEN (preferred): When g_placement_plan has multi_device=true
+        // and expert_device map is populated, each expert's target device comes
+        // from the planner.  The planner considers ALL model weights (dense + KV
+        // + MoE) holistically, avoiding the greedy trap where Phase 2 fills a
+        // secondary GPU with experts and leaves no room for dense weights.
+        //
+        // GREEDY BIN-PACKING (fallback): When no multi-device plan exists, use
+        // the legacy greedy algorithm that sorts by popularity and fills the
+        // secondary GPU with the most remaining slots.
+        //
+        // Both paths upload experts via direct_stage_expert with SOA layout and
+        // BCS queue routing.  Experts uploaded here override Phase 1's GPU0
+        // default with an explicit device_ptr on the target device.
         struct device_budget {
             int             dev;
             size_t          n_slots;
@@ -4013,206 +4025,310 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
         }
 
         if (!budgets.empty()) {
-            // Sort experts by expert_idx (ascending) for popularity-weighted placement.
-            // Low-index experts (especially expert 0) are activated most frequently in
-            // MoE models.  By placing them first, B50 caches the most-used experts
-            // across ALL layers, rather than all experts from just the first few layers.
-            std::vector<size_t> upload_order(expert_list.size());
-            std::iota(upload_order.begin(), upload_order.end(), 0);
-            std::sort(upload_order.begin(), upload_order.end(), [&](size_t a, size_t b) {
-                if (expert_list[a].expert_idx != expert_list[b].expert_idx) {
-                    return expert_list[a].expert_idx < expert_list[b].expert_idx;
-                }
-                return expert_list[a].layer_id < expert_list[b].layer_id;
-            });
-
             // Secondary GPU dispatch uses SOA MMVQ kernels, so experts must be
             // cached in SOA layout with proper AOS→SOA reordering.
             ggml_sycl_reorder_fill_ctx reorder_ctx{};
 
-            // Default: fill all available secondary GPU VRAM with experts.
-            // Override via GGML_SYCL_PHASE2_MAX_UPLOAD or GGML_SYCL_B50_EXPERT_SLOTS env vars.
-            size_t total_secondary_slots = 0;
-            for (const auto & b : budgets) {
-                total_secondary_slots += b.n_slots;
-            }
-
-            // GGML_SYCL_B50_EXPERT_SLOTS: cap total secondary GPU expert cache slots.
-            // Set to 0 to disable B50 expert cache entirely.
-            // Default -1 (auto: use full VRAM capacity).
-            const char * b50_slots_env = std::getenv("GGML_SYCL_B50_EXPERT_SLOTS");
-            if (b50_slots_env) {
-                int val = std::atoi(b50_slots_env);
-                if (val >= 0) {
-                    size_t capped = static_cast<size_t>(val);
-                    if (capped < total_secondary_slots) {
-                        GGML_LOG_INFO(
-                            "[MoE-GPU-INIT] B50 expert slots capped: %zu -> %zu (via GGML_SYCL_B50_EXPERT_SLOTS)\n",
-                            total_secondary_slots, capped);
-                        total_secondary_slots = capped;
-                    }
-                }
-            }
-
-            size_t       max_phase2_upload = total_secondary_slots;
-            const char * phase2_env        = std::getenv("GGML_SYCL_PHASE2_MAX_UPLOAD");
-            if (phase2_env) {
-                int val = std::atoi(phase2_env);
-                if (val >= 0) {
-                    max_phase2_upload = static_cast<size_t>(val);
-                }
-            }
-
             // Time-budget Phase 2: stop uploading after 30s to avoid blocking init.
-            // Override with GGML_SYCL_PHASE2_TIMEOUT_SEC.
-            int          phase2_timeout_sec = 30;
-            const char * timeout_env        = std::getenv("GGML_SYCL_PHASE2_TIMEOUT_SEC");
-            if (timeout_env) {
-                int val = std::atoi(timeout_env);
-                if (val > 0) {
-                    phase2_timeout_sec = val;
-                }
-            }
             const auto phase2_start    = std::chrono::steady_clock::now();
-            const auto phase2_deadline = phase2_start + std::chrono::seconds(phase2_timeout_sec);
+            const auto phase2_deadline = phase2_start + std::chrono::seconds(30);
             bool       phase2_timeout  = false;
 
-            for (size_t oi = 0; oi < upload_order.size() && total_uploaded < max_phase2_upload; oi++) {
-                // Check time budget every 16 uploads to avoid clock overhead
-                if ((total_uploaded & 15) == 0 && total_uploaded > 0) {
-                    if (std::chrono::steady_clock::now() >= phase2_deadline) {
-                        phase2_timeout = true;
-                        GGML_LOG_INFO("[MOE-PHASE2] Time budget exhausted (%ds), stopping after %zu experts\n",
-                                      phase2_timeout_sec, total_uploaded);
-                        break;
-                    }
-                }
-                size_t ei = upload_order[oi];
-                if (placed[ei]) {
-                    continue;
-                }
-                const auto & info = expert_list[ei];
-                if (!info.extra) {
-                    continue;
-                }
+            // Check the unified cache for a multi-device placement plan with
+            // per-expert device assignments.  The cache stores a copy of the
+            // global g_placement_plan set by compute_and_store_plan_for_inventory().
+            ggml_sycl::unified_cache * plan_cache = ggml_sycl::get_unified_cache_for_device(device);
+            const bool use_planner =
+                plan_cache && plan_cache->has_placement_plan() &&
+                plan_cache->get_placement_plan().multi_device &&
+                !plan_cache->get_placement_plan().expert_device.empty();
 
-                // Find secondary device with most remaining slots
-                int    best_idx   = -1;
-                size_t best_slots = 0;
+            if (use_planner) {
+                const auto & plan_ref = plan_cache->get_placement_plan();
+                GGML_LOG_INFO("[MOE-PHASE2] Using planner-driven expert distribution "
+                              "(%zu layers with expert_device map)\n",
+                              plan_ref.expert_device.size());
+
+                // device_id → index into budgets vector
+                std::unordered_map<int, int> dev_to_budget_idx;
                 for (int i = 0; i < static_cast<int>(budgets.size()); i++) {
-                    if (budgets[i].n_slots > best_slots) {
-                        best_idx   = i;
-                        best_slots = budgets[i].n_slots;
-                    }
-                }
-                if (best_idx < 0) {
-                    break;  // All secondary devices full
+                    dev_to_budget_idx[budgets[i].dev] = i;
                 }
 
-                ggml_sycl_cache_id key = ggml_sycl_get_moe_expert_cache_key(info.tensor, info.extra, info.expert_idx);
-                if (!key.valid) {
-                    continue;
-                }
-
-                // Compute SOA layout size for this expert type
-                const int64_t ncols  = info.tensor->ne[0];
-                const int64_t nrows  = info.tensor->ne[1];
-                auto &        budget = budgets[best_idx];
-                const size_t  soa_bytes =
-                    ggml_sycl_layout_bytes_for_dims(info.tensor->type, ncols, nrows, GGML_LAYOUT_SOA, budget.dev);
-                const size_t dst_bytes = (soa_bytes > 0) ? soa_bytes : info.bytes;
-
-                // Budget guard: stop uploading to this device if the SOA-expanded
-                // expert size would exceed the remaining VRAM.  Without this check,
-                // the slot count (computed from AOS bytes) overestimates capacity
-                // and causes VRAM exhaustion + Level Zero SIGABRT.
-                if (dst_bytes > budget.bytes_remaining) {
-                    budget.n_slots = 0;  // mark device as full
-                    GGML_LOG_INFO(
-                        "[MOE-PHASE2] GPU%d VRAM budget exhausted: need %zu bytes, "
-                        "remaining %zu bytes (uploaded %zu experts)\n",
-                        budget.dev, dst_bytes, budget.bytes_remaining, budget.n_uploaded);
-                    continue;  // try next expert (may fit on different device)
-                }
-
-                // Determine if source pointer is device memory (VRAM on device 0).
-                // If so, D2H stage it via device 0's queue before passing to
-                // direct_stage_expert on the secondary GPU.  The mmap source
-                // may have been unmapped after model loading, so the only reliable
-                // host-accessible copy for device-resident weights is via D2H.
-                const bool src_on_device = (info.tensor->buffer && !ggml_backend_buffer_is_host(info.tensor->buffer));
-
-                const void *                    upload_src = info.data_ptr;
-                ggml_sycl::scoped_unified_alloc d2h_staging;
-
-                if (src_on_device) {
-                    // D2H stage from device 0 to pinned host buffer
-                    ggml_sycl::alloc_request req{};
-                    req.queue                               = &q;
-                    req.device                              = ggml_sycl_get_device_id_from_queue(q);
-                    req.size                                = info.bytes;
-                    req.intent.role                         = ggml_sycl::alloc_role::STAGING;
-                    req.intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
-                    req.intent.constraints.must_host_pinned = true;
-                    req.intent.constraints.use_pinned_pool  = true;
-                    d2h_staging.allocate(req);
-                    if (void * staged = d2h_staging.get()) {
-                        q.memcpy(staged, info.data_ptr, info.bytes).wait();
-                        upload_src = staged;
-                    } else {
-                        GGML_LOG_ERROR("[MOE-PHASE2] D2H staging alloc failed for L%d E%d (%zu bytes)\n", info.layer_id,
-                                       info.expert_idx, info.bytes);
+                for (size_t ei = 0; ei < expert_list.size(); ei++) {
+                    if (placed[ei]) {
                         continue;
                     }
+                    const auto & info = expert_list[ei];
+                    if (!info.extra) {
+                        continue;
+                    }
+
+                    // Check time budget every 16 uploads
+                    if ((total_uploaded & 15) == 0 && total_uploaded > 0) {
+                        if (std::chrono::steady_clock::now() >= phase2_deadline) {
+                            phase2_timeout = true;
+                            GGML_LOG_INFO("[MOE-PHASE2] Time budget exhausted, stopping after %zu experts\n",
+                                          total_uploaded);
+                            break;
+                        }
+                    }
+
+                    // Look up planner-assigned device for this expert
+                    int target_dev = -1;  // -1 means host/CPU
+                    auto layer_it = plan_ref.expert_device.find(info.layer_id);
+                    if (layer_it != plan_ref.expert_device.end()) {
+                        auto expert_it = layer_it->second.find(info.expert_idx);
+                        if (expert_it != layer_it->second.end()) {
+                            target_dev = expert_it->second;
+                        }
+                    }
+
+                    // Only upload to secondary GPUs (device > 0).
+                    // Device 0 experts stay on GPU0 from Phase 1 (cache-managed).
+                    // Host-planned experts (-1) are handled by CPU dispatch.
+                    if (target_dev <= 0) {
+                        continue;
+                    }
+
+                    // Find the budget slot for this target device
+                    auto budget_it = dev_to_budget_idx.find(target_dev);
+                    if (budget_it == dev_to_budget_idx.end()) {
+                        // Planner assigned to a device we don't have a budget for
+                        // (e.g., device not registered as secondary GPU). Skip.
+                        continue;
+                    }
+                    auto & budget = budgets[budget_it->second];
+                    if (budget.bytes_remaining < info.bytes) {
+                        // Budget exhausted for this device — skip, don't crash.
+                        continue;
+                    }
+
+                    ggml_sycl_cache_id key = ggml_sycl_get_moe_expert_cache_key(info.tensor, info.extra, info.expert_idx);
+                    if (!key.valid) {
+                        continue;
+                    }
+
+                    // Compute SOA layout size for this expert type
+                    const int64_t ncols     = info.tensor->ne[0];
+                    const int64_t nrows     = info.tensor->ne[1];
+                    const size_t  soa_bytes =
+                        ggml_sycl_layout_bytes_for_dims(info.tensor->type, ncols, nrows, GGML_LAYOUT_SOA, budget.dev);
+                    const size_t dst_bytes = (soa_bytes > 0) ? soa_bytes : info.bytes;
+
+                    if (dst_bytes > budget.bytes_remaining) {
+                        budget.n_slots = 0;
+                        GGML_LOG_INFO("[MOE-PHASE2] GPU%d budget exhausted: need %zu, remaining %zu\n",
+                                      budget.dev, dst_bytes, budget.bytes_remaining);
+                        continue;
+                    }
+
+                    // D2H staging for device-resident source weights
+                    const bool src_on_device = (info.tensor->buffer && !ggml_backend_buffer_is_host(info.tensor->buffer));
+                    const void *                    upload_src = info.data_ptr;
+                    ggml_sycl::scoped_unified_alloc d2h_staging;
+
+                    if (src_on_device) {
+                        ggml_sycl::alloc_request req{};
+                        req.queue                               = &q;
+                        req.device                              = ggml_sycl_get_device_id_from_queue(q);
+                        req.size                                = info.bytes;
+                        req.intent.role                         = ggml_sycl::alloc_role::STAGING;
+                        req.intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
+                        req.intent.constraints.must_host_pinned = true;
+                        req.intent.constraints.use_pinned_pool  = true;
+                        d2h_staging.allocate(req);
+                        if (void * staged = d2h_staging.get()) {
+                            q.memcpy(staged, info.data_ptr, info.bytes).wait();
+                            upload_src = staged;
+                        } else {
+                            GGML_LOG_ERROR("[MOE-PHASE2] D2H staging alloc failed for L%d E%d (%zu bytes)\n",
+                                           info.layer_id, info.expert_idx, info.bytes);
+                            continue;
+                        }
+                    }
+
+                    // Set up reorder context for AOS→SOA conversion
+                    reorder_ctx               = {};
+                    reorder_ctx.type          = info.tensor->type;
+                    reorder_ctx.ncols         = ncols;
+                    reorder_ctx.nrows         = nrows;
+                    reorder_ctx.nbytes        = info.bytes;
+                    reorder_ctx.dst_bytes     = dst_bytes;
+                    reorder_ctx.layout        = GGML_LAYOUT_SOA;
+                    reorder_ctx.src_is_device = false;
+                    reorder_ctx.device_id     = budget.dev;
+
+                    GGML_SYCL_DEBUG("[MOE-PHASE2-PLAN] Uploading L%d E%d to GPU%d (planner-assigned)\n",
+                                    info.layer_id, info.expert_idx, budget.dev);
+
+                    sycl::queue * phase2_bcs = &budget.cache->get_bcs_queue();
+                    ggml_sycl::direct_stage_result stage_result{};
+                    try {
+                        stage_result = budget.cache->direct_stage_expert(
+                            key, upload_src, info.bytes, dst_bytes, GGML_LAYOUT_SOA,
+                            ggml_sycl_fill_reordered_host, &reorder_ctx, phase2_bcs);
+                    } catch (const std::exception & e) {
+                        GGML_LOG_ERROR("[MOE-PHASE2] direct_stage_expert EXCEPTION: %s\n", e.what());
+                        continue;
+                    } catch (...) {
+                        GGML_LOG_ERROR("[MOE-PHASE2] direct_stage_expert UNKNOWN EXCEPTION\n");
+                        continue;
+                    }
+                    if (stage_result.ok && stage_result.ptr) {
+                        set_expert_popularity_rank(info.layer_id, info.expert_idx, static_cast<int>(total_uploaded));
+                        budget.n_slots--;
+                        budget.n_uploaded++;
+                        budget.bytes_remaining -= std::min(dst_bytes, budget.bytes_remaining);
+                        total_uploaded++;
+                        placed[ei] = true;
+                    }
+                }
+            } else {
+                // --- Greedy bin-packing fallback (no planner) --------------------
+                // Popularity-weighted sort: low-index experts (esp. expert 0) are
+                // activated most frequently.  Placing them first caches the most-used
+                // experts across ALL layers, not just all experts from first few layers.
+                std::vector<size_t> upload_order(expert_list.size());
+                std::iota(upload_order.begin(), upload_order.end(), 0);
+                std::sort(upload_order.begin(), upload_order.end(), [&](size_t a, size_t b) {
+                    if (expert_list[a].expert_idx != expert_list[b].expert_idx) {
+                        return expert_list[a].expert_idx < expert_list[b].expert_idx;
+                    }
+                    return expert_list[a].layer_id < expert_list[b].layer_id;
+                });
+
+                size_t total_secondary_slots = 0;
+                for (const auto & b : budgets) {
+                    total_secondary_slots += b.n_slots;
                 }
 
-                // Set up reorder context for AOS→SOA conversion
-                reorder_ctx               = {};
-                reorder_ctx.type          = info.tensor->type;
-                reorder_ctx.ncols         = ncols;
-                reorder_ctx.nrows         = nrows;
-                reorder_ctx.nbytes        = info.bytes;
-                reorder_ctx.dst_bytes     = dst_bytes;
-                reorder_ctx.layout        = GGML_LAYOUT_SOA;
-                reorder_ctx.src_is_device = false;  // upload_src is always host-accessible
-                reorder_ctx.device_id     = budget.dev;
-
-                GGML_SYCL_DEBUG(
-                    "[MOE-PHASE2] Uploading expert #%zu L%d E%d to GPU%d "
-                    "(type=%d dst_bytes=%zu)\n",
-                    total_uploaded, info.layer_id, info.expert_idx, budget.dev, (int) info.tensor->type, dst_bytes);
-
-                // Route H2D to BCS (copy engine) on the secondary GPU to prevent
-                // CCS monopolization during Phase 2 expert uploads.
-                sycl::queue * phase2_bcs = &budget.cache->get_bcs_queue();
-
-                ggml_sycl::direct_stage_result stage_result{};
-                try {
-                    stage_result =
-                        budget.cache->direct_stage_expert(key, upload_src, info.bytes, dst_bytes, GGML_LAYOUT_SOA,
-                                                          ggml_sycl_fill_reordered_host, &reorder_ctx, phase2_bcs);
-                } catch (const std::exception & e) {
-                    GGML_LOG_ERROR("[MOE-PHASE2] direct_stage_expert EXCEPTION: %s\n", e.what());
-                    continue;
-                } catch (...) {
-                    GGML_LOG_ERROR("[MOE-PHASE2] direct_stage_expert UNKNOWN EXCEPTION\n");
-                    continue;
+                size_t       max_phase2_upload = total_secondary_slots;
+                const char * phase2_env        = std::getenv("GGML_SYCL_PHASE2_MAX_UPLOAD");
+                if (phase2_env) {
+                    int val = std::atoi(phase2_env);
+                    if (val >= 0) {
+                        max_phase2_upload = static_cast<size_t>(val);
+                    }
                 }
-                if (stage_result.ok && stage_result.ptr) {
-                    set_expert_popularity_rank(info.layer_id, info.expert_idx, static_cast<int>(total_uploaded));
-                    budget.n_slots--;
-                    budget.n_uploaded++;
-                    budget.bytes_remaining -= std::min(dst_bytes, budget.bytes_remaining);
-                    total_uploaded++;
-                    placed[ei] = true;
+
+                for (size_t oi = 0; oi < upload_order.size() && total_uploaded < max_phase2_upload; oi++) {
+                    // Check time budget every 16 uploads
+                    if ((total_uploaded & 15) == 0 && total_uploaded > 0) {
+                        if (std::chrono::steady_clock::now() >= phase2_deadline) {
+                            phase2_timeout = true;
+                            GGML_LOG_INFO("[MOE-PHASE2] Time budget exhausted, stopping after %zu experts\n",
+                                          total_uploaded);
+                            break;
+                        }
+                    }
+                    size_t ei = upload_order[oi];
+                    if (placed[ei]) {
+                        continue;
+                    }
+                    const auto & info = expert_list[ei];
+                    if (!info.extra) {
+                        continue;
+                    }
+
+                    // Find secondary device with most remaining slots
+                    int    best_idx   = -1;
+                    size_t best_slots = 0;
+                    for (int i = 0; i < static_cast<int>(budgets.size()); i++) {
+                        if (budgets[i].n_slots > best_slots) {
+                            best_idx   = i;
+                            best_slots = budgets[i].n_slots;
+                        }
+                    }
+                    if (best_idx < 0) {
+                        break;  // All secondary devices full
+                    }
+
+                    ggml_sycl_cache_id key = ggml_sycl_get_moe_expert_cache_key(info.tensor, info.extra, info.expert_idx);
+                    if (!key.valid) {
+                        continue;
+                    }
+
+                    const int64_t ncols  = info.tensor->ne[0];
+                    const int64_t nrows  = info.tensor->ne[1];
+                    auto &        budget = budgets[best_idx];
+                    const size_t  soa_bytes =
+                        ggml_sycl_layout_bytes_for_dims(info.tensor->type, ncols, nrows, GGML_LAYOUT_SOA, budget.dev);
+                    const size_t dst_bytes = (soa_bytes > 0) ? soa_bytes : info.bytes;
+
+                    if (dst_bytes > budget.bytes_remaining) {
+                        budget.n_slots = 0;
+                        GGML_LOG_INFO(
+                            "[MOE-PHASE2] GPU%d VRAM budget exhausted: need %zu bytes, "
+                            "remaining %zu bytes (uploaded %zu experts)\n",
+                            budget.dev, dst_bytes, budget.bytes_remaining, budget.n_uploaded);
+                        continue;
+                    }
+
+                    const bool src_on_device = (info.tensor->buffer && !ggml_backend_buffer_is_host(info.tensor->buffer));
+                    const void *                    upload_src = info.data_ptr;
+                    ggml_sycl::scoped_unified_alloc d2h_staging;
+
+                    if (src_on_device) {
+                        ggml_sycl::alloc_request req{};
+                        req.queue                               = &q;
+                        req.device                              = ggml_sycl_get_device_id_from_queue(q);
+                        req.size                                = info.bytes;
+                        req.intent.role                         = ggml_sycl::alloc_role::STAGING;
+                        req.intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
+                        req.intent.constraints.must_host_pinned = true;
+                        req.intent.constraints.use_pinned_pool  = true;
+                        d2h_staging.allocate(req);
+                        if (void * staged = d2h_staging.get()) {
+                            q.memcpy(staged, info.data_ptr, info.bytes).wait();
+                            upload_src = staged;
+                        } else {
+                            GGML_LOG_ERROR("[MOE-PHASE2] D2H staging alloc failed for L%d E%d (%zu bytes)\n",
+                                           info.layer_id, info.expert_idx, info.bytes);
+                            continue;
+                        }
+                    }
+
+                    reorder_ctx               = {};
+                    reorder_ctx.type          = info.tensor->type;
+                    reorder_ctx.ncols         = ncols;
+                    reorder_ctx.nrows         = nrows;
+                    reorder_ctx.nbytes        = info.bytes;
+                    reorder_ctx.dst_bytes     = dst_bytes;
+                    reorder_ctx.layout        = GGML_LAYOUT_SOA;
+                    reorder_ctx.src_is_device = false;
+                    reorder_ctx.device_id     = budget.dev;
+
+                    sycl::queue * phase2_bcs = &budget.cache->get_bcs_queue();
+                    ggml_sycl::direct_stage_result stage_result{};
+                    try {
+                        stage_result =
+                            budget.cache->direct_stage_expert(key, upload_src, info.bytes, dst_bytes, GGML_LAYOUT_SOA,
+                                                              ggml_sycl_fill_reordered_host, &reorder_ctx, phase2_bcs);
+                    } catch (const std::exception & e) {
+                        GGML_LOG_ERROR("[MOE-PHASE2] direct_stage_expert EXCEPTION: %s\n", e.what());
+                        continue;
+                    } catch (...) {
+                        GGML_LOG_ERROR("[MOE-PHASE2] direct_stage_expert UNKNOWN EXCEPTION\n");
+                        continue;
+                    }
+                    if (stage_result.ok && stage_result.ptr) {
+                        set_expert_popularity_rank(info.layer_id, info.expert_idx, static_cast<int>(total_uploaded));
+                        budget.n_slots--;
+                        budget.n_uploaded++;
+                        budget.bytes_remaining -= std::min(dst_bytes, budget.bytes_remaining);
+                        total_uploaded++;
+                        placed[ei] = true;
+                    }
                 }
             }
 
             // Log Phase 2 elapsed time
             const auto phase2_elapsed = std::chrono::steady_clock::now() - phase2_start;
             const auto phase2_ms      = std::chrono::duration_cast<std::chrono::milliseconds>(phase2_elapsed).count();
-            GGML_LOG_INFO("[MOE-PHASE2] Completed: %zu experts uploaded in %.1f s%s\n", total_uploaded,
-                          phase2_ms / 1000.0, phase2_timeout ? " (timeout)" : "");
+            GGML_LOG_INFO("[MOE-PHASE2] Completed: %zu experts uploaded in %.1f s (strategy=%s)%s\n", total_uploaded,
+                          phase2_ms / 1000.0, use_planner ? "planner" : "greedy",
+                          phase2_timeout ? " (timeout)" : "");
         }
 
         // Verify Phase 2 placement via cache residency
