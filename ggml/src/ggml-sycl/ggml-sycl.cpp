@@ -3295,12 +3295,11 @@ static float *                    g_secondary_staging_buffer[GGML_SYCL_MAX_DEVIC
 static size_t                     g_secondary_staging_size[GGML_SYCL_MAX_DEVICES]   = {};
 static size_t                     g_secondary_staging_max_N[GGML_SYCL_MAX_DEVICES]  = {};
 static managed_host_pinned_buffer g_secondary_staging_alloc[GGML_SYCL_MAX_DEVICES];
-// Dedicated in-order queues for secondary GPU compute submissions.
-// Created during moe_hybrid_init_once() when multi-GPU is enabled.
-// MUST be in-order: cross-device OOQ depends_on is broken on Level Zero.
-static sycl::queue *              g_secondary_queues[GGML_SYCL_MAX_DEVICES] = {};
-// Backward compat alias: g_gpu1_queue points to g_secondary_queues[1].
-static sycl::queue *&             g_gpu1_queue                              = g_secondary_queues[1];
+// Secondary GPU queues are now managed by the shared-context queue pool
+// in unified-cache.cpp (init_shared_context_queues / get_shared_context_queue).
+// This ensures all cross-device queues share device 0's SYCL context for
+// Level Zero depends_on() compatibility.
+// Legacy g_secondary_queues[] / g_gpu1_queue removed — use ggml_sycl::get_shared_context_queue(d).
 
 // Compute a stable, unique cache layer ID from a tensor name.
 // This ensures each distinct weight tensor (e.g. blk.0.ffn_gate_exps vs
@@ -3661,6 +3660,8 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
         }
         n_moe_layers++;
 
+ 
+
         // Register each expert's pointer + tensor info for eager upload.
         // IMPORTANT: the tensor storage pointer may be a device VRAM pointer (not CPU-accessible)
         // when the buffer was allocated in device memory.  The mmap source data
@@ -3877,36 +3878,21 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
         const bool   multi_gpu_on = moe_opt_in ? (std::atoi(moe_opt_in) != 0) : (total_gpus >= 2);
 
         if (multi_gpu_on && total_gpus >= 2) {
-            // All secondary queues MUST share device 0's sycl::context so that
-            // cross-device depends_on() works on Level Zero.  Without a shared
-            // context each device gets its own ze_context_handle_t and
-            // depends_on(cross_device_event) hard-aborts in L0.
-            auto & dev0       = ggml_sycl_get_gpu_device(0);
-            auto   shared_ctx = dev0.default_queue().get_context();
+            // Initialize shared-context queue pool for cross-device Level Zero compat.
+            // All secondary queues share device 0's SYCL context so that
+            // cross-device depends_on() works.  The pool lives in unified-cache.cpp
+            // and is idempotent (safe to call if already initialized).
+            ggml_sycl::init_shared_context_queues(total_gpus);
 
+            // Register each secondary queue with the unified cache for VRAM arena access.
             int n_early_ok = 0;
             for (int gpu_d = 1; gpu_d < total_gpus && gpu_d < GGML_SYCL_MAX_DEVICES; gpu_d++) {
-                try {
-                    // Use ggml_sycl_get_gpu_device() which accesses the full
-                    // pre-scheduler-hiding GPU map (gpu_dpct_ids[]).
-                    // ggml_sycl_get_device() uses the scheduler-filtered map and
-                    // falls back to identity for hidden devices, which is wrong
-                    // when non-GPU devices are interleaved in dpct enumeration.
-                    auto & dev_d              = ggml_sycl_get_gpu_device(gpu_d);
-                    // Create IOQ with device 0's context for cross-device event compat.
-                    g_secondary_queues[gpu_d] = new sycl::queue(shared_ctx, dev_d, default_queue_properties());
-                    ggml_sycl::unified_cache_register_for_queue(gpu_d, *g_secondary_queues[gpu_d]);
+                sycl::queue * q_d = ggml_sycl::get_shared_context_queue(gpu_d);
+                if (q_d) {
+                    ggml_sycl::unified_cache_register_for_queue(gpu_d, *q_d);
                     n_early_ok++;
-                    GGML_LOG_INFO("[MOE-MULTI-GPU] Device %d registered: %s (dpct_id=%d)\n", gpu_d,
-                                  dev_d.get_info<sycl::info::device::name>().c_str(),
+                    GGML_LOG_INFO("[MOE-MULTI-GPU] Device %d registered (dpct_id=%d)\n", gpu_d,
                                   ggml_sycl_info().gpu_dpct_ids[gpu_d]);
-                } catch (const std::exception & e) {
-                    GGML_LOG_WARN("[MOE-MULTI-GPU] Early init: device %d unavailable: %s\n", gpu_d, e.what());
-                } catch (...) {
-                    GGML_LOG_WARN(
-                        "[MOE-MULTI-GPU] Early init: device %d unavailable "
-                        "(unknown error)\n",
-                        gpu_d);
                 }
             }
             if (n_early_ok > 0) {
@@ -3926,6 +3912,22 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
                                                                 "single GPU detected "
                                                                 "(use ONEAPI_DEVICE_SELECTOR=\"level_zero:0,1\" "
                                                                 "for dual GPU)");
+        }
+    }
+
+    // Phase 3: Consult the unified cache planner's multi_device flag.
+    // When the planner detects multiple GPUs and distributes layers across
+    // devices, MoE multi-GPU must also be active so the dispatch triage
+    // checks secondary GPU caches.  Without this, the planner may place
+    // expert weights on secondary GPUs but the dispatch code ignores them.
+    {
+        ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
+        if (cache && cache->has_placement_plan()) {
+            const auto & plan = cache->get_placement_plan();
+            if (plan.multi_device && !g_moe_multi_gpu_active.load(std::memory_order_acquire)) {
+                g_moe_multi_gpu_active.store(true, std::memory_order_release);
+                GGML_LOG_INFO("[MOE-MULTI-GPU] Activated by unified cache planner (multi_device=true)\n");
+            }
         }
     }
 
@@ -4301,8 +4303,8 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
             if (d == device) {
                 continue;  // already initialized above
             }
-            if (g_secondary_queues[d] != nullptr && !g_expert_prefetchers[d].is_initialized()) {
-                g_expert_prefetchers[d].init(*g_secondary_queues[d]);
+            if (ggml_sycl::get_shared_context_queue(d) != nullptr && !g_expert_prefetchers[d].is_initialized()) {
+                g_expert_prefetchers[d].init(*ggml_sycl::get_shared_context_queue(d));
                 GGML_LOG_INFO("[MOE-HYBRID] Initialized ExpertPrefetcher for GPU%d (demand-driven LRU)\n", d);
             }
         }
@@ -4484,7 +4486,7 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
         int       n_secondary_ok = 0;
 
         for (int gpu_d = 1; gpu_d < total_devices && gpu_d < GGML_SYCL_MAX_DEVICES; gpu_d++) {
-            if (!g_secondary_queues[gpu_d]) {
+            if (!ggml_sycl::get_shared_context_queue(gpu_d)) {
                 continue;  // Early init failed for this device
             }
             GGML_LOG_INFO("[MOE-MULTI-GPU] Initializing device %d for MoE expert dispatch\n", gpu_d);
@@ -4492,7 +4494,7 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
             try {
                 if (max_K > 0 && max_N > 0 && max_dispatch_count > 0) {
                     auto & pool_d = g_pinned_buffer_pools[gpu_d];
-                    pool_d.init(*g_secondary_queues[gpu_d], gpu_d, static_cast<size_t>(max_dispatch_count),
+                    pool_d.init(*ggml_sycl::get_shared_context_queue(gpu_d), gpu_d, static_cast<size_t>(max_dispatch_count),
                                 static_cast<size_t>(max_K), static_cast<size_t>(max_N));
                 }
 
@@ -6349,6 +6351,19 @@ std::atomic<bool>                                  g_tiered_enabled{ false };
 // applied in preload_model_weights).  Gated by GGML_SYCL_VRAM_ARENA=1.
 static ggml_sycl::placement_plan g_placement_plan;
 static bool                      g_has_placement_plan = false;
+
+bool ggml_backend_sycl_has_active_placement_plan(void) {
+    return g_has_placement_plan;
+}
+
+void ggml_backend_sycl_set_sched_placement_plan(ggml_backend_sched_t sched) {
+    // No-op placeholder: the unified cache planner manages placement
+    // independently via compute_placement_plan().  The scheduler hook
+    // exists so llama-context.cpp can trigger plan computation, but
+    // the actual plan is stored in g_placement_plan (SYCL backend local).
+    // A future implementation may pass the scheduler's layer split
+    // information here for multi-backend coordination.
+}
 
 static std::array<size_t, GGML_SYCL_MAX_DEVICES> g_tiered_headroom_reserve = {};
 
@@ -9486,7 +9501,7 @@ static ggml_sycl_device_info ggml_sycl_init() {
     // from allocating compute buffers on secondary GPUs, reserving their VRAM
     // for internal use (MoE expert caching or persistent TG row-split).
     // Secondary GPUs remain accessible internally: MoE dispatch uses
-    // g_secondary_queues[], persistent split uses split_config_init().
+    // get_shared_context_queue(), persistent split uses split_config_init().
     //
     // Opt-out: GGML_SYCL_SPLIT_RATIO or GGML_SYCL_TENSOR_SPLIT explicitly
     // request multi-GPU tensor splitting via the scheduler, so we keep all
@@ -10120,9 +10135,19 @@ static bool ggml_sycl_is_host_resident_weight(const ggml_tensor * src0, sycl::qu
             if (ggml_sycl_weight_is_planned_on_host(src0, device)) {
                 return true;
             }
-            auto resolved = ggml_sycl_resolve(src0, device);
-            if (resolved) {
-                return !resolved.on_device;
+            // MoE expert weights (_exps composite tensors) have their own cache
+            // management via moe_hybrid_init_once.  The unified cache's resolve
+            // may return on_device=false for composite _exps tensors because
+            // compute_placement_plan packs expert entries after dense weights+KV
+            // and may mark them as host when VRAM budget is exhausted.  Since MoE
+            // hybrid cache manages expert placement independently, skip the resolve
+            // check for MOE_EXPERT_WEIGHT tensors and defer to the placement plan.
+            const auto usage = ggml_sycl_get_tensor_usage(src0);
+            if (usage != tensor_usage::MOE_EXPERT_WEIGHT) {
+                auto resolved = ggml_sycl_resolve(src0, device);
+                if (resolved) {
+                    return !resolved.on_device;
+                }
             }
         }
     }
@@ -27275,6 +27300,7 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
     bool                       host_weights = ggml_sycl_is_host_resident_weight(src0, stream);
     ggml_sycl::unified_cache * cache        = ggml_sycl::get_unified_cache(*stream);
     const bool                 plan_active  = cache && cache->has_placement_plan();
+    const bool                 is_moe_expert = (ggml_sycl_get_tensor_usage(src0) == tensor_usage::MOE_EXPERT_WEIGHT);
     void *                     direct_base  = nullptr;
     if (layout == GGML_LAYOUT_AOS) {
         // Try to find the whole-tensor entry in the unified cache (VRAM).
@@ -27288,7 +27314,7 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
             direct_base = whole_tensor_resolved.ptr;
         }
         if (!direct_base && src0_is_usm_accessible) {
-            if (plan_active) {
+            if (plan_active && !is_moe_expert) {
                 GGML_SYCL_DEBUG(
                     "[MOE-PTR] Placement-plan preload active; refusing AoS zero-copy base for %s and forcing host "
                     "routing fallback on misses\n",
@@ -33785,7 +33811,7 @@ static void dispatch_experts_secondary_gpu_impl(const std::vector<expert_dispatc
                                                 int                                        target_device,
                                                 secondary_dispatch_ctx &                   ctx,
                                                 std::vector<expert_dispatch_entry> &       cpu_fallback) {
-    sycl::queue * target_queue = g_secondary_queues[target_device];
+    sycl::queue * target_queue = ggml_sycl::get_shared_context_queue(target_device);
     if (entries.empty() || !target_queue) {
         return;
     }
@@ -34798,7 +34824,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                     bool                  found_sec = false;
                                     const moe_tensor_type role      = is_gate_fast ? MOE_TENSOR_GATE : MOE_TENSOR_UP;
                                     for (int d = 1; d < n_gpu_devs && !found_sec; d++) {
-                                        if (!g_secondary_queues[d]) {
+                                        if (!ggml_sycl::get_shared_context_queue(d)) {
                                             continue;
                                         }
                                         void * sec_ptr = get_expert_device_ptr(block_id, eid, role, d);
@@ -34822,7 +34848,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                             continue;
                                         }
                                         void * cached = pf_d.get_cached_ptr(cur_layer_hash, eid);
-                                        if (cached && g_secondary_queues[d] != nullptr) {
+                                        if (cached && ggml_sycl::get_shared_context_queue(d) != nullptr) {
                                             fusion.sec_indices.push_back({ ci, d, cached });
                                             found_sec = true;
                                         }
@@ -35664,7 +35690,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         const int32_t eid_skip = ids_data[ci];
                         // Check secondary GPU caches for skip tracking
                         for (int d = 1; d < n_gpu_devs_fast; d++) {
-                            if (!g_secondary_queues[d]) {
+                            if (!ggml_sycl::get_shared_context_queue(d)) {
                                 continue;
                             }
                             if (is_expert_resident(block_unfused, eid_skip, d)) {
@@ -35714,7 +35740,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     if (have_secondary_fast) {
                         bool found_sec_uf = false;
                         for (int d = 1; d < n_gpu_devs_fast && !found_sec_uf; d++) {
-                            if (!g_secondary_queues[d]) {
+                            if (!ggml_sycl::get_shared_context_queue(d)) {
                                 continue;
                             }
                             void * sec_ptr = get_expert_device_ptr(block_unfused, expert_id, role_unfused, d);
@@ -37080,13 +37106,32 @@ cpu_tg_fallthrough:
                     // llama.cpp-n04bq probe: log the source of truth for each host
                     // expert pointer at CPU-dispatch time.  Include src0->data so we
                     // can correlate against the raw tensor-data path.
+                    // Fallback: compute host weight pointer from the composite _exps
+                    // tensor's host-storage base + expert offset.  This closes the
+                    // "CPU dispatch dead zone" where device-resident experts that
+                    // missed cache routing (steps 2-5 of the dispatch triage) were
+                    // neither computed on GPU nor CPU.  The _exps tensor's mmap data
+                    // is always host-accessible (it's the original GGUF weight data),
+                    // even when a device VRAM copy also exists.
+                    if (!host_weight && src0_host_storage && nb02 > 0 &&
+                        entry.expert_id >= 0 && static_cast<size_t>(entry.expert_id) < n_as) {
+                        host_weight = static_cast<const char *>(src0_host_storage) +
+                                      static_cast<size_t>(entry.expert_id) * nb02;
+                    }
+
                     n04bq_probe_log("dispatch_cpu_compute", src0->name, entry.expert_id,
                                     "expert_ptrs_host[e]=%p (is_dev=%d) host_weight=%p "
                                     "src0->data=%p src0_host_storage=%p nb02=%zu",
                                     candidate_ptr, candidate_is_device ? 1 : 0, host_weight,
                                     src0 ? src0->data : nullptr, src0_host_storage, nb02);
                     if (!host_weight) {
-                        // Expert is device-resident -- skip CPU dispatch (safety guard).
+                        // Expert weight is truly inaccessible (no host copy, no
+                        // mmap data) — skip CPU dispatch.  This should be extremely
+                        // rare now that the src0_host_storage fallback is active.
+                        GGML_LOG_WARN("[MoE-CPU] Skipping expert %d: no host-accessible weight "
+                                      "(tensor=%s, expert_ptrs_host=%p, src0_host=%p)\n",
+                                      entry.expert_id, src0->name ? src0->name : "?",
+                                      candidate_ptr, src0_host_storage);
                         continue;
                     }
 
@@ -37263,7 +37308,7 @@ cpu_tg_fallthrough:
                         // Check secondary GPUs
                         if (!routed && block_tg >= 0) {
                             for (int d = 1; d < n_gpu_devs && !routed; d++) {
-                                if (!g_secondary_queues[d]) {
+                                if (!ggml_sycl::get_shared_context_queue(d)) {
                                     continue;
                                 }
                                 if (is_expert_resident(block_tg, i02, d)) {
@@ -37294,7 +37339,7 @@ cpu_tg_fallthrough:
                                 if (cached) {
                                     if (d == 0) {
                                         gpu_entries.push_back({ iid1, id, i02, cached, 0 });
-                                    } else if (g_secondary_queues[d] != nullptr) {
+                                    } else if (ggml_sycl::get_shared_context_queue(d) != nullptr) {
                                         per_gpu_entries[d].push_back({ iid1, id, i02, cached });
                                     }
                                     routed = true;
@@ -37581,7 +37626,7 @@ cpu_tg_fallthrough:
                         // Check secondary GPU caches
                         if (!routed && multi_gpu && block_pp >= 0) {
                             for (int d = 1; d < n_gpu && !routed; d++) {
-                                if (d >= n_gpu_devs || !g_secondary_queues[d]) {
+                                if (d >= n_gpu_devs || !ggml_sycl::get_shared_context_queue(d)) {
                                     continue;
                                 }
                                 void * ptr = get_expert_device_ptr(block_pp, i02, role_pp, d);
@@ -37610,7 +37655,7 @@ cpu_tg_fallthrough:
                                 if (cached) {
                                     if (d == 0) {
                                         gpu_entries.push_back({ iid1, id, i02, cached });
-                                    } else if (d < n_gpu_devs && g_secondary_queues[d]) {
+                                    } else if (d < n_gpu_devs && ggml_sycl::get_shared_context_queue(d)) {
                                         per_gpu_entries[d].push_back({ iid1, id, i02, cached });
                                     }
                                     routed = true;
@@ -37628,7 +37673,7 @@ cpu_tg_fallthrough:
                                 void * loaded = pf.demand_load(layer_id, i02);
                                 if (loaded) {
                                     n_demand_loaded++;
-                                    if (d < n_gpu_devs && g_secondary_queues[d]) {
+                                    if (d < n_gpu_devs && ggml_sycl::get_shared_context_queue(d)) {
                                         per_gpu_entries[d].push_back({ iid1, id, i02, loaded });
                                     } else {
                                         gpu_entries.push_back({ iid1, id, i02, loaded });

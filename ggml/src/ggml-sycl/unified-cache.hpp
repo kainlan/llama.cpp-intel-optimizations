@@ -2154,6 +2154,27 @@ unified_cache_mode get_unified_cache_mode();
 // Set cache mode (call before first cache access)
 void set_unified_cache_mode(unified_cache_mode mode);
 
+// Set the scheduler-filtered device count (call from ggml_sycl_init after device map filtering)
+void set_scheduler_device_count(int count);
+
+// Set the total physical GPU count before cache pre-initialization
+// (call from ggml_sycl_init BEFORE get_unified_cache_for_device to avoid
+// ggml_sycl_info() re-entry deadlock on the static init guard)
+void set_total_gpu_count(int count);
+
+// === Shared-Context Queue Pool ===
+//
+// On Level Zero, cross-device SYCL events (depends_on, USM transfers) REQUIRE
+// matching ze_context_handle_t.  Device default queues (dpct::dev_mgr) each
+// have their OWN context.  All queues used for cross-device dispatch MUST share
+// device 0's context to avoid DEVICE_LOST errors.
+//
+// This pool creates per-device in-order queues that share device 0's SYCL
+// context, replacing the global g_secondary_queues[] array.
+
+sycl::queue * get_shared_context_queue(int device);
+void init_shared_context_queues(int total_gpus);
+
 // === Global API ===
 
 // Get unified cache for the device associated with the given queue

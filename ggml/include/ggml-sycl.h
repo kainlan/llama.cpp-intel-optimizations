@@ -730,6 +730,14 @@ GGML_BACKEND_API void ggml_backend_sycl_set_model_loading(bool loading);
 // tensors may outlive backends (e.g., temporary backends during model loading).
 GGML_BACKEND_API void ggml_backend_sycl_release_host_weight_extras(void);
 
+// Wire the SYCL placement plan into the ggml scheduler.  When multi-GPU
+// SPLIT_RATIO is active, this tells the scheduler which backend (device)
+// should process each tensor, enabling proper graph splitting during warmup
+// and inference.  Must be called after compute_multi_device_plan and after
+// the scheduler is created with all GPU backends.
+GGML_BACKEND_API void ggml_backend_sycl_set_sched_placement_plan(ggml_backend_sched_t sched);
+GGML_BACKEND_API bool ggml_backend_sycl_has_active_placement_plan(void);
+
 #ifdef __cplusplus
 }
 #endif

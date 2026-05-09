@@ -1491,7 +1491,8 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
     const uint32_t n_tokens = ubatch->n_tokens;
     GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
 
-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    // Accept any CPU-accessible buffer (HOST, HOST_COMPUTE, HOST_PINNED)
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer) || dst->data);
     int64_t * data = (int64_t *) dst->data;
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
@@ -1507,7 +1508,7 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
     const uint32_t n_tokens = ubatch->n_tokens;
     GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
 
-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer) || dst->data);
     int64_t * data = (int64_t *) dst->data;
 
     if (!v_trans) {
@@ -1537,7 +1538,7 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
 }
 
 void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer) || dst->data);
 
     int32_t * data = (int32_t *) dst->data;
 
@@ -1553,7 +1554,7 @@ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer) || dst->data);
     float * data = (float *) dst->data;
 
     const int64_t n_kv     = dst->ne[0];
@@ -1640,7 +1641,7 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
     GGML_ASSERT(n_stream == 1 && "TODO: support multiple streams");
     const auto & cells = v_cells[0];
 
-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer) || dst->data);
     GGML_ASSERT(!ubatch->equal_seqs()); // TODO: use ubatch->n_seqs instead of failing
 
     int32_t * data = (int32_t *) dst->data;

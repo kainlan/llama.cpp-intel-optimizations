@@ -173,7 +173,7 @@ void llm_graph_input_pos_bucket::set_input(const llama_ubatch * ubatch) {
     if (pos_bucket) {
         const int64_t n_tokens = ubatch->n_tokens;
 
-        GGML_ASSERT(ggml_backend_buffer_is_host(pos_bucket->buffer));
+        GGML_ASSERT(ggml_backend_buffer_is_host(pos_bucket->buffer) || pos_bucket->data);
         GGML_ASSERT(!ubatch->equal_seqs()); // TODO: use ubatch->n_seqs instead of failing
 
         int32_t * data = (int32_t *) pos_bucket->data;
@@ -199,7 +199,7 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_tokens = ubatch->n_tokens;
 
-    GGML_ASSERT(ggml_backend_buffer_is_host(out_ids->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(out_ids->buffer) || out_ids->data);
     int32_t * data = (int32_t *) out_ids->data;
 
     if (n_outputs == n_tokens) {

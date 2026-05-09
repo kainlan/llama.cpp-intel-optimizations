@@ -47,14 +47,8 @@ void ExpertPrefetcher::init(sycl::queue & compute_q) {
     // Derive device ID from the compute queue for VRAM budget tracking.
     device_id_ = ggml_sycl_get_device_id_from_queue(compute_q);
 
-    // Read prefetch depth from environment
-    const char * depth_env = std::getenv("GGML_SYCL_EXPERT_PREFETCH_DEPTH");
-    if (depth_env) {
-        int d = std::atoi(depth_env);
-        if (d > 0 && d <= 16) {
-            prefetch_depth_ = d;
-        }
-    }
+    // GGML_SYCL_EXPERT_PREFETCH_DEPTH env var removed — unified cache
+    // manages prefetch depth automatically.
 
     initialized_ = true;
     GGML_LOG_INFO("[SYCL] Expert prefetcher initialized (depth=%d, dynamic pool)\n", prefetch_depth_);
@@ -489,13 +483,8 @@ void ExpertPredictor::init(int n_layers, int n_experts, int n_experts_used) {
     window_total_      = 0;
 
     // Read prediction depth from environment
-    const char * depth_env = std::getenv("GGML_SYCL_EXPERT_PREDICT_DEPTH");
-    if (depth_env) {
-        int d = std::atoi(depth_env);
-        if (d >= 1 && d <= 8) {
-            predict_depth_ = d;
-        }
-    }
+    // GGML_SYCL_EXPERT_PREDICT_DEPTH env var removed — unified cache
+    // manages prediction depth automatically.
 
     initialized_ = true;
     GGML_LOG_INFO("[SYCL] Expert predictor initialized (layers=%d, experts=%d, top_k=%d, depth=%d)\n", n_layers,
@@ -957,13 +946,8 @@ bool ExpertPredictor::has_gate_weights(int layer_idx) const {
 // ============================================================================
 
 bool ggml_sycl_expert_predict_enabled() {
-    static int cached = -1;
-    if (cached < 0) {
-        const char * env = std::getenv("GGML_SYCL_EXPERT_PREDICT");
-        // Default: ON (1) unless explicitly set to 0
-        cached           = (!env || std::atoi(env) != 0) ? 1 : 0;
-    }
-    return cached != 0;
+    // GGML_SYCL_EXPERT_PREDICT env var removed — always enabled.
+    return true;
 }
 
 // ============================================================================

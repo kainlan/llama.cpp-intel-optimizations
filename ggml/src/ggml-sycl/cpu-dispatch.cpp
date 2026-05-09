@@ -1351,24 +1351,13 @@ void ggml_sycl_cpu_expert_mul_mat_batched(
 // ---------------------------------------------------------------------------
 
 expert_miss_precision ggml_sycl_expert_miss_precision_mode() {
-    static expert_miss_precision mode = []() {
-        const char * env = getenv("GGML_SYCL_EXPERT_MISS_PRECISION");
-        if (env) {
-            if (std::string(env) == "full") {
-                return expert_miss_precision::FULL;
-            }
-        }
-        return expert_miss_precision::MIXED;  // Default: mixed
-    }();
-    return mode;
+    // GGML_SYCL_EXPERT_MISS_PRECISION env var removed — always MIXED.
+    return expert_miss_precision::MIXED;
 }
 
 int ggml_sycl_expert_miss_burst_threshold() {
-    static int threshold = []() {
-        const char * env = getenv("GGML_SYCL_EXPERT_MISS_BURST_THRESHOLD");
-        return env ? std::max(1, atoi(env)) : 3;
-    }();
-    return threshold;
+    // GGML_SYCL_EXPERT_MISS_BURST_THRESHOLD env var removed — hardcoded 3.
+    return 3;
 }
 
 // Compute one expert using INT4 fast-path (Q4_0 only).

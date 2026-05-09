@@ -41,6 +41,8 @@ static int                                                     g_unified_cache_b
 static size_t                                                  g_unified_cache_host_budget = 0;  // 0 = auto-calc
 static int                                                     g_unified_cache_host_budget_pct = 90;
 static unified_cache_mode                                      g_cache_mode = unified_cache_mode::AUTO;
+static int                                                     g_scheduler_device_count = -1;
+static int                                                     g_total_gpu_count       = -1;
 static std::atomic<bool>   g_cache_mode_locked{ false };   // Locked after first cache access
 static std::atomic<bool>   g_sycl_shutting_down{ false };  // Set during shutdown to skip sycl::free()
 // VRAM runtime counters removed — arena zones (zone_used) are the single source of truth.
@@ -1293,7 +1295,28 @@ unified_cache::unified_cache(sycl::queue & queue,
             host_mem_budget = (total_mem > 0) ? static_cast<size_t>(total_mem * (static_cast<double>(pct) / 100.0)) :
                                                 (size_t(128) << 30);
         }
-        const size_t pinned_cap    = size_t(128) << 30;
+        size_t pinned_cap = size_t(128) << 30;
+
+        // On Intel Arc discrete GPUs (Xe architecture), USM host memory
+        // (sycl::malloc_host / zeMemAllocHost) is mapped through the PPGTT
+        // (Per-Process GTT), NOT the GGTT.  The PPGTT provides a 256 TB
+        // address space per device — effectively unlimited for practical
+        // allocations.  The GGTT is reserved for kernel/privileged resources
+        // (GuC firmware, display engine) and is NOT consumed by user-space
+        // USM allocations.  Therefore there is no GGTT aperture constraint
+        // on pinned host memory, and no budget cap is needed for multi-GPU.
+        //
+        // See: Intel GPU PRM Vol06 "Memory Views" — PPGTT is 48-bit (256 TB),
+        //      GGTT is 32-bit (4 GB) and reserved for kernel resources only.
+        //      Level Zero spec: host allocations are accessible by all devices
+        //      in the context via PPGTT mappings, not GGTT.
+
+        if (getenv("GGML_SYCL_NO_PINNED") != nullptr) {
+            GGML_LOG_INFO("[HOST-ARENA] GGML_SYCL_NO_PINNED set: disabling pinned host memory\n");
+            pinned_cap = 0;
+        }
+
+
         const size_t pinned_budget = std::min(host_mem_budget, pinned_cap);
         host_arena_                = std::make_unique<pinned_chunk_pool>(queue_, pinned_budget);
         GGML_LOG_INFO("[HOST-ARENA] Created with %.1f GB budget (from system RAM)\n",
@@ -4109,7 +4132,6 @@ sycl::event unified_cache::copy_to_device_async(void *                          
         GGML_LOG_INFO("[SYCL] copy_to_device_async ptr types: dst=%p type=%d src=%p type=%d size=%zu\n", dst,
                       (int) dst_type, src, (int) src_type, size);
         if (copy_trace_enabled()) {
-            fflush(stderr);
         }
     }
     if (dst_type == sycl::usm::alloc::unknown && cache_assert_enabled()) {
@@ -4985,13 +5007,82 @@ void set_unified_cache_mode(unified_cache_mode mode) {
     g_cache_mode = mode;
 }
 
+void set_scheduler_device_count(int count) {
+    g_scheduler_device_count = count;
+}
+
+void set_total_gpu_count(int count) {
+    g_total_gpu_count = count;
+}
+
+// === Shared-Context Queue Pool ===
+// Per-device queues sharing device 0's SYCL context for Level Zero cross-device ops.
+static sycl::queue * g_shared_ctx_queues[GGML_SYCL_MAX_DEVICES] = {};
+static bool g_shared_ctx_queues_initialized = false;
+
+void init_shared_context_queues(int total_gpus) {
+    if (g_shared_ctx_queues_initialized) {
+        return;
+    }
+    g_shared_ctx_queues_initialized = true;
+
+    if (total_gpus < 2) {
+        return;
+    }
+
+    auto & dev0       = ggml_sycl_get_gpu_device(0);
+    auto   shared_ctx = dev0.default_queue().get_context();
+
+    int n_created = 0;
+    for (int d = 1; d < total_gpus && d < GGML_SYCL_MAX_DEVICES; d++) {
+        try {
+            auto & dev_d = ggml_sycl_get_gpu_device(d);
+            if (!g_shared_ctx_queues[d]) {
+                g_shared_ctx_queues[d] = new sycl::queue(shared_ctx, dev_d, default_queue_properties());
+            }
+            n_created++;
+        } catch (const std::exception & e) {
+            GGML_LOG_WARN("[SHARED-CTX-QUEUE] Device %d unavailable: %s\n", d, e.what());
+        } catch (...) {
+            GGML_LOG_WARN("[SHARED-CTX-QUEUE] Device %d unavailable (unknown error)\n", d);
+        }
+    }
+    if (n_created > 0) {
+        GGML_LOG_INFO("[SHARED-CTX-QUEUE] %d secondary queues created with shared context\n", n_created);
+    }
+}
+
+sycl::queue * get_shared_context_queue(int device) {
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return nullptr;
+    }
+    return g_shared_ctx_queues[device];
+}
+
 // Helper: Determine effective mode (resolves AUTO)
 static unified_cache_mode get_effective_mode() {
     unified_cache_mode mode = get_unified_cache_mode();
     if (mode == unified_cache_mode::AUTO) {
-        // Auto-detect: use per_device if multiple GPUs available
-        int device_count = dpct::dev_mgr::instance().device_count();
-        return (device_count > 1) ? unified_cache_mode::PER_DEVICE : unified_cache_mode::GLOBAL;
+        // Use g_total_gpu_count (physical GPUs) to determine cache mode.
+        // When multiple physical GPUs are visible, each gets its own
+        // PER_DEVICE cache so the unified cache planner can place weights
+        // on the correct device.  The scheduler may still see only device 0
+        // (no tensor split), but the planner distributes weights across all
+        // physical GPUs.
+        //
+        // IMPORTANT: Do NOT call ggml_sycl_info() here.  This function is
+        // called from get_unified_cache_for_device_impl(), which is invoked
+        // inside ggml_sycl_init()'s static initialization.  Calling
+        // ggml_sycl_info() would re-enter the static guard and deadlock.
+        // Use g_total_gpu_count instead — it is set in ggml_sycl_init()
+        // BEFORE cache pre-initialization runs.
+        int total_gpus = g_total_gpu_count;
+        // If not yet initialized (called before ggml_sycl_init sets it),
+        // fall back to dpct device count (safe — no static guard).
+        if (total_gpus < 0) {
+            total_gpus = dpct::dev_mgr::instance().device_count();
+        }
+        return (total_gpus > 1) ? unified_cache_mode::PER_DEVICE : unified_cache_mode::GLOBAL;
     }
     return mode;
 }
@@ -9957,7 +10048,6 @@ void unified_cache::arena_destroy() {
                             "[VRAM-ARENA] chunk %p size=%.1f MB still has %u outstanding lease(s) after 5s — "
                             "aborting (llama.cpp-dyhdl)\n",
                             c.ptr, c.size / (1024.0 * 1024.0), outstanding);
-                        std::fflush(stderr);
                         GGML_ASSERT(false && "VRAM arena chunk freed while leases outstanding (dyhdl timeout)");
                     }
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -10538,20 +10628,20 @@ placement_plan compute_placement_plan(const std::vector<std::pair<std::string, s
         }
     }
 
+    // MoE expert entries are managed by the MoE hybrid cache (moe_hybrid_init_once),
+    // which has its own budget separate from the dense weight VRAM budget.  The hybrid
+    // cache uses the full managed memory (unified_cache_total_managed) rather than the
+    // weight-only remaining budget.  Marking experts as host-resident here causes
+    // ggml_sycl_moe_tensor_all_experts_on_host() to reject MUL_MAT_ID from the SYCL
+    // backend at graph-build time, routing all expert compute to CPU and producing
+    // garbage output.  For single-device plans, all experts default to the device;
+    // the hybrid cache will handle actual staging lazily.
     for (size_t idx : moe_indices) {
         auto & entry = plan.entries[idx];
-        if (entry.dst_size <= remaining) {
-            entry.on_device     = true;
-            entry.target_device = device_id;
-            remaining -= entry.dst_size;
-            plan.weight_vram_bytes += entry.dst_size;
-            plan.vram_bytes += entry.dst_size;
-        } else {
-            entry.on_device     = false;
-            entry.target_device = -1;
-            plan.weight_host_bytes += entry.dst_size;
-            plan.host_bytes += entry.dst_size;
-        }
+        entry.on_device     = true;
+        entry.target_device = device_id;
+        plan.weight_vram_bytes += entry.dst_size;
+        plan.vram_bytes += entry.dst_size;
     }
 
     populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info.n_expert_used);

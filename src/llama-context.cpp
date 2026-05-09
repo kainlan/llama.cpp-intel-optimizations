@@ -444,6 +444,9 @@ llama_context::llama_context(
                 (model.params.split_mode == LLAMA_SPLIT_MODE_PIPELINE)
             );
 
+        if (pipeline_parallel && ggml_backend_sycl_has_active_placement_plan())
+            pipeline_parallel = false;
+
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
             for (auto & backend : backends) {
@@ -464,6 +467,8 @@ llama_context::llama_context(
         }
 
         sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, pipeline_parallel, cparams.op_offload));
+
+        ggml_backend_sycl_set_sched_placement_plan(sched.get());
 
         if (pipeline_parallel) {
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled (n_copies=%d)\n", __func__, ggml_backend_sched_get_n_copies(sched.get()));
@@ -676,11 +681,11 @@ llama_context::llama_context(
         // Must be done after graph_reserve() populates backend_buf_exp_size[].
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             if (ggml_backend_is_sycl(backend_ptrs[i])) {
+                size_t dev_size[1] = { backend_buf_exp_size[i] };
                 ggml_backend_sycl_notify_compute_buffer_sizes(
                         backend_ptrs[i],
-                        backend_buf_exp_size.data(),
-                        (int) backend_buf_exp_size.size());
-                break;  // One call covers all devices (function iterates internals)
+                        dev_size, 1);
+                // Don't break — each SYCL backend needs its own RUNTIME zone
             }
         }
 #endif

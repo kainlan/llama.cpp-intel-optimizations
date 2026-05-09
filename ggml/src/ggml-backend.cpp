@@ -760,7 +760,7 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #endif
 
 #ifndef GGML_SCHED_MAX_SPLIT_INPUTS
-#    define GGML_SCHED_MAX_SPLIT_INPUTS 30
+#    define GGML_SCHED_MAX_SPLIT_INPUTS 256
 #endif
 
 #ifndef GGML_SCHED_MAX_COPIES
@@ -837,6 +837,9 @@ struct ggml_backend_sched {
     int            tp_world_size;
     ggml_backend_t tp_backends[GGML_SCHED_MAX_BACKENDS];
 
+    void * placement_plan_ctx;
+    int  (*placement_plan_get_device)(void *ctx, const char *name, int def_dev);
+
     // Pipeline profiling
     bool                 do_profile_pipeline;
     int64_t              t_split_start;
@@ -903,6 +906,28 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 
 // returns the backend that should be used for the node based on the current locations
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
+    if (sched->placement_plan_get_device) {
+        auto try_plan = [&](const char * name) -> int {
+            if (!name || !name[0]) return -1;
+            int b = sched->placement_plan_get_device(sched->placement_plan_ctx, name, -1);
+            return (b >= 0 && b < sched->n_backends) ? b : -1;
+        };
+        int plan_backend = try_plan(tensor->name);
+        const ggml_tensor * t = tensor;
+        for (int depth = 0; depth < 16 && plan_backend < 0; depth++) {
+            for (int j = 0; j < GGML_MAX_SRC && plan_backend < 0; j++) {
+                if (!t->src[j]) continue;
+                plan_backend = try_plan(t->src[j]->name);
+                if (plan_backend < 0 && t->src[j]->buffer &&
+                    t->src[j]->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                    plan_backend = ggml_backend_sched_backend_from_buffer(sched, t->src[j], tensor);
+                }
+            }
+            if (plan_backend < 0 && t->src[0]) t = t->src[0]; else break;
+        }
+        if (plan_backend >= 0) { SET_CAUSE(tensor, "plan"); return plan_backend; }
+    }
+
     // assign pre-allocated nodes to their backend
     int cur_backend_id = ggml_backend_sched_backend_from_buffer(sched, tensor, tensor);
     if (cur_backend_id != -1) {
@@ -1310,11 +1335,49 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
             }
         }
-        // if the node is still unassigned, assign it to the first backend that supports it
-        for (int b = 0; b < sched->n_backends && *cur_backend_id == -1; b++) {
-            ggml_backend_sched_set_if_supported(sched, node, b, cur_backend_id);
+        if (*cur_backend_id == -1) {
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                struct ggml_tensor * src = node->src[j];
+                if (!src || !src->buffer) continue;
+                if (src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                    *cur_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, node);
+                    if (*cur_backend_id >= 0) { SET_CAUSE(node, "4.wt"); break; }
+                }
+            }
+            for (int j = 0; j < GGML_MAX_SRC && *cur_backend_id == -1; j++) {
+                struct ggml_tensor * src = node->src[j];
+                if (!src) continue;
+                int src_id = tensor_backend_id(src);
+                if (src_id >= 0 && src_id != sched->n_backends - 1) { *cur_backend_id = src_id; SET_CAUSE(node, "4.inh"); }
+            }
+            for (int b = 0; b < sched->n_backends - 1 && *cur_backend_id == -1; b++) {
+                ggml_backend_sched_set_if_supported(sched, node, b, cur_backend_id);
+            }
+            if (*cur_backend_id == -1) {
+                ggml_backend_sched_set_if_supported(sched, node, sched->n_backends - 1, cur_backend_id);
+            }
+            GGML_ASSERT(*cur_backend_id != -1);
         }
-        GGML_ASSERT(*cur_backend_id != -1);
+    }
+
+    // Lone-node smoothing: eliminate single-node alternations
+    for (int pass = 0; pass < 3; pass++) {
+        int changed = 0;
+        for (int i = 0; i < graph->n_nodes; i++) {
+            struct ggml_tensor * node = graph->nodes[i];
+            if (ggml_is_view_op(node->op)) continue;
+            int * self_id = &tensor_backend_id(node);
+            int prev_id = -1, next_id = -1;
+            for (int j = i - 1; j >= 0; j--)
+                if (!ggml_is_view_op(graph->nodes[j]->op)) { prev_id = tensor_backend_id(graph->nodes[j]); break; }
+            for (int jj = i + 1; jj < graph->n_nodes; jj++)
+                if (!ggml_is_view_op(graph->nodes[jj]->op)) { next_id = tensor_backend_id(graph->nodes[jj]); break; }
+            if (prev_id >= 0 && prev_id == next_id && *self_id != prev_id) {
+                *self_id = prev_id;
+                changed++;
+            }
+        }
+        if (!changed) break;
     }
 
     // pass 5: split graph, find tensors that need to be copied
@@ -1589,6 +1652,19 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 }
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+    // Plan-based multi-device: disable per-tensor allocation.
+    // The per-tensor path assigned SYCL device buffers to ALL tensors
+    // (including input tensors like inp_tokens), which broke set_inputs
+    // because the CPU-based client can't write to device-local buffers directly.
+    // Instead, let the normal gallocr-based allocator handle tensor placement.
+    // The plan callback provides per-tensor backend assignment which the
+    // scheduler uses for split creation and graph allocation.
+#if 0
+    if (sched->placement_plan_get_device) {
+        // (disabled per-tensor alloc)
+    }
+#endif
+
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
@@ -2097,6 +2173,15 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
         sched->is_reset = true;
     }
     sched->is_alloc = false;
+}
+
+void ggml_backend_sched_set_placement_plan(
+    ggml_backend_sched_t sched,
+    void * ctx,
+    int (*get_device)(void * ctx, const char * name, int default_device)) {
+    if (!sched) return;
+    sched->placement_plan_ctx        = ctx;
+    sched->placement_plan_get_device = get_device;
 }
 
 void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {

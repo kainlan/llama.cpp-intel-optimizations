@@ -170,13 +170,11 @@ enum class expert_miss_precision {
     MIXED = 1,   // Use INT4 for burst misses (>threshold per layer)
 };
 
-// Return the configured miss precision mode.
-// Reads GGML_SYCL_EXPERT_MISS_PRECISION env var (full|mixed, default: mixed).
+// Return the configured miss precision mode (always MIXED).
 expert_miss_precision ggml_sycl_expert_miss_precision_mode();
 
-// Return the burst miss threshold (default: 3).
+// Return the burst miss threshold (always 3).
 // When miss count per layer exceeds this, mixed precision activates.
-// Reads GGML_SYCL_EXPERT_MISS_BURST_THRESHOLD env var.
 int ggml_sycl_expert_miss_burst_threshold();
 
 // Compute multiple experts with adaptive precision based on miss count.
