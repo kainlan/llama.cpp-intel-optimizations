@@ -3287,10 +3287,11 @@ static float *                    g_secondary_staging_buffer[GGML_SYCL_MAX_DEVIC
 static size_t                     g_secondary_staging_size[GGML_SYCL_MAX_DEVICES]   = {};
 static size_t                     g_secondary_staging_max_N[GGML_SYCL_MAX_DEVICES]  = {};
 static managed_host_pinned_buffer g_secondary_staging_alloc[GGML_SYCL_MAX_DEVICES];
-// Secondary GPU queues are now managed by the shared-context queue pool
+// Secondary GPU queues are managed by the per-device queue pool
 // in unified-cache.cpp (init_shared_context_queues / get_shared_context_queue).
-// This ensures all cross-device queues share device 0's SYCL context for
-// Level Zero depends_on() compatibility.
+// Each secondary queue uses its own single-device SYCL context to avoid
+// the multi-device Level Zero context regression (compute-runtime#916, #921).
+// Cross-device data moves via host-staged memcpy; no shared USM or depends_on().
 // Legacy g_secondary_queues[] / g_gpu1_queue removed — use ggml_sycl::get_shared_context_queue(d).
 
 // Compute a stable, unique cache layer ID from a tensor name.
@@ -3867,13 +3868,19 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
     if (device == 0) {
         const char * moe_opt_in   = std::getenv("GGML_SYCL_MOE_MULTI_GPU");
         const int    total_gpus   = ggml_sycl_info().total_gpu_count;
-        // Auto-enable for MoE models with 2+ GPUs, unless explicitly disabled
-        const bool   multi_gpu_on = moe_opt_in ? (std::atoi(moe_opt_in) != 0) : (total_gpus >= 2);
+        // Multi-GPU MoE dispatch is currently BLOCKED by the Level Zero
+        // DEVICE_LOST regression (compute-runtime#916, #921).  A multi-device
+        // SYCL platform context triggers error 20 at the first MUL_MAT.
+        // Default to OFF; require explicit GGML_SYCL_MOE_MULTI_GPU=1 to enable.
+        // This will be re-enabled once the driver regression is fixed.
+        const bool   multi_gpu_on = moe_opt_in ? (std::atoi(moe_opt_in) != 0) : false;
 
         if (multi_gpu_on && total_gpus >= 2) {
-            // Initialize shared-context queue pool for cross-device Level Zero compat.
-            // All secondary queues share device 0's SYCL context so that
-            // cross-device depends_on() works.  The pool lives in unified-cache.cpp
+            // Initialize per-device queue pool for multi-GPU MoE dispatch.
+            // Each secondary queue gets its own single-device SYCL context
+            // (avoids the multi-device Level Zero context regression —
+            // compute-runtime#916, #921).  Cross-device data moves via
+            // host-staged memcpy.  The pool lives in unified-cache.cpp
             // and is idempotent (safe to call if already initialized).
             ggml_sycl::init_shared_context_queues(total_gpus);
 
@@ -9570,8 +9577,11 @@ static ggml_sycl_device_info ggml_sycl_init() {
     // to the backend scheduler by default.  This prevents pipeline parallelism
     // from allocating compute buffers on secondary GPUs, reserving their VRAM
     // for internal use (MoE expert caching or persistent TG row-split).
-    // Secondary GPUs remain accessible internally: MoE dispatch uses
-    // get_shared_context_queue(), persistent split uses split_config_init().
+    // Secondary GPUs remain accessible internally via per-device queues:
+    // MoE dispatch uses get_shared_context_queue(), persistent split uses
+    // split_config_init().  Each secondary queue has its own single-device
+    // SYCL context to avoid the multi-device Level Zero context regression
+    // (compute-runtime#916, #921).
     //
     // Opt-out: GGML_SYCL_SPLIT_RATIO or GGML_SYCL_TENSOR_SPLIT explicitly
     // request multi-GPU tensor splitting via the scheduler, so we keep all
@@ -9586,6 +9596,24 @@ static ggml_sycl_device_info ggml_sycl_init() {
                 "(%zu physical GPUs available internally for MoE/split)\n",
                 device_map.size());
             device_map.resize(1);
+        }
+
+        // Multi-GPU DEVICE_LOST warning: compute-runtime 26.x has a regression
+        // where a Level Zero context spanning 2+ discrete Arc GPUs triggers
+        // UR_RESULT_ERROR_DEVICE_LOST (error 20) at the first MUL_MAT.
+        // See intel/compute-runtime#916 and #921.  The per-device context
+        // architecture in init_shared_context_queues() avoids creating explicit
+        // multi-device contexts, but the SYCL runtime's platform-level default
+        // context still spans all visible devices.  Until Intel fixes the
+        // regression, multi-GPU inference requires ONEAPI_DEVICE_SELECTOR
+        // restricted to a single device.
+        if (info.total_gpu_count > 1) {
+            GGML_LOG_WARN(
+                "[SYCL] WARNING: %d GPUs visible. Multi-GPU Level Zero contexts "
+                "trigger DEVICE_LOST on compute-runtime 26.x (intel/compute-runtime#916, #921). "
+                "Set ONEAPI_DEVICE_SELECTOR=level_zero:0 for single-GPU operation. "
+                "Multi-GPU MoE dispatch is disabled until the driver regression is fixed.\n",
+                info.total_gpu_count);
         }
     }
 

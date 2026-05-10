@@ -5015,8 +5015,20 @@ void set_total_gpu_count(int count) {
     g_total_gpu_count = count;
 }
 
-// === Shared-Context Queue Pool ===
-// Per-device queues sharing device 0's SYCL context for Level Zero cross-device ops.
+// === Per-Device Queue Pool ===
+// Per-device queues each using their OWN SYCL context (single-device context).
+//
+// IMPORTANT: Prior implementations used a shared context (device 0's context
+// spanning all GPUs), which triggers DEVICE_LOST / OUT_OF_DEVICE_MEMORY errors
+// on compute-runtime 26.x when the Level Zero context spans multiple discrete
+// Arc GPUs.  See intel/compute-runtime#916 and #921.
+//
+// With per-device contexts:
+//   - Each secondary GPU gets its own sycl::context containing only that device.
+//   - Cross-device data transfer uses host-staged copies (already the pattern
+//     in dispatch_experts_secondary_gpu_impl).
+//   - No cross-device depends_on() or USM sharing — each context is isolated.
+//   - Synchronization uses host-side event.wait() between queues.
 static sycl::queue * g_shared_ctx_queues[GGML_SYCL_MAX_DEVICES] = {};
 static bool g_shared_ctx_queues_initialized = false;
 
@@ -5030,25 +5042,28 @@ void init_shared_context_queues(int total_gpus) {
         return;
     }
 
-    auto & dev0       = ggml_sycl_get_gpu_device(0);
-    auto   shared_ctx = dev0.default_queue().get_context();
-
     int n_created = 0;
     for (int d = 1; d < total_gpus && d < GGML_SYCL_MAX_DEVICES; d++) {
         try {
             auto & dev_d = ggml_sycl_get_gpu_device(d);
             if (!g_shared_ctx_queues[d]) {
-                g_shared_ctx_queues[d] = new sycl::queue(shared_ctx, dev_d, default_queue_properties());
+                // Create a SINGLE-DEVICE context for device d.  This avoids the
+                // multi-device Level Zero context regression (compute-runtime#916,
+                // #921) that causes DEVICE_LOST when a context spans 2+ discrete
+                // Arc GPUs.  Each device operates in its own context; data moves
+                // between devices via host-staged memcpy.
+                sycl::context dev_d_ctx(dev_d);
+                g_shared_ctx_queues[d] = new sycl::queue(dev_d_ctx, dev_d, default_queue_properties());
             }
             n_created++;
         } catch (const std::exception & e) {
-            GGML_LOG_WARN("[SHARED-CTX-QUEUE] Device %d unavailable: %s\n", d, e.what());
+            GGML_LOG_WARN("[PER-DEV-QUEUE] Device %d unavailable: %s\n", d, e.what());
         } catch (...) {
-            GGML_LOG_WARN("[SHARED-CTX-QUEUE] Device %d unavailable (unknown error)\n", d);
+            GGML_LOG_WARN("[PER-DEV-QUEUE] Device %d unavailable (unknown error)\n", d);
         }
     }
     if (n_created > 0) {
-        GGML_LOG_INFO("[SHARED-CTX-QUEUE] %d secondary queues created with shared context\n", n_created);
+        GGML_LOG_INFO("[PER-DEV-QUEUE] %d secondary queues created with per-device contexts\n", n_created);
     }
 }
 

@@ -2166,11 +2166,15 @@ void set_total_gpu_count(int count);
 //
 // On Level Zero, cross-device SYCL events (depends_on, USM transfers) REQUIRE
 // matching ze_context_handle_t.  Device default queues (dpct::dev_mgr) each
-// have their OWN context.  All queues used for cross-device dispatch MUST share
-// device 0's context to avoid DEVICE_LOST errors.
+// have their OWN context.
 //
-// This pool creates per-device in-order queues that share device 0's SYCL
-// context, replacing the global g_secondary_queues[] array.
+// PRIOR DESIGN (broken): shared device 0's context across all secondary queues.
+// This created a multi-device Level Zero context, triggering DEVICE_LOST on
+// compute-runtime 26.x (intel/compute-runtime#916, #921).
+//
+// CURRENT DESIGN: Each secondary queue uses its own single-device SYCL context.
+// Cross-device data moves via host-staged memcpy (no shared USM).  Each context
+// is isolated — no cross-device depends_on() or USM access.
 
 sycl::queue * get_shared_context_queue(int device);
 void init_shared_context_queues(int total_gpus);
