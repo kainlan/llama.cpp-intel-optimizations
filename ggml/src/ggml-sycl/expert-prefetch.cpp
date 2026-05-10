@@ -955,13 +955,10 @@ bool ggml_sycl_expert_predict_enabled() {
 // ============================================================================
 
 bool MoeDispatchStats::enabled() {
-    static int cached = -1;
-    if (cached < 0) {
-        const char * env = std::getenv("GGML_SYCL_MOE_STATS");
-        // Default: ON (1) when expert prediction is active, unless explicitly 0
-        cached           = (!env || std::atoi(env) != 0) ? 1 : 0;
-    }
-    return cached != 0;
+    // Always enabled: dispatch stats are lightweight counters that help
+    // diagnose MoE cache performance.  Previously tunable via
+    // GGML_SYCL_MOE_STATS; now hardcoded on.
+    return true;
 }
 
 void MoeDispatchStats::record_dispatch(int n_vram, int n_host, int n_staging, int n_miss, int n_prefetched) {
@@ -1086,15 +1083,8 @@ MoeDispatchStats & get_moe_dispatch_stats(int device) {
         device = 0;
     }
 
-    std::call_once(init_flags[device], [device]() {
-        const char * env = std::getenv("GGML_SYCL_MOE_STATS_INTERVAL");
-        if (env) {
-            int val = std::atoi(env);
-            if (val > 0) {
-                stats[device].report_interval = val;
-            }
-        }
-    });
+    // Stats reporting interval uses the default (1000 tokens).
+    // Previously tunable via GGML_SYCL_MOE_STATS_INTERVAL; now hardcoded.
 
     return stats[device];
 }

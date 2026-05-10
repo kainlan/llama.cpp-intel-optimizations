@@ -398,9 +398,8 @@ class ExpertPredictor {
 // Integrated at the dispatch partition point in ggml_sycl_mul_mat_id() to
 // measure actual cache residency and prediction overlap.
 //
-// Env var: GGML_SYCL_MOE_STATS=1 enables stats collection (default: ON when
-// expert prediction is active). GGML_SYCL_MOE_STATS_INTERVAL=N controls
-// reporting interval in tokens (default: 10).
+// Dispatch stats are always enabled (lightweight counters for diagnosing
+// MoE cache performance). Reporting interval: every 1000 tokens (default).
 //
 struct MoeDispatchStats {
     // Cumulative counters (lifetime)

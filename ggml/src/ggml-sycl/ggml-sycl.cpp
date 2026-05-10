@@ -1076,17 +1076,9 @@ struct moe_warmup_state {
         if (ggml_sycl::unified_cache_enabled()) {
             warmup_tokens = 0;  // Use gate norms, skip inference profiling
         }
-        // Read env var for warmup token count (0 = skip warmup, use gate norms).
-        // Placed AFTER the S1 default so the user can still override.
-        const char * env = getenv("GGML_SYCL_MOE_WARMUP_TOKENS");
-        if (env) {
-            warmup_tokens = std::max(0, std::atoi(env));
-        }
-        // Read env var for re-rank interval (0 disables periodic re-ranking)
-        const char * rerank_env = getenv("GGML_SYCL_MOE_RERANK_INTERVAL");
-        if (rerank_env) {
-            rerank_interval = std::max(0, std::atoi(rerank_env));
-        }
+        // Warmup tokens and rerank interval are auto-determined by the unified
+        // cache planner.  When unified_cache_enabled(), warmup_tokens is already 0
+        // (gate-norm placement).  Rerank is disabled by default (interval=0).
         if (warmup_tokens == 0) {
             GGML_LOG_INFO(
                 "[MOE-WARMUP] Zero-warmup mode: %d layers x %d experts, "
@@ -3868,8 +3860,9 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
     // Early multi-GPU setup: register unified caches for secondary GPUs BEFORE
     // the eager VRAM upload so the upload loop can distribute experts across
     // all devices. Auto-enabled when multiple GPUs are visible and the model
-    // has MoE layers. Override with GGML_SYCL_MOE_MULTI_GPU=0 to disable or
-    // GGML_SYCL_MOE_MULTI_GPU=1 to force enable.
+    // has MoE layers. The unified cache planner drives multi-device placement
+    // automatically. Override with GGML_SYCL_MOE_MULTI_GPU=0 to disable
+    // (e.g., for debugging cross-device issues).
     // -----------------------------------------------------------------------
     if (device == 0) {
         const char * moe_opt_in   = std::getenv("GGML_SYCL_MOE_MULTI_GPU");
@@ -5286,18 +5279,9 @@ static void ggml_sycl_debug_dump_tensor_meta(const char * tag, const ggml_tensor
 // Larger batches (e.g., prefill with 512 tokens) fall back to host-side oneDNN batching
 // which is ~7x faster for large batches (679 t/s vs 87 t/s on GPT-OSS 20B).
 // The fused kernel excels at decode (single-token) but is slower than oneDNN for prefill.
-// Override with GGML_SYCL_FUSED_MOE_MAX_BATCH=N env var (0 = always use oneDNN).
+// Hardcoded at 32; previously tunable via GGML_SYCL_FUSED_MOE_MAX_BATCH.
 static int64_t get_fused_moe_max_batch() {
-    static int64_t val = []() -> int64_t {
-        const char * env = std::getenv("GGML_SYCL_FUSED_MOE_MAX_BATCH");
-        if (env) {
-            int v = std::atoi(env);
-            GGML_LOG_INFO("[MoE] FUSED_MOE_MAX_BATCH override: %d\n", v);
-            return v >= 0 ? v : 32;
-        }
-        return 32;
-    }();
-    return val;
+    return 32;
 }
 
 #define GGML_SYCL_FUSED_MOE_MAX_BATCH (get_fused_moe_max_batch())
@@ -7323,18 +7307,12 @@ static void ggml_sycl_moe_layer_ids_cache_new_graph() {
 // Populated by a pre-scan in graph_compute_impl, consumed by mul_mat_id.
 static thread_local std::unordered_map<int, const ggml_tensor *> g_moe_weights_by_layer;
 
+// MoE expert probability threshold: skip low-probability experts in TG.
+// Disabled by default (threshold=0.0); the unified cache planner handles
+// expert placement and the inference path routes host-planned experts to
+// CPU automatically, making probability-based skipping unnecessary.
 static float ggml_sycl_moe_prob_threshold() {
-    static float threshold = -1.0f;
-    if (threshold < 0.0f) {
-        const char * env = getenv("GGML_SYCL_MOE_PROB_THRESHOLD");
-        float        val = env ? std::atof(env) : 0.0f;  // Default: disabled
-        if (val < 0.0f || val >= 1.0f) {
-            GGML_LOG_WARN("[MOE-SKIP] GGML_SYCL_MOE_PROB_THRESHOLD=%.4f out of range [0, 1), disabled\n", val);
-            val = 0.0f;
-        }
-        threshold = val;
-    }
-    return threshold;
+    return 0.0f;
 }
 
 // ---------------------------------------------------------------------------
@@ -8345,15 +8323,10 @@ static bool ggml_sycl_moe_fusion_enabled() {
         return false;
     }
 
-    static std::atomic<int> moe_fusion_mode{ -1 };
-    int                     val = moe_fusion_mode.load(std::memory_order_acquire);
-    if (val < 0) {
-        const char * env     = getenv("GGML_SYCL_MOE_FUSE");
-        int          new_val = env ? std::atoi(env) : 1;
-        moe_fusion_mode.compare_exchange_strong(val, new_val, std::memory_order_release, std::memory_order_acquire);
-        val = moe_fusion_mode.load(std::memory_order_acquire);
-    }
-    return val != 0;
+    // MoE fusion is always enabled when not under placement-plan residency.
+    // Previously tunable via GGML_SYCL_MOE_FUSE; now hardcoded as the unified
+    // cache planner handles expert placement decisions.
+    return true;
 }
 
 // Flush any pending deferred CPU scatter.  Called:
@@ -8534,20 +8507,9 @@ static bool flush_pending_cpu_scatter_if_consumed(const ggml_tensor * consuming_
         return false;
     }
 
-    // Opt-out: GGML_SYCL_EXPERT_DEFER=0 disables deferral (always flush)
-    static std::atomic<int> expert_defer_mode{ -1 };
-    int                     defer_val = expert_defer_mode.load(std::memory_order_acquire);
-    if (defer_val < 0) {
-        const char * env     = getenv("GGML_SYCL_EXPERT_DEFER");
-        int          new_val = env ? std::atoi(env) : 1;  // Default: enabled
-        expert_defer_mode.compare_exchange_strong(defer_val, new_val, std::memory_order_release,
-                                                  std::memory_order_acquire);
-        defer_val = expert_defer_mode.load(std::memory_order_acquire);
-    }
-    if (defer_val == 0) {
-        flush_pending_cpu_scatter();
-        return true;
-    }
+    // Expert deferral is always enabled — it pipelines CPU expert compute
+    // with GPU work, overlapping CPU compute with GPU attention/normalization.
+    // Previously tunable via GGML_SYCL_EXPERT_DEFER; now hardcoded on.
 
     const ggml_tensor * pending_dst = g_pending_scatter.dst_tensor;
     if (!pending_dst) {
@@ -8583,21 +8545,13 @@ static bool flush_pending_cpu_scatter_if_consumed(const ggml_tensor * consuming_
     return false;  // No overlap — defer the scatter
 }
 
-// ----- Pipeline MoE: environment variable gate -----
-// When GGML_SYCL_PIPELINE_MOE=1, B50 expert compute for layer N overlaps
-// with GPU0 attention for layer N+1.  A background thread waits for B50
-// D2H events and submits H2D scatter on a dedicated copy queue, so the
-// main thread (feeding GPU0's compute queue) never blocks.
+// Pipeline MoE: B50 expert compute for layer N overlaps with GPU0 attention
+// for layer N+1.  A background thread waits for B50 D2H events and submits
+// H2D scatter on a dedicated copy queue.  Disabled by default; will be
+// auto-enabled by the unified cache planner in a future update.
+// Previously tunable via GGML_SYCL_PIPELINE_MOE.
 static bool ggml_sycl_pipeline_moe_enabled() {
-    static std::atomic<int> val{ -1 };
-    int                     v = val.load(std::memory_order_acquire);
-    if (v < 0) {
-        const char * env = getenv("GGML_SYCL_PIPELINE_MOE");
-        int          nv  = env ? atoi(env) : 0;  // Default: OFF
-        val.compare_exchange_strong(v, nv, std::memory_order_release, std::memory_order_acquire);
-        v = val.load(std::memory_order_acquire);
-    }
-    return v != 0;
+    return false;
 }
 
 // ----- Pipeline CPU: environment variable gate -----
@@ -12715,12 +12669,11 @@ static void ggml_sycl_preload_model_weights() {
                 static_cast<size_t>(g_moe_n_experts_total) * static_cast<size_t>(g_model_n_layer);
             const size_t per_expert_bytes = g_moe_expert_total_bytes / n_expert_tensors;
 
-            // Working set = n_experts_used * multiplier (default 2x, covers token-to-token variation)
-            int          ws_mult  = 2;
-            const char * mult_env = std::getenv("GGML_SYCL_EXPERT_RESERVE_MULT");
-            if (mult_env) {
-                ws_mult = std::max(1, std::min(16, std::atoi(mult_env)));
-            }
+            // Working set = n_experts_used * 2x multiplier (covers token-to-token
+            // variation in expert selection).  Previously tunable via
+            // GGML_SYCL_EXPERT_RESERVE_MULT; now hardcoded as the unified
+            // cache planner handles VRAM budget allocation.
+            const int ws_mult = 2;
             const size_t popular_count =
                 std::min(static_cast<size_t>(g_moe_n_experts_used) * static_cast<size_t>(ws_mult),
                          static_cast<size_t>(g_moe_n_experts_total));
@@ -27987,20 +27940,15 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
 // layer, this causes cache thrashing and DEVICE_LOST.
 // Solution: Skip blind preload when expert count exceeds threshold unless model-load
 // placement has already materialized every expert in its planned tier.
-// Env var: GGML_SYCL_MAX_BLIND_PRELOAD_EXPERTS (default: 64)
-// - n_experts <= threshold: use blind preload (loads all experts)
-// - n_experts > threshold: skip blind preload, routing-aware pre-staging handles it
+// Blind preload threshold: models with n_experts <= 64 use blind preload
+// (loads all experts eagerly), models with more experts skip blind preload
+// and rely on routing-aware pre-staging instead.  This avoids cache thrashing
+// and DEVICE_LOST on large MoE models (e.g. GPT-OSS 20B with 4608 experts).
+// Previously tunable via GGML_SYCL_MAX_BLIND_PRELOAD_EXPERTS; now hardcoded.
+static const int BLIND_PRELOAD_THRESHOLD = 64;
 
-// Get the blind preload threshold (cached, reads env var once)
 int ggml_sycl_get_blind_preload_threshold() {
-    static int threshold = -1;
-    if (threshold < 0) {
-        const char * env = getenv("GGML_SYCL_MAX_BLIND_PRELOAD_EXPERTS");
-        threshold        = env ? atoi(env) : 64;  // Default: 64 experts
-        GGML_LOG_INFO("[SYCL] Blind preload threshold: %d experts (GGML_SYCL_MAX_BLIND_PRELOAD_EXPERTS=%s)\n",
-                      threshold, env ? env : "default");
-    }
-    return threshold;
+    return BLIND_PRELOAD_THRESHOLD;
 }
 
 // Check if blind preload should be skipped for given expert count
@@ -32559,12 +32507,12 @@ static bool g_moe_debug_enabled = false;
 
 static int g_moe_debug_call_count = 0;
 
+// MoE debug logging: use GGML_SYCL_DEBUG=1 for general debug output.
+// The per-subsystem GGML_SYCL_MOE_DEBUG env var has been removed;
+// MoE debug traces are now covered by the unified GGML_SYCL_DEBUG flag.
 static void init_moe_debug() {
-    static bool initialized = false;
-    if (!initialized) {
-        g_moe_debug_enabled = (getenv("GGML_SYCL_MOE_DEBUG") != nullptr);
-        initialized         = true;
-    }
+    // Intentionally empty: GGML_SYCL_MOE_DEBUG removed.
+    // Use GGML_SYCL_DEBUG for debug output.
 }
 
 // Try fused MoE ESIMD kernel for batched prefill (ne12 > 1)
@@ -34695,15 +34643,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         // `dispatch_cpu_compute` lambda and does not require an
         // EXPERT_STAGING pinned-zone allocation to succeed.
         bool                    cpu_tg_alloc_failed = false;
-        static std::atomic<int> cpu_expert_tg_mode_fast{ -1 };
-        int                     cpu_tg_val_fast = cpu_expert_tg_mode_fast.load(std::memory_order_acquire);
-        if (cpu_tg_val_fast < 0) {
-            const char * env     = getenv("GGML_SYCL_CPU_EXPERT_TG");
-            int          new_val = env ? std::atoi(env) : -2;  // Default: auto (enable when host-resident)
-            cpu_expert_tg_mode_fast.compare_exchange_strong(cpu_tg_val_fast, new_val, std::memory_order_release,
-                                                            std::memory_order_acquire);
-            cpu_tg_val_fast = cpu_expert_tg_mode_fast.load(std::memory_order_acquire);
-        }
+        // CPU expert TG dispatch: auto-enabled when weights are host-resident
+        // (planner-spilled experts).  Previously tunable via GGML_SYCL_CPU_EXPERT_TG;
+        // now hardcoded to auto (-2 = enable when host-resident).
+        const int cpu_tg_val_fast = -2;
 
         // Check if weights are host-accessible.  Uses buffer-context tier
         // check first (zero cost), falls back to USM pointer type only when
@@ -35965,23 +35908,12 @@ cpu_fallback_fast:
             // GPU MMVQ Probe: measure real GPU dispatch overhead for MXFP4
             // experts by force-dispatching a subset through mmvq_moe_batched_dispatch.
             // Output is discarded (CPU path produces correct results).
-            // Only active when GGML_SYCL_MOE_PROFILE=1 (auto) or GGML_SYCL_MOE_GPU_PROBE=N.
+            // GPU probe count: 0 = disabled.  Previously tunable via
+            // GGML_SYCL_MOE_GPU_PROBE; now hardcoded to 0 (disabled).
+            // Use VTune or GGML_SYCL_MOE_PROFILE for profiling instead.
             // ---------------------------------------------------------------
             {
-                static std::atomic<int> s_moe_gpu_probe_count{ -1 };
-                {
-                    int probe_n = s_moe_gpu_probe_count.load(std::memory_order_acquire);
-                    if (probe_n < 0) {
-                        const char * env     = getenv("GGML_SYCL_MOE_GPU_PROBE");
-                        int          new_val = env ? std::atoi(env) : 0;
-                        if (new_val == 0 && g_moe_profile_enabled) {
-                            new_val = 8;
-                        }
-                        s_moe_gpu_probe_count.compare_exchange_strong(probe_n, new_val, std::memory_order_release,
-                                                                      std::memory_order_acquire);
-                    }
-                }
-                const int n_gpu_probe = s_moe_gpu_probe_count.load(std::memory_order_acquire);
+                const int n_gpu_probe = 0;
 
                 if (n_gpu_probe > 0 && n_tasks > 0 && src0->type == GGML_TYPE_MXFP4) {
                     using hrc_p             = std::chrono::high_resolution_clock;
@@ -36724,19 +36656,14 @@ cpu_tg_fallthrough:
         }
     }
     // ---------------------------------------------------------------------------
-    // MoE hybrid GPU+CPU dispatch gate (GGML_SYCL_MOE_HYBRID=1)
+    // MoE hybrid GPU+CPU dispatch gate.
     // MUST be computed BEFORE update_moe_ptr_table so expert data is staged
     // in the correct layout (AOS for hybrid, SOA/coalesced otherwise).
+    // Always enabled: the unified cache planner automatically routes host-planned
+    // experts to CPU via plan_has_cpu_experts below.  Previously tunable via
+    // GGML_SYCL_MOE_HYBRID; now hardcoded on.
     // ---------------------------------------------------------------------------
-    static std::atomic<int> moe_hybrid_enabled{ -1 };
-    int                     moe_hybrid_val = moe_hybrid_enabled.load(std::memory_order_acquire);
-    if (moe_hybrid_val < 0) {
-        const char * env     = getenv("GGML_SYCL_MOE_HYBRID");
-        int          new_val = env ? atoi(env) : 1;  // Default: ON
-        moe_hybrid_enabled.compare_exchange_strong(moe_hybrid_val, new_val, std::memory_order_release,
-                                                   std::memory_order_acquire);
-        moe_hybrid_val = moe_hybrid_enabled.load(std::memory_order_acquire);
-    }
+    const int moe_hybrid_val = 1;
     const auto * cpu_traits_check = ggml_get_type_traits_cpu(src0->type);
     const bool   cpu_type_ok      = cpu_traits_check && cpu_traits_check->vec_dot;
     // Hybrid CPU dispatch requires ne11==1 (all experts share the same activation row).
@@ -36997,15 +36924,10 @@ cpu_tg_fallthrough:
     // CPU-primary expert routing for TG (batch=1 decode).
     // Routes ALL expert FFNs to CPU, bypassing GPU cache entirely.
     // Rationale: CPU DRAM BW (70 GB/s) >> PCIe BW (13.4 GB/s) for batch=1.
-    static std::atomic<int> cpu_expert_tg_mode{ -1 };
-    int                     cpu_tg_val = cpu_expert_tg_mode.load(std::memory_order_acquire);
-    if (cpu_tg_val < 0) {
-        const char * env     = getenv("GGML_SYCL_CPU_EXPERT_TG");
-        int          new_val = env ? std::atoi(env) : -2;  // -2 = auto
-        cpu_expert_tg_mode.compare_exchange_strong(cpu_tg_val, new_val, std::memory_order_release,
-                                                   std::memory_order_acquire);
-        cpu_tg_val = cpu_expert_tg_mode.load(std::memory_order_acquire);
-    }
+    // CPU expert TG dispatch: auto-enabled when moe_hybrid is active and
+    // planner routes experts to host.  Previously tunable via
+    // GGML_SYCL_CPU_EXPERT_TG; now hardcoded to auto (-2).
+    const int cpu_tg_val = -2;
 
     // Auto-detect: enable CPU expert TG when moe_hybrid is active (with plan awareness)
     // (moe_hybrid_with_plan extends moe_hybrid_active with plan-based host routing)
@@ -37925,22 +37847,11 @@ cpu_tg_fallthrough:
             // skips deferral entirely (batch=1 has few experts, splitting
             // gains nothing, and deferral requires flush_pending_cpu_scatter
             // which submits stream->memcpy — unsafe from an async thread).
-            static std::atomic<int> moe_defer_count{ -1 };
-            auto                    do_cpu_dispatch = [&]() {
-                int defer_n = moe_defer_count.load(std::memory_order_acquire);
-                if (defer_n < 0) {
-                    const char * env     = getenv("GGML_SYCL_MOE_DEFER_COUNT");
-                    int          new_val = env ? std::atoi(env) : 1;
-                    if (new_val < 0) {
-                        new_val = 0;
-                    }
-                    if (new_val > 3) {
-                        new_val = 3;
-                    }
-                    moe_defer_count.compare_exchange_strong(defer_n, new_val, std::memory_order_release,
-                                                                               std::memory_order_acquire);
-                    defer_n = moe_defer_count.load(std::memory_order_acquire);
-                }
+            // MoE CPU expert deferral count: how many CPU experts to batch
+            // before dispatching.  Default: 1 (dispatch each expert immediately).
+            // Previously tunable via GGML_SYCL_MOE_DEFER_COUNT; now hardcoded.
+            auto do_cpu_dispatch = [&]() {
+                const int defer_n = 1;
 
                 if (defer_n == 0 || static_cast<int>(cpu_entries.size()) <= defer_n) {
                     dispatch_cpu_and_scatter(cpu_entries);
@@ -38150,21 +38061,12 @@ cpu_tg_fallthrough:
             // ----- Standard (non-hybrid) per-expert dispatch -----
             // Try batched MMVQ dispatch first to reduce kernel launch overhead
             // (1 kernel per (layer, tensor_type) instead of 1 per expert).
-            // Controlled by GGML_SYCL_BATCH_EXPERTS env var (default: ON).
-            //
-            // When ne11 > 1 (non-broadcast src1, e.g. test-backend-ops b=0 with
-            // n_used>1), the batched MMVQ kernel has Q8_1 row addressing issues
-            // for MXFP4.  Skip batched dispatch and use per-expert fallback which
-            // correctly slices src1 per expert.
-            static std::atomic<int> batch_experts_enabled{ -1 };
-            int                     batch_experts_val = batch_experts_enabled.load(std::memory_order_acquire);
-            if (batch_experts_val < 0) {
-                const char * env     = getenv("GGML_SYCL_BATCH_EXPERTS");
-                int          new_val = env ? atoi(env) : 1;  // Default: ON
-                batch_experts_enabled.compare_exchange_strong(batch_experts_val, new_val, std::memory_order_release,
-                                                              std::memory_order_acquire);
-                batch_experts_val = batch_experts_enabled.load(std::memory_order_acquire);
-            }
+            // Always enabled.  When ne11 > 1 (non-broadcast src1, e.g.
+            // test-backend-ops b=0 with n_used>1), the batched MMVQ kernel
+            // has Q8_1 row addressing issues for MXFP4.  Skip batched dispatch
+            // and use per-expert fallback which correctly slices src1 per expert.
+            // Previously tunable via GGML_SYCL_BATCH_EXPERTS; now hardcoded on.
+            const int batch_experts_val = 1;
 
             std::vector<expert_dispatch_entry> cpu_entries;
             cpu_entries.reserve(static_cast<size_t>(ids->ne[1] * n_ids));
@@ -49822,24 +49724,15 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
     // placement table, prefetcher, and predictor on first graph compute.
     // Runs HERE (outside graph_compute_impl) so that warmup profiling
     // overhead (~5-10s) is NOT counted as PP time.
+    // Always enabled: the unified cache planner drives expert placement.
+    // Previously tunable via GGML_SYCL_MOE_HYBRID; now hardcoded on.
     {
-        static std::atomic<int> moe_hybrid_gate{ -1 };
-        int                     gate_val = moe_hybrid_gate.load(std::memory_order_acquire);
-        if (gate_val < 0) {
-            const char * env     = getenv("GGML_SYCL_MOE_HYBRID");
-            int          new_val = env ? atoi(env) : 1;  // Default: ON (auto for MoE models)
-            moe_hybrid_gate.compare_exchange_strong(gate_val, new_val, std::memory_order_release,
-                                                    std::memory_order_acquire);
-            gate_val = moe_hybrid_gate.load(std::memory_order_acquire);
-        }
-        if (gate_val != 0) {
-            const int dev = sycl_ctx->device;
-            if (dev >= 0 && dev < GGML_SYCL_MAX_DEVICES) {
-                std::call_once(g_moe_hybrid_init_flags[dev], [&]() { moe_hybrid_init_once(*sycl_ctx, cgraph); });
-                // Signal that init is done so subsequent tokens activate the
-                // eviction guard early (in compute_impl_guard constructor).
-                g_moe_hybrid_init_done.store(true, std::memory_order_release);
-            }
+        const int dev = sycl_ctx->device;
+        if (dev >= 0 && dev < GGML_SYCL_MAX_DEVICES) {
+            std::call_once(g_moe_hybrid_init_flags[dev], [&]() { moe_hybrid_init_once(*sycl_ctx, cgraph); });
+            // Signal that init is done so subsequent tokens activate the
+            // eviction guard early (in compute_impl_guard constructor).
+            g_moe_hybrid_init_done.store(true, std::memory_order_release);
         }
     }
 
@@ -51271,7 +51164,10 @@ bool ggml_backend_sycl_moe_multi_gpu_requested() {
     // Auto-enabled when 2+ GPUs are available. MoE models benefit from
     // distributing experts across secondary GPU VRAM for higher cache hit
     // rates (B50 MMVQ = 0.085ms, 4.6x faster than CPU fallback).
-    // Opt-out: GGML_SYCL_MOE_MULTI_GPU=0 to force single-GPU MoE.
+    // The unified cache planner drives multi-device placement automatically
+    // via compute_placement_plan().  This env var remains as an opt-out
+    // (GGML_SYCL_MOE_MULTI_GPU=0) to force single-GPU MoE when needed
+    // (e.g., for debugging cross-device issues).
     const char * env = std::getenv("GGML_SYCL_MOE_MULTI_GPU");
     if (env) {
         return std::atoi(env) != 0 && ggml_sycl_info().total_gpu_count >= 2;
