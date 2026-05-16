@@ -312,14 +312,15 @@ static void mxfp4_moe_tg_reuse_store(int                           device,
     cache.layout          = layout;
 }
 
-static bool mxfp4_moe_tg_publish_q8_soa(sycl::queue *  stream,
-                                        int            device,
-                                        int            layer,
-                                        mxfp4_moe_role role,
-                                        const float *  src,
-                                        int64_t        ne0,
-                                        int64_t        total_rows,
-                                        double *       quant_us_out = nullptr) {
+static bool mxfp4_moe_tg_publish_q8_soa(sycl::queue *                 stream,
+                                        int                           device,
+                                        int                           layer,
+                                        mxfp4_moe_role                role,
+                                        const float *                 src,
+                                        int64_t                       ne0,
+                                        int64_t                       total_rows,
+                                        double *                      quant_us_out        = nullptr,
+                                        const ggml_sycl::mem_handle * src_handle_override = nullptr) {
     if (!stream || !src || device < 0 || layer < 0 || role != mxfp4_moe_role::DOWN || ne0 <= 0 || total_rows <= 0) {
         return false;
     }
@@ -346,7 +347,17 @@ static bool mxfp4_moe_tg_publish_q8_soa(sycl::queue *  stream,
         *quant_us_out += std::chrono::duration<double, std::micro>(t_end - t_begin).count();
     }
 
-    auto src_handle = ggml_sycl::mem_handle::from_chunk_ptr(const_cast<float *>(src), device, GGML_LAYOUT_AOS, true);
+    ggml_sycl::mem_handle src_handle;
+    if (src_handle_override && src_handle_override->valid()) {
+        src_handle        = *src_handle_override;
+        auto src_resolved = src_handle.resolve(device);
+        if (!src_resolved || src_resolved.ptr != src) {
+            src_handle = {};
+        }
+    }
+    if (!src_handle.valid()) {
+        src_handle = ggml_sycl::mem_handle::from_chunk_ptr(const_cast<float *>(src), device, GGML_LAYOUT_AOS, true);
+    }
     mxfp4_moe_tg_reuse_store(device, layer, role, src_handle, ne0, total_rows, ne0_padded, q8_row_size, q8_bytes,
                              GGML_LAYOUT_SOA);
     GGML_SYCL_DEBUG("[MOE-Q8-ARTIFACT] STORE role=down layer=%d src=%p rows=%lld ne0=%lld bytes=%zu q8=%p\n", layer,
@@ -4458,21 +4469,22 @@ void ggml_sycl_moe_pre_allocate_buffers(ggml_backend_sycl_context & ctx, ggml_cg
 // table with a safe dummy pointer so the kernel writes *something* to
 // those dst slots.  The CPU path overwrites those slots afterwards.
 // ---------------------------------------------------------------------------
-bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context & ctx,
-                               const ggml_tensor *         src0,
-                               const ggml_tensor *         src1,
-                               ggml_tensor *               dst,
-                               const void * const *        expert_ptrs_device,
-                               const int32_t *             gpu_expert_ids,
-                               const int64_t *             gpu_iid1s,
-                               const int64_t *             gpu_ids,
-                               int                         n_gpu_entries,
-                               int                         n_experts,
-                               int64_t                     n_ids,
-                               layout_mode                 layout,
-                               const int32_t *             direct_ids_device,
-                               int64_t                     direct_ids_nb0,
-                               int64_t                     direct_ids_nb1) {
+bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &   ctx,
+                               const ggml_tensor *           src0,
+                               const ggml_tensor *           src1,
+                               ggml_tensor *                 dst,
+                               const void * const *          expert_ptrs_device,
+                               const int32_t *               gpu_expert_ids,
+                               const int64_t *               gpu_iid1s,
+                               const int64_t *               gpu_ids,
+                               int                           n_gpu_entries,
+                               int                           n_experts,
+                               int64_t                       n_ids,
+                               layout_mode                   layout,
+                               const int32_t *               direct_ids_device,
+                               int64_t                       direct_ids_nb0,
+                               int64_t                       direct_ids_nb1,
+                               const ggml_sycl::mem_handle * src1_handle_override) {
     if (n_gpu_entries <= 0 || !expert_ptrs_device) {
         return false;
     }
@@ -4513,9 +4525,19 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context & ctx,
     int            reuse_layer = -1;
     const bool     reuse_candidate =
         mxfp4_moe_tg_reuse_candidate(src0, src0->type, layout, ne12, total_src1_rows, &reuse_role, &reuse_layer);
-    const int runtime_device = ctx.device;
-    auto      src1_handle =
-        mxfp4_moe_tensor_mem_handle(src1, runtime_device, const_cast<float *>(src1_d), GGML_LAYOUT_AOS, true);
+    const int             runtime_device = ctx.device;
+    ggml_sycl::mem_handle src1_handle;
+    if (src1_handle_override && src1_handle_override->valid()) {
+        src1_handle        = *src1_handle_override;
+        auto src1_resolved = src1_handle.resolve(runtime_device);
+        if (!src1_resolved || src1_resolved.ptr != src1_d) {
+            src1_handle = {};
+        }
+    }
+    if (!src1_handle.valid()) {
+        src1_handle =
+            mxfp4_moe_tensor_mem_handle(src1, runtime_device, const_cast<float *>(src1_d), GGML_LAYOUT_AOS, true);
+    }
     const bool reuse_q8 = reuse_candidate && mxfp4_moe_tg_reuse_can_use(runtime_device, reuse_layer, reuse_role,
                                                                         src1_handle, ne10, total_src1_rows, ne10_padded,
                                                                         q8_1_row_size, required_size, layout);
@@ -4588,10 +4610,10 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context & ctx,
     bool       can_use_direct_ids =
         full_gpu_cover && direct_ids_device != nullptr && direct_ids_nb0 > 0 && direct_ids_nb1 > 0;
     if (can_use_direct_ids) {
-        constexpr int64_t seen_stack_size = 16;
-        uint8_t seen_stack[seen_stack_size] = {};
+        constexpr int64_t    seen_stack_size             = 16;
+        uint8_t              seen_stack[seen_stack_size] = {};
         std::vector<uint8_t> seen_heap;
-        uint8_t * seen = seen_stack;
+        uint8_t *            seen = seen_stack;
         if (total_batches > seen_stack_size) {
             seen_heap.assign(static_cast<size_t>(total_batches), 0);
             seen = seen_heap.data();
@@ -4843,25 +4865,26 @@ bool mmvq_moe_batched_dispatch_pair_mxfp4_soa(ggml_backend_sycl_context & ctx,
     return true;
 }
 
-bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context & ctx,
-                                                  const ggml_tensor *         gate_weight,
-                                                  const ggml_tensor *         up_weight,
-                                                  const ggml_tensor *         src1,
-                                                  ggml_tensor *               glu_dst,
-                                                  const void * const *        gate_ptrs_device,
-                                                  const void * const *        up_ptrs_device,
-                                                  const int32_t *             ids_device,
-                                                  const float *               gate_bias_device,
-                                                  const float *               up_bias_device,
-                                                  int64_t                     gate_bias_nb1,
-                                                  int64_t                     up_bias_nb1,
-                                                  int                         n_gpu_entries,
-                                                  int64_t                     n_ids,
-                                                  int64_t                     ids_nb0,
-                                                  int64_t                     ids_nb1,
-                                                  int                         glu_op,
-                                                  float                       alpha,
-                                                  float                       limit) {
+bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   ctx,
+                                                  const ggml_tensor *           gate_weight,
+                                                  const ggml_tensor *           up_weight,
+                                                  const ggml_tensor *           src1,
+                                                  ggml_tensor *                 glu_dst,
+                                                  const void * const *          gate_ptrs_device,
+                                                  const void * const *          up_ptrs_device,
+                                                  const int32_t *               ids_device,
+                                                  const float *                 gate_bias_device,
+                                                  const float *                 up_bias_device,
+                                                  int64_t                       gate_bias_nb1,
+                                                  int64_t                       up_bias_nb1,
+                                                  int                           n_gpu_entries,
+                                                  int64_t                       n_ids,
+                                                  int64_t                       ids_nb0,
+                                                  int64_t                       ids_nb1,
+                                                  int                           glu_op,
+                                                  float                         alpha,
+                                                  float                         limit,
+                                                  const ggml_sycl::mem_handle * glu_dst_handle_override) {
     if (n_gpu_entries <= 0 || !gate_ptrs_device || !up_ptrs_device || !ids_device) {
         return false;
     }
@@ -4951,7 +4974,7 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context & ct
     const int64_t glu_rows           = glu_dst->ne[1] * glu_dst->ne[2];
     if (glu_dst->nb[0] == sizeof(float) && glu_dst->nb[1] == static_cast<size_t>(glu_dst->ne[0]) * sizeof(float)) {
         if (mxfp4_moe_tg_publish_q8_soa(stream, ctx.device, down_layer, mxfp4_moe_role::DOWN, glu_d, glu_dst->ne[0],
-                                        glu_rows, &down_q8_publish_us)) {
+                                        glu_rows, &down_q8_publish_us, glu_dst_handle_override)) {
             quant_us += down_q8_publish_us;
         }
     }

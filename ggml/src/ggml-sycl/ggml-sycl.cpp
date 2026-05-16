@@ -8724,25 +8724,85 @@ struct moe_layer_decode_role_plan {
     std::vector<sycl::event>           ready_events;
 };
 
-struct moe_layer_decode_plan {
-    int                        layer           = -1;
-    int                        layer_hash      = -1;
-    int64_t                    n_ids           = 0;
-    size_t                     n_entries       = 0;
-    layout_mode                layout          = GGML_LAYOUT_AOS;
-    bool                       current_is_gate = false;
-    const int32_t *            ids_host        = nullptr;
-    const int32_t *            ids_device      = nullptr;
-    const ggml_tensor *        src1            = nullptr;
-    const ggml_tensor *        ids             = nullptr;
-    const moe_gate_up_pair *   pair            = nullptr;
-    moe_layer_decode_role_plan current;
-    moe_layer_decode_role_plan partner;
-    moe_layer_decode_role_plan gate;
-    moe_layer_decode_role_plan up;
-    moe_layer_decode_role_plan down;
-    bool                       down_eligible = false;
+struct moe_layer_decode_artifact_plan {
+    const char *            role   = nullptr;
+    const ggml_tensor *     tensor = nullptr;
+    ggml_sycl::mem_handle   handle;
+    ggml_sycl::resolved_ptr resolved;
 };
+
+struct moe_layer_decode_plan {
+    int                            layer           = -1;
+    int                            layer_hash      = -1;
+    int64_t                        n_ids           = 0;
+    size_t                         n_entries       = 0;
+    layout_mode                    layout          = GGML_LAYOUT_AOS;
+    bool                           current_is_gate = false;
+    const int32_t *                ids_host        = nullptr;
+    const int32_t *                ids_device      = nullptr;
+    const ggml_tensor *            src1            = nullptr;
+    const ggml_tensor *            ids             = nullptr;
+    const moe_gate_up_pair *       pair            = nullptr;
+    moe_layer_decode_artifact_plan activation;
+    moe_layer_decode_artifact_plan ids_control;
+    moe_layer_decode_artifact_plan gate_bias;
+    moe_layer_decode_artifact_plan up_bias;
+    moe_layer_decode_artifact_plan glu_output;
+    moe_layer_decode_artifact_plan down_output;
+    moe_layer_decode_role_plan     current;
+    moe_layer_decode_role_plan     partner;
+    moe_layer_decode_role_plan     gate;
+    moe_layer_decode_role_plan     up;
+    moe_layer_decode_role_plan     down;
+    bool                           down_eligible = false;
+};
+
+static bool moe_layer_capture_tensor_artifact(moe_layer_decode_artifact_plan & artifact,
+                                              const ggml_tensor *              tensor,
+                                              int                              device,
+                                              layout_mode                      expected_layout,
+                                              const char *                     role,
+                                              bool                             require_device,
+                                              bool                             require_layout = true) {
+    artifact = {};
+    if (!tensor) {
+        return false;
+    }
+
+    ggml_sycl::resolved_ptr resolved = ggml_sycl_resolve(tensor, device);
+    if (!resolved.ptr) {
+        return false;
+    }
+    if (require_layout && resolved.layout != expected_layout) {
+        return false;
+    }
+    if (require_device && !resolved.on_device) {
+        return false;
+    }
+
+    ggml_sycl::mem_handle handle;
+    if (tensor->view_src == nullptr && tensor->extra != nullptr && device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
+        auto * extra         = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
+        handle               = extra->data_handle[device];
+        auto handle_resolved = handle.resolve(device);
+        if (!handle_resolved || handle_resolved.ptr != resolved.ptr) {
+            handle = {};
+        }
+    }
+    if (!handle.valid()) {
+        handle = ggml_sycl::mem_handle::from_chunk_ptr(resolved.ptr, device, resolved.layout, resolved.on_device);
+    }
+    auto handle_resolved = handle.resolve(device);
+    if (!handle_resolved || handle_resolved.ptr != resolved.ptr) {
+        return false;
+    }
+
+    artifact.role     = role;
+    artifact.tensor   = tensor;
+    artifact.handle   = std::move(handle);
+    artifact.resolved = resolved;
+    return true;
+}
 
 static thread_local std::unordered_map<int, moe_gate_up_pair> g_moe_gate_up_pairs;
 static thread_local std::unordered_set<const ggml_tensor *>   g_moe_precomputed_mmid_skip;
@@ -40129,6 +40189,27 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 plan.ids             = ids;
                 plan.pair            = &pair;
 
+                auto reject_artifact = [&](const char * reason, const ggml_tensor * tensor) -> bool {
+                    if (path_trace_enabled != 0) {
+                        static std::atomic<int> artifact_reject_log{ 0 };
+                        if (artifact_reject_log.fetch_add(1, std::memory_order_relaxed) < 64) {
+                            fprintf(stderr, "[MOE-LAYER-PLAN-ARTIFACT-REJECT] layer=%d role=%s tensor=%s\n", layer,
+                                    reason, tensor && tensor->name ? tensor->name : "?");
+                        }
+                    }
+                    return reject_pair(reason);
+                };
+
+                if (!moe_layer_capture_tensor_artifact(plan.activation, src1, ctx.device, GGML_LAYOUT_AOS, "activation",
+                                                       true)) {
+                    return reject_artifact("activation-handle", src1);
+                }
+                if (!moe_layer_capture_tensor_artifact(plan.ids_control, ids, ctx.device, GGML_LAYOUT_AOS,
+                                                       "ids-control", true)) {
+                    return reject_artifact("ids-handle", ids);
+                }
+                plan.ids_device = static_cast<const int32_t *>(plan.ids_control.resolved.ptr);
+
                 auto log_route_reject = [&](const char * side, const ggml_tensor * tensor, int32_t eid,
                                             const moe_expert_route & route) {
                     if (path_trace_enabled == 0) {
@@ -40199,12 +40280,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     plan.gate = plan.partner;
                 }
 
-                const int32_t * ids_device =
-                    static_cast<const int32_t *>(ggml_sycl_resolve_tensor_ptr(ids, ctx.device));
-                if (!ids_device) {
-                    return reject_pair("ids-device");
-                }
-                plan.ids_device = ids_device;
+                const int32_t * ids_device = plan.ids_device;
 
                 ggml_sycl_ensure_weight_on_device(partner_weight, ctx.device);
                 const void * const * current_ptrs =
@@ -40220,10 +40296,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     if (accept_log.fetch_add(1, std::memory_order_relaxed) < 64) {
                         fprintf(stderr,
                                 "[MOE-LAYER-PLAN] layer=%d cur=%s partner=%s device=%d entries=%zu topk=%lld "
-                                "layout=%s ids_device=%p\n",
+                                "layout=%s activation=%p ids_device=%p\n",
                                 plan.layer, src0->name ? src0->name : "?",
                                 partner_weight->name ? partner_weight->name : "?", ctx.device, plan.n_entries,
-                                (long long) plan.n_ids, ggml_sycl_layout_mode_name(plan.layout), plan.ids_device);
+                                (long long) plan.n_ids, ggml_sycl_layout_mode_name(plan.layout),
+                                plan.activation.resolved.ptr, plan.ids_device);
                     }
                 }
 
@@ -40242,14 +40319,23 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 if (can_fuse_glu) {
                     const void * const * gate_ptrs = current_is_gate ? current_ptrs : partner_ptrs;
                     const void * const * up_ptrs   = current_is_up ? current_ptrs : partner_ptrs;
-                    const float *        gate_bias_ptr =
-                        pair.gate_bias ?
-                                   static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(pair.gate_bias, ctx.device)) :
-                                   nullptr;
+                    if (pair.gate_bias && !moe_layer_capture_tensor_artifact(plan.gate_bias, pair.gate_bias, ctx.device,
+                                                                             GGML_LAYOUT_AOS, "gate-bias", false,
+                                                                             false)) {
+                        return reject_artifact("gate-bias-handle", pair.gate_bias);
+                    }
+                    if (pair.up_bias && !moe_layer_capture_tensor_artifact(plan.up_bias, pair.up_bias, ctx.device,
+                                                                           GGML_LAYOUT_AOS, "up-bias", false, false)) {
+                        return reject_artifact("up-bias-handle", pair.up_bias);
+                    }
+                    if (!moe_layer_capture_tensor_artifact(plan.glu_output, pair.glu_dst, ctx.device, GGML_LAYOUT_AOS,
+                                                           "glu-output", true)) {
+                        return reject_artifact("glu-output-handle", pair.glu_dst);
+                    }
+                    const float * gate_bias_ptr =
+                        pair.gate_bias ? static_cast<const float *>(plan.gate_bias.resolved.ptr) : nullptr;
                     const float * up_bias_ptr =
-                        pair.up_bias ?
-                            static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(pair.up_bias, ctx.device)) :
-                            nullptr;
+                        pair.up_bias ? static_cast<const float *>(plan.up_bias.resolved.ptr) : nullptr;
                     if ((!pair.gate_bias || gate_bias_ptr) && (!pair.up_bias || up_bias_ptr)) {
                         const float alpha  = ggml_get_op_params_f32(pair.glu_dst, 2);
                         const float limit  = ggml_get_op_params_f32(pair.glu_dst, 3);
@@ -40257,7 +40343,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             ctx, pair.gate_weight, pair.up_weight, src1, pair.glu_dst, gate_ptrs, up_ptrs, ids_device,
                             gate_bias_ptr, up_bias_ptr, pair.gate_bias ? pair.gate_bias->nb[1] : 0,
                             pair.up_bias ? pair.up_bias->nb[1] : 0, static_cast<int>(plan.current.expert_ids.size()),
-                            n_ids_pair, ids->nb[0], ids->nb[1], pair.glu_op, alpha, limit);
+                            n_ids_pair, ids->nb[0], ids->nb[1], pair.glu_op, alpha, limit, &plan.glu_output.handle);
                         if (ok_glu) {
                             static const int layer_executor_enabled = [] {
                                 const char * env = std::getenv("GGML_SYCL_MOE_LAYER_EXECUTOR");
@@ -40297,6 +40383,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 const int down_layer_hash = moe_cache_layer_id(pair.down_weight->name);
                                 ggml_sycl_ensure_weight_on_device(pair.down_weight, ctx.device);
                                 const bool down_plan_ok = build_role_plan(plan.down, pair.down_weight, "down-route");
+                                if (down_plan_ok &&
+                                    !moe_layer_capture_tensor_artifact(plan.down_output, pair.down_dst, ctx.device,
+                                                                       GGML_LAYOUT_AOS, "down-output", true)) {
+                                    return reject_artifact("down-output-handle", pair.down_dst);
+                                }
                                 const void * const * down_ptrs = down_plan_ok ?
                                                                      moe_fusion_upload_ptrs_from_handles(
                                                                          ctx, plan.down, down_layer_hash, pair_layout) :
@@ -40307,18 +40398,19 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                         plan.down.expert_ids.data(), down_iid1s.data(), down_ids.data(),
                                         static_cast<int>(plan.down.expert_ids.size()),
                                         static_cast<int>(pair.down_weight->ne[2]), n_ids_pair, pair_layout, ids_device,
-                                        ids->nb[0], ids->nb[1]);
+                                        ids->nb[0], ids->nb[1], &plan.glu_output.handle);
                                     if (ok_down) {
                                         ggml_sycl_moe_down_shadow_capture(ctx, pair.down_dst, layer);
                                     }
                                     if (ok_down && path_trace_enabled != 0) {
                                         fprintf(stderr,
                                                 "[MOE-PAIR] path=pair_glu_down tensor=%s down=%s layer=%d entries=%zu "
-                                                "tokens=%lld skip_later=%d device=%d\n",
+                                                "tokens=%lld skip_later=%d device=%d glu=%p down_out=%p\n",
                                                 src0->name ? src0->name : "?",
                                                 pair.down_weight->name ? pair.down_weight->name : "?", layer,
                                                 plan.down.expert_ids.size(), (long long) down_tokens,
-                                                layer_executor_skip_eligible ? 1 : 0, ctx.device);
+                                                layer_executor_skip_eligible ? 1 : 0, ctx.device,
+                                                plan.glu_output.resolved.ptr, plan.down_output.resolved.ptr);
                                     }
                                     if (ok_down && layer_executor_enabled == 1 && !layer_executor_skip_eligible &&
                                         !layer_executor_graph_warning_shown) {
@@ -40335,12 +40427,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             if (path_trace_enabled != 0) {
                                 fprintf(stderr,
                                         "[MOE-PAIR] path=pair_glu tensor=%s partner=%s layer=%d layout=%s "
-                                        "entries=%zu n_ids=%lld glu=%s gate_bias=%d up_bias=%d device=%d\n",
+                                        "entries=%zu n_ids=%lld glu=%s gate_bias=%p up_bias=%p device=%d\n",
                                         src0->name ? src0->name : "?",
                                         partner_weight->name ? partner_weight->name : "?", layer,
                                         ggml_sycl_layout_mode_name(pair_layout), plan.current.expert_ids.size(),
-                                        (long long) n_ids_pair, ggml_glu_op_name(pair.glu_op), pair.gate_bias ? 1 : 0,
-                                        pair.up_bias ? 1 : 0, ctx.device);
+                                        (long long) n_ids_pair, ggml_glu_op_name(pair.glu_op),
+                                        pair.gate_bias ? plan.gate_bias.resolved.ptr : nullptr,
+                                        pair.up_bias ? plan.up_bias.resolved.ptr : nullptr, ctx.device);
                             }
                             g_moe_precomputed_mmid_skip.insert(partner_dst);
                             if (pair.gate_biased) {

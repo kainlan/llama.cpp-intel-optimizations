@@ -62,7 +62,8 @@ bool mmvq_moe_batched_dispatch(
     layout_mode                 layout = GGML_LAYOUT_AOS,
     const int32_t *             direct_ids_device = nullptr,
     int64_t                     direct_ids_nb0    = 0,
-    int64_t                     direct_ids_nb1    = 0);
+    int64_t                     direct_ids_nb1    = 0,
+    const ggml_sycl::mem_handle * src1_handle_override = nullptr);
 
 bool mmvq_moe_batched_dispatch_pair_mxfp4_soa(
     ggml_backend_sycl_context & ctx,
@@ -98,7 +99,8 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(
     int64_t                     ids_nb1,
     int                         glu_op,
     float                       alpha,
-    float                       limit);
+    float                       limit,
+    const ggml_sycl::mem_handle * glu_dst_handle_override = nullptr);
 
 struct mmvq_moe_dispatch_timing {
     double activation_quant_us = 0.0;
