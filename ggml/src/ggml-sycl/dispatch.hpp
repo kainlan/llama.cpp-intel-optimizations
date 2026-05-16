@@ -156,7 +156,7 @@ inline int get_debug_level() {
  * Check if persistent TG kernel is enabled via environment variable.
  *
  * Persistent token generation kernel — fuses entire TG forward pass.
- * Default: disabled (experimental). Set GGML_SYCL_PERSISTENT_TG=1 to enable.
+ * Default: disabled. Set GGML_SYCL_PERSISTENT_TG=1 to enable.
  *
  * @return true if persistent TG kernel is enabled
  */
@@ -164,8 +164,8 @@ inline bool env_persistent_tg_enabled() {
     static int enabled = -1;
     if (enabled < 0) {
         const char * env = std::getenv("GGML_SYCL_PERSISTENT_TG");
-        // Default OFF (experimental) — set =1 to enable
-        enabled = (env != nullptr && std::strcmp(env, "1") == 0) ? 1 : 0;
+        // Default OFF until the persistent policy is faster for the normal TG shape.
+        enabled = (env != nullptr && std::atoi(env) != 0) ? 1 : 0;
     }
     return enabled != 0;
 }

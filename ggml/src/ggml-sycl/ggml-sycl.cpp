@@ -52997,7 +52997,8 @@ full_build:
                                 weight_layout = resolved_ptg.layout;
                             }
                         }
-                        if (weight_layout != GGML_LAYOUT_AOS && weight_layout != GGML_LAYOUT_SOA) {
+                        if (weight_layout != GGML_LAYOUT_AOS && weight_layout != GGML_LAYOUT_SOA &&
+                            weight_layout != GGML_LAYOUT_COALESCED) {
                             GGML_LOG_ERROR("[PERSISTENT-TG] MUL_MAT unsupported weight layout=%d\n",
                                            (int) weight_layout);
                             return false;
@@ -53019,7 +53020,7 @@ full_build:
                         const layout_mode soa_layout =
                             ggml_sycl_adjust_layout_for_tensor(weight_tensor, GGML_LAYOUT_SOA, ctx.device);
                         if (soa_layout == GGML_LAYOUT_SOA) {
-                            // Prefer a concrete SoA/Coalesced pointer for persistent DMMV.
+                            // Prefer a concrete reordered pointer for persistent DMMV.
                             {
                                 auto resolved_ptg = ggml_sycl_resolve(weight_tensor, ctx.device);
                                 if (resolved_ptg && resolved_ptg.layout != GGML_LAYOUT_AOS) {
@@ -55383,7 +55384,7 @@ static bool graph_has_only_persistent_ops(ggml_cgraph * cgraph) {
  * @return true if persistent TG kernel should be used
  */
 static bool should_use_persistent_tg(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph) {
-    // 1. Environment variable gate
+    // 1. Environment variable gate.
     if (!ggml_sycl::env_persistent_tg_enabled()) {
         return false;
     }
@@ -55740,7 +55741,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
     // reducing kernel dispatch overhead for token generation (M=1) workloads.
     //
     // Requirements:
-    // - Persistent TG enabled (GGML_SYCL_PERSISTENT_TG=1; disabled by default)
+    // - Persistent TG enabled (GGML_SYCL_PERSISTENT_TG=1)
     // - Decode phase (batch size == 1)
     // - Supported model architecture and quantization
     // - XMX hardware support
