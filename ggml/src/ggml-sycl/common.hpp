@@ -304,7 +304,7 @@ void * ggml_sycl_get_cached_tensor_ptr_for(const ggml_tensor *      tensor,
 #    define GGML_SYCL_DMMV_X 32
 #endif
 #ifndef GGML_SYCL_MMV_Y
-#    define GGML_SYCL_MMV_Y 4
+#    define GGML_SYCL_MMV_Y 1
 #endif
 
 typedef sycl::queue * queue_ptr;
