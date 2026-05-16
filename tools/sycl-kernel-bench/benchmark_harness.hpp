@@ -341,19 +341,10 @@ struct DpasDimTuningEntry {
     DpasAccType acc = DpasAccType::INT32;
 };
 
-inline bool dpas_device_is_b580(const DeviceInfo & info) {
-    if (info.device_id == 0xe20b) {
-        return true;
-    }
-    if (info.name.find("B580") != std::string::npos) {
-        return true;
-    }
-    return false;
-}
-
 inline bool dpas_lookup_dim_tuning(const BenchmarkConfig & config,
                                    const DeviceInfo & info,
                                    DpasDimTuningEntry & out) {
+    GGML_UNUSED(info);
     if (config.dim_n <= 0 || (config.dim_n % 16) != 0) {
         return false;
     }
@@ -369,19 +360,8 @@ inline bool dpas_lookup_dim_tuning(const BenchmarkConfig & config,
         {8, 512, 4, DpasMemoryPattern::LSC_STREAMING, DpasGrfMode::GRF_128, DpasAccType::FP32},
         {8, 1024, 4, DpasMemoryPattern::LSC_STREAMING, DpasGrfMode::GRF_256, DpasAccType::INT32},
     };
-    const DpasDimTuningEntry b580_table[] = {
-        {4, 128, 8, DpasMemoryPattern::LSC_STREAMING, DpasGrfMode::GRF_128, DpasAccType::FP32},
-        {4, 256, 8, DpasMemoryPattern::LSC_STREAMING, DpasGrfMode::GRF_128, DpasAccType::FP32},
-        {8, 128, 4, DpasMemoryPattern::LSC_STREAMING, DpasGrfMode::GRF_128, DpasAccType::FP32},
-        {8, 256, 4, DpasMemoryPattern::LSC_STREAMING, DpasGrfMode::GRF_128, DpasAccType::FP32},
-    };
-
     const DpasDimTuningEntry * table = default_table;
     size_t table_size = sizeof(default_table) / sizeof(default_table[0]);
-    if (dpas_device_is_b580(info)) {
-        table = b580_table;
-        table_size = sizeof(b580_table) / sizeof(b580_table[0]);
-    }
 
     for (size_t i = 0; i < table_size; ++i) {
         const auto & entry = table[i];
@@ -982,6 +962,21 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
             if (!run_mxfp4_decode_bandwidth(weights, m, k, config.layout, output_f16,
                                             config.warmup_iterations, config.measure_iterations,
                                             queue, metrics, error)) {
+                out.error = error;
+                return false;
+            }
+            break;
+        }
+        case KernelKind::MXFP4_INLINE_DOT: {
+            GeneratedWeights weights;
+            if (!generate_quantized_weights(GGML_TYPE_MXFP4, config.layout, m, k, false, weights)) {
+                out.error = "Failed to generate MXFP4 weights for inline-dot benchmark.";
+                return false;
+            }
+            GeneratedActivations activations = generate_activations(n, k, k, false, true, false);
+            if (!run_mxfp4_inline_dot(weights, activations, m, n, k, config.layout, config.validate,
+                                      config.warmup_iterations, config.measure_iterations,
+                                      queue, metrics, error)) {
                 out.error = error;
                 return false;
             }

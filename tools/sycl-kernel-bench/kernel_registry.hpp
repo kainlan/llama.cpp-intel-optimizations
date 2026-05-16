@@ -20,6 +20,7 @@ enum class KernelKind {
     UNIFIED_MATMUL,
     MEMORY_BANDWIDTH,
     MXFP4_DECODE_BANDWIDTH,
+    MXFP4_INLINE_DOT,
     ROOFLINE_COMPUTE,
     DPAS_EXPLORATION,
 };
@@ -90,6 +91,8 @@ inline const std::vector<KernelInfo> & kernel_list() {
         { "mxfp4_decode_soa", GGML_LAYOUT_SOA, KernelKind::MXFP4_DECODE_BANDWIDTH },
         { "mxfp4_decode_f16_aos", GGML_LAYOUT_AOS, KernelKind::MXFP4_DECODE_BANDWIDTH },
         { "mxfp4_decode_f16_soa", GGML_LAYOUT_SOA, KernelKind::MXFP4_DECODE_BANDWIDTH },
+        { "mxfp4_inline_dot_aos", GGML_LAYOUT_AOS, KernelKind::MXFP4_INLINE_DOT },
+        { "mxfp4_inline_dot_soa", GGML_LAYOUT_SOA, KernelKind::MXFP4_INLINE_DOT },
         { "roofline_compute", GGML_LAYOUT_AOS, KernelKind::ROOFLINE_COMPUTE },
     };
     return kernels;

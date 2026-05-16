@@ -11507,10 +11507,14 @@ static ggml_sycl_device_info ggml_sycl_init() {
                       info.devices[i].safe_max_alloc_size / (1024.0 * 1024.0));
         // Query XMX (Intel matrix engine) capabilities
         info.devices[i].xmx_caps = query_xmx_capabilities(device);
-        GGML_LOG_INFO("[SYCL] Device %d XMX: %s, M=%zu N=%zu K=%zu, SLM=%zuKB\n", i,
-
-                      info.devices[i].xmx_caps.supported ? "yes" : "no", info.devices[i].xmx_caps.M,
-                      info.devices[i].xmx_caps.N, info.devices[i].xmx_caps.K, info.devices[i].xmx_caps.slm_size / 1024);
+        const auto & caps = info.devices[i].xmx_caps;
+        GGML_LOG_INFO(
+            "[SYCL] Device %d caps: CU=%u, WG=%zu, SG=%zu preferred, SLM=%zuKB, "
+            "USM(device/shared/host)=%d/%d/%d, fp16=%d, XMX=%s M=%zu N=%zu K=%zu tile_m=%d tile_n=%d\n",
+            i, caps.compute_units, caps.max_work_group_size, caps.preferred_sub_group_size, caps.slm_size / 1024,
+            caps.supports_usm_device ? 1 : 0, caps.supports_usm_shared ? 1 : 0, caps.supports_usm_host ? 1 : 0,
+            caps.supports_fp16_type ? 1 : 0, caps.supported ? "yes" : "no", caps.M, caps.N, caps.K,
+            caps.optimal_tiles_m, caps.optimal_tiles_n);
     }
     for (int id = 0; id < info.device_count; ++id) {
         info.default_tensor_split[id] /= total_vram;

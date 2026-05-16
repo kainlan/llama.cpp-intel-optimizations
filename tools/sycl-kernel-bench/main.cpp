@@ -119,6 +119,7 @@ static void print_usage(const char * argv0) {
                  "onednn_fp16_gemm|onednn_int8_gemm|onednn_woq_gemm|onednn_mxfp4_gemm|"
                  "onednn_mxfp4_f32scale_gemm|unified_matmul|memory_bandwidth|"
                  "mxfp4_decode_aos|mxfp4_decode_soa|mxfp4_decode_f16_aos|mxfp4_decode_f16_soa|roofline_compute|"
+                 "mxfp4_inline_dot_aos|mxfp4_inline_dot_soa|"
                  "dpas_baseline|dpas_sweep|dpas_memory_patterns (comma-separated to compare)\n"
                  "  --quant=Q4_0|Q8_0|Q6_K|Q4_K|Q5_K|Q2_K|Q3_K|Q4_1|Q5_0|Q5_1|MXFP4\n"
                  "  --batch=1,4,8,16,32,64\n"
@@ -839,6 +840,7 @@ int main(int argc, char ** argv) {
                                                 case KernelKind::ONEDNN_WOQ_GEMM:
                                                     return s.type != GGML_TYPE_Q4_0;
                                                 case KernelKind::ONEDNN_MXFP4_GEMM:
+                                                case KernelKind::MXFP4_INLINE_DOT:
                                                     return s.type != GGML_TYPE_MXFP4;
                                                 case KernelKind::UNIFIED_MATMUL:
                                                     return s.type != GGML_TYPE_Q4_0 ||

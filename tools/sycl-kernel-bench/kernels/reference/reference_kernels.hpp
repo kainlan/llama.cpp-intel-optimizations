@@ -112,6 +112,19 @@ bool run_mxfp4_decode_bandwidth(const GeneratedWeights & weights,
                                 ReferenceMetrics & out,
                                 std::string & error);
 
+bool run_mxfp4_inline_dot(const GeneratedWeights & weights,
+                          const GeneratedActivations & activations,
+                          int64_t m,
+                          int64_t n,
+                          int64_t k,
+                          ggml_layout_mode layout,
+                          bool validate,
+                          int warmup,
+                          int iterations,
+                          sycl::queue & queue,
+                          ReferenceMetrics & out,
+                          std::string & error);
+
 bool run_roofline_compute(size_t elements,
                           int ops_per_element,
                           int warmup,

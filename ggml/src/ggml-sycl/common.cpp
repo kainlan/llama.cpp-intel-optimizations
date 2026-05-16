@@ -798,13 +798,45 @@ bool gpu_has_xmx(sycl::device & dev) {
 XMXCapabilities query_xmx_capabilities(sycl::device & dev) {
     XMXCapabilities caps;
 
+    try {
+        caps.compute_units = dev.get_info<sycl::info::device::max_compute_units>();
+    } catch (...) {}
+    try {
+        caps.global_mem_size = dev.get_info<sycl::info::device::global_mem_size>();
+    } catch (...) {}
+    try {
+        caps.max_mem_alloc_size = dev.get_info<sycl::info::device::max_mem_alloc_size>();
+    } catch (...) {}
+    try {
+        caps.max_work_group_size = dev.get_info<sycl::info::device::max_work_group_size>();
+    } catch (...) {}
+    try {
+        caps.slm_size = dev.get_info<sycl::info::device::local_mem_size>();
+    } catch (...) {}
+    try {
+        const auto sizes = dev.get_info<sycl::info::device::sub_group_sizes>();
+        caps.sub_group_size_count =
+            std::min(sizes.size(), XMXCapabilities::MAX_RECORDED_SUB_GROUP_SIZES);
+        for (size_t i = 0; i < caps.sub_group_size_count; ++i) {
+            caps.sub_group_sizes[i] = sizes[i];
+            caps.max_sub_group_size = std::max(caps.max_sub_group_size, sizes[i]);
+            if (sizes[i] == 32) {
+                caps.preferred_sub_group_size = 32;
+            }
+        }
+        if (caps.preferred_sub_group_size == 0) {
+            caps.preferred_sub_group_size = caps.max_sub_group_size;
+        }
+    } catch (...) {}
+    caps.supports_usm_device = dev.has(sycl::aspect::usm_device_allocations);
+    caps.supports_usm_shared = dev.has(sycl::aspect::usm_shared_allocations);
+    caps.supports_usm_host   = dev.has(sycl::aspect::usm_host_allocations);
+    caps.supports_fp16_type  = dev.has(sycl::aspect::fp16);
+
     if (!dev.has(sycl::aspect::ext_intel_matrix)) {
         return caps;
     }
     caps.supported = true;
-
-    // Query SLM size
-    caps.slm_size = dev.get_info<sycl::info::device::local_mem_size>();
 
 #if defined(SYCL_EXT_ONEAPI_MATRIX_VERSION) && SYCL_EXT_ONEAPI_MATRIX_VERSION >= 1
     using namespace sycl::ext::oneapi::experimental;

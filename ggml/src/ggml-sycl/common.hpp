@@ -26,6 +26,7 @@
 #include "unified-cache.hpp"
 
 #include <atomic>
+#include <array>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdlib>
@@ -565,7 +566,21 @@ struct XMXCapabilities {
     bool supports_fp16 = false;
 
     // Device memory info
-    size_t slm_size = 0;  // Shared local memory per work-group
+    size_t   slm_size = 0;  // Shared local memory per work-group
+    uint32_t compute_units = 0;
+    size_t   global_mem_size = 0;
+    size_t   max_mem_alloc_size = 0;
+    size_t   max_work_group_size = 0;
+    size_t   max_sub_group_size = 0;
+    size_t   preferred_sub_group_size = 0;
+    bool     supports_usm_device = false;
+    bool     supports_usm_shared = false;
+    bool     supports_usm_host = false;
+    bool     supports_fp16_type = false;
+
+    static constexpr size_t MAX_RECORDED_SUB_GROUP_SIZES = 8;
+    std::array<size_t, MAX_RECORDED_SUB_GROUP_SIZES> sub_group_sizes = {};
+    size_t sub_group_size_count = 0;
 
     // Derived optimal config
     int optimal_tiles_m = 1;
