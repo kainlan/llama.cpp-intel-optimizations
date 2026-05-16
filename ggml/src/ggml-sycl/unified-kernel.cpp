@@ -6508,7 +6508,7 @@ template <int BLOCK_SIZE> class PersistentTGKernelImpl {
             return;
         }
         const StridedCopyMeta * meta = &op.strided_copy_meta;
-        if (!op.input || !op.output || meta->type_size <= 0) {
+        if (!op.input || !op.output || meta->src_size <= 0 || meta->dst_size <= 0) {
             return;
         }
 
@@ -6528,18 +6528,23 @@ template <int BLOCK_SIZE> class PersistentTGKernelImpl {
         }
 
         const int64_t src_off = i0 * meta->nb[0] + i1 * meta->nb[1] + i2 * meta->nb[2] + i3 * meta->nb[3];
-        const int64_t dst_off = (int64_t) idx * meta->type_size;
+        const int64_t dst_off = (int64_t) idx * meta->dst_size;
         const char *  src     = static_cast<const char *>(op.input);
         char *        dst     = static_cast<char *>(op.output);
 
-        if (meta->type_size == 4) {
+        if (meta->src_type == 0 && meta->dst_type == 1) {
+            *reinterpret_cast<sycl::half *>(dst + dst_off) = sycl::half(*reinterpret_cast<const float *>(src + src_off));
+        } else if (meta->src_type == 1 && meta->dst_type == 0) {
+            *reinterpret_cast<float *>(dst + dst_off) =
+                static_cast<float>(*reinterpret_cast<const sycl::half *>(src + src_off));
+        } else if (meta->dst_size == 4) {
             *reinterpret_cast<uint32_t *>(dst + dst_off) = *reinterpret_cast<const uint32_t *>(src + src_off);
-        } else if (meta->type_size == 2) {
+        } else if (meta->dst_size == 2) {
             *reinterpret_cast<uint16_t *>(dst + dst_off) = *reinterpret_cast<const uint16_t *>(src + src_off);
-        } else if (meta->type_size == 1) {
+        } else if (meta->dst_size == 1) {
             dst[dst_off] = src[src_off];
         } else {
-            for (int b = 0; b < meta->type_size; ++b) {
+            for (int b = 0; b < meta->dst_size; ++b) {
                 dst[dst_off + b] = src[src_off + b];
             }
         }
@@ -9809,7 +9814,9 @@ static void micro_submit_strided_copy(sycl::queue & q, const DeviceOperation * d
     const int64_t nb1       = op_rec.strided_copy_meta.nb[1];
     const int64_t nb2       = op_rec.strided_copy_meta.nb[2];
     const int64_t nb3       = op_rec.strided_copy_meta.nb[3];
-    const int32_t type_size = op_rec.strided_copy_meta.type_size;
+    const int32_t src_type = op_rec.strided_copy_meta.src_type;
+    const int32_t dst_type = op_rec.strided_copy_meta.dst_type;
+    const int32_t dst_size = op_rec.strided_copy_meta.dst_size;
 
     q.submit([&](sycl::handler & cgh) {
         cgh.parallel_for<micro_graph_strided_copy_tag>(
@@ -9835,16 +9842,22 @@ static void micro_submit_strided_copy(sycl::queue & q, const DeviceOperation * d
                 }
 
                 const int64_t src_off = i0 * nb0 + i1 * nb1 + i2 * nb2 + i3 * nb3;
-                const int64_t dst_off = (int64_t) idx * type_size;
+                const int64_t dst_off = (int64_t) idx * dst_size;
 
-                if (type_size == 4) {
+                if (src_type == 0 && dst_type == 1) {
+                    *reinterpret_cast<sycl::half *>(dst + dst_off) =
+                        sycl::half(*reinterpret_cast<const float *>(src + src_off));
+                } else if (src_type == 1 && dst_type == 0) {
+                    *reinterpret_cast<float *>(dst + dst_off) =
+                        static_cast<float>(*reinterpret_cast<const sycl::half *>(src + src_off));
+                } else if (dst_size == 4) {
                     *reinterpret_cast<uint32_t *>(dst + dst_off) = *reinterpret_cast<const uint32_t *>(src + src_off);
-                } else if (type_size == 2) {
+                } else if (dst_size == 2) {
                     *reinterpret_cast<uint16_t *>(dst + dst_off) = *reinterpret_cast<const uint16_t *>(src + src_off);
-                } else if (type_size == 1) {
+                } else if (dst_size == 1) {
                     dst[dst_off] = src[src_off];
                 } else {
-                    for (int b = 0; b < type_size; ++b) {
+                    for (int b = 0; b < dst_size; ++b) {
                         dst[dst_off + b] = src[src_off + b];
                     }
                 }

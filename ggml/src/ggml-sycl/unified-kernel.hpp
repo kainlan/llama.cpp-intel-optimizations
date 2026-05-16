@@ -308,8 +308,10 @@ struct RopeDescriptor {
 struct StridedCopyMeta {
     int64_t ne[4];
     int64_t nb[4];
-    int32_t type_size;
-    int32_t pad;
+    int32_t src_type;   // 0=F32/raw, 1=F16
+    int32_t dst_type;   // 0=F32/raw, 1=F16
+    int32_t src_size;
+    int32_t dst_size;
 };
 
 // Metadata for GGML_OP_SET_ROWS.

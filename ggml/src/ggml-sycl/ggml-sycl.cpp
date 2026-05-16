@@ -51029,6 +51029,9 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
         nb[2]            = nb[1] * tensor->ne[1];
         nb[3]            = nb[2] * tensor->ne[2];
     };
+    auto strided_copy_type_code = [](ggml_type type) -> int32_t {
+        return type == GGML_TYPE_F16 ? 1 : 0;
+    };
     // Helper: read a single int32_t from a tensor pointer, preferring host-side
     // read when the pointer is host-accessible (malloc_host or malloc_shared).
     // Falls back to blocking D2H memcpy only for device-only pointers.
@@ -51126,8 +51129,10 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
             meta.ne[d] = tensor->ne[d];
             meta.nb[d] = (int64_t) tensor->nb[d];
         }
-        meta.type_size = (int32_t) ggml_type_size(tensor->type);
-        meta.pad       = 0;
+        meta.src_type = strided_copy_type_code(tensor->type);
+        meta.dst_type = meta.src_type;
+        meta.src_size = (int32_t) ggml_type_size(tensor->type);
+        meta.dst_size = meta.src_size;
 
         if (log_ops && (max_ops_limit <= 0 || ops_added >= max_ops_limit - 2)) {
             GGML_LOG_INFO("[PERSISTENT-TG] resolve_input_ptr: materialize name=%s bytes=%zu\n",
@@ -51142,7 +51147,7 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
             GGML_LOG_ERROR("[PERSISTENT-TG] Materialize tensor too large: %lld elements\n", (long long) n_elements);
             return nullptr;
         }
-        const int64_t output_bytes = n_elements * meta.type_size;
+        const int64_t output_bytes = n_elements * meta.dst_size;
         kernel.add_strided_copy(layer, src_ptr, dst_ptr, meta, (int) n_elements, output_bytes);
         log_op("STRIDED_COPY", layer, tensor, dst_ptr);
         ops_added++;
@@ -51291,6 +51296,27 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
         entry.output_ptr = output_ptr;
         entry.op_index   = op_index;
         g_persistent_trace_ops.push_back(entry);
+    };
+    auto tensor_used_after = [&](const ggml_tensor * tensor, int node_idx) -> bool {
+        if (!tensor) {
+            return false;
+        }
+        for (int j = node_idx + 1; j < cgraph->n_nodes; j++) {
+            const ggml_tensor * user = cgraph->nodes[j];
+            if (!user) {
+                continue;
+            }
+            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                const ggml_tensor * src = user->src[s];
+                while (src) {
+                    if (src == tensor) {
+                        return true;
+                    }
+                    src = src->view_src;
+                }
+            }
+        }
+        return false;
     };
 
     // Fast path: reuse cached plan and refresh mutable pointers only.
@@ -52518,8 +52544,10 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
                                 meta.ne[d] = node->src[0]->ne[d];
                                 meta.nb[d] = (int64_t) node->src[0]->nb[d];
                             }
-                            meta.type_size = (int32_t) ggml_type_size(node->type);
-                            meta.pad       = 0;
+                            meta.src_type = strided_copy_type_code(node->src[0]->type);
+                            meta.dst_type = strided_copy_type_code(node->type);
+                            meta.src_size = (int32_t) ggml_type_size(node->src[0]->type);
+                            meta.dst_size = (int32_t) ggml_type_size(node->type);
 
                             const int64_t n_elements = ggml_nelements(node->src[0]);
                             if (n_elements <= 0 || n_elements > std::numeric_limits<int>::max()) {
@@ -52529,7 +52557,7 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
                             op_desc.input             = src_ptr;
                             op_desc.output            = dst_ptr;
                             op_desc.M                 = (int) n_elements;
-                            op_desc.output_bytes      = n_elements * meta.type_size;
+                            op_desc.output_bytes      = n_elements * meta.dst_size;
                             op_desc.strided_copy_meta = meta;
                             op_desc.has_embedded_meta = true;
                             if (!kernel.update_op_descriptor(op_idx, op_desc)) {
@@ -52549,6 +52577,54 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
                         {
                             if (!node->src[0] || !node->src[1]) {
                                 fast_path_ok = false;
+                                break;
+                            }
+                            if (tensor_used_after(node, i)) {
+                                const void * src_ptr = get_tensor_ptr_view_fast(node->src[0]);
+                                void *       dst_ptr = get_tensor_ptr_view_fast(node);
+                                if (!dst_ptr) {
+                                    dst_ptr = get_tensor_ptr_view_fast(node->src[1]);
+                                }
+                                if (!src_ptr || !dst_ptr || !ggml_is_contiguous(node)) {
+                                    fast_path_ok = false;
+                                    break;
+                                }
+                                if (!kernel.get_op_descriptor(op_idx, op_desc) ||
+                                    op_desc.type != OperationType::STRIDED_COPY) {
+                                    fast_path_ok = false;
+                                    break;
+                                }
+                                StridedCopyMeta meta = {};
+                                for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                                    meta.ne[d] = node->ne[d];
+                                    meta.nb[d] = (int64_t) node->src[0]->nb[d];
+                                }
+                                meta.src_type = strided_copy_type_code(node->src[0]->type);
+                                meta.dst_type = strided_copy_type_code(node->type);
+                                meta.src_size = (int32_t) ggml_type_size(node->src[0]->type);
+                                meta.dst_size = (int32_t) ggml_type_size(node->type);
+                                const int64_t n_elements = ggml_nelements(node);
+                                if (n_elements <= 0 || n_elements > std::numeric_limits<int>::max()) {
+                                    fast_path_ok = false;
+                                    break;
+                                }
+                                op_desc.input             = src_ptr;
+                                op_desc.output            = dst_ptr;
+                                op_desc.M                 = (int) n_elements;
+                                op_desc.output_bytes      = n_elements * meta.dst_size;
+                                op_desc.strided_copy_meta = meta;
+                                op_desc.has_embedded_meta = true;
+                                if (!kernel.update_op_descriptor(op_idx, op_desc)) {
+                                    fast_path_ok = false;
+                                    break;
+                                }
+                                materialized_ptrs[node] = dst_ptr;
+                                if (building_recipe) {
+                                    recipe_entries.push_back({ op_idx, OperationType::STRIDED_COPY,
+                                                               PtrSource::GGML_TENSOR, PtrSource::GGML_TENSOR,
+                                                               PtrSource::STABLE, PtrSource::STABLE, i, -1 });
+                                }
+                                op_idx++;
                                 break;
                             }
                             // Defer CPY until after persistent kernel execution.
@@ -53707,6 +53783,7 @@ full_build:
                     log_tensor("ATTN K", K_fa);
                     log_tensor("ATTN V", V_fa);
                     log_tensor("ATTN mask", mask);
+                    log_tensor("ATTN dst", node);
 
                     if (Q_fa->type != GGML_TYPE_F32 &&
                         (Q_fa->type != GGML_TYPE_F16 ||
@@ -54247,8 +54324,10 @@ full_build:
                         meta.ne[d] = node->src[0]->ne[d];
                         meta.nb[d] = (int64_t) node->src[0]->nb[d];
                     }
-                    meta.type_size = (int32_t) ggml_type_size(node->type);
-                    meta.pad       = 0;
+                    meta.src_type = strided_copy_type_code(node->src[0]->type);
+                    meta.dst_type = strided_copy_type_code(node->type);
+                    meta.src_size = (int32_t) ggml_type_size(node->src[0]->type);
+                    meta.dst_size = (int32_t) ggml_type_size(node->type);
 
                     const int64_t n_elements = ggml_nelements(node->src[0]);
                     if (n_elements > std::numeric_limits<int>::max()) {
@@ -54256,7 +54335,7 @@ full_build:
                                        (long long) n_elements);
                         return false;
                     }
-                    const int64_t output_bytes = n_elements * meta.type_size;
+                    const int64_t output_bytes = n_elements * meta.dst_size;
                     kernel.add_strided_copy(layer, src_ptr, dst_ptr, meta, (int) n_elements, output_bytes);
                     log_op("STRIDED_COPY", layer, node, dst_ptr);
                     ops_added++;
@@ -54273,6 +54352,40 @@ full_build:
                 if (!node->src[0] || !node->src[1]) {
                     GGML_LOG_ERROR("[PERSISTENT-TG] CPY missing src\n");
                     return false;
+                }
+                if (tensor_used_after(node, i)) {
+                    const void * src_ptr = get_tensor_ptr_view_fast(node->src[0]);
+                    void *       dst_ptr = get_tensor_ptr_view_fast(node);
+                    if (!dst_ptr) {
+                        dst_ptr = get_tensor_ptr_view_fast(node->src[1]);
+                    }
+                    if (!src_ptr || !dst_ptr || !ggml_is_contiguous(node)) {
+                        GGML_LOG_ERROR("[PERSISTENT-TG] CPY input/output not contiguous\n");
+                        return false;
+                    }
+                    StridedCopyMeta meta = {};
+                    for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                        meta.ne[d] = node->ne[d];
+                        meta.nb[d] = (int64_t) node->src[0]->nb[d];
+                    }
+                    meta.src_type = strided_copy_type_code(node->src[0]->type);
+                    meta.dst_type = strided_copy_type_code(node->type);
+                    meta.src_size = (int32_t) ggml_type_size(node->src[0]->type);
+                    meta.dst_size = (int32_t) ggml_type_size(node->type);
+
+                    const int64_t n_elements = ggml_nelements(node);
+                    if (n_elements > std::numeric_limits<int>::max()) {
+                        GGML_LOG_ERROR("[PERSISTENT-TG] CPY tensor too large: %lld elements\n",
+                                       (long long) n_elements);
+                        return false;
+                    }
+                    const int64_t output_bytes = n_elements * meta.dst_size;
+                    kernel.add_strided_copy(layer, src_ptr, dst_ptr, meta, (int) n_elements, output_bytes);
+                    log_op("STRIDED_COPY", layer, node, dst_ptr);
+                    ops_added++;
+                    materialized_ptrs[node] = dst_ptr;
+                    record_trace(node->op, node, dst_ptr, ops_added - 1);
+                    break;
                 }
                 {
                     // Find which plan op produced the CPY source data.
