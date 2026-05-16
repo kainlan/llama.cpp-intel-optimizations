@@ -37272,9 +37272,10 @@ static bool try_xmx_sorted_moe(ggml_backend_sycl_context & ctx,
         if (!g_ggml_sycl_graph_recording) {
             // force_cache_aos=host_weights ensures experts are staged to GPU memory even for AoS layout
             // This is critical for mmap'd weights which cannot be accessed directly by GPU kernels
+            // XMX kernels cannot consume host-routed experts, so selected experts must be staged instead of skipped.
             if (!ggml_sycl_update_moe_ptr_table(ctx, src0, ids, layout, &table_event, /*allow_all_experts=*/false,
                                                 nullptr, false, /*force_cache_aos=*/host_weights,
-                                                /*skip_cpu_routed_experts=*/host_weights,
+                                                /*skip_cpu_routed_experts=*/false,
                                                 /*exact_layout_required=*/false)) {
                 GGML_SYCL_DEBUG("[XMX MoE] Failed to update expert pointer table for %s\n", src0->name);
                 return reject_xmx("ptr-table-update");
@@ -49530,6 +49531,13 @@ static bool check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgra
     // Check if unified cache is enabled for lazy-moe
     // Graph preloading will handle the actual capacity check and caching
     if (total_experts_needed > 0) {
+        if (ggml_sycl_xmx_moe_forced()) {
+            GGML_LOG_INFO(
+                "[GRAPH-CHECK] Forced XMX MoE with host-resident expert weights requires direct TG dispatch; "
+                "disabling SYCL graph replay for this graph\n");
+            g_graph_diag_counters.graph_disabled.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
         if (!ggml_sycl::unified_cache_enabled()) {
             GGML_SYCL_DEBUG("[GRAPH-CHECK] lazy-moe: unified cache disabled, graphs allowed (%zu experts)\n",
                             total_experts_needed);
