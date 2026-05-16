@@ -458,9 +458,7 @@ SYCL_EXTERNAL inline sycl::half dequant_q4_0_half_soa(const uint8_t *    qs_base
 // aligned from the slm_row base.
 // `qs` MUST be 4-byte aligned (SOA qs buffers are; AOS block_q4_0_unified->qs is
 // 2-byte aligned — use `dequant_q4_0_block_half8_unaligned` for that case).
-SYCL_EXTERNAL inline void dequant_q4_0_block_half8(const uint8_t *  qs,
-                                                   sycl::half       d_h,
-                                                   sycl::half *     slm_row) {
+SYCL_EXTERNAL inline void dequant_q4_0_block_half8(const uint8_t * qs, sycl::half d_h, sycl::half * slm_row) {
     const uint32_t * qs32 = reinterpret_cast<const uint32_t *>(qs);
     const uint32_t   w0   = qs32[0];
     const uint32_t   w1   = qs32[1];
@@ -476,42 +474,26 @@ SYCL_EXTERNAL inline void dequant_q4_0_block_half8(const uint8_t *  qs,
     //   y[8..15] <- low nibbles of (w2, w3)
     //   y[16..23] <- high nibbles of (w0, w1)
     //   y[24..31] <- high nibbles of (w2, w3)
-    sycl::vec<float, 8> lo0_f(sycl::fma(d, float( w0        & 0xF), dm),
-                              sycl::fma(d, float((w0 >>  8) & 0xF), dm),
-                              sycl::fma(d, float((w0 >> 16) & 0xF), dm),
-                              sycl::fma(d, float((w0 >> 24) & 0xF), dm),
-                              sycl::fma(d, float( w1        & 0xF), dm),
-                              sycl::fma(d, float((w1 >>  8) & 0xF), dm),
-                              sycl::fma(d, float((w1 >> 16) & 0xF), dm),
-                              sycl::fma(d, float((w1 >> 24) & 0xF), dm));
-    sycl::vec<float, 8> lo1_f(sycl::fma(d, float( w2        & 0xF), dm),
-                              sycl::fma(d, float((w2 >>  8) & 0xF), dm),
-                              sycl::fma(d, float((w2 >> 16) & 0xF), dm),
-                              sycl::fma(d, float((w2 >> 24) & 0xF), dm),
-                              sycl::fma(d, float( w3        & 0xF), dm),
-                              sycl::fma(d, float((w3 >>  8) & 0xF), dm),
-                              sycl::fma(d, float((w3 >> 16) & 0xF), dm),
-                              sycl::fma(d, float((w3 >> 24) & 0xF), dm));
-    sycl::vec<float, 8> hi0_f(sycl::fma(d, float((w0 >>  4) & 0xF), dm),
-                              sycl::fma(d, float((w0 >> 12) & 0xF), dm),
-                              sycl::fma(d, float((w0 >> 20) & 0xF), dm),
-                              sycl::fma(d, float((w0 >> 28) & 0xF), dm),
-                              sycl::fma(d, float((w1 >>  4) & 0xF), dm),
-                              sycl::fma(d, float((w1 >> 12) & 0xF), dm),
-                              sycl::fma(d, float((w1 >> 20) & 0xF), dm),
-                              sycl::fma(d, float((w1 >> 28) & 0xF), dm));
-    sycl::vec<float, 8> hi1_f(sycl::fma(d, float((w2 >>  4) & 0xF), dm),
-                              sycl::fma(d, float((w2 >> 12) & 0xF), dm),
-                              sycl::fma(d, float((w2 >> 20) & 0xF), dm),
-                              sycl::fma(d, float((w2 >> 28) & 0xF), dm),
-                              sycl::fma(d, float((w3 >>  4) & 0xF), dm),
-                              sycl::fma(d, float((w3 >> 12) & 0xF), dm),
-                              sycl::fma(d, float((w3 >> 20) & 0xF), dm),
-                              sycl::fma(d, float((w3 >> 28) & 0xF), dm));
+    sycl::vec<float, 8> lo0_f(sycl::fma(d, float(w0 & 0xF), dm), sycl::fma(d, float((w0 >> 8) & 0xF), dm),
+                              sycl::fma(d, float((w0 >> 16) & 0xF), dm), sycl::fma(d, float((w0 >> 24) & 0xF), dm),
+                              sycl::fma(d, float(w1 & 0xF), dm), sycl::fma(d, float((w1 >> 8) & 0xF), dm),
+                              sycl::fma(d, float((w1 >> 16) & 0xF), dm), sycl::fma(d, float((w1 >> 24) & 0xF), dm));
+    sycl::vec<float, 8> lo1_f(sycl::fma(d, float(w2 & 0xF), dm), sycl::fma(d, float((w2 >> 8) & 0xF), dm),
+                              sycl::fma(d, float((w2 >> 16) & 0xF), dm), sycl::fma(d, float((w2 >> 24) & 0xF), dm),
+                              sycl::fma(d, float(w3 & 0xF), dm), sycl::fma(d, float((w3 >> 8) & 0xF), dm),
+                              sycl::fma(d, float((w3 >> 16) & 0xF), dm), sycl::fma(d, float((w3 >> 24) & 0xF), dm));
+    sycl::vec<float, 8> hi0_f(sycl::fma(d, float((w0 >> 4) & 0xF), dm), sycl::fma(d, float((w0 >> 12) & 0xF), dm),
+                              sycl::fma(d, float((w0 >> 20) & 0xF), dm), sycl::fma(d, float((w0 >> 28) & 0xF), dm),
+                              sycl::fma(d, float((w1 >> 4) & 0xF), dm), sycl::fma(d, float((w1 >> 12) & 0xF), dm),
+                              sycl::fma(d, float((w1 >> 20) & 0xF), dm), sycl::fma(d, float((w1 >> 28) & 0xF), dm));
+    sycl::vec<float, 8> hi1_f(sycl::fma(d, float((w2 >> 4) & 0xF), dm), sycl::fma(d, float((w2 >> 12) & 0xF), dm),
+                              sycl::fma(d, float((w2 >> 20) & 0xF), dm), sycl::fma(d, float((w2 >> 28) & 0xF), dm),
+                              sycl::fma(d, float((w3 >> 4) & 0xF), dm), sycl::fma(d, float((w3 >> 12) & 0xF), dm),
+                              sycl::fma(d, float((w3 >> 20) & 0xF), dm), sycl::fma(d, float((w3 >> 28) & 0xF), dm));
 
-    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 0)  =
+    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 0) =
         lo0_f.convert<sycl::half, sycl::rounding_mode::automatic>();
-    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 8)  =
+    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 8) =
         lo1_f.convert<sycl::half, sycl::rounding_mode::automatic>();
     *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 16) =
         hi0_f.convert<sycl::half, sycl::rounding_mode::automatic>();
@@ -525,11 +507,9 @@ SYCL_EXTERNAL inline void dequant_q4_0_block_half8(const uint8_t *  qs,
 // path the compiler uses for `memcpy(&u32, qs, 4)`: two aligned u16 reads then
 // shift+or. Measured on Arc B580: benchmark validation passes with this path
 // (unlike a raw uint32 load which corrupts output for AOS weights).
-SYCL_EXTERNAL inline void dequant_q4_0_block_half8_unaligned(const uint8_t * qs,
-                                                             sycl::half      d_h,
-                                                             sycl::half *    slm_row) {
-    const uint16_t * qs16 = reinterpret_cast<const uint16_t *>(qs);
-    auto mk_u32 = [](uint16_t lo, uint16_t hi) -> uint32_t {
+SYCL_EXTERNAL inline void dequant_q4_0_block_half8_unaligned(const uint8_t * qs, sycl::half d_h, sycl::half * slm_row) {
+    const uint16_t * qs16   = reinterpret_cast<const uint16_t *>(qs);
+    auto             mk_u32 = [](uint16_t lo, uint16_t hi) -> uint32_t {
         return uint32_t(lo) | (uint32_t(hi) << 16);
     };
     const uint32_t w0 = mk_u32(qs16[0], qs16[1]);
@@ -540,42 +520,26 @@ SYCL_EXTERNAL inline void dequant_q4_0_block_half8_unaligned(const uint8_t * qs,
     const float d  = float(d_h);
     const float dm = d * -8.0f;
 
-    sycl::vec<float, 8> lo0_f(sycl::fma(d, float( w0        & 0xF), dm),
-                              sycl::fma(d, float((w0 >>  8) & 0xF), dm),
-                              sycl::fma(d, float((w0 >> 16) & 0xF), dm),
-                              sycl::fma(d, float((w0 >> 24) & 0xF), dm),
-                              sycl::fma(d, float( w1        & 0xF), dm),
-                              sycl::fma(d, float((w1 >>  8) & 0xF), dm),
-                              sycl::fma(d, float((w1 >> 16) & 0xF), dm),
-                              sycl::fma(d, float((w1 >> 24) & 0xF), dm));
-    sycl::vec<float, 8> lo1_f(sycl::fma(d, float( w2        & 0xF), dm),
-                              sycl::fma(d, float((w2 >>  8) & 0xF), dm),
-                              sycl::fma(d, float((w2 >> 16) & 0xF), dm),
-                              sycl::fma(d, float((w2 >> 24) & 0xF), dm),
-                              sycl::fma(d, float( w3        & 0xF), dm),
-                              sycl::fma(d, float((w3 >>  8) & 0xF), dm),
-                              sycl::fma(d, float((w3 >> 16) & 0xF), dm),
-                              sycl::fma(d, float((w3 >> 24) & 0xF), dm));
-    sycl::vec<float, 8> hi0_f(sycl::fma(d, float((w0 >>  4) & 0xF), dm),
-                              sycl::fma(d, float((w0 >> 12) & 0xF), dm),
-                              sycl::fma(d, float((w0 >> 20) & 0xF), dm),
-                              sycl::fma(d, float((w0 >> 28) & 0xF), dm),
-                              sycl::fma(d, float((w1 >>  4) & 0xF), dm),
-                              sycl::fma(d, float((w1 >> 12) & 0xF), dm),
-                              sycl::fma(d, float((w1 >> 20) & 0xF), dm),
-                              sycl::fma(d, float((w1 >> 28) & 0xF), dm));
-    sycl::vec<float, 8> hi1_f(sycl::fma(d, float((w2 >>  4) & 0xF), dm),
-                              sycl::fma(d, float((w2 >> 12) & 0xF), dm),
-                              sycl::fma(d, float((w2 >> 20) & 0xF), dm),
-                              sycl::fma(d, float((w2 >> 28) & 0xF), dm),
-                              sycl::fma(d, float((w3 >>  4) & 0xF), dm),
-                              sycl::fma(d, float((w3 >> 12) & 0xF), dm),
-                              sycl::fma(d, float((w3 >> 20) & 0xF), dm),
-                              sycl::fma(d, float((w3 >> 28) & 0xF), dm));
+    sycl::vec<float, 8> lo0_f(sycl::fma(d, float(w0 & 0xF), dm), sycl::fma(d, float((w0 >> 8) & 0xF), dm),
+                              sycl::fma(d, float((w0 >> 16) & 0xF), dm), sycl::fma(d, float((w0 >> 24) & 0xF), dm),
+                              sycl::fma(d, float(w1 & 0xF), dm), sycl::fma(d, float((w1 >> 8) & 0xF), dm),
+                              sycl::fma(d, float((w1 >> 16) & 0xF), dm), sycl::fma(d, float((w1 >> 24) & 0xF), dm));
+    sycl::vec<float, 8> lo1_f(sycl::fma(d, float(w2 & 0xF), dm), sycl::fma(d, float((w2 >> 8) & 0xF), dm),
+                              sycl::fma(d, float((w2 >> 16) & 0xF), dm), sycl::fma(d, float((w2 >> 24) & 0xF), dm),
+                              sycl::fma(d, float(w3 & 0xF), dm), sycl::fma(d, float((w3 >> 8) & 0xF), dm),
+                              sycl::fma(d, float((w3 >> 16) & 0xF), dm), sycl::fma(d, float((w3 >> 24) & 0xF), dm));
+    sycl::vec<float, 8> hi0_f(sycl::fma(d, float((w0 >> 4) & 0xF), dm), sycl::fma(d, float((w0 >> 12) & 0xF), dm),
+                              sycl::fma(d, float((w0 >> 20) & 0xF), dm), sycl::fma(d, float((w0 >> 28) & 0xF), dm),
+                              sycl::fma(d, float((w1 >> 4) & 0xF), dm), sycl::fma(d, float((w1 >> 12) & 0xF), dm),
+                              sycl::fma(d, float((w1 >> 20) & 0xF), dm), sycl::fma(d, float((w1 >> 28) & 0xF), dm));
+    sycl::vec<float, 8> hi1_f(sycl::fma(d, float((w2 >> 4) & 0xF), dm), sycl::fma(d, float((w2 >> 12) & 0xF), dm),
+                              sycl::fma(d, float((w2 >> 20) & 0xF), dm), sycl::fma(d, float((w2 >> 28) & 0xF), dm),
+                              sycl::fma(d, float((w3 >> 4) & 0xF), dm), sycl::fma(d, float((w3 >> 12) & 0xF), dm),
+                              sycl::fma(d, float((w3 >> 20) & 0xF), dm), sycl::fma(d, float((w3 >> 28) & 0xF), dm));
 
-    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 0)  =
+    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 0) =
         lo0_f.convert<sycl::half, sycl::rounding_mode::automatic>();
-    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 8)  =
+    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 8) =
         lo1_f.convert<sycl::half, sycl::rounding_mode::automatic>();
     *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 16) =
         hi0_f.convert<sycl::half, sycl::rounding_mode::automatic>();
@@ -585,8 +549,7 @@ SYCL_EXTERNAL inline void dequant_q4_0_block_half8_unaligned(const uint8_t * qs,
 
 // AOS wrapper: block_q4_0_unified = { half d; uint8_t qs[16]; }
 // `blk->qs` is at struct offset 2 (half-aligned), so use the unaligned variant.
-SYCL_EXTERNAL inline void dequant_q4_0_block_half8_aos(const block_q4_0_unified * blk,
-                                                       sycl::half *               slm_row) {
+SYCL_EXTERNAL inline void dequant_q4_0_block_half8_aos(const block_q4_0_unified * blk, sycl::half * slm_row) {
     dequant_q4_0_block_half8_unaligned(blk->qs, blk->d, slm_row);
 }
 
@@ -597,9 +560,9 @@ SYCL_EXTERNAL inline void dequant_q4_0_block_half8_soa(const uint8_t *    qs_bas
                                                        int                k_blocks,
                                                        int                block_idx,
                                                        sycl::half *       slm_row) {
-    const int          row_qs_bytes = k_blocks * 16;
-    const uint8_t *    qs           = qs_base + row * row_qs_bytes + block_idx * 16;
-    const sycl::half   d            = d_base[row * k_blocks + block_idx];
+    const int        row_qs_bytes = k_blocks * 16;
+    const uint8_t *  qs           = qs_base + row * row_qs_bytes + block_idx * 16;
+    const sycl::half d            = d_base[row * k_blocks + block_idx];
     dequant_q4_0_block_half8(qs, d, slm_row);
 }
 
@@ -751,9 +714,9 @@ SYCL_EXTERNAL void unified_matmul_xmx_kernel_impl(sycl::nd_item<2>              
             // Mistral Q4_0 and GPT-OSS 20B MXFP4 both have K divisible by 32.
             // Each thread processes entire 32-elem blocks.
             for (int blk_idx = local_linear; blk_idx < BLOCKS_IN_TILE; blk_idx += local_total) {
-                const int     n_off    = blk_idx / BLOCKS_PER_ROW;
-                const int     kb_off   = blk_idx % BLOCKS_PER_ROW;  // which K-block within this n_row
-                const int64_t n_global = n_start + n_off;
+                const int     n_off              = blk_idx / BLOCKS_PER_ROW;
+                const int     kb_off             = blk_idx % BLOCKS_PER_ROW;  // which K-block within this n_row
+                const int64_t n_global           = n_start + n_off;
                 const int     block_in_row_local = static_cast<int>(k_start / UNIFIED_QK4_0) + kb_off;
 
                 sycl::half * slm_row = &slm_weights[n_off * TILE_K + kb_off * UNIFIED_QK4_0];
@@ -763,8 +726,8 @@ SYCL_EXTERNAL void unified_matmul_xmx_kernel_impl(sycl::nd_item<2>              
                         const int64_t block_idx = n_global * k_blocks_per_row + block_in_row_local;
                         dequant_mxfp4_block_half8_aos(&weights_mx[block_idx], slm_row);
                     } else if (use_soa) {
-                        dequant_q4_0_block_half8_soa(qs_base, d_base, n_global, k_blocks_per_row,
-                                                     block_in_row_local, slm_row);
+                        dequant_q4_0_block_half8_soa(qs_base, d_base, n_global, k_blocks_per_row, block_in_row_local,
+                                                     slm_row);
                     } else {
                         const int64_t block_idx = n_global * k_blocks_per_row + block_in_row_local;
                         dequant_q4_0_block_half8_aos(&weights_q4[block_idx], slm_row);
@@ -962,9 +925,9 @@ SYCL_EXTERNAL void unified_matmul_xmx_slm_only_kernel_impl(sycl::nd_item<2>     
 
         if (TILE_K_ALIGNED && k_len == TILE_K) {
             for (int blk_idx = local_linear; blk_idx < BLOCKS_IN_TILE; blk_idx += local_total) {
-                const int     n_off    = blk_idx / BLOCKS_PER_ROW;
-                const int     kb_off   = blk_idx % BLOCKS_PER_ROW;
-                const int64_t n_global = n_start + n_off;
+                const int     n_off              = blk_idx / BLOCKS_PER_ROW;
+                const int     kb_off             = blk_idx % BLOCKS_PER_ROW;
+                const int64_t n_global           = n_start + n_off;
                 const int     block_in_row_local = static_cast<int>(k_start / UNIFIED_QK4_0) + kb_off;
 
                 sycl::half * slm_row = &slm_weights[n_off * TILE_K + kb_off * UNIFIED_QK4_0];
@@ -974,8 +937,8 @@ SYCL_EXTERNAL void unified_matmul_xmx_slm_only_kernel_impl(sycl::nd_item<2>     
                         const int64_t block_idx = n_global * k_blocks_per_row + block_in_row_local;
                         dequant_mxfp4_block_half8_aos(&weights_mx[block_idx], slm_row);
                     } else if (use_soa) {
-                        dequant_q4_0_block_half8_soa(qs_base, d_base, n_global, k_blocks_per_row,
-                                                     block_in_row_local, slm_row);
+                        dequant_q4_0_block_half8_soa(qs_base, d_base, n_global, k_blocks_per_row, block_in_row_local,
+                                                     slm_row);
                     } else {
                         const int64_t block_idx = n_global * k_blocks_per_row + block_in_row_local;
                         dequant_q4_0_block_half8_aos(&weights_q4[block_idx], slm_row);
@@ -3927,11 +3890,11 @@ static bool xmx_detail_enabled() {
 }
 
 struct xmx_detail_stats {
-    uint64_t n_ops         = 0;
-    double   us_total      = 0;  // real kernel wall time
-    double   us_launch     = 0;  // empty kernel wall time
-    double   us_slm_total  = 0;  // slm-only wall time (includes launch)
-    uint64_t sum_wg        = 0;  // cumulative work-group count (grid_m * grid_n)
+    uint64_t n_ops        = 0;
+    double   us_total     = 0;  // real kernel wall time
+    double   us_launch    = 0;  // empty kernel wall time
+    double   us_slm_total = 0;  // slm-only wall time (includes launch)
+    uint64_t sum_wg       = 0;  // cumulative work-group count (grid_m * grid_n)
 };
 
 static thread_local xmx_detail_stats g_xmx_detail_stats;
@@ -4881,18 +4844,20 @@ static alloc_handle pinned_alloc(size_t bytes, sycl::queue & queue, int device_i
         return {};
     }
     alloc_request req{};
-    req.queue                          = &queue;
-    req.device                         = device_id;
-    req.size                           = bytes;
-    req.intent.role                    = alloc_role::COMPUTE;
-    req.intent.category                = runtime_category::COMPUTE;
+    req.queue                               = &queue;
+    req.device                              = device_id;
+    req.size                                = bytes;
+    req.intent.role                         = alloc_role::COMPUTE;
+    req.intent.category                     = runtime_category::COMPUTE;
     req.intent.constraints.must_host_pinned = true;
     alloc_handle h{};
     if (unified_alloc(req, &h) && h.ptr) {
         return h;
     }
-    GGML_LOG_WARN("[UNIFIED-KERNEL] pinned_alloc: allocation failed for %zu bytes, "
-                  "persistent kernel disabled\n", bytes);
+    GGML_LOG_WARN(
+        "[UNIFIED-KERNEL] pinned_alloc: allocation failed for %zu bytes, "
+        "persistent kernel disabled\n",
+        bytes);
     return {};
 }
 
@@ -4903,13 +4868,13 @@ static alloc_handle device_alloc_persistent(size_t bytes, sycl::queue & queue, i
         return {};
     }
     alloc_request req{};
-    req.queue                                 = &queue;
-    req.device                                = device_id;
-    req.size                                  = bytes;
-    req.intent.role                           = alloc_role::COMPUTE;
-    req.intent.category                       = runtime_category::COMPUTE;
-    req.intent.constraints.must_device        = true;
-    req.intent.constraints.prefer_vram_zone   = vram_zone_id::WEIGHT;
+    req.queue                               = &queue;
+    req.device                              = device_id;
+    req.size                                = bytes;
+    req.intent.role                         = alloc_role::COMPUTE;
+    req.intent.category                     = runtime_category::COMPUTE;
+    req.intent.constraints.must_device      = true;
+    req.intent.constraints.prefer_vram_zone = vram_zone_id::WEIGHT;
     alloc_handle h{};
     if (unified_alloc(req, &h) && h.ptr) {
         return h;
@@ -4928,13 +4893,13 @@ static alloc_handle device_alloc_scratch(size_t bytes, sycl::queue & queue, int 
         return {};
     }
     alloc_request req{};
-    req.queue                                 = &queue;
-    req.device                                = device_id;
-    req.size                                  = bytes;
-    req.intent.role                           = alloc_role::COMPUTE;
-    req.intent.category                       = runtime_category::COMPUTE;
-    req.intent.constraints.must_device        = true;
-    req.intent.constraints.prefer_vram_zone   = vram_zone_id::SCRATCH;
+    req.queue                               = &queue;
+    req.device                              = device_id;
+    req.size                                = bytes;
+    req.intent.role                         = alloc_role::COMPUTE;
+    req.intent.category                     = runtime_category::COMPUTE;
+    req.intent.constraints.must_device      = true;
+    req.intent.constraints.prefer_vram_zone = vram_zone_id::SCRATCH;
     alloc_handle h{};
     if (unified_alloc(req, &h) && h.ptr) {
         return h;
@@ -6533,7 +6498,8 @@ template <int BLOCK_SIZE> class PersistentTGKernelImpl {
         char *        dst     = static_cast<char *>(op.output);
 
         if (meta->src_type == 0 && meta->dst_type == 1) {
-            *reinterpret_cast<sycl::half *>(dst + dst_off) = sycl::half(*reinterpret_cast<const float *>(src + src_off));
+            *reinterpret_cast<sycl::half *>(dst + dst_off) =
+                sycl::half(*reinterpret_cast<const float *>(src + src_off));
         } else if (meta->src_type == 1 && meta->dst_type == 0) {
             *reinterpret_cast<float *>(dst + dst_off) =
                 static_cast<float>(*reinterpret_cast<const sycl::half *>(src + src_off));
@@ -7104,7 +7070,7 @@ template <int BLOCK_SIZE> class PersistentTGKernelImpl {
 
         const char * q_base = static_cast<const char *>(op.input);
         const int    q_type = op.q_type;
-        auto load_q = [&](int d) -> float {
+        auto         load_q = [&](int d) -> float {
             const char * ptr = q_base + static_cast<int64_t>(head) * op.q_nb2 + static_cast<int64_t>(d) * op.q_nb0;
             if (q_type == GGML_TYPE_F16) {
                 return static_cast<float>(*reinterpret_cast<const sycl::half *>(ptr));
@@ -7114,14 +7080,29 @@ template <int BLOCK_SIZE> class PersistentTGKernelImpl {
 
         // K/V cache: use byte-based strides for head and position addressing.
         // k_nb0 = element size, k_nb1 = seq stride, k_nb2 = head stride
-        const char *  k_base        = static_cast<const char *>(op.weights);
-        const char *  v_base        = static_cast<const char *>(op.aux);
-        const int64_t k_head_offset = static_cast<int64_t>(kv_head) * op.k_nb2;
-        const int64_t v_head_offset = static_cast<int64_t>(kv_head) * op.v_nb2;
-        const int64_t k_seq_stride  = op.k_nb1;
-        const int64_t v_seq_stride  = op.v_nb1;
-        const int64_t k_elem_stride = op.k_nb0;
-        const int64_t v_elem_stride = op.v_nb0;
+        const char *  k_base         = static_cast<const char *>(op.weights);
+        const char *  v_base         = static_cast<const char *>(op.aux);
+        const int64_t k_head_offset  = static_cast<int64_t>(kv_head) * op.k_nb2;
+        const int64_t v_head_offset  = static_cast<int64_t>(kv_head) * op.v_nb2;
+        const int64_t k_seq_stride   = op.k_nb1;
+        const int64_t v_seq_stride   = op.v_nb1;
+        const int64_t k_elem_stride  = op.k_nb0;
+        const int64_t v_elem_stride  = op.v_nb0;
+        auto          load_attn_mask = [&](int pos) -> float {
+            if (!op.mask || op.mask_type < 0) {
+                return 0.0f;
+            }
+            const int64_t m_ne2  = op.mask_ne2 > 0 ? op.mask_ne2 : 1;
+            const int64_t m_ne3  = op.mask_ne3 > 0 ? op.mask_ne3 : 1;
+            const int64_t m02    = m_ne2 > 0 ? (head % m_ne2) : 0;
+            const int64_t m03    = m_ne3 > 0 ? (0 % m_ne3) : 0;
+            const int64_t off    = m02 * op.mask_nb2 + m03 * op.mask_nb3 + (int64_t) pos * op.mask_nb0;
+            const char *  mask_b = static_cast<const char *>(op.mask);
+            if (op.mask_type == 1) {
+                return static_cast<float>(*reinterpret_cast<const sycl::half *>(mask_b + off));
+            }
+            return *reinterpret_cast<const float *>(mask_b + off);
+        };
 
         float * output_ptr = static_cast<float *>(op.output);
         float * o_head     = output_ptr + head * head_dim;
@@ -7153,7 +7134,7 @@ template <int BLOCK_SIZE> class PersistentTGKernelImpl {
                     }
                     float score = sycl::reduce_over_group(sg, partial, sycl::plus<float>());
                     if (lane_id == 0) {
-                        score *= scale;
+                        score                     = score * scale + load_attn_mask(p);
                         slm_[slm_scores_base + p] = score;
                         local_max                 = sycl::fmax(local_max, score);
                     }
@@ -7166,7 +7147,7 @@ template <int BLOCK_SIZE> class PersistentTGKernelImpl {
                         const float k_val = load_kv_element(k_base, k_pos_offset + d * k_elem_stride, kv_type);
                         score += slm_[d] * k_val;
                     }
-                    score *= scale;
+                    score                     = score * scale + load_attn_mask(p);
                     slm_[slm_scores_base + p] = score;
                     local_max                 = sycl::fmax(local_max, score);
                 }
@@ -7223,7 +7204,7 @@ template <int BLOCK_SIZE> class PersistentTGKernelImpl {
                 }
                 float score = sycl::reduce_over_group(sg, partial, sycl::plus<float>());
                 if (lane_id == 0) {
-                    score *= scale;
+                    score     = score * scale + load_attn_mask(p);
                     local_max = sycl::fmax(local_max, score);
                 }
             }
@@ -7235,7 +7216,7 @@ template <int BLOCK_SIZE> class PersistentTGKernelImpl {
                     const float k_val = load_kv_element(k_base, k_pos_offset + d * k_elem_stride, kv_type);
                     score += slm_[d] * k_val;
                 }
-                score *= scale;
+                score     = score * scale + load_attn_mask(p);
                 local_max = sycl::fmax(local_max, score);
             }
         }
@@ -7253,7 +7234,7 @@ template <int BLOCK_SIZE> class PersistentTGKernelImpl {
                 }
                 float score = sycl::reduce_over_group(sg, partial, sycl::plus<float>());
                 if (lane_id == 0) {
-                    score *= scale;
+                    score = score * scale + load_attn_mask(p);
                     local_sum += sycl::exp(score - global_max);
                 }
             }
@@ -7265,7 +7246,7 @@ template <int BLOCK_SIZE> class PersistentTGKernelImpl {
                     const float k_val = load_kv_element(k_base, k_pos_offset + d * k_elem_stride, kv_type);
                     score += slm_[d] * k_val;
                 }
-                score *= scale;
+                score = score * scale + load_attn_mask(p);
                 local_sum += sycl::exp(score - global_max);
             }
         }
@@ -7282,7 +7263,7 @@ template <int BLOCK_SIZE> class PersistentTGKernelImpl {
                     const float k_val = load_kv_element(k_base, k_pos_offset + dd * k_elem_stride, kv_type);
                     score += slm_[dd] * k_val;
                 }
-                score *= scale;
+                score                      = score * scale + load_attn_mask(p);
                 const float   prob         = sycl::exp(score - global_max) * inv_sum;
                 const int64_t v_pos_offset = v_head_offset + static_cast<int64_t>(p) * v_seq_stride;
                 const float   v_val        = load_kv_element(v_base, v_pos_offset + d * v_elem_stride, kv_type);
@@ -7651,9 +7632,9 @@ void UnifiedKernel::free_persistent_buffers() {
         sync_block_alloc_ = {};
         sync_block_       = nullptr;
     }
-    tile_counter_   = nullptr;
-    barrier_counter_= nullptr;
-    barrier_sense_  = nullptr;
+    tile_counter_    = nullptr;
+    barrier_counter_ = nullptr;
+    barrier_sense_   = nullptr;
     if (d_ops_pool_) {
         (void) unified_free(ops_pool_alloc_);
         ops_pool_alloc_  = {};
@@ -7804,30 +7785,30 @@ void UnifiedKernel::build_dag(const std::vector<std::vector<int>> & successors, 
             dag_completed_alloc_      = {};
         }
         // Allocate new with some headroom
-        const int alloc_ops   = n_ops + 64;
-        const int alloc_edges = n_edges + 128;
-        dag_ready_counter_alloc_  = device_alloc_persistent(alloc_ops * sizeof(int), queue_, device_id_);
-        dag_state_.ready_counter  = static_cast<int *>(dag_ready_counter_alloc_.ptr);
-        dag_tile_claimed_alloc_   = device_alloc_persistent(alloc_ops * sizeof(int), queue_, device_id_);
-        dag_state_.tile_claimed   = static_cast<int *>(dag_tile_claimed_alloc_.ptr);
-        dag_tiles_done_alloc_     = device_alloc_persistent(alloc_ops * sizeof(int), queue_, device_id_);
-        dag_state_.tiles_done     = static_cast<int *>(dag_tiles_done_alloc_.ptr);
-        dag_successor_off_alloc_  = pinned_alloc((alloc_ops + 1) * sizeof(int), queue_, device_id_);
+        const int alloc_ops         = n_ops + 64;
+        const int alloc_edges       = n_edges + 128;
+        dag_ready_counter_alloc_    = device_alloc_persistent(alloc_ops * sizeof(int), queue_, device_id_);
+        dag_state_.ready_counter    = static_cast<int *>(dag_ready_counter_alloc_.ptr);
+        dag_tile_claimed_alloc_     = device_alloc_persistent(alloc_ops * sizeof(int), queue_, device_id_);
+        dag_state_.tile_claimed     = static_cast<int *>(dag_tile_claimed_alloc_.ptr);
+        dag_tiles_done_alloc_       = device_alloc_persistent(alloc_ops * sizeof(int), queue_, device_id_);
+        dag_state_.tiles_done       = static_cast<int *>(dag_tiles_done_alloc_.ptr);
+        dag_successor_off_alloc_    = pinned_alloc((alloc_ops + 1) * sizeof(int), queue_, device_id_);
         dag_state_.successor_offset = static_cast<int *>(dag_successor_off_alloc_.ptr);
-        dag_successor_list_alloc_ = pinned_alloc(std::max(alloc_edges, 1) * sizeof(int), queue_, device_id_);
-        dag_state_.successor_list = static_cast<int *>(dag_successor_list_alloc_.ptr);
-        dag_n_tiles_alloc_        = pinned_alloc(alloc_ops * sizeof(int), queue_, device_id_);
-        dag_state_.n_tiles        = static_cast<int *>(dag_n_tiles_alloc_.ptr);
+        dag_successor_list_alloc_   = pinned_alloc(std::max(alloc_edges, 1) * sizeof(int), queue_, device_id_);
+        dag_state_.successor_list   = static_cast<int *>(dag_successor_list_alloc_.ptr);
+        dag_n_tiles_alloc_          = pinned_alloc(alloc_ops * sizeof(int), queue_, device_id_);
+        dag_state_.n_tiles          = static_cast<int *>(dag_n_tiles_alloc_.ptr);
         if (!dag_state_.successor_offset || !dag_state_.successor_list || !dag_state_.n_tiles) {
             GGML_LOG_WARN("[PERSISTENT-TG] DAG pinned_alloc failed \u2014 persistent DAG kernel disabled\n");
             dag_pool_n_ops_   = 0;
             dag_pool_n_edges_ = 0;
             return;
         }
-        dag_completed_alloc_      = device_alloc_persistent(1 * sizeof(int), queue_, device_id_);
+        dag_completed_alloc_       = device_alloc_persistent(1 * sizeof(int), queue_, device_id_);
         dag_state_.completed_count = static_cast<int *>(dag_completed_alloc_.ptr);
-        dag_pool_n_ops_   = alloc_ops;
-        dag_pool_n_edges_ = alloc_edges;
+        dag_pool_n_ops_            = alloc_ops;
+        dag_pool_n_edges_          = alloc_edges;
         // Track new DAG device bytes (3 arrays of alloc_ops + 1 completed_count)
         if (device_id_ >= 0) {
             const size_t new_dag_bytes = (3 * alloc_ops + 1) * sizeof(int);
@@ -7963,28 +7944,33 @@ void UnifiedKernel::build_phase_schedule(const std::vector<std::vector<int>> & s
     // Allocate host-pinned arrays (grow-on-demand; kernel reads via PCIe zero-copy)
     if (n_ops > phase_pool_n_ops_ || n_phases > phase_pool_n_phases_) {
         if (phase_allocated_) {
-            (void) unified_free(phase_entries_alloc_);  phase_entries_alloc_ = {};
-            (void) unified_free(phase_offset_alloc_);   phase_offset_alloc_  = {};
-            (void) unified_free(phase_tiles_alloc_);    phase_tiles_alloc_   = {};
+            (void) unified_free(phase_entries_alloc_);
+            phase_entries_alloc_ = {};
+            (void) unified_free(phase_offset_alloc_);
+            phase_offset_alloc_ = {};
+            (void) unified_free(phase_tiles_alloc_);
+            phase_tiles_alloc_ = {};
             if (phase_schedule_.phase_type) {
-                (void) unified_free(phase_type_alloc_); phase_type_alloc_ = {};
+                (void) unified_free(phase_type_alloc_);
+                phase_type_alloc_ = {};
             }
         }
-        const int    alloc_ops              = n_ops + 64;
-        const int    alloc_phases           = n_phases + 16;
-        const size_t phase_entries_bytes    = alloc_ops * sizeof(DevicePhaseEntry);
-        const size_t phase_offset_bytes     = (alloc_phases + 1) * sizeof(int);
-        const size_t phase_tiles_bytes      = alloc_phases * sizeof(int);
-        const size_t phase_type_bytes       = alloc_phases * sizeof(int);
-        phase_entries_alloc_     = pinned_alloc(phase_entries_bytes, queue_, device_id_);
-        phase_offset_alloc_      = pinned_alloc(phase_offset_bytes, queue_, device_id_);
-        phase_tiles_alloc_       = pinned_alloc(phase_tiles_bytes, queue_, device_id_);
-        phase_type_alloc_        = pinned_alloc(phase_type_bytes, queue_, device_id_);
-        phase_schedule_.entries      = static_cast<DevicePhaseEntry *>(phase_entries_alloc_.ptr);
-        phase_schedule_.phase_offset = static_cast<int *>(phase_offset_alloc_.ptr);
-        phase_schedule_.phase_tiles  = static_cast<int *>(phase_tiles_alloc_.ptr);
-        phase_schedule_.phase_type   = static_cast<int *>(phase_type_alloc_.ptr);
-        if (!phase_schedule_.entries || !phase_schedule_.phase_offset || !phase_schedule_.phase_tiles || !phase_schedule_.phase_type) {
+        const int    alloc_ops           = n_ops + 64;
+        const int    alloc_phases        = n_phases + 16;
+        const size_t phase_entries_bytes = alloc_ops * sizeof(DevicePhaseEntry);
+        const size_t phase_offset_bytes  = (alloc_phases + 1) * sizeof(int);
+        const size_t phase_tiles_bytes   = alloc_phases * sizeof(int);
+        const size_t phase_type_bytes    = alloc_phases * sizeof(int);
+        phase_entries_alloc_             = pinned_alloc(phase_entries_bytes, queue_, device_id_);
+        phase_offset_alloc_              = pinned_alloc(phase_offset_bytes, queue_, device_id_);
+        phase_tiles_alloc_               = pinned_alloc(phase_tiles_bytes, queue_, device_id_);
+        phase_type_alloc_                = pinned_alloc(phase_type_bytes, queue_, device_id_);
+        phase_schedule_.entries          = static_cast<DevicePhaseEntry *>(phase_entries_alloc_.ptr);
+        phase_schedule_.phase_offset     = static_cast<int *>(phase_offset_alloc_.ptr);
+        phase_schedule_.phase_tiles      = static_cast<int *>(phase_tiles_alloc_.ptr);
+        phase_schedule_.phase_type       = static_cast<int *>(phase_type_alloc_.ptr);
+        if (!phase_schedule_.entries || !phase_schedule_.phase_offset || !phase_schedule_.phase_tiles ||
+            !phase_schedule_.phase_type) {
             GGML_LOG_WARN("[PERSISTENT-TG] Phase pinned_alloc failed \u2014 persistent phase kernel disabled\n");
             phase_pool_n_ops_    = 0;
             phase_pool_n_phases_ = 0;
@@ -8194,41 +8180,44 @@ void UnifiedKernel::build_role_schedule(const std::vector<DeviceOperation> & hos
         // Free old allocations
         if (role_allocated_) {
             if (role_schedule_.elem_segments) {
-                (void) unified_free(role_elem_alloc_);  role_elem_alloc_ = {};
+                (void) unified_free(role_elem_alloc_);
+                role_elem_alloc_ = {};
             }
             if (role_schedule_.matmul_segments) {
-                (void) unified_free(role_matmul_alloc_);  role_matmul_alloc_ = {};
+                (void) unified_free(role_matmul_alloc_);
+                role_matmul_alloc_ = {};
             }
             // sync_flags is the base of a single contiguous device allocation;
             // role_tile_counter and barrier counters are offsets within it.
             if (role_schedule_.sync_flags) {
-                (void) unified_free(role_sync_alloc_);  role_sync_alloc_ = {};
+                (void) unified_free(role_sync_alloc_);
+                role_sync_alloc_ = {};
             }
             // Barrier counters are within the sync_flags allocation (contiguous block)
             // Actually let's use a single allocation for all sync ints
         }
 
         // Allocate segments
-        const int    alloc_elem          = n_elem_segs + 16;
-        const int    alloc_matmul        = n_matmul_segs + 16;
-        const int    alloc_sync          = std::max(n_sync, 1) + 8;
-        const size_t role_elem_bytes     = alloc_elem * sizeof(RoleSegment);
-        const size_t role_matmul_bytes   = alloc_matmul * sizeof(RoleSegment);
+        const int    alloc_elem        = n_elem_segs + 16;
+        const int    alloc_matmul      = n_matmul_segs + 16;
+        const int    alloc_sync        = std::max(n_sync, 1) + 8;
+        const size_t role_elem_bytes   = alloc_elem * sizeof(RoleSegment);
+        const size_t role_matmul_bytes = alloc_matmul * sizeof(RoleSegment);
 
-        role_elem_alloc_   = pinned_alloc(role_elem_bytes, queue_, device_id_);
-        role_matmul_alloc_ = pinned_alloc(role_matmul_bytes, queue_, device_id_);
-        role_schedule_.elem_segments    = static_cast<RoleSegment *>(role_elem_alloc_.ptr);
-        role_schedule_.matmul_segments  = static_cast<RoleSegment *>(role_matmul_alloc_.ptr);
+        role_elem_alloc_               = pinned_alloc(role_elem_bytes, queue_, device_id_);
+        role_matmul_alloc_             = pinned_alloc(role_matmul_bytes, queue_, device_id_);
+        role_schedule_.elem_segments   = static_cast<RoleSegment *>(role_elem_alloc_.ptr);
+        role_schedule_.matmul_segments = static_cast<RoleSegment *>(role_matmul_alloc_.ptr);
 
         // Single allocation for all sync/counter/barrier ints.
         // Each atomic counter/sense pair is padded to 64 bytes (16 ints) to avoid
         // false sharing on GPU L2 cache lines. Without padding, the elem and matmul
         // barrier counters share a cache line, causing stale reads in spin-wait loops
         // and barrier malfunction with 3+ elementwise WGs.
-        constexpr int CL_INTS    = 16;                            // 64 bytes / 4 bytes per int
-        const int     total_ints = alloc_sync * 2 + CL_INTS * 5;  // sync_flags + 5 padded slots
-        role_sync_alloc_  = device_alloc_persistent(total_ints * sizeof(int), queue_, device_id_);
-        int * sync_block  = static_cast<int *>(role_sync_alloc_.ptr);
+        constexpr int CL_INTS             = 16;                            // 64 bytes / 4 bytes per int
+        const int     total_ints          = alloc_sync * 2 + CL_INTS * 5;  // sync_flags + 5 padded slots
+        role_sync_alloc_                  = device_alloc_persistent(total_ints * sizeof(int), queue_, device_id_);
+        int * sync_block                  = static_cast<int *>(role_sync_alloc_.ptr);
         role_schedule_.sync_flags         = sync_block;                                 // [0..2*alloc_sync)
         role_schedule_.role_tile_counter  = sync_block + alloc_sync * 2;                // CL-aligned slot 0
         role_schedule_.elem_barrier_cnt   = sync_block + alloc_sync * 2 + CL_INTS;      // CL-aligned slot 1
@@ -9806,14 +9795,14 @@ static void micro_submit_strided_copy(sycl::queue & q, const DeviceOperation * d
     const int               n_wgs      = (n_elements + WG_SIZE - 1) / WG_SIZE;
 
     // Structural metadata is stable across tokens — capture by value
-    const int64_t ne0       = op_rec.strided_copy_meta.ne[0];
-    const int64_t ne1       = op_rec.strided_copy_meta.ne[1] > 0 ? op_rec.strided_copy_meta.ne[1] : 1;
-    const int64_t ne2       = op_rec.strided_copy_meta.ne[2] > 0 ? op_rec.strided_copy_meta.ne[2] : 1;
-    const int64_t ne3       = op_rec.strided_copy_meta.ne[3] > 0 ? op_rec.strided_copy_meta.ne[3] : 1;
-    const int64_t nb0       = op_rec.strided_copy_meta.nb[0];
-    const int64_t nb1       = op_rec.strided_copy_meta.nb[1];
-    const int64_t nb2       = op_rec.strided_copy_meta.nb[2];
-    const int64_t nb3       = op_rec.strided_copy_meta.nb[3];
+    const int64_t ne0      = op_rec.strided_copy_meta.ne[0];
+    const int64_t ne1      = op_rec.strided_copy_meta.ne[1] > 0 ? op_rec.strided_copy_meta.ne[1] : 1;
+    const int64_t ne2      = op_rec.strided_copy_meta.ne[2] > 0 ? op_rec.strided_copy_meta.ne[2] : 1;
+    const int64_t ne3      = op_rec.strided_copy_meta.ne[3] > 0 ? op_rec.strided_copy_meta.ne[3] : 1;
+    const int64_t nb0      = op_rec.strided_copy_meta.nb[0];
+    const int64_t nb1      = op_rec.strided_copy_meta.nb[1];
+    const int64_t nb2      = op_rec.strided_copy_meta.nb[2];
+    const int64_t nb3      = op_rec.strided_copy_meta.nb[3];
     const int32_t src_type = op_rec.strided_copy_meta.src_type;
     const int32_t dst_type = op_rec.strided_copy_meta.dst_type;
     const int32_t dst_size = op_rec.strided_copy_meta.dst_size;
@@ -10116,7 +10105,7 @@ static void micro_submit_attention(sycl::queue &           q,
 
                 const char * q_base = static_cast<const char *>(op.input);
                 const int    q_type = op.q_type;
-                auto load_q = [&](int d) -> float {
+                auto         load_q = [&](int d) -> float {
                     const char * ptr =
                         q_base + static_cast<int64_t>(head) * op.q_nb2 + static_cast<int64_t>(d) * op.q_nb0;
                     if (q_type == GGML_TYPE_F16) {
@@ -10134,6 +10123,21 @@ static void micro_submit_attention(sycl::queue &           q,
                 const int64_t v_seq_stride  = op.v_nb1;
                 const int64_t k_elem_stride = op.k_nb0;
                 const int64_t v_elem_stride = op.v_nb0;
+                auto          load_mask     = [&](int pos) -> float {
+                    if (!op.mask || op.mask_type < 0) {
+                        return 0.0f;
+                    }
+                    const int64_t m_ne2  = op.mask_ne2 > 0 ? op.mask_ne2 : 1;
+                    const int64_t m_ne3  = op.mask_ne3 > 0 ? op.mask_ne3 : 1;
+                    const int64_t m02    = m_ne2 > 0 ? (head % m_ne2) : 0;
+                    const int64_t m03    = m_ne3 > 0 ? (0 % m_ne3) : 0;
+                    const int64_t off    = m02 * op.mask_nb2 + m03 * op.mask_nb3 + (int64_t) pos * op.mask_nb0;
+                    const char *  mask_b = static_cast<const char *>(op.mask);
+                    if (op.mask_type == 1) {
+                        return static_cast<float>(*reinterpret_cast<const sycl::half *>(mask_b + off));
+                    }
+                    return *reinterpret_cast<const float *>(mask_b + off);
+                };
 
                 float * output_ptr = static_cast<float *>(op.output);
                 float * o_head     = output_ptr + head * head_dim;
@@ -10171,7 +10175,7 @@ static void micro_submit_attention(sycl::queue &           q,
                             }
                             float score = sycl::reduce_over_group(sg, partial, sycl::plus<float>());
                             if (lane_id == 0) {
-                                score *= scale;
+                                score                    = score * scale + load_mask(p);
                                 slm[slm_scores_base + p] = score;
                                 local_max                = sycl::fmax(local_max, score);
                             }
@@ -10184,7 +10188,7 @@ static void micro_submit_attention(sycl::queue &           q,
                                 const float k_val = load_kv(k_base, k_pos_offset + d * k_elem_stride);
                                 score += slm[d] * k_val;
                             }
-                            score *= scale;
+                            score                    = score * scale + load_mask(p);
                             slm[slm_scores_base + p] = score;
                             local_max                = sycl::fmax(local_max, score);
                         }
@@ -10241,7 +10245,7 @@ static void micro_submit_attention(sycl::queue &           q,
                         }
                         float score = sycl::reduce_over_group(sg, partial, sycl::plus<float>());
                         if (lane_id == 0) {
-                            score *= scale;
+                            score     = score * scale + load_mask(p);
                             local_max = sycl::fmax(local_max, score);
                         }
                     }
@@ -10253,7 +10257,7 @@ static void micro_submit_attention(sycl::queue &           q,
                             const float k_val = load_kv(k_base, k_pos_offset + d * k_elem_stride);
                             score += slm[d] * k_val;
                         }
-                        score *= scale;
+                        score     = score * scale + load_mask(p);
                         local_max = sycl::fmax(local_max, score);
                     }
                 }
@@ -10271,7 +10275,7 @@ static void micro_submit_attention(sycl::queue &           q,
                         }
                         float score = sycl::reduce_over_group(sg, partial, sycl::plus<float>());
                         if (lane_id == 0) {
-                            score *= scale;
+                            score = score * scale + load_mask(p);
                             local_sum += sycl::exp(score - global_max_fb);
                         }
                     }
@@ -10283,7 +10287,7 @@ static void micro_submit_attention(sycl::queue &           q,
                             const float k_val = load_kv(k_base, k_pos_offset + d * k_elem_stride);
                             score += slm[d] * k_val;
                         }
-                        score *= scale;
+                        score = score * scale + load_mask(p);
                         local_sum += sycl::exp(score - global_max_fb);
                     }
                 }
@@ -10300,7 +10304,7 @@ static void micro_submit_attention(sycl::queue &           q,
                             const float k_val = load_kv(k_base, k_pos_offset + dd * k_elem_stride);
                             score += slm[dd] * k_val;
                         }
-                        score *= scale;
+                        score                      = score * scale + load_mask(p);
                         const float   prob         = sycl::exp(score - global_max_fb) * inv_sum_fb;
                         const int64_t v_pos_offset = v_head_offset + static_cast<int64_t>(p) * v_seq_stride;
                         const float   v_val        = load_kv(v_base, v_pos_offset + d * v_elem_stride);
@@ -10372,8 +10376,8 @@ void UnifiedKernel::record_micro_graph() {
     // zeroing all tile counters before each graph replay, we increment the
     // generation and kernels compute their tile range as [gen*n_tiles, (gen+1)*n_tiles).
     if (!micro_generation_) {
-        micro_gen_alloc_   = pinned_alloc(sizeof(int), queue_, device_id_);
-        micro_generation_  = static_cast<int *>(micro_gen_alloc_.ptr);
+        micro_gen_alloc_  = pinned_alloc(sizeof(int), queue_, device_id_);
+        micro_generation_ = static_cast<int *>(micro_gen_alloc_.ptr);
         if (micro_generation_) {
             *micro_generation_ = -1;  // First ++generation yields 0, matching zeroed counters
         }
@@ -11064,9 +11068,9 @@ void UnifiedKernel::execute_persistent_phased(phase_callback_t on_matmul_complet
                 ops_pool_alloc_ = {};
             }
             const size_t ops_pool_bytes = phase.count * sizeof(DeviceOperation);
-            ops_pool_alloc_ = pinned_alloc(ops_pool_bytes, queue_, device_id_);
-            d_ops_pool_     = ops_pool_alloc_.ptr;
-            d_ops_pool_size_ = d_ops_pool_ ? phase.count : 0;
+            ops_pool_alloc_             = pinned_alloc(ops_pool_bytes, queue_, device_id_);
+            d_ops_pool_                 = ops_pool_alloc_.ptr;
+            d_ops_pool_size_            = d_ops_pool_ ? phase.count : 0;
         }
         DeviceOperation * d_ops = static_cast<DeviceOperation *>(d_ops_pool_);
         std::memcpy(d_ops, &host_ops[phase.start], phase.count * sizeof(DeviceOperation));
@@ -11216,18 +11220,18 @@ void UnifiedKernel::launch_persistent_kernel(bool build_only) {
             dst.mask    = src.mask;
 
             // Patch mutable stride fields
-            dst.q_nb0 = src.q_nb0;
-            dst.q_nb1 = src.q_nb1;
-            dst.q_nb2 = src.q_nb2;
-            dst.q_nb3 = src.q_nb3;
-            dst.k_nb0 = src.k_nb0;
-            dst.k_nb1 = src.k_nb1;
-            dst.k_nb2 = src.k_nb2;
-            dst.k_nb3 = src.k_nb3;
-            dst.v_nb0 = src.v_nb0;
-            dst.v_nb1 = src.v_nb1;
-            dst.v_nb2 = src.v_nb2;
-            dst.v_nb3 = src.v_nb3;
+            dst.q_nb0  = src.q_nb0;
+            dst.q_nb1  = src.q_nb1;
+            dst.q_nb2  = src.q_nb2;
+            dst.q_nb3  = src.q_nb3;
+            dst.k_nb0  = src.k_nb0;
+            dst.k_nb1  = src.k_nb1;
+            dst.k_nb2  = src.k_nb2;
+            dst.k_nb3  = src.k_nb3;
+            dst.v_nb0  = src.v_nb0;
+            dst.v_nb1  = src.v_nb1;
+            dst.v_nb2  = src.v_nb2;
+            dst.v_nb3  = src.v_nb3;
             dst.q_type = src.q_type;
 
             // Patch mutable dimension/scalar fields
@@ -11773,11 +11777,15 @@ void UnifiedKernel::launch_persistent_kernel(bool build_only) {
         const int final_n_ops    = phase_schedule_.total_ops;
         if (final_n_ops > phase_pool_n_ops_ || final_n_phases > phase_pool_n_phases_) {
             // Grow host-pinned arrays (rare: only if fusion increased beyond initial allocation)
-            (void) unified_free(phase_entries_alloc_);  phase_entries_alloc_ = {};
-            (void) unified_free(phase_offset_alloc_);   phase_offset_alloc_  = {};
-            (void) unified_free(phase_tiles_alloc_);    phase_tiles_alloc_   = {};
+            (void) unified_free(phase_entries_alloc_);
+            phase_entries_alloc_ = {};
+            (void) unified_free(phase_offset_alloc_);
+            phase_offset_alloc_ = {};
+            (void) unified_free(phase_tiles_alloc_);
+            phase_tiles_alloc_ = {};
             if (phase_schedule_.phase_type) {
-                (void) unified_free(phase_type_alloc_); phase_type_alloc_ = {};
+                (void) unified_free(phase_type_alloc_);
+                phase_type_alloc_ = {};
             }
             const int    alloc_ops           = final_n_ops + 64;
             const int    alloc_phases        = final_n_phases + 16;
@@ -11785,16 +11793,16 @@ void UnifiedKernel::launch_persistent_kernel(bool build_only) {
             const size_t phase_offset_bytes  = (alloc_phases + 1) * sizeof(int);
             const size_t phase_tiles_bytes   = alloc_phases * sizeof(int);
             const size_t phase_type_bytes    = alloc_phases * sizeof(int);
-            phase_entries_alloc_ = pinned_alloc(phase_entries_bytes, queue_, device_id_);
-            phase_offset_alloc_  = pinned_alloc(phase_offset_bytes, queue_, device_id_);
-            phase_tiles_alloc_   = pinned_alloc(phase_tiles_bytes, queue_, device_id_);
-            phase_type_alloc_    = pinned_alloc(phase_type_bytes, queue_, device_id_);
-            phase_schedule_.entries      = static_cast<DevicePhaseEntry *>(phase_entries_alloc_.ptr);
-            phase_schedule_.phase_offset = static_cast<int *>(phase_offset_alloc_.ptr);
-            phase_schedule_.phase_tiles  = static_cast<int *>(phase_tiles_alloc_.ptr);
-            phase_schedule_.phase_type   = static_cast<int *>(phase_type_alloc_.ptr);
-            phase_pool_n_ops_    = alloc_ops;
-            phase_pool_n_phases_ = alloc_phases;
+            phase_entries_alloc_             = pinned_alloc(phase_entries_bytes, queue_, device_id_);
+            phase_offset_alloc_              = pinned_alloc(phase_offset_bytes, queue_, device_id_);
+            phase_tiles_alloc_               = pinned_alloc(phase_tiles_bytes, queue_, device_id_);
+            phase_type_alloc_                = pinned_alloc(phase_type_bytes, queue_, device_id_);
+            phase_schedule_.entries          = static_cast<DevicePhaseEntry *>(phase_entries_alloc_.ptr);
+            phase_schedule_.phase_offset     = static_cast<int *>(phase_offset_alloc_.ptr);
+            phase_schedule_.phase_tiles      = static_cast<int *>(phase_tiles_alloc_.ptr);
+            phase_schedule_.phase_type       = static_cast<int *>(phase_type_alloc_.ptr);
+            phase_pool_n_ops_                = alloc_ops;
+            phase_pool_n_phases_             = alloc_phases;
         }
 
         // Copy to host-pinned buffers (no queue memcpy needed, kernel reads via PCIe zero-copy)
@@ -11817,9 +11825,9 @@ void UnifiedKernel::launch_persistent_kernel(bool build_only) {
             ops_pool_alloc_ = {};
         }
         const size_t ops_pool_bytes = n_ops_device * sizeof(DeviceOperation);
-        ops_pool_alloc_ = pinned_alloc(ops_pool_bytes, queue_, device_id_);
-        d_ops_pool_     = ops_pool_alloc_.ptr;
-        d_ops_pool_size_ = d_ops_pool_ ? n_ops_device : 0;
+        ops_pool_alloc_             = pinned_alloc(ops_pool_bytes, queue_, device_id_);
+        d_ops_pool_                 = ops_pool_alloc_.ptr;
+        d_ops_pool_size_            = d_ops_pool_ ? n_ops_device : 0;
     }
     DeviceOperation * d_ops = static_cast<DeviceOperation *>(d_ops_pool_);
     std::memcpy(d_ops, host_ops_.data(), host_ops_.size() * sizeof(DeviceOperation));
@@ -12040,7 +12048,7 @@ void UnifiedKernel::launch_persistent_kernel(bool build_only) {
             const int alloc_size = n_final_phases + 16;
             light_flags_alloc_   = device_alloc_persistent(alloc_size * sizeof(int), queue_, device_id_);
             light_flags_         = static_cast<int *>(light_flags_alloc_.ptr);
-            light_flags_size_ = alloc_size;
+            light_flags_size_    = alloc_size;
             // Track new allocation
             if (device_id_ >= 0) {
                 const size_t light_bytes = alloc_size * sizeof(int);
@@ -12394,9 +12402,9 @@ void UnifiedKernel::launch_persistent_kernel_async() {
             ops_pool_alloc_ = {};
         }
         const size_t ops_pool_bytes = n_ops_device * sizeof(DeviceOperation);
-        ops_pool_alloc_ = pinned_alloc(ops_pool_bytes, queue_, device_id_);
-        d_ops_pool_     = ops_pool_alloc_.ptr;
-        d_ops_pool_size_ = d_ops_pool_ ? n_ops_device : 0;
+        ops_pool_alloc_             = pinned_alloc(ops_pool_bytes, queue_, device_id_);
+        d_ops_pool_                 = ops_pool_alloc_.ptr;
+        d_ops_pool_size_            = d_ops_pool_ ? n_ops_device : 0;
     }
     DeviceOperation * d_ops = static_cast<DeviceOperation *>(d_ops_pool_);
     std::memcpy(d_ops, host_ops.data(), host_ops.size() * sizeof(DeviceOperation));
