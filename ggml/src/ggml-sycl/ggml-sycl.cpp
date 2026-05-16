@@ -39871,6 +39871,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
             if (g_moe_precomputed_mmid_skip.erase(dst) > 0) {
                 GGML_SYCL_DEBUG("[MOE-PAIR] Skipping precomputed MUL_MAT_ID %s\n", src0->name ? src0->name : "?");
+                if (g_moe_profile_enabled) {
+                    g_moe_profile.moe_gpu_compute_done();
+                    g_moe_profile.moe_compute_done(0, 0);
+                }
                 return;
             }
 
@@ -40235,6 +40239,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     }
                 }
 
+                auto record_pair_profile = [&](int64_t n_gpu_entries) {
+                    if (g_moe_profile_enabled) {
+                        g_moe_profile.moe_gpu_compute_done();
+                        g_moe_profile.moe_compute_done(0, static_cast<int>(n_gpu_entries));
+                    }
+                };
+
                 const bool can_fuse_glu =
                     pair.glu_dst != nullptr &&
                     (pair.glu_op == GGML_GLU_OP_SWIGLU || pair.glu_op == GGML_GLU_OP_SWIGLU_OAI) &&
@@ -40357,6 +40368,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 ggml_sycl_moe_layer_executor_skip_allowed()) {
                                 g_moe_precomputed_mmid_skip.insert(pair.down_dst);
                             }
+                            const int64_t matrices_executed = ok_down ? 3 : 2;
+                            record_pair_profile(matrices_executed *
+                                                static_cast<int64_t>(plan.current.expert_ids.size()));
                             return true;
                         }
                     }
@@ -40375,6 +40389,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 (long long) n_ids_pair, ctx.device);
                     }
                     g_moe_precomputed_mmid_skip.insert(partner_dst);
+                    record_pair_profile(2 * static_cast<int64_t>(plan.current.expert_ids.size()));
                 }
                 return ok ? true : reject_pair("dispatch-false");
             };
