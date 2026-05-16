@@ -3273,8 +3273,7 @@ static void ggml_sycl_abort_unresolved_device_expert(const ggml_tensor *      sr
 }
 
 static bool ggml_sycl_moe_route_is_layout_miss(const moe_expert_route & route) {
-    return route.kind == moe_expert_route_kind::UNAVAILABLE && route.reason == expert_resolve_reason::LAYOUT_MISMATCH &&
-           route.requested_layout != GGML_LAYOUT_AOS;
+    return route.kind == moe_expert_route_kind::UNAVAILABLE && route.reason == expert_resolve_reason::LAYOUT_MISMATCH;
 }
 
 struct legacy_expert_resolve_result {
