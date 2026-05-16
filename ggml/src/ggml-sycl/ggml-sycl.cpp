@@ -12734,6 +12734,28 @@ static bool ggml_sycl_xmx_moe_capable_for_device(int device_id) {
 #endif
 }
 
+enum class ggml_sycl_xmx_moe_policy {
+    disabled,
+    diagnostic_default,
+    diagnostic_forced,
+};
+
+static ggml_sycl_xmx_moe_policy ggml_sycl_get_xmx_moe_policy() {
+    static const ggml_sycl_xmx_moe_policy policy = [] {
+        const char * env = std::getenv("GGML_SYCL_XMX_MOE");
+        if (!env) {
+            return ggml_sycl_xmx_moe_policy::diagnostic_default;
+        }
+        return std::atoi(env) != 0 ? ggml_sycl_xmx_moe_policy::diagnostic_forced :
+                                     ggml_sycl_xmx_moe_policy::disabled;
+    }();
+    return policy;
+}
+
+static bool ggml_sycl_xmx_moe_forced() {
+    return ggml_sycl_get_xmx_moe_policy() == ggml_sycl_xmx_moe_policy::diagnostic_forced;
+}
+
 static layout_mode ggml_sycl_select_moe_gpu_layout(const ggml_tensor * src0, int device, const char ** reason_out) {
     const char * reason = "default-policy";
     layout_mode  target = layout_policy::get_with_override(src0->type, ggml_sycl_get_tensor_usage(src0), device);
@@ -36980,18 +37002,27 @@ static bool try_xmx_sorted_moe(ggml_backend_sycl_context & ctx,
         if (g_ggml_sycl_debug || trace_enabled != 0) {
             static std::atomic<int> reject_log{ 0 };
             if (reject_log.fetch_add(1, std::memory_order_relaxed) < 128) {
-                fprintf(stderr, "[XMX-MOE-REJECT] tensor=%s device=%d reason=%s\n",
-                        src0 && src0->name ? src0->name : "?", ctx.device, reason ? reason : "unknown");
+                fprintf(stderr,
+                        "[XMX-MOE-REJECT] tensor=%s type=%s device=%d reason=%s "
+                        "src0=[%lld,%lld,%lld,%lld] src1=[%lld,%lld,%lld,%lld] ids=[%lld,%lld,%lld,%lld]\n",
+                        src0 && src0->name ? src0->name : "?", src0 ? ggml_type_name(src0->type) : "null",
+                        ctx.device, reason ? reason : "unknown", src0 ? (long long) src0->ne[0] : 0,
+                        src0 ? (long long) src0->ne[1] : 0, src0 ? (long long) src0->ne[2] : 0,
+                        src0 ? (long long) src0->ne[3] : 0, src1 ? (long long) src1->ne[0] : 0,
+                        src1 ? (long long) src1->ne[1] : 0, src1 ? (long long) src1->ne[2] : 0,
+                        src1 ? (long long) src1->ne[3] : 0, ids ? (long long) ids->ne[0] : 0,
+                        ids ? (long long) ids->ne[1] : 0, ids ? (long long) ids->ne[2] : 0,
+                        ids ? (long long) ids->ne[3] : 0);
             }
         }
         return false;
     };
 
-    static bool enabled = getenv("GGML_SYCL_XMX_MOE") != nullptr;
-
-    if (!enabled) {
-        return reject_xmx("disabled");
+    const ggml_sycl_xmx_moe_policy xmx_policy = ggml_sycl_get_xmx_moe_policy();
+    if (xmx_policy == ggml_sycl_xmx_moe_policy::disabled) {
+        return reject_xmx("env-disabled");
     }
+    const bool xmx_forced = xmx_policy == ggml_sycl_xmx_moe_policy::diagnostic_forced;
 
     static bool      fused_enabled     = getenv("GGML_SYCL_XMX_MOE_FUSED") != nullptr;
     static const int xmx_trace_enabled = [] {
@@ -37006,7 +37037,7 @@ static bool try_xmx_sorted_moe(ggml_backend_sycl_context & ctx,
     };
     // Enable XMX tile-aligned layout for MXFP4 MoE (requires GGML_SYCL_XMX_MOE_TILED=1)
     const bool tiled_enabled = ggml_sycl_xmx_tiled_enabled_for_device(ctx.device);
-    GGML_SYCL_DEBUG("[XMX-DEBUG] XMX MoE: enabled=%d fused_enabled=%d tiled_enabled=%d\n", enabled ? 1 : 0,
+    GGML_SYCL_DEBUG("[XMX-DEBUG] XMX MoE: forced=%d fused_enabled=%d tiled_enabled=%d\n", xmx_forced ? 1 : 0,
                     fused_enabled ? 1 : 0, tiled_enabled ? 1 : 0);
     // Get XMX capabilities from cached device info
     auto & caps = ggml_sycl_info().devices[ctx.device].xmx_caps;
@@ -37063,6 +37094,31 @@ static bool try_xmx_sorted_moe(ggml_backend_sycl_context & ctx,
         GGML_SYCL_DEBUG("[XMX MoE] MXFP4 requires XMX tiled layout, skipping XMX path\n");
         return reject_xmx("tiled-layout-required");
     }
+
+    const int64_t in_dim    = src0->ne[0];
+    const int64_t out_dim   = src0->ne[1];
+    const int64_t n_experts = src0->ne[2];
+    const int64_t n_tokens  = src1->ne[2];
+    const int64_t ne11      = src1->ne[1];
+    const int64_t n_ids     = ids->ne[0];
+    if (in_dim <= 0 || out_dim <= 0 || n_experts <= 0 || n_tokens <= 0 || n_ids <= 0) {
+        return reject_xmx("shape-empty");
+    }
+    if (ne11 <= 0 || (ne11 != 1 && ne11 != n_ids)) {
+        return reject_xmx("broadcast-shape");
+    }
+    if ((in_dim % 32) != 0) {
+        return reject_xmx("tile-shape-in-dim");
+    }
+    const int64_t total_pairs  = n_tokens * n_ids;
+    const int64_t n_input_rows = n_tokens * ne11;
+    if (total_pairs <= 0 || n_input_rows <= 0) {
+        return reject_xmx("shape-overflow");
+    }
+    if (!xmx_forced) {
+        return reject_xmx("diagnostic-only-current-sorted-wrapper");
+    }
+
     sycl::queue *              stream = ctx.stream();
     ggml_sycl::unified_cache * cache =
         ggml_sycl::unified_cache_enabled() ? ggml_sycl::get_unified_cache(*stream) : nullptr;
@@ -37221,16 +37277,8 @@ static bool try_xmx_sorted_moe(ggml_backend_sycl_context & ctx,
 
     // ids: [n_ids, n_tokens] - expert assignments (I32)
     // dst: [out_dim, n_ids, n_tokens] - output (F32)
-    const int64_t in_dim    = src0->ne[0];
-    const int64_t out_dim   = src0->ne[1];
-    const int64_t n_experts = src0->ne[2];
-    const int64_t n_tokens  = src1->ne[2];  // FIX: was src1->ne[1], should be ne[2] like ESIMD path
-    const int64_t ne11      = src1->ne[1];  // Broadcast dimension for input (1 or n_ids)
-    const int64_t n_ids     = ids->ne[0];
     GGML_ASSERT(ne11 > 0 && "MoE input broadcast dimension ne11 must be positive");
     GGML_ASSERT((ne11 == 1 || ne11 == n_ids) && "MoE input broadcast dimension ne11 must be 1 or n_ids");
-    const int64_t total_pairs  = n_tokens * n_ids;
-    const int64_t n_input_rows = n_tokens * ne11;  // Total input rows accounting for broadcast
     GGML_SYCL_DEBUG("[XMX MoE] tokens=%ld, ids=%ld, experts=%ld, in_dim=%ld, out_dim=%ld\n", (long) n_tokens,
                     (long) n_ids, (long) n_experts, (long) in_dim, (long) out_dim);
     GGML_SYCL_DEBUG("[XMX MoE] src1 tensor: ne=[%ld,%ld,%ld,%ld] nb=[%ld,%ld,%ld,%ld]\n", (long) src1->ne[0],
@@ -38878,10 +38926,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         required = ggml_sycl_adjust_layout_for_tensor(src0, required, ctx.device);
         return required == override_layout;
     };
-    static const bool xmx_moe_forced = [] {
-        const char * env = std::getenv("GGML_SYCL_XMX_MOE");
-        return env && std::atoi(env) != 0;
-    }();
+    const bool xmx_moe_forced = ggml_sycl_xmx_moe_forced();
     // ---------------------------------------------------------------
     // CPU-primary expert TG fast-path: route ALL experts to CPU for
     // batch=1 decode.  Must be checked BEFORE GPU dispatch paths
@@ -49629,9 +49674,7 @@ static void ggml_sycl_mmvq_soa_pre_allocate_buffers(ggml_backend_sycl_context & 
 // Pre-allocate buffers for XMX sorted MoE graph recording.
 // These buffers must be stable across graph execution.
 static void ggml_sycl_xmx_moe_pre_allocate_buffers(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph) {
-    static bool xmx_enabled = getenv("GGML_SYCL_XMX_MOE") != nullptr;
-
-    if (!xmx_enabled) {
+    if (!ggml_sycl_xmx_moe_forced()) {
         return;
     }
     const auto & caps = ggml_sycl_info().devices[ctx.device].xmx_caps;
