@@ -170,6 +170,16 @@ static bool run_sycl_graph_refresh_test() {
         ggml_backend_free(backend);
         return true;
     }
+    if (!ggml_sycl::test_graph_recording_uses_gpu_only_dispatch()) {
+        std::fprintf(stderr, "FAIL: graph recording can still enter CPU-offload dispatch\n");
+        ggml_backend_free(backend);
+        return false;
+    }
+    if (!ggml_sycl::test_backend_graph_recording_uses_gpu_only_dispatch(backend)) {
+        std::fprintf(stderr, "FAIL: backend graph recording can still enter CPU-offload dispatch\n");
+        ggml_backend_free(backend);
+        return false;
+    }
 
     const int k = 128;
     const int n = 64;
@@ -196,15 +206,19 @@ static bool run_sycl_graph_refresh_test() {
 
     std::vector<float> input_a(static_cast<size_t>(k));
     std::vector<float> input_b(static_cast<size_t>(k));
+    std::vector<float> input_c(static_cast<size_t>(k));
     for (int i = 0; i < k; ++i) {
         input_a[static_cast<size_t>(i)] = 0.01f * float(i + 1);
         input_b[static_cast<size_t>(i)] = 0.02f * float(i + 3);
+        input_c[static_cast<size_t>(i)] = 0.015f * float((i % 17) + 5);
     }
 
     std::vector<float> cpu_out_a;
     std::vector<float> cpu_out_b;
+    std::vector<float> cpu_out_c;
     if (!run_cpu_reference(weight_q4, input_a, k, n, cpu_out_a) ||
-        !run_cpu_reference(weight_q4, input_b, k, n, cpu_out_b)) {
+        !run_cpu_reference(weight_q4, input_b, k, n, cpu_out_b) ||
+        !run_cpu_reference(weight_q4, input_c, k, n, cpu_out_c)) {
         std::fprintf(stderr, "FAIL: CPU reference computation failed\n");
         ggml_backend_free(backend);
         return false;
@@ -296,25 +310,24 @@ static bool run_sycl_graph_refresh_test() {
         return false;
     }
 
-    const size_t pinned_after_first = ggml_sycl::test_graph_pinned_entry_count(backend);
-    if (pinned_after_first == 0) {
-        std::printf("SKIP: SYCL graph did not pin cache entries; cannot validate replay\n");
+    std::vector<float> sycl_out_a(static_cast<size_t>(n));
+    ggml_backend_tensor_get(final_out, sycl_out_a.data(), 0, sycl_out_a.size() * sizeof(float));
+
+    // Update input data and run the graph a second time. The first compute is
+    // warmup, so this second compute must record and cache an executable graph.
+    ggml_backend_tensor_set(input, input_b.data(), 0, input_b.size() * sizeof(float));
+    status = ggml_backend_graph_compute(backend, graph);
+    if (status != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "FAIL: SYCL graph compute (record) failed\n");
         for (ggml_backend_buffer_t buf : buffers) {
             ggml_backend_buffer_free(buf);
         }
         ggml_free(ctx);
         ggml_backend_free(backend);
-        return true;
+        return false;
     }
-
-    std::vector<float> sycl_out_a(static_cast<size_t>(n));
-    ggml_backend_tensor_get(final_out, sycl_out_a.data(), 0, sycl_out_a.size() * sizeof(float));
-
-    // Update input data and replay the same graph.
-    ggml_backend_tensor_set(input, input_b.data(), 0, input_b.size() * sizeof(float));
-    status = ggml_backend_graph_compute(backend, graph);
-    if (status != GGML_STATUS_SUCCESS) {
-        std::fprintf(stderr, "FAIL: SYCL graph compute (replay) failed\n");
+    if (!ggml_sycl::test_backend_has_exec_graph(backend)) {
+        std::fprintf(stderr, "FAIL: second compute did not cache an executable graph\n");
         for (ggml_backend_buffer_t buf : buffers) {
             ggml_backend_buffer_free(buf);
         }
@@ -326,8 +339,34 @@ static bool run_sycl_graph_refresh_test() {
     std::vector<float> sycl_out_b(static_cast<size_t>(n));
     ggml_backend_tensor_get(final_out, sycl_out_b.data(), 0, sycl_out_b.size() * sizeof(float));
 
+    const uint64_t replay_count_before = ggml_sycl::test_backend_graph_replay_count(backend);
+    ggml_backend_tensor_set(input, input_c.data(), 0, input_c.size() * sizeof(float));
+    status = ggml_backend_graph_compute(backend, graph);
+    if (status != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "FAIL: SYCL graph compute (replay) failed\n");
+        for (ggml_backend_buffer_t buf : buffers) {
+            ggml_backend_buffer_free(buf);
+        }
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+    const uint64_t replay_count_after = ggml_sycl::test_backend_graph_replay_count(backend);
+    if (replay_count_after <= replay_count_before) {
+        std::fprintf(stderr, "FAIL: third compute did not execute an existing SYCL graph\n");
+        for (ggml_backend_buffer_t buf : buffers) {
+            ggml_backend_buffer_free(buf);
+        }
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    std::vector<float> sycl_out_c(static_cast<size_t>(n));
+    ggml_backend_tensor_get(final_out, sycl_out_c.data(), 0, sycl_out_c.size() * sizeof(float));
+
     float refresh_delta = 0.0f;
-    if (!max_abs_diff(sycl_out_a, sycl_out_b, refresh_delta)) {
+    if (!max_abs_diff(sycl_out_b, sycl_out_c, refresh_delta)) {
         std::fprintf(stderr, "FAIL: output size mismatch between runs\n");
         for (ggml_backend_buffer_t buf : buffers) {
             ggml_backend_buffer_free(buf);
@@ -348,7 +387,9 @@ static bool run_sycl_graph_refresh_test() {
 
     float diff_a = 0.0f;
     float diff_b = 0.0f;
-    if (!max_abs_diff(sycl_out_a, cpu_out_a, diff_a) || !max_abs_diff(sycl_out_b, cpu_out_b, diff_b)) {
+    float diff_c = 0.0f;
+    if (!max_abs_diff(sycl_out_a, cpu_out_a, diff_a) || !max_abs_diff(sycl_out_b, cpu_out_b, diff_b) ||
+        !max_abs_diff(sycl_out_c, cpu_out_c, diff_c)) {
         std::fprintf(stderr, "FAIL: SYCL/CPU output size mismatch\n");
         for (ggml_backend_buffer_t buf : buffers) {
             ggml_backend_buffer_free(buf);
@@ -359,8 +400,9 @@ static bool run_sycl_graph_refresh_test() {
     }
 
     const float tol = 2e-2f;
-    if (diff_a > tol || diff_b > tol) {
-        std::fprintf(stderr, "FAIL: SYCL/CPU mismatch (diff_a=%g diff_b=%g tol=%g)\n", diff_a, diff_b, tol);
+    if (diff_a > tol || diff_b > tol || diff_c > tol) {
+        std::fprintf(stderr, "FAIL: SYCL/CPU mismatch (diff_a=%g diff_b=%g diff_c=%g tol=%g)\n", diff_a, diff_b,
+                     diff_c, tol);
         for (ggml_backend_buffer_t buf : buffers) {
             ggml_backend_buffer_free(buf);
         }
@@ -369,8 +411,8 @@ static bool run_sycl_graph_refresh_test() {
         return false;
     }
 
-    std::printf("PASS: SYCL graph replay refreshes inputs (delta=%g diff_a=%g diff_b=%g)\n",
-                refresh_delta, diff_a, diff_b);
+    std::printf("PASS: SYCL graph replay refreshes inputs (delta=%g diff_a=%g diff_b=%g diff_c=%g)\n",
+                refresh_delta, diff_a, diff_b, diff_c);
 
     for (ggml_backend_buffer_t buf : buffers) {
         ggml_backend_buffer_free(buf);

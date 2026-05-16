@@ -12,6 +12,7 @@
 #if GGML_SYCL_DNNL
 
 #    include "fattn-common.hpp"
+#    include "fattn.hpp"
 #    include "oneapi/dnnl/dnnl_graph.hpp"
 #    include "oneapi/dnnl/dnnl_graph_sycl.hpp"
 #    include "oneapi/dnnl/dnnl_sycl.hpp"
@@ -21,6 +22,13 @@
 #    include <memory>
 #    include <mutex>
 #    include <unordered_map>
+
+struct ggml_sycl_onednn_fa_materialized_kv {
+    ggml_sycl::scoped_unified_alloc K_alloc;
+    ggml_sycl::scoped_unified_alloc V_alloc;
+    ggml_sycl::mem_handle           K;
+    ggml_sycl::mem_handle           V;
+};
 
 // Cache key for oneDNN graph compiled_partition.
 // Per plan §8.7: keyed by (device_id, shape) — compiled_partitions are device-specific.
@@ -179,6 +187,12 @@ bool ggml_sycl_flash_attn_ext_onednn_eligible(const fattn_params & params,
 // Falls back silently to false on any oneDNN error; caller routes to kernel path.
 // Returns true if oneDNN executed, false if fell through.
 bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fattn_params & params);
+
+bool ggml_sycl_flash_attn_ext_onednn_materialize_kv(
+    const ggml_sycl_onednn_fa_materialization_desc & desc,
+    const fattn_params &                            params,
+    sycl::queue &                                   stream,
+    ggml_sycl_onednn_fa_materialized_kv *           out);
 
 #endif  // GGML_SYCL_DNNL
 #endif  // GGML_SYCL_FATTN_ONEDNN_HPP

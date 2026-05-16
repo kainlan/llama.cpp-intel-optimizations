@@ -290,7 +290,7 @@ GGML_BACKEND_API int  ggml_backend_sycl_get_device_count();
 GGML_BACKEND_API void ggml_backend_sycl_get_device_memory(int device, size_t * free, size_t * total);
 
 // Check if MoE multi-GPU mode is requested via GGML_SYCL_MOE_MULTI_GPU=1.
-// Auto-enabled when 2+ GPUs visible. Opt-out: GGML_SYCL_MOE_MULTI_GPU=0.
+// Disabled by default while multi-device Level Zero execution is unstable.
 // When true, the SYCL backend handles multi-device MoE dispatch internally,
 // and secondary GPUs should NOT be exposed to the backend scheduler.
 GGML_BACKEND_API bool ggml_backend_sycl_moe_multi_gpu_requested(void);

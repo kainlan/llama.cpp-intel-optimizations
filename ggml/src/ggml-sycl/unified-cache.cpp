@@ -40,9 +40,9 @@ static size_t                                                  g_unified_cache_b
 static int                                                     g_unified_cache_budget_pct  = 100;
 static size_t                                                  g_unified_cache_host_budget = 0;  // 0 = auto-calc
 static int                                                     g_unified_cache_host_budget_pct = 90;
-static unified_cache_mode                                      g_cache_mode = unified_cache_mode::AUTO;
+static unified_cache_mode                                      g_cache_mode             = unified_cache_mode::AUTO;
 static int                                                     g_scheduler_device_count = -1;
-static int                                                     g_total_gpu_count       = -1;
+static int                                                     g_total_gpu_count        = -1;
 static std::atomic<bool>   g_cache_mode_locked{ false };   // Locked after first cache access
 static std::atomic<bool>   g_sycl_shutting_down{ false };  // Set during shutdown to skip sycl::free()
 // VRAM runtime counters removed — arena zones (zone_used) are the single source of truth.
@@ -73,6 +73,12 @@ static std::unordered_map<void *, runtime_alloc_record> g_runtime_alloc_registry
 static std::unordered_map<std::string, alloc_tier>      g_runtime_cohort_tier;
 static std::mutex                                       g_offload_pool_mutex;
 static std::atomic<uint64_t>                            g_offload_pool_lease_id{ 1 };
+
+constexpr size_t k_device_alloc_alignment = 2ull * 1024ull * 1024ull;
+
+static void * sycl_aligned_malloc_device(size_t size, const sycl::queue & queue) {
+    return sycl::aligned_alloc_device(k_device_alloc_alignment, size, queue);
+}
 
 struct offload_pool_key {
     int                 device    = -1;
@@ -206,6 +212,8 @@ static runtime_category category_from_role(alloc_role role) {
             return runtime_category::GRAPH;
         case alloc_role::EXPERT_STAGING:
             return runtime_category::EXPERT_CACHE;
+        case alloc_role::CONTROL:
+            return runtime_category::CONTROL;
         case alloc_role::WEIGHT:
         case alloc_role::OTHER:
         default:
@@ -1171,7 +1179,7 @@ unified_cache::unified_cache(sycl::queue & queue,
 
     // VRAM Arena: pre-allocate a single VRAM block when GGML_SYCL_VRAM_ARENA=1.
     if (vram_arena_enabled()) {
-        const int dev_id = ggml_sycl_get_device_id_from_queue(queue_);
+        const int    dev_id    = ggml_sycl_get_device_id_from_queue(queue_);
         // Per-allocation cap = the runtime's reported max_mem_alloc_size from
         // the L0 device query.  This is what the runtime actually accepts;
         // the alloc-probe `safe_max_alloc_size` (in ggml_sycl_info) saturates
@@ -1315,7 +1323,6 @@ unified_cache::unified_cache(sycl::queue & queue,
             GGML_LOG_INFO("[HOST-ARENA] GGML_SYCL_NO_PINNED set: disabling pinned host memory\n");
             pinned_cap = 0;
         }
-
 
         const size_t pinned_budget = std::min(host_mem_budget, pinned_cap);
         host_arena_                = std::make_unique<pinned_chunk_pool>(queue_, pinned_budget);
@@ -1981,10 +1988,10 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
 // === Direct Staging API ===
 
 direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
-                                                       const void *         src_ptr,
-                                                       size_t               src_size,
-                                                       size_t               dst_size,
-                                                       ggml_layout_mode     layout,
+                                                      const void *         src_ptr,
+                                                      size_t               src_size,
+                                                      size_t               dst_size,
+                                                      ggml_layout_mode     layout,
                                                        cache_layout_fill_fn fill_fn,
                                                        const void *         fill_ctx,
                                                        sycl::queue *        queue) {
@@ -1995,6 +2002,21 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
     if (!queue) {
         GGML_LOG_ERROR("[DIRECT-STAGE] null queue for weight staging\n");
         return result;
+    }
+
+    {
+        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+        const unified_cache_key             cache_key{ cache_entry_type::DENSE_WEIGHT, key, -1, -1 };
+        auto                                it = entries_.find(cache_key);
+        if (it != entries_.end() && it->second.device_ptr && it->second.layout == layout &&
+            it->second.location == cache_location::DEVICE) {
+            result.ptr = it->second.device_ptr;
+            if (it->second.has_ready_event) {
+                result.event = it->second.ready_event;
+            }
+            result.ok = true;
+            return result;
+        }
     }
 
     // 1. Allocate from WEIGHT zone
@@ -2024,7 +2046,62 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
     // 4. Store in lookup table (keyed by full cache_id for collision safety)
     {
         std::unique_lock<std::shared_mutex> lock(direct_stage_mutex_);
-        direct_weight_entries_[key] = weight_entry{ ptr, dst_size, layout, cache_location::DEVICE, nullptr };
+        weight_entry                        entry{};
+        entry.ptr                   = ptr;
+        entry.size                  = dst_size;
+        entry.layout                = layout;
+        entry.location              = cache_location::DEVICE;
+        entry.has_ready_event       = true;
+        entry.ready_event           = last_event;
+        direct_weight_entries_[key] = std::move(entry);
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+        unified_cache_key                   cache_key{ cache_entry_type::DENSE_WEIGHT, key, -1, -1 };
+        unified_cache_entry                 entry{};
+        entry.device_ptr       = ptr;
+        entry.src_ptr          = src_ptr;
+        entry.content_hash     = 0;
+        entry.size             = dst_size;
+        entry.type             = cache_entry_type::DENSE_WEIGHT;
+        entry.layer_id         = -1;
+        entry.expert_id        = -1;
+        entry.layout           = layout;
+        entry.access_count     = 0;
+        entry.last_access      = time_++;
+        entry.pinned           = true;
+        entry.hot              = true;
+        entry.state            = cache_entry_state::IN_PROGRESS;
+        entry.has_ready_event  = true;
+        entry.ready_event      = last_event;
+        entry.host_resident    = false;
+        entry.location         = cache_location::DEVICE;
+        entry.pool_allocated   = false;
+        entry.last_write_event = last_event;
+        entry.has_write_event  = true;
+        auto old = entries_.find(cache_key);
+        if (old != entries_.end() && old->second.device_ptr && old->second.device_ptr != ptr) {
+            const uint32_t live = old->second.in_use_count.load();
+            if (live != 0) {
+                GGML_LOG_WARN(
+                    "[DIRECT-STAGE] replacing dense entry with live leases model=%llu name_hash=0x%llx leases=%u\n",
+                    (unsigned long long) key.model_id, (unsigned long long) key.name_hash, live);
+            } else if (old->second.host_resident || old->second.location == cache_location::HOST_PINNED) {
+                if (host_zones_configured()) {
+                    host_zone_free(host_zone_id::WEIGHT, old->second.device_ptr);
+                } else {
+                    host_pool_free(old->second.device_ptr, old->second.size);
+                }
+            } else if (vram_owns(old->second.device_ptr)) {
+                zone_free(vram_zone_id::WEIGHT, old->second.device_ptr);
+            } else if (layout_pool_ && layout_pool_->owns(old->second.device_ptr)) {
+                saturating_sub_used(old->second.size);
+            } else {
+                enqueue_deferred_free(old->second.device_ptr, old->second.size);
+            }
+        }
+        entries_[cache_key]    = entry;
+        id_to_key_[key]        = cache_key;
     }
 
     result.ptr   = ptr;
@@ -2032,6 +2109,14 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
     result.ok    = true;
     return result;
 }
+
+static bool moe_direct_trace_enabled();
+static void moe_direct_trace_key(const char * op,
+                                 const ggml_sycl_cache_id & key,
+                                 ggml_layout_mode           layout,
+                                 const char *               detail,
+                                 size_t                     direct_entries,
+                                 const weight_entry *       entry);
 
 direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
                                                        const void *         src_ptr,
@@ -2049,6 +2134,22 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         GGML_LOG_ERROR("[DIRECT-STAGE] null queue for expert staging\n");
         return result;
     }
+
+    {
+        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+        const unified_cache_key             cache_key{ cache_entry_type::MOE_EXPERT, key, -1, -1 };
+        auto                                it = entries_.find(cache_key);
+        if (it != entries_.end() && it->second.device_ptr && it->second.layout == layout &&
+            it->second.location == cache_location::DEVICE) {
+            result.ptr = it->second.device_ptr;
+            if (it->second.has_ready_event) {
+                result.event = it->second.ready_event;
+            }
+            result.ok = true;
+            return result;
+        }
+    }
+
     if (has_placement_plan() && unified_cache_is_graph_compute_active()) {
         GGML_LOG_ERROR(
             "[DIRECT-STAGE] inference-time expert staging is forbidden when placement-plan preload is active\n");
@@ -2059,6 +2160,29 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
     // 1. Allocate from WEIGHT zone
     void * ptr = zone_alloc(vram_zone_id::WEIGHT, dst_size);
     if (!ptr) {
+        if (has_placement_plan() && layout != GGML_LAYOUT_AOS) {
+            static std::atomic<int> planned_stage_fail_log{ 0 };
+            if (planned_stage_fail_log.fetch_add(1, std::memory_order_relaxed) < 10) {
+                size_t entry_count         = 0;
+                size_t direct_expert_count = 0;
+                {
+                    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+                    entry_count = entries_.size();
+                }
+                {
+                    std::shared_lock<std::shared_mutex> lock(direct_stage_mutex_);
+                    direct_expert_count = direct_expert_entries_.size();
+                }
+                GGML_LOG_WARN(
+                    "[DIRECT-STAGE] WEIGHT zone full (%zu bytes) for planned layout=%d expert; refusing host AoS "
+                    "fallback (used=%.1f MB avail=%.1f MB largest=%.1f MB entries=%zu direct_experts=%zu)\n",
+                    dst_size, (int) layout, zone_used(vram_zone_id::WEIGHT) / (1024.0 * 1024.0),
+                    zone_available(vram_zone_id::WEIGHT) / (1024.0 * 1024.0),
+                    zone_largest_free(vram_zone_id::WEIGHT) / (1024.0 * 1024.0), entry_count, direct_expert_count);
+            }
+            return result;
+        }
+
         static std::atomic<int> host_fallback_log{ 0 };
         if (host_fallback_log.fetch_add(1, std::memory_order_relaxed) < 10) {
             GGML_LOG_WARN("[DIRECT-STAGE] WEIGHT zone full (%zu bytes) — host arena fallback\n", dst_size);
@@ -2086,8 +2210,41 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         }
 
         {
+            std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+            unified_cache_key                   cache_key{ cache_entry_type::MOE_EXPERT, key, -1, -1 };
+            unified_cache_entry                 entry{};
+            entry.device_ptr       = host_ptr;
+            entry.src_ptr          = src_ptr;
+            entry.content_hash     = 0;
+            entry.size             = src_size;
+            entry.type             = cache_entry_type::MOE_EXPERT;
+            entry.layer_id         = -1;
+            entry.expert_id        = -1;
+            entry.layout           = GGML_LAYOUT_AOS;
+            entry.access_count     = 0;
+            entry.last_access      = time_++;
+            entry.pinned           = true;
+            entry.hot              = true;
+            entry.state            = cache_entry_state::READY;
+            entry.has_ready_event  = false;
+            entry.host_resident    = loc != cache_location::DEVICE;
+            entry.location         = loc;
+            entry.pool_allocated   = false;
+            entry.last_write_event = {};
+            entry.has_write_event  = false;
+            entries_[cache_key]    = entry;
+            id_to_key_[key]        = cache_key;
+        }
+        {
             std::unique_lock<std::shared_mutex> lock(direct_stage_mutex_);
-            direct_expert_entries_[key] = weight_entry{ host_ptr, src_size, GGML_LAYOUT_AOS, loc, nullptr };
+            weight_entry                        entry{};
+            entry.ptr                   = host_ptr;
+            entry.size                  = src_size;
+            entry.layout                = GGML_LAYOUT_AOS;
+            entry.location              = loc;
+            direct_expert_entries_[key] = std::move(entry);
+            moe_direct_trace_key("insert-host", key, GGML_LAYOUT_AOS, "zone-full", direct_expert_entries_.size(),
+                                 &direct_expert_entries_.find(key)->second);
         }
         result.ptr = host_ptr;
         result.ok  = true;
@@ -2114,13 +2271,112 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
     // 4. Store in lookup table (keyed by full cache_id for collision safety)
     {
         std::unique_lock<std::shared_mutex> lock(direct_stage_mutex_);
-        direct_expert_entries_[key] = weight_entry{ ptr, dst_size, layout, cache_location::DEVICE, nullptr };
+        weight_entry                        entry{};
+        entry.ptr                   = ptr;
+        entry.size                  = dst_size;
+        entry.layout                = layout;
+        entry.location              = cache_location::DEVICE;
+        entry.has_ready_event       = true;
+        entry.ready_event           = last_event;
+        direct_expert_entries_[key] = std::move(entry);
+        moe_direct_trace_key("insert-device", key, layout, "", direct_expert_entries_.size(),
+                             &direct_expert_entries_.find(key)->second);
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+        unified_cache_key                   cache_key{ cache_entry_type::MOE_EXPERT, key, -1, -1 };
+        unified_cache_entry                 entry{};
+        entry.device_ptr       = ptr;
+        entry.src_ptr          = src_ptr;
+        entry.content_hash     = 0;
+        entry.size             = dst_size;
+        entry.type             = cache_entry_type::MOE_EXPERT;
+        entry.layer_id         = -1;
+        entry.expert_id        = -1;
+        entry.layout           = layout;
+        entry.access_count     = 0;
+        entry.last_access      = time_++;
+        entry.pinned           = true;
+        entry.hot              = true;
+        entry.state            = cache_entry_state::IN_PROGRESS;
+        entry.has_ready_event  = true;
+        entry.ready_event      = last_event;
+        entry.host_resident    = false;
+        entry.location         = cache_location::DEVICE;
+        entry.pool_allocated   = false;
+        entry.last_write_event = last_event;
+        entry.has_write_event  = true;
+        auto old = entries_.find(cache_key);
+        if (old != entries_.end() && old->second.device_ptr && old->second.device_ptr != ptr) {
+            const uint32_t live = old->second.in_use_count.load();
+            if (live != 0) {
+                GGML_LOG_WARN(
+                    "[DIRECT-STAGE] replacing expert entry with live leases model=%llu name_hash=0x%llx leases=%u\n",
+                    (unsigned long long) key.model_id, (unsigned long long) key.name_hash, live);
+            } else if (old->second.host_resident || old->second.location == cache_location::HOST_PINNED) {
+                if (host_zones_configured()) {
+                    host_zone_free(host_zone_id::WEIGHT, old->second.device_ptr);
+                } else {
+                    host_pool_free(old->second.device_ptr, old->second.size);
+                }
+            } else if (vram_owns(old->second.device_ptr)) {
+                zone_free(vram_zone_id::WEIGHT, old->second.device_ptr);
+            } else if (layout_pool_ && layout_pool_->owns(old->second.device_ptr)) {
+                saturating_sub_used(old->second.size);
+            } else {
+                enqueue_deferred_free(old->second.device_ptr, old->second.size);
+            }
+        }
+        entries_[cache_key]    = entry;
+        id_to_key_[key]        = cache_key;
     }
 
     result.ptr   = ptr;
     result.event = last_event;
     result.ok    = true;
     return result;
+}
+
+static bool moe_direct_trace_enabled() {
+    static std::atomic<int> cached{ -1 };
+    int                     v = cached.load(std::memory_order_acquire);
+    if (v < 0) {
+        const char * env_route  = std::getenv("GGML_SYCL_MOE_ROUTE_LOG");
+        const char * env_direct = std::getenv("GGML_SYCL_MOE_DIRECT_LOG");
+        v = ((env_route && std::atoi(env_route) != 0) || (env_direct && std::atoi(env_direct) != 0)) ? 1 : 0;
+        cached.store(v, std::memory_order_release);
+    }
+    return v != 0;
+}
+
+static void moe_direct_trace_key(const char * op,
+                                 const ggml_sycl_cache_id & key,
+                                 ggml_layout_mode           layout,
+                                 const char *               detail,
+                                 size_t                     direct_entries,
+                                 const weight_entry *       entry) {
+    if (!moe_direct_trace_enabled()) {
+        return;
+    }
+    bool        force_log = false;
+    const char * hash_env = std::getenv("GGML_SYCL_MOE_DIRECT_HASH");
+    if (hash_env && hash_env[0] != '\0') {
+        char *   end  = nullptr;
+        uint64_t want = std::strtoull(hash_env, &end, 0);
+        force_log     = end != hash_env && want == key.name_hash;
+    }
+    static std::atomic<int> log_count{ 0 };
+    if (!force_log && log_count.fetch_add(1, std::memory_order_relaxed) >= 400) {
+        return;
+    }
+    fprintf(stderr,
+            "[MOE-DIRECT] op=%s model=%llu name_hash=0x%llx aux=%llu type=%d ne=[%lld,%lld,%lld,%lld] "
+            "layout=%d entries=%zu %s ptr=%p entry_layout=%d loc=%d ready=%d\n",
+            op ? op : "?", (unsigned long long) key.model_id, (unsigned long long) key.name_hash,
+            (unsigned long long) key.aux_id, (int) key.type, (long long) key.ne[0], (long long) key.ne[1],
+            (long long) key.ne[2], (long long) key.ne[3], (int) layout, direct_entries, detail ? detail : "",
+            entry ? entry->ptr : nullptr, entry ? (int) entry->layout : -1, entry ? (int) entry->location : -1,
+            entry ? (entry->has_ready_event ? 1 : 0) : 0);
 }
 
 const weight_entry * unified_cache::lookup_weight(ggml_sycl_cache_id key) const {
@@ -2136,30 +2392,341 @@ const weight_entry * unified_cache::lookup_expert(ggml_sycl_cache_id key) const 
     std::shared_lock<std::shared_mutex> lock(direct_stage_mutex_);
     auto                                it = direct_expert_entries_.find(key);
     if (it == direct_expert_entries_.end()) {
+        moe_direct_trace_key("lookup-miss", key, GGML_LAYOUT_AOS, "", direct_expert_entries_.size(), nullptr);
         return nullptr;
     }
+    moe_direct_trace_key("lookup-hit", key, it->second.layout, "", direct_expert_entries_.size(), &it->second);
     return &it->second;
 }
 
+static expert_resolve_tier expert_tier_from_location(cache_location location) {
+    switch (location) {
+        case cache_location::DEVICE:
+            return expert_resolve_tier::DEVICE_VRAM;
+        case cache_location::HOST_PINNED:
+            return expert_resolve_tier::HOST_PINNED;
+        case cache_location::HOST_MMAP:
+            return expert_resolve_tier::HOST_MMAP;
+        case cache_location::UNKNOWN:
+        default:
+            return expert_resolve_tier::UNAVAILABLE;
+    }
+}
+
+static bool expert_resolution_allowed(const expert_resolve_request & req,
+                                      cache_location                 location,
+                                      int                            owning_device,
+                                      expert_resolve_reason *        out_reason) {
+    if (out_reason) {
+        *out_reason = expert_resolve_reason::FOUND;
+    }
+
+    if (location == cache_location::HOST_PINNED || location == cache_location::HOST_MMAP) {
+        if (!req.allow_host) {
+            if (out_reason) {
+                *out_reason = expert_resolve_reason::HOST_DISALLOWED;
+            }
+            return false;
+        }
+        if (location == cache_location::HOST_MMAP && !req.allow_mmap_host) {
+            if (out_reason) {
+                *out_reason = expert_resolve_reason::MMAP_HOST_DISALLOWED;
+            }
+            return false;
+        }
+        return true;
+    }
+
+    if (location == cache_location::DEVICE) {
+        if (req.device_policy == expert_resolve_device_policy::CURRENT_ONLY && req.current_device >= 0 &&
+            owning_device != req.current_device) {
+            if (out_reason) {
+                *out_reason = expert_resolve_reason::DEVICE_MISMATCH;
+            }
+            return false;
+        }
+        if (req.device_policy == expert_resolve_device_policy::PREFERRED_ONLY && req.preferred_device >= 0 &&
+            owning_device != req.preferred_device) {
+            if (out_reason) {
+                *out_reason = expert_resolve_reason::DEVICE_MISMATCH;
+            }
+            return false;
+        }
+        return true;
+    }
+
+    if (out_reason) {
+        *out_reason = expert_resolve_reason::NOT_FOUND;
+    }
+    return false;
+}
+
+expert_resolve_result unified_cache::resolve_expert(const expert_resolve_request & req) {
+    expert_resolve_result result{};
+    result.reason = expert_resolve_reason::NOT_FOUND;
+
+    if (!req.key.valid) {
+        result.reason = expert_resolve_reason::INVALID_REQUEST;
+        return result;
+    }
+
+    const int cache_device = ggml_sycl_get_device_id_from_queue(queue_);
+    auto      apply_miss   = [&result](expert_resolve_reason reason) {
+        if (result.reason == expert_resolve_reason::NOT_FOUND) {
+            result.reason = reason;
+        }
+    };
+
+    {
+        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+        auto                                entry_it = entries_.end();
+        const unified_cache_key explicit_key{ cache_entry_type::MOE_EXPERT, req.key, req.layer_id, req.expert_id };
+        entry_it = entries_.find(explicit_key);
+        if (entry_it == entries_.end()) {
+            auto id_it = id_to_key_.find(req.key);
+            if (id_it != id_to_key_.end() && id_it->second.type == cache_entry_type::MOE_EXPERT) {
+                entry_it = entries_.find(id_it->second);
+            }
+        }
+
+        if (entry_it != entries_.end()) {
+            auto & entry                     = entry_it->second;
+            bool   entry_ready               = entry.state == cache_entry_state::READY;
+            bool   entry_in_progress_allowed = entry.state == cache_entry_state::IN_PROGRESS && !req.require_ready;
+            if (entry.layout != req.requested_layout) {
+                apply_miss(expert_resolve_reason::LAYOUT_MISMATCH);
+            } else if (!entry.device_ptr) {
+                apply_miss(expert_resolve_reason::NOT_FOUND);
+            } else if (entry.state == cache_entry_state::EVICTING || entry.state == cache_entry_state::FAILED) {
+                apply_miss(expert_resolve_reason::NOT_READY);
+            } else if (entry.state == cache_entry_state::IN_PROGRESS && req.require_ready) {
+                entry_ready = entry.has_ready_event && event_complete(entry.ready_event);
+                if (!entry_ready) {
+                    apply_miss(expert_resolve_reason::NOT_READY);
+                }
+            }
+
+            if ((entry_ready || entry_in_progress_allowed) && entry.device_ptr &&
+                entry.layout == req.requested_layout) {
+                const cache_location  location      = entry.location;
+                const bool            on_device     = location == cache_location::DEVICE;
+                const int             owner         = on_device ? cache_device : mem_handle::HOST_DEVICE;
+                expert_resolve_reason reject_reason = expert_resolve_reason::FOUND;
+                if (expert_resolution_allowed(req, location, owner, &reject_reason)) {
+                    entry.in_use_count.fetch_add(1);
+                    result.ptr             = entry.device_ptr;
+                    result.size            = entry.size;
+                    result.tier            = expert_tier_from_location(location);
+                    result.location        = location;
+                    result.owning_device   = owner;
+                    result.actual_layout   = entry.layout;
+                    result.cpu_accessible  = !on_device;
+                    result.has_ready_event = entry.state == cache_entry_state::IN_PROGRESS && entry.has_ready_event;
+                    if (result.has_ready_event) {
+                        result.ready_event = entry.ready_event;
+                    }
+                    result.reason   = expert_resolve_reason::FOUND;
+                    result.lifetime = std::make_unique<mem_handle>(mem_handle::from_weight_lease(
+                        entry_it->first, owner, entry.device_ptr, entry.layout, on_device, &entry));
+                    return result;
+                }
+                apply_miss(reject_reason);
+            }
+        }
+    }
+
+    {
+        std::shared_lock<std::shared_mutex> lock(direct_stage_mutex_);
+        auto                                it = direct_expert_entries_.find(req.key);
+        if (it == direct_expert_entries_.end()) {
+            moe_direct_trace_key("resolve-direct-miss", req.key, req.requested_layout, "",
+                                 direct_expert_entries_.size(), nullptr);
+            return result;
+        }
+
+        const weight_entry & entry = it->second;
+        moe_direct_trace_key("resolve-direct-hit", req.key, req.requested_layout, "", direct_expert_entries_.size(),
+                             &entry);
+        if (entry.layout != req.requested_layout) {
+            result.reason = expert_resolve_reason::LAYOUT_MISMATCH;
+            return result;
+        }
+        if (!entry.ptr) {
+            result.reason = expert_resolve_reason::NOT_FOUND;
+            return result;
+        }
+        if (req.require_ready && entry.has_ready_event && !event_complete(entry.ready_event)) {
+            result.reason = expert_resolve_reason::NOT_READY;
+            return result;
+        }
+
+        const bool            on_device     = entry.location == cache_location::DEVICE;
+        const int             owner         = on_device ? cache_device : mem_handle::HOST_DEVICE;
+        expert_resolve_reason reject_reason = expert_resolve_reason::FOUND;
+        result.tier                         = expert_tier_from_location(entry.location);
+        result.location                     = entry.location;
+        result.owning_device                = owner;
+        result.actual_layout                = entry.layout;
+        result.cpu_accessible               = !on_device;
+        result.has_ready_event              = entry.has_ready_event;
+        if (entry.has_ready_event) {
+            result.ready_event = entry.ready_event;
+        }
+        if (!expert_resolution_allowed(req, entry.location, owner, &reject_reason)) {
+            result.reason = reject_reason;
+            return result;
+        }
+
+        void *                 entry_ptr             = entry.ptr;
+        const size_t           entry_size            = entry.size;
+        const cache_location   entry_location        = entry.location;
+        const ggml_layout_mode entry_layout          = entry.layout;
+        const bool             entry_has_ready_event = entry.has_ready_event;
+        unified_cache_key      mirror_key{ cache_entry_type::MOE_EXPERT, req.key, -1, -1 };
+        lock.unlock();
+
+        auto lease = acquire_entry_lease(mirror_key);
+        if (lease) {
+            result.ptr             = lease.ptr;
+            result.size            = entry_size;
+            result.tier            = expert_tier_from_location(entry_location);
+            result.location        = entry_location;
+            result.owning_device   = owner;
+            result.actual_layout   = lease.layout;
+            result.cpu_accessible  = !lease.on_device;
+            result.has_ready_event = entry_has_ready_event;
+            result.reason          = expert_resolve_reason::FOUND;
+            result.lifetime        = std::make_unique<mem_handle>(mem_handle::from_weight_lease(
+                mirror_key, owner, lease.ptr, lease.layout, lease.on_device, lease.entry));
+            return result;
+        }
+
+        if (on_device) {
+            static std::atomic<int> unowned_direct_device_log{ 0 };
+            if (unowned_direct_device_log.fetch_add(1, std::memory_order_relaxed) < 10) {
+                GGML_LOG_WARN(
+                    "[MOE-DIRECT] refusing unleased device direct entry model=%llu name_hash=0x%llx; "
+                    "canonical unified-cache entry is missing\n",
+                    (unsigned long long) req.key.model_id, (unsigned long long) req.key.name_hash);
+            }
+            result.reason = expert_resolve_reason::NOT_FOUND;
+            return result;
+        }
+
+        static std::atomic<int> unowned_direct_host_log{ 0 };
+        if (unowned_direct_host_log.fetch_add(1, std::memory_order_relaxed) < 10) {
+            GGML_LOG_WARN(
+                "[MOE-DIRECT] refusing unleased host direct entry model=%llu name_hash=0x%llx; "
+                "canonical unified-cache entry is missing\n",
+                (unsigned long long) req.key.model_id, (unsigned long long) req.key.name_hash);
+        }
+        result.reason = expert_resolve_reason::NOT_FOUND;
+        return result;
+    }
+}
+
 void unified_cache::register_host_expert(ggml_sycl_cache_id key, void * ptr, size_t size, ggml_layout_mode layout) {
+    const int       dev = ggml_sycl_get_device_id_from_queue(queue_);
+    memory_location loc = query_location(ptr, dev);
+    cache_location  cache_loc =
+        loc.tier == alloc_tier::HOST_PINNED ? cache_location::HOST_PINNED : cache_location::HOST_MMAP;
+    if (cache_loc != cache_location::HOST_PINNED) {
+        try {
+            const sycl::usm::alloc atype = sycl::get_pointer_type(ptr, queue_.get_context());
+            if (atype == sycl::usm::alloc::host || atype == sycl::usm::alloc::shared) {
+                cache_loc = cache_location::HOST_PINNED;
+            }
+        } catch (...) {
+            cache_loc = cache_location::HOST_MMAP;
+        }
+    }
+
+    {
+        std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_);
+        unified_cache_key                   cache_key{ cache_entry_type::MOE_EXPERT, key, -1, -1 };
+        unified_cache_entry                 cache_entry{};
+        cache_entry.device_ptr       = ptr;
+        cache_entry.src_ptr          = ptr;
+        cache_entry.content_hash     = 0;
+        cache_entry.size             = size;
+        cache_entry.type             = cache_entry_type::MOE_EXPERT;
+        cache_entry.layer_id         = -1;
+        cache_entry.expert_id        = -1;
+        cache_entry.layout           = layout;
+        cache_entry.access_count     = 0;
+        cache_entry.last_access      = time_++;
+        cache_entry.pinned           = true;
+        cache_entry.hot              = true;
+        cache_entry.state            = cache_entry_state::READY;
+        cache_entry.has_ready_event  = false;
+        cache_entry.host_resident    = cache_loc != cache_location::DEVICE;
+        cache_entry.location         = cache_loc;
+        cache_entry.pool_allocated   = false;
+        cache_entry.last_write_event = {};
+        cache_entry.has_write_event  = false;
+        entries_[cache_key] = cache_entry;
+        id_to_key_[key]     = cache_key;
+    }
+
     std::unique_lock<std::shared_mutex> lock(direct_stage_mutex_);
-    weight_entry entry{ ptr, size, layout, cache_location::HOST_PINNED, nullptr };
-    // llama.cpp-pxvih 4b: per-entry chunk lease (defense in depth).
-    // Acquire a CHUNK_LEASE on the pinned-pool chunk containing `ptr` so that
-    // the chunk cannot be sycl::free'd while this expert entry is registered.
-    // from_chunk_ptr returns DIRECT (no-op) for mmap/external pointers that
-    // are not inside any arena chunk — correct, since those are never pool-freed.
-    // The lease stacks with the buffer-level lease from 4a: eviction requires
-    // both the buffer refcount and all per-entry refcounts to reach zero.
-    const int dev = ggml_sycl_get_device_id_from_queue(queue_);
-    entry.entry_lease = std::make_unique<mem_handle>(
-        mem_handle::from_chunk_ptr(ptr, dev, GGML_LAYOUT_AOS, false));
+    weight_entry                        entry{};
+    entry.ptr                   = ptr;
+    entry.size                  = size;
+    entry.layout                = layout;
+    entry.location              = cache_loc;
     direct_expert_entries_[key] = std::move(entry);
 }
 
 void unified_cache::register_host_weight(ggml_sycl_cache_id key, void * ptr, size_t size, ggml_layout_mode layout) {
+    const int       dev = ggml_sycl_get_device_id_from_queue(queue_);
+    memory_location loc = query_location(ptr, dev);
+    cache_location  cache_loc =
+        loc.tier == alloc_tier::HOST_PINNED ? cache_location::HOST_PINNED : cache_location::HOST_MMAP;
+    if (cache_loc != cache_location::HOST_PINNED) {
+        try {
+            const sycl::usm::alloc atype = sycl::get_pointer_type(ptr, queue_.get_context());
+            if (atype == sycl::usm::alloc::host || atype == sycl::usm::alloc::shared) {
+                cache_loc = cache_location::HOST_PINNED;
+            }
+        } catch (...) {
+            cache_loc = cache_location::HOST_MMAP;
+        }
+    }
+
+    {
+        std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_);
+        unified_cache_key                   cache_key{ cache_entry_type::DENSE_WEIGHT, key, -1, -1 };
+        unified_cache_entry                 cache_entry{};
+        cache_entry.device_ptr       = ptr;
+        cache_entry.src_ptr          = ptr;
+        cache_entry.content_hash     = 0;
+        cache_entry.size             = size;
+        cache_entry.type             = cache_entry_type::DENSE_WEIGHT;
+        cache_entry.layer_id         = -1;
+        cache_entry.expert_id        = -1;
+        cache_entry.layout           = layout;
+        cache_entry.access_count     = 0;
+        cache_entry.last_access      = time_++;
+        cache_entry.pinned           = true;
+        cache_entry.hot              = true;
+        cache_entry.state            = cache_entry_state::READY;
+        cache_entry.has_ready_event  = false;
+        cache_entry.host_resident    = cache_loc != cache_location::DEVICE;
+        cache_entry.location         = cache_loc;
+        cache_entry.pool_allocated   = false;
+        cache_entry.last_write_event = {};
+        cache_entry.has_write_event  = false;
+        entries_[cache_key]          = cache_entry;
+        id_to_key_[key]              = cache_key;
+    }
+
     std::unique_lock<std::shared_mutex> lock(direct_stage_mutex_);
-    direct_weight_entries_[key] = weight_entry{ ptr, size, layout, cache_location::HOST_PINNED, nullptr };
+    weight_entry                        entry{};
+    entry.ptr                   = ptr;
+    entry.size                  = size;
+    entry.layout                = layout;
+    entry.location              = cache_loc;
+    direct_weight_entries_[key] = std::move(entry);
 }
 
 bool unified_cache::is_cached(const ggml_sycl_cache_id & key_id, ggml_layout_mode layout) const {
@@ -2359,6 +2926,13 @@ void * unified_cache::allocate_slot(const ggml_sycl_cache_id & key,
             if (!entry.pool_allocated) {
                 enqueue_deferred_free(entry.device_ptr, entry.size);
             }
+        }
+        if (type == cache_entry_type::MOE_EXPERT && layer_id == 0 && expert_id == 0) {
+            fprintf(stderr,
+                    "[MOE-ENTRY-ERASE] path=allocate_slot-reclaim layer=%d expert=%d have_layout=%d want_layout=%d "
+                    "size=%zu pinned=%d state=%d\n",
+                    layer_id, expert_id, (int) entry.layout, (int) layout, entry.size, entry.pinned ? 1 : 0,
+                    (int) entry.state);
         }
         entries_.erase(it);
     }
@@ -2872,13 +3446,13 @@ size_t unified_cache::evict_coldest_expert_group(const std::unordered_map<int64_
         if (entry_it == entries_.end()) {
             return { false, 0, 0, 0, false };
         }
-        const auto & e = entry_it->second;
+        const auto & e    = entry_it->second;
         // llama.cpp-vtf7f: treat live mem_handle leases as pinned for the
         // purposes of group eviction.  evict_expert_group() below issues
         // per-tensor remove() which itself refuses on in_use_count > 0, so
         // this is defence-in-depth — without it, the scoring loop might
         // select a leased group only to have the actual remove() skip.
-        const bool held = e.pinned || e.in_use_count.load() > 0;
+        const bool   held = e.pinned || e.in_use_count.load() > 0;
         return { true, e.access_count, e.last_access, e.size, held };
     };
 
@@ -3049,40 +3623,41 @@ unified_cache::weight_ptr_result unified_cache::get_weight_ptr(const ggml_sycl_c
 // the result comes from direct_weight_entries_, entry == nullptr, meaning the
 // caller has no lease obligation (and no lifetime protection against an
 // arena-wide teardown, which only happens at model unload).
-unified_cache::weight_ptr_lease_result unified_cache::acquire_weight_lease(
-    const ggml_sycl_cache_id & key) {
+unified_cache::weight_ptr_lease_result unified_cache::acquire_weight_lease(const ggml_sycl_cache_id & key) {
+    unified_cache_key ckey{ cache_entry_type::DENSE_WEIGHT, key, -1, -1 };
+    return acquire_entry_lease(ckey);
+}
+
+unified_cache::weight_ptr_lease_result unified_cache::acquire_entry_lease(const unified_cache_key & key) {
     weight_ptr_lease_result result{};
-    if (!key.valid) {
+    if (!key.id.valid) {
         return result;
     }
-    static const ggml_layout_mode       try_layouts[] = { GGML_LAYOUT_COALESCED, GGML_LAYOUT_SOA, GGML_LAYOUT_AOS };
     std::shared_lock<std::shared_mutex> lock(rw_mutex_);
-    for (auto layout : try_layouts) {
-        unified_cache_key ckey{ cache_entry_type::DENSE_WEIGHT, key, -1, -1 };
-        auto              entry_it = entries_.find(ckey);
-        if (entry_it == entries_.end()) {
-            continue;
+    {
+        auto entry_it = entries_.find(key);
+        if (entry_it != entries_.end()) {
+            auto & entry = entry_it->second;
+            if (entry.state != cache_entry_state::READY) {
+                return result;
+            }
+            if (!entry.device_ptr) {
+                return result;
+            }
+            // HOST_MMAP entries hold raw mmap pointers — not GPU-accessible; same
+            // filter as get_weight_ptr so mem_handle semantics are consistent.
+            if (entry.location == cache_location::HOST_MMAP) {
+                return result;
+            }
+            // Bump the lease refcount under shared_lock.  Visible to any evictor
+            // that later acquires the unique_lock (acq_rel ordering).
+            entry.in_use_count.fetch_add(1);
+            result.ptr       = entry.device_ptr;
+            result.layout    = entry.layout;
+            result.on_device = !entry.host_resident;
+            result.entry     = &entry;  // pointer stable across unordered_map inserts
+            return result;
         }
-        auto & entry = entry_it->second;
-        if (entry.state != cache_entry_state::READY) {
-            continue;
-        }
-        if (!entry.device_ptr) {
-            continue;
-        }
-        // HOST_MMAP entries hold raw mmap pointers — not GPU-accessible; same
-        // filter as get_weight_ptr so mem_handle semantics are consistent.
-        if (entry.location == cache_location::HOST_MMAP) {
-            continue;
-        }
-        // Bump the lease refcount under shared_lock.  Visible to any evictor
-        // that later acquires the unique_lock (acq_rel ordering).
-        entry.in_use_count.fetch_add(1);
-        result.ptr       = entry.device_ptr;
-        result.layout    = entry.layout;
-        result.on_device = !entry.host_resident;
-        result.entry     = &entry;  // pointer stable across unordered_map inserts
-        return result;
     }
     lock.unlock();
 
@@ -3097,8 +3672,10 @@ unified_cache::weight_ptr_lease_result unified_cache::acquire_weight_lease(
     // (cpu_mul_mat → DNNL) must check on_device=false.
     {
         std::shared_lock<std::shared_mutex> dlock(direct_stage_mutex_);
-        auto                                it = direct_weight_entries_.find(key);
-        if (it != direct_weight_entries_.end() && it->second.ptr) {
+        const auto &                        entries =
+            key.type == cache_entry_type::MOE_EXPERT ? direct_expert_entries_ : direct_weight_entries_;
+        auto it = entries.find(key.id);
+        if (it != entries.end() && it->second.ptr) {
             result.ptr       = it->second.ptr;
             result.layout    = it->second.layout;
             result.on_device = (it->second.location == cache_location::DEVICE);
@@ -3210,15 +3787,20 @@ void unified_cache::remove(const ggml_sycl_cache_id & key_id,
     // pointer we are about to free.  Log loudly and skip.
     const uint32_t remove_leases = it->second.in_use_count.load();
     if (remove_leases > 0) {
-        GGML_LOG_WARN(
-            "[UNIFIED-CACHE] remove refused: model=%llu name_hash=0x%llx layout=%d in_use=%u (entry kept)\n",
-            (unsigned long long) key_id.model_id, (unsigned long long) key_id.name_hash,
-            (int) it->second.layout, remove_leases);
+        GGML_LOG_WARN("[UNIFIED-CACHE] remove refused: model=%llu name_hash=0x%llx layout=%d in_use=%u (entry kept)\n",
+                      (unsigned long long) key_id.model_id, (unsigned long long) key_id.name_hash,
+                      (int) it->second.layout, remove_leases);
         return;
     }
 
     enqueue_deferred_free(it->second.device_ptr, it->second.size);
 
+    if (type == cache_entry_type::MOE_EXPERT && layer_id == 0 && expert_id == 0) {
+        fprintf(stderr,
+                "[MOE-ENTRY-ERASE] path=remove layer=%d expert=%d layout=%d size=%zu pinned=%d state=%d\n",
+                layer_id, expert_id, (int) it->second.layout, it->second.size, it->second.pinned ? 1 : 0,
+                (int) it->second.state);
+    }
     entries_.erase(it);
     id_to_key_.erase(key_id);
 }
@@ -3813,6 +4395,13 @@ size_t unified_cache::evict_one(size_t /* new_size */) {
         void * ptr           = it->second.device_ptr;
         bool   host_resident = it->second.host_resident;
         int    entry_layout  = static_cast<int>(it->second.layout);
+        if (it->second.type == cache_entry_type::MOE_EXPERT && it->second.layer_id == 0 && it->second.expert_id == 0) {
+            fprintf(stderr,
+                    "[MOE-ENTRY-ERASE] path=evict_one layer=%d expert=%d layout=%d size=%zu pinned=%d state=%d "
+                    "host_resident=%d\n",
+                    it->second.layer_id, it->second.expert_id, entry_layout, entry_size, it->second.pinned ? 1 : 0,
+                    (int) it->second.state, host_resident ? 1 : 0);
+        }
         GGML_SYCL_DEBUG("[UNIFIED-CACHE] evict model=%llu name_hash=0x%llx layout=%d size=%zu host_resident=%d\n",
                         (unsigned long long) evict_key.id.model_id, (unsigned long long) evict_key.id.name_hash,
                         (int) it->second.layout, entry_size, host_resident ? 1 : 0);
@@ -4635,6 +5224,115 @@ void unified_cache::reset_stats() {
     misses_ = 0;
 }
 
+void unified_cache::reset_model_weight_entries() {
+    // Model load is a quiescent boundary for inference. Drain cache queues so
+    // direct-entry metadata cannot be cleared while an S1 copy/reorder from the
+    // previous model is still in flight.
+    try {
+        queue_.wait();
+        if (dma_queue_) {
+            dma_queue_->wait();
+        }
+        if (bcs_queue_) {
+            bcs_queue_->wait();
+        }
+    } catch (const sycl::exception & e) {
+        GGML_LOG_WARN("[UNIFIED-CACHE] reset_model_weight_entries queue drain failed: %s\n", e.what());
+    }
+
+    struct stale_alloc {
+        void *         ptr           = nullptr;
+        size_t         size          = 0;
+        cache_location location      = cache_location::UNKNOWN;
+        bool           host_resident = false;
+        bool           pool_allocated = false;
+    };
+    std::vector<stale_alloc> to_free;
+    const bool               trace_reset        = moe_direct_trace_enabled();
+    const size_t             weight_used_before = zone_used(vram_zone_id::WEIGHT);
+    const size_t             weight_avail_before = zone_available(vram_zone_id::WEIGHT);
+    const size_t             weight_largest_before = zone_largest_free(vram_zone_id::WEIGHT);
+    size_t                   entries_seen       = 0;
+    size_t                   entries_erased     = 0;
+    size_t                   entries_preserved  = 0;
+    size_t                   bytes_erased       = 0;
+    size_t                   direct_weights_before = 0;
+    size_t                   direct_experts_before = 0;
+    {
+        std::shared_lock<std::shared_mutex> lock(direct_stage_mutex_);
+        direct_weights_before = direct_weight_entries_.size();
+        direct_experts_before = direct_expert_entries_.size();
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+        for (auto it = entries_.begin(); it != entries_.end();) {
+            unified_cache_entry & entry = it->second;
+            const uint32_t        live  = entry.in_use_count.load();
+            entries_seen++;
+            if (live != 0) {
+                entries_preserved++;
+                GGML_LOG_WARN(
+                    "[UNIFIED-CACHE] preserving stale model weight with live leases model=%llu name_hash=0x%llx "
+                    "leases=%u\n",
+                    (unsigned long long) it->first.id.model_id, (unsigned long long) it->first.id.name_hash, live);
+                ++it;
+                continue;
+            }
+            if (entry.device_ptr) {
+                to_free.push_back(
+                    { entry.device_ptr, entry.size, entry.location, entry.host_resident, entry.pool_allocated });
+                bytes_erased += entry.size;
+            }
+            id_to_key_.erase(it->first.id);
+            it = entries_.erase(it);
+            entries_erased++;
+        }
+        layer_ready_.clear();
+        layer_weights_.clear();
+        layer_layouts_.clear();
+    }
+    for (const stale_alloc & alloc : to_free) {
+        if (!alloc.ptr) {
+            continue;
+        }
+        if (alloc.host_resident || alloc.location == cache_location::HOST_PINNED) {
+            if (host_zones_configured()) {
+                host_zone_free(host_zone_id::WEIGHT, alloc.ptr);
+            } else {
+                host_pool_free(alloc.ptr, alloc.size);
+            }
+            continue;
+        }
+        if (vram_owns(alloc.ptr)) {
+            zone_free(vram_zone_id::WEIGHT, alloc.ptr);
+        } else if (layout_pool_ && layout_pool_->owns(alloc.ptr)) {
+            saturating_sub_used(alloc.size);
+        } else {
+            enqueue_deferred_free(alloc.ptr, alloc.size);
+        }
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(direct_stage_mutex_);
+        direct_weight_entries_.clear();
+        direct_expert_entries_.clear();
+    }
+
+    has_evictions_.store(false, std::memory_order_relaxed);
+    evictions_in_flight_.store(0, std::memory_order_relaxed);
+    if (trace_reset) {
+        GGML_LOG_INFO(
+            "[UNIFIED-CACHE] reset model weight entries: entries seen=%zu erased=%zu preserved_live=%zu "
+            "queued_free=%.1f MB direct_before weight=%zu expert=%zu "
+            "weight_zone used %.1f->%.1f MB avail %.1f->%.1f MB largest %.1f->%.1f MB\n",
+            entries_seen, entries_erased, entries_preserved, bytes_erased / (1024.0 * 1024.0),
+            direct_weights_before, direct_experts_before, weight_used_before / (1024.0 * 1024.0),
+            zone_used(vram_zone_id::WEIGHT) / (1024.0 * 1024.0), weight_avail_before / (1024.0 * 1024.0),
+            zone_available(vram_zone_id::WEIGHT) / (1024.0 * 1024.0),
+            weight_largest_before / (1024.0 * 1024.0), zone_largest_free(vram_zone_id::WEIGHT) / (1024.0 * 1024.0));
+    }
+    GGML_SYCL_DEBUG("[UNIFIED-CACHE] reset model weight entries\n");
+}
+
 bool unified_cache::validate() const {
     std::unique_lock<std::shared_mutex> lock(rw_mutex_);
     bool                                ok = true;
@@ -5030,7 +5728,7 @@ void set_total_gpu_count(int count) {
 //   - No cross-device depends_on() or USM sharing — each context is isolated.
 //   - Synchronization uses host-side event.wait() between queues.
 static sycl::queue * g_shared_ctx_queues[GGML_SYCL_MAX_DEVICES] = {};
-static bool g_shared_ctx_queues_initialized = false;
+static bool          g_shared_ctx_queues_initialized            = false;
 
 void init_shared_context_queues(int total_gpus) {
     if (g_shared_ctx_queues_initialized) {
@@ -5317,27 +6015,27 @@ static unified_cache * create_cache_for_device(int                     device_id
                       budget / (1024.0f * 1024.0f), pct);
     }
 
-    const size_t staging_bytes = resolve_host_staging_bytes();
+    const size_t staging_bytes       = resolve_host_staging_bytes();
     // Total VRAM for arena_reserve's runtime-headroom calculation.  Sourced
     // from the hint when supplied (mid ggml_sycl_init() — calling
     // ggml_backend_sycl_get_device_memory() there would reenter
     // ggml_sycl_info() and deadlock), otherwise queried directly.
-    size_t total_vram_for_ctor = hint ? hint->total_mem : size_t(0);
+    size_t       total_vram_for_ctor = hint ? hint->total_mem : size_t(0);
     if (total_vram_for_ctor == 0) {
         size_t free_unused = 0;
         ggml_backend_sycl_get_device_memory(device_id, &free_unused, &total_vram_for_ctor);
     }
     try {
-        g_device_caches[device_id]  = std::make_unique<unified_cache>(
-            queue, budget, staging_bytes, dma_reserve_bytes, total_vram_for_ctor);
+        g_device_caches[device_id] =
+            std::make_unique<unified_cache>(queue, budget, staging_bytes, dma_reserve_bytes, total_vram_for_ctor);
         // Always baseline pre-existing runtime reservations so they don't
         // eat into the cache's weight budget.  Allocations that existed before
         // cache creation (DMA pre-reserve, probe residuals) are already
         // accounted for in the budget calculation — only NEW runtime
         // allocations after this point should reduce available cache space.
-        const size_t reserved_total = runtime_reserved_bytes_nolock(device_id);
+        const size_t reserved_total    = runtime_reserved_bytes_nolock(device_id);
         // Baseline no longer stored separately — arena zones provide the single source of truth.
-        const size_t baseline       = 0;  // No baseline adjustment needed with arena zones.
+        const size_t baseline          = 0;  // No baseline adjustment needed with arena zones.
         const size_t reserved_adjusted = runtime_reserved_adjusted_nolock(device_id);
         // Defer update_reserved_bytes to caller (after releasing g_cache_rw_mutex)
         // to avoid deadlock: update_reserved_bytes → recalc → layer streaming
@@ -5526,27 +6224,33 @@ static bool unified_free_record(const runtime_alloc_record & rec) {
         }
         // Zone-managed allocations: route through handle.zone_managed fields.
         // VRAM TLSF zones (zone_managed=true, vram_zone!=COUNT): call zone_free() for O(1) reclaim.
-        // Host zones use TLSF; WEIGHT zone supports per-alloc zone_free. SCRATCH/STAGING/KV are
-        // bump-reset: their callers allocate→use→abandon within a well-defined scope ended by
-        // host_zone_reset(). Per-alloc free on those would fragment without benefit.
+        // Host zones use TLSF. WEIGHT and persistent KV zones support
+        // per-alloc zone_free. EXPERT_STAGING in SCRATCH is also scoped and
+        // reclaimable: PP MoE CPU fallback allocates act/out slabs per expert
+        // and releases them after synchronous D2H → CPU → H2D completion.
+        // Other SCRATCH/STAGING users remain reset-scoped and are reclaimed by
+        // host_zone_reset().
         // Bump-arena device allocations (from_arena=true, vram_zone==COUNT): freed by arena_reset().
         if (rec.handle.zone_managed) {
             if (rec.handle.vram_zone != vram_zone_id::COUNT) {
                 unified_cache_zone_free(rec.handle.device, rec.handle.vram_zone, rec.handle.ptr);
-            } else if (rec.handle.host_zone == host_zone_id::WEIGHT) {
-                // WEIGHT zone: per-alloc lifetime — return to TLSF zone allocator.
+            } else if (rec.handle.host_zone == host_zone_id::WEIGHT || rec.handle.host_zone == host_zone_id::KV ||
+                       (rec.handle.host_zone == host_zone_id::SCRATCH &&
+                        rec.handle.role == alloc_role::EXPERT_STAGING)) {
+                // These zones/roles have per-allocation lifetimes and must be
+                // reclaimable during rollback or scoped MoE CPU fallback.
                 auto * cache = get_unified_cache_for_device(rec.handle.device);
                 if (cache) {
                     if (!rec.handle.all_segments.empty()) {
                         for (const auto & seg : rec.handle.all_segments) {
-                            cache->host_zone_free(host_zone_id::WEIGHT, seg.ptr);
+                            cache->host_zone_free(rec.handle.host_zone, seg.ptr);
                         }
                     } else {
-                        cache->host_zone_free(host_zone_id::WEIGHT, rec.handle.ptr);
+                        cache->host_zone_free(rec.handle.host_zone, rec.handle.ptr);
                     }
                 }
             }
-            // SCRATCH/STAGING/KV host zones: reset-only by design — freed by host_zone_reset().
+            // SCRATCH/STAGING host zones: reset-only by design — freed by host_zone_reset().
             // Assertion: every zone-managed alloc must be accounted for by a known zone type.
             GGML_ASSERT(rec.handle.vram_zone != vram_zone_id::COUNT || rec.handle.host_zone != host_zone_id::COUNT);
             return true;
@@ -5663,7 +6367,10 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
         int                     mode = s_phase_gate_mode.load(std::memory_order_relaxed);
         if (mode < 0) {
             const char * env = std::getenv("GGML_SYCL_ALLOC_PHASE_GATE");
-            mode             = (env != nullptr) ? std::atoi(env) : 1;  // Default ON warn mode (0=off, 1=warn, 2=assert)
+            // Diagnostic gate only. Default logging here interleaves with token
+            // output and breaks deterministic completion checks; enable it
+            // explicitly when auditing steady-state allocation regressions.
+            mode             = (env != nullptr) ? std::atoi(env) : 0;  // 0=off, 1=warn, 2=assert
             s_phase_gate_mode.store(mode, std::memory_order_relaxed);
         }
         if (mode > 0) {
@@ -5795,6 +6502,11 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                     out->vram_zone    = vram_zone_id::KV;
                     GGML_SYCL_DEBUG("[UNIFIED-ALLOC] KV arena alloc: dev=%d size=%.1f MB ptr=%p\n", req.device,
                                     alloc_size / (1024.0 * 1024.0), ptr);
+                } else if (req.intent.constraints.must_device) {
+                    GGML_SYCL_DEBUG(
+                        "[UNIFIED-ALLOC] KV arena zone full for must-device request "
+                        "(need %.1f MB, avail %.1f MB); trying raw device allocation\n",
+                        alloc_size / (1024.0 * 1024.0), cache->zone_available(vram_zone_id::KV) / (1024.0 * 1024.0));
                 } else {
                     // Shared zone full (weights consumed most of it).
                     // Fall back to host-pinned KV instead of raw device alloc
@@ -5814,21 +6526,27 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
         if (!ptr && kv_spill_to_host) {
             reserve_device = false;
             reserve_host   = true;
+            tier           = alloc_tier::HOST_PINNED;
         }
     }
     if (!ptr && (tier == alloc_tier::HOST_PINNED || kv_spill_to_host)) {
         // Always try the pre-allocated pinned chunk pool first (lock-free path).
         if (auto * ucache = get_unified_cache_for_device(req.device)) {
-            // Route to the correct host zone based on role.  KV spills go to KV
+            // Route to the correct host zone based on role. KV spills go to KV
             // zone; permanent weight data (WEIGHT role) goes to WEIGHT zone so
-            // it is never recycled by STAGING zone resets; everything else
-            // (ephemeral per-graph activation staging) stays in STAGING.
+            // it is never recycled by reset-scoped zones. EXPERT_STAGING is
+            // CPU compute scratch (act/out slabs for MoE CPU fallback), so it
+            // uses SCRATCH and can be reclaimed by scoped smart-handle owners.
+            // Transfer/readback staging stays in STAGING.
             auto select_zone = [&]() {
                 if (kv_spill_to_host || req.intent.role == alloc_role::KV) {
                     return host_zone_id::KV;
                 }
                 if (req.intent.role == alloc_role::WEIGHT) {
                     return host_zone_id::WEIGHT;
+                }
+                if (req.intent.role == alloc_role::EXPERT_STAGING) {
+                    return host_zone_id::SCRATCH;
                 }
                 return host_zone_id::STAGING;
             };
@@ -6293,9 +7011,11 @@ static void category_to_intent(alloc_category cat, alloc_intent & intent) {
             intent.category = runtime_category::STAGING;
             break;
         case alloc_category::CONTROL:
-            intent.role                    = alloc_role::GRAPH_TMP;
-            intent.category                = runtime_category::GRAPH;
-            intent.constraints.must_device = true;
+            intent.role                         = alloc_role::CONTROL;
+            intent.category                     = runtime_category::CONTROL;
+            intent.constraints.must_host_pinned = true;
+            intent.constraints.must_device      = false;
+            intent.constraints.use_pinned_pool  = false;
             break;
         case alloc_category::EXPERT_CACHE:
             intent.role     = alloc_role::EXPERT_STAGING;
@@ -6318,7 +7038,7 @@ int alloc_category_priority(alloc_category cat) {
         case alloc_category::WEIGHT:
             return 2;  // attention weights: used every token
         case alloc_category::CONTROL:
-            return 2;  // tiny, must be on device
+            return 4;  // host-control, not a VRAM eviction participant
         case alloc_category::EXPERT_CACHE:
             return 3;  // MoE experts: evictable via LRU/frequency
         case alloc_category::STAGING:
@@ -6457,6 +7177,8 @@ size_t unified_cache_get_runtime_bytes_by_category(int device, runtime_category 
             return 0;  // Host memory — not tracked by VRAM zones
         case runtime_category::EXPERT_CACHE:
             return cache->zone_used(vram_zone_id::RUNTIME);
+        case runtime_category::CONTROL:
+            return 0;  // Host-pinned control memory, not VRAM
         case runtime_category::OTHER:
             return cache->zone_used(vram_zone_id::ONEDNN);
         case runtime_category::COUNT:
@@ -6897,8 +7619,8 @@ void unpin_all_experts() {
 // === Routing-Aware Expert Pre-staging ===
 
 // Helper: Create a cache ID for an expert that matches the dispatch path's key generation.
-// Uses tensor name hash + cache_uuid + model_id (same as ggml_sycl_get_moe_expert_cache_key
-// in ggml-sycl.cpp) so prestaged entries are found during dispatch.
+// Uses semantic tensor identity (model id + tensor name + expert id + type/dims), not graph-local
+// tensor/extra wrapper identity, so prestaged entries are found across PP/TG graph transitions.
 static ggml_sycl_cache_id make_expert_cache_id(const char * tensor_name,
                                                uint64_t     cache_uuid,
                                                uint32_t     model_id,
@@ -6906,6 +7628,7 @@ static ggml_sycl_cache_id make_expert_cache_id(const char * tensor_name,
                                                ggml_type    tensor_type = GGML_TYPE_COUNT,
                                                int64_t      ne0         = 0,
                                                int64_t      ne1         = 0) {
+    (void) cache_uuid;
     ggml_sycl_cache_id id{};
 
     // Use name-based key with expert_id suffix for per-expert uniqueness.
@@ -6936,10 +7659,7 @@ static ggml_sycl_cache_id make_expert_cache_id(const char * tensor_name,
     id.ne[2] = 1;
     id.ne[3] = 1;
 
-    // Combine cache_uuid with expert_id — matches ggml_sycl_get_moe_expert_cache_key
-    uint64_t aux = cache_uuid;
-    aux          = detail::cache_hash_combine(aux, static_cast<uint64_t>(expert_id));
-    id.aux_id    = aux;
+    id.aux_id = 0;
 
     return id;
 }
@@ -7208,7 +7928,7 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         onednn_weights_scratch_size_ = weights_size;
     } else {
         try {
-            onednn_weights_scratch_ = sycl::malloc_device(weights_size, queue_);
+            onednn_weights_scratch_ = sycl_aligned_malloc_device(weights_size, queue_);
             if (!onednn_weights_scratch_) {
                 GGML_SYCL_DEBUG("[UNIFIED-CACHE] Failed to allocate oneDNN weights scratch (%.1f MB)\n",
                                 weights_size / (1024.0f * 1024.0f));
@@ -7237,7 +7957,7 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         onednn_activations_scratch_size_ = activations_size;
     } else {
         try {
-            onednn_activations_scratch_ = sycl::malloc_device(activations_size, queue_);
+            onednn_activations_scratch_ = sycl_aligned_malloc_device(activations_size, queue_);
             if (!onednn_activations_scratch_) {
                 GGML_SYCL_DEBUG("[UNIFIED-CACHE] Failed to allocate oneDNN activations scratch (%.1f MB)\n",
                                 activations_size / (1024.0f * 1024.0f));
@@ -7451,7 +8171,7 @@ bool unified_cache::reserve_persistent_scratch(const std::string & buffer_name, 
             }
         }
         try {
-            ptr = sycl::malloc_device(size_bytes, queue_);
+            ptr = sycl_aligned_malloc_device(size_bytes, queue_);
             if (!ptr) {
                 GGML_LOG_ERROR("[UNIFIED-CACHE] Failed to allocate persistent scratch '%s' (%.1f MB)\n",
                                buffer_name.c_str(), size_bytes / (1024.0f * 1024.0f));
@@ -7769,8 +8489,7 @@ unified_cache * unified_cache_register_for_queue(int device_id, sycl::queue & qu
 
     const size_t staging_bytes = 16 * 1024 * 1024;  // 16 MB staging for secondary device
     try {
-        g_device_caches[device_id] =
-            std::make_unique<unified_cache>(queue, budget, staging_bytes, 0, total);
+        g_device_caches[device_id] = std::make_unique<unified_cache>(queue, budget, staging_bytes, 0, total);
         return g_device_caches[device_id].get();
     } catch (const sycl::exception & e) {
         GGML_LOG_ERROR("[UNIFIED-CACHE] Failed to register device %d: %s\n", device_id, e.what());
@@ -7837,7 +8556,7 @@ const weight_entry * unified_cache_lookup_expert(int device_id, ggml_sycl_cache_
 void * unified_cache_raw_malloc_device(size_t size, const sycl::queue & queue) {
     void * ptr = nullptr;
     try {
-        ptr = sycl::malloc_device(size, queue);
+        ptr = sycl_aligned_malloc_device(size, queue);
     } catch (...) {
         return nullptr;
     }
@@ -7962,8 +8681,8 @@ void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
                 GGML_LOG_WARN(
                     "[UNIFIED-CACHE] ensure_cached_alloc: layout switch refused "
                     "model=%llu name_hash=0x%llx in_use=%u have=%d want=%d (reusing old layout)\n",
-                    (unsigned long long) key_id.model_id, (unsigned long long) key_id.name_hash,
-                    ensure_leases, (int) it->second.layout, (int) layout);
+                    (unsigned long long) key_id.model_id, (unsigned long long) key_id.name_hash, ensure_leases,
+                    (int) it->second.layout, (int) layout);
                 // Fall through: use existing entry as-is under its current layout.
             } else {
                 if (it->second.pinned) {
@@ -7976,6 +8695,13 @@ void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
                 void * stale_ptr      = it->second.device_ptr;
                 size_t stale_size     = it->second.size;
                 bool   stale_host_res = it->second.host_resident;
+                if (type == cache_entry_type::MOE_EXPERT && layer_id == 0 && expert_id == 0) {
+                    fprintf(stderr,
+                            "[MOE-ENTRY-ERASE] path=ensure_cached_alloc-layout-switch layer=%d expert=%d "
+                            "have_layout=%d want_layout=%d size=%zu pinned=%d state=%d\n",
+                            layer_id, expert_id, (int) it->second.layout, (int) layout, it->second.size,
+                            it->second.pinned ? 1 : 0, (int) it->second.state);
+                }
                 entries_.erase(it);
                 it = entries_.end();
                 if (!stale_host_res && stale_ptr && stale_size > 0) {
@@ -7986,9 +8712,9 @@ void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
         if (it == entries_.end()) {
             // Fall through to allocation path below
         } else {
-            bool need_realloc    = (alloc_size != it->second.size);
-            bool content_changed = validate_content || (it->second.src_ptr != src_ptr) ||
-                                   (it->second.content_hash != new_hash);
+            bool need_realloc = (alloc_size != it->second.size);
+            bool content_changed =
+                validate_content || (it->second.src_ptr != src_ptr) || (it->second.content_hash != new_hash);
 
             if (need_realloc) {
                 const bool   was_pinned = it->second.pinned;
@@ -8037,8 +8763,8 @@ void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
                 content_changed = true;
             }
 
-            it->second.src_ptr         = src_ptr;
-            it->second.content_hash    = new_hash;
+            it->second.src_ptr      = src_ptr;
+            it->second.content_hash = new_hash;
             it->second.access_count++;
             it->second.last_access     = time_++;
             it->second.state           = cache_entry_state::READY;
@@ -8484,10 +9210,10 @@ bool unified_cache::reserve_compute_arena(size_t arena_bytes) {
 
     // Allocate a single contiguous VRAM block.
     try {
-        compute_arena_ptr_ = sycl::malloc_device(arena_bytes, queue_);
+        compute_arena_ptr_ = sycl_aligned_malloc_device(arena_bytes, queue_);
     } catch (const sycl::exception & e) {
-        GGML_LOG_ERROR("[COMPUTE-ARENA] sycl::malloc_device failed (%.1f MB): %s\n", arena_bytes / (1024.0 * 1024.0),
-                       e.what());
+        GGML_LOG_ERROR("[COMPUTE-ARENA] sycl::aligned_alloc_device failed (%.1f MB): %s\n",
+                       arena_bytes / (1024.0 * 1024.0), e.what());
         compute_arena_ptr_ = nullptr;
     }
 
@@ -8857,6 +9583,26 @@ memory_location query_location(const void * ptr, int device_hint) {
 
     loc.ptr = const_cast<void *>(ptr);
 
+    {
+        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+        auto                        it = g_runtime_alloc_registry.find(loc.ptr);
+        if (it != g_runtime_alloc_registry.end()) {
+            const alloc_handle & h = it->second.handle;
+            loc.device             = h.device;
+            loc.tier               = h.tier;
+            loc.role               = h.role;
+            loc.zone               = h.vram_zone;
+            loc.from_arena         = h.zone_managed && h.vram_zone != vram_zone_id::COUNT;
+            loc.layout             = GGML_LAYOUT_AOS;
+            if (h.host_zone != host_zone_id::COUNT && loc.role == alloc_role::OTHER) {
+                loc.role = h.host_zone == host_zone_id::KV     ? alloc_role::KV :
+                           h.host_zone == host_zone_id::WEIGHT ? alloc_role::WEIGHT :
+                                                                 alloc_role::STAGING;
+            }
+            return loc;
+        }
+    }
+
     // Step 1: Check alloc_registry for tier classification (O(1) binary search).
     const auto * info = alloc_registry::instance().lookup(ptr);
     if (info) {
@@ -8975,6 +9721,186 @@ void unified_cache_reset_scratch_pool(int device_id) {
     }
 }
 
+static size_t align_256(size_t n) {
+    return (n + 255) & ~size_t(255);
+}
+
+static const char * scratch_layout_name(ggml_layout_mode layout) {
+    switch (layout) {
+        case GGML_LAYOUT_AOS:
+            return "aos";
+        case GGML_LAYOUT_SOA:
+            return "soa";
+        case GGML_LAYOUT_COALESCED:
+            return "coalesced";
+        case GGML_LAYOUT_XMX_TILED:
+            return "xmx_tiled";
+        case GGML_LAYOUT_XMX_GEMM_TILED:
+            return "xmx_gemm_tiled";
+        case GGML_LAYOUT_ONEDNN_PACKED:
+            return "onednn_packed";
+        case GGML_LAYOUT_ONEDNN_WOQ:
+            return "onednn_woq";
+    }
+    return "unknown";
+}
+
+static bool moe_q8_1_scratch_supported_type(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_MXFP4:
+            return true;
+        default:
+            return false;
+    }
+}
+
+moe_q8_1_scratch_demand unified_cache_plan_moe_q8_1_scratch(const moe_q8_1_scratch_shape & shape) {
+    moe_q8_1_scratch_demand demand;
+    demand.weight_type   = shape.weight_type;
+    demand.layout        = shape.layout;
+    demand.input_cols    = shape.input_cols;
+    demand.input_rows    = shape.input_rows;
+    demand.buffer_count  = shape.graph_op_count;
+    demand.device_id     = shape.device_id;
+    demand.segment_id    = shape.segment_id;
+    demand.layer_id      = shape.layer_id;
+    demand.n_experts     = shape.n_experts;
+    demand.n_expert_used = shape.n_expert_used;
+
+    if (!moe_q8_1_scratch_supported_type(shape.weight_type) || shape.input_cols <= 0 || shape.input_rows <= 0 ||
+        shape.graph_op_count <= 0) {
+        return demand;
+    }
+
+    constexpr int64_t qk8_1            = 32;
+    constexpr size_t  q8_1_ds_bytes    = 4;  // two fp16 scale values per QK8_1 block
+    demand.supported                   = true;
+    demand.input_cols_padded           = GGML_PAD(shape.input_cols, qk8_1);
+    const size_t q8_1_qs_bytes_per_row = static_cast<size_t>(demand.input_cols_padded);
+    const size_t q8_1_ds_bytes_per_row = static_cast<size_t>(demand.input_cols_padded / qk8_1) * q8_1_ds_bytes;
+    const size_t q8_1_row_bytes        = q8_1_qs_bytes_per_row + q8_1_ds_bytes_per_row;
+    demand.bytes_per_buffer            = static_cast<size_t>(shape.input_rows) * q8_1_row_bytes;
+    demand.aligned_bytes_per_buffer    = align_256(demand.bytes_per_buffer);
+    demand.total_bytes                 = static_cast<size_t>(shape.graph_op_count) * demand.aligned_bytes_per_buffer;
+    return demand;
+}
+
+bool unified_cache_reserve_moe_q8_1_scratch(int device_id, const moe_q8_1_scratch_demand & demand) {
+    if (!demand.supported || demand.total_bytes == 0) {
+        return true;
+    }
+
+    auto * cache = get_unified_cache_for_device(device_id);
+    if (!cache) {
+        GGML_LOG_ERROR("[MOE-GRAPH-SCRATCH] device=%d no unified cache for Q8_1 scratch reserve\n", device_id);
+        return false;
+    }
+
+    const size_t before_capacity = cache->scratch_pool_capacity();
+    if (before_capacity >= demand.total_bytes) {
+        GGML_SYCL_DEBUG(
+            "[MOE-GRAPH-SCRATCH] reserve satisfied device=%d requested=%zu capacity=%zu layout=%s dtype=%d "
+            "buffers=%d per_buffer=%zu aligned=%zu cols=%lld padded=%lld rows=%lld segment=%d layer=%d "
+            "experts=%d used=%d\n",
+            device_id, demand.total_bytes, before_capacity, scratch_layout_name(demand.layout), demand.weight_type,
+            demand.buffer_count, demand.bytes_per_buffer, demand.aligned_bytes_per_buffer,
+            (long long) demand.input_cols, (long long) demand.input_cols_padded, (long long) demand.input_rows,
+            demand.segment_id, demand.layer_id, demand.n_experts, demand.n_expert_used);
+        return true;
+    }
+
+    const bool   ok           = cache->reserve_scratch_pool(demand.total_bytes);
+    const size_t new_capacity = cache->scratch_pool_capacity();
+    if (!ok || new_capacity < demand.total_bytes) {
+        GGML_LOG_ERROR(
+            "[MOE-GRAPH-SCRATCH] reserve failed device=%d requested=%zu capacity_before=%zu capacity_after=%zu "
+            "layout=%s dtype=%d buffers=%d per_buffer=%zu aligned=%zu cols=%lld padded=%lld rows=%lld "
+            "segment=%d layer=%d experts=%d used=%d\n",
+            device_id, demand.total_bytes, before_capacity, new_capacity, scratch_layout_name(demand.layout),
+            demand.weight_type, demand.buffer_count, demand.bytes_per_buffer, demand.aligned_bytes_per_buffer,
+            (long long) demand.input_cols, (long long) demand.input_cols_padded, (long long) demand.input_rows,
+            demand.segment_id, demand.layer_id, demand.n_experts, demand.n_expert_used);
+        return false;
+    }
+
+    GGML_SYCL_DEBUG(
+        "[MOE-GRAPH-SCRATCH] reserved device=%d requested=%zu capacity_before=%zu capacity_after=%zu layout=%s "
+        "dtype=%d buffers=%d per_buffer=%zu aligned=%zu cols=%lld padded=%lld rows=%lld segment=%d layer=%d "
+        "experts=%d used=%d\n",
+        device_id, demand.total_bytes, before_capacity, new_capacity, scratch_layout_name(demand.layout),
+        demand.weight_type, demand.buffer_count, demand.bytes_per_buffer, demand.aligned_bytes_per_buffer,
+        (long long) demand.input_cols, (long long) demand.input_cols_padded, (long long) demand.input_rows,
+        demand.segment_id, demand.layer_id, demand.n_experts, demand.n_expert_used);
+    return true;
+}
+
+bool unified_cache_allocate_moe_q8_1_graph_scratch(int                            device_id,
+                                                   const moe_q8_1_scratch_demand & demand,
+                                                   alloc_handle *                  out) {
+    if (!out) {
+        return false;
+    }
+    *out = {};
+
+    if (!demand.supported || demand.total_bytes == 0) {
+        return true;
+    }
+
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        GGML_LOG_ERROR("[MOE-GRAPH-SCRATCH] graph allocation invalid device=%d requested=%zu\n", device_id,
+                       demand.total_bytes);
+        return false;
+    }
+
+    sycl::queue * queue = nullptr;
+    try {
+        queue = &ggml_sycl_get_device(device_id).default_queue();
+    } catch (...) {
+        GGML_LOG_ERROR("[MOE-GRAPH-SCRATCH] graph allocation missing queue device=%d requested=%zu\n", device_id,
+                       demand.total_bytes);
+        return false;
+    }
+
+    alloc_request req{};
+    req.queue                               = queue;
+    req.device                              = device_id;
+    req.size                                = demand.total_bytes;
+    req.intent.role                         = alloc_role::GRAPH_TMP;
+    req.intent.category                     = runtime_category::GRAPH;
+    req.intent.constraints.must_device      = true;
+    req.intent.constraints.prefer_vram_zone = vram_zone_id::WEIGHT;
+
+    auto *       cache           = get_unified_cache_for_device(device_id);
+    const size_t scratch_capacity = cache ? cache->scratch_pool_capacity() : 0;
+    if (!unified_alloc(req, out) || !out->ptr) {
+        GGML_LOG_ERROR(
+            "[MOE-GRAPH-SCRATCH] graph allocation failed device=%d requested=%zu scratch_capacity=%zu layout=%s "
+            "dtype=%d buffers=%d per_buffer=%zu aligned=%zu cols=%lld padded=%lld rows=%lld segment=%d "
+            "layer=%d experts=%d used=%d\n",
+            device_id, demand.total_bytes, scratch_capacity, scratch_layout_name(demand.layout), demand.weight_type,
+            demand.buffer_count, demand.bytes_per_buffer, demand.aligned_bytes_per_buffer,
+            (long long) demand.input_cols, (long long) demand.input_cols_padded, (long long) demand.input_rows,
+            demand.segment_id, demand.layer_id, demand.n_experts, demand.n_expert_used);
+        *out = {};
+        return false;
+    }
+
+    GGML_SYCL_DEBUG(
+        "[MOE-GRAPH-SCRATCH] graph allocated device=%d ptr=%p requested=%zu scratch_capacity=%zu zone=%d "
+        "layout=%s dtype=%d buffers=%d per_buffer=%zu aligned=%zu cols=%lld padded=%lld rows=%lld segment=%d "
+        "layer=%d experts=%d used=%d\n",
+        device_id, out->ptr, demand.total_bytes, scratch_capacity, static_cast<int>(out->vram_zone),
+        scratch_layout_name(demand.layout), demand.weight_type, demand.buffer_count, demand.bytes_per_buffer,
+        demand.aligned_bytes_per_buffer, (long long) demand.input_cols, (long long) demand.input_cols_padded,
+        (long long) demand.input_rows, demand.segment_id, demand.layer_id, demand.n_experts, demand.n_expert_used);
+    return true;
+}
+
 void unified_cache_grow_host_scratch_zone(size_t additional_bytes) {
     auto * cache = get_unified_cache_for_device(resolve_effective_device(0));
     if (cache) {
@@ -9002,6 +9928,13 @@ void unified_cache_zone_reset(int device_id, vram_zone_id zone) {
     auto * cache = get_unified_cache_for_device(device_id);
     if (cache) {
         cache->zone_reset(zone);
+    }
+}
+
+void unified_cache_reset_model_weight_entries(int device_id) {
+    auto * cache = get_unified_cache_for_device(device_id);
+    if (cache) {
+        cache->reset_model_weight_entries();
     }
 }
 
@@ -9336,23 +10269,33 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     // and no hint was supplied) — in that case we trust the caller's budget
     // and skip the headroom subtraction.
     if (device_total_vram > 0) {
-        const size_t runtime_headroom =
-            std::max<size_t>(2ull * 1024ull * 1024ull * 1024ull, device_total_vram / 6);
+        const size_t runtime_headroom = std::max<size_t>(2ull * 1024ull * 1024ull * 1024ull, device_total_vram / 8);
         if (device_total_vram > runtime_headroom) {
             const size_t arena_cap = device_total_vram - runtime_headroom;
             if (alloc_size > arena_cap) {
                 const size_t prev_alloc = alloc_size;
                 alloc_size              = arena_cap;
-                GGML_LOG_INFO("[VRAM-ARENA] Capping arena at %.1f MB (was %.1f MB) to leave %.0f MB headroom for runtime allocs\n",
-                              alloc_size / (1024.0 * 1024.0), prev_alloc / (1024.0 * 1024.0),
-                              runtime_headroom / (1024.0 * 1024.0));
+                GGML_LOG_INFO(
+                    "[VRAM-ARENA] Capping arena at %.1f MB (was %.1f MB) to leave %.0f MB headroom for runtime "
+                    "allocs\n",
+                    alloc_size / (1024.0 * 1024.0), prev_alloc / (1024.0 * 1024.0),
+                    runtime_headroom / (1024.0 * 1024.0));
             }
         }
     } else {
-        GGML_SYCL_DEBUG("[VRAM-ARENA] device_total_vram=0, skipping runtime-headroom cap "
-                        "(arena reserved at full budget %.1f MB)\n",
-                        alloc_size / (1024.0 * 1024.0));
+        GGML_SYCL_DEBUG(
+            "[VRAM-ARENA] device_total_vram=0, skipping runtime-headroom cap "
+            "(arena reserved at full budget %.1f MB)\n",
+            alloc_size / (1024.0 * 1024.0));
     }
+
+    // Keep every zone base naturally aligned.  The headroom cap above can
+    // produce byte-granular arena sizes (for example total_vram - total_vram/6),
+    // and the tail zones are carved from the end of the arena.  If alloc_size is
+    // not rounded down first, RUNTIME/ONEDNN/SCRATCH suballocations inherit a
+    // misaligned base pointer even though each zone size is aligned.
+    constexpr size_t k_arena_size_alignment = 2ull * 1024ull * 1024ull;
+    alloc_size                              = (alloc_size / k_arena_size_alignment) * k_arena_size_alignment;
 
     // Minimum shared (KV+WEIGHT) zone that is worth carving out.  Below this
     // the arena is useless for weight/KV storage and only aliases the tail
@@ -9372,11 +10315,10 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
             GGML_LOG_WARN(
                 "[VRAM-ARENA] Insufficient budget for single-chunk arena: "
                 "%.1f MB < tail %.1f MB + min shared %.1f MB; refusing reservation\n",
-                alloc_size / (1024.0 * 1024.0), tail_bytes / (1024.0 * 1024.0),
-                k_min_shared_bytes / (1024.0 * 1024.0));
+                alloc_size / (1024.0 * 1024.0), tail_bytes / (1024.0 * 1024.0), k_min_shared_bytes / (1024.0 * 1024.0));
         } else {
             try {
-                ptr = sycl::malloc_device(alloc_size, queue);
+                ptr = sycl_aligned_malloc_device(alloc_size, queue);
             } catch (const sycl::exception & e) {
                 GGML_LOG_WARN("[VRAM-ARENA] Single alloc (%.1f MB) failed: %s\n", alloc_size / (1024.0 * 1024.0),
                               e.what());
@@ -9484,13 +10426,12 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     // tail_bytes + k_min_shared_bytes (so KV has a sane carve-out).  If the
     // total budget is smaller than that, refuse — single-chunk path would
     // already have caught this case via its own min-shared check.
-    const size_t tail_chunk_min  = tail_bytes + k_min_shared_bytes;
+    const size_t tail_chunk_min = tail_bytes + k_min_shared_bytes;
     if (per_chunk_cap < tail_chunk_min) {
         GGML_LOG_WARN(
             "[VRAM-ARENA] Per-chunk cap %.1f MB too small to hold tail zones (%.1f MB) + min KV (%.1f MB); "
             "refusing reservation\n",
-            per_chunk_cap / (1024.0 * 1024.0), tail_bytes / (1024.0 * 1024.0),
-            k_min_shared_bytes / (1024.0 * 1024.0));
+            per_chunk_cap / (1024.0 * 1024.0), tail_bytes / (1024.0 * 1024.0), k_min_shared_bytes / (1024.0 * 1024.0));
         return false;
     }
 
@@ -9502,8 +10443,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
         GGML_LOG_WARN(
             "[VRAM-ARENA] Insufficient budget for N-chunk arena: total %.1f MB < tail %.1f MB + min KV %.1f MB; "
             "refusing reservation\n",
-            alloc_size / (1024.0 * 1024.0), tail_bytes / (1024.0 * 1024.0),
-            k_min_shared_bytes / (1024.0 * 1024.0));
+            alloc_size / (1024.0 * 1024.0), tail_bytes / (1024.0 * 1024.0), k_min_shared_bytes / (1024.0 * 1024.0));
         return false;
     }
 
@@ -9548,7 +10488,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     for (size_t i = 0; i < chunk_sizes.size(); ++i) {
         void * p = nullptr;
         try {
-            p = sycl::malloc_device(chunk_sizes[i], queue);
+            p = sycl_aligned_malloc_device(chunk_sizes[i], queue);
         } catch (const sycl::exception & e) {
             GGML_LOG_WARN("[VRAM-ARENA] N-chunk: chunk %zu (%.1f MB) failed: %s\n", i,
                           chunk_sizes[i] / (1024.0 * 1024.0), e.what());
@@ -9557,8 +10497,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
             p = nullptr;
         }
         if (!p) {
-            GGML_LOG_WARN("[VRAM-ARENA] N-chunk: chunk %zu (%.1f MB) failed\n", i,
-                          chunk_sizes[i] / (1024.0 * 1024.0));
+            GGML_LOG_WARN("[VRAM-ARENA] N-chunk: chunk %zu (%.1f MB) failed\n", i, chunk_sizes[i] / (1024.0 * 1024.0));
             // Roll back any successful allocs.  Log on free failure so a
             // silently leaked chunk leaves a breadcrumb in the operator log.
             for (size_t j = 0; j < arena_chunks_.size(); ++j) {
@@ -9568,8 +10507,8 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
                     try {
                         sycl::free(c.ptr, queue);
                     } catch (const sycl::exception & e) {
-                        GGML_LOG_WARN("[VRAM-ARENA] N-chunk rollback: free of chunk %zu failed (leaking): %s\n",
-                                      j, e.what());
+                        GGML_LOG_WARN("[VRAM-ARENA] N-chunk rollback: free of chunk %zu failed (leaking): %s\n", j,
+                                      e.what());
                     } catch (...) {
                         GGML_LOG_WARN("[VRAM-ARENA] N-chunk rollback: free of chunk %zu failed (leaking)\n", j);
                     }
@@ -9696,18 +10635,15 @@ void * unified_cache::zone_alloc(vram_zone_id zone, size_t size, size_t align) {
             // tlsf_allocator::used() reports.
             const size_t after      = wca.allocator->used();
             const size_t delta      = after - before;
-            const size_t total_used =
-                z.used.fetch_add(delta, std::memory_order_relaxed) + delta;
+            const size_t total_used = z.used.fetch_add(delta, std::memory_order_relaxed) + delta;
             if (profile_active) {
                 const size_t idx = static_cast<size_t>(zone);
                 t_arena_pp_profile.zone_alloc_calls[idx]++;
                 t_arena_pp_profile.zone_alloc_bytes[idx] += size;
                 t_arena_pp_profile.zone_alloc_us[idx] += arena_profile_elapsed_us(t0);
-                t_arena_pp_profile.zone_used_peak[idx] =
-                    std::max(t_arena_pp_profile.zone_used_peak[idx], total_used);
+                t_arena_pp_profile.zone_used_peak[idx] = std::max(t_arena_pp_profile.zone_used_peak[idx], total_used);
                 t_arena_pp_profile.zone_largest_free_min[idx] =
-                    std::min(t_arena_pp_profile.zone_largest_free_min[idx],
-                             wca.allocator->largest_free_block());
+                    std::min(t_arena_pp_profile.zone_largest_free_min[idx], wca.allocator->largest_free_block());
             }
             return offset_to_ptr(wca.logical_start + offset);
         }
@@ -9857,10 +10793,10 @@ void unified_cache::zone_free(vram_zone_id zone, void * ptr) {
             return;
         }
         std::lock_guard<std::mutex> lock(z.alloc_mutex);
-        const auto   chunk_base = reinterpret_cast<uintptr_t>(arena_chunks_[chunk_idx].ptr);
-        const auto   p          = reinterpret_cast<uintptr_t>(ptr);
-        const size_t chunk_off  = static_cast<size_t>(p - chunk_base);
-        const size_t before     = target->allocator->used();
+        const auto                  chunk_base = reinterpret_cast<uintptr_t>(arena_chunks_[chunk_idx].ptr);
+        const auto                  p          = reinterpret_cast<uintptr_t>(ptr);
+        const size_t                chunk_off  = static_cast<size_t>(p - chunk_base);
+        const size_t                before     = target->allocator->used();
         target->allocator->free(chunk_off);
         // Incremental aggregate: see matching fetch_add comment in zone_alloc.
         const size_t after = target->allocator->used();
@@ -10208,6 +11144,68 @@ static int p4_extract_layer_id(const char * name) {
     return std::atoi(blk + 4);
 }
 
+static int count_observed_moe_layers(const placement_plan & plan) {
+    std::unordered_set<int> layers;
+    for (const auto & entry : plan.entries) {
+        if (entry.expert_id >= 0 && entry.layer_id >= 0) {
+            layers.insert(entry.layer_id);
+        }
+    }
+    return static_cast<int>(layers.size());
+}
+
+static const char * placement_target_name(int target, char * buf, size_t buf_size) {
+    if (target < 0) {
+        return "HOST";
+    }
+    std::snprintf(buf, buf_size, "device%d", target);
+    return buf;
+}
+
+static void log_moe_placement_diagnostics(const char * tag, const placement_plan & plan, int n_experts) {
+    if (n_experts <= 0) {
+        return;
+    }
+
+    const int observed_layers = count_observed_moe_layers(plan);
+    if (observed_layers <= 0) {
+        return;
+    }
+
+    const auto summary = plan.summarize_expert_placements(observed_layers, n_experts);
+    GGML_LOG_INFO("[%s] expected=%zu planned=%zu unclassified=%zu duplicates=%zu missing=%zu\n", tag, summary.expected,
+                  summary.planned, summary.unclassified, summary.duplicates, summary.missing);
+    GGML_LOG_INFO("[%s] roles: gate=%zu up=%zu down=%zu unknown=%zu\n", tag,
+                  summary.role_counts[static_cast<size_t>(expert_tensor_role::GATE)],
+                  summary.role_counts[static_cast<size_t>(expert_tensor_role::UP)],
+                  summary.role_counts[static_cast<size_t>(expert_tensor_role::DOWN)],
+                  summary.role_counts[static_cast<size_t>(expert_tensor_role::UNKNOWN)]);
+
+    std::vector<int> targets;
+    targets.reserve(summary.target_counts.size());
+    for (const auto & [target, count] : summary.target_counts) {
+        GGML_UNUSED(count);
+        targets.push_back(target);
+    }
+    std::sort(targets.begin(), targets.end());
+    for (int target : targets) {
+        char target_buf[32];
+        GGML_LOG_INFO("[%s] target %s: %zu expert tensors\n", tag,
+                      placement_target_name(target, target_buf, sizeof(target_buf)), summary.target_counts.at(target));
+    }
+
+    if (observed_layers > 8 && n_experts > 30) {
+        for (expert_tensor_role role : { expert_tensor_role::GATE, expert_tensor_role::UP, expert_tensor_role::DOWN }) {
+            const auto placement = plan.lookup_expert_placement(8, 30, role);
+            char       target_buf[32];
+            GGML_LOG_INFO("[%s] sample blk.8 expert 30 %s: %s\n", tag, expert_tensor_role_name(role),
+                          placement.found() ?
+                              placement_target_name(placement.target_device, target_buf, sizeof(target_buf)) :
+                              "MISSING");
+        }
+    }
+}
+
 static void populate_host_zone_sizing(placement_plan &                                    plan,
                                       const std::vector<std::pair<std::string, size_t>> & tensor_inventory,
                                       int                                                 n_experts,
@@ -10256,9 +11254,12 @@ static void populate_host_zone_sizing(placement_plan &                          
         // 3a. Expert bias D2H: float32 bias per expert across all MoE layers, staged to host.
         plan.expert_bias_bytes = static_cast<size_t>(n_experts) * sizeof(float) * static_cast<size_t>(n_moe_layers);
 
-        // 3b. MoE routing IDs: per-batch expert assignment buffer on device.
+        // 3b. MoE routing IDs: per-batch expert assignment control buffer.
         //     n_expert rows × max_batch_tokens cols, each entry is int32_t.
         //     planner_n_ctx is the maximum context length = conservative max batch size.
+        //     These are CPU-produced and read by any participating GPU, so they
+        //     are planned as shared-context host-pinned CONTROL memory rather
+        //     than VRAM runtime bytes.
         const size_t max_batch_tokens = static_cast<size_t>(std::max<uint32_t>(plan.planner_n_ctx, 1));
         plan.moe_routing_ids_bytes    = static_cast<size_t>(n_experts) * sizeof(int32_t) * max_batch_tokens;
 
@@ -10269,15 +11270,29 @@ static void populate_host_zone_sizing(placement_plan &                          
         plan.moe_expert_ptrs_bytes =
             static_cast<size_t>(k_max_experts_prealloc) * sizeof(void *) * static_cast<size_t>(n_moe_layers);
 
+        // 3d. PP CPU expert act/out staging. These are scoped EXPERT_STAGING
+        //     HOST_COMPUTE allocations routed to host SCRATCH, so the zone only
+        //     needs the peak live act/out pair, not graph-wide accumulation.
+        //     Tensor inventory does not carry K/N, so use the largest MoE
+        //     tensor as a shape-free conservative proxy.
+        size_t max_moe_tensor_bytes = 0;
+        for (const auto & [name, sz] : tensor_inventory) {
+            if (expert_tensor_role_from_tensor_name(name.c_str()) != expert_tensor_role::UNKNOWN) {
+                max_moe_tensor_bytes = std::max(max_moe_tensor_bytes, sz);
+            }
+        }
+        plan.moe_cpu_expert_staging_bytes = max_moe_tensor_bytes;
+
         GGML_LOG_INFO(
             "[SYCL-PLAN] MoE routing buffer sizing: n_experts=%d n_moe_layers=%d "
-            "max_batch=%zu routing_ids=%.2f MB expert_ptrs=%.2f MB\n",
+            "max_batch=%zu control_ids=%.2f MB host-pinned, expert_ptrs=%.2f MB VRAM, cpu_staging=%.2f MB\n",
             n_experts, n_moe_layers, max_batch_tokens, plan.moe_routing_ids_bytes / (1024.0 * 1024.0),
-            plan.moe_expert_ptrs_bytes / (1024.0 * 1024.0));
+            plan.moe_expert_ptrs_bytes / (1024.0 * 1024.0), plan.moe_cpu_expert_staging_bytes / (1024.0 * 1024.0));
     } else {
-        plan.expert_bias_bytes     = 0;
-        plan.moe_routing_ids_bytes = 0;
-        plan.moe_expert_ptrs_bytes = 0;
+        plan.expert_bias_bytes            = 0;
+        plan.moe_routing_ids_bytes        = 0;
+        plan.moe_expert_ptrs_bytes        = 0;
+        plan.moe_cpu_expert_staging_bytes = 0;
     }
 
     // 4. CPU quantization temp buffers: 3 pre-allocated slots (cpu_dispatch_buffers) each
@@ -10347,9 +11362,10 @@ static void populate_host_zone_sizing(placement_plan &                          
     // reservation. 0 when TP disabled (both components are 0).
     plan.tp_vram_runtime_bytes = plan.tp_ffn_buffer_bytes + plan.tp_attn_buffer_bytes;
 
-    // Aggregate MoE routing buffers into a single VRAM RUNTIME reservation field.
-    // 0 for dense models (both components are 0 when n_experts == 0).
-    plan.moe_vram_runtime_bytes = plan.moe_routing_ids_bytes + plan.moe_expert_ptrs_bytes;
+    // Aggregate MoE device-side routing buffers into a single VRAM RUNTIME
+    // reservation field. CPU-produced routing IDs are host-pinned CONTROL data
+    // and are accounted in host staging, not VRAM.
+    plan.moe_vram_runtime_bytes = plan.moe_expert_ptrs_bytes;
 
     // 7. DMA staging pool: device-resident double-buffer for host→device weight streaming.
     //    Two slices, each sized to the largest weight tensor (conservative — actual slice size
@@ -10390,13 +11406,14 @@ static void populate_host_zone_sizing(placement_plan &                          
     plan.host_zone_weight_bytes =
         static_cast<size_t>(static_cast<double>(plan.weight_host_bytes) * k_weight_headroom_ratio);
     plan.host_zone_kv_bytes = std::max<size_t>(k_min_zone_bytes, plan.kv_host_bytes);
-    // Staging zone: baseline (2x max tensor + headroom) plus expert bias D2H and TP staging.
+    // Staging zone: baseline (2x max tensor + headroom) plus expert bias D2H,
+    // cross-device MoE routing CONTROL ids, and TP staging.
     plan.host_zone_staging_bytes =
         std::max<size_t>(k_min_zone_bytes, plan.max_tensor_bytes * 2 + k_tp_staging_headroom + plan.expert_bias_bytes +
-                                               plan.tp_staging_buffer_bytes);
+                                               plan.moe_routing_ids_bytes + plan.tp_staging_buffer_bytes);
     // SCRATCH zone: baseline (max_tensor + headroom) plus oneDNN reorder, MoE Q8_1 workspace,
-    // MoE routing buffers (routing IDs + expert pointer tables), TP compute buffers, and
-    // DMA staging pool (device double-buffer for weight streaming).
+    // PP CPU expert act/out staging, MoE device routing buffers (expert pointer tables),
+    // TP compute buffers, and DMA staging pool (device double-buffer for weight streaming).
     // VRAM RUNTIME fields (moe/tp/dma) are folded here as conservative zone budgeting —
     // the actual allocations live in the VRAM RUNTIME zone, but the host SCRATCH zone
     // grows proportionally to ensure the planner accounts for peak VRAM usage.
@@ -10404,10 +11421,10 @@ static void populate_host_zone_sizing(placement_plan &                          
     // after the ggml scheduler is created.
     // Note: onednn_scratchpad_bytes goes to the ONEDNN zone (separate 256 MB allocation),
     // not counted here.
-    plan.host_zone_scratch_bytes =
-        std::max<size_t>(k_min_zone_bytes, plan.max_tensor_bytes + k_scratch_headroom + plan.onednn_reorder_bytes +
-                                               plan.moe_q8_workspace_bytes + plan.moe_vram_runtime_bytes +
-                                               plan.tp_vram_runtime_bytes + plan.dma_staging_pool_bytes);
+    plan.host_zone_scratch_bytes = std::max<size_t>(
+        k_min_zone_bytes, plan.max_tensor_bytes + k_scratch_headroom + plan.onednn_reorder_bytes +
+                              plan.moe_q8_workspace_bytes + plan.moe_cpu_expert_staging_bytes +
+                              plan.moe_vram_runtime_bytes + plan.tp_vram_runtime_bytes + plan.dma_staging_pool_bytes);
 }
 
 // Maps the int32 flash_attn_type encoding on ggml_sycl_placement_envelope
@@ -10475,6 +11492,7 @@ placement_plan compute_placement_plan(const std::vector<std::pair<std::string, s
             const int                layer_id    = p4_extract_layer_id(name.c_str());
             const size_t             expert_size = src_size / static_cast<size_t>(n_experts);
             const placement_priority prio        = tensor_to_placement_priority(usage, name.c_str());
+            const expert_tensor_role role        = expert_tensor_role_from_tensor_name(name.c_str());
 
             for (int e = 0; e < n_experts; ++e) {
                 placement_entry entry;
@@ -10484,6 +11502,7 @@ placement_plan compute_placement_plan(const std::vector<std::pair<std::string, s
                 entry.kv_size       = 0;
                 entry.layer_id      = layer_id;
                 entry.expert_id     = e;
+                entry.expert_role   = role;
                 entry.priority      = prio;
                 entry.on_device     = false;
                 entry.target_device = -1;
@@ -10530,7 +11549,10 @@ placement_plan compute_placement_plan(const std::vector<std::pair<std::string, s
         if (a.dst_size != b.dst_size) {
             return a.dst_size > b.dst_size;
         }
-        return a.expert_id < b.expert_id;
+        if (a.expert_id != b.expert_id) {
+            return a.expert_id < b.expert_id;
+        }
+        return static_cast<uint8_t>(a.expert_role) < static_cast<uint8_t>(b.expert_role);
     });
 
     // Planner contract:
@@ -10679,6 +11701,7 @@ placement_plan compute_placement_plan(const std::vector<std::pair<std::string, s
 
     // Build the name->index lookup for O(1) queries
     plan.build_index();
+    log_moe_placement_diagnostics("PLACEMENT-MOE", plan, n_experts);
 
     // Log placement summary per priority level
     static const char * priority_names[] = { "NORM/EMBED", "ATTENTION", "FFN",          "MOE_GATE",
@@ -10802,8 +11825,11 @@ multi_gpu_mode get_multi_gpu_mode(bool is_moe) {
             "using default\n",
             env);
     }
-    // Default: hybrid for MoE, layer for dense-only
-    return is_moe ? multi_gpu_mode::HYBRID : multi_gpu_mode::LAYER;
+    // Default: expert parallelism for MoE, layer placement for dense-only.
+    // Hybrid/layer MoE can place dense activations and KV on hidden physical
+    // devices; keep that an explicit opt-in until all cross-device paths are
+    // fully covered.
+    return is_moe ? multi_gpu_mode::EXPERT : multi_gpu_mode::LAYER;
 }
 
 placement_plan compute_multi_device_plan(const std::vector<device_budget> &                  device_budgets,
@@ -10901,6 +11927,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
             const int                layer_id    = p4_extract_layer_id(name.c_str());
             const size_t             expert_size = src_size / static_cast<size_t>(n_experts);
             const placement_priority prio        = tensor_to_placement_priority(usage, name.c_str());
+            const expert_tensor_role role        = expert_tensor_role_from_tensor_name(name.c_str());
 
             for (int e = 0; e < n_experts; ++e) {
                 placement_entry entry;
@@ -10910,6 +11937,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                 entry.kv_size       = 0;
                 entry.layer_id      = layer_id;
                 entry.expert_id     = e;
+                entry.expert_role   = role;
                 entry.priority      = prio;
                 entry.on_device     = false;
                 entry.target_device = -1;
@@ -10953,7 +11981,10 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         if (a.dst_size != b.dst_size) {
             return a.dst_size > b.dst_size;
         }
-        return a.expert_id < b.expert_id;
+        if (a.expert_id != b.expert_id) {
+            return a.expert_id < b.expert_id;
+        }
+        return static_cast<uint8_t>(a.expert_role) < static_cast<uint8_t>(b.expert_role);
     });
 
     // Step 4: Pack entries into devices.
@@ -11094,6 +12125,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
 
     plan.build_index();
+    log_moe_placement_diagnostics("PLACEMENT-MOE", plan, n_experts);
 
     // Build runtime query maps for multi-device inference routing.
 

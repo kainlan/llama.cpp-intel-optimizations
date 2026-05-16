@@ -1,6 +1,6 @@
 #include "binbcast.hpp"
-#include "dnnl-ops.hpp"
 
+#include "dnnl-ops.hpp"
 #include "ggml.h"
 
 #include <cmath>
@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <sycl/sycl.hpp>
 #include <vector>
 
@@ -157,6 +158,33 @@ static void ggml_sycl_debug_check_tensor_ptr(const char * tag, const ggml_tensor
         fprintf(stderr, "[SYCL-ADD-DBG] %s pointer out of range: data=%p need=%zu base=%p size=%zu buft=%s\n", tag,
                 tensor_data, need, base, size, buft ? buft : "(null)");
     }
+}
+
+static bool ggml_sycl_binbcast_needs_raw_host_staging(const ggml_tensor * tensor, const void * resolved_ptr, int) {
+    if (tensor == nullptr || resolved_ptr == nullptr) {
+        return false;
+    }
+    const void * raw_ptr = ggml_sycl_host_data(tensor);
+    if (resolved_ptr != raw_ptr) {
+        return false;
+    }
+
+    const auto * info = ggml_sycl::alloc_registry::instance().lookup(resolved_ptr);
+    if (info != nullptr) {
+        if (info->type == ggml_sycl::alloc_type::DEVICE) {
+            return false;
+        }
+        if (g_ggml_sycl_graph_recording &&
+            (info->type == ggml_sycl::alloc_type::HOST_PINNED || info->type == ggml_sycl::alloc_type::SHARED)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool ggml_sycl_test_binbcast_needs_raw_host_staging(const ggml_tensor * tensor, const void * resolved_ptr, int device) {
+    return ggml_sycl_binbcast_needs_raw_host_staging(tensor, resolved_ptr, device);
 }
 
 template <float (*bin_op)(const float, const float), typename src0_t, typename src1_t, typename dst_t>
@@ -482,6 +510,48 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
     void *    src0_d = ggml_sycl_resolve_tensor_ptr(src0, device);
     void *    src1_d = ggml_sycl_resolve_tensor_ptr(src1, device);
     void *    dst_d  = ggml_sycl_resolve_tensor_ptr(dst, device);
+
+    ggml_sycl::scoped_unified_alloc src0_stage;
+    ggml_sycl::scoped_unified_alloc src1_stage;
+    bool                            staged_raw_host = false;
+
+    auto stage_raw_host_source = [&](const ggml_tensor * tensor, void * resolved_ptr, size_t span_bytes,
+                                     ggml_sycl::scoped_unified_alloc & stage) -> void * {
+        if (!ggml_sycl_binbcast_needs_raw_host_staging(tensor, resolved_ptr, device)) {
+            return resolved_ptr;
+        }
+        if (span_bytes == 0) {
+            return resolved_ptr;
+        }
+
+        ggml_sycl::alloc_request req{};
+        req.queue                          = main_stream;
+        req.device                         = device;
+        req.size                           = span_bytes;
+        req.intent.role                    = ggml_sycl::alloc_role::STAGING;
+        req.intent.category                = ggml_sycl::runtime_category::COMPUTE;
+        req.intent.constraints.must_device = true;
+        if (!stage.allocate(req) || stage.get() == nullptr) {
+            GGML_LOG_ERROR("[SYCL-BINBCAST] failed to stage raw host tensor=%s bytes=%zu device=%d\n",
+                           tensor ? tensor->name : "(null)", span_bytes, device);
+            return resolved_ptr;
+        }
+
+        GGML_SYCL_DEBUG("[SYCL-BINBCAST] staging raw host tensor=%s bytes=%zu device=%d src=%p dst=%p\n",
+                        tensor ? tensor->name : "(null)", span_bytes, device, resolved_ptr, stage.get());
+        if (g_ggml_sycl_graph_recording) {
+            throw std::runtime_error("bin-broadcast raw host staging is not graph-recordable");
+        }
+        ggml_sycl_graph_safe_memcpy(*main_stream, stage.get(), resolved_ptr, span_bytes).wait();
+        staged_raw_host = true;
+        return stage.get();
+    };
+
+    const size_t src0_need = max_end_bytes(ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03);
+    const size_t src1_need = max_end_bytes(ne10, ne11, ne12, ne13, nb10, nb11, nb12, nb13);
+    src0_d                 = stage_raw_host_source(src0, src0_d, src0_need, src0_stage);
+    src1_d                 = stage_raw_host_source(src1, src1_d, src1_need, src1_stage);
+
     GGML_SYCL_DEBUG("[BINBCAST-PTR] src0=%s src0_host=%p src0_d=%p\n", src0 ? src0->name : "(null)",
                     src0 ? const_cast<void *>(ggml_sycl_host_data(src0)) : nullptr, src0_d);
     GGML_SYCL_DEBUG("[BINBCAST-PTR] src1=%s src1_host=%p src1_d=%p\n", src1 ? src1->name : "(null)",
@@ -590,6 +660,10 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
                 }
             }
         }
+    }
+
+    if (staged_raw_host) {
+        main_stream->wait_and_throw();
     }
 }
 
@@ -703,11 +777,10 @@ void ggml_sycl_mul(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) 
         const auto & src0 = dst.src(0);
         const auto & src1 = dst.src(1);
 
-        const bool is_f32     = src0.type() == GGML_TYPE_F32 && src1.type() == GGML_TYPE_F32;
-        const bool contiguous = src0.nb(0) == sizeof(float) && src1.nb(0) == sizeof(float);
-        const bool row_bcast  = src1.ne(1) == 1 && src1.ne(2) == 1 && src1.ne(3) == 1
-                              && src0.ne(0) == src1.ne(0);
-        const int64_t batch   = src0.ne(1) * src0.ne(2) * src0.ne(3);
+        const bool    is_f32     = src0.type() == GGML_TYPE_F32 && src1.type() == GGML_TYPE_F32;
+        const bool    contiguous = src0.nb(0) == sizeof(float) && src1.nb(0) == sizeof(float);
+        const bool    row_bcast  = src1.ne(1) == 1 && src1.ne(2) == 1 && src1.ne(3) == 1 && src0.ne(0) == src1.ne(0);
+        const int64_t batch      = src0.ne(1) * src0.ne(2) * src0.ne(3);
 
         if (is_f32 && contiguous && row_bcast && batch >= 128) {
             const float * src0_ptr = src0.resolve_as<const float>();
@@ -715,11 +788,8 @@ void ggml_sycl_mul(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) 
             float *       dst_ptr  = dst.resolve_as<float>();
             auto          q        = ctx.stream();
 
-            DnnlBinaryWrapper::binary_broadcast_row(
-                ctx, DnnlBinaryWrapper::op::MUL,
-                src0_ptr, src1_ptr, dst_ptr,
-                batch, src0.ne(0),
-                DnnlBinaryWrapper::dt::f32, q);
+            DnnlBinaryWrapper::binary_broadcast_row(ctx, DnnlBinaryWrapper::op::MUL, src0_ptr, src1_ptr, dst_ptr, batch,
+                                                    src0.ne(0), DnnlBinaryWrapper::dt::f32, q);
             return;
         }
     }

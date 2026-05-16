@@ -211,11 +211,27 @@ sudo ldconfig
 
 The patched runtime correctly enforces per-allocation hardware caps (~1.5 GB on Arc B580). Historically the alloc probe in `ggml_sycl_init` did a binary-search of `sycl::malloc_device`/`sycl::free` to converge on `safe_max_alloc_size` (~1593 MB observed) — but on patched libze 1.14.37435 every freed probe chunk lingers in the L0 USM pool's internal cache, eating residual VRAM and surfacing later as `ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` at first kernel launch (mislabeled as `UR_RESULT_ERROR_OUT_OF_RESOURCES` / `40` in SYCL exception text). Commit `28ef6cea1` removed the probe and switched to `safe_max_alloc_size = floor(max_mem_alloc_size * 0.95)` directly — empirically validated against the bench gate (PP512 ≥ 1700, TG128 ≥ 80) on patched libze. **Reverting to stock libze 1.14.37020 without restoring the probe will reintroduce the original silent-oversize-alloc-wedge mode** that the probe was designed to defend against — stock historically accepted oversized allocs that hung at runtime, while patched libze 1.14.37435 fails them cleanly so the direct formula is safe on the supported config.
 
-### SYCL Device Selection (Critical!)
+### SYCL Device Selection
 
-**WARNING**: On multi-GPU systems, you MUST explicitly select a single device. Without this, llama.cpp uses all visible GPUs and the unified kernel will **hang indefinitely**.
+On multi-GPU systems, use `ONEAPI_DEVICE_SELECTOR` to choose the visible Level
+Zero devices. Selector syntax is `backend:devices`: use `level_zero:0` for one
+device, `level_zero:0,1` for a numeric multi-device set, or `level_zero:gpu` for
+all Level Zero GPU devices. The `level_zero:gpu:0` strings printed by some tools
+are display IDs, not valid selector values.
 
 This system has 3 GPUs: Arc B580 (device 0), Arc Pro B50 (device 1), iGPU (device 2).
+
+As of 2026-05-10 after the ECC-off reboot, the B50 initializes with
+`ONEAPI_DEVICE_SELECTOR=level_zero:1`, reports `Memory ECC: Current disabled /
+Pending disabled`, and can run the Mistral 7B Q4_0 completion gate. ECC-off is
+a workstation performance setting with a reliability tradeoff: it raises B50
+reported VRAM from ~14.3 GiB to ~16.3 GiB and improves Mistral 7B Q4_0 from
+~1053 PP512 / ~40 TG128 to ~1197 PP512 / ~44 TG128.
+
+GPT-OSS 20B now fits and runs on the B50-only path. The all-GPU
+`level_zero:0,1` / `level_zero:gpu` path still hits
+`UR_RESULT_ERROR_DEVICE_LOST` in `MUL_MAT`, so use a single-device selector for
+GPT-OSS quick gates.
 
 ```bash
 # List available devices
@@ -223,6 +239,9 @@ sycl-ls
 
 # REQUIRED: Select Arc B580 (device 0) for stable operation
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench ...
+
+# Select all Level Zero GPUs
+ONEAPI_DEVICE_SELECTOR=level_zero:gpu ./build/bin/llama-bench ...
 
 # NOTE: GGML_SYCL_VISIBLE_DEVICES=0 does NOT work - it filters at llama.cpp level
 # but unified cache still sees all Level Zero devices. Use ONEAPI_DEVICE_SELECTOR.
@@ -232,7 +251,7 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench ...
 
 | Metric | tok/s | Notes |
 |--------|-------|-------|
-| PP512 (Level 0, all VRAM) | ~1700 | oneDNN SDPA graph (fattn-xmx-v2 + 5-D GQA) with F16 attention path (GGML_SYCL_F16=ON) |
+| PP512 (Level 0, all VRAM) | ~1700 | default no-FA bench path |
 | TG128 (Level 0, all VRAM) | ~81 | MMVQ fast-path with SOA layout + graph replay + SCRATCH TLSF zone |
 | TG128 (no graph) | ~70 | MMVQ fast-path alone (graph adds ~13%) |
 | PP512 (Level 3, 30% budget) | ~269 | 15/33 GPU layers, rest on CPU |
@@ -241,6 +260,27 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench ...
 | TG128 3-device (B580+B50+CPU) | ~27 | `GGML_SYCL_SPLIT_RATIO="60,32,8"` tensor split |
 | TG128 (persistent TG, phase) | ~30 | `GGML_SYCL_PERSISTENT_TG=1` (experimental) |
 | TG128 (persistent TG, DAG) | ~19 | `GGML_SYCL_PERSISTENT_TG=1` + `PHASE=0 DAG=1` |
+
+### Performance Expectations (Arc Pro B50, ECC Disabled)
+
+Mistral 7B Q4_0:
+
+| Metric | tok/s | Notes |
+|--------|-------|-------|
+| PP512 (Level 0, all VRAM) | ~1197 | default no-FA bench path, ECC disabled |
+| TG128 (Level 0, all VRAM) | ~44 | Coalesced/SOA MMVQ, 70 W power cap |
+
+Do not use `GGML_SYCL_FA_ONEDNN_ALLOW=1` to restore Mistral PP numbers. It can
+raise PP throughput, but the deterministic completion gate produces incorrect
+output with the current nc!=D contiguity bypass.
+
+GPT-OSS 20B MXFP4:
+
+| Device selector | PP512 tok/s | TG128 tok/s | Notes |
+|-----------------|------------:|------------:|-------|
+| `level_zero:1` B50 ECC-off | ~169 | ~17 | Fits in 16.3 GiB reported VRAM |
+| `level_zero:0` B580 | ~66 | ~17 | Smaller VRAM budget causes more pressure |
+| `level_zero:0,1` | fails | fails | `UR_RESULT_ERROR_DEVICE_LOST` multi-device L0 regression |
 
 ### SYCL Environment Variables
 

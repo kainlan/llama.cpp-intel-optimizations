@@ -354,6 +354,105 @@ bool test_kvalues_lut_correct(sycl::queue & q) {
     return true;
 }
 
+bool test_local_joint_matrix_int8_launch(sycl::queue & q) {
+    TEST_BEGIN("MXFP4MoE.LocalJointMatrixInt8Launch");
+
+#if !SYCL_XMX_MOE_AVAILABLE
+    TEST_SKIP("XMX/joint_matrix not available");
+    return true;
+#else
+    constexpr int M       = 8;
+    constexpr int N       = 16;
+    constexpr int K       = 32;
+    constexpr int SG_SIZE = 16;
+
+    int8_t *  d_a = sycl::malloc_device<int8_t>(M * K, q);
+    int8_t *  d_b = sycl::malloc_device<int8_t>(K * N, q);
+    int32_t * d_c = sycl::malloc_device<int32_t>(M * N, q);
+    TEST_ASSERT(d_a && d_b && d_c, "device allocation failed");
+
+    std::vector<int8_t>  h_a(M * K, 1);
+    std::vector<int8_t>  h_b(K * N, 2);
+    std::vector<int32_t> h_c(M * N, 0);
+
+    try {
+        q.memcpy(d_a, h_a.data(), h_a.size() * sizeof(int8_t)).wait();
+        q.memcpy(d_b, h_b.data(), h_b.size() * sizeof(int8_t)).wait();
+        q.memset(d_c, 0, h_c.size() * sizeof(int32_t)).wait();
+
+        q.submit([&](sycl::handler & cgh) {
+             sycl::local_accessor<int8_t, 1>  slm_a(sycl::range<1>(M * K), cgh);
+             sycl::local_accessor<int8_t, 1>  slm_b(sycl::range<1>(K * N), cgh);
+             sycl::local_accessor<int32_t, 1> slm_c(sycl::range<1>(M * N), cgh);
+
+             cgh.parallel_for(sycl::nd_range<1>(SG_SIZE, SG_SIZE),
+                              [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                                  auto sg   = item.get_sub_group();
+                                  int  lane = sg.get_local_linear_id();
+
+                                  for (int i = lane; i < M * K; i += SG_SIZE) {
+                                      slm_a[i] = d_a[i];
+                                  }
+                                  for (int i = lane; i < K * N; i += SG_SIZE) {
+                                      slm_b[i] = d_b[i];
+                                  }
+                                  item.barrier(sycl::access::fence_space::local_space);
+
+                                  joint_matrix<sycl::sub_group, int8_t, use::a, M, K, layout::row_major> mat_a;
+                                  joint_matrix<sycl::sub_group, int8_t, use::b, K, N, layout::col_major> mat_b;
+                                  joint_matrix<sycl::sub_group, int32_t, use::accumulator, M, N>         mat_c;
+
+                                  auto a_ptr =
+                                      sycl::address_space_cast<sycl::access::address_space::local_space,
+                                                               sycl::access::decorated::no>(&slm_a[0]);
+                                  auto b_ptr =
+                                      sycl::address_space_cast<sycl::access::address_space::local_space,
+                                                               sycl::access::decorated::no>(&slm_b[0]);
+                                  auto c_ptr =
+                                      sycl::address_space_cast<sycl::access::address_space::local_space,
+                                                               sycl::access::decorated::no>(&slm_c[0]);
+
+                                  joint_matrix_load(sg, mat_a, a_ptr, K);
+                                  joint_matrix_load(sg, mat_b, b_ptr, K);
+                                  joint_matrix_fill(sg, mat_c, 0);
+                                  joint_matrix_mad(sg, mat_c, mat_a, mat_b, mat_c);
+                                  joint_matrix_store(sg, mat_c, c_ptr, N, layout::row_major);
+                                  sycl::group_barrier(sg);
+
+                                  for (int i = lane; i < M * N; i += SG_SIZE) {
+                                      d_c[i] = slm_c[i];
+                                  }
+                              });
+         }).wait_and_throw();
+
+        q.memcpy(h_c.data(), d_c, h_c.size() * sizeof(int32_t)).wait();
+    } catch (const sycl::exception & e) {
+        fprintf(stderr, "\nSYCL exception: %s\n", e.what());
+        sycl::free(d_a, q);
+        sycl::free(d_b, q);
+        sycl::free(d_c, q);
+        TEST_ASSERT(false, "local joint_matrix int8 kernel failed");
+    }
+
+    bool ok = true;
+    for (int32_t v : h_c) {
+        if (v != 64) {
+            ok = false;
+            break;
+        }
+    }
+
+    sycl::free(d_a, q);
+    sycl::free(d_b, q);
+    sycl::free(d_c, q);
+
+    TEST_ASSERT(ok, "local joint_matrix int8 output mismatch");
+    fprintf(stderr, "(verified local int8 joint_matrix load/store) ");
+    TEST_PASS();
+    return true;
+#endif
+}
+
 // =============================================================================
 // Test 3: FusedSingleKernelLaunch
 //
@@ -959,6 +1058,9 @@ int main(int argc, char ** argv) {
 
     // Test 2: KValuesLUTCorrect
     all_passed &= test_kvalues_lut_correct(q);
+
+    // Test 2b: actual local-memory int8 joint_matrix launch
+    all_passed &= test_local_joint_matrix_int8_launch(q);
 
     // Test 3: FusedSingleKernelLaunch
     all_passed &= test_fused_single_kernel_launch(q);

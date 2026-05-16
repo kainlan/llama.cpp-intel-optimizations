@@ -125,12 +125,43 @@ constexpr int XMX_N_SG = XMX_NTHREADS / XMX_SG;  // 32 sub-groups
 
 // Number of KV positions to process per main loop iteration
 // Optimal: 32 balances loop overhead vs XMX efficiency
-constexpr int XMX_BATCH_KV = 32;
+constexpr int XMX_BATCH_KV_DEFAULT = 32;
+constexpr int XMX_BATCH_KV_LARGE   = 48;
 
 // Shared memory padding to reduce bank conflicts (32 banks on Intel)
 // IMPORTANT: joint_matrix_load requires stride to be divisible by 8!
-// With XMX_BATCH_KV=16, stride is already 16 (divisible by 8), no pad needed.
+// With batch_kv=16, stride is already 16 (divisible by 8), no pad needed.
 constexpr int XMX_PAD = 0;
+
+inline size_t ggml_sycl_fattn_xmx_v1_shared_mem_bytes(int D, int ncols, int batch_kv) {
+    const int ncols_padded = (ncols < XMX_TM) ? XMX_TM : ncols;
+    const int kt_stride    = batch_kv + XMX_PAD;
+    const int kt_size      = D * kt_stride;
+    const int v_stride     = D + XMX_PAD;
+    const int s_stride     = batch_kv + XMX_PAD;
+    const int d_tiles      = D / XMX_TN;
+    const int k_tiles      = batch_kv / XMX_TK;
+    const int total_work   = d_tiles * k_tiles;
+    const int sv_copies    = ((k_tiles > 1) && (total_work <= XMX_N_SG)) ? k_tiles : 1;
+
+    const size_t shared_half  = (size_t) ncols_padded * D +       // tile_Q
+                                (size_t) kt_size * 2 +            // tile_KT[2]
+                                (size_t) batch_kv * v_stride +    // tile_V
+                                (size_t) ncols_padded * s_stride; // tile_S
+    const size_t shared_float = (size_t) ncols_padded * batch_kv + // QK_acc
+                                (size_t) sv_copies * ncols_padded * D;
+
+    return (shared_half + shared_float * 2) * sizeof(sycl::half);
+}
+
+inline int ggml_sycl_fattn_xmx_v1_select_batch_kv(int D, int ncols, size_t local_mem_size) {
+    if (D == 128 && ncols == XMX_TM &&
+        local_mem_size >= ggml_sycl_fattn_xmx_v1_shared_mem_bytes(D, ncols, XMX_BATCH_KV_LARGE)) {
+        return XMX_BATCH_KV_LARGE;
+    }
+
+    return XMX_BATCH_KV_DEFAULT;
+}
 
 // =============================================================================
 // Flash Attention XMX Kernel - With Double Buffering for K
@@ -142,7 +173,8 @@ constexpr int XMX_PAD = 0;
 //   Q_type: query tensor type (float or sycl::half)
 //   kv_is_fp8: if true, K/V are FP8 E4M3 and need on-the-fly dequantization
 
-template <int D, int ncols, bool use_logit_softcap, typename Q_type, bool kv_is_fp8 = false>
+template <int D, int ncols, bool use_logit_softcap, typename Q_type, int batch_kv = XMX_BATCH_KV_DEFAULT,
+          bool kv_is_fp8 = false>
 static void flash_attn_xmx_f16_kernel(
     const char * __restrict__ Q,
     const char * __restrict__ K,
@@ -185,7 +217,7 @@ static void flash_attn_xmx_f16_kernel(
     sycl::half * shared_mem) {
 
     static_assert(D % XMX_TK == 0, "Head dimension D must be divisible by XMX_TK (16)");
-    static_assert(XMX_BATCH_KV % XMX_TN == 0, "BATCH_KV must be divisible by XMX_TN (16)");
+    static_assert(batch_kv % XMX_TN == 0, "BATCH_KV must be divisible by XMX_TN (16)");
 
     // PagedAttention note: seq_lens is used to get per-sequence KV length when needed
     // Currently the kernel uses mask-based KV bounds, but seq_lens can be used for optimization
@@ -267,24 +299,24 @@ static void flash_attn_xmx_f16_kernel(
     constexpr int ncols_padded = (ncols < XMX_TM) ? XMX_TM : ncols;
 
     // tile_Q:      [ncols_padded][D] half - padded to XMX_TM for XMX loads
-    // tile_KT[2]:  [D][XMX_BATCH_KV + PAD] half x 2 - K transposed, DOUBLE BUFFERED
-    // tile_V:      [XMX_BATCH_KV][D + PAD] half - V tile with padding for XMX stride
-    // tile_S:      [ncols_padded][XMX_BATCH_KV + PAD] half - Softmax weights for XMX S@V
-    // QK_acc:      [ncols_padded][XMX_BATCH_KV] float - QK scores before softmax
+    // tile_KT[2]:  [D][batch_kv + PAD] half x 2 - K transposed, DOUBLE BUFFERED
+    // tile_V:      [batch_kv][D + PAD] half - V tile with padding for XMX stride
+    // tile_S:      [ncols_padded][batch_kv + PAD] half - Softmax weights for XMX S@V
+    // QK_acc:      [ncols_padded][batch_kv] float - QK scores before softmax
     // SV_acc:      [ncols_padded][D] float - S@V result for current batch
-    constexpr int KT_STRIDE = XMX_BATCH_KV + XMX_PAD;  // Padded stride (must be divisible by 8!)
+    constexpr int KT_STRIDE = batch_kv + XMX_PAD;  // Padded stride (must be divisible by 8!)
     constexpr int KT_SIZE = D * KT_STRIDE;
     constexpr int V_STRIDE = D + XMX_PAD;  // V stride with padding for XMX
-    constexpr int S_STRIDE = XMX_BATCH_KV + XMX_PAD;  // S stride with padding for XMX
+    constexpr int S_STRIDE = batch_kv + XMX_PAD;  // S stride with padding for XMX
 
     sycl::half * tile_Q = shared_mem;
     sycl::half * tile_KT[2];
     tile_KT[0] = tile_Q + ncols_padded * D;
     tile_KT[1] = tile_KT[0] + KT_SIZE;  // Second buffer for double buffering
     sycl::half * tile_V = tile_KT[1] + KT_SIZE;
-    sycl::half * tile_S = tile_V + XMX_BATCH_KV * V_STRIDE;
+    sycl::half * tile_S = tile_V + batch_kv * V_STRIDE;
     float * QK_acc = reinterpret_cast<float*>(tile_S + ncols_padded * S_STRIDE);
-    float * SV_acc = QK_acc + ncols_padded * XMX_BATCH_KV;
+    float * SV_acc = QK_acc + ncols_padded * batch_kv;
 
     // =========================================================================
     // Load Q into shared memory (scaled) - ALL threads participate
@@ -394,7 +426,7 @@ static void flash_attn_xmx_f16_kernel(
     // =========================================================================
     // Start from seq_kv_start when multi-sequence batching is enabled
     const int kv_loop_start = seq_kv_start;
-    int kv_count_prefetch = sycl::min(XMX_BATCH_KV, seq_kv_end - kv_loop_start);
+    int kv_count_prefetch = sycl::min(batch_kv, seq_kv_end - kv_loop_start);
 
     // Load K[kv_loop_start:kv_loop_start+BATCH_KV] transposed into tile_KT[0]
     for (int idx = tid; idx < kv_count_prefetch * D; idx += XMX_NTHREADS) {
@@ -424,10 +456,10 @@ static void flash_attn_xmx_f16_kernel(
         }
     }
     // Zero-pad if first batch is partial
-    if (kv_count_prefetch < XMX_BATCH_KV) {
-        for (int idx = tid; idx < D * (XMX_BATCH_KV - kv_count_prefetch); idx += XMX_NTHREADS) {
-            const int d = idx / (XMX_BATCH_KV - kv_count_prefetch);
-            const int k_off = idx % (XMX_BATCH_KV - kv_count_prefetch);
+    if (kv_count_prefetch < batch_kv) {
+        for (int idx = tid; idx < D * (batch_kv - kv_count_prefetch); idx += XMX_NTHREADS) {
+            const int d = idx / (batch_kv - kv_count_prefetch);
+            const int k_off = idx % (batch_kv - kv_count_prefetch);
             if (d < D) {
                 tile_KT[0][d * KT_STRIDE + kv_count_prefetch + k_off] = sycl::half(0.0f);
             }
@@ -462,8 +494,8 @@ static void flash_attn_xmx_f16_kernel(
     // NOTE: mask can be arbitrary (not necessarily causal). Do not apply causal skip
     // based on mask presence, or we can incorrectly skip valid KV positions.
 
-    for (int kv_start = kv_loop_start; kv_start < kv_loop_end_bound; kv_start += XMX_BATCH_KV) {
-        const int kv_end = sycl::min(kv_start + XMX_BATCH_KV, seq_kv_end);
+    for (int kv_start = kv_loop_start; kv_start < kv_loop_end_bound; kv_start += batch_kv) {
+        const int kv_end = sycl::min(kv_start + batch_kv, seq_kv_end);
         const int kv_count = kv_end - kv_start;
 
         // Current K^T buffer to use for computation
@@ -474,8 +506,8 @@ static void flash_attn_xmx_f16_kernel(
         sycl::half * tile_KT_next = tile_KT[buf_load];
 
         // Compute next batch bounds for prefetching
-        const int next_kv_start = kv_start + XMX_BATCH_KV;
-        const int next_kv_end = sycl::min(next_kv_start + XMX_BATCH_KV, seq_kv_end);
+        const int next_kv_start = kv_start + batch_kv;
+        const int next_kv_end = sycl::min(next_kv_start + batch_kv, seq_kv_end);
         const int next_kv_count = next_kv_end - next_kv_start;
         // Only prefetch if next batch is within loop boundary
         const bool has_next = (next_kv_start < kv_loop_end_bound);
@@ -488,7 +520,7 @@ static void flash_attn_xmx_f16_kernel(
         if (head == 0 && tid == 0 && (ic0 + ncols - 1) == (ne01 - 1)) {
             sycl::ext::oneapi::experimental::printf(
                 "[K_CHECK] kv_batch=%d kv_start=%d ne01=%d ne11=%d kv_loop_end=%d seq_kv_end=%d\n",
-                kv_start / XMX_BATCH_KV, kv_start, ne01, ne11, kv_loop_end_bound, seq_kv_end);
+                kv_start / batch_kv, kv_start, ne01, ne11, kv_loop_end_bound, seq_kv_end);
         }
 #endif
         // Phase 2b DISABLED - no need to initialize QK_acc since all tiles computed
@@ -498,7 +530,7 @@ static void flash_attn_xmx_f16_kernel(
             for (int q_tile = sg_id * XMX_TM; q_tile < ncols_padded; q_tile += XMX_N_SG * XMX_TM) {
                 if (q_tile >= ncols_padded) continue;
 
-                for (int k_tile = 0; k_tile < XMX_BATCH_KV; k_tile += XMX_TN) {
+                for (int k_tile = 0; k_tile < batch_kv; k_tile += XMX_TN) {
                     // Phase 2b: Check if this XMX tile (q_tile:q_tile+8 x k_tile:k_tile+16)
                     // has any valid query-KV pairs. If not, skip the XMX computation.
                     // KV positions in this tile: [kv_start + k_tile, kv_start + k_tile + XMX_TN)
@@ -534,8 +566,8 @@ static void flash_attn_xmx_f16_kernel(
 
                     sycl_xmx::joint_matrix_store(sg, mat_QK,
                         sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
-                            &QK_acc[q_tile * XMX_BATCH_KV + k_tile]),
-                        XMX_BATCH_KV, sycl_xmx::layout::row_major);
+                            &QK_acc[q_tile * batch_kv + k_tile]),
+                        batch_kv, sycl_xmx::layout::row_major);
                 }
             }
         }
@@ -556,7 +588,7 @@ static void flash_attn_xmx_f16_kernel(
         for (int j = tid; j < ncols; j += XMX_NTHREADS) {
             if (ic0 + j >= ne01) continue;
 
-            float * qk_row = &QK_acc[j * XMX_BATCH_KV];
+            float * qk_row = &QK_acc[j * batch_kv];
             // Use stride_mask (nb31/sizeof(half)) for mask indexing, matching CUDA implementation
             const sycl::half * mask_row = maskh ? &maskh[j * stride_mask + kv_start] : nullptr;
 
@@ -722,7 +754,7 @@ static void flash_attn_xmx_f16_kernel(
         if (head == 0 && tid == 0 && (ic0 + ncols - 1) == (ne01 - 1)) {
             sycl::ext::oneapi::experimental::printf(
                 "[PREFETCH] kv_batch=%d has_next=%d next_kv_start=%d next_kv_count=%d buf_load=%d\n",
-                kv_start / XMX_BATCH_KV, has_next ? 1 : 0, next_kv_start, next_kv_count, buf_load);
+                kv_start / batch_kv, has_next ? 1 : 0, next_kv_start, next_kv_count, buf_load);
         }
 #endif
         // Prefetch next K batch into tile_KT_next
@@ -781,10 +813,10 @@ static void flash_attn_xmx_f16_kernel(
             }
 #endif
             // Zero-pad if next batch is partial
-            if (next_kv_count < XMX_BATCH_KV) {
-                for (int idx = tid; idx < D * (XMX_BATCH_KV - next_kv_count); idx += XMX_NTHREADS) {
-                    const int d = idx / (XMX_BATCH_KV - next_kv_count);
-                    const int k_off = idx % (XMX_BATCH_KV - next_kv_count);
+            if (next_kv_count < batch_kv) {
+                for (int idx = tid; idx < D * (batch_kv - next_kv_count); idx += XMX_NTHREADS) {
+                    const int d = idx / (batch_kv - next_kv_count);
+                    const int k_off = idx % (batch_kv - next_kv_count);
                     if (d < D) {
                         tile_KT_next[d * KT_STRIDE + next_kv_count + k_off] = sycl::half(0.0f);
                     }
@@ -817,13 +849,13 @@ static void flash_attn_xmx_f16_kernel(
         for (int j = tid; j < ncols; j += XMX_NTHREADS) {
             float batch_max = -FLT_MAX;
             if (ic0 + j < ne01) {
-                const float * row = &QK_acc[j * XMX_BATCH_KV];
+                const float * row = &QK_acc[j * batch_kv];
 #if FATTN_XMX_DEBUG
                 // Debug: Check QK_acc values for tid=0 and 1
                 if (head == 0 && (ic0 + ncols - 1) == (ne01 - 1) && j == 0) {
                     sycl::ext::oneapi::experimental::printf(
                         "[QK_ACC] kv_batch=%d j=%d QK_acc[0..7]=%.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
-                        kv_start / XMX_BATCH_KV, j, row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7]);
+                        kv_start / batch_kv, j, row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7]);
                 }
 #endif
                 int k = 0;
@@ -873,7 +905,7 @@ static void flash_attn_xmx_f16_kernel(
             if (dbg_log && j == (ncols - 1)) {
                 sycl::ext::oneapi::experimental::printf(
                     "  kv_batch=%d: batch_max=%.6f, KQ_max_old->new=%.6f->%.6f, scale_old=%.6f, KQ_sum=%.6f\n",
-                    kv_start / XMX_BATCH_KV, batch_max, batch_max_shared[j] - (new_max - KQ_max[j]), KQ_max[j], scale_old, KQ_sum[j]);
+                    kv_start / batch_kv, batch_max, batch_max_shared[j] - (new_max - KQ_max[j]), KQ_max[j], scale_old, KQ_sum[j]);
             }
 #endif
         }
@@ -889,18 +921,18 @@ static void flash_attn_xmx_f16_kernel(
                 continue;
             }
 
-            const float kq_val = QK_acc[j * XMX_BATCH_KV + k];
+            const float kq_val = QK_acc[j * batch_kv + k];
             // Use FTZ threshold to avoid numerical issues with very small softmax weights
             const float diff = kq_val - KQ_max[j];
             const float w = diff >= SOFTMAX_FTZ_THRESHOLD ? sycl::exp(diff) : 0.0f;
             tile_S[j * S_STRIDE + k] = sycl::half(w);
         }
         // Zero-pad S for positions beyond kv_count in each query row
-        // This is critical for partial batches (kv_count < XMX_BATCH_KV)
+        // This is critical for partial batches (kv_count < batch_kv)
         // Without this, XMX S@V reads uninitialized shared memory
-        if (kv_count < XMX_BATCH_KV) {
+        if (kv_count < batch_kv) {
             const int pad_start = kv_count;
-            const int pad_count = XMX_BATCH_KV - kv_count;
+            const int pad_count = batch_kv - kv_count;
             for (int idx = tid; idx < ncols * pad_count; idx += XMX_NTHREADS) {
                 const int j = idx / pad_count;
                 const int k = pad_start + (idx % pad_count);
@@ -911,8 +943,8 @@ static void flash_attn_xmx_f16_kernel(
         for (int idx = tid; idx < ncols_padded * XMX_PAD; idx += XMX_NTHREADS) {
             const int j_idx = XMX_PAD > 0 ? idx / XMX_PAD : 0;
             const int p_idx = XMX_PAD > 0 ? idx % XMX_PAD : 0;
-            if (j_idx < ncols_padded && XMX_BATCH_KV + p_idx < S_STRIDE) {
-                tile_S[j_idx * S_STRIDE + XMX_BATCH_KV + p_idx] = sycl::half(0.0f);
+            if (j_idx < ncols_padded && batch_kv + p_idx < S_STRIDE) {
+                tile_S[j_idx * S_STRIDE + batch_kv + p_idx] = sycl::half(0.0f);
             }
         }
         // Zero-pad S for padding rows (if ncols < ncols_padded)
@@ -985,7 +1017,7 @@ static void flash_attn_xmx_f16_kernel(
         // Each sub-group handles different D tiles
         // D=64: D_TILES=4, D=128: D_TILES=8, D=256: D_TILES=16
         constexpr int D_TILES = D / XMX_TN;  // Number of output tiles in D dimension
-        constexpr int K_TILES = XMX_BATCH_KV / XMX_TK;  // Reduction tiles (32/16 = 2)
+        constexpr int K_TILES = batch_kv / XMX_TK;  // Reduction tiles (32/16 = 2)
 
         // D=64 PARALLELISM FIX:
         // For D=64, D_TILES=4 but we have 32 sub-groups → only 4 active (87.5% idle!)
@@ -1241,10 +1273,10 @@ static void flash_attn_xmx_f16_kernel(
 // =============================================================================
 
 // Kernel name class for VTune/profiler visibility
-template <int D, int ncols, bool use_logit_softcap, typename Q_type>
+template <int D, int ncols, bool use_logit_softcap, typename Q_type, int batch_kv = XMX_BATCH_KV_DEFAULT>
 class fattn_xmx_f16_kernel_name;
 
-template <int D, int ncols, bool use_logit_softcap, typename Q_type>
+template <int D, int ncols, bool use_logit_softcap, typename Q_type, int batch_kv = XMX_BATCH_KV_DEFAULT>
 void launch_fattn_xmx_f16(
     const fattn_params & params,
     dpct::queue_ptr stream) {
@@ -1256,25 +1288,25 @@ void launch_fattn_xmx_f16(
     constexpr int ncols_padded = (ncols < XMX_TM) ? XMX_TM : ncols;
 
     // tile_Q:      ncols_padded * D * sizeof(half)
-    // tile_KT[2]:  D * (XMX_BATCH_KV + PAD) * sizeof(half) * 2  <-- DOUBLE BUFFERED
-    // tile_V:      XMX_BATCH_KV * (D + PAD) * sizeof(half)  <-- with stride padding
-    // tile_S:      ncols_padded * (XMX_BATCH_KV + PAD) * sizeof(half)  <-- softmax weights
-    // QK_acc:      ncols_padded * XMX_BATCH_KV * sizeof(float)
+    // tile_KT[2]:  D * (batch_kv + PAD) * sizeof(half) * 2  <-- DOUBLE BUFFERED
+    // tile_V:      batch_kv * (D + PAD) * sizeof(half)  <-- with stride padding
+    // tile_S:      ncols_padded * (batch_kv + PAD) * sizeof(half)  <-- softmax weights
+    // QK_acc:      ncols_padded * batch_kv * sizeof(float)
     // SV_acc:      K_TILES * ncols_padded * D * sizeof(float)  <-- S@V partial results for K reduction
-    constexpr int KT_STRIDE = XMX_BATCH_KV + XMX_PAD;
+    constexpr int KT_STRIDE = batch_kv + XMX_PAD;
     constexpr int KT_SIZE = D * KT_STRIDE;
     constexpr int V_STRIDE = D + XMX_PAD;
-    constexpr int S_STRIDE = XMX_BATCH_KV + XMX_PAD;
+    constexpr int S_STRIDE = batch_kv + XMX_PAD;
     constexpr int D_TILES = D / XMX_TN;
-    constexpr int K_TILES = XMX_BATCH_KV / XMX_TK;
+    constexpr int K_TILES = batch_kv / XMX_TK;
     constexpr int TOTAL_WORK_ITEMS = D_TILES * K_TILES;
     // Need K_TILES copies of SV_acc only when doing K reduction (small D)
     constexpr int SV_ACC_COPIES = ((K_TILES > 1) && (TOTAL_WORK_ITEMS <= XMX_N_SG)) ? K_TILES : 1;
     constexpr size_t shared_half = ncols_padded * D +           // tile_Q
                                    KT_SIZE * 2 +                 // tile_KT[2]
-                                   XMX_BATCH_KV * V_STRIDE +     // tile_V
+                                   batch_kv * V_STRIDE +     // tile_V
                                    ncols_padded * S_STRIDE;      // tile_S
-    constexpr size_t shared_float = ncols_padded * XMX_BATCH_KV +        // QK_acc
+    constexpr size_t shared_float = ncols_padded * batch_kv +        // QK_acc
                                     SV_ACC_COPIES * ncols_padded * D;    // SV_acc (with K reduction copies)
     constexpr size_t shared_mem_size = shared_half + shared_float * 2;
 
@@ -1330,14 +1362,14 @@ void launch_fattn_xmx_f16(
         // Capture kv_is_fp8 flag for runtime dispatch
         const bool kv_fp8 = params.kv_is_fp8;
 
-        cgh.parallel_for<fattn_xmx_f16_kernel_name<D, ncols, use_logit_softcap, Q_type>>(
+        cgh.parallel_for<fattn_xmx_f16_kernel_name<D, ncols, use_logit_softcap, Q_type, batch_kv>>(
             sycl::nd_range<3>(grid * block, block),
             [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(XMX_SG)]] {
                 sycl::half * shared = shared_acc.get_multi_ptr<sycl::access::decorated::no>().get();
                 // Runtime dispatch: select kernel based on KV cache type
                 // Note: both kernels are instantiated, but only one path is taken at runtime
                 if (kv_fp8) {
-                    flash_attn_xmx_f16_kernel<D, ncols, use_logit_softcap, Q_type, true>(
+                    flash_attn_xmx_f16_kernel<D, ncols, use_logit_softcap, Q_type, batch_kv, true>(
                         Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, dst_ptr,
                         scale_val, max_bias_val, m0_val, m1_val, n_head_log2_val, logit_softcap_val,
                         ne00, ne01, ne02, ne03,
@@ -1353,7 +1385,7 @@ void launch_fattn_xmx_f16(
                         multi_token_decode, q_positions, kv_base_pos,
                         item, shared);
                 } else {
-                    flash_attn_xmx_f16_kernel<D, ncols, use_logit_softcap, Q_type, false>(
+                    flash_attn_xmx_f16_kernel<D, ncols, use_logit_softcap, Q_type, batch_kv, false>(
                         Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, dst_ptr,
                         scale_val, max_bias_val, m0_val, m1_val, n_head_log2_val, logit_softcap_val,
                         ne00, ne01, ne02, ne03,

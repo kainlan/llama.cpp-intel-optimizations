@@ -9,6 +9,7 @@
 #include "unified-cache.hpp"  // unified_cache_key, ggml_layout_mode
 
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace ggml_sycl {
@@ -104,6 +105,12 @@ class mem_handle {
                                         ggml_layout_mode           layout,
                                         bool                       on_device,
                                         unified_cache_entry *      entry);
+    static mem_handle from_weight_lease(const unified_cache_key & key,
+                                        int                       device,
+                                        void *                    ptr,
+                                        ggml_layout_mode          layout,
+                                        bool                      on_device,
+                                        unified_cache_entry *     entry);
 
     // Create a WEIGHT handle from a bare cache ID + device.
     // Convenience factory for callers that have ggml_sycl_cache_id (e.g.
@@ -128,8 +135,10 @@ class mem_handle {
     //   RUNTIME -> ARENA_RUNTIME, SCRATCH -> ARENA_SCRATCH, ONEDNN -> ARENA_ONEDNN.
     static mem_handle from_arena_zone(int zone_id, size_t offset, size_t size, int device, uint64_t generation);
 
-    // llama.cpp-dyhdl: create a handle from a raw pointer whose arena-chunk
-    // ownership should be reference-counted for the handle's lifetime.
+    // Compatibility/test bridge for legacy raw pointers whose arena-chunk
+    // ownership must be protected while callers are migrated to allocation-time
+    // handles. Production allocation paths should return/store canonical
+    // mem_handles directly instead of reconstructing them from raw pointers.
     //
     // Resolution order:
     //   1. Query unified_cache on `device`: if ptr is in the VRAM arena,
@@ -191,6 +200,14 @@ class mem_handle {
 
     uint64_t generation() const { return arena_gen_; }
 
+    // Handles are usable as temporary unordered_map/set keys for dispatch
+    // planning. Equality prefers the resolved backing pointer when available
+    // so aliases to the same allocation compare equal; unresolved cache-managed
+    // weights fall back to their stable cache identity.
+    bool operator==(const mem_handle & other) const;
+    bool operator!=(const mem_handle & other) const { return !(*this == other); }
+    size_t hash() const;
+
   private:
     // Slow path: re-query the unified cache for the current pointer.
     resolved_ptr resolve_slow() const;
@@ -241,7 +258,7 @@ class mem_handle {
     //   2 = VRAM arena (handle stored in vram_chunk_idx_)
     //
     // Populated:
-    //   - by from_chunk_ptr() for raw-pointer escape migration
+    //   - by from_chunk_ptr() compatibility/test bridge
     //   - by resolve_slow() for WEIGHT handles, so cached weights auto-pin
     //     their chunk (belt + suspenders alongside leased_entry_ refcount)
     //
@@ -251,6 +268,10 @@ class mem_handle {
     mutable uint64_t host_chunk_handle_ = UINT64_MAX;  // pinned_chunk_pool::INVALID_CHUNK_HANDLE
     mutable int32_t  vram_chunk_idx_    = -1;
     mutable int32_t  chunk_device_      = -1;
+};
+
+struct mem_handle_hash {
+    size_t operator()(const mem_handle & h) const { return h.hash(); }
 };
 
 // === layer_weight_handles ===
@@ -292,3 +313,10 @@ bool build_layer_handles(int device, int layer_id, layer_weight_handles & out);
 void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event event);
 
 }  // namespace ggml_sycl
+
+namespace std {
+template <>
+struct hash<ggml_sycl::mem_handle> {
+    size_t operator()(const ggml_sycl::mem_handle & h) const { return h.hash(); }
+};
+}  // namespace std

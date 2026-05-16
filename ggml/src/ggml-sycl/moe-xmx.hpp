@@ -4,6 +4,8 @@
 #include "common.hpp"
 #include "moe-sort.hpp"
 
+#include <cstdio>
+#include <cstdlib>
 #include <sycl/sycl.hpp>
 
 #if __has_include(<sycl/ext/oneapi/matrix/matrix.hpp>)
@@ -1650,9 +1652,27 @@ void launch_xmx_moe_gemm_mxfp4_soa(const uint8_t *      weights_qs,    // [nbloc
     sycl::range<2> local{ static_cast<size_t>(cfg.wg_size), 1 };
 
     const int num_sgs = cfg.wg_size / SG_SIZE;
+    const size_t slm_bytes = static_cast<size_t>(TILES_N * XMX_N * XMX_K) * sizeof(int8_t) +
+                             static_cast<size_t>(num_sgs * XMX_M * XMX_N) * sizeof(int32_t) +
+                             static_cast<size_t>(TILES_M * XMX_M * XMX_K) * sizeof(int8_t) +
+                             static_cast<size_t>(TILES_N * XMX_N) * sizeof(float) +
+                             static_cast<size_t>(TILES_M * XMX_M) * sizeof(float) + 16 * sizeof(int8_t);
 
-    queue
-        .submit([&](sycl::handler & cgh) {
+    static const bool trace = [] {
+        const char * env = std::getenv("GGML_SYCL_MOE_PATH_TRACE");
+        return env && std::atoi(env) != 0;
+    }();
+    if (trace) {
+        std::fprintf(stderr,
+                     "[XMX-MOE-LAUNCH] per_expert_mxfp4_soa tiles=(%d,%d) batch=%lld out=%lld in=%lld grid=(%zu,%zu) "
+                     "local=(%zu,%zu) num_sgs=%d slm_bytes=%zu\n",
+                     TILES_M, TILES_N, (long long) batch, (long long) out_dim, (long long) in_dim, global[0],
+                     global[1], local[0], local[1], num_sgs, slm_bytes);
+    }
+
+    try {
+        queue
+            .submit([&](sycl::handler & cgh) {
             constexpr int                   slm_weights_size = TILES_N * XMX_N * XMX_K;
             sycl::local_accessor<int8_t, 1> slm_weights(sycl::range<1>(slm_weights_size), cgh);
 
@@ -1869,8 +1889,16 @@ void launch_xmx_moe_gemm_mxfp4_soa(const uint8_t *      weights_qs,    // [nbloc
                     }
                 }
             });
-        })
-        .wait();
+            })
+            .wait_and_throw();
+    } catch (const sycl::exception & e) {
+        std::fprintf(stderr,
+                     "[XMX-MOE-FAIL] per_expert_mxfp4_soa tiles=(%d,%d) batch=%lld out=%lld in=%lld grid=(%zu,%zu) "
+                     "local=(%zu,%zu) num_sgs=%d slm_bytes=%zu error=%s\n",
+                     TILES_M, TILES_N, (long long) batch, (long long) out_dim, (long long) in_dim, global[0],
+                     global[1], local[0], local[1], num_sgs, slm_bytes, e.what());
+        throw;
+    }
 }  // end launch_xmx_moe_gemm_mxfp4_soa
 
 // MXFP4 Coalesced XMX GEMM for a single expert's token batch

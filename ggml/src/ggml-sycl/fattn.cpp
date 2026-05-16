@@ -258,8 +258,12 @@ static thread_local tl_fattn_weight_stage g_tl_fattn_weight_stage;
 //
 // `slot_ptr` / `slot_capacity` reference the staging-buffer slot to reuse
 // across calls (one slot per tensor role).
-static const char * ggml_sycl_fattn_stage_weight_src(const ggml_tensor * src, int device, sycl::queue * stream,
-                                                     const char * role, void *& slot_ptr, size_t & slot_capacity) {
+static const char * ggml_sycl_fattn_stage_weight_src(const ggml_tensor * src,
+                                                     int                 device,
+                                                     sycl::queue *       stream,
+                                                     const char *        role,
+                                                     void *&             slot_ptr,
+                                                     size_t &            slot_capacity) {
     if (!src || !stream) {
         return nullptr;
     }
@@ -302,9 +306,10 @@ static const char * ggml_sycl_fattn_stage_weight_src(const ggml_tensor * src, in
         if (!slot_ptr) {
             static bool warned = false;
             if (!warned) {
-                GGML_LOG_WARN("[SYCL] fattn weight staging: failed to allocate %zu bytes for %s; "
-                              "falling back to host-pinned zero-copy (may be slower)\n",
-                              bytes, role);
+                GGML_LOG_WARN(
+                    "[SYCL] fattn weight staging: failed to allocate %zu bytes for %s; "
+                    "falling back to host-pinned zero-copy (may be slower)\n",
+                    bytes, role);
                 warned = true;
             }
             return static_cast<const char *>(resolved);  // Host-pinned USM, still GPU-readable.
@@ -542,6 +547,7 @@ static bool g_sycl_fa_esimd_enabled           = false;
 static bool g_sycl_fa_esimd_initialized       = false;
 static bool g_sycl_fa_safe_decode_initialized = false;
 static bool g_sycl_fa_safe_decode_enabled     = true;
+static bool g_sycl_fa_safe_decode_forced      = false;
 
 static void init_fa_esimd_config() {
     if (g_sycl_fa_esimd_initialized) {
@@ -577,7 +583,7 @@ static void init_fa_onednn_config() {
         return;
     }
     g_sycl_fa_onednn_initialized = true;
-    const char * env = std::getenv("GGML_SYCL_FA_ONEDNN");
+    const char * env             = std::getenv("GGML_SYCL_FA_ONEDNN");
     if (env && (strcmp(env, "0") == 0 || strcmp(env, "false") == 0)) {
         g_sycl_fa_onednn_enabled = false;
         fprintf(stderr, "[SYCL] oneDNN SDPA path disabled (GGML_SYCL_FA_ONEDNN=0)\n");
@@ -604,7 +610,52 @@ static void init_fa_safe_decode_config() {
     const char * env                  = std::getenv("GGML_SYCL_FA_SAFE_DECODE");
     if (env && (strcmp(env, "0") == 0 || strcmp(env, "false") == 0)) {
         g_sycl_fa_safe_decode_enabled = false;
+    } else if (env && (strcmp(env, "1") == 0 || strcmp(env, "true") == 0)) {
+        g_sycl_fa_safe_decode_enabled = true;
+        g_sycl_fa_safe_decode_forced  = true;
     }
+}
+
+ggml_sycl_fattn_decode_policy ggml_sycl_fattn_fast_decode_policy(const fattn_params & params, int D) {
+    if (params.ne01 > 1) {
+        return { false, ggml_sycl_fattn_decode_policy_reason::NOT_SINGLE_QUERY };
+    }
+    if (params.kv_is_fp8) {
+        return { false, ggml_sycl_fattn_decode_policy_reason::FP8_KV_UNSUPPORTED };
+    }
+    // The ESIMD f16 decode kernel implements the stateless attention modifiers
+    // directly: attention sinks after the KV loop, optional logit softcap, and
+    // ALiBi slope scaling. Keep routing descriptors below conservative because
+    // they alter KV addressing or sequence ownership and need separate proof.
+    if (params.use_paged_attn || params.use_paged_layout || params.block_table != nullptr ||
+        params.seq_lens != nullptr) {
+        return { false, ggml_sycl_fattn_decode_policy_reason::PAGED_UNSUPPORTED };
+    }
+    if (params.n_seqs > 1 || params.seq_q_offsets != nullptr || params.seq_kv_offsets != nullptr) {
+        return { false, ggml_sycl_fattn_decode_policy_reason::MULTI_SEQ_UNSUPPORTED };
+    }
+    if (params.q_seq_ids != nullptr || params.kv_seq_ids != nullptr) {
+        return { false, ggml_sycl_fattn_decode_policy_reason::SEQ_IDS_UNSUPPORTED };
+    }
+    if (params.multi_token_decode || params.q_positions != nullptr) {
+        return { false, ggml_sycl_fattn_decode_policy_reason::MULTI_TOKEN_DECODE_UNSUPPORTED };
+    }
+    if (!fattn_vec_supports_head_dim(D)) {
+        return { false, ggml_sycl_fattn_decode_policy_reason::HEAD_DIM_UNSUPPORTED };
+    }
+    if (params.ne12 <= 0 || params.ne02 <= 0 || params.ne02 % params.ne12 != 0) {
+        return { false, ggml_sycl_fattn_decode_policy_reason::HEAD_RATIO_UNSUPPORTED };
+    }
+    if (params.Q_type != GGML_TYPE_F16 && params.Q_type != GGML_TYPE_F32) {
+        return { false, ggml_sycl_fattn_decode_policy_reason::Q_TYPE_UNSUPPORTED };
+    }
+    if (params.K_type != GGML_TYPE_F16) {
+        return { false, ggml_sycl_fattn_decode_policy_reason::K_TYPE_UNSUPPORTED };
+    }
+    if (params.V_type != GGML_TYPE_F16) {
+        return { false, ggml_sycl_fattn_decode_policy_reason::V_TYPE_UNSUPPORTED };
+    }
+    return { true, ggml_sycl_fattn_decode_policy_reason::OK };
 }
 
 // ============================================================================
@@ -916,7 +967,6 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
 // Shape-aware FA dispatch table (5edo8.5)
 // =============================================================================
 
-
 // Dispatcher that selects appropriate kernel based on head dimension and GPU capabilities
 template <int D, typename Q_type>
 static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & ctx, const fattn_params & params) {
@@ -928,9 +978,13 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
 
     // Runtime kernel selection based on GPU capabilities
     // Check if the device has XMX (Intel matrix extension) support
-    sycl::device dev         = stream->get_device();
-    bool         use_xmx     = gpu_has_xmx(dev);
-    const bool   safe_decode = g_sycl_fa_safe_decode_enabled && ne01 <= 1;
+    sycl::device dev                = stream->get_device();
+    bool         use_xmx            = gpu_has_xmx(dev);
+    const auto   fast_decode_policy = ggml_sycl_fattn_fast_decode_policy(params, D);
+    const bool   fast_esimd_decode =
+        fast_decode_policy.fast_esimd_safe && g_sycl_fa_esimd_enabled && fattn_esimd_f16_available();
+    const bool safe_decode =
+        g_sycl_fa_safe_decode_enabled && ne01 <= 1 && (g_sycl_fa_safe_decode_forced || !fast_esimd_decode);
     if (safe_decode) {
         use_xmx = false;
     }
@@ -941,7 +995,7 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
         }();
         if (force_no_xmx) {
             use_xmx = false;
-      }
+        }
     }
 
     // Helper macro to dispatch softcap — defined here so FA_FORCE_PATH can use it.
@@ -953,67 +1007,169 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
         LAUNCHER<D, NCOLS, true, Q_type>(params, stream);  \
     }
 
+#define DISPATCH_NCOLS_BATCH_KV(NCOLS, BATCH_KV, LAUNCHER)           \
+    if (logit_softcap == 0.0f) {                                     \
+        LAUNCHER<D, NCOLS, false, Q_type, BATCH_KV>(params, stream); \
+    } else {                                                         \
+        LAUNCHER<D, NCOLS, true, Q_type, BATCH_KV>(params, stream);  \
+    }
+
 // Same but launcher takes `ctx` first and returns bool (XMX-v2 pattern).
-#define DISPATCH_NCOLS_CTX_ACC(NCOLS, LAUNCHER, ACC_T)                                    \
-    if (logit_softcap == 0.0f) {                                                          \
-        v2_dispatched = LAUNCHER<D, NCOLS, false, Q_type, ACC_T>(ctx, params, stream);    \
-    } else {                                                                              \
-        v2_dispatched = LAUNCHER<D, NCOLS, true, Q_type, ACC_T>(ctx, params, stream);     \
+#define DISPATCH_NCOLS_CTX_ACC(NCOLS, LAUNCHER, ACC_T)                                 \
+    if (logit_softcap == 0.0f) {                                                       \
+        v2_dispatched = LAUNCHER<D, NCOLS, false, Q_type, ACC_T>(ctx, params, stream); \
+    } else {                                                                           \
+        v2_dispatched = LAUNCHER<D, NCOLS, true, Q_type, ACC_T>(ctx, params, stream);  \
     }
 
     // ---- Debug trace: gated by GGML_SYCL_FA_DISPATCH_DEBUG, limited by GGML_SYCL_FA_DISPATCH_DEBUG_LIMIT ----
-    static std::atomic<int>  fattn_dispatch_debug_count  = 0;
-    int  dispatch_debug_counter = fattn_dispatch_debug_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    int  debug_limit             = std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG_LIMIT") ? std::atoi(std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG_LIMIT")) : 32;
-    if (std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG") && dispatch_debug_counter <= debug_limit) {
-        const char *selected =
-            safe_decode ? "(safe)"
-                        : ne01 <= 1 ? "ne1=1"
-                                    : ne01 <= 2 ? "ne1<=2"
-                                                : ne01 <= 4 ? "ne1<=4" : ne01 <= 16 ? "ne1<=16" : "ne1>16";
-        fprintf(stderr, "[SYCL] fattn dispatch [%d/%d] D=%d %s xmx=%d\n",
-                dispatch_debug_counter, debug_limit, D, selected, (int) use_xmx);
+    static std::atomic<int> fattn_dispatch_debug_count = 0;
+    int        dispatch_debug_counter = fattn_dispatch_debug_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    int        debug_limit            = std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG_LIMIT") ?
+                                            std::atoi(std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG_LIMIT")) :
+                                            32;
+    const bool dispatch_debug_enabled =
+        std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG") && dispatch_debug_counter <= debug_limit;
+    auto dispatch_debug_kernel = [&](const char * kernel) {
+        if (dispatch_debug_enabled) {
+            fprintf(stderr, "[SYCL] fattn selected [%d/%d] %s D=%d ne01=%d safe_decode=%d fast_esimd_safe=%d\n",
+                    dispatch_debug_counter, debug_limit, kernel, D, ne01, (int) safe_decode,
+                    (int) fast_decode_policy.fast_esimd_safe);
+        }
+    };
+    if (dispatch_debug_enabled) {
+        const char * selected = safe_decode ? "(safe)" :
+                                ne01 <= 1   ? "ne1=1" :
+                                ne01 <= 2   ? "ne1<=2" :
+                                ne01 <= 4   ? "ne1<=4" :
+                                ne01 <= 16  ? "ne1<=16" :
+                                              "ne1>16";
+        fprintf(stderr,
+                "[SYCL] fattn dispatch [%d/%d] D=%d %s xmx=%d safe_decode=%d fast_esimd_safe=%d forced_safe=%d\n",
+                dispatch_debug_counter, debug_limit, D, selected, (int) use_xmx, (int) safe_decode,
+                (int) fast_decode_policy.fast_esimd_safe, (int) g_sycl_fa_safe_decode_forced);
     }
+
+#if GGML_SYCL_DNNL
+    auto onednn_layout_reason_name = [](ggml_sycl_onednn_fa_layout_reason reason) {
+        switch (reason) {
+            case ggml_sycl_onednn_fa_layout_reason::OK:
+                return "ok";
+            case ggml_sycl_onednn_fa_layout_reason::BELOW_MIN_NCOLS:
+                return "below-min-ncols";
+            case ggml_sycl_onednn_fa_layout_reason::SINKS_UNSUPPORTED:
+                return "sinks-unsupported";
+            case ggml_sycl_onednn_fa_layout_reason::SOFTCAP_UNSUPPORTED:
+                return "softcap-unsupported";
+            case ggml_sycl_onednn_fa_layout_reason::FP8_KV_UNSUPPORTED:
+                return "fp8-kv-unsupported";
+            case ggml_sycl_onednn_fa_layout_reason::MULTI_SEQ_UNSUPPORTED:
+                return "multi-seq-unsupported";
+            case ggml_sycl_onednn_fa_layout_reason::BATCH_UNSUPPORTED:
+                return "batch-unsupported";
+            case ggml_sycl_onednn_fa_layout_reason::PAGED_UNSUPPORTED:
+                return "paged-unsupported";
+            case ggml_sycl_onednn_fa_layout_reason::UNSUPPORTED_D:
+                return "unsupported-D";
+            case ggml_sycl_onednn_fa_layout_reason::EMPTY_KV:
+                return "empty-kv";
+            case ggml_sycl_onednn_fa_layout_reason::KV_NC_STRIDE_MISMATCH:
+                return "kv-nc-stride-mismatch";
+            case ggml_sycl_onednn_fa_layout_reason::HEAD_RATIO_UNSUPPORTED:
+                return "head-ratio-unsupported";
+            case ggml_sycl_onednn_fa_layout_reason::Q_TYPE_UNSUPPORTED:
+                return "q-type-unsupported";
+            case ggml_sycl_onednn_fa_layout_reason::K_TYPE_UNSUPPORTED:
+                return "k-type-unsupported";
+            case ggml_sycl_onednn_fa_layout_reason::V_TYPE_UNSUPPORTED:
+                return "v-type-unsupported";
+            case ggml_sycl_onednn_fa_layout_reason::MASK_TYPE_UNSUPPORTED:
+                return "mask-type-unsupported";
+        }
+        return "unknown";
+    };
+#endif
 
     // GGML_SYCL_FA_FORCE_PATH: override all shape-based kernel selection.
 
-      // ---- GGML_SYCL_FA_FORCE_PATH: override all shape-based kernel selection ----
+    // ---- GGML_SYCL_FA_FORCE_PATH: override all shape-based kernel selection ----
     {
-        const char *force = std::getenv("GGML_SYCL_FA_FORCE_PATH");
+        const char * force = std::getenv("GGML_SYCL_FA_FORCE_PATH");
         if (force) {
-            // Inlined DISPATCH_NCOLS equivalent for softcap-aware dispatch
-            #define DISPATCH_NCOLS(NCOLS, LAUNCHER)                                             \
-                if (logit_softcap == 0.0f) { LAUNCHER<D, NCOLS, false, Q_type>(params, stream); } \
-                else { LAUNCHER<D, NCOLS, true, Q_type>(params, stream); }
-            // Inlined DISPATCH_NCOLS_CTX_ACC equivalent
-            #define DISPATCH_NCOLS_CTX_ACC(NCOLS, LAUNCHER, ACC_T)                                  \
-                if (logit_softcap == 0.0f) { v2_dispatched = LAUNCHER<D, NCOLS, false, Q_type, ACC_T>(ctx, params, stream); } \
-                else { v2_dispatched = LAUNCHER<D, NCOLS, true, Q_type, ACC_T>(ctx, params, stream); }
+            bool force_known = false;
+// Inlined DISPATCH_NCOLS equivalent for softcap-aware dispatch
+#define DISPATCH_NCOLS(NCOLS, LAUNCHER)                    \
+    if (logit_softcap == 0.0f) {                           \
+        LAUNCHER<D, NCOLS, false, Q_type>(params, stream); \
+    } else {                                               \
+        LAUNCHER<D, NCOLS, true, Q_type>(params, stream);  \
+    }
+// Inlined DISPATCH_NCOLS_CTX_ACC equivalent
+#define DISPATCH_NCOLS_CTX_ACC(NCOLS, LAUNCHER, ACC_T)                                 \
+    if (logit_softcap == 0.0f) {                                                       \
+        v2_dispatched = LAUNCHER<D, NCOLS, false, Q_type, ACC_T>(ctx, params, stream); \
+    } else {                                                                           \
+        v2_dispatched = LAUNCHER<D, NCOLS, true, Q_type, ACC_T>(ctx, params, stream);  \
+    }
 
-            if (strcmp(force, "vec") == 0 && !params.kv_is_fp8 && ne01 <= 1 && D <= 256) {
-                GGML_SYCL_KTRACE("fattn FORCE=vec", " D=%d ncols=1 ne01=%d", D, ne01);
-                DISPATCH_NCOLS(1, launch_fattn_vec_f16);
-                return;
-            }
-            if (strcmp(force, "onednn") == 0 && g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled) {
-                GGML_SYCL_KTRACE("fattn FORCE=onednn", " D=%d ne01=%d ne11=%d", D, ne01, params.ne11);
-                if (ggml_sycl_flash_attn_ext_onednn(ctx, params)) {
+            if (strcmp(force, "vec") == 0) {
+                force_known = true;
+                if (!params.kv_is_fp8 && ne01 <= 1 && D <= 256) {
+                    GGML_SYCL_KTRACE("fattn FORCE=vec", " D=%d ncols=1 ne01=%d", D, ne01);
+                    dispatch_debug_kernel("force_vec_f16");
+                    DISPATCH_NCOLS(1, launch_fattn_vec_f16);
                     return;
                 }
+                if (dispatch_debug_enabled) {
+                    fprintf(stderr,
+                            "[SYCL] fattn: GGML_SYCL_FA_FORCE_PATH=vec deferred; requires f16/f32 single-query "
+                            "decode with D<=256 (ne01=%d D=%d kv_fp8=%d)\n",
+                            ne01, D, (int) params.kv_is_fp8);
+                }
             }
+#if GGML_SYCL_DNNL
+            if (strcmp(force, "onednn") == 0 && g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled) {
+                force_known                                     = true;
+                const bool                            multi_seq = (params.n_seqs > 1);
+                const ggml_sycl_onednn_fa_layout_plan plan =
+                    ggml_sycl_flash_attn_ext_onednn_plan(params, params.ne02, params.ne12, params.kv_is_fp8, multi_seq);
+                if (plan.kind == ggml_sycl_onednn_fa_layout_kind::DIRECT ||
+                    plan.kind == ggml_sycl_onednn_fa_layout_kind::MATERIALIZE_REQUIRED) {
+                    GGML_SYCL_KTRACE("fattn FORCE=onednn", " D=%d ne01=%d ne11=%d materialize=%d", D, ne01, params.ne11,
+                                     (int) (plan.kind == ggml_sycl_onednn_fa_layout_kind::MATERIALIZE_REQUIRED));
+                    if (ggml_sycl_flash_attn_ext_onednn(ctx, params)) {
+                        dispatch_debug_kernel("force_onednn");
+                        return;
+                    }
+                    if (plan.kind == ggml_sycl_onednn_fa_layout_kind::MATERIALIZE_REQUIRED) {
+                        fprintf(stderr,
+                                "[SYCL] fattn: GGML_SYCL_FA_FORCE_PATH=onednn MATERIALIZE_REQUIRED_BUT_UNAVAILABLE "
+                                "reason=%s\n",
+                                onednn_layout_reason_name(plan.reason));
+                    }
+                } else {
+                    fprintf(
+                        stderr,
+                        "[SYCL] fattn: GGML_SYCL_FA_FORCE_PATH=onednn REJECTED unsupported layout: kind=%d reason=%s\n",
+                        (int) plan.kind, onednn_layout_reason_name(plan.reason));
+                }
+            }
+#endif
             if (strcmp(force, "xmx-v1") == 0) {
                 // v1 kernel — kept for A/B comparison only — use GGML_SYCL_FA_XMX_V1 instead
                 GGML_SYCL_KTRACE("fattn FORCE=xmx-v1", " D=%d ncols=%d ne01=%d", D, 8, ne01);
+                dispatch_debug_kernel("force_xmx_v1_f16");
                 DISPATCH_NCOLS(8, launch_fattn_xmx_f16);
                 return;
             }
             if (strcmp(force, "xmx-v2-tm16") == 0 || strcmp(force, "xmx-v2-tm8") == 0) {
                 // Actually force XMX-v2 TM variant via env var (TM=8→0, TM=16→1)
-                const char *variant = strcmp(force, "xmx-v2-tm16") == 0 ? "1" : "0";
+                const char * variant = strcmp(force, "xmx-v2-tm16") == 0 ? "1" : "0";
                 GGML_SYCL_KTRACE("fattn FORCE=xmx-v2", " D=%d ncols=%s variant=%s", D, force + 10, variant);
-                bool        v2_dispatched = false;
-                const bool  use_f32_acc   = (params.prec == GGML_PREC_F32);
-                GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=8 ne01=%d prec=%s variant=%s", D, ne01, (int) params.prec, variant);
+                bool       v2_dispatched = false;
+                const bool use_f32_acc   = (params.prec == GGML_PREC_F32);
+                GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=8 ne01=%d prec=%s variant=%s", D, ne01,
+                                 (int) params.prec, variant);
                 {
                     char buf[64];
                     snprintf(buf, sizeof(buf), "GGML_SYCL_FA_XMX_V2_VARIANT=%s", variant);
@@ -1026,37 +1182,53 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
                 }
                 if (!v2_dispatched) {
                     GGML_SYCL_KTRACE("fattn FORCE=xmx-v2 fallback TILE", " D=%d ncols=%d ne01=%d", D, 8, ne01);
+                    dispatch_debug_kernel("force_xmx_v2_fallback_tile_f16");
                     DISPATCH_NCOLS(8, launch_fattn_tile_f16);
+                } else {
+                    dispatch_debug_kernel("force_xmx_v2_f16");
                 }
                 return;
             }
-            if (strcmp(force, "esimd") == 0 && g_sycl_fa_esimd_enabled && fattn_esimd_f16_available()) {
-                GGML_SYCL_KTRACE("fattn FORCE=esimd", " D=%d ne01=%d", D, ne01);
-                fattn_esimd_f16<D, Q_type>(params, *stream);
-                return;
+            if (strcmp(force, "esimd") == 0) {
+                force_known = true;
+                if (g_sycl_fa_esimd_enabled && fattn_esimd_f16_available()) {
+                    GGML_SYCL_KTRACE("fattn FORCE=esimd", " D=%d ne01=%d", D, ne01);
+                    dispatch_debug_kernel("force_esimd_f16");
+                    fattn_esimd_f16<D, Q_type>(params, *stream);
+                    return;
+                }
+                if (dispatch_debug_enabled) {
+                    fprintf(stderr, "[SYCL] fattn: GGML_SYCL_FA_FORCE_PATH=esimd unavailable; falling through\n");
+                }
             }
             if (strcmp(force, "tile") == 0) {
+                force_known = true;
                 GGML_SYCL_KTRACE("fattn FORCE=tile", " D=%d ncols=%d ne01=%d", D, 8, ne01);
+                dispatch_debug_kernel("force_tile_f16");
                 DISPATCH_NCOLS(8, launch_fattn_tile_f16);
                 return;
             }
-            fprintf(stderr, "[SYCL] fattn: unknown GGML_SYCL_FA_FORCE_PATH=%s, falling through\n", force);
+            if (!force_known) {
+                fprintf(stderr, "[SYCL] fattn: unknown GGML_SYCL_FA_FORCE_PATH=%s, falling through\n", force);
+            }
         }
     }
 
     // ---- ESIMD kernel dispatch (uses explicit SIMD operations) ----
     // - Single query (ne01 <= 1): +7% speedup for decode on Mistral 7B
     // - Batched queries (ne01 <= 8): Only for D=64 due to SLM constraints
-    if (!safe_decode && g_sycl_fa_esimd_enabled && fattn_esimd_f16_available()) {
+    if (!safe_decode && fast_esimd_decode) {
         if (ne01 <= 1) {
             // Partitioned kernel: each thread processes disjoint KV ranges
             GGML_SYCL_KTRACE("fattn_esimd_f16", " D=%d ne01=%d", D, ne01);
+            dispatch_debug_kernel("esimd_f16");
             fattn_esimd_f16<D, Q_type>(params, *stream);
             return;
         } else if (false && D == 64 && ne01 <= 8 && fattn_esimd_batched_fits_slm<D>()) {
             // DISABLED: Batched ESIMD is 20% slower than XMX for pp
             // Keep single-query ESIMD for tg (ne01 <= 1) which has +7% speedup
             GGML_SYCL_KTRACE("fattn_esimd_f16_batched", " D=%d ne01=%d", D, ne01);
+            dispatch_debug_kernel("esimd_f16_batched");
             fattn_esimd_f16_batched<D, Q_type>(params, *stream);
             return;
         }
@@ -1069,6 +1241,7 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
     // VEC replaces BOTH the racy XMX (ne01=1 wastes 7/8 tile) and the safe_decode scalar default.
     if (!params.kv_is_fp8 && ne01 <= 1 && D <= 256) {
         GGML_SYCL_KTRACE("fattn_vec_f16", " D=%d ncols=1 ne01=%d", D, ne01);
+        dispatch_debug_kernel("vec_f16");
         DISPATCH_NCOLS(1, launch_fattn_vec_f16);
         return;
     }
@@ -1078,8 +1251,8 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
     // Retired by default for Mistral-like GQA shapes (nc≠D) since oneDNN's
     // 4-D strided layout cannot represent non-contiguous nc-D K planes.
     // Eligible for non-GQA and nc==D shapes.
-    // Opt-in: GGML_SYCL_FA_ONEDNN_ALLOW=1 bypasses the nc==D gate for A/B
-    // testing; output correctness not guaranteed for non-contiguous shapes.
+    // GGML_SYCL_FA_ONEDNN_ALLOW intentionally does not bypass the nc==D gate:
+    // Mistral-like GQA layouts produced deterministic completion corruption.
     // Other eligibility: no sinks, no softcap, f16 KV, D ≤ 512, not multi-
     // seq, not paged-v2, not safe_decode. The paged-v2 block layout stores
     // K/V as [D, block_size, n_blocks] rather than the contiguous [D, n_kv]
@@ -1087,18 +1260,28 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
     // below and must win before the oneDNN branch considers the op.
     // Ineligible: gpt-oss-20b (sinks+softcap), Gemma-2 (softcap), FP8 KV.
     // Falls back to kernel path if oneDNN compile fails or during graph recording.
-   if (!safe_decode && g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled) {
-        const bool multi_seq = (params.n_seqs > 1);
-        if (ggml_sycl_flash_attn_ext_onednn_eligible(params,
-                                                     params.ne02,  // H_q
-                                                     params.ne12,  // H_kv
-                                                     params.kv_is_fp8, multi_seq)) {
-            GGML_SYCL_KTRACE("fattn_onednn", " D=%d ne01=%d ne11=%d H_q=%d H_kv=%d", D, ne01, params.ne11, params.ne02,
-                              params.ne12);
+    if (!safe_decode && g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled) {
+        const bool                            multi_seq = (params.n_seqs > 1);
+        const ggml_sycl_onednn_fa_layout_plan plan      = ggml_sycl_flash_attn_ext_onednn_plan(params,
+                                                                                               params.ne02,  // H_q
+                                                                                               params.ne12,  // H_kv
+                                                                                               params.kv_is_fp8, multi_seq);
+        if (plan.kind == ggml_sycl_onednn_fa_layout_kind::DIRECT ||
+            plan.kind == ggml_sycl_onednn_fa_layout_kind::MATERIALIZE_REQUIRED) {
+            GGML_SYCL_KTRACE("fattn_onednn", " D=%d ne01=%d ne11=%d H_q=%d H_kv=%d materialize=%d", D, ne01,
+                             params.ne11, params.ne02, params.ne12,
+                             (int) (plan.kind == ggml_sycl_onednn_fa_layout_kind::MATERIALIZE_REQUIRED));
             if (ggml_sycl_flash_attn_ext_onednn(ctx, params)) {
+                dispatch_debug_kernel("onednn");
                 return;
             }
-            // Fall through to kernel path on failure
+            if (plan.kind == ggml_sycl_onednn_fa_layout_kind::MATERIALIZE_REQUIRED &&
+                std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG") && dispatch_debug_counter <= debug_limit) {
+                fprintf(
+                    stderr,
+                    "[SYCL] fattn: oneDNN MATERIALIZE_REQUIRED_BUT_UNAVAILABLE; falling back to native FA: reason=%s\n",
+                    onednn_layout_reason_name(plan.reason));
+            }
         }
     }
 #endif  // GGML_SYCL_DNNL
@@ -1115,9 +1298,8 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
             const char * env = std::getenv("GGML_SYCL_FA_XMX_V1_PP");
             return env && std::atoi(env) == 0;
         }();
-        const bool simple_pp_xmx_v1 =
-            !disable_xmx_v1_pp && ne01 >= 8 && D == 128 && params.sinks == nullptr && params.logit_softcap == 0.0f &&
-            !params.kv_is_fp8;
+        const bool simple_pp_xmx_v1 = !disable_xmx_v1_pp && ne01 >= 8 && D == 128 && params.sinks == nullptr &&
+                                      params.logit_softcap == 0.0f && !params.kv_is_fp8;
 
         if (force_xmx_v1 || simple_pp_xmx_v1) {
             // v1 kernel — kept for A/B regression and used for simple D=128 PP
@@ -1126,16 +1308,28 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
             // default.
             if (ne01 <= 1) {
                 GGML_SYCL_KTRACE("fattn_xmx_v1_f16", " D=%d ncols=1 ne01=%d", D, ne01);
+                dispatch_debug_kernel("xmx_v1_f16_ncols1");
                 DISPATCH_NCOLS(1, launch_fattn_xmx_f16);
             } else if (ne01 <= 2) {
                 GGML_SYCL_KTRACE("fattn_xmx_v1_f16", " D=%d ncols=2 ne01=%d", D, ne01);
+                dispatch_debug_kernel("xmx_v1_f16_ncols2");
                 DISPATCH_NCOLS(2, launch_fattn_xmx_f16);
             } else if (ne01 <= 4) {
                 GGML_SYCL_KTRACE("fattn_xmx_v1_f16", " D=%d ncols=4 ne01=%d", D, ne01);
+                dispatch_debug_kernel("xmx_v1_f16_ncols4");
                 DISPATCH_NCOLS(4, launch_fattn_xmx_f16);
             } else {
-                GGML_SYCL_KTRACE("fattn_xmx_v1_f16", " D=%d ncols=8 ne01=%d", D, ne01);
-                DISPATCH_NCOLS(8, launch_fattn_xmx_f16);
+                const size_t local_mem_size = (size_t) dev.get_info<sycl::info::device::local_mem_size>();
+                const int    batch_kv       = ggml_sycl_fattn_xmx_v1_select_batch_kv(D, 8, local_mem_size);
+                GGML_SYCL_KTRACE("fattn_xmx_v1_f16", " D=%d ncols=8 ne01=%d batch_kv=%d local_mem=%zu", D, ne01,
+                                 batch_kv, local_mem_size);
+                if (batch_kv == XMX_BATCH_KV_LARGE) {
+                    dispatch_debug_kernel("xmx_v1_f16_ncols8_large_kv");
+                    DISPATCH_NCOLS_BATCH_KV(8, XMX_BATCH_KV_LARGE, launch_fattn_xmx_f16);
+                } else {
+                    dispatch_debug_kernel("xmx_v1_f16_ncols8");
+                    DISPATCH_NCOLS(8, launch_fattn_xmx_f16);
+                }
             }
         } else {
             // v2 kernel — structurally correct, no SLM aliasing, deterministic.
@@ -1149,8 +1343,8 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
             // up the build-time `afloat` typedef — half under GGML_SYCL_F16,
             // float otherwise. Mirrors CUDA's pattern at
             // ggml/src/ggml-cuda/fattn-wmma-f16.cu:541.
-            bool        v2_dispatched = false;
-            const bool  use_f32_acc   = (params.prec == GGML_PREC_F32);
+            bool       v2_dispatched = false;
+            const bool use_f32_acc   = (params.prec == GGML_PREC_F32);
             if (ne01 <= 1) {
                 GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=1 ne01=%d prec=%d", D, ne01, (int) params.prec);
                 if (use_f32_acc) {
@@ -1158,6 +1352,7 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
                 } else {
                     DISPATCH_NCOLS_CTX_ACC(1, launch_fattn_xmx_v2_f16, afloat);
                 }
+                dispatch_debug_kernel(v2_dispatched ? "xmx_v2_f16_ncols1" : "xmx_v2_f16_ncols1_rejected");
             } else if (ne01 <= 2) {
                 GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=2 ne01=%d prec=%d", D, ne01, (int) params.prec);
                 if (use_f32_acc) {
@@ -1165,6 +1360,7 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
                 } else {
                     DISPATCH_NCOLS_CTX_ACC(2, launch_fattn_xmx_v2_f16, afloat);
                 }
+                dispatch_debug_kernel(v2_dispatched ? "xmx_v2_f16_ncols2" : "xmx_v2_f16_ncols2_rejected");
             } else if (ne01 <= 4) {
                 GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=8 ne01=%d prec=%d", D, ne01, (int) params.prec);
                 if (use_f32_acc) {
@@ -1172,6 +1368,7 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
                 } else {
                     DISPATCH_NCOLS_CTX_ACC(8, launch_fattn_xmx_v2_f16, afloat);
                 }
+                dispatch_debug_kernel(v2_dispatched ? "xmx_v2_f16_ncols8" : "xmx_v2_f16_ncols8_rejected");
             } else if (ne01 <= 16) {
                 GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=16 ne01=%d prec=%d", D, ne01, (int) params.prec);
                 if (use_f32_acc) {
@@ -1179,6 +1376,7 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
                 } else {
                     DISPATCH_NCOLS_CTX_ACC(16, launch_fattn_xmx_v2_f16, afloat);
                 }
+                dispatch_debug_kernel(v2_dispatched ? "xmx_v2_f16_ncols16" : "xmx_v2_f16_ncols16_rejected");
             } else {
                 GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=16 ne01=%d prec=%d", D, ne01, (int) params.prec);
                 if (use_f32_acc) {
@@ -1186,6 +1384,7 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
                 } else {
                     DISPATCH_NCOLS_CTX_ACC(16, launch_fattn_xmx_v2_f16, afloat);
                 }
+                dispatch_debug_kernel(v2_dispatched ? "xmx_v2_f16_ncols16_large" : "xmx_v2_f16_ncols16_large_rejected");
             }
             if (!v2_dispatched) {
                 use_xmx = false;
@@ -1197,15 +1396,19 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
         //                  / v2 SLM-fit failure (see v2_dispatched flip above).
         if (ne01 <= 1) {
             GGML_SYCL_KTRACE("fattn_tile_f16", " D=%d ncols=1 ne01=%d", D, ne01);
+            dispatch_debug_kernel("tile_f16_ncols1");
             DISPATCH_NCOLS(1, launch_fattn_tile_f16);
         } else if (ne01 <= 2) {
             GGML_SYCL_KTRACE("fattn_tile_f16", " D=%d ncols=2 ne01=%d", D, ne01);
+            dispatch_debug_kernel("tile_f16_ncols2");
             DISPATCH_NCOLS(2, launch_fattn_tile_f16);
         } else if (ne01 <= 4) {
             GGML_SYCL_KTRACE("fattn_tile_f16", " D=%d ncols=4 ne01=%d", D, ne01);
+            dispatch_debug_kernel("tile_f16_ncols4");
             DISPATCH_NCOLS(4, launch_fattn_tile_f16);
         } else {
             GGML_SYCL_KTRACE("fattn_tile_f16", " D=%d ncols=8 ne01=%d", D, ne01);
+            dispatch_debug_kernel("tile_f16_ncols8");
             DISPATCH_NCOLS(8, launch_fattn_tile_f16);
         }
     }
@@ -1216,9 +1419,9 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
 
 // Main flash attention entry point
 void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor safe_dst) {
-     GGML_SYCL_PROFILE_SCOPE_FA("flash_attn");
-     // Initialize configuration on first call
-     #if GGML_SYCL_FA_V2_ENABLED
+    GGML_SYCL_PROFILE_SCOPE_FA("flash_attn");
+// Initialize configuration on first call
+#if GGML_SYCL_FA_V2_ENABLED
 #endif
     init_kv_fp8_config();
     init_fa_esimd_config();
@@ -1355,10 +1558,10 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     fattn_params params;
 
     // Use device-specific pointers for TP mode (KV cache is allocated per-device)
-    const int device = ctx.device;
-    params.Q         = static_cast<const char *>(Q_t.resolve_ptr());
-    params.K         = static_cast<const char *>(K_t.resolve_ptr());
-    params.V         = static_cast<const char *>(V_t.resolve_ptr());
+    const int device         = ctx.device;
+    params.Q                 = static_cast<const char *>(Q_t.resolve_ptr());
+    params.K                 = static_cast<const char *>(K_t.resolve_ptr());
+    params.V                 = static_cast<const char *>(V_t.resolve_ptr());
     // llama.cpp-15li2 CRIT-1: FA's src[4] (`sinks`) is a per-layer WEIGHT
     // for GPT-OSS; with host-planned layers it resolves to host-pinned
     // USM.  Stage to device if the resolved pointer is not
@@ -1366,17 +1569,15 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     // even though today it is always a per-batch activation — if a
     // future model makes its mask weight-planned, this will keep working.
     sycl::queue * stream_ptr = ctx.stream();
-    params.mask              = mask ? ggml_sycl_fattn_stage_weight_src(
-                                          mask, device, stream_ptr, "mask",
-                                          g_tl_fattn_weight_stage.mask_dev,
-                                          g_tl_fattn_weight_stage.mask_capacity)
-                                    : nullptr;
-    params.sinks             = sinks ? ggml_sycl_fattn_stage_weight_src(
-                                          sinks, device, stream_ptr, "attn_sinks",
-                                          g_tl_fattn_weight_stage.sinks_dev,
-                                          g_tl_fattn_weight_stage.sinks_capacity)
-                                     : nullptr;
-    params.dst       = safe_dst.resolve_as<float>();
+    params.mask =
+        mask ? ggml_sycl_fattn_stage_weight_src(mask, device, stream_ptr, "mask", g_tl_fattn_weight_stage.mask_dev,
+                                                g_tl_fattn_weight_stage.mask_capacity) :
+               nullptr;
+    params.sinks = sinks ? ggml_sycl_fattn_stage_weight_src(sinks, device, stream_ptr, "attn_sinks",
+                                                            g_tl_fattn_weight_stage.sinks_dev,
+                                                            g_tl_fattn_weight_stage.sinks_capacity) :
+                           nullptr;
+    params.dst   = safe_dst.resolve_as<float>();
 
     // Source tensor types — consumers (e.g. oneDNN SDPA) need these to size byte
     // strides correctly and to build logical tensors with the right data_type.

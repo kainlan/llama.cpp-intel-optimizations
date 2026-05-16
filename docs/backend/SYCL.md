@@ -9,6 +9,7 @@
 - [Linux](#linux)
 - [Windows](#windows)
 - [Environment Variable](#environment-variable)
+- [Cross-device KV placement contract](#cross-device-kv-placement-contract)
 - [Known Issue](#known-issues)
 - [Q&A](#qa)
 - [TODO](#todo)
@@ -408,11 +409,17 @@ found 2 SYCL devices:
 
 #### Choose level-zero devices
 
+`ONEAPI_DEVICE_SELECTOR` uses the `backend:devices` syntax. The device list is
+comma-separated; semicolons separate independent filters/backends. The
+`[level_zero:gpu:0]` strings printed by `llama-ls-sycl-device` are display IDs,
+not valid `ONEAPI_DEVICE_SELECTOR` values.
+
 |Chosen Device ID|Setting|
 |-|-|
 |0|`export ONEAPI_DEVICE_SELECTOR="level_zero:0"` or no action|
 |1|`export ONEAPI_DEVICE_SELECTOR="level_zero:1"`|
-|0 & 1|`export ONEAPI_DEVICE_SELECTOR="level_zero:0;level_zero:1"`|
+|All level-zero GPUs|`export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"`|
+|0 & 1|`export ONEAPI_DEVICE_SELECTOR="level_zero:0,1"`|
 
 #### Execute
 
@@ -701,11 +708,17 @@ found 2 SYCL devices:
 
 #### Choose level-zero devices
 
+`ONEAPI_DEVICE_SELECTOR` uses the `backend:devices` syntax. The device list is
+comma-separated; semicolons separate independent filters/backends. The
+`[level_zero:gpu:0]` strings printed by `llama-ls-sycl-device` are display IDs,
+not valid `ONEAPI_DEVICE_SELECTOR` values.
+
 |Chosen Device ID|Setting|
 |-|-|
 |0|Default option. You may also want to `set ONEAPI_DEVICE_SELECTOR="level_zero:0"`|
 |1|`set ONEAPI_DEVICE_SELECTOR="level_zero:1"`|
-|0 & 1|`set ONEAPI_DEVICE_SELECTOR="level_zero:0;level_zero:1"` or `set ONEAPI_DEVICE_SELECTOR="level_zero:*"`|
+|All level-zero GPUs|`set ONEAPI_DEVICE_SELECTOR="level_zero:gpu"`|
+|0 & 1|`set ONEAPI_DEVICE_SELECTOR="level_zero:0,1"`|
 
 #### Execute
 
@@ -819,6 +832,86 @@ use 1 SYCL GPUs: [0] with Max compute units:512
 | ZES_ENABLE_SYSMAN | 0 (default) or 1 | Support to get free memory of GPU by sycl::aspect::ext_intel_free_memory.<br>Recommended to use when --split-mode = layer |
 | UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS | 0 (default) or 1 | Support malloc device memory more than 4GB.|
 
+#### Flash Attention oneDNN Layout Policy
+
+The SYCL flash-attention oneDNN path uses the oneDNN Graph SDPA pattern
+`MatMul(Q,K^T) -> Divide(scale) -> Add(mask) -> SoftMax -> MatMul(V)`.
+The direct path is enabled only when tensor metadata can be represented safely
+as oneDNN strided logical tensors:
+
+- MHA uses 4-D logical tensors `(batch, heads, seq, head_dim)`.
+- GQA/MQA uses 5-D logical tensors `(batch, kv_heads, head_repetition, seq, head_dim)`.
+- Q/K/V must be f16, mask must be f16 or f32, `head_dim <= 512`, no attention sinks,
+  no logit softcap, no FP8 KV, no multi-sequence batch, tensor batch must be the
+  proven batch-1 descriptor class, K/V must not use paged layouts, and prompt
+  batch must meet `GGML_SYCL_FA_ONEDNN_MIN_NCOLS` (default `8`).
+- Direct GQA/MQA additionally requires the physical K/V token stride to match
+  `head_dim`. If `nc_stride != head_dim`, the planner marks the shape as
+  `MATERIALIZE_REQUIRED` and repacks K/V into dense f16 device buffers before
+  oneDNN execute. Allocation or repack failure still falls back to native FA.
+- oneDNN's GQA example (`/opt/intel/oneapi/dnnl/2025.3/share/doc/dnnl/examples/gqa.cpp`)
+  defines 5-D GQA as Q/output `(mb, kv_heads, head_rep, seq, head_size)`,
+  K/V `(mb, kv_heads, 1, seq, head_size)`, score
+  `(mb, kv_heads, head_rep, seq, seq)`, and mask `(mb, 1, 1, 1, seq)`.
+  The SYCL backend follows that rank/order while using explicit strides for
+  GGML storage.
+
+`GGML_SYCL_FA_FORCE_PATH=onednn` is diagnostic for unsupported layouts: it prints
+the planner reason and falls back instead of bypassing safety. For proven
+MATERIALIZE_REQUIRED GQA/MQA shapes it exercises the materialized oneDNN path.
+`GGML_SYCL_FA_ONEDNN_ALLOW` does not override the layout planner.
+
+Token-generation decode uses a separate native FA policy. The conservative
+safe-decode fallback remains available, but the default now bypasses it for
+single-query f16 descriptor classes with an integral Q-head/KV-head ratio. The
+ESIMD f16 decode kernel implements stateless attention modifiers directly:
+attention sinks, logit softcap, and ALiBi bias may use the fast path. FP8 KV,
+paged K/V, multi-sequence routing/IDs, and multi-token decode remain on the
+conservative path until those address/ownership variants have separate proof.
+`GGML_SYCL_FA_SAFE_DECODE=1` forces the fallback for debugging, and
+`GGML_SYCL_FA_SAFE_DECODE=0` disables the safe-decode gate entirely for A/B
+testing. `GGML_SYCL_FA_DISPATCH_DEBUG=1` prints the selected decode kernel
+(`esimd_f16`, `vec_f16`, `tile_f16`, `xmx_*`, or `onednn`) and the fast-decode
+eligibility bit.
+
+On B580 with Mistral 7B Q4_0, build `5b206c499-dirty`, the fixed default
+`-fa 1` policy measured PP512 `2173.92 +/- 10.01` tok/s and TG128
+`88.42 +/- 0.47` tok/s. The deterministic completion gate also produced the
+expected `1, 2, 3, ..., 10` sequence while default decode selected `esimd_f16`.
+Logs for that validation were `/tmp/kkxtv7.7-default-fa-completion.log` and
+`/tmp/kkxtv7.7-default-fa-pp512-tg128.log`.
+
+On B50 with GPT-OSS 20B MXFP4, build `5b206c499-dirty`, a decode-focused
+`-p 1 -n 16 -fa 1` run selected `esimd_f16` with `fast_esimd_safe=1` for the
+sinks+softcap decode path and measured TG16 `14.65 +/- 0.05` tok/s. The full
+PP512/TG128 GPT-OSS B50 benchmark is currently blocked before decode by a
+separate MoE CPU expert host-zone allocation abort in `MUL_MAT_ID`; see
+`/tmp/kkxtv7.7-gptoss20b-b50-fa-op-relax-pp512-tg128.log`.
+
+The planner-owned materialization contract is implemented separately from the
+oneDNN execute gate:
+
+- Source K/V are f16 GGML flash-attention views with dimensions
+  `[head_dim, kv_tokens, kv_heads, batch]` and byte strides carried by
+  `fattn_params`; the executable materialized path is currently limited to
+  `batch == 1`.
+- Target K/V are dense f16 device buffers on the planned SYCL device with token
+  stride `head_dim * sizeof(f16)` and head stride
+  `kv_tokens * head_dim * sizeof(f16)`.
+- Target allocation ownership is through the unified-cache allocation policy and
+  exposed to users as smart `mem_handle` objects. Private FA caches and raw
+  untracked cross-device buffers are not valid ownership.
+- Materialization is not attempted during SYCL graph recording or for paged K/V;
+  native FA handles those cases.
+- End-to-end oneDNN consumption of materialized GQA/MQA K/V is enabled only for
+  the proven f16 descriptor class above. The output logical tensor is not dense
+  `(batch, heads, seq, head_dim)` storage: it writes directly to GGML dst layout
+  `[head_dim, heads, seq, batch]`, so the required output strides are
+  4-D `{heads * seq * head_dim, head_dim, heads * head_dim, 1}` and 5-D
+  `{heads * seq * head_dim, head_rep * head_dim, head_dim, heads * head_dim, 1}`.
+  The old dense output descriptor is rejected by the synthetic descriptor test
+  because it permutes query/head output and reproduces deterministic corruption.
+
 #### CPU Offload Bench + VTune Harness
 
 Use the helper script to run PP/TG separately with unified-cache CPU offload and optional VTune collection:
@@ -843,7 +936,46 @@ The harness reports PP/TG separately and can enforce metric gates:
 - `zeEventHostSynchronize` call count
 - `ggml_backend_sycl_buffer_set_tensor` CPU time
 
+## Cross-device KV placement contract
 
+This contract applies to hidden-device multi-GPU runs where the SYCL backend may
+expose fewer scheduler devices than physical Level Zero GPUs. For example, the
+runtime can expose `device_count == 1` to the ggml scheduler while still keeping
+`total_gpu_count > device_count` physical GPUs available to the unified cache for
+expert, weight, KV, or activation ownership.
+
+The planner is the source of truth for ownership. The `kv_device` and `layer_device` fields have distinct meanings: `layer_device` identifies the
+device that should execute a layer's dense work, and `kv_device` identifies the
+device that owns that layer's KV roots. A non-negative `kv_device` is a physical
+SYCL device ordinal in the unified-cache device namespace, even when that ordinal
+is greater than or equal to scheduler-visible `device_count`. Host KV is valid
+only when the planner explicitly chooses host placement, an explicit KV-host mode
+is enabled, or a documented fail-fast allocation error is being reported.
+
+`SYCL_KV_Tiered` must materialize `cache_k_l*` and `cache_v_l*` root tensors on
+the planned owner. Remote device-planned KV must never be represented as ordinary host-pinned fallback. A tensor planned for physical device 1 remains device-owned
+by device 1; it is not a host tensor merely because the scheduler currently runs
+the graph on device 0.
+
+Smart handles carry this ownership across roots, views, and staging decisions.
+The KV root tensor must have an `extra_gpu` smart handle for the planned owner,
+and views of that root must resolve through root plus `view_offs` for the
+requested device. A view-local raw pointer or stale direct handle is not allowed
+to override the root smart-handle owner. If execution needs data on another GPU,
+the routing layer must either execute on the KV owner or explicitly stage/migrate
+through unified-cache handles.
+
+CPU fallback is invalid for device-planned F16 attention and KV. When F16 attention consumes device-planned KV, code should fail fast with ownership
+diagnostics or route the operation to a GPU owner. It must not silently recover
+by running CPU attention over host-pinned copies of KV that the planner assigned
+to a GPU.
+
+The safe default for hidden-device multi-GPU MoE is expert-mode execution, and hybrid/layer placement remains explicit until cross-device KV routing is implemented. In expert mode, dense activations and KV stay local to the
+scheduler-visible GPU while experts use the unified cache across physical GPUs.
+Hybrid/layer can assign KV to a hidden physical device and therefore requires
+the full ownership and routing contract described here.
+
+Diagnostics for future cross-device KV tasks must report, at minimum, the planned device, materialized owner, buffer type, root extra/smart-handle status, and routing decision for each affected KV layer or F16 attention operation.
 
 ## Known Issues
 

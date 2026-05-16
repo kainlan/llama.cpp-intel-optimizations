@@ -961,6 +961,129 @@ if(GGML_SYCL)
     add_test(NAME test-unified-cache-bugs COMMAND $<TARGET_FILE:test-unified-cache-bugs>)
 endif()
 
+# test-sycl-moe-handle-resolution: unified-cache expert smart-handle resolver
+if(GGML_SYCL)
+    add_executable(test-sycl-moe-handle-resolution test-sycl-moe-handle-resolution.cpp)
+    target_link_libraries(test-sycl-moe-handle-resolution PRIVATE ggml ggml-cpu)
+    target_include_directories(test-sycl-moe-handle-resolution PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/include
+        ${PROJECT_SOURCE_DIR}/ggml/src)
+    target_compile_options(test-sycl-moe-handle-resolution PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-sycl-moe-handle-resolution PRIVATE "-fsycl")
+    install(TARGETS test-sycl-moe-handle-resolution RUNTIME)
+    add_test(NAME test-sycl-moe-handle-resolution COMMAND $<TARGET_FILE:test-sycl-moe-handle-resolution>)
+endif()
+
+# test-sycl-moe-q8-scratch: MoE graph Q8_1 scratch sizing contract.
+if(GGML_SYCL)
+    add_executable(test-sycl-moe-q8-scratch test-sycl-moe-q8-scratch.cpp)
+    target_link_libraries(test-sycl-moe-q8-scratch PRIVATE ggml ggml-cpu)
+    target_include_directories(test-sycl-moe-q8-scratch PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/include
+        ${PROJECT_SOURCE_DIR}/ggml/src)
+    target_compile_options(test-sycl-moe-q8-scratch PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-sycl-moe-q8-scratch PRIVATE "-fsycl")
+    install(TARGETS test-sycl-moe-q8-scratch RUNTIME)
+    add_test(NAME test-sycl-moe-q8-scratch COMMAND $<TARGET_FILE:test-sycl-moe-q8-scratch>)
+endif()
+
+# test-sycl-fattn-onednn-gates: oneDNN SDPA must reject unsafe FA layouts.
+if(GGML_SYCL)
+    add_executable(test-sycl-fattn-onednn-gates test-sycl-fattn-onednn-gates.cpp)
+    target_link_libraries(test-sycl-fattn-onednn-gates PRIVATE ggml ggml-cpu)
+    target_include_directories(test-sycl-fattn-onednn-gates PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/include
+        ${PROJECT_SOURCE_DIR}/ggml/src)
+    target_compile_definitions(test-sycl-fattn-onednn-gates PRIVATE
+        $<TARGET_PROPERTY:ggml-sycl,COMPILE_DEFINITIONS>)
+    target_compile_options(test-sycl-fattn-onednn-gates PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-sycl-fattn-onednn-gates PRIVATE "-fsycl")
+    install(TARGETS test-sycl-fattn-onednn-gates RUNTIME)
+    add_test(NAME test-sycl-fattn-onednn-gates COMMAND $<TARGET_FILE:test-sycl-fattn-onednn-gates>)
+endif()
+
+# test-sycl-fattn-onednn-materialization: planner-owned oneDNN FA K/V materialization contract.
+if(GGML_SYCL)
+    add_executable(test-sycl-fattn-onednn-materialization test-sycl-fattn-onednn-materialization.cpp)
+    target_link_libraries(test-sycl-fattn-onednn-materialization PRIVATE ggml ggml-cpu)
+    target_include_directories(test-sycl-fattn-onednn-materialization PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/include
+        ${PROJECT_SOURCE_DIR}/ggml/src)
+    target_compile_definitions(test-sycl-fattn-onednn-materialization PRIVATE
+        $<TARGET_PROPERTY:ggml-sycl,COMPILE_DEFINITIONS>)
+    target_compile_options(test-sycl-fattn-onednn-materialization PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-sycl-fattn-onednn-materialization PRIVATE "-fsycl")
+    install(TARGETS test-sycl-fattn-onednn-materialization RUNTIME)
+    add_test(NAME test-sycl-fattn-onednn-materialization COMMAND $<TARGET_FILE:test-sycl-fattn-onednn-materialization>)
+endif()
+
+# test-sycl-fattn-onednn-descriptors: oneDNN SDPA descriptor semantics vs CPU reference.
+if(GGML_SYCL)
+    add_executable(test-sycl-fattn-onednn-descriptors test-sycl-fattn-onednn-descriptors.cpp)
+    target_link_libraries(test-sycl-fattn-onednn-descriptors PRIVATE ggml ggml-cpu)
+    target_include_directories(test-sycl-fattn-onednn-descriptors PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/include
+        ${PROJECT_SOURCE_DIR}/ggml/src)
+    target_compile_definitions(test-sycl-fattn-onednn-descriptors PRIVATE
+        $<TARGET_PROPERTY:ggml-sycl,COMPILE_DEFINITIONS>)
+    target_compile_options(test-sycl-fattn-onednn-descriptors PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-sycl-fattn-onednn-descriptors PRIVATE "-fsycl")
+    install(TARGETS test-sycl-fattn-onednn-descriptors RUNTIME)
+    add_test(NAME test-sycl-fattn-onednn-descriptors COMMAND $<TARGET_FILE:test-sycl-fattn-onednn-descriptors>)
+endif()
+
+# test-sycl-fattn-xmx-policy: native FA XMX dispatch/resource policy.
+if(GGML_SYCL)
+    add_executable(test-sycl-fattn-xmx-policy test-sycl-fattn-xmx-policy.cpp)
+    target_link_libraries(test-sycl-fattn-xmx-policy PRIVATE ggml ggml-cpu)
+    target_include_directories(test-sycl-fattn-xmx-policy PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/include
+        ${PROJECT_SOURCE_DIR}/ggml/src)
+    target_compile_options(test-sycl-fattn-xmx-policy PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-sycl-fattn-xmx-policy PRIVATE "-fsycl")
+    install(TARGETS test-sycl-fattn-xmx-policy RUNTIME)
+    add_test(NAME test-sycl-fattn-xmx-policy COMMAND $<TARGET_FILE:test-sycl-fattn-xmx-policy>)
+endif()
+
+# test-sycl-kv-planned-device-materialization: KV roots follow placement_plan.kv_device.
+if(GGML_SYCL)
+    add_executable(test-sycl-kv-planned-device-materialization test-sycl-kv-planned-device-materialization.cpp)
+    target_link_libraries(test-sycl-kv-planned-device-materialization PRIVATE ggml ggml-cpu)
+    target_include_directories(test-sycl-kv-planned-device-materialization PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/include
+        ${PROJECT_SOURCE_DIR}/ggml/src)
+    target_compile_options(test-sycl-kv-planned-device-materialization PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-sycl-kv-planned-device-materialization PRIVATE "-fsycl")
+    install(TARGETS test-sycl-kv-planned-device-materialization RUNTIME)
+    add_test(NAME test-sycl-kv-planned-device-materialization COMMAND $<TARGET_FILE:test-sycl-kv-planned-device-materialization>)
+endif()
+
+# test-sycl-kv-view-resolution: KV/view smart-handle resolver regressions
+if(GGML_SYCL)
+    add_executable(test-sycl-kv-view-resolution test-sycl-kv-view-resolution.cpp)
+    target_link_libraries(test-sycl-kv-view-resolution PRIVATE ggml ggml-cpu)
+    target_include_directories(test-sycl-kv-view-resolution PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/include
+        ${PROJECT_SOURCE_DIR}/ggml/src)
+    target_compile_options(test-sycl-kv-view-resolution PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-sycl-kv-view-resolution PRIVATE "-fsycl")
+    install(TARGETS test-sycl-kv-view-resolution RUNTIME)
+    add_test(NAME test-sycl-kv-view-resolution COMMAND $<TARGET_FILE:test-sycl-kv-view-resolution>)
+endif()
+
+# test-sycl-set-rows-owner-routing: SET_ROWS follows KV owner/control staging policy
+if(GGML_SYCL)
+    add_executable(test-sycl-set-rows-owner-routing test-sycl-set-rows-owner-routing.cpp)
+    target_link_libraries(test-sycl-set-rows-owner-routing PRIVATE ggml ggml-cpu)
+    target_include_directories(test-sycl-set-rows-owner-routing PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/include
+        ${PROJECT_SOURCE_DIR}/ggml/src)
+    target_compile_options(test-sycl-set-rows-owner-routing PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-sycl-set-rows-owner-routing PRIVATE "-fsycl")
+    install(TARGETS test-sycl-set-rows-owner-routing RUNTIME)
+    add_test(NAME test-sycl-set-rows-owner-routing COMMAND $<TARGET_FILE:test-sycl-set-rows-owner-routing>)
+endif()
+
 # test-unified-cache-integrity: layout cache stress + map consistency
 if(GGML_SYCL)
     add_executable(test-unified-cache-integrity test-unified-cache-integrity.cpp)

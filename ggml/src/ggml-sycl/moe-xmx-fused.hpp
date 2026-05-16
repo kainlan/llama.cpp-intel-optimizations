@@ -10,6 +10,8 @@
 #include "common.hpp"
 #include "moe-xmx.hpp"  // For MoEXMXConfig and preprocessing
 
+#include <cstdio>
+#include <cstdlib>
 #include <sycl/sycl.hpp>
 #include <utility>
 #include <vector>
@@ -636,6 +638,25 @@ sycl::event fused_xmx_moe_gemm_mxfp4_soa(
 
     const int num_k_blocks   = in_dim / XMX_K;
     const int n_output_tiles = (out_dim + TILE_N - 1) / TILE_N;
+    const int launch_wg_size  = SG_SIZE;
+    const int launch_wgs      = cfg.num_persistent_wgs > 0 ? cfg.num_persistent_wgs : 1;
+    const size_t slm_bytes =
+        XMX_M * XMX_K * sizeof(int8_t) + sizeof(float) + TILE_N * XMX_K * sizeof(int8_t) +
+        TILE_N * sizeof(float) + 16 * sizeof(int8_t) + XMX_M * XMX_N * sizeof(int32_t);
+
+    static const bool trace = [] {
+        const char * env = std::getenv("GGML_SYCL_MOE_PATH_TRACE");
+        return env && std::atoi(env) != 0;
+    }();
+    if (trace) {
+        std::fprintf(stderr,
+                     "[XMX-MOE-LAUNCH] fused_mxfp4_soa tokens=%d experts=%d out=%lld in=%lld k_blocks=%d "
+                     "out_tiles=%d persistent_wgs=%d wg_size=%d slm_bytes=%zu qs_stride=%lld e_stride=%lld "
+                     "use_ptr_table=%d\n",
+                     num_tokens, n_experts, (long long) out_dim, (long long) in_dim, num_k_blocks, n_output_tiles,
+                     launch_wgs, launch_wg_size, slm_bytes, (long long) expert_qs_stride,
+                     (long long) expert_e_stride, use_ptr_table ? 1 : 0);
+    }
 
     // Suppress unused variable warnings
     (void) TILE_M;
@@ -658,12 +679,12 @@ sycl::event fused_xmx_moe_gemm_mxfp4_soa(
         // kvalues_mxfp4 LUT cached in SLM
         sycl::local_accessor<int8_t, 1>  slm_kvalues(sycl::range<1>(16), cgh);
         // Per-sub-group accumulator extraction buffer
-        sycl::local_accessor<int32_t, 1> slm_acc(sycl::range<1>(cfg.wg_size / SG_SIZE * XMX_M * XMX_N), cgh);
+        sycl::local_accessor<int32_t, 1> slm_acc(sycl::range<1>(XMX_M * XMX_N), cgh);
 
-        const int num_persistent_wgs_captured = cfg.num_persistent_wgs;
+        const int num_persistent_wgs_captured = launch_wgs;
 
         cgh.parallel_for(
-            sycl::nd_range<1>(cfg.num_persistent_wgs * cfg.wg_size, cfg.wg_size),
+            sycl::nd_range<1>(launch_wgs * launch_wg_size, launch_wg_size),
             [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(SG_SIZE)]] {
                 auto sg       = item.get_sub_group();
                 int  group_id = item.get_group_linear_id();

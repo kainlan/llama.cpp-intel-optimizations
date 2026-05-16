@@ -134,6 +134,14 @@ void dequantize_row_q4_0_soa_to_fp16_rowmajor(
     int nrows,
     dpct::queue_ptr stream);
 
+// Dequantize MXFP4 SOA→row-major FP16 (for oneDNN PP path)
+void dequantize_row_mxfp4_soa_to_fp16_rowmajor(
+    const void * src,
+    sycl::half * dst,
+    int blocks_per_row,
+    int nrows,
+    dpct::queue_ptr stream);
+
 // Convert Q4_0 from Coalesced layout to SoA layout (for testing/debugging)
 void reorder_q4_0_coalesced_to_soa_sycl(
     const void * src,

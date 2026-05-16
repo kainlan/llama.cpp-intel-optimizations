@@ -26,6 +26,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "../common.hpp"
@@ -291,6 +293,67 @@ static bool test_wrong_device_weight_handle_fails(int n_gpu_devices) {
 }
 
 // =============================================================================
+// Test 7: mem_handle equality/hash are usable for dispatch route tables
+// =============================================================================
+static bool test_mem_handle_hash_identity() {
+    TEST_BEGIN("mem_handle_hash_identity");
+
+    int marker = 123;
+    void * ptr = &marker;
+
+    ggml_sycl::mem_handle a = ggml_sycl::mem_handle::from_direct(ptr, GGML_LAYOUT_AOS, true, 0);
+    ggml_sycl::mem_handle b = ggml_sycl::mem_handle::from_direct(ptr, GGML_LAYOUT_SOA, true, 0);
+    TEST_ASSERT(a == b, "direct handles resolving to the same allocation must compare equal");
+    TEST_ASSERT(a.hash() == b.hash(), "direct handles resolving to the same allocation must hash the same");
+
+    std::unordered_set<ggml_sycl::mem_handle, ggml_sycl::mem_handle_hash> handles;
+    handles.insert(a);
+    handles.insert(b);
+    TEST_ASSERT(handles.size() == 1, "unordered_set must collapse handles for the same allocation");
+
+    std::unordered_set<ggml_sycl::mem_handle> default_hash_handles;
+    default_hash_handles.insert(a);
+    default_hash_handles.insert(b);
+    TEST_ASSERT(default_hash_handles.size() == 1, "std::hash<mem_handle> must key same-allocation aliases");
+
+    ggml_sycl::mem_handle c = a;
+    TEST_ASSERT(c == a, "copied direct handle must compare equal to source");
+    TEST_ASSERT(c.hash() == a.hash(), "copied direct handle must hash equal to source");
+
+    std::unordered_map<ggml_sycl::mem_handle, int> route_map;
+    route_map.emplace(a, 17);
+    TEST_ASSERT(route_map.find(c) != route_map.end(), "copied same-allocation handle must find existing map entry");
+
+    ggml_sycl::mem_handle host_a =
+        ggml_sycl::mem_handle::from_direct(ptr, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+    ggml_sycl::mem_handle host_b =
+        ggml_sycl::mem_handle::from_direct(ptr, GGML_LAYOUT_COALESCED, false, ggml_sycl::mem_handle::HOST_DEVICE);
+    TEST_ASSERT(host_a == host_b, "host handles resolving to same allocation must compare equal");
+    TEST_ASSERT(host_a.hash() == host_b.hash(), "host handles resolving to same allocation must hash the same");
+
+    ggml_sycl_cache_id id = {};
+    id.valid              = true;
+    id.model_id           = 8888;
+    id.aux_id             = 7;
+    id.nbytes             = 4096;
+    id.name_hash          = id.model_id ^ id.aux_id;
+    id.type               = GGML_TYPE_Q4_0;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        id.ne[i]           = (i == 0) ? 1024 : 1;
+        id.tp_local_ne[i]  = id.ne[i];
+        id.tp_offset_ne[i] = 0;
+    }
+
+    ggml_sycl::mem_handle w0 = ggml_sycl::mem_handle::from_cache_id(id, 0);
+    ggml_sycl::mem_handle w1 = ggml_sycl::mem_handle::from_cache_id(id, 0);
+    TEST_ASSERT(w0 == w1, "unresolved weight handles with the same cache identity must compare equal");
+    TEST_ASSERT(w0.hash() == w1.hash(), "unresolved weight handles with the same cache identity must hash the same");
+
+    TEST_PASS();
+    return true;
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
@@ -330,6 +393,7 @@ int main(int argc, char ** argv) {
     all_passed &= test_host_device_handle_resolves_from_any_device(n_gpu_devices);
     all_passed &= test_chunk_lease_tripwire_and_wrong_device_resolve(n_gpu_devices);
     all_passed &= test_wrong_device_weight_handle_fails(n_gpu_devices);
+    all_passed &= test_mem_handle_hash_identity();
 
     fprintf(stderr, "-------------------------------------------------\n");
     fprintf(stderr, "Tests: %d run, %d passed, %d skipped\n",

@@ -759,9 +759,9 @@ namespace dpct
         init_queues();
       }
 
-      sycl::queue &in_order_queue() { return _q_in_order; }
+      sycl::queue &in_order_queue() { return *_q_in_order; }
 
-      sycl::queue &out_of_order_queue() { return _q_out_of_order; }
+      sycl::queue &out_of_order_queue() { return *_q_out_of_order; }
 
       // NOTE: Out-of-order queues were extensively tested (December 2024) but caused
       // non-deterministic output even with sync before AND after each operation.
@@ -827,16 +827,21 @@ namespace dpct
       }
       sycl::queue get_saved_queue() const {
         std::lock_guard<mutex_type> lock(m_mutex);
-        return _saved_queue;
+        return *_saved_queue;
       }
 
      private:
-      void clear_queues() { _queues.clear(); }
+      void clear_queues() {
+        _saved_queue.reset();
+        _q_out_of_order.reset();
+        _q_in_order.reset();
+        _queues.clear();
+      }
 
       void init_queues() {
-        _q_in_order =
-            create_queue_impl(true, sycl::property::queue::in_order());
-        _q_out_of_order = create_queue_impl(true);
+        _q_in_order.emplace(
+            create_queue_impl(true, sycl::property::queue::in_order()));
+        _q_out_of_order.emplace(create_queue_impl(true));
         _saved_queue = default_queue();
       }
 
@@ -849,8 +854,9 @@ namespace dpct
         if (enable_exception_handler) {
           eh = exception_handler;
         }
+        sycl::context ctx(*this, eh);
         _queues.push_back(sycl::queue(
-            *this, eh,
+            ctx, *this, eh,
             sycl::property_list(
 #ifdef DPCT_PROFILING_ENABLED
                 sycl::property::queue::enable_profiling(),
@@ -868,8 +874,9 @@ namespace dpct
         if (enable_exception_handler) {
           eh = exception_handler;
         }
+        sycl::context ctx(device, eh);
         _queues.push_back(sycl::queue(
-            device, eh,
+            ctx, device, eh,
                         sycl::property_list(
 #ifdef DPCT_PROFILING_ENABLED
                             sycl::property::queue::enable_profiling(),
@@ -882,8 +889,8 @@ namespace dpct
       void get_version(int &major, int &minor) const {
         detail::get_version(*this, major, minor);
       }
-      sycl::queue _q_in_order, _q_out_of_order;
-      sycl::queue _saved_queue;
+      std::optional<sycl::queue> _q_in_order, _q_out_of_order;
+      std::optional<sycl::queue> _saved_queue;
       std::vector<sycl::queue> _queues;
       mutable mutex_type m_mutex;
     };

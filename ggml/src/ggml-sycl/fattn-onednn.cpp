@@ -14,6 +14,7 @@
 #    include <cmath>
 #    include <cstdio>
 #    include <mutex>
+#    include <thread>
 
 using namespace dnnl::graph;
 using lt       = logical_tensor;
@@ -61,80 +62,301 @@ void ggml_sycl_sdpa_cache_destroy(void * ptr) {
 // -------------------------------------------------------------------
 // Eligibility gate
 // -------------------------------------------------------------------
-bool ggml_sycl_flash_attn_ext_onednn_eligible(const fattn_params & params,
-                                                int                  H_q,
-                                                int                  H_kv,
-                                                bool                 kv_is_fp8,
-                                                bool                 multi_seq) {
+static ggml_sycl_onednn_fa_layout_plan ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason reason) {
+    return { ggml_sycl_onednn_fa_layout_kind::REJECT, reason };
+}
+
+class onednn_fa_materialize_k_kernel;
+class onednn_fa_materialize_v_kernel;
+class onednn_fa_materialized_release_marker_kernel;
+
+ggml_sycl_onednn_fa_layout_plan ggml_sycl_flash_attn_ext_onednn_plan(const fattn_params & params,
+                                                                     int                  H_q,
+                                                                     int                  H_kv,
+                                                                     bool                 kv_is_fp8,
+                                                                     bool                 multi_seq) {
     // Default threshold is 8 to avoid excessive JIT recompilation during TG.
     // GGML_SYCL_FA_ONEDNN_MIN_NCOLS=0 disables the threshold (all batch sizes).
     static const int onednn_min_ncols = []() {
-        const char *e = std::getenv("GGML_SYCL_FA_ONEDNN_MIN_NCOLS");
+        const char * e = std::getenv("GGML_SYCL_FA_ONEDNN_MIN_NCOLS");
         return e ? std::atoi(e) : 8;
     }();
     if (params.ne01 < onednn_min_ncols) {
-        return false;
+        return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::BELOW_MIN_NCOLS);
     }
     if (params.sinks) {
-        return false;  // attention sinks unsupported
+        return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::SINKS_UNSUPPORTED);
     }
     if (params.logit_softcap != 0) {
-        return false;  // softcap unsupported
+        return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::SOFTCAP_UNSUPPORTED);
     }
     if (kv_is_fp8) {
-        return false;  // FP8 KV unsupported
+        return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::FP8_KV_UNSUPPORTED);
     }
     if (multi_seq) {
-        return false;  // multi-seq unsupported
+        return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::MULTI_SEQ_UNSUPPORTED);
+    }
+    if (params.ne03 != 1 || params.ne13 != 1 || (params.mask && params.ne33 != 1)) {
+        return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::BATCH_UNSUPPORTED);
+    }
+    if (params.use_paged_attn || params.use_paged_layout || params.block_table || params.seq_lens) {
+        return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::PAGED_UNSUPPORTED);
     }
     if (params.ne00 > 512) {
-        return false;  // D > 512 unsupported
+        return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::UNSUPPORTED_D);
     }
     if (params.ne11 <= 0) {
-        return false;  // empty KV
+        return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::EMPTY_KV);
     }
-    // GQA contiguity: K must be contiguous in nc-D plane (nc == D).
-    //   K nc-stride in elements = params.nb11 / sizeof(half).
-    //   oneDNN 4-D strided layout only works when nc == D (Q and K share
-    //   contiguous rows).  When nc != D the strided strides can't express
-    //   the actual GGML layout → oneDNN reads wrong memory → bad output.
-    //
-    // Retired for Mistral PP512 (nc=512, D=128): oneDNN is blocked by default
-    // for non-contiguous nc-D shapes. GGML_SYCL_FA_ONEDNN_ALLOW=1 re-enables
-    // it as an opt-in debug knob for A/B testing; the default path falls
-    // through to XMX-v2 which reaches comparable PP performance.
-    {
-        int nc_elK = (int)(params.nb11 / sizeof(sycl::half));
-        int d_val  = (int)params.ne00;
-        if (nc_elK != d_val) {
-            if (getenv("GGML_SYCL_FA_ONEDNN_ALLOW")) {
-                fprintf(stderr,
-                        "[SYCL] oneDNN SDPA: nc!=D contiguity gate bypassed by GGML_SYCL_FA_ONEDNN_ALLOW=1 "
-                        "(shape: nc_stride=%d D=%d — may produce incorrect output)\n",
-                        nc_elK, d_val);
-            } else {
-                return false;
-            }
-        }
+    if (H_q <= 0 || H_kv <= 0 || (H_q % H_kv) != 0) {
+        return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::HEAD_RATIO_UNSUPPORTED);
     }
     // The compiled partition is built with Q/K/V dtypes taken from params.*_type.
     // Scale and scratch buffer sizing assumes f16 Q (sizeof(half) scale slot),
     // and the existing path only supports f16 KV. Restrict to the well-tested
     // combination until the scale buffer is generalized.
     if (params.Q_type != GGML_TYPE_F16) {
-        return false;
+        return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::Q_TYPE_UNSUPPORTED);
     }
     if (params.K_type != GGML_TYPE_F16) {
-        return false;
+        return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::K_TYPE_UNSUPPORTED);
     }
     if (params.V_type != GGML_TYPE_F16) {
-        return false;
+        return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::V_TYPE_UNSUPPORTED);
     }
     if (params.mask && params.mask_type != GGML_TYPE_F16 && params.mask_type != GGML_TYPE_F32) {
-        return false;
+        return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::MASK_TYPE_UNSUPPORTED);
+    }
+
+    // oneDNN Graph SDPA can represent MHA as 4-D (batch,H,S,D) and GQA/MQA as
+    // 5-D (batch,H_kv,N_rep,S,D). The direct GQA/MQA path still requires a
+    // contiguous K/V token-D plane. When nc_stride != D, the planner asks the
+    // unified-cache-backed materializer for dense f16 K/V before oneDNN execute.
+    const int64_t k_nc_stride = params.nb11 / (int64_t) sizeof(sycl::half);
+    const int64_t v_nc_stride = params.nb21 / (int64_t) sizeof(sycl::half);
+    const int64_t D           = params.ne00;
+    if ((H_q != H_kv) && (k_nc_stride != D || v_nc_stride != D)) {
+        return { ggml_sycl_onednn_fa_layout_kind::MATERIALIZE_REQUIRED,
+                 ggml_sycl_onednn_fa_layout_reason::KV_NC_STRIDE_MISMATCH };
     }
     (void) H_q;
     (void) H_kv;
+    return { ggml_sycl_onednn_fa_layout_kind::DIRECT, ggml_sycl_onednn_fa_layout_reason::OK };
+}
+
+bool ggml_sycl_flash_attn_ext_onednn_eligible(const fattn_params & params,
+                                              int                  H_q,
+                                              int                  H_kv,
+                                              bool                 kv_is_fp8,
+                                              bool                 multi_seq) {
+    const ggml_sycl_onednn_fa_layout_plan plan =
+        ggml_sycl_flash_attn_ext_onednn_plan(params, H_q, H_kv, kv_is_fp8, multi_seq);
+    return plan.kind == ggml_sycl_onednn_fa_layout_kind::DIRECT;
+}
+
+bool ggml_sycl_flash_attn_ext_onednn_materialization_desc(const fattn_params &                       params,
+                                                          int                                        H_q,
+                                                          int                                        H_kv,
+                                                          int                                        target_device,
+                                                          ggml_sycl_onednn_fa_materialization_desc * out) {
+    if (!out) {
+        return false;
+    }
+    *out = {};
+
+    const ggml_sycl_onednn_fa_layout_plan plan =
+        ggml_sycl_flash_attn_ext_onednn_plan(params, H_q, H_kv, params.kv_is_fp8, params.n_seqs > 1);
+    if (plan.kind == ggml_sycl_onednn_fa_layout_kind::REJECT) {
+        return false;
+    }
+    if (H_q <= 0 || H_kv <= 0 || (H_q % H_kv) != 0) {
+        return false;
+    }
+
+    const int64_t elem_size = (int64_t) sizeof(sycl::half);
+    if (params.ne00 <= 0 || params.ne11 <= 0 || params.ne12 <= 0 || params.ne10 != params.ne00) {
+        return false;
+    }
+    if (params.K_type != GGML_TYPE_F16 || params.V_type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (params.nb11 < elem_size || params.nb12 < elem_size || params.nb21 < elem_size || params.nb22 < elem_size) {
+        return false;
+    }
+
+    const int64_t dense_token_nb = (int64_t) params.ne00 * elem_size;
+    const int64_t dense_head_nb  = dense_token_nb * (int64_t) params.ne11;
+    const int64_t dense_batch_nb = dense_head_nb * (int64_t) params.ne12;
+
+    out->required         = (plan.kind == ggml_sycl_onednn_fa_layout_kind::MATERIALIZE_REQUIRED);
+    out->target_device    = target_device;
+    out->D                = params.ne00;
+    out->n_kv             = params.ne11;
+    out->H_q              = H_q;
+    out->H_kv             = H_kv;
+    out->n_rep            = H_q / H_kv;
+    out->bytes_per_tensor = out->required ? (size_t) dense_batch_nb : 0;
+    out->k_src_nb1        = params.nb11;
+    out->k_src_nb2        = params.nb12;
+    out->k_src_nb3        = params.nb13;
+    out->v_src_nb1        = params.nb21;
+    out->v_src_nb2        = params.nb22;
+    out->v_src_nb3        = params.nb23;
+    out->k_target_nb1     = dense_token_nb;
+    out->k_target_nb2     = dense_head_nb;
+    out->k_target_nb3     = dense_batch_nb;
+    out->v_target_nb1     = dense_token_nb;
+    out->v_target_nb2     = dense_head_nb;
+    out->v_target_nb3     = dense_batch_nb;
+    return true;
+}
+
+size_t ggml_sycl_onednn_fa_materialized_src_offset(const ggml_sycl_onednn_fa_materialization_desc & desc,
+                                                   bool                                             value_tensor,
+                                                   int                                              h,
+                                                   int                                              t,
+                                                   int                                              d) {
+    const int64_t nb1 = value_tensor ? desc.v_src_nb1 : desc.k_src_nb1;
+    const int64_t nb2 = value_tensor ? desc.v_src_nb2 : desc.k_src_nb2;
+    return (size_t) h * (size_t) nb2 + (size_t) t * (size_t) nb1 + (size_t) d * sizeof(sycl::half);
+}
+
+size_t ggml_sycl_onednn_fa_materialized_dst_offset(const ggml_sycl_onednn_fa_materialization_desc & desc,
+                                                   int                                              h,
+                                                   int                                              t,
+                                                   int                                              d) {
+    return (size_t) h * (size_t) desc.k_target_nb2 + (size_t) t * (size_t) desc.k_target_nb1 +
+           (size_t) d * sizeof(sycl::half);
+}
+
+static sycl::event ggml_sycl_onednn_fa_materialize_one(sycl::queue &                                    stream,
+                                                       const char *                                     src,
+                                                       char *                                           dst,
+                                                       const ggml_sycl_onednn_fa_materialization_desc & desc,
+                                                       bool                                             value_tensor) {
+    const int H_kv = desc.H_kv;
+    const int n_kv = desc.n_kv;
+    const int D    = desc.D;
+
+    const int64_t src_nb1 = value_tensor ? desc.v_src_nb1 : desc.k_src_nb1;
+    const int64_t src_nb2 = value_tensor ? desc.v_src_nb2 : desc.k_src_nb2;
+    const int64_t dst_nb1 = value_tensor ? desc.v_target_nb1 : desc.k_target_nb1;
+    const int64_t dst_nb2 = value_tensor ? desc.v_target_nb2 : desc.k_target_nb2;
+
+    if (value_tensor) {
+        return stream.parallel_for<onednn_fa_materialize_v_kernel>(
+            sycl::range<3>((size_t) H_kv, (size_t) n_kv, (size_t) D), [=](sycl::id<3> idx) {
+                const int    h = (int) idx[0];
+                const int    t = (int) idx[1];
+                const int    d = (int) idx[2];
+                const size_t src_off =
+                    (size_t) h * (size_t) src_nb2 + (size_t) t * (size_t) src_nb1 + (size_t) d * sizeof(sycl::half);
+                const size_t dst_off =
+                    (size_t) h * (size_t) dst_nb2 + (size_t) t * (size_t) dst_nb1 + (size_t) d * sizeof(sycl::half);
+                reinterpret_cast<sycl::half *>(dst + dst_off)[0] =
+                    reinterpret_cast<const sycl::half *>(src + src_off)[0];
+            });
+    }
+    return stream.parallel_for<onednn_fa_materialize_k_kernel>(
+        sycl::range<3>((size_t) H_kv, (size_t) n_kv, (size_t) D), [=](sycl::id<3> idx) {
+            const int    h = (int) idx[0];
+            const int    t = (int) idx[1];
+            const int    d = (int) idx[2];
+            const size_t src_off =
+                (size_t) h * (size_t) src_nb2 + (size_t) t * (size_t) src_nb1 + (size_t) d * sizeof(sycl::half);
+            const size_t dst_off =
+                (size_t) h * (size_t) dst_nb2 + (size_t) t * (size_t) dst_nb1 + (size_t) d * sizeof(sycl::half);
+            reinterpret_cast<sycl::half *>(dst + dst_off)[0] = reinterpret_cast<const sycl::half *>(src + src_off)[0];
+        });
+}
+
+static void ggml_sycl_release_materialized_after_event(ggml_sycl::alloc_handle k,
+                                                       ggml_sycl::alloc_handle v,
+                                                       sycl::event             event) {
+    std::thread([k = std::move(k), v = std::move(v), event = std::move(event)]() mutable {
+        try {
+            event.wait_and_throw();
+        } catch (const std::exception & e) {
+            GGML_LOG_ERROR("[SYCL] oneDNN FA materialized K/V event wait failed: %s\n", e.what());
+        } catch (...) {
+            GGML_LOG_ERROR("[SYCL] oneDNN FA materialized K/V event wait failed with unknown exception\n");
+        }
+        (void) ggml_sycl::unified_free(k);
+        (void) ggml_sycl::unified_free(v);
+    }).detach();
+}
+
+bool ggml_sycl_flash_attn_ext_onednn_materialize_kv(const ggml_sycl_onednn_fa_materialization_desc & desc,
+                                                    const fattn_params &                             params,
+                                                    sycl::queue &                                    stream,
+                                                    ggml_sycl_onednn_fa_materialized_kv *            out) {
+    if (!out) {
+        return false;
+    }
+    *out = {};
+    if (!desc.required) {
+        return true;
+    }
+    if (!params.K || !params.V || desc.bytes_per_tensor == 0 || desc.target_device < 0) {
+        return false;
+    }
+
+    ggml_sycl::alloc_request req{};
+    req.queue                               = &stream;
+    req.device                              = desc.target_device;
+    req.size                                = desc.bytes_per_tensor;
+    req.intent.role                         = ggml_sycl::alloc_role::KV;
+    req.intent.category                     = ggml_sycl::runtime_category::KV_CACHE;
+    req.intent.cohort_id                    = "onednn-fa-kv-materialized";
+    req.intent.constraints.must_device      = true;
+    req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;
+
+    if (!out->K_alloc.allocate(req) || !out->K_alloc.get()) {
+        return false;
+    }
+    if (!out->V_alloc.allocate(req) || !out->V_alloc.get()) {
+        out->K_alloc.reset();
+        return false;
+    }
+
+    out->K          = out->K_alloc.as_mem_handle();
+    out->V          = out->V_alloc.as_mem_handle();
+    auto k_resolved = out->K.resolve(desc.target_device);
+    auto v_resolved = out->V.resolve(desc.target_device);
+    if (!k_resolved || !v_resolved || !k_resolved.on_device || !v_resolved.on_device) {
+        out->K_alloc.reset();
+        out->V_alloc.reset();
+        out->K = {};
+        out->V = {};
+        return false;
+    }
+
+    try {
+        sycl::event k_evt = ggml_sycl_onednn_fa_materialize_one(stream, params.K, static_cast<char *>(k_resolved.ptr),
+                                                                desc, /*value_tensor=*/false);
+        sycl::event v_evt = ggml_sycl_onednn_fa_materialize_one(stream, params.V, static_cast<char *>(v_resolved.ptr),
+                                                                desc, /*value_tensor=*/true);
+        v_evt.wait_and_throw();
+        k_evt.wait_and_throw();
+    } catch (const std::exception & e) {
+        if (std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
+            fprintf(stderr, "[SYCL] fattn: oneDNN materialized K/V repack failed: %s\n", e.what());
+        }
+        out->K_alloc.reset();
+        out->V_alloc.reset();
+        out->K = {};
+        out->V = {};
+        return false;
+    } catch (...) {
+        if (std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
+            fprintf(stderr, "[SYCL] fattn: oneDNN materialized K/V repack failed with unknown exception\n");
+        }
+        out->K_alloc.reset();
+        out->V_alloc.reset();
+        out->K = {};
+        out->V = {};
+        return false;
+    }
     return true;
 }
 
@@ -277,9 +499,11 @@ static build_result build_and_compile_sdpa(const sdpa_shape_key & key, const dnn
         k_strides = { k_s3, k_s2, k_s1, 1 };
         v_strides = { v_s3, v_s2, v_s1, 1 };
 
-        // Score and output remain contiguous intermediates/dense dst.
+        // Score is an internal contiguous intermediate. Output writes directly
+        // to ggml dst layout [D, H, ncols, batch], viewed as oneDNN logical
+        // dims (batch, H, ncols, D).
         score_strides = { H_q * ncols * ne11, ncols * ne11, ne11, 1 };
-        out_strides   = { H_q * ncols * D, ncols * D, D, 1 };
+        out_strides   = { H_q * ncols * D, D, H_q * D, 1 };
     } else {
         // 5-D GQA: Q=(batch, H_kv, N_rep, ncols, D), K/V=(batch, H_kv, 1, ne11, D)
         q_dims     = { batch, H_kv, N_rep, ncols, D };
@@ -305,10 +529,10 @@ static build_result build_and_compile_sdpa(const sdpa_shape_key & key, const dnn
 
         score_strides = { (dim_t) (H_kv * N_rep * ncols * ne11), (dim_t) (N_rep * ncols * ne11), (dim_t) (ncols * ne11),
                           (dim_t) (ne11), (dim_t) (1) };
-        // Dense f32 output layout (batch, H_q, ncols, D) viewed 5-D:
-        // (batch, H_kv, N_rep, ncols, D) with h_q = kv_head*N_rep + rep
-        out_strides   = { (dim_t) (H_kv * N_rep * ncols * D), (dim_t) (N_rep * ncols * D), (dim_t) (ncols * D),
-                          (dim_t) (D), (dim_t) (1) };
+        // Dense f32 ggml output layout [D, H_q, ncols, batch], viewed 5-D as
+        // (batch, H_kv, N_rep, ncols, D) with h_q = kv_head*N_rep + rep.
+        out_strides   = { (dim_t) (H_kv * N_rep * ncols * D), (dim_t) (N_rep * D), (dim_t) D, (dim_t) (H_q * D),
+                          (dim_t) 1 };
     }
 
     // ---- Scale tensor (scalar, same dtype as Q) ---------------------------
@@ -469,6 +693,19 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
     const int H_kv = params.ne12;
     const int D    = params.ne00;
 
+    const bool                            multi_seq = (params.n_seqs > 1);
+    const ggml_sycl_onednn_fa_layout_plan layout_plan =
+        ggml_sycl_flash_attn_ext_onednn_plan(params, H_q, H_kv, params.kv_is_fp8, multi_seq);
+    if (layout_plan.kind == ggml_sycl_onednn_fa_layout_kind::REJECT) {
+        return false;
+    }
+    // oneDNN graph execute and the materialization allocation/repack are not
+    // compatible with SYCL command graph recording. Follow the same policy as
+    // DnnlMatMulWrapper: native FA handles recorded graphs.
+    if (g_ggml_sycl_graph_recording) {
+        return false;
+    }
+
     // oneDNN graph SYCL execute requires device USM for ALL input tensors.
     // Any of Q, K, V may be host-pinned (sycl::malloc_host) under
     // GGML_SYCL_HOST_COMPUTE, GGML_SYCL_KV_HOST, host-resident weight
@@ -483,42 +720,93 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
     if (reinterpret_cast<uintptr_t>(params.Q) < kDeviceVAThreshold) {
         return false;                                                     // Q is host/mmap — skip oneDNN
     }
-    if (reinterpret_cast<uintptr_t>(params.K) < kDeviceVAThreshold) {
-        return false;  // K is host/mmap — skip oneDNN
+    if (reinterpret_cast<uintptr_t>(params.K) < kDeviceVAThreshold ||
+        reinterpret_cast<uintptr_t>(params.V) < kDeviceVAThreshold) {
+        return false;  // K/V source is host/mmap — skip oneDNN and native FA will handle it.
     }
-    if (reinterpret_cast<uintptr_t>(params.V) < kDeviceVAThreshold) {
-        return false;  // V is host/mmap — skip oneDNN
+
+    fattn_params                        active_params = params;
+    ggml_sycl_onednn_fa_materialized_kv materialized{};
+    if (layout_plan.kind == ggml_sycl_onednn_fa_layout_kind::MATERIALIZE_REQUIRED) {
+        ggml_sycl_onednn_fa_materialization_desc desc{};
+        if (!ggml_sycl_flash_attn_ext_onednn_materialization_desc(params, H_q, H_kv, ctx.device, &desc) ||
+            !desc.required) {
+            if (std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
+                fprintf(stderr,
+                        "[SYCL] fattn: oneDNN MATERIALIZE_REQUIRED_BUT_UNAVAILABLE descriptor rejected "
+                        "D=%d ne01=%d ne11=%d H_q=%d H_kv=%d k_nb1=%d k_nb2=%lld v_nb1=%d v_nb2=%lld\n",
+                        D, params.ne01, params.ne11, H_q, H_kv, params.nb11, (long long) params.nb12, params.nb21,
+                        (long long) params.nb22);
+            }
+            return false;
+        }
+        if (!ggml_sycl_flash_attn_ext_onednn_materialize_kv(desc, params, *stream, &materialized)) {
+            if (std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
+                fprintf(stderr,
+                        "[SYCL] fattn: oneDNN MATERIALIZE_REQUIRED_BUT_UNAVAILABLE allocation_or_repack_failed "
+                        "D=%d ne01=%d ne11=%d H_q=%d H_kv=%d bytes=%zu\n",
+                        D, params.ne01, params.ne11, H_q, H_kv, desc.bytes_per_tensor);
+            }
+            return false;
+        }
+        auto k_resolved = materialized.K.resolve(ctx.device);
+        auto v_resolved = materialized.V.resolve(ctx.device);
+        if (!k_resolved || !v_resolved) {
+            if (std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
+                fprintf(stderr,
+                        "[SYCL] fattn: oneDNN MATERIALIZE_REQUIRED_BUT_UNAVAILABLE handle_resolve_failed "
+                        "device=%d\n",
+                        ctx.device);
+            }
+            return false;
+        }
+        if (std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
+            fprintf(stderr, "[SYCL] fattn: oneDNN MATERIALIZED D=%d ne01=%d ne11=%d H_q=%d H_kv=%d bytes=%zu\n", D,
+                    params.ne01, params.ne11, H_q, H_kv, desc.bytes_per_tensor);
+        }
+        active_params.K    = static_cast<const char *>(k_resolved.ptr);
+        active_params.V    = static_cast<const char *>(v_resolved.ptr);
+        active_params.nb11 = (int32_t) desc.k_target_nb1;
+        active_params.nb12 = (int32_t) desc.k_target_nb2;
+        active_params.nb13 = desc.k_target_nb3;
+        active_params.nb21 = (int32_t) desc.v_target_nb1;
+        active_params.nb22 = (int32_t) desc.v_target_nb2;
+        active_params.nb23 = desc.v_target_nb3;
     }
 
     sdpa_shape_key key;
     key.device_id = ctx.device;
     key.D         = D;
-    key.ncols     = params.ne01;
-    key.ne11      = params.ne11;
+    key.ncols     = active_params.ne01;
+    key.ne11      = active_params.ne11;
     key.H_q       = H_q;
     key.H_kv      = H_kv;
-    key.has_mask  = (params.mask != nullptr);
+    key.has_mask  = (active_params.mask != nullptr);
     key.is_gqa    = (H_q != H_kv);
 
-    key.Q_type    = (int) params.Q_type;
-    key.K_type    = (int) params.K_type;
-    key.V_type    = (int) params.V_type;
-    key.mask_type = (int) params.mask_type;
+    key.Q_type    = (int) active_params.Q_type;
+    key.K_type    = (int) active_params.K_type;
+    key.V_type    = (int) active_params.V_type;
+    key.mask_type = (int) active_params.mask_type;
 
-    key.q_nb1 = params.nb01;
-    key.q_nb2 = params.nb02;
-    key.q_nb3 = params.nb03;
-    key.k_nb1 = params.nb11;
-    key.k_nb2 = params.nb12;
-    key.k_nb3 = params.nb13;
-    key.v_nb1 = params.nb21;
-    key.v_nb2 = params.nb22;
-    key.v_nb3 = params.nb23;
-    key.m_nb1 = key.has_mask ? params.nb31 : 0;
-    key.m_nb2 = key.has_mask ? params.nb32 : 0;
-    key.m_nb3 = key.has_mask ? params.nb33 : 0;
+    key.q_nb1 = active_params.nb01;
+    key.q_nb2 = active_params.nb02;
+    key.q_nb3 = active_params.nb03;
+    key.k_nb1 = active_params.nb11;
+    key.k_nb2 = active_params.nb12;
+    key.k_nb3 = active_params.nb13;
+    key.v_nb1 = active_params.nb21;
+    key.v_nb2 = active_params.nb22;
+    key.v_nb3 = active_params.nb23;
+    key.m_nb1 = key.has_mask ? active_params.nb31 : 0;
+    key.m_nb2 = key.has_mask ? active_params.nb32 : 0;
+    key.m_nb3 = key.has_mask ? active_params.nb33 : 0;
 
     sdpa_partition_cache * cache = get_or_create_cache(ctx);
+    if (layout_plan.kind == ggml_sycl_onednn_fa_layout_kind::DIRECT && std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
+        fprintf(stderr, "[SYCL] fattn: oneDNN DIRECT D=%d ne01=%d ne11=%d H_q=%d H_kv=%d\n", D, active_params.ne01,
+                active_params.ne11, H_q, H_kv);
+    }
 
     // ------------------------------------------------------------------
     // Cache lookup + (if needed) compile — all under the per-cache mutex.
@@ -576,7 +864,7 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
                 entry            = std::move(ent);
             } catch (std::exception & e) {
                 fprintf(stderr, "[SYCL] oneDNN SDPA compile failed for D=%d ncols=%d ne11=%d H_q=%d H_kv=%d: %s\n", D,
-                        params.ne01, params.ne11, H_q, H_kv, e.what());
+                        active_params.ne01, active_params.ne11, H_q, H_kv, e.what());
                 cache->negative[key] = true;
                 return false;
             }
@@ -589,12 +877,6 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
     // (under the cache mutex) and is never written again; the execute
     // path only READS it. No race.
     // ------------------------------------------------------------------
-
-    // oneDNN graph execute is NOT compatible with SYCL command graph recording.
-    // Follow the same pattern as DnnlMatMulWrapper in dnnl-ops.hpp: skip during recording.
-    if (g_ggml_sycl_graph_recording) {
-        return false;
-    }
 
     // ---- Wrap USM pointers as dnnl::graph::tensor ----------------------------
     dnnl::engine eng = ctx.engine_dnnl(stream);
@@ -616,10 +898,10 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
     // D=128). The f16 narrowing happens elsewhere — at the STORE of
     // `*scale_usm` in build_and_compile_sdpa — and is separate from this
     // comparison.
-    if (params.scale == 0.0f) {
+    if (active_params.scale == 0.0f) {
         return false;  // zero scale would divide-by-zero; upstream never sends this
     }
-    const float inv_scale  = 1.0f / params.scale;
+    const float inv_scale  = 1.0f / active_params.scale;
     const float sqrt_D     = sqrtf(static_cast<float>(D));
     const float scale_diff = std::fabs(inv_scale - sqrt_D);
     GGML_ASSERT(scale_diff < 1e-3f &&
@@ -631,21 +913,21 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
     // in_ports order: Q, K, scale, [mask], V
     size_t port_idx = 0;
 
-    dnnl::graph::tensor t_q(in_ports[port_idx++], eng, const_cast<void *>(static_cast<const void *>(params.Q)));
-    dnnl::graph::tensor t_k(in_ports[port_idx++], eng, const_cast<void *>(static_cast<const void *>(params.K)));
+    dnnl::graph::tensor t_q(in_ports[port_idx++], eng, const_cast<void *>(static_cast<const void *>(active_params.Q)));
+    dnnl::graph::tensor t_k(in_ports[port_idx++], eng, const_cast<void *>(static_cast<const void *>(active_params.K)));
     dnnl::graph::tensor t_scale(in_ports[port_idx++], eng, entry->scale_usm);
 
     dnnl::graph::tensor t_mask;
     if (key.has_mask) {
-        t_mask =
-            dnnl::graph::tensor(in_ports[port_idx++], eng, const_cast<void *>(static_cast<const void *>(params.mask)));
+        t_mask = dnnl::graph::tensor(in_ports[port_idx++], eng,
+                                     const_cast<void *>(static_cast<const void *>(active_params.mask)));
     }
 
     // V pointer: same element layout as K
-    dnnl::graph::tensor t_v(in_ports[port_idx++], eng, const_cast<void *>(static_cast<const void *>(params.V)));
+    dnnl::graph::tensor t_v(in_ports[port_idx++], eng, const_cast<void *>(static_cast<const void *>(active_params.V)));
 
     // Output is f32 directly into params.dst — no intermediate buffer needed.
-    dnnl::graph::tensor t_out(out_ports[0], eng, params.dst);
+    dnnl::graph::tensor t_out(out_ports[0], eng, active_params.dst);
 
     // Assemble input/output tensor lists
     std::vector<dnnl::graph::tensor> in_tensors;
@@ -655,13 +937,18 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
     if (key.has_mask) {
         in_tensors.push_back(t_mask);
     }
-   in_tensors.push_back(t_v);
+    in_tensors.push_back(t_v);
 
     std::vector<dnnl::graph::tensor> out_tensors = { t_out };
 
-  try {
+    try {
         dnnl::stream dnnl_stream = ctx.stream_dnnl(stream);
         dnnl::graph::sycl_interop::execute(entry->cp, dnnl_stream, in_tensors, out_tensors);
+        if (layout_plan.kind == ggml_sycl_onednn_fa_layout_kind::MATERIALIZE_REQUIRED) {
+            sycl::event done = ggml_sycl_submit_marker<onednn_fa_materialized_release_marker_kernel>(*stream);
+            ggml_sycl_release_materialized_after_event(materialized.K_alloc.release(), materialized.V_alloc.release(),
+                                                       std::move(done));
+        }
     } catch (std::exception & e) {
         fprintf(stderr, "[SYCL] oneDNN SDPA execute failed: %s\n", e.what());
         return false;

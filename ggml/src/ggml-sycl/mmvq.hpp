@@ -59,7 +59,57 @@ bool mmvq_moe_batched_dispatch(
     int                         n_gpu_entries,
     int                         n_experts,
     int64_t                     n_ids,
-    layout_mode                 layout = GGML_LAYOUT_AOS);
+    layout_mode                 layout = GGML_LAYOUT_AOS,
+    const int32_t *             direct_ids_device = nullptr,
+    int64_t                     direct_ids_nb0    = 0,
+    int64_t                     direct_ids_nb1    = 0);
+
+bool mmvq_moe_batched_dispatch_pair_mxfp4_soa(
+    ggml_backend_sycl_context & ctx,
+    const ggml_tensor *         src0_a,
+    const ggml_tensor *         src0_b,
+    const ggml_tensor *         src1,
+    ggml_tensor *               dst_a,
+    ggml_tensor *               dst_b,
+    const void * const *        expert_ptrs_a_device,
+    const void * const *        expert_ptrs_b_device,
+    const int32_t *             ids_device,
+    int                         n_gpu_entries,
+    int64_t                     n_ids,
+    int64_t                     ids_nb0,
+    int64_t                     ids_nb1);
+
+bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(
+    ggml_backend_sycl_context & ctx,
+    const ggml_tensor *         gate_weight,
+    const ggml_tensor *         up_weight,
+    const ggml_tensor *         src1,
+    ggml_tensor *               glu_dst,
+    const void * const *        gate_ptrs_device,
+    const void * const *        up_ptrs_device,
+    const int32_t *             ids_device,
+    const float *               gate_bias_device,
+    const float *               up_bias_device,
+    int64_t                     gate_bias_nb1,
+    int64_t                     up_bias_nb1,
+    int                         n_gpu_entries,
+    int64_t                     n_ids,
+    int64_t                     ids_nb0,
+    int64_t                     ids_nb1,
+    int                         glu_op,
+    float                       alpha,
+    float                       limit);
+
+struct mmvq_moe_dispatch_timing {
+    double activation_quant_us = 0.0;
+    double batch_id_us         = 0.0;
+    double kernel_submit_us    = 0.0;
+    int    calls               = 0;
+    int    entries             = 0;
+};
+
+void                     mmvq_moe_dispatch_timing_reset();
+mmvq_moe_dispatch_timing mmvq_moe_dispatch_timing_consume();
 
 // Convert reordered tensor to coalesced layout for better memory bandwidth
 // Call this AFTER reorder_qw and BEFORE graph recording (at model load time)

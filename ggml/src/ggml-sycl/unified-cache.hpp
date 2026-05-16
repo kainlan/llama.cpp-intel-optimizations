@@ -13,6 +13,7 @@
 #include "pinned-pool.hpp"
 #include "tlsf-allocator.hpp"
 
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
@@ -20,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <list>
 #include <memory>
@@ -104,17 +106,116 @@ enum class placement_priority : uint8_t {
     COUNT         = 7,
 };
 
+enum class expert_tensor_role : uint8_t {
+    UNKNOWN = 0,
+    GATE    = 1,
+    UP      = 2,
+    DOWN    = 3,
+    COUNT   = 4,
+};
+
+inline const char * expert_tensor_role_name(expert_tensor_role role) {
+    switch (role) {
+        case expert_tensor_role::GATE:
+            return "gate";
+        case expert_tensor_role::UP:
+            return "up";
+        case expert_tensor_role::DOWN:
+            return "down";
+        case expert_tensor_role::UNKNOWN:
+        default:
+            return "unknown";
+    }
+}
+
+inline expert_tensor_role expert_tensor_role_from_tensor_name(const char * name) {
+    if (!name) {
+        return expert_tensor_role::UNKNOWN;
+    }
+    if (std::strstr(name, "ffn_gate_exps")) {
+        return expert_tensor_role::GATE;
+    }
+    if (std::strstr(name, "ffn_up_exps")) {
+        return expert_tensor_role::UP;
+    }
+    if (std::strstr(name, "ffn_down_exps")) {
+        return expert_tensor_role::DOWN;
+    }
+    return expert_tensor_role::UNKNOWN;
+}
+
+inline int expert_layer_from_tensor_name(const char * name) {
+    if (!name) {
+        return -1;
+    }
+    const char * blk = std::strstr(name, "blk.");
+    if (!blk) {
+        return -1;
+    }
+    return std::atoi(blk + 4);
+}
+
+struct expert_placement_key {
+    int                layer_id  = -1;
+    int                expert_id = -1;
+    expert_tensor_role role      = expert_tensor_role::UNKNOWN;
+
+    bool operator==(const expert_placement_key & other) const {
+        return layer_id == other.layer_id && expert_id == other.expert_id && role == other.role;
+    }
+};
+
+struct expert_placement_key_hash {
+    size_t operator()(const expert_placement_key & key) const {
+        size_t h = std::hash<int>()(key.layer_id);
+        h ^= std::hash<int>()(key.expert_id) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= std::hash<int>()(static_cast<int>(key.role)) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+enum class expert_placement_status : uint8_t {
+    FOUND   = 0,
+    MISSING = 1,
+};
+
+struct expert_placement_result {
+    expert_placement_status status    = expert_placement_status::MISSING;
+    int                     layer_id  = -1;
+    int                     expert_id = -1;
+    expert_tensor_role      role      = expert_tensor_role::UNKNOWN;
+    std::string             tensor_name;
+    bool                    on_device     = false;
+    int                     target_device = -1;
+    size_t                  src_size      = 0;
+    size_t                  dst_size      = 0;
+    placement_priority      priority      = placement_priority::COUNT;
+
+    bool found() const { return status == expert_placement_status::FOUND; }
+};
+
+struct expert_placement_summary {
+    size_t                                                             planned      = 0;
+    size_t                                                             expected     = 0;
+    size_t                                                             missing      = 0;
+    size_t                                                             duplicates   = 0;
+    size_t                                                             unclassified = 0;
+    std::array<size_t, static_cast<size_t>(expert_tensor_role::COUNT)> role_counts{};
+    std::unordered_map<int, size_t>                                    target_counts;
+};
+
 // Single entry in the placement plan: one weight tensor's placement decision.
 struct placement_entry {
-    std::string        name;           // Tensor name (for logging and S1-PRELOAD lookup)
-    size_t             src_size;       // AOS source bytes
-    size_t             dst_size;       // Layout-converted destination bytes (SOA/COALESCED)
-    size_t             kv_size;        // KV bytes charged by this entry (usually 0)
-    placement_priority priority;       // Sort key
-    int                layer_id;       // Layer number (earlier = higher priority within same level)
-    int                expert_id;      // -1 for dense weights, >=0 for individual MoE experts
-    bool               on_device;      // true = VRAM (any device), false = host
-    int                target_device;  // Target GPU device_id (-1 = host/CPU)
+    std::string        name;       // Tensor name (for logging and S1-PRELOAD lookup)
+    size_t             src_size;   // AOS source bytes
+    size_t             dst_size;   // Layout-converted destination bytes (SOA/COALESCED)
+    size_t             kv_size;    // KV bytes charged by this entry (usually 0)
+    placement_priority priority;   // Sort key
+    int                layer_id;   // Layer number (earlier = higher priority within same level)
+    int                expert_id;  // -1 for dense weights, >=0 for individual MoE experts
+    expert_tensor_role expert_role = expert_tensor_role::UNKNOWN;  // gate/up/down for MoE expert tensors
+    bool               on_device;                                  // true = VRAM (any device), false = host
+    int                target_device;                              // Target GPU device_id (-1 = host/CPU)
 };
 
 // Per-device VRAM budget for multi-GPU placement planning.
@@ -210,32 +311,36 @@ struct placement_plan {
 
     // --- Inference memory categories (computed by populate_host_zone_sizing) ---
     // oneDNN reorder: one temp buffer (max weight tensor size) reused per layer.
-    size_t onednn_reorder_bytes      = 0;  // Zone: SCRATCH (device VRAM)
+    size_t onednn_reorder_bytes         = 0;  // Zone: SCRATCH (device VRAM)
     // MoE Q8_1 workspace: quantized activations for batched expert dispatch.
-    size_t moe_q8_workspace_bytes    = 0;  // Zone: SCRATCH (device VRAM)
+    size_t moe_q8_workspace_bytes       = 0;  // Zone: SCRATCH (device VRAM)
+    // CPU expert fallback act/out staging. EXPERT_STAGING HOST_COMPUTE uses
+    // smart-handle scoped ownership and routes to host SCRATCH.
+    size_t moe_cpu_expert_staging_bytes = 0;  // Zone: SCRATCH (host pinned)
     // Expert bias D2H copy: float bias tensors staged to host for gate computation.
-    size_t expert_bias_bytes         = 0;  // Zone: STAGING (host pinned)
-    // MoE routing: per-batch expert ID staging buffer (n_expert * max_batch_tokens * sizeof(int32_t)).
-    size_t moe_routing_ids_bytes     = 0;  // Zone: RUNTIME (device VRAM)
+    size_t expert_bias_bytes            = 0;  // Zone: STAGING (host pinned)
+    // MoE routing: per-batch expert ID control buffer (n_expert * max_batch_tokens * sizeof(int32_t)).
+    size_t moe_routing_ids_bytes        = 0;  // Zone: HOST_CONTROL (shared-context host pinned)
     // MoE expert pointer tables: void* per expert per MoE layer (MAX_EXPERTS * n_moe_layers * sizeof(void*)).
-    size_t moe_expert_ptrs_bytes     = 0;  // Zone: RUNTIME (device VRAM)
-    // Combined VRAM RUNTIME reservation for MoE routing buffers (routing_ids + expert_ptrs).
+    size_t moe_expert_ptrs_bytes        = 0;  // Zone: RUNTIME (device VRAM)
+    // Combined VRAM RUNTIME reservation for MoE device routing buffers (expert_ptrs only;
+    // routing IDs are HOST_CONTROL and are accounted in host pinned planning).
     // 0 when model has no MoE layers.
-    size_t moe_vram_runtime_bytes    = 0;  // Zone: RUNTIME (device VRAM)
+    size_t moe_vram_runtime_bytes       = 0;  // Zone: RUNTIME (device VRAM)
     // DMA staging pool: device-resident double-buffer for host→device weight streaming.
     // Sized as max_tensor_bytes × k_dma_pipeline_depth (2 buffers). 0 when streaming disabled.
-    size_t dma_staging_pool_bytes    = 0;  // Zone: RUNTIME (device VRAM)
+    size_t dma_staging_pool_bytes       = 0;  // Zone: RUNTIME (device VRAM)
     // oneDNN scratchpad: workspace for matmul weight reorder (weights) + activation buffer.
     // Sized as max_tensor_bytes × 2. Must fit within the ONEDNN zone (default 256 MB).
-    size_t onednn_scratchpad_bytes   = 0;  // Zone: ONEDNN (device VRAM)
+    size_t onednn_scratchpad_bytes      = 0;  // Zone: ONEDNN (device VRAM)
     // PP pipeline scratch: double-buffered FP16 weight staging for prompt-processing
     // dequant prefetch. Computed from the largest quantized weight tensor as
     // 2 x (n_elements * sizeof(fp16)). Lives in the RUNTIME zone.
-    size_t pp_pipeline_scratch_bytes = 0;  // Zone: RUNTIME (device VRAM)
+    size_t pp_pipeline_scratch_bytes    = 0;  // Zone: RUNTIME (device VRAM)
     // CPU quantization temp buffers: pre-allocated by T1 cpu_dispatch_buffers.
-    size_t cpu_quant_buffer_bytes    = 0;  // Zone: HOST (system heap)
+    size_t cpu_quant_buffer_bytes       = 0;  // Zone: HOST (system heap)
     // Graph metadata: layer classification vectors and MoE routing tables.
-    size_t graph_metadata_bytes      = 0;  // Zone: HOST (system heap)
+    size_t graph_metadata_bytes         = 0;  // Zone: HOST (system heap)
 
     // --- Tensor Parallelism buffer estimates (0 when TP is disabled) ---
     // Per-layer FFN compute buffers on secondary TP devices (device VRAM).
@@ -265,9 +370,9 @@ struct placement_plan {
 
     std::unordered_map<int, layer_range> device_layers;
 
-    // expert_device[layer_id][expert_id] = device_id (-1 = host/CPU).
-    // For MoE models: maps each expert to its target device.
-    // Empty for dense-only models.
+    // Compatibility summary: expert_device[layer_id][expert_id] = device_id (-1 = host/CPU).
+    // This collapses gate/up/down and is not authoritative for role-specific MoE placement.
+    // Use lookup_expert_placement(layer, expert, role) for planner decisions.
     std::unordered_map<int, std::unordered_map<int, int>> expert_device;
 
     // kv_location[layer_id] = device_id for KV cache co-location.
@@ -287,6 +392,62 @@ struct placement_plan {
     int get_layer_device(int layer_id) const {
         auto it = layer_device.find(layer_id);
         return it == layer_device.end() ? -1 : it->second;
+    }
+
+    expert_placement_result lookup_expert_placement(int layer_id, int expert_id, expert_tensor_role role) const {
+        expert_placement_result result;
+        result.layer_id  = layer_id;
+        result.expert_id = expert_id;
+        result.role      = role;
+
+        const expert_placement_key key{ layer_id, expert_id, role };
+        auto                       it = expert_placement_index_.find(key);
+        if (it == expert_placement_index_.end()) {
+            return result;
+        }
+
+        const auto & e       = entries[it->second];
+        result.status        = expert_placement_status::FOUND;
+        result.tensor_name   = e.name;
+        result.on_device     = e.on_device;
+        result.target_device = e.target_device;
+        result.src_size      = e.src_size;
+        result.dst_size      = e.dst_size;
+        result.priority      = e.priority;
+        return result;
+    }
+
+    expert_placement_result lookup_expert_placement(const std::string & tensor_name, int expert_id) const {
+        const int                layer_id = expert_layer_from_tensor_name(tensor_name.c_str());
+        const expert_tensor_role role     = expert_tensor_role_from_tensor_name(tensor_name.c_str());
+        return lookup_expert_placement(layer_id, expert_id, role);
+    }
+
+    expert_placement_summary summarize_expert_placements(int expected_layers = -1, int expected_experts = -1) const {
+        expert_placement_summary summary;
+        summary.planned      = expert_placement_index_.size();
+        summary.duplicates   = expert_placement_duplicate_count_;
+        summary.unclassified = expert_placement_unclassified_count_;
+        summary.target_counts.reserve(entries.size());
+
+        for (const auto & e : entries) {
+            if (e.expert_id < 0) {
+                continue;
+            }
+            const size_t role_idx = static_cast<size_t>(e.expert_role);
+            if (role_idx < summary.role_counts.size()) {
+                summary.role_counts[role_idx]++;
+            }
+            summary.target_counts[e.target_device]++;
+        }
+
+        if (expected_layers > 0 && expected_experts > 0) {
+            summary.expected = static_cast<size_t>(expected_layers) * static_cast<size_t>(expected_experts) * 3u;
+        } else {
+            summary.expected = summary.planned + summary.unclassified + summary.duplicates;
+        }
+        summary.missing = summary.expected > summary.planned ? summary.expected - summary.planned : 0;
+        return summary;
     }
 
     // Quick lookup: is this tensor on any device?
@@ -325,10 +486,21 @@ struct placement_plan {
     // expert_id: individual expert index (0..n_experts-1)
     // device_id: if >= 0, checks assignment to a specific device; -1 checks any device
     bool expert_on_device(const std::string & tensor_name, int expert_id, int device_id = -1) const {
+        const auto placement = lookup_expert_placement(tensor_name, expert_id);
+        if (placement.found()) {
+            if (!placement.on_device) {
+                return false;
+            }
+            if (device_id >= 0) {
+                return placement.target_device == device_id;
+            }
+            return true;
+        }
+
         const std::string key = tensor_name + ":e" + std::to_string(expert_id);
         auto              it  = expert_index_.find(key);
         if (it == expert_index_.end()) {
-            return true;  // No plan entry for this expert — default to device (safe fallback)
+            return false;  // Missing/unclassified entries are explicit host/miss, never implicit device.
         }
         const auto & e = entries[it->second];
         if (!e.on_device) {
@@ -345,8 +517,19 @@ struct placement_plan {
     // already provides O(1) per-expert lookup, so a separate memoization layer is redundant.
     // device_id: if >= 0, checks residency for that specific device; -1 checks any device.
     bool has_host_experts(const std::string & tensor_name, int64_t n_experts, int device_id = -1) const {
+        (void) device_id;
         for (int64_t e = 0; e < n_experts; ++e) {
-            if (!expert_on_device(tensor_name, static_cast<int>(e), device_id)) {
+            const auto placement = lookup_expert_placement(tensor_name, static_cast<int>(e));
+            if (placement.found()) {
+                if (!placement.on_device) {
+                    return true;
+                }
+                continue;
+            }
+
+            const std::string key = tensor_name + ":e" + std::to_string(e);
+            auto              it  = expert_index_.find(key);
+            if (it != expert_index_.end() && !entries[it->second].on_device) {
                 return true;
             }
         }
@@ -357,14 +540,29 @@ struct placement_plan {
     void build_index() {
         name_index_.clear();
         expert_index_.clear();
+        expert_placement_index_.clear();
+        expert_placement_duplicate_count_    = 0;
+        expert_placement_unclassified_count_ = 0;
         name_index_.reserve(entries.size());
         expert_index_.reserve(entries.size());
+        expert_placement_index_.reserve(entries.size());
         for (size_t i = 0; i < entries.size(); ++i) {
             const auto & e = entries[i];
             if (e.expert_id >= 0) {
                 // MoE expert entry: index by "tensor_name:eN"
                 const std::string key = e.name + ":e" + std::to_string(e.expert_id);
                 expert_index_[key]    = i;
+
+                if (e.expert_role == expert_tensor_role::UNKNOWN || e.layer_id < 0) {
+                    expert_placement_unclassified_count_++;
+                    continue;
+                }
+
+                const expert_placement_key semantic_key{ e.layer_id, e.expert_id, e.expert_role };
+                auto                       inserted = expert_placement_index_.emplace(semantic_key, i);
+                if (!inserted.second) {
+                    expert_placement_duplicate_count_++;
+                }
             } else {
                 // Dense weight: index by name
                 name_index_[e.name] = i;
@@ -375,6 +573,10 @@ struct placement_plan {
   private:
     std::unordered_map<std::string, size_t> name_index_;    // Dense weights: name -> index
     std::unordered_map<std::string, size_t> expert_index_;  // MoE experts: "name:eN" -> index
+    std::unordered_map<expert_placement_key, size_t, expert_placement_key_hash>
+           expert_placement_index_;                         // MoE experts: (layer, expert, role) -> index
+    size_t expert_placement_duplicate_count_    = 0;
+    size_t expert_placement_unclassified_count_ = 0;
 };
 
 // Compute placement plan for all model weights given a VRAM budget.
@@ -448,7 +650,13 @@ static inline size_t cache_hash_combine(size_t seed, size_t value) {
 }
 
 static inline bool cache_id_equal(const ggml_sycl_cache_id & a, const ggml_sycl_cache_id & b) {
-    if (a.valid != b.valid || a.model_id != b.model_id || a.has_gguf != b.has_gguf || a.file_idx != b.file_idx ||
+    // GGUF-backed weights already carry stable file identity.  Do not include
+    // model_id in that case: graph-local wrappers for the same loaded weight
+    // can churn model_id while still needing to resolve to the same smart
+    // mem_handle/cache entry.
+    const bool compare_model_id = !(a.has_gguf && b.has_gguf);
+    if (a.valid != b.valid || (compare_model_id && a.model_id != b.model_id) || a.has_gguf != b.has_gguf ||
+        a.file_idx != b.file_idx ||
         a.file_offs != b.file_offs || a.nbytes != b.nbytes || a.name_hash != b.name_hash || a.type != b.type ||
         a.tp_sharded != b.tp_sharded || a.tp_rank != b.tp_rank || a.tp_world_size != b.tp_world_size ||
         a.aux_id != b.aux_id) {
@@ -470,8 +678,10 @@ struct cache_id_hash {
     size_t operator()(const ggml_sycl_cache_id & id) const {
         size_t h = 0;
         h        = cache_hash_combine(h, std::hash<bool>()(id.valid));
-        h        = cache_hash_combine(h, std::hash<uint64_t>()(id.model_id));
         h        = cache_hash_combine(h, std::hash<bool>()(id.has_gguf));
+        if (!id.has_gguf) {
+            h = cache_hash_combine(h, std::hash<uint64_t>()(id.model_id));
+        }
         h        = cache_hash_combine(h, std::hash<uint16_t>()(id.file_idx));
         h        = cache_hash_combine(h, std::hash<size_t>()(id.file_offs));
         h        = cache_hash_combine(h, std::hash<size_t>()(id.nbytes));
@@ -693,24 +903,74 @@ struct cache_layout_request {
 // No state machine, no IN_PROGRESS/READY transitions.
 
 struct weight_entry {
-    void *           ptr      = nullptr;
-    size_t           size     = 0;
-    ggml_layout_mode layout   = GGML_LAYOUT_AOS;
-    cache_location   location = cache_location::DEVICE;
-    // llama.cpp-pxvih 4b: per-entry chunk lease (defense in depth).
-    // Holds a CHUNK_LEASE mem_handle for the underlying pinned-pool chunk so
-    // the chunk cannot be sycl::free'd while any host expert entry references
-    // memory within it.  Stacks with the buffer-level lease from 4a.
-    // unique_ptr used to avoid a circular include (mem_handle is forward-
-    // declared here; full type available in unified-cache.cpp via mem-handle.hpp).
-    // nullptr for DEVICE-location entries or mmap-backed pointers (DIRECT).
-    std::unique_ptr<mem_handle> entry_lease;
+    void *                      ptr             = nullptr;
+    size_t                      size            = 0;
+    ggml_layout_mode            layout          = GGML_LAYOUT_AOS;
+    cache_location              location        = cache_location::DEVICE;
+    bool                        has_ready_event = false;
+    sycl::event                 ready_event;
+    // Transient direct lookup mirror only. Lifetime and ownership live in
+    // entries_ / mem_handle leases; this struct must not keep allocations alive.
 };
 
 struct direct_stage_result {
     void *      ptr = nullptr;  // Device pointer in WEIGHT zone
     sycl::event event;          // Completion event
     bool        ok = false;
+};
+
+enum class expert_resolve_device_policy : uint8_t {
+    ANY            = 0,  // Accept any owning device or allowed host tier
+    PREFER_CURRENT = 1,  // Prefer current_device, but do not reject other devices
+    CURRENT_ONLY   = 2,  // Reject DEVICE entries not owned by current_device
+    PREFERRED_ONLY = 3,  // Reject DEVICE entries not owned by preferred_device
+};
+
+enum class expert_resolve_tier : uint8_t {
+    DEVICE_VRAM = 0,
+    HOST_PINNED = 1,
+    HOST_MMAP   = 2,
+    UNAVAILABLE = 3,
+};
+
+enum class expert_resolve_reason : uint8_t {
+    FOUND                = 0,
+    INVALID_REQUEST      = 1,
+    NOT_FOUND            = 2,
+    LAYOUT_MISMATCH      = 3,
+    NOT_READY            = 4,
+    DEVICE_MISMATCH      = 5,
+    HOST_DISALLOWED      = 6,
+    MMAP_HOST_DISALLOWED = 7,
+};
+
+struct expert_resolve_request {
+    ggml_sycl_cache_id           key              = {};
+    ggml_layout_mode             requested_layout = GGML_LAYOUT_AOS;
+    int                          layer_id         = -1;
+    int                          expert_id        = -1;
+    int                          current_device   = -1;
+    int                          preferred_device = -1;
+    expert_resolve_device_policy device_policy    = expert_resolve_device_policy::ANY;
+    bool                         allow_host       = true;
+    bool                         allow_mmap_host  = true;
+    bool                         require_ready    = false;
+};
+
+struct expert_resolve_result {
+    void *                      ptr             = nullptr;
+    size_t                      size            = 0;
+    expert_resolve_tier         tier            = expert_resolve_tier::UNAVAILABLE;
+    cache_location              location        = cache_location::UNKNOWN;
+    int                         owning_device   = -1;
+    ggml_layout_mode            actual_layout   = GGML_LAYOUT_AOS;
+    bool                        cpu_accessible  = false;
+    bool                        has_ready_event = false;
+    sycl::event                 ready_event;
+    expert_resolve_reason       reason = expert_resolve_reason::NOT_FOUND;
+    std::unique_ptr<mem_handle> lifetime;
+
+    explicit operator bool() const { return ptr != nullptr && reason == expert_resolve_reason::FOUND; }
 };
 
 // --- Expert Popularity Ranking ---
@@ -770,23 +1030,28 @@ struct copyable_atomic_u32 {
     std::atomic<uint32_t> v{ 0 };
 
     copyable_atomic_u32() = default;
-    copyable_atomic_u32(const copyable_atomic_u32 & o) :
-        v(o.v.load(std::memory_order_relaxed)) {}
-    copyable_atomic_u32(copyable_atomic_u32 && o) noexcept :
-        v(o.v.load(std::memory_order_relaxed)) {}
+
+    copyable_atomic_u32(const copyable_atomic_u32 & o) : v(o.v.load(std::memory_order_relaxed)) {}
+
+    copyable_atomic_u32(copyable_atomic_u32 && o) noexcept : v(o.v.load(std::memory_order_relaxed)) {}
+
     copyable_atomic_u32 & operator=(const copyable_atomic_u32 & o) {
         v.store(o.v.load(std::memory_order_relaxed), std::memory_order_relaxed);
         return *this;
     }
+
     copyable_atomic_u32 & operator=(copyable_atomic_u32 && o) noexcept {
         v.store(o.v.load(std::memory_order_relaxed), std::memory_order_relaxed);
         return *this;
     }
 
     uint32_t fetch_add(uint32_t n) { return v.fetch_add(n, std::memory_order_acq_rel); }
+
     uint32_t fetch_sub(uint32_t n) { return v.fetch_sub(n, std::memory_order_acq_rel); }
-    uint32_t load() const          { return v.load(std::memory_order_acquire); }
-    void     store(uint32_t x)     { v.store(x, std::memory_order_release); }
+
+    uint32_t load() const { return v.load(std::memory_order_acquire); }
+
+    void store(uint32_t x) { v.store(x, std::memory_order_release); }
 };
 
 // Metadata for a cached entry
@@ -938,7 +1203,9 @@ class unified_cache {
 
         explicit operator bool() const { return ptr != nullptr; }
     };
+
     weight_ptr_lease_result acquire_weight_lease(const ggml_sycl_cache_id & key);
+    weight_ptr_lease_result acquire_entry_lease(const unified_cache_key & key);
 
     // --- Decomposed cache operations (no queue ops during inference) ---
 
@@ -1040,6 +1307,11 @@ class unified_cache {
     // Returns nullptr if not staged.  No allocation, no state machine.
     const weight_entry * lookup_weight(ggml_sycl_cache_id key) const;
     const weight_entry * lookup_expert(ggml_sycl_cache_id key) const;
+
+    // Resolve an MoE expert tensor across both unified cache entries_ and
+    // direct_expert_entries_.  The result gives callers explicit tier/device
+    // metadata so dispatch code does not need SYCL pointer-type probes.
+    expert_resolve_result resolve_expert(const expert_resolve_request & req);
 
     // Register a host-arena pointer directly as a HOST_PINNED expert entry.
     // ptr must be host-pinned memory (typically from host_zone_alloc(WEIGHT)).
@@ -1401,8 +1673,7 @@ class unified_cache {
     // Returns true if any expert of a MoE tensor is planned for host memory on device_id.
     // Replaces ad-hoc static cache maps in dispatch code: placement_plan::expert_index_ is
     // already O(1) per lookup, so no caller-side memoization is needed.
-    bool moe_tensor_has_host_experts(const std::string & tensor_name, int64_t n_experts,
-                                     int device_id = -1) const {
+    bool moe_tensor_has_host_experts(const std::string & tensor_name, int64_t n_experts, int device_id = -1) const {
         if (!has_placement_plan_) {
             return false;  // No plan → all experts are device-resident (default)
         }
@@ -1506,6 +1777,11 @@ class unified_cache {
     // Without this, evicted VRAM pointers can be freed while GPU kernels on the
     // compute queue still reference them → GPU page fault → DEVICE_LOST.
     void set_compute_queue(sycl::queue * q) { compute_queue_ = q; }
+
+    // Called at the start of a new model load.  Model-load IDs are deliberately
+    // unique, so stale direct/model weight entries from a previous load cannot
+    // be resolved by the new graph and must not keep occupying the WEIGHT arena.
+    void reset_model_weight_entries();
 
     void reset_stats();
     // Debug/testing helper: verify internal maps are consistent.
@@ -1779,23 +2055,22 @@ class unified_cache {
 
     size_t pinned_pool_budget() const { return host_arena_ ? host_arena_->budget() : 0; }
 
-    bool             contains_pinned(const void * ptr) const;
-    size_t           pre_allocate_host_pool(size_t total_bytes);
+    bool   contains_pinned(const void * ptr) const;
+    size_t pre_allocate_host_pool(size_t total_bytes);
 
     // Deprecated shim — tests written against the old API. Migrate callers to unified_alloc().
-    [[deprecated("use unified_alloc()")]]
-    void * ensure_cached_alloc(const ggml_sycl_cache_id & key,
-                               const void *               src_ptr,
-                               size_t                     src_size,
-                               size_t                     alloc_size,
-                               cache_entry_type           type,
-                               int                        layer_id,
-                               int                        expert_id,
-                               ggml_layout_mode           layout,
-                               bool                       validate_content,
-                               bool *                     needs_fill);
-    size_t           pre_allocate_all(size_t model_weight_bytes);
-    size_t           pre_allocate_runtime_chunks(size_t total_bytes);
+    [[deprecated("use unified_alloc()")]] void * ensure_cached_alloc(const ggml_sycl_cache_id & key,
+                                                                     const void *               src_ptr,
+                                                                     size_t                     src_size,
+                                                                     size_t                     alloc_size,
+                                                                     cache_entry_type           type,
+                                                                     int                        layer_id,
+                                                                     int                        expert_id,
+                                                                     ggml_layout_mode           layout,
+                                                                     bool                       validate_content,
+                                                                     bool *                     needs_fill);
+    size_t                                       pre_allocate_all(size_t model_weight_bytes);
+    size_t                                       pre_allocate_runtime_chunks(size_t total_bytes);
     // Host zone allocation (owned by unified_cache).
     segmented_buffer host_zone_alloc_segmented(host_zone_id zone, size_t size, size_t alignment = 64);
     void *           host_zone_alloc(host_zone_id zone, size_t size, size_t alignment = 64);
@@ -1936,8 +2211,8 @@ class unified_cache {
 
     // N-chunk arena: each chunk capped at the runtime's per-allocation limit
     // so the patched libze (~1.5 GB on Arc B580) does not reject the alloc.
-    std::vector<arena_chunk>        arena_chunks_;
-    sycl::queue *                   arena_queue_ = nullptr;
+    std::vector<arena_chunk> arena_chunks_;
+    sycl::queue *            arena_queue_ = nullptr;
 
     // Per-physical-chunk TLSF allocators for the WEIGHT zone in N-chunk mode.
     // A weight tensor must not span a chunk boundary (each chunk is its own
@@ -1953,10 +2228,11 @@ class unified_cache {
     // chunk_idx is `int` to match arena_find_chunk()'s return type and the
     // arena lease API (which uses -1 as a not-owned sentinel).
     struct weight_chunk_alloc {
-        int                             chunk_idx     = 0;     // index into arena_chunks_
-        size_t                          logical_start = 0;     // cumulative offset of this chunk
+        int                             chunk_idx     = 0;  // index into arena_chunks_
+        size_t                          logical_start = 0;  // cumulative offset of this chunk
         std::unique_ptr<tlsf_allocator> allocator;
     };
+
     std::vector<weight_chunk_alloc> weight_chunk_allocators_;
     vram_zone                       arena_zones_[static_cast<int>(vram_zone_id::COUNT)];
 
@@ -2093,8 +2369,10 @@ class unified_cache {
     // The prefetch worker loop (runs on background thread)
     void prefetch_worker_loop();
 
-    // === Direct Staging Lookup Tables ===
-    // Simple O(1) maps for the direct staging API.
+    // === Direct Staging Lookup Mirrors ===
+    // Non-owning mirrors for legacy/raw-pointer call sites and diagnostics.
+    // Canonical allocation lifetime is entries_ + mem_handle leases; these maps
+    // must not be treated as independent caches or ownership roots.
     // Keyed by full ggml_sycl_cache_id (uses proven detail::cache_id_hash/equal_fn).
     // Thread-safe via direct_stage_mutex_ (shared for reads, exclusive for writes).
     std::unordered_map<ggml_sycl_cache_id, weight_entry, detail::cache_id_hash, detail::cache_id_equal_fn>
@@ -2177,7 +2455,7 @@ void set_total_gpu_count(int count);
 // is isolated — no cross-device depends_on() or USM access.
 
 sycl::queue * get_shared_context_queue(int device);
-void init_shared_context_queues(int total_gpus);
+void          init_shared_context_queues(int total_gpus);
 
 // === Global API ===
 
@@ -2225,8 +2503,9 @@ enum class runtime_category : uint8_t {
     GRAPH        = 3,  // Persistent TG temp allocs, get_rows_pool
     HOST_COMPUTE = 4,  // Host-pinned scratch for CPU offload layers
     EXPERT_CACHE = 5,  // MoE expert VRAM cache pool
-    OTHER        = 6,  // Everything else (default for backward compat)
-    COUNT        = 7
+    CONTROL      = 6,  // Small CPU-produced control tensors read by any GPU
+    OTHER        = 7,  // Everything else (default for backward compat)
+    COUNT        = 8
 };
 
 // Unified runtime allocation API.
@@ -2246,7 +2525,8 @@ enum class alloc_role : uint8_t {
     GRAPH_TMP      = 4,
     TP_TMP         = 5,
     EXPERT_STAGING = 6,
-    OTHER          = 7,
+    CONTROL        = 7,
+    OTHER          = 8,
 };
 
 // Location-transparent descriptor for any managed allocation.
@@ -2327,8 +2607,9 @@ struct alloc_handle {
     // through a zone sub-allocator instead of a raw sycl::malloc call.
     // unified_free() uses these to dispatch the correct reclaim path:
     //   zone_managed=true, vram_zone!=COUNT → cache->zone_free(vram_zone, ptr) [TLSF reclaim]
-    //   zone_managed=true, host_zone==WEIGHT → cache->host_zone_free(WEIGHT, ptr) [TLSF reclaim]
-    //   zone_managed=true, host_zone==SCRATCH|STAGING|KV → reset-only (freed by host_zone_reset)
+    //   zone_managed=true, host_zone==WEIGHT|KV → cache->host_zone_free(zone, ptr) [TLSF reclaim]
+    //   zone_managed=true, host_zone==SCRATCH and role==EXPERT_STAGING → scoped TLSF reclaim
+    //   zone_managed=true, host_zone==SCRATCH|STAGING otherwise → reset-only (freed by host_zone_reset)
     //   zone_managed=false                  → registry lookup → sycl::free or pinned_pool free
     bool         zone_managed = false;
     vram_zone_id vram_zone    = vram_zone_id::COUNT;
@@ -2384,7 +2665,7 @@ enum class alloc_category : uint8_t {
     KV_CACHE        = 1,  // Permanent KV cache, high priority
     COMPUTE_SCRATCH = 2,  // Ephemeral per-op scratch, can fall back to host
     STAGING         = 3,  // Small transfer staging buffers, can fall back to host
-    CONTROL         = 4,  // Tiny kernel control buffers, must be on device
+    CONTROL         = 4,  // Tiny CPU-produced control buffers, host-pinned and device-readable
     EXPERT_CACHE    = 5,  // MoE expert data, evictable from device
 };
 
@@ -2869,6 +3150,46 @@ void * unified_cache_get_scratch(int device_id, size_t size);
 void   unified_cache_return_scratch(int device_id, void * ptr, size_t size);
 void   unified_cache_reset_scratch_pool(int device_id);
 
+// MoE graph Q8_1 scratch demand derived from the selected MMVQ layout and
+// activation shape.  This is a planning contract: graph callers allocate one
+// owned unified-cache handle, then slice stable graph buffers from it.
+struct moe_q8_1_scratch_shape {
+    ggml_type        weight_type    = GGML_TYPE_COUNT;
+    ggml_layout_mode layout         = GGML_LAYOUT_AOS;
+    int64_t          input_cols     = 0;
+    int64_t          input_rows     = 0;
+    int              graph_op_count = 0;
+    int              device_id      = -1;
+    int              segment_id     = -1;
+    int              layer_id       = -1;
+    int              n_experts      = 0;
+    int              n_expert_used  = 0;
+};
+
+struct moe_q8_1_scratch_demand {
+    bool             supported                = false;
+    ggml_type        weight_type              = GGML_TYPE_COUNT;
+    ggml_layout_mode layout                   = GGML_LAYOUT_AOS;
+    int64_t          input_cols               = 0;
+    int64_t          input_cols_padded        = 0;
+    int64_t          input_rows               = 0;
+    int              buffer_count             = 0;
+    int              device_id                = -1;
+    int              segment_id               = -1;
+    int              layer_id                 = -1;
+    int              n_experts                = 0;
+    int              n_expert_used            = 0;
+    size_t           bytes_per_buffer         = 0;
+    size_t           aligned_bytes_per_buffer = 0;
+    size_t           total_bytes              = 0;
+};
+
+moe_q8_1_scratch_demand unified_cache_plan_moe_q8_1_scratch(const moe_q8_1_scratch_shape & shape);
+bool                    unified_cache_reserve_moe_q8_1_scratch(int device_id, const moe_q8_1_scratch_demand & demand);
+bool unified_cache_allocate_moe_q8_1_graph_scratch(int                            device_id,
+                                                   const moe_q8_1_scratch_demand & demand,
+                                                   alloc_handle *                  out);
+
 // Grow the host SCRATCH zone to accommodate compute buffer needs.
 // Called after the ggml scheduler is created and compute buffer sizes are known.
 void unified_cache_grow_host_scratch_zone(size_t additional_bytes);
@@ -2886,6 +3207,7 @@ void unified_cache_zone_free(int device_id, vram_zone_id zone, void * ptr);
 
 // Reset a VRAM zone (TLSF coalescing reset — all sub-allocations become free).
 void   unified_cache_zone_reset(int device_id, vram_zone_id zone);
+void   unified_cache_reset_model_weight_entries(int device_id);
 size_t unified_cache_host_zone_used(host_zone_id zone);
 size_t unified_cache_host_zone_capacity(host_zone_id zone);
 size_t unified_cache_host_zone_largest_free_block(host_zone_id zone);

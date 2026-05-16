@@ -1117,6 +1117,11 @@ struct cmd_params_instance {
     bool                                          no_op_offload;
     bool                                          no_host;
 
+    uint32_t model_n_ctx_envelope() const {
+        const uint32_t n_ctx = (uint32_t) (n_prompt + n_gen + n_depth);
+        return GGML_PAD(n_ctx, 256);
+    }
+
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
 
@@ -1129,6 +1134,8 @@ struct cmd_params_instance {
         mparams.tensor_split = tensor_split.data();
         mparams.use_mmap     = use_mmap;
         mparams.no_host      = no_host;
+        mparams.n_ctx        = model_n_ctx_envelope();
+        mparams.n_ubatch     = n_ubatch;
 
         if (n_cpu_moe <= 0) {
             if (tensor_buft_overrides.empty()) {
@@ -1172,6 +1179,8 @@ struct cmd_params_instance {
         return model == other.model && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
                split_mode == other.split_mode && main_gpu == other.main_gpu && use_mmap == other.use_mmap &&
                tensor_split == other.tensor_split && devices == other.devices && no_host == other.no_host &&
+               model_n_ctx_envelope() == other.model_n_ctx_envelope() &&
+               n_ubatch == other.n_ubatch &&
                vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
     }
 

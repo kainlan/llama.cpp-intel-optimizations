@@ -121,13 +121,20 @@ section() {
 init_environment() {
     echo -e "${BLUE}=== Initializing Intel oneAPI Environment ===${NC}"
 
-    # Source oneAPI if available and not already sourced
+    # Source oneAPI if available and not already sourced.
+    # Temporarily disable nounset because setvars.sh references unset variables.
     if [ -z "${INTEL_ONEAPI_SOURCED:-}" ] && [ -f "/opt/intel/oneapi/setvars.sh" ]; then
-        source /opt/intel/oneapi/setvars.sh --force 2>/dev/null || {
-            echo -e "${RED}Error: Failed to source /opt/intel/oneapi/setvars.sh${NC}"
+        local prev_nounset=""
+        set +o | grep -q '^set -u$' && prev_nounset="yes"
+        set +u
+        source /opt/intel/oneapi/setvars.sh --force 2>/dev/null
+        local rc=$?
+        [ -n "$prev_nounset" ] && set -u
+        if [ $rc -ne 0 ]; then
+            echo -e "${RED}Error: Failed to source /opt/intel/oneapi/setvars.sh (exit $rc)${NC}"
             echo "oneAPI is required for SYCL builds. Install via: https://www.intel.com/content/www/us/en/developer/tools/oneapi/toolkits.html"
             exit 1
-        }
+        fi
         export INTEL_ONEAPI_SOURCED=1
     fi
 
@@ -149,14 +156,14 @@ init_environment() {
     export LD_LIBRARY_PATH="${BUILD_DIR}/bin:${LD_LIBRARY_PATH}"
 
     export ONEAPI_DEVICE_SELECTOR
+
+    # Initialize results file deterministically before any logging
+    : > "$RESULTS_FILE"
+
     log "Build: $(cd "$PROJECT_DIR" && git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
     log "GPU: ${ONEAPI_DEVICE_SELECTOR}"
     log "Model: ${MODEL_MISTRAL_Q4}"
     log "Build dir: ${BUILD_DIR}"
-    log ""
-
-    # Initialize results file deterministically
-    : > "$RESULTS_FILE"
 }
 
 # ============================================================================
@@ -202,7 +209,8 @@ run_correctness_check() {
         pass "${description}: ordered continuation '6, 7, 8, 9, 10' found"
     else
         fail "${description}: ordered continuation '6, 7, 8, 9, 10' NOT found"
-        log "    Tokens near 6-10: $(echo "$check_result" | grep -oE '.{0,30}6.{0,20}' | head -1)"
+        log "    Tokens near 6-10: $(echo "$tokens" | grep -oE '.{0,30}6.{0,20}' | head -1)"
+        log "    Raw tail: $(echo "$output" | tail -5)"
     fi
 }
 
@@ -329,14 +337,19 @@ run_bench_test() {
     local fa_mode="$3"
     local extra_args="${4:-}"
 
-    local fa_flag=""
-    [ "$fa_mode" = "1" ] && fa_flag="-fa 1"
-
-    local cmd="ONEAPI_DEVICE_SELECTOR=\"${ONEAPI_DEVICE_SELECTOR}\" ${BUILD_DIR}/bin/llama-bench -m \"${MODEL_MISTRAL_Q4}\" -p ${prompt_tokens} -n ${gen_tokens} ${fa_flag}"
-    [ -n "$extra_args" ] && cmd="$cmd $extra_args"
+    # Build argv array — never build a string command; Bash would treat
+    # env-var assignments as the command name.
+    local -a bench_argv=(
+        "${BUILD_DIR}/bin/llama-bench"
+        -m "${MODEL_MISTRAL_Q4}"
+        -p "${prompt_tokens}"
+        -n "${gen_tokens}"
+    )
+    [ "$fa_mode" = "1" ] && bench_argv+=(-fa 1)
+    [ -n "$extra_args" ] && bench_argv+=($extra_args)
 
     local result
-    result=$($cmd 2>&1) || true
+    result=$(ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR}" "${bench_argv[@]}" 2>&1) || true
     echo "$result"
 }
 
@@ -459,19 +472,25 @@ run_backend_ops() {
     output=$(ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR}" \
         timeout 120 "${BUILD_DIR}/bin/test-backend-ops" -o FLASH_ATTN_EXT 2>&1) || true
 
-    local exit_code=0
     if echo "$output" | grep -qi "pass"; then
         pass "test-backend-ops -o FLASH_ATTN_EXT (SYCL) passed"
         echo "$output" | grep -E 'all passed|PASSED' | tee -a "$RESULTS_FILE" || true
     else
-        # Check if there were actual failures vs timeout/signal
         local has_fail
         has_fail=$(echo "$output" | grep -cE 'failed|FAIL|FAILED' || true)
         if [ "$has_fail" -gt 0 ]; then
             fail "test-backend-ops -o FLASH_ATTN_EXT had ${has_fail} failures"
+            log "    Failing summary lines:"
+            echo "$output" | grep -E 'failed|FAIL|FAILED' | head -10 | while IFS= read -r line; do
+                log "      $line"
+            done
         else
             skip "test-backend-ops -o FLASH_ATTN_EXT (no pass/fail indicators, may be timeout)"
         fi
+        log "    Last 40 lines of raw output:"
+        echo "$output" | tail -40 | while IFS= read -r line; do
+            log "      $line"
+        done
     fi
 }
 

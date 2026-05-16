@@ -27,6 +27,27 @@ void cache_generation_bump() {
     g_cache_generation.fetch_add(1, std::memory_order_relaxed);
 }
 
+static size_t mem_handle_hash_combine(size_t seed, size_t value) {
+    return detail::cache_hash_combine(seed, value);
+}
+
+static bool mem_handle_cache_identity_equal(const mem_handle & a, const mem_handle & b) {
+    if (a.kind() != b.kind() || a.device() != b.device()) {
+        return false;
+    }
+
+    if (a.is_weight()) {
+        return a.key() == b.key();
+    }
+
+    if (a.is_arena() || a.kind() == mem_handle_kind::CHUNK_LEASE) {
+        return a.zone_id() == b.zone_id() && a.offset() == b.offset() && a.size() == b.size() &&
+               a.generation() == b.generation();
+    }
+
+    return false;
+}
+
 // === mem_handle factory methods ===
 
 mem_handle mem_handle::from_weight(const unified_cache_key & key, int device) {
@@ -49,16 +70,48 @@ mem_handle mem_handle::from_weight_lease(const ggml_sycl_cache_id & key_id,
                                          ggml_layout_mode           layout,
                                          bool                       on_device,
                                          unified_cache_entry *      entry) {
+    unified_cache_key key;
+    key.type      = cache_entry_type::DENSE_WEIGHT;
+    key.id        = key_id;
+    key.layer_id  = -1;
+    key.expert_id = -1;
+    return from_weight_lease(key, device, ptr, layout, on_device, entry);
+}
+
+mem_handle mem_handle::from_weight_lease(const unified_cache_key & key,
+                                         int                       device,
+                                         void *                    ptr,
+                                         ggml_layout_mode          layout,
+                                         bool                      on_device,
+                                         unified_cache_entry *     entry) {
     mem_handle h;
-    h.kind_          = mem_handle_kind::WEIGHT;
-    h.device_        = device;
-    h.key_.type      = cache_entry_type::DENSE_WEIGHT;
-    h.key_.id        = key_id;
-    h.key_.layer_id  = -1;
-    h.key_.expert_id = -1;
-    h.gen_           = cache_generation();  // Fresh — no slow-path re-query
-    h.cached_        = { ptr, layout, on_device };
-    h.leased_entry_  = entry;               // ownership of the refcount bump transferred
+    h.kind_         = mem_handle_kind::WEIGHT;
+    h.device_       = device;
+    h.key_          = key;
+    h.gen_          = cache_generation();  // Fresh — no slow-path re-query
+    h.cached_       = { ptr, layout, on_device };
+    h.leased_entry_ = entry;               // ownership of the refcount bump transferred
+
+    if (ptr != nullptr && device >= 0) {
+        unified_cache * cache = get_unified_cache_for_device(device);
+        if (cache) {
+            const int vram_idx = cache->arena_acquire_chunk_lease(ptr);
+            if (vram_idx >= 0) {
+                h.chunk_source_      = 2;
+                h.chunk_device_      = device;
+                h.vram_chunk_idx_    = vram_idx;
+                h.host_chunk_handle_ = UINT64_MAX;
+            } else {
+                const uint64_t host_handle = cache->host_acquire_chunk_lease(ptr);
+                if (host_handle != pinned_chunk_pool::INVALID_CHUNK_HANDLE) {
+                    h.chunk_source_      = 1;
+                    h.chunk_device_      = device;
+                    h.host_chunk_handle_ = host_handle;
+                    h.vram_chunk_idx_    = -1;
+                }
+            }
+        }
+    }
     return h;
 }
 
@@ -111,11 +164,9 @@ mem_handle mem_handle::from_arena_zone(int zone_id, size_t offset, size_t size, 
     return h;
 }
 
-// llama.cpp-dyhdl: wrap a raw pointer in a handle that refcounts the owning
-// arena chunk for the lifetime of the returned mem_handle.  Falls back to a
-// plain DIRECT handle (no refcount) if the pointer is not in any known
-// arena chunk — which is the correct behavior for, e.g., mmap-backed
-// weights, graph compute buffers, or other non-arena allocations.
+// Compatibility/test bridge: wrap a raw pointer in a handle that refcounts the
+// owning arena chunk for the lifetime of the returned mem_handle. Production
+// allocation paths should keep the mem_handle they received when allocating.
 mem_handle mem_handle::from_chunk_ptr(void * ptr, int device, ggml_layout_mode layout, bool on_device) {
     mem_handle h;
     h.device_ = device;
@@ -237,7 +288,7 @@ resolved_ptr mem_handle::resolve_slow() const {
 
     // Acquire under shared_lock; visible to any future evictor via acq_rel
     // ordering on the in_use_count atomic.
-    auto result = cache->acquire_weight_lease(key_.id);
+    auto result = cache->acquire_entry_lease(key_);
     if (!result) {
         // No cache hit; leave handle unpinned.
         cached_       = {};
@@ -306,6 +357,39 @@ void mem_handle::release_lease() noexcept {
         vram_chunk_idx_    = -1;
         chunk_device_      = -1;
     }
+}
+
+bool mem_handle::operator==(const mem_handle & other) const {
+    resolved_ptr a = resolve();
+    resolved_ptr b = other.resolve();
+
+    if (a.ptr != nullptr || b.ptr != nullptr) {
+        return a.ptr != nullptr && a.ptr == b.ptr;
+    }
+
+    return mem_handle_cache_identity_equal(*this, other);
+}
+
+size_t mem_handle::hash() const {
+    resolved_ptr r = resolve();
+    if (r.ptr != nullptr) {
+        return std::hash<void *>()(r.ptr);
+    }
+
+    size_t h = 0;
+    h        = mem_handle_hash_combine(h, std::hash<int>()(static_cast<int>(kind_)));
+    h        = mem_handle_hash_combine(h, std::hash<int>()(device_));
+
+    if (is_weight()) {
+        h = mem_handle_hash_combine(h, unified_cache_key_hash{}(key_));
+    } else if (is_arena() || kind_ == mem_handle_kind::CHUNK_LEASE) {
+        h = mem_handle_hash_combine(h, std::hash<int>()(zone_id_));
+        h = mem_handle_hash_combine(h, std::hash<size_t>()(offset_));
+        h = mem_handle_hash_combine(h, std::hash<size_t>()(size_));
+        h = mem_handle_hash_combine(h, std::hash<uint64_t>()(arena_gen_));
+    }
+
+    return h;
 }
 
 // === destructor / copy / move ===

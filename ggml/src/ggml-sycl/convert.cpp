@@ -1094,6 +1094,51 @@ void dequantize_row_q4_0_soa_to_fp16_rowmajor(const void *    src,
         });
 }
 
+static void dequantize_block_mxfp4_soa_rowmajor(const void * __restrict__ vx,
+                                                sycl::half * __restrict__ yy,
+                                                const int blocks_per_row,
+                                                const int nrows,
+                                                const sycl::nd_item<3> & item) {
+    (void) nrows;
+    const int ib = item.get_global_id(2);
+    const int row = ib / blocks_per_row;
+    const int block = ib - row * blocks_per_row;
+    const int64_t nblocks = static_cast<int64_t>(nrows) * blocks_per_row;
+
+    const uint8_t * qs = static_cast<const uint8_t *>(vx);
+    const uint8_t * e  = qs + nblocks * (QK_MXFP4 / 2);
+    sycl::half * y = yy + (static_cast<int64_t>(row) * blocks_per_row + block) * QK_MXFP4;
+
+    const uint8_t * q4 = qs + static_cast<int64_t>(ib) * (QK_MXFP4 / 2);
+    const float d = ggml_sycl_e8m0_to_fp32(e[ib]);
+    for (int j = 0; j < QK_MXFP4 / 2; ++j) {
+        const uint8_t q = q4[j];
+        y[j] = sycl::half(d * kvalues_mxfp4[q & 0xf] * 0.5f);
+        y[j + QK_MXFP4 / 2] = sycl::half(d * kvalues_mxfp4[q >> 4] * 0.5f);
+    }
+}
+
+void dequantize_row_mxfp4_soa_to_fp16_rowmajor(const void *    src,
+                                               sycl::half *    dst,
+                                               int             blocks_per_row,
+                                               int             nrows,
+                                               dpct::queue_ptr stream) {
+    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+
+    const int total_blocks = nrows * blocks_per_row;
+    constexpr int WG_SIZE = 256;
+    const int n_wgs = (total_blocks + WG_SIZE - 1) / WG_SIZE;
+
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, n_wgs * WG_SIZE), sycl::range<3>(1, 1, WG_SIZE)),
+        [=](sycl::nd_item<3> item) {
+            const int ib = item.get_global_id(2);
+            if (ib < total_blocks) {
+                dequantize_block_mxfp4_soa_rowmajor(src, dst, blocks_per_row, nrows, item);
+            }
+        });
+}
+
 // Host function to launch Q4_0 Coalesced to SoA conversion
 void reorder_q4_0_coalesced_to_soa_sycl(const void *    src,
                                         void *          dst,  // SoA format: [all qs bytes][all d values]

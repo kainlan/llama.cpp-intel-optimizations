@@ -256,7 +256,13 @@ void * ComputeBufferManager::allocate_new_buffer(size_t size) {
         fprintf(stderr, "[ComputeBufferManager] allocation failed for %zu bytes\n", size);
         return nullptr;
     }
-    return h.resolve().ptr;
+    auto resolved = h.resolve(device_id_);
+    if (!resolved) {
+        fprintf(stderr, "[ComputeBufferManager] allocation for %zu bytes did not resolve on device %d\n", size,
+                device_id_);
+        return nullptr;
+    }
+    return resolved.ptr;
 }
 
 void ComputeBufferManager::grow_scratch(size_t new_size) {
