@@ -8720,6 +8720,33 @@ struct moe_gate_up_pair {
     enum ggml_glu_op    glu_op          = GGML_GLU_OP_SWIGLU;
 };
 
+struct moe_layer_decode_role_plan {
+    const ggml_tensor *                weight = nullptr;
+    std::vector<int32_t>               expert_ids;
+    std::vector<ggml_sycl::mem_handle> handles;
+    std::vector<sycl::event>           ready_events;
+};
+
+struct moe_layer_decode_plan {
+    int                         layer            = -1;
+    int                         layer_hash       = -1;
+    int64_t                     n_ids            = 0;
+    size_t                      n_entries        = 0;
+    layout_mode                 layout           = GGML_LAYOUT_AOS;
+    bool                        current_is_gate  = false;
+    const int32_t *             ids_host         = nullptr;
+    const int32_t *             ids_device       = nullptr;
+    const ggml_tensor *         src1             = nullptr;
+    const ggml_tensor *         ids              = nullptr;
+    const moe_gate_up_pair *    pair             = nullptr;
+    moe_layer_decode_role_plan  current;
+    moe_layer_decode_role_plan  partner;
+    moe_layer_decode_role_plan  gate;
+    moe_layer_decode_role_plan  up;
+    moe_layer_decode_role_plan  down;
+    bool                        down_eligible    = false;
+};
+
 static thread_local std::unordered_map<int, moe_gate_up_pair> g_moe_gate_up_pairs;
 static thread_local std::unordered_set<const ggml_tensor *>   g_moe_precomputed_mmid_skip;
 static thread_local std::unordered_set<const ggml_tensor *>   g_moe_precomputed_node_skip;
@@ -30673,6 +30700,87 @@ static const void * const * moe_fusion_ensure_gpu0_ptrs(ggml_backend_sycl_contex
     return static_cast<const void * const *>(extra->moe_ptrs_ptr(device));
 }
 
+static const void * const * moe_fusion_upload_ptrs_from_handles(ggml_backend_sycl_context &             ctx,
+                                                                const moe_layer_decode_role_plan &      role,
+                                                                int                                    layer_hash,
+                                                                layout_mode                            layout) {
+    const ggml_tensor * src0 = role.weight;
+    if (!src0 || role.expert_ids.size() != role.handles.size()) {
+        return nullptr;
+    }
+    auto * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
+    if (!extra) {
+        return nullptr;
+    }
+
+    const int     device    = ctx.device;
+    const int64_t n_experts = src0->ne[2] > 0 ? src0->ne[2] : 1;
+    sycl::queue & q         = *ctx.stream();
+
+    int table_index = -1;
+    {
+        auto & seq_map = g_moe_layer_seq[device];
+        auto   it      = seq_map.find(layer_hash);
+        if (it != seq_map.end()) {
+            table_index = it->second;
+        }
+    }
+
+    ggml_sycl_ensure_moe_ptr_table(extra, device, static_cast<int>(n_experts), q, table_index);
+    if (!extra->moe_ptrs_ptr(device)) {
+        return nullptr;
+    }
+
+    auto & host_ptrs = extra->moe_expert_ptrs_host[device];
+    auto & expert_handles = extra->moe_expert_handles[device];
+    if (expert_handles.size() != host_ptrs.size()) {
+        expert_handles.assign(host_ptrs.size(), ggml_sycl::mem_handle{});
+    }
+
+    std::vector<ggml_sycl::mem_handle> leases;
+    std::vector<sycl::event>           table_deps;
+    bool                               any_updated = false;
+    leases.reserve(role.handles.size());
+    table_deps.reserve(role.ready_events.size());
+
+    for (size_t i = 0; i < role.expert_ids.size(); ++i) {
+        const int eid = role.expert_ids[i];
+        if (eid < 0 || eid >= n_experts) {
+            return nullptr;
+        }
+
+        ggml_sycl::mem_handle handle   = role.handles[i];
+        auto                  resolved = handle.resolve(device);
+        if (!resolved.ptr || !resolved.on_device || resolved.layout != layout) {
+            return nullptr;
+        }
+
+        expert_handles[static_cast<size_t>(eid)] = handle;
+        host_ptrs[static_cast<size_t>(eid)]      = resolved.ptr;
+        leases.push_back(std::move(handle));
+        any_updated = true;
+    }
+
+    for (const sycl::event & event : role.ready_events) {
+        table_deps.push_back(event);
+        ggml_sycl::g_test_moe_ptr_table_ready_event_deps.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    if (!any_updated) {
+        return nullptr;
+    }
+
+    sycl::event table_event = q.submit([&](sycl::handler & h) {
+        if (!table_deps.empty()) {
+            h.depends_on(table_deps);
+        }
+        h.memcpy(extra->moe_ptrs_ptr(device), host_ptrs.data(), host_ptrs.size() * sizeof(void *));
+    });
+    ggml_sycl::retain_handles_until_event(std::move(leases), table_event);
+
+    return static_cast<const void * const *>(extra->moe_ptrs_ptr(device));
+}
+
 static void ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,
                                            int                     device,
                                            int64_t                 n_experts,
@@ -39992,10 +40100,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     return reject_pair("layout-not-soa");
                 }
 
-                const int64_t n_ids_pair    = ids->ne[0];
-                const size_t  ids_n_elem    = static_cast<size_t>(ids->ne[1] * n_ids_pair);
-                const int     layer_hash    = moe_cache_layer_id(tname);
-                const int64_t total_experts = src0->ne[2];
+                const int64_t n_ids_pair = ids->ne[0];
+                const size_t  ids_n_elem = static_cast<size_t>(ids->ne[1] * n_ids_pair);
+                const int     layer_hash = moe_cache_layer_id(tname);
 
                 const int32_t * ids_data = nullptr;
                 auto            layer_it = g_moe_layer_ids_cache.find(layer);
@@ -40018,76 +40125,114 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     return reject_pair("ids-data");
                 }
 
-                static thread_local std::vector<int32_t> pair_eids;
-                pair_eids.resize(ids_n_elem);
-                for (size_t ci = 0; ci < ids_n_elem; ++ci) {
-                    const int32_t eid = ids_data[ci];
-                    if (eid < 0 || eid >= total_experts) {
-                        return reject_pair("expert-id");
+                moe_layer_decode_plan plan;
+                plan.layer           = layer;
+                plan.layer_hash      = layer_hash;
+                plan.n_ids           = n_ids_pair;
+                plan.n_entries       = ids_n_elem;
+                plan.layout          = pair_layout;
+                plan.current_is_gate = current_is_gate;
+                plan.ids_host        = ids_data;
+                plan.src1            = src1;
+                plan.ids             = ids;
+                plan.pair            = &pair;
+
+                auto log_route_reject = [&](const char * side, const ggml_tensor * tensor, int32_t eid,
+                                            const moe_expert_route & route) {
+                    if (path_trace_enabled == 0) {
+                        return;
                     }
-                    moe_expert_route current_route =
-                        ggml_sycl_resolve_moe_expert_route(src0, ctx.device, eid, pair_layout);
-                    if (current_route.kind != moe_expert_route_kind::LOCAL_DEVICE ||
-                        current_route.ptr == nullptr || current_route.actual_layout != pair_layout) {
-                        if (path_trace_enabled != 0) {
-                            static std::atomic<int> route_reject_log{ 0 };
-                            if (route_reject_log.fetch_add(1, std::memory_order_relaxed) < 64) {
-                                fprintf(stderr,
-                                        "[MOE-PAIR-ROUTE-REJECT] side=current tensor=%s layer=%d expert=%d "
-                                        "kind=%s ptr=%p owning=%d planned=%d plan_found=%d plan_missing=%d "
-                                        "planned_on_device=%d requested=%s actual=%s tier=%s reason=%s\n",
-                                        src0->name ? src0->name : "?", layer, eid,
-                                        ggml_sycl::ggml_sycl_moe_route_kind_name(current_route.kind), current_route.ptr,
-                                        current_route.owning_device, current_route.planned_device,
-                                        current_route.plan_found ? 1 : 0, current_route.plan_missing ? 1 : 0,
-                                        current_route.planned_device_residency ? 1 : 0,
-                                        ggml_sycl_layout_mode_name(current_route.requested_layout),
-                                        ggml_sycl_layout_mode_name(current_route.actual_layout),
-                                        ggml_sycl::ggml_sycl_expert_tier_name(current_route.tier),
-                                        ggml_sycl::ggml_sycl_expert_resolve_reason_name(current_route.reason));
-                            }
+                    static std::atomic<int> route_reject_log{ 0 };
+                    if (route_reject_log.fetch_add(1, std::memory_order_relaxed) < 64) {
+                        fprintf(stderr,
+                                "[MOE-LAYER-PLAN-ROUTE-REJECT] side=%s tensor=%s layer=%d expert=%d "
+                                "kind=%s ptr=%p owning=%d planned=%d plan_found=%d plan_missing=%d "
+                                "planned_on_device=%d requested=%s actual=%s tier=%s reason=%s\n",
+                                side, tensor && tensor->name ? tensor->name : "?", layer, eid,
+                                ggml_sycl::ggml_sycl_moe_route_kind_name(route.kind), route.ptr,
+                                route.owning_device, route.planned_device, route.plan_found ? 1 : 0,
+                                route.plan_missing ? 1 : 0, route.planned_device_residency ? 1 : 0,
+                                ggml_sycl_layout_mode_name(route.requested_layout),
+                                ggml_sycl_layout_mode_name(route.actual_layout),
+                                ggml_sycl::ggml_sycl_expert_tier_name(route.tier),
+                                ggml_sycl::ggml_sycl_expert_resolve_reason_name(route.reason));
+                    }
+                };
+
+                auto build_role_plan = [&](moe_layer_decode_role_plan & role, const ggml_tensor * weight,
+                                           const char * side) -> bool {
+                    const int64_t role_total_experts = weight->ne[2] > 0 ? weight->ne[2] : 1;
+                    role.weight = weight;
+                    role.expert_ids.resize(ids_n_elem);
+                    role.handles.clear();
+                    role.ready_events.clear();
+                    role.handles.reserve(ids_n_elem);
+                    role.ready_events.reserve(ids_n_elem);
+                    for (size_t ci = 0; ci < ids_n_elem; ++ci) {
+                        const int32_t eid = ids_data[ci];
+                        if (eid < 0 || eid >= role_total_experts) {
+                            return reject_pair("expert-id");
                         }
-                        return reject_pair("current-route");
-                    }
-                    moe_expert_route partner_route =
-                        ggml_sycl_resolve_moe_expert_route(partner_weight, ctx.device, eid, pair_layout);
-                    if (partner_route.kind != moe_expert_route_kind::LOCAL_DEVICE ||
-                        partner_route.ptr == nullptr || partner_route.actual_layout != pair_layout) {
-                        if (path_trace_enabled != 0) {
-                            static std::atomic<int> route_reject_log{ 0 };
-                            if (route_reject_log.fetch_add(1, std::memory_order_relaxed) < 64) {
-                                fprintf(stderr,
-                                        "[MOE-PAIR-ROUTE-REJECT] side=partner tensor=%s layer=%d expert=%d "
-                                        "kind=%s ptr=%p owning=%d planned=%d plan_found=%d plan_missing=%d "
-                                        "planned_on_device=%d requested=%s actual=%s tier=%s reason=%s\n",
-                                        partner_weight->name ? partner_weight->name : "?", layer, eid,
-                                        ggml_sycl::ggml_sycl_moe_route_kind_name(partner_route.kind), partner_route.ptr,
-                                        partner_route.owning_device, partner_route.planned_device,
-                                        partner_route.plan_found ? 1 : 0, partner_route.plan_missing ? 1 : 0,
-                                        partner_route.planned_device_residency ? 1 : 0,
-                                        ggml_sycl_layout_mode_name(partner_route.requested_layout),
-                                        ggml_sycl_layout_mode_name(partner_route.actual_layout),
-                                        ggml_sycl::ggml_sycl_expert_tier_name(partner_route.tier),
-                                        ggml_sycl::ggml_sycl_expert_resolve_reason_name(partner_route.reason));
-                            }
+                        moe_expert_route route =
+                            ggml_sycl_resolve_moe_expert_route(weight, ctx.device, eid, pair_layout);
+                        if (route.kind != moe_expert_route_kind::LOCAL_DEVICE || route.ptr == nullptr ||
+                            route.actual_layout != pair_layout) {
+                            log_route_reject(side, weight, eid, route);
+                            return reject_pair(side);
                         }
-                        return reject_pair("partner-route");
+                        ggml_sycl::mem_handle handle = std::move(route.lease);
+                        auto                  resolved = handle.resolve(ctx.device);
+                        if (!resolved.ptr || !resolved.on_device || resolved.layout != pair_layout) {
+                            log_route_reject(side, weight, eid, route);
+                            return reject_pair("handle-resolve");
+                        }
+                        role.expert_ids[ci] = eid;
+                        role.handles.push_back(std::move(handle));
+                        if (route.has_ready_event) {
+                            role.ready_events.push_back(route.ready_event);
+                        }
                     }
-                    pair_eids[ci] = eid;
+                    return true;
+                };
+
+                if (!build_role_plan(plan.current, src0, "current-route") ||
+                    !build_role_plan(plan.partner, partner_weight, "partner-route")) {
+                    return false;
+                }
+                if (current_is_gate) {
+                    plan.gate = plan.current;
+                    plan.up   = plan.partner;
+                } else {
+                    plan.up   = plan.current;
+                    plan.gate = plan.partner;
                 }
 
-                ggml_sycl_ensure_weight_on_device(partner_weight, ctx.device);
-                const void * const * current_ptrs =
-                    moe_fusion_ensure_gpu0_ptrs(ctx, src0, pair_eids.data(), pair_eids.size(), layer_hash, pair_layout);
-                const void * const * partner_ptrs = moe_fusion_ensure_gpu0_ptrs(
-                    ctx, partner_weight, pair_eids.data(), pair_eids.size(), layer_hash, pair_layout);
-                if (!current_ptrs || !partner_ptrs) {
-                    return reject_pair(!current_ptrs ? "current-ptrs" : "partner-ptrs");
-                }
                 const int32_t * ids_device =
                     static_cast<const int32_t *>(ggml_sycl_resolve_tensor_ptr(ids, ctx.device));
                 if (!ids_device) {
                     return reject_pair("ids-device");
+                }
+                plan.ids_device = ids_device;
+
+                ggml_sycl_ensure_weight_on_device(partner_weight, ctx.device);
+                const void * const * current_ptrs =
+                    moe_fusion_upload_ptrs_from_handles(ctx, plan.current, layer_hash, pair_layout);
+                const void * const * partner_ptrs =
+                    moe_fusion_upload_ptrs_from_handles(ctx, plan.partner, layer_hash, pair_layout);
+                if (!current_ptrs || !partner_ptrs) {
+                    return reject_pair(!current_ptrs ? "current-ptrs" : "partner-ptrs");
+                }
+
+                if (path_trace_enabled != 0) {
+                    static std::atomic<int> accept_log{ 0 };
+                    if (accept_log.fetch_add(1, std::memory_order_relaxed) < 64) {
+                        fprintf(stderr,
+                                "[MOE-LAYER-PLAN] layer=%d cur=%s partner=%s device=%d entries=%zu topk=%lld "
+                                "layout=%s ids_device=%p\n",
+                                plan.layer, src0->name ? src0->name : "?",
+                                partner_weight->name ? partner_weight->name : "?", ctx.device, plan.n_entries,
+                                (long long) plan.n_ids, ggml_sycl_layout_mode_name(plan.layout), plan.ids_device);
+                    }
                 }
 
                 const bool can_fuse_glu =
@@ -40112,8 +40257,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         const bool  ok_glu = mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(
                             ctx, pair.gate_weight, pair.up_weight, src1, pair.glu_dst, gate_ptrs, up_ptrs, ids_device,
                             gate_bias_ptr, up_bias_ptr, pair.gate_bias ? pair.gate_bias->nb[1] : 0,
-                            pair.up_bias ? pair.up_bias->nb[1] : 0, static_cast<int>(pair_eids.size()), n_ids_pair,
-                            ids->nb[0], ids->nb[1], pair.glu_op, alpha, limit);
+                            pair.up_bias ? pair.up_bias->nb[1] : 0,
+                            static_cast<int>(plan.current.expert_ids.size()), n_ids_pair, ids->nb[0], ids->nb[1],
+                            pair.glu_op, alpha, limit);
                         if (ok_glu) {
                             static const int layer_executor_enabled = [] {
                                 const char * env = std::getenv("GGML_SYCL_MOE_LAYER_EXECUTOR");
@@ -40133,37 +40279,38 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 pair.glu_dst->ne[0] == pair.down_weight->ne[0] &&
                                 pair.glu_dst->ne[1] == n_ids_pair &&
                                 pair.glu_dst->ne[2] == ids->ne[1]) {
-                                static thread_local std::vector<int32_t> down_eids;
                                 static thread_local std::vector<int64_t> down_iid1s;
                                 static thread_local std::vector<int64_t> down_ids;
                                 const int64_t down_tokens = pair.glu_dst->ne[2];
                                 const size_t  down_entries =
                                     static_cast<size_t>(n_ids_pair) * static_cast<size_t>(down_tokens);
-                                down_eids.resize(down_entries);
+                                plan.down_eligible = true;
+                                plan.down.weight   = pair.down_weight;
                                 down_iid1s.resize(down_entries);
                                 down_ids.resize(down_entries);
                                 size_t ci = 0;
                                 for (int64_t iid1 = 0; iid1 < down_tokens; ++iid1) {
                                     for (int64_t id = 0; id < n_ids_pair; ++id) {
-                                        const int32_t eid = ids_data[static_cast<size_t>(iid1 * n_ids_pair + id)];
-                                        down_eids[ci]   = eid;
-                                        down_iid1s[ci]  = iid1;
-                                        down_ids[ci]    = id;
+                                        down_iid1s[ci] = iid1;
+                                        down_ids[ci]   = id;
                                         ++ci;
                                     }
                                 }
 
                                 const int down_layer_hash = moe_cache_layer_id(pair.down_weight->name);
                                 ggml_sycl_ensure_weight_on_device(pair.down_weight, ctx.device);
-                                const void * const * down_ptrs = moe_fusion_ensure_gpu0_ptrs(
-                                    ctx, pair.down_weight, down_eids.data(), down_eids.size(), down_layer_hash,
-                                    pair_layout);
+                                const bool down_plan_ok = build_role_plan(plan.down, pair.down_weight, "down-route");
+                                const void * const * down_ptrs =
+                                    down_plan_ok ? moe_fusion_upload_ptrs_from_handles(ctx, plan.down, down_layer_hash,
+                                                                                      pair_layout) :
+                                                   nullptr;
                                 if (down_ptrs) {
                                     ok_down = mmvq_moe_batched_dispatch(
-                                        ctx, pair.down_weight, pair.glu_dst, pair.down_dst, down_ptrs, down_eids.data(),
-                                        down_iid1s.data(), down_ids.data(), static_cast<int>(down_eids.size()),
-                                        static_cast<int>(pair.down_weight->ne[2]), n_ids_pair, pair_layout, ids_device,
-                                        ids->nb[0], ids->nb[1]);
+                                        ctx, pair.down_weight, pair.glu_dst, pair.down_dst, down_ptrs,
+                                        plan.down.expert_ids.data(), down_iid1s.data(), down_ids.data(),
+                                        static_cast<int>(plan.down.expert_ids.size()),
+                                        static_cast<int>(pair.down_weight->ne[2]), n_ids_pair, pair_layout,
+                                        ids_device, ids->nb[0], ids->nb[1]);
                                     if (ok_down) {
                                         ggml_sycl_moe_down_shadow_capture(ctx, pair.down_dst, layer);
                                     }
@@ -40173,7 +40320,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                                 "tokens=%lld skip_later=%d device=%d\n",
                                                 src0->name ? src0->name : "?",
                                                 pair.down_weight->name ? pair.down_weight->name : "?", layer,
-                                                down_eids.size(), (long long) down_tokens,
+                                                plan.down.expert_ids.size(), (long long) down_tokens,
                                                 layer_executor_skip_eligible ? 1 : 0, ctx.device);
                                     }
                                     if (ok_down && layer_executor_enabled == 1 &&
@@ -40194,7 +40341,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                         "[MOE-PAIR] path=pair_glu tensor=%s partner=%s layer=%d layout=%s "
                                         "entries=%zu n_ids=%lld glu=%s gate_bias=%d up_bias=%d device=%d\n",
                                         src0->name ? src0->name : "?", partner_weight->name ? partner_weight->name : "?",
-                                        layer, ggml_sycl_layout_mode_name(pair_layout), pair_eids.size(),
+                                        layer, ggml_sycl_layout_mode_name(pair_layout), plan.current.expert_ids.size(),
                                         (long long) n_ids_pair, ggml_glu_op_name(pair.glu_op),
                                         pair.gate_bias ? 1 : 0, pair.up_bias ? 1 : 0, ctx.device);
                             }
@@ -40217,14 +40364,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
                 const bool ok = mmvq_moe_batched_dispatch_pair_mxfp4_soa(
                     ctx, src0, partner_weight, src1, dst, partner_dst, current_ptrs, partner_ptrs, ids_device,
-                    static_cast<int>(pair_eids.size()), n_ids_pair, ids->nb[0], ids->nb[1]);
+                    static_cast<int>(plan.current.expert_ids.size()), n_ids_pair, ids->nb[0], ids->nb[1]);
                 if (ok) {
                     if (path_trace_enabled != 0) {
                         fprintf(stderr,
                                 "[MOE-PAIR] path=pair_raw tensor=%s partner=%s layer=%d layout=%s entries=%zu "
                                 "n_ids=%lld device=%d\n",
                                 src0->name ? src0->name : "?", partner_weight->name ? partner_weight->name : "?",
-                                layer, ggml_sycl_layout_mode_name(pair_layout), pair_eids.size(),
+                                layer, ggml_sycl_layout_mode_name(pair_layout), plan.current.expert_ids.size(),
                                 (long long) n_ids_pair, ctx.device);
                     }
                     g_moe_precomputed_mmid_skip.insert(partner_dst);
