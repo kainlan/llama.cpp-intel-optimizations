@@ -116,7 +116,8 @@ static void print_usage(const char * argv0) {
                  "mmvq_esimd_hybrid|mmvq_esimd_cooperative|mmvq_q4_0_specialized|"
                  "mmvq_q6_k_specialized|mmvq_mxfp4_native|"
                  "mmq_aos|mmq_soa|mmq_coalesced|mmq|"
-                 "onednn_fp16_gemm|onednn_int8_gemm|onednn_woq_gemm|unified_matmul|memory_bandwidth|roofline_compute|"
+                 "onednn_fp16_gemm|onednn_int8_gemm|onednn_woq_gemm|unified_matmul|memory_bandwidth|"
+                 "mxfp4_decode_aos|mxfp4_decode_soa|roofline_compute|"
                  "dpas_baseline|dpas_sweep|dpas_memory_patterns (comma-separated to compare)\n"
                  "  --quant=Q4_0|Q8_0|Q6_K|Q4_K|Q5_K|Q2_K|Q3_K|Q4_1|Q5_0|Q5_1|MXFP4\n"
                  "  --batch=1,4,8,16,32,64\n"
@@ -770,6 +771,7 @@ int main(int argc, char ** argv) {
     if (!params.model_path.empty()) {
         for (const auto * kernel : kernels) {
             if (kernel->kind == KernelKind::MEMORY_BANDWIDTH ||
+                kernel->kind == KernelKind::MXFP4_DECODE_BANDWIDTH ||
                 kernel->kind == KernelKind::ROOFLINE_COMPUTE ||
                 kernel->kind == KernelKind::DPAS_EXPLORATION) {
                 std::fprintf(stderr, "--model is not supported for the selected kernel kind.\\n");

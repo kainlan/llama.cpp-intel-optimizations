@@ -88,6 +88,16 @@ bool run_memory_bandwidth(size_t bytes,
                           ReferenceMetrics & out,
                           std::string & error);
 
+bool run_mxfp4_decode_bandwidth(const GeneratedWeights & weights,
+                                int64_t m,
+                                int64_t k,
+                                ggml_layout_mode layout,
+                                int warmup,
+                                int iterations,
+                                sycl::queue & queue,
+                                ReferenceMetrics & out,
+                                std::string & error);
+
 bool run_roofline_compute(size_t elements,
                           int ops_per_element,
                           int warmup,

@@ -18,6 +18,7 @@ enum class KernelKind {
     ONEDNN_WOQ_GEMM,
     UNIFIED_MATMUL,
     MEMORY_BANDWIDTH,
+    MXFP4_DECODE_BANDWIDTH,
     ROOFLINE_COMPUTE,
     DPAS_EXPLORATION,
 };
@@ -82,6 +83,8 @@ inline const std::vector<KernelInfo> & kernel_list() {
         { "onednn_woq_gemm", GGML_LAYOUT_AOS, KernelKind::ONEDNN_WOQ_GEMM },
         { "unified_matmul", GGML_LAYOUT_AOS, KernelKind::UNIFIED_MATMUL },
         { "memory_bandwidth", GGML_LAYOUT_AOS, KernelKind::MEMORY_BANDWIDTH },
+        { "mxfp4_decode_aos", GGML_LAYOUT_AOS, KernelKind::MXFP4_DECODE_BANDWIDTH },
+        { "mxfp4_decode_soa", GGML_LAYOUT_SOA, KernelKind::MXFP4_DECODE_BANDWIDTH },
         { "roofline_compute", GGML_LAYOUT_AOS, KernelKind::ROOFLINE_COMPUTE },
     };
     return kernels;

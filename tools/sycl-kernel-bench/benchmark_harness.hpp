@@ -950,6 +950,20 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
             }
             break;
         }
+        case KernelKind::MXFP4_DECODE_BANDWIDTH: {
+            GeneratedWeights weights;
+            if (!generate_quantized_weights(GGML_TYPE_MXFP4, config.layout, m, k, false, weights)) {
+                out.error = "Failed to generate MXFP4 weights for decode benchmark.";
+                return false;
+            }
+            if (!run_mxfp4_decode_bandwidth(weights, m, k, config.layout,
+                                            config.warmup_iterations, config.measure_iterations,
+                                            queue, metrics, error)) {
+                out.error = error;
+                return false;
+            }
+            break;
+        }
         case KernelKind::ROOFLINE_COMPUTE: {
             size_t elements = (config.roofline_elements > 0)
                 ? static_cast<size_t>(config.roofline_elements)

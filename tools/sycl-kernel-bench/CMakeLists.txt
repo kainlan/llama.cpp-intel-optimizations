@@ -5,6 +5,7 @@ add_executable(${TARGET}
     kernels/reference/onednn_int8_gemm.cpp
     kernels/reference/onednn_woq_gemm.cpp
     kernels/reference/memory_bandwidth.cpp
+    kernels/reference/mxfp4_decode_bandwidth.cpp
     kernels/reference/roofline_compute.cpp
     kernels/tier1/mmvq_aos_baseline.cpp
     kernels/tier1/mmvq_soa_baseline.cpp
