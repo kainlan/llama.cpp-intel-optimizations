@@ -8395,6 +8395,9 @@ struct moe_ids_cache_entry {
 // Keyed by the ggml_tensor pointer (avoids unnecessary device round-trips).
 static thread_local std::unordered_map<const ggml_tensor *, moe_ids_cache_entry> g_moe_ids_d2h_cache;
 
+static bool ggml_sycl_refresh_moe_ids_cache(ggml_backend_sycl_context & ctx, const ggml_tensor * ids,
+                                            moe_ids_cache_entry & entry);
+
 // ---------------------------------------------------------------------------
 // Per-layer IDs D2H cache for MoE sub-op batching (Task 1E).
 // Gate/Up/Down sub-ops within the same MoE block share the same expert IDs.
@@ -8921,6 +8924,10 @@ static void ggml_sycl_moe_precomputed_skip_new_graph() {
 }
 
 static bool ggml_sycl_moe_layer_executor_skip_allowed() {
+    // Only skip the later down MUL_MAT_ID when MoE is executing directly.
+    // During full graph recording, the router/argsort producers before a paused
+    // MoE op have been recorded but not executed yet, so host-side route-ID
+    // validation would read stale control data.
     return g_ggml_sycl_disable_graph || g_moe_segmented_graph_dispatch_active || g_moe_direct_tg_dispatch_active;
 }
 
@@ -31067,6 +31074,20 @@ static bool ggml_sycl_copy_ids_to_host(ggml_backend_sycl_context & ctx,
     return true;
 }
 
+static bool ggml_sycl_refresh_moe_ids_cache(ggml_backend_sycl_context & ctx, const ggml_tensor * ids,
+                                            moe_ids_cache_entry & entry) {
+    if (!ggml_sycl_copy_ids_to_host(ctx, ids, entry.host_ids, &entry.d2h_event)) {
+        entry.host_ids.clear();
+        entry.n_elements = 0;
+        entry.pending    = false;
+        return false;
+    }
+    entry.n_elements = entry.host_ids.size();
+    entry.pending    = true;
+    entry.wait();
+    return true;
+}
+
 static uint64_t ggml_sycl_hash_ids(const std::vector<int32_t> & ids) {
     uint64_t hash = 1469598103934665603ull;
     for (int32_t v : ids) {
@@ -40004,22 +40025,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 const size_t    ids_n_elem    = static_cast<size_t>(ids->ne[1] * n_ids_layer);
                 const int64_t   total_experts = src0->ne[2];
                 const int32_t * ids_data      = nullptr;
-                auto            layer_ids_it  = g_moe_layer_ids_cache.find(layer);
-                if (layer_ids_it != g_moe_layer_ids_cache.end() && layer_ids_it->second.ids_host.size() == ids_n_elem) {
-                    ids_data = layer_ids_it->second.ids_host.data();
-                } else {
-                    auto & entry = g_moe_ids_d2h_cache[ids];
-                    if (entry.n_elements != ids_n_elem) {
-                        ggml_sycl_copy_ids_to_host(ctx, ids, entry.host_ids, &entry.d2h_event);
-                        entry.n_elements = entry.host_ids.size();
-                        entry.pending    = true;
-                    }
-                    entry.wait();
-                    ids_data      = entry.host_ids.data();
-                    auto & lentry = g_moe_layer_ids_cache[layer];
-                    lentry.ids_host.assign(ids_data, ids_data + ids_n_elem);
-                    ids_data = lentry.ids_host.data();
+                auto &          entry         = g_moe_ids_d2h_cache[ids];
+                if (!ggml_sycl_refresh_moe_ids_cache(ctx, ids, entry) || entry.n_elements != ids_n_elem) {
+                    return reject_layer("ids-copy");
                 }
+                ids_data      = entry.host_ids.data();
+                auto & lentry = g_moe_layer_ids_cache[layer];
+                lentry.ids_host.assign(ids_data, ids_data + ids_n_elem);
+                ids_data = lentry.ids_host.data();
                 if (!ids_data) {
                     return reject_layer("ids-data");
                 }
@@ -40157,22 +40170,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 const int     layer_hash = moe_cache_layer_id(tname);
 
                 const int32_t * ids_data = nullptr;
-                auto            layer_it = g_moe_layer_ids_cache.find(layer);
-                if (layer_it != g_moe_layer_ids_cache.end() && layer_it->second.ids_host.size() == ids_n_elem) {
-                    ids_data = layer_it->second.ids_host.data();
-                } else {
-                    auto & entry = g_moe_ids_d2h_cache[ids];
-                    if (entry.n_elements != ids_n_elem) {
-                        ggml_sycl_copy_ids_to_host(ctx, ids, entry.host_ids, &entry.d2h_event);
-                        entry.n_elements = entry.host_ids.size();
-                        entry.pending    = true;
-                    }
-                    entry.wait();
-                    ids_data      = entry.host_ids.data();
-                    auto & lentry = g_moe_layer_ids_cache[layer];
-                    lentry.ids_host.assign(ids_data, ids_data + ids_n_elem);
-                    ids_data = lentry.ids_host.data();
+                auto &          entry    = g_moe_ids_d2h_cache[ids];
+                if (!ggml_sycl_refresh_moe_ids_cache(ctx, ids, entry) || entry.n_elements != ids_n_elem) {
+                    return reject_pair("ids-copy");
                 }
+                ids_data      = entry.host_ids.data();
+                auto & lentry = g_moe_layer_ids_cache[layer];
+                lentry.ids_host.assign(ids_data, ids_data + ids_n_elem);
+                ids_data = lentry.ids_host.data();
                 if (!ids_data) {
                     return reject_pair("ids-data");
                 }
@@ -40514,18 +40519,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             const size_t    ids_n_elem = static_cast<size_t>(ids->ne[1] * n_ids_f);
             const int32_t * ids_data   = nullptr;
 
-            auto cache_it = g_moe_ids_d2h_cache.find(ids);
-            if (cache_it != g_moe_ids_d2h_cache.end() && cache_it->second.n_elements == ids_n_elem) {
-                cache_it->second.wait();
-                ids_data = cache_it->second.host_ids.data();
-            } else {
-                auto & entry = g_moe_ids_d2h_cache[ids];
-                ggml_sycl_copy_ids_to_host(ctx, ids, entry.host_ids, &entry.d2h_event);
-                entry.n_elements = entry.host_ids.size();
-                entry.pending    = true;
-                entry.wait();
-                ids_data = entry.host_ids.data();
+            auto & entry = g_moe_ids_d2h_cache[ids];
+            if (!ggml_sycl_refresh_moe_ids_cache(ctx, ids, entry) || entry.n_elements != ids_n_elem) {
+                GGML_LOG_ERROR("[MoE] Failed to refresh ids for %s\n", src0->name ? src0->name : "?");
+                return;
             }
+            ids_data = entry.host_ids.data();
 
             if (prof_enabled) {
                 t1 = hrc::now();
@@ -56730,8 +56729,7 @@ normal_dispatch:
         }
     }
 
-    if (use_sycl_graph && cached_is_decode && sycl_ctx->moe_graph_rerecord &&
-        !moe_decode_segmented_graph_profitable(cgraph)) {
+    if (use_sycl_graph && cached_is_decode && !moe_decode_segmented_graph_profitable(cgraph)) {
         static std::atomic<bool> logged{ false };
         if (!logged.exchange(true, std::memory_order_acq_rel)) {
             GGML_LOG_INFO(
