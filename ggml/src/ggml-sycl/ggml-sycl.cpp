@@ -8723,6 +8723,122 @@ struct moe_gate_up_pair {
 static thread_local std::unordered_map<int, moe_gate_up_pair> g_moe_gate_up_pairs;
 static thread_local std::unordered_set<const ggml_tensor *>   g_moe_precomputed_mmid_skip;
 static thread_local std::unordered_set<const ggml_tensor *>   g_moe_precomputed_node_skip;
+static thread_local bool                                      g_moe_segmented_graph_dispatch_active = false;
+
+struct moe_down_shadow_entry {
+    int                  device = -1;
+    int                  layer  = -1;
+    size_t               nbytes = 0;
+    uint64_t             hash   = 0;
+    std::vector<uint8_t> bytes;
+};
+
+static thread_local std::unordered_map<const ggml_tensor *, moe_down_shadow_entry> g_moe_down_shadow;
+static thread_local bool g_moe_direct_tg_dispatch_active = false;
+
+static bool ggml_sycl_moe_down_shadow_enabled() {
+    static const int enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_MOE_DOWN_SHADOW");
+        return env ? std::atoi(env) : 0;
+    }();
+    return enabled != 0;
+}
+
+static uint64_t ggml_sycl_moe_shadow_hash_bytes(const uint8_t * data, size_t n) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; ++i) {
+        h ^= static_cast<uint64_t>(data[i]);
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static bool ggml_sycl_moe_shadow_copy_tensor(ggml_backend_sycl_context & ctx,
+                                             const ggml_tensor *         tensor,
+                                             std::vector<uint8_t> &      bytes) {
+    if (!tensor) {
+        return false;
+    }
+    void * ptr = ggml_sycl_resolve_tensor_ptr(tensor, ctx.device);
+    if (!ptr) {
+        return false;
+    }
+    const size_t nbytes = ggml_nbytes(tensor);
+    bytes.resize(nbytes);
+    if (nbytes == 0) {
+        return true;
+    }
+    ctx.stream()->memcpy(bytes.data(), ptr, nbytes).wait();
+    return true;
+}
+
+static void ggml_sycl_moe_down_shadow_capture(ggml_backend_sycl_context & ctx, const ggml_tensor * tensor, int layer) {
+    if (!ggml_sycl_moe_down_shadow_enabled() || !tensor) {
+        return;
+    }
+    moe_down_shadow_entry entry;
+    entry.device = ctx.device;
+    entry.layer  = layer;
+    if (!ggml_sycl_moe_shadow_copy_tensor(ctx, tensor, entry.bytes)) {
+        fprintf(stderr, "[MOE-DOWN-SHADOW] capture_failed tensor=%s layer=%d device=%d\n",
+                tensor->name ? tensor->name : "?", layer, ctx.device);
+        return;
+    }
+    entry.nbytes = entry.bytes.size();
+    entry.hash   = ggml_sycl_moe_shadow_hash_bytes(entry.bytes.data(), entry.bytes.size());
+    g_moe_down_shadow[tensor] = std::move(entry);
+    fprintf(stderr, "[MOE-DOWN-SHADOW] captured tensor=%s layer=%d device=%d bytes=%zu hash=%016llx\n",
+            tensor->name ? tensor->name : "?", layer, ctx.device, g_moe_down_shadow[tensor].nbytes,
+            (unsigned long long) g_moe_down_shadow[tensor].hash);
+}
+
+static void ggml_sycl_moe_down_shadow_compare(ggml_backend_sycl_context & ctx, const ggml_tensor * tensor) {
+    if (!ggml_sycl_moe_down_shadow_enabled() || !tensor) {
+        return;
+    }
+    auto it = g_moe_down_shadow.find(tensor);
+    if (it == g_moe_down_shadow.end()) {
+        return;
+    }
+
+    std::vector<uint8_t> current;
+    if (!ggml_sycl_moe_shadow_copy_tensor(ctx, tensor, current)) {
+        fprintf(stderr, "[MOE-DOWN-SHADOW] compare_failed tensor=%s layer=%d device=%d\n",
+                tensor->name ? tensor->name : "?", it->second.layer, ctx.device);
+        g_moe_down_shadow.erase(it);
+        return;
+    }
+
+    const uint64_t current_hash = ggml_sycl_moe_shadow_hash_bytes(current.data(), current.size());
+    const bool     size_match   = current.size() == it->second.bytes.size();
+    size_t         first_diff   = SIZE_MAX;
+    if (size_match && current_hash != it->second.hash) {
+        for (size_t i = 0; i < current.size(); ++i) {
+            if (current[i] != it->second.bytes[i]) {
+                first_diff = i;
+                break;
+            }
+        }
+    }
+
+    fprintf(stderr,
+            "[MOE-DOWN-SHADOW] compare tensor=%s layer=%d early_device=%d normal_device=%d bytes=%zu "
+            "early_hash=%016llx normal_hash=%016llx match=%d first_diff=%lld\n",
+            tensor->name ? tensor->name : "?", it->second.layer, it->second.device, ctx.device, current.size(),
+            (unsigned long long) it->second.hash, (unsigned long long) current_hash,
+            (size_match && current_hash == it->second.hash) ? 1 : 0, (long long) first_diff);
+    g_moe_down_shadow.erase(it);
+}
+
+static void ggml_sycl_moe_precomputed_skip_new_graph() {
+    g_moe_precomputed_mmid_skip.clear();
+    g_moe_precomputed_node_skip.clear();
+    g_moe_down_shadow.clear();
+}
+
+static bool ggml_sycl_moe_layer_executor_skip_allowed() {
+    return g_ggml_sycl_disable_graph || g_moe_segmented_graph_dispatch_active || g_moe_direct_tg_dispatch_active;
+}
 
 // MoE expert probability threshold: skip low-probability experts in TG.
 // Disabled by default (threshold=0.0); the unified cache planner handles
@@ -39956,13 +40072,16 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         if (ok_glu) {
                             static const int layer_executor_enabled = [] {
                                 const char * env = std::getenv("GGML_SYCL_MOE_LAYER_EXECUTOR");
-                                return env ? std::atoi(env) : 0;
+                                return env ? std::atoi(env) : 1;
                             }();
                             static bool layer_executor_graph_warning_shown = false;
-                            bool ok_down = false;
-                            if (layer_executor_enabled != 0 && pair.down_weight && pair.down_dst &&
-                                pair.down_dst->src[1] == pair.glu_dst && pair.down_dst->src[2] == ids &&
-                                pair.down_index > pair.glu_index &&
+                            bool        ok_down                            = false;
+                            const bool  layer_executor_skip_eligible =
+                                layer_executor_enabled == 1 && ggml_sycl_moe_layer_executor_skip_allowed();
+                            const bool layer_executor_shadow_probe = layer_executor_enabled == 2;
+                            if ((layer_executor_skip_eligible || layer_executor_shadow_probe) && pair.down_weight &&
+                                pair.down_dst && pair.down_dst->src[1] == pair.glu_dst &&
+                                pair.down_dst->src[2] == ids && pair.down_index > pair.glu_index &&
                                 pair.down_weight->type == GGML_TYPE_MXFP4 &&
                                 ggml_sycl_adjust_layout_for_tensor(pair.down_weight, requested_layout, ctx.device) ==
                                     pair_layout &&
@@ -40000,21 +40119,25 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                         down_iid1s.data(), down_ids.data(), static_cast<int>(down_eids.size()),
                                         static_cast<int>(pair.down_weight->ne[2]), n_ids_pair, pair_layout, ids_device,
                                         ids->nb[0], ids->nb[1]);
+                                    if (ok_down) {
+                                        ggml_sycl_moe_down_shadow_capture(ctx, pair.down_dst, layer);
+                                    }
                                     if (ok_down && path_trace_enabled != 0) {
-                                        const bool can_skip_later = layer_executor_enabled == 1 && g_ggml_sycl_disable_graph;
                                         fprintf(stderr,
                                                 "[MOE-PAIR] path=pair_glu_down tensor=%s down=%s layer=%d entries=%zu "
                                                 "tokens=%lld skip_later=%d device=%d\n",
                                                 src0->name ? src0->name : "?",
                                                 pair.down_weight->name ? pair.down_weight->name : "?", layer,
                                                 down_eids.size(), (long long) down_tokens,
-                                                can_skip_later ? 1 : 0, ctx.device);
+                                                layer_executor_skip_eligible ? 1 : 0, ctx.device);
                                     }
-                                    if (ok_down && layer_executor_enabled == 1 && !g_ggml_sycl_disable_graph &&
+                                    if (ok_down && layer_executor_enabled == 1 &&
+                                        !layer_executor_skip_eligible &&
                                         !layer_executor_graph_warning_shown) {
                                         fprintf(stderr,
                                                 "[MOE-PAIR] GGML_SYCL_MOE_LAYER_EXECUTOR skip disabled because SYCL "
-                                                "graphs are enabled; set GGML_SYCL_DISABLE_GRAPH=1 for skip proof.\n");
+                                                "graphs are enabled outside segmented MoE replay; set "
+                                                "GGML_SYCL_DISABLE_GRAPH=1 for the direct-dispatch skip proof.\n");
                                         layer_executor_graph_warning_shown = true;
                                     }
                                 } else if (path_trace_enabled != 0) {
@@ -40038,7 +40161,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 g_moe_precomputed_node_skip.insert(pair.up_biased);
                             }
                             g_moe_precomputed_node_skip.insert(pair.glu_dst);
-                            if (ok_down && layer_executor_enabled == 1 && g_ggml_sycl_disable_graph) {
+                            if (ok_down && layer_executor_enabled == 1 &&
+                                ggml_sycl_moe_layer_executor_skip_allowed()) {
                                 g_moe_precomputed_mmid_skip.insert(pair.down_dst);
                             }
                             return true;
@@ -44995,6 +45119,7 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
                 return false;
             }
             ggml_sycl_mul_mat_id(ctx, dst);
+            ggml_sycl_moe_down_shadow_compare(ctx, dst);
             break;
         case GGML_OP_OUT_PROD:
             ggml_sycl_op_out_prod(ctx, dst);
@@ -47229,8 +47354,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     }
 
     g_moe_gate_up_pairs.clear();
-    g_moe_precomputed_mmid_skip.clear();
-    g_moe_precomputed_node_skip.clear();
+    ggml_sycl_moe_precomputed_skip_new_graph();
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
         if (!node || node->op != GGML_OP_MUL_MAT_ID || !node->src[0] || !node->src[1] || !node->src[2]) {
@@ -48902,6 +49026,12 @@ static bool moe_graph_record_segments(ggml_backend_sycl_context * sycl_ctx,
     bool used_direct_fa_segment = false;
 
     queue_ptr stream = sycl_ctx->stream();
+    ggml_sycl_moe_precomputed_skip_new_graph();
+
+    struct segmented_dispatch_scope {
+        segmented_dispatch_scope() { g_moe_segmented_graph_dispatch_active = true; }
+        ~segmented_dispatch_scope() { g_moe_segmented_graph_dispatch_active = false; }
+    } segmented_scope;
 
     for (size_t seg_idx = 0; seg_idx < segments.size(); seg_idx++) {
         const auto &  seg                  = segments[seg_idx];
@@ -49102,6 +49232,12 @@ static void moe_graph_replay_segments(ggml_backend_sycl_context * sycl_ctx, ggml
                     sycl_ctx->moe_node_indices.size());
 
     queue_ptr stream = sycl_ctx->stream();
+    ggml_sycl_moe_precomputed_skip_new_graph();
+
+    struct segmented_dispatch_scope {
+        segmented_dispatch_scope() { g_moe_segmented_graph_dispatch_active = true; }
+        ~segmented_dispatch_scope() { g_moe_segmented_graph_dispatch_active = false; }
+    } segmented_scope;
 
     // Merged schedule: segments and MoE ops in node-index order.
     size_t seg_idx = 0;
@@ -55296,10 +55432,24 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
     auto compute_impl = [&]() {
         ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
     };
+    bool allow_moe_layer_skip_in_direct_tg = false;
     auto compute_impl_unlocked = [&]() {
         if (global_graph_lock.owns_lock()) {
             global_graph_lock.unlock();
         }
+        struct direct_tg_scope {
+            bool active = false;
+            explicit direct_tg_scope(bool enable) : active(enable) {
+                if (active) {
+                    g_moe_direct_tg_dispatch_active = true;
+                }
+            }
+            ~direct_tg_scope() {
+                if (active) {
+                    g_moe_direct_tg_dispatch_active = false;
+                }
+            }
+        } direct_scope(allow_moe_layer_skip_in_direct_tg);
         compute_impl();
     };
     GGML_SYCL_DEBUG("[DEBUG-GRAPH-COMPUTE] Lambda created\n");
@@ -56018,6 +56168,7 @@ normal_dispatch:
     if (ggml_sycl_graph_diag_enabled() && !use_sycl_graph) {
         g_graph_diag_counters.graph_disabled.fetch_add(1, std::memory_order_relaxed);
     }
+    allow_moe_layer_skip_in_direct_tg = cached_is_decode && !use_sycl_graph;
 
     // ---- Diagnostic: log once why use_sycl_graph is disabled during TG ----
     // This block runs after all overrides so it sees the final use_sycl_graph value.
