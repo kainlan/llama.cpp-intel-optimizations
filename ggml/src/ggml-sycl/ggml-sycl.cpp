@@ -8704,16 +8704,19 @@ struct moe_gate_up_pair {
     const ggml_tensor * ids             = nullptr;
     const ggml_tensor * up_bias         = nullptr;
     const ggml_tensor * gate_bias       = nullptr;
+    const ggml_tensor * down_weight     = nullptr;
     ggml_tensor *       up_dst          = nullptr;
     ggml_tensor *       gate_dst        = nullptr;
     ggml_tensor *       up_biased       = nullptr;
     ggml_tensor *       gate_biased     = nullptr;
     ggml_tensor *       glu_dst         = nullptr;
+    ggml_tensor *       down_dst        = nullptr;
     int                 up_index        = -1;
     int                 gate_index      = -1;
     int                 up_bias_index   = -1;
     int                 gate_bias_index = -1;
     int                 glu_index       = -1;
+    int                 down_index      = -1;
     enum ggml_glu_op    glu_op          = GGML_GLU_OP_SWIGLU;
 };
 
@@ -39602,6 +39605,151 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 return;
             }
 
+            auto trace_selected_moe_layer_executor = [&]() -> bool {
+                static const int trace_enabled = [] {
+                    const char * env = std::getenv("GGML_SYCL_MOE_LAYER_EXECUTOR_TRACE");
+                    return env ? std::atoi(env) : 0;
+                }();
+                if (trace_enabled == 0) {
+                    return false;
+                }
+
+                const char * tname = src0->name ? src0->name : "?";
+                auto         reject_layer = [&](const char * reason) -> bool {
+                    static std::atomic<int> reject_log{ 0 };
+                    if (reject_log.fetch_add(1, std::memory_order_relaxed) < 64) {
+                        fprintf(stderr, "[MOE-LAYER-EXEC-REJECT] cur=%s reason=%s\n", tname, reason);
+                    }
+                    return false;
+                };
+
+                if (ne12 != 1 || src0->type != GGML_TYPE_MXFP4 ||
+                    g_moe_multi_gpu_active.load(std::memory_order_acquire)) {
+                    return reject_layer("shape-type-or-multigpu");
+                }
+
+                const auto & xmx_caps = ggml_sycl_info().devices[ctx.device].xmx_caps;
+                if (!xmx_caps.supported || !xmx_caps.supports_int8) {
+                    return reject_layer("xmx-capability");
+                }
+
+                const int layer = parse_layer_id_from_name(tname);
+                if (layer < 0) {
+                    return reject_layer("no-layer");
+                }
+                auto pair_it = g_moe_gate_up_pairs.find(layer);
+                if (pair_it == g_moe_gate_up_pairs.end()) {
+                    return reject_layer("no-layer-topology");
+                }
+                const moe_gate_up_pair & pair = pair_it->second;
+                if (!pair.up_weight || !pair.gate_weight || !pair.down_weight || !pair.up_dst || !pair.gate_dst ||
+                    !pair.down_dst || !pair.glu_dst) {
+                    return reject_layer("incomplete-topology");
+                }
+                const bool current_is_up   = (dst == pair.up_dst);
+                const bool current_is_gate = (dst == pair.gate_dst);
+                if (!current_is_up && !current_is_gate) {
+                    return false;
+                }
+                if (pair.src1 != src1 || pair.ids != ids) {
+                    return reject_layer("src-or-ids-mismatch");
+                }
+                const ggml_tensor * partner_weight = current_is_up ? pair.gate_weight : pair.up_weight;
+                ggml_tensor *       partner_dst    = current_is_up ? pair.gate_dst : pair.up_dst;
+                const int           current_index  = current_is_up ? pair.up_index : pair.gate_index;
+                const int           partner_index  = current_is_up ? pair.gate_index : pair.up_index;
+                if (current_index < 0 || partner_index <= current_index || pair.glu_index <= partner_index ||
+                    pair.down_index <= pair.glu_index || g_moe_precomputed_mmid_skip.count(partner_dst) != 0) {
+                    return reject_layer("node-order");
+                }
+                if (pair.down_dst->src[1] != pair.glu_dst || pair.down_dst->src[2] != pair.ids) {
+                    return reject_layer("down-inputs");
+                }
+                if (partner_weight->type != src0->type || pair.down_weight->type != src0->type) {
+                    return reject_layer("weight-type");
+                }
+                layout_mode requested_layout = has_override ? override_layout : GGML_LAYOUT_SOA;
+                layout_mode layer_layout     = ggml_sycl_adjust_layout_for_tensor(src0, requested_layout, ctx.device);
+                if (layer_layout != GGML_LAYOUT_SOA ||
+                    ggml_sycl_adjust_layout_for_tensor(partner_weight, requested_layout, ctx.device) !=
+                        GGML_LAYOUT_SOA ||
+                    ggml_sycl_adjust_layout_for_tensor(pair.down_weight, requested_layout, ctx.device) !=
+                        GGML_LAYOUT_SOA) {
+                    return reject_layer("layout-not-soa");
+                }
+
+                const int64_t n_ids_layer  = ids->ne[0];
+                const size_t  ids_n_elem   = static_cast<size_t>(ids->ne[1] * n_ids_layer);
+                const int64_t total_experts = src0->ne[2];
+                const int32_t * ids_data    = nullptr;
+                auto            layer_ids_it = g_moe_layer_ids_cache.find(layer);
+                if (layer_ids_it != g_moe_layer_ids_cache.end() &&
+                    layer_ids_it->second.ids_host.size() == ids_n_elem) {
+                    ids_data = layer_ids_it->second.ids_host.data();
+                } else {
+                    auto & entry = g_moe_ids_d2h_cache[ids];
+                    if (entry.n_elements != ids_n_elem) {
+                        ggml_sycl_copy_ids_to_host(ctx, ids, entry.host_ids, &entry.d2h_event);
+                        entry.n_elements = entry.host_ids.size();
+                        entry.pending    = true;
+                    }
+                    entry.wait();
+                    ids_data      = entry.host_ids.data();
+                    auto & lentry = g_moe_layer_ids_cache[layer];
+                    lentry.ids_host.assign(ids_data, ids_data + ids_n_elem);
+                    ids_data = lentry.ids_host.data();
+                }
+                if (!ids_data) {
+                    return reject_layer("ids-data");
+                }
+
+                for (size_t ci = 0; ci < ids_n_elem; ++ci) {
+                    const int32_t eid = ids_data[ci];
+                    if (eid < 0 || eid >= total_experts) {
+                        return reject_layer("expert-id");
+                    }
+                    const ggml_tensor * weights[3] = { pair.gate_weight, pair.up_weight, pair.down_weight };
+                    const char *        roles[3]   = { "gate", "up", "down" };
+                    for (int wi = 0; wi < 3; ++wi) {
+                        moe_expert_route route =
+                            ggml_sycl_resolve_moe_expert_route(weights[wi], ctx.device, eid, layer_layout);
+                        if (route.kind != moe_expert_route_kind::LOCAL_DEVICE || route.ptr == nullptr ||
+                            route.actual_layout != layer_layout) {
+                            static std::atomic<int> route_reject_log{ 0 };
+                            if (route_reject_log.fetch_add(1, std::memory_order_relaxed) < 64) {
+                                fprintf(stderr,
+                                        "[MOE-LAYER-EXEC-ROUTE-REJECT] role=%s tensor=%s layer=%d expert=%d "
+                                        "kind=%s ptr=%p owning=%d planned=%d plan_found=%d plan_missing=%d "
+                                        "planned_on_device=%d requested=%s actual=%s tier=%s reason=%s\n",
+                                        roles[wi], weights[wi]->name ? weights[wi]->name : "?", layer, eid,
+                                        ggml_sycl::ggml_sycl_moe_route_kind_name(route.kind), route.ptr,
+                                        route.owning_device, route.planned_device, route.plan_found ? 1 : 0,
+                                        route.plan_missing ? 1 : 0, route.planned_device_residency ? 1 : 0,
+                                        ggml_sycl_layout_mode_name(route.requested_layout),
+                                        ggml_sycl_layout_mode_name(route.actual_layout),
+                                        ggml_sycl::ggml_sycl_expert_tier_name(route.tier),
+                                        ggml_sycl::ggml_sycl_expert_resolve_reason_name(route.reason));
+                            }
+                            return reject_layer("route");
+                        }
+                    }
+                }
+
+                static std::atomic<int> accept_log{ 0 };
+                if (accept_log.fetch_add(1, std::memory_order_relaxed) < 64) {
+                    fprintf(stderr,
+                            "[MOE-LAYER-EXEC] eligible layer=%d cur=%s device=%d entries=%zu topk=%lld layout=%s "
+                            "glu=%s gate_bias=%d up_bias=%d down=%s\n",
+                            layer, tname, ctx.device, ids_n_elem, (long long) n_ids_layer,
+                            ggml_sycl_layout_mode_name(layer_layout), ggml_glu_op_name(pair.glu_op),
+                            pair.gate_bias ? 1 : 0, pair.up_bias ? 1 : 0,
+                            pair.down_weight->name ? pair.down_weight->name : "?");
+                }
+                return false;
+            };
+
+            trace_selected_moe_layer_executor();
+
             auto try_gpu_moe_pair = [&]() -> bool {
                 const char * tname       = src0->name;
                 static const int path_trace_enabled = [] {
@@ -47012,6 +47160,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             if (!pair.src1) {
                 pair.src1 = node->src[1];
             }
+            if (!pair.ids) {
+                pair.ids = node->src[2];
+            }
+        } else if (strstr(weight_name, "ffn_down")) {
+            pair.down_weight = node->src[0];
+            pair.down_dst    = node;
+            pair.down_index  = i;
             if (!pair.ids) {
                 pair.ids = node->src[2];
             }
