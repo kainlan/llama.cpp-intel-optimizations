@@ -39745,6 +39745,31 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             pair.gate_bias ? 1 : 0, pair.up_bias ? 1 : 0,
                             pair.down_weight->name ? pair.down_weight->name : "?");
                 }
+                if (trace_enabled > 1) {
+                    static std::atomic<int> shape_log{ 0 };
+                    if (shape_log.fetch_add(1, std::memory_order_relaxed) < 64) {
+                        fprintf(stderr,
+                                "[MOE-LAYER-EXEC-SHAPE] layer=%d ids_ne=[%lld,%lld,%lld,%lld] "
+                                "ids_nb=[%zu,%zu,%zu,%zu] src1_ne=[%lld,%lld,%lld,%lld] "
+                                "glu_ne=[%lld,%lld,%lld,%lld] glu_nb=[%zu,%zu,%zu,%zu] "
+                                "down_w_ne=[%lld,%lld,%lld,%lld] down_dst_ne=[%lld,%lld,%lld,%lld] "
+                                "down_dst_nb=[%zu,%zu,%zu,%zu] ids=[%d,%d,%d,%d]\n",
+                                layer, (long long) ids->ne[0], (long long) ids->ne[1], (long long) ids->ne[2],
+                                (long long) ids->ne[3], ids->nb[0], ids->nb[1], ids->nb[2], ids->nb[3],
+                                (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2],
+                                (long long) src1->ne[3], (long long) pair.glu_dst->ne[0],
+                                (long long) pair.glu_dst->ne[1], (long long) pair.glu_dst->ne[2],
+                                (long long) pair.glu_dst->ne[3], pair.glu_dst->nb[0], pair.glu_dst->nb[1],
+                                pair.glu_dst->nb[2], pair.glu_dst->nb[3], (long long) pair.down_weight->ne[0],
+                                (long long) pair.down_weight->ne[1], (long long) pair.down_weight->ne[2],
+                                (long long) pair.down_weight->ne[3], (long long) pair.down_dst->ne[0],
+                                (long long) pair.down_dst->ne[1], (long long) pair.down_dst->ne[2],
+                                (long long) pair.down_dst->ne[3], pair.down_dst->nb[0], pair.down_dst->nb[1],
+                                pair.down_dst->nb[2], pair.down_dst->nb[3],
+                                ids_n_elem > 0 ? ids_data[0] : -1, ids_n_elem > 1 ? ids_data[1] : -1,
+                                ids_n_elem > 2 ? ids_data[2] : -1, ids_n_elem > 3 ? ids_data[3] : -1);
+                    }
+                }
                 return false;
             };
 
@@ -39929,6 +39954,73 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             pair.up_bias ? pair.up_bias->nb[1] : 0, static_cast<int>(pair_eids.size()), n_ids_pair,
                             ids->nb[0], ids->nb[1], pair.glu_op, alpha, limit);
                         if (ok_glu) {
+                            static const int layer_executor_enabled = [] {
+                                const char * env = std::getenv("GGML_SYCL_MOE_LAYER_EXECUTOR");
+                                return env ? std::atoi(env) : 0;
+                            }();
+                            static bool layer_executor_graph_warning_shown = false;
+                            bool ok_down = false;
+                            if (layer_executor_enabled != 0 && pair.down_weight && pair.down_dst &&
+                                pair.down_dst->src[1] == pair.glu_dst && pair.down_dst->src[2] == ids &&
+                                pair.down_index > pair.glu_index &&
+                                pair.down_weight->type == GGML_TYPE_MXFP4 &&
+                                ggml_sycl_adjust_layout_for_tensor(pair.down_weight, requested_layout, ctx.device) ==
+                                    pair_layout &&
+                                pair.glu_dst->ne[0] == pair.down_weight->ne[0] &&
+                                pair.glu_dst->ne[1] == n_ids_pair &&
+                                pair.glu_dst->ne[2] == ids->ne[1]) {
+                                static thread_local std::vector<int32_t> down_eids;
+                                static thread_local std::vector<int64_t> down_iid1s;
+                                static thread_local std::vector<int64_t> down_ids;
+                                const int64_t down_tokens = pair.glu_dst->ne[2];
+                                const size_t  down_entries =
+                                    static_cast<size_t>(n_ids_pair) * static_cast<size_t>(down_tokens);
+                                down_eids.resize(down_entries);
+                                down_iid1s.resize(down_entries);
+                                down_ids.resize(down_entries);
+                                size_t ci = 0;
+                                for (int64_t iid1 = 0; iid1 < down_tokens; ++iid1) {
+                                    for (int64_t id = 0; id < n_ids_pair; ++id) {
+                                        const int32_t eid = ids_data[static_cast<size_t>(iid1 * n_ids_pair + id)];
+                                        down_eids[ci]   = eid;
+                                        down_iid1s[ci]  = iid1;
+                                        down_ids[ci]    = id;
+                                        ++ci;
+                                    }
+                                }
+
+                                const int down_layer_hash = moe_cache_layer_id(pair.down_weight->name);
+                                ggml_sycl_ensure_weight_on_device(pair.down_weight, ctx.device);
+                                const void * const * down_ptrs = moe_fusion_ensure_gpu0_ptrs(
+                                    ctx, pair.down_weight, down_eids.data(), down_eids.size(), down_layer_hash,
+                                    pair_layout);
+                                if (down_ptrs) {
+                                    ok_down = mmvq_moe_batched_dispatch(
+                                        ctx, pair.down_weight, pair.glu_dst, pair.down_dst, down_ptrs, down_eids.data(),
+                                        down_iid1s.data(), down_ids.data(), static_cast<int>(down_eids.size()),
+                                        static_cast<int>(pair.down_weight->ne[2]), n_ids_pair, pair_layout, ids_device,
+                                        ids->nb[0], ids->nb[1]);
+                                    if (ok_down && path_trace_enabled != 0) {
+                                        const bool can_skip_later = layer_executor_enabled == 1 && g_ggml_sycl_disable_graph;
+                                        fprintf(stderr,
+                                                "[MOE-PAIR] path=pair_glu_down tensor=%s down=%s layer=%d entries=%zu "
+                                                "tokens=%lld skip_later=%d device=%d\n",
+                                                src0->name ? src0->name : "?",
+                                                pair.down_weight->name ? pair.down_weight->name : "?", layer,
+                                                down_eids.size(), (long long) down_tokens,
+                                                can_skip_later ? 1 : 0, ctx.device);
+                                    }
+                                    if (ok_down && layer_executor_enabled == 1 && !g_ggml_sycl_disable_graph &&
+                                        !layer_executor_graph_warning_shown) {
+                                        fprintf(stderr,
+                                                "[MOE-PAIR] GGML_SYCL_MOE_LAYER_EXECUTOR skip disabled because SYCL "
+                                                "graphs are enabled; set GGML_SYCL_DISABLE_GRAPH=1 for skip proof.\n");
+                                        layer_executor_graph_warning_shown = true;
+                                    }
+                                } else if (path_trace_enabled != 0) {
+                                    fprintf(stderr, "[MOE-PAIR-REJECT] cur=%s reason=down-ptrs\n", tname);
+                                }
+                            }
                             if (path_trace_enabled != 0) {
                                 fprintf(stderr,
                                         "[MOE-PAIR] path=pair_glu tensor=%s partner=%s layer=%d layout=%s "
@@ -39946,6 +40038,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 g_moe_precomputed_node_skip.insert(pair.up_biased);
                             }
                             g_moe_precomputed_node_skip.insert(pair.glu_dst);
+                            if (ok_down && layer_executor_enabled == 1 && g_ggml_sycl_disable_graph) {
+                                g_moe_precomputed_mmid_skip.insert(pair.down_dst);
+                            }
                             return true;
                         }
                     }
