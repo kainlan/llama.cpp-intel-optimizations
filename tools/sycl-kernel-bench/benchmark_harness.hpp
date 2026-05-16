@@ -938,6 +938,28 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
             }
             break;
         }
+        case KernelKind::ONEDNN_MXFP4_GEMM: {
+            if (config.quant_type != GGML_TYPE_MXFP4) {
+                out.error = "onednn_mxfp4_gemm requires MXFP4 weights.";
+                return false;
+            }
+            GeneratedWeights weights;
+            if (!generate_quantized_weights(GGML_TYPE_MXFP4, GGML_LAYOUT_AOS, m, k, false, weights)) {
+                out.error = "Failed to generate MXFP4 weights for oneDNN MXFP4 GEMM.";
+                return false;
+            }
+            GeneratedActivations activations = generate_activations(n, k, k, false, true, false);
+            const int scale_mode = config.kernel_name.find("f32scale") != std::string::npos ? 1 : 0;
+            if (!run_onednn_mxfp4_gemm(weights, activations, m, n, k,
+                                       config.warmup_iterations, config.measure_iterations,
+                                       config.validate,
+                                       scale_mode,
+                                       queue, metrics, error)) {
+                out.error = error;
+                return false;
+            }
+            break;
+        }
         case KernelKind::MEMORY_BANDWIDTH: {
             size_t bytes = config.transfer_bytes;
             if (bytes == 0) {

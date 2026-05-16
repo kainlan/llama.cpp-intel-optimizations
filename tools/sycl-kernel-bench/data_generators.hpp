@@ -6,6 +6,7 @@
 #include <cstring>
 #include <random>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include <sycl/sycl.hpp>
@@ -72,6 +73,22 @@ static inline void fill_random(float * data, size_t count, std::mt19937 & rng) {
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     for (size_t i = 0; i < count; ++i) {
         data[i] = dist(rng);
+    }
+}
+
+static inline ggml_half bench_float_to_half(float v) {
+    if constexpr (std::is_same_v<ggml_half, sycl::half>) {
+        return sycl::half(v);
+    } else {
+        return ggml_fp32_to_fp16(v);
+    }
+}
+
+static inline float bench_half_to_float(ggml_half v) {
+    if constexpr (std::is_same_v<ggml_half, sycl::half>) {
+        return static_cast<float>(v);
+    } else {
+        return ggml_fp16_to_fp32(v);
     }
 }
 
@@ -549,7 +566,7 @@ static inline GeneratedActivations generate_activations(int64_t batch,
         }
         if (keep_fp16) {
             for (int64_t i = 0; i < k_padded; ++i) {
-                out.fp16[(size_t) row * k_padded + (size_t) i] = ggml_fp32_to_fp16(row_fp32[(size_t) i]);
+                out.fp16[(size_t) row * k_padded + (size_t) i] = bench_float_to_half(row_fp32[(size_t) i]);
             }
         }
         uint8_t * row_dst = out.q8_1.data() + (size_t) row * row_bytes;
