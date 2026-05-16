@@ -52190,7 +52190,10 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
                                 fast_path_ok = false;
                                 break;
                             }
-                            if (Q_fa->type != GGML_TYPE_F32 || K_fa->type != V_fa->type) {
+                            if ((Q_fa->type != GGML_TYPE_F32 &&
+                                 (Q_fa->type != GGML_TYPE_F16 ||
+                                  std::getenv("GGML_SYCL_PERSISTENT_TG_F16_Q") == nullptr)) ||
+                                K_fa->type != V_fa->type) {
                                 fast_path_ok = false;
                                 break;
                             }
@@ -52335,6 +52338,7 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
                             op_desc.K          = head_dim_attn;
                             op_desc.n_kv_heads = n_kv_heads_attn;
                             op_desc.scale      = scale_attn;
+                            op_desc.q_type     = Q_fa->type;
                             op_desc.q_nb0      = q_nb[0];
                             op_desc.q_nb1      = q_nb[1];
                             op_desc.q_nb2      = q_nb[q_head_axis];
@@ -53704,8 +53708,17 @@ full_build:
                     log_tensor("ATTN V", V_fa);
                     log_tensor("ATTN mask", mask);
 
-                    if (Q_fa->type != GGML_TYPE_F32) {
-                        GGML_LOG_ERROR("[PERSISTENT-TG] FLASH_ATTN unsupported Q type=%d (expected F32)\n", Q_fa->type);
+                    if (Q_fa->type != GGML_TYPE_F32 &&
+                        (Q_fa->type != GGML_TYPE_F16 ||
+                         std::getenv("GGML_SYCL_PERSISTENT_TG_F16_Q") == nullptr)) {
+                        static bool logged_f16_q_gate_once = false;
+                        if (!logged_f16_q_gate_once) {
+                            GGML_LOG_ERROR(
+                                "[PERSISTENT-TG] FLASH_ATTN unsupported Q type=%d (expected F32; F16 is gated by "
+                                "GGML_SYCL_PERSISTENT_TG_F16_Q while correctness validation is open)\n",
+                                Q_fa->type);
+                            logged_f16_q_gate_once = true;
+                        }
                         return false;
                     }
 
@@ -54014,6 +54027,7 @@ full_build:
                     attn_desc.mask                = mask_ptr;
                     attn_desc.output              = out_ptr;
                     attn_desc.kv_type             = kv_type;
+                    attn_desc.q_type              = Q_fa->type;
                     attn_desc.n_heads             = n_heads_attn;
                     attn_desc.n_kv_heads          = n_kv_heads_attn;
                     attn_desc.head_dim            = head_dim_attn;
@@ -55346,6 +55360,20 @@ static bool graph_has_only_persistent_ops(ggml_cgraph * cgraph) {
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
+        if (node && node->op == GGML_OP_MUL_MAT_ID) {
+            static bool logged_moe_once = false;
+            if (!logged_moe_once) {
+                GGML_LOG_INFO(
+                    "[PERSISTENT-TG] MoE graph contains MUL_MAT_ID; persistent MoE requires a routed smart-handle "
+                    "expert descriptor and is not enabled yet, falling back to normal/segmented MoE dispatch\n");
+                logged_moe_once = true;
+            }
+            return false;
+        }
+    }
+
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
         switch (node->op) {
             case GGML_OP_GET_ROWS:
             case GGML_OP_RMS_NORM:
@@ -55387,6 +55415,23 @@ static bool should_use_persistent_tg(ggml_backend_sycl_context & ctx, ggml_cgrap
     // 1. Environment variable gate.
     if (!ggml_sycl::env_persistent_tg_enabled()) {
         return false;
+    }
+
+    if (cgraph) {
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            if (node && node->op == GGML_OP_MUL_MAT_ID) {
+                static bool logged_moe_once = false;
+                if (!logged_moe_once) {
+                    GGML_LOG_INFO(
+                        "[PERSISTENT-TG] MoE graph contains MUL_MAT_ID; persistent MoE requires a routed "
+                        "smart-handle expert descriptor and is not enabled yet, falling back to normal/segmented MoE "
+                        "dispatch\n");
+                    logged_moe_once = true;
+                }
+                return false;
+            }
+        }
     }
 
     // 1a. Multi-device guard: when multiple SYCL GPUs are visible, the backend
@@ -56046,7 +56091,11 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
 
         // Extract persistent plan from graph
         if (!extract_persistent_plan(kernel, *sycl_ctx, cgraph)) {
-            GGML_LOG_ERROR("[PERSISTENT-TG] Failed to build persistent plan, falling back to normal dispatch\n");
+            static bool logged_persistent_plan_fallback_once = false;
+            if (!logged_persistent_plan_fallback_once) {
+                GGML_LOG_ERROR("[PERSISTENT-TG] Failed to build persistent plan, falling back to normal dispatch\n");
+                logged_persistent_plan_fallback_once = true;
+            }
             if (g_persistent_debug_hash_ptr) {
                 sycl::queue * q = sycl_ctx->stream();
                 sycl::free(g_persistent_debug_hash_ptr, *q);

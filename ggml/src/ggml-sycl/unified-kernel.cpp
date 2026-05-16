@@ -5054,6 +5054,7 @@ struct alignas(64) DeviceOperation {
     int          weight_layout;
     int          n_tiles;     // Number of tiles for this operation
     int          n_kv_heads;  // Number of KV heads for GQA (0 = same as n_heads)
+    int          q_type;      // GGML_TYPE_F32 or GGML_TYPE_F16 for attention Q
     int          mask_type;   // 0=f32, 1=f16, -1=none
     int64_t      mask_nb0;
     int64_t      mask_nb1;
@@ -7070,7 +7071,7 @@ template <int BLOCK_SIZE> class PersistentTGKernelImpl {
         //   k_nb2 = KV head stride in bytes
         //   (same for v_nb0/1/2)
         //
-        // Q is always F32 with q_nb2 = per-head stride in bytes.
+        // Q can be F32 or F16; q_nb0/q_nb2 are byte strides.
         //
         // Fast path: cache attention scores/probabilities in SLM so pass 2 does
         // not recompute Q·K per output dimension.
@@ -7096,9 +7097,15 @@ template <int BLOCK_SIZE> class PersistentTGKernelImpl {
 
         const int kv_head = (n_kv_heads > 0 && n_kv_heads < n_heads) ? head / (n_heads / n_kv_heads) : head;
 
-        // Q is always F32. Use byte-based head stride (q_nb2).
-        const char *  q_base = static_cast<const char *>(op.input);
-        const float * q_head = reinterpret_cast<const float *>(q_base + head * op.q_nb2);
+        const char * q_base = static_cast<const char *>(op.input);
+        const int    q_type = op.q_type;
+        auto load_q = [&](int d) -> float {
+            const char * ptr = q_base + static_cast<int64_t>(head) * op.q_nb2 + static_cast<int64_t>(d) * op.q_nb0;
+            if (q_type == GGML_TYPE_F16) {
+                return static_cast<float>(*reinterpret_cast<const sycl::half *>(ptr));
+            }
+            return *reinterpret_cast<const float *>(ptr);
+        };
 
         // K/V cache: use byte-based strides for head and position addressing.
         // k_nb0 = element size, k_nb1 = seq stride, k_nb2 = head stride
@@ -7124,7 +7131,7 @@ template <int BLOCK_SIZE> class PersistentTGKernelImpl {
         const int slm_scores_cap  = args_.hidden_dim - slm_scores_base;
 
         for (int d = tid; d < head_dim; d += BLOCK_SIZE) {
-            slm_[d] = q_head[d];
+            slm_[d] = load_q(d);
         }
         sycl::group_barrier(wg);
 
@@ -8418,6 +8425,7 @@ void UnifiedKernel::add_attention(int layer, const AttentionDescriptor & desc, i
     op.K            = desc.head_dim;
     op.scale        = desc.scale;
     op.n_kv_heads   = desc.n_kv_heads;  // GQA: propagate KV head count
+    op.q_type       = desc.q_type;
     op.q_nb0        = desc.q_nb0;
     op.q_nb1        = desc.q_nb1;
     op.q_nb2        = desc.q_nb2;
@@ -10093,9 +10101,16 @@ static void micro_submit_attention(sycl::queue &           q,
 
                 const int kv_head = (n_kv_heads > 0 && n_kv_heads < n_heads) ? head / (n_heads / n_kv_heads) : head;
 
-                // Q is always F32, use byte-based head stride
-                const char *  q_base = static_cast<const char *>(op.input);
-                const float * q_head = reinterpret_cast<const float *>(q_base + head * op.q_nb2);
+                const char * q_base = static_cast<const char *>(op.input);
+                const int    q_type = op.q_type;
+                auto load_q = [&](int d) -> float {
+                    const char * ptr =
+                        q_base + static_cast<int64_t>(head) * op.q_nb2 + static_cast<int64_t>(d) * op.q_nb0;
+                    if (q_type == GGML_TYPE_F16) {
+                        return static_cast<float>(*reinterpret_cast<const sycl::half *>(ptr));
+                    }
+                    return *reinterpret_cast<const float *>(ptr);
+                };
 
                 // K/V cache: byte-based strides
                 const char *  k_base        = static_cast<const char *>(op.weights);
@@ -10126,7 +10141,7 @@ static void micro_submit_attention(sycl::queue &           q,
 
                 // Load query into SLM
                 for (int d = tid; d < head_dim; d += WG_SIZE) {
-                    slm[d] = q_head[d];
+                    slm[d] = load_q(d);
                 }
                 sycl::group_barrier(wg);
 
@@ -10891,6 +10906,7 @@ void UnifiedKernel::execute_persistent_phased(phase_callback_t on_matmul_complet
         dst.quant_type       = src.quant_type;
         dst.weight_layout    = src.weight_layout;
         dst.n_kv_heads       = src.n_kv_heads;
+        dst.q_type           = src.q_type;
         dst.mask_type        = src.mask_type;
         dst.mask_nb0         = src.mask_nb0;
         dst.mask_nb1         = src.mask_nb1;
@@ -11199,6 +11215,7 @@ void UnifiedKernel::launch_persistent_kernel(bool build_only) {
             dst.v_nb1 = src.v_nb1;
             dst.v_nb2 = src.v_nb2;
             dst.v_nb3 = src.v_nb3;
+            dst.q_type = src.q_type;
 
             // Patch mutable dimension/scalar fields
             dst.M     = src.M;
@@ -11298,6 +11315,7 @@ void UnifiedKernel::launch_persistent_kernel(bool build_only) {
         dst.quant_type       = src.quant_type;
         dst.weight_layout    = src.weight_layout;
         dst.n_kv_heads       = src.n_kv_heads;
+        dst.q_type           = src.q_type;
         dst.mask_type        = src.mask_type;
         dst.mask_nb0         = src.mask_nb0;
         dst.mask_nb1         = src.mask_nb1;
@@ -12241,6 +12259,7 @@ void UnifiedKernel::launch_persistent_kernel_async() {
         dst.quant_type       = src.quant_type;
         dst.weight_layout    = src.weight_layout;
         dst.n_kv_heads       = src.n_kv_heads;
+        dst.q_type           = src.q_type;
         dst.mask_type        = src.mask_type;
         dst.mask_nb0         = src.mask_nb0;
         dst.mask_nb1         = src.mask_nb1;

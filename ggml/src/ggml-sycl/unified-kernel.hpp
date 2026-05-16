@@ -269,6 +269,7 @@ struct AttentionDescriptor {
     int          n_kv_heads;
     int          head_dim;
     int          seq_len;
+    int          q_type;  // GGML_TYPE_F32 or GGML_TYPE_F16
     int64_t      q_nb0;
     int64_t      q_nb1;
     int64_t      q_nb2;
@@ -366,6 +367,7 @@ struct OperationDescriptor {
     int           quant_type;
     int           weight_layout;
     int           n_kv_heads;   // For GQA support in attention (0 = same as n_heads)
+    int           q_type;       // GGML_TYPE_F32 or GGML_TYPE_F16 for attention Q
     int           mask_type;
     int64_t       mask_nb0;
     int64_t       mask_nb1;
