@@ -956,7 +956,8 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                 out.error = "Failed to generate MXFP4 weights for decode benchmark.";
                 return false;
             }
-            if (!run_mxfp4_decode_bandwidth(weights, m, k, config.layout,
+            const bool output_f16 = config.kernel_name.find("_f16_") != std::string::npos;
+            if (!run_mxfp4_decode_bandwidth(weights, m, k, config.layout, output_f16,
                                             config.warmup_iterations, config.measure_iterations,
                                             queue, metrics, error)) {
                 out.error = error;

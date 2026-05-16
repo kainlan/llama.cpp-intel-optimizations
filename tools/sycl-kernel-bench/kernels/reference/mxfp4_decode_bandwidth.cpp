@@ -1,7 +1,7 @@
 #include "reference_kernels.hpp"
 
-#include <chrono>
 #include <cstdint>
+#include <chrono>
 
 namespace sycl_bench {
 
@@ -50,15 +50,16 @@ static inline float mxfp4_value_device(uint8_t v) {
     return 0.0f;
 }
 
-bool run_mxfp4_decode_bandwidth(const GeneratedWeights & weights,
-                                int64_t                  m,
-                                int64_t                  k,
-                                ggml_layout_mode         layout,
-                                int                      warmup,
-                                int                      iterations,
-                                sycl::queue &            queue,
-                                ReferenceMetrics &       out,
-                                std::string &            error) {
+template <typename output_t>
+static bool run_mxfp4_decode_bandwidth_typed(const GeneratedWeights & weights,
+                                             int64_t                  m,
+                                             int64_t                  k,
+                                             ggml_layout_mode         layout,
+                                             int                      warmup,
+                                             int                      iterations,
+                                             sycl::queue &            queue,
+                                             ReferenceMetrics &       out,
+                                             std::string &            error) {
     if (m <= 0 || k <= 0 || (k % QK_MXFP4) != 0) {
         error = "mxfp4_decode requires positive M and K divisible by QK_MXFP4";
         return false;
@@ -76,12 +77,12 @@ bool run_mxfp4_decode_bandwidth(const GeneratedWeights & weights,
 
     const size_t  input_bytes    = host_weights.size();
     const size_t  output_count   = static_cast<size_t>(m) * static_cast<size_t>(k);
-    const size_t  output_bytes   = output_count * sizeof(float);
+    const size_t  output_bytes   = output_count * sizeof(output_t);
     const int64_t blocks_per_row = k / QK_MXFP4;
     const size_t  nblocks        = static_cast<size_t>(m) * static_cast<size_t>(blocks_per_row);
 
-    uint8_t * d_weights = sycl::malloc_device<uint8_t>(input_bytes, queue);
-    float *   d_output  = sycl::malloc_device<float>(output_count, queue);
+    uint8_t *  d_weights = sycl::malloc_device<uint8_t>(input_bytes, queue);
+    output_t * d_output  = sycl::malloc_device<output_t>(output_count, queue);
     if (!d_weights || !d_output) {
         if (d_weights) {
             sycl::free(d_weights, queue);
@@ -116,11 +117,11 @@ bool run_mxfp4_decode_bandwidth(const GeneratedWeights & weights,
                 }
 
                 const float scale   = mxfp4_e8m0_to_fp32_device(e);
-                float *     out_row = d_output + row * static_cast<size_t>(k) + block_in_row * QK_MXFP4;
+                output_t *  out_row = d_output + row * static_cast<size_t>(k) + block_in_row * QK_MXFP4;
                 for (int i = 0; i < QK_MXFP4 / 2; ++i) {
                     const uint8_t packed      = qs[i];
-                    out_row[i]                = scale * mxfp4_value_device(packed & 0x0f);
-                    out_row[i + QK_MXFP4 / 2] = scale * mxfp4_value_device(packed >> 4);
+                    out_row[i]                = static_cast<output_t>(scale * mxfp4_value_device(packed & 0x0f));
+                    out_row[i + QK_MXFP4 / 2] = static_cast<output_t>(scale * mxfp4_value_device(packed >> 4));
                 }
             });
         });
@@ -150,6 +151,23 @@ bool run_mxfp4_decode_bandwidth(const GeneratedWeights & weights,
     sycl::free(d_weights, queue);
     sycl::free(d_output, queue);
     return true;
+}
+
+bool run_mxfp4_decode_bandwidth(const GeneratedWeights & weights,
+                                int64_t                  m,
+                                int64_t                  k,
+                                ggml_layout_mode         layout,
+                                bool                     output_f16,
+                                int                      warmup,
+                                int                      iterations,
+                                sycl::queue &            queue,
+                                ReferenceMetrics &       out,
+                                std::string &            error) {
+    if (output_f16) {
+        return run_mxfp4_decode_bandwidth_typed<sycl::half>(weights, m, k, layout, warmup, iterations, queue, out,
+                                                            error);
+    }
+    return run_mxfp4_decode_bandwidth_typed<float>(weights, m, k, layout, warmup, iterations, queue, out, error);
 }
 
 }  // namespace sycl_bench

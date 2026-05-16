@@ -85,6 +85,8 @@ inline const std::vector<KernelInfo> & kernel_list() {
         { "memory_bandwidth", GGML_LAYOUT_AOS, KernelKind::MEMORY_BANDWIDTH },
         { "mxfp4_decode_aos", GGML_LAYOUT_AOS, KernelKind::MXFP4_DECODE_BANDWIDTH },
         { "mxfp4_decode_soa", GGML_LAYOUT_SOA, KernelKind::MXFP4_DECODE_BANDWIDTH },
+        { "mxfp4_decode_f16_aos", GGML_LAYOUT_AOS, KernelKind::MXFP4_DECODE_BANDWIDTH },
+        { "mxfp4_decode_f16_soa", GGML_LAYOUT_SOA, KernelKind::MXFP4_DECODE_BANDWIDTH },
         { "roofline_compute", GGML_LAYOUT_AOS, KernelKind::ROOFLINE_COMPUTE },
     };
     return kernels;
