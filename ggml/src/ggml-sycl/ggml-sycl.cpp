@@ -50957,6 +50957,15 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
             return nullptr;
         }
 
+        if ((tensor->flags & GGML_TENSOR_FLAG_INPUT) != 0 && !ggml_sycl_tensor_is_weight(tensor)) {
+            if (void * refreshed = ggml_sycl_get_data_ptr(tensor, ctx.device)) {
+                if (refreshed != tensor->data) {
+                    ggml_sycl_refresh_cached_input_ptr(refreshed, tensor->data, ggml_nbytes(tensor), ctx.device);
+                }
+                return refreshed;
+            }
+        }
+
         if (tensor->extra) {
             auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
             // WEIGHT handles resolve through the cache (arena VRAM pointer)
@@ -51056,10 +51065,11 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
         }
         GGML_LOG_INFO(
             "[PERSISTENT-TG] %s: name=%s type=%d ne=[%lld,%lld,%lld,%lld] nb=[%lld,%lld,%lld,%lld] contig=%d "
-            "permuted=%d\n",
+            "permuted=%d view_src=%p view_offs=%zu data=%p\n",
             tag, t->name[0] != '\0' ? t->name : "(unnamed)", (int) t->type, (long long) t->ne[0], (long long) t->ne[1],
             (long long) t->ne[2], (long long) t->ne[3], (long long) t->nb[0], (long long) t->nb[1],
-            (long long) t->nb[2], (long long) t->nb[3], ggml_is_contiguous(t) ? 1 : 0, ggml_is_permuted(t) ? 1 : 0);
+            (long long) t->nb[2], (long long) t->nb[3], ggml_is_contiguous(t) ? 1 : 0, ggml_is_permuted(t) ? 1 : 0,
+            (const void *) t->view_src, (size_t) t->view_offs, t->data);
     };
 
     auto resolve_input_ptr = [&](const ggml_tensor * tensor, int layer) -> const void * {
@@ -51474,39 +51484,117 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
                     case OperationType::ATTENTION_F16:
                     case OperationType::ATTENTION_F32:
                         {
-                            // K/V cache pointers, mask, and seq_len change each token
-                            if (!node || !node->src[1] || !node->src[2] || !op) {
+                            // Q/output, K/V cache pointers, mask, and seq_len change each token.
+                            if (!node || !node->src[0] || !node->src[1] || !node->src[2] || !op) {
                                 recipe_ok = false;
                                 break;
                             }
+                            const ggml_tensor * Q_fa = node->src[0];
                             const ggml_tensor * K_fa = node->src[1];
                             const ggml_tensor * V_fa = node->src[2];
                             const ggml_tensor * mask = node->src[3];
 
+                            int64_t      q_nb[GGML_MAX_DIMS] = {};
                             int64_t      k_nb[GGML_MAX_DIMS] = {};
                             int64_t      v_nb[GGML_MAX_DIMS] = {};
+                            const void * q_ptr               = resolve_input_ptr_with_nb(Q_fa, op->layer, q_nb, true);
                             const void * k_ptr               = resolve_input_ptr_with_nb(K_fa, op->layer, k_nb, true);
                             const void * v_ptr               = resolve_input_ptr_with_nb(V_fa, op->layer, v_nb, true);
-                            if (!k_ptr || !v_ptr) {
+                            void *       out_ptr             = kernel.scratch_output(oi);
+                            if (!out_ptr) {
+                                out_ptr = get_tensor_ptr_view_fast(node);
+                            }
+                            if (!q_ptr || !k_ptr || !v_ptr || !out_ptr) {
                                 recipe_ok = false;
                                 break;
                             }
 
-                            int seq_len_attn = (int) K_fa->ne[1];  // k_seq_axis = 1
+                            auto find_axis_for_dim = [](const ggml_tensor * t, int dim) -> int {
+                                if (!t || dim <= 0) {
+                                    return -1;
+                                }
+                                for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                                    if ((int) t->ne[d] == dim) {
+                                        return d;
+                                    }
+                                }
+                                return -1;
+                            };
+                            auto pick_seq_axis = [](const ggml_tensor * t, int head_axis, int value_axis) -> int {
+                                if (!t) {
+                                    return -1;
+                                }
+                                int     best_axis = -1;
+                                int64_t best_ne   = -1;
+                                for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                                    if (d == head_axis || d == value_axis) {
+                                        continue;
+                                    }
+                                    if (t->ne[d] > best_ne) {
+                                        best_ne   = t->ne[d];
+                                        best_axis = d;
+                                    }
+                                }
+                                return best_axis;
+                            };
+
+                            const int head_dim_attn = (int) Q_fa->ne[0];
+                            int       q_head_axis   = find_axis_for_dim(Q_fa, n_heads);
+                            if (q_head_axis < 0) {
+                                q_head_axis = 2;
+                            }
+                            int k_head_axis = find_axis_for_dim(K_fa, n_kv_heads);
+                            if (k_head_axis < 0) {
+                                k_head_axis = 2;
+                            }
+                            int v_head_axis = find_axis_for_dim(V_fa, n_kv_heads);
+                            if (v_head_axis < 0) {
+                                v_head_axis = k_head_axis;
+                            }
+                            int k_value_axis = find_axis_for_dim(K_fa, head_dim_attn);
+                            if (k_value_axis < 0) {
+                                k_value_axis = 0;
+                            }
+                            int v_value_axis = find_axis_for_dim(V_fa, head_dim_attn);
+                            if (v_value_axis < 0) {
+                                v_value_axis = (v_head_axis == 0) ? 1 : 0;
+                            }
+                            int k_seq_axis = pick_seq_axis(K_fa, k_head_axis, k_value_axis);
+                            if (k_seq_axis < 0) {
+                                k_seq_axis = 1;
+                            }
+                            int v_seq_axis = pick_seq_axis(V_fa, v_head_axis, v_value_axis);
+                            if (v_seq_axis < 0) {
+                                v_seq_axis = k_seq_axis;
+                            }
+                            if (v_head_axis != k_head_axis) {
+                                v_head_axis = k_head_axis;
+                            }
+
+                            int seq_len_attn = (int) K_fa->ne[k_seq_axis];
                             if (decode_kv_pos_hint >= 0 && decode_kv_pos_hint + 1 < (int64_t) seq_len_attn) {
                                 seq_len_attn = (int) (decode_kv_pos_hint + 1);
                             }
 
+                            op->input   = q_ptr;
                             op->weights = k_ptr;
                             op->aux     = const_cast<void *>(v_ptr);
+                            op->output  = out_ptr;
                             op->M       = seq_len_attn;
-                            op->k_nb0   = k_nb[0];
-                            op->k_nb1   = k_nb[1];  // k_seq_axis
-                            op->k_nb2   = k_nb[2];  // k_head_axis
+                            op->N       = (int) Q_fa->ne[q_head_axis];
+                            op->K       = head_dim_attn;
+                            op->q_type  = Q_fa->type;
+                            op->q_nb0   = q_nb[0];
+                            op->q_nb1   = q_nb[1];
+                            op->q_nb2   = q_nb[q_head_axis];
+                            op->q_nb3   = q_nb[3];
+                            op->k_nb0   = k_nb[k_value_axis];
+                            op->k_nb1   = k_nb[k_seq_axis];
+                            op->k_nb2   = k_nb[k_head_axis];
                             op->k_nb3   = k_nb[3];
-                            op->v_nb0   = v_nb[0];
-                            op->v_nb1   = v_nb[1];  // v_seq_axis
-                            op->v_nb2   = v_nb[2];  // v_head_axis
+                            op->v_nb0   = v_nb[v_value_axis];
+                            op->v_nb1   = v_nb[v_seq_axis];
+                            op->v_nb2   = v_nb[v_head_axis];
                             op->v_nb3   = v_nb[3];
 
                             if (mask) {
@@ -52214,10 +52302,7 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
                                 fast_path_ok = false;
                                 break;
                             }
-                            if ((Q_fa->type != GGML_TYPE_F32 &&
-                                 (Q_fa->type != GGML_TYPE_F16 ||
-                                  std::getenv("GGML_SYCL_PERSISTENT_TG_F16_Q") == nullptr)) ||
-                                K_fa->type != V_fa->type) {
+                            if (Q_fa->type != GGML_TYPE_F32 || K_fa->type != V_fa->type) {
                                 fast_path_ok = false;
                                 break;
                             }
@@ -53798,13 +53883,12 @@ full_build:
                     log_tensor("ATTN mask", mask);
                     log_tensor("ATTN dst", node);
 
-                    if (Q_fa->type != GGML_TYPE_F32 &&
-                        (Q_fa->type != GGML_TYPE_F16 || std::getenv("GGML_SYCL_PERSISTENT_TG_F16_Q") == nullptr)) {
+                    if (Q_fa->type != GGML_TYPE_F32) {
                         static bool logged_f16_q_gate_once = false;
                         if (!logged_f16_q_gate_once) {
                             GGML_LOG_ERROR(
-                                "[PERSISTENT-TG] FLASH_ATTN unsupported Q type=%d (expected F32; F16 is gated by "
-                                "GGML_SYCL_PERSISTENT_TG_F16_Q while correctness validation is open)\n",
+                                "[PERSISTENT-TG] FLASH_ATTN unsupported Q type=%d (expected F32; F16-Q falls back "
+                                "to the regular SYCL FA path until persistent F16-Q is correctness-proven)\n",
                                 Q_fa->type);
                             logged_f16_q_gate_once = true;
                         }
@@ -53954,10 +54038,11 @@ full_build:
                             if (mask) {
                                 GGML_LOG_INFO(
                                     "[PERSISTENT-TG] ATTN mask ne=[%lld,%lld,%lld,%lld] nb=[%lld,%lld,%lld,%lld] "
-                                    "type=%d\n",
+                                    "type=%d view_src=%p view_offs=%zu data=%p\n",
                                     (long long) mask->ne[0], (long long) mask->ne[1], (long long) mask->ne[2],
                                     (long long) mask->ne[3], (long long) mask->nb[0], (long long) mask->nb[1],
-                                    (long long) mask->nb[2], (long long) mask->nb[3], (int) mask->type);
+                                    (long long) mask->nb[2], (long long) mask->nb[3], (int) mask->type,
+                                    (const void *) mask->view_src, (size_t) mask->view_offs, mask->data);
                             } else {
                                 GGML_LOG_INFO("[PERSISTENT-TG] ATTN mask: none\n");
                             }
