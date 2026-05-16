@@ -3318,6 +3318,48 @@ static __dpct_inline__ void mxfp4_soa_q8_1_block_dot_pair(const uint8_t * __rest
     acc_b += d_b * d8 * sumi_b;
 }
 
+static __dpct_inline__ void mxfp4_soa_q8_1_block_dot_pair_slm(const uint8_t * __restrict__ qs_row_a,
+                                                              const uint8_t * __restrict__ scale_row_a,
+                                                              const uint8_t * __restrict__ qs_row_b,
+                                                              const uint8_t * __restrict__ scale_row_b,
+                                                              const int * __restrict__ y_qs,
+                                                              const sycl::half2 * __restrict__ y_ds,
+                                                              const int y_qs_stride,
+                                                              const int b,
+                                                              float &   acc_a,
+                                                              float &   acc_b) {
+    const int *         q8_qs = y_qs + b * y_qs_stride;
+    const sycl::half2 * q8_ds = y_ds + b;
+    const float         d8    = (float) (*q8_ds)[0];
+
+    const uint8_t * qs_a = qs_row_a + b * (QK_MXFP4 / 2);
+    const uint8_t * qs_b = qs_row_b + b * (QK_MXFP4 / 2);
+
+    int sumi_a = 0;
+    int sumi_b = 0;
+#pragma unroll
+    for (int i = 0; i < QK_MXFP4 / 2; i += 4) {
+        const int aux_q4_a = *((const int *) (qs_a + i));
+        const int aux_q4_b = *((const int *) (qs_b + i));
+
+        const sycl::int2 va = get_int_from_table_16(aux_q4_a, kvalues_mxfp4);
+        const sycl::int2 vb = get_int_from_table_16(aux_q4_b, kvalues_mxfp4);
+
+        const int q8_0 = q8_qs[i / 4];
+        const int q8_1 = q8_qs[i / 4 + 4];
+
+        sumi_a = ggml_sycl_dp4a(va.x(), q8_0, sumi_a);
+        sumi_a = ggml_sycl_dp4a(va.y(), q8_1, sumi_a);
+        sumi_b = ggml_sycl_dp4a(vb.x(), q8_0, sumi_b);
+        sumi_b = ggml_sycl_dp4a(vb.y(), q8_1, sumi_b);
+    }
+
+    const float d_a = ggml_sycl_e8m0_to_fp32(scale_row_a[b]) * 0.5f;
+    const float d_b = ggml_sycl_e8m0_to_fp32(scale_row_b[b]) * 0.5f;
+    acc_a += d_a * d8 * sumi_a;
+    acc_b += d_b * d8 * sumi_b;
+}
+
 // MoE dispatch: MXFP4 with SoA layout (reordered weights) + expert routing
 // SoA layout for weights: [all qs for all experts][all scales for all experts]
 // SoA layout for Q8_1: per row [quants: ncols_y bytes][ds: nblocks * sizeof(half2)]
@@ -3790,7 +3832,7 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_xmx_sycl(const void * con
 }
 #endif
 
-template <int GLU_OP>
+template <int GLU_OP, bool CACHE_Y_LOCAL>
 static void mul_mat_vec_mxfp4_q8_1_soa_id_pair_glu_kernel(const uint8_t * const * __restrict__ gate_ptrs,
                                                           const uint8_t * const * __restrict__ up_ptrs,
                                                           const void * __restrict__ vy,
@@ -3815,13 +3857,11 @@ static void mul_mat_vec_mxfp4_q8_1_soa_id_pair_glu_kernel(const uint8_t * const 
                                                           const int64_t            up_bias_nb1,
                                                           const float              alpha,
                                                           const float              limit,
-                                                          const sycl::nd_item<3> & item_ct1) {
+                                                          const sycl::nd_item<3> & item_ct1,
+                                                          int * __restrict__ slm_y_qs,
+                                                          sycl::half2 * __restrict__ slm_y_ds) {
     const int batch_idx = item_ct1.get_group(1);
     const int row       = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
-
-    if (row >= nrows_per_expert) {
-        return;
-    }
 
     const int id   = batch_idx / n_tokens;
     const int iid1 = batch_idx - id * n_tokens;
@@ -3832,7 +3872,29 @@ static void mul_mat_vec_mxfp4_q8_1_soa_id_pair_glu_kernel(const uint8_t * const 
     const int64_t i1        = id;
     const int64_t i2        = iid1;
 
-    const int       blocks_per_row   = ncols / QK_MXFP4;
+    const char * global_y_base = (const char *) vy + i11 * nb11 + i12 * nb12;
+    const int    lane_id       = item_ct1.get_local_id(2);
+    const int    local_row     = item_ct1.get_local_id(1);
+
+    const int blocks_per_row = ncols / QK_MXFP4;
+    if constexpr (CACHE_Y_LOCAL) {
+        if (local_row == 0) {
+            for (int b = lane_id; b < blocks_per_row; b += WARP_SIZE) {
+                const int * q8_qs = (const int *) (global_y_base + b * QK8_1);
+#pragma unroll
+                for (int j = 0; j < QI8_1; ++j) {
+                    slm_y_qs[b * QI8_1 + j] = q8_qs[j];
+                }
+                slm_y_ds[b] = *((const sycl::half2 *) (global_y_base + ncols_y + b * sizeof(sycl::half2)));
+            }
+        }
+        item_ct1.barrier(sycl::access::fence_space::local_space);
+    }
+
+    if (row >= nrows_per_expert) {
+        return;
+    }
+
     const int64_t   row_qs_offset    = row * blocks_per_row * (QK_MXFP4 / 2);
     const int64_t   row_scale_offset = total_qs_size_per_expert + row * blocks_per_row;
     const uint8_t * gate_base        = gate_ptrs[expert_id];
@@ -3841,8 +3903,6 @@ static void mul_mat_vec_mxfp4_q8_1_soa_id_pair_glu_kernel(const uint8_t * const 
     const uint8_t * gate_scale_row   = gate_base + row_scale_offset;
     const uint8_t * up_qs_row        = up_base + row_qs_offset;
     const uint8_t * up_scale_row     = up_base + row_scale_offset;
-    const char *    y_base           = (const char *) vy + i11 * nb11 + i12 * nb12;
-    const int       lane_id          = item_ct1.get_local_id(2);
     constexpr int   blocks_per_warp  = WARP_SIZE;
 
     float gate_acc = 0.0f;
@@ -3850,14 +3910,26 @@ static void mul_mat_vec_mxfp4_q8_1_soa_id_pair_glu_kernel(const uint8_t * const 
 
     int b = lane_id;
     for (; b + blocks_per_warp < blocks_per_row; b += 2 * blocks_per_warp) {
-        mxfp4_soa_q8_1_block_dot_pair(gate_qs_row, gate_scale_row, up_qs_row, up_scale_row, y_base, ncols_y, b,
-                                      gate_acc, up_acc);
-        mxfp4_soa_q8_1_block_dot_pair(gate_qs_row, gate_scale_row, up_qs_row, up_scale_row, y_base, ncols_y,
-                                      b + blocks_per_warp, gate_acc, up_acc);
+        if constexpr (CACHE_Y_LOCAL) {
+            mxfp4_soa_q8_1_block_dot_pair_slm(gate_qs_row, gate_scale_row, up_qs_row, up_scale_row, slm_y_qs, slm_y_ds,
+                                              QI8_1, b, gate_acc, up_acc);
+            mxfp4_soa_q8_1_block_dot_pair_slm(gate_qs_row, gate_scale_row, up_qs_row, up_scale_row, slm_y_qs, slm_y_ds,
+                                              QI8_1, b + blocks_per_warp, gate_acc, up_acc);
+        } else {
+            mxfp4_soa_q8_1_block_dot_pair(gate_qs_row, gate_scale_row, up_qs_row, up_scale_row, global_y_base, ncols_y,
+                                          b, gate_acc, up_acc);
+            mxfp4_soa_q8_1_block_dot_pair(gate_qs_row, gate_scale_row, up_qs_row, up_scale_row, global_y_base, ncols_y,
+                                          b + blocks_per_warp, gate_acc, up_acc);
+        }
     }
     for (; b < blocks_per_row; b += blocks_per_warp) {
-        mxfp4_soa_q8_1_block_dot_pair(gate_qs_row, gate_scale_row, up_qs_row, up_scale_row, y_base, ncols_y, b,
-                                      gate_acc, up_acc);
+        if constexpr (CACHE_Y_LOCAL) {
+            mxfp4_soa_q8_1_block_dot_pair_slm(gate_qs_row, gate_scale_row, up_qs_row, up_scale_row, slm_y_qs, slm_y_ds,
+                                              QI8_1, b, gate_acc, up_acc);
+        } else {
+            mxfp4_soa_q8_1_block_dot_pair(gate_qs_row, gate_scale_row, up_qs_row, up_scale_row, global_y_base, ncols_y,
+                                          b, gate_acc, up_acc);
+        }
     }
 
     gate_acc = sycl::reduce_over_group(item_ct1.get_sub_group(), gate_acc, sycl::plus<float>());
@@ -4116,23 +4188,39 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl(const void * const *
     const sycl::range<3> block_dims(1, moe_mmv_y, WARP_SIZE);
 
     const int64_t total_qs_size_per_expert = (ncols / 2) * nrows_per_expert;
-    auto          submit_glu               = [&](auto glu_tag) {
-        constexpr int GLU_OP = decltype(glu_tag)::value;
+    const int     blocks_per_row           = ncols / QK_MXFP4;
+    const bool    cache_y_local            = nb11 > 0 && nb11 <= 16 * 1024 && blocks_per_row > 0;
+    auto          submit_glu               = [&](auto glu_tag, auto cache_tag) {
+        constexpr int  GLU_OP        = decltype(glu_tag)::value;
+        constexpr bool CACHE_Y_LOCAL = decltype(cache_tag)::value;
         stream->submit([&](sycl::handler & cgh) {
+            sycl::local_accessor<int, 1> slm_y_qs(
+                sycl::range<1>(CACHE_Y_LOCAL ? static_cast<size_t>(blocks_per_row * QI8_1) : 1), cgh);
+            sycl::local_accessor<sycl::half2, 1> slm_y_ds(
+                sycl::range<1>(CACHE_Y_LOCAL ? static_cast<size_t>(blocks_per_row) : 1), cgh);
             cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
                                                     [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                 mul_mat_vec_mxfp4_q8_1_soa_id_pair_glu_kernel<GLU_OP>(
+                                 mul_mat_vec_mxfp4_q8_1_soa_id_pair_glu_kernel<GLU_OP, CACHE_Y_LOCAL>(
                                      (const uint8_t * const *) gate_ptrs, (const uint8_t * const *) up_ptrs, vy,
                                      dst_glu, ids, gate_bias, up_bias, ncols, ncols_y, nrows_per_expert, n_ids,
                                      n_tokens, ne11, total_qs_size_per_expert, ids_nb0, ids_nb1, nb11, nb12, dst_nb1,
-                                     dst_nb2, gate_bias_nb1, up_bias_nb1, alpha, limit, item_ct1);
+                                     dst_nb2, gate_bias_nb1, up_bias_nb1, alpha, limit, item_ct1,
+                                     SYCL_LOCAL_ACC_PTR(slm_y_qs), SYCL_LOCAL_ACC_PTR(slm_y_ds));
                              });
         });
     };
     if (glu_op == GGML_GLU_OP_SWIGLU_OAI) {
-        submit_glu(std::integral_constant<int, GGML_GLU_OP_SWIGLU_OAI>{});
+        if (cache_y_local) {
+            submit_glu(std::integral_constant<int, GGML_GLU_OP_SWIGLU_OAI>{}, std::true_type{});
+        } else {
+            submit_glu(std::integral_constant<int, GGML_GLU_OP_SWIGLU_OAI>{}, std::false_type{});
+        }
     } else {
-        submit_glu(std::integral_constant<int, GGML_GLU_OP_SWIGLU>{});
+        if (cache_y_local) {
+            submit_glu(std::integral_constant<int, GGML_GLU_OP_SWIGLU>{}, std::true_type{});
+        } else {
+            submit_glu(std::integral_constant<int, GGML_GLU_OP_SWIGLU>{}, std::false_type{});
+        }
     }
 }
 
