@@ -2597,10 +2597,12 @@ static void mul_mat_vec_q4_0_q8_1_id_sycl(const void *         vx,
                                           const int64_t        nb2,
                                           dpct::queue_ptr      stream) {
     GGML_ASSERT(ncols % QK4_0 == 0);
-    const int            block_num_z = (nrows_per_expert + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    constexpr int moe_mmv_y = GGML_SYCL_MOE_MMV_Y;
+    static_assert(moe_mmv_y * WARP_SIZE <= 1024, "GGML_SYCL_MOE_MMV_Y exceeds SYCL work-group limit");
+    const int            block_num_z = (nrows_per_expert + moe_mmv_y - 1) / moe_mmv_y;
     // 3D dispatch: (1, total_batches, block_num_z) - batch in y dimension, rows in z
     const sycl::range<3> block_nums(1, total_batches, block_num_z);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, moe_mmv_y, WARP_SIZE);
 
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for<mmvq_id_kernel_name<GGML_TYPE_Q4_0>>(
@@ -2756,9 +2758,11 @@ static void mul_mat_vec_q8_0_q8_1_id_sycl(const void *         vx,
                                           const int64_t        nb2,
                                           dpct::queue_ptr      stream) {
     GGML_ASSERT(ncols % QK8_0 == 0);
-    const int            block_num_z = (nrows_per_expert + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    constexpr int moe_mmv_y = GGML_SYCL_MOE_MMV_Y;
+    static_assert(moe_mmv_y * WARP_SIZE <= 1024, "GGML_SYCL_MOE_MMV_Y exceeds SYCL work-group limit");
+    const int            block_num_z = (nrows_per_expert + moe_mmv_y - 1) / moe_mmv_y;
     const sycl::range<3> block_nums(1, total_batches, block_num_z);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, moe_mmv_y, WARP_SIZE);
 
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for<mmvq_id_kernel_name<GGML_TYPE_Q8_0>>(
@@ -3217,9 +3221,11 @@ static void mul_mat_vec_mxfp4_q8_1_id_sycl(const void *         vx,
                                            const int64_t        nb2,
                                            dpct::queue_ptr      stream) {
     GGML_ASSERT(ncols % QK_MXFP4 == 0);
-    const int            block_num_z = (nrows_per_expert + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    constexpr int moe_mmv_y = GGML_SYCL_MOE_MMV_Y;
+    static_assert(moe_mmv_y * WARP_SIZE <= 1024, "GGML_SYCL_MOE_MMV_Y exceeds SYCL work-group limit");
+    const int            block_num_z = (nrows_per_expert + moe_mmv_y - 1) / moe_mmv_y;
     const sycl::range<3> block_nums(1, total_batches, block_num_z);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, moe_mmv_y, WARP_SIZE);
 
     // Use generic template with vec_dot_mxfp4_q8_1 function pointer
     // This matches how Q4_0 and Q8_0 work
@@ -4000,9 +4006,11 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_sycl(const void *         vx,
                                                    const int64_t        nb2,
                                                    dpct::queue_ptr      stream) {
     GGML_ASSERT(ncols % QK_MXFP4 == 0);
-    const int            block_num_z = (nrows_per_expert + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    constexpr int moe_mmv_y = GGML_SYCL_MOE_MMV_Y;
+    static_assert(moe_mmv_y * WARP_SIZE <= 1024, "GGML_SYCL_MOE_MMV_Y exceeds SYCL work-group limit");
+    const int            block_num_z = (nrows_per_expert + moe_mmv_y - 1) / moe_mmv_y;
     const sycl::range<3> block_nums(1, total_batches, block_num_z);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, moe_mmv_y, WARP_SIZE);
 
     // SoA layout for MXFP4: qs_size = (ncols / 2) * total_rows
     const int64_t total_rows               = (int64_t) nrows_per_expert * num_experts;
@@ -4043,9 +4051,11 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_sycl(const void * const * exp
                                                         const int64_t        nb2_b,
                                                         dpct::queue_ptr      stream) {
     GGML_ASSERT(ncols % QK_MXFP4 == 0);
-    const int            block_num_z = (nrows_per_expert + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    constexpr int moe_mmv_y = GGML_SYCL_MOE_MMV_Y;
+    static_assert(moe_mmv_y * WARP_SIZE <= 1024, "GGML_SYCL_MOE_MMV_Y exceeds SYCL work-group limit");
+    const int            block_num_z = (nrows_per_expert + moe_mmv_y - 1) / moe_mmv_y;
     const sycl::range<3> block_nums(1, total_batches, block_num_z);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, moe_mmv_y, WARP_SIZE);
 
     const int64_t total_qs_size_per_expert = (ncols / 2) * nrows_per_expert;
 
@@ -4088,9 +4098,11 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl(const void * const *
                                                             const float          limit,
                                                             dpct::queue_ptr      stream) {
     GGML_ASSERT(ncols % QK_MXFP4 == 0);
-    const int            block_num_z = (nrows_per_expert + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    constexpr int moe_mmv_y = GGML_SYCL_MOE_MMV_Y;
+    static_assert(moe_mmv_y * WARP_SIZE <= 1024, "GGML_SYCL_MOE_MMV_Y exceeds SYCL work-group limit");
+    const int            block_num_z = (nrows_per_expert + moe_mmv_y - 1) / moe_mmv_y;
     const sycl::range<3> block_nums(1, total_batches, block_num_z);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, moe_mmv_y, WARP_SIZE);
 
     const int64_t total_qs_size_per_expert = (ncols / 2) * nrows_per_expert;
     auto          submit_glu               = [&](auto glu_tag) {
@@ -4137,9 +4149,11 @@ static void coalesced_mul_mat_vec_mxfp4_q8_1_id_sycl(const void *         vx,
                                                      dpct::queue_ptr      stream) {
     GGML_ASSERT(ncols % QK_MXFP4 == 0);
     GGML_ASSERT((ncols / QK_MXFP4) % MMVQ_COALESCED_TILE_BLOCKS == 0);
-    const int            block_num_z = (nrows_per_expert + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    constexpr int moe_mmv_y = GGML_SYCL_MOE_MMV_Y;
+    static_assert(moe_mmv_y * WARP_SIZE <= 1024, "GGML_SYCL_MOE_MMV_Y exceeds SYCL work-group limit");
+    const int            block_num_z = (nrows_per_expert + moe_mmv_y - 1) / moe_mmv_y;
     const sycl::range<3> block_nums(1, total_batches, block_num_z);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, moe_mmv_y, WARP_SIZE);
 
     const int64_t total_rows               = (int64_t) nrows_per_expert * num_experts;
     const int64_t total_qs_size            = (ncols / 2) * total_rows;

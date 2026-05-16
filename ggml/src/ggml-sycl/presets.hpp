@@ -62,6 +62,9 @@
 #ifndef GGML_SYCL_MMV_Y
 #define GGML_SYCL_MMV_Y 1
 #endif
+#ifndef GGML_SYCL_MOE_MMV_Y
+#define GGML_SYCL_MOE_MMV_Y 4
+#endif
 
 #ifndef K_QUANTS_PER_ITERATION
 #define K_QUANTS_PER_ITERATION 2
