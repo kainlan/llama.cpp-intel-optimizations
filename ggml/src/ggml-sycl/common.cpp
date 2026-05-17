@@ -800,23 +800,27 @@ XMXCapabilities query_xmx_capabilities(sycl::device & dev) {
 
     try {
         caps.compute_units = dev.get_info<sycl::info::device::max_compute_units>();
-    } catch (...) {}
+    } catch (...) {
+    }
     try {
         caps.global_mem_size = dev.get_info<sycl::info::device::global_mem_size>();
-    } catch (...) {}
+    } catch (...) {
+    }
     try {
         caps.max_mem_alloc_size = dev.get_info<sycl::info::device::max_mem_alloc_size>();
-    } catch (...) {}
+    } catch (...) {
+    }
     try {
         caps.max_work_group_size = dev.get_info<sycl::info::device::max_work_group_size>();
-    } catch (...) {}
+    } catch (...) {
+    }
     try {
         caps.slm_size = dev.get_info<sycl::info::device::local_mem_size>();
-    } catch (...) {}
+    } catch (...) {
+    }
     try {
-        const auto sizes = dev.get_info<sycl::info::device::sub_group_sizes>();
-        caps.sub_group_size_count =
-            std::min(sizes.size(), XMXCapabilities::MAX_RECORDED_SUB_GROUP_SIZES);
+        const auto sizes          = dev.get_info<sycl::info::device::sub_group_sizes>();
+        caps.sub_group_size_count = std::min(sizes.size(), XMXCapabilities::MAX_RECORDED_SUB_GROUP_SIZES);
         for (size_t i = 0; i < caps.sub_group_size_count; ++i) {
             caps.sub_group_sizes[i] = sizes[i];
             caps.max_sub_group_size = std::max(caps.max_sub_group_size, sizes[i]);
@@ -827,7 +831,8 @@ XMXCapabilities query_xmx_capabilities(sycl::device & dev) {
         if (caps.preferred_sub_group_size == 0) {
             caps.preferred_sub_group_size = caps.max_sub_group_size;
         }
-    } catch (...) {}
+    } catch (...) {
+    }
     caps.supports_usm_device = dev.has(sycl::aspect::usm_device_allocations);
     caps.supports_usm_shared = dev.has(sycl::aspect::usm_shared_allocations);
     caps.supports_usm_host   = dev.has(sycl::aspect::usm_host_allocations);
@@ -876,17 +881,12 @@ XMXCapabilities query_xmx_capabilities(sycl::device & dev) {
     bool slm_calculation_success = false;
 
     if (caps.M > 0 && caps.N > 0 && caps.K > 0 && caps.slm_size > 0) {
-        // Fixed XMX dimensions (Intel Arc default)
-        constexpr int XMX_M = 8;
-        constexpr int XMX_N = 16;
-        constexpr int XMX_K = 32;
-
         // SLM reservation for LUT (MXFP4->INT8 lookup table)
         constexpr size_t LUT_BYTES = 16;
 
         // SLM reservation for token tile (M × K × sizeof(int8))
-        // Each work-group needs token data for XMX_M rows
-        size_t token_tile_bytes = XMX_M * caps.K * sizeof(int8_t);
+        // Each work-group needs token data for the queried XMX M tile.
+        size_t token_tile_bytes = caps.M * caps.K * sizeof(int8_t);
 
         // Remaining SLM budget after reserving LUT and tokens
         size_t slm_for_weights = caps.slm_size - LUT_BYTES - token_tile_bytes;

@@ -8770,7 +8770,16 @@ struct moe_layer_direct_xmx_decision {
     size_t       n_entries        = 0;
     size_t       n_unique_experts = 0;
     layout_mode  layout           = GGML_LAYOUT_AOS;
+    size_t       caps_m           = 0;
+    size_t       caps_n           = 0;
+    size_t       caps_k           = 0;
+    size_t       required_sg      = 0;
 };
+
+static constexpr size_t MOE_DIRECT_XMX_GLU_M  = 8;
+static constexpr size_t MOE_DIRECT_XMX_GLU_N  = 16;
+static constexpr size_t MOE_DIRECT_XMX_GLU_K  = 32;
+static constexpr size_t MOE_DIRECT_XMX_GLU_SG = 16;
 
 static moe_layer_direct_xmx_decision moe_layer_direct_xmx_check_role(const moe_layer_decode_role_plan & role,
                                                                      int                                device,
@@ -8808,9 +8817,21 @@ static moe_layer_direct_xmx_decision moe_layer_direct_xmx_check_role(const moe_l
     }
 
 #if SYCL_XMX_MOE_AVAILABLE
-    const auto & caps = ggml_sycl_info().devices[device].xmx_caps;
+    const auto & caps    = ggml_sycl_info().devices[device].xmx_caps;
+    decision.caps_m      = caps.M;
+    decision.caps_n      = caps.N;
+    decision.caps_k      = caps.K;
+    decision.required_sg = MOE_DIRECT_XMX_GLU_SG;
     if (!caps.supported || !caps.supports_int8) {
         decision.reason = "capability";
+        return decision;
+    }
+    if (!xmx_capabilities_match_int8_tile(caps, MOE_DIRECT_XMX_GLU_M, MOE_DIRECT_XMX_GLU_N, MOE_DIRECT_XMX_GLU_K)) {
+        decision.reason = "kernel-tile-shape";
+        return decision;
+    }
+    if (!xmx_capabilities_support_sub_group(caps, MOE_DIRECT_XMX_GLU_SG)) {
+        decision.reason = "subgroup";
         return decision;
     }
     if (caps.K == 0 || (decision.in_dim % static_cast<int64_t>(caps.K)) != 0) {
@@ -8867,9 +8888,10 @@ static void moe_layer_direct_xmx_trace_decisions(const moe_layer_decode_plan &  
 
     fprintf(stderr,
             "[MOE-DIRECT-XMX-PLAN] layer=%d device=%d entries=%zu topk=%lld layout=%s "
-            "gate=%s uniq=%zu up=%s uniq=%zu",
+            "gate=%s uniq=%zu up=%s uniq=%zu caps=%zux%zux%zu kernel=%zux%zux%zu sg=%zu",
             plan.layer, gate.device, plan.n_entries, (long long) plan.n_ids, ggml_sycl_layout_mode_name(plan.layout),
-            gate.reason, gate.n_unique_experts, up.reason, up.n_unique_experts);
+            gate.reason, gate.n_unique_experts, up.reason, up.n_unique_experts, gate.caps_m, gate.caps_n, gate.caps_k,
+            MOE_DIRECT_XMX_GLU_M, MOE_DIRECT_XMX_GLU_N, MOE_DIRECT_XMX_GLU_K, gate.required_sg);
     if (down) {
         fprintf(stderr, " down=%s down_uniq=%zu", down->reason, down->n_unique_experts);
     }

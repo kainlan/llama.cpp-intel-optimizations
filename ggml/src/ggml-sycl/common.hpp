@@ -566,26 +566,46 @@ struct XMXCapabilities {
     bool supports_fp16 = false;
 
     // Device memory info
-    size_t   slm_size = 0;  // Shared local memory per work-group
-    uint32_t compute_units = 0;
-    size_t   global_mem_size = 0;
-    size_t   max_mem_alloc_size = 0;
-    size_t   max_work_group_size = 0;
-    size_t   max_sub_group_size = 0;
+    size_t   slm_size                 = 0;  // Shared local memory per work-group
+    uint32_t compute_units            = 0;
+    size_t   global_mem_size          = 0;
+    size_t   max_mem_alloc_size       = 0;
+    size_t   max_work_group_size      = 0;
+    size_t   max_sub_group_size       = 0;
     size_t   preferred_sub_group_size = 0;
-    bool     supports_usm_device = false;
-    bool     supports_usm_shared = false;
-    bool     supports_usm_host = false;
-    bool     supports_fp16_type = false;
+    bool     supports_usm_device      = false;
+    bool     supports_usm_shared      = false;
+    bool     supports_usm_host        = false;
+    bool     supports_fp16_type       = false;
 
-    static constexpr size_t MAX_RECORDED_SUB_GROUP_SIZES = 8;
-    std::array<size_t, MAX_RECORDED_SUB_GROUP_SIZES> sub_group_sizes = {};
-    size_t sub_group_size_count = 0;
+    static constexpr size_t                          MAX_RECORDED_SUB_GROUP_SIZES = 8;
+    std::array<size_t, MAX_RECORDED_SUB_GROUP_SIZES> sub_group_sizes              = {};
+    size_t                                           sub_group_size_count         = 0;
 
     // Derived optimal config
     int optimal_tiles_m = 1;
     int optimal_tiles_n = 1;
 };
+
+static inline bool xmx_capabilities_support_sub_group(const XMXCapabilities & caps, size_t required_size) {
+    if (required_size == 0) {
+        return false;
+    }
+    for (size_t i = 0; i < caps.sub_group_size_count; ++i) {
+        if (caps.sub_group_sizes[i] == required_size) {
+            return true;
+        }
+    }
+    return caps.sub_group_size_count == 0 &&
+           (caps.preferred_sub_group_size == required_size || caps.max_sub_group_size == required_size);
+}
+
+static inline bool xmx_capabilities_match_int8_tile(const XMXCapabilities & caps,
+                                                    size_t                  required_m,
+                                                    size_t                  required_n,
+                                                    size_t                  required_k) {
+    return caps.supported && caps.supports_int8 && caps.M == required_m && caps.N == required_n && caps.K == required_k;
+}
 
 XMXCapabilities query_xmx_capabilities(sycl::device & dev);
 

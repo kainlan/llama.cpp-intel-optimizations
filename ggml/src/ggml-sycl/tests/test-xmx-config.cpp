@@ -3,12 +3,12 @@
 // Tests hardware-queried dimensions for ESIMD dpas kernel configuration
 //
 
+#include "../common.hpp"
+#include "../unified-kernel.hpp"
+
 #include <cassert>
 #include <cstdlib>
 #include <iostream>
-
-#include "../unified-kernel.hpp"
-#include "../common.hpp"
 
 using namespace ggml_sycl_unified;
 
@@ -76,7 +76,7 @@ void test_use_esimd_dpas_env_unset() {
     // With env unset, should return false
     bool result = use_esimd_dpas();
     // Just verify it doesn't crash and returns a bool
-    (void)result;
+    (void) result;
 
     std::cout << "PASSED (returned " << (result ? "true" : "false") << ")" << std::endl;
 }
@@ -87,7 +87,7 @@ void test_use_int8_dpas_env_unset() {
 
     bool result = use_int8_dpas();
     // Just verify it doesn't crash and returns a bool
-    (void)result;
+    (void) result;
 
     std::cout << "PASSED (returned " << (result ? "true" : "false") << ")" << std::endl;
 }
@@ -96,7 +96,7 @@ void test_use_int8_dpas_env_unset() {
 void test_from_device_valid() {
     std::cout << "Test: from_device with valid device... ";
 
-    const auto& info = ggml_sycl_info();
+    const auto & info = ggml_sycl_info();
     if (info.device_count == 0) {
         std::cout << "SKIPPED (no devices)" << std::endl;
         return;
@@ -112,17 +112,42 @@ void test_from_device_valid() {
     assert(cfg.xmx_k_fp16 == 16 && "K_FP16 should always be 16");
     assert(cfg.slm_size > 0 && "SLM size should be positive");
 
-    std::cout << "PASSED (M=" << cfg.xmx_m
-              << ", N=" << cfg.xmx_n
-              << ", K_INT8=" << cfg.xmx_k_int8
+    std::cout << "PASSED (M=" << cfg.xmx_m << ", N=" << cfg.xmx_n << ", K_INT8=" << cfg.xmx_k_int8
               << ", SLM=" << cfg.slm_size << ")" << std::endl;
 }
 
-// Test 7: Verify Arc B580 specific values (if running on that hardware)
+// Test 7: capability helper predicates used by MoE direct-XMX policy
+void test_capability_helper_predicates() {
+    std::cout << "Test: XMX capability helper predicates... ";
+
+    XMXCapabilities caps;
+    caps.supported            = true;
+    caps.supports_int8        = true;
+    caps.M                    = 8;
+    caps.N                    = 16;
+    caps.K                    = 32;
+    caps.sub_group_size_count = 2;
+    caps.sub_group_sizes[0]   = 16;
+    caps.sub_group_sizes[1]   = 32;
+
+    assert(xmx_capabilities_match_int8_tile(caps, 8, 16, 32));
+    assert(!xmx_capabilities_match_int8_tile(caps, 4, 16, 32));
+    assert(xmx_capabilities_support_sub_group(caps, 16));
+    assert(xmx_capabilities_support_sub_group(caps, 32));
+    assert(!xmx_capabilities_support_sub_group(caps, 8));
+
+    caps.sub_group_size_count     = 0;
+    caps.preferred_sub_group_size = 16;
+    assert(xmx_capabilities_support_sub_group(caps, 16));
+
+    std::cout << "PASSED" << std::endl;
+}
+
+// Test 8: Verify Arc B580 specific values (if running on that hardware)
 void test_arc_b580_dimensions() {
     std::cout << "Test: Arc B580 expected dimensions... ";
 
-    const auto& info = ggml_sycl_info();
+    const auto & info = ggml_sycl_info();
     if (info.device_count == 0) {
         std::cout << "SKIPPED (no devices)" << std::endl;
         return;
@@ -136,8 +161,7 @@ void test_arc_b580_dimensions() {
     if (is_expected) {
         std::cout << "PASSED (M=8, N=16, K_INT8=32 as expected)" << std::endl;
     } else {
-        std::cout << "PASSED (different hardware: M=" << cfg.xmx_m
-                  << ", N=" << cfg.xmx_n
+        std::cout << "PASSED (different hardware: M=" << cfg.xmx_m << ", N=" << cfg.xmx_n
                   << ", K_INT8=" << cfg.xmx_k_int8 << ")" << std::endl;
     }
 }
@@ -152,6 +176,7 @@ int main() {
     test_use_esimd_dpas_env_unset();
     test_use_int8_dpas_env_unset();
     test_from_device_valid();
+    test_capability_helper_predicates();
     test_arc_b580_dimensions();
 
     std::cout << std::endl;
