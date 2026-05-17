@@ -1040,8 +1040,10 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                     out.error = "Failed to generate MXFP4 weights for selected-read benchmark.";
                     return false;
                 }
-                if (!run_mxfp4_selected_read(weights, m, n, k, config.layout, config.validate, config.warmup_iterations,
-                                             config.measure_iterations, queue, metrics, error)) {
+                const bool interleave_rows = config.kernel_name.find("interleave") != std::string::npos;
+                if (!run_mxfp4_selected_read(weights, m, n, k, config.layout, interleave_rows, config.validate,
+                                             config.warmup_iterations, config.measure_iterations, queue, metrics,
+                                             error)) {
                     out.error = error;
                     return false;
                 }

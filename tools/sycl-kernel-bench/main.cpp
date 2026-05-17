@@ -121,6 +121,7 @@ static void print_usage(const char * argv0) {
                  "onednn_mxfp4_f32scale_gemm|unified_matmul|memory_bandwidth|"
                  "mxfp4_decode_aos|mxfp4_decode_soa|mxfp4_decode_f16_aos|mxfp4_decode_f16_soa|roofline_compute|"
                  "mxfp4_inline_dot_aos|mxfp4_inline_dot_soa|mxfp4_selected_read_aos|mxfp4_selected_read_soa|"
+                 "mxfp4_selected_read_interleave_aos|mxfp4_selected_read_interleave_soa|"
                  "dpas_baseline|dpas_sweep|dpas_memory_patterns (comma-separated to compare)\n"
                  "  --quant=Q4_0|Q8_0|Q6_K|Q4_K|Q5_K|Q2_K|Q3_K|Q4_1|Q5_0|Q5_1|MXFP4\n"
                  "  --batch=1,4,8,16,32,64\n"

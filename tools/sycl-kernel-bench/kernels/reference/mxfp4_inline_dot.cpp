@@ -275,6 +275,7 @@ bool run_mxfp4_selected_read(const GeneratedWeights & weights,
                              int64_t                  n_selected,
                              int64_t                  k,
                              ggml_layout_mode         layout,
+                             bool                     interleave_rows,
                              bool                     validate,
                              int                      warmup,
                              int                      iterations,
@@ -344,8 +345,8 @@ bool run_mxfp4_selected_read(const GeneratedWeights & weights,
                 sycl::nd_range<2>(sycl::range<2>(out_count, local_size), sycl::range<2>(1, local_size)),
                 [=](sycl::nd_item<2> item) {
                     const size_t task = item.get_group(0);
-                    const size_t sel  = task / static_cast<size_t>(m);
-                    const size_t row  = task - sel * static_cast<size_t>(m);
+                    const size_t sel  = interleave_rows ? task % selected_count : task / static_cast<size_t>(m);
+                    const size_t row  = interleave_rows ? task / selected_count : task - sel * static_cast<size_t>(m);
                     const size_t lid  = item.get_local_id(1);
 
                     const uint8_t * expert = d_ptrs[sel];
