@@ -51,6 +51,7 @@
 #include <cstring>
 #include <mutex>
 #include <sycl/sycl.hpp>
+#include <type_traits>
 #include <vector>
 
 #if __has_include(<sycl/ext/oneapi/matrix/matrix.hpp>)
@@ -78,14 +79,16 @@ static constexpr int XMX_V2_SG = 16;
 static constexpr int XMX_V2_MAX_NTHREADS = 512;
 
 // KV batch size — number of KV rows processed per outer-loop iteration.
-// SLM budget: (ncols*D + 2*BATCH_KV*D + ncols*BATCH_KV) * sizeof(half).
-// For ncols=8, D=128, BATCH_KV=32: (8+64)*128*2 + 8*32*2 = 18432 + 512 = 18944 bytes — within 64 KB.
+// SLM budget: (ncols*D + 2*BATCH_KV*D + 2*ncols*BATCH_KV) * sizeof(half).
+// For ncols=8, D=128, BATCH_KV=32: (8+64)*128*2 + 2*8*32*2 = 18432 + 1024 = 19456 bytes — within 64 KB.
 // llama.cpp-0sres (closed) added the runtime SLM-fit check in
 // `fattn_xmx_v2_pick_variant_cached`: if the fixed BATCH_KV overflows the device's
 // reported local_mem_size for the requested shape, the picker returns use_xmx=false
 // and the dispatcher falls back to the TILE kernel. BATCH_KV itself remains a
 // compile-time constant; only the gate is runtime.
 static constexpr int XMX_V2_BATCH_KV = 32;  // must be divisible by every variant's TK and TN
+static constexpr int XMX_V2_FLOAT_AS_HALF_ELEMS =
+    static_cast<int>((sizeof(float) + sizeof(sycl::half) - 1) / sizeof(sycl::half));
 
 // =============================================================================
 // Variant catalogue — the compile-time-instantiated universe of (TM, TK, TN)
@@ -357,7 +360,8 @@ struct fattn_xmx_v2_device_cache {
 static constexpr size_t fattn_xmx_v2_required_slm_bytes() {
     constexpr size_t D_max     = 256;
     constexpr size_t ncols_max = 16;
-    constexpr size_t halves    = ncols_max * D_max + 2 * XMX_V2_BATCH_KV * D_max + ncols_max * XMX_V2_BATCH_KV;
+    constexpr size_t halves =
+        ncols_max * D_max + 2 * XMX_V2_BATCH_KV * D_max + ncols_max * XMX_V2_BATCH_KV * XMX_V2_FLOAT_AS_HALF_ELEMS;
     return halves * sizeof(sycl::half);
 }
 
@@ -408,18 +412,23 @@ inline std::size_t fattn_xmx_v2_pick_variant_cached(ggml_backend_sycl_context & 
 // tile_Q[ncols][D]            — loaded once at kernel start, register-resident Q
 // tile_K[BATCH_KV][D]         — K tile per KV batch
 // tile_V[BATCH_KV][D]         — V tile per KV batch (separate from K)
-// tile_S[ncols][BATCH_KV]     — softmax weights written before S@V MAD
+// tile_S[ncols][BATCH_KV]     — softmax weights written before S@V. The S
+//                                region is sized for float weights so
+//                                GGML_PREC_F32 can avoid half probability
+//                                quantization; PREC_DEFAULT uses the first
+//                                half-sized portion for the XMX S@V path.
 //
 // All regions start at WORD-aligned offsets.  The ordering above places each
 // region right after the previous one with NO overlap.
 // =============================================================================
 
 template <int D, int ncols> struct fattn_v2_slm {
-    static constexpr int Q_ELEMS = ncols * D;
-    static constexpr int K_ELEMS = XMX_V2_BATCH_KV * D;
-    static constexpr int V_ELEMS = XMX_V2_BATCH_KV * D;
-    static constexpr int S_ELEMS = ncols * XMX_V2_BATCH_KV;
-    static constexpr int TOTAL   = Q_ELEMS + K_ELEMS + V_ELEMS + S_ELEMS;
+    static constexpr int Q_ELEMS         = ncols * D;
+    static constexpr int K_ELEMS         = XMX_V2_BATCH_KV * D;
+    static constexpr int V_ELEMS         = XMX_V2_BATCH_KV * D;
+    static constexpr int S_HALF_ELEMS    = ncols * XMX_V2_BATCH_KV;
+    static constexpr int S_STORAGE_ELEMS = S_HALF_ELEMS * XMX_V2_FLOAT_AS_HALF_ELEMS;
+    static constexpr int TOTAL           = Q_ELEMS + K_ELEMS + V_ELEMS + S_STORAGE_ELEMS;
 
     static constexpr int Q_OFFSET = 0;
     static constexpr int K_OFFSET = Q_OFFSET + Q_ELEMS;
@@ -550,10 +559,11 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
     // ------------------------------------------------------------------
     // SLM region pointers (strictly non-overlapping — Rule 1)
     // ------------------------------------------------------------------
-    sycl::half * tile_Q = slm + slm_layout::Q_OFFSET;  // [ncols][D]
-    sycl::half * tile_K = slm + slm_layout::K_OFFSET;  // [BATCH_KV][D]
-    sycl::half * tile_V = slm + slm_layout::V_OFFSET;  // [BATCH_KV][D]
-    sycl::half * tile_S = slm + slm_layout::S_OFFSET;  // [ncols][BATCH_KV]
+    sycl::half * tile_Q   = slm + slm_layout::Q_OFFSET;  // [ncols][D]
+    sycl::half * tile_K   = slm + slm_layout::K_OFFSET;  // [BATCH_KV][D]
+    sycl::half * tile_V   = slm + slm_layout::V_OFFSET;  // [BATCH_KV][D]
+    sycl::half * tile_S   = slm + slm_layout::S_OFFSET;  // [ncols][BATCH_KV]
+    float *      tile_S_f = reinterpret_cast<float *>(slm + slm_layout::S_OFFSET);
 
     // ------------------------------------------------------------------
     // Register state (Rule 2: all cross-lane softmax state in registers)
@@ -742,51 +752,79 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
                 const int s_row = sg_q_base + r;
                 const int s_col = kv_col + lane;
                 if (s_row < ncols && s_col < XMX_V2_BATCH_KV) {
-                    tile_S[s_row * XMX_V2_BATCH_KV + s_col] = sycl::half(p);
+                    if constexpr (std::is_same_v<Acc_t, float>) {
+                        tile_S_f[s_row * XMX_V2_BATCH_KV + s_col] = p;
+                    } else {
+                        tile_S[s_row * XMX_V2_BATCH_KV + s_col] = sycl::half(p);
+                    }
+                }
+            }
+
+            // ---- Phase 5: S @ V for this KV tile ----
+            // Online softmax may rescale VKQ when a later KV tile raises the
+            // row max, so the current tile's probabilities must be consumed
+            // before the next tile can update KQ_max.
+            sycl::group_barrier(item.get_group());  // Rule 3
+
+            if constexpr (std::is_same_v<Acc_t, float>) {
+                for (int d_tile = 0; d_tile < D_TILES; ++d_tile) {
+                    const int d = d_tile * TN + lane;
+
+#    pragma unroll
+                    for (int r = 0; r < TM; ++r) {
+                        const int q_abs = ic0 + sg_q_base + r;
+                        if (q_abs >= ne01) {
+                            continue;
+                        }
+
+                        float acc = 0.0f;
+#    pragma unroll
+                        for (int k = 0; k < TN; ++k) {
+                            const int kv_idx = kv_col + k;
+                            acc += tile_S_f[(sg_q_base + r) * XMX_V2_BATCH_KV + kv_idx] *
+                                   static_cast<float>(tile_V[kv_idx * D + d]);
+                        }
+                        VKQ[r][d_tile] += acc;
+                    }
+                }
+            } else {
+                for (int d_tile = 0; d_tile < D_TILES; ++d_tile) {
+                    const int d_start = d_tile * TN;
+
+                    sycl_xmx::joint_matrix<sycl::sub_group, float, sycl_xmx::use::accumulator, TM, TN> mat_SV;
+                    sycl_xmx::joint_matrix_fill(sg, mat_SV, 0.0f);
+
+                    sycl_xmx::joint_matrix<sycl::sub_group, sycl::half, sycl_xmx::use::a, TM, TK,
+                                           sycl_xmx::layout::row_major>
+                        mat_S;
+                    sycl_xmx::joint_matrix<sycl::sub_group, sycl::half, sycl_xmx::use::b, TK, TN,
+                                           sycl_xmx::layout::row_major>
+                        mat_V;
+
+                    sycl_xmx::joint_matrix_load(
+                        sg, mat_S,
+                        sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
+                            &tile_S[sg_q_base * XMX_V2_BATCH_KV + kv_col]),
+                        XMX_V2_BATCH_KV);
+
+                    sycl_xmx::joint_matrix_load(
+                        sg, mat_V,
+                        sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
+                            &tile_V[kv_col * D + d_start]),
+                        D);
+
+                    sycl_xmx::joint_matrix_mad(sg, mat_SV, mat_S, mat_V, mat_SV);
+
+                    {
+                        int slot = 0;
+                        sycl_xmx::joint_matrix_apply(sg, mat_SV, [&](float & elem) {
+                            VKQ[slot][d_tile] += elem;
+                            ++slot;
+                        });
+                    }
                 }
             }
         }  // end kv_tile loop
-
-        sycl::group_barrier(item.get_group());  // Rule 3
-
-        // ---- Phase 5: S @ V via joint_matrix_mad ----
-        for (int d_tile = 0; d_tile < D_TILES; ++d_tile) {
-            const int d_start = d_tile * TN;
-
-            sycl_xmx::joint_matrix<sycl::sub_group, float, sycl_xmx::use::accumulator, TM, TN> mat_SV;
-            sycl_xmx::joint_matrix_fill(sg, mat_SV, 0.0f);
-
-            for (int k = 0; k < XMX_V2_BATCH_KV; k += TK) {
-                sycl_xmx::joint_matrix<sycl::sub_group, sycl::half, sycl_xmx::use::a, TM, TK,
-                                       sycl_xmx::layout::row_major>
-                    mat_S;
-                sycl_xmx::joint_matrix<sycl::sub_group, sycl::half, sycl_xmx::use::b, TK, TN,
-                                       sycl_xmx::layout::row_major>
-                    mat_V;
-
-                sycl_xmx::joint_matrix_load(
-                    sg, mat_S,
-                    sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
-                        &tile_S[sg_q_base * XMX_V2_BATCH_KV + k]),
-                    XMX_V2_BATCH_KV);
-
-                sycl_xmx::joint_matrix_load(
-                    sg, mat_V,
-                    sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
-                        &tile_V[k * D + d_start]),
-                    D);
-
-                sycl_xmx::joint_matrix_mad(sg, mat_SV, mat_S, mat_V, mat_SV);
-            }
-
-            {
-                int slot = 0;
-                sycl_xmx::joint_matrix_apply(sg, mat_SV, [&](float & elem) {
-                    VKQ[slot][d_tile] += elem;
-                    ++slot;
-                });
-            }
-        }
 
         sycl::group_barrier(item.get_group());  // Rule 3
 

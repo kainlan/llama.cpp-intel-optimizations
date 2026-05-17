@@ -8043,6 +8043,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Focused XMX-v2/SYCL FA coverage that the Cartesian matrix above does not
+    // generate: ncols2, plus GPT-OSS-like D64 PP with sinks and softcap.
+    test_cases.emplace_back(new test_flash_attn_ext(
+                64, 64, 4, {1, 1}, 113, 2, false, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(
+                64, 64, 4, {1, 1}, 512, 512, false, true, 0.0f, 10.0f, GGML_PREC_F32, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(
+                64, 64, 4, {1, 1}, 512, 512, true, true, 8.0f, 10.0f, GGML_PREC_F32, GGML_TYPE_F16));
+
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));

@@ -1378,11 +1378,9 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
     }
 #endif  // GGML_SYCL_DNNL
 
-    // Batched ESIMD D=64 PP path. XMX-v2 has a faster GPT-OSS B50 PP
-    // measurement after the active-subgroup fix, but broader backend-op
-    // coverage exposed D64 FA shapes where v2 is not correctness-clean yet.
-    // Keep the proven ESIMD path as the default and use the shape-preserving
-    // XMX-v2 force path for targeted profiling until v2 passes the full gate.
+    // Batched ESIMD D=64 PP path. XMX-v2 now has focused backend-op coverage,
+    // but keep the proven ESIMD path as the default until a separate promotion
+    // change updates the PP/TG dispatch policy and its performance guardrails.
     if (can_use_esimd_batched_pp(false)) {
         GGML_SYCL_KTRACE("fattn_esimd_f16_batched", " D=%d ne01=%d slm=%zu", D, ne01,
                          fattn_esimd_batched_slm_bytes<D>());
