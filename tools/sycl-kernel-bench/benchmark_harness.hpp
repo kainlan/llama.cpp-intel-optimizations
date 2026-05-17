@@ -1060,7 +1060,7 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                     out.error = "Failed to generate MXFP4 SOA weights for pair-GLU benchmark.";
                     return false;
                 }
-                GeneratedActivations activations = generate_activations(1, k, k, false, false, false);
+                GeneratedActivations activations = generate_activations(1, k, k, false, false, true);
                 int                  rows_per_wg = 4;
                 if (config.kernel_name.find("_r1") != std::string::npos) {
                     rows_per_wg = 1;
@@ -1071,9 +1071,39 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                 } else if (config.kernel_name.find("_r16") != std::string::npos) {
                     rows_per_wg = 16;
                 }
-                const bool cache_y = config.kernel_name.find("_nocache") == std::string::npos;
+                const bool cache_y = config.kernel_name.find("_cache") != std::string::npos &&
+                                     config.kernel_name.find("_nocache") == std::string::npos;
                 if (!run_mxfp4_pair_glu(weights, activations, m, n, k, rows_per_wg, cache_y, config.validate,
                                         config.warmup_iterations, config.measure_iterations, queue, metrics, error)) {
+                    out.error = error;
+                    return false;
+                }
+                break;
+            }
+        case KernelKind::MXFP4_MMV_ID:
+            {
+                if (config.layout != GGML_LAYOUT_SOA) {
+                    out.error = "mxfp4_mmv_id requires SOA layout.";
+                    return false;
+                }
+                GeneratedWeights weights;
+                if (!generate_quantized_weights(GGML_TYPE_MXFP4, GGML_LAYOUT_SOA, m, k, false, weights)) {
+                    out.error = "Failed to generate MXFP4 SOA weights for MMV-ID benchmark.";
+                    return false;
+                }
+                GeneratedActivations activations = generate_activations(1, k, k, false, false, true);
+                int                  rows_per_wg = 4;
+                if (config.kernel_name.find("_r1") != std::string::npos) {
+                    rows_per_wg = 1;
+                } else if (config.kernel_name.find("_r2") != std::string::npos) {
+                    rows_per_wg = 2;
+                } else if (config.kernel_name.find("_r8") != std::string::npos) {
+                    rows_per_wg = 8;
+                } else if (config.kernel_name.find("_r16") != std::string::npos) {
+                    rows_per_wg = 16;
+                }
+                if (!run_mxfp4_mmv_id(weights, activations, m, n, k, rows_per_wg, config.validate,
+                                      config.warmup_iterations, config.measure_iterations, queue, metrics, error)) {
                     out.error = error;
                     return false;
                 }

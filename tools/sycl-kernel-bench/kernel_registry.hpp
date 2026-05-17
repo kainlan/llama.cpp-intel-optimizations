@@ -23,6 +23,7 @@ enum class KernelKind {
     MXFP4_INLINE_DOT,
     MXFP4_SELECTED_READ,
     MXFP4_PAIR_GLU,
+    MXFP4_MMV_ID,
     ROOFLINE_COMPUTE,
     DPAS_EXPLORATION,
 };
@@ -104,7 +105,13 @@ inline const std::vector<KernelInfo> & kernel_list() {
         { "mxfp4_pair_glu_soa_r4",              GGML_LAYOUT_SOA,       KernelKind::MXFP4_PAIR_GLU         },
         { "mxfp4_pair_glu_soa_r8",              GGML_LAYOUT_SOA,       KernelKind::MXFP4_PAIR_GLU         },
         { "mxfp4_pair_glu_soa_r16",             GGML_LAYOUT_SOA,       KernelKind::MXFP4_PAIR_GLU         },
+        { "mxfp4_pair_glu_soa_r4_cache",        GGML_LAYOUT_SOA,       KernelKind::MXFP4_PAIR_GLU         },
         { "mxfp4_pair_glu_soa_r4_nocache",      GGML_LAYOUT_SOA,       KernelKind::MXFP4_PAIR_GLU         },
+        { "mxfp4_mmv_id_soa_r1",                GGML_LAYOUT_SOA,       KernelKind::MXFP4_MMV_ID           },
+        { "mxfp4_mmv_id_soa_r2",                GGML_LAYOUT_SOA,       KernelKind::MXFP4_MMV_ID           },
+        { "mxfp4_mmv_id_soa_r4",                GGML_LAYOUT_SOA,       KernelKind::MXFP4_MMV_ID           },
+        { "mxfp4_mmv_id_soa_r8",                GGML_LAYOUT_SOA,       KernelKind::MXFP4_MMV_ID           },
+        { "mxfp4_mmv_id_soa_r16",               GGML_LAYOUT_SOA,       KernelKind::MXFP4_MMV_ID           },
         { "roofline_compute",                   GGML_LAYOUT_AOS,       KernelKind::ROOFLINE_COMPUTE       },
     };
     return kernels;

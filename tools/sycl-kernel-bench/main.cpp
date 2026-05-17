@@ -123,7 +123,9 @@ static void print_usage(const char * argv0) {
                  "mxfp4_inline_dot_aos|mxfp4_inline_dot_soa|mxfp4_selected_read_aos|mxfp4_selected_read_soa|"
                  "mxfp4_selected_read_interleave_aos|mxfp4_selected_read_interleave_soa|"
                  "mxfp4_pair_glu_soa_r1|mxfp4_pair_glu_soa_r2|mxfp4_pair_glu_soa_r4|mxfp4_pair_glu_soa_r8|"
-                 "mxfp4_pair_glu_soa_r16|mxfp4_pair_glu_soa_r4_nocache|"
+                 "mxfp4_pair_glu_soa_r16|mxfp4_pair_glu_soa_r4_cache|mxfp4_pair_glu_soa_r4_nocache|"
+                 "mxfp4_mmv_id_soa_r1|mxfp4_mmv_id_soa_r2|mxfp4_mmv_id_soa_r4|mxfp4_mmv_id_soa_r8|"
+                 "mxfp4_mmv_id_soa_r16|"
                  "dpas_baseline|dpas_sweep|dpas_memory_patterns (comma-separated to compare)\n"
                  "  --quant=Q4_0|Q8_0|Q6_K|Q4_K|Q5_K|Q2_K|Q3_K|Q4_1|Q5_0|Q5_1|MXFP4\n"
                  "  --batch=1,4,8,16,32,64\n"
@@ -863,6 +865,7 @@ int main(int argc, char ** argv) {
                                                 case KernelKind::MXFP4_INLINE_DOT:
                                                 case KernelKind::MXFP4_SELECTED_READ:
                                                 case KernelKind::MXFP4_PAIR_GLU:
+                                                case KernelKind::MXFP4_MMV_ID:
                                                     return s.type != GGML_TYPE_MXFP4;
                                                 case KernelKind::UNIFIED_MATMUL:
                                                     return s.type != GGML_TYPE_Q4_0 ||

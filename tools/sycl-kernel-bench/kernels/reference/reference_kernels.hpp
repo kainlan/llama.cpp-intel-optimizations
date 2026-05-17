@@ -172,6 +172,19 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
                         ReferenceMetrics &           out,
                         std::string &                error);
 
+bool run_mxfp4_mmv_id(const GeneratedWeights &     weights,
+                      const GeneratedActivations & activations,
+                      int64_t                      m,
+                      int64_t                      n_selected,
+                      int64_t                      k,
+                      int                          rows_per_wg,
+                      bool                         validate,
+                      int                          warmup,
+                      int                          iterations,
+                      sycl::queue &                queue,
+                      ReferenceMetrics &           out,
+                      std::string &                error);
+
 bool run_roofline_compute(size_t             elements,
                           int                ops_per_element,
                           int                warmup,

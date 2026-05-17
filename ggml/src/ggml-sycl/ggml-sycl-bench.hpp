@@ -88,6 +88,36 @@ struct mxfp4_pair_glu_bench_args {
 
 bool ggml_sycl_mxfp4_pair_glu_bench_launch(const mxfp4_pair_glu_bench_args & args);
 
+// Arguments for benchmarking the production MXFP4 SOA MoE selected-expert
+// single-role kernel, matching the down projection shape.
+struct mxfp4_mmv_id_bench_args {
+    sycl::queue * stream = nullptr;
+
+    const void * const * expert_ptrs        = nullptr;
+    const void *         activations_q8_soa = nullptr;
+    float *              output             = nullptr;
+    const int32_t *      ids                = nullptr;
+
+    int ncols            = 0;
+    int ncols_y          = 0;
+    int nrows_per_expert = 0;
+    int num_experts      = 0;
+    int n_ids            = 0;
+    int n_tokens         = 1;
+    int ne11             = 1;
+
+    int64_t ids_nb0 = 0;
+    int64_t ids_nb1 = 0;
+    int64_t nb11    = 0;
+    int64_t nb12    = 0;
+    int64_t dst_nb1 = 0;
+    int64_t dst_nb2 = 0;
+
+    int rows_per_wg = 4;
+};
+
+bool ggml_sycl_mxfp4_mmv_id_bench_launch(const mxfp4_mmv_id_bench_args & args);
+
 // Arguments for benchmarking MMQ kernels directly (without ggml_tensor overhead)
 struct mmq_bench_args {
     // Required: SYCL queue for kernel submission
