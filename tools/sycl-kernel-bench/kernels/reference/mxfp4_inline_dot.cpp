@@ -296,18 +296,23 @@ bool run_mxfp4_selected_read(const GeneratedWeights & weights,
         return false;
     }
 
-    const size_t  weight_bytes   = host_weights.size();
+    const size_t  expert_bytes   = host_weights.size();
     const size_t  selected_count = static_cast<size_t>(n_selected);
+    const size_t  weight_bytes   = expert_bytes * selected_count;
     const size_t  out_count      = static_cast<size_t>(m) * selected_count;
     const size_t  out_bytes      = out_count * sizeof(float);
     const int64_t blocks_per_row = k / QK_MXFP4;
     const size_t  nblocks        = static_cast<size_t>(m) * static_cast<size_t>(blocks_per_row);
     constexpr int local_size     = 256;
 
-    uint8_t *                    d_weights = sycl::malloc_device<uint8_t>(weight_bytes, queue);
-    const uint8_t **             d_ptrs    = sycl::malloc_device<const uint8_t *>(selected_count, queue);
-    float *                      d_out     = sycl::malloc_device<float>(out_count, queue);
-    std::vector<const uint8_t *> host_ptrs(selected_count, d_weights);
+    std::vector<uint8_t> host_weight_slices(weight_bytes);
+    for (size_t sel = 0; sel < selected_count; ++sel) {
+        std::copy(host_weights.begin(), host_weights.end(), host_weight_slices.begin() + sel * expert_bytes);
+    }
+
+    uint8_t *        d_weights = sycl::malloc_device<uint8_t>(weight_bytes, queue);
+    const uint8_t ** d_ptrs    = sycl::malloc_device<const uint8_t *>(selected_count, queue);
+    float *          d_out     = sycl::malloc_device<float>(out_count, queue);
 
     if (!d_weights || !d_ptrs || !d_out) {
         if (d_weights) {
@@ -323,7 +328,12 @@ bool run_mxfp4_selected_read(const GeneratedWeights & weights,
         return false;
     }
 
-    queue.memcpy(d_weights, host_weights.data(), weight_bytes);
+    std::vector<const uint8_t *> host_ptrs(selected_count);
+    for (size_t sel = 0; sel < selected_count; ++sel) {
+        host_ptrs[sel] = d_weights + sel * expert_bytes;
+    }
+
+    queue.memcpy(d_weights, host_weight_slices.data(), weight_bytes);
     queue.memcpy(d_ptrs, host_ptrs.data(), selected_count * sizeof(const uint8_t *));
     queue.wait_and_throw();
 
@@ -393,7 +403,7 @@ bool run_mxfp4_selected_read(const GeneratedWeights & weights,
     const double total_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
     const double mean_us  = (iterations > 0) ? total_us / iterations : 0.0;
     const double mean_s   = mean_us * 1e-6;
-    const double bytes    = static_cast<double>(weight_bytes) * static_cast<double>(n_selected) +
+    const double bytes    = static_cast<double>(weight_bytes) +
                          static_cast<double>(selected_count * sizeof(const uint8_t *)) + static_cast<double>(out_bytes);
 
     out.total_us       = mean_us;
