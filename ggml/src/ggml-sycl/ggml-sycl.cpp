@@ -8945,6 +8945,170 @@ static bool moe_layer_capture_tensor_artifact(moe_layer_decode_artifact_plan & a
     return true;
 }
 
+static bool ggml_sycl_moe_group_profile_enabled() {
+    static const int enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_MOE_GROUP_PROFILE");
+        return env ? std::atoi(env) : 0;
+    }();
+    return enabled != 0;
+}
+
+static int ggml_sycl_moe_group_profile_window() {
+    static const int window = [] {
+        const char * env = std::getenv("GGML_SYCL_MOE_GROUP_PROFILE_WINDOW");
+        const int    val = env ? std::atoi(env) : 1;
+        return val > 0 ? val : 1;
+    }();
+    return window;
+}
+
+struct moe_layer_group_profile_accum {
+    int64_t                               roles           = 0;
+    int64_t                               gate_roles      = 0;
+    int64_t                               up_roles        = 0;
+    int64_t                               down_roles      = 0;
+    int64_t                               entries         = 0;
+    int64_t                               tokens          = 0;
+    int64_t                               topk_sum        = 0;
+    int64_t                               device_handles  = 0;
+    int64_t                               host_handles    = 0;
+    int64_t                               missing_handles = 0;
+    int64_t                               layout_mismatch = 0;
+    int64_t                               soa_roles       = 0;
+    int64_t                               coalesced_roles = 0;
+    int64_t                               aos_roles       = 0;
+    std::unordered_map<uint64_t, int64_t> rows_by_group;
+};
+
+static thread_local moe_layer_group_profile_accum g_moe_layer_group_profile;
+
+static uint64_t moe_layer_group_profile_key(int          layer,
+                                            const char * role_name,
+                                            int32_t      eid,
+                                            layout_mode  layout,
+                                            int          device) {
+    uint64_t role = 0;
+    if (std::strcmp(role_name, "gate") == 0) {
+        role = 1;
+    } else if (std::strcmp(role_name, "up") == 0) {
+        role = 2;
+    } else if (std::strcmp(role_name, "down") == 0) {
+        role = 3;
+    }
+    const uint64_t layer_bits  = static_cast<uint64_t>(static_cast<uint32_t>(std::max(layer, 0))) & 0xffffu;
+    const uint64_t expert_bits = static_cast<uint64_t>(static_cast<uint32_t>(std::max<int32_t>(eid, 0))) & 0xffffffu;
+    const uint64_t device_bits = static_cast<uint64_t>(static_cast<uint32_t>(std::max(device, 0))) & 0xffu;
+    const uint64_t layout_bits = static_cast<uint64_t>(static_cast<uint32_t>(layout)) & 0xffu;
+    return (layout_bits << 56) | (device_bits << 48) | (role << 40) | (layer_bits << 24) | expert_bits;
+}
+
+static void moe_layer_group_profile_record(const moe_layer_decode_plan &      plan,
+                                           const moe_layer_decode_role_plan & role,
+                                           const char *                       role_name,
+                                           const char *                       executor,
+                                           int                                device) {
+    if (!ggml_sycl_moe_group_profile_enabled()) {
+        return;
+    }
+
+    const int64_t entries = static_cast<int64_t>(role.expert_ids.size());
+    if (entries <= 0) {
+        return;
+    }
+
+    auto & p = g_moe_layer_group_profile;
+    p.roles++;
+    p.entries += entries;
+    p.tokens += plan.n_ids > 0 ? entries / plan.n_ids : 0;
+    p.topk_sum += plan.n_ids;
+    if (std::strcmp(role_name, "gate") == 0) {
+        p.gate_roles++;
+    } else if (std::strcmp(role_name, "up") == 0) {
+        p.up_roles++;
+    } else if (std::strcmp(role_name, "down") == 0) {
+        p.down_roles++;
+    }
+    if (plan.layout == GGML_LAYOUT_SOA) {
+        p.soa_roles++;
+    } else if (plan.layout == GGML_LAYOUT_COALESCED) {
+        p.coalesced_roles++;
+    } else if (plan.layout == GGML_LAYOUT_AOS) {
+        p.aos_roles++;
+    }
+
+    for (int32_t eid : role.expert_ids) {
+        p.rows_by_group[moe_layer_group_profile_key(plan.layer, role_name, eid, plan.layout, device)]++;
+    }
+
+    for (const ggml_sycl::mem_handle & handle : role.handles) {
+        ggml_sycl::resolved_ptr resolved = handle.resolve(device);
+        if (!resolved.ptr) {
+            p.missing_handles++;
+        } else if (resolved.on_device) {
+            p.device_handles++;
+        } else {
+            p.host_handles++;
+        }
+        if (resolved.ptr && resolved.layout != plan.layout) {
+            p.layout_mismatch++;
+        }
+    }
+
+    static thread_local const char * last_executor = nullptr;
+    last_executor                                  = executor;
+
+    // GPT-OSS 20B has 24 MoE layers and three expert roles per layer. The
+    // optional window lets one line describe multiple concurrent decode units,
+    // exposing cross-request grouping opportunities without synchronizing the
+    // queue or touching device memory.
+    const int64_t flush_roles = 72 * static_cast<int64_t>(ggml_sycl_moe_group_profile_window());
+    if (p.roles < flush_roles || p.roles % flush_roles != 0) {
+        return;
+    }
+
+    int64_t groups      = static_cast<int64_t>(p.rows_by_group.size());
+    int64_t hist_1      = 0;
+    int64_t hist_2      = 0;
+    int64_t hist_3      = 0;
+    int64_t hist_4_7    = 0;
+    int64_t hist_8_plus = 0;
+    int64_t max_rows    = 0;
+    for (const auto & kv : p.rows_by_group) {
+        const int64_t rows = kv.second;
+        max_rows           = std::max(max_rows, rows);
+        if (rows == 1) {
+            hist_1++;
+        } else if (rows == 2) {
+            hist_2++;
+        } else if (rows == 3) {
+            hist_3++;
+        } else if (rows <= 7) {
+            hist_4_7++;
+        } else {
+            hist_8_plus++;
+        }
+    }
+
+    const int64_t layers = std::max(p.gate_roles, std::max(p.up_roles, p.down_roles));
+    fprintf(stderr,
+            "[MOE-GROUP-PROFILE] roles=%lld window=%d layers=%lld device=%d layout=%s "
+            "entries=%lld groups=%lld avg_rows_per_group=%.2f max_rows=%lld "
+            "tokens=%lld avg_topk=%.2f roles_by_kind gate=%lld up=%lld down=%lld "
+            "rows_per_group{1=%lld 2=%lld 3=%lld 4_7=%lld 8p=%lld} "
+            "handle_residency device=%lld host=%lld missing=%lld layout_mismatch=%lld "
+            "layouts soa=%lld coalesced=%lld aos=%lld last_executor=%s\n",
+            (long long) p.roles, ggml_sycl_moe_group_profile_window(), (long long) layers, device,
+            ggml_sycl_layout_mode_name(plan.layout), (long long) p.entries, (long long) groups,
+            groups > 0 ? static_cast<double>(p.entries) / static_cast<double>(groups) : 0.0, (long long) max_rows,
+            (long long) p.tokens, p.roles > 0 ? static_cast<double>(p.topk_sum) / static_cast<double>(p.roles) : 0.0,
+            (long long) p.gate_roles, (long long) p.up_roles, (long long) p.down_roles, (long long) hist_1,
+            (long long) hist_2, (long long) hist_3, (long long) hist_4_7, (long long) hist_8_plus,
+            (long long) p.device_handles, (long long) p.host_handles, (long long) p.missing_handles,
+            (long long) p.layout_mismatch, (long long) p.soa_roles, (long long) p.coalesced_roles,
+            (long long) p.aos_roles, last_executor ? last_executor : "?");
+    p = {};
+}
+
 static thread_local std::unordered_map<int, moe_gate_up_pair> g_moe_gate_up_pairs;
 static thread_local std::unordered_set<const ggml_tensor *>   g_moe_precomputed_mmid_skip;
 static thread_local std::unordered_set<const ggml_tensor *>   g_moe_precomputed_node_skip;
@@ -40513,6 +40677,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             direct_gate_decision && direct_up_decision && direct_gate_decision->eligible &&
                                 direct_up_decision->eligible);
                         if (ok_glu) {
+                            const bool direct_xmx_glu_used = direct_xmx_glu_enabled != 0 && direct_gate_decision &&
+                                                             direct_up_decision && direct_gate_decision->eligible &&
+                                                             direct_up_decision->eligible;
+                            const char * gate_up_executor = direct_xmx_glu_used ? "direct-xmx-glu" : "mmvq-pair-glu";
+                            moe_layer_group_profile_record(plan, plan.gate, "gate", gate_up_executor, ctx.device);
+                            moe_layer_group_profile_record(plan, plan.up, "up", gate_up_executor, ctx.device);
                             static const int layer_executor_enabled = [] {
                                 const char * env = std::getenv("GGML_SYCL_MOE_LAYER_EXECUTOR");
                                 return env ? std::atoi(env) : 1;
@@ -40575,6 +40745,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                         static_cast<int>(pair.down_weight->ne[2]), n_ids_pair, pair_layout, ids_device,
                                         ids->nb[0], ids->nb[1], &plan.glu_output.handle);
                                     if (ok_down) {
+                                        moe_layer_group_profile_record(plan, plan.down, "down", "mmvq-down",
+                                                                       ctx.device);
                                         ggml_sycl_moe_down_shadow_capture(ctx, pair.down_dst, layer);
                                     }
                                     if (ok_down && path_trace_enabled != 0) {
@@ -40633,6 +40805,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     ctx, src0, partner_weight, src1, dst, partner_dst, current_ptrs, partner_ptrs, ids_device,
                     static_cast<int>(plan.current.expert_ids.size()), n_ids_pair, ids->nb[0], ids->nb[1]);
                 if (ok) {
+                    moe_layer_group_profile_record(plan, plan.current, current_is_gate ? "gate" : "up", "mmvq-pair-raw",
+                                                   ctx.device);
+                    moe_layer_group_profile_record(plan, plan.partner, current_is_gate ? "up" : "gate", "mmvq-pair-raw",
+                                                   ctx.device);
                     if (path_trace_enabled != 0) {
                         fprintf(stderr,
                                 "[MOE-PAIR] path=pair_raw tensor=%s partner=%s layer=%d layout=%s entries=%zu "
