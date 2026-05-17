@@ -1102,9 +1102,11 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                                      config.kernel_name.find("_nocache") == std::string::npos;
                 const bool direct_xmx          = config.kernel_name.find("_xmx_") != std::string::npos;
                 const bool ignore_weight_scale = config.kernel_name.find("_noscale") != std::string::npos;
+                const bool sparse_expert_slots = config.kernel_name.find("_sparse32") != std::string::npos;
+                const bool use_bias            = config.kernel_name.find("_bias") != std::string::npos;
                 if (!run_mxfp4_pair_glu(weights, activations, m, n, k, token_rows, rows_per_wg, cache_y, direct_xmx,
-                                        ignore_weight_scale, config.validate, config.warmup_iterations,
-                                        config.measure_iterations, queue, metrics, error)) {
+                                        ignore_weight_scale, sparse_expert_slots, use_bias, config.validate,
+                                        config.warmup_iterations, config.measure_iterations, queue, metrics, error)) {
                     out.error = error;
                     return false;
                 }
@@ -1125,9 +1127,10 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                 GeneratedActivations activations         = generate_activations(token_rows, k, k, false, false, true);
                 const int            rows_per_wg         = parse_moe_rows_per_wg(config.kernel_name);
                 const bool           ignore_weight_scale = config.kernel_name.find("_noscale") != std::string::npos;
+                const bool           sparse_expert_slots = config.kernel_name.find("_sparse32") != std::string::npos;
                 if (!run_mxfp4_mmv_id(weights, activations, m, n, k, token_rows, rows_per_wg, config.validate,
-                                      ignore_weight_scale, config.warmup_iterations, config.measure_iterations, queue,
-                                      metrics, error)) {
+                                      ignore_weight_scale, sparse_expert_slots, config.warmup_iterations,
+                                      config.measure_iterations, queue, metrics, error)) {
                     out.error = error;
                     return false;
                 }

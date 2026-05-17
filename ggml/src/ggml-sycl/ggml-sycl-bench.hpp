@@ -64,6 +64,8 @@ struct mxfp4_pair_glu_bench_args {
     const void *         activations_q8_soa = nullptr;
     float *              output             = nullptr;
     const int32_t *      ids                = nullptr;
+    const float *        gate_bias          = nullptr;
+    const float *        up_bias            = nullptr;
 
     int ncols            = 0;
     int ncols_y          = 0;
@@ -72,12 +74,14 @@ struct mxfp4_pair_glu_bench_args {
     int n_tokens         = 1;
     int ne11             = 1;
 
-    int64_t ids_nb0 = 0;
-    int64_t ids_nb1 = 0;
-    int64_t nb11    = 0;
-    int64_t nb12    = 0;
-    int64_t dst_nb1 = 0;
-    int64_t dst_nb2 = 0;
+    int64_t ids_nb0       = 0;
+    int64_t ids_nb1       = 0;
+    int64_t nb11          = 0;
+    int64_t nb12          = 0;
+    int64_t dst_nb1       = 0;
+    int64_t dst_nb2       = 0;
+    int64_t gate_bias_nb1 = 0;
+    int64_t up_bias_nb1   = 0;
 
     int   rows_per_wg         = 4;
     bool  cache_y             = true;

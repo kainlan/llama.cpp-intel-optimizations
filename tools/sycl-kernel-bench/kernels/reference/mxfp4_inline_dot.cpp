@@ -11,6 +11,13 @@
 
 namespace sycl_bench {
 
+static size_t sparse_expert_slot(size_t sel, size_t selected_count, size_t expert_slots) {
+    if (selected_count <= 1) {
+        return 0;
+    }
+    return (sel * (expert_slots - 1)) / (selected_count - 1);
+}
+
 static inline float mxfp4_e8m0_to_fp32_device(uint8_t x) {
     if (x == 0) {
         return sycl::bit_cast<float>(uint32_t{ 0x00400000 });
@@ -444,6 +451,8 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
                         bool                         cache_y,
                         bool                         direct_xmx,
                         bool                         ignore_weight_scale,
+                        bool                         sparse_expert_slots,
+                        bool                         use_bias,
                         bool                         validate,
                         int                          warmup,
                         int                          iterations,
@@ -471,26 +480,31 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     const size_t  token_count    = static_cast<size_t>(n_tokens);
     const size_t  ids_count      = selected_count * token_count;
     const size_t  expert_bytes   = weights.layout.size();
-    const size_t  weight_bytes   = expert_bytes * selected_count;
+    const size_t  expert_slots   = sparse_expert_slots ? std::max<size_t>(32, selected_count) : selected_count;
+    const size_t  weight_bytes   = expert_bytes * expert_slots;
     const size_t  act_bytes      = activations.q8_1.size();
     const size_t  out_count      = static_cast<size_t>(m) * selected_count * token_count;
     const size_t  out_bytes      = out_count * sizeof(float);
+    const size_t  bias_count     = static_cast<size_t>(m) * expert_slots;
+    const size_t  bias_bytes     = bias_count * sizeof(float);
     const int64_t q8_row_bytes   = static_cast<int64_t>(k * sizeof(block_q8_1) / QK8_1);
 
     std::vector<uint8_t> gate_slices(weight_bytes);
     std::vector<uint8_t> up_slices(weight_bytes);
-    for (size_t sel = 0; sel < selected_count; ++sel) {
-        std::copy(weights.layout.begin(), weights.layout.end(), gate_slices.begin() + sel * expert_bytes);
-        std::copy(weights.layout.begin(), weights.layout.end(), up_slices.begin() + sel * expert_bytes);
+    for (size_t slot = 0; slot < expert_slots; ++slot) {
+        std::copy(weights.layout.begin(), weights.layout.end(), gate_slices.begin() + slot * expert_bytes);
+        std::copy(weights.layout.begin(), weights.layout.end(), up_slices.begin() + slot * expert_bytes);
     }
 
     uint8_t *        d_gate      = sycl::malloc_device<uint8_t>(weight_bytes, queue);
     uint8_t *        d_up        = sycl::malloc_device<uint8_t>(weight_bytes, queue);
-    const uint8_t ** d_gate_ptrs = sycl::malloc_device<const uint8_t *>(selected_count, queue);
-    const uint8_t ** d_up_ptrs   = sycl::malloc_device<const uint8_t *>(selected_count, queue);
+    const uint8_t ** d_gate_ptrs = sycl::malloc_device<const uint8_t *>(expert_slots, queue);
+    const uint8_t ** d_up_ptrs   = sycl::malloc_device<const uint8_t *>(expert_slots, queue);
     uint8_t *        d_act       = sycl::malloc_device<uint8_t>(act_bytes, queue);
     int32_t *        d_ids       = sycl::malloc_device<int32_t>(ids_count, queue);
     float *          d_out       = sycl::malloc_device<float>(out_count, queue);
+    float *          d_gate_bias = use_bias ? sycl::malloc_device<float>(bias_count, queue) : nullptr;
+    float *          d_up_bias   = use_bias ? sycl::malloc_device<float>(bias_count, queue) : nullptr;
     float *          d_ref_out   = direct_xmx && validate ? sycl::malloc_device<float>(out_count, queue) : nullptr;
 
     auto cleanup = [&]() {
@@ -515,37 +529,56 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
         if (d_out) {
             sycl::free(d_out, queue);
         }
+        if (d_gate_bias) {
+            sycl::free(d_gate_bias, queue);
+        }
+        if (d_up_bias) {
+            sycl::free(d_up_bias, queue);
+        }
         if (d_ref_out) {
             sycl::free(d_ref_out, queue);
         }
     };
 
     if (!d_gate || !d_up || !d_gate_ptrs || !d_up_ptrs || !d_act || !d_ids || !d_out ||
-        (direct_xmx && validate && !d_ref_out)) {
+        (use_bias && (!d_gate_bias || !d_up_bias)) || (direct_xmx && validate && !d_ref_out)) {
         cleanup();
         error = "device allocation failed for mxfp4_pair_glu.";
         return false;
     }
 
-    std::vector<const uint8_t *> host_gate_ptrs(selected_count);
-    std::vector<const uint8_t *> host_up_ptrs(selected_count);
+    std::vector<const uint8_t *> host_gate_ptrs(expert_slots);
+    std::vector<const uint8_t *> host_up_ptrs(expert_slots);
     std::vector<int32_t>         host_ids(ids_count);
-    for (size_t sel = 0; sel < selected_count; ++sel) {
-        host_gate_ptrs[sel] = d_gate + sel * expert_bytes;
-        host_up_ptrs[sel]   = d_up + sel * expert_bytes;
+    std::vector<float>           host_gate_bias;
+    std::vector<float>           host_up_bias;
+    for (size_t slot = 0; slot < expert_slots; ++slot) {
+        host_gate_ptrs[slot] = d_gate + slot * expert_bytes;
+        host_up_ptrs[slot]   = d_up + slot * expert_bytes;
     }
     for (size_t token = 0; token < token_count; ++token) {
         for (size_t sel = 0; sel < selected_count; ++sel) {
-            host_ids[token * selected_count + sel] = static_cast<int32_t>(sel);
+            const size_t slot = sparse_expert_slots ? sparse_expert_slot(sel, selected_count, expert_slots) : sel;
+            host_ids[token * selected_count + sel] = static_cast<int32_t>(slot);
         }
     }
 
     queue.memcpy(d_gate, gate_slices.data(), weight_bytes);
     queue.memcpy(d_up, up_slices.data(), weight_bytes);
-    queue.memcpy(d_gate_ptrs, host_gate_ptrs.data(), selected_count * sizeof(const uint8_t *));
-    queue.memcpy(d_up_ptrs, host_up_ptrs.data(), selected_count * sizeof(const uint8_t *));
+    queue.memcpy(d_gate_ptrs, host_gate_ptrs.data(), expert_slots * sizeof(const uint8_t *));
+    queue.memcpy(d_up_ptrs, host_up_ptrs.data(), expert_slots * sizeof(const uint8_t *));
     queue.memcpy(d_act, activations.q8_1.data(), act_bytes);
     queue.memcpy(d_ids, host_ids.data(), ids_count * sizeof(int32_t));
+    if (use_bias) {
+        host_gate_bias.resize(bias_count);
+        host_up_bias.resize(bias_count);
+        for (size_t i = 0; i < bias_count; ++i) {
+            host_gate_bias[i] = 0.001f * static_cast<float>((i % 17) - 8);
+            host_up_bias[i]   = 0.001f * static_cast<float>((i % 23) - 11);
+        }
+        queue.memcpy(d_gate_bias, host_gate_bias.data(), bias_bytes);
+        queue.memcpy(d_up_bias, host_up_bias.data(), bias_bytes);
+    }
     queue.memset(d_out, 0, out_bytes);
     queue.wait_and_throw();
 
@@ -568,6 +601,10 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     args.nb12                = q8_row_bytes;
     args.dst_nb1             = static_cast<int64_t>(m * sizeof(float));
     args.dst_nb2             = static_cast<int64_t>(selected_count * static_cast<size_t>(m) * sizeof(float));
+    args.gate_bias           = d_gate_bias;
+    args.up_bias             = d_up_bias;
+    args.gate_bias_nb1       = static_cast<int64_t>(m * sizeof(float));
+    args.up_bias_nb1         = static_cast<int64_t>(m * sizeof(float));
     args.rows_per_wg         = rows_per_wg;
     args.cache_y             = cache_y;
     args.direct_xmx          = direct_xmx;
@@ -607,10 +644,13 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     const double mean_s   = mean_us * 1e-6;
     const double ops = 4.0 * static_cast<double>(m) * static_cast<double>(n_selected) * static_cast<double>(n_tokens) *
                        static_cast<double>(k);
-    const double bytes = 2.0 * static_cast<double>(weight_bytes) * static_cast<double>(n_tokens) +
-                         static_cast<double>(act_bytes) + static_cast<double>(out_bytes) +
-                         2.0 * static_cast<double>(selected_count * sizeof(const uint8_t *)) +
-                         static_cast<double>(ids_count * sizeof(int32_t));
+    const double selected_weight_bytes = static_cast<double>(expert_bytes) * static_cast<double>(selected_count);
+    const double bytes =
+        2.0 * selected_weight_bytes * static_cast<double>(n_tokens) + static_cast<double>(act_bytes) +
+        static_cast<double>(out_bytes) +
+        (use_bias ? 2.0 * static_cast<double>(selected_count * static_cast<size_t>(m) * sizeof(float)) : 0.0) +
+        2.0 * static_cast<double>(selected_count * sizeof(const uint8_t *)) +
+        static_cast<double>(ids_count * sizeof(int32_t));
 
     out.total_us       = mean_us;
     out.gemm_us        = mean_us;
@@ -677,6 +717,7 @@ bool run_mxfp4_mmv_id(const GeneratedWeights &     weights,
                       int                          rows_per_wg,
                       bool                         validate,
                       bool                         ignore_weight_scale,
+                      bool                         sparse_expert_slots,
                       int                          warmup,
                       int                          iterations,
                       sycl::queue &                queue,
@@ -703,19 +744,20 @@ bool run_mxfp4_mmv_id(const GeneratedWeights &     weights,
     const size_t  token_count    = static_cast<size_t>(n_tokens);
     const size_t  ids_count      = selected_count * token_count;
     const size_t  expert_bytes   = weights.layout.size();
-    const size_t  weight_bytes   = expert_bytes * selected_count;
+    const size_t  expert_slots   = sparse_expert_slots ? std::max<size_t>(32, selected_count) : selected_count;
+    const size_t  weight_bytes   = expert_bytes * expert_slots;
     const size_t  act_bytes      = activations.q8_1.size();
     const size_t  out_count      = static_cast<size_t>(m) * selected_count * token_count;
     const size_t  out_bytes      = out_count * sizeof(float);
     const int64_t q8_row_bytes   = static_cast<int64_t>(k * sizeof(block_q8_1) / QK8_1);
 
     std::vector<uint8_t> weight_slices(weight_bytes);
-    for (size_t sel = 0; sel < selected_count; ++sel) {
-        std::copy(weights.layout.begin(), weights.layout.end(), weight_slices.begin() + sel * expert_bytes);
+    for (size_t slot = 0; slot < expert_slots; ++slot) {
+        std::copy(weights.layout.begin(), weights.layout.end(), weight_slices.begin() + slot * expert_bytes);
     }
 
     uint8_t *        d_weights = sycl::malloc_device<uint8_t>(weight_bytes, queue);
-    const uint8_t ** d_ptrs    = sycl::malloc_device<const uint8_t *>(selected_count, queue);
+    const uint8_t ** d_ptrs    = sycl::malloc_device<const uint8_t *>(expert_slots, queue);
     uint8_t *        d_act     = sycl::malloc_device<uint8_t>(act_bytes, queue);
     int32_t *        d_ids     = sycl::malloc_device<int32_t>(ids_count, queue);
     float *          d_out     = sycl::malloc_device<float>(out_count, queue);
@@ -744,19 +786,20 @@ bool run_mxfp4_mmv_id(const GeneratedWeights &     weights,
         return false;
     }
 
-    std::vector<const uint8_t *> host_ptrs(selected_count);
+    std::vector<const uint8_t *> host_ptrs(expert_slots);
     std::vector<int32_t>         host_ids(ids_count);
-    for (size_t sel = 0; sel < selected_count; ++sel) {
-        host_ptrs[sel] = d_weights + sel * expert_bytes;
+    for (size_t slot = 0; slot < expert_slots; ++slot) {
+        host_ptrs[slot] = d_weights + slot * expert_bytes;
     }
     for (size_t token = 0; token < token_count; ++token) {
         for (size_t sel = 0; sel < selected_count; ++sel) {
-            host_ids[token * selected_count + sel] = static_cast<int32_t>(sel);
+            const size_t slot = sparse_expert_slots ? sparse_expert_slot(sel, selected_count, expert_slots) : sel;
+            host_ids[token * selected_count + sel] = static_cast<int32_t>(slot);
         }
     }
 
     queue.memcpy(d_weights, weight_slices.data(), weight_bytes);
-    queue.memcpy(d_ptrs, host_ptrs.data(), selected_count * sizeof(const uint8_t *));
+    queue.memcpy(d_ptrs, host_ptrs.data(), expert_slots * sizeof(const uint8_t *));
     queue.memcpy(d_act, activations.q8_1.data(), act_bytes);
     queue.memcpy(d_ids, host_ids.data(), ids_count * sizeof(int32_t));
     queue.memset(d_out, 0, out_bytes);
@@ -771,7 +814,7 @@ bool run_mxfp4_mmv_id(const GeneratedWeights &     weights,
     args.ncols               = static_cast<int>(k);
     args.ncols_y             = static_cast<int>(k);
     args.nrows_per_expert    = static_cast<int>(m);
-    args.num_experts         = static_cast<int>(n_selected);
+    args.num_experts         = static_cast<int>(expert_slots);
     args.n_ids               = static_cast<int>(n_selected);
     args.n_tokens            = static_cast<int>(n_tokens);
     args.ne11                = 1;
@@ -815,8 +858,9 @@ bool run_mxfp4_mmv_id(const GeneratedWeights &     weights,
     const double mean_s   = mean_us * 1e-6;
     const double ops = 2.0 * static_cast<double>(m) * static_cast<double>(n_selected) * static_cast<double>(n_tokens) *
                        static_cast<double>(k);
-    const double bytes = static_cast<double>(weight_bytes) * static_cast<double>(n_tokens) +
-                         static_cast<double>(act_bytes) + static_cast<double>(out_bytes) +
+    const double selected_weight_bytes = static_cast<double>(expert_bytes) * static_cast<double>(selected_count);
+    const double bytes = selected_weight_bytes * static_cast<double>(n_tokens) + static_cast<double>(act_bytes) +
+                         static_cast<double>(out_bytes) +
                          static_cast<double>(selected_count * sizeof(const uint8_t *)) +
                          static_cast<double>(ids_count * sizeof(int32_t));
 
