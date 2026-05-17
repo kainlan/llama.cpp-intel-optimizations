@@ -11,10 +11,12 @@ B580_SELECTOR="${B580_SELECTOR:-level_zero:0}"
 OUTDIR="${OUTDIR:-/tmp/sycl-moe-roofline.$(date +%Y%m%d-%H%M%S)}"
 
 TOKENS="${TOKENS:-128}"
+PROMPT_TOKENS="${PROMPT_TOKENS:-512}"
 REPS="${REPS:-3}"
 PROFILE_TOKENS="${PROFILE_TOKENS:-16}"
 TG_BATCHES="${TG_BATCHES:-1 4 8 16 32}"
 FA_VALUES="${FA_VALUES:-0 1}"
+RUN_GPTOSS_PP="${RUN_GPTOSS_PP:-1}"
 RUN_MISTRAL="${RUN_MISTRAL:-1}"
 THEORETICAL_BW_GBPS="${THEORETICAL_BW_GBPS:-}"
 MXFP4_ENTRY_BYTES="${MXFP4_ENTRY_BYTES:-}"
@@ -38,10 +40,12 @@ Environment:
   B580_SELECTOR          Mistral guard selector, default level_zero:0
   OUTDIR                 log directory
   TOKENS                 clean TG tokens, default 128
+  PROMPT_TOKENS          clean PP prompt tokens, default 512
   REPS                   clean TG reps, default 3
   PROFILE_TOKENS         synced profile TG tokens, default 16
   TG_BATCHES             space-separated tg-batch values, default "1 4 8 16 32"
   FA_VALUES              space-separated FA values, default "0 1"
+  RUN_GPTOSS_PP=0        skip GPT-OSS PP FA on/off sweep
   RUN_MISTRAL=0          skip B580 Mistral FA guard
   THEORETICAL_BW_GBPS    optional board bandwidth for roofline math
   MXFP4_ENTRY_BYTES      optional bytes per selected expert role; inferred from GGUF when possible
@@ -265,6 +269,10 @@ echo "MXFP4_ENTRY_BYTES=$entry_bytes" >"$OUTDIR/model-mxfp4-bytes.env"
 entries_per_token="${MXFP4_ENTRIES_PER_TOKEN:-0}"
 
 for fa in $FA_VALUES; do
+    if [[ "$RUN_GPTOSS_PP" == "1" ]]; then
+        run_case "gptoss-pp-fa${fa}" "$SELECTOR" "$MODEL" "$PROMPT_TOKENS" 0 "$REPS" "$fa" 1
+    fi
+
     for tgb in $TG_BATCHES; do
         run_case "gptoss-tg-fa${fa}-tgb${tgb}" "$SELECTOR" "$MODEL" 0 "$TOKENS" "$REPS" "$fa" "$tgb"
     done
