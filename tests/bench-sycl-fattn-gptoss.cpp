@@ -376,9 +376,20 @@ static void run_shape(const bench_shape & shape) {
     params.kv_is_fp8          = false;
     params.multi_token_decode = false;
 
-    const std::vector<sample_ref> refs   = build_reference_samples(Q, K, V, mask, sinks, params);
-    const int                     warmup = env_int("GGML_SYCL_FATTN_GPTOSS_WARMUP", 3);
-    const int                     iters  = env_int("GGML_SYCL_FATTN_GPTOSS_ITERS", 10);
+    const std::vector<sample_ref> refs         = build_reference_samples(Q, K, V, mask, sinks, params);
+    const int                     warmup       = env_int("GGML_SYCL_FATTN_GPTOSS_WARMUP", 3);
+    const int                     iters        = env_int("GGML_SYCL_FATTN_GPTOSS_ITERS", 10);
+    const bool                    decode_shape = shape.n_q <= 1;
+    const int                     split_n_partitions =
+        decode_shape ? (params.ne11 + XMX_V2_DECODE_BATCH_KV - 1) / XMX_V2_DECODE_BATCH_KV : 0;
+    const size_t split_partial_elems =
+        decode_shape ? (size_t) params.ne03 * (size_t) params.ne02 * (size_t) params.ne01 * split_n_partitions : 0;
+    float * split_partial_max = decode_shape ? sycl::malloc_device<float>(split_partial_elems, *q) : nullptr;
+    float * split_partial_sum = decode_shape ? sycl::malloc_device<float>(split_partial_elems, *q) : nullptr;
+    float * split_partial_out = decode_shape ? sycl::malloc_device<float>(split_partial_elems * D, *q) : nullptr;
+    if (decode_shape && (!split_partial_max || !split_partial_sum || !split_partial_out)) {
+        throw std::runtime_error("split-KV partial allocation failed");
+    }
 
     std::printf("\nshape=%s D=%d n_q=%d n_kv=%d H_q=%d H_kv=%d sinks=1 logit_softcap=%.1f scale=%.8f\n", shape.name, D,
                 shape.n_q, N_KV, H_Q, H_KV, shape.logit_softcap, params.scale);
@@ -407,8 +418,55 @@ static void run_shape(const bench_shape & shape) {
         return { timing, max_abs, public_abs };
     };
 
-    const bool decode_shape = shape.n_q <= 1;
     if (decode_shape) {
+        (void) run_and_report(
+            "xmx-v2-gqa-split-k32", output_layout::public_qhd,
+            [&]() {
+                const bool ok = params.logit_softcap == 0.0f ?
+                                    launch_fattn_xmx_v2_decode_gqa_split_tk<D, false, sycl::half, 32>(
+                                        ctx, params, q, split_partial_max, split_partial_sum, split_partial_out,
+                                        split_n_partitions) :
+                                    launch_fattn_xmx_v2_decode_gqa_split_tk<D, true, sycl::half, 32>(
+                                        ctx, params, q, split_partial_max, split_partial_sum, split_partial_out,
+                                        split_n_partitions);
+                if (!ok) {
+                    throw std::runtime_error("xmx-v2 gqa-split-k32 decode rejected shape");
+                }
+            },
+            "prototype split-KV with M=1/K=32/N=64");
+
+        (void) run_and_report(
+            "xmx-v2-gqa-split-direct", output_layout::public_qhd,
+            [&]() {
+                const bool ok = params.logit_softcap == 0.0f ?
+                                    launch_fattn_xmx_v2_decode_gqa_split_tk<D, false, sycl::half, 16, true>(
+                                        ctx, params, q, split_partial_max, split_partial_sum, split_partial_out,
+                                        split_n_partitions) :
+                                    launch_fattn_xmx_v2_decode_gqa_split_tk<D, true, sycl::half, 16, true>(
+                                        ctx, params, q, split_partial_max, split_partial_sum, split_partial_out,
+                                        split_n_partitions);
+                if (!ok) {
+                    throw std::runtime_error("xmx-v2 gqa-split-direct decode rejected shape");
+                }
+            },
+            "prototype split-KV direct subgroup P@V");
+
+        (void) run_and_report(
+            "xmx-v2-gqa-split", output_layout::public_qhd,
+            [&]() {
+                const bool ok = params.logit_softcap == 0.0f ?
+                                    launch_fattn_xmx_v2_decode_gqa_split<D, false, sycl::half>(
+                                        ctx, params, q, split_partial_max, split_partial_sum, split_partial_out,
+                                        split_n_partitions) :
+                                    launch_fattn_xmx_v2_decode_gqa_split<D, true, sycl::half>(
+                                        ctx, params, q, split_partial_max, split_partial_sum, split_partial_out,
+                                        split_n_partitions);
+                if (!ok) {
+                    throw std::runtime_error("xmx-v2 gqa-split decode rejected shape");
+                }
+            },
+            "prototype split-KV partial softmax merge");
+
         (void) run_and_report(
             "xmx-v2-gqa-shared", output_layout::public_qhd,
             [&]() {
@@ -542,6 +600,15 @@ static void run_shape(const bench_shape & shape) {
     sycl::free(mask_dev, *q);
     sycl::free(sinks_dev, *q);
     sycl::free(out_dev, *q);
+    if (split_partial_max) {
+        sycl::free(split_partial_max, *q);
+    }
+    if (split_partial_sum) {
+        sycl::free(split_partial_sum, *q);
+    }
+    if (split_partial_out) {
+        sycl::free(split_partial_out, *q);
+    }
 }
 
 int main() {

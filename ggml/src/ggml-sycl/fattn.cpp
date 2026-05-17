@@ -658,6 +658,124 @@ ggml_sycl_fattn_decode_policy ggml_sycl_fattn_fast_decode_policy(const fattn_par
     return { true, ggml_sycl_fattn_decode_policy_reason::OK };
 }
 
+static ggml_sycl_fattn_xmx_decode_kv_layout_plan ggml_sycl_fattn_xmx_decode_kv_reject(
+    const fattn_params &                        params,
+    int                                         D,
+    ggml_sycl_fattn_xmx_decode_kv_layout_reason reason) {
+    return {
+        ggml_sycl_fattn_xmx_decode_kv_layout_kind::REJECT, reason, D, params.ne02, params.ne12, 0, 0, 0, 0, 0, 0, 0, 0
+    };
+}
+
+ggml_sycl_fattn_xmx_decode_kv_layout_plan ggml_sycl_fattn_xmx_decode_kv_layout_plan_from_caps(
+    const fattn_params &                       params,
+    int                                        D,
+    const ggml_sycl_fattn_xmx_decode_kv_caps & caps) {
+    if (params.ne01 != 1) {
+        return ggml_sycl_fattn_xmx_decode_kv_reject(params, D,
+                                                    ggml_sycl_fattn_xmx_decode_kv_layout_reason::NOT_SINGLE_QUERY);
+    }
+    if (params.kv_is_fp8) {
+        return ggml_sycl_fattn_xmx_decode_kv_reject(params, D,
+                                                    ggml_sycl_fattn_xmx_decode_kv_layout_reason::FP8_KV_UNSUPPORTED);
+    }
+    if (params.use_paged_attn || params.use_paged_layout || params.block_table != nullptr ||
+        params.seq_lens != nullptr) {
+        return ggml_sycl_fattn_xmx_decode_kv_reject(params, D,
+                                                    ggml_sycl_fattn_xmx_decode_kv_layout_reason::PAGED_UNSUPPORTED);
+    }
+    if (params.n_seqs > 1 || params.seq_q_offsets != nullptr || params.seq_kv_offsets != nullptr ||
+        params.q_seq_ids != nullptr || params.kv_seq_ids != nullptr) {
+        return ggml_sycl_fattn_xmx_decode_kv_reject(params, D,
+                                                    ggml_sycl_fattn_xmx_decode_kv_layout_reason::MULTI_SEQ_UNSUPPORTED);
+    }
+    if (params.multi_token_decode || params.q_positions != nullptr) {
+        return ggml_sycl_fattn_xmx_decode_kv_reject(
+            params, D, ggml_sycl_fattn_xmx_decode_kv_layout_reason::MULTI_TOKEN_DECODE_UNSUPPORTED);
+    }
+    if (D != 64) {
+        return ggml_sycl_fattn_xmx_decode_kv_reject(params, D,
+                                                    ggml_sycl_fattn_xmx_decode_kv_layout_reason::HEAD_DIM_UNSUPPORTED);
+    }
+    if (params.ne12 <= 0 || params.ne02 <= 0 || params.ne02 % params.ne12 != 0) {
+        return ggml_sycl_fattn_xmx_decode_kv_reject(
+            params, D, ggml_sycl_fattn_xmx_decode_kv_layout_reason::HEAD_RATIO_UNSUPPORTED);
+    }
+    const int n_rep = params.ne02 / params.ne12;
+    if (n_rep <= 0 || n_rep > XMX_V2_DECODE_GQA_MAX) {
+        return ggml_sycl_fattn_xmx_decode_kv_reject(params, D,
+                                                    ggml_sycl_fattn_xmx_decode_kv_layout_reason::GQA_RATIO_UNSUPPORTED);
+    }
+    if (params.Q_type != GGML_TYPE_F16 && params.Q_type != GGML_TYPE_F32) {
+        return ggml_sycl_fattn_xmx_decode_kv_reject(params, D,
+                                                    ggml_sycl_fattn_xmx_decode_kv_layout_reason::Q_TYPE_UNSUPPORTED);
+    }
+    if (params.K_type != GGML_TYPE_F16) {
+        return ggml_sycl_fattn_xmx_decode_kv_reject(params, D,
+                                                    ggml_sycl_fattn_xmx_decode_kv_layout_reason::K_TYPE_UNSUPPORTED);
+    }
+    if (params.V_type != GGML_TYPE_F16) {
+        return ggml_sycl_fattn_xmx_decode_kv_reject(params, D,
+                                                    ggml_sycl_fattn_xmx_decode_kv_layout_reason::V_TYPE_UNSUPPORTED);
+    }
+    if (!caps.k_device_resident || !caps.v_device_resident) {
+        return ggml_sycl_fattn_xmx_decode_kv_reject(
+            params, D, ggml_sycl_fattn_xmx_decode_kv_layout_reason::KV_NOT_DEVICE_RESIDENT);
+    }
+    if (!caps.m1n64_k16_supported) {
+        return ggml_sycl_fattn_xmx_decode_kv_reject(
+            params, D, ggml_sycl_fattn_xmx_decode_kv_layout_reason::DEVICE_XMX_M1N64_UNSUPPORTED);
+    }
+
+    const size_t required_slm_bytes       = fattn_v2_decode_gqa_slm<64>::TOTAL * sizeof(sycl::half);
+    const size_t source_k_bytes_per_block = XMX_V2_DECODE_BATCH_KV * D * sizeof(sycl::half);
+    const size_t packed_k_bytes_per_block = fattn_v2_decode_gqa_slm<64>::K_PACKED_ELEMS * sizeof(sycl::half);
+    if (caps.local_mem_size < required_slm_bytes) {
+        return { ggml_sycl_fattn_xmx_decode_kv_layout_kind::REJECT,
+                 ggml_sycl_fattn_xmx_decode_kv_layout_reason::LOCAL_MEM_UNSUPPORTED,
+                 D,
+                 params.ne02,
+                 params.ne12,
+                 n_rep,
+                 0,
+                 caps.m1n64_k32_supported ? 32 : 0,
+                 XMX_V2_DECODE_BATCH_KV,
+                 required_slm_bytes,
+                 source_k_bytes_per_block,
+                 packed_k_bytes_per_block,
+                 packed_k_bytes_per_block - source_k_bytes_per_block };
+    }
+
+    return { ggml_sycl_fattn_xmx_decode_kv_layout_kind::PACKED_K_MEM_HANDLE,
+             ggml_sycl_fattn_xmx_decode_kv_layout_reason::OK,
+             D,
+             params.ne02,
+             params.ne12,
+             n_rep,
+             16,
+             caps.m1n64_k32_supported ? 32 : 0,
+             XMX_V2_DECODE_BATCH_KV,
+             required_slm_bytes,
+             source_k_bytes_per_block,
+             packed_k_bytes_per_block,
+             packed_k_bytes_per_block - source_k_bytes_per_block };
+}
+
+ggml_sycl_fattn_xmx_decode_kv_layout_plan ggml_sycl_flash_attn_ext_xmx_decode_kv_layout_plan(
+    const fattn_params & params,
+    int                  D,
+    const sycl::device & dev,
+    bool                 k_device_resident,
+    bool                 v_device_resident) {
+    ggml_sycl_fattn_xmx_decode_kv_caps caps;
+    caps.m1n64_k16_supported = fattn_xmx_v2_decode_m1n64_supported(dev, 16);
+    caps.m1n64_k32_supported = fattn_xmx_v2_decode_m1n64_supported(dev, 32);
+    caps.local_mem_size      = dev.get_info<sycl::info::device::local_mem_size>();
+    caps.k_device_resident   = k_device_resident;
+    caps.v_device_resident   = v_device_resident;
+    return ggml_sycl_fattn_xmx_decode_kv_layout_plan_from_caps(params, D, caps);
+}
+
 // ============================================================================
 // Multi-sequence boundary detection from mask
 // ============================================================================

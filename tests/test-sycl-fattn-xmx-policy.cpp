@@ -25,6 +25,23 @@ static bool expect_decode_policy(const fattn_params &                 params,
     return true;
 }
 
+static bool expect_xmx_decode_kv_plan(const fattn_params &                        params,
+                                      int                                         D,
+                                      const ggml_sycl_fattn_xmx_decode_kv_caps &  caps,
+                                      ggml_sycl_fattn_xmx_decode_kv_layout_kind   want_kind,
+                                      ggml_sycl_fattn_xmx_decode_kv_layout_reason want_reason,
+                                      int                                         want_tk,
+                                      const char *                                name) {
+    const ggml_sycl_fattn_xmx_decode_kv_layout_plan got =
+        ggml_sycl_fattn_xmx_decode_kv_layout_plan_from_caps(params, D, caps);
+    if (got.kind != want_kind || got.reason != want_reason || got.preferred_tk != want_tk) {
+        std::fprintf(stderr, "FAIL: %s got kind=%d reason=%d tk=%d want kind=%d reason=%d tk=%d\n", name,
+                     (int) got.kind, (int) got.reason, got.preferred_tk, (int) want_kind, (int) want_reason, want_tk);
+        return false;
+    }
+    return true;
+}
+
 static fattn_params decode_params(int h_q, int h_kv) {
     fattn_params params{};
     params.Q_type    = GGML_TYPE_F16;
@@ -100,6 +117,60 @@ int main() {
         fattn_params params = decode_params(/*h_q=*/30, /*h_kv=*/8);
         ok &= expect_decode_policy(params, 128, false, ggml_sycl_fattn_decode_policy_reason::HEAD_RATIO_UNSUPPORTED,
                                    "non-integral GQA head ratio stays conservative");
+    }
+    {
+        ggml_sycl_fattn_xmx_decode_kv_caps caps;
+        caps.m1n64_k16_supported = true;
+        caps.m1n64_k32_supported = true;
+        caps.local_mem_size      = 128 * 1024;
+        caps.k_device_resident   = true;
+        caps.v_device_resident   = true;
+
+        const fattn_params params = decode_params(/*h_q=*/64, /*h_kv=*/8);
+        ok &=
+            expect_xmx_decode_kv_plan(params, 64, caps, ggml_sycl_fattn_xmx_decode_kv_layout_kind::PACKED_K_MEM_HANDLE,
+                                      ggml_sycl_fattn_xmx_decode_kv_layout_reason::OK, 16,
+                                      "GPT-OSS decode can plan a packed-K mem_handle layout from caps");
+        const ggml_sycl_fattn_xmx_decode_kv_layout_plan plan =
+            ggml_sycl_fattn_xmx_decode_kv_layout_plan_from_caps(params, 64, caps);
+        ok &= expect_eq((int) plan.n_rep, 8, "GPT-OSS GQA ratio captured in XMX decode KV plan");
+        ok &= expect_eq((int) plan.kv_block_tokens, 64, "XMX decode KV plan uses measured 64-token block");
+        ok &= expect_eq((int) plan.source_k_bytes_per_block, 8192, "source K block byte count is explicit");
+        ok &= expect_eq((int) plan.packed_k_bytes_per_block, 16384, "packed K block byte count is explicit");
+        ok &= expect_eq((int) plan.packed_k_overhead_per_block, 8192, "packed K overhead is explicit");
+    }
+    {
+        ggml_sycl_fattn_xmx_decode_kv_caps caps;
+        caps.m1n64_k16_supported = true;
+        caps.local_mem_size      = 128 * 1024;
+        caps.k_device_resident   = false;
+        caps.v_device_resident   = true;
+        ok &= expect_xmx_decode_kv_plan(decode_params(/*h_q=*/64, /*h_kv=*/8), 64, caps,
+                                        ggml_sycl_fattn_xmx_decode_kv_layout_kind::REJECT,
+                                        ggml_sycl_fattn_xmx_decode_kv_layout_reason::KV_NOT_DEVICE_RESIDENT, 0,
+                                        "host-resident K rejects packed device XMX decode layout");
+    }
+    {
+        ggml_sycl_fattn_xmx_decode_kv_caps caps;
+        caps.m1n64_k16_supported = true;
+        caps.local_mem_size      = 4 * 1024;
+        caps.k_device_resident   = true;
+        caps.v_device_resident   = true;
+        ok &= expect_xmx_decode_kv_plan(decode_params(/*h_q=*/64, /*h_kv=*/8), 64, caps,
+                                        ggml_sycl_fattn_xmx_decode_kv_layout_kind::REJECT,
+                                        ggml_sycl_fattn_xmx_decode_kv_layout_reason::LOCAL_MEM_UNSUPPORTED, 0,
+                                        "insufficient SLM rejects packed device XMX decode layout");
+    }
+    {
+        ggml_sycl_fattn_xmx_decode_kv_caps caps;
+        caps.m1n64_k16_supported = false;
+        caps.local_mem_size      = 128 * 1024;
+        caps.k_device_resident   = true;
+        caps.v_device_resident   = true;
+        ok &= expect_xmx_decode_kv_plan(decode_params(/*h_q=*/64, /*h_kv=*/8), 64, caps,
+                                        ggml_sycl_fattn_xmx_decode_kv_layout_kind::REJECT,
+                                        ggml_sycl_fattn_xmx_decode_kv_layout_reason::DEVICE_XMX_M1N64_UNSUPPORTED, 0,
+                                        "missing M=1,N=64,K=16 matrix capability rejects XMX decode KV layout");
     }
 
     std::printf("SYCL fattn policy tests: %s\n", ok ? "PASS" : "FAIL");

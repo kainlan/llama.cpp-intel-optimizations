@@ -11,6 +11,7 @@
 #include "fattn-common.hpp"
 
 #include <cstddef>
+#include <cstdint>
 
 // Check if flash attention is supported for the given tensor configuration
 bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst);
@@ -50,6 +51,70 @@ struct ggml_sycl_fattn_decode_policy {
 // fallback and use the faster ESIMD f16 path. This is intentionally a
 // descriptor/capability policy, not a device-name or model-name policy.
 ggml_sycl_fattn_decode_policy ggml_sycl_fattn_fast_decode_policy(const fattn_params & params, int D);
+
+enum class ggml_sycl_fattn_xmx_decode_kv_layout_kind {
+    PUBLIC_CONTIGUOUS,
+    PACKED_K_MEM_HANDLE,
+    REJECT,
+};
+
+enum class ggml_sycl_fattn_xmx_decode_kv_layout_reason {
+    OK,
+    NOT_SINGLE_QUERY,
+    FP8_KV_UNSUPPORTED,
+    PAGED_UNSUPPORTED,
+    MULTI_SEQ_UNSUPPORTED,
+    MULTI_TOKEN_DECODE_UNSUPPORTED,
+    HEAD_DIM_UNSUPPORTED,
+    HEAD_RATIO_UNSUPPORTED,
+    GQA_RATIO_UNSUPPORTED,
+    Q_TYPE_UNSUPPORTED,
+    K_TYPE_UNSUPPORTED,
+    V_TYPE_UNSUPPORTED,
+    KV_NOT_DEVICE_RESIDENT,
+    DEVICE_XMX_M1N64_UNSUPPORTED,
+    LOCAL_MEM_UNSUPPORTED,
+};
+
+struct ggml_sycl_fattn_xmx_decode_kv_caps {
+    bool   m1n64_k16_supported = false;
+    bool   m1n64_k32_supported = false;
+    size_t local_mem_size      = 0;
+    bool   k_device_resident   = false;
+    bool   v_device_resident   = false;
+};
+
+struct ggml_sycl_fattn_xmx_decode_kv_layout_plan {
+    ggml_sycl_fattn_xmx_decode_kv_layout_kind   kind;
+    ggml_sycl_fattn_xmx_decode_kv_layout_reason reason;
+    int                                         D;
+    int                                         H_q;
+    int                                         H_kv;
+    int                                         n_rep;
+    int                                         preferred_tk;
+    int                                         alternate_tk;
+    int                                         kv_block_tokens;
+    size_t                                      required_slm_bytes;
+    size_t                                      source_k_bytes_per_block;
+    size_t                                      packed_k_bytes_per_block;
+    size_t                                      packed_k_overhead_per_block;
+};
+
+// Plan the future XMX decode KV layout using descriptor and device capability
+// facts only.  PACKED_K_MEM_HANDLE means the planner must materialize a packed
+// K allocation owned by a smart mem_handle before dispatch/graph recording;
+// this function does not allocate and default dispatch remains unchanged.
+ggml_sycl_fattn_xmx_decode_kv_layout_plan ggml_sycl_fattn_xmx_decode_kv_layout_plan_from_caps(
+    const fattn_params &                       params,
+    int                                        D,
+    const ggml_sycl_fattn_xmx_decode_kv_caps & caps);
+
+ggml_sycl_fattn_xmx_decode_kv_layout_plan ggml_sycl_flash_attn_ext_xmx_decode_kv_layout_plan(
+    const fattn_params & params,
+    int                  D,
+    const sycl::device & dev,
+    bool                 k_device_resident,
+    bool                 v_device_resident);
 
 #if GGML_SYCL_DNNL
 enum class ggml_sycl_onednn_fa_layout_kind {
