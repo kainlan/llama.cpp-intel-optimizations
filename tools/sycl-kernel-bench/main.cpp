@@ -1,3 +1,11 @@
+#include "benchmark_harness.hpp"
+#include "dpas_config.hpp"
+#include "ggml-sycl.h"
+#include "ggml.h"
+#include "kernel_registry.hpp"
+#include "model_shapes.hpp"
+#include "output_formats.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -6,15 +14,6 @@
 #include <limits>
 #include <string>
 #include <vector>
-
-#include "benchmark_harness.hpp"
-#include "dpas_config.hpp"
-#include "kernel_registry.hpp"
-#include "model_shapes.hpp"
-#include "output_formats.hpp"
-
-#include "ggml-sycl.h"
-#include "ggml.h"
 
 using namespace sycl_bench;
 
@@ -26,88 +25,90 @@ enum class SampleStrategy {
 };
 
 struct CmdParams {
-    std::string kernel_name = "mmvq_aos";
-    ggml_type   quant_type = GGML_TYPE_Q4_0;
-    std::vector<int64_t> batch_sizes = { 1 };
-    int64_t dim_m = 4096;
-    int64_t dim_n = 4096;
-    int64_t dim_k = 4096;
-    int warmup = 10;
-    int iterations = 100;
-    MemoryMode memory_mode = MemoryMode::USM_DEVICE;
-    OutputFormat output_format = OutputFormat::CSV;
-    bool validate = false;
-    double abs_tol = 1e-2;
-    double rel_tol = 1e-2;
-    bool list_devices = false;
-    bool include_percentiles = false;
-    bool include_ref_metrics = false;
-    bool show_help = false;
-    int device_id = -1;
-    size_t transfer_bytes = 0;
-    int64_t roofline_elements = 0;
-    int roofline_ops = 0;
-    double xmx_peak_tops = 0.0;
-    double expect_tps = -1.0;
-    double expect_tops = -1.0;
-    double expect_bandwidth_gbps = -1.0;
-    double expect_xmx_util_pct = -1.0;
-    std::string dpas_config_name;
-    DpasType dpas_type_a = DpasType::INT8;
-    DpasType dpas_type_b = DpasType::INT8;
-    DpasAccType dpas_type_acc = DpasAccType::INT32;
-    DpasMemoryPattern dpas_memory_pattern = DpasMemoryPattern::DIRECT_GLOBAL;
-    DpasGrfMode dpas_grf_mode = DpasGrfMode::GRF_128;
-    int dpas_repeat = 8;
-    int dpas_n_tile_repeats = 1;
-    bool dpas_misaligned = false;
-    bool dpas_device_opt = false;
-    bool dpas_autotune = false;
-    bool dpas_autotune_force = false;
-    DpasTuneMetric dpas_autotune_metric = DpasTuneMetric::THROUGHPUT;
-    std::string dpas_autotune_cache = "benchmark_results/dpas_tuning_cache.jsonl";
-    int dpas_autotune_override_ntiles = 0;
-    int dpas_autotune_override_prefetch = 0;
-    bool dpas_memory_explicit = false;
-    bool dpas_ntiles_explicit = false;
-    bool dpas_grf_explicit = false;
-    bool dpas_acc_explicit = false;
-    std::string model_path;
-    std::string model_filter;
-    int model_max_shapes = 0;
-    bool model_dedup = false;
-    bool model_include_fp = false;
-    bool quant_type_overridden = false;
-    std::string emit_json_path;
-    SampleStrategy sample_strategy = SampleStrategy::CUSTOM;
+    std::string          kernel_name           = "mmvq_aos";
+    ggml_type            quant_type            = GGML_TYPE_Q4_0;
+    std::vector<int64_t> batch_sizes           = { 1 };
+    int64_t              dim_m                 = 4096;
+    int64_t              dim_n                 = 4096;
+    int64_t              dim_k                 = 4096;
+    int                  warmup                = 10;
+    int                  iterations            = 100;
+    MemoryMode           memory_mode           = MemoryMode::USM_DEVICE;
+    OutputFormat         output_format         = OutputFormat::CSV;
+    bool                 validate              = false;
+    double               abs_tol               = 1e-2;
+    double               rel_tol               = 1e-2;
+    bool                 list_devices          = false;
+    bool                 include_percentiles   = false;
+    bool                 include_ref_metrics   = false;
+    bool                 show_help             = false;
+    int                  device_id             = -1;
+    size_t               transfer_bytes        = 0;
+    int64_t              roofline_elements     = 0;
+    int                  roofline_ops          = 0;
+    double               xmx_peak_tops         = 0.0;
+    double               expect_tps            = -1.0;
+    double               expect_tops           = -1.0;
+    double               expect_bandwidth_gbps = -1.0;
+    double               expect_xmx_util_pct   = -1.0;
+    std::string          dpas_config_name;
+    DpasType             dpas_type_a                     = DpasType::INT8;
+    DpasType             dpas_type_b                     = DpasType::INT8;
+    DpasAccType          dpas_type_acc                   = DpasAccType::INT32;
+    DpasMemoryPattern    dpas_memory_pattern             = DpasMemoryPattern::DIRECT_GLOBAL;
+    DpasGrfMode          dpas_grf_mode                   = DpasGrfMode::GRF_128;
+    int                  dpas_repeat                     = 8;
+    int                  dpas_n_tile_repeats             = 1;
+    bool                 dpas_misaligned                 = false;
+    bool                 dpas_device_opt                 = false;
+    bool                 dpas_autotune                   = false;
+    bool                 dpas_autotune_force             = false;
+    DpasTuneMetric       dpas_autotune_metric            = DpasTuneMetric::THROUGHPUT;
+    std::string          dpas_autotune_cache             = "benchmark_results/dpas_tuning_cache.jsonl";
+    int                  dpas_autotune_override_ntiles   = 0;
+    int                  dpas_autotune_override_prefetch = 0;
+    bool                 dpas_memory_explicit            = false;
+    bool                 dpas_ntiles_explicit            = false;
+    bool                 dpas_grf_explicit               = false;
+    bool                 dpas_acc_explicit               = false;
+    std::string          model_path;
+    std::string          model_filter;
+    int                  model_max_shapes      = 0;
+    bool                 model_dedup           = false;
+    bool                 model_include_fp      = false;
+    bool                 quant_type_overridden = false;
+    std::string          emit_json_path;
+    SampleStrategy       sample_strategy = SampleStrategy::CUSTOM;
 };
 
 struct KernelRunSummary {
     std::string kernel;
-    bool ok = false;
+    bool        ok = false;
     std::string error;
-    double latency_us = 0.0;
-    double throughput_tps = 0.0;
-    double throughput_tops = 0.0;
-    double bandwidth_gbps = 0.0;
-    double xmx_util_pct = 0.0;
+    double      latency_us      = 0.0;
+    double      throughput_tps  = 0.0;
+    double      throughput_tops = 0.0;
+    double      bandwidth_gbps  = 0.0;
+    double      xmx_util_pct    = 0.0;
 };
 
 struct ShapeSummary {
-    std::string tensor;
-    ggml_type type = GGML_TYPE_F32;
-    int64_t dim_m = 0;
-    int64_t dim_n = 0;
-    int64_t dim_k = 0;
-    int64_t instances = 1;
+    std::string                   tensor;
+    ggml_type                     type      = GGML_TYPE_F32;
+    int64_t                       dim_m     = 0;
+    int64_t                       dim_n     = 0;
+    int64_t                       dim_k     = 0;
+    int64_t                       instances = 1;
     std::vector<KernelRunSummary> runs;
-    std::string winner;
+    std::string                   winner;
 };
 
 static void print_usage(const char * argv0) {
     std::fprintf(stderr,
                  "Usage: %s [options]\n"
-                 "  --kernel=mmvq_aos|mmvq_aos_baseline|mmvq_soa|mmvq_soa_baseline|mmvq_coalesced|mmvq_slm_cached|mmvq_prefetch|mmvq_wide_load|mmvq_esimd_block_load|mmvq_esimd_slm|"
+                 "  "
+                 "--kernel=mmvq_aos|mmvq_aos_baseline|mmvq_soa|mmvq_soa_baseline|mmvq_coalesced|mmvq_slm_cached|mmvq_"
+                 "prefetch|mmvq_wide_load|mmvq_esimd_block_load|mmvq_esimd_slm|"
                  "mmvq_xmx_tile_8x8|mmvq_xmx_tile_16x16|mmvq_xmx_aos_direct|mmvq_xmx_soa_direct|mmvq_xmx_double_buffer|"
                  "mmvq_esimd_dpas_1x16x32|mmvq_esimd_dpas_8x16x32|mmvq_esimd_dpas_chained|"
                  "mmvq_xmx_tile_64x64|mmvq_xmx_register_accum|mmvq_xmx_multi_wg|mmvq_xmx_persistent|"
@@ -119,7 +120,7 @@ static void print_usage(const char * argv0) {
                  "onednn_fp16_gemm|onednn_int8_gemm|onednn_woq_gemm|onednn_mxfp4_gemm|"
                  "onednn_mxfp4_f32scale_gemm|unified_matmul|memory_bandwidth|"
                  "mxfp4_decode_aos|mxfp4_decode_soa|mxfp4_decode_f16_aos|mxfp4_decode_f16_soa|roofline_compute|"
-                 "mxfp4_inline_dot_aos|mxfp4_inline_dot_soa|"
+                 "mxfp4_inline_dot_aos|mxfp4_inline_dot_soa|mxfp4_selected_read_aos|mxfp4_selected_read_soa|"
                  "dpas_baseline|dpas_sweep|dpas_memory_patterns (comma-separated to compare)\n"
                  "  --quant=Q4_0|Q8_0|Q6_K|Q4_K|Q5_K|Q2_K|Q3_K|Q4_1|Q5_0|Q5_1|MXFP4\n"
                  "  --batch=1,4,8,16,32,64\n"
@@ -146,10 +147,12 @@ static void print_usage(const char * argv0) {
                  "  --dpas-type-a=int8|fp16|bf16\n"
                  "  --dpas-type-b=int8|fp16|bf16\n"
                  "  --dpas-acc=int32|float\n"
-                "  --dpas-memory=direct_global|slm_buffer|reg_prefetch|double_buffer|lsc_streaming|lsc_prefetch|lsc_prefetch2|lsc_prefetch3|lsc_prefetch4|lsc_prefetch5|lsc_prefetch6|lsc_prefetch8|lsc_prefetch10\n"
+                 "  "
+                 "--dpas-memory=direct_global|slm_buffer|reg_prefetch|double_buffer|lsc_streaming|lsc_prefetch|lsc_"
+                 "prefetch2|lsc_prefetch3|lsc_prefetch4|lsc_prefetch5|lsc_prefetch6|lsc_prefetch8|lsc_prefetch10\n"
                  "  --dpas-grf=128|256\n"
                  "  --dpas-repeat=1|2|4|8\n"
-                "  --dpas-ntiles=1|2|4|8 (N tiles per work-item)\n"
+                 "  --dpas-ntiles=1|2|4|8 (N tiles per work-item)\n"
                  "  --dpas-misaligned\n"
                  "  --dpas-device-opt (heuristic tuning for dpas_memory_patterns)\n"
                  "  --dpas-autotune (autotune ntiles/prefetch for dpas_memory_patterns)\n"
@@ -204,17 +207,39 @@ static bool parse_int_list(const std::string & input, std::vector<int64_t> & out
 
 static ggml_type parse_quant_type(const std::string & input) {
     const std::string q = to_lower(input);
-    if (q == "q4_0") return GGML_TYPE_Q4_0;
-    if (q == "q4_1") return GGML_TYPE_Q4_1;
-    if (q == "q5_0") return GGML_TYPE_Q5_0;
-    if (q == "q5_1") return GGML_TYPE_Q5_1;
-    if (q == "q8_0") return GGML_TYPE_Q8_0;
-    if (q == "q2_k") return GGML_TYPE_Q2_K;
-    if (q == "q3_k") return GGML_TYPE_Q3_K;
-    if (q == "q4_k") return GGML_TYPE_Q4_K;
-    if (q == "q5_k") return GGML_TYPE_Q5_K;
-    if (q == "q6_k") return GGML_TYPE_Q6_K;
-    if (q == "mxfp4") return GGML_TYPE_MXFP4;
+    if (q == "q4_0") {
+        return GGML_TYPE_Q4_0;
+    }
+    if (q == "q4_1") {
+        return GGML_TYPE_Q4_1;
+    }
+    if (q == "q5_0") {
+        return GGML_TYPE_Q5_0;
+    }
+    if (q == "q5_1") {
+        return GGML_TYPE_Q5_1;
+    }
+    if (q == "q8_0") {
+        return GGML_TYPE_Q8_0;
+    }
+    if (q == "q2_k") {
+        return GGML_TYPE_Q2_K;
+    }
+    if (q == "q3_k") {
+        return GGML_TYPE_Q3_K;
+    }
+    if (q == "q4_k") {
+        return GGML_TYPE_Q4_K;
+    }
+    if (q == "q5_k") {
+        return GGML_TYPE_Q5_K;
+    }
+    if (q == "q6_k") {
+        return GGML_TYPE_Q6_K;
+    }
+    if (q == "mxfp4") {
+        return GGML_TYPE_MXFP4;
+    }
     return GGML_TYPE_COUNT;
 }
 
@@ -237,9 +262,18 @@ static bool parse_memory_mode(const std::string & input, MemoryMode & mode) {
 
 static bool parse_output_format(const std::string & input, OutputFormat & fmt) {
     const std::string v = to_lower(input);
-    if (v == "csv") { fmt = OutputFormat::CSV; return true; }
-    if (v == "json") { fmt = OutputFormat::JSON; return true; }
-    if (v == "jsonl") { fmt = OutputFormat::JSONL; return true; }
+    if (v == "csv") {
+        fmt = OutputFormat::CSV;
+        return true;
+    }
+    if (v == "json") {
+        fmt = OutputFormat::JSON;
+        return true;
+    }
+    if (v == "jsonl") {
+        fmt = OutputFormat::JSONL;
+        return true;
+    }
     return false;
 }
 
@@ -314,11 +348,7 @@ static bool is_skippable_error(const std::string & error) {
         return true;
     }
     static const char * tokens[] = {
-        "not enabled",
-        "requires",
-        "supports",
-        "not supported",
-        "Kernel layout not supported",
+        "not enabled", "requires", "supports", "not supported", "Kernel layout not supported",
     };
     for (const char * token : tokens) {
         if (error.find(token) != std::string::npos) {
@@ -336,7 +366,7 @@ static std::string pick_winner(const ShapeSummary & summary) {
             break;
         }
     }
-    double best_score = use_tops ? -1.0 : std::numeric_limits<double>::infinity();
+    double      best_score = use_tops ? -1.0 : std::numeric_limits<double>::infinity();
     std::string winner;
     for (const auto & run : summary.runs) {
         if (!run.ok) {
@@ -346,12 +376,12 @@ static std::string pick_winner(const ShapeSummary & summary) {
         if (use_tops) {
             if (score > best_score) {
                 best_score = score;
-                winner = run.kernel;
+                winner     = run.kernel;
             }
         } else {
             if (score < best_score) {
                 best_score = score;
-                winner = run.kernel;
+                winner     = run.kernel;
             }
         }
     }
@@ -379,11 +409,8 @@ static void write_summary_json(const std::string & path, const std::vector<Shape
                      "      \"dim_k\": %lld,\n"
                      "      \"tensor_instances\": %lld,\n"
                      "      \"winner\": ",
-                     json_escape(entry.tensor).c_str(),
-                     ggml_type_name(entry.type),
-                     static_cast<long long>(entry.dim_m),
-                     static_cast<long long>(entry.dim_n),
-                     static_cast<long long>(entry.dim_k),
+                     json_escape(entry.tensor).c_str(), ggml_type_name(entry.type), static_cast<long long>(entry.dim_m),
+                     static_cast<long long>(entry.dim_n), static_cast<long long>(entry.dim_k),
                      static_cast<long long>(entry.instances));
         if (entry.winner.empty()) {
             std::fputs("null,\n", out);
@@ -399,9 +426,7 @@ static void write_summary_json(const std::string & path, const std::vector<Shape
                          "          \"ok\": %s,\n"
                          "          \"error\": \"%s\",\n"
                          "          \"latency_us\": ",
-                         json_escape(run.kernel).c_str(),
-                         run.ok ? "true" : "false",
-                         json_escape(run.error).c_str());
+                         json_escape(run.kernel).c_str(), run.ok ? "true" : "false", json_escape(run.error).c_str());
             print_json_number(out, run.latency_us);
             std::fprintf(out, ",\n          \"throughput_tps\": ");
             print_json_number(out, run.throughput_tps);
@@ -489,7 +514,7 @@ static bool parse_args(int argc, char ** argv, CmdParams & params) {
                 return true;
             }
             if (key == "--quant") {
-                params.quant_type = parse_quant_type(value);
+                params.quant_type            = parse_quant_type(value);
                 params.quant_type_overridden = true;
                 return params.quant_type != GGML_TYPE_COUNT;
             }
@@ -498,7 +523,9 @@ static bool parse_args(int argc, char ** argv, CmdParams & params) {
             }
             if (key == "--dim") {
                 const int64_t dim = std::strtoll(value.c_str(), nullptr, 10);
-                if (dim <= 0) return false;
+                if (dim <= 0) {
+                    return false;
+                }
                 params.dim_m = dim;
                 params.dim_n = dim;
                 params.dim_k = dim;
@@ -644,16 +671,13 @@ static bool parse_args(int argc, char ** argv, CmdParams & params) {
                 if (params.dpas_autotune_override_ntiles == 0) {
                     return true;
                 }
-                return params.dpas_autotune_override_ntiles == 1 ||
-                       params.dpas_autotune_override_ntiles == 2 ||
-                       params.dpas_autotune_override_ntiles == 4 ||
-                       params.dpas_autotune_override_ntiles == 8;
+                return params.dpas_autotune_override_ntiles == 1 || params.dpas_autotune_override_ntiles == 2 ||
+                       params.dpas_autotune_override_ntiles == 4 || params.dpas_autotune_override_ntiles == 8;
             }
             if (key == "--dpas-autotune-override-prefetch") {
                 params.dpas_autotune_override_prefetch = std::atoi(value.c_str());
                 return params.dpas_autotune_override_prefetch >= 0 &&
-                       (params.dpas_autotune_override_prefetch <= 6 ||
-                        params.dpas_autotune_override_prefetch == 8 ||
+                       (params.dpas_autotune_override_prefetch <= 6 || params.dpas_autotune_override_prefetch == 8 ||
                         params.dpas_autotune_override_prefetch == 10);
             }
             if (key == "--abs-tol") {
@@ -671,7 +695,7 @@ static bool parse_args(int argc, char ** argv, CmdParams & params) {
 
         size_t eq = arg.find('=');
         if (eq != std::string::npos) {
-            const std::string key = arg.substr(0, eq);
+            const std::string key   = arg.substr(0, eq);
             const std::string value = arg.substr(eq + 1);
             if (!parse_kv(key, value)) {
                 params.show_help = true;
@@ -683,16 +707,14 @@ static bool parse_args(int argc, char ** argv, CmdParams & params) {
         if (arg == "--kernel" || arg == "--quant" || arg == "--batch" || arg == "--dim" || arg == "--dim_m" ||
             arg == "--dim_n" || arg == "--dim_k" || arg == "--model" || arg == "--model-filter" ||
             arg == "--model-max-shapes" || arg == "--limit-shapes" || arg == "--emit-json" ||
-            arg == "--sample-strategy" || arg == "--iterations" || arg == "--warmup" ||
-            arg == "--memory" || arg == "--output" || arg == "--device" || arg == "--bytes" ||
-            arg == "--elements" || arg == "--ops" || arg == "--xmx-peak-tops" || arg == "--expect-tps" ||
-            arg == "--expect-tops" ||
+            arg == "--sample-strategy" || arg == "--iterations" || arg == "--warmup" || arg == "--memory" ||
+            arg == "--output" || arg == "--device" || arg == "--bytes" || arg == "--elements" || arg == "--ops" ||
+            arg == "--xmx-peak-tops" || arg == "--expect-tps" || arg == "--expect-tops" ||
             arg == "--expect-bandwidth" || arg == "--expect-xmx-util" || arg == "--abs-tol" || arg == "--rel-tol" ||
             arg == "--dpas-config" || arg == "--dpas-type-a" || arg == "--dpas-type-b" || arg == "--dpas-acc" ||
             arg == "--dpas-memory" || arg == "--dpas-grf" || arg == "--dpas-repeat" || arg == "--dpas-ntiles" ||
             arg == "--dpas-autotune-cache" || arg == "--dpas-autotune-metric" ||
-            arg == "--dpas-autotune-override-ntiles" ||
-            arg == "--dpas-autotune-override-prefetch") {
+            arg == "--dpas-autotune-override-ntiles" || arg == "--dpas-autotune-override-prefetch") {
             const char * value = require_value(arg.c_str());
             if (!value) {
                 return false;
@@ -714,23 +736,23 @@ static bool parse_args(int argc, char ** argv, CmdParams & params) {
 static bool check_expectations(const CmdParams & params, const BenchmarkOutput & output) {
     bool ok = true;
     if (params.expect_tps >= 0.0 && output.result.throughput_tps < params.expect_tps) {
-        std::fprintf(stderr, "Throughput TPS %.3f below expectation %.3f\n",
-                     output.result.throughput_tps, params.expect_tps);
+        std::fprintf(stderr, "Throughput TPS %.3f below expectation %.3f\n", output.result.throughput_tps,
+                     params.expect_tps);
         ok = false;
     }
     if (params.expect_tops >= 0.0 && output.result.throughput_tops < params.expect_tops) {
-        std::fprintf(stderr, "Throughput TOPS %.3f below expectation %.3f\n",
-                     output.result.throughput_tops, params.expect_tops);
+        std::fprintf(stderr, "Throughput TOPS %.3f below expectation %.3f\n", output.result.throughput_tops,
+                     params.expect_tops);
         ok = false;
     }
     if (params.expect_bandwidth_gbps >= 0.0 && output.result.bandwidth_gbps < params.expect_bandwidth_gbps) {
-        std::fprintf(stderr, "Bandwidth GB/s %.3f below expectation %.3f\n",
-                     output.result.bandwidth_gbps, params.expect_bandwidth_gbps);
+        std::fprintf(stderr, "Bandwidth GB/s %.3f below expectation %.3f\n", output.result.bandwidth_gbps,
+                     params.expect_bandwidth_gbps);
         ok = false;
     }
     if (params.expect_xmx_util_pct >= 0.0 && output.result.xmx_util_pct < params.expect_xmx_util_pct) {
-        std::fprintf(stderr, "XMX util %.2f%% below expectation %.2f%%\n",
-                     output.result.xmx_util_pct, params.expect_xmx_util_pct);
+        std::fprintf(stderr, "XMX util %.2f%% below expectation %.2f%%\n", output.result.xmx_util_pct,
+                     params.expect_xmx_util_pct);
         ok = false;
     }
     return ok;
@@ -766,16 +788,15 @@ int main(int argc, char ** argv) {
     const bool compare_mode = kernels.size() > 1 || !params.emit_json_path.empty();
 
     if (params.quant_type == GGML_TYPE_COUNT) {
-        std::fprintf(stderr, "Unknown quant type. Use --quant=Q4_0|Q8_0|Q6_K|Q4_K|Q5_K|Q2_K|Q3_K|Q4_1|Q5_0|Q5_1|MXFP4\\n");
+        std::fprintf(stderr,
+                     "Unknown quant type. Use --quant=Q4_0|Q8_0|Q6_K|Q4_K|Q5_K|Q2_K|Q3_K|Q4_1|Q5_0|Q5_1|MXFP4\\n");
         return 1;
     }
 
     if (!params.model_path.empty()) {
         for (const auto * kernel : kernels) {
-            if (kernel->kind == KernelKind::MEMORY_BANDWIDTH ||
-                kernel->kind == KernelKind::MXFP4_DECODE_BANDWIDTH ||
-                kernel->kind == KernelKind::ROOFLINE_COMPUTE ||
-                kernel->kind == KernelKind::DPAS_EXPLORATION) {
+            if (kernel->kind == KernelKind::MEMORY_BANDWIDTH || kernel->kind == KernelKind::MXFP4_DECODE_BANDWIDTH ||
+                kernel->kind == KernelKind::ROOFLINE_COMPUTE || kernel->kind == KernelKind::DPAS_EXPLORATION) {
                 std::fprintf(stderr, "--model is not supported for the selected kernel kind.\\n");
                 return 1;
             }
@@ -784,7 +805,7 @@ int main(int argc, char ** argv) {
     }
 
     BenchmarkHarness harness;
-    bool printed_header = false;
+    bool             printed_header = false;
 
     std::vector<ModelMatmulShape> shapes;
     if (!params.model_path.empty()) {
@@ -796,9 +817,7 @@ int main(int argc, char ** argv) {
 
         if (!params.model_include_fp) {
             shapes.erase(std::remove_if(shapes.begin(), shapes.end(),
-                                        [](const ModelMatmulShape & s) {
-                                            return !ggml_is_quantized(s.type);
-                                        }),
+                                        [](const ModelMatmulShape & s) { return !ggml_is_quantized(s.type); }),
                          shapes.end());
         }
 
@@ -817,9 +836,7 @@ int main(int argc, char ** argv) {
             for (const auto & shape : shapes) {
                 bool seen = false;
                 for (const auto & existing : deduped) {
-                    if (existing.type == shape.type &&
-                        existing.dim_m == shape.dim_m &&
-                        existing.dim_k == shape.dim_k) {
+                    if (existing.type == shape.type && existing.dim_m == shape.dim_m && existing.dim_k == shape.dim_k) {
                         seen = true;
                         break;
                     }
@@ -832,8 +849,8 @@ int main(int argc, char ** argv) {
         }
 
         if (kernels.size() == 1) {
-            const KernelInfo * kernel = kernels.front();
-            const int64_t q4_block = ggml_blck_size(GGML_TYPE_Q4_0);
+            const KernelInfo * kernel   = kernels.front();
+            const int64_t      q4_block = ggml_blck_size(GGML_TYPE_Q4_0);
             shapes.erase(std::remove_if(shapes.begin(), shapes.end(),
                                         [&](const ModelMatmulShape & s) {
                                             switch (kernel->kind) {
@@ -841,6 +858,7 @@ int main(int argc, char ** argv) {
                                                     return s.type != GGML_TYPE_Q4_0;
                                                 case KernelKind::ONEDNN_MXFP4_GEMM:
                                                 case KernelKind::MXFP4_INLINE_DOT:
+                                                case KernelKind::MXFP4_SELECTED_READ:
                                                     return s.type != GGML_TYPE_MXFP4;
                                                 case KernelKind::UNIFIED_MATMUL:
                                                     return s.type != GGML_TYPE_Q4_0 ||
@@ -857,19 +875,16 @@ int main(int argc, char ** argv) {
                          shapes.end());
         }
 
-        std::sort(shapes.begin(), shapes.end(),
-                  [](const ModelMatmulShape & a, const ModelMatmulShape & b) {
-                      const long double size_a =
-                          static_cast<long double>(a.dim_m) * static_cast<long double>(a.dim_k) *
-                          static_cast<long double>(a.instances);
-                      const long double size_b =
-                          static_cast<long double>(b.dim_m) * static_cast<long double>(b.dim_k) *
-                          static_cast<long double>(b.instances);
-                      if (size_a != size_b) {
-                          return size_a > size_b;
-                      }
-                      return a.name < b.name;
-                  });
+        std::sort(shapes.begin(), shapes.end(), [](const ModelMatmulShape & a, const ModelMatmulShape & b) {
+            const long double size_a = static_cast<long double>(a.dim_m) * static_cast<long double>(a.dim_k) *
+                                       static_cast<long double>(a.instances);
+            const long double size_b = static_cast<long double>(b.dim_m) * static_cast<long double>(b.dim_k) *
+                                       static_cast<long double>(b.instances);
+            if (size_a != size_b) {
+                return size_a > size_b;
+            }
+            return a.name < b.name;
+        });
 
         if (params.model_max_shapes > 0 && static_cast<int>(shapes.size()) > params.model_max_shapes) {
             shapes.resize(static_cast<size_t>(params.model_max_shapes));
@@ -884,15 +899,15 @@ int main(int argc, char ** argv) {
         }
     } else {
         ModelMatmulShape shape{};
-        shape.name = "";
-        shape.type = params.quant_type;
-        shape.dim_m = params.dim_m;
-        shape.dim_n = params.dim_n;
-        shape.dim_k = params.dim_k;
+        shape.name      = "";
+        shape.type      = params.quant_type;
+        shape.dim_m     = params.dim_m;
+        shape.dim_n     = params.dim_n;
+        shape.dim_k     = params.dim_k;
         shape.instances = 1;
-        shape.n_dims = 2;
-        shape.dims[0] = params.dim_k;
-        shape.dims[1] = params.dim_m;
+        shape.n_dims    = 2;
+        shape.dims[0]   = params.dim_k;
+        shape.dims[1]   = params.dim_m;
         shapes.push_back(shape);
     }
 
@@ -902,73 +917,72 @@ int main(int argc, char ** argv) {
         for (int64_t batch : params.batch_sizes) {
             ShapeSummary summary{};
             if (!params.emit_json_path.empty()) {
-                summary.tensor = shape.name;
-                summary.type = params.model_path.empty() ? params.quant_type : shape.type;
-                summary.dim_m = shape.dim_m;
-                summary.dim_k = shape.dim_k;
-                summary.dim_n = params.model_path.empty() ? params.dim_n : batch;
+                summary.tensor    = shape.name;
+                summary.type      = params.model_path.empty() ? params.quant_type : shape.type;
+                summary.dim_m     = shape.dim_m;
+                summary.dim_k     = shape.dim_k;
+                summary.dim_n     = params.model_path.empty() ? params.dim_n : batch;
                 summary.instances = shape.instances;
                 summary.runs.reserve(kernels.size());
             }
 
             for (const auto * kernel : kernels) {
                 BenchmarkConfig config;
-                config.kernel_name = kernel->name;
-                config.quant_type = params.model_path.empty() ? params.quant_type : shape.type;
-                config.layout = kernel->layout;
-                config.kernel_kind = kernel->kind;
-                config.tensor_name = shape.name;
-                config.tensor_instances = shape.instances;
-                config.batch_size = batch;
-                config.dim_m = shape.dim_m;
-                config.dim_n = params.model_path.empty() ? params.dim_n : batch;
-                config.dim_k = shape.dim_k;
-                config.warmup_iterations = params.warmup;
-                config.measure_iterations = params.iterations;
-                config.memory_mode = params.memory_mode;
-                config.validate = params.validate;
+                config.kernel_name         = kernel->name;
+                config.quant_type          = params.model_path.empty() ? params.quant_type : shape.type;
+                config.layout              = kernel->layout;
+                config.kernel_kind         = kernel->kind;
+                config.tensor_name         = shape.name;
+                config.tensor_instances    = shape.instances;
+                config.batch_size          = batch;
+                config.dim_m               = shape.dim_m;
+                config.dim_n               = params.model_path.empty() ? params.dim_n : batch;
+                config.dim_k               = shape.dim_k;
+                config.warmup_iterations   = params.warmup;
+                config.measure_iterations  = params.iterations;
+                config.memory_mode         = params.memory_mode;
+                config.validate            = params.validate;
                 config.include_percentiles = params.include_percentiles;
                 config.include_ref_metrics =
                     params.include_ref_metrics || (kernel->kind != KernelKind::MMVQ && kernel->kind != KernelKind::MMQ);
-                config.transfer_bytes = params.transfer_bytes;
-                config.roofline_elements = params.roofline_elements;
-                config.roofline_ops = params.roofline_ops;
-                config.abs_tol = params.abs_tol;
-                config.rel_tol = params.rel_tol;
-                config.device_id = params.device_id;
-                config.dpas_config_name = params.dpas_config_name;
-                config.dpas_type_a = params.dpas_type_a;
-                config.dpas_type_b = params.dpas_type_b;
-                config.dpas_type_acc = params.dpas_type_acc;
-                config.dpas_memory_pattern = params.dpas_memory_pattern;
-                config.dpas_grf_mode = params.dpas_grf_mode;
-                config.dpas_repeat = params.dpas_repeat;
-                config.dpas_n_tile_repeats = params.dpas_n_tile_repeats;
-                config.dpas_misaligned = params.dpas_misaligned;
-                config.dpas_device_opt = params.dpas_device_opt;
-                config.dpas_autotune = params.dpas_autotune;
-                config.dpas_autotune_force = params.dpas_autotune_force;
-                config.dpas_autotune_metric = params.dpas_autotune_metric;
-                config.dpas_autotune_cache = params.dpas_autotune_cache;
-                config.dpas_autotune_override_ntiles = params.dpas_autotune_override_ntiles;
+                config.transfer_bytes                  = params.transfer_bytes;
+                config.roofline_elements               = params.roofline_elements;
+                config.roofline_ops                    = params.roofline_ops;
+                config.abs_tol                         = params.abs_tol;
+                config.rel_tol                         = params.rel_tol;
+                config.device_id                       = params.device_id;
+                config.dpas_config_name                = params.dpas_config_name;
+                config.dpas_type_a                     = params.dpas_type_a;
+                config.dpas_type_b                     = params.dpas_type_b;
+                config.dpas_type_acc                   = params.dpas_type_acc;
+                config.dpas_memory_pattern             = params.dpas_memory_pattern;
+                config.dpas_grf_mode                   = params.dpas_grf_mode;
+                config.dpas_repeat                     = params.dpas_repeat;
+                config.dpas_n_tile_repeats             = params.dpas_n_tile_repeats;
+                config.dpas_misaligned                 = params.dpas_misaligned;
+                config.dpas_device_opt                 = params.dpas_device_opt;
+                config.dpas_autotune                   = params.dpas_autotune;
+                config.dpas_autotune_force             = params.dpas_autotune_force;
+                config.dpas_autotune_metric            = params.dpas_autotune_metric;
+                config.dpas_autotune_cache             = params.dpas_autotune_cache;
+                config.dpas_autotune_override_ntiles   = params.dpas_autotune_override_ntiles;
                 config.dpas_autotune_override_prefetch = params.dpas_autotune_override_prefetch;
-                config.dpas_memory_explicit = params.dpas_memory_explicit;
-                config.dpas_ntiles_explicit = params.dpas_ntiles_explicit;
-                config.dpas_grf_explicit = params.dpas_grf_explicit;
-                config.dpas_acc_explicit = params.dpas_acc_explicit;
+                config.dpas_memory_explicit            = params.dpas_memory_explicit;
+                config.dpas_ntiles_explicit            = params.dpas_ntiles_explicit;
+                config.dpas_grf_explicit               = params.dpas_grf_explicit;
+                config.dpas_acc_explicit               = params.dpas_acc_explicit;
 
                 BenchmarkOutput output;
                 if (!harness.run(config, output)) {
-                    const bool skippable = compare_mode
-                        ? is_skippable_error(output.error)
-                        : (output.error.rfind("SKIP:", 0) == 0);
+                    const bool skippable =
+                        compare_mode ? is_skippable_error(output.error) : (output.error.rfind("SKIP:", 0) == 0);
                     if (skippable) {
                         std::fprintf(stderr, "Benchmark skipped: %s\\n", output.error.c_str());
                         if (!params.emit_json_path.empty()) {
                             KernelRunSummary run{};
                             run.kernel = kernel->name;
-                            run.ok = false;
-                            run.error = output.error;
+                            run.ok     = false;
+                            run.error  = output.error;
                             summary.runs.push_back(std::move(run));
                         }
                         continue;
@@ -978,8 +992,8 @@ int main(int argc, char ** argv) {
                         if (!params.emit_json_path.empty()) {
                             KernelRunSummary run{};
                             run.kernel = kernel->name;
-                            run.ok = false;
-                            run.error = output.error;
+                            run.ok     = false;
+                            run.error  = output.error;
                             summary.runs.push_back(std::move(run));
                         }
                         continue;
@@ -997,13 +1011,13 @@ int main(int argc, char ** argv) {
                 if (!params.emit_json_path.empty()) {
                     KernelRunSummary run{};
                     run.kernel = kernel->name;
-                    run.ok = true;
+                    run.ok     = true;
                     run.error.clear();
-                    run.latency_us = output.result.latency_us;
-                    run.throughput_tps = output.result.throughput_tps;
+                    run.latency_us      = output.result.latency_us;
+                    run.throughput_tps  = output.result.throughput_tps;
                     run.throughput_tops = output.result.throughput_tops;
-                    run.bandwidth_gbps = output.result.bandwidth_gbps;
-                    run.xmx_util_pct = output.result.xmx_util_pct;
+                    run.bandwidth_gbps  = output.result.bandwidth_gbps;
+                    run.xmx_util_pct    = output.result.xmx_util_pct;
                     summary.runs.push_back(std::move(run));
                 }
 

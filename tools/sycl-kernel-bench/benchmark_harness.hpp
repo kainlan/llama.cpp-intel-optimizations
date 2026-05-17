@@ -1,5 +1,23 @@
 #pragma once
 
+#include "data_generators.hpp"
+#include "dpas_config.hpp"
+#include "ggml-backend.h"
+#include "ggml-sycl.h"
+#include "ggml-sycl/common.hpp"
+#include "ggml-sycl/dispatch.hpp"
+#include "ggml-sycl/ggml-sycl-bench.hpp"
+#include "ggml-sycl/presets.hpp"
+#include "ggml.h"
+#include "kernel_registry.hpp"
+#include "kernels/dpas_exploration/dpas_kernels.hpp"
+#include "kernels/reference/reference_kernels.hpp"
+#include "kernels/tier1/mmvq_tier1.hpp"
+#include "kernels/tier2/mmvq_tier2.hpp"
+#include "kernels/tier3/mmvq_tier3.hpp"
+#include "kernels/tier4/mmvq_tier4.hpp"
+#include "roofline.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -9,30 +27,9 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <sycl/sycl.hpp>
 #include <type_traits>
 #include <vector>
-
-#include <sycl/sycl.hpp>
-
-#include "ggml-backend.h"
-#include "ggml-sycl.h"
-#include "ggml.h"
-
-#include "ggml-sycl/ggml-sycl-bench.hpp"
-#include "ggml-sycl/common.hpp"
-#include "ggml-sycl/dispatch.hpp"
-#include "ggml-sycl/presets.hpp"
-
-#include "data_generators.hpp"
-#include "dpas_config.hpp"
-#include "kernel_registry.hpp"
-#include "kernels/reference/reference_kernels.hpp"
-#include "kernels/dpas_exploration/dpas_kernels.hpp"
-#include "kernels/tier1/mmvq_tier1.hpp"
-#include "kernels/tier2/mmvq_tier2.hpp"
-#include "kernels/tier3/mmvq_tier3.hpp"
-#include "kernels/tier4/mmvq_tier4.hpp"
-#include "roofline.hpp"
 
 namespace sycl_bench {
 
@@ -48,106 +45,106 @@ enum class DpasTuneMetric {
 };
 
 struct BenchmarkConfig {
-    std::string    kernel_name = "mmvq_aos";
-    ggml_type      quant_type  = GGML_TYPE_Q4_0;
-    ggml_layout_mode layout    = GGML_LAYOUT_AOS;
-    KernelKind     kernel_kind = KernelKind::MMVQ;
-    std::string    tensor_name;
-    int64_t        tensor_instances = 1;
-    int64_t        batch_size  = 1;
-    int64_t        dim_m       = 4096;
-    int64_t        dim_n       = 4096;
-    int64_t        dim_k       = 4096;
-    int           warmup_iterations  = 10;
-    int           measure_iterations = 100;
-    MemoryMode    memory_mode = MemoryMode::USM_DEVICE;
-    bool          validate    = false;
-    bool          include_percentiles = false;
-    bool          include_ref_metrics = false;
-    size_t        transfer_bytes = 0;
-    int64_t       roofline_elements = 0;
-    int           roofline_ops = 0;
-    double        abs_tol     = 1e-2;
-    double        rel_tol     = 1e-2;
-    int           device_id   = -1;
-    std::string   dpas_config_name;
-    DpasType      dpas_type_a = DpasType::INT8;
-    DpasType      dpas_type_b = DpasType::INT8;
-    DpasAccType   dpas_type_acc = DpasAccType::INT32;
-    DpasMemoryPattern dpas_memory_pattern = DpasMemoryPattern::DIRECT_GLOBAL;
-    DpasGrfMode   dpas_grf_mode = DpasGrfMode::GRF_128;
-    int           dpas_repeat = 8;
-    int           dpas_n_tile_repeats = 1;
-    bool          dpas_misaligned = false;
-    bool          dpas_device_opt = false;
-    bool          dpas_autotune = false;
-    bool          dpas_autotune_force = false;
-    DpasTuneMetric dpas_autotune_metric = DpasTuneMetric::THROUGHPUT;
-    std::string   dpas_autotune_cache = "benchmark_results/dpas_tuning_cache.jsonl";
-    int           dpas_autotune_override_ntiles = 0;
-    int           dpas_autotune_override_prefetch = 0;
-    bool          dpas_memory_explicit = false;
-    bool          dpas_ntiles_explicit = false;
-    bool          dpas_grf_explicit = false;
-    bool          dpas_acc_explicit = false;
+    std::string       kernel_name = "mmvq_aos";
+    ggml_type         quant_type  = GGML_TYPE_Q4_0;
+    ggml_layout_mode  layout      = GGML_LAYOUT_AOS;
+    KernelKind        kernel_kind = KernelKind::MMVQ;
+    std::string       tensor_name;
+    int64_t           tensor_instances    = 1;
+    int64_t           batch_size          = 1;
+    int64_t           dim_m               = 4096;
+    int64_t           dim_n               = 4096;
+    int64_t           dim_k               = 4096;
+    int               warmup_iterations   = 10;
+    int               measure_iterations  = 100;
+    MemoryMode        memory_mode         = MemoryMode::USM_DEVICE;
+    bool              validate            = false;
+    bool              include_percentiles = false;
+    bool              include_ref_metrics = false;
+    size_t            transfer_bytes      = 0;
+    int64_t           roofline_elements   = 0;
+    int               roofline_ops        = 0;
+    double            abs_tol             = 1e-2;
+    double            rel_tol             = 1e-2;
+    int               device_id           = -1;
+    std::string       dpas_config_name;
+    DpasType          dpas_type_a                     = DpasType::INT8;
+    DpasType          dpas_type_b                     = DpasType::INT8;
+    DpasAccType       dpas_type_acc                   = DpasAccType::INT32;
+    DpasMemoryPattern dpas_memory_pattern             = DpasMemoryPattern::DIRECT_GLOBAL;
+    DpasGrfMode       dpas_grf_mode                   = DpasGrfMode::GRF_128;
+    int               dpas_repeat                     = 8;
+    int               dpas_n_tile_repeats             = 1;
+    bool              dpas_misaligned                 = false;
+    bool              dpas_device_opt                 = false;
+    bool              dpas_autotune                   = false;
+    bool              dpas_autotune_force             = false;
+    DpasTuneMetric    dpas_autotune_metric            = DpasTuneMetric::THROUGHPUT;
+    std::string       dpas_autotune_cache             = "benchmark_results/dpas_tuning_cache.jsonl";
+    int               dpas_autotune_override_ntiles   = 0;
+    int               dpas_autotune_override_prefetch = 0;
+    bool              dpas_memory_explicit            = false;
+    bool              dpas_ntiles_explicit            = false;
+    bool              dpas_grf_explicit               = false;
+    bool              dpas_acc_explicit               = false;
 };
 
 struct DeviceInfo {
-    std::string name;
-    std::string vendor;
-    std::string driver_version;
-    uint32_t vendor_id = 0;
-    uint32_t device_id = 0;
-    uint32_t max_compute_units = 0;
-    uint32_t max_clock_mhz = 0;
-    size_t local_mem_size = 0;
-    size_t max_work_group_size = 0;
+    std::string         name;
+    std::string         vendor;
+    std::string         driver_version;
+    uint32_t            vendor_id           = 0;
+    uint32_t            device_id           = 0;
+    uint32_t            max_compute_units   = 0;
+    uint32_t            max_clock_mhz       = 0;
+    size_t              local_mem_size      = 0;
+    size_t              max_work_group_size = 0;
     std::vector<size_t> sub_group_sizes;
 };
 
 struct DpasTuneKey {
     std::string device_key;
-    int64_t dim_m = 0;
-    int64_t dim_n = 0;
-    int64_t dim_k = 0;
-    int repeat = 0;
-    DpasType type_a = DpasType::INT8;
-    DpasType type_b = DpasType::INT8;
-    DpasAccType type_acc = DpasAccType::INT32;
-    DpasGrfMode grf_mode = DpasGrfMode::GRF_128;
-    bool misaligned = false;
+    int64_t     dim_m      = 0;
+    int64_t     dim_n      = 0;
+    int64_t     dim_k      = 0;
+    int         repeat     = 0;
+    DpasType    type_a     = DpasType::INT8;
+    DpasType    type_b     = DpasType::INT8;
+    DpasAccType type_acc   = DpasAccType::INT32;
+    DpasGrfMode grf_mode   = DpasGrfMode::GRF_128;
+    bool        misaligned = false;
     std::string metric;
 };
 
 struct DpasTuneResult {
-    int ntiles = 0;
-    int prefetch_dist = 0;
-    double tops = 0.0;
-    double bandwidth = 0.0;
-    bool valid = false;
+    int               ntiles         = 0;
+    int               prefetch_dist  = 0;
+    double            tops           = 0.0;
+    double            bandwidth      = 0.0;
+    bool              valid          = false;
     DpasMemoryPattern memory_pattern = DpasMemoryPattern::LSC_PREFETCH;
 };
 
 struct BenchmarkResult {
-    double throughput_tps = 0.0;
-    double latency_us     = 0.0;
-    double latency_std    = 0.0;
-    double latency_p50_us = 0.0;
-    double latency_p90_us = 0.0;
-    double latency_p99_us = 0.0;
-    double bandwidth_gbps = 0.0;
-    double variance_pct   = 0.0;
-    double xmx_util_pct   = 0.0;
-    double ref_total_us   = 0.0;
-    double ref_dequant_us = 0.0;
-    double ref_gemm_us    = 0.0;
-    double ref_scale_us   = 0.0;
-    double ref_tflops     = 0.0;
-    double ref_tops       = 0.0;
-    double ref_bandwidth_gbps = 0.0;
+    double throughput_tps      = 0.0;
+    double latency_us          = 0.0;
+    double latency_std         = 0.0;
+    double latency_p50_us      = 0.0;
+    double latency_p90_us      = 0.0;
+    double latency_p99_us      = 0.0;
+    double bandwidth_gbps      = 0.0;
+    double variance_pct        = 0.0;
+    double xmx_util_pct        = 0.0;
+    double ref_total_us        = 0.0;
+    double ref_dequant_us      = 0.0;
+    double ref_gemm_us         = 0.0;
+    double ref_scale_us        = 0.0;
+    double ref_tflops          = 0.0;
+    double ref_tops            = 0.0;
+    double ref_bandwidth_gbps  = 0.0;
     double ref_arith_intensity = 0.0;
-    double throughput_tops = 0.0;
-    double latency_ns = 0.0;
+    double throughput_tops     = 0.0;
+    double latency_ns          = 0.0;
 };
 
 struct BenchmarkOutput {
@@ -181,16 +178,46 @@ inline std::string json_escape_string(const std::string & input) {
 
 inline DeviceInfo query_device_info(const sycl::device & device) {
     DeviceInfo info{};
-    try { info.name = device.get_info<sycl::info::device::name>(); } catch (...) {}
-    try { info.vendor = device.get_info<sycl::info::device::vendor>(); } catch (...) {}
-    try { info.driver_version = device.get_info<sycl::info::device::driver_version>(); } catch (...) {}
-    try { info.vendor_id = device.get_info<sycl::info::device::vendor_id>(); } catch (...) {}
-    try { info.device_id = device.get_info<sycl::ext::intel::info::device::device_id>(); } catch (...) {}
-    try { info.max_compute_units = device.get_info<sycl::info::device::max_compute_units>(); } catch (...) {}
-    try { info.max_clock_mhz = device.get_info<sycl::info::device::max_clock_frequency>(); } catch (...) {}
-    try { info.local_mem_size = device.get_info<sycl::info::device::local_mem_size>(); } catch (...) {}
-    try { info.max_work_group_size = device.get_info<sycl::info::device::max_work_group_size>(); } catch (...) {}
-    try { info.sub_group_sizes = device.get_info<sycl::info::device::sub_group_sizes>(); } catch (...) {}
+    try {
+        info.name = device.get_info<sycl::info::device::name>();
+    } catch (...) {
+    }
+    try {
+        info.vendor = device.get_info<sycl::info::device::vendor>();
+    } catch (...) {
+    }
+    try {
+        info.driver_version = device.get_info<sycl::info::device::driver_version>();
+    } catch (...) {
+    }
+    try {
+        info.vendor_id = device.get_info<sycl::info::device::vendor_id>();
+    } catch (...) {
+    }
+    try {
+        info.device_id = device.get_info<sycl::ext::intel::info::device::device_id>();
+    } catch (...) {
+    }
+    try {
+        info.max_compute_units = device.get_info<sycl::info::device::max_compute_units>();
+    } catch (...) {
+    }
+    try {
+        info.max_clock_mhz = device.get_info<sycl::info::device::max_clock_frequency>();
+    } catch (...) {
+    }
+    try {
+        info.local_mem_size = device.get_info<sycl::info::device::local_mem_size>();
+    } catch (...) {
+    }
+    try {
+        info.max_work_group_size = device.get_info<sycl::info::device::max_work_group_size>();
+    } catch (...) {
+    }
+    try {
+        info.sub_group_sizes = device.get_info<sycl::info::device::sub_group_sizes>();
+    } catch (...) {
+    }
     return info;
 }
 
@@ -202,9 +229,12 @@ inline std::string make_device_key(const DeviceInfo & info) {
 
 inline const char * dpas_tune_metric_name(DpasTuneMetric metric) {
     switch (metric) {
-        case DpasTuneMetric::BANDWIDTH: return "bandwidth";
-        case DpasTuneMetric::THROUGHPUT: return "throughput";
-        default: return "throughput";
+        case DpasTuneMetric::BANDWIDTH:
+            return "bandwidth";
+        case DpasTuneMetric::THROUGHPUT:
+            return "throughput";
+        default:
+            return "throughput";
     }
 }
 
@@ -222,58 +252,72 @@ inline bool parse_dpas_tune_metric(const std::string & input, DpasTuneMetric & o
 
 inline int dpas_prefetch_dist_from_pattern(DpasMemoryPattern pattern) {
     switch (pattern) {
-        case DpasMemoryPattern::LSC_PREFETCH: return 1;
-        case DpasMemoryPattern::LSC_PREFETCH_2: return 2;
-        case DpasMemoryPattern::LSC_PREFETCH_3: return 3;
-        case DpasMemoryPattern::LSC_PREFETCH_4: return 4;
-        case DpasMemoryPattern::LSC_PREFETCH_5: return 5;
-        case DpasMemoryPattern::LSC_PREFETCH_6: return 6;
-        case DpasMemoryPattern::LSC_PREFETCH_8: return 8;
-        case DpasMemoryPattern::LSC_PREFETCH_10: return 10;
-        default: return 0;
+        case DpasMemoryPattern::LSC_PREFETCH:
+            return 1;
+        case DpasMemoryPattern::LSC_PREFETCH_2:
+            return 2;
+        case DpasMemoryPattern::LSC_PREFETCH_3:
+            return 3;
+        case DpasMemoryPattern::LSC_PREFETCH_4:
+            return 4;
+        case DpasMemoryPattern::LSC_PREFETCH_5:
+            return 5;
+        case DpasMemoryPattern::LSC_PREFETCH_6:
+            return 6;
+        case DpasMemoryPattern::LSC_PREFETCH_8:
+            return 8;
+        case DpasMemoryPattern::LSC_PREFETCH_10:
+            return 10;
+        default:
+            return 0;
     }
 }
 
 inline DpasMemoryPattern dpas_prefetch_pattern_from_dist(int dist) {
     switch (dist) {
-        case 1: return DpasMemoryPattern::LSC_PREFETCH;
-        case 2: return DpasMemoryPattern::LSC_PREFETCH_2;
-        case 3: return DpasMemoryPattern::LSC_PREFETCH_3;
-        case 4: return DpasMemoryPattern::LSC_PREFETCH_4;
-        case 5: return DpasMemoryPattern::LSC_PREFETCH_5;
-        case 6: return DpasMemoryPattern::LSC_PREFETCH_6;
-        case 8: return DpasMemoryPattern::LSC_PREFETCH_8;
-        case 10: return DpasMemoryPattern::LSC_PREFETCH_10;
-        default: return DpasMemoryPattern::LSC_PREFETCH;
+        case 1:
+            return DpasMemoryPattern::LSC_PREFETCH;
+        case 2:
+            return DpasMemoryPattern::LSC_PREFETCH_2;
+        case 3:
+            return DpasMemoryPattern::LSC_PREFETCH_3;
+        case 4:
+            return DpasMemoryPattern::LSC_PREFETCH_4;
+        case 5:
+            return DpasMemoryPattern::LSC_PREFETCH_5;
+        case 6:
+            return DpasMemoryPattern::LSC_PREFETCH_6;
+        case 8:
+            return DpasMemoryPattern::LSC_PREFETCH_8;
+        case 10:
+            return DpasMemoryPattern::LSC_PREFETCH_10;
+        default:
+            return DpasMemoryPattern::LSC_PREFETCH;
     }
 }
 
-inline size_t dpas_slm_total_bytes(const BenchmarkConfig & config,
-                                   int ntiles,
-                                   bool double_buffer) {
+inline size_t dpas_slm_total_bytes(const BenchmarkConfig & config, int ntiles, bool double_buffer) {
     const int k_per = dpas_k_per_tile(config.dpas_type_a, config.dpas_type_b);
     if (k_per <= 0) {
         return 0;
     }
     const size_t slm_a_bytes = static_cast<size_t>(config.dpas_repeat) * static_cast<size_t>(k_per) *
                                ((config.dpas_type_a == DpasType::INT8) ? sizeof(int8_t) : sizeof(uint16_t));
-    const size_t slm_b_bytes = static_cast<size_t>(k_per) * 16u *
-                               ((config.dpas_type_b == DpasType::INT8) ? sizeof(int8_t) : sizeof(uint16_t));
-    const size_t slm_pad = 64;
+    const size_t slm_b_bytes =
+        static_cast<size_t>(k_per) * 16u * ((config.dpas_type_b == DpasType::INT8) ? sizeof(int8_t) : sizeof(uint16_t));
+    const size_t slm_pad      = 64;
     const size_t slm_b_offset = align_up(slm_a_bytes, slm_pad);
     const size_t slm_b_stride = align_up(slm_b_bytes, slm_pad);
-    const size_t tile_bytes = slm_b_offset + slm_b_stride * static_cast<size_t>(ntiles);
+    const size_t tile_bytes   = slm_b_offset + slm_b_stride * static_cast<size_t>(ntiles);
     return double_buffer ? tile_bytes * 2 : tile_bytes;
 }
 
-inline int dpas_max_slm_ntiles(const BenchmarkConfig & config,
-                               const DeviceInfo & info,
-                               bool double_buffer) {
+inline int dpas_max_slm_ntiles(const BenchmarkConfig & config, const DeviceInfo & info, bool double_buffer) {
     const size_t slm_limit = info.local_mem_size;
     if (slm_limit == 0) {
         return 1;
     }
-    for (int ntiles : {4, 2, 1}) {
+    for (int ntiles : { 4, 2, 1 }) {
         if (dpas_slm_total_bytes(config, ntiles, double_buffer) <= slm_limit) {
             return ntiles;
         }
@@ -281,14 +325,21 @@ inline int dpas_max_slm_ntiles(const BenchmarkConfig & config,
     return 1;
 }
 
-inline int dpas_heuristic_ntiles(const BenchmarkConfig & config,
-                                 const DeviceInfo & info) {
+inline int dpas_heuristic_ntiles(const BenchmarkConfig & config, const DeviceInfo & info) {
     int ntiles = 1;
     switch (config.dpas_repeat) {
-        case 1: ntiles = 8; break;
-        case 2: ntiles = 4; break;
-        case 4: ntiles = 8; break;
-        case 8: ntiles = 4; break;
+        case 1:
+            ntiles = 8;
+            break;
+        case 2:
+            ntiles = 4;
+            break;
+        case 4:
+            ntiles = 8;
+            break;
+        case 8:
+            ntiles = 4;
+            break;
         default:
             if (info.max_compute_units >= 128) {
                 ntiles = 4;
@@ -304,7 +355,7 @@ inline int dpas_heuristic_ntiles(const BenchmarkConfig & config,
     if (config.dpas_memory_pattern == DpasMemoryPattern::SLM_BUFFER ||
         config.dpas_memory_pattern == DpasMemoryPattern::DOUBLE_BUFFER) {
         const bool double_buffer = (config.dpas_memory_pattern == DpasMemoryPattern::DOUBLE_BUFFER);
-        const int slm_cap = dpas_max_slm_ntiles(config, info, double_buffer);
+        const int  slm_cap       = dpas_max_slm_ntiles(config, info, double_buffer);
         if (slm_cap < ntiles) {
             ntiles = slm_cap;
             while (ntiles > 1 && (n_tiles % ntiles) != 0) {
@@ -315,8 +366,7 @@ inline int dpas_heuristic_ntiles(const BenchmarkConfig & config,
     return ntiles;
 }
 
-inline DpasMemoryPattern dpas_heuristic_memory_pattern(const BenchmarkConfig & config,
-                                                       const DeviceInfo & info) {
+inline DpasMemoryPattern dpas_heuristic_memory_pattern(const BenchmarkConfig & config, const DeviceInfo & info) {
     if (config.dpas_repeat >= 4) {
         return DpasMemoryPattern::LSC_STREAMING;
     }
@@ -333,35 +383,33 @@ inline DpasMemoryPattern dpas_heuristic_memory_pattern(const BenchmarkConfig & c
 }
 
 struct DpasDimTuningEntry {
-    int repeat = 0;
-    int64_t dim_n_tiles = 0;
-    int ntiles = 0;
-    DpasMemoryPattern pattern = DpasMemoryPattern::DIRECT_GLOBAL;
-    DpasGrfMode grf = DpasGrfMode::GRF_128;
-    DpasAccType acc = DpasAccType::INT32;
+    int               repeat      = 0;
+    int64_t           dim_n_tiles = 0;
+    int               ntiles      = 0;
+    DpasMemoryPattern pattern     = DpasMemoryPattern::DIRECT_GLOBAL;
+    DpasGrfMode       grf         = DpasGrfMode::GRF_128;
+    DpasAccType       acc         = DpasAccType::INT32;
 };
 
-inline bool dpas_lookup_dim_tuning(const BenchmarkConfig & config,
-                                   const DeviceInfo & info,
-                                   DpasDimTuningEntry & out) {
+inline bool dpas_lookup_dim_tuning(const BenchmarkConfig & config, const DeviceInfo & info, DpasDimTuningEntry & out) {
     GGML_UNUSED(info);
     if (config.dim_n <= 0 || (config.dim_n % 16) != 0) {
         return false;
     }
-    const int64_t dim_n_tiles = config.dim_n / 16;
+    const int64_t            dim_n_tiles     = config.dim_n / 16;
     const DpasDimTuningEntry default_table[] = {
-        {2, 256, 4, DpasMemoryPattern::LSC_STREAMING, DpasGrfMode::GRF_128, DpasAccType::FP32},
-        {2, 512, 8, DpasMemoryPattern::LSC_PREFETCH_2, DpasGrfMode::GRF_256, DpasAccType::FP32},
-        {4, 128, 8, DpasMemoryPattern::LSC_STREAMING, DpasGrfMode::GRF_128, DpasAccType::FP32},
-        {4, 256, 8, DpasMemoryPattern::LSC_STREAMING, DpasGrfMode::GRF_256, DpasAccType::FP32},
-        {4, 512, 4, DpasMemoryPattern::LSC_PREFETCH_2, DpasGrfMode::GRF_128, DpasAccType::INT32},
-        {4, 1024, 8, DpasMemoryPattern::LSC_STREAMING, DpasGrfMode::GRF_128, DpasAccType::INT32},
-        {8, 256, 4, DpasMemoryPattern::LSC_STREAMING, DpasGrfMode::GRF_256, DpasAccType::FP32},
-        {8, 512, 4, DpasMemoryPattern::LSC_STREAMING, DpasGrfMode::GRF_128, DpasAccType::FP32},
-        {8, 1024, 4, DpasMemoryPattern::LSC_STREAMING, DpasGrfMode::GRF_256, DpasAccType::INT32},
+        { 2, 256,  4, DpasMemoryPattern::LSC_STREAMING,  DpasGrfMode::GRF_128, DpasAccType::FP32  },
+        { 2, 512,  8, DpasMemoryPattern::LSC_PREFETCH_2, DpasGrfMode::GRF_256, DpasAccType::FP32  },
+        { 4, 128,  8, DpasMemoryPattern::LSC_STREAMING,  DpasGrfMode::GRF_128, DpasAccType::FP32  },
+        { 4, 256,  8, DpasMemoryPattern::LSC_STREAMING,  DpasGrfMode::GRF_256, DpasAccType::FP32  },
+        { 4, 512,  4, DpasMemoryPattern::LSC_PREFETCH_2, DpasGrfMode::GRF_128, DpasAccType::INT32 },
+        { 4, 1024, 8, DpasMemoryPattern::LSC_STREAMING,  DpasGrfMode::GRF_128, DpasAccType::INT32 },
+        { 8, 256,  4, DpasMemoryPattern::LSC_STREAMING,  DpasGrfMode::GRF_256, DpasAccType::FP32  },
+        { 8, 512,  4, DpasMemoryPattern::LSC_STREAMING,  DpasGrfMode::GRF_128, DpasAccType::FP32  },
+        { 8, 1024, 4, DpasMemoryPattern::LSC_STREAMING,  DpasGrfMode::GRF_256, DpasAccType::INT32 },
     };
-    const DpasDimTuningEntry * table = default_table;
-    size_t table_size = sizeof(default_table) / sizeof(default_table[0]);
+    const DpasDimTuningEntry * table      = default_table;
+    size_t                     table_size = sizeof(default_table) / sizeof(default_table[0]);
 
     for (size_t i = 0; i < table_size; ++i) {
         const auto & entry = table[i];
@@ -375,7 +423,7 @@ inline bool dpas_lookup_dim_tuning(const BenchmarkConfig & config,
 
 inline bool json_extract_string(const std::string & line, const char * key, std::string & out) {
     const std::string needle = std::string("\"") + key + "\":";
-    size_t pos = line.find(needle);
+    size_t            pos    = line.find(needle);
     if (pos == std::string::npos) {
         return false;
     }
@@ -405,7 +453,7 @@ inline bool json_extract_string(const std::string & line, const char * key, std:
 
 inline bool json_extract_int64(const std::string & line, const char * key, int64_t & out) {
     const std::string needle = std::string("\"") + key + "\":";
-    size_t pos = line.find(needle);
+    size_t            pos    = line.find(needle);
     if (pos == std::string::npos) {
         return false;
     }
@@ -413,9 +461,9 @@ inline bool json_extract_int64(const std::string & line, const char * key, int64
     while (pos < line.size() && std::isspace(static_cast<unsigned char>(line[pos]))) {
         ++pos;
     }
-    const char * start = line.c_str() + pos;
-    char * end = nullptr;
-    const long long val = std::strtoll(start, &end, 10);
+    const char *    start = line.c_str() + pos;
+    char *          end   = nullptr;
+    const long long val   = std::strtoll(start, &end, 10);
     if (start == end) {
         return false;
     }
@@ -425,7 +473,7 @@ inline bool json_extract_int64(const std::string & line, const char * key, int64
 
 inline bool json_extract_double(const std::string & line, const char * key, double & out) {
     const std::string needle = std::string("\"") + key + "\":";
-    size_t pos = line.find(needle);
+    size_t            pos    = line.find(needle);
     if (pos == std::string::npos) {
         return false;
     }
@@ -434,8 +482,8 @@ inline bool json_extract_double(const std::string & line, const char * key, doub
         ++pos;
     }
     const char * start = line.c_str() + pos;
-    char * end = nullptr;
-    const double val = std::strtod(start, &end);
+    char *       end   = nullptr;
+    const double val   = std::strtod(start, &end);
     if (start == end) {
         return false;
     }
@@ -445,14 +493,14 @@ inline bool json_extract_double(const std::string & line, const char * key, doub
 
 inline bool json_extract_dims3(const std::string & line, int64_t & m, int64_t & n, int64_t & k) {
     const std::string needle = "\"dims\":[";
-    size_t pos = line.find(needle);
+    size_t            pos    = line.find(needle);
     if (pos == std::string::npos) {
         return false;
     }
     pos += needle.size();
-    const char * start = line.c_str() + pos;
-    char * end = nullptr;
-    const long long v0 = std::strtoll(start, &end, 10);
+    const char *    start = line.c_str() + pos;
+    char *          end   = nullptr;
+    const long long v0    = std::strtoll(start, &end, 10);
     if (!end || *end != ',') {
         return false;
     }
@@ -470,26 +518,24 @@ inline bool json_extract_dims3(const std::string & line, int64_t & m, int64_t & 
     return true;
 }
 
-inline bool load_dpas_tuning_cache(const std::string & path,
-                                   const DpasTuneKey & key,
-                                   DpasTuneResult & out) {
+inline bool load_dpas_tuning_cache(const std::string & path, const DpasTuneKey & key, DpasTuneResult & out) {
     std::ifstream file(path);
     if (!file) {
         return false;
     }
-    std::string line;
-    bool found = false;
+    std::string    line;
+    bool           found = false;
     DpasTuneResult best{};
     while (std::getline(file, line)) {
         if (line.empty() || line[0] != '{') {
             continue;
         }
         std::string device_key;
-        int64_t dim_m = 0, dim_n = 0, dim_k = 0, repeat = 0, ntiles = 0, prefetch = 0;
+        int64_t     dim_m = 0, dim_n = 0, dim_k = 0, repeat = 0, ntiles = 0, prefetch = 0;
         std::string type_a, type_b, acc, grf, memory, metric;
-        int64_t misaligned = 0;
-        double tops = 0.0;
-        double bandwidth = 0.0;
+        int64_t     misaligned = 0;
+        double      tops       = 0.0;
+        double      bandwidth  = 0.0;
         if (!json_extract_string(line, "device_key", device_key)) {
             continue;
         }
@@ -505,14 +551,11 @@ inline bool load_dpas_tuning_cache(const std::string & path,
         if (!json_extract_int64(line, "repeat", repeat) || repeat != key.repeat) {
             continue;
         }
-        if (!json_extract_string(line, "type_a", type_a) ||
-            !json_extract_string(line, "type_b", type_b) ||
-            !json_extract_string(line, "acc", acc) ||
-            !json_extract_string(line, "grf", grf)) {
+        if (!json_extract_string(line, "type_a", type_a) || !json_extract_string(line, "type_b", type_b) ||
+            !json_extract_string(line, "acc", acc) || !json_extract_string(line, "grf", grf)) {
             continue;
         }
-        if (type_a != dpas_type_name(key.type_a) ||
-            type_b != dpas_type_name(key.type_b) ||
+        if (type_a != dpas_type_name(key.type_a) || type_b != dpas_type_name(key.type_b) ||
             acc != dpas_acc_name(key.type_acc)) {
             continue;
         }
@@ -528,8 +571,7 @@ inline bool load_dpas_tuning_cache(const std::string & path,
         if (!key.metric.empty() && metric != key.metric) {
             continue;
         }
-        if (!json_extract_int64(line, "ntiles", ntiles) ||
-            !json_extract_int64(line, "prefetch", prefetch)) {
+        if (!json_extract_int64(line, "ntiles", ntiles) || !json_extract_int64(line, "prefetch", prefetch)) {
             continue;
         }
         if (!json_extract_string(line, "memory", memory)) {
@@ -538,10 +580,10 @@ inline bool load_dpas_tuning_cache(const std::string & path,
         json_extract_double(line, "tops", tops);
         json_extract_double(line, "bandwidth", bandwidth);
         DpasTuneResult candidate{};
-        candidate.ntiles = static_cast<int>(ntiles);
+        candidate.ntiles        = static_cast<int>(ntiles);
         candidate.prefetch_dist = static_cast<int>(prefetch);
-        candidate.tops = tops;
-        candidate.bandwidth = bandwidth;
+        candidate.tops          = tops;
+        candidate.bandwidth     = bandwidth;
         if (!memory.empty()) {
             DpasMemoryPattern pattern{};
             if (parse_dpas_memory_pattern(memory, pattern)) {
@@ -552,12 +594,12 @@ inline bool load_dpas_tuning_cache(const std::string & path,
         } else {
             candidate.memory_pattern = dpas_prefetch_pattern_from_dist(candidate.prefetch_dist);
         }
-        candidate.valid = true;
-        const bool prefer_bandwidth = (key.metric == "bandwidth");
-        const double candidate_score = prefer_bandwidth ? candidate.bandwidth : candidate.tops;
-        const double best_score = prefer_bandwidth ? best.bandwidth : best.tops;
+        candidate.valid               = true;
+        const bool   prefer_bandwidth = (key.metric == "bandwidth");
+        const double candidate_score  = prefer_bandwidth ? candidate.bandwidth : candidate.tops;
+        const double best_score       = prefer_bandwidth ? best.bandwidth : best.tops;
         if (!found || candidate_score > best_score) {
-            best = candidate;
+            best  = candidate;
             found = true;
         }
     }
@@ -567,9 +609,9 @@ inline bool load_dpas_tuning_cache(const std::string & path,
     return found;
 }
 
-inline bool append_dpas_tuning_cache(const std::string & path,
-                                     const DeviceInfo & info,
-                                     const DpasTuneKey & key,
+inline bool append_dpas_tuning_cache(const std::string &    path,
+                                     const DeviceInfo &     info,
+                                     const DpasTuneKey &    key,
                                      const DpasTuneResult & result) {
     std::ofstream file(path, std::ios::app);
     if (!file) {
@@ -598,78 +640,65 @@ inline bool append_dpas_tuning_cache(const std::string & path,
 }
 
 struct DeviceBuffer {
-    void *                 ptr = nullptr;
-    size_t                 size = 0;
-    ggml_backend_buffer_t  buffer = nullptr;
-    MemoryMode             mode = MemoryMode::USM_DEVICE;
+    void *                ptr    = nullptr;
+    size_t                size   = 0;
+    ggml_backend_buffer_t buffer = nullptr;
+    MemoryMode            mode   = MemoryMode::USM_DEVICE;
 };
 
 class BenchmarkHarness {
-public:
+  public:
     bool run(const BenchmarkConfig & config, BenchmarkOutput & out) const;
 
-private:
-    static bool run_reference(const BenchmarkConfig & config,
-                              sycl::queue & queue,
-                              BenchmarkOutput & out);
-    static bool run_unified(const BenchmarkConfig & config,
-                            sycl::queue & queue,
-                            BenchmarkOutput & out);
-    static bool run_mmq(const BenchmarkConfig & config,
-                        sycl::queue & queue,
-                        BenchmarkOutput & out);
-    static bool run_dpas(const BenchmarkConfig & config,
-                         sycl::queue & queue,
-                         BenchmarkOutput & out);
-    static bool apply_dpas_tuning(BenchmarkConfig & config,
-                                  sycl::queue & queue,
-                                  std::string & error);
-    static bool run_dpas_autotune(const BenchmarkConfig & base,
-                                  sycl::queue & queue,
-                                  DpasTuneResult & best,
-                                  std::string & error);
-    static DeviceBuffer allocate_buffer(size_t bytes,
-                                        MemoryMode mode,
+  private:
+    static bool         run_reference(const BenchmarkConfig & config, sycl::queue & queue, BenchmarkOutput & out);
+    static bool         run_unified(const BenchmarkConfig & config, sycl::queue & queue, BenchmarkOutput & out);
+    static bool         run_mmq(const BenchmarkConfig & config, sycl::queue & queue, BenchmarkOutput & out);
+    static bool         run_dpas(const BenchmarkConfig & config, sycl::queue & queue, BenchmarkOutput & out);
+    static bool         apply_dpas_tuning(BenchmarkConfig & config, sycl::queue & queue, std::string & error);
+    static bool         run_dpas_autotune(const BenchmarkConfig & base,
+                                          sycl::queue &           queue,
+                                          DpasTuneResult &        best,
+                                          std::string &           error);
+    static DeviceBuffer allocate_buffer(size_t        bytes,
+                                        MemoryMode    mode,
                                         sycl::queue & queue,
-                                        int device_id,
+                                        int           device_id,
                                         std::string & error);
-    static void free_buffer(DeviceBuffer & buffer, sycl::queue & queue);
-    static bool copy_to_device(DeviceBuffer & buffer,
-                               const void * src,
-                               size_t bytes,
-                               sycl::queue & queue,
-                               std::string & error);
-    static bool copy_to_host(void * dst,
-                             const DeviceBuffer & buffer,
-                             size_t bytes,
-                             sycl::queue & queue,
-                             std::string & error);
-    static bool get_event_timing(const sycl::event & event,
-                                 uint64_t & start,
-                                 uint64_t & end,
-                                 std::string & error);
-    static bool dequantize_weights_row(ggml_type type,
-                                       const void * src,
-                                       float * dst,
-                                       int64_t k,
-                                       std::string & error);
+    static void         free_buffer(DeviceBuffer & buffer, sycl::queue & queue);
+    static bool         copy_to_device(DeviceBuffer & buffer,
+                                       const void *   src,
+                                       size_t         bytes,
+                                       sycl::queue &  queue,
+                                       std::string &  error);
+    static bool         copy_to_host(void *               dst,
+                                     const DeviceBuffer & buffer,
+                                     size_t               bytes,
+                                     sycl::queue &        queue,
+                                     std::string &        error);
+    static bool get_event_timing(const sycl::event & event, uint64_t & start, uint64_t & end, std::string & error);
+    static bool dequantize_weights_row(ggml_type type, const void * src, float * dst, int64_t k, std::string & error);
     static void dequantize_q8_1_row_aos(const block_q8_1 * src, float * dst, int64_t k);
     static void dequantize_q8_1_row_soa(const uint8_t * src, float * dst, int64_t k, int64_t k_padded);
 };
 
 inline const char * memory_mode_name(MemoryMode mode) {
     switch (mode) {
-        case MemoryMode::USM_DEVICE: return "USM_DEVICE";
-        case MemoryMode::USM_SHARED: return "USM_SHARED";
-        case MemoryMode::BUFFER: return "BUFFER";
-        default: return "UNKNOWN";
+        case MemoryMode::USM_DEVICE:
+            return "USM_DEVICE";
+        case MemoryMode::USM_SHARED:
+            return "USM_SHARED";
+        case MemoryMode::BUFFER:
+            return "BUFFER";
+        default:
+            return "UNKNOWN";
     }
 }
 
-inline DeviceBuffer BenchmarkHarness::allocate_buffer(size_t bytes,
-                                                      MemoryMode mode,
+inline DeviceBuffer BenchmarkHarness::allocate_buffer(size_t        bytes,
+                                                      MemoryMode    mode,
                                                       sycl::queue & queue,
-                                                      int device_id,
+                                                      int           device_id,
                                                       std::string & error) {
     DeviceBuffer out;
     out.size = bytes;
@@ -719,22 +748,22 @@ inline void BenchmarkHarness::free_buffer(DeviceBuffer & buffer, sycl::queue & q
     if (buffer.buffer) {
         ggml_backend_buffer_free(buffer.buffer);
         buffer.buffer = nullptr;
-        buffer.ptr = nullptr;
-        buffer.size = 0;
+        buffer.ptr    = nullptr;
+        buffer.size   = 0;
         return;
     }
     if (buffer.ptr) {
         sycl::free(buffer.ptr, queue);
-        buffer.ptr = nullptr;
+        buffer.ptr  = nullptr;
         buffer.size = 0;
     }
 }
 
 inline bool BenchmarkHarness::copy_to_device(DeviceBuffer & buffer,
-                                             const void * src,
-                                             size_t bytes,
-                                             sycl::queue & queue,
-                                             std::string & error) {
+                                             const void *   src,
+                                             size_t         bytes,
+                                             sycl::queue &  queue,
+                                             std::string &  error) {
     if (!buffer.ptr || bytes == 0) {
         return true;
     }
@@ -751,11 +780,11 @@ inline bool BenchmarkHarness::copy_to_device(DeviceBuffer & buffer,
     return true;
 }
 
-inline bool BenchmarkHarness::copy_to_host(void * dst,
+inline bool BenchmarkHarness::copy_to_host(void *               dst,
                                            const DeviceBuffer & buffer,
-                                           size_t bytes,
-                                           sycl::queue & queue,
-                                           std::string & error) {
+                                           size_t               bytes,
+                                           sycl::queue &        queue,
+                                           std::string &        error) {
     if (!buffer.ptr || bytes == 0) {
         return true;
     }
@@ -773,9 +802,9 @@ inline bool BenchmarkHarness::copy_to_host(void * dst,
 }
 
 inline bool BenchmarkHarness::get_event_timing(const sycl::event & event,
-                                               uint64_t & start,
-                                               uint64_t & end,
-                                               std::string & error) {
+                                               uint64_t &          start,
+                                               uint64_t &          end,
+                                               std::string &       error) {
     try {
         start = event.get_profiling_info<sycl::info::event_profiling::command_start>();
         end   = event.get_profiling_info<sycl::info::event_profiling::command_end>();
@@ -790,23 +819,45 @@ inline bool BenchmarkHarness::get_event_timing(const sycl::event & event,
     return true;
 }
 
-inline bool BenchmarkHarness::dequantize_weights_row(ggml_type type,
-                                                     const void * src,
-                                                     float * dst,
-                                                     int64_t k,
+inline bool BenchmarkHarness::dequantize_weights_row(ggml_type     type,
+                                                     const void *  src,
+                                                     float *       dst,
+                                                     int64_t       k,
                                                      std::string & error) {
     switch (type) {
-        case GGML_TYPE_Q4_0: dequantize_row_q4_0((const block_q4_0 *) src, dst, k); break;
-        case GGML_TYPE_Q4_1: dequantize_row_q4_1((const block_q4_1 *) src, dst, k); break;
-        case GGML_TYPE_Q5_0: dequantize_row_q5_0((const block_q5_0 *) src, dst, k); break;
-        case GGML_TYPE_Q5_1: dequantize_row_q5_1((const block_q5_1 *) src, dst, k); break;
-        case GGML_TYPE_Q8_0: dequantize_row_q8_0((const block_q8_0 *) src, dst, k); break;
-        case GGML_TYPE_MXFP4: dequantize_row_mxfp4((const block_mxfp4 *) src, dst, k); break;
-        case GGML_TYPE_Q2_K: dequantize_row_q2_K((const block_q2_K *) src, dst, k); break;
-        case GGML_TYPE_Q3_K: dequantize_row_q3_K((const block_q3_K *) src, dst, k); break;
-        case GGML_TYPE_Q4_K: dequantize_row_q4_K((const block_q4_K *) src, dst, k); break;
-        case GGML_TYPE_Q5_K: dequantize_row_q5_K((const block_q5_K *) src, dst, k); break;
-        case GGML_TYPE_Q6_K: dequantize_row_q6_K((const block_q6_K *) src, dst, k); break;
+        case GGML_TYPE_Q4_0:
+            dequantize_row_q4_0((const block_q4_0 *) src, dst, k);
+            break;
+        case GGML_TYPE_Q4_1:
+            dequantize_row_q4_1((const block_q4_1 *) src, dst, k);
+            break;
+        case GGML_TYPE_Q5_0:
+            dequantize_row_q5_0((const block_q5_0 *) src, dst, k);
+            break;
+        case GGML_TYPE_Q5_1:
+            dequantize_row_q5_1((const block_q5_1 *) src, dst, k);
+            break;
+        case GGML_TYPE_Q8_0:
+            dequantize_row_q8_0((const block_q8_0 *) src, dst, k);
+            break;
+        case GGML_TYPE_MXFP4:
+            dequantize_row_mxfp4((const block_mxfp4 *) src, dst, k);
+            break;
+        case GGML_TYPE_Q2_K:
+            dequantize_row_q2_K((const block_q2_K *) src, dst, k);
+            break;
+        case GGML_TYPE_Q3_K:
+            dequantize_row_q3_K((const block_q3_K *) src, dst, k);
+            break;
+        case GGML_TYPE_Q4_K:
+            dequantize_row_q4_K((const block_q4_K *) src, dst, k);
+            break;
+        case GGML_TYPE_Q5_K:
+            dequantize_row_q5_K((const block_q5_K *) src, dst, k);
+            break;
+        case GGML_TYPE_Q6_K:
+            dequantize_row_q6_K((const block_q6_K *) src, dst, k);
+            break;
         default:
             error = "unsupported quant type for dequantize";
             return false;
@@ -818,8 +869,8 @@ inline void BenchmarkHarness::dequantize_q8_1_row_aos(const block_q8_1 * src, fl
     const int64_t blocks = k / QK8_1;
     for (int64_t b = 0; b < blocks; ++b) {
         const block_q8_1 & block = src[b];
-        const sycl::half2 ds = *reinterpret_cast<const sycl::half2 *>(&block.ds);
-        const float d = static_cast<float>(ds.x());
+        const sycl::half2  ds    = *reinterpret_cast<const sycl::half2 *>(&block.ds);
+        const float        d     = static_cast<float>(ds.x());
         for (int i = 0; i < QK8_1; ++i) {
             dst[b * QK8_1 + i] = d * static_cast<float>(block.qs[i]);
         }
@@ -827,13 +878,13 @@ inline void BenchmarkHarness::dequantize_q8_1_row_aos(const block_q8_1 * src, fl
 }
 
 inline void BenchmarkHarness::dequantize_q8_1_row_soa(const uint8_t * src, float * dst, int64_t k, int64_t k_padded) {
-    const int64_t blocks = k / QK8_1;
-    const int8_t * qs = reinterpret_cast<const int8_t *>(src);
-    const uint8_t * ds = src + k;
+    const int64_t   blocks = k / QK8_1;
+    const int8_t *  qs     = reinterpret_cast<const int8_t *>(src);
+    const uint8_t * ds     = src + k;
 
     for (int64_t b = 0; b < blocks; ++b) {
         const sycl::half2 ds_vals = *reinterpret_cast<const sycl::half2 *>(ds + b * sizeof(sycl::half2));
-        const float d = static_cast<float>(ds_vals.x());
+        const float       d       = static_cast<float>(ds_vals.x());
         for (int i = 0; i < QK8_1; ++i) {
             dst[b * QK8_1 + i] = d * static_cast<float>(qs[b * QK8_1 + i]);
         }
@@ -845,180 +896,193 @@ inline void BenchmarkHarness::dequantize_q8_1_row_soa(const uint8_t * src, float
 }
 
 inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
-                                            sycl::queue & queue,
-                                            BenchmarkOutput & out) {
+                                            sycl::queue &           queue,
+                                            BenchmarkOutput &       out) {
     ReferenceMetrics metrics{};
-    std::string error;
+    std::string      error;
 
     if (config.dim_m <= 0 || config.dim_k <= 0 || config.batch_size <= 0) {
         out.error = "Invalid dimensions.";
         return false;
     }
 
-    const int64_t m = config.dim_m;
-    const int64_t n = config.batch_size;
-    const int64_t k = config.dim_k;
+    const int64_t m        = config.dim_m;
+    const int64_t n        = config.batch_size;
+    const int64_t k        = config.dim_k;
     const int64_t k_padded = GGML_PAD(k, QK8_1);
 
     switch (config.kernel_kind) {
-        case KernelKind::ONEDNN_FP16_GEMM: {
-            GeneratedWeights weights;
-            if (!generate_quantized_weights(config.quant_type, GGML_LAYOUT_AOS, m, k, false, weights)) {
-                out.error = "Failed to generate quantized weights for FP16 GEMM baseline.";
-                return false;
+        case KernelKind::ONEDNN_FP16_GEMM:
+            {
+                GeneratedWeights weights;
+                if (!generate_quantized_weights(config.quant_type, GGML_LAYOUT_AOS, m, k, false, weights)) {
+                    out.error = "Failed to generate quantized weights for FP16 GEMM baseline.";
+                    return false;
+                }
+                GeneratedActivations activations = generate_activations(n, k, k_padded, false, true, false);
+                if (!run_onednn_fp16_gemm(weights, activations, m, n, k, config.quant_type, config.warmup_iterations,
+                                          config.measure_iterations, queue, metrics, error)) {
+                    out.error = error;
+                    return false;
+                }
+                break;
             }
-            GeneratedActivations activations = generate_activations(n, k, k_padded, false, true, false);
-            if (!run_onednn_fp16_gemm(weights, activations, m, n, k, config.quant_type,
-                                      config.warmup_iterations, config.measure_iterations,
-                                      queue, metrics, error)) {
-                out.error = error;
-                return false;
+        case KernelKind::ONEDNN_INT8_GEMM:
+            {
+                GeneratedWeights weights;
+                if (!generate_quantized_weights(config.quant_type, GGML_LAYOUT_AOS, m, k, false, weights)) {
+                    out.error = "Failed to generate quantized weights for INT8 GEMM baseline.";
+                    return false;
+                }
+                GeneratedActivations activations = generate_activations(n, k, k_padded, true, false, false);
+                if (!run_onednn_int8_gemm(weights, activations, m, n, k, config.quant_type, config.warmup_iterations,
+                                          config.measure_iterations, queue, metrics, error)) {
+                    out.error = error;
+                    return false;
+                }
+                break;
             }
-            break;
-        }
-        case KernelKind::ONEDNN_INT8_GEMM: {
-            GeneratedWeights weights;
-            if (!generate_quantized_weights(config.quant_type, GGML_LAYOUT_AOS, m, k, false, weights)) {
-                out.error = "Failed to generate quantized weights for INT8 GEMM baseline.";
-                return false;
+        case KernelKind::ONEDNN_WOQ_GEMM:
+            {
+                if (m == 2048 && k == 2048) {
+                    out.error = "SKIP: oneDNN WoQ matmul (M=2048,K=2048) triggers device lost on Xe; skipping.";
+                    return false;
+                }
+                if (m == 4096 && k == 14336) {
+                    out.error = "SKIP: oneDNN WoQ matmul (M=4096,K=14336) triggers device lost on Xe; skipping.";
+                    return false;
+                }
+                if (m == 14336 && k == 4096) {
+                    out.error = "SKIP: oneDNN WoQ matmul (M=14336,K=4096) triggers device lost on Xe; skipping.";
+                    return false;
+                }
+                GeneratedWeights weights;
+                if (!generate_quantized_weights(config.quant_type, GGML_LAYOUT_AOS, m, k, false, weights)) {
+                    out.error = "Failed to generate quantized weights for oneDNN WoQ.";
+                    return false;
+                }
+                GeneratedActivations activations = generate_activations(n, k, k, true, true, false);
+                if (!run_onednn_woq_gemm(weights, activations, m, n, k, config.quant_type, config.warmup_iterations,
+                                         config.measure_iterations, queue, metrics, error)) {
+                    out.error = error;
+                    return false;
+                }
+                break;
             }
-            GeneratedActivations activations = generate_activations(n, k, k_padded, true, false, false);
-            if (!run_onednn_int8_gemm(weights, activations, m, n, k, config.quant_type,
-                                      config.warmup_iterations, config.measure_iterations,
-                                      queue, metrics, error)) {
-                out.error = error;
-                return false;
+        case KernelKind::ONEDNN_MXFP4_GEMM:
+            {
+                if (config.quant_type != GGML_TYPE_MXFP4) {
+                    out.error = "onednn_mxfp4_gemm requires MXFP4 weights.";
+                    return false;
+                }
+                GeneratedWeights weights;
+                if (!generate_quantized_weights(GGML_TYPE_MXFP4, GGML_LAYOUT_AOS, m, k, false, weights)) {
+                    out.error = "Failed to generate MXFP4 weights for oneDNN MXFP4 GEMM.";
+                    return false;
+                }
+                GeneratedActivations activations = generate_activations(n, k, k, false, true, false);
+                const int            scale_mode  = config.kernel_name.find("f32scale") != std::string::npos ? 1 : 0;
+                if (!run_onednn_mxfp4_gemm(weights, activations, m, n, k, config.warmup_iterations,
+                                           config.measure_iterations, config.validate, scale_mode, queue, metrics,
+                                           error)) {
+                    out.error = error;
+                    return false;
+                }
+                break;
             }
-            break;
-        }
-        case KernelKind::ONEDNN_WOQ_GEMM: {
-            if (m == 2048 && k == 2048) {
-                out.error = "SKIP: oneDNN WoQ matmul (M=2048,K=2048) triggers device lost on Xe; skipping.";
-                return false;
+        case KernelKind::MEMORY_BANDWIDTH:
+            {
+                size_t bytes = config.transfer_bytes;
+                if (bytes == 0) {
+                    bytes = static_cast<size_t>(config.batch_size) * (1ull << 30);
+                }
+                if (!run_memory_bandwidth(bytes, config.warmup_iterations, config.measure_iterations, queue, metrics,
+                                          error)) {
+                    out.error = error;
+                    return false;
+                }
+                break;
             }
-            if (m == 4096 && k == 14336) {
-                out.error = "SKIP: oneDNN WoQ matmul (M=4096,K=14336) triggers device lost on Xe; skipping.";
-                return false;
+        case KernelKind::MXFP4_DECODE_BANDWIDTH:
+            {
+                GeneratedWeights weights;
+                if (!generate_quantized_weights(GGML_TYPE_MXFP4, config.layout, m, k, false, weights)) {
+                    out.error = "Failed to generate MXFP4 weights for decode benchmark.";
+                    return false;
+                }
+                const bool output_f16 = config.kernel_name.find("_f16_") != std::string::npos;
+                if (!run_mxfp4_decode_bandwidth(weights, m, k, config.layout, output_f16, config.warmup_iterations,
+                                                config.measure_iterations, queue, metrics, error)) {
+                    out.error = error;
+                    return false;
+                }
+                break;
             }
-            if (m == 14336 && k == 4096) {
-                out.error = "SKIP: oneDNN WoQ matmul (M=14336,K=4096) triggers device lost on Xe; skipping.";
-                return false;
+        case KernelKind::MXFP4_INLINE_DOT:
+            {
+                GeneratedWeights weights;
+                if (!generate_quantized_weights(GGML_TYPE_MXFP4, config.layout, m, k, false, weights)) {
+                    out.error = "Failed to generate MXFP4 weights for inline-dot benchmark.";
+                    return false;
+                }
+                GeneratedActivations activations = generate_activations(n, k, k, false, true, false);
+                if (!run_mxfp4_inline_dot(weights, activations, m, n, k, config.layout, config.validate,
+                                          config.warmup_iterations, config.measure_iterations, queue, metrics, error)) {
+                    out.error = error;
+                    return false;
+                }
+                break;
             }
-            GeneratedWeights weights;
-            if (!generate_quantized_weights(config.quant_type, GGML_LAYOUT_AOS, m, k, false, weights)) {
-                out.error = "Failed to generate quantized weights for oneDNN WoQ.";
-                return false;
+        case KernelKind::MXFP4_SELECTED_READ:
+            {
+                GeneratedWeights weights;
+                if (!generate_quantized_weights(GGML_TYPE_MXFP4, config.layout, m, k, false, weights)) {
+                    out.error = "Failed to generate MXFP4 weights for selected-read benchmark.";
+                    return false;
+                }
+                if (!run_mxfp4_selected_read(weights, m, n, k, config.layout, config.validate, config.warmup_iterations,
+                                             config.measure_iterations, queue, metrics, error)) {
+                    out.error = error;
+                    return false;
+                }
+                break;
             }
-            GeneratedActivations activations = generate_activations(n, k, k, true, true, false);
-            if (!run_onednn_woq_gemm(weights, activations, m, n, k, config.quant_type,
-                                     config.warmup_iterations, config.measure_iterations,
-                                     queue, metrics, error)) {
-                out.error = error;
-                return false;
+        case KernelKind::ROOFLINE_COMPUTE:
+            {
+                size_t elements = (config.roofline_elements > 0) ?
+                                      static_cast<size_t>(config.roofline_elements) :
+                                      static_cast<size_t>(config.dim_m) * static_cast<size_t>(config.dim_k);
+                int    ops      = config.roofline_ops > 0 ? config.roofline_ops : 1000;
+                if (!run_roofline_compute(elements, ops, config.warmup_iterations, config.measure_iterations, queue,
+                                          metrics, error)) {
+                    out.error = error;
+                    return false;
+                }
+                break;
             }
-            break;
-        }
-        case KernelKind::ONEDNN_MXFP4_GEMM: {
-            if (config.quant_type != GGML_TYPE_MXFP4) {
-                out.error = "onednn_mxfp4_gemm requires MXFP4 weights.";
-                return false;
-            }
-            GeneratedWeights weights;
-            if (!generate_quantized_weights(GGML_TYPE_MXFP4, GGML_LAYOUT_AOS, m, k, false, weights)) {
-                out.error = "Failed to generate MXFP4 weights for oneDNN MXFP4 GEMM.";
-                return false;
-            }
-            GeneratedActivations activations = generate_activations(n, k, k, false, true, false);
-            const int scale_mode = config.kernel_name.find("f32scale") != std::string::npos ? 1 : 0;
-            if (!run_onednn_mxfp4_gemm(weights, activations, m, n, k,
-                                       config.warmup_iterations, config.measure_iterations,
-                                       config.validate,
-                                       scale_mode,
-                                       queue, metrics, error)) {
-                out.error = error;
-                return false;
-            }
-            break;
-        }
-        case KernelKind::MEMORY_BANDWIDTH: {
-            size_t bytes = config.transfer_bytes;
-            if (bytes == 0) {
-                bytes = static_cast<size_t>(config.batch_size) * (1ull << 30);
-            }
-            if (!run_memory_bandwidth(bytes, config.warmup_iterations, config.measure_iterations,
-                                      queue, metrics, error)) {
-                out.error = error;
-                return false;
-            }
-            break;
-        }
-        case KernelKind::MXFP4_DECODE_BANDWIDTH: {
-            GeneratedWeights weights;
-            if (!generate_quantized_weights(GGML_TYPE_MXFP4, config.layout, m, k, false, weights)) {
-                out.error = "Failed to generate MXFP4 weights for decode benchmark.";
-                return false;
-            }
-            const bool output_f16 = config.kernel_name.find("_f16_") != std::string::npos;
-            if (!run_mxfp4_decode_bandwidth(weights, m, k, config.layout, output_f16,
-                                            config.warmup_iterations, config.measure_iterations,
-                                            queue, metrics, error)) {
-                out.error = error;
-                return false;
-            }
-            break;
-        }
-        case KernelKind::MXFP4_INLINE_DOT: {
-            GeneratedWeights weights;
-            if (!generate_quantized_weights(GGML_TYPE_MXFP4, config.layout, m, k, false, weights)) {
-                out.error = "Failed to generate MXFP4 weights for inline-dot benchmark.";
-                return false;
-            }
-            GeneratedActivations activations = generate_activations(n, k, k, false, true, false);
-            if (!run_mxfp4_inline_dot(weights, activations, m, n, k, config.layout, config.validate,
-                                      config.warmup_iterations, config.measure_iterations,
-                                      queue, metrics, error)) {
-                out.error = error;
-                return false;
-            }
-            break;
-        }
-        case KernelKind::ROOFLINE_COMPUTE: {
-            size_t elements = (config.roofline_elements > 0)
-                ? static_cast<size_t>(config.roofline_elements)
-                : static_cast<size_t>(config.dim_m) * static_cast<size_t>(config.dim_k);
-            int ops = config.roofline_ops > 0 ? config.roofline_ops : 1000;
-            if (!run_roofline_compute(elements, ops, config.warmup_iterations, config.measure_iterations,
-                                      queue, metrics, error)) {
-                out.error = error;
-                return false;
-            }
-            break;
-        }
         default:
             out.error = "Unsupported reference kernel kind.";
             return false;
     }
 
-    out.result.latency_us = metrics.total_us;
-    out.result.latency_std = 0.0;
-    out.result.throughput_tps = 0.0;
-    out.result.bandwidth_gbps = metrics.bandwidth_gbps;
-    out.result.ref_total_us = metrics.total_us;
-    out.result.ref_dequant_us = metrics.dequant_us;
-    out.result.ref_gemm_us = metrics.gemm_us;
-    out.result.ref_scale_us = metrics.scale_us;
-    out.result.ref_tflops = metrics.tflops;
-    out.result.ref_tops = metrics.tops;
-    out.result.ref_bandwidth_gbps = metrics.bandwidth_gbps;
+    out.result.latency_us          = metrics.total_us;
+    out.result.latency_std         = 0.0;
+    out.result.throughput_tps      = 0.0;
+    out.result.bandwidth_gbps      = metrics.bandwidth_gbps;
+    out.result.ref_total_us        = metrics.total_us;
+    out.result.ref_dequant_us      = metrics.dequant_us;
+    out.result.ref_gemm_us         = metrics.gemm_us;
+    out.result.ref_scale_us        = metrics.scale_us;
+    out.result.ref_tflops          = metrics.tflops;
+    out.result.ref_tops            = metrics.tops;
+    out.result.ref_bandwidth_gbps  = metrics.bandwidth_gbps;
     out.result.ref_arith_intensity = metrics.arithmetic_intensity;
 
     out.ok = true;
     return true;
 }
 
-inline bool BenchmarkHarness::run_unified(const BenchmarkConfig & config,
-                                          sycl::queue & queue,
-                                          BenchmarkOutput & out) {
+inline bool BenchmarkHarness::run_unified(const BenchmarkConfig & config, sycl::queue & queue, BenchmarkOutput & out) {
     if (config.quant_type != GGML_TYPE_Q4_0 && config.quant_type != GGML_TYPE_MXFP4) {
         out.error = "Unified kernel benchmark supports Q4_0 and MXFP4 only.";
         return false;
@@ -1040,22 +1104,14 @@ inline bool BenchmarkHarness::run_unified(const BenchmarkConfig & config,
     }
 
     GeneratedWeights weights;
-    if (!generate_quantized_weights(config.quant_type,
-                                    GGML_LAYOUT_AOS,
-                                    config.dim_m,
-                                    config.dim_k,
-                                    config.validate,
+    if (!generate_quantized_weights(config.quant_type, GGML_LAYOUT_AOS, config.dim_m, config.dim_k, config.validate,
                                     weights)) {
         out.error = "Failed to generate quantized weights for unified kernel.";
         return false;
     }
 
-    GeneratedActivations activations = generate_activations(config.batch_size,
-                                                            config.dim_k,
-                                                            config.dim_k,
-                                                            true,
-                                                            false,
-                                                            false);
+    GeneratedActivations activations =
+        generate_activations(config.batch_size, config.dim_k, config.dim_k, true, false, false);
 
     const size_t weight_bytes = weights.bytes_aos;
     const size_t activation_bytes =
@@ -1064,7 +1120,7 @@ inline bool BenchmarkHarness::run_unified(const BenchmarkConfig & config,
         static_cast<size_t>(config.batch_size) * static_cast<size_t>(config.dim_m) * sizeof(float);
 
     std::string error;
-    int device_id = get_current_device_id();
+    int         device_id = get_current_device_id();
     if (device_id < 0) {
         out.error = "Invalid device id.";
         return false;
@@ -1106,14 +1162,9 @@ inline bool BenchmarkHarness::run_unified(const BenchmarkConfig & config,
     queue.wait_and_throw();
 
     for (int i = 0; i < config.warmup_iterations; ++i) {
-        ggml_sycl::ggml_sycl_mul_mat_unified_default(queue,
-                                                     weight_buf.ptr,
-                                                     static_cast<const float *>(act_buf.ptr),
-                                                     static_cast<float *>(out_buf.ptr),
-                                                     config.batch_size,
-                                                     config.dim_m,
-                                                     config.dim_k,
-                                                     config.quant_type);
+        ggml_sycl::ggml_sycl_mul_mat_unified_default(queue, weight_buf.ptr, static_cast<const float *>(act_buf.ptr),
+                                                     static_cast<float *>(out_buf.ptr), config.batch_size, config.dim_m,
+                                                     config.dim_k, config.quant_type);
     }
     queue.wait_and_throw();
 
@@ -1121,14 +1172,9 @@ inline bool BenchmarkHarness::run_unified(const BenchmarkConfig & config,
     iter_us.reserve(static_cast<size_t>(config.measure_iterations));
     for (int i = 0; i < config.measure_iterations; ++i) {
         auto t0 = std::chrono::high_resolution_clock::now();
-        ggml_sycl::ggml_sycl_mul_mat_unified_default(queue,
-                                                     weight_buf.ptr,
-                                                     static_cast<const float *>(act_buf.ptr),
-                                                     static_cast<float *>(out_buf.ptr),
-                                                     config.batch_size,
-                                                     config.dim_m,
-                                                     config.dim_k,
-                                                     config.quant_type);
+        ggml_sycl::ggml_sycl_mul_mat_unified_default(queue, weight_buf.ptr, static_cast<const float *>(act_buf.ptr),
+                                                     static_cast<float *>(out_buf.ptr), config.batch_size, config.dim_m,
+                                                     config.dim_k, config.quant_type);
         queue.wait_and_throw();
         auto t1 = std::chrono::high_resolution_clock::now();
         iter_us.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
@@ -1139,26 +1185,22 @@ inline bool BenchmarkHarness::run_unified(const BenchmarkConfig & config,
         sum_us += v;
     }
     const double mean_us = (iter_us.empty()) ? 0.0 : sum_us / static_cast<double>(iter_us.size());
-    const double mean_s = mean_us * 1e-6;
+    const double mean_s  = mean_us * 1e-6;
 
     double variance = 0.0;
     for (double v : iter_us) {
         const double diff = v - mean_us;
         variance += diff * diff;
     }
-    const double std_us = (iter_us.size() > 1)
-        ? std::sqrt(variance / static_cast<double>(iter_us.size() - 1))
-        : 0.0;
+    const double std_us = (iter_us.size() > 1) ? std::sqrt(variance / static_cast<double>(iter_us.size() - 1)) : 0.0;
 
-    out.result.latency_us = mean_us;
-    out.result.latency_std = std_us;
+    out.result.latency_us     = mean_us;
+    out.result.latency_std    = std_us;
     out.result.throughput_tps = (mean_s > 0.0) ? (static_cast<double>(config.batch_size) / mean_s) : 0.0;
-    out.result.bandwidth_gbps = (mean_s > 0.0)
-        ? (static_cast<double>(weight_bytes + activation_bytes + output_bytes) / mean_s) / 1e9
-        : 0.0;
+    out.result.bandwidth_gbps =
+        (mean_s > 0.0) ? (static_cast<double>(weight_bytes + activation_bytes + output_bytes) / mean_s) / 1e9 : 0.0;
     if (mean_s > 0.0) {
-        const double ops = 2.0 * static_cast<double>(config.batch_size) *
-                           static_cast<double>(config.dim_m) *
+        const double ops = 2.0 * static_cast<double>(config.batch_size) * static_cast<double>(config.dim_m) *
                            static_cast<double>(config.dim_k);
         out.result.throughput_tops = ops / mean_s / 1.0e12;
     }
@@ -1174,14 +1216,13 @@ inline bool BenchmarkHarness::run_unified(const BenchmarkConfig & config,
         }
         queue.wait_and_throw();
 
-        const double abs_tol = config.abs_tol;
-        const double rel_tol = config.rel_tol;
+        const double       abs_tol = config.abs_tol;
+        const double       rel_tol = config.rel_tol;
         std::vector<float> weights_deq(config.dim_m * config.dim_k);
 
         for (int64_t row = 0; row < config.dim_m; ++row) {
             const uint8_t * row_ptr = weights.aos.data() + row * ggml_row_size(config.quant_type, config.dim_k);
-            if (!dequantize_weights_row(config.quant_type, row_ptr,
-                                        weights_deq.data() + row * config.dim_k,
+            if (!dequantize_weights_row(config.quant_type, row_ptr, weights_deq.data() + row * config.dim_k,
                                         config.dim_k, error)) {
                 out.error = error;
                 free_buffer(weight_buf, queue);
@@ -1191,35 +1232,35 @@ inline bool BenchmarkHarness::run_unified(const BenchmarkConfig & config,
             }
         }
 
-        double max_err = 0.0;
-        double sum_err = 0.0;
-        double max_ref_abs = 0.0;
-        const size_t total_vals = static_cast<size_t>(config.batch_size * config.dim_m);
+        double       max_err     = 0.0;
+        double       sum_err     = 0.0;
+        double       max_ref_abs = 0.0;
+        const size_t total_vals  = static_cast<size_t>(config.batch_size * config.dim_m);
         for (int64_t b = 0; b < config.batch_size; ++b) {
             const float * act = activations.fp32.data() + b * config.dim_k;
             for (int64_t row = 0; row < config.dim_m; ++row) {
-                const float * w = weights_deq.data() + row * config.dim_k;
-                float sum_row = 0.0f;
+                const float * w       = weights_deq.data() + row * config.dim_k;
+                float         sum_row = 0.0f;
                 for (int64_t k = 0; k < config.dim_k; ++k) {
                     sum_row += w[k] * act[k];
                 }
-                const size_t idx = static_cast<size_t>(b) * static_cast<size_t>(config.dim_m) + static_cast<size_t>(row);
+                const size_t idx =
+                    static_cast<size_t>(b) * static_cast<size_t>(config.dim_m) + static_cast<size_t>(row);
                 const double ref_val = static_cast<double>(sum_row);
-                const double diff = std::fabs(ref_val - static_cast<double>(host_output[idx]));
+                const double diff    = std::fabs(ref_val - static_cast<double>(host_output[idx]));
                 sum_err += diff;
-                max_err = std::max(max_err, diff);
+                max_err     = std::max(max_err, diff);
                 max_ref_abs = std::max(max_ref_abs, std::fabs(ref_val));
             }
         }
 
-        out.max_abs_error = max_err;
+        out.max_abs_error  = max_err;
         out.mean_abs_error = (total_vals > 0) ? sum_err / static_cast<double>(total_vals) : 0.0;
 
         const double tol = abs_tol + rel_tol * max_ref_abs;
         if (max_err > tol) {
             char msg[256];
-            std::snprintf(msg, sizeof(msg),
-                          "Validation failed: max_abs_error=%.6f (tol=%.6f, abs=%.6f, rel=%.6f).",
+            std::snprintf(msg, sizeof(msg), "Validation failed: max_abs_error=%.6f (tol=%.6f, abs=%.6f, rel=%.6f).",
                           max_err, tol, abs_tol, rel_tol);
             out.error = msg;
             free_buffer(weight_buf, queue);
@@ -1237,9 +1278,7 @@ inline bool BenchmarkHarness::run_unified(const BenchmarkConfig & config,
     return true;
 }
 
-inline bool BenchmarkHarness::run_dpas(const BenchmarkConfig & config,
-                                       sycl::queue & queue,
-                                       BenchmarkOutput & out) {
+inline bool BenchmarkHarness::run_dpas(const BenchmarkConfig & config, sycl::queue & queue, BenchmarkOutput & out) {
     int device_id = config.device_id;
     if (device_id < 0) {
         device_id = get_current_device_id();
@@ -1248,13 +1287,12 @@ inline bool BenchmarkHarness::run_dpas(const BenchmarkConfig & config,
         out.error = "Invalid dimensions for DPAS benchmark.";
         return false;
     }
-    if (config.dpas_repeat != 1 && config.dpas_repeat != 2 &&
-        config.dpas_repeat != 4 && config.dpas_repeat != 8) {
+    if (config.dpas_repeat != 1 && config.dpas_repeat != 2 && config.dpas_repeat != 4 && config.dpas_repeat != 8) {
         out.error = "DPAS repeat must be 1,2,4,8.";
         return false;
     }
-    if (config.dpas_n_tile_repeats != 1 && config.dpas_n_tile_repeats != 2 &&
-        config.dpas_n_tile_repeats != 4 && config.dpas_n_tile_repeats != 8) {
+    if (config.dpas_n_tile_repeats != 1 && config.dpas_n_tile_repeats != 2 && config.dpas_n_tile_repeats != 4 &&
+        config.dpas_n_tile_repeats != 8) {
         out.error = "DPAS n-tile repeats must be 1, 2, 4, or 8.";
         return false;
     }
@@ -1293,11 +1331,11 @@ inline bool BenchmarkHarness::run_dpas(const BenchmarkConfig & config,
 
     const size_t a_tile_elems = static_cast<size_t>(config.dpas_repeat) * static_cast<size_t>(k_per);
     const size_t b_tile_elems = static_cast<size_t>(k_per) * 16u;
-    const size_t a_elems = static_cast<size_t>(m_tiles) * static_cast<size_t>(k_tiles) * a_tile_elems;
-    const size_t b_elems = static_cast<size_t>(n_tiles) * static_cast<size_t>(k_tiles) * b_tile_elems;
-    const size_t c_elems = static_cast<size_t>(config.dim_m) * static_cast<size_t>(config.dim_n);
+    const size_t a_elems      = static_cast<size_t>(m_tiles) * static_cast<size_t>(k_tiles) * a_tile_elems;
+    const size_t b_elems      = static_cast<size_t>(n_tiles) * static_cast<size_t>(k_tiles) * b_tile_elems;
+    const size_t c_elems      = static_cast<size_t>(config.dim_m) * static_cast<size_t>(config.dim_n);
 
-    std::string error;
+    std::string  error;
     const size_t misalign = config.dpas_misaligned ? 1u : 0u;
 
     auto alloc = [&](size_t bytes, DeviceBuffer & buf) -> bool {
@@ -1357,10 +1395,10 @@ inline bool BenchmarkHarness::run_dpas(const BenchmarkConfig & config,
         }
 
         const int elem_bits = static_cast<int>(sizeof(TB) * 8);
-        const int pack = (elem_bits > 0) ? (32 / elem_bits) : 1;
+        const int pack      = (elem_bits > 0) ? (32 / elem_bits) : 1;
 
-        const size_t per_tile_k = static_cast<size_t>(k_per);
-        const size_t per_tile_n = 16;
+        const size_t    per_tile_k = static_cast<size_t>(k_per);
+        const size_t    per_tile_n = 16;
         std::vector<TB> b_tile(per_tile_k * per_tile_n);
         for (size_t i = 0; i < b_tile.size(); ++i) {
             if constexpr (std::is_same_v<TB, int8_t>) {
@@ -1383,12 +1421,17 @@ inline bool BenchmarkHarness::run_dpas(const BenchmarkConfig & config,
         DeviceBuffer b_buf;
         DeviceBuffer c_buf;
 
-        if (!alloc(a_host.size() * sizeof(TA), a_buf) ||
-            !alloc(b_host.size() * sizeof(TB), b_buf) ||
+        if (!alloc(a_host.size() * sizeof(TA), a_buf) || !alloc(b_host.size() * sizeof(TB), b_buf) ||
             !alloc(c_host.size() * sizeof(TC), c_buf)) {
-            if (a_buf.ptr) free_buffer(a_buf, queue);
-            if (b_buf.ptr) free_buffer(b_buf, queue);
-            if (c_buf.ptr) free_buffer(c_buf, queue);
+            if (a_buf.ptr) {
+                free_buffer(a_buf, queue);
+            }
+            if (b_buf.ptr) {
+                free_buffer(b_buf, queue);
+            }
+            if (c_buf.ptr) {
+                free_buffer(c_buf, queue);
+            }
             return false;
         }
 
@@ -1411,21 +1454,21 @@ inline bool BenchmarkHarness::run_dpas(const BenchmarkConfig & config,
         queue.wait_and_throw();
 
         DpasBenchArgs args{};
-        args.a = a_ptr;
-        args.b = b_ptr;
-        args.c = c_ptr;
-        args.m = config.dim_m;
-        args.n = config.dim_n;
-        args.k = config.dim_k;
-        args.type_a = config.dpas_type_a;
-        args.type_b = config.dpas_type_b;
-        args.type_acc = config.dpas_type_acc;
+        args.a              = a_ptr;
+        args.b              = b_ptr;
+        args.c              = c_ptr;
+        args.m              = config.dim_m;
+        args.n              = config.dim_n;
+        args.k              = config.dim_k;
+        args.type_a         = config.dpas_type_a;
+        args.type_b         = config.dpas_type_b;
+        args.type_acc       = config.dpas_type_acc;
         args.memory_pattern = config.dpas_memory_pattern;
-        args.grf_mode = config.dpas_grf_mode;
-        args.repeat = config.dpas_repeat;
+        args.grf_mode       = config.dpas_grf_mode;
+        args.repeat         = config.dpas_repeat;
         args.n_tile_repeats = config.dpas_n_tile_repeats;
-        args.misaligned = config.dpas_misaligned;
-        args.stream = &queue;
+        args.misaligned     = config.dpas_misaligned;
+        args.stream         = &queue;
 
         auto launch_kernel = [&](std::vector<sycl::event> * evs, std::string & launch_error) -> bool {
             if (config.kernel_name == "dpas_baseline") {
@@ -1471,7 +1514,7 @@ inline bool BenchmarkHarness::run_dpas(const BenchmarkConfig & config,
         std::vector<double> iter_ns;
         iter_ns.reserve(events.size());
         for (const auto & ev : events) {
-            uint64_t start = 0;
+            uint64_t start  = 0;
             uint64_t finish = 0;
             if (!get_event_timing(ev, start, finish, error)) {
                 out.error = error;
@@ -1487,29 +1530,30 @@ inline bool BenchmarkHarness::run_dpas(const BenchmarkConfig & config,
         for (double v : iter_ns) {
             sum += v;
         }
-        const double mean_ns = (iter_ns.empty()) ? 0.0 : sum / static_cast<double>(iter_ns.size());
-        double variance = 0.0;
+        const double mean_ns  = (iter_ns.empty()) ? 0.0 : sum / static_cast<double>(iter_ns.size());
+        double       variance = 0.0;
         for (double v : iter_ns) {
             const double diff = v - mean_ns;
             variance += diff * diff;
         }
-        const double std_ns = (iter_ns.size() > 1) ? std::sqrt(variance / static_cast<double>(iter_ns.size() - 1)) : 0.0;
+        const double std_ns =
+            (iter_ns.size() > 1) ? std::sqrt(variance / static_cast<double>(iter_ns.size() - 1)) : 0.0;
 
         const double mean_s = mean_ns * 1e-9;
-        const double ops = 2.0 * static_cast<double>(config.dim_m) * static_cast<double>(config.dim_n) * static_cast<double>(config.dim_k);
+        const double ops    = 2.0 * static_cast<double>(config.dim_m) * static_cast<double>(config.dim_n) *
+                           static_cast<double>(config.dim_k);
         const double tops = (mean_s > 0.0) ? (ops / mean_s / 1.0e12) : 0.0;
 
-        const double bytes_moved = static_cast<double>(a_host.size() * sizeof(TA) +
-                                                       b_host.size() * sizeof(TB) +
-                                                       c_host.size() * sizeof(TC));
+        const double bytes_moved =
+            static_cast<double>(a_host.size() * sizeof(TA) + b_host.size() * sizeof(TB) + c_host.size() * sizeof(TC));
         const double bandwidth = (mean_s > 0.0) ? (bytes_moved / mean_s / 1.0e9) : 0.0;
 
         out.result.throughput_tops = tops;
-        out.result.latency_ns = mean_ns;
-        out.result.latency_us = mean_ns * 1e-3;
-        out.result.latency_std = std_ns * 1e-3;
-        out.result.bandwidth_gbps = bandwidth;
-        out.ok = true;
+        out.result.latency_ns      = mean_ns;
+        out.result.latency_us      = mean_ns * 1e-3;
+        out.result.latency_std     = std_ns * 1e-3;
+        out.result.bandwidth_gbps  = bandwidth;
+        out.ok                     = true;
 
         free_buffer(a_buf, queue);
         free_buffer(b_buf, queue);
@@ -1534,56 +1578,47 @@ inline bool BenchmarkHarness::run_dpas(const BenchmarkConfig & config,
     return false;
 }
 
-inline bool BenchmarkHarness::apply_dpas_tuning(BenchmarkConfig & config,
-                                                sycl::queue & queue,
-                                                std::string & error) {
+inline bool BenchmarkHarness::apply_dpas_tuning(BenchmarkConfig & config, sycl::queue & queue, std::string & error) {
     if (!config.dpas_device_opt && !config.dpas_autotune) {
         return true;
     }
     if (config.kernel_name != "dpas_memory_patterns") {
         return true;
     }
-    const DeviceInfo info = query_device_info(queue.get_device());
-    const std::string device_key = make_device_key(info);
-    const int prefetch_override = config.dpas_autotune_override_prefetch;
-    const int ntiles_override = config.dpas_autotune_override_ntiles;
-    bool tuned = false;
+    const DeviceInfo  info              = query_device_info(queue.get_device());
+    const std::string device_key        = make_device_key(info);
+    const int         prefetch_override = config.dpas_autotune_override_prefetch;
+    const int         ntiles_override   = config.dpas_autotune_override_ntiles;
+    bool              tuned             = false;
 
     if (config.dpas_memory_explicit || config.dpas_ntiles_explicit) {
-        std::fprintf(stderr,
-                     "[DPAS tune] Skipping device tuning; explicit --dpas-memory/--dpas-ntiles provided.\n");
+        std::fprintf(stderr, "[DPAS tune] Skipping device tuning; explicit --dpas-memory/--dpas-ntiles provided.\n");
         return true;
     }
 
     DpasTuneKey key{};
     key.device_key = device_key;
-    key.dim_m = config.dim_m;
-    key.dim_n = config.dim_n;
-    key.dim_k = config.dim_k;
-    key.repeat = config.dpas_repeat;
-    key.type_a = config.dpas_type_a;
-    key.type_b = config.dpas_type_b;
-    key.type_acc = config.dpas_type_acc;
-    key.grf_mode = config.dpas_grf_mode;
+    key.dim_m      = config.dim_m;
+    key.dim_n      = config.dim_n;
+    key.dim_k      = config.dim_k;
+    key.repeat     = config.dpas_repeat;
+    key.type_a     = config.dpas_type_a;
+    key.type_b     = config.dpas_type_b;
+    key.type_acc   = config.dpas_type_acc;
+    key.grf_mode   = config.dpas_grf_mode;
     key.misaligned = config.dpas_misaligned;
-    key.metric = dpas_tune_metric_name(config.dpas_autotune_metric);
+    key.metric     = dpas_tune_metric_name(config.dpas_autotune_metric);
 
     if (config.dpas_autotune) {
         DpasTuneResult cached{};
-        if (!config.dpas_autotune_force &&
-            load_dpas_tuning_cache(config.dpas_autotune_cache, key, cached)) {
-            config.dpas_n_tile_repeats = cached.ntiles;
-            config.dpas_memory_pattern = cached.memory_pattern;
-            const bool prefer_bandwidth = (key.metric == "bandwidth");
-            const double metric_value = prefer_bandwidth ? cached.bandwidth : cached.tops;
-            std::fprintf(stderr,
-                         "[DPAS tune] Cache hit (%s): metric=%s ntiles=%d prefetch=%d memory=%s %s=%.2f\n",
-                         config.dpas_autotune_cache.c_str(),
-                         key.metric.c_str(),
-                         cached.ntiles,
-                         cached.prefetch_dist,
-                         dpas_memory_pattern_name(cached.memory_pattern),
-                         prefer_bandwidth ? "bandwidth" : "tops",
+        if (!config.dpas_autotune_force && load_dpas_tuning_cache(config.dpas_autotune_cache, key, cached)) {
+            config.dpas_n_tile_repeats    = cached.ntiles;
+            config.dpas_memory_pattern    = cached.memory_pattern;
+            const bool   prefer_bandwidth = (key.metric == "bandwidth");
+            const double metric_value     = prefer_bandwidth ? cached.bandwidth : cached.tops;
+            std::fprintf(stderr, "[DPAS tune] Cache hit (%s): metric=%s ntiles=%d prefetch=%d memory=%s %s=%.2f\n",
+                         config.dpas_autotune_cache.c_str(), key.metric.c_str(), cached.ntiles, cached.prefetch_dist,
+                         dpas_memory_pattern_name(cached.memory_pattern), prefer_bandwidth ? "bandwidth" : "tops",
                          metric_value);
             tuned = true;
         } else {
@@ -1592,17 +1627,13 @@ inline bool BenchmarkHarness::apply_dpas_tuning(BenchmarkConfig & config,
                 config.dpas_n_tile_repeats = best.ntiles;
                 config.dpas_memory_pattern = best.memory_pattern;
                 append_dpas_tuning_cache(config.dpas_autotune_cache, info, key, best);
-                const bool prefer_bandwidth = (key.metric == "bandwidth");
-                const double metric_value = prefer_bandwidth ? best.bandwidth : best.tops;
-                std::fprintf(stderr,
-                             "[DPAS tune] Autotune picked metric=%s ntiles=%d prefetch=%d memory=%s %s=%.2f (cache=%s)\n",
-                             key.metric.c_str(),
-                             best.ntiles,
-                             best.prefetch_dist,
-                             dpas_memory_pattern_name(best.memory_pattern),
-                             prefer_bandwidth ? "bandwidth" : "tops",
-                             metric_value,
-                             config.dpas_autotune_cache.c_str());
+                const bool   prefer_bandwidth = (key.metric == "bandwidth");
+                const double metric_value     = prefer_bandwidth ? best.bandwidth : best.tops;
+                std::fprintf(
+                    stderr,
+                    "[DPAS tune] Autotune picked metric=%s ntiles=%d prefetch=%d memory=%s %s=%.2f (cache=%s)\n",
+                    key.metric.c_str(), best.ntiles, best.prefetch_dist, dpas_memory_pattern_name(best.memory_pattern),
+                    prefer_bandwidth ? "bandwidth" : "tops", metric_value, config.dpas_autotune_cache.c_str());
                 tuned = true;
             } else if (!error.empty()) {
                 std::fprintf(stderr, "[DPAS tune] Autotune failed: %s\n", error.c_str());
@@ -1623,38 +1654,29 @@ inline bool BenchmarkHarness::apply_dpas_tuning(BenchmarkConfig & config,
             if (!config.dpas_grf_explicit) {
                 config.dpas_grf_mode = entry.grf;
             }
-            if (!config.dpas_acc_explicit &&
-                config.dpas_type_a == DpasType::INT8 &&
+            if (!config.dpas_acc_explicit && config.dpas_type_a == DpasType::INT8 &&
                 config.dpas_type_b == DpasType::INT8) {
                 config.dpas_type_acc = entry.acc;
             }
             const int prefetch_dist = dpas_prefetch_dist_from_pattern(config.dpas_memory_pattern);
-            std::fprintf(stderr,
-                         "[DPAS tune] Heuristic table: ntiles=%d prefetch=%d memory=%s grf=%s acc=%s (repeat=%d, dim_n=%lld)\n",
-                         config.dpas_n_tile_repeats,
-                         prefetch_dist,
-                         dpas_memory_pattern_name(config.dpas_memory_pattern),
-                         dpas_grf_mode_name(config.dpas_grf_mode),
-                         dpas_acc_name(config.dpas_type_acc),
-                         config.dpas_repeat,
-                         static_cast<long long>(config.dim_n));
+            std::fprintf(
+                stderr,
+                "[DPAS tune] Heuristic table: ntiles=%d prefetch=%d memory=%s grf=%s acc=%s (repeat=%d, dim_n=%lld)\n",
+                config.dpas_n_tile_repeats, prefetch_dist, dpas_memory_pattern_name(config.dpas_memory_pattern),
+                dpas_grf_mode_name(config.dpas_grf_mode), dpas_acc_name(config.dpas_type_acc), config.dpas_repeat,
+                static_cast<long long>(config.dim_n));
             tuned = true;
         }
     }
 
     if (!tuned && config.dpas_device_opt) {
-        int ntiles = dpas_heuristic_ntiles(config, info);
+        int ntiles                 = dpas_heuristic_ntiles(config, info);
         config.dpas_memory_pattern = dpas_heuristic_memory_pattern(config, info);
-        int prefetch_dist = dpas_prefetch_dist_from_pattern(config.dpas_memory_pattern);
+        int prefetch_dist          = dpas_prefetch_dist_from_pattern(config.dpas_memory_pattern);
         config.dpas_n_tile_repeats = ntiles;
-        std::fprintf(stderr,
-                     "[DPAS tune] Heuristic ntiles=%d prefetch=%d memory=%s (repeat=%d, EU=%u, SLM=%zu KB)\n",
-                     ntiles,
-                     prefetch_dist,
-                     dpas_memory_pattern_name(config.dpas_memory_pattern),
-                     config.dpas_repeat,
-                     info.max_compute_units,
-                     info.local_mem_size / 1024);
+        std::fprintf(stderr, "[DPAS tune] Heuristic ntiles=%d prefetch=%d memory=%s (repeat=%d, EU=%u, SLM=%zu KB)\n",
+                     ntiles, prefetch_dist, dpas_memory_pattern_name(config.dpas_memory_pattern), config.dpas_repeat,
+                     info.max_compute_units, info.local_mem_size / 1024);
     }
 
     if (ntiles_override > 0) {
@@ -1670,39 +1692,41 @@ inline bool BenchmarkHarness::apply_dpas_tuning(BenchmarkConfig & config,
 }
 
 inline bool BenchmarkHarness::run_dpas_autotune(const BenchmarkConfig & base,
-                                                sycl::queue & queue,
-                                                DpasTuneResult & best,
-                                                std::string & error) {
-    BenchmarkConfig config = base;
-    config.validate = false;
+                                                sycl::queue &           queue,
+                                                DpasTuneResult &        best,
+                                                std::string &           error) {
+    BenchmarkConfig config     = base;
+    config.validate            = false;
     config.include_percentiles = false;
     config.include_ref_metrics = false;
-    config.warmup_iterations = std::min(config.warmup_iterations, 5);
-    config.measure_iterations = std::min(config.measure_iterations, 20);
+    config.warmup_iterations   = std::min(config.warmup_iterations, 5);
+    config.measure_iterations  = std::min(config.measure_iterations, 20);
     config.dpas_memory_pattern = DpasMemoryPattern::LSC_PREFETCH;
 
-    const int64_t n_tiles = config.dim_n / 16;
-    const int ntiles_candidates[] = {1, 2, 4, 8};
+    const int64_t n_tiles             = config.dim_n / 16;
+    const int     ntiles_candidates[] = { 1, 2, 4, 8 };
+
     struct PatternCandidate {
         DpasMemoryPattern pattern;
-        int prefetch_dist;
+        int               prefetch_dist;
     };
+
     const PatternCandidate pattern_candidates[] = {
-        {DpasMemoryPattern::LSC_STREAMING, 0},
-        {DpasMemoryPattern::LSC_PREFETCH, 1},
-        {DpasMemoryPattern::LSC_PREFETCH_2, 2},
-        {DpasMemoryPattern::LSC_PREFETCH_3, 3},
-        {DpasMemoryPattern::LSC_PREFETCH_4, 4},
-        {DpasMemoryPattern::LSC_PREFETCH_5, 5},
-        {DpasMemoryPattern::LSC_PREFETCH_6, 6},
-        {DpasMemoryPattern::LSC_PREFETCH_8, 8},
-        {DpasMemoryPattern::LSC_PREFETCH_10, 10},
+        { DpasMemoryPattern::LSC_STREAMING,   0  },
+        { DpasMemoryPattern::LSC_PREFETCH,    1  },
+        { DpasMemoryPattern::LSC_PREFETCH_2,  2  },
+        { DpasMemoryPattern::LSC_PREFETCH_3,  3  },
+        { DpasMemoryPattern::LSC_PREFETCH_4,  4  },
+        { DpasMemoryPattern::LSC_PREFETCH_5,  5  },
+        { DpasMemoryPattern::LSC_PREFETCH_6,  6  },
+        { DpasMemoryPattern::LSC_PREFETCH_8,  8  },
+        { DpasMemoryPattern::LSC_PREFETCH_10, 10 },
     };
 
     // Precompile all candidates to reduce JIT bias during the timed sweep.
     {
-        BenchmarkConfig warm = config;
-        warm.warmup_iterations = 0;
+        BenchmarkConfig warm    = config;
+        warm.warmup_iterations  = 0;
         warm.measure_iterations = 1;
         for (const auto & candidate : pattern_candidates) {
             warm.dpas_memory_pattern = candidate.pattern;
@@ -1726,12 +1750,12 @@ inline bool BenchmarkHarness::run_dpas_autotune(const BenchmarkConfig & base,
         double med = values[mid];
         if ((values.size() & 1u) == 0u && mid > 0) {
             const double lower = *std::max_element(values.begin(), values.begin() + mid);
-            med = 0.5 * (med + lower);
+            med                = 0.5 * (med + lower);
         }
         return med;
     };
 
-    const int sweep_samples = 5;
+    const int      sweep_samples = 5;
     DpasTuneResult best_local{};
     for (const auto & candidate : pattern_candidates) {
         config.dpas_memory_pattern = candidate.pattern;
@@ -1755,17 +1779,17 @@ inline bool BenchmarkHarness::run_dpas_autotune(const BenchmarkConfig & base,
             if (tops_samples.empty()) {
                 continue;
             }
-            const double tops = median_value(tops_samples);
+            const double tops      = median_value(tops_samples);
             const double bandwidth = median_value(bw_samples);
-            const double score = (base.dpas_autotune_metric == DpasTuneMetric::BANDWIDTH) ? bandwidth : tops;
+            const double score     = (base.dpas_autotune_metric == DpasTuneMetric::BANDWIDTH) ? bandwidth : tops;
             const double best_score =
                 (base.dpas_autotune_metric == DpasTuneMetric::BANDWIDTH) ? best_local.bandwidth : best_local.tops;
             if (!best_local.valid || score > best_score) {
-                best_local.valid = true;
-                best_local.ntiles = ntiles;
-                best_local.prefetch_dist = candidate.prefetch_dist;
-                best_local.tops = tops;
-                best_local.bandwidth = bandwidth;
+                best_local.valid          = true;
+                best_local.ntiles         = ntiles;
+                best_local.prefetch_dist  = candidate.prefetch_dist;
+                best_local.tops           = tops;
+                best_local.bandwidth      = bandwidth;
                 best_local.memory_pattern = candidate.pattern;
             }
         }
@@ -1779,7 +1803,7 @@ inline bool BenchmarkHarness::run_dpas_autotune(const BenchmarkConfig & base,
 }
 
 inline bool BenchmarkHarness::run(const BenchmarkConfig & config, BenchmarkOutput & out) const {
-    out = {};
+    out        = {};
     out.config = config;
 
     const int device_count = ggml_backend_sycl_get_device_count();
@@ -1798,9 +1822,9 @@ inline bool BenchmarkHarness::run(const BenchmarkConfig & config, BenchmarkOutpu
     }
 
     dpct::select_device(static_cast<unsigned int>(device_id));
-    auto & device = dpct::get_device(device_id);
-    auto & base_queue = device.default_queue();
-    sycl::async_handler handler = [](sycl::exception_list exceptions) {
+    auto &              device     = dpct::get_device(device_id);
+    auto &              base_queue = device.default_queue();
+    sycl::async_handler handler    = [](sycl::exception_list exceptions) {
         for (const auto & e : exceptions) {
             try {
                 std::rethrow_exception(e);
@@ -1809,14 +1833,12 @@ inline bool BenchmarkHarness::run(const BenchmarkConfig & config, BenchmarkOutpu
             }
         }
     };
-    sycl::queue queue(base_queue.get_context(),
-                      device,
-                      handler,
+    sycl::queue queue(base_queue.get_context(), device, handler,
                       sycl::property_list{ sycl::property::queue::enable_profiling{} });
 
     if (config.kernel_kind == KernelKind::DPAS_EXPLORATION) {
         BenchmarkConfig tuned = config;
-        std::string tune_error;
+        std::string     tune_error;
         if (!apply_dpas_tuning(tuned, queue, tune_error)) {
             out.error = tune_error;
             return false;
@@ -1848,48 +1870,37 @@ inline bool BenchmarkHarness::run(const BenchmarkConfig & config, BenchmarkOutpu
     }
 
     const int64_t k_padded = GGML_PAD(config.dim_k, MATRIX_ROW_PADDING);
-    const size_t activation_bytes =
+    const size_t  activation_bytes =
         static_cast<size_t>(config.batch_size) * static_cast<size_t>(k_padded) * sizeof(block_q8_1) / QK8_1;
     const size_t output_bytes =
         static_cast<size_t>(config.batch_size) * static_cast<size_t>(config.dim_m) * sizeof(float);
 
     GeneratedWeights weights;
-    if (!generate_quantized_weights(config.quant_type,
-                                    config.layout,
-                                    config.dim_m,
-                                    config.dim_k,
-                                    config.validate,
+    if (!generate_quantized_weights(config.quant_type, config.layout, config.dim_m, config.dim_k, config.validate,
                                     weights)) {
         out.error = "Failed to generate quantized weights for requested layout/type.";
         return false;
     }
 
-    const bool activations_soa = (config.layout == GGML_LAYOUT_SOA || config.layout == GGML_LAYOUT_COALESCED);
-    GeneratedActivations activations = generate_activations(config.batch_size,
-                                                            config.dim_k,
-                                                            k_padded,
-                                                            config.validate,
-                                                            config.validate,
-                                                            activations_soa);
+    const bool           activations_soa = (config.layout == GGML_LAYOUT_SOA || config.layout == GGML_LAYOUT_COALESCED);
+    GeneratedActivations activations = generate_activations(config.batch_size, config.dim_k, k_padded, config.validate,
+                                                            config.validate, activations_soa);
 
     const size_t weight_bytes = (config.layout == GGML_LAYOUT_AOS) ? weights.bytes_aos : weights.bytes_layout;
-    const size_t total_bytes = weight_bytes + activation_bytes + output_bytes;
+    const size_t total_bytes  = weight_bytes + activation_bytes + output_bytes;
 
-    size_t free_mem = 0;
+    size_t free_mem  = 0;
     size_t total_mem = 0;
     ggml_backend_sycl_get_device_memory(device_id, &free_mem, &total_mem);
     if (total_mem > 0 && total_bytes > total_mem) {
         char msg[256];
-        std::snprintf(msg,
-                      sizeof(msg),
-                      "Required memory (%.2f GB) exceeds device memory (%.2f GB).",
-                      total_bytes / (1024.0 * 1024.0 * 1024.0),
-                      total_mem / (1024.0 * 1024.0 * 1024.0));
+        std::snprintf(msg, sizeof(msg), "Required memory (%.2f GB) exceeds device memory (%.2f GB).",
+                      total_bytes / (1024.0 * 1024.0 * 1024.0), total_mem / (1024.0 * 1024.0 * 1024.0));
         out.error = msg;
         return false;
     }
 
-    std::string error;
+    std::string  error;
     DeviceBuffer weight_buf = allocate_buffer(weight_bytes, config.memory_mode, queue, device_id, error);
     if (!error.empty()) {
         out.error = error;
@@ -1928,21 +1939,21 @@ inline bool BenchmarkHarness::run(const BenchmarkConfig & config, BenchmarkOutpu
     queue.wait_and_throw();
 
     ggml_sycl::mmvq_bench_args args{};
-    args.weight_type = config.quant_type;
-    args.layout = config.layout;
-    args.weights = weight_buf.ptr;
-    args.layout_base = (config.layout == GGML_LAYOUT_AOS) ? nullptr : weight_buf.ptr;
-    args.activations = act_buf.ptr;
-    args.output = static_cast<float *>(out_buf.ptr);
-    args.ncols = config.dim_k;
-    args.nrows = config.dim_m;
-    args.batch = config.batch_size;
-    args.row_low = 0;
-    args.row_high = config.dim_m;
+    args.weight_type          = config.quant_type;
+    args.layout               = config.layout;
+    args.weights              = weight_buf.ptr;
+    args.layout_base          = (config.layout == GGML_LAYOUT_AOS) ? nullptr : weight_buf.ptr;
+    args.activations          = act_buf.ptr;
+    args.output               = static_cast<float *>(out_buf.ptr);
+    args.ncols                = config.dim_k;
+    args.nrows                = config.dim_m;
+    args.batch                = config.batch_size;
+    args.row_low              = 0;
+    args.row_high             = config.dim_m;
     args.src1_padded_col_size = k_padded;
-    args.dst_row_stride = config.dim_m;
-    args.device_id = device_id;
-    args.stream = &queue;
+    args.dst_row_stride       = config.dim_m;
+    args.device_id            = device_id;
+    args.stream               = &queue;
 
     auto zero_output_if_needed = [&]() {
         if (config.kernel_name == "mmvq_xmx_multi_wg") {
@@ -2089,7 +2100,7 @@ inline bool BenchmarkHarness::run(const BenchmarkConfig & config, BenchmarkOutpu
     if (events.empty()) {
         // Fallback to host timing when kernels do not surface events.
         for (int i = 0; i < config.measure_iterations; ++i) {
-            auto t0 = std::chrono::high_resolution_clock::now();
+            auto        t0 = std::chrono::high_resolution_clock::now();
             std::string launch_error;
             if (!launch_kernel(nullptr, launch_error)) {
                 out.error = launch_error.empty() ? "Measured kernel launch failed." : launch_error;
@@ -2105,7 +2116,7 @@ inline bool BenchmarkHarness::run(const BenchmarkConfig & config, BenchmarkOutpu
     } else {
         for (size_t i = 0; i < iter_offsets.size(); ++i) {
             const size_t begin = iter_offsets[i];
-            const size_t end = (i + 1 < iter_offsets.size()) ? iter_offsets[i + 1] : events.size();
+            const size_t end   = (i + 1 < iter_offsets.size()) ? iter_offsets[i + 1] : events.size();
             if (end <= begin) {
                 out.error = "No events captured for iteration.";
                 free_buffer(weight_buf, queue);
@@ -2114,9 +2125,9 @@ inline bool BenchmarkHarness::run(const BenchmarkConfig & config, BenchmarkOutpu
                 return false;
             }
             uint64_t min_start = 0;
-            uint64_t max_end = 0;
+            uint64_t max_end   = 0;
             for (size_t j = begin; j < end; ++j) {
-                uint64_t start = 0;
+                uint64_t start  = 0;
                 uint64_t finish = 0;
                 if (!get_event_timing(events[j], start, finish, error)) {
                     out.error = error;
@@ -2158,30 +2169,26 @@ inline bool BenchmarkHarness::run(const BenchmarkConfig & config, BenchmarkOutpu
         if (sorted_ns.size() == 1) {
             return sorted_ns[0];
         }
-        const double pos = (pct / 100.0) * static_cast<double>(sorted_ns.size() - 1);
-        const size_t idx = static_cast<size_t>(pos);
+        const double pos  = (pct / 100.0) * static_cast<double>(sorted_ns.size() - 1);
+        const size_t idx  = static_cast<size_t>(pos);
         const size_t idx2 = std::min(idx + 1, sorted_ns.size() - 1);
         const double frac = pos - static_cast<double>(idx);
         return sorted_ns[idx] + (sorted_ns[idx2] - sorted_ns[idx]) * frac;
     };
 
-    const double mean_s = mean_ns * 1e-9;
-    out.result.latency_us = mean_ns * 1e-3;
-    out.result.latency_std = std_ns * 1e-3;
+    const double mean_s       = mean_ns * 1e-9;
+    out.result.latency_us     = mean_ns * 1e-3;
+    out.result.latency_std    = std_ns * 1e-3;
     out.result.latency_p50_us = percentile_ns(50.0) * 1e-3;
     out.result.latency_p90_us = percentile_ns(90.0) * 1e-3;
     out.result.latency_p99_us = percentile_ns(99.0) * 1e-3;
-    out.result.variance_pct = (mean_ns > 0.0) ? (std_ns / mean_ns) * 100.0 : 0.0;
+    out.result.variance_pct   = (mean_ns > 0.0) ? (std_ns / mean_ns) * 100.0 : 0.0;
     out.result.throughput_tps = (mean_s > 0.0) ? (static_cast<double>(config.batch_size) / mean_s) : 0.0;
 
-    const RooflineEstimate roofline = estimate_mmvq_roofline(config.dim_m,
-                                                             config.dim_k,
-                                                             config.batch_size,
-                                                             weight_bytes,
-                                                             activation_bytes,
-                                                             output_bytes);
-    out.result.bandwidth_gbps = (mean_s > 0.0) ? (roofline.bytes / mean_s) / 1e9 : 0.0;
-    out.result.xmx_util_pct = 0.0;
+    const RooflineEstimate roofline = estimate_mmvq_roofline(config.dim_m, config.dim_k, config.batch_size,
+                                                             weight_bytes, activation_bytes, output_bytes);
+    out.result.bandwidth_gbps       = (mean_s > 0.0) ? (roofline.bytes / mean_s) / 1e9 : 0.0;
+    out.result.xmx_util_pct         = 0.0;
 
     if (config.validate) {
         std::vector<float> host_output(config.dim_m * config.batch_size);
@@ -2194,8 +2201,8 @@ inline bool BenchmarkHarness::run(const BenchmarkConfig & config, BenchmarkOutpu
         }
         queue.wait_and_throw();
 
-        const double abs_tol = config.abs_tol;
-        const double rel_tol = config.rel_tol;
+        const double       abs_tol = config.abs_tol;
+        const double       rel_tol = config.rel_tol;
         std::vector<float> weights_deq(config.dim_m * config.dim_k);
         std::vector<float> act_deq(config.batch_size * k_padded);
 
@@ -2220,41 +2227,39 @@ inline bool BenchmarkHarness::run(const BenchmarkConfig & config, BenchmarkOutpu
                 const block_q8_1 * src_blocks = reinterpret_cast<const block_q8_1 *>(src);
                 dequantize_q8_1_row_aos(src_blocks, act_deq.data() + b * k_padded, config.dim_k);
                 if (k_padded > config.dim_k) {
-                    std::fill(act_deq.data() + b * k_padded + config.dim_k,
-                              act_deq.data() + (b + 1) * k_padded, 0.0f);
+                    std::fill(act_deq.data() + b * k_padded + config.dim_k, act_deq.data() + (b + 1) * k_padded, 0.0f);
                 }
             }
         }
 
-        double max_err = 0.0;
-        double sum_err = 0.0;
-        double max_ref_abs = 0.0;
-        const size_t total_vals = static_cast<size_t>(config.dim_m * config.batch_size);
+        double       max_err     = 0.0;
+        double       sum_err     = 0.0;
+        double       max_ref_abs = 0.0;
+        const size_t total_vals  = static_cast<size_t>(config.dim_m * config.batch_size);
         for (int64_t b = 0; b < config.batch_size; ++b) {
             const float * act = act_deq.data() + b * k_padded;
             for (int64_t row = 0; row < config.dim_m; ++row) {
-                const float * w = weights_deq.data() + row * config.dim_k;
-                float sum_row = 0.0f;
+                const float * w       = weights_deq.data() + row * config.dim_k;
+                float         sum_row = 0.0f;
                 for (int64_t k = 0; k < config.dim_k; ++k) {
                     sum_row += w[k] * act[k];
                 }
-                const size_t idx = (size_t) b * (size_t) config.dim_m + (size_t) row;
+                const size_t idx     = (size_t) b * (size_t) config.dim_m + (size_t) row;
                 const double ref_val = static_cast<double>(sum_row);
-                const double diff = std::fabs(ref_val - static_cast<double>(host_output[idx]));
+                const double diff    = std::fabs(ref_val - static_cast<double>(host_output[idx]));
                 sum_err += diff;
-                max_err = std::max(max_err, diff);
+                max_err     = std::max(max_err, diff);
                 max_ref_abs = std::max(max_ref_abs, std::fabs(ref_val));
             }
         }
 
-        out.max_abs_error = max_err;
+        out.max_abs_error  = max_err;
         out.mean_abs_error = (total_vals > 0) ? sum_err / static_cast<double>(total_vals) : 0.0;
 
         const double tol = abs_tol + rel_tol * max_ref_abs;
         if (max_err > tol) {
             char msg[256];
-            std::snprintf(msg, sizeof(msg),
-                          "Validation failed: max_abs_error=%.6f (tol=%.6f, abs=%.6f, rel=%.6f).",
+            std::snprintf(msg, sizeof(msg), "Validation failed: max_abs_error=%.6f (tol=%.6f, abs=%.6f, rel=%.6f).",
                           max_err, tol, abs_tol, rel_tol);
             out.error = msg;
             free_buffer(weight_buf, queue);
@@ -2272,9 +2277,7 @@ inline bool BenchmarkHarness::run(const BenchmarkConfig & config, BenchmarkOutpu
     return true;
 }
 
-inline bool BenchmarkHarness::run_mmq(const BenchmarkConfig & config,
-                                      sycl::queue & queue,
-                                      BenchmarkOutput & out) {
+inline bool BenchmarkHarness::run_mmq(const BenchmarkConfig & config, sycl::queue & queue, BenchmarkOutput & out) {
     const auto mmq_supports_type = [](ggml_type type) -> bool {
         switch (type) {
             case GGML_TYPE_Q4_0:
@@ -2315,48 +2318,37 @@ inline bool BenchmarkHarness::run_mmq(const BenchmarkConfig & config,
     }
 
     const int64_t k_padded = GGML_PAD(config.dim_k, MATRIX_ROW_PADDING);
-    const size_t activation_bytes =
+    const size_t  activation_bytes =
         static_cast<size_t>(config.batch_size) * static_cast<size_t>(k_padded) * sizeof(block_q8_1) / QK8_1;
     const size_t output_bytes =
         static_cast<size_t>(config.batch_size) * static_cast<size_t>(config.dim_m) * sizeof(float);
 
     GeneratedWeights weights;
-    if (!generate_quantized_weights(config.quant_type,
-                                    config.layout,
-                                    config.dim_m,
-                                    config.dim_k,
-                                    config.validate,
+    if (!generate_quantized_weights(config.quant_type, config.layout, config.dim_m, config.dim_k, config.validate,
                                     weights)) {
         out.error = "Failed to generate quantized weights for requested layout/type.";
         return false;
     }
 
-    const bool activations_soa = false;
-    GeneratedActivations activations = generate_activations(config.batch_size,
-                                                            config.dim_k,
-                                                            k_padded,
-                                                            config.validate,
-                                                            config.validate,
-                                                            activations_soa);
+    const bool           activations_soa = false;
+    GeneratedActivations activations = generate_activations(config.batch_size, config.dim_k, k_padded, config.validate,
+                                                            config.validate, activations_soa);
 
     const size_t weight_bytes = (config.layout == GGML_LAYOUT_AOS) ? weights.bytes_aos : weights.bytes_layout;
-    const size_t total_bytes = weight_bytes + activation_bytes + output_bytes;
+    const size_t total_bytes  = weight_bytes + activation_bytes + output_bytes;
 
-    size_t free_mem = 0;
+    size_t free_mem  = 0;
     size_t total_mem = 0;
     ggml_backend_sycl_get_device_memory(device_id, &free_mem, &total_mem);
     if (total_mem > 0 && total_bytes > total_mem) {
         char msg[256];
-        std::snprintf(msg,
-                      sizeof(msg),
-                      "Required memory (%.2f GB) exceeds device memory (%.2f GB).",
-                      total_bytes / (1024.0 * 1024.0 * 1024.0),
-                      total_mem / (1024.0 * 1024.0 * 1024.0));
+        std::snprintf(msg, sizeof(msg), "Required memory (%.2f GB) exceeds device memory (%.2f GB).",
+                      total_bytes / (1024.0 * 1024.0 * 1024.0), total_mem / (1024.0 * 1024.0 * 1024.0));
         out.error = msg;
         return false;
     }
 
-    std::string error;
+    std::string  error;
     DeviceBuffer weight_buf = allocate_buffer(weight_bytes, config.memory_mode, queue, device_id, error);
     if (!error.empty()) {
         out.error = error;
@@ -2395,21 +2387,21 @@ inline bool BenchmarkHarness::run_mmq(const BenchmarkConfig & config,
     queue.wait_and_throw();
 
     ggml_sycl::mmq_bench_args args{};
-    args.weight_type = config.quant_type;
-    args.layout = config.layout;
-    args.weights = weight_buf.ptr;
-    args.layout_base = (config.layout == GGML_LAYOUT_AOS) ? nullptr : weight_buf.ptr;
-    args.activations = act_buf.ptr;
-    args.output = static_cast<float *>(out_buf.ptr);
-    args.ncols = config.dim_k;
-    args.nrows = config.dim_m;
-    args.batch = config.batch_size;
-    args.row_low = 0;
-    args.row_high = config.dim_m;
+    args.weight_type          = config.quant_type;
+    args.layout               = config.layout;
+    args.weights              = weight_buf.ptr;
+    args.layout_base          = (config.layout == GGML_LAYOUT_AOS) ? nullptr : weight_buf.ptr;
+    args.activations          = act_buf.ptr;
+    args.output               = static_cast<float *>(out_buf.ptr);
+    args.ncols                = config.dim_k;
+    args.nrows                = config.dim_m;
+    args.batch                = config.batch_size;
+    args.row_low              = 0;
+    args.row_high             = config.dim_m;
     args.src1_padded_row_size = k_padded;
-    args.dst_row_stride = config.dim_m;
-    args.device_id = device_id;
-    args.stream = &queue;
+    args.dst_row_stride       = config.dim_m;
+    args.device_id            = device_id;
+    args.stream               = &queue;
 
     auto launch_kernel = [&](std::vector<sycl::event> * evs, std::string & launch_error) -> bool {
         if (!ggml_sycl::ggml_sycl_mmq_bench_launch(args, evs)) {
@@ -2458,7 +2450,7 @@ inline bool BenchmarkHarness::run_mmq(const BenchmarkConfig & config,
 
     for (size_t i = 0; i < iter_offsets.size(); ++i) {
         const size_t begin = iter_offsets[i];
-        const size_t end = (i + 1 < iter_offsets.size()) ? iter_offsets[i + 1] : events.size();
+        const size_t end   = (i + 1 < iter_offsets.size()) ? iter_offsets[i + 1] : events.size();
         if (end <= begin) {
             out.error = "No events captured for iteration.";
             free_buffer(weight_buf, queue);
@@ -2467,9 +2459,9 @@ inline bool BenchmarkHarness::run_mmq(const BenchmarkConfig & config,
             return false;
         }
         uint64_t min_start = 0;
-        uint64_t max_end = 0;
+        uint64_t max_end   = 0;
         for (size_t j = begin; j < end; ++j) {
-            uint64_t start = 0;
+            uint64_t start  = 0;
             uint64_t finish = 0;
             if (!get_event_timing(events[j], start, finish, error)) {
                 out.error = error;
@@ -2510,30 +2502,26 @@ inline bool BenchmarkHarness::run_mmq(const BenchmarkConfig & config,
         if (sorted_ns.size() == 1) {
             return sorted_ns[0];
         }
-        const double pos = (pct / 100.0) * static_cast<double>(sorted_ns.size() - 1);
-        const size_t idx = static_cast<size_t>(pos);
+        const double pos  = (pct / 100.0) * static_cast<double>(sorted_ns.size() - 1);
+        const size_t idx  = static_cast<size_t>(pos);
         const size_t idx2 = std::min(idx + 1, sorted_ns.size() - 1);
         const double frac = pos - static_cast<double>(idx);
         return sorted_ns[idx] + (sorted_ns[idx2] - sorted_ns[idx]) * frac;
     };
 
-    const double mean_s = mean_ns * 1e-9;
-    out.result.latency_us = mean_ns * 1e-3;
-    out.result.latency_std = std_ns * 1e-3;
+    const double mean_s       = mean_ns * 1e-9;
+    out.result.latency_us     = mean_ns * 1e-3;
+    out.result.latency_std    = std_ns * 1e-3;
     out.result.latency_p50_us = percentile_ns(50.0) * 1e-3;
     out.result.latency_p90_us = percentile_ns(90.0) * 1e-3;
     out.result.latency_p99_us = percentile_ns(99.0) * 1e-3;
-    out.result.variance_pct = (mean_ns > 0.0) ? (std_ns / mean_ns) * 100.0 : 0.0;
+    out.result.variance_pct   = (mean_ns > 0.0) ? (std_ns / mean_ns) * 100.0 : 0.0;
     out.result.throughput_tps = (mean_s > 0.0) ? (static_cast<double>(config.batch_size) / mean_s) : 0.0;
 
-    const RooflineEstimate roofline = estimate_mmvq_roofline(config.dim_m,
-                                                             config.dim_k,
-                                                             config.batch_size,
-                                                             weight_bytes,
-                                                             activation_bytes,
-                                                             output_bytes);
-    out.result.bandwidth_gbps = (mean_s > 0.0) ? (roofline.bytes / mean_s) / 1e9 : 0.0;
-    out.result.xmx_util_pct = 0.0;
+    const RooflineEstimate roofline = estimate_mmvq_roofline(config.dim_m, config.dim_k, config.batch_size,
+                                                             weight_bytes, activation_bytes, output_bytes);
+    out.result.bandwidth_gbps       = (mean_s > 0.0) ? (roofline.bytes / mean_s) / 1e9 : 0.0;
+    out.result.xmx_util_pct         = 0.0;
 
     if (config.validate) {
         std::vector<float> host_output(config.dim_m * config.batch_size);
@@ -2546,8 +2534,8 @@ inline bool BenchmarkHarness::run_mmq(const BenchmarkConfig & config,
         }
         queue.wait_and_throw();
 
-        const double abs_tol = config.abs_tol;
-        const double rel_tol = config.rel_tol;
+        const double       abs_tol = config.abs_tol;
+        const double       rel_tol = config.rel_tol;
         std::vector<float> weights_deq(config.dim_m * config.dim_k);
         std::vector<float> act_deq(config.batch_size * k_padded);
 
@@ -2565,44 +2553,42 @@ inline bool BenchmarkHarness::run_mmq(const BenchmarkConfig & config,
 
         const size_t row_bytes = (size_t) (k_padded / QK8_1) * sizeof(block_q8_1);
         for (int64_t b = 0; b < config.batch_size; ++b) {
-            const uint8_t * src = activations.q8_1.data() + (size_t) b * row_bytes;
+            const uint8_t *    src        = activations.q8_1.data() + (size_t) b * row_bytes;
             const block_q8_1 * src_blocks = reinterpret_cast<const block_q8_1 *>(src);
             dequantize_q8_1_row_aos(src_blocks, act_deq.data() + b * k_padded, config.dim_k);
             if (k_padded > config.dim_k) {
-                std::fill(act_deq.data() + b * k_padded + config.dim_k,
-                          act_deq.data() + (b + 1) * k_padded, 0.0f);
+                std::fill(act_deq.data() + b * k_padded + config.dim_k, act_deq.data() + (b + 1) * k_padded, 0.0f);
             }
         }
 
-        double max_err = 0.0;
-        double sum_err = 0.0;
-        double max_ref_abs = 0.0;
-        const size_t total_vals = static_cast<size_t>(config.dim_m * config.batch_size);
+        double       max_err     = 0.0;
+        double       sum_err     = 0.0;
+        double       max_ref_abs = 0.0;
+        const size_t total_vals  = static_cast<size_t>(config.dim_m * config.batch_size);
         for (int64_t b = 0; b < config.batch_size; ++b) {
             const float * act = act_deq.data() + b * k_padded;
             for (int64_t row = 0; row < config.dim_m; ++row) {
-                const float * w = weights_deq.data() + row * config.dim_k;
-                float sum_row = 0.0f;
+                const float * w       = weights_deq.data() + row * config.dim_k;
+                float         sum_row = 0.0f;
                 for (int64_t k = 0; k < config.dim_k; ++k) {
                     sum_row += w[k] * act[k];
                 }
-                const size_t idx = (size_t) b * (size_t) config.dim_m + (size_t) row;
+                const size_t idx     = (size_t) b * (size_t) config.dim_m + (size_t) row;
                 const double ref_val = static_cast<double>(sum_row);
-                const double diff = std::fabs(ref_val - static_cast<double>(host_output[idx]));
+                const double diff    = std::fabs(ref_val - static_cast<double>(host_output[idx]));
                 sum_err += diff;
-                max_err = std::max(max_err, diff);
+                max_err     = std::max(max_err, diff);
                 max_ref_abs = std::max(max_ref_abs, std::fabs(ref_val));
             }
         }
 
-        out.max_abs_error = max_err;
+        out.max_abs_error  = max_err;
         out.mean_abs_error = (total_vals > 0) ? sum_err / static_cast<double>(total_vals) : 0.0;
 
         const double tol = abs_tol + rel_tol * max_ref_abs;
         if (max_err > tol) {
             char msg[256];
-            std::snprintf(msg, sizeof(msg),
-                          "Validation failed: max_abs_error=%.6f (tol=%.6f, abs=%.6f, rel=%.6f).",
+            std::snprintf(msg, sizeof(msg), "Validation failed: max_abs_error=%.6f (tol=%.6f, abs=%.6f, rel=%.6f).",
                           max_err, tol, abs_tol, rel_tol);
             out.error = msg;
             free_buffer(weight_buf, queue);
