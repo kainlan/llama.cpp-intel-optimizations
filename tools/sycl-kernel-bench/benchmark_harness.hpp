@@ -89,6 +89,41 @@ struct BenchmarkConfig {
     bool              dpas_acc_explicit               = false;
 };
 
+static inline int parse_moe_rows_per_wg(const std::string & kernel_name) {
+    if (kernel_name.find("_r16") != std::string::npos) {
+        return 16;
+    }
+    if (kernel_name.find("_r8") != std::string::npos) {
+        return 8;
+    }
+    if (kernel_name.find("_r4") != std::string::npos) {
+        return 4;
+    }
+    if (kernel_name.find("_r2") != std::string::npos) {
+        return 2;
+    }
+    if (kernel_name.find("_r1") != std::string::npos) {
+        return 1;
+    }
+    return 4;
+}
+
+static inline int64_t parse_moe_token_rows(const std::string & kernel_name) {
+    if (kernel_name.find("_t16") != std::string::npos) {
+        return 16;
+    }
+    if (kernel_name.find("_t8") != std::string::npos) {
+        return 8;
+    }
+    if (kernel_name.find("_t4") != std::string::npos) {
+        return 4;
+    }
+    if (kernel_name.find("_t2") != std::string::npos) {
+        return 2;
+    }
+    return 1;
+}
+
 struct DeviceInfo {
     std::string         name;
     std::string         vendor;
@@ -1060,21 +1095,14 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                     out.error = "Failed to generate MXFP4 SOA weights for pair-GLU benchmark.";
                     return false;
                 }
-                GeneratedActivations activations = generate_activations(1, k, k, false, false, true);
-                int                  rows_per_wg = 4;
-                if (config.kernel_name.find("_r1") != std::string::npos) {
-                    rows_per_wg = 1;
-                } else if (config.kernel_name.find("_r2") != std::string::npos) {
-                    rows_per_wg = 2;
-                } else if (config.kernel_name.find("_r8") != std::string::npos) {
-                    rows_per_wg = 8;
-                } else if (config.kernel_name.find("_r16") != std::string::npos) {
-                    rows_per_wg = 16;
-                }
-                const bool cache_y = config.kernel_name.find("_cache") != std::string::npos &&
+                const int64_t        token_rows  = parse_moe_token_rows(config.kernel_name);
+                GeneratedActivations activations = generate_activations(token_rows, k, k, false, false, true);
+                const int            rows_per_wg = parse_moe_rows_per_wg(config.kernel_name);
+                const bool           cache_y     = config.kernel_name.find("_cache") != std::string::npos &&
                                      config.kernel_name.find("_nocache") == std::string::npos;
-                if (!run_mxfp4_pair_glu(weights, activations, m, n, k, rows_per_wg, cache_y, config.validate,
-                                        config.warmup_iterations, config.measure_iterations, queue, metrics, error)) {
+                if (!run_mxfp4_pair_glu(weights, activations, m, n, k, token_rows, rows_per_wg, cache_y,
+                                        config.validate, config.warmup_iterations, config.measure_iterations, queue,
+                                        metrics, error)) {
                     out.error = error;
                     return false;
                 }
@@ -1091,18 +1119,10 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                     out.error = "Failed to generate MXFP4 SOA weights for MMV-ID benchmark.";
                     return false;
                 }
-                GeneratedActivations activations = generate_activations(1, k, k, false, false, true);
-                int                  rows_per_wg = 4;
-                if (config.kernel_name.find("_r1") != std::string::npos) {
-                    rows_per_wg = 1;
-                } else if (config.kernel_name.find("_r2") != std::string::npos) {
-                    rows_per_wg = 2;
-                } else if (config.kernel_name.find("_r8") != std::string::npos) {
-                    rows_per_wg = 8;
-                } else if (config.kernel_name.find("_r16") != std::string::npos) {
-                    rows_per_wg = 16;
-                }
-                if (!run_mxfp4_mmv_id(weights, activations, m, n, k, rows_per_wg, config.validate,
+                const int64_t        token_rows  = parse_moe_token_rows(config.kernel_name);
+                GeneratedActivations activations = generate_activations(token_rows, k, k, false, false, true);
+                const int            rows_per_wg = parse_moe_rows_per_wg(config.kernel_name);
+                if (!run_mxfp4_mmv_id(weights, activations, m, n, k, token_rows, rows_per_wg, config.validate,
                                       config.warmup_iterations, config.measure_iterations, queue, metrics, error)) {
                     out.error = error;
                     return false;

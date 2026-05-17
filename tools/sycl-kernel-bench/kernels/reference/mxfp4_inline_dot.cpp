@@ -438,6 +438,7 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
                         int64_t                      m,
                         int64_t                      n_selected,
                         int64_t                      k,
+                        int64_t                      n_tokens,
                         int                          rows_per_wg,
                         bool                         cache_y,
                         bool                         validate,
@@ -446,8 +447,8 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
                         sycl::queue &                queue,
                         ReferenceMetrics &           out,
                         std::string &                error) {
-    if (m <= 0 || n_selected <= 0 || k <= 0 || (k % QK_MXFP4) != 0 || (k % QK8_1) != 0) {
-        error = "mxfp4_pair_glu requires positive M/selected/K and K divisible by QK_MXFP4/QK8_1.";
+    if (m <= 0 || n_selected <= 0 || n_tokens <= 0 || k <= 0 || (k % QK_MXFP4) != 0 || (k % QK8_1) != 0) {
+        error = "mxfp4_pair_glu requires positive M/selected/tokens/K and K divisible by QK_MXFP4/QK8_1.";
         return false;
     }
     if (rows_per_wg != 1 && rows_per_wg != 2 && rows_per_wg != 4 && rows_per_wg != 8 && rows_per_wg != 16) {
@@ -464,10 +465,12 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     }
 
     const size_t  selected_count = static_cast<size_t>(n_selected);
+    const size_t  token_count    = static_cast<size_t>(n_tokens);
+    const size_t  ids_count      = selected_count * token_count;
     const size_t  expert_bytes   = weights.layout.size();
     const size_t  weight_bytes   = expert_bytes * selected_count;
     const size_t  act_bytes      = activations.q8_1.size();
-    const size_t  out_count      = static_cast<size_t>(m) * selected_count;
+    const size_t  out_count      = static_cast<size_t>(m) * selected_count * token_count;
     const size_t  out_bytes      = out_count * sizeof(float);
     const int64_t q8_row_bytes   = static_cast<int64_t>(k * sizeof(block_q8_1) / QK8_1);
 
@@ -483,7 +486,7 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     const uint8_t ** d_gate_ptrs = sycl::malloc_device<const uint8_t *>(selected_count, queue);
     const uint8_t ** d_up_ptrs   = sycl::malloc_device<const uint8_t *>(selected_count, queue);
     uint8_t *        d_act       = sycl::malloc_device<uint8_t>(act_bytes, queue);
-    int32_t *        d_ids       = sycl::malloc_device<int32_t>(selected_count, queue);
+    int32_t *        d_ids       = sycl::malloc_device<int32_t>(ids_count, queue);
     float *          d_out       = sycl::malloc_device<float>(out_count, queue);
 
     auto cleanup = [&]() {
@@ -518,11 +521,15 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
 
     std::vector<const uint8_t *> host_gate_ptrs(selected_count);
     std::vector<const uint8_t *> host_up_ptrs(selected_count);
-    std::vector<int32_t>         host_ids(selected_count);
+    std::vector<int32_t>         host_ids(ids_count);
     for (size_t sel = 0; sel < selected_count; ++sel) {
         host_gate_ptrs[sel] = d_gate + sel * expert_bytes;
         host_up_ptrs[sel]   = d_up + sel * expert_bytes;
-        host_ids[sel]       = static_cast<int32_t>(sel);
+    }
+    for (size_t token = 0; token < token_count; ++token) {
+        for (size_t sel = 0; sel < selected_count; ++sel) {
+            host_ids[token * selected_count + sel] = static_cast<int32_t>(sel);
+        }
     }
 
     queue.memcpy(d_gate, gate_slices.data(), weight_bytes);
@@ -530,7 +537,7 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     queue.memcpy(d_gate_ptrs, host_gate_ptrs.data(), selected_count * sizeof(const uint8_t *));
     queue.memcpy(d_up_ptrs, host_up_ptrs.data(), selected_count * sizeof(const uint8_t *));
     queue.memcpy(d_act, activations.q8_1.data(), act_bytes);
-    queue.memcpy(d_ids, host_ids.data(), selected_count * sizeof(int32_t));
+    queue.memcpy(d_ids, host_ids.data(), ids_count * sizeof(int32_t));
     queue.memset(d_out, 0, out_bytes);
     queue.wait_and_throw();
 
@@ -545,14 +552,14 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     args.ncols_y            = static_cast<int>(k);
     args.nrows_per_expert   = static_cast<int>(m);
     args.n_ids              = static_cast<int>(n_selected);
-    args.n_tokens           = 1;
+    args.n_tokens           = static_cast<int>(n_tokens);
     args.ne11               = 1;
     args.ids_nb0            = sizeof(int32_t);
     args.ids_nb1            = static_cast<int64_t>(selected_count * sizeof(int32_t));
     args.nb11               = q8_row_bytes;
     args.nb12               = q8_row_bytes;
     args.dst_nb1            = static_cast<int64_t>(m * sizeof(float));
-    args.dst_nb2            = static_cast<int64_t>(out_bytes);
+    args.dst_nb2            = static_cast<int64_t>(selected_count * static_cast<size_t>(m) * sizeof(float));
     args.rows_per_wg        = rows_per_wg;
     args.cache_y            = cache_y;
     args.glu_op             = GGML_GLU_OP_SWIGLU_OAI;
@@ -588,11 +595,12 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     const double total_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
     const double mean_us  = (iterations > 0) ? total_us / iterations : 0.0;
     const double mean_s   = mean_us * 1e-6;
-    const double ops      = 4.0 * static_cast<double>(m) * static_cast<double>(n_selected) * static_cast<double>(k);
-    const double bytes    = 2.0 * static_cast<double>(weight_bytes) + static_cast<double>(act_bytes) +
-                         static_cast<double>(out_bytes) +
+    const double ops = 4.0 * static_cast<double>(m) * static_cast<double>(n_selected) * static_cast<double>(n_tokens) *
+                       static_cast<double>(k);
+    const double bytes = 2.0 * static_cast<double>(weight_bytes) * static_cast<double>(n_tokens) +
+                         static_cast<double>(act_bytes) + static_cast<double>(out_bytes) +
                          2.0 * static_cast<double>(selected_count * sizeof(const uint8_t *)) +
-                         static_cast<double>(selected_count * sizeof(int32_t));
+                         static_cast<double>(ids_count * sizeof(int32_t));
 
     out.total_us       = mean_us;
     out.gemm_us        = mean_us;
@@ -620,6 +628,7 @@ bool run_mxfp4_mmv_id(const GeneratedWeights &     weights,
                       int64_t                      m,
                       int64_t                      n_selected,
                       int64_t                      k,
+                      int64_t                      n_tokens,
                       int                          rows_per_wg,
                       bool                         validate,
                       int                          warmup,
@@ -627,8 +636,8 @@ bool run_mxfp4_mmv_id(const GeneratedWeights &     weights,
                       sycl::queue &                queue,
                       ReferenceMetrics &           out,
                       std::string &                error) {
-    if (m <= 0 || n_selected <= 0 || k <= 0 || (k % QK_MXFP4) != 0 || (k % QK8_1) != 0) {
-        error = "mxfp4_mmv_id requires positive M/selected/K and K divisible by QK_MXFP4/QK8_1.";
+    if (m <= 0 || n_selected <= 0 || n_tokens <= 0 || k <= 0 || (k % QK_MXFP4) != 0 || (k % QK8_1) != 0) {
+        error = "mxfp4_mmv_id requires positive M/selected/tokens/K and K divisible by QK_MXFP4/QK8_1.";
         return false;
     }
     if (rows_per_wg != 1 && rows_per_wg != 2 && rows_per_wg != 4 && rows_per_wg != 8 && rows_per_wg != 16) {
@@ -645,10 +654,12 @@ bool run_mxfp4_mmv_id(const GeneratedWeights &     weights,
     }
 
     const size_t  selected_count = static_cast<size_t>(n_selected);
+    const size_t  token_count    = static_cast<size_t>(n_tokens);
+    const size_t  ids_count      = selected_count * token_count;
     const size_t  expert_bytes   = weights.layout.size();
     const size_t  weight_bytes   = expert_bytes * selected_count;
     const size_t  act_bytes      = activations.q8_1.size();
-    const size_t  out_count      = static_cast<size_t>(m) * selected_count;
+    const size_t  out_count      = static_cast<size_t>(m) * selected_count * token_count;
     const size_t  out_bytes      = out_count * sizeof(float);
     const int64_t q8_row_bytes   = static_cast<int64_t>(k * sizeof(block_q8_1) / QK8_1);
 
@@ -660,7 +671,7 @@ bool run_mxfp4_mmv_id(const GeneratedWeights &     weights,
     uint8_t *        d_weights = sycl::malloc_device<uint8_t>(weight_bytes, queue);
     const uint8_t ** d_ptrs    = sycl::malloc_device<const uint8_t *>(selected_count, queue);
     uint8_t *        d_act     = sycl::malloc_device<uint8_t>(act_bytes, queue);
-    int32_t *        d_ids     = sycl::malloc_device<int32_t>(selected_count, queue);
+    int32_t *        d_ids     = sycl::malloc_device<int32_t>(ids_count, queue);
     float *          d_out     = sycl::malloc_device<float>(out_count, queue);
 
     auto cleanup = [&]() {
@@ -688,16 +699,20 @@ bool run_mxfp4_mmv_id(const GeneratedWeights &     weights,
     }
 
     std::vector<const uint8_t *> host_ptrs(selected_count);
-    std::vector<int32_t>         host_ids(selected_count);
+    std::vector<int32_t>         host_ids(ids_count);
     for (size_t sel = 0; sel < selected_count; ++sel) {
         host_ptrs[sel] = d_weights + sel * expert_bytes;
-        host_ids[sel]  = static_cast<int32_t>(sel);
+    }
+    for (size_t token = 0; token < token_count; ++token) {
+        for (size_t sel = 0; sel < selected_count; ++sel) {
+            host_ids[token * selected_count + sel] = static_cast<int32_t>(sel);
+        }
     }
 
     queue.memcpy(d_weights, weight_slices.data(), weight_bytes);
     queue.memcpy(d_ptrs, host_ptrs.data(), selected_count * sizeof(const uint8_t *));
     queue.memcpy(d_act, activations.q8_1.data(), act_bytes);
-    queue.memcpy(d_ids, host_ids.data(), selected_count * sizeof(int32_t));
+    queue.memcpy(d_ids, host_ids.data(), ids_count * sizeof(int32_t));
     queue.memset(d_out, 0, out_bytes);
     queue.wait_and_throw();
 
@@ -712,14 +727,14 @@ bool run_mxfp4_mmv_id(const GeneratedWeights &     weights,
     args.nrows_per_expert   = static_cast<int>(m);
     args.num_experts        = static_cast<int>(n_selected);
     args.n_ids              = static_cast<int>(n_selected);
-    args.n_tokens           = 1;
+    args.n_tokens           = static_cast<int>(n_tokens);
     args.ne11               = 1;
     args.ids_nb0            = sizeof(int32_t);
     args.ids_nb1            = static_cast<int64_t>(selected_count * sizeof(int32_t));
     args.nb11               = q8_row_bytes;
     args.nb12               = q8_row_bytes;
     args.dst_nb1            = static_cast<int64_t>(m * sizeof(float));
-    args.dst_nb2            = static_cast<int64_t>(out_bytes);
+    args.dst_nb2            = static_cast<int64_t>(selected_count * static_cast<size_t>(m) * sizeof(float));
     args.rows_per_wg        = rows_per_wg;
 
     auto launch = [&]() {
@@ -751,11 +766,12 @@ bool run_mxfp4_mmv_id(const GeneratedWeights &     weights,
     const double total_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
     const double mean_us  = (iterations > 0) ? total_us / iterations : 0.0;
     const double mean_s   = mean_us * 1e-6;
-    const double ops      = 2.0 * static_cast<double>(m) * static_cast<double>(n_selected) * static_cast<double>(k);
-    const double bytes    = static_cast<double>(weight_bytes) + static_cast<double>(act_bytes) +
-                         static_cast<double>(out_bytes) +
+    const double ops = 2.0 * static_cast<double>(m) * static_cast<double>(n_selected) * static_cast<double>(n_tokens) *
+                       static_cast<double>(k);
+    const double bytes = static_cast<double>(weight_bytes) * static_cast<double>(n_tokens) +
+                         static_cast<double>(act_bytes) + static_cast<double>(out_bytes) +
                          static_cast<double>(selected_count * sizeof(const uint8_t *)) +
-                         static_cast<double>(selected_count * sizeof(int32_t));
+                         static_cast<double>(ids_count * sizeof(int32_t));
 
     out.total_us       = mean_us;
     out.gemm_us        = mean_us;
