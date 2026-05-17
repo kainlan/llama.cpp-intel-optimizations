@@ -28,8 +28,8 @@ Usage: scripts/sycl-moe-roofline-harness.sh
 
 Sequential B50/B580 SYCL MoE profiling harness for GPT-OSS MXFP4 TG work.
 It records clean TG throughput, TG batch-scaling, synchronized MXFP4/MoE
-subphase timings, FA dispatch path, hardware capability log lines, and an
-optional memory roofline.
+subphase timings, FA dispatch path, hardware capability log lines, an optional
+memory roofline, and selected-expert row aggregation telemetry.
 
 Environment:
   BENCH                  llama-bench path, default build/bin/llama-bench
@@ -49,6 +49,8 @@ Environment:
   RUN_MISTRAL=0          skip B580 Mistral FA guard
   THEORETICAL_BW_GBPS    optional board bandwidth for roofline math
   MXFP4_ENTRY_BYTES      optional bytes per selected expert role; inferred from GGUF when possible
+  GGML_SYCL_MOE_ROW_AGG_DEBUG_LIMIT
+                          max row-aggregation lines in profile runs, default 256 here
 
 Notes:
   - Source oneAPI before running this script.
@@ -72,11 +74,13 @@ mkdir -p "$OUTDIR"
 summary="$OUTDIR/summary.tsv"
 profile_summary="$OUTDIR/mxfp4-profile.tsv"
 roofline_summary="$OUTDIR/roofline.tsv"
+row_agg_summary="$OUTDIR/row-agg.tsv"
 caps_log="$OUTDIR/runtime-caps.log"
 
 printf "case\tselector\tfa\ttg_batch\tpp_tok_s\ttg_tok_s\tlog\n" >"$summary"
 printf "fa\tentries\tbatches\tavg_total_ms\tavg_kernel_ms\tavg_quant_ms\tavg_gateup_glu_ms\tavg_down_ms\tavg_per_entry_kernel_us\tlog\n" >"$profile_summary"
 printf "case\tfa\ttg_batch\ttg_tok_s\tentry_bytes\tentries_per_token\tweight_gb_per_token\teffective_weight_gbps\ttheoretical_bw_gbps\troofline_tg_tok_s\n" >"$roofline_summary"
+printf "fa\tpath\ttensor\tlayer\trole\tdevice\tlayout\tbatch\ttopk\tselected\tunique\tmax_per_expert\tavg_per_expert\tlog\n" >"$row_agg_summary"
 
 extract_rate() {
     local log="$1"
@@ -213,6 +217,34 @@ parse_profile() {
     ' "$log" >>"$profile_summary"
 }
 
+parse_row_agg() {
+    local fa="$1"
+    local log="$2"
+    awk -v fa="$fa" -v logfile="$log" '
+        /\[MOE-ROW-AGG\]/ && /stage=selected/ {
+            path = tensor = layer = role = device = layout = batch = topk = selected = unique = max_per_expert = avg = "NA"
+            for (i = 1; i <= NF; ++i) {
+                split($i, kv, "=")
+                if (kv[1] == "path") path = kv[2]
+                if (kv[1] == "tensor") tensor = kv[2]
+                if (kv[1] == "layer") layer = kv[2]
+                if (kv[1] == "role") role = kv[2]
+                if (kv[1] == "device") device = kv[2]
+                if (kv[1] == "layout") layout = kv[2]
+                if (kv[1] == "batch") batch = kv[2]
+                if (kv[1] == "topk") topk = kv[2]
+                if (kv[1] == "selected") selected = kv[2]
+                if (kv[1] == "unique") unique = kv[2]
+                if (kv[1] == "max_per_expert") max_per_expert = kv[2]
+                if (kv[1] == "avg_per_expert") avg = kv[2]
+            }
+            printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+                fa, path, tensor, layer, role, device, layout, batch, topk, selected,
+                unique, max_per_expert, avg, logfile
+        }
+    ' "$log" >>"$row_agg_summary"
+}
+
 extract_profile_entries() {
     local log="$1"
     awk '
@@ -278,8 +310,10 @@ for fa in $FA_VALUES; do
     done
 
     run_case "gptoss-profile-fa${fa}" "$SELECTOR" "$MODEL" 0 "$PROFILE_TOKENS" 1 "$fa" 1 \
-        GGML_SYCL_MOE_PROFILE=1 GGML_SYCL_MXFP4_TG_PROFILE=1
+        GGML_SYCL_MOE_PROFILE=1 GGML_SYCL_MXFP4_TG_PROFILE=1 \
+        GGML_SYCL_MOE_ROW_AGG_DEBUG=1 GGML_SYCL_MOE_ROW_AGG_DEBUG_LIMIT=256
     parse_profile "$fa" "$OUTDIR/gptoss-profile-fa${fa}.log"
+    parse_row_agg "$fa" "$OUTDIR/gptoss-profile-fa${fa}.log"
     observed_entries="$(extract_profile_entries "$OUTDIR/gptoss-profile-fa${fa}.log")"
     if [[ "$observed_entries" != "0" ]]; then
         entries_per_token="$observed_entries"
@@ -299,4 +333,5 @@ fi
 echo "summary=$summary"
 echo "profile_summary=$profile_summary"
 echo "roofline_summary=$roofline_summary"
+echo "row_agg_summary=$row_agg_summary"
 echo "caps_log=$caps_log"
