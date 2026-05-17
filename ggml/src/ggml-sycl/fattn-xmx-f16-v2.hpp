@@ -47,6 +47,8 @@
 #include <cfloat>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <sycl/sycl.hpp>
 #include <vector>
@@ -70,10 +72,10 @@ namespace sycl_xmx = sycl::ext::oneapi::experimental::matrix;
 // sub-group collectives are parameterized at kernel level, not per-variant.
 static constexpr int XMX_V2_SG = 16;
 
-// Work-group thread count.  Must be a multiple of XMX_V2_SG.
-// 512 = 32 sub-groups → enough parallelism for D=256 (16 K-tiles × 2 reduce groups).
-static constexpr int XMX_V2_NTHREADS = 512;
-static constexpr int XMX_V2_N_SG     = XMX_V2_NTHREADS / XMX_V2_SG;  // 32
+// Historical maximum work-group size. The leaf now launches only as many
+// sub-groups as own unique query rows for the compile-time (ncols, TM) shape.
+// Keeping the bound makes the intended resource ceiling explicit.
+static constexpr int XMX_V2_MAX_NTHREADS = 512;
 
 // KV batch size — number of KV rows processed per outer-loop iteration.
 // SLM budget: (ncols*D + 2*BATCH_KV*D + ncols*BATCH_KV) * sizeof(half).
@@ -126,7 +128,9 @@ struct variant_info {
 // Triple-brace init: std::array<T, N> wraps a single-element C-array; the outer
 // pair opens the array, the middle opens the C-array, and the innermost opens
 // the variant_info aggregate.
-static constexpr std::array<variant_info, 2> fattn_xmx_v2_variants = { { { 8, 16, 16, 8 }, { 16, 16, 16, 16 } } };
+static constexpr std::array<variant_info, 2> fattn_xmx_v2_variants = {
+    { { 8, 16, 16, 8 }, { 16, 16, 16, 16 } }
+};
 
 static_assert(fattn_xmx_v2_variants[0].tm == 8 && fattn_xmx_v2_variants[0].tk == 16 &&
                   fattn_xmx_v2_variants[0].tn == 16,
@@ -240,6 +244,35 @@ inline int fattn_xmx_v2_score_variant_for_combo(const variant_info & v, const sy
 #    endif
 }
 
+inline int fattn_xmx_v2_parse_forced_variant(const char * env) noexcept {
+    if (!env || env[0] == '\0' || std::strcmp(env, "auto") == 0) {
+        return -1;
+    }
+    if (std::strcmp(env, "0") == 0 || std::strcmp(env, "tm8") == 0 || std::strcmp(env, "TM8") == 0) {
+        return 0;
+    }
+    if (std::strcmp(env, "1") == 0 || std::strcmp(env, "tm16") == 0 || std::strcmp(env, "TM16") == 0) {
+        return 1;
+    }
+    return -1;
+}
+
+inline bool fattn_xmx_v2_variant_supported(const sycl::device & dev, std::size_t variant_idx) noexcept {
+    if (variant_idx == 0) {
+        return true;
+    }
+    if (variant_idx >= fattn_xmx_v2_variants.size()) {
+        return false;
+    }
+    const auto combos = fattn_xmx_v2_query_combinations(dev);
+    for (const auto & c : combos) {
+        if (fattn_xmx_v2_score_variant_for_combo(fattn_xmx_v2_variants[variant_idx], c) > 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Shape-aware variant selector for XMX-v2.
 // Returns 0 (fallback TM=8) for shapes that should not use TM=16:
 //   - TG/small ncols: ne01 <= 1 or ncols <= 8 (TM=16 over-provisioned)
@@ -247,17 +280,12 @@ inline int fattn_xmx_v2_score_variant_for_combo(const variant_info & v, const sy
 // Returns 1 (TM=16) for PP shapes with ncols >= 16 and D >= 128,
 //   only when the device matrix extension supports (16,16,16).
 //
-// Env override: GGML_SYCL_FA_XMX_V2_VARIANT=0 forces TM=8, =1 forces TM=16,
-// =auto (default) uses shape-aware selection.
+// Env override: GGML_SYCL_FA_XMX_V2_VARIANT=0/tm8 forces TM=8,
+// =1/tm16 forces TM=16, =auto (default) uses shape-aware selection.
 inline std::size_t fattn_xmx_v2_pick_variant_for_shape(const sycl::device & dev, int D, int ncols, int ne01) noexcept {
-    // Env override takes priority: 0=TM8, 1=TM16, anything else=auto
-    const char *var_env = std::getenv("GGML_SYCL_FA_XMX_V2_VARIANT");
-    if (var_env) {
-        int requested = std::atoi(var_env);
-        if (requested == 0 || requested == 1) {
-            return static_cast<std::size_t>(requested);
-        }
-        // "auto" via numeric parse -> fall through to shape-aware
+    const int forced_variant = fattn_xmx_v2_parse_forced_variant(std::getenv("GGML_SYCL_FA_XMX_V2_VARIANT"));
+    if (forced_variant >= 0 && fattn_xmx_v2_variant_supported(dev, static_cast<std::size_t>(forced_variant))) {
+        return static_cast<std::size_t>(forced_variant);
     }
 
     // Shape guard: don't use TM=16 for small shapes.
@@ -271,12 +299,11 @@ inline std::size_t fattn_xmx_v2_pick_variant_for_shape(const sycl::device & dev,
     const auto combos = fattn_xmx_v2_query_combinations(dev);
     for (const auto & c : combos) {
         using sycl_xmx::matrix_type;
-        if (c.atype == matrix_type::fp16 && c.btype == matrix_type::fp16 &&
-            c.ctype == matrix_type::fp32 && c.dtype == matrix_type::fp32 &&
-            (int) c.nsize == 16 && (int) c.ksize == 16) {
+        if (c.atype == matrix_type::fp16 && c.btype == matrix_type::fp16 && c.ctype == matrix_type::fp32 &&
+            c.dtype == matrix_type::fp32 && (int) c.nsize == 16 && (int) c.ksize == 16) {
             const bool m_is_range = (c.msize == 0);
-            const int m_fixed = (int) c.msize;
-            const int m_max   = (int) c.max_msize;
+            const int  m_fixed    = (int) c.msize;
+            const int  m_max      = (int) c.max_msize;
             if (m_is_range ? m_max >= 16 : m_fixed == 16) {
                 return 1;
             }
@@ -362,7 +389,7 @@ inline std::size_t fattn_xmx_v2_pick_variant_cached(ggml_backend_sycl_context & 
 
         std::fprintf(
             stderr,
-            "[fattn-xmx-v2] device %d: local_mem=%zu KB, required=%zu B for (D=256,ncols=8), variant=%zu, slm_ok=%d\n",
+            "[fattn-xmx-v2] device %d: local_mem=%zu KB, required=%zu B for (D=256,ncols=16), variant=%zu, slm_ok=%d\n",
             ctx.device, cache->slm_size_bytes / 1024, required_bytes, cache->variant_idx, cache->slm_ok ? 1 : 0);
 
         if (!cache->slm_ok) {
@@ -434,15 +461,15 @@ inline sycl::half fp8_e4m3_to_half_v2(uint8_t bits) {
 // leaves land with matching lane-ownership math.
 // =============================================================================
 
-template <int D,
-          int ncols,
+template <int  D,
+          int  ncols,
           bool use_logit_softcap,
           typename Q_type,
           typename Acc_t,
           bool kv_is_fp8,
-          int TM,
-          int TK,
-          int TN>
+          int  TM,
+          int  TK,
+          int  TN>
 static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
                                               const char * __restrict__ K_base,
                                               const char * __restrict__ V_base,
@@ -476,20 +503,23 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
                                               int64_t                  nb33,
                                               const sycl::nd_item<3> & item,
                                               sycl::half *             slm) {
-    static_assert((TM == XMX_V2_TM && TK == XMX_V2_TK && TN == XMX_V2_TN) ||
-                  (TM == 16 && TK == XMX_V2_TK && TN == XMX_V2_TN),
-                  "Only (8,16,16) and (16,16,16) fallback leaf bodies are implemented. "
-                  "Follow-up tasks must add kernel specializations for other leaves.");
+    static_assert(
+        (TM == XMX_V2_TM && TK == XMX_V2_TK && TN == XMX_V2_TN) || (TM == 16 && TK == XMX_V2_TK && TN == XMX_V2_TN),
+        "Only (8,16,16) and (16,16,16) fallback leaf bodies are implemented. "
+        "Follow-up tasks must add kernel specializations for other leaves.");
     static_assert(D % TK == 0, "D must be divisible by TK");
     static_assert(ncols % TM == 0 || ncols < TM, "ncols must be <= TM or a multiple of TM");
 
-    using slm_layout = fattn_v2_slm<D, ncols>;
+    using slm_layout            = fattn_v2_slm<D, ncols>;
+    constexpr int SG_ROWS_PER_Q = (ncols + TM - 1) / TM;  // ceil(ncols/TM)
+    constexpr int NTHREADS      = SG_ROWS_PER_Q * XMX_V2_SG;
+    static_assert(NTHREADS <= XMX_V2_MAX_NTHREADS, "XMX-v2 active workgroup exceeds historical max");
 
     // ------------------------------------------------------------------
     // Sub-group / work-item identifiers
     // ------------------------------------------------------------------
     auto      sg    = item.get_sub_group();
-    const int sg_id = static_cast<int>(sg.get_group_linear_id());    // 0..N_SG-1
+    const int sg_id = static_cast<int>(sg.get_group_linear_id());    // 0..active_subgroups-1
     const int lane  = static_cast<int>(sg.get_local_id());           // 0..SG-1
     const int tid   = static_cast<int>(item.get_local_linear_id());  // 0..NTHREADS-1
 
@@ -529,11 +559,10 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
     // Register state (Rule 2: all cross-lane softmax state in registers)
     // ------------------------------------------------------------------
     static_assert(D % TN == 0, "D must be divisible by TN for lane-D mapping");
-    constexpr int D_TILES = D / TN;                        // number of V-tiles in D direction
+    constexpr int D_TILES = D / TN;                    // number of V-tiles in D direction
 
-    constexpr int SG_ROWS_PER_Q  = (ncols + TM - 1) / TM;  // ceil(ncols/TM)
-    const int     this_sg_q_tile = sg_id % SG_ROWS_PER_Q;  // which Q-tile this SG covers
-    const int     sg_q_base      = this_sg_q_tile * TM;
+    const int this_sg_q_tile = sg_id % SG_ROWS_PER_Q;  // which Q-tile this SG covers
+    const int sg_q_base      = this_sg_q_tile * TM;
 
     // Per-lane accumulator. `Acc_t` is a template parameter set by the
     // dispatcher: `float` on GGML_PREC_F32 (matches CUDA's KQ_acc_t=float
@@ -560,7 +589,7 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
     // ------------------------------------------------------------------
     // Phase 0: Cooperatively load tile_Q from global into SLM (Rule 1)
     // ------------------------------------------------------------------
-    for (int idx = tid; idx < ncols * D; idx += XMX_V2_NTHREADS) {
+    for (int idx = tid; idx < ncols * D; idx += NTHREADS) {
         const int j     = idx / D;
         const int d     = idx % D;
         const int q_idx = ic0 + j;
@@ -580,7 +609,7 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
         const int kv_count = sycl::min(XMX_V2_BATCH_KV, ne11 - kv_start);
 
         // ---- Phase 1: Load tile_K and tile_V from global to SLM ----
-        for (int idx = tid; idx < kv_count * D; idx += XMX_V2_NTHREADS) {
+        for (int idx = tid; idx < kv_count * D; idx += NTHREADS) {
             const int k      = idx / D;
             const int d      = idx % D;
             const int kv_pos = kv_start + k;
@@ -600,7 +629,7 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
             tile_V[k * D + d] = v_val;
         }
         // Zero-pad incomplete last batch so XMX never reads uninitialized SLM.
-        for (int idx = tid; idx < (XMX_V2_BATCH_KV - kv_count) * D; idx += XMX_V2_NTHREADS) {
+        for (int idx = tid; idx < (XMX_V2_BATCH_KV - kv_count) * D; idx += NTHREADS) {
             const int k       = kv_count + idx / D;
             const int d       = idx % D;
             tile_K[k * D + d] = sycl::half(0.0f);
@@ -828,21 +857,24 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
 // Leaf launch helper — one instantiation per compile-time variant.
 // =============================================================================
 
-template <int D,
-          int ncols,
+template <int  D,
+          int  ncols,
           bool use_logit_softcap,
           typename Q_type,
           typename Acc_t,
           bool kv_is_fp8,
-          int TM,
-          int TK,
-          int TN>
+          int  TM,
+          int  TK,
+          int  TN>
 static void launch_fattn_xmx_v2_f16_leaf(const fattn_params & params, dpct::queue_ptr stream) {
-    using slm_layout = fattn_v2_slm<D, ncols>;
+    using slm_layout            = fattn_v2_slm<D, ncols>;
+    constexpr int sg_rows_per_q = (ncols + TM - 1) / TM;
+    constexpr int nthreads      = sg_rows_per_q * XMX_V2_SG;
+    static_assert(nthreads <= XMX_V2_MAX_NTHREADS, "XMX-v2 active workgroup exceeds historical max");
 
     const int      n_query_blocks = (params.ne01 + ncols - 1) / ncols;
     sycl::range<3> grid(params.ne02 * params.ne03, 1, n_query_blocks);
-    sycl::range<3> block(1, 1, XMX_V2_NTHREADS);
+    sycl::range<3> block(1, 1, nthreads);
 
     const char *   Q_ptr       = params.Q;
     const char *   K_ptr       = params.K;
@@ -891,9 +923,22 @@ static void launch_fattn_xmx_v2_f16_leaf(const fattn_params & params, dpct::queu
 // =============================================================================
 
 template <int D, int ncols, bool use_logit_softcap, typename Q_type, typename Acc_t, bool kv_is_fp8 = false>
-bool launch_fattn_xmx_v2_f16(ggml_backend_sycl_context & ctx, const fattn_params & params, dpct::queue_ptr stream) {
-    const std::size_t variant_idx = fattn_xmx_v2_pick_variant_for_shape(
-        stream->get_device(), D, ncols, params.ne01);
+bool launch_fattn_xmx_v2_f16_variant(ggml_backend_sycl_context & ctx,
+                                     const fattn_params &        params,
+                                     dpct::queue_ptr             stream,
+                                     int                         forced_variant) {
+    const sycl::device dev = stream->get_device();
+    (void) fattn_xmx_v2_pick_variant_cached(ctx, dev);
+
+    std::size_t variant_idx = 0;
+    if (forced_variant >= 0) {
+        variant_idx = static_cast<std::size_t>(forced_variant);
+        if (!fattn_xmx_v2_variant_supported(dev, variant_idx)) {
+            return false;
+        }
+    } else {
+        variant_idx = fattn_xmx_v2_pick_variant_for_shape(dev, D, ncols, params.ne01);
+    }
 
     // SLM-fit gate: if the fallback leaf's worst case doesn't fit this device's
     // local_mem_size, bail to caller-level fallback (TILE path). Logged once at
@@ -917,6 +962,12 @@ bool launch_fattn_xmx_v2_f16(ggml_backend_sycl_context & ctx, const fattn_params
     return true;
 }
 
+template <int D, int ncols, bool use_logit_softcap, typename Q_type, typename Acc_t, bool kv_is_fp8 = false>
+bool launch_fattn_xmx_v2_f16(ggml_backend_sycl_context & ctx, const fattn_params & params, dpct::queue_ptr stream) {
+    return launch_fattn_xmx_v2_f16_variant<D, ncols, use_logit_softcap, Q_type, Acc_t, kv_is_fp8>(ctx, params, stream,
+                                                                                                  -1);
+}
+
 // =============================================================================
 // Availability check (mirrors fattn_xmx_f16_available)
 // =============================================================================
@@ -926,6 +977,12 @@ inline bool fattn_xmx_v2_f16_available() {
 }
 
 #else   // !SYCL_XMX_V2_AVAILABLE
+
+template <int D, int ncols, bool use_logit_softcap, typename Q_type, typename Acc_t, bool kv_is_fp8 = false>
+bool launch_fattn_xmx_v2_f16_variant(ggml_backend_sycl_context &, const fattn_params &, dpct::queue_ptr, int) {
+    GGML_ABORT("XMX v2 not available at compile time");
+    return false;
+}
 
 template <int D, int ncols, bool use_logit_softcap, typename Q_type, typename Acc_t, bool kv_is_fp8 = false>
 bool launch_fattn_xmx_v2_f16(ggml_backend_sycl_context &, const fattn_params &, dpct::queue_ptr) {

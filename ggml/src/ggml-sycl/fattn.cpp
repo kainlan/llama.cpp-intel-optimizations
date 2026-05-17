@@ -1022,6 +1022,13 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
         v2_dispatched = LAUNCHER<D, NCOLS, true, Q_type, ACC_T>(ctx, params, stream);  \
     }
 
+#define DISPATCH_NCOLS_CTX_ACC_VARIANT(NCOLS, LAUNCHER, ACC_T, VARIANT)                         \
+    if (logit_softcap == 0.0f) {                                                                \
+        v2_dispatched = LAUNCHER<D, NCOLS, false, Q_type, ACC_T>(ctx, params, stream, VARIANT); \
+    } else {                                                                                    \
+        v2_dispatched = LAUNCHER<D, NCOLS, true, Q_type, ACC_T>(ctx, params, stream, VARIANT);  \
+    }
+
     // ---- Debug trace: gated by GGML_SYCL_FA_DISPATCH_DEBUG, limited by GGML_SYCL_FA_DISPATCH_DEBUG_LIMIT ----
     static std::atomic<int> fattn_dispatch_debug_count = 0;
     int        dispatch_debug_counter = fattn_dispatch_debug_count.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1145,27 +1152,11 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
     };
 #endif
 
-    // GGML_SYCL_FA_FORCE_PATH: override all shape-based kernel selection.
-
     // ---- GGML_SYCL_FA_FORCE_PATH: override all shape-based kernel selection ----
     {
         const char * force = std::getenv("GGML_SYCL_FA_FORCE_PATH");
         if (force) {
             bool force_known = false;
-// Inlined DISPATCH_NCOLS equivalent for softcap-aware dispatch
-#define DISPATCH_NCOLS(NCOLS, LAUNCHER)                    \
-    if (logit_softcap == 0.0f) {                           \
-        LAUNCHER<D, NCOLS, false, Q_type>(params, stream); \
-    } else {                                               \
-        LAUNCHER<D, NCOLS, true, Q_type>(params, stream);  \
-    }
-// Inlined DISPATCH_NCOLS_CTX_ACC equivalent
-#define DISPATCH_NCOLS_CTX_ACC(NCOLS, LAUNCHER, ACC_T)                                 \
-    if (logit_softcap == 0.0f) {                                                       \
-        v2_dispatched = LAUNCHER<D, NCOLS, false, Q_type, ACC_T>(ctx, params, stream); \
-    } else {                                                                           \
-        v2_dispatched = LAUNCHER<D, NCOLS, true, Q_type, ACC_T>(ctx, params, stream);  \
-    }
 
             if (strcmp(force, "vec") == 0) {
                 force_known = true;
@@ -1226,30 +1217,63 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
                             D, ne01, params.sinks != nullptr, params.logit_softcap, (int) params.kv_is_fp8);
                 }
             }
-            if (strcmp(force, "xmx-v2-tm16") == 0 || strcmp(force, "xmx-v2-tm8") == 0) {
-                // Actually force XMX-v2 TM variant via env var (TM=8→0, TM=16→1)
-                const char * variant = strcmp(force, "xmx-v2-tm16") == 0 ? "1" : "0";
-                GGML_SYCL_KTRACE("fattn FORCE=xmx-v2", " D=%d ncols=%s variant=%s", D, force + 10, variant);
-                bool       v2_dispatched = false;
-                const bool use_f32_acc   = (params.prec == GGML_PREC_F32);
-                GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=8 ne01=%d prec=%s variant=%s", D, ne01,
-                                 (int) params.prec, variant);
-                {
-                    char buf[64];
-                    snprintf(buf, sizeof(buf), "GGML_SYCL_FA_XMX_V2_VARIANT=%s", variant);
-                    putenv(strdup(buf));
-                }
-                if (use_f32_acc) {
-                    DISPATCH_NCOLS_CTX_ACC(8, launch_fattn_xmx_v2_f16, float);
+            if (strcmp(force, "xmx-v2") == 0 || strcmp(force, "xmx-v2-tm16") == 0 || strcmp(force, "xmx-v2-tm8") == 0) {
+                force_known               = true;
+                const int  forced_variant = strcmp(force, "xmx-v2-tm16") == 0 ? 1 :
+                                            strcmp(force, "xmx-v2-tm8") == 0  ? 0 :
+                                                                                -1;
+                const bool use_f32_acc    = (params.prec == GGML_PREC_F32);
+                bool       v2_dispatched  = false;
+
+                if (ne01 <= 1) {
+                    GGML_SYCL_KTRACE("fattn FORCE=xmx-v2", " D=%d ncols=1 ne01=%d variant=%d", D, ne01, forced_variant);
+                    if (use_f32_acc) {
+                        DISPATCH_NCOLS_CTX_ACC_VARIANT(1, launch_fattn_xmx_v2_f16_variant, float, forced_variant);
+                    } else {
+                        DISPATCH_NCOLS_CTX_ACC_VARIANT(1, launch_fattn_xmx_v2_f16_variant, afloat, forced_variant);
+                    }
+                    dispatch_debug_kernel(v2_dispatched ? "force_xmx_v2_f16_ncols1" :
+                                                          "force_xmx_v2_f16_ncols1_rejected");
+                    if (!v2_dispatched) {
+                        DISPATCH_NCOLS(1, launch_fattn_tile_f16);
+                    }
+                } else if (ne01 <= 2) {
+                    GGML_SYCL_KTRACE("fattn FORCE=xmx-v2", " D=%d ncols=2 ne01=%d variant=%d", D, ne01, forced_variant);
+                    if (use_f32_acc) {
+                        DISPATCH_NCOLS_CTX_ACC_VARIANT(2, launch_fattn_xmx_v2_f16_variant, float, forced_variant);
+                    } else {
+                        DISPATCH_NCOLS_CTX_ACC_VARIANT(2, launch_fattn_xmx_v2_f16_variant, afloat, forced_variant);
+                    }
+                    dispatch_debug_kernel(v2_dispatched ? "force_xmx_v2_f16_ncols2" :
+                                                          "force_xmx_v2_f16_ncols2_rejected");
+                    if (!v2_dispatched) {
+                        DISPATCH_NCOLS(2, launch_fattn_tile_f16);
+                    }
+                } else if (ne01 <= 4) {
+                    GGML_SYCL_KTRACE("fattn FORCE=xmx-v2", " D=%d ncols=8 ne01=%d variant=%d", D, ne01, forced_variant);
+                    if (use_f32_acc) {
+                        DISPATCH_NCOLS_CTX_ACC_VARIANT(8, launch_fattn_xmx_v2_f16_variant, float, forced_variant);
+                    } else {
+                        DISPATCH_NCOLS_CTX_ACC_VARIANT(8, launch_fattn_xmx_v2_f16_variant, afloat, forced_variant);
+                    }
+                    dispatch_debug_kernel(v2_dispatched ? "force_xmx_v2_f16_ncols8" :
+                                                          "force_xmx_v2_f16_ncols8_rejected");
+                    if (!v2_dispatched) {
+                        DISPATCH_NCOLS(4, launch_fattn_tile_f16);
+                    }
                 } else {
-                    DISPATCH_NCOLS_CTX_ACC(8, launch_fattn_xmx_v2_f16, afloat);
-                }
-                if (!v2_dispatched) {
-                    GGML_SYCL_KTRACE("fattn FORCE=xmx-v2 fallback TILE", " D=%d ncols=%d ne01=%d", D, 8, ne01);
-                    dispatch_debug_kernel("force_xmx_v2_fallback_tile_f16");
-                    DISPATCH_NCOLS(8, launch_fattn_tile_f16);
-                } else {
-                    dispatch_debug_kernel("force_xmx_v2_f16");
+                    GGML_SYCL_KTRACE("fattn FORCE=xmx-v2", " D=%d ncols=16 ne01=%d variant=%d", D, ne01,
+                                     forced_variant);
+                    if (use_f32_acc) {
+                        DISPATCH_NCOLS_CTX_ACC_VARIANT(16, launch_fattn_xmx_v2_f16_variant, float, forced_variant);
+                    } else {
+                        DISPATCH_NCOLS_CTX_ACC_VARIANT(16, launch_fattn_xmx_v2_f16_variant, afloat, forced_variant);
+                    }
+                    dispatch_debug_kernel(v2_dispatched ? "force_xmx_v2_f16_ncols16" :
+                                                          "force_xmx_v2_f16_ncols16_rejected");
+                    if (!v2_dispatched) {
+                        DISPATCH_NCOLS(8, launch_fattn_tile_f16);
+                    }
                 }
                 return;
             }
@@ -1354,10 +1378,11 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
     }
 #endif  // GGML_SYCL_DNNL
 
-    // Batched ESIMD D=64 PP path.  Keep oneDNN ahead of this branch for
-    // oneDNN-compatible models; GPT-OSS reaches this path because sinks are not
-    // oneDNN SDPA-compatible today.  The predicate is capability/shape driven:
-    // queried SLM size, f16 K/V, public-layout output, no paged/multi-seq modes.
+    // Batched ESIMD D=64 PP path. XMX-v2 has a faster GPT-OSS B50 PP
+    // measurement after the active-subgroup fix, but broader backend-op
+    // coverage exposed D64 FA shapes where v2 is not correctness-clean yet.
+    // Keep the proven ESIMD path as the default and use the shape-preserving
+    // XMX-v2 force path for targeted profiling until v2 passes the full gate.
     if (can_use_esimd_batched_pp(false)) {
         GGML_SYCL_KTRACE("fattn_esimd_f16_batched", " D=%d ne01=%d slm=%zu", D, ne01,
                          fattn_esimd_batched_slm_bytes<D>());
@@ -1366,8 +1391,9 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
         return;
     }
 
-    // Dispatch to appropriate kernel based on GPU capabilities.
-    // Default: XMX-v2 (fattn-xmx-f16-v2.hpp) — no SLM aliasing, deterministic.
+    // Dispatch remaining shapes based on GPU capabilities.
+    // XMX-v2 (fattn-xmx-f16-v2.hpp) has no SLM aliasing and remains the
+    // XMX-capable path for shapes not claimed by the proven fast paths above.
     // GGML_SYCL_FA_XMX_V1=1: fallback to broken v1 kernel for A/B comparison only.
     if (use_xmx) {
         static const bool force_xmx_v1 = []() {
@@ -1502,6 +1528,7 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
 
 #undef DISPATCH_NCOLS
 #undef DISPATCH_NCOLS_CTX_ACC
+#undef DISPATCH_NCOLS_CTX_ACC_VARIANT
 }
 
 // Main flash attention entry point
