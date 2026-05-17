@@ -40,6 +40,12 @@ struct bench_timing {
     double max_us  = 0.0;
 };
 
+struct path_result {
+    bench_timing timing;
+    float        max_abs    = 0.0f;
+    float        public_abs = 0.0f;
+};
+
 struct sample_ref {
     int   h;
     int   q;
@@ -382,7 +388,7 @@ static void run_shape(const bench_shape & shape) {
                 "notes");
 
     auto run_and_report = [&](const char * name, output_layout layout, const std::function<void()> & fn,
-                              const char * notes) {
+                              const char * notes) -> path_result {
         q->memset(out_dev, 0, (size_t) H_Q * N_Q * D * sizeof(float)).wait();
         const bench_timing timing = time_path(*q, warmup, iters, fn);
 
@@ -392,9 +398,10 @@ static void run_shape(const bench_shape & shape) {
         const float public_abs = sample_max_abs(actual, refs, output_layout::public_qhd);
         std::printf("%-22s %10.1f %10.1f %10.1f %12.5g %12.5g %s\n", name, timing.mean_us, timing.min_us, timing.max_us,
                     max_abs, public_abs, notes);
+        return { timing, max_abs, public_abs };
     };
 
-    run_and_report(
+    (void) run_and_report(
         "xmx-v2-ncols16", output_layout::public_qhd,
         [&]() {
             const bool ok = params.logit_softcap == 0.0f ?
@@ -406,7 +413,7 @@ static void run_shape(const bench_shape & shape) {
         },
         "default public layout");
 
-    run_and_report(
+    (void) run_and_report(
         "xmx-v1-ncols8", output_layout::public_qhd,
         [&]() {
             const size_t local_mem = (size_t) q->get_device().get_info<sycl::info::device::local_mem_size>();
@@ -425,9 +432,12 @@ static void run_shape(const bench_shape & shape) {
         },
         "diagnostic public layout");
 
-    run_and_report(
-        "esimd-batched", output_layout::head_major_hqd, [&]() { fattn_esimd_f16_batched<D, sycl::half>(params, *q); },
-        "diagnostic head-major output");
+    const path_result esimd = run_and_report(
+        "esimd-batched", output_layout::public_qhd, [&]() { fattn_esimd_f16_batched<D, sycl::half>(params, *q); },
+        "candidate public layout");
+    if (esimd.public_abs > 1.0e-3f) {
+        throw std::runtime_error("esimd-batched public layout check failed");
+    }
 
     sycl::free(q_dev, *q);
     sycl::free(k_dev, *q);

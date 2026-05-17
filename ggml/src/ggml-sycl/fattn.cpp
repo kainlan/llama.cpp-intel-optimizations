@@ -1050,6 +1050,61 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
                 (int) fast_decode_policy.fast_esimd_safe, (int) g_sycl_fa_safe_decode_forced);
     }
 
+    auto can_use_esimd_batched_pp = [&](bool ignore_safe_decode) -> bool {
+        if constexpr (D != 64) {
+            return false;
+        } else {
+            if (!ignore_safe_decode && safe_decode) {
+                return false;
+            }
+            if (ne01 <= 1 || !g_sycl_fa_esimd_enabled || !fattn_esimd_f16_available()) {
+                return false;
+            }
+            if (params.kv_is_fp8 || params.K_type != GGML_TYPE_F16 || params.V_type != GGML_TYPE_F16) {
+                return false;
+            }
+            if (params.Q_type != GGML_TYPE_F16 && params.Q_type != GGML_TYPE_F32) {
+                return false;
+            }
+            if (params.mask != nullptr && params.mask_type != GGML_TYPE_F16) {
+                return false;
+            }
+            if (params.use_paged_attn || params.use_paged_layout || params.block_table != nullptr ||
+                params.seq_lens != nullptr) {
+                return false;
+            }
+            if (params.n_seqs > 1 || params.seq_q_offsets != nullptr || params.seq_kv_offsets != nullptr ||
+                params.q_seq_ids != nullptr || params.kv_seq_ids != nullptr) {
+                return false;
+            }
+            if (params.multi_token_decode || params.q_positions != nullptr) {
+                return false;
+            }
+            if (params.ne12 <= 0 || params.ne02 <= 0 || params.ne02 % params.ne12 != 0) {
+                return false;
+            }
+
+            const size_t local_mem_size = (size_t) dev.get_info<sycl::info::device::local_mem_size>();
+            return local_mem_size >= fattn_esimd_batched_slm_bytes<D>();
+        }
+    };
+
+    auto can_use_xmx_v1_runtime = [&]() -> bool {
+        // XMX-v1 is the old diagnostic kernel.  It still has measurable drift
+        // on GPT-OSS sink+softcap shapes, so only allow it for the simple D=128
+        // PP shape family it was historically used for.  Everything else must
+        // use v2 or a later proven path.
+        if constexpr (D != 128) {
+            return false;
+        } else {
+            return ne01 >= 8 && params.sinks == nullptr && params.logit_softcap == 0.0f && !params.kv_is_fp8 &&
+                   !params.use_paged_attn && !params.use_paged_layout && params.block_table == nullptr &&
+                   params.seq_lens == nullptr && params.n_seqs <= 1 && params.seq_q_offsets == nullptr &&
+                   params.seq_kv_offsets == nullptr && params.q_seq_ids == nullptr && params.kv_seq_ids == nullptr &&
+                   !params.multi_token_decode && params.q_positions == nullptr;
+        }
+    };
+
 #if GGML_SYCL_DNNL
     auto onednn_layout_reason_name = [](ggml_sycl_onednn_fa_layout_reason reason) {
         switch (reason) {
@@ -1157,10 +1212,19 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
 #endif
             if (strcmp(force, "xmx-v1") == 0) {
                 // v1 kernel — kept for A/B comparison only — use GGML_SYCL_FA_XMX_V1 instead
-                GGML_SYCL_KTRACE("fattn FORCE=xmx-v1", " D=%d ncols=%d ne01=%d", D, 8, ne01);
-                dispatch_debug_kernel("force_xmx_v1_f16");
-                DISPATCH_NCOLS(8, launch_fattn_xmx_f16);
-                return;
+                force_known = true;
+                if (can_use_xmx_v1_runtime()) {
+                    GGML_SYCL_KTRACE("fattn FORCE=xmx-v1", " D=%d ncols=%d ne01=%d", D, 8, ne01);
+                    dispatch_debug_kernel("force_xmx_v1_f16");
+                    DISPATCH_NCOLS(8, launch_fattn_xmx_f16);
+                    return;
+                }
+                if (dispatch_debug_enabled) {
+                    fprintf(stderr,
+                            "[SYCL] fattn: GGML_SYCL_FA_FORCE_PATH=xmx-v1 rejected for D=%d ne01=%d sinks=%d "
+                            "softcap=%.6g fp8=%d; falling through\n",
+                            D, ne01, params.sinks != nullptr, params.logit_softcap, (int) params.kv_is_fp8);
+                }
             }
             if (strcmp(force, "xmx-v2-tm16") == 0 || strcmp(force, "xmx-v2-tm8") == 0) {
                 // Actually force XMX-v2 TM variant via env var (TM=8→0, TM=16→1)
@@ -1192,13 +1256,24 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
             if (strcmp(force, "esimd") == 0) {
                 force_known = true;
                 if (g_sycl_fa_esimd_enabled && fattn_esimd_f16_available()) {
-                    GGML_SYCL_KTRACE("fattn FORCE=esimd", " D=%d ne01=%d", D, ne01);
-                    dispatch_debug_kernel("force_esimd_f16");
-                    fattn_esimd_f16<D, Q_type>(params, *stream);
-                    return;
+                    if (ne01 <= 1) {
+                        GGML_SYCL_KTRACE("fattn FORCE=esimd", " D=%d ne01=%d", D, ne01);
+                        dispatch_debug_kernel("force_esimd_f16");
+                        fattn_esimd_f16<D, Q_type>(params, *stream);
+                        return;
+                    }
+                    if (can_use_esimd_batched_pp(true)) {
+                        GGML_SYCL_KTRACE("fattn FORCE=esimd_batched", " D=%d ne01=%d", D, ne01);
+                        dispatch_debug_kernel("force_esimd_f16_batched");
+                        fattn_esimd_f16_batched<D, Q_type>(params, *stream);
+                        return;
+                    }
                 }
                 if (dispatch_debug_enabled) {
-                    fprintf(stderr, "[SYCL] fattn: GGML_SYCL_FA_FORCE_PATH=esimd unavailable; falling through\n");
+                    fprintf(stderr,
+                            "[SYCL] fattn: GGML_SYCL_FA_FORCE_PATH=esimd unavailable for D=%d ne01=%d; falling "
+                            "through\n",
+                            D, ne01);
                 }
             }
             if (strcmp(force, "tile") == 0) {
@@ -1214,22 +1289,15 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
         }
     }
 
-    // ---- ESIMD kernel dispatch (uses explicit SIMD operations) ----
-    // - Single query (ne01 <= 1): +7% speedup for decode on Mistral 7B
-    // - Batched queries (ne01 <= 8): Only for D=64 due to SLM constraints
+    // ---- ESIMD decode dispatch (uses explicit SIMD operations) ----
+    // Single query (ne01 <= 1): +7% speedup for decode on Mistral 7B.
+    // Batched D=64 PP is selected below after oneDNN has had first refusal.
     if (!safe_decode && fast_esimd_decode) {
         if (ne01 <= 1) {
             // Partitioned kernel: each thread processes disjoint KV ranges
             GGML_SYCL_KTRACE("fattn_esimd_f16", " D=%d ne01=%d", D, ne01);
             dispatch_debug_kernel("esimd_f16");
             fattn_esimd_f16<D, Q_type>(params, *stream);
-            return;
-        } else if (false && D == 64 && ne01 <= 8 && fattn_esimd_batched_fits_slm<D>()) {
-            // DISABLED: Batched ESIMD is 20% slower than XMX for pp
-            // Keep single-query ESIMD for tg (ne01 <= 1) which has +7% speedup
-            GGML_SYCL_KTRACE("fattn_esimd_f16_batched", " D=%d ne01=%d", D, ne01);
-            dispatch_debug_kernel("esimd_f16_batched");
-            fattn_esimd_f16_batched<D, Q_type>(params, *stream);
             return;
         }
     }
@@ -1286,6 +1354,18 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
     }
 #endif  // GGML_SYCL_DNNL
 
+    // Batched ESIMD D=64 PP path.  Keep oneDNN ahead of this branch for
+    // oneDNN-compatible models; GPT-OSS reaches this path because sinks are not
+    // oneDNN SDPA-compatible today.  The predicate is capability/shape driven:
+    // queried SLM size, f16 K/V, public-layout output, no paged/multi-seq modes.
+    if (can_use_esimd_batched_pp(false)) {
+        GGML_SYCL_KTRACE("fattn_esimd_f16_batched", " D=%d ne01=%d slm=%zu", D, ne01,
+                         fattn_esimd_batched_slm_bytes<D>());
+        dispatch_debug_kernel("esimd_f16_batched");
+        fattn_esimd_f16_batched<D, Q_type>(params, *stream);
+        return;
+    }
+
     // Dispatch to appropriate kernel based on GPU capabilities.
     // Default: XMX-v2 (fattn-xmx-f16-v2.hpp) — no SLM aliasing, deterministic.
     // GGML_SYCL_FA_XMX_V1=1: fallback to broken v1 kernel for A/B comparison only.
@@ -1298,13 +1378,20 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
             const char * env = std::getenv("GGML_SYCL_FA_XMX_V1_PP");
             return env && std::atoi(env) == 0;
         }();
-        const bool simple_pp_xmx_v1 = !disable_xmx_v1_pp && ne01 >= 8 && D == 128 && params.sinks == nullptr &&
-                                      params.logit_softcap == 0.0f && !params.kv_is_fp8;
+        const bool xmx_v1_supported = can_use_xmx_v1_runtime();
+        const bool simple_pp_xmx_v1 = !disable_xmx_v1_pp && xmx_v1_supported;
+        const bool use_xmx_v1_path  = xmx_v1_supported && (force_xmx_v1 || simple_pp_xmx_v1);
+        if (force_xmx_v1 && !xmx_v1_supported && dispatch_debug_enabled) {
+            fprintf(stderr,
+                    "[SYCL] fattn: GGML_SYCL_FA_XMX_V1=1 rejected for D=%d ne01=%d sinks=%d softcap=%.6g fp8=%d; "
+                    "using v2/fallback\n",
+                    D, ne01, params.sinks != nullptr, params.logit_softcap, (int) params.kv_is_fp8);
+        }
 
-        if (force_xmx_v1 || simple_pp_xmx_v1) {
-            // v1 kernel — kept for A/B regression and used for simple D=128 PP
-            // FA shapes where v2's small tile is much slower. Do not use this
-            // for sink/softcap/FP8/TG cases that motivated the deterministic v2
+        if (use_xmx_v1_path) {
+            // v1 kernel — kept for A/B regression and simple D=128 PP FA shapes
+            // where v2's small tile is much slower. Do not use it for
+            // sink/softcap/FP8/TG cases that motivated the deterministic v2
             // default.
             if (ne01 <= 1) {
                 GGML_SYCL_KTRACE("fattn_xmx_v1_f16", " D=%d ncols=1 ne01=%d", D, ne01);
