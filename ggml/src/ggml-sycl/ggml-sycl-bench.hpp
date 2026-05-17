@@ -6,12 +6,11 @@
 
 #pragma once
 
-#include <cstdint>
-#include <vector>
-
-#include <sycl/sycl.hpp>
-
 #include "ggml.h"
+
+#include <cstdint>
+#include <sycl/sycl.hpp>
+#include <vector>
 
 namespace ggml_sycl {
 
@@ -53,6 +52,41 @@ struct mmvq_bench_args {
 // Returns true on success, false on invalid arguments
 // If events is non-null, kernel events are appended for timing (if supported)
 bool ggml_sycl_mmvq_bench_launch(const mmvq_bench_args & args, std::vector<sycl::event> * events);
+
+// Arguments for benchmarking the production MXFP4 SOA MoE gate/up/GLU kernel
+// shape directly.  The pointer tables are transient launch ABI payloads: each
+// entry points at one resident SOA expert slice.
+struct mxfp4_pair_glu_bench_args {
+    sycl::queue * stream = nullptr;
+
+    const void * const * gate_ptrs          = nullptr;
+    const void * const * up_ptrs            = nullptr;
+    const void *         activations_q8_soa = nullptr;
+    float *              output             = nullptr;
+    const int32_t *      ids                = nullptr;
+
+    int ncols            = 0;
+    int ncols_y          = 0;
+    int nrows_per_expert = 0;
+    int n_ids            = 0;
+    int n_tokens         = 1;
+    int ne11             = 1;
+
+    int64_t ids_nb0 = 0;
+    int64_t ids_nb1 = 0;
+    int64_t nb11    = 0;
+    int64_t nb12    = 0;
+    int64_t dst_nb1 = 0;
+    int64_t dst_nb2 = 0;
+
+    int   rows_per_wg = 4;
+    bool  cache_y     = true;
+    int   glu_op      = 0;
+    float alpha       = 1.702f;
+    float limit       = 7.0f;
+};
+
+bool ggml_sycl_mxfp4_pair_glu_bench_launch(const mxfp4_pair_glu_bench_args & args);
 
 // Arguments for benchmarking MMQ kernels directly (without ggml_tensor overhead)
 struct mmq_bench_args {

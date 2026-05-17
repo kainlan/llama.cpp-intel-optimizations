@@ -4154,42 +4154,43 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_sycl(const void * const * exp
     });
 }
 
-static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl(const void * const * gate_ptrs,
-                                                            const void * const * up_ptrs,
-                                                            const void *         vy,
-                                                            float *              dst_glu,
-                                                            const int32_t *      ids,
-                                                            const float *        gate_bias,
-                                                            const float *        up_bias,
-                                                            const int            ncols,
-                                                            const int            ncols_y,
-                                                            const int            nrows_per_expert,
-                                                            const int            total_batches,
-                                                            const int            n_ids,
-                                                            const int            n_tokens,
-                                                            const int            ne11,
-                                                            const int64_t        ids_nb0,
-                                                            const int64_t        ids_nb1,
-                                                            const int64_t        nb11,
-                                                            const int64_t        nb12,
-                                                            const int64_t        dst_nb1,
-                                                            const int64_t        dst_nb2,
-                                                            const int64_t        gate_bias_nb1,
-                                                            const int64_t        up_bias_nb1,
-                                                            const int            glu_op,
-                                                            const float          alpha,
-                                                            const float          limit,
-                                                            dpct::queue_ptr      stream) {
+template <int MOE_MMV_Y>
+static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows(const void * const * gate_ptrs,
+                                                                 const void * const * up_ptrs,
+                                                                 const void *         vy,
+                                                                 float *              dst_glu,
+                                                                 const int32_t *      ids,
+                                                                 const float *        gate_bias,
+                                                                 const float *        up_bias,
+                                                                 const int            ncols,
+                                                                 const int            ncols_y,
+                                                                 const int            nrows_per_expert,
+                                                                 const int            total_batches,
+                                                                 const int            n_ids,
+                                                                 const int            n_tokens,
+                                                                 const int            ne11,
+                                                                 const int64_t        ids_nb0,
+                                                                 const int64_t        ids_nb1,
+                                                                 const int64_t        nb11,
+                                                                 const int64_t        nb12,
+                                                                 const int64_t        dst_nb1,
+                                                                 const int64_t        dst_nb2,
+                                                                 const int64_t        gate_bias_nb1,
+                                                                 const int64_t        up_bias_nb1,
+                                                                 const int            glu_op,
+                                                                 const float          alpha,
+                                                                 const float          limit,
+                                                                 bool                 cache_y_local,
+                                                                 dpct::queue_ptr      stream) {
     GGML_ASSERT(ncols % QK_MXFP4 == 0);
-    constexpr int moe_mmv_y = GGML_SYCL_MOE_MMV_Y;
-    static_assert(moe_mmv_y * WARP_SIZE <= 1024, "GGML_SYCL_MOE_MMV_Y exceeds SYCL work-group limit");
-    const int            block_num_z = (nrows_per_expert + moe_mmv_y - 1) / moe_mmv_y;
+    static_assert(MOE_MMV_Y > 0, "MOE_MMV_Y must be positive");
+    static_assert(MOE_MMV_Y * WARP_SIZE <= 1024, "MOE_MMV_Y exceeds SYCL work-group limit");
+    const int            block_num_z = (nrows_per_expert + MOE_MMV_Y - 1) / MOE_MMV_Y;
     const sycl::range<3> block_nums(1, total_batches, block_num_z);
-    const sycl::range<3> block_dims(1, moe_mmv_y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, MOE_MMV_Y, WARP_SIZE);
 
     const int64_t total_qs_size_per_expert = (ncols / 2) * nrows_per_expert;
     const int     blocks_per_row           = ncols / QK_MXFP4;
-    const bool    cache_y_local            = nb11 > 0 && nb11 <= 16 * 1024 && blocks_per_row > 0;
     auto          submit_glu               = [&](auto glu_tag, auto cache_tag) {
         constexpr int  GLU_OP        = decltype(glu_tag)::value;
         constexpr bool CACHE_Y_LOCAL = decltype(cache_tag)::value;
@@ -4222,6 +4223,40 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl(const void * const *
             submit_glu(std::integral_constant<int, GGML_GLU_OP_SWIGLU>{}, std::false_type{});
         }
     }
+}
+
+static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl(const void * const * gate_ptrs,
+                                                            const void * const * up_ptrs,
+                                                            const void *         vy,
+                                                            float *              dst_glu,
+                                                            const int32_t *      ids,
+                                                            const float *        gate_bias,
+                                                            const float *        up_bias,
+                                                            const int            ncols,
+                                                            const int            ncols_y,
+                                                            const int            nrows_per_expert,
+                                                            const int            total_batches,
+                                                            const int            n_ids,
+                                                            const int            n_tokens,
+                                                            const int            ne11,
+                                                            const int64_t        ids_nb0,
+                                                            const int64_t        ids_nb1,
+                                                            const int64_t        nb11,
+                                                            const int64_t        nb12,
+                                                            const int64_t        dst_nb1,
+                                                            const int64_t        dst_nb2,
+                                                            const int64_t        gate_bias_nb1,
+                                                            const int64_t        up_bias_nb1,
+                                                            const int            glu_op,
+                                                            const float          alpha,
+                                                            const float          limit,
+                                                            dpct::queue_ptr      stream) {
+    GGML_UNUSED(nb11);
+    const bool cache_y_local = false;
+    reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<GGML_SYCL_MOE_MMV_Y>(
+        gate_ptrs, up_ptrs, vy, dst_glu, ids, gate_bias, up_bias, ncols, ncols_y, nrows_per_expert, total_batches,
+        n_ids, n_tokens, ne11, ids_nb0, ids_nb1, nb11, nb12, dst_nb1, dst_nb2, gate_bias_nb1, up_bias_nb1, glu_op,
+        alpha, limit, cache_y_local, stream);
 }
 
 // MoE dispatch: MXFP4 Coalesced layout with expert routing
@@ -6681,6 +6716,64 @@ bool ggml_sycl_mmvq_bench_launch(const mmvq_bench_args & args, std::vector<sycl:
                             args.src1_padded_col_size, static_cast<const char *>(args.activations), args.output,
                             args.dst_row_stride, args.stream);
     return true;
+}
+
+bool ggml_sycl_mxfp4_pair_glu_bench_launch(const mxfp4_pair_glu_bench_args & args) {
+    if (!args.stream || !args.gate_ptrs || !args.up_ptrs || !args.activations_q8_soa || !args.output || !args.ids) {
+        return false;
+    }
+    if (args.ncols <= 0 || args.ncols_y <= 0 || args.nrows_per_expert <= 0 || args.n_ids <= 0 || args.n_tokens <= 0 ||
+        args.ne11 <= 0) {
+        return false;
+    }
+    if (args.ncols % QK_MXFP4 != 0 || args.ids_nb0 <= 0 || args.ids_nb1 <= 0 || args.nb11 <= 0 || args.nb12 <= 0 ||
+        args.dst_nb1 <= 0 || args.dst_nb2 <= 0) {
+        return false;
+    }
+    if (args.glu_op != GGML_GLU_OP_SWIGLU && args.glu_op != GGML_GLU_OP_SWIGLU_OAI) {
+        return false;
+    }
+
+    const int total_batches = args.n_ids * args.n_tokens;
+    switch (args.rows_per_wg) {
+        case 1:
+            reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<1>(
+                args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids, nullptr, nullptr,
+                args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids, args.n_tokens, args.ne11,
+                args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, 0, 0, args.glu_op,
+                args.alpha, args.limit, args.cache_y, args.stream);
+            return true;
+        case 2:
+            reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<2>(
+                args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids, nullptr, nullptr,
+                args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids, args.n_tokens, args.ne11,
+                args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, 0, 0, args.glu_op,
+                args.alpha, args.limit, args.cache_y, args.stream);
+            return true;
+        case 4:
+            reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<4>(
+                args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids, nullptr, nullptr,
+                args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids, args.n_tokens, args.ne11,
+                args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, 0, 0, args.glu_op,
+                args.alpha, args.limit, args.cache_y, args.stream);
+            return true;
+        case 8:
+            reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<8>(
+                args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids, nullptr, nullptr,
+                args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids, args.n_tokens, args.ne11,
+                args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, 0, 0, args.glu_op,
+                args.alpha, args.limit, args.cache_y, args.stream);
+            return true;
+        case 16:
+            reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<16>(
+                args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids, nullptr, nullptr,
+                args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids, args.n_tokens, args.ne11,
+                args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, 0, 0, args.glu_op,
+                args.alpha, args.limit, args.cache_y, args.stream);
+            return true;
+        default:
+            return false;
+    }
 }
 
 }  // namespace ggml_sycl

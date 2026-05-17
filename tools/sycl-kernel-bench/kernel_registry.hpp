@@ -22,6 +22,7 @@ enum class KernelKind {
     MXFP4_DECODE_BANDWIDTH,
     MXFP4_INLINE_DOT,
     MXFP4_SELECTED_READ,
+    MXFP4_PAIR_GLU,
     ROOFLINE_COMPUTE,
     DPAS_EXPLORATION,
 };
@@ -98,6 +99,12 @@ inline const std::vector<KernelInfo> & kernel_list() {
         { "mxfp4_selected_read_soa",            GGML_LAYOUT_SOA,       KernelKind::MXFP4_SELECTED_READ    },
         { "mxfp4_selected_read_interleave_aos", GGML_LAYOUT_AOS,       KernelKind::MXFP4_SELECTED_READ    },
         { "mxfp4_selected_read_interleave_soa", GGML_LAYOUT_SOA,       KernelKind::MXFP4_SELECTED_READ    },
+        { "mxfp4_pair_glu_soa_r1",              GGML_LAYOUT_SOA,       KernelKind::MXFP4_PAIR_GLU         },
+        { "mxfp4_pair_glu_soa_r2",              GGML_LAYOUT_SOA,       KernelKind::MXFP4_PAIR_GLU         },
+        { "mxfp4_pair_glu_soa_r4",              GGML_LAYOUT_SOA,       KernelKind::MXFP4_PAIR_GLU         },
+        { "mxfp4_pair_glu_soa_r8",              GGML_LAYOUT_SOA,       KernelKind::MXFP4_PAIR_GLU         },
+        { "mxfp4_pair_glu_soa_r16",             GGML_LAYOUT_SOA,       KernelKind::MXFP4_PAIR_GLU         },
+        { "mxfp4_pair_glu_soa_r4_nocache",      GGML_LAYOUT_SOA,       KernelKind::MXFP4_PAIR_GLU         },
         { "roofline_compute",                   GGML_LAYOUT_AOS,       KernelKind::ROOFLINE_COMPUTE       },
     };
     return kernels;
