@@ -443,6 +443,7 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
                         int                          rows_per_wg,
                         bool                         cache_y,
                         bool                         direct_xmx,
+                        bool                         ignore_weight_scale,
                         bool                         validate,
                         int                          warmup,
                         int                          iterations,
@@ -549,30 +550,31 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     queue.wait_and_throw();
 
     ggml_sycl::mxfp4_pair_glu_bench_args args{};
-    args.stream             = &queue;
-    args.gate_ptrs          = reinterpret_cast<const void * const *>(d_gate_ptrs);
-    args.up_ptrs            = reinterpret_cast<const void * const *>(d_up_ptrs);
-    args.activations_q8_soa = d_act;
-    args.output             = d_out;
-    args.ids                = d_ids;
-    args.ncols              = static_cast<int>(k);
-    args.ncols_y            = static_cast<int>(k);
-    args.nrows_per_expert   = static_cast<int>(m);
-    args.n_ids              = static_cast<int>(n_selected);
-    args.n_tokens           = static_cast<int>(n_tokens);
-    args.ne11               = 1;
-    args.ids_nb0            = sizeof(int32_t);
-    args.ids_nb1            = static_cast<int64_t>(selected_count * sizeof(int32_t));
-    args.nb11               = q8_row_bytes;
-    args.nb12               = q8_row_bytes;
-    args.dst_nb1            = static_cast<int64_t>(m * sizeof(float));
-    args.dst_nb2            = static_cast<int64_t>(selected_count * static_cast<size_t>(m) * sizeof(float));
-    args.rows_per_wg        = rows_per_wg;
-    args.cache_y            = cache_y;
-    args.direct_xmx         = direct_xmx;
-    args.glu_op             = GGML_GLU_OP_SWIGLU_OAI;
-    args.alpha              = 1.702f;
-    args.limit              = 7.0f;
+    args.stream              = &queue;
+    args.gate_ptrs           = reinterpret_cast<const void * const *>(d_gate_ptrs);
+    args.up_ptrs             = reinterpret_cast<const void * const *>(d_up_ptrs);
+    args.activations_q8_soa  = d_act;
+    args.output              = d_out;
+    args.ids                 = d_ids;
+    args.ncols               = static_cast<int>(k);
+    args.ncols_y             = static_cast<int>(k);
+    args.nrows_per_expert    = static_cast<int>(m);
+    args.n_ids               = static_cast<int>(n_selected);
+    args.n_tokens            = static_cast<int>(n_tokens);
+    args.ne11                = 1;
+    args.ids_nb0             = sizeof(int32_t);
+    args.ids_nb1             = static_cast<int64_t>(selected_count * sizeof(int32_t));
+    args.nb11                = q8_row_bytes;
+    args.nb12                = q8_row_bytes;
+    args.dst_nb1             = static_cast<int64_t>(m * sizeof(float));
+    args.dst_nb2             = static_cast<int64_t>(selected_count * static_cast<size_t>(m) * sizeof(float));
+    args.rows_per_wg         = rows_per_wg;
+    args.cache_y             = cache_y;
+    args.direct_xmx          = direct_xmx;
+    args.ignore_weight_scale = ignore_weight_scale;
+    args.glu_op              = GGML_GLU_OP_SWIGLU_OAI;
+    args.alpha               = 1.702f;
+    args.limit               = 7.0f;
 
     auto launch = [&]() {
         if (!ggml_sycl::ggml_sycl_mxfp4_pair_glu_bench_launch(args)) {
@@ -674,6 +676,7 @@ bool run_mxfp4_mmv_id(const GeneratedWeights &     weights,
                       int64_t                      n_tokens,
                       int                          rows_per_wg,
                       bool                         validate,
+                      bool                         ignore_weight_scale,
                       int                          warmup,
                       int                          iterations,
                       sycl::queue &                queue,
@@ -760,25 +763,26 @@ bool run_mxfp4_mmv_id(const GeneratedWeights &     weights,
     queue.wait_and_throw();
 
     ggml_sycl::mxfp4_mmv_id_bench_args args{};
-    args.stream             = &queue;
-    args.expert_ptrs        = reinterpret_cast<const void * const *>(d_ptrs);
-    args.activations_q8_soa = d_act;
-    args.output             = d_out;
-    args.ids                = d_ids;
-    args.ncols              = static_cast<int>(k);
-    args.ncols_y            = static_cast<int>(k);
-    args.nrows_per_expert   = static_cast<int>(m);
-    args.num_experts        = static_cast<int>(n_selected);
-    args.n_ids              = static_cast<int>(n_selected);
-    args.n_tokens           = static_cast<int>(n_tokens);
-    args.ne11               = 1;
-    args.ids_nb0            = sizeof(int32_t);
-    args.ids_nb1            = static_cast<int64_t>(selected_count * sizeof(int32_t));
-    args.nb11               = q8_row_bytes;
-    args.nb12               = q8_row_bytes;
-    args.dst_nb1            = static_cast<int64_t>(m * sizeof(float));
-    args.dst_nb2            = static_cast<int64_t>(selected_count * static_cast<size_t>(m) * sizeof(float));
-    args.rows_per_wg        = rows_per_wg;
+    args.stream              = &queue;
+    args.expert_ptrs         = reinterpret_cast<const void * const *>(d_ptrs);
+    args.activations_q8_soa  = d_act;
+    args.output              = d_out;
+    args.ids                 = d_ids;
+    args.ncols               = static_cast<int>(k);
+    args.ncols_y             = static_cast<int>(k);
+    args.nrows_per_expert    = static_cast<int>(m);
+    args.num_experts         = static_cast<int>(n_selected);
+    args.n_ids               = static_cast<int>(n_selected);
+    args.n_tokens            = static_cast<int>(n_tokens);
+    args.ne11                = 1;
+    args.ids_nb0             = sizeof(int32_t);
+    args.ids_nb1             = static_cast<int64_t>(selected_count * sizeof(int32_t));
+    args.nb11                = q8_row_bytes;
+    args.nb12                = q8_row_bytes;
+    args.dst_nb1             = static_cast<int64_t>(m * sizeof(float));
+    args.dst_nb2             = static_cast<int64_t>(selected_count * static_cast<size_t>(m) * sizeof(float));
+    args.rows_per_wg         = rows_per_wg;
+    args.ignore_weight_scale = ignore_weight_scale;
 
     auto launch = [&]() {
         if (!ggml_sycl::ggml_sycl_mxfp4_mmv_id_bench_launch(args)) {

@@ -79,12 +79,13 @@ struct mxfp4_pair_glu_bench_args {
     int64_t dst_nb1 = 0;
     int64_t dst_nb2 = 0;
 
-    int   rows_per_wg = 4;
-    bool  cache_y     = true;
-    bool  direct_xmx  = false;
-    int   glu_op      = 0;
-    float alpha       = 1.702f;
-    float limit       = 7.0f;
+    int   rows_per_wg         = 4;
+    bool  cache_y             = true;
+    bool  direct_xmx          = false;
+    bool  ignore_weight_scale = false;
+    int   glu_op              = 0;
+    float alpha               = 1.702f;
+    float limit               = 7.0f;
 };
 
 bool ggml_sycl_mxfp4_pair_glu_bench_launch(const mxfp4_pair_glu_bench_args & args);
@@ -114,7 +115,8 @@ struct mxfp4_mmv_id_bench_args {
     int64_t dst_nb1 = 0;
     int64_t dst_nb2 = 0;
 
-    int rows_per_wg = 4;
+    int  rows_per_wg         = 4;
+    bool ignore_weight_scale = false;
 };
 
 bool ggml_sycl_mxfp4_mmv_id_bench_launch(const mxfp4_mmv_id_bench_args & args);

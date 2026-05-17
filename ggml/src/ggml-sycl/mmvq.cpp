@@ -3250,14 +3250,12 @@ static void mul_mat_vec_mxfp4_q8_1_id_sycl(const void *         vx,
     });
 }
 
+template <bool USE_WEIGHT_SCALE = true>
 static __dpct_inline__ float mxfp4_soa_q8_1_block_dot(const uint8_t * __restrict__ qs_row,
                                                       const uint8_t * __restrict__ scale_row,
                                                       const char * __restrict__ y_base,
                                                       const int ncols_y,
                                                       const int b) {
-    const uint8_t e8m0 = scale_row[b];
-    const float   d    = ggml_sycl_e8m0_to_fp32(e8m0) * 0.5f;
-
     const int *         q8_qs = (const int *) (y_base + b * QK8_1);
     const sycl::half2 * q8_ds = (const sycl::half2 *) (y_base + ncols_y + b * sizeof(sycl::half2));
     const float         d8    = (float) (*q8_ds)[0];
@@ -3274,9 +3272,17 @@ static __dpct_inline__ float mxfp4_soa_q8_1_block_dot(const uint8_t * __restrict
         sumi = ggml_sycl_dp4a(v.y(), q8_qs[i / 4 + 4], sumi);
     }
 
-    return d * d8 * sumi;
+    if constexpr (USE_WEIGHT_SCALE) {
+        const uint8_t e8m0 = scale_row[b];
+        const float   d    = ggml_sycl_e8m0_to_fp32(e8m0) * 0.5f;
+        return d * d8 * sumi;
+    } else {
+        GGML_UNUSED(scale_row);
+        return d8 * sumi;
+    }
 }
 
+template <bool USE_WEIGHT_SCALE = true>
 static __dpct_inline__ void mxfp4_soa_q8_1_block_dot_pair(const uint8_t * __restrict__ qs_row_a,
                                                           const uint8_t * __restrict__ scale_row_a,
                                                           const uint8_t * __restrict__ qs_row_b,
@@ -3312,12 +3318,20 @@ static __dpct_inline__ void mxfp4_soa_q8_1_block_dot_pair(const uint8_t * __rest
         sumi_b = ggml_sycl_dp4a(vb.y(), q8_1, sumi_b);
     }
 
-    const float d_a = ggml_sycl_e8m0_to_fp32(scale_row_a[b]) * 0.5f;
-    const float d_b = ggml_sycl_e8m0_to_fp32(scale_row_b[b]) * 0.5f;
-    acc_a += d_a * d8 * sumi_a;
-    acc_b += d_b * d8 * sumi_b;
+    if constexpr (USE_WEIGHT_SCALE) {
+        const float d_a = ggml_sycl_e8m0_to_fp32(scale_row_a[b]) * 0.5f;
+        const float d_b = ggml_sycl_e8m0_to_fp32(scale_row_b[b]) * 0.5f;
+        acc_a += d_a * d8 * sumi_a;
+        acc_b += d_b * d8 * sumi_b;
+    } else {
+        GGML_UNUSED(scale_row_a);
+        GGML_UNUSED(scale_row_b);
+        acc_a += d8 * sumi_a;
+        acc_b += d8 * sumi_b;
+    }
 }
 
+template <bool USE_WEIGHT_SCALE = true>
 static __dpct_inline__ void mxfp4_soa_q8_1_block_dot_pair_slm(const uint8_t * __restrict__ qs_row_a,
                                                               const uint8_t * __restrict__ scale_row_a,
                                                               const uint8_t * __restrict__ qs_row_b,
@@ -3354,16 +3368,24 @@ static __dpct_inline__ void mxfp4_soa_q8_1_block_dot_pair_slm(const uint8_t * __
         sumi_b = ggml_sycl_dp4a(vb.y(), q8_1, sumi_b);
     }
 
-    const float d_a = ggml_sycl_e8m0_to_fp32(scale_row_a[b]) * 0.5f;
-    const float d_b = ggml_sycl_e8m0_to_fp32(scale_row_b[b]) * 0.5f;
-    acc_a += d_a * d8 * sumi_a;
-    acc_b += d_b * d8 * sumi_b;
+    if constexpr (USE_WEIGHT_SCALE) {
+        const float d_a = ggml_sycl_e8m0_to_fp32(scale_row_a[b]) * 0.5f;
+        const float d_b = ggml_sycl_e8m0_to_fp32(scale_row_b[b]) * 0.5f;
+        acc_a += d_a * d8 * sumi_a;
+        acc_b += d_b * d8 * sumi_b;
+    } else {
+        GGML_UNUSED(scale_row_a);
+        GGML_UNUSED(scale_row_b);
+        acc_a += d8 * sumi_a;
+        acc_b += d8 * sumi_b;
+    }
 }
 
 // MoE dispatch: MXFP4 with SoA layout (reordered weights) + expert routing
 // SoA layout for weights: [all qs for all experts][all scales for all experts]
 // SoA layout for Q8_1: per row [quants: ncols_y bytes][ds: nblocks * sizeof(half2)]
 // After reorder_qw_mxfp4: qs at offset 0, scales at offset (ncols/2)*total_rows
+template <bool USE_WEIGHT_SCALE = true>
 static void mul_mat_vec_mxfp4_q8_1_soa_id_kernel(
     const uint8_t * __restrict__ vx,                   // Base pointer to reordered MXFP4 tensor (SoA layout)
     const uint8_t * const * __restrict__ expert_ptrs,  // Optional per-expert base pointers (SoA layout)
@@ -3444,13 +3466,13 @@ static void mul_mat_vec_mxfp4_q8_1_soa_id_kernel(
 
     int b = lane_id;
     for (; b + 3 * blocks_per_warp < blocks_per_row; b += 4 * blocks_per_warp) {
-        acc0 += mxfp4_soa_q8_1_block_dot(qs_row, scale_row, y_base, ncols_y, b);
-        acc1 += mxfp4_soa_q8_1_block_dot(qs_row, scale_row, y_base, ncols_y, b + blocks_per_warp);
-        acc2 += mxfp4_soa_q8_1_block_dot(qs_row, scale_row, y_base, ncols_y, b + 2 * blocks_per_warp);
-        acc3 += mxfp4_soa_q8_1_block_dot(qs_row, scale_row, y_base, ncols_y, b + 3 * blocks_per_warp);
+        acc0 += mxfp4_soa_q8_1_block_dot<USE_WEIGHT_SCALE>(qs_row, scale_row, y_base, ncols_y, b);
+        acc1 += mxfp4_soa_q8_1_block_dot<USE_WEIGHT_SCALE>(qs_row, scale_row, y_base, ncols_y, b + blocks_per_warp);
+        acc2 += mxfp4_soa_q8_1_block_dot<USE_WEIGHT_SCALE>(qs_row, scale_row, y_base, ncols_y, b + 2 * blocks_per_warp);
+        acc3 += mxfp4_soa_q8_1_block_dot<USE_WEIGHT_SCALE>(qs_row, scale_row, y_base, ncols_y, b + 3 * blocks_per_warp);
     }
     for (; b < blocks_per_row; b += blocks_per_warp) {
-        acc0 += mxfp4_soa_q8_1_block_dot(qs_row, scale_row, y_base, ncols_y, b);
+        acc0 += mxfp4_soa_q8_1_block_dot<USE_WEIGHT_SCALE>(qs_row, scale_row, y_base, ncols_y, b);
     }
 
     float acc = (acc0 + acc1) + (acc2 + acc3);
@@ -3832,7 +3854,7 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_xmx_sycl(const void * con
 }
 #endif
 
-template <int GLU_OP, bool CACHE_Y_LOCAL>
+template <int GLU_OP, bool CACHE_Y_LOCAL, bool USE_WEIGHT_SCALE = true>
 static void mul_mat_vec_mxfp4_q8_1_soa_id_pair_glu_kernel(const uint8_t * const * __restrict__ gate_ptrs,
                                                           const uint8_t * const * __restrict__ up_ptrs,
                                                           const void * __restrict__ vy,
@@ -3911,24 +3933,26 @@ static void mul_mat_vec_mxfp4_q8_1_soa_id_pair_glu_kernel(const uint8_t * const 
     int b = lane_id;
     for (; b + blocks_per_warp < blocks_per_row; b += 2 * blocks_per_warp) {
         if constexpr (CACHE_Y_LOCAL) {
-            mxfp4_soa_q8_1_block_dot_pair_slm(gate_qs_row, gate_scale_row, up_qs_row, up_scale_row, slm_y_qs, slm_y_ds,
-                                              QI8_1, b, gate_acc, up_acc);
-            mxfp4_soa_q8_1_block_dot_pair_slm(gate_qs_row, gate_scale_row, up_qs_row, up_scale_row, slm_y_qs, slm_y_ds,
-                                              QI8_1, b + blocks_per_warp, gate_acc, up_acc);
+            mxfp4_soa_q8_1_block_dot_pair_slm<USE_WEIGHT_SCALE>(gate_qs_row, gate_scale_row, up_qs_row, up_scale_row,
+                                                                slm_y_qs, slm_y_ds, QI8_1, b, gate_acc, up_acc);
+            mxfp4_soa_q8_1_block_dot_pair_slm<USE_WEIGHT_SCALE>(gate_qs_row, gate_scale_row, up_qs_row, up_scale_row,
+                                                                slm_y_qs, slm_y_ds, QI8_1, b + blocks_per_warp,
+                                                                gate_acc, up_acc);
         } else {
-            mxfp4_soa_q8_1_block_dot_pair(gate_qs_row, gate_scale_row, up_qs_row, up_scale_row, global_y_base, ncols_y,
-                                          b, gate_acc, up_acc);
-            mxfp4_soa_q8_1_block_dot_pair(gate_qs_row, gate_scale_row, up_qs_row, up_scale_row, global_y_base, ncols_y,
-                                          b + blocks_per_warp, gate_acc, up_acc);
+            mxfp4_soa_q8_1_block_dot_pair<USE_WEIGHT_SCALE>(gate_qs_row, gate_scale_row, up_qs_row, up_scale_row,
+                                                            global_y_base, ncols_y, b, gate_acc, up_acc);
+            mxfp4_soa_q8_1_block_dot_pair<USE_WEIGHT_SCALE>(gate_qs_row, gate_scale_row, up_qs_row, up_scale_row,
+                                                            global_y_base, ncols_y, b + blocks_per_warp, gate_acc,
+                                                            up_acc);
         }
     }
     for (; b < blocks_per_row; b += blocks_per_warp) {
         if constexpr (CACHE_Y_LOCAL) {
-            mxfp4_soa_q8_1_block_dot_pair_slm(gate_qs_row, gate_scale_row, up_qs_row, up_scale_row, slm_y_qs, slm_y_ds,
-                                              QI8_1, b, gate_acc, up_acc);
+            mxfp4_soa_q8_1_block_dot_pair_slm<USE_WEIGHT_SCALE>(gate_qs_row, gate_scale_row, up_qs_row, up_scale_row,
+                                                                slm_y_qs, slm_y_ds, QI8_1, b, gate_acc, up_acc);
         } else {
-            mxfp4_soa_q8_1_block_dot_pair(gate_qs_row, gate_scale_row, up_qs_row, up_scale_row, global_y_base, ncols_y,
-                                          b, gate_acc, up_acc);
+            mxfp4_soa_q8_1_block_dot_pair<USE_WEIGHT_SCALE>(gate_qs_row, gate_scale_row, up_qs_row, up_scale_row,
+                                                            global_y_base, ncols_y, b, gate_acc, up_acc);
         }
     }
 
@@ -4068,7 +4092,7 @@ static void mul_mat_vec_mxfp4_q8_1_coalesced_id_kernel(
 
 // MoE dispatch: MXFP4 SoA layout with expert routing
 // Both MXFP4 weights and Q8_1 inputs must be in SoA layout
-template <int MOE_MMV_Y>
+template <int MOE_MMV_Y, bool USE_WEIGHT_SCALE = true>
 static void reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows(const void *         vx,
                                                         const void * const * expert_ptrs,
                                                         const void *         vy,
@@ -4104,7 +4128,7 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows(const void *         vx,
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
                          [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                             mul_mat_vec_mxfp4_q8_1_soa_id_kernel(
+                             mul_mat_vec_mxfp4_q8_1_soa_id_kernel<USE_WEIGHT_SCALE>(
                                  (const uint8_t *) vx, (const uint8_t * const *) expert_ptrs, vy, dst, ids, ncols,
                                  ncols_y, nrows_per_expert, n_ids, n_tokens, ne11, total_qs_size,
                                  total_qs_size_per_expert, ids_nb0, ids_nb1, nb11, nb12, nb1, nb2, item_ct1);
@@ -4180,7 +4204,7 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_sycl(const void * const * exp
     });
 }
 
-template <int MOE_MMV_Y>
+template <int MOE_MMV_Y, bool USE_WEIGHT_SCALE = true>
 static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows(const void * const * gate_ptrs,
                                                                  const void * const * up_ptrs,
                                                                  const void *         vy,
@@ -4227,7 +4251,7 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows(const void * co
                 sycl::range<1>(CACHE_Y_LOCAL ? static_cast<size_t>(blocks_per_row) : 1), cgh);
             cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
                                                     [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                 mul_mat_vec_mxfp4_q8_1_soa_id_pair_glu_kernel<GLU_OP, CACHE_Y_LOCAL>(
+                                 mul_mat_vec_mxfp4_q8_1_soa_id_pair_glu_kernel<GLU_OP, CACHE_Y_LOCAL, USE_WEIGHT_SCALE>(
                                      (const uint8_t * const *) gate_ptrs, (const uint8_t * const *) up_ptrs, vy,
                                      dst_glu, ids, gate_bias, up_bias, ncols, ncols_y, nrows_per_expert, n_ids,
                                      n_tokens, ne11, total_qs_size_per_expert, ids_nb0, ids_nb1, nb11, nb12, dst_nb1,
@@ -6777,35 +6801,75 @@ bool ggml_sycl_mxfp4_pair_glu_bench_launch(const mxfp4_pair_glu_bench_args & arg
 #endif
     switch (args.rows_per_wg) {
         case 1:
-            reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<1>(
+            if (args.ignore_weight_scale) {
+                reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<1, false>(
+                    args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids, nullptr, nullptr,
+                    args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids, args.n_tokens,
+                    args.ne11, args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, 0, 0,
+                    args.glu_op, args.alpha, args.limit, args.cache_y, args.stream);
+                return true;
+            }
+            reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<1, true>(
                 args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids, nullptr, nullptr,
                 args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids, args.n_tokens, args.ne11,
                 args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, 0, 0, args.glu_op,
                 args.alpha, args.limit, args.cache_y, args.stream);
             return true;
         case 2:
-            reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<2>(
+            if (args.ignore_weight_scale) {
+                reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<2, false>(
+                    args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids, nullptr, nullptr,
+                    args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids, args.n_tokens,
+                    args.ne11, args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, 0, 0,
+                    args.glu_op, args.alpha, args.limit, args.cache_y, args.stream);
+                return true;
+            }
+            reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<2, true>(
                 args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids, nullptr, nullptr,
                 args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids, args.n_tokens, args.ne11,
                 args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, 0, 0, args.glu_op,
                 args.alpha, args.limit, args.cache_y, args.stream);
             return true;
         case 4:
-            reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<4>(
+            if (args.ignore_weight_scale) {
+                reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<4, false>(
+                    args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids, nullptr, nullptr,
+                    args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids, args.n_tokens,
+                    args.ne11, args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, 0, 0,
+                    args.glu_op, args.alpha, args.limit, args.cache_y, args.stream);
+                return true;
+            }
+            reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<4, true>(
                 args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids, nullptr, nullptr,
                 args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids, args.n_tokens, args.ne11,
                 args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, 0, 0, args.glu_op,
                 args.alpha, args.limit, args.cache_y, args.stream);
             return true;
         case 8:
-            reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<8>(
+            if (args.ignore_weight_scale) {
+                reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<8, false>(
+                    args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids, nullptr, nullptr,
+                    args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids, args.n_tokens,
+                    args.ne11, args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, 0, 0,
+                    args.glu_op, args.alpha, args.limit, args.cache_y, args.stream);
+                return true;
+            }
+            reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<8, true>(
                 args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids, nullptr, nullptr,
                 args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids, args.n_tokens, args.ne11,
                 args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, 0, 0, args.glu_op,
                 args.alpha, args.limit, args.cache_y, args.stream);
             return true;
         case 16:
-            reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<16>(
+            if (args.ignore_weight_scale) {
+                reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<16, false>(
+                    args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids, nullptr, nullptr,
+                    args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids, args.n_tokens,
+                    args.ne11, args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, 0, 0,
+                    args.glu_op, args.alpha, args.limit, args.cache_y, args.stream);
+                return true;
+            }
+            reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<16, true>(
                 args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids, nullptr, nullptr,
                 args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids, args.n_tokens, args.ne11,
                 args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, 0, 0, args.glu_op,
@@ -6832,31 +6896,66 @@ bool ggml_sycl_mxfp4_mmv_id_bench_launch(const mxfp4_mmv_id_bench_args & args) {
     const int total_batches = args.n_ids * args.n_tokens;
     switch (args.rows_per_wg) {
         case 1:
-            reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<1>(
+            if (args.ignore_weight_scale) {
+                reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<1, false>(
+                    nullptr, args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
+                    args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
+                    args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.stream);
+                return true;
+            }
+            reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<1, true>(
                 nullptr, args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
                 args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
                 args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.stream);
             return true;
         case 2:
-            reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<2>(
+            if (args.ignore_weight_scale) {
+                reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<2, false>(
+                    nullptr, args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
+                    args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
+                    args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.stream);
+                return true;
+            }
+            reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<2, true>(
                 nullptr, args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
                 args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
                 args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.stream);
             return true;
         case 4:
-            reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<4>(
+            if (args.ignore_weight_scale) {
+                reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<4, false>(
+                    nullptr, args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
+                    args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
+                    args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.stream);
+                return true;
+            }
+            reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<4, true>(
                 nullptr, args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
                 args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
                 args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.stream);
             return true;
         case 8:
-            reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<8>(
+            if (args.ignore_weight_scale) {
+                reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<8, false>(
+                    nullptr, args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
+                    args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
+                    args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.stream);
+                return true;
+            }
+            reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<8, true>(
                 nullptr, args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
                 args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
                 args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.stream);
             return true;
         case 16:
-            reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<16>(
+            if (args.ignore_weight_scale) {
+                reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<16, false>(
+                    nullptr, args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
+                    args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
+                    args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.stream);
+                return true;
+            }
+            reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<16, true>(
                 nullptr, args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
                 args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
                 args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.stream);
