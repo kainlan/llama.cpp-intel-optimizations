@@ -1045,6 +1045,20 @@ if(GGML_SYCL)
     add_test(NAME test-sycl-fattn-xmx-policy COMMAND $<TARGET_FILE:test-sycl-fattn-xmx-policy>)
 endif()
 
+# bench-sycl-fattn-gptoss: synthetic GPT-OSS PP FA kernel proof harness.
+if(GGML_SYCL)
+    add_executable(bench-sycl-fattn-gptoss bench-sycl-fattn-gptoss.cpp)
+    target_link_libraries(bench-sycl-fattn-gptoss PRIVATE ggml ggml-cpu)
+    target_include_directories(bench-sycl-fattn-gptoss PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/include
+        ${PROJECT_SOURCE_DIR}/ggml/src)
+    target_compile_definitions(bench-sycl-fattn-gptoss PRIVATE
+        $<TARGET_PROPERTY:ggml-sycl,COMPILE_DEFINITIONS>)
+    target_compile_options(bench-sycl-fattn-gptoss PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(bench-sycl-fattn-gptoss PRIVATE "-fsycl")
+    install(TARGETS bench-sycl-fattn-gptoss RUNTIME)
+endif()
+
 # test-sycl-kv-planned-device-materialization: KV roots follow placement_plan.kv_device.
 if(GGML_SYCL)
     add_executable(test-sycl-kv-planned-device-materialization test-sycl-kv-planned-device-materialization.cpp)
