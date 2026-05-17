@@ -8760,6 +8760,122 @@ struct moe_layer_decode_plan {
     bool                           down_eligible = false;
 };
 
+struct moe_layer_direct_xmx_decision {
+    bool         eligible         = false;
+    const char * reason           = "not-evaluated";
+    int          device           = -1;
+    int64_t      in_dim           = 0;
+    int64_t      out_dim          = 0;
+    int64_t      n_experts        = 0;
+    size_t       n_entries        = 0;
+    size_t       n_unique_experts = 0;
+    layout_mode  layout           = GGML_LAYOUT_AOS;
+};
+
+static moe_layer_direct_xmx_decision moe_layer_direct_xmx_check_role(const moe_layer_decode_role_plan & role,
+                                                                     int                                device,
+                                                                     size_t                             n_entries,
+                                                                     layout_mode                        layout) {
+    moe_layer_direct_xmx_decision decision;
+    decision.device    = device;
+    decision.n_entries = n_entries;
+    decision.layout    = layout;
+
+    const ggml_tensor * weight = role.weight;
+    if (!weight) {
+        decision.reason = "missing-weight";
+        return decision;
+    }
+    decision.in_dim    = weight->ne[0];
+    decision.out_dim   = weight->ne[1];
+    decision.n_experts = weight->ne[2] > 0 ? weight->ne[2] : 1;
+
+    if (weight->type != GGML_TYPE_MXFP4) {
+        decision.reason = "type";
+        return decision;
+    }
+    if (layout != GGML_LAYOUT_SOA) {
+        decision.reason = "layout";
+        return decision;
+    }
+    if (decision.in_dim <= 0 || decision.out_dim <= 0 || decision.n_experts <= 0 || n_entries == 0) {
+        decision.reason = "shape-empty";
+        return decision;
+    }
+    if (role.expert_ids.size() != n_entries || role.handles.size() != n_entries) {
+        decision.reason = "role-size";
+        return decision;
+    }
+
+#if SYCL_XMX_MOE_AVAILABLE
+    const auto & caps = ggml_sycl_info().devices[device].xmx_caps;
+    if (!caps.supported || !caps.supports_int8) {
+        decision.reason = "capability";
+        return decision;
+    }
+    if (caps.K == 0 || (decision.in_dim % static_cast<int64_t>(caps.K)) != 0) {
+        decision.reason = "tile-k";
+        return decision;
+    }
+    if (caps.N == 0 || caps.M == 0 || caps.optimal_tiles_n <= 0 || caps.optimal_tiles_m <= 0) {
+        decision.reason = "tile-config";
+        return decision;
+    }
+#else
+    decision.reason = "xmx-unavailable";
+    return decision;
+#endif
+
+    std::unordered_set<int32_t> unique_experts;
+    unique_experts.reserve(role.expert_ids.size());
+    for (size_t i = 0; i < role.expert_ids.size(); ++i) {
+        const int32_t eid = role.expert_ids[i];
+        if (eid < 0 || eid >= decision.n_experts) {
+            decision.reason = "expert-id";
+            return decision;
+        }
+        ggml_sycl::resolved_ptr resolved = role.handles[i].resolve(device);
+        if (!resolved.ptr) {
+            decision.reason = "handle-resolve";
+            return decision;
+        }
+        if (!resolved.on_device) {
+            decision.reason = "residency";
+            return decision;
+        }
+        if (resolved.layout != layout) {
+            decision.reason = "handle-layout";
+            return decision;
+        }
+        unique_experts.insert(eid);
+    }
+
+    decision.n_unique_experts = unique_experts.size();
+    decision.reason           = "eligible";
+    decision.eligible         = true;
+    return decision;
+}
+
+static void moe_layer_direct_xmx_trace_decisions(const moe_layer_decode_plan &         plan,
+                                                 const moe_layer_direct_xmx_decision & gate,
+                                                 const moe_layer_direct_xmx_decision & up,
+                                                 const moe_layer_direct_xmx_decision * down) {
+    static std::atomic<int> trace_log{ 0 };
+    if (trace_log.fetch_add(1, std::memory_order_relaxed) >= 64) {
+        return;
+    }
+
+    fprintf(stderr,
+            "[MOE-DIRECT-XMX-PLAN] layer=%d device=%d entries=%zu topk=%lld layout=%s "
+            "gate=%s uniq=%zu up=%s uniq=%zu",
+            plan.layer, gate.device, plan.n_entries, (long long) plan.n_ids, ggml_sycl_layout_mode_name(plan.layout),
+            gate.reason, gate.n_unique_experts, up.reason, up.n_unique_experts);
+    if (down) {
+        fprintf(stderr, " down=%s down_uniq=%zu", down->reason, down->n_unique_experts);
+    }
+    fprintf(stderr, "\n");
+}
+
 static bool moe_layer_capture_tensor_artifact(moe_layer_decode_artifact_plan & artifact,
                                               const ggml_tensor *              tensor,
                                               int                              device,
@@ -40288,6 +40404,20 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     plan.up   = plan.current;
                     plan.gate = plan.partner;
                 }
+                static const int direct_xmx_probe_enabled = [] {
+                    const char * env = std::getenv("GGML_SYCL_DIRECT_XMX_MOE_PROBE");
+                    return env ? std::atoi(env) : 0;
+                }();
+                const bool direct_xmx_probe = direct_xmx_probe_enabled != 0 || path_trace_enabled > 1;
+                std::optional<moe_layer_direct_xmx_decision> direct_gate_decision;
+                std::optional<moe_layer_direct_xmx_decision> direct_up_decision;
+                if (direct_xmx_probe) {
+                    direct_gate_decision =
+                        moe_layer_direct_xmx_check_role(plan.gate, ctx.device, plan.n_entries, pair_layout);
+                    direct_up_decision =
+                        moe_layer_direct_xmx_check_role(plan.up, ctx.device, plan.n_entries, pair_layout);
+                    moe_layer_direct_xmx_trace_decisions(plan, *direct_gate_decision, *direct_up_decision, nullptr);
+                }
 
                 const int32_t * ids_device = plan.ids_device;
 
@@ -40328,9 +40458,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 if (can_fuse_glu) {
                     const void * const * gate_ptrs = current_is_gate ? current_ptrs : partner_ptrs;
                     const void * const * up_ptrs   = current_is_up ? current_ptrs : partner_ptrs;
-                    if (pair.gate_bias && !moe_layer_capture_tensor_artifact(plan.gate_bias, pair.gate_bias, ctx.device,
-                                                                             GGML_LAYOUT_AOS, "gate-bias", false,
-                                                                             false)) {
+                    if (pair.gate_bias &&
+                        !moe_layer_capture_tensor_artifact(plan.gate_bias, pair.gate_bias, ctx.device, GGML_LAYOUT_AOS,
+                                                           "gate-bias", false, false)) {
                         return reject_artifact("gate-bias-handle", pair.gate_bias);
                     }
                     if (pair.up_bias && !moe_layer_capture_tensor_artifact(plan.up_bias, pair.up_bias, ctx.device,
@@ -40392,6 +40522,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 const int down_layer_hash = moe_cache_layer_id(pair.down_weight->name);
                                 ggml_sycl_ensure_weight_on_device(pair.down_weight, ctx.device);
                                 const bool down_plan_ok = build_role_plan(plan.down, pair.down_weight, "down-route");
+                                std::optional<moe_layer_direct_xmx_decision> direct_down_decision;
+                                if (direct_xmx_probe && down_plan_ok && direct_gate_decision && direct_up_decision) {
+                                    direct_down_decision = moe_layer_direct_xmx_check_role(plan.down, ctx.device,
+                                                                                           down_entries, pair_layout);
+                                    moe_layer_direct_xmx_trace_decisions(plan, *direct_gate_decision,
+                                                                         *direct_up_decision, &*direct_down_decision);
+                                }
                                 if (down_plan_ok &&
                                     !moe_layer_capture_tensor_artifact(plan.down_output, pair.down_dst, ctx.device,
                                                                        GGML_LAYOUT_AOS, "down-output", true)) {
