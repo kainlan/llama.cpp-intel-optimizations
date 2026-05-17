@@ -6761,6 +6761,20 @@ bool ggml_sycl_mxfp4_pair_glu_bench_launch(const mxfp4_pair_glu_bench_args & arg
     }
 
     const int total_batches = args.n_ids * args.n_tokens;
+#if GGML_SYCL_XMX_JOINT_MATRIX_AVAILABLE
+    if (args.direct_xmx) {
+        reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_xmx_sycl(
+            args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids, nullptr, nullptr, args.ncols,
+            args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids, args.n_tokens, args.ne11, args.ids_nb0,
+            args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, 0, 0, args.glu_op, args.alpha, args.limit,
+            args.stream);
+        return true;
+    }
+#else
+    if (args.direct_xmx) {
+        return false;
+    }
+#endif
     switch (args.rows_per_wg) {
         case 1:
             reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<1>(

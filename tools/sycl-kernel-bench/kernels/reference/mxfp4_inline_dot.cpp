@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <sstream>
 #include <type_traits>
 
@@ -441,6 +442,7 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
                         int64_t                      n_tokens,
                         int                          rows_per_wg,
                         bool                         cache_y,
+                        bool                         direct_xmx,
                         bool                         validate,
                         int                          warmup,
                         int                          iterations,
@@ -488,6 +490,7 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     uint8_t *        d_act       = sycl::malloc_device<uint8_t>(act_bytes, queue);
     int32_t *        d_ids       = sycl::malloc_device<int32_t>(ids_count, queue);
     float *          d_out       = sycl::malloc_device<float>(out_count, queue);
+    float *          d_ref_out   = direct_xmx && validate ? sycl::malloc_device<float>(out_count, queue) : nullptr;
 
     auto cleanup = [&]() {
         if (d_gate) {
@@ -511,9 +514,13 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
         if (d_out) {
             sycl::free(d_out, queue);
         }
+        if (d_ref_out) {
+            sycl::free(d_ref_out, queue);
+        }
     };
 
-    if (!d_gate || !d_up || !d_gate_ptrs || !d_up_ptrs || !d_act || !d_ids || !d_out) {
+    if (!d_gate || !d_up || !d_gate_ptrs || !d_up_ptrs || !d_act || !d_ids || !d_out ||
+        (direct_xmx && validate && !d_ref_out)) {
         cleanup();
         error = "device allocation failed for mxfp4_pair_glu.";
         return false;
@@ -562,6 +569,7 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     args.dst_nb2            = static_cast<int64_t>(selected_count * static_cast<size_t>(m) * sizeof(float));
     args.rows_per_wg        = rows_per_wg;
     args.cache_y            = cache_y;
+    args.direct_xmx         = direct_xmx;
     args.glu_op             = GGML_GLU_OP_SWIGLU_OAI;
     args.alpha              = 1.702f;
     args.limit              = 7.0f;
@@ -615,6 +623,41 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
                 cleanup();
                 error = "mxfp4_pair_glu validation failed: non-finite output.";
                 return false;
+            }
+        }
+        if (direct_xmx) {
+            queue.memset(d_ref_out, 0, out_bytes).wait();
+            ggml_sycl::mxfp4_pair_glu_bench_args ref_args = args;
+            ref_args.output                               = d_ref_out;
+            ref_args.direct_xmx                           = false;
+            ref_args.rows_per_wg                          = 1;
+            ref_args.cache_y                              = false;
+            if (!ggml_sycl::ggml_sycl_mxfp4_pair_glu_bench_launch(ref_args)) {
+                cleanup();
+                error = "mxfp4_pair_glu direct-XMX reference launch rejected.";
+                return false;
+            }
+            queue.wait_and_throw();
+            std::vector<float> expected(out_count);
+            queue.memcpy(expected.data(), d_ref_out, out_bytes).wait();
+            double max_err = 0.0;
+            double sum_err = 0.0;
+            for (size_t i = 0; i < out_count; ++i) {
+                const double diff = std::abs(static_cast<double>(actual[i]) - static_cast<double>(expected[i]));
+                max_err           = std::max(max_err, diff);
+                sum_err += diff;
+                const double tol = 1e-2 + 1e-2 * std::abs(static_cast<double>(expected[i]));
+                if (diff > tol) {
+                    cleanup();
+                    char msg[256];
+                    std::snprintf(msg, sizeof(msg),
+                                  "mxfp4_pair_glu direct-XMX validation failed at %zu: actual=%.6f expected=%.6f "
+                                  "diff=%.6f tol=%.6f max=%.6f mean=%.6f.",
+                                  i, static_cast<double>(actual[i]), static_cast<double>(expected[i]), diff, tol,
+                                  max_err, sum_err / static_cast<double>(i + 1));
+                    error = msg;
+                    return false;
+                }
             }
         }
     }

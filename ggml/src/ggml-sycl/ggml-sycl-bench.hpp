@@ -81,6 +81,7 @@ struct mxfp4_pair_glu_bench_args {
 
     int   rows_per_wg = 4;
     bool  cache_y     = true;
+    bool  direct_xmx  = false;
     int   glu_op      = 0;
     float alpha       = 1.702f;
     float limit       = 7.0f;

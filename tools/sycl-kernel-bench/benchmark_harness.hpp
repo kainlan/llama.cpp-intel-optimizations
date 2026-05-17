@@ -1100,7 +1100,8 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                 const int            rows_per_wg = parse_moe_rows_per_wg(config.kernel_name);
                 const bool           cache_y     = config.kernel_name.find("_cache") != std::string::npos &&
                                      config.kernel_name.find("_nocache") == std::string::npos;
-                if (!run_mxfp4_pair_glu(weights, activations, m, n, k, token_rows, rows_per_wg, cache_y,
+                const bool direct_xmx = config.kernel_name.find("_xmx_") != std::string::npos;
+                if (!run_mxfp4_pair_glu(weights, activations, m, n, k, token_rows, rows_per_wg, cache_y, direct_xmx,
                                         config.validate, config.warmup_iterations, config.measure_iterations, queue,
                                         metrics, error)) {
                     out.error = error;
