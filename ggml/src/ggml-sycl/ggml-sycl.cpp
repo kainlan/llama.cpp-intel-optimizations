@@ -40408,7 +40408,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     const char * env = std::getenv("GGML_SYCL_DIRECT_XMX_MOE_PROBE");
                     return env ? std::atoi(env) : 0;
                 }();
-                const bool direct_xmx_probe = direct_xmx_probe_enabled != 0 || path_trace_enabled > 1;
+                static const int direct_xmx_glu_enabled = [] {
+                    const char * env = std::getenv("GGML_SYCL_MOE_DIRECT_XMX_GLU");
+                    return env ? std::atoi(env) : 0;
+                }();
+                const bool direct_xmx_probe =
+                    direct_xmx_probe_enabled != 0 || direct_xmx_glu_enabled != 0 || path_trace_enabled > 1;
                 std::optional<moe_layer_direct_xmx_decision> direct_gate_decision;
                 std::optional<moe_layer_direct_xmx_decision> direct_up_decision;
                 if (direct_xmx_probe) {
@@ -40482,7 +40487,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             ctx, pair.gate_weight, pair.up_weight, src1, pair.glu_dst, gate_ptrs, up_ptrs, ids_device,
                             gate_bias_ptr, up_bias_ptr, pair.gate_bias ? pair.gate_bias->nb[1] : 0,
                             pair.up_bias ? pair.up_bias->nb[1] : 0, static_cast<int>(plan.current.expert_ids.size()),
-                            n_ids_pair, ids->nb[0], ids->nb[1], pair.glu_op, alpha, limit, &plan.glu_output.handle);
+                            n_ids_pair, ids->nb[0], ids->nb[1], pair.glu_op, alpha, limit, &plan.glu_output.handle,
+                            direct_gate_decision && direct_up_decision && direct_gate_decision->eligible &&
+                                direct_up_decision->eligible);
                         if (ok_glu) {
                             static const int layer_executor_enabled = [] {
                                 const char * env = std::getenv("GGML_SYCL_MOE_LAYER_EXECUTOR");

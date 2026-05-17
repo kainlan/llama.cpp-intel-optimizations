@@ -4972,7 +4972,8 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                                                   int                           glu_op,
                                                   float                         alpha,
                                                   float                         limit,
-                                                  const ggml_sycl::mem_handle * glu_dst_handle_override) {
+                                                  const ggml_sycl::mem_handle * glu_dst_handle_override,
+                                                  bool                          direct_xmx_eligible) {
     if (n_gpu_entries <= 0 || !gate_ptrs_device || !up_ptrs_device || !ids_device) {
         return false;
     }
@@ -5034,7 +5035,7 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
     bool used_direct_xmx = false;
 #if GGML_SYCL_XMX_JOINT_MATRIX_AVAILABLE
     const auto & xmx_caps = ggml_sycl_info().devices[ctx.device].xmx_caps;
-    if (mmvq_moe_direct_xmx_glu_enabled() && xmx_caps.supported && xmx_caps.supports_int8) {
+    if (mmvq_moe_direct_xmx_glu_enabled() && direct_xmx_eligible && xmx_caps.supported && xmx_caps.supports_int8) {
         reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_xmx_sycl(
             gate_ptrs_device, up_ptrs_device, q8_1_buffer, glu_d, ids_device, gate_bias_device, up_bias_device, ne00,
             ne10, ne01, total_batches, n_ids, num_tokens, ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, glu_dst->nb[1],

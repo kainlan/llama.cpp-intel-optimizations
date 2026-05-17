@@ -80,27 +80,27 @@ bool mmvq_moe_batched_dispatch_pair_mxfp4_soa(
     int64_t                     ids_nb0,
     int64_t                     ids_nb1);
 
-bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(
-    ggml_backend_sycl_context & ctx,
-    const ggml_tensor *         gate_weight,
-    const ggml_tensor *         up_weight,
-    const ggml_tensor *         src1,
-    ggml_tensor *               glu_dst,
-    const void * const *        gate_ptrs_device,
-    const void * const *        up_ptrs_device,
-    const int32_t *             ids_device,
-    const float *               gate_bias_device,
-    const float *               up_bias_device,
-    int64_t                     gate_bias_nb1,
-    int64_t                     up_bias_nb1,
-    int                         n_gpu_entries,
-    int64_t                     n_ids,
-    int64_t                     ids_nb0,
-    int64_t                     ids_nb1,
-    int                         glu_op,
-    float                       alpha,
-    float                       limit,
-    const ggml_sycl::mem_handle * glu_dst_handle_override = nullptr);
+bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   ctx,
+                                                  const ggml_tensor *           gate_weight,
+                                                  const ggml_tensor *           up_weight,
+                                                  const ggml_tensor *           src1,
+                                                  ggml_tensor *                 glu_dst,
+                                                  const void * const *          gate_ptrs_device,
+                                                  const void * const *          up_ptrs_device,
+                                                  const int32_t *               ids_device,
+                                                  const float *                 gate_bias_device,
+                                                  const float *                 up_bias_device,
+                                                  int64_t                       gate_bias_nb1,
+                                                  int64_t                       up_bias_nb1,
+                                                  int                           n_gpu_entries,
+                                                  int64_t                       n_ids,
+                                                  int64_t                       ids_nb0,
+                                                  int64_t                       ids_nb1,
+                                                  int                           glu_op,
+                                                  float                         alpha,
+                                                  float                         limit,
+                                                  const ggml_sycl::mem_handle * glu_dst_handle_override = nullptr,
+                                                  bool                          direct_xmx_eligible     = false);
 
 struct mmvq_moe_dispatch_timing {
     double activation_quant_us = 0.0;
