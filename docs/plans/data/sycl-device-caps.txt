@@ -6,12 +6,12 @@ Device 0
   Platform vendor: Intel(R) Corporation
   Device name    : Intel(R) Arc(TM) B580 Graphics
   Device vendor  : Intel(R) Corporation
-  Driver version : 1.14.37020
+  Driver version : 1.14.37435
 
   --- Memory ---
   local_mem_size       : 131072 bytes (128 KB)
   local_mem_type       : local
-  global_mem_size      : 12168933376 bytes (11605 MB)
+  global_mem_size      : 12809404416 bytes (12216 MB)
   max_mem_alloc_size   : 12168933376 bytes (11605 MB)
 
   --- Compute ---
@@ -90,13 +90,13 @@ Device 1
   Platform vendor: Intel(R) Corporation
   Device name    : Intel(R) Arc(TM) Pro B50 Graphics
   Device vendor  : Intel(R) Corporation
-  Driver version : 1.14.37020
+  Driver version : 1.14.37435
 
   --- Memory ---
   local_mem_size       : 131072 bytes (128 KB)
   local_mem_type       : local
-  global_mem_size      : 14205059072 bytes (13547 MB)
-  max_mem_alloc_size   : 14205059072 bytes (13547 MB)
+  global_mem_size      : 17095983104 bytes (16304 MB)
+  max_mem_alloc_size   : 16241180672 bytes (15488 MB)
 
   --- Compute ---
   max_work_group_size  : 1024
@@ -194,30 +194,6 @@ Device 2
 ======================================================================
 Device 3
 ======================================================================
-  Platform       : Intel(R) OpenCL
-  Platform vendor: Intel(R) Corporation
-  Device name    : Intel(R) Core(TM) Ultra 7 265K
-  Device vendor  : Intel(R) Corporation
-  Driver version : 2026.20.3.0.19_160000.xmain-hotfix
-
-  --- Memory ---
-  local_mem_size       : 262144 bytes (256 KB)
-  local_mem_type       : global
-  global_mem_size      : 265123631104 bytes (252841 MB)
-  max_mem_alloc_size   : 132561815552 bytes (126420 MB)
-
-  --- Compute ---
-  max_work_group_size  : 8192
-  max_num_sub_groups   : 2048
-  max_compute_units    : 20
-  sub_group_sizes      : [4, 8, 16, 32, 64]
-
-  --- XMX joint_matrix combinations (0 total) ---
-  (none -- no XMX hardware support reported)
-
-======================================================================
-Device 4
-======================================================================
   Platform       : Intel(R) OpenCL Graphics
   Platform vendor: Intel(R) Corporation
   Device name    : Intel(R) Arc(TM) B580 Graphics
@@ -295,7 +271,7 @@ Device 4
   0       8       16      8       0       0       tf32          tf32          fp32          fp32          
 
 ======================================================================
-Device 5
+Device 4
 ======================================================================
   Platform       : Intel(R) OpenCL Graphics
   Platform vendor: Intel(R) Corporation
@@ -306,8 +282,8 @@ Device 5
   --- Memory ---
   local_mem_size       : 131072 bytes (128 KB)
   local_mem_type       : local
-  global_mem_size      : 14205059072 bytes (13547 MB)
-  max_mem_alloc_size   : 14205059072 bytes (13547 MB)
+  global_mem_size      : 16241180672 bytes (15488 MB)
+  max_mem_alloc_size   : 16241180672 bytes (15488 MB)
 
   --- Compute ---
   max_work_group_size  : 1024
@@ -377,14 +353,14 @@ Device 5
 ######################################################################
 # MACHINE-PARSABLE SUMMARY
 ######################################################################
-device_count=6
+device_count=5
 
 [device 0]
 name=Intel(R) Arc(TM) B580 Graphics
 vendor=Intel(R) Corporation
-driver=1.14.37020
+driver=1.14.37435
 local_mem_bytes=131072
-global_mem_bytes=12168933376
+global_mem_bytes=12809404416
 max_wg_size=1024
 max_compute_units=160
 sub_group_sizes=16,32
@@ -449,9 +425,9 @@ matrix_combo_52=0x8x16:max=8x0x0:a=tf32:b=tf32:c=fp32:d=fp32
 [device 1]
 name=Intel(R) Arc(TM) Pro B50 Graphics
 vendor=Intel(R) Corporation
-driver=1.14.37020
+driver=1.14.37435
 local_mem_bytes=131072
-global_mem_bytes=14205059072
+global_mem_bytes=17095983104
 max_wg_size=1024
 max_compute_units=128
 sub_group_sizes=16,32
@@ -525,17 +501,6 @@ sub_group_sizes=4,8,16,32,64
 matrix_combinations_count=0
 
 [device 3]
-name=Intel(R) Core(TM) Ultra 7 265K
-vendor=Intel(R) Corporation
-driver=2026.20.3.0.19_160000.xmain-hotfix
-local_mem_bytes=262144
-global_mem_bytes=265123631104
-max_wg_size=8192
-max_compute_units=20
-sub_group_sizes=4,8,16,32,64
-matrix_combinations_count=0
-
-[device 4]
 name=Intel(R) Arc(TM) B580 Graphics
 vendor=Intel(R) Corporation
 driver=26.05.037020
@@ -599,12 +564,12 @@ matrix_combo_50=32x32x64:max=0x0x0:a=bf16:b=bf16:c=fp32:d=bf16
 matrix_combo_51=32x32x64:max=0x0x0:a=bf16:b=bf16:c=bf16:d=bf16
 matrix_combo_52=0x8x16:max=8x0x0:a=tf32:b=tf32:c=fp32:d=fp32
 
-[device 5]
+[device 4]
 name=Intel(R) Arc(TM) Pro B50 Graphics
 vendor=Intel(R) Corporation
 driver=26.05.037020
 local_mem_bytes=131072
-global_mem_bytes=14205059072
+global_mem_bytes=16241180672
 max_wg_size=1024
 max_compute_units=128
 sub_group_sizes=16,32

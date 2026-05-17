@@ -1096,6 +1096,39 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
         }
     };
 
+    auto can_use_xmx_v2_d64_batched_pp = [&]() -> bool {
+        if constexpr (D != 64) {
+            return false;
+        } else {
+            // XMX-v2 is currently proven for real PP batches. Tiny multi-query
+            // batches stay on ESIMD until separately measured.
+            if (!use_xmx || safe_decode || ne01 < 64 || !fattn_xmx_v2_f16_available()) {
+                return false;
+            }
+            if (params.kv_is_fp8 || params.K_type != GGML_TYPE_F16 || params.V_type != GGML_TYPE_F16) {
+                return false;
+            }
+            if (params.Q_type != GGML_TYPE_F16 && params.Q_type != GGML_TYPE_F32) {
+                return false;
+            }
+            if (params.mask != nullptr && params.mask_type != GGML_TYPE_F16) {
+                return false;
+            }
+            if (params.use_paged_attn || params.use_paged_layout || params.block_table != nullptr ||
+                params.seq_lens != nullptr) {
+                return false;
+            }
+            if (params.n_seqs > 1 || params.seq_q_offsets != nullptr || params.seq_kv_offsets != nullptr ||
+                params.q_seq_ids != nullptr || params.kv_seq_ids != nullptr) {
+                return false;
+            }
+            if (params.multi_token_decode || params.q_positions != nullptr) {
+                return false;
+            }
+            return params.ne12 > 0 && params.ne02 > 0 && params.ne02 % params.ne12 == 0;
+        }
+    };
+
     auto can_use_xmx_v1_runtime = [&]() -> bool {
         // XMX-v1 is the old diagnostic kernel.  It still has measurable drift
         // on GPT-OSS sink+softcap shapes, so only allow it for the simple D=128
@@ -1378,9 +1411,28 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
     }
 #endif  // GGML_SYCL_DNNL
 
-    // Batched ESIMD D=64 PP path. XMX-v2 now has focused backend-op coverage,
-    // but keep the proven ESIMD path as the default until a separate promotion
-    // change updates the PP/TG dispatch policy and its performance guardrails.
+    // Batched D=64 PP: XMX-v2 is the default when the shape/capability guards
+    // match. B50 GPT-OSS profiling in llama.cpp-v90xn.32.6 measured the v2
+    // kernel ahead of ESIMD for PP, while decode/TG stayed faster on ESIMD/VEC.
+    // The v2 launcher still owns the per-device matrix/SLM fit check; rejection
+    // falls through to ESIMD without requiring an environment override.
+    if (can_use_xmx_v2_d64_batched_pp()) {
+        bool       v2_dispatched = false;
+        const bool use_f32_acc   = (params.prec == GGML_PREC_F32);
+        GGML_SYCL_KTRACE("fattn_xmx_v2_f16_pp", " D=%d ncols=16 ne01=%d prec=%d", D, ne01, (int) params.prec);
+        if (use_f32_acc) {
+            DISPATCH_NCOLS_CTX_ACC(16, launch_fattn_xmx_v2_f16, float);
+        } else {
+            DISPATCH_NCOLS_CTX_ACC(16, launch_fattn_xmx_v2_f16, afloat);
+        }
+        dispatch_debug_kernel(v2_dispatched ? "xmx_v2_f16_pp_ncols16" : "xmx_v2_f16_pp_ncols16_rejected");
+        if (v2_dispatched) {
+            return;
+        }
+    }
+
+    // Batched ESIMD D=64 PP fallback. This remains the proven fallback for
+    // devices without XMX-v2 support or shapes rejected by the v2 launcher.
     if (can_use_esimd_batched_pp(false)) {
         GGML_SYCL_KTRACE("fattn_esimd_f16_batched", " D=%d ne01=%d slm=%zu", D, ne01,
                          fattn_esimd_batched_slm_bytes<D>());

@@ -1,5 +1,7 @@
 #include "ggml-sycl/fattn-esimd-f16.hpp"
 #include "ggml-sycl/fattn-onednn.hpp"
+#include "ggml-sycl/fattn-tile-f16.hpp"
+#include "ggml-sycl/fattn-vec-f16.hpp"
 #include "ggml-sycl/fattn-xmx-f16-v2.hpp"
 #include "ggml-sycl/fattn-xmx-f16.hpp"
 
@@ -31,6 +33,7 @@ static constexpr int N_REP = H_Q / H_KV;
 
 struct bench_shape {
     const char * name;
+    int          n_q;
     float        logit_softcap;
 };
 
@@ -183,6 +186,9 @@ static std::vector<sample_ref> build_reference_samples(const std::vector<sycl::h
                  (sizeof(dims) / sizeof(dims[0])));
     for (int h : heads) {
         for (int q : queries) {
+            if (q >= params.ne01) {
+                continue;
+            }
             for (int d : dims) {
                 refs.push_back(
                     { h, q, d, reference_value(Q, K, V, mask, sinks, params.scale, params.logit_softcap, h, q, d) });
@@ -339,7 +345,7 @@ static void run_shape(const bench_shape & shape) {
     params.logit_softcap      = shape.logit_softcap;
     params.prec               = GGML_PREC_F32;
     params.ne00               = D;
-    params.ne01               = N_Q;
+    params.ne01               = shape.n_q;
     params.ne02               = H_Q;
     params.ne03               = 1;
     params.nb01               = D * (int) sizeof(sycl::half);
@@ -375,7 +381,7 @@ static void run_shape(const bench_shape & shape) {
     const int                     iters  = env_int("GGML_SYCL_FATTN_GPTOSS_ITERS", 10);
 
     std::printf("\nshape=%s D=%d n_q=%d n_kv=%d H_q=%d H_kv=%d sinks=1 logit_softcap=%.1f scale=%.8f\n", shape.name, D,
-                N_Q, N_KV, H_Q, H_KV, shape.logit_softcap, params.scale);
+                shape.n_q, N_KV, H_Q, H_KV, shape.logit_softcap, params.scale);
 #    if GGML_SYCL_DNNL
     const ggml_sycl_onednn_fa_layout_plan onednn_plan =
         ggml_sycl_flash_attn_ext_onednn_plan(params, H_Q, H_KV, false, false);
@@ -401,42 +407,109 @@ static void run_shape(const bench_shape & shape) {
         return { timing, max_abs, public_abs };
     };
 
-    (void) run_and_report(
-        "xmx-v2-ncols16", output_layout::public_qhd,
-        [&]() {
-            const bool ok = params.logit_softcap == 0.0f ?
-                                launch_fattn_xmx_v2_f16<D, 16, false, sycl::half, float>(ctx, params, q) :
-                                launch_fattn_xmx_v2_f16<D, 16, true, sycl::half, float>(ctx, params, q);
-            if (!ok) {
-                throw std::runtime_error("xmx-v2 rejected shape");
-            }
-        },
-        "default public layout");
-
-    (void) run_and_report(
-        "xmx-v1-ncols8", output_layout::public_qhd,
-        [&]() {
-            const size_t local_mem = (size_t) q->get_device().get_info<sycl::info::device::local_mem_size>();
-            const int    batch_kv  = ggml_sycl_fattn_xmx_v1_select_batch_kv(D, 8, local_mem);
-            if (batch_kv == XMX_BATCH_KV_LARGE) {
-                if (params.logit_softcap == 0.0f) {
-                    launch_fattn_xmx_f16<D, 8, false, sycl::half, XMX_BATCH_KV_LARGE>(params, q);
-                } else {
-                    launch_fattn_xmx_f16<D, 8, true, sycl::half, XMX_BATCH_KV_LARGE>(params, q);
+    const bool decode_shape = shape.n_q <= 1;
+    if (decode_shape) {
+        (void) run_and_report(
+            "xmx-v2-ncols1-f32", output_layout::public_qhd,
+            [&]() {
+                const bool ok = params.logit_softcap == 0.0f ?
+                                    launch_fattn_xmx_v2_f16<D, 1, false, sycl::half, float>(ctx, params, q) :
+                                    launch_fattn_xmx_v2_f16<D, 1, true, sycl::half, float>(ctx, params, q);
+                if (!ok) {
+                    throw std::runtime_error("xmx-v2 rejected decode shape");
                 }
-            } else if (params.logit_softcap == 0.0f) {
-                launch_fattn_xmx_f16<D, 8, false, sycl::half>(params, q);
-            } else {
-                launch_fattn_xmx_f16<D, 8, true, sycl::half>(params, q);
-            }
-        },
-        "diagnostic public layout");
+            },
+            "decode public layout, f32 acc/scalar SV");
 
-    const path_result esimd = run_and_report(
-        "esimd-batched", output_layout::public_qhd, [&]() { fattn_esimd_f16_batched<D, sycl::half>(params, *q); },
-        "candidate public layout");
-    if (esimd.public_abs > 1.0e-3f) {
-        throw std::runtime_error("esimd-batched public layout check failed");
+        (void) run_and_report(
+            "xmx-v2-ncols1-afloat", output_layout::public_qhd,
+            [&]() {
+                const bool ok = params.logit_softcap == 0.0f ?
+                                    launch_fattn_xmx_v2_f16<D, 1, false, sycl::half, afloat>(ctx, params, q) :
+                                    launch_fattn_xmx_v2_f16<D, 1, true, sycl::half, afloat>(ctx, params, q);
+                if (!ok) {
+                    throw std::runtime_error("xmx-v2 rejected decode shape");
+                }
+            },
+            "decode public layout, half SV");
+
+        (void) run_and_report(
+            "xmx-v1-ncols1", output_layout::public_qhd,
+            [&]() {
+                if (params.logit_softcap == 0.0f) {
+                    launch_fattn_xmx_f16<D, 1, false, sycl::half>(params, q);
+                } else {
+                    launch_fattn_xmx_f16<D, 1, true, sycl::half>(params, q);
+                }
+            },
+            "diagnostic decode layout");
+
+        (void) run_and_report(
+            "tile-ncols1", output_layout::public_qhd,
+            [&]() {
+                if (params.logit_softcap == 0.0f) {
+                    launch_fattn_tile_f16<D, 1, false, sycl::half>(params, q);
+                } else {
+                    launch_fattn_tile_f16<D, 1, true, sycl::half>(params, q);
+                }
+            },
+            "scalar SLM fallback");
+
+        (void) run_and_report(
+            "vec-decode", output_layout::public_qhd,
+            [&]() {
+                if (params.logit_softcap == 0.0f) {
+                    launch_fattn_vec_f16<D, 1, false, sycl::half>(params, q);
+                } else {
+                    launch_fattn_vec_f16<D, 1, true, sycl::half>(params, q);
+                }
+            },
+            "current deterministic TG fallback");
+
+        const path_result esimd = run_and_report(
+            "esimd-decode", output_layout::public_qhd, [&]() { fattn_esimd_f16<D, sycl::half>(params, *q); },
+            "current fast TG path");
+        if (esimd.public_abs > 1.0e-3f) {
+            throw std::runtime_error("esimd-decode public layout check failed");
+        }
+    } else {
+        (void) run_and_report(
+            "xmx-v2-ncols16", output_layout::public_qhd,
+            [&]() {
+                const bool ok = params.logit_softcap == 0.0f ?
+                                    launch_fattn_xmx_v2_f16<D, 16, false, sycl::half, float>(ctx, params, q) :
+                                    launch_fattn_xmx_v2_f16<D, 16, true, sycl::half, float>(ctx, params, q);
+                if (!ok) {
+                    throw std::runtime_error("xmx-v2 rejected shape");
+                }
+            },
+            "default public layout");
+
+        (void) run_and_report(
+            "xmx-v1-ncols8", output_layout::public_qhd,
+            [&]() {
+                const size_t local_mem = (size_t) q->get_device().get_info<sycl::info::device::local_mem_size>();
+                const int    batch_kv  = ggml_sycl_fattn_xmx_v1_select_batch_kv(D, 8, local_mem);
+                if (batch_kv == XMX_BATCH_KV_LARGE) {
+                    if (params.logit_softcap == 0.0f) {
+                        launch_fattn_xmx_f16<D, 8, false, sycl::half, XMX_BATCH_KV_LARGE>(params, q);
+                    } else {
+                        launch_fattn_xmx_f16<D, 8, true, sycl::half, XMX_BATCH_KV_LARGE>(params, q);
+                    }
+                } else if (params.logit_softcap == 0.0f) {
+                    launch_fattn_xmx_f16<D, 8, false, sycl::half>(params, q);
+                } else {
+                    launch_fattn_xmx_f16<D, 8, true, sycl::half>(params, q);
+                }
+            },
+            "diagnostic public layout");
+
+        const path_result esimd = run_and_report(
+            "esimd-batched", output_layout::public_qhd, [&]() { fattn_esimd_f16_batched<D, sycl::half>(params, *q); },
+            "candidate public layout");
+        if (esimd.public_abs > 1.0e-3f) {
+            throw std::runtime_error("esimd-batched public layout check failed");
+        }
     }
 
     sycl::free(q_dev, *q);
@@ -450,8 +523,12 @@ static void run_shape(const bench_shape & shape) {
 int main() {
     try {
         const bench_shape shapes[] = {
-            { "gptoss-sinks-only",      0.0f  },
-            { "gptoss-sinks-softcap50", 50.0f },
+            { "gptoss-tg-sinks-only",         1,   0.0f  },
+            { "gptoss-tg-sinks-softcap50",    1,   50.0f },
+            { "gptoss-pp64-sinks-only",       64,  0.0f  },
+            { "gptoss-pp64-sinks-softcap50",  64,  50.0f },
+            { "gptoss-pp512-sinks-only",      512, 0.0f  },
+            { "gptoss-pp512-sinks-softcap50", 512, 50.0f },
         };
         for (const bench_shape & shape : shapes) {
             run_shape(shape);

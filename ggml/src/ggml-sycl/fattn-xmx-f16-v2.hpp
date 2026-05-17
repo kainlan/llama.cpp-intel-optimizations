@@ -37,8 +37,9 @@
 //
 // Implemented by llama.cpp-1a038 (closed): runtime matrix_combinations query
 // with a single (8,16,16) leaf active today. The variant array is sized for
-// N>1 so adding future leaves (e.g. TM=1/TK=64 TG fast path) is a one-line
-// array entry plus the leaf specialization. See `fattn_xmx_v2_variants[]` below.
+// N>1 so adding future leaves (e.g. TM=1/TK=64/TN=64 TG fast path) is an
+// explicit array entry plus a matching leaf specialization. See
+// `fattn_xmx_v2_variants[]` below.
 // =============================================================================
 
 #include "fattn-common.hpp"
@@ -279,7 +280,7 @@ inline bool fattn_xmx_v2_variant_supported(const sycl::device & dev, std::size_t
 // Shape-aware variant selector for XMX-v2.
 // Returns 0 (fallback TM=8) for shapes that should not use TM=16:
 //   - TG/small ncols: ne01 <= 1 or ncols <= 8 (TM=16 over-provisioned)
-//   - Small D: D < 128 (not enough elements per tile for TM=16 benefit)
+//   - small D: D < 128 (not enough elements per tile for TM=16 benefit)
 // Returns 1 (TM=16) for PP shapes with ncols >= 16 and D >= 128,
 //   only when the device matrix extension supports (16,16,16).
 //
