@@ -1250,6 +1250,28 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
                             D, ne01, params.sinks != nullptr, params.logit_softcap, (int) params.kv_is_fp8);
                 }
             }
+            if (strcmp(force, "xmx-v2-decode") == 0 || strcmp(force, "xmx-v2-m1n64") == 0) {
+                force_known      = true;
+                bool decode_sent = false;
+                if constexpr (D == 64) {
+                    if (ne01 <= 1 && !safe_decode) {
+                        GGML_SYCL_KTRACE("fattn FORCE=xmx-v2-decode", " D=%d ne01=%d", D, ne01);
+                        if (logit_softcap == 0.0f) {
+                            decode_sent = launch_fattn_xmx_v2_decode_m1n64<D, false, Q_type>(ctx, params, stream);
+                        } else {
+                            decode_sent = launch_fattn_xmx_v2_decode_m1n64<D, true, Q_type>(ctx, params, stream);
+                        }
+                    }
+                }
+                dispatch_debug_kernel(decode_sent ? "force_xmx_v2_decode_m1n64" : "force_xmx_v2_decode_m1n64_rejected");
+                if (decode_sent) {
+                    return;
+                }
+                if (ne01 <= 1) {
+                    DISPATCH_NCOLS(1, launch_fattn_tile_f16);
+                    return;
+                }
+            }
             if (strcmp(force, "xmx-v2") == 0 || strcmp(force, "xmx-v2-tm16") == 0 || strcmp(force, "xmx-v2-tm8") == 0) {
                 force_known               = true;
                 const int  forced_variant = strcmp(force, "xmx-v2-tm16") == 0 ? 1 :

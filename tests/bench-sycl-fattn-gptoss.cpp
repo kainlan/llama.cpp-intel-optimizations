@@ -410,6 +410,18 @@ static void run_shape(const bench_shape & shape) {
     const bool decode_shape = shape.n_q <= 1;
     if (decode_shape) {
         (void) run_and_report(
+            "xmx-v2-m1n64-f32", output_layout::public_qhd,
+            [&]() {
+                const bool ok = params.logit_softcap == 0.0f ?
+                                    launch_fattn_xmx_v2_decode_m1n64<D, false, sycl::half>(ctx, params, q) :
+                                    launch_fattn_xmx_v2_decode_m1n64<D, true, sycl::half>(ctx, params, q);
+                if (!ok) {
+                    throw std::runtime_error("xmx-v2 m1n64 decode rejected shape");
+                }
+            },
+            "prototype packed M=1/N=64 decode");
+
+        (void) run_and_report(
             "xmx-v2-ncols1-f32", output_layout::public_qhd,
             [&]() {
                 const bool ok = params.logit_softcap == 0.0f ?
