@@ -410,6 +410,18 @@ static void run_shape(const bench_shape & shape) {
     const bool decode_shape = shape.n_q <= 1;
     if (decode_shape) {
         (void) run_and_report(
+            "xmx-v2-gqa-shared", output_layout::public_qhd,
+            [&]() {
+                const bool ok = params.logit_softcap == 0.0f ?
+                                    launch_fattn_xmx_v2_decode_gqa<D, false, sycl::half>(ctx, params, q) :
+                                    launch_fattn_xmx_v2_decode_gqa<D, true, sycl::half>(ctx, params, q);
+                if (!ok) {
+                    throw std::runtime_error("xmx-v2 gqa-shared decode rejected shape");
+                }
+            },
+            "prototype shared K/V per GQA group");
+
+        (void) run_and_report(
             "xmx-v2-m1n64-f32", output_layout::public_qhd,
             [&]() {
                 const bool ok = params.logit_softcap == 0.0f ?
