@@ -656,10 +656,9 @@ static inline bool cache_id_equal(const ggml_sycl_cache_id & a, const ggml_sycl_
     // mem_handle/cache entry.
     const bool compare_model_id = !(a.has_gguf && b.has_gguf);
     if (a.valid != b.valid || (compare_model_id && a.model_id != b.model_id) || a.has_gguf != b.has_gguf ||
-        a.file_idx != b.file_idx ||
-        a.file_offs != b.file_offs || a.nbytes != b.nbytes || a.name_hash != b.name_hash || a.type != b.type ||
-        a.tp_sharded != b.tp_sharded || a.tp_rank != b.tp_rank || a.tp_world_size != b.tp_world_size ||
-        a.aux_id != b.aux_id) {
+        a.file_idx != b.file_idx || a.file_offs != b.file_offs || a.nbytes != b.nbytes || a.name_hash != b.name_hash ||
+        a.type != b.type || a.tp_sharded != b.tp_sharded || a.tp_rank != b.tp_rank ||
+        a.tp_world_size != b.tp_world_size || a.aux_id != b.aux_id) {
         return false;
     }
     for (int i = 0; i < GGML_MAX_DIMS; ++i) {
@@ -682,15 +681,15 @@ struct cache_id_hash {
         if (!id.has_gguf) {
             h = cache_hash_combine(h, std::hash<uint64_t>()(id.model_id));
         }
-        h        = cache_hash_combine(h, std::hash<uint16_t>()(id.file_idx));
-        h        = cache_hash_combine(h, std::hash<size_t>()(id.file_offs));
-        h        = cache_hash_combine(h, std::hash<size_t>()(id.nbytes));
-        h        = cache_hash_combine(h, std::hash<uint64_t>()(id.name_hash));
-        h        = cache_hash_combine(h, std::hash<int>()(id.type));
-        h        = cache_hash_combine(h, std::hash<bool>()(id.tp_sharded));
-        h        = cache_hash_combine(h, std::hash<int>()(id.tp_rank));
-        h        = cache_hash_combine(h, std::hash<int>()(id.tp_world_size));
-        h        = cache_hash_combine(h, std::hash<uint64_t>()(id.aux_id));
+        h = cache_hash_combine(h, std::hash<uint16_t>()(id.file_idx));
+        h = cache_hash_combine(h, std::hash<size_t>()(id.file_offs));
+        h = cache_hash_combine(h, std::hash<size_t>()(id.nbytes));
+        h = cache_hash_combine(h, std::hash<uint64_t>()(id.name_hash));
+        h = cache_hash_combine(h, std::hash<int>()(id.type));
+        h = cache_hash_combine(h, std::hash<bool>()(id.tp_sharded));
+        h = cache_hash_combine(h, std::hash<int>()(id.tp_rank));
+        h = cache_hash_combine(h, std::hash<int>()(id.tp_world_size));
+        h = cache_hash_combine(h, std::hash<uint64_t>()(id.aux_id));
         for (int i = 0; i < GGML_MAX_DIMS; ++i) {
             h = cache_hash_combine(h, std::hash<int64_t>()(id.ne[i]));
             h = cache_hash_combine(h, std::hash<int64_t>()(id.tp_local_ne[i]));
@@ -903,12 +902,12 @@ struct cache_layout_request {
 // No state machine, no IN_PROGRESS/READY transitions.
 
 struct weight_entry {
-    void *                      ptr             = nullptr;
-    size_t                      size            = 0;
-    ggml_layout_mode            layout          = GGML_LAYOUT_AOS;
-    cache_location              location        = cache_location::DEVICE;
-    bool                        has_ready_event = false;
-    sycl::event                 ready_event;
+    void *           ptr             = nullptr;
+    size_t           size            = 0;
+    ggml_layout_mode layout          = GGML_LAYOUT_AOS;
+    cache_location   location        = cache_location::DEVICE;
+    bool             has_ready_event = false;
+    sycl::event      ready_event;
     // Transient direct lookup mirror only. Lifetime and ownership live in
     // entries_ / mem_handle leases; this struct must not keep allocations alive.
 };
@@ -3186,9 +3185,9 @@ struct moe_q8_1_scratch_demand {
 
 moe_q8_1_scratch_demand unified_cache_plan_moe_q8_1_scratch(const moe_q8_1_scratch_shape & shape);
 bool                    unified_cache_reserve_moe_q8_1_scratch(int device_id, const moe_q8_1_scratch_demand & demand);
-bool unified_cache_allocate_moe_q8_1_graph_scratch(int                            device_id,
-                                                   const moe_q8_1_scratch_demand & demand,
-                                                   alloc_handle *                  out);
+bool                    unified_cache_allocate_moe_q8_1_graph_scratch(int                             device_id,
+                                                                      const moe_q8_1_scratch_demand & demand,
+                                                                      alloc_handle *                  out);
 
 // Grow the host SCRATCH zone to accommodate compute buffer needs.
 // Called after the ggml scheduler is created and compute buffer sizes are known.
@@ -3254,6 +3253,19 @@ struct moe_inference_buffers {
     size_t ids_staging_bytes = 0;
     bool   ids_on_device     = false;
 
+    // Compact selected-row pointer list for MoE MMVQ dispatch.
+    // Size: max(n_expert_used * max_batch * sizeof(void*)).
+    // A single shared buffer is sufficient because MoE layers execute
+    // sequentially on a device queue.
+    void * compact_ptrs       = nullptr;
+    size_t compact_ptrs_bytes = 0;
+    bool   compact_on_device  = false;
+
+    // Optional device-side missing flag used by validation/fallback builders.
+    int *  compact_missing           = nullptr;
+    size_t compact_missing_bytes     = 0;
+    bool   compact_missing_on_device = false;
+
     // True if buffers have been allocated.
     bool initialized = false;
 };
@@ -3275,6 +3287,13 @@ void * moe_get_expert_ptr_table(int device_id, int table_index);
 // Get the shared MoE IDs staging buffer.
 // Returns nullptr if not pre-allocated or if needed_bytes exceeds the pre-allocated size.
 void * moe_get_ids_staging(int device_id, size_t needed_bytes);
+
+// Get the shared compact selected-row pointer list.
+// Returns nullptr if not pre-allocated or if needed_bytes exceeds capacity.
+void * moe_get_compact_ptrs(int device_id, size_t needed_bytes);
+
+// Get the shared compact-list missing flag.
+int * moe_get_compact_missing_flag(int device_id);
 
 // Free all pre-allocated MoE buffers for a device (called during shutdown).
 void moe_free_inference_buffers(int device_id);

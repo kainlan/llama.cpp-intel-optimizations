@@ -29,7 +29,8 @@ Usage: scripts/sycl-moe-roofline-harness.sh
 Sequential B50/B580 SYCL MoE profiling harness for GPT-OSS MXFP4 TG work.
 It records clean TG throughput, TG batch-scaling, synchronized MXFP4/MoE
 subphase timings, FA dispatch path, hardware capability log lines, an optional
-memory roofline, and selected-expert row aggregation telemetry.
+memory roofline, selected-expert row aggregation telemetry, and planner
+descriptor grouping telemetry.
 
 Environment:
   BENCH                  llama-bench path, default build/bin/llama-bench
@@ -75,12 +76,14 @@ summary="$OUTDIR/summary.tsv"
 profile_summary="$OUTDIR/mxfp4-profile.tsv"
 roofline_summary="$OUTDIR/roofline.tsv"
 row_agg_summary="$OUTDIR/row-agg.tsv"
+descriptor_summary="$OUTDIR/row-agg-descriptor.tsv"
 caps_log="$OUTDIR/runtime-caps.log"
 
 printf "case\tselector\tfa\ttg_batch\tpp_tok_s\ttg_tok_s\tlog\n" >"$summary"
 printf "fa\tentries\tbatches\tavg_total_ms\tavg_kernel_ms\tavg_quant_ms\tavg_gateup_glu_ms\tavg_down_ms\tavg_per_entry_kernel_us\tlog\n" >"$profile_summary"
 printf "case\tfa\ttg_batch\ttg_tok_s\tentry_bytes\tentries_per_token\tweight_gb_per_token\teffective_weight_gbps\ttheoretical_bw_gbps\troofline_tg_tok_s\n" >"$roofline_summary"
 printf "fa\tpath\ttensor\tlayer\trole\tdevice\tlayout\tbatch\ttopk\tselected\tunique\tmax_per_expert\tavg_per_expert\tlog\n" >"$row_agg_summary"
+printf "fa\tpath\ttensor\tlayer\trole\tsubmit_device\tlayout\tbatch\ttopk\tentries\tgroups\tdevice_rows\thost_rows\tmissing_rows\tlayout_mismatch\tunique_handles\tmax_rows\tavg_rows_per_group\tlog\n" >"$descriptor_summary"
 
 extract_rate() {
     local log="$1"
@@ -245,6 +248,40 @@ parse_row_agg() {
     ' "$log" >>"$row_agg_summary"
 }
 
+parse_descriptor_agg() {
+    local fa="$1"
+    local log="$2"
+    awk -v fa="$fa" -v logfile="$log" '
+        /\[MOE-ROW-AGG\]/ && /stage=descriptor/ {
+            path = tensor = layer = role = device = layout = batch = topk = entries = groups = "NA"
+            device_rows = host_rows = missing_rows = layout_mismatch = unique_handles = max_rows = avg = "NA"
+            for (i = 1; i <= NF; ++i) {
+                split($i, kv, "=")
+                if (kv[1] == "path") path = kv[2]
+                if (kv[1] == "tensor") tensor = kv[2]
+                if (kv[1] == "layer") layer = kv[2]
+                if (kv[1] == "role") role = kv[2]
+                if (kv[1] == "submit_device") device = kv[2]
+                if (kv[1] == "layout") layout = kv[2]
+                if (kv[1] == "batch") batch = kv[2]
+                if (kv[1] == "topk") topk = kv[2]
+                if (kv[1] == "entries") entries = kv[2]
+                if (kv[1] == "groups") groups = kv[2]
+                if (kv[1] == "device_rows") device_rows = kv[2]
+                if (kv[1] == "host_rows") host_rows = kv[2]
+                if (kv[1] == "missing_rows") missing_rows = kv[2]
+                if (kv[1] == "layout_mismatch") layout_mismatch = kv[2]
+                if (kv[1] == "unique_handles") unique_handles = kv[2]
+                if (kv[1] == "max_rows") max_rows = kv[2]
+                if (kv[1] == "avg_rows_per_group") avg = kv[2]
+            }
+            printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+                fa, path, tensor, layer, role, device, layout, batch, topk, entries, groups,
+                device_rows, host_rows, missing_rows, layout_mismatch, unique_handles, max_rows, avg, logfile
+        }
+    ' "$log" >>"$descriptor_summary"
+}
+
 extract_profile_entries() {
     local log="$1"
     awk '
@@ -314,6 +351,7 @@ for fa in $FA_VALUES; do
         GGML_SYCL_MOE_ROW_AGG_DEBUG=1 GGML_SYCL_MOE_ROW_AGG_DEBUG_LIMIT=256
     parse_profile "$fa" "$OUTDIR/gptoss-profile-fa${fa}.log"
     parse_row_agg "$fa" "$OUTDIR/gptoss-profile-fa${fa}.log"
+    parse_descriptor_agg "$fa" "$OUTDIR/gptoss-profile-fa${fa}.log"
     observed_entries="$(extract_profile_entries "$OUTDIR/gptoss-profile-fa${fa}.log")"
     if [[ "$observed_entries" != "0" ]]; then
         entries_per_token="$observed_entries"
@@ -334,4 +372,5 @@ echo "summary=$summary"
 echo "profile_summary=$profile_summary"
 echo "roofline_summary=$roofline_summary"
 echo "row_agg_summary=$row_agg_summary"
+echo "descriptor_summary=$descriptor_summary"
 echo "caps_log=$caps_log"

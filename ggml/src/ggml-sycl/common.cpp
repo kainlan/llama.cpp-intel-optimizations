@@ -1015,16 +1015,22 @@ void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> str
         extra->moe_expert_ptrs_host[i].clear();
 
         if (extra->moe_expert_ptrs_compact_device[i] != nullptr && streams.size() > 0) {
-            ggml_sycl_set_device(i);
-            SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(extra->moe_expert_ptrs_compact_device[i], *(streams[i]))));
-            extra->moe_expert_ptrs_compact_device[i]   = nullptr;
-            extra->moe_expert_ptrs_compact_size[i]     = 0;
-            extra->moe_expert_ptrs_compact_capacity[i] = 0;
+            if (!extra->moe_expert_ptrs_compact_from_prealloc[i]) {
+                ggml_sycl_set_device(i);
+                SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(extra->moe_expert_ptrs_compact_device[i], *(streams[i]))));
+            }
+            extra->moe_expert_ptrs_compact_device[i]        = nullptr;
+            extra->moe_expert_ptrs_compact_size[i]          = 0;
+            extra->moe_expert_ptrs_compact_capacity[i]      = 0;
+            extra->moe_expert_ptrs_compact_from_prealloc[i] = false;
         }
         if (extra->moe_expert_ptrs_missing_device[i] != nullptr && streams.size() > 0) {
-            ggml_sycl_set_device(i);
-            SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(extra->moe_expert_ptrs_missing_device[i], *(streams[i]))));
-            extra->moe_expert_ptrs_missing_device[i] = nullptr;
+            if (!extra->moe_expert_ptrs_missing_from_prealloc[i]) {
+                ggml_sycl_set_device(i);
+                SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(extra->moe_expert_ptrs_missing_device[i], *(streams[i]))));
+            }
+            extra->moe_expert_ptrs_missing_device[i]        = nullptr;
+            extra->moe_expert_ptrs_missing_from_prealloc[i] = false;
         }
     }
 

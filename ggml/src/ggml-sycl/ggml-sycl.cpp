@@ -8735,11 +8735,18 @@ struct moe_gate_up_pair {
     enum ggml_glu_op    glu_op          = GGML_GLU_OP_SWIGLU;
 };
 
+struct moe_layer_grouped_route_row {
+    size_t  entry = 0;
+    int64_t iid1  = 0;
+    int64_t id    = 0;
+};
+
 struct moe_layer_decode_role_plan {
-    const ggml_tensor *                weight = nullptr;
-    std::vector<int32_t>               expert_ids;
-    std::vector<ggml_sycl::mem_handle> handles;
-    std::vector<sycl::event>           ready_events;
+    const ggml_tensor *                      weight = nullptr;
+    std::vector<int32_t>                     expert_ids;
+    std::vector<ggml_sycl::mem_handle>       handles;
+    std::vector<moe_layer_grouped_route_row> rows;
+    std::vector<sycl::event>                 ready_events;
 };
 
 struct moe_layer_decode_artifact_plan {
@@ -8961,6 +8968,128 @@ static bool moe_layer_capture_tensor_artifact(moe_layer_decode_artifact_plan & a
     return true;
 }
 
+enum class moe_layer_route_residency : uint8_t {
+    MISSING = 0,
+    DEVICE  = 1,
+    HOST    = 2,
+};
+
+struct moe_layer_grouped_route_group {
+    int32_t                                  expert_id    = -1;
+    int                                      device       = ggml_sycl::mem_handle::HOST_DEVICE;
+    layout_mode                              layout       = GGML_LAYOUT_AOS;
+    moe_layer_route_residency                residency    = moe_layer_route_residency::MISSING;
+    size_t                                   handle_index = SIZE_MAX;
+    size_t                                   handle_hash  = 0;
+    std::vector<moe_layer_grouped_route_row> rows;
+};
+
+struct moe_layer_grouped_route_view {
+    const ggml_tensor *                        weight               = nullptr;
+    const char *                               role_name            = "unknown";
+    int                                        submit_device        = -1;
+    int64_t                                    top_k                = 0;
+    int64_t                                    batch                = 0;
+    size_t                                     entries              = 0;
+    size_t                                     n_groups             = 0;
+    size_t                                     device_rows          = 0;
+    size_t                                     host_rows            = 0;
+    size_t                                     missing_rows         = 0;
+    size_t                                     layout_mismatch_rows = 0;
+    size_t                                     max_rows_per_group   = 0;
+    size_t                                     ready_events         = 0;
+    std::vector<moe_layer_grouped_route_group> groups;
+};
+
+static bool moe_layer_group_matches(const moe_layer_grouped_route_group & group,
+                                    int32_t                               expert_id,
+                                    int                                   device,
+                                    layout_mode                           layout,
+                                    moe_layer_route_residency             residency,
+                                    size_t                                handle_hash) {
+    return group.expert_id == expert_id && group.device == device && group.layout == layout &&
+           group.residency == residency && group.handle_hash == handle_hash;
+}
+
+static moe_layer_grouped_route_view moe_layer_build_grouped_route_view(const moe_layer_decode_plan &      plan,
+                                                                       const moe_layer_decode_role_plan & role,
+                                                                       const char *                       role_name,
+                                                                       int submit_device) {
+    moe_layer_grouped_route_view view;
+    view.weight        = role.weight;
+    view.role_name     = role_name ? role_name : "unknown";
+    view.submit_device = submit_device;
+    view.top_k         = plan.n_ids;
+    view.entries       = role.expert_ids.size();
+    view.batch         = plan.n_ids > 0 ? static_cast<int64_t>(view.entries / static_cast<size_t>(plan.n_ids)) : 0;
+    view.ready_events  = role.ready_events.size();
+    view.groups.reserve(std::min<size_t>(view.entries, 32));
+
+    for (size_t ci = 0; ci < view.entries; ++ci) {
+        const int32_t                 eid    = role.expert_ids[ci];
+        const ggml_sycl::mem_handle * handle = ci < role.handles.size() ? &role.handles[ci] : nullptr;
+
+        ggml_sycl::resolved_ptr   resolved;
+        moe_layer_route_residency residency   = moe_layer_route_residency::MISSING;
+        int                       route_dev   = ggml_sycl::mem_handle::HOST_DEVICE;
+        layout_mode               route_lay   = plan.layout;
+        size_t                    handle_hash = 0;
+
+        if (handle) {
+            resolved = handle->resolve();
+            if (resolved.ptr) {
+                route_lay   = resolved.layout;
+                handle_hash = handle->hash();
+                if (resolved.on_device) {
+                    residency = moe_layer_route_residency::DEVICE;
+                    route_dev = handle->device() >= 0 ? handle->device() : submit_device;
+                    view.device_rows++;
+                } else {
+                    residency = moe_layer_route_residency::HOST;
+                    route_dev = ggml_sycl::mem_handle::HOST_DEVICE;
+                    view.host_rows++;
+                }
+                if (resolved.layout != plan.layout) {
+                    view.layout_mismatch_rows++;
+                }
+            } else {
+                view.missing_rows++;
+            }
+        } else {
+            view.missing_rows++;
+        }
+
+        auto it = std::find_if(view.groups.begin(), view.groups.end(), [&](const moe_layer_grouped_route_group & g) {
+            return moe_layer_group_matches(g, eid, route_dev, route_lay, residency, handle_hash);
+        });
+        if (it == view.groups.end()) {
+            moe_layer_grouped_route_group group;
+            group.expert_id    = eid;
+            group.device       = route_dev;
+            group.layout       = route_lay;
+            group.residency    = residency;
+            group.handle_index = handle ? ci : SIZE_MAX;
+            group.handle_hash  = handle_hash;
+            view.groups.push_back(std::move(group));
+            it = view.groups.end() - 1;
+        }
+
+        moe_layer_grouped_route_row row = ci < role.rows.size() ? role.rows[ci] : moe_layer_grouped_route_row{};
+        if (ci >= role.rows.size()) {
+            row.entry = ci;
+            if (plan.n_ids > 0) {
+                row.iid1 = static_cast<int64_t>(ci / static_cast<size_t>(plan.n_ids));
+                row.id   = static_cast<int64_t>(ci % static_cast<size_t>(plan.n_ids));
+            }
+        }
+        it->rows.push_back(row);
+        view.max_rows_per_group = std::max(view.max_rows_per_group, it->rows.size());
+    }
+
+    view.n_groups = view.groups.size();
+    return view;
+}
+
 static bool ggml_sycl_moe_group_profile_enabled() {
     static const int enabled = [] {
         const char * env = std::getenv("GGML_SYCL_MOE_GROUP_PROFILE");
@@ -9013,7 +9142,7 @@ static uint64_t moe_layer_group_profile_key(int          layer,
     }
     const uint64_t layer_bits  = static_cast<uint64_t>(static_cast<uint32_t>(std::max(layer, 0))) & 0xffffu;
     const uint64_t expert_bits = static_cast<uint64_t>(static_cast<uint32_t>(std::max<int32_t>(eid, 0))) & 0xffffffu;
-    const uint64_t device_bits = static_cast<uint64_t>(static_cast<uint32_t>(std::max(device, 0))) & 0xffu;
+    const uint64_t device_bits = device >= 0 ? static_cast<uint64_t>(static_cast<uint32_t>(device)) & 0xffu : 0xffu;
     const uint64_t layout_bits = static_cast<uint64_t>(static_cast<uint32_t>(layout)) & 0xffu;
     return (layout_bits << 56) | (device_bits << 48) | (role << 40) | (layer_bits << 24) | expert_bits;
 }
@@ -9032,10 +9161,11 @@ static void moe_layer_group_profile_record(const moe_layer_decode_plan &      pl
         return;
     }
 
-    auto & p = g_moe_layer_group_profile;
+    const moe_layer_grouped_route_view view = moe_layer_build_grouped_route_view(plan, role, role_name, device);
+    auto &                             p    = g_moe_layer_group_profile;
     p.roles++;
     p.entries += entries;
-    p.tokens += plan.n_ids > 0 ? entries / plan.n_ids : 0;
+    p.tokens += view.batch;
     p.topk_sum += plan.n_ids;
     if (std::strcmp(role_name, "gate") == 0) {
         p.gate_roles++;
@@ -9052,23 +9182,14 @@ static void moe_layer_group_profile_record(const moe_layer_decode_plan &      pl
         p.aos_roles++;
     }
 
-    for (int32_t eid : role.expert_ids) {
-        p.rows_by_group[moe_layer_group_profile_key(plan.layer, role_name, eid, plan.layout, device)]++;
+    for (const moe_layer_grouped_route_group & group : view.groups) {
+        p.rows_by_group[moe_layer_group_profile_key(plan.layer, role_name, group.expert_id, group.layout,
+                                                    group.device)] += group.rows.size();
     }
-
-    for (const ggml_sycl::mem_handle & handle : role.handles) {
-        ggml_sycl::resolved_ptr resolved = handle.resolve(device);
-        if (!resolved.ptr) {
-            p.missing_handles++;
-        } else if (resolved.on_device) {
-            p.device_handles++;
-        } else {
-            p.host_handles++;
-        }
-        if (resolved.ptr && resolved.layout != plan.layout) {
-            p.layout_mismatch++;
-        }
-    }
+    p.device_handles += view.device_rows;
+    p.host_handles += view.host_rows;
+    p.missing_handles += view.missing_rows;
+    p.layout_mismatch += view.layout_mismatch_rows;
 
     static thread_local const char * last_executor = nullptr;
     last_executor                                  = executor;
@@ -38684,6 +38805,13 @@ static bool ggml_sycl_moe_row_agg_should_log_routed() {
     return limit <= 0 || n < limit;
 }
 
+static bool ggml_sycl_moe_row_agg_should_log_descriptor() {
+    static std::atomic<int> counter{ 0 };
+    const int               limit = ggml_sycl_moe_row_agg_debug_limit();
+    const int               n     = counter.fetch_add(1, std::memory_order_relaxed);
+    return limit <= 0 || n < limit;
+}
+
 struct moe_row_agg_stats {
     size_t total             = 0;
     size_t valid             = 0;
@@ -38878,6 +39006,192 @@ static void ggml_sycl_moe_row_agg_log_routed(const ggml_tensor *                
             "batch=%lld topk=%lld routed_rows=%zu groups=%s boundary=layer,role,route_kind,device,layout\n",
             path ? path : "unknown", name, layer, role, device, ggml_sycl_layout_mode_name(layout), (long long) batch,
             (long long) top_k, total_rows, route_summary.c_str());
+}
+
+static void ggml_sycl_moe_row_agg_log_descriptor(const moe_layer_decode_plan &      plan,
+                                                 const moe_layer_decode_role_plan & role,
+                                                 const char *                       role_name,
+                                                 int                                submit_device,
+                                                 const char *                       path) {
+    if (!ggml_sycl_moe_row_agg_debug_enabled() || !ggml_sycl_moe_row_agg_should_log_descriptor()) {
+        return;
+    }
+
+    const moe_layer_grouped_route_view view = moe_layer_build_grouped_route_view(plan, role, role_name, submit_device);
+
+    size_t                     device_groups  = 0;
+    size_t                     host_groups    = 0;
+    size_t                     missing_groups = 0;
+    size_t                     singleton      = 0;
+    size_t                     grouped        = 0;
+    std::unordered_set<size_t> handle_hashes;
+    for (const moe_layer_grouped_route_group & group : view.groups) {
+        if (group.residency == moe_layer_route_residency::DEVICE) {
+            device_groups++;
+        } else if (group.residency == moe_layer_route_residency::HOST) {
+            host_groups++;
+        } else {
+            missing_groups++;
+        }
+        if (group.rows.size() <= 1) {
+            singleton++;
+        } else {
+            grouped++;
+        }
+        if (group.handle_hash != 0) {
+            handle_hashes.insert(group.handle_hash);
+        }
+    }
+    const double avg_rows_per_group =
+        view.n_groups > 0 ? static_cast<double>(view.entries) / static_cast<double>(view.n_groups) : 0.0;
+    const char * tensor_name = view.weight ? view.weight->name : "?";
+
+    fprintf(stderr,
+            "[MOE-ROW-AGG] stage=descriptor path=%s tensor=%s layer=%d role=%s submit_device=%d "
+            "layout=%s batch=%lld topk=%lld entries=%zu groups=%zu device_groups=%zu host_groups=%zu "
+            "missing_groups=%zu device_rows=%zu host_rows=%zu missing_rows=%zu layout_mismatch=%zu "
+            "ready_events=%zu unique_handles=%zu grouped_experts=%zu singleton_experts=%zu max_rows=%zu "
+            "avg_rows_per_group=%.2f boundary=layer,role,expert,residency,device,layout,mem_handle\n",
+            path ? path : "unknown", tensor_name, plan.layer, view.role_name, submit_device,
+            ggml_sycl_layout_mode_name(plan.layout), (long long) view.batch, (long long) view.top_k, view.entries,
+            view.n_groups, device_groups, host_groups, missing_groups, view.device_rows, view.host_rows,
+            view.missing_rows, view.layout_mismatch_rows, view.ready_events, handle_hashes.size(), grouped, singleton,
+            view.max_rows_per_group, avg_rows_per_group);
+}
+
+static void ggml_sycl_moe_row_agg_log_entries_descriptor(
+    const ggml_tensor *                                     weight,
+    int                                                     submit_device,
+    int64_t                                                 top_k,
+    int64_t                                                 batch,
+    ggml_layout_mode                                        layout,
+    const char *                                            path,
+    const std::vector<expert_dispatch_entry> &              local_entries,
+    const std::vector<std::vector<expert_dispatch_entry>> & per_gpu_entries,
+    const std::vector<expert_dispatch_entry> &              host_entries) {
+    if (!ggml_sycl_moe_row_agg_debug_enabled()) {
+        return;
+    }
+
+    moe_layer_decode_plan plan;
+    const char *          weight_name = weight ? weight->name : "";
+    plan.layer                        = parse_layer_id_from_name(weight_name);
+    plan.layer_hash                   = moe_cache_layer_id(weight_name);
+    plan.n_ids                        = top_k;
+    plan.layout                       = layout;
+
+    moe_layer_decode_role_plan role;
+    role.weight = weight;
+
+    const size_t total_entries = local_entries.size() + host_entries.size() +
+                                 std::accumulate(per_gpu_entries.begin(), per_gpu_entries.end(), size_t(0),
+                                                 [](size_t acc, const std::vector<expert_dispatch_entry> & entries) {
+                                                     return acc + entries.size();
+                                                 });
+    role.expert_ids.reserve(total_entries);
+    role.handles.reserve(total_entries);
+    role.rows.reserve(total_entries);
+
+    auto append_entries = [&](const std::vector<expert_dispatch_entry> & entries, bool fallback_on_device,
+                              int fallback_device) {
+        for (const expert_dispatch_entry & entry : entries) {
+            const size_t row_index = role.expert_ids.size();
+            role.expert_ids.push_back(entry.expert_id);
+            if (entry.lease.valid()) {
+                role.handles.push_back(entry.lease);
+            } else {
+                const int handle_device = fallback_on_device ? fallback_device : ggml_sycl::mem_handle::HOST_DEVICE;
+                role.handles.push_back(ggml_sycl::mem_handle::from_direct(
+                    entry.device_ptr, layout, fallback_on_device && entry.device_ptr != nullptr, handle_device));
+            }
+            moe_layer_grouped_route_row row;
+            row.entry = row_index;
+            row.iid1  = entry.iid1;
+            row.id    = entry.id;
+            role.rows.push_back(row);
+        }
+    };
+
+    append_entries(local_entries, true, submit_device);
+    for (size_t d = 0; d < per_gpu_entries.size(); ++d) {
+        if (static_cast<int>(d) == submit_device) {
+            continue;
+        }
+        append_entries(per_gpu_entries[d], true, static_cast<int>(d));
+    }
+    append_entries(host_entries, false, ggml_sycl::mem_handle::HOST_DEVICE);
+
+    plan.n_entries = role.expert_ids.size();
+    GGML_UNUSED(batch);
+    ggml_sycl_moe_row_agg_log_descriptor(plan, role, moe_tensor_type_name(moe_classify_tensor(weight_name)),
+                                         submit_device, path);
+}
+
+static void ggml_sycl_moe_row_agg_log_selected_descriptor(const ggml_tensor * weight,
+                                                          int                 submit_device,
+                                                          const int32_t *     ids,
+                                                          size_t              n_selected,
+                                                          int64_t             top_k,
+                                                          int64_t             batch,
+                                                          int64_t             n_experts,
+                                                          ggml_layout_mode    layout,
+                                                          const char *        path) {
+    if (!ggml_sycl_moe_row_agg_debug_enabled() || !weight || !ids) {
+        return;
+    }
+
+    moe_layer_decode_plan plan;
+    const char *          weight_name = weight->name;
+    plan.layer                        = parse_layer_id_from_name(weight_name);
+    plan.layer_hash                   = moe_cache_layer_id(weight_name);
+    plan.n_ids                        = top_k;
+    plan.layout                       = layout;
+
+    moe_layer_decode_role_plan role;
+    role.weight = weight;
+    role.expert_ids.reserve(n_selected);
+    role.handles.reserve(n_selected);
+    role.rows.reserve(n_selected);
+    role.ready_events.reserve(n_selected);
+
+    for (size_t ci = 0; ci < n_selected; ++ci) {
+        const int32_t eid = ids[ci];
+        role.expert_ids.push_back(eid);
+
+        moe_layer_grouped_route_row row;
+        row.entry = ci;
+        if (top_k > 0) {
+            row.iid1 = static_cast<int64_t>(ci / static_cast<size_t>(top_k));
+            row.id   = static_cast<int64_t>(ci % static_cast<size_t>(top_k));
+        }
+        role.rows.push_back(row);
+
+        if (eid < 0 || eid >= n_experts) {
+            role.handles.push_back({});
+            continue;
+        }
+
+        moe_expert_route route = ggml_sycl_resolve_moe_expert_route(weight, submit_device, eid, layout);
+        if (route.lease.valid()) {
+            role.handles.push_back(std::move(route.lease));
+        } else {
+            const bool route_on_device = route.kind == moe_expert_route_kind::LOCAL_DEVICE ||
+                                         route.kind == moe_expert_route_kind::SECONDARY_DEVICE;
+            const int route_device = route_on_device ?
+                                         (route.owning_device >= 0 ? route.owning_device : submit_device) :
+                                         ggml_sycl::mem_handle::HOST_DEVICE;
+            role.handles.push_back(ggml_sycl::mem_handle::from_direct(
+                route.ptr, route.actual_layout, route_on_device && route.ptr != nullptr, route_device));
+        }
+        if (route.has_ready_event) {
+            role.ready_events.push_back(route.ready_event);
+        }
+    }
+
+    plan.n_entries = role.expert_ids.size();
+    GGML_UNUSED(batch);
+    ggml_sycl_moe_row_agg_log_descriptor(plan, role, moe_tensor_type_name(moe_classify_tensor(weight_name)),
+                                         submit_device, path);
 }
 
 // Context for secondary GPU expert dispatch.  Captures the variables that the
@@ -40836,8 +41150,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     role.weight                      = weight;
                     role.expert_ids.resize(ids_n_elem);
                     role.handles.clear();
+                    role.rows.clear();
                     role.ready_events.clear();
                     role.handles.reserve(ids_n_elem);
+                    role.rows.reserve(ids_n_elem);
                     role.ready_events.reserve(ids_n_elem);
                     for (size_t ci = 0; ci < ids_n_elem; ++ci) {
                         const int32_t eid = ids_data[ci];
@@ -40859,6 +41175,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         }
                         role.expert_ids[ci] = eid;
                         role.handles.push_back(std::move(handle));
+                        moe_layer_grouped_route_row row;
+                        row.entry = ci;
+                        if (n_ids_pair > 0) {
+                            row.iid1 = static_cast<int64_t>(ci / static_cast<size_t>(n_ids_pair));
+                            row.id   = static_cast<int64_t>(ci % static_cast<size_t>(n_ids_pair));
+                        }
+                        role.rows.push_back(row);
                         if (route.has_ready_event) {
                             role.ready_events.push_back(route.ready_event);
                         }
@@ -40877,6 +41200,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     plan.up   = plan.current;
                     plan.gate = plan.partner;
                 }
+                ggml_sycl_moe_row_agg_log_descriptor(plan, plan.gate, "gate", ctx.device, "moe_pair_descriptor");
+                ggml_sycl_moe_row_agg_log_descriptor(plan, plan.up, "up", ctx.device, "moe_pair_descriptor");
                 static const int direct_xmx_probe_enabled = [] {
                     const char * env = std::getenv("GGML_SYCL_DIRECT_XMX_MOE_PROBE");
                     return env ? std::atoi(env) : 0;
@@ -41008,6 +41333,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 const int down_layer_hash = moe_cache_layer_id(pair.down_weight->name);
                                 ggml_sycl_ensure_weight_on_device(pair.down_weight, ctx.device);
                                 const bool down_plan_ok = build_role_plan(plan.down, pair.down_weight, "down-route");
+                                if (down_plan_ok) {
+                                    ggml_sycl_moe_row_agg_log_descriptor(plan, plan.down, "down", ctx.device,
+                                                                         "moe_pair_down_descriptor");
+                                }
                                 std::optional<moe_layer_direct_xmx_decision> direct_down_decision;
                                 if (direct_xmx_probe && down_plan_ok && direct_gate_decision && direct_up_decision) {
                                     direct_down_decision = moe_layer_direct_xmx_check_role(plan.down, ctx.device,
@@ -42638,6 +42967,8 @@ cpu_tg_fallthrough:
     ggml_sycl_moe_row_agg_log_selected(src0, ctx.device, ids_host.data(), ids_host.size(), n_ids, ids->ne[1], n_as,
                                        route_layout, "planner_route_setup", ids_from_cache, use_expert_cache,
                                        has_placement_plan);
+    ggml_sycl_moe_row_agg_log_selected_descriptor(src0, ctx.device, ids_host.data(), ids_host.size(), n_ids, ids->ne[1],
+                                                  n_as, route_layout, "planner_route_descriptor");
 
     // After first full PP pass through all MoE layers, trigger popularity-based
     // pre-staging so that TG starts with GPU0 placement table entries populated.
@@ -43790,6 +44121,10 @@ cpu_tg_fallthrough:
                 ggml_sycl_moe_row_agg_log_routed(src0, ctx.device, n_ids, ids->ne[1], route_layout,
                                                  cpu_expert_tg_active ? "cpu_tg_hybrid" : "planner_hybrid", gpu_entries,
                                                  per_gpu_entries, cpu_entries);
+                ggml_sycl_moe_row_agg_log_entries_descriptor(
+                    src0, ctx.device, n_ids, ids->ne[1], route_layout,
+                    cpu_expert_tg_active ? "cpu_tg_descriptor" : "planner_descriptor", gpu_entries, per_gpu_entries,
+                    cpu_entries);
 
                 // --- MoE dispatch stats instrumentation ---
                 if (ggml_sycl::MoeDispatchStats::enabled()) {

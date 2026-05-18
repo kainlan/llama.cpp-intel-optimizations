@@ -1988,10 +1988,10 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
 // === Direct Staging API ===
 
 direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
-                                                      const void *         src_ptr,
-                                                      size_t               src_size,
-                                                      size_t               dst_size,
-                                                      ggml_layout_mode     layout,
+                                                       const void *         src_ptr,
+                                                       size_t               src_size,
+                                                       size_t               dst_size,
+                                                       ggml_layout_mode     layout,
                                                        cache_layout_fill_fn fill_fn,
                                                        const void *         fill_ctx,
                                                        sycl::queue *        queue) {
@@ -2079,7 +2079,7 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
         entry.pool_allocated   = false;
         entry.last_write_event = last_event;
         entry.has_write_event  = true;
-        auto old = entries_.find(cache_key);
+        auto old               = entries_.find(cache_key);
         if (old != entries_.end() && old->second.device_ptr && old->second.device_ptr != ptr) {
             const uint32_t live = old->second.in_use_count.load();
             if (live != 0) {
@@ -2100,8 +2100,8 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
                 enqueue_deferred_free(old->second.device_ptr, old->second.size);
             }
         }
-        entries_[cache_key]    = entry;
-        id_to_key_[key]        = cache_key;
+        entries_[cache_key] = entry;
+        id_to_key_[key]     = cache_key;
     }
 
     result.ptr   = ptr;
@@ -2111,7 +2111,7 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
 }
 
 static bool moe_direct_trace_enabled();
-static void moe_direct_trace_key(const char * op,
+static void moe_direct_trace_key(const char *               op,
                                  const ggml_sycl_cache_id & key,
                                  ggml_layout_mode           layout,
                                  const char *               detail,
@@ -2306,7 +2306,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         entry.pool_allocated   = false;
         entry.last_write_event = last_event;
         entry.has_write_event  = true;
-        auto old = entries_.find(cache_key);
+        auto old               = entries_.find(cache_key);
         if (old != entries_.end() && old->second.device_ptr && old->second.device_ptr != ptr) {
             const uint32_t live = old->second.in_use_count.load();
             if (live != 0) {
@@ -2327,8 +2327,8 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
                 enqueue_deferred_free(old->second.device_ptr, old->second.size);
             }
         }
-        entries_[cache_key]    = entry;
-        id_to_key_[key]        = cache_key;
+        entries_[cache_key] = entry;
+        id_to_key_[key]     = cache_key;
     }
 
     result.ptr   = ptr;
@@ -2349,7 +2349,7 @@ static bool moe_direct_trace_enabled() {
     return v != 0;
 }
 
-static void moe_direct_trace_key(const char * op,
+static void moe_direct_trace_key(const char *               op,
                                  const ggml_sycl_cache_id & key,
                                  ggml_layout_mode           layout,
                                  const char *               detail,
@@ -2358,8 +2358,8 @@ static void moe_direct_trace_key(const char * op,
     if (!moe_direct_trace_enabled()) {
         return;
     }
-    bool        force_log = false;
-    const char * hash_env = std::getenv("GGML_SYCL_MOE_DIRECT_HASH");
+    bool         force_log = false;
+    const char * hash_env  = std::getenv("GGML_SYCL_MOE_DIRECT_HASH");
     if (hash_env && hash_env[0] != '\0') {
         char *   end  = nullptr;
         uint64_t want = std::strtoull(hash_env, &end, 0);
@@ -2664,8 +2664,8 @@ void unified_cache::register_host_expert(ggml_sycl_cache_id key, void * ptr, siz
         cache_entry.pool_allocated   = false;
         cache_entry.last_write_event = {};
         cache_entry.has_write_event  = false;
-        entries_[cache_key] = cache_entry;
-        id_to_key_[key]     = cache_key;
+        entries_[cache_key]          = cache_entry;
+        id_to_key_[key]              = cache_key;
     }
 
     std::unique_lock<std::shared_mutex> lock(direct_stage_mutex_);
@@ -3796,8 +3796,7 @@ void unified_cache::remove(const ggml_sycl_cache_id & key_id,
     enqueue_deferred_free(it->second.device_ptr, it->second.size);
 
     if (type == cache_entry_type::MOE_EXPERT && layer_id == 0 && expert_id == 0) {
-        fprintf(stderr,
-                "[MOE-ENTRY-ERASE] path=remove layer=%d expert=%d layout=%d size=%zu pinned=%d state=%d\n",
+        fprintf(stderr, "[MOE-ENTRY-ERASE] path=remove layer=%d expert=%d layout=%d size=%zu pinned=%d state=%d\n",
                 layer_id, expert_id, (int) it->second.layout, it->second.size, it->second.pinned ? 1 : 0,
                 (int) it->second.state);
     }
@@ -5241,21 +5240,22 @@ void unified_cache::reset_model_weight_entries() {
     }
 
     struct stale_alloc {
-        void *         ptr           = nullptr;
-        size_t         size          = 0;
-        cache_location location      = cache_location::UNKNOWN;
-        bool           host_resident = false;
+        void *         ptr            = nullptr;
+        size_t         size           = 0;
+        cache_location location       = cache_location::UNKNOWN;
+        bool           host_resident  = false;
         bool           pool_allocated = false;
     };
+
     std::vector<stale_alloc> to_free;
-    const bool               trace_reset        = moe_direct_trace_enabled();
-    const size_t             weight_used_before = zone_used(vram_zone_id::WEIGHT);
-    const size_t             weight_avail_before = zone_available(vram_zone_id::WEIGHT);
+    const bool               trace_reset           = moe_direct_trace_enabled();
+    const size_t             weight_used_before    = zone_used(vram_zone_id::WEIGHT);
+    const size_t             weight_avail_before   = zone_available(vram_zone_id::WEIGHT);
     const size_t             weight_largest_before = zone_largest_free(vram_zone_id::WEIGHT);
-    size_t                   entries_seen       = 0;
-    size_t                   entries_erased     = 0;
-    size_t                   entries_preserved  = 0;
-    size_t                   bytes_erased       = 0;
+    size_t                   entries_seen          = 0;
+    size_t                   entries_erased        = 0;
+    size_t                   entries_preserved     = 0;
+    size_t                   bytes_erased          = 0;
     size_t                   direct_weights_before = 0;
     size_t                   direct_experts_before = 0;
     {
@@ -5324,11 +5324,11 @@ void unified_cache::reset_model_weight_entries() {
             "[UNIFIED-CACHE] reset model weight entries: entries seen=%zu erased=%zu preserved_live=%zu "
             "queued_free=%.1f MB direct_before weight=%zu expert=%zu "
             "weight_zone used %.1f->%.1f MB avail %.1f->%.1f MB largest %.1f->%.1f MB\n",
-            entries_seen, entries_erased, entries_preserved, bytes_erased / (1024.0 * 1024.0),
-            direct_weights_before, direct_experts_before, weight_used_before / (1024.0 * 1024.0),
+            entries_seen, entries_erased, entries_preserved, bytes_erased / (1024.0 * 1024.0), direct_weights_before,
+            direct_experts_before, weight_used_before / (1024.0 * 1024.0),
             zone_used(vram_zone_id::WEIGHT) / (1024.0 * 1024.0), weight_avail_before / (1024.0 * 1024.0),
-            zone_available(vram_zone_id::WEIGHT) / (1024.0 * 1024.0),
-            weight_largest_before / (1024.0 * 1024.0), zone_largest_free(vram_zone_id::WEIGHT) / (1024.0 * 1024.0));
+            zone_available(vram_zone_id::WEIGHT) / (1024.0 * 1024.0), weight_largest_before / (1024.0 * 1024.0),
+            zone_largest_free(vram_zone_id::WEIGHT) / (1024.0 * 1024.0));
     }
     GGML_SYCL_DEBUG("[UNIFIED-CACHE] reset model weight entries\n");
 }
@@ -9839,7 +9839,7 @@ bool unified_cache_reserve_moe_q8_1_scratch(int device_id, const moe_q8_1_scratc
     return true;
 }
 
-bool unified_cache_allocate_moe_q8_1_graph_scratch(int                            device_id,
+bool unified_cache_allocate_moe_q8_1_graph_scratch(int                             device_id,
                                                    const moe_q8_1_scratch_demand & demand,
                                                    alloc_handle *                  out) {
     if (!out) {
@@ -9875,7 +9875,7 @@ bool unified_cache_allocate_moe_q8_1_graph_scratch(int                          
     req.intent.constraints.must_device      = true;
     req.intent.constraints.prefer_vram_zone = vram_zone_id::WEIGHT;
 
-    auto *       cache           = get_unified_cache_for_device(device_id);
+    auto *       cache            = get_unified_cache_for_device(device_id);
     const size_t scratch_capacity = cache ? cache->scratch_pool_capacity() : 0;
     if (!unified_alloc(req, out) || !out->ptr) {
         GGML_LOG_ERROR(
@@ -10028,11 +10028,13 @@ bool moe_preallocate_inference_buffers(int device_id, const moe_buffer_params & 
     // IDs staging: n_expert_used * max_batch * sizeof(int32_t)
     const size_t ids_bytes =
         static_cast<size_t>(params.n_expert_used) * static_cast<size_t>(params.max_batch) * sizeof(int32_t);
+    const size_t compact_bytes =
+        static_cast<size_t>(params.n_expert_used) * static_cast<size_t>(params.max_batch) * sizeof(void *);
 
     GGML_LOG_INFO(
         "[MOE-PREALLOC] device %d: n_tables=%d table_bytes=%zu "
-        "total_table=%.1f KB ids_staging=%.1f KB\n",
-        device_id, n_tables, table_bytes, total_table_bytes / 1024.0, ids_bytes / 1024.0);
+        "total_table=%.1f KB ids_staging=%.1f KB compact=%.1f KB\n",
+        device_id, n_tables, table_bytes, total_table_bytes / 1024.0, ids_bytes / 1024.0, compact_bytes / 1024.0);
 
     // --- Allocate expert pointer tables ---
     if (n_tables > 0 && table_bytes > 0) {
@@ -10095,11 +10097,39 @@ bool moe_preallocate_inference_buffers(int device_id, const moe_buffer_params & 
         }
     }
 
+    // --- Allocate compact selected-row pointer list ---
+    if (compact_bytes > 0) {
+        auto compact_result = unified_cache_allocate(device_id, compact_bytes,
+                                                     unified_cache::alloc_lifetime::PERSISTENT, "moe_compact_ptrs");
+
+        if (!compact_result) {
+            GGML_LOG_ERROR(
+                "[MOE-PREALLOC] failed to allocate compact pointer list "
+                "(%.1f KB)\n",
+                compact_bytes / 1024.0);
+        } else {
+            bufs.compact_ptrs       = compact_result.ptr;
+            bufs.compact_ptrs_bytes = compact_bytes;
+            bufs.compact_on_device  = compact_result.on_device;
+        }
+
+        auto missing_result = unified_cache_allocate(device_id, sizeof(int), unified_cache::alloc_lifetime::PERSISTENT,
+                                                     "moe_compact_missing");
+        if (!missing_result) {
+            GGML_LOG_ERROR("[MOE-PREALLOC] failed to allocate compact missing flag\n");
+        } else {
+            bufs.compact_missing           = static_cast<int *>(missing_result.ptr);
+            bufs.compact_missing_bytes     = sizeof(int);
+            bufs.compact_missing_on_device = missing_result.on_device;
+        }
+    }
+
     bufs.initialized = true;
 
-    GGML_LOG_INFO("[MOE-PREALLOC] device %d: tables=%s (%d x %zu B) ids=%s (%.1f KB)\n", device_id,
+    GGML_LOG_INFO("[MOE-PREALLOC] device %d: tables=%s (%d x %zu B) ids=%s (%.1f KB) compact=%s (%.1f KB)\n", device_id,
                   bufs.tables_on_device ? "VRAM" : "host", bufs.n_tables, bufs.table_bytes,
-                  bufs.ids_on_device ? "VRAM" : "host", bufs.ids_staging_bytes / 1024.0);
+                  bufs.ids_on_device ? "VRAM" : "host", bufs.ids_staging_bytes / 1024.0,
+                  bufs.compact_on_device ? "VRAM" : "host", bufs.compact_ptrs_bytes / 1024.0);
 
     return true;
 }
@@ -10147,6 +10177,33 @@ void * moe_get_ids_staging(int device_id, size_t needed_bytes) {
     return bufs.ids_staging;
 }
 
+void * moe_get_compact_ptrs(int device_id, size_t needed_bytes) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return nullptr;
+    }
+    const moe_inference_buffers & bufs = g_moe_buffers[device_id];
+    if (!bufs.initialized || !bufs.compact_ptrs) {
+        return nullptr;
+    }
+    if (needed_bytes > bufs.compact_ptrs_bytes) {
+        GGML_SYCL_DEBUG("[MOE-PREALLOC] compact pointer list too small: need %zu have %zu\n", needed_bytes,
+                        bufs.compact_ptrs_bytes);
+        return nullptr;
+    }
+    return bufs.compact_ptrs;
+}
+
+int * moe_get_compact_missing_flag(int device_id) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return nullptr;
+    }
+    const moe_inference_buffers & bufs = g_moe_buffers[device_id];
+    if (!bufs.initialized || !bufs.compact_missing || bufs.compact_missing_bytes < sizeof(int)) {
+        return nullptr;
+    }
+    return bufs.compact_missing;
+}
+
 void moe_free_inference_buffers(int device_id) {
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
         return;
@@ -10171,6 +10228,15 @@ void moe_free_inference_buffers(int device_id) {
     // Free IDs staging.
     if (bufs.ids_staging) {
         unified_cache_deallocate(device_id, bufs.ids_staging, bufs.ids_staging_bytes,
+                                 unified_cache::alloc_lifetime::PERSISTENT);
+    }
+
+    if (bufs.compact_ptrs) {
+        unified_cache_deallocate(device_id, bufs.compact_ptrs, bufs.compact_ptrs_bytes,
+                                 unified_cache::alloc_lifetime::PERSISTENT);
+    }
+    if (bufs.compact_missing) {
+        unified_cache_deallocate(device_id, bufs.compact_missing, bufs.compact_missing_bytes,
                                  unified_cache::alloc_lifetime::PERSISTENT);
     }
 

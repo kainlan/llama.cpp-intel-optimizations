@@ -25,8 +25,8 @@
 #include "tensor-types.hpp"
 #include "unified-cache.hpp"
 
-#include <atomic>
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdlib>
@@ -2297,10 +2297,12 @@ struct ggml_tensor_extra_gpu {
     std::vector<ggml_sycl::mem_handle> moe_expert_ptrs_leases[GGML_SYCL_MAX_DEVICES];
 
     // MoE compact pointer list (row-major by id) and missing flag
-    void * moe_expert_ptrs_compact_device[GGML_SYCL_MAX_DEVICES]   = { nullptr };
-    size_t moe_expert_ptrs_compact_size[GGML_SYCL_MAX_DEVICES]     = { 0 };
-    size_t moe_expert_ptrs_compact_capacity[GGML_SYCL_MAX_DEVICES] = { 0 };
-    int *  moe_expert_ptrs_missing_device[GGML_SYCL_MAX_DEVICES]   = { nullptr };
+    void * moe_expert_ptrs_compact_device[GGML_SYCL_MAX_DEVICES]        = { nullptr };
+    size_t moe_expert_ptrs_compact_size[GGML_SYCL_MAX_DEVICES]          = { 0 };
+    size_t moe_expert_ptrs_compact_capacity[GGML_SYCL_MAX_DEVICES]      = { 0 };
+    bool   moe_expert_ptrs_compact_from_prealloc[GGML_SYCL_MAX_DEVICES] = { false };
+    int *  moe_expert_ptrs_missing_device[GGML_SYCL_MAX_DEVICES]        = { nullptr };
+    bool   moe_expert_ptrs_missing_from_prealloc[GGML_SYCL_MAX_DEVICES] = { false };
 
     // MoE expert hotness tracking (per layer)
     std::vector<float> moe_expert_scores;
@@ -3320,7 +3322,7 @@ struct ggml_backend_sycl_context {
     };
 
     std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph = nullptr;
-    sycl_exec_graph_replay_state active_exec_graph;
+    sycl_exec_graph_replay_state                                              active_exec_graph;
     int      exec_graph_n_nodes       = 0;      // Track graph size for cache invalidation
     bool     exec_graph_is_decode     = false;  // Track which phase the cached graph was recorded for
     int      warmup_decode_n_nodes    = 0;      // Track which decode graph has been warmed up
@@ -3349,10 +3351,10 @@ struct ggml_backend_sycl_context {
     };
 
     std::vector<moe_graph_segment> moe_segments;
-    std::vector<int>               moe_node_indices;            // Indices of MUL_MAT_ID nodes
-    int                            moe_segments_n_nodes   = 0;  // n_nodes when segments were recorded
-    bool                           moe_segments_is_decode = false;
-    bool                           moe_segments_valid     = false;
+    std::vector<int>               moe_node_indices;                       // Indices of MUL_MAT_ID nodes
+    int                            moe_segments_n_nodes              = 0;  // n_nodes when segments were recorded
+    bool                           moe_segments_is_decode            = false;
+    bool                           moe_segments_valid                = false;
     bool                           moe_fa_post_prompt_record_pending = false;
 
     void invalidate_moe_segments() {

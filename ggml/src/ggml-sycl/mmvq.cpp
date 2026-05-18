@@ -4393,35 +4393,53 @@ static bool ggml_sycl_moe_ensure_compact_storage(ggml_backend_sycl_context & ctx
         extra->moe_expert_ptrs_compact_capacity[ctx.device] >= bytes) {
         extra->moe_expert_ptrs_compact_size[ctx.device] = bytes;
     } else {
-        if (!allow_alloc) {
-            return false;
-        }
         if (extra->moe_expert_ptrs_compact_device[ctx.device] != nullptr) {
-            sycl::free(extra->moe_expert_ptrs_compact_device[ctx.device], *stream);
-            extra->moe_expert_ptrs_compact_device[ctx.device]   = nullptr;
-            extra->moe_expert_ptrs_compact_capacity[ctx.device] = 0;
-            extra->moe_expert_ptrs_compact_size[ctx.device]     = 0;
+            if (!extra->moe_expert_ptrs_compact_from_prealloc[ctx.device]) {
+                sycl::free(extra->moe_expert_ptrs_compact_device[ctx.device], *stream);
+            }
+            extra->moe_expert_ptrs_compact_device[ctx.device]        = nullptr;
+            extra->moe_expert_ptrs_compact_capacity[ctx.device]      = 0;
+            extra->moe_expert_ptrs_compact_size[ctx.device]          = 0;
+            extra->moe_expert_ptrs_compact_from_prealloc[ctx.device] = false;
         }
-        void * compact = ggml_sycl_malloc_device(bytes, *stream, "mmvq_compact");
-        if (!compact) {
-            GGML_LOG_ERROR("[MOE] Failed to allocate compact pointer list (%zu bytes)\n", bytes);
+
+        void * compact = ggml_sycl::moe_get_compact_ptrs(ctx.device, bytes);
+        if (compact) {
+            extra->moe_expert_ptrs_compact_device[ctx.device]        = compact;
+            extra->moe_expert_ptrs_compact_capacity[ctx.device]      = bytes;
+            extra->moe_expert_ptrs_compact_size[ctx.device]          = bytes;
+            extra->moe_expert_ptrs_compact_from_prealloc[ctx.device] = true;
+        } else if (!allow_alloc) {
             return false;
+        } else {
+            compact = ggml_sycl_malloc_device(bytes, *stream, "mmvq_compact");
+            if (!compact) {
+                GGML_LOG_ERROR("[MOE] Failed to allocate compact pointer list (%zu bytes)\n", bytes);
+                return false;
+            }
+            extra->moe_expert_ptrs_compact_device[ctx.device]        = compact;
+            extra->moe_expert_ptrs_compact_capacity[ctx.device]      = bytes;
+            extra->moe_expert_ptrs_compact_size[ctx.device]          = bytes;
+            extra->moe_expert_ptrs_compact_from_prealloc[ctx.device] = false;
         }
-        extra->moe_expert_ptrs_compact_device[ctx.device]   = compact;
-        extra->moe_expert_ptrs_compact_capacity[ctx.device] = bytes;
-        extra->moe_expert_ptrs_compact_size[ctx.device]     = bytes;
     }
 
     if (extra->moe_expert_ptrs_missing_device[ctx.device] == nullptr) {
-        if (!allow_alloc) {
+        int * missing = ggml_sycl::moe_get_compact_missing_flag(ctx.device);
+        if (missing) {
+            extra->moe_expert_ptrs_missing_device[ctx.device]        = missing;
+            extra->moe_expert_ptrs_missing_from_prealloc[ctx.device] = true;
+        } else if (!allow_alloc) {
             return false;
+        } else {
+            missing = ggml_sycl_malloc_device_t<int>(1, *stream, "mmvq_missing");
+            if (!missing) {
+                GGML_LOG_ERROR("[MOE] Failed to allocate compact list missing flag\n");
+                return false;
+            }
+            extra->moe_expert_ptrs_missing_device[ctx.device]        = missing;
+            extra->moe_expert_ptrs_missing_from_prealloc[ctx.device] = false;
         }
-        int * missing = ggml_sycl_malloc_device_t<int>(1, *stream, "mmvq_missing");
-        if (!missing) {
-            GGML_LOG_ERROR("[MOE] Failed to allocate compact list missing flag\n");
-            return false;
-        }
-        extra->moe_expert_ptrs_missing_device[ctx.device] = missing;
     }
 
     return true;
@@ -4783,13 +4801,13 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &   ctx,
         mxfp4_moe_tg_reuse_invalidate();
     }
 
-    // --- Build compact pointer table for batched dispatch ---
-    // We dispatch over n_gpu_entries only.  Each entry becomes one
-    // batch_idx in the kernel.  We use compact mode (ids=nullptr) where
-    // expert_ptrs[batch_idx] gives the weight pointer directly.
-    //
-    // To get correct dst offsets we set n_tokens=1 and provide per-entry
-    // id via the ids array (so that batch_idx → id mapping is explicit).
+    // --- Build routing payload for batched dispatch ---
+    // When the selected GPU entries cover the whole (token, top-k) grid and
+    // the caller provides a device ids tensor, derive a compact per-row pointer
+    // payload on device.  The source table is still descriptor/unified-cache
+    // owned; the compact list is only the kernel ABI payload.  With ids=nullptr
+    // kernels index expert_ptrs[batch_idx] directly and avoid the expert-id
+    // table lookup in the hot loop.
     const int64_t num_tokens    = ne12;
     const int64_t total_batches = n_ids * num_tokens;
 
@@ -4864,10 +4882,45 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &   ctx,
     if (tg_profile) {
         stream->wait();
     }
-    auto t_batch_end = std::chrono::high_resolution_clock::now();
 
-    const int64_t ids_nb0 = can_use_direct_ids ? direct_ids_nb0 : static_cast<int64_t>(sizeof(int32_t));
-    const int64_t ids_nb1 = can_use_direct_ids ? direct_ids_nb1 : n_ids * static_cast<int64_t>(sizeof(int32_t));
+    const void * const * dispatch_ptrs = expert_ptrs_device;
+    const int32_t *      dispatch_ids  = ids_device;
+    int64_t              ids_nb0       = can_use_direct_ids ? direct_ids_nb0 : static_cast<int64_t>(sizeof(int32_t));
+    int64_t              ids_nb1 = can_use_direct_ids ? direct_ids_nb1 : n_ids * static_cast<int64_t>(sizeof(int32_t));
+
+    if (can_use_direct_ids) {
+        // Compact storage is planner/graph-preload-owned.  The hot dispatch path
+        // may consume an existing compact ABI buffer, but should not allocate one.
+        constexpr bool allow_compact_alloc = false;
+        const bool compact_ready = ggml_sycl_moe_prepare_compact_list(ctx, src0, total_batches, allow_compact_alloc);
+        if (compact_ready) {
+            auto *  extra_mut = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
+            void ** compact_ptrs =
+                extra_mut ? static_cast<void **>(extra_mut->moe_expert_ptrs_compact_device[ctx.device]) : nullptr;
+            if (compact_ptrs) {
+                // No missing-flag readback here: this path is only reached when
+                // the caller already resolved every selected GPU entry.
+                ggml_sycl_build_moe_compact_list(*stream, compact_ptrs, expert_ptrs_device, ids_device, n_ids,
+                                                 num_tokens, n_experts, ids_nb0, ids_nb1, nullptr, {});
+                dispatch_ptrs = compact_ptrs;
+                dispatch_ids  = nullptr;
+                ids_nb0       = 0;
+                ids_nb1       = 0;
+                static std::atomic<int> compact_log{ 0 };
+                const char *            row_agg_debug = std::getenv("GGML_SYCL_MOE_ROW_AGG_DEBUG");
+                if (row_agg_debug && std::atoi(row_agg_debug) != 0 &&
+                    compact_log.fetch_add(1, std::memory_order_relaxed) < 32) {
+                    fprintf(stderr,
+                            "[MOE-ROW-AGG] stage=compact path=mmvq_compact tensor=%s layout=%d "
+                            "entries=%d total_batches=%lld topk=%lld tokens=%lld device=%d\n",
+                            src0->name ? src0->name : "?", (int) layout, n_gpu_entries, (long long) total_batches,
+                            (long long) n_ids, (long long) num_tokens, ctx.device);
+                }
+            }
+        }
+    }
+
+    auto t_batch_end = std::chrono::high_resolution_clock::now();
 
     auto t_kernel_begin = std::chrono::high_resolution_clock::now();
     if (tg_profile) {
@@ -4878,26 +4931,26 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &   ctx,
     bool        have_kernel_event = false;
     switch (src0->type) {
         case GGML_TYPE_Q4_0:
-            mul_mat_vec_q4_0_q8_1_id_sycl(nullptr,             // vx (unused with expert_ptrs)
-                                          expert_ptrs_device,  // expert pointer table
-                                          q8_1_buffer, dst_d, ids_device,
-                                          ne00,                // ncols
-                                          ne01,                // nrows_per_expert
+            mul_mat_vec_q4_0_q8_1_id_sycl(nullptr,           // vx (unused with expert_ptrs)
+                                          dispatch_ptrs,     // expert pointer table or compact row list
+                                          q8_1_buffer, dst_d, dispatch_ids,
+                                          ne00,              // ncols
+                                          ne01,              // nrows_per_expert
                                           total_batches, n_ids, num_tokens, ne11, stride_expert_x, ids_nb0,
-                                          ids_nb1,             // ids strides
-                                          q8_nb11, q8_nb12,    // Q8_1 strides
-                                          nb1, nb2,            // dst strides
+                                          ids_nb1,           // ids strides
+                                          q8_nb11, q8_nb12,  // Q8_1 strides
+                                          nb1, nb2,          // dst strides
                                           stream);
             break;
         case GGML_TYPE_Q8_0:
-            mul_mat_vec_q8_0_q8_1_id_sycl(nullptr, expert_ptrs_device, q8_1_buffer, dst_d, ids_device, ne00, ne01,
+            mul_mat_vec_q8_0_q8_1_id_sycl(nullptr, dispatch_ptrs, q8_1_buffer, dst_d, dispatch_ids, ne00, ne01,
                                           total_batches, n_ids, num_tokens, ne11, stride_expert_x, ids_nb0, ids_nb1,
                                           q8_nb11, q8_nb12, nb1, nb2, stream);
             break;
         case GGML_TYPE_MXFP4:
             if (layout == GGML_LAYOUT_COALESCED) {
                 coalesced_mul_mat_vec_mxfp4_q8_1_id_sycl(nullptr,           // vx (unused with expert_ptrs)
-                                                         expert_ptrs_device, q8_1_buffer, dst_d, ids_device,
+                                                         dispatch_ptrs, q8_1_buffer, dst_d, dispatch_ids,
                                                          ne00,              // ncols (MXFP4)
                                                          ne10,              // ncols_y (Q8_1 row size for SoA ds offset)
                                                          ne01,              // nrows_per_expert
@@ -4909,7 +4962,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &   ctx,
                                                          stream);
             } else if (layout == GGML_LAYOUT_SOA) {
                 reorder_mul_mat_vec_mxfp4_q8_1_id_sycl(nullptr,           // vx (unused with expert_ptrs)
-                                                       expert_ptrs_device, q8_1_buffer, dst_d, ids_device,
+                                                       dispatch_ptrs, q8_1_buffer, dst_d, dispatch_ids,
                                                        ne00,              // ncols (MXFP4)
                                                        ne10,              // ncols_y (Q8_1 row size for SoA ds offset)
                                                        ne01,              // nrows_per_expert
@@ -4923,7 +4976,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &   ctx,
             } else {
                 // AOS layout
                 mul_mat_vec_mxfp4_q8_1_id_sycl(nullptr,           // vx (unused with expert_ptrs)
-                                               expert_ptrs_device, q8_1_buffer, dst_d, ids_device,
+                                               dispatch_ptrs, q8_1_buffer, dst_d, dispatch_ids,
                                                ne00,              // ncols
                                                ne01,              // nrows_per_expert
                                                total_batches, n_ids, num_tokens, ne11, stride_expert_x, ids_nb0,
