@@ -1482,6 +1482,9 @@ using ggml_sycl::expert_tensor_group;
 static std::unordered_map<int64_t, expert_tensor_group> g_expert_groups;
 static std::shared_mutex                                g_expert_groups_mutex;
 
+static ggml_sycl_cache_id ggml_sycl_layout_specific_moe_expert_cache_key(ggml_sycl_cache_id key,
+                                                                         ggml_layout_mode   layout);
+
 // ---------------------------------------------------------------------------
 // Lightweight popularity ranking: maps (layer_id, expert_id) -> popularity rank.
 // Replaces ExpertPlacementTable's popularity_rank field.
@@ -1613,7 +1616,8 @@ static bool is_expert_resident(int block_id, int expert_id, int device_id) {
             return false;
         }
         for (auto layout : layouts) {
-            if (cache->lookup_device_only(key, layout) != nullptr) {
+            const ggml_sycl_cache_id layout_key = ggml_sycl_layout_specific_moe_expert_cache_key(key, layout);
+            if (cache->lookup_device_only(layout_key, layout) != nullptr) {
                 return true;
             }
         }
@@ -1692,7 +1696,8 @@ static void * get_expert_device_ptr(int block_id, int expert_id, moe_tensor_type
     static const ggml_layout_mode layouts[] = { GGML_LAYOUT_SOA, GGML_LAYOUT_COALESCED, GGML_LAYOUT_XMX_TILED,
                                                 GGML_LAYOUT_AOS };
     for (auto layout : layouts) {
-        void * ptr = cache->lookup_device_only(*key_ptr, layout);
+        const ggml_sycl_cache_id layout_key = ggml_sycl_layout_specific_moe_expert_cache_key(*key_ptr, layout);
+        void *                   ptr        = cache->lookup_device_only(layout_key, layout);
         if (ptr) {
             return ptr;
         }
@@ -1707,12 +1712,37 @@ static ggml_sycl_cache_id ggml_sycl_get_moe_expert_cache_key(const ggml_tensor *
 
 static ggml_sycl_cache_id ggml_sycl_layout_specific_moe_expert_cache_key(ggml_sycl_cache_id key,
                                                                          ggml_layout_mode   layout) {
-    if (layout == GGML_LAYOUT_MXFP4_I8) {
-        constexpr uint64_t layout_key_tag = 0x4d584650344938ull;  // "MXFP4I8"
-        key.aux_id                        = ggml_sycl::detail::cache_hash_combine(key.aux_id, layout_key_tag);
-    } else if (layout == GGML_LAYOUT_MXFP4_DPAS) {
-        constexpr uint64_t layout_key_tag = 0x4d584650344450ull;  // "MXFP4DP"
-        key.aux_id                        = ggml_sycl::detail::cache_hash_combine(key.aux_id, layout_key_tag);
+    uint64_t layout_key_tag = 0;
+    switch (layout) {
+        case GGML_LAYOUT_AOS:
+            return key;
+        case GGML_LAYOUT_SOA:
+            layout_key_tag = 0x4d4f45534f410000ull;  // "MOESOA"
+            break;
+        case GGML_LAYOUT_COALESCED:
+            layout_key_tag = 0x4d4f45434f414c00ull;  // "MOECOAL"
+            break;
+        case GGML_LAYOUT_MXFP4_I8:
+            layout_key_tag = 0x4d584650344938ull;  // "MXFP4I8"
+            break;
+        case GGML_LAYOUT_XMX_TILED:
+            layout_key_tag = 0x4d4f45584d585400ull;  // "MOEXMXT"
+            break;
+        case GGML_LAYOUT_XMX_GEMM_TILED:
+            layout_key_tag = 0x4d4f45584d584700ull;  // "MOEXMXG"
+            break;
+        case GGML_LAYOUT_ONEDNN_PACKED:
+            layout_key_tag = 0x4d4f454f4e454400ull;  // "MOEONED"
+            break;
+        case GGML_LAYOUT_ONEDNN_WOQ:
+            layout_key_tag = 0x4d4f45574f510000ull;  // "MOEWOQ"
+            break;
+        case GGML_LAYOUT_MXFP4_DPAS:
+            layout_key_tag = 0x4d584650344450ull;  // "MXFP4DP"
+            break;
+    }
+    if (layout_key_tag != 0) {
+        key.aux_id = ggml_sycl::detail::cache_hash_combine(key.aux_id, layout_key_tag);
     }
     return key;
 }
@@ -2045,7 +2075,7 @@ static void moe_prestage_popular_experts() {
             sd.layer_id  = meta->layer_id;
             sd.expert_id = meta->expert_idx;
 
-            req.key              = ckey;
+            req.key              = ggml_sycl_layout_specific_moe_expert_cache_key(ckey, GGML_LAYOUT_SOA);
             req.src_ptr          = meta->data_ptr;
             req.src_size         = meta->bytes;
             req.dst_size         = dst_bytes;
@@ -2147,7 +2177,20 @@ static void moe_prestage_popular_experts() {
             }
 
             // Stage all 3 tensors atomically
-            bool ok = cache->stage_expert_group(mg.block_num, mg.expert_idx, grp, gate_sd, up_sd, down_sd,
+            ggml_sycl::expert_tensor_group layout_grp = grp;
+            if (layout_grp.has_gate) {
+                layout_grp.gate_key =
+                    ggml_sycl_layout_specific_moe_expert_cache_key(layout_grp.gate_key, GGML_LAYOUT_SOA);
+            }
+            if (layout_grp.has_up) {
+                layout_grp.up_key = ggml_sycl_layout_specific_moe_expert_cache_key(layout_grp.up_key, GGML_LAYOUT_SOA);
+            }
+            if (layout_grp.has_down) {
+                layout_grp.down_key =
+                    ggml_sycl_layout_specific_moe_expert_cache_key(layout_grp.down_key, GGML_LAYOUT_SOA);
+            }
+
+            bool ok = cache->stage_expert_group(mg.block_num, mg.expert_idx, layout_grp, gate_sd, up_sd, down_sd,
                                                 GGML_LAYOUT_SOA, gate_ok ? &gate_req : nullptr,
                                                 up_ok ? &up_req : nullptr, down_ok ? &down_req : nullptr);
 
@@ -2408,6 +2451,7 @@ static void moe_prestage_popular_experts() {
                 if (!key.valid) {
                     continue;
                 }
+                key = ggml_sycl_layout_specific_moe_expert_cache_key(key, GGML_LAYOUT_SOA);
 
                 // Deduct budget eagerly during collection so device selection
                 // remains accurate for subsequent experts.
@@ -2645,8 +2689,10 @@ static void moe_prestage_popular_experts() {
                         return;
                     }
                     for (auto layout : pin_layouts) {
-                        if (pin_cache->lookup(key, layout)) {
-                            pin_cache->pin(key, layout);
+                        const ggml_sycl_cache_id layout_key =
+                            ggml_sycl_layout_specific_moe_expert_cache_key(key, layout);
+                        if (pin_cache->lookup(layout_key, layout)) {
+                            pin_cache->pin(layout_key, layout);
                             break;
                         }
                     }
@@ -2722,6 +2768,8 @@ void * moe_expert_ensure_soa_cached(int layer_idx, int expert_idx, int device_id
     if (!key.valid) {
         return nullptr;
     }
+
+    key = ggml_sycl_layout_specific_moe_expert_cache_key(key, GGML_LAYOUT_SOA);
 
     if (cache->has_placement_plan()) {
         return cache->lookup(key, GGML_LAYOUT_SOA);
@@ -3116,7 +3164,8 @@ static std::vector<ggml_layout_mode> ggml_sycl_moe_resolve_layouts(ggml_layout_m
 static moe_expert_route ggml_sycl_resolve_moe_expert_route(const ggml_tensor * src0,
                                                            int                 current_device,
                                                            int                 expert_id,
-                                                           ggml_layout_mode    requested_layout) {
+                                                           ggml_layout_mode    requested_layout,
+                                                           bool                allow_materialize = true) {
     moe_expert_route route{};
     route.requested_layout = requested_layout;
 
@@ -3241,7 +3290,36 @@ static moe_expert_route ggml_sycl_resolve_moe_expert_route(const ggml_tensor * s
                 }
             }
             if (!resolved) {
-                if (device_planned && req.preferred_device == d && layout == requested_layout) {
+                if (allow_materialize && host_only && layout == GGML_LAYOUT_AOS && src0->data && src0->buffer &&
+                    ggml_backend_buffer_is_host(src0->buffer)) {
+                    const size_t expert_size = static_cast<size_t>(src0->nb[2]);
+                    if (expert_size > 0) {
+                        const uint8_t * expert_aos =
+                            static_cast<const uint8_t *>(src0->data) + static_cast<size_t>(expert_id) * expert_size;
+                        if (expert_aos) {
+                            cache->register_host_expert(layout_key,
+                                                        const_cast<void *>(static_cast<const void *>(expert_aos)),
+                                                        expert_size, GGML_LAYOUT_AOS);
+                            resolved    = cache->resolve_expert(req);
+                            last_reason = resolved.reason;
+                            if (ggml_sycl_moe_route_log_enabled()) {
+                                static std::atomic<int> logged_host_register{ 0 };
+                                const int n = logged_host_register.fetch_add(1, std::memory_order_relaxed);
+                                if (n < 80) {
+                                    fprintf(stderr,
+                                            "[MOE-HOST-REGISTER] tensor=%s expert=%d device=%d layout=%d "
+                                            "resolved=%d reason=%s ptr=%p\n",
+                                            src0 && src0->name ? src0->name : "?", expert_id, d, (int) layout,
+                                            resolved ? 1 : 0, ggml_sycl_expert_resolve_reason_name(resolved.reason),
+                                            resolved.ptr);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (!resolved) {
+                if (allow_materialize && device_planned && req.preferred_device == d && layout == requested_layout) {
                     if (ggml_sycl_moe_route_log_enabled()) {
                         static std::atomic<int> logged{ 0 };
                         const int               n = logged.fetch_add(1, std::memory_order_relaxed);
@@ -3567,7 +3645,7 @@ bool moe_get_expert_stage_info(int layer_idx, int expert_idx, int device_id, exp
     const size_t      layout_bytes =
         ggml_sycl_layout_bytes_for_dims(meta->type, meta->ne0, meta->ne1, optimal_layout, device_id);
     const size_t dst_bytes = (layout_bytes > 0) ? layout_bytes : meta->bytes;
-    out.cache_key          = key;
+    out.cache_key          = ggml_sycl_layout_specific_moe_expert_cache_key(key, optimal_layout);
     out.src_ptr            = meta->data_ptr;
     out.src_size           = meta->bytes;
     out.dst_size           = dst_bytes;
@@ -4952,6 +5030,7 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
                     if (!key.valid) {
                         continue;
                     }
+                    key = ggml_sycl_layout_specific_moe_expert_cache_key(key, GGML_LAYOUT_SOA);
 
                     // Compute SOA layout size for this expert type
                     const int64_t ncols = info.tensor->ne[0];
@@ -5094,6 +5173,7 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
                     if (!key.valid) {
                         continue;
                     }
+                    key = ggml_sycl_layout_specific_moe_expert_cache_key(key, GGML_LAYOUT_SOA);
 
                     const int64_t ncols  = info.tensor->ne[0];
                     const int64_t nrows  = info.tensor->ne[1];
@@ -6049,6 +6129,7 @@ bool test_moe_route_preserves_ready_event_for_chaining() {
     if (!key.valid) {
         return false;
     }
+    key = ggml_sycl_layout_specific_moe_expert_cache_key(key, GGML_LAYOUT_SOA);
 
     auto stage =
         cache->direct_stage_expert(key, data.data(), data.size(), data.size(), GGML_LAYOUT_SOA, nullptr, nullptr, &q);
@@ -6108,6 +6189,7 @@ bool test_moe_ptr_table_retains_route_lease_until_event() {
         if (!key.valid) {
             return false;
         }
+        key        = ggml_sycl_layout_specific_moe_expert_cache_key(key, GGML_LAYOUT_SOA);
         auto stage = cache->direct_stage_expert(key, data.data(), data.size(), data.size(), GGML_LAYOUT_SOA, nullptr,
                                                 nullptr, &q);
         if (!stage.ok || !stage.ptr) {
@@ -6205,6 +6287,7 @@ bool test_moe_ptr_table_cached_reuse_retains_lease_and_ready_event() {
             sycl::event::wait(stage_events);
             return false;
         }
+        key        = ggml_sycl_layout_specific_moe_expert_cache_key(key, GGML_LAYOUT_SOA);
         auto stage = cache->direct_stage_expert(key, data.data(), data.size(), data.size(), GGML_LAYOUT_SOA, nullptr,
                                                 nullptr, &q);
         if (!stage.ok || !stage.ptr) {
@@ -6349,6 +6432,8 @@ bool test_moe_ptr_table_cached_reuse_is_tensor_specific() {
             sycl::event::wait(stage_events);
             return false;
         }
+        gate_key        = ggml_sycl_layout_specific_moe_expert_cache_key(gate_key, GGML_LAYOUT_SOA);
+        up_key          = ggml_sycl_layout_specific_moe_expert_cache_key(up_key, GGML_LAYOUT_SOA);
         auto gate_stage = cache->direct_stage_expert(gate_key, gate_data.data(), gate_data.size(), gate_data.size(),
                                                      GGML_LAYOUT_SOA, nullptr, nullptr, &q);
         auto up_stage   = cache->direct_stage_expert(up_key, up_data.data(), up_data.size(), up_data.size(),
@@ -8667,6 +8752,7 @@ bool test_moe_ptr_table_does_not_persist_pointer_cache() {
             sycl::event::wait(stage_events);
             return false;
         }
+        key        = ggml_sycl_layout_specific_moe_expert_cache_key(key, GGML_LAYOUT_SOA);
         auto stage = cache->direct_stage_expert(key, data.data(), data.size(), data.size(), GGML_LAYOUT_SOA, nullptr,
                                                 nullptr, &q);
         if (!stage.ok || !stage.ptr) {
@@ -8747,6 +8833,7 @@ bool test_moe_ptr_table_lease_covers_populated_slots() {
             sycl::event::wait(stage_events);
             return false;
         }
+        key        = ggml_sycl_layout_specific_moe_expert_cache_key(key, GGML_LAYOUT_SOA);
         auto stage = cache->direct_stage_expert(key, data.data(), data.size(), data.size(), GGML_LAYOUT_SOA, nullptr,
                                                 nullptr, &q);
         if (!stage.ok || !stage.ptr) {
@@ -14110,7 +14197,8 @@ static moe_planned_layout_probe ggml_sycl_probe_moe_planned_layout(const ggml_te
     const int64_t n_experts = src0->ne[2] > 0 ? src0->ne[2] : 1;
     for (int64_t e = 0; e < n_experts; ++e) {
         ggml_sycl::moe_expert_route route =
-            ggml_sycl::ggml_sycl_resolve_moe_expert_route(src0, device, static_cast<int>(e), layout);
+            ggml_sycl::ggml_sycl_resolve_moe_expert_route(src0, device, static_cast<int>(e), layout,
+                                                          /*allow_materialize=*/false);
         if (route.kind == ggml_sycl::moe_expert_route_kind::LOCAL_DEVICE && route.ptr &&
             route.actual_layout == layout) {
             probe.local++;
@@ -15141,10 +15229,22 @@ static void ggml_sycl_drop_non_target_expert_entries(ggml_sycl::unified_cache * 
         if (mode == target) {
             continue;
         }
-        if (!cache->is_cached(key_id, mode)) {
+        const ggml_sycl_cache_id layout_key = ggml_sycl_layout_specific_moe_expert_cache_key(key_id, mode);
+        if (!cache->is_cached(layout_key, mode)) {
             continue;
         }
-        if (cache->is_pinned(key_id, mode)) {
+        if (mode == GGML_LAYOUT_AOS) {
+            const ggml_sycl::weight_entry * entry = cache->lookup_expert(layout_key);
+            if (entry && entry->ptr && entry->location != ggml_sycl::cache_location::DEVICE) {
+                GGML_SYCL_DEBUG(
+                    "[UNIFIED-CACHE] keep expert layout=%s model=%llu name_hash=0x%llx L%d:E%d "
+                    "(host-resident) target=%s\n",
+                    ggml_sycl_layout_mode_name(mode), (unsigned long long) key_id.model_id,
+                    (unsigned long long) key_id.name_hash, layer_id, expert_id, ggml_sycl_layout_mode_name(target));
+                continue;
+            }
+        }
+        if (cache->is_pinned(layout_key, mode)) {
             GGML_SYCL_DEBUG(
                 "[UNIFIED-CACHE] keep expert layout=%s model=%llu name_hash=0x%llx L%d:E%d (pinned) target=%s\n",
 
@@ -15156,7 +15256,7 @@ static void ggml_sycl_drop_non_target_expert_entries(ggml_sycl::unified_cache * 
 
                         ggml_sycl_layout_mode_name(mode), (unsigned long long) key_id.model_id,
                         (unsigned long long) key_id.name_hash, layer_id, expert_id, ggml_sycl_layout_mode_name(target));
-        cache->remove(key_id, ggml_sycl::cache_entry_type::MOE_EXPERT, layer_id, expert_id, mode);
+        cache->remove(layout_key, ggml_sycl::cache_entry_type::MOE_EXPERT, layer_id, expert_id, mode);
     }
 }
 
@@ -16055,6 +16155,7 @@ static void ggml_sycl_preload_model_weights() {
                             if (!expert_aos || !key.valid) {
                                 continue;
                             }
+                            key = ggml_sycl_layout_specific_moe_expert_cache_key(key, base_layout);
                             ggml_sycl_reorder_fill_ctx rollback_ctx = reorder_ctx;
                             rollback_ctx.dst_bytes                  = expert_base_bytes;
                             rollback_ctx.layout                     = base_layout;
@@ -32029,7 +32130,8 @@ namespace ggml_sycl {
 static moe_expert_route ggml_sycl_resolve_moe_expert_route(const ggml_tensor * src0,
                                                            int                 current_device,
                                                            int                 expert_id,
-                                                           ggml_layout_mode    requested_layout);
+                                                           ggml_layout_mode    requested_layout,
+                                                           bool                allow_materialize);
 static void             ggml_sycl_abort_unresolved_device_expert(const ggml_tensor *      src0,
                                                                  int                      expert_id,
                                                                  int                      current_device,
@@ -32485,7 +32587,8 @@ static void ggml_sycl_update_moe_hotset(ggml_sycl::unified_cache *   cache,
         if (!key.valid) {
             continue;
         }
-        cache->set_hot(key, ggml_sycl::cache_entry_type::MOE_EXPERT, layer_id, expert_id, layout, true);
+        const ggml_sycl_cache_id layout_key = ggml_sycl_layout_specific_moe_expert_cache_key(key, layout);
+        cache->set_hot(layout_key, ggml_sycl::cache_entry_type::MOE_EXPERT, layer_id, expert_id, layout, true);
     }
 
     // Feedback popularity data so N-device dispatch and eviction scoring
@@ -33181,8 +33284,8 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
         if (!expert_aos) {
             return false;
         }
-        ggml_sycl_cache_id expert_cache_key = ggml_sycl_layout_specific_moe_expert_cache_key(
-            ggml_sycl_get_moe_expert_cache_key(src0, extra, static_cast<int>(e)), layout);
+        const ggml_sycl_cache_id expert_base_key = ggml_sycl_get_moe_expert_cache_key(src0, extra, static_cast<int>(e));
+        ggml_sycl_cache_id expert_cache_key = ggml_sycl_layout_specific_moe_expert_cache_key(expert_base_key, layout);
         if (!expert_cache_key.valid) {
             GGML_LOG_ERROR("[MOE] Missing cache key for %s expert=%ld layer=%d\n", src0->name, (long) e, layer_id);
             GGML_ASSERT(expert_cache_key.valid && "missing MoE cache key");
@@ -33399,7 +33502,7 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
 
                 const bool need_drop = ggml_sycl_unified_kernel_requires_aos(src0->type) || layout != GGML_LAYOUT_AOS;
                 if (cache && need_drop) {
-                    ggml_sycl_drop_non_target_expert_entries(cache, expert_cache_key, layer_id, static_cast<int>(e),
+                    ggml_sycl_drop_non_target_expert_entries(cache, expert_base_key, layer_id, static_cast<int>(e),
                                                              layout);
                 }
                 continue;
@@ -39752,8 +39855,10 @@ static bool try_xmx_sorted_moe(ggml_backend_sycl_context & ctx,
         expert_ctx.expert_scale_buf = expert_scale_buf;
         expert_ctx.xmx_cfg          = xmx_cfg;
         if (use_ptr_table) {
-            ggml_sycl_cache_id expert_cache_key =
+            ggml_sycl_cache_id expert_base_key =
                 ggml_sycl_get_moe_expert_cache_key(src0, src0_extra, static_cast<int>(e));
+            ggml_sycl_cache_id expert_cache_key =
+                ggml_sycl_layout_specific_moe_expert_cache_key(expert_base_key, layout);
             ggml_sycl::cache_ptr_view view{};
 
             if (cache && expert_cache_key.valid) {
