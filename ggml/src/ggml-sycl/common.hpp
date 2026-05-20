@@ -2125,32 +2125,42 @@ struct staging_buffer_pool {
     // Acquire a pinned host buffer of at least `needed` bytes.
     // Returns an existing free slot whose size >= needed, or allocates a new one.
     void * acquire(size_t needed, sycl::queue & queue) {
+        auto pending_event_complete = [](sycl::event & evt) -> bool {
+            try {
+                return evt.get_info<sycl::info::event::command_execution_status>() ==
+                       sycl::info::event_command_status::complete;
+            } catch (...) {
+                // Invalid events can occur after device teardown/reset. Treat
+                // them as complete so stale metadata does not force unbounded
+                // staging growth.
+                return true;
+            }
+        };
+
         auto allocate_new_slot = [&]() -> void * {
-            // No suitable ready slot — allocate from the pre-allocated pinned
-            // chunk pool so that NO sycl::malloc_host occurs during inference.
+            // No suitable ready slot: allocate from the configured unified-cache
+            // host STAGING zone. Once zones are configured, a miss must surface
+            // as back-pressure/reuse below rather than silently escaping to a
+            // separate runtime pinned allocation path.
             void * ptr       = nullptr;
             bool   from_pool = false;
             {
-                auto * ucache = ggml_sycl::get_unified_cache_for_device(ggml_sycl_get_device_id_from_queue(queue));
+                const int device_id = ggml_sycl_get_device_id_from_queue(queue);
+                auto *    ucache    = ggml_sycl::get_unified_cache_for_device(device_id);
                 if (ucache) {
                     if (ucache->host_zones_configured()) {
                         ggml_sycl::alloc_request _stg_req{};
                         _stg_req.queue                               = &queue;
+                        _stg_req.device                              = device_id;
                         _stg_req.size                                = needed;
+                        _stg_req.suppress_failure_log                = true;
                         _stg_req.intent.role                         = ggml_sycl::alloc_role::STAGING;
                         _stg_req.intent.constraints.must_host_pinned = true;
                         _stg_req.intent.constraints.use_pinned_pool  = true;
                         ptr = ggml_sycl::unified_allocate(_stg_req).resolve().ptr;
-                        // Zone allocation returns nullptr when the allocation spans a chunk
-                        // boundary or the STAGING zone is exhausted.  Fall back to runtime
-                        // pinned-pool allocation, still under unified-cache ownership.
                         if (!ptr) {
-                            GGML_LOG_WARN(
-                                "[STAGING] zone_alloc failed for %zu bytes, falling back to runtime pinned "
-                                "allocation\n",
-                                needed);
-                            ptr       = ucache->host_pool_alloc(needed, 64);
-                            from_pool = (ptr != nullptr);
+                            GGML_SYCL_DEBUG("[STAGING] zone allocation miss for %zu bytes; will try pending slots\n",
+                                            needed);
                         } else {
                             from_pool = true;
                         }
@@ -2188,6 +2198,9 @@ struct staging_buffer_pool {
             size_t                      best_size = SIZE_MAX;
             for (size_t i = 0; i < slots_.size(); ++i) {
                 auto & s = slots_[i];
+                if (!s.in_use && s.has_pending_event && pending_event_complete(s.pending_event)) {
+                    s.has_pending_event = false;
+                }
                 if (!s.in_use && !s.has_pending_event && s.size >= needed && s.size < best_size) {
                     best_idx  = i;
                     best_size = s.size;
@@ -2204,9 +2217,9 @@ struct staging_buffer_pool {
             return ptr;
         }
 
-        // Last resort: the pinned pool could not grow, so reuse the best
-        // pending slot after its DMA completes.  Mark it in-use before dropping
-        // the mutex so another caller cannot select the same slot.
+        // Last resort: the unified-cache staging zone could not grow, so reuse
+        // the best pending slot after its DMA completes. Mark it in-use before
+        // dropping the mutex so another caller cannot select the same slot.
         sycl::event wait_event;
         void *      wait_ptr    = nullptr;
         bool        wait_needed = false;
@@ -2243,9 +2256,9 @@ struct staging_buffer_pool {
             return wait_ptr;
         }
 
-        // Pinned pool exhausted and no reusable slot exists.
+        // The staging zone/pool is exhausted and no reusable slot exists.
         GGML_LOG_WARN(
-            "[staging_buffer_pool] pinned pool exhausted, cannot allocate %zu bytes "
+            "[staging_buffer_pool] staging allocation exhausted, cannot allocate %zu bytes "
             "(no runtime sycl::malloc_host fallback)\n",
             needed);
         return nullptr;

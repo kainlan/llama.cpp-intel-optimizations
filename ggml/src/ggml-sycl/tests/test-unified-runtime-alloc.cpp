@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <string>
 #include <sycl/sycl.hpp>
 
 static int g_tests_run    = 0;
@@ -48,6 +49,18 @@ static void enable_strict_mode_env() {
     (void) _putenv_s("GGML_SYCL_UNIFIED_ALLOC_STRICT", "1");
 #else
     (void) setenv("GGML_SYCL_UNIFIED_ALLOC_STRICT", "1", 1);
+#endif
+}
+
+static void set_env_var(const char * name, const char * value) {
+#if defined(_WIN32)
+    (void) _putenv_s(name, value ? value : "");
+#else
+    if (value) {
+        (void) setenv(name, value, 1);
+    } else {
+        (void) unsetenv(name);
+    }
 #endif
 }
 
@@ -535,6 +548,35 @@ static bool offload_host_alloc_stats_split_by_tag() {
     return true;
 }
 
+static bool host_zone_contiguous_alloc_skips_chunk_tail(sycl::queue & q) {
+    TEST_BEGIN("host_zone_contiguous_alloc_skips_chunk_tail");
+
+    const char * old_chunk_mb = std::getenv("GGML_SYCL_PINNED_CHUNK_MB");
+    const bool   had_chunk_mb = old_chunk_mb != nullptr;
+    std::string  saved_chunk_mb;
+    if (had_chunk_mb) {
+        saved_chunk_mb = old_chunk_mb;
+    }
+    set_env_var("GGML_SYCL_PINNED_CHUNK_MB", "16");
+
+    constexpr size_t  mib = 1024ull * 1024ull;
+    pinned_chunk_pool pool(q, 128ull * mib);
+    pool.configure_zones(12ull * mib, 2ull * mib, 40ull * mib, 2ull * mib);
+    set_env_var("GGML_SYCL_PINNED_CHUNK_MB", had_chunk_mb ? saved_chunk_mb.c_str() : nullptr);
+
+    TEST_ASSERT(pool.zones_configured(), "host zones were not configured");
+    TEST_ASSERT(pool.zone_largest_free_block(host_zone_id::STAGING) >= 16ull * mib,
+                "expected a full staging chunk after the partial chunk tail");
+
+    void * ptr = pool.zone_alloc(host_zone_id::STAGING, 8ull * mib, pinned_chunk_pool::DEFAULT_ALIGNMENT);
+
+    TEST_ASSERT(ptr != nullptr, "contiguous zone allocation should skip the partial chunk tail");
+    pool.zone_free(host_zone_id::STAGING, ptr);
+
+    TEST_PASS();
+    return true;
+}
+
 int main() {
     fprintf(stderr, "===========================================\n");
     fprintf(stderr, "Unified Runtime Allocator Tests\n");
@@ -577,6 +619,7 @@ int main() {
     ok &= offload_phase_roundtrip();
     ok &= offload_transition_wait_stats_split_by_phase();
     ok &= offload_host_alloc_stats_split_by_tag();
+    ok &= host_zone_contiguous_alloc_skips_chunk_tail(q);
 
     fprintf(stderr, "-------------------------------------------\n");
     fprintf(stderr, "Tests: %d run, %d passed\n", g_tests_run, g_tests_passed);

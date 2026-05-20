@@ -2053,7 +2053,9 @@ class unified_cache {
     void   grow_scratch_zone(size_t additional_bytes);
 
     size_t pinned_pool_budget() const { return host_arena_ ? host_arena_->budget() : 0; }
+
     size_t pinned_pool_committed() const { return host_arena_ ? host_arena_->allocated() : 0; }
+
     size_t pinned_pool_chunk_count() const { return host_arena_ ? host_arena_->chunk_count() : 0; }
 
     bool   contains_pinned(const void * ptr) const;
@@ -2479,6 +2481,24 @@ unified_cache * get_unified_cache_for_device(int    device_id,
 // Check if unified cache is enabled (via env var or auto-detection)
 bool unified_cache_enabled();
 
+static constexpr size_t GGML_SYCL_S1_PRELOAD_MAX_IN_FLIGHT_DEFAULT = 16;
+static constexpr size_t GGML_SYCL_S1_PRELOAD_MAX_IN_FLIGHT_MIN     = 4;
+static constexpr size_t GGML_SYCL_S1_PRELOAD_MAX_IN_FLIGHT_MAX     = 64;
+
+inline size_t s1_preload_max_in_flight_limit() {
+    size_t value = GGML_SYCL_S1_PRELOAD_MAX_IN_FLIGHT_DEFAULT;
+    if (const char * env = std::getenv("GGML_SYCL_S1_MAX_IN_FLIGHT")) {
+        value = static_cast<size_t>(std::atoi(env));
+    }
+    if (value < GGML_SYCL_S1_PRELOAD_MAX_IN_FLIGHT_MIN) {
+        value = GGML_SYCL_S1_PRELOAD_MAX_IN_FLIGHT_MIN;
+    }
+    if (value > GGML_SYCL_S1_PRELOAD_MAX_IN_FLIGHT_MAX) {
+        value = GGML_SYCL_S1_PRELOAD_MAX_IN_FLIGHT_MAX;
+    }
+    return value;
+}
+
 // Set unified cache budget (call before first use)
 // In PER_DEVICE mode, this sets budget per device
 void set_unified_cache_budget(size_t bytes);
@@ -2589,9 +2609,10 @@ struct alloc_intent {
 };
 
 struct alloc_request {
-    sycl::queue * queue  = nullptr;
-    int           device = -1;
-    size_t        size   = 0;
+    sycl::queue * queue                = nullptr;
+    int           device               = -1;
+    size_t        size                 = 0;
+    bool          suppress_failure_log = false;  // Caller handles nullptr locally (e.g. back-pressure/reuse).
     alloc_intent  intent;
 };
 

@@ -321,8 +321,8 @@ void pinned_chunk_pool::configure_zones(size_t weight_bytes,
         auto & z = zones_[static_cast<size_t>(zone_id)];
         z.size   = sz;
     };
-    set_zone(host_zone_id::WEIGHT,  weight_bytes);
-    set_zone(host_zone_id::KV,      kv_bytes);
+    set_zone(host_zone_id::WEIGHT, weight_bytes);
+    set_zone(host_zone_id::KV, kv_bytes);
     set_zone(host_zone_id::STAGING, staging_bytes);
     set_zone(host_zone_id::SCRATCH, scratch_bytes);
 
@@ -413,7 +413,7 @@ segmented_buffer pinned_chunk_pool::zone_alloc_segmented(host_zone_id zone, size
         size_t try_size = std::min(remaining, avail);
         // Round UP to TLSF alignment to avoid leaving a sub-alignment remainder
         // that would round to 0 on the next iteration and cause allocation failure.
-        try_size = (try_size + tlsf_align - 1) & ~(tlsf_align - 1);
+        try_size        = (try_size + tlsf_align - 1) & ~(tlsf_align - 1);
         if (try_size == 0 || try_size > avail) {
             continue;
         }
@@ -427,7 +427,7 @@ segmented_buffer pinned_chunk_pool::zone_alloc_segmented(host_zone_id zone, size
         // tlsf_align=256 → try_size=256).  Record only the bytes we need from
         // this segment so remaining -= consume never underflows.
         const size_t consume = std::min(try_size, remaining);
-        void * ptr = static_cast<uint8_t *>(chunks_[zcs.chunk_idx].base) + zcs.zone_start + offset;
+        void *       ptr     = static_cast<uint8_t *>(chunks_[zcs.chunk_idx].base) + zcs.zone_start + offset;
         result.segments.push_back({ ptr, consume });
         result.total_size += consume;
         remaining -= consume;
@@ -440,27 +440,37 @@ segmented_buffer pinned_chunk_pool::zone_alloc_segmented(host_zone_id zone, size
         }
         result.segments.clear();
         result.total_size = 0;
-        GGML_LOG_ERROR("[HOST-ZONE] segmented alloc failed: zone=%s size=%zu remaining=%zu\n",
-                       host_zone_name(zone), size, remaining);
+        GGML_LOG_ERROR("[HOST-ZONE] segmented alloc failed: zone=%s size=%zu remaining=%zu\n", host_zone_name(zone),
+                       size, remaining);
         return {};
     }
     return result;
 }
 
 void * pinned_chunk_pool::zone_alloc(host_zone_id zone, size_t size, size_t alignment) {
-    segmented_buffer buf = zone_alloc_segmented(zone, size, alignment);
-    if (buf.segments.empty()) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const size_t                zi = static_cast<size_t>(zone);
+    if (zi >= static_cast<size_t>(host_zone_id::COUNT) || !zones_configured_) {
         return nullptr;
     }
-    if (buf.segments.size() > 1) {
-        // Contiguous allocation required — free the segments and fail.
-        // (Caller should use zone_alloc_segmented for multi-chunk buffers.)
-        for (auto & seg : buf.segments) {
-            zone_free(zone, seg.ptr, seg.size);
+
+    size                    = align_up(size, alignment);
+    const size_t tlsf_align = std::max(alignment, (size_t) 256);
+
+    for (auto & zcs : zone_allocators_[zi]) {
+        if (!zcs.allocator || zcs.allocator->largest_free_block() < size) {
+            continue;
         }
-        return nullptr;
+
+        const size_t offset = zcs.allocator->allocate(size, tlsf_align);
+        if (offset == SIZE_MAX) {
+            continue;
+        }
+
+        return static_cast<uint8_t *>(chunks_[zcs.chunk_idx].base) + zcs.zone_start + offset;
     }
-    return buf.segments[0].ptr;
+
+    return nullptr;
 }
 
 void pinned_chunk_pool::zone_free_unlocked(host_zone_id zone, void * ptr, size_t /* size */) {
@@ -509,7 +519,7 @@ void pinned_chunk_pool::zone_reset(host_zone_id zone) {
 
 size_t pinned_chunk_pool::zone_used(host_zone_id zone) const {
     std::lock_guard<std::mutex> lock(mutex_);
-    const size_t zi = static_cast<size_t>(zone);
+    const size_t                zi = static_cast<size_t>(zone);
     if (zi >= static_cast<size_t>(host_zone_id::COUNT) || !zones_configured_) {
         return 0;
     }
@@ -533,7 +543,7 @@ size_t pinned_chunk_pool::zone_capacity(host_zone_id zone) const {
 // therefore cannot consume a cross-chunk (fragmented) allocation.
 size_t pinned_chunk_pool::zone_largest_free_block(host_zone_id zone) const {
     std::lock_guard<std::mutex> lock(mutex_);
-    const size_t zi = static_cast<size_t>(zone);
+    const size_t                zi = static_cast<size_t>(zone);
     if (zi >= static_cast<size_t>(host_zone_id::COUNT) || !zones_configured_) {
         return 0;
     }
@@ -677,10 +687,9 @@ void * pinned_chunk_pool::allocate_from_chunks(std::vector<chunk> & chunks,
     const size_t tlsf_align = std::max(alignment, (size_t) 256);
 
     if (pinned_trace_enabled()) {
-        GGML_LOG_INFO(
-            "[SYCL] pinned alloc request: size=%zu align=%zu chunks=%zu used=%.1f GB mode=%s\n",
-            size, alignment, chunks.size(), total_allocated_ / (1024.0 * 1024.0 * 1024.0),
-            runtime_pool ? "runtime" : "zone-base");
+        GGML_LOG_INFO("[SYCL] pinned alloc request: size=%zu align=%zu chunks=%zu used=%.1f GB mode=%s\n", size,
+                      alignment, chunks.size(), total_allocated_ / (1024.0 * 1024.0 * 1024.0),
+                      runtime_pool ? "runtime" : "zone-base");
     }
 
     for (auto & c : chunks) {
@@ -711,9 +720,8 @@ void * pinned_chunk_pool::allocate_from_chunks(std::vector<chunk> & chunks,
     if (offset != SIZE_MAX) {
         return static_cast<char *>(c.base) + offset;
     }
-    GGML_LOG_ERROR(
-        "[SYCL] Pinned pool TLSF allocation %zu MB failed in new chunk %zu MB.\n",
-        size / (1024 * 1024), c.size / (1024 * 1024));
+    GGML_LOG_ERROR("[SYCL] Pinned pool TLSF allocation %zu MB failed in new chunk %zu MB.\n", size / (1024 * 1024),
+                   c.size / (1024 * 1024));
     return nullptr;
 }
 
@@ -815,9 +823,9 @@ bool pinned_chunk_pool::grow_into(std::vector<chunk> & chunks, size_t min_size, 
     auto alloc = std::make_unique<tlsf_allocator>(chunk_size);
     // Note: chunk contains pool_atomic_u32 lease_count — default-construct it in place.
     chunks.emplace_back();
-    chunks.back().base        = ptr;
-    chunks.back().size        = chunk_size;
-    chunks.back().allocator   = std::move(alloc);
+    chunks.back().base      = ptr;
+    chunks.back().size      = chunk_size;
+    chunks.back().allocator = std::move(alloc);
     // lease_count default-initializes to 0.
     total_allocated_ += chunk_size;
 
@@ -890,7 +898,7 @@ void pinned_chunk_pool::release_chunk_lease(uint64_t handle) {
     const size_t idx        = static_cast<size_t>(handle & ~CHUNK_KIND_RUNTIME_BIT);
 
     std::lock_guard<std::mutex> lock(mutex_);
-    auto & vec = is_runtime ? runtime_chunks_ : chunks_;
+    auto &                      vec = is_runtime ? runtime_chunks_ : chunks_;
     if (idx >= vec.size()) {
         GGML_LOG_ERROR("[PINNED-POOL] release_chunk_lease: invalid handle=0x%" PRIx64 " (idx=%zu, size=%zu)\n", handle,
                        idx, vec.size());
@@ -912,7 +920,7 @@ bool pinned_chunk_pool::chunk_has_leases(uint64_t handle) const {
     const size_t idx        = static_cast<size_t>(handle & ~CHUNK_KIND_RUNTIME_BIT);
 
     std::lock_guard<std::mutex> lock(mutex_);
-    const auto & vec        = is_runtime ? runtime_chunks_ : chunks_;
+    const auto &                vec = is_runtime ? runtime_chunks_ : chunks_;
     if (idx >= vec.size()) {
         return false;
     }
@@ -924,7 +932,7 @@ void pinned_chunk_pool::wait_for_chunk_drain_or_assert(const chunk & c, const ch
     // lock-free — writers (acquire/release) acquire the mutex before
     // mutating the vector, but the atomic count itself is observable
     // without the lock.
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    const auto deadline    = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     uint32_t   outstanding = c.lease_count.load();
     if (outstanding == 0) {
         return;

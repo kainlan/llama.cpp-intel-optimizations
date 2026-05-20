@@ -15494,11 +15494,7 @@ static void ggml_sycl_preload_model_weights() {
             // create GPU idle gaps), we wait only on the OLDEST event when
             // the window fills.  In-order queue guarantee: completing event N
             // implies all events <= N are complete.
-            constexpr size_t S1_MAX_IN_FLIGHT_DEFAULT = 16;
-            size_t           s1_max_in_flight         = S1_MAX_IN_FLIGHT_DEFAULT;
-            if (const char * env = std::getenv("GGML_SYCL_S1_MAX_IN_FLIGHT")) {
-                s1_max_in_flight = std::max<size_t>(4, std::min<size_t>(64, std::atoi(env)));
-            }
+            const size_t            s1_max_in_flight = ggml_sycl::s1_preload_max_in_flight_limit();
             std::deque<sycl::event> s1_in_flight;
             size_t                  s1_drain_count = 0;
 

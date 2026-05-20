@@ -6714,11 +6714,16 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
             if (req.intent.role == alloc_role::WEIGHT) {
                 ptr = ggml_sycl_malloc_host(alloc_size, *req.queue, "unified_alloc:weight");
             } else {
-                GGML_LOG_ERROR(
-                    "[UNIFIED-ALLOC] allocation failed: %zu bytes, tier=%s. "
-                    "All inference allocations must go through the unified cache zone system. "
-                    "Consider increasing host zone budgets or enabling dynamic pool growth.\n",
-                    alloc_size, alloc_tier_name(tier));
+                if (req.suppress_failure_log) {
+                    GGML_SYCL_DEBUG("[UNIFIED-ALLOC] allocation miss: %zu bytes, tier=%s\n", alloc_size,
+                                    alloc_tier_name(tier));
+                } else {
+                    GGML_LOG_ERROR(
+                        "[UNIFIED-ALLOC] allocation failed: %zu bytes, tier=%s. "
+                        "All inference allocations must go through the unified cache zone system. "
+                        "Consider increasing host zone budgets or enabling dynamic pool growth.\n",
+                        alloc_size, alloc_tier_name(tier));
+                }
                 return false;
             }
         }
@@ -11712,12 +11717,21 @@ static void populate_host_zone_sizing(placement_plan &                          
 
     plan.host_zone_weight_bytes =
         static_cast<size_t>(static_cast<double>(plan.weight_host_bytes) * k_weight_headroom_ratio);
-    plan.host_zone_kv_bytes = std::max<size_t>(k_min_zone_bytes, plan.kv_host_bytes);
-    // Staging zone: baseline (2x max tensor + headroom) plus expert bias D2H,
-    // cross-device MoE routing CONTROL ids, and TP staging.
+    plan.host_zone_kv_bytes               = std::max<size_t>(k_min_zone_bytes, plan.kv_host_bytes);
+    // Staging zone: S1 preload may keep multiple async H2D/reorder submissions
+    // alive. CPU-side layout conversion can hold both the source staging copy
+    // and the converted destination staging copy until the corresponding copy
+    // event completes, so size this zone from the same in-flight window that
+    // preload uses instead of a fixed two-buffer heuristic.
+    const size_t s1_in_flight             = s1_preload_max_in_flight_limit();
+    const size_t s1_reorder_guard_bytes   = 2ull * 1024ull * 1024ull;
+    const size_t s1_per_inflight_bytes    = plan.max_tensor_bytes * 2 + s1_reorder_guard_bytes;
+    const size_t s1_preload_staging_bytes = s1_per_inflight_bytes * s1_in_flight;
     plan.host_zone_staging_bytes =
-        std::max<size_t>(k_min_zone_bytes, plan.max_tensor_bytes * 2 + k_tp_staging_headroom + plan.expert_bias_bytes +
+        std::max<size_t>(k_min_zone_bytes, s1_preload_staging_bytes + k_tp_staging_headroom + plan.expert_bias_bytes +
                                                plan.moe_routing_ids_bytes + plan.tp_staging_buffer_bytes);
+    GGML_LOG_INFO("[SYCL-PLAN] Host staging zone: s1_window=%zu per_inflight=%.1f MB total=%.1f MB\n", s1_in_flight,
+                  s1_per_inflight_bytes / (1024.0 * 1024.0), plan.host_zone_staging_bytes / (1024.0 * 1024.0));
     // SCRATCH zone: baseline (max_tensor + headroom) plus oneDNN reorder, MoE Q8_1 workspace,
     // PP CPU expert act/out staging, MoE device routing buffers (expert pointer tables),
     // TP compute buffers, and DMA staging pool (device double-buffer for weight streaming).
