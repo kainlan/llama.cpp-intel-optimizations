@@ -704,14 +704,15 @@ struct ggml_tensor_tp_info {
 
 // Tensor layout modes (for backend-specific layout optimizations)
 enum ggml_layout_mode {
-    GGML_LAYOUT_AOS = 0,           // Array-of-Structures (original/mmap)
-    GGML_LAYOUT_SOA,               // Structure-of-Arrays
-    GGML_LAYOUT_COALESCED,         // Warp-coalesced tile layout
-    GGML_LAYOUT_MXFP4_I8,          // MXFP4 predecoded int8 mantissas + E8M0 scales
-    GGML_LAYOUT_XMX_TILED,         // XMX tile-aligned layout (MXFP4 MoE)
-    GGML_LAYOUT_XMX_GEMM_TILED,    // XMX GEMM tiled layout (quant/int8 weights)
-    GGML_LAYOUT_ONEDNN_PACKED,     // oneDNN packed weight layout (matmul primitive)
-    GGML_LAYOUT_ONEDNN_WOQ,        // oneDNN WoQ layout (s4 + grouped scales/zp)
+    GGML_LAYOUT_AOS = 0,         // Array-of-Structures (original/mmap)
+    GGML_LAYOUT_SOA,             // Structure-of-Arrays
+    GGML_LAYOUT_COALESCED,       // Warp-coalesced tile layout
+    GGML_LAYOUT_MXFP4_I8,        // MXFP4 predecoded int8 mantissas + E8M0 scales
+    GGML_LAYOUT_XMX_TILED,       // XMX tile-aligned layout (MXFP4 MoE)
+    GGML_LAYOUT_XMX_GEMM_TILED,  // XMX GEMM tiled layout (quant/int8 weights)
+    GGML_LAYOUT_ONEDNN_PACKED,   // oneDNN packed weight layout (matmul primitive)
+    GGML_LAYOUT_ONEDNN_WOQ,      // oneDNN WoQ layout (s4 + grouped scales/zp)
+    GGML_LAYOUT_MXFP4_DPAS,      // MXFP4 DPAS-ready predecoded int8 tiles + packed FP32 scales
 };
 
 // Backend-managed layout metadata for a tensor
@@ -728,7 +729,7 @@ struct ggml_tensor_layout {
     int64_t        n_experts;
 
     // oneDNN packed layout metadata (valid when mode == GGML_LAYOUT_ONEDNN_PACKED or GGML_LAYOUT_ONEDNN_WOQ)
-    int64_t        onednn_pack_m;  // M dimension used during oneDNN packing (0 = unset)
+    int64_t onednn_pack_m;  // M dimension used during oneDNN packing (0 = unset)
 
     // XMX-specific metadata (valid when mode == GGML_LAYOUT_XMX_TILED)
     struct {

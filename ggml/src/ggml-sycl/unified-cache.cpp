@@ -5243,7 +5243,7 @@ void unified_cache::print_stats() const {
 
     size_t        dense = 0, experts = 0;
     size_t        dense_bytes = 0, expert_bytes = 0;
-    constexpr int layout_count                = GGML_LAYOUT_ONEDNN_WOQ + 1;
+    constexpr int layout_count                = GGML_LAYOUT_MXFP4_DPAS + 1;
     size_t        layout_counts[layout_count] = {};
     size_t        layout_bytes[layout_count]  = {};
     for (const auto & pair : entries_) {
@@ -5268,12 +5268,14 @@ void unified_cache::print_stats() const {
                     used_.load() / (1024.0f * 1024.0f), budget_ / (1024.0f * 1024.0f));
     GGML_LOG_INFO(
         "[UNIFIED-CACHE] Layouts: aos=%zu (%.1f MB), soa=%zu (%.1f MB), coalesced=%zu (%.1f MB), "
-        "mxfp4_i8=%zu (%.1f MB), xmx_tiled=%zu (%.1f MB), xmx_gemm_tiled=%zu (%.1f MB), "
+        "mxfp4_i8=%zu (%.1f MB), mxfp4_dpas=%zu (%.1f MB), "
+        "xmx_tiled=%zu (%.1f MB), xmx_gemm_tiled=%zu (%.1f MB), "
         "onednn_packed=%zu (%.1f MB), onednn_woq=%zu (%.1f MB)\n",
         layout_counts[GGML_LAYOUT_AOS], layout_bytes[GGML_LAYOUT_AOS] / (1024.0f * 1024.0f),
         layout_counts[GGML_LAYOUT_SOA], layout_bytes[GGML_LAYOUT_SOA] / (1024.0f * 1024.0f),
         layout_counts[GGML_LAYOUT_COALESCED], layout_bytes[GGML_LAYOUT_COALESCED] / (1024.0f * 1024.0f),
         layout_counts[GGML_LAYOUT_MXFP4_I8], layout_bytes[GGML_LAYOUT_MXFP4_I8] / (1024.0f * 1024.0f),
+        layout_counts[GGML_LAYOUT_MXFP4_DPAS], layout_bytes[GGML_LAYOUT_MXFP4_DPAS] / (1024.0f * 1024.0f),
         layout_counts[GGML_LAYOUT_XMX_TILED], layout_bytes[GGML_LAYOUT_XMX_TILED] / (1024.0f * 1024.0f),
         layout_counts[GGML_LAYOUT_XMX_GEMM_TILED], layout_bytes[GGML_LAYOUT_XMX_GEMM_TILED] / (1024.0f * 1024.0f),
         layout_counts[GGML_LAYOUT_ONEDNN_PACKED], layout_bytes[GGML_LAYOUT_ONEDNN_PACKED] / (1024.0f * 1024.0f),
@@ -9814,6 +9816,8 @@ static const char * scratch_layout_name(ggml_layout_mode layout) {
             return "coalesced";
         case GGML_LAYOUT_MXFP4_I8:
             return "mxfp4_i8";
+        case GGML_LAYOUT_MXFP4_DPAS:
+            return "mxfp4_dpas";
         case GGML_LAYOUT_XMX_TILED:
             return "xmx_tiled";
         case GGML_LAYOUT_XMX_GEMM_TILED:

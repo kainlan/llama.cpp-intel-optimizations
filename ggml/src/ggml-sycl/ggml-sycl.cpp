@@ -1710,6 +1710,9 @@ static ggml_sycl_cache_id ggml_sycl_layout_specific_moe_expert_cache_key(ggml_sy
     if (layout == GGML_LAYOUT_MXFP4_I8) {
         constexpr uint64_t layout_key_tag = 0x4d584650344938ull;  // "MXFP4I8"
         key.aux_id                        = ggml_sycl::detail::cache_hash_combine(key.aux_id, layout_key_tag);
+    } else if (layout == GGML_LAYOUT_MXFP4_DPAS) {
+        constexpr uint64_t layout_key_tag = 0x4d584650344450ull;  // "MXFP4DP"
+        key.aux_id                        = ggml_sycl::detail::cache_hash_combine(key.aux_id, layout_key_tag);
     }
     return key;
 }
@@ -3043,7 +3046,8 @@ static bool ggml_sycl_materialize_planned_expert_layout(const ggml_tensor * src0
     ggml_sycl_reorder_fill_ctx reorder_ctx{};
     cache_layout_fill_fn       fill_fn  = nullptr;
     const void *               fill_ctx = nullptr;
-    if (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED || layout == GGML_LAYOUT_MXFP4_I8) {
+    if (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED || layout == GGML_LAYOUT_MXFP4_I8 ||
+        layout == GGML_LAYOUT_MXFP4_DPAS) {
         reorder_ctx.type          = meta->type;
         reorder_ctx.ncols         = meta->ne0;
         reorder_ctx.nrows         = meta->ne1;
@@ -6503,6 +6507,8 @@ static const char * ggml_sycl_layout_mode_name(ggml_layout_mode mode) {
             return "coalesced";
         case GGML_LAYOUT_MXFP4_I8:
             return "mxfp4_i8";
+        case GGML_LAYOUT_MXFP4_DPAS:
+            return "mxfp4_dpas";
         case GGML_LAYOUT_XMX_TILED:
             return "xmx_tiled";
         case GGML_LAYOUT_XMX_GEMM_TILED:
@@ -6538,6 +6544,10 @@ static bool ggml_sycl_layout_mode_from_string(const char * value, layout_mode * 
     }
     if (lower == "mxfp4_i8" || lower == "mxfp4_predecoded" || lower == "predecoded_i8") {
         *out = GGML_LAYOUT_MXFP4_I8;
+        return true;
+    }
+    if (lower == "mxfp4_dpas" || lower == "mxfp4_dpas_ps" || lower == "mxfp4_predecoded_ps") {
+        *out = GGML_LAYOUT_MXFP4_DPAS;
         return true;
     }
     if (lower == "xmx_tiled" || lower == "xmx") {
@@ -8968,10 +8978,10 @@ static moe_layer_grouped_dpas_decision moe_layer_grouped_dpas_check(const moe_la
     decision.n_tile_repeat  = decision.rows >= 4 * caps.N ? 2 : 1;
     decision.reason         = "shape-eligible";
 
-    // The proven production candidate needs a predecoded/packed-scale layout.
-    // MXFP4_I8 is the current model-load materialized stepping stone; SOA groups
-    // are shape-eligible but still need the DPAS-native layout materialized.
-    if (group.layout == GGML_LAYOUT_MXFP4_I8) {
+    // The proven production candidate needs the packed-scale DPAS layout.
+    // MXFP4_I8 is a separate MMVQ-oriented predecoded layout and is not enough
+    // for the grouped DPAS executor.
+    if (group.layout == GGML_LAYOUT_MXFP4_DPAS) {
         decision.layout_ready = true;
         decision.reason       = "layout-ready";
     }
@@ -9271,6 +9281,7 @@ struct moe_layer_group_profile_accum {
     int64_t                               coalesced_roles         = 0;
     int64_t                               aos_roles               = 0;
     int64_t                               mxfp4_i8_roles          = 0;
+    int64_t                               mxfp4_dpas_roles        = 0;
     int64_t                               dpas_shape_groups       = 0;
     int64_t                               dpas_shape_rows         = 0;
     int64_t                               dpas_ready_groups       = 0;
@@ -9340,6 +9351,8 @@ static void moe_layer_group_profile_record(const moe_layer_decode_plan &      pl
         p.coalesced_roles++;
     } else if (plan.layout == GGML_LAYOUT_MXFP4_I8) {
         p.mxfp4_i8_roles++;
+    } else if (plan.layout == GGML_LAYOUT_MXFP4_DPAS) {
+        p.mxfp4_dpas_roles++;
     } else if (plan.layout == GGML_LAYOUT_AOS) {
         p.aos_roles++;
     }
@@ -9423,7 +9436,7 @@ static void moe_layer_group_profile_record(const moe_layer_decode_plan &      pl
             "dpas_groups shape=%lld ready=%lld nt2=%lld dpas_rows shape=%lld ready=%lld max=%lld "
             "dpas_blocked capability=%lld layout=%lld residency=%lld rows=%lld shape=%lld "
             "handle_residency device=%lld host=%lld missing=%lld layout_mismatch=%lld "
-            "layouts soa=%lld coalesced=%lld mxfp4_i8=%lld aos=%lld last_executor=%s\n",
+            "layouts soa=%lld coalesced=%lld mxfp4_i8=%lld mxfp4_dpas=%lld aos=%lld last_executor=%s\n",
             (long long) p.roles, ggml_sycl_moe_group_profile_window(), (long long) layers, device,
             ggml_sycl_layout_mode_name(plan.layout), (long long) p.entries, (long long) groups,
             groups > 0 ? static_cast<double>(p.entries) / static_cast<double>(groups) : 0.0, (long long) max_rows,
@@ -9436,7 +9449,8 @@ static void moe_layer_group_profile_record(const moe_layer_decode_plan &      pl
             (long long) p.dpas_blocked_residency, (long long) p.dpas_blocked_rows, (long long) p.dpas_blocked_shape,
             (long long) p.device_handles, (long long) p.host_handles, (long long) p.missing_handles,
             (long long) p.layout_mismatch, (long long) p.soa_roles, (long long) p.coalesced_roles,
-            (long long) p.mxfp4_i8_roles, (long long) p.aos_roles, last_executor ? last_executor : "?");
+            (long long) p.mxfp4_i8_roles, (long long) p.mxfp4_dpas_roles, (long long) p.aos_roles,
+            last_executor ? last_executor : "?");
     p = {};
 }
 
@@ -13341,6 +13355,7 @@ static void reorder_q6_k_cpu(void * dst_soa, const void * src_aos, size_t nblock
 static bool reorder_q6_k_coalesced_cpu(void * dst_coalesced, const void * src_aos, int ncols, int nrows);
 static void reorder_mxfp4_cpu(void * dst_soa, const void * src_aos, int ncols, int nrows);
 static void reorder_mxfp4_i8_cpu(void * dst_i8, const void * src_aos, int ncols, int nrows);
+static void reorder_mxfp4_dpas_cpu(void * dst_dpas, size_t dst_size, const void * src_aos, int ncols, int nrows);
 
 static bool reorder_mxfp4_coalesced_cpu(void * dst_coalesced, const void * src_aos, int ncols, int nrows);
 
@@ -13890,6 +13905,23 @@ layout_mode ggml_sycl_adjust_layout_for_tensor(const ggml_tensor * tensor, layou
         }
     }
 
+    if (resolved == GGML_LAYOUT_MXFP4_DPAS) {
+        bool ok =
+            tensor->type == GGML_TYPE_MXFP4 && (tensor->ne[0] % GGML_SYCL_MXFP4_MOE_XMX_K) == 0 && tensor->ne[1] > 0;
+        if (ok) {
+            ok = device >= 0 && device < ggml_sycl_info().device_count;
+        }
+        if (ok) {
+            const auto & caps = ggml_sycl_info().devices[device].xmx_caps;
+            ok = xmx_capabilities_match_int8_tile(caps, GGML_SYCL_MXFP4_MOE_XMX_M, GGML_SYCL_MXFP4_MOE_XMX_N,
+                                                  GGML_SYCL_MXFP4_MOE_XMX_K) &&
+                 xmx_capabilities_support_sub_group(caps, GGML_SYCL_MXFP4_MOE_XMX_SG);
+        }
+        if (!ok) {
+            resolved = GGML_LAYOUT_SOA;
+        }
+    }
+
     if (resolved == GGML_LAYOUT_XMX_GEMM_TILED) {
 #if defined(GGML_SYCL_XMX_GEMM) && defined(GGML_SYCL_MMQ_XMX)
         bool xmx_ok = g_ggml_sycl_use_xmx_gemm != 0;
@@ -14275,6 +14307,10 @@ static bool ggml_sycl_reorder_weight_cpu(void * dst, const void * src, const ggm
                 return true;
             }
         case GGML_TYPE_MXFP4:
+            if (ctx.layout == GGML_LAYOUT_MXFP4_DPAS) {
+                reorder_mxfp4_dpas_cpu(dst, ctx.dst_bytes, src, ctx.ncols, ctx.nrows);
+                return true;
+            }
             if (ctx.layout == GGML_LAYOUT_MXFP4_I8) {
                 reorder_mxfp4_i8_cpu(dst, src, ctx.ncols, ctx.nrows);
                 return true;
@@ -14474,6 +14510,40 @@ static size_t ggml_sycl_align_up(size_t value, size_t alignment) {
     }
     const size_t mask = alignment - 1;
     return (value + mask) & ~mask;
+}
+
+static constexpr int GGML_SYCL_MXFP4_DPAS_REPEAT = 8;
+static constexpr int GGML_SYCL_MXFP4_DPAS_K      = 32;
+
+static size_t ggml_sycl_mxfp4_dpas_padded_rows(int64_t nrows) {
+    if (nrows <= 0) {
+        return 0;
+    }
+    return ggml_sycl_align_up(static_cast<size_t>(nrows), GGML_SYCL_MXFP4_DPAS_REPEAT);
+}
+
+static size_t ggml_sycl_mxfp4_dpas_weight_i8_bytes(int64_t ncols, int64_t nrows) {
+    if (ncols <= 0 || nrows <= 0 || (ncols % GGML_SYCL_MXFP4_DPAS_K) != 0) {
+        return 0;
+    }
+    const size_t rows_padded = ggml_sycl_mxfp4_dpas_padded_rows(nrows);
+    const size_t k_tiles     = static_cast<size_t>(ncols / GGML_SYCL_MXFP4_DPAS_K);
+    return rows_padded * k_tiles * GGML_SYCL_MXFP4_DPAS_K;
+}
+
+static size_t ggml_sycl_mxfp4_dpas_scale_offset(int64_t ncols, int64_t nrows) {
+    const size_t i8_bytes = ggml_sycl_mxfp4_dpas_weight_i8_bytes(ncols, nrows);
+    return i8_bytes == 0 ? 0 : ggml_sycl_align_up(i8_bytes, 64);
+}
+
+static size_t ggml_sycl_layout_bytes_mxfp4_dpas_for_dims(ggml_type type, int64_t ncols, int64_t nrows) {
+    if (type != GGML_TYPE_MXFP4 || ncols <= 0 || nrows <= 0 || (ncols % GGML_SYCL_MXFP4_DPAS_K) != 0) {
+        return 0;
+    }
+    const size_t rows_padded = ggml_sycl_mxfp4_dpas_padded_rows(nrows);
+    const size_t k_tiles     = static_cast<size_t>(ncols / GGML_SYCL_MXFP4_DPAS_K);
+    const size_t scale_off   = ggml_sycl_mxfp4_dpas_scale_offset(ncols, nrows);
+    return scale_off + rows_padded * k_tiles * sizeof(float);
 }
 
 static ggml_sycl_onednn_woq_layout_info ggml_sycl_onednn_woq_layout_for_dims(int64_t ncols, int64_t nrows) {
@@ -14997,9 +15067,9 @@ static void ggml_sycl_drop_non_target_cache_entries(ggml_sycl::unified_cache * c
         return;
     }
     const ggml_layout_mode layouts[] = {
-        GGML_LAYOUT_AOS,           GGML_LAYOUT_SOA,        GGML_LAYOUT_COALESCED,
-        GGML_LAYOUT_MXFP4_I8,      GGML_LAYOUT_XMX_TILED,  GGML_LAYOUT_XMX_GEMM_TILED,
-        GGML_LAYOUT_ONEDNN_PACKED, GGML_LAYOUT_ONEDNN_WOQ,
+        GGML_LAYOUT_AOS,        GGML_LAYOUT_SOA,       GGML_LAYOUT_COALESCED,      GGML_LAYOUT_MXFP4_I8,
+        GGML_LAYOUT_MXFP4_DPAS, GGML_LAYOUT_XMX_TILED, GGML_LAYOUT_XMX_GEMM_TILED, GGML_LAYOUT_ONEDNN_PACKED,
+        GGML_LAYOUT_ONEDNN_WOQ,
 
     };
     for (ggml_layout_mode mode : layouts) {
@@ -15030,9 +15100,9 @@ static void ggml_sycl_drop_all_weight_cache_entries(ggml_sycl::unified_cache * c
     }
 
     const ggml_layout_mode layouts[] = {
-        GGML_LAYOUT_AOS,           GGML_LAYOUT_SOA,        GGML_LAYOUT_COALESCED,
-        GGML_LAYOUT_MXFP4_I8,      GGML_LAYOUT_XMX_TILED,  GGML_LAYOUT_XMX_GEMM_TILED,
-        GGML_LAYOUT_ONEDNN_PACKED, GGML_LAYOUT_ONEDNN_WOQ,
+        GGML_LAYOUT_AOS,        GGML_LAYOUT_SOA,       GGML_LAYOUT_COALESCED,      GGML_LAYOUT_MXFP4_I8,
+        GGML_LAYOUT_MXFP4_DPAS, GGML_LAYOUT_XMX_TILED, GGML_LAYOUT_XMX_GEMM_TILED, GGML_LAYOUT_ONEDNN_PACKED,
+        GGML_LAYOUT_ONEDNN_WOQ,
     };
 
     for (ggml_layout_mode mode : layouts) {
@@ -15063,9 +15133,9 @@ static void ggml_sycl_drop_non_target_expert_entries(ggml_sycl::unified_cache * 
         return;
     }
     const ggml_layout_mode layouts[] = {
-        GGML_LAYOUT_AOS,           GGML_LAYOUT_SOA,        GGML_LAYOUT_COALESCED,
-        GGML_LAYOUT_MXFP4_I8,      GGML_LAYOUT_XMX_TILED,  GGML_LAYOUT_XMX_GEMM_TILED,
-        GGML_LAYOUT_ONEDNN_PACKED, GGML_LAYOUT_ONEDNN_WOQ,
+        GGML_LAYOUT_AOS,        GGML_LAYOUT_SOA,       GGML_LAYOUT_COALESCED,      GGML_LAYOUT_MXFP4_I8,
+        GGML_LAYOUT_MXFP4_DPAS, GGML_LAYOUT_XMX_TILED, GGML_LAYOUT_XMX_GEMM_TILED, GGML_LAYOUT_ONEDNN_PACKED,
+        GGML_LAYOUT_ONEDNN_WOQ,
     };
     for (ggml_layout_mode mode : layouts) {
         if (mode == target) {
@@ -15151,7 +15221,8 @@ static bool ggml_sycl_preload_moe_experts(const ggml_tensor * src0, int device, 
 #endif
     }
     const bool src0_is_device = ggml_sycl_get_alloc_type(src0->data) == sycl::usm::alloc::device;
-    if (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED || layout == GGML_LAYOUT_MXFP4_I8) {
+    if (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED || layout == GGML_LAYOUT_MXFP4_I8 ||
+        layout == GGML_LAYOUT_MXFP4_DPAS) {
         reorder_ctx.type  = src0->type;
         reorder_ctx.ncols = ncols;
 
@@ -15209,7 +15280,8 @@ static bool ggml_sycl_preload_moe_experts(const ggml_tensor * src0, int device, 
         // Determine fill function for layout conversion
         ggml_sycl::cache_layout_fill_fn fill_fn  = nullptr;
         const void *                    fill_ctx = nullptr;
-        if (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED || layout == GGML_LAYOUT_MXFP4_I8) {
+        if (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED || layout == GGML_LAYOUT_MXFP4_I8 ||
+            layout == GGML_LAYOUT_MXFP4_DPAS) {
             fill_fn  = ggml_sycl_fill_reordered_host;
             fill_ctx = &reorder_ctx;
         } else if (layout == GGML_LAYOUT_XMX_TILED) {
@@ -15504,7 +15576,7 @@ static void ggml_sycl_preload_model_weights() {
                     ggml_sycl_reorder_fill_ctx      reorder_ctx{};
                     ggml_sycl_xmx_tiled_fill_ctx    tiled_ctx{};
                     if (preload_layout == GGML_LAYOUT_SOA || preload_layout == GGML_LAYOUT_COALESCED ||
-                        preload_layout == GGML_LAYOUT_MXFP4_I8) {
+                        preload_layout == GGML_LAYOUT_MXFP4_I8 || preload_layout == GGML_LAYOUT_MXFP4_DPAS) {
                         reorder_ctx.type          = tensor->type;
                         reorder_ctx.ncols         = ncols;
                         reorder_ctx.nrows         = nrows;
@@ -15629,7 +15701,7 @@ static void ggml_sycl_preload_model_weights() {
                         }
 
                         if (preload_layout == GGML_LAYOUT_SOA || preload_layout == GGML_LAYOUT_COALESCED ||
-                            preload_layout == GGML_LAYOUT_MXFP4_I8) {
+                            preload_layout == GGML_LAYOUT_MXFP4_I8 || preload_layout == GGML_LAYOUT_MXFP4_DPAS) {
                             reorder_ctx.src_is_device = tensor_source_is_device;
                         }
                         auto result = ggml_sycl::unified_cache_direct_stage_expert(device, key, expert_aos, expert_size,
@@ -16253,14 +16325,15 @@ void * ggml_sycl_get_weight_layout_ptr(const ggml_tensor * tensor, int device, l
     const bool strict_aos = ggml_sycl_unified_dispatch_enabled() && ggml_sycl::should_use_unified(tensor->type) &&
                             target == GGML_LAYOUT_AOS;
     layout_mode resolved = strict_aos ? GGML_LAYOUT_AOS : ggml_sycl_adjust_layout_for_tensor(tensor, target, device);
-    const bool  host_layout_supported = (resolved == GGML_LAYOUT_AOS || resolved == GGML_LAYOUT_SOA ||
-                                        resolved == GGML_LAYOUT_COALESCED || resolved == GGML_LAYOUT_MXFP4_I8 ||
-                                        resolved == GGML_LAYOUT_XMX_GEMM_TILED || resolved == GGML_LAYOUT_XMX_TILED);
+    const bool  host_layout_supported =
+        (resolved == GGML_LAYOUT_AOS || resolved == GGML_LAYOUT_SOA || resolved == GGML_LAYOUT_COALESCED ||
+         resolved == GGML_LAYOUT_MXFP4_I8 || resolved == GGML_LAYOUT_MXFP4_DPAS ||
+         resolved == GGML_LAYOUT_XMX_GEMM_TILED || resolved == GGML_LAYOUT_XMX_TILED);
     // Only prefer host placement when VRAM budget is actually exceeded AND GPU
     // streaming is the fallback (no CPU offload). When the model fits in VRAM,
     // let the cache upload everything to device for maximum performance.
     // GGML_SYCL_FORCE_VRAM=1 overrides this to always prefer VRAM (for debugging).
-    bool        prefer_host_default   = ggml_backend_sycl_weights_evictable() && !src_is_device &&
+    bool prefer_host_default = ggml_backend_sycl_weights_evictable() && !src_is_device &&
                                ggml_sycl::unified_cache_is_budget_exceeded(device) && !ggml_sycl_force_vram_enabled() &&
                                !ggml_sycl_cpu_offload_available();
     // For reordered/tiled layouts, prefer device placement to avoid non-USM host pointers
@@ -30792,6 +30865,44 @@ static void reorder_mxfp4_i8_cpu(void * dst_i8, const void * src_aos, int ncols,
     }
 }
 
+// DPAS-ready MXFP4 layout for grouped MoE rows:
+//   [int8 weight tiles: tile_m(8) x k_tile(32)][packed fp32 scales].
+// The scale tile order mirrors the int8 tile order so a grouped DPAS executor
+// can load one K tile of 8 rows with contiguous scale lanes.
+static void reorder_mxfp4_dpas_cpu(void * dst_dpas, size_t dst_size, const void * src_aos, int ncols, int nrows) {
+    const size_t required = ggml_sycl_layout_bytes_mxfp4_dpas_for_dims(GGML_TYPE_MXFP4, ncols, nrows);
+    if (!dst_dpas || !src_aos || required == 0 || dst_size < required) {
+        return;
+    }
+
+    std::memset(dst_dpas, 0, required);
+
+    const size_t    blocks_per_row = static_cast<size_t>(ncols / QK_MXFP4);
+    const size_t    k_tiles        = static_cast<size_t>(ncols / GGML_SYCL_MXFP4_DPAS_K);
+    const uint8_t * aos            = static_cast<const uint8_t *>(src_aos);
+    int8_t *        out_i8         = static_cast<int8_t *>(dst_dpas);
+    float *         out_scales =
+        reinterpret_cast<float *>(static_cast<uint8_t *>(dst_dpas) + ggml_sycl_mxfp4_dpas_scale_offset(ncols, nrows));
+
+    for (int row = 0; row < nrows; ++row) {
+        const size_t tile_m = static_cast<size_t>(row) / GGML_SYCL_MXFP4_DPAS_REPEAT;
+        const size_t row_m  = static_cast<size_t>(row) % GGML_SYCL_MXFP4_DPAS_REPEAT;
+        for (size_t kt = 0; kt < k_tiles; ++kt) {
+            const size_t block_idx = static_cast<size_t>(row) * blocks_per_row + kt;
+            const auto * block     = reinterpret_cast<const block_mxfp4 *>(aos + block_idx * sizeof(block_mxfp4));
+            int8_t * qs = out_i8 + (tile_m * k_tiles + kt) * (GGML_SYCL_MXFP4_DPAS_REPEAT * GGML_SYCL_MXFP4_DPAS_K) +
+                          row_m * GGML_SYCL_MXFP4_DPAS_K;
+            for (int i = 0; i < QK_MXFP4 / 2; ++i) {
+                const uint8_t packed               = block->qs[i];
+                qs[i]                              = mxfp4_i8_code_value(packed);
+                qs[i + GGML_SYCL_MXFP4_DPAS_K / 2] = mxfp4_i8_code_value(packed >> 4);
+            }
+            out_scales[(tile_m * k_tiles + kt) * GGML_SYCL_MXFP4_DPAS_REPEAT + row_m] =
+                GGML_E8M0_TO_FP32_HALF(block->e);
+        }
+    }
+}
+
 // Check if tensor is eligible for CPU-side SoA reorder during upload
 static bool should_cpu_reorder(const ggml_tensor * tensor, const ggml_backend_sycl_buffer_context * ctx) {
     // Supported quantized types for CPU-side SoA reorder
@@ -31582,6 +31693,8 @@ static int ggml_sycl_layout_priority(layout_mode mode) {
             return 4;
         case GGML_LAYOUT_XMX_TILED:
             return 3;
+        case GGML_LAYOUT_MXFP4_DPAS:
+            return 3;
         case GGML_LAYOUT_MXFP4_I8:
             return 3;
         case GGML_LAYOUT_COALESCED:
@@ -31816,6 +31929,10 @@ static size_t ggml_sycl_layout_bytes_for_dims(ggml_type   type,
                 const size_t nblocks        = blocks_per_row * static_cast<size_t>(nrows);
                 return nblocks * (QK_MXFP4 + 1);
             }
+        case GGML_LAYOUT_MXFP4_DPAS:
+            {
+                return ggml_sycl_layout_bytes_mxfp4_dpas_for_dims(type, ncols, nrows);
+            }
         case GGML_LAYOUT_XMX_GEMM_TILED:
             {
                 return ggml_sycl_layout_bytes_xmx_gemm_for_dims(type, ncols, nrows, device);
@@ -31889,6 +32006,7 @@ static size_t ggml_sycl_layout_bytes_for_tensor(const ggml_tensor * tensor, layo
 
         case GGML_LAYOUT_COALESCED:
         case GGML_LAYOUT_MXFP4_I8:
+        case GGML_LAYOUT_MXFP4_DPAS:
             {
                 const size_t bytes = ggml_sycl_layout_bytes_for_dims(tensor->type, ncols, nrows, layout, device);
                 return bytes != 0 ? bytes : ggml_nbytes(tensor);
@@ -33088,7 +33206,8 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
         req.validate_content = false;
         req.xmx_info         = xmx_info;
         reorder_ctx          = {};
-        if (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED || layout == GGML_LAYOUT_MXFP4_I8) {
+        if (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED || layout == GGML_LAYOUT_MXFP4_I8 ||
+            layout == GGML_LAYOUT_MXFP4_DPAS) {
             reorder_ctx.type  = src0->type;
             reorder_ctx.ncols = ncols;
 

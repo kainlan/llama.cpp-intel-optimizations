@@ -2667,6 +2667,7 @@ static inline reorder_mode get_effective_reorder_mode(const ggml_tensor_extra_gp
         case GGML_LAYOUT_COALESCED:
             return reorder_mode::COALESCED;
         case GGML_LAYOUT_MXFP4_I8:
+        case GGML_LAYOUT_MXFP4_DPAS:
         case GGML_LAYOUT_XMX_TILED:
         case GGML_LAYOUT_XMX_GEMM_TILED:
         case GGML_LAYOUT_ONEDNN_PACKED:
