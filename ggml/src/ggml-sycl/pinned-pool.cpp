@@ -102,7 +102,7 @@ pinned_chunk_pool::pinned_chunk_pool(sycl::queue & queue, size_t budget) :
     budget_(budget),
     chunk_size_(resolve_chunk_size()),
     alloc_timeout_ms_(resolve_alloc_timeout_ms()) {
-    GGML_LOG_INFO("[SYCL] Pinned chunk pool created with %.1f GB budget (chunk=%.1f MB)\n",
+    GGML_LOG_INFO("[SYCL] Pinned chunk pool created with %.1f GB budget, committed=0.0 GB (chunk=%.1f MB)\n",
                   budget / (1024.0 * 1024.0 * 1024.0), chunk_size_ / (1024.0 * 1024.0));
 }
 

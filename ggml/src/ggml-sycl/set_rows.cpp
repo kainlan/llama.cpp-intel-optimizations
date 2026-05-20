@@ -2,6 +2,7 @@
 
 #include "common.hpp"
 #include "cpy.hpp"
+#include "fattn.hpp"
 
 static constexpr int GGML_SYCL_SET_ROWS_UNKNOWN_DEVICE_USM = -2;
 
@@ -76,6 +77,26 @@ static bool ggml_sycl_set_rows_ptr_needs_staging(const void * ptr,
     return true;
 }
 
+static bool ggml_sycl_set_rows_dst_device_accessible(const void * ptr, int owner_device, bool already_on_owner_device) {
+    if (!ptr) {
+        return false;
+    }
+    if (already_on_owner_device) {
+        return true;
+    }
+
+    const auto * info = ggml_sycl::alloc_registry::instance().lookup(ptr);
+    if (info) {
+        if (info->type == ggml_sycl::alloc_type::DEVICE) {
+            return info->device_id == owner_device;
+        }
+        return info->type == ggml_sycl::alloc_type::HOST_PINNED || info->type == ggml_sycl::alloc_type::SHARED;
+    }
+
+    const sycl::usm::alloc alloc_type = ggml_sycl_probe_alloc_type_any_context(ptr);
+    return alloc_type == sycl::usm::alloc::host || alloc_type == sycl::usm::alloc::shared;
+}
+
 static const ggml_tensor * ggml_sycl_set_rows_root(const ggml_tensor * tensor, size_t & view_offs) {
     view_offs = 0;
     if (!tensor) {
@@ -97,7 +118,7 @@ static int ggml_sycl_set_rows_owner_device(const ggml_tensor * dst, int fallback
     }
 
     if (root && root->extra) {
-        const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(root->extra);
+        const auto * extra       = static_cast<const ggml_tensor_extra_gpu *>(root->extra);
         int          only_device = -1;
         int          n_devices   = 0;
 
@@ -255,7 +276,9 @@ bool ggml_sycl_plan_set_rows(const ggml_tensor * dst, int fallback_device, ggml_
         return false;
     }
 
-    if (!out.src0_ptr || !out.index_ptr || !out.dst_ptr || !dst_on_owner) {
+    const bool dst_device_accessible =
+        ggml_sycl_set_rows_dst_device_accessible(out.dst_ptr, out.owner_device, dst_on_owner);
+    if (!out.src0_ptr || !out.index_ptr || !out.dst_ptr || !dst_device_accessible) {
         return false;
     }
 
@@ -786,6 +809,13 @@ void ggml_sycl_op_set_rows(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tens
         evt = set_rows_sycl<float, int64_t>(ctx, src0, src1, dst, plan);
     } else {
         evt = set_rows_sycl<float, int32_t>(ctx, src0, src1, dst, plan);
+    }
+
+    sycl::event packed_k_evt;
+    if (ggml_sycl_fattn_xmx_update_packed_k_from_set_rows(dst.raw(), src0, src1, plan.owner_device, plan.src0_ptr,
+                                                          plan.index_ptr, ctx.stream(plan.owner_device, 0), evt,
+                                                          &packed_k_evt)) {
+        evt = packed_k_evt;
     }
 
     // Note: KV cache synchronization is now handled via barrier-based sync in llama-context.cpp

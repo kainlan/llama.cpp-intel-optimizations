@@ -63,6 +63,8 @@ struct mxfp4_pair_glu_bench_args {
     const void * const * up_ptrs            = nullptr;
     const void *         activations_q8_soa = nullptr;
     float *              output             = nullptr;
+    float *              gate_tmp           = nullptr;
+    float *              up_tmp             = nullptr;
     const int32_t *      ids                = nullptr;
     const float *        gate_bias          = nullptr;
     const float *        up_bias            = nullptr;
@@ -70,6 +72,7 @@ struct mxfp4_pair_glu_bench_args {
     int ncols            = 0;
     int ncols_y          = 0;
     int nrows_per_expert = 0;
+    int num_experts      = 0;
     int n_ids            = 0;
     int n_tokens         = 1;
     int ne11             = 1;
@@ -86,13 +89,69 @@ struct mxfp4_pair_glu_bench_args {
     int   rows_per_wg         = 4;
     bool  cache_y             = true;
     bool  direct_xmx          = false;
+    bool  split_gate_up       = false;
+    int   xmx_tiles_n         = 1;
+    bool  vector_qs_load      = false;
     bool  ignore_weight_scale = false;
+    int   scale_stride_blocks = 0;
+    int   subgroup_size       = 32;
     int   glu_op              = 0;
     float alpha               = 1.702f;
     float limit               = 7.0f;
 };
 
 bool ggml_sycl_mxfp4_pair_glu_bench_launch(const mxfp4_pair_glu_bench_args & args);
+
+// Arguments for benchmarking the current one-layer MXFP4 MoE decode sequence:
+// gate/up/GLU, GLU->Q8_1 SOA artifact publication, then down projection. This
+// is diagnostic-only; production ownership still flows through smart handles.
+struct mxfp4_layer_glu_down_bench_args {
+    sycl::queue * stream = nullptr;
+
+    const void * const * gate_ptrs          = nullptr;
+    const void * const * up_ptrs            = nullptr;
+    const void * const * down_ptrs          = nullptr;
+    const void *         activations_q8_soa = nullptr;
+    float *              glu_f32            = nullptr;
+    void *               down_q8_soa        = nullptr;
+    float *              output             = nullptr;
+    const int32_t *      ids                = nullptr;
+    const float *        gate_bias          = nullptr;
+    const float *        up_bias            = nullptr;
+
+    int activation_cols        = 0;
+    int intermediate_cols      = 0;
+    int output_rows_per_expert = 0;
+    int num_experts            = 0;
+    int n_ids                  = 0;
+    int n_tokens               = 1;
+    int ne11                   = 1;
+
+    int64_t ids_nb0         = 0;
+    int64_t ids_nb1         = 0;
+    int64_t activation_nb11 = 0;
+    int64_t activation_nb12 = 0;
+    int64_t glu_nb1         = 0;
+    int64_t glu_nb2         = 0;
+    int64_t down_q8_nb11    = 0;
+    int64_t down_q8_nb12    = 0;
+    int64_t output_nb1      = 0;
+    int64_t output_nb2      = 0;
+    int64_t gate_bias_nb1   = 0;
+    int64_t up_bias_nb1     = 0;
+
+    int   rows_per_wg         = 4;
+    bool  cache_y             = true;
+    bool  vector_qs_load      = false;
+    bool  ignore_weight_scale = false;
+    int   scale_stride_blocks = 0;
+    int   subgroup_size       = 32;
+    int   glu_op              = 0;
+    float alpha               = 1.702f;
+    float limit               = 7.0f;
+};
+
+bool ggml_sycl_mxfp4_layer_glu_down_bench_launch(const mxfp4_layer_glu_down_bench_args & args);
 
 // Arguments for benchmarking the production MXFP4 SOA MoE selected-expert
 // single-role kernel, matching the down projection shape.
@@ -120,10 +179,46 @@ struct mxfp4_mmv_id_bench_args {
     int64_t dst_nb2 = 0;
 
     int  rows_per_wg         = 4;
+    bool cache_y             = false;
+    bool vector_qs_load      = false;
     bool ignore_weight_scale = false;
+    int  scale_stride_blocks = 0;
+    int  subgroup_size       = 32;
 };
 
 bool ggml_sycl_mxfp4_mmv_id_bench_launch(const mxfp4_mmv_id_bench_args & args);
+bool ggml_sycl_mxfp4_mmv_id_predecoded_bench_launch(const mxfp4_mmv_id_bench_args & args);
+
+// Arguments for benchmarking a DPAS-ready MXFP4 selected-expert down role.
+// Each expert pointer references an XMX-tiled layout materialized outside the
+// hot path: per K-block, per output tile, scales followed by packed qs.
+struct mxfp4_mmv_id_xmx_tiled_bench_args {
+    sycl::queue * stream = nullptr;
+
+    const void * const * expert_ptrs        = nullptr;
+    const void *         activations_q8_soa = nullptr;
+    float *              output             = nullptr;
+    const int32_t *      ids                = nullptr;
+
+    int  ncols            = 0;
+    int  ncols_y          = 0;
+    int  nrows_per_expert = 0;
+    int  num_experts      = 0;
+    int  n_ids            = 0;
+    int  n_tokens         = 1;
+    int  ne11             = 1;
+    int  xmx_tiles_n      = 4;
+    bool raw_accum        = false;
+
+    int64_t ids_nb0 = 0;
+    int64_t ids_nb1 = 0;
+    int64_t nb11    = 0;
+    int64_t nb12    = 0;
+    int64_t dst_nb1 = 0;
+    int64_t dst_nb2 = 0;
+};
+
+bool ggml_sycl_mxfp4_mmv_id_xmx_tiled_bench_launch(const mxfp4_mmv_id_xmx_tiled_bench_args & args);
 
 // Arguments for benchmarking MMQ kernels directly (without ggml_tensor overhead)
 struct mmq_bench_args {

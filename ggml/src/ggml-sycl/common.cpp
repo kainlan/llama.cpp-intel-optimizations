@@ -888,8 +888,9 @@ XMXCapabilities query_xmx_capabilities(sycl::device & dev) {
         // Each work-group needs token data for the queried XMX M tile.
         size_t token_tile_bytes = caps.M * caps.K * sizeof(int8_t);
 
-        // Remaining SLM budget after reserving LUT and tokens
-        size_t slm_for_weights = caps.slm_size - LUT_BYTES - token_tile_bytes;
+        // Remaining SLM budget after reserving LUT and tokens.
+        const size_t reserved_slm    = LUT_BYTES + token_tile_bytes;
+        size_t       slm_for_weights = caps.slm_size > reserved_slm ? caps.slm_size - reserved_slm : 0;
 
         // Calculate weight tile size for MXFP4 (4-bit quantization)
         // Per tile in N dimension: XMX_N * XMX_K / 2 bytes
@@ -1005,32 +1006,51 @@ void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> str
         if (extra->moe_expert_ptrs_device[i] != nullptr && streams.size() > 0) {
             // Skip cleanup for Phase 4 pre-allocated tables — owned by unified cache
             if (!extra->moe_expert_ptrs_from_prealloc[i]) {
-                ggml_sycl_set_device(i);
-                SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(extra->moe_expert_ptrs_device[i], *(streams[i]))));
+                if (extra->moe_expert_ptrs_alloc[i].ptr) {
+                    ggml_sycl::unified_free(extra->moe_expert_ptrs_alloc[i]);
+                    extra->moe_expert_ptrs_alloc[i] = {};
+                } else {
+                    ggml_sycl_set_device(i);
+                    SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(extra->moe_expert_ptrs_device[i], *(streams[i]))));
+                }
             }
             extra->moe_expert_ptrs_device[i]        = nullptr;
             extra->moe_expert_ptrs_size[i]          = 0;
             extra->moe_expert_ptrs_from_prealloc[i] = false;
         }
         extra->moe_expert_ptrs_host[i].clear();
+        extra->moe_expert_handles[i].clear();
+        extra->moe_expert_ptrs_leases[i].clear();
 
         if (extra->moe_expert_ptrs_compact_device[i] != nullptr && streams.size() > 0) {
             if (!extra->moe_expert_ptrs_compact_from_prealloc[i]) {
-                ggml_sycl_set_device(i);
-                SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(extra->moe_expert_ptrs_compact_device[i], *(streams[i]))));
+                if (extra->moe_expert_ptrs_compact_alloc[i].ptr) {
+                    ggml_sycl::unified_free(extra->moe_expert_ptrs_compact_alloc[i]);
+                    extra->moe_expert_ptrs_compact_alloc[i] = {};
+                } else {
+                    ggml_sycl_set_device(i);
+                    SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(extra->moe_expert_ptrs_compact_device[i], *(streams[i]))));
+                }
             }
             extra->moe_expert_ptrs_compact_device[i]        = nullptr;
             extra->moe_expert_ptrs_compact_size[i]          = 0;
             extra->moe_expert_ptrs_compact_capacity[i]      = 0;
             extra->moe_expert_ptrs_compact_from_prealloc[i] = false;
+            extra->moe_expert_ptrs_compact_handle[i]        = {};
         }
         if (extra->moe_expert_ptrs_missing_device[i] != nullptr && streams.size() > 0) {
             if (!extra->moe_expert_ptrs_missing_from_prealloc[i]) {
-                ggml_sycl_set_device(i);
-                SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(extra->moe_expert_ptrs_missing_device[i], *(streams[i]))));
+                if (extra->moe_expert_ptrs_missing_alloc[i].ptr) {
+                    ggml_sycl::unified_free(extra->moe_expert_ptrs_missing_alloc[i]);
+                    extra->moe_expert_ptrs_missing_alloc[i] = {};
+                } else {
+                    ggml_sycl_set_device(i);
+                    SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(extra->moe_expert_ptrs_missing_device[i], *(streams[i]))));
+                }
             }
             extra->moe_expert_ptrs_missing_device[i]        = nullptr;
             extra->moe_expert_ptrs_missing_from_prealloc[i] = false;
+            extra->moe_expert_ptrs_missing_handle[i]        = {};
         }
     }
 

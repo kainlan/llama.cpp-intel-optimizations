@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <future>
@@ -1102,6 +1103,7 @@ static void unified_cache_atexit_handler() {
 
 // Forward declarations needed by unified_cache constructor (defined later in file)
 static size_t get_total_system_memory_bytes();
+static size_t get_available_system_memory_bytes();
 
 bool ggml_sycl_is_shutting_down() {
     return g_sycl_shutting_down.load(std::memory_order_acquire);
@@ -1288,22 +1290,44 @@ unified_cache::unified_cache(sycl::queue & queue,
     }
 
     // Host arena: allocate pinned host memory via 2GB chunks to bypass Level Zero's
-    // ~11GB per-allocation limit.  Budget is derived from system RAM (same logic as
-    // host arena), NOT from VRAM budget_bytes.  Cap at 128 GB for 120B-class models.
+    // ~11GB per-allocation limit.  Budget is derived from queried system RAM
+    // and bounded by currently available RAM minus an OS reserve, NOT by VRAM.
+    // The pool grows lazily; this budget is a cap, not committed memory.
     {
         size_t host_mem_budget = g_unified_cache_host_budget;
+        size_t total_mem       = 0;
+        size_t available_mem   = 0;
+        size_t os_reserve      = 0;
         if (host_mem_budget == 0) {
-            const size_t total_mem = get_total_system_memory_bytes();
-            int          pct       = g_unified_cache_host_budget_pct;
+            total_mem     = get_total_system_memory_bytes();
+            available_mem = get_available_system_memory_bytes();
+            int pct       = g_unified_cache_host_budget_pct;
             if (pct < 1) {
                 pct = 1;
             } else if (pct > 100) {
                 pct = 100;
             }
-            host_mem_budget = (total_mem > 0) ? static_cast<size_t>(total_mem * (static_cast<double>(pct) / 100.0)) :
-                                                (size_t(128) << 30);
+
+            if (total_mem > 0) {
+                host_mem_budget =
+                    static_cast<size_t>(static_cast<double>(total_mem) * (static_cast<double>(pct) / 100.0));
+                os_reserve = std::max<size_t>(8ull << 30, total_mem / 32);
+            } else if (available_mem > 0) {
+                host_mem_budget = available_mem;
+                os_reserve      = std::min<size_t>(8ull << 30, available_mem / 4);
+            } else {
+                host_mem_budget = std::numeric_limits<size_t>::max() / 4;
+                GGML_LOG_WARN(
+                    "[HOST-ARENA] System RAM detection failed; using lazy-growth host arena without a detected RAM "
+                    "cap\n");
+            }
+
+            if (available_mem > 0 && os_reserve > 0) {
+                const size_t available_cap =
+                    available_mem > os_reserve ? available_mem - os_reserve : available_mem / 2;
+                host_mem_budget = std::min(host_mem_budget, available_cap);
+            }
         }
-        size_t pinned_cap = size_t(128) << 30;
 
         // On Intel Arc discrete GPUs (Xe architecture), USM host memory
         // (sycl::malloc_host / zeMemAllocHost) is mapped through the PPGTT
@@ -1321,13 +1345,16 @@ unified_cache::unified_cache(sycl::queue & queue,
 
         if (getenv("GGML_SYCL_NO_PINNED") != nullptr) {
             GGML_LOG_INFO("[HOST-ARENA] GGML_SYCL_NO_PINNED set: disabling pinned host memory\n");
-            pinned_cap = 0;
+            host_mem_budget = 0;
         }
 
-        const size_t pinned_budget = std::min(host_mem_budget, pinned_cap);
-        host_arena_                = std::make_unique<pinned_chunk_pool>(queue_, pinned_budget);
-        GGML_LOG_INFO("[HOST-ARENA] Created with %.1f GB budget (from system RAM)\n",
-                      pinned_budget / (1024.0 * 1024.0 * 1024.0));
+        host_arena_ = std::make_unique<pinned_chunk_pool>(queue_, host_mem_budget);
+        GGML_LOG_INFO(
+            "[HOST-ARENA] Created with %.1f GB budget, committed=0.0 GB "
+            "(system total=%.1f GB available=%.1f GB reserve=%.1f GB pct=%d)\n",
+            host_mem_budget / (1024.0 * 1024.0 * 1024.0), total_mem / (1024.0 * 1024.0 * 1024.0),
+            available_mem / (1024.0 * 1024.0 * 1024.0), os_reserve / (1024.0 * 1024.0 * 1024.0),
+            g_unified_cache_host_budget_pct);
     }
 
     // Ensure unordered_map has buckets before any find() calls.
@@ -1659,6 +1686,39 @@ static size_t get_total_system_memory_bytes() {
         return 0;
     }
     return static_cast<size_t>(pages) * static_cast<size_t>(page_size);
+#endif
+}
+
+static size_t get_available_system_memory_bytes() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX status;
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status)) {
+        return static_cast<size_t>(status.ullAvailPhys);
+    }
+    return 0;
+#else
+    FILE * f = std::fopen("/proc/meminfo", "r");
+    if (f) {
+        char               key[64]  = {};
+        char               unit[32] = {};
+        unsigned long long value_kb = 0;
+        while (std::fscanf(f, "%63s %llu %31s", key, &value_kb, unit) == 3) {
+            if (std::strcmp(key, "MemAvailable:") == 0) {
+                std::fclose(f);
+                return static_cast<size_t>(value_kb) * 1024ULL;
+            }
+        }
+        std::fclose(f);
+    }
+#    ifdef _SC_AVPHYS_PAGES
+    long pages     = sysconf(_SC_AVPHYS_PAGES);
+    long page_size = sysconf(_SC_PAGE_SIZE);
+    if (pages > 0 && page_size > 0) {
+        return static_cast<size_t>(pages) * static_cast<size_t>(page_size);
+    }
+#    endif
+    return 0;
 #endif
 }
 
@@ -5207,11 +5267,13 @@ void unified_cache::print_stats() const {
                     dense_bytes / (1024.0f * 1024.0f), experts, expert_bytes / (1024.0f * 1024.0f),
                     used_.load() / (1024.0f * 1024.0f), budget_ / (1024.0f * 1024.0f));
     GGML_LOG_INFO(
-        "[UNIFIED-CACHE] Layouts: aos=%zu (%.1f MB), soa=%zu (%.1f MB), coalesced=%zu (%.1f MB), xmx_tiled=%zu (%.1f "
-        "MB), xmx_gemm_tiled=%zu (%.1f MB), onednn_packed=%zu (%.1f MB), onednn_woq=%zu (%.1f MB)\n",
+        "[UNIFIED-CACHE] Layouts: aos=%zu (%.1f MB), soa=%zu (%.1f MB), coalesced=%zu (%.1f MB), "
+        "mxfp4_i8=%zu (%.1f MB), xmx_tiled=%zu (%.1f MB), xmx_gemm_tiled=%zu (%.1f MB), "
+        "onednn_packed=%zu (%.1f MB), onednn_woq=%zu (%.1f MB)\n",
         layout_counts[GGML_LAYOUT_AOS], layout_bytes[GGML_LAYOUT_AOS] / (1024.0f * 1024.0f),
         layout_counts[GGML_LAYOUT_SOA], layout_bytes[GGML_LAYOUT_SOA] / (1024.0f * 1024.0f),
         layout_counts[GGML_LAYOUT_COALESCED], layout_bytes[GGML_LAYOUT_COALESCED] / (1024.0f * 1024.0f),
+        layout_counts[GGML_LAYOUT_MXFP4_I8], layout_bytes[GGML_LAYOUT_MXFP4_I8] / (1024.0f * 1024.0f),
         layout_counts[GGML_LAYOUT_XMX_TILED], layout_bytes[GGML_LAYOUT_XMX_TILED] / (1024.0f * 1024.0f),
         layout_counts[GGML_LAYOUT_XMX_GEMM_TILED], layout_bytes[GGML_LAYOUT_XMX_GEMM_TILED] / (1024.0f * 1024.0f),
         layout_counts[GGML_LAYOUT_ONEDNN_PACKED], layout_bytes[GGML_LAYOUT_ONEDNN_PACKED] / (1024.0f * 1024.0f),
@@ -5847,6 +5909,17 @@ static unified_cache * get_cache_shared(int effective_device) {
         return nullptr;
     }
     return it->second.get();
+}
+
+// Non-initializing cache lookup for planner diagnostics.  Placement planning can
+// be called from unit tests before ggml_sycl_info() has finished its static
+// initialization; creating a cache from there re-enters that static guard.
+static unified_cache * get_existing_cache_for_device(int device_id) {
+    const int effective_device = resolve_effective_device(device_id);
+    if (effective_device < 0) {
+        return nullptr;
+    }
+    return get_cache_shared(effective_device);
 }
 
 // Direct arena zone query — caller MUST hold g_cache_rw_mutex.
@@ -6599,13 +6672,19 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 return ucache->host_zone_alloc(zone, alloc_size, pinned_chunk_pool::DEFAULT_ALIGNMENT);
             };
             if (req.intent.constraints.use_pinned_pool) {
-                host_zone_id pool_zone = select_zone();
-                ptr                    = try_zone_alloc_contiguous(pool_zone);
+                if (!ucache->host_zones_configured()) {
+                    ptr = ucache->host_pool_alloc(alloc_size, pinned_chunk_pool::DEFAULT_ALIGNMENT);
+                } else {
+                    host_zone_id pool_zone = select_zone();
+                    ptr                    = try_zone_alloc_contiguous(pool_zone);
+                    if (ptr) {
+                        zone_managed      = true;
+                        out->zone_managed = true;
+                        out->host_zone    = pool_zone;
+                    }
+                }
                 if (ptr) {
-                    uses_pinned_pool  = true;
-                    zone_managed      = true;
-                    out->zone_managed = true;
-                    out->host_zone    = pool_zone;
+                    uses_pinned_pool = true;
                 }
             } else if (ucache->host_zones_configured()) {
                 host_zone_id zone = select_zone();
@@ -9733,6 +9812,8 @@ static const char * scratch_layout_name(ggml_layout_mode layout) {
             return "soa";
         case GGML_LAYOUT_COALESCED:
             return "coalesced";
+        case GGML_LAYOUT_MXFP4_I8:
+            return "mxfp4_i8";
         case GGML_LAYOUT_XMX_TILED:
             return "xmx_tiled";
         case GGML_LAYOUT_XMX_GEMM_TILED:
@@ -11228,6 +11309,138 @@ static const char * placement_target_name(int target, char * buf, size_t buf_siz
     return buf;
 }
 
+struct moe_triplet_group {
+    int                 layer_id  = -1;
+    int                 expert_id = -1;
+    std::vector<size_t> indices;
+    size_t              bytes     = 0;
+    uint8_t             role_mask = 0;
+};
+
+static uint8_t moe_role_bit(expert_tensor_role role) {
+    switch (role) {
+        case expert_tensor_role::GATE:
+            return 1u << 0;
+        case expert_tensor_role::UP:
+            return 1u << 1;
+        case expert_tensor_role::DOWN:
+            return 1u << 2;
+        case expert_tensor_role::UNKNOWN:
+        default:
+            return 0;
+    }
+}
+
+static bool moe_triplet_complete(const moe_triplet_group & group) {
+    constexpr uint8_t all_roles = (1u << 0) | (1u << 1) | (1u << 2);
+    return (group.role_mask & all_roles) == all_roles;
+}
+
+static std::vector<moe_triplet_group> build_moe_triplet_groups(const placement_plan &      plan,
+                                                               const std::vector<size_t> & moe_indices) {
+    std::map<std::pair<int, int>, size_t> group_index;
+    std::vector<moe_triplet_group>        groups;
+    groups.reserve(moe_indices.size() / 3 + 1);
+
+    for (size_t idx : moe_indices) {
+        const auto & entry = plan.entries[idx];
+        const auto   key   = std::make_pair(entry.layer_id, entry.expert_id);
+        auto         it    = group_index.find(key);
+        if (it == group_index.end()) {
+            moe_triplet_group group;
+            group.layer_id  = entry.layer_id;
+            group.expert_id = entry.expert_id;
+            groups.push_back(std::move(group));
+            const size_t new_idx = groups.size() - 1;
+            group_index.emplace(key, new_idx);
+            it = group_index.find(key);
+        }
+
+        auto & group = groups[it->second];
+        group.indices.push_back(idx);
+        group.bytes += entry.dst_size;
+        group.role_mask |= moe_role_bit(entry.expert_role);
+    }
+
+    // Static fallback hotness: earlier layers first, then lower expert IDs.
+    // Runtime routing stats can reorder this vector later without changing the
+    // all-or-host triplet placement contract.
+    std::sort(groups.begin(), groups.end(), [](const moe_triplet_group & a, const moe_triplet_group & b) {
+        if (a.layer_id != b.layer_id) {
+            return a.layer_id < b.layer_id;
+        }
+        if (a.expert_id != b.expert_id) {
+            return a.expert_id < b.expert_id;
+        }
+        return a.bytes > b.bytes;
+    });
+    return groups;
+}
+
+struct moe_triplet_pack_stats {
+    size_t groups            = 0;
+    size_t complete_groups   = 0;
+    size_t incomplete_groups = 0;
+    size_t device_groups     = 0;
+    size_t host_groups       = 0;
+    size_t device_entries    = 0;
+    size_t host_entries      = 0;
+    size_t device_bytes      = 0;
+    size_t host_bytes        = 0;
+};
+
+static void log_moe_triplet_pack_stats(const char * tag, const moe_triplet_pack_stats & stats, size_t remaining) {
+    if (stats.groups == 0) {
+        return;
+    }
+    GGML_LOG_INFO(
+        "[%s] triplet packing: groups=%zu complete=%zu incomplete=%zu device_groups=%zu host_groups=%zu "
+        "device_entries=%zu (%.1f MB) host_entries=%zu (%.1f MB) remaining=%.1f MB "
+        "hotness=static(layer,expert)\n",
+        tag, stats.groups, stats.complete_groups, stats.incomplete_groups, stats.device_groups, stats.host_groups,
+        stats.device_entries, stats.device_bytes / (1024.0 * 1024.0), stats.host_entries,
+        stats.host_bytes / (1024.0 * 1024.0), remaining / (1024.0 * 1024.0));
+}
+
+static void log_moe_device_policy(const char * tag,
+                                  int          device_id,
+                                  size_t       vram_budget,
+                                  size_t       weight_budget,
+                                  size_t       arena_total,
+                                  size_t       arena_scratch,
+                                  size_t       arena_runtime,
+                                  size_t       arena_onednn,
+                                  int          n_experts) {
+    if (n_experts <= 0 || !get_existing_cache_for_device(device_id)) {
+        return;
+    }
+    if (device_id < 0 || device_id >= ggml_sycl_info().device_count) {
+        return;
+    }
+
+    const auto & dinfo  = ggml_sycl_info().devices[device_id];
+    const auto   policy = ggml_sycl_make_moe_device_policy(
+        dinfo.xmx_caps, device_id, dinfo.total_vram, dinfo.free_vram_at_init, dinfo.max_alloc_size,
+        dinfo.safe_max_alloc_size, vram_budget, weight_budget, arena_total, arena_scratch, arena_runtime, arena_onednn,
+        /*in_dim=*/0, /*out_dim=*/0, n_experts, /*device_resident=*/true, /*tiled_kernel_validated=*/false);
+
+    GGML_LOG_INFO(
+        "[%s] device=%d total=%.1f MB free_init=%.1f MB plan_budget=%.1f MB weight_budget=%.1f MB "
+        "max_alloc=%.1f MB safe_alloc=%.1f MB arena=%.1f MB zones(scratch/runtime/onednn)=%.1f/%.1f/%.1f MB "
+        "cu=%u wg=%zu sg_pref=%zu sg_max=%zu slm=%zu KB usm(d/s/h)=%d/%d/%d fp16(type/xmx)=%d/%d "
+        "xmx_int8=%d tile=%zux%zux%zu tiles=%dx%d executor=%s reason=%s\n",
+        tag, device_id, dinfo.total_vram / (1024.0 * 1024.0), dinfo.free_vram_at_init / (1024.0 * 1024.0),
+        vram_budget / (1024.0 * 1024.0), weight_budget / (1024.0 * 1024.0), dinfo.max_alloc_size / (1024.0 * 1024.0),
+        dinfo.safe_max_alloc_size / (1024.0 * 1024.0), arena_total / (1024.0 * 1024.0),
+        arena_scratch / (1024.0 * 1024.0), arena_runtime / (1024.0 * 1024.0), arena_onednn / (1024.0 * 1024.0),
+        policy.caps.compute_units, policy.caps.max_work_group_size, policy.caps.preferred_sub_group_size,
+        policy.caps.max_sub_group_size, policy.caps.slm_size / 1024, policy.caps.supports_usm_device ? 1 : 0,
+        policy.caps.supports_usm_shared ? 1 : 0, policy.caps.supports_usm_host ? 1 : 0,
+        policy.caps.supports_fp16_type ? 1 : 0, policy.caps.supports_fp16 ? 1 : 0, policy.xmx_int8_candidate ? 1 : 0,
+        policy.caps.M, policy.caps.N, policy.caps.K, policy.caps.optimal_tiles_m, policy.caps.optimal_tiles_n,
+        policy.device_executor, policy.executor_reason);
+}
+
 static void log_moe_placement_diagnostics(const char * tag, const placement_plan & plan, int n_experts) {
     if (n_experts <= 0) {
         return;
@@ -11631,14 +11844,19 @@ placement_plan compute_placement_plan(const std::vector<std::pair<std::string, s
     // scratch zone capacities from the budget BEFORE packing weights.
     // Without this, weights fill all available VRAM and leave zero space
     // for compute scratch → "VRAM exhaustion" abort on large models.
-    size_t remaining = vram_budget;
+    size_t remaining       = vram_budget;
+    size_t arena_total     = 0;
+    size_t scratch_reserve = 0;
+    size_t onednn_reserve  = 0;
+    size_t runtime_reserve = 0;
     if (vram_arena_enabled()) {
-        auto * cache = get_unified_cache_for_device(device_id);
+        auto * cache = get_existing_cache_for_device(device_id);
         if (cache && cache->arena_active()) {
-            const size_t scratch_reserve = cache->zone_capacity(vram_zone_id::SCRATCH);
-            const size_t onednn_reserve  = cache->zone_capacity(vram_zone_id::ONEDNN);
-            const size_t runtime_reserve = cache->zone_capacity(vram_zone_id::RUNTIME);
-            const size_t total_reserve   = scratch_reserve + onednn_reserve + runtime_reserve;
+            arena_total                = cache->arena_total_size();
+            scratch_reserve            = cache->zone_capacity(vram_zone_id::SCRATCH);
+            onednn_reserve             = cache->zone_capacity(vram_zone_id::ONEDNN);
+            runtime_reserve            = cache->zone_capacity(vram_zone_id::RUNTIME);
+            const size_t total_reserve = scratch_reserve + onednn_reserve + runtime_reserve;
             if (remaining > total_reserve) {
                 remaining -= total_reserve;
             } else {
@@ -11651,6 +11869,8 @@ placement_plan compute_placement_plan(const std::vector<std::pair<std::string, s
                 runtime_reserve / (1024.0 * 1024.0), total_reserve / (1024.0 * 1024.0), remaining / (1024.0 * 1024.0));
         }
     }
+    log_moe_device_policy("MOE-POLICY", device_id, vram_budget, remaining, arena_total, scratch_reserve,
+                          runtime_reserve, onednn_reserve, n_experts);
     std::vector<size_t>                standalone_dense_indices;
     std::map<int, std::vector<size_t>> dense_layer_indices;
     std::vector<size_t>                moe_indices;
@@ -11731,36 +11951,47 @@ placement_plan compute_placement_plan(const std::vector<std::pair<std::string, s
         }
     }
 
-    // MoE expert entries: budget-aware placement.
-    //
-    // The MoE hybrid cache (moe_hybrid_init_once) manages expert staging
-    // lazily via its own VRAM budget, NOT the planner's dense weight budget.
-    // However, the planner must still account for expert VRAM to avoid
-    // overcommitting the GPU.  When experts fit within remaining VRAM,
-    // mark them on_device; when they don't, spill to host.
-    //
-    // Spilling experts to host is safe because:
-    //  1. ggml_sycl_moe_tensor_all_experts_on_host() only rejects MUL_MAT_ID
-    //     when ALL experts of a tensor are on host — partial spill still
-    //     routes to GPU.
-    //  2. The CPU dispatch dead zone fix (src0_host_storage fallback) ensures
-    //     host-resident experts are computed correctly on CPU.
-    //  3. The hybrid cache will lazily upload on_device experts to VRAM
-    //     during inference; host experts are served from host memory.
-    for (size_t idx : moe_indices) {
-        auto & entry = plan.entries[idx];
-        if (entry.dst_size <= remaining) {
-            entry.on_device     = true;
-            entry.target_device = device_id;
-            remaining -= entry.dst_size;
-            plan.weight_vram_bytes += entry.dst_size;
-            plan.vram_bytes += entry.dst_size;
-        } else {
-            entry.on_device     = false;
-            entry.target_device = -1;
-            plan.weight_host_bytes += entry.dst_size;
-            plan.host_bytes += entry.dst_size;
+    // MoE expert entries: budget-aware placement at (layer, expert) triplet
+    // granularity.  A layer executor consumes gate/up/down for the same routed
+    // expert together; splitting the roles across device and host creates the
+    // worst possible execution shape (device kernels plus CPU handoff for the
+    // same routed expert).  Under pressure, keep a complete triplet on one
+    // domain or mark the triplet as an explicit host/CPU domain.
+    {
+        const auto             moe_groups = build_moe_triplet_groups(plan, moe_indices);
+        moe_triplet_pack_stats stats;
+        stats.groups = moe_groups.size();
+        for (const auto & group : moe_groups) {
+            if (moe_triplet_complete(group)) {
+                stats.complete_groups++;
+            } else {
+                stats.incomplete_groups++;
+            }
+
+            const bool on_device = group.bytes <= remaining;
+            const int  target    = on_device ? device_id : -1;
+            if (on_device) {
+                remaining -= group.bytes;
+                plan.weight_vram_bytes += group.bytes;
+                plan.vram_bytes += group.bytes;
+                stats.device_groups++;
+                stats.device_entries += group.indices.size();
+                stats.device_bytes += group.bytes;
+            } else {
+                plan.weight_host_bytes += group.bytes;
+                plan.host_bytes += group.bytes;
+                stats.host_groups++;
+                stats.host_entries += group.indices.size();
+                stats.host_bytes += group.bytes;
+            }
+
+            for (size_t idx : group.indices) {
+                auto & entry        = plan.entries[idx];
+                entry.on_device     = on_device;
+                entry.target_device = target;
+            }
         }
+        log_moe_triplet_pack_stats("PLACEMENT-MOE", stats, remaining);
     }
 
     populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
@@ -11942,20 +12173,29 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     plan.per_device_vram.resize(n_devs, 0);
     std::vector<size_t> remaining(n_devs);
     for (size_t d = 0; d < n_devs; d++) {
-        plan.devices[d] = device_budgets[d].device_id;
-        remaining[d]    = device_budgets[d].vram_budget;
+        plan.devices[d]        = device_budgets[d].device_id;
+        remaining[d]           = device_budgets[d].vram_budget;
+        size_t arena_total     = 0;
+        size_t scratch_reserve = 0;
+        size_t onednn_reserve  = 0;
+        size_t runtime_reserve = 0;
 
         // Subtract arena scratch + oneDNN + runtime zone reservations from
         // per-device budget so weights don't fill space needed for compute.
         if (vram_arena_enabled()) {
-            auto * cache = get_unified_cache_for_device(device_budgets[d].device_id);
+            auto * cache = get_existing_cache_for_device(device_budgets[d].device_id);
             if (cache && cache->arena_active()) {
-                const size_t reserve = cache->zone_capacity(vram_zone_id::SCRATCH) +
-                                       cache->zone_capacity(vram_zone_id::ONEDNN) +
-                                       cache->zone_capacity(vram_zone_id::RUNTIME);
-                remaining[d] = remaining[d] > reserve ? remaining[d] - reserve : 0;
+                arena_total          = cache->arena_total_size();
+                scratch_reserve      = cache->zone_capacity(vram_zone_id::SCRATCH);
+                onednn_reserve       = cache->zone_capacity(vram_zone_id::ONEDNN);
+                runtime_reserve      = cache->zone_capacity(vram_zone_id::RUNTIME);
+                const size_t reserve = scratch_reserve + onednn_reserve + runtime_reserve;
+                remaining[d]         = remaining[d] > reserve ? remaining[d] - reserve : 0;
             }
         }
+
+        log_moe_device_policy("MOE-POLICY-MULTI", device_budgets[d].device_id, device_budgets[d].vram_budget,
+                              remaining[d], arena_total, scratch_reserve, runtime_reserve, onednn_reserve, n_experts);
 
         plan.vram_budget += device_budgets[d].vram_budget;
     }
@@ -12154,27 +12394,52 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         }
     }
 
-    for (size_t idx : moe_indices) {
-        auto & entry          = plan.entries[idx];
-        int    target_dev_idx = -1;
-        if (mode != multi_gpu_mode::LAYER) {
-            size_t best_remaining = 0;
-            for (size_t d = 0; d < n_devs; d++) {
-                if (remaining[d] >= entry.dst_size && remaining[d] > best_remaining) {
-                    best_remaining = remaining[d];
-                    target_dev_idx = static_cast<int>(d);
+    {
+        const auto             moe_groups = build_moe_triplet_groups(plan, moe_indices);
+        moe_triplet_pack_stats stats;
+        stats.groups = moe_groups.size();
+        for (const auto & group : moe_groups) {
+            if (moe_triplet_complete(group)) {
+                stats.complete_groups++;
+            } else {
+                stats.incomplete_groups++;
+            }
+
+            int target_dev_idx = -1;
+            if (mode != multi_gpu_mode::LAYER) {
+                size_t best_remaining = 0;
+                for (size_t d = 0; d < n_devs; d++) {
+                    if (remaining[d] >= group.bytes && remaining[d] > best_remaining) {
+                        best_remaining = remaining[d];
+                        target_dev_idx = static_cast<int>(d);
+                    }
+                }
+            } else if (group.layer_id >= 0 && group.layer_id < n_layers) {
+                target_dev_idx = layer_owner[group.layer_id];
+                if (remaining[target_dev_idx] < group.bytes) {
+                    target_dev_idx = -1;
                 }
             }
-        } else if (entry.layer_id >= 0 && entry.layer_id < n_layers) {
-            target_dev_idx = layer_owner[entry.layer_id];
-            if (remaining[target_dev_idx] < entry.dst_size) {
-                target_dev_idx = -1;
+
+            const int target = commit_bytes(target_dev_idx, group.bytes, 0);
+            if (target >= 0) {
+                stats.device_groups++;
+                stats.device_entries += group.indices.size();
+                stats.device_bytes += group.bytes;
+            } else {
+                stats.host_groups++;
+                stats.host_entries += group.indices.size();
+                stats.host_bytes += group.bytes;
+            }
+
+            for (size_t idx : group.indices) {
+                auto & entry        = plan.entries[idx];
+                entry.on_device     = target >= 0;
+                entry.target_device = target;
             }
         }
-
-        const int target    = commit_bytes(target_dev_idx, entry.dst_size, 0);
-        entry.on_device     = target >= 0;
-        entry.target_device = target;
+        const size_t total_remaining = std::accumulate(remaining.begin(), remaining.end(), size_t(0));
+        log_moe_triplet_pack_stats("PLACEMENT-MOE-MULTI", stats, total_remaining);
     }
 
     // The multi-device plan places all KV on-device (kv_host_bytes = 0) because it

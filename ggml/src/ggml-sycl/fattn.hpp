@@ -100,6 +100,90 @@ struct ggml_sycl_fattn_xmx_decode_kv_layout_plan {
     size_t                                      packed_k_overhead_per_block;
 };
 
+static constexpr int GGML_SYCL_FATTN_XMX_PACKED_K_D            = 64;
+static constexpr int GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS       = 64;
+static constexpr int GGML_SYCL_FATTN_XMX_PACKED_K_TN           = 64;
+static constexpr int GGML_SYCL_FATTN_XMX_PACKED_K_SG           = 16;
+static constexpr int GGML_SYCL_FATTN_XMX_PACKED_K_ACTIVE_LANES = 8;
+static constexpr int GGML_SYCL_FATTN_XMX_PACKED_K_SLOTS =
+    GGML_SYCL_FATTN_XMX_PACKED_K_TN / GGML_SYCL_FATTN_XMX_PACKED_K_SG;
+static constexpr int GGML_SYCL_FATTN_XMX_PACKED_K_HALF_TOKENS =
+    GGML_SYCL_FATTN_XMX_PACKED_K_ACTIVE_LANES * GGML_SYCL_FATTN_XMX_PACKED_K_SLOTS;
+static constexpr size_t GGML_SYCL_FATTN_XMX_PACKED_K_HALFS_PER_HALF =
+    (GGML_SYCL_FATTN_XMX_PACKED_K_D / 2) * (GGML_SYCL_FATTN_XMX_PACKED_K_TN * 2);
+static constexpr size_t GGML_SYCL_FATTN_XMX_PACKED_K_HALFS_PER_BLOCK = 2 * GGML_SYCL_FATTN_XMX_PACKED_K_HALFS_PER_HALF;
+static constexpr size_t GGML_SYCL_FATTN_XMX_PACKED_K_BYTES_PER_BLOCK =
+    GGML_SYCL_FATTN_XMX_PACKED_K_HALFS_PER_BLOCK * sizeof(sycl::half);
+
+static inline size_t ggml_sycl_fattn_xmx_packed_k_element_offset_half(int kv_local, int d) {
+    if (kv_local < 0 || kv_local >= GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS || d < 0 ||
+        d >= GGML_SYCL_FATTN_XMX_PACKED_K_D) {
+        return SIZE_MAX;
+    }
+
+    const int half_id     = kv_local / GGML_SYCL_FATTN_XMX_PACKED_K_HALF_TOKENS;
+    const int compact_col = kv_local - half_id * GGML_SYCL_FATTN_XMX_PACKED_K_HALF_TOKENS;
+    const int active_lane = compact_col % GGML_SYCL_FATTN_XMX_PACKED_K_ACTIVE_LANES;
+    const int slot        = compact_col / GGML_SYCL_FATTN_XMX_PACKED_K_ACTIVE_LANES;
+    const int active_col  = slot * GGML_SYCL_FATTN_XMX_PACKED_K_SG + active_lane;
+
+    return static_cast<size_t>(half_id) * GGML_SYCL_FATTN_XMX_PACKED_K_HALFS_PER_HALF +
+           static_cast<size_t>(d / 2) * (GGML_SYCL_FATTN_XMX_PACKED_K_TN * 2) +
+           static_cast<size_t>(active_col * 2 + (d & 1));
+}
+
+struct ggml_sycl_fattn_xmx_packed_k_materialization_desc {
+    bool required      = false;
+    int  target_device = -1;
+    int  D             = 0;
+    int  n_kv          = 0;
+    int  H_kv          = 0;
+    int  batch         = 0;
+    int  preferred_tk  = 0;
+    int  alternate_tk  = 0;
+    int  block_tokens  = 0;
+    int  n_blocks      = 0;
+
+    size_t source_k_bytes_per_block    = 0;
+    size_t packed_k_bytes_per_block    = 0;
+    size_t packed_k_overhead_per_block = 0;
+    size_t total_blocks                = 0;
+    size_t total_packed_bytes          = 0;
+
+    int64_t k_src_nb1 = 0;
+    int64_t k_src_nb2 = 0;
+    int64_t k_src_nb3 = 0;
+
+    int64_t packed_block_stride = 0;
+    int64_t packed_head_stride  = 0;
+    int64_t packed_batch_stride = 0;
+};
+
+struct ggml_sycl_fattn_xmx_packed_k {
+    ggml_sycl::alloc_handle alloc{};
+    ggml_sycl::mem_handle   handle{};
+    sycl::event             ready_event{};
+
+    int    device      = -1;
+    int    D           = 0;
+    int    n_kv        = 0;
+    int    H_kv        = 0;
+    int    batch       = 0;
+    int    n_blocks    = 0;
+    size_t total_bytes = 0;
+
+    ggml_sycl_fattn_xmx_packed_k() = default;
+    ~ggml_sycl_fattn_xmx_packed_k();
+
+    ggml_sycl_fattn_xmx_packed_k(const ggml_sycl_fattn_xmx_packed_k &)             = delete;
+    ggml_sycl_fattn_xmx_packed_k & operator=(const ggml_sycl_fattn_xmx_packed_k &) = delete;
+
+    ggml_sycl_fattn_xmx_packed_k(ggml_sycl_fattn_xmx_packed_k && other) noexcept;
+    ggml_sycl_fattn_xmx_packed_k & operator=(ggml_sycl_fattn_xmx_packed_k && other) noexcept;
+
+    void reset();
+};
+
 // Plan the future XMX decode KV layout using descriptor and device capability
 // facts only.  PACKED_K_MEM_HANDLE means the planner must materialize a packed
 // K allocation owned by a smart mem_handle before dispatch/graph recording;
@@ -115,6 +199,38 @@ ggml_sycl_fattn_xmx_decode_kv_layout_plan ggml_sycl_flash_attn_ext_xmx_decode_kv
     const sycl::device & dev,
     bool                 k_device_resident,
     bool                 v_device_resident);
+
+bool ggml_sycl_fattn_xmx_packed_k_materialization_desc_from_plan(
+    const fattn_params &                                params,
+    const ggml_sycl_fattn_xmx_decode_kv_layout_plan &   plan,
+    int                                                 target_device,
+    ggml_sycl_fattn_xmx_packed_k_materialization_desc * out);
+
+size_t ggml_sycl_fattn_xmx_packed_k_block_offset_bytes(const ggml_sycl_fattn_xmx_packed_k_materialization_desc & desc,
+                                                       int sequence,
+                                                       int kv_head,
+                                                       int block);
+
+bool ggml_sycl_fattn_xmx_materialize_packed_k(const fattn_params &                              params,
+                                              const ggml_sycl_fattn_xmx_decode_kv_layout_plan & plan,
+                                              int                                               target_device,
+                                              dpct::queue_ptr                                   stream,
+                                              ggml_sycl_fattn_xmx_packed_k *                    out);
+
+ggml_sycl_fattn_xmx_packed_k * ggml_sycl_fattn_xmx_find_packed_k_sidecar(const fattn_params & params,
+                                                                         int                  target_device);
+
+bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows(const ggml_tensor * dst,
+                                                       const ggml_tensor * src0,
+                                                       const ggml_tensor * src1,
+                                                       int                 target_device,
+                                                       const void *        src0_ptr,
+                                                       const void *        index_ptr,
+                                                       dpct::queue_ptr     stream,
+                                                       const sycl::event & set_rows_event,
+                                                       sycl::event *       out_event);
+
+void ggml_sycl_fattn_xmx_unregister_packed_k_range(const void * ptr, size_t size);
 
 #if GGML_SYCL_DNNL
 enum class ggml_sycl_onednn_fa_layout_kind {

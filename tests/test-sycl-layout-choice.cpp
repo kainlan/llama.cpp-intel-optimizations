@@ -1,20 +1,262 @@
 // SYCL unified-cache layout choice test.
 // Verifies that resolve() returns the correct layout for cached weights.
 
+#include "ggml-backend.h"
+#include "ggml-sycl.h"
+#include "ggml.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
-
-#include "ggml-backend.h"
-#include "ggml-sycl.h"
-#include "ggml.h"
 #ifndef GGML_SYCL_WARP_SIZE
-#define GGML_SYCL_WARP_SIZE 32
+#    define GGML_SYCL_WARP_SIZE 32
 #endif
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml-sycl/unified-cache.hpp"
+
+static XMXCapabilities test_mxfp4_caps() {
+    XMXCapabilities caps{};
+    caps.supported                = true;
+    caps.supports_int8            = true;
+    caps.M                        = GGML_SYCL_MXFP4_MOE_XMX_M;
+    caps.N                        = GGML_SYCL_MXFP4_MOE_XMX_N;
+    caps.K                        = GGML_SYCL_MXFP4_MOE_XMX_K;
+    caps.slm_size                 = 64 * 1024;
+    caps.max_work_group_size      = 256;
+    caps.preferred_sub_group_size = GGML_SYCL_MXFP4_MOE_XMX_SG;
+    caps.sub_group_sizes[0]       = GGML_SYCL_MXFP4_MOE_XMX_SG;
+    caps.sub_group_size_count     = 1;
+    caps.optimal_tiles_n          = 4;
+    return caps;
+}
+
+static bool run_mxfp4_moe_policy_test() {
+    XMXCapabilities caps = test_mxfp4_caps();
+
+    auto decision = ggml_sycl_select_mxfp4_moe_layout(caps,
+                                                      /*in_dim=*/2880,
+                                                      /*out_dim=*/2880,
+                                                      /*n_experts=*/128,
+                                                      /*device_resident=*/true,
+                                                      /*tiled_kernel_validated=*/false);
+    if (decision.layout != GGML_LAYOUT_SOA || !decision.tiled_eligible || decision.tiled_selected ||
+        std::strcmp(decision.reason, "xmx-tiled-not-validated-shared-soa") != 0) {
+        printf(
+            "FAIL: expected eligible-but-not-selected tiled MXFP4 decision, got layout=%d eligible=%d selected=%d "
+            "reason=%s\n",
+            (int) decision.layout, decision.tiled_eligible ? 1 : 0, decision.tiled_selected ? 1 : 0, decision.reason);
+        return false;
+    }
+
+    decision = ggml_sycl_select_mxfp4_moe_layout(caps,
+                                                 /*in_dim=*/2880,
+                                                 /*out_dim=*/2880,
+                                                 /*n_experts=*/128,
+                                                 /*device_resident=*/true,
+                                                 /*tiled_kernel_validated=*/true);
+    if (decision.layout != GGML_LAYOUT_XMX_TILED || !decision.tiled_selected ||
+        decision.tile_n_total != (int64_t) (caps.N * caps.optimal_tiles_n)) {
+        printf("FAIL: expected validated tiled MXFP4 decision, got layout=%d selected=%d tile_n=%lld\n",
+               (int) decision.layout, decision.tiled_selected ? 1 : 0, (long long) decision.tile_n_total);
+        return false;
+    }
+
+    XMXCapabilities unsupported = caps;
+    unsupported.supports_int8   = false;
+    decision                    = ggml_sycl_select_mxfp4_moe_layout(unsupported,
+                                                                    /*in_dim=*/4096,
+                                                                    /*out_dim=*/2880,
+                                                                    /*n_experts=*/128,
+                                                                    /*device_resident=*/true,
+                                                                    /*tiled_kernel_validated=*/true);
+    if (decision.layout != GGML_LAYOUT_COALESCED || decision.tiled_eligible) {
+        printf("FAIL: expected non-XMX coalesced fallback, got layout=%d eligible=%d reason=%s\n",
+               (int) decision.layout, decision.tiled_eligible ? 1 : 0, decision.reason);
+        return false;
+    }
+
+    XMXCapabilities different_tile = caps;
+    different_tile.K               = 64;
+    decision                       = ggml_sycl_select_mxfp4_moe_layout(different_tile,
+                                                                       /*in_dim=*/4096,
+                                                                       /*out_dim=*/2880,
+                                                                       /*n_experts=*/128,
+                                                                       /*device_resident=*/true,
+                                                                       /*tiled_kernel_validated=*/true);
+    if (decision.layout != GGML_LAYOUT_COALESCED || decision.tiled_eligible ||
+        std::strcmp(decision.reason, "kernel-tile-shape") != 0) {
+        printf("FAIL: expected tile-shape fallback, got layout=%d eligible=%d reason=%s\n", (int) decision.layout,
+               decision.tiled_eligible ? 1 : 0, decision.reason);
+        return false;
+    }
+
+    decision = ggml_sycl_select_mxfp4_moe_layout(caps,
+                                                 /*in_dim=*/2880,
+                                                 /*out_dim=*/2880,
+                                                 /*n_experts=*/128,
+                                                 /*device_resident=*/false,
+                                                 /*tiled_kernel_validated=*/true);
+    if (decision.layout != GGML_LAYOUT_AOS || decision.tiled_eligible ||
+        std::strcmp(decision.reason, "host-resident-aos") != 0) {
+        printf("FAIL: expected host-resident AOS fallback, got layout=%d eligible=%d reason=%s\n",
+               (int) decision.layout, decision.tiled_eligible ? 1 : 0, decision.reason);
+        return false;
+    }
+
+    printf("PASS: MXFP4 MoE tiled policy is capability/shape/residency driven\n");
+    return true;
+}
+
+static bool run_moe_device_policy_mock_test() {
+    XMXCapabilities full_caps     = test_mxfp4_caps();
+    full_caps.compute_units       = 160;
+    full_caps.global_mem_size     = 12ull * 1024ull * 1024ull * 1024ull;
+    full_caps.max_mem_alloc_size  = 11ull * 1024ull * 1024ull * 1024ull;
+    full_caps.supports_usm_device = true;
+    full_caps.supports_usm_shared = true;
+    full_caps.supports_usm_host   = true;
+    full_caps.supports_fp16       = true;
+    full_caps.supports_fp16_type  = true;
+
+    auto full_policy = ggml_sycl_make_moe_device_policy(full_caps,
+                                                        /*device_id=*/0,
+                                                        /*total_vram=*/12ull * 1024ull * 1024ull * 1024ull,
+                                                        /*free_vram_at_init=*/11ull * 1024ull * 1024ull * 1024ull,
+                                                        /*max_alloc_size=*/11ull * 1024ull * 1024ull * 1024ull,
+                                                        /*safe_max_alloc_size=*/10ull * 1024ull * 1024ull * 1024ull,
+                                                        /*vram_budget=*/10ull * 1024ull * 1024ull * 1024ull,
+                                                        /*weight_budget=*/9ull * 1024ull * 1024ull * 1024ull,
+                                                        /*arena_total=*/10ull * 1024ull * 1024ull * 1024ull,
+                                                        /*arena_scratch=*/256ull * 1024ull * 1024ull,
+                                                        /*arena_runtime=*/512ull * 1024ull * 1024ull,
+                                                        /*arena_onednn=*/256ull * 1024ull * 1024ull,
+                                                        /*in_dim=*/2880,
+                                                        /*out_dim=*/2880,
+                                                        /*n_experts=*/128,
+                                                        /*device_resident=*/true,
+                                                        /*tiled_kernel_validated=*/false);
+    if (!full_policy.xmx_int8_candidate || !full_policy.onednn_candidate || !full_policy.cpu_island_candidate ||
+        full_policy.mxfp4_device_layout.layout != GGML_LAYOUT_SOA ||
+        std::strcmp(full_policy.device_executor, "xmx-mmvq") != 0) {
+        printf(
+            "FAIL: full mocked policy should select XMX-backed SOA executor, got xmx=%d onednn=%d cpu=%d "
+            "layout=%d executor=%s reason=%s\n",
+            full_policy.xmx_int8_candidate ? 1 : 0, full_policy.onednn_candidate ? 1 : 0,
+            full_policy.cpu_island_candidate ? 1 : 0, (int) full_policy.mxfp4_device_layout.layout,
+            full_policy.device_executor, full_policy.executor_reason);
+        return false;
+    }
+
+    XMXCapabilities limited_caps          = full_caps;
+    limited_caps.supported                = false;
+    limited_caps.supports_int8            = false;
+    limited_caps.supports_fp16            = false;
+    limited_caps.supports_fp16_type       = false;
+    limited_caps.supports_usm_shared      = false;
+    limited_caps.supports_usm_host        = false;
+    limited_caps.compute_units            = 32;
+    limited_caps.slm_size                 = 16 * 1024;
+    limited_caps.sub_group_size_count     = 0;
+    limited_caps.max_sub_group_size       = 8;
+    limited_caps.preferred_sub_group_size = 8;
+
+    auto limited_policy = ggml_sycl_make_moe_device_policy(limited_caps,
+                                                           /*device_id=*/1,
+                                                           /*total_vram=*/6ull * 1024ull * 1024ull * 1024ull,
+                                                           /*free_vram_at_init=*/5ull * 1024ull * 1024ull * 1024ull,
+                                                           /*max_alloc_size=*/2ull * 1024ull * 1024ull * 1024ull,
+                                                           /*safe_max_alloc_size=*/1ull * 1024ull * 1024ull * 1024ull,
+                                                           /*vram_budget=*/4ull * 1024ull * 1024ull * 1024ull,
+                                                           /*weight_budget=*/3ull * 1024ull * 1024ull * 1024ull,
+                                                           /*arena_total=*/4ull * 1024ull * 1024ull * 1024ull,
+                                                           /*arena_scratch=*/128ull * 1024ull * 1024ull,
+                                                           /*arena_runtime=*/128ull * 1024ull * 1024ull,
+                                                           /*arena_onednn=*/0,
+                                                           /*in_dim=*/4096,
+                                                           /*out_dim=*/2880,
+                                                           /*n_experts=*/128,
+                                                           /*device_resident=*/true,
+                                                           /*tiled_kernel_validated=*/true);
+    if (limited_policy.xmx_int8_candidate || limited_policy.onednn_candidate || limited_policy.cpu_island_candidate ||
+        limited_policy.mxfp4_device_layout.layout != GGML_LAYOUT_COALESCED ||
+        std::strcmp(limited_policy.mxfp4_device_layout.reason, "no-xmx-coalesced") != 0) {
+        printf(
+            "FAIL: limited mocked policy should fall back by queried capabilities, got xmx=%d onednn=%d cpu=%d "
+            "layout=%d reason=%s\n",
+            limited_policy.xmx_int8_candidate ? 1 : 0, limited_policy.onednn_candidate ? 1 : 0,
+            limited_policy.cpu_island_candidate ? 1 : 0, (int) limited_policy.mxfp4_device_layout.layout,
+            limited_policy.mxfp4_device_layout.reason);
+        return false;
+    }
+
+    printf("PASS: MoE device policy derives executor/layout from mocked hardware facts\n");
+    return true;
+}
+
+static bool run_moe_triplet_planner_test() {
+    constexpr int                                     n_experts = 4;
+    const std::vector<std::pair<std::string, size_t>> inventory = {
+        { "blk.0.ffn_gate_exps.weight", 40  },
+        { "blk.0.ffn_up_exps.weight",   80  },
+        { "blk.0.ffn_down_exps.weight", 120 },
+        { "blk.0.ffn_gate_exps.bias",   16  },
+        { "blk.0.ffn_up_exps.bias",     16  },
+        { "blk.0.ffn_down_exps.bias",   16  },
+    };
+
+    ggml_sycl::placement_kv_info kv_info{};
+    const size_t                 bias_bytes               = 48;
+    const size_t                 triplet_bytes_per_expert = 10 + 20 + 30;
+    const size_t                 budget                   = bias_bytes + 2 * triplet_bytes_per_expert + 1;
+    auto       plan    = ggml_sycl::compute_placement_plan(inventory, budget, 0, kv_info, nullptr, n_experts);
+    const auto summary = plan.summarize_expert_placements(1, n_experts);
+
+    if (summary.expected != 12 || summary.planned != summary.expected || summary.duplicates != 0 ||
+        summary.unclassified != 0 || summary.missing != 0) {
+        printf("FAIL: expected 12 unique expert weight placements, got planned=%zu expected=%zu dup=%zu miss=%zu\n",
+               summary.planned, summary.expected, summary.duplicates, summary.missing);
+        return false;
+    }
+    if (!plan.has_dense_entry("blk.0.ffn_gate_exps.bias") || !plan.has_dense_entry("blk.0.ffn_up_exps.bias") ||
+        !plan.has_dense_entry("blk.0.ffn_down_exps.bias")) {
+        printf("FAIL: expert bias tensors should remain dense planner entries, not per-expert placements\n");
+        return false;
+    }
+
+    size_t device_triplets = 0;
+    size_t host_triplets   = 0;
+    for (int e = 0; e < n_experts; ++e) {
+        const auto gate = plan.lookup_expert_placement(0, e, ggml_sycl::expert_tensor_role::GATE);
+        const auto up   = plan.lookup_expert_placement(0, e, ggml_sycl::expert_tensor_role::UP);
+        const auto down = plan.lookup_expert_placement(0, e, ggml_sycl::expert_tensor_role::DOWN);
+        if (!gate.found() || !up.found() || !down.found()) {
+            printf("FAIL: missing triplet placement for expert %d\n", e);
+            return false;
+        }
+        if (gate.on_device != up.on_device || gate.on_device != down.on_device ||
+            gate.target_device != up.target_device || gate.target_device != down.target_device) {
+            printf("FAIL: mixed residency in expert %d triplet: gate=%d/%d up=%d/%d down=%d/%d\n", e,
+                   gate.on_device ? 1 : 0, gate.target_device, up.on_device ? 1 : 0, up.target_device,
+                   down.on_device ? 1 : 0, down.target_device);
+            return false;
+        }
+        if (gate.on_device) {
+            device_triplets++;
+        } else {
+            host_triplets++;
+        }
+    }
+    if (device_triplets != 2 || host_triplets != 2) {
+        printf("FAIL: expected 2 device and 2 host triplets, got device=%zu host=%zu\n", device_triplets,
+               host_triplets);
+        return false;
+    }
+
+    printf("PASS: MoE planner packs gate/up/down as triplets and excludes expert biases\n");
+    return true;
+}
 
 static bool run_layout_choice_test() {
     ggml_backend_t backend = ggml_backend_sycl_init(0);
@@ -64,9 +306,15 @@ static bool run_layout_choice_test() {
 
     if (!weight_buf || !input_buf || !output_buf) {
         printf("FAIL: buffer allocation failed\n");
-        if (weight_buf) ggml_backend_buffer_free(weight_buf);
-        if (input_buf) ggml_backend_buffer_free(input_buf);
-        if (output_buf) ggml_backend_buffer_free(output_buf);
+        if (weight_buf) {
+            ggml_backend_buffer_free(weight_buf);
+        }
+        if (input_buf) {
+            ggml_backend_buffer_free(input_buf);
+        }
+        if (output_buf) {
+            ggml_backend_buffer_free(output_buf);
+        }
         ggml_free(ctx);
         ggml_backend_free(backend);
         return false;
@@ -114,8 +362,8 @@ static bool run_layout_choice_test() {
         return false;
     }
 
-    auto resolved_layout = ggml_sycl_resolve(weight, 0);
-    layout_mode chosen_layout = resolved_layout ? static_cast<layout_mode>(resolved_layout.layout) : GGML_LAYOUT_AOS;
+    auto        resolved_layout = ggml_sycl_resolve(weight, 0);
+    layout_mode chosen_layout   = resolved_layout ? static_cast<layout_mode>(resolved_layout.layout) : GGML_LAYOUT_AOS;
     if (!resolved_layout) {
         printf("FAIL: missing cache entry for weight after finalize\n");
         ggml_backend_buffer_free(weight_buf);
@@ -135,7 +383,7 @@ static bool run_layout_choice_test() {
         return false;
     }
 
-    sycl::queue & q = dpct::dev_mgr::instance().get_device(0).default_queue();
+    sycl::queue &              q     = dpct::dev_mgr::instance().get_device(0).default_queue();
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache(q);
     if (!cache) {
         printf("SKIP: unified cache unavailable\n");
@@ -147,9 +395,9 @@ static bool run_layout_choice_test() {
         return true;
     }
 
-    ggml_sycl_cache_id key = ggml_backend_sycl_get_weight_cache_key(weight, 0);
-    const bool   soa_cached = key.valid && cache->is_cached(key, GGML_LAYOUT_SOA);
-    const bool   coa_cached = key.valid && cache->is_cached(key, GGML_LAYOUT_COALESCED);
+    ggml_sycl_cache_id key        = ggml_backend_sycl_get_weight_cache_key(weight, 0);
+    const bool         soa_cached = key.valid && cache->is_cached(key, GGML_LAYOUT_SOA);
+    const bool         coa_cached = key.valid && cache->is_cached(key, GGML_LAYOUT_COALESCED);
 
     ggml_backend_buffer_free(weight_buf);
     ggml_backend_buffer_free(input_buf);
@@ -171,7 +419,16 @@ static bool run_layout_choice_test() {
 }
 
 int main() {
+    if (!run_mxfp4_moe_policy_test()) {
+        return 1;
+    }
+    if (!run_moe_device_policy_mock_test()) {
+        return 1;
+    }
+    if (!run_moe_triplet_planner_test()) {
+        return 1;
+    }
     ggml_sycl::test_layout_override_guard guard(GGML_LAYOUT_SOA);
-    bool ok = run_layout_choice_test();
+    bool                                  ok = run_layout_choice_test();
     return ok ? 0 : 1;
 }

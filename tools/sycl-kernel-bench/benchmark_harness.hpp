@@ -124,6 +124,34 @@ static inline int64_t parse_moe_token_rows(const std::string & kernel_name) {
     return 1;
 }
 
+static inline int parse_moe_scale_stride_blocks(const std::string & kernel_name, int64_t k) {
+    (void) k;
+    if (kernel_name.find("_scale128") != std::string::npos) {
+        return 128;
+    }
+    if (kernel_name.find("_scale96") != std::string::npos) {
+        return 96;
+    }
+    return 0;
+}
+
+static inline int parse_moe_xmx_tiles_n(const std::string & kernel_name) {
+    if (kernel_name.find("_tn4") != std::string::npos) {
+        return 4;
+    }
+    if (kernel_name.find("_tn2") != std::string::npos) {
+        return 2;
+    }
+    return 1;
+}
+
+static inline int parse_moe_subgroup_size(const std::string & kernel_name) {
+    if (kernel_name.find("_sg16") != std::string::npos) {
+        return 16;
+    }
+    return 32;
+}
+
 struct DeviceInfo {
     std::string         name;
     std::string         vendor;
@@ -1016,7 +1044,16 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                     return false;
                 }
                 GeneratedActivations activations = generate_activations(n, k, k, false, true, false);
-                const int            scale_mode  = config.kernel_name.find("f32scale") != std::string::npos ? 1 : 0;
+                int                  scale_mode  = 0;
+                if (config.kernel_name.find("f32scale") != std::string::npos) {
+                    scale_mode |= 1;
+                }
+                if (config.kernel_name.find("f32dst") != std::string::npos) {
+                    scale_mode |= 2;
+                }
+                if (config.kernel_name.find("user") != std::string::npos) {
+                    scale_mode |= 4;
+                }
                 if (!run_onednn_mxfp4_gemm(weights, activations, m, n, k, config.warmup_iterations,
                                            config.measure_iterations, config.validate, scale_mode, queue, metrics,
                                            error)) {
@@ -1095,18 +1132,26 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                     out.error = "Failed to generate MXFP4 SOA weights for pair-GLU benchmark.";
                     return false;
                 }
-                const int64_t        token_rows  = parse_moe_token_rows(config.kernel_name);
-                GeneratedActivations activations = generate_activations(token_rows, k, k, false, false, true);
-                const int            rows_per_wg = parse_moe_rows_per_wg(config.kernel_name);
-                const bool           cache_y     = config.kernel_name.find("_cache") != std::string::npos &&
+                const int64_t        selected_count = config.dim_n;
+                const int64_t        token_rows     = parse_moe_token_rows(config.kernel_name);
+                GeneratedActivations activations    = generate_activations(token_rows, k, k, false, false, true);
+                const int            rows_per_wg    = parse_moe_rows_per_wg(config.kernel_name);
+                const bool           cache_y        = config.kernel_name.find("_cache") != std::string::npos &&
                                      config.kernel_name.find("_nocache") == std::string::npos;
                 const bool direct_xmx          = config.kernel_name.find("_xmx_") != std::string::npos;
+                const bool split_gate_up       = config.kernel_name.find("_split") != std::string::npos;
+                const int  xmx_tiles_n         = parse_moe_xmx_tiles_n(config.kernel_name);
+                const bool vector_qs_load      = config.kernel_name.find("_vecq") != std::string::npos;
                 const bool ignore_weight_scale = config.kernel_name.find("_noscale") != std::string::npos;
+                const int  scale_stride_blocks = parse_moe_scale_stride_blocks(config.kernel_name, k);
+                const int  subgroup_size       = parse_moe_subgroup_size(config.kernel_name);
                 const bool sparse_expert_slots = config.kernel_name.find("_sparse32") != std::string::npos;
                 const bool use_bias            = config.kernel_name.find("_bias") != std::string::npos;
-                if (!run_mxfp4_pair_glu(weights, activations, m, n, k, token_rows, rows_per_wg, cache_y, direct_xmx,
-                                        ignore_weight_scale, sparse_expert_slots, use_bias, config.validate,
-                                        config.warmup_iterations, config.measure_iterations, queue, metrics, error)) {
+                if (!run_mxfp4_pair_glu(weights, activations, m, selected_count, k, token_rows, rows_per_wg, cache_y,
+                                        direct_xmx, split_gate_up, xmx_tiles_n, vector_qs_load, ignore_weight_scale,
+                                        scale_stride_blocks, subgroup_size, sparse_expert_slots, use_bias,
+                                        config.validate, config.warmup_iterations, config.measure_iterations, queue,
+                                        metrics, error)) {
                     out.error = error;
                     return false;
                 }
@@ -1123,14 +1168,117 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                     out.error = "Failed to generate MXFP4 SOA weights for MMV-ID benchmark.";
                     return false;
                 }
+                const int64_t        selected_count = config.dim_n;
+                const int64_t        token_rows     = parse_moe_token_rows(config.kernel_name);
+                GeneratedActivations activations    = generate_activations(token_rows, k, k, false, false, true);
+                const int            rows_per_wg    = parse_moe_rows_per_wg(config.kernel_name);
+                const bool           cache_y        = config.kernel_name.find("_cache") != std::string::npos &&
+                                     config.kernel_name.find("_nocache") == std::string::npos;
+                const bool vector_qs_load      = config.kernel_name.find("_vecq") != std::string::npos;
+                const bool ignore_weight_scale = config.kernel_name.find("_noscale") != std::string::npos;
+                const bool predecoded_i8       = config.kernel_name.find("_predecoded") != std::string::npos;
+                const int  scale_stride_blocks = parse_moe_scale_stride_blocks(config.kernel_name, k);
+                const int  subgroup_size       = parse_moe_subgroup_size(config.kernel_name);
+                const bool sparse_expert_slots = config.kernel_name.find("_sparse32") != std::string::npos;
+                if (!run_mxfp4_mmv_id(weights, activations, m, selected_count, k, token_rows, rows_per_wg, cache_y,
+                                      predecoded_i8, config.validate, vector_qs_load, ignore_weight_scale,
+                                      scale_stride_blocks, subgroup_size, sparse_expert_slots, config.warmup_iterations,
+                                      config.measure_iterations, queue, metrics, error)) {
+                    out.error = error;
+                    return false;
+                }
+                break;
+            }
+        case KernelKind::MXFP4_MMV_ID_XMX_TILED:
+            {
+                GeneratedWeights weights;
+                if (!generate_quantized_weights(GGML_TYPE_MXFP4, GGML_LAYOUT_SOA, m, k, false, weights)) {
+                    out.error = "Failed to generate MXFP4 SOA weights for XMX-tiled MMV-ID benchmark.";
+                    return false;
+                }
+                const int64_t        selected_count      = config.dim_n;
                 const int64_t        token_rows          = parse_moe_token_rows(config.kernel_name);
                 GeneratedActivations activations         = generate_activations(token_rows, k, k, false, false, true);
-                const int            rows_per_wg         = parse_moe_rows_per_wg(config.kernel_name);
-                const bool           ignore_weight_scale = config.kernel_name.find("_noscale") != std::string::npos;
+                const int            requested_tiles_n   = parse_moe_xmx_tiles_n(config.kernel_name);
+                const bool           explicit_tiles_n    = config.kernel_name.find("_tn") != std::string::npos;
                 const bool           sparse_expert_slots = config.kernel_name.find("_sparse32") != std::string::npos;
-                if (!run_mxfp4_mmv_id(weights, activations, m, n, k, token_rows, rows_per_wg, config.validate,
-                                      ignore_weight_scale, sparse_expert_slots, config.warmup_iterations,
-                                      config.measure_iterations, queue, metrics, error)) {
+                const bool           raw_accum           = config.kernel_name.find("_raw") != std::string::npos;
+                if (!run_mxfp4_mmv_id_xmx_tiled(weights, activations, m, selected_count, k, token_rows,
+                                                explicit_tiles_n ? requested_tiles_n : 0, sparse_expert_slots,
+                                                raw_accum, config.validate, config.warmup_iterations,
+                                                config.measure_iterations, queue, metrics, error)) {
+                    out.error = error;
+                    return false;
+                }
+                break;
+            }
+        case KernelKind::MXFP4_DPAS_GROUPED:
+            {
+                GeneratedWeights weights;
+                if (!generate_quantized_weights(GGML_TYPE_MXFP4, GGML_LAYOUT_SOA, m, k, false, weights)) {
+                    out.error = "Failed to generate MXFP4 SOA weights for DPAS grouped benchmark.";
+                    return false;
+                }
+                GeneratedActivations activations = generate_activations(config.dim_n, k, k, false, false, true);
+                int                  ntiles      = 1;
+                if (config.kernel_name.find("_nt4") != std::string::npos) {
+                    ntiles = 4;
+                } else if (config.kernel_name.find("_nt2") != std::string::npos) {
+                    ntiles = 2;
+                }
+                const bool use_prefetch4 = config.kernel_name.find("_pf4") != std::string::npos;
+                if (config.kernel_name.find("_compact_raw") != std::string::npos) {
+                    if (!run_mxfp4_dpas_grouped_compact_raw(weights, activations, m, config.dim_n, k, ntiles,
+                                                            config.validate, config.warmup_iterations,
+                                                            config.measure_iterations, queue, metrics, error)) {
+                        out.error = error;
+                        return false;
+                    }
+                } else if (config.kernel_name.find("_scaled_predecoded") != std::string::npos) {
+                    const bool packed_scales = config.kernel_name.find("_ps") != std::string::npos;
+                    if (!run_mxfp4_dpas_grouped_scaled_predecoded(
+                            weights, activations, m, config.dim_n, k, ntiles, packed_scales, config.validate,
+                            config.warmup_iterations, config.measure_iterations, queue, metrics, error)) {
+                        out.error = error;
+                        return false;
+                    }
+                } else {
+                    if (!run_mxfp4_dpas_grouped_raw(weights, activations, m, config.dim_n, k, ntiles, use_prefetch4,
+                                                    config.validate, config.warmup_iterations,
+                                                    config.measure_iterations, queue, metrics, error)) {
+                        out.error = error;
+                        return false;
+                    }
+                }
+                break;
+            }
+        case KernelKind::MXFP4_LAYER_GLU_DOWN:
+            {
+                if (config.layout != GGML_LAYOUT_SOA) {
+                    out.error = "mxfp4_layer_glu_down requires SOA layout.";
+                    return false;
+                }
+                GeneratedWeights weights;
+                if (!generate_quantized_weights(GGML_TYPE_MXFP4, GGML_LAYOUT_SOA, m, k, false, weights)) {
+                    out.error = "Failed to generate MXFP4 SOA weights for layer GLU/down benchmark.";
+                    return false;
+                }
+                const int64_t        selected_count = config.dim_n;
+                const int64_t        token_rows     = parse_moe_token_rows(config.kernel_name);
+                GeneratedActivations activations    = generate_activations(token_rows, k, k, false, false, true);
+                const int            rows_per_wg    = parse_moe_rows_per_wg(config.kernel_name);
+                const bool           cache_y        = config.kernel_name.find("_cache") != std::string::npos &&
+                                     config.kernel_name.find("_nocache") == std::string::npos;
+                const bool vector_qs_load      = config.kernel_name.find("_vecq") != std::string::npos;
+                const bool ignore_weight_scale = config.kernel_name.find("_noscale") != std::string::npos;
+                const int  scale_stride_blocks = parse_moe_scale_stride_blocks(config.kernel_name, k);
+                const int  subgroup_size       = parse_moe_subgroup_size(config.kernel_name);
+                const bool sparse_expert_slots = config.kernel_name.find("_sparse32") != std::string::npos;
+                const bool use_bias            = config.kernel_name.find("_bias") != std::string::npos;
+                if (!run_mxfp4_layer_glu_down(
+                        weights, activations, m, selected_count, k, token_rows, rows_per_wg, cache_y, vector_qs_load,
+                        ignore_weight_scale, scale_stride_blocks, subgroup_size, sparse_expert_slots, use_bias,
+                        config.validate, config.warmup_iterations, config.measure_iterations, queue, metrics, error)) {
                     out.error = error;
                     return false;
                 }

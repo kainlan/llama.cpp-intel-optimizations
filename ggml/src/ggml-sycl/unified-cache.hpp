@@ -2053,6 +2053,8 @@ class unified_cache {
     void   grow_scratch_zone(size_t additional_bytes);
 
     size_t pinned_pool_budget() const { return host_arena_ ? host_arena_->budget() : 0; }
+    size_t pinned_pool_committed() const { return host_arena_ ? host_arena_->allocated() : 0; }
+    size_t pinned_pool_chunk_count() const { return host_arena_ ? host_arena_->chunk_count() : 0; }
 
     bool   contains_pinned(const void * ptr) const;
     size_t pre_allocate_host_pool(size_t total_bytes);

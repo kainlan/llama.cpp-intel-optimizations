@@ -707,6 +707,7 @@ enum ggml_layout_mode {
     GGML_LAYOUT_AOS = 0,           // Array-of-Structures (original/mmap)
     GGML_LAYOUT_SOA,               // Structure-of-Arrays
     GGML_LAYOUT_COALESCED,         // Warp-coalesced tile layout
+    GGML_LAYOUT_MXFP4_I8,          // MXFP4 predecoded int8 mantissas + E8M0 scales
     GGML_LAYOUT_XMX_TILED,         // XMX tile-aligned layout (MXFP4 MoE)
     GGML_LAYOUT_XMX_GEMM_TILED,    // XMX GEMM tiled layout (quant/int8 weights)
     GGML_LAYOUT_ONEDNN_PACKED,     // oneDNN packed weight layout (matmul primitive)

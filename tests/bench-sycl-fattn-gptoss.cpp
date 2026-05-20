@@ -4,6 +4,7 @@
 #include "ggml-sycl/fattn-vec-f16.hpp"
 #include "ggml-sycl/fattn-xmx-f16-v2.hpp"
 #include "ggml-sycl/fattn-xmx-f16.hpp"
+#include "ggml-sycl/fattn.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -391,6 +392,21 @@ static void run_shape(const bench_shape & shape) {
         throw std::runtime_error("split-KV partial allocation failed");
     }
 
+    ggml_sycl_fattn_xmx_packed_k packed_k;
+    bool                         packed_k_ready = false;
+    if (decode_shape) {
+        const ggml_sycl_fattn_xmx_decode_kv_layout_plan packed_plan =
+            ggml_sycl_flash_attn_ext_xmx_decode_kv_layout_plan(params, D, q->get_device(), true, true);
+        std::printf(
+            "XMX decode packed-K plan: kind=%d reason=%d preferred_tk=%d alternate_tk=%d block_tokens=%d "
+            "packed_block_bytes=%zu\n",
+            (int) packed_plan.kind, (int) packed_plan.reason, packed_plan.preferred_tk, packed_plan.alternate_tk,
+            packed_plan.kv_block_tokens, packed_plan.packed_k_bytes_per_block);
+        if (packed_plan.kind == ggml_sycl_fattn_xmx_decode_kv_layout_kind::PACKED_K_MEM_HANDLE) {
+            packed_k_ready = ggml_sycl_fattn_xmx_materialize_packed_k(params, packed_plan, ctx.device, q, &packed_k);
+        }
+    }
+
     std::printf("\nshape=%s D=%d n_q=%d n_kv=%d H_q=%d H_kv=%d sinks=1 logit_softcap=%.1f scale=%.8f\n", shape.name, D,
                 shape.n_q, N_KV, H_Q, H_KV, shape.logit_softcap, params.scale);
 #    if GGML_SYCL_DNNL
@@ -419,6 +435,24 @@ static void run_shape(const bench_shape & shape) {
     };
 
     if (decode_shape) {
+        if (packed_k_ready) {
+            (void) run_and_report(
+                "xmx-v2-split-packed-k32", output_layout::public_qhd,
+                [&]() {
+                    const bool ok = params.logit_softcap == 0.0f ?
+                                        launch_fattn_xmx_v2_decode_gqa_split_packed_tk<D, false, sycl::half, 32>(
+                                            ctx, params, q, &packed_k, split_partial_max, split_partial_sum,
+                                            split_partial_out, split_n_partitions) :
+                                        launch_fattn_xmx_v2_decode_gqa_split_packed_tk<D, true, sycl::half, 32>(
+                                            ctx, params, q, &packed_k, split_partial_max, split_partial_sum,
+                                            split_partial_out, split_n_partitions);
+                    if (!ok) {
+                        throw std::runtime_error("xmx-v2 packed gqa-split-k32 decode rejected shape");
+                    }
+                },
+                "planner-owned packed-K mem_handle, global ext_intel_packed load");
+        }
+
         (void) run_and_report(
             "xmx-v2-gqa-split-k32", output_layout::public_qhd,
             [&]() {
@@ -566,6 +600,42 @@ static void run_shape(const bench_shape & shape) {
                 }
             },
             "default public layout");
+
+        (void) run_and_report(
+            "xmx-v2-ncols16-afloat", output_layout::public_qhd,
+            [&]() {
+                const bool ok = params.logit_softcap == 0.0f ?
+                                    launch_fattn_xmx_v2_f16<D, 16, false, sycl::half, afloat>(ctx, params, q) :
+                                    launch_fattn_xmx_v2_f16<D, 16, true, sycl::half, afloat>(ctx, params, q);
+                if (!ok) {
+                    throw std::runtime_error("xmx-v2 afloat rejected shape");
+                }
+            },
+            "half accumulator diagnostic");
+
+        (void) run_and_report(
+            "xmx-v2-ncols32-afloat", output_layout::public_qhd,
+            [&]() {
+                const bool ok = params.logit_softcap == 0.0f ?
+                                    launch_fattn_xmx_v2_f16<D, 32, false, sycl::half, afloat>(ctx, params, q) :
+                                    launch_fattn_xmx_v2_f16<D, 32, true, sycl::half, afloat>(ctx, params, q);
+                if (!ok) {
+                    throw std::runtime_error("xmx-v2 ncols32 afloat rejected shape");
+                }
+            },
+            "wider query tile diagnostic");
+
+        (void) run_and_report(
+            "xmx-v2-ncols8", output_layout::public_qhd,
+            [&]() {
+                const bool ok = params.logit_softcap == 0.0f ?
+                                    launch_fattn_xmx_v2_f16<D, 8, false, sycl::half, float>(ctx, params, q) :
+                                    launch_fattn_xmx_v2_f16<D, 8, true, sycl::half, float>(ctx, params, q);
+                if (!ok) {
+                    throw std::runtime_error("xmx-v2 ncols8 rejected shape");
+                }
+            },
+            "narrower query tile diagnostic");
 
         (void) run_and_report(
             "xmx-v1-ncols8", output_layout::public_qhd,

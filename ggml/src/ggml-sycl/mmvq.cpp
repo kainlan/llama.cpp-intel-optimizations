@@ -10,10 +10,12 @@
 #include "unified-kernel.hpp"  // For split barrier support
 #include "vecdotq.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <climits>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <type_traits>
 
 static thread_local mmvq_moe_dispatch_timing g_mmvq_moe_dispatch_timing;
@@ -225,7 +227,8 @@ static bool mxfp4_moe_tg_reuse_candidate(const ggml_tensor * src0,
     if (layer_out) {
         *layer_out = layer;
     }
-    if (type != GGML_TYPE_MXFP4 || layout != GGML_LAYOUT_SOA || ne12 != 1 || layer < 0) {
+    const bool y_soa_layout = layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_MXFP4_I8;
+    if (type != GGML_TYPE_MXFP4 || !y_soa_layout || ne12 != 1 || layer < 0) {
         return false;
     }
     if (role == mxfp4_moe_role::GATE || role == mxfp4_moe_role::UP) {
@@ -3182,7 +3185,7 @@ static void mul_mat_vec_q_mxfp4_q8_1_id(const void * __restrict__ vx,
     const int iid1 = batch_idx - id * n_tokens;  // Token position
 
     // Read expert ID from ids tensor using proper 2D indexing
-    const int32_t expert_id = *(const int32_t *) ((const char *) ids + iid1 * ids_nb1 + id * ids_nb0);
+    const int32_t expert_id = ids ? *(const int32_t *) ((const char *) ids + iid1 * ids_nb1 + id * ids_nb0) : -1;
 
     // Compute src1 and dst offsets matching host-side logic
     const int64_t i11 = id % ne11;
@@ -3260,7 +3263,99 @@ static void mul_mat_vec_mxfp4_q8_1_id_sycl(const void *         vx,
     });
 }
 
-template <bool USE_WEIGHT_SCALE = true>
+template <bool VECTOR_QS_LOAD = false>
+static __dpct_inline__ int mxfp4_soa_q8_1_block_sumi(const uint8_t * __restrict__ qs, const int * __restrict__ q8_qs) {
+    int sumi = 0;
+    if constexpr (VECTOR_QS_LOAD) {
+        const sycl::int4 aux_q4 = *((const sycl::int4 *) qs);
+        const sycl::int2 v0     = get_int_from_table_16(aux_q4.x(), kvalues_mxfp4);
+        const sycl::int2 v1     = get_int_from_table_16(aux_q4.y(), kvalues_mxfp4);
+        const sycl::int2 v2     = get_int_from_table_16(aux_q4.z(), kvalues_mxfp4);
+        const sycl::int2 v3     = get_int_from_table_16(aux_q4.w(), kvalues_mxfp4);
+
+        sumi = ggml_sycl_dp4a(v0.x(), q8_qs[0], sumi);
+        sumi = ggml_sycl_dp4a(v0.y(), q8_qs[4], sumi);
+        sumi = ggml_sycl_dp4a(v1.x(), q8_qs[1], sumi);
+        sumi = ggml_sycl_dp4a(v1.y(), q8_qs[5], sumi);
+        sumi = ggml_sycl_dp4a(v2.x(), q8_qs[2], sumi);
+        sumi = ggml_sycl_dp4a(v2.y(), q8_qs[6], sumi);
+        sumi = ggml_sycl_dp4a(v3.x(), q8_qs[3], sumi);
+        sumi = ggml_sycl_dp4a(v3.y(), q8_qs[7], sumi);
+    } else {
+#pragma unroll
+        for (int i = 0; i < QK_MXFP4 / 2; i += 4) {
+            const int        aux_q4 = *((const int *) (qs + i));
+            const sycl::int2 v      = get_int_from_table_16(aux_q4, kvalues_mxfp4);
+
+            sumi = ggml_sycl_dp4a(v.x(), q8_qs[i / 4], sumi);
+            sumi = ggml_sycl_dp4a(v.y(), q8_qs[i / 4 + 4], sumi);
+        }
+    }
+    return sumi;
+}
+
+template <bool VECTOR_QS_LOAD = false>
+static __dpct_inline__ void mxfp4_soa_q8_1_block_sumi_pair(const uint8_t * __restrict__ qs_a,
+                                                           const uint8_t * __restrict__ qs_b,
+                                                           const int * __restrict__ q8_qs,
+                                                           int & sumi_a,
+                                                           int & sumi_b) {
+    sumi_a = 0;
+    sumi_b = 0;
+    if constexpr (VECTOR_QS_LOAD) {
+        const sycl::int4 aux_q4_a = *((const sycl::int4 *) qs_a);
+        const sycl::int4 aux_q4_b = *((const sycl::int4 *) qs_b);
+
+        const sycl::int2 va0 = get_int_from_table_16(aux_q4_a.x(), kvalues_mxfp4);
+        const sycl::int2 va1 = get_int_from_table_16(aux_q4_a.y(), kvalues_mxfp4);
+        const sycl::int2 va2 = get_int_from_table_16(aux_q4_a.z(), kvalues_mxfp4);
+        const sycl::int2 va3 = get_int_from_table_16(aux_q4_a.w(), kvalues_mxfp4);
+
+        const sycl::int2 vb0 = get_int_from_table_16(aux_q4_b.x(), kvalues_mxfp4);
+        const sycl::int2 vb1 = get_int_from_table_16(aux_q4_b.y(), kvalues_mxfp4);
+        const sycl::int2 vb2 = get_int_from_table_16(aux_q4_b.z(), kvalues_mxfp4);
+        const sycl::int2 vb3 = get_int_from_table_16(aux_q4_b.w(), kvalues_mxfp4);
+
+        sumi_a = ggml_sycl_dp4a(va0.x(), q8_qs[0], sumi_a);
+        sumi_a = ggml_sycl_dp4a(va0.y(), q8_qs[4], sumi_a);
+        sumi_b = ggml_sycl_dp4a(vb0.x(), q8_qs[0], sumi_b);
+        sumi_b = ggml_sycl_dp4a(vb0.y(), q8_qs[4], sumi_b);
+
+        sumi_a = ggml_sycl_dp4a(va1.x(), q8_qs[1], sumi_a);
+        sumi_a = ggml_sycl_dp4a(va1.y(), q8_qs[5], sumi_a);
+        sumi_b = ggml_sycl_dp4a(vb1.x(), q8_qs[1], sumi_b);
+        sumi_b = ggml_sycl_dp4a(vb1.y(), q8_qs[5], sumi_b);
+
+        sumi_a = ggml_sycl_dp4a(va2.x(), q8_qs[2], sumi_a);
+        sumi_a = ggml_sycl_dp4a(va2.y(), q8_qs[6], sumi_a);
+        sumi_b = ggml_sycl_dp4a(vb2.x(), q8_qs[2], sumi_b);
+        sumi_b = ggml_sycl_dp4a(vb2.y(), q8_qs[6], sumi_b);
+
+        sumi_a = ggml_sycl_dp4a(va3.x(), q8_qs[3], sumi_a);
+        sumi_a = ggml_sycl_dp4a(va3.y(), q8_qs[7], sumi_a);
+        sumi_b = ggml_sycl_dp4a(vb3.x(), q8_qs[3], sumi_b);
+        sumi_b = ggml_sycl_dp4a(vb3.y(), q8_qs[7], sumi_b);
+    } else {
+#pragma unroll
+        for (int i = 0; i < QK_MXFP4 / 2; i += 4) {
+            const int aux_q4_a = *((const int *) (qs_a + i));
+            const int aux_q4_b = *((const int *) (qs_b + i));
+
+            const sycl::int2 va = get_int_from_table_16(aux_q4_a, kvalues_mxfp4);
+            const sycl::int2 vb = get_int_from_table_16(aux_q4_b, kvalues_mxfp4);
+
+            const int q8_0 = q8_qs[i / 4];
+            const int q8_1 = q8_qs[i / 4 + 4];
+
+            sumi_a = ggml_sycl_dp4a(va.x(), q8_0, sumi_a);
+            sumi_a = ggml_sycl_dp4a(va.y(), q8_1, sumi_a);
+            sumi_b = ggml_sycl_dp4a(vb.x(), q8_0, sumi_b);
+            sumi_b = ggml_sycl_dp4a(vb.y(), q8_1, sumi_b);
+        }
+    }
+}
+
+template <bool USE_WEIGHT_SCALE = true, bool VECTOR_QS_LOAD = false>
 static __dpct_inline__ float mxfp4_soa_q8_1_block_dot(const uint8_t * __restrict__ qs_row,
                                                       const uint8_t * __restrict__ scale_row,
                                                       const char * __restrict__ y_base,
@@ -3272,15 +3367,68 @@ static __dpct_inline__ float mxfp4_soa_q8_1_block_dot(const uint8_t * __restrict
 
     const uint8_t * qs = qs_row + b * (QK_MXFP4 / 2);
 
+    const int sumi = mxfp4_soa_q8_1_block_sumi<VECTOR_QS_LOAD>(qs, q8_qs);
+
+    if constexpr (USE_WEIGHT_SCALE) {
+        const uint8_t e8m0 = scale_row[b];
+        const float   d    = ggml_sycl_e8m0_to_fp32(e8m0) * 0.5f;
+        return d * d8 * sumi;
+    } else {
+        GGML_UNUSED(scale_row);
+        return d8 * sumi;
+    }
+}
+
+template <bool USE_WEIGHT_SCALE = true, bool VECTOR_QS_LOAD = false>
+static __dpct_inline__ float mxfp4_soa_q8_1_block_dot_slm(const uint8_t * __restrict__ qs_row,
+                                                          const uint8_t * __restrict__ scale_row,
+                                                          const int * __restrict__ y_qs,
+                                                          const sycl::half2 * __restrict__ y_ds,
+                                                          const int y_qs_stride,
+                                                          const int b) {
+    const int *         q8_qs = y_qs + b * y_qs_stride;
+    const sycl::half2 * q8_ds = y_ds + b;
+    const float         d8    = (float) (*q8_ds)[0];
+
+    const uint8_t * qs = qs_row + b * (QK_MXFP4 / 2);
+
+    const int sumi = mxfp4_soa_q8_1_block_sumi<VECTOR_QS_LOAD>(qs, q8_qs);
+
+    if constexpr (USE_WEIGHT_SCALE) {
+        const uint8_t e8m0 = scale_row[b];
+        const float   d    = ggml_sycl_e8m0_to_fp32(e8m0) * 0.5f;
+        return d * d8 * sumi;
+    } else {
+        GGML_UNUSED(scale_row);
+        return d8 * sumi;
+    }
+}
+
+static __dpct_inline__ int mxfp4_i8_q8_1_block_sumi(const int8_t * __restrict__ qs, const int * __restrict__ q8_qs) {
     int sumi = 0;
 #pragma unroll
     for (int i = 0; i < QK_MXFP4 / 2; i += 4) {
-        const int        aux_q4 = *((const int *) (qs + i));
-        const sycl::int2 v      = get_int_from_table_16(aux_q4, kvalues_mxfp4);
+        const int w_lo = *((const int *) (qs + i));
+        const int w_hi = *((const int *) (qs + QK_MXFP4 / 2 + i));
 
-        sumi = ggml_sycl_dp4a(v.x(), q8_qs[i / 4], sumi);
-        sumi = ggml_sycl_dp4a(v.y(), q8_qs[i / 4 + 4], sumi);
+        sumi = ggml_sycl_dp4a(w_lo, q8_qs[i / 4], sumi);
+        sumi = ggml_sycl_dp4a(w_hi, q8_qs[i / 4 + 4], sumi);
     }
+    return sumi;
+}
+
+template <bool USE_WEIGHT_SCALE = true>
+static __dpct_inline__ float mxfp4_i8_q8_1_block_dot(const int8_t * __restrict__ qs_row,
+                                                     const uint8_t * __restrict__ scale_row,
+                                                     const char * __restrict__ y_base,
+                                                     const int ncols_y,
+                                                     const int b) {
+    const int *         q8_qs = (const int *) (y_base + b * QK8_1);
+    const sycl::half2 * q8_ds = (const sycl::half2 *) (y_base + ncols_y + b * sizeof(sycl::half2));
+    const float         d8    = (float) (*q8_ds)[0];
+
+    const int8_t * qs   = qs_row + b * QK_MXFP4;
+    const int      sumi = mxfp4_i8_q8_1_block_sumi(qs, q8_qs);
 
     if constexpr (USE_WEIGHT_SCALE) {
         const uint8_t e8m0 = scale_row[b];
@@ -3293,6 +3441,145 @@ static __dpct_inline__ float mxfp4_soa_q8_1_block_dot(const uint8_t * __restrict
 }
 
 template <bool USE_WEIGHT_SCALE = true>
+static __dpct_inline__ float mxfp4_i8_q8_1_block_dot_slm(const int8_t * __restrict__ qs_row,
+                                                         const uint8_t * __restrict__ scale_row,
+                                                         const int * __restrict__ y_qs,
+                                                         const sycl::half2 * __restrict__ y_ds,
+                                                         const int y_qs_stride,
+                                                         const int b) {
+    const int *         q8_qs = y_qs + b * y_qs_stride;
+    const sycl::half2 * q8_ds = y_ds + b;
+    const float         d8    = (float) (*q8_ds)[0];
+
+    const int8_t * qs   = qs_row + b * QK_MXFP4;
+    const int      sumi = mxfp4_i8_q8_1_block_sumi(qs, q8_qs);
+
+    if constexpr (USE_WEIGHT_SCALE) {
+        const uint8_t e8m0 = scale_row[b];
+        const float   d    = ggml_sycl_e8m0_to_fp32(e8m0) * 0.5f;
+        return d * d8 * sumi;
+    } else {
+        GGML_UNUSED(scale_row);
+        return d8 * sumi;
+    }
+}
+
+template <bool USE_WEIGHT_SCALE = true, bool CACHE_Y_LOCAL = false, int SUBGROUP_SIZE = WARP_SIZE>
+static void mul_mat_vec_mxfp4_i8_q8_1_id_kernel(const int8_t * const * __restrict__ expert_ptrs,
+                                                const void * __restrict__ vy,
+                                                float * __restrict__ dst,
+                                                const int32_t * __restrict__ ids,
+                                                const int                ncols,
+                                                const int                ncols_y,
+                                                const int                nrows_per_expert,
+                                                const int                n_ids,
+                                                const int                n_tokens,
+                                                const int                ne11,
+                                                const int64_t            total_i8_size_per_expert,
+                                                const int64_t            ids_nb0,
+                                                const int64_t            ids_nb1,
+                                                const int64_t            nb11,
+                                                const int64_t            nb12,
+                                                const int64_t            nb1,
+                                                const int64_t            nb2,
+                                                const int                scale_stride_blocks,
+                                                const sycl::nd_item<3> & item_ct1,
+                                                int * __restrict__ slm_y_qs,
+                                                sycl::half2 * __restrict__ slm_y_ds) {
+    const int batch_idx = item_ct1.get_group(1);
+    const int row       = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
+
+    const int id   = batch_idx / n_tokens;
+    const int iid1 = batch_idx - id * n_tokens;
+
+    int32_t expert_id = 0;
+    if (ids) {
+        expert_id = *(const int32_t *) ((const char *) ids + iid1 * ids_nb1 + id * ids_nb0);
+    }
+    const int64_t i11 = id % ne11;
+    const int64_t i12 = iid1;
+    const int64_t i1  = id;
+    const int64_t i2  = iid1;
+
+    const int    blocks_per_row = ncols / QK_MXFP4;
+    const char * global_y_base  = (const char *) vy + i11 * nb11 + i12 * nb12;
+    const int    lane_id        = item_ct1.get_local_id(2);
+    const int    local_row      = item_ct1.get_local_id(1);
+
+    if constexpr (CACHE_Y_LOCAL) {
+        if (local_row == 0) {
+            for (int b = lane_id; b < blocks_per_row; b += SUBGROUP_SIZE) {
+                const int * q8_qs = (const int *) (global_y_base + b * QK8_1);
+#pragma unroll
+                for (int j = 0; j < QI8_1; ++j) {
+                    slm_y_qs[b * QI8_1 + j] = q8_qs[j];
+                }
+                slm_y_ds[b] = *((const sycl::half2 *) (global_y_base + ncols_y + b * sizeof(sycl::half2)));
+            }
+        }
+        item_ct1.barrier(sycl::access::fence_space::local_space);
+    }
+
+    if (row >= nrows_per_expert) {
+        return;
+    }
+
+    const int8_t * base = ids ? expert_ptrs[expert_id] : expert_ptrs[batch_idx];
+    if (!base) {
+        return;
+    }
+
+    const int64_t   row_i8_offset    = static_cast<int64_t>(row) * blocks_per_row * QK_MXFP4;
+    const int64_t   row_scale_offset = total_i8_size_per_expert + static_cast<int64_t>(row) * scale_stride_blocks;
+    const int8_t *  qs_row           = base + row_i8_offset;
+    const uint8_t * scale_row        = (const uint8_t *) base + row_scale_offset;
+    constexpr int   blocks_per_warp  = SUBGROUP_SIZE;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+
+    int b = lane_id;
+    for (; b + 3 * blocks_per_warp < blocks_per_row; b += 4 * blocks_per_warp) {
+        if constexpr (CACHE_Y_LOCAL) {
+            acc0 += mxfp4_i8_q8_1_block_dot_slm<USE_WEIGHT_SCALE>(qs_row, scale_row, slm_y_qs, slm_y_ds, QI8_1, b);
+            acc1 += mxfp4_i8_q8_1_block_dot_slm<USE_WEIGHT_SCALE>(qs_row, scale_row, slm_y_qs, slm_y_ds, QI8_1,
+                                                                  b + blocks_per_warp);
+            acc2 += mxfp4_i8_q8_1_block_dot_slm<USE_WEIGHT_SCALE>(qs_row, scale_row, slm_y_qs, slm_y_ds, QI8_1,
+                                                                  b + 2 * blocks_per_warp);
+            acc3 += mxfp4_i8_q8_1_block_dot_slm<USE_WEIGHT_SCALE>(qs_row, scale_row, slm_y_qs, slm_y_ds, QI8_1,
+                                                                  b + 3 * blocks_per_warp);
+        } else {
+            acc0 += mxfp4_i8_q8_1_block_dot<USE_WEIGHT_SCALE>(qs_row, scale_row, global_y_base, ncols_y, b);
+            acc1 += mxfp4_i8_q8_1_block_dot<USE_WEIGHT_SCALE>(qs_row, scale_row, global_y_base, ncols_y,
+                                                              b + blocks_per_warp);
+            acc2 += mxfp4_i8_q8_1_block_dot<USE_WEIGHT_SCALE>(qs_row, scale_row, global_y_base, ncols_y,
+                                                              b + 2 * blocks_per_warp);
+            acc3 += mxfp4_i8_q8_1_block_dot<USE_WEIGHT_SCALE>(qs_row, scale_row, global_y_base, ncols_y,
+                                                              b + 3 * blocks_per_warp);
+        }
+    }
+    for (; b < blocks_per_row; b += blocks_per_warp) {
+        if constexpr (CACHE_Y_LOCAL) {
+            acc0 += mxfp4_i8_q8_1_block_dot_slm<USE_WEIGHT_SCALE>(qs_row, scale_row, slm_y_qs, slm_y_ds, QI8_1, b);
+        } else {
+            acc0 += mxfp4_i8_q8_1_block_dot<USE_WEIGHT_SCALE>(qs_row, scale_row, global_y_base, ncols_y, b);
+        }
+    }
+
+    float acc = (acc0 + acc1) + (acc2 + acc3);
+    acc       = sycl::reduce_over_group(item_ct1.get_sub_group(), acc, sycl::plus<float>());
+
+    if (lane_id == 0) {
+        float * dst_out = (float *) ((char *) dst + i1 * nb1 + i2 * nb2);
+        dst_out[row]    = acc;
+    }
+
+    GGML_UNUSED(n_ids);
+}
+
+template <bool USE_WEIGHT_SCALE = true, bool VECTOR_QS_LOAD = false>
 static __dpct_inline__ void mxfp4_soa_q8_1_block_dot_pair(const uint8_t * __restrict__ qs_row_a,
                                                           const uint8_t * __restrict__ scale_row_a,
                                                           const uint8_t * __restrict__ qs_row_b,
@@ -3309,24 +3596,9 @@ static __dpct_inline__ void mxfp4_soa_q8_1_block_dot_pair(const uint8_t * __rest
     const uint8_t * qs_a = qs_row_a + b * (QK_MXFP4 / 2);
     const uint8_t * qs_b = qs_row_b + b * (QK_MXFP4 / 2);
 
-    int sumi_a = 0;
-    int sumi_b = 0;
-#pragma unroll
-    for (int i = 0; i < QK_MXFP4 / 2; i += 4) {
-        const int aux_q4_a = *((const int *) (qs_a + i));
-        const int aux_q4_b = *((const int *) (qs_b + i));
-
-        const sycl::int2 va = get_int_from_table_16(aux_q4_a, kvalues_mxfp4);
-        const sycl::int2 vb = get_int_from_table_16(aux_q4_b, kvalues_mxfp4);
-
-        const int q8_0 = q8_qs[i / 4];
-        const int q8_1 = q8_qs[i / 4 + 4];
-
-        sumi_a = ggml_sycl_dp4a(va.x(), q8_0, sumi_a);
-        sumi_a = ggml_sycl_dp4a(va.y(), q8_1, sumi_a);
-        sumi_b = ggml_sycl_dp4a(vb.x(), q8_0, sumi_b);
-        sumi_b = ggml_sycl_dp4a(vb.y(), q8_1, sumi_b);
-    }
+    int sumi_a;
+    int sumi_b;
+    mxfp4_soa_q8_1_block_sumi_pair<VECTOR_QS_LOAD>(qs_a, qs_b, q8_qs, sumi_a, sumi_b);
 
     if constexpr (USE_WEIGHT_SCALE) {
         const float d_a = ggml_sycl_e8m0_to_fp32(scale_row_a[b]) * 0.5f;
@@ -3341,7 +3613,7 @@ static __dpct_inline__ void mxfp4_soa_q8_1_block_dot_pair(const uint8_t * __rest
     }
 }
 
-template <bool USE_WEIGHT_SCALE = true>
+template <bool USE_WEIGHT_SCALE = true, bool VECTOR_QS_LOAD = false>
 static __dpct_inline__ void mxfp4_soa_q8_1_block_dot_pair_slm(const uint8_t * __restrict__ qs_row_a,
                                                               const uint8_t * __restrict__ scale_row_a,
                                                               const uint8_t * __restrict__ qs_row_b,
@@ -3359,24 +3631,9 @@ static __dpct_inline__ void mxfp4_soa_q8_1_block_dot_pair_slm(const uint8_t * __
     const uint8_t * qs_a = qs_row_a + b * (QK_MXFP4 / 2);
     const uint8_t * qs_b = qs_row_b + b * (QK_MXFP4 / 2);
 
-    int sumi_a = 0;
-    int sumi_b = 0;
-#pragma unroll
-    for (int i = 0; i < QK_MXFP4 / 2; i += 4) {
-        const int aux_q4_a = *((const int *) (qs_a + i));
-        const int aux_q4_b = *((const int *) (qs_b + i));
-
-        const sycl::int2 va = get_int_from_table_16(aux_q4_a, kvalues_mxfp4);
-        const sycl::int2 vb = get_int_from_table_16(aux_q4_b, kvalues_mxfp4);
-
-        const int q8_0 = q8_qs[i / 4];
-        const int q8_1 = q8_qs[i / 4 + 4];
-
-        sumi_a = ggml_sycl_dp4a(va.x(), q8_0, sumi_a);
-        sumi_a = ggml_sycl_dp4a(va.y(), q8_1, sumi_a);
-        sumi_b = ggml_sycl_dp4a(vb.x(), q8_0, sumi_b);
-        sumi_b = ggml_sycl_dp4a(vb.y(), q8_1, sumi_b);
-    }
+    int sumi_a;
+    int sumi_b;
+    mxfp4_soa_q8_1_block_sumi_pair<VECTOR_QS_LOAD>(qs_a, qs_b, q8_qs, sumi_a, sumi_b);
 
     if constexpr (USE_WEIGHT_SCALE) {
         const float d_a = ggml_sycl_e8m0_to_fp32(scale_row_a[b]) * 0.5f;
@@ -3395,7 +3652,10 @@ static __dpct_inline__ void mxfp4_soa_q8_1_block_dot_pair_slm(const uint8_t * __
 // SoA layout for weights: [all qs for all experts][all scales for all experts]
 // SoA layout for Q8_1: per row [quants: ncols_y bytes][ds: nblocks * sizeof(half2)]
 // After reorder_qw_mxfp4: qs at offset 0, scales at offset (ncols/2)*total_rows
-template <bool USE_WEIGHT_SCALE = true>
+template <bool USE_WEIGHT_SCALE = true,
+          bool CACHE_Y_LOCAL    = false,
+          bool VECTOR_QS_LOAD   = false,
+          int  SUBGROUP_SIZE    = WARP_SIZE>
 static void mul_mat_vec_mxfp4_q8_1_soa_id_kernel(
     const uint8_t * __restrict__ vx,                   // Base pointer to reordered MXFP4 tensor (SoA layout)
     const uint8_t * const * __restrict__ expert_ptrs,  // Optional per-expert base pointers (SoA layout)
@@ -3416,13 +3676,12 @@ static void mul_mat_vec_mxfp4_q8_1_soa_id_kernel(
     const int64_t            nb12,
     const int64_t            nb1,
     const int64_t            nb2,
-    const sycl::nd_item<3> & item_ct1) {
+    const int                scale_stride_blocks,
+    const sycl::nd_item<3> & item_ct1,
+    int * __restrict__ slm_y_qs,
+    sycl::half2 * __restrict__ slm_y_ds) {
     const int batch_idx = item_ct1.get_group(1);
     const int row       = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
-
-    if (row >= nrows_per_expert) {
-        return;
-    }
 
     // Decompose batch_idx into (iid1, id) - row-major by id
     const int id   = batch_idx / n_tokens;
@@ -3442,6 +3701,29 @@ static void mul_mat_vec_mxfp4_q8_1_soa_id_kernel(
 
     const int blocks_per_row = ncols / QK_MXFP4;
 
+    // Q8_1 input: base pointer for this token (SoA layout)
+    const char * global_y_base = (const char *) vy + i11 * nb11 + i12 * nb12;
+    const int    lane_id       = item_ct1.get_local_id(2);
+    const int    local_row     = item_ct1.get_local_id(1);
+
+    if constexpr (CACHE_Y_LOCAL) {
+        if (local_row == 0) {
+            for (int b = lane_id; b < blocks_per_row; b += SUBGROUP_SIZE) {
+                const int * q8_qs = (const int *) (global_y_base + b * QK8_1);
+#pragma unroll
+                for (int j = 0; j < QI8_1; ++j) {
+                    slm_y_qs[b * QI8_1 + j] = q8_qs[j];
+                }
+                slm_y_ds[b] = *((const sycl::half2 *) (global_y_base + ncols_y + b * sizeof(sycl::half2)));
+            }
+        }
+        item_ct1.barrier(sycl::access::fence_space::local_space);
+    }
+
+    if (row >= nrows_per_expert) {
+        return;
+    }
+
     const bool      use_expert_ptrs = (expert_ptrs != nullptr);
     const uint8_t * base            = nullptr;
     if (use_expert_ptrs) {
@@ -3458,16 +3740,12 @@ static void mul_mat_vec_mxfp4_q8_1_soa_id_kernel(
     // SoA layout for MXFP4: compute absolute row offset
     const int64_t abs_row          = use_expert_ptrs ? row : (expert_id * nrows_per_expert + row);
     const int64_t row_qs_offset    = abs_row * blocks_per_row * (QK_MXFP4 / 2);  // 16 bytes per block
-    const int64_t row_scale_offset = qs_offset + abs_row * blocks_per_row;
+    const int64_t row_scale_offset = qs_offset + abs_row * scale_stride_blocks;
 
     const uint8_t * qs_row    = base + row_qs_offset;
     const uint8_t * scale_row = base + row_scale_offset;
 
-    // Q8_1 input: base pointer for this token (SoA layout)
-    const char * y_base = (const char *) vy + i11 * nb11 + i12 * nb12;
-
-    const int     lane_id         = item_ct1.get_local_id(2);
-    constexpr int blocks_per_warp = WARP_SIZE;  // Each thread handles one block
+    constexpr int blocks_per_warp = SUBGROUP_SIZE;  // Each thread handles one block
 
     float acc0 = 0.0f;
     float acc1 = 0.0f;
@@ -3476,13 +3754,34 @@ static void mul_mat_vec_mxfp4_q8_1_soa_id_kernel(
 
     int b = lane_id;
     for (; b + 3 * blocks_per_warp < blocks_per_row; b += 4 * blocks_per_warp) {
-        acc0 += mxfp4_soa_q8_1_block_dot<USE_WEIGHT_SCALE>(qs_row, scale_row, y_base, ncols_y, b);
-        acc1 += mxfp4_soa_q8_1_block_dot<USE_WEIGHT_SCALE>(qs_row, scale_row, y_base, ncols_y, b + blocks_per_warp);
-        acc2 += mxfp4_soa_q8_1_block_dot<USE_WEIGHT_SCALE>(qs_row, scale_row, y_base, ncols_y, b + 2 * blocks_per_warp);
-        acc3 += mxfp4_soa_q8_1_block_dot<USE_WEIGHT_SCALE>(qs_row, scale_row, y_base, ncols_y, b + 3 * blocks_per_warp);
+        if constexpr (CACHE_Y_LOCAL) {
+            acc0 += mxfp4_soa_q8_1_block_dot_slm<USE_WEIGHT_SCALE, VECTOR_QS_LOAD>(qs_row, scale_row, slm_y_qs,
+                                                                                   slm_y_ds, QI8_1, b);
+            acc1 += mxfp4_soa_q8_1_block_dot_slm<USE_WEIGHT_SCALE, VECTOR_QS_LOAD>(
+                qs_row, scale_row, slm_y_qs, slm_y_ds, QI8_1, b + blocks_per_warp);
+            acc2 += mxfp4_soa_q8_1_block_dot_slm<USE_WEIGHT_SCALE, VECTOR_QS_LOAD>(
+                qs_row, scale_row, slm_y_qs, slm_y_ds, QI8_1, b + 2 * blocks_per_warp);
+            acc3 += mxfp4_soa_q8_1_block_dot_slm<USE_WEIGHT_SCALE, VECTOR_QS_LOAD>(
+                qs_row, scale_row, slm_y_qs, slm_y_ds, QI8_1, b + 3 * blocks_per_warp);
+        } else {
+            acc0 += mxfp4_soa_q8_1_block_dot<USE_WEIGHT_SCALE, VECTOR_QS_LOAD>(qs_row, scale_row, global_y_base,
+                                                                               ncols_y, b);
+            acc1 += mxfp4_soa_q8_1_block_dot<USE_WEIGHT_SCALE, VECTOR_QS_LOAD>(qs_row, scale_row, global_y_base,
+                                                                               ncols_y, b + blocks_per_warp);
+            acc2 += mxfp4_soa_q8_1_block_dot<USE_WEIGHT_SCALE, VECTOR_QS_LOAD>(qs_row, scale_row, global_y_base,
+                                                                               ncols_y, b + 2 * blocks_per_warp);
+            acc3 += mxfp4_soa_q8_1_block_dot<USE_WEIGHT_SCALE, VECTOR_QS_LOAD>(qs_row, scale_row, global_y_base,
+                                                                               ncols_y, b + 3 * blocks_per_warp);
+        }
     }
     for (; b < blocks_per_row; b += blocks_per_warp) {
-        acc0 += mxfp4_soa_q8_1_block_dot<USE_WEIGHT_SCALE>(qs_row, scale_row, y_base, ncols_y, b);
+        if constexpr (CACHE_Y_LOCAL) {
+            acc0 += mxfp4_soa_q8_1_block_dot_slm<USE_WEIGHT_SCALE, VECTOR_QS_LOAD>(qs_row, scale_row, slm_y_qs,
+                                                                                   slm_y_ds, QI8_1, b);
+        } else {
+            acc0 += mxfp4_soa_q8_1_block_dot<USE_WEIGHT_SCALE, VECTOR_QS_LOAD>(qs_row, scale_row, global_y_base,
+                                                                               ncols_y, b);
+        }
     }
 
     float acc = (acc0 + acc1) + (acc2 + acc3);
@@ -3605,6 +3904,230 @@ static bool mmvq_moe_direct_xmx_glu_enabled() {
         return env && std::atoi(env) != 0;
     }();
     return enabled;
+}
+
+template <int TILES_N = 4, bool RAW_ACCUM = false>
+static void mul_mat_vec_mxfp4_q8_1_xmx_tiled_id_kernel(const uint8_t * const * __restrict__ expert_ptrs,
+                                                       const void * __restrict__ vy,
+                                                       float * __restrict__ dst,
+                                                       const int32_t * __restrict__ ids,
+                                                       const int                       ncols,
+                                                       const int                       ncols_y,
+                                                       const int                       nrows_per_expert,
+                                                       const int                       n_output_tiles,
+                                                       const int                       n_tokens,
+                                                       const int                       ne11,
+                                                       const int64_t                   ids_nb0,
+                                                       const int64_t                   ids_nb1,
+                                                       const int64_t                   nb11,
+                                                       const int64_t                   nb12,
+                                                       const int64_t                   dst_nb1,
+                                                       const int64_t                   dst_nb2,
+                                                       const sycl::nd_item<1> &        item,
+                                                       sycl::local_accessor<int8_t, 1> slm_token,
+                                                       sycl::local_accessor<int8_t, 1> slm_weights,
+                                                       sycl::local_accessor<int8_t, 1> slm_kvalues,
+                                                       sycl::local_accessor<float, 1>  slm_weight_scales,
+                                                       sycl::local_accessor<float, 1>  slm_token_scale) {
+    using namespace sycl::ext::oneapi::experimental::matrix;
+
+    constexpr int XMX_M       = 8;
+    constexpr int XMX_N       = 16;
+    constexpr int XMX_K       = 32;
+    constexpr int SG_SIZE     = 16;
+    constexpr int TILE_N      = TILES_N * XMX_N;
+    constexpr int PACKED_SIZE = QK_MXFP4 / 2;
+
+    auto sg   = item.get_sub_group();
+    int  lane = sg.get_local_linear_id();
+
+    const int work_group = item.get_group(0);
+    const int batch_idx  = work_group / n_output_tiles;
+    const int tile_idx   = work_group - batch_idx * n_output_tiles;
+    const int col_start  = tile_idx * TILE_N;
+
+    const int id   = batch_idx / n_tokens;
+    const int iid1 = batch_idx - id * n_tokens;
+
+    const int32_t expert_id = *(const int32_t *) ((const char *) ids + iid1 * ids_nb1 + id * ids_nb0);
+    const int64_t i11       = id % ne11;
+    const int64_t i12       = iid1;
+    const int64_t i1        = id;
+    const int64_t i2        = iid1;
+
+    const uint8_t * expert_base = expert_ptrs[expert_id];
+    if (!expert_base) {
+        return;
+    }
+
+    const char *        y_base       = (const char *) vy + i11 * nb11 + i12 * nb12;
+    const int8_t *      y_qs         = (const int8_t *) y_base;
+    const sycl::half2 * y_ds         = (const sycl::half2 *) (y_base + ncols_y);
+    const int           num_k_blocks = ncols / QK_MXFP4;
+    const int64_t       group_bytes  = TILE_N * (1 + PACKED_SIZE);
+
+    if (lane < 16) {
+        slm_kvalues[lane] = kvalues_mxfp4[lane];
+    }
+    sycl::group_barrier(item.get_group());
+
+    float acc_float[TILE_N] = { 0.0f };
+
+    joint_matrix<sycl::sub_group, int32_t, use::accumulator, XMX_M, XMX_N> acc[TILES_N];
+    if constexpr (RAW_ACCUM) {
+        for (int tn = 0; tn < TILES_N; ++tn) {
+            joint_matrix_fill(sg, acc[tn], 0);
+        }
+    }
+
+    for (int k_block = 0; k_block < num_k_blocks; ++k_block) {
+        if constexpr (!RAW_ACCUM) {
+            for (int tn = 0; tn < TILES_N; ++tn) {
+                joint_matrix_fill(sg, acc[tn], 0);
+            }
+        }
+
+        for (int i = lane; i < XMX_M * XMX_K; i += SG_SIZE) {
+            const int row = i / XMX_K;
+            const int col = i - row * XMX_K;
+            slm_token[i]  = row == 0 ? y_qs[k_block * XMX_K + col] : 0;
+        }
+        if constexpr (!RAW_ACCUM) {
+            if (lane == 0) {
+                slm_token_scale[0] = static_cast<float>(y_ds[k_block][0]);
+            }
+        }
+
+        const uint8_t * tile_group =
+            expert_base + (static_cast<int64_t>(k_block) * n_output_tiles + tile_idx) * group_bytes;
+        const uint8_t * scales_ptr = tile_group;
+        const uint8_t * qs_ptr     = tile_group + TILE_N;
+
+        for (int i = lane; i < TILE_N * XMX_K; i += SG_SIZE) {
+            const int out_col_local = i / XMX_K;
+            const int k_elem        = i - out_col_local * XMX_K;
+            const int out_col       = col_start + out_col_local;
+
+            int8_t v = 0;
+            float  s = 0.0f;
+            if (out_col < nrows_per_expert) {
+                const uint8_t packed = qs_ptr[out_col_local * PACKED_SIZE + (k_elem % PACKED_SIZE)];
+                const uint8_t nibble = k_elem < PACKED_SIZE ? (packed & 0xF) : (packed >> 4);
+                v                    = slm_kvalues[nibble];
+                if constexpr (!RAW_ACCUM) {
+                    s = sycl_e8m0_to_fp32_half(scales_ptr[out_col_local]);
+                }
+            }
+            slm_weights[out_col_local * XMX_K + k_elem] = v;
+            if constexpr (!RAW_ACCUM) {
+                if (k_elem == 0) {
+                    slm_weight_scales[out_col_local] = s;
+                }
+            }
+        }
+        sycl::group_barrier(item.get_group());
+
+        joint_matrix<sycl::sub_group, int8_t, use::a, XMX_M, XMX_K, layout::row_major> mat_a;
+        auto                                                                           token_ptr =
+            sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
+                &slm_token[0]);
+        joint_matrix_load(sg, mat_a, token_ptr, XMX_K);
+
+        for (int tn = 0; tn < TILES_N; ++tn) {
+            joint_matrix<sycl::sub_group, int8_t, use::b, XMX_K, XMX_N, layout::col_major> mat_b;
+            auto                                                                           weight_ptr =
+                sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
+                    &slm_weights[tn * XMX_N * XMX_K]);
+            joint_matrix_load(sg, mat_b, weight_ptr, XMX_K);
+            joint_matrix_mad(sg, acc[tn], mat_a, mat_b, acc[tn]);
+
+            if constexpr (!RAW_ACCUM) {
+                int32_t row0 = 0;
+                int     slot = 0;
+                joint_matrix_apply(sg, acc[tn], [&](int32_t & elem) {
+                    if (slot == 0) {
+                        row0 = elem;
+                    }
+                    ++slot;
+                });
+
+                const float scale = slm_token_scale[0] * slm_weight_scales[tn * XMX_N + lane];
+                acc_float[tn * XMX_N + lane] += static_cast<float>(row0) * scale;
+            }
+        }
+        sycl::group_barrier(item.get_group());
+    }
+
+    if constexpr (RAW_ACCUM) {
+        for (int tn = 0; tn < TILES_N; ++tn) {
+            int32_t row0 = 0;
+            int     slot = 0;
+            joint_matrix_apply(sg, acc[tn], [&](int32_t & elem) {
+                if (slot == 0) {
+                    row0 = elem;
+                }
+                ++slot;
+            });
+            acc_float[tn * XMX_N + lane] = static_cast<float>(row0);
+        }
+    }
+
+    float * dst_out = (float *) ((char *) dst + i1 * dst_nb1 + i2 * dst_nb2);
+    for (int i = lane; i < TILE_N; i += SG_SIZE) {
+        const int out_col = col_start + i;
+        if (out_col < nrows_per_expert) {
+            dst_out[out_col] = acc_float[i];
+        }
+    }
+}
+
+template <int TILES_N, bool RAW_ACCUM = false>
+static void reorder_mul_mat_vec_mxfp4_q8_1_xmx_tiled_id_sycl(const void * const * expert_ptrs,
+                                                             const void *         vy,
+                                                             float *              dst,
+                                                             const int32_t *      ids,
+                                                             const int            ncols,
+                                                             const int            ncols_y,
+                                                             const int            nrows_per_expert,
+                                                             const int            total_batches,
+                                                             const int            n_ids,
+                                                             const int            n_tokens,
+                                                             const int            ne11,
+                                                             const int64_t        ids_nb0,
+                                                             const int64_t        ids_nb1,
+                                                             const int64_t        nb11,
+                                                             const int64_t        nb12,
+                                                             const int64_t        dst_nb1,
+                                                             const int64_t        dst_nb2,
+                                                             dpct::queue_ptr      stream) {
+    GGML_ASSERT(ncols % QK_MXFP4 == 0);
+    GGML_UNUSED(n_ids);
+    constexpr int XMX_M   = 8;
+    constexpr int XMX_N   = 16;
+    constexpr int XMX_K   = 32;
+    constexpr int SG_SIZE = 16;
+    constexpr int TILE_N  = TILES_N * XMX_N;
+
+    const int n_output_tiles = (nrows_per_expert + TILE_N - 1) / TILE_N;
+    const int total_work     = total_batches * n_output_tiles;
+    if (total_work <= 0) {
+        return;
+    }
+
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<int8_t, 1> slm_token(sycl::range<1>(XMX_M * XMX_K), cgh);
+        sycl::local_accessor<int8_t, 1> slm_weights(sycl::range<1>(TILE_N * XMX_K), cgh);
+        sycl::local_accessor<int8_t, 1> slm_kvalues(sycl::range<1>(16), cgh);
+        sycl::local_accessor<float, 1>  slm_weight_scales(sycl::range<1>(TILE_N), cgh);
+        sycl::local_accessor<float, 1>  slm_token_scale(sycl::range<1>(1), cgh);
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(total_work * SG_SIZE), sycl::range<1>(SG_SIZE)),
+                         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                             mul_mat_vec_mxfp4_q8_1_xmx_tiled_id_kernel<TILES_N, RAW_ACCUM>(
+                                 (const uint8_t * const *) expert_ptrs, vy, dst, ids, ncols, ncols_y, nrows_per_expert,
+                                 n_output_tiles, n_tokens, ne11, ids_nb0, ids_nb1, nb11, nb12, dst_nb1, dst_nb2, item,
+                                 slm_token, slm_weights, slm_kvalues, slm_weight_scales, slm_token_scale);
+                         });
+    });
 }
 
 template <int TILES_N = 4>
@@ -3801,6 +4324,7 @@ static void mul_mat_vec_mxfp4_q8_1_soa_id_pair_glu_xmx_kernel(const uint8_t * co
     }
 }
 
+template <int TILES_N>
 static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_xmx_sycl(const void * const * gate_ptrs,
                                                                 const void * const * up_ptrs,
                                                                 const void *         vy,
@@ -3829,7 +4353,6 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_xmx_sycl(const void * con
                                                                 dpct::queue_ptr      stream) {
     GGML_ASSERT(ncols % QK_MXFP4 == 0);
     GGML_UNUSED(n_ids);
-    constexpr int TILES_N = 1;
     constexpr int XMX_M   = 8;
     constexpr int XMX_N   = 16;
     constexpr int XMX_K   = 32;
@@ -3864,7 +4387,11 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_xmx_sycl(const void * con
 }
 #endif
 
-template <int GLU_OP, bool CACHE_Y_LOCAL, bool USE_WEIGHT_SCALE = true>
+template <int  GLU_OP,
+          bool CACHE_Y_LOCAL,
+          bool USE_WEIGHT_SCALE = true,
+          bool VECTOR_QS_LOAD   = false,
+          int  SUBGROUP_SIZE    = WARP_SIZE>
 static void mul_mat_vec_mxfp4_q8_1_soa_id_pair_glu_kernel(const uint8_t * const * __restrict__ gate_ptrs,
                                                           const uint8_t * const * __restrict__ up_ptrs,
                                                           const void * __restrict__ vy,
@@ -3889,6 +4416,7 @@ static void mul_mat_vec_mxfp4_q8_1_soa_id_pair_glu_kernel(const uint8_t * const 
                                                           const int64_t            up_bias_nb1,
                                                           const float              alpha,
                                                           const float              limit,
+                                                          const int                scale_stride_blocks,
                                                           const sycl::nd_item<3> & item_ct1,
                                                           int * __restrict__ slm_y_qs,
                                                           sycl::half2 * __restrict__ slm_y_ds) {
@@ -3911,7 +4439,7 @@ static void mul_mat_vec_mxfp4_q8_1_soa_id_pair_glu_kernel(const uint8_t * const 
     const int blocks_per_row = ncols / QK_MXFP4;
     if constexpr (CACHE_Y_LOCAL) {
         if (local_row == 0) {
-            for (int b = lane_id; b < blocks_per_row; b += WARP_SIZE) {
+            for (int b = lane_id; b < blocks_per_row; b += SUBGROUP_SIZE) {
                 const int * q8_qs = (const int *) (global_y_base + b * QK8_1);
 #pragma unroll
                 for (int j = 0; j < QI8_1; ++j) {
@@ -3928,14 +4456,14 @@ static void mul_mat_vec_mxfp4_q8_1_soa_id_pair_glu_kernel(const uint8_t * const 
     }
 
     const int64_t   row_qs_offset    = row * blocks_per_row * (QK_MXFP4 / 2);
-    const int64_t   row_scale_offset = total_qs_size_per_expert + row * blocks_per_row;
+    const int64_t   row_scale_offset = total_qs_size_per_expert + row * scale_stride_blocks;
     const uint8_t * gate_base        = gate_ptrs[expert_id];
     const uint8_t * up_base          = up_ptrs[expert_id];
     const uint8_t * gate_qs_row      = gate_base + row_qs_offset;
     const uint8_t * gate_scale_row   = gate_base + row_scale_offset;
     const uint8_t * up_qs_row        = up_base + row_qs_offset;
     const uint8_t * up_scale_row     = up_base + row_scale_offset;
-    constexpr int   blocks_per_warp  = WARP_SIZE;
+    constexpr int   blocks_per_warp  = SUBGROUP_SIZE;
 
     float gate_acc = 0.0f;
     float up_acc   = 0.0f;
@@ -3943,26 +4471,26 @@ static void mul_mat_vec_mxfp4_q8_1_soa_id_pair_glu_kernel(const uint8_t * const 
     int b = lane_id;
     for (; b + blocks_per_warp < blocks_per_row; b += 2 * blocks_per_warp) {
         if constexpr (CACHE_Y_LOCAL) {
-            mxfp4_soa_q8_1_block_dot_pair_slm<USE_WEIGHT_SCALE>(gate_qs_row, gate_scale_row, up_qs_row, up_scale_row,
-                                                                slm_y_qs, slm_y_ds, QI8_1, b, gate_acc, up_acc);
-            mxfp4_soa_q8_1_block_dot_pair_slm<USE_WEIGHT_SCALE>(gate_qs_row, gate_scale_row, up_qs_row, up_scale_row,
-                                                                slm_y_qs, slm_y_ds, QI8_1, b + blocks_per_warp,
-                                                                gate_acc, up_acc);
+            mxfp4_soa_q8_1_block_dot_pair_slm<USE_WEIGHT_SCALE, VECTOR_QS_LOAD>(
+                gate_qs_row, gate_scale_row, up_qs_row, up_scale_row, slm_y_qs, slm_y_ds, QI8_1, b, gate_acc, up_acc);
+            mxfp4_soa_q8_1_block_dot_pair_slm<USE_WEIGHT_SCALE, VECTOR_QS_LOAD>(gate_qs_row, gate_scale_row, up_qs_row,
+                                                                                up_scale_row, slm_y_qs, slm_y_ds, QI8_1,
+                                                                                b + blocks_per_warp, gate_acc, up_acc);
         } else {
-            mxfp4_soa_q8_1_block_dot_pair<USE_WEIGHT_SCALE>(gate_qs_row, gate_scale_row, up_qs_row, up_scale_row,
-                                                            global_y_base, ncols_y, b, gate_acc, up_acc);
-            mxfp4_soa_q8_1_block_dot_pair<USE_WEIGHT_SCALE>(gate_qs_row, gate_scale_row, up_qs_row, up_scale_row,
-                                                            global_y_base, ncols_y, b + blocks_per_warp, gate_acc,
-                                                            up_acc);
+            mxfp4_soa_q8_1_block_dot_pair<USE_WEIGHT_SCALE, VECTOR_QS_LOAD>(
+                gate_qs_row, gate_scale_row, up_qs_row, up_scale_row, global_y_base, ncols_y, b, gate_acc, up_acc);
+            mxfp4_soa_q8_1_block_dot_pair<USE_WEIGHT_SCALE, VECTOR_QS_LOAD>(gate_qs_row, gate_scale_row, up_qs_row,
+                                                                            up_scale_row, global_y_base, ncols_y,
+                                                                            b + blocks_per_warp, gate_acc, up_acc);
         }
     }
     for (; b < blocks_per_row; b += blocks_per_warp) {
         if constexpr (CACHE_Y_LOCAL) {
-            mxfp4_soa_q8_1_block_dot_pair_slm<USE_WEIGHT_SCALE>(gate_qs_row, gate_scale_row, up_qs_row, up_scale_row,
-                                                                slm_y_qs, slm_y_ds, QI8_1, b, gate_acc, up_acc);
+            mxfp4_soa_q8_1_block_dot_pair_slm<USE_WEIGHT_SCALE, VECTOR_QS_LOAD>(
+                gate_qs_row, gate_scale_row, up_qs_row, up_scale_row, slm_y_qs, slm_y_ds, QI8_1, b, gate_acc, up_acc);
         } else {
-            mxfp4_soa_q8_1_block_dot_pair<USE_WEIGHT_SCALE>(gate_qs_row, gate_scale_row, up_qs_row, up_scale_row,
-                                                            global_y_base, ncols_y, b, gate_acc, up_acc);
+            mxfp4_soa_q8_1_block_dot_pair<USE_WEIGHT_SCALE, VECTOR_QS_LOAD>(
+                gate_qs_row, gate_scale_row, up_qs_row, up_scale_row, global_y_base, ncols_y, b, gate_acc, up_acc);
         }
     }
 
@@ -4102,7 +4630,7 @@ static void mul_mat_vec_mxfp4_q8_1_coalesced_id_kernel(
 
 // MoE dispatch: MXFP4 SoA layout with expert routing
 // Both MXFP4 weights and Q8_1 inputs must be in SoA layout
-template <int MOE_MMV_Y, bool USE_WEIGHT_SCALE = true>
+template <int MOE_MMV_Y, bool USE_WEIGHT_SCALE = true, int SUBGROUP_SIZE = WARP_SIZE>
 static void reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows(const void *         vx,
                                                         const void * const * expert_ptrs,
                                                         const void *         vy,
@@ -4122,31 +4650,119 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows(const void *         vx,
                                                         const int64_t   nb12,
                                                         const int64_t   nb1,
                                                         const int64_t   nb2,
+                                                        bool            vector_qs_load,
+                                                        int             scale_stride_blocks,
+                                                        bool            cache_y_local,
                                                         dpct::queue_ptr stream,
                                                         sycl::event *   event_out = nullptr) {
     GGML_ASSERT(ncols % QK_MXFP4 == 0);
     static_assert(MOE_MMV_Y > 0, "MOE_MMV_Y must be positive");
-    static_assert(MOE_MMV_Y * WARP_SIZE <= 1024, "MOE_MMV_Y exceeds SYCL work-group limit");
+    static_assert(SUBGROUP_SIZE == 16 || SUBGROUP_SIZE == 32, "MXFP4 MoE subgroup size must be 16 or 32");
+    static_assert(MOE_MMV_Y * SUBGROUP_SIZE <= 1024, "MOE_MMV_Y exceeds SYCL work-group limit");
     const int            block_num_z = (nrows_per_expert + MOE_MMV_Y - 1) / MOE_MMV_Y;
     const sycl::range<3> block_nums(1, total_batches, block_num_z);
-    const sycl::range<3> block_dims(1, MOE_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, MOE_MMV_Y, SUBGROUP_SIZE);
 
     // SoA layout for MXFP4: qs_size = (ncols / 2) * total_rows
     const int64_t total_rows               = (int64_t) nrows_per_expert * num_experts;
     const int64_t total_qs_size            = (ncols / 2) * total_rows;
     const int64_t total_qs_size_per_expert = (ncols / 2) * nrows_per_expert;
+    const int     blocks_per_row           = ncols / QK_MXFP4;
+    const int     scale_stride             = scale_stride_blocks > 0 ? scale_stride_blocks : blocks_per_row;
+    GGML_ASSERT(scale_stride >= blocks_per_row);
 
-    sycl::event ev = stream->submit([&](sycl::handler & cgh) {
-        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
-                         [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                             mul_mat_vec_mxfp4_q8_1_soa_id_kernel<USE_WEIGHT_SCALE>(
-                                 (const uint8_t *) vx, (const uint8_t * const *) expert_ptrs, vy, dst, ids, ncols,
-                                 ncols_y, nrows_per_expert, n_ids, n_tokens, ne11, total_qs_size,
-                                 total_qs_size_per_expert, ids_nb0, ids_nb1, nb11, nb12, nb1, nb2, item_ct1);
-                         });
-    });
+    auto submit_mmv = [&](auto cache_tag, auto vec_tag) -> sycl::event {
+        constexpr bool CACHE_Y_LOCAL  = decltype(cache_tag)::value;
+        constexpr bool VECTOR_QS_LOAD = decltype(vec_tag)::value;
+        return stream->submit([&](sycl::handler & cgh) {
+            sycl::local_accessor<int, 1> slm_y_qs(
+                sycl::range<1>(CACHE_Y_LOCAL ? static_cast<size_t>(blocks_per_row * QI8_1) : 1), cgh);
+            sycl::local_accessor<sycl::half2, 1> slm_y_ds(
+                sycl::range<1>(CACHE_Y_LOCAL ? static_cast<size_t>(blocks_per_row) : 1), cgh);
+            cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(SUBGROUP_SIZE)]] {
+                                 mul_mat_vec_mxfp4_q8_1_soa_id_kernel<USE_WEIGHT_SCALE, CACHE_Y_LOCAL, VECTOR_QS_LOAD,
+                                                                      SUBGROUP_SIZE>(
+                                     (const uint8_t *) vx, (const uint8_t * const *) expert_ptrs, vy, dst, ids, ncols,
+                                     ncols_y, nrows_per_expert, n_ids, n_tokens, ne11, total_qs_size,
+                                     total_qs_size_per_expert, ids_nb0, ids_nb1, nb11, nb12, nb1, nb2, scale_stride,
+                                     item_ct1, SYCL_LOCAL_ACC_PTR(slm_y_qs), SYCL_LOCAL_ACC_PTR(slm_y_ds));
+                             });
+        });
+    };
+
+    sycl::event ev;
+    if (cache_y_local) {
+        ev = vector_qs_load ? submit_mmv(std::true_type{}, std::true_type{}) :
+                              submit_mmv(std::true_type{}, std::false_type{});
+    } else {
+        ev = vector_qs_load ? submit_mmv(std::false_type{}, std::true_type{}) :
+                              submit_mmv(std::false_type{}, std::false_type{});
+    }
     if (event_out) {
         *event_out = ev;
+    }
+}
+
+template <int MOE_MMV_Y, bool USE_WEIGHT_SCALE = true, int SUBGROUP_SIZE = WARP_SIZE>
+static void reorder_mul_mat_vec_mxfp4_i8_q8_1_id_sycl_rows(const void * const * expert_ptrs,
+                                                           const void *         vy,
+                                                           float *              dst,
+                                                           const int32_t *      ids,
+                                                           const int            ncols,
+                                                           const int     ncols_y,  // Q8_1 row size (for SoA ds offset)
+                                                           const int     nrows_per_expert,
+                                                           const int     num_experts,
+                                                           const int     total_batches,
+                                                           const int     n_ids,
+                                                           const int     n_tokens,
+                                                           const int     ne11,
+                                                           const int64_t ids_nb0,
+                                                           const int64_t ids_nb1,
+                                                           const int64_t nb11,
+                                                           const int64_t nb12,
+                                                           const int64_t nb1,
+                                                           const int64_t nb2,
+                                                           int           scale_stride_blocks,
+                                                           bool          cache_y_local,
+                                                           dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_MXFP4 == 0);
+    static_assert(MOE_MMV_Y > 0, "MOE_MMV_Y must be positive");
+    static_assert(SUBGROUP_SIZE == 16 || SUBGROUP_SIZE == 32, "MXFP4 MoE subgroup size must be 16 or 32");
+    static_assert(MOE_MMV_Y * SUBGROUP_SIZE <= 1024, "MOE_MMV_Y exceeds SYCL work-group limit");
+    GGML_UNUSED(num_experts);
+
+    const int            block_num_z = (nrows_per_expert + MOE_MMV_Y - 1) / MOE_MMV_Y;
+    const sycl::range<3> block_nums(1, total_batches, block_num_z);
+    const sycl::range<3> block_dims(1, MOE_MMV_Y, SUBGROUP_SIZE);
+
+    const int     blocks_per_row           = ncols / QK_MXFP4;
+    const int     scale_stride             = scale_stride_blocks > 0 ? scale_stride_blocks : blocks_per_row;
+    const int64_t total_i8_size_per_expert = static_cast<int64_t>(nrows_per_expert) * blocks_per_row * QK_MXFP4;
+    GGML_ASSERT(scale_stride >= blocks_per_row);
+
+    auto submit_mmv = [&](auto cache_tag) {
+        constexpr bool CACHE_Y_LOCAL = decltype(cache_tag)::value;
+        stream->submit([&](sycl::handler & cgh) {
+            sycl::local_accessor<int, 1> slm_y_qs(
+                sycl::range<1>(CACHE_Y_LOCAL ? static_cast<size_t>(blocks_per_row * QI8_1) : 1), cgh);
+            sycl::local_accessor<sycl::half2, 1> slm_y_ds(
+                sycl::range<1>(CACHE_Y_LOCAL ? static_cast<size_t>(blocks_per_row) : 1), cgh);
+            cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(SUBGROUP_SIZE)]] {
+                                 mul_mat_vec_mxfp4_i8_q8_1_id_kernel<USE_WEIGHT_SCALE, CACHE_Y_LOCAL, SUBGROUP_SIZE>(
+                                     (const int8_t * const *) expert_ptrs, vy, dst, ids, ncols, ncols_y,
+                                     nrows_per_expert, n_ids, n_tokens, ne11, total_i8_size_per_expert, ids_nb0,
+                                     ids_nb1, nb11, nb12, nb1, nb2, scale_stride, item_ct1,
+                                     SYCL_LOCAL_ACC_PTR(slm_y_qs), SYCL_LOCAL_ACC_PTR(slm_y_ds));
+                             });
+        });
+    };
+
+    if (cache_y_local) {
+        submit_mmv(std::true_type{});
+    } else {
+        submit_mmv(std::false_type{});
     }
 }
 
@@ -4171,9 +4787,168 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_sycl(const void *         vx,
                                                    const int64_t        nb2,
                                                    dpct::queue_ptr      stream,
                                                    sycl::event *        event_out = nullptr) {
-    reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<GGML_SYCL_MOE_MMV_Y>(
+    int device_id = -1;
+    if (stream) {
+        device_id = ggml_sycl_get_device_id_from_queue(*stream);
+    }
+    const bool use_sg16 = device_id >= 0 && device_id < ggml_sycl_info().device_count &&
+                          xmx_capabilities_support_sub_group(ggml_sycl_info().devices[device_id].xmx_caps, 16);
+
+    if (use_sg16) {
+        reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<GGML_SYCL_MOE_MMV_Y, true, 16>(
+            vx, expert_ptrs, vy, dst, ids, ncols, ncols_y, nrows_per_expert, num_experts, total_batches, n_ids,
+            n_tokens, ne11, ids_nb0, ids_nb1, nb11, nb12, nb1, nb2, false, 0, false, stream, event_out);
+        return;
+    }
+    reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<GGML_SYCL_MOE_MMV_Y, true, 32>(
         vx, expert_ptrs, vy, dst, ids, ncols, ncols_y, nrows_per_expert, num_experts, total_batches, n_ids, n_tokens,
-        ne11, ids_nb0, ids_nb1, nb11, nb12, nb1, nb2, stream, event_out);
+        ne11, ids_nb0, ids_nb1, nb11, nb12, nb1, nb2, false, 0, false, stream, event_out);
+}
+
+template <int GLU_OP>
+static void mxfp4_pair_glu_split_kernel(const float * __restrict__ gate,
+                                        const float * __restrict__ up,
+                                        float * __restrict__ dst_glu,
+                                        const int32_t * __restrict__ ids,
+                                        const float * __restrict__ gate_bias,
+                                        const float * __restrict__ up_bias,
+                                        const int     nrows_per_expert,
+                                        const int     n_tokens,
+                                        const int64_t ids_nb0,
+                                        const int64_t ids_nb1,
+                                        const int64_t src_nb1,
+                                        const int64_t src_nb2,
+                                        const int64_t dst_nb1,
+                                        const int64_t dst_nb2,
+                                        const int64_t gate_bias_nb1,
+                                        const int64_t up_bias_nb1,
+                                        const float   alpha,
+                                        const float   limit,
+                                        const int64_t elem) {
+    const int batch_idx = static_cast<int>(elem / nrows_per_expert);
+    const int row       = static_cast<int>(elem - static_cast<int64_t>(batch_idx) * nrows_per_expert);
+    const int id        = batch_idx / n_tokens;
+    const int iid1      = batch_idx - id * n_tokens;
+
+    const int32_t expert_id = *(const int32_t *) ((const char *) ids + iid1 * ids_nb1 + id * ids_nb0);
+
+    float gate_value = *(const float *) ((const char *) gate + id * src_nb1 + iid1 * src_nb2 + row * sizeof(float));
+    float up_value   = *(const float *) ((const char *) up + id * src_nb1 + iid1 * src_nb2 + row * sizeof(float));
+    if (gate_bias) {
+        gate_value += *(const float *) ((const char *) gate_bias + expert_id * gate_bias_nb1 + row * sizeof(float));
+    }
+    if (up_bias) {
+        up_value += *(const float *) ((const char *) up_bias + expert_id * up_bias_nb1 + row * sizeof(float));
+    }
+
+    float * dst_out = (float *) ((char *) dst_glu + id * dst_nb1 + iid1 * dst_nb2);
+    dst_out[row]    = mmvq_moe_apply_pair_glu<GLU_OP>(gate_value, up_value, alpha, limit);
+}
+
+static sycl::event mxfp4_pair_glu_split_submit(const float *       gate,
+                                               const float *       up,
+                                               float *             dst_glu,
+                                               const int32_t *     ids,
+                                               const float *       gate_bias,
+                                               const float *       up_bias,
+                                               const int           nrows_per_expert,
+                                               const int           total_batches,
+                                               const int           n_tokens,
+                                               const int64_t       ids_nb0,
+                                               const int64_t       ids_nb1,
+                                               const int64_t       src_nb1,
+                                               const int64_t       src_nb2,
+                                               const int64_t       dst_nb1,
+                                               const int64_t       dst_nb2,
+                                               const int64_t       gate_bias_nb1,
+                                               const int64_t       up_bias_nb1,
+                                               const int           glu_op,
+                                               const float         alpha,
+                                               const float         limit,
+                                               const sycl::event & gate_event,
+                                               const sycl::event & up_event,
+                                               dpct::queue_ptr     stream) {
+    const size_t     total_elems     = static_cast<size_t>(nrows_per_expert) * static_cast<size_t>(total_batches);
+    constexpr size_t work_group_size = 256;
+    const size_t     global_size     = ((total_elems + work_group_size - 1) / work_group_size) * work_group_size;
+
+    auto submit_glu = [&](auto glu_tag) -> sycl::event {
+        constexpr int GLU_OP = decltype(glu_tag)::value;
+        return stream->submit([&](sycl::handler & cgh) {
+            cgh.depends_on(gate_event);
+            cgh.depends_on(up_event);
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(work_group_size)),
+                             [=](sycl::nd_item<1> item) {
+                                 const size_t global_id = item.get_global_linear_id();
+                                 if (global_id >= total_elems) {
+                                     return;
+                                 }
+                                 mxfp4_pair_glu_split_kernel<GLU_OP>(
+                                     gate, up, dst_glu, ids, gate_bias, up_bias, nrows_per_expert, n_tokens, ids_nb0,
+                                     ids_nb1, src_nb1, src_nb2, dst_nb1, dst_nb2, gate_bias_nb1, up_bias_nb1, alpha,
+                                     limit, static_cast<int64_t>(global_id));
+                             });
+        });
+    };
+
+    if (glu_op == GGML_GLU_OP_SWIGLU_OAI) {
+        return submit_glu(std::integral_constant<int, GGML_GLU_OP_SWIGLU_OAI>{});
+    }
+    return submit_glu(std::integral_constant<int, GGML_GLU_OP_SWIGLU>{});
+}
+
+template <int MOE_MMV_Y, bool USE_WEIGHT_SCALE = true, int SUBGROUP_SIZE = WARP_SIZE>
+static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_split_sycl_rows(const void * const * gate_ptrs,
+                                                                       const void * const * up_ptrs,
+                                                                       const void *         vy,
+                                                                       float *              gate_tmp,
+                                                                       float *              up_tmp,
+                                                                       float *              dst_glu,
+                                                                       const int32_t *      ids,
+                                                                       const float *        gate_bias,
+                                                                       const float *        up_bias,
+                                                                       const int            ncols,
+                                                                       const int            ncols_y,
+                                                                       const int            nrows_per_expert,
+                                                                       const int            num_experts,
+                                                                       const int            total_batches,
+                                                                       const int            n_ids,
+                                                                       const int            n_tokens,
+                                                                       const int            ne11,
+                                                                       const int64_t        ids_nb0,
+                                                                       const int64_t        ids_nb1,
+                                                                       const int64_t        nb11,
+                                                                       const int64_t        nb12,
+                                                                       const int64_t        dst_nb1,
+                                                                       const int64_t        dst_nb2,
+                                                                       const int64_t        gate_bias_nb1,
+                                                                       const int64_t        up_bias_nb1,
+                                                                       const int            glu_op,
+                                                                       const float          alpha,
+                                                                       const float          limit,
+                                                                       bool                 vector_qs_load,
+                                                                       int                  scale_stride_blocks,
+                                                                       bool                 cache_y_local,
+                                                                       dpct::queue_ptr      stream,
+                                                                       sycl::event *        event_out = nullptr) {
+    sycl::event gate_event;
+    sycl::event up_event;
+    reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<MOE_MMV_Y, USE_WEIGHT_SCALE, SUBGROUP_SIZE>(
+        nullptr, gate_ptrs, vy, gate_tmp, ids, ncols, ncols_y, nrows_per_expert, num_experts, total_batches, n_ids,
+        n_tokens, ne11, ids_nb0, ids_nb1, nb11, nb12, dst_nb1, dst_nb2, vector_qs_load, scale_stride_blocks,
+        cache_y_local, stream, &gate_event);
+    reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<MOE_MMV_Y, USE_WEIGHT_SCALE, SUBGROUP_SIZE>(
+        nullptr, up_ptrs, vy, up_tmp, ids, ncols, ncols_y, nrows_per_expert, num_experts, total_batches, n_ids,
+        n_tokens, ne11, ids_nb0, ids_nb1, nb11, nb12, dst_nb1, dst_nb2, vector_qs_load, scale_stride_blocks,
+        cache_y_local, stream, &up_event);
+
+    sycl::event glu_event =
+        mxfp4_pair_glu_split_submit(gate_tmp, up_tmp, dst_glu, ids, gate_bias, up_bias, nrows_per_expert, total_batches,
+                                    n_tokens, ids_nb0, ids_nb1, dst_nb1, dst_nb2, dst_nb1, dst_nb2, gate_bias_nb1,
+                                    up_bias_nb1, glu_op, alpha, limit, gate_event, up_event, stream);
+    if (event_out) {
+        *event_out = glu_event;
+    }
 }
 
 static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_sycl(const void * const * expert_ptrs_a,
@@ -4219,7 +4994,7 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_sycl(const void * const * exp
     });
 }
 
-template <int MOE_MMV_Y, bool USE_WEIGHT_SCALE = true>
+template <int MOE_MMV_Y, bool USE_WEIGHT_SCALE = true, int SUBGROUP_SIZE = WARP_SIZE>
 static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows(const void * const * gate_ptrs,
                                                                  const void * const * up_ptrs,
                                                                  const void *         vy,
@@ -4245,49 +5020,60 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows(const void * co
                                                                  const int            glu_op,
                                                                  const float          alpha,
                                                                  const float          limit,
+                                                                 bool                 vector_qs_load,
+                                                                 int                  scale_stride_blocks,
                                                                  bool                 cache_y_local,
                                                                  dpct::queue_ptr      stream,
                                                                  sycl::event *        event_out = nullptr) {
     GGML_ASSERT(ncols % QK_MXFP4 == 0);
     static_assert(MOE_MMV_Y > 0, "MOE_MMV_Y must be positive");
-    static_assert(MOE_MMV_Y * WARP_SIZE <= 1024, "MOE_MMV_Y exceeds SYCL work-group limit");
+    static_assert(SUBGROUP_SIZE == 16 || SUBGROUP_SIZE == 32, "MXFP4 MoE subgroup size must be 16 or 32");
+    static_assert(MOE_MMV_Y * SUBGROUP_SIZE <= 1024, "MOE_MMV_Y exceeds SYCL work-group limit");
     const int            block_num_z = (nrows_per_expert + MOE_MMV_Y - 1) / MOE_MMV_Y;
     const sycl::range<3> block_nums(1, total_batches, block_num_z);
-    const sycl::range<3> block_dims(1, MOE_MMV_Y, WARP_SIZE);
+    const sycl::range<3> block_dims(1, MOE_MMV_Y, SUBGROUP_SIZE);
 
     const int64_t total_qs_size_per_expert = (ncols / 2) * nrows_per_expert;
     const int     blocks_per_row           = ncols / QK_MXFP4;
-    sycl::event   kernel_event;
-    auto          submit_glu = [&](auto glu_tag, auto cache_tag) -> sycl::event {
-        constexpr int  GLU_OP        = decltype(glu_tag)::value;
-        constexpr bool CACHE_Y_LOCAL = decltype(cache_tag)::value;
+    const int     scale_stride             = scale_stride_blocks > 0 ? scale_stride_blocks : blocks_per_row;
+    GGML_ASSERT(scale_stride >= blocks_per_row);
+    sycl::event kernel_event;
+    auto        submit_glu = [&](auto glu_tag, auto cache_tag, auto vec_tag) -> sycl::event {
+        constexpr int  GLU_OP         = decltype(glu_tag)::value;
+        constexpr bool CACHE_Y_LOCAL  = decltype(cache_tag)::value;
+        constexpr bool VECTOR_QS_LOAD = decltype(vec_tag)::value;
         return stream->submit([&](sycl::handler & cgh) {
             sycl::local_accessor<int, 1> slm_y_qs(
                 sycl::range<1>(CACHE_Y_LOCAL ? static_cast<size_t>(blocks_per_row * QI8_1) : 1), cgh);
             sycl::local_accessor<sycl::half2, 1> slm_y_ds(
                 sycl::range<1>(CACHE_Y_LOCAL ? static_cast<size_t>(blocks_per_row) : 1), cgh);
             cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
-                                      [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                 mul_mat_vec_mxfp4_q8_1_soa_id_pair_glu_kernel<GLU_OP, CACHE_Y_LOCAL, USE_WEIGHT_SCALE>(
+                                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(SUBGROUP_SIZE)]] {
+                                 mul_mat_vec_mxfp4_q8_1_soa_id_pair_glu_kernel<GLU_OP, CACHE_Y_LOCAL, USE_WEIGHT_SCALE,
+                                                                                      VECTOR_QS_LOAD, SUBGROUP_SIZE>(
                                      (const uint8_t * const *) gate_ptrs, (const uint8_t * const *) up_ptrs, vy,
                                      dst_glu, ids, gate_bias, up_bias, ncols, ncols_y, nrows_per_expert, n_ids,
                                      n_tokens, ne11, total_qs_size_per_expert, ids_nb0, ids_nb1, nb11, nb12, dst_nb1,
-                                     dst_nb2, gate_bias_nb1, up_bias_nb1, alpha, limit, item_ct1,
+                                     dst_nb2, gate_bias_nb1, up_bias_nb1, alpha, limit, scale_stride, item_ct1,
                                      SYCL_LOCAL_ACC_PTR(slm_y_qs), SYCL_LOCAL_ACC_PTR(slm_y_ds));
                              });
         });
     };
+    auto submit_for_cache = [&](auto glu_tag, auto cache_tag) -> sycl::event {
+        return vector_qs_load ? submit_glu(glu_tag, cache_tag, std::true_type{}) :
+                                submit_glu(glu_tag, cache_tag, std::false_type{});
+    };
     if (glu_op == GGML_GLU_OP_SWIGLU_OAI) {
         if (cache_y_local) {
-            kernel_event = submit_glu(std::integral_constant<int, GGML_GLU_OP_SWIGLU_OAI>{}, std::true_type{});
+            kernel_event = submit_for_cache(std::integral_constant<int, GGML_GLU_OP_SWIGLU_OAI>{}, std::true_type{});
         } else {
-            kernel_event = submit_glu(std::integral_constant<int, GGML_GLU_OP_SWIGLU_OAI>{}, std::false_type{});
+            kernel_event = submit_for_cache(std::integral_constant<int, GGML_GLU_OP_SWIGLU_OAI>{}, std::false_type{});
         }
     } else {
         if (cache_y_local) {
-            kernel_event = submit_glu(std::integral_constant<int, GGML_GLU_OP_SWIGLU>{}, std::true_type{});
+            kernel_event = submit_for_cache(std::integral_constant<int, GGML_GLU_OP_SWIGLU>{}, std::true_type{});
         } else {
-            kernel_event = submit_glu(std::integral_constant<int, GGML_GLU_OP_SWIGLU>{}, std::false_type{});
+            kernel_event = submit_for_cache(std::integral_constant<int, GGML_GLU_OP_SWIGLU>{}, std::false_type{});
         }
     }
     if (event_out) {
@@ -4327,7 +5113,7 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl(const void * const *
     reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<GGML_SYCL_MOE_PAIR_GLU_MMV_Y>(
         gate_ptrs, up_ptrs, vy, dst_glu, ids, gate_bias, up_bias, ncols, ncols_y, nrows_per_expert, total_batches,
         n_ids, n_tokens, ne11, ids_nb0, ids_nb1, nb11, nb12, dst_nb1, dst_nb2, gate_bias_nb1, up_bias_nb1, glu_op,
-        alpha, limit, cache_y_local, stream, event_out);
+        alpha, limit, false, 0, cache_y_local, stream, event_out);
 }
 
 // MoE dispatch: MXFP4 Coalesced layout with expert routing
@@ -4389,56 +5175,91 @@ static bool ggml_sycl_moe_ensure_compact_storage(ggml_backend_sycl_context & ctx
     sycl::queue * stream = ctx.stream();
     const size_t  bytes  = static_cast<size_t>(total_batches) * sizeof(void *);
 
-    if (extra->moe_expert_ptrs_compact_device[ctx.device] != nullptr &&
-        extra->moe_expert_ptrs_compact_capacity[ctx.device] >= bytes) {
+    if (extra->moe_compact_ptr(ctx.device) != nullptr && extra->moe_expert_ptrs_compact_capacity[ctx.device] >= bytes) {
         extra->moe_expert_ptrs_compact_size[ctx.device] = bytes;
     } else {
-        if (extra->moe_expert_ptrs_compact_device[ctx.device] != nullptr) {
+        if (extra->moe_compact_ptr(ctx.device) != nullptr) {
             if (!extra->moe_expert_ptrs_compact_from_prealloc[ctx.device]) {
-                sycl::free(extra->moe_expert_ptrs_compact_device[ctx.device], *stream);
+                if (extra->moe_expert_ptrs_compact_alloc[ctx.device].ptr) {
+                    ggml_sycl::unified_free(extra->moe_expert_ptrs_compact_alloc[ctx.device]);
+                    extra->moe_expert_ptrs_compact_alloc[ctx.device] = {};
+                } else {
+                    sycl::free(extra->moe_expert_ptrs_compact_device[ctx.device], *stream);
+                }
             }
             extra->moe_expert_ptrs_compact_device[ctx.device]        = nullptr;
             extra->moe_expert_ptrs_compact_capacity[ctx.device]      = 0;
             extra->moe_expert_ptrs_compact_size[ctx.device]          = 0;
             extra->moe_expert_ptrs_compact_from_prealloc[ctx.device] = false;
+            extra->moe_expert_ptrs_compact_handle[ctx.device]        = {};
         }
 
         void * compact = ggml_sycl::moe_get_compact_ptrs(ctx.device, bytes);
         if (compact) {
+            const auto * bufs                                        = ggml_sycl::moe_get_inference_buffers(ctx.device);
+            const bool   on_device                                   = !bufs || bufs->compact_on_device;
             extra->moe_expert_ptrs_compact_device[ctx.device]        = compact;
             extra->moe_expert_ptrs_compact_capacity[ctx.device]      = bytes;
             extra->moe_expert_ptrs_compact_size[ctx.device]          = bytes;
             extra->moe_expert_ptrs_compact_from_prealloc[ctx.device] = true;
+            extra->moe_expert_ptrs_compact_handle[ctx.device]        = ggml_sycl::mem_handle::from_direct(
+                compact, GGML_LAYOUT_AOS, on_device, on_device ? ctx.device : ggml_sycl::mem_handle::HOST_DEVICE);
         } else if (!allow_alloc) {
             return false;
         } else {
-            compact = ggml_sycl_malloc_device(bytes, *stream, "mmvq_compact");
-            if (!compact) {
+            ggml_sycl::alloc_request req{};
+            req.queue                          = stream;
+            req.device                         = ctx.device;
+            req.size                           = bytes;
+            req.intent.role                    = ggml_sycl::alloc_role::CONTROL;
+            req.intent.category                = ggml_sycl::runtime_category::CONTROL;
+            req.intent.constraints.must_device = true;
+            if (!ggml_sycl::unified_alloc(req, &extra->moe_expert_ptrs_compact_alloc[ctx.device]) ||
+                !extra->moe_expert_ptrs_compact_alloc[ctx.device].ptr) {
+                extra->moe_expert_ptrs_compact_alloc[ctx.device] = {};
                 GGML_LOG_ERROR("[MOE] Failed to allocate compact pointer list (%zu bytes)\n", bytes);
                 return false;
             }
-            extra->moe_expert_ptrs_compact_device[ctx.device]        = compact;
-            extra->moe_expert_ptrs_compact_capacity[ctx.device]      = bytes;
-            extra->moe_expert_ptrs_compact_size[ctx.device]          = bytes;
+            compact                                             = extra->moe_expert_ptrs_compact_alloc[ctx.device].ptr;
+            extra->moe_expert_ptrs_compact_device[ctx.device]   = compact;
+            extra->moe_expert_ptrs_compact_capacity[ctx.device] = bytes;
+            extra->moe_expert_ptrs_compact_size[ctx.device]     = bytes;
             extra->moe_expert_ptrs_compact_from_prealloc[ctx.device] = false;
+            extra->moe_expert_ptrs_compact_handle[ctx.device] =
+                extra->moe_expert_ptrs_compact_alloc[ctx.device].as_mem_handle();
         }
     }
 
-    if (extra->moe_expert_ptrs_missing_device[ctx.device] == nullptr) {
+    if (extra->moe_compact_missing_ptr(ctx.device) == nullptr) {
         int * missing = ggml_sycl::moe_get_compact_missing_flag(ctx.device);
         if (missing) {
+            const auto * bufs                                        = ggml_sycl::moe_get_inference_buffers(ctx.device);
+            const bool   on_device                                   = !bufs || bufs->compact_missing_on_device;
             extra->moe_expert_ptrs_missing_device[ctx.device]        = missing;
             extra->moe_expert_ptrs_missing_from_prealloc[ctx.device] = true;
+            extra->moe_expert_ptrs_missing_handle[ctx.device]        = ggml_sycl::mem_handle::from_direct(
+                missing, GGML_LAYOUT_AOS, on_device, on_device ? ctx.device : ggml_sycl::mem_handle::HOST_DEVICE);
         } else if (!allow_alloc) {
             return false;
         } else {
-            missing = ggml_sycl_malloc_device_t<int>(1, *stream, "mmvq_missing");
-            if (!missing) {
+            ggml_sycl::alloc_request req{};
+            req.queue                          = stream;
+            req.device                         = ctx.device;
+            req.size                           = sizeof(int);
+            req.intent.role                    = ggml_sycl::alloc_role::CONTROL;
+            req.intent.category                = ggml_sycl::runtime_category::CONTROL;
+            req.intent.constraints.must_device = true;
+            if (!ggml_sycl::unified_alloc(req, &extra->moe_expert_ptrs_missing_alloc[ctx.device]) ||
+                !extra->moe_expert_ptrs_missing_alloc[ctx.device].ptr) {
+                extra->moe_expert_ptrs_missing_alloc[ctx.device] = {};
                 GGML_LOG_ERROR("[MOE] Failed to allocate compact list missing flag\n");
                 return false;
             }
+            missing = static_cast<int *>(extra->moe_expert_ptrs_missing_alloc[ctx.device].ptr);
             extra->moe_expert_ptrs_missing_device[ctx.device]        = missing;
             extra->moe_expert_ptrs_missing_from_prealloc[ctx.device] = false;
+            extra->moe_expert_ptrs_missing_handle[ctx.device] =
+                extra->moe_expert_ptrs_missing_alloc[ctx.device].as_mem_handle();
         }
     }
 
@@ -4705,7 +5526,15 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &   ctx,
     switch (src0->type) {
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
+            if (layout != GGML_LAYOUT_AOS) {
+                return false;
+            }
+            break;
         case GGML_TYPE_MXFP4:
+            if (layout != GGML_LAYOUT_AOS && layout != GGML_LAYOUT_SOA && layout != GGML_LAYOUT_COALESCED &&
+                layout != GGML_LAYOUT_MXFP4_I8) {
+                return false;
+            }
             break;
         default:
             return false;
@@ -4732,7 +5561,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &   ctx,
     }
 
     // Use SoA quantizer if weights are in reordered layout (both SoA and COALESCED kernels expect SoA Y)
-    const bool     y_soa       = (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED);
+    const bool y_soa = (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED || layout == GGML_LAYOUT_MXFP4_I8);
     mxfp4_moe_role reuse_role  = mxfp4_moe_role::OTHER;
     int            reuse_layer = -1;
     const bool     reuse_candidate =
@@ -4889,14 +5718,14 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &   ctx,
     int64_t              ids_nb1 = can_use_direct_ids ? direct_ids_nb1 : n_ids * static_cast<int64_t>(sizeof(int32_t));
 
     if (can_use_direct_ids) {
-        // Compact storage is planner/graph-preload-owned.  The hot dispatch path
-        // may consume an existing compact ABI buffer, but should not allocate one.
-        constexpr bool allow_compact_alloc = false;
+        // Compact storage is owned by the tensor extra as a unified-cache
+        // allocation. Graph recording may only consume preallocated storage;
+        // direct dispatch can allocate it once and reuse it on later calls.
+        const bool allow_compact_alloc = !g_ggml_sycl_graph_recording;
         const bool compact_ready = ggml_sycl_moe_prepare_compact_list(ctx, src0, total_batches, allow_compact_alloc);
         if (compact_ready) {
-            auto *  extra_mut = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
-            void ** compact_ptrs =
-                extra_mut ? static_cast<void **>(extra_mut->moe_expert_ptrs_compact_device[ctx.device]) : nullptr;
+            auto *  extra_mut    = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
+            void ** compact_ptrs = extra_mut ? static_cast<void **>(extra_mut->moe_compact_ptr(ctx.device)) : nullptr;
             if (compact_ptrs) {
                 // No missing-flag readback here: this path is only reached when
                 // the caller already resolved every selected GPU entry.
@@ -4948,7 +5777,30 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &   ctx,
                                           q8_nb11, q8_nb12, nb1, nb2, stream);
             break;
         case GGML_TYPE_MXFP4:
-            if (layout == GGML_LAYOUT_COALESCED) {
+            if (layout == GGML_LAYOUT_MXFP4_I8) {
+                const auto & caps     = ggml_sycl_info().devices[ctx.device].xmx_caps;
+                const bool   use_sg16 = xmx_capabilities_support_sub_group(caps, 16);
+                if (use_sg16) {
+                    reorder_mul_mat_vec_mxfp4_i8_q8_1_id_sycl_rows<1, true, 16>(
+                        dispatch_ptrs, q8_1_buffer, dst_d, dispatch_ids,
+                        ne00,              // ncols (MXFP4)
+                        ne10,              // ncols_y (Q8_1 row size for SoA ds offset)
+                        ne01,              // nrows_per_expert
+                        ne02,              // num_experts
+                        total_batches, n_ids, num_tokens, ne11, ids_nb0,
+                        ids_nb1,           // ids strides
+                        q8_nb11, q8_nb12,  // Q8_1 strides
+                        nb1, nb2,          // dst strides
+                        /*scale_stride_blocks=*/0,
+                        /*cache_y_local=*/false, stream);
+                } else {
+                    reorder_mul_mat_vec_mxfp4_i8_q8_1_id_sycl_rows<1, true>(
+                        dispatch_ptrs, q8_1_buffer, dst_d, dispatch_ids, ne00, ne10, ne01, ne02, total_batches, n_ids,
+                        num_tokens, ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, nb1, nb2,
+                        /*scale_stride_blocks=*/0,
+                        /*cache_y_local=*/false, stream);
+                }
+            } else if (layout == GGML_LAYOUT_COALESCED) {
                 coalesced_mul_mat_vec_mxfp4_q8_1_id_sycl(nullptr,           // vx (unused with expert_ptrs)
                                                          dispatch_ptrs, q8_1_buffer, dst_d, dispatch_ids,
                                                          ne00,              // ncols (MXFP4)
@@ -5142,7 +5994,9 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                                                   float                         alpha,
                                                   float                         limit,
                                                   const ggml_sycl::mem_handle * glu_dst_handle_override,
-                                                  bool                          direct_xmx_eligible) {
+                                                  bool                          direct_xmx_eligible,
+                                                  ggml_tensor *                 gate_tmp,
+                                                  ggml_tensor *                 up_tmp) {
     if (n_gpu_entries <= 0 || !gate_ptrs_device || !up_ptrs_device || !ids_device) {
         return false;
     }
@@ -5200,26 +6054,50 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
     const int64_t q8_nb11       = q8_1_row_size;
     const int64_t q8_nb12       = ne11 * q8_1_row_size;
 
-    auto        t_kernel_begin  = std::chrono::high_resolution_clock::now();
-    bool        used_direct_xmx = false;
-    sycl::event kernel_event;
-    bool        have_kernel_event = false;
+    auto         t_kernel_begin  = std::chrono::high_resolution_clock::now();
+    bool         used_direct_xmx = false;
+    bool         used_split_sg16 = false;
+    sycl::event  kernel_event;
+    bool         have_kernel_event = false;
+    const auto & xmx_caps          = ggml_sycl_info().devices[ctx.device].xmx_caps;
 #if GGML_SYCL_XMX_JOINT_MATRIX_AVAILABLE
-    const auto & xmx_caps = ggml_sycl_info().devices[ctx.device].xmx_caps;
     if (mmvq_moe_direct_xmx_glu_enabled() && direct_xmx_eligible && xmx_caps.supported && xmx_caps.supports_int8) {
-        reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_xmx_sycl(
+        reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_xmx_sycl<1>(
             gate_ptrs_device, up_ptrs_device, q8_1_buffer, glu_d, ids_device, gate_bias_device, up_bias_device, ne00,
             ne10, ne01, total_batches, n_ids, num_tokens, ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, glu_dst->nb[1],
             glu_dst->nb[2], gate_bias_nb1, up_bias_nb1, glu_op, alpha, limit, stream);
         used_direct_xmx = true;
     }
 #endif
+    const bool split_sg16_eligible =
+        !used_direct_xmx && ne12 == 1 && gate_tmp && up_tmp && gate_tmp->type == GGML_TYPE_F32 &&
+        up_tmp->type == GGML_TYPE_F32 && gate_tmp->ne[0] == ne01 && up_tmp->ne[0] == ne01 && gate_tmp->ne[1] == n_ids &&
+        up_tmp->ne[1] == n_ids && gate_tmp->ne[2] == ne12 && up_tmp->ne[2] == ne12 &&
+        gate_tmp->nb[0] == sizeof(float) && up_tmp->nb[0] == sizeof(float) && gate_tmp->nb[1] == up_tmp->nb[1] &&
+        gate_tmp->nb[2] == up_tmp->nb[2] && gate_tmp->nb[1] == glu_dst->nb[1] && gate_tmp->nb[2] == glu_dst->nb[2] &&
+        xmx_capabilities_support_sub_group(xmx_caps, 16);
+    if (split_sg16_eligible) {
+        float * gate_tmp_d = static_cast<float *>(ggml_sycl_resolve_tensor_ptr(gate_tmp, ctx.device));
+        float * up_tmp_d   = static_cast<float *>(ggml_sycl_resolve_tensor_ptr(up_tmp, ctx.device));
+        if (gate_tmp_d && up_tmp_d) {
+            reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_split_sycl_rows<GGML_SYCL_MOE_MMV_Y, true, 16>(
+                gate_ptrs_device, up_ptrs_device, q8_1_buffer, gate_tmp_d, up_tmp_d, glu_d, ids_device,
+                gate_bias_device, up_bias_device, ne00, ne10, ne01, static_cast<int>(gate_weight->ne[2]), total_batches,
+                n_ids, num_tokens, ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, gate_tmp->nb[1], gate_tmp->nb[2],
+                gate_bias_nb1, up_bias_nb1, glu_op, alpha, limit, false, 0, false, stream, &kernel_event);
+            used_split_sg16   = true;
+            have_kernel_event = true;
+        }
+    }
     if (!used_direct_xmx) {
-        reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl(
-            gate_ptrs_device, up_ptrs_device, q8_1_buffer, glu_d, ids_device, gate_bias_device, up_bias_device, ne00,
-            ne10, ne01, total_batches, n_ids, num_tokens, ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, glu_dst->nb[1],
-            glu_dst->nb[2], gate_bias_nb1, up_bias_nb1, glu_op, alpha, limit, stream, &kernel_event);
-        have_kernel_event = true;
+        if (!used_split_sg16) {
+            reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl(
+                gate_ptrs_device, up_ptrs_device, q8_1_buffer, glu_d, ids_device, gate_bias_device, up_bias_device,
+                ne00, ne10, ne01, total_batches, n_ids, num_tokens, ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12,
+                glu_dst->nb[1], glu_dst->nb[2], gate_bias_nb1, up_bias_nb1, glu_op, alpha, limit, stream,
+                &kernel_event);
+            have_kernel_event = true;
+        }
     }
     if (tg_profile) {
         if (have_kernel_event) {
@@ -5254,7 +6132,8 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
         mmvq_moe_tg_profile_record(GGML_LAYOUT_SOA, 2 * n_gpu_entries, 2 * total_batches, quant_us - down_q8_publish_us,
                                    0.0, kernel_profile_us, down_q8_publish_us, mmvq_moe_tg_profile_kind::GATEUP_GLU, 2);
     }
-    GGML_SYCL_DEBUG("[MOE-PAIR-GLU] Dispatched %d GPU experts for fused MXFP4 SOA gate/up/GLU\n", n_gpu_entries);
+    GGML_SYCL_DEBUG("[MOE-PAIR-GLU] Dispatched %d GPU experts for MXFP4 SOA gate/up/GLU (%s)\n", n_gpu_entries,
+                    used_direct_xmx ? "direct-xmx" : (used_split_sg16 ? "split-sg16" : "fused-pair"));
     return true;
 }
 
@@ -5338,9 +6217,10 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
     // For MXFP4 MoE: allow SOA/Coalesced dispatch even when base tensor is AOS.
     // The expert pointer table + unified cache will stage per-expert data in the
     // requested reordered layout on-the-fly. This avoids the slow AOS kernel.
-    const bool mxfp4_moe_reorder_dispatch = (src0->type == GGML_TYPE_MXFP4) &&
-                                            (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED) &&
-                                            src0_extra && (get_effective_layout_mode(src0_extra) == GGML_LAYOUT_AOS);
+    const bool mxfp4_moe_reorder_dispatch = (src0->type == GGML_TYPE_MXFP4) && src0_extra &&
+                                            (((layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED) &&
+                                              get_effective_layout_mode(src0_extra) == GGML_LAYOUT_AOS) ||
+                                             layout == GGML_LAYOUT_MXFP4_I8);
 
     // Always validate that the forced layout is actually supported by the tensor
     // dimensions.  COALESCED requires blocks_per_row % 32 == 0 — reject if not met,
@@ -5411,6 +6291,12 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
     const queue_ptr stream                = ctx.stream();
     auto *          route_cache           = ggml_sycl::get_unified_cache(*stream);
     const bool      placement_plan_active = route_cache && route_cache->has_placement_plan();
+    bool            plan_has_host_experts = false;
+    if (placement_plan_active && src0->name && src0->name[0] != '\0') {
+        const int64_t n_experts = src0->ne[2] > 0 ? src0->ne[2] : 1;
+        plan_has_host_experts =
+            route_cache->moe_tensor_has_host_experts(std::string(src0->name), n_experts, ctx.device);
+    }
     // Previously returned false here when (placement_plan_active && use_ptr_table).
     // The mixed-ptr check at ~3870-3886 is the architecturally correct gate: it
     // inspects actual expert pointer residency after ggml_sycl_update_moe_ptr_table
@@ -5445,7 +6331,10 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
 
     const void * const * expert_ptrs = nullptr;
     sycl::event          table_event;
-    bool                 has_table_event = false;
+    bool                 has_table_event          = false;
+    const bool           all_experts_local_device = !g_ggml_sycl_graph_recording && use_ptr_table && !host_weights &&
+                                          placement_plan_active && layout != GGML_LAYOUT_MXFP4_I8 &&
+                                          ggml_sycl_moe_all_experts_local_device(src0, ctx.device, layout);
     if (use_ptr_table) {
         if (g_ggml_sycl_graph_recording) {
             if (src0_extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES) {
@@ -5468,14 +6357,17 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                 has_table_event = true;
             }
         } else {
-            const bool allow_all_experts = false;
+            const bool allow_all_experts       = all_experts_local_device;
+            const bool skip_cpu_routed_experts = host_weights || plan_has_host_experts;
             // force_cache_aos=true ensures experts are staged to GPU memory even for AoS layout
             // This is critical for mmap'd weights which cannot be accessed directly by GPU kernels
             GGML_SYCL_DEBUG("[MMVQ] About to call ggml_sycl_update_moe_ptr_table layout=%d\n", (int) layout);
-            if (!ggml_sycl_update_moe_ptr_table(ctx, src0, ids, layout, &table_event, allow_all_experts, nullptr,
+            if (!ggml_sycl_update_moe_ptr_table(ctx, src0, all_experts_local_device ? nullptr : ids, layout,
+                                                &table_event, allow_all_experts, nullptr,
                                                 /*skip_device_copy=*/false,
                                                 /*force_cache_aos=*/host_weights,
-                                                /*skip_cpu_routed_experts=*/host_weights || placement_plan_active)) {
+                                                /*skip_cpu_routed_experts=*/skip_cpu_routed_experts,
+                                                /*exact_layout_required=*/layout == GGML_LAYOUT_MXFP4_I8)) {
                 GGML_SYCL_DEBUG("[MMVQ] Failed to update expert pointer table for %s\n", src0->name);
                 return false;
             }
@@ -5563,7 +6455,8 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
         // Quantize all rows to Q8_1
         // Use SoA quantizer if weights are in any reordered layout (both SoA and COALESCED kernels expect SoA Y)
         ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
-        const bool              y_soa = (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED);
+        const bool              y_soa =
+            (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED || layout == GGML_LAYOUT_MXFP4_I8);
         if (y_soa) {
             GGML_SYCL_DEBUG("[MoE-Q8_1] Quantizing Y to SoA layout (X is_soa=%d)\n", y_soa);
             quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(src1_d, (char *) q8_1_buffer, ne10, total_src1_rows,
@@ -5608,19 +6501,17 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
     const int64_t q8_nb12 = ne11 * q8_1_row_size;
 
     const bool allow_compact_alloc = !g_ggml_sycl_graph_recording;
-    const bool compact_ready =
-        expert_ptrs && ggml_sycl_moe_prepare_compact_list(ctx, src0, total_batches, allow_compact_alloc);
+    const bool compact_ready       = !all_experts_local_device && expert_ptrs &&
+                               ggml_sycl_moe_prepare_compact_list(ctx, src0, total_batches, allow_compact_alloc);
     const void * const * dispatch_ptrs = expert_ptrs;
     const int32_t *      dispatch_ids  = ids_d;
 
     if (compact_ready && expert_ptrs) {
-        auto *  extra_mut = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
-        void ** compact_ptrs =
-            extra_mut ? static_cast<void **>(extra_mut->moe_expert_ptrs_compact_device[ctx.device]) : nullptr;
+        auto *  extra_mut    = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
+        void ** compact_ptrs = extra_mut ? static_cast<void **>(extra_mut->moe_compact_ptr(ctx.device)) : nullptr;
         if (compact_ptrs) {
-            int *                    missing_device = (!g_ggml_sycl_graph_recording && extra_mut) ?
-                                                          extra_mut->moe_expert_ptrs_missing_device[ctx.device] :
-                                                          nullptr;
+            int * missing_device =
+                (!g_ggml_sycl_graph_recording && extra_mut) ? extra_mut->moe_compact_missing_ptr(ctx.device) : nullptr;
             std::vector<sycl::event> compact_deps;
             if (!g_ggml_sycl_graph_recording && has_table_event) {
                 compact_deps.push_back(table_event);
@@ -5682,15 +6573,17 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                 auto *     extra          = (ggml_tensor_extra_gpu *) src0->extra;
                 const bool x_is_soa       = (layout == GGML_LAYOUT_SOA);
                 const bool x_is_coalesced = (layout == GGML_LAYOUT_COALESCED);
-                const bool x_is_reordered = x_is_soa || x_is_coalesced;
+                const bool x_is_mxfp4_i8  = (layout == GGML_LAYOUT_MXFP4_I8);
+                const bool x_is_reordered = x_is_soa || x_is_coalesced || x_is_mxfp4_i8;
 
                 GGML_SYCL_DEBUG(
                     "[MMVQ-MXFP4] ENTER: layout=%d use_ptr_table=%d host_weights=%d src0_d=%p dispatch_ptrs=%p\n",
                     (int) layout, use_ptr_table, host_weights, src0_d, (void *) dispatch_ptrs);
-                GGML_SYCL_DEBUG("[MMVQ-MXFP4] X: is_soa=%d is_coalesced=%d is_reordered=%d extra=%p tensor=%s\n",
-                                x_is_soa, x_is_coalesced, x_is_reordered, extra, src0->name ? src0->name : "null");
+                GGML_SYCL_DEBUG(
+                    "[MMVQ-MXFP4] X: is_soa=%d is_coalesced=%d is_mxfp4_i8=%d is_reordered=%d extra=%p tensor=%s\n",
+                    x_is_soa, x_is_coalesced, x_is_mxfp4_i8, x_is_reordered, extra, src0->name ? src0->name : "null");
 
-                if (x_is_soa || x_is_coalesced) {
+                if (x_is_soa || x_is_coalesced || x_is_mxfp4_i8) {
                     // SoA layout - both MXFP4 weights and Q8_1 input must be in SoA format
                     // Verify: is_soa should imply is_reordered
                     GGML_ASSERT(x_is_reordered && "X is_soa but not is_reordered - flag inconsistency");
@@ -5760,7 +6653,33 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                                 (float) y_ds_sample[1][0], (float) y_ds_sample[1][1]);
                     }
 
-                    if (x_is_coalesced) {
+                    if (x_is_mxfp4_i8) {
+                        const auto & caps     = ggml_sycl_info().devices[ctx.device].xmx_caps;
+                        const bool   use_sg16 = xmx_capabilities_support_sub_group(caps, 16);
+                        GGML_SYCL_DEBUG(
+                            "[MMVQ-MXFP4-I8] X=predecoded_i8 Y=SoA ne00=%lld ne10=%lld ne01=%lld ne02=%lld "
+                            "sg16=%d\n",
+                            (long long) ne00, (long long) ne10, (long long) ne01, (long long) ne02, use_sg16 ? 1 : 0);
+                        if (use_sg16) {
+                            reorder_mul_mat_vec_mxfp4_i8_q8_1_id_sycl_rows<1, true, 16>(
+                                dispatch_ptrs, q8_1_buffer, dst_d, dispatch_ids,
+                                ne00,              // ncols (MXFP4)
+                                ne10,              // ncols_y (Q8_1 row size for SoA ds offset)
+                                ne01,              // nrows_per_expert
+                                ne02,              // num_experts
+                                total_batches, n_ids, num_tokens, ne11, ids_nb0,
+                                ids_nb1,           // ids strides
+                                q8_nb11, q8_nb12,  // Q8_1 strides
+                                nb1, nb2,          // dst strides
+                                /*scale_stride_blocks=*/0,
+                                /*cache_y_local=*/false, stream);
+                        } else {
+                            reorder_mul_mat_vec_mxfp4_i8_q8_1_id_sycl_rows<1, true>(
+                                dispatch_ptrs, q8_1_buffer, dst_d, dispatch_ids, ne00, ne10, ne01, ne02, total_batches,
+                                n_ids, num_tokens, ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, nb1, nb2,
+                                /*scale_stride_blocks=*/0, /*cache_y_local=*/false, stream);
+                        }
+                    } else if (x_is_coalesced) {
                         GGML_SYCL_DEBUG(
                             "[MMVQ-MXFP4-Coalesced] X=Coalesced Y=SoA ne00=%lld ne10=%lld ne01=%lld ne02=%lld\n",
                             (long long) ne00, (long long) ne10, (long long) ne01, (long long) ne02);
@@ -6865,6 +7784,9 @@ bool ggml_sycl_mxfp4_pair_glu_bench_launch(const mxfp4_pair_glu_bench_args & arg
     if (!args.stream || !args.gate_ptrs || !args.up_ptrs || !args.activations_q8_soa || !args.output || !args.ids) {
         return false;
     }
+    if (args.split_gate_up && (!args.gate_tmp || !args.up_tmp || args.direct_xmx)) {
+        return false;
+    }
     if (args.ncols <= 0 || args.ncols_y <= 0 || args.nrows_per_expert <= 0 || args.n_ids <= 0 || args.n_tokens <= 0 ||
         args.ne11 <= 0) {
         return false;
@@ -6876,15 +7798,116 @@ bool ggml_sycl_mxfp4_pair_glu_bench_launch(const mxfp4_pair_glu_bench_args & arg
     if (args.glu_op != GGML_GLU_OP_SWIGLU && args.glu_op != GGML_GLU_OP_SWIGLU_OAI) {
         return false;
     }
+    const int blocks_per_row = args.ncols / QK_MXFP4;
+    if (args.scale_stride_blocks > 0 && args.scale_stride_blocks < blocks_per_row) {
+        return false;
+    }
+    if (args.direct_xmx && (args.vector_qs_load || args.scale_stride_blocks > 0)) {
+        return false;
+    }
 
     const int total_batches = args.n_ids * args.n_tokens;
+    const int num_experts   = args.num_experts > 0 ? args.num_experts : args.n_ids;
+    if (args.split_gate_up) {
+        if (args.subgroup_size == 16) {
+            switch (args.rows_per_wg) {
+                case 1:
+                    reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_split_sycl_rows<1, true, 16>(
+                        args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.gate_tmp, args.up_tmp, args.output,
+                        args.ids, args.gate_bias, args.up_bias, args.ncols, args.ncols_y, args.nrows_per_expert,
+                        num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11, args.ids_nb0, args.ids_nb1,
+                        args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.gate_bias_nb1, args.up_bias_nb1,
+                        args.glu_op, args.alpha, args.limit, args.vector_qs_load, args.scale_stride_blocks,
+                        args.cache_y, args.stream);
+                    return true;
+                case 4:
+                    reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_split_sycl_rows<4, true, 16>(
+                        args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.gate_tmp, args.up_tmp, args.output,
+                        args.ids, args.gate_bias, args.up_bias, args.ncols, args.ncols_y, args.nrows_per_expert,
+                        num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11, args.ids_nb0, args.ids_nb1,
+                        args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.gate_bias_nb1, args.up_bias_nb1,
+                        args.glu_op, args.alpha, args.limit, args.vector_qs_load, args.scale_stride_blocks,
+                        args.cache_y, args.stream);
+                    return true;
+                default:
+                    return false;
+            }
+        }
+        switch (args.rows_per_wg) {
+            case 1:
+                reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_split_sycl_rows<1>(
+                    args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.gate_tmp, args.up_tmp, args.output,
+                    args.ids, args.gate_bias, args.up_bias, args.ncols, args.ncols_y, args.nrows_per_expert,
+                    num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11, args.ids_nb0, args.ids_nb1,
+                    args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.gate_bias_nb1, args.up_bias_nb1, args.glu_op,
+                    args.alpha, args.limit, args.vector_qs_load, args.scale_stride_blocks, args.cache_y, args.stream);
+                return true;
+            case 2:
+                reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_split_sycl_rows<2>(
+                    args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.gate_tmp, args.up_tmp, args.output,
+                    args.ids, args.gate_bias, args.up_bias, args.ncols, args.ncols_y, args.nrows_per_expert,
+                    num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11, args.ids_nb0, args.ids_nb1,
+                    args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.gate_bias_nb1, args.up_bias_nb1, args.glu_op,
+                    args.alpha, args.limit, args.vector_qs_load, args.scale_stride_blocks, args.cache_y, args.stream);
+                return true;
+            case 4:
+                reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_split_sycl_rows<4>(
+                    args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.gate_tmp, args.up_tmp, args.output,
+                    args.ids, args.gate_bias, args.up_bias, args.ncols, args.ncols_y, args.nrows_per_expert,
+                    num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11, args.ids_nb0, args.ids_nb1,
+                    args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.gate_bias_nb1, args.up_bias_nb1, args.glu_op,
+                    args.alpha, args.limit, args.vector_qs_load, args.scale_stride_blocks, args.cache_y, args.stream);
+                return true;
+            case 8:
+                reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_split_sycl_rows<8>(
+                    args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.gate_tmp, args.up_tmp, args.output,
+                    args.ids, args.gate_bias, args.up_bias, args.ncols, args.ncols_y, args.nrows_per_expert,
+                    num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11, args.ids_nb0, args.ids_nb1,
+                    args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.gate_bias_nb1, args.up_bias_nb1, args.glu_op,
+                    args.alpha, args.limit, args.vector_qs_load, args.scale_stride_blocks, args.cache_y, args.stream);
+                return true;
+            case 16:
+                reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_split_sycl_rows<16>(
+                    args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.gate_tmp, args.up_tmp, args.output,
+                    args.ids, args.gate_bias, args.up_bias, args.ncols, args.ncols_y, args.nrows_per_expert,
+                    num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11, args.ids_nb0, args.ids_nb1,
+                    args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.gate_bias_nb1, args.up_bias_nb1, args.glu_op,
+                    args.alpha, args.limit, args.vector_qs_load, args.scale_stride_blocks, args.cache_y, args.stream);
+                return true;
+            default:
+                return false;
+        }
+    }
 #if GGML_SYCL_XMX_JOINT_MATRIX_AVAILABLE
     if (args.direct_xmx) {
-        reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_xmx_sycl(
-            args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids, args.gate_bias, args.up_bias,
-            args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids, args.n_tokens, args.ne11,
-            args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.gate_bias_nb1,
-            args.up_bias_nb1, args.glu_op, args.alpha, args.limit, args.stream);
+        switch (args.xmx_tiles_n) {
+            case 4:
+                reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_xmx_sycl<4>(
+                    args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids, args.gate_bias,
+                    args.up_bias, args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids,
+                    args.n_tokens, args.ne11, args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1,
+                    args.dst_nb2, args.gate_bias_nb1, args.up_bias_nb1, args.glu_op, args.alpha, args.limit,
+                    args.stream);
+                break;
+            case 2:
+                reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_xmx_sycl<2>(
+                    args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids, args.gate_bias,
+                    args.up_bias, args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids,
+                    args.n_tokens, args.ne11, args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1,
+                    args.dst_nb2, args.gate_bias_nb1, args.up_bias_nb1, args.glu_op, args.alpha, args.limit,
+                    args.stream);
+                break;
+            case 1:
+                reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_xmx_sycl<1>(
+                    args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids, args.gate_bias,
+                    args.up_bias, args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids,
+                    args.n_tokens, args.ne11, args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1,
+                    args.dst_nb2, args.gate_bias_nb1, args.up_bias_nb1, args.glu_op, args.alpha, args.limit,
+                    args.stream);
+                break;
+            default:
+                return false;
+        }
         return true;
     }
 #else
@@ -6892,6 +7915,49 @@ bool ggml_sycl_mxfp4_pair_glu_bench_launch(const mxfp4_pair_glu_bench_args & arg
         return false;
     }
 #endif
+    if (args.subgroup_size != 16 && args.subgroup_size != 32) {
+        return false;
+    }
+    if (args.subgroup_size == 16) {
+        switch (args.rows_per_wg) {
+            case 1:
+                if (args.ignore_weight_scale) {
+                    reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<1, false, 16>(
+                        args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids, args.gate_bias,
+                        args.up_bias, args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids,
+                        args.n_tokens, args.ne11, args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1,
+                        args.dst_nb2, args.gate_bias_nb1, args.up_bias_nb1, args.glu_op, args.alpha, args.limit,
+                        args.vector_qs_load, args.scale_stride_blocks, args.cache_y, args.stream);
+                    return true;
+                }
+                reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<1, true, 16>(
+                    args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids, args.gate_bias,
+                    args.up_bias, args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids,
+                    args.n_tokens, args.ne11, args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1,
+                    args.dst_nb2, args.gate_bias_nb1, args.up_bias_nb1, args.glu_op, args.alpha, args.limit,
+                    args.vector_qs_load, args.scale_stride_blocks, args.cache_y, args.stream);
+                return true;
+            case 4:
+                if (args.ignore_weight_scale) {
+                    reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<4, false, 16>(
+                        args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids, args.gate_bias,
+                        args.up_bias, args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids,
+                        args.n_tokens, args.ne11, args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1,
+                        args.dst_nb2, args.gate_bias_nb1, args.up_bias_nb1, args.glu_op, args.alpha, args.limit,
+                        args.vector_qs_load, args.scale_stride_blocks, args.cache_y, args.stream);
+                    return true;
+                }
+                reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<4, true, 16>(
+                    args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids, args.gate_bias,
+                    args.up_bias, args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids,
+                    args.n_tokens, args.ne11, args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1,
+                    args.dst_nb2, args.gate_bias_nb1, args.up_bias_nb1, args.glu_op, args.alpha, args.limit,
+                    args.vector_qs_load, args.scale_stride_blocks, args.cache_y, args.stream);
+                return true;
+            default:
+                return false;
+        }
+    }
     switch (args.rows_per_wg) {
         case 1:
             if (args.ignore_weight_scale) {
@@ -6900,14 +7966,15 @@ bool ggml_sycl_mxfp4_pair_glu_bench_launch(const mxfp4_pair_glu_bench_args & arg
                     args.up_bias, args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids,
                     args.n_tokens, args.ne11, args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1,
                     args.dst_nb2, args.gate_bias_nb1, args.up_bias_nb1, args.glu_op, args.alpha, args.limit,
-                    args.cache_y, args.stream);
+                    args.vector_qs_load, args.scale_stride_blocks, args.cache_y, args.stream);
                 return true;
             }
             reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<1, true>(
                 args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids, args.gate_bias,
                 args.up_bias, args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids, args.n_tokens,
                 args.ne11, args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2,
-                args.gate_bias_nb1, args.up_bias_nb1, args.glu_op, args.alpha, args.limit, args.cache_y, args.stream);
+                args.gate_bias_nb1, args.up_bias_nb1, args.glu_op, args.alpha, args.limit, args.vector_qs_load,
+                args.scale_stride_blocks, args.cache_y, args.stream);
             return true;
         case 2:
             if (args.ignore_weight_scale) {
@@ -6916,14 +7983,15 @@ bool ggml_sycl_mxfp4_pair_glu_bench_launch(const mxfp4_pair_glu_bench_args & arg
                     args.up_bias, args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids,
                     args.n_tokens, args.ne11, args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1,
                     args.dst_nb2, args.gate_bias_nb1, args.up_bias_nb1, args.glu_op, args.alpha, args.limit,
-                    args.cache_y, args.stream);
+                    args.vector_qs_load, args.scale_stride_blocks, args.cache_y, args.stream);
                 return true;
             }
             reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<2, true>(
                 args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids, args.gate_bias,
                 args.up_bias, args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids, args.n_tokens,
                 args.ne11, args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2,
-                args.gate_bias_nb1, args.up_bias_nb1, args.glu_op, args.alpha, args.limit, args.cache_y, args.stream);
+                args.gate_bias_nb1, args.up_bias_nb1, args.glu_op, args.alpha, args.limit, args.vector_qs_load,
+                args.scale_stride_blocks, args.cache_y, args.stream);
             return true;
         case 4:
             if (args.ignore_weight_scale) {
@@ -6932,14 +8000,15 @@ bool ggml_sycl_mxfp4_pair_glu_bench_launch(const mxfp4_pair_glu_bench_args & arg
                     args.up_bias, args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids,
                     args.n_tokens, args.ne11, args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1,
                     args.dst_nb2, args.gate_bias_nb1, args.up_bias_nb1, args.glu_op, args.alpha, args.limit,
-                    args.cache_y, args.stream);
+                    args.vector_qs_load, args.scale_stride_blocks, args.cache_y, args.stream);
                 return true;
             }
             reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<4, true>(
                 args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids, args.gate_bias,
                 args.up_bias, args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids, args.n_tokens,
                 args.ne11, args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2,
-                args.gate_bias_nb1, args.up_bias_nb1, args.glu_op, args.alpha, args.limit, args.cache_y, args.stream);
+                args.gate_bias_nb1, args.up_bias_nb1, args.glu_op, args.alpha, args.limit, args.vector_qs_load,
+                args.scale_stride_blocks, args.cache_y, args.stream);
             return true;
         case 8:
             if (args.ignore_weight_scale) {
@@ -6948,14 +8017,15 @@ bool ggml_sycl_mxfp4_pair_glu_bench_launch(const mxfp4_pair_glu_bench_args & arg
                     args.up_bias, args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids,
                     args.n_tokens, args.ne11, args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1,
                     args.dst_nb2, args.gate_bias_nb1, args.up_bias_nb1, args.glu_op, args.alpha, args.limit,
-                    args.cache_y, args.stream);
+                    args.vector_qs_load, args.scale_stride_blocks, args.cache_y, args.stream);
                 return true;
             }
             reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<8, true>(
                 args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids, args.gate_bias,
                 args.up_bias, args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids, args.n_tokens,
                 args.ne11, args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2,
-                args.gate_bias_nb1, args.up_bias_nb1, args.glu_op, args.alpha, args.limit, args.cache_y, args.stream);
+                args.gate_bias_nb1, args.up_bias_nb1, args.glu_op, args.alpha, args.limit, args.vector_qs_load,
+                args.scale_stride_blocks, args.cache_y, args.stream);
             return true;
         case 16:
             if (args.ignore_weight_scale) {
@@ -6964,18 +8034,122 @@ bool ggml_sycl_mxfp4_pair_glu_bench_launch(const mxfp4_pair_glu_bench_args & arg
                     args.up_bias, args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids,
                     args.n_tokens, args.ne11, args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1,
                     args.dst_nb2, args.gate_bias_nb1, args.up_bias_nb1, args.glu_op, args.alpha, args.limit,
-                    args.cache_y, args.stream);
+                    args.vector_qs_load, args.scale_stride_blocks, args.cache_y, args.stream);
                 return true;
             }
             reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows<16, true>(
                 args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids, args.gate_bias,
                 args.up_bias, args.ncols, args.ncols_y, args.nrows_per_expert, total_batches, args.n_ids, args.n_tokens,
                 args.ne11, args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2,
-                args.gate_bias_nb1, args.up_bias_nb1, args.glu_op, args.alpha, args.limit, args.cache_y, args.stream);
+                args.gate_bias_nb1, args.up_bias_nb1, args.glu_op, args.alpha, args.limit, args.vector_qs_load,
+                args.scale_stride_blocks, args.cache_y, args.stream);
             return true;
         default:
             return false;
     }
+}
+
+bool ggml_sycl_mxfp4_layer_glu_down_bench_launch(const mxfp4_layer_glu_down_bench_args & args) {
+    if (!args.stream || !args.gate_ptrs || !args.up_ptrs || !args.down_ptrs || !args.activations_q8_soa ||
+        !args.glu_f32 || !args.down_q8_soa || !args.output || !args.ids) {
+        return false;
+    }
+    if (args.activation_cols <= 0 || args.intermediate_cols <= 0 || args.output_rows_per_expert <= 0 ||
+        args.num_experts <= 0 || args.n_ids <= 0 || args.n_tokens <= 0 || args.ne11 <= 0) {
+        return false;
+    }
+    if ((args.activation_cols % QK_MXFP4) != 0 || (args.intermediate_cols % QK_MXFP4) != 0 ||
+        (args.intermediate_cols % QK8_1) != 0 || args.ids_nb0 <= 0 || args.ids_nb1 <= 0 || args.activation_nb11 <= 0 ||
+        args.activation_nb12 <= 0 || args.glu_nb1 <= 0 || args.glu_nb2 <= 0 || args.down_q8_nb11 <= 0 ||
+        args.down_q8_nb12 <= 0 || args.output_nb1 <= 0 || args.output_nb2 <= 0) {
+        return false;
+    }
+    if (args.glu_nb1 != static_cast<int64_t>(args.intermediate_cols * sizeof(float))) {
+        return false;
+    }
+    if (args.glu_op != GGML_GLU_OP_SWIGLU && args.glu_op != GGML_GLU_OP_SWIGLU_OAI) {
+        return false;
+    }
+    if (args.subgroup_size != 16 && args.subgroup_size != 32) {
+        return false;
+    }
+    const int down_blocks_per_row = args.intermediate_cols / QK_MXFP4;
+    if (args.scale_stride_blocks > 0 && args.scale_stride_blocks < down_blocks_per_row) {
+        return false;
+    }
+
+    mxfp4_pair_glu_bench_args pair_args{};
+    pair_args.stream              = args.stream;
+    pair_args.gate_ptrs           = args.gate_ptrs;
+    pair_args.up_ptrs             = args.up_ptrs;
+    pair_args.activations_q8_soa  = args.activations_q8_soa;
+    pair_args.output              = args.glu_f32;
+    pair_args.ids                 = args.ids;
+    pair_args.gate_bias           = args.gate_bias;
+    pair_args.up_bias             = args.up_bias;
+    pair_args.ncols               = args.activation_cols;
+    pair_args.ncols_y             = args.activation_cols;
+    pair_args.nrows_per_expert    = args.intermediate_cols;
+    pair_args.n_ids               = args.n_ids;
+    pair_args.n_tokens            = args.n_tokens;
+    pair_args.ne11                = args.ne11;
+    pair_args.ids_nb0             = args.ids_nb0;
+    pair_args.ids_nb1             = args.ids_nb1;
+    pair_args.nb11                = args.activation_nb11;
+    pair_args.nb12                = args.activation_nb12;
+    pair_args.dst_nb1             = args.glu_nb1;
+    pair_args.dst_nb2             = args.glu_nb2;
+    pair_args.gate_bias_nb1       = args.gate_bias_nb1;
+    pair_args.up_bias_nb1         = args.up_bias_nb1;
+    pair_args.rows_per_wg         = args.rows_per_wg;
+    pair_args.cache_y             = args.cache_y;
+    pair_args.vector_qs_load      = args.vector_qs_load;
+    pair_args.ignore_weight_scale = args.ignore_weight_scale;
+    pair_args.scale_stride_blocks = args.scale_stride_blocks;
+    pair_args.subgroup_size       = args.subgroup_size;
+    pair_args.glu_op              = args.glu_op;
+    pair_args.alpha               = args.alpha;
+    pair_args.limit               = args.limit;
+    if (!ggml_sycl_mxfp4_pair_glu_bench_launch(pair_args)) {
+        return false;
+    }
+
+    const int64_t total_batches = static_cast<int64_t>(args.n_ids) * static_cast<int64_t>(args.n_tokens);
+    const int64_t ne0_padded    = GGML_PAD(args.intermediate_cols, QK8_1);
+    const int64_t q8_row_size   = ne0_padded * sizeof(block_q8_1) / QK8_1;
+    if (args.down_q8_nb11 != q8_row_size) {
+        return false;
+    }
+    quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(args.glu_f32, static_cast<char *>(args.down_q8_soa),
+                                                          args.intermediate_cols, total_batches, ne0_padded,
+                                                          args.stream);
+
+    mxfp4_mmv_id_bench_args down_args{};
+    down_args.stream              = args.stream;
+    down_args.expert_ptrs         = args.down_ptrs;
+    down_args.activations_q8_soa  = args.down_q8_soa;
+    down_args.output              = args.output;
+    down_args.ids                 = args.ids;
+    down_args.ncols               = args.intermediate_cols;
+    down_args.ncols_y             = args.intermediate_cols;
+    down_args.nrows_per_expert    = args.output_rows_per_expert;
+    down_args.num_experts         = args.num_experts;
+    down_args.n_ids               = args.n_ids;
+    down_args.n_tokens            = args.n_tokens;
+    down_args.ne11                = args.ne11;
+    down_args.ids_nb0             = args.ids_nb0;
+    down_args.ids_nb1             = args.ids_nb1;
+    down_args.nb11                = args.down_q8_nb11;
+    down_args.nb12                = args.down_q8_nb12;
+    down_args.dst_nb1             = args.output_nb1;
+    down_args.dst_nb2             = args.output_nb2;
+    down_args.rows_per_wg         = args.rows_per_wg;
+    down_args.cache_y             = args.cache_y;
+    down_args.vector_qs_load      = args.vector_qs_load;
+    down_args.ignore_weight_scale = args.ignore_weight_scale;
+    down_args.scale_stride_blocks = args.scale_stride_blocks;
+    down_args.subgroup_size       = args.subgroup_size;
+    return ggml_sycl_mxfp4_mmv_id_bench_launch(down_args);
 }
 
 bool ggml_sycl_mxfp4_mmv_id_bench_launch(const mxfp4_mmv_id_bench_args & args) {
@@ -6990,77 +8164,287 @@ bool ggml_sycl_mxfp4_mmv_id_bench_launch(const mxfp4_mmv_id_bench_args & args) {
         args.dst_nb1 <= 0 || args.dst_nb2 <= 0) {
         return false;
     }
+    const int blocks_per_row = args.ncols / QK_MXFP4;
+    if (args.scale_stride_blocks > 0 && args.scale_stride_blocks < blocks_per_row) {
+        return false;
+    }
+    if (args.subgroup_size != 16 && args.subgroup_size != 32) {
+        return false;
+    }
 
     const int total_batches = args.n_ids * args.n_tokens;
+    if (args.subgroup_size == 16) {
+        switch (args.rows_per_wg) {
+            case 1:
+                if (args.ignore_weight_scale) {
+                    reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<1, false, 16>(
+                        nullptr, args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols,
+                        args.ncols_y, args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens,
+                        args.ne11, args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2,
+                        args.vector_qs_load, args.scale_stride_blocks, args.cache_y, args.stream);
+                    return true;
+                }
+                reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<1, true, 16>(
+                    nullptr, args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
+                    args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
+                    args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.vector_qs_load,
+                    args.scale_stride_blocks, args.cache_y, args.stream);
+                return true;
+            case 4:
+                if (args.ignore_weight_scale) {
+                    reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<4, false, 16>(
+                        nullptr, args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols,
+                        args.ncols_y, args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens,
+                        args.ne11, args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2,
+                        args.vector_qs_load, args.scale_stride_blocks, args.cache_y, args.stream);
+                    return true;
+                }
+                reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<4, true, 16>(
+                    nullptr, args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
+                    args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
+                    args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.vector_qs_load,
+                    args.scale_stride_blocks, args.cache_y, args.stream);
+                return true;
+            default:
+                return false;
+        }
+    }
     switch (args.rows_per_wg) {
         case 1:
             if (args.ignore_weight_scale) {
                 reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<1, false>(
                     nullptr, args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
                     args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
-                    args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.stream);
+                    args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.vector_qs_load,
+                    args.scale_stride_blocks, args.cache_y, args.stream);
                 return true;
             }
             reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<1, true>(
                 nullptr, args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
                 args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
-                args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.stream);
+                args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.vector_qs_load,
+                args.scale_stride_blocks, args.cache_y, args.stream);
             return true;
         case 2:
             if (args.ignore_weight_scale) {
                 reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<2, false>(
                     nullptr, args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
                     args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
-                    args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.stream);
+                    args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.vector_qs_load,
+                    args.scale_stride_blocks, args.cache_y, args.stream);
                 return true;
             }
             reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<2, true>(
                 nullptr, args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
                 args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
-                args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.stream);
+                args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.vector_qs_load,
+                args.scale_stride_blocks, args.cache_y, args.stream);
             return true;
         case 4:
             if (args.ignore_weight_scale) {
                 reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<4, false>(
                     nullptr, args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
                     args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
-                    args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.stream);
+                    args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.vector_qs_load,
+                    args.scale_stride_blocks, args.cache_y, args.stream);
                 return true;
             }
             reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<4, true>(
                 nullptr, args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
                 args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
-                args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.stream);
+                args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.vector_qs_load,
+                args.scale_stride_blocks, args.cache_y, args.stream);
             return true;
         case 8:
             if (args.ignore_weight_scale) {
                 reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<8, false>(
                     nullptr, args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
                     args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
-                    args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.stream);
+                    args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.vector_qs_load,
+                    args.scale_stride_blocks, args.cache_y, args.stream);
                 return true;
             }
             reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<8, true>(
                 nullptr, args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
                 args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
-                args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.stream);
+                args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.vector_qs_load,
+                args.scale_stride_blocks, args.cache_y, args.stream);
             return true;
         case 16:
             if (args.ignore_weight_scale) {
                 reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<16, false>(
                     nullptr, args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
                     args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
-                    args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.stream);
+                    args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.vector_qs_load,
+                    args.scale_stride_blocks, args.cache_y, args.stream);
                 return true;
             }
             reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<16, true>(
                 nullptr, args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
                 args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
-                args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.stream);
+                args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.vector_qs_load,
+                args.scale_stride_blocks, args.cache_y, args.stream);
             return true;
         default:
             return false;
     }
+}
+
+bool ggml_sycl_mxfp4_mmv_id_predecoded_bench_launch(const mxfp4_mmv_id_bench_args & args) {
+    if (!args.stream || !args.expert_ptrs || !args.activations_q8_soa || !args.output || !args.ids) {
+        return false;
+    }
+    if (args.ncols <= 0 || args.ncols_y <= 0 || args.nrows_per_expert <= 0 || args.num_experts <= 0 ||
+        args.n_ids <= 0 || args.n_tokens <= 0 || args.ne11 <= 0) {
+        return false;
+    }
+    if (args.ncols % QK_MXFP4 != 0 || args.ids_nb0 <= 0 || args.ids_nb1 <= 0 || args.nb11 <= 0 || args.nb12 <= 0 ||
+        args.dst_nb1 <= 0 || args.dst_nb2 <= 0) {
+        return false;
+    }
+    const int blocks_per_row = args.ncols / QK_MXFP4;
+    if (args.scale_stride_blocks > 0 && args.scale_stride_blocks < blocks_per_row) {
+        return false;
+    }
+    if (args.subgroup_size != 16 && args.subgroup_size != 32) {
+        return false;
+    }
+
+    const int total_batches = args.n_ids * args.n_tokens;
+    if (args.subgroup_size == 16) {
+        switch (args.rows_per_wg) {
+            case 1:
+                if (args.ignore_weight_scale) {
+                    reorder_mul_mat_vec_mxfp4_i8_q8_1_id_sycl_rows<1, false, 16>(
+                        args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
+                        args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
+                        args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2,
+                        args.scale_stride_blocks, args.cache_y, args.stream);
+                    return true;
+                }
+                reorder_mul_mat_vec_mxfp4_i8_q8_1_id_sycl_rows<1, true, 16>(
+                    args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
+                    args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
+                    args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2,
+                    args.scale_stride_blocks, args.cache_y, args.stream);
+                return true;
+            case 4:
+                if (args.ignore_weight_scale) {
+                    reorder_mul_mat_vec_mxfp4_i8_q8_1_id_sycl_rows<4, false, 16>(
+                        args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
+                        args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
+                        args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2,
+                        args.scale_stride_blocks, args.cache_y, args.stream);
+                    return true;
+                }
+                reorder_mul_mat_vec_mxfp4_i8_q8_1_id_sycl_rows<4, true, 16>(
+                    args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
+                    args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
+                    args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2,
+                    args.scale_stride_blocks, args.cache_y, args.stream);
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    switch (args.rows_per_wg) {
+        case 1:
+            if (args.ignore_weight_scale) {
+                reorder_mul_mat_vec_mxfp4_i8_q8_1_id_sycl_rows<1, false>(
+                    args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
+                    args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
+                    args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2,
+                    args.scale_stride_blocks, args.cache_y, args.stream);
+                return true;
+            }
+            reorder_mul_mat_vec_mxfp4_i8_q8_1_id_sycl_rows<1, true>(
+                args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
+                args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
+                args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.scale_stride_blocks,
+                args.cache_y, args.stream);
+            return true;
+        case 4:
+            if (args.ignore_weight_scale) {
+                reorder_mul_mat_vec_mxfp4_i8_q8_1_id_sycl_rows<4, false>(
+                    args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
+                    args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
+                    args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2,
+                    args.scale_stride_blocks, args.cache_y, args.stream);
+                return true;
+            }
+            reorder_mul_mat_vec_mxfp4_i8_q8_1_id_sycl_rows<4, true>(
+                args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
+                args.nrows_per_expert, args.num_experts, total_batches, args.n_ids, args.n_tokens, args.ne11,
+                args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.scale_stride_blocks,
+                args.cache_y, args.stream);
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool ggml_sycl_mxfp4_mmv_id_xmx_tiled_bench_launch(const mxfp4_mmv_id_xmx_tiled_bench_args & args) {
+    if (!args.stream || !args.expert_ptrs || !args.activations_q8_soa || !args.output || !args.ids) {
+        return false;
+    }
+    if (args.ncols <= 0 || args.ncols_y <= 0 || args.nrows_per_expert <= 0 || args.num_experts <= 0 ||
+        args.n_ids <= 0 || args.n_tokens <= 0 || args.ne11 <= 0) {
+        return false;
+    }
+    if (args.ncols % QK_MXFP4 != 0 || args.ids_nb0 <= 0 || args.ids_nb1 <= 0 || args.nb11 <= 0 || args.nb12 <= 0 ||
+        args.dst_nb1 <= 0 || args.dst_nb2 <= 0) {
+        return false;
+    }
+
+#if GGML_SYCL_XMX_JOINT_MATRIX_AVAILABLE
+    const int total_batches = args.n_ids * args.n_tokens;
+    switch (args.xmx_tiles_n) {
+        case 1:
+            if (args.raw_accum) {
+                reorder_mul_mat_vec_mxfp4_q8_1_xmx_tiled_id_sycl<1, true>(
+                    args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
+                    args.nrows_per_expert, total_batches, args.n_ids, args.n_tokens, args.ne11, args.ids_nb0,
+                    args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.stream);
+            } else {
+                reorder_mul_mat_vec_mxfp4_q8_1_xmx_tiled_id_sycl<1>(
+                    args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
+                    args.nrows_per_expert, total_batches, args.n_ids, args.n_tokens, args.ne11, args.ids_nb0,
+                    args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.stream);
+            }
+            return true;
+        case 2:
+            if (args.raw_accum) {
+                reorder_mul_mat_vec_mxfp4_q8_1_xmx_tiled_id_sycl<2, true>(
+                    args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
+                    args.nrows_per_expert, total_batches, args.n_ids, args.n_tokens, args.ne11, args.ids_nb0,
+                    args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.stream);
+            } else {
+                reorder_mul_mat_vec_mxfp4_q8_1_xmx_tiled_id_sycl<2>(
+                    args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
+                    args.nrows_per_expert, total_batches, args.n_ids, args.n_tokens, args.ne11, args.ids_nb0,
+                    args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.stream);
+            }
+            return true;
+        case 4:
+            if (args.raw_accum) {
+                reorder_mul_mat_vec_mxfp4_q8_1_xmx_tiled_id_sycl<4, true>(
+                    args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
+                    args.nrows_per_expert, total_batches, args.n_ids, args.n_tokens, args.ne11, args.ids_nb0,
+                    args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.stream);
+            } else {
+                reorder_mul_mat_vec_mxfp4_q8_1_xmx_tiled_id_sycl<4>(
+                    args.expert_ptrs, args.activations_q8_soa, args.output, args.ids, args.ncols, args.ncols_y,
+                    args.nrows_per_expert, total_batches, args.n_ids, args.n_tokens, args.ne11, args.ids_nb0,
+                    args.ids_nb1, args.nb11, args.nb12, args.dst_nb1, args.dst_nb2, args.stream);
+            }
+            return true;
+        default:
+            return false;
+    }
+#else
+    return false;
+#endif
 }
 
 }  // namespace ggml_sycl

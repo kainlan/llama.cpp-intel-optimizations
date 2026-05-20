@@ -311,7 +311,7 @@ void * ggml_sycl_get_cached_tensor_ptr_for(const ggml_tensor *      tensor,
 #    define GGML_SYCL_MOE_MMV_Y 4
 #endif
 #ifndef GGML_SYCL_MOE_PAIR_GLU_MMV_Y
-#    define GGML_SYCL_MOE_PAIR_GLU_MMV_Y 1
+#    define GGML_SYCL_MOE_PAIR_GLU_MMV_Y 2
 #endif
 
 typedef sycl::queue * queue_ptr;
@@ -590,6 +590,11 @@ struct XMXCapabilities {
     int optimal_tiles_n = 1;
 };
 
+static constexpr size_t GGML_SYCL_MXFP4_MOE_XMX_M  = 8;
+static constexpr size_t GGML_SYCL_MXFP4_MOE_XMX_N  = 16;
+static constexpr size_t GGML_SYCL_MXFP4_MOE_XMX_K  = 32;
+static constexpr size_t GGML_SYCL_MXFP4_MOE_XMX_SG = 16;
+
 static inline bool xmx_capabilities_support_sub_group(const XMXCapabilities & caps, size_t required_size) {
     if (required_size == 0) {
         return false;
@@ -608,6 +613,197 @@ static inline bool xmx_capabilities_match_int8_tile(const XMXCapabilities & caps
                                                     size_t                  required_n,
                                                     size_t                  required_k) {
     return caps.supported && caps.supports_int8 && caps.M == required_m && caps.N == required_n && caps.K == required_k;
+}
+
+struct mxfp4_moe_layout_decision {
+    layout_mode  layout         = GGML_LAYOUT_AOS;
+    const char * reason         = "unset";
+    bool         tiled_eligible = false;
+    bool         tiled_selected = false;
+    int64_t      tile_n_total   = 0;
+    int64_t      tile_k         = 0;
+    size_t       required_sg    = GGML_SYCL_MXFP4_MOE_XMX_SG;
+    size_t       required_slm   = 0;
+};
+
+static inline bool ggml_sycl_mxfp4_moe_coalesced_shape_ok(int64_t in_dim) {
+    return in_dim > 0 && (in_dim % QK_MXFP4) == 0 && ((in_dim / QK_MXFP4) % MMVQ_COALESCED_TILE_BLOCKS) == 0;
+}
+
+static inline mxfp4_moe_layout_decision ggml_sycl_select_mxfp4_moe_layout(const XMXCapabilities & caps,
+                                                                          int64_t                 in_dim,
+                                                                          int64_t                 out_dim,
+                                                                          int64_t                 n_experts,
+                                                                          bool                    device_resident,
+                                                                          bool tiled_kernel_validated) {
+    mxfp4_moe_layout_decision d{};
+    d.layout = GGML_LAYOUT_AOS;
+
+    if (in_dim <= 0 || out_dim <= 0 || n_experts <= 0) {
+        d.reason = "shape-empty";
+        return d;
+    }
+    if ((in_dim % QK_MXFP4) != 0) {
+        d.reason = "mxfp4-block-alignment";
+        return d;
+    }
+    if (!device_resident) {
+        d.reason = "host-resident-aos";
+        return d;
+    }
+
+    const bool coalesced_ok = ggml_sycl_mxfp4_moe_coalesced_shape_ok(in_dim);
+    d.layout                = coalesced_ok ? GGML_LAYOUT_COALESCED : GGML_LAYOUT_SOA;
+
+    if (!caps.supported || !caps.supports_int8) {
+        d.reason = coalesced_ok ? "no-xmx-coalesced" : "no-xmx-soa";
+        return d;
+    }
+    if (!xmx_capabilities_match_int8_tile(caps, GGML_SYCL_MXFP4_MOE_XMX_M, GGML_SYCL_MXFP4_MOE_XMX_N,
+                                          GGML_SYCL_MXFP4_MOE_XMX_K)) {
+        d.reason = "kernel-tile-shape";
+        return d;
+    }
+    if (!xmx_capabilities_support_sub_group(caps, GGML_SYCL_MXFP4_MOE_XMX_SG)) {
+        d.reason = "subgroup";
+        return d;
+    }
+    if (caps.optimal_tiles_n <= 0) {
+        d.reason = "tile-config";
+        return d;
+    }
+
+    const size_t tile_n_total       = caps.N * static_cast<size_t>(caps.optimal_tiles_n);
+    const size_t token_tile_bytes   = caps.M * caps.K * sizeof(int8_t);
+    const size_t weight_q_bytes     = tile_n_total * caps.K / 2;
+    const size_t weight_scale_bytes = tile_n_total;
+    d.required_slm                  = 16 + token_tile_bytes + weight_q_bytes + weight_scale_bytes;
+    if (caps.slm_size > 0 && d.required_slm > caps.slm_size) {
+        d.reason = "slm-budget";
+        return d;
+    }
+
+    d.tiled_eligible = true;
+    d.tile_n_total   = static_cast<int64_t>(tile_n_total);
+    d.tile_k         = static_cast<int64_t>(caps.K);
+
+    if (!tiled_kernel_validated) {
+        d.layout = GGML_LAYOUT_SOA;
+        d.reason = "xmx-tiled-not-validated-shared-soa";
+        return d;
+    }
+
+    d.layout         = GGML_LAYOUT_XMX_TILED;
+    d.reason         = "xmx-tiled-capability-shape-residency";
+    d.tiled_selected = true;
+    return d;
+}
+
+struct moe_device_policy {
+    int    device_id           = -1;
+    size_t total_vram          = 0;
+    size_t free_vram_at_init   = 0;
+    size_t max_alloc_size      = 0;
+    size_t safe_max_alloc_size = 0;
+    size_t vram_budget         = 0;
+    size_t weight_budget       = 0;
+    size_t arena_total         = 0;
+    size_t arena_scratch       = 0;
+    size_t arena_runtime       = 0;
+    size_t arena_onednn        = 0;
+
+    XMXCapabilities caps{};
+
+    bool xmx_int8_candidate   = false;
+    bool xmx_fp16_candidate   = false;
+    bool onednn_candidate     = false;
+    bool cpu_island_candidate = false;
+    bool direct_xmx_candidate = false;
+
+    mxfp4_moe_layout_decision mxfp4_device_layout{};
+    const char *              device_executor = "unavailable";
+    const char *              executor_reason = "unset";
+    const char *              host_executor   = "unavailable";
+    const char *              host_reason     = "unset";
+};
+
+static inline moe_device_policy ggml_sycl_make_moe_device_policy(const XMXCapabilities & caps,
+                                                                 int                     device_id,
+                                                                 size_t                  total_vram,
+                                                                 size_t                  free_vram_at_init,
+                                                                 size_t                  max_alloc_size,
+                                                                 size_t                  safe_max_alloc_size,
+                                                                 size_t                  vram_budget,
+                                                                 size_t                  weight_budget,
+                                                                 size_t                  arena_total,
+                                                                 size_t                  arena_scratch,
+                                                                 size_t                  arena_runtime,
+                                                                 size_t                  arena_onednn,
+                                                                 int64_t                 in_dim,
+                                                                 int64_t                 out_dim,
+                                                                 int64_t                 n_experts,
+                                                                 bool                    device_resident,
+                                                                 bool                    tiled_kernel_validated) {
+    moe_device_policy p{};
+    p.device_id           = device_id;
+    p.total_vram          = total_vram;
+    p.free_vram_at_init   = free_vram_at_init;
+    p.max_alloc_size      = max_alloc_size;
+    p.safe_max_alloc_size = safe_max_alloc_size;
+    p.vram_budget         = vram_budget;
+    p.weight_budget       = weight_budget;
+    p.arena_total         = arena_total;
+    p.arena_scratch       = arena_scratch;
+    p.arena_runtime       = arena_runtime;
+    p.arena_onednn        = arena_onednn;
+    p.caps                = caps;
+
+    p.xmx_int8_candidate = xmx_capabilities_match_int8_tile(caps, GGML_SYCL_MXFP4_MOE_XMX_M, GGML_SYCL_MXFP4_MOE_XMX_N,
+                                                            GGML_SYCL_MXFP4_MOE_XMX_K) &&
+                           xmx_capabilities_support_sub_group(caps, GGML_SYCL_MXFP4_MOE_XMX_SG);
+    p.xmx_fp16_candidate   = caps.supported && caps.supports_fp16 && caps.supports_fp16_type;
+    p.onednn_candidate     = caps.supports_usm_device && caps.supports_fp16_type;
+    p.cpu_island_candidate = caps.supports_usm_host;
+
+    p.mxfp4_device_layout =
+        ggml_sycl_select_mxfp4_moe_layout(caps, in_dim, out_dim, n_experts, device_resident, tiled_kernel_validated);
+    p.direct_xmx_candidate = p.mxfp4_device_layout.tiled_eligible || p.xmx_int8_candidate;
+
+    const bool shape_known = in_dim > 0 && out_dim > 0 && n_experts > 0;
+    if (!shape_known) {
+        p.device_executor = p.xmx_int8_candidate ? "shape-deferred-xmx" : "shape-deferred";
+        p.executor_reason = "shape-deferred";
+    } else if (!device_resident) {
+        p.device_executor = "cpu-island";
+        p.executor_reason = "host-resident";
+    } else if (p.mxfp4_device_layout.layout == GGML_LAYOUT_XMX_TILED) {
+        p.device_executor = "xmx-tiled";
+        p.executor_reason = p.mxfp4_device_layout.reason;
+    } else if (p.xmx_int8_candidate && (p.mxfp4_device_layout.layout == GGML_LAYOUT_SOA ||
+                                        p.mxfp4_device_layout.layout == GGML_LAYOUT_COALESCED)) {
+        p.device_executor = "xmx-mmvq";
+        p.executor_reason = p.mxfp4_device_layout.reason;
+    } else if (p.mxfp4_device_layout.layout == GGML_LAYOUT_SOA ||
+               p.mxfp4_device_layout.layout == GGML_LAYOUT_COALESCED) {
+        p.device_executor = "mmvq";
+        p.executor_reason = p.mxfp4_device_layout.reason;
+    } else if (p.cpu_island_candidate) {
+        p.device_executor = "cpu-island";
+        p.executor_reason = p.mxfp4_device_layout.reason;
+    } else {
+        p.device_executor = "unavailable";
+        p.executor_reason = p.mxfp4_device_layout.reason;
+    }
+
+    if (p.cpu_island_candidate) {
+        p.host_executor = "cpu-island";
+        p.host_reason   = "usm-host";
+    } else {
+        p.host_executor = "unavailable";
+        p.host_reason   = "no-usm-host";
+    }
+
+    return p;
 }
 
 XMXCapabilities query_xmx_capabilities(sycl::device & dev);
@@ -847,9 +1043,17 @@ inline tensor_usage infer_tensor_usage(const char * name) {
         return tensor_usage::UNKNOWN;
     }
 
-    // MoE expert weights (highest priority - check first)
-    if (strstr(name, "ffn_gate_exps") || strstr(name, "ffn_up_exps") || strstr(name, "ffn_down_exps")) {
+    // MoE expert weights (highest priority - check first).  Bias tensors share
+    // the same ffn_*_exps prefix but are separate small tensors; treating them
+    // as per-expert weights duplicates the planner's semantic
+    // (layer, expert, role) entries.
+    const bool moe_exps_name =
+        strstr(name, "ffn_gate_exps") || strstr(name, "ffn_up_exps") || strstr(name, "ffn_down_exps");
+    if (moe_exps_name && !strstr(name, ".bias")) {
         return tensor_usage::MOE_EXPERT_WEIGHT;
+    }
+    if (moe_exps_name) {
+        return tensor_usage::MOE_INTERMEDIATE;
     }
 
     // MoE routing gate
@@ -905,6 +1109,7 @@ bool   ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
                                       bool                         force_cache_aos         = false,
                                       bool                         skip_cpu_routed_experts = false,
                                       bool                         exact_layout_required   = false);
+bool   ggml_sycl_moe_all_experts_local_device(const ggml_tensor * src0, int device, layout_mode layout);
 bool   ggml_sycl_moe_prepare_compact_list(ggml_backend_sycl_context & ctx,
                                           const ggml_tensor *         src0,
                                           int64_t                     total_batches,
@@ -1896,8 +2101,8 @@ template <typename T> inline void ggml_sycl_free_host_tracked_t(T * ptr, size_t 
 // sycl::malloc_host / sycl::free calls during SOA weight conversion.
 // Thread-safe.  Buffers are pinned host memory (sycl::malloc_host) and are
 // GPU DMA-accessible.  The pool grows on demand and never shrinks until
-// shutdown/destruction.  In practice, pool size stabilizes at ~6-8 slots
-// for typical models (one per concurrent SOA conversion buffer size).
+// shutdown/destruction.  During async S1 preload the pool can grow to the
+// in-flight copy window so staging does not block on every pending DMA event.
 // --------------------------------------------------------------------------
 struct staging_buffer_pool {
     struct slot {
@@ -1920,91 +2125,130 @@ struct staging_buffer_pool {
     // Acquire a pinned host buffer of at least `needed` bytes.
     // Returns an existing free slot whose size >= needed, or allocates a new one.
     void * acquire(size_t needed, sycl::queue & queue) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        auto allocate_new_slot = [&]() -> void * {
+            // No suitable ready slot — allocate from the pre-allocated pinned
+            // chunk pool so that NO sycl::malloc_host occurs during inference.
+            void * ptr       = nullptr;
+            bool   from_pool = false;
+            {
+                auto * ucache = ggml_sycl::get_unified_cache_for_device(ggml_sycl_get_device_id_from_queue(queue));
+                if (ucache) {
+                    if (ucache->host_zones_configured()) {
+                        ggml_sycl::alloc_request _stg_req{};
+                        _stg_req.queue                               = &queue;
+                        _stg_req.size                                = needed;
+                        _stg_req.intent.role                         = ggml_sycl::alloc_role::STAGING;
+                        _stg_req.intent.constraints.must_host_pinned = true;
+                        _stg_req.intent.constraints.use_pinned_pool  = true;
+                        ptr = ggml_sycl::unified_allocate(_stg_req).resolve().ptr;
+                        // Zone allocation returns nullptr when the allocation spans a chunk
+                        // boundary or the STAGING zone is exhausted.  Fall back to runtime
+                        // pinned-pool allocation, still under unified-cache ownership.
+                        if (!ptr) {
+                            GGML_LOG_WARN(
+                                "[STAGING] zone_alloc failed for %zu bytes, falling back to runtime pinned "
+                                "allocation\n",
+                                needed);
+                            ptr       = ucache->host_pool_alloc(needed, 64);
+                            from_pool = (ptr != nullptr);
+                        } else {
+                            from_pool = true;
+                        }
+                    } else {
+                        ptr       = ucache->host_pool_alloc(needed, 64);
+                        from_pool = (ptr != nullptr);
+                    }
+                }
+            }
+            if (!ptr) {
+                return nullptr;
+            }
 
-        // First pass: find smallest free slot that fits (best-fit).
-        size_t best_idx  = SIZE_MAX;
-        size_t best_size = SIZE_MAX;
-        for (size_t i = 0; i < slots_.size(); ++i) {
-            auto & s = slots_[i];
-            if (!s.in_use && s.size >= needed && s.size < best_size) {
-                best_idx  = i;
-                best_size = s.size;
+            ggml_sycl::alloc_registry::instance().register_alloc(ptr, needed, -1, ggml_sycl::alloc_type::HOST_PINNED);
+            slot new_slot{};
+            new_slot.ptr              = ptr;
+            new_slot.size             = needed;
+            new_slot.in_use           = true;
+            new_slot.from_pinned_pool = from_pool;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                slots_.push_back(new_slot);
+            }
+            total_bytes_.fetch_add(needed, std::memory_order_relaxed);
+            return ptr;
+        };
+
+        // First pass: find the smallest ready free slot that fits.  Do not
+        // choose a pending-DMA slot here: S1 preload already bounds in-flight
+        // copies, and blocking inside the staging pool can turn async preload
+        // into a fragile Level Zero event wait.
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            size_t                      best_idx  = SIZE_MAX;
+            size_t                      best_size = SIZE_MAX;
+            for (size_t i = 0; i < slots_.size(); ++i) {
+                auto & s = slots_[i];
+                if (!s.in_use && !s.has_pending_event && s.size >= needed && s.size < best_size) {
+                    best_idx  = i;
+                    best_size = s.size;
+                }
+            }
+            if (best_idx != SIZE_MAX) {
+                auto & best = slots_[best_idx];
+                best.in_use = true;
+                return best.ptr;
             }
         }
-        if (best_idx != SIZE_MAX) {
-            auto & best = slots_[best_idx];
-            // Wait for any pending async copy before reusing the buffer.
-            // Use wait_and_throw() (event-level) rather than bare wait() so
-            // async errors propagate as sycl::exception. The empty-waitlist
-            // ext_oneapi_submit_barrier() form must NOT be used here — it
-            // triggers xe_guc_submit kernel-job timeout + GT-reset on Arc
-            // B580 (per E1 RCA, docs/plans/data/e1-rca/findings.md).
-            if (best.has_pending_event) {
+
+        if (void * ptr = allocate_new_slot()) {
+            return ptr;
+        }
+
+        // Last resort: the pinned pool could not grow, so reuse the best
+        // pending slot after its DMA completes.  Mark it in-use before dropping
+        // the mutex so another caller cannot select the same slot.
+        sycl::event wait_event;
+        void *      wait_ptr    = nullptr;
+        bool        wait_needed = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            size_t                      best_idx  = SIZE_MAX;
+            size_t                      best_size = SIZE_MAX;
+            for (size_t i = 0; i < slots_.size(); ++i) {
+                auto & s = slots_[i];
+                if (!s.in_use && s.size >= needed && s.size < best_size) {
+                    best_idx  = i;
+                    best_size = s.size;
+                }
+            }
+            if (best_idx != SIZE_MAX) {
+                auto & best = slots_[best_idx];
+                wait_ptr    = best.ptr;
+                if (best.has_pending_event) {
+                    wait_event             = best.pending_event;
+                    best.has_pending_event = false;
+                    wait_needed            = true;
+                }
+                best.in_use = true;
+            }
+        }
+        if (wait_ptr) {
+            if (wait_needed) {
                 try {
-                    best.pending_event.wait_and_throw();
+                    wait_event.wait_and_throw();
                 } catch (...) {
                     // Event may be invalid after device reset — safe to ignore.
                 }
-                best.has_pending_event = false;
             }
-            best.in_use = true;
-            return best.ptr;
+            return wait_ptr;
         }
 
-        // No suitable slot — allocate from the pre-allocated pinned chunk pool
-        // so that NO sycl::malloc_host occurs during inference.
-        void * ptr       = nullptr;
-        bool   from_pool = false;
-        {
-            auto * ucache = ggml_sycl::get_unified_cache_for_device(ggml_sycl_get_device_id_from_queue(queue));
-            if (ucache) {
-                if (ucache->host_zones_configured()) {
-                    ggml_sycl::alloc_request _stg_req{};
-                    _stg_req.queue                               = &queue;
-                    _stg_req.size                                = needed;
-                    _stg_req.intent.role                         = ggml_sycl::alloc_role::STAGING;
-                    _stg_req.intent.constraints.must_host_pinned = true;
-                    _stg_req.intent.constraints.use_pinned_pool  = true;
-                    ptr                                          = ggml_sycl::unified_allocate(_stg_req).resolve().ptr;
-                    // Zone allocation returns nullptr when the allocation spans a chunk
-                    // boundary or the STAGING zone is exhausted.  Fall back to runtime
-                    // pinned allocation (sycl::malloc_host bypassing the pool).
-                    if (!ptr) {
-                        GGML_LOG_WARN(
-                            "[STAGING] zone_alloc failed for %zu bytes, falling back to runtime pinned allocation\n",
-                            needed);
-                        ptr       = ucache->host_pool_alloc(needed, 64);
-                        from_pool = (ptr != nullptr);
-                    } else {
-                        from_pool = true;
-                    }
-                } else {
-                    ptr       = ucache->host_pool_alloc(needed, 64);
-                    from_pool = (ptr != nullptr);
-                }
-            }
-        }
-        if (!ptr) {
-            // Pinned pool exhausted — the pool should be pre-sized correctly
-            // at init time.  Do NOT fall back to sycl::malloc_host during
-            // inference (violates zero-malloc-during-inference invariant).
-            GGML_LOG_WARN(
-                "[staging_buffer_pool] pinned pool exhausted, cannot allocate %zu bytes "
-                "(no runtime sycl::malloc_host fallback)\n",
-                needed);
-            return nullptr;
-        }
-        ggml_sycl::alloc_registry::instance().register_alloc(ptr, needed, -1, ggml_sycl::alloc_type::HOST_PINNED);
-        slot new_slot{};
-        new_slot.ptr              = ptr;
-        new_slot.size             = needed;
-        new_slot.in_use           = true;
-        new_slot.from_pinned_pool = from_pool;
-        slots_.push_back(new_slot);
-        total_bytes_.fetch_add(needed, std::memory_order_relaxed);
-        // Track pinned host allocation against the unified cache host budget.
-        return ptr;
+        // Pinned pool exhausted and no reusable slot exists.
+        GGML_LOG_WARN(
+            "[staging_buffer_pool] pinned pool exhausted, cannot allocate %zu bytes "
+            "(no runtime sycl::malloc_host fallback)\n",
+            needed);
+        return nullptr;
     }
 
     // Mark a previously acquired buffer as available for reuse.
@@ -2024,9 +2268,9 @@ struct staging_buffer_pool {
     }
 
     // Mark buffer as available for reuse with a pending async event.
-    // The next acquire() that selects this slot will wait on the event
-    // before returning the buffer, ensuring the async copy completes
-    // before the buffer contents are overwritten.
+    // acquire() prefers ready slots and new unified-cache-owned staging slots;
+    // if it must reuse this exact slot, it waits before returning the buffer so
+    // the async copy completes before the contents are overwritten.
     void release(void * ptr, sycl::event evt) {
         if (!ptr) {
             return;
@@ -2175,6 +2419,15 @@ struct ggml_tensor_extra_gpu {
     void * data_device_ptr(int dev) const {
         auto resolved = data_handle[dev].resolve(dev);
         if (resolved) {
+            if (data_device[dev] != nullptr && data_device[dev] != resolved.ptr) {
+                static std::atomic<int> stale_raw_warns{ 0 };
+                if (g_ggml_sycl_debug && stale_raw_warns.fetch_add(1, std::memory_order_relaxed) < 16) {
+                    GGML_LOG_WARN(
+                        "[SYCL] extra data_handle/raw pointer mismatch dev=%d handle=%p raw=%p; "
+                        "using mem_handle\n",
+                        dev, resolved.ptr, data_device[dev]);
+                }
+            }
             return resolved.ptr;
         }
         void * ptr = data_device[dev];
@@ -2201,6 +2454,63 @@ struct ggml_tensor_extra_gpu {
         } else {
             data_handle[dev] = ggml_sycl::mem_handle{};
         }
+    }
+
+    // Clear only tensor-storage authority. Backend metadata such as TP state,
+    // layout policy, graph/MoE tables, and events is intentionally preserved.
+    void clear_data_authority() {
+        for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+            data_device[d]      = nullptr;
+            data_handle[d]      = ggml_sycl::mem_handle{};
+            data_alloc[d]       = {};
+            data_device_size[d] = 0;
+            resolved_ptr[d]     = nullptr;
+            resolved_gen[d]     = 0;
+        }
+    }
+
+    // Install storage for a synthetic direct slice/view tensor. The caller may
+    // provide the source handle that resolved to ptr; when it matches, the
+    // temporary tensor keeps the same lifetime/refcount authority. Otherwise we
+    // fall back to a DIRECT handle and emit a bounded debug warning.
+    void install_direct_slice_storage(int                           dev,
+                                      void *                        ptr,
+                                      size_t                        bytes,
+                                      ggml_layout_mode              storage_layout = GGML_LAYOUT_AOS,
+                                      bool                          on_device      = true,
+                                      const ggml_sycl::mem_handle * source_handle  = nullptr) {
+        clear_data_authority();
+
+        data_device[dev]      = ptr;
+        data_device_size[dev] = bytes;
+
+        bool installed_source_handle = false;
+        if (source_handle != nullptr && source_handle->valid()) {
+            auto resolved = source_handle->resolve(dev);
+            if (resolved.ptr == ptr) {
+                data_handle[dev]        = *source_handle;
+                installed_source_handle = true;
+            } else {
+                static std::atomic<int> mismatch_warns{ 0 };
+                if (g_ggml_sycl_debug && mismatch_warns.fetch_add(1, std::memory_order_relaxed) < 16) {
+                    GGML_LOG_WARN(
+                        "[SYCL] direct slice source handle mismatch dev=%d handle=%p slice=%p; "
+                        "using direct handle\n",
+                        dev, resolved.ptr, ptr);
+                }
+            }
+        }
+
+        if (!installed_source_handle) {
+            const int owner  = on_device ? dev : ggml_sycl::mem_handle::HOST_DEVICE;
+            data_handle[dev] = ggml_sycl::mem_handle::from_direct(ptr, storage_layout, on_device, owner);
+        }
+
+        layout.mode        = storage_layout;
+        layout.size        = bytes;
+        layout.owns_memory = false;
+        layout.device_id   = on_device ? dev : ggml_sycl::mem_handle::HOST_DEVICE;
+        layout.data_ptr    = ptr;
     }
 
     // Accessor: resolve xmx_mxfp4_tiled via alloc_handle, fall back to raw pointer.
@@ -2283,7 +2593,8 @@ struct ggml_tensor_extra_gpu {
     // MoE expert pointer table (device + host staging) for per-expert layout access.
     // moe_expert_handles is the owner/source of truth; moe_expert_ptrs_host is
     // only the resolved raw-pointer payload uploaded to kernels that still take
-    // a void** table.
+    // a void** table. moe_expert_ptrs_leases covers the active transient table
+    // payload so graph replay/direct dispatch retains the underlying mem_handles.
     // DEPRECATED: use moe_ptrs_ptr() instead of moe_expert_ptrs_device[dev] directly
     void *                             moe_expert_ptrs_device[GGML_SYCL_MAX_DEVICES] = { nullptr };
     size_t                             moe_expert_ptrs_size[GGML_SYCL_MAX_DEVICES]   = { 0 };
@@ -2297,12 +2608,26 @@ struct ggml_tensor_extra_gpu {
     std::vector<ggml_sycl::mem_handle> moe_expert_ptrs_leases[GGML_SYCL_MAX_DEVICES];
 
     // MoE compact pointer list (row-major by id) and missing flag
-    void * moe_expert_ptrs_compact_device[GGML_SYCL_MAX_DEVICES]        = { nullptr };
-    size_t moe_expert_ptrs_compact_size[GGML_SYCL_MAX_DEVICES]          = { 0 };
-    size_t moe_expert_ptrs_compact_capacity[GGML_SYCL_MAX_DEVICES]      = { 0 };
-    bool   moe_expert_ptrs_compact_from_prealloc[GGML_SYCL_MAX_DEVICES] = { false };
-    int *  moe_expert_ptrs_missing_device[GGML_SYCL_MAX_DEVICES]        = { nullptr };
-    bool   moe_expert_ptrs_missing_from_prealloc[GGML_SYCL_MAX_DEVICES] = { false };
+    void *                  moe_expert_ptrs_compact_device[GGML_SYCL_MAX_DEVICES]        = { nullptr };
+    size_t                  moe_expert_ptrs_compact_size[GGML_SYCL_MAX_DEVICES]          = { 0 };
+    size_t                  moe_expert_ptrs_compact_capacity[GGML_SYCL_MAX_DEVICES]      = { 0 };
+    bool                    moe_expert_ptrs_compact_from_prealloc[GGML_SYCL_MAX_DEVICES] = { false };
+    ggml_sycl::alloc_handle moe_expert_ptrs_compact_alloc[GGML_SYCL_MAX_DEVICES];
+    ggml_sycl::mem_handle   moe_expert_ptrs_compact_handle[GGML_SYCL_MAX_DEVICES];
+    int *                   moe_expert_ptrs_missing_device[GGML_SYCL_MAX_DEVICES]        = { nullptr };
+    bool                    moe_expert_ptrs_missing_from_prealloc[GGML_SYCL_MAX_DEVICES] = { false };
+    ggml_sycl::alloc_handle moe_expert_ptrs_missing_alloc[GGML_SYCL_MAX_DEVICES];
+    ggml_sycl::mem_handle   moe_expert_ptrs_missing_handle[GGML_SYCL_MAX_DEVICES];
+
+    void * moe_compact_ptr(int dev) const {
+        auto resolved = moe_expert_ptrs_compact_handle[dev].resolve(dev);
+        return resolved.ptr ? resolved.ptr : moe_expert_ptrs_compact_device[dev];
+    }
+
+    int * moe_compact_missing_ptr(int dev) const {
+        auto resolved = moe_expert_ptrs_missing_handle[dev].resolve(dev);
+        return resolved.ptr ? static_cast<int *>(resolved.ptr) : moe_expert_ptrs_missing_device[dev];
+    }
 
     // MoE expert hotness tracking (per layer)
     std::vector<float> moe_expert_scores;
@@ -2341,11 +2666,12 @@ static inline reorder_mode get_effective_reorder_mode(const ggml_tensor_extra_gp
             return reorder_mode::SOA;
         case GGML_LAYOUT_COALESCED:
             return reorder_mode::COALESCED;
+        case GGML_LAYOUT_MXFP4_I8:
         case GGML_LAYOUT_XMX_TILED:
         case GGML_LAYOUT_XMX_GEMM_TILED:
         case GGML_LAYOUT_ONEDNN_PACKED:
         case GGML_LAYOUT_ONEDNN_WOQ:
-            return reorder_mode::NONE;  // XMX uses separate dispatch
+            return reorder_mode::NONE;  // Specialized layouts use separate dispatch
         default:
             return reorder_mode::NONE;
     }

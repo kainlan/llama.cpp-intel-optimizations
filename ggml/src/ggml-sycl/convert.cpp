@@ -1,6 +1,6 @@
 #include "convert.hpp"
-#include "common.hpp"
 
+#include "common.hpp"
 #include "convert-esimd.hpp"
 #include "dequantize.hpp"
 #include "presets.hpp"
@@ -156,9 +156,11 @@ static void dequantize_row_q4_0_sycl_coalesced(const void * vx, dst_t * y, const
 // indexing), this uses a 2D [nrows, tiles_per_row] grid with explicit per-row
 // tile addressing so the output is guaranteed row-major.
 template <typename dst_t>
-static void dequantize_row_q4_0_sycl_coalesced_rowmajor(const void * vx, dst_t * y,
-                                                         const int blocks_per_row, const int nrows,
-                                                         dpct::queue_ptr stream) {
+static void dequantize_row_q4_0_sycl_coalesced_rowmajor(const void *    vx,
+                                                        dst_t *         y,
+                                                        const int       blocks_per_row,
+                                                        const int       nrows,
+                                                        dpct::queue_ptr stream) {
     dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
 
     const int tiles_per_row = blocks_per_row / MMVQ_COALESCED_TILE_BLOCKS;
@@ -576,9 +578,8 @@ void reorder_q4_0_aos_to_coalesced_sycl(const void *    src,
 
     stream->submit([&](sycl::handler & cgh) {
         cgh.depends_on(convert_event);
-        cgh.host_task([temp, total_bytes, stream]() {
-            ggml_sycl_free_device_tracked_bytes(temp, total_bytes, *stream);
-        });
+        cgh.host_task(
+            [temp, total_bytes, stream]() { ggml_sycl_free_device_tracked_bytes(temp, total_bytes, *stream); });
     });
 }
 
@@ -658,9 +659,8 @@ void reorder_q8_0_aos_to_coalesced_sycl(const void *    src,
 
     stream->submit([&](sycl::handler & cgh) {
         cgh.depends_on(convert_event);
-        cgh.host_task([temp, total_bytes, stream]() {
-            ggml_sycl_free_device_tracked_bytes(temp, total_bytes, *stream);
-        });
+        cgh.host_task(
+            [temp, total_bytes, stream]() { ggml_sycl_free_device_tracked_bytes(temp, total_bytes, *stream); });
     });
 }
 
@@ -738,9 +738,8 @@ void reorder_mxfp4_aos_to_coalesced_sycl(const void *    src,
 
     stream->submit([&](sycl::handler & cgh) {
         cgh.depends_on(convert_event);
-        cgh.host_task([temp, total_bytes, stream]() {
-            ggml_sycl_free_device_tracked_bytes(temp, total_bytes, *stream);
-        });
+        cgh.host_task(
+            [temp, total_bytes, stream]() { ggml_sycl_free_device_tracked_bytes(temp, total_bytes, *stream); });
     });
 }
 
@@ -842,9 +841,8 @@ void reorder_q6_k_aos_to_coalesced_sycl(const void *    src,
 
     stream->submit([&](sycl::handler & cgh) {
         cgh.depends_on(convert_event);
-        cgh.host_task([temp, total_bytes, stream]() {
-            ggml_sycl_free_device_tracked_bytes(temp, total_bytes, *stream);
-        });
+        cgh.host_task(
+            [temp, total_bytes, stream]() { ggml_sycl_free_device_tracked_bytes(temp, total_bytes, *stream); });
     });
 }
 
@@ -1056,10 +1054,10 @@ static void reorder_q4_0_coalesced_to_soa_kernel(const uint8_t * __restrict__ sr
 // Dispatches to ESIMD kernel when available (and GGML_SYCL_ESIMD_DEQUANT != 0),
 // otherwise falls back to standard-SYCL implementation.
 void dequantize_row_q4_0_coalesced_to_fp16_rowmajor(const void *    src,
-                                                     sycl::half *    dst,
-                                                     int             blocks_per_row,
-                                                     int             nrows,
-                                                     dpct::queue_ptr stream) {
+                                                    sycl::half *    dst,
+                                                    int             blocks_per_row,
+                                                    int             nrows,
+                                                    dpct::queue_ptr stream) {
     if (g_esimd_dequant_enabled) {
         dequantize_row_q4_0_coalesced_to_fp16_rowmajor_esimd(src, dst, blocks_per_row, nrows, stream);
         return;
@@ -1072,10 +1070,10 @@ void dequantize_row_q4_0_coalesced_to_fp16_rowmajor(const void *    src,
 // Dispatches to ESIMD kernel when available (and GGML_SYCL_ESIMD_DEQUANT != 0),
 // otherwise falls back to standard-SYCL implementation.
 void dequantize_row_q4_0_soa_to_fp16_rowmajor(const void *    src,
-                                               sycl::half *    dst,
-                                               int             blocks_per_row,
-                                               int             nrows,
-                                               dpct::queue_ptr stream) {
+                                              sycl::half *    dst,
+                                              int             blocks_per_row,
+                                              int             nrows,
+                                              dpct::queue_ptr stream) {
     if (g_esimd_dequant_enabled) {
         dequantize_row_q4_0_soa_to_fp16_rowmajor_esimd(src, dst, blocks_per_row, nrows, stream);
         return;
@@ -1083,38 +1081,50 @@ void dequantize_row_q4_0_soa_to_fp16_rowmajor(const void *    src,
 
     dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
 
-    const int total_blocks = nrows * blocks_per_row;
-    constexpr int WG_SIZE  = 256;
-    const int     n_wgs    = (total_blocks + WG_SIZE - 1) / WG_SIZE;
+    const int     total_blocks = nrows * blocks_per_row;
+    constexpr int WG_SIZE      = 256;
+    const int     n_wgs        = (total_blocks + WG_SIZE - 1) / WG_SIZE;
 
     stream->parallel_for(
         sycl::nd_range<3>(sycl::range<3>(1, 1, n_wgs * WG_SIZE), sycl::range<3>(1, 1, WG_SIZE)),
-        [=](sycl::nd_item<3> item) {
-            dequantize_block_q4_0_soa_rowmajor(src, dst, blocks_per_row, nrows, item);
-        });
+        [=](sycl::nd_item<3> item) { dequantize_block_q4_0_soa_rowmajor(src, dst, blocks_per_row, nrows, item); });
 }
 
-static void dequantize_block_mxfp4_soa_rowmajor(const void * __restrict__ vx,
-                                                sycl::half * __restrict__ yy,
-                                                const int blocks_per_row,
-                                                const int nrows,
-                                                const sycl::nd_item<3> & item) {
+static void dequantize_tile_mxfp4_soa_rowmajor(const void * __restrict__ vx,
+                                               sycl::half * __restrict__ yy,
+                                               const int                blocks_per_row,
+                                               const int                tiles_per_row,
+                                               const int                nrows,
+                                               const sycl::nd_item<3> & item) {
     (void) nrows;
-    const int ib = item.get_global_id(2);
-    const int row = ib / blocks_per_row;
-    const int block = ib - row * blocks_per_row;
+    constexpr int BLOCKS_PER_TILE = QK_K / QK_MXFP4;
+
+    const int64_t group = item.get_group(2);
+    const int     row   = group / tiles_per_row;
+    const int     tile  = group - row * tiles_per_row;
+    const int     tid   = item.get_local_id(2);
+    const int     il    = tid / BLOCKS_PER_TILE;
+    const int     ib    = tid - il * BLOCKS_PER_TILE;
+    const int     block = tile * BLOCKS_PER_TILE + ib;
+
+    if (block >= blocks_per_row) {
+        return;
+    }
+
     const int64_t nblocks = static_cast<int64_t>(nrows) * blocks_per_row;
+    const int64_t block_i = static_cast<int64_t>(row) * blocks_per_row + block;
 
     const uint8_t * qs = static_cast<const uint8_t *>(vx);
     const uint8_t * e  = qs + nblocks * (QK_MXFP4 / 2);
-    sycl::half * y = yy + (static_cast<int64_t>(row) * blocks_per_row + block) * QK_MXFP4;
+    const uint8_t * q4 = qs + block_i * (QK_MXFP4 / 2) + 4 * il;
+    sycl::half *    y  = yy + block_i * QK_MXFP4 + 4 * il;
 
-    const uint8_t * q4 = qs + static_cast<int64_t>(ib) * (QK_MXFP4 / 2);
-    const float d = ggml_sycl_e8m0_to_fp32(e[ib]);
-    for (int j = 0; j < QK_MXFP4 / 2; ++j) {
-        const uint8_t q = q4[j];
-        y[j] = sycl::half(d * kvalues_mxfp4[q & 0xf] * 0.5f);
-        y[j + QK_MXFP4 / 2] = sycl::half(d * kvalues_mxfp4[q >> 4] * 0.5f);
+    const float d = sycl_e8m0_to_fp32_half(e[block_i]);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const uint8_t q     = q4[j];
+        y[j]                = sycl::half(d * kvalues_mxfp4[q & 0xf]);
+        y[j + QK_MXFP4 / 2] = sycl::half(d * kvalues_mxfp4[q >> 4]);
     }
 }
 
@@ -1125,18 +1135,15 @@ void dequantize_row_mxfp4_soa_to_fp16_rowmajor(const void *    src,
                                                dpct::queue_ptr stream) {
     dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
 
-    const int total_blocks = nrows * blocks_per_row;
-    constexpr int WG_SIZE = 256;
-    const int n_wgs = (total_blocks + WG_SIZE - 1) / WG_SIZE;
+    constexpr int BLOCKS_PER_TILE = QK_K / QK_MXFP4;
+    constexpr int WG_SIZE         = 32;
+    const int     tiles_per_row   = (blocks_per_row + BLOCKS_PER_TILE - 1) / BLOCKS_PER_TILE;
+    const int     total_tiles     = nrows * tiles_per_row;
 
-    stream->parallel_for(
-        sycl::nd_range<3>(sycl::range<3>(1, 1, n_wgs * WG_SIZE), sycl::range<3>(1, 1, WG_SIZE)),
-        [=](sycl::nd_item<3> item) {
-            const int ib = item.get_global_id(2);
-            if (ib < total_blocks) {
-                dequantize_block_mxfp4_soa_rowmajor(src, dst, blocks_per_row, nrows, item);
-            }
-        });
+    stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, total_tiles * WG_SIZE), sycl::range<3>(1, 1, WG_SIZE)),
+                         [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             dequantize_tile_mxfp4_soa_rowmajor(src, dst, blocks_per_row, tiles_per_row, nrows, item);
+                         });
 }
 
 // Host function to launch Q4_0 Coalesced to SoA conversion
@@ -1167,8 +1174,8 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst, bool ful
     // This only works when k == full tensor size. For row slices, use standard kernels.
     const ggml_tensor_extra_gpu * extra =
         dst->src[0]->extra ? static_cast<const ggml_tensor_extra_gpu *>(dst->src[0]->extra) : nullptr;
-    const bool use_reorder    = full_tensor && ggml_sycl_layout_is_soa(extra);
-    const bool use_coalesced  = full_tensor && ggml_sycl_layout_is_coalesced(extra);
+    const bool use_reorder   = full_tensor && ggml_sycl_layout_is_soa(extra);
+    const bool use_coalesced = full_tensor && ggml_sycl_layout_is_coalesced(extra);
 
     switch (type) {
         case GGML_TYPE_Q4_0:
@@ -1241,8 +1248,8 @@ to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor * dst, bool ful
     // This only works when k == full tensor size. For row slices, use standard kernels.
     const ggml_tensor_extra_gpu * extra =
         dst->src[0]->extra ? static_cast<const ggml_tensor_extra_gpu *>(dst->src[0]->extra) : nullptr;
-    const bool use_reorder    = full_tensor && ggml_sycl_layout_is_soa(extra);
-    const bool use_coalesced  = full_tensor && ggml_sycl_layout_is_coalesced(extra);
+    const bool use_reorder   = full_tensor && ggml_sycl_layout_is_soa(extra);
+    const bool use_coalesced = full_tensor && ggml_sycl_layout_is_coalesced(extra);
 
     switch (type) {
         case GGML_TYPE_Q4_0:

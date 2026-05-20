@@ -43,6 +43,7 @@
 // =============================================================================
 
 #include "fattn-common.hpp"
+#include "fattn.hpp"
 
 #include <array>
 #include <cfloat>
@@ -50,6 +51,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <sycl/sycl.hpp>
 #include <type_traits>
@@ -366,14 +368,34 @@ struct fattn_xmx_v2_device_cache {
     std::size_t    variant_idx    = 0;
     size_t         slm_size_bytes = 0;
     bool           slm_ok         = false;
+
+    ggml_sycl_fattn_xmx_packed_k forced_split_packed_k;
+    ggml_sycl::alloc_handle      split_partial_max_alloc;
+    ggml_sycl::alloc_handle      split_partial_sum_alloc;
+    ggml_sycl::alloc_handle      split_partial_out_alloc;
+    size_t                       split_partial_elems     = 0;
+    size_t                       split_partial_out_elems = 0;
+    int                          split_partial_device    = -1;
+
+    ~fattn_xmx_v2_device_cache() {
+        if (split_partial_max_alloc.ptr) {
+            (void) ggml_sycl::unified_free(split_partial_max_alloc);
+        }
+        if (split_partial_sum_alloc.ptr) {
+            (void) ggml_sycl::unified_free(split_partial_sum_alloc);
+        }
+        if (split_partial_out_alloc.ptr) {
+            (void) ggml_sycl::unified_free(split_partial_out_alloc);
+        }
+    }
 };
 
-// Bytes of SLM required for the fallback leaf's worst case (D=256, NCOLS=16).
+// Bytes of SLM required for the fallback leaf's worst case (D=256, NCOLS=32).
 // fattn_v2_slm<D, ncols>::TOTAL is in sycl::half units, so multiply by sizeof(half).
-// NCOLS=16 covers all PP shapes (nc<=16 dispatches as NCOLS=16, nc>16 clips to NCOLS=16).
+// NCOLS=32 covers the D=64 batched-PP fast path that reuses K/V across wider query blocks.
 static constexpr size_t fattn_xmx_v2_required_slm_bytes() {
     constexpr size_t D_max     = 256;
-    constexpr size_t ncols_max = 16;
+    constexpr size_t ncols_max = 32;
     constexpr size_t halves =
         ncols_max * D_max + 2 * XMX_V2_BATCH_KV * D_max + ncols_max * XMX_V2_BATCH_KV * XMX_V2_FLOAT_AS_HALF_ELEMS;
     return halves * sizeof(sycl::half);
@@ -407,7 +429,7 @@ inline std::size_t fattn_xmx_v2_pick_variant_cached(ggml_backend_sycl_context & 
 
         std::fprintf(
             stderr,
-            "[fattn-xmx-v2] device %d: local_mem=%zu KB, required=%zu B for (D=256,ncols=16), variant=%zu, slm_ok=%d\n",
+            "[fattn-xmx-v2] device %d: local_mem=%zu KB, required=%zu B for (D=256,ncols=32), variant=%zu, slm_ok=%d\n",
             ctx.device, cache->slm_size_bytes / 1024, required_bytes, cache->variant_idx, cache->slm_ok ? 1 : 0);
 
         if (!cache->slm_ok) {
@@ -1578,9 +1600,10 @@ static void flash_attn_xmx_v2_decode_gqa_kernel(const char * __restrict__ Q_base
     }
 }
 
-template <int D, bool use_logit_softcap, typename Q_type, int TK, bool DIRECT_PV = false>
+template <int D, bool use_logit_softcap, typename Q_type, int TK, bool DIRECT_PV = false, bool PACKED_K = false>
 static void flash_attn_xmx_v2_decode_gqa_split_first_kernel(const char * __restrict__ Q_base,
                                                             const char * __restrict__ K_base,
+                                                            const sycl::half * __restrict__ K_packed_base,
                                                             const char * __restrict__ V_base,
                                                             const char * __restrict__ maskh_base,
                                                             float * __restrict__ partial_max,
@@ -1611,6 +1634,9 @@ static void flash_attn_xmx_v2_decode_gqa_split_first_kernel(const char * __restr
                                                             int                      nb31,
                                                             int                      nb32,
                                                             int64_t                  nb33,
+                                                            int64_t                  packed_batch_stride,
+                                                            int64_t                  packed_head_stride,
+                                                            int64_t                  packed_block_stride,
                                                             int                      n_partitions,
                                                             const sycl::nd_item<3> & item,
                                                             sycl::half *             slm) {
@@ -1640,7 +1666,18 @@ static void flash_attn_xmx_v2_decode_gqa_split_first_kernel(const char * __restr
     const bool active    = q_rel < gqa_ratio && head < ne02 && q_abs < ne01 && partition < n_partitions;
 
     const char * Q_ptr = Q_base + (int64_t) nb03 * sequence;
-    const char * K_ptr = K_base + nb13 * sequence + (int64_t) nb12 * kv_head;
+    const char * K_ptr = nullptr;
+    if constexpr (!PACKED_K) {
+        K_ptr = K_base + nb13 * sequence + (int64_t) nb12 * kv_head;
+    }
+    const sycl::half * K_packed_block = nullptr;
+    if constexpr (PACKED_K) {
+        const int64_t packed_block_offset_half =
+            ((int64_t) sequence * packed_batch_stride + (int64_t) kv_head * packed_head_stride +
+             (int64_t) partition * packed_block_stride) /
+            (int64_t) sizeof(sycl::half);
+        K_packed_block = K_packed_base + packed_block_offset_half;
+    }
     const char * V_ptr = V_base + nb23 * sequence + (int64_t) nb22 * kv_head;
 
     const float slope = active ? get_alibi_slope(max_bias, head, n_head_log2, m0, m1) : 0.0f;
@@ -1684,22 +1721,26 @@ static void flash_attn_xmx_v2_decode_gqa_split_first_kernel(const char * __restr
         const int d        = idx - kv_local * D;
         const int kv_abs   = kv_start + kv_local;
 
-        sycl::half k_val = sycl::half(0.0f);
         sycl::half v_val = sycl::half(0.0f);
         if (kv_abs < ne11) {
-            k_val = reinterpret_cast<const sycl::half *>(K_ptr + (int64_t) nb11 * kv_abs)[d];
             v_val = reinterpret_cast<const sycl::half *>(V_ptr + (int64_t) nb21 * kv_abs)[d];
         }
         tile_V[kv_local * D + d] = v_val;
 
-        const int half_id     = kv_local / XMX_V2_DECODE_HALF_KV;
-        const int compact_col = kv_local - half_id * XMX_V2_DECODE_HALF_KV;
-        const int active_lane = compact_col % XMX_V2_DECODE_ACTIVE_LANES;
-        const int slot        = compact_col / XMX_V2_DECODE_ACTIVE_LANES;
-        const int active_col  = slot * XMX_V2_SG + active_lane;
-        const int packed_idx =
-            half_id * slm_layout::K_PACKED_PER_HALF + (d / 2) * (XMX_V2_DECODE_TN * 2) + active_col * 2 + (d & 1);
-        tile_K_packed[packed_idx] = k_val;
+        if constexpr (!PACKED_K) {
+            sycl::half k_val = sycl::half(0.0f);
+            if (kv_abs < ne11) {
+                k_val = reinterpret_cast<const sycl::half *>(K_ptr + (int64_t) nb11 * kv_abs)[d];
+            }
+            const int half_id     = kv_local / XMX_V2_DECODE_HALF_KV;
+            const int compact_col = kv_local - half_id * XMX_V2_DECODE_HALF_KV;
+            const int active_lane = compact_col % XMX_V2_DECODE_ACTIVE_LANES;
+            const int slot        = compact_col / XMX_V2_DECODE_ACTIVE_LANES;
+            const int active_col  = slot * XMX_V2_SG + active_lane;
+            const int packed_idx =
+                half_id * slm_layout::K_PACKED_PER_HALF + (d / 2) * (XMX_V2_DECODE_TN * 2) + active_col * 2 + (d & 1);
+            tile_K_packed[packed_idx] = k_val;
+        }
     }
     sycl::group_barrier(item.get_group());
 
@@ -1727,11 +1768,21 @@ static void flash_attn_xmx_v2_decode_gqa_split_first_kernel(const char * __restr
                 sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
                     &tile_Q[q_rel * D + d]),
                 D);
-            sycl_xmx::joint_matrix_load(
-                sg, mat_K,
-                sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
-                    &tile_K_packed[half_id * slm_layout::K_PACKED_PER_HALF + (d / 2) * (XMX_V2_DECODE_TN * 2)]),
-                XMX_V2_DECODE_TN * 2);
+            if constexpr (PACKED_K) {
+                const sycl::half * K_packed_tile = K_packed_block + half_id * slm_layout::K_PACKED_PER_HALF +
+                                                   (d / 2) * (XMX_V2_DECODE_TN * 2);
+                sycl_xmx::joint_matrix_load(
+                    sg, mat_K,
+                    sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
+                        K_packed_tile),
+                    XMX_V2_DECODE_TN * 2);
+            } else {
+                sycl_xmx::joint_matrix_load(
+                    sg, mat_K,
+                    sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
+                        &tile_K_packed[half_id * slm_layout::K_PACKED_PER_HALF + (d / 2) * (XMX_V2_DECODE_TN * 2)]),
+                    XMX_V2_DECODE_TN * 2);
+            }
             sycl_xmx::joint_matrix_mad(sg, mat_QK, mat_Q, mat_K, mat_QK);
         }
 
@@ -1892,15 +1943,23 @@ static void flash_attn_xmx_v2_decode_gqa_split_merge_kernel(const char * __restr
 
     const float inv_sum = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
     float *     dst_row = dst + (int64_t) D * (head + ne02 * (q_abs + ne01 * sequence));
+    float acc[D_TILES];
 #    pragma unroll
     for (int t = 0; t < D_TILES; ++t) {
-        const int d   = t * XMX_V2_SG + lane;
-        float     acc = 0.0f;
-        for (int p = 0; p < n_partitions; ++p) {
-            const float weight = sycl::exp(partial_max[partial_base + (size_t) p] - max_val);
-            acc += partial_out[(partial_base + (size_t) p) * D + (size_t) d] * weight;
+        acc[t] = 0.0f;
+    }
+    for (int p = 0; p < n_partitions; ++p) {
+        const float weight = sycl::exp(partial_max[partial_base + (size_t) p] - max_val);
+#    pragma unroll
+        for (int t = 0; t < D_TILES; ++t) {
+            const int d = t * XMX_V2_SG + lane;
+            acc[t] += partial_out[(partial_base + (size_t) p) * D + (size_t) d] * weight;
         }
-        const float val = acc * inv_sum;
+    }
+#    pragma unroll
+    for (int t = 0; t < D_TILES; ++t) {
+        const int   d   = t * XMX_V2_SG + lane;
+        const float val = acc[t] * inv_sum;
         dst_row[d]      = sycl::isfinite(val) ? val : 0.0f;
     }
 }
@@ -1951,62 +2010,76 @@ static void launch_fattn_xmx_v2_decode_gqa_leaf(const fattn_params & params, dpc
     });
 }
 
-template <int D, bool use_logit_softcap, typename Q_type, int TK, bool DIRECT_PV = false>
-static void launch_fattn_xmx_v2_decode_gqa_split_leaf(const fattn_params & params,
-                                                      dpct::queue_ptr      stream,
-                                                      float *              partial_max,
-                                                      float *              partial_sum,
-                                                      float *              partial_out,
-                                                      int                  n_partitions) {
+template <int D, bool use_logit_softcap, typename Q_type, int TK, bool DIRECT_PV = false, bool PACKED_K = false>
+static sycl::event launch_fattn_xmx_v2_decode_gqa_split_leaf(const fattn_params & params,
+                                                             dpct::queue_ptr      stream,
+                                                             float *              partial_max,
+                                                             float *              partial_sum,
+                                                             float *              partial_out,
+                                                             int                  n_partitions,
+                                                             const sycl::half *   packed_k_ptr         = nullptr,
+                                                             int64_t              packed_batch_stride  = 0,
+                                                             int64_t              packed_head_stride   = 0,
+                                                             int64_t              packed_block_stride  = 0,
+                                                             const sycl::event *  packed_k_ready_event = nullptr) {
     using slm_layout       = fattn_v2_decode_gqa_slm<D>;
     constexpr int nthreads = XMX_V2_DECODE_GQA_MAX * XMX_V2_SG;
 
     const int n_query_blocks = params.ne01;
 
-    const char *   Q_ptr       = params.Q;
-    const char *   K_ptr       = params.K;
-    const char *   V_ptr       = params.V;
-    const char *   mask_ptr    = params.mask;
-    const char *   sinks_ptr   = params.sinks;
-    float *        dst_ptr     = params.dst;
-    const float    scale_v     = params.scale;
-    const float    max_bias    = params.max_bias;
-    const float    m0          = params.m0;
-    const float    m1          = params.m1;
-    const uint32_t n_head_log2 = params.n_head_log2;
-    const float    logit_sc    = params.logit_softcap;
-    const int      ne01 = params.ne01, ne02 = params.ne02, ne03 = params.ne03;
-    const int      nb01 = params.nb01, nb02 = params.nb02, nb03 = params.nb03;
-    const int      ne11 = params.ne11, ne12 = params.ne12;
-    const int      nb11 = params.nb11, nb12 = params.nb12;
-    const int64_t  nb13 = params.nb13;
-    const int      nb21 = params.nb21, nb22 = params.nb22;
-    const int64_t  nb23 = params.nb23;
-    const int      ne30 = params.ne30, ne32 = params.ne32, ne33 = params.ne33;
-    const int      nb31 = params.nb31, nb32 = params.nb32;
-    const int64_t  nb33 = params.nb33;
+    const char *      Q_ptr       = params.Q;
+    const char *      K_ptr       = params.K;
+    const char *      V_ptr       = params.V;
+    const char *      mask_ptr    = params.mask;
+    const char *      sinks_ptr   = params.sinks;
+    float *           dst_ptr     = params.dst;
+    const float       scale_v     = params.scale;
+    const float       max_bias    = params.max_bias;
+    const float       m0          = params.m0;
+    const float       m1          = params.m1;
+    const uint32_t    n_head_log2 = params.n_head_log2;
+    const float       logit_sc    = params.logit_softcap;
+    const int         ne01 = params.ne01, ne02 = params.ne02, ne03 = params.ne03;
+    const int         nb01 = params.nb01, nb02 = params.nb02, nb03 = params.nb03;
+    const int         ne11 = params.ne11, ne12 = params.ne12;
+    const int         nb11 = params.nb11, nb12 = params.nb12;
+    const int64_t     nb13 = params.nb13;
+    const int         nb21 = params.nb21, nb22 = params.nb22;
+    const int64_t     nb23 = params.nb23;
+    const int         ne30 = params.ne30, ne32 = params.ne32, ne33 = params.ne33;
+    const int         nb31 = params.nb31, nb32 = params.nb32;
+    const int64_t     nb33               = params.nb33;
+    const sycl::event packed_ready_event = packed_k_ready_event ? *packed_k_ready_event : sycl::event{};
+    const bool        add_packed_dep =
+        PACKED_K && packed_k_ready_event != nullptr && ggml_sycl_should_add_dependency(packed_ready_event);
 
     sycl::range<3> first_grid(params.ne12 * params.ne03, n_partitions, n_query_blocks);
     sycl::range<3> first_block(1, 1, nthreads);
 
-    stream->submit([&](sycl::handler & cgh) {
+    sycl::event first_event = stream->submit([&](sycl::handler & cgh) {
+        if constexpr (PACKED_K) {
+            if (add_packed_dep) {
+                cgh.depends_on(*packed_k_ready_event);
+            }
+        }
         sycl::local_accessor<sycl::half, 1> slm(sycl::range<1>(slm_layout::TOTAL), cgh);
 
         cgh.parallel_for(
             sycl::nd_range<3>(first_grid * first_block, first_block),
             [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(XMX_V2_SG)]] {
-                flash_attn_xmx_v2_decode_gqa_split_first_kernel<D, use_logit_softcap, Q_type, TK, DIRECT_PV>(
-                    Q_ptr, K_ptr, V_ptr, mask_ptr, partial_max, partial_sum, partial_out, scale_v, max_bias, m0, m1,
-                    n_head_log2, logit_sc, ne01, ne02, nb01, nb02, nb03, ne11, ne12, nb11, nb12, nb13, nb21, nb22, nb23,
-                    ne30, ne32, ne33, nb31, nb32, nb33, n_partitions, item,
-                    slm.get_multi_ptr<sycl::access::decorated::no>().get());
+                flash_attn_xmx_v2_decode_gqa_split_first_kernel<D, use_logit_softcap, Q_type, TK, DIRECT_PV, PACKED_K>(
+                    Q_ptr, K_ptr, packed_k_ptr, V_ptr, mask_ptr, partial_max, partial_sum, partial_out, scale_v,
+                    max_bias, m0, m1, n_head_log2, logit_sc, ne01, ne02, nb01, nb02, nb03, ne11, ne12, nb11, nb12, nb13,
+                    nb21, nb22, nb23, ne30, ne32, ne33, nb31, nb32, nb33, packed_batch_stride, packed_head_stride,
+                    packed_block_stride, n_partitions, item, slm.get_multi_ptr<sycl::access::decorated::no>().get());
             });
     });
 
     sycl::range<3> merge_grid(params.ne02 * params.ne03, 1, n_query_blocks);
     sycl::range<3> merge_block(1, 1, XMX_V2_SG);
 
-    stream->submit([&](sycl::handler & cgh) {
+    sycl::event merge_event = stream->submit([&](sycl::handler & cgh) {
+        cgh.depends_on(first_event);
         cgh.parallel_for(sycl::nd_range<3>(merge_grid * merge_block, merge_block),
                          [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(XMX_V2_SG)]] {
                              flash_attn_xmx_v2_decode_gqa_split_merge_kernel<D>(sinks_ptr, partial_max, partial_sum,
@@ -2014,6 +2087,7 @@ static void launch_fattn_xmx_v2_decode_gqa_split_leaf(const fattn_params & param
                                                                                 n_partitions, item);
                          });
     });
+    return merge_event;
 }
 
 template <int D, bool use_logit_softcap, typename Q_type>
@@ -2114,15 +2188,13 @@ bool launch_fattn_xmx_v2_decode_gqa(ggml_backend_sycl_context & ctx,
     }
 }
 
-template <int D, bool use_logit_softcap, typename Q_type, int TK, bool DIRECT_PV = false>
-bool launch_fattn_xmx_v2_decode_gqa_split_tk(ggml_backend_sycl_context & ctx,
-                                             const fattn_params &        params,
-                                             dpct::queue_ptr             stream,
-                                             float *                     partial_max,
-                                             float *                     partial_sum,
-                                             float *                     partial_out,
-                                             int                         n_partitions) {
-    (void) ctx;
+template <int D, int TK>
+static bool fattn_xmx_v2_decode_gqa_split_supported(const fattn_params & params,
+                                                    dpct::queue_ptr      stream,
+                                                    float *              partial_max,
+                                                    float *              partial_sum,
+                                                    float *              partial_out,
+                                                    int                  n_partitions) {
     if constexpr (D != 64) {
         return false;
     } else {
@@ -2172,10 +2244,101 @@ bool launch_fattn_xmx_v2_decode_gqa_split_tk(ggml_backend_sycl_context & ctx,
             return false;
         }
 
-        launch_fattn_xmx_v2_decode_gqa_split_leaf<D, use_logit_softcap, Q_type, TK, DIRECT_PV>(
+        return true;
+    }
+}
+
+template <int D, bool use_logit_softcap, typename Q_type, int TK, bool DIRECT_PV = false>
+bool launch_fattn_xmx_v2_decode_gqa_split_tk(ggml_backend_sycl_context & ctx,
+                                             const fattn_params &        params,
+                                             dpct::queue_ptr             stream,
+                                             float *                     partial_max,
+                                             float *                     partial_sum,
+                                             float *                     partial_out,
+                                             int                         n_partitions) {
+    (void) ctx;
+    if constexpr (D != 64) {
+        return false;
+    } else {
+        if (!fattn_xmx_v2_decode_gqa_split_supported<D, TK>(params, stream, partial_max, partial_sum, partial_out,
+                                                            n_partitions)) {
+            return false;
+        }
+
+        (void) launch_fattn_xmx_v2_decode_gqa_split_leaf<D, use_logit_softcap, Q_type, TK, DIRECT_PV, false>(
             params, stream, partial_max, partial_sum, partial_out, n_partitions);
         return true;
     }
+}
+
+template <int D, bool use_logit_softcap, typename Q_type, int TK, bool DIRECT_PV = false>
+bool launch_fattn_xmx_v2_decode_gqa_split_packed_tk(ggml_backend_sycl_context &    ctx,
+                                                    const fattn_params &           params,
+                                                    dpct::queue_ptr                stream,
+                                                    ggml_sycl_fattn_xmx_packed_k * packed_k,
+                                                    float *                        partial_max,
+                                                    float *                        partial_sum,
+                                                    float *                        partial_out,
+                                                    int                            n_partitions) {
+    if constexpr (D != 64) {
+        return false;
+    } else {
+        if (!fattn_xmx_v2_decode_gqa_split_supported<D, TK>(params, stream, partial_max, partial_sum, partial_out,
+                                                            n_partitions)) {
+            return false;
+        }
+        if (packed_k == nullptr || packed_k->device != ctx.device || packed_k->D != D ||
+            packed_k->n_kv < params.ne11 || packed_k->H_kv != params.ne12 || packed_k->batch != params.ne03 ||
+            packed_k->n_blocks < n_partitions) {
+            return false;
+        }
+
+        const size_t block_stride = GGML_SYCL_FATTN_XMX_PACKED_K_BYTES_PER_BLOCK;
+        if (packed_k->n_blocks <= 0 || packed_k->H_kv <= 0 || packed_k->batch <= 0) {
+            return false;
+        }
+        if ((size_t) packed_k->n_blocks > std::numeric_limits<size_t>::max() / block_stride) {
+            return false;
+        }
+        const size_t head_stride = (size_t) packed_k->n_blocks * block_stride;
+        if ((size_t) packed_k->H_kv > std::numeric_limits<size_t>::max() / head_stride) {
+            return false;
+        }
+        const size_t batch_stride = (size_t) packed_k->H_kv * head_stride;
+        if ((size_t) packed_k->batch > std::numeric_limits<size_t>::max() / batch_stride) {
+            return false;
+        }
+        const size_t required_bytes = (size_t) packed_k->batch * batch_stride;
+        if (packed_k->total_bytes < required_bytes) {
+            return false;
+        }
+
+        const ggml_sycl::resolved_ptr resolved = packed_k->handle.resolve(ctx.device);
+        if (!resolved || !resolved.on_device) {
+            return false;
+        }
+
+        sycl::event merge_event =
+            launch_fattn_xmx_v2_decode_gqa_split_leaf<D, use_logit_softcap, Q_type, TK, DIRECT_PV, true>(
+                params, stream, partial_max, partial_sum, partial_out, n_partitions,
+                static_cast<const sycl::half *>(resolved.ptr), (int64_t) batch_stride, (int64_t) head_stride,
+                (int64_t) block_stride, &packed_k->ready_event);
+        packed_k->ready_event = merge_event;
+        return true;
+    }
+}
+
+template <int D, bool use_logit_softcap, typename Q_type>
+bool launch_fattn_xmx_v2_decode_gqa_split_packed(ggml_backend_sycl_context &    ctx,
+                                                 const fattn_params &           params,
+                                                 dpct::queue_ptr                stream,
+                                                 ggml_sycl_fattn_xmx_packed_k * packed_k,
+                                                 float *                        partial_max,
+                                                 float *                        partial_sum,
+                                                 float *                        partial_out,
+                                                 int                            n_partitions) {
+    return launch_fattn_xmx_v2_decode_gqa_split_packed_tk<D, use_logit_softcap, Q_type, XMX_V2_DECODE_TK>(
+        ctx, params, stream, packed_k, partial_max, partial_sum, partial_out, n_partitions);
 }
 
 template <int D, bool use_logit_softcap, typename Q_type>
@@ -2289,6 +2452,32 @@ bool launch_fattn_xmx_v2_decode_gqa_split_tk(ggml_backend_sycl_context &,
                                              int) {
     GGML_ABORT("XMX v2 not available at compile time");
     return false;
+}
+
+template <int D, bool use_logit_softcap, typename Q_type, int TK, bool DIRECT_PV = false>
+bool launch_fattn_xmx_v2_decode_gqa_split_packed_tk(ggml_backend_sycl_context &,
+                                                    const fattn_params &,
+                                                    dpct::queue_ptr,
+                                                    ggml_sycl_fattn_xmx_packed_k *,
+                                                    float *,
+                                                    float *,
+                                                    float *,
+                                                    int) {
+    GGML_ABORT("XMX v2 not available at compile time");
+    return false;
+}
+
+template <int D, bool use_logit_softcap, typename Q_type>
+bool launch_fattn_xmx_v2_decode_gqa_split_packed(ggml_backend_sycl_context &    ctx,
+                                                 const fattn_params &           params,
+                                                 dpct::queue_ptr                stream,
+                                                 ggml_sycl_fattn_xmx_packed_k * packed_k,
+                                                 float *                        partial_max,
+                                                 float *                        partial_sum,
+                                                 float *                        partial_out,
+                                                 int                            n_partitions) {
+    return launch_fattn_xmx_v2_decode_gqa_split_packed_tk<D, use_logit_softcap, Q_type, XMX_V2_DECODE_TK>(
+        ctx, params, stream, packed_k, partial_max, partial_sum, partial_out, n_partitions);
 }
 
 template <int D, bool use_logit_softcap, typename Q_type>

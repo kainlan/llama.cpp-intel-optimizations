@@ -263,6 +263,7 @@ static void pp_scratch_profile_end() {
 #include "ggml-sycl/ggml-sycl-bench.hpp"
 #include "ggml-sycl/gpu-sampler.hpp"
 #include "ggml-sycl/mmvq.hpp"
+#include "ggml-sycl/moe-layer-plan.hpp"
 #include "ggml-sycl/moe-sort.hpp"
 #include "ggml-sycl/moe-tile-convert.hpp"
 #include "ggml-sycl/moe-xmx-fused.hpp"
@@ -274,6 +275,16 @@ static void pp_scratch_profile_end() {
 #include "ggml-sycl/vmem-kv.hpp"
 #include "ggml.h"
 #include "mem-handle.hpp"
+
+using ggml_sycl::moe_gate_up_pair;
+using ggml_sycl::moe_layer_decode_artifact_plan;
+using ggml_sycl::moe_layer_decode_plan;
+using ggml_sycl::moe_layer_decode_role_plan;
+using ggml_sycl::moe_layer_grouped_route_group;
+using ggml_sycl::moe_layer_grouped_route_row;
+using ggml_sycl::moe_layer_grouped_route_view;
+using ggml_sycl::moe_layer_route_residency;
+using ggml_sycl::moe_layer_transient_ptr_table_slot;
 
 static bool g_sycl_loaded          = false;
 int         g_ggml_sycl_debug      = 0;
@@ -1384,6 +1395,8 @@ enum moe_tensor_type : int {
     MOE_TENSOR_UNKNOWN = 3,
 };
 
+static constexpr int MOE_PROFILE_ROLE_COUNT = static_cast<int>(MOE_TENSOR_UNKNOWN) + 1;
+
 // Classify tensor type from its name (e.g. "blk.5.ffn_gate_exps").
 static moe_tensor_type moe_classify_tensor(const char * name) {
     if (!name) {
@@ -1413,6 +1426,11 @@ static const char * moe_tensor_type_name(moe_tensor_type type) {
             return "unknown";
     }
     return "unknown";
+}
+
+static int moe_profile_role_index(moe_tensor_type type) {
+    const int idx = static_cast<int>(type);
+    return idx >= 0 && idx < MOE_PROFILE_ROLE_COUNT ? idx : static_cast<int>(MOE_TENSOR_UNKNOWN);
 }
 
 // Extract block number from tensor name (e.g. "blk.5.ffn_gate_exps" -> 5).
@@ -1686,6 +1704,15 @@ static void * get_expert_device_ptr(int block_id, int expert_id, moe_tensor_type
 static ggml_sycl_cache_id ggml_sycl_get_moe_expert_cache_key(const ggml_tensor *     tensor,
                                                              ggml_tensor_extra_gpu * extra,
                                                              int                     expert_id);
+
+static ggml_sycl_cache_id ggml_sycl_layout_specific_moe_expert_cache_key(ggml_sycl_cache_id key,
+                                                                         ggml_layout_mode   layout) {
+    if (layout == GGML_LAYOUT_MXFP4_I8) {
+        constexpr uint64_t layout_key_tag = 0x4d584650344938ull;  // "MXFP4I8"
+        key.aux_id                        = ggml_sycl::detail::cache_hash_combine(key.aux_id, layout_key_tag);
+    }
+    return key;
+}
 
 struct ggml_sycl_reorder_fill_ctx {
     ggml_type type;
@@ -2774,6 +2801,9 @@ static void ggml_sycl_configure_host_zones_for_plan(ggml_sycl::unified_cache * c
         GGML_LOG_INFO("[HOST-ARENA] Zones configured: WEIGHT=%.1f MB KV=%.1f MB STAGING=%.1f MB SCRATCH=%.1f MB\n",
                       plan.host_zone_weight_bytes / (1024.0 * 1024.0), kv_zone_bytes / (1024.0 * 1024.0),
                       plan.host_zone_staging_bytes / (1024.0 * 1024.0), scratch_zone_bytes / (1024.0 * 1024.0));
+        GGML_LOG_INFO("[HOST-ARENA] Committed %.1f MB in %zu chunk(s) after plan pre-size (budget=%.1f MB)\n",
+                      cache->pinned_pool_committed() / (1024.0 * 1024.0), cache->pinned_pool_chunk_count(),
+                      cache->pinned_pool_budget() / (1024.0 * 1024.0));
     } else {
         GGML_LOG_WARN(
             "[HOST-ARENA] Host zones disabled for this plan; model load will use fallback pinned allocations\n");
@@ -3013,7 +3043,7 @@ static bool ggml_sycl_materialize_planned_expert_layout(const ggml_tensor * src0
     ggml_sycl_reorder_fill_ctx reorder_ctx{};
     cache_layout_fill_fn       fill_fn  = nullptr;
     const void *               fill_ctx = nullptr;
-    if (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED) {
+    if (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED || layout == GGML_LAYOUT_MXFP4_I8) {
         reorder_ctx.type          = meta->type;
         reorder_ctx.ncols         = meta->ne0;
         reorder_ctx.nrows         = meta->ne1;
@@ -3092,8 +3122,8 @@ static moe_expert_route ggml_sycl_resolve_moe_expert_route(const ggml_tensor * s
         return route;
     }
 
-    ggml_sycl_cache_id key = ggml_sycl_get_moe_expert_cache_key(src0, extra, expert_id);
-    if (!key.valid) {
+    const ggml_sycl_cache_id base_key = ggml_sycl_get_moe_expert_cache_key(src0, extra, expert_id);
+    if (!base_key.valid) {
         route.reason = expert_resolve_reason::INVALID_REQUEST;
         return route;
     }
@@ -3132,6 +3162,17 @@ static moe_expert_route ggml_sycl_resolve_moe_expert_route(const ggml_tensor * s
     const bool host_only      = route.plan_found && !route.planned_device_residency;
     const bool device_planned = route.plan_found && route.planned_device_residency;
     auto       layouts        = ggml_sycl_moe_resolve_layouts(requested_layout, host_only);
+    if (device_planned && requested_layout == GGML_LAYOUT_AOS && ggml_sycl_moe_route_log_enabled()) {
+        static std::atomic<int> logged_aos_request{ 0 };
+        const int               n = logged_aos_request.fetch_add(1, std::memory_order_relaxed);
+        if (n < 120) {
+            fprintf(stderr,
+                    "[MOE-AOS-REQUEST] tensor=%s expert=%d current=%d planned=%d requested=%s "
+                    "reason=device-plan\n",
+                    src0 && src0->name ? src0->name : "?", expert_id, current_device, route.planned_device,
+                    ggml_sycl_layout_mode_name(requested_layout));
+        }
+    }
 
     expert_resolve_reason last_reason = expert_resolve_reason::NOT_FOUND;
     for (int d : devices) {
@@ -3140,8 +3181,9 @@ static moe_expert_route ggml_sycl_resolve_moe_expert_route(const ggml_tensor * s
             continue;
         }
         for (ggml_layout_mode layout : layouts) {
-            expert_resolve_request req{};
-            req.key              = key;
+            const ggml_sycl_cache_id layout_key = ggml_sycl_layout_specific_moe_expert_cache_key(base_key, layout);
+            expert_resolve_request   req{};
+            req.key              = layout_key;
             req.requested_layout = layout;
             req.layer_id         = ggml_sycl_tp_extract_layer_number(src0->name);
             req.expert_id        = expert_id;
@@ -3157,12 +3199,12 @@ static moe_expert_route ggml_sycl_resolve_moe_expert_route(const ggml_tensor * s
             last_reason                    = resolved.reason;
             if (!resolved && !canonical_keys.empty()) {
                 for (const ggml_sycl_cache_id & canonical_key : canonical_keys) {
-                    if (ggml_sycl::detail::cache_id_equal(canonical_key, key)) {
+                    if (ggml_sycl::detail::cache_id_equal(canonical_key, base_key)) {
                         continue;
                     }
                     expert_resolve_request canonical_req = req;
-                    canonical_req.key                    = canonical_key;
-                    expert_resolve_result canonical      = cache->resolve_expert(canonical_req);
+                    canonical_req.key = ggml_sycl_layout_specific_moe_expert_cache_key(canonical_key, layout);
+                    expert_resolve_result canonical = cache->resolve_expert(canonical_req);
                     if (device_planned && ggml_sycl_moe_route_log_enabled()) {
                         static std::atomic<int> logged_canonical{ 0 };
                         const int               n = logged_canonical.fetch_add(1, std::memory_order_relaxed);
@@ -3207,7 +3249,10 @@ static moe_expert_route ggml_sycl_resolve_moe_expert_route(const ggml_tensor * s
                         }
                     }
                     sycl::event              stage_event;
-                    const ggml_sycl_cache_id stage_key = !canonical_keys.empty() ? canonical_keys.front() : key;
+                    const ggml_sycl_cache_id stage_base_key =
+                        !canonical_keys.empty() ? canonical_keys.front() : base_key;
+                    const ggml_sycl_cache_id stage_key =
+                        ggml_sycl_layout_specific_moe_expert_cache_key(stage_base_key, layout);
                     if (ggml_sycl_materialize_planned_expert_layout(src0, stage_key, expert_id, d, layout,
                                                                     &stage_event)) {
                         expert_resolve_request retry_req = req;
@@ -3275,6 +3320,10 @@ static void ggml_sycl_abort_unresolved_device_expert(const ggml_tensor *      sr
                                                      int                      expert_id,
                                                      int                      current_device,
                                                      const moe_expert_route & route) {
+    if (route.requested_layout == GGML_LAYOUT_MXFP4_I8 &&
+        (route.reason == expert_resolve_reason::NOT_FOUND || route.reason == expert_resolve_reason::LAYOUT_MISMATCH)) {
+        return;
+    }
     if (!route.plan_missing && !route.plan_found) {
         return;
     }
@@ -3290,6 +3339,26 @@ static bool ggml_sycl_moe_route_is_layout_miss(const moe_expert_route & route) {
     return route.kind == moe_expert_route_kind::UNAVAILABLE && route.reason == expert_resolve_reason::LAYOUT_MISMATCH;
 }
 
+bool ggml_sycl_moe_all_experts_local_device(const ggml_tensor * src0, int device, layout_mode layout) {
+    if (!src0 || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return false;
+    }
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
+    if (!cache || !cache->has_placement_plan()) {
+        return false;
+    }
+
+    const int64_t n_experts = src0->ne[2] > 0 ? src0->ne[2] : 1;
+    for (int64_t e = 0; e < n_experts; ++e) {
+        moe_expert_route route = ggml_sycl_resolve_moe_expert_route(src0, device, static_cast<int>(e), layout);
+        if (route.kind != moe_expert_route_kind::LOCAL_DEVICE || route.ptr == nullptr ||
+            route.actual_layout != layout) {
+            return false;
+        }
+    }
+    return true;
+}
+
 struct legacy_expert_resolve_result {
     const void *          ptr     = nullptr;
     bool                  is_host = false;  // true = safe for CPU vec_dot
@@ -3302,25 +3371,99 @@ static legacy_expert_resolve_result ggml_sycl_resolve_expert_ptr(const ggml_tens
         return {};
     }
 
-    moe_expert_route route = ggml_sycl_resolve_moe_expert_route(src0, device, expert_id, GGML_LAYOUT_AOS);
-    if (route.ptr && route.kind == moe_expert_route_kind::HOST) {
+    auto route_to_result = [&](moe_expert_route & route, const char * tag) -> legacy_expert_resolve_result {
         legacy_expert_resolve_result r{};
-        r.ptr     = route.ptr;
-        r.is_host = true;
-        r.lease   = std::move(route.lease);
-        n04bq_probe_log("resolve/uc-host", src0->name, expert_id, "ptr=%p tier=%s layout=%d", route.ptr,
-                        ggml_sycl_expert_tier_name(route.tier), (int) route.actual_layout);
+        if (!route.ptr) {
+            return r;
+        }
+        if (route.kind == moe_expert_route_kind::HOST) {
+            r.ptr     = route.ptr;
+            r.is_host = true;
+            r.lease   = std::move(route.lease);
+            n04bq_probe_log(tag, src0->name, expert_id, "ptr=%p tier=%s layout=%d", route.ptr,
+                            ggml_sycl_expert_tier_name(route.tier), (int) route.actual_layout);
+            return r;
+        }
+        if (route.kind == moe_expert_route_kind::LOCAL_DEVICE ||
+            route.kind == moe_expert_route_kind::SECONDARY_DEVICE) {
+            r.ptr     = route.ptr;
+            r.is_host = false;
+            r.lease   = std::move(route.lease);
+            n04bq_probe_log(tag, src0->name, expert_id, "ptr=%p owner=%d layout=%d", route.ptr, route.owning_device,
+                            (int) route.actual_layout);
+            return r;
+        }
         return r;
+    };
+
+    unified_cache * plan_cache = get_unified_cache_for_device(device);
+    if (plan_cache && plan_cache->has_placement_plan() && src0->name && src0->name[0] != '\0') {
+        const auto placement =
+            plan_cache->get_placement_plan().lookup_expert_placement(std::string(src0->name), expert_id);
+        if (placement.found()) {
+            std::array<ggml_layout_mode, 4> candidates{};
+            size_t                          n_candidates  = 0;
+            auto                            add_candidate = [&](ggml_layout_mode layout) {
+                for (size_t i = 0; i < n_candidates; ++i) {
+                    if (candidates[i] == layout) {
+                        return;
+                    }
+                }
+                if (n_candidates < candidates.size()) {
+                    candidates[n_candidates++] = layout;
+                }
+            };
+
+            if (!placement.on_device) {
+                add_candidate(GGML_LAYOUT_AOS);
+            } else if (src0->type == GGML_TYPE_MXFP4) {
+                add_candidate(GGML_LAYOUT_SOA);
+                if (moe_classify_tensor(src0->name) == MOE_TENSOR_DOWN) {
+                    add_candidate(GGML_LAYOUT_MXFP4_I8);
+                }
+                add_candidate(GGML_LAYOUT_COALESCED);
+            } else {
+                add_candidate(GGML_LAYOUT_AOS);
+            }
+
+            moe_expert_route last_route{};
+            for (size_t i = 0; i < n_candidates; ++i) {
+                moe_expert_route route = ggml_sycl_resolve_moe_expert_route(src0, device, expert_id, candidates[i]);
+                last_route             = route;
+                legacy_expert_resolve_result r =
+                    route_to_result(route, placement.on_device ? "resolve/plan-device" : "resolve/plan-host");
+                if (r.ptr) {
+                    return r;
+                }
+                if (route.kind == moe_expert_route_kind::UNAVAILABLE && !ggml_sycl_moe_route_is_layout_miss(route)) {
+                    break;
+                }
+            }
+
+            ggml_sycl_abort_unresolved_device_expert(src0, expert_id, device, last_route);
+            return {};
+        }
     }
-    if (route.ptr &&
-        (route.kind == moe_expert_route_kind::LOCAL_DEVICE || route.kind == moe_expert_route_kind::SECONDARY_DEVICE)) {
-        legacy_expert_resolve_result r{};
-        r.ptr     = route.ptr;
-        r.is_host = false;
-        r.lease   = std::move(route.lease);
-        n04bq_probe_log("resolve/uc-device", src0->name, expert_id, "ptr=%p owner=%d layout=%d", route.ptr,
-                        route.owning_device, (int) route.actual_layout);
-        return r;
+
+    moe_expert_route route = ggml_sycl_resolve_moe_expert_route(src0, device, expert_id, GGML_LAYOUT_AOS);
+    if (ggml_sycl_moe_route_log_enabled()) {
+        static std::atomic<int> logged_legacy_aos{ 0 };
+        const int               n = logged_legacy_aos.fetch_add(1, std::memory_order_relaxed);
+        if (n < 80) {
+            fprintf(stderr,
+                    "[MOE-LEGACY-AOS-FALLBACK] tensor=%s expert=%d device=%d kind=%d reason=%s ptr=%p "
+                    "plan_found=%d plan_missing=%d\n",
+                    src0 && src0->name ? src0->name : "?", expert_id, device, (int) route.kind,
+                    ggml_sycl_expert_resolve_reason_name(route.reason), route.ptr, route.plan_found ? 1 : 0,
+                    route.plan_missing ? 1 : 0);
+        }
+    }
+    {
+        legacy_expert_resolve_result r =
+            route_to_result(route, route.kind == moe_expert_route_kind::HOST ? "resolve/uc-host" : "resolve/uc-device");
+        if (r.ptr) {
+            return r;
+        }
     }
     ggml_sycl_abort_unresolved_device_expert(src0, expert_id, device, route);
 
@@ -3342,19 +3485,25 @@ static legacy_expert_resolve_result ggml_sycl_resolve_expert_ptr(const ggml_tens
     ggml_sycl_cache_id key   = ggml_sycl_get_moe_expert_cache_key(src0, extra, expert_id);
     if (cache && key.valid) {
         if (const weight_entry * entry = cache->lookup_expert(key); entry && entry->ptr) {
-            bool host = (entry->location != cache_location::DEVICE);
-            if (host) {
-                n04bq_probe_log("resolve/cache-host", src0->name, expert_id, "loc=%d ptr=%p size=%zu",
-                                (int) entry->location, entry->ptr, entry->size);
-                return make_host_result(entry->ptr);
+            if (entry->layout != GGML_LAYOUT_AOS) {
+                n04bq_probe_log("resolve/cache-layout-miss", src0->name, expert_id, "layout=%d ptr=%p size=%zu",
+                                (int) entry->layout, entry->ptr, entry->size);
+            } else {
+                bool host = (entry->location != cache_location::DEVICE);
+                if (host) {
+                    n04bq_probe_log("resolve/cache-host", src0->name, expert_id, "loc=%d ptr=%p size=%zu",
+                                    (int) entry->location, entry->ptr, entry->size);
+                    return make_host_result(entry->ptr);
+                }
+                // Device-resident: caller routes to GPU, no lease needed on the
+                // device VRAM pointer (CPU dispatch skips is_host==false paths).
+                n04bq_probe_log("resolve/cache-device", src0->name, expert_id, "ptr=%p size=%zu", entry->ptr,
+                                entry->size);
+                legacy_expert_resolve_result r{};
+                r.ptr     = entry->ptr;
+                r.is_host = false;
+                return r;
             }
-            // Device-resident: caller routes to GPU, no lease needed on the
-            // device VRAM pointer (CPU dispatch skips is_host==false paths).
-            n04bq_probe_log("resolve/cache-device", src0->name, expert_id, "ptr=%p size=%zu", entry->ptr, entry->size);
-            legacy_expert_resolve_result r{};
-            r.ptr     = entry->ptr;
-            r.is_host = false;
-            return r;
         }
     }
 
@@ -3465,6 +3614,10 @@ uint32_t get_expert_frequency(int layer_hash, int expert_id) {
 }
 
 }  // namespace ggml_sycl
+
+bool ggml_sycl_moe_all_experts_local_device(const ggml_tensor * src0, int device, layout_mode layout) {
+    return ggml_sycl::ggml_sycl_moe_all_experts_local_device(src0, device, layout);
+}
 
 // ---------------------------------------------------------------------------
 // Periodic re-ranking: re-evaluate expert popularity from epoch counters and
@@ -4357,9 +4510,17 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
         }
 
         // Validate the tensor storage pointer before computing expert offsets.
-        const uintptr_t src0_addr = reinterpret_cast<uintptr_t>(src0_storage);
-        if (src0_addr == 0 || (src0_addr >> 47) != 0) {
-            // Null or non-canonical address (bits 47+ set = kernel space on x86-64)
+        //
+        // Level Zero device USM pointers may be high virtual addresses that
+        // fail x86 host-pointer canonicality heuristics.  That is valid for a
+        // SYCL device buffer because the pointer is only used as a device-side
+        // expert base and host_src_ptr remains null.  Only reject the old
+        // high-address case for host-resident buffers where this pointer would
+        // be dereferenced or copied from the host side.
+        const bool      src0_device_vram = ggml_sycl_is_device_vram_buffer(src0);
+        const uintptr_t src0_addr        = reinterpret_cast<uintptr_t>(src0_storage);
+        if (src0_addr == 0 || (!src0_device_vram && (src0_addr >> 47) != 0)) {
+            // Null or non-canonical host address (bits 47+ set = kernel space on x86-64).
             GGML_LOG_WARN(
                 "[MOE-HYBRID] Skipping MUL_MAT_ID node with invalid src0 storage=%p "
                 "(tensor=%s, buffer=%s)\n",
@@ -4370,7 +4531,7 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
 
         for (int e = 0; e < n_experts; e++) {
             const void * ptr      = static_cast<const char *>(src0_storage) + static_cast<size_t>(e) * nb02;
-            const void * host_ptr = ggml_sycl_is_device_vram_buffer(src0) ? nullptr : ptr;
+            const void * host_ptr = src0_device_vram ? nullptr : ptr;
             expert_list.push_back({ layer_id, e, ptr, host_ptr, nb02, src0, src0_extra });
         }
     }
@@ -6340,6 +6501,8 @@ static const char * ggml_sycl_layout_mode_name(ggml_layout_mode mode) {
             return "soa";
         case GGML_LAYOUT_COALESCED:
             return "coalesced";
+        case GGML_LAYOUT_MXFP4_I8:
+            return "mxfp4_i8";
         case GGML_LAYOUT_XMX_TILED:
             return "xmx_tiled";
         case GGML_LAYOUT_XMX_GEMM_TILED:
@@ -6371,6 +6534,10 @@ static bool ggml_sycl_layout_mode_from_string(const char * value, layout_mode * 
     }
     if (lower == "coalesced" || lower == "coa") {
         *out = GGML_LAYOUT_COALESCED;
+        return true;
+    }
+    if (lower == "mxfp4_i8" || lower == "mxfp4_predecoded" || lower == "predecoded_i8") {
+        *out = GGML_LAYOUT_MXFP4_I8;
         return true;
     }
     if (lower == "xmx_tiled" || lower == "xmx") {
@@ -8031,25 +8198,10 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
                       scratch_remaining / MB);
     }
 
-    // Pre-allocate host-pinned memory for the full model working set so that
-    // NO sycl::malloc_host calls occur during inference.  The model size is
-    // known from the tensor inventory; pre_allocate_all adds 20% headroom for
-    // SOA conversion temporaries, staging buffers, and runtime allocations.
-    {
-        auto * cache = ggml_sycl::get_unified_cache_for_device(ctx->device);
-        if (cache) {
-            const size_t chunks_grown = cache->pre_allocate_all(g_tensor_inventory_total_size);
-            if (chunks_grown > 0) {
-                GGML_LOG_INFO(
-                    "[SYCL] Host-pinned pre-allocate: %zu chunks for full model "
-                    "(%.1f MB + 20%% headroom)\n",
-                    chunks_grown, g_tensor_inventory_total_size / (1024.0 * 1024.0));
-            }
-        }
-    }
-
     // Phase C: compute placement plan + store to per-device caches.
     // Idempotent against a prior early call with the same inventory.
+    // Host-pinned pool pre-sizing is plan-derived and happens when host zones
+    // are configured, so all-VRAM models do not allocate a full host copy here.
     compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct);
 
     GGML_LOG_INFO(
@@ -8526,10 +8678,19 @@ bool test_moe_ptr_table_does_not_persist_pointer_cache() {
     g_test_moe_ptr_table_ready_event_deps.store(0, std::memory_order_relaxed);
     const void * const * table       = moe_fusion_ensure_gpu0_ptrs(ctx, &tensor, routed, 1, 13);
     const bool           dep_chained = g_test_moe_ptr_table_ready_event_deps.load(std::memory_order_relaxed) > 0;
+    bool                 lease_covers_uploaded_ptr = false;
+    for (const auto & lease : extra.moe_expert_ptrs_leases[0]) {
+        auto resolved = lease.resolve(0);
+        if (resolved.ptr == expected_ptr && resolved.layout == GGML_LAYOUT_SOA && resolved.on_device) {
+            lease_covers_uploaded_ptr = true;
+            break;
+        }
+    }
     ctx.stream()->wait();
     sycl::event::wait(stage_events);
 
-    return table != nullptr && extra.moe_expert_ptrs_host[0][expert_id] == expected_ptr && dep_chained;
+    return table != nullptr && extra.moe_expert_ptrs_host[0][expert_id] == expected_ptr && dep_chained &&
+           lease_covers_uploaded_ptr;
 }
 
 bool test_moe_ptr_table_lease_covers_populated_slots() {
@@ -8711,76 +8872,6 @@ static void ggml_sycl_moe_layer_ids_cache_new_graph() {
 // Maps layer_id -> pointer to the final ffn_moe_weights tensor for this graph.
 // Populated by a pre-scan in graph_compute_impl, consumed by mul_mat_id.
 static thread_local std::unordered_map<int, const ggml_tensor *> g_moe_weights_by_layer;
-
-struct moe_gate_up_pair {
-    const ggml_tensor * up_weight       = nullptr;
-    const ggml_tensor * gate_weight     = nullptr;
-    const ggml_tensor * src1            = nullptr;
-    const ggml_tensor * ids             = nullptr;
-    const ggml_tensor * up_bias         = nullptr;
-    const ggml_tensor * gate_bias       = nullptr;
-    const ggml_tensor * down_weight     = nullptr;
-    ggml_tensor *       up_dst          = nullptr;
-    ggml_tensor *       gate_dst        = nullptr;
-    ggml_tensor *       up_biased       = nullptr;
-    ggml_tensor *       gate_biased     = nullptr;
-    ggml_tensor *       glu_dst         = nullptr;
-    ggml_tensor *       down_dst        = nullptr;
-    int                 up_index        = -1;
-    int                 gate_index      = -1;
-    int                 up_bias_index   = -1;
-    int                 gate_bias_index = -1;
-    int                 glu_index       = -1;
-    int                 down_index      = -1;
-    enum ggml_glu_op    glu_op          = GGML_GLU_OP_SWIGLU;
-};
-
-struct moe_layer_grouped_route_row {
-    size_t  entry = 0;
-    int64_t iid1  = 0;
-    int64_t id    = 0;
-};
-
-struct moe_layer_decode_role_plan {
-    const ggml_tensor *                      weight = nullptr;
-    std::vector<int32_t>                     expert_ids;
-    std::vector<ggml_sycl::mem_handle>       handles;
-    std::vector<moe_layer_grouped_route_row> rows;
-    std::vector<sycl::event>                 ready_events;
-};
-
-struct moe_layer_decode_artifact_plan {
-    const char *            role   = nullptr;
-    const ggml_tensor *     tensor = nullptr;
-    ggml_sycl::mem_handle   handle;
-    ggml_sycl::resolved_ptr resolved;
-};
-
-struct moe_layer_decode_plan {
-    int                            layer           = -1;
-    int                            layer_hash      = -1;
-    int64_t                        n_ids           = 0;
-    size_t                         n_entries       = 0;
-    layout_mode                    layout          = GGML_LAYOUT_AOS;
-    bool                           current_is_gate = false;
-    const int32_t *                ids_host        = nullptr;
-    const int32_t *                ids_device      = nullptr;
-    const ggml_tensor *            src1            = nullptr;
-    const ggml_tensor *            ids             = nullptr;
-    const moe_gate_up_pair *       pair            = nullptr;
-    moe_layer_decode_artifact_plan activation;
-    moe_layer_decode_artifact_plan ids_control;
-    moe_layer_decode_artifact_plan gate_bias;
-    moe_layer_decode_artifact_plan up_bias;
-    moe_layer_decode_artifact_plan glu_output;
-    moe_layer_decode_artifact_plan down_output;
-    moe_layer_decode_role_plan     current;
-    moe_layer_decode_role_plan     partner;
-    moe_layer_decode_role_plan     gate;
-    moe_layer_decode_role_plan     up;
-    moe_layer_decode_role_plan     down;
-    bool                           down_eligible = false;
-};
 
 struct moe_layer_direct_xmx_decision {
     bool         eligible         = false;
@@ -8968,47 +9059,17 @@ static bool moe_layer_capture_tensor_artifact(moe_layer_decode_artifact_plan & a
     return true;
 }
 
-enum class moe_layer_route_residency : uint8_t {
-    MISSING = 0,
-    DEVICE  = 1,
-    HOST    = 2,
-};
-
-struct moe_layer_grouped_route_group {
-    int32_t                                  expert_id    = -1;
-    int                                      device       = ggml_sycl::mem_handle::HOST_DEVICE;
-    layout_mode                              layout       = GGML_LAYOUT_AOS;
-    moe_layer_route_residency                residency    = moe_layer_route_residency::MISSING;
-    size_t                                   handle_index = SIZE_MAX;
-    size_t                                   handle_hash  = 0;
-    std::vector<moe_layer_grouped_route_row> rows;
-};
-
-struct moe_layer_grouped_route_view {
-    const ggml_tensor *                        weight               = nullptr;
-    const char *                               role_name            = "unknown";
-    int                                        submit_device        = -1;
-    int64_t                                    top_k                = 0;
-    int64_t                                    batch                = 0;
-    size_t                                     entries              = 0;
-    size_t                                     n_groups             = 0;
-    size_t                                     device_rows          = 0;
-    size_t                                     host_rows            = 0;
-    size_t                                     missing_rows         = 0;
-    size_t                                     layout_mismatch_rows = 0;
-    size_t                                     max_rows_per_group   = 0;
-    size_t                                     ready_events         = 0;
-    std::vector<moe_layer_grouped_route_group> groups;
-};
-
 static bool moe_layer_group_matches(const moe_layer_grouped_route_group & group,
                                     int32_t                               expert_id,
                                     int                                   device,
                                     layout_mode                           layout,
                                     moe_layer_route_residency             residency,
+                                    const ggml_sycl::mem_handle *         handle,
                                     size_t                                handle_hash) {
+    const bool handle_matches =
+        handle && handle->valid() ? group.handle.valid() && group.handle == *handle : group.handle_hash == handle_hash;
     return group.expert_id == expert_id && group.device == device && group.layout == layout &&
-           group.residency == residency && group.handle_hash == handle_hash;
+           group.residency == residency && handle_matches;
 }
 
 static moe_layer_grouped_route_view moe_layer_build_grouped_route_view(const moe_layer_decode_plan &      plan,
@@ -9060,7 +9121,7 @@ static moe_layer_grouped_route_view moe_layer_build_grouped_route_view(const moe
         }
 
         auto it = std::find_if(view.groups.begin(), view.groups.end(), [&](const moe_layer_grouped_route_group & g) {
-            return moe_layer_group_matches(g, eid, route_dev, route_lay, residency, handle_hash);
+            return moe_layer_group_matches(g, eid, route_dev, route_lay, residency, handle, handle_hash);
         });
         if (it == view.groups.end()) {
             moe_layer_grouped_route_group group;
@@ -9069,7 +9130,10 @@ static moe_layer_grouped_route_view moe_layer_build_grouped_route_view(const moe
             group.layout       = route_lay;
             group.residency    = residency;
             group.handle_index = handle ? ci : SIZE_MAX;
-            group.handle_hash  = handle_hash;
+            if (handle && handle->valid()) {
+                group.handle = *handle;
+            }
+            group.handle_hash = handle_hash;
             view.groups.push_back(std::move(group));
             it = view.groups.end() - 1;
         }
@@ -9122,6 +9186,7 @@ struct moe_layer_group_profile_accum {
     int64_t                               soa_roles       = 0;
     int64_t                               coalesced_roles = 0;
     int64_t                               aos_roles       = 0;
+    int64_t                               mxfp4_i8_roles  = 0;
     std::unordered_map<uint64_t, int64_t> rows_by_group;
 };
 
@@ -9178,6 +9243,8 @@ static void moe_layer_group_profile_record(const moe_layer_decode_plan &      pl
         p.soa_roles++;
     } else if (plan.layout == GGML_LAYOUT_COALESCED) {
         p.coalesced_roles++;
+    } else if (plan.layout == GGML_LAYOUT_MXFP4_I8) {
+        p.mxfp4_i8_roles++;
     } else if (plan.layout == GGML_LAYOUT_AOS) {
         p.aos_roles++;
     }
@@ -9233,7 +9300,7 @@ static void moe_layer_group_profile_record(const moe_layer_decode_plan &      pl
             "tokens=%lld avg_topk=%.2f roles_by_kind gate=%lld up=%lld down=%lld "
             "rows_per_group{1=%lld 2=%lld 3=%lld 4_7=%lld 8p=%lld} "
             "handle_residency device=%lld host=%lld missing=%lld layout_mismatch=%lld "
-            "layouts soa=%lld coalesced=%lld aos=%lld last_executor=%s\n",
+            "layouts soa=%lld coalesced=%lld mxfp4_i8=%lld aos=%lld last_executor=%s\n",
             (long long) p.roles, ggml_sycl_moe_group_profile_window(), (long long) layers, device,
             ggml_sycl_layout_mode_name(plan.layout), (long long) p.entries, (long long) groups,
             groups > 0 ? static_cast<double>(p.entries) / static_cast<double>(groups) : 0.0, (long long) max_rows,
@@ -9242,7 +9309,7 @@ static void moe_layer_group_profile_record(const moe_layer_decode_plan &      pl
             (long long) hist_2, (long long) hist_3, (long long) hist_4_7, (long long) hist_8_plus,
             (long long) p.device_handles, (long long) p.host_handles, (long long) p.missing_handles,
             (long long) p.layout_mismatch, (long long) p.soa_roles, (long long) p.coalesced_roles,
-            (long long) p.aos_roles, last_executor ? last_executor : "?");
+            (long long) p.mxfp4_i8_roles, (long long) p.aos_roles, last_executor ? last_executor : "?");
     p = {};
 }
 
@@ -9389,14 +9456,17 @@ static float ggml_sycl_moe_prob_threshold() {
 // ---------------------------------------------------------------------------
 
 struct pending_cpu_scatter {
-    std::future<void>       future;      // CPU compute completion
-    float *                 out_pinned;  // Output buffer to scatter from
-    float *                 act_pinned;  // Activation buffer (for deferred release)
+    std::future<void>        future;         // CPU compute completion
+    float *                  out_pinned;     // Output buffer to scatter from
+    float *                  act_pinned;     // Activation buffer (for deferred release)
+    uint8_t *                weight_pinned;  // Optional D2H-staged weights for unsupported device kernels
     // Use .as_mem_handle() for read/resolve access; unified_free(alloc_handle) for ownership
-    ggml_sycl::alloc_handle out_alloc;
-    ggml_sycl::alloc_handle act_alloc;
-    sycl::queue *           stream;    // GPU queue for H2D copies
-    sycl::context           sycl_ctx;  // SYCL context for deferred sycl::free
+    ggml_sycl::alloc_handle  out_alloc;
+    ggml_sycl::alloc_handle  act_alloc;
+    ggml_sycl::alloc_handle  weight_alloc;
+    std::vector<sycl::event> scatter_events;
+    sycl::queue *            stream;    // GPU queue for H2D copies
+    sycl::context            sycl_ctx;  // SYCL context for deferred sycl::free
 
     // Per-expert scatter metadata
     struct scatter_entry {
@@ -9428,21 +9498,27 @@ struct pending_cpu_scatter {
     // cleanup to the next flush call — by then, at least one kernel on the
     // in-order queue has executed, guaranteeing the memcpys finished.
     struct deferred_bufs {
-        float *                 out = nullptr;
-        float *                 act = nullptr;
-        ggml_sycl::alloc_handle out_alloc{};
-        ggml_sycl::alloc_handle act_alloc{};
-        sycl::context           ctx;
-        int                     dev_id  = -1;
-        bool                    pool    = false;
-        bool                    pending = false;
+        float *                  out    = nullptr;
+        float *                  act    = nullptr;
+        uint8_t *                weight = nullptr;
+        ggml_sycl::alloc_handle  out_alloc{};
+        ggml_sycl::alloc_handle  act_alloc{};
+        ggml_sycl::alloc_handle  weight_alloc{};
+        std::vector<sycl::event> scatter_events;
+        sycl::context            ctx;
+        int                      dev_id  = -1;
+        bool                     pool    = false;
+        bool                     pending = false;
     } prev_bufs;
 
     pending_cpu_scatter() :
         out_pinned(nullptr),
         act_pinned(nullptr),
+        weight_pinned(nullptr),
         out_alloc(),
         act_alloc(),
+        weight_alloc(),
+        scatter_events(),
         stream(nullptr),
         sycl_ctx(),
         device_id(-1),
@@ -9452,7 +9528,8 @@ struct pending_cpu_scatter {
         dst_tensor(nullptr) {}
 };
 
-static thread_local pending_cpu_scatter g_pending_scatter = {};
+static thread_local pending_cpu_scatter      g_pending_scatter = {};
+static thread_local std::vector<sycl::event> g_cpu_tg_direct_pending_scatter;
 
 // Result struct for async CPU expert dispatch.  Carries compute output and
 // metadata from the async thread back to the main thread so the main thread
@@ -9759,6 +9836,30 @@ struct moe_profile_layer {
     int fused_esimd_count  = 0;  // Times fused ESIMD kernel handled the op
     int xmx_sorted_count   = 0;  // Times XMX sorted dispatch handled the op
     int host_routing_count = 0;  // Times host-side routing was used
+
+    struct route_stats {
+        int64_t calls               = 0;  // Number of route decisions for this role
+        int64_t entries_dev0        = 0;  // Entries resolved to current/primary device
+        int64_t entries_secondary   = 0;  // Entries resolved to another GPU
+        int64_t entries_host        = 0;  // Entries resolved to host-pinned/mmap CPU execution
+        int64_t entries_unavailable = 0;  // Entries with no usable placement
+        int64_t handles_device      = 0;  // Smart handles that resolved to device memory
+        int64_t handles_host        = 0;  // Smart handles that resolved to host memory
+        int64_t handles_missing     = 0;  // Missing/unresolved handles
+    };
+
+    struct host_detail {
+        double  act_d2h_us     = 0;  // Activation copy to host for CPU experts
+        double  cpu_compute_us = 0;  // CPU expert kernel wall time
+        double  out_h2d_us     = 0;  // CPU expert output copy back to device
+        double  bytes_d2h      = 0;
+        double  bytes_h2d      = 0;
+        int64_t rows           = 0;
+        int64_t batches        = 0;
+    };
+
+    std::array<route_stats, MOE_PROFILE_ROLE_COUNT> routes{};
+    host_detail                                     host{};
 };
 
 struct moe_profile_token {
@@ -10007,6 +10108,46 @@ struct moe_profile_state {
         cur_layer.kernel_submit_us += kernel_submit_us;
     }
 
+    void moe_route_stats(moe_tensor_type role,
+                         int64_t         entries_dev0,
+                         int64_t         entries_secondary,
+                         int64_t         entries_host,
+                         int64_t         entries_unavailable,
+                         int64_t         handles_device,
+                         int64_t         handles_host,
+                         int64_t         handles_missing) {
+        if (!token_active) {
+            return;
+        }
+        auto & r = cur_layer.routes[moe_profile_role_index(role)];
+        r.calls++;
+        r.entries_dev0 += entries_dev0;
+        r.entries_secondary += entries_secondary;
+        r.entries_host += entries_host;
+        r.entries_unavailable += entries_unavailable;
+        r.handles_device += handles_device;
+        r.handles_host += handles_host;
+        r.handles_missing += handles_missing;
+    }
+
+    void moe_host_detail(double  act_d2h_us,
+                         double  cpu_compute_us,
+                         double  out_h2d_us,
+                         int64_t rows,
+                         double  bytes_d2h,
+                         double  bytes_h2d) {
+        if (!token_active) {
+            return;
+        }
+        cur_layer.host.act_d2h_us += act_d2h_us;
+        cur_layer.host.cpu_compute_us += cpu_compute_us;
+        cur_layer.host.out_h2d_us += out_h2d_us;
+        cur_layer.host.bytes_d2h += bytes_d2h;
+        cur_layer.host.bytes_h2d += bytes_h2d;
+        cur_layer.host.rows += rows;
+        cur_layer.host.batches++;
+    }
+
     // Called at MoE MUL_MAT_ID exit
     void moe_op_end() {
         if (!token_active) {
@@ -10072,6 +10213,94 @@ struct moe_profile_state {
             return;
         }
 
+        auto add_route_stats = [](std::array<moe_profile_layer::route_stats, MOE_PROFILE_ROLE_COUNT> &       dst,
+                                  const std::array<moe_profile_layer::route_stats, MOE_PROFILE_ROLE_COUNT> & src) {
+            for (int i = 0; i < MOE_PROFILE_ROLE_COUNT; ++i) {
+                dst[i].calls += src[i].calls;
+                dst[i].entries_dev0 += src[i].entries_dev0;
+                dst[i].entries_secondary += src[i].entries_secondary;
+                dst[i].entries_host += src[i].entries_host;
+                dst[i].entries_unavailable += src[i].entries_unavailable;
+                dst[i].handles_device += src[i].handles_device;
+                dst[i].handles_host += src[i].handles_host;
+                dst[i].handles_missing += src[i].handles_missing;
+            }
+        };
+        auto add_host_detail = [](moe_profile_layer::host_detail & dst, const moe_profile_layer::host_detail & src) {
+            dst.act_d2h_us += src.act_d2h_us;
+            dst.cpu_compute_us += src.cpu_compute_us;
+            dst.out_h2d_us += src.out_h2d_us;
+            dst.bytes_d2h += src.bytes_d2h;
+            dst.bytes_h2d += src.bytes_h2d;
+            dst.rows += src.rows;
+            dst.batches += src.batches;
+        };
+        auto print_route_stats = [](const char *                                                               title,
+                                    const std::array<moe_profile_layer::route_stats, MOE_PROFILE_ROLE_COUNT> & routes,
+                                    int                                                                        nt_div) {
+            int64_t total_calls = 0;
+            for (const auto & r : routes) {
+                total_calls += r.calls;
+            }
+            if (total_calls == 0) {
+                return;
+            }
+            fprintf(stderr, "\n--- %s: Handle-Resolved Routes ---\n", title);
+            fprintf(stderr, "%-8s | %6s | %9s | %9s | %9s | %11s | %10s | %10s | %10s\n", "Role", "Calls", "Dev0",
+                    "Secondary", "Host", "Unavailable", "HDevice", "HHost", "HMissing");
+            fprintf(stderr, "%-8s-+-%6s-+-%9s-+-%9s-+-%9s-+-%11s-+-%10s-+-%10s-+-%10s\n", "--------", "------",
+                    "---------", "---------", "---------", "-----------", "----------", "----------", "----------");
+            for (int i = 0; i < MOE_PROFILE_ROLE_COUNT; ++i) {
+                const auto & r = routes[i];
+                if (r.calls == 0) {
+                    continue;
+                }
+                fprintf(stderr, "%-8s | %6lld | %9lld | %9lld | %9lld | %11lld | %10lld | %10lld | %10lld\n",
+                        moe_tensor_type_name(static_cast<moe_tensor_type>(i)), (long long) r.calls,
+                        (long long) r.entries_dev0, (long long) r.entries_secondary, (long long) r.entries_host,
+                        (long long) r.entries_unavailable, (long long) r.handles_device, (long long) r.handles_host,
+                        (long long) r.handles_missing);
+            }
+            if (nt_div > 1) {
+                int64_t dev0 = 0, sec = 0, host = 0, miss = 0;
+                for (const auto & r : routes) {
+                    dev0 += r.entries_dev0;
+                    sec += r.entries_secondary;
+                    host += r.entries_host;
+                    miss += r.entries_unavailable;
+                }
+                fprintf(stderr, "  Per token entries: dev0 %.1f, secondary %.1f, host %.1f, unavailable %.1f\n",
+                        static_cast<double>(dev0) / nt_div, static_cast<double>(sec) / nt_div,
+                        static_cast<double>(host) / nt_div, static_cast<double>(miss) / nt_div);
+            }
+        };
+        auto print_host_detail = [](const char * title, const moe_profile_layer::host_detail & h, int nt_div) {
+            if (h.batches == 0) {
+                return;
+            }
+            const double total_us = h.act_d2h_us + h.cpu_compute_us + h.out_h2d_us;
+            auto         bw_gbs   = [](double bytes, double us) {
+                return us > 0.0 ? bytes / (us * 1e-6) / 1e9 : 0.0;
+            };
+            fprintf(stderr, "\n--- %s: Host Expert Detail ---\n", title);
+            fprintf(stderr, "  Batches: %lld, rows: %lld", (long long) h.batches, (long long) h.rows);
+            if (nt_div > 1) {
+                fprintf(stderr, " (%.1f batches/token, %.1f rows/token)", static_cast<double>(h.batches) / nt_div,
+                        static_cast<double>(h.rows) / nt_div);
+            }
+            fprintf(stderr, "\n");
+            fprintf(stderr, "  Activation D2H: %8.1f us, %.1f KB, %.3f GB/s\n", h.act_d2h_us, h.bytes_d2h / 1024.0,
+                    bw_gbs(h.bytes_d2h, h.act_d2h_us));
+            fprintf(stderr, "  CPU compute:    %8.1f us\n", h.cpu_compute_us);
+            fprintf(stderr, "  Output H2D:     %8.1f us, %.1f KB, %.3f GB/s\n", h.out_h2d_us, h.bytes_h2d / 1024.0,
+                    bw_gbs(h.bytes_h2d, h.out_h2d_us));
+            if (nt_div > 1) {
+                fprintf(stderr, "  Host detail per token: %.3f ms total (D2H %.3f, CPU %.3f, H2D %.3f)\n",
+                        total_us / 1000.0 / nt_div, h.act_d2h_us / 1000.0 / nt_div, h.cpu_compute_us / 1000.0 / nt_div,
+                        h.out_h2d_us / 1000.0 / nt_div);
+            }
+        };
+
         // Print per-token summary table
         fprintf(stderr, "\n=== MoE Per-Phase Profile (%d tokens, %d warmup skipped) ===\n",
                 static_cast<int>(tokens.size()), n_warmup);
@@ -10087,6 +10316,8 @@ struct moe_profile_state {
         double avg_scatter_bytes   = 0;
         int    avg_scatter_entries = 0, avg_scatter_calls = 0;
         int    avg_layers = 0, avg_cpu_experts = 0, avg_gpu_experts = 0;
+        std::array<moe_profile_layer::route_stats, MOE_PROFILE_ROLE_COUNT> route_totals{};
+        moe_profile_layer::host_detail                                     host_totals{};
 
         for (auto & tok : tokens) {
             double tok_ids = 0, tok_routing = 0, tok_cpu = 0, tok_gpu = 0, tok_scatter = 0;
@@ -10116,6 +10347,8 @@ struct moe_profile_state {
                 tok_scat_ent += lay.scatter_n_entries;
                 tok_scat_calls += lay.scatter_n_calls;
                 tok_scat_bytes += lay.scatter_bytes;
+                add_route_stats(route_totals, lay.routes);
+                add_host_detail(host_totals, lay.host);
             }
             avg_ids += tok_ids;
             avg_routing += tok_routing;
@@ -10187,6 +10420,8 @@ struct moe_profile_state {
         double dtok_scat_cpu = 0, dtok_scat_sub = 0, dtok_scat_wait = 0, dtok_scat_bytes = 0;
         int    dtok_scat_ent = 0, dtok_scat_calls = 0;
         int    dtok_cpu_exp = 0, dtok_gpu_exp = 0;
+        std::array<moe_profile_layer::route_stats, MOE_PROFILE_ROLE_COUNT> dtok_routes{};
+        moe_profile_layer::host_detail                                     dtok_host{};
         for (auto & lay : dtok.layers) {
             dtok_ids += lay.ids_d2h_us;
             dtok_routing += lay.routing_us;
@@ -10207,6 +10442,8 @@ struct moe_profile_state {
             dtok_scat_ent += lay.scatter_n_entries;
             dtok_scat_calls += lay.scatter_n_calls;
             dtok_scat_bytes += lay.scatter_bytes;
+            add_route_stats(dtok_routes, lay.routes);
+            add_host_detail(dtok_host, lay.host);
         }
 
         // Accumulate weight_load
@@ -10264,6 +10501,8 @@ struct moe_profile_state {
         fprintf(stderr, "%-25s | %10.1f |               | %7.1f%%\n", "Token total", dtok.token_total_us / 1000.0,
                 100.0);
         fprintf(stderr, "  Experts: %d CPU, %d GPU | MoE layers: %d\n", dtok_cpu_exp, dtok_gpu_exp, dtok.n_moe_layers);
+        print_route_stats("Detailed token", dtok_routes, 1);
+        print_host_detail("Detailed token", dtok_host, 1);
 
         // PP profile: cache hit/miss and dispatch path breakdown
         if (g_moe_pp_profile_enabled) {
@@ -10354,6 +10593,8 @@ struct moe_profile_state {
         fprintf(stderr, "  Avg experts/token: %d CPU, %d GPU | MoE layers: %d\n", avg_cpu_experts / nt,
                 avg_gpu_experts / nt, avg_nl);
         fprintf(stderr, "  Token rate: %.2f tok/s\n", avg_total > 0 ? 1e6 / avg_total : 0);
+        print_route_stats("Averages", route_totals, nt);
+        print_host_detail("Averages", host_totals, nt);
 
         // Per-expert GPU MMVQ dispatch cost
         const int total_gpu_exp = avg_gpu_experts;  // already summed
@@ -10465,14 +10706,21 @@ static void flush_prev_scatter_bufs() {
     if (!pb.pending) {
         return;
     }
+    if (!pb.scatter_events.empty()) {
+        sycl::event::wait(pb.scatter_events);
+        pb.scatter_events.clear();
+    }
     if (pb.pool) {
         g_pinned_buffer_pools[pb.dev_id].release({ pb.act, pb.out });
-    } else if (pb.act_alloc.ptr != nullptr || pb.out_alloc.ptr != nullptr) {
+    } else if (pb.act_alloc.ptr != nullptr || pb.out_alloc.ptr != nullptr || pb.weight_alloc.ptr != nullptr) {
         if (pb.act_alloc.ptr != nullptr) {
             (void) ggml_sycl::unified_free(pb.act_alloc);
         }
         if (pb.out_alloc.ptr != nullptr) {
             (void) ggml_sycl::unified_free(pb.out_alloc);
+        }
+        if (pb.weight_alloc.ptr != nullptr) {
+            (void) ggml_sycl::unified_free(pb.weight_alloc);
         }
     } else {
         // Legacy sycl::free path — dead code after migration to unified_alloc
@@ -10482,15 +10730,22 @@ static void flush_prev_scatter_bufs() {
         if (pb.out) {
             GGML_ASSERT(false && "pending_cpu_scatter.out: legacy sycl::free path — out_alloc should always be set");
         }
+        if (pb.weight) {
+            GGML_ASSERT(false &&
+                        "pending_cpu_scatter.weight: legacy sycl::free path — weight_alloc should always be set");
+        }
     }
-    pb.out       = nullptr;
-    pb.act       = nullptr;
-    pb.out_alloc = {};
-    pb.act_alloc = {};
-    pb.ctx       = sycl::context();
-    pb.dev_id    = -1;
-    pb.pool      = false;
-    pb.pending   = false;
+    pb.out          = nullptr;
+    pb.act          = nullptr;
+    pb.weight       = nullptr;
+    pb.out_alloc    = {};
+    pb.act_alloc    = {};
+    pb.weight_alloc = {};
+    pb.scatter_events.clear();
+    pb.ctx     = sycl::context();
+    pb.dev_id  = -1;
+    pb.pool    = false;
+    pb.pending = false;
 }
 
 static void flush_pending_cpu_scatter() {
@@ -10519,6 +10774,7 @@ static void flush_pending_cpu_scatter() {
         // to let the host proceed to dispatch the next layer immediately.
         double total_bytes = 0;
         int    n_entries   = 0;
+        g_pending_scatter.scatter_events.clear();
         if (g_pending_scatter.stream && g_pending_scatter.out_pinned) {
             // Batch contiguous scatter entries into single memcpy calls.
             // Source (out_pinned) is always contiguous; check if destination
@@ -10545,7 +10801,8 @@ static void flush_pending_cpu_scatter() {
                     src_base += entries[j].N;
                     j++;
                 }
-                g_pending_scatter.stream->memcpy(batch_dst, batch_src, batch_N * sizeof(float));
+                g_pending_scatter.scatter_events.push_back(
+                    g_pending_scatter.stream->memcpy(batch_dst, batch_src, batch_N * sizeof(float)));
                 total_bytes += static_cast<double>(batch_N) * sizeof(float);
                 n_entries++;
                 i = j;
@@ -10571,24 +10828,42 @@ static void flush_pending_cpu_scatter() {
     // Defer buffer cleanup: memcpys are submitted but may not have executed
     // yet.  Move buffers to prev_bufs for cleanup at the next flush call
     // (by then, the in-order queue guarantees completion).
-    if (g_pending_scatter.owns_buffers) {
-        auto & pb    = g_pending_scatter.prev_bufs;
-        pb.out       = g_pending_scatter.out_pinned;
-        pb.act       = g_pending_scatter.act_pinned;
-        pb.out_alloc = g_pending_scatter.out_alloc;
-        pb.act_alloc = g_pending_scatter.act_alloc;
-        pb.ctx       = g_pending_scatter.sycl_ctx;
-        pb.dev_id    = g_pending_scatter.device_id;
-        pb.pool      = g_pending_scatter.from_pool;
-        pb.pending   = true;
+    {
+        auto & pb         = g_pending_scatter.prev_bufs;
+        pb.scatter_events = std::move(g_pending_scatter.scatter_events);
+        if (g_pending_scatter.owns_buffers) {
+            pb.out          = g_pending_scatter.out_pinned;
+            pb.act          = g_pending_scatter.act_pinned;
+            pb.weight       = g_pending_scatter.weight_pinned;
+            pb.out_alloc    = g_pending_scatter.out_alloc;
+            pb.act_alloc    = g_pending_scatter.act_alloc;
+            pb.weight_alloc = g_pending_scatter.weight_alloc;
+            pb.ctx          = g_pending_scatter.sycl_ctx;
+            pb.dev_id       = g_pending_scatter.device_id;
+            pb.pool         = g_pending_scatter.from_pool;
+        } else {
+            pb.out          = nullptr;
+            pb.act          = nullptr;
+            pb.weight       = nullptr;
+            pb.out_alloc    = {};
+            pb.act_alloc    = {};
+            pb.weight_alloc = {};
+            pb.ctx          = sycl::context();
+            pb.dev_id       = g_pending_scatter.device_id;
+            pb.pool         = false;
+        }
+        pb.pending = !pb.scatter_events.empty() || g_pending_scatter.owns_buffers;
     }
 
     g_pending_scatter.entries.clear();
     g_pending_scatter.tasks.clear();
-    g_pending_scatter.out_pinned   = nullptr;
-    g_pending_scatter.act_pinned   = nullptr;
-    g_pending_scatter.out_alloc    = {};
-    g_pending_scatter.act_alloc    = {};
+    g_pending_scatter.out_pinned    = nullptr;
+    g_pending_scatter.act_pinned    = nullptr;
+    g_pending_scatter.weight_pinned = nullptr;
+    g_pending_scatter.out_alloc     = {};
+    g_pending_scatter.act_alloc     = {};
+    g_pending_scatter.weight_alloc  = {};
+    g_pending_scatter.scatter_events.clear();
     g_pending_scatter.stream       = nullptr;
     g_pending_scatter.sycl_ctx     = sycl::context();  // release ref
     g_pending_scatter.active       = false;
@@ -11128,6 +11403,10 @@ static void pipeline_scatter_start_async(int device) {
 
 // Public entry point for graph boundary flush
 void ggml_sycl_cpu_tg_flush_pending() {
+    if (!g_cpu_tg_direct_pending_scatter.empty()) {
+        sycl::event::wait(g_cpu_tg_direct_pending_scatter);
+        g_cpu_tg_direct_pending_scatter.clear();
+    }
     flush_pending_cpu_pipeline();
     flush_pending_cpu_scatter();
     flush_prev_cpu_pipeline_bufs();  // Final cleanup for last deferred pipeline scatter
@@ -11492,12 +11771,11 @@ static ggml_sycl_cache_id ggml_sycl_get_moe_expert_cache_key(const ggml_tensor *
             id.tp_offset_ne[i] = extra->tp_offset_ne[i];
         }
     }
-    // Keep the auxiliary id semantic too.  MoE tensors can be represented by
-    // different graph-local tensor/extra wrappers across PP/TG; using an
-    // extra-local cache UUID here makes handles for the same named expert miss
-    // each other.  The name hash already includes ":e<expert_id>", while type
-    // and dimensions are carried in the key proper.
-    id.aux_id = 0;
+    // Keep real model expert keys stable across graph-local wrappers, but do
+    // not alias transient/test tensors that reuse the same name for different
+    // backing data in one process.  Real model tensors should have a model_id
+    // populated during weight registration; synthetic tensors do not.
+    id.aux_id = (extra->model_id == 0) ? ggml_sycl_assign_cache_uuid(extra) : 0;
     return id;
 }
 
@@ -12453,6 +12731,30 @@ static bool ggml_sycl_is_device_vram_buffer(const ggml_tensor * t) {
     return buf_ctx->managed_alloc.tier == ggml_sycl::alloc_tier::DEVICE_VRAM;
 }
 
+static bool ggml_sycl_moe_plan_has_host_experts(const ggml_tensor * src0, int device, bool * known = nullptr) {
+    if (known) {
+        *known = false;
+    }
+    if (!src0 || device < 0 || ggml_sycl_get_tensor_usage(src0) != tensor_usage::MOE_EXPERT_WEIGHT) {
+        return false;
+    }
+    auto *        cache     = ggml_sycl::get_unified_cache_for_device(device);
+    const int64_t n_experts = src0->ne[2] > 0 ? src0->ne[2] : 1;
+    if (cache && cache->has_placement_plan()) {
+        if (known) {
+            *known = true;
+        }
+        return cache->moe_tensor_has_host_experts(src0->name ? src0->name : "", n_experts, device);
+    }
+    if (g_has_placement_plan) {
+        if (known) {
+            *known = true;
+        }
+        return g_placement_plan.has_host_experts(src0->name ? src0->name : "", n_experts, device);
+    }
+    return false;
+}
+
 // Returns true if the tensor's weights are host-resident (not in device VRAM).
 // Uses managed_alloc.tier as primary detection (ground truth from allocator,
 // immune to Level Zero get_pointer_type bugs in multi-device contexts).
@@ -12461,18 +12763,22 @@ static bool ggml_sycl_is_host_resident_weight(const ggml_tensor * src0, sycl::qu
     if (src0 && stream) {
         const int device = ggml_sycl_get_device_id_from_queue(*stream);
         if (device >= 0) {
-            if (ggml_sycl_weight_is_planned_on_host(src0, device)) {
-                return true;
-            }
-            // MoE expert weights (_exps composite tensors) have their own cache
-            // management via moe_hybrid_init_once.  The unified cache's resolve
-            // may return on_device=false for composite _exps tensors because
-            // compute_placement_plan packs expert entries after dense weights+KV
-            // and may mark them as host when VRAM budget is exhausted.  Since MoE
-            // hybrid cache manages expert placement independently, skip the resolve
-            // check for MOE_EXPERT_WEIGHT tensors and defer to the placement plan.
             const auto usage = ggml_sycl_get_tensor_usage(src0);
-            if (usage != tensor_usage::MOE_EXPERT_WEIGHT) {
+            // MoE expert weights (_exps composite tensors) have their own cache
+            // management via per-expert smart handles.  The composite tensor's
+            // backing buffer can be the host mmap source even when every expert
+            // is planned and materialized in VRAM.  Therefore the CPU-island
+            // gate must consult expert placement, not composite buffer tier.
+            if (usage == tensor_usage::MOE_EXPERT_WEIGHT) {
+                bool       plan_known    = false;
+                const bool plan_has_host = ggml_sycl_moe_plan_has_host_experts(src0, device, &plan_known);
+                if (plan_known) {
+                    return plan_has_host;
+                }
+            } else {
+                if (ggml_sycl_weight_is_planned_on_host(src0, device)) {
+                    return true;
+                }
                 auto resolved = ggml_sycl_resolve(src0, device);
                 if (resolved) {
                     return !resolved.on_device;
@@ -12824,19 +13130,27 @@ static enum ggml_status ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer
             layout_mode  planned_layout = layout_policy::get_with_override(tensor->type, usage, ctx->device);
             planned_layout              = ggml_sycl_adjust_layout_for_tensor(tensor, planned_layout, ctx->device);
             const char * reason         = "policy";
-            if (tensor->type == GGML_TYPE_MXFP4 && caps.supported && caps.supports_int8 &&
-                planned_layout == GGML_LAYOUT_SOA) {
-                reason = "xmx-int8-capability-shared-soa";
-            } else if (tensor->type == GGML_TYPE_MXFP4 && planned_layout == GGML_LAYOUT_COALESCED) {
-                reason = "mmvq-coalesced-compatible";
+            const char * executor       = "policy";
+            if (tensor->type == GGML_TYPE_MXFP4) {
+                const auto & dinfo  = ggml_sycl_info().devices[ctx->device];
+                const auto   policy = ggml_sycl_make_moe_device_policy(
+                    caps, ctx->device, dinfo.total_vram, dinfo.free_vram_at_init, dinfo.max_alloc_size,
+                    dinfo.safe_max_alloc_size, /*vram_budget=*/0, /*weight_budget=*/0, /*arena_total=*/0,
+                    /*arena_scratch=*/0, /*arena_runtime=*/0, /*arena_onednn=*/0, tensor->ne[0], tensor->ne[1],
+                    tensor->ne[2] > 0 ? tensor->ne[2] : 1, /*device_resident=*/true,
+                    /*tiled_kernel_validated=*/false);
+                planned_layout =
+                    ggml_sycl_adjust_layout_for_tensor(tensor, policy.mxfp4_device_layout.layout, ctx->device);
+                reason   = policy.mxfp4_device_layout.reason;
+                executor = policy.device_executor;
             }
             GGML_LOG_INFO(
                 "[MOE-LAYOUT] tensor=%s device=%d residency=device-buffer type=%s shape=[%lld,%lld,%lld] "
-                "layout=%s reason=%s xmx=%d int8=%d slm=%zu tile_m=%d tile_n=%d coalesced_ok=%d\n",
+                "layout=%s reason=%s executor=%s xmx=%d int8=%d slm=%zu tile_m=%d tile_n=%d coalesced_ok=%d\n",
                 tensor->name ? tensor->name : "?", ctx->device, ggml_type_name(tensor->type), (long long) tensor->ne[0],
                 (long long) tensor->ne[1], (long long) tensor->ne[2], ggml_sycl_layout_mode_name(planned_layout),
-                reason, caps.supported ? 1 : 0, caps.supports_int8 ? 1 : 0, caps.slm_size, caps.optimal_tiles_m,
-                caps.optimal_tiles_n, ggml_sycl_layout_supports_coalesced(tensor) ? 1 : 0);
+                reason, executor, caps.supported ? 1 : 0, caps.supports_int8 ? 1 : 0, caps.slm_size,
+                caps.optimal_tiles_m, caps.optimal_tiles_n, ggml_sycl_layout_supports_coalesced(tensor) ? 1 : 0);
         }
 
         GGML_SYCL_DEBUG("[SOA-DEBUG] init_tensor: %s type=%d allocated extra=%p reorder_mode=%d (total=%zu)\n",
@@ -12899,6 +13213,7 @@ static void reorder_q4_k_cpu(void * dst_soa, const void * src_aos, size_t nblock
 static void reorder_q6_k_cpu(void * dst_soa, const void * src_aos, size_t nblocks);
 static bool reorder_q6_k_coalesced_cpu(void * dst_coalesced, const void * src_aos, int ncols, int nrows);
 static void reorder_mxfp4_cpu(void * dst_soa, const void * src_aos, int ncols, int nrows);
+static void reorder_mxfp4_i8_cpu(void * dst_i8, const void * src_aos, int ncols, int nrows);
 
 static bool reorder_mxfp4_coalesced_cpu(void * dst_coalesced, const void * src_aos, int ncols, int nrows);
 
@@ -13294,18 +13609,29 @@ static layout_mode ggml_sycl_select_moe_gpu_layout(const ggml_tensor * src0, int
     layout_mode  target = layout_policy::get_with_override(src0->type, ggml_sycl_get_tensor_usage(src0), device);
 
     if (src0->type == GGML_TYPE_MXFP4) {
-        if (ggml_sycl_xmx_tiled_enabled_for_device(device)) {
+        XMXCapabilities caps{};
+        size_t          total_vram          = 0;
+        size_t          free_vram_at_init   = 0;
+        size_t          max_alloc_size      = 0;
+        size_t          safe_max_alloc_size = 0;
+        if (device >= 0 && device < ggml_sycl_info().device_count) {
+            const auto & dinfo  = ggml_sycl_info().devices[device];
+            caps                = dinfo.xmx_caps;
+            total_vram          = dinfo.total_vram;
+            free_vram_at_init   = dinfo.free_vram_at_init;
+            max_alloc_size      = dinfo.max_alloc_size;
+            safe_max_alloc_size = dinfo.safe_max_alloc_size;
+        }
+        const auto policy = ggml_sycl_make_moe_device_policy(
+            caps, device, total_vram, free_vram_at_init, max_alloc_size, safe_max_alloc_size, /*vram_budget=*/0,
+            /*weight_budget=*/0, /*arena_total=*/0, /*arena_scratch=*/0, /*arena_runtime=*/0, /*arena_onednn=*/0,
+            src0->ne[0], src0->ne[1], src0->ne[2] > 0 ? src0->ne[2] : 1, /*device_resident=*/true,
+            /*tiled_kernel_validated=*/false);
+        target = policy.mxfp4_device_layout.layout;
+        reason = policy.mxfp4_device_layout.reason;
+        if (ggml_sycl_xmx_tiled_enabled_for_device(device) && policy.mxfp4_device_layout.tiled_eligible) {
             target = GGML_LAYOUT_XMX_TILED;
-            reason = "xmx-tiled-env-and-capability";
-        } else if (ggml_sycl_xmx_moe_capable_for_device(device)) {
-            target = GGML_LAYOUT_SOA;
-            reason = "xmx-int8-capability-shared-soa";
-        } else if (ggml_sycl_layout_supports_coalesced(src0)) {
-            target = GGML_LAYOUT_COALESCED;
-            reason = "mmvq-coalesced-compatible";
-        } else {
-            target = GGML_LAYOUT_SOA;
-            reason = "mmvq-soa-fallback";
+            reason = "xmx-tiled-forced-diagnostic";
         }
     }
 
@@ -13367,6 +13693,19 @@ static bool ggml_sycl_layout_supports_soa(ggml_type type) {
     }
 }
 
+static bool ggml_sycl_moe_mmvq_batched_supports_layout(ggml_type type, layout_mode layout) {
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q8_0:
+            return layout == GGML_LAYOUT_AOS;
+        case GGML_TYPE_MXFP4:
+            return layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED ||
+                   layout == GGML_LAYOUT_MXFP4_I8;
+        default:
+            return false;
+    }
+}
+
 // ggml_sycl_layout_supports_coalesced is now defined in common.hpp
 // as a static inline function, accessible to all SYCL backend TUs.
 
@@ -13410,6 +13749,20 @@ layout_mode ggml_sycl_adjust_layout_for_tensor(const ggml_tensor * tensor, layou
         resolved = GGML_LAYOUT_SOA;
     }
 
+    if (resolved == GGML_LAYOUT_MXFP4_I8) {
+        bool ok = tensor->type == GGML_TYPE_MXFP4 && (tensor->ne[0] % QK_MXFP4) == 0;
+        if (ok) {
+            ok = device >= 0 && device < ggml_sycl_info().device_count;
+        }
+        if (ok) {
+            const auto & caps = ggml_sycl_info().devices[device].xmx_caps;
+            ok                = caps.supports_int8 && xmx_capabilities_support_sub_group(caps, 16);
+        }
+        if (!ok) {
+            resolved = GGML_LAYOUT_SOA;
+        }
+    }
+
     if (resolved == GGML_LAYOUT_XMX_GEMM_TILED) {
 #if defined(GGML_SYCL_XMX_GEMM) && defined(GGML_SYCL_MMQ_XMX)
         bool xmx_ok = g_ggml_sycl_use_xmx_gemm != 0;
@@ -13451,6 +13804,12 @@ layout_mode ggml_sycl_adjust_layout_for_tensor(const ggml_tensor * tensor, layou
 layout_mode ggml_sycl_select_moe_mmvq_layout(const ggml_tensor * src0, int device, bool host_weights) {
     const char * reason   = nullptr;
     layout_mode  resolved = ggml_sycl_select_moe_gpu_layout(src0, device, &reason);
+    if (src0 && (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0)) {
+        // The q4_0/q8_0 MoE MMVQ-ID kernels consume AoS expert blocks. They do
+        // not have a reordered SOA/coalesced variant; choosing SOA here creates
+        // valid unified-cache handles for data the kernel then misinterprets.
+        resolved = GGML_LAYOUT_AOS;
+    }
     if (resolved == GGML_LAYOUT_XMX_TILED) {
         // MMVQ does not support XMX tiled layouts.
         resolved = ggml_sycl_adjust_layout_for_tensor(src0, GGML_LAYOUT_COALESCED, device);
@@ -13471,16 +13830,24 @@ layout_mode ggml_sycl_select_moe_mmvq_layout(const ggml_tensor * src0, int devic
             should_log = logged.insert(key).second;
         }
         if (should_log) {
-            XMXCapabilities caps{};
+            XMXCapabilities   caps{};
+            moe_device_policy policy{};
             if (device >= 0 && device < ggml_sycl_info().device_count) {
-                caps = ggml_sycl_info().devices[device].xmx_caps;
+                const auto & dinfo = ggml_sycl_info().devices[device];
+                caps               = dinfo.xmx_caps;
+                policy             = ggml_sycl_make_moe_device_policy(
+                    caps, device, dinfo.total_vram, dinfo.free_vram_at_init, dinfo.max_alloc_size,
+                    dinfo.safe_max_alloc_size, /*vram_budget=*/0, /*weight_budget=*/0, /*arena_total=*/0,
+                    /*arena_scratch=*/0, /*arena_runtime=*/0, /*arena_onednn=*/0, src0->ne[0], src0->ne[1],
+                    src0->ne[2] > 0 ? src0->ne[2] : 1, !host_weights, /*tiled_kernel_validated=*/false);
             }
             GGML_LOG_INFO(
                 "[MOE-LAYOUT] tensor=%s device=%d residency=%s type=%s shape=[%lld,%lld,%lld] "
-                "layout=%s reason=%s xmx=%d int8=%d slm=%zu tile_m=%d tile_n=%d coalesced_ok=%d\n",
+                "layout=%s reason=%s executor=%s xmx=%d int8=%d slm=%zu tile_m=%d tile_n=%d coalesced_ok=%d\n",
                 src0->name ? src0->name : "?", device, host_weights ? "host-source-planned" : "device-resident",
                 ggml_type_name(src0->type), (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2],
-                ggml_sycl_layout_mode_name(final_layout), reason ? reason : "policy", caps.supported ? 1 : 0,
+                ggml_sycl_layout_mode_name(final_layout), reason ? reason : "policy",
+                policy.device_executor ? policy.device_executor : "policy", caps.supported ? 1 : 0,
                 caps.supports_int8 ? 1 : 0, caps.slm_size, caps.optimal_tiles_m, caps.optimal_tiles_n,
                 ggml_sycl_layout_supports_coalesced(src0) ? 1 : 0);
         }
@@ -13488,12 +13855,52 @@ layout_mode ggml_sycl_select_moe_mmvq_layout(const ggml_tensor * src0, int devic
     return final_layout;
 }
 
+static layout_mode ggml_sycl_select_moe_decode_down_layout(const ggml_tensor * src0, int device, int64_t n_tokens) {
+    if (!src0 || src0->type != GGML_TYPE_MXFP4 || moe_classify_tensor(src0->name) != MOE_TENSOR_DOWN) {
+        return ggml_sycl_adjust_layout_for_tensor(src0, GGML_LAYOUT_SOA, device);
+    }
+
+    // MXFP4_I8 is a planner-owned/materialized layout, not a per-token probe.
+    // Scanning or staging selected experts here regresses TG and can leave mixed
+    // pointer-table state. Singleton decode still stays on SOA until the I8 TG
+    // path is proven end-to-end; grouped/PP work can use a planner-promoted I8
+    // tensor because it amortizes the larger materialized layout.
+    if (n_tokens <= 1) {
+        return ggml_sycl_adjust_layout_for_tensor(src0, GGML_LAYOUT_SOA, device);
+    }
+
+    const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+    if (extra && get_effective_layout_mode(extra) == GGML_LAYOUT_MXFP4_I8) {
+        return ggml_sycl_adjust_layout_for_tensor(src0, GGML_LAYOUT_MXFP4_I8, device);
+    }
+
+    return ggml_sycl_adjust_layout_for_tensor(src0, GGML_LAYOUT_SOA, device);
+}
+
 static layout_mode ggml_sycl_select_moe_grouped_pp_layout(const ggml_tensor * src0,
                                                           int                 device,
                                                           bool                host_weights,
                                                           int64_t             n_tokens) {
+    if (src0 && src0->type == GGML_TYPE_MXFP4 && moe_classify_tensor(src0->name) == MOE_TENSOR_DOWN) {
+        return ggml_sycl_select_moe_decode_down_layout(src0, device, n_tokens);
+    }
     (void) n_tokens;
     return ggml_sycl_select_moe_mmvq_layout(src0, device, host_weights);
+}
+
+static layout_mode ggml_sycl_select_moe_expert_cache_layout(const ggml_tensor * src0, int device, int64_t n_tokens) {
+    if (src0 && src0->type == GGML_TYPE_MXFP4 && moe_classify_tensor(src0->name) == MOE_TENSOR_DOWN) {
+        return ggml_sycl_select_moe_decode_down_layout(src0, device, n_tokens);
+    }
+
+    layout_mode resolved = ggml_sycl_select_moe_gpu_layout(src0, device, nullptr);
+    if (src0 && (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0)) {
+        return GGML_LAYOUT_AOS;
+    }
+    if (resolved == GGML_LAYOUT_XMX_TILED) {
+        resolved = ggml_sycl_adjust_layout_for_tensor(src0, GGML_LAYOUT_COALESCED, device);
+    }
+    return resolved;
 }
 
 static layout_mode ggml_sycl_select_moe_graph_layout(const ggml_tensor * src0, int device, bool host_weights) {
@@ -13512,6 +13919,122 @@ static layout_mode ggml_sycl_select_moe_graph_layout(const ggml_tensor * src0, i
     }
 
     return ggml_sycl_select_moe_mmvq_layout(src0, device, host_weights);
+}
+
+struct moe_planned_layout_probe {
+    bool   ok        = false;
+    size_t local     = 0;
+    size_t secondary = 0;
+    size_t host      = 0;
+    size_t missing   = 0;
+};
+
+static void ggml_sycl_add_moe_layout_candidate(std::vector<layout_mode> & candidates,
+                                               const ggml_tensor *        src0,
+                                               int                        device,
+                                               layout_mode                layout) {
+    const layout_mode adjusted = ggml_sycl_adjust_layout_for_tensor(src0, layout, device);
+    if (std::find(candidates.begin(), candidates.end(), adjusted) == candidates.end()) {
+        candidates.push_back(adjusted);
+    }
+}
+
+static moe_planned_layout_probe ggml_sycl_probe_moe_planned_layout(const ggml_tensor * src0,
+                                                                   int                 device,
+                                                                   layout_mode         layout) {
+    moe_planned_layout_probe probe{};
+    if (!src0) {
+        probe.missing = 1;
+        return probe;
+    }
+
+    const int64_t n_experts = src0->ne[2] > 0 ? src0->ne[2] : 1;
+    for (int64_t e = 0; e < n_experts; ++e) {
+        ggml_sycl::moe_expert_route route =
+            ggml_sycl::ggml_sycl_resolve_moe_expert_route(src0, device, static_cast<int>(e), layout);
+        if (route.kind == ggml_sycl::moe_expert_route_kind::LOCAL_DEVICE && route.ptr &&
+            route.actual_layout == layout) {
+            probe.local++;
+            continue;
+        }
+        if (route.kind == ggml_sycl::moe_expert_route_kind::SECONDARY_DEVICE && route.ptr &&
+            route.actual_layout == layout) {
+            probe.secondary++;
+            continue;
+        }
+        if (route.kind == ggml_sycl::moe_expert_route_kind::HOST && route.ptr) {
+            // Host-planned experts are resolved as host AoS handles. They do not
+            // need, and must not invent, a current-device pointer-table slot.
+            probe.host++;
+            continue;
+        }
+        probe.missing++;
+        if (route.plan_found && route.planned_device_residency) {
+            break;
+        }
+    }
+
+    probe.ok = probe.missing == 0;
+    return probe;
+}
+
+static layout_mode ggml_sycl_select_moe_planned_graph_layout(const ggml_tensor * src0,
+                                                             int                 device,
+                                                             bool                host_weights,
+                                                             int64_t             n_tokens) {
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
+    if (!cache || !cache->has_placement_plan()) {
+        return ggml_sycl_select_moe_graph_layout(src0, device, host_weights);
+    }
+
+    std::vector<layout_mode> candidates;
+    ggml_sycl_add_moe_layout_candidate(candidates, src0, device,
+                                       ggml_sycl_select_moe_expert_cache_layout(src0, device, n_tokens));
+    ggml_sycl_add_moe_layout_candidate(candidates, src0, device,
+                                       ggml_sycl_select_moe_graph_layout(src0, device, host_weights));
+    ggml_sycl_add_moe_layout_candidate(candidates, src0, device,
+                                       ggml_sycl_select_moe_gpu_layout(src0, device, nullptr));
+    if (src0 && src0->type == GGML_TYPE_MXFP4) {
+        ggml_sycl_add_moe_layout_candidate(candidates, src0, device, GGML_LAYOUT_SOA);
+        if (moe_classify_tensor(src0->name) == MOE_TENSOR_DOWN) {
+            ggml_sycl_add_moe_layout_candidate(candidates, src0, device, GGML_LAYOUT_MXFP4_I8);
+        }
+        ggml_sycl_add_moe_layout_candidate(candidates, src0, device, GGML_LAYOUT_COALESCED);
+    }
+    ggml_sycl_add_moe_layout_candidate(candidates, src0, device, GGML_LAYOUT_AOS);
+
+    layout_mode              best_layout = candidates.empty() ? GGML_LAYOUT_AOS : candidates.front();
+    moe_planned_layout_probe best_probe{};
+    bool                     have_best = false;
+    for (layout_mode candidate : candidates) {
+        moe_planned_layout_probe probe = ggml_sycl_probe_moe_planned_layout(src0, device, candidate);
+        if (!have_best || probe.local + probe.secondary > best_probe.local + best_probe.secondary ||
+            (probe.local + probe.secondary == best_probe.local + best_probe.secondary &&
+             probe.host > best_probe.host)) {
+            best_layout = candidate;
+            best_probe  = probe;
+            have_best   = true;
+        }
+        if (probe.ok) {
+            if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                fprintf(stderr,
+                        "[GRAPH-MOE-LAYOUT] tensor=%s device=%d plan=1 selected=%s local=%zu secondary=%zu host=%zu "
+                        "missing=%zu host_weights=%d\n",
+                        src0 && src0->name ? src0->name : "?", device, ggml_sycl_layout_mode_name(candidate),
+                        probe.local, probe.secondary, probe.host, probe.missing, host_weights ? 1 : 0);
+            }
+            return candidate;
+        }
+    }
+
+    if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+        fprintf(stderr,
+                "[GRAPH-MOE-LAYOUT] tensor=%s device=%d plan=1 selected=%s local=%zu secondary=%zu host=%zu "
+                "missing=%zu host_weights=%d fallback=best-effort\n",
+                src0 && src0->name ? src0->name : "?", device, ggml_sycl_layout_mode_name(best_layout),
+                best_probe.local, best_probe.secondary, best_probe.host, best_probe.missing, host_weights ? 1 : 0);
+    }
+    return best_layout;
 }
 
 static bool reorder_xmx_gemm_tiled_cpu(void * dst, const void * src, const ggml_sycl_reorder_fill_ctx & ctx) {
@@ -13625,6 +14148,10 @@ static bool ggml_sycl_reorder_weight_cpu(void * dst, const void * src, const ggm
                 return true;
             }
         case GGML_TYPE_MXFP4:
+            if (ctx.layout == GGML_LAYOUT_MXFP4_I8) {
+                reorder_mxfp4_i8_cpu(dst, src, ctx.ncols, ctx.nrows);
+                return true;
+            }
             if (ctx.layout == GGML_LAYOUT_COALESCED) {
                 return reorder_mxfp4_coalesced_cpu(dst, src, ctx.ncols, ctx.nrows);
             }
@@ -13754,7 +14281,7 @@ static sycl::event ggml_sycl_fill_reordered_host(sycl::queue &                  
             (int) ctx->layout, (int) ctx->type, (long long) ctx->ncols, (long long) ctx->nrows);
         std::memcpy(reorder_buf, reorder_src, std::min(dst_size, src_size));
     }
-    if (dst_size > src_size) {
+    if (!ok && dst_size > src_size) {
         std::memset(static_cast<char *>(reorder_buf) + src_size, 0, dst_size - src_size);
     }
     if (!ggml_sycl_check_reorder_guard_dual(static_cast<uint8_t *>(reorder_buf_raw) + k_pre_guard, dst_size,
@@ -14343,13 +14870,9 @@ static void ggml_sycl_drop_non_target_cache_entries(ggml_sycl::unified_cache * c
         return;
     }
     const ggml_layout_mode layouts[] = {
-        GGML_LAYOUT_AOS,
-        GGML_LAYOUT_SOA,
-        GGML_LAYOUT_COALESCED,
-        GGML_LAYOUT_XMX_TILED,
-        GGML_LAYOUT_XMX_GEMM_TILED,
-        GGML_LAYOUT_ONEDNN_PACKED,
-        GGML_LAYOUT_ONEDNN_WOQ,
+        GGML_LAYOUT_AOS,           GGML_LAYOUT_SOA,        GGML_LAYOUT_COALESCED,
+        GGML_LAYOUT_MXFP4_I8,      GGML_LAYOUT_XMX_TILED,  GGML_LAYOUT_XMX_GEMM_TILED,
+        GGML_LAYOUT_ONEDNN_PACKED, GGML_LAYOUT_ONEDNN_WOQ,
 
     };
     for (ggml_layout_mode mode : layouts) {
@@ -14380,13 +14903,9 @@ static void ggml_sycl_drop_all_weight_cache_entries(ggml_sycl::unified_cache * c
     }
 
     const ggml_layout_mode layouts[] = {
-        GGML_LAYOUT_AOS,
-        GGML_LAYOUT_SOA,
-        GGML_LAYOUT_COALESCED,
-        GGML_LAYOUT_XMX_TILED,
-        GGML_LAYOUT_XMX_GEMM_TILED,
-        GGML_LAYOUT_ONEDNN_PACKED,
-        GGML_LAYOUT_ONEDNN_WOQ,
+        GGML_LAYOUT_AOS,           GGML_LAYOUT_SOA,        GGML_LAYOUT_COALESCED,
+        GGML_LAYOUT_MXFP4_I8,      GGML_LAYOUT_XMX_TILED,  GGML_LAYOUT_XMX_GEMM_TILED,
+        GGML_LAYOUT_ONEDNN_PACKED, GGML_LAYOUT_ONEDNN_WOQ,
     };
 
     for (ggml_layout_mode mode : layouts) {
@@ -14417,13 +14936,9 @@ static void ggml_sycl_drop_non_target_expert_entries(ggml_sycl::unified_cache * 
         return;
     }
     const ggml_layout_mode layouts[] = {
-        GGML_LAYOUT_AOS,
-        GGML_LAYOUT_SOA,
-        GGML_LAYOUT_COALESCED,
-        GGML_LAYOUT_XMX_TILED,
-        GGML_LAYOUT_XMX_GEMM_TILED,
-        GGML_LAYOUT_ONEDNN_PACKED,
-        GGML_LAYOUT_ONEDNN_WOQ,
+        GGML_LAYOUT_AOS,           GGML_LAYOUT_SOA,        GGML_LAYOUT_COALESCED,
+        GGML_LAYOUT_MXFP4_I8,      GGML_LAYOUT_XMX_TILED,  GGML_LAYOUT_XMX_GEMM_TILED,
+        GGML_LAYOUT_ONEDNN_PACKED, GGML_LAYOUT_ONEDNN_WOQ,
     };
     for (ggml_layout_mode mode : layouts) {
         if (mode == target) {
@@ -14509,7 +15024,7 @@ static bool ggml_sycl_preload_moe_experts(const ggml_tensor * src0, int device, 
 #endif
     }
     const bool src0_is_device = ggml_sycl_get_alloc_type(src0->data) == sycl::usm::alloc::device;
-    if (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED) {
+    if (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED || layout == GGML_LAYOUT_MXFP4_I8) {
         reorder_ctx.type  = src0->type;
         reorder_ctx.ncols = ncols;
 
@@ -14528,8 +15043,8 @@ static bool ggml_sycl_preload_moe_experts(const ggml_tensor * src0, int device, 
     const std::string tname(src0->name ? src0->name : "");
     const bool        src0_host_accessible = src0->buffer && ggml_backend_buffer_is_host(src0->buffer);
     for (int64_t e = 0; e < n_experts; ++e) {
-        ggml_sycl_cache_id key = ggml_sycl_get_moe_expert_cache_key(src0, extra, static_cast<int>(e));
-        if (!key.valid) {
+        ggml_sycl_cache_id base_key = ggml_sycl_get_moe_expert_cache_key(src0, extra, static_cast<int>(e));
+        if (!base_key.valid) {
             failed++;
             continue;
         }
@@ -14557,8 +15072,8 @@ static bool ggml_sycl_preload_moe_experts(const ggml_tensor * src0, int device, 
                 // expert_aos already lives in the model's host-pinned buffer
                 // (allocated by ggml_backend_sycl_host_buffer_type_alloc_buffer at model load).
                 // Register in-place — no second allocation, no memcpy.
-                cache->register_host_expert(key, const_cast<void *>(static_cast<const void *>(expert_aos)), expert_size,
-                                            GGML_LAYOUT_AOS);
+                cache->register_host_expert(base_key, const_cast<void *>(static_cast<const void *>(expert_aos)),
+                                            expert_size, GGML_LAYOUT_AOS);
                 host_registered++;
                 continue;
             }
@@ -14567,7 +15082,7 @@ static bool ggml_sycl_preload_moe_experts(const ggml_tensor * src0, int device, 
         // Determine fill function for layout conversion
         ggml_sycl::cache_layout_fill_fn fill_fn  = nullptr;
         const void *                    fill_ctx = nullptr;
-        if (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED) {
+        if (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED || layout == GGML_LAYOUT_MXFP4_I8) {
             fill_fn  = ggml_sycl_fill_reordered_host;
             fill_ctx = &reorder_ctx;
         } else if (layout == GGML_LAYOUT_XMX_TILED) {
@@ -14577,8 +15092,9 @@ static bool ggml_sycl_preload_moe_experts(const ggml_tensor * src0, int device, 
 #endif
         }
         // Route H2D to BCS (copy engine) to keep CCS free during MoE preload.
-        sycl::queue * bcs_q  = &cache->get_bcs_queue();
-        auto          result = ggml_sycl::unified_cache_direct_stage_expert(
+        sycl::queue *      bcs_q  = &cache->get_bcs_queue();
+        ggml_sycl_cache_id key    = ggml_sycl_layout_specific_moe_expert_cache_key(base_key, layout);
+        auto               result = ggml_sycl::unified_cache_direct_stage_expert(
             device, key, expert_aos, expert_size, expert_layout_bytes, layout, fill_fn, fill_ctx, bcs_q);
 
         if (result.ok && result.ptr) {
@@ -14752,11 +15268,25 @@ static void ggml_sycl_preload_model_weights() {
             // S1-PRELOAD uses direct_stage_weight/direct_stage_expert which
             // handle arena allocation + fill + lookup registration atomically.
 
-            // Route H2D through BCS (copy-only) queue to keep CCS free.
-            // For 120B models, S1-PRELOAD uploads ~5 GB of attention weights.
-            // Without BCS routing, all H2D memcpy + reorder kernels go to CCS,
-            // which can monopolize the compute engine and trigger GT resets.
-            sycl::queue * bcs_q = &cache->get_bcs_queue();
+            // S1-PRELOAD runs during model load, before inference kernels are
+            // submitted, so correctness and forward progress are more important
+            // than copy/compute engine overlap.  The BCS copy queue remains
+            // useful as a diagnostic opt-in, but defaulting preload to the
+            // device queue avoids Level Zero event waits observed on long
+            // GPT-OSS B50 staging runs.
+            static const bool s1_use_bcs_queue = [] {
+                const char * env = std::getenv("GGML_SYCL_S1_USE_BCS");
+                return env && std::atoi(env) != 0;
+            }();
+            sycl::queue * s1_preload_q = s1_use_bcs_queue ? &cache->get_bcs_queue() : &stream;
+            if (!s1_use_bcs_queue) {
+                static bool logged_s1_queue = false;
+                if (!logged_s1_queue) {
+                    GGML_LOG_INFO(
+                        "[S1-PRELOAD] Using device queue for preload copies (BCS opt-in via GGML_SYCL_S1_USE_BCS=1)\n");
+                    logged_s1_queue = true;
+                }
+            }
 
             // Sliding event window: bound in-flight BCS commands to prevent
             // DirectSubmission ring buffer saturation.  Each queue.memcpy()
@@ -14846,7 +15376,8 @@ static void ggml_sycl_preload_model_weights() {
                     const void *                    fill_ctx = nullptr;
                     ggml_sycl_reorder_fill_ctx      reorder_ctx{};
                     ggml_sycl_xmx_tiled_fill_ctx    tiled_ctx{};
-                    if (preload_layout == GGML_LAYOUT_SOA || preload_layout == GGML_LAYOUT_COALESCED) {
+                    if (preload_layout == GGML_LAYOUT_SOA || preload_layout == GGML_LAYOUT_COALESCED ||
+                        preload_layout == GGML_LAYOUT_MXFP4_I8) {
                         reorder_ctx.type          = tensor->type;
                         reorder_ctx.ncols         = ncols;
                         reorder_ctx.nrows         = nrows;
@@ -14871,7 +15402,9 @@ static void ggml_sycl_preload_model_weights() {
 #endif
                     }
 
-                    const bool tensor_host_accessible = tensor->buffer && ggml_backend_buffer_is_host(tensor->buffer);
+                    const sycl::usm::alloc tensor_src_alloc =
+                        tensor->data ? ggml_sycl_get_alloc_type(tensor->data) : sycl::usm::alloc::unknown;
+                    const bool tensor_source_is_device = tensor_src_alloc == sycl::usm::alloc::device;
 
                     bool any_cached         = false;
                     bool logged_host_layout = false;
@@ -14898,8 +15431,7 @@ static void ggml_sycl_preload_model_weights() {
                                         ggml_sycl_layout_mode_name(GGML_LAYOUT_AOS));
                                     logged_host_layout = true;
                                 }
-                                // Skip if tensor data is device-resident (already on device).
-                                if (!tensor_host_accessible) {
+                                if (!tensor->data) {
                                     continue;
                                 }
                                 const uint8_t * expert_aos =
@@ -14927,7 +15459,11 @@ static void ggml_sycl_preload_model_weights() {
                                         arena_ptr = nullptr;  // Don't memcpy into partial segment
                                     }
                                     if (arena_ptr) {
-                                        std::memcpy(arena_ptr, expert_aos, expert_size);
+                                        if (tensor_source_is_device) {
+                                            stream.memcpy(arena_ptr, expert_aos, expert_size).wait();
+                                        } else {
+                                            std::memcpy(arena_ptr, expert_aos, expert_size);
+                                        }
                                         ggml_sycl_cache_id key =
                                             ggml_sycl_get_moe_expert_cache_key(tensor, extra, static_cast<int>(e));
                                         if (key.valid) {
@@ -14952,20 +15488,26 @@ static void ggml_sycl_preload_model_weights() {
                             }
                         }
 
-                        // Skip device-resident experts — already on device, no host staging needed.
-                        if (!tensor_host_accessible) {
+                        // The full tensor may already be device-resident, but the planner-selected
+                        // per-expert layout still belongs in the unified cache at model load.
+                        if (!tensor->data) {
                             continue;
                         }
 
                         const uint8_t *    expert_aos = static_cast<const uint8_t *>(tensor->data) + e * expert_size;
-                        ggml_sycl_cache_id key = ggml_sycl_get_moe_expert_cache_key(tensor, extra, static_cast<int>(e));
+                        ggml_sycl_cache_id key        = ggml_sycl_layout_specific_moe_expert_cache_key(
+                            ggml_sycl_get_moe_expert_cache_key(tensor, extra, static_cast<int>(e)), preload_layout);
                         if (!expert_aos || !key.valid) {
                             continue;
                         }
 
+                        if (preload_layout == GGML_LAYOUT_SOA || preload_layout == GGML_LAYOUT_COALESCED ||
+                            preload_layout == GGML_LAYOUT_MXFP4_I8) {
+                            reorder_ctx.src_is_device = tensor_source_is_device;
+                        }
                         auto result = ggml_sycl::unified_cache_direct_stage_expert(device, key, expert_aos, expert_size,
                                                                                    expert_layout_bytes, preload_layout,
-                                                                                   fill_fn, fill_ctx, bcs_q);
+                                                                                   fill_fn, fill_ctx, s1_preload_q);
                         if (result.ok && result.ptr) {
                             any_cached = true;
                             total_bytes += expert_layout_bytes;
@@ -15123,8 +15665,9 @@ static void ggml_sycl_preload_model_weights() {
                         fill_ctx = &reorder_ctx;
                     }
 
-                    auto result = ggml_sycl::unified_cache_direct_stage_weight(
-                        device, cache_key, src_ptr, src_size, dst_size, preload_layout, fill_fn, fill_ctx, bcs_q);
+                    auto result =
+                        ggml_sycl::unified_cache_direct_stage_weight(device, cache_key, src_ptr, src_size, dst_size,
+                                                                     preload_layout, fill_fn, fill_ctx, s1_preload_q);
                     if (result.ok && result.ptr) {
                         dense_cached++;
                         total_bytes += dst_size;
@@ -15167,6 +15710,198 @@ static void ggml_sycl_preload_model_weights() {
 
             // Process deferred frees after all DMA is complete
             cache->process_deferred_frees_public();
+
+            static const bool s1_mxfp4_i8_down_enabled = [] {
+                const char * env = std::getenv("GGML_SYCL_MXFP4_I8_DOWN");
+                return !env || std::atoi(env) != 0;
+            }();
+            size_t i8_down_tensors          = 0;
+            size_t i8_down_experts          = 0;
+            size_t i8_down_net_bytes        = 0;
+            size_t i8_down_skipped_capacity = 0;
+            size_t i8_down_failed           = 0;
+            if (s1_mxfp4_i8_down_enabled) {
+                size_t i8_headroom = 512ull * 1024ull * 1024ull;
+                if (const char * env = std::getenv("GGML_SYCL_MXFP4_I8_HEADROOM_MB")) {
+                    i8_headroom = std::max<size_t>(128ull * 1024ull * 1024ull,
+                                                   static_cast<size_t>(std::atoi(env)) * 1024ull * 1024ull);
+                }
+
+                for (size_t idx : indices) {
+                    const auto & item   = items[idx];
+                    const auto * tensor = item.tensor;
+                    if (!item.is_moe || !tensor || tensor->type != GGML_TYPE_MXFP4 ||
+                        moe_classify_tensor(tensor->name) != MOE_TENSOR_DOWN || !tensor->data) {
+                        continue;
+                    }
+                    auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
+                    if (!extra) {
+                        continue;
+                    }
+                    const int64_t n_experts = tensor->ne[2] > 0 ? tensor->ne[2] : 1;
+                    if (n_experts <= 0) {
+                        continue;
+                    }
+                    const std::string tname(tensor->name ? tensor->name : "");
+                    const bool        have_plan        = cache->has_placement_plan() && !tname.empty();
+                    bool              all_local_device = true;
+                    if (have_plan) {
+                        for (int64_t e = 0; e < n_experts; ++e) {
+                            const auto placement =
+                                cache->get_placement_plan().lookup_expert_placement(tname, static_cast<int>(e));
+                            if (!placement.found() || !placement.on_device || placement.target_device != device) {
+                                all_local_device = false;
+                                break;
+                            }
+                        }
+                    }
+                    if (!all_local_device) {
+                        continue;
+                    }
+
+                    const int64_t ncols = tensor->ne[0];
+                    const int64_t nrows = tensor->ne[1];
+                    if (ggml_sycl_adjust_layout_for_tensor(tensor, GGML_LAYOUT_MXFP4_I8, device) !=
+                        GGML_LAYOUT_MXFP4_I8) {
+                        continue;
+                    }
+                    const size_t expert_i8_bytes =
+                        ggml_sycl_layout_bytes_for_dims(tensor->type, ncols, nrows, GGML_LAYOUT_MXFP4_I8, device);
+                    if (expert_i8_bytes == 0) {
+                        continue;
+                    }
+
+                    const layout_mode base_layout = ggml_sycl_adjust_layout_for_tensor(
+                        tensor, ggml_sycl_select_moe_gpu_layout(tensor, device, nullptr), device);
+                    size_t expert_base_bytes = tensor->nb[2];
+                    if (base_layout == GGML_LAYOUT_AOS) {
+                        expert_base_bytes = ggml_sycl_get_padded_weight_bytes(tensor->type, ncols, tensor->nb[2]);
+                    } else {
+                        const size_t layout_bytes =
+                            ggml_sycl_layout_bytes_for_dims(tensor->type, ncols, nrows, base_layout, device);
+                        if (layout_bytes != 0) {
+                            expert_base_bytes = layout_bytes;
+                        }
+                    }
+
+                    const size_t tensor_i8_bytes         = expert_i8_bytes * static_cast<size_t>(n_experts);
+                    size_t       tensor_i8_missing_bytes = 0;
+                    for (int64_t e = 0; e < n_experts; ++e) {
+                        ggml_sycl_cache_id key = ggml_sycl_layout_specific_moe_expert_cache_key(
+                            ggml_sycl_get_moe_expert_cache_key(tensor, extra, static_cast<int>(e)),
+                            GGML_LAYOUT_MXFP4_I8);
+                        if (!key.valid) {
+                            continue;
+                        }
+                        const ggml_sycl::weight_entry * existing = ggml_sycl::unified_cache_lookup_expert(device, key);
+                        if (!existing || existing->location != ggml_sycl::cache_location::DEVICE ||
+                            existing->layout != GGML_LAYOUT_MXFP4_I8 || existing->size < expert_i8_bytes) {
+                            tensor_i8_missing_bytes += expert_i8_bytes;
+                        }
+                    }
+                    if (tensor_i8_missing_bytes == 0) {
+                        continue;
+                    }
+                    const size_t required_available = i8_headroom + std::max(tensor_i8_missing_bytes, expert_i8_bytes);
+                    if (cache->zone_available(ggml_sycl::vram_zone_id::WEIGHT) < required_available ||
+                        cache->zone_largest_free(ggml_sycl::vram_zone_id::WEIGHT) < expert_i8_bytes) {
+                        i8_down_skipped_capacity++;
+                        continue;
+                    }
+
+                    ggml_sycl_reorder_fill_ctx reorder_ctx{};
+                    reorder_ctx.type          = tensor->type;
+                    reorder_ctx.ncols         = ncols;
+                    reorder_ctx.nrows         = nrows;
+                    reorder_ctx.nbytes        = tensor->nb[2];
+                    reorder_ctx.dst_bytes     = expert_i8_bytes;
+                    reorder_ctx.layout        = GGML_LAYOUT_MXFP4_I8;
+                    reorder_ctx.src_is_device = ggml_sycl_get_alloc_type(tensor->data) == sycl::usm::alloc::device;
+                    reorder_ctx.device_id     = device;
+
+                    std::vector<int> staged_experts;
+                    staged_experts.reserve(static_cast<size_t>(n_experts));
+                    bool all_staged = true;
+                    for (int64_t e = 0; e < n_experts; ++e) {
+                        const uint8_t *    expert_aos = static_cast<const uint8_t *>(tensor->data) + e * tensor->nb[2];
+                        ggml_sycl_cache_id key        = ggml_sycl_layout_specific_moe_expert_cache_key(
+                            ggml_sycl_get_moe_expert_cache_key(tensor, extra, static_cast<int>(e)),
+                            GGML_LAYOUT_MXFP4_I8);
+                        if (!expert_aos || !key.valid) {
+                            all_staged = false;
+                            break;
+                        }
+                        auto result = ggml_sycl::unified_cache_direct_stage_expert(
+                            device, key, expert_aos, tensor->nb[2], expert_i8_bytes, GGML_LAYOUT_MXFP4_I8,
+                            ggml_sycl_fill_reordered_host, &reorder_ctx, s1_preload_q);
+                        if (!result.ok || !result.ptr) {
+                            all_staged = false;
+                            break;
+                        }
+                        staged_experts.push_back(static_cast<int>(e));
+                        s1_in_flight.push_back(result.event);
+                        while (s1_in_flight.size() >= s1_max_in_flight) {
+                            s1_in_flight.front().wait();
+                            s1_in_flight.pop_front();
+                            s1_drain_count++;
+                            if (s1_drain_count % s1_max_in_flight == 0) {
+                                cache->process_deferred_frees_public();
+                                ggml_sycl_watchdog_heartbeat();
+                            }
+                        }
+                    }
+
+                    if (!all_staged || staged_experts.size() != static_cast<size_t>(n_experts)) {
+                        i8_down_failed++;
+                        for (int e : staged_experts) {
+                            const uint8_t * expert_aos =
+                                static_cast<const uint8_t *>(tensor->data) + static_cast<size_t>(e) * tensor->nb[2];
+                            ggml_sycl_cache_id key = ggml_sycl_get_moe_expert_cache_key(tensor, extra, e);
+                            if (!expert_aos || !key.valid) {
+                                continue;
+                            }
+                            ggml_sycl_reorder_fill_ctx rollback_ctx = reorder_ctx;
+                            rollback_ctx.dst_bytes                  = expert_base_bytes;
+                            rollback_ctx.layout                     = base_layout;
+                            auto rollback                           = ggml_sycl::unified_cache_direct_stage_expert(
+                                device, key, expert_aos, tensor->nb[2], expert_base_bytes, base_layout,
+                                ggml_sycl_fill_reordered_host, &rollback_ctx, s1_preload_q);
+                            if (rollback.ok && rollback.ptr) {
+                                s1_in_flight.push_back(rollback.event);
+                            }
+                        }
+                        continue;
+                    }
+
+                    extra->layout.mode        = GGML_LAYOUT_MXFP4_I8;
+                    extra->layout.data_ptr    = nullptr;
+                    extra->layout.size        = tensor_i8_bytes;
+                    extra->layout.owns_memory = false;
+                    extra->layout.device_id   = device;
+                    extra->layout.qtype       = tensor->type;
+                    extra->layout.n_elements  = ggml_nelements(tensor);
+                    extra->layout.n_experts   = n_experts;
+
+                    i8_down_tensors++;
+                    i8_down_experts += static_cast<size_t>(n_experts);
+                    i8_down_net_bytes += tensor_i8_missing_bytes;
+                }
+
+                for (auto & evt : s1_in_flight) {
+                    evt.wait();
+                }
+                s1_in_flight.clear();
+                cache->process_deferred_frees_public();
+                if (i8_down_tensors > 0 || i8_down_skipped_capacity > 0 || i8_down_failed > 0) {
+                    GGML_LOG_INFO(
+                        "[S1-PRELOAD] MXFP4_I8 down promotion: tensors=%zu experts=%zu net_extra=%.1f MB "
+                        "skipped_capacity=%zu failed=%zu headroom=%.1f MB\n",
+                        i8_down_tensors, i8_down_experts, i8_down_net_bytes / (1024.0 * 1024.0),
+                        i8_down_skipped_capacity, i8_down_failed, i8_headroom / (1024.0 * 1024.0));
+                }
+                weight_device_bytes[device] += i8_down_net_bytes;
+                total_bytes += i8_down_net_bytes;
+            }
 
             // Replace each tensor's DIRECT handle (host-pinned pointer from
             // model load) with a WEIGHT handle that resolves through the cache.
@@ -15391,14 +16126,14 @@ void * ggml_sycl_get_weight_layout_ptr(const ggml_tensor * tensor, int device, l
     const bool strict_aos = ggml_sycl_unified_dispatch_enabled() && ggml_sycl::should_use_unified(tensor->type) &&
                             target == GGML_LAYOUT_AOS;
     layout_mode resolved = strict_aos ? GGML_LAYOUT_AOS : ggml_sycl_adjust_layout_for_tensor(tensor, target, device);
-    const bool  host_layout_supported =
-        (resolved == GGML_LAYOUT_AOS || resolved == GGML_LAYOUT_SOA || resolved == GGML_LAYOUT_COALESCED ||
-         resolved == GGML_LAYOUT_XMX_GEMM_TILED || resolved == GGML_LAYOUT_XMX_TILED);
+    const bool  host_layout_supported = (resolved == GGML_LAYOUT_AOS || resolved == GGML_LAYOUT_SOA ||
+                                        resolved == GGML_LAYOUT_COALESCED || resolved == GGML_LAYOUT_MXFP4_I8 ||
+                                        resolved == GGML_LAYOUT_XMX_GEMM_TILED || resolved == GGML_LAYOUT_XMX_TILED);
     // Only prefer host placement when VRAM budget is actually exceeded AND GPU
     // streaming is the fallback (no CPU offload). When the model fits in VRAM,
     // let the cache upload everything to device for maximum performance.
     // GGML_SYCL_FORCE_VRAM=1 overrides this to always prefer VRAM (for debugging).
-    bool prefer_host_default = ggml_backend_sycl_weights_evictable() && !src_is_device &&
+    bool        prefer_host_default   = ggml_backend_sycl_weights_evictable() && !src_is_device &&
                                ggml_sycl::unified_cache_is_budget_exceeded(device) && !ggml_sycl_force_vram_enabled() &&
                                !ggml_sycl_cpu_offload_available();
     // For reordered/tiled layouts, prefer device placement to avoid non-USM host pointers
@@ -16075,9 +16810,10 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     // handle AOS tensors on-demand during inference, checking live free memory
     // to avoid OOM when KV cache and other buffers compete for VRAM.
     //
-    // MoE expert weights are ALSO deferred: they stay AOS in host memory and get
-    // SOA-converted on-demand by the expert cache when promoted to VRAM.  Eagerly
-    // reordering 59 GB of experts (120B model) would take minutes and double RAM.
+    // MoE expert weights are materialized per expert by the placement-plan preload
+    // pass, where residency is known.  Keep set_tensor limited to registering the
+    // source AoS tensor; host-planned experts stay AoS, device-planned experts get
+    // the selected GPU layout during preload.
     const bool is_moe_expert         = (usage == tensor_usage::MOE_EXPERT_WEIGHT);
     // When the model buffer is host-pinned (model too large for VRAM), defer
     // layout materialization to inference time.  Eagerly materializing device
@@ -17486,6 +18222,9 @@ static void tiered_kv_buffer_free(ggml_backend_buffer_t buffer) {
     // Per-layer allocs from vmem are sub-ranges of the virtual address space and must NOT
     // be individually freed.
     if (ctx->vmem_pool) {
+        for (auto & la : ctx->layer_allocs) {
+            ggml_sycl_fattn_xmx_unregister_packed_k_range(la.ptr, la.size);
+        }
         ctx->vmem_pool->destroy();
         ctx->vmem_pool.reset();
         // alloc_base was the vmem virtual address — already freed by vmem_pool.destroy()
@@ -17501,6 +18240,7 @@ static void tiered_kv_buffer_free(ggml_backend_buffer_t buffer) {
     // Arena-sourced layers are freed individually via zone_free (TLSF coalesces
     // adjacent blocks automatically).  Non-arena layers use unified_cache_deallocate.
     for (auto & la : ctx->layer_allocs) {
+        ggml_sycl_fattn_xmx_unregister_packed_k_range(la.ptr, la.size);
         if (la.ptr && la.zone_h.ptr) {
             // Zone-managed KV layer: unified_free calls zone_free(KV) via vram_zone routing.
             (void) ggml_sycl::unified_free(la.zone_h);
@@ -17626,18 +18366,15 @@ static enum ggml_status tiered_kv_buffer_init_tensor(ggml_backend_buffer_t buffe
             void * old_data            = tensor->data;
             tensor->data               = static_cast<char *>(la.ptr) + offset_within_layer;
 
-            // Set data_device so the fast path (ggml_sycl_get_data_ptr) resolves
-            // directly without hitting the slow path.  Without this, the slow path
-            // may fail to identify the per-layer device pointer (cross-context
-            // get_pointer_type returns unknown) and try to memcpy from device memory
-            // on the host side → segfault on 120B.
-            if (la.on_device) {
+            // Set the smart handle for both device and host-pinned KV layers so
+            // SET_ROWS and attention dispatch can route by actual residency.
+            {
                 if (!tensor->extra) {
                     tensor->extra = new ggml_tensor_extra_gpu{};
                 }
-                auto *    extra        = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
-                const int owner_device = la.owner_device >= 0 ? la.owner_device : ctx->device;
-                extra->set_data_device(owner_device, tensor->data);
+                auto *    extra       = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
+                const int handle_slot = la.on_device && la.owner_device >= 0 ? la.owner_device : ctx->device;
+                extra->set_data_device(handle_slot, tensor->data, GGML_LAYOUT_AOS, la.on_device);
             }
 
             // Diagnostic: log first 4 layers + last layer to verify remapping
@@ -29901,6 +30638,33 @@ static void reorder_mxfp4_cpu(void * dst_soa, const void * src_aos, int ncols, i
     }
 }
 
+static inline int8_t mxfp4_i8_code_value(uint8_t v) {
+    static constexpr int8_t table[16] = { 0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12 };
+    return table[v & 0x0f];
+}
+
+// MXFP4 predecoded layout: [all decoded int8 qs][all E8M0 scales].
+// This trades roughly 2x MXFP4 storage for removing per-token nibble LUT unpack
+// in decode/down kernels.  Source remains canonical AoS owned by unified-cache.
+static void reorder_mxfp4_i8_cpu(void * dst_i8, const void * src_aos, int ncols, int nrows) {
+    const size_t    blocks_per_row = ncols / QK_MXFP4;
+    const size_t    nblocks        = blocks_per_row * nrows;
+    const uint8_t * aos            = (const uint8_t *) src_aos;
+    int8_t *        out_qs         = (int8_t *) dst_i8;
+    uint8_t *       out_e          = (uint8_t *) out_qs + nblocks * QK_MXFP4;
+
+    for (size_t ib = 0; ib < nblocks; ib++) {
+        const block_mxfp4 * block = (const block_mxfp4 *) (aos + ib * sizeof(block_mxfp4));
+        int8_t *            qs    = out_qs + ib * QK_MXFP4;
+        for (int i = 0; i < QK_MXFP4 / 2; ++i) {
+            const uint8_t packed = block->qs[i];
+            qs[i]                = mxfp4_i8_code_value(packed);
+            qs[i + QK_MXFP4 / 2] = mxfp4_i8_code_value(packed >> 4);
+        }
+        out_e[ib] = block->e;
+    }
+}
+
 // Check if tensor is eligible for CPU-side SoA reorder during upload
 static bool should_cpu_reorder(const ggml_tensor * tensor, const ggml_backend_sycl_buffer_context * ctx) {
     // Supported quantized types for CPU-side SoA reorder
@@ -30691,6 +31455,8 @@ static int ggml_sycl_layout_priority(layout_mode mode) {
             return 4;
         case GGML_LAYOUT_XMX_TILED:
             return 3;
+        case GGML_LAYOUT_MXFP4_I8:
+            return 3;
         case GGML_LAYOUT_COALESCED:
             return 2;
         case GGML_LAYOUT_SOA:
@@ -30914,6 +31680,15 @@ static size_t ggml_sycl_layout_bytes_for_dims(ggml_type   type,
             {
                 return ggml_sycl_layout_bytes_coalesced_for_dims(type, ncols, nrows);
             }
+        case GGML_LAYOUT_MXFP4_I8:
+            {
+                if (type != GGML_TYPE_MXFP4 || (ncols % QK_MXFP4) != 0) {
+                    return 0;
+                }
+                const size_t blocks_per_row = static_cast<size_t>(ncols / QK_MXFP4);
+                const size_t nblocks        = blocks_per_row * static_cast<size_t>(nrows);
+                return nblocks * (QK_MXFP4 + 1);
+            }
         case GGML_LAYOUT_XMX_GEMM_TILED:
             {
                 return ggml_sycl_layout_bytes_xmx_gemm_for_dims(type, ncols, nrows, device);
@@ -30986,6 +31761,7 @@ static size_t ggml_sycl_layout_bytes_for_tensor(const ggml_tensor * tensor, layo
             }
 
         case GGML_LAYOUT_COALESCED:
+        case GGML_LAYOUT_MXFP4_I8:
             {
                 const size_t bytes = ggml_sycl_layout_bytes_for_dims(tensor->type, ncols, nrows, layout, device);
                 return bytes != 0 ? bytes : ggml_nbytes(tensor);
@@ -31106,27 +31882,7 @@ void ggml_sycl_retain_moe_ptr_table_leases_until_event(ggml_tensor_extra_gpu * e
     ggml_sycl::retain_handles_until_event(std::move(leases), std::move(event));
 }
 
-// Populate moe_expert_ptrs_device for GPU0-routed experts in the fusion path.
-// The standard path uses update_moe_ptr_table() which is expensive and designed
-// for the full routing flow.  The fusion path only needs pointers for a small
-// subset of experts whose device_ptr is already known from the placement table.
-// Returns the device-side pointer table, or nullptr on failure.
-static const void * const * moe_fusion_ensure_gpu0_ptrs(ggml_backend_sycl_context & ctx,
-                                                        const ggml_tensor *         src0,
-                                                        const int32_t *             expert_ids,
-                                                        size_t                      n_experts_routed,
-                                                        int                         layer_hash,
-                                                        layout_mode                 layout) {
-    auto * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
-    if (!extra) {
-        return nullptr;
-    }
-
-    const int     device    = ctx.device;
-    const int64_t n_experts = src0->ne[2] > 0 ? src0->ne[2] : 1;
-    sycl::queue & q         = *ctx.stream();
-
-    // Compute table_index from layer_hash for Phase 4 pre-allocated tables
+static int ggml_sycl_moe_ptr_table_index(int device, int layer_hash) {
     int table_index = -1;
     {
         auto & seq_map = g_moe_layer_seq[device];
@@ -31135,101 +31891,17 @@ static const void * const * moe_fusion_ensure_gpu0_ptrs(ggml_backend_sycl_contex
             table_index = it->second;
         }
     }
-
-    const bool table_was_valid = extra->moe_device_table_valid[device] && extra->moe_ptrs_ptr_raw(device) != nullptr &&
-                                 extra->moe_expert_ptrs_size[device] == static_cast<size_t>(n_experts) * sizeof(void *);
-
-    // Ensure device-side table is allocated (uses pre-allocated if available)
-    ggml_sycl_ensure_moe_ptr_table(extra, device, static_cast<int>(n_experts), q, table_index);
-    if (!extra->moe_ptrs_ptr(device)) {
-        return nullptr;
-    }
-    const bool force_refresh = !table_was_valid;
-
-    auto & host_ptrs      = extra->moe_expert_ptrs_host[device];
-    auto & expert_handles = extra->moe_expert_handles[device];
-    if (expert_handles.size() != host_ptrs.size()) {
-        expert_handles.assign(host_ptrs.size(), ggml_sycl::mem_handle{});
-    }
-
-    std::vector<ggml_sycl::mem_handle> leases;
-    std::vector<sycl::event>           table_deps;
-    bool                               any_updated = false;
-    bool                               any_valid   = false;
-    for (size_t i = 0; i < n_experts_routed; i++) {
-        const int eid = expert_ids[i];
-        if (eid < 0 || eid >= n_experts) {
-            continue;
-        }
-        if (!force_refresh && layout == GGML_LAYOUT_AOS && static_cast<size_t>(eid) < host_ptrs.size() &&
-            host_ptrs[eid] != nullptr) {
-            any_valid = true;
-            continue;
-        }
-        moe_expert_route route = ggml_sycl_resolve_moe_expert_route(src0, device, eid, layout);
-        if (route.kind == moe_expert_route_kind::LOCAL_DEVICE && route.ptr != nullptr &&
-            route.actual_layout == layout) {
-            ggml_sycl::mem_handle handle = std::move(route.lease);
-            if (handle.resolve(device).ptr == nullptr) {
-                continue;
-            }
-            auto resolved = handle.resolve(device);
-            if (!resolved.ptr) {
-                continue;
-            }
-            const size_t slot     = static_cast<size_t>(eid);
-            const bool same_entry = !force_refresh && host_ptrs[slot] == resolved.ptr && expert_handles[slot].valid() &&
-                                    expert_handles[slot] == handle;
-            if (!same_entry) {
-                expert_handles[slot] = handle;
-                host_ptrs[slot]      = resolved.ptr;
-                leases.push_back(std::move(handle));
-                any_updated = true;
-            }
-            if (route.has_ready_event) {
-                table_deps.push_back(route.ready_event);
-                ggml_sycl::g_test_moe_ptr_table_ready_event_deps.fetch_add(1, std::memory_order_relaxed);
-            }
-            any_valid = true;
-            continue;
-        }
-        if (route.kind == moe_expert_route_kind::UNAVAILABLE) {
-            if (ggml_sycl_moe_route_is_layout_miss(route)) {
-                continue;
-            }
-            ggml_sycl_abort_unresolved_device_expert(src0, eid, device, route);
-        }
-    }
-    if (!any_valid) {
-        return nullptr;
-    }
-
-    // H2D copy of the pointer table. Expert routes may still be backed by
-    // in-flight unified-cache staging work; chain those events instead of
-    // waiting on the host so graph recording remains legal.
-    if (any_updated || !table_deps.empty()) {
-        sycl::event table_event = q.submit([&](sycl::handler & h) {
-            if (!table_deps.empty()) {
-                h.depends_on(table_deps);
-            }
-            if (any_updated) {
-                h.memcpy(extra->moe_ptrs_ptr(device), host_ptrs.data(), host_ptrs.size() * sizeof(void *));
-            } else {
-                h.single_task([]() {});
-            }
-        });
-        ggml_sycl::retain_handles_until_event(std::move(leases), table_event);
-    }
-
-    return static_cast<const void * const *>(extra->moe_ptrs_ptr(device));
+    return table_index;
 }
 
-static const void * const * moe_fusion_upload_ptrs_from_handles(ggml_backend_sycl_context &        ctx,
-                                                                const moe_layer_decode_role_plan & role,
-                                                                int                                layer_hash,
-                                                                layout_mode                        layout) {
-    const ggml_tensor * src0 = role.weight;
-    if (!src0 || role.expert_ids.size() != role.handles.size()) {
+static const void * const * ggml_sycl_upload_moe_transient_ptr_table(
+    ggml_backend_sycl_context &                             ctx,
+    const ggml_tensor *                                     src0,
+    const std::vector<moe_layer_transient_ptr_table_slot> & slots,
+    int                                                     layer_hash,
+    layout_mode                                             layout,
+    const std::vector<sycl::event> *                        role_ready_events = nullptr) {
+    if (!src0 || slots.empty()) {
         return nullptr;
     }
     auto * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
@@ -31241,19 +31913,11 @@ static const void * const * moe_fusion_upload_ptrs_from_handles(ggml_backend_syc
     const int64_t n_experts = src0->ne[2] > 0 ? src0->ne[2] : 1;
     sycl::queue & q         = *ctx.stream();
 
-    int table_index = -1;
-    {
-        auto & seq_map = g_moe_layer_seq[device];
-        auto   it      = seq_map.find(layer_hash);
-        if (it != seq_map.end()) {
-            table_index = it->second;
-        }
-    }
-
+    const int  table_index     = ggml_sycl_moe_ptr_table_index(device, layer_hash);
     const bool table_was_valid = extra->moe_device_table_valid[device] && extra->moe_ptrs_ptr_raw(device) != nullptr &&
                                  extra->moe_expert_ptrs_size[device] == static_cast<size_t>(n_experts) * sizeof(void *);
 
-    ggml_sycl_ensure_moe_ptr_table(extra, device, static_cast<int>(n_experts), q, table_index);
+    ggml_sycl_ensure_moe_ptr_table(extra, device, n_experts, q, table_index);
     if (!extra->moe_ptrs_ptr(device)) {
         return nullptr;
     }
@@ -31268,16 +31932,16 @@ static const void * const * moe_fusion_upload_ptrs_from_handles(ggml_backend_syc
     std::vector<ggml_sycl::mem_handle> leases;
     std::vector<sycl::event>           table_deps;
     bool                               any_updated = false;
-    leases.reserve(role.handles.size());
-    table_deps.reserve(role.ready_events.size());
+    leases.reserve(slots.size());
+    table_deps.reserve(slots.size());
 
-    for (size_t i = 0; i < role.expert_ids.size(); ++i) {
-        const int eid = role.expert_ids[i];
+    for (const auto & slot_info : slots) {
+        const int eid = slot_info.expert_id;
         if (eid < 0 || eid >= n_experts) {
             return nullptr;
         }
 
-        ggml_sycl::mem_handle handle   = role.handles[i];
+        ggml_sycl::mem_handle handle   = slot_info.handle;
         auto                  resolved = handle.resolve(device);
         if (!resolved.ptr || !resolved.on_device || resolved.layout != layout) {
             return nullptr;
@@ -31289,16 +31953,24 @@ static const void * const * moe_fusion_upload_ptrs_from_handles(ggml_backend_syc
         if (!same_entry) {
             expert_handles[slot] = handle;
             host_ptrs[slot]      = resolved.ptr;
-            leases.push_back(std::move(handle));
-            any_updated = true;
+            any_updated          = true;
+        }
+        leases.push_back(std::move(handle));
+        if (slot_info.has_ready_event) {
+            table_deps.push_back(slot_info.ready_event);
+            ggml_sycl::g_test_moe_ptr_table_ready_event_deps.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (role_ready_events) {
+        for (const sycl::event & event : *role_ready_events) {
+            table_deps.push_back(event);
+            ggml_sycl::g_test_moe_ptr_table_ready_event_deps.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
-    for (const sycl::event & event : role.ready_events) {
-        table_deps.push_back(event);
-        ggml_sycl::g_test_moe_ptr_table_ready_event_deps.fetch_add(1, std::memory_order_relaxed);
-    }
-
+    // Expert pointer tables are transient kernel ABI payloads.  The slots above
+    // are derived from canonical mem_handles, and the handles are retained until
+    // the uploaded table is no longer the active dispatch payload.
     if (any_updated || !table_deps.empty()) {
         sycl::event table_event = q.submit([&](sycl::handler & h) {
             if (!table_deps.empty()) {
@@ -31310,7 +31982,116 @@ static const void * const * moe_fusion_upload_ptrs_from_handles(ggml_backend_syc
                 h.single_task([]() {});
             }
         });
-        ggml_sycl::retain_handles_until_event(std::move(leases), table_event);
+        (void) table_event;
+    }
+    ggml_sycl_set_moe_ptr_table_leases(extra, device, std::move(leases), &q);
+
+    return static_cast<const void * const *>(extra->moe_ptrs_ptr(device));
+}
+
+// Populate moe_expert_ptrs_device for GPU-routed experts in the fusion path.
+// Raw pointers are derived from mem_handles only for this transient kernel ABI.
+static const void * const * moe_fusion_ensure_gpu0_ptrs(ggml_backend_sycl_context & ctx,
+                                                        const ggml_tensor *         src0,
+                                                        const int32_t *             expert_ids,
+                                                        size_t                      n_experts_routed,
+                                                        int                         layer_hash,
+                                                        layout_mode                 layout) {
+    if (!src0 || !expert_ids) {
+        return nullptr;
+    }
+
+    const int     device    = ctx.device;
+    const int64_t n_experts = src0->ne[2] > 0 ? src0->ne[2] : 1;
+
+    std::vector<moe_layer_transient_ptr_table_slot> slots;
+    slots.reserve(n_experts_routed);
+    for (size_t i = 0; i < n_experts_routed; i++) {
+        const int eid = expert_ids[i];
+        if (eid < 0 || eid >= n_experts) {
+            continue;
+        }
+        moe_expert_route route = ggml_sycl_resolve_moe_expert_route(src0, device, eid, layout);
+        if (route.kind == moe_expert_route_kind::LOCAL_DEVICE && route.ptr != nullptr &&
+            route.actual_layout == layout) {
+            ggml_sycl::mem_handle handle = std::move(route.lease);
+            if (handle.resolve(device).ptr == nullptr) {
+                continue;
+            }
+            moe_layer_transient_ptr_table_slot slot;
+            slot.expert_id       = eid;
+            slot.handle          = std::move(handle);
+            slot.ready_event     = route.ready_event;
+            slot.has_ready_event = route.has_ready_event;
+            slots.push_back(std::move(slot));
+            continue;
+        }
+        if (route.kind == moe_expert_route_kind::UNAVAILABLE) {
+            if (ggml_sycl_moe_route_is_layout_miss(route)) {
+                continue;
+            }
+            ggml_sycl_abort_unresolved_device_expert(src0, eid, device, route);
+        }
+    }
+
+    return ggml_sycl_upload_moe_transient_ptr_table(ctx, src0, slots, layer_hash, layout);
+}
+
+static const void * const * moe_fusion_upload_ptrs_from_handles(ggml_backend_sycl_context &        ctx,
+                                                                const moe_layer_decode_role_plan & role,
+                                                                int                                layer_hash,
+                                                                layout_mode                        layout) {
+    const ggml_tensor * src0 = role.weight;
+    if (!src0 || role.expert_ids.size() != role.handles.size()) {
+        return nullptr;
+    }
+
+    std::vector<moe_layer_transient_ptr_table_slot> slots;
+    slots.reserve(role.handles.size());
+    for (size_t i = 0; i < role.expert_ids.size(); ++i) {
+        moe_layer_transient_ptr_table_slot slot;
+        slot.expert_id = role.expert_ids[i];
+        slot.handle    = role.handles[i];
+        slots.push_back(std::move(slot));
+    }
+
+    return ggml_sycl_upload_moe_transient_ptr_table(ctx, src0, slots, layer_hash, layout, &role.ready_events);
+}
+
+static const void * const * moe_fusion_full_local_ptr_table(const ggml_tensor * weight,
+                                                            int                 device,
+                                                            layout_mode         layout) {
+    if (!weight) {
+        return nullptr;
+    }
+    const int64_t n_experts = weight->ne[2] > 0 ? weight->ne[2] : 1;
+    if (n_experts <= 0 || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return nullptr;
+    }
+
+    auto * extra = static_cast<ggml_tensor_extra_gpu *>(weight->extra);
+    if (!extra || !extra->moe_device_table_valid[device] || extra->moe_ptrs_ptr(device) == nullptr) {
+        return nullptr;
+    }
+
+    const size_t count = static_cast<size_t>(n_experts);
+    if (extra->moe_expert_ptrs_host[device].size() != count || extra->moe_expert_handles[device].size() != count) {
+        return nullptr;
+    }
+
+    for (size_t e = 0; e < count; ++e) {
+        void * ptr = extra->moe_expert_ptrs_host[device][e];
+        if (!ptr) {
+            return nullptr;
+        }
+        const ggml_sycl::mem_handle & handle = extra->moe_expert_handles[device][e];
+        if (!handle.valid()) {
+            return nullptr;
+        }
+        auto resolved = handle.resolve(device);
+        if (!resolved.ptr || resolved.ptr != ptr || !resolved.on_device || resolved.layout != layout) {
+            return nullptr;
+        }
     }
 
     return static_cast<const void * const *>(extra->moe_ptrs_ptr(device));
@@ -31902,6 +32683,19 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
     ggml_sycl::unified_cache * cache         = ggml_sycl::get_unified_cache(*stream);
     const bool                 plan_active   = cache && cache->has_placement_plan();
     const bool                 is_moe_expert = (ggml_sycl_get_tensor_usage(src0) == tensor_usage::MOE_EXPERT_WEIGHT);
+    if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+        static std::atomic<int> logged_ptr_enter{ 0 };
+        const int               n = logged_ptr_enter.fetch_add(1, std::memory_order_relaxed);
+        if (n < 120) {
+            fprintf(stderr,
+                    "[MOE-PTR-ENTER] tensor=%s device=%d layout=%s allow_all=%d skip_device_copy=%d "
+                    "force_cache_aos=%d skip_cpu=%d exact=%d plan=%d host_weights=%d src0_alloc=%d\n",
+                    src0 && src0->name ? src0->name : "?", device, ggml_sycl_layout_mode_name(layout),
+                    allow_all_experts ? 1 : 0, skip_device_copy ? 1 : 0, force_cache_aos ? 1 : 0,
+                    skip_cpu_routed_experts ? 1 : 0, exact_layout_required ? 1 : 0, plan_active ? 1 : 0,
+                    host_weights ? 1 : 0, (int) src0_alloc);
+        }
+    }
     if (layout == GGML_LAYOUT_AOS && !src0_is_usm_accessible && !force_cache_aos) {
         // Not USM-accessible - must use cache path for proper staging.
         GGML_SYCL_DEBUG("[MOE-PTR] Non-USM host storage, forcing cache path for %s\n", src0->name);
@@ -31961,7 +32755,7 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
             GGML_LAYOUT_COALESCED,
             GGML_LAYOUT_AOS,
         };
-        const int n_layouts = allow_layout_fallback ? 4 : 1;
+        const int n_layouts = (allow_layout_fallback && !plan_active) ? 4 : 1;
         for (int i = 0; i < n_layouts; ++i) {
             const ggml_layout_mode candidate = layouts[i];
             bool                   seen      = false;
@@ -31974,6 +32768,18 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
             if (seen) {
                 continue;
             }
+            if (plan_active && candidate == GGML_LAYOUT_AOS && ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                static std::atomic<int> logged_ptr_aos{ 0 };
+                const int               n = logged_ptr_aos.fetch_add(1, std::memory_order_relaxed);
+                if (n < 80) {
+                    fprintf(stderr,
+                            "[MOE-PTR-AOS-RESOLVE] tensor=%s expert=%lld device=%d requested=%s "
+                            "allow_fallback=%d allow_host=%d exact=%d\n",
+                            src0 && src0->name ? src0->name : "?", (long long) e, device,
+                            ggml_sycl_layout_mode_name(requested_layout), allow_layout_fallback ? 1 : 0,
+                            allow_host_slot ? 1 : 0, exact_layout_required ? 1 : 0);
+                }
+            }
             moe_expert_route route = ggml_sycl_resolve_moe_expert_route(src0, device, static_cast<int>(e), candidate);
             if (route.kind == moe_expert_route_kind::LOCAL_DEVICE && route.ptr) {
                 return route;
@@ -31982,7 +32788,9 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
                 return route;
             }
             if (route.kind == moe_expert_route_kind::SECONDARY_DEVICE || route.kind == moe_expert_route_kind::HOST ||
-                ggml_sycl_moe_route_is_layout_miss(route)) {
+                ggml_sycl_moe_route_is_layout_miss(route) ||
+                (requested_layout == GGML_LAYOUT_MXFP4_I8 && route.kind == moe_expert_route_kind::UNAVAILABLE &&
+                 route.reason == ggml_sycl::expert_resolve_reason::NOT_FOUND)) {
                 continue;
             }
             ggml_sycl_abort_unresolved_device_expert(src0, static_cast<int>(e), device, route);
@@ -32132,7 +32940,8 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
         if (!expert_aos) {
             return false;
         }
-        ggml_sycl_cache_id expert_cache_key = ggml_sycl_get_moe_expert_cache_key(src0, extra, static_cast<int>(e));
+        ggml_sycl_cache_id expert_cache_key = ggml_sycl_layout_specific_moe_expert_cache_key(
+            ggml_sycl_get_moe_expert_cache_key(src0, extra, static_cast<int>(e)), layout);
         if (!expert_cache_key.valid) {
             GGML_LOG_ERROR("[MOE] Missing cache key for %s expert=%ld layer=%d\n", src0->name, (long) e, layer_id);
             GGML_ASSERT(expert_cache_key.valid && "missing MoE cache key");
@@ -32152,7 +32961,7 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
         req.validate_content = false;
         req.xmx_info         = xmx_info;
         reorder_ctx          = {};
-        if (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED) {
+        if (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED || layout == GGML_LAYOUT_MXFP4_I8) {
             reorder_ctx.type  = src0->type;
             reorder_ctx.ncols = ncols;
 
@@ -32617,14 +33426,17 @@ static bool graph_preload_moe_experts(ggml_backend_sycl_context & ctx, ggml_cgra
         }
         any_moe = true;
 
-        bool host_weights = ggml_sycl_is_host_resident_weight(src0, ctx.stream());
-
+        bool              host_weights       = ggml_sycl_is_host_resident_weight(src0, ctx.stream());
+        const int64_t     n_ids              = ids->ne[0];
+        const int64_t     n_tokens           = ids->ne[1];
         const bool        plan_preloaded     = cache && cache->has_placement_plan();
         // Check if this MoE layer has too many experts for blind preload
         const int64_t     n_experts          = src0->ne[2];
         const bool        skip_blind_preload = !plan_preloaded && ggml_sycl_should_skip_blind_preload(n_experts);
         bool              prefer_routing     = false;
-        const layout_mode layout             = ggml_sycl_select_moe_graph_layout(src0, ctx.device, host_weights);
+        const layout_mode layout =
+            plan_preloaded ? ggml_sycl_select_moe_planned_graph_layout(src0, ctx.device, host_weights, n_tokens) :
+                             ggml_sycl_select_moe_graph_layout(src0, ctx.device, host_weights);
         if (!plan_preloaded && host_weights && cache) {
             cache->evict(0);  // drain deferred frees to get accurate accounting
             const size_t total_layout_bytes = ggml_sycl_estimate_layout_bytes(src0, layout, ctx.device);
@@ -32656,11 +33468,11 @@ static bool graph_preload_moe_experts(ggml_backend_sycl_context & ctx, ggml_cgra
                             src0->name ? src0->name : "(unknown)");
         }
 
-        host_weights           = ggml_sycl_is_host_resident_weight(src0, ctx.stream());
-        const int64_t n_ids    = ids->ne[0];
-        const int64_t n_tokens = ids->ne[1];
+        host_weights = ggml_sycl_is_host_resident_weight(src0, ctx.stream());
 
-        const int64_t total_batches = n_ids * n_tokens;
+        const int64_t total_batches     = n_ids * n_tokens;
+        const bool    allow_all_experts = plan_preloaded || !use_routing_prestage;
+        const bool    ids_on_host       = ids->buffer && ggml_backend_buffer_is_host(ids->buffer);
         if (!ggml_sycl_moe_prepare_compact_list(ctx, src0, total_batches, true)) {
             GGML_SYCL_DEBUG("[GRAPH-PRELOAD] Failed to allocate compact list for %s\n", src0->name);
         }
@@ -32678,21 +33490,25 @@ static bool graph_preload_moe_experts(ggml_backend_sycl_context & ctx, ggml_cgra
             ggml_sycl_ensure_moe_ptr_table(extra, ctx.device, src0->ne[2] > 0 ? src0->ne[2] : 1, *ctx.stream(),
                                            preload_tbl_idx);
         }
+        auto &               ids_entry = ctx.moe_ids_cache[ids];
         std::vector<int32_t> ids_host;
-        if (!ggml_sycl_copy_ids_to_host(ctx, ids, ids_host)) {
-            GGML_LOG_ERROR("[GRAPH-PRELOAD] Failed to read MoE ids for %s\n", src0->name);
-            return false;
-        }
+        const bool           need_host_ids = !allow_all_experts || ids_on_host;
+        if (need_host_ids) {
+            if (!ggml_sycl_copy_ids_to_host(ctx, ids, ids_host)) {
+                GGML_LOG_ERROR("[GRAPH-PRELOAD] Failed to read MoE ids for %s\n", src0->name);
+                return false;
+            }
 
-        const uint64_t ids_hash  = ggml_sycl_hash_ids(ids_host);
-        auto &         ids_entry = ctx.moe_ids_cache[ids];
-
-        const bool ids_changed = ids_entry.host_ids.empty() || ids_entry.hash != ids_hash;
-        if (ids_changed) {
-            ids_entry.hash     = ids_hash;
-            ids_entry.host_ids = std::move(ids_host);
+            const uint64_t ids_hash    = ggml_sycl_hash_ids(ids_host);
+            const bool     ids_changed = ids_entry.host_ids.empty() || ids_entry.hash != ids_hash;
+            if (ids_changed) {
+                ids_entry.hash     = ids_hash;
+                ids_entry.host_ids = std::move(ids_host);
+            }
+        } else if (!ids_entry.host_ids.empty()) {
+            ids_entry.host_ids.clear();
+            ids_entry.hash = 0;
         }
-        const bool ids_on_host = ids->buffer && ggml_backend_buffer_is_host(ids->buffer);
 
         if (ids_on_host) {
             const size_t ids_bytes = static_cast<size_t>(n_ids * n_tokens) * sizeof(int32_t);
@@ -32757,7 +33573,6 @@ static bool graph_preload_moe_experts(ggml_backend_sycl_context & ctx, ggml_cgra
             GGML_LOG_INFO("[GRAPH-PRELOAD] Pre-loading %lld experts for layer %d (within threshold %d)\n",
                           (long long) src0->ne[2], layer_id_log, ggml_sycl_get_blind_preload_threshold());
         }
-        const bool   allow_all_experts = plan_preloaded || !use_routing_prestage;
         const auto * ids_override = (!allow_all_experts && !ids_entry.host_ids.empty()) ? &ids_entry.host_ids : nullptr;
         if (use_routing_prestage && !ids_override) {
             GGML_LOG_ERROR("[GRAPH-PRELOAD] Routing prestage requested but ids are unavailable for %s\n", src0->name);
@@ -35378,62 +36193,101 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                 if (data_layout == ggml_sycl_unified::LayoutMode::COALESCED ||
                     data_layout == ggml_sycl_unified::LayoutMode::SOA) {
                     const bool mxfp4_profile = mxfp4_tg_profile_enabled();
+                    const bool split_timing  = pp_split_timing_enabled();
                     bool       used_onednn   = false;
 #if GGML_SYCL_DNNL
                     if (M >= 2 && data_layout == ggml_sycl_unified::LayoutMode::SOA) {
                         const to_fp16_sycl_t f32_to_fp16 =
                             ggml_get_to_fp16_sycl(GGML_TYPE_F32, dst, /*full_tensor=*/false);
-                        if (f32_to_fp16) {
-                            const size_t src0_elems = static_cast<size_t>(N) * static_cast<size_t>(K);
-                            const size_t src1_elems = static_cast<size_t>(M) * static_cast<size_t>(K);
+                        const size_t src0_elems = static_cast<size_t>(N) * static_cast<size_t>(K);
+                        const size_t src1_elems = static_cast<size_t>(M) * static_cast<size_t>(K);
 
-                            ggml_sycl_pool_alloc<sycl::half> src0_f16(ctx.pool());
-                            ggml_sycl_pool_alloc<sycl::half> src1_f16(ctx.pool());
-                            bool                             alloc_ok = true;
-                            try {
+                        ggml_sycl_pool_alloc<sycl::half> src0_f16(ctx.pool());
+                        ggml_sycl_pool_alloc<sycl::half> src1_f16(ctx.pool());
+                        bool                             alloc_ok = true;
+                        try {
+                            if (!f32_to_fp16) {
+                                alloc_ok = false;
+                            } else {
                                 src0_f16.alloc(src0_elems);
                                 src1_f16.alloc(src1_elems);
-                            } catch (...) {
-                                alloc_ok = false;
                             }
-                            if (alloc_ok) {
-                                const int blocks_per_row = static_cast<int>(K / QK_MXFP4);
-                                for (int64_t i0 = 0; i0 < n_batch; ++i0) {
-                                    auto t_soa_pp0 = std::chrono::high_resolution_clock::now();
-                                    if (mxfp4_profile) {
-                                        ctx.stream()->wait();
-                                        t_soa_pp0 = std::chrono::high_resolution_clock::now();
-                                    }
-                                    const int64_t src0_batch = i0 / i02_divisor;
-                                    const char *  src0_batch_ptr =
-                                        static_cast<const char *>(src0_data) + src0_batch * src0_plane_bytes;
-                                    const float * src1_batch_ptr = src1_data + i0 * src1_plane_elems;
-                                    float *       dst_batch_ptr  = dst_data + i0 * dst_plane_elems;
+                        } catch (...) {
+                            alloc_ok = false;
+                        }
+                        if (alloc_ok) {
+                            const int blocks_per_row = static_cast<int>(K / QK_MXFP4);
+                            for (int64_t i0 = 0; i0 < n_batch; ++i0) {
+                                auto t_soa_pp0 = std::chrono::high_resolution_clock::now();
+                                if (mxfp4_profile) {
+                                    ctx.stream()->wait();
+                                    t_soa_pp0 = std::chrono::high_resolution_clock::now();
+                                }
+                                const int64_t src0_batch = i0 / i02_divisor;
+                                const char *  src0_batch_ptr =
+                                    static_cast<const char *>(src0_data) + src0_batch * src0_plane_bytes;
+                                const float * src1_batch_ptr = src1_data + i0 * src1_plane_elems;
+                                float *       dst_batch_ptr  = dst_data + i0 * dst_plane_elems;
 
-                                    dequantize_row_mxfp4_soa_to_fp16_rowmajor(src0_batch_ptr, src0_f16.get(),
-                                                                              blocks_per_row, static_cast<int>(N),
-                                                                              ctx.stream());
-                                    f32_to_fp16(src1_batch_ptr, src1_f16.get(), src1_elems, ctx.stream());
+                                auto t_dequant_w0 = std::chrono::high_resolution_clock::now();
+                                if (split_timing) {
+                                    ctx.stream()->wait();
+                                    t_dequant_w0 = std::chrono::high_resolution_clock::now();
+                                }
+                                dequantize_row_mxfp4_soa_to_fp16_rowmajor(
+                                    src0_batch_ptr, src0_f16.get(), blocks_per_row, static_cast<int>(N), ctx.stream());
+                                if (split_timing) {
+                                    ctx.stream()->wait();
+                                    const auto t_dequant_w1 = std::chrono::high_resolution_clock::now();
+                                    g_pp_split_timing.us_dequant_w +=
+                                        std::chrono::duration<double, std::micro>(t_dequant_w1 - t_dequant_w0).count();
+                                    g_pp_split_timing.n_cache_miss++;
+                                }
 
-                                    try {
-                                        DnnlGemmWrapper::row_gemm(ctx, static_cast<int>(N), static_cast<int>(M),
-                                                                  static_cast<int>(K), src0_f16.get(),
-                                                                  DnnlGemmWrapper::to_dt<sycl::half>(), src1_f16.get(),
-                                                                  DnnlGemmWrapper::to_dt<sycl::half>(), dst_batch_ptr,
-                                                                  DnnlGemmWrapper::to_dt<float>(), ctx.stream());
-                                        used_onednn = true;
-                                    } catch (const std::exception & e) {
-                                        GGML_LOG_WARN("[MXFP4-DIRECT] oneDNN SOA PP failed: %s\n", e.what());
-                                        used_onednn = false;
-                                        break;
-                                    }
-                                    if (mxfp4_profile) {
+                                auto t_dequant_a0 = std::chrono::high_resolution_clock::now();
+                                if (split_timing) {
+                                    ctx.stream()->wait();
+                                    t_dequant_a0 = std::chrono::high_resolution_clock::now();
+                                }
+                                f32_to_fp16(src1_batch_ptr, src1_f16.get(), src1_elems, ctx.stream());
+                                if (split_timing) {
+                                    ctx.stream()->wait();
+                                    const auto t_dequant_a1 = std::chrono::high_resolution_clock::now();
+                                    g_pp_split_timing.us_dequant_a +=
+                                        std::chrono::duration<double, std::micro>(t_dequant_a1 - t_dequant_a0).count();
+                                }
+
+                                try {
+                                    auto t_gemm0 = std::chrono::high_resolution_clock::now();
+                                    if (split_timing) {
                                         ctx.stream()->wait();
-                                        const auto t_soa_pp1 = std::chrono::high_resolution_clock::now();
-                                        g_mxfp4_tg_timing.us_soa_pp +=
-                                            std::chrono::duration<double, std::micro>(t_soa_pp1 - t_soa_pp0).count();
-                                        g_mxfp4_tg_timing.pp_soa_batches++;
+                                        t_gemm0 = std::chrono::high_resolution_clock::now();
                                     }
+                                    DnnlGemmWrapper::row_gemm(ctx, static_cast<int>(N), static_cast<int>(M),
+                                                              static_cast<int>(K), src0_f16.get(),
+                                                              DnnlGemmWrapper::to_dt<sycl::half>(), src1_f16.get(),
+                                                              DnnlGemmWrapper::to_dt<sycl::half>(), dst_batch_ptr,
+                                                              DnnlGemmWrapper::to_dt<float>(), ctx.stream());
+                                    ctx.stream()->wait_and_throw();
+                                    if (split_timing) {
+                                        const auto t_gemm1 = std::chrono::high_resolution_clock::now();
+                                        g_pp_split_timing.us_gemm +=
+                                            std::chrono::duration<double, std::micro>(t_gemm1 - t_gemm0).count();
+                                        g_pp_split_timing.n_ops++;
+                                        pp_split_timing_dump_if_due();
+                                    }
+                                    used_onednn = true;
+                                } catch (const std::exception & e) {
+                                    GGML_LOG_WARN("[MXFP4-DIRECT] oneDNN SOA PP failed: %s\n", e.what());
+                                    used_onednn = false;
+                                    break;
+                                }
+                                if (mxfp4_profile) {
+                                    ctx.stream()->wait();
+                                    const auto t_soa_pp1 = std::chrono::high_resolution_clock::now();
+                                    g_mxfp4_tg_timing.us_soa_pp +=
+                                        std::chrono::duration<double, std::micro>(t_soa_pp1 - t_soa_pp0).count();
+                                    g_mxfp4_tg_timing.pp_soa_batches++;
                                 }
                             }
                         }
@@ -35539,6 +36393,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                                                                   DnnlGemmWrapper::to_dt<sycl::half>(), src1_f16.get(),
                                                                   DnnlGemmWrapper::to_dt<sycl::half>(), dst_batch_ptr,
                                                                   DnnlGemmWrapper::to_dt<float>(), ctx.stream());
+                                        ctx.stream()->wait_and_throw();
                                         used_onednn = true;
                                     } catch (const std::exception & e) {
                                         GGML_LOG_WARN("[MXFP4-DIRECT] oneDNN PP failed: %s\n", e.what());
@@ -37199,49 +38054,104 @@ struct mmid_row_mapping {
     int32_t i2;
 };
 
-__dpct_inline__ static void k_copy_src1_to_contiguous(const char * __restrict__ src1_original,
-                                                      char * __restrict__ src1_contiguous,
+struct fused_moe_route_validation {
+    bool                               ok     = false;
+    const char *                       reason = "not-validated";
+    std::vector<ggml_sycl::mem_handle> leases;
+    std::vector<sycl::event>           ready_events;
+};
 
-                                                      int * __restrict__ cur_src1_row,
-                                                      mmid_row_mapping * __restrict__ row_mapping,
-                                                      const char * __restrict ids,
-                                                      int64_t                  i02,
-                                                      size_t                   ids_nb1,
-                                                      size_t                   ids_nb0,
-                                                      int64_t                  ne11,
-                                                      int64_t                  ne10,
-                                                      size_t                   nb11,
-                                                      size_t                   nb12,
-                                                      const sycl::nd_item<3> & item_ct1,
-                                                      int &                    src1_row) {
-    int32_t iid1 = item_ct1.get_group(2);
-    int32_t id   = item_ct1.get_group(1);
-
-    const int32_t row_id_i = *(const int32_t *) (ids + iid1 * ids_nb1 + id * ids_nb0);
-    if (row_id_i != i02) {
-        return;
+static fused_moe_route_validation ggml_sycl_validate_fused_moe_routes(ggml_backend_sycl_context & ctx,
+                                                                      const ggml_tensor *         src0,
+                                                                      const ggml_tensor *         ids,
+                                                                      layout_mode                 layout) {
+    fused_moe_route_validation validation;
+    if (!src0 || !ids) {
+        validation.reason = "invalid-request";
+        return validation;
     }
-    const int64_t i11 = id % ne11;
 
-    const int64_t i12 = iid1;
-    if (item_ct1.get_local_id(2) == 0) {
-        src1_row              = dpct::atomic_fetch_add<sycl::access::address_space::generic_space>(cur_src1_row, 1);
-        row_mapping[src1_row] = { id, iid1 };
+    std::vector<int32_t> ids_host_vec;
+    if (!ggml_sycl_copy_ids_to_host(ctx, ids, ids_host_vec)) {
+        validation.reason = "ids-host-copy";
+        return validation;
     }
-    /*
-    DPCT1065:194: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
 
-    */
+    std::vector<uint8_t> checked(static_cast<size_t>(std::max<int64_t>(src0->ne[2], 0)), 0);
+    for (int32_t expert_id : ids_host_vec) {
+        if (expert_id < 0 || expert_id >= src0->ne[2]) {
+            validation.reason = "expert-id-range";
+            return validation;
+        }
+        if (checked[static_cast<size_t>(expert_id)] != 0) {
+            continue;
+        }
+        checked[static_cast<size_t>(expert_id)] = 1;
 
-    item_ct1.barrier();
+        moe_expert_route route = ggml_sycl_resolve_moe_expert_route(src0, ctx.device, expert_id, layout);
+        if (route.kind != moe_expert_route_kind::LOCAL_DEVICE || !route.ptr) {
+            validation.reason = "non-local-route";
+            return validation;
+        }
+        if (route.actual_layout != layout) {
+            validation.reason = "layout-mismatch";
+            return validation;
+        }
+        if (route.has_ready_event) {
+            validation.ready_events.push_back(route.ready_event);
+        }
+        if (route.lease.valid()) {
+            validation.leases.push_back(std::move(route.lease));
+        }
+    }
+
+    validation.ok     = true;
+    validation.reason = "ok";
+    return validation;
+}
+
+__dpct_inline__ static void k_copy_src1_to_contiguous_mapped(const char * __restrict__ src1_original,
+                                                             char * __restrict__ src1_contiguous,
+                                                             const mmid_row_mapping * __restrict__ row_mapping,
+                                                             int64_t                  ne11,
+                                                             int64_t                  ne10,
+                                                             size_t                   nb11,
+                                                             size_t                   nb12,
+                                                             const sycl::nd_item<3> & item_ct1) {
+    const int32_t i                   = item_ct1.get_group(2);
+    const int32_t id                  = row_mapping[i].i1;
+    const int32_t iid1                = row_mapping[i].i2;
+    const int64_t i11                 = id % ne11;
+    const int64_t i12                 = iid1;
     const float * src1_row_original   = (const float *) (src1_original + i11 * nb11 + i12 * nb12);
-    float *       src1_row_contiguous = (float *) (src1_contiguous + src1_row * nb11);
-#pragma unroll
+    float *       src1_row_contiguous = (float *) (src1_contiguous + static_cast<int64_t>(i) * nb11);
 
-    for (int i = item_ct1.get_local_id(2); i < ne10; i += item_ct1.get_local_range(2)) {
-        src1_row_contiguous[i] = src1_row_original[i];
+#pragma unroll
+    for (int j = item_ct1.get_local_id(2); j < ne10; j += item_ct1.get_local_range(2)) {
+        src1_row_contiguous[j] = src1_row_original[j];
+    }
+}
+
+__dpct_inline__ static void k_copy_src1_to_contiguous_f16_mapped(const char * __restrict__ src1_original,
+                                                                 char * __restrict__ src1_contiguous,
+                                                                 const mmid_row_mapping * __restrict__ row_mapping,
+                                                                 int64_t                  ne11,
+                                                                 int64_t                  ne10,
+                                                                 size_t                   nb11,
+                                                                 size_t                   nb12,
+                                                                 size_t                   dst_nb1,
+                                                                 const sycl::nd_item<3> & item_ct1) {
+    const int32_t i                 = item_ct1.get_group(2);
+    const int32_t id                = row_mapping[i].i1;
+    const int32_t iid1              = row_mapping[i].i2;
+    const int64_t i11               = id % ne11;
+    const int64_t i12               = iid1;
+    const float * src1_row_original = (const float *) (src1_original + i11 * nb11 + i12 * nb12);
+    sycl::half *  src1_row_f16      = (sycl::half *) (src1_contiguous + static_cast<int64_t>(i) * dst_nb1);
+
+#pragma unroll
+    for (int j = item_ct1.get_local_id(2); j < ne10; j += item_ct1.get_local_range(2)) {
+        src1_row_f16[j] = sycl::half(src1_row_original[j]);
     }
 }
 
@@ -37380,52 +38290,23 @@ static bool ggml_sycl_mul_mat_id_fused(ggml_backend_sycl_context & ctx,
                         (int) host_weights, (int) use_layout);
         return false;
     }
+    if (ggml_sycl_get_alloc_type(src0_weight_ptr) != sycl::usm::alloc::device) {
+        GGML_SYCL_DEBUG("[MoE FUSED] Full tensor layout for %s is not device USM, falling back\n", src0->name);
+        return false;
+    }
+
     // Verify that all routed experts are device-resident before committing to
     // the fused kernel, which uses contiguous base+stride addressing.
-    //
-    // Two paths depending on whether the placement table is populated:
-    //
-    // Path A (placement table available): check each routed expert's device_ptr
-    //   in the placement table.  This is exact and O(n_ids * n_tokens).
-    //
-    // Path B (placement table absent): fall back to a single USM pointer-type
-    //   check on the base weight pointer returned by get_layout_ptr_for.
-    //   CRITICAL: check for != device due to Level Zero driver bug that reports
-    //   mmap'd memory as "shared" rather than "unknown" on some builds.
-    {
-        const int block_fused_chk = moe_extract_block_number(src0->name);
-
-        if (block_fused_chk >= 0) {
-            // Path A: per-expert device-residency check via unified cache.
-            // Uses is_expert_resident with block-number keys instead of the
-            // placement table (which had FNV hash mismatches).
-            std::vector<int32_t> ids_host_vec;
-            if (!ggml_sycl_copy_ids_to_host(ctx, ids, ids_host_vec)) {
-                GGML_SYCL_DEBUG("[MoE FUSED] Failed to read ids host data for %s\n", src0->name);
-                return false;
-            }
-            const int64_t n_ids_local = ids->ne[0];
-            for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
-                for (int64_t id = 0; id < n_ids_local; id++) {
-                    const int32_t expert_id = ids_host_vec[static_cast<size_t>(iid1 * n_ids_local + id)];
-                    if (!is_expert_resident(block_fused_chk, expert_id, ctx.device)) {
-                        GGML_SYCL_DEBUG("[MoE FUSED] Expert %d not in VRAM (block=%d), fallback to MMVQ\n", expert_id,
-                                        block_fused_chk);
-                        return false;
-                    }
-                }
-            }
-            // All routed experts are device-resident — proceed with fused kernel.
-        } else {
-            // Path B: single pointer-type check on the contiguous weight block.
-            sycl::usm::alloc ptr_type = ggml_sycl_get_alloc_type(src0_weight_ptr);
-            if (ptr_type != sycl::usm::alloc::device) {
-                GGML_SYCL_DEBUG("[MoE FUSED] Weights not in device memory (type=%d), falling back to MMVQ\n",
-                                (int) ptr_type);
-                return false;  // Let MMVQ handle with expert caching
-            }
-        }
+    fused_moe_route_validation fused_routes = ggml_sycl_validate_fused_moe_routes(ctx, src0, ids, use_layout);
+    if (!fused_routes.ok) {
+        GGML_SYCL_DEBUG("[MoE FUSED] Route validation failed for %s: %s\n", src0->name ? src0->name : "?",
+                        fused_routes.reason);
+        return false;
     }
+    if (!fused_routes.ready_events.empty()) {
+        stream->ext_oneapi_submit_barrier(fused_routes.ready_events);
+    }
+
     // Calculate parameters
     const int64_t num_experts = ne02;        // Number of experts
     const int64_t nrows       = ne01;        // Output rows per expert
@@ -37458,6 +38339,9 @@ static bool ggml_sycl_mul_mat_id_fused(ggml_backend_sycl_context & ctx,
                               nb2,      // dst stride for dim 2
                               *stream);
         GGML_SYCL_DEBUG("[MoE FUSED] Q8_0 kernel launched\n");
+        if (!fused_routes.leases.empty()) {
+            ggml_sycl::retain_handles_until_event(std::move(fused_routes.leases), stream->ext_oneapi_submit_barrier());
+        }
         return true;
     } else if (src0->type == GGML_TYPE_MXFP4) {
         const bool use_soa = (layout == GGML_LAYOUT_SOA);
@@ -37508,6 +38392,9 @@ static bool ggml_sycl_mul_mat_id_fused(ggml_backend_sycl_context & ctx,
                     n_ids, num_tokens, ne11, ids_nb0, ids_nb1, nb11, nb12, nb1, nb2, *stream);
                 GGML_SYCL_DEBUG("[MoE FUSED] MXFP4 parallel kernel launched (tokens=%ld)\n", (long) num_tokens);
             }
+        }
+        if (!fused_routes.leases.empty()) {
+            ggml_sycl::retain_handles_until_event(std::move(fused_routes.leases), stream->ext_oneapi_submit_barrier());
         }
         return true;
     }
@@ -39048,12 +39935,14 @@ static void ggml_sycl_moe_row_agg_log_descriptor(const moe_layer_decode_plan &  
 
     fprintf(stderr,
             "[MOE-ROW-AGG] stage=descriptor path=%s tensor=%s layer=%d role=%s submit_device=%d "
-            "layout=%s batch=%lld topk=%lld entries=%zu groups=%zu device_groups=%zu host_groups=%zu "
+            "executor=%s reject=%s layout=%s batch=%lld topk=%lld entries=%zu groups=%zu device_groups=%zu host_groups=%zu "
             "missing_groups=%zu device_rows=%zu host_rows=%zu missing_rows=%zu layout_mismatch=%zu "
             "ready_events=%zu unique_handles=%zu grouped_experts=%zu singleton_experts=%zu max_rows=%zu "
             "avg_rows_per_group=%.2f boundary=layer,role,expert,residency,device,layout,mem_handle\n",
             path ? path : "unknown", tensor_name, plan.layer, view.role_name, submit_device,
-            ggml_sycl_layout_mode_name(plan.layout), (long long) view.batch, (long long) view.top_k, view.entries,
+            ggml_sycl::moe_layer_executor_kind_name(plan.executor),
+            ggml_sycl::moe_layer_reject_reason_name(plan.reject_reason), ggml_sycl_layout_mode_name(plan.layout),
+            (long long) view.batch, (long long) view.top_k, view.entries,
             view.n_groups, device_groups, host_groups, missing_groups, view.device_rows, view.host_rows,
             view.missing_rows, view.layout_mismatch_rows, view.ready_events, handle_hashes.size(), grouped, singleton,
             view.max_rows_per_group, avg_rows_per_group);
@@ -39079,6 +39968,13 @@ static void ggml_sycl_moe_row_agg_log_entries_descriptor(
     plan.layer_hash                   = moe_cache_layer_id(weight_name);
     plan.n_ids                        = top_k;
     plan.layout                       = layout;
+    const bool has_secondary_entries =
+        std::any_of(per_gpu_entries.begin(), per_gpu_entries.end(), [](const std::vector<expert_dispatch_entry> & e) {
+            return !e.empty();
+        });
+    plan.executor = !host_entries.empty() || has_secondary_entries ?
+                        ggml_sycl::moe_layer_executor_kind::MIXED_RESIDENCY :
+                        ggml_sycl::moe_layer_executor_kind::MMVQ_COMPAT;
 
     moe_layer_decode_role_plan role;
     role.weight = weight;
@@ -39146,6 +40042,7 @@ static void ggml_sycl_moe_row_agg_log_selected_descriptor(const ggml_tensor * we
     plan.layer_hash                   = moe_cache_layer_id(weight_name);
     plan.n_ids                        = top_k;
     plan.layout                       = layout;
+    plan.executor                     = ggml_sycl::moe_layer_executor_kind::MMVQ_COMPAT;
 
     moe_layer_decode_role_plan role;
     role.weight = weight;
@@ -39886,10 +40783,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // --- Drain deferred scatter from previous CPU-TG call ---
     // The previous call's H2D scatter may still be in-flight reading from
     // thread-local pinned buffers.  Drain before those buffers are reused.
-    static thread_local std::vector<sycl::event> tl_pending_scatter;
-    if (!tl_pending_scatter.empty()) {
-        sycl::event::wait(tl_pending_scatter);
-        tl_pending_scatter.clear();
+    if (!g_cpu_tg_direct_pending_scatter.empty()) {
+        sycl::event::wait(g_cpu_tg_direct_pending_scatter);
+        g_cpu_tg_direct_pending_scatter.clear();
     }
 
     // BCS/DMA drain moved to compute_impl_guard constructor (graph_compute entry).
@@ -40031,9 +40927,25 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         // check first (zero cost), falls back to USM pointer type only when
         // buffer context is unavailable.  Avoids ~0.7ms driver round-trip
         // per call that the old inline get_pointer_type() incurred.
-        const bool   host_weights_fast = ggml_sycl_is_host_resident_weight(src0, ctx.stream());
-        const auto * cpu_traits_fast   = ggml_get_type_traits_cpu(src0->type);
-        const bool   cpu_type_ok_fast  = cpu_traits_fast && cpu_traits_fast->vec_dot;
+        bool       host_weights_fast   = ggml_sycl_is_host_resident_weight(src0, ctx.stream());
+        bool       moe_plan_known_fast = false;
+        const bool moe_plan_host_fast  = ggml_sycl_moe_plan_has_host_experts(src0, ctx.device, &moe_plan_known_fast);
+        if (moe_plan_known_fast) {
+            if (host_weights_fast != moe_plan_host_fast) {
+                static std::atomic<int> moe_plan_residency_log{ 0 };
+                if (moe_plan_residency_log.fetch_add(1, std::memory_order_relaxed) < 8) {
+                    GGML_LOG_WARN(
+                        "[MOE-RESIDENCY] tensor=%s generic_host=%d planner_host=%d device=%d; using planner expert "
+                        "residency\n",
+                        src0->name ? src0->name : "?", host_weights_fast ? 1 : 0, moe_plan_host_fast ? 1 : 0,
+                        ctx.device);
+                }
+            }
+            host_weights_fast = moe_plan_host_fast;
+        }
+        const auto * cpu_traits_fast  = ggml_get_type_traits_cpu(src0->type);
+        const bool   cpu_type_ok_fast = cpu_traits_fast && cpu_traits_fast->vec_dot;
+        const bool   cpu_act_ok_fast  = src1->type == GGML_TYPE_F32;
 
         // Guard: if fusion state is pending but this weight is NOT host-resident,
         // the gate/up/down weights for this layer have mixed residency (some on
@@ -40053,9 +40965,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
         }
 
-        if ((cpu_tg_val_fast == 1 || cpu_tg_val_fast == -2) && host_weights_fast && cpu_type_ok_fast) {
+        const bool cpu_tg_enabled_fast =
+            (cpu_tg_val_fast == 1 || cpu_tg_val_fast == -2) && host_weights_fast && cpu_type_ok_fast &&
+            cpu_act_ok_fast;
+        const bool gpu_pair_probe_fast = !host_weights_fast && cpu_act_ok_fast && src0->type == GGML_TYPE_MXFP4;
+        if (cpu_tg_enabled_fast || gpu_pair_probe_fast) {
             static std::atomic<int> cpu_tg_log{ 0 };
-            if (cpu_tg_log.fetch_add(1, std::memory_order_relaxed) < 3) {
+            if (cpu_tg_enabled_fast && cpu_tg_log.fetch_add(1, std::memory_order_relaxed) < 3) {
                 GGML_LOG_INFO("[CPU-TG] Routing %s (type=%d, ne12=%lld) to CPU-primary path\n",
                               src0->name ? src0->name : "?", (int) src0->type, (long long) ne12);
             }
@@ -40066,17 +40982,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             flush_pending_secondary_scatter_if_consumed(dst);
             flush_pending_cpu_pipeline_if_consumed(dst);
 
-            // Check if multi-GPU secondary dispatch is available.  When active,
-            // fusion is disabled because secondary experts scatter directly to
-            // the gate/up output tensors while fusion bypasses those tensors.
-            const bool multi_gpu_fast     = g_moe_multi_gpu_active.load(std::memory_order_acquire);
+            const bool multi_gpu_fast     = cpu_tg_enabled_fast && g_moe_multi_gpu_active.load(std::memory_order_acquire);
             const bool have_secondary_pre = multi_gpu_fast;
-
-            // --- Gate+Up+SiLU fusion (Phase 4: expert-unit dispatch) ---
-            // Expert routing is resolved ONCE on the first MUL_MAT_ID arrival
-            // (gate or up — ordering varies by model).  The routing decision is
-            // cached and reused for all 3 sub-tensors within the same MoE layer.
-            {
+            if (cpu_tg_enabled_fast) {
+                // Check if multi-GPU secondary dispatch is available.  When active,
+                // fusion is disabled because secondary experts scatter directly to
+                // the gate/up output tensors while fusion bypasses those tensors.
+                // --- Gate+Up+SiLU fusion (Phase 4: expert-unit dispatch) ---
+                // Expert routing is resolved ONCE on the first MUL_MAT_ID arrival
+                // (gate or up — ordering varies by model).  The routing decision is
+                // cached and reused for all 3 sub-tensors within the same MoE layer.
+                {
                 const char *       tname_fast     = src0->name ? src0->name : "";
                 const bool         is_gate_fast   = (strstr(tname_fast, "ffn_gate") != nullptr);
                 const bool         is_up_fast     = (strstr(tname_fast, "ffn_up") != nullptr);
@@ -40335,6 +41251,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     }
 
                     if (g_moe_profile_enabled) {
+                        const moe_tensor_type first_role = is_gate_fast ? MOE_TENSOR_GATE : MOE_TENSOR_UP;
+                        g_moe_profile.moe_route_stats(
+                            first_role, static_cast<int64_t>(fusion.gpu0_cached_indices.size()),
+                            static_cast<int64_t>(fusion.sec_indices.size()),
+                            static_cast<int64_t>(fusion.cpu_indices.size()), 0,
+                            static_cast<int64_t>(fusion.gpu0_cached_indices.size() + fusion.sec_indices.size()),
+                            static_cast<int64_t>(fusion.cpu_indices.size()), 0);
                         g_moe_profile.moe_routing_done();
                     }
 
@@ -40512,7 +41435,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 const int64_t iid1 = static_cast<int64_t>(ci / static_cast<size_t>(n_ids_f));
                                 const int64_t id   = static_cast<int64_t>(ci % static_cast<size_t>(n_ids_f));
                                 char *        slot = dst_device_base + id * nb1 + iid1 * nb2;
-                                tl_pending_scatter.push_back(
+                                g_cpu_tg_direct_pending_scatter.push_back(
                                     stream->memcpy(slot, tl_first_out.as<float>() + i * static_cast<size_t>(N_first),
                                                    static_cast<size_t>(N_first) * sizeof(float)));
                             }
@@ -40786,18 +41709,20 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 char *        slot = dst_d + id * nb1 + iid1 * nb2;
                                 g_pending_scatter.entries.push_back({ slot, static_cast<int>(N_d) });
                             }
-                            g_pending_scatter.future       = std::move(fut);
-                            g_pending_scatter.out_pinned   = tl_down_out.as<float>();
-                            g_pending_scatter.act_pinned   = nullptr;
-                            g_pending_scatter.out_alloc    = {};
-                            g_pending_scatter.act_alloc    = {};
-                            g_pending_scatter.stream       = stream;
-                            g_pending_scatter.sycl_ctx     = stream->get_context();
-                            g_pending_scatter.device_id    = ctx.device;
-                            g_pending_scatter.from_pool    = false;
-                            g_pending_scatter.owns_buffers = false;
-                            g_pending_scatter.active       = true;
-                            g_pending_scatter.dst_tensor   = dst;
+                            g_pending_scatter.future        = std::move(fut);
+                            g_pending_scatter.out_pinned    = tl_down_out.as<float>();
+                            g_pending_scatter.act_pinned    = nullptr;
+                            g_pending_scatter.weight_pinned = nullptr;
+                            g_pending_scatter.out_alloc     = {};
+                            g_pending_scatter.act_alloc     = {};
+                            g_pending_scatter.weight_alloc  = {};
+                            g_pending_scatter.stream        = stream;
+                            g_pending_scatter.sycl_ctx      = stream->get_context();
+                            g_pending_scatter.device_id     = ctx.device;
+                            g_pending_scatter.from_pool     = false;
+                            g_pending_scatter.owns_buffers  = false;
+                            g_pending_scatter.active        = true;
+                            g_pending_scatter.dst_tensor    = dst;
                         }
                     } else {
                         sycl::event::wait(down_events);
@@ -40837,6 +41762,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                        cur_layer_fast, (int) layer_fusion->phase, layer_fusion->layer_id);
                     }
                     moe_fusion_erase(cur_layer_fast);
+                }
                 }
             }
 
@@ -41070,25 +41996,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 const size_t  ids_n_elem = static_cast<size_t>(ids->ne[1] * n_ids_pair);
                 const int     layer_hash = moe_cache_layer_id(tname);
 
-                const int32_t * ids_data = nullptr;
-                auto &          entry    = g_moe_ids_d2h_cache[ids];
-                if (!ggml_sycl_refresh_moe_ids_cache(ctx, ids, entry) || entry.n_elements != ids_n_elem) {
-                    return reject_pair("ids-copy");
-                }
-                ids_data      = entry.host_ids.data();
-                auto & lentry = g_moe_layer_ids_cache[layer];
-                lentry.ids_host.assign(ids_data, ids_data + ids_n_elem);
-                ids_data = lentry.ids_host.data();
-                if (!ids_data) {
-                    return reject_pair("ids-data");
-                }
-
-                ggml_sycl_moe_row_agg_log_selected(src0, ctx.device, ids_data, ids_n_elem, n_ids_pair, ids->ne[1],
-                                                   src0->ne[2], pair_layout, "moe_pair_probe",
-                                                   /*ids_from_cache=*/false,
-                                                   /*use_expert_cache=*/true,
-                                                   /*has_placement_plan=*/false);
-
                 moe_layer_decode_plan plan;
                 plan.layer           = layer;
                 plan.layer_hash      = layer_hash;
@@ -41096,10 +42003,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 plan.n_entries       = ids_n_elem;
                 plan.layout          = pair_layout;
                 plan.current_is_gate = current_is_gate;
-                plan.ids_host        = ids_data;
                 plan.src1            = src1;
                 plan.ids             = ids;
                 plan.pair            = &pair;
+                plan.executor        = ggml_sycl::moe_layer_executor_kind::MMVQ_COMPAT;
+                plan.reject_reason   = ggml_sycl::moe_layer_reject_reason::NONE;
 
                 auto reject_artifact = [&](const char * reason, const ggml_tensor * tensor) -> bool {
                     if (path_trace_enabled != 0) {
@@ -41121,6 +42029,58 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     return reject_artifact("ids-handle", ids);
                 }
                 plan.ids_device = static_cast<const int32_t *>(plan.ids_control.resolved.ptr);
+
+                static const int direct_xmx_ids_required = [] {
+                    const char * probe_env = std::getenv("GGML_SYCL_DIRECT_XMX_MOE_PROBE");
+                    const char * glu_env   = std::getenv("GGML_SYCL_MOE_DIRECT_XMX_GLU");
+                    return ((probe_env && std::atoi(probe_env) != 0) || (glu_env && std::atoi(glu_env) != 0)) ? 1 : 0;
+                }();
+                const bool host_ids_required = ggml_sycl_moe_row_agg_debug_enabled() ||
+                                               ggml_sycl_moe_group_profile_enabled() || path_trace_enabled > 1 ||
+                                               direct_xmx_ids_required != 0;
+                const void * const * all_local_current_ptrs =
+                    host_ids_required ? nullptr : moe_fusion_full_local_ptr_table(src0, ctx.device, pair_layout);
+                const void * const * all_local_partner_ptrs =
+                    host_ids_required ? nullptr :
+                                        moe_fusion_full_local_ptr_table(partner_weight, ctx.device, pair_layout);
+                const bool all_local_pair_tables = all_local_current_ptrs && all_local_partner_ptrs;
+
+                const int32_t * ids_data             = nullptr;
+                auto            ensure_pair_ids_host = [&]() -> bool {
+                    if (ids_data) {
+                        return true;
+                    }
+                    auto & entry = g_moe_ids_d2h_cache[ids];
+                    if (!ggml_sycl_refresh_moe_ids_cache(ctx, ids, entry) || entry.n_elements != ids_n_elem) {
+                        return reject_pair("ids-copy");
+                    }
+                    ids_data      = entry.host_ids.data();
+                    auto & lentry = g_moe_layer_ids_cache[layer];
+                    lentry.ids_host.assign(ids_data, ids_data + ids_n_elem);
+                    ids_data = lentry.ids_host.data();
+                    if (!ids_data) {
+                        return reject_pair("ids-data");
+                    }
+
+                    ggml_sycl_moe_row_agg_log_selected(src0, ctx.device, ids_data, ids_n_elem, n_ids_pair, ids->ne[1],
+                                                                  src0->ne[2], pair_layout, "moe_pair_probe",
+                                                                  /*ids_from_cache=*/false,
+                                                                  /*use_expert_cache=*/true,
+                                                                  /*has_placement_plan=*/false);
+                    plan.ids_host = ids_data;
+                    return true;
+                };
+                if (!all_local_pair_tables) {
+                    if (!ensure_pair_ids_host()) {
+                        return false;
+                    }
+                } else {
+                    g_moe_layer_ids_cache.erase(layer);
+                }
+
+                if (g_moe_profile_enabled) {
+                    g_moe_profile.moe_ids_done();
+                }
 
                 auto log_route_reject = [&](const char * side, const ggml_tensor * tensor, int32_t eid,
                                             const moe_expert_route & route) {
@@ -41145,7 +42105,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 };
 
                 auto build_role_plan = [&](moe_layer_decode_role_plan & role, const ggml_tensor * weight,
-                                           const char * side) -> bool {
+                                           const char * side, layout_mode role_layout) -> bool {
                     const int64_t role_total_experts = weight->ne[2] > 0 ? weight->ne[2] : 1;
                     role.weight                      = weight;
                     role.expert_ids.resize(ids_n_elem);
@@ -41161,15 +42121,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             return reject_pair("expert-id");
                         }
                         moe_expert_route route =
-                            ggml_sycl_resolve_moe_expert_route(weight, ctx.device, eid, pair_layout);
+                            ggml_sycl_resolve_moe_expert_route(weight, ctx.device, eid, role_layout);
                         if (route.kind != moe_expert_route_kind::LOCAL_DEVICE || route.ptr == nullptr ||
-                            route.actual_layout != pair_layout) {
+                            route.actual_layout != role_layout) {
                             log_route_reject(side, weight, eid, route);
                             return reject_pair(side);
                         }
                         ggml_sycl::mem_handle handle   = std::move(route.lease);
                         auto                  resolved = handle.resolve(ctx.device);
-                        if (!resolved.ptr || !resolved.on_device || resolved.layout != pair_layout) {
+                        if (!resolved.ptr || !resolved.on_device || resolved.layout != role_layout) {
                             log_route_reject(side, weight, eid, route);
                             return reject_pair("handle-resolve");
                         }
@@ -41189,8 +42149,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     return true;
                 };
 
-                if (!build_role_plan(plan.current, src0, "current-route") ||
-                    !build_role_plan(plan.partner, partner_weight, "partner-route")) {
+                bool gate_up_plan_ok = true;
+                if (all_local_pair_tables) {
+                    plan.current.weight = src0;
+                    plan.partner.weight = partner_weight;
+                } else {
+                    gate_up_plan_ok = build_role_plan(plan.current, src0, "current-route", pair_layout) &&
+                                      build_role_plan(plan.partner, partner_weight, "partner-route", pair_layout);
+                }
+                if (!gate_up_plan_ok) {
                     return false;
                 }
                 if (current_is_gate) {
@@ -41222,13 +42189,20 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     moe_layer_direct_xmx_trace_decisions(plan, *direct_gate_decision, *direct_up_decision, nullptr);
                 }
 
-                const int32_t * ids_device = plan.ids_device;
+                const int32_t * ids_device               = plan.ids_device;
+                const int       gate_up_dispatch_entries = all_local_pair_tables ?
+                                                               static_cast<int>(ids_n_elem) :
+                                                               static_cast<int>(plan.current.expert_ids.size());
 
                 ggml_sycl_ensure_weight_on_device(partner_weight, ctx.device);
                 const void * const * current_ptrs =
-                    moe_fusion_upload_ptrs_from_handles(ctx, plan.current, layer_hash, pair_layout);
+                    all_local_pair_tables ?
+                        all_local_current_ptrs :
+                        moe_fusion_upload_ptrs_from_handles(ctx, plan.current, layer_hash, pair_layout);
                 const void * const * partner_ptrs =
-                    moe_fusion_upload_ptrs_from_handles(ctx, plan.partner, layer_hash, pair_layout);
+                    all_local_pair_tables ?
+                        all_local_partner_ptrs :
+                        moe_fusion_upload_ptrs_from_handles(ctx, plan.partner, layer_hash, pair_layout);
                 if (!current_ptrs || !partner_ptrs) {
                     return reject_pair(!current_ptrs ? "current-ptrs" : "partner-ptrs");
                 }
@@ -41248,6 +42222,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
                 auto record_pair_profile = [&](int64_t n_gpu_entries) {
                     if (g_moe_profile_enabled) {
+                        const int64_t gate_up_entries = static_cast<int64_t>(gate_up_dispatch_entries);
+                        g_moe_profile.moe_route_stats(MOE_TENSOR_GATE, gate_up_entries, 0, 0, 0, gate_up_entries, 0, 0);
+                        g_moe_profile.moe_route_stats(MOE_TENSOR_UP, gate_up_entries, 0, 0, 0, gate_up_entries, 0, 0);
+                        const int64_t down_entries = n_gpu_entries - 2 * gate_up_entries;
+                        if (down_entries > 0) {
+                            g_moe_profile.moe_route_stats(MOE_TENSOR_DOWN, down_entries, 0, 0, 0, down_entries, 0, 0);
+                        }
                         g_moe_profile.moe_gpu_compute_done();
                         g_moe_profile.moe_compute_done(0, static_cast<int>(n_gpu_entries));
                     }
@@ -41279,19 +42260,33 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     const float * up_bias_ptr =
                         pair.up_bias ? static_cast<const float *>(plan.up_bias.resolved.ptr) : nullptr;
                     if ((!pair.gate_bias || gate_bias_ptr) && (!pair.up_bias || up_bias_ptr)) {
+                        ggml_tensor * gate_split_tmp = nullptr;
+                        ggml_tensor * up_split_tmp   = nullptr;
+                        const auto &  split_caps     = ggml_sycl_info().devices[ctx.device].xmx_caps;
+                        if (xmx_capabilities_support_sub_group(split_caps, 16) &&
+                            moe_layer_capture_tensor_artifact(plan.gate_output, pair.gate_dst, ctx.device,
+                                                              GGML_LAYOUT_AOS, "gate-output", true) &&
+                            moe_layer_capture_tensor_artifact(plan.up_output, pair.up_dst, ctx.device, GGML_LAYOUT_AOS,
+                                                              "up-output", true)) {
+                            gate_split_tmp = pair.gate_dst;
+                            up_split_tmp   = pair.up_dst;
+                        }
                         const float alpha  = ggml_get_op_params_f32(pair.glu_dst, 2);
                         const float limit  = ggml_get_op_params_f32(pair.glu_dst, 3);
                         const bool  ok_glu = mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(
                             ctx, pair.gate_weight, pair.up_weight, src1, pair.glu_dst, gate_ptrs, up_ptrs, ids_device,
                             gate_bias_ptr, up_bias_ptr, pair.gate_bias ? pair.gate_bias->nb[1] : 0,
-                            pair.up_bias ? pair.up_bias->nb[1] : 0, static_cast<int>(plan.current.expert_ids.size()),
-                            n_ids_pair, ids->nb[0], ids->nb[1], pair.glu_op, alpha, limit, &plan.glu_output.handle,
+                            pair.up_bias ? pair.up_bias->nb[1] : 0, gate_up_dispatch_entries, n_ids_pair, ids->nb[0],
+                            ids->nb[1], pair.glu_op, alpha, limit, &plan.glu_output.handle,
                             direct_gate_decision && direct_up_decision && direct_gate_decision->eligible &&
-                                direct_up_decision->eligible);
+                                direct_up_decision->eligible,
+                            gate_split_tmp, up_split_tmp);
                         if (ok_glu) {
                             const bool direct_xmx_glu_used = direct_xmx_glu_enabled != 0 && direct_gate_decision &&
                                                              direct_up_decision && direct_gate_decision->eligible &&
                                                              direct_up_decision->eligible;
+                            plan.executor = direct_xmx_glu_used ? ggml_sycl::moe_layer_executor_kind::DIRECT_XMX :
+                                                                  ggml_sycl::moe_layer_executor_kind::FUSED_LAYER;
                             const char * gate_up_executor = direct_xmx_glu_used ? "direct-xmx-glu" : "mmvq-pair-glu";
                             moe_layer_group_profile_record(plan, plan.gate, "gate", gate_up_executor, ctx.device);
                             moe_layer_group_profile_record(plan, plan.up, "up", gate_up_executor, ctx.device);
@@ -41308,13 +42303,26 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 pair.down_dst && pair.down_dst->src[1] == pair.glu_dst &&
                                 pair.down_dst->src[2] == ids && pair.down_index > pair.glu_index &&
                                 pair.down_weight->type == GGML_TYPE_MXFP4 &&
-                                ggml_sycl_adjust_layout_for_tensor(pair.down_weight, requested_layout, ctx.device) ==
-                                    pair_layout &&
                                 pair.glu_dst->ne[0] == pair.down_weight->ne[0] && pair.glu_dst->ne[1] == n_ids_pair &&
                                 pair.glu_dst->ne[2] == ids->ne[1]) {
+                                const int64_t down_tokens           = pair.glu_dst->ne[2];
+                                layout_mode   requested_down_layout = has_override ?
+                                                                          override_layout :
+                                                                          ggml_sycl_select_moe_decode_down_layout(
+                                                                            pair.down_weight, ctx.device, down_tokens);
+                                layout_mode   down_layout           = ggml_sycl_adjust_layout_for_tensor(
+                                    pair.down_weight, requested_down_layout, ctx.device);
+                                if (!ggml_sycl_moe_mmvq_batched_supports_layout(pair.down_weight->type, down_layout)) {
+                                    if (path_trace_enabled != 0) {
+                                        fprintf(stderr,
+                                                "[MOE-PAIR-REJECT] cur=%s reason=down-layout layout=%s requested=%s\n",
+                                                tname, ggml_sycl_layout_mode_name(down_layout),
+                                                ggml_sycl_layout_mode_name(requested_down_layout));
+                                    }
+                                    return reject_pair("down-layout");
+                                }
                                 static thread_local std::vector<int64_t> down_iid1s;
                                 static thread_local std::vector<int64_t> down_ids;
-                                const int64_t                            down_tokens = pair.glu_dst->ne[2];
                                 const size_t                             down_entries =
                                     static_cast<size_t>(n_ids_pair) * static_cast<size_t>(down_tokens);
                                 plan.down_eligible = true;
@@ -41332,15 +42340,78 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
                                 const int down_layer_hash = moe_cache_layer_id(pair.down_weight->name);
                                 ggml_sycl_ensure_weight_on_device(pair.down_weight, ctx.device);
-                                const bool down_plan_ok = build_role_plan(plan.down, pair.down_weight, "down-route");
+                                const void * const * down_all_local_ptrs =
+                                    all_local_pair_tables ?
+                                        moe_fusion_full_local_ptr_table(pair.down_weight, ctx.device, down_layout) :
+                                        nullptr;
+                                const bool           down_all_local_table   = down_all_local_ptrs != nullptr;
+                                bool                 down_plan_ok           = true;
+                                bool                 down_use_full_id_table = down_all_local_table;
+                                const void * const * down_ptrs              = down_all_local_ptrs;
+                                if (down_all_local_table) {
+                                    plan.down.weight = pair.down_weight;
+                                } else if (down_layout == GGML_LAYOUT_MXFP4_I8) {
+                                    static thread_local std::vector<int32_t> down_forced_ids;
+                                    down_plan_ok = ensure_pair_ids_host();
+                                    if (down_plan_ok) {
+                                        down_forced_ids.assign(ids_data, ids_data + ids_n_elem);
+                                        for (const int32_t eid : down_forced_ids) {
+                                            moe_expert_route i8_route = ggml_sycl_resolve_moe_expert_route(
+                                                pair.down_weight, ctx.device, eid, GGML_LAYOUT_MXFP4_I8);
+                                            if (i8_route.kind == moe_expert_route_kind::LOCAL_DEVICE &&
+                                                i8_route.ptr != nullptr &&
+                                                i8_route.actual_layout == GGML_LAYOUT_MXFP4_I8) {
+                                                continue;
+                                            }
+                                            moe_expert_route soa_route = ggml_sycl_resolve_moe_expert_route(
+                                                pair.down_weight, ctx.device, eid, GGML_LAYOUT_SOA);
+                                            if (soa_route.kind != moe_expert_route_kind::LOCAL_DEVICE ||
+                                                soa_route.ptr == nullptr ||
+                                                soa_route.actual_layout != GGML_LAYOUT_SOA) {
+                                                down_plan_ok = false;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if (down_plan_ok) {
+                                        sycl::event table_event;
+                                        down_plan_ok = ggml_sycl_update_moe_ptr_table(
+                                            ctx, pair.down_weight, ids, down_layout, &table_event,
+                                            /*allow_all_experts=*/false, &down_forced_ids,
+                                            /*skip_device_copy=*/false,
+                                            /*force_cache_aos=*/false,
+                                            /*skip_cpu_routed_experts=*/false,
+                                            /*exact_layout_required=*/true);
+                                        auto * down_extra =
+                                            static_cast<ggml_tensor_extra_gpu *>(pair.down_weight->extra);
+                                        down_ptrs = (down_plan_ok && down_extra) ?
+                                                        static_cast<const void * const *>(
+                                                            down_extra->moe_ptrs_ptr(ctx.device)) :
+                                                        nullptr;
+                                    }
+                                    if (down_plan_ok && down_ptrs) {
+                                        plan.down.weight = pair.down_weight;
+                                        plan.down.expert_ids.assign(ids_data, ids_data + ids_n_elem);
+                                        down_use_full_id_table = true;
+                                    }
+                                } else {
+                                    down_plan_ok =
+                                        ensure_pair_ids_host() &&
+                                        build_role_plan(plan.down, pair.down_weight, "down-route", down_layout);
+                                    if (down_plan_ok) {
+                                        down_ptrs = moe_fusion_upload_ptrs_from_handles(ctx, plan.down, down_layer_hash,
+                                                                                        down_layout);
+                                    }
+                                }
                                 if (down_plan_ok) {
                                     ggml_sycl_moe_row_agg_log_descriptor(plan, plan.down, "down", ctx.device,
                                                                          "moe_pair_down_descriptor");
                                 }
                                 std::optional<moe_layer_direct_xmx_decision> direct_down_decision;
-                                if (direct_xmx_probe && down_plan_ok && direct_gate_decision && direct_up_decision) {
+                                if (direct_xmx_probe && down_plan_ok && direct_gate_decision && direct_up_decision &&
+                                    down_layout == pair_layout) {
                                     direct_down_decision = moe_layer_direct_xmx_check_role(plan.down, ctx.device,
-                                                                                           down_entries, pair_layout);
+                                                                                           down_entries, down_layout);
                                     moe_layer_direct_xmx_trace_decisions(plan, *direct_gate_decision,
                                                                          *direct_up_decision, &*direct_down_decision);
                                 }
@@ -41349,16 +42420,19 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                                                        GGML_LAYOUT_AOS, "down-output", true)) {
                                     return reject_artifact("down-output-handle", pair.down_dst);
                                 }
-                                const void * const * down_ptrs = down_plan_ok ?
-                                                                     moe_fusion_upload_ptrs_from_handles(
-                                                                         ctx, plan.down, down_layer_hash, pair_layout) :
-                                                                     nullptr;
                                 if (down_ptrs) {
+                                    static thread_local std::vector<int32_t> down_dummy_expert_ids;
+                                    const int32_t * down_expert_ids = plan.down.expert_ids.data();
+                                    int down_dispatch_entries       = static_cast<int>(plan.down.expert_ids.size());
+                                    if (down_use_full_id_table) {
+                                        down_dummy_expert_ids.assign(down_entries, 0);
+                                        down_expert_ids       = down_dummy_expert_ids.data();
+                                        down_dispatch_entries = static_cast<int>(down_entries);
+                                    }
                                     ok_down = mmvq_moe_batched_dispatch(
-                                        ctx, pair.down_weight, pair.glu_dst, pair.down_dst, down_ptrs,
-                                        plan.down.expert_ids.data(), down_iid1s.data(), down_ids.data(),
-                                        static_cast<int>(plan.down.expert_ids.size()),
-                                        static_cast<int>(pair.down_weight->ne[2]), n_ids_pair, pair_layout, ids_device,
+                                        ctx, pair.down_weight, pair.glu_dst, pair.down_dst, down_ptrs, down_expert_ids,
+                                        down_iid1s.data(), down_ids.data(), down_dispatch_entries,
+                                        static_cast<int>(pair.down_weight->ne[2]), n_ids_pair, down_layout, ids_device,
                                         ids->nb[0], ids->nb[1], &plan.glu_output.handle);
                                     if (ok_down) {
                                         moe_layer_group_profile_record(plan, plan.down, "down", "mmvq-down",
@@ -41368,12 +42442,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                     if (ok_down && path_trace_enabled != 0) {
                                         fprintf(stderr,
                                                 "[MOE-PAIR] path=pair_glu_down tensor=%s down=%s layer=%d entries=%zu "
-                                                "tokens=%lld skip_later=%d device=%d glu=%p down_out=%p\n",
+                                                "tokens=%lld skip_later=%d device=%d layout=%s glu=%p down_out=%p\n",
                                                 src0->name ? src0->name : "?",
                                                 pair.down_weight->name ? pair.down_weight->name : "?", layer,
                                                 plan.down.expert_ids.size(), (long long) down_tokens,
                                                 layer_executor_skip_eligible ? 1 : 0, ctx.device,
-                                                plan.glu_output.resolved.ptr, plan.down_output.resolved.ptr);
+                                                ggml_sycl_layout_mode_name(down_layout), plan.glu_output.resolved.ptr,
+                                                plan.down_output.resolved.ptr);
                                     }
                                     if (ok_down && layer_executor_enabled == 1 && !layer_executor_skip_eligible &&
                                         !layer_executor_graph_warning_shown) {
@@ -41410,8 +42485,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 g_moe_precomputed_mmid_skip.insert(pair.down_dst);
                             }
                             const int64_t matrices_executed = ok_down ? 3 : 2;
-                            record_pair_profile(matrices_executed *
-                                                static_cast<int64_t>(plan.current.expert_ids.size()));
+                            record_pair_profile(matrices_executed * static_cast<int64_t>(gate_up_dispatch_entries));
                             return true;
                         }
                     }
@@ -41419,7 +42493,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
                 const bool ok = mmvq_moe_batched_dispatch_pair_mxfp4_soa(
                     ctx, src0, partner_weight, src1, dst, partner_dst, current_ptrs, partner_ptrs, ids_device,
-                    static_cast<int>(plan.current.expert_ids.size()), n_ids_pair, ids->nb[0], ids->nb[1]);
+                    gate_up_dispatch_entries, n_ids_pair, ids->nb[0], ids->nb[1]);
                 if (ok) {
                     moe_layer_group_profile_record(plan, plan.current, current_is_gate ? "gate" : "up", "mmvq-pair-raw",
                                                    ctx.device);
@@ -41434,13 +42508,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 (long long) n_ids_pair, ctx.device);
                     }
                     g_moe_precomputed_mmid_skip.insert(partner_dst);
-                    record_pair_profile(2 * static_cast<int64_t>(plan.current.expert_ids.size()));
+                    record_pair_profile(2 * static_cast<int64_t>(gate_up_dispatch_entries));
                 }
                 return ok ? true : reject_pair("dispatch-false");
             };
 
             if (!xmx_moe_forced && try_gpu_moe_pair()) {
                 return;
+            }
+
+            if (!cpu_tg_enabled_fast) {
+                goto cpu_tg_fallthrough;
             }
 
             // --- Phase-level profiling (enabled by GGML_SYCL_CPU_TG_PROFILE=1) ---
@@ -41466,7 +42544,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
             using hrc = std::chrono::high_resolution_clock;
             hrc::time_point t0, t1, t2, t3, t4;
-            if (prof_enabled) {
+            const bool      moe_phase_timing_enabled = prof_enabled || g_moe_profile_enabled;
+            if (moe_phase_timing_enabled) {
                 t0 = hrc::now();
             }
 
@@ -41488,7 +42567,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
             ids_data = entry.host_ids.data();
 
-            if (prof_enabled) {
+            if (moe_phase_timing_enabled) {
                 t1 = hrc::now();
             }
             if (g_moe_profile_enabled) {
@@ -41528,7 +42607,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // --- Activation resolve: check if src1 is already host-accessible ---
             // For mmap'd models or host-pinned compute buffers, src1 may already
             // be in host memory. Skip D2H copy in that case.
-            const float * act_host_ptr = nullptr;
+            const float * act_host_ptr       = nullptr;
+            const char *  act_host_base_fast = nullptr;
 
             // Use USM host-pinned buffer for activation D2H.  Page-locked
             // memory enables direct DMA from GPU to host, avoiding the
@@ -41556,17 +42636,25 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // with the routing/placement work below.  We defer the wait until
             // just before CPU compute actually reads the data.
             sycl::event act_d2h_evt;
-            bool        act_d2h_pending = false;
+            bool        act_d2h_pending    = false;
+            size_t      act_d2h_bytes_fast = 0;
 
             if (src1_on_host) {
                 // Zero-copy: use src1 data directly from host
-                act_host_ptr = static_cast<const float *>(src1_host_storage);
+                act_host_base_fast = static_cast<const char *>(src1_host_storage);
+                act_host_ptr       = reinterpret_cast<const float *>(act_host_base_fast);
             } else {
                 // D2H: copy activation to pinned host buffer (reused across calls).
                 // Pinned memory enables direct DMA without internal staging.
-                const size_t act_floats = static_cast<size_t>(K);
-                if (!tl_act_pinned.ensure(*stream, ctx.device, act_floats * sizeof(float),
-                                          ggml_sycl::alloc_role::EXPERT_STAGING,
+                if (!src1_device_base) {
+                    cpu_tg_alloc_failed = true;
+                    goto cpu_tg_fallthrough;
+                }
+                const size_t act_bytes = static_cast<size_t>(ne12 > 0 ? ne12 - 1 : 0) * nb12 +
+                                         static_cast<size_t>(ne11 > 0 ? ne11 - 1 : 0) * nb11 +
+                                         static_cast<size_t>(K) * sizeof(float);
+                act_d2h_bytes_fast = act_bytes;
+                if (!tl_act_pinned.ensure(*stream, ctx.device, act_bytes, ggml_sycl::alloc_role::EXPERT_STAGING,
                                           ggml_sycl::runtime_category::HOST_COMPUTE, "moe_cpu_tg_act")) {
                     GGML_LOG_ERROR(
                         "[CPU-TG] Failed activation staging alloc for %s; "
@@ -41575,12 +42663,21 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     cpu_tg_alloc_failed = true;
                     goto cpu_tg_fallthrough;
                 }
-                act_d2h_evt = stream->memcpy(tl_act_pinned.as<float>(), src1_device_base, act_floats * sizeof(float));
-                act_d2h_pending = true;
-                act_host_ptr    = tl_act_pinned.as<float>();
+                act_d2h_evt        = stream->memcpy(tl_act_pinned.as<float>(), src1_device_base, act_bytes);
+                act_d2h_pending    = true;
+                act_host_base_fast = reinterpret_cast<const char *>(tl_act_pinned.as<float>());
+                act_host_ptr       = reinterpret_cast<const float *>(act_host_base_fast);
             }
 
-            if (prof_enabled) {
+            auto act_ptr_for_slot_fast = [&](size_t ci) -> const float * {
+                const int64_t iid1 = static_cast<int64_t>(ci / static_cast<size_t>(n_ids_f));
+                const int64_t id   = static_cast<int64_t>(ci % static_cast<size_t>(n_ids_f));
+                const int64_t i11  = ne11 > 0 ? id % ne11 : 0;
+                const size_t  off  = static_cast<size_t>(i11) * nb11 + static_cast<size_t>(iid1) * nb12;
+                return reinterpret_cast<const float *>(act_host_base_fast + off);
+            };
+
+            if (moe_phase_timing_enabled) {
                 t2 = hrc::now();
             }
             if (g_moe_profile_enabled) {
@@ -41697,24 +42794,38 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
             // --- Route experts to GPU0 VRAM cache / secondary GPUs / CPU ---
             // Reuse have_secondary_pre and placement_table_pre computed above.
-            const bool   have_secondary_fast = have_secondary_pre;
-            const int    n_gpu_devs_fast     = have_secondary_fast ? ggml_sycl_info().total_gpu_count : 0;
-            const char * tname_layer         = src0->name ? src0->name : "";
+            const bool            have_secondary_fast = have_secondary_pre;
+            const int             n_gpu_devs_fast     = have_secondary_fast ? ggml_sycl_info().total_gpu_count : 0;
+            const char *          tname_layer         = src0->name ? src0->name : "";
             // Always compute layer hash — needed for GPU0 cache lookup even in single-GPU mode
-            const int    layer_id_fast       = parse_layer_id_from_name(tname_layer);
-            const int    layer_hash_fast     = moe_cache_layer_id(tname_layer);
+            const int             layer_id_fast       = parse_layer_id_from_name(tname_layer);
+            const int             layer_hash_fast     = moe_cache_layer_id(tname_layer);
+            const moe_tensor_type role_unfused        = moe_classify_tensor(tname_layer);
 
             // Check placement table for GPU0-cached experts.
             // Experts get staged to VRAM during PP via the hybrid dispatch path
             // (which calls update_moe_ptr_table → direct_stage_expert).
             // Here we just check what's already cached — no new staging.
             const layout_mode requested_layout_fast =
-                has_override ? override_layout : ggml_sycl_select_moe_mmvq_layout(src0, ctx.device, true);
+                has_override ? override_layout : ggml_sycl_select_moe_expert_cache_layout(src0, ctx.device, ne12);
             layout_mode route_layout_fast = ggml_sycl_adjust_layout_for_tensor(src0, requested_layout_fast, ctx.device);
             const bool  exact_layout_fast = has_override && route_layout_fast == override_layout;
             if (has_override && !exact_layout_fast && g_ggml_sycl_debug) {
                 GGML_SYCL_DEBUG("[MoE] Requested layout=%d unsupported for %s, using layout=%d\n",
                                 (int) override_layout, src0->name ? src0->name : "?", (int) route_layout_fast);
+            }
+            if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                static std::atomic<int> logged_fast_layout{ 0 };
+                const int               n = logged_fast_layout.fetch_add(1, std::memory_order_relaxed);
+                if (n < 120) {
+                    fprintf(stderr,
+                            "[MOE-FAST-LAYOUT] tensor=%s device=%d requested=%s route_layout=%s has_override=%d "
+                            "exact=%d ne12=%lld\n",
+                            src0 && src0->name ? src0->name : "?", ctx.device,
+                            ggml_sycl_layout_mode_name(requested_layout_fast),
+                            ggml_sycl_layout_mode_name(route_layout_fast), has_override ? 1 : 0,
+                            exact_layout_fast ? 1 : 0, (long long) ne12);
+                }
             }
             auto * extra_fast = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
 
@@ -41753,6 +42864,29 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             int64_t *            g0_iid1s = stack_g0_iid1s;
             int64_t *            g0_ids   = stack_g0_ids;
             size_t               n_gpu0   = 0;
+            const bool           gpu0_mmvq_supported_fast =
+                ggml_sycl_moe_mmvq_batched_supports_layout(src0->type, route_layout_fast);
+            auto push_gpu0_fast = [&](int32_t expert_id_fast, size_t ci_fast) -> bool {
+                if (!gpu0_mmvq_supported_fast) {
+                    return false;
+                }
+                if (n_gpu0 >= STACK_GPU0 && heap_g0_eids.empty()) {
+                    heap_g0_eids.resize(n_cpu);
+                    heap_g0_iid1s.resize(n_cpu);
+                    heap_g0_ids.resize(n_cpu);
+                    memcpy(heap_g0_eids.data(), stack_g0_eids, STACK_GPU0 * sizeof(int32_t));
+                    memcpy(heap_g0_iid1s.data(), stack_g0_iid1s, STACK_GPU0 * sizeof(int64_t));
+                    memcpy(heap_g0_ids.data(), stack_g0_ids, STACK_GPU0 * sizeof(int64_t));
+                    g0_eids  = heap_g0_eids.data();
+                    g0_iid1s = heap_g0_iid1s.data();
+                    g0_ids   = heap_g0_ids.data();
+                }
+                g0_eids[n_gpu0]  = expert_id_fast;
+                g0_iid1s[n_gpu0] = static_cast<int64_t>(ci_fast / static_cast<size_t>(n_ids_f));
+                g0_ids[n_gpu0]   = static_cast<int64_t>(ci_fast % static_cast<size_t>(n_ids_f));
+                n_gpu0++;
+                return true;
+            };
 
             // Build task array on stack for small expert counts, heap for large.
             // Typical: 8 experts (top-K), max ~16.
@@ -41765,10 +42899,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 tasks_ptr = heap_tasks.data();
             }
 
-            int                   n_tasks       = 0;
-            int                   n_sec_skipped = 0;
-            const int             block_unfused = layer_id_fast;
-            const moe_tensor_type role_unfused  = moe_classify_tensor(tname_layer);
+            int       n_tasks            = 0;
+            int       n_sec_skipped      = 0;
+            double    cpu_tg_act_wait_us = 0.0;
+            double    cpu_tg_compute_us  = 0.0;
+            double    cpu_tg_h2d_us      = 0.0;
+            const int block_unfused      = layer_id_fast;
             for (size_t ci = 0; ci < n_cpu; ci++) {
                 float *               out_ptr              = tl_out_pinned.as<float>() + ci * static_cast<size_t>(N);
                 const void *          resolved_host_weight = nullptr;
@@ -41805,42 +42941,33 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         ctx.device < GGML_SYCL_MAX_DEVICES &&
                         static_cast<size_t>(expert_id) < extra_fast->moe_expert_ptrs_host[ctx.device].size() &&
                         extra_fast->moe_expert_ptrs_host[ctx.device][expert_id] != nullptr) {
-                        if (n_gpu0 >= STACK_GPU0 && heap_g0_eids.empty()) {
-                            heap_g0_eids.resize(n_cpu);
-                            heap_g0_iid1s.resize(n_cpu);
-                            heap_g0_ids.resize(n_cpu);
-                            memcpy(heap_g0_eids.data(), stack_g0_eids, STACK_GPU0 * sizeof(int32_t));
-                            memcpy(heap_g0_iid1s.data(), stack_g0_iid1s, STACK_GPU0 * sizeof(int64_t));
-                            memcpy(heap_g0_ids.data(), stack_g0_ids, STACK_GPU0 * sizeof(int64_t));
-                            g0_eids  = heap_g0_eids.data();
-                            g0_iid1s = heap_g0_iid1s.data();
-                            g0_ids   = heap_g0_ids.data();
+                        auto & table_handles = extra_fast->moe_expert_handles[ctx.device];
+                        if (static_cast<size_t>(expert_id) < table_handles.size()) {
+                            ggml_sycl::mem_handle table_handle = table_handles[static_cast<size_t>(expert_id)];
+                            auto                  resolved     = table_handle.resolve(ctx.device);
+                            if (resolved.ptr ==
+                                    extra_fast->moe_expert_ptrs_host[ctx.device][static_cast<size_t>(expert_id)] &&
+                                resolved.on_device && resolved.layout == route_layout_fast) {
+                                if (push_gpu0_fast(expert_id, ci)) {
+                                    continue;
+                                }
+                            } else if (resolved.ptr && !resolved.on_device) {
+                                resolved_host_weight = resolved.ptr;
+                                resolved_host_lease  = std::move(table_handle);
+                                goto cpu_fallback_fast;
+                            }
                         }
-                        g0_eids[n_gpu0]  = expert_id;
-                        g0_iid1s[n_gpu0] = static_cast<int64_t>(ci / static_cast<size_t>(n_ids_f));
-                        g0_ids[n_gpu0]   = static_cast<int64_t>(ci % static_cast<size_t>(n_ids_f));
-                        n_gpu0++;
-                        continue;
                     }
                     moe_expert_route route =
                         ggml_sycl_resolve_moe_expert_route(src0, ctx.device, expert_id, route_layout_fast);
                     if (route.kind == moe_expert_route_kind::LOCAL_DEVICE && route.ptr) {
-                        if (n_gpu0 >= STACK_GPU0 && heap_g0_eids.empty()) {
-                            heap_g0_eids.resize(n_cpu);
-                            heap_g0_iid1s.resize(n_cpu);
-                            heap_g0_ids.resize(n_cpu);
-                            memcpy(heap_g0_eids.data(), stack_g0_eids, STACK_GPU0 * sizeof(int32_t));
-                            memcpy(heap_g0_iid1s.data(), stack_g0_iid1s, STACK_GPU0 * sizeof(int64_t));
-                            memcpy(heap_g0_ids.data(), stack_g0_ids, STACK_GPU0 * sizeof(int64_t));
-                            g0_eids  = heap_g0_eids.data();
-                            g0_iid1s = heap_g0_iid1s.data();
-                            g0_ids   = heap_g0_ids.data();
+                        if (push_gpu0_fast(expert_id, ci)) {
+                            continue;
                         }
-                        g0_eids[n_gpu0]  = expert_id;
-                        g0_iid1s[n_gpu0] = static_cast<int64_t>(ci / static_cast<size_t>(n_ids_f));
-                        g0_ids[n_gpu0]   = static_cast<int64_t>(ci % static_cast<size_t>(n_ids_f));
-                        n_gpu0++;
-                        continue;
+                        resolved_host_weight = src0_host_storage ? static_cast<const char *>(src0_host_storage) +
+                                                                       static_cast<size_t>(expert_id) * nb02 :
+                                                                   nullptr;
+                        goto cpu_fallback_fast;
                     }
                     if (route.kind == moe_expert_route_kind::SECONDARY_DEVICE && route.ptr &&
                         route.owning_device >= 0 && route.owning_device < n_gpu_devs_fast &&
@@ -41876,22 +43003,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     // Check GPU0 cache via is_expert_resident
                     if (is_expert_resident(block_unfused, expert_id, ctx.device)) {
                         // Route to GPU0 VRAM cache — dispatch via MMVQ
-                        if (n_gpu0 >= STACK_GPU0 && heap_g0_eids.empty()) {
-                            heap_g0_eids.resize(n_cpu);
-                            heap_g0_iid1s.resize(n_cpu);
-                            heap_g0_ids.resize(n_cpu);
-                            memcpy(heap_g0_eids.data(), stack_g0_eids, STACK_GPU0 * sizeof(int32_t));
-                            memcpy(heap_g0_iid1s.data(), stack_g0_iid1s, STACK_GPU0 * sizeof(int64_t));
-                            memcpy(heap_g0_ids.data(), stack_g0_ids, STACK_GPU0 * sizeof(int64_t));
-                            g0_eids  = heap_g0_eids.data();
-                            g0_iid1s = heap_g0_iid1s.data();
-                            g0_ids   = heap_g0_ids.data();
+                        if (push_gpu0_fast(expert_id, ci)) {
+                            continue;
                         }
-                        g0_eids[n_gpu0]  = expert_id;
-                        g0_iid1s[n_gpu0] = static_cast<int64_t>(ci / static_cast<size_t>(n_ids_f));
-                        g0_ids[n_gpu0]   = static_cast<int64_t>(ci % static_cast<size_t>(n_ids_f));
-                        n_gpu0++;
-                        continue;
+                        resolved_host_weight = src0_host_storage ? static_cast<const char *>(src0_host_storage) +
+                                                                       static_cast<size_t>(expert_id) * nb02 :
+                                                                   nullptr;
+                        goto cpu_fallback_fast;
                     }
                     // Check secondary GPUs for cached experts
                     if (have_secondary_fast) {
@@ -41916,22 +43034,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     {
                         auto & pf_unfused = g_expert_prefetchers[ctx.device];
                         if (pf_unfused.is_initialized() && pf_unfused.get_cached_ptr(layer_hash_fast, expert_id)) {
-                            if (n_gpu0 >= STACK_GPU0 && heap_g0_eids.empty()) {
-                                heap_g0_eids.resize(n_cpu);
-                                heap_g0_iid1s.resize(n_cpu);
-                                heap_g0_ids.resize(n_cpu);
-                                memcpy(heap_g0_eids.data(), stack_g0_eids, STACK_GPU0 * sizeof(int32_t));
-                                memcpy(heap_g0_iid1s.data(), stack_g0_iid1s, STACK_GPU0 * sizeof(int64_t));
-                                memcpy(heap_g0_ids.data(), stack_g0_ids, STACK_GPU0 * sizeof(int64_t));
-                                g0_eids  = heap_g0_eids.data();
-                                g0_iid1s = heap_g0_iid1s.data();
-                                g0_ids   = heap_g0_ids.data();
+                            if (push_gpu0_fast(expert_id, ci)) {
+                                continue;
                             }
-                            g0_eids[n_gpu0]  = expert_id;
-                            g0_iid1s[n_gpu0] = static_cast<int64_t>(ci / static_cast<size_t>(n_ids_f));
-                            g0_ids[n_gpu0]   = static_cast<int64_t>(ci % static_cast<size_t>(n_ids_f));
-                            n_gpu0++;
-                            continue;
+                            resolved_host_weight = src0_host_storage ? static_cast<const char *>(src0_host_storage) +
+                                                                           static_cast<size_t>(expert_id) * nb02 :
+                                                                       nullptr;
+                            goto cpu_fallback_fast;
                         }
                     }
                 }
@@ -41948,33 +43057,53 @@ cpu_fallback_fast:
                 {
                     ggml_sycl::legacy_expert_resolve_result resolved{};
                     if (!resolved_host_weight) {
-                        resolved = ggml_sycl::ggml_sycl_resolve_expert_ptr(src0, ctx.device, expert_id);
-                        if (resolved.ptr && resolved.is_host) {
-                            resolved_host_weight = resolved.ptr;
-                            resolved_host_lease  = std::move(resolved.lease);
+                        if (have_plan_fast) {
+                            moe_expert_route planned_route =
+                                ggml_sycl_resolve_moe_expert_route(src0, ctx.device, expert_id, route_layout_fast);
+                            if (planned_route.kind == moe_expert_route_kind::LOCAL_DEVICE && planned_route.ptr) {
+                                if (push_gpu0_fast(expert_id, ci)) {
+                                    continue;
+                                }
+                                static std::atomic<int> unsupported_planned_gpu_log{ 0 };
+                                if (unsupported_planned_gpu_log.fetch_add(1, std::memory_order_relaxed) < 5) {
+                                    GGML_LOG_WARN(
+                                        "[CPU-TG] Planned device expert cannot use fast GPU dispatcher; "
+                                        "tensor=%s expert=%d layout=%d\n",
+                                        src0->name ? src0->name : "?", expert_id, (int) route_layout_fast);
+                                }
+                                continue;
+                            }
+                            if (planned_route.kind == moe_expert_route_kind::HOST && planned_route.ptr) {
+                                resolved_host_weight = planned_route.ptr;
+                                resolved_host_lease  = std::move(planned_route.lease);
+                            } else if (ggml_sycl_moe_route_is_layout_miss(planned_route)) {
+                                continue;
+                            } else {
+                                ggml_sycl_abort_unresolved_device_expert(src0, expert_id, ctx.device, planned_route);
+                                GGML_UNREACHABLE();
+                            }
+                        } else {
+                            resolved = ggml_sycl::ggml_sycl_resolve_expert_ptr(src0, ctx.device, expert_id);
+                            if (resolved.ptr && resolved.is_host) {
+                                resolved_host_weight = resolved.ptr;
+                                resolved_host_lease  = std::move(resolved.lease);
+                            } else if (resolved.ptr && !resolved.is_host) {
+                                if (push_gpu0_fast(expert_id, ci)) {
+                                    continue;
+                                }
+                            }
                         }
                     }
                     n04bq_probe_log("cpu-tg-fast/task", src0->name, expert_id,
                                     "host_weight=%p act_host_ptr=%p out_ptr=%p K=%lld N=%lld", resolved_host_weight,
                                     act_host_ptr, out_ptr, (long long) K, (long long) N);
                     if (!resolved_host_weight) {
-                        // Expert is device-resident -- route to GPU0 dispatch instead of CPU.
-                        if (n_gpu0 >= STACK_GPU0 && heap_g0_eids.empty()) {
-                            heap_g0_eids.resize(n_cpu);
-                            heap_g0_iid1s.resize(n_cpu);
-                            heap_g0_ids.resize(n_cpu);
-                            memcpy(heap_g0_eids.data(), stack_g0_eids, STACK_GPU0 * sizeof(int32_t));
-                            memcpy(heap_g0_iid1s.data(), stack_g0_iid1s, STACK_GPU0 * sizeof(int64_t));
-                            memcpy(heap_g0_ids.data(), stack_g0_ids, STACK_GPU0 * sizeof(int64_t));
-                            g0_eids  = heap_g0_eids.data();
-                            g0_iid1s = heap_g0_iid1s.data();
-                            g0_ids   = heap_g0_ids.data();
+                        resolved_host_weight = src0_host_storage ? static_cast<const char *>(src0_host_storage) +
+                                                                       static_cast<size_t>(expert_id) * nb02 :
+                                                                   nullptr;
+                        if (!resolved_host_weight) {
+                            continue;
                         }
-                        g0_eids[n_gpu0]  = expert_id;
-                        g0_iid1s[n_gpu0] = static_cast<int64_t>(ci / static_cast<size_t>(n_ids_f));
-                        g0_ids[n_gpu0]   = static_cast<int64_t>(ci % static_cast<size_t>(n_ids_f));
-                        n_gpu0++;
-                        continue;
                     }
                     tasks_ptr[n_tasks].weight_host  = resolved_host_weight;
                     // llama.cpp-0k543: pin arena chunk for the SYNC batched call.
@@ -41982,7 +43111,7 @@ cpu_fallback_fast:
                     // lock is released between lookup_expert and the dispatch.
                     tasks_ptr[n_tasks].weight_lease = std::move(resolved_host_lease);
                 }
-                tasks_ptr[n_tasks].act_host    = act_host_ptr;
+                tasks_ptr[n_tasks].act_host    = act_ptr_for_slot_fast(ci);
                 tasks_ptr[n_tasks].output_host = out_ptr;
                 tasks_ptr[n_tasks].type        = src0->type;
                 tasks_ptr[n_tasks].K           = static_cast<int>(K);
@@ -42004,6 +43133,12 @@ cpu_fallback_fast:
                         "[CPU-TG-ROUTE] layer=%d: GPU0=%zu secondary=%zu CPU=%d "
                         "skipped=%d multi_gpu=%d\n",
                         layer_id_fast, n_gpu0, n_secondary_total, n_tasks, n_sec_skipped, have_secondary_pre ? 1 : 0);
+                }
+                if (g_moe_profile_enabled) {
+                    g_moe_profile.moe_route_stats(
+                        role_unfused, static_cast<int64_t>(n_gpu0), static_cast<int64_t>(n_secondary_total),
+                        static_cast<int64_t>(n_tasks), 0, static_cast<int64_t>(n_gpu0 + n_secondary_total),
+                        static_cast<int64_t>(n_tasks), 0);
                 }
             }
 
@@ -42240,7 +43375,7 @@ cpu_fallback_fast:
                     nb1,
                     nb2,
                     true,           // act_on_host: fast path already resolved
-                    act_host_ptr,   // shared_act_host
+                    act_host_ptr,   // shared_act_host for broadcast activations
                     sycl::event{},  // act_d2h_event: no-op (already on host)
                     dst             // dst_tensor for tracking
                 };
@@ -42263,7 +43398,7 @@ cpu_fallback_fast:
                             static_cast<size_t>(e.iid1) * static_cast<size_t>(n_ids_f) + static_cast<size_t>(e.id);
                         float * out_fb                  = tl_out_pinned.as<float>() + ci_fb * static_cast<size_t>(N);
                         tasks_ptr[n_tasks].weight_host  = resolved.ptr;
-                        tasks_ptr[n_tasks].act_host     = act_host_ptr;
+                        tasks_ptr[n_tasks].act_host     = act_ptr_for_slot_fast(ci_fb);
                         tasks_ptr[n_tasks].output_host  = out_fb;
                         tasks_ptr[n_tasks].type         = src0->type;
                         tasks_ptr[n_tasks].K            = static_cast<int>(K);
@@ -42294,7 +43429,13 @@ cpu_fallback_fast:
                 // The DMA was submitted earlier and has been running in parallel
                 // with routing/placement work above.
                 if (act_d2h_pending) {
+                    auto t_act_wait0 = hrc::now();
                     act_d2h_evt.wait();
+                    auto t_act_wait1 = hrc::now();
+                    if (g_moe_profile_enabled) {
+                        cpu_tg_act_wait_us +=
+                            std::chrono::duration<double, std::micro>(t_act_wait1 - t_act_wait0).count();
+                    }
                     act_d2h_pending = false;
                 }
                 // llama.cpp-l144i probe: hash the activation AND per-expert weight
@@ -42305,7 +43446,13 @@ cpu_fallback_fast:
                     GGML_SYCL_L144I_PROBE_SCALAR("cputg/task_ptrs", src0->name, -1, layer_id_fast, "weight_host",
                                                  (long long) tasks_ptr[ti].weight_host);
                 }
+                auto t_cpu_compute0 = hrc::now();
                 ggml_sycl_cpu_expert_mul_mat_batched(tasks_ptr, n_tasks);
+                auto t_cpu_compute1 = hrc::now();
+                if (g_moe_profile_enabled) {
+                    cpu_tg_compute_us +=
+                        std::chrono::duration<double, std::micro>(t_cpu_compute1 - t_cpu_compute0).count();
+                }
                 // llama.cpp-l144i probe: hash the CPU compute output before scatter.
                 GGML_SYCL_L144I_PROBE_FLOATS("cputg/out_after_compute", src0->name, -1, layer_id_fast,
                                              tl_out_pinned.as<float>(), n_cpu * static_cast<size_t>(N));
@@ -42331,7 +43478,7 @@ cpu_fallback_fast:
                 }
             }
 
-            if (prof_enabled) {
+            if (moe_phase_timing_enabled) {
                 t3 = hrc::now();
             }
 
@@ -42351,13 +43498,14 @@ cpu_fallback_fast:
 
             // Defer scatter completion to start of next call — the H2D copies
             // run asynchronously while the host proceeds with other graph ops.
-            // The deferred wait at the top of this path drains tl_pending_scatter
-            // before tl_out_pinned is reused, preventing data races.
+            // The deferred wait at the top of this path and the graph-boundary
+            // flush drain these events before the staging buffer is reused.
             if (n_tasks > 0) {
+                auto t_h2d0 = hrc::now();
                 if (scatter_contiguous && ne12 == 1 && n_gpu0 == 0 && !any_secondary_dispatched) {
                     // Single bulk H2D copy — safe only when ALL slots are CPU-computed
                     // (no GPU0 MMVQ results and no secondary GPU results to preserve).
-                    tl_pending_scatter.push_back(
+                    g_cpu_tg_direct_pending_scatter.push_back(
                         stream->memcpy(dst_d, out_src, n_cpu * static_cast<size_t>(N) * sizeof(float)));
                 } else {
                     // Per-slot scatter: skip GPU0-routed and secondary-routed slots
@@ -42388,23 +43536,37 @@ cpu_fallback_fast:
                         const int64_t iid1     = static_cast<int64_t>(ci / static_cast<size_t>(n_ids_f));
                         const int64_t id       = static_cast<int64_t>(ci % static_cast<size_t>(n_ids_f));
                         char *        dst_slot = dst_d + id * nb1 + iid1 * nb2;
-                        tl_pending_scatter.push_back(stream->memcpy(dst_slot, out_src + ci * static_cast<size_t>(N),
-                                                                    static_cast<size_t>(N) * sizeof(float)));
+                        g_cpu_tg_direct_pending_scatter.push_back(stream->memcpy(
+                            dst_slot, out_src + ci * static_cast<size_t>(N), static_cast<size_t>(N) * sizeof(float)));
                     }
+                }
+                auto t_h2d1 = hrc::now();
+                if (g_moe_profile_enabled) {
+                    cpu_tg_h2d_us += std::chrono::duration<double, std::micro>(t_h2d1 - t_h2d0).count();
                 }
             }
 
-            if (have_plan_fast && !tl_pending_scatter.empty()) {
+            if (have_plan_fast && !g_cpu_tg_direct_pending_scatter.empty()) {
                 // Planner-authoritative host routing favors a strict residency
                 // contract over overlap. Complete CPU->device scatter before
                 // returning so the following bias/GLU ops never observe
                 // in-flight host-routed results on the same queue.
-                sycl::event::wait(tl_pending_scatter);
-                tl_pending_scatter.clear();
+                auto t_h2d_wait0 = hrc::now();
+                sycl::event::wait(g_cpu_tg_direct_pending_scatter);
+                auto t_h2d_wait1 = hrc::now();
+                if (g_moe_profile_enabled) {
+                    cpu_tg_h2d_us += std::chrono::duration<double, std::micro>(t_h2d_wait1 - t_h2d_wait0).count();
+                }
+                g_cpu_tg_direct_pending_scatter.clear();
             }
 
-            if (prof_enabled) {
+            if (moe_phase_timing_enabled) {
                 t4 = hrc::now();
+            }
+            if (g_moe_profile_enabled && n_tasks > 0) {
+                g_moe_profile.moe_host_detail(cpu_tg_act_wait_us, cpu_tg_compute_us, cpu_tg_h2d_us, n_tasks,
+                                              static_cast<double>(act_d2h_bytes_fast),
+                                              static_cast<double>(n_tasks) * static_cast<double>(N) * sizeof(float));
             }
 
             // Accumulate profiling stats and print per-token summary
@@ -42503,6 +43665,7 @@ cpu_tg_fallthrough:
 
     auto record_moe_gpu_path = [&](const char * path, layout_mode layout, int64_t n_gpu_entries) {
         if (g_moe_profile_enabled) {
+            g_moe_profile.moe_route_stats(moe_classify_tensor(src0->name), n_gpu_entries, 0, 0, 0, n_gpu_entries, 0, 0);
             g_moe_profile.moe_gpu_compute_done();
             g_moe_profile.moe_compute_done(0, static_cast<int>(n_gpu_entries));
         }
@@ -42598,6 +43761,16 @@ cpu_tg_fallthrough:
                 GGML_SYCL_DEBUG("[MoE] Skipping layout=%d (override=%d)\n", (int) layout, (int) override_layout);
                 return false;
             }
+            if (!has_override && layout == GGML_LAYOUT_AOS && src0->type == GGML_TYPE_MXFP4 &&
+                ggml_sycl_planner_authoritative_residency_active(ctx.device) &&
+                ggml_sycl_get_tensor_usage(src0) == tensor_usage::MOE_EXPERT_WEIGHT) {
+                const layout_mode selected = ggml_sycl_select_moe_expert_cache_layout(src0, ctx.device, ne12);
+                if (selected != GGML_LAYOUT_AOS) {
+                    GGML_SYCL_DEBUG("[MoE] Skipping legacy AoS MMVQ for placement-planned %s (selected=%d)\n",
+                                    src0->name ? src0->name : "?", (int) selected);
+                    return false;
+                }
+            }
             if (!has_override) {
                 // Use resolve().layout to get the materialized layout from the cache.
                 auto        resolved_moe = ggml_sycl_resolve(src0, ctx.device);
@@ -42615,10 +43788,19 @@ cpu_tg_fallthrough:
                     // Must match chosen layout to satisfy cache layout assertions downstream.
                     const bool allow_moe_reorder_dispatch =
                         (src0->type == GGML_TYPE_MXFP4) && (effective == GGML_LAYOUT_AOS) && (layout == chosen);
+                    const bool allow_moe_grouped_i8_dispatch =
+                        (src0->type == GGML_TYPE_MXFP4) && (layout == GGML_LAYOUT_MXFP4_I8) &&
+                        (moe_classify_tensor(src0->name) == MOE_TENSOR_DOWN) && ne12 > 1 && extra_gpu &&
+                        get_effective_layout_mode(extra_gpu) == GGML_LAYOUT_MXFP4_I8;
                     if (!allow_moe_aos_fallback && !allow_moe_reorder_dispatch) {
-                        return false;
+                        if (!allow_moe_grouped_i8_dispatch) {
+                            return false;
+                        }
                     }
-                    if (allow_moe_reorder_dispatch) {
+                    if (allow_moe_grouped_i8_dispatch) {
+                        GGML_SYCL_DEBUG("[MoE] Allowing MXFP4 predecoded-i8 DOWN grouped dispatch for %s (chosen=%d)\n",
+                                        src0->name ? src0->name : "?", (int) chosen);
+                    } else if (allow_moe_reorder_dispatch) {
                         GGML_SYCL_DEBUG("[MoE] Allowing reorder dispatch layout=%d for MXFP4 (effective AoS) %s\n",
                                         (int) layout, src0->name ? src0->name : "?");
                     } else {
@@ -42632,6 +43814,17 @@ cpu_tg_fallthrough:
             GGML_SYCL_DEBUG("[MoE] MMVQ layout=%d returned %s\n", (int) layout, result ? "true" : "false");
             return result;
         };
+        if (src0->type == GGML_TYPE_MXFP4 && moe_classify_tensor(src0->name) == MOE_TENSOR_DOWN &&
+            (has_override || (ne12 > 1 && src0->extra &&
+                              get_effective_layout_mode(static_cast<const ggml_tensor_extra_gpu *>(src0->extra)) ==
+                                  GGML_LAYOUT_MXFP4_I8))) {
+            GGML_SYCL_DEBUG("[MoE] About to try MXFP4_I8 layout\n");
+            if (try_mmvq_layout(GGML_LAYOUT_MXFP4_I8)) {
+                GGML_SYCL_DEBUG("[MoE] GPU-side MMVQ (MXFP4_I8) dispatch successful for type %d\n", src0->type);
+                record_moe_gpu_path("mmvq_mxfp4_i8", GGML_LAYOUT_MXFP4_I8, moe_selected_entries);
+                return;
+            }
+        }
         GGML_SYCL_DEBUG("[MoE] About to try COALESCED layout\n");
         if (try_mmvq_layout(GGML_LAYOUT_COALESCED)) {
             GGML_SYCL_DEBUG("[MoE] GPU-side MMVQ (coalesced) dispatch successful for type %d\n", src0->type);
@@ -42751,30 +43944,41 @@ cpu_tg_fallthrough:
         }
         fprintf(stderr, "]\n");
     }
-    ggml_tensor src0_row           = *src0;
-    ggml_tensor src1_row           = *src1;
-    ggml_tensor dst_row            = *dst;
-    src0_row.layout                = nullptr;
-    src1_row.layout                = nullptr;
-    dst_row.layout                 = nullptr;
-    auto *      src0_extra         = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
+    ggml_tensor src0_row            = *src0;
+    ggml_tensor src1_row            = *src1;
+    ggml_tensor dst_row             = *dst;
+    src0_row.layout                 = nullptr;
+    src1_row.layout                 = nullptr;
+    dst_row.layout                  = nullptr;
+    src1_row.extra                  = nullptr;
+    dst_row.extra                   = nullptr;
+    auto *     src0_extra           = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
     // Detect host-resident weights including SYCL HOST_PINNED buffers
-    bool        host_weights       = ggml_sycl_is_host_resident_weight(src0, ctx.stream());
-    auto *      route_cache        = ggml_sycl::get_unified_cache(*stream);
-    const bool  has_placement_plan = route_cache && route_cache->has_placement_plan();
-    layout_mode src0_layout        = GGML_LAYOUT_AOS;
-    bool        src0_layout_aos    = true;
-    void *      src0_layout_ptr    = nullptr;
+    bool       host_weights         = ggml_sycl_is_host_resident_weight(src0, ctx.stream());
+    auto *     route_cache          = ggml_sycl::get_unified_cache(*stream);
+    const bool has_placement_plan   = route_cache && route_cache->has_placement_plan();
+    bool       plan_has_cpu_experts = false;
+    if (has_placement_plan && src0->name && src0->name[0] != '\0') {
+        const std::string tname(src0->name);
+        const int64_t     n_exp = src0->ne[2] > 0 ? src0->ne[2] : 1;
+        plan_has_cpu_experts    = route_cache->moe_tensor_has_host_experts(tname, n_exp, ctx.device);
+    }
+    layout_mode src0_layout     = GGML_LAYOUT_AOS;
+    bool        src0_layout_aos = true;
+    void *      src0_layout_ptr = nullptr;
     if (!host_weights) {
         auto resolved   = ggml_sycl_resolve(src0, ctx.device);
         src0_layout     = resolved.layout;
         src0_layout_ptr = resolved.ptr;
         src0_layout_aos = (src0_layout == GGML_LAYOUT_AOS);
     }
-    // Check if expert weights need to be resolved through the per-expert pointer table.
-    // Planned hybrid residency still uses the pointer table so device-planned experts
-    // stay on GPU while host-tier experts are routed explicitly to CPU.
-    bool             use_expert_cache = host_weights;
+    // Check if expert weights need to be resolved through per-expert smart handles.
+    // Under a placement plan, the composite _exps tensor is not residency authority:
+    // device-planned and host-planned experts both live in the unified cache and are
+    // resolved from mem_handles. Pointer tables are only transient GPU ABI payloads.
+    const bool placement_planned_moe =
+        has_placement_plan && ggml_sycl_get_tensor_usage(src0) == tensor_usage::MOE_EXPERT_WEIGHT;
+    bool             use_expert_cache = host_weights || placement_planned_moe;
     int              layer_id         = -1;
     const size_t     expert_size      = nb02;  // Bytes per expert
     sycl::usm::alloc ptr_type         = sycl::usm::alloc::unknown;
@@ -42803,11 +44007,10 @@ cpu_tg_fallthrough:
         GGML_SYCL_DEBUG("[MoE] Using expert cache for %s (layer=%d, host_buf=%d, ptr_type=%d)\n", src0->name, layer_id,
                         is_host_buffer, (int) ptr_type);
     }
-    // Placement-plan routing must also apply to mixed-residency expert tensors:
-    // some experts may be device-planned while others remain host-planned.
-    // `host_weights` only captures the fully-host-resident case, so key this off
-    // pointer-table MoE mode instead.
-    const bool plan_host_routing = use_expert_cache && has_placement_plan;
+    // Expert-cache routing is not the same thing as host routing.  All-device
+    // MoE plans also use per-expert smart handles because the composite _exps
+    // tensor is not necessarily a full device allocation.
+    const bool plan_host_routing = has_placement_plan && plan_has_cpu_experts;
 
     layout_mode route_layout = src0_layout;
     if (use_expert_cache) {
@@ -42823,7 +44026,7 @@ cpu_tg_fallthrough:
             }
 
         } else {
-            route_layout = ggml_sycl_select_moe_grouped_pp_layout(src0, ctx.device, true, ne12);
+            route_layout = ggml_sycl_select_moe_expert_cache_layout(src0, ctx.device, ne12);
         }
     } else if (has_override) {
         const layout_mode adjusted = ggml_sycl_adjust_layout_for_tensor(src0, override_layout, ctx.device);
@@ -42840,6 +44043,20 @@ cpu_tg_fallthrough:
         GGML_SYCL_DEBUG("[MoE] Host routing uses AoS layout for %s (requested=%d)\n", src0->name ? src0->name : "?",
                         (int) route_layout);
         route_layout = GGML_LAYOUT_AOS;
+    }
+    if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+        static std::atomic<int> logged_dispatch_layout{ 0 };
+        const int               n = logged_dispatch_layout.fetch_add(1, std::memory_order_relaxed);
+        if (n < 120) {
+            fprintf(stderr,
+                    "[MOE-DISPATCH-LAYOUT] tensor=%s device=%d route_layout=%s src0_layout=%s "
+                    "use_expert_cache=%d placement_planned=%d host_weights=%d plan=%d plan_host=%d "
+                    "has_override=%d ne12=%lld\n",
+                    src0 && src0->name ? src0->name : "?", ctx.device, ggml_sycl_layout_mode_name(route_layout),
+                    ggml_sycl_layout_mode_name(src0_layout), use_expert_cache ? 1 : 0, placement_planned_moe ? 1 : 0,
+                    host_weights ? 1 : 0, has_placement_plan ? 1 : 0, plan_has_cpu_experts ? 1 : 0,
+                    has_override ? 1 : 0, (long long) ne12);
+        }
     }
     // resolve_weight returns the best available layout from the cache,
     // superseding any layout choice registry adjustments.
@@ -42892,12 +44109,6 @@ cpu_tg_fallthrough:
     // Direct query: placement_plan::expert_index_ is an O(1) hash map — no caller-side
     // static cache is needed.  The static plan_has_cpu_cache map was eliminated in P6
     // (llama.cpp-0q7dv) in favour of unified_cache::moe_tensor_has_host_experts().
-    bool plan_has_cpu_experts = false;
-    if (has_placement_plan && route_cache && src0->name && src0->name[0] != '\0') {
-        const std::string tname(src0->name);
-        const int64_t     n_exp = src0->ne[2] > 0 ? src0->ne[2] : 1;
-        plan_has_cpu_experts    = route_cache->moe_tensor_has_host_experts(tname, n_exp, ctx.device);
-    }
     const bool plan_hybrid = plan_has_cpu_experts && cpu_type_ok;
     if (plan_hybrid && !moe_hybrid_active) {
         static std::atomic<int> plan_hybrid_log{ 0 };
@@ -42909,8 +44120,9 @@ cpu_tg_fallthrough:
     // With an explicit placement plan, the planner owns residency.  The legacy
     // hybrid path is only valid for planned host experts; all-device plans must
     // stay on the GPU cascade instead of probing non-materialized expert layouts.
-    const bool moe_hybrid_with_plan      = has_placement_plan ? plan_hybrid : moe_hybrid_active;
-    const bool route_host_experts_to_cpu = use_expert_cache && !exact_layout_override;
+    const bool moe_hybrid_with_plan = has_placement_plan ? plan_hybrid : moe_hybrid_active;
+    const bool route_host_experts_to_cpu =
+        !exact_layout_override && (has_placement_plan ? plan_has_cpu_experts : use_expert_cache);
 
     // Expert cache stages data in the requested layout via direct_stage_expert.
     // No longer force AOS — GPU0 batched dispatch now supports SOA/Coalesced MXFP4
@@ -42922,27 +44134,29 @@ cpu_tg_fallthrough:
         // Stage experts in the requested layout (SOA/Coalesced for MXFP4, AOS otherwise).
         // force_cache_aos=true only when layout is AOS (ensures mmap'd weights get staged).
         bool         need_force_aos      = (route_layout == GGML_LAYOUT_AOS);
-        const bool   host_only_ptr_table = has_placement_plan && route_host_experts_to_cpu;
+        const bool   host_only_ptr_table = !has_placement_plan && route_host_experts_to_cpu;
+        const bool   skip_cpu_routed     = moe_hybrid_with_plan || (!has_placement_plan && route_host_experts_to_cpu);
         // Task 1E: pass pre-resolved ids_host to avoid redundant D2H inside update_moe_ptr_table
         const auto * ids_override        = ids_host.empty() ? nullptr : &ids_host;
-        if (!ggml_sycl_update_moe_ptr_table(
-                ctx, src0, ids, route_layout, nullptr, /*allow_all_experts=*/false, ids_override, host_only_ptr_table,
-                /*force_cache_aos=*/need_force_aos,
-                /*skip_cpu_routed_experts=*/moe_hybrid_with_plan || route_host_experts_to_cpu,
-                /*exact_layout_required=*/exact_layout_override)) {
-            // SOA/COALESCED staging failed (cache miss). Fall back to AOS which
-            // uses direct pointer arithmetic from USM-accessible host storage.
-            if (!exact_layout_override && route_layout != GGML_LAYOUT_AOS) {
+        if (!ggml_sycl_update_moe_ptr_table(ctx, src0, ids, route_layout, nullptr, /*allow_all_experts=*/false,
+                                            ids_override, host_only_ptr_table,
+                                            /*force_cache_aos=*/need_force_aos,
+                                            /*skip_cpu_routed_experts=*/skip_cpu_routed,
+                                            /*exact_layout_required=*/exact_layout_override)) {
+            // SOA/COALESCED staging failed (cache miss). Before placement plans,
+            // this cascaded to AoS host pointer arithmetic. With a placement plan,
+            // the planner owns the materialized layout and tier, so a miss is a
+            // preload/dispatch mismatch that must not bypass smart handles.
+            if (!has_placement_plan && !exact_layout_override && route_layout != GGML_LAYOUT_AOS) {
                 GGML_SYCL_DEBUG("[MoE] Retrying with AOS layout (cache miss for layout=%d) for %s\n",
                                 (int) route_layout, src0->name ? src0->name : "?");
                 route_layout   = GGML_LAYOUT_AOS;
                 need_force_aos = true;
-                if (!ggml_sycl_update_moe_ptr_table(
-                        ctx, src0, ids, route_layout, nullptr,
-                        /*allow_all_experts=*/false, ids_override, host_only_ptr_table,
-                        /*force_cache_aos=*/need_force_aos,
-                        /*skip_cpu_routed_experts=*/moe_hybrid_with_plan || route_host_experts_to_cpu,
-                        /*exact_layout_required=*/false)) {
+                if (!ggml_sycl_update_moe_ptr_table(ctx, src0, ids, route_layout, nullptr,
+                                                    /*allow_all_experts=*/false, ids_override, host_only_ptr_table,
+                                                    /*force_cache_aos=*/need_force_aos,
+                                                    /*skip_cpu_routed_experts=*/skip_cpu_routed,
+                                                    /*exact_layout_required=*/false)) {
                     GGML_LOG_ERROR("[MoE] Failed to update expert pointer table (AOS fallback) for %s\n", src0->name);
                 } else if (src0_extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES) {
                     const auto & host_ptrs = src0_extra->moe_expert_ptrs_host[ctx.device];
@@ -43080,8 +44294,6 @@ cpu_tg_fallthrough:
     if (src0_extra) {
         local_extra.cache_uuid = src0_extra->cache_uuid;
         local_extra.model_id   = src0_extra->model_id;
-        std::memcpy(local_extra.data_device, src0_extra->data_device, sizeof(local_extra.data_device));
-        std::memcpy(local_extra.data_device_size, src0_extra->data_device_size, sizeof(local_extra.data_device_size));
         std::memcpy(local_extra.events, src0_extra->events, sizeof(local_extra.events));
         local_extra.tp_sharded  = src0_extra->tp_sharded;
         local_extra.tp_usm_host = src0_extra->tp_usm_host;
@@ -43098,8 +44310,6 @@ cpu_tg_fallthrough:
     } else {
         local_extra.cache_uuid = 0;
         local_extra.model_id   = 0;
-        std::memset(local_extra.data_device, 0, sizeof(local_extra.data_device));
-        std::memset(local_extra.data_device_size, 0, sizeof(local_extra.data_device_size));
         std::memset(local_extra.events, 0, sizeof(local_extra.events));
         local_extra.tp_sharded     = false;
         local_extra.tp_usm_host    = false;
@@ -43113,12 +44323,9 @@ cpu_tg_fallthrough:
         std::memset(local_extra.tp_offset_ne, 0, sizeof(local_extra.tp_offset_ne));
     }
     local_extra.moe_expert_id = -1;  // Initialize: not an expert slice yet
-    if (use_expert_cache) {
-        // Ensure ggml_sycl_get_data_ptr uses the per-expert pointer we assign to src0_row.data.
-        // Retaining src0_extra->data_device here can route kernels to the full weight buffer.
-        std::memset(local_extra.data_device, 0, sizeof(local_extra.data_device));
-        std::memset(local_extra.data_device_size, 0, sizeof(local_extra.data_device_size));
-    }
+    // This synthetic row tensor inherits metadata only. Storage authority is
+    // installed per expert below from the resolved mem_handle/slice pointer.
+    local_extra.clear_data_authority();
     auto layout_to_reorder = [](layout_mode mode) -> reorder_mode {
         switch (mode) {
             case GGML_LAYOUT_SOA:
@@ -43134,24 +44341,33 @@ cpu_tg_fallthrough:
                 return reorder_mode::NONE;
         }
     };
-    local_extra.optimized_feature  = optimize_feature(layout_to_reorder(route_layout));
-    local_extra.layout.mode        = route_layout;
-    local_extra.layout.size        = expert_size;
-    local_extra.layout.owns_memory = false;
-    local_extra.layout.device_id   = ctx.device;
-    local_extra.layout.qtype       = src0->type;
-    local_extra.layout.n_elements  = src0_row.ne[0] * src0_row.ne[1];
-    local_extra.layout.n_experts   = 1;
-    local_extra.layout.data_ptr    = nullptr;
-    src0_row.extra                 = &local_extra;
-    src0_row.layout                = &local_extra.layout;
+    local_extra.optimized_feature     = optimize_feature(layout_to_reorder(route_layout));
+    local_extra.layout.mode           = route_layout;
+    local_extra.layout.size           = expert_size;
+    local_extra.layout.owns_memory    = false;
+    local_extra.layout.device_id      = ctx.device;
+    local_extra.layout.qtype          = src0->type;
+    local_extra.layout.n_elements     = src0_row.ne[0] * src0_row.ne[1];
+    local_extra.layout.n_experts      = 1;
+    local_extra.layout.data_ptr       = nullptr;
+    src0_row.extra                    = &local_extra;
+    src0_row.layout                   = &local_extra.layout;
+    auto install_expert_slice_storage = [&](void * ptr, int expert_id,
+                                            const ggml_sycl::mem_handle * source_handle = nullptr) {
+        src0_row.data = ptr;
+        local_extra.install_direct_slice_storage(ctx.device, ptr, expert_size, route_layout, true, source_handle);
+        local_extra.layout.qtype      = src0->type;
+        local_extra.layout.n_elements = src0_row.ne[0] * src0_row.ne[1];
+        local_extra.layout.n_experts  = 1;
+        local_extra.moe_expert_id     = expert_id;
+    };
     // CPU-primary expert routing for TG (batch=1 decode).
     // Routes ALL expert FFNs to CPU, bypassing GPU cache entirely.
     // Rationale: CPU DRAM BW (70 GB/s) >> PCIe BW (13.4 GB/s) for batch=1.
     // CPU expert TG dispatch: auto-enabled when moe_hybrid is active and
     // planner routes experts to host.  Previously tunable via
     // GGML_SYCL_CPU_EXPERT_TG; now hardcoded to auto (-2).
-    const int cpu_tg_val           = -2;
+    const int cpu_tg_val = -2;
 
     // Auto-detect: enable CPU expert TG when moe_hybrid is active (with plan awareness)
     // (moe_hybrid_with_plan extends moe_hybrid_active with plan-based host routing)
@@ -43477,19 +44693,21 @@ cpu_tg_fallthrough:
                 if (!r.valid) {
                     return;
                 }
-                g_pending_scatter.future       = std::move(r.future);
-                g_pending_scatter.out_pinned   = r.out_pinned;
-                g_pending_scatter.act_pinned   = r.act_pinned;
-                g_pending_scatter.out_alloc    = r.out_alloc;
-                g_pending_scatter.act_alloc    = r.act_alloc;
-                g_pending_scatter.stream       = stream;
-                g_pending_scatter.sycl_ctx     = stream->get_context();
-                g_pending_scatter.device_id    = r.device_id;
-                g_pending_scatter.from_pool    = r.from_pool;
-                g_pending_scatter.owns_buffers = r.owns_buffers;
-                g_pending_scatter.active       = true;
-                g_pending_scatter.dst_tensor   = dst;
-                g_pending_scatter.entries      = std::move(r.entries);
+                g_pending_scatter.future        = std::move(r.future);
+                g_pending_scatter.out_pinned    = r.out_pinned;
+                g_pending_scatter.act_pinned    = r.act_pinned;
+                g_pending_scatter.weight_pinned = nullptr;
+                g_pending_scatter.out_alloc     = r.out_alloc;
+                g_pending_scatter.act_alloc     = r.act_alloc;
+                g_pending_scatter.weight_alloc  = {};
+                g_pending_scatter.stream        = stream;
+                g_pending_scatter.sycl_ctx      = stream->get_context();
+                g_pending_scatter.device_id     = r.device_id;
+                g_pending_scatter.from_pool     = r.from_pool;
+                g_pending_scatter.owns_buffers  = r.owns_buffers;
+                g_pending_scatter.active        = true;
+                g_pending_scatter.dst_tensor    = dst;
+                g_pending_scatter.entries       = std::move(r.entries);
             };
 
             // Apply CPU dispatch result to pipeline (cross-layer overlap).
@@ -43698,6 +44916,13 @@ cpu_tg_fallthrough:
                     g_moe_profile.moe_cache_stats(static_cast<int>(gpu_entries.size()),
                                                   static_cast<int>(cpu_entries.size()),
                                                   static_cast<int>(secondary_count));
+                }
+                if (g_moe_profile_enabled) {
+                    g_moe_profile.moe_route_stats(
+                        role_tg, static_cast<int64_t>(gpu_entries.size()), static_cast<int64_t>(secondary_count),
+                        static_cast<int64_t>(cpu_entries.size()), static_cast<int64_t>(route_unavailable_count),
+                        static_cast<int64_t>(gpu_entries.size() + secondary_count),
+                        static_cast<int64_t>(cpu_entries.size()), static_cast<int64_t>(route_unavailable_count));
                 }
 
                 // Compute sequential layer ID for warmup/stats (CPU-TG path)
@@ -44061,6 +45286,17 @@ cpu_tg_fallthrough:
                     g_moe_profile.moe_cache_stats(static_cast<int>(gpu_entries.size()),
                                                   static_cast<int>(cpu_entries.size()), static_cast<int>(pp_sec_count));
                 }
+                if (g_moe_profile_enabled) {
+                    size_t pp_sec_count = 0;
+                    for (int d = 1; d < n_gpu_devs; d++) {
+                        pp_sec_count += per_gpu_entries[d].size();
+                    }
+                    g_moe_profile.moe_route_stats(
+                        role_pp, static_cast<int64_t>(gpu_entries.size()), static_cast<int64_t>(pp_sec_count),
+                        static_cast<int64_t>(cpu_entries.size()), static_cast<int64_t>(route_unavailable_count),
+                        static_cast<int64_t>(gpu_entries.size() + pp_sec_count),
+                        static_cast<int64_t>(cpu_entries.size()), static_cast<int64_t>(route_unavailable_count));
+                }
 
                 // Record expert activations for warmup + adaptive prestage
                 {
@@ -44275,11 +45511,9 @@ cpu_tg_fallthrough:
 
                         GGML_ASSERT(entry.device_ptr != nullptr);
 
-                        src0_row.data               = entry.device_ptr;
-                        local_extra.layout.data_ptr = entry.device_ptr;
-                        local_extra.moe_expert_id   = entry.expert_id;
-                        src1_row.data               = src1_original + i11 * nb11 + i12 * nb12;
-                        dst_row.data                = dst_original + i1 * nb1 + i2 * nb2;
+                        install_expert_slice_storage(entry.device_ptr, entry.expert_id, &entry.lease);
+                        src1_row.data = src1_original + i11 * nb11 + i12 * nb12;
+                        dst_row.data  = dst_original + i1 * nb1 + i2 * nb2;
 
                         ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row, &route_layout);
                     }
@@ -44421,13 +45655,22 @@ cpu_tg_fallthrough:
                     flush_pending_cpu_scatter();
                 }
 
-                const int64_t           K          = ne00;
-                const int64_t           N          = ne01;
-                const size_t            n_cpu      = entries.size();
-                float *                 act_pinned = nullptr;
-                float *                 out_pinned = nullptr;
+                const int64_t           K             = ne00;
+                const int64_t           N             = ne01;
+                const size_t            n_cpu         = entries.size();
+                float *                 act_pinned    = nullptr;
+                float *                 out_pinned    = nullptr;
+                uint8_t *               weight_pinned = nullptr;
                 ggml_sycl::alloc_handle act_alloc{};
                 ggml_sycl::alloc_handle out_alloc{};
+                ggml_sycl::alloc_handle weight_alloc{};
+                bool                    need_weight_d2h = false;
+                for (const auto & entry : entries) {
+                    if (entry.device_ptr && ggml_sycl::ggml_sycl_is_device_expert_ptr(entry.device_ptr)) {
+                        need_weight_d2h = true;
+                        break;
+                    }
+                }
 
                 if (allocate_managed_host_pinned(*stream, ctx.device, n_cpu * static_cast<size_t>(K) * sizeof(float),
                                                  ggml_sycl::alloc_role::EXPERT_STAGING,
@@ -44441,8 +45684,14 @@ cpu_tg_fallthrough:
                                                  &out_alloc, true)) {
                     out_pinned = static_cast<float *>(out_alloc.ptr);
                 }
+                if (need_weight_d2h && allocate_managed_host_pinned(*stream, ctx.device, n_cpu * expert_size,
+                                                                    ggml_sycl::alloc_role::EXPERT_STAGING,
+                                                                    ggml_sycl::runtime_category::HOST_COMPUTE,
+                                                                    "moe_planner_cpu_weight", &weight_alloc)) {
+                    weight_pinned = static_cast<uint8_t *>(weight_alloc.ptr);
+                }
 
-                if (!act_pinned || !out_pinned) {
+                if (!act_pinned || !out_pinned || (need_weight_d2h && !weight_pinned)) {
                     GGML_LOG_ERROR("[MoE] Failed planner CPU dispatch staging alloc for %s (%zu entries)\n",
                                    src0->name ? src0->name : "?", n_cpu);
                     if (act_alloc.ptr != nullptr) {
@@ -44451,11 +45700,14 @@ cpu_tg_fallthrough:
                     if (out_alloc.ptr != nullptr) {
                         (void) ggml_sycl::unified_free(out_alloc);
                     }
+                    if (weight_alloc.ptr != nullptr) {
+                        (void) ggml_sycl::unified_free(weight_alloc);
+                    }
                     return;
                 }
 
                 std::vector<sycl::event> copy_events;
-                copy_events.reserve(n_cpu);
+                copy_events.reserve(n_cpu + (need_weight_d2h ? n_cpu : 0));
                 for (size_t ci = 0; ci < n_cpu; ++ci) {
                     const auto &  entry    = entries[ci];
                     const int64_t i11      = entry.id % ne11;
@@ -44463,6 +45715,11 @@ cpu_tg_fallthrough:
                     const char *  src1_dev = src1_original + i11 * nb11 + i12 * nb12;
                     float *       dst_host = act_pinned + ci * static_cast<size_t>(K);
                     copy_events.push_back(stream->memcpy(dst_host, src1_dev, static_cast<size_t>(K) * sizeof(float)));
+                    if (weight_pinned && entry.device_ptr &&
+                        ggml_sycl::ggml_sycl_is_device_expert_ptr(entry.device_ptr)) {
+                        copy_events.push_back(
+                            stream->memcpy(weight_pinned + ci * expert_size, entry.device_ptr, expert_size));
+                    }
                 }
                 sycl::event::wait(copy_events);
 
@@ -44479,7 +45736,11 @@ cpu_tg_fallthrough:
                     const auto &          entry       = entries[ci];
                     const void *          host_weight = nullptr;
                     ggml_sycl::mem_handle host_lease{};  // llama.cpp-0k543
-                    if (expert_ptrs_host && entry.expert_id >= 0 && entry.expert_id < n_as) {
+                    if (weight_pinned && entry.device_ptr &&
+                        ggml_sycl::ggml_sycl_is_device_expert_ptr(entry.device_ptr)) {
+                        host_weight = weight_pinned + ci * expert_size;
+                    }
+                    if (!host_weight && expert_ptrs_host && entry.expert_id >= 0 && entry.expert_id < n_as) {
                         const void * candidate = expert_ptrs_host[entry.expert_id];
                         if (candidate && !ggml_sycl::ggml_sycl_is_device_expert_ptr(candidate)) {
                             if (src0_extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES &&
@@ -44533,25 +45794,30 @@ cpu_tg_fallthrough:
                         });
                 }
 
-                g_pending_scatter.out_pinned   = out_pinned;
-                g_pending_scatter.act_pinned   = act_pinned;
-                g_pending_scatter.out_alloc    = out_alloc;
-                g_pending_scatter.act_alloc    = act_alloc;
-                g_pending_scatter.stream       = stream;
-                g_pending_scatter.sycl_ctx     = stream->get_context();
-                g_pending_scatter.device_id    = ctx.device;
-                g_pending_scatter.from_pool    = false;
-                g_pending_scatter.owns_buffers = true;
-                g_pending_scatter.active       = true;
-                g_pending_scatter.dst_tensor   = dst;
+                g_pending_scatter.out_pinned    = out_pinned;
+                g_pending_scatter.act_pinned    = act_pinned;
+                g_pending_scatter.weight_pinned = weight_pinned;
+                g_pending_scatter.out_alloc     = out_alloc;
+                g_pending_scatter.act_alloc     = act_alloc;
+                g_pending_scatter.weight_alloc  = weight_alloc;
+                g_pending_scatter.stream        = stream;
+                g_pending_scatter.sycl_ctx      = stream->get_context();
+                g_pending_scatter.device_id     = ctx.device;
+                g_pending_scatter.from_pool     = false;
+                g_pending_scatter.owns_buffers  = true;
+                g_pending_scatter.active        = true;
+                g_pending_scatter.dst_tensor    = dst;
 
                 flush_pending_cpu_scatter();
             };
 
-            bool         batched_ok              = false;
-            int          pp_fallback_gpu_entries = 0;
-            const char * pp_fallback_path        = "pp_per_expert";
-            if (batch_experts_val != 0 && ne11 == 1) {
+            bool         batched_ok                 = false;
+            bool         all_entries_routed_cpu     = false;
+            int          pp_fallback_gpu_entries    = 0;
+            const char * pp_fallback_path           = "pp_per_expert";
+            const bool   device_weight_cpu_fallback = (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_IQ2_XXS);
+            const bool pp_mmvq_batched_supported = ggml_sycl_moe_mmvq_batched_supports_layout(src0->type, route_layout);
+            if (batch_experts_val != 0 && ne11 == 1 && pp_mmvq_batched_supported) {
                 // Get device pointer table from extra
                 const void * const * expert_ptrs_dev = nullptr;
                 if (src0_extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES) {
@@ -44599,6 +45865,13 @@ cpu_tg_fallthrough:
                                 continue;
                             }
 
+                            if (device_weight_cpu_fallback && expert_ptr) {
+                                expert_dispatch_entry entry{ iid1, id, i02, const_cast<void *>(expert_ptr), 0 };
+                                entry.allow_cpu_fallback = false;
+                                cpu_entries.push_back(std::move(entry));
+                                continue;
+                            }
+
                             if (expert_ptr) {
                                 gpu_expert_ids.push_back(i02);
                                 gpu_iid1s.push_back(iid1);
@@ -44607,6 +45880,8 @@ cpu_tg_fallthrough:
                         }
                     }
 
+                    all_entries_routed_cpu = device_weight_cpu_fallback && gpu_expert_ids.empty() &&
+                                             cpu_entries.size() == static_cast<size_t>(total_entries);
                     if (!gpu_expert_ids.empty()) {
                         batched_ok = mmvq_moe_batched_dispatch(
                             ctx, src0, src1, dst, expert_ptrs_dev, gpu_expert_ids.data(), gpu_iid1s.data(),
@@ -44629,7 +45904,7 @@ cpu_tg_fallthrough:
             }
 
             // Fallback: per-expert dispatch if batched path unavailable or disabled
-            if (!batched_ok) {
+            if (!batched_ok && !all_entries_routed_cpu) {
                 for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
                     for (int64_t id = 0; id < n_ids; id++) {
                         const int32_t i02 = ids_host[static_cast<size_t>(iid1 * n_ids + id)];
@@ -44683,12 +45958,22 @@ cpu_tg_fallthrough:
                             continue;
                         }
 
-                        src0_row.data = const_cast<void *>(expert_ptr);
+                        if (device_weight_cpu_fallback && expert_ptr) {
+                            expert_dispatch_entry entry{ i12, id, i02, const_cast<void *>(expert_ptr), 0 };
+                            entry.allow_cpu_fallback = false;
+                            cpu_entries.push_back(std::move(entry));
+                            continue;
+                        }
 
-                        local_extra.layout.data_ptr = const_cast<void *>(expert_ptr);
-                        local_extra.moe_expert_id   = static_cast<int>(i02);
-                        src1_row.data               = src1_original + i11 * nb11 + i12 * nb12;
-                        dst_row.data                = dst_original + i1 * nb1 + i2 * nb2;
+                        const ggml_sycl::mem_handle * expert_handle = nullptr;
+                        if (use_expert_cache && src0_extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES &&
+                            static_cast<size_t>(i02) < src0_extra->moe_expert_handles[ctx.device].size()) {
+                            expert_handle = &src0_extra->moe_expert_handles[ctx.device][static_cast<size_t>(i02)];
+                        }
+                        install_expert_slice_storage(const_cast<void *>(expert_ptr), static_cast<int>(i02),
+                                                     expert_handle);
+                        src1_row.data = src1_original + i11 * nb11 + i12 * nb12;
+                        dst_row.data  = dst_original + i1 * nb1 + i2 * nb2;
 
                         ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row, &route_layout);
                         pp_fallback_gpu_entries++;
@@ -44700,6 +45985,10 @@ cpu_tg_fallthrough:
                 dispatch_cpu_entries_now(cpu_entries);
             }
             if (g_moe_profile_enabled) {
+                const moe_tensor_type pp_fallback_role = moe_classify_tensor(src0->name);
+                g_moe_profile.moe_route_stats(pp_fallback_role, pp_fallback_gpu_entries, 0,
+                                              static_cast<int64_t>(cpu_entries.size()), 0, pp_fallback_gpu_entries,
+                                              static_cast<int64_t>(cpu_entries.size()), 0);
                 g_moe_profile.moe_gpu_compute_done();
                 g_moe_profile.moe_compute_done(static_cast<int>(cpu_entries.size()), pp_fallback_gpu_entries);
                 if (g_moe_pp_profile_enabled) {
@@ -44792,26 +46081,11 @@ cpu_tg_fallthrough:
         }
 #endif
         // PP fallback: per-expert dispatch with contiguous gather/scatter.
-        // Use raw byte copy and byte-offset indexing (matching CUDA/master)
-        // to correctly handle non-contiguous ids VIEW tensors from argsort.
-        std::vector<char> ids_host_raw(ggml_nbytes(ids));
-        const bool        ids_on_host_pp = ids->buffer && ggml_backend_buffer_is_host(ids->buffer);
-        const char *      ids_raw_src    = ids_on_host_pp ? static_cast<const char *>(ids_host_storage) : ids_device;
-        if (ids_on_host_pp) {
-            std::memcpy(ids_host_raw.data(), ids_raw_src, ggml_nbytes(ids));
-        } else {
-            SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(ids_host_raw.data(), ids_raw_src, ggml_nbytes(ids))));
-            SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
-        }
+        // ids_host was already copied above with ids->nb[1] handling and is
+        // cached across gate/up/down for this layer.  Re-copying the raw view
+        // here adds a stream wait for every MoE role and serializes PP.
+        GGML_ASSERT(ids_host.size() == static_cast<size_t>(ids->ne[1] * n_ids));
 
-        ggml_sycl_pool_alloc<char> src1_contiguous(ctx.pool(), sizeof(float) * ggml_nelements(src1));
-        ggml_sycl_pool_alloc<char> dst_contiguous(ctx.pool(), sizeof(float) * ggml_nelements(dst));
-        // Zero dst buffer: skipped experts (null cache pointer) leave rows unwritten.
-        // Without zeroing, pool memory retains stale data → NaN in output.
-        SYCL_CHECK(CHECK_TRY_ERROR(stream->memset(dst_contiguous.get(), 0, sizeof(float) * ggml_nelements(dst))));
-        src1_row.data = src1_contiguous.get();
-
-        dst_row.data                        = dst_contiguous.get();
         const bool             pp_multi_gpu = g_moe_multi_gpu_active.load(std::memory_order_acquire);
         const int              pp_n_gpus    = pp_multi_gpu ? ggml_sycl_info().total_gpu_count : 1;
         const int              pp_block     = moe_extract_block_number(src0->name ? src0->name : "");
@@ -44819,43 +46093,67 @@ cpu_tg_fallthrough:
         secondary_dispatch_ctx pp_sec_ctx   = { stream, src0,  src1_original, dst_original,  ne00,
                                                 ne01,   ne11,  nb11,          nb12,          nb1,
                                                 nb2,    false, nullptr,       sycl::event{}, dst };
-        // llama.cpp-0k543: the caller passes a mem_handle that pins the host
-        // arena chunk backing host_weight_ptr (if any).  The handle is moved
-        // into each cpu_expert_task so the lease survives into the pool
-        // worker and is released when the task vector is destroyed.
-        auto dispatch_host_expert_rows = [&](int32_t expert_id, const std::vector<std::pair<int64_t, int64_t>> & rows,
-                                             const void * host_weight_ptr, ggml_sycl::mem_handle host_weight_lease) {
+        struct pp_host_expert_group {
+            int32_t                                  expert_id   = -1;
+            std::vector<std::pair<int64_t, int64_t>> rows;
+            const void *                             host_weight = nullptr;
+            ggml_sycl::mem_handle                    weight_lease;
+        };
+        std::vector<pp_host_expert_group> pp_host_groups;
+
+        auto enqueue_host_expert_rows = [&](int32_t expert_id, std::vector<std::pair<int64_t, int64_t>> rows,
+                                            const void * host_weight_ptr, ggml_sycl::mem_handle host_weight_lease) {
             if (rows.empty()) {
                 return;
             }
-            // llama.cpp-n04bq probe: log host_weight_ptr for PP-path host expert.
-            n04bq_probe_log("dispatch_host_expert_rows", src0->name, expert_id,
+            n04bq_probe_log("enqueue_host_expert_rows", src0->name, expert_id,
                             "host_weight_ptr=%p n_rows=%zu src0->data=%p src0_host_storage=%p", host_weight_ptr,
                             rows.size(), src0 ? src0->data : nullptr, src0_host_storage);
             if (!host_weight_ptr || ggml_sycl::ggml_sycl_is_device_expert_ptr(host_weight_ptr)) {
-                GGML_ABORT("[MOE-ROUTE] PP CPU expert dispatch received non-host weight tensor=%s expert=%d ptr=%p",
+                GGML_ABORT("[MOE-ROUTE] PP CPU island queued non-host weight tensor=%s expert=%d ptr=%p",
                            src0 && src0->name ? src0->name : "?", expert_id, host_weight_ptr);
             }
+            if (!host_weight_lease.valid()) {
+                host_weight_lease = ggml_sycl::mem_handle::from_chunk_ptr(
+                    const_cast<void *>(host_weight_ptr), ctx.device, GGML_LAYOUT_AOS, /*on_device=*/false);
+            }
 
-            const size_t             n_rows = rows.size();
-            const int64_t            K      = ne00;
-            const int64_t            N      = ne01;
+            pp_host_expert_group group;
+            group.expert_id    = expert_id;
+            group.rows         = std::move(rows);
+            group.host_weight  = host_weight_ptr;
+            group.weight_lease = std::move(host_weight_lease);
+            pp_host_groups.push_back(std::move(group));
+        };
+
+        auto dispatch_host_expert_groups = [&](std::vector<pp_host_expert_group> & groups) {
+            if (groups.empty()) {
+                return;
+            }
+
+            size_t n_rows = 0;
+            for (const pp_host_expert_group & group : groups) {
+                n_rows += group.rows.size();
+            }
+            if (n_rows == 0) {
+                groups.clear();
+                return;
+            }
+
+            const int64_t K = ne00;
+            const int64_t N = ne01;
             ggml_sycl::alloc_request act_req{};
             act_req.queue                               = stream;
             act_req.device                              = ctx.device;
             act_req.size                                = n_rows * static_cast<size_t>(K) * sizeof(float);
             act_req.intent.role                         = ggml_sycl::alloc_role::EXPERT_STAGING;
             act_req.intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
-            act_req.intent.cohort_id                    = "moe_pp_cpu_act";
+            act_req.intent.cohort_id                    = "moe_pp_cpu_island_act";
             act_req.intent.constraints.must_host_pinned = true;
             ggml_sycl::alloc_request out_req            = act_req;
             out_req.size                                = n_rows * static_cast<size_t>(N) * sizeof(float);
-            out_req.intent.cohort_id                    = "moe_pp_cpu_out";
+            out_req.intent.cohort_id                    = "moe_pp_cpu_island_out";
 
-            // CPU expert dispatch needs HOST-PINNED memory (CPU-accessible).
-            // Keep ownership in unified-cache scoped handles so EXPERT_STAGING
-            // SCRATCH allocations are released after the synchronous
-            // D2H -> CPU -> H2D flow below.
             ggml_sycl::scoped_unified_alloc act_alloc(act_req);
             ggml_sycl::scoped_unified_alloc out_alloc(out_req);
             ggml_sycl::mem_handle           act_handle = act_alloc.as_mem_handle();
@@ -44864,75 +46162,225 @@ cpu_tg_fallthrough:
             auto                            out_r      = out_handle.resolve();
             if (!act_r || !out_r) {
                 GGML_ABORT(
-                    "[MoE] Failed host-pinned alloc for CPU expert act/out: %s expert=%d rows=%zu\n"
+                    "[MoE] Failed host-pinned alloc for PP CPU island act/out: %s groups=%zu rows=%zu\n"
                     "Ensure host zone has enough capacity (populate_host_zone_sizing).",
-                    src0->name ? src0->name : "?", expert_id, n_rows);
+                    src0->name ? src0->name : "?", groups.size(), n_rows);
             }
+
             float * act_pinned = static_cast<float *>(act_r.ptr);
             float * out_pinned = static_cast<float *>(out_r.ptr);
             std::memset(out_pinned, 0, n_rows * static_cast<size_t>(N) * sizeof(float));
 
+            const bool profile_host_detail = g_moe_profile_enabled;
+            auto       host_phase_now      = []() {
+                return std::chrono::high_resolution_clock::now();
+            };
+            auto host_phase_us = [](auto a, auto b) {
+                return std::chrono::duration<double, std::micro>(b - a).count();
+            };
+
+            auto                     t_d2h_begin = host_phase_now();
             std::vector<sycl::event> d2h_events;
             d2h_events.reserve(n_rows);
-            for (size_t ri = 0; ri < n_rows; ++ri) {
-                const auto [iid1, id]  = rows[ri];
-                const int64_t i11      = id % ne11;
-                const char *  src1_dev = src1_original + i11 * nb11 + iid1 * nb12;
-                d2h_events.push_back(stream->memcpy(act_pinned + ri * static_cast<size_t>(K), src1_dev,
-                                                    static_cast<size_t>(K) * sizeof(float)));
+            size_t flat_row = 0;
+            for (const pp_host_expert_group & group : groups) {
+                for (const auto & row : group.rows) {
+                    const auto [iid1, id]  = row;
+                    const int64_t i11      = id % ne11;
+                    const char *  src1_dev = src1_original + i11 * nb11 + iid1 * nb12;
+                    d2h_events.push_back(stream->memcpy(act_pinned + flat_row * static_cast<size_t>(K), src1_dev,
+                                                        static_cast<size_t>(K) * sizeof(float)));
+                    ++flat_row;
+                }
             }
             sycl::event::wait(d2h_events);
+            auto t_d2h_end = host_phase_now();
 
-            // A7L5W MoE: validate the single-expert slab covers the row-stride
-            // extent that ggml_sycl_cpu_vec_dot_rows will dereference.
-            {
-                const std::size_t expert_row_bytes  = ggml_row_size(src0->type, static_cast<int>(K));
-                const std::size_t expert_slab_bytes = static_cast<std::size_t>(N) * expert_row_bytes;
+            const std::size_t expert_row_bytes  = ggml_row_size(src0->type, static_cast<int>(K));
+            const std::size_t expert_slab_bytes = static_cast<std::size_t>(N) * expert_row_bytes;
+            for (const pp_host_expert_group & group : groups) {
                 GGML_SYCL_A7L5W_ASSERT_PTR("moe_host_expert/weight_host",
-                                           src0 && src0->name ? src0->name : "(moe_expert)", host_weight_ptr,
+                                           src0 && src0->name ? src0->name : "(moe_expert)", group.host_weight,
                                            expert_slab_bytes);
             }
 
             std::vector<cpu_expert_task> tasks;
+            std::vector<char *>          scatter_dsts;
             tasks.reserve(n_rows);
-            for (size_t ri = 0; ri < n_rows; ++ri) {
-                cpu_expert_task task;
-                task.weight_host = host_weight_ptr;
-                task.act_host    = act_pinned + ri * static_cast<size_t>(K);
-                task.output_host = out_pinned + ri * static_cast<size_t>(N);
-                task.type        = src0->type;
-                task.K           = static_cast<int>(K);
-                task.N           = static_cast<int>(N);
-                // llama.cpp-0k543: only the first task carries the chunk lease —
-                // all tasks share the same weight_host, so one refcount bump is
-                // sufficient for the batch.  The lease transfers into the pool
-                // worker via move and releases when the worker's task vector is
-                // destroyed.
-                if (ri == 0) {
-                    task.weight_lease = std::move(host_weight_lease);
+            scatter_dsts.reserve(n_rows);
+            flat_row = 0;
+            for (pp_host_expert_group & group : groups) {
+                for (size_t ri = 0; ri < group.rows.size(); ++ri) {
+                    const auto [iid1, id] = group.rows[ri];
+                    cpu_expert_task task;
+                    task.weight_host = group.host_weight;
+                    task.act_host    = act_pinned + flat_row * static_cast<size_t>(K);
+                    task.output_host = out_pinned + flat_row * static_cast<size_t>(N);
+                    task.type        = src0->type;
+                    task.K           = static_cast<int>(K);
+                    task.N           = static_cast<int>(N);
+                    if (ri == 0) {
+                        task.weight_lease = std::move(group.weight_lease);
+                    }
+                    tasks.push_back(std::move(task));
+                    scatter_dsts.push_back(dst_original + id * nb1 + iid1 * nb2);
+                    ++flat_row;
                 }
-                tasks.push_back(std::move(task));
             }
 
-            auto & cpu_pool = g_cpu_expert_pools[ctx.device];
+            auto & cpu_pool    = g_cpu_expert_pools[ctx.device];
+            auto   t_cpu_begin = host_phase_now();
             if (cpu_pool.is_active()) {
-                // Synchronous submission: move the vector in, then block on
-                // the returned future.  The worker owns the storage; this
-                // scope does not.
                 cpu_pool.submit_batch(std::move(tasks)).get();
             } else {
                 ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), static_cast<int>(tasks.size()));
             }
+            auto t_cpu_end = host_phase_now();
 
+            auto                     t_h2d_begin = host_phase_now();
             std::vector<sycl::event> h2d_events;
             h2d_events.reserve(n_rows);
             for (size_t ri = 0; ri < n_rows; ++ri) {
-                const auto [iid1, id] = rows[ri];
-                char * dst_d          = dst_original + id * nb1 + iid1 * nb2;
-                h2d_events.push_back(stream->memcpy(dst_d, out_pinned + ri * static_cast<size_t>(N),
+                h2d_events.push_back(stream->memcpy(scatter_dsts[ri], out_pinned + ri * static_cast<size_t>(N),
                                                     static_cast<size_t>(N) * sizeof(float)));
             }
             sycl::event::wait(h2d_events);
+            auto t_h2d_end = host_phase_now();
+
+            if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                static std::atomic<int> pp_cpu_island_log{ 0 };
+                if (pp_cpu_island_log.fetch_add(1, std::memory_order_relaxed) < 32) {
+                    GGML_LOG_INFO("[MOE-CPU-ISLAND] tensor=%s layer=%d role=%s groups=%zu rows=%zu device=%d\n",
+                                  src0 && src0->name ? src0->name : "?", layer_id, moe_tensor_type_name(pp_role),
+                                  groups.size(), n_rows, ctx.device);
+                }
+            }
+            if (profile_host_detail) {
+                g_moe_profile.moe_host_detail(
+                    host_phase_us(t_d2h_begin, t_d2h_end), host_phase_us(t_cpu_begin, t_cpu_end),
+                    host_phase_us(t_h2d_begin, t_h2d_end), static_cast<int64_t>(n_rows),
+                    n_rows * static_cast<double>(K) * sizeof(float), n_rows * static_cast<double>(N) * sizeof(float));
+            }
+            groups.clear();
+        };
+
+        std::vector<size_t>           row_map_offsets(static_cast<size_t>(n_as) + 1, 0);
+        std::vector<mmid_row_mapping> row_maps_flat;
+        for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
+            for (int64_t id = 0; id < n_ids; id++) {
+                const int32_t row_id_i = ids_host[static_cast<size_t>(iid1 * n_ids + id)];
+                GGML_ASSERT(row_id_i >= 0 && row_id_i < n_as);
+                row_map_offsets[static_cast<size_t>(row_id_i) + 1]++;
+            }
+        }
+        for (size_t i = 1; i < row_map_offsets.size(); ++i) {
+            row_map_offsets[i] += row_map_offsets[i - 1];
+        }
+        const size_t row_maps_total = row_map_offsets[static_cast<size_t>(n_as)];
+        row_maps_flat.resize(row_maps_total);
+        std::vector<size_t> row_map_write_offsets = row_map_offsets;
+        for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
+            for (int64_t id = 0; id < n_ids; id++) {
+                const int32_t row_id_i = ids_host[static_cast<size_t>(iid1 * n_ids + id)];
+                const size_t  pos      = row_map_write_offsets[static_cast<size_t>(row_id_i)]++;
+                row_maps_flat[pos]     = { static_cast<int32_t>(id), static_cast<int32_t>(iid1) };
+            }
+        }
+        ggml_sycl_pool_alloc<mmid_row_mapping> dev_row_mappings(ctx.pool());
+        sycl::event                            row_mappings_ready;
+        if (row_maps_total > 0) {
+            dev_row_mappings.alloc(row_maps_total);
+            row_mappings_ready =
+                stream->memcpy(dev_row_mappings.get(), row_maps_flat.data(), row_maps_total * sizeof(mmid_row_mapping));
+        }
+        auto make_matched_rows = [&](size_t begin, size_t end) {
+            std::vector<std::pair<int64_t, int64_t>> rows;
+            rows.reserve(end - begin);
+            for (size_t ri = begin; ri < end; ++ri) {
+                const mmid_row_mapping & row = row_maps_flat[ri];
+                rows.emplace_back(static_cast<int64_t>(row.i2), static_cast<int64_t>(row.i1));
+            }
+            return rows;
+        };
+        auto append_secondary_entries = [&](std::vector<expert_dispatch_entry> & entries, size_t begin, size_t end,
+                                            int32_t expert_id, const void * ptr, int device,
+                                            const ggml_sycl::mem_handle * lease) {
+            entries.reserve(entries.size() + (end - begin));
+            for (size_t ri = begin; ri < end; ++ri) {
+                const mmid_row_mapping & row = row_maps_flat[ri];
+                expert_dispatch_entry    entry{ static_cast<int64_t>(row.i2), static_cast<int64_t>(row.i1), expert_id,
+                                             const_cast<void *>(ptr), device };
+                if (lease) {
+                    entry.lease = *lease;
+                }
+                entry.allow_cpu_fallback = false;
+                entries.push_back(std::move(entry));
+            }
+        };
+
+        bool pp_all_active_batches_ge2 = true;
+        for (int64_t i02 = 0; i02 < n_as; ++i02) {
+            const size_t active_rows =
+                row_map_offsets[static_cast<size_t>(i02) + 1] - row_map_offsets[static_cast<size_t>(i02)];
+            if (active_rows > 0 && active_rows < 2) {
+                pp_all_active_batches_ge2 = false;
+                break;
+            }
+        }
+#if GGML_SYCL_DNNL
+        const bool pp_mxfp4_soa_f16_input = src0->type == GGML_TYPE_MXFP4 && route_layout == GGML_LAYOUT_SOA &&
+                                            src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+                                            pp_all_active_batches_ge2;
+#else
+        const bool pp_mxfp4_soa_f16_input = false;
+#endif
+        const size_t src1_contiguous_row_bytes =
+            pp_mxfp4_soa_f16_input ? static_cast<size_t>(ne10) * sizeof(sycl::half) : nb11;
+        ggml_sycl_pool_alloc<char> src1_contiguous(ctx.pool(), src1_contiguous_row_bytes * ids->ne[1] * n_ids);
+        ggml_sycl_pool_alloc<char> dst_contiguous(ctx.pool(), sizeof(float) * ggml_nelements(dst));
+        src1_row.data = src1_contiguous.get();
+        dst_row.data  = dst_contiguous.get();
+
+        auto dispatch_mxfp4_soa_pp_f16_input = [&](const void * expert_ptr, int64_t batch, const void * src1_f16_ptr,
+                                                   void * dst_f32_ptr) -> bool {
+#if GGML_SYCL_DNNL
+            if (!pp_mxfp4_soa_f16_input || !expert_ptr || !src1_f16_ptr || !dst_f32_ptr || batch <= 0) {
+                return false;
+            }
+            if (ne00 <= 0 || ne01 <= 0 || (ne00 % QK_MXFP4) != 0) {
+                return false;
+            }
+            const size_t                     src0_elems = static_cast<size_t>(ne01) * static_cast<size_t>(ne00);
+            ggml_sycl_pool_alloc<sycl::half> src0_f16(ctx.pool());
+            try {
+                src0_f16.alloc(src0_elems);
+            } catch (...) {
+                return false;
+            }
+            const int blocks_per_row = static_cast<int>(ne00 / QK_MXFP4);
+            dequantize_row_mxfp4_soa_to_fp16_rowmajor(static_cast<const char *>(expert_ptr), src0_f16.get(),
+                                                      blocks_per_row, static_cast<int>(ne01), ctx.stream());
+            try {
+                DnnlGemmWrapper::row_gemm(ctx, static_cast<int>(ne01), static_cast<int>(batch), static_cast<int>(ne00),
+                                          src0_f16.get(), DnnlGemmWrapper::to_dt<sycl::half>(), src1_f16_ptr,
+                                          DnnlGemmWrapper::to_dt<sycl::half>(), dst_f32_ptr,
+                                          DnnlGemmWrapper::to_dt<float>(), ctx.stream());
+                ctx.stream()->wait_and_throw();
+                return true;
+            } catch (const std::exception & e) {
+                static std::atomic<int> warned{ 0 };
+                if (warned.fetch_add(1, std::memory_order_relaxed) < 4) {
+                    GGML_LOG_WARN("[MXFP4-DIRECT] oneDNN SOA PP f16-input failed: %s\n", e.what());
+                }
+                return false;
+            }
+#else
+            GGML_UNUSED(expert_ptr);
+            GGML_UNUSED(batch);
+            GGML_UNUSED(src1_f16_ptr);
+            GGML_UNUSED(dst_f32_ptr);
+            return false;
+#endif
         };
 
         std::vector<ggml_sycl::mem_handle> pp_gpu_leases;
@@ -44945,20 +46393,9 @@ cpu_tg_fallthrough:
         size_t                             pp_entries_host        = 0;
         size_t                             pp_entries_unavailable = 0;
         for (int64_t i02 = 0; i02 < n_as; i02++) {
-            int64_t                                  num_src1_rows = 0;
-            std::vector<std::pair<int64_t, int64_t>> matched_rows;
-            for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
-                for (int64_t id = 0; id < n_ids; id++) {
-                    const int32_t row_id_i =
-                        *(const int32_t *) (ids_host_raw.data() + iid1 * ids->nb[1] + id * ids->nb[0]);
-                    GGML_ASSERT(row_id_i >= 0 && row_id_i < n_as);
-                    if (row_id_i != i02) {
-                        continue;
-                    }
-                    num_src1_rows++;
-                    matched_rows.emplace_back(iid1, id);
-                }
-            }
+            const size_t  row_begin     = row_map_offsets[static_cast<size_t>(i02)];
+            const size_t  row_end       = row_map_offsets[static_cast<size_t>(i02) + 1];
+            const int64_t num_src1_rows = static_cast<int64_t>(row_end - row_begin);
             if (num_src1_rows == 0) {
                 continue;
             }
@@ -44976,14 +46413,8 @@ cpu_tg_fallthrough:
                            route.owning_device >= 0 && route.owning_device < pp_n_gpus &&
                            ggml_sycl::get_shared_context_queue(route.owning_device) != nullptr) {
                     std::vector<expert_dispatch_entry> sec_entries;
-                    sec_entries.reserve(matched_rows.size());
-                    for (const auto & row : matched_rows) {
-                        expert_dispatch_entry entry{ row.first, row.second, static_cast<int32_t>(i02), route.ptr,
-                                                     route.owning_device };
-                        entry.lease              = route.lease;
-                        entry.allow_cpu_fallback = false;
-                        sec_entries.push_back(std::move(entry));
-                    }
+                    append_secondary_entries(sec_entries, row_begin, row_end, static_cast<int32_t>(i02), route.ptr,
+                                             route.owning_device, &route.lease);
                     std::vector<expert_dispatch_entry> cpu_fallback;
                     dispatch_experts_secondary_gpu_impl(sec_entries, route.owning_device, pp_sec_ctx, cpu_fallback);
                     const bool secondary_dispatched = cpu_fallback.empty();
@@ -44991,9 +46422,10 @@ cpu_tg_fallthrough:
                         moe_expert_route host_route = ggml_sycl_resolve_moe_expert_route(
                             src0, ctx.device, static_cast<int>(i02), GGML_LAYOUT_AOS);
                         if (host_route.kind == moe_expert_route_kind::HOST && host_route.ptr) {
-                            dispatch_host_expert_rows(static_cast<int32_t>(i02), matched_rows, host_route.ptr,
-                                                      std::move(host_route.lease));
-                            pp_entries_host += matched_rows.size();
+                            auto matched_rows = make_matched_rows(row_begin, row_end);
+                            enqueue_host_expert_rows(static_cast<int32_t>(i02), std::move(matched_rows),
+                                                     host_route.ptr, std::move(host_route.lease));
+                            pp_entries_host += static_cast<size_t>(num_src1_rows);
                         } else {
                             if (ggml_sycl_moe_route_is_layout_miss(host_route)) {
                                 continue;
@@ -45004,18 +46436,19 @@ cpu_tg_fallthrough:
                     }
                     pp_route_dev1++;
                     if (secondary_dispatched) {
-                        pp_entries_dev1 += matched_rows.size();
+                        pp_entries_dev1 += static_cast<size_t>(num_src1_rows);
                     }
                     continue;
                 } else if (route.kind == moe_expert_route_kind::HOST && route.ptr) {
-                    dispatch_host_expert_rows(static_cast<int32_t>(i02), matched_rows, route.ptr,
-                                              std::move(route.lease));
+                    auto matched_rows = make_matched_rows(row_begin, row_end);
+                    enqueue_host_expert_rows(static_cast<int32_t>(i02), std::move(matched_rows), route.ptr,
+                                             std::move(route.lease));
                     pp_route_host++;
-                    pp_entries_host += matched_rows.size();
+                    pp_entries_host += static_cast<size_t>(num_src1_rows);
                     continue;
                 } else {
                     pp_route_unavailable++;
-                    pp_entries_unavailable += matched_rows.size();
+                    pp_entries_unavailable += static_cast<size_t>(num_src1_rows);
                     if (!ggml_sycl_moe_route_is_layout_miss(route)) {
                         ggml_sycl_abort_unresolved_device_expert(src0, static_cast<int>(i02), ctx.device, route);
                         GGML_UNREACHABLE();
@@ -45052,11 +46485,8 @@ cpu_tg_fallthrough:
                 }
                 if (target_ptr && target_device >= 0) {
                     std::vector<expert_dispatch_entry> sec_entries;
-                    sec_entries.reserve(matched_rows.size());
-                    for (const auto & row : matched_rows) {
-                        sec_entries.push_back(
-                            { row.first, row.second, static_cast<int32_t>(i02), target_ptr, target_device });
-                    }
+                    append_secondary_entries(sec_entries, row_begin, row_end, static_cast<int32_t>(i02), target_ptr,
+                                             target_device, nullptr);
                     std::vector<expert_dispatch_entry> cpu_fallback;
                     dispatch_experts_secondary_gpu_impl(sec_entries, target_device, pp_sec_ctx, cpu_fallback);
                     const bool secondary_dispatched = cpu_fallback.empty();
@@ -45070,13 +46500,14 @@ cpu_tg_fallthrough:
                             host_weight_lease = std::move(resolved.lease);
                         }
                         if (host_weight) {
-                            dispatch_host_expert_rows(static_cast<int32_t>(i02), matched_rows, host_weight,
-                                                      std::move(host_weight_lease));
-                            pp_entries_host += matched_rows.size();
+                            auto matched_rows = make_matched_rows(row_begin, row_end);
+                            enqueue_host_expert_rows(static_cast<int32_t>(i02), std::move(matched_rows), host_weight,
+                                                     std::move(host_weight_lease));
+                            pp_entries_host += static_cast<size_t>(num_src1_rows);
                         }
                     }
                     if (secondary_dispatched) {
-                        pp_entries_dev1 += matched_rows.size();
+                        pp_entries_dev1 += static_cast<size_t>(num_src1_rows);
                     }
                     continue;
                 }
@@ -45113,37 +46544,45 @@ cpu_tg_fallthrough:
                 if (!host_weight) {
                     // Expert is device-resident -- fall through to GPU dispatch below.
                 } else {
-                    dispatch_host_expert_rows(static_cast<int32_t>(i02), matched_rows, host_weight,
-                                              std::move(host_weight_lease));
-                    pp_entries_host += matched_rows.size();
+                    auto matched_rows = make_matched_rows(row_begin, row_end);
+                    enqueue_host_expert_rows(static_cast<int32_t>(i02), std::move(matched_rows), host_weight,
+                                             std::move(host_weight_lease));
+                    pp_entries_host += static_cast<size_t>(num_src1_rows);
                     continue;
                 }
             }
 
-            ggml_sycl_pool_alloc<int> dev_cur_src1_row(ctx.pool(), 1);
-
-            ggml_sycl_pool_alloc<mmid_row_mapping> dev_row_mapping(ctx.pool(), num_src1_rows);
-            SYCL_CHECK(CHECK_TRY_ERROR(stream->memset(dev_cur_src1_row.get(), 0, sizeof(int))));
             const unsigned int max_work_group_size = ggml_sycl_info().max_work_group_sizes[ctx.device];
             assert(max_work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
+            mmid_row_mapping * dev_row_mapping = dev_row_mappings.get() + row_begin;
             {
                 sycl::range<3> block_dims(1, 1, std::min((unsigned int) ne10, max_work_group_size));
-                sycl::range<3> grid_dims(1, n_ids, ids->ne[1]);
-                stream->submit([&](sycl::handler & cgh) {
-                    sycl::local_accessor<int, 0> src1_row_acc(cgh);
-
-                    char * __restrict src1_contiguous_get             = src1_contiguous.get();
-                    int * __restrict dev_cur_src1_row_get             = dev_cur_src1_row.get();
-                    mmid_row_mapping * __restrict dev_row_mapping_get = dev_row_mapping.get();
-                    size_t ids_nb_ct6                                 = static_cast<size_t>(ids_nb1);
-                    size_t ids_nb_ct7                                 = static_cast<size_t>(ids_nb0);
-                    cgh.parallel_for(
-                        sycl::nd_range<3>(grid_dims * block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
-                            k_copy_src1_to_contiguous(src1_original, src1_contiguous_get, dev_cur_src1_row_get,
-                                                      dev_row_mapping_get, ids_device, i02, ids_nb_ct6, ids_nb_ct7,
-                                                      ne11, ne10, nb11, nb12, item_ct1, src1_row_acc);
-                        });
-                });
+                sycl::range<3> grid_dims(1, 1, num_src1_rows);
+                if (pp_mxfp4_soa_f16_input) {
+                    stream->submit([&](sycl::handler & cgh) {
+                        cgh.depends_on(row_mappings_ready);
+                        char * __restrict src1_contiguous_get             = src1_contiguous.get();
+                        mmid_row_mapping * __restrict dev_row_mapping_get = dev_row_mapping;
+                        const size_t dst_nb1_f16                          = src1_contiguous_row_bytes;
+                        cgh.parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
+                                         [=](sycl::nd_item<3> item_ct1) {
+                                             k_copy_src1_to_contiguous_f16_mapped(src1_original, src1_contiguous_get,
+                                                                                  dev_row_mapping_get, ne11, ne10, nb11,
+                                                                                  nb12, dst_nb1_f16, item_ct1);
+                                         });
+                    });
+                } else {
+                    stream->submit([&](sycl::handler & cgh) {
+                        cgh.depends_on(row_mappings_ready);
+                        char * __restrict src1_contiguous_get             = src1_contiguous.get();
+                        mmid_row_mapping * __restrict dev_row_mapping_get = dev_row_mapping;
+                        cgh.parallel_for(
+                            sycl::nd_range<3>(grid_dims * block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
+                                k_copy_src1_to_contiguous_mapped(src1_original, src1_contiguous_get,
+                                                                 dev_row_mapping_get, ne11, ne10, nb11, nb12, item_ct1);
+                            });
+                    });
+                }
             }
             if (use_expert_cache && !expert_ptr) {
                 // Cannot use mmap fallback - GPU cannot access non-USM memory
@@ -45152,9 +46591,7 @@ cpu_tg_fallthrough:
                                 (int) i02);
                 continue;
             }
-            src0_row.data               = const_cast<void *>(expert_ptr);
-            local_extra.layout.data_ptr = const_cast<void *>(expert_ptr);
-            local_extra.moe_expert_id   = static_cast<int>(i02);
+            install_expert_slice_storage(const_cast<void *>(expert_ptr), static_cast<int>(i02), &expert_gpu_lease);
             if (expert_gpu_lease.resolve(ctx.device).ptr != nullptr) {
                 pp_gpu_leases.push_back(std::move(expert_gpu_lease));
             }
@@ -45170,7 +46607,7 @@ cpu_tg_fallthrough:
             while (batch_start < num_src1_rows) {
                 const int64_t batch = std::min<int64_t>(max_batch, num_src1_rows - batch_start);
 
-                const size_t src1_offset = static_cast<size_t>(batch_start) * nb11;
+                const size_t src1_offset = static_cast<size_t>(batch_start) * src1_contiguous_row_bytes;
                 const size_t dst_offset  = static_cast<size_t>(batch_start) * nb1;
                 src1_row.ne[1]           = batch;
                 src1_row.nb[2]           = batch * nb11;
@@ -45182,7 +46619,13 @@ cpu_tg_fallthrough:
                 dst_row.nb[3] = batch * nb1;
                 dst_row.data  = dst_contiguous.get() + dst_offset;
 
-                ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row, &route_layout);
+                if (pp_mxfp4_soa_f16_input) {
+                    const bool dispatched = dispatch_mxfp4_soa_pp_f16_input(
+                        expert_ptr, batch, src1_contiguous.get() + src1_offset, dst_contiguous.get() + dst_offset);
+                    GGML_ASSERT(dispatched && "MXFP4 SOA PP f16-input dispatch failed");
+                } else {
+                    ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row, &route_layout);
+                }
                 batch_start += batch;
             }
             pp_entries_dev0 += static_cast<size_t>(num_src1_rows);
@@ -45192,7 +46635,7 @@ cpu_tg_fallthrough:
                 sycl::range<3> grid_dims(1, 1, num_src1_rows);
                 stream->submit([&](sycl::handler & cgh) {
                     const char * __restrict dst_contiguous_get              = dst_contiguous.get();
-                    const mmid_row_mapping * __restrict dev_row_mapping_get = dev_row_mapping.get();
+                    const mmid_row_mapping * __restrict dev_row_mapping_get = dev_row_mapping;
                     cgh.parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
 
                                      [=](sycl::nd_item<3> item_ct1) {
@@ -45202,6 +46645,7 @@ cpu_tg_fallthrough:
                 });
             }
         }
+        dispatch_host_expert_groups(pp_host_groups);
         if (!pp_gpu_leases.empty()) {
             ggml_sycl::retain_handles_until_event(std::move(pp_gpu_leases), stream->ext_oneapi_submit_barrier());
         }
@@ -45220,6 +46664,11 @@ cpu_tg_fallthrough:
         if (g_moe_profile_enabled) {
             const int pp_gpu_entries = static_cast<int>(pp_entries_dev0 + pp_entries_dev1);
             const int pp_cpu_entries = static_cast<int>(pp_entries_host);
+            g_moe_profile.moe_route_stats(
+                pp_role, static_cast<int64_t>(pp_entries_dev0), static_cast<int64_t>(pp_entries_dev1),
+                static_cast<int64_t>(pp_entries_host), static_cast<int64_t>(pp_entries_unavailable),
+                static_cast<int64_t>(pp_entries_dev0 + pp_entries_dev1), static_cast<int64_t>(pp_entries_host),
+                static_cast<int64_t>(pp_entries_unavailable));
             g_moe_profile.moe_gpu_compute_done();
             g_moe_profile.moe_compute_done(pp_cpu_entries, pp_gpu_entries);
             if (g_moe_pp_profile_enabled) {
@@ -57831,16 +59280,15 @@ normal_dispatch:
 
     if (use_sycl_graph) {
         GGML_ASSERT(global_graph_lock.owns_lock());
-        // Cache graph hash (saves ~41K FNV-1a hash mix ops per token)
-        uint64_t graph_hash;
-        if (sycl_ctx->cached_graph_sig_n_nodes == cgraph->n_nodes && sycl_ctx->exec_graph) {
-            graph_hash = sycl_ctx->cached_graph_sig;
-        } else {
-            GGML_SYCL_DEBUG("[DEBUG] About to call ggml_sycl_graph_signature cgraph=%p\n", (void *) cgraph);
-            graph_hash                         = ggml_sycl_graph_signature(cgraph);
-            sycl_ctx->cached_graph_sig         = graph_hash;
-            sycl_ctx->cached_graph_sig_n_nodes = cgraph->n_nodes;
-        }
+        // The executable graph key must reflect the current graph structure, not
+        // only the node count. Backend-op sweeps and server workloads can reuse
+        // a context for different graphs with the same n_nodes but different
+        // shapes or op_params; replaying the previous executable graph in that
+        // case corrupts outputs.
+        GGML_SYCL_DEBUG("[DEBUG] About to call ggml_sycl_graph_signature cgraph=%p\n", (void *) cgraph);
+        const uint64_t graph_hash          = ggml_sycl_graph_signature(cgraph);
+        sycl_ctx->cached_graph_sig         = graph_hash;
+        sycl_ctx->cached_graph_sig_n_nodes = cgraph->n_nodes;
         GGML_SYCL_DEBUG("[DEBUG] graph_hash=%lu\n", graph_hash);
         GGML_SYCL_DEBUG("[DEBUG] Checking graph support for device %d...\n", sycl_ctx->device);
         const bool graph_support = ggml_sycl_get_device(sycl_ctx->device).has(sycl::aspect::ext_oneapi_limited_graph);
@@ -58731,6 +60179,15 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                 }
                 ggml_type a_type = a->type;
                 if (op->op == GGML_OP_MUL_MAT_ID) {
+                    // These types currently fall through to the generic
+                    // per-expert MUL_MAT fallback rather than a validated
+                    // MUL_MAT_ID kernel.  q4_K produces incorrect results and
+                    // the selected-slice path can hang in Level Zero; iq2_xxs
+                    // produces large numeric mismatches.  Do not advertise
+                    // support until a real _id path is implemented.
+                    if (a_type == GGML_TYPE_Q4_K || a_type == GGML_TYPE_IQ2_XXS) {
+                        return false;
+                    }
                     // Known NaN issues for these quantized types in the MoE host-routing path when n==1.
                     if ((a_type == GGML_TYPE_Q8_0 || a_type == GGML_TYPE_Q6_K) && (b->ne[1] == 1 || b->ne[2] == 1)) {
                         return false;

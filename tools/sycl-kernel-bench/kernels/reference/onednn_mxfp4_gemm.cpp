@@ -74,13 +74,14 @@ static void pack_mxfp4_to_onednn_km(const GeneratedWeights & weights,
     }
 }
 
-static bool validate_mxfp4_result(const GeneratedWeights &       weights,
-                                  const GeneratedActivations &   activations,
-                                  const std::vector<ggml_half> & actual,
-                                  int64_t                        m,
-                                  int64_t                        n,
-                                  int64_t                        k,
-                                  std::string &                  error) {
+static bool validate_mxfp4_result(const GeneratedWeights &     weights,
+                                  const GeneratedActivations & activations,
+                                  const void *                 actual,
+                                  bool                         actual_is_f32,
+                                  int64_t                      m,
+                                  int64_t                      n,
+                                  int64_t                      k,
+                                  std::string &                error) {
     std::vector<float> weight_row(static_cast<size_t>(k));
     std::vector<float> ref(static_cast<size_t>(n) * static_cast<size_t>(m), 0.0f);
     std::string        dequant_error;
@@ -108,7 +109,9 @@ static bool validate_mxfp4_result(const GeneratedWeights &       weights,
     size_t nonfinite_ref = 0;
     size_t first_bad     = ref.size();
     for (size_t i = 0; i < ref.size(); ++i) {
-        const double got = static_cast<double>(bench_half_to_float(actual[i]));
+        const double got = actual_is_f32 ?
+                               static_cast<double>(static_cast<const float *>(actual)[i]) :
+                               static_cast<double>(bench_half_to_float(static_cast<const ggml_half *>(actual)[i]));
         if (!std::isfinite(got)) {
             ++nonfinite_got;
             if (first_bad == ref.size()) {
@@ -136,8 +139,11 @@ static bool validate_mxfp4_result(const GeneratedWeights &       weights,
             oss << " nonfinite_got=" << nonfinite_got << " nonfinite_ref=" << nonfinite_ref;
         }
         if (first_bad < ref.size()) {
-            oss << " first_bad=" << first_bad << " got=" << bench_half_to_float(actual[first_bad])
-                << " ref=" << ref[first_bad];
+            const double got =
+                actual_is_f32 ?
+                    static_cast<double>(static_cast<const float *>(actual)[first_bad]) :
+                    static_cast<double>(bench_half_to_float(static_cast<const ggml_half *>(actual)[first_bad]));
+            oss << " first_bad=" << first_bad << " got=" << got << " ref=" << ref[first_bad];
         }
         error = oss.str();
         return false;
@@ -179,15 +185,18 @@ bool run_onednn_mxfp4_gemm(const GeneratedWeights &     weights,
 
         const size_t src_bytes      = activations.fp16.size() * sizeof(ggml_half);
         const size_t wei_user_bytes = weights_f4.size();
-        const size_t dst_bytes      = static_cast<size_t>(n) * static_cast<size_t>(m) * sizeof(ggml_half);
-        const bool   use_f32_scales = scale_mode != 0;
+        const bool   use_f32_scales = (scale_mode & 1) != 0;
+        const bool   use_f32_dst    = (scale_mode & 2) != 0;
+        const bool   use_user_wei_md = (scale_mode & 4) != 0;
+        const size_t dst_elems      = static_cast<size_t>(n) * static_cast<size_t>(m);
+        const size_t dst_bytes      = dst_elems * (use_f32_dst ? sizeof(float) : sizeof(ggml_half));
         const size_t scale_bytes =
             use_f32_scales ? scales_f32.size() * sizeof(float) : scales_e8m0.size() * sizeof(uint8_t);
 
         ggml_half * src_dev      = static_cast<ggml_half *>(sycl::aligned_alloc_device(64, src_bytes, queue));
         uint8_t *   wei_user_dev = static_cast<uint8_t *>(sycl::aligned_alloc_device(64, wei_user_bytes, queue));
         uint8_t *   scales_dev   = static_cast<uint8_t *>(sycl::aligned_alloc_device(64, scale_bytes, queue));
-        ggml_half * dst_dev      = static_cast<ggml_half *>(sycl::aligned_alloc_device(64, dst_bytes, queue));
+        void *      dst_dev      = sycl::aligned_alloc_device(64, dst_bytes, queue);
 
         if (!src_dev || !wei_user_dev || !scales_dev || !dst_dev) {
             if (src_dev) {
@@ -218,7 +227,8 @@ bool run_onednn_mxfp4_gemm(const GeneratedWeights &     weights,
         dnnl::memory::desc src_md({ n, k }, dnnl::memory::data_type::f16, { k, 1 });
         dnnl::memory::desc wei_user_md({ k, m }, dnnl::memory::data_type::f4_e2m1, { m, 1 });
         dnnl::memory::desc wei_any_md({ k, m }, dnnl::memory::data_type::f4_e2m1, dnnl::memory::format_tag::any);
-        dnnl::memory::desc dst_md({ n, m }, dnnl::memory::data_type::f16, { m, 1 });
+        dnnl::memory::desc dst_md({ n, m }, use_f32_dst ? dnnl::memory::data_type::f32 : dnnl::memory::data_type::f16,
+                                  { m, 1 });
 
         dnnl::primitive_attr attr;
         attr.set_scales(DNNL_ARG_WEIGHTS, (1 << 0) | (1 << 1), { QK_MXFP4, 1 },
@@ -226,7 +236,9 @@ bool run_onednn_mxfp4_gemm(const GeneratedWeights &     weights,
         attr.set_fpmath_mode(dnnl::fpmath_mode::f16);
         attr.set_scratchpad_mode(dnnl::scratchpad_mode::library);
 
-        auto matmul_pd = dnnl::matmul::primitive_desc(eng, src_md, wei_any_md, dst_md, attr);
+        auto matmul_pd =
+            use_user_wei_md ? dnnl::matmul::primitive_desc(eng, src_md, wei_user_md, dst_md, attr) :
+                              dnnl::matmul::primitive_desc(eng, src_md, wei_any_md, dst_md, attr);
 
         dnnl::memory src_mem(src_md, eng, src_dev);
         dnnl::memory wei_user_mem(wei_user_md, eng, wei_user_dev);
@@ -290,9 +302,9 @@ bool run_onednn_mxfp4_gemm(const GeneratedWeights &     weights,
         out.bandwidth_gbps        = (gemm_s > 0.0) ? (steady_bytes / gemm_s) / 1.0e9 : 0.0;
 
         if (validate) {
-            std::vector<ggml_half> actual(static_cast<size_t>(n) * static_cast<size_t>(m));
+            std::vector<uint8_t> actual(dst_bytes);
             queue.memcpy(actual.data(), dst_dev, dst_bytes).wait();
-            if (!validate_mxfp4_result(weights, activations, actual, m, n, k, error)) {
+            if (!validate_mxfp4_result(weights, activations, actual.data(), use_f32_dst, m, n, k, error)) {
                 sycl::free(src_dev, queue);
                 sycl::free(wei_user_dev, queue);
                 sycl::free(scales_dev, queue);

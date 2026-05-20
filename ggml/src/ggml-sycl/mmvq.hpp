@@ -100,7 +100,9 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                                                   float                         alpha,
                                                   float                         limit,
                                                   const ggml_sycl::mem_handle * glu_dst_handle_override = nullptr,
-                                                  bool                          direct_xmx_eligible     = false);
+                                                  bool                          direct_xmx_eligible     = false,
+                                                  ggml_tensor *                 gate_tmp                = nullptr,
+                                                  ggml_tensor *                 up_tmp                  = nullptr);
 
 struct mmvq_moe_dispatch_timing {
     double activation_quant_us = 0.0;

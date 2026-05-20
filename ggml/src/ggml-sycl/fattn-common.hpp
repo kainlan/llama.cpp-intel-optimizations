@@ -66,6 +66,9 @@ static inline void dequantize_V_f16(
 struct fattn_params {
     const char * Q;
     const char * K;
+    size_t K_handle_hash = 0;
+    bool K_handle_valid = false;
+    size_t K_view_offs = 0;
     const char * V;
     const char * mask;
     const char * sinks;  // Attention sinks tensor (src[4])

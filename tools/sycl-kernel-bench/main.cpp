@@ -118,7 +118,8 @@ static void print_usage(const char * argv0) {
                  "mmvq_q6_k_specialized|mmvq_mxfp4_native|"
                  "mmq_aos|mmq_soa|mmq_coalesced|mmq|"
                  "onednn_fp16_gemm|onednn_int8_gemm|onednn_woq_gemm|onednn_mxfp4_gemm|"
-                 "onednn_mxfp4_f32scale_gemm|unified_matmul|memory_bandwidth|"
+                 "onednn_mxfp4_f32scale_gemm|onednn_mxfp4_f32dst_gemm|"
+                 "onednn_mxfp4_f32scale_f32dst_gemm|unified_matmul|memory_bandwidth|"
                  "mxfp4_decode_aos|mxfp4_decode_soa|mxfp4_decode_f16_aos|mxfp4_decode_f16_soa|roofline_compute|"
                  "mxfp4_inline_dot_aos|mxfp4_inline_dot_soa|mxfp4_selected_read_aos|mxfp4_selected_read_soa|"
                  "mxfp4_selected_read_interleave_aos|mxfp4_selected_read_interleave_soa|"
@@ -131,11 +132,24 @@ static void print_usage(const char * argv0) {
                  "mxfp4_pair_glu_xmx_soa|mxfp4_pair_glu_xmx_soa_t4|"
                  "mxfp4_pair_glu_xmx_soa_t8|mxfp4_pair_glu_xmx_soa_t16|"
                  "mxfp4_pair_glu_soa_r4_cache|mxfp4_pair_glu_soa_r4_nocache|"
+                 "mxfp4_pair_glu_soa_r1_vecq|mxfp4_pair_glu_soa_r4_vecq|"
+                 "mxfp4_pair_glu_soa_r1_scale96|mxfp4_pair_glu_soa_r1_scale128|"
+                 "mxfp4_pair_glu_soa_r4_scale96|mxfp4_pair_glu_soa_r4_scale128|"
+                 "mxfp4_pair_glu_soa_r1_vecq_scale96|mxfp4_pair_glu_soa_r1_vecq_scale128|"
+                 "mxfp4_pair_glu_split_soa_r1_sg16|mxfp4_pair_glu_split_soa_r4_sg16|"
+                 "mxfp4_pair_glu_split_soa_r4|"
                  "mxfp4_mmv_id_soa_r1|mxfp4_mmv_id_soa_r2|mxfp4_mmv_id_soa_r4|mxfp4_mmv_id_soa_r8|"
                  "mxfp4_mmv_id_soa_r16|mxfp4_mmv_id_soa_r1_t4|mxfp4_mmv_id_soa_r1_t8|"
                  "mxfp4_mmv_id_soa_r1_t16|mxfp4_mmv_id_soa_r4_t4|mxfp4_mmv_id_soa_r4_t8|"
                  "mxfp4_mmv_id_soa_r4_t16|mxfp4_mmv_id_soa_r1_noscale|mxfp4_mmv_id_soa_r4_noscale|"
                  "mxfp4_mmv_id_soa_r1_sparse32|mxfp4_mmv_id_soa_r4_sparse32|"
+                 "mxfp4_mmv_id_soa_r4_cache|mxfp4_mmv_id_soa_r4_nocache|"
+                 "mxfp4_mmv_id_soa_r1_vecq|mxfp4_mmv_id_soa_r4_vecq|"
+                 "mxfp4_mmv_id_soa_r1_scale96|mxfp4_mmv_id_soa_r1_scale128|"
+                 "mxfp4_mmv_id_soa_r4_scale96|mxfp4_mmv_id_soa_r4_scale128|"
+                 "mxfp4_mmv_id_soa_r1_vecq_scale96|mxfp4_mmv_id_soa_r1_vecq_scale128|"
+                 "mxfp4_mmv_id_predecoded_r1_sg16|mxfp4_mmv_id_predecoded_r4_sg16|"
+                 "mxfp4_mmv_id_predecoded_r4_cache_sg16|"
                  "dpas_baseline|dpas_sweep|dpas_memory_patterns (comma-separated to compare)\n"
                  "  --quant=Q4_0|Q8_0|Q6_K|Q4_K|Q5_K|Q2_K|Q3_K|Q4_1|Q5_0|Q5_1|MXFP4\n"
                  "  --batch=1,4,8,16,32,64\n"
@@ -875,7 +889,9 @@ int main(int argc, char ** argv) {
                                                 case KernelKind::MXFP4_INLINE_DOT:
                                                 case KernelKind::MXFP4_SELECTED_READ:
                                                 case KernelKind::MXFP4_PAIR_GLU:
+                                                case KernelKind::MXFP4_LAYER_GLU_DOWN:
                                                 case KernelKind::MXFP4_MMV_ID:
+                                                case KernelKind::MXFP4_MMV_ID_XMX_TILED:
                                                     return s.type != GGML_TYPE_MXFP4;
                                                 case KernelKind::UNIFIED_MATMUL:
                                                     return s.type != GGML_TYPE_Q4_0 ||
