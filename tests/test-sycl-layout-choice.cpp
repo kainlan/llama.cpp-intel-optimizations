@@ -254,6 +254,38 @@ static bool run_moe_triplet_planner_test() {
         return false;
     }
 
+    const std::vector<std::pair<std::string, size_t>> balanced_inventory = {
+        { "blk.0.ffn_gate_exps.weight", 40  },
+        { "blk.0.ffn_up_exps.weight",   80  },
+        { "blk.0.ffn_down_exps.weight", 120 },
+        { "blk.1.ffn_gate_exps.weight", 40  },
+        { "blk.1.ffn_up_exps.weight",   80  },
+        { "blk.1.ffn_down_exps.weight", 120 },
+    };
+    ggml_sycl::set_expert_popularity_rank(/*layer_id=*/1, /*expert_id=*/0, /*rank=*/0);
+    ggml_sycl::set_expert_popularity_rank(/*layer_id=*/1, /*expert_id=*/1, /*rank=*/1);
+    ggml_sycl::set_expert_popularity_rank(/*layer_id=*/0, /*expert_id=*/0, /*rank=*/2);
+    ggml_sycl::set_expert_popularity_rank(/*layer_id=*/0, /*expert_id=*/1, /*rank=*/3);
+
+    auto balanced_plan = ggml_sycl::compute_placement_plan(balanced_inventory, 4 * triplet_bytes_per_expert, 0, kv_info,
+                                                           nullptr, n_experts);
+    auto triplet_on_device = [&](int layer_id, int expert_id) {
+        const auto gate =
+            balanced_plan.lookup_expert_placement(layer_id, expert_id, ggml_sycl::expert_tensor_role::GATE);
+        const auto up = balanced_plan.lookup_expert_placement(layer_id, expert_id, ggml_sycl::expert_tensor_role::UP);
+        const auto down =
+            balanced_plan.lookup_expert_placement(layer_id, expert_id, ggml_sycl::expert_tensor_role::DOWN);
+        return gate.found() && up.found() && down.found() && gate.on_device && up.on_device && down.on_device;
+    };
+    if (!triplet_on_device(1, 0) || !triplet_on_device(1, 1) || !triplet_on_device(0, 0) || !triplet_on_device(0, 1)) {
+        printf("FAIL: expected popularity-aware MoE packing to keep ranked routed experts resident\n");
+        return false;
+    }
+    if (triplet_on_device(0, 2) || triplet_on_device(1, 2) || triplet_on_device(0, 3) || triplet_on_device(1, 3)) {
+        printf("FAIL: popularity-aware MoE packing should spill unranked colder experts first\n");
+        return false;
+    }
+
     printf("PASS: MoE planner packs gate/up/down as triplets and excludes expert biases\n");
     return true;
 }

@@ -11313,8 +11313,9 @@ struct moe_triplet_group {
     int                 layer_id  = -1;
     int                 expert_id = -1;
     std::vector<size_t> indices;
-    size_t              bytes     = 0;
-    uint8_t             role_mask = 0;
+    size_t              bytes           = 0;
+    uint8_t             role_mask       = 0;
+    int                 popularity_rank = -1;
 };
 
 static uint8_t moe_role_bit(expert_tensor_role role) {
@@ -11337,7 +11338,8 @@ static bool moe_triplet_complete(const moe_triplet_group & group) {
 }
 
 static std::vector<moe_triplet_group> build_moe_triplet_groups(const placement_plan &      plan,
-                                                               const std::vector<size_t> & moe_indices) {
+                                                               const std::vector<size_t> & moe_indices,
+                                                               const char **               hotness_source) {
     std::map<std::pair<int, int>, size_t> group_index;
     std::vector<moe_triplet_group>        groups;
     groups.reserve(moe_indices.size() / 3 + 1);
@@ -11362,31 +11364,53 @@ static std::vector<moe_triplet_group> build_moe_triplet_groups(const placement_p
         group.role_mask |= moe_role_bit(entry.expert_role);
     }
 
-    // Static fallback hotness: earlier layers first, then lower expert IDs.
-    // Runtime routing stats can reorder this vector later without changing the
-    // all-or-host triplet placement contract.
-    std::sort(groups.begin(), groups.end(), [](const moe_triplet_group & a, const moe_triplet_group & b) {
-        if (a.layer_id != b.layer_id) {
-            return a.layer_id < b.layer_id;
+    bool has_ranked_groups = false;
+    if (is_expert_popularity_initialized()) {
+        for (auto & group : groups) {
+            group.popularity_rank = get_expert_popularity_rank(group.layer_id, group.expert_id);
+            has_ranked_groups     = has_ranked_groups || group.popularity_rank >= 0;
         }
-        if (a.expert_id != b.expert_id) {
-            return a.expert_id < b.expert_id;
-        }
-        return a.bytes > b.bytes;
-    });
+    }
+
+    if (hotness_source != nullptr) {
+        *hotness_source = has_ranked_groups ? "routing-popularity" : "static(layer,expert)";
+    }
+
+    // When routing/popularity data is available, place hot routed triplets
+    // first. Otherwise use the layer-first fallback: it preserves fully
+    // device-resident early MoE layers under pressure and avoids making every
+    // layer mixed-resident based on an unproven expert-ID prior.
+    std::sort(groups.begin(), groups.end(),
+              [has_ranked_groups](const moe_triplet_group & a, const moe_triplet_group & b) {
+                  if (has_ranked_groups) {
+                      const int a_rank = a.popularity_rank >= 0 ? a.popularity_rank : std::numeric_limits<int>::max();
+                      const int b_rank = b.popularity_rank >= 0 ? b.popularity_rank : std::numeric_limits<int>::max();
+                      if (a_rank != b_rank) {
+                          return a_rank < b_rank;
+                      }
+                  }
+                  if (a.layer_id != b.layer_id) {
+                      return a.layer_id < b.layer_id;
+                  }
+                  if (a.expert_id != b.expert_id) {
+                      return a.expert_id < b.expert_id;
+                  }
+                  return a.bytes > b.bytes;
+              });
     return groups;
 }
 
 struct moe_triplet_pack_stats {
-    size_t groups            = 0;
-    size_t complete_groups   = 0;
-    size_t incomplete_groups = 0;
-    size_t device_groups     = 0;
-    size_t host_groups       = 0;
-    size_t device_entries    = 0;
-    size_t host_entries      = 0;
-    size_t device_bytes      = 0;
-    size_t host_bytes        = 0;
+    size_t       groups            = 0;
+    size_t       complete_groups   = 0;
+    size_t       incomplete_groups = 0;
+    size_t       device_groups     = 0;
+    size_t       host_groups       = 0;
+    size_t       device_entries    = 0;
+    size_t       host_entries      = 0;
+    size_t       device_bytes      = 0;
+    size_t       host_bytes        = 0;
+    const char * hotness           = "static(layer,expert)";
 };
 
 static void log_moe_triplet_pack_stats(const char * tag, const moe_triplet_pack_stats & stats, size_t remaining) {
@@ -11396,10 +11420,10 @@ static void log_moe_triplet_pack_stats(const char * tag, const moe_triplet_pack_
     GGML_LOG_INFO(
         "[%s] triplet packing: groups=%zu complete=%zu incomplete=%zu device_groups=%zu host_groups=%zu "
         "device_entries=%zu (%.1f MB) host_entries=%zu (%.1f MB) remaining=%.1f MB "
-        "hotness=static(layer,expert)\n",
+        "hotness=%s\n",
         tag, stats.groups, stats.complete_groups, stats.incomplete_groups, stats.device_groups, stats.host_groups,
         stats.device_entries, stats.device_bytes / (1024.0 * 1024.0), stats.host_entries,
-        stats.host_bytes / (1024.0 * 1024.0), remaining / (1024.0 * 1024.0));
+        stats.host_bytes / (1024.0 * 1024.0), remaining / (1024.0 * 1024.0), stats.hotness);
 }
 
 static void log_moe_device_policy(const char * tag,
@@ -11958,9 +11982,11 @@ placement_plan compute_placement_plan(const std::vector<std::pair<std::string, s
     // same routed expert).  Under pressure, keep a complete triplet on one
     // domain or mark the triplet as an explicit host/CPU domain.
     {
-        const auto             moe_groups = build_moe_triplet_groups(plan, moe_indices);
+        const char *           hotness_source = nullptr;
+        const auto             moe_groups     = build_moe_triplet_groups(plan, moe_indices, &hotness_source);
         moe_triplet_pack_stats stats;
-        stats.groups = moe_groups.size();
+        stats.groups  = moe_groups.size();
+        stats.hotness = hotness_source != nullptr ? hotness_source : stats.hotness;
         for (const auto & group : moe_groups) {
             if (moe_triplet_complete(group)) {
                 stats.complete_groups++;
@@ -12395,9 +12421,11 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     }
 
     {
-        const auto             moe_groups = build_moe_triplet_groups(plan, moe_indices);
+        const char *           hotness_source = nullptr;
+        const auto             moe_groups     = build_moe_triplet_groups(plan, moe_indices, &hotness_source);
         moe_triplet_pack_stats stats;
-        stats.groups = moe_groups.size();
+        stats.groups  = moe_groups.size();
+        stats.hotness = hotness_source != nullptr ? hotness_source : stats.hotness;
         for (const auto & group : moe_groups) {
             if (moe_triplet_complete(group)) {
                 stats.complete_groups++;
