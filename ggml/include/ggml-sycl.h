@@ -153,8 +153,10 @@ GGML_BACKEND_API void ggml_backend_sycl_register_weight_usage(const char *      
 
 // Tensor inventory for tiered memory placement
 struct ggml_sycl_tensor_info {
-    const char * name;
-    size_t       size;
+    const char *   name;
+    size_t         size;
+    enum ggml_type type;
+    int64_t        ne[GGML_MAX_DIMS];
 };
 
 struct ggml_sycl_tensor_inventory {
@@ -173,10 +175,10 @@ struct ggml_sycl_tensor_inventory {
     uint32_t                       n_ctx;         // Context size (tokens)
     uint32_t                       n_ubatch;      // Physical batch size (for SWA KV sizing)
     // SWA (Sliding Window Attention) info for models with heterogeneous attention
-    uint32_t                       n_swa;              // Sliding window size (0 = no SWA)
-    uint32_t                       n_swa_layers;       // Number of SWA layers (0 = all full-attn)
-    const bool *                   swa_layer_mask;     // Per-layer SWA flag [n_layer], NULL if no SWA
-    uint32_t                       swa_layer_mask_count; // Length of swa_layer_mask (must == n_layer)
+    uint32_t                       n_swa;                 // Sliding window size (0 = no SWA)
+    uint32_t                       n_swa_layers;          // Number of SWA layers (0 = all full-attn)
+    const bool *                   swa_layer_mask;        // Per-layer SWA flag [n_layer], NULL if no SWA
+    uint32_t                       swa_layer_mask_count;  // Length of swa_layer_mask (must == n_layer)
 };
 
 // SYCL-side projection of the four placement-envelope fields the llama
@@ -266,8 +268,9 @@ GGML_BACKEND_API bool ggml_backend_sycl_has_tensor_cache(ggml_backend_t backend)
 // - Grows the host pinned SCRATCH zone for host-side compute buffers (oneDNN reorder, etc.).
 // sizes[i] is the compute buffer size for backend i; n_sizes is the length of sizes[].
 // NULL sizes or n_sizes == 0 is a no-op.
-GGML_BACKEND_API void ggml_backend_sycl_notify_compute_buffer_sizes(
-        ggml_backend_t backend, const size_t * sizes, int n_sizes);
+GGML_BACKEND_API void ggml_backend_sycl_notify_compute_buffer_sizes(ggml_backend_t backend,
+                                                                    const size_t * sizes,
+                                                                    int            n_sizes);
 
 // Get cache hit/miss statistics (stub — returns zeros).
 // hits/misses may be NULL if caller doesn't need that stat.

@@ -582,7 +582,7 @@ static void dequantize_mul_mat_vec_q4_0_coalesced(
 
     constexpr int TILE_BLOCKS = MMVQ_COALESCED_TILE_BLOCKS;  // 32
     const int blocks_per_row = ncols / QK4_0;
-    const int tiles_per_row = blocks_per_row / TILE_BLOCKS;
+    const int tiles_per_row = ggml_sycl_coalesced_fixed_tile_count(blocks_per_row);
     constexpr int word_stride = TILE_BLOCKS * 4;  // 128 bytes
 
     // X base pointers (coalesced layout: quants first, then scales)
@@ -1224,11 +1224,12 @@ static void dequantize_mul_mat_vec_q8_0_q8_0_coalesced(
 
     constexpr int TILE_BLOCKS = MMVQ_COALESCED_TILE_BLOCKS;
     const int blocks_per_row = ncols / QK8_0;
-    const int tiles_per_row = blocks_per_row / TILE_BLOCKS;
+    const int tiles_per_row = ggml_sycl_coalesced_fixed_tile_count(blocks_per_row);
     const int word_stride = TILE_BLOCKS * 4;
 
     const uint8_t * x_qs = (const uint8_t *)vx;
-    const int x_row_stride = ncols;
+    const int x_row_stride =
+        static_cast<int>(ggml_sycl_q8_0_coalesced_row_quants_bytes(blocks_per_row));
     const ggml_half * x_d = (const ggml_half *)((const char *)vx + nrows_full * x_row_stride);
 
     float partial_sum = 0.0f;
@@ -1237,10 +1238,13 @@ static void dequantize_mul_mat_vec_q8_0_q8_0_coalesced(
         const int tile_base = row * x_row_stride + tile * MMVQ_COALESCED_TILE_BYTES_Q8_0;
 
         for (int block_in_tile = lane_id; block_in_tile < TILE_BLOCKS; block_in_tile += WARP_SIZE) {
-            const int block_idx = (row_low + row) * blocks_per_row + tile * TILE_BLOCKS + block_in_tile;
+            const int y_block = tile * TILE_BLOCKS + block_in_tile;
+            if (y_block >= blocks_per_row) {
+                continue;
+            }
+            const int block_idx = (row_low + row) * blocks_per_row + y_block;
             const float d = (float)x_d[block_idx];
 
-            const int y_block = tile * TILE_BLOCKS + block_in_tile;
             const block_q8_0 * yb = y + y_block;
 
             int sumi = 0;
@@ -1273,7 +1277,6 @@ static void dequantize_mul_mat_vec_q8_0_sycl_coalesced_q8_0(
     const int nrows_full, const int row_low,
     dpct::queue_ptr stream)
 {
-    GGML_ASSERT((ncols / QK8_0) % MMVQ_COALESCED_TILE_BLOCKS == 0);
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
@@ -1329,12 +1332,13 @@ static void dequantize_mul_mat_vec_q8_0_coalesced(
 
     constexpr int TILE_BLOCKS = MMVQ_COALESCED_TILE_BLOCKS;
     const int blocks_per_row = ncols / QK8_0;
-    const int tiles_per_row = blocks_per_row / TILE_BLOCKS;
+    const int tiles_per_row = ggml_sycl_coalesced_fixed_tile_count(blocks_per_row);
     const int word_stride = TILE_BLOCKS * 4;
 
     // X base pointers (coalesced layout: quants first, then scales)
     const uint8_t * x_qs = (const uint8_t *)vx;
-    const int x_row_stride = ncols;  // bytes per row of quants
+    const int x_row_stride =
+        static_cast<int>(ggml_sycl_q8_0_coalesced_row_quants_bytes(blocks_per_row));
 
     // Scales are after all quants in the FULL tensor
     const sycl::half * x_d = (const sycl::half *)((const char *)vx + nrows_full * x_row_stride);
@@ -1345,10 +1349,14 @@ static void dequantize_mul_mat_vec_q8_0_coalesced(
         const int tile_base = row * x_row_stride + tile * MMVQ_COALESCED_TILE_BYTES_Q8_0;
 
         for (int block_in_tile = lane_id; block_in_tile < TILE_BLOCKS; block_in_tile += WARP_SIZE) {
-            const int block_idx = (row_low + row) * blocks_per_row + tile * TILE_BLOCKS + block_in_tile;
+            const int y_block = tile * TILE_BLOCKS + block_in_tile;
+            if (y_block >= blocks_per_row) {
+                continue;
+            }
+            const int block_idx = (row_low + row) * blocks_per_row + y_block;
             const float d = (float)x_d[block_idx];
 
-            const int y_base = (tile * TILE_BLOCKS + block_in_tile) * QK8_0;
+            const int y_base = y_block * QK8_0;
 
             uint8_t qs[QK8_0];
 #pragma unroll
@@ -1387,7 +1395,6 @@ static void dequantize_mul_mat_vec_q8_0_sycl_coalesced(
     const int nrows_full, const int row_low,
     dpct::queue_ptr stream)
 {
-    GGML_ASSERT((ncols / QK8_0) % MMVQ_COALESCED_TILE_BLOCKS == 0);
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);

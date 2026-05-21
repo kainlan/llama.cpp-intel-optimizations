@@ -50,18 +50,25 @@ static ggml_sycl::expert_resolve_request make_request(const ggml_sycl_cache_id &
 static bool test_normal_cache_expert_resolution(sycl::queue & q) {
     printf("\n=== Test: normal cache expert resolution ===\n");
 
-    ggml_sycl::unified_cache cache(q, 16 * 1024);
-    std::vector<uint8_t>     data(128, 0x31);
-    ggml_sycl_cache_id       key = ggml_sycl::test_make_cache_id(data.data());
-    key.aux_id                   = 0x70003;
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(0);
+    TEST_ASSERT(cache != nullptr, "global unified cache unavailable");
+    constexpr size_t test_arena_bytes = 32u * 1024u * 1024u;
+    if (cache->zone_available(ggml_sycl::vram_zone_id::WEIGHT) < 4096) {
+        TEST_ASSERT(cache->arena_reserve(q, test_arena_bytes, test_arena_bytes, 0, 0, 0, 0),
+                    "test cache should reserve a small WEIGHT arena");
+    }
+    std::vector<uint8_t> data(128, 0x31);
+    ggml_sycl_cache_id   key = ggml_sycl::test_make_cache_id(data.data());
+    key.aux_id               = 0x70003;
 
-    void * ptr = cache.allocate_slot(key, data.size(), GGML_LAYOUT_AOS, ggml_sycl::cache_entry_type::MOE_EXPERT, 7, 3);
+    void * ptr =
+        cache->allocate_slot(key, data.size(), GGML_LAYOUT_AOS, ggml_sycl::cache_entry_type::MOE_EXPERT, 7, 3);
     TEST_ASSERT(ptr != nullptr, "allocate_slot failed");
     q.memcpy(ptr, data.data(), data.size()).wait();
-    cache.register_ready(key, ptr, GGML_LAYOUT_AOS, data.size(), ggml_sycl::cache_entry_type::MOE_EXPERT, 7, 3,
-                         data.data());
+    cache->register_ready(key, ptr, GGML_LAYOUT_AOS, data.size(), ggml_sycl::cache_entry_type::MOE_EXPERT, 7, 3,
+                          data.data());
 
-    auto res = cache.resolve_expert(make_request(key, GGML_LAYOUT_AOS));
+    auto res = cache->resolve_expert(make_request(key, GGML_LAYOUT_AOS));
     TEST_ASSERT(res.reason == ggml_sycl::expert_resolve_reason::FOUND, "normal expert should resolve");
     TEST_ASSERT(res.ptr == ptr, "normal expert pointer mismatch");
     TEST_ASSERT(res.tier == ggml_sycl::expert_resolve_tier::DEVICE_VRAM, "normal expert tier mismatch");
@@ -74,7 +81,7 @@ static bool test_normal_cache_expert_resolution(sycl::queue & q) {
 
     auto wrong_device_req          = make_request(key, GGML_LAYOUT_AOS, 1);
     wrong_device_req.device_policy = ggml_sycl::expert_resolve_device_policy::CURRENT_ONLY;
-    auto wrong_device              = cache.resolve_expert(wrong_device_req);
+    auto wrong_device              = cache->resolve_expert(wrong_device_req);
     TEST_ASSERT(wrong_device.reason == ggml_sycl::expert_resolve_reason::DEVICE_MISMATCH,
                 "current-device-only policy should reject another device");
 
@@ -90,9 +97,11 @@ static bool test_direct_staged_device_resolution(sycl::queue & q) {
     ggml_sycl_cache_id   key = ggml_sycl::test_make_cache_id(data.data());
     key.aux_id               = 0x70004;
 
-    auto stage =
-        cache->direct_stage_expert(key, data.data(), data.size(), data.size(), GGML_LAYOUT_SOA, nullptr, nullptr, &q);
+    ggml_sycl::mem_handle stage_handle;
+    auto stage = cache->direct_stage_expert(key, data.data(), data.size(), data.size(), GGML_LAYOUT_SOA, nullptr,
+                                            nullptr, &q, &stage_handle);
     TEST_ASSERT(stage.ok && stage.ptr != nullptr, "direct_stage_expert failed");
+    TEST_ASSERT(stage_handle.resolve(0).ptr == stage.ptr, "direct_stage_expert should return allocation-time handle");
 
     auto res = cache->resolve_expert(make_request(key, GGML_LAYOUT_SOA));
     TEST_ASSERT(res.reason == ggml_sycl::expert_resolve_reason::FOUND, "direct staged expert should resolve");
@@ -118,7 +127,9 @@ static bool test_direct_host_and_miss_resolution(sycl::queue & q) {
     ggml_sycl_cache_id host_key = ggml_sycl::test_make_cache_id(pinned);
     host_key.aux_id             = 0x70005;
 
-    cache.register_host_expert(host_key, pinned, 64, GGML_LAYOUT_AOS);
+    ggml_sycl::mem_handle host_handle;
+    cache.register_host_expert(host_key, pinned, 64, GGML_LAYOUT_AOS, &host_handle);
+    TEST_ASSERT(host_handle.resolve(0).ptr == pinned, "register_host_expert should return allocation-time handle");
 
     auto host_res = cache.resolve_expert(make_request(host_key, GGML_LAYOUT_AOS));
     TEST_ASSERT(host_res.reason == ggml_sycl::expert_resolve_reason::FOUND, "host expert should resolve");
@@ -218,15 +229,15 @@ static bool test_planner_role_specific_expert_placement() {
     printf("\n=== Test: planner role-specific expert placement ===\n");
 
     constexpr int                                     n_experts = 32;
+    constexpr size_t                                  mib       = 1024u * 1024u;
     const std::vector<std::pair<std::string, size_t>> inventory = {
-        { "blk.0.ffn_gate_exps.weight", 512u * n_experts  },
-        { "blk.0.ffn_up_exps.weight",   2048u * n_experts },
-        { "blk.0.ffn_down_exps.weight", 1024u * n_experts },
-        { "blk.8.ffn_gate_exps.weight", 512u * n_experts  },
-        { "blk.8.ffn_up_exps.weight",   2048u * n_experts },
-        { "blk.8.ffn_down_exps.weight", 1024u * n_experts },
+        { "blk.0.ffn_gate_exps.weight", 8u * mib * n_experts  },
+        { "blk.0.ffn_up_exps.weight",   16u * mib * n_experts },
+        { "blk.0.ffn_down_exps.weight", 8u * mib * n_experts  },
+        { "blk.8.ffn_gate_exps.weight", 8u * mib * n_experts  },
+        { "blk.8.ffn_up_exps.weight",   16u * mib * n_experts },
+        { "blk.8.ffn_down_exps.weight", 8u * mib * n_experts  },
     };
-    constexpr size_t                            mib     = 1024u * 1024u;
     const std::vector<ggml_sycl::device_budget> devices = {
         { 0, 1024u * mib + 32u * 1024u, 1024u * mib + 32u * 1024u },
         { 1, 64u * 1024u,               64u * 1024u               },

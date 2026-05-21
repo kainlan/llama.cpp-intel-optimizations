@@ -568,12 +568,13 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
     inflight_pin pins[2]   = {};
     int          pin_count = 0;
 
-    auto is_graph_pinned = [&](const ggml_sycl_cache_id & key, ggml_layout_mode layout) -> bool {
-        if (!key.valid || ctx.graph_pinned_entries.empty()) {
+    auto is_graph_pinned_ptr = [&](const void * ptr, ggml_layout_mode layout) -> bool {
+        if (!ptr || ctx.graph_weight_leases.empty()) {
             return false;
         }
-        for (const auto & entry : ctx.graph_pinned_entries) {
-            if (entry.second == layout && ggml_sycl::detail::cache_id_equal(entry.first, key)) {
+        for (const auto & handle : ctx.graph_weight_leases) {
+            auto resolved = handle.resolve(device);
+            if (resolved.ptr == ptr && resolved.layout == layout) {
                 return true;
             }
         }
@@ -602,7 +603,7 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
         GGML_SYCL_DEBUG("[SYCL-BINBCAST] pin tensor=%s model=%llu name_hash=0x%llx layout=%d\n", tensor->name,
                         (unsigned long long) key.model_id, (unsigned long long) key.name_hash, (int) layout->mode);
         if (pin_count < 2) {
-            pins[pin_count++] = { key, layout->mode, is_graph_pinned(key, layout->mode) };
+            pins[pin_count++] = { key, layout->mode, is_graph_pinned_ptr(layout->data_ptr, layout->mode) };
         }
     };
 

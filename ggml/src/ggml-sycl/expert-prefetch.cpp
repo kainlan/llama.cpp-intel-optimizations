@@ -455,10 +455,10 @@ ExpertPredictor::~ExpertPredictor() {
     if (scores_alloc_.ptr && !ggml_sycl_is_shutting_down()) {
         (void) ggml_sycl::unified_free(scores_alloc_);
     }
-    scores_alloc_  = {};
-    scores_dev_    = nullptr;
-    scores_dev_n_  = 0;
-    scores_queue_  = nullptr;
+    scores_alloc_ = {};
+    scores_dev_   = nullptr;
+    scores_dev_n_ = 0;
+    scores_queue_ = nullptr;
 }
 
 void ExpertPredictor::init(int n_layers, int n_experts, int n_experts_used) {
@@ -961,21 +961,36 @@ bool MoeDispatchStats::enabled() {
     return true;
 }
 
-void MoeDispatchStats::record_dispatch(int n_vram, int n_host, int n_staging, int n_miss, int n_prefetched) {
-    const int total = n_vram + n_host + n_staging + n_miss;
+void MoeDispatchStats::record_route_residency(int n_device0,
+                                              int n_device_other,
+                                              int n_host,
+                                              int n_missing,
+                                              int n_layout_mismatch,
+                                              int n_unsupported) {
+    const int total = n_device0 + n_device_other + n_host + n_missing + n_layout_mismatch + n_unsupported;
     total_experts_dispatched.fetch_add(total, std::memory_order_relaxed);
-    total_vram_hits.fetch_add(n_vram, std::memory_order_relaxed);
-    total_host_hits.fetch_add(n_host, std::memory_order_relaxed);
-    total_staging.fetch_add(n_staging, std::memory_order_relaxed);
-    total_cpu_fallbacks.fetch_add(n_miss, std::memory_order_relaxed);
-    total_prefetch_hits.fetch_add(n_prefetched, std::memory_order_relaxed);
+    total_device0_rows.fetch_add(n_device0, std::memory_order_relaxed);
+    total_device_other_rows.fetch_add(n_device_other, std::memory_order_relaxed);
+    total_host_rows.fetch_add(n_host, std::memory_order_relaxed);
+    total_missing_rows.fetch_add(n_missing, std::memory_order_relaxed);
+    total_layout_mismatch_rows.fetch_add(n_layout_mismatch, std::memory_order_relaxed);
+    total_unsupported_rows.fetch_add(n_unsupported, std::memory_order_relaxed);
     total_layers.fetch_add(1, std::memory_order_relaxed);
 
     interval_experts.fetch_add(total, std::memory_order_relaxed);
-    interval_vram_hits.fetch_add(n_vram, std::memory_order_relaxed);
-    interval_host_hits.fetch_add(n_host, std::memory_order_relaxed);
-    interval_staging.fetch_add(n_staging, std::memory_order_relaxed);
-    interval_cpu_fallbacks.fetch_add(n_miss, std::memory_order_relaxed);
+    interval_device0_rows.fetch_add(n_device0, std::memory_order_relaxed);
+    interval_device_other_rows.fetch_add(n_device_other, std::memory_order_relaxed);
+    interval_host_rows.fetch_add(n_host, std::memory_order_relaxed);
+    interval_missing_rows.fetch_add(n_missing, std::memory_order_relaxed);
+    interval_layout_mismatch_rows.fetch_add(n_layout_mismatch, std::memory_order_relaxed);
+    interval_unsupported_rows.fetch_add(n_unsupported, std::memory_order_relaxed);
+}
+
+void MoeDispatchStats::record_dispatch(int n_vram, int n_host, int n_staging, int n_miss, int n_prefetched) {
+    GGML_UNUSED(n_prefetched);
+    // Legacy "staging" means the route has a ready event; it is still a device
+    // route. Runtime staging is not part of the planned-mode contract.
+    record_route_residency(n_vram + n_staging, 0, n_host, n_miss, 0, 0);
 }
 
 void MoeDispatchStats::record_prediction_accuracy(const std::vector<int> & predicted, const std::vector<int> & actual) {
@@ -1011,73 +1026,83 @@ void MoeDispatchStats::tick_token() {
 }
 
 void MoeDispatchStats::print_summary(const char * tag) const {
-    int64_t dispatched = total_experts_dispatched.load(std::memory_order_relaxed);
-    int64_t vram       = total_vram_hits.load(std::memory_order_relaxed);
-    int64_t host       = total_host_hits.load(std::memory_order_relaxed);
-    int64_t staging    = total_staging.load(std::memory_order_relaxed);
-    int64_t cpu        = total_cpu_fallbacks.load(std::memory_order_relaxed);
-    int64_t prefetch   = total_prefetch_hits.load(std::memory_order_relaxed);
-    int64_t tokens     = total_tokens.load(std::memory_order_relaxed);
-    int64_t layers     = total_layers.load(std::memory_order_relaxed);
-    int64_t p_total    = pred_total_experts.load(std::memory_order_relaxed);
-    int64_t p_correct  = pred_correct_experts.load(std::memory_order_relaxed);
-    int64_t p_layers   = pred_total_layers.load(std::memory_order_relaxed);
+    int64_t dispatched      = total_experts_dispatched.load(std::memory_order_relaxed);
+    int64_t device0         = total_device0_rows.load(std::memory_order_relaxed);
+    int64_t device_other    = total_device_other_rows.load(std::memory_order_relaxed);
+    int64_t host            = total_host_rows.load(std::memory_order_relaxed);
+    int64_t missing         = total_missing_rows.load(std::memory_order_relaxed);
+    int64_t layout_mismatch = total_layout_mismatch_rows.load(std::memory_order_relaxed);
+    int64_t unsupported     = total_unsupported_rows.load(std::memory_order_relaxed);
+    int64_t tokens          = total_tokens.load(std::memory_order_relaxed);
+    int64_t layers          = total_layers.load(std::memory_order_relaxed);
+    int64_t p_total         = pred_total_experts.load(std::memory_order_relaxed);
+    int64_t p_correct       = pred_correct_experts.load(std::memory_order_relaxed);
+    int64_t p_layers        = pred_total_layers.load(std::memory_order_relaxed);
 
     if (dispatched == 0) {
         return;
     }
 
-    float vram_pct     = dispatched > 0 ? 100.0f * static_cast<float>(vram) / static_cast<float>(dispatched) : 0.0f;
-    float host_pct     = dispatched > 0 ? 100.0f * static_cast<float>(host) / static_cast<float>(dispatched) : 0.0f;
-    float staging_pct  = dispatched > 0 ? 100.0f * static_cast<float>(staging) / static_cast<float>(dispatched) : 0.0f;
-    float pred_pct     = p_total > 0 ? 100.0f * static_cast<float>(p_correct) / static_cast<float>(p_total) : 0.0f;
-    float pcie_per_tok = tokens > 0 ? static_cast<float>(host + staging) / static_cast<float>(tokens) : 0.0f;
+    float device0_pct = dispatched > 0 ? 100.0f * static_cast<float>(device0) / static_cast<float>(dispatched) : 0.0f;
+    float device_other_pct =
+        dispatched > 0 ? 100.0f * static_cast<float>(device_other) / static_cast<float>(dispatched) : 0.0f;
+    float host_pct    = dispatched > 0 ? 100.0f * static_cast<float>(host) / static_cast<float>(dispatched) : 0.0f;
+    float missing_pct = dispatched > 0 ? 100.0f * static_cast<float>(missing) / static_cast<float>(dispatched) : 0.0f;
+    float layout_mismatch_pct =
+        dispatched > 0 ? 100.0f * static_cast<float>(layout_mismatch) / static_cast<float>(dispatched) : 0.0f;
+    float unsupported_pct =
+        dispatched > 0 ? 100.0f * static_cast<float>(unsupported) / static_cast<float>(dispatched) : 0.0f;
+    float pred_pct = p_total > 0 ? 100.0f * static_cast<float>(p_correct) / static_cast<float>(p_total) : 0.0f;
 
-    GGML_LOG_INFO("\n[MOE-STATS %s] ===== MoE Dispatch Statistics =====\n", tag);
-    GGML_LOG_INFO("[MOE-STATS %s] Tokens: %lld, Layers: %lld, Experts: %lld\n", tag, (long long) tokens,
+    GGML_LOG_INFO("\n[MOE-ROUTE-STATS %s] ===== MoE Route Residency =====\n", tag);
+    GGML_LOG_INFO("[MOE-ROUTE-STATS %s] Tokens: %lld, Layers: %lld, Expert rows: %lld\n", tag, (long long) tokens,
                   (long long) layers, (long long) dispatched);
-    GGML_LOG_INFO("[MOE-STATS %s] VRAM hits:  %lld (%.1f%%) - fast, no PCIe\n", tag, (long long) vram, vram_pct);
-    GGML_LOG_INFO("[MOE-STATS %s] Host hits:  %lld (%.1f%%) - PCIe streaming\n", tag, (long long) host, host_pct);
-    GGML_LOG_INFO("[MOE-STATS %s] Staging:    %lld (%.1f%%) - fresh upload\n", tag, (long long) staging, staging_pct);
-    GGML_LOG_INFO("[MOE-STATS %s] CPU miss:   %lld (%.0f%%) - fallback\n", tag, (long long) cpu,
-                  dispatched > 0 ? 100.0f * static_cast<float>(cpu) / static_cast<float>(dispatched) : 0.0f);
-    GGML_LOG_INFO("[MOE-STATS %s] PCIe experts/token: %.1f (host + staging)\n", tag, pcie_per_tok);
-    GGML_LOG_INFO("[MOE-STATS %s] Prefetch: %lld DMA-awaited\n", tag, (long long) prefetch);
-    GGML_LOG_INFO("[MOE-STATS %s] Prediction: %lld/%lld correct (%.1f%%) across %lld layers\n", tag,
+    GGML_LOG_INFO("[MOE-ROUTE-STATS %s] Device0 rows:       %lld (%.1f%%)\n", tag, (long long) device0, device0_pct);
+    GGML_LOG_INFO("[MOE-ROUTE-STATS %s] Other-device rows:  %lld (%.1f%%)\n", tag, (long long) device_other,
+                  device_other_pct);
+    GGML_LOG_INFO("[MOE-ROUTE-STATS %s] Host rows:          %lld (%.1f%%)\n", tag, (long long) host, host_pct);
+    GGML_LOG_INFO("[MOE-ROUTE-STATS %s] Missing rows:       %lld (%.1f%%)\n", tag, (long long) missing, missing_pct);
+    GGML_LOG_INFO("[MOE-ROUTE-STATS %s] Layout mismatches:  %lld (%.1f%%)\n", tag, (long long) layout_mismatch,
+                  layout_mismatch_pct);
+    GGML_LOG_INFO("[MOE-ROUTE-STATS %s] Unsupported rows:   %lld (%.1f%%)\n", tag, (long long) unsupported,
+                  unsupported_pct);
+    GGML_LOG_INFO("[MOE-ROUTE-STATS %s] Prediction: %lld/%lld correct (%.1f%%) across %lld layers\n", tag,
                   (long long) p_correct, (long long) p_total, pred_pct, (long long) p_layers);
-    GGML_LOG_INFO("[MOE-STATS %s] ================================\n\n", tag);
+    GGML_LOG_INFO("[MOE-ROUTE-STATS %s] ================================\n\n", tag);
 }
 
 void MoeDispatchStats::print_interval() {
-    int64_t i_experts = interval_experts.exchange(0, std::memory_order_relaxed);
-    int64_t i_vram    = interval_vram_hits.exchange(0, std::memory_order_relaxed);
-    int64_t i_host    = interval_host_hits.exchange(0, std::memory_order_relaxed);
-    int64_t i_staging = interval_staging.exchange(0, std::memory_order_relaxed);
-    int64_t i_cpu     = interval_cpu_fallbacks.exchange(0, std::memory_order_relaxed);
-    int64_t i_pt      = interval_pred_total.exchange(0, std::memory_order_relaxed);
-    int64_t i_pc      = interval_pred_correct.exchange(0, std::memory_order_relaxed);
-    int64_t i_tok     = interval_tokens.exchange(0, std::memory_order_relaxed);
-    int64_t tok_total = total_tokens.load(std::memory_order_relaxed);
+    int64_t i_experts      = interval_experts.exchange(0, std::memory_order_relaxed);
+    int64_t i_device0      = interval_device0_rows.exchange(0, std::memory_order_relaxed);
+    int64_t i_device_other = interval_device_other_rows.exchange(0, std::memory_order_relaxed);
+    int64_t i_host         = interval_host_rows.exchange(0, std::memory_order_relaxed);
+    int64_t i_missing      = interval_missing_rows.exchange(0, std::memory_order_relaxed);
+    int64_t i_layout       = interval_layout_mismatch_rows.exchange(0, std::memory_order_relaxed);
+    int64_t i_unsupported  = interval_unsupported_rows.exchange(0, std::memory_order_relaxed);
+    int64_t i_pt           = interval_pred_total.exchange(0, std::memory_order_relaxed);
+    int64_t i_pc           = interval_pred_correct.exchange(0, std::memory_order_relaxed);
+    int64_t i_tok          = interval_tokens.exchange(0, std::memory_order_relaxed);
+    int64_t tok_total      = total_tokens.load(std::memory_order_relaxed);
 
     if (i_experts == 0) {
         return;
     }
 
-    float vram_pct     = i_experts > 0 ? 100.0f * static_cast<float>(i_vram) / static_cast<float>(i_experts) : 0.0f;
-    float host_pct     = i_experts > 0 ? 100.0f * static_cast<float>(i_host) / static_cast<float>(i_experts) : 0.0f;
-    float pcie_per_tok = i_tok > 0 ? static_cast<float>(i_host + i_staging) / static_cast<float>(i_tok) : 0.0f;
-    float pred_pct     = i_pt > 0 ? 100.0f * static_cast<float>(i_pc) / static_cast<float>(i_pt) : 0.0f;
+    float device0_pct = i_experts > 0 ? 100.0f * static_cast<float>(i_device0) / static_cast<float>(i_experts) : 0.0f;
+    float device_other_pct =
+        i_experts > 0 ? 100.0f * static_cast<float>(i_device_other) / static_cast<float>(i_experts) : 0.0f;
+    float host_pct = i_experts > 0 ? 100.0f * static_cast<float>(i_host) / static_cast<float>(i_experts) : 0.0f;
+    float pred_pct = i_pt > 0 ? 100.0f * static_cast<float>(i_pc) / static_cast<float>(i_pt) : 0.0f;
 
     GGML_LOG_INFO(
-        "[MOE-STATS T%lld] vram=%.1f%% host=%.1f%% miss=%lld (%lld/%lld) "
-        "pcie/tok=%.1f pred=%.1f%% (%lld tok)\n",
-        (long long) tok_total, vram_pct, host_pct, (long long) i_cpu, (long long) (i_vram + i_host + i_staging),
-        (long long) i_experts, pcie_per_tok, pred_pct, (long long) i_tok);
+        "[MOE-ROUTE-STATS T%lld] dev0=%.1f%% other_dev=%.1f%% host=%.1f%% "
+        "missing=%lld layout=%lld unsupported=%lld (%lld rows) pred=%.1f%% (%lld tok)\n",
+        (long long) tok_total, device0_pct, device_other_pct, host_pct, (long long) i_missing, (long long) i_layout,
+        (long long) i_unsupported, (long long) i_experts, pred_pct, (long long) i_tok);
 }
 
 MoeDispatchStats & get_moe_dispatch_stats(int device) {
     static MoeDispatchStats stats[GGML_SYCL_MAX_DEVICES];
-    static std::once_flag   init_flags[GGML_SYCL_MAX_DEVICES];
 
     if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
         device = 0;

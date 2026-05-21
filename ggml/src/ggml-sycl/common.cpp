@@ -877,7 +877,12 @@ XMXCapabilities query_xmx_capabilities(sycl::device & dev) {
     GGML_SYCL_DEBUG("[XMX] Using default config: M=8, N=16, K=32\n");
 #endif
 
-    // Compute optimal tile counts based on SLM constraints
+    // The current MXFP4 MoE XMX kernels execute selected-expert decode as a
+    // single useful DPAS N column. Aggregating multiple N tiles into one layout
+    // group lowers the group count, but each work item still consumes only the
+    // first result column and pays extra weight-load/packing cost. Keep one
+    // queried hardware N tile for this layout until we have a batching-aware
+    // kernel that fills the additional N columns.
     bool slm_calculation_success = false;
 
     if (caps.M > 0 && caps.N > 0 && caps.K > 0 && caps.slm_size > 0) {
@@ -900,18 +905,19 @@ XMXCapabilities query_xmx_capabilities(sycl::device & dev) {
         // This ensures room for accumulation buffers and other SLM usage
         if (weight_tile_bytes > 0 && slm_for_weights > 0) {
             int max_tiles_from_slm  = static_cast<int>((slm_for_weights / 2) / weight_tile_bytes);
-            caps.optimal_tiles_n    = std::max(1, std::min(4, max_tiles_from_slm));
+            caps.optimal_tiles_n    = std::max(1, std::min(1, max_tiles_from_slm));
             slm_calculation_success = true;
 
-            GGML_LOG_INFO("[XMX] SLM-aware optimal_tiles_n=%d (SLM=%zuKB, weight_tile=%zuB, token_tile=%zuB)\n",
-                          caps.optimal_tiles_n, caps.slm_size / 1024, weight_tile_bytes, token_tile_bytes);
+            GGML_LOG_INFO("[XMX] decode-aware optimal_tiles_n=%d (SLM=%zuKB, max_slm_tiles_n=%d, weight_tile=%zuB, token_tile=%zuB)\n",
+                          caps.optimal_tiles_n, caps.slm_size / 1024, max_tiles_from_slm, weight_tile_bytes,
+                          token_tile_bytes);
         }
     }
 
     // Fallback to default calculation if SLM info unavailable or calculation failed
     if (!slm_calculation_success && caps.M > 0 && caps.N > 0) {
         caps.optimal_tiles_m = std::min(4, static_cast<int>(32 / caps.M));
-        caps.optimal_tiles_n = std::min(4, static_cast<int>(64 / caps.N));
+        caps.optimal_tiles_n = 1;
     }
 
     return caps;
@@ -1064,6 +1070,7 @@ void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> str
     }
 
     ggml_sycl_unregister_optimize_feature(&extra->optimized_feature);
+    extra->clear_moe_storage_handles();
     delete extra;
 }
 

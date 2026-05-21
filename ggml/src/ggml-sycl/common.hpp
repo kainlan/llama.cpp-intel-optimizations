@@ -414,6 +414,15 @@ constexpr int MMVQ_COALESCED_TILE_BYTES_MXFP4 = MMVQ_COALESCED_TILE_BLOCKS * 16;
 // Legacy alias for Q4_0
 constexpr int MMVQ_COALESCED_TILE_BYTES       = MMVQ_COALESCED_TILE_BYTES_Q4_0;
 
+static inline int ggml_sycl_coalesced_fixed_tile_count(int blocks_per_row) {
+    return (blocks_per_row + MMVQ_COALESCED_TILE_BLOCKS - 1) / MMVQ_COALESCED_TILE_BLOCKS;
+}
+
+static inline size_t ggml_sycl_q8_0_coalesced_row_quants_bytes(int blocks_per_row) {
+    return static_cast<size_t>(ggml_sycl_coalesced_fixed_tile_count(blocks_per_row)) *
+           static_cast<size_t>(MMVQ_COALESCED_TILE_BYTES_Q8_0);
+}
+
 // Variable tile decomposition helpers (power-of-2, largest first, max 32)
 // Used for Q6_K coalesced layout to support arbitrary block counts
 inline int tile_count(int blocks) {
@@ -626,8 +635,73 @@ struct mxfp4_moe_layout_decision {
     size_t       required_slm   = 0;
 };
 
+struct mxfp4_grouped_dpas_decision {
+    bool         shape_eligible = false;
+    bool         layout_ready   = false;
+    const char * reason         = "not-evaluated";
+    size_t       rows           = 0;
+    size_t       row_tile       = 0;
+    size_t       n_tile_repeat  = 1;
+    size_t       caps_m         = 0;
+    size_t       caps_n         = 0;
+    size_t       caps_k         = 0;
+    size_t       required_sg    = 0;
+};
+
 static inline bool ggml_sycl_mxfp4_moe_coalesced_shape_ok(int64_t in_dim) {
     return in_dim > 0 && (in_dim % QK_MXFP4) == 0 && ((in_dim / QK_MXFP4) % MMVQ_COALESCED_TILE_BLOCKS) == 0;
+}
+
+static inline mxfp4_grouped_dpas_decision ggml_sycl_select_mxfp4_grouped_dpas(const XMXCapabilities & caps,
+                                                                              int64_t                 in_dim,
+                                                                              int64_t                 out_dim,
+                                                                              size_t                  grouped_rows,
+                                                                              layout_mode             layout,
+                                                                              bool local_device_resident) {
+    mxfp4_grouped_dpas_decision d{};
+    d.rows        = grouped_rows;
+    d.required_sg = GGML_SYCL_MXFP4_MOE_XMX_SG;
+    d.caps_m      = caps.M;
+    d.caps_n      = caps.N;
+    d.caps_k      = caps.K;
+    d.row_tile    = caps.N;
+
+    if (!local_device_resident) {
+        d.reason = "residency";
+        return d;
+    }
+    if (in_dim <= 0 || out_dim <= 0 || caps.M == 0 || caps.N == 0 || caps.K == 0) {
+        d.reason = "shape";
+        return d;
+    }
+    if ((in_dim % static_cast<int64_t>(caps.K)) != 0 || (out_dim % static_cast<int64_t>(caps.M)) != 0) {
+        d.reason = "shape";
+        return d;
+    }
+    if (!xmx_capabilities_match_int8_tile(caps, GGML_SYCL_MXFP4_MOE_XMX_M, GGML_SYCL_MXFP4_MOE_XMX_N,
+                                          GGML_SYCL_MXFP4_MOE_XMX_K)) {
+        d.reason = "capability";
+        return d;
+    }
+    if (!xmx_capabilities_support_sub_group(caps, GGML_SYCL_MXFP4_MOE_XMX_SG)) {
+        d.reason = "subgroup";
+        return d;
+    }
+    if (grouped_rows < caps.N) {
+        d.reason = "rows";
+        return d;
+    }
+
+    d.shape_eligible = true;
+    d.n_tile_repeat  = grouped_rows >= 4 * caps.N ? 2 : 1;
+    d.reason         = "layout-not-materialized";
+    if (layout == GGML_LAYOUT_MXFP4_DPAS || layout == GGML_LAYOUT_XMX_TILED || layout == GGML_LAYOUT_MXFP4_I8) {
+        d.layout_ready = true;
+        d.reason       = layout == GGML_LAYOUT_MXFP4_DPAS ? "layout-ready" :
+                         layout == GGML_LAYOUT_XMX_TILED  ? "layout-ready-xmx-tiled" :
+                                                            "layout-ready-i8";
+    }
+    return d;
 }
 
 static inline mxfp4_moe_layout_decision ggml_sycl_select_mxfp4_moe_layout(const XMXCapabilities & caps,
@@ -989,9 +1063,17 @@ struct layout_policy {
             }
         }
 
-        // Embedding weights: prefer AoS for Q6_K to avoid known SoA kernel hangs on host-backed weights.
-        if (usage == tensor_usage::EMBEDDING && qtype == GGML_TYPE_Q6_K) {
-            return GGML_LAYOUT_AOS;
+        // Embedding/output weights: Q8_0 has GET_ROWS and MMVQ coalesced paths.
+        // Dimension-specific filtering in ggml_sycl_adjust_layout_for_tensor keeps
+        // non-tile-multiple rows on SOA when padded coalesced would add decode work.
+        if (usage == tensor_usage::EMBEDDING) {
+            if (qtype == GGML_TYPE_Q8_0 && is_coalesced_supported(qtype)) {
+                return GGML_LAYOUT_COALESCED;
+            }
+            // Q6_K remains AoS to avoid known SoA kernel hangs on host-backed weights.
+            if (qtype == GGML_TYPE_Q6_K) {
+                return GGML_LAYOUT_AOS;
+            }
         }
 
         if (!ggml_is_quantized(qtype)) {
@@ -1098,23 +1180,27 @@ layout_mode ggml_sycl_adjust_layout_for_tensor(const ggml_tensor * tensor, layou
 layout_mode ggml_sycl_select_moe_mmvq_layout(const ggml_tensor * src0, int device, bool host_weights);
 void *      ggml_sycl_get_weight_layout_ptr(const ggml_tensor * tensor, int device, layout_mode target);
 void * ggml_sycl_get_weight_layout_ptr(const ggml_tensor * tensor, int device, layout_mode target, bool prefer_host);
-bool   ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
-                                      const ggml_tensor *          src0,
-                                      const ggml_tensor *          ids,
-                                      layout_mode                  layout,
-                                      sycl::event *                out_event,
-                                      bool                         allow_all_experts       = false,
-                                      const std::vector<int32_t> * ids_host_override       = nullptr,
-                                      bool                         skip_device_copy        = false,
-                                      bool                         force_cache_aos         = false,
-                                      bool                         skip_cpu_routed_experts = false,
-                                      bool                         exact_layout_required   = false);
-bool   ggml_sycl_moe_all_experts_local_device(const ggml_tensor * src0, int device, layout_mode layout);
-bool   ggml_sycl_moe_prepare_compact_list(ggml_backend_sycl_context & ctx,
-                                          const ggml_tensor *         src0,
-                                          int64_t                     total_batches,
-                                          bool                        allow_alloc);
-void   ggml_sycl_retain_moe_ptr_table_leases_until_event(ggml_tensor_extra_gpu * extra, int device, sycl::event event);
+enum class moe_ptr_table_coverage {
+    SELECTED_IDS,
+    FULL_TABLE,
+    AUTO_RESOLVED_VIEW,
+};
+bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
+                                    const ggml_tensor *          src0,
+                                    const ggml_tensor *          ids,
+                                    layout_mode                  layout,
+                                    sycl::event *                out_event,
+                                    moe_ptr_table_coverage       coverage = moe_ptr_table_coverage::SELECTED_IDS,
+                                    const std::vector<int32_t> * ids_host_override       = nullptr,
+                                    bool                         skip_device_copy        = false,
+                                    bool                         force_cache_aos         = false,
+                                    bool                         skip_cpu_routed_experts = false,
+                                    bool                         exact_layout_required   = false);
+bool ggml_sycl_moe_prepare_compact_list(ggml_backend_sycl_context & ctx,
+                                        const ggml_tensor *         src0,
+                                        int64_t                     total_batches,
+                                        bool                        allow_alloc);
+void ggml_sycl_retain_moe_ptr_table_leases_until_event(ggml_tensor_extra_gpu * extra, int device, sycl::event event);
 const int32_t * ggml_sycl_get_moe_ids_device_ptr(ggml_backend_sycl_context & ctx,
                                                  const ggml_tensor *         ids,
                                                  sycl::event *               out_event,
@@ -2603,19 +2689,88 @@ struct ggml_tensor_extra_gpu {
     // expert-specific cache key (with ":eN" suffix) matching registration keys.
     int moe_expert_id = -1;
 
+    // MoE expert storage handles are the persistent ownership view for experts
+    // returned by unified-cache allocation/registration. The key is
+    // (layout, expert_id); device/location are properties of the mem_handle
+    // itself, not of this container. Pointer tables below are transient kernel
+    // ABI payloads rebuilt from these handles or route-local handles.
+    static uint64_t moe_storage_handle_key(int expert_id, ggml_layout_mode layout) {
+        return (static_cast<uint64_t>(static_cast<uint32_t>(layout)) << 32) | static_cast<uint32_t>(expert_id);
+    }
+
+    struct moe_expert_storage_record {
+        ggml_sycl::mem_handle handle;
+        bool                  has_ready_event = false;
+        sycl::event           ready_event;
+    };
+
+    void remember_moe_storage_handle(int                   expert_id,
+                                     ggml_layout_mode      layout,
+                                     ggml_sycl::mem_handle h,
+                                     const sycl::event *   ready_event = nullptr) {
+        auto resolved = h.resolve();
+        if (expert_id < 0 || !resolved.ptr || resolved.layout != layout) {
+            return;
+        }
+        moe_expert_storage_record record;
+        record.handle = std::move(h);
+        if (ready_event) {
+            record.has_ready_event = true;
+            record.ready_event     = *ready_event;
+        }
+        moe_expert_storage_handles[moe_storage_handle_key(expert_id, layout)] = std::move(record);
+        ++moe_expert_storage_generation;
+    }
+
+    const moe_expert_storage_record * find_moe_storage_handle(int expert_id, ggml_layout_mode layout) const {
+        if (expert_id < 0) {
+            return nullptr;
+        }
+        auto it = moe_expert_storage_handles.find(moe_storage_handle_key(expert_id, layout));
+        return it == moe_expert_storage_handles.end() ? nullptr : &it->second;
+    }
+
+    void clear_moe_storage_handles() {
+        moe_expert_storage_handles.clear();
+        ++moe_expert_storage_generation;
+    }
+
+    void clear_moe_storage_handles_for_owner(int owner_device) {
+        bool erased = false;
+        for (auto it = moe_expert_storage_handles.begin(); it != moe_expert_storage_handles.end();) {
+            if (it->second.handle.device() == owner_device) {
+                it     = moe_expert_storage_handles.erase(it);
+                erased = true;
+            } else {
+                ++it;
+            }
+        }
+        if (erased) {
+            ++moe_expert_storage_generation;
+        }
+    }
+
     // MoE expert pointer table (device + host staging) for per-expert layout access.
-    // moe_expert_handles is the owner/source of truth; moe_expert_ptrs_host is
+    // moe_expert_handles is the current table view; moe_expert_ptrs_host is
     // only the resolved raw-pointer payload uploaded to kernels that still take
     // a void** table. moe_expert_ptrs_leases covers the active transient table
     // payload so graph replay/direct dispatch retains the underlying mem_handles.
     // DEPRECATED: use moe_ptrs_ptr() instead of moe_expert_ptrs_device[dev] directly
-    void *                             moe_expert_ptrs_device[GGML_SYCL_MAX_DEVICES] = { nullptr };
-    size_t                             moe_expert_ptrs_size[GGML_SYCL_MAX_DEVICES]   = { 0 };
-    ggml_sycl::alloc_handle            moe_expert_ptrs_alloc[GGML_SYCL_MAX_DEVICES];
-    bool                               moe_expert_ptrs_from_prealloc[GGML_SYCL_MAX_DEVICES] = { false };
+    void *                  moe_expert_ptrs_device[GGML_SYCL_MAX_DEVICES] = { nullptr };
+    size_t                  moe_expert_ptrs_size[GGML_SYCL_MAX_DEVICES]   = { 0 };
+    ggml_sycl::alloc_handle moe_expert_ptrs_alloc[GGML_SYCL_MAX_DEVICES];
+    bool                    moe_expert_ptrs_from_prealloc[GGML_SYCL_MAX_DEVICES] = { false };
     // Validity flag: set false when host-only pointer table mode is active (skip_device_copy=true).
     // Prevents stale device table from a prior token being used when VRAM was sufficient.
-    bool                               moe_device_table_valid[GGML_SYCL_MAX_DEVICES]        = { false };
+    bool                    moe_device_table_valid[GGML_SYCL_MAX_DEVICES]        = { false };
+    std::unordered_map<uint64_t, moe_expert_storage_record> moe_expert_storage_handles;
+    uint64_t                                                moe_expert_storage_generation                          = 1;
+    uint64_t                                                moe_full_local_probe_generation[GGML_SYCL_MAX_DEVICES] = {};
+    ggml_layout_mode                                        moe_full_local_probe_layout[GGML_SYCL_MAX_DEVICES]     = {};
+    bool                                                    moe_full_local_probe_ok[GGML_SYCL_MAX_DEVICES]         = {};
+    uint64_t                           moe_planned_layout_generation[GGML_SYCL_MAX_DEVICES][2]                     = {};
+    ggml_layout_mode                   moe_planned_layout_cache[GGML_SYCL_MAX_DEVICES][2]                          = {};
+    bool                               moe_planned_layout_valid[GGML_SYCL_MAX_DEVICES][2]                          = {};
     std::vector<void *>                moe_expert_ptrs_host[GGML_SYCL_MAX_DEVICES];
     std::vector<ggml_sycl::mem_handle> moe_expert_handles[GGML_SYCL_MAX_DEVICES];
     std::vector<ggml_sycl::mem_handle> moe_expert_ptrs_leases[GGML_SYCL_MAX_DEVICES];
@@ -2713,7 +2868,8 @@ static inline bool ggml_sycl_layout_is_soa_or_coalesced(const ggml_tensor_extra_
 }
 
 // Check if a tensor's dimensions support COALESCED layout.
-// Requires (ncols / block_size) % MMVQ_COALESCED_TILE_BLOCKS == 0.
+// Q8_0 supports a padded tail tile; older fixed-tile formats still require
+// an exact tile multiple until their consumers use padded row strides too.
 static inline bool ggml_sycl_layout_supports_coalesced(const ggml_tensor * tensor) {
     if (!tensor || !is_coalesced_supported(tensor->type)) {
         return false;
@@ -2740,7 +2896,14 @@ static inline bool ggml_sycl_layout_supports_coalesced(const ggml_tensor * tenso
     if (block_size == 0) {
         return false;
     }
-    return ((ncols / block_size) % MMVQ_COALESCED_TILE_BLOCKS) == 0;
+    if ((ncols % block_size) != 0) {
+        return false;
+    }
+    const int64_t blocks_per_row = ncols / block_size;
+    if (tensor->type == GGML_TYPE_Q8_0) {
+        return blocks_per_row > 0;
+    }
+    return (blocks_per_row % MMVQ_COALESCED_TILE_BLOCKS) == 0;
 }
 
 // Accessors for backend-managed layout metadata
@@ -4164,11 +4327,9 @@ struct ggml_backend_sycl_context {
     ggml_sycl_pool & host_pool() { return host_pool(device); }
 
     // Flag to disable graphs when weight streaming is active
-    bool                                                         weight_streaming_graphs_disabled = false;
-    // Track graph-pinned cache entries (cache_id + layout) for unpinning.
-    std::vector<std::pair<ggml_sycl_cache_id, ggml_layout_mode>> graph_pinned_entries;
-    std::vector<ggml_sycl::mem_handle>                           graph_weight_leases;
-    std::vector<ggml_sycl::mem_handle>                           graph_moe_expert_leases;
+    bool                               weight_streaming_graphs_disabled = false;
+    std::vector<ggml_sycl::mem_handle> graph_weight_leases;
+    std::vector<ggml_sycl::mem_handle> graph_moe_expert_leases;
 
     struct fa_graph_ptr_snapshot {
         const void * q           = nullptr;

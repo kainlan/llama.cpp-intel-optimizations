@@ -8,7 +8,7 @@
 
 #include <atomic>
 #include <exception>
-#include <thread>
+#include <mutex>
 #include <utility>
 
 namespace ggml_sycl {
@@ -26,6 +26,27 @@ uint64_t cache_generation() {
 void cache_generation_bump() {
     g_cache_generation.fetch_add(1, std::memory_order_relaxed);
 }
+
+namespace {
+
+struct retained_handle_record {
+    std::vector<mem_handle> handles;
+    sycl::event             event;
+};
+
+std::mutex                          g_retained_handles_mutex;
+std::vector<retained_handle_record> g_retained_handles;
+
+bool retained_event_complete(const sycl::event & event) {
+    try {
+        return event.get_info<sycl::info::event::command_execution_status>() ==
+               sycl::info::event_command_status::complete;
+    } catch (...) {
+        return false;
+    }
+}
+
+}  // namespace
 
 static size_t mem_handle_hash_combine(size_t seed, size_t value) {
     return detail::cache_hash_combine(seed, value);
@@ -239,13 +260,17 @@ resolved_ptr mem_handle::resolve() const {
     return resolve_slow();
 }
 
-// === resolve(device_id) — device-checking overload ===
-// Validates that the handle's owning device matches the caller's device before
-// returning the resolved pointer.  Policy: explicit fail — return null and log.
-// HOST_DEVICE (-1) handles always pass (host-pinned pointers are device-agnostic).
+// === resolve(device_id) — dispatch-device overload ===
+// Resolves the pointer first, then rejects only device-resident pointers whose
+// allocator owner is not the caller's device. Host-pinned/host-mmap pointers are
+// device-agnostic from the dispatcher's perspective; device_ remains the cache
+// owner used for re-resolution and cleanup.
 
 resolved_ptr mem_handle::resolve(int device_id) const {
-    // Host handles (device_ == HOST_DEVICE) are accessible from any device.
+    resolved_ptr r = resolve();
+    if (!r.ptr || !r.on_device) {
+        return r;
+    }
     if (device_ != HOST_DEVICE && device_ != device_id) {
         GGML_LOG_WARN(
             "mem_handle::resolve(device_id=%d): wrong-device access — handle owns "
@@ -253,7 +278,7 @@ resolved_ptr mem_handle::resolve(int device_id) const {
             device_id, device_, static_cast<int>(kind_));
         return {};
     }
-    return resolve();
+    return r;
 }
 
 // === resolve_slow ===
@@ -665,22 +690,53 @@ bool build_layer_handles(int device, int layer_id, layer_weight_handles & out) {
     return true;
 }
 
+void reap_retained_handles(bool wait_all) {
+    std::vector<retained_handle_record> ready;
+
+    {
+        std::lock_guard<std::mutex> lock(g_retained_handles_mutex);
+        if (wait_all) {
+            ready.swap(g_retained_handles);
+        } else {
+            std::vector<retained_handle_record> pending;
+            pending.reserve(g_retained_handles.size());
+            for (auto & record : g_retained_handles) {
+                if (retained_event_complete(record.event)) {
+                    ready.push_back(std::move(record));
+                } else {
+                    pending.push_back(std::move(record));
+                }
+            }
+            g_retained_handles.swap(pending);
+        }
+    }
+
+    for (auto & record : ready) {
+        if (wait_all) {
+            try {
+                record.event.wait_and_throw();
+            } catch (const std::exception & e) {
+                GGML_LOG_ERROR("[MEM-HANDLE] event-bound lease wait failed: %s\n", e.what());
+            } catch (...) {
+                GGML_LOG_ERROR("[MEM-HANDLE] event-bound lease wait failed with unknown exception\n");
+            }
+        }
+        // record.handles is destroyed here, releasing cache-entry/chunk leases.
+    }
+}
+
 void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event event) {
     if (handles.empty()) {
         return;
     }
 
-    std::thread([handles = std::move(handles), event = std::move(event)]() mutable {
-        try {
-            event.wait_and_throw();
-        } catch (const std::exception & e) {
-            GGML_LOG_ERROR("[MEM-HANDLE] event-bound lease wait failed: %s\n", e.what());
-        } catch (...) {
-            GGML_LOG_ERROR("[MEM-HANDLE] event-bound lease wait failed with unknown exception\n");
-        }
-        // `handles` is destroyed here, releasing cache-entry and chunk leases
-        // after dependent SYCL work has completed.
-    }).detach();
+    reap_retained_handles(false);
+    if (retained_event_complete(event)) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_retained_handles_mutex);
+    g_retained_handles.push_back({ std::move(handles), std::move(event) });
 }
 
 }  // namespace ggml_sycl

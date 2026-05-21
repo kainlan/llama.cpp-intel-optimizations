@@ -90,6 +90,7 @@ struct mxfp4_pair_glu_bench_args {
     bool  cache_y             = true;
     bool  direct_xmx          = false;
     bool  split_gate_up       = false;
+    bool  predecoded_i8       = false;
     int   xmx_tiles_n         = 1;
     bool  vector_qs_load      = false;
     bool  ignore_weight_scale = false;
@@ -199,6 +200,8 @@ struct mxfp4_mmv_id_xmx_tiled_bench_args {
     const void *         activations_q8_soa = nullptr;
     float *              output             = nullptr;
     const int32_t *      ids                = nullptr;
+    int8_t *             dpas_b_packed      = nullptr;
+    float *              dpas_y_scales      = nullptr;
 
     int  ncols            = 0;
     int  ncols_y          = 0;
@@ -209,6 +212,7 @@ struct mxfp4_mmv_id_xmx_tiled_bench_args {
     int  ne11             = 1;
     int  xmx_tiles_n      = 4;
     bool raw_accum        = false;
+    bool i8_rowmajor      = false;
 
     int64_t ids_nb0 = 0;
     int64_t ids_nb1 = 0;

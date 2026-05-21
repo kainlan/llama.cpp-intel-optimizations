@@ -109,6 +109,72 @@ static bool run_mxfp4_moe_policy_test() {
     return true;
 }
 
+static bool run_mxfp4_grouped_dpas_policy_test() {
+    XMXCapabilities caps = test_mxfp4_caps();
+
+    auto decision = ggml_sycl_select_mxfp4_grouped_dpas(caps,
+                                                        /*in_dim=*/2880,
+                                                        /*out_dim=*/2880,
+                                                        /*grouped_rows=*/caps.N - 1, GGML_LAYOUT_MXFP4_DPAS,
+                                                        /*local_device_resident=*/true);
+    if (decision.shape_eligible || decision.layout_ready || std::strcmp(decision.reason, "rows") != 0) {
+        printf("FAIL: expected grouped DPAS row-count rejection, got eligible=%d ready=%d reason=%s\n",
+               decision.shape_eligible ? 1 : 0, decision.layout_ready ? 1 : 0, decision.reason);
+        return false;
+    }
+
+    decision = ggml_sycl_select_mxfp4_grouped_dpas(caps,
+                                                   /*in_dim=*/2880,
+                                                   /*out_dim=*/2880,
+                                                   /*grouped_rows=*/caps.N, GGML_LAYOUT_SOA,
+                                                   /*local_device_resident=*/true);
+    if (!decision.shape_eligible || decision.layout_ready ||
+        std::strcmp(decision.reason, "layout-not-materialized") != 0 || decision.n_tile_repeat != 1) {
+        printf("FAIL: expected grouped DPAS shape-only eligibility, got eligible=%d ready=%d repeat=%zu reason=%s\n",
+               decision.shape_eligible ? 1 : 0, decision.layout_ready ? 1 : 0, decision.n_tile_repeat, decision.reason);
+        return false;
+    }
+
+    decision = ggml_sycl_select_mxfp4_grouped_dpas(caps,
+                                                   /*in_dim=*/2880,
+                                                   /*out_dim=*/2880,
+                                                   /*grouped_rows=*/4 * caps.N, GGML_LAYOUT_MXFP4_DPAS,
+                                                   /*local_device_resident=*/true);
+    if (!decision.shape_eligible || !decision.layout_ready || decision.n_tile_repeat != 2 ||
+        std::strcmp(decision.reason, "layout-ready") != 0) {
+        printf("FAIL: expected grouped DPAS ready decision, got eligible=%d ready=%d repeat=%zu reason=%s\n",
+               decision.shape_eligible ? 1 : 0, decision.layout_ready ? 1 : 0, decision.n_tile_repeat, decision.reason);
+        return false;
+    }
+
+    decision = ggml_sycl_select_mxfp4_grouped_dpas(caps,
+                                                   /*in_dim=*/2880,
+                                                   /*out_dim=*/2880,
+                                                   /*grouped_rows=*/4 * caps.N, GGML_LAYOUT_MXFP4_DPAS,
+                                                   /*local_device_resident=*/false);
+    if (decision.shape_eligible || std::strcmp(decision.reason, "residency") != 0) {
+        printf("FAIL: expected grouped DPAS residency rejection, got eligible=%d reason=%s\n",
+               decision.shape_eligible ? 1 : 0, decision.reason);
+        return false;
+    }
+
+    XMXCapabilities unsupported = caps;
+    unsupported.supports_int8   = false;
+    decision                    = ggml_sycl_select_mxfp4_grouped_dpas(unsupported,
+                                                                      /*in_dim=*/2880,
+                                                                      /*out_dim=*/2880,
+                                                                      /*grouped_rows=*/4 * caps.N, GGML_LAYOUT_MXFP4_DPAS,
+                                                                      /*local_device_resident=*/true);
+    if (decision.shape_eligible || std::strcmp(decision.reason, "capability") != 0) {
+        printf("FAIL: expected grouped DPAS capability rejection, got eligible=%d reason=%s\n",
+               decision.shape_eligible ? 1 : 0, decision.reason);
+        return false;
+    }
+
+    printf("PASS: grouped DPAS policy is capability/shape/layout/residency driven\n");
+    return true;
+}
+
 static bool run_moe_device_policy_mock_test() {
     XMXCapabilities full_caps     = test_mxfp4_caps();
     full_caps.compute_units       = 160;
@@ -198,17 +264,17 @@ static bool run_moe_device_policy_mock_test() {
 static bool run_moe_triplet_planner_test() {
     constexpr int                                     n_experts = 4;
     const std::vector<std::pair<std::string, size_t>> inventory = {
-        { "blk.0.ffn_gate_exps.weight", 40  },
-        { "blk.0.ffn_up_exps.weight",   80  },
-        { "blk.0.ffn_down_exps.weight", 120 },
-        { "blk.0.ffn_gate_exps.bias",   16  },
-        { "blk.0.ffn_up_exps.bias",     16  },
-        { "blk.0.ffn_down_exps.bias",   16  },
+        { "blk.0.ffn_gate_exps.weight", 1024 },
+        { "blk.0.ffn_up_exps.weight",   2048 },
+        { "blk.0.ffn_down_exps.weight", 3072 },
+        { "blk.0.ffn_gate_exps.bias",   256  },
+        { "blk.0.ffn_up_exps.bias",     256  },
+        { "blk.0.ffn_down_exps.bias",   256  },
     };
 
     ggml_sycl::placement_kv_info kv_info{};
-    const size_t                 bias_bytes               = 48;
-    const size_t                 triplet_bytes_per_expert = 10 + 20 + 30;
+    const size_t                 bias_bytes               = 3 * 256;
+    const size_t                 triplet_bytes_per_expert = 256 + 512 + 768;
     const size_t                 budget                   = bias_bytes + 2 * triplet_bytes_per_expert + 1;
     auto       plan    = ggml_sycl::compute_placement_plan(inventory, budget, 0, kv_info, nullptr, n_experts);
     const auto summary = plan.summarize_expert_placements(1, n_experts);
@@ -255,12 +321,12 @@ static bool run_moe_triplet_planner_test() {
     }
 
     const std::vector<std::pair<std::string, size_t>> balanced_inventory = {
-        { "blk.0.ffn_gate_exps.weight", 40  },
-        { "blk.0.ffn_up_exps.weight",   80  },
-        { "blk.0.ffn_down_exps.weight", 120 },
-        { "blk.1.ffn_gate_exps.weight", 40  },
-        { "blk.1.ffn_up_exps.weight",   80  },
-        { "blk.1.ffn_down_exps.weight", 120 },
+        { "blk.0.ffn_gate_exps.weight", 1024 },
+        { "blk.0.ffn_up_exps.weight",   2048 },
+        { "blk.0.ffn_down_exps.weight", 3072 },
+        { "blk.1.ffn_gate_exps.weight", 1024 },
+        { "blk.1.ffn_up_exps.weight",   2048 },
+        { "blk.1.ffn_down_exps.weight", 3072 },
     };
     ggml_sycl::set_expert_popularity_rank(/*layer_id=*/1, /*expert_id=*/0, /*rank=*/0);
     ggml_sycl::set_expert_popularity_rank(/*layer_id=*/1, /*expert_id=*/1, /*rank=*/1);
@@ -283,6 +349,27 @@ static bool run_moe_triplet_planner_test() {
     }
     if (triplet_on_device(0, 2) || triplet_on_device(1, 2) || triplet_on_device(0, 3) || triplet_on_device(1, 3)) {
         printf("FAIL: popularity-aware MoE packing should spill unranked colder experts first\n");
+        return false;
+    }
+
+    const std::vector<std::pair<std::string, size_t>> unaligned_inventory = {
+        { "blk.2.ffn_gate_exps.weight", 257 * 2 },
+        { "blk.2.ffn_up_exps.weight",   257 * 2 },
+        { "blk.2.ffn_down_exps.weight", 257 * 2 },
+    };
+    auto   unaligned_plan = ggml_sycl::compute_placement_plan(unaligned_inventory, 257 * 3 * 2, 0, kv_info, nullptr, 2);
+    size_t unaligned_device_triplets = 0;
+    for (int e = 0; e < 2; ++e) {
+        const auto gate = unaligned_plan.lookup_expert_placement(2, e, ggml_sycl::expert_tensor_role::GATE);
+        const auto up   = unaligned_plan.lookup_expert_placement(2, e, ggml_sycl::expert_tensor_role::UP);
+        const auto down = unaligned_plan.lookup_expert_placement(2, e, ggml_sycl::expert_tensor_role::DOWN);
+        if (gate.found() && up.found() && down.found() && gate.on_device && up.on_device && down.on_device) {
+            unaligned_device_triplets++;
+        }
+    }
+    if (unaligned_device_triplets != 1) {
+        printf("FAIL: planner should charge allocator-rounded VRAM bytes, got %zu resident triplets\n",
+               unaligned_device_triplets);
         return false;
     }
 
@@ -452,6 +539,9 @@ static bool run_layout_choice_test() {
 
 int main() {
     if (!run_mxfp4_moe_policy_test()) {
+        return 1;
+    }
+    if (!run_mxfp4_grouped_dpas_policy_test()) {
         return 1;
     }
     if (!run_moe_device_policy_mock_test()) {

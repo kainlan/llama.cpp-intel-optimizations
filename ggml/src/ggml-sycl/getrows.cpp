@@ -1275,7 +1275,8 @@ static void k_get_rows_q8_0_coalesced(const void *             src0,
     const int word_idx1     = (iqs + 1) / 4;
     const int byte_in_word1 = (iqs + 1) % 4;
 
-    const int64_t row_quants_bytes = ne00;
+    const int64_t row_quants_bytes =
+        static_cast<int64_t>(ggml_sycl_q8_0_coalesced_row_quants_bytes(static_cast<int>(blocks_per_row)));
     const int64_t row_base         = i01 * row_quants_bytes;
     const int64_t tile_base        = row_base + tile * (TILE_BLOCKS * QK8_0);
 
@@ -1519,8 +1520,13 @@ static void ggml_sycl_get_rows_dispatch_slice(ggml_backend_sycl_context & ctx,
             break;
         case GGML_TYPE_Q8_0:
             {
-                const int64_t ne00     = src0->ne[0];
-                const int64_t d_offset = storage_rows * ne00;
+                const int64_t ne00 = src0->ne[0];
+                const int64_t d_offset =
+                    layout == GGML_LAYOUT_COALESCED ?
+                        storage_rows *
+                            static_cast<int64_t>(ggml_sycl_q8_0_coalesced_row_quants_bytes(
+                                static_cast<int>(ne00 / QK8_0))) :
+                        storage_rows * ne00;
                 if (layout == GGML_LAYOUT_SOA) {
                     get_rows_sycl_reorder<QK8_0, QR8_0, dequantize_q8_0_reorder>(
                         ctx, src0, src1, dst, src0_dd, src1_dd, dst_dd, row_offset, d_offset, stream);
@@ -2268,10 +2274,13 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tens
                         ctx, src0, dst->src[1], dst, layout_base, src1_i32, dst_d, row_offset, d_offset,
                         ctx.stream());
                 } else if (layout == GGML_LAYOUT_COALESCED && layout_base) {
-                    // Coalesced layout: word-major within tiles
-                    // d_offset = total qs bytes = storage_rows * ne00 (for Q8_0: 32 bytes qs per 32 values)
-                    const int64_t ne00     = src0->ne[0];
-                    const int64_t d_offset = storage_rows * ne00;
+                    // Coalesced layout: word-major within padded fixed-size tiles.
+                    const int64_t ne00           = src0->ne[0];
+                    const int64_t blocks_per_row = ne00 / QK8_0;
+                    const int64_t d_offset =
+                        storage_rows *
+                        static_cast<int64_t>(
+                            ggml_sycl_q8_0_coalesced_row_quants_bytes(static_cast<int>(blocks_per_row)));
                     get_rows_q8_0_coalesced_sycl(ctx, src0, dst->src[1], dst, layout_base, src1_i32, dst_d,
                                                  row_offset, d_offset, ctx.stream());
                 } else {

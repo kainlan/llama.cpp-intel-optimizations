@@ -96,7 +96,7 @@ static bool make_mxfp4_predecoded_i8_layout(const std::vector<uint8_t> & src,
                 reinterpret_cast<int8_t *>(dst_i8) +
                 (static_cast<size_t>(row) * static_cast<size_t>(blocks_per_row) + static_cast<size_t>(b)) * QK_MXFP4;
             for (int i = 0; i < QK_MXFP4 / 2; ++i) {
-                out[i]                 = mxfp4_code_value(packed[i] & 0x0f);
+                out[i]                = mxfp4_code_value(packed[i] & 0x0f);
                 out[QK_MXFP4 / 2 + i] = mxfp4_code_value(packed[i] >> 4);
             }
         }
@@ -643,6 +643,7 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
                         bool                         cache_y,
                         bool                         direct_xmx,
                         bool                         split_gate_up,
+                        bool                         predecoded_i8,
                         int                          xmx_tiles_n,
                         bool                         vector_qs_load,
                         bool                         ignore_weight_scale,
@@ -666,6 +667,10 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     }
     if (subgroup_size != 16 && subgroup_size != 32) {
         error = "mxfp4_pair_glu subgroup_size must be 16 or 32.";
+        return false;
+    }
+    if (predecoded_i8 && !split_gate_up) {
+        error = "mxfp4_pair_glu predecoded_i8 requires split gate/up.";
         return false;
     }
     if (weights.layout_mode != GGML_LAYOUT_SOA || weights.layout.empty()) {
@@ -698,8 +703,16 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     if (!make_mxfp4_soa_scale_stride_layout(weights.layout, m, k, scale_stride, expert_layout, error)) {
         return false;
     }
-    const size_t  expert_bytes         = expert_layout.size();
-    const size_t  logical_expert_bytes = weights.layout.size();
+    std::vector<uint8_t> launch_layout;
+    if (predecoded_i8) {
+        if (!make_mxfp4_predecoded_i8_layout(expert_layout, m, k, scale_stride, launch_layout, error)) {
+            return false;
+        }
+    } else {
+        launch_layout = expert_layout;
+    }
+    const size_t  expert_bytes         = launch_layout.size();
+    const size_t  logical_expert_bytes = predecoded_i8 ? launch_layout.size() : weights.layout.size();
     const size_t  expert_slots         = sparse_expert_slots ? std::max<size_t>(32, selected_count) : selected_count;
     const size_t  weight_bytes         = expert_bytes * expert_slots;
     const size_t  act_bytes            = activations.q8_1.size();
@@ -712,23 +725,31 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     std::vector<uint8_t> gate_slices(weight_bytes);
     std::vector<uint8_t> up_slices(weight_bytes);
     for (size_t slot = 0; slot < expert_slots; ++slot) {
-        std::copy(expert_layout.begin(), expert_layout.end(), gate_slices.begin() + slot * expert_bytes);
-        std::copy(expert_layout.begin(), expert_layout.end(), up_slices.begin() + slot * expert_bytes);
+        std::copy(launch_layout.begin(), launch_layout.end(), gate_slices.begin() + slot * expert_bytes);
+        std::copy(launch_layout.begin(), launch_layout.end(), up_slices.begin() + slot * expert_bytes);
     }
 
-    uint8_t *        d_gate       = sycl::malloc_device<uint8_t>(weight_bytes, queue);
-    uint8_t *        d_up         = sycl::malloc_device<uint8_t>(weight_bytes, queue);
-    const uint8_t ** d_gate_ptrs  = sycl::malloc_device<const uint8_t *>(expert_slots, queue);
-    const uint8_t ** d_up_ptrs    = sycl::malloc_device<const uint8_t *>(expert_slots, queue);
-    uint8_t *        d_act        = sycl::malloc_device<uint8_t>(act_bytes, queue);
-    int32_t *        d_ids        = sycl::malloc_device<int32_t>(ids_count, queue);
-    float *          d_out        = sycl::malloc_device<float>(out_count, queue);
-    float *          d_gate_bias  = use_bias ? sycl::malloc_device<float>(bias_count, queue) : nullptr;
-    float *          d_up_bias    = use_bias ? sycl::malloc_device<float>(bias_count, queue) : nullptr;
-    const bool       need_ref_out = validate && (direct_xmx || split_gate_up || vector_qs_load);
-    float *          d_ref_out    = need_ref_out ? sycl::malloc_device<float>(out_count, queue) : nullptr;
-    float *          d_gate_tmp   = split_gate_up ? sycl::malloc_device<float>(out_count, queue) : nullptr;
-    float *          d_up_tmp     = split_gate_up ? sycl::malloc_device<float>(out_count, queue) : nullptr;
+    uint8_t *        d_gate      = sycl::malloc_device<uint8_t>(weight_bytes, queue);
+    uint8_t *        d_up        = sycl::malloc_device<uint8_t>(weight_bytes, queue);
+    const uint8_t ** d_gate_ptrs = sycl::malloc_device<const uint8_t *>(expert_slots, queue);
+    const uint8_t ** d_up_ptrs   = sycl::malloc_device<const uint8_t *>(expert_slots, queue);
+    uint8_t *        d_ref_gate =
+        predecoded_i8 ? sycl::malloc_device<uint8_t>(expert_layout.size() * expert_slots, queue) : nullptr;
+    uint8_t * d_ref_up =
+        predecoded_i8 ? sycl::malloc_device<uint8_t>(expert_layout.size() * expert_slots, queue) : nullptr;
+    const uint8_t ** d_ref_gate_ptrs =
+        predecoded_i8 ? sycl::malloc_device<const uint8_t *>(expert_slots, queue) : nullptr;
+    const uint8_t ** d_ref_up_ptrs =
+        predecoded_i8 ? sycl::malloc_device<const uint8_t *>(expert_slots, queue) : nullptr;
+    uint8_t *  d_act        = sycl::malloc_device<uint8_t>(act_bytes, queue);
+    int32_t *  d_ids        = sycl::malloc_device<int32_t>(ids_count, queue);
+    float *    d_out        = sycl::malloc_device<float>(out_count, queue);
+    float *    d_gate_bias  = use_bias ? sycl::malloc_device<float>(bias_count, queue) : nullptr;
+    float *    d_up_bias    = use_bias ? sycl::malloc_device<float>(bias_count, queue) : nullptr;
+    const bool need_ref_out = validate && (direct_xmx || split_gate_up || vector_qs_load);
+    float *    d_ref_out    = need_ref_out ? sycl::malloc_device<float>(out_count, queue) : nullptr;
+    float *    d_gate_tmp   = split_gate_up ? sycl::malloc_device<float>(out_count, queue) : nullptr;
+    float *    d_up_tmp     = split_gate_up ? sycl::malloc_device<float>(out_count, queue) : nullptr;
 
     auto cleanup = [&]() {
         if (d_gate) {
@@ -742,6 +763,18 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
         }
         if (d_up_ptrs) {
             sycl::free(d_up_ptrs, queue);
+        }
+        if (d_ref_gate) {
+            sycl::free(d_ref_gate, queue);
+        }
+        if (d_ref_up) {
+            sycl::free(d_ref_up, queue);
+        }
+        if (d_ref_gate_ptrs) {
+            sycl::free(d_ref_gate_ptrs, queue);
+        }
+        if (d_ref_up_ptrs) {
+            sycl::free(d_ref_up_ptrs, queue);
         }
         if (d_act) {
             sycl::free(d_act, queue);
@@ -771,7 +804,8 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
 
     if (!d_gate || !d_up || !d_gate_ptrs || !d_up_ptrs || !d_act || !d_ids || !d_out ||
         (use_bias && (!d_gate_bias || !d_up_bias)) || (need_ref_out && !d_ref_out) ||
-        (split_gate_up && (!d_gate_tmp || !d_up_tmp))) {
+        (split_gate_up && (!d_gate_tmp || !d_up_tmp)) ||
+        (predecoded_i8 && (!d_ref_gate || !d_ref_up || !d_ref_gate_ptrs || !d_ref_up_ptrs))) {
         cleanup();
         error = "device allocation failed for mxfp4_pair_glu.";
         return false;
@@ -779,12 +813,18 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
 
     std::vector<const uint8_t *> host_gate_ptrs(expert_slots);
     std::vector<const uint8_t *> host_up_ptrs(expert_slots);
+    std::vector<const uint8_t *> host_ref_gate_ptrs(expert_slots);
+    std::vector<const uint8_t *> host_ref_up_ptrs(expert_slots);
     std::vector<int32_t>         host_ids(ids_count);
     std::vector<float>           host_gate_bias;
     std::vector<float>           host_up_bias;
     for (size_t slot = 0; slot < expert_slots; ++slot) {
         host_gate_ptrs[slot] = d_gate + slot * expert_bytes;
         host_up_ptrs[slot]   = d_up + slot * expert_bytes;
+        if (predecoded_i8) {
+            host_ref_gate_ptrs[slot] = d_ref_gate + slot * expert_layout.size();
+            host_ref_up_ptrs[slot]   = d_ref_up + slot * expert_layout.size();
+        }
     }
     for (size_t token = 0; token < token_count; ++token) {
         for (size_t sel = 0; sel < selected_count; ++sel) {
@@ -797,6 +837,19 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     queue.memcpy(d_up, up_slices.data(), weight_bytes);
     queue.memcpy(d_gate_ptrs, host_gate_ptrs.data(), expert_slots * sizeof(const uint8_t *));
     queue.memcpy(d_up_ptrs, host_up_ptrs.data(), expert_slots * sizeof(const uint8_t *));
+    if (predecoded_i8) {
+        std::vector<uint8_t> ref_gate_slices(expert_layout.size() * expert_slots);
+        std::vector<uint8_t> ref_up_slices(expert_layout.size() * expert_slots);
+        for (size_t slot = 0; slot < expert_slots; ++slot) {
+            std::copy(expert_layout.begin(), expert_layout.end(),
+                      ref_gate_slices.begin() + slot * expert_layout.size());
+            std::copy(expert_layout.begin(), expert_layout.end(), ref_up_slices.begin() + slot * expert_layout.size());
+        }
+        queue.memcpy(d_ref_gate, ref_gate_slices.data(), ref_gate_slices.size());
+        queue.memcpy(d_ref_up, ref_up_slices.data(), ref_up_slices.size());
+        queue.memcpy(d_ref_gate_ptrs, host_ref_gate_ptrs.data(), expert_slots * sizeof(const uint8_t *));
+        queue.memcpy(d_ref_up_ptrs, host_ref_up_ptrs.data(), expert_slots * sizeof(const uint8_t *));
+    }
     queue.memcpy(d_act, activations.q8_1.data(), act_bytes);
     queue.memcpy(d_ids, host_ids.data(), ids_count * sizeof(int32_t));
     if (use_bias) {
@@ -842,6 +895,7 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     args.cache_y             = cache_y;
     args.direct_xmx          = direct_xmx;
     args.split_gate_up       = split_gate_up;
+    args.predecoded_i8       = predecoded_i8;
     args.xmx_tiles_n         = xmx_tiles_n;
     args.vector_qs_load      = vector_qs_load;
     args.ignore_weight_scale = ignore_weight_scale;
@@ -911,14 +965,19 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
             queue.memset(d_ref_out, 0, out_bytes).wait();
             ggml_sycl::mxfp4_pair_glu_bench_args ref_args = args;
             ref_args.output                               = d_ref_out;
-            ref_args.direct_xmx                           = false;
-            ref_args.split_gate_up                        = false;
-            ref_args.gate_tmp                             = nullptr;
-            ref_args.up_tmp                               = nullptr;
-            ref_args.xmx_tiles_n                          = 1;
-            ref_args.vector_qs_load                       = false;
-            ref_args.rows_per_wg                          = 1;
-            ref_args.cache_y                              = false;
+            if (predecoded_i8) {
+                ref_args.gate_ptrs = reinterpret_cast<const void * const *>(d_ref_gate_ptrs);
+                ref_args.up_ptrs   = reinterpret_cast<const void * const *>(d_ref_up_ptrs);
+            }
+            ref_args.direct_xmx     = false;
+            ref_args.split_gate_up  = false;
+            ref_args.predecoded_i8  = false;
+            ref_args.gate_tmp       = nullptr;
+            ref_args.up_tmp         = nullptr;
+            ref_args.xmx_tiles_n    = 1;
+            ref_args.vector_qs_load = false;
+            ref_args.rows_per_wg    = 1;
+            ref_args.cache_y        = false;
             if (!ggml_sycl::ggml_sycl_mxfp4_pair_glu_bench_launch(ref_args)) {
                 cleanup();
                 error = "mxfp4_pair_glu reference launch rejected.";
@@ -1318,15 +1377,16 @@ bool run_mxfp4_mmv_id(const GeneratedWeights &     weights,
         std::copy(launch_layout.begin(), launch_layout.end(), weight_slices.begin() + slot * expert_bytes);
     }
 
-    const bool needs_ref = validate && (vector_qs_load || predecoded_i8);
-    uint8_t *        d_weights     = sycl::malloc_device<uint8_t>(weight_bytes, queue);
-    const uint8_t ** d_ptrs        = sycl::malloc_device<const uint8_t *>(expert_slots, queue);
-    uint8_t *        d_ref_weights = predecoded_i8 ? sycl::malloc_device<uint8_t>(expert_layout.size() * expert_slots, queue) : nullptr;
-    const uint8_t ** d_ref_ptrs    = predecoded_i8 ? sycl::malloc_device<const uint8_t *>(expert_slots, queue) : nullptr;
-    uint8_t *        d_act         = sycl::malloc_device<uint8_t>(act_bytes, queue);
-    int32_t *        d_ids         = sycl::malloc_device<int32_t>(ids_count, queue);
-    float *          d_out         = sycl::malloc_device<float>(out_count, queue);
-    float *          d_ref_out     = needs_ref ? sycl::malloc_device<float>(out_count, queue) : nullptr;
+    const bool       needs_ref = validate && (vector_qs_load || predecoded_i8);
+    uint8_t *        d_weights = sycl::malloc_device<uint8_t>(weight_bytes, queue);
+    const uint8_t ** d_ptrs    = sycl::malloc_device<const uint8_t *>(expert_slots, queue);
+    uint8_t *        d_ref_weights =
+        predecoded_i8 ? sycl::malloc_device<uint8_t>(expert_layout.size() * expert_slots, queue) : nullptr;
+    const uint8_t ** d_ref_ptrs = predecoded_i8 ? sycl::malloc_device<const uint8_t *>(expert_slots, queue) : nullptr;
+    uint8_t *        d_act      = sycl::malloc_device<uint8_t>(act_bytes, queue);
+    int32_t *        d_ids      = sycl::malloc_device<int32_t>(ids_count, queue);
+    float *          d_out      = sycl::malloc_device<float>(out_count, queue);
+    float *          d_ref_out  = needs_ref ? sycl::malloc_device<float>(out_count, queue) : nullptr;
 
     auto cleanup = [&]() {
         if (d_weights) {
@@ -1383,7 +1443,8 @@ bool run_mxfp4_mmv_id(const GeneratedWeights &     weights,
     if (predecoded_i8) {
         std::vector<uint8_t> ref_weight_slices(expert_layout.size() * expert_slots);
         for (size_t slot = 0; slot < expert_slots; ++slot) {
-            std::copy(expert_layout.begin(), expert_layout.end(), ref_weight_slices.begin() + slot * expert_layout.size());
+            std::copy(expert_layout.begin(), expert_layout.end(),
+                      ref_weight_slices.begin() + slot * expert_layout.size());
         }
         queue.memcpy(d_ref_weights, ref_weight_slices.data(), ref_weight_slices.size());
         queue.memcpy(d_ref_ptrs, host_ref_ptrs.data(), expert_slots * sizeof(const uint8_t *));
@@ -1477,8 +1538,9 @@ bool run_mxfp4_mmv_id(const GeneratedWeights &     weights,
         if (needs_ref) {
             queue.memset(d_ref_out, 0, out_bytes).wait();
             ggml_sycl::mxfp4_mmv_id_bench_args ref_args = args;
-            ref_args.output         = d_ref_out;
-            ref_args.expert_ptrs    = predecoded_i8 ? reinterpret_cast<const void * const *>(d_ref_ptrs) : args.expert_ptrs;
+            ref_args.output                             = d_ref_out;
+            ref_args.expert_ptrs =
+                predecoded_i8 ? reinterpret_cast<const void * const *>(d_ref_ptrs) : args.expert_ptrs;
             ref_args.vector_qs_load = false;
             ref_args.rows_per_wg    = 1;
             ref_args.cache_y        = false;
@@ -1716,8 +1778,8 @@ static bool launch_mxfp4_dpas_scaled_predecoded_kernel(const int8_t *,
 
 #if DPAS_EXPLORATION_ESIMD_AVAILABLE
 template <int N>
-SYCL_ESIMD_FUNCTION inline sycl::ext::intel::esimd::simd<int8_t, N>
-mxfp4_code_values_esimd(sycl::ext::intel::esimd::simd<uint8_t, N> codes) {
+SYCL_ESIMD_FUNCTION inline sycl::ext::intel::esimd::simd<int8_t, N> mxfp4_code_values_esimd(
+    sycl::ext::intel::esimd::simd<uint8_t, N> codes) {
     using namespace sycl::ext::intel::esimd;
     simd<uint8_t, N> base_mag = codes & uint8_t{ 7 };
     simd<uint8_t, N> mag      = base_mag;
@@ -1730,6 +1792,13 @@ mxfp4_code_values_esimd(sycl::ext::intel::esimd::simd<uint8_t, N> codes) {
     simd<int8_t, N> neg    = -values;
     values.merge(neg, (codes & uint8_t{ 8 }) != uint8_t{ 0 });
     return values;
+}
+
+SYCL_ESIMD_FUNCTION inline float mxfp4_e8m0_to_fp32_half_esimd_local(uint8_t e) {
+    uint32_t bits = e == 0 ? 0x00400000u : (static_cast<uint32_t>(e - 1) << 23);
+    float    result;
+    std::memcpy(&result, &bits, sizeof(float));
+    return result;
 }
 
 template <int Repeat, int NTileRepeats> struct mxfp4_dpas_compact_raw_kernel;
@@ -1774,11 +1843,11 @@ static bool launch_mxfp4_dpas_compact_raw_kernel(const uint8_t * compact_a,
                 const int64_t tile_group_n = tile_idx - tile_m * n_tile_groups;
                 const int64_t tile_n_base  = tile_group_n * NTileRepeats;
 
-                simd<int, Repeat * ExecN> acc0  = 0;
-                simd<int, Repeat * ExecN> acc1  = 0;
-                simd<int, Repeat * ExecN> acc2  = 0;
-                simd<int, Repeat * ExecN> acc3  = 0;
-                const uint8_t *           a_ptr = compact_a + (tile_m * k_tiles) * CompactABytes;
+                simd<int, Repeat * ExecN> acc0   = 0;
+                simd<int, Repeat * ExecN> acc1   = 0;
+                simd<int, Repeat * ExecN> acc2   = 0;
+                simd<int, Repeat * ExecN> acc3   = 0;
+                const uint8_t *           a_ptr  = compact_a + (tile_m * k_tiles) * CompactABytes;
                 const int8_t *            b_ptr0 = b_base + ((tile_n_base + 0) * k_tiles) * BN;
                 const int8_t * b_ptr1 = b_base + ((tile_n_base + (NTileRepeats >= 2 ? 1 : 0)) * k_tiles) * BN;
                 const int8_t * b_ptr2 = b_base + ((tile_n_base + (NTileRepeats >= 4 ? 2 : 0)) * k_tiles) * BN;
@@ -1856,6 +1925,416 @@ static bool launch_mxfp4_dpas_compact_raw_kernel(const uint8_t *,
     (void) Repeat;
     (void) NTileRepeats;
     error = "SYCL ESIMD unavailable; mxfp4_dpas_compact_raw disabled.";
+    return false;
+}
+#endif
+
+#if DPAS_EXPLORATION_ESIMD_AVAILABLE
+template <int Repeat, int NTileRepeats, bool XmxLayout> struct mxfp4_dpas_compact_bytescale_kernel;
+
+template <int Repeat, int NTileRepeats, bool XmxLayout>
+static bool launch_mxfp4_dpas_compact_bytescale_kernel(const uint8_t * compact_a,
+                                                       const int8_t *  b_base,
+                                                       const float *   y_scales,
+                                                       float *         c_base,
+                                                       int64_t         m,
+                                                       int64_t         n,
+                                                       int64_t         k,
+                                                       int64_t         tile_n_total,
+                                                       int64_t         n_tile_groups_n,
+                                                       sycl::queue &   queue,
+                                                       std::string &   error) {
+    static_assert(NTileRepeats == 1 || NTileRepeats == 2 || NTileRepeats == 4);
+    constexpr int ExecN         = 16;
+    constexpr int KPer          = 32;
+    constexpr int AN            = Repeat * KPer;
+    constexpr int BN            = KPer * ExecN;
+    constexpr int ScaleBytes    = Repeat;
+    constexpr int CompactABytes = Repeat * (KPer / 2);
+    constexpr int ATileBytes    = ScaleBytes + CompactABytes;
+    if (!compact_a || !b_base || !y_scales || !c_base) {
+        error = "mxfp4_dpas_compact_bytescale buffers are null.";
+        return false;
+    }
+    if ((m % Repeat) != 0 || (n % ExecN) != 0 || (k % KPer) != 0) {
+        error = "mxfp4_dpas_compact_bytescale dims must be multiples of repeat, 16, and 32.";
+        return false;
+    }
+    if constexpr (XmxLayout) {
+        if (tile_n_total < Repeat || (tile_n_total % Repeat) != 0 || n_tile_groups_n <= 0) {
+            error = "mxfp4_dpas_compact_bytescale XMX layout has invalid tile metadata.";
+            return false;
+        }
+    }
+
+    const int64_t m_tiles       = m / Repeat;
+    const int64_t n_tiles       = n / ExecN;
+    const int64_t n_tile_groups = n_tiles / NTileRepeats;
+    const int64_t k_tiles       = k / KPer;
+    const int64_t tiles         = m_tiles * n_tile_groups;
+
+    sycl::event ev = queue.submit([&](sycl::handler & h) {
+        h.parallel_for<mxfp4_dpas_compact_bytescale_kernel<Repeat, NTileRepeats, XmxLayout>>(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(tiles)), sycl::range<1>(1)),
+            [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL DPAS_NUM_REGS(128) {
+                using namespace sycl::ext::intel::esimd;
+                const int64_t tile_idx     = static_cast<int64_t>(item.get_global_id(0));
+                const int64_t tile_m       = tile_idx / n_tile_groups;
+                const int64_t tile_group_n = tile_idx - tile_m * n_tile_groups;
+                const int64_t tile_n_base  = tile_group_n * NTileRepeats;
+
+                simd<float, Repeat * ExecN> acc0            = 0.0f;
+                simd<float, Repeat * ExecN> acc1            = 0.0f;
+                simd<float, Repeat * ExecN> acc2            = 0.0f;
+                simd<float, Repeat * ExecN> acc3            = 0.0f;
+                const uint8_t *             a_ptr           = compact_a + (tile_m * k_tiles) * ATileBytes;
+                const int64_t               xmx_group_bytes = tile_n_total * (1 + KPer / 2);
+                const int64_t               xmx_row_start   = tile_m * Repeat;
+                const int64_t               xmx_group_n     = tile_n_total > 0 ? xmx_row_start / tile_n_total : 0;
+                const int64_t  xmx_row_in_group = tile_n_total > 0 ? xmx_row_start - xmx_group_n * tile_n_total : 0;
+                const int8_t * b_ptr0           = b_base + ((tile_n_base + 0) * k_tiles) * BN;
+                const int8_t * b_ptr1           = b_base + ((tile_n_base + (NTileRepeats >= 2 ? 1 : 0)) * k_tiles) * BN;
+                const int8_t * b_ptr2           = b_base + ((tile_n_base + (NTileRepeats >= 4 ? 2 : 0)) * k_tiles) * BN;
+                const int8_t * b_ptr3           = b_base + ((tile_n_base + (NTileRepeats >= 4 ? 3 : 0)) * k_tiles) * BN;
+
+                for (int64_t kt = 0; kt < k_tiles; ++kt) {
+                    const uint8_t * scale_ptr  = a_ptr;
+                    const uint8_t * packed_ptr = a_ptr + ScaleBytes;
+                    if constexpr (XmxLayout) {
+                        const uint8_t * group = compact_a + (kt * n_tile_groups_n + xmx_group_n) * xmx_group_bytes;
+                        scale_ptr             = group + xmx_row_in_group;
+                        packed_ptr            = group + tile_n_total + xmx_row_in_group * (KPer / 2);
+                    }
+                    simd<uint8_t, ScaleBytes> scale_bytes =
+                        dpas_block_load<uint8_t, ScaleBytes, DpasMemoryPattern::DIRECT_GLOBAL>(scale_ptr, false);
+                    simd<uint8_t, CompactABytes> packed =
+                        dpas_block_load<uint8_t, CompactABytes, DpasMemoryPattern::DIRECT_GLOBAL>(packed_ptr, false);
+                    simd<int8_t, AN>    a_vec;
+                    simd<float, Repeat> w_scale_vec;
+#    pragma unroll
+                    for (int r = 0; r < Repeat; ++r) {
+                        simd<uint8_t, KPer / 2> row = packed.template select<KPer / 2, 1>(r * (KPer / 2));
+                        a_vec.template select<KPer / 2, 1>(r * KPer) =
+                            mxfp4_code_values_esimd<KPer / 2>(row & uint8_t{ 0x0f });
+                        a_vec.template select<KPer / 2, 1>(r * KPer + KPer / 2) =
+                            mxfp4_code_values_esimd<KPer / 2>(row >> 4);
+                        w_scale_vec[r] = mxfp4_e8m0_to_fp32_half_esimd_local(scale_bytes[r]);
+                    }
+
+                    simd<int8_t, BN> b_vec0 =
+                        dpas_block_load<int8_t, BN, DpasMemoryPattern::DIRECT_GLOBAL>(b_ptr0, false);
+                    simd<int, Repeat * ExecN> part0 = 0;
+                    part0 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(part0, b_vec0, a_vec);
+
+                    simd<float, ExecN> y_scale_vec0 =
+                        block_load<float, ExecN>(y_scales + ((tile_n_base + 0) * k_tiles + kt) * ExecN);
+#    pragma unroll
+                    for (int r = 0; r < Repeat; ++r) {
+                        const float        w_scale                = w_scale_vec[r];
+                        simd<int, ExecN>   row_i                  = part0.template select<ExecN, 1>(r * ExecN);
+                        simd<float, ExecN> row                    = convert<float>(row_i) * (y_scale_vec0 * w_scale);
+                        acc0.template select<ExecN, 1>(r * ExecN) = acc0.template select<ExecN, 1>(r * ExecN) + row;
+                    }
+
+                    if constexpr (NTileRepeats >= 2) {
+                        simd<int8_t, BN> b_vec1 =
+                            dpas_block_load<int8_t, BN, DpasMemoryPattern::DIRECT_GLOBAL>(b_ptr1, false);
+                        simd<int, Repeat * ExecN> part1 = 0;
+                        part1 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(part1, b_vec1, a_vec);
+                        simd<float, ExecN> y_scale_vec1 =
+                            block_load<float, ExecN>(y_scales + ((tile_n_base + 1) * k_tiles + kt) * ExecN);
+#    pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            const float        w_scale = w_scale_vec[r];
+                            simd<int, ExecN>   row_i   = part1.template select<ExecN, 1>(r * ExecN);
+                            simd<float, ExecN> row     = convert<float>(row_i) * (y_scale_vec1 * w_scale);
+                            acc1.template select<ExecN, 1>(r * ExecN) = acc1.template select<ExecN, 1>(r * ExecN) + row;
+                        }
+                    }
+
+                    if constexpr (NTileRepeats >= 4) {
+                        simd<int8_t, BN> b_vec2 =
+                            dpas_block_load<int8_t, BN, DpasMemoryPattern::DIRECT_GLOBAL>(b_ptr2, false);
+                        simd<int8_t, BN> b_vec3 =
+                            dpas_block_load<int8_t, BN, DpasMemoryPattern::DIRECT_GLOBAL>(b_ptr3, false);
+                        simd<int, Repeat * ExecN> part2 = 0;
+                        simd<int, Repeat * ExecN> part3 = 0;
+                        part2 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(part2, b_vec2, a_vec);
+                        part3 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(part3, b_vec3, a_vec);
+                        simd<float, ExecN> y_scale_vec2 =
+                            block_load<float, ExecN>(y_scales + ((tile_n_base + 2) * k_tiles + kt) * ExecN);
+                        simd<float, ExecN> y_scale_vec3 =
+                            block_load<float, ExecN>(y_scales + ((tile_n_base + 3) * k_tiles + kt) * ExecN);
+#    pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            const float        w_scale = w_scale_vec[r];
+                            simd<int, ExecN>   row_i2  = part2.template select<ExecN, 1>(r * ExecN);
+                            simd<int, ExecN>   row_i3  = part3.template select<ExecN, 1>(r * ExecN);
+                            simd<float, ExecN> row2    = convert<float>(row_i2) * (y_scale_vec2 * w_scale);
+                            simd<float, ExecN> row3    = convert<float>(row_i3) * (y_scale_vec3 * w_scale);
+                            acc2.template select<ExecN, 1>(r * ExecN) =
+                                acc2.template select<ExecN, 1>(r * ExecN) + row2;
+                            acc3.template select<ExecN, 1>(r * ExecN) =
+                                acc3.template select<ExecN, 1>(r * ExecN) + row3;
+                        }
+                    }
+
+                    if constexpr (!XmxLayout) {
+                        a_ptr += ATileBytes;
+                    }
+                    b_ptr0 += BN;
+                    b_ptr1 += BN;
+                    b_ptr2 += BN;
+                    b_ptr3 += BN;
+                }
+
+#    pragma unroll
+                for (int r = 0; r < Repeat; ++r) {
+                    float * out_ptr0 = c_base + (tile_m * Repeat + r) * n + (tile_n_base + 0) * ExecN;
+                    block_store(out_ptr0, acc0.template select<ExecN, 1>(r * ExecN));
+                    if constexpr (NTileRepeats >= 2) {
+                        float * out_ptr1 = c_base + (tile_m * Repeat + r) * n + (tile_n_base + 1) * ExecN;
+                        block_store(out_ptr1, acc1.template select<ExecN, 1>(r * ExecN));
+                    }
+                    if constexpr (NTileRepeats >= 4) {
+                        float * out_ptr2 = c_base + (tile_m * Repeat + r) * n + (tile_n_base + 2) * ExecN;
+                        float * out_ptr3 = c_base + (tile_m * Repeat + r) * n + (tile_n_base + 3) * ExecN;
+                        block_store(out_ptr2, acc2.template select<ExecN, 1>(r * ExecN));
+                        block_store(out_ptr3, acc3.template select<ExecN, 1>(r * ExecN));
+                    }
+                }
+            });
+    });
+    ev.wait_and_throw();
+    return true;
+}
+#else
+template <int Repeat, int NTileRepeats, bool XmxLayout>
+static bool launch_mxfp4_dpas_compact_bytescale_kernel(const uint8_t *,
+                                                       const int8_t *,
+                                                       const float *,
+                                                       float *,
+                                                       int64_t,
+                                                       int64_t,
+                                                       int64_t,
+                                                       int64_t,
+                                                       int64_t,
+                                                       sycl::queue &,
+                                                       std::string & error) {
+    (void) Repeat;
+    (void) NTileRepeats;
+    (void) XmxLayout;
+    error = "SYCL ESIMD unavailable; mxfp4_dpas_compact_bytescale disabled.";
+    return false;
+}
+#endif
+
+#if DPAS_EXPLORATION_ESIMD_AVAILABLE
+template <int Repeat, int NTileRepeats, bool PackedScales> struct mxfp4_dpas_compact_scaled_kernel;
+
+template <int Repeat, int NTileRepeats, bool PackedScales>
+static bool launch_mxfp4_dpas_compact_scaled_kernel(const uint8_t * compact_a,
+                                                    const int8_t *  b_base,
+                                                    const float *   w_scales,
+                                                    const float *   y_scales,
+                                                    float *         c_base,
+                                                    int64_t         m,
+                                                    int64_t         n,
+                                                    int64_t         k,
+                                                    sycl::queue &   queue,
+                                                    std::string &   error) {
+    static_assert(NTileRepeats == 1 || NTileRepeats == 2 || NTileRepeats == 4);
+    constexpr int ExecN         = 16;
+    constexpr int KPer          = 32;
+    constexpr int AN            = Repeat * KPer;
+    constexpr int BN            = KPer * ExecN;
+    constexpr int CompactABytes = Repeat * (KPer / 2);
+    if (!compact_a || !b_base || !w_scales || !y_scales || !c_base) {
+        error = "mxfp4_dpas_compact_scaled buffers are null.";
+        return false;
+    }
+    if ((m % Repeat) != 0 || (n % ExecN) != 0 || (k % KPer) != 0) {
+        error = "mxfp4_dpas_compact_scaled dims must be multiples of repeat, 16, and 32.";
+        return false;
+    }
+
+    const int64_t m_tiles       = m / Repeat;
+    const int64_t n_tiles       = n / ExecN;
+    const int64_t n_tile_groups = n_tiles / NTileRepeats;
+    const int64_t k_tiles       = k / KPer;
+    const int64_t tiles         = m_tiles * n_tile_groups;
+
+    sycl::event ev = queue.submit([&](sycl::handler & h) {
+        h.parallel_for<mxfp4_dpas_compact_scaled_kernel<Repeat, NTileRepeats, PackedScales>>(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(tiles)), sycl::range<1>(1)),
+            [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL DPAS_NUM_REGS(128) {
+                using namespace sycl::ext::intel::esimd;
+                const int64_t tile_idx     = static_cast<int64_t>(item.get_global_id(0));
+                const int64_t tile_m       = tile_idx / n_tile_groups;
+                const int64_t tile_group_n = tile_idx - tile_m * n_tile_groups;
+                const int64_t tile_n_base  = tile_group_n * NTileRepeats;
+
+                simd<float, Repeat * ExecN> acc0   = 0.0f;
+                simd<float, Repeat * ExecN> acc1   = 0.0f;
+                simd<float, Repeat * ExecN> acc2   = 0.0f;
+                simd<float, Repeat * ExecN> acc3   = 0.0f;
+                const uint8_t *             a_ptr  = compact_a + (tile_m * k_tiles) * CompactABytes;
+                const int8_t *              b_ptr0 = b_base + ((tile_n_base + 0) * k_tiles) * BN;
+                const int8_t * b_ptr1 = b_base + ((tile_n_base + (NTileRepeats >= 2 ? 1 : 0)) * k_tiles) * BN;
+                const int8_t * b_ptr2 = b_base + ((tile_n_base + (NTileRepeats >= 4 ? 2 : 0)) * k_tiles) * BN;
+                const int8_t * b_ptr3 = b_base + ((tile_n_base + (NTileRepeats >= 4 ? 3 : 0)) * k_tiles) * BN;
+
+                for (int64_t kt = 0; kt < k_tiles; ++kt) {
+                    simd<uint8_t, CompactABytes> packed =
+                        dpas_block_load<uint8_t, CompactABytes, DpasMemoryPattern::DIRECT_GLOBAL>(a_ptr, false);
+                    simd<int8_t, AN> a_vec;
+#    pragma unroll
+                    for (int r = 0; r < Repeat; ++r) {
+                        simd<uint8_t, KPer / 2> row = packed.template select<KPer / 2, 1>(r * (KPer / 2));
+                        a_vec.template select<KPer / 2, 1>(r * KPer) =
+                            mxfp4_code_values_esimd<KPer / 2>(row & uint8_t{ 0x0f });
+                        a_vec.template select<KPer / 2, 1>(r * KPer + KPer / 2) =
+                            mxfp4_code_values_esimd<KPer / 2>(row >> 4);
+                    }
+
+                    simd<float, Repeat> w_scale_vec;
+                    if constexpr (PackedScales) {
+                        w_scale_vec = block_load<float, Repeat>(w_scales + (tile_m * k_tiles + kt) * Repeat);
+                    } else {
+#    pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            w_scale_vec[r] = w_scales[(tile_m * Repeat + r) * k_tiles + kt];
+                        }
+                    }
+
+                    simd<int8_t, BN> b_vec0 =
+                        dpas_block_load<int8_t, BN, DpasMemoryPattern::DIRECT_GLOBAL>(b_ptr0, false);
+                    simd<int, Repeat * ExecN> part0 = 0;
+                    part0 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(part0, b_vec0, a_vec);
+
+                    simd<float, ExecN> y_scale_vec0;
+                    if constexpr (PackedScales) {
+                        y_scale_vec0 = block_load<float, ExecN>(y_scales + ((tile_n_base + 0) * k_tiles + kt) * ExecN);
+                    } else {
+#    pragma unroll
+                        for (int col = 0; col < ExecN; ++col) {
+                            y_scale_vec0[col] = y_scales[((tile_n_base + 0) * ExecN + col) * k_tiles + kt];
+                        }
+                    }
+#    pragma unroll
+                    for (int r = 0; r < Repeat; ++r) {
+                        const float        w_scale                = w_scale_vec[r];
+                        simd<int, ExecN>   row_i                  = part0.template select<ExecN, 1>(r * ExecN);
+                        simd<float, ExecN> row                    = convert<float>(row_i) * (y_scale_vec0 * w_scale);
+                        acc0.template select<ExecN, 1>(r * ExecN) = acc0.template select<ExecN, 1>(r * ExecN) + row;
+                    }
+
+                    if constexpr (NTileRepeats >= 2) {
+                        simd<int8_t, BN> b_vec1 =
+                            dpas_block_load<int8_t, BN, DpasMemoryPattern::DIRECT_GLOBAL>(b_ptr1, false);
+                        simd<int, Repeat * ExecN> part1 = 0;
+                        part1 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(part1, b_vec1, a_vec);
+
+                        simd<float, ExecN> y_scale_vec1;
+                        if constexpr (PackedScales) {
+                            y_scale_vec1 =
+                                block_load<float, ExecN>(y_scales + ((tile_n_base + 1) * k_tiles + kt) * ExecN);
+                        } else {
+#    pragma unroll
+                            for (int col = 0; col < ExecN; ++col) {
+                                y_scale_vec1[col] = y_scales[((tile_n_base + 1) * ExecN + col) * k_tiles + kt];
+                            }
+                        }
+#    pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            const float        w_scale = w_scale_vec[r];
+                            simd<int, ExecN>   row_i   = part1.template select<ExecN, 1>(r * ExecN);
+                            simd<float, ExecN> row     = convert<float>(row_i) * (y_scale_vec1 * w_scale);
+                            acc1.template select<ExecN, 1>(r * ExecN) = acc1.template select<ExecN, 1>(r * ExecN) + row;
+                        }
+                    }
+
+                    if constexpr (NTileRepeats >= 4) {
+                        simd<int8_t, BN> b_vec2 =
+                            dpas_block_load<int8_t, BN, DpasMemoryPattern::DIRECT_GLOBAL>(b_ptr2, false);
+                        simd<int8_t, BN> b_vec3 =
+                            dpas_block_load<int8_t, BN, DpasMemoryPattern::DIRECT_GLOBAL>(b_ptr3, false);
+                        simd<int, Repeat * ExecN> part2 = 0;
+                        simd<int, Repeat * ExecN> part3 = 0;
+                        part2 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(part2, b_vec2, a_vec);
+                        part3 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(part3, b_vec3, a_vec);
+
+                        simd<float, ExecN> y_scale_vec2;
+                        simd<float, ExecN> y_scale_vec3;
+                        if constexpr (PackedScales) {
+                            y_scale_vec2 =
+                                block_load<float, ExecN>(y_scales + ((tile_n_base + 2) * k_tiles + kt) * ExecN);
+                            y_scale_vec3 =
+                                block_load<float, ExecN>(y_scales + ((tile_n_base + 3) * k_tiles + kt) * ExecN);
+                        } else {
+#    pragma unroll
+                            for (int col = 0; col < ExecN; ++col) {
+                                y_scale_vec2[col] = y_scales[((tile_n_base + 2) * ExecN + col) * k_tiles + kt];
+                                y_scale_vec3[col] = y_scales[((tile_n_base + 3) * ExecN + col) * k_tiles + kt];
+                            }
+                        }
+#    pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            const float        w_scale = w_scale_vec[r];
+                            simd<int, ExecN>   row_i2  = part2.template select<ExecN, 1>(r * ExecN);
+                            simd<int, ExecN>   row_i3  = part3.template select<ExecN, 1>(r * ExecN);
+                            simd<float, ExecN> row2    = convert<float>(row_i2) * (y_scale_vec2 * w_scale);
+                            simd<float, ExecN> row3    = convert<float>(row_i3) * (y_scale_vec3 * w_scale);
+                            acc2.template select<ExecN, 1>(r * ExecN) =
+                                acc2.template select<ExecN, 1>(r * ExecN) + row2;
+                            acc3.template select<ExecN, 1>(r * ExecN) =
+                                acc3.template select<ExecN, 1>(r * ExecN) + row3;
+                        }
+                    }
+
+                    a_ptr += CompactABytes;
+                    b_ptr0 += BN;
+                    b_ptr1 += BN;
+                    b_ptr2 += BN;
+                    b_ptr3 += BN;
+                }
+
+#    pragma unroll
+                for (int r = 0; r < Repeat; ++r) {
+                    float * out_ptr0 = c_base + (tile_m * Repeat + r) * n + (tile_n_base + 0) * ExecN;
+                    block_store(out_ptr0, acc0.template select<ExecN, 1>(r * ExecN));
+                    if constexpr (NTileRepeats >= 2) {
+                        float * out_ptr1 = c_base + (tile_m * Repeat + r) * n + (tile_n_base + 1) * ExecN;
+                        block_store(out_ptr1, acc1.template select<ExecN, 1>(r * ExecN));
+                    }
+                    if constexpr (NTileRepeats >= 4) {
+                        float * out_ptr2 = c_base + (tile_m * Repeat + r) * n + (tile_n_base + 2) * ExecN;
+                        float * out_ptr3 = c_base + (tile_m * Repeat + r) * n + (tile_n_base + 3) * ExecN;
+                        block_store(out_ptr2, acc2.template select<ExecN, 1>(r * ExecN));
+                        block_store(out_ptr3, acc3.template select<ExecN, 1>(r * ExecN));
+                    }
+                }
+            });
+    });
+    ev.wait_and_throw();
+    return true;
+}
+#else
+template <int Repeat, int NTileRepeats, bool PackedScales>
+static bool launch_mxfp4_dpas_compact_scaled_kernel(const uint8_t *,
+                                                    const int8_t *,
+                                                    const float *,
+                                                    const float *,
+                                                    float *,
+                                                    int64_t,
+                                                    int64_t,
+                                                    int64_t,
+                                                    sycl::queue &,
+                                                    std::string & error) {
+    (void) Repeat;
+    (void) NTileRepeats;
+    (void) PackedScales;
+    error = "SYCL ESIMD unavailable; mxfp4_dpas_compact_scaled disabled.";
     return false;
 }
 #endif
@@ -2640,6 +3119,644 @@ bool run_mxfp4_dpas_grouped_compact_raw(const GeneratedWeights &     weights,
     return true;
 }
 
+bool run_mxfp4_dpas_grouped_compact_scaled(const GeneratedWeights &     weights,
+                                           const GeneratedActivations & activations,
+                                           int64_t                      m,
+                                           int64_t                      n,
+                                           int64_t                      k,
+                                           int                          n_tile_repeats,
+                                           bool                         packed_scales,
+                                           bool                         validate,
+                                           int                          warmup,
+                                           int                          iterations,
+                                           sycl::queue &                queue,
+                                           ReferenceMetrics &           out,
+                                           std::string &                error) {
+    constexpr int repeat = 8;
+    constexpr int exec_n = 16;
+    constexpr int k_per  = 32;
+
+    if (m <= 0 || n <= 0 || k <= 0 || (m % repeat) != 0 || (n % exec_n) != 0 || (k % k_per) != 0) {
+        error = "mxfp4_dpas_compact_scaled requires M multiple of 8, N multiple of 16, and K multiple of 32.";
+        return false;
+    }
+    if (n_tile_repeats != 1 && n_tile_repeats != 2 && n_tile_repeats != 4) {
+        error = "mxfp4_dpas_compact_scaled n-tile repeats must be 1, 2, or 4.";
+        return false;
+    }
+    if (weights.layout_mode != GGML_LAYOUT_SOA || weights.layout.empty()) {
+        error = "mxfp4_dpas_compact_scaled requires SOA MXFP4 weights as the source layout.";
+        return false;
+    }
+    if (activations.q8_1.empty()) {
+        error = "mxfp4_dpas_compact_scaled requires SOA Q8_1 activations.";
+        return false;
+    }
+
+    const int64_t blocks_per_row = k / QK_MXFP4;
+    const int64_t m_tiles        = m / repeat;
+    const int64_t n_tiles        = n / exec_n;
+    const int64_t k_tiles        = k / k_per;
+    if ((n_tiles % n_tile_repeats) != 0) {
+        error = "mxfp4_dpas_compact_scaled dim_n/16 must be divisible by n-tile repeats.";
+        return false;
+    }
+
+    const size_t nblocks       = static_cast<size_t>(m) * static_cast<size_t>(blocks_per_row);
+    const size_t qs_bytes      = nblocks * (QK_MXFP4 / 2);
+    const size_t scale_bytes   = nblocks;
+    const size_t q8_row_bytes  = static_cast<size_t>(k / QK8_1) * sizeof(block_q8_1);
+    const size_t a_tile_bytes  = static_cast<size_t>(repeat) * static_cast<size_t>(k_per / 2);
+    const size_t b_tile_elems  = static_cast<size_t>(k_per) * static_cast<size_t>(exec_n);
+    const size_t a_bytes       = static_cast<size_t>(m_tiles) * static_cast<size_t>(k_tiles) * a_tile_bytes;
+    const size_t b_elems       = static_cast<size_t>(n_tiles) * static_cast<size_t>(k_tiles) * b_tile_elems;
+    const size_t c_elems       = static_cast<size_t>(m) * static_cast<size_t>(n);
+    const size_t b_bytes       = b_elems * sizeof(int8_t);
+    const size_t c_bytes       = c_elems * sizeof(float);
+    const size_t w_scale_count = static_cast<size_t>(m) * static_cast<size_t>(k_tiles);
+    const size_t y_scale_count = static_cast<size_t>(n) * static_cast<size_t>(k_tiles);
+    const size_t w_scale_bytes = w_scale_count * sizeof(float);
+    const size_t y_scale_bytes = y_scale_count * sizeof(float);
+    if (weights.layout.size() < qs_bytes + scale_bytes) {
+        error = "mxfp4_dpas_compact_scaled source weight layout is too small.";
+        return false;
+    }
+    if (activations.q8_1.size() < static_cast<size_t>(n) * q8_row_bytes) {
+        error = "mxfp4_dpas_compact_scaled activation buffer is too small.";
+        return false;
+    }
+
+    std::vector<uint8_t> a_host(a_bytes, 0);
+    std::vector<int8_t>  b_host(b_elems, 0);
+    std::vector<float>   w_scale_host(w_scale_count, 0.0f);
+    std::vector<float>   y_scale_host(y_scale_count, 0.0f);
+    std::vector<int8_t>  weight_raw;
+    std::vector<int8_t>  act_raw;
+    if (validate) {
+        weight_raw.assign(static_cast<size_t>(m) * static_cast<size_t>(k), 0);
+        act_raw.assign(static_cast<size_t>(n) * static_cast<size_t>(k), 0);
+    }
+
+    auto w_scale_index = [&](int64_t row, int64_t kt) -> size_t {
+        if (packed_scales) {
+            return (static_cast<size_t>(row / repeat) * static_cast<size_t>(k_tiles) + static_cast<size_t>(kt)) *
+                       static_cast<size_t>(repeat) +
+                   static_cast<size_t>(row % repeat);
+        }
+        return static_cast<size_t>(row) * static_cast<size_t>(k_tiles) + static_cast<size_t>(kt);
+    };
+    auto y_scale_index = [&](int64_t row, int64_t kt) -> size_t {
+        if (packed_scales) {
+            return (static_cast<size_t>(row / exec_n) * static_cast<size_t>(k_tiles) + static_cast<size_t>(kt)) *
+                       static_cast<size_t>(exec_n) +
+                   static_cast<size_t>(row % exec_n);
+        }
+        return static_cast<size_t>(row) * static_cast<size_t>(k_tiles) + static_cast<size_t>(kt);
+    };
+
+    const uint8_t * qs_base    = weights.layout.data();
+    const uint8_t * scale_base = weights.layout.data() + qs_bytes;
+    for (int64_t row = 0; row < m; ++row) {
+        for (int64_t kt = 0; kt < k_tiles; ++kt) {
+            const size_t block_idx =
+                static_cast<size_t>(row) * static_cast<size_t>(blocks_per_row) + static_cast<size_t>(kt);
+            w_scale_host[w_scale_index(row, kt)] = mxfp4_e8m0_to_fp32_device(scale_base[block_idx]) * 0.5f;
+        }
+    }
+
+    for (int64_t tile_m = 0; tile_m < m_tiles; ++tile_m) {
+        for (int64_t kt = 0; kt < k_tiles; ++kt) {
+            const size_t tile_off =
+                (static_cast<size_t>(tile_m) * static_cast<size_t>(k_tiles) + static_cast<size_t>(kt)) * a_tile_bytes;
+            for (int r = 0; r < repeat; ++r) {
+                const int64_t row = tile_m * repeat + r;
+                const size_t  block_idx =
+                    static_cast<size_t>(row) * static_cast<size_t>(blocks_per_row) + static_cast<size_t>(kt);
+                const uint8_t * block_qs = qs_base + block_idx * (QK_MXFP4 / 2);
+                std::copy(block_qs, block_qs + (QK_MXFP4 / 2),
+                          a_host.data() + tile_off + static_cast<size_t>(r) * (QK_MXFP4 / 2));
+                if (validate) {
+                    for (int i = 0; i < QK_MXFP4 / 2; ++i) {
+                        const uint8_t packed = block_qs[i];
+                        const int64_t k0     = kt * k_per + i;
+                        const int64_t k1     = kt * k_per + (QK_MXFP4 / 2) + i;
+                        weight_raw[static_cast<size_t>(row) * static_cast<size_t>(k) + static_cast<size_t>(k0)] =
+                            mxfp4_code_value(static_cast<uint8_t>(packed & 0x0f));
+                        weight_raw[static_cast<size_t>(row) * static_cast<size_t>(k) + static_cast<size_t>(k1)] =
+                            mxfp4_code_value(static_cast<uint8_t>(packed >> 4));
+                    }
+                }
+            }
+        }
+    }
+
+    auto pack_vnni_tile = [&](int8_t * dst, const int8_t * src) {
+        size_t idx = 0;
+        for (int k0 = 0; k0 < k_per; k0 += 4) {
+            for (int col = 0; col < exec_n; ++col) {
+                for (int p = 0; p < 4; ++p) {
+                    dst[idx++] = src[(k0 + p) * exec_n + col];
+                }
+            }
+        }
+    };
+
+    std::vector<int8_t> b_tile(b_tile_elems, 0);
+    for (int64_t row = 0; row < n; ++row) {
+        const uint8_t * q8_row  = activations.q8_1.data() + static_cast<size_t>(row) * q8_row_bytes;
+        const uint8_t * ds_base = q8_row + static_cast<size_t>(k);
+        for (int64_t kt = 0; kt < k_tiles; ++kt) {
+            sycl::half d{};
+            std::memcpy(&d, ds_base + static_cast<size_t>(kt) * sizeof(sycl::half2), sizeof(sycl::half));
+            y_scale_host[y_scale_index(row, kt)] = static_cast<float>(d);
+        }
+    }
+
+    for (int64_t tile_n = 0; tile_n < n_tiles; ++tile_n) {
+        for (int64_t kt = 0; kt < k_tiles; ++kt) {
+            std::fill(b_tile.begin(), b_tile.end(), 0);
+            for (int kk = 0; kk < k_per; ++kk) {
+                const int64_t k_elem = kt * k_per + kk;
+                for (int col = 0; col < exec_n; ++col) {
+                    const int64_t   row    = tile_n * exec_n + col;
+                    const uint8_t * q8_row = activations.q8_1.data() + static_cast<size_t>(row) * q8_row_bytes;
+                    const int8_t    value  = reinterpret_cast<const int8_t *>(q8_row)[k_elem];
+                    b_tile[static_cast<size_t>(kk) * exec_n + static_cast<size_t>(col)] = value;
+                    if (validate) {
+                        act_raw[static_cast<size_t>(row) * static_cast<size_t>(k) + static_cast<size_t>(k_elem)] =
+                            value;
+                    }
+                }
+            }
+            const size_t tile_off =
+                (static_cast<size_t>(tile_n) * static_cast<size_t>(k_tiles) + static_cast<size_t>(kt)) * b_tile_elems;
+            pack_vnni_tile(b_host.data() + tile_off, b_tile.data());
+        }
+    }
+
+    uint8_t * d_a       = sycl::malloc_device<uint8_t>(a_bytes, queue);
+    int8_t *  d_b       = sycl::malloc_device<int8_t>(b_elems, queue);
+    float *   d_w_scale = sycl::malloc_device<float>(w_scale_count, queue);
+    float *   d_y_scale = sycl::malloc_device<float>(y_scale_count, queue);
+    float *   d_c       = sycl::malloc_device<float>(c_elems, queue);
+    auto      cleanup   = [&]() {
+        if (d_a) {
+            sycl::free(d_a, queue);
+        }
+        if (d_b) {
+            sycl::free(d_b, queue);
+        }
+        if (d_w_scale) {
+            sycl::free(d_w_scale, queue);
+        }
+        if (d_y_scale) {
+            sycl::free(d_y_scale, queue);
+        }
+        if (d_c) {
+            sycl::free(d_c, queue);
+        }
+    };
+    if (!d_a || !d_b || !d_w_scale || !d_y_scale || !d_c) {
+        cleanup();
+        error = "device allocation failed for mxfp4_dpas_compact_scaled.";
+        return false;
+    }
+
+    queue.memcpy(d_a, a_host.data(), a_bytes);
+    queue.memcpy(d_b, b_host.data(), b_bytes);
+    queue.memcpy(d_w_scale, w_scale_host.data(), w_scale_bytes);
+    queue.memcpy(d_y_scale, y_scale_host.data(), y_scale_bytes);
+    queue.memset(d_c, 0, c_bytes);
+    queue.wait_and_throw();
+
+    auto launch = [&]() {
+        switch (n_tile_repeats) {
+            case 1:
+                if (packed_scales) {
+                    return launch_mxfp4_dpas_compact_scaled_kernel<repeat, 1, true>(d_a, d_b, d_w_scale, d_y_scale, d_c,
+                                                                                    m, n, k, queue, error);
+                }
+                return launch_mxfp4_dpas_compact_scaled_kernel<repeat, 1, false>(d_a, d_b, d_w_scale, d_y_scale, d_c, m,
+                                                                                 n, k, queue, error);
+            case 2:
+                if (packed_scales) {
+                    return launch_mxfp4_dpas_compact_scaled_kernel<repeat, 2, true>(d_a, d_b, d_w_scale, d_y_scale, d_c,
+                                                                                    m, n, k, queue, error);
+                }
+                return launch_mxfp4_dpas_compact_scaled_kernel<repeat, 2, false>(d_a, d_b, d_w_scale, d_y_scale, d_c, m,
+                                                                                 n, k, queue, error);
+            case 4:
+                if (packed_scales) {
+                    return launch_mxfp4_dpas_compact_scaled_kernel<repeat, 4, true>(d_a, d_b, d_w_scale, d_y_scale, d_c,
+                                                                                    m, n, k, queue, error);
+                }
+                return launch_mxfp4_dpas_compact_scaled_kernel<repeat, 4, false>(d_a, d_b, d_w_scale, d_y_scale, d_c, m,
+                                                                                 n, k, queue, error);
+            default:
+                error = "mxfp4_dpas_compact_scaled unsupported n-tile repeats.";
+                return false;
+        }
+    };
+
+    for (int i = 0; i < warmup; ++i) {
+        if (!launch()) {
+            cleanup();
+            return false;
+        }
+    }
+    queue.wait_and_throw();
+
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iterations; ++i) {
+        if (!launch()) {
+            cleanup();
+            return false;
+        }
+    }
+    queue.wait_and_throw();
+    const auto t1 = std::chrono::high_resolution_clock::now();
+
+    const double total_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+    const double mean_us  = iterations > 0 ? total_us / static_cast<double>(iterations) : 0.0;
+    const double mean_s   = mean_us * 1e-6;
+    const double ops      = 2.0 * static_cast<double>(m) * static_cast<double>(n) * static_cast<double>(k);
+    const double bytes    = static_cast<double>(a_bytes + b_bytes + w_scale_bytes + y_scale_bytes + c_bytes);
+    out.total_us          = mean_us;
+    out.gemm_us           = mean_us;
+    out.tops              = mean_s > 0.0 ? (ops / mean_s) / 1.0e12 : 0.0;
+    out.tflops            = out.tops;
+    out.bandwidth_gbps    = mean_s > 0.0 ? (bytes / mean_s) / 1.0e9 : 0.0;
+
+    if (validate) {
+        std::vector<float> actual(c_elems);
+        queue.memcpy(actual.data(), d_c, c_bytes).wait();
+        for (int64_t row = 0; row < m; ++row) {
+            for (int64_t col = 0; col < n; ++col) {
+                float ref = 0.0f;
+                for (int64_t kt = 0; kt < k_tiles; ++kt) {
+                    int32_t dot = 0;
+                    for (int kk = 0; kk < k_per; ++kk) {
+                        const int64_t k_elem = kt * k_per + kk;
+                        const int32_t w =
+                            weight_raw[static_cast<size_t>(row) * static_cast<size_t>(k) + static_cast<size_t>(k_elem)];
+                        const int32_t a =
+                            act_raw[static_cast<size_t>(col) * static_cast<size_t>(k) + static_cast<size_t>(k_elem)];
+                        dot += w * a;
+                    }
+                    const float ws = w_scale_host[w_scale_index(row, kt)];
+                    const float ys = y_scale_host[y_scale_index(col, kt)];
+                    ref += static_cast<float>(dot) * ws * ys;
+                }
+                const size_t idx  = static_cast<size_t>(row) * static_cast<size_t>(n) + static_cast<size_t>(col);
+                const float  diff = std::fabs(actual[idx] - ref);
+                const float  tol  = std::max(0.05f, std::fabs(ref) * 1.0e-3f);
+                if (!std::isfinite(actual[idx]) || diff > tol) {
+                    std::ostringstream oss;
+                    oss << "mxfp4_dpas_compact_scaled validation failed at row=" << row << " col=" << col
+                        << " actual=" << actual[idx] << " expected=" << ref << " diff=" << diff << " tol=" << tol;
+                    error = oss.str();
+                    cleanup();
+                    return false;
+                }
+            }
+        }
+    }
+
+    cleanup();
+    return true;
+}
+
+bool run_mxfp4_dpas_grouped_compact_bytescale(const GeneratedWeights &     weights,
+                                              const GeneratedActivations & activations,
+                                              int64_t                      m,
+                                              int64_t                      n,
+                                              int64_t                      k,
+                                              int                          n_tile_repeats,
+                                              bool                         xmx_layout,
+                                              bool                         validate,
+                                              int                          warmup,
+                                              int                          iterations,
+                                              sycl::queue &                queue,
+                                              ReferenceMetrics &           out,
+                                              std::string &                error) {
+    constexpr int repeat = 8;
+    constexpr int exec_n = 16;
+    constexpr int k_per  = 32;
+
+    if (m <= 0 || n <= 0 || k <= 0 || (m % repeat) != 0 || (n % exec_n) != 0 || (k % k_per) != 0) {
+        error = "mxfp4_dpas_compact_bytescale requires M multiple of 8, N multiple of 16, and K multiple of 32.";
+        return false;
+    }
+    if (n_tile_repeats != 1 && n_tile_repeats != 2 && n_tile_repeats != 4) {
+        error = "mxfp4_dpas_compact_bytescale n-tile repeats must be 1, 2, or 4.";
+        return false;
+    }
+    if (weights.layout_mode != GGML_LAYOUT_SOA || weights.layout.empty()) {
+        error = "mxfp4_dpas_compact_bytescale requires SOA MXFP4 weights as the source layout.";
+        return false;
+    }
+    if (activations.q8_1.empty()) {
+        error = "mxfp4_dpas_compact_bytescale requires SOA Q8_1 activations.";
+        return false;
+    }
+
+    const int64_t blocks_per_row = k / QK_MXFP4;
+    const int64_t m_tiles        = m / repeat;
+    const int64_t n_tiles        = n / exec_n;
+    const int64_t k_tiles        = k / k_per;
+    if ((n_tiles % n_tile_repeats) != 0) {
+        error = "mxfp4_dpas_compact_bytescale dim_n/16 must be divisible by n-tile repeats.";
+        return false;
+    }
+
+    const size_t nblocks      = static_cast<size_t>(m) * static_cast<size_t>(blocks_per_row);
+    const size_t qs_bytes     = nblocks * (QK_MXFP4 / 2);
+    const size_t scale_bytes  = nblocks;
+    const size_t q8_row_bytes = static_cast<size_t>(k / QK8_1) * sizeof(block_q8_1);
+    if (weights.layout.size() < qs_bytes + scale_bytes) {
+        error = "mxfp4_dpas_compact_bytescale source weight layout is too small.";
+        return false;
+    }
+    if (activations.q8_1.size() < static_cast<size_t>(n) * q8_row_bytes) {
+        error = "mxfp4_dpas_compact_bytescale activation buffer is too small.";
+        return false;
+    }
+
+    int64_t tile_n_total = repeat;
+    if (xmx_layout) {
+        const int device_id = ggml_sycl_get_device_id_from_queue(queue);
+        if (device_id >= 0 && device_id < ggml_sycl_info().device_count) {
+            const auto & caps = ggml_sycl_info().devices[device_id].xmx_caps;
+            if (caps.N > 0 && caps.optimal_tiles_n > 0) {
+                tile_n_total = static_cast<int64_t>(caps.N) * static_cast<int64_t>(caps.optimal_tiles_n);
+            }
+        }
+        if (tile_n_total < repeat || (tile_n_total % repeat) != 0) {
+            error = "mxfp4_dpas_compact_bytescale invalid queried XMX tile width.";
+            return false;
+        }
+    }
+    const int64_t n_tile_groups_n = xmx_layout ? (m + tile_n_total - 1) / tile_n_total : m_tiles;
+    const size_t  a_tile_bytes    = xmx_layout ? static_cast<size_t>(tile_n_total) * (1 + QK_MXFP4 / 2) :
+                                                 static_cast<size_t>(repeat) + static_cast<size_t>(repeat) * (QK_MXFP4 / 2);
+    const size_t  b_tile_elems    = static_cast<size_t>(k_per) * static_cast<size_t>(exec_n);
+    const size_t  a_bytes         = static_cast<size_t>(n_tile_groups_n) * static_cast<size_t>(k_tiles) * a_tile_bytes;
+    const size_t  b_elems         = static_cast<size_t>(n_tiles) * static_cast<size_t>(k_tiles) * b_tile_elems;
+    const size_t  c_elems         = static_cast<size_t>(m) * static_cast<size_t>(n);
+    const size_t  b_bytes         = b_elems * sizeof(int8_t);
+    const size_t  c_bytes         = c_elems * sizeof(float);
+    const size_t  y_scale_count =
+        static_cast<size_t>(n_tiles) * static_cast<size_t>(k_tiles) * static_cast<size_t>(exec_n);
+    const size_t y_scale_bytes = y_scale_count * sizeof(float);
+
+    std::vector<uint8_t> a_host(a_bytes, 0);
+    std::vector<int8_t>  b_host(b_elems, 0);
+    std::vector<float>   y_scale_host(y_scale_count, 0.0f);
+    std::vector<int8_t>  weight_raw;
+    std::vector<int8_t>  act_raw;
+    if (validate) {
+        weight_raw.assign(static_cast<size_t>(m) * static_cast<size_t>(k), 0);
+        act_raw.assign(static_cast<size_t>(n) * static_cast<size_t>(k), 0);
+    }
+
+    const uint8_t * qs_base           = weights.layout.data();
+    const uint8_t * scale_base        = weights.layout.data() + qs_bytes;
+    auto            record_weight_raw = [&](int64_t row, int64_t kt, const uint8_t * block_qs) {
+        if (!validate) {
+            return;
+        }
+        for (int i = 0; i < QK_MXFP4 / 2; ++i) {
+            const uint8_t packed = block_qs[i];
+            const int64_t k0     = kt * k_per + i;
+            const int64_t k1     = kt * k_per + (QK_MXFP4 / 2) + i;
+            weight_raw[static_cast<size_t>(row) * static_cast<size_t>(k) + static_cast<size_t>(k0)] =
+                mxfp4_code_value(static_cast<uint8_t>(packed & 0x0f));
+            weight_raw[static_cast<size_t>(row) * static_cast<size_t>(k) + static_cast<size_t>(k1)] =
+                mxfp4_code_value(static_cast<uint8_t>(packed >> 4));
+        }
+    };
+
+    if (xmx_layout) {
+        for (int64_t kt = 0; kt < k_tiles; ++kt) {
+            for (int64_t tg_n = 0; tg_n < n_tile_groups_n; ++tg_n) {
+                uint8_t * group = a_host.data() + (static_cast<size_t>(kt) * static_cast<size_t>(n_tile_groups_n) +
+                                                   static_cast<size_t>(tg_n)) *
+                                                      a_tile_bytes;
+                uint8_t * scales = group;
+                uint8_t * qs     = group + static_cast<size_t>(tile_n_total);
+                for (int64_t tn = 0; tn < tile_n_total; ++tn) {
+                    const int64_t row = tg_n * tile_n_total + tn;
+                    if (row >= m) {
+                        continue;
+                    }
+                    const size_t block_idx =
+                        static_cast<size_t>(row) * static_cast<size_t>(blocks_per_row) + static_cast<size_t>(kt);
+                    const uint8_t * block_qs = qs_base + block_idx * (QK_MXFP4 / 2);
+                    scales[tn]               = scale_base[block_idx];
+                    std::copy(block_qs, block_qs + (QK_MXFP4 / 2), qs + static_cast<size_t>(tn) * (QK_MXFP4 / 2));
+                    record_weight_raw(row, kt, block_qs);
+                }
+            }
+        }
+    } else {
+        for (int64_t tile_m = 0; tile_m < m_tiles; ++tile_m) {
+            for (int64_t kt = 0; kt < k_tiles; ++kt) {
+                uint8_t * tile = a_host.data() + (static_cast<size_t>(tile_m) * static_cast<size_t>(k_tiles) +
+                                                  static_cast<size_t>(kt)) *
+                                                     a_tile_bytes;
+                uint8_t * scales = tile;
+                uint8_t * qs     = tile + static_cast<size_t>(repeat);
+                for (int r = 0; r < repeat; ++r) {
+                    const int64_t row = tile_m * repeat + r;
+                    const size_t  block_idx =
+                        static_cast<size_t>(row) * static_cast<size_t>(blocks_per_row) + static_cast<size_t>(kt);
+                    const uint8_t * block_qs = qs_base + block_idx * (QK_MXFP4 / 2);
+                    scales[r]                = scale_base[block_idx];
+                    std::copy(block_qs, block_qs + (QK_MXFP4 / 2), qs + static_cast<size_t>(r) * (QK_MXFP4 / 2));
+                    record_weight_raw(row, kt, block_qs);
+                }
+            }
+        }
+    }
+
+    auto pack_vnni_tile = [&](int8_t * dst, const int8_t * src) {
+        size_t idx = 0;
+        for (int k0 = 0; k0 < k_per; k0 += 4) {
+            for (int col = 0; col < exec_n; ++col) {
+                for (int p = 0; p < 4; ++p) {
+                    dst[idx++] = src[(k0 + p) * exec_n + col];
+                }
+            }
+        }
+    };
+
+    std::vector<int8_t> b_tile(b_tile_elems, 0);
+    for (int64_t row = 0; row < n; ++row) {
+        const uint8_t * q8_row  = activations.q8_1.data() + static_cast<size_t>(row) * q8_row_bytes;
+        const uint8_t * ds_base = q8_row + static_cast<size_t>(k);
+        for (int64_t kt = 0; kt < k_tiles; ++kt) {
+            sycl::half d{};
+            std::memcpy(&d, ds_base + static_cast<size_t>(kt) * sizeof(sycl::half2), sizeof(sycl::half));
+            y_scale_host[(static_cast<size_t>(row / exec_n) * static_cast<size_t>(k_tiles) + static_cast<size_t>(kt)) *
+                             static_cast<size_t>(exec_n) +
+                         static_cast<size_t>(row % exec_n)] = static_cast<float>(d);
+        }
+    }
+
+    for (int64_t tile_n = 0; tile_n < n_tiles; ++tile_n) {
+        for (int64_t kt = 0; kt < k_tiles; ++kt) {
+            std::fill(b_tile.begin(), b_tile.end(), 0);
+            for (int kk = 0; kk < k_per; ++kk) {
+                const int64_t k_elem = kt * k_per + kk;
+                for (int col = 0; col < exec_n; ++col) {
+                    const int64_t   row    = tile_n * exec_n + col;
+                    const uint8_t * q8_row = activations.q8_1.data() + static_cast<size_t>(row) * q8_row_bytes;
+                    const int8_t    value  = reinterpret_cast<const int8_t *>(q8_row)[k_elem];
+                    b_tile[static_cast<size_t>(kk) * exec_n + static_cast<size_t>(col)] = value;
+                    if (validate) {
+                        act_raw[static_cast<size_t>(row) * static_cast<size_t>(k) + static_cast<size_t>(k_elem)] =
+                            value;
+                    }
+                }
+            }
+            const size_t tile_off =
+                (static_cast<size_t>(tile_n) * static_cast<size_t>(k_tiles) + static_cast<size_t>(kt)) * b_tile_elems;
+            pack_vnni_tile(b_host.data() + tile_off, b_tile.data());
+        }
+    }
+
+    uint8_t * d_a       = sycl::malloc_device<uint8_t>(a_bytes, queue);
+    int8_t *  d_b       = sycl::malloc_device<int8_t>(b_elems, queue);
+    float *   d_y_scale = sycl::malloc_device<float>(y_scale_count, queue);
+    float *   d_c       = sycl::malloc_device<float>(c_elems, queue);
+    auto      cleanup   = [&]() {
+        if (d_a) {
+            sycl::free(d_a, queue);
+        }
+        if (d_b) {
+            sycl::free(d_b, queue);
+        }
+        if (d_y_scale) {
+            sycl::free(d_y_scale, queue);
+        }
+        if (d_c) {
+            sycl::free(d_c, queue);
+        }
+    };
+    if (!d_a || !d_b || !d_y_scale || !d_c) {
+        cleanup();
+        error = "device allocation failed for mxfp4_dpas_compact_bytescale.";
+        return false;
+    }
+
+    queue.memcpy(d_a, a_host.data(), a_bytes);
+    queue.memcpy(d_b, b_host.data(), b_bytes);
+    queue.memcpy(d_y_scale, y_scale_host.data(), y_scale_bytes);
+    queue.memset(d_c, 0, c_bytes);
+    queue.wait_and_throw();
+
+    auto launch = [&]() {
+        switch (n_tile_repeats) {
+            case 1:
+                if (xmx_layout) {
+                    return launch_mxfp4_dpas_compact_bytescale_kernel<repeat, 1, true>(
+                        d_a, d_b, d_y_scale, d_c, m, n, k, tile_n_total, n_tile_groups_n, queue, error);
+                }
+                return launch_mxfp4_dpas_compact_bytescale_kernel<repeat, 1, false>(d_a, d_b, d_y_scale, d_c, m, n, k,
+                                                                                    0, 0, queue, error);
+            case 2:
+                if (xmx_layout) {
+                    return launch_mxfp4_dpas_compact_bytescale_kernel<repeat, 2, true>(
+                        d_a, d_b, d_y_scale, d_c, m, n, k, tile_n_total, n_tile_groups_n, queue, error);
+                }
+                return launch_mxfp4_dpas_compact_bytescale_kernel<repeat, 2, false>(d_a, d_b, d_y_scale, d_c, m, n, k,
+                                                                                    0, 0, queue, error);
+            case 4:
+                if (xmx_layout) {
+                    return launch_mxfp4_dpas_compact_bytescale_kernel<repeat, 4, true>(
+                        d_a, d_b, d_y_scale, d_c, m, n, k, tile_n_total, n_tile_groups_n, queue, error);
+                }
+                return launch_mxfp4_dpas_compact_bytescale_kernel<repeat, 4, false>(d_a, d_b, d_y_scale, d_c, m, n, k,
+                                                                                    0, 0, queue, error);
+            default:
+                error = "mxfp4_dpas_compact_bytescale unsupported n-tile repeats.";
+                return false;
+        }
+    };
+
+    for (int i = 0; i < warmup; ++i) {
+        if (!launch()) {
+            cleanup();
+            return false;
+        }
+    }
+    queue.wait_and_throw();
+
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iterations; ++i) {
+        if (!launch()) {
+            cleanup();
+            return false;
+        }
+    }
+    queue.wait_and_throw();
+    const auto t1 = std::chrono::high_resolution_clock::now();
+
+    const double total_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+    const double mean_us  = iterations > 0 ? total_us / static_cast<double>(iterations) : 0.0;
+    const double mean_s   = mean_us * 1e-6;
+    const double ops      = 2.0 * static_cast<double>(m) * static_cast<double>(n) * static_cast<double>(k);
+    const double bytes    = static_cast<double>(a_bytes + b_bytes + y_scale_bytes + c_bytes);
+    out.total_us          = mean_us;
+    out.gemm_us           = mean_us;
+    out.tops              = mean_s > 0.0 ? (ops / mean_s) / 1.0e12 : 0.0;
+    out.tflops            = out.tops;
+    out.bandwidth_gbps    = mean_s > 0.0 ? (bytes / mean_s) / 1.0e9 : 0.0;
+
+    if (validate) {
+        std::vector<float> actual(c_elems);
+        queue.memcpy(actual.data(), d_c, c_bytes).wait();
+        for (int64_t row = 0; row < m; ++row) {
+            for (int64_t col = 0; col < n; ++col) {
+                float ref = 0.0f;
+                for (int64_t kt = 0; kt < k_tiles; ++kt) {
+                    int32_t dot = 0;
+                    for (int kk = 0; kk < k_per; ++kk) {
+                        const int64_t k_elem = kt * k_per + kk;
+                        const int32_t w =
+                            weight_raw[static_cast<size_t>(row) * static_cast<size_t>(k) + static_cast<size_t>(k_elem)];
+                        const int32_t a =
+                            act_raw[static_cast<size_t>(col) * static_cast<size_t>(k) + static_cast<size_t>(k_elem)];
+                        dot += w * a;
+                    }
+                    const size_t block_idx =
+                        static_cast<size_t>(row) * static_cast<size_t>(blocks_per_row) + static_cast<size_t>(kt);
+                    const float ws = mxfp4_e8m0_to_fp32_device(scale_base[block_idx]) * 0.5f;
+                    const float ys = y_scale_host[(static_cast<size_t>(col / exec_n) * static_cast<size_t>(k_tiles) +
+                                                   static_cast<size_t>(kt)) *
+                                                      static_cast<size_t>(exec_n) +
+                                                  static_cast<size_t>(col % exec_n)];
+                    ref += static_cast<float>(dot) * ws * ys;
+                }
+                const size_t idx  = static_cast<size_t>(row) * static_cast<size_t>(n) + static_cast<size_t>(col);
+                const float  diff = std::fabs(actual[idx] - ref);
+                const float  tol  = std::max(0.05f, std::fabs(ref) * 1.0e-3f);
+                if (!std::isfinite(actual[idx]) || diff > tol) {
+                    std::ostringstream oss;
+                    oss << "mxfp4_dpas_compact_bytescale validation failed at row=" << row << " col=" << col
+                        << " actual=" << actual[idx] << " expected=" << ref << " diff=" << diff << " tol=" << tol;
+                    error = oss.str();
+                    cleanup();
+                    return false;
+                }
+            }
+        }
+    }
+
+    cleanup();
+    return true;
+}
+
 bool run_mxfp4_mmv_id_xmx_tiled(const GeneratedWeights &     weights,
                                 const GeneratedActivations & activations,
                                 int64_t                      m,
@@ -2649,6 +3766,7 @@ bool run_mxfp4_mmv_id_xmx_tiled(const GeneratedWeights &     weights,
                                 int                          requested_tiles_n,
                                 bool                         sparse_expert_slots,
                                 bool                         raw_accum,
+                                bool                         i8_rowmajor,
                                 bool                         validate,
                                 int                          warmup,
                                 int                          iterations,
@@ -2669,40 +3787,60 @@ bool run_mxfp4_mmv_id_xmx_tiled(const GeneratedWeights &     weights,
     }
 
     int tiles_n = 0;
-    if (!select_mxfp4_xmx_tiles_n(queue, requested_tiles_n, tiles_n, error)) {
+    if (!i8_rowmajor && !select_mxfp4_xmx_tiles_n(queue, requested_tiles_n, tiles_n, error)) {
         return false;
     }
-    const int tile_n_total = tiles_n * static_cast<int>(GGML_SYCL_MXFP4_MOE_XMX_N);
+    const int tile_n_total = i8_rowmajor ? 0 : tiles_n * static_cast<int>(GGML_SYCL_MXFP4_MOE_XMX_N);
 
-    std::vector<uint8_t> tiled_layout;
-    if (!make_mxfp4_xmx_tiled_layout(weights.layout, m, k, tile_n_total, tiled_layout, error)) {
-        return false;
+    std::vector<uint8_t> launch_layout;
+    if (i8_rowmajor) {
+        if (!make_mxfp4_predecoded_i8_layout(weights.layout, m, k, static_cast<int>(k / QK_MXFP4), launch_layout,
+                                             error)) {
+            return false;
+        }
+    } else {
+        if (!make_mxfp4_xmx_tiled_layout(weights.layout, m, k, tile_n_total, launch_layout, error)) {
+            return false;
+        }
     }
 
     const size_t  selected_count       = static_cast<size_t>(n_selected);
     const size_t  token_count          = static_cast<size_t>(n_tokens);
     const size_t  ids_count            = selected_count * token_count;
-    const size_t  tiled_expert_bytes   = tiled_layout.size();
+    const size_t  launch_expert_bytes  = launch_layout.size();
     const size_t  logical_expert_bytes = weights.layout.size();
     const size_t  expert_slots         = sparse_expert_slots ? std::max<size_t>(32, selected_count) : selected_count;
-    const size_t  tiled_weight_bytes   = tiled_expert_bytes * expert_slots;
+    const size_t  launch_weight_bytes  = launch_expert_bytes * expert_slots;
     const size_t  act_bytes            = activations.q8_1.size();
     const size_t  out_count            = static_cast<size_t>(m) * selected_count * token_count;
     const size_t  out_bytes            = out_count * sizeof(float);
     const int64_t q8_row_bytes         = static_cast<int64_t>(k * sizeof(block_q8_1) / QK8_1);
     const bool    compare_to_soa       = validate && !raw_accum;
+    const int64_t k_tiles              = k / GGML_SYCL_MXFP4_MOE_XMX_K;
+    const size_t  dpas_b_bytes         = i8_rowmajor ?
+                                             ids_count * static_cast<size_t>(k_tiles) *
+                                        static_cast<size_t>(GGML_SYCL_MXFP4_MOE_XMX_K * GGML_SYCL_MXFP4_MOE_XMX_N) :
+                                             0;
+    const size_t  dpas_y_bytes         = i8_rowmajor ? ids_count * static_cast<size_t>(k_tiles) *
+                                                  static_cast<size_t>(GGML_SYCL_MXFP4_MOE_XMX_N) * sizeof(float) :
+                                                       0;
 
-    std::vector<uint8_t> tiled_slices(tiled_weight_bytes);
+    std::vector<uint8_t> launch_slices(launch_weight_bytes);
     for (size_t slot = 0; slot < expert_slots; ++slot) {
-        std::copy(tiled_layout.begin(), tiled_layout.end(), tiled_slices.begin() + slot * tiled_expert_bytes);
+        std::copy(launch_layout.begin(), launch_layout.end(), launch_slices.begin() + slot * launch_expert_bytes);
     }
 
-    uint8_t *        d_tiled = sycl::malloc_device<uint8_t>(tiled_weight_bytes, queue);
+    uint8_t *        d_tiled = sycl::malloc_device<uint8_t>(launch_weight_bytes, queue);
     const uint8_t ** d_ptrs  = sycl::malloc_device<const uint8_t *>(expert_slots, queue);
     uint8_t *        d_act   = sycl::malloc_device<uint8_t>(act_bytes, queue);
     int32_t *        d_ids   = sycl::malloc_device<int32_t>(ids_count, queue);
     float *          d_out   = sycl::malloc_device<float>(out_count, queue);
-    uint8_t *        d_ref_weights =
+    int8_t *         d_dpas_b =
+        i8_rowmajor ? sycl::malloc_device<int8_t>(dpas_b_bytes == 0 ? 1 : dpas_b_bytes, queue) : nullptr;
+    float *   d_dpas_y = i8_rowmajor ? sycl::malloc_device<float>(
+                                         (dpas_y_bytes == 0 ? sizeof(float) : dpas_y_bytes) / sizeof(float), queue) :
+                                       nullptr;
+    uint8_t * d_ref_weights =
         compare_to_soa ? sycl::malloc_device<uint8_t>(logical_expert_bytes * expert_slots, queue) : nullptr;
     const uint8_t ** d_ref_ptrs = compare_to_soa ? sycl::malloc_device<const uint8_t *>(expert_slots, queue) : nullptr;
     float *          d_ref_out  = compare_to_soa ? sycl::malloc_device<float>(out_count, queue) : nullptr;
@@ -2723,6 +3861,12 @@ bool run_mxfp4_mmv_id_xmx_tiled(const GeneratedWeights &     weights,
         if (d_out) {
             sycl::free(d_out, queue);
         }
+        if (d_dpas_b) {
+            sycl::free(d_dpas_b, queue);
+        }
+        if (d_dpas_y) {
+            sycl::free(d_dpas_y, queue);
+        }
         if (d_ref_weights) {
             sycl::free(d_ref_weights, queue);
         }
@@ -2734,7 +3878,7 @@ bool run_mxfp4_mmv_id_xmx_tiled(const GeneratedWeights &     weights,
         }
     };
 
-    if (!d_tiled || !d_ptrs || !d_act || !d_ids || !d_out ||
+    if (!d_tiled || !d_ptrs || !d_act || !d_ids || !d_out || (i8_rowmajor && (!d_dpas_b || !d_dpas_y)) ||
         (compare_to_soa && (!d_ref_weights || !d_ref_ptrs || !d_ref_out))) {
         cleanup();
         error = "device allocation failed for mxfp4_mmv_id_xmx_tiled.";
@@ -2745,7 +3889,7 @@ bool run_mxfp4_mmv_id_xmx_tiled(const GeneratedWeights &     weights,
     std::vector<const uint8_t *> host_ref_ptrs;
     std::vector<int32_t>         host_ids(ids_count);
     for (size_t slot = 0; slot < expert_slots; ++slot) {
-        host_ptrs[slot] = d_tiled + slot * tiled_expert_bytes;
+        host_ptrs[slot] = d_tiled + slot * launch_expert_bytes;
     }
     for (size_t token = 0; token < token_count; ++token) {
         for (size_t sel = 0; sel < selected_count; ++sel) {
@@ -2754,7 +3898,7 @@ bool run_mxfp4_mmv_id_xmx_tiled(const GeneratedWeights &     weights,
         }
     }
 
-    queue.memcpy(d_tiled, tiled_slices.data(), tiled_weight_bytes);
+    queue.memcpy(d_tiled, launch_slices.data(), launch_weight_bytes);
     queue.memcpy(d_ptrs, host_ptrs.data(), expert_slots * sizeof(const uint8_t *));
     queue.memcpy(d_act, activations.q8_1.data(), act_bytes);
     queue.memcpy(d_ids, host_ids.data(), ids_count * sizeof(int32_t));
@@ -2780,6 +3924,8 @@ bool run_mxfp4_mmv_id_xmx_tiled(const GeneratedWeights &     weights,
     args.activations_q8_soa = d_act;
     args.output             = d_out;
     args.ids                = d_ids;
+    args.dpas_b_packed      = d_dpas_b;
+    args.dpas_y_scales      = d_dpas_y;
     args.ncols              = static_cast<int>(k);
     args.ncols_y            = static_cast<int>(k);
     args.nrows_per_expert   = static_cast<int>(m);
@@ -2789,6 +3935,7 @@ bool run_mxfp4_mmv_id_xmx_tiled(const GeneratedWeights &     weights,
     args.ne11               = 1;
     args.xmx_tiles_n        = tiles_n;
     args.raw_accum          = raw_accum;
+    args.i8_rowmajor        = i8_rowmajor;
     args.ids_nb0            = sizeof(int32_t);
     args.ids_nb1            = static_cast<int64_t>(selected_count * sizeof(int32_t));
     args.nb11               = q8_row_bytes;

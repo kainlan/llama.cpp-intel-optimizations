@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <limits>
 #include <sycl/sycl.hpp>
+#include <utility>
 #include <vector>
 
 #if !defined(GGML_USE_SYCL)
@@ -190,6 +191,61 @@ static bool test_direct_stage_expert_basic(sycl::queue & q) {
     const auto * entry = cache.lookup_expert(key);
     if (!entry || !entry->ptr) {
         fprintf(stderr, "lookup_expert failed after staging\n");
+        return false;
+    }
+
+    return true;
+}
+
+static bool test_planned_materialization_guard(sycl::queue & q) {
+    printf("\n=== Test: planned materialization guard ===\n");
+
+    ggml_sycl::unified_cache cache(q, 4096);
+    ggml_sycl::placement_plan plan{};
+    plan.build_index();
+    cache.set_placement_plan(std::move(plan));
+
+    std::vector<uint8_t> data(128, 0xcd);
+    ggml_sycl_cache_id   key = ggml_sycl::test_make_cache_id(data.data());
+
+    auto rejected = cache.direct_stage_weight(key, data.data(), data.size(), data.size(),
+                                              GGML_LAYOUT_AOS, nullptr, nullptr, &q);
+    if (rejected.ok || rejected.ptr || cache.lookup_weight(key) != nullptr) {
+        fprintf(stderr, "direct_stage_weight mutated planned cache without materialization token\n");
+        return false;
+    }
+
+    if (cache.planned_materialization_active()) {
+        fprintf(stderr, "planned materialization unexpectedly active before scope\n");
+        return false;
+    }
+
+    std::vector<uint8_t> host_data(64, 0xef);
+    ggml_sycl_cache_id   host_key = ggml_sycl::test_make_cache_id(host_data.data());
+    host_key.aux_id = 7;
+
+    cache.register_host_expert(host_key, host_data.data(), host_data.size(), GGML_LAYOUT_AOS);
+    if (cache.lookup_expert(host_key) != nullptr) {
+        fprintf(stderr, "register_host_expert mutated planned cache without materialization token\n");
+        return false;
+    }
+
+    {
+        ggml_sycl::scoped_planned_materialization materialize(&cache, "unit-test-host");
+        if (!cache.planned_materialization_active()) {
+            fprintf(stderr, "planned materialization not active inside scope\n");
+            return false;
+        }
+        cache.register_host_expert(host_key, host_data.data(), host_data.size(), GGML_LAYOUT_AOS);
+    }
+
+    if (cache.planned_materialization_active()) {
+        fprintf(stderr, "planned materialization unexpectedly active after scope\n");
+        return false;
+    }
+
+    if (cache.lookup_expert(host_key) == nullptr) {
+        fprintf(stderr, "register_host_expert failed under materialization token\n");
         return false;
     }
 
@@ -756,6 +812,7 @@ int main() {
     ok &= test_realloc_eviction_failure_keeps_entry(q);
     ok &= test_direct_stage_weight_basic(q);
     ok &= test_direct_stage_expert_basic(q);
+    ok &= test_planned_materialization_guard(q);
     ok &= test_graph_pins_host_weights();
     ok &= test_stream_dma_mmap_fail(q);
     ok &= test_all_pinned_eviction_failure_new_entry(q);

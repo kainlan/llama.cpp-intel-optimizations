@@ -21,6 +21,11 @@
 
 #pragma once
 
+#include "expert-key.hpp"
+#include "ggml-sycl.h"
+#include "ggml.h"
+#include "unified-cache.hpp"
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -29,11 +34,6 @@
 #include <sycl/sycl.hpp>
 #include <unordered_map>
 #include <vector>
-
-#include "ggml.h"
-#include "ggml-sycl.h"
-#include "expert-key.hpp"
-#include "unified-cache.hpp"
 
 namespace ggml_sycl {
 
@@ -48,25 +48,24 @@ void * moe_expert_ensure_soa_cached(int layer_idx, int expert_idx, int device_id
 // Metadata needed to stage an expert's weights asynchronously.
 // Returned by moe_get_expert_stage_info() -- read-only accessor into g_moe_expert_meta.
 struct expert_stage_info {
-    ggml_sycl_cache_id cache_key  = {};       // Stable cache key (model_id + tensor hash)
-    const void *       src_ptr    = nullptr;  // Host-accessible AOS weight data
-    size_t             src_size   = 0;        // AOS byte count
-    size_t             dst_size   = 0;        // SOA byte count (may differ due to reorder padding)
-    ggml_layout_mode   layout     = GGML_LAYOUT_AOS;  // Optimal layout for this expert
-    ggml_type          type       = GGML_TYPE_F32;     // Weight quantization type
-    int64_t            ncols      = 0;        // Weight columns (K dimension)
-    int64_t            nrows      = 0;        // Weight rows (N dimension)
-    int                layer_id   = -1;       // Hash-based layer ID
-    int                expert_id  = -1;       // Expert index within layer
-    bool               valid      = false;    // True if metadata was found
+    ggml_sycl_cache_id cache_key = {};               // Stable cache key (model_id + tensor hash)
+    const void *       src_ptr   = nullptr;          // Host-accessible AOS weight data
+    size_t             src_size  = 0;                // AOS byte count
+    size_t             dst_size  = 0;                // SOA byte count (may differ due to reorder padding)
+    ggml_layout_mode   layout    = GGML_LAYOUT_AOS;  // Optimal layout for this expert
+    ggml_type          type      = GGML_TYPE_F32;    // Weight quantization type
+    int64_t            ncols     = 0;                // Weight columns (K dimension)
+    int64_t            nrows     = 0;                // Weight rows (N dimension)
+    int                layer_id  = -1;               // Hash-based layer ID
+    int                expert_id = -1;               // Expert index within layer
+    bool               valid     = false;            // True if metadata was found
 };
 
 // Read-only metadata accessor for expert staging.
 // Looks up g_moe_expert_meta, computes cache key and optimal layout.
 // Does NOT allocate VRAM, submit DMA, or modify any state.
 // Thread-safe: acquires g_moe_expert_meta_mutex (shared lock).
-bool moe_get_expert_stage_info(int layer_idx, int expert_idx, int device_id,
-                               expert_stage_info & out);
+bool moe_get_expert_stage_info(int layer_idx, int expert_idx, int device_id, expert_stage_info & out);
 
 // Context for AOS->SOA reorder fill function (used with cache_layout_request::fill_ctx).
 struct reorder_fill_ctx {
@@ -100,16 +99,16 @@ uint32_t get_expert_frequency(int layer_hash, int expert_id);
 // The event is from direct_stage_expert() and completes when H2D DMA +
 // AOS->SOA reorder finish on the cache's DMA queue.
 struct prefetch_request {
-    expert_key  key;
-    sycl::event event;                 // DMA completion event from cache DMA queue
-    void *      device_ptr = nullptr;  // VRAM destination (from unified cache)
-    bool        completed  = false;
+    expert_key         key;
+    sycl::event        event;                 // DMA completion event from cache DMA queue
+    void *             device_ptr = nullptr;  // VRAM destination (from unified cache)
+    bool               completed  = false;
     // Unified cache tracking for async finalization in await().
-    ggml_sycl_cache_id cache_key = {};            // Cache key for register_ready
-    ggml_layout_mode   layout    = GGML_LAYOUT_AOS;  // Layout used for cache entry
-    size_t             size      = 0;             // Allocation size in bytes
-    int                layer_id  = -1;            // Layer ID for cache entry
-    int                expert_id = -1;            // Expert ID for cache entry
+    ggml_sycl_cache_id cache_key  = {};               // Cache key for register_ready
+    ggml_layout_mode   layout     = GGML_LAYOUT_AOS;  // Layout used for cache entry
+    size_t             size       = 0;                // Allocation size in bytes
+    int                layer_id   = -1;               // Layer ID for cache entry
+    int                expert_id  = -1;               // Expert ID for cache entry
 };
 
 // Async DMA engine for prefetching MoE expert weights from host RAM to VRAM.
@@ -165,9 +164,7 @@ class ExpertPrefetcher {
     //   auto cpu_indices = prefetcher.hint_batch_adaptive(layer, experts, n_miss);
     //   // cpu_indices: experts to dispatch via cpu_expert_mul_mat_int4()
     //   // remaining: await() as normal (they were prefetched to VRAM)
-    std::vector<int> hint_batch_adaptive(int layer_idx,
-                                         const std::vector<int> & expert_indices,
-                                         int n_miss_total);
+    std::vector<int> hint_batch_adaptive(int layer_idx, const std::vector<int> & expert_indices, int n_miss_total);
 
     // Wait for a specific expert's prefetch to complete and return its VRAM ptr.
     // Waits on the per-expert sycl::event (not a global queue wait).
@@ -194,8 +191,9 @@ class ExpertPrefetcher {
     bool is_initialized() const { return initialized_; }
 
     // Statistics
-    int  pending_count() const;
-    int  completed_count() const;
+    int pending_count() const;
+    int completed_count() const;
+
     bool is_active() const { return initialized_; }
 
     // Pre-fill the cache with popular experts at model init time.
@@ -204,10 +202,11 @@ class ExpertPrefetcher {
     void preload_experts(int layer_idx, const std::vector<int> & expert_ids);
 
   private:
-    std::unique_ptr<sycl::queue> dma_queue_;    // OOQ for async H2D DMA (unique_ptr to avoid static init + enable leak-on-exit)
-    int                          device_id_      = 0;  // Device index for VRAM budget tracking
-    int                          prefetch_depth_ = 2;  // Default: 2 layers ahead
-    bool                         initialized_   = false;
+    std::unique_ptr<sycl::queue>
+         dma_queue_;           // OOQ for async H2D DMA (unique_ptr to avoid static init + enable leak-on-exit)
+    int  device_id_      = 0;  // Device index for VRAM budget tracking
+    int  prefetch_depth_ = 2;  // Default: 2 layers ahead
+    bool initialized_    = false;
 
     // Max concurrent in-flight DMA operations. Limits PCIe bandwidth
     // saturation to avoid starving the compute engine.
@@ -234,7 +233,7 @@ class ExpertPrefetcher {
     bool hint_locked(int layer_idx, int expert_idx);
 
     // Set when prediction hit rate drops below threshold; disables prefetching.
-    std::atomic<bool> prefetch_disabled_{false};
+    std::atomic<bool> prefetch_disabled_{ false };
 };
 
 // ============================================================================
@@ -312,20 +311,21 @@ class ExpertPredictor {
     // Multi-layer lookahead prediction: predict experts for layers L+1..L+depth.
     // Returns a vector of (target_layer_idx, predicted_experts) pairs.
     // Uses predict_pregate() for each target layer with correct gate weights.
-    std::vector<std::pair<int, std::vector<int>>> predict_multi_layer(
-        int current_seq_layer,
-        const void * hidden_state,
-        sycl::queue & compute_q);
+    std::vector<std::pair<int, std::vector<int>>> predict_multi_layer(int           current_seq_layer,
+                                                                      const void *  hidden_state,
+                                                                      sycl::queue & compute_q);
 
     // Return the configured prediction depth (layers ahead to predict).
     int predict_depth() const { return predict_depth_; }
 
     // Statistics (rolling window of last ACCURACY_WINDOW predictions)
-    float hit_rate() const;       // Rolling prediction accuracy (0.0 - 1.0)
-    int   window_size() const;    // Current window sample count (up to ACCURACY_WINDOW)
-    int   window_hits() const;    // Hits within current window
-    bool  is_active() const { return initialized_; }
-    int   n_layers() const { return n_layers_; }
+    float hit_rate() const;     // Rolling prediction accuracy (0.0 - 1.0)
+    int   window_size() const;  // Current window sample count (up to ACCURACY_WINDOW)
+    int   window_hits() const;  // Hits within current window
+
+    bool is_active() const { return initialized_; }
+
+    int n_layers() const { return n_layers_; }
 
     // Returns true when prediction accuracy is too low for useful prefetching.
     // Checked by ExpertPrefetcher to short-circuit hint().
@@ -336,9 +336,9 @@ class ExpertPredictor {
     std::vector<std::pair<int, uint32_t>> get_frequency_ranking(int layer_idx) const;
 
   private:
-    bool initialized_ = false;
-    int  n_layers_      = 0;
-    int  n_experts_     = 0;
+    bool initialized_    = false;
+    int  n_layers_       = 0;
+    int  n_experts_      = 0;
     int  n_experts_used_ = 0;
     int  predict_depth_  = 3;  // Number of layers to predict ahead (default: 3)
 
@@ -360,18 +360,18 @@ class ExpertPredictor {
 
     // Pre-allocated device buffer for predict_pregate() GEMV output scores.
     // Avoids sycl::malloc_device/free per call (3 calls per MoE dispatch with 3-layer lookahead).
-    float *               scores_dev_   = nullptr;
-    int                   scores_dev_n_ = 0;     // Number of floats allocated
-    sycl::queue *         scores_queue_ = nullptr;
-    ggml_sycl::alloc_handle scores_alloc_{};     // Owns the device buffer; unified_free on resize/dtor
+    float *                 scores_dev_   = nullptr;
+    int                     scores_dev_n_ = 0;  // Number of floats allocated
+    sycl::queue *           scores_queue_ = nullptr;
+    ggml_sycl::alloc_handle scores_alloc_{};    // Owns the device buffer; unified_free on resize/dtor
 
     // Rolling accuracy stats (last ACCURACY_WINDOW predictions).
     static constexpr int ACCURACY_WINDOW = 100;
-    int accuracy_hits_   = 0;
-    int window_total_    = 0;  // Number of samples in the rolling accuracy window (up to ACCURACY_WINDOW)
+    int                  accuracy_hits_  = 0;
+    int                  window_total_ = 0;  // Number of samples in the rolling accuracy window (up to ACCURACY_WINDOW)
 
     // Set when hit rate drops below threshold; signals prefetcher to disable.
-    std::atomic<bool> prefetch_disabled_{false};
+    std::atomic<bool> prefetch_disabled_{ false };
 
     // Circular buffer for rolling window eviction.
     // uint8_t avoids std::vector<bool> specialization issues.
@@ -399,48 +399,54 @@ class ExpertPredictor {
 // measure actual cache residency and prediction overlap.
 //
 // Dispatch stats are always enabled (lightweight counters for diagnosing
-// MoE cache performance). Reporting interval: every 1000 tokens (default).
+// planned MoE route residency). Reporting interval: every 10 tokens (default).
 //
 struct MoeDispatchStats {
     // Cumulative counters (lifetime)
-    std::atomic<int64_t> total_experts_dispatched{0};  // Total expert dispatches
-    std::atomic<int64_t> total_vram_hits{0};           // Expert in VRAM cache (fastest)
-    std::atomic<int64_t> total_host_hits{0};           // Expert in host-pinned cache (PCIe streaming)
-    std::atomic<int64_t> total_staging{0};             // Expert freshly staged from host (IN_PROGRESS)
-    std::atomic<int64_t> total_cpu_fallbacks{0};       // Expert fell to CPU (cache miss)
-    std::atomic<int64_t> total_prefetch_hits{0};       // Expert was in-flight prefetched and awaited
-    std::atomic<int64_t> total_tokens{0};              // Token counter
-    std::atomic<int64_t> total_layers{0};              // Layer dispatch counter
+    std::atomic<int64_t> total_experts_dispatched{ 0 };    // Total selected expert rows
+    std::atomic<int64_t> total_device0_rows{ 0 };          // Rows routed to the submitting device
+    std::atomic<int64_t> total_device_other_rows{ 0 };     // Rows routed to another GPU
+    std::atomic<int64_t> total_host_rows{ 0 };             // Rows routed to host CPU-capable execution
+    std::atomic<int64_t> total_missing_rows{ 0 };          // Selected rows with no planned handle
+    std::atomic<int64_t> total_layout_mismatch_rows{ 0 };  // Planned handle exists, but not in requested layout
+    std::atomic<int64_t> total_unsupported_rows{ 0 };      // Planned route exists, but no executor supports it
+    std::atomic<int64_t> total_tokens{ 0 };                // Token counter
+    std::atomic<int64_t> total_layers{ 0 };                // Layer dispatch counter
 
     // Per-expert prediction accuracy (cumulative)
-    std::atomic<int64_t> pred_total_experts{0};     // Total experts in actual selections
-    std::atomic<int64_t> pred_correct_experts{0};   // Experts that were in prediction set
-    std::atomic<int64_t> pred_total_layers{0};      // Layers where prediction was available
+    std::atomic<int64_t> pred_total_experts{ 0 };    // Total experts in actual selections
+    std::atomic<int64_t> pred_correct_experts{ 0 };  // Experts that were in prediction set
+    std::atomic<int64_t> pred_total_layers{ 0 };     // Layers where prediction was available
 
     // Interval counters (reset each report)
-    std::atomic<int64_t> interval_experts{0};
-    std::atomic<int64_t> interval_vram_hits{0};
-    std::atomic<int64_t> interval_host_hits{0};
-    std::atomic<int64_t> interval_staging{0};
-    std::atomic<int64_t> interval_cpu_fallbacks{0};
-    std::atomic<int64_t> interval_pred_total{0};
-    std::atomic<int64_t> interval_pred_correct{0};
-    std::atomic<int64_t> interval_tokens{0};
+    std::atomic<int64_t> interval_experts{ 0 };
+    std::atomic<int64_t> interval_device0_rows{ 0 };
+    std::atomic<int64_t> interval_device_other_rows{ 0 };
+    std::atomic<int64_t> interval_host_rows{ 0 };
+    std::atomic<int64_t> interval_missing_rows{ 0 };
+    std::atomic<int64_t> interval_layout_mismatch_rows{ 0 };
+    std::atomic<int64_t> interval_unsupported_rows{ 0 };
+    std::atomic<int64_t> interval_pred_total{ 0 };
+    std::atomic<int64_t> interval_pred_correct{ 0 };
+    std::atomic<int64_t> interval_tokens{ 0 };
 
     // Reporting interval in tokens
     int report_interval = 10;
 
-    // Record a dispatch partition for one MUL_MAT_ID call.
-    // n_vram: experts found in VRAM (device-resident)
-    // n_host: experts found in host-pinned cache (PCIe streaming)
-    // n_staging: experts freshly being staged (IN_PROGRESS)
-    // n_miss: cache misses (nullptr, falls to CPU)
-    // n_prefetched: experts from async DMA prefetch
+    // Record a planned residency partition for one MUL_MAT_ID call.
+    void record_route_residency(int n_device0,
+                                int n_device_other,
+                                int n_host,
+                                int n_missing,
+                                int n_layout_mismatch,
+                                int n_unsupported);
+
+    // Compatibility wrapper for legacy callers that still report cache-shaped
+    // counters. New code should call record_route_residency().
     void record_dispatch(int n_vram, int n_host, int n_staging, int n_miss, int n_prefetched);
 
     // Record prediction accuracy for one layer: predicted vs actual expert sets
-    void record_prediction_accuracy(const std::vector<int> & predicted,
-                                    const std::vector<int> & actual);
+    void record_prediction_accuracy(const std::vector<int> & predicted, const std::vector<int> & actual);
 
     // Called once per token (after all layers) to check if we should report
     void tick_token();

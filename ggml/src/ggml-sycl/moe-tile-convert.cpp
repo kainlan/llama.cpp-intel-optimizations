@@ -49,7 +49,7 @@ sycl::event reorder_mxfp4_to_xmx_tiled(
 
                 // Calculate output offset for this tile group
                 // Each tile group: scales[tile_n_total] + qs[tile_n_total][16]
-                const size_t group_bytes = info.tile_n_total * (1 + PACKED_BYTES);
+                const size_t group_bytes  = info.tile_n_total * (1 + PACKED_BYTES);
                 const size_t group_offset = (tg_k * info.n_tile_groups_n + tg_n) * group_bytes;
 
                 const size_t nblocks_per_expert = static_cast<size_t>(info.n_rows) *

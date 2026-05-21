@@ -81,14 +81,14 @@ struct MXFPXMXConfig {
 };
 
 // XMX tile-aligned layout metadata
-// Layout: [tile_groups...] where each tile_group contains:
-//   scales[tiles_k][tile_n_total] followed by qs[tiles_k][tile_n_total][16]
+// Layout: k-tile-major [tile_k_group][tile_n_group], where each
+// tile group contains scales[tile_n_total] followed by qs[tile_n_total][16].
 struct MXFPXMXLayoutInfo {
     int64_t n_rows;             // out_dim
     int64_t n_cols;             // in_dim
     int64_t n_tile_groups_k;    // ceil(in_dim / (XMX_K * tiles_k_per_group))
     int64_t n_tile_groups_n;    // ceil(out_dim / tile_n_total)
-    int64_t tile_n_total;       // XMX_N * tiles_n (from hardware)
+    int64_t tile_n_total;       // XMX_N * tiles_n
     int64_t tiles_k_per_group;  // Number of K blocks per tile group
     int64_t total_bytes;        // Size of converted buffer
 
@@ -119,7 +119,7 @@ struct MXFPXMXLayoutInfo {
 
 // Convert MXFP4 weights from SoA layout to XMX tile-aligned layout
 // SoA input: qs[nblocks * 16], e[nblocks] where nblocks = out_dim * (in_dim/32)
-// XMX output: [tile_groups...] with scales and qs grouped by tile
+// XMX output: k-tile-major [tile_k_group][tile_n_group] groups.
 //
 // This runs on host at model load time (not in hot path)
 inline void reorder_mxfp4_to_xmx_layout(const uint8_t *           src_qs,  // SoA packed nibbles [nblocks * 16]
@@ -131,11 +131,12 @@ inline void reorder_mxfp4_to_xmx_layout(const uint8_t *           src_qs,  // So
 
     const int64_t n_k_blocks = info.n_cols / XMX_K;
 
-    // Iterate over tile groups
-    uint8_t * dst_ptr = dst;
+    const int64_t bytes_per_tile_group = info.tile_n_total * (1 + PACKED_BYTES);
 
     for (int64_t tg_k = 0; tg_k < info.n_tile_groups_k; tg_k++) {
         for (int64_t tg_n = 0; tg_n < info.n_tile_groups_n; tg_n++) {
+            uint8_t * dst_ptr = dst + (tg_k * info.n_tile_groups_n + tg_n) * bytes_per_tile_group;
+
             // Write scales for this tile group [tile_n_total]
             for (int64_t tn = 0; tn < info.tile_n_total; tn++) {
                 int64_t out_col = tg_n * info.tile_n_total + tn;
@@ -195,8 +196,7 @@ sycl::event fused_xmx_moe_gemm_mxfp4_tiled(
     const int num_k_blocks   = in_dim / XMX_K;
     const int n_output_tiles = (out_dim + TILE_N - 1) / TILE_N;
 
-    // Bytes per tile group in XMX layout: scales[TILE_N] + qs[TILE_N][16]
-    const int64_t bytes_per_tile_group = TILE_N * (1 + 16);
+    const int64_t bytes_per_tile_group = static_cast<int64_t>(cfg.tile_n_total) * (1 + 16);
 
     (void) num_tokens;
     (void) TILES_M;
@@ -255,6 +255,7 @@ sycl::event fused_xmx_moe_gemm_mxfp4_tiled(
                         int tile_idx        = local_work % n_output_tiles;
                         int local_token_idx = local_work / n_output_tiles;
                         int sorted_idx      = expert_start + local_token_idx;
+                        int col_start       = tile_idx * TILE_N;
 
                         float float_acc[TILES_N * XMX_N] = { 0.0f };
 
@@ -275,21 +276,26 @@ sycl::event fused_xmx_moe_gemm_mxfp4_tiled(
                                     static_cast<float>(token_scales[sorted_idx * num_k_blocks + k_block]);
                             }
 
-                            // Load weights from tile-aligned layout
-                            // Tile group offset: (k_block * n_tile_groups_n + tile_idx) * bytes_per_tile_group
                             const uint8_t * tile_group =
-                                expert_tiled + (k_block * n_output_tiles + tile_idx) * bytes_per_tile_group;
+                                expert_tiled +
+                                (static_cast<int64_t>(k_block) * n_output_tiles + tile_idx) * bytes_per_tile_group;
                             const uint8_t * scales_ptr = tile_group;
-                            const uint8_t * qs_ptr     = tile_group + TILE_N;
+                            const uint8_t * qs_ptr     = tile_group + cfg.tile_n_total;
 
                             for (int i = lane; i < TILE_N; i += SG_SIZE) {
-                                // Load scale (E8M0 -> float)
+                                if (col_start + i >= static_cast<int>(out_dim)) {
+                                    slm_weight_scales[i] = 0.0f;
+                                    for (int k = 0; k < XMX_K; ++k) {
+                                        slm_weights[i * XMX_K + k] = 0;
+                                    }
+                                    continue;
+                                }
+
                                 slm_weight_scales[i] = sycl_e8m0_to_fp32_half(scales_ptr[i]);
 
-                                // Unpack nibbles
                                 const uint8_t * packed = qs_ptr + i * 16;
                                 for (int k = 0; k < 16; k++) {
-                                    uint8_t byte                    = packed[k];
+                                    uint8_t byte                   = packed[k];
                                     slm_weights[i * XMX_K + k]      = slm_kvalues[byte & 0xF];
                                     slm_weights[i * XMX_K + k + 16] = slm_kvalues[byte >> 4];
                                 }
@@ -966,7 +972,6 @@ inline std::pair<bool, sycl::event> try_fused_xmx_moe_mxfp4_tiled(sycl::event   
     }
 
     moe_xmx_fused::MXFPXMXConfig cfg = moe_xmx_fused::MXFPXMXConfig::from_device(device_id);
-
     GGML_SYCL_DEBUG(
         "[MoE-Fused] Launching XMX MXFP4 tiled kernel: "
         "tokens=%d experts=%d out=%ld in=%ld wgs=%d tiled_stride=%ld\n",

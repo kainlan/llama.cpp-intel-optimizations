@@ -1140,6 +1140,7 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                                      config.kernel_name.find("_nocache") == std::string::npos;
                 const bool direct_xmx          = config.kernel_name.find("_xmx_") != std::string::npos;
                 const bool split_gate_up       = config.kernel_name.find("_split") != std::string::npos;
+                const bool predecoded_i8       = config.kernel_name.find("_predecoded") != std::string::npos;
                 const int  xmx_tiles_n         = parse_moe_xmx_tiles_n(config.kernel_name);
                 const bool vector_qs_load      = config.kernel_name.find("_vecq") != std::string::npos;
                 const bool ignore_weight_scale = config.kernel_name.find("_noscale") != std::string::npos;
@@ -1148,10 +1149,10 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                 const bool sparse_expert_slots = config.kernel_name.find("_sparse32") != std::string::npos;
                 const bool use_bias            = config.kernel_name.find("_bias") != std::string::npos;
                 if (!run_mxfp4_pair_glu(weights, activations, m, selected_count, k, token_rows, rows_per_wg, cache_y,
-                                        direct_xmx, split_gate_up, xmx_tiles_n, vector_qs_load, ignore_weight_scale,
-                                        scale_stride_blocks, subgroup_size, sparse_expert_slots, use_bias,
-                                        config.validate, config.warmup_iterations, config.measure_iterations, queue,
-                                        metrics, error)) {
+                                        direct_xmx, split_gate_up, predecoded_i8, xmx_tiles_n, vector_qs_load,
+                                        ignore_weight_scale, scale_stride_blocks, subgroup_size, sparse_expert_slots,
+                                        use_bias, config.validate, config.warmup_iterations, config.measure_iterations,
+                                        queue, metrics, error)) {
                     out.error = error;
                     return false;
                 }
@@ -1203,9 +1204,10 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                 const bool           explicit_tiles_n    = config.kernel_name.find("_tn") != std::string::npos;
                 const bool           sparse_expert_slots = config.kernel_name.find("_sparse32") != std::string::npos;
                 const bool           raw_accum           = config.kernel_name.find("_raw") != std::string::npos;
+                const bool           i8_rowmajor         = config.kernel_name.find("_i8rm") != std::string::npos;
                 if (!run_mxfp4_mmv_id_xmx_tiled(weights, activations, m, selected_count, k, token_rows,
                                                 explicit_tiles_n ? requested_tiles_n : 0, sparse_expert_slots,
-                                                raw_accum, config.validate, config.warmup_iterations,
+                                                raw_accum, i8_rowmajor, config.validate, config.warmup_iterations,
                                                 config.measure_iterations, queue, metrics, error)) {
                     out.error = error;
                     return false;
@@ -1227,7 +1229,23 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                     ntiles = 2;
                 }
                 const bool use_prefetch4 = config.kernel_name.find("_pf4") != std::string::npos;
-                if (config.kernel_name.find("_compact_raw") != std::string::npos) {
+                if (config.kernel_name.find("_compact_bytescale") != std::string::npos) {
+                    const bool xmx_layout = config.kernel_name.find("_xmxlayout") != std::string::npos;
+                    if (!run_mxfp4_dpas_grouped_compact_bytescale(weights, activations, m, config.dim_n, k, ntiles,
+                                                                  xmx_layout, config.validate, config.warmup_iterations,
+                                                                  config.measure_iterations, queue, metrics, error)) {
+                        out.error = error;
+                        return false;
+                    }
+                } else if (config.kernel_name.find("_compact_scaled") != std::string::npos) {
+                    const bool packed_scales = config.kernel_name.find("_ps") != std::string::npos;
+                    if (!run_mxfp4_dpas_grouped_compact_scaled(weights, activations, m, config.dim_n, k, ntiles,
+                                                               packed_scales, config.validate, config.warmup_iterations,
+                                                               config.measure_iterations, queue, metrics, error)) {
+                        out.error = error;
+                        return false;
+                    }
+                } else if (config.kernel_name.find("_compact_raw") != std::string::npos) {
                     if (!run_mxfp4_dpas_grouped_compact_raw(weights, activations, m, config.dim_n, k, ntiles,
                                                             config.validate, config.warmup_iterations,
                                                             config.measure_iterations, queue, metrics, error)) {

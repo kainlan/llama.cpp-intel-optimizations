@@ -519,7 +519,8 @@ static void reorder_q4_0_aos_to_coalesced_kernel(const block_q4_0 * __restrict__
     // Layout sizes
     constexpr int qs_bytes_per_tile = TILE_BLOCKS * QS_BYTES_PER_BLOCK;
 
-    const int64_t row_quants_bytes   = (int64_t) blocks_per_row * QS_BYTES_PER_BLOCK;
+    const int64_t row_quants_bytes =
+        (int64_t) ggml_sycl_q8_0_coalesced_row_quants_bytes(blocks_per_row);
     const int64_t total_quants_bytes = (int64_t) nrows * row_quants_bytes;
 
     // Destination offsets - use int64_t to avoid overflow for large tensors
@@ -636,11 +637,10 @@ void reorder_q8_0_aos_to_coalesced_sycl(const void *    src,
                                         int64_t         ne01,
                                         dpct::queue_ptr stream) {
     GGML_ASSERT(ne00 % QK8_0 == 0);
-    GGML_ASSERT((ne00 / QK8_0) % MMVQ_COALESCED_TILE_BLOCKS == 0);
 
     const int    blocks_per_row = ne00 / QK8_0;
     const int    nrows          = ne01;
-    const int    tiles_per_row  = blocks_per_row / MMVQ_COALESCED_TILE_BLOCKS;
+    const int    tiles_per_row  = ggml_sycl_coalesced_fixed_tile_count(blocks_per_row);
     const size_t total_blocks   = (size_t) blocks_per_row * (size_t) nrows;
     const size_t total_bytes    = total_blocks * sizeof(block_q8_0);
 

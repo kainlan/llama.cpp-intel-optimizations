@@ -156,10 +156,9 @@ class mem_handle {
                                      ggml_layout_mode layout    = GGML_LAYOUT_AOS,
                                      bool             on_device = false);
 
-    // Resolve with explicit device check.  Returns null resolved_ptr and logs a
-    // diagnostic if device_id does not match this handle's device_ (when device_
-    // is >= 0).  HOST_DEVICE (-1) handles always pass.  Use this overload from
-    // any dispatch path that knows which device it is submitting work to.
+    // Resolve for a dispatch device. Device-resident pointers must belong to
+    // that device; host-resident pointers are returned for any device. The
+    // handle's device_ is the allocator/cache owner used for re-resolution.
     resolved_ptr resolve(int device_id) const;
 
     // Resolve the current pointer.  Hot path (~3 ns):
@@ -179,7 +178,7 @@ class mem_handle {
     // Access the cache key (only meaningful for WEIGHT handles).
     const unified_cache_key & key() const { return key_; }
 
-    // Access the device ID.
+    // Access the allocator/cache owner device ID.
     int device() const { return device_; }
 
     // Access the handle kind.
@@ -205,7 +204,9 @@ class mem_handle {
     // so aliases to the same allocation compare equal; unresolved cache-managed
     // weights fall back to their stable cache identity.
     bool operator==(const mem_handle & other) const;
+
     bool operator!=(const mem_handle & other) const { return !(*this == other); }
+
     size_t hash() const;
 
   private:
@@ -312,11 +313,15 @@ bool build_layer_handles(int device, int layer_id, layer_weight_handles & out);
 // copies while the submitted event still depends on the backing pointer.
 void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event event);
 
+// Release completed event-bound handle leases.  When wait_all is true, wait for
+// every retained event before releasing.  Model-load replanning uses this after
+// draining queues so stale weight handles drop before cache entries are removed.
+void reap_retained_handles(bool wait_all = false);
+
 }  // namespace ggml_sycl
 
 namespace std {
-template <>
-struct hash<ggml_sycl::mem_handle> {
+template <> struct hash<ggml_sycl::mem_handle> {
     size_t operator()(const ggml_sycl::mem_handle & h) const { return h.hash(); }
 };
 }  // namespace std

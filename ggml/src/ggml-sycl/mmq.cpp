@@ -512,8 +512,8 @@ load_tiles_q4_0_coalesced(const uint8_t *__restrict__ qs_base,
 
     float * x_dmf = (float *) x_dm;
     const sycl::half * d_base = (const sycl::half *)(qs_base + d_offset);
-    const int tiles_per_row = blocks_per_row / TILE_BLOCKS;
-    const size_t row_stride = tiles_per_row * tile_bytes;
+    const int tiles_per_row = ggml_sycl_coalesced_fixed_tile_count(blocks_per_row);
+    const size_t row_stride = static_cast<size_t>(tiles_per_row) * tile_bytes;
 
 #pragma unroll 1
     for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
@@ -1081,8 +1081,8 @@ load_tiles_q8_0_coalesced(const int8_t *__restrict__ qs_base,
     const int kqsx = k % QI8_0;
 
     const sycl::half * d_base = (const sycl::half *)((const uint8_t *)qs_base + d_offset);
-    const int tiles_per_row = blocks_per_row / TILE_BLOCKS;
-    const size_t row_stride = tiles_per_row * tile_bytes;
+    const int tiles_per_row = ggml_sycl_coalesced_fixed_tile_count(blocks_per_row);
+    const size_t row_stride = static_cast<size_t>(tiles_per_row) * tile_bytes;
 
 #pragma unroll
     for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
@@ -6602,9 +6602,10 @@ static void ggml_sycl_mmq_dispatch(const ggml_tensor *     src0,
             } else
 #endif
             if (use_layout == GGML_LAYOUT_COALESCED) {
-                const size_t nblocks        = static_cast<size_t>(layout_rows) * static_cast<size_t>(ne00 / QK8_0);
-                const size_t total_qs_bytes = nblocks * QK8_0;
-                const size_t d_offset       = total_qs_bytes;
+                const size_t blocks_per_row = static_cast<size_t>(ne00 / QK8_0);
+                const size_t d_offset =
+                    static_cast<size_t>(layout_rows) *
+                    ggml_sycl_q8_0_coalesced_row_quants_bytes(static_cast<int>(blocks_per_row));
 
                 GGML_SYCL_KTRACE("mmq_q8_0_coalesced", " ne00=%lld row_low=%lld row_diff=%lld ncols=%lld d_offset=%zu global_row=%lld",
                     (long long)ne00, (long long)row_low, (long long)row_diff, (long long)src1_ncols, d_offset,

@@ -1,19 +1,18 @@
 #pragma once
 
+#include "ggml-quants.h"
+#include "ggml-sycl/common.hpp"
+#include "ggml.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <random>
 #include <string>
+#include <sycl/sycl.hpp>
 #include <type_traits>
 #include <vector>
-
-#include <sycl/sycl.hpp>
-
-#include "ggml.h"
-#include "ggml-quants.h"
-#include "ggml-sycl/common.hpp"
 
 #define GGML_COMMON_DECL_CPP
 #include "ggml-common.h"
@@ -21,7 +20,7 @@
 namespace sycl_bench {
 
 static inline int tile_count(int blocks) {
-    int count = 0;
+    int count     = 0;
     int remaining = blocks;
     while (remaining > 0) {
         int ts = 1;
@@ -53,16 +52,16 @@ struct GeneratedWeights {
     std::vector<uint8_t> aos;
     std::vector<uint8_t> layout;
     std::vector<float>   fp32;
-    ggml_layout_mode     layout_mode = GGML_LAYOUT_AOS;
-    size_t               bytes_aos = 0;
+    ggml_layout_mode     layout_mode  = GGML_LAYOUT_AOS;
+    size_t               bytes_aos    = 0;
     size_t               bytes_layout = 0;
 };
 
 struct GeneratedActivations {
-    std::vector<uint8_t>    q8_1;
-    std::vector<float>      fp32;
-    std::vector<ggml_half>  fp16;
-    int64_t                 k_padded = 0;
+    std::vector<uint8_t>   q8_1;
+    std::vector<float>     fp32;
+    std::vector<ggml_half> fp16;
+    int64_t                k_padded = 0;
 };
 
 static inline int64_t padded_k(int64_t k, int64_t pad) {
@@ -102,13 +101,13 @@ static inline void quantize_q8_1_block_ref(const float * src, int8_t * qs, float
     for (int i = 0; i < QK8_1; ++i) {
         amax = std::max(amax, std::fabs(src[i]));
     }
-    d = amax / 127.0f;
-    const float id = (d != 0.0f) ? 1.0f / d : 0.0f;
-    int sum = 0;
+    d               = amax / 127.0f;
+    const float id  = (d != 0.0f) ? 1.0f / d : 0.0f;
+    int         sum = 0;
     for (int i = 0; i < QK8_1; ++i) {
-        const float v = src[i] * id;
+        const float  v = src[i] * id;
         const int8_t q = static_cast<int8_t>(std::round(v));
-        qs[i] = q;
+        qs[i]          = q;
         sum += q;
     }
     s = static_cast<float>(sum) * d;
@@ -116,31 +115,31 @@ static inline void quantize_q8_1_block_ref(const float * src, int8_t * qs, float
 
 static inline void quantize_q8_1_row_aos(const float * src, uint8_t * dst, int64_t k, int64_t k_padded) {
     const int64_t blocks = k / QK8_1;
-    const int64_t pitch = k_padded / QK8_1;
+    const int64_t pitch  = k_padded / QK8_1;
     std::memset(dst, 0, (size_t) pitch * sizeof(block_q8_1));
 
     for (int64_t b = 0; b < blocks; ++b) {
         const float * block_src = src + b * QK8_1;
-        block_q8_1 * block_dst = reinterpret_cast<block_q8_1 *>(dst) + b;
-        float d = 0.0f;
-        float s = 0.0f;
+        block_q8_1 *  block_dst = reinterpret_cast<block_q8_1 *>(dst) + b;
+        float         d         = 0.0f;
+        float         s         = 0.0f;
         quantize_q8_1_block_ref(block_src, block_dst->qs, d, s);
         pack_half2(reinterpret_cast<uint8_t *>(&block_dst->ds), d, s);
     }
 }
 
 static inline void quantize_q8_1_row_soa(const float * src, uint8_t * dst, int64_t k, int64_t k_padded) {
-    const int64_t blocks = k / QK8_1;
-    const size_t row_bytes = (size_t) (k_padded / QK8_1) * sizeof(block_q8_1);
+    const int64_t blocks    = k / QK8_1;
+    const size_t  row_bytes = (size_t) (k_padded / QK8_1) * sizeof(block_q8_1);
     std::memset(dst, 0, row_bytes);
 
-    int8_t * qs_dst = reinterpret_cast<int8_t *>(dst);
+    int8_t *  qs_dst = reinterpret_cast<int8_t *>(dst);
     uint8_t * ds_dst = dst + k;
 
     for (int64_t b = 0; b < blocks; ++b) {
         const float * block_src = src + b * QK8_1;
-        float d = 0.0f;
-        float s = 0.0f;
+        float         d         = 0.0f;
+        float         s         = 0.0f;
         quantize_q8_1_block_ref(block_src, qs_dst + b * QK8_1, d, s);
         pack_half2(ds_dst + b * sizeof(sycl::half2), d, s);
     }
@@ -152,11 +151,11 @@ static inline bool requires_block_alignment(ggml_type type) {
 
 // === CPU-side layout helpers (copied from ggml-sycl.cpp for staging) ===
 static void reorder_q4_0_cpu(void * dst_soa, const void * src_aos, int ncols, int nrows) {
-    const size_t blocks_per_row = ncols / QK4_0;
-    const size_t nblocks        = blocks_per_row * nrows;
-    const uint8_t * aos    = (const uint8_t *) src_aos;
-    uint8_t *       soa_qs = (uint8_t *) dst_soa;
-    uint8_t *       soa_d  = soa_qs + nblocks * (QK4_0 / 2);
+    const size_t    blocks_per_row = ncols / QK4_0;
+    const size_t    nblocks        = blocks_per_row * nrows;
+    const uint8_t * aos            = (const uint8_t *) src_aos;
+    uint8_t *       soa_qs         = (uint8_t *) dst_soa;
+    uint8_t *       soa_d          = soa_qs + nblocks * (QK4_0 / 2);
     for (size_t ib = 0; ib < nblocks; ib++) {
         const uint8_t * block_aos = aos + ib * sizeof(block_q4_0);
         memcpy(soa_qs + ib * (QK4_0 / 2), block_aos + sizeof(ggml_half), QK4_0 / 2);
@@ -170,14 +169,14 @@ static bool reorder_q4_0_coalesced_cpu(void * dst_coalesced, const void * src_ao
     constexpr int WORDS_PER_BLOCK   = 4;
     constexpr int WORD_PLANE_STRIDE = TILE_BLOCKS * 4;
 
-    const size_t blocks_per_row = ncols / QK4_0;
-    const size_t nblocks        = blocks_per_row * nrows;
+    const size_t blocks_per_row     = ncols / QK4_0;
+    const size_t nblocks            = blocks_per_row * nrows;
     const size_t row_quants_bytes   = ncols / 2;
     const size_t total_quants_bytes = nrows * row_quants_bytes;
 
-    const uint8_t * aos = (const uint8_t *) src_aos;
-    uint8_t * coal_qs = (uint8_t *) dst_coalesced;
-    uint8_t * coal_d  = coal_qs + total_quants_bytes;
+    const uint8_t * aos     = (const uint8_t *) src_aos;
+    uint8_t *       coal_qs = (uint8_t *) dst_coalesced;
+    uint8_t *       coal_d  = coal_qs + total_quants_bytes;
 
     if (blocks_per_row % TILE_BLOCKS != 0) {
         std::fprintf(stderr, "[sycl-kernel-bench] Q4_0 coalesced: blocks_per_row=%zu not divisible by %d\n",
@@ -186,13 +185,13 @@ static bool reorder_q4_0_coalesced_cpu(void * dst_coalesced, const void * src_ao
     }
 
     for (size_t ib = 0; ib < nblocks; ib++) {
-        const uint8_t * block_aos = aos + ib * sizeof(block_q4_0);
-        const uint8_t * src_qs    = block_aos + sizeof(ggml_half);
-        const size_t row           = ib / blocks_per_row;
-        const size_t col_block     = ib % blocks_per_row;
-        const size_t tile          = col_block / TILE_BLOCKS;
-        const size_t block_in_tile = col_block % TILE_BLOCKS;
-        const size_t tile_base = row * row_quants_bytes + tile * (TILE_BLOCKS * BYTES_PER_BLOCK);
+        const uint8_t * block_aos     = aos + ib * sizeof(block_q4_0);
+        const uint8_t * src_qs        = block_aos + sizeof(ggml_half);
+        const size_t    row           = ib / blocks_per_row;
+        const size_t    col_block     = ib % blocks_per_row;
+        const size_t    tile          = col_block / TILE_BLOCKS;
+        const size_t    block_in_tile = col_block % TILE_BLOCKS;
+        const size_t    tile_base     = row * row_quants_bytes + tile * (TILE_BLOCKS * BYTES_PER_BLOCK);
 
         for (int word = 0; word < WORDS_PER_BLOCK; word++) {
             const size_t word_offset = tile_base + word * WORD_PLANE_STRIDE + block_in_tile * 4;
@@ -204,11 +203,11 @@ static bool reorder_q4_0_coalesced_cpu(void * dst_coalesced, const void * src_ao
 }
 
 static void reorder_q8_0_cpu(void * dst_soa, const void * src_aos, int ncols, int nrows) {
-    const size_t blocks_per_row = ncols / QK8_0;
-    const size_t nblocks        = blocks_per_row * nrows;
-    const uint8_t * aos    = (const uint8_t *) src_aos;
-    uint8_t *       soa_qs = (uint8_t *) dst_soa;
-    uint8_t *       soa_d  = soa_qs + nblocks * QK8_0;
+    const size_t    blocks_per_row = ncols / QK8_0;
+    const size_t    nblocks        = blocks_per_row * nrows;
+    const uint8_t * aos            = (const uint8_t *) src_aos;
+    uint8_t *       soa_qs         = (uint8_t *) dst_soa;
+    uint8_t *       soa_d          = soa_qs + nblocks * QK8_0;
     for (size_t ib = 0; ib < nblocks; ib++) {
         const uint8_t * block_aos = aos + ib * sizeof(block_q8_0);
         memcpy(soa_qs + ib * QK8_0, block_aos + sizeof(ggml_half), QK8_0);
@@ -222,29 +221,23 @@ static bool reorder_q8_0_coalesced_cpu(void * dst_coalesced, const void * src_ao
     constexpr int WORDS_PER_BLOCK   = 8;
     constexpr int WORD_PLANE_STRIDE = TILE_BLOCKS * 4;
 
-    const size_t blocks_per_row = ncols / QK8_0;
-    const size_t nblocks        = blocks_per_row * nrows;
-    const size_t row_quants_bytes   = ncols;
+    const size_t blocks_per_row     = ncols / QK8_0;
+    const size_t nblocks            = blocks_per_row * nrows;
+    const size_t row_quants_bytes   = ggml_sycl_q8_0_coalesced_row_quants_bytes(static_cast<int>(blocks_per_row));
     const size_t total_quants_bytes = nrows * row_quants_bytes;
 
-    const uint8_t * aos = (const uint8_t *) src_aos;
-    uint8_t * coal_qs = (uint8_t *) dst_coalesced;
-    uint8_t * coal_d  = coal_qs + total_quants_bytes;
-
-    if (blocks_per_row % TILE_BLOCKS != 0) {
-        std::fprintf(stderr, "[sycl-kernel-bench] Q8_0 coalesced: blocks_per_row=%zu not divisible by %d\n",
-                     blocks_per_row, TILE_BLOCKS);
-        return false;
-    }
+    const uint8_t * aos     = (const uint8_t *) src_aos;
+    uint8_t *       coal_qs = (uint8_t *) dst_coalesced;
+    uint8_t *       coal_d  = coal_qs + total_quants_bytes;
 
     for (size_t ib = 0; ib < nblocks; ib++) {
-        const uint8_t * block_aos = aos + ib * sizeof(block_q8_0);
-        const uint8_t * src_qs    = block_aos + sizeof(ggml_half);
-        const size_t row           = ib / blocks_per_row;
-        const size_t col_block     = ib % blocks_per_row;
-        const size_t tile          = col_block / TILE_BLOCKS;
-        const size_t block_in_tile = col_block % TILE_BLOCKS;
-        const size_t tile_base = row * row_quants_bytes + tile * (TILE_BLOCKS * BYTES_PER_BLOCK);
+        const uint8_t * block_aos     = aos + ib * sizeof(block_q8_0);
+        const uint8_t * src_qs        = block_aos + sizeof(ggml_half);
+        const size_t    row           = ib / blocks_per_row;
+        const size_t    col_block     = ib % blocks_per_row;
+        const size_t    tile          = col_block / TILE_BLOCKS;
+        const size_t    block_in_tile = col_block % TILE_BLOCKS;
+        const size_t    tile_base     = row * row_quants_bytes + tile * (TILE_BLOCKS * BYTES_PER_BLOCK);
 
         for (int word = 0; word < WORDS_PER_BLOCK; word++) {
             const size_t word_offset = tile_base + word * WORD_PLANE_STRIDE + block_in_tile * 4;
@@ -272,10 +265,10 @@ static void reorder_q6_k_cpu(void * dst_soa, const void * src_aos, size_t nblock
 }
 
 static void reorder_q2_k_cpu(void * dst_soa, const void * src_aos, size_t nblocks) {
-    const uint8_t * aos           = (const uint8_t *) src_aos;
-    uint8_t *       soa_qs        = (uint8_t *) dst_soa;
-    uint8_t *       soa_scales    = soa_qs + nblocks * (QK_K / 4);
-    uint8_t *       soa_dm        = soa_scales + nblocks * (QK_K / 16);
+    const uint8_t * aos        = (const uint8_t *) src_aos;
+    uint8_t *       soa_qs     = (uint8_t *) dst_soa;
+    uint8_t *       soa_scales = soa_qs + nblocks * (QK_K / 4);
+    uint8_t *       soa_dm     = soa_scales + nblocks * (QK_K / 16);
 
     for (size_t ib = 0; ib < nblocks; ib++) {
         const uint8_t * block_aos = aos + ib * sizeof(block_q2_K);
@@ -318,10 +311,10 @@ static void reorder_q5_k_cpu(void * dst_soa, const void * src_aos, size_t nblock
 }
 
 static bool reorder_q6_k_coalesced_cpu(void * dst_coalesced, const void * src_aos, int ncols, int nrows) {
-    const int blocks_per_row = ncols / QK_K;
-    const size_t nblocks     = (size_t) blocks_per_row * nrows;
+    const int    blocks_per_row = ncols / QK_K;
+    const size_t nblocks        = (size_t) blocks_per_row * nrows;
     (void) nblocks;
-    const int num_tiles      = tile_count(blocks_per_row);
+    const int num_tiles = tile_count(blocks_per_row);
 
     size_t row_quants_bytes = 0;
     for (int t = 0; t < num_tiles; t++) {
@@ -329,22 +322,22 @@ static bool reorder_q6_k_coalesced_cpu(void * dst_coalesced, const void * src_ao
         row_quants_bytes += (size_t) ts * (128 + 64 + 16);
     }
 
-    const uint8_t * aos = (const uint8_t *) src_aos;
-    uint8_t * coal_d = (uint8_t *) dst_coalesced + (size_t) nrows * row_quants_bytes;
+    const uint8_t * aos    = (const uint8_t *) src_aos;
+    uint8_t *       coal_d = (uint8_t *) dst_coalesced + (size_t) nrows * row_quants_bytes;
 
     for (int row = 0; row < nrows; row++) {
-        uint8_t * row_dst = (uint8_t *) dst_coalesced + row * row_quants_bytes;
-        int block_idx = 0;
+        uint8_t * row_dst   = (uint8_t *) dst_coalesced + row * row_quants_bytes;
+        int       block_idx = 0;
         for (int tile = 0; tile < num_tiles; tile++) {
-            const int tile_size = tile_size_at(blocks_per_row, tile);
+            const int tile_size         = tile_size_at(blocks_per_row, tile);
             const int word_plane_stride = tile_size * 4;
-            uint8_t * tile_ql = row_dst;
-            uint8_t * tile_qh = tile_ql + tile_size * 128;
-            uint8_t * tile_sc = tile_qh + tile_size * 64;
+            uint8_t * tile_ql           = row_dst;
+            uint8_t * tile_qh           = tile_ql + tile_size * 128;
+            uint8_t * tile_sc           = tile_qh + tile_size * 64;
 
             for (int b = 0; b < tile_size; b++) {
-                const size_t global_block = (size_t) row * blocks_per_row + block_idx + b;
-                const uint8_t * block_aos = aos + global_block * sizeof(block_q6_K);
+                const size_t    global_block = (size_t) row * blocks_per_row + block_idx + b;
+                const uint8_t * block_aos    = aos + global_block * sizeof(block_q6_K);
 
                 const uint8_t * src_ql = block_aos;
                 for (int word = 0; word < 32; word++) {
@@ -373,11 +366,11 @@ static bool reorder_q6_k_coalesced_cpu(void * dst_coalesced, const void * src_ao
 }
 
 static void reorder_mxfp4_cpu(void * dst_soa, const void * src_aos, int ncols, int nrows) {
-    const size_t blocks_per_row = ncols / QK_MXFP4;
-    const size_t nblocks        = blocks_per_row * nrows;
-    const uint8_t * aos    = (const uint8_t *) src_aos;
-    uint8_t *       soa_qs = (uint8_t *) dst_soa;
-    uint8_t *       soa_e  = soa_qs + nblocks * (QK_MXFP4 / 2);
+    const size_t    blocks_per_row = ncols / QK_MXFP4;
+    const size_t    nblocks        = blocks_per_row * nrows;
+    const uint8_t * aos            = (const uint8_t *) src_aos;
+    uint8_t *       soa_qs         = (uint8_t *) dst_soa;
+    uint8_t *       soa_e          = soa_qs + nblocks * (QK_MXFP4 / 2);
 
     for (size_t ib = 0; ib < nblocks; ib++) {
         const block_mxfp4 * block = (const block_mxfp4 *) (aos + ib * sizeof(block_mxfp4));
@@ -392,14 +385,14 @@ static bool reorder_mxfp4_coalesced_cpu(void * dst_coalesced, const void * src_a
     constexpr int WORDS_PER_BLOCK   = 4;
     constexpr int WORD_PLANE_STRIDE = TILE_BLOCKS * 4;
 
-    const size_t blocks_per_row = ncols / QK_MXFP4;
-    const size_t nblocks        = blocks_per_row * nrows;
+    const size_t blocks_per_row     = ncols / QK_MXFP4;
+    const size_t nblocks            = blocks_per_row * nrows;
     const size_t row_quants_bytes   = ncols / 2;
     const size_t total_quants_bytes = nrows * row_quants_bytes;
 
-    const uint8_t * aos = (const uint8_t *) src_aos;
-    uint8_t * coal_qs = (uint8_t *) dst_coalesced;
-    uint8_t * coal_e  = coal_qs + total_quants_bytes;
+    const uint8_t * aos     = (const uint8_t *) src_aos;
+    uint8_t *       coal_qs = (uint8_t *) dst_coalesced;
+    uint8_t *       coal_e  = coal_qs + total_quants_bytes;
 
     if (blocks_per_row % TILE_BLOCKS != 0) {
         std::fprintf(stderr, "[sycl-kernel-bench] MXFP4 coalesced: blocks_per_row=%zu not divisible by %d\n",
@@ -408,13 +401,13 @@ static bool reorder_mxfp4_coalesced_cpu(void * dst_coalesced, const void * src_a
     }
 
     for (size_t ib = 0; ib < nblocks; ib++) {
-        const uint8_t * block_aos = aos + ib * sizeof(block_mxfp4);
-        const uint8_t * src_qs    = block_aos + 1;
-        const size_t row           = ib / blocks_per_row;
-        const size_t col_block     = ib % blocks_per_row;
-        const size_t tile          = col_block / TILE_BLOCKS;
-        const size_t block_in_tile = col_block % TILE_BLOCKS;
-        const size_t tile_base = row * row_quants_bytes + tile * (TILE_BLOCKS * BYTES_PER_BLOCK);
+        const uint8_t * block_aos     = aos + ib * sizeof(block_mxfp4);
+        const uint8_t * src_qs        = block_aos + 1;
+        const size_t    row           = ib / blocks_per_row;
+        const size_t    col_block     = ib % blocks_per_row;
+        const size_t    tile          = col_block / TILE_BLOCKS;
+        const size_t    block_in_tile = col_block % TILE_BLOCKS;
+        const size_t    tile_base     = row * row_quants_bytes + tile * (TILE_BLOCKS * BYTES_PER_BLOCK);
 
         for (int word = 0; word < WORDS_PER_BLOCK; word++) {
             const size_t word_offset = tile_base + word * WORD_PLANE_STRIDE + block_in_tile * 4;
@@ -426,26 +419,26 @@ static bool reorder_mxfp4_coalesced_cpu(void * dst_coalesced, const void * src_a
 }
 
 // Generate quantized weights (AoS), optionally plus layout-specific buffers.
-static inline bool generate_quantized_weights(const ggml_type type,
+static inline bool generate_quantized_weights(const ggml_type        type,
                                               const ggml_layout_mode layout_mode,
-                                              int64_t m,
-                                              int64_t k,
-                                              bool keep_fp32,
-                                              GeneratedWeights & out) {
+                                              int64_t                m,
+                                              int64_t                k,
+                                              bool                   keep_fp32,
+                                              GeneratedWeights &     out) {
     if (requires_block_alignment(type) && (k % ggml_blck_size(type) != 0)) {
-        std::fprintf(stderr, "[sycl-kernel-bench] Unsupported K=%lld for type %d (block size=%lld)\n",
-                     (long long) k, type, (long long) ggml_blck_size(type));
+        std::fprintf(stderr, "[sycl-kernel-bench] Unsupported K=%lld for type %d (block size=%lld)\n", (long long) k,
+                     type, (long long) ggml_blck_size(type));
         return false;
     }
 
-    const size_t row_size = ggml_row_size(type, k);
+    const size_t row_size    = ggml_row_size(type, k);
     const size_t total_bytes = row_size * m;
 
     out.aos.assign(total_bytes, 0);
-    out.bytes_aos = total_bytes;
+    out.bytes_aos   = total_bytes;
     out.layout_mode = layout_mode;
 
-    std::mt19937 rng(42);
+    std::mt19937       rng(42);
     std::vector<float> row_fp32((size_t) k);
 
     if (keep_fp32) {
@@ -472,17 +465,22 @@ static inline bool generate_quantized_weights(const ggml_type type,
     if (layout_mode == GGML_LAYOUT_SOA) {
         layout_bytes = ggml_row_size(type, k) * m;
     } else if (layout_mode == GGML_LAYOUT_COALESCED) {
-        layout_bytes = ggml_row_size(type, k) * m; // coarse allocation; may differ for Q6_K
-        if (type == GGML_TYPE_Q6_K) {
-            const int blocks_per_row = (int) (k / QK_K);
-            const int num_tiles = tile_count(blocks_per_row);
-            size_t row_quants_bytes = 0;
+        layout_bytes = ggml_row_size(type, k) * m;  // coarse allocation; may differ for padded/coalesced layouts
+        if (type == GGML_TYPE_Q8_0) {
+            const int    blocks_per_row   = (int) (k / QK8_0);
+            const size_t row_quants_bytes = ggml_sycl_q8_0_coalesced_row_quants_bytes(blocks_per_row);
+            const size_t nblocks          = (size_t) blocks_per_row * m;
+            layout_bytes                  = (size_t) m * row_quants_bytes + nblocks * sizeof(ggml_half);
+        } else if (type == GGML_TYPE_Q6_K) {
+            const int blocks_per_row   = (int) (k / QK_K);
+            const int num_tiles        = tile_count(blocks_per_row);
+            size_t    row_quants_bytes = 0;
             for (int t = 0; t < num_tiles; t++) {
                 const int ts = tile_size_at(blocks_per_row, t);
                 row_quants_bytes += (size_t) ts * (128 + 64 + 16);
             }
             const size_t nblocks = (size_t) blocks_per_row * m;
-            layout_bytes = (size_t) m * row_quants_bytes + nblocks * sizeof(ggml_half);
+            layout_bytes         = (size_t) m * row_quants_bytes + nblocks * sizeof(ggml_half);
         }
     }
 
@@ -492,27 +490,42 @@ static inline bool generate_quantized_weights(const ggml_type type,
     switch (layout_mode) {
         case GGML_LAYOUT_SOA:
             switch (type) {
-                case GGML_TYPE_Q4_0: reorder_q4_0_cpu(out.layout.data(), out.aos.data(), (int) k, (int) m); break;
-                case GGML_TYPE_Q8_0: reorder_q8_0_cpu(out.layout.data(), out.aos.data(), (int) k, (int) m); break;
-                case GGML_TYPE_Q6_K: reorder_q6_k_cpu(out.layout.data(), out.aos.data(), (size_t) (m * (k / QK_K))); break;
-                case GGML_TYPE_MXFP4: reorder_mxfp4_cpu(out.layout.data(), out.aos.data(), (int) k, (int) m); break;
-                case GGML_TYPE_Q4_K: {
-                    const size_t nblocks = (size_t) (m * (k / QK_K));
-                    const uint8_t * aos = out.aos.data();
-                    uint8_t * soa_qs = out.layout.data();
-                    uint8_t * soa_scales = soa_qs + nblocks * (QK_K / 2);
-                    uint8_t * soa_dm = soa_scales + nblocks * K_SCALE_SIZE;
-                    for (size_t ib = 0; ib < nblocks; ib++) {
-                        const uint8_t * block_aos = aos + ib * sizeof(block_q4_K);
-                        memcpy(soa_qs + ib * (QK_K / 2), block_aos + 4 + K_SCALE_SIZE, QK_K / 2);
-                        memcpy(soa_scales + ib * K_SCALE_SIZE, block_aos + 4, K_SCALE_SIZE);
-                        memcpy(soa_dm + ib * 4, block_aos, 4);
-                    }
+                case GGML_TYPE_Q4_0:
+                    reorder_q4_0_cpu(out.layout.data(), out.aos.data(), (int) k, (int) m);
                     break;
-                }
-                case GGML_TYPE_Q2_K: reorder_q2_k_cpu(out.layout.data(), out.aos.data(), (size_t) (m * (k / QK_K))); break;
-                case GGML_TYPE_Q3_K: reorder_q3_k_cpu(out.layout.data(), out.aos.data(), (size_t) (m * (k / QK_K))); break;
-                case GGML_TYPE_Q5_K: reorder_q5_k_cpu(out.layout.data(), out.aos.data(), (size_t) (m * (k / QK_K))); break;
+                case GGML_TYPE_Q8_0:
+                    reorder_q8_0_cpu(out.layout.data(), out.aos.data(), (int) k, (int) m);
+                    break;
+                case GGML_TYPE_Q6_K:
+                    reorder_q6_k_cpu(out.layout.data(), out.aos.data(), (size_t) (m * (k / QK_K)));
+                    break;
+                case GGML_TYPE_MXFP4:
+                    reorder_mxfp4_cpu(out.layout.data(), out.aos.data(), (int) k, (int) m);
+                    break;
+                case GGML_TYPE_Q4_K:
+                    {
+                        const size_t    nblocks    = (size_t) (m * (k / QK_K));
+                        const uint8_t * aos        = out.aos.data();
+                        uint8_t *       soa_qs     = out.layout.data();
+                        uint8_t *       soa_scales = soa_qs + nblocks * (QK_K / 2);
+                        uint8_t *       soa_dm     = soa_scales + nblocks * K_SCALE_SIZE;
+                        for (size_t ib = 0; ib < nblocks; ib++) {
+                            const uint8_t * block_aos = aos + ib * sizeof(block_q4_K);
+                            memcpy(soa_qs + ib * (QK_K / 2), block_aos + 4 + K_SCALE_SIZE, QK_K / 2);
+                            memcpy(soa_scales + ib * K_SCALE_SIZE, block_aos + 4, K_SCALE_SIZE);
+                            memcpy(soa_dm + ib * 4, block_aos, 4);
+                        }
+                        break;
+                    }
+                case GGML_TYPE_Q2_K:
+                    reorder_q2_k_cpu(out.layout.data(), out.aos.data(), (size_t) (m * (k / QK_K)));
+                    break;
+                case GGML_TYPE_Q3_K:
+                    reorder_q3_k_cpu(out.layout.data(), out.aos.data(), (size_t) (m * (k / QK_K)));
+                    break;
+                case GGML_TYPE_Q5_K:
+                    reorder_q5_k_cpu(out.layout.data(), out.aos.data(), (size_t) (m * (k / QK_K)));
+                    break;
                 default:
                     std::fprintf(stderr, "[sycl-kernel-bench] SoA layout unsupported for type %d\n", type);
                     return false;
@@ -521,10 +534,14 @@ static inline bool generate_quantized_weights(const ggml_type type,
 
         case GGML_LAYOUT_COALESCED:
             switch (type) {
-                case GGML_TYPE_Q4_0: return reorder_q4_0_coalesced_cpu(out.layout.data(), out.aos.data(), (int) k, (int) m);
-                case GGML_TYPE_Q8_0: return reorder_q8_0_coalesced_cpu(out.layout.data(), out.aos.data(), (int) k, (int) m);
-                case GGML_TYPE_Q6_K: return reorder_q6_k_coalesced_cpu(out.layout.data(), out.aos.data(), (int) k, (int) m);
-                case GGML_TYPE_MXFP4: return reorder_mxfp4_coalesced_cpu(out.layout.data(), out.aos.data(), (int) k, (int) m);
+                case GGML_TYPE_Q4_0:
+                    return reorder_q4_0_coalesced_cpu(out.layout.data(), out.aos.data(), (int) k, (int) m);
+                case GGML_TYPE_Q8_0:
+                    return reorder_q8_0_coalesced_cpu(out.layout.data(), out.aos.data(), (int) k, (int) m);
+                case GGML_TYPE_Q6_K:
+                    return reorder_q6_k_coalesced_cpu(out.layout.data(), out.aos.data(), (int) k, (int) m);
+                case GGML_TYPE_MXFP4:
+                    return reorder_mxfp4_coalesced_cpu(out.layout.data(), out.aos.data(), (int) k, (int) m);
                 default:
                     std::fprintf(stderr, "[sycl-kernel-bench] Coalesced layout unsupported for type %d\n", type);
                     return false;
@@ -539,11 +556,11 @@ static inline bool generate_quantized_weights(const ggml_type type,
 static inline GeneratedActivations generate_activations(int64_t batch,
                                                         int64_t k,
                                                         int64_t k_padded,
-                                                        bool keep_fp32,
-                                                        bool keep_fp16,
-                                                        bool use_soa_layout) {
+                                                        bool    keep_fp32,
+                                                        bool    keep_fp16,
+                                                        bool    use_soa_layout) {
     GeneratedActivations out;
-    out.k_padded = k_padded;
+    out.k_padded           = k_padded;
     const size_t row_bytes = (size_t) (k_padded / QK8_1) * sizeof(block_q8_1);
     out.q8_1.resize((size_t) batch * row_bytes);
     if (keep_fp32) {
@@ -553,7 +570,7 @@ static inline GeneratedActivations generate_activations(int64_t batch,
         out.fp16.resize((size_t) (batch * k_padded));
     }
 
-    std::mt19937 rng(42);
+    std::mt19937       rng(42);
     std::vector<float> row_fp32((size_t) k_padded);
 
     for (int64_t row = 0; row < batch; ++row) {
