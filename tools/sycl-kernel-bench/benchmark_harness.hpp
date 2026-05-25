@@ -1121,6 +1121,52 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                 }
                 break;
             }
+        case KernelKind::MXFP4_SELECTED_KMAJOR:
+            {
+                if (config.layout != GGML_LAYOUT_SOA) {
+                    out.error = "mxfp4_selected_kmajor requires SOA source weights.";
+                    return false;
+                }
+                GeneratedWeights weights;
+                if (!generate_quantized_weights(GGML_TYPE_MXFP4, GGML_LAYOUT_SOA, m, k, false, weights)) {
+                    out.error = "Failed to generate MXFP4 SOA weights for selected K-major benchmark.";
+                    return false;
+                }
+                const int64_t        selected_count = config.dim_n;
+                const bool           pair_glu       = config.kernel_name.find("pair_glu") != std::string::npos;
+                const bool           tile_read      = config.kernel_name.find("tile_read") != std::string::npos;
+                GeneratedActivations activations    = generate_activations(1, k, k, false, false, true);
+                if (!run_mxfp4_selected_kmajor(weights, activations, m, selected_count, k, pair_glu, tile_read,
+                                               config.validate, config.warmup_iterations, config.measure_iterations,
+                                               queue, metrics, error)) {
+                    out.error = error;
+                    return false;
+                }
+                break;
+            }
+        case KernelKind::MXFP4_SELECTED_XMX_DPAS:
+            {
+                if (config.layout != GGML_LAYOUT_SOA) {
+                    out.error = "mxfp4_selected_xmx_dpas_tile requires SOA source weights.";
+                    return false;
+                }
+                GeneratedWeights weights;
+                if (!generate_quantized_weights(GGML_TYPE_MXFP4, GGML_LAYOUT_SOA, m, k, false, weights)) {
+                    out.error = "Failed to generate MXFP4 SOA weights for selected XMX/DPAS benchmark.";
+                    return false;
+                }
+                const int64_t selected_count        = config.dim_n;
+                const int     xmx_tiles_n           = parse_moe_xmx_tiles_n(config.kernel_name);
+                const int     m_tiles_per_work_item = config.kernel_name.find("_m2") != std::string::npos ? 2 : 1;
+                GeneratedActivations activations    = generate_activations(1, k, k, false, false, true);
+                if (!run_mxfp4_selected_xmx_dpas_tile(weights, activations, m, selected_count, k, xmx_tiles_n,
+                                                      m_tiles_per_work_item, config.validate, config.warmup_iterations,
+                                                      config.measure_iterations, queue, metrics, error)) {
+                    out.error = error;
+                    return false;
+                }
+                break;
+            }
         case KernelKind::MXFP4_PAIR_GLU:
             {
                 if (config.layout != GGML_LAYOUT_SOA) {
@@ -1138,7 +1184,11 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                 const int            rows_per_wg    = parse_moe_rows_per_wg(config.kernel_name);
                 const bool           cache_y        = config.kernel_name.find("_cache") != std::string::npos &&
                                      config.kernel_name.find("_nocache") == std::string::npos;
-                const bool direct_xmx          = config.kernel_name.find("_xmx_") != std::string::npos;
+                const bool xmx_tiled           = config.kernel_name.find("_xmx_tiled") != std::string::npos;
+                const bool xmx_tiled_pack_q8   = config.kernel_name.find("_packed") != std::string::npos;
+                const bool xmx_tiled_prefetch  = config.kernel_name.find("_prefetch") != std::string::npos;
+                const int  xmx_tiled_m_tiles   = config.kernel_name.find("_m2") != std::string::npos ? 2 : 1;
+                const bool direct_xmx          = config.kernel_name.find("_xmx_soa") != std::string::npos;
                 const bool split_gate_up       = config.kernel_name.find("_split") != std::string::npos;
                 const bool predecoded_i8       = config.kernel_name.find("_predecoded") != std::string::npos;
                 const int  xmx_tiles_n         = parse_moe_xmx_tiles_n(config.kernel_name);
@@ -1149,10 +1199,11 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                 const bool sparse_expert_slots = config.kernel_name.find("_sparse32") != std::string::npos;
                 const bool use_bias            = config.kernel_name.find("_bias") != std::string::npos;
                 if (!run_mxfp4_pair_glu(weights, activations, m, selected_count, k, token_rows, rows_per_wg, cache_y,
-                                        direct_xmx, split_gate_up, predecoded_i8, xmx_tiles_n, vector_qs_load,
-                                        ignore_weight_scale, scale_stride_blocks, subgroup_size, sparse_expert_slots,
-                                        use_bias, config.validate, config.warmup_iterations, config.measure_iterations,
-                                        queue, metrics, error)) {
+                                        direct_xmx, xmx_tiled, xmx_tiled_pack_q8, xmx_tiled_prefetch, xmx_tiled_m_tiles,
+                                        split_gate_up, predecoded_i8, xmx_tiles_n, vector_qs_load, ignore_weight_scale,
+                                        scale_stride_blocks, subgroup_size, sparse_expert_slots, use_bias,
+                                        config.validate, config.warmup_iterations, config.measure_iterations, queue,
+                                        metrics, error)) {
                     out.error = error;
                     return false;
                 }
@@ -1185,6 +1236,33 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                                       predecoded_i8, config.validate, vector_qs_load, ignore_weight_scale,
                                       scale_stride_blocks, subgroup_size, sparse_expert_slots, config.warmup_iterations,
                                       config.measure_iterations, queue, metrics, error)) {
+                    out.error = error;
+                    return false;
+                }
+                break;
+            }
+        case KernelKind::MXFP4_MMV_ID_F32:
+            {
+                if (config.layout != GGML_LAYOUT_SOA) {
+                    out.error = "mxfp4_mmv_id_f32 requires SOA layout.";
+                    return false;
+                }
+                GeneratedWeights weights;
+                if (!generate_quantized_weights(GGML_TYPE_MXFP4, GGML_LAYOUT_SOA, m, k, false, weights)) {
+                    out.error = "Failed to generate MXFP4 SOA weights for F32 MMV-ID benchmark.";
+                    return false;
+                }
+                const int64_t        selected_count = config.dim_n;
+                const int64_t        token_rows     = parse_moe_token_rows(config.kernel_name);
+                GeneratedActivations activations =
+                    generate_activations(selected_count * token_rows, k, k, true, false, true);
+                const bool ignore_weight_scale = config.kernel_name.find("_noscale") != std::string::npos;
+                const int  scale_stride_blocks = parse_moe_scale_stride_blocks(config.kernel_name, k);
+                const int  subgroup_size       = parse_moe_subgroup_size(config.kernel_name);
+                const bool sparse_expert_slots = config.kernel_name.find("_sparse32") != std::string::npos;
+                if (!run_mxfp4_mmv_id_f32(weights, activations, m, selected_count, k, token_rows, ignore_weight_scale,
+                                          scale_stride_blocks, subgroup_size, sparse_expert_slots, config.validate,
+                                          config.warmup_iterations, config.measure_iterations, queue, metrics, error)) {
                     out.error = error;
                     return false;
                 }

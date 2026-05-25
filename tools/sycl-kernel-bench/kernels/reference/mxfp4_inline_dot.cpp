@@ -255,6 +255,98 @@ static inline int8_t mxfp4_code_value(uint8_t v) {
     return values[v & 0x0f];
 }
 
+static bool make_mxfp4_selected_kmajor_layout(const std::vector<uint8_t> & src,
+                                              int64_t                      m,
+                                              int64_t                      n_selected,
+                                              int64_t                      k,
+                                              std::vector<uint8_t> &       dst,
+                                              std::string &                error) {
+    if (m <= 0 || n_selected <= 0 || k <= 0 || (k % QK_MXFP4) != 0) {
+        error = "MXFP4 selected K-major layout requires positive M/selected/K and K divisible by QK_MXFP4.";
+        return false;
+    }
+
+    const int64_t blocks_per_row = k / QK_MXFP4;
+    const size_t  nblocks        = static_cast<size_t>(m) * static_cast<size_t>(blocks_per_row);
+    const size_t  qs_bytes       = nblocks * (QK_MXFP4 / 2);
+    const size_t  scale_bytes    = nblocks;
+    if (src.size() < qs_bytes + scale_bytes) {
+        error = "MXFP4 SOA source layout is too small for selected K-major conversion.";
+        return false;
+    }
+
+    constexpr size_t roles        = 2;  // gate and up
+    constexpr size_t record_bytes = sizeof(block_mxfp4);
+    const size_t     selected     = static_cast<size_t>(n_selected);
+    const size_t     rows         = static_cast<size_t>(m);
+    const size_t     blocks       = static_cast<size_t>(blocks_per_row);
+    dst.assign(blocks * selected * roles * rows * record_bytes, 0);
+
+    const uint8_t * src_qs     = src.data();
+    const uint8_t * src_scales = src.data() + qs_bytes;
+    for (size_t block = 0; block < blocks; ++block) {
+        for (size_t sel = 0; sel < selected; ++sel) {
+            for (size_t role = 0; role < roles; ++role) {
+                for (size_t row = 0; row < rows; ++row) {
+                    const size_t src_block = row * blocks + block;
+                    const size_t dst_slot  = (((block * selected + sel) * roles + role) * rows + row) * record_bytes;
+                    uint8_t *    record    = dst.data() + dst_slot;
+                    record[0]              = src_scales[src_block];
+                    std::copy(src_qs + src_block * (QK_MXFP4 / 2), src_qs + (src_block + 1) * (QK_MXFP4 / 2),
+                              record + 1);
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static inline float mxfp4_selected_kmajor_record_checksum(const uint8_t * record) {
+    float sum = static_cast<float>(record[0]);
+    for (int i = 0; i < QK_MXFP4 / 2; ++i) {
+        sum += static_cast<float>(record[1 + i]);
+    }
+    return sum;
+}
+
+static inline float mxfp4_selected_kmajor_dot_q8_1(const uint8_t * record, const int8_t * q8_qs, float q8_scale) {
+    const float scale = mxfp4_e8m0_to_fp32_device(record[0]) * q8_scale;
+    float       sum   = 0.0f;
+    for (int i = 0; i < QK_MXFP4 / 2; ++i) {
+        const uint8_t packed = record[1 + i];
+        sum += scale * mxfp4_value_device(packed & 0x0f) * static_cast<float>(q8_qs[static_cast<size_t>(i)]);
+        sum +=
+            scale * mxfp4_value_device(packed >> 4) * static_cast<float>(q8_qs[static_cast<size_t>(i + QK_MXFP4 / 2)]);
+    }
+    return sum;
+}
+
+static inline float mxfp4_selected_kmajor_q8_1_scale(const uint8_t * q8_row, int64_t k, int64_t block) {
+    const uint8_t *   scale_ptr = q8_row + static_cast<size_t>(k) + static_cast<size_t>(block) * sizeof(sycl::half2);
+    const sycl::half2 ds_vals   = *reinterpret_cast<const sycl::half2 *>(scale_ptr);
+    return static_cast<float>(ds_vals.x());
+}
+
+static inline float mxfp4_selected_kmajor_oai_glu(float gate, float up) {
+    constexpr float alpha        = 1.702f;
+    constexpr float limit        = 7.0f;
+    const float     gate_limited = sycl::fmin(gate, limit);
+    const float     up_limited   = sycl::fmax(sycl::fmin(up, limit), -limit);
+    return (gate_limited / (1.0f + sycl::native::exp(-gate_limited * alpha))) * (1.0f + up_limited);
+}
+
+static inline float mxfp4_e8m0_to_fp32_prod_host(uint8_t e) {
+    uint32_t bits;
+    if (e < 2) {
+        bits = e == 0 ? 0x00000000u : 0x33800000u;
+    } else {
+        bits = static_cast<uint32_t>(e - 1) << 23;
+    }
+    float result;
+    std::memcpy(&result, &bits, sizeof(float));
+    return result;
+}
+
 static inline float half_to_float_device(ggml_half v) {
     if constexpr (std::is_same_v<ggml_half, sycl::half>) {
         return static_cast<float>(v);
@@ -633,6 +725,241 @@ bool run_mxfp4_selected_read(const GeneratedWeights & weights,
     return true;
 }
 
+bool run_mxfp4_selected_kmajor(const GeneratedWeights &     weights,
+                               const GeneratedActivations & activations,
+                               int64_t                      m,
+                               int64_t                      n_selected,
+                               int64_t                      k,
+                               bool                         pair_glu,
+                               bool                         tile_read,
+                               bool                         validate,
+                               int                          warmup,
+                               int                          iterations,
+                               sycl::queue &                queue,
+                               ReferenceMetrics &           out,
+                               std::string &                error) {
+    if (m <= 0 || n_selected <= 0 || k <= 0 || (k % QK_MXFP4) != 0 || (k % QK8_1) != 0) {
+        error = "mxfp4_selected_kmajor requires positive M/selected/K and K divisible by QK_MXFP4/QK8_1.";
+        return false;
+    }
+    if (weights.layout_mode != GGML_LAYOUT_SOA || weights.layout.empty()) {
+        error = "mxfp4_selected_kmajor requires SOA MXFP4 source weights.";
+        return false;
+    }
+    if (pair_glu && activations.q8_1.empty()) {
+        error = "mxfp4_selected_kmajor_pair_glu requires SOA Q8_1 activations.";
+        return false;
+    }
+    if (pair_glu && tile_read) {
+        error = "mxfp4_selected_kmajor cannot combine pair_glu and tile_read modes.";
+        return false;
+    }
+
+    std::vector<uint8_t> kmajor_layout;
+    if (!make_mxfp4_selected_kmajor_layout(weights.layout, m, n_selected, k, kmajor_layout, error)) {
+        return false;
+    }
+
+    constexpr int    local_size     = 128;
+    constexpr size_t roles          = 2;
+    constexpr size_t record_bytes   = sizeof(block_mxfp4);
+    const int64_t    blocks_per_row = k / QK_MXFP4;
+    const size_t     selected_count = static_cast<size_t>(n_selected);
+    const size_t     rows           = static_cast<size_t>(m);
+    const size_t     out_count      = rows * selected_count;
+    const size_t     out_bytes      = out_count * sizeof(float);
+    const size_t     weight_bytes   = kmajor_layout.size();
+    const size_t     act_bytes      = pair_glu ? activations.q8_1.size() : 0;
+    const size_t     total_records  = weight_bytes / record_bytes;
+
+    uint8_t * d_weights = sycl::malloc_device<uint8_t>(weight_bytes, queue);
+    uint8_t * d_act     = pair_glu ? sycl::malloc_device<uint8_t>(act_bytes, queue) : nullptr;
+    float *   d_out     = sycl::malloc_device<float>(out_count, queue);
+
+    auto cleanup = [&]() {
+        if (d_weights) {
+            sycl::free(d_weights, queue);
+        }
+        if (d_act) {
+            sycl::free(d_act, queue);
+        }
+        if (d_out) {
+            sycl::free(d_out, queue);
+        }
+    };
+
+    if (!d_weights || !d_out || (pair_glu && !d_act)) {
+        cleanup();
+        error = "device allocation failed for mxfp4_selected_kmajor.";
+        return false;
+    }
+
+    queue.memcpy(d_weights, kmajor_layout.data(), weight_bytes);
+    if (pair_glu) {
+        queue.memcpy(d_act, activations.q8_1.data(), act_bytes);
+    }
+    queue.memset(d_out, 0, out_bytes);
+    queue.wait_and_throw();
+
+    auto submit_kernel = [&]() {
+        return queue.submit([&](sycl::handler & cgh) {
+            sycl::local_accessor<float, 1> partial_gate(sycl::range<1>(local_size), cgh);
+            sycl::local_accessor<float, 1> partial_up(sycl::range<1>(local_size), cgh);
+            cgh.parallel_for(
+                sycl::nd_range<2>(sycl::range<2>(out_count, local_size), sycl::range<2>(1, local_size)),
+                [=](sycl::nd_item<2> item) {
+                    const size_t task = item.get_group(0);
+                    const size_t sel  = task / rows;
+                    const size_t row  = task - sel * rows;
+                    const size_t lid  = item.get_local_id(1);
+
+                    float gate_sum = 0.0f;
+                    float up_sum   = 0.0f;
+                    if (tile_read) {
+                        const size_t linear_id     = task * static_cast<size_t>(local_size) + lid;
+                        const size_t linear_stride = out_count * static_cast<size_t>(local_size);
+                        for (size_t record_idx = linear_id; record_idx < total_records; record_idx += linear_stride) {
+                            const uint8_t * record = d_weights + record_idx * record_bytes;
+                            gate_sum += mxfp4_selected_kmajor_record_checksum(record);
+                        }
+                    } else {
+                        for (int64_t block = static_cast<int64_t>(lid); block < blocks_per_row; block += local_size) {
+                            const size_t base_slot =
+                                ((static_cast<size_t>(block) * selected_count + sel) * roles) * rows + row;
+                            const uint8_t * gate_record = d_weights + base_slot * record_bytes;
+                            const uint8_t * up_record   = d_weights + (base_slot + rows) * record_bytes;
+
+                            if (pair_glu) {
+                                const uint8_t * q8_row = d_act;
+                                const int8_t *  q8_qs =
+                                    reinterpret_cast<const int8_t *>(q8_row) + static_cast<size_t>(block) * QK8_1;
+                                const float q8_scale = mxfp4_selected_kmajor_q8_1_scale(q8_row, k, block);
+                                gate_sum += mxfp4_selected_kmajor_dot_q8_1(gate_record, q8_qs, q8_scale);
+                                up_sum += mxfp4_selected_kmajor_dot_q8_1(up_record, q8_qs, q8_scale);
+                            } else {
+                                gate_sum += mxfp4_selected_kmajor_record_checksum(gate_record);
+                                gate_sum += mxfp4_selected_kmajor_record_checksum(up_record);
+                            }
+                        }
+                    }
+
+                    partial_gate[lid] = gate_sum;
+                    partial_up[lid]   = up_sum;
+                    item.barrier(sycl::access::fence_space::local_space);
+                    for (size_t stride = local_size / 2; stride > 0; stride >>= 1) {
+                        if (lid < stride) {
+                            partial_gate[lid] += partial_gate[lid + stride];
+                            partial_up[lid] += partial_up[lid + stride];
+                        }
+                        item.barrier(sycl::access::fence_space::local_space);
+                    }
+                    if (lid == 0) {
+                        d_out[task] =
+                            pair_glu ? mxfp4_selected_kmajor_oai_glu(partial_gate[0], partial_up[0]) : partial_gate[0];
+                    }
+                });
+        });
+    };
+
+    for (int i = 0; i < warmup; ++i) {
+        submit_kernel();
+    }
+    queue.wait_and_throw();
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iterations; ++i) {
+        submit_kernel();
+    }
+    queue.wait_and_throw();
+    auto t1 = std::chrono::high_resolution_clock::now();
+
+    const double total_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+    const double mean_us  = (iterations > 0) ? total_us / iterations : 0.0;
+    const double mean_s   = mean_us * 1e-6;
+    const double ops =
+        pair_glu ? 4.0 * static_cast<double>(m) * static_cast<double>(n_selected) * static_cast<double>(k) : 0.0;
+    const double bytes =
+        static_cast<double>(weight_bytes) + static_cast<double>(act_bytes) + static_cast<double>(out_bytes);
+
+    out.total_us       = mean_us;
+    out.gemm_us        = mean_us;
+    out.tflops         = (mean_s > 0.0 && ops > 0.0) ? (ops / mean_s) / 1.0e12 : 0.0;
+    out.bandwidth_gbps = (mean_s > 0.0) ? (bytes / mean_s) / 1.0e9 : 0.0;
+
+    if (validate) {
+        std::vector<float> actual(out_count);
+        queue.memcpy(actual.data(), d_out, out_bytes).wait();
+
+        double max_err = 0.0;
+        double sum_err = 0.0;
+        for (size_t sel = 0; sel < selected_count; ++sel) {
+            for (size_t row = 0; row < rows; ++row) {
+                float        expected_gate = 0.0f;
+                float        expected_up   = 0.0f;
+                const size_t task          = sel * rows + row;
+                if (tile_read) {
+                    const size_t linear_stride = out_count * static_cast<size_t>(local_size);
+                    for (size_t lid = 0; lid < static_cast<size_t>(local_size); ++lid) {
+                        const size_t linear_id = task * static_cast<size_t>(local_size) + lid;
+                        for (size_t record_idx = linear_id; record_idx < total_records; record_idx += linear_stride) {
+                            const uint8_t * record = kmajor_layout.data() + record_idx * record_bytes;
+                            expected_gate += mxfp4_selected_kmajor_record_checksum(record);
+                        }
+                    }
+                } else {
+                    for (int64_t block = 0; block < blocks_per_row; ++block) {
+                        const size_t base_slot =
+                            ((static_cast<size_t>(block) * selected_count + sel) * roles) * rows + row;
+                        const uint8_t * gate_record = kmajor_layout.data() + base_slot * record_bytes;
+                        const uint8_t * up_record   = kmajor_layout.data() + (base_slot + rows) * record_bytes;
+
+                        if (pair_glu) {
+                            const uint8_t * q8_row = activations.q8_1.data();
+                            const int8_t *  q8_qs =
+                                reinterpret_cast<const int8_t *>(q8_row) + static_cast<size_t>(block) * QK8_1;
+                            const float q8_scale = mxfp4_selected_kmajor_q8_1_scale(q8_row, k, block);
+                            expected_gate += mxfp4_selected_kmajor_dot_q8_1(gate_record, q8_qs, q8_scale);
+                            expected_up += mxfp4_selected_kmajor_dot_q8_1(up_record, q8_qs, q8_scale);
+                        } else {
+                            expected_gate += mxfp4_selected_kmajor_record_checksum(gate_record);
+                            expected_gate += mxfp4_selected_kmajor_record_checksum(up_record);
+                        }
+                    }
+                }
+
+                float expected = expected_gate;
+                if (pair_glu) {
+                    constexpr float alpha        = 1.702f;
+                    constexpr float limit        = 7.0f;
+                    const float     gate_limited = std::fmin(expected_gate, limit);
+                    const float     up_limited   = std::fmax(std::fmin(expected_up, limit), -limit);
+                    expected = (gate_limited / (1.0f + std::exp(-gate_limited * alpha))) * (1.0f + up_limited);
+                }
+
+                const size_t idx  = sel * rows + row;
+                const double diff = std::fabs(static_cast<double>(actual[idx]) - static_cast<double>(expected));
+                max_err           = std::max(max_err, diff);
+                sum_err += diff;
+                const double tol = pair_glu ? (1e-2 + 1e-2 * std::fabs(static_cast<double>(expected))) : 1e-3;
+                if (!std::isfinite(actual[idx]) || diff > tol) {
+                    cleanup();
+                    char msg[256];
+                    std::snprintf(msg, sizeof(msg),
+                                  "mxfp4_selected_kmajor validation failed at %zu: actual=%.6f expected=%.6f "
+                                  "diff=%.6f tol=%.6f max=%.6f mean=%.6f.",
+                                  idx, static_cast<double>(actual[idx]), static_cast<double>(expected), diff, tol,
+                                  max_err, sum_err / static_cast<double>(idx + 1));
+                    error = msg;
+                    return false;
+                }
+            }
+        }
+    }
+
+    cleanup();
+    return true;
+}
+
 bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
                         const GeneratedActivations & activations,
                         int64_t                      m,
@@ -642,6 +969,10 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
                         int                          rows_per_wg,
                         bool                         cache_y,
                         bool                         direct_xmx,
+                        bool                         xmx_tiled,
+                        bool                         xmx_tiled_pack_q8,
+                        bool                         xmx_tiled_prefetch,
+                        int                          xmx_tiled_m_tiles,
                         bool                         split_gate_up,
                         bool                         predecoded_i8,
                         int                          xmx_tiles_n,
@@ -673,6 +1004,27 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
         error = "mxfp4_pair_glu predecoded_i8 requires split gate/up.";
         return false;
     }
+    if (xmx_tiled && (direct_xmx || split_gate_up || predecoded_i8 || vector_qs_load || scale_stride_blocks > 0)) {
+        error =
+            "mxfp4_pair_glu XMX_TILED path is exclusive with SOA-XMX/split/predecoded/vector/scale-stride variants.";
+        return false;
+    }
+    if (xmx_tiled_pack_q8 && !xmx_tiled) {
+        error = "mxfp4_pair_glu packed-Q8 variant requires XMX_TILED.";
+        return false;
+    }
+    if (xmx_tiled_prefetch && (!xmx_tiled || !xmx_tiled_pack_q8)) {
+        error = "mxfp4_pair_glu prefetch variant requires packed XMX_TILED.";
+        return false;
+    }
+    if (xmx_tiled_m_tiles != 1 && xmx_tiled_m_tiles != 2) {
+        error = "mxfp4_pair_glu XMX_TILED M-tile grouping must be 1 or 2.";
+        return false;
+    }
+    if (xmx_tiled_m_tiles != 1 && (!xmx_tiled || rows_per_wg != 8)) {
+        error = "mxfp4_pair_glu XMX_TILED M-tile grouping is only implemented for r8.";
+        return false;
+    }
     if (weights.layout_mode != GGML_LAYOUT_SOA || weights.layout.empty()) {
         error = "mxfp4_pair_glu requires SOA MXFP4 weights.";
         return false;
@@ -695,6 +1047,10 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
         error = "mxfp4_pair_glu direct-XMX tile count must be 1, 2, or 4.";
         return false;
     }
+    if (xmx_tiled && xmx_tiles_n != 1 && xmx_tiles_n != 2 && xmx_tiles_n != 4) {
+        error = "mxfp4_pair_glu XMX_TILED tile count must be 1, 2, or 4.";
+        return false;
+    }
 
     const size_t         selected_count = static_cast<size_t>(n_selected);
     const size_t         token_count    = static_cast<size_t>(n_tokens);
@@ -704,8 +1060,17 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
         return false;
     }
     std::vector<uint8_t> launch_layout;
+    int                  tiles_n = 0;
+    if (xmx_tiled && !select_mxfp4_xmx_tiles_n(queue, xmx_tiles_n, tiles_n, error)) {
+        return false;
+    }
     if (predecoded_i8) {
         if (!make_mxfp4_predecoded_i8_layout(expert_layout, m, k, scale_stride, launch_layout, error)) {
+            return false;
+        }
+    } else if (xmx_tiled) {
+        if (!make_mxfp4_xmx_tiled_layout(expert_layout, m, k, tiles_n * static_cast<int>(GGML_SYCL_MXFP4_MOE_XMX_N),
+                                         launch_layout, error)) {
             return false;
         }
     } else {
@@ -721,6 +1086,14 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     const size_t  bias_count           = static_cast<size_t>(m) * expert_slots;
     const size_t  bias_bytes           = bias_count * sizeof(float);
     const int64_t q8_row_bytes         = static_cast<int64_t>(k * sizeof(block_q8_1) / QK8_1);
+    const int64_t k_tiles              = k / GGML_SYCL_MXFP4_MOE_XMX_K;
+    const size_t  dpas_b_bytes         = xmx_tiled_pack_q8 ?
+                                             ids_count * static_cast<size_t>(k_tiles) *
+                                        static_cast<size_t>(GGML_SYCL_MXFP4_MOE_XMX_K * GGML_SYCL_MXFP4_MOE_XMX_N) :
+                                             0;
+    const size_t  dpas_y_bytes         = xmx_tiled_pack_q8 ? ids_count * static_cast<size_t>(k_tiles) *
+                                                        static_cast<size_t>(GGML_SYCL_MXFP4_MOE_XMX_N) * sizeof(float) :
+                                                             0;
 
     std::vector<uint8_t> gate_slices(weight_bytes);
     std::vector<uint8_t> up_slices(weight_bytes);
@@ -729,27 +1102,34 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
         std::copy(launch_layout.begin(), launch_layout.end(), up_slices.begin() + slot * expert_bytes);
     }
 
-    uint8_t *        d_gate      = sycl::malloc_device<uint8_t>(weight_bytes, queue);
-    uint8_t *        d_up        = sycl::malloc_device<uint8_t>(weight_bytes, queue);
-    const uint8_t ** d_gate_ptrs = sycl::malloc_device<const uint8_t *>(expert_slots, queue);
-    const uint8_t ** d_up_ptrs   = sycl::malloc_device<const uint8_t *>(expert_slots, queue);
+    uint8_t *        d_gate            = sycl::malloc_device<uint8_t>(weight_bytes, queue);
+    uint8_t *        d_up              = sycl::malloc_device<uint8_t>(weight_bytes, queue);
+    const uint8_t ** d_gate_ptrs       = sycl::malloc_device<const uint8_t *>(expert_slots, queue);
+    const uint8_t ** d_up_ptrs         = sycl::malloc_device<const uint8_t *>(expert_slots, queue);
+    const bool       needs_ref_weights = predecoded_i8 || xmx_tiled;
     uint8_t *        d_ref_gate =
-        predecoded_i8 ? sycl::malloc_device<uint8_t>(expert_layout.size() * expert_slots, queue) : nullptr;
+        needs_ref_weights ? sycl::malloc_device<uint8_t>(expert_layout.size() * expert_slots, queue) : nullptr;
     uint8_t * d_ref_up =
-        predecoded_i8 ? sycl::malloc_device<uint8_t>(expert_layout.size() * expert_slots, queue) : nullptr;
+        needs_ref_weights ? sycl::malloc_device<uint8_t>(expert_layout.size() * expert_slots, queue) : nullptr;
     const uint8_t ** d_ref_gate_ptrs =
-        predecoded_i8 ? sycl::malloc_device<const uint8_t *>(expert_slots, queue) : nullptr;
+        needs_ref_weights ? sycl::malloc_device<const uint8_t *>(expert_slots, queue) : nullptr;
     const uint8_t ** d_ref_up_ptrs =
-        predecoded_i8 ? sycl::malloc_device<const uint8_t *>(expert_slots, queue) : nullptr;
+        needs_ref_weights ? sycl::malloc_device<const uint8_t *>(expert_slots, queue) : nullptr;
     uint8_t *  d_act        = sycl::malloc_device<uint8_t>(act_bytes, queue);
     int32_t *  d_ids        = sycl::malloc_device<int32_t>(ids_count, queue);
     float *    d_out        = sycl::malloc_device<float>(out_count, queue);
     float *    d_gate_bias  = use_bias ? sycl::malloc_device<float>(bias_count, queue) : nullptr;
     float *    d_up_bias    = use_bias ? sycl::malloc_device<float>(bias_count, queue) : nullptr;
-    const bool need_ref_out = validate && (direct_xmx || split_gate_up || vector_qs_load);
+    const bool need_ref_out = validate && (direct_xmx || xmx_tiled || split_gate_up || vector_qs_load);
     float *    d_ref_out    = need_ref_out ? sycl::malloc_device<float>(out_count, queue) : nullptr;
     float *    d_gate_tmp   = split_gate_up ? sycl::malloc_device<float>(out_count, queue) : nullptr;
     float *    d_up_tmp     = split_gate_up ? sycl::malloc_device<float>(out_count, queue) : nullptr;
+    int8_t *   d_dpas_b =
+        xmx_tiled_pack_q8 ? sycl::malloc_device<int8_t>(dpas_b_bytes == 0 ? 1 : dpas_b_bytes, queue) : nullptr;
+    float * d_dpas_y =
+        xmx_tiled_pack_q8 ?
+            sycl::malloc_device<float>((dpas_y_bytes == 0 ? sizeof(float) : dpas_y_bytes) / sizeof(float), queue) :
+            nullptr;
 
     auto cleanup = [&]() {
         if (d_gate) {
@@ -800,12 +1180,18 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
         if (d_up_tmp) {
             sycl::free(d_up_tmp, queue);
         }
+        if (d_dpas_b) {
+            sycl::free(d_dpas_b, queue);
+        }
+        if (d_dpas_y) {
+            sycl::free(d_dpas_y, queue);
+        }
     };
 
     if (!d_gate || !d_up || !d_gate_ptrs || !d_up_ptrs || !d_act || !d_ids || !d_out ||
         (use_bias && (!d_gate_bias || !d_up_bias)) || (need_ref_out && !d_ref_out) ||
-        (split_gate_up && (!d_gate_tmp || !d_up_tmp)) ||
-        (predecoded_i8 && (!d_ref_gate || !d_ref_up || !d_ref_gate_ptrs || !d_ref_up_ptrs))) {
+        (split_gate_up && (!d_gate_tmp || !d_up_tmp)) || (xmx_tiled_pack_q8 && (!d_dpas_b || !d_dpas_y)) ||
+        (needs_ref_weights && (!d_ref_gate || !d_ref_up || !d_ref_gate_ptrs || !d_ref_up_ptrs))) {
         cleanup();
         error = "device allocation failed for mxfp4_pair_glu.";
         return false;
@@ -821,7 +1207,7 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     for (size_t slot = 0; slot < expert_slots; ++slot) {
         host_gate_ptrs[slot] = d_gate + slot * expert_bytes;
         host_up_ptrs[slot]   = d_up + slot * expert_bytes;
-        if (predecoded_i8) {
+        if (needs_ref_weights) {
             host_ref_gate_ptrs[slot] = d_ref_gate + slot * expert_layout.size();
             host_ref_up_ptrs[slot]   = d_ref_up + slot * expert_layout.size();
         }
@@ -837,7 +1223,7 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     queue.memcpy(d_up, up_slices.data(), weight_bytes);
     queue.memcpy(d_gate_ptrs, host_gate_ptrs.data(), expert_slots * sizeof(const uint8_t *));
     queue.memcpy(d_up_ptrs, host_up_ptrs.data(), expert_slots * sizeof(const uint8_t *));
-    if (predecoded_i8) {
+    if (needs_ref_weights) {
         std::vector<uint8_t> ref_gate_slices(expert_layout.size() * expert_slots);
         std::vector<uint8_t> ref_up_slices(expert_layout.size() * expert_slots);
         for (size_t slot = 0; slot < expert_slots; ++slot) {
@@ -873,6 +1259,8 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     args.output              = d_out;
     args.gate_tmp            = d_gate_tmp;
     args.up_tmp              = d_up_tmp;
+    args.dpas_b_packed       = d_dpas_b;
+    args.dpas_y_scales       = d_dpas_y;
     args.ids                 = d_ids;
     args.ncols               = static_cast<int>(k);
     args.ncols_y             = static_cast<int>(k);
@@ -894,9 +1282,13 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     args.rows_per_wg         = rows_per_wg;
     args.cache_y             = cache_y;
     args.direct_xmx          = direct_xmx;
+    args.xmx_tiled           = xmx_tiled;
+    args.xmx_tiled_pack_q8   = xmx_tiled_pack_q8;
+    args.xmx_tiled_prefetch  = xmx_tiled_prefetch;
+    args.xmx_tiled_m_tiles   = xmx_tiled_m_tiles;
     args.split_gate_up       = split_gate_up;
     args.predecoded_i8       = predecoded_i8;
-    args.xmx_tiles_n         = xmx_tiles_n;
+    args.xmx_tiles_n         = xmx_tiled ? tiles_n : xmx_tiles_n;
     args.vector_qs_load      = vector_qs_load;
     args.ignore_weight_scale = ignore_weight_scale;
     args.scale_stride_blocks = scale_stride_blocks;
@@ -965,19 +1357,25 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
             queue.memset(d_ref_out, 0, out_bytes).wait();
             ggml_sycl::mxfp4_pair_glu_bench_args ref_args = args;
             ref_args.output                               = d_ref_out;
-            if (predecoded_i8) {
+            if (needs_ref_weights) {
                 ref_args.gate_ptrs = reinterpret_cast<const void * const *>(d_ref_gate_ptrs);
                 ref_args.up_ptrs   = reinterpret_cast<const void * const *>(d_ref_up_ptrs);
             }
-            ref_args.direct_xmx     = false;
-            ref_args.split_gate_up  = false;
-            ref_args.predecoded_i8  = false;
-            ref_args.gate_tmp       = nullptr;
-            ref_args.up_tmp         = nullptr;
-            ref_args.xmx_tiles_n    = 1;
-            ref_args.vector_qs_load = false;
-            ref_args.rows_per_wg    = 1;
-            ref_args.cache_y        = false;
+            ref_args.direct_xmx         = false;
+            ref_args.xmx_tiled          = false;
+            ref_args.xmx_tiled_pack_q8  = false;
+            ref_args.xmx_tiled_prefetch = false;
+            ref_args.xmx_tiled_m_tiles  = 1;
+            ref_args.split_gate_up      = false;
+            ref_args.predecoded_i8      = false;
+            ref_args.gate_tmp           = nullptr;
+            ref_args.up_tmp             = nullptr;
+            ref_args.dpas_b_packed      = nullptr;
+            ref_args.dpas_y_scales      = nullptr;
+            ref_args.xmx_tiles_n        = 1;
+            ref_args.vector_qs_load     = false;
+            ref_args.rows_per_wg        = 1;
+            ref_args.cache_y            = false;
             if (!ggml_sycl::ggml_sycl_mxfp4_pair_glu_bench_launch(ref_args)) {
                 cleanup();
                 error = "mxfp4_pair_glu reference launch rejected.";
@@ -1292,6 +1690,267 @@ bool run_mxfp4_layer_glu_down(const GeneratedWeights &     weights,
             if (!std::isfinite(value)) {
                 cleanup();
                 error = "mxfp4_layer_glu_down validation failed: non-finite output.";
+                return false;
+            }
+        }
+    }
+
+    cleanup();
+    return true;
+}
+
+template <int LocalSize> struct mxfp4_mmv_id_f32_kernel;
+
+template <int LocalSize>
+static sycl::event launch_mxfp4_mmv_id_f32_kernel(const uint8_t * const * expert_ptrs,
+                                                  const float *           activations_f32,
+                                                  float *                 output,
+                                                  const int32_t *         ids,
+                                                  int                     ncols,
+                                                  int                     nrows_per_expert,
+                                                  int                     total_batches,
+                                                  int                     n_ids,
+                                                  int                     n_tokens,
+                                                  int64_t                 ids_nb0,
+                                                  int64_t                 ids_nb1,
+                                                  int64_t                 act_nb1,
+                                                  int64_t                 act_nb2,
+                                                  int64_t                 dst_nb1,
+                                                  int64_t                 dst_nb2,
+                                                  int                     scale_stride_blocks,
+                                                  bool                    apply_weight_scale,
+                                                  sycl::queue &           queue) {
+    constexpr int qbytes_per_block = QK_MXFP4 / 2;
+    const int     blocks_per_row   = ncols / QK_MXFP4;
+    const int     scale_stride     = scale_stride_blocks > 0 ? scale_stride_blocks : blocks_per_row;
+    const size_t  qs_bytes         = static_cast<size_t>(nrows_per_expert) * static_cast<size_t>(blocks_per_row) *
+                            static_cast<size_t>(qbytes_per_block);
+
+    return queue.submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> partial(sycl::range<1>(LocalSize), cgh);
+        cgh.parallel_for<mxfp4_mmv_id_f32_kernel<LocalSize>>(
+            sycl::nd_range<2>(sycl::range<2>(static_cast<size_t>(total_batches) * static_cast<size_t>(nrows_per_expert),
+                                             static_cast<size_t>(LocalSize)),
+                              sycl::range<2>(1, static_cast<size_t>(LocalSize))),
+            [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(LocalSize)]] {
+                const size_t task  = item.get_group(0);
+                const int    row   = static_cast<int>(task % static_cast<size_t>(nrows_per_expert));
+                const int    batch = static_cast<int>(task / static_cast<size_t>(nrows_per_expert));
+                const int    token = batch / n_ids;
+                const int    sel   = batch - token * n_ids;
+                const int    lid   = static_cast<int>(item.get_local_id(1));
+
+                const auto * ids_base = reinterpret_cast<const int32_t *>(reinterpret_cast<const uint8_t *>(ids) +
+                                                                          static_cast<size_t>(token) * ids_nb1);
+                const int    expert   = *reinterpret_cast<const int32_t *>(reinterpret_cast<const uint8_t *>(ids_base) +
+                                                                           static_cast<size_t>(sel) * ids_nb0);
+                const uint8_t * weight = expert_ptrs[expert];
+                const float * act = reinterpret_cast<const float *>(reinterpret_cast<const uint8_t *>(activations_f32) +
+                                                                    static_cast<size_t>(token) * act_nb2 +
+                                                                    static_cast<size_t>(sel) * act_nb1);
+                float *       dst = reinterpret_cast<float *>(reinterpret_cast<uint8_t *>(output) +
+                                                              static_cast<size_t>(token) * dst_nb2 +
+                                                              static_cast<size_t>(sel) * dst_nb1);
+
+                const uint8_t * qs_base     = weight;
+                const uint8_t * scales_base = weight + qs_bytes;
+                float           sum         = 0.0f;
+                for (int block = lid; block < blocks_per_row; block += LocalSize) {
+                    const size_t block_idx =
+                        static_cast<size_t>(row) * static_cast<size_t>(blocks_per_row) + static_cast<size_t>(block);
+                    const uint8_t * qs = qs_base + block_idx * qbytes_per_block;
+                    const float     scale =
+                        apply_weight_scale ?
+                                mxfp4_e8m0_to_fp32_device(
+                                scales_base[static_cast<size_t>(row) * static_cast<size_t>(scale_stride) +
+                                            static_cast<size_t>(block)]) :
+                                1.0f;
+                    const int act_base = block * QK_MXFP4;
+                    for (int i = 0; i < QK_MXFP4 / 2; ++i) {
+                        const uint8_t packed = qs[i];
+                        sum += scale * mxfp4_value_device(packed & 0x0f) * act[act_base + i];
+                        sum += scale * mxfp4_value_device(packed >> 4) * act[act_base + QK_MXFP4 / 2 + i];
+                    }
+                }
+
+                partial[lid] = sum;
+                item.barrier(sycl::access::fence_space::local_space);
+                for (int stride = LocalSize / 2; stride > 0; stride >>= 1) {
+                    if (lid < stride) {
+                        partial[lid] += partial[lid + stride];
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+                if (lid == 0) {
+                    dst[row] = partial[0];
+                }
+            });
+    });
+}
+
+bool run_mxfp4_mmv_id_f32(const GeneratedWeights &     weights,
+                          const GeneratedActivations & activations,
+                          int64_t                      m,
+                          int64_t                      n_selected,
+                          int64_t                      k,
+                          int64_t                      n_tokens,
+                          bool                         ignore_weight_scale,
+                          int                          scale_stride_blocks,
+                          int                          subgroup_size,
+                          bool                         sparse_expert_slots,
+                          bool                         validate,
+                          int                          warmup,
+                          int                          iterations,
+                          sycl::queue &                queue,
+                          ReferenceMetrics &           out,
+                          std::string &                error) {
+    if (m <= 0 || n_selected <= 0 || n_tokens <= 0 || k <= 0 || (k % QK_MXFP4) != 0) {
+        error = "mxfp4_mmv_id_f32 requires positive M/selected/tokens/K and K divisible by QK_MXFP4.";
+        return false;
+    }
+    if (subgroup_size != 16 && subgroup_size != 32) {
+        error = "mxfp4_mmv_id_f32 subgroup_size must be 16 or 32.";
+        return false;
+    }
+    if (weights.layout_mode != GGML_LAYOUT_SOA || weights.layout.empty()) {
+        error = "mxfp4_mmv_id_f32 requires SOA MXFP4 weights.";
+        return false;
+    }
+    const size_t selected_count = static_cast<size_t>(n_selected);
+    const size_t token_count    = static_cast<size_t>(n_tokens);
+    if (activations.fp32.size() < selected_count * token_count * static_cast<size_t>(k)) {
+        error = "mxfp4_mmv_id_f32 requires F32 activations for every selected token row.";
+        return false;
+    }
+
+    const int blocks_per_row = static_cast<int>(k / QK_MXFP4);
+    const int scale_stride   = scale_stride_blocks > 0 ? scale_stride_blocks : blocks_per_row;
+    if (scale_stride < blocks_per_row) {
+        error = "mxfp4_mmv_id_f32 scale stride must be at least K / QK_MXFP4.";
+        return false;
+    }
+
+    std::vector<uint8_t> expert_layout;
+    if (!make_mxfp4_soa_scale_stride_layout(weights.layout, m, k, scale_stride, expert_layout, error)) {
+        return false;
+    }
+
+    const size_t ids_count    = selected_count * token_count;
+    const size_t expert_slots = sparse_expert_slots ? std::max<size_t>(32, selected_count) : selected_count;
+    const size_t weight_bytes = expert_layout.size() * expert_slots;
+    const size_t act_count    = selected_count * token_count * static_cast<size_t>(k);
+    const size_t act_bytes    = act_count * sizeof(float);
+    const size_t out_count    = static_cast<size_t>(m) * selected_count * token_count;
+    const size_t out_bytes    = out_count * sizeof(float);
+
+    std::vector<uint8_t> weight_slices(weight_bytes);
+    for (size_t slot = 0; slot < expert_slots; ++slot) {
+        std::copy(expert_layout.begin(), expert_layout.end(), weight_slices.begin() + slot * expert_layout.size());
+    }
+
+    uint8_t *        d_weights = sycl::malloc_device<uint8_t>(weight_bytes, queue);
+    const uint8_t ** d_ptrs    = sycl::malloc_device<const uint8_t *>(expert_slots, queue);
+    float *          d_act     = sycl::malloc_device<float>(act_count, queue);
+    int32_t *        d_ids     = sycl::malloc_device<int32_t>(ids_count, queue);
+    float *          d_out     = sycl::malloc_device<float>(out_count, queue);
+
+    auto cleanup = [&]() {
+        if (d_weights) {
+            sycl::free(d_weights, queue);
+        }
+        if (d_ptrs) {
+            sycl::free(d_ptrs, queue);
+        }
+        if (d_act) {
+            sycl::free(d_act, queue);
+        }
+        if (d_ids) {
+            sycl::free(d_ids, queue);
+        }
+        if (d_out) {
+            sycl::free(d_out, queue);
+        }
+    };
+
+    if (!d_weights || !d_ptrs || !d_act || !d_ids || !d_out) {
+        cleanup();
+        error = "device allocation failed for mxfp4_mmv_id_f32.";
+        return false;
+    }
+
+    std::vector<const uint8_t *> host_ptrs(expert_slots);
+    std::vector<int32_t>         host_ids(ids_count);
+    for (size_t slot = 0; slot < expert_slots; ++slot) {
+        host_ptrs[slot] = d_weights + slot * expert_layout.size();
+    }
+    for (size_t token = 0; token < token_count; ++token) {
+        for (size_t sel = 0; sel < selected_count; ++sel) {
+            const size_t slot = sparse_expert_slots ? sparse_expert_slot(sel, selected_count, expert_slots) : sel;
+            host_ids[token * selected_count + sel] = static_cast<int32_t>(slot);
+        }
+    }
+
+    queue.memcpy(d_weights, weight_slices.data(), weight_bytes);
+    queue.memcpy(d_ptrs, host_ptrs.data(), expert_slots * sizeof(const uint8_t *));
+    queue.memcpy(d_act, activations.fp32.data(), act_bytes);
+    queue.memcpy(d_ids, host_ids.data(), ids_count * sizeof(int32_t));
+    queue.memset(d_out, 0, out_bytes);
+    queue.wait_and_throw();
+
+    const int     total_batches = static_cast<int>(ids_count);
+    const int64_t act_nb1       = static_cast<int64_t>(k * sizeof(float));
+    const int64_t act_nb2       = static_cast<int64_t>(selected_count * static_cast<size_t>(k) * sizeof(float));
+    const int64_t dst_nb1       = static_cast<int64_t>(m * sizeof(float));
+    const int64_t dst_nb2       = static_cast<int64_t>(selected_count * static_cast<size_t>(m) * sizeof(float));
+    auto          launch        = [&]() {
+        if (subgroup_size == 16) {
+            return launch_mxfp4_mmv_id_f32_kernel<16>(
+                d_ptrs, d_act, d_out, d_ids, static_cast<int>(k), static_cast<int>(m), total_batches,
+                static_cast<int>(n_selected), static_cast<int>(n_tokens), sizeof(int32_t),
+                static_cast<int64_t>(selected_count * sizeof(int32_t)), act_nb1, act_nb2, dst_nb1, dst_nb2,
+                scale_stride, !ignore_weight_scale, queue);
+        }
+        return launch_mxfp4_mmv_id_f32_kernel<32>(d_ptrs, d_act, d_out, d_ids, static_cast<int>(k), static_cast<int>(m),
+                                                                  total_batches, static_cast<int>(n_selected),
+                                                                  static_cast<int>(n_tokens), sizeof(int32_t),
+                                                                  static_cast<int64_t>(selected_count * sizeof(int32_t)), act_nb1,
+                                                                  act_nb2, dst_nb1, dst_nb2, scale_stride, !ignore_weight_scale, queue);
+    };
+
+    for (int i = 0; i < warmup; ++i) {
+        launch();
+    }
+    queue.wait_and_throw();
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iterations; ++i) {
+        launch();
+    }
+    queue.wait_and_throw();
+    auto t1 = std::chrono::high_resolution_clock::now();
+
+    const double total_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+    const double mean_us  = (iterations > 0) ? total_us / iterations : 0.0;
+    const double mean_s   = mean_us * 1e-6;
+    const double ops = 2.0 * static_cast<double>(m) * static_cast<double>(n_selected) * static_cast<double>(n_tokens) *
+                       static_cast<double>(k);
+    const double bytes =
+        static_cast<double>(weights.layout.size()) * static_cast<double>(n_selected) * static_cast<double>(n_tokens) +
+        static_cast<double>(act_bytes) + static_cast<double>(out_bytes) +
+        static_cast<double>(ids_count * sizeof(int32_t)) + static_cast<double>(expert_slots * sizeof(const uint8_t *));
+
+    out.total_us       = mean_us;
+    out.gemm_us        = mean_us;
+    out.tflops         = (mean_s > 0.0) ? (ops / mean_s) / 1.0e12 : 0.0;
+    out.bandwidth_gbps = (mean_s > 0.0) ? (bytes / mean_s) / 1.0e9 : 0.0;
+
+    if (validate) {
+        std::vector<float> actual(out_count);
+        queue.memcpy(actual.data(), d_out, out_bytes).wait();
+        for (float value : actual) {
+            if (!std::isfinite(value)) {
+                cleanup();
+                error = "mxfp4_mmv_id_f32 validation failed: non-finite output.";
                 return false;
             }
         }
@@ -1794,6 +2453,44 @@ SYCL_ESIMD_FUNCTION inline sycl::ext::intel::esimd::simd<int8_t, N> mxfp4_code_v
     return values;
 }
 
+template <int N>
+SYCL_ESIMD_FUNCTION inline sycl::ext::intel::esimd::simd<float, N> mxfp4_e8m0_to_fp32_prod_esimd(
+    sycl::ext::intel::esimd::simd<uint8_t, N> e) {
+    using namespace sycl::ext::intel::esimd;
+    simd<uint32_t, N> bits = (convert<uint32_t>(e) - uint32_t{ 1 }) << 23;
+    bits.merge(simd<uint32_t, N>(0x00000000u), e == uint8_t{ 0 });
+    bits.merge(simd<uint32_t, N>(0x33800000u), e == uint8_t{ 1 });
+    return bits.template bit_cast_view<float>();
+}
+
+template <int Repeat>
+SYCL_ESIMD_FUNCTION inline void mxfp4_xmx_tiled_load_a_vec_from_group_local(
+    const uint8_t *                                                             group,
+    int64_t                                                                     tile_n_total,
+    int64_t                                                                     xmx_row_in_group,
+    sycl::ext::intel::esimd::simd<int8_t, Repeat * GGML_SYCL_MXFP4_MOE_XMX_K> & a_vec,
+    sycl::ext::intel::esimd::simd<float, Repeat> &                              w_scale_vec) {
+    using namespace sycl::ext::intel::esimd;
+    constexpr int k_per         = GGML_SYCL_MXFP4_MOE_XMX_K;
+    constexpr int packed_bytes  = k_per / 2;
+    constexpr int compact_bytes = Repeat * packed_bytes;
+
+    const uint8_t * scale_ptr  = group + xmx_row_in_group;
+    const uint8_t * packed_ptr = group + tile_n_total + xmx_row_in_group * packed_bytes;
+
+    simd<uint8_t, Repeat>        scale_bytes = block_load<uint8_t, Repeat>(scale_ptr);
+    simd<uint8_t, compact_bytes> packed      = block_load<uint8_t, compact_bytes>(packed_ptr);
+    w_scale_vec                              = mxfp4_e8m0_to_fp32_prod_esimd<Repeat>(scale_bytes);
+#    pragma unroll
+    for (int r = 0; r < Repeat; ++r) {
+        simd<uint8_t, packed_bytes> row = packed.template select<packed_bytes, 1>(r * packed_bytes);
+        simd<uint8_t, k_per>        codes;
+        codes.template select<packed_bytes, 1>(0)            = row & uint8_t{ 0x0f };
+        codes.template select<packed_bytes, 1>(packed_bytes) = row >> 4;
+        a_vec.template select<k_per, 1>(r * k_per)           = mxfp4_code_values_esimd<k_per>(codes);
+    }
+}
+
 SYCL_ESIMD_FUNCTION inline float mxfp4_e8m0_to_fp32_half_esimd_local(uint8_t e) {
     uint32_t bits = e == 0 ? 0x00400000u : (static_cast<uint32_t>(e - 1) << 23);
     float    result;
@@ -2128,6 +2825,454 @@ static bool launch_mxfp4_dpas_compact_bytescale_kernel(const uint8_t *,
     return false;
 }
 #endif
+
+#if DPAS_EXPLORATION_ESIMD_AVAILABLE
+template <int Repeat>
+SYCL_ESIMD_FUNCTION inline void mxfp4_selected_xmx_dpas_accum_one(
+    const uint8_t *                                                                                      gate_base,
+    const uint8_t *                                                                                      up_base,
+    const sycl::ext::intel::esimd::simd<int8_t, GGML_SYCL_MXFP4_MOE_XMX_K * GGML_SYCL_MXFP4_MOE_XMX_N> & b_vec,
+    sycl::ext::intel::esimd::simd<float, 1>                                                              y_scale,
+    int64_t                                                                                              kt,
+    int64_t                                        n_tile_groups_n,
+    int64_t                                        group_bytes,
+    int64_t                                        tile_n_total,
+    int64_t                                        xmx_group_n,
+    int64_t                                        xmx_row_in_group,
+    sycl::ext::intel::esimd::simd<float, Repeat> & gate_acc,
+    sycl::ext::intel::esimd::simd<float, Repeat> & up_acc) {
+    using namespace sycl::ext::intel::esimd;
+    constexpr int exec_n = GGML_SYCL_MXFP4_MOE_XMX_N;
+    constexpr int k_per  = GGML_SYCL_MXFP4_MOE_XMX_K;
+    constexpr int an     = Repeat * k_per;
+
+    const uint8_t * gate_group = gate_base + (kt * n_tile_groups_n + xmx_group_n) * group_bytes;
+    const uint8_t * up_group   = up_base + (kt * n_tile_groups_n + xmx_group_n) * group_bytes;
+
+    simd<int8_t, an>    gate_a_vec;
+    simd<int8_t, an>    up_a_vec;
+    simd<float, Repeat> gate_w_scale;
+    simd<float, Repeat> up_w_scale;
+    mxfp4_xmx_tiled_load_a_vec_from_group_local<Repeat>(gate_group, tile_n_total, xmx_row_in_group, gate_a_vec,
+                                                        gate_w_scale);
+    mxfp4_xmx_tiled_load_a_vec_from_group_local<Repeat>(up_group, tile_n_total, xmx_row_in_group, up_a_vec, up_w_scale);
+
+    simd<int, Repeat * exec_n> gate_part = 0;
+    simd<int, Repeat * exec_n> up_part   = 0;
+    gate_part                            = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(gate_part, b_vec, gate_a_vec);
+    up_part                              = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(up_part, b_vec, up_a_vec);
+#    pragma unroll
+    for (int r = 0; r < Repeat; ++r) {
+        simd<int, 1>   gate_i = gate_part.template select<1, 1>(r * exec_n);
+        simd<int, 1>   up_i   = up_part.template select<1, 1>(r * exec_n);
+        simd<float, 1> gate_f = convert<float>(gate_i) * (y_scale * gate_w_scale[r]);
+        simd<float, 1> up_f   = convert<float>(up_i) * (y_scale * up_w_scale[r]);
+        gate_acc[r] += gate_f[0];
+        up_acc[r] += up_f[0];
+    }
+}
+
+SYCL_ESIMD_FUNCTION inline float mxfp4_selected_xmx_oai_glu_esimd(float gate, float up) {
+    using namespace sycl::ext::intel::esimd;
+    constexpr float alpha        = 1.702f;
+    constexpr float limit        = 7.0f;
+    const float     gate_limited = gate < limit ? gate : limit;
+    float           up_limited   = up < limit ? up : limit;
+    up_limited                   = up_limited > -limit ? up_limited : -limit;
+    return (gate_limited / (1.0f + exp(-gate_limited * alpha))) * (1.0f + up_limited);
+}
+
+template <int Repeat>
+SYCL_ESIMD_FUNCTION inline void mxfp4_selected_xmx_store_one(float * dst,
+                                                             int64_t nrows_per_expert,
+                                                             int64_t selected_slot,
+                                                             int64_t tile_m,
+                                                             sycl::ext::intel::esimd::simd<float, Repeat> gate_acc,
+                                                             sycl::ext::intel::esimd::simd<float, Repeat> up_acc) {
+    using namespace sycl::ext::intel::esimd;
+#    pragma unroll
+    for (int r = 0; r < Repeat; ++r) {
+        const int row = static_cast<int>(tile_m) * Repeat + r;
+        if (row < nrows_per_expert) {
+            const float value = mxfp4_selected_xmx_oai_glu_esimd(gate_acc[r], up_acc[r]);
+            block_store<float, 1>(dst + selected_slot * nrows_per_expert + row, simd<float, 1>(value));
+        }
+    }
+}
+
+template <int Repeat, bool M2> struct mxfp4_selected_xmx_dpas_tile_kernel;
+
+template <int Repeat, bool M2>
+static bool launch_mxfp4_selected_xmx_dpas_tile_kernel(const uint8_t * selected_tiles,
+                                                       const uint8_t * q8_src,
+                                                       float *         dst,
+                                                       int64_t         nrows_per_expert,
+                                                       int64_t         n_selected,
+                                                       int64_t         ncols,
+                                                       int64_t         ncols_y,
+                                                       int64_t         expert_bytes,
+                                                       int64_t         tile_n_total,
+                                                       sycl::queue &   queue,
+                                                       std::string &   error) {
+    constexpr int exec_n = GGML_SYCL_MXFP4_MOE_XMX_N;
+    constexpr int k_per  = GGML_SYCL_MXFP4_MOE_XMX_K;
+    constexpr int bn     = k_per * exec_n;
+
+    if (!selected_tiles || !q8_src || !dst) {
+        error = "mxfp4_selected_xmx_dpas_tile buffers are null.";
+        return false;
+    }
+    if (nrows_per_expert <= 0 || n_selected <= 0 || n_selected > 4 || ncols <= 0 || (ncols % k_per) != 0 ||
+        tile_n_total < Repeat || (tile_n_total % Repeat) != 0 || expert_bytes <= 0) {
+        error = "mxfp4_selected_xmx_dpas_tile received invalid dimensions.";
+        return false;
+    }
+
+    const int64_t m_tiles         = (nrows_per_expert + Repeat - 1) / Repeat;
+    const int64_t work_m_tiles    = M2 ? (m_tiles + 1) / 2 : m_tiles;
+    const int64_t k_tiles         = ncols / k_per;
+    const int64_t n_tile_groups_n = (nrows_per_expert + tile_n_total - 1) / tile_n_total;
+    const int64_t group_bytes     = tile_n_total * (1 + k_per / 2);
+
+    sycl::event ev = queue.submit([&](sycl::handler & h) {
+        h.parallel_for<mxfp4_selected_xmx_dpas_tile_kernel<Repeat, M2>>(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(work_m_tiles)), sycl::range<1>(1)),
+            [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL DPAS_NUM_REGS(256) {
+                using namespace sycl::ext::intel::esimd;
+                const int64_t work_tile = static_cast<int64_t>(item.get_global_id(0));
+                const int64_t tile_m0   = M2 ? work_tile * 2 : work_tile;
+                const int64_t tile_m1   = tile_m0 + 1;
+                const bool    have_m1   = M2 && tile_m1 < m_tiles;
+
+                const int64_t xmx_row_start0    = tile_m0 * Repeat;
+                const int64_t xmx_group_n0      = xmx_row_start0 / tile_n_total;
+                const int64_t xmx_row_in_group0 = xmx_row_start0 - xmx_group_n0 * tile_n_total;
+                const int64_t xmx_row_start1    = tile_m1 * Repeat;
+                const int64_t xmx_group_n1      = xmx_row_start1 / tile_n_total;
+                const int64_t xmx_row_in_group1 = xmx_row_start1 - xmx_group_n1 * tile_n_total;
+
+                const uint8_t * gate_base0 = selected_tiles + 0 * 2 * expert_bytes;
+                const uint8_t * up_base0   = gate_base0 + expert_bytes;
+                const uint8_t * gate_base1 = selected_tiles + 1 * 2 * expert_bytes;
+                const uint8_t * up_base1   = gate_base1 + expert_bytes;
+                const uint8_t * gate_base2 = selected_tiles + 2 * 2 * expert_bytes;
+                const uint8_t * up_base2   = gate_base2 + expert_bytes;
+                const uint8_t * gate_base3 = selected_tiles + 3 * 2 * expert_bytes;
+                const uint8_t * up_base3   = gate_base3 + expert_bytes;
+
+                simd<float, Repeat> gate_acc0_s0 = 0.0f;
+                simd<float, Repeat> up_acc0_s0   = 0.0f;
+                simd<float, Repeat> gate_acc0_s1 = 0.0f;
+                simd<float, Repeat> up_acc0_s1   = 0.0f;
+                simd<float, Repeat> gate_acc0_s2 = 0.0f;
+                simd<float, Repeat> up_acc0_s2   = 0.0f;
+                simd<float, Repeat> gate_acc0_s3 = 0.0f;
+                simd<float, Repeat> up_acc0_s3   = 0.0f;
+                simd<float, Repeat> gate_acc1_s0 = 0.0f;
+                simd<float, Repeat> up_acc1_s0   = 0.0f;
+                simd<float, Repeat> gate_acc1_s1 = 0.0f;
+                simd<float, Repeat> up_acc1_s1   = 0.0f;
+                simd<float, Repeat> gate_acc1_s2 = 0.0f;
+                simd<float, Repeat> up_acc1_s2   = 0.0f;
+                simd<float, Repeat> gate_acc1_s3 = 0.0f;
+                simd<float, Repeat> up_acc1_s3   = 0.0f;
+
+                for (int64_t kt = 0; kt < k_tiles; ++kt) {
+                    simd<int8_t, k_per> q_vec =
+                        block_load<int8_t, k_per>(reinterpret_cast<const int8_t *>(q8_src) + kt * k_per);
+                    simd<int8_t, bn> b_vec = 0;
+#    pragma unroll
+                    for (int kk = 0; kk < k_per; ++kk) {
+                        b_vec[(kk / 4) * exec_n * 4 + (kk % 4)] = q_vec[kk];
+                    }
+
+                    const sycl::half * y_scale_ptr =
+                        reinterpret_cast<const sycl::half *>(q8_src + ncols_y + kt * 2 * sizeof(sycl::half));
+                    simd<sycl::half, 1> y_half  = block_load<sycl::half, 1>(y_scale_ptr);
+                    simd<float, 1>      y_scale = y_half;
+
+                    if (n_selected > 0) {
+                        mxfp4_selected_xmx_dpas_accum_one<Repeat>(
+                            gate_base0, up_base0, b_vec, y_scale, kt, n_tile_groups_n, group_bytes, tile_n_total,
+                            xmx_group_n0, xmx_row_in_group0, gate_acc0_s0, up_acc0_s0);
+                        if (have_m1) {
+                            mxfp4_selected_xmx_dpas_accum_one<Repeat>(
+                                gate_base0, up_base0, b_vec, y_scale, kt, n_tile_groups_n, group_bytes, tile_n_total,
+                                xmx_group_n1, xmx_row_in_group1, gate_acc1_s0, up_acc1_s0);
+                        }
+                    }
+                    if (n_selected > 1) {
+                        mxfp4_selected_xmx_dpas_accum_one<Repeat>(
+                            gate_base1, up_base1, b_vec, y_scale, kt, n_tile_groups_n, group_bytes, tile_n_total,
+                            xmx_group_n0, xmx_row_in_group0, gate_acc0_s1, up_acc0_s1);
+                        if (have_m1) {
+                            mxfp4_selected_xmx_dpas_accum_one<Repeat>(
+                                gate_base1, up_base1, b_vec, y_scale, kt, n_tile_groups_n, group_bytes, tile_n_total,
+                                xmx_group_n1, xmx_row_in_group1, gate_acc1_s1, up_acc1_s1);
+                        }
+                    }
+                    if (n_selected > 2) {
+                        mxfp4_selected_xmx_dpas_accum_one<Repeat>(
+                            gate_base2, up_base2, b_vec, y_scale, kt, n_tile_groups_n, group_bytes, tile_n_total,
+                            xmx_group_n0, xmx_row_in_group0, gate_acc0_s2, up_acc0_s2);
+                        if (have_m1) {
+                            mxfp4_selected_xmx_dpas_accum_one<Repeat>(
+                                gate_base2, up_base2, b_vec, y_scale, kt, n_tile_groups_n, group_bytes, tile_n_total,
+                                xmx_group_n1, xmx_row_in_group1, gate_acc1_s2, up_acc1_s2);
+                        }
+                    }
+                    if (n_selected > 3) {
+                        mxfp4_selected_xmx_dpas_accum_one<Repeat>(
+                            gate_base3, up_base3, b_vec, y_scale, kt, n_tile_groups_n, group_bytes, tile_n_total,
+                            xmx_group_n0, xmx_row_in_group0, gate_acc0_s3, up_acc0_s3);
+                        if (have_m1) {
+                            mxfp4_selected_xmx_dpas_accum_one<Repeat>(
+                                gate_base3, up_base3, b_vec, y_scale, kt, n_tile_groups_n, group_bytes, tile_n_total,
+                                xmx_group_n1, xmx_row_in_group1, gate_acc1_s3, up_acc1_s3);
+                        }
+                    }
+                }
+
+                if (n_selected > 0) {
+                    mxfp4_selected_xmx_store_one<Repeat>(dst, nrows_per_expert, 0, tile_m0, gate_acc0_s0, up_acc0_s0);
+                    if (have_m1) {
+                        mxfp4_selected_xmx_store_one<Repeat>(dst, nrows_per_expert, 0, tile_m1, gate_acc1_s0,
+                                                             up_acc1_s0);
+                    }
+                }
+                if (n_selected > 1) {
+                    mxfp4_selected_xmx_store_one<Repeat>(dst, nrows_per_expert, 1, tile_m0, gate_acc0_s1, up_acc0_s1);
+                    if (have_m1) {
+                        mxfp4_selected_xmx_store_one<Repeat>(dst, nrows_per_expert, 1, tile_m1, gate_acc1_s1,
+                                                             up_acc1_s1);
+                    }
+                }
+                if (n_selected > 2) {
+                    mxfp4_selected_xmx_store_one<Repeat>(dst, nrows_per_expert, 2, tile_m0, gate_acc0_s2, up_acc0_s2);
+                    if (have_m1) {
+                        mxfp4_selected_xmx_store_one<Repeat>(dst, nrows_per_expert, 2, tile_m1, gate_acc1_s2,
+                                                             up_acc1_s2);
+                    }
+                }
+                if (n_selected > 3) {
+                    mxfp4_selected_xmx_store_one<Repeat>(dst, nrows_per_expert, 3, tile_m0, gate_acc0_s3, up_acc0_s3);
+                    if (have_m1) {
+                        mxfp4_selected_xmx_store_one<Repeat>(dst, nrows_per_expert, 3, tile_m1, gate_acc1_s3,
+                                                             up_acc1_s3);
+                    }
+                }
+            });
+    });
+    ev.wait_and_throw();
+    return true;
+}
+#else
+template <int Repeat, bool M2>
+static bool launch_mxfp4_selected_xmx_dpas_tile_kernel(const uint8_t *,
+                                                       const uint8_t *,
+                                                       float *,
+                                                       int64_t,
+                                                       int64_t,
+                                                       int64_t,
+                                                       int64_t,
+                                                       int64_t,
+                                                       int64_t,
+                                                       sycl::queue &,
+                                                       std::string & error) {
+    (void) Repeat;
+    (void) M2;
+    error = "SYCL ESIMD unavailable; mxfp4_selected_xmx_dpas_tile disabled.";
+    return false;
+}
+#endif
+
+bool run_mxfp4_selected_xmx_dpas_tile(const GeneratedWeights &     weights,
+                                      const GeneratedActivations & activations,
+                                      int64_t                      m,
+                                      int64_t                      n_selected,
+                                      int64_t                      k,
+                                      int                          requested_tiles_n,
+                                      int                          m_tiles_per_work_item,
+                                      bool                         validate,
+                                      int                          warmup,
+                                      int                          iterations,
+                                      sycl::queue &                queue,
+                                      ReferenceMetrics &           out,
+                                      std::string &                error) {
+    if (m <= 0 || n_selected <= 0 || n_selected > 4 || k <= 0 || (k % QK_MXFP4) != 0 || (k % QK8_1) != 0) {
+        error = "mxfp4_selected_xmx_dpas_tile requires positive M/K, 1..4 selected routes, and block-aligned K.";
+        return false;
+    }
+    if (m_tiles_per_work_item != 1 && m_tiles_per_work_item != 2) {
+        error = "mxfp4_selected_xmx_dpas_tile supports one or two M tiles per work-item.";
+        return false;
+    }
+    if (weights.layout_mode != GGML_LAYOUT_SOA || weights.layout.empty()) {
+        error = "mxfp4_selected_xmx_dpas_tile requires SOA MXFP4 source weights.";
+        return false;
+    }
+    if (activations.q8_1.empty()) {
+        error = "mxfp4_selected_xmx_dpas_tile requires SOA Q8_1 activations.";
+        return false;
+    }
+
+    int tiles_n = 0;
+    if (!select_mxfp4_xmx_tiles_n(queue, requested_tiles_n, tiles_n, error)) {
+        return false;
+    }
+    const int tile_n_total = tiles_n * static_cast<int>(GGML_SYCL_MXFP4_MOE_XMX_N);
+
+    std::vector<uint8_t> xmx_layout;
+    if (!make_mxfp4_xmx_tiled_layout(weights.layout, m, k, tile_n_total, xmx_layout, error)) {
+        return false;
+    }
+
+    constexpr size_t selected_slots       = 4;
+    constexpr size_t roles                = 2;
+    const size_t     selected_count       = static_cast<size_t>(n_selected);
+    const size_t     rows                 = static_cast<size_t>(m);
+    const size_t     expert_bytes         = xmx_layout.size();
+    const size_t     logical_expert_bytes = weights.layout.size();
+    const size_t     weight_bytes         = selected_slots * roles * expert_bytes;
+    const size_t     act_bytes            = activations.q8_1.size();
+    const size_t     out_count            = rows * selected_count;
+    const size_t     out_bytes            = out_count * sizeof(float);
+
+    std::vector<uint8_t> selected_tiles(weight_bytes);
+    for (size_t sel = 0; sel < selected_slots; ++sel) {
+        for (size_t role = 0; role < roles; ++role) {
+            std::copy(xmx_layout.begin(), xmx_layout.end(),
+                      selected_tiles.begin() + (sel * roles + role) * expert_bytes);
+        }
+    }
+
+    uint8_t * d_weights = sycl::malloc_device<uint8_t>(weight_bytes, queue);
+    uint8_t * d_act     = sycl::malloc_device<uint8_t>(act_bytes, queue);
+    float *   d_out     = sycl::malloc_device<float>(out_count, queue);
+
+    auto cleanup = [&]() {
+        if (d_weights) {
+            sycl::free(d_weights, queue);
+        }
+        if (d_act) {
+            sycl::free(d_act, queue);
+        }
+        if (d_out) {
+            sycl::free(d_out, queue);
+        }
+    };
+
+    if (!d_weights || !d_act || !d_out) {
+        cleanup();
+        error = "device allocation failed for mxfp4_selected_xmx_dpas_tile.";
+        return false;
+    }
+
+    queue.memcpy(d_weights, selected_tiles.data(), weight_bytes);
+    queue.memcpy(d_act, activations.q8_1.data(), act_bytes);
+    queue.memset(d_out, 0, out_bytes);
+    queue.wait_and_throw();
+
+    auto launch = [&]() {
+        if (m_tiles_per_work_item == 2) {
+            return launch_mxfp4_selected_xmx_dpas_tile_kernel<8, true>(d_weights, d_act, d_out, m, n_selected, k, k,
+                                                                       static_cast<int64_t>(expert_bytes), tile_n_total,
+                                                                       queue, error);
+        }
+        return launch_mxfp4_selected_xmx_dpas_tile_kernel<8, false>(d_weights, d_act, d_out, m, n_selected, k, k,
+                                                                    static_cast<int64_t>(expert_bytes), tile_n_total,
+                                                                    queue, error);
+    };
+
+    for (int i = 0; i < warmup; ++i) {
+        if (!launch()) {
+            cleanup();
+            return false;
+        }
+    }
+    queue.wait_and_throw();
+
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iterations; ++i) {
+        if (!launch()) {
+            cleanup();
+            return false;
+        }
+    }
+    queue.wait_and_throw();
+    const auto t1 = std::chrono::high_resolution_clock::now();
+
+    const double total_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+    const double mean_us  = iterations > 0 ? total_us / static_cast<double>(iterations) : 0.0;
+    const double mean_s   = mean_us * 1e-6;
+    const double ops      = 4.0 * static_cast<double>(m) * static_cast<double>(n_selected) * static_cast<double>(k);
+    const double bytes    = 2.0 * static_cast<double>(logical_expert_bytes) * static_cast<double>(selected_count) +
+                         static_cast<double>(act_bytes) + static_cast<double>(out_bytes);
+
+    out.total_us       = mean_us;
+    out.gemm_us        = mean_us;
+    out.tflops         = mean_s > 0.0 ? (ops / mean_s) / 1.0e12 : 0.0;
+    out.bandwidth_gbps = mean_s > 0.0 ? (bytes / mean_s) / 1.0e9 : 0.0;
+
+    if (validate) {
+        std::vector<float> actual(out_count);
+        queue.memcpy(actual.data(), d_out, out_bytes).wait();
+
+        const int64_t   blocks_per_row = k / QK_MXFP4;
+        const size_t    qs_bytes       = rows * static_cast<size_t>(blocks_per_row) * static_cast<size_t>(QK_MXFP4 / 2);
+        const uint8_t * src_qs         = weights.layout.data();
+        const uint8_t * src_scales     = weights.layout.data() + qs_bytes;
+        const uint8_t * q8_row         = activations.q8_1.data();
+
+        double max_err = 0.0;
+        double sum_err = 0.0;
+        for (size_t sel = 0; sel < selected_count; ++sel) {
+            for (size_t row = 0; row < rows; ++row) {
+                float dot = 0.0f;
+                for (int64_t block = 0; block < blocks_per_row; ++block) {
+                    const size_t    block_idx = row * static_cast<size_t>(blocks_per_row) + static_cast<size_t>(block);
+                    const uint8_t * qs        = src_qs + block_idx * static_cast<size_t>(QK_MXFP4 / 2);
+                    const int8_t *  q8_qs =
+                        reinterpret_cast<const int8_t *>(q8_row) + static_cast<size_t>(block) * QK8_1;
+                    const float scale = mxfp4_e8m0_to_fp32_prod_host(src_scales[block_idx]) *
+                                        mxfp4_selected_kmajor_q8_1_scale(q8_row, k, block);
+                    for (int i = 0; i < QK_MXFP4 / 2; ++i) {
+                        const uint8_t packed = qs[i];
+                        dot += scale * static_cast<float>(mxfp4_code_value(packed & 0x0f)) *
+                               static_cast<float>(q8_qs[static_cast<size_t>(i)]);
+                        dot += scale * static_cast<float>(mxfp4_code_value(packed >> 4)) *
+                               static_cast<float>(q8_qs[static_cast<size_t>(i + QK_MXFP4 / 2)]);
+                    }
+                }
+
+                constexpr float alpha        = 1.702f;
+                constexpr float limit        = 7.0f;
+                const float     gate_limited = std::fmin(dot, limit);
+                const float     up_limited   = std::fmax(std::fmin(dot, limit), -limit);
+                const float  expected = (gate_limited / (1.0f + std::exp(-gate_limited * alpha))) * (1.0f + up_limited);
+                const size_t idx      = sel * rows + row;
+                const double diff     = std::fabs(static_cast<double>(actual[idx]) - static_cast<double>(expected));
+                max_err               = std::max(max_err, diff);
+                sum_err += diff;
+                const double tol = 2e-2 + 2e-2 * std::fabs(static_cast<double>(expected));
+                if (!std::isfinite(actual[idx]) || diff > tol) {
+                    cleanup();
+                    char msg[320];
+                    std::snprintf(msg, sizeof(msg),
+                                  "mxfp4_selected_xmx_dpas_tile validation failed at %zu: actual=%.6f "
+                                  "expected=%.6f diff=%.6f tol=%.6f max=%.6f mean=%.6f.",
+                                  idx, static_cast<double>(actual[idx]), static_cast<double>(expected), diff, tol,
+                                  max_err, sum_err / static_cast<double>(idx + 1));
+                    error = msg;
+                    return false;
+                }
+            }
+        }
+    }
+
+    cleanup();
+    return true;
+}
 
 #if DPAS_EXPLORATION_ESIMD_AVAILABLE
 template <int Repeat, int NTileRepeats, bool PackedScales> struct mxfp4_dpas_compact_scaled_kernel;
