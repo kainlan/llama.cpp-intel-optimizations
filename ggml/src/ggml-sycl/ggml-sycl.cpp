@@ -46105,6 +46105,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 g_pending_secondary_scatter.entries.clear();
                 g_pending_secondary_scatter.bulk_entries.clear();
 
+                auto reject_after_partial_group_submit = [&]() -> bool {
+                    g_pending_secondary_scatter.entries.clear();
+                    g_pending_secondary_scatter.bulk_entries.clear();
+                    g_pending_secondary_scatter.active     = false;
+                    g_pending_secondary_scatter.dst_tensor = nullptr;
+                    return reject_mixed("execute-group");
+                };
+
                 auto execute_group = [&](int target_device, const std::vector<mixed_moe_row> & rows) -> bool {
                     if (rows.empty()) {
                         return true;
@@ -46403,11 +46411,22 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     return true;
                 };
 
+                // Stage secondary groups first.  Their activation copies are ordered
+                // on the primary queue; submitting them before the local group lets
+                // secondary compute overlap the later primary-device MoE kernels.
                 for (int d = 0; d < n_gpu_devs; ++d) {
+                    if (d == ctx.device) {
+                        continue;
+                    }
                     if (!rows_by_device[static_cast<size_t>(d)].empty() &&
                         !execute_group(d, rows_by_device[static_cast<size_t>(d)])) {
-                        return reject_mixed("execute-group");
+                        return reject_after_partial_group_submit();
                     }
+                }
+                if (ctx.device >= 0 && ctx.device < n_gpu_devs &&
+                    !rows_by_device[static_cast<size_t>(ctx.device)].empty() &&
+                    !execute_group(ctx.device, rows_by_device[static_cast<size_t>(ctx.device)])) {
+                    return reject_after_partial_group_submit();
                 }
 
                 if (!g_pending_secondary_scatter.entries.empty() || !g_pending_secondary_scatter.bulk_entries.empty()) {
