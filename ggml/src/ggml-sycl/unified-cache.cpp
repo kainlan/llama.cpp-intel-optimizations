@@ -13743,7 +13743,147 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
             std::fill(moe_device_scores.begin(), moe_device_scores.end(), 1.0);
         }
 
+        // In EXPERT mode, keep complete expert triplets together at layer
+        // granularity under pressure. Optional fast-layout upgrades run after
+        // base placement and must not evict otherwise resident primary layers.
+        struct moe_layer_target_plan {
+            int    target_dev_idx    = -2;
+            size_t base_charge       = 0;
+            bool   complete          = false;
+            bool   secondary_capable = true;
+            size_t groups            = 0;
+            std::array<size_t, static_cast<size_t>(expert_tensor_role::COUNT)> role_entries{};
+        };
+
+        std::map<int, moe_layer_target_plan> moe_layer_targets;
+        if (mode == multi_gpu_mode::EXPERT && n_devs > 1 && !moe_groups.empty()) {
+            for (const moe_triplet_group & group : moe_groups) {
+                if (group.layer_id < 0 || group.expert_id < 0 || !moe_triplet_complete(group)) {
+                    continue;
+                }
+
+                auto & layer           = moe_layer_targets[group.layer_id];
+                layer.base_charge += group.charge_bytes;
+                layer.groups++;
+
+                for (size_t idx : group.indices) {
+                    if (idx >= plan.entries.size()) {
+                        continue;
+                    }
+                    const placement_entry & entry = plan.entries[idx];
+                    const size_t            role_idx = static_cast<size_t>(entry.expert_role);
+                    if (role_idx < layer.role_entries.size()) {
+                        layer.role_entries[role_idx]++;
+                    }
+                    if (!planner_moe_multi_device_executor_supports_layout(entry, GGML_LAYOUT_SOA)) {
+                        layer.secondary_capable = false;
+                    }
+                }
+            }
+
+            for (auto & item : moe_layer_targets) {
+                moe_layer_target_plan & layer = item.second;
+                layer.complete = n_experts > 0 &&
+                                 layer.role_entries[static_cast<size_t>(expert_tensor_role::GATE)] ==
+                                     static_cast<size_t>(n_experts) &&
+                                 layer.role_entries[static_cast<size_t>(expert_tensor_role::UP)] ==
+                                     static_cast<size_t>(n_experts) &&
+                                 layer.role_entries[static_cast<size_t>(expert_tensor_role::DOWN)] ==
+                                     static_cast<size_t>(n_experts);
+            }
+
+            std::vector<size_t> simulated_remaining = remaining;
+            size_t              primary_layers      = 0;
+            size_t              secondary_layers    = 0;
+            size_t              degraded_layers     = 0;
+            size_t              host_layers         = 0;
+            size_t              secondary_not_capable_layers = 0;
+            size_t              secondary_no_budget_layers   = 0;
+
+            auto choose_secondary_for_layer = [&](const moe_layer_target_plan & layer) -> int {
+                int    best_idx   = -1;
+                double best_score = -std::numeric_limits<double>::infinity();
+                for (size_t d = 1; d < n_devs; ++d) {
+                    if (simulated_remaining[d] < layer.base_charge) {
+                        continue;
+                    }
+                    const double remaining_gib =
+                        static_cast<double>(simulated_remaining[d]) / (1024.0 * 1024.0 * 1024.0);
+                    const double score = moe_device_scores[d] * std::sqrt(std::max(0.125, remaining_gib));
+                    if (score > best_score) {
+                        best_score = score;
+                        best_idx   = static_cast<int>(d);
+                    }
+                }
+                return best_idx;
+            };
+
+            for (auto & item : moe_layer_targets) {
+                moe_layer_target_plan & layer = item.second;
+                if (layer.complete && simulated_remaining[0] >= layer.base_charge) {
+                    layer.target_dev_idx = 0;
+                    simulated_remaining[0] -= layer.base_charge;
+                    primary_layers++;
+                    continue;
+                }
+
+                if (layer.complete && layer.secondary_capable) {
+                    const int secondary_idx = choose_secondary_for_layer(layer);
+                    if (secondary_idx >= 0) {
+                        layer.target_dev_idx = secondary_idx;
+                        simulated_remaining[secondary_idx] -= layer.base_charge;
+                        secondary_layers++;
+                        continue;
+                    }
+                    secondary_no_budget_layers++;
+                } else if (layer.complete) {
+                    secondary_not_capable_layers++;
+                }
+
+                if (simulated_remaining[0] >= layer.base_charge) {
+                    layer.target_dev_idx = 0;
+                    simulated_remaining[0] -= layer.base_charge;
+                    degraded_layers++;
+                    continue;
+                }
+
+                layer.target_dev_idx = -1;
+                host_layers++;
+            }
+
+            if (!moe_layer_targets.empty()) {
+                GGML_LOG_INFO(
+                    "[PLACEMENT-MOE-MULTI] layer route plan: primary=%zu secondary=%zu primary_degraded=%zu "
+                    "host=%zu primary_remaining=%.1f MB\n",
+                    primary_layers, secondary_layers, degraded_layers, host_layers,
+                    simulated_remaining[0] / (1024.0 * 1024.0));
+                if (moe_direct_trace_enabled()) {
+                    fprintf(stderr,
+                            "[PLACEMENT-MOE-MULTI-LAYER-TRACE] primary=%zu secondary=%zu degraded=%zu host=%zu "
+                            "primary_remaining=%.1fMB "
+                            "secondary_no_budget=%zu secondary_not_capable=%zu\n",
+                            primary_layers, secondary_layers, degraded_layers, host_layers,
+                            simulated_remaining[0] / (1024.0 * 1024.0), secondary_no_budget_layers,
+                            secondary_not_capable_layers);
+                }
+            }
+        }
+
         auto choose_moe_target_device = [&](const moe_triplet_group & group, int preferred_dev_idx) -> int {
+            if (group.expert_id >= 0 && moe_triplet_complete(group)) {
+                auto layer_target_it = moe_layer_targets.find(group.layer_id);
+                if (layer_target_it != moe_layer_targets.end()) {
+                    const int planned_target = layer_target_it->second.target_dev_idx;
+                    if (planned_target >= 0 && static_cast<size_t>(planned_target) < n_devs &&
+                        remaining[planned_target] >= group.charge_bytes) {
+                        return planned_target;
+                    }
+                    if (planned_target < 0) {
+                        return -1;
+                    }
+                }
+            }
+
             if (preferred_dev_idx >= 0 && static_cast<size_t>(preferred_dev_idx) < n_devs &&
                 remaining[preferred_dev_idx] >= group.charge_bytes) {
                 return preferred_dev_idx;
