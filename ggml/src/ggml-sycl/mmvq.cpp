@@ -5664,8 +5664,10 @@ template <int Repeat, int GLU_OP, bool Prefetch> struct mxfp4_pair_glu_xmx_tiled
 template <int Repeat, int GLU_OP> struct mxfp4_pair_glu_xmx_tiled_dpas_direct_q8_kernel;
 template <int Repeat, int GLU_OP> struct mxfp4_pair_glu_xmx_tiled_dpas_m2_direct_q8_kernel;
 template <int Repeat> struct mxfp4_xmx_tiled_grouped_direct_q8_kernel;
+template <int Repeat> struct mxfp4_xmx_tiled_grouped_chunk_join_kernel;
 template <int Repeat> struct mxfp4_i8_grouped_direct_q8_kernel;
 template <int Repeat, int GLU_OP> struct mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_kernel;
+template <int Repeat> struct mxfp4_pair_glu_xmx_tiled_grouped_chunk_join_kernel;
 
 template <int Repeat, int GLU_OP>
 static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_sycl(sycl::queue &        queue,
@@ -6362,6 +6364,7 @@ static sycl::event mxfp4_xmx_tiled_grouped_direct_q8_sycl(sycl::queue &        q
                                                           int64_t              q8_nb12,
                                                           int64_t              dst_nb1,
                                                           int64_t              dst_nb2,
+                                                          const std::vector<sycl::event> & deps,
                                                           int                  tile_n_total) {
     constexpr int exec_n = GGML_SYCL_MXFP4_MOE_XMX_N;
     constexpr int k_per  = GGML_SYCL_MXFP4_MOE_XMX_K;
@@ -6373,6 +6376,9 @@ static sycl::event mxfp4_xmx_tiled_grouped_direct_q8_sycl(sycl::queue &        q
     const int64_t tiles   = static_cast<int64_t>(n_chunks) * m_tiles;
 
     return queue.submit([&](sycl::handler & h) {
+        if (!deps.empty()) {
+            h.depends_on(deps);
+        }
         h.parallel_for<mxfp4_xmx_tiled_grouped_direct_q8_kernel<Repeat>>(
             sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(tiles)), sycl::range<1>(1)),
             [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
@@ -6640,6 +6646,7 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_sycl(sycl::queue &
                                                                    int64_t              dst_nb2,
                                                                    int64_t              gate_bias_nb1,
                                                                    int64_t              up_bias_nb1,
+                                                                   const std::vector<sycl::event> & deps,
                                                                    float                alpha,
                                                                    float                limit,
                                                                    int                  tile_n_total) {
@@ -6653,6 +6660,9 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_sycl(sycl::queue &
     const int64_t tiles   = static_cast<int64_t>(n_chunks) * m_tiles;
 
     return queue.submit([&](sycl::handler & h) {
+        if (!deps.empty()) {
+            h.depends_on(deps);
+        }
         h.parallel_for<mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_kernel<Repeat, GLU_OP>>(
             sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(tiles)), sycl::range<1>(1)),
             [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
@@ -6967,6 +6977,7 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_submit(sycl::queue
                                                                      int64_t              gate_bias_nb1,
                                                                      int64_t              up_bias_nb1,
                                                                      int                  glu_op,
+                                                                     const std::vector<sycl::event> & deps,
                                                                      float                alpha,
                                                                      float                limit,
                                                                      int                  tile_n_total) {
@@ -6974,12 +6985,12 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_submit(sycl::queue
         return mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_sycl<Repeat, GGML_GLU_OP_SWIGLU_OAI>(
             queue, gate_ptrs, up_ptrs, q8_src, dst_glu, group_expert_ids, group_offsets, group_row_slots, chunk_groups,
             chunk_row_starts, gate_bias, up_bias, ncols, ncols_y, nrows_per_expert, n_chunks, n_tokens, ne11, q8_nb11,
-            q8_nb12, dst_nb1, dst_nb2, gate_bias_nb1, up_bias_nb1, alpha, limit, tile_n_total);
+            q8_nb12, dst_nb1, dst_nb2, gate_bias_nb1, up_bias_nb1, deps, alpha, limit, tile_n_total);
     }
     return mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_sycl<Repeat, GGML_GLU_OP_SWIGLU>(
         queue, gate_ptrs, up_ptrs, q8_src, dst_glu, group_expert_ids, group_offsets, group_row_slots, chunk_groups,
         chunk_row_starts, gate_bias, up_bias, ncols, ncols_y, nrows_per_expert, n_chunks, n_tokens, ne11, q8_nb11,
-        q8_nb12, dst_nb1, dst_nb2, gate_bias_nb1, up_bias_nb1, alpha, limit, tile_n_total);
+        q8_nb12, dst_nb1, dst_nb2, gate_bias_nb1, up_bias_nb1, deps, alpha, limit, tile_n_total);
 }
 
 static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_sycl(const void * const * expert_ptrs_a,
@@ -7615,7 +7626,8 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &   ctx,
 
     // Use SoA quantizer if weights are in reordered layout (both SoA and COALESCED kernels expect SoA Y)
     const bool     y_soa       = (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED ||
-                        layout == GGML_LAYOUT_MXFP4_I8 || layout == GGML_LAYOUT_MXFP4_DPAS);
+                        layout == GGML_LAYOUT_MXFP4_I8 || layout == GGML_LAYOUT_MXFP4_DPAS ||
+                        layout == GGML_LAYOUT_XMX_TILED);
     mxfp4_moe_role reuse_role  = mxfp4_moe_role::OTHER;
     int            reuse_layer = -1;
     const bool     reuse_candidate =
@@ -8059,16 +8071,20 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &   ctx,
                     log_xmx_reject("group-alloc");
                     return false;
                 }
-                stream->memcpy(grouped_experts_device, grouped_experts_host.data(),
-                               grouped_experts_host.size() * sizeof(int32_t));
-                stream->memcpy(grouped_offsets_device, grouped_offsets_host.data(),
-                               grouped_offsets_host.size() * sizeof(int32_t));
-                stream->memcpy(grouped_rows_device, grouped_rows_host.data(),
-                               grouped_rows_host.size() * sizeof(int32_t));
-                stream->memcpy(grouped_chunk_groups_device, grouped_chunk_groups_host.data(),
-                               grouped_chunk_groups_host.size() * sizeof(int32_t));
-                stream->memcpy(grouped_chunk_starts_device, grouped_chunk_starts_host.data(),
-                               grouped_chunk_starts_host.size() * sizeof(int32_t));
+                std::vector<sycl::event> grouped_copy_events;
+                grouped_copy_events.reserve(5);
+                grouped_copy_events.push_back(stream->memcpy(grouped_experts_device, grouped_experts_host.data(),
+                                                             grouped_experts_host.size() * sizeof(int32_t)));
+                grouped_copy_events.push_back(stream->memcpy(grouped_offsets_device, grouped_offsets_host.data(),
+                                                             grouped_offsets_host.size() * sizeof(int32_t)));
+                grouped_copy_events.push_back(stream->memcpy(grouped_rows_device, grouped_rows_host.data(),
+                                                             grouped_rows_host.size() * sizeof(int32_t)));
+                grouped_copy_events.push_back(
+                    stream->memcpy(grouped_chunk_groups_device, grouped_chunk_groups_host.data(),
+                                   grouped_chunk_groups_host.size() * sizeof(int32_t)));
+                grouped_copy_events.push_back(
+                    stream->memcpy(grouped_chunk_starts_device, grouped_chunk_starts_host.data(),
+                                   grouped_chunk_starts_host.size() * sizeof(int32_t)));
 
                 static std::atomic<int> grouped_log{ 0 };
                 const char *            row_agg_debug = std::getenv("GGML_SYCL_MOE_ROW_AGG_DEBUG");
@@ -8092,12 +8108,17 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &   ctx,
                         *stream, expert_ptrs_device, q8_1_buffer, dst_d, grouped_experts_device, grouped_offsets_device,
                         grouped_rows_device, grouped_chunk_groups_device + chunk_begin,
                         grouped_chunk_starts_device + chunk_begin, ne00, ne10, ne01, chunk_count, num_tokens, ne11,
-                        q8_nb11, q8_nb12, nb1, nb2, tile_n_total);
+                        q8_nb11, q8_nb12, nb1, nb2, grouped_copy_events, tile_n_total);
                 };
                 if (chunked_row_limit) {
+                    std::vector<sycl::event> chunk_events;
+                    chunk_events.reserve(chunk_passes.size());
                     for (const auto & pass : chunk_passes) {
-                        kernel_event = submit_chunk_range(pass.first, pass.second);
+                        chunk_events.push_back(submit_chunk_range(pass.first, pass.second));
                     }
+                    kernel_event =
+                        ggml_sycl_submit_marker<mxfp4_xmx_tiled_grouped_chunk_join_kernel<repeat>>(*stream,
+                                                                                                    chunk_events);
                 } else {
                     kernel_event = submit_chunk_range(0, grouped_n_chunks);
                 }
@@ -8578,8 +8599,13 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
             return false;
         }
 
-        const bool grouped_decode_shape =
-            total_batches >= exec_n && n_gpu_entries == total_batches && ids_host && ids_host_count == total_batches;
+        // The grouped XMX_TILED variant packs multiple selected rows into DPAS
+        // lanes. Prompt-token routing stays on the validated per-selected-row
+        // XMX_TILED path until the grouped PP route has its own validator.
+        constexpr bool grouped_xmx_tiled_pair_glu_validated = false;
+        const bool     grouped_decode_shape =
+            grouped_xmx_tiled_pair_glu_validated && total_batches >= exec_n && n_gpu_entries == total_batches &&
+            ids_host && ids_host_count == total_batches;
         if (grouped_decode_shape) {
             static thread_local std::vector<int32_t> grouped_experts_host;
             static thread_local std::vector<int32_t> grouped_offsets_host;
@@ -8707,15 +8733,18 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                 return false;
             }
 
-            stream->memcpy(grouped_experts_device, grouped_experts_host.data(),
-                           grouped_experts_host.size() * sizeof(int32_t));
-            stream->memcpy(grouped_offsets_device, grouped_offsets_host.data(),
-                           grouped_offsets_host.size() * sizeof(int32_t));
-            stream->memcpy(grouped_rows_device, grouped_rows_host.data(), grouped_rows_host.size() * sizeof(int32_t));
-            stream->memcpy(grouped_chunk_groups_device, grouped_chunk_groups_host.data(),
-                           grouped_chunk_groups_host.size() * sizeof(int32_t));
-            stream->memcpy(grouped_chunk_starts_device, grouped_chunk_starts_host.data(),
-                           grouped_chunk_starts_host.size() * sizeof(int32_t));
+            std::vector<sycl::event> grouped_copy_events;
+            grouped_copy_events.reserve(5);
+            grouped_copy_events.push_back(stream->memcpy(grouped_experts_device, grouped_experts_host.data(),
+                                                         grouped_experts_host.size() * sizeof(int32_t)));
+            grouped_copy_events.push_back(stream->memcpy(grouped_offsets_device, grouped_offsets_host.data(),
+                                                         grouped_offsets_host.size() * sizeof(int32_t)));
+            grouped_copy_events.push_back(stream->memcpy(grouped_rows_device, grouped_rows_host.data(),
+                                                         grouped_rows_host.size() * sizeof(int32_t)));
+            grouped_copy_events.push_back(stream->memcpy(grouped_chunk_groups_device, grouped_chunk_groups_host.data(),
+                                                         grouped_chunk_groups_host.size() * sizeof(int32_t)));
+            grouped_copy_events.push_back(stream->memcpy(grouped_chunk_starts_device, grouped_chunk_starts_host.data(),
+                                                         grouped_chunk_starts_host.size() * sizeof(int32_t)));
 
             static std::atomic<int> grouped_glu_log{ 0 };
             const char *            row_agg_debug = std::getenv("GGML_SYCL_MOE_ROW_AGG_DEBUG");
@@ -8740,16 +8769,22 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                     grouped_offsets_device, grouped_rows_device, grouped_chunk_groups_device + chunk_begin,
                     grouped_chunk_starts_device + chunk_begin, gate_bias_device, up_bias_device, ne00, ne10, ne01,
                     chunk_count, static_cast<int>(num_tokens), static_cast<int>(ne11), q8_nb11, q8_nb12, glu_dst->nb[1],
-                    glu_dst->nb[2], gate_bias_nb1, up_bias_nb1, glu_op, alpha, limit, tile_n_total);
+                    glu_dst->nb[2], gate_bias_nb1, up_bias_nb1, glu_op, grouped_copy_events, alpha, limit,
+                    tile_n_total);
             };
             if (chunked_row_limit) {
+                std::vector<sycl::event> chunk_events;
+                chunk_events.reserve(chunk_passes.size());
                 for (const auto & pass : chunk_passes) {
-                    kernel_event = submit_chunk_range(pass.first, pass.second);
+                    chunk_events.push_back(submit_chunk_range(pass.first, pass.second));
                 }
+                kernel_event =
+                    ggml_sycl_submit_marker<mxfp4_pair_glu_xmx_tiled_grouped_chunk_join_kernel<repeat>>(*stream,
+                                                                                                        chunk_events);
             } else {
                 kernel_event = submit_chunk_range(0, grouped_n_chunks);
             }
-        } else if (ne12 == 1) {
+        } else {
             const int    k_tiles = ne00 / k_per;
             const size_t b_bytes =
                 static_cast<size_t>(total_batches) * static_cast<size_t>(k_tiles) * static_cast<size_t>(k_per * exec_n);
@@ -8761,7 +8796,7 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                 stream, ctx.device, b_bytes, reuse.dpas_b_alloc, reuse.dpas_b_handle));
             float *  y_scales = static_cast<float *>(mxfp4_moe_tg_reuse_get_or_alloc_device_scratch(
                 stream, ctx.device, y_bytes, reuse.dpas_y_alloc, reuse.dpas_y_handle));
-            if (b_packed && y_scales) {
+            if (ne12 == 1 && b_packed && y_scales) {
                 sycl::event pack_event = mxfp4_dpas_pack_q8_single_col_groups_sycl(
                     *stream, q8_1_buffer, b_packed, y_scales, ne00, ne10, static_cast<int>(total_batches),
                     static_cast<int>(num_tokens), static_cast<int>(ne11), q8_nb11, q8_nb12);
@@ -8777,8 +8812,6 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                     static_cast<int>(ne11), ids_nb0, ids_nb1, q8_nb11, q8_nb12, glu_dst->nb[1], glu_dst->nb[2],
                     gate_bias_nb1, up_bias_nb1, glu_op, alpha, limit, tile_n_total);
             }
-        } else {
-            return false;
         }
         used_xmx_tiled_dpas = true;
         have_kernel_event   = true;

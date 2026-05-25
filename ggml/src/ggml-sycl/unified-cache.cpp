@@ -12096,6 +12096,14 @@ static size_t planner_expected_moe_pp_rows(const placement_kv_info &            
     return pp_tokens * top_k;
 }
 
+static bool planner_moe_xmx_tiled_pp_proof_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_XMX_TILED_PP_PROOF");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static bool planner_moe_layout_needs_pp_soa(const placement_entry &              entry,
                                             ggml_layout_mode                     layout,
                                             int                                  device_id,
@@ -12118,6 +12126,9 @@ static bool planner_moe_layout_needs_pp_soa(const placement_entry &             
     const size_t row_limit = ggml_sycl_mxfp4_grouped_dpas_row_list_limit(caps);
     const size_t pp_tokens = static_cast<size_t>(planner_effective_ubatch_for_moe_pp(kv_info, envelope));
     const size_t pp_rows   = planner_expected_moe_pp_rows(kv_info, envelope);
+    if (pp_tokens > 1 && layout == GGML_LAYOUT_XMX_TILED && planner_moe_xmx_tiled_pp_proof_enabled()) {
+        return false;
+    }
     return pp_tokens > 1 && (row_limit == 0 || pp_rows > row_limit || layout == GGML_LAYOUT_MXFP4_I8 ||
                              layout == GGML_LAYOUT_MXFP4_DPAS || layout == GGML_LAYOUT_COALESCED);
 }
@@ -12147,6 +12158,13 @@ static size_t apply_single_moe_pp_safe_xmx_layouts(placement_plan &             
     const size_t row_limit = ggml_sycl_mxfp4_grouped_dpas_row_list_limit(caps);
     const size_t pp_rows   = planner_expected_moe_pp_rows(kv_info, envelope);
     if (row_limit > 0 && pp_rows <= row_limit) {
+        return 0;
+    }
+    if (planner_moe_xmx_tiled_pp_proof_enabled()) {
+        GGML_LOG_INFO(
+            "[PLACEMENT-MOE] PP-safe XMX layout: proof gate enabled; keeping xmx_tiled pp_tokens=%zu "
+            "selected_rows=%zu row_limit=%zu\n",
+            pp_tokens, pp_rows, row_limit);
         return 0;
     }
 
@@ -12228,6 +12246,13 @@ static void apply_multi_moe_pp_safe_xmx_layouts(placement_plan &                
         return;
     }
     const size_t pp_rows = planner_expected_moe_pp_rows(kv_info, envelope);
+    if (planner_moe_xmx_tiled_pp_proof_enabled()) {
+        GGML_LOG_INFO(
+            "[PLACEMENT-MOE-MULTI] PP-safe XMX layout: proof gate enabled; keeping xmx_tiled pp_tokens=%zu "
+            "selected_rows=%zu\n",
+            pp_tokens, pp_rows);
+        return;
+    }
 
     std::unordered_map<int, size_t> device_to_index;
     device_to_index.reserve(device_budgets.size());

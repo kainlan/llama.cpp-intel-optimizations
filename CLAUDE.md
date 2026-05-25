@@ -366,6 +366,7 @@ GGML_SYCL_PERSISTENT_TG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
 | `GGML_SYCL_NAN_CHECK=1` | Enable NaN detection in outputs |
 | `GGML_SYCL_VALIDATE=1` | Enable A/B validation between kernel paths |
 | `GGML_SYCL_GRAPH_RERECORD=1` | Use graph re-record instead of replay (very slow, diagnostic only) |
+| `GGML_SYCL_XMX_TILED_PP_PROOF=1` | Keep XMX-tiled GPT-OSS MoE gate/up layouts for PP proof runs; diagnostic only, not the intended default policy |
 | `GGML_SYCL_OP_TIMEOUT_MS=<N>` | Abort with diagnostic if no inference progress for N ms (default 30000, set to 0 to disable). Fires before the xe driver's 10s GT-reset cascade. Effective detection latency is `timeout + ~500 ms`. |
 | `GGML_SYCL_SAFE_MODE=1` | Drain the SYCL queue after every op submit so a fault surfaces at the op that caused it (2-3x slowdown, implies `GGML_SYCL_DISABLE_GRAPH=1`). Useful for CI canaries and correlating intermittent wedges 1:1 with their triggering op. |
 

@@ -47549,20 +47549,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             const bool  layer_executor_skip_eligible =
                                 layer_executor_enabled == 1 && ggml_sycl_moe_layer_executor_skip_allowed();
                             const bool layer_executor_shadow_probe = layer_executor_enabled == 2;
-                            const bool layer_executor_xmx_pp_down_unsupported =
-                                pair_layout == GGML_LAYOUT_XMX_TILED && ids->ne[1] > 1;
-                            if (layer_executor_xmx_pp_down_unsupported && path_trace_enabled != 0) {
-                                fprintf(stderr,
-                                        "[MOE-PAIR-REJECT] cur=%s reason=down-xmx-pp-layer-executor layout=%s "
-                                        "tokens=%lld\n",
-                                        tname, ggml_sycl_layout_mode_name(pair_layout), (long long) ids->ne[1]);
-                            }
                             if ((layer_executor_skip_eligible || layer_executor_shadow_probe) && pair.down_weight &&
-                                !layer_executor_xmx_pp_down_unsupported && pair.down_dst &&
-                                pair.down_dst->src[1] == pair.glu_dst && pair.down_dst->src[2] == ids &&
-                                pair.down_index > pair.glu_index && pair.down_weight->type == GGML_TYPE_MXFP4 &&
-                                pair.glu_dst->ne[0] == pair.down_weight->ne[0] && pair.glu_dst->ne[1] == n_ids_pair &&
-                                pair.glu_dst->ne[2] == ids->ne[1]) {
+                                pair.down_dst && pair.down_dst->src[1] == pair.glu_dst &&
+                                pair.down_dst->src[2] == ids && pair.down_index > pair.glu_index &&
+                                pair.down_weight->type == GGML_TYPE_MXFP4 &&
+                                pair.glu_dst->ne[0] == pair.down_weight->ne[0] &&
+                                pair.glu_dst->ne[1] == n_ids_pair && pair.glu_dst->ne[2] == ids->ne[1]) {
                                 const int64_t down_tokens = pair.glu_dst->ne[2];
                                 const bool    down_has_plan =
                                     ggml_sycl::unified_cache_enabled() &&
@@ -47577,6 +47569,28 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                                                         pair.down_weight, ctx.device, down_tokens));
                                 layout_mode down_layout = ggml_sycl_adjust_layout_for_tensor(
                                     pair.down_weight, requested_down_layout, ctx.device);
+                                if (down_layout == GGML_LAYOUT_XMX_TILED && down_tokens > 1) {
+                                    const layout_mode fallback_layout =
+                                        ggml_sycl_adjust_layout_for_tensor(pair.down_weight, GGML_LAYOUT_MXFP4_I8,
+                                                                           ctx.device);
+                                    if (ggml_sycl_moe_mmvq_batched_supports_layout(pair.down_weight->type,
+                                                                                   fallback_layout)) {
+                                        requested_down_layout = fallback_layout;
+                                        down_layout           = fallback_layout;
+                                    } else {
+                                        requested_down_layout = GGML_LAYOUT_SOA;
+                                        down_layout = ggml_sycl_adjust_layout_for_tensor(pair.down_weight,
+                                                                                        requested_down_layout,
+                                                                                        ctx.device);
+                                    }
+                                    if (path_trace_enabled != 0) {
+                                        fprintf(stderr,
+                                                "[MOE-PAIR] cur=%s reason=down-xmx-pp-fallback gate_layout=%s "
+                                                "down_layout=%s tokens=%lld\n",
+                                                tname, ggml_sycl_layout_mode_name(pair_layout),
+                                                ggml_sycl_layout_mode_name(down_layout), (long long) down_tokens);
+                                    }
+                                }
                                 if (!ggml_sycl_moe_mmvq_batched_supports_layout(pair.down_weight->type, down_layout)) {
                                     if (path_trace_enabled != 0) {
                                         fprintf(stderr,

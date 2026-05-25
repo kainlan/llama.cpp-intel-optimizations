@@ -351,6 +351,7 @@ Debugging:
 | `GGML_SYCL_NAN_CHECK=1` | Enable NaN detection |
 | `GGML_SYCL_VALIDATE=1` | A/B validation between kernel paths |
 | `GGML_SYCL_GRAPH_RERECORD=1` | Diagnostic graph re-record path |
+| `GGML_SYCL_XMX_TILED_PP_PROOF=1` | Keep XMX-tiled GPT-OSS MoE gate/up layouts for PP proof runs; diagnostic only |
 | `GGML_SYCL_OP_TIMEOUT_MS=<N>` | Abort if no inference progress for N ms |
 | `GGML_SYCL_SAFE_MODE=1` | Drain queue after every op; slow diagnostic mode |
 | `GGML_SYCL_LAYOUT_OVERRIDE=<mode>` | Force `aos`, `soa`, `coalesced`, or `xmx_tiled` |

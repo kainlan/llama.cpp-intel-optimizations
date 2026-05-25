@@ -21,8 +21,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -109,6 +111,18 @@ static inline int parse_moe_rows_per_wg(const std::string & kernel_name) {
 }
 
 static inline int64_t parse_moe_token_rows(const std::string & kernel_name) {
+    for (size_t pos = 0; (pos = kernel_name.find("_t", pos)) != std::string::npos; pos += 2) {
+        const size_t digit_pos = pos + 2;
+        if (digit_pos >= kernel_name.size() || !std::isdigit(static_cast<unsigned char>(kernel_name[digit_pos]))) {
+            continue;
+        }
+        char *      end   = nullptr;
+        const char * start = kernel_name.c_str() + digit_pos;
+        const long  value = std::strtol(start, &end, 10);
+        if (end != start && value > 0) {
+            return value;
+        }
+    }
     if (kernel_name.find("_t16") != std::string::npos) {
         return 16;
     }
