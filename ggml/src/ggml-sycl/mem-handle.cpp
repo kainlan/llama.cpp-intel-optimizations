@@ -231,6 +231,43 @@ mem_handle mem_handle::from_chunk_ptr(void * ptr, int device, ggml_layout_mode l
     return h;
 }
 
+namespace {
+
+void release_owned_alloc_handle(alloc_handle * handle) {
+    if (!handle) {
+        return;
+    }
+    if (handle->ptr) {
+        bool released = unified_free(*handle);
+        if (!released && handle->zone_managed && handle->vram_zone != vram_zone_id::COUNT && handle->device >= 0) {
+            // Some legacy arena callers still construct alloc_handle directly
+            // from zone_alloc() without registering it in runtime_alloc_registry.
+            // The mem_handle remains the lifetime owner; release the zone block
+            // through the unified cache when the registry has no record.
+            unified_cache_zone_free(handle->device, handle->vram_zone, handle->ptr);
+            released = true;
+        }
+        if (!released) {
+            GGML_LOG_WARN("[MEM-HANDLE] owning alloc release failed ptr=%p size=%zu device=%d\n", handle->ptr,
+                          handle->size, handle->device);
+        }
+    }
+    delete handle;
+}
+
+}  // namespace
+
+mem_handle mem_handle::from_owned_alloc(alloc_handle handle, ggml_layout_mode layout) {
+    if (!handle.ptr) {
+        return {};
+    }
+
+    const bool on_device = handle.tier == alloc_tier::DEVICE_VRAM;
+    mem_handle h         = from_direct(handle.ptr, layout, on_device, on_device ? handle.device : HOST_DEVICE);
+    h.owned_alloc_       = std::shared_ptr<alloc_handle>(new alloc_handle(std::move(handle)), release_owned_alloc_handle);
+    return h;
+}
+
 // === resolve ===
 
 resolved_ptr mem_handle::resolve() const {
@@ -466,6 +503,7 @@ mem_handle::mem_handle(const mem_handle & other) :
     arena_gen_(other.arena_gen_),
     gen_(other.gen_),
     cached_(other.cached_),
+    owned_alloc_(other.owned_alloc_),
     leased_entry_(other.leased_entry_),
     chunk_source_(other.chunk_source_),
     host_chunk_handle_(UINT64_MAX),
@@ -498,6 +536,7 @@ mem_handle::mem_handle(mem_handle && other) noexcept :
     arena_gen_(other.arena_gen_),
     gen_(other.gen_),
     cached_(other.cached_),
+    owned_alloc_(std::move(other.owned_alloc_)),
     leased_entry_(other.leased_entry_),
     chunk_source_(other.chunk_source_),
     host_chunk_handle_(other.host_chunk_handle_),
@@ -528,6 +567,7 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
     arena_gen_         = other.arena_gen_;
     gen_               = other.gen_;
     cached_            = other.cached_;
+    owned_alloc_       = other.owned_alloc_;
     leased_entry_      = other.leased_entry_;
     chunk_source_      = other.chunk_source_;
     chunk_device_      = other.chunk_device_;
@@ -563,6 +603,7 @@ mem_handle & mem_handle::operator=(mem_handle && other) noexcept {
     arena_gen_               = other.arena_gen_;
     gen_                     = other.gen_;
     cached_                  = other.cached_;
+    owned_alloc_             = std::move(other.owned_alloc_);
     leased_entry_            = other.leased_entry_;
     chunk_source_            = other.chunk_source_;
     host_chunk_handle_       = other.host_chunk_handle_;

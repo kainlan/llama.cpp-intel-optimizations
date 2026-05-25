@@ -92,19 +92,26 @@ struct moe_gate_up_pair {
     const ggml_tensor * ids             = nullptr;
     const ggml_tensor * up_bias         = nullptr;
     const ggml_tensor * gate_bias       = nullptr;
+    const ggml_tensor * down_bias       = nullptr;
     const ggml_tensor * down_weight     = nullptr;
+    const ggml_tensor * moe_weights     = nullptr;
     ggml_tensor *       up_dst          = nullptr;
     ggml_tensor *       gate_dst        = nullptr;
     ggml_tensor *       up_biased       = nullptr;
     ggml_tensor *       gate_biased     = nullptr;
     ggml_tensor *       glu_dst         = nullptr;
     ggml_tensor *       down_dst        = nullptr;
+    ggml_tensor *       down_biased     = nullptr;
+    ggml_tensor *       weighted_dst    = nullptr;
     int                 up_index        = -1;
     int                 gate_index      = -1;
     int                 up_bias_index   = -1;
     int                 gate_bias_index = -1;
     int                 glu_index       = -1;
     int                 down_index      = -1;
+    int                 down_bias_index = -1;
+    int                 weighted_index  = -1;
+    int                 down_sum_final_index = -1;
     enum ggml_glu_op    glu_op          = GGML_GLU_OP_SWIGLU;
 };
 
@@ -116,6 +123,7 @@ struct moe_layer_grouped_route_row {
 
 struct moe_layer_decode_role_plan {
     const ggml_tensor *                weight = nullptr;
+    ggml_layout_mode                   layout = GGML_LAYOUT_AOS;
     std::vector<int32_t>               expert_ids;
     std::vector<mem_handle>            handles;
     std::vector<moe_layer_grouped_route_row> rows;
@@ -138,6 +146,48 @@ struct moe_layer_decode_artifact_plan {
     const ggml_tensor * tensor = nullptr;
     mem_handle        handle;
     resolved_ptr      resolved;
+};
+
+struct moe_layer_persistent_tensor_descriptor {
+    const char *        role   = nullptr;
+    const ggml_tensor * tensor = nullptr;
+    mem_handle          handle;
+};
+
+struct moe_layer_persistent_role_descriptor {
+    const char *           role   = nullptr;
+    const ggml_tensor *    weight = nullptr;
+    ggml_layout_mode       layout = GGML_LAYOUT_AOS;
+    std::vector<mem_handle>  expert_handles;
+    std::vector<sycl::event> ready_events;
+
+    size_t experts() const { return expert_handles.size(); }
+};
+
+struct moe_layer_persistent_descriptor {
+    int                                    layer         = -1;
+    int                                    submit_device = -1;
+    int64_t                                top_k         = 0;
+    moe_layer_persistent_tensor_descriptor activation;
+    moe_layer_persistent_tensor_descriptor ids_control;
+    moe_layer_persistent_role_descriptor   gate;
+    moe_layer_persistent_role_descriptor   up;
+    moe_layer_persistent_role_descriptor   down;
+
+    size_t retained_handles() const {
+        size_t n = 0;
+        n += activation.handle.valid() ? 1 : 0;
+        n += ids_control.handle.valid() ? 1 : 0;
+        n += gate.expert_handles.size();
+        n += up.expert_handles.size();
+        n += down.expert_handles.size();
+        return n;
+    }
+
+    bool complete() const {
+        return layer >= 0 && submit_device >= 0 && activation.handle.valid() && ids_control.handle.valid() &&
+               !gate.expert_handles.empty() && !up.expert_handles.empty() && !down.expert_handles.empty();
+    }
 };
 
 struct moe_layer_decode_plan {
@@ -181,6 +231,61 @@ enum class moe_layer_route_residency : uint8_t {
     MISSING = 0,
     DEVICE  = 1,
     HOST    = 2,
+};
+
+enum class moe_route_phase : uint8_t {
+    DECODE = 0,
+    PROMPT = 1,
+};
+
+inline const char * moe_route_phase_name(moe_route_phase phase) {
+    switch (phase) {
+        case moe_route_phase::DECODE:
+            return "decode";
+        case moe_route_phase::PROMPT:
+            return "prompt";
+    }
+    return "unknown";
+}
+
+enum class moe_route_kernel : uint8_t {
+    NONE          = 0,
+    HOST_CPU      = 1,
+    MMVQ_COMPAT   = 2,
+    SECONDARY_SOA = 3,
+    XMX_TILED     = 4,
+    MXFP4_I8      = 5,
+    MXFP4_DPAS    = 6,
+};
+
+inline const char * moe_route_kernel_name(moe_route_kernel kernel) {
+    switch (kernel) {
+        case moe_route_kernel::NONE:
+            return "none";
+        case moe_route_kernel::HOST_CPU:
+            return "host-cpu";
+        case moe_route_kernel::MMVQ_COMPAT:
+            return "mmvq-compat";
+        case moe_route_kernel::SECONDARY_SOA:
+            return "secondary-soa";
+        case moe_route_kernel::XMX_TILED:
+            return "xmx-tiled";
+        case moe_route_kernel::MXFP4_I8:
+            return "mxfp4-i8";
+        case moe_route_kernel::MXFP4_DPAS:
+            return "mxfp4-dpas";
+    }
+    return "unknown";
+}
+
+struct moe_route_capability {
+    bool                    supported             = false;
+    bool                    local_device          = false;
+    bool                    requires_host_staging = false;
+    moe_route_phase         phase                 = moe_route_phase::DECODE;
+    moe_route_kernel        kernel                = moe_route_kernel::NONE;
+    moe_layer_reject_reason reject_reason         = moe_layer_reject_reason::NONE;
+    const char *            reason                = "uninitialized";
 };
 
 struct moe_layer_grouped_route_group {

@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <vector>
 
 namespace ggml_sycl {
@@ -156,6 +157,13 @@ class mem_handle {
                                      ggml_layout_mode layout    = GGML_LAYOUT_AOS,
                                      bool             on_device = false);
 
+    // Create an owning DIRECT handle from an allocation-time handle.  Copies of
+    // the mem_handle share ownership; the underlying allocation is released via
+    // unified_free() when the last copy is destroyed.  This is the canonical
+    // bridge for runtime allocations whose lifetime must survive asynchronous
+    // queue submission.
+    static mem_handle from_owned_alloc(alloc_handle handle, ggml_layout_mode layout = GGML_LAYOUT_AOS);
+
     // Resolve for a dispatch device. Device-resident pointers must belong to
     // that device; host-resident pointers are returned for any device. The
     // handle's device_ is the allocator/cache owner used for re-resolution.
@@ -235,6 +243,11 @@ class mem_handle {
     // pointer) but updates the cache as a side effect.
     mutable uint64_t     gen_    = 0;
     mutable resolved_ptr cached_ = {};
+
+    // Optional runtime allocation owner.  DIRECT handles that wrap scratch,
+    // staging, or runtime allocations can carry this shared owner so copies are
+    // true ref-counted leases rather than raw pointer aliases.
+    std::shared_ptr<alloc_handle> owned_alloc_;
 
     // Lease-protected backing entry pointer (llama.cpp-vtf7f).  When non-null,
     // this handle has incremented the entry's in_use_count, guaranteeing the

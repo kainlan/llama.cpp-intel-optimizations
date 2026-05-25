@@ -565,6 +565,10 @@ static void watchdog_thread_fn(int64_t timeout_ms) {
         if (!g_watchdog_active.load(std::memory_order_acquire)) {
             break;
         }
+        if (ggml_sycl_graph_inflight_count() <= 0) {
+            ggml_sycl_watchdog_heartbeat();
+            continue;
+        }
         const int64_t last    = g_watchdog_last_tick_ns.load(std::memory_order_relaxed);
         const int64_t now     = ggml_sycl_watchdog_now_ns();
         const int64_t elapsed = now - last;
@@ -901,11 +905,14 @@ XMXCapabilities query_xmx_capabilities(sycl::device & dev) {
         // Per tile in N dimension: XMX_N * XMX_K / 2 bytes
         size_t weight_tile_bytes = caps.N * caps.K / 2;
 
-        // Max tiles_n that fit in available SLM (conservative: 50% of remaining budget)
-        // This ensures room for accumulation buffers and other SLM usage
+        // Max tiles_n that fit in available SLM (conservative: 50% of remaining budget).
+        // The current singleton selected-expert executor only consumes one useful
+        // DPAS N tile. Larger layout groups fit in SLM, but measured neutral/slower
+        // on GPT-OSS until a grouped/batched kernel fills the extra N columns.
         if (weight_tile_bytes > 0 && slm_for_weights > 0) {
+            constexpr int singleton_supported_tiles_n = 1;
             int max_tiles_from_slm  = static_cast<int>((slm_for_weights / 2) / weight_tile_bytes);
-            caps.optimal_tiles_n    = std::max(1, std::min(1, max_tiles_from_slm));
+            caps.optimal_tiles_n    = std::max(1, std::min(singleton_supported_tiles_n, max_tiles_from_slm));
             slm_calculation_success = true;
 
             GGML_LOG_INFO("[XMX] decode-aware optimal_tiles_n=%d (SLM=%zuKB, max_slm_tiles_n=%d, weight_tile=%zuB, token_tile=%zuB)\n",

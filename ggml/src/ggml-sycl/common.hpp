@@ -19,12 +19,14 @@
 #include "kv-offload.hpp"
 #include "layer-streaming.hpp"
 #include "mem-handle.hpp"
+#include "moe-layer-plan.hpp"
 #include "orchestrator.hpp"
 #include "presets.hpp"
 #include "sycl_hw.hpp"
 #include "tensor-types.hpp"
 #include "unified-cache.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -648,8 +650,82 @@ struct mxfp4_grouped_dpas_decision {
     size_t       required_sg    = 0;
 };
 
+struct mxfp4_grouped_dpas_occupancy_decision {
+    bool         dispatch_ready = false;
+    const char * reason         = "not-evaluated";
+    size_t       row_tile       = 0;
+    size_t       active_groups  = 0;
+    size_t       total_rows     = 0;
+    size_t       padded_rows    = 0;
+    size_t       max_rows       = 0;
+    size_t       max_total_rows = 0;
+    size_t       chunks         = 0;
+    size_t       min_util_num   = 2;
+    size_t       min_util_den   = 3;
+};
+
 static inline bool ggml_sycl_mxfp4_moe_coalesced_shape_ok(int64_t in_dim) {
     return in_dim > 0 && (in_dim % QK_MXFP4) == 0 && ((in_dim / QK_MXFP4) % MMVQ_COALESCED_TILE_BLOCKS) == 0;
+}
+
+static constexpr size_t GGML_SYCL_MXFP4_GROUPED_DPAS_ROW_LIST_TILES = 16;
+
+static inline size_t ggml_sycl_mxfp4_grouped_dpas_row_list_limit(const XMXCapabilities & caps) {
+    return caps.N == 0 ? 0 : caps.N * GGML_SYCL_MXFP4_GROUPED_DPAS_ROW_LIST_TILES;
+}
+
+static inline mxfp4_grouped_dpas_occupancy_decision ggml_sycl_select_mxfp4_grouped_dpas_occupancy(
+    const XMXCapabilities & caps,
+    const int32_t *         rows_per_group,
+    size_t                  n_groups,
+    size_t                  max_total_rows = 0) {
+    mxfp4_grouped_dpas_occupancy_decision d{};
+    d.row_tile       = caps.N;
+    d.max_total_rows = max_total_rows;
+
+    if (caps.N == 0) {
+        d.reason = "capability";
+        return d;
+    }
+    if (!rows_per_group || n_groups == 0) {
+        d.reason = "groups";
+        return d;
+    }
+
+    for (size_t i = 0; i < n_groups; ++i) {
+        const int32_t rows_i = rows_per_group[i];
+        if (rows_i <= 0) {
+            continue;
+        }
+        const size_t rows = static_cast<size_t>(rows_i);
+        d.active_groups++;
+        d.total_rows += rows;
+        d.max_rows          = std::max(d.max_rows, rows);
+        const size_t chunks = (rows + caps.N - 1) / caps.N;
+        d.chunks += chunks;
+        d.padded_rows += chunks * caps.N;
+    }
+
+    if (d.active_groups == 0 || d.total_rows == 0) {
+        d.reason = "groups";
+        return d;
+    }
+    if (max_total_rows > 0 && d.total_rows > max_total_rows) {
+        d.reason = "kernel-row-limit";
+        return d;
+    }
+    if (d.max_rows < caps.N) {
+        d.reason = "rows-per-expert";
+        return d;
+    }
+    if (d.padded_rows * d.min_util_num > d.total_rows * d.min_util_den) {
+        d.reason = "occupancy";
+        return d;
+    }
+
+    d.dispatch_ready = true;
+    d.reason         = "ok";
+    return d;
 }
 
 static inline mxfp4_grouped_dpas_decision ggml_sycl_select_mxfp4_grouped_dpas(const XMXCapabilities & caps,
@@ -929,9 +1005,8 @@ size_t                        ggml_sycl_get_free_vram_at_init(int device);
 size_t                        ggml_sycl_get_host_max_alloc_size();
 
 // Access a device by logical GPU index using the full (pre-scheduler-hiding) map.
-// Unlike ggml_sycl_get_device() which uses the scheduler-filtered map and falls
-// back to identity for hidden devices (wrong when non-GPU devices are interleaved
-// in dpct enumeration), this uses gpu_dpct_ids[] which was saved before hiding.
+// ggml_sycl_get_device() uses the same full map for GPU logical IDs; this helper
+// is useful during initialization and in paths that need the saved map explicitly.
 inline dpct::device_ext & ggml_sycl_get_gpu_device(int gpu_index) {
     const auto & info = ggml_sycl_info();
     GGML_ASSERT(gpu_index >= 0 && gpu_index < info.total_gpu_count);
@@ -4327,9 +4402,11 @@ struct ggml_backend_sycl_context {
     ggml_sycl_pool & host_pool() { return host_pool(device); }
 
     // Flag to disable graphs when weight streaming is active
-    bool                               weight_streaming_graphs_disabled = false;
-    std::vector<ggml_sycl::mem_handle> graph_weight_leases;
-    std::vector<ggml_sycl::mem_handle> graph_moe_expert_leases;
+    bool                                                    weight_streaming_graphs_disabled = false;
+    std::vector<ggml_sycl::mem_handle>                      graph_weight_leases;
+    std::vector<ggml_sycl::mem_handle>                      graph_moe_expert_leases;
+    std::vector<ggml_sycl::mem_handle>                      persistent_moe_descriptor_leases;
+    std::vector<ggml_sycl::moe_layer_persistent_descriptor> persistent_moe_descriptors;
 
     struct fa_graph_ptr_snapshot {
         const void * q           = nullptr;

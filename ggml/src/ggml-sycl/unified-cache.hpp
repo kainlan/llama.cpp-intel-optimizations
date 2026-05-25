@@ -179,6 +179,12 @@ enum class expert_placement_status : uint8_t {
     MISSING = 1,
 };
 
+struct placement_alternate_layout {
+    ggml_layout_mode layout           = GGML_LAYOUT_AOS;
+    size_t           dst_size         = 0;
+    size_t           vram_charge_size = 0;
+};
+
 struct expert_placement_result {
     expert_placement_status status    = expert_placement_status::MISSING;
     int                     layer_id  = -1;
@@ -191,6 +197,7 @@ struct expert_placement_result {
     size_t                  dst_size         = 0;
     size_t                  vram_charge_size = 0;
     ggml_layout_mode        layout           = GGML_LAYOUT_AOS;
+    std::vector<placement_alternate_layout> alternate_layouts;
     placement_priority      priority         = placement_priority::COUNT;
 
     bool found() const { return status == expert_placement_status::FOUND; }
@@ -230,6 +237,7 @@ struct placement_entry {
     int                expert_id         = -1;  // -1 for dense weights, >=0 for individual MoE experts
     expert_tensor_role expert_role       = expert_tensor_role::UNKNOWN;  // gate/up/down for MoE expert tensors
     ggml_layout_mode   layout            = GGML_LAYOUT_AOS;  // Materialized device layout planned for this entry
+    std::vector<placement_alternate_layout> alternate_layouts;  // Additional cache-owned executable layouts
     bool               on_device         = false;            // true = VRAM (any device), false = host
     int                target_device     = -1;               // Target GPU device_id (-1 = host/CPU)
     size_t             vram_charge_size  = 0;  // Bytes consumed by zone_alloc(WEIGHT) after allocator rounding
@@ -471,6 +479,7 @@ struct placement_plan {
         result.dst_size         = e.dst_size;
         result.vram_charge_size = e.vram_charge_size;
         result.layout           = e.layout;
+        result.alternate_layouts = e.alternate_layouts;
         result.priority         = e.priority;
         return result;
     }

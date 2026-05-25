@@ -65,6 +65,8 @@ struct mxfp4_pair_glu_bench_args {
     float *              output             = nullptr;
     float *              gate_tmp           = nullptr;
     float *              up_tmp             = nullptr;
+    int8_t *             dpas_b_packed      = nullptr;
+    float *              dpas_y_scales      = nullptr;
     const int32_t *      ids                = nullptr;
     const float *        gate_bias          = nullptr;
     const float *        up_bias            = nullptr;
@@ -89,6 +91,10 @@ struct mxfp4_pair_glu_bench_args {
     int   rows_per_wg         = 4;
     bool  cache_y             = true;
     bool  direct_xmx          = false;
+    bool  xmx_tiled           = false;
+    bool  xmx_tiled_pack_q8   = false;
+    bool  xmx_tiled_prefetch  = false;
+    int   xmx_tiled_m_tiles   = 1;
     bool  split_gate_up       = false;
     bool  predecoded_i8       = false;
     int   xmx_tiles_n         = 1;

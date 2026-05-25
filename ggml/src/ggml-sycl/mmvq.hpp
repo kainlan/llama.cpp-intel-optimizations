@@ -29,6 +29,17 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx,
                                 const int64_t               src1_padded_row_size,
                                 const dpct::queue_ptr &     stream);
 
+struct ggml_sycl_mmvq_fused_add {
+    const float * data = nullptr;
+    int64_t       ne0  = 0;
+    int64_t       nb0  = sizeof(float);
+
+    bool active() const { return data != nullptr && ne0 > 0 && nb0 > 0; }
+};
+
+void ggml_sycl_mmvq_set_fused_add(const ggml_sycl_mmvq_fused_add & add);
+void ggml_sycl_mmvq_clear_fused_add();
+
 // MoE-aware MUL_MAT_ID dispatch: GPU-side expert routing without host sync
 // This is compatible with SYCL command graph recording
 // Returns true if the operation was handled, false to fall back to host-side routing
@@ -71,7 +82,9 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &   ctx,
                                int64_t                       direct_ids_nb1       = 0,
                                const ggml_sycl::mem_handle * src1_handle_override = nullptr,
                                const int32_t *               ids_host             = nullptr,
-                               int64_t                       ids_host_count       = 0);
+                               int64_t                       ids_host_count       = 0,
+                               sycl::event *                 completion_event     = nullptr,
+                               bool *                        completion_event_set = nullptr);
 
 bool mmvq_moe_batched_dispatch_pair_mxfp4_soa(ggml_backend_sycl_context & ctx,
                                               const ggml_tensor *         src0_a,
@@ -112,7 +125,9 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                                                   ggml_tensor *                 gate_tmp                = nullptr,
                                                   ggml_tensor *                 up_tmp                  = nullptr,
                                                   const int32_t *               ids_host                = nullptr,
-                                                  int64_t                       ids_host_count          = 0);
+                                                  int64_t                       ids_host_count          = 0,
+                                                  sycl::event *                 completion_event        = nullptr,
+                                                  bool *                        completion_event_set    = nullptr);
 
 struct mmvq_moe_dispatch_timing {
     double activation_quant_us = 0.0;
@@ -173,6 +188,17 @@ void mmvq_submit_mxfp4_soa(sycl::queue & q,
                            int           nrows,
                            int           total_nrows,
                            int           row_low);
+
+void mmvq_submit_mxfp4_soa_batched(sycl::queue &        q,
+                                   const void * const * expert_ptrs_device,
+                                   const void *         y_q8_soa,
+                                   const int32_t *      ids_device,
+                                   float *              dst,
+                                   int                  ncols,
+                                   int                  nrows,
+                                   int                  total_batches,
+                                   int64_t              q8_row_stride,
+                                   int64_t              dst_row_stride);
 
 // Coalesced MXFP4 MMVQ kernel submission
 // vx: coalesced-layout weights (quants tiled word-major, then exponents)

@@ -171,6 +171,43 @@ static bool run_mxfp4_grouped_dpas_policy_test() {
         return false;
     }
 
+    const int32_t dense_counts[] = { 16, 16, 16, 16 };
+    auto          occupancy      = ggml_sycl_select_mxfp4_grouped_dpas_occupancy(caps, dense_counts,
+                                                                                 sizeof(dense_counts) / sizeof(dense_counts[0]));
+    if (!occupancy.dispatch_ready || occupancy.total_rows != 64 || occupancy.padded_rows != 64 ||
+        std::strcmp(occupancy.reason, "ok") != 0) {
+        printf("FAIL: expected dense grouped occupancy ready, got ready=%d rows=%zu padded=%zu reason=%s\n",
+               occupancy.dispatch_ready ? 1 : 0, occupancy.total_rows, occupancy.padded_rows, occupancy.reason);
+        return false;
+    }
+
+    const int32_t sparse_counts[] = { 16, 1, 1, 1 };
+    occupancy                     = ggml_sycl_select_mxfp4_grouped_dpas_occupancy(caps, sparse_counts,
+                                                                                  sizeof(sparse_counts) / sizeof(sparse_counts[0]));
+    if (occupancy.dispatch_ready || std::strcmp(occupancy.reason, "occupancy") != 0) {
+        printf("FAIL: expected sparse grouped occupancy rejection, got ready=%d rows=%zu padded=%zu reason=%s\n",
+               occupancy.dispatch_ready ? 1 : 0, occupancy.total_rows, occupancy.padded_rows, occupancy.reason);
+        return false;
+    }
+
+    const int32_t underfilled_counts[] = { 15, 15, 15, 15 };
+    occupancy                          = ggml_sycl_select_mxfp4_grouped_dpas_occupancy(
+        caps, underfilled_counts, sizeof(underfilled_counts) / sizeof(underfilled_counts[0]));
+    if (occupancy.dispatch_ready || std::strcmp(occupancy.reason, "rows-per-expert") != 0) {
+        printf("FAIL: expected underfilled grouped occupancy rejection, got ready=%d max=%zu reason=%s\n",
+               occupancy.dispatch_ready ? 1 : 0, occupancy.max_rows, occupancy.reason);
+        return false;
+    }
+
+    const int32_t pp_counts[] = { 512, 512, 512, 512 };
+    occupancy = ggml_sycl_select_mxfp4_grouped_dpas_occupancy(caps, pp_counts, sizeof(pp_counts) / sizeof(pp_counts[0]),
+                                                              ggml_sycl_mxfp4_grouped_dpas_row_list_limit(caps));
+    if (occupancy.dispatch_ready || std::strcmp(occupancy.reason, "kernel-row-limit") != 0) {
+        printf("FAIL: expected PP row-list kernel rejection, got ready=%d rows=%zu limit=%zu reason=%s\n",
+               occupancy.dispatch_ready ? 1 : 0, occupancy.total_rows, occupancy.max_total_rows, occupancy.reason);
+        return false;
+    }
+
     printf("PASS: grouped DPAS policy is capability/shape/layout/residency driven\n");
     return true;
 }
