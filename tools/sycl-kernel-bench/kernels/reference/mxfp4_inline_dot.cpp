@@ -970,6 +970,7 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
                         bool                         cache_y,
                         bool                         direct_xmx,
                         bool                         xmx_tiled,
+                        bool                         xmx_tiled_grouped,
                         bool                         xmx_tiled_pack_q8,
                         bool                         xmx_tiled_prefetch,
                         int                          xmx_tiled_m_tiles,
@@ -1007,6 +1008,10 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     if (xmx_tiled && (direct_xmx || split_gate_up || predecoded_i8 || vector_qs_load || scale_stride_blocks > 0)) {
         error =
             "mxfp4_pair_glu XMX_TILED path is exclusive with SOA-XMX/split/predecoded/vector/scale-stride variants.";
+        return false;
+    }
+    if (xmx_tiled_grouped && (!xmx_tiled || xmx_tiled_pack_q8 || rows_per_wg != 8 || xmx_tiled_m_tiles != 1)) {
+        error = "mxfp4_pair_glu grouped XMX_TILED path requires un-packed xmx_tiled r8.";
         return false;
     }
     if (xmx_tiled_pack_q8 && !xmx_tiled) {
@@ -1115,16 +1120,22 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
         needs_ref_weights ? sycl::malloc_device<const uint8_t *>(expert_slots, queue) : nullptr;
     const uint8_t ** d_ref_up_ptrs =
         needs_ref_weights ? sycl::malloc_device<const uint8_t *>(expert_slots, queue) : nullptr;
-    uint8_t *  d_act        = sycl::malloc_device<uint8_t>(act_bytes, queue);
-    int32_t *  d_ids        = sycl::malloc_device<int32_t>(ids_count, queue);
-    float *    d_out        = sycl::malloc_device<float>(out_count, queue);
-    float *    d_gate_bias  = use_bias ? sycl::malloc_device<float>(bias_count, queue) : nullptr;
-    float *    d_up_bias    = use_bias ? sycl::malloc_device<float>(bias_count, queue) : nullptr;
-    const bool need_ref_out = validate && (direct_xmx || xmx_tiled || split_gate_up || vector_qs_load);
-    float *    d_ref_out    = need_ref_out ? sycl::malloc_device<float>(out_count, queue) : nullptr;
-    float *    d_gate_tmp   = split_gate_up ? sycl::malloc_device<float>(out_count, queue) : nullptr;
-    float *    d_up_tmp     = split_gate_up ? sycl::malloc_device<float>(out_count, queue) : nullptr;
-    int8_t *   d_dpas_b =
+    uint8_t *  d_act                = sycl::malloc_device<uint8_t>(act_bytes, queue);
+    int32_t *  d_ids                = sycl::malloc_device<int32_t>(ids_count, queue);
+    int32_t *  d_grouped_experts    = nullptr;
+    int32_t *  d_grouped_offsets    = nullptr;
+    int32_t *  d_grouped_rows       = nullptr;
+    int32_t *  d_grouped_chunks     = nullptr;
+    int32_t *  d_grouped_row_starts = nullptr;
+    float *    d_out                = sycl::malloc_device<float>(out_count, queue);
+    float *    d_gate_bias          = use_bias ? sycl::malloc_device<float>(bias_count, queue) : nullptr;
+    float *    d_up_bias            = use_bias ? sycl::malloc_device<float>(bias_count, queue) : nullptr;
+    const bool need_ref_out =
+        validate && (direct_xmx || xmx_tiled || xmx_tiled_grouped || split_gate_up || vector_qs_load);
+    float *  d_ref_out  = need_ref_out ? sycl::malloc_device<float>(out_count, queue) : nullptr;
+    float *  d_gate_tmp = split_gate_up ? sycl::malloc_device<float>(out_count, queue) : nullptr;
+    float *  d_up_tmp   = split_gate_up ? sycl::malloc_device<float>(out_count, queue) : nullptr;
+    int8_t * d_dpas_b =
         xmx_tiled_pack_q8 ? sycl::malloc_device<int8_t>(dpas_b_bytes == 0 ? 1 : dpas_b_bytes, queue) : nullptr;
     float * d_dpas_y =
         xmx_tiled_pack_q8 ?
@@ -1161,6 +1172,21 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
         }
         if (d_ids) {
             sycl::free(d_ids, queue);
+        }
+        if (d_grouped_experts) {
+            sycl::free(d_grouped_experts, queue);
+        }
+        if (d_grouped_offsets) {
+            sycl::free(d_grouped_offsets, queue);
+        }
+        if (d_grouped_rows) {
+            sycl::free(d_grouped_rows, queue);
+        }
+        if (d_grouped_chunks) {
+            sycl::free(d_grouped_chunks, queue);
+        }
+        if (d_grouped_row_starts) {
+            sycl::free(d_grouped_row_starts, queue);
         }
         if (d_out) {
             sycl::free(d_out, queue);
@@ -1219,6 +1245,68 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
         }
     }
 
+    std::vector<int32_t> grouped_experts_host;
+    std::vector<int32_t> grouped_offsets_host;
+    std::vector<int32_t> grouped_rows_host;
+    std::vector<int32_t> grouped_chunks_host;
+    std::vector<int32_t> grouped_row_starts_host;
+    if (xmx_tiled_grouped) {
+        constexpr int                     exec_n         = GGML_SYCL_MXFP4_MOE_XMX_N;
+        constexpr int                     row_list_tiles = 16;
+        const size_t                      row_limit      = static_cast<size_t>(exec_n * row_list_tiles);
+        std::vector<std::vector<int32_t>> grouped_slots;
+        grouped_slots.reserve(std::min(expert_slots, ids_count));
+        for (size_t token = 0; token < token_count; ++token) {
+            for (size_t sel = 0; sel < selected_count; ++sel) {
+                const int32_t eid = host_ids[token * selected_count + sel];
+                auto          it  = std::find(grouped_experts_host.begin(), grouped_experts_host.end(), eid);
+                size_t        group_index;
+                if (it == grouped_experts_host.end()) {
+                    group_index = grouped_experts_host.size();
+                    grouped_experts_host.push_back(eid);
+                    grouped_slots.emplace_back();
+                } else {
+                    group_index = static_cast<size_t>(std::distance(grouped_experts_host.begin(), it));
+                }
+                grouped_slots[group_index].push_back(static_cast<int32_t>(sel * token_count + token));
+            }
+        }
+        grouped_offsets_host.reserve(grouped_experts_host.size() + 1);
+        grouped_offsets_host.push_back(0);
+        for (size_t group = 0; group < grouped_slots.size(); ++group) {
+            auto & rows = grouped_slots[group];
+            std::sort(rows.begin(), rows.end());
+            const int rows_begin = static_cast<int>(grouped_rows_host.size());
+            grouped_rows_host.insert(grouped_rows_host.end(), rows.begin(), rows.end());
+            for (int row_start = 0; row_start < static_cast<int>(rows.size()); row_start += exec_n) {
+                grouped_chunks_host.push_back(static_cast<int32_t>(group));
+                grouped_row_starts_host.push_back(row_start);
+            }
+            grouped_offsets_host.push_back(rows_begin + static_cast<int>(rows.size()));
+        }
+        if (grouped_rows_host.size() != ids_count || grouped_chunks_host.empty() || row_limit == 0) {
+            cleanup();
+            error = "mxfp4_pair_glu grouped XMX_TILED setup failed.";
+            return false;
+        }
+        d_grouped_experts    = sycl::malloc_device<int32_t>(grouped_experts_host.size(), queue);
+        d_grouped_offsets    = sycl::malloc_device<int32_t>(grouped_offsets_host.size(), queue);
+        d_grouped_rows       = sycl::malloc_device<int32_t>(grouped_rows_host.size(), queue);
+        d_grouped_chunks     = sycl::malloc_device<int32_t>(grouped_chunks_host.size(), queue);
+        d_grouped_row_starts = sycl::malloc_device<int32_t>(grouped_row_starts_host.size(), queue);
+        if (!d_grouped_experts || !d_grouped_offsets || !d_grouped_rows || !d_grouped_chunks || !d_grouped_row_starts) {
+            cleanup();
+            error = "device allocation failed for grouped mxfp4_pair_glu.";
+            return false;
+        }
+        queue.memcpy(d_grouped_experts, grouped_experts_host.data(), grouped_experts_host.size() * sizeof(int32_t));
+        queue.memcpy(d_grouped_offsets, grouped_offsets_host.data(), grouped_offsets_host.size() * sizeof(int32_t));
+        queue.memcpy(d_grouped_rows, grouped_rows_host.data(), grouped_rows_host.size() * sizeof(int32_t));
+        queue.memcpy(d_grouped_chunks, grouped_chunks_host.data(), grouped_chunks_host.size() * sizeof(int32_t));
+        queue.memcpy(d_grouped_row_starts, grouped_row_starts_host.data(),
+                     grouped_row_starts_host.size() * sizeof(int32_t));
+    }
+
     queue.memcpy(d_gate, gate_slices.data(), weight_bytes);
     queue.memcpy(d_up, up_slices.data(), weight_bytes);
     queue.memcpy(d_gate_ptrs, host_gate_ptrs.data(), expert_slots * sizeof(const uint8_t *));
@@ -1262,6 +1350,11 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     args.dpas_b_packed       = d_dpas_b;
     args.dpas_y_scales       = d_dpas_y;
     args.ids                 = d_ids;
+    args.grouped_expert_ids  = d_grouped_experts;
+    args.grouped_offsets     = d_grouped_offsets;
+    args.grouped_row_slots   = d_grouped_rows;
+    args.grouped_chunks      = d_grouped_chunks;
+    args.grouped_row_starts  = d_grouped_row_starts;
     args.ncols               = static_cast<int>(k);
     args.ncols_y             = static_cast<int>(k);
     args.nrows_per_expert    = static_cast<int>(m);
@@ -1283,6 +1376,7 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     args.cache_y             = cache_y;
     args.direct_xmx          = direct_xmx;
     args.xmx_tiled           = xmx_tiled;
+    args.xmx_tiled_grouped   = xmx_tiled_grouped;
     args.xmx_tiled_pack_q8   = xmx_tiled_pack_q8;
     args.xmx_tiled_prefetch  = xmx_tiled_prefetch;
     args.xmx_tiled_m_tiles   = xmx_tiled_m_tiles;
@@ -1293,6 +1387,7 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     args.ignore_weight_scale = ignore_weight_scale;
     args.scale_stride_blocks = scale_stride_blocks;
     args.subgroup_size       = subgroup_size;
+    args.grouped_n_chunks    = static_cast<int>(grouped_chunks_host.size());
     args.glu_op              = GGML_GLU_OP_SWIGLU_OAI;
     args.alpha               = 1.702f;
     args.limit               = 7.0f;
@@ -1363,6 +1458,7 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
             }
             ref_args.direct_xmx         = false;
             ref_args.xmx_tiled          = false;
+            ref_args.xmx_tiled_grouped  = false;
             ref_args.xmx_tiled_pack_q8  = false;
             ref_args.xmx_tiled_prefetch = false;
             ref_args.xmx_tiled_m_tiles  = 1;
@@ -1372,6 +1468,12 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
             ref_args.up_tmp             = nullptr;
             ref_args.dpas_b_packed      = nullptr;
             ref_args.dpas_y_scales      = nullptr;
+            ref_args.grouped_expert_ids = nullptr;
+            ref_args.grouped_offsets    = nullptr;
+            ref_args.grouped_row_slots  = nullptr;
+            ref_args.grouped_chunks     = nullptr;
+            ref_args.grouped_row_starts = nullptr;
+            ref_args.grouped_n_chunks   = 0;
             ref_args.xmx_tiles_n        = 1;
             ref_args.vector_qs_load     = false;
             ref_args.rows_per_wg        = 1;

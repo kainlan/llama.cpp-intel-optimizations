@@ -1930,7 +1930,7 @@ bool convert_tensor_to_coalesced(const ggml_tensor * tensor, dpct::queue_ptr str
     const int64_t nrows     = ggml_nrows(tensor);
     int           device_id = -1;
     device_id               = ggml_sycl_get_device_id_from_queue(*stream);
-    void * tensor_ptr = ggml_sycl_resolve_tensor_ptr(tensor, device_id);
+    void * tensor_ptr       = ggml_sycl_resolve_tensor_ptr(tensor, device_id);
     if (!tensor_ptr) {
         fprintf(stderr, "[COALESCED-UNIFIED] ERROR: tensor '%s' has no resolved device pointer\n",
                 tensor->name ? tensor->name : "?");
@@ -3034,12 +3034,9 @@ static void mul_mat_vec_q4_K_q8_1_sycl(const void *    vx,
             cgh.parallel_for<mmvq_kernel_name<GGML_TYPE_Q4_K>>(
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                    mul_mat_vec_q<QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1>(vx, vy, dst, ncols,
-                                                                                                  nrows, item_ct1,
-                                                                                                  fused_add,
-                                                                                                  fused_add_ne0,
-                                                                                                  fused_add_nb0,
-                                                                                                  fused_add_row_base);
+                    mul_mat_vec_q<QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1>(
+                        vx, vy, dst, ncols, nrows, item_ct1, fused_add, fused_add_ne0, fused_add_nb0,
+                        fused_add_row_base);
                 });
         });
     }
@@ -3071,10 +3068,9 @@ static void reorder_mul_mat_vec_q4_k_q8_1_sycl(const void *    vx,
         cgh.parallel_for<mmvq_reorder_kernel_name<GGML_TYPE_Q4_K>>(
             sycl::nd_range<3>(global_size, workgroup_size),
             [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q4_K>>(vx, vy, dst, ncols, nrows, total_nrows,
-                                                                              row_low, nd_item, fused_add,
-                                                                              fused_add_ne0, fused_add_nb0,
-                                                                              fused_add_row_base);
+                mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q4_K>>(
+                    vx, vy, dst, ncols, nrows, total_nrows, row_low, nd_item, fused_add, fused_add_ne0, fused_add_nb0,
+                    fused_add_row_base);
             });
     });
 }
@@ -3168,12 +3164,9 @@ static void mul_mat_vec_iq2_xxs_q8_1_sycl(const void *    vx,
         stream->submit([&](sycl::handler & cgh) {
             cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
                              [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                 mul_mat_vec_q_iq2_xxs_q8_1<QK_K, QI2_XXS / 2, block_iq2_xxs, 1>(vx, vy, dst, ncols,
-                                                                                                 nrows, item_ct1,
-                                                                                                 fused_add,
-                                                                                                 fused_add_ne0,
-                                                                                                 fused_add_nb0,
-                                                                                                 fused_add_row_base);
+                                 mul_mat_vec_q_iq2_xxs_q8_1<QK_K, QI2_XXS / 2, block_iq2_xxs, 1>(
+                                     vx, vy, dst, ncols, nrows, item_ct1, fused_add, fused_add_ne0, fused_add_nb0,
+                                     fused_add_row_base);
                              });
         });
     }
@@ -6345,27 +6338,27 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_direct_q8_sycl(sycl::queue &   
 }
 
 template <int Repeat>
-static sycl::event mxfp4_xmx_tiled_grouped_direct_q8_sycl(sycl::queue &        queue,
-                                                          const void * const * expert_ptrs,
-                                                          const void *         q8_src,
-                                                          float *              dst,
-                                                          const int32_t *      group_expert_ids,
-                                                          const int32_t *      group_offsets,
-                                                          const int32_t *      group_row_slots,
-                                                          const int32_t *      chunk_groups,
-                                                          const int32_t *      chunk_row_starts,
-                                                          int                  ncols,
-                                                          int                  ncols_y,
-                                                          int                  nrows_per_expert,
-                                                          int                  n_chunks,
-                                                          int                  n_tokens,
-                                                          int                  ne11,
-                                                          int64_t              q8_nb11,
-                                                          int64_t              q8_nb12,
-                                                          int64_t              dst_nb1,
-                                                          int64_t              dst_nb2,
+static sycl::event mxfp4_xmx_tiled_grouped_direct_q8_sycl(sycl::queue &                    queue,
+                                                          const void * const *             expert_ptrs,
+                                                          const void *                     q8_src,
+                                                          float *                          dst,
+                                                          const int32_t *                  group_expert_ids,
+                                                          const int32_t *                  group_offsets,
+                                                          const int32_t *                  group_row_slots,
+                                                          const int32_t *                  chunk_groups,
+                                                          const int32_t *                  chunk_row_starts,
+                                                          int                              ncols,
+                                                          int                              ncols_y,
+                                                          int                              nrows_per_expert,
+                                                          int                              n_chunks,
+                                                          int                              n_tokens,
+                                                          int                              ne11,
+                                                          int64_t                          q8_nb11,
+                                                          int64_t                          q8_nb12,
+                                                          int64_t                          dst_nb1,
+                                                          int64_t                          dst_nb2,
                                                           const std::vector<sycl::event> & deps,
-                                                          int                  tile_n_total) {
+                                                          int                              tile_n_total) {
     constexpr int exec_n = GGML_SYCL_MXFP4_MOE_XMX_N;
     constexpr int k_per  = GGML_SYCL_MXFP4_MOE_XMX_K;
     constexpr int an     = Repeat * k_per;
@@ -6622,34 +6615,34 @@ static sycl::event mxfp4_i8_grouped_direct_q8_sycl(sycl::queue &        queue,
 }
 
 template <int Repeat, int GLU_OP>
-static sycl::event mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_sycl(sycl::queue &        queue,
-                                                                   const void * const * gate_ptrs,
-                                                                   const void * const * up_ptrs,
-                                                                   const void *         q8_src,
-                                                                   float *              dst_glu,
-                                                                   const int32_t *      group_expert_ids,
-                                                                   const int32_t *      group_offsets,
-                                                                   const int32_t *      group_row_slots,
-                                                                   const int32_t *      chunk_groups,
-                                                                   const int32_t *      chunk_row_starts,
-                                                                   const float *        gate_bias,
-                                                                   const float *        up_bias,
-                                                                   int                  ncols,
-                                                                   int                  ncols_y,
-                                                                   int                  nrows_per_expert,
-                                                                   int                  n_chunks,
-                                                                   int                  n_tokens,
-                                                                   int                  ne11,
-                                                                   int64_t              q8_nb11,
-                                                                   int64_t              q8_nb12,
-                                                                   int64_t              dst_nb1,
-                                                                   int64_t              dst_nb2,
-                                                                   int64_t              gate_bias_nb1,
-                                                                   int64_t              up_bias_nb1,
+static sycl::event mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_sycl(sycl::queue &                    queue,
+                                                                   const void * const *             gate_ptrs,
+                                                                   const void * const *             up_ptrs,
+                                                                   const void *                     q8_src,
+                                                                   float *                          dst_glu,
+                                                                   const int32_t *                  group_expert_ids,
+                                                                   const int32_t *                  group_offsets,
+                                                                   const int32_t *                  group_row_slots,
+                                                                   const int32_t *                  chunk_groups,
+                                                                   const int32_t *                  chunk_row_starts,
+                                                                   const float *                    gate_bias,
+                                                                   const float *                    up_bias,
+                                                                   int                              ncols,
+                                                                   int                              ncols_y,
+                                                                   int                              nrows_per_expert,
+                                                                   int                              n_chunks,
+                                                                   int                              n_tokens,
+                                                                   int                              ne11,
+                                                                   int64_t                          q8_nb11,
+                                                                   int64_t                          q8_nb12,
+                                                                   int64_t                          dst_nb1,
+                                                                   int64_t                          dst_nb2,
+                                                                   int64_t                          gate_bias_nb1,
+                                                                   int64_t                          up_bias_nb1,
                                                                    const std::vector<sycl::event> & deps,
-                                                                   float                alpha,
-                                                                   float                limit,
-                                                                   int                  tile_n_total) {
+                                                                   float                            alpha,
+                                                                   float                            limit,
+                                                                   int                              tile_n_total) {
     constexpr int exec_n = GGML_SYCL_MXFP4_MOE_XMX_N;
     constexpr int k_per  = GGML_SYCL_MXFP4_MOE_XMX_K;
     constexpr int an     = Repeat * k_per;
@@ -6952,35 +6945,35 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_direct_q8_submit(sycl::queue
 }
 
 template <int Repeat>
-static sycl::event mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_submit(sycl::queue &        queue,
-                                                                     const void * const * gate_ptrs,
-                                                                     const void * const * up_ptrs,
-                                                                     const void *         q8_src,
-                                                                     float *              dst_glu,
-                                                                     const int32_t *      group_expert_ids,
-                                                                     const int32_t *      group_offsets,
-                                                                     const int32_t *      group_row_slots,
-                                                                     const int32_t *      chunk_groups,
-                                                                     const int32_t *      chunk_row_starts,
-                                                                     const float *        gate_bias,
-                                                                     const float *        up_bias,
-                                                                     int                  ncols,
-                                                                     int                  ncols_y,
-                                                                     int                  nrows_per_expert,
-                                                                     int                  n_chunks,
-                                                                     int                  n_tokens,
-                                                                     int                  ne11,
-                                                                     int64_t              q8_nb11,
-                                                                     int64_t              q8_nb12,
-                                                                     int64_t              dst_nb1,
-                                                                     int64_t              dst_nb2,
-                                                                     int64_t              gate_bias_nb1,
-                                                                     int64_t              up_bias_nb1,
-                                                                     int                  glu_op,
+static sycl::event mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_submit(sycl::queue &                    queue,
+                                                                     const void * const *             gate_ptrs,
+                                                                     const void * const *             up_ptrs,
+                                                                     const void *                     q8_src,
+                                                                     float *                          dst_glu,
+                                                                     const int32_t *                  group_expert_ids,
+                                                                     const int32_t *                  group_offsets,
+                                                                     const int32_t *                  group_row_slots,
+                                                                     const int32_t *                  chunk_groups,
+                                                                     const int32_t *                  chunk_row_starts,
+                                                                     const float *                    gate_bias,
+                                                                     const float *                    up_bias,
+                                                                     int                              ncols,
+                                                                     int                              ncols_y,
+                                                                     int                              nrows_per_expert,
+                                                                     int                              n_chunks,
+                                                                     int                              n_tokens,
+                                                                     int                              ne11,
+                                                                     int64_t                          q8_nb11,
+                                                                     int64_t                          q8_nb12,
+                                                                     int64_t                          dst_nb1,
+                                                                     int64_t                          dst_nb2,
+                                                                     int64_t                          gate_bias_nb1,
+                                                                     int64_t                          up_bias_nb1,
+                                                                     int                              glu_op,
                                                                      const std::vector<sycl::event> & deps,
-                                                                     float                alpha,
-                                                                     float                limit,
-                                                                     int                  tile_n_total) {
+                                                                     float                            alpha,
+                                                                     float                            limit,
+                                                                     int                              tile_n_total) {
     if (glu_op == GGML_GLU_OP_SWIGLU_OAI) {
         return mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_sycl<Repeat, GGML_GLU_OP_SWIGLU_OAI>(
             queue, gate_ptrs, up_ptrs, q8_src, dst_glu, group_expert_ids, group_offsets, group_row_slots, chunk_groups,
@@ -7625,9 +7618,9 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &   ctx,
     }
 
     // Use SoA quantizer if weights are in reordered layout (both SoA and COALESCED kernels expect SoA Y)
-    const bool     y_soa       = (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED ||
-                        layout == GGML_LAYOUT_MXFP4_I8 || layout == GGML_LAYOUT_MXFP4_DPAS ||
-                        layout == GGML_LAYOUT_XMX_TILED);
+    const bool y_soa =
+        (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED || layout == GGML_LAYOUT_MXFP4_I8 ||
+         layout == GGML_LAYOUT_MXFP4_DPAS || layout == GGML_LAYOUT_XMX_TILED);
     mxfp4_moe_role reuse_role  = mxfp4_moe_role::OTHER;
     int            reuse_layer = -1;
     const bool     reuse_candidate =
@@ -8079,12 +8072,12 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &   ctx,
                                                              grouped_offsets_host.size() * sizeof(int32_t)));
                 grouped_copy_events.push_back(stream->memcpy(grouped_rows_device, grouped_rows_host.data(),
                                                              grouped_rows_host.size() * sizeof(int32_t)));
-                grouped_copy_events.push_back(
-                    stream->memcpy(grouped_chunk_groups_device, grouped_chunk_groups_host.data(),
-                                   grouped_chunk_groups_host.size() * sizeof(int32_t)));
-                grouped_copy_events.push_back(
-                    stream->memcpy(grouped_chunk_starts_device, grouped_chunk_starts_host.data(),
-                                   grouped_chunk_starts_host.size() * sizeof(int32_t)));
+                grouped_copy_events.push_back(stream->memcpy(grouped_chunk_groups_device,
+                                                             grouped_chunk_groups_host.data(),
+                                                             grouped_chunk_groups_host.size() * sizeof(int32_t)));
+                grouped_copy_events.push_back(stream->memcpy(grouped_chunk_starts_device,
+                                                             grouped_chunk_starts_host.data(),
+                                                             grouped_chunk_starts_host.size() * sizeof(int32_t)));
 
                 static std::atomic<int> grouped_log{ 0 };
                 const char *            row_agg_debug = std::getenv("GGML_SYCL_MOE_ROW_AGG_DEBUG");
@@ -8116,9 +8109,8 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &   ctx,
                     for (const auto & pass : chunk_passes) {
                         chunk_events.push_back(submit_chunk_range(pass.first, pass.second));
                     }
-                    kernel_event =
-                        ggml_sycl_submit_marker<mxfp4_xmx_tiled_grouped_chunk_join_kernel<repeat>>(*stream,
-                                                                                                    chunk_events);
+                    kernel_event = ggml_sycl_submit_marker<mxfp4_xmx_tiled_grouped_chunk_join_kernel<repeat>>(
+                        *stream, chunk_events);
                 } else {
                     kernel_event = submit_chunk_range(0, grouped_n_chunks);
                 }
@@ -8601,11 +8593,11 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
 
         // The grouped XMX_TILED variant packs multiple selected rows into DPAS
         // lanes. Prompt-token routing stays on the validated per-selected-row
-        // XMX_TILED path until the grouped PP route has its own validator.
+        // XMX_TILED path until the grouped PP route beats the production SOA
+        // planner path, not just the standalone harness baseline.
         constexpr bool grouped_xmx_tiled_pair_glu_validated = false;
-        const bool     grouped_decode_shape =
-            grouped_xmx_tiled_pair_glu_validated && total_batches >= exec_n && n_gpu_entries == total_batches &&
-            ids_host && ids_host_count == total_batches;
+        const bool     grouped_decode_shape = grouped_xmx_tiled_pair_glu_validated && total_batches >= exec_n &&
+                                          n_gpu_entries == total_batches && ids_host && ids_host_count == total_batches;
         if (grouped_decode_shape) {
             static thread_local std::vector<int32_t> grouped_experts_host;
             static thread_local std::vector<int32_t> grouped_offsets_host;
@@ -8778,9 +8770,8 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                 for (const auto & pass : chunk_passes) {
                     chunk_events.push_back(submit_chunk_range(pass.first, pass.second));
                 }
-                kernel_event =
-                    ggml_sycl_submit_marker<mxfp4_pair_glu_xmx_tiled_grouped_chunk_join_kernel<repeat>>(*stream,
-                                                                                                        chunk_events);
+                kernel_event = ggml_sycl_submit_marker<mxfp4_pair_glu_xmx_tiled_grouped_chunk_join_kernel<repeat>>(
+                    *stream, chunk_events);
             } else {
                 kernel_event = submit_chunk_range(0, grouped_n_chunks);
             }
@@ -10040,8 +10031,8 @@ static void ggml_sycl_mmvq_dispatch(const ggml_tensor *     src0,
                 break;
             case GGML_TYPE_IQ2_XXS:
                 GGML_SYCL_KTRACE("mmvq_iq2_xxs", " ne00=%lld row_diff=%lld", (long long) ne00, (long long) row_diff);
-                mul_mat_vec_iq2_xxs_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream,
-                                              fused_add, fused_add_ne0, fused_add_nb0, fused_add_row_base);
+                mul_mat_vec_iq2_xxs_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream, fused_add,
+                                              fused_add_ne0, fused_add_nb0, fused_add_row_base);
                 break;
             case GGML_TYPE_IQ2_XS:
                 GGML_SYCL_KTRACE("mmvq_iq2_xs", " ne00=%lld row_diff=%lld", (long long) ne00, (long long) row_diff);
@@ -10605,6 +10596,12 @@ bool ggml_sycl_mxfp4_pair_glu_bench_launch(const mxfp4_pair_glu_bench_args & arg
                            args.scale_stride_blocks > 0)) {
         return false;
     }
+    if (args.xmx_tiled_grouped &&
+        (!args.xmx_tiled || args.xmx_tiled_pack_q8 || args.rows_per_wg != 8 || args.xmx_tiled_m_tiles != 1 ||
+         !args.grouped_expert_ids || !args.grouped_offsets || !args.grouped_row_slots || !args.grouped_chunks ||
+         !args.grouped_row_starts || args.grouped_n_chunks <= 0)) {
+        return false;
+    }
     if (args.xmx_tiled_pack_q8 && (!args.xmx_tiled || !args.dpas_b_packed || !args.dpas_y_scales)) {
         return false;
     }
@@ -10780,6 +10777,16 @@ bool ggml_sycl_mxfp4_pair_glu_bench_launch(const mxfp4_pair_glu_bench_args & arg
                 }
                 return true;
             case 8:
+                if (args.xmx_tiled_grouped) {
+                    mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_submit<8>(
+                        *args.stream, args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output,
+                        args.grouped_expert_ids, args.grouped_offsets, args.grouped_row_slots, args.grouped_chunks,
+                        args.grouped_row_starts, args.gate_bias, args.up_bias, args.ncols, args.ncols_y,
+                        args.nrows_per_expert, args.grouped_n_chunks, args.n_tokens, args.ne11, args.nb11, args.nb12,
+                        args.dst_nb1, args.dst_nb2, args.gate_bias_nb1, args.up_bias_nb1, args.glu_op, {}, args.alpha,
+                        args.limit, tile_n_total);
+                    return true;
+                }
                 if (args.xmx_tiled_pack_q8) {
                     sycl::event pack_event = mxfp4_dpas_pack_q8_single_col_groups_sycl(
                         *args.stream, args.activations_q8_soa, args.dpas_b_packed, args.dpas_y_scales, args.ncols,

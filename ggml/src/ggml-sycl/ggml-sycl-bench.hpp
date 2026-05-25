@@ -68,6 +68,11 @@ struct mxfp4_pair_glu_bench_args {
     int8_t *             dpas_b_packed      = nullptr;
     float *              dpas_y_scales      = nullptr;
     const int32_t *      ids                = nullptr;
+    const int32_t *      grouped_expert_ids = nullptr;
+    const int32_t *      grouped_offsets    = nullptr;
+    const int32_t *      grouped_row_slots  = nullptr;
+    const int32_t *      grouped_chunks     = nullptr;
+    const int32_t *      grouped_row_starts = nullptr;
     const float *        gate_bias          = nullptr;
     const float *        up_bias            = nullptr;
 
@@ -92,6 +97,7 @@ struct mxfp4_pair_glu_bench_args {
     bool  cache_y             = true;
     bool  direct_xmx          = false;
     bool  xmx_tiled           = false;
+    bool  xmx_tiled_grouped   = false;
     bool  xmx_tiled_pack_q8   = false;
     bool  xmx_tiled_prefetch  = false;
     int   xmx_tiled_m_tiles   = 1;
@@ -102,6 +108,7 @@ struct mxfp4_pair_glu_bench_args {
     bool  ignore_weight_scale = false;
     int   scale_stride_blocks = 0;
     int   subgroup_size       = 32;
+    int   grouped_n_chunks    = 0;
     int   glu_op              = 0;
     float alpha               = 1.702f;
     float limit               = 7.0f;

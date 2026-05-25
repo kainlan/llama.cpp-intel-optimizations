@@ -13472,17 +13472,28 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                 stats.device_entries += group.indices.size();
                 stats.device_bytes += group.bytes;
             } else {
-                plan.weight_host_bytes += group.bytes;
-                plan.host_bytes += group.bytes;
+                size_t host_bytes = 0;
+                for (size_t idx : group.indices) {
+                    if (idx < plan.entries.size()) {
+                        host_bytes += plan.entries[idx].src_size;
+                    }
+                }
+                plan.weight_host_bytes += host_bytes;
+                plan.host_bytes += host_bytes;
                 stats.host_groups++;
                 stats.host_entries += group.indices.size();
-                stats.host_bytes += group.bytes;
+                stats.host_bytes += host_bytes;
             }
 
             for (size_t idx : group.indices) {
                 auto & entry        = plan.entries[idx];
                 entry.on_device     = on_device;
                 entry.target_device = target;
+                if (!on_device) {
+                    entry.layout           = GGML_LAYOUT_AOS;
+                    entry.dst_size         = entry.src_size;
+                    entry.vram_charge_size = placement_vram_charge_bytes(entry.dst_size);
+                }
             }
         }
         maybe_upgrade_moe_down_layouts_to_i8(plan, remaining, device_id, n_experts);

@@ -19,9 +19,9 @@
 #include "roofline.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
-#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -116,9 +116,9 @@ static inline int64_t parse_moe_token_rows(const std::string & kernel_name) {
         if (digit_pos >= kernel_name.size() || !std::isdigit(static_cast<unsigned char>(kernel_name[digit_pos]))) {
             continue;
         }
-        char *      end   = nullptr;
+        char *       end   = nullptr;
         const char * start = kernel_name.c_str() + digit_pos;
-        const long  value = std::strtol(start, &end, 10);
+        const long   value = std::strtol(start, &end, 10);
         if (end != start && value > 0) {
             return value;
         }
@@ -1199,6 +1199,7 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                 const bool           cache_y        = config.kernel_name.find("_cache") != std::string::npos &&
                                      config.kernel_name.find("_nocache") == std::string::npos;
                 const bool xmx_tiled           = config.kernel_name.find("_xmx_tiled") != std::string::npos;
+                const bool xmx_tiled_grouped   = config.kernel_name.find("_grouped") != std::string::npos;
                 const bool xmx_tiled_pack_q8   = config.kernel_name.find("_packed") != std::string::npos;
                 const bool xmx_tiled_prefetch  = config.kernel_name.find("_prefetch") != std::string::npos;
                 const int  xmx_tiled_m_tiles   = config.kernel_name.find("_m2") != std::string::npos ? 2 : 1;
@@ -1213,11 +1214,11 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                 const bool sparse_expert_slots = config.kernel_name.find("_sparse32") != std::string::npos;
                 const bool use_bias            = config.kernel_name.find("_bias") != std::string::npos;
                 if (!run_mxfp4_pair_glu(weights, activations, m, selected_count, k, token_rows, rows_per_wg, cache_y,
-                                        direct_xmx, xmx_tiled, xmx_tiled_pack_q8, xmx_tiled_prefetch, xmx_tiled_m_tiles,
-                                        split_gate_up, predecoded_i8, xmx_tiles_n, vector_qs_load, ignore_weight_scale,
-                                        scale_stride_blocks, subgroup_size, sparse_expert_slots, use_bias,
-                                        config.validate, config.warmup_iterations, config.measure_iterations, queue,
-                                        metrics, error)) {
+                                        direct_xmx, xmx_tiled, xmx_tiled_grouped, xmx_tiled_pack_q8, xmx_tiled_prefetch,
+                                        xmx_tiled_m_tiles, split_gate_up, predecoded_i8, xmx_tiles_n, vector_qs_load,
+                                        ignore_weight_scale, scale_stride_blocks, subgroup_size, sparse_expert_slots,
+                                        use_bias, config.validate, config.warmup_iterations, config.measure_iterations,
+                                        queue, metrics, error)) {
                     out.error = error;
                     return false;
                 }

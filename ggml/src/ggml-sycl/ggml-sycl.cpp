@@ -10780,9 +10780,21 @@ struct moe_profile_layer {
         int64_t batches         = 0;
     };
 
+    struct role_timing {
+        double ids_d2h_us      = 0;
+        double routing_us      = 0;
+        double gpu_compute_us  = 0;
+        double cpu_compute_us  = 0;
+        double post_compute_us = 0;
+        int    n_cpu_experts   = 0;
+        int    n_gpu_experts   = 0;
+        int    n_calls         = 0;
+    };
+
     std::array<route_stats, MOE_PROFILE_ROLE_COUNT> routes{};
     host_detail                                     host{};
     secondary_detail                                secondary{};
+    std::array<role_timing, MOE_PROFILE_ROLE_COUNT> role_timings{};
 };
 
 struct moe_profile_token {
@@ -10820,6 +10832,7 @@ struct moe_profile_state {
     bool            has_last_op_end = false;
     int             op_n_cpu        = 0;
     int             op_n_gpu        = 0;
+    moe_tensor_type cur_op_role     = MOE_TENSOR_UNKNOWN;
 
     // Collected tokens
     std::vector<moe_profile_token> tokens;
@@ -10896,7 +10909,7 @@ struct moe_profile_state {
     }
 
     // Called at MoE MUL_MAT_ID entry
-    void moe_op_begin(int layer_id) {
+    void moe_op_begin(int layer_id, moe_tensor_type role = MOE_TENSOR_UNKNOWN) {
         if (!token_active) {
             return;
         }
@@ -10938,6 +10951,7 @@ struct moe_profile_state {
         compute_done        = op_start;  // Default: no compute
         op_n_cpu            = 0;
         op_n_gpu            = 0;
+        cur_op_role         = role;
     }
 
     // Sub-phase timestamps within a MUL_MAT_ID call
@@ -11106,14 +11120,30 @@ struct moe_profile_state {
         auto gpu_t     = (gpu_compute_done_tp > op_start) ? gpu_compute_done_tp : routing_t;
         auto compute_t = (compute_done > op_start) ? compute_done : gpu_t;
 
-        cur_layer.ids_d2h_us += us(op_start, ids_t);
-        cur_layer.routing_us += us(ids_t, routing_t);
-        cur_layer.gpu_compute_us += us(routing_t, gpu_t);
-        cur_layer.cpu_compute_us += us(gpu_t, compute_t);
-        cur_layer.post_compute_us += us(compute_t, now);
+        const double ids_us          = us(op_start, ids_t);
+        const double routing_us_val  = us(ids_t, routing_t);
+        const double gpu_us          = us(routing_t, gpu_t);
+        const double cpu_us          = us(gpu_t, compute_t);
+        const double post_compute_us = us(compute_t, now);
+
+        cur_layer.ids_d2h_us += ids_us;
+        cur_layer.routing_us += routing_us_val;
+        cur_layer.gpu_compute_us += gpu_us;
+        cur_layer.cpu_compute_us += cpu_us;
+        cur_layer.post_compute_us += post_compute_us;
         cur_layer.n_cpu_experts += op_n_cpu;
         cur_layer.n_gpu_experts += op_n_gpu;
         cur_layer.n_calls++;
+
+        auto & role_t = cur_layer.role_timings[moe_profile_role_index(cur_op_role)];
+        role_t.ids_d2h_us += ids_us;
+        role_t.routing_us += routing_us_val;
+        role_t.gpu_compute_us += gpu_us;
+        role_t.cpu_compute_us += cpu_us;
+        role_t.post_compute_us += post_compute_us;
+        role_t.n_cpu_experts += op_n_cpu;
+        role_t.n_gpu_experts += op_n_gpu;
+        role_t.n_calls++;
 
         // U6 diagnostic: detect when compute_done was never set (falls back to
         // op_start or routing_done), causing entire op time to be misattributed
@@ -11192,6 +11222,48 @@ struct moe_profile_state {
             dst.rows += src.rows;
             dst.batches += src.batches;
         };
+        auto add_role_timing = [](std::array<moe_profile_layer::role_timing, MOE_PROFILE_ROLE_COUNT> &       dst,
+                                  const std::array<moe_profile_layer::role_timing, MOE_PROFILE_ROLE_COUNT> & src) {
+            for (int i = 0; i < MOE_PROFILE_ROLE_COUNT; ++i) {
+                dst[i].ids_d2h_us += src[i].ids_d2h_us;
+                dst[i].routing_us += src[i].routing_us;
+                dst[i].gpu_compute_us += src[i].gpu_compute_us;
+                dst[i].cpu_compute_us += src[i].cpu_compute_us;
+                dst[i].post_compute_us += src[i].post_compute_us;
+                dst[i].n_cpu_experts += src[i].n_cpu_experts;
+                dst[i].n_gpu_experts += src[i].n_gpu_experts;
+                dst[i].n_calls += src[i].n_calls;
+            }
+        };
+        auto print_role_timing =
+            [](const char *                                                               title,
+               const std::array<moe_profile_layer::role_timing, MOE_PROFILE_ROLE_COUNT> & role_timings, int nt_div) {
+                int total_calls = 0;
+                for (const auto & r : role_timings) {
+                    total_calls += r.n_calls;
+                }
+                if (total_calls == 0) {
+                    return;
+                }
+                fprintf(stderr, "\n--- %s: Per-Role MUL_MAT_ID Timing ---\n", title);
+                fprintf(stderr, "%-8s | %5s | %10s | %10s | %9s | %9s | %9s | %10s | %10s\n", "Role", "Calls",
+                        "GPU(ms)", "CPU(ms)", "IDs(ms)", "Route(ms)", "Post(ms)", "GPU rows", "GPU us/call");
+                fprintf(stderr, "%-8s-+-%5s-+-%10s-+-%10s-+-%9s-+-%9s-+-%9s-+-%10s-+-%10s\n", "--------", "-----",
+                        "----------", "----------", "---------", "---------", "---------", "----------", "----------");
+                for (int i = 0; i < MOE_PROFILE_ROLE_COUNT; ++i) {
+                    const auto & r = role_timings[i];
+                    if (r.n_calls == 0) {
+                        continue;
+                    }
+                    const double div = nt_div > 0 ? static_cast<double>(nt_div) : 1.0;
+                    fprintf(stderr, "%-8s | %5d | %10.1f | %10.1f | %9.1f | %9.1f | %9.1f | %10d | %10.1f\n",
+                            moe_tensor_type_name(static_cast<moe_tensor_type>(i)), r.n_calls,
+                            r.gpu_compute_us / 1000.0 / div, r.cpu_compute_us / 1000.0 / div,
+                            r.ids_d2h_us / 1000.0 / div, r.routing_us / 1000.0 / div, r.post_compute_us / 1000.0 / div,
+                            r.n_gpu_experts / std::max(1, nt_div),
+                            r.n_calls > 0 ? r.gpu_compute_us / static_cast<double>(r.n_calls) : 0.0);
+                }
+            };
         auto print_route_stats = [](const char *                                                               title,
                                     const std::array<moe_profile_layer::route_stats, MOE_PROFILE_ROLE_COUNT> & routes,
                                     int                                                                        nt_div) {
@@ -11309,6 +11381,7 @@ struct moe_profile_state {
         std::array<moe_profile_layer::route_stats, MOE_PROFILE_ROLE_COUNT> route_totals{};
         moe_profile_layer::host_detail                                     host_totals{};
         moe_profile_layer::secondary_detail                                secondary_totals{};
+        std::array<moe_profile_layer::role_timing, MOE_PROFILE_ROLE_COUNT> role_timing_totals{};
 
         for (auto & tok : tokens) {
             double tok_ids = 0, tok_routing = 0, tok_cpu = 0, tok_gpu = 0, tok_scatter = 0;
@@ -11341,6 +11414,7 @@ struct moe_profile_state {
                 add_route_stats(route_totals, lay.routes);
                 add_host_detail(host_totals, lay.host);
                 add_secondary_detail(secondary_totals, lay.secondary);
+                add_role_timing(role_timing_totals, lay.role_timings);
             }
             avg_ids += tok_ids;
             avg_routing += tok_routing;
@@ -11415,6 +11489,7 @@ struct moe_profile_state {
         std::array<moe_profile_layer::route_stats, MOE_PROFILE_ROLE_COUNT> dtok_routes{};
         moe_profile_layer::host_detail                                     dtok_host{};
         moe_profile_layer::secondary_detail                                dtok_secondary{};
+        std::array<moe_profile_layer::role_timing, MOE_PROFILE_ROLE_COUNT> dtok_role_timings{};
         for (auto & lay : dtok.layers) {
             dtok_ids += lay.ids_d2h_us;
             dtok_routing += lay.routing_us;
@@ -11438,6 +11513,7 @@ struct moe_profile_state {
             add_route_stats(dtok_routes, lay.routes);
             add_host_detail(dtok_host, lay.host);
             add_secondary_detail(dtok_secondary, lay.secondary);
+            add_role_timing(dtok_role_timings, lay.role_timings);
         }
 
         // Accumulate weight_load
@@ -11495,6 +11571,7 @@ struct moe_profile_state {
         fprintf(stderr, "%-25s | %10.1f |               | %7.1f%%\n", "Token total", dtok.token_total_us / 1000.0,
                 100.0);
         fprintf(stderr, "  Experts: %d CPU, %d GPU | MoE layers: %d\n", dtok_cpu_exp, dtok_gpu_exp, dtok.n_moe_layers);
+        print_role_timing("Detailed token", dtok_role_timings, 1);
         print_route_stats("Detailed token", dtok_routes, 1);
         print_host_detail("Detailed token", dtok_host, 1);
         print_secondary_detail("Detailed token", dtok_secondary, 1);
@@ -11588,6 +11665,7 @@ struct moe_profile_state {
         fprintf(stderr, "  Avg experts/token: %d CPU, %d GPU | MoE layers: %d\n", avg_cpu_experts / nt,
                 avg_gpu_experts / nt, avg_nl);
         fprintf(stderr, "  Token rate: %.2f tok/s\n", avg_total > 0 ? 1e6 / avg_total : 0);
+        print_role_timing("Averages", role_timing_totals, nt);
         print_route_stats("Averages", route_totals, nt);
         print_host_detail("Averages", host_totals, nt);
         print_secondary_detail("Averages", secondary_totals, nt);
@@ -44608,8 +44686,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
     // MoE profiling: instrument entry with layer ID from tensor name
     if (g_moe_profile_enabled) {
-        const int prof_layer = parse_layer_id_from_name(src0->name ? src0->name : "");
-        g_moe_profile.moe_op_begin(prof_layer);
+        const char *          prof_name  = src0->name ? src0->name : "";
+        const int             prof_layer = parse_layer_id_from_name(prof_name);
+        const moe_tensor_type prof_role  = moe_classify_tensor(prof_name);
+        g_moe_profile.moe_op_begin(prof_layer, prof_role);
     }
 
     // RAII guard to call moe_op_end at ALL exit points
@@ -47553,8 +47633,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 pair.down_dst && pair.down_dst->src[1] == pair.glu_dst &&
                                 pair.down_dst->src[2] == ids && pair.down_index > pair.glu_index &&
                                 pair.down_weight->type == GGML_TYPE_MXFP4 &&
-                                pair.glu_dst->ne[0] == pair.down_weight->ne[0] &&
-                                pair.glu_dst->ne[1] == n_ids_pair && pair.glu_dst->ne[2] == ids->ne[1]) {
+                                pair.glu_dst->ne[0] == pair.down_weight->ne[0] && pair.glu_dst->ne[1] == n_ids_pair &&
+                                pair.glu_dst->ne[2] == ids->ne[1]) {
                                 const int64_t down_tokens = pair.glu_dst->ne[2];
                                 const bool    down_has_plan =
                                     ggml_sycl::unified_cache_enabled() &&
@@ -47570,18 +47650,16 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 layout_mode down_layout = ggml_sycl_adjust_layout_for_tensor(
                                     pair.down_weight, requested_down_layout, ctx.device);
                                 if (down_layout == GGML_LAYOUT_XMX_TILED && down_tokens > 1) {
-                                    const layout_mode fallback_layout =
-                                        ggml_sycl_adjust_layout_for_tensor(pair.down_weight, GGML_LAYOUT_MXFP4_I8,
-                                                                           ctx.device);
+                                    const layout_mode fallback_layout = ggml_sycl_adjust_layout_for_tensor(
+                                        pair.down_weight, GGML_LAYOUT_MXFP4_I8, ctx.device);
                                     if (ggml_sycl_moe_mmvq_batched_supports_layout(pair.down_weight->type,
                                                                                    fallback_layout)) {
                                         requested_down_layout = fallback_layout;
                                         down_layout           = fallback_layout;
                                     } else {
                                         requested_down_layout = GGML_LAYOUT_SOA;
-                                        down_layout = ggml_sycl_adjust_layout_for_tensor(pair.down_weight,
-                                                                                        requested_down_layout,
-                                                                                        ctx.device);
+                                        down_layout           = ggml_sycl_adjust_layout_for_tensor(
+                                            pair.down_weight, requested_down_layout, ctx.device);
                                     }
                                     if (path_trace_enabled != 0) {
                                         fprintf(stderr,
