@@ -12084,7 +12084,7 @@ static uint32_t planner_effective_ubatch_for_moe_pp(const placement_kv_info &   
     uint32_t ubatch = kv_info.n_ubatch;
     if (envelope != nullptr) {
         const uint32_t envelope_ubatch = envelope->n_ubatch != 0 ? envelope->n_ubatch : 512;
-        ubatch                        = std::max(ubatch, envelope_ubatch);
+        ubatch                         = std::max(ubatch, envelope_ubatch);
     }
     return ubatch != 0 ? ubatch : 512;
 }
@@ -12096,13 +12096,13 @@ static size_t planner_expected_moe_pp_rows(const placement_kv_info &            
     return pp_tokens * top_k;
 }
 
-static bool planner_moe_layout_needs_pp_soa(const placement_entry &             entry,
-                                            ggml_layout_mode                    layout,
-                                            int                                 device_id,
+static bool planner_moe_layout_needs_pp_soa(const placement_entry &              entry,
+                                            ggml_layout_mode                     layout,
+                                            int                                  device_id,
                                             const placement_kv_info &            kv_info,
                                             const ggml_sycl_placement_envelope * envelope) {
-    if (entry.expert_id < 0 || !entry.on_device || entry.target_device != device_id ||
-        entry.type != GGML_TYPE_MXFP4 || layout == GGML_LAYOUT_SOA ||
+    if (entry.expert_id < 0 || !entry.on_device || entry.target_device != device_id || entry.type != GGML_TYPE_MXFP4 ||
+        layout == GGML_LAYOUT_SOA ||
         (entry.expert_role != expert_tensor_role::GATE && entry.expert_role != expert_tensor_role::UP &&
          entry.expert_role != expert_tensor_role::DOWN)) {
         return false;
@@ -12122,17 +12122,206 @@ static bool planner_moe_layout_needs_pp_soa(const placement_entry &             
                              layout == GGML_LAYOUT_MXFP4_DPAS || layout == GGML_LAYOUT_COALESCED);
 }
 
-static bool planner_moe_entry_needs_pp_soa_alternate(const placement_entry &             entry,
-                                                     int                                 device_id,
+static bool planner_moe_entry_needs_pp_soa_alternate(const placement_entry &              entry,
+                                                     int                                  device_id,
                                                      const placement_kv_info &            kv_info,
                                                      const ggml_sycl_placement_envelope * envelope) {
     return planner_moe_layout_needs_pp_soa(entry, entry.layout, device_id, kv_info, envelope);
 }
 
-static void add_multi_moe_pp_executable_alternates(placement_plan &                   plan,
-                                                   std::vector<size_t> &              remaining,
-                                                   const std::vector<device_budget> & device_budgets,
-                                                   const placement_kv_info &          kv_info,
+static size_t apply_single_moe_pp_safe_xmx_layouts(placement_plan &                     plan,
+                                                   size_t &                             remaining,
+                                                   int                                  device_id,
+                                                   const placement_kv_info &            kv_info,
+                                                   const ggml_sycl_placement_envelope * envelope) {
+    if (device_id < 0 || device_id >= ggml_sycl_info().device_count) {
+        return 0;
+    }
+
+    const size_t pp_tokens = static_cast<size_t>(planner_effective_ubatch_for_moe_pp(kv_info, envelope));
+    if (pp_tokens <= 1) {
+        return 0;
+    }
+
+    const auto & caps      = ggml_sycl_info().devices[device_id].xmx_caps;
+    const size_t row_limit = ggml_sycl_mxfp4_grouped_dpas_row_list_limit(caps);
+    const size_t pp_rows   = planner_expected_moe_pp_rows(kv_info, envelope);
+    if (row_limit > 0 && pp_rows <= row_limit) {
+        return 0;
+    }
+
+    size_t changed          = 0;
+    size_t skipped_capacity = 0;
+    size_t skipped_shape    = 0;
+    size_t released_bytes   = 0;
+    size_t charged_bytes    = 0;
+
+    for (placement_entry & entry : plan.entries) {
+        if (entry.expert_id < 0 || !entry.on_device || entry.target_device != device_id ||
+            entry.type != GGML_TYPE_MXFP4 || entry.layout != GGML_LAYOUT_XMX_TILED ||
+            (entry.expert_role != expert_tensor_role::GATE && entry.expert_role != expert_tensor_role::UP)) {
+            continue;
+        }
+
+        const size_t new_size = planner_layout_bytes_for_entry(entry, GGML_LAYOUT_SOA, device_id);
+        if (new_size == 0) {
+            skipped_shape++;
+            continue;
+        }
+
+        const size_t old_charge =
+            entry.vram_charge_size != 0 ? entry.vram_charge_size : placement_vram_charge_bytes(entry.dst_size);
+        const size_t new_charge = placement_vram_charge_bytes(new_size);
+        if (new_charge > old_charge) {
+            const size_t extra = new_charge - old_charge;
+            if (extra > remaining) {
+                skipped_capacity++;
+                continue;
+            }
+            remaining -= extra;
+            plan.weight_vram_bytes += extra;
+            plan.vram_bytes += extra;
+            charged_bytes += extra;
+            if (!plan.per_device_vram.empty()) {
+                plan.per_device_vram[0] += extra;
+            }
+        } else if (old_charge > new_charge) {
+            const size_t freed = old_charge - new_charge;
+            remaining += freed;
+            plan.weight_vram_bytes = plan.weight_vram_bytes > freed ? plan.weight_vram_bytes - freed : 0;
+            plan.vram_bytes        = plan.vram_bytes > freed ? plan.vram_bytes - freed : 0;
+            released_bytes += freed;
+            if (!plan.per_device_vram.empty()) {
+                plan.per_device_vram[0] = plan.per_device_vram[0] > freed ? plan.per_device_vram[0] - freed : 0;
+            }
+        }
+
+        entry.layout           = GGML_LAYOUT_SOA;
+        entry.dst_size         = new_size;
+        entry.vram_charge_size = new_charge;
+        changed++;
+    }
+
+    if (changed > 0 || skipped_capacity > 0 || skipped_shape > 0) {
+        GGML_LOG_INFO(
+            "[PLACEMENT-MOE] PP-safe XMX layout: xmx_tiled->soa entries=%zu skipped_capacity=%zu "
+            "skipped_shape=%zu charged=%.1f MB released=%.1f MB remaining=%.1f MB pp_tokens=%zu "
+            "selected_rows=%zu row_limit=%zu\n",
+            changed, skipped_capacity, skipped_shape, charged_bytes / (1024.0 * 1024.0),
+            released_bytes / (1024.0 * 1024.0), remaining / (1024.0 * 1024.0), pp_tokens, pp_rows, row_limit);
+    }
+
+    return charged_bytes;
+}
+
+static void apply_multi_moe_pp_safe_xmx_layouts(placement_plan &                     plan,
+                                                std::vector<size_t> &                remaining,
+                                                const std::vector<device_budget> &   device_budgets,
+                                                const placement_kv_info &            kv_info,
+                                                const ggml_sycl_placement_envelope * envelope) {
+    if (device_budgets.empty()) {
+        return;
+    }
+
+    const size_t pp_tokens = static_cast<size_t>(planner_effective_ubatch_for_moe_pp(kv_info, envelope));
+    if (pp_tokens <= 1) {
+        return;
+    }
+    const size_t pp_rows = planner_expected_moe_pp_rows(kv_info, envelope);
+
+    std::unordered_map<int, size_t> device_to_index;
+    device_to_index.reserve(device_budgets.size());
+    for (size_t i = 0; i < device_budgets.size(); ++i) {
+        device_to_index[device_budgets[i].device_id] = i;
+    }
+
+    size_t changed          = 0;
+    size_t skipped_capacity = 0;
+    size_t skipped_shape    = 0;
+    size_t skipped_support  = 0;
+    size_t released_bytes   = 0;
+    size_t charged_bytes    = 0;
+
+    for (placement_entry & entry : plan.entries) {
+        if (entry.expert_id < 0 || !entry.on_device || entry.target_device < 0 || entry.type != GGML_TYPE_MXFP4 ||
+            entry.layout != GGML_LAYOUT_XMX_TILED ||
+            (entry.expert_role != expert_tensor_role::GATE && entry.expert_role != expert_tensor_role::UP)) {
+            continue;
+        }
+
+        if (entry.target_device >= ggml_sycl_info().device_count) {
+            skipped_support++;
+            continue;
+        }
+        const auto & caps      = ggml_sycl_info().devices[entry.target_device].xmx_caps;
+        const size_t row_limit = ggml_sycl_mxfp4_grouped_dpas_row_list_limit(caps);
+        if (row_limit > 0 && pp_rows <= row_limit) {
+            continue;
+        }
+        if (!planner_moe_primary_executor_supports_layout(entry, GGML_LAYOUT_SOA, entry.target_device)) {
+            skipped_support++;
+            continue;
+        }
+
+        auto dev_it = device_to_index.find(entry.target_device);
+        if (dev_it == device_to_index.end() || dev_it->second >= remaining.size() ||
+            dev_it->second >= plan.per_device_vram.size()) {
+            skipped_support++;
+            continue;
+        }
+        const size_t dev_index = dev_it->second;
+
+        const size_t new_size = planner_layout_bytes_for_entry(entry, GGML_LAYOUT_SOA, entry.target_device);
+        if (new_size == 0) {
+            skipped_shape++;
+            continue;
+        }
+
+        const size_t old_charge =
+            entry.vram_charge_size != 0 ? entry.vram_charge_size : placement_vram_charge_bytes(entry.dst_size);
+        const size_t new_charge = placement_vram_charge_bytes(new_size);
+        if (new_charge > old_charge) {
+            const size_t extra = new_charge - old_charge;
+            if (extra > remaining[dev_index]) {
+                skipped_capacity++;
+                continue;
+            }
+            remaining[dev_index] -= extra;
+            plan.weight_vram_bytes += extra;
+            plan.vram_bytes += extra;
+            plan.per_device_vram[dev_index] += extra;
+            charged_bytes += extra;
+        } else if (old_charge > new_charge) {
+            const size_t freed = old_charge - new_charge;
+            remaining[dev_index] += freed;
+            plan.weight_vram_bytes = plan.weight_vram_bytes > freed ? plan.weight_vram_bytes - freed : 0;
+            plan.vram_bytes        = plan.vram_bytes > freed ? plan.vram_bytes - freed : 0;
+            plan.per_device_vram[dev_index] =
+                plan.per_device_vram[dev_index] > freed ? plan.per_device_vram[dev_index] - freed : 0;
+            released_bytes += freed;
+        }
+
+        entry.layout           = GGML_LAYOUT_SOA;
+        entry.dst_size         = new_size;
+        entry.vram_charge_size = new_charge;
+        changed++;
+    }
+
+    if (changed > 0 || skipped_capacity > 0 || skipped_shape > 0 || skipped_support > 0) {
+        const size_t total_remaining = std::accumulate(remaining.begin(), remaining.end(), size_t(0));
+        GGML_LOG_INFO(
+            "[PLACEMENT-MOE-MULTI] PP-safe XMX layout: xmx_tiled->soa entries=%zu skipped_capacity=%zu "
+            "skipped_shape=%zu skipped_support=%zu charged=%.1f MB released=%.1f MB remaining=%.1f MB "
+            "pp_tokens=%zu selected_rows=%zu\n",
+            changed, skipped_capacity, skipped_shape, skipped_support, charged_bytes / (1024.0 * 1024.0),
+            released_bytes / (1024.0 * 1024.0), total_remaining / (1024.0 * 1024.0), pp_tokens, pp_rows);
+    }
+}
+
+static void add_multi_moe_pp_executable_alternates(placement_plan &                     plan,
+                                                   std::vector<size_t> &                remaining,
+                                                   const std::vector<device_budget> &   device_budgets,
+                                                   const placement_kv_info &            kv_info,
                                                    const ggml_sycl_placement_envelope * envelope) {
     if (device_budgets.empty()) {
         return;
@@ -12185,9 +12374,8 @@ static void add_multi_moe_pp_executable_alternates(placement_plan &             
         } else {
             const auto & caps      = ggml_sycl_info().devices[entry.target_device].xmx_caps;
             const size_t row_limit = ggml_sycl_mxfp4_grouped_dpas_row_list_limit(caps);
-            if (!(pp_tokens > 1 &&
-                  (row_limit == 0 || pp_rows > row_limit || entry.layout == GGML_LAYOUT_MXFP4_I8 ||
-                   entry.layout == GGML_LAYOUT_MXFP4_DPAS || entry.layout == GGML_LAYOUT_COALESCED))) {
+            if (!(pp_tokens > 1 && (row_limit == 0 || pp_rows > row_limit || entry.layout == GGML_LAYOUT_MXFP4_I8 ||
+                                    entry.layout == GGML_LAYOUT_MXFP4_DPAS || entry.layout == GGML_LAYOUT_COALESCED))) {
                 skip_rows_ok++;
             }
         }
@@ -12379,7 +12567,6 @@ static void apply_multi_moe_per_target_layouts(placement_plan &                 
                 static_cast<double>(charged_delta) / (1024.0 * 1024.0),
                 static_cast<double>(host_delta) / (1024.0 * 1024.0));
     }
-
 }
 
 static void maybe_upgrade_multi_moe_primary_layouts(placement_plan & plan,
@@ -12603,9 +12790,8 @@ static size_t maybe_upgrade_moe_down_layouts_to_i8(placement_plan & plan,
             fprintf(stderr,
                     "[PLACEMENT-MOE-DOWN-I8-TRACE] device=%d tensors=%zu/%zu expert_entries=%zu charged=%.1fMB "
                     "remaining=%.1fMB guard=%.1fMB\n",
-                    device_id, upgraded_tensors, candidates.size(), upgraded_entries,
-                    charged_bytes / (1024.0 * 1024.0), remaining / (1024.0 * 1024.0),
-                    k_layout_upgrade_guard / (1024.0 * 1024.0));
+                    device_id, upgraded_tensors, candidates.size(), upgraded_entries, charged_bytes / (1024.0 * 1024.0),
+                    remaining / (1024.0 * 1024.0), k_layout_upgrade_guard / (1024.0 * 1024.0));
         }
     } else if (moe_direct_trace_enabled() && considered > 0) {
         size_t incomplete_tensors = 0;
@@ -12618,9 +12804,8 @@ static size_t maybe_upgrade_moe_down_layouts_to_i8(placement_plan & plan,
                 "[PLACEMENT-MOE-DOWN-I8-TRACE] device=%d considered=%zu by_tensor=%zu incomplete=%zu "
                 "n_experts=%d skip_not_down=%zu skip_already_i8=%zu skip_not_device=%zu skip_wrong_dev=%zu "
                 "skip_unsupported=%zu remaining=%.1fMB\n",
-                device_id, considered, by_tensor.size(), incomplete_tensors, n_experts, skip_not_down,
-                skip_already_i8, skip_not_device, skip_wrong_dev, skip_unsupported,
-                remaining / (1024.0 * 1024.0));
+                device_id, considered, by_tensor.size(), incomplete_tensors, n_experts, skip_not_down, skip_already_i8,
+                skip_not_device, skip_wrong_dev, skip_unsupported, remaining / (1024.0 * 1024.0));
     }
     return charged_bytes;
 }
@@ -13276,6 +13461,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
             }
         }
         maybe_upgrade_moe_down_layouts_to_i8(plan, remaining, device_id, n_experts);
+        apply_single_moe_pp_safe_xmx_layouts(plan, remaining, device_id, kv_info, envelope);
         maybe_upgrade_moe_gate_up_layouts_to_i8(plan, remaining, device_id, n_experts);
         log_moe_triplet_pack_stats("PLACEMENT-MOE", stats, remaining);
         reorder_plan_entries_for_moe_materialization(plan, moe_groups);
@@ -13747,11 +13933,11 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         // granularity under pressure. Optional fast-layout upgrades run after
         // base placement and must not evict otherwise resident primary layers.
         struct moe_layer_target_plan {
-            int    target_dev_idx    = -2;
-            size_t base_charge       = 0;
-            bool   complete          = false;
-            bool   secondary_capable = true;
-            size_t groups            = 0;
+            int                                                                target_dev_idx    = -2;
+            size_t                                                             base_charge       = 0;
+            bool                                                               complete          = false;
+            bool                                                               secondary_capable = true;
+            size_t                                                             groups            = 0;
             std::array<size_t, static_cast<size_t>(expert_tensor_role::COUNT)> role_entries{};
         };
 
@@ -13762,7 +13948,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                     continue;
                 }
 
-                auto & layer           = moe_layer_targets[group.layer_id];
+                auto & layer = moe_layer_targets[group.layer_id];
                 layer.base_charge += group.charge_bytes;
                 layer.groups++;
 
@@ -13770,7 +13956,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                     if (idx >= plan.entries.size()) {
                         continue;
                     }
-                    const placement_entry & entry = plan.entries[idx];
+                    const placement_entry & entry    = plan.entries[idx];
                     const size_t            role_idx = static_cast<size_t>(entry.expert_role);
                     if (role_idx < layer.role_entries.size()) {
                         layer.role_entries[role_idx]++;
@@ -13783,20 +13969,19 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
 
             for (auto & item : moe_layer_targets) {
                 moe_layer_target_plan & layer = item.second;
-                layer.complete = n_experts > 0 &&
-                                 layer.role_entries[static_cast<size_t>(expert_tensor_role::GATE)] ==
-                                     static_cast<size_t>(n_experts) &&
-                                 layer.role_entries[static_cast<size_t>(expert_tensor_role::UP)] ==
-                                     static_cast<size_t>(n_experts) &&
-                                 layer.role_entries[static_cast<size_t>(expert_tensor_role::DOWN)] ==
-                                     static_cast<size_t>(n_experts);
+                layer.complete =
+                    n_experts > 0 &&
+                    layer.role_entries[static_cast<size_t>(expert_tensor_role::GATE)] ==
+                        static_cast<size_t>(n_experts) &&
+                    layer.role_entries[static_cast<size_t>(expert_tensor_role::UP)] == static_cast<size_t>(n_experts) &&
+                    layer.role_entries[static_cast<size_t>(expert_tensor_role::DOWN)] == static_cast<size_t>(n_experts);
             }
 
-            std::vector<size_t> simulated_remaining = remaining;
-            size_t              primary_layers      = 0;
-            size_t              secondary_layers    = 0;
-            size_t              degraded_layers     = 0;
-            size_t              host_layers         = 0;
+            std::vector<size_t> simulated_remaining          = remaining;
+            size_t              primary_layers               = 0;
+            size_t              secondary_layers             = 0;
+            size_t              degraded_layers              = 0;
+            size_t              host_layers                  = 0;
             size_t              secondary_not_capable_layers = 0;
             size_t              secondary_no_budget_layers   = 0;
 
@@ -13971,6 +14156,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
             }
         } else {
             apply_multi_moe_per_target_layouts(plan, remaining, device_budgets);
+            apply_multi_moe_pp_safe_xmx_layouts(plan, remaining, device_budgets, kv_info, envelope);
             // Multi-device per-target layout selection keeps secondary routes on
             // SOA because that is the only grouped secondary executor today. The
             // primary route still owns local smart handles and can use the same

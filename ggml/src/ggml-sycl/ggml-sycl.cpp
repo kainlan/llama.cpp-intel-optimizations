@@ -15781,6 +15781,37 @@ static layout_mode ggml_sycl_moe_layout_for_selected_rows(const ggml_tensor * sr
     const auto & caps      = ggml_sycl_info().devices[device].xmx_caps;
     const size_t row_limit = ggml_sycl_mxfp4_grouped_dpas_row_list_limit(caps);
     if (row_limit > 0 && selected_rows > row_limit) {
+        if (ggml_sycl_planner_authoritative_residency_active(device)) {
+            const moe_planned_layout_probe fallback_probe =
+                ggml_sycl_probe_moe_planned_layout(src0, device, GGML_LAYOUT_SOA);
+            if (fallback_probe.ok) {
+                if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                    static std::atomic<int> row_limit_verified_log{ 0 };
+                    if (row_limit_verified_log.fetch_add(1, std::memory_order_relaxed) < 96) {
+                        fprintf(stderr,
+                                "[GRAPH-MOE-LAYOUT] tensor=%s device=%d selected=%s rows=%zu row_limit=%zu "
+                                "fallback=soa reason=xmx-row-list-limit-verified local=%zu secondary=%zu host=%zu\n",
+                                src0->name ? src0->name : "?", device, ggml_sycl_layout_mode_name(layout),
+                                selected_rows, row_limit, fallback_probe.local, fallback_probe.secondary,
+                                fallback_probe.host);
+                    }
+                }
+                return GGML_LAYOUT_SOA;
+            }
+            if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                static std::atomic<int> row_limit_keep_log{ 0 };
+                if (row_limit_keep_log.fetch_add(1, std::memory_order_relaxed) < 96) {
+                    fprintf(stderr,
+                            "[GRAPH-MOE-LAYOUT] tensor=%s device=%d selected=%s rows=%zu row_limit=%zu "
+                            "fallback=none reason=xmx-row-list-limit-unmaterialized-soa local=%zu secondary=%zu "
+                            "host=%zu missing=%zu\n",
+                            src0->name ? src0->name : "?", device, ggml_sycl_layout_mode_name(layout), selected_rows,
+                            row_limit, fallback_probe.local, fallback_probe.secondary, fallback_probe.host,
+                            fallback_probe.missing);
+                }
+            }
+            return layout;
+        }
         if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
             static std::atomic<int> row_limit_log{ 0 };
             if (row_limit_log.fetch_add(1, std::memory_order_relaxed) < 96) {
@@ -19299,8 +19330,7 @@ static inline bool ggml_sycl_should_prefer_kernel_readback(int device, const ggm
     }
 
     const bool is_logits_readback = std::strcmp(tensor->name, "result_output") == 0;
-    const bool is_large_readback =
-        min_size_mb > 0 && size >= static_cast<size_t>(min_size_mb) * 1024ULL * 1024ULL;
+    const bool is_large_readback  = min_size_mb > 0 && size >= static_cast<size_t>(min_size_mb) * 1024ULL * 1024ULL;
     if (!is_logits_readback && !is_large_readback) {
         return false;
     }
@@ -19558,8 +19588,7 @@ static bool ggml_sycl_readback_via_shared_kernel(sycl::queue &               q,
             q.wait_and_throw();
         } catch (const sycl::exception & e) {
             if (s_shared_fallback_trace) {
-                GGML_LOG_ERROR("[SYCL] %s: host-accessible readback wait failed, copying anyway: %s\n", tag,
-                               e.what());
+                GGML_LOG_ERROR("[SYCL] %s: host-accessible readback wait failed, copying anyway: %s\n", tag, e.what());
             }
         }
         std::memcpy(dst_host, src_ptr, size);
@@ -24873,8 +24902,8 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         size_t size = 0;
     };
 
-    ggml_sycl_buffer buffer_pool[MAX_SYCL_BUFFERS] = {};
-    size_t           pool_size                     = 0;
+    ggml_sycl_buffer                                  buffer_pool[MAX_SYCL_BUFFERS] = {};
+    size_t                                            pool_size                     = 0;
     std::mutex                                        arena_handles_mutex;
     std::unordered_map<void *, ggml_sycl::mem_handle> arena_handles;
 
@@ -44746,7 +44775,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         // CPU expert TG dispatch: auto-enabled when weights are host-resident
         // (planner-spilled experts).  Previously tunable via GGML_SYCL_CPU_EXPERT_TG;
         // now hardcoded to auto (-2 = enable when host-resident).
-        const int cpu_tg_val_fast     = -2;
+        const int cpu_tg_val_fast = -2;
 
         // Check if weights are host-accessible.  Uses buffer-context tier
         // check first (zero cost), falls back to USM pointer type only when
@@ -44856,8 +44885,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         }
                         if (!ids_data_f) {
                             auto & entry = g_moe_ids_d2h_cache[ids];
-                            if (!ggml_sycl_refresh_moe_ids_cache(ctx, ids, entry) ||
-                                entry.n_elements != ids_n_elem || entry.host_ids.size() != ids_n_elem) {
+                            if (!ggml_sycl_refresh_moe_ids_cache(ctx, ids, entry) || entry.n_elements != ids_n_elem ||
+                                entry.host_ids.size() != ids_n_elem) {
                                 GGML_LOG_WARN(
                                     "[MOE-P4] Failed to resolve expert IDs for layer %d; "
                                     "falling through to unfused dispatch\n",
@@ -47240,7 +47269,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         entry.host_ids.size() != ids_n_elem) {
                         return reject_pair("ids-copy");
                     }
-                    ids_data      = entry.host_ids.data();
+                    ids_data = entry.host_ids.data();
                     if (!ids_data) {
                         return reject_pair("ids-data");
                     }
@@ -48164,10 +48193,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             if (ok_down && layer_executor_skip_eligible) {
                                 g_moe_precomputed_mmid_skip.insert(pair.down_dst);
                             }
-                            const sycl::event * layer_done_event =
-                                ok_down && down_event_set ? &down_event :
-                                pair_glu_event_set        ? &pair_glu_event :
-                                                            nullptr;
+                            const sycl::event * layer_done_event = ok_down && down_event_set ? &down_event :
+                                                                   pair_glu_event_set        ? &pair_glu_event :
+                                                                                               nullptr;
                             moe_layer_retain_executor_abi_until_barrier(
                                 ctx, moe_layer_build_executor_abi(plan, ctx.device), layer_done_event,
                                 ok_down ? "pair_glu_down" : "pair_glu");
@@ -49399,8 +49427,7 @@ cpu_tg_fallthrough:
                 GGML_LOG_WARN(
                     "[CPU-TG] Fast path unavailable (%s); falling through "
                     "to unfused dispatch for %s\n",
-                    cpu_tg_fallthrough_reason ? cpu_tg_fallthrough_reason : "staging",
-                    src0->name ? src0->name : "?");
+                    cpu_tg_fallthrough_reason ? cpu_tg_fallthrough_reason : "staging", src0->name ? src0->name : "?");
             }
         }
     }
@@ -55297,9 +55324,9 @@ static bool ggml_sycl_tensor_has_later_consumer(const ggml_cgraph * cgraph,
 }
 
 static bool ggml_sycl_try_fuse_tg_router_f32_add_argsort(ggml_backend_sycl_context & ctx,
-                                                          const ggml_cgraph *         cgraph,
-                                                          int                         node_idx,
-                                                          int *                       extra_skip_nodes) {
+                                                         const ggml_cgraph *         cgraph,
+                                                         int                         node_idx,
+                                                         int *                       extra_skip_nodes) {
     if (extra_skip_nodes) {
         *extra_skip_nodes = 0;
     }
@@ -55538,8 +55565,8 @@ static bool ggml_sycl_try_fuse_tg_mul_mat_add(ggml_backend_sycl_context & ctx,
     const layout_mode effective_layout = extra ? get_effective_layout_mode(extra) : GGML_LAYOUT_AOS;
     const bool        has_reorder =
         resolved.on_device && resolved.layout != GGML_LAYOUT_AOS && ggml_sycl_supports_reorder_mmvq(weight->type);
-    const layout_mode dispatch_layout = has_reorder ? resolved.layout : (has_soa_reorder ? effective_layout :
-                                                                                           GGML_LAYOUT_AOS);
+    const layout_mode dispatch_layout =
+        has_reorder ? resolved.layout : (has_soa_reorder ? effective_layout : GGML_LAYOUT_AOS);
     if (!ggml_sycl_mmvq_fused_add_supported(weight->type, dispatch_layout)) {
         return false;
     }
@@ -55554,8 +55581,8 @@ static bool ggml_sycl_try_fuse_tg_mul_mat_add(ggml_backend_sycl_context & ctx,
     fused_add_scope clear_fused_add;
 
     if (has_soa_reorder || has_reorder) {
-        return ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(
-            ctx, weight, act, add, ggml_sycl_op_mul_mat_vec_q, dispatch_layout);
+        return ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(ctx, weight, act, add, ggml_sycl_op_mul_mat_vec_q,
+                                                                   dispatch_layout);
     }
     if (act->ne[1] <= MMVQ_MAX_BATCH_SIZE) {
         return ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, weight, act, add, ggml_sycl_op_mul_mat_vec_q, GGML_LAYOUT_AOS);
