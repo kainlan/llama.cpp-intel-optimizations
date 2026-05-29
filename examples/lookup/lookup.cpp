@@ -6,10 +6,7 @@
 #include "log.h"
 #include "llama.h"
 
-#ifdef GGML_USE_SYCL
-#include "ggml-sycl.h"
-#endif
-
+#include <clocale>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
@@ -17,16 +14,18 @@
 #include <vector>
 
 int main(int argc, char ** argv){
+    std::setlocale(LC_NUMERIC, "C");
+
     common_params params;
+
+    common_init();
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_LOOKUP)) {
         return 1;
     }
 
-    common_init();
-
     // max. number of additional tokens to draft if match is found
-    const int n_draft = params.speculative.n_max;
+    const int n_draft = params.speculative.draft.n_max;
 
     // init llama.cpp
     llama_backend_init();
@@ -55,18 +54,18 @@ int main(int argc, char ** argv){
         const int64_t t_start_draft_us = ggml_time_us();
         common_ngram_cache_update(ngram_cache_context, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, inp.size(), false);
 
-        if (!params.lookup_cache_static.empty()) {
+        if (!params.speculative.ngram_cache.lookup_cache_static.empty()) {
             try {
-                ngram_cache_static = common_ngram_cache_load(params.lookup_cache_static);
+                ngram_cache_static = common_ngram_cache_load(params.speculative.ngram_cache.lookup_cache_static);
             } catch (std::ifstream::failure const &) {
-                LOG_ERR("failed to open static lookup cache: %s", params.lookup_cache_static.c_str());
+                LOG_ERR("failed to open static lookup cache: %s", params.speculative.ngram_cache.lookup_cache_static.c_str());
                 exit(1);
             }
         }
 
-        if (!params.lookup_cache_dynamic.empty()) {
+        if (!params.speculative.ngram_cache.lookup_cache_dynamic.empty()) {
             try {
-                ngram_cache_dynamic = common_ngram_cache_load(params.lookup_cache_dynamic);
+                ngram_cache_dynamic = common_ngram_cache_load(params.speculative.ngram_cache.lookup_cache_dynamic);
             } catch (std::ifstream::failure const &) {} // if the file does not exist it will simply be created at the end of the program
         }
 
@@ -110,33 +109,7 @@ int main(int argc, char ** argv){
 
     std::vector<llama_token> draft;
 
-    // Use actual context size, not params.n_ctx which may be 0 (auto-detect)
-    llama_batch batch_tgt = llama_batch_init(max_context_size, 0, 1);
-
-#ifdef GGML_USE_SYCL
-    // GPU verification setup (only for SYCL backends with --gpu-sampling)
-    ggml_sycl_sampler_t gpu_sampler = nullptr;
-    bool gpu_verify_enabled = params.gpu_sampling;
-
-    if (gpu_verify_enabled) {
-        ggml_backend_t logits_backend = llama_get_logits_backend(ctx);
-        if (logits_backend && ggml_backend_is_sycl(logits_backend)) {
-            const int n_vocab = llama_vocab_n_tokens(vocab);
-            gpu_sampler = ggml_backend_sycl_sampler_create(logits_backend, n_vocab, params.sampling.seed);
-            if (gpu_sampler) {
-                LOG_INF("GPU verification enabled on '%s'\n", ggml_backend_name(logits_backend));
-            } else {
-                LOG_WRN("Failed to create GPU sampler, falling back to CPU verification\n");
-                gpu_verify_enabled = false;
-            }
-        } else {
-            LOG_WRN("Logits backend is not SYCL, falling back to CPU verification\n");
-            gpu_verify_enabled = false;
-        }
-    }
-#else
-    bool gpu_verify_enabled = false;
-#endif
+    llama_batch batch_tgt = llama_batch_init(llama_n_ctx(ctx), 0, 1);
 
     const auto t_dec_start = ggml_time_us();
 
@@ -144,175 +117,31 @@ int main(int argc, char ** argv){
         // print current draft sequence
         LOG_DBG("drafted %s\n", string_from(ctx, draft).c_str());
 
-#ifdef GGML_USE_SYCL
-        if (gpu_verify_enabled && !draft.empty()) {
-            // GPU verification path - verify all draft tokens on GPU
-            // IMPORTANT: Synchronize to ensure decode is complete and logits are in accumulated buffer
-            llama_synchronize(ctx);
+        int i_dft = 0;
+        while (true) {
+            // sample from the target model
+            llama_token id = common_sampler_sample(smpl, ctx, i_dft);
 
-            // Get the accumulated GPU logits buffer (NOT the scratch tensor!)
-            // The scratch tensor may be recycled, but the accumulated buffer persists
-            float * gpu_logits = llama_get_gpu_logits_buffer(ctx);
-            const int n_vocab = llama_vocab_n_tokens(vocab);
+            common_sampler_accept(smpl, id, true);
 
-            if (gpu_logits && draft.size() > 0) {
-                // Allocate buffer for sampled tokens
-                std::vector<int32_t> sampled_tokens(draft.size());
+            const std::string token_str = common_token_to_piece(ctx, id);
 
-                // Verify draft tokens against model logits on GPU
-                // Returns number of consecutive matching tokens from the start
-                int n_verified = ggml_backend_sycl_verify_speculative_from_ptr(
-                    gpu_sampler,
-                    gpu_logits,
-                    n_vocab,
-                    (int)draft.size(),  // n_outputs in the buffer
-                    draft.data(),
-                    sampled_tokens.data(),
-                    (int)draft.size(),
-                    0  // logits_offset - start from position 0
-                );
-
-                // Debug: show verification results
-                LOG_DBG("[GPU VERIFY] gpu_logits=%p, draft.size()=%zu, n_verified=%d\n",
-                        (void*)gpu_logits, draft.size(), n_verified);
-                for (size_t d = 0; d < draft.size(); d++) {
-                    LOG_DBG("[GPU VERIFY] pos %zu: draft=%d ('%s'), sampled=%d ('%s'), match=%d\n",
-                            d, draft[d], common_token_to_piece(ctx, draft[d]).c_str(),
-                            sampled_tokens[d], common_token_to_piece(ctx, sampled_tokens[d]).c_str(),
-                            (draft[d] == sampled_tokens[d] ? 1 : 0));
-                }
-
-                // Process verification results
-                int i_dft = 0;
-                while (i_dft < n_verified) {
-                    llama_token id = sampled_tokens[i_dft];
-                    const std::string token_str = common_token_to_piece(ctx, id);
-
-                    common_sampler_accept(smpl, id, true);
-
-                    if (!params.use_color) {
-                        LOG("%s", token_str.c_str());
-                    }
-
-                    if (llama_vocab_is_eog(vocab, id)) {
-                        has_eos = true;
-                    }
-
-                    ++n_predict;
-                    ++n_accept;
-                    ++n_past;
-                    inp.push_back(id);
-
-                    // Update context ngram cache
-                    const int64_t t_start_draft_us = ggml_time_us();
-                    common_ngram_cache_update(ngram_cache_context, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, 1, false);
-                    t_draft_us += ggml_time_us() - t_start_draft_us;
-
-                    if (params.use_color) {
-                        LOG("\033[34m%s\033[0m", token_str.c_str());
-                        fflush(stdout);
-                    }
-
-                    i_dft++;
-                }
-
-                // Handle first mismatch or end of draft
-                if (i_dft < (int)draft.size()) {
-                    // There was a mismatch at position i_dft
-                    llama_token id = sampled_tokens[i_dft];
-                    const std::string token_str = common_token_to_piece(ctx, id);
-
-                    common_sampler_accept(smpl, id, true);
-
-                    if (!params.use_color) {
-                        LOG("%s", token_str.c_str());
-                    } else {
-                        LOG("%s", token_str.c_str());
-                    }
-                    fflush(stdout);
-
-                    if (llama_vocab_is_eog(vocab, id)) {
-                        has_eos = true;
-                    }
-
-                    ++n_predict;
-                    inp.push_back(id);
-
-                    const int64_t t_start_draft_us = ggml_time_us();
-                    common_ngram_cache_update(ngram_cache_context, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, 1, false);
-                    t_draft_us += ggml_time_us() - t_start_draft_us;
-
-                    draft.clear();
-                    draft.push_back(id);
-                } else {
-                    // All drafts were accepted!
-                    // The last sampled_token is the token AFTER all drafts (from position n_verified-1)
-                    // We need to use the last verified token as our continuation point
-                    llama_token id = sampled_tokens[n_verified - 1];
-
-                    // This token was already counted in the loop above, so just set up for next iteration
-                    draft.clear();
-                    draft.push_back(id);
-                }
-
-                goto next_iteration;
+            if (!params.use_color) {
+                LOG("%s", token_str.c_str());
             }
-        }
-#endif
 
-        // CPU verification path (original code)
-        {
-            int i_dft = 0;
-            while (true) {
-                // sample from the target model
-                llama_token id = common_sampler_sample(smpl, ctx, i_dft);
+            if (llama_vocab_is_eog(vocab, id)) {
+                has_eos = true;
+            }
 
-                common_sampler_accept(smpl, id, true);
+            ++n_predict;
 
-                const std::string token_str = common_token_to_piece(ctx, id);
-
-                if (!params.use_color) {
-                    LOG("%s", token_str.c_str());
-                }
-
-                if (llama_vocab_is_eog(vocab, id)) {
-                    has_eos = true;
-                }
-
-                ++n_predict;
-
-                // check if the target token matches the draft
-                if (i_dft < (int) draft.size() && id == draft[i_dft]) {
-                    LOG_DBG("the sampled target token matches the %dth drafted token (%d, '%s') - accepted\n", i_dft, id, token_str.c_str());
-                    ++n_accept;
-                    ++n_past;
-                    ++i_dft;
-                    inp.push_back(id);
-                    {
-                        // Update context ngram cache with the newly accepted token:
-                        const int64_t t_start_draft_us = ggml_time_us();
-                        common_ngram_cache_update(ngram_cache_context, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, 1, false);
-                        t_draft_us += ggml_time_us() - t_start_draft_us;
-                    }
-
-                    if (params.use_color) {
-                        // color accepted draft token
-                        LOG("\033[34m%s\033[0m", token_str.c_str());
-                        fflush(stdout);
-                    }
-                    continue;
-                }
-
-                if (params.use_color) {
-                    LOG("%s", token_str.c_str());
-                }
-                fflush(stdout);
-
-
-                LOG_DBG("the sampled target token (%d, '%s') did not match, or we ran out of drafted tokens\n", id, token_str.c_str());
-
-                draft.clear();
-                draft.push_back(id);
+            // check if the target token matches the draft
+            if (i_dft < (int) draft.size() && id == draft[i_dft]) {
+                LOG_DBG("the sampled target token matches the %dth drafted token (%d, '%s') - accepted\n", i_dft, id, token_str.c_str());
+                ++n_accept;
+                ++n_past;
+                ++i_dft;
                 inp.push_back(id);
                 {
                     // Update context ngram cache with the newly accepted token:
@@ -320,13 +149,34 @@ int main(int argc, char ** argv){
                     common_ngram_cache_update(ngram_cache_context, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, 1, false);
                     t_draft_us += ggml_time_us() - t_start_draft_us;
                 }
-                break;
-            }
-        }
 
-#ifdef GGML_USE_SYCL
-next_iteration:
-#endif
+                if (params.use_color) {
+                    // color accepted draft token
+                    LOG("\033[34m%s\033[0m", token_str.c_str());
+                    fflush(stdout);
+                }
+                continue;
+            }
+
+            if (params.use_color) {
+                LOG("%s", token_str.c_str());
+            }
+            fflush(stdout);
+
+
+            LOG_DBG("the sampled target token (%d, '%s') did not match, or we ran out of drafted tokens\n", id, token_str.c_str());
+
+            draft.clear();
+            draft.push_back(id);
+            inp.push_back(id);
+            {
+                // Update context ngram cache with the newly accepted token:
+                const int64_t t_start_draft_us = ggml_time_us();
+                common_ngram_cache_update(ngram_cache_context, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, 1, false);
+                t_draft_us += ggml_time_us() - t_start_draft_us;
+            }
+            break;
+        }
 
         if ((params.n_predict > 0 && n_predict > params.n_predict) || has_eos) {
             break;
@@ -363,7 +213,7 @@ next_iteration:
 
     // Update dynamic ngram cache with context ngram cache and save it to disk:
     common_ngram_cache_merge(ngram_cache_dynamic, ngram_cache_context);
-    common_ngram_cache_save(ngram_cache_dynamic, params.lookup_cache_dynamic);
+    common_ngram_cache_save(ngram_cache_dynamic, params.speculative.ngram_cache.lookup_cache_dynamic);
 
     LOG("\n\n");
 
@@ -384,12 +234,6 @@ next_iteration:
     common_perf_print(ctx, smpl);
 
     common_sampler_free(smpl);
-
-#ifdef GGML_USE_SYCL
-    if (gpu_sampler) {
-        ggml_backend_sycl_sampler_free(gpu_sampler);
-    }
-#endif
 
     llama_batch_free(batch_tgt);
 

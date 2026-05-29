@@ -738,10 +738,6 @@ static sycl::event set_rows_sycl(ggml_backend_sycl_context &     ctx,
                 src0_d, src1_d, dst_d, ne00, ne01, ne02, ne03, ne11, ne12, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2,
                 nb3, sizeof(TIn), sizeof(sycl::ext::oneapi::bfloat16), stream);
             break;
-        case GGML_TYPE_F8_E4M3:
-            evt = set_rows_sycl_fp8<TIdx>(src0_d, src1_d, (fp8_e4m3_t *) dst_d, ne00, ne01, ne02, ne03, ne11, ne12,
-                                          nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
-            break;
         case GGML_TYPE_Q8_0:
             evt = set_rows_sycl_q<TIdx, block_q8_0, QK8_0, cpy_blck_f32_q8_0>(
                 src0_d, src1_d, (block_q8_0 *) dst_d, ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb00, nb01, nb02,

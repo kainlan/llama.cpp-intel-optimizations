@@ -1864,7 +1864,7 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
     }
 
     // Check K/V types - F16 or FP8 E4M3 (for memory savings)
-    const bool kv_is_fp8 = (K->type == GGML_TYPE_F8_E4M3 && V->type == GGML_TYPE_F8_E4M3);
+    const bool kv_is_fp8 = (ggml_sycl_type_is_fp8_e4m3(K->type) && ggml_sycl_type_is_fp8_e4m3(V->type));
     const bool kv_is_f16 = (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16);
     if (!kv_is_f16 && !kv_is_fp8) {
         return false;
@@ -2773,8 +2773,8 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     }
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32 || Q->type == GGML_TYPE_F16);
-    GGML_ASSERT(K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_F8_E4M3);  // FP16 or FP8 KV cache
-    GGML_ASSERT(V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_F8_E4M3);  // FP16 or FP8 KV cache
+    GGML_ASSERT(K->type == GGML_TYPE_F16 || ggml_sycl_type_is_fp8_e4m3(K->type));  // FP16 or FP8 KV cache
+    GGML_ASSERT(V->type == GGML_TYPE_F16 || ggml_sycl_type_is_fp8_e4m3(V->type));  // FP16 or FP8 KV cache
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
     // Extract scale, max_bias, and logit_softcap from op_params
@@ -3089,7 +3089,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     }
 
     // Set FP8 KV cache flag - enables on-the-fly dequantization in flash attention kernel
-    params.kv_is_fp8 = (K->type == GGML_TYPE_F8_E4M3 && V->type == GGML_TYPE_F8_E4M3);
+    params.kv_is_fp8 = (ggml_sycl_type_is_fp8_e4m3(K->type) && ggml_sycl_type_is_fp8_e4m3(V->type));
 
     // Multi-token decode support - disabled by default
     // Will be enabled when q_positions array is provided via thread-local storage

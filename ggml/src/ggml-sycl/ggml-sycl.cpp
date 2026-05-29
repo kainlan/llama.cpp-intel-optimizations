@@ -13551,6 +13551,8 @@ static const ggml_backend_buffer_i ggml_backend_sycl_probe_buffer_interface = {
 
     /* .set_tensor      = */ NULL,
     /* .get_tensor      = */ NULL,
+    /* .set_tensor_2d   = */ NULL,
+    /* .get_tensor_2d   = */ NULL,
     /* .cpy_tensor      = */ NULL,
 
     /* .clear           = */ NULL,
@@ -22043,6 +22045,8 @@ static const ggml_backend_buffer_i ggml_backend_sycl_buffer_interface = {
     /* .memset_tensor   = */ ggml_backend_sycl_buffer_memset_tensor,
     /* .set_tensor      = */ ggml_backend_sycl_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_sycl_buffer_get_tensor,
+    /* .set_tensor_2d   = */ NULL,
+    /* .get_tensor_2d   = */ NULL,
     /* .cpy_tensor      = */ ggml_backend_sycl_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_sycl_buffer_clear,
 
@@ -23011,6 +23015,8 @@ static const ggml_backend_buffer_i tiered_kv_buffer_interface = {
     /* .memset_tensor   = */ tiered_kv_buffer_memset_tensor,
     /* .set_tensor      = */ tiered_kv_buffer_set_tensor,
     /* .get_tensor      = */ tiered_kv_buffer_get_tensor,
+    /* .set_tensor_2d   = */ NULL,
+    /* .get_tensor_2d   = */ NULL,
     /* .cpy_tensor      = */ NULL,
     /* .clear           = */ tiered_kv_buffer_clear,
     /* .reset           = */ NULL,
@@ -24027,6 +24033,8 @@ static struct ggml_backend_buffer_i ggml_backend_sycl_split_buffer_interface = {
     /* .memset_tensor   = */ NULL,
     /* .set_tensor      = */ ggml_backend_sycl_split_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_sycl_split_buffer_get_tensor,
+    /* .set_tensor_2d   = */ NULL,
+    /* .get_tensor_2d   = */ NULL,
     /* .cpy_tensor      = */ NULL,
 
     /* .clear           = */ ggml_backend_sycl_split_buffer_clear,
@@ -24693,6 +24701,8 @@ static struct ggml_backend_buffer_i ggml_backend_sycl_tp_buffer_interface = {
     /* .memset_tensor   = */ NULL,
     /* .set_tensor      = */ ggml_backend_sycl_tp_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_sycl_tp_buffer_get_tensor,
+    /* .set_tensor_2d   = */ NULL,
+    /* .get_tensor_2d   = */ NULL,
 
     /* .cpy_tensor      = */ NULL,
     /* .clear           = */ ggml_backend_sycl_tp_buffer_clear,
@@ -73616,6 +73626,8 @@ static ggml_backend_i ggml_backend_sycl_interface = {
     /* .free                    = */ ggml_backend_sycl_free,
     /* .set_tensor_async        = */ ggml_backend_sycl_set_tensor_async,
     /* .get_tensor_async        = */ ggml_backend_sycl_get_tensor_async,
+    /* .set_tensor_2d_async     = */ NULL,
+    /* .get_tensor_2d_async     = */ NULL,
     /* .cpy_tensor_async        = */ NULL,  // ggml_backend_sycl_cpy_tensor_async,
 
                                             // // TODO: update for the new
@@ -73977,7 +73989,7 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SET_ROWS:
             {
                 return ((op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
-                         op->type == GGML_TYPE_F8_E4M3 ||  // FP8 KV cache support
+                         ggml_sycl_type_is_fp8_e4m3(op->type) ||
                          op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q5_0 ||
                          op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_IQ4_NL) &&
                         (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32));

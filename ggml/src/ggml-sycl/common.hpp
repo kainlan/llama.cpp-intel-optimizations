@@ -488,6 +488,10 @@ int  get_current_device_id();
 int  ggml_sycl_map_device_id(int device);
 void ggml_sycl_set_device_map(const int * device_ids, int device_count);
 
+inline int ggml_sycl_get_device() {
+    return get_current_device_id();
+}
+
 inline dpct::device_ext & ggml_sycl_get_device(int device) {
     return dpct::dev_mgr::instance().get_device(ggml_sycl_map_device_id(device));
 }
@@ -5007,15 +5011,70 @@ static const sycl::uint3 init_fastdiv_values(uint32_t d) {
     return sycl::uint3(mp, L, d);
 }
 
+static constexpr int ggml_sycl_get_max_cpy_bytes() {
+    return 16;
+}
+
+template <int nbytes, int alignment = 0>
+static __dpct_inline__ void ggml_sycl_memcpy_1(void * dst, const void * src) {
+    if constexpr (alignment != 0) {
+        static_assert(nbytes % alignment == 0, "bad alignment");
+    }
+    constexpr int nb_per_cpy = alignment == 0 ? nbytes : alignment;
+
+#pragma unroll
+    for (int i = 0; i < nbytes / nb_per_cpy; ++i) {
+        if constexpr (nb_per_cpy == 1) {
+            ((char *) dst)[i] = ((const char *) src)[i];
+        } else if constexpr (nb_per_cpy == 2) {
+            ((short *) dst)[i] = ((const short *) src)[i];
+        } else if constexpr (nb_per_cpy == 4) {
+            ((int *) dst)[i] = ((const int *) src)[i];
+        } else if constexpr (nb_per_cpy == 8) {
+            ((sycl::int2 *) dst)[i] = ((const sycl::int2 *) src)[i];
+        } else if constexpr (nb_per_cpy == 16) {
+            ((sycl::int4 *) dst)[i] = ((const sycl::int4 *) src)[i];
+        } else {
+            static_assert(nbytes == 0 && nbytes == -1, "bad nbytes");
+        }
+    }
+}
+
 static __dpct_inline__ uint32_t fastdiv(uint32_t n, const sycl::uint3 fastdiv_values) {
     const uint32_t hi = sycl::mul_hi<unsigned>(n, fastdiv_values.x());
     return (hi + n) >> fastdiv_values.y();
+}
+
+static __dpct_inline__ uint32_t fastmodulo(uint32_t n, const sycl::uint3 fastdiv_values) {
+    return n - fastdiv(n, fastdiv_values) * fastdiv_values.z();
 }
 
 static __dpct_inline__ sycl::uint2 fast_div_modulo(uint32_t n, const sycl::uint3 fastdiv_values) {
     const uint32_t div_val = fastdiv(n, fastdiv_values);
     const uint32_t mod_val = n - div_val * fastdiv_values.z();
     return sycl::uint2(div_val, mod_val);
+}
+
+template <int n>
+struct ggml_sycl_unroll {
+    template <typename Func, typename... Args>
+    void operator()(const Func & f, Args... args) const {
+        f(n - 1, args...);
+        ggml_sycl_unroll<n - 1>{}(f, args...);
+    }
+};
+
+template <>
+struct ggml_sycl_unroll<1> {
+    template <typename Func, typename... Args>
+    void operator()(const Func & f, Args... args) const {
+        f(0, args...);
+    }
+};
+
+static constexpr bool fast_fp16_available(const int cc) {
+    GGML_UNUSED(cc);
+    return true;
 }
 
 static __dpct_inline__ int ggml_sycl_dp4a(const int a, const int b, int c) {
@@ -5033,6 +5092,23 @@ static __dpct_inline__ float ggml_sycl_e8m0_to_fp32(uint8_t x) {
     float result;
     memcpy(&result, &bits, sizeof(float));
     return result;
+}
+
+static __dpct_inline__ float ggml_sycl_ue4m3_to_fp32(uint8_t x) {
+    if (x == 0 || x == 0x7f || x == 0xff) {
+        return 0.0f;
+    }
+
+    const int   exp = (x >> 3) & 0xf;
+    const int   man = x & 0x7;
+    const float raw = exp == 0 ? sycl::ldexp((float) man, -9)
+                               : sycl::ldexp(1.0f + (float) man / 8.0f, exp - 7);
+    return raw * 0.5f;
+}
+
+static inline bool ggml_sycl_type_is_fp8_e4m3(ggml_type type) {
+    GGML_UNUSED(type);
+    return false;
 }
 
 // Application-level SYCL submission timeout watchdog.

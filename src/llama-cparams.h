@@ -12,6 +12,7 @@ struct llama_cparams {
     uint32_t n_batch;
     uint32_t n_ubatch;
     uint32_t n_seq_max;
+    uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
     int32_t  n_threads;       // number of threads to use for generation
     int32_t  n_threads_batch; // number of threads to use for batch processing
 
@@ -27,23 +28,22 @@ struct llama_cparams {
     float yarn_beta_slow;
 
     bool embeddings;
+    bool embeddings_pre_norm;        // also extract the hidden state before the final output norm
+    bool embeddings_pre_norm_masked; // extract for only rows where batch.logits != 0
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;
+    bool auto_fa;
+    bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
+    bool fused_gdn_ch;       // use fused gated delta net (chunked)
+    bool auto_fgdn;
     bool no_perf;
     bool warmup;
     bool op_offload;
     bool kv_unified;
-    bool paged_attn;    // PagedAttention: use block-based K/V addressing (vLLM-style)
-    bool paged_layout;  // Paged KV layout: 4D format [D, block_size, n_heads, num_blocks] for V2 dispatch
-    bool prefix_cache;  // Prefix caching: share KV blocks with identical content (requires paged_attn)
+    bool pipeline_parallel;
 
-    // Pipeline parallelism parameters (vLLM-style)
-    int32_t pp_size;           // number of pipeline stages (0 = auto)
-    int32_t tp_size;           // tensor parallelism degree within each PP stage
-    int32_t pp_chunk_size;     // max tokens per prefill chunk (0 = disabled)
-    bool    pp_chunked_prefill; // enable chunked prefill for pipeline parallelism
-
+    enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;
 
     ggml_backend_sched_eval_callback cb_eval;

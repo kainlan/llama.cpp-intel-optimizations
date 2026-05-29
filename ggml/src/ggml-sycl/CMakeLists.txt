@@ -173,17 +173,12 @@ if (GGML_SYCL_TARGET STREQUAL "INTEL")
         message(STATUS "Found TBB for ggml-sycl CPU dispatch: ${TBB_DIR}")
     endif()
 
-    # Optional MKL fallback for Intel targets
-    if(GGML_SYCL_USE_MKL_FALLBACK)
-        find_package(MKL QUIET)
-        if(MKL_FOUND)
-            target_link_libraries(ggml-sycl PRIVATE MKL::MKL_SYCL::BLAS)
-            set(GGML_SYCL_MKL_FALLBACK_ENABLED 1)
-            message(STATUS "Found oneMKL: enabled as optional fallback")
-        else()
-            message(WARNING "MKL fallback requested but MKL not found - using oneDNN only")
-        endif()
-    endif()
+    # solve_tri.cpp calls oneMKL BLAS directly for batched TRSM, so Intel SYCL
+    # builds must link the SYCL BLAS component even when other math paths use oneDNN.
+    find_package(MKL REQUIRED)
+    target_link_libraries(ggml-sycl PRIVATE MKL::MKL_SYCL::BLAS)
+    set(GGML_SYCL_MKL_FALLBACK_ENABLED 1)
+    message(STATUS "Found oneMKL BLAS for SYCL solve_tri")
 else()
     # For NVIDIA/AMD: oneDNN is optional (they use oneMath with cuBLAS/rocBLAS)
     find_package(DNNL QUIET)

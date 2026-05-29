@@ -1,4 +1,7 @@
-ARG ASCEND_VERSION=8.1.RC1.alpha001-910b-openeuler22.03-py3.10
+ARG ASCEND_VERSION=8.5.0-910b-openeuler22.03-py3.10
+ARG BUILD_DATE=N/A
+ARG APP_VERSION=N/A
+ARG APP_REVISION=N/A
 
 FROM ascendai/cann:$ASCEND_VERSION AS build
 
@@ -6,7 +9,7 @@ WORKDIR /app
 
 COPY . .
 
-RUN yum install -y gcc g++ cmake make libcurl-devel
+RUN yum install -y gcc g++ cmake make openssl-devel
 ENV ASCEND_TOOLKIT_HOME=/usr/local/Ascend/ascend-toolkit/latest
 ENV LIBRARY_PATH=${ASCEND_TOOLKIT_HOME}/lib64:$LIBRARY_PATH
 ENV LD_LIBRARY_PATH=${ASCEND_TOOLKIT_HOME}/lib64:${ASCEND_TOOLKIT_HOME}/lib64/plugin/opskernel:${ASCEND_TOOLKIT_HOME}/lib64/plugin/nnengine:${ASCEND_TOOLKIT_HOME}/opp/built-in/op_impl/ai_core/tbe/op_tiling:${LD_LIBRARY_PATH}
@@ -28,6 +31,20 @@ RUN echo "Building with static libs" && \
 
 # TODO: use image with NNRT
 FROM ascendai/cann:$ASCEND_VERSION AS runtime
+
+ARG BUILD_DATE=N/A
+ARG APP_VERSION=N/A
+ARG APP_REVISION=N/A
+ARG IMAGE_URL=https://github.com/ggml-org/llama.cpp
+ARG IMAGE_SOURCE=https://github.com/ggml-org/llama.cpp
+LABEL org.opencontainers.image.created=$BUILD_DATE \
+      org.opencontainers.image.version=$APP_VERSION \
+      org.opencontainers.image.revision=$APP_REVISION \
+      org.opencontainers.image.title="llama.cpp" \
+      org.opencontainers.image.description="LLM inference in C/C++" \
+      org.opencontainers.image.url=$IMAGE_URL \
+      org.opencontainers.image.source=$IMAGE_SOURCE
+
 COPY --from=build /app/build/bin/llama-cli /app/build/bin/llama-completion /
 
 ENV LC_ALL=C.utf8

@@ -2196,6 +2196,10 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tens
             get_rows_sycl_float(ctx, dst->src[0], dst->src[1], dst, (const sycl::half *) src0_d, src1_i32, dst_d,
                                 ctx.stream());
             break;
+        case GGML_TYPE_BF16:
+            get_rows_sycl_float(ctx, dst->src[0], dst->src[1], dst, (const sycl::ext::oneapi::bfloat16 *)dst->src[0]->data,
+                                src1_i32, (float *)dst->data, ctx.stream());
+            break;
         case GGML_TYPE_F32:
             get_rows_sycl_float(ctx, dst->src[0], dst->src[1], dst, (const float *) src0_d, src1_i32, dst_d,
                                 ctx.stream());
