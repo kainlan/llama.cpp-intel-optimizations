@@ -29,7 +29,7 @@ static void test_set_inventory() {
         { "blk.0.ffn_down_exps.weight", 200 * 1024 * 1024 },
     };
 
-    ggml_sycl_tensor_inventory inventory;
+    ggml_sycl_tensor_inventory inventory = {};
     inventory.tensors    = tensors.data();
     inventory.count      = tensors.size();
     inventory.total_size = 350 * 1024 * 1024;
@@ -66,7 +66,7 @@ static void test_empty_inventory() {
     }
 
     // Empty inventory
-    ggml_sycl_tensor_inventory inventory;
+    ggml_sycl_tensor_inventory inventory = {};
     inventory.tensors    = nullptr;
     inventory.count      = 0;
     inventory.total_size = 0;
@@ -109,7 +109,7 @@ static void test_large_inventory() {
         tensors.push_back({ name_storage.back().c_str(), size_per_tensor });
     }
 
-    ggml_sycl_tensor_inventory inventory;
+    ggml_sycl_tensor_inventory inventory = {};
     inventory.tensors    = tensors.data();
     inventory.count      = tensors.size();
     inventory.total_size = total_size;

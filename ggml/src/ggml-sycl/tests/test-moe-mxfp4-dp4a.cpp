@@ -62,23 +62,20 @@ static constexpr int8_t kvalues_mxfp4[16] = {
 
 // E8M0 to FP32 with 0.5 factor (matches sycl_e8m0_to_fp32_half from common.hpp)
 static inline float e8m0_to_float_half(uint8_t e) {
-    if (e < 2) {
-        static const uint32_t denorm_table[2] = { 0x00000000, 0x33800000 };
-        float                 result;
-        memcpy(&result, &denorm_table[e], sizeof(float));
-        return result;
+    uint32_t bits;
+    if (e == 0) {
+        bits = 0x00200000u;
+    } else if (e == 1) {
+        bits = 0x00400000u;
+    } else {
+        bits = static_cast<uint32_t>(e - 1) << 23;
     }
-    uint32_t bits = static_cast<uint32_t>(e - 1) << 23;
-    float    result;
+    float result;
     memcpy(&result, &bits, sizeof(float));
     return result;
 }
 
 // E8M0 to FP32 raw (matches ggml_sycl_e8m0_to_fp32 from common.hpp)
-// NOTE: For e=0, this returns a tiny denormal (2^(-149)), NOT 0.0.
-// The DP4A kernel uses this function * 0.5f, which for e=0 gives ~2.94e-46.
-// The scalar kernel uses e8m0_to_float_half(0) which returns exactly 0.0.
-// This discrepancy is acceptable because e=0 represents a near-zero scale.
 static inline float e8m0_to_float_raw(uint8_t e) {
     uint32_t bits = (e == 0) ? 0x00400000u : (static_cast<uint32_t>(e) << 23);
     float    result;
@@ -740,14 +737,11 @@ void gpu_mxfp4_scalar_kernel(const block_mxfp4 * __restrict__ weights,
 
     for (int b = tid; b < blocks_per_row; b += 32) {
         const uint8_t e = w_row[b].e;
-        float scale;
-        if (e < 2) {
-            static const uint32_t denorm_table[2] = { 0x00000000, 0x33800000 };
-            memcpy(&scale, &denorm_table[e], sizeof(float));
-        } else {
-            uint32_t bits = static_cast<uint32_t>(e - 1) << 23;
-            memcpy(&scale, &bits, sizeof(float));
-        }
+        float         scale;
+        const uint32_t bits = e == 0 ? 0x00200000u :
+                              e == 1 ? 0x00400000u :
+                                       static_cast<uint32_t>(e - 1) << 23;
+        memcpy(&scale, &bits, sizeof(float));
 
         for (int i = 0; i < 16; i++) {
             uint8_t packed = w_row[b].qs[i];

@@ -128,6 +128,7 @@ struct moe_layer_decode_role_plan {
     std::vector<mem_handle>            handles;
     std::vector<moe_layer_grouped_route_row> rows;
     std::vector<sycl::event>           ready_events;
+    bool                               full_table_static_handles = false;
 
     size_t entries() const { return expert_ids.size(); }
 
@@ -293,9 +294,11 @@ struct moe_layer_grouped_route_group {
     int                                 device       = mem_handle::HOST_DEVICE;
     ggml_layout_mode                    layout       = GGML_LAYOUT_AOS;
     moe_layer_route_residency           residency    = moe_layer_route_residency::MISSING;
+    moe_route_phase                     phase        = moe_route_phase::DECODE;
     size_t                              handle_index = SIZE_MAX;
     mem_handle                          handle;
     size_t                              handle_hash  = 0;
+    std::vector<sycl::event>            deps;
     std::vector<moe_layer_grouped_route_row> rows;
 };
 
@@ -313,6 +316,7 @@ struct moe_layer_grouped_route_view {
     size_t                                      layout_mismatch_rows = 0;
     size_t                                      max_rows_per_group   = 0;
     size_t                                      ready_events         = 0;
+    std::vector<sycl::event>                    deps;
     std::vector<moe_layer_grouped_route_group> groups;
 };
 

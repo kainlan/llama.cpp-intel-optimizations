@@ -77,6 +77,7 @@ struct reorder_fill_ctx {
     ggml_layout_mode layout;
     bool             src_is_device;
     int              device_id;
+    int              source_device_id = -1;
 };
 
 // CPU-side AOS->SOA reorder + H2D DMA as a cache_layout_fill_fn.

@@ -72,15 +72,15 @@ static inline float e8m0_to_float_raw(uint8_t e) {
 // E8M0 to FP32 conversion with 0.5 factor (for MXFP4 kvalues)
 // This matches sycl_e8m0_to_fp32_half from common.hpp
 static inline float e8m0_to_float_half(uint8_t e) {
-    if (e < 2) {
-        static const uint32_t denorm_table[2] = { 0x00000000, 0x33800000 };
-        float                 result;
-        memcpy(&result, &denorm_table[e], sizeof(float));
-        return result;
+    uint32_t bits;
+    if (e == 0) {
+        bits = 0x00200000u;
+    } else if (e == 1) {
+        bits = 0x00400000u;
+    } else {
+        bits = static_cast<uint32_t>(e - 1) << 23;
     }
-    // Normal case: exponent - 1 gives halving
-    uint32_t bits = static_cast<uint32_t>(e - 1) << 23;
-    float    result;
+    float result;
     memcpy(&result, &bits, sizeof(float));
     return result;
 }
@@ -270,14 +270,13 @@ bool test_e8m0_exponent_correct(sycl::queue & q) {
     // Value = 2^(e - 127) for normal values
     // With halving factor: 2^(e - 128)
 
-    // Test case 1: e = 0 (special case, represents 0 or smallest denormal)
+    // Test case 1: e = 0 (subnormal half scale)
     float scale_e0 = e8m0_to_float_half(0);
-    TEST_ASSERT_NEAR(scale_e0, 0.0f, 1e-10f, "E8M0 e=0 should be 0.0");
+    TEST_ASSERT(scale_e0 > 0.0f && scale_e0 < 1e-37f, "E8M0 e=0 should be a positive subnormal");
 
-    // Test case 2: e = 1 (denormal lookup table value)
+    // Test case 2: e = 1 (smallest normal halved)
     float scale_e1 = e8m0_to_float_half(1);
-    // From denorm_table[1] = 0x33800000, which is approximately 5.96e-08
-    TEST_ASSERT(scale_e1 > 0.0f && scale_e1 < 1e-6f, "E8M0 e=1 should be small positive (denormal)");
+    TEST_ASSERT(scale_e1 > scale_e0 && scale_e1 < 1e-37f, "E8M0 e=1 should be the next positive subnormal");
 
     // Test case 3: e = 127 (2^0 / 2 = 0.5)
     float scale_e127 = e8m0_to_float_half(127);

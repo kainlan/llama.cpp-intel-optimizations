@@ -24,6 +24,7 @@
 #include <cstring>
 #include <future>
 #include <limits>
+#include <stdexcept>
 #include <thread>
 #include <unordered_set>
 
@@ -2160,12 +2161,47 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
         return result;
     }
 
+    auto release_unpublished_ptr = [&]() {
+        if (!ptr) {
+            return;
+        }
+        if (raw_device_alloc) {
+            try {
+                sycl::free(ptr, *queue);
+            } catch (...) {
+            }
+            saturating_sub_used(dst_size);
+        } else {
+            zone_free(vram_zone_id::WEIGHT, ptr);
+        }
+        ptr = nullptr;
+    };
+
     // 2. Fill: reorder or plain memcpy
     sycl::event fill_event;
-    if (fill_fn) {
-        fill_event = fill_fn(*queue, ptr, dst_size, src_ptr, src_size, fill_ctx, {});
-    } else {
-        fill_event = queue->memcpy(ptr, src_ptr, src_size);
+    try {
+        if (fill_fn) {
+            fill_event = fill_fn(*queue, ptr, dst_size, src_ptr, src_size, fill_ctx, {});
+        } else {
+            fill_event = queue->memcpy(ptr, src_ptr, src_size);
+        }
+    } catch (const sycl::exception & e) {
+        GGML_LOG_ERROR("[DIRECT-STAGE] dense fill failed model=%llu name_hash=0x%llx layout=%d bytes=%zu: %s\n",
+                       (unsigned long long) key.model_id, (unsigned long long) key.name_hash, (int) layout, dst_size,
+                       e.what());
+        release_unpublished_ptr();
+        return result;
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("[DIRECT-STAGE] dense fill failed model=%llu name_hash=0x%llx layout=%d bytes=%zu: %s\n",
+                       (unsigned long long) key.model_id, (unsigned long long) key.name_hash, (int) layout, dst_size,
+                       e.what());
+        release_unpublished_ptr();
+        return result;
+    } catch (...) {
+        GGML_LOG_ERROR("[DIRECT-STAGE] dense fill failed model=%llu name_hash=0x%llx layout=%d bytes=%zu\n",
+                       (unsigned long long) key.model_id, (unsigned long long) key.name_hash, (int) layout, dst_size);
+        release_unpublished_ptr();
+        return result;
     }
 
     // 3. Zero-fill padding if dst_size > src_size
@@ -2414,12 +2450,50 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         return result;
     }
 
+    auto release_unpublished_ptr = [&]() {
+        if (!ptr) {
+            return;
+        }
+        if (raw_device_alloc) {
+            try {
+                sycl::free(ptr, *queue);
+            } catch (...) {
+            }
+            saturating_sub_used(dst_size);
+        } else {
+            zone_free(vram_zone_id::WEIGHT, ptr);
+        }
+        ptr = nullptr;
+    };
+
     // 2. Fill: reorder or plain memcpy
     sycl::event fill_event;
-    if (fill_fn) {
-        fill_event = fill_fn(*queue, ptr, dst_size, src_ptr, src_size, fill_ctx, {});
-    } else {
-        fill_event = queue->memcpy(ptr, src_ptr, src_size);
+    try {
+        if (fill_fn) {
+            fill_event = fill_fn(*queue, ptr, dst_size, src_ptr, src_size, fill_ctx, {});
+        } else {
+            fill_event = queue->memcpy(ptr, src_ptr, src_size);
+        }
+    } catch (const sycl::exception & e) {
+        GGML_LOG_ERROR(
+            "[DIRECT-STAGE] expert fill failed model=%llu name_hash=0x%llx aux=%llu layout=%d bytes=%zu: %s\n",
+            (unsigned long long) key.model_id, (unsigned long long) key.name_hash, (unsigned long long) key.aux_id,
+            (int) layout, dst_size, e.what());
+        release_unpublished_ptr();
+        return result;
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR(
+            "[DIRECT-STAGE] expert fill failed model=%llu name_hash=0x%llx aux=%llu layout=%d bytes=%zu: %s\n",
+            (unsigned long long) key.model_id, (unsigned long long) key.name_hash, (unsigned long long) key.aux_id,
+            (int) layout, dst_size, e.what());
+        release_unpublished_ptr();
+        return result;
+    } catch (...) {
+        GGML_LOG_ERROR("[DIRECT-STAGE] expert fill failed model=%llu name_hash=0x%llx aux=%llu layout=%d bytes=%zu\n",
+                       (unsigned long long) key.model_id, (unsigned long long) key.name_hash,
+                       (unsigned long long) key.aux_id, (int) layout, dst_size);
+        release_unpublished_ptr();
+        return result;
     }
 
     // 3. Zero-fill padding if dst_size > src_size
@@ -2459,7 +2533,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         entry.layout          = layout;
         entry.access_count    = 0;
         entry.last_access     = time_++;
-        entry.pinned          = true;
+        entry.pinned          = false;
         entry.hot             = true;
         entry.state           = cache_entry_state::IN_PROGRESS;
         entry.has_ready_event = true;
@@ -2792,6 +2866,111 @@ expert_resolve_result unified_cache::resolve_expert(const expert_resolve_request
         }
         result.reason = expert_resolve_reason::NOT_FOUND;
         return result;
+    }
+}
+
+bool unified_cache::drop_expert_entry(ggml_sycl_cache_id key, const char * reason) {
+    if (!key.valid) {
+        return false;
+    }
+
+    unified_cache_key cache_key{ cache_entry_type::MOE_EXPERT, key, -1, -1 };
+
+    for (;;) {
+        sycl::event wait_event;
+        bool        needs_wait = false;
+
+        {
+            std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+            auto                                it = entries_.find(cache_key);
+            if (it == entries_.end()) {
+                lock.unlock();
+                std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_);
+                direct_expert_entries_.erase(key);
+                return false;
+            }
+
+            unified_cache_entry & entry = it->second;
+            if (entry.state == cache_entry_state::IN_PROGRESS) {
+                if (entry.has_ready_event && !event_complete(entry.ready_event)) {
+                    wait_event = entry.ready_event;
+                    needs_wait = true;
+                } else {
+                    entry.state           = cache_entry_state::READY;
+                    entry.has_ready_event = false;
+                }
+            }
+
+            if (needs_wait) {
+                // Do not block while holding rw_mutex_; producers may need the
+                // same cache lock to publish readiness or release handles.
+            } else {
+                const uint32_t live = entry.in_use_count.load();
+                if (live != 0) {
+                    static std::atomic<int> refused_log{ 0 };
+                    if (refused_log.fetch_add(1, std::memory_order_relaxed) < 40) {
+                        GGML_LOG_WARN(
+                            "[UNIFIED-CACHE] drop_expert_entry refused: model=%llu name_hash=0x%llx layout=%d "
+                            "in_use=%u reason=%s\n",
+                            (unsigned long long) key.model_id, (unsigned long long) key.name_hash,
+                            (int) entry.layout, live, reason ? reason : "");
+                    }
+                    return false;
+                }
+
+                void *         ptr           = entry.device_ptr;
+                const size_t   entry_size    = entry.size;
+                const bool     host_resident = entry.host_resident;
+                const auto     location      = entry.location;
+                const int      entry_layout  = static_cast<int>(entry.layout);
+                const bool     is_arena      = ptr && vram_owns(ptr);
+                const bool     is_pool       = ptr && !is_arena && layout_pool_ && layout_pool_->owns(ptr);
+                constexpr bool log_drops     = false;
+                if (log_drops) {
+                    GGML_LOG_INFO("[UNIFIED-CACHE] drop expert model=%llu name_hash=0x%llx layout=%d reason=%s\n",
+                                  (unsigned long long) key.model_id, (unsigned long long) key.name_hash,
+                                  entry_layout, reason ? reason : "");
+                }
+
+                if (ptr && !host_resident) {
+                    if (is_arena) {
+                        zone_free(vram_zone_id::WEIGHT, ptr);
+                    } else if (is_pool) {
+                        saturating_sub_used(entry_size);
+                    } else {
+                        enqueue_deferred_free(ptr, entry_size);
+                    }
+                    has_evictions_.store(true, std::memory_order_release);
+                } else if (ptr && location == cache_location::HOST_PINNED && contains_pinned(ptr)) {
+                    if (host_zones_configured()) {
+                        host_zone_free(host_zone_id::WEIGHT, ptr);
+                    } else {
+                        host_pool_free(ptr, entry_size);
+                    }
+                }
+
+                id_to_key_.erase(key);
+                entries_.erase(it);
+                cache_generation_bump();
+
+                lock.unlock();
+                {
+                    std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_);
+                    direct_expert_entries_.erase(key);
+                }
+                return true;
+            }
+        }
+
+        if (needs_wait) {
+            try {
+                wait_event.wait_and_throw();
+            } catch (const sycl::exception & e) {
+                GGML_LOG_WARN("[UNIFIED-CACHE] drop_expert_entry wait failed model=%llu name_hash=0x%llx: %s\n",
+                              (unsigned long long) key.model_id, (unsigned long long) key.name_hash, e.what());
+                return false;
+            }
+        }
     }
 }
 
@@ -4694,6 +4873,15 @@ size_t unified_cache::evict_one(size_t /* new_size */) {
         // Remove from lookup
         id_to_key_.erase(evict_key.id);
 
+        {
+            std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_);
+            if (evict_key.type == cache_entry_type::MOE_EXPERT) {
+                direct_expert_entries_.erase(evict_key.id);
+            } else if (evict_key.type == cache_entry_type::DENSE_WEIGHT) {
+                direct_weight_entries_.erase(evict_key.id);
+            }
+        }
+
         // Remove from entries — invalidates iterator, must not dereference `it` after this
         entries_.erase(it);
 
@@ -5926,7 +6114,9 @@ void set_total_gpu_count(int count) {
 // Arc GPUs.  See intel/compute-runtime#916 and #921.
 //
 // With per-device contexts:
-//   - Each secondary GPU gets its own sycl::context containing only that device.
+//   - Each visible GPU gets its own sycl::context containing only that device.
+//     Device 0 is not special here; it can be primary or secondary depending
+//     on the planner/executor route being submitted.
 //   - Cross-device data transfer uses host-staged copies (already the pattern
 //     in dispatch_experts_secondary_gpu_impl).
 //   - No cross-device depends_on() or USM sharing — each context is isolated.
@@ -5940,20 +6130,29 @@ void init_shared_context_queues(int total_gpus) {
         return;
     }
     if (g_shared_ctx_queues_initialized && total_gpus <= g_shared_ctx_queues_initialized_for) {
-        return;
+        bool all_available = true;
+        for (int d = 0; d < total_gpus && d < GGML_SYCL_MAX_DEVICES; d++) {
+            if (!g_shared_ctx_queues[d]) {
+                all_available = false;
+                break;
+            }
+        }
+        if (all_available) {
+            return;
+        }
     }
 
     int n_created   = 0;
     int n_available = 0;
-    for (int d = 1; d < total_gpus && d < GGML_SYCL_MAX_DEVICES; d++) {
+    for (int d = 0; d < total_gpus && d < GGML_SYCL_MAX_DEVICES; d++) {
         try {
             auto & dev_d = ggml_sycl_get_gpu_device(d);
             if (!g_shared_ctx_queues[d]) {
                 // Create a SINGLE-DEVICE context for device d.  This avoids the
                 // multi-device Level Zero context regression (compute-runtime#916,
                 // #921) that causes DEVICE_LOST when a context spans 2+ discrete
-                // Arc GPUs.  Each device operates in its own context; data moves
-                // between devices via host-staged memcpy.
+                // Arc GPUs.  Any visible device can be a non-primary target in a
+                // heterogeneous run, including logical device 0.
                 sycl::context dev_d_ctx(dev_d);
                 g_shared_ctx_queues[d] = new sycl::queue(dev_d_ctx, dev_d, default_queue_properties());
                 n_created++;
@@ -6141,9 +6340,10 @@ static std::string query_device_name_no_info(int device_id, sycl::queue & queue)
 
 static unified_cache * create_cache_for_device(int                     device_id,
                                                size_t *                deferred_reserved_out = nullptr,
-                                               const device_mem_hint * hint                  = nullptr) {
+                                               const device_mem_hint * hint                  = nullptr,
+                                               sycl::queue *           queue_override        = nullptr) {
     // Get queue for this device
-    sycl::queue & queue = ggml_sycl_get_device(device_id).default_queue();
+    sycl::queue & queue = queue_override ? *queue_override : ggml_sycl_get_device(device_id).default_queue();
 
     // Reserve VRAM headroom for DMA staging buffers.
     // Match the resolved defaults (including evictable-weight sizing) unless explicitly overridden.
@@ -8736,37 +8936,27 @@ unified_cache * unified_cache_register_for_queue(int device_id, sycl::queue & qu
         }
     }
 
-    // Slow path: create under exclusive lock
-    std::unique_lock<std::shared_mutex> lock(g_cache_rw_mutex);
+    unified_cache * result           = nullptr;
+    size_t          deferred_reserve = 0;
+    {
+        // Slow path: create under exclusive lock
+        std::unique_lock<std::shared_mutex> lock(g_cache_rw_mutex);
 
-    // Double-check after acquiring write lock
-    auto it = g_device_caches.find(device_id);
-    if (it != g_device_caches.end()) {
-        return it->second.get();
+        // Double-check after acquiring write lock
+        auto it = g_device_caches.find(device_id);
+        if (it != g_device_caches.end()) {
+            return it->second.get();
+        }
+
+        // Hidden/secondary devices must use the same budget and arena policy as
+        // primary devices. The explicit queue preserves the isolated per-device
+        // context needed to avoid Level Zero multi-device context failures.
+        result = create_cache_for_device(device_id, &deferred_reserve, nullptr, &queue);
     }
-
-    // Query VRAM from the queue's device (no dpct dependency)
-    sycl::device dev    = queue.get_device();
-    size_t       total  = dev.get_info<sycl::info::device::global_mem_size>();
-    size_t       budget = static_cast<size_t>(total * 0.80);  // 80% budget for secondary GPU
-
-    const size_t min_headroom = 256ull * 1024ull * 1024ull;
-    if (total > min_headroom && budget > total - min_headroom) {
-        budget = total - min_headroom;
+    if (result && deferred_reserve > 0) {
+        result->update_reserved_bytes(deferred_reserve);
     }
-
-    GGML_LOG_INFO("[UNIFIED-CACHE] Registering device %d (%s): total=%.1f MB budget=%.1f MB\n", device_id,
-                  dev.get_info<sycl::info::device::name>().c_str(), total / (1024.0f * 1024.0f),
-                  budget / (1024.0f * 1024.0f));
-
-    const size_t staging_bytes = 16 * 1024 * 1024;  // 16 MB staging for secondary device
-    try {
-        g_device_caches[device_id] = std::make_unique<unified_cache>(queue, budget, staging_bytes, 0, total);
-        return g_device_caches[device_id].get();
-    } catch (const sycl::exception & e) {
-        GGML_LOG_ERROR("[UNIFIED-CACHE] Failed to register device %d: %s\n", device_id, e.what());
-        return nullptr;
-    }
+    return result;
 }
 
 // === Direct Staging API — Free-Standing Wrappers ===
@@ -10557,9 +10747,10 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
                                   size_t        device_total_vram) {
     if (arena_base_) {
         // Same model, new context — reset ephemeral zones so KV/runtime
-        // space from the previous context is reclaimable.  Weight zone is
-        // untouched (weights persist across contexts).  SCRATCH resets at
-        // graph_compute start via arena_reset().
+        // space from the previous context is reclaimable.  In single-chunk
+        // arenas KV and WEIGHT share the same TLSF allocator; zone_reset(KV)
+        // detects live weight entries and refuses to reset in that case.
+        // SCRATCH resets at graph_compute start via arena_reset().
         zone_reset(vram_zone_id::KV);
         zone_reset(vram_zone_id::RUNTIME);
 
@@ -10603,15 +10794,14 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
 
     // Cap upfront reservation so non-arena runtime allocations (driver state,
     // direct fallback allocations, and any code path not yet routed through a
-    // zone) still fit in residual VRAM.  RUNTIME/SCRATCH/ONEDNN allocations are
-    // already modeled as arena zones, so they must not be double-counted as a
-    // large fixed external reserve.  Caller passes total VRAM rather than us
-    // probing because this routine may run inside ggml_sycl_init() static init,
-    // where ggml_backend_sycl_get_device_memory() would reenter ggml_sycl_info()
-    // and deadlock.  Caller passes 0 to opt out of the cap entirely (e.g.
-    // mid-init paths where the live VRAM query would deadlock and no hint was
-    // supplied); in that case we trust the caller's budget and skip the
-    // headroom subtraction.
+    // zone) still fit in residual VRAM.  The unified-cache public budget may
+    // already have subtracted device slack before this function is called; do
+    // not subtract a second proportional headroom on top of that.  RUNTIME,
+    // SCRATCH, and ONEDNN allocations are already modeled as arena zones.
+    // Caller passes total VRAM rather than us probing because this routine may
+    // run inside ggml_sycl_init() static init, where a memory query would
+    // reenter ggml_sycl_info() and deadlock.  Caller passes 0 to opt out of the
+    // cap entirely.
     if (device_total_vram > 0) {
         constexpr size_t k_one_gib               = 1024ull * 1024ull * 1024ull;
         constexpr size_t k_max_external_headroom = 2ull * k_one_gib;
@@ -10619,6 +10809,11 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
         const size_t     proportional_headroom   = device_total_vram / 10;
         size_t           external_headroom =
             std::min(k_max_external_headroom, std::max(min_external_headroom, proportional_headroom));
+        const size_t caller_reserved_headroom =
+            device_total_vram > budget_bytes ? device_total_vram - budget_bytes : 0;
+        if (caller_reserved_headroom > 0) {
+            external_headroom = std::min(external_headroom, caller_reserved_headroom);
+        }
         if (const char * env = std::getenv("GGML_SYCL_VRAM_ARENA_EXTERNAL_HEADROOM_MB")) {
             const long parsed = std::strtol(env, nullptr, 10);
             if (parsed > 0) {
@@ -10626,8 +10821,10 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
             }
         }
         GGML_LOG_INFO(
-            "[VRAM-ARENA] External headroom %.0f MB; internal zones runtime=%.0f MB oneDNN=%.0f MB scratch=%.0f MB\n",
-            external_headroom / (1024.0 * 1024.0), runtime_bytes / (1024.0 * 1024.0), onednn_bytes / (1024.0 * 1024.0),
+            "[VRAM-ARENA] External headroom %.0f MB (caller-reserved %.0f MB); internal zones runtime=%.0f MB "
+            "oneDNN=%.0f MB scratch=%.0f MB\n",
+            external_headroom / (1024.0 * 1024.0), caller_reserved_headroom / (1024.0 * 1024.0),
+            runtime_bytes / (1024.0 * 1024.0), onednn_bytes / (1024.0 * 1024.0),
             scratch_bytes / (1024.0 * 1024.0));
         if (device_total_vram > external_headroom) {
             const size_t arena_cap = device_total_vram - external_headroom;
@@ -11066,6 +11263,32 @@ void unified_cache::zone_reset(vram_zone_id zone) {
             "[UNIFIED-CACHE] ignoring WEIGHT zone_reset request; weights are owned by refcounted mem_handles and "
             "must be released by dropping handles\n");
         return;
+    }
+
+    if (zone == vram_zone_id::KV && arena_chunks_.size() == 1 &&
+        arena_zones_[static_cast<int>(vram_zone_id::WEIGHT)].allocator == nullptr) {
+        size_t device_weight_entries = 0;
+        {
+            std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+            for (const auto & it : entries_) {
+                const unified_cache_entry & entry = it.second;
+                if ((entry.type == cache_entry_type::DENSE_WEIGHT || entry.type == cache_entry_type::MOE_EXPERT) &&
+                    entry.location == cache_location::DEVICE && entry.device_ptr && vram_owns(entry.device_ptr)) {
+                    device_weight_entries++;
+                }
+            }
+        }
+        if (device_weight_entries > 0) {
+            static std::atomic<int> shared_kv_reset_logs{ 0 };
+            if (shared_kv_reset_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+                GGML_LOG_WARN(
+                    "[UNIFIED-CACHE] refusing KV zone_reset in shared KV+WEIGHT arena with %zu device weight "
+                    "entries; KV/compute buffers must release their mem_handles instead of resetting the shared "
+                    "allocator\n",
+                    device_weight_entries);
+            }
+            return;
+        }
     }
 
     const bool                  profile_active = arena_pp_profile_active();
@@ -11840,7 +12063,11 @@ static bool planner_mxfp4_i8_supported(const placement_entry & entry, int device
 
 static bool planner_xmx_tiled_moe_enabled() {
     const char * env = std::getenv("GGML_SYCL_XMX_MOE_TILED");
-    return !env || std::atoi(env) != 0;
+    if (env) {
+        return std::atoi(env) != 0;
+    }
+    env = std::getenv("GGML_SYCL_XMX_MOE");
+    return env ? std::atoi(env) != 0 : true;
 }
 
 static size_t planner_layout_bytes_xmx_tiled_for_dims(ggml_type type, int64_t ncols, int64_t nrows, int device_id) {
@@ -12005,6 +12232,21 @@ static bool planner_moe_multi_device_executor_supports_layout(const placement_en
     return false;
 }
 
+static bool planner_moe_static_secondary_route_supports_prompt(const placement_entry & entry, ggml_layout_mode layout) {
+    GGML_UNUSED(entry);
+    GGML_UNUSED(layout);
+    // Static model-load placement is used by both prompt and decode.  The
+    // runtime currently validates secondary SOA for decode route groups only;
+    // prompt secondary routes must remain primary/host until the PP secondary
+    // executor has an end-to-end numeric equivalence gate.
+    return false;
+}
+
+static bool planner_moe_static_secondary_route_supported(const placement_entry & entry, ggml_layout_mode layout) {
+    return planner_moe_multi_device_executor_supports_layout(entry, layout) &&
+           planner_moe_static_secondary_route_supports_prompt(entry, layout);
+}
+
 static ggml_layout_mode planner_multi_device_moe_common_layout(const placement_tensor_info & tensor,
                                                                int                           primary_device_id) {
     const ggml_layout_mode preferred =
@@ -12070,9 +12312,12 @@ static bool planner_moe_primary_executor_supports_layout(const placement_entry &
     return false;
 }
 
-static bool planner_entry_has_alternate_layout(const placement_entry & entry, ggml_layout_mode layout) {
+static bool planner_entry_has_alternate_layout_on_device(const placement_entry & entry,
+                                                         ggml_layout_mode        layout,
+                                                         int                     target_device) {
     for (const placement_alternate_layout & alt : entry.alternate_layouts) {
-        if (alt.layout == layout) {
+        const int alt_target = alt.target_device >= 0 ? alt.target_device : entry.target_device;
+        if (alt.layout == layout && alt_target == target_device) {
             return true;
         }
     }
@@ -12122,15 +12367,19 @@ static bool planner_moe_layout_needs_pp_soa(const placement_entry &             
         return false;
     }
 
-    const auto & caps      = ggml_sycl_info().devices[device_id].xmx_caps;
-    const size_t row_limit = ggml_sycl_mxfp4_grouped_dpas_row_list_limit(caps);
     const size_t pp_tokens = static_cast<size_t>(planner_effective_ubatch_for_moe_pp(kv_info, envelope));
-    const size_t pp_rows   = planner_expected_moe_pp_rows(kv_info, envelope);
-    if (pp_tokens > 1 && layout == GGML_LAYOUT_XMX_TILED && planner_moe_xmx_tiled_pp_proof_enabled()) {
+    if (pp_tokens <= 1) {
         return false;
     }
-    return pp_tokens > 1 && (row_limit == 0 || pp_rows > row_limit || layout == GGML_LAYOUT_MXFP4_I8 ||
-                             layout == GGML_LAYOUT_MXFP4_DPAS || layout == GGML_LAYOUT_COALESCED);
+
+    if (layout == GGML_LAYOUT_XMX_TILED) {
+        if (planner_moe_xmx_tiled_pp_proof_enabled()) {
+            return false;
+        }
+        return true;
+    }
+
+    return layout == GGML_LAYOUT_MXFP4_DPAS || layout == GGML_LAYOUT_COALESCED;
 }
 
 static bool planner_moe_entry_needs_pp_soa_alternate(const placement_entry &              entry,
@@ -12140,207 +12389,83 @@ static bool planner_moe_entry_needs_pp_soa_alternate(const placement_entry &    
     return planner_moe_layout_needs_pp_soa(entry, entry.layout, device_id, kv_info, envelope);
 }
 
-static size_t apply_single_moe_pp_safe_xmx_layouts(placement_plan &                     plan,
-                                                   size_t &                             remaining,
-                                                   int                                  device_id,
-                                                   const placement_kv_info &            kv_info,
-                                                   const ggml_sycl_placement_envelope * envelope) {
+static size_t add_single_moe_pp_executable_alternates(placement_plan &                     plan,
+                                                      size_t &                             remaining,
+                                                      int                                  device_id,
+                                                      const placement_kv_info &            kv_info,
+                                                      const ggml_sycl_placement_envelope * envelope,
+                                                      size_t *                             per_device_vram) {
     if (device_id < 0 || device_id >= ggml_sycl_info().device_count) {
         return 0;
     }
 
     const size_t pp_tokens = static_cast<size_t>(planner_effective_ubatch_for_moe_pp(kv_info, envelope));
-    if (pp_tokens <= 1) {
-        return 0;
-    }
-
-    const auto & caps      = ggml_sycl_info().devices[device_id].xmx_caps;
-    const size_t row_limit = ggml_sycl_mxfp4_grouped_dpas_row_list_limit(caps);
     const size_t pp_rows   = planner_expected_moe_pp_rows(kv_info, envelope);
-    if (row_limit > 0 && pp_rows <= row_limit) {
-        return 0;
-    }
-    if (planner_moe_xmx_tiled_pp_proof_enabled()) {
-        GGML_LOG_INFO(
-            "[PLACEMENT-MOE] PP-safe XMX layout: proof gate enabled; keeping xmx_tiled pp_tokens=%zu "
-            "selected_rows=%zu row_limit=%zu\n",
-            pp_tokens, pp_rows, row_limit);
-        return 0;
-    }
 
-    size_t changed          = 0;
+    size_t considered       = 0;
+    size_t candidates       = 0;
+    size_t already_present  = 0;
+    size_t not_needed       = 0;
+    size_t no_layout_bytes  = 0;
+    size_t added            = 0;
     size_t skipped_capacity = 0;
-    size_t skipped_shape    = 0;
-    size_t released_bytes   = 0;
     size_t charged_bytes    = 0;
 
     for (placement_entry & entry : plan.entries) {
-        if (entry.expert_id < 0 || !entry.on_device || entry.target_device != device_id ||
-            entry.type != GGML_TYPE_MXFP4 || entry.layout != GGML_LAYOUT_XMX_TILED ||
-            (entry.expert_role != expert_tensor_role::GATE && entry.expert_role != expert_tensor_role::UP)) {
+        if (entry.expert_id < 0) {
+            continue;
+        }
+        considered++;
+        if (!planner_moe_entry_needs_pp_soa_alternate(entry, device_id, kv_info, envelope)) {
+            not_needed++;
+            continue;
+        }
+        candidates++;
+        if (planner_entry_has_alternate_layout_on_device(entry, GGML_LAYOUT_SOA, device_id)) {
+            already_present++;
             continue;
         }
 
-        const size_t new_size = planner_layout_bytes_for_entry(entry, GGML_LAYOUT_SOA, device_id);
-        if (new_size == 0) {
-            skipped_shape++;
+        const size_t alt_size = planner_layout_bytes_for_entry(entry, GGML_LAYOUT_SOA, device_id);
+        if (alt_size == 0) {
+            no_layout_bytes++;
             continue;
         }
 
-        const size_t old_charge =
-            entry.vram_charge_size != 0 ? entry.vram_charge_size : placement_vram_charge_bytes(entry.dst_size);
-        const size_t new_charge = placement_vram_charge_bytes(new_size);
-        if (new_charge > old_charge) {
-            const size_t extra = new_charge - old_charge;
-            if (extra > remaining) {
-                skipped_capacity++;
-                continue;
-            }
-            remaining -= extra;
-            plan.weight_vram_bytes += extra;
-            plan.vram_bytes += extra;
-            charged_bytes += extra;
-            if (!plan.per_device_vram.empty()) {
-                plan.per_device_vram[0] += extra;
-            }
-        } else if (old_charge > new_charge) {
-            const size_t freed = old_charge - new_charge;
-            remaining += freed;
-            plan.weight_vram_bytes = plan.weight_vram_bytes > freed ? plan.weight_vram_bytes - freed : 0;
-            plan.vram_bytes        = plan.vram_bytes > freed ? plan.vram_bytes - freed : 0;
-            released_bytes += freed;
-            if (!plan.per_device_vram.empty()) {
-                plan.per_device_vram[0] = plan.per_device_vram[0] > freed ? plan.per_device_vram[0] - freed : 0;
-            }
+        const size_t alt_charge = placement_vram_charge_bytes(alt_size);
+        if (remaining < alt_charge) {
+            skipped_capacity++;
+            continue;
         }
 
-        entry.layout           = GGML_LAYOUT_SOA;
-        entry.dst_size         = new_size;
-        entry.vram_charge_size = new_charge;
-        changed++;
+        placement_alternate_layout alt;
+        alt.layout           = GGML_LAYOUT_SOA;
+        alt.dst_size         = alt_size;
+        alt.vram_charge_size = alt_charge;
+        alt.target_device    = -1;
+        entry.alternate_layouts.push_back(alt);
+
+        remaining -= alt_charge;
+        plan.weight_vram_bytes += alt_charge;
+        plan.vram_bytes += alt_charge;
+        if (per_device_vram != nullptr) {
+            *per_device_vram += alt_charge;
+        }
+        charged_bytes += alt_charge;
+        added++;
     }
 
-    if (changed > 0 || skipped_capacity > 0 || skipped_shape > 0) {
+    if (considered > 0 && (candidates > 0 || moe_direct_trace_enabled())) {
         GGML_LOG_INFO(
-            "[PLACEMENT-MOE] PP-safe XMX layout: xmx_tiled->soa entries=%zu skipped_capacity=%zu "
-            "skipped_shape=%zu charged=%.1f MB released=%.1f MB remaining=%.1f MB pp_tokens=%zu "
-            "selected_rows=%zu row_limit=%zu\n",
-            changed, skipped_capacity, skipped_shape, charged_bytes / (1024.0 * 1024.0),
-            released_bytes / (1024.0 * 1024.0), remaining / (1024.0 * 1024.0), pp_tokens, pp_rows, row_limit);
+            "[PLACEMENT-MOE] PP executable alternate layouts: device=%d considered=%zu candidates=%zu "
+            "soa_added=%zu already=%zu not_needed=%zu no_layout_bytes=%zu skipped_capacity=%zu "
+            "charged=%.1f MB remaining=%.1f MB pp_tokens=%zu selected_rows=%zu envelope=%s\n",
+            device_id, considered, candidates, added, already_present, not_needed, no_layout_bytes,
+            skipped_capacity, charged_bytes / (1024.0 * 1024.0), remaining / (1024.0 * 1024.0), pp_tokens,
+            pp_rows, envelope != nullptr ? "yes" : "no");
     }
 
     return charged_bytes;
-}
-
-static void apply_multi_moe_pp_safe_xmx_layouts(placement_plan &                     plan,
-                                                std::vector<size_t> &                remaining,
-                                                const std::vector<device_budget> &   device_budgets,
-                                                const placement_kv_info &            kv_info,
-                                                const ggml_sycl_placement_envelope * envelope) {
-    if (device_budgets.empty()) {
-        return;
-    }
-
-    const size_t pp_tokens = static_cast<size_t>(planner_effective_ubatch_for_moe_pp(kv_info, envelope));
-    if (pp_tokens <= 1) {
-        return;
-    }
-    const size_t pp_rows = planner_expected_moe_pp_rows(kv_info, envelope);
-    if (planner_moe_xmx_tiled_pp_proof_enabled()) {
-        GGML_LOG_INFO(
-            "[PLACEMENT-MOE-MULTI] PP-safe XMX layout: proof gate enabled; keeping xmx_tiled pp_tokens=%zu "
-            "selected_rows=%zu\n",
-            pp_tokens, pp_rows);
-        return;
-    }
-
-    std::unordered_map<int, size_t> device_to_index;
-    device_to_index.reserve(device_budgets.size());
-    for (size_t i = 0; i < device_budgets.size(); ++i) {
-        device_to_index[device_budgets[i].device_id] = i;
-    }
-
-    size_t changed          = 0;
-    size_t skipped_capacity = 0;
-    size_t skipped_shape    = 0;
-    size_t skipped_support  = 0;
-    size_t released_bytes   = 0;
-    size_t charged_bytes    = 0;
-
-    for (placement_entry & entry : plan.entries) {
-        if (entry.expert_id < 0 || !entry.on_device || entry.target_device < 0 || entry.type != GGML_TYPE_MXFP4 ||
-            entry.layout != GGML_LAYOUT_XMX_TILED ||
-            (entry.expert_role != expert_tensor_role::GATE && entry.expert_role != expert_tensor_role::UP)) {
-            continue;
-        }
-
-        if (entry.target_device >= ggml_sycl_info().device_count) {
-            skipped_support++;
-            continue;
-        }
-        const auto & caps      = ggml_sycl_info().devices[entry.target_device].xmx_caps;
-        const size_t row_limit = ggml_sycl_mxfp4_grouped_dpas_row_list_limit(caps);
-        if (row_limit > 0 && pp_rows <= row_limit) {
-            continue;
-        }
-        if (!planner_moe_primary_executor_supports_layout(entry, GGML_LAYOUT_SOA, entry.target_device)) {
-            skipped_support++;
-            continue;
-        }
-
-        auto dev_it = device_to_index.find(entry.target_device);
-        if (dev_it == device_to_index.end() || dev_it->second >= remaining.size() ||
-            dev_it->second >= plan.per_device_vram.size()) {
-            skipped_support++;
-            continue;
-        }
-        const size_t dev_index = dev_it->second;
-
-        const size_t new_size = planner_layout_bytes_for_entry(entry, GGML_LAYOUT_SOA, entry.target_device);
-        if (new_size == 0) {
-            skipped_shape++;
-            continue;
-        }
-
-        const size_t old_charge =
-            entry.vram_charge_size != 0 ? entry.vram_charge_size : placement_vram_charge_bytes(entry.dst_size);
-        const size_t new_charge = placement_vram_charge_bytes(new_size);
-        if (new_charge > old_charge) {
-            const size_t extra = new_charge - old_charge;
-            if (extra > remaining[dev_index]) {
-                skipped_capacity++;
-                continue;
-            }
-            remaining[dev_index] -= extra;
-            plan.weight_vram_bytes += extra;
-            plan.vram_bytes += extra;
-            plan.per_device_vram[dev_index] += extra;
-            charged_bytes += extra;
-        } else if (old_charge > new_charge) {
-            const size_t freed = old_charge - new_charge;
-            remaining[dev_index] += freed;
-            plan.weight_vram_bytes = plan.weight_vram_bytes > freed ? plan.weight_vram_bytes - freed : 0;
-            plan.vram_bytes        = plan.vram_bytes > freed ? plan.vram_bytes - freed : 0;
-            plan.per_device_vram[dev_index] =
-                plan.per_device_vram[dev_index] > freed ? plan.per_device_vram[dev_index] - freed : 0;
-            released_bytes += freed;
-        }
-
-        entry.layout           = GGML_LAYOUT_SOA;
-        entry.dst_size         = new_size;
-        entry.vram_charge_size = new_charge;
-        changed++;
-    }
-
-    if (changed > 0 || skipped_capacity > 0 || skipped_shape > 0 || skipped_support > 0) {
-        const size_t total_remaining = std::accumulate(remaining.begin(), remaining.end(), size_t(0));
-        GGML_LOG_INFO(
-            "[PLACEMENT-MOE-MULTI] PP-safe XMX layout: xmx_tiled->soa entries=%zu skipped_capacity=%zu "
-            "skipped_shape=%zu skipped_support=%zu charged=%.1f MB released=%.1f MB remaining=%.1f MB "
-            "pp_tokens=%zu selected_rows=%zu\n",
-            changed, skipped_capacity, skipped_shape, skipped_support, charged_bytes / (1024.0 * 1024.0),
-            released_bytes / (1024.0 * 1024.0), total_remaining / (1024.0 * 1024.0), pp_tokens, pp_rows);
-    }
 }
 
 static void add_multi_moe_pp_executable_alternates(placement_plan &                     plan,
@@ -12397,10 +12522,10 @@ static void add_multi_moe_pp_executable_alternates(placement_plan &             
         } else if (entry.target_device >= ggml_sycl_info().device_count) {
             skip_no_caps++;
         } else {
-            const auto & caps      = ggml_sycl_info().devices[entry.target_device].xmx_caps;
-            const size_t row_limit = ggml_sycl_mxfp4_grouped_dpas_row_list_limit(caps);
-            if (!(pp_tokens > 1 && (row_limit == 0 || pp_rows > row_limit || entry.layout == GGML_LAYOUT_MXFP4_I8 ||
-                                    entry.layout == GGML_LAYOUT_MXFP4_DPAS || entry.layout == GGML_LAYOUT_COALESCED))) {
+            const bool xmx_needs_soa = entry.layout == GGML_LAYOUT_XMX_TILED;
+            const bool non_xmx_needs_soa =
+                entry.layout == GGML_LAYOUT_MXFP4_DPAS || entry.layout == GGML_LAYOUT_COALESCED;
+            if (!(pp_tokens > 1 && (xmx_needs_soa || non_xmx_needs_soa))) {
                 skip_rows_ok++;
             }
         }
@@ -12409,7 +12534,7 @@ static void add_multi_moe_pp_executable_alternates(placement_plan &             
             continue;
         }
         candidates++;
-        if (planner_entry_has_alternate_layout(entry, GGML_LAYOUT_SOA)) {
+        if (planner_entry_has_alternate_layout_on_device(entry, GGML_LAYOUT_SOA, entry.target_device)) {
             already_present++;
             continue;
         }
@@ -12436,6 +12561,7 @@ static void add_multi_moe_pp_executable_alternates(placement_plan &             
         alt.layout           = GGML_LAYOUT_SOA;
         alt.dst_size         = alt_size;
         alt.vram_charge_size = alt_charge;
+        alt.target_device    = -1;
         entry.alternate_layouts.push_back(alt);
 
         remaining[dev_index] -= alt_charge;
@@ -12462,6 +12588,190 @@ static void add_multi_moe_pp_executable_alternates(placement_plan &             
                 skip_non_mxfp4, skip_already_soa, skip_bad_role, skip_no_soa, skip_no_caps, skip_rows_ok,
                 no_layout_bytes, skipped_capacity, charged_bytes / (1024.0 * 1024.0), pp_tokens, pp_rows,
                 envelope != nullptr ? 1 : 0);
+    }
+}
+
+static void add_multi_moe_decode_secondary_alternates(placement_plan &                   plan,
+                                                      std::vector<size_t> &              remaining,
+                                                      const std::vector<device_budget> & device_budgets,
+                                                      const std::vector<double> &        moe_device_scores) {
+    if (device_budgets.size() <= 1 || remaining.size() != device_budgets.size()) {
+        return;
+    }
+
+    std::vector<size_t> moe_indices;
+    moe_indices.reserve(plan.entries.size());
+    for (size_t i = 0; i < plan.entries.size(); ++i) {
+        const placement_entry & entry = plan.entries[i];
+        if (entry.expert_id >= 0 || placement_priority_is_moe_weight(entry.priority)) {
+            moe_indices.push_back(i);
+        }
+    }
+
+    const char * hotness_source = nullptr;
+    auto         groups         = build_moe_triplet_groups(plan, moe_indices, &hotness_source);
+    if (groups.empty()) {
+        return;
+    }
+
+    std::vector<int> device_order;
+    device_order.reserve(device_budgets.size());
+    for (size_t d = 0; d < device_budgets.size(); ++d) {
+        if (device_budgets[d].dense_supported && device_budgets[d].dense_score > 0.0) {
+            device_order.push_back(static_cast<int>(d));
+        }
+    }
+    std::sort(device_order.begin(), device_order.end(), [&](int a, int b) {
+        const double score_a =
+            static_cast<size_t>(a) < moe_device_scores.size() ? moe_device_scores[static_cast<size_t>(a)] : 0.0;
+        const double score_b =
+            static_cast<size_t>(b) < moe_device_scores.size() ? moe_device_scores[static_cast<size_t>(b)] : 0.0;
+        if (score_a != score_b) {
+            return score_a > score_b;
+        }
+        if (device_budgets[static_cast<size_t>(a)].dense_score != device_budgets[static_cast<size_t>(b)].dense_score) {
+            return device_budgets[static_cast<size_t>(a)].dense_score >
+                   device_budgets[static_cast<size_t>(b)].dense_score;
+        }
+        return device_budgets[static_cast<size_t>(a)].device_id < device_budgets[static_cast<size_t>(b)].device_id;
+    });
+
+    size_t              considered         = 0;
+    size_t              complete           = 0;
+    size_t              replicated_groups  = 0;
+    size_t              replicated_entries = 0;
+    size_t              skipped_incomplete = 0;
+    size_t              skipped_host_base  = 0;
+    size_t              skipped_support    = 0;
+    size_t              skipped_capacity   = 0;
+    size_t              already_replicated = 0;
+    size_t              charged_bytes      = 0;
+    std::vector<size_t> per_device_groups(device_budgets.size(), 0);
+    std::vector<size_t> per_device_charge(device_budgets.size(), 0);
+
+    for (const moe_triplet_group & group : groups) {
+        considered++;
+        if (!moe_triplet_complete(group)) {
+            skipped_incomplete++;
+            continue;
+        }
+        complete++;
+
+        int  base_target = -2;
+        bool base_valid  = true;
+        for (size_t idx : group.indices) {
+            if (idx >= plan.entries.size()) {
+                base_valid = false;
+                break;
+            }
+            const placement_entry & entry = plan.entries[idx];
+            if (!entry.on_device || entry.target_device < 0) {
+                base_valid = false;
+                break;
+            }
+            if (base_target == -2) {
+                base_target = entry.target_device;
+            } else if (entry.target_device != base_target) {
+                base_valid = false;
+                break;
+            }
+        }
+        if (!base_valid || base_target < 0) {
+            skipped_host_base++;
+            continue;
+        }
+
+        bool group_already_replicated = false;
+        for (int dev_idx : device_order) {
+            if (dev_idx < 0 || static_cast<size_t>(dev_idx) >= device_budgets.size()) {
+                continue;
+            }
+            const int target_device = device_budgets[static_cast<size_t>(dev_idx)].device_id;
+            if (target_device == base_target) {
+                continue;
+            }
+
+            size_t group_charge = 0;
+            bool   supported    = true;
+            bool   duplicate    = true;
+            for (size_t idx : group.indices) {
+                placement_entry & entry = plan.entries[idx];
+                if (!planner_moe_multi_device_executor_supports_layout(entry, GGML_LAYOUT_SOA)) {
+                    supported = false;
+                    break;
+                }
+                const size_t alt_size = planner_layout_bytes_for_entry(entry, GGML_LAYOUT_SOA, target_device);
+                if (alt_size == 0) {
+                    supported = false;
+                    break;
+                }
+                group_charge += placement_vram_charge_bytes(alt_size);
+                duplicate =
+                    duplicate && planner_entry_has_alternate_layout_on_device(entry, GGML_LAYOUT_SOA, target_device);
+            }
+            if (!supported) {
+                skipped_support++;
+                continue;
+            }
+            if (duplicate) {
+                group_already_replicated = true;
+                already_replicated++;
+                break;
+            }
+            if (remaining[static_cast<size_t>(dev_idx)] < group_charge) {
+                skipped_capacity++;
+                continue;
+            }
+
+            for (size_t idx : group.indices) {
+                placement_entry & entry = plan.entries[idx];
+                if (planner_entry_has_alternate_layout_on_device(entry, GGML_LAYOUT_SOA, target_device)) {
+                    continue;
+                }
+                placement_alternate_layout alt;
+                alt.layout           = GGML_LAYOUT_SOA;
+                alt.dst_size         = planner_layout_bytes_for_entry(entry, GGML_LAYOUT_SOA, target_device);
+                alt.vram_charge_size = placement_vram_charge_bytes(alt.dst_size);
+                alt.target_device    = target_device;
+                entry.alternate_layouts.push_back(alt);
+                replicated_entries++;
+            }
+
+            remaining[static_cast<size_t>(dev_idx)] -= group_charge;
+            plan.weight_vram_bytes += group_charge;
+            plan.vram_bytes += group_charge;
+            if (static_cast<size_t>(dev_idx) < plan.per_device_vram.size()) {
+                plan.per_device_vram[static_cast<size_t>(dev_idx)] += group_charge;
+            }
+            per_device_groups[static_cast<size_t>(dev_idx)]++;
+            per_device_charge[static_cast<size_t>(dev_idx)] += group_charge;
+            charged_bytes += group_charge;
+            replicated_groups++;
+            group_already_replicated = true;
+            break;
+        }
+
+        if (!group_already_replicated && device_order.size() <= 1) {
+            skipped_support++;
+        }
+    }
+
+    GGML_LOG_INFO(
+        "[PLACEMENT-MOE-MULTI] decode secondary alternates: considered=%zu complete=%zu groups=%zu entries=%zu "
+        "already=%zu skipped_incomplete=%zu skipped_host_base=%zu skipped_support=%zu skipped_capacity=%zu "
+        "charged=%.1f MB hotness=%s\n",
+        considered, complete, replicated_groups, replicated_entries, already_replicated, skipped_incomplete,
+        skipped_host_base, skipped_support, skipped_capacity, charged_bytes / (1024.0 * 1024.0),
+        hotness_source ? hotness_source : "static(layer,expert)");
+    for (size_t d = 0; d < device_budgets.size(); ++d) {
+        if (per_device_groups[d] == 0 && per_device_charge[d] == 0) {
+            continue;
+        }
+        GGML_LOG_INFO(
+            "[PLACEMENT-MOE-MULTI] decode secondary target logical=%zu physical=%d groups=%zu charged=%.1f MB "
+            "remaining=%.1f MB score=%.2f\n",
+            d, device_budgets[d].device_id, per_device_groups[d], per_device_charge[d] / (1024.0 * 1024.0),
+            remaining[d] / (1024.0 * 1024.0), d < moe_device_scores.size() ? moe_device_scores[d] : 0.0);
     }
 }
 
@@ -13497,7 +13807,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
             }
         }
         maybe_upgrade_moe_down_layouts_to_i8(plan, remaining, device_id, n_experts);
-        apply_single_moe_pp_safe_xmx_layouts(plan, remaining, device_id, kv_info, envelope);
+        add_single_moe_pp_executable_alternates(plan, remaining, device_id, kv_info, envelope, nullptr);
         maybe_upgrade_moe_gate_up_layouts_to_i8(plan, remaining, device_id, n_experts);
         log_moe_triplet_pack_stats("PLACEMENT-MOE", stats, remaining);
         reorder_plan_entries_for_moe_materialization(plan, moe_groups);
@@ -13605,7 +13915,8 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
 //   1. Compute per-device budgets and total VRAM pool.
 //   2. For DENSE layers: assign contiguous layer ranges proportional to VRAM.
 //      Each device gets a range [layer_start, layer_end).  Dense weights for
-//      a layer go entirely to the owning device.
+//      a layer go entirely to the preferred owner while it has budget, then
+//      overflow as complete layers to another GPU before host fallback.
 //   3. For MoE EXPERT tensors: place complete gate/up/down expert triplets
 //      with the layer execution owner while budget allows, then spill to the
 //      next device with enough remaining budget.  This keeps decode locality
@@ -13730,9 +14041,9 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         plan.vram_budget += device_budgets[d].vram_budget;
     }
 
-    // Step 1: Compute layer-to-device assignment (dense layers).
-    // Proportional to total VRAM, so bigger GPU gets more layers.
-    // layer_owner[l] = device index in device_budgets (not device_id).
+    // Step 1: Compute legacy layer-to-device assignment for explicit layer/hybrid
+    // modes. Dense weight placement itself is scored below by device capability
+    // and capacity; VRAM size is only a fit constraint.
     std::vector<int> layer_owner(n_layers, 0);
     {
         size_t total_vram = 0;
@@ -13879,25 +14190,122 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         return -1;
     };
 
+    std::vector<int> dense_order;
+    dense_order.reserve(n_devs);
+    for (size_t d = 0; d < n_devs; ++d) {
+        if (device_budgets[d].dense_supported && device_budgets[d].dense_score > 0.0) {
+            dense_order.push_back(static_cast<int>(d));
+        }
+    }
+    const size_t        dense_locality_tokens = std::max<size_t>(1, kv_info.n_ubatch);
+    std::vector<double> dense_net_score(n_devs, 1.0);
+    std::vector<double> dense_locality_penalty(n_devs, 1.0);
+    for (size_t d = 0; d < n_devs; ++d) {
+        const double raw_score = std::max(0.0, device_budgets[d].dense_score);
+        if (d != 0 && dense_locality_tokens > 1) {
+            // The scheduler exposes the primary device as the graph execution owner.
+            // A remote dense owner has to move layer activations across devices.  Penalize
+            // that route by the prompt microbatch scale so raw compute only wins when it is
+            // enough to pay for the additional activation traffic.
+            dense_locality_penalty[d] = std::sqrt(static_cast<double>(dense_locality_tokens));
+        }
+        dense_net_score[d] = raw_score / dense_locality_penalty[d];
+    }
+
+    std::sort(dense_order.begin(), dense_order.end(), [&](int a, int b) {
+        const auto & da    = device_budgets[static_cast<size_t>(a)];
+        const auto & db    = device_budgets[static_cast<size_t>(b)];
+        const double net_a = dense_net_score[static_cast<size_t>(a)];
+        const double net_b = dense_net_score[static_cast<size_t>(b)];
+        if (net_a != net_b) {
+            return net_a > net_b;
+        }
+        if (da.dense_score != db.dense_score) {
+            return da.dense_score > db.dense_score;
+        }
+        if (da.vram_budget != db.vram_budget) {
+            return da.vram_budget > db.vram_budget;
+        }
+        return da.device_id < db.device_id;
+    });
+    if (dense_order.empty()) {
+        for (size_t d = 0; d < n_devs; ++d) {
+            dense_order.push_back(static_cast<int>(d));
+        }
+    }
+
+    for (int rank = 0; rank < static_cast<int>(dense_order.size()); ++rank) {
+        const int    idx = dense_order[static_cast<size_t>(rank)];
+        const auto & db  = device_budgets[static_cast<size_t>(idx)];
+        GGML_LOG_INFO(
+            "[PLACEMENT-MULTI] Dense candidate rank=%d logical=%d physical=%d raw_score=%.2f net_score=%.2f "
+            "locality_penalty=%.2f tokens=%zu supported=%d budget=%.1f MB remaining=%.1f MB\n",
+            rank, idx, db.device_id, db.dense_score, dense_net_score[static_cast<size_t>(idx)],
+            dense_locality_penalty[static_cast<size_t>(idx)], dense_locality_tokens, db.dense_supported ? 1 : 0,
+            db.vram_budget / (1024.0 * 1024.0), remaining[static_cast<size_t>(idx)] / (1024.0 * 1024.0));
+    }
+
+    auto choose_dense_target_device = [&](size_t total_cost, const char ** reason) -> int {
+        for (int idx : dense_order) {
+            if (idx < 0 || static_cast<size_t>(idx) >= n_devs) {
+                continue;
+            }
+            if (remaining[static_cast<size_t>(idx)] >= total_cost) {
+                if (reason) {
+                    *reason = "net-best-compatible";
+                }
+                return idx;
+            }
+        }
+        if (reason) {
+            *reason = "no-compatible-gpu-capacity";
+        }
+        return -1;
+    };
+
+    std::vector<size_t> dense_assigned_charge(n_devs, 0);
+    std::vector<size_t> dense_assigned_bytes(n_devs, 0);
+    std::vector<size_t> dense_group_count(n_devs, 0);
+    std::vector<size_t> dense_rank_group_count(n_devs, 0);
+    size_t              dense_net_best_groups = 0;
+    size_t              dense_spill_groups    = 0;
+    size_t              dense_host_groups     = 0;
+    size_t              dense_host_bytes      = 0;
+
     for (size_t idx : standalone_dense_indices) {
-        auto &       entry          = plan.entries[idx];
-        int          target_dev_idx = 0;
+        auto &       entry = plan.entries[idx];
         const size_t charge =
             entry.vram_charge_size != 0 ? entry.vram_charge_size : placement_vram_charge_bytes(entry.dst_size);
-        if (remaining[target_dev_idx] < charge) {
-            target_dev_idx = -1;
+        const char * reason         = nullptr;
+        int          target_dev_idx = choose_dense_target_device(charge, &reason);
+        const int    target         = commit_bytes(target_dev_idx, entry.dst_size, charge, 0);
+        entry.on_device             = target >= 0;
+        entry.target_device         = target;
+        if (target >= 0 && target_dev_idx >= 0 && static_cast<size_t>(target_dev_idx) < n_devs) {
+            dense_assigned_charge[target_dev_idx] += charge;
+            dense_assigned_bytes[target_dev_idx] += entry.dst_size;
+            dense_group_count[target_dev_idx]++;
+            const auto rank_it  = std::find(dense_order.begin(), dense_order.end(), target_dev_idx);
+            const bool net_best = rank_it == dense_order.begin();
+            if (rank_it != dense_order.end()) {
+                dense_rank_group_count[static_cast<size_t>(std::distance(dense_order.begin(), rank_it))]++;
+            }
+            if (net_best) {
+                dense_net_best_groups++;
+            } else {
+                dense_spill_groups++;
+            }
+            GGML_SYCL_DEBUG("[PLACEMENT-MULTI] Dense standalone %s -> device=%d reason=%s bytes=%.1f MB\n",
+                            entry.name.c_str(), target, reason ? reason : "?", entry.dst_size / (1024.0 * 1024.0));
+        } else {
+            dense_host_groups++;
+            dense_host_bytes += entry.dst_size;
+            GGML_LOG_WARN("[PLACEMENT-MULTI] Dense standalone %s -> host reason=%s bytes=%.1f MB\n", entry.name.c_str(),
+                          reason ? reason : "?", entry.dst_size / (1024.0 * 1024.0));
         }
-        const int target    = commit_bytes(target_dev_idx, entry.dst_size, charge, 0);
-        entry.on_device     = target >= 0;
-        entry.target_device = target;
     }
 
     for (const auto & [layer_id, indices] : dense_layer_indices) {
-        int target_dev_idx = 0;
-        if (mode != multi_gpu_mode::EXPERT && layer_id >= 0 && layer_id < n_layers) {
-            target_dev_idx = layer_owner[layer_id];
-        }
-
         const size_t weight_bytes  = layer_weight_bytes[layer_id];
         const size_t weight_charge = layer_weight_charge_bytes[layer_id];
         // Charge each attention layer at its actual KV cost (SWA vs full-attn).
@@ -13906,15 +14314,33 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
             layer_has_attention[layer_id] ?
                 (kv_info.is_swa_layer(layer_id) ? kv_info.kv_bytes_per_swa_layer() : plan.kv_per_layer) :
                 0;
-        const size_t total_cost = weight_charge + kv_cost;
-        if (target_dev_idx >= 0 && static_cast<size_t>(target_dev_idx) < n_devs &&
-            remaining[target_dev_idx] < total_cost) {
-            target_dev_idx = -1;
-        }
+        const size_t total_cost     = weight_charge + kv_cost;
+        const char * reason         = nullptr;
+        int          target_dev_idx = choose_dense_target_device(total_cost, &reason);
 
         const int target            = commit_bytes(target_dev_idx, weight_bytes, weight_charge, kv_cost);
         plan.layer_device[layer_id] = target;
         plan.kv_device[layer_id]    = kv_cost > 0 ? target : -1;
+        if (target >= 0 && target_dev_idx >= 0 && static_cast<size_t>(target_dev_idx) < n_devs) {
+            dense_assigned_charge[target_dev_idx] += total_cost;
+            dense_assigned_bytes[target_dev_idx] += weight_bytes;
+            dense_group_count[target_dev_idx]++;
+            const auto rank_it  = std::find(dense_order.begin(), dense_order.end(), target_dev_idx);
+            const bool net_best = rank_it == dense_order.begin();
+            if (rank_it != dense_order.end()) {
+                dense_rank_group_count[static_cast<size_t>(std::distance(dense_order.begin(), rank_it))]++;
+            }
+            if (net_best) {
+                dense_net_best_groups++;
+            } else {
+                dense_spill_groups++;
+            }
+        } else {
+            dense_host_groups++;
+            dense_host_bytes += weight_bytes;
+            GGML_LOG_WARN("[PLACEMENT-MULTI] Dense layer %d -> host reason=%s weights=%.1f MB kv=%.1f MB\n", layer_id,
+                          reason ? reason : "?", weight_bytes / (1024.0 * 1024.0), kv_cost / (1024.0 * 1024.0));
+        }
 
         size_t kv_anchor = indices.front();
         if (kv_cost > 0) {
@@ -13934,6 +14360,28 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         }
     }
 
+    if (!standalone_dense_indices.empty() || !dense_layer_indices.empty()) {
+        for (size_t d = 0; d < n_devs; ++d) {
+            GGML_LOG_INFO(
+                "[PLACEMENT-MULTI] Dense target logical=%zu physical=%d raw_score=%.2f net_score=%.2f "
+                "locality_penalty=%.2f assigned=%.1f MB charged=%.1f MB groups=%zu remaining=%.1f MB\n",
+                d, device_budgets[d].device_id, device_budgets[d].dense_score, dense_net_score[d],
+                dense_locality_penalty[d], dense_assigned_bytes[d] / (1024.0 * 1024.0),
+                dense_assigned_charge[d] / (1024.0 * 1024.0), dense_group_count[d], remaining[d] / (1024.0 * 1024.0));
+        }
+        for (size_t r = 0; r < dense_rank_group_count.size(); ++r) {
+            if (dense_rank_group_count[r] == 0 || r >= dense_order.size()) {
+                continue;
+            }
+            const int idx = dense_order[r];
+            GGML_LOG_INFO("[PLACEMENT-MULTI] Dense rank=%zu device=%d groups=%zu\n", r,
+                          device_budgets[static_cast<size_t>(idx)].device_id, dense_rank_group_count[r]);
+        }
+        GGML_LOG_INFO(
+            "[PLACEMENT-MULTI] Dense placement groups: net_best=%zu spill_gpu=%zu host=%zu host_bytes=%.1f MB\n",
+            dense_net_best_groups, dense_spill_groups, dense_host_groups, dense_host_bytes / (1024.0 * 1024.0));
+    }
+
     {
         const char *           hotness_source = nullptr;
         const auto             moe_groups     = build_moe_triplet_groups(plan, moe_indices, &hotness_source);
@@ -13942,22 +14390,37 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         stats.hotness = hotness_source != nullptr ? hotness_source : stats.hotness;
 
         std::vector<double> moe_device_scores(n_devs, 1.0);
+        std::vector<double> moe_transfer_penalty(n_devs, 1.0);
         std::vector<size_t> moe_assigned_charge(n_devs, 0);
         double              moe_total_score = 0.0;
         for (size_t d = 0; d < n_devs; ++d) {
-            const int dev_id        = device_budgets[d].device_id;
-            double    compute_units = 1.0;
-            double    xmx_factor    = 1.0;
-            if (dev_id >= 0 && dev_id < ggml_sycl_info().total_gpu_count) {
-                const auto & dinfo = ggml_sycl_info().devices[dev_id];
-                compute_units      = static_cast<double>(std::max<uint32_t>(1, dinfo.xmx_caps.compute_units));
-                xmx_factor         = dinfo.xmx_caps.supported ? 1.15 : 1.0;
-                if (dinfo.xmx_caps.supports_int8) {
-                    xmx_factor *= 1.10;
+            const int dev_id = device_budgets[d].device_id;
+
+            if (d != 0) {
+                double                      penalty = 0.90;
+                const sycl_peer_link_info * link    = ggml_sycl_get_peer_link_info(device_budgets[0].device_id, dev_id);
+                if (link && link->valid) {
+                    if (link->same_device) {
+                        penalty = 1.0;
+                    } else if (link->same_sycl_context && (link->direct_copy_measured || link->l0_can_access_peer)) {
+                        penalty = 0.98;
+                    } else if (link->l0_can_access_peer) {
+                        penalty = 0.95;
+                    } else if (link->host_bounce_measured && link->host_bounce_us > 0.0) {
+                        // Remote MoE decode ships activations/results, not weights.  A measured tens-of-us
+                        // host bounce should reduce the score slightly, while millisecond-class links
+                        // should stop winning over local execution.
+                        penalty = 1.0 / std::sqrt(1.0 + link->host_bounce_us / 1000.0);
+                    }
+                    if (!link->same_backend || !link->same_platform) {
+                        penalty *= 0.50;
+                    }
                 }
+                moe_transfer_penalty[d] = std::max(0.05, std::min(1.0, penalty));
             }
             const double budget_gib = std::max(1.0, static_cast<double>(remaining[d]) / (1024.0 * 1024.0 * 1024.0));
-            moe_device_scores[d]    = compute_units * std::sqrt(budget_gib) * xmx_factor;
+            const double raw_score  = device_budgets[d].dense_score > 0.0 ? device_budgets[d].dense_score : 1.0;
+            moe_device_scores[d]    = raw_score * std::sqrt(budget_gib) * moe_transfer_penalty[d];
             moe_total_score += moe_device_scores[d];
         }
         if (moe_total_score <= 0.0) {
@@ -13966,8 +14429,9 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         }
 
         // In EXPERT mode, keep complete expert triplets together at layer
-        // granularity under pressure. Optional fast-layout upgrades run after
-        // base placement and must not evict otherwise resident primary layers.
+        // granularity for the static model-load plan.  Decode-only secondary
+        // alternates are materialized by the runtime route planner; the static
+        // plan must preserve the primary's fast prompt path.
         struct moe_layer_target_plan {
             int                                                                target_dev_idx    = -2;
             size_t                                                             base_charge       = 0;
@@ -13997,7 +14461,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                     if (role_idx < layer.role_entries.size()) {
                         layer.role_entries[role_idx]++;
                     }
-                    if (!planner_moe_multi_device_executor_supports_layout(entry, GGML_LAYOUT_SOA)) {
+                    if (!planner_moe_static_secondary_route_supported(entry, GGML_LAYOUT_SOA)) {
                         layer.secondary_capable = false;
                     }
                 }
@@ -14068,6 +14532,17 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                     continue;
                 }
 
+                if (layer.complete && !layer.secondary_capable) {
+                    // Leave this layer unpinned to a layer-wide target.  The
+                    // per-expert group packer below will fill primary VRAM with
+                    // as many prompt-safe expert triplets as fit, then place the
+                    // rest on host.  A whole-layer host decision here would
+                    // unnecessarily discard primary-local prompt capacity.
+                    layer.target_dev_idx = -2;
+                    degraded_layers++;
+                    continue;
+                }
+
                 layer.target_dev_idx = -1;
                 host_layers++;
             }
@@ -14099,7 +14574,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                         remaining[planned_target] >= group.charge_bytes) {
                         return planned_target;
                     }
-                    if (planned_target < 0) {
+                    if (planned_target == -1) {
                         return -1;
                     }
                 }
@@ -14113,9 +14588,23 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                 return -1;
             }
 
+            bool static_secondary_supported = true;
+            for (size_t idx : group.indices) {
+                if (idx >= plan.entries.size()) {
+                    continue;
+                }
+                if (!planner_moe_static_secondary_route_supported(plan.entries[idx], GGML_LAYOUT_SOA)) {
+                    static_secondary_supported = false;
+                    break;
+                }
+            }
+
             int    best_idx   = -1;
             double best_score = -std::numeric_limits<double>::infinity();
             for (size_t d = 0; d < n_devs; ++d) {
+                if (d != 0 && !static_secondary_supported) {
+                    continue;
+                }
                 if (remaining[d] < group.charge_bytes) {
                     continue;
                 }
@@ -14126,7 +14615,8 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                                                                      0.0;
                 double       score        = desired - current;
                 // Once the preferred local route is unavailable, choose the
-                // best spill target by queried capability and remaining budget.
+                // best spill target by queried capability, transfer path, and
+                // remaining budget.
                 if (preferred_dev_idx == static_cast<int>(d)) {
                     score += 0.05;
                 }
@@ -14176,23 +14666,27 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         if (!moe_groups.empty()) {
             for (size_t d = 0; d < n_devs; ++d) {
                 GGML_LOG_INFO(
-                    "[PLACEMENT-MOE-MULTI] workload target device=%d score=%.2f share=%.1f%% assigned=%.1f MB "
-                    "remaining=%.1f MB\n",
-                    device_budgets[d].device_id, moe_device_scores[d], 100.0 * moe_device_scores[d] / moe_total_score,
-                    moe_assigned_charge[d] / (1024.0 * 1024.0), remaining[d] / (1024.0 * 1024.0));
+                    "[PLACEMENT-MOE-MULTI] workload target logical=%zu physical=%d raw_score=%.2f "
+                    "xfer_penalty=%.2f score=%.2f share=%.1f%% assigned=%.1f MB remaining=%.1f MB "
+                    "budget=%.1f MB\n",
+                    d, device_budgets[d].device_id, device_budgets[d].dense_score, moe_transfer_penalty[d],
+                    moe_device_scores[d], 100.0 * moe_device_scores[d] / moe_total_score,
+                    moe_assigned_charge[d] / (1024.0 * 1024.0), remaining[d] / (1024.0 * 1024.0),
+                    device_budgets[d].vram_budget / (1024.0 * 1024.0));
             }
         }
         if (n_devs == 1) {
             for (size_t d = 0; d < n_devs; ++d) {
                 const size_t down_charged =
                     maybe_upgrade_moe_down_layouts_to_i8(plan, remaining[d], device_budgets[d].device_id, n_experts);
+                add_single_moe_pp_executable_alternates(plan, remaining[d], device_budgets[d].device_id, kv_info,
+                                                        envelope, &plan.per_device_vram[d]);
                 const size_t gate_up_charged =
                     maybe_upgrade_moe_gate_up_layouts_to_i8(plan, remaining[d], device_budgets[d].device_id, n_experts);
                 plan.per_device_vram[d] += down_charged + gate_up_charged;
             }
         } else {
             apply_multi_moe_per_target_layouts(plan, remaining, device_budgets);
-            apply_multi_moe_pp_safe_xmx_layouts(plan, remaining, device_budgets, kv_info, envelope);
             // Multi-device per-target layout selection keeps secondary routes on
             // SOA because that is the only grouped secondary executor today. The
             // primary route still owns local smart handles and can use the same
@@ -14201,6 +14695,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
             const size_t primary_down_charged =
                 maybe_upgrade_moe_down_layouts_to_i8(plan, remaining[0], device_budgets[0].device_id, n_experts);
             plan.per_device_vram[0] += primary_down_charged;
+            add_multi_moe_decode_secondary_alternates(plan, remaining, device_budgets, moe_device_scores);
             add_multi_moe_pp_executable_alternates(plan, remaining, device_budgets, kv_info, envelope);
             GGML_LOG_INFO(
                 "[PLACEMENT-MOE-MULTI] secondary executor layout is selected per planned route; current secondary "
@@ -14229,12 +14724,13 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
 
     // Build runtime query maps for multi-device inference routing.
 
-    // device_layers: per-device contiguous layer range
+    // device_layers: per-device dense layer range from actual planned owners.
     for (size_t d = 0; d < n_devs; d++) {
         int dev_id = device_budgets[d].device_id;
         int first = n_layers, last = -1;
         for (int l = 0; l < n_layers; l++) {
-            if (layer_owner[l] == static_cast<int>(d)) {
+            auto it = plan.layer_device.find(l);
+            if (it != plan.layer_device.end() && it->second == dev_id) {
                 first = std::min(first, l);
                 last  = std::max(last, l);
             }
@@ -14271,18 +14767,20 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     // Log multi-device placement summary
     GGML_LOG_INFO("[PLACEMENT-MULTI] %zu devices, %d layers, hybrid parallelism\n", n_devs, n_layers);
     for (size_t d = 0; d < n_devs; d++) {
-        int first_layer = n_layers, last_layer = -1;
+        const int dev_id      = device_budgets[d].device_id;
+        int       first_layer = n_layers, last_layer = -1;
         for (int l = 0; l < n_layers; l++) {
-            if (layer_owner[l] == static_cast<int>(d)) {
+            auto it = plan.layer_device.find(l);
+            if (it != plan.layer_device.end() && it->second == dev_id) {
                 first_layer = std::min(first_layer, l);
                 last_layer  = std::max(last_layer, l);
             }
         }
         GGML_LOG_INFO(
-            "[PLACEMENT-MULTI] Device %d: layers [%d, %d], "
+            "[PLACEMENT-MULTI] Device logical=%zu physical=%d raw_dense_score=%.2f layers [%d, %d], "
             "%.1f MB planned bytes used (%.1f MB budget)\n",
-            device_budgets[d].device_id, first_layer, last_layer, plan.per_device_vram[d] / (1024.0 * 1024.0),
-            device_budgets[d].vram_budget / (1024.0 * 1024.0));
+            d, device_budgets[d].device_id, device_budgets[d].dense_score, first_layer, last_layer,
+            plan.per_device_vram[d] / (1024.0 * 1024.0), device_budgets[d].vram_budget / (1024.0 * 1024.0));
     }
 
     // Per-priority breakdown

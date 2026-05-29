@@ -1380,16 +1380,20 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                 const int            rows_per_wg    = parse_moe_rows_per_wg(config.kernel_name);
                 const bool           cache_y        = config.kernel_name.find("_cache") != std::string::npos &&
                                      config.kernel_name.find("_nocache") == std::string::npos;
+                const bool xmx_tiled_gate_up   = config.kernel_name.find("_xmx_tiled") != std::string::npos;
+                const bool xmx_tiled_grouped   = config.kernel_name.find("_grouped") != std::string::npos;
+                const int  xmx_tiles_n         = parse_moe_xmx_tiles_n(config.kernel_name);
                 const bool vector_qs_load      = config.kernel_name.find("_vecq") != std::string::npos;
                 const bool ignore_weight_scale = config.kernel_name.find("_noscale") != std::string::npos;
                 const int  scale_stride_blocks = parse_moe_scale_stride_blocks(config.kernel_name, k);
                 const int  subgroup_size       = parse_moe_subgroup_size(config.kernel_name);
                 const bool sparse_expert_slots = config.kernel_name.find("_sparse32") != std::string::npos;
                 const bool use_bias            = config.kernel_name.find("_bias") != std::string::npos;
-                if (!run_mxfp4_layer_glu_down(
-                        weights, activations, m, selected_count, k, token_rows, rows_per_wg, cache_y, vector_qs_load,
-                        ignore_weight_scale, scale_stride_blocks, subgroup_size, sparse_expert_slots, use_bias,
-                        config.validate, config.warmup_iterations, config.measure_iterations, queue, metrics, error)) {
+                if (!run_mxfp4_layer_glu_down(weights, activations, m, selected_count, k, token_rows, rows_per_wg,
+                                              cache_y, xmx_tiled_gate_up, xmx_tiled_grouped, xmx_tiles_n,
+                                              vector_qs_load, ignore_weight_scale, scale_stride_blocks, subgroup_size,
+                                              sparse_expert_slots, use_bias, config.validate, config.warmup_iterations,
+                                              config.measure_iterations, queue, metrics, error)) {
                     out.error = error;
                     return false;
                 }

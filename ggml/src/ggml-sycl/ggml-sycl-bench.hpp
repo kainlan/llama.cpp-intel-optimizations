@@ -156,13 +156,23 @@ struct mxfp4_layer_glu_down_bench_args {
 
     int   rows_per_wg         = 4;
     bool  cache_y             = true;
+    bool  xmx_tiled_gate_up   = false;
+    bool  xmx_tiled_grouped   = false;
+    int   xmx_tiles_n         = 1;
     bool  vector_qs_load      = false;
     bool  ignore_weight_scale = false;
     int   scale_stride_blocks = 0;
     int   subgroup_size       = 32;
+    int   grouped_n_chunks    = 0;
     int   glu_op              = 0;
     float alpha               = 1.702f;
     float limit               = 7.0f;
+
+    const int32_t * grouped_expert_ids = nullptr;
+    const int32_t * grouped_offsets    = nullptr;
+    const int32_t * grouped_row_slots  = nullptr;
+    const int32_t * grouped_chunks     = nullptr;
+    const int32_t * grouped_row_starts = nullptr;
 };
 
 bool ggml_sycl_mxfp4_layer_glu_down_bench_launch(const mxfp4_layer_glu_down_bench_args & args);

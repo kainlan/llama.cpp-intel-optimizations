@@ -189,6 +189,17 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
   -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 
+# GPT-OSS B50 chat correctness gate. Expected output starts:
+# : 1, 2, 3, 4, 5
+# Use the GGUF tokenizer.chat_template metadata. Do not force
+# `--chat-template gpt-oss`; that selects the older native formatter.
+ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-cli \
+  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -ngl 99 \
+  -cnv -st --simple-io --no-display-prompt \
+  --reasoning-format none --reasoning-budget 0 \
+  -p 'Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5' \
+  -n 48 --seed 42 --temp 0
+
 # Benchmark prompt processing (PP) and token generation (TG)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
   -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128

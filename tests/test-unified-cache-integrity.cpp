@@ -22,6 +22,7 @@ int main() {
 
 #include "ggml-quants.h"
 #include "ggml-sycl/common.hpp"
+#include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml-sycl/unified-cache.hpp"
 #include <sycl/sycl.hpp>
 
@@ -80,13 +81,6 @@ static bool stress_layout_cache(ggml_context * ctx,
             ggml_backend_tensor_set(weight, host_data.data(), 0, host_data.size());
 
             const ggml_layout_mode target = pick_layout(weight, device_id);
-            void * cached = ggml_sycl_get_weight_layout_ptr(weight, device_id, target);
-            if (!cached) {
-                fprintf(stderr, "Failed to cache layout for type=%d idx=%d\n", (int) type, i);
-                ok = false;
-                break;
-            }
-
             if (!cache) {
                 cache = ggml_sycl::get_unified_cache_for_device(device_id);
                 if (!cache) {
@@ -94,6 +88,28 @@ static bool stress_layout_cache(ggml_context * ctx,
                     ok = false;
                     break;
                 }
+            }
+
+            ggml_sycl_cache_id cache_key = ggml_backend_sycl_get_weight_cache_key(weight, device_id);
+            size_t             dst_size  = ggml_sycl::test_layout_bytes(weight, target, device_id);
+            if (dst_size == 0) {
+                dst_size = host_data.size();
+            }
+            sycl::queue & stream = ggml_sycl_get_device(device_id).default_queue();
+            auto          stage  = cache->direct_stage_weight(cache_key, host_data.data(), host_data.size(), dst_size,
+                                                              target, nullptr, nullptr, &stream);
+            if (!stage.ok || !stage.ptr) {
+                fprintf(stderr, "Failed to stage layout for type=%d idx=%d\n", (int) type, i);
+                ok = false;
+                break;
+            }
+            stage.event.wait();
+
+            void * cached = ggml_sycl_get_weight_layout_ptr(weight, device_id, target);
+            if (!cached) {
+                fprintf(stderr, "Failed to cache layout for type=%d idx=%d\n", (int) type, i);
+                ok = false;
+                break;
             }
 
             if (((i + 1) % 32) == 0 && !cache->validate()) {

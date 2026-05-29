@@ -1520,6 +1520,9 @@ bool run_mxfp4_layer_glu_down(const GeneratedWeights &     weights,
                               int64_t                      n_tokens,
                               int                          rows_per_wg,
                               bool                         cache_y,
+                              bool                         xmx_tiled_gate_up,
+                              bool                         xmx_tiled_grouped,
+                              int                          xmx_tiles_n,
                               bool                         vector_qs_load,
                               bool                         ignore_weight_scale,
                               int                          scale_stride_blocks,
@@ -1549,6 +1552,18 @@ bool run_mxfp4_layer_glu_down(const GeneratedWeights &     weights,
         error = "mxfp4_layer_glu_down subgroup_size must be 16 or 32.";
         return false;
     }
+    if (xmx_tiled_grouped && (!xmx_tiled_gate_up || rows_per_wg != 8)) {
+        error = "mxfp4_layer_glu_down grouped XMX_TILED gate/up requires xmx_tiled r8.";
+        return false;
+    }
+    if (xmx_tiled_gate_up && (vector_qs_load || scale_stride_blocks > 0)) {
+        error = "mxfp4_layer_glu_down XMX_TILED gate/up is exclusive with SOA load variants.";
+        return false;
+    }
+    if (xmx_tiled_gate_up && xmx_tiles_n != 1 && xmx_tiles_n != 2 && xmx_tiles_n != 4) {
+        error = "mxfp4_layer_glu_down XMX_TILED tile count must be 1, 2, or 4.";
+        return false;
+    }
     if (weights.layout_mode != GGML_LAYOUT_SOA || weights.layout.empty()) {
         error = "mxfp4_layer_glu_down requires SOA MXFP4 weights.";
         return false;
@@ -1572,10 +1587,26 @@ bool run_mxfp4_layer_glu_down(const GeneratedWeights &     weights,
     if (!make_mxfp4_soa_scale_stride_layout(weights.layout, m, k, scale_stride, expert_layout, error)) {
         return false;
     }
-    const size_t  expert_bytes         = expert_layout.size();
+    std::vector<uint8_t> gate_up_layout;
+    int                  gate_up_tiles_n = 0;
+    if (xmx_tiled_gate_up && !select_mxfp4_xmx_tiles_n(queue, xmx_tiles_n, gate_up_tiles_n, error)) {
+        return false;
+    }
+    if (xmx_tiled_gate_up) {
+        if (!make_mxfp4_xmx_tiled_layout(expert_layout, m, k,
+                                         gate_up_tiles_n * static_cast<int>(GGML_SYCL_MXFP4_MOE_XMX_N), gate_up_layout,
+                                         error)) {
+            return false;
+        }
+    } else {
+        gate_up_layout = expert_layout;
+    }
+    const size_t  gate_up_expert_bytes = gate_up_layout.size();
+    const size_t  down_expert_bytes    = expert_layout.size();
     const size_t  logical_expert_bytes = weights.layout.size();
     const size_t  expert_slots         = sparse_expert_slots ? std::max<size_t>(32, selected_count) : selected_count;
-    const size_t  weight_bytes         = expert_bytes * expert_slots;
+    const size_t  gate_up_weight_bytes = gate_up_expert_bytes * expert_slots;
+    const size_t  down_weight_bytes    = down_expert_bytes * expert_slots;
     const size_t  act_bytes            = activations.q8_1.size();
     const size_t  glu_count            = static_cast<size_t>(m) * selected_count * token_count;
     const size_t  glu_bytes            = glu_count * sizeof(float);
@@ -1586,28 +1617,33 @@ bool run_mxfp4_layer_glu_down(const GeneratedWeights &     weights,
     const int64_t q8_row_bytes         = static_cast<int64_t>(k * sizeof(block_q8_1) / QK8_1);
     const size_t  down_q8_bytes        = ids_count * static_cast<size_t>(q8_row_bytes);
 
-    std::vector<uint8_t> gate_slices(weight_bytes);
-    std::vector<uint8_t> up_slices(weight_bytes);
-    std::vector<uint8_t> down_slices(weight_bytes);
+    std::vector<uint8_t> gate_slices(gate_up_weight_bytes);
+    std::vector<uint8_t> up_slices(gate_up_weight_bytes);
+    std::vector<uint8_t> down_slices(down_weight_bytes);
     for (size_t slot = 0; slot < expert_slots; ++slot) {
-        std::copy(expert_layout.begin(), expert_layout.end(), gate_slices.begin() + slot * expert_bytes);
-        std::copy(expert_layout.begin(), expert_layout.end(), up_slices.begin() + slot * expert_bytes);
-        std::copy(expert_layout.begin(), expert_layout.end(), down_slices.begin() + slot * expert_bytes);
+        std::copy(gate_up_layout.begin(), gate_up_layout.end(), gate_slices.begin() + slot * gate_up_expert_bytes);
+        std::copy(gate_up_layout.begin(), gate_up_layout.end(), up_slices.begin() + slot * gate_up_expert_bytes);
+        std::copy(expert_layout.begin(), expert_layout.end(), down_slices.begin() + slot * down_expert_bytes);
     }
 
-    uint8_t *        d_gate      = sycl::malloc_device<uint8_t>(weight_bytes, queue);
-    uint8_t *        d_up        = sycl::malloc_device<uint8_t>(weight_bytes, queue);
-    uint8_t *        d_down      = sycl::malloc_device<uint8_t>(weight_bytes, queue);
-    const uint8_t ** d_gate_ptrs = sycl::malloc_device<const uint8_t *>(expert_slots, queue);
-    const uint8_t ** d_up_ptrs   = sycl::malloc_device<const uint8_t *>(expert_slots, queue);
-    const uint8_t ** d_down_ptrs = sycl::malloc_device<const uint8_t *>(expert_slots, queue);
-    uint8_t *        d_act       = sycl::malloc_device<uint8_t>(act_bytes, queue);
-    int32_t *        d_ids       = sycl::malloc_device<int32_t>(ids_count, queue);
-    float *          d_glu       = sycl::malloc_device<float>(glu_count, queue);
-    uint8_t *        d_down_q8   = sycl::malloc_device<uint8_t>(down_q8_bytes, queue);
-    float *          d_out       = sycl::malloc_device<float>(out_count, queue);
-    float *          d_gate_bias = use_bias ? sycl::malloc_device<float>(bias_count, queue) : nullptr;
-    float *          d_up_bias   = use_bias ? sycl::malloc_device<float>(bias_count, queue) : nullptr;
+    uint8_t *        d_gate               = sycl::malloc_device<uint8_t>(gate_up_weight_bytes, queue);
+    uint8_t *        d_up                 = sycl::malloc_device<uint8_t>(gate_up_weight_bytes, queue);
+    uint8_t *        d_down               = sycl::malloc_device<uint8_t>(down_weight_bytes, queue);
+    const uint8_t ** d_gate_ptrs          = sycl::malloc_device<const uint8_t *>(expert_slots, queue);
+    const uint8_t ** d_up_ptrs            = sycl::malloc_device<const uint8_t *>(expert_slots, queue);
+    const uint8_t ** d_down_ptrs          = sycl::malloc_device<const uint8_t *>(expert_slots, queue);
+    uint8_t *        d_act                = sycl::malloc_device<uint8_t>(act_bytes, queue);
+    int32_t *        d_ids                = sycl::malloc_device<int32_t>(ids_count, queue);
+    int32_t *        d_grouped_experts    = nullptr;
+    int32_t *        d_grouped_offsets    = nullptr;
+    int32_t *        d_grouped_rows       = nullptr;
+    int32_t *        d_grouped_chunks     = nullptr;
+    int32_t *        d_grouped_row_starts = nullptr;
+    float *          d_glu                = sycl::malloc_device<float>(glu_count, queue);
+    uint8_t *        d_down_q8            = sycl::malloc_device<uint8_t>(down_q8_bytes, queue);
+    float *          d_out                = sycl::malloc_device<float>(out_count, queue);
+    float *          d_gate_bias          = use_bias ? sycl::malloc_device<float>(bias_count, queue) : nullptr;
+    float *          d_up_bias            = use_bias ? sycl::malloc_device<float>(bias_count, queue) : nullptr;
 
     auto cleanup = [&]() {
         if (d_gate) {
@@ -1633,6 +1669,21 @@ bool run_mxfp4_layer_glu_down(const GeneratedWeights &     weights,
         }
         if (d_ids) {
             sycl::free(d_ids, queue);
+        }
+        if (d_grouped_experts) {
+            sycl::free(d_grouped_experts, queue);
+        }
+        if (d_grouped_offsets) {
+            sycl::free(d_grouped_offsets, queue);
+        }
+        if (d_grouped_rows) {
+            sycl::free(d_grouped_rows, queue);
+        }
+        if (d_grouped_chunks) {
+            sycl::free(d_grouped_chunks, queue);
+        }
+        if (d_grouped_row_starts) {
+            sycl::free(d_grouped_row_starts, queue);
         }
         if (d_glu) {
             sycl::free(d_glu, queue);
@@ -1665,9 +1716,9 @@ bool run_mxfp4_layer_glu_down(const GeneratedWeights &     weights,
     std::vector<float>           host_gate_bias;
     std::vector<float>           host_up_bias;
     for (size_t slot = 0; slot < expert_slots; ++slot) {
-        host_gate_ptrs[slot] = d_gate + slot * expert_bytes;
-        host_up_ptrs[slot]   = d_up + slot * expert_bytes;
-        host_down_ptrs[slot] = d_down + slot * expert_bytes;
+        host_gate_ptrs[slot] = d_gate + slot * gate_up_expert_bytes;
+        host_up_ptrs[slot]   = d_up + slot * gate_up_expert_bytes;
+        host_down_ptrs[slot] = d_down + slot * down_expert_bytes;
     }
     for (size_t token = 0; token < token_count; ++token) {
         for (size_t sel = 0; sel < selected_count; ++sel) {
@@ -1676,9 +1727,71 @@ bool run_mxfp4_layer_glu_down(const GeneratedWeights &     weights,
         }
     }
 
-    queue.memcpy(d_gate, gate_slices.data(), weight_bytes);
-    queue.memcpy(d_up, up_slices.data(), weight_bytes);
-    queue.memcpy(d_down, down_slices.data(), weight_bytes);
+    std::vector<int32_t> grouped_experts_host;
+    std::vector<int32_t> grouped_offsets_host;
+    std::vector<int32_t> grouped_rows_host;
+    std::vector<int32_t> grouped_chunks_host;
+    std::vector<int32_t> grouped_row_starts_host;
+    if (xmx_tiled_grouped) {
+        constexpr int                     exec_n         = GGML_SYCL_MXFP4_MOE_XMX_N;
+        constexpr int                     row_list_tiles = 16;
+        const size_t                      row_limit      = static_cast<size_t>(exec_n * row_list_tiles);
+        std::vector<std::vector<int32_t>> grouped_slots;
+        grouped_slots.reserve(std::min(expert_slots, ids_count));
+        for (size_t token = 0; token < token_count; ++token) {
+            for (size_t sel = 0; sel < selected_count; ++sel) {
+                const int32_t eid = host_ids[token * selected_count + sel];
+                auto          it  = std::find(grouped_experts_host.begin(), grouped_experts_host.end(), eid);
+                size_t        group_index;
+                if (it == grouped_experts_host.end()) {
+                    group_index = grouped_experts_host.size();
+                    grouped_experts_host.push_back(eid);
+                    grouped_slots.emplace_back();
+                } else {
+                    group_index = static_cast<size_t>(std::distance(grouped_experts_host.begin(), it));
+                }
+                grouped_slots[group_index].push_back(static_cast<int32_t>(sel * token_count + token));
+            }
+        }
+        grouped_offsets_host.reserve(grouped_experts_host.size() + 1);
+        grouped_offsets_host.push_back(0);
+        for (size_t group = 0; group < grouped_slots.size(); ++group) {
+            auto & rows = grouped_slots[group];
+            std::sort(rows.begin(), rows.end());
+            const int rows_begin = static_cast<int>(grouped_rows_host.size());
+            grouped_rows_host.insert(grouped_rows_host.end(), rows.begin(), rows.end());
+            for (int row_start = 0; row_start < static_cast<int>(rows.size()); row_start += exec_n) {
+                grouped_chunks_host.push_back(static_cast<int32_t>(group));
+                grouped_row_starts_host.push_back(row_start);
+            }
+            grouped_offsets_host.push_back(rows_begin + static_cast<int>(rows.size()));
+        }
+        if (grouped_rows_host.size() != ids_count || grouped_chunks_host.empty() || row_limit == 0) {
+            cleanup();
+            error = "mxfp4_layer_glu_down grouped XMX_TILED setup failed.";
+            return false;
+        }
+        d_grouped_experts    = sycl::malloc_device<int32_t>(grouped_experts_host.size(), queue);
+        d_grouped_offsets    = sycl::malloc_device<int32_t>(grouped_offsets_host.size(), queue);
+        d_grouped_rows       = sycl::malloc_device<int32_t>(grouped_rows_host.size(), queue);
+        d_grouped_chunks     = sycl::malloc_device<int32_t>(grouped_chunks_host.size(), queue);
+        d_grouped_row_starts = sycl::malloc_device<int32_t>(grouped_row_starts_host.size(), queue);
+        if (!d_grouped_experts || !d_grouped_offsets || !d_grouped_rows || !d_grouped_chunks || !d_grouped_row_starts) {
+            cleanup();
+            error = "device allocation failed for grouped mxfp4_layer_glu_down.";
+            return false;
+        }
+        queue.memcpy(d_grouped_experts, grouped_experts_host.data(), grouped_experts_host.size() * sizeof(int32_t));
+        queue.memcpy(d_grouped_offsets, grouped_offsets_host.data(), grouped_offsets_host.size() * sizeof(int32_t));
+        queue.memcpy(d_grouped_rows, grouped_rows_host.data(), grouped_rows_host.size() * sizeof(int32_t));
+        queue.memcpy(d_grouped_chunks, grouped_chunks_host.data(), grouped_chunks_host.size() * sizeof(int32_t));
+        queue.memcpy(d_grouped_row_starts, grouped_row_starts_host.data(),
+                     grouped_row_starts_host.size() * sizeof(int32_t));
+    }
+
+    queue.memcpy(d_gate, gate_slices.data(), gate_up_weight_bytes);
+    queue.memcpy(d_up, up_slices.data(), gate_up_weight_bytes);
+    queue.memcpy(d_down, down_slices.data(), down_weight_bytes);
     queue.memcpy(d_gate_ptrs, host_gate_ptrs.data(), expert_slots * sizeof(const uint8_t *));
     queue.memcpy(d_up_ptrs, host_up_ptrs.data(), expert_slots * sizeof(const uint8_t *));
     queue.memcpy(d_down_ptrs, host_down_ptrs.data(), expert_slots * sizeof(const uint8_t *));
@@ -1732,10 +1845,19 @@ bool run_mxfp4_layer_glu_down(const GeneratedWeights &     weights,
     args.up_bias_nb1            = static_cast<int64_t>(m * sizeof(float));
     args.rows_per_wg            = rows_per_wg;
     args.cache_y                = cache_y;
+    args.xmx_tiled_gate_up      = xmx_tiled_gate_up;
+    args.xmx_tiled_grouped      = xmx_tiled_grouped;
+    args.xmx_tiles_n            = xmx_tiled_gate_up ? gate_up_tiles_n : xmx_tiles_n;
     args.vector_qs_load         = vector_qs_load;
     args.ignore_weight_scale    = ignore_weight_scale;
     args.scale_stride_blocks    = scale_stride_blocks;
     args.subgroup_size          = subgroup_size;
+    args.grouped_expert_ids     = d_grouped_experts;
+    args.grouped_offsets        = d_grouped_offsets;
+    args.grouped_row_slots      = d_grouped_rows;
+    args.grouped_chunks         = d_grouped_chunks;
+    args.grouped_row_starts     = d_grouped_row_starts;
+    args.grouped_n_chunks       = static_cast<int>(grouped_chunks_host.size());
     args.glu_op                 = GGML_GLU_OP_SWIGLU_OAI;
     args.alpha                  = 1.702f;
     args.limit                  = 7.0f;

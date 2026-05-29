@@ -183,6 +183,7 @@ struct placement_alternate_layout {
     ggml_layout_mode layout           = GGML_LAYOUT_AOS;
     size_t           dst_size         = 0;
     size_t           vram_charge_size = 0;
+    int              target_device    = -1;  // -1 means same device as the owning placement_entry
 };
 
 struct expert_placement_result {
@@ -284,9 +285,11 @@ struct placement_tensor_info {
 
 // Per-device VRAM budget for multi-GPU placement planning.
 struct device_budget {
-    int    device_id;    // SYCL device index
-    size_t vram_budget;  // Available VRAM bytes for weights on this device
-    size_t total_vram;   // Total VRAM on this device (for proportional split)
+    int    device_id       = 0;     // SYCL device index
+    size_t vram_budget     = 0;     // Available VRAM bytes for weights on this device
+    size_t total_vram      = 0;     // Total VRAM on this device (for proportional split)
+    double dense_score     = 1.0;   // Queried dense-execution capability score
+    bool   dense_supported = true;  // False when dense dispatch cannot run on this device
 };
 
 // Multi-GPU parallelism mode (GGML_SYCL_MULTI_GPU_MODE env var).
@@ -1433,6 +1436,12 @@ class unified_cache {
                                             const void *         fill_ctx,
                                             sycl::queue *        queue,
                                             mem_handle *         out_handle = nullptr);
+
+    // Drop one cache-owned expert entry after all smart-handle leases have
+    // been released. This is used for planner-owned PP/TG layout phase
+    // switches; it refuses to free live handles and erases only transient raw
+    // pointer mirrors after the canonical entry is gone.
+    bool drop_expert_entry(ggml_sycl_cache_id key, const char * reason = nullptr);
 
     // Fast O(1) lookup for inference-time weight resolution.
     // Returns nullptr if not staged.  No allocation, no state machine.

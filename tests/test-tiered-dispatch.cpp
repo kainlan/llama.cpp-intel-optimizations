@@ -46,7 +46,7 @@ static void test_tiered_mode_query() {
         total_size += size_per_tensor;
     }
 
-    ggml_sycl_tensor_inventory inventory;
+    ggml_sycl_tensor_inventory inventory = {};
     inventory.tensors    = tensors.data();
     inventory.count      = tensors.size();
     inventory.total_size = total_size;
@@ -92,7 +92,7 @@ static void test_small_inventory_no_tiered() {
         total_size += size_per_tensor;
     }
 
-    ggml_sycl_tensor_inventory inventory;
+    ggml_sycl_tensor_inventory inventory = {};
     inventory.tensors    = tensors.data();
     inventory.count      = tensors.size();
     inventory.total_size = total_size;
@@ -136,7 +136,7 @@ static void test_inventory_tensor_types() {
         total_size += t.size;
     }
 
-    ggml_sycl_tensor_inventory inventory;
+    ggml_sycl_tensor_inventory inventory = {};
     inventory.tensors    = tensors.data();
     inventory.count      = tensors.size();
     inventory.total_size = total_size;
@@ -205,7 +205,7 @@ static void test_inventory_clear() {
         tensors_large.push_back({ name_storage_large.back().c_str(), free_vram / 25 });
     }
 
-    ggml_sycl_tensor_inventory inv_large;
+    ggml_sycl_tensor_inventory inv_large = {};
     inv_large.tensors    = tensors_large.data();
     inv_large.count      = tensors_large.size();
     inv_large.total_size = num_large * (free_vram / 25);
@@ -223,7 +223,7 @@ static void test_inventory_clear() {
         tensors_small.push_back({ name_storage_small.back().c_str(), free_vram / 20 });
     }
 
-    ggml_sycl_tensor_inventory inv_small;
+    ggml_sycl_tensor_inventory inv_small = {};
     inv_small.tensors    = tensors_small.data();
     inv_small.count      = tensors_small.size();
     inv_small.total_size = num_small * (free_vram / 20);  // 25% of VRAM

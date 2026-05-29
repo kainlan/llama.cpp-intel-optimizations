@@ -322,19 +322,15 @@ enum ggml_sycl_backend_gpu_mode { SYCL_UNSET_GPU_MODE = -1, SYCL_SINGLE_GPU_MODE
 
 static_assert(sizeof(sycl::half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
-// SYCL-compatible E8M0 to FP32 conversion (halved for MXFP4)
-// E8M0 is an 8-bit exponent-only format used in MX (Microscaling) formats
+// SYCL-compatible E8M0 to FP32 conversion (halved for MXFP4).
+// This must match ggml_sycl_e8m0_to_fp32(e) * 0.5f, including the
+// subnormal values for e=0 and e=1.
 static __dpct_inline__ float sycl_e8m0_to_fp32_half(uint8_t e) {
-    // For e < 2: use precomputed denormal patterns
-    // For e >= 2: exponent - 1 gives FP32 exponent (halving = divide by 2)
     uint32_t bits;
     if (e < 2) {
-        // Denormal handling: e=0 -> 0.0, e=1 -> very small denormal
-        static const uint32_t denorm_table[2] = { 0x00000000, 0x33800000 };
-        bits                                  = denorm_table[e];
+        bits = 0x00200000u << e;
     } else {
-        // Normal case: FP32 exponent = e - 1 (bias 127, so -1 gives halving)
-        bits = ((uint32_t) (e - 1)) << 23;
+        bits = static_cast<uint32_t>(e - 1) << 23;
     }
     float result;
     memcpy(&result, &bits, sizeof(result));
@@ -674,6 +670,14 @@ static inline size_t ggml_sycl_mxfp4_grouped_dpas_row_list_limit(const XMXCapabi
     return caps.N == 0 ? 0 : caps.N * GGML_SYCL_MXFP4_GROUPED_DPAS_ROW_LIST_TILES;
 }
 
+static inline bool ggml_sycl_mxfp4_grouped_dpas_can_chunk_row_limit(const XMXCapabilities & caps) {
+    const size_t row_limit = ggml_sycl_mxfp4_grouped_dpas_row_list_limit(caps);
+    return row_limit >= GGML_SYCL_MXFP4_MOE_XMX_N &&
+           xmx_capabilities_match_int8_tile(caps, GGML_SYCL_MXFP4_MOE_XMX_M, GGML_SYCL_MXFP4_MOE_XMX_N,
+                                            GGML_SYCL_MXFP4_MOE_XMX_K) &&
+           xmx_capabilities_support_sub_group(caps, GGML_SYCL_MXFP4_MOE_XMX_SG);
+}
+
 static inline mxfp4_grouped_dpas_occupancy_decision ggml_sycl_select_mxfp4_grouped_dpas_occupancy(
     const XMXCapabilities & caps,
     const int32_t *         rows_per_group,
@@ -975,11 +979,37 @@ struct sycl_device_info {
     char            device_name[256] = { 0 };      // Device name for GPU family detection
 };
 
+struct sycl_peer_link_info {
+    bool     valid                   = false;
+    int      src_device              = -1;
+    int      dst_device              = -1;
+    bool     same_device             = false;
+    bool     same_backend            = false;
+    bool     same_platform           = false;
+    bool     same_sycl_context       = false;
+    bool     level_zero              = false;
+    bool     l0_peer_query_supported = false;
+    bool     l0_can_access_peer      = false;
+    uint32_t l0_p2p_flags            = 0;
+    bool     host_bounce_measured    = false;
+    bool     direct_copy_measured    = false;
+    size_t   measured_bytes          = 0;
+    double   host_bounce_us          = 0.0;
+    double   host_bounce_gbps        = 0.0;
+    double   host_bounce_d2h_us      = 0.0;
+    double   host_bounce_h2d_us      = 0.0;
+    double   direct_copy_us          = 0.0;
+    double   direct_copy_gbps        = 0.0;
+    char     preferred_transfer[32]  = { 0 };
+    char     unsupported_reason[64]  = { 0 };
+};
+
 struct ggml_sycl_device_info {
     int device_count    = 0;  // GPUs visible to scheduler (may be reduced to 1)
     int total_gpu_count = 0;  // Total physical GPUs (before scheduler hiding)
 
-    sycl_device_info devices[GGML_SYCL_MAX_DEVICES] = {};
+    sycl_device_info    devices[GGML_SYCL_MAX_DEVICES]                           = {};
+    sycl_peer_link_info peer_links[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_DEVICES] = {};
 
     std::array<float, GGML_SYCL_MAX_DEVICES> default_tensor_split = {};
 
@@ -1003,6 +1033,8 @@ const ggml_sycl_device_info & ggml_sycl_info();
 size_t                        ggml_sycl_get_safe_max_alloc_size(int device);
 size_t                        ggml_sycl_get_free_vram_at_init(int device);
 size_t                        ggml_sycl_get_host_max_alloc_size();
+const sycl_peer_link_info *   ggml_sycl_get_peer_link_info(int src_device, int dst_device);
+void                          ggml_sycl_dump_peer_link_info();
 
 // Access a device by logical GPU index using the full (pre-scheduler-hiding) map.
 // ggml_sycl_get_device() uses the same full map for GPU logical IDs; this helper
@@ -2766,9 +2798,11 @@ struct ggml_tensor_extra_gpu {
 
     // MoE expert storage handles are the persistent ownership view for experts
     // returned by unified-cache allocation/registration. The key is
-    // (layout, expert_id); device/location are properties of the mem_handle
-    // itself, not of this container. Pointer tables below are transient kernel
-    // ABI payloads rebuilt from these handles or route-local handles.
+    // (layout, expert_id); each key may have multiple handles when the planner
+    // intentionally materializes replicas on different devices. Device/location
+    // are properties of each mem_handle, not of the container key. Pointer tables
+    // below are transient kernel ABI payloads rebuilt from these handles or
+    // route-local handles.
     static uint64_t moe_storage_handle_key(int expert_id, ggml_layout_mode layout) {
         return (static_cast<uint64_t>(static_cast<uint32_t>(layout)) << 32) | static_cast<uint32_t>(expert_id);
     }
@@ -2793,7 +2827,16 @@ struct ggml_tensor_extra_gpu {
             record.has_ready_event = true;
             record.ready_event     = *ready_event;
         }
-        moe_expert_storage_handles[moe_storage_handle_key(expert_id, layout)] = std::move(record);
+        auto &    records   = moe_expert_storage_handles[moe_storage_handle_key(expert_id, layout)];
+        const int new_owner = record.handle.device();
+        for (moe_expert_storage_record & existing : records) {
+            if (existing.handle.device() == new_owner) {
+                existing = std::move(record);
+                ++moe_expert_storage_generation;
+                return;
+            }
+        }
+        records.push_back(std::move(record));
         ++moe_expert_storage_generation;
     }
 
@@ -2802,7 +2845,74 @@ struct ggml_tensor_extra_gpu {
             return nullptr;
         }
         auto it = moe_expert_storage_handles.find(moe_storage_handle_key(expert_id, layout));
-        return it == moe_expert_storage_handles.end() ? nullptr : &it->second;
+        if (it == moe_expert_storage_handles.end() || it->second.empty()) {
+            return nullptr;
+        }
+        return &it->second.front();
+    }
+
+    const moe_expert_storage_record * find_moe_storage_handle_on_device(int              expert_id,
+                                                                        ggml_layout_mode layout,
+                                                                        int              owner_device) const {
+        if (expert_id < 0) {
+            return nullptr;
+        }
+        auto it = moe_expert_storage_handles.find(moe_storage_handle_key(expert_id, layout));
+        if (it == moe_expert_storage_handles.end()) {
+            return nullptr;
+        }
+        for (const moe_expert_storage_record & record : it->second) {
+            if (record.handle.device() == owner_device) {
+                return &record;
+            }
+        }
+        return nullptr;
+    }
+
+    bool forget_moe_storage_handle_on_device(int expert_id, ggml_layout_mode layout, int owner_device) {
+        if (expert_id < 0) {
+            return false;
+        }
+
+        bool erased = false;
+        auto it     = moe_expert_storage_handles.find(moe_storage_handle_key(expert_id, layout));
+        if (it != moe_expert_storage_handles.end()) {
+            auto &       records = it->second;
+            const size_t before  = records.size();
+            records.erase(std::remove_if(records.begin(), records.end(),
+                                         [&](const moe_expert_storage_record & record) {
+                                             return record.handle.device() == owner_device;
+                                         }),
+                          records.end());
+            erased = records.size() != before;
+            if (records.empty()) {
+                moe_expert_storage_handles.erase(it);
+            }
+        }
+
+        if (owner_device >= 0 && owner_device < GGML_SYCL_MAX_DEVICES) {
+            const size_t slot = static_cast<size_t>(expert_id);
+            if (slot < moe_expert_handles[owner_device].size()) {
+                ggml_sycl::mem_handle & table_handle = moe_expert_handles[owner_device][slot];
+                auto                    resolved     = table_handle.resolve(owner_device);
+                if (resolved.ptr && resolved.layout == layout && table_handle.device() == owner_device) {
+                    table_handle = ggml_sycl::mem_handle{};
+                    if (slot < moe_expert_ptrs_host[owner_device].size()) {
+                        moe_expert_ptrs_host[owner_device][slot] = nullptr;
+                    }
+                    moe_device_table_valid[owner_device]                 = false;
+                    moe_full_local_probe_generation[owner_device]        = 0;
+                    moe_full_local_probe_layout[owner_device]            = GGML_LAYOUT_AOS;
+                    moe_full_local_probe_ok[owner_device]                = false;
+                    erased                                               = true;
+                }
+            }
+        }
+
+        if (erased) {
+            ++moe_expert_storage_generation;
+        }
+        return erased;
     }
 
     void clear_moe_storage_handles() {
@@ -2813,12 +2923,21 @@ struct ggml_tensor_extra_gpu {
     void clear_moe_storage_handles_for_owner(int owner_device) {
         bool erased = false;
         for (auto it = moe_expert_storage_handles.begin(); it != moe_expert_storage_handles.end();) {
-            if (it->second.handle.device() == owner_device) {
-                it     = moe_expert_storage_handles.erase(it);
+            auto &       records = it->second;
+            const size_t before  = records.size();
+            records.erase(std::remove_if(records.begin(), records.end(),
+                                         [&](const moe_expert_storage_record & record) {
+                                             return record.handle.device() == owner_device;
+                                         }),
+                          records.end());
+            if (records.size() != before) {
                 erased = true;
-            } else {
-                ++it;
             }
+            if (records.empty()) {
+                it = moe_expert_storage_handles.erase(it);
+                continue;
+            }
+            ++it;
         }
         if (erased) {
             ++moe_expert_storage_generation;
@@ -2838,14 +2957,14 @@ struct ggml_tensor_extra_gpu {
     // Validity flag: set false when host-only pointer table mode is active (skip_device_copy=true).
     // Prevents stale device table from a prior token being used when VRAM was sufficient.
     bool                    moe_device_table_valid[GGML_SYCL_MAX_DEVICES]        = { false };
-    std::unordered_map<uint64_t, moe_expert_storage_record> moe_expert_storage_handles;
-    uint64_t                                                moe_expert_storage_generation                          = 1;
-    uint64_t                                                moe_full_local_probe_generation[GGML_SYCL_MAX_DEVICES] = {};
-    ggml_layout_mode                                        moe_full_local_probe_layout[GGML_SYCL_MAX_DEVICES]     = {};
-    bool                                                    moe_full_local_probe_ok[GGML_SYCL_MAX_DEVICES]         = {};
-    uint64_t                           moe_planned_layout_generation[GGML_SYCL_MAX_DEVICES][2]                     = {};
-    ggml_layout_mode                   moe_planned_layout_cache[GGML_SYCL_MAX_DEVICES][2]                          = {};
-    bool                               moe_planned_layout_valid[GGML_SYCL_MAX_DEVICES][2]                          = {};
+    std::unordered_map<uint64_t, std::vector<moe_expert_storage_record>> moe_expert_storage_handles;
+    uint64_t                                                             moe_expert_storage_generation = 1;
+    uint64_t                           moe_full_local_probe_generation[GGML_SYCL_MAX_DEVICES]          = {};
+    ggml_layout_mode                   moe_full_local_probe_layout[GGML_SYCL_MAX_DEVICES]              = {};
+    bool                               moe_full_local_probe_ok[GGML_SYCL_MAX_DEVICES]                  = {};
+    uint64_t                           moe_planned_layout_generation[GGML_SYCL_MAX_DEVICES][2][2]      = {};
+    ggml_layout_mode                   moe_planned_layout_cache[GGML_SYCL_MAX_DEVICES][2][2]           = {};
+    bool                               moe_planned_layout_valid[GGML_SYCL_MAX_DEVICES][2][2]           = {};
     std::vector<void *>                moe_expert_ptrs_host[GGML_SYCL_MAX_DEVICES];
     std::vector<ggml_sycl::mem_handle> moe_expert_handles[GGML_SYCL_MAX_DEVICES];
     std::vector<ggml_sycl::mem_handle> moe_expert_ptrs_leases[GGML_SYCL_MAX_DEVICES];
@@ -3928,24 +4047,92 @@ struct ggml_backend_sycl_context {
         std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph;
     };
 
+    struct moe_graph_moe_dispatch {
+        int      node_idx;       // Fused MoE dispatch boundary in cgraph->nodes[]
+        uint64_t graph_hash;     // Structural cgraph signature at record time
+        uint64_t pointer_hash;   // Resolved operand/handle signature at record time
+        std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph;
+    };
+
+    struct moe_graph_block {
+        int start_node;  // Inclusive start index in cgraph->nodes[]
+        int end_node;    // Exclusive end index in cgraph->nodes[]
+        uint64_t graph_hash;
+        uint64_t pointer_hash;
+        std::vector<int> moe_nodes;
+        std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph;
+    };
+
     std::vector<moe_graph_segment> moe_segments;
+    std::vector<moe_graph_moe_dispatch> moe_dispatch_graphs;
     std::vector<int>               moe_node_indices;                       // Indices of MUL_MAT_ID nodes
     int                            moe_segments_n_nodes              = 0;  // n_nodes when segments were recorded
     bool                           moe_segments_is_decode            = false;
     bool                           moe_segments_valid                = false;
     bool                           moe_fa_post_prompt_record_pending = false;
 
+    // Direct decode graphlets cache only the fused MoE descriptor dispatches.
+    // They are independent from segmented non-MoE graph replay and are safe to
+    // drop without changing weight ownership: mem_handles/unified cache retain
+    // all underlying allocations.
+    std::vector<moe_graph_moe_dispatch> moe_direct_dispatch_graphs;
+    int                                 moe_direct_dispatch_graphs_n_nodes   = 0;
+    uint64_t                            moe_direct_dispatch_graphs_hash      = 0;
+    bool                                moe_direct_dispatch_graphs_is_decode = false;
+    bool                                moe_direct_dispatch_graphs_disabled  = false;
+
+    std::vector<moe_graph_block> moe_block_graphs;
+    int                          moe_block_graphs_n_nodes    = 0;
+    uint64_t                     moe_block_graphs_hash       = 0;
+    bool                         moe_block_graphs_is_decode  = false;
+    int                          moe_block_graphs_block_size = 0;
+    bool                         moe_block_graphs_valid      = false;
+    bool                         moe_block_graphs_disabled   = false;
+
     void invalidate_moe_segments() {
         moe_segments.clear();
+        moe_dispatch_graphs.clear();
         moe_node_indices.clear();
         moe_segments_n_nodes = 0;
         moe_segments_valid   = false;
+    }
+
+    void invalidate_moe_direct_dispatch_graphs() {
+        moe_direct_dispatch_graphs.clear();
+        moe_direct_dispatch_graphs_n_nodes   = 0;
+        moe_direct_dispatch_graphs_hash      = 0;
+        moe_direct_dispatch_graphs_is_decode = false;
+        moe_direct_dispatch_graphs_disabled  = false;
+    }
+
+    void invalidate_moe_block_graphs() {
+        moe_block_graphs.clear();
+        moe_block_graphs_n_nodes    = 0;
+        moe_block_graphs_hash       = 0;
+        moe_block_graphs_is_decode  = false;
+        moe_block_graphs_block_size = 0;
+        moe_block_graphs_valid      = false;
     }
 
     // === Cached per-graph computations (reset when n_nodes changes) ===
     int  cached_persistent_n_nodes = -1;     // n_nodes when persistent check was cached
     bool cached_persistent_result  = false;  // cached should_use_persistent_tg result
     bool cached_is_decode_phase    = false;  // cached phase detection result
+
+    // MoE phase layouts are persistent unified-cache allocations. Once a graph
+    // phase has verified/materialized the planner-selected expert layouts,
+    // repeated TG calls do not need to re-resolve every expert handle.
+    int  moe_phase_layout_cache_key       = -1;
+    bool moe_phase_layout_cache_is_decode = false;
+    bool moe_phase_layout_cache_valid     = false;
+    bool moe_phase_layout_cache_missing   = true;
+
+    void invalidate_moe_phase_layout_cache() {
+        moe_phase_layout_cache_key       = -1;
+        moe_phase_layout_cache_is_decode = false;
+        moe_phase_layout_cache_valid     = false;
+        moe_phase_layout_cache_missing   = true;
+    }
 
     uint64_t cached_graph_sig         = 0;   // cached graph signature hash
     int      cached_graph_sig_n_nodes = -1;  // n_nodes when hash was cached
@@ -4128,6 +4315,112 @@ struct ggml_backend_sycl_context {
             max_nrows          = 0;
         }
     } mmvq_soa_buffers;
+
+    // Per-context Q8_1 activation cache for repeated MMVQ inputs.
+    // This is scratch reuse, not weight ownership: unified cache owns the
+    // backing allocation and the mem_handle is the stable identity.
+    struct mmvq_q8_activation_cache_t {
+        ggml_sycl::alloc_handle backing_alloc = {};
+        ggml_sycl::mem_handle   backing_handle;
+        size_t                  backing_capacity = 0;
+        int                     backing_device   = -1;
+
+        void *              cached_q8_1    = nullptr;
+        const ggml_tensor * cached_tensor  = nullptr;
+        const void *        cached_src     = nullptr;
+        int64_t             cached_ne10    = 0;
+        int64_t             cached_rows    = 0;
+        int64_t             cached_padded  = 0;
+        size_t              cached_size    = 0;
+        bool                cached_soa_y   = false;
+        bool                valid          = false;
+
+        void invalidate() {
+            cached_tensor = nullptr;
+            cached_src    = nullptr;
+            cached_ne10   = 0;
+            cached_rows   = 0;
+            cached_padded = 0;
+            cached_size   = 0;
+            cached_soa_y  = false;
+            valid         = false;
+        }
+
+        void release() {
+            invalidate();
+            cached_q8_1 = nullptr;
+            if (backing_alloc.ptr) {
+                (void) ggml_sycl::unified_free(backing_alloc);
+            }
+            backing_alloc    = {};
+            backing_handle   = {};
+            backing_capacity = 0;
+            backing_device   = -1;
+        }
+
+        void * ensure_buffer(size_t required_size, int device, sycl::queue & queue) {
+            if (required_size == 0) {
+                return nullptr;
+            }
+            if (backing_alloc.ptr && backing_capacity >= required_size && backing_device == device) {
+                if (!backing_handle.valid()) {
+                    backing_handle = backing_alloc.as_mem_handle();
+                }
+                auto resolved = backing_handle.resolve(device);
+                return resolved ? resolved.ptr : backing_alloc.ptr;
+            }
+
+            release();
+
+            ggml_sycl::alloc_request req{};
+            req.queue                          = &queue;
+            req.device                         = device;
+            req.size                           = required_size;
+            req.intent.role                    = ggml_sycl::alloc_role::STAGING;
+            req.intent.category                = ggml_sycl::runtime_category::STAGING;
+            req.intent.constraints.must_device = true;
+            if (!ggml_sycl::unified_alloc(req, &backing_alloc) || !backing_alloc.ptr) {
+                backing_alloc = {};
+                return nullptr;
+            }
+            backing_handle   = backing_alloc.as_mem_handle();
+            backing_capacity = backing_alloc.size;
+            backing_device   = device;
+
+            auto resolved = backing_handle.resolve(device);
+            return resolved ? resolved.ptr : backing_alloc.ptr;
+        }
+
+        bool matches(const ggml_tensor * tensor,
+                     const void *        src,
+                     int64_t             ne10,
+                     int64_t             rows,
+                     int64_t             padded,
+                     size_t              size,
+                     bool                soa_y) const {
+            return valid && cached_tensor == tensor && cached_src == src && cached_ne10 == ne10 &&
+                   cached_rows == rows && cached_padded == padded && cached_size >= size && cached_soa_y == soa_y;
+        }
+
+        void store(const ggml_tensor * tensor,
+                   const void *        src,
+                   void *              q8_1,
+                   int64_t             ne10,
+                   int64_t             rows,
+                   int64_t             padded,
+                   size_t              size,
+                   bool                soa_y) {
+            cached_tensor = tensor;
+            cached_src    = src;
+            cached_q8_1   = q8_1;
+            cached_ne10   = ne10;
+            cached_rows   = rows;
+            cached_padded = padded;
+            cached_size   = size;
+            cached_soa_y  = soa_y;
+            valid         = q8_1 != nullptr;
+        }
+    } mmvq_q8_activation_cache;
 
     // Pre-allocated buffers for XMX MoE graph recording
     // XMX MoE needs various temporary buffers that can't be allocated during graph recording
@@ -4405,8 +4698,8 @@ struct ggml_backend_sycl_context {
     bool                                                    weight_streaming_graphs_disabled = false;
     std::vector<ggml_sycl::mem_handle>                      graph_weight_leases;
     std::vector<ggml_sycl::mem_handle>                      graph_moe_expert_leases;
-    std::vector<ggml_sycl::mem_handle>                      persistent_moe_descriptor_leases;
     std::vector<ggml_sycl::moe_layer_persistent_descriptor> persistent_moe_descriptors;
+    bool                                                    persistent_moe_descriptors_static_valid = false;
 
     struct fa_graph_ptr_snapshot {
         const void * q           = nullptr;

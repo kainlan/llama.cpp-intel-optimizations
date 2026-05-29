@@ -1519,17 +1519,17 @@ SYCL_ESIMD_FUNCTION esimd::simd<sycl::half, TILE_K> dequant_q4_0_tile_vectorized
  * @return Float scale factor (already halved)
  */
 SYCL_ESIMD_FUNCTION float e8m0_to_scale_esimd(uint8_t e) {
+    using namespace sycl::ext::intel::esimd;
     uint32_t bits;
     if (e == 0) {
-        // Denormal case: return 2^(-127) * 0.5 = 2^(-128)
-        bits = 0x00400000;  // Small positive float
+        bits = 0x00200000u;
+    } else if (e == 1) {
+        bits = 0x00400000u;
     } else {
-        // Normal case: 2^(e-127) * 0.5 = 2^(e-128)
         bits = static_cast<uint32_t>(e - 1) << 23;
     }
-    float result;
-    std::memcpy(&result, &bits, sizeof(float));
-    return result;
+    simd<uint32_t, 1> packed(bits);
+    return packed.template bit_cast_view<float>()[0];
 }
 
 /**
