@@ -1464,7 +1464,10 @@ struct test_case {
             GGML_UNUSED(index);
         };
 
-        const bool cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud, run_whole_graph() ? out : nullptr);
+        const ggml_tensor * test_nodes[] = { out };
+        const bool cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
+                                                               run_whole_graph() ? test_nodes : nullptr,
+                                                               run_whole_graph() ? 1 : 0);
 
         ggml_backend_buffer_free(buf);
         for (ggml_backend_buffer_t buf_w : weight_buffers) {

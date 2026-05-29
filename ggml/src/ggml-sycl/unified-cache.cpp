@@ -10793,10 +10793,10 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     const size_t per_chunk_cap = max_alloc_size;
 
     // Cap upfront reservation so non-arena runtime allocations (driver state,
-    // direct fallback allocations, and any code path not yet routed through a
-    // zone) still fit in residual VRAM.  The unified-cache public budget may
-    // already have subtracted device slack before this function is called; do
-    // not subtract a second proportional headroom on top of that.  RUNTIME,
+    // kernel residency, graph/event state, and any code path not yet routed
+    // through a zone) still fit in residual VRAM.  The arena is an eager TLSF
+    // reservation, so consuming every byte of the public cache budget can
+    // starve Level Zero even when the model itself is much smaller.  RUNTIME,
     // SCRATCH, and ONEDNN allocations are already modeled as arena zones.
     // Caller passes total VRAM rather than us probing because this routine may
     // run inside ggml_sycl_init() static init, where a memory query would
@@ -10804,16 +10804,13 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     // cap entirely.
     if (device_total_vram > 0) {
         constexpr size_t k_one_gib               = 1024ull * 1024ull * 1024ull;
-        constexpr size_t k_max_external_headroom = 2ull * k_one_gib;
+        constexpr size_t k_max_external_headroom = 4ull * k_one_gib;
         const size_t     min_external_headroom   = std::min(k_one_gib, device_total_vram / 8);
-        const size_t     proportional_headroom   = device_total_vram / 10;
+        const size_t     proportional_headroom   = device_total_vram / 3;
         size_t           external_headroom =
             std::min(k_max_external_headroom, std::max(min_external_headroom, proportional_headroom));
         const size_t caller_reserved_headroom =
             device_total_vram > budget_bytes ? device_total_vram - budget_bytes : 0;
-        if (caller_reserved_headroom > 0) {
-            external_headroom = std::min(external_headroom, caller_reserved_headroom);
-        }
         if (const char * env = std::getenv("GGML_SYCL_VRAM_ARENA_EXTERNAL_HEADROOM_MB")) {
             const long parsed = std::strtol(env, nullptr, 10);
             if (parsed > 0) {
@@ -12196,6 +12193,13 @@ static ggml_layout_mode planner_default_device_layout(const placement_tensor_inf
         }
         return GGML_LAYOUT_SOA;
     }
+    if (usage == tensor_usage::ATTENTION_WEIGHT || usage == tensor_usage::FFN_WEIGHT ||
+        usage == tensor_usage::EMBEDDING) {
+        const ggml_layout_mode layout = layout_policy::get_optimal(tensor.type, usage, device_id);
+        if (layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED) {
+            return layout;
+        }
+    }
     return GGML_LAYOUT_AOS;
 }
 
@@ -12210,6 +12214,14 @@ static ggml_layout_mode planner_default_device_layout(const placement_entry & en
             return layout;
         }
         return GGML_LAYOUT_SOA;
+    }
+    const tensor_usage usage = infer_tensor_usage(entry.name.c_str());
+    if (usage == tensor_usage::ATTENTION_WEIGHT || usage == tensor_usage::FFN_WEIGHT ||
+        usage == tensor_usage::EMBEDDING) {
+        const ggml_layout_mode layout = layout_policy::get_optimal(entry.type, usage, device_id);
+        if (layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED) {
+            return layout;
+        }
     }
     return GGML_LAYOUT_AOS;
 }

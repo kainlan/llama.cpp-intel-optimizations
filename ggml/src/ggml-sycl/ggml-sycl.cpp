@@ -20884,23 +20884,21 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
             ggml_sycl_layout_supports_coalesced(tensor) ? 1 : 0);
     }
 
-    const bool use_unified_cache = is_weight_buffer && ggml_sycl::unified_cache_enabled();
+    const bool use_unified_cache      = is_weight_buffer && ggml_sycl::unified_cache_enabled();
+    const bool buffer_is_host_pinned  = ctx->managed_alloc.tier == ggml_sycl::alloc_tier::HOST_PINNED;
+    const bool s1_canonical_host_src  = use_unified_cache && ggml_backend_sycl_weights_evictable() &&
+                                       (ggml_backend_buffer_is_host(buffer) || buffer_is_host_pinned);
     if (do_reorder && (adjusted_layout == GGML_LAYOUT_AOS || adjusted_layout == GGML_LAYOUT_XMX_TILED ||
                        adjusted_layout == GGML_LAYOUT_XMX_GEMM_TILED)) {
         do_reorder = false;
     }
     if (do_reorder && is_weight_buffer) {
-        if (ggml_backend_sycl_weights_evictable() && ggml_backend_buffer_is_host(buffer)) {
+        if (s1_canonical_host_src) {
             // Keep host AoS as the canonical source for layout conversions.
-            do_reorder = false;
-        } else if (ggml_backend_buffer_is_sycl(buffer)) {
-            // Device-resident weights should use unified cache layout paths.
             do_reorder = false;
         }
     }
-    if (use_unified_cache && do_reorder) {
-        // Always use unified cache for weight reordering (regardless of host/device residency).
-
+    if (s1_canonical_host_src && do_reorder) {
         do_reorder = false;
     }
     // Debug: trace CPU reorder decision for MXFP4
@@ -21182,6 +21180,7 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
         extra->layout.size        = reorder_size;
         extra->layout.owns_memory = false;
         extra->layout.device_id   = ctx->device;
+        extra->set_data_device(ctx->device, tensor->data, extra->layout.mode, true);
 
         extra->layout.qtype      = tensor->type;
         extra->layout.n_elements = ggml_nelements(tensor);
@@ -21209,8 +21208,11 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     //
     // Check the buffer's managed_alloc tier: if it's HOST_PINNED, the model
     // didn't fit in VRAM and we shouldn't eagerly fill VRAM with layouts.
-    const bool buffer_is_host_pinned = ctx->managed_alloc.tier == ggml_sycl::alloc_tier::HOST_PINNED;
-    const bool should_materialize    = (adjusted_layout != GGML_LAYOUT_AOS) && !is_moe_expert && !buffer_is_host_pinned;
+    const bool has_direct_device_layout =
+        do_cpu_reorder && extra && extra->layout.data_ptr == tensor->data &&
+        extra->layout.device_id == ctx->device && !buffer_is_host_pinned;
+    const bool should_materialize =
+        (adjusted_layout != GGML_LAYOUT_AOS) && !is_moe_expert && !buffer_is_host_pinned && !has_direct_device_layout;
     // Register AOS as the layout choice for MoE expert weights so layout
     // assertions pass during inference.  Expert cache handles SOA on-demand.
     if (use_unified_cache && is_moe_expert) {
@@ -26207,6 +26209,12 @@ static void * ggml_backend_sycl_host_buffer_get_base(ggml_backend_buffer_t buffe
     return ctx->ptr;
 }
 
+static void ggml_backend_sycl_host_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    auto * ctx = static_cast<sycl_host_buf_ctx *>(buffer->context);
+    GGML_ASSERT(ctx && ctx->ptr);
+    memset(ctx->ptr, value, buffer->size);
+}
+
 static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
                                                                              size_t                     size) {
     const bool weights_evictable = ggml_backend_sycl_weights_evictable();
@@ -26262,6 +26270,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggm
     buffer->context           = ctx;
     buffer->iface.get_base    = ggml_backend_sycl_host_buffer_get_base;
     buffer->iface.free_buffer = ggml_backend_sycl_host_buffer_free_buffer;
+    buffer->iface.clear       = ggml_backend_sycl_host_buffer_clear;
     return buffer;
 }
 
@@ -73742,8 +73751,14 @@ static void ggml_backend_sycl_device_get_props(ggml_backend_dev_t dev, ggml_back
 #else
     bool events = true;
 #endif
+    // During model loading, SYCL set_tensor has layout/metadata semantics for
+    // weights.  Upstream's async loader sends 1 MB chunks through
+    // set_tensor_async, which is intentionally just a raw queue copy.  Report
+    // async disabled only inside the model-load guard so load_all_data falls
+    // back to full-tensor set_tensor and the planned layout is materialized.
+    const bool async = !g_sycl_in_model_load.load(std::memory_order_acquire);
     props->caps = {
-        /* .async                 = */ true,
+        /* .async                 = */ async,
         /* .host_buffer           = */ host_buffer,
         /* .buffer_from_host_ptr  = */ false,
         /* .events                = */ events,

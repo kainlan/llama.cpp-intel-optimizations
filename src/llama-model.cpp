@@ -19,6 +19,9 @@
 
 #include "ggml.h"
 #include "ggml-cpp.h"
+#ifdef GGML_USE_SYCL
+#include "ggml-sycl.h"
+#endif
 
 #include <algorithm>
 #include <cassert>
@@ -34,6 +37,45 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#ifdef GGML_USE_SYCL
+static bool llama_model_buffer_is_sycl(ggml_backend_buffer_t buf) {
+    if (buf == nullptr) {
+        return false;
+    }
+    const char * name = ggml_backend_buffer_name(buf);
+    return name != nullptr && std::strncmp(name, GGML_SYCL_NAME, std::strlen(GGML_SYCL_NAME)) == 0;
+}
+
+static bool llama_model_buft_is_sycl(ggml_backend_buffer_type_t buft) {
+    if (buft == nullptr) {
+        return false;
+    }
+    const char * name = ggml_backend_buft_name(buft);
+    return name != nullptr && std::strncmp(name, GGML_SYCL_NAME, std::strlen(GGML_SYCL_NAME)) == 0;
+}
+
+struct llama_model_sycl_loading_guard {
+    bool active = false;
+
+    explicit llama_model_sycl_loading_guard(bool enabled) : active(enabled) {
+        if (active) {
+            ggml_backend_sycl_set_model_loading(true);
+        }
+    }
+
+    ~llama_model_sycl_loading_guard() {
+        finish();
+    }
+
+    void finish() {
+        if (active) {
+            ggml_backend_sycl_set_model_loading(false);
+            active = false;
+        }
+    }
+};
+#endif
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
@@ -1436,6 +1478,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+#ifdef GGML_USE_SYCL
+    bool has_sycl_weight_buft = false;
+    for (const auto & [buft, _] : ml.ctx_map) {
+        if (llama_model_buft_is_sycl(buft)) {
+            has_sycl_weight_buft = true;
+            break;
+        }
+    }
+    if (has_sycl_weight_buft && ml.use_mmap) {
+        LLAMA_LOG_INFO("%s: disabling mmap for SYCL weight layout upload\n", __func__);
+        ml.use_mmap = false;
+    }
+#endif
+
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
@@ -1446,6 +1502,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // Ensure we have enough capacity for the maximum backend buffer we will potentially create
     const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
     pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
+
+#ifdef GGML_USE_SYCL
+    bool has_sycl_weight_buffer = false;
+#endif
 
     for (auto & [buft, ctx_ptr] : ml.ctx_map) {
         ggml_context * ctx = ctx_ptr.get();
@@ -1523,6 +1583,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             // indicate that this buffer contains weights
             // this is used by ggml_backend_sched to improve op scheduling: ops that use a weight are preferably scheduled to the backend that contains the weight
             ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+#ifdef GGML_USE_SYCL
+            if (llama_model_buffer_is_sycl(buf.get())) {
+                has_sycl_weight_buffer = true;
+            }
+#endif
         }
 
         pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
@@ -1559,11 +1624,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     // load tensor data
+#ifdef GGML_USE_SYCL
+    llama_model_sycl_loading_guard sycl_loading_guard(has_sycl_weight_buffer);
+#endif
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
     }
+#ifdef GGML_USE_SYCL
+    sycl_loading_guard.finish();
+#endif
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
