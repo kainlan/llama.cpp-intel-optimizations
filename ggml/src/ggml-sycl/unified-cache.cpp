@@ -7150,20 +7150,20 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
 
     {
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-        if (g_runtime_alloc_registry.find(ptr) != g_runtime_alloc_registry.end()) {
-            GGML_LOG_ERROR("[UNIFIED-ALLOC] duplicate pointer registration ptr=%p size=%zu tier=%s\n", ptr, alloc_size,
-                           alloc_tier_name(tier));
-            // Arena zones handle their own accounting — no separate counter sub needed.
-            if (uses_pinned_pool && !zone_managed) {
-                if (auto * ucache = get_unified_cache_for_device(req.device)) {
-                    ucache->host_pool_free(ptr, alloc_size);
-                }
-            } else if (uses_pinned_pool) {
-                // Zone-managed host allocations are released by zone reset.
-            } else {
-                sycl::free(ptr, *req.queue);
+        if (auto dup = g_runtime_alloc_registry.find(ptr); dup != g_runtime_alloc_registry.end()) {
+            const auto & old = dup->second.handle;
+            GGML_SYCL_DEBUG(
+                "[UNIFIED-ALLOC] replacing stale pointer registration ptr=%p new_size=%zu new_tier=%s new_role=%d "
+                "new_category=%d new_zone=%d old_size=%zu old_tier=%s old_role=%d old_category=%d old_zone=%d "
+                "old_alloc_id=%llu old_cohort=%s\n",
+                ptr, alloc_size, alloc_tier_name(tier), (int) req.intent.role, (int) cat,
+                (int) rec.handle.vram_zone, old.size, alloc_tier_name(old.tier), (int) old.role, (int) old.category,
+                (int) old.vram_zone, (unsigned long long) old.alloc_id,
+                dup->second.cohort_id.empty() ? "(none)" : dup->second.cohort_id.c_str());
+            if (!dup->second.cohort_id.empty()) {
+                g_runtime_cohort_tier.erase(dup->second.cohort_id);
             }
-            return false;
+            g_runtime_alloc_registry.erase(dup);
         }
         g_runtime_alloc_registry.emplace(ptr, rec);
         if (!rec.cohort_id.empty()) {
@@ -11675,6 +11675,8 @@ static placement_priority tensor_to_placement_priority(tensor_usage usage, const
         case tensor_usage::NORM:
         case tensor_usage::EMBEDDING:
             return placement_priority::NORM_EMBED;
+        case tensor_usage::OUTPUT_WEIGHT:
+            return placement_priority::ATTENTION;
         case tensor_usage::ATTENTION_WEIGHT:
             return placement_priority::ATTENTION;
         case tensor_usage::FFN_WEIGHT:
@@ -12194,7 +12196,7 @@ static ggml_layout_mode planner_default_device_layout(const placement_tensor_inf
         return GGML_LAYOUT_SOA;
     }
     if (usage == tensor_usage::ATTENTION_WEIGHT || usage == tensor_usage::FFN_WEIGHT ||
-        usage == tensor_usage::EMBEDDING) {
+        usage == tensor_usage::EMBEDDING || usage == tensor_usage::OUTPUT_WEIGHT) {
         const ggml_layout_mode layout = layout_policy::get_optimal(tensor.type, usage, device_id);
         if (layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED) {
             return layout;
@@ -12217,7 +12219,7 @@ static ggml_layout_mode planner_default_device_layout(const placement_entry & en
     }
     const tensor_usage usage = infer_tensor_usage(entry.name.c_str());
     if (usage == tensor_usage::ATTENTION_WEIGHT || usage == tensor_usage::FFN_WEIGHT ||
-        usage == tensor_usage::EMBEDDING) {
+        usage == tensor_usage::EMBEDDING || usage == tensor_usage::OUTPUT_WEIGHT) {
         const ggml_layout_mode layout = layout_policy::get_optimal(entry.type, usage, device_id);
         if (layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED) {
             return layout;

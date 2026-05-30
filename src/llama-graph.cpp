@@ -12,6 +12,10 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#ifdef GGML_USE_SYCL
+#include "ggml-sycl.h"
+#endif
+
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -2048,6 +2052,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         if (v_trans) {
             v = ggml_transpose(ctx0, v);
         }
+
+#ifdef GGML_USE_SYCL
+        {
+            const enum ggml_type sycl_q_type = (enum ggml_type) GGML_SYCL_FATTN_Q_TYPE;
+            if (q->type != sycl_q_type) {
+                q = ggml_cast(ctx0, q, sycl_q_type);
+            }
+        }
+#endif
 
         // this can happen when KV cache is not used (e.g. an embedding model with non-causal attn)
         if (k->type == GGML_TYPE_F32) {

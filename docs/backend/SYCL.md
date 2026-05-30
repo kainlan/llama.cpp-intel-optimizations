@@ -9,6 +9,7 @@
 - [Linux](#linux)
 - [Windows](#windows)
 - [Environment Variable](#environment-variable)
+- [Memory placement](#memory-placement)
 - [Cross-device KV placement contract](#cross-device-kv-placement-contract)
 - [Known Issue](#known-issues)
 - [Q&A](#qa)
@@ -831,6 +832,19 @@ use 1 SYCL GPUs: [0] with Max compute units:512
 | GGML_SYCL_COPY_TO_DEVICE_SYNC | 0 (default) or 1 | Force legacy synchronous `copy_to_device_async` behavior for bringup/debug. |
 | ZES_ENABLE_SYSMAN | 0 (default) or 1 | Support to get free memory of GPU by sycl::aspect::ext_intel_free_memory.<br>Recommended to use when --split-mode = layer |
 | UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS | 0 (default) or 1 | Support malloc device memory more than 4GB.|
+
+## Memory placement
+
+SYCL builds use the unified cache as the memory placement authority. Model
+weights, KV cache, pinned host memory, and backend-visible SYCL buffers must be
+placed by the unified cache planner or by SYCL buffer types that delegate to it.
+
+The generic llama.cpp fit path (`-fit`, `--fit-target`, and `--fit-ctx`) is
+disabled for SYCL builds. That path rewrites `n_gpu_layers`, tensor split, and
+tensor buffer overrides before model loading, which duplicates and can conflict
+with unified cache placement. In SYCL builds, common initialization ignores
+`-fit on`, `llama-bench` ignores `--fit-target`/`--fit-ctx`, and direct calls to
+`common_fit_params()` return without modifying placement parameters.
 
 #### Flash Attention oneDNN Layout Policy
 

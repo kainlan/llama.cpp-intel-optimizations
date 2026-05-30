@@ -2428,8 +2428,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_MAIN_GPU"));
     add_opt(common_arg(
         { "-fit", "--fit" }, "[on|off]",
+#ifdef GGML_USE_SYCL
+        string_format("whether to adjust unset arguments to fit in device memory ('on' or 'off', disabled for SYCL unified cache, default: '%s')", params.fit_params ? "on" : "off"),
+#else
         string_format("whether to adjust unset arguments to fit in device memory ('on' or 'off', default: '%s')", params.fit_params ? "on" : "off"),
+#endif
         [](common_params & params, const std::string & value) {
+#ifdef GGML_USE_SYCL
+            if (is_truthy(value)) {
+                fprintf(stderr, "warning: --fit is disabled for SYCL builds; unified cache owns memory placement\n");
+                params.fit_params = false;
+            } else if (is_falsey(value)) {
+                params.fit_params = false;
+            } else {
+                throw std::runtime_error(
+                    string_format("error: unknown value for --fit: '%s'\n", value.c_str()));
+            }
+#else
             if (is_truthy(value)) {
                 params.fit_params = true;
             } else if (is_falsey(value)) {
@@ -2438,6 +2453,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::runtime_error(
                     string_format("error: unknown value for --fit: '%s'\n", value.c_str()));
             }
+#endif
         }
     ).set_env("LLAMA_ARG_FIT"));
     add_opt(common_arg(

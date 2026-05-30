@@ -68,6 +68,7 @@ static ggml_sycl_onednn_fa_layout_plan ggml_sycl_onednn_fa_reject(ggml_sycl_oned
 
 class onednn_fa_materialize_k_kernel;
 class onednn_fa_materialize_v_kernel;
+class onednn_fa_materialize_q_f32_kernel;
 class onednn_fa_materialized_release_marker_kernel;
 
 ggml_sycl_onednn_fa_layout_plan ggml_sycl_flash_attn_ext_onednn_plan(const fattn_params & params,
@@ -90,6 +91,9 @@ ggml_sycl_onednn_fa_layout_plan ggml_sycl_flash_attn_ext_onednn_plan(const fattn
     if (params.logit_softcap != 0) {
         return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::SOFTCAP_UNSUPPORTED);
     }
+    if (params.max_bias != 0.0f) {
+        return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::MAX_BIAS_UNSUPPORTED);
+    }
     if (kv_is_fp8) {
         return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::FP8_KV_UNSUPPORTED);
     }
@@ -111,11 +115,10 @@ ggml_sycl_onednn_fa_layout_plan ggml_sycl_flash_attn_ext_onednn_plan(const fattn
     if (H_q <= 0 || H_kv <= 0 || (H_q % H_kv) != 0) {
         return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::HEAD_RATIO_UNSUPPORTED);
     }
-    // The compiled partition is built with Q/K/V dtypes taken from params.*_type.
-    // Scale and scratch buffer sizing assumes f16 Q (sizeof(half) scale slot),
-    // and the existing path only supports f16 KV. Restrict to the well-tested
-    // combination until the scale buffer is generalized.
-    if (params.Q_type != GGML_TYPE_F16) {
+    // The compiled partition is built with Q/K/V dtypes taken from
+    // params.*_type. The scalar divisor is allocated with the same dtype as Q,
+    // so Mistral-style F32 Q + F16 KV can use the oneDNN PP path.
+    if (params.Q_type != GGML_TYPE_F16 && params.Q_type != GGML_TYPE_F32) {
         return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::Q_TYPE_UNSUPPORTED);
     }
     if (params.K_type != GGML_TYPE_F16) {
@@ -270,20 +273,111 @@ static sycl::event ggml_sycl_onednn_fa_materialize_one(sycl::queue &            
         });
 }
 
-static void ggml_sycl_release_materialized_after_event(ggml_sycl::alloc_handle k,
+static void ggml_sycl_release_materialized_after_event(ggml_sycl::alloc_handle q,
+                                                       ggml_sycl::alloc_handle k,
                                                        ggml_sycl::alloc_handle v,
                                                        sycl::event             event) {
-    std::thread([k = std::move(k), v = std::move(v), event = std::move(event)]() mutable {
+    std::thread([q = std::move(q), k = std::move(k), v = std::move(v), event = std::move(event)]() mutable {
         try {
             event.wait_and_throw();
         } catch (const std::exception & e) {
-            GGML_LOG_ERROR("[SYCL] oneDNN FA materialized K/V event wait failed: %s\n", e.what());
+            GGML_LOG_ERROR("[SYCL] oneDNN FA materialized Q/K/V event wait failed: %s\n", e.what());
         } catch (...) {
-            GGML_LOG_ERROR("[SYCL] oneDNN FA materialized K/V event wait failed with unknown exception\n");
+            GGML_LOG_ERROR("[SYCL] oneDNN FA materialized Q/K/V event wait failed with unknown exception\n");
         }
-        (void) ggml_sycl::unified_free(k);
-        (void) ggml_sycl::unified_free(v);
+        if (q.ptr) {
+            (void) ggml_sycl::unified_free(q);
+        }
+        if (k.ptr) {
+            (void) ggml_sycl::unified_free(k);
+        }
+        if (v.ptr) {
+            (void) ggml_sycl::unified_free(v);
+        }
     }).detach();
+}
+
+static bool ggml_sycl_flash_attn_ext_onednn_materialize_q_f32(const fattn_params &                  params,
+                                                              int                                   target_device,
+                                                              sycl::queue &                         stream,
+                                                              ggml_sycl_onednn_fa_materialized_kv * out,
+                                                              int32_t *                             out_nb1,
+                                                              int64_t *                             out_nb2,
+                                                              int64_t *                             out_nb3) {
+    if (!out || !out_nb1 || !out_nb2 || !out_nb3 || params.Q_type != GGML_TYPE_F32 || !params.Q) {
+        return false;
+    }
+    if (params.ne00 <= 0 || params.ne01 <= 0 || params.ne02 <= 0 || params.ne03 != 1 || target_device < 0) {
+        return false;
+    }
+
+    const int64_t D        = params.ne00;
+    const int64_t n_q      = params.ne01;
+    const int64_t H_q      = params.ne02;
+    const int64_t dst_nb1  = D * (int64_t) sizeof(sycl::half);
+    const int64_t dst_nb2  = dst_nb1 * n_q;
+    const int64_t dst_nb3  = dst_nb2 * H_q;
+    const size_t  q_bytes  = (size_t) dst_nb3;
+
+    ggml_sycl::alloc_request req{};
+    req.queue                               = &stream;
+    req.device                              = target_device;
+    req.size                                = q_bytes;
+    req.intent.role                         = ggml_sycl::alloc_role::GRAPH_TMP;
+    req.intent.category                     = ggml_sycl::runtime_category::GRAPH;
+    req.intent.cohort_id                    = "onednn-fa-q-materialized";
+    req.intent.constraints.must_device      = true;
+    req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;
+
+    if (!out->Q_alloc.allocate(req) || !out->Q_alloc.get()) {
+        return false;
+    }
+    out->Q          = out->Q_alloc.as_mem_handle();
+    auto q_resolved = out->Q.resolve(target_device);
+    if (!q_resolved || !q_resolved.on_device) {
+        out->Q_alloc.reset();
+        out->Q = {};
+        return false;
+    }
+
+    char *       dst     = static_cast<char *>(q_resolved.ptr);
+    const char * src     = params.Q;
+    const int64_t src_nb1 = params.nb01;
+    const int64_t src_nb2 = params.nb02;
+
+    try {
+        stream.parallel_for<onednn_fa_materialize_q_f32_kernel>(
+            sycl::range<3>((size_t) H_q, (size_t) n_q, (size_t) D), [=](sycl::id<3> idx) {
+                const int64_t h = (int64_t) idx[0];
+                const int64_t t = (int64_t) idx[1];
+                const int64_t d = (int64_t) idx[2];
+                const size_t  src_off =
+                    (size_t) h * (size_t) src_nb2 + (size_t) t * (size_t) src_nb1 + (size_t) d * sizeof(float);
+                const size_t dst_off =
+                    (size_t) h * (size_t) dst_nb2 + (size_t) t * (size_t) dst_nb1 + (size_t) d * sizeof(sycl::half);
+                reinterpret_cast<sycl::half *>(dst + dst_off)[0] =
+                    static_cast<sycl::half>(reinterpret_cast<const float *>(src + src_off)[0]);
+            }).wait_and_throw();
+    } catch (const std::exception & e) {
+        if (std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
+            fprintf(stderr, "[SYCL] fattn: oneDNN materialized Q repack failed: %s\n", e.what());
+        }
+        out->Q_alloc.reset();
+        out->Q = {};
+        return false;
+    } catch (...) {
+        if (std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
+            fprintf(stderr, "[SYCL] fattn: oneDNN materialized Q repack failed with unknown exception\n");
+        }
+        out->Q_alloc.reset();
+        out->Q = {};
+        return false;
+    }
+
+    *out_nb1 = (int32_t) dst_nb1;
+    *out_nb2 = dst_nb2;
+    *out_nb3 = dst_nb3;
+    return true;
 }
 
 bool ggml_sycl_flash_attn_ext_onednn_materialize_kv(const ggml_sycl_onednn_fa_materialization_desc & desc,
@@ -382,7 +476,7 @@ struct build_result {
     std::vector<lt>                 in_ports;
     std::vector<lt>                 out_ports;
     dnnl::graph::compiled_partition cp;
-    sycl::half *                    scale_usm = nullptr;
+    void *                          scale_usm = nullptr;
     sycl::queue *                   usm_queue = nullptr;
 
     build_result()                                 = default;
@@ -670,9 +764,14 @@ static build_result build_and_compile_sdpa(const sdpa_shape_key & key, const dnn
     // a runtime assertion at dispatch), so the divisor sqrt(D) is shape-
     // determined and a single buffer per compiled partition is correct for
     // all calls that reuse the partition.
-    sycl::half * scale_usm = static_cast<sycl::half *>(sycl::malloc_host(sizeof(sycl::half), *stream));
+    const size_t scale_bytes = (q_dt == dt::f32) ? sizeof(float) : sizeof(sycl::half);
+    void *       scale_usm   = sycl::malloc_host(scale_bytes, *stream);
     GGML_ASSERT(scale_usm && "oneDNN SDPA: failed to allocate USM scale buffer");
-    *scale_usm = static_cast<sycl::half>(sqrtf(static_cast<float>(key.D)));
+    if (q_dt == dt::f32) {
+        *static_cast<float *>(scale_usm) = sqrtf(static_cast<float>(key.D));
+    } else {
+        *static_cast<sycl::half *>(scale_usm) = static_cast<sycl::half>(sqrtf(static_cast<float>(key.D)));
+    }
 
     build_result r;
     r.in_ports  = std::move(in_ports);
@@ -772,6 +871,29 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
         active_params.nb21 = (int32_t) desc.v_target_nb1;
         active_params.nb22 = (int32_t) desc.v_target_nb2;
         active_params.nb23 = desc.v_target_nb3;
+    }
+    if (active_params.Q_type == GGML_TYPE_F32) {
+        int32_t q_nb1 = 0;
+        int64_t q_nb2 = 0;
+        int64_t q_nb3 = 0;
+        if (!ggml_sycl_flash_attn_ext_onednn_materialize_q_f32(active_params, ctx.device, *stream, &materialized,
+                                                               &q_nb1, &q_nb2, &q_nb3)) {
+            if (std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
+                fprintf(stderr,
+                        "[SYCL] fattn: oneDNN Q_F32_MATERIALIZE_FAILED D=%d ne01=%d H_q=%d\n",
+                        D, active_params.ne01, H_q);
+            }
+            return false;
+        }
+        auto q_resolved = materialized.Q.resolve(ctx.device);
+        if (!q_resolved || !q_resolved.on_device) {
+            return false;
+        }
+        active_params.Q       = static_cast<const char *>(q_resolved.ptr);
+        active_params.Q_type  = GGML_TYPE_F16;
+        active_params.nb01    = q_nb1;
+        active_params.nb02    = q_nb2;
+        active_params.nb03    = q_nb3;
     }
 
     sdpa_shape_key key;
@@ -944,10 +1066,10 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
     try {
         dnnl::stream dnnl_stream = ctx.stream_dnnl(stream);
         dnnl::graph::sycl_interop::execute(entry->cp, dnnl_stream, in_tensors, out_tensors);
-        if (layout_plan.kind == ggml_sycl_onednn_fa_layout_kind::MATERIALIZE_REQUIRED) {
+        if (materialized.Q_alloc || materialized.K_alloc || materialized.V_alloc) {
             sycl::event done = ggml_sycl_submit_marker<onednn_fa_materialized_release_marker_kernel>(*stream);
-            ggml_sycl_release_materialized_after_event(materialized.K_alloc.release(), materialized.V_alloc.release(),
-                                                       std::move(done));
+            ggml_sycl_release_materialized_after_event(materialized.Q_alloc.release(), materialized.K_alloc.release(),
+                                                       materialized.V_alloc.release(), std::move(done));
         }
     } catch (std::exception & e) {
         fprintf(stderr, "[SYCL] oneDNN SDPA execute failed: %s\n", e.what());

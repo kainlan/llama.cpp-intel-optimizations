@@ -2105,6 +2105,8 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
                 return "sinks-unsupported";
             case ggml_sycl_onednn_fa_layout_reason::SOFTCAP_UNSUPPORTED:
                 return "softcap-unsupported";
+            case ggml_sycl_onednn_fa_layout_reason::MAX_BIAS_UNSUPPORTED:
+                return "max-bias-unsupported";
             case ggml_sycl_onednn_fa_layout_reason::FP8_KV_UNSUPPORTED:
                 return "fp8-kv-unsupported";
             case ggml_sycl_onednn_fa_layout_reason::MULTI_SEQ_UNSUPPORTED:

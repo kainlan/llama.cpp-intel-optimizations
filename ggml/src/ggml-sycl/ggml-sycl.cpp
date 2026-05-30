@@ -16764,15 +16764,15 @@ layout_mode ggml_sycl_adjust_layout_for_tensor(const ggml_tensor * tensor, layou
     if (resolved == GGML_LAYOUT_COALESCED && !ggml_sycl_layout_supports_coalesced(tensor)) {
         resolved = GGML_LAYOUT_SOA;
     }
+    const tensor_usage usage = ggml_sycl_get_tensor_usage(tensor);
     if (resolved == GGML_LAYOUT_COALESCED && tensor->type == GGML_TYPE_Q8_0 &&
-        ggml_sycl_get_tensor_usage(tensor) == tensor_usage::EMBEDDING) {
+        (usage == tensor_usage::EMBEDDING || usage == tensor_usage::OUTPUT_WEIGHT)) {
         const int64_t ncols          = tensor->ne[0];
         const int64_t blocks_per_row = ncols > 0 ? ncols / QK8_0 : 0;
         if (blocks_per_row <= 0 || (ncols % QK8_0) != 0 || (blocks_per_row % MMVQ_COALESCED_TILE_BLOCKS) != 0) {
             // Q8_0 coalesced kernels support padded tail tiles, but the large
             // decode output projection pays for the padded K tile every token.
-            // Keep embedding/output weights on SOA unless the row is naturally
-            // tile-aligned.
+            // Keep embedding/output weights on SOA unless the row is naturally tile-aligned.
             resolved = GGML_LAYOUT_SOA;
         }
     }
@@ -66839,6 +66839,60 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
             (long long) t->nb[2], (long long) t->nb[3], ggml_is_contiguous(t) ? 1 : 0, ggml_is_permuted(t) ? 1 : 0,
             (const void *) t->view_src, (size_t) t->view_offs, t->data);
     };
+    auto prepare_rope_tables = [&](uint64_t key, int half_dim, int n_dims, int32_t position, float freq_base,
+                                   float * preferred_cos, float * preferred_sin, float ** out_cos,
+                                   float ** out_sin) -> bool {
+        auto rope_it = rope_cache_by_pos.find(key);
+        if (rope_it != rope_cache_by_pos.end()) {
+            *out_cos = rope_it->second.first;
+            *out_sin = rope_it->second.second;
+            return true;
+        }
+
+        std::vector<float> cos_cache(half_dim);
+        std::vector<float> sin_cache(half_dim);
+        for (int j = 0; j < half_dim; j++) {
+            const float theta = (float) position * powf(freq_base, -2.0f * (float) j / (float) n_dims);
+            cos_cache[j]      = cosf(theta);
+            sin_cache[j]      = sinf(theta);
+        }
+
+        if (preferred_cos && preferred_sin) {
+            q->memcpy(preferred_cos, cos_cache.data(), half_dim * sizeof(float));
+            q->memcpy(preferred_sin, sin_cache.data(), half_dim * sizeof(float));
+            rope_cache_by_pos.emplace(key, std::make_pair(preferred_cos, preferred_sin));
+            *out_cos = preferred_cos;
+            *out_sin = preferred_sin;
+            return true;
+        }
+
+        ggml_sycl::alloc_request rope_req;
+        rope_req.queue                          = q;
+        rope_req.device                         = ctx.device;
+        rope_req.size                           = half_dim * sizeof(float);
+        rope_req.intent.role                    = ggml_sycl::alloc_role::GRAPH_TMP;
+        rope_req.intent.category                = ggml_sycl::runtime_category::GRAPH;
+        rope_req.intent.constraints.must_device = true;
+        ggml_sycl::alloc_handle cos_alloc{};
+        ggml_sycl::alloc_handle sin_alloc{};
+        if (!ggml_sycl::unified_alloc(rope_req, &cos_alloc) || !ggml_sycl::unified_alloc(rope_req, &sin_alloc) ||
+            cos_alloc.ptr == nullptr || sin_alloc.ptr == nullptr) {
+            (void) ggml_sycl::unified_free(cos_alloc);
+            (void) ggml_sycl::unified_free(sin_alloc);
+            return false;
+        }
+
+        float * d_cos = static_cast<float *>(cos_alloc.ptr);
+        float * d_sin = static_cast<float *>(sin_alloc.ptr);
+        q->memcpy(d_cos, cos_cache.data(), half_dim * sizeof(float));
+        q->memcpy(d_sin, sin_cache.data(), half_dim * sizeof(float));
+        kernel.add_temp_device_alloc_handle(cos_alloc);
+        kernel.add_temp_device_alloc_handle(sin_alloc);
+        rope_cache_by_pos.emplace(key, std::make_pair(d_cos, d_sin));
+        *out_cos = d_cos;
+        *out_sin = d_sin;
+        return true;
+    };
 
     auto resolve_input_ptr = [&](const ggml_tensor * tensor, int layer) -> const void * {
         if (!tensor) {
@@ -67172,43 +67226,11 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
                                 static_cast<uint64_t>(static_cast<uint32_t>(n_dims));
                             float * d_cos   = nullptr;
                             float * d_sin   = nullptr;
-                            auto    rope_it = rope_cache_by_pos.find(rope_cache_key);
-                            if (rope_it != rope_cache_by_pos.end()) {
-                                d_cos = rope_it->second.first;
-                                d_sin = rope_it->second.second;
-                            } else {
-                                std::vector<float> cos_cache(half_dim);
-                                std::vector<float> sin_cache(half_dim);
-                                for (int j = 0; j < half_dim; j++) {
-                                    const float theta =
-                                        (float) position * powf(freq_base, -2.0f * (float) j / (float) n_dims);
-                                    cos_cache[j] = cosf(theta);
-                                    sin_cache[j] = sinf(theta);
-                                }
-                                ggml_sycl::alloc_request rope_req;
-                                rope_req.queue                          = q;
-                                rope_req.device                         = ctx.device;
-                                rope_req.size                           = half_dim * sizeof(float);
-                                rope_req.intent.role                    = ggml_sycl::alloc_role::GRAPH_TMP;
-                                rope_req.intent.category                = ggml_sycl::runtime_category::GRAPH;
-                                rope_req.intent.constraints.must_device = true;
-                                ggml_sycl::alloc_handle cos_alloc{};
-                                ggml_sycl::alloc_handle sin_alloc{};
-                                if (!ggml_sycl::unified_alloc(rope_req, &cos_alloc) ||
-                                    !ggml_sycl::unified_alloc(rope_req, &sin_alloc) || cos_alloc.ptr == nullptr ||
-                                    sin_alloc.ptr == nullptr) {
-                                    (void) ggml_sycl::unified_free(cos_alloc);
-                                    (void) ggml_sycl::unified_free(sin_alloc);
-                                    recipe_ok = false;
-                                    break;
-                                }
-                                d_cos = static_cast<float *>(cos_alloc.ptr);
-                                d_sin = static_cast<float *>(sin_alloc.ptr);
-                                q->memcpy(d_cos, cos_cache.data(), half_dim * sizeof(float));
-                                q->memcpy(d_sin, sin_cache.data(), half_dim * sizeof(float));
-                                kernel.add_temp_device_alloc_handle(cos_alloc);
-                                kernel.add_temp_device_alloc_handle(sin_alloc);
-                                rope_cache_by_pos.emplace(rope_cache_key, std::make_pair(d_cos, d_sin));
+                            if (!prepare_rope_tables(rope_cache_key, half_dim, n_dims, position, freq_base,
+                                                     const_cast<float *>(static_cast<const float *>(op->weights)),
+                                                     static_cast<float *>(op->aux), &d_cos, &d_sin)) {
+                                recipe_ok = false;
+                                break;
                             }
 
                             const int  mode    = ((int32_t *) node->op_params)[2];
@@ -67873,55 +67895,22 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
                             const uint64_t rope_cache_key =
                                 (static_cast<uint64_t>(static_cast<uint32_t>(position)) << 32) |
                                 static_cast<uint64_t>(static_cast<uint32_t>(n_dims));
-                            float * d_cos   = nullptr;
-                            float * d_sin   = nullptr;
-                            auto    rope_it = rope_cache_by_pos.find(rope_cache_key);
-                            if (rope_it != rope_cache_by_pos.end()) {
-                                d_cos = rope_it->second.first;
-                                d_sin = rope_it->second.second;
-                            } else {
-                                std::vector<float> cos_cache(half_dim);
-                                std::vector<float> sin_cache(half_dim);
-                                for (int j = 0; j < half_dim; j++) {
-                                    const float theta =
-                                        (float) position * powf(freq_base, -2.0f * (float) j / (float) n_dims);
-                                    cos_cache[j] = cosf(theta);
-                                    sin_cache[j] = sinf(theta);
-                                }
-                                ggml_sycl::alloc_request rope_req;
-                                rope_req.queue                          = q;
-                                rope_req.device                         = ctx.device;
-                                rope_req.size                           = half_dim * sizeof(float);
-                                rope_req.intent.role                    = ggml_sycl::alloc_role::GRAPH_TMP;
-                                rope_req.intent.category                = ggml_sycl::runtime_category::GRAPH;
-                                rope_req.intent.constraints.must_device = true;
-                                ggml_sycl::alloc_handle cos_alloc{};
-                                ggml_sycl::alloc_handle sin_alloc{};
-                                if (!ggml_sycl::unified_alloc(rope_req, &cos_alloc) ||
-                                    !ggml_sycl::unified_alloc(rope_req, &sin_alloc) || cos_alloc.ptr == nullptr ||
-                                    sin_alloc.ptr == nullptr) {
-                                    (void) ggml_sycl::unified_free(cos_alloc);
-                                    (void) ggml_sycl::unified_free(sin_alloc);
-                                    fast_path_ok = false;
-                                    break;
-                                }
-                                d_cos = static_cast<float *>(cos_alloc.ptr);
-                                d_sin = static_cast<float *>(sin_alloc.ptr);
-                                // Batch both uploads (in-order queue ensures completion before kernel)
-                                q->memcpy(d_cos, cos_cache.data(), half_dim * sizeof(float));
-                                q->memcpy(d_sin, sin_cache.data(), half_dim * sizeof(float));
-                                kernel.add_temp_device_alloc_handle(cos_alloc);
-                                kernel.add_temp_device_alloc_handle(sin_alloc);
-                                rope_cache_by_pos.emplace(rope_cache_key, std::make_pair(d_cos, d_sin));
+                            if (!kernel.get_op_descriptor(op_idx, op_desc) || op_desc.type != OperationType::ROPE) {
+                                fast_path_ok = false;
+                                break;
+                            }
+                            float * d_cos = nullptr;
+                            float * d_sin = nullptr;
+                            if (!prepare_rope_tables(rope_cache_key, half_dim, n_dims, position, freq_base,
+                                                     const_cast<float *>(static_cast<const float *>(op_desc.weights)),
+                                                     static_cast<float *>(op_desc.aux), &d_cos, &d_sin)) {
+                                fast_path_ok = false;
+                                break;
                             }
 
                             void * input_rope  = const_cast<void *>(resolve_input_ptr_no_materialize(node->src[0]));
                             void * output_rope = resolve_output_ptr(op_idx, node);
                             if (!input_rope || !output_rope || !ggml_is_contiguous(node)) {
-                                fast_path_ok = false;
-                                break;
-                            }
-                            if (!kernel.get_op_descriptor(op_idx, op_desc) || op_desc.type != OperationType::ROPE) {
                                 fast_path_ok = false;
                                 break;
                             }
@@ -69431,46 +69420,10 @@ full_build:
 
                     float * d_cos   = nullptr;
                     float * d_sin   = nullptr;
-                    auto    rope_it = rope_cache_by_pos.find(rope_cache_key);
-                    if (rope_it != rope_cache_by_pos.end()) {
-                        d_cos = rope_it->second.first;
-                        d_sin = rope_it->second.second;
-                    } else {
-                        // Build and upload RoPE cos/sin once per (position, n_dims).
-                        std::vector<float> cos_cache(half_dim);
-                        std::vector<float> sin_cache(half_dim);
-                        for (int j = 0; j < half_dim; j++) {
-                            const float theta = (float) position * powf(freq_base, -2.0f * (float) j / (float) n_dims);
-                            cos_cache[j]      = cosf(theta);
-                            sin_cache[j]      = sinf(theta);
-                        }
-
-                        ggml_sycl::alloc_request rope_req;
-                        rope_req.queue                          = q;
-                        rope_req.device                         = ctx.device;
-                        rope_req.size                           = half_dim * sizeof(float);
-                        rope_req.intent.role                    = ggml_sycl::alloc_role::GRAPH_TMP;
-                        rope_req.intent.category                = ggml_sycl::runtime_category::GRAPH;
-                        rope_req.intent.constraints.must_device = true;
-                        ggml_sycl::alloc_handle cos_alloc{};
-                        ggml_sycl::alloc_handle sin_alloc{};
-                        if (!ggml_sycl::unified_alloc(rope_req, &cos_alloc) ||
-                            !ggml_sycl::unified_alloc(rope_req, &sin_alloc) || cos_alloc.ptr == nullptr ||
-                            sin_alloc.ptr == nullptr) {
-                            GGML_LOG_ERROR("[PERSISTENT-TG] ROPE cache alloc failed (half_dim=%d)\n", half_dim);
-                            (void) ggml_sycl::unified_free(cos_alloc);
-                            (void) ggml_sycl::unified_free(sin_alloc);
-                            return false;
-                        }
-                        d_cos = static_cast<float *>(cos_alloc.ptr);
-                        d_sin = static_cast<float *>(sin_alloc.ptr);
-                        // Batch both uploads (in-order queue ensures completion before kernel)
-                        q->memcpy(d_cos, cos_cache.data(), half_dim * sizeof(float));
-                        q->memcpy(d_sin, sin_cache.data(), half_dim * sizeof(float));
-
-                        kernel.add_temp_device_alloc_handle(cos_alloc);
-                        kernel.add_temp_device_alloc_handle(sin_alloc);
-                        rope_cache_by_pos.emplace(rope_cache_key, std::make_pair(d_cos, d_sin));
+                    if (!prepare_rope_tables(rope_cache_key, half_dim, n_dims, position, freq_base, nullptr, nullptr,
+                                             &d_cos, &d_sin)) {
+                        GGML_LOG_ERROR("[PERSISTENT-TG] ROPE cache alloc failed (half_dim=%d)\n", half_dim);
+                        return false;
                     }
 
                     // Each graph ROPE op processes a single tensor (Q or K)
@@ -73941,6 +73894,13 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                     if (a_type == GGML_TYPE_MXFP4 && b->ne[1] > 1 && b->ne[2] <= 1) {
                         return false;
                     }
+                }
+                if (op->op == GGML_OP_MUL_MAT && ggml_is_quantized(a_type) &&
+                    (ggml_is_permuted(a) || !ggml_is_contiguous(a))) {
+                    // Quantized kernels decode blocks assuming canonical src0
+                    // strides.  A permuted/viewed quantized weight tensor needs
+                    // CPU fallback or an explicit contiguous materialization.
+                    return false;
                 }
                 if (op->op == GGML_OP_MUL_MAT && a_type == GGML_TYPE_Q4_0) {
                     // Q4_0 kernels currently do not handle broadcasted batch dims or large batch slices reliably.

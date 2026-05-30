@@ -24,8 +24,10 @@
 #    include <unordered_map>
 
 struct ggml_sycl_onednn_fa_materialized_kv {
+    ggml_sycl::scoped_unified_alloc Q_alloc;
     ggml_sycl::scoped_unified_alloc K_alloc;
     ggml_sycl::scoped_unified_alloc V_alloc;
+    ggml_sycl::mem_handle           Q;
     ggml_sycl::mem_handle           K;
     ggml_sycl::mem_handle           V;
 };
@@ -106,10 +108,10 @@ struct sdpa_shape_key_hash {
 // Per-shape cache entry: compiled_partition + port lists + a per-shape USM
 // scratch for the scalar Divide op.
 //
-// `scale_usm` is a sycl::half scalar buffer (sycl::malloc_host, pinned +
-// GPU-accessible via PCIe zero-copy). It is allocated AND populated exactly
-// once inside build_and_compile_sdpa() — which runs under the cache mutex —
-// so the execute path only READS it; there is no WRITE race.
+// `scale_usm` is a scalar buffer matching the Q dtype (sycl::malloc_host,
+// pinned + GPU-accessible via PCIe zero-copy). It is allocated AND populated
+// exactly once inside build_and_compile_sdpa() — which runs under the cache
+// mutex — so the execute path only READS it; there is no WRITE race.
 //
 // The value stored is the divisor sqrt(D) derived from `key.D` at compile
 // time. A runtime assertion at dispatch verifies that 1/params.scale matches
@@ -125,7 +127,7 @@ struct sdpa_compiled_entry {
     dnnl::graph::compiled_partition          cp;
     std::vector<dnnl::graph::logical_tensor> in_ports;
     std::vector<dnnl::graph::logical_tensor> out_ports;
-    sycl::half *                             scale_usm = nullptr;
+    void *                                   scale_usm = nullptr;
     sycl::queue *                            usm_queue = nullptr;
 
     sdpa_compiled_entry()                                        = default;
@@ -167,13 +169,13 @@ struct sdpa_partition_cache {
 };
 
 // Check whether the current op is eligible for the oneDNN graph SDPA path.
-// Eligibility returns true when: no sinks, no softcap, no FP8 KV, f16 Q/K/V
-// (and if mask is present, f16 or f32 mask), D <= 512, ncols >= 8 (PP batch),
-// not multi-seq. Device-USM-ness of Q/K/V is NOT checked here — that
-// rejection happens one level later inside ggml_sycl_flash_attn_ext_onednn
-// via the kDeviceVAThreshold guards, because the buffers can move between
-// host-pinned and device between eligibility and dispatch under
-// GGML_SYCL_HOST_COMPUTE / GGML_SYCL_KV_HOST.
+// Eligibility returns true when: no sinks, no softcap, no ALiBi/max-bias, no
+// FP8 KV, f16/f32 Q, f16 K/V (and if mask is present, f16 or f32 mask),
+// D <= 512, ncols >= 8 (PP batch), not multi-seq. Device-USM-ness of Q/K/V is
+// NOT checked here — that rejection happens one level later inside
+// ggml_sycl_flash_attn_ext_onednn via the kDeviceVAThreshold guards, because
+// the buffers can move between host-pinned and device between eligibility and
+// dispatch under GGML_SYCL_HOST_COMPUTE / GGML_SYCL_KV_HOST.
 // Caller must additionally check: !safe_decode, g_sycl_fa_onednn_enabled,
 // !g_sycl_paged_v2_enabled (all three are file-scope / template-local flags
 // that this function cannot see directly).

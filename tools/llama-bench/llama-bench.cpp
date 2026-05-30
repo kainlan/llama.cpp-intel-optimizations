@@ -418,8 +418,13 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -v, --verbose                               verbose output\n");
     printf("  --progress                                  print test progress indicators\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
+#ifdef GGML_USE_SYCL
+    printf("  -fitt, --fit-target <MiB>                   ignored for SYCL; unified cache owns memory placement\n");
+    printf("  -fitc, --fit-ctx <n>                        ignored for SYCL; unified cache owns memory placement\n");
+#else
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
+#endif
     if (llama_supports_rpc()) {
         printf("  -rpc, --rpc <rpc_servers>                   register RPC devices (comma separated)\n");
     }
@@ -2217,6 +2222,12 @@ int llama_bench(int argc, char ** argv) {
 
         bool do_fit = inst.fit_target != cmd_params_defaults.fit_params_target[0] ||
                       inst.fit_min_ctx != cmd_params_defaults.fit_params_min_ctx[0];
+#ifdef GGML_USE_SYCL
+        if (do_fit) {
+            fprintf(stderr, "llama-bench: --fit-target/--fit-ctx ignored for SYCL builds; unified cache owns memory placement\n");
+            do_fit = false;
+        }
+#endif
 
         std::vector<float> fit_tensor_split(llama_max_devices(), 0.0f);
         std::vector<llama_model_tensor_buft_override> fit_overrides(llama_max_tensor_buft_overrides(), {nullptr, nullptr});

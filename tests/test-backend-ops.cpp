@@ -1120,12 +1120,25 @@ struct test_case {
         return 1e-7;
     }
 
+    virtual double max_nmse_err(ggml_backend_t backend) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        // See https://github.com/ggml-org/llama.cpp/pull/22976 for explanation.
+        if (contains_f16 && strcmp(ggml_backend_reg_name(reg), "WebGPU") == 0) {
+            return std::max(max_nmse_err(), 1e-6);
+        }
+        return max_nmse_err();
+    }
+
     virtual double max_maa_err() {
         return 1e-4;
     }
 
     virtual double max_err() {
         return max_nmse_err();
+    }
+
+    virtual double max_err(ggml_backend_t backend) {
+        return max_nmse_err(backend);
     }
 
     virtual double err(const float * a, const float * b, size_t n) {
@@ -1182,6 +1195,8 @@ struct test_case {
 
     virtual bool run_whole_graph() { return false; }
 
+    virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
+
     ggml_cgraph * gf = nullptr;
     ggml_cgraph * gb = nullptr;
 
@@ -1192,6 +1207,18 @@ struct test_case {
     std::vector<ggml_tensor *> sentinels;
 
     std::string current_op_name;
+    bool contains_f16 = false;
+
+    // Used by the WebGPU backend to relax error thresholds on ops on f16 tensors.
+    void check_for_f16_tensor(ggml_context * ctx) {
+        contains_f16 = false;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_F16) {
+                contains_f16 = true;
+                break;
+            }
+        }
+    }
 
     void add_sentinel(ggml_context * ctx) {
         if (mode == MODE_PERF || mode == MODE_GRAD || mode == MODE_SUPPORT) {
@@ -1285,6 +1312,7 @@ struct test_case {
 
         ggml_tensor * out = build_graph(ctx);
         current_op_name   = op_desc(out);
+        check_for_f16_tensor(ctx);
 
         if (!matches_filter(out, op_names_filter)) {
             //printf("  %s: skipping\n", op_desc(out).c_str());
@@ -1449,7 +1477,7 @@ struct test_case {
             }
 
             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
-            const double tol = ud->tc->max_err() * g_nmse_tolerance_mult;
+            const double tol = ud->tc->max_err(ud->backend1) * g_nmse_tolerance_mult;
             if (err > tol) {
                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, tol);
                 //for (int i = 0; i < (int) f1.size(); i++) {

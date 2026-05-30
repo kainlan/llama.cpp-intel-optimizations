@@ -753,6 +753,12 @@ private:
         SRV_INF("loading model '%s'\n", params.model.path.c_str());
 
         params_base = params;
+#ifdef GGML_USE_SYCL
+        if (params_base.fit_params) {
+            SRV_WRN("%s", "--fit is disabled for SYCL builds; unified cache owns memory placement\n");
+            params_base.fit_params = false;
+        }
+#endif
 
         std::string & mmproj_path = params_base.mmproj.path;
         bool has_mmproj = !mmproj_path.empty();

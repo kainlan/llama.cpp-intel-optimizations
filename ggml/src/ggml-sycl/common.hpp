@@ -551,6 +551,7 @@ enum class tensor_usage : uint8_t {
     MOE_GATE,           // MoE routing gate
     MOE_INTERMEDIATE,   // MoE intermediate tensors (probs, indices, etc.)
     EMBEDDING,          // token embeddings
+    OUTPUT_WEIGHT,      // lm-head/output projection
     NORM,               // RMS/LayerNorm weights
 };
 
@@ -1174,7 +1175,18 @@ struct layout_policy {
             }
         }
 
-        // Embedding/output weights: Q8_0 has GET_ROWS and MMVQ coalesced paths.
+        // Output projection weights are consumed by MUL_MAT in decode; keep
+        // them on matmul-optimized layouts instead of embedding-safe layouts.
+        if (usage == tensor_usage::OUTPUT_WEIGHT) {
+            if (qtype == GGML_TYPE_Q8_0 && is_coalesced_supported(qtype)) {
+                return GGML_LAYOUT_COALESCED;
+            }
+            if (ggml_is_quantized(qtype)) {
+                return GGML_LAYOUT_SOA;
+            }
+        }
+
+        // Embedding weights: Q8_0 has GET_ROWS and MMVQ coalesced paths.
         // Dimension-specific filtering in ggml_sycl_adjust_layout_for_tensor keeps
         // non-tile-multiple rows on SOA when padded coalesced would add decode work.
         if (usage == tensor_usage::EMBEDDING) {
@@ -1271,8 +1283,14 @@ inline tensor_usage infer_tensor_usage(const char * name) {
         return tensor_usage::FFN_WEIGHT;
     }
 
+    // Standalone lm-head/output projection.  Do not classify this as an
+    // embedding: it is a MUL_MAT hot path during decode.
+    if (strcmp(name, "output.weight") == 0 || strstr(name, ".output.weight")) {
+        return tensor_usage::OUTPUT_WEIGHT;
+    }
+
     // Embeddings
-    if (strstr(name, "token_embd") || strstr(name, "output.weight")) {
+    if (strstr(name, "token_embd")) {
         return tensor_usage::EMBEDDING;
     }
 

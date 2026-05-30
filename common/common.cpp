@@ -1187,6 +1187,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto cparams = common_context_params_to_llama(params);
 
     if (params.fit_params) {
+#ifdef GGML_USE_SYCL
+        LOG_WRN("%s: -fit is ignored for SYCL builds; unified cache owns memory placement\n", __func__);
+#else
         LOG_INF("%s: fitting params to device memory ...\n", __func__);
         LOG_INF("%s: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n", __func__);
         common_fit_params(params.model.path.c_str(), &mparams, &cparams,
@@ -1195,6 +1198,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+#endif
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);

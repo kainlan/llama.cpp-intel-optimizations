@@ -772,6 +772,19 @@ enum common_params_fit_status common_fit_params(
         size_t * margins,
         uint32_t n_ctx_min,
         ggml_log_level log_level) {
+#ifdef GGML_USE_SYCL
+    GGML_UNUSED(path_model);
+    GGML_UNUSED(mparams);
+    GGML_UNUSED(cparams);
+    GGML_UNUSED(tensor_split);
+    GGML_UNUSED(tensor_buft_overrides);
+    GGML_UNUSED(margins);
+    GGML_UNUSED(n_ctx_min);
+    GGML_UNUSED(log_level);
+
+    LOG_WRN("%s: disabled for SYCL builds; unified cache owns memory placement\n", __func__);
+    return COMMON_PARAMS_FIT_STATUS_FAILURE;
+#else
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
@@ -787,6 +800,7 @@ enum common_params_fit_status common_fit_params(
     const int64_t t1_us = llama_time_us();
     LOG_TRC("%s: fitting params to free memory took %.2f seconds\n", __func__, (t1_us - t0_us) * 1e-6);
     return status;
+#endif
 }
 
 void common_memory_breakdown_print(const struct llama_context * ctx) {

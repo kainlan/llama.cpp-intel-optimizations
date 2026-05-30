@@ -5,6 +5,10 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#ifdef GGML_USE_SYCL
+#include "ggml-sycl.h"
+#endif
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -193,7 +197,11 @@ llama_kv_cache::llama_kv_cache(
 
         if (offload) {
             auto * dev = model.dev_layer(il);
+#ifdef GGML_USE_SYCL
+            buft = ggml_backend_sycl_kv_buffer_type_from_dev(dev);
+#else
             buft = ggml_backend_dev_buffer_type(dev);
+#endif
 
             dev_name = ggml_backend_dev_name(dev);
         }
