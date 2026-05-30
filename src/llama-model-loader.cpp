@@ -2,6 +2,9 @@
 
 #include "ggml-alloc.h"
 #include "ggml.h"
+#ifdef GGML_USE_SYCL
+#    include "ggml-sycl.h"
+#endif
 #include "gguf.h"
 #include "llama-hparams.h"
 
@@ -897,6 +900,15 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
         return true;
     }
 
+#ifdef GGML_USE_SYCL
+    if (ggml_backend_dev_backend_reg(dev) == ggml_backend_sycl_reg() && ggml_backend_sycl_weights_evictable()) {
+        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+        if (host_buft && buft == host_buft) {
+            return true;
+        }
+    }
+#endif
+
     ggml_init_params params = {
         /*.mem_size   =*/ ggml_tensor_overhead()*8,
         /*.mem_buffer =*/ NULL,
@@ -1029,8 +1041,38 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
 }
 
 // find the first buffer type in the list that can use the tensor
-static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t * buft_list) {
+static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams,
+                                                     ggml_tensor *         tensor,
+                                                     ggml_op               op,
+                                                     const buft_list_t *   buft_list,
+                                                     bool                  prefer_host_weights = false) {
     GGML_ASSERT(!buft_list->empty());
+#ifdef GGML_USE_SYCL
+    if (prefer_host_weights) {
+        ggml_backend_dev_t dev = buft_list->front().first;
+        if (ggml_backend_dev_backend_reg(dev) == ggml_backend_sycl_reg()) {
+            ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+            if (host_buft && ggml_backend_buft_is_host(host_buft) &&
+                weight_buft_supported(hparams, tensor, op, host_buft, dev)) {
+                return host_buft;
+            }
+        }
+
+        for (const auto & cur : *buft_list) {
+            ggml_backend_dev_t         cur_dev  = cur.first;
+            ggml_backend_buffer_type_t cur_buft = cur.second;
+            if (!ggml_backend_buft_is_host(cur_buft)) {
+                continue;
+            }
+            if (weight_buft_supported(hparams, tensor, op, cur_buft, cur_dev)) {
+                return cur_buft;
+            }
+        }
+    }
+#else
+    GGML_UNUSED(prefer_host_weights);
+#endif
+
     for (const auto & cur : *buft_list) {
         ggml_backend_dev_t cur_dev = cur.first;
         ggml_backend_buffer_type_t cur_buft = cur.second;
@@ -1074,6 +1116,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
         return it->second.get();
     };
+
+    ggml_backend_dev_t selected_layer_dev = nullptr;
+    llm_tensor         selected_tn_tensor = tn.tensor;
+    bool               selected_bias      = false;
 
     auto buft_for_tensor = [&](ggml_tensor * t_meta) -> ggml_backend_buffer_type_t {
         if (!t_meta) {
@@ -1150,6 +1196,18 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 GGML_ABORT("invalid layer %d for tensor %s", info.layer, tn.str().c_str());
         }
 
+        ggml_backend_dev_t layer_dev = buft_list->front().first;
+        selected_layer_dev           = layer_dev;
+        selected_tn_tensor           = tn_tensor;
+        selected_bias                = bias;
+
+        bool prefer_host_weights = false;
+#ifdef GGML_USE_SYCL
+        if (ggml_backend_dev_backend_reg(layer_dev) == ggml_backend_sycl_reg()) {
+            prefer_host_weights = ggml_backend_sycl_weights_evictable();
+        }
+#endif
+
         ggml_backend_buffer_type_t buft = nullptr;
 
         // check overrides
@@ -1181,7 +1239,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         if (!buft) {
-            buft = select_weight_buft(hparams, t_meta, op, buft_list);
+            buft = select_weight_buft(hparams, t_meta, op, buft_list, prefer_host_weights);
             if (!buft) {
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
             }
@@ -1189,7 +1247,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         // avoid using a host buffer when using mmap
         auto * buft_dev = ggml_backend_buft_get_device(buft);
-        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
+        bool   allow_host_buft_with_mmap = false;
+#ifdef GGML_USE_SYCL
+        if (prefer_host_weights && buft_dev && ggml_backend_dev_backend_reg(buft_dev) == ggml_backend_sycl_reg()) {
+            allow_host_buft_with_mmap = true;
+        }
+#endif
+        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev) && !allow_host_buft_with_mmap) {
             auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
             if (!cpu_dev) {
                 throw std::runtime_error("no CPU backend found");
@@ -1208,6 +1272,151 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         return buft;
+    };
+
+    auto register_sycl_tensor_metadata = [&](ggml_tensor * tensor) {
+#ifdef GGML_USE_SYCL
+        if (!tensor || selected_bias || !selected_layer_dev) {
+            return;
+        }
+        if (ggml_backend_dev_backend_reg(selected_layer_dev) != ggml_backend_sycl_reg()) {
+            return;
+        }
+
+        if (ggml_backend_sycl_weights_evictable()) {
+            ggml_backend_sycl_register_host_weight_tensor(selected_layer_dev, tensor);
+        }
+
+        auto usage_from_tensor = [](llm_tensor t) -> ggml_backend_sycl_tensor_usage {
+            switch (t) {
+                case LLM_TENSOR_ATTN_Q:
+                case LLM_TENSOR_ATTN_K:
+                case LLM_TENSOR_ATTN_V:
+                case LLM_TENSOR_ATTN_QKV:
+                case LLM_TENSOR_ATTN_OUT:
+                case LLM_TENSOR_ATTN_GATE:
+                case LLM_TENSOR_ATTN_Q_A:
+                case LLM_TENSOR_ATTN_Q_B:
+                case LLM_TENSOR_ATTN_KV_A_MQA:
+                case LLM_TENSOR_ATTN_KV_B:
+                case LLM_TENSOR_ATTN_K_B:
+                case LLM_TENSOR_ATTN_V_B:
+                case LLM_TENSOR_DEC_ATTN_Q:
+                case LLM_TENSOR_DEC_ATTN_K:
+                case LLM_TENSOR_DEC_ATTN_V:
+                case LLM_TENSOR_DEC_ATTN_OUT:
+                case LLM_TENSOR_DEC_CROSS_ATTN_Q:
+                case LLM_TENSOR_DEC_CROSS_ATTN_K:
+                case LLM_TENSOR_DEC_CROSS_ATTN_V:
+                case LLM_TENSOR_DEC_CROSS_ATTN_OUT:
+                case LLM_TENSOR_ENC_ATTN_Q:
+                case LLM_TENSOR_ENC_ATTN_K:
+                case LLM_TENSOR_ENC_ATTN_V:
+                case LLM_TENSOR_ENC_ATTN_OUT:
+                case LLM_TENSOR_POS_NET_ATTN_Q:
+                case LLM_TENSOR_POS_NET_ATTN_K:
+                case LLM_TENSOR_POS_NET_ATTN_V:
+                case LLM_TENSOR_POS_NET_ATTN_OUT:
+                case LLM_TENSOR_VISEXP_ATTN_QKV:
+                case LLM_TENSOR_VISEXP_ATTN_OUT:
+                    return GGML_SYCL_TENSOR_USAGE_ATTENTION_WEIGHT;
+
+                case LLM_TENSOR_FFN_GATE:
+                case LLM_TENSOR_FFN_DOWN:
+                case LLM_TENSOR_FFN_UP:
+                case LLM_TENSOR_FFN_ACT:
+                case LLM_TENSOR_FFN_GATE_SHEXP:
+                case LLM_TENSOR_FFN_DOWN_SHEXP:
+                case LLM_TENSOR_FFN_UP_SHEXP:
+                case LLM_TENSOR_FFN_LATENT_DOWN:
+                case LLM_TENSOR_FFN_LATENT_UP:
+                case LLM_TENSOR_DEC_FFN_GATE:
+                case LLM_TENSOR_DEC_FFN_DOWN:
+                case LLM_TENSOR_DEC_FFN_UP:
+                case LLM_TENSOR_ENC_FFN_GATE:
+                case LLM_TENSOR_ENC_FFN_DOWN:
+                case LLM_TENSOR_ENC_FFN_UP:
+                case LLM_TENSOR_VISEXP_FFN_GATE:
+                case LLM_TENSOR_VISEXP_FFN_DOWN:
+                case LLM_TENSOR_VISEXP_FFN_UP:
+                    return GGML_SYCL_TENSOR_USAGE_FFN_WEIGHT;
+
+                case LLM_TENSOR_FFN_GATE_INP:
+                case LLM_TENSOR_FFN_GATE_INP_SHEXP:
+                    return GGML_SYCL_TENSOR_USAGE_MOE_GATE;
+
+                case LLM_TENSOR_FFN_DOWN_EXP:
+                case LLM_TENSOR_FFN_GATE_EXP:
+                case LLM_TENSOR_FFN_UP_EXP:
+                case LLM_TENSOR_FFN_NORM_EXPS:
+                case LLM_TENSOR_FFN_DOWN_EXPS:
+                case LLM_TENSOR_FFN_GATE_EXPS:
+                case LLM_TENSOR_FFN_UP_EXPS:
+                case LLM_TENSOR_FFN_GATE_UP_EXPS:
+                case LLM_TENSOR_FFN_DOWN_CHEXPS:
+                case LLM_TENSOR_FFN_GATE_CHEXPS:
+                case LLM_TENSOR_FFN_UP_CHEXPS:
+                    return GGML_SYCL_TENSOR_USAGE_MOE_EXPERT_WEIGHT;
+
+                case LLM_TENSOR_TOKEN_EMBD:
+                case LLM_TENSOR_POS_EMBD:
+                case LLM_TENSOR_TOKEN_TYPES:
+                case LLM_TENSOR_PER_LAYER_TOKEN_EMBD:
+                case LLM_TENSOR_NEXTN_EMBED_TOKENS:
+                    return GGML_SYCL_TENSOR_USAGE_EMBEDDING;
+
+                case LLM_TENSOR_TOKEN_EMBD_NORM:
+                case LLM_TENSOR_OUTPUT_NORM:
+                case LLM_TENSOR_OUTPUT_NORM_LFM2:
+                case LLM_TENSOR_ATTN_NORM:
+                case LLM_TENSOR_ATTN_NORM_2:
+                case LLM_TENSOR_ATTN_Q_NORM:
+                case LLM_TENSOR_ATTN_K_NORM:
+                case LLM_TENSOR_ATTN_Q_A_NORM:
+                case LLM_TENSOR_ATTN_KV_A_NORM:
+                case LLM_TENSOR_ATTN_OUT_NORM:
+                case LLM_TENSOR_ATTN_POST_NORM:
+                case LLM_TENSOR_ATTN_SUB_NORM:
+                case LLM_TENSOR_FFN_NORM:
+                case LLM_TENSOR_FFN_POST_NORM:
+                case LLM_TENSOR_FFN_POST_NORM_1:
+                case LLM_TENSOR_FFN_POST_NORM_2:
+                case LLM_TENSOR_FFN_PRE_NORM_2:
+                case LLM_TENSOR_FFN_SUB_NORM:
+                case LLM_TENSOR_LAYER_OUT_NORM:
+                case LLM_TENSOR_POST_ATTN_NORM:
+                case LLM_TENSOR_POST_MLP_NORM:
+                case LLM_TENSOR_DEC_ATTN_NORM:
+                case LLM_TENSOR_DEC_CROSS_ATTN_NORM:
+                case LLM_TENSOR_DEC_FFN_NORM:
+                case LLM_TENSOR_DEC_OUTPUT_NORM:
+                case LLM_TENSOR_ENC_ATTN_NORM:
+                case LLM_TENSOR_ENC_FFN_NORM:
+                case LLM_TENSOR_ENC_OUTPUT_NORM:
+                case LLM_TENSOR_CLS_NORM:
+                case LLM_TENSOR_CONVNEXT_NORM:
+                case LLM_TENSOR_POS_NET_NORM:
+                case LLM_TENSOR_POS_NET_NORM1:
+                case LLM_TENSOR_POS_NET_NORM2:
+                case LLM_TENSOR_POS_NET_ATTN_NORM:
+                case LLM_TENSOR_INDEXER_K_NORM:
+                case LLM_TENSOR_NEXTN_ENORM:
+                case LLM_TENSOR_NEXTN_HNORM:
+                case LLM_TENSOR_NEXTN_SHARED_HEAD_NORM:
+                    return GGML_SYCL_TENSOR_USAGE_NORM;
+
+                case LLM_TENSOR_OUTPUT:
+                    return GGML_SYCL_TENSOR_USAGE_UNKNOWN;
+
+                default:
+                    return GGML_SYCL_TENSOR_USAGE_UNKNOWN;
+            }
+        };
+
+        ggml_backend_sycl_register_weight_usage(ggml_get_name(tensor), usage_from_tensor(selected_tn_tensor));
+#else
+        GGML_UNUSED(tensor);
+#endif
     };
 
     if (files.empty()) {
@@ -1245,6 +1454,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_context * ctx = ctx_for_buft(buft);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
+        register_sycl_tensor_metadata(ret);
         return ret;
     }
 
@@ -1259,6 +1469,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     if (flags & TENSOR_DUPLICATED) {
         ggml_tensor * t = ggml_get_tensor(ctx, tn.str().c_str());
         if (t) {
+            register_sycl_tensor_metadata(t);
             return t;
         }
     }
@@ -1281,6 +1492,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         n_created++;
     }
 
+    register_sycl_tensor_metadata(tensor);
     return tensor;
 }
 

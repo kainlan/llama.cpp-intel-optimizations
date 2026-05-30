@@ -1,6 +1,9 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#ifdef GGML_USE_SYCL
+#    include "ggml-sycl.h"
+#endif
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -247,6 +250,16 @@ llama_context::llama_context(
             }
             backends.emplace_back(backend);
         }
+
+#ifdef GGML_USE_SYCL
+        for (auto & backend : backends) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+            if (dev != nullptr && ggml_backend_dev_backend_reg(dev) == ggml_backend_sycl_reg()) {
+                ggml_backend_sycl_set_runtime_context(backend.get(), cparams.n_ctx, cparams.n_ubatch,
+                                                      cparams.n_seq_max);
+            }
+        }
+#endif
 
         // add ACCEL backends (such as BLAS)
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {

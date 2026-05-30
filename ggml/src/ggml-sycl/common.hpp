@@ -3161,6 +3161,16 @@ inline void ggml_sycl_refresh_cached_input_ptr(void * dst, const void * src, siz
 // Defined in ggml-sycl.cpp to avoid inlining a 100-line function.
 void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device);
 
+inline const ggml_tensor * ggml_sycl_view_root_and_offset(const ggml_tensor * tensor, size_t & view_offs) {
+    view_offs               = 0;
+    const ggml_tensor * cur = tensor;
+    while (cur && cur->view_src) {
+        view_offs += cur->view_offs;
+        cur = cur->view_src;
+    }
+    return cur;
+}
+
 // Hot path: 2 dereferences + 1 null check for common case (model fits in VRAM)
 // Input tensor refresh is handled by set_tensor (scheduler) and graph_refresh_input_tensors (replay),
 // NOT here — calling refresh here would add get_pointer_type() driver round-trips to every resolution.
@@ -3172,10 +3182,8 @@ inline void * ggml_sycl_get_data_ptr(const ggml_tensor * tensor, int device) {
     // before trusting the view's own cached direct handle. A view direct handle
     // can reflect an earlier host/main-device storage value.
     if (tensor->view_src != nullptr) {
-        const ggml_tensor * base = tensor->view_src;
-        while (base->view_src != nullptr) {
-            base = base->view_src;
-        }
+        size_t              view_offs = 0;
+        const ggml_tensor * base      = ggml_sycl_view_root_and_offset(tensor, view_offs);
 
         void * base_ptr             = nullptr;
         bool   base_on_device       = false;
@@ -3236,7 +3244,7 @@ inline void * ggml_sycl_get_data_ptr(const ggml_tensor * tensor, int device) {
         }
 
         if (base_ptr != nullptr) {
-            void * ptr = static_cast<char *>(base_ptr) + tensor->view_offs;
+            void * ptr = static_cast<char *>(base_ptr) + view_offs;
             if (tensor->extra != nullptr && device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
                 auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
                 extra->set_data_device(device, ptr, GGML_LAYOUT_AOS, base_on_device);

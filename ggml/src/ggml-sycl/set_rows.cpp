@@ -98,16 +98,7 @@ static bool ggml_sycl_set_rows_dst_device_accessible(const void * ptr, int owner
 }
 
 static const ggml_tensor * ggml_sycl_set_rows_root(const ggml_tensor * tensor, size_t & view_offs) {
-    view_offs = 0;
-    if (!tensor) {
-        return nullptr;
-    }
-    view_offs                = tensor->view_src ? tensor->view_offs : 0;
-    const ggml_tensor * root = tensor;
-    while (root->view_src) {
-        root = root->view_src;
-    }
-    return root;
+    return ggml_sycl_view_root_and_offset(tensor, view_offs);
 }
 
 static int ggml_sycl_set_rows_owner_device(const ggml_tensor * dst, int fallback_device) {
@@ -231,6 +222,94 @@ static void * ggml_sycl_set_rows_resolve_view_any_device(const ggml_tensor * ten
     return const_cast<void *>(ggml_sycl_host_data(tensor));
 }
 
+static const char * ggml_sycl_set_rows_alloc_type_name(const void * ptr) {
+    if (!ptr) {
+        return "null";
+    }
+    const auto * info = ggml_sycl::alloc_registry::instance().lookup(ptr);
+    if (!info) {
+        return "unregistered";
+    }
+    switch (info->type) {
+        case ggml_sycl::alloc_type::DEVICE:
+            return "device";
+        case ggml_sycl::alloc_type::HOST_PINNED:
+            return "host_pinned";
+        case ggml_sycl::alloc_type::SHARED:
+            return "shared";
+        case ggml_sycl::alloc_type::MMAP:
+            return "mmap";
+        default:
+            return "other";
+    }
+}
+
+static int ggml_sycl_set_rows_alloc_device(const void * ptr) {
+    if (!ptr) {
+        return ggml_sycl::mem_handle::HOST_DEVICE;
+    }
+    const auto * info = ggml_sycl::alloc_registry::instance().lookup(ptr);
+    return info ? info->device_id : ggml_sycl::mem_handle::HOST_DEVICE;
+}
+
+static void ggml_sycl_set_rows_log_tensor_resolution(const char * role, const ggml_tensor * tensor, int device) {
+    if (!tensor) {
+        GGML_LOG_ERROR("[SYCL] SET_ROWS plan fail %s: null tensor\n", role);
+        return;
+    }
+
+    size_t              view_offs = 0;
+    const ggml_tensor * root      = ggml_sycl_set_rows_root(tensor, view_offs);
+    if (!root) {
+        root = tensor;
+    }
+
+    bool   on_owner = false;
+    void * ptr      = ggml_sycl_set_rows_resolve_view_on_device(tensor, device, &on_owner);
+    GGML_LOG_ERROR(
+        "[SYCL] SET_ROWS plan fail %s: tensor=%s op=%s type=%s data=%p view_src=%s view_offs=%zu root=%s "
+        "root_data=%p root_extra=%p resolved=%p on_owner=%d alloc=%s alloc_dev=%d\n",
+        role, tensor->name ? tensor->name : "?", ggml_op_name(tensor->op), ggml_type_name(tensor->type), tensor->data,
+        tensor->view_src ? (tensor->view_src->name ? tensor->view_src->name : "?") : "none", view_offs,
+        root->name ? root->name : "?", root->data, root->extra, ptr, on_owner ? 1 : 0,
+        ggml_sycl_set_rows_alloc_type_name(ptr), ggml_sycl_set_rows_alloc_device(ptr));
+
+    if (root->extra && device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
+        auto * extra = static_cast<ggml_tensor_extra_gpu *>(root->extra);
+        for (int d = 0; d < ggml_sycl_info().device_count && d < GGML_SYCL_MAX_DEVICES; ++d) {
+            auto resolved = extra->data_handle[d].resolve(d);
+            GGML_LOG_ERROR(
+                "[SYCL] SET_ROWS plan fail %s root slot %d: raw=%p handle_ptr=%p handle_on_device=%d "
+                "handle_valid=%d alloc=%s alloc_dev=%d\n",
+                role, d, extra->data_device[d], resolved.ptr, resolved.on_device ? 1 : 0,
+                extra->data_handle[d].valid() ? 1 : 0, ggml_sycl_set_rows_alloc_type_name(resolved.ptr),
+                ggml_sycl_set_rows_alloc_device(resolved.ptr));
+        }
+    }
+}
+
+static void ggml_sycl_set_rows_log_plan_failure(const ggml_tensor *             dst,
+                                                const ggml_sycl_set_rows_plan & out,
+                                                bool                            src0_on_owner,
+                                                bool                            index_on_owner,
+                                                bool                            dst_on_owner,
+                                                bool                            dst_device_accessible) {
+    static std::atomic<int> log_count{ 0 };
+    if (log_count.fetch_add(1, std::memory_order_relaxed) >= 8) {
+        return;
+    }
+
+    GGML_LOG_ERROR(
+        "[SYCL] SET_ROWS plan failed: owner=%d src0=%p src0_on_owner=%d src0_stage=%d src0_device=%d "
+        "index=%p index_on_owner=%d index_stage=%d index_device=%d dst=%p dst_on_owner=%d dst_accessible=%d\n",
+        out.owner_device, out.src0_ptr, src0_on_owner ? 1 : 0, out.src0_needs_staging ? 1 : 0, out.src0_device,
+        out.index_ptr, index_on_owner ? 1 : 0, out.index_needs_staging ? 1 : 0, out.index_device, out.dst_ptr,
+        dst_on_owner ? 1 : 0, dst_device_accessible ? 1 : 0);
+    ggml_sycl_set_rows_log_tensor_resolution("src0", dst ? dst->src[0] : nullptr, out.owner_device);
+    ggml_sycl_set_rows_log_tensor_resolution("index", dst ? dst->src[1] : nullptr, out.owner_device);
+    ggml_sycl_set_rows_log_tensor_resolution("dst", dst, out.owner_device);
+}
+
 bool ggml_sycl_plan_set_rows(const ggml_tensor * dst, int fallback_device, ggml_sycl_set_rows_plan * plan) {
     if (!dst || !dst->src[0] || !dst->src[1] || !plan) {
         return false;
@@ -279,6 +358,8 @@ bool ggml_sycl_plan_set_rows(const ggml_tensor * dst, int fallback_device, ggml_
     const bool dst_device_accessible =
         ggml_sycl_set_rows_dst_device_accessible(out.dst_ptr, out.owner_device, dst_on_owner);
     if (!out.src0_ptr || !out.index_ptr || !out.dst_ptr || !dst_device_accessible) {
+        ggml_sycl_set_rows_log_plan_failure(dst, out, src0_on_owner, index_on_owner, dst_on_owner,
+                                            dst_device_accessible);
         return false;
     }
 

@@ -75,6 +75,176 @@ struct llama_model_sycl_loading_guard {
         }
     }
 };
+
+static bool llama_model_buft_backend_is_sycl(ggml_backend_buffer_type_t buft) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    return dev != nullptr && ggml_backend_dev_backend_reg(dev) == ggml_backend_sycl_reg();
+}
+
+static ggml_sycl_placement_envelope llama_model_sycl_make_placement_envelope() {
+    ggml_sycl_placement_envelope envelope = {};
+    envelope.n_ctx                        = 0;
+    envelope.n_ubatch                     = 0;
+    envelope.n_seq_max                    = 1;
+    envelope.flash_attn_type              = -1;
+    return envelope;
+}
+
+static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &         inventory,
+                                                std::vector<ggml_sycl_tensor_info> & tensors,
+                                                const bool *                         swa_layer_mask,
+                                                size_t                               total_size,
+                                                size_t                               max_pp_pipeline_weight_bytes,
+                                                const llama_hparams &                hparams) {
+    inventory                           = {};
+    inventory.tensors                   = tensors.data();
+    inventory.count                     = tensors.size();
+    inventory.total_size                = total_size;
+    inventory.pp_pipeline_scratch_bytes = max_pp_pipeline_weight_bytes * 2;
+    inventory.n_expert                  = hparams.n_expert;
+    inventory.n_expert_used             = hparams.n_expert_used;
+    inventory.n_layer                   = hparams.n_layer;
+    inventory.n_embd_k_gqa              = hparams.n_embd_k_gqa();
+    inventory.n_embd_v_gqa              = hparams.n_embd_v_gqa();
+    // Model loading no longer has runtime context params. Do not reserve
+    // train-context KV here; actual KV allocations are placed later by the
+    // unified cache once llama_context provides the real n_ctx.
+    inventory.n_ubatch                  = 512;
+    inventory.n_ctx                     = inventory.n_ubatch;
+    inventory.n_swa                     = hparams.n_swa;
+    inventory.n_swa_layers              = 0;
+    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+        if (hparams.is_swa(il)) {
+            inventory.n_swa_layers++;
+        }
+    }
+    inventory.swa_layer_mask       = swa_layer_mask;
+    inventory.swa_layer_mask_count = hparams.n_layer;
+}
+
+static void llama_model_sycl_apply_inventory(const ggml_sycl_tensor_inventory &   inventory,
+                                             const ggml_sycl_placement_envelope & envelope,
+                                             bool                                 early) {
+    for (int i = 0; i < ggml_backend_sycl_get_device_count(); ++i) {
+        ggml_backend_t sycl_backend = ggml_backend_sycl_init(i);
+        if (!sycl_backend) {
+            continue;
+        }
+        ggml_backend_sycl_set_placement_envelope(sycl_backend, &envelope);
+        if (early) {
+            ggml_backend_sycl_compute_placement_plan_early(sycl_backend, &inventory);
+        } else {
+            ggml_backend_sycl_set_tensor_inventory(sycl_backend, &inventory);
+        }
+        ggml_backend_free(sycl_backend);
+    }
+}
+
+static void llama_model_sycl_add_tensor_info(std::vector<ggml_sycl_tensor_info> & tensors,
+                                             size_t &                             total_size,
+                                             size_t &                             max_pp_pipeline_weight_bytes,
+                                             ggml_tensor *                        tensor) {
+    if (tensor == nullptr) {
+        return;
+    }
+    const size_t nbytes = ggml_nbytes(tensor);
+    if (nbytes == 0) {
+        return;
+    }
+
+    ggml_sycl_tensor_info info = {};
+    info.name                  = ggml_get_name(tensor);
+    info.size                  = nbytes;
+    info.type                  = tensor->type;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        info.ne[i] = tensor->ne[i];
+    }
+    tensors.push_back(info);
+    total_size += nbytes;
+    if (ggml_is_quantized(tensor->type)) {
+        const size_t fp16_bytes      = static_cast<size_t>(ggml_nelements(tensor)) * sizeof(ggml_fp16_t);
+        max_pp_pipeline_weight_bytes = std::max(max_pp_pipeline_weight_bytes, fp16_bytes);
+    }
+}
+
+static void llama_model_sycl_compute_early_plan(llama_model_loader &  ml,
+                                                const llama_hparams & hparams,
+                                                const char *          log_func) {
+    if (ml.no_alloc || ml.weights_map.empty()) {
+        return;
+    }
+
+    std::vector<ggml_sycl_tensor_info> tensors;
+    tensors.reserve(ml.weights_map.size());
+    size_t total_size                   = 0;
+    size_t max_pp_pipeline_weight_bytes = 0;
+    for (auto & weight : ml.weights_map) {
+        llama_model_sycl_add_tensor_info(tensors, total_size, max_pp_pipeline_weight_bytes, weight.second.tensor);
+    }
+    if (tensors.empty()) {
+        return;
+    }
+
+    std::unique_ptr<bool[]> swa_layer_mask(new bool[hparams.n_layer]);
+    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+        swa_layer_mask[il] = hparams.is_swa(il);
+    }
+
+    ggml_sycl_tensor_inventory inventory = {};
+    llama_model_sycl_populate_inventory(inventory, tensors, swa_layer_mask.get(), total_size,
+                                        max_pp_pipeline_weight_bytes, hparams);
+    const ggml_sycl_placement_envelope envelope = llama_model_sycl_make_placement_envelope();
+    llama_model_sycl_apply_inventory(inventory, envelope, true);
+
+    LLAMA_LOG_INFO("%s: SYCL early placement plan: %zu weights, %.2f GB (computed pre-create_tensor)\n", log_func,
+                   tensors.size(), total_size / (1024.0 * 1024.0 * 1024.0));
+}
+
+static void llama_model_sycl_set_late_inventory(llama_model_loader &  ml,
+                                                const llama_hparams & hparams,
+                                                const char *          log_func) {
+    if (ml.no_alloc) {
+        return;
+    }
+
+    LLAMA_LOG_INFO("%s: [SYCL] Starting tensor inventory collection (ctx_map size: %zu)\n", log_func,
+                   ml.ctx_map.size());
+
+    std::vector<ggml_sycl_tensor_info> tensors;
+    size_t                             total_size                   = 0;
+    size_t                             max_pp_pipeline_weight_bytes = 0;
+
+    for (auto & it : ml.ctx_map) {
+        ggml_backend_buffer_type_t buft = it.first;
+        if (!llama_model_buft_backend_is_sycl(buft)) {
+            continue;
+        }
+        ggml_context * ctx = it.second.get();
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            llama_model_sycl_add_tensor_info(tensors, total_size, max_pp_pipeline_weight_bytes, t);
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: [SYCL] Collected %zu tensors, %.2f GB total\n", log_func, tensors.size(),
+                   total_size / (1024.0 * 1024.0 * 1024.0));
+    if (tensors.empty()) {
+        return;
+    }
+
+    std::unique_ptr<bool[]> swa_layer_mask(new bool[hparams.n_layer]);
+    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+        swa_layer_mask[il] = hparams.is_swa(il);
+    }
+
+    ggml_sycl_tensor_inventory inventory = {};
+    llama_model_sycl_populate_inventory(inventory, tensors, swa_layer_mask.get(), total_size,
+                                        max_pp_pipeline_weight_bytes, hparams);
+    const ggml_sycl_placement_envelope envelope = llama_model_sycl_make_placement_envelope();
+    llama_model_sycl_apply_inventory(inventory, envelope, false);
+
+    LLAMA_LOG_INFO("%s: SYCL tensor inventory: %zu tensors, %.2f GB (enables unified placement before allocation)\n",
+                   log_func, tensors.size(), total_size / (1024.0 * 1024.0 * 1024.0));
+}
 #endif
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
@@ -952,6 +1122,15 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
     // add the device default buffer type
     buft_list.emplace_back(dev, ggml_backend_dev_buffer_type(dev));
 
+#ifdef GGML_USE_SYCL
+    if (ggml_backend_dev_backend_reg(dev) == ggml_backend_sycl_reg() && ggml_backend_sycl_weights_evictable()) {
+        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+        if (host_buft != nullptr) {
+            buft_list.emplace_back(dev, host_buft);
+        }
+    }
+#endif
+
     // add the device extra buffer type (if any)
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
     if (reg) {
@@ -1206,6 +1385,11 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
 }
 
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
+#ifdef GGML_USE_SYCL
+    llama_model_sycl_loading_guard sycl_model_loading_guard(true);
+    llama_model_sycl_compute_early_plan(ml, hparams, __func__);
+#endif
+
     const auto & split_mode   = params.split_mode;
     const auto & use_mlock    = params.use_mlock;
     const auto & tensor_split = params.tensor_split;
@@ -1479,9 +1663,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
 #ifdef GGML_USE_SYCL
+    llama_model_sycl_set_late_inventory(ml, hparams, __func__);
+
     bool has_sycl_weight_buft = false;
     for (const auto & [buft, _] : ml.ctx_map) {
-        if (llama_model_buft_is_sycl(buft)) {
+        if (llama_model_buft_is_sycl(buft) || llama_model_buft_backend_is_sycl(buft)) {
             has_sycl_weight_buft = true;
             break;
         }

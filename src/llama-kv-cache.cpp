@@ -110,6 +110,9 @@ llama_kv_cache::llama_kv_cache(
         }
     };
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+#ifdef GGML_USE_SYCL
+    std::map<ggml_backend_buffer_type_t, std::vector<uint8_t>, ggml_backend_buft_comparator> sycl_kv_layer_masks;
+#endif
 
     // create a context for each buffer type
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
@@ -213,6 +216,19 @@ llama_kv_cache::llama_kv_cache(
             throw std::runtime_error("failed to create ggml context for kv cache");
         }
 
+#ifdef GGML_USE_SYCL
+        ggml_backend_dev_t buft_dev = ggml_backend_buft_get_device(buft);
+        if (buft_dev != nullptr && ggml_backend_dev_backend_reg(buft_dev) == ggml_backend_sycl_reg()) {
+            auto & mask = sycl_kv_layer_masks[buft];
+            if (mask.empty()) {
+                mask.assign(hparams.n_layer, 0);
+            }
+            if (il < mask.size()) {
+                mask[il] = 1;
+            }
+        }
+#endif
+
         const bool has_k = true;
         const bool has_v = !is_mla;
 
@@ -268,6 +284,15 @@ llama_kv_cache::llama_kv_cache(
                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
             }
         } else {
+#ifdef GGML_USE_SYCL
+            ggml_backend_dev_t buft_dev = ggml_backend_buft_get_device(buft);
+            auto               mask_it  = sycl_kv_layer_masks.find(buft);
+            if (buft_dev != nullptr && ggml_backend_dev_backend_reg(buft_dev) == ggml_backend_sycl_reg() &&
+                mask_it != sycl_kv_layer_masks.end() && !mask_it->second.empty()) {
+                ggml_backend_sycl_push_kv_layer_mask_from_dev(buft_dev, mask_it->second.data(),
+                                                              static_cast<uint32_t>(mask_it->second.size()));
+            }
+#endif
             buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
         }
         if (!buf) {

@@ -7891,6 +7891,38 @@ static int ggml_sycl_device_id_from_backend_dev(ggml_backend_dev_t dev) {
     return -1;
 }
 
+static std::mutex                       g_pending_kv_layer_masks_mutex;
+static std::deque<std::vector<uint8_t>> g_pending_kv_layer_masks[GGML_SYCL_MAX_DEVICES];
+
+void ggml_backend_sycl_push_kv_layer_mask_from_dev(ggml_backend_dev_t dev,
+                                                   const uint8_t *    layer_mask,
+                                                   uint32_t           layer_count) {
+    const int device = ggml_sycl_device_id_from_backend_dev(dev);
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || layer_mask == nullptr || layer_count == 0) {
+        return;
+    }
+
+    std::vector<uint8_t>        mask(layer_mask, layer_mask + layer_count);
+    std::lock_guard<std::mutex> lock(g_pending_kv_layer_masks_mutex);
+    g_pending_kv_layer_masks[device].push_back(std::move(mask));
+}
+
+static std::vector<uint8_t> ggml_sycl_pop_kv_layer_mask(int device) {
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return {};
+    }
+
+    std::lock_guard<std::mutex> lock(g_pending_kv_layer_masks_mutex);
+    auto &                      queue = g_pending_kv_layer_masks[device];
+    if (queue.empty()) {
+        return {};
+    }
+
+    std::vector<uint8_t> mask = std::move(queue.front());
+    queue.pop_front();
+    return mask;
+}
+
 static void ggml_sycl_release_host_weight_extras(ggml_sycl_host_weight_release_mode mode) {
     std::lock_guard<std::mutex> lock(g_sycl_host_weight_extras_mutex);
     if (mode == ggml_sycl_host_weight_release_mode::registry_only) {
@@ -9049,7 +9081,10 @@ void ggml_backend_sycl_set_placement_envelope(ggml_backend_t backend, const ggml
     g_placement_envelope_set = true;
 }
 
-void ggml_backend_sycl_set_runtime_n_ctx(ggml_backend_t backend, uint32_t n_ctx) {
+void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
+                                           uint32_t       n_ctx,
+                                           uint32_t       n_ubatch,
+                                           uint32_t       n_seq_max) {
     if (!backend || n_ctx == 0) {
         return;
     }
@@ -9060,22 +9095,34 @@ void ggml_backend_sycl_set_runtime_n_ctx(ggml_backend_t backend, uint32_t n_ctx)
     }
 
     std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    if (n_ubatch > 0) {
+        g_placement_kv_info.n_ubatch = n_ubatch;
+    }
     g_placement_kv_info.n_ctx            = n_ctx;
     g_placement_kv_info.n_ctx_is_runtime = true;
 
     if (g_has_placement_plan) {
-        g_placement_plan.planner_n_ctx            = n_ctx;
-        g_placement_plan.planner_n_ctx_is_runtime = true;
+        g_placement_plan.update_runtime_kv_sizes(n_ctx, g_placement_kv_info.kv_bytes_per_layer(),
+                                                 g_placement_kv_info.kv_bytes_per_swa_layer());
     }
 
     if (auto * cache = ggml_sycl::get_unified_cache_for_device(ctx->device)) {
-        cache->update_placement_plan_runtime_n_ctx(n_ctx);
+        cache->update_placement_plan_runtime_kv(n_ctx, g_placement_kv_info.kv_bytes_per_layer(),
+                                                g_placement_kv_info.kv_bytes_per_swa_layer());
     }
 
     if (g_placement_kv_info.valid()) {
-        GGML_LOG_INFO("[SYCL-PLAN] Runtime n_ctx update: n_ctx=%u kv_per_layer=%.1f MB\n", g_placement_kv_info.n_ctx,
-                      g_placement_kv_info.kv_bytes_per_layer() / (1024.0 * 1024.0));
+        GGML_LOG_INFO(
+            "[SYCL-PLAN] Runtime context update: n_ctx=%u n_ubatch=%u n_seq_max=%u kv_per_layer=%.1f MB "
+            "kv_per_swa_layer=%.1f MB\n",
+            g_placement_kv_info.n_ctx, g_placement_kv_info.n_ubatch, n_seq_max,
+            g_placement_kv_info.kv_bytes_per_layer() / (1024.0 * 1024.0),
+            g_placement_kv_info.kv_bytes_per_swa_layer() / (1024.0 * 1024.0));
     }
+}
+
+void ggml_backend_sycl_set_runtime_n_ctx(ggml_backend_t backend, uint32_t n_ctx) {
+    ggml_backend_sycl_set_runtime_context(backend, n_ctx, 0, 1);
 }
 
 void ggml_backend_sycl_notify_compute_buffer_sizes(ggml_backend_t backend, const size_t * sizes, int n_sizes) {
@@ -13149,10 +13196,8 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
     // Views must resolve through the root on the requested physical device
     // before any cached per-view direct handle can win.
     if (tensor->view_src != nullptr) {
-        const ggml_tensor * base = tensor;
-        while (base->view_src) {
-            base = base->view_src;
-        }
+        size_t              view_offs = 0;
+        const ggml_tensor * base      = ggml_sycl_view_root_and_offset(tensor, view_offs);
 
         void * base_dev_ptr   = nullptr;
         bool   base_on_device = false;
@@ -13175,7 +13220,7 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
             }
         }
         if (base_dev_ptr != nullptr) {
-            void * result = static_cast<char *>(base_dev_ptr) + tensor->view_offs;
+            void * result = static_cast<char *>(base_dev_ptr) + view_offs;
             if (tensor->extra != nullptr && device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
                 auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
                 extra->set_data_device(device, result, GGML_LAYOUT_AOS, base_on_device);
@@ -13240,10 +13285,8 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
     // data_device unset.  Walk the view_src chain to find the base tensor
     // with a known device pointer, then compute the view offset.
     if (tensor->view_src != nullptr) {
-        const ggml_tensor * base = tensor;
-        while (base->view_src) {
-            base = base->view_src;
-        }
+        size_t              view_offs = 0;
+        const ggml_tensor * base      = ggml_sycl_view_root_and_offset(tensor, view_offs);
         GGML_SYCL_DEBUG(
             "ggml_sycl_get_data_ptr_slow: tensor=%s view_src chain -> base=%s, base->extra=%p, base->data=%p, "
             "tensor->data=%p\n",
@@ -13270,7 +13313,7 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
                 }
             }
             if (base_dev_ptr != nullptr) {
-                const size_t offset = tensor->view_offs;
+                const size_t offset = view_offs;
                 void *       result = static_cast<char *>(base_dev_ptr) + offset;
                 GGML_SYCL_DEBUG(
                     "ggml_sycl_get_data_ptr_slow: tensor=%s, device=%d, resolved via view_src %s + offset %zu = %p\n",
@@ -13311,7 +13354,7 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
                     base_alloc_info && (base_alloc_info->type == ggml_sycl::alloc_type::HOST_PINNED ||
                                         base_alloc_info->type == ggml_sycl::alloc_type::SHARED);
                 if (base_device_matches || base_host_accessible || base_ptr_type == sycl::usm::alloc::shared) {
-                    const size_t offset = tensor->view_offs;
+                    const size_t offset = view_offs;
                     void *       result = static_cast<char *>(base->data) + offset;
                     GGML_SYCL_DEBUG(
                         "ggml_sycl_get_data_ptr_slow: tensor=%s, device=%d, resolved via view_src base USM + offset "
@@ -17114,8 +17157,7 @@ static layout_mode ggml_sycl_select_moe_planned_graph_layout(const ggml_tensor *
                 }
                 return remember_layout(GGML_LAYOUT_SOA);
             }
-            if (secondary_supported &&
-                (moe_kind == MOE_TENSOR_GATE || moe_kind == MOE_TENSOR_UP)) {
+            if (secondary_supported && (moe_kind == MOE_TENSOR_GATE || moe_kind == MOE_TENSOR_UP)) {
                 if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                     fprintf(stderr,
                             "[GRAPH-MOE-LAYOUT] tensor=%s device=%d plan=1 selected=%s local=%zu secondary=%zu "
@@ -17375,7 +17417,13 @@ static bool moe_layer_descriptor_executor_enabled() {
             return std::atoi(explicit_env) != 0;
         }
         const char * layer_env = std::getenv("GGML_SYCL_MOE_LAYER_EXECUTOR");
-        return layer_env ? std::atoi(layer_env) != 0 : true;
+        if (layer_env) {
+            return std::atoi(layer_env) != 0;
+        }
+        // The descriptor executor must stay opt-in until it preserves the
+        // planner-owned MoE decode speed.  On B50 GPT-OSS it currently turns the
+        // default all-device path from ~40 tok/s into ~25 tok/s.
+        return false;
     }();
     return enabled;
 }
@@ -23085,32 +23133,65 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
     } else if (plan_cache && plan_cache->has_placement_plan() && !plan_cache->get_placement_plan().kv_device.empty()) {
         kv_plan = &plan_cache->get_placement_plan();
     }
-    if (kv_plan) {
-        mgr.configure_from_plan(device, *kv_plan, n_layers, size);
-    } else {
-        mgr.configure_with_weights(device, n_layers, kv_vram_cap, size);
-    }
+
+    const std::vector<uint8_t> explicit_layer_mask     = ggml_sycl_pop_kv_layer_mask(device);
+    const bool                 has_explicit_layer_mask = explicit_layer_mask.size() >= static_cast<size_t>(n_layers);
+    const uint32_t             explicit_layer_count =
+        has_explicit_layer_mask ?
+                        static_cast<uint32_t>(std::count_if(explicit_layer_mask.begin(), explicit_layer_mask.begin() + n_layers,
+                                                            [](uint8_t v) { return v != 0; })) :
+                        0;
 
     // Compute per-layer KV size.  Models with heterogeneous attention (e.g.
     // alternating SWA + full attention) create separate KV buffers for each
     // attention type.  We identify which buffer this is by matching its total
-    // size against the planner's expected per-type totals.
+    // size against the planner's expected per-type totals, unless llama_kv_cache
+    // provided exact layer membership for this buffer.
     const size_t   planner_full_kv = g_placement_kv_info.kv_bytes_per_layer();
     const size_t   planner_swa_kv  = g_placement_kv_info.kv_bytes_per_swa_layer();
     const uint32_t n_full_layers   = g_placement_kv_info.n_full_attn_layers();
     const uint32_t n_swa_layers    = g_placement_kv_info.n_swa_layers;
 
     // Identify this buffer by comparing its total size against expected totals.
-    // Full-attn buffer: n_full_layers * kv_per_full_layer
-    // SWA buffer: anything smaller that doesn't match the full-attn total
+    // Do not assume the SWA buffer is smaller: at short contexts the SWA
+    // window can equal the full KV size per layer, and models with more SWA
+    // layers than full-attention layers then have a larger SWA buffer.
     const size_t expected_full_total = planner_full_kv * n_full_layers;
+    const size_t expected_swa_total  = planner_swa_kv * n_swa_layers;
+    enum class kv_buffer_kind {
+        ALL_LAYERS,
+        FULL_ATTN_ONLY,
+        SWA_ONLY,
+    };
+    kv_buffer_kind buffer_kind = kv_buffer_kind::ALL_LAYERS;
+    if (!has_explicit_layer_mask && planner_full_kv > 0 && planner_swa_kv > 0 && n_full_layers > 0 &&
+        n_swa_layers > 0) {
+        const size_t full_diff = size > expected_full_total ? size - expected_full_total : expected_full_total - size;
+        const size_t swa_diff  = size > expected_swa_total ? size - expected_swa_total : expected_swa_total - size;
+        buffer_kind            = swa_diff < full_diff ? kv_buffer_kind::SWA_ONLY : kv_buffer_kind::FULL_ATTN_ONLY;
+    }
+    auto layer_in_this_kv_buffer = [&](uint32_t layer_id) {
+        if (has_explicit_layer_mask) {
+            return layer_id < explicit_layer_mask.size() && explicit_layer_mask[layer_id] != 0;
+        }
+        if (buffer_kind == kv_buffer_kind::ALL_LAYERS) {
+            return true;
+        }
+        const bool is_swa = g_placement_kv_info.is_swa_layer(layer_id);
+        return buffer_kind == kv_buffer_kind::SWA_ONLY ? is_swa : !is_swa;
+    };
+    const bool kv_buffer_covers_all_layers =
+        has_explicit_layer_mask ? explicit_layer_count == n_layers : buffer_kind == kv_buffer_kind::ALL_LAYERS;
     size_t       kv_per_layer;
     uint32_t     n_kv_layers;
-    if (planner_full_kv > 0 && n_full_layers > 0 && size >= expected_full_total * 9 / 10) {
+    if (has_explicit_layer_mask) {
+        n_kv_layers  = explicit_layer_count > 0 ? explicit_layer_count : n_layers;
+        kv_per_layer = size / n_kv_layers;
+    } else if (buffer_kind == kv_buffer_kind::FULL_ATTN_ONLY) {
         // Size matches expected full-attention total (within 10% for alignment)
         kv_per_layer = planner_full_kv;
-        n_kv_layers  = static_cast<uint32_t>(size / kv_per_layer);
-    } else if (n_swa_layers > 0 && size < expected_full_total * 9 / 10) {
+        n_kv_layers  = n_full_layers;
+    } else if (buffer_kind == kv_buffer_kind::SWA_ONLY) {
         // Smaller than full-attn total — this is the SWA buffer
         n_kv_layers  = n_swa_layers;
         kv_per_layer = size / n_kv_layers;
@@ -23124,8 +23205,59 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
                   kv_per_layer / (1024.0 * 1024.0), planner_full_kv / (1024.0 * 1024.0),
                   planner_swa_kv / (1024.0 * 1024.0), n_kv_layers, n_layers);
 
+    ggml_sycl::placement_plan runtime_kv_plan;
+    if (kv_plan && g_placement_kv_info.valid()) {
+        runtime_kv_plan = *kv_plan;
+        runtime_kv_plan.update_runtime_kv_sizes(g_placement_kv_info.n_ctx, planner_full_kv, planner_swa_kv);
+
+        size_t planned_device_bytes = 0;
+        for (uint32_t l = 0; l < n_layers; ++l) {
+            if (!layer_in_this_kv_buffer(l) || runtime_kv_plan.get_kv_device(static_cast<int>(l)) != device) {
+                continue;
+            }
+            planned_device_bytes += runtime_kv_plan.kv_size_for_layer(l);
+        }
+
+        if (planned_device_bytes > kv_vram_cap) {
+            size_t   replanned_device_bytes = 0;
+            uint32_t demoted_layers         = 0;
+            for (uint32_t l = 0; l < n_layers; ++l) {
+                if (!layer_in_this_kv_buffer(l) || runtime_kv_plan.get_kv_device(static_cast<int>(l)) != device) {
+                    continue;
+                }
+                const size_t layer_bytes = runtime_kv_plan.kv_size_for_layer(l);
+                if (replanned_device_bytes + layer_bytes <= kv_vram_cap) {
+                    replanned_device_bytes += layer_bytes;
+                } else {
+                    runtime_kv_plan.kv_device[static_cast<int>(l)] = -1;
+                    demoted_layers++;
+                }
+            }
+            runtime_kv_plan.refresh_kv_byte_totals();
+            GGML_LOG_INFO(
+                "[KV-TIER] Runtime KV placement resized for device %d: planned %.1f MB > available %.1f MB; "
+                "demoted %u layers to host for this KV buffer\n",
+                device, planned_device_bytes / (1024.0 * 1024.0), kv_vram_cap / (1024.0 * 1024.0), demoted_layers);
+        }
+
+        kv_plan = &runtime_kv_plan;
+    }
+
+    if (kv_plan) {
+        mgr.configure_from_plan(device, *kv_plan, n_layers, size);
+    } else {
+        mgr.configure_with_weights(device, n_layers, kv_vram_cap, size);
+    }
+
     // Compute per-layer layout from the tier manager.
     auto layout = mgr.compute_region_layout(size);
+    for (auto & region : layout) {
+        if (!layer_in_this_kv_buffer(region.layer_id)) {
+            region.size      = 0;
+            region.on_device = false;
+            region.offset    = 0;
+        }
+    }
 
     // Check env var override: GGML_SYCL_KV_HOT_PCT=N overrides tier manager placement.
     const char * hot_pct_env = std::getenv("GGML_SYCL_KV_HOT_PCT");
@@ -23138,21 +23270,45 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
     }
 
     uint32_t planned_device_layers = 0;
+    uint32_t planned_buffer_layers = 0;
     size_t   planned_kv_device     = 0;
     for (const auto & region : layout) {
+        if (!layer_in_this_kv_buffer(region.layer_id)) {
+            continue;
+        }
+        planned_buffer_layers++;
         if (region.on_device) {
             planned_device_layers++;
             planned_kv_device += region.size;
         }
     }
     planned_kv_device                  = std::min<size_t>(planned_kv_device, size);
-    const uint32_t planned_host_layers = n_layers > planned_device_layers ? n_layers - planned_device_layers : 0;
+    const uint32_t planned_host_layers =
+        planned_buffer_layers > planned_device_layers ? planned_buffer_layers - planned_device_layers : 0;
     const size_t   planned_kv_host     = size > planned_kv_device ? size - planned_kv_device : 0;
+    if (planned_kv_host > 0 && plan_cache && plan_cache->host_zones_configured()) {
+        const size_t used = plan_cache->host_zone_used(ggml_sycl::host_zone_id::KV);
+        const size_t cap  = plan_cache->host_zone_capacity(ggml_sycl::host_zone_id::KV);
+        if (used + planned_kv_host > cap) {
+            const size_t grow_by = used + planned_kv_host - cap;
+            if (plan_cache->host_zone_grow(ggml_sycl::host_zone_id::KV, grow_by)) {
+                GGML_LOG_INFO(
+                    "[KV-TIER] Grew host KV zone by %.1f MB for runtime context (used=%.1f MB, planned_host=%.1f "
+                    "MB)\n",
+                    grow_by / (1024.0 * 1024.0), used / (1024.0 * 1024.0), planned_kv_host / (1024.0 * 1024.0));
+            } else {
+                GGML_LOG_WARN("[KV-TIER] Host KV zone needs %.1f MB but capacity is %.1f MB and growth failed\n",
+                              (used + planned_kv_host) / (1024.0 * 1024.0), cap / (1024.0 * 1024.0));
+            }
+        }
+    }
     ggml_sycl_log_load_summary(device, planned_kv_device, planned_kv_host, planned_device_layers, planned_host_layers,
                                "planned");
 
-    const bool all_layers_on_device = std::all_of(
-        layout.begin(), layout.end(), [](const ggml_sycl::layer_region & region) { return region.on_device; });
+    const bool all_layers_on_device =
+        std::all_of(layout.begin(), layout.end(), [&](const ggml_sycl::layer_region & region) {
+            return !layer_in_this_kv_buffer(region.layer_id) || region.on_device;
+        });
 
     // === Per-layer allocation via unified_cache_allocate() ===
     // Each layer gets its own allocation (~100MB for Mistral 7B at n_ctx=10240)
@@ -23204,8 +23360,9 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
         }
     }
     const bool vmem_single_physical_owner = !kv_plan || (kv_plan_single_owner && kv_plan_owner == device);
-    if (kv_host_val != 1 && all_layers_on_device && vmem_single_physical_owner && size <= kv_device_budget &&
-        ggml_sycl::vram_arena_enabled() && ggml_sycl::vmem_kv_available(*buft_ctx->stream)) {
+    if (kv_host_val != 1 && kv_buffer_covers_all_layers && all_layers_on_device && vmem_single_physical_owner &&
+        size <= kv_device_budget && ggml_sycl::vram_arena_enabled() &&
+        ggml_sycl::vmem_kv_available(*buft_ctx->stream)) {
         auto   vmem              = std::make_unique<ggml_sycl::vmem_kv_pool>();
         // Reserve for the larger of: requested size vs actual per-layer total
         // (per-layer alignment can push total above size; heterogeneous layers
@@ -23307,6 +23464,9 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
         // Use the per-layer size from the region layout — heterogeneous for
         // models with SWA layers (SWA layers are much smaller than full-attn).
         const size_t layer_size           = (l < layout.size()) ? layout[l].size : aligned_per_layer;
+        if (!layer_in_this_kv_buffer(l) || layer_size == 0) {
+            continue;
+        }
         const int    planned_owner        = kv_plan ? kv_plan->get_kv_device(static_cast<int>(l)) :
                                                       ((l < layout.size() && layout[l].on_device) ? device : -1);
         const bool   planned_device_layer = planned_owner >= 0;
@@ -23452,6 +23612,9 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
     if (kv_plan) {
         uint32_t diverged = 0;
         for (uint32_t l = 0; l < n_layers; ++l) {
+            if (!layer_in_this_kv_buffer(l)) {
+                continue;
+            }
             const bool planned_on_device = (kv_plan->get_kv_device(static_cast<int>(l)) >= 0);
             const bool actual_on_dev     = actual_layer_on_device[l];
             if (planned_on_device != actual_on_dev) {
@@ -23465,7 +23628,7 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
         if (diverged > 0) {
             GGML_LOG_ERROR("[KV-TIER] %u/%u layers diverged from placement plan\n", diverged, n_layers);
         } else {
-            GGML_LOG_INFO("[KV-TIER] All %u layers match placement plan\n", n_layers);
+            GGML_LOG_INFO("[KV-TIER] All %u KV-buffer layers match placement plan\n", planned_buffer_layers);
         }
     }
 
@@ -23484,9 +23647,13 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
     int       arena_owner_device = -1;
     bool      arena_contiguous   = true;
     uintptr_t expected_next      = 0;
+    void *    arena_first_ptr    = nullptr;
     for (const auto & la : layer_allocs) {
         if (la.zone_h.ptr) {
             n_arena_layers++;
+            if (arena_first_ptr == nullptr) {
+                arena_first_ptr = la.ptr;
+            }
             if (arena_owner_device < 0) {
                 arena_owner_device = la.owner_device;
             } else if (arena_owner_device != la.owner_device) {
@@ -23509,10 +23676,11 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
     void *       alloc_base          = nullptr;
     bool         alloc_base_is_arena = false;
 
-    if (arena_kv_active && n_host_layers == 0 && n_device_layers == n_layers && n_arena_layers == n_layers &&
-        arena_single_owner && arena_owner_device == device && arena_contiguous) {
+    if (arena_kv_active && kv_buffer_covers_all_layers && planned_buffer_layers > 0 && n_host_layers == 0 &&
+        n_device_layers == planned_buffer_layers && n_arena_layers == planned_buffer_layers && arena_single_owner &&
+        arena_owner_device == device && arena_contiguous && arena_first_ptr != nullptr) {
         // All layers are contiguous in arena KV zone — use first layer's ptr
-        alloc_base          = layer_allocs[0].ptr;
+        alloc_base          = arena_first_ptr;
         alloc_base_is_arena = true;
         GGML_LOG_INFO("[KV-TIER] Using arena KV zone as alloc_base: %p (no synthetic base)\n", alloc_base);
     } else {
@@ -23579,11 +23747,12 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
 
     // Log placement summary
     if (n_device_layers == 0) {
-        GGML_LOG_INFO("[KV-TIER] Device %d: all %u KV layers on host (%.1f MB, per-layer alloc)%s\n", device, n_layers,
-                      size / (1024.0 * 1024.0), kv_host_val == 1 ? " (KV_HOST=1)" : " (VRAM exhausted)");
+        GGML_LOG_INFO("[KV-TIER] Device %d: all %u KV-buffer layers on host (%.1f MB, per-layer alloc)%s\n", device,
+                      planned_buffer_layers, size / (1024.0 * 1024.0),
+                      kv_host_val == 1 ? " (KV_HOST=1)" : " (VRAM exhausted)");
     } else if (n_host_layers == 0) {
-        GGML_LOG_INFO("[KV-TIER] Device %d: all %u KV layers on device (%.1f MB, per-layer alloc%s)\n", device,
-                      n_layers, size / (1024.0 * 1024.0), n_arena_layers > 0 ? ", arena KV zone" : "");
+        GGML_LOG_INFO("[KV-TIER] Device %d: all %u KV-buffer layers on device (%.1f MB, per-layer alloc%s)\n", device,
+                      planned_buffer_layers, size / (1024.0 * 1024.0), n_arena_layers > 0 ? ", arena KV zone" : "");
     } else {
         GGML_LOG_INFO(
             "[KV-TIER] Device %d: %u device layers (%.1f MB%s), "
@@ -33518,7 +33687,9 @@ static const ggml_tensor * ggml_sycl_attention_root(const ggml_tensor * tensor) 
 }
 
 static size_t ggml_sycl_attention_view_offset(const ggml_tensor * tensor) {
-    return tensor && tensor->view_src ? tensor->view_offs : 0;
+    size_t view_offs = 0;
+    (void) ggml_sycl_view_root_and_offset(tensor, view_offs);
+    return view_offs;
 }
 
 static bool ggml_sycl_attention_tensor_is_kv(const ggml_tensor * tensor) {
@@ -39019,7 +39190,11 @@ static bool ggml_sycl_materialize_moe_phase_layouts(ggml_backend_sycl_context & 
 static bool ggml_sycl_moe_runtime_phase_materialization_enabled() {
     static const bool enabled = []() {
         const char * env = std::getenv("GGML_SYCL_MOE_PHASE_MATERIALIZE");
-        return env ? std::atoi(env) != 0 : true;
+        // The unified-cache planner owns steady-state MoE layouts. Runtime
+        // phase rematerialization is a diagnostic escape hatch; enabling it by
+        // default can replace the planner-selected TG layout after PP and make
+        // decode substantially slower.
+        return env ? std::atoi(env) != 0 : false;
     }();
     return enabled;
 }
@@ -66205,12 +66380,7 @@ int ggml_sycl_test_extract_layer_index(const char * name) {
 }
 
 static const ggml_tensor * ggml_sycl_get_view_root(const ggml_tensor * tensor, size_t & view_offs) {
-    view_offs               = tensor ? tensor->view_offs : 0;
-    const ggml_tensor * cur = tensor;
-    while (cur && cur->view_src) {
-        cur = cur->view_src;
-    }
-    return cur;
+    return ggml_sycl_view_root_and_offset(tensor, view_offs);
 }
 
 static void * ggml_sycl_get_data_ptr_view(const ggml_tensor * tensor, int device) {

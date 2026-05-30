@@ -7046,14 +7046,13 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 // one chunk to add a fresh TLSF arena whose `largest_free_block`
                 // covers the request, then retry.
                 const size_t largest = ucache->host_zone_largest_free_block(zone);
-                if (largest >= alloc_size) {
-                    // There IS a single-chunk free block big enough, but the
-                    // first-attempt allocation lost to a race or alignment
-                    // detail. Do not grow — return failure so the caller
-                    // surfaces the real error.
-                    return nullptr;
-                }
-                const size_t need = alloc_size - largest + pinned_chunk_pool::DEFAULT_ALIGNMENT;
+                // `largest_free_block()` is byte-capacity only; TLSF alignment
+                // can still reject an allocation that nominally fits.  A failed
+                // first attempt means the zone cannot currently hand out this
+                // contiguous pointer, so grow a fresh chunk and retry instead
+                // of surfacing a false zone-capacity failure.
+                const size_t need = largest < alloc_size ? alloc_size - largest + pinned_chunk_pool::DEFAULT_ALIGNMENT :
+                                                           alloc_size + pinned_chunk_pool::DEFAULT_ALIGNMENT;
                 if (!ucache->host_zone_grow(zone, need)) {
                     return nullptr;
                 }
@@ -7087,6 +7086,18 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 // is itself backed by a single-chunk TLSF and returns nullptr
                 // rather than spanning chunks.
                 ptr = ucache->host_pool_alloc(alloc_size, pinned_chunk_pool::DEFAULT_ALIGNMENT);
+            }
+            if (!ptr && req.intent.constraints.use_pinned_pool && req.intent.role == alloc_role::KV) {
+                // Runtime contexts can legitimately need more host KV than the
+                // model-load provisional zone plan reserved.  Keep the
+                // allocation owned by unified_cache and ref-counted via
+                // alloc_handle, but fall back to the pinned pool rather than
+                // forcing a hard failure or a raw sycl::malloc_host escape.
+                ptr = ucache->host_pool_alloc(alloc_size, pinned_chunk_pool::DEFAULT_ALIGNMENT);
+                if (ptr) {
+                    uses_pinned_pool = true;
+                    zone_managed     = false;
+                }
             }
             uses_pinned_pool = (ptr != nullptr);
         }
@@ -10797,20 +10808,21 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     // through a zone) still fit in residual VRAM.  The arena is an eager TLSF
     // reservation, so consuming every byte of the public cache budget can
     // starve Level Zero even when the model itself is much smaller.  RUNTIME,
-    // SCRATCH, and ONEDNN allocations are already modeled as arena zones.
+    // SCRATCH, and ONEDNN allocations are already modeled as arena zones, so
+    // this headroom must cover only memory still outside the unified cache.
     // Caller passes total VRAM rather than us probing because this routine may
     // run inside ggml_sycl_init() static init, where a memory query would
     // reenter ggml_sycl_info() and deadlock.  Caller passes 0 to opt out of the
     // cap entirely.
     if (device_total_vram > 0) {
         constexpr size_t k_one_gib               = 1024ull * 1024ull * 1024ull;
-        constexpr size_t k_max_external_headroom = 4ull * k_one_gib;
-        const size_t     min_external_headroom   = std::min(k_one_gib, device_total_vram / 8);
-        const size_t     proportional_headroom   = device_total_vram / 3;
-        size_t           external_headroom =
-            std::min(k_max_external_headroom, std::max(min_external_headroom, proportional_headroom));
         const size_t caller_reserved_headroom =
             device_total_vram > budget_bytes ? device_total_vram - budget_bytes : 0;
+        constexpr size_t k_min_external_headroom = 512ull * 1024ull * 1024ull;
+        constexpr size_t k_max_external_headroom = 2ull * k_one_gib;
+        const size_t     queried_headroom =
+            std::min(k_max_external_headroom, std::max(k_min_external_headroom, device_total_vram / 16));
+        size_t external_headroom = std::max(caller_reserved_headroom, queried_headroom);
         if (const char * env = std::getenv("GGML_SYCL_VRAM_ARENA_EXTERNAL_HEADROOM_MB")) {
             const long parsed = std::strtol(env, nullptr, 10);
             if (parsed > 0) {

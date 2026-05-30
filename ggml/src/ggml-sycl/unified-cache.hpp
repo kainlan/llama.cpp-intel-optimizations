@@ -461,6 +461,60 @@ struct placement_plan {
         return it == layer_device.end() ? -1 : it->second;
     }
 
+    size_t kv_size_for_layer(uint32_t layer_id) const {
+        if (kv_per_swa_layer > 0 && layer_id < swa_layer_mask.size() && swa_layer_mask[layer_id]) {
+            return kv_per_swa_layer;
+        }
+        return kv_per_layer;
+    }
+
+    size_t kv_layer_count() const {
+        size_t n = swa_layer_mask.size();
+        for (const auto & [layer_id, _] : kv_device) {
+            if (layer_id >= 0) {
+                n = std::max(n, static_cast<size_t>(layer_id) + 1);
+            }
+        }
+        for (const auto & [layer_id, _] : layer_device) {
+            if (layer_id >= 0) {
+                n = std::max(n, static_cast<size_t>(layer_id) + 1);
+            }
+        }
+        return n;
+    }
+
+    void refresh_kv_byte_totals() {
+        kv_vram_bytes = 0;
+        kv_host_bytes = 0;
+
+        const size_t n_layers = kv_layer_count();
+        for (uint32_t l = 0; l < n_layers; ++l) {
+            const size_t kv_bytes = kv_size_for_layer(l);
+            if (kv_bytes == 0) {
+                continue;
+            }
+            if (get_kv_device(static_cast<int>(l)) >= 0) {
+                kv_vram_bytes += kv_bytes;
+            } else {
+                kv_host_bytes += kv_bytes;
+            }
+        }
+
+        vram_bytes = weight_vram_bytes + kv_vram_bytes;
+        host_bytes = weight_host_bytes + kv_host_bytes;
+        if (kv_host_bytes > host_zone_kv_bytes) {
+            host_zone_kv_bytes = kv_host_bytes;
+        }
+    }
+
+    void update_runtime_kv_sizes(uint32_t n_ctx, size_t full_kv_per_layer, size_t swa_kv_per_layer) {
+        planner_n_ctx            = n_ctx;
+        planner_n_ctx_is_runtime = true;
+        kv_per_layer             = full_kv_per_layer;
+        kv_per_swa_layer         = swa_kv_per_layer;
+        refresh_kv_byte_totals();
+    }
+
     expert_placement_result lookup_expert_placement(int layer_id, int expert_id, expert_tensor_role role) const {
         expert_placement_result result;
         result.layer_id  = layer_id;
@@ -1797,12 +1851,11 @@ class unified_cache {
         has_placement_plan_ = true;
     }
 
-    void update_placement_plan_runtime_n_ctx(uint32_t n_ctx) {
+    void update_placement_plan_runtime_kv(uint32_t n_ctx, size_t kv_per_layer, size_t kv_per_swa_layer) {
         if (!has_placement_plan_) {
             return;
         }
-        placement_plan_.planner_n_ctx            = n_ctx;
-        placement_plan_.planner_n_ctx_is_runtime = true;
+        placement_plan_.update_runtime_kv_sizes(n_ctx, kv_per_layer, kv_per_swa_layer);
     }
 
     bool plan_on_device(const std::string & tensor_name) const {

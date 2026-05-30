@@ -234,10 +234,25 @@ GGML_BACKEND_API int ggml_backend_sycl_planned_target_device(const char * tensor
 GGML_BACKEND_API void ggml_backend_sycl_set_placement_envelope(ggml_backend_t                              backend,
                                                                const struct ggml_sycl_placement_envelope * envelope);
 
-// Update the planner metadata with the runtime context size for the current
+// Update the planner metadata with the runtime context shape for the current
 // inference context. This does not retroactively re-place already loaded
-// weights, but it lets KV/runtime consumers distinguish train-context sizing
-// from the active context.
+// weights, but it lets KV/runtime consumers size cache/control allocations from
+// the active context instead of the model's training context.
+GGML_BACKEND_API void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
+                                                            uint32_t       n_ctx,
+                                                            uint32_t       n_ubatch,
+                                                            uint32_t       n_seq_max);
+
+// Provide the actual layer membership for the next KV buffer allocation on a
+// SYCL device. llama_kv_cache may create multiple same-sized KV buffers for
+// heterogeneous attention (for example non-SWA and SWA layers); the SYCL
+// unified-cache planner uses this mask instead of inferring membership from
+// byte size.
+GGML_BACKEND_API void ggml_backend_sycl_push_kv_layer_mask_from_dev(ggml_backend_dev_t dev,
+                                                                    const uint8_t *    layer_mask,
+                                                                    uint32_t           layer_count);
+
+// Backward-compatible helper for callers that only know n_ctx.
 GGML_BACKEND_API void ggml_backend_sycl_set_runtime_n_ctx(ggml_backend_t backend, uint32_t n_ctx);
 
 // Check if tiered memory mode is enabled for this backend.

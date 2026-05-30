@@ -6,6 +6,10 @@
 #include "llama-batch.h"
 #include "llama-model.h"
 
+#ifdef GGML_USE_SYCL
+#    include "ggml-sycl.h"
+#endif
+
 #include <algorithm>
 #include <cassert>
 #include <cstring>
@@ -84,7 +88,11 @@ llama_memory_recurrent::llama_memory_recurrent(
 
         if (offload) {
             auto * dev = model.dev_layer(i);
+#ifdef GGML_USE_SYCL
+            buft = ggml_backend_sycl_kv_buffer_type_from_dev(dev);
+#else
             buft = ggml_backend_dev_buffer_type(dev);
+#endif
 
             dev_name = ggml_backend_dev_name(dev);
         }
