@@ -257,18 +257,35 @@ ONEAPI_DEVICE_SELECTOR=level_zero:gpu ./build/bin/llama-bench ...   # all Level 
 
 ### Patched compute-runtime
 
-The system `libze_intel_gpu.so.1` is the patched build at:
+The system `libze_intel_gpu.so.1` is the patched 26.22/BMG-only build installed
+at:
 
 ```text
-/Apps/compute-runtime/build-26.09/bin/libze_intel_gpu.so.1.14.37435
+/usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1.15.38646
 ```
 
-It is installed via `dpkg-divert`; stock `1.14.37020` is preserved. The patched
-runtime fixes the m09zb `event.wait()` post-init hang during alloc-probe and
-cleanly enforces per-allocation hardware caps on Arc B580.
+It was built from `/Apps/compute-runtime-26.22-llama` branch
+`llama/26.22-cross-device`, based on `upstream/releases/26.22`, with the local
+wedged-i915 discovery fix, cross-device in-order dependency fixes, and the
+upstream PR 930 USM compression fix. The build is BMG-only because the installed
+IGC/ocloc does not recognize 26.22's future Xe3p/NVLP built-ins.
 
-Do not casually revert this runtime. Reverting to stock without restoring the old
-allocation probe can reintroduce silent oversized allocation hangs.
+It is installed through the diverted system library path; stock `1.14.37020` and
+the previous patched 26.09 files are preserved. Do not casually revert this
+runtime. To roll back to the prior patched 26.09 runtime without removing the
+diversion:
+
+```bash
+sudo ln -sfn libze_intel_gpu.so.1.14.37435.pre-single-device-default-ctx /usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1
+sudo ldconfig
+```
+
+Validation on 2026-05-30: `sycl-ls` reports the B580 and B50 Level Zero devices
+on driver `1.15.38646`, and a small GPT-OSS multi-GPU llama.cpp bench runs
+through the isolated/host-bounce path. Raw SYCL direct device-to-device USM copy
+between B580 and B50 still fails with `UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY`, so
+do not enable direct peer-copy/shared-context transfer paths by default unless a
+runtime probe proves they are safe.
 
 ### Performance Expectations
 

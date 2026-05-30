@@ -208,19 +208,39 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-backend-ops
 ```
 
-### Patched compute-runtime (system default as of 2026-04-25)
+### Patched compute-runtime (system default as of 2026-05-30)
 
-The system `libze_intel_gpu.so.1` is the **patched** build at `/Apps/compute-runtime/build-26.09/bin/libze_intel_gpu.so.1.14.37435` (branch `fix/combined-26.09`). Installed via `dpkg-divert` so apt won't overwrite. The stock 1.14.37020 is preserved at `/usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1.14.37020.stock`.
+The system `libze_intel_gpu.so.1` is the patched 26.22/BMG-only build installed at
+`/usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1.15.38646` from
+`/Apps/compute-runtime-26.22-llama` branch `llama/26.22-cross-device`. The build
+is based on `upstream/releases/26.22` and carries the local wedged-i915 discovery
+fix, the cross-device in-order dependency fixes, and the upstream PR 930 USM
+compression fix. It was configured with `SUPPORT_GEN_DEFAULT=FALSE`,
+`SUPPORT_PLATFORM_DEFAULT=FALSE`, and `SUPPORT_BMG=TRUE` because the installed
+IGC/ocloc does not recognize 26.22's future Xe3p/NVLP built-ins.
 
-The patched runtime fixes the **m09zb wedge** (`event.wait()` post-init hang during alloc-probe). Reverting to stock will reintroduce that wedge. To revert if needed:
+The install still uses the diverted system library path; stock `1.14.37020` is
+preserved at `/usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1.14.37020.stock`.
+The previous patched 26.09 files are also preserved. To roll back to the prior
+patched runtime without removing the diversion:
 
 ```bash
-sudo dpkg-divert --rename --remove /usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1.14.37020
-sudo ln -sf libze_intel_gpu.so.1.14.37020 /usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1
+sudo ln -sfn libze_intel_gpu.so.1.14.37435.pre-single-device-default-ctx /usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1
 sudo ldconfig
 ```
 
-The patched runtime correctly enforces per-allocation hardware caps (~1.5 GB on Arc B580). Historically the alloc probe in `ggml_sycl_init` did a binary-search of `sycl::malloc_device`/`sycl::free` to converge on `safe_max_alloc_size` (~1593 MB observed) — but on patched libze 1.14.37435 every freed probe chunk lingers in the L0 USM pool's internal cache, eating residual VRAM and surfacing later as `ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` at first kernel launch (mislabeled as `UR_RESULT_ERROR_OUT_OF_RESOURCES` / `40` in SYCL exception text). Commit `28ef6cea1` removed the probe and switched to `safe_max_alloc_size = floor(max_mem_alloc_size * 0.95)` directly — empirically validated against the bench gate (PP512 ≥ 1700, TG128 ≥ 80) on patched libze. **Reverting to stock libze 1.14.37020 without restoring the probe will reintroduce the original silent-oversize-alloc-wedge mode** that the probe was designed to defend against — stock historically accepted oversized allocs that hung at runtime, while patched libze 1.14.37435 fails them cleanly so the direct formula is safe on the supported config.
+Validation on 2026-05-30:
+`sycl-ls` reports B580 and B50 Level Zero devices on driver `1.15.38646`, and
+`ONEAPI_DEVICE_SELECTOR=level_zero:0,1` can run a small GPT-OSS bench through
+llama.cpp's isolated/host-bounce path. Raw SYCL direct device-to-device USM copy
+between B580 and B50 still fails with `UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY`, so
+do not enable direct peer-copy or shared-context transfer paths by default unless
+a runtime probe proves they are safe on the active driver.
+
+The patched runtime still fixes the m09zb `event.wait()` post-init hang during
+alloc-probe and cleanly enforces per-allocation hardware caps. Reverting to stock
+without restoring the old allocation probe can reintroduce silent oversized
+allocation hangs.
 
 ### SYCL Device Selection
 
