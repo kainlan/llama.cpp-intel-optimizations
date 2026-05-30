@@ -231,11 +231,21 @@ sudo ldconfig
 
 Validation on 2026-05-30:
 `sycl-ls` reports B580 and B50 Level Zero devices on driver `1.15.38646`, and
-`ONEAPI_DEVICE_SELECTOR=level_zero:0,1` can run a small GPT-OSS bench through
-llama.cpp's isolated/host-bounce path. Raw SYCL direct device-to-device USM copy
-between B580 and B50 still fails with `UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY`, so
-do not enable direct peer-copy or shared-context transfer paths by default unless
-a runtime probe proves they are safe on the active driver.
+`ONEAPI_DEVICE_SELECTOR=level_zero:0,1` can run a full GPT-OSS bench through
+llama.cpp's isolated/host-bounce path. Raw SYCL and Level Zero direct
+device-to-device USM copy between B580 and B50 still fails
+(`UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` / `ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY`),
+and importing a B580 device allocation on the B50 returns
+`ZE_RESULT_ERROR_INVALID_ARGUMENT`. Kernel logs report:
+
+```text
+xe 0000:03:00.0: cannot be used for peer-to-peer DMA as the client and provider (0000:07:00.0) do not share an upstream bridge or whitelisted host bridge
+```
+
+This is a PCI P2PDMA/topology restriction, not just a compute-runtime selector
+bug. Do not enable direct peer-copy or shared-context transfer paths by default
+unless a runtime probe proves they are safe on the active hardware, kernel, and
+driver.
 
 The patched runtime still fixes the m09zb `event.wait()` post-init hang during
 alloc-probe and cleanly enforces per-allocation hardware caps. Reverting to stock
