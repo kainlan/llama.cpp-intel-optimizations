@@ -187,19 +187,19 @@ struct placement_alternate_layout {
 };
 
 struct expert_placement_result {
-    expert_placement_status status    = expert_placement_status::MISSING;
-    int                     layer_id  = -1;
-    int                     expert_id = -1;
-    expert_tensor_role      role      = expert_tensor_role::UNKNOWN;
-    std::string             tensor_name;
-    bool                    on_device        = false;
-    int                     target_device    = -1;
-    size_t                  src_size         = 0;
-    size_t                  dst_size         = 0;
-    size_t                  vram_charge_size = 0;
-    ggml_layout_mode        layout           = GGML_LAYOUT_AOS;
+    expert_placement_status                 status    = expert_placement_status::MISSING;
+    int                                     layer_id  = -1;
+    int                                     expert_id = -1;
+    expert_tensor_role                      role      = expert_tensor_role::UNKNOWN;
+    std::string                             tensor_name;
+    bool                                    on_device        = false;
+    int                                     target_device    = -1;
+    size_t                                  src_size         = 0;
+    size_t                                  dst_size         = 0;
+    size_t                                  vram_charge_size = 0;
+    ggml_layout_mode                        layout           = GGML_LAYOUT_AOS;
     std::vector<placement_alternate_layout> alternate_layouts;
-    placement_priority      priority         = placement_priority::COUNT;
+    placement_priority                      priority = placement_priority::COUNT;
 
     bool found() const { return status == expert_placement_status::FOUND; }
 };
@@ -237,11 +237,11 @@ struct placement_entry {
     int                layer_id          = -1;  // Layer number (earlier = higher priority within same level)
     int                expert_id         = -1;  // -1 for dense weights, >=0 for individual MoE experts
     expert_tensor_role expert_role       = expert_tensor_role::UNKNOWN;  // gate/up/down for MoE expert tensors
-    ggml_layout_mode   layout            = GGML_LAYOUT_AOS;  // Materialized device layout planned for this entry
-    std::vector<placement_alternate_layout> alternate_layouts;  // Additional cache-owned executable layouts
-    bool               on_device         = false;            // true = VRAM (any device), false = host
-    int                target_device     = -1;               // Target GPU device_id (-1 = host/CPU)
-    size_t             vram_charge_size  = 0;  // Bytes consumed by zone_alloc(WEIGHT) after allocator rounding
+    ggml_layout_mode   layout            = GGML_LAYOUT_AOS;         // Materialized device layout planned for this entry
+    std::vector<placement_alternate_layout> alternate_layouts;      // Additional cache-owned executable layouts
+    bool                                    on_device     = false;  // true = VRAM (any device), false = host
+    int                                     target_device = -1;     // Target GPU device_id (-1 = host/CPU)
+    size_t vram_charge_size = 0;  // Bytes consumed by zone_alloc(WEIGHT) after allocator rounding
 
     placement_entry() = default;
 
@@ -435,7 +435,31 @@ struct placement_plan {
         int end   = -1;
     };
 
+    // Contiguous transformer-layer block selected by the planner.  This is the
+    // contract the multi-device executor consumes: complete layer ranges, their
+    // dense/KV owner, and the MoE residency footprint that may require routed
+    // expert dispatch inside the block.  `kv_device == -2` means the block has
+    // mixed KV ownership.
+    struct layer_block {
+        int         start_layer             = -1;
+        int         end_layer               = -1;
+        int         execution_device        = -1;
+        int         dense_device            = -1;
+        int         kv_device               = -1;
+        size_t      dense_weight_bytes      = 0;
+        size_t      dense_vram_charge_bytes = 0;
+        size_t      kv_bytes                = 0;
+        size_t      moe_device_weight_bytes = 0;
+        size_t      moe_host_weight_bytes   = 0;
+        double      dense_score             = 0.0;
+        bool        dense_on_fastest_device = false;
+        std::string dense_policy_reason;
+    };
+
     std::unordered_map<int, layer_range> device_layers;
+    std::vector<layer_block>             layer_blocks;
+    int                                  fastest_dense_device = -1;
+    double                               fastest_dense_score  = 0.0;
 
     // Compatibility summary: expert_device[layer_id][expert_id] = device_id (-1 = host/CPU).
     // This collapses gate/up/down and is not authoritative for role-specific MoE placement.
@@ -527,17 +551,17 @@ struct placement_plan {
             return result;
         }
 
-        const auto & e          = entries[it->second];
-        result.status           = expert_placement_status::FOUND;
-        result.tensor_name      = e.name;
-        result.on_device        = e.on_device;
-        result.target_device    = e.target_device;
-        result.src_size         = e.src_size;
-        result.dst_size         = e.dst_size;
-        result.vram_charge_size = e.vram_charge_size;
-        result.layout           = e.layout;
+        const auto & e           = entries[it->second];
+        result.status            = expert_placement_status::FOUND;
+        result.tensor_name       = e.name;
+        result.on_device         = e.on_device;
+        result.target_device     = e.target_device;
+        result.src_size          = e.src_size;
+        result.dst_size          = e.dst_size;
+        result.vram_charge_size  = e.vram_charge_size;
+        result.layout            = e.layout;
         result.alternate_layouts = e.alternate_layouts;
-        result.priority         = e.priority;
+        result.priority          = e.priority;
         return result;
     }
 

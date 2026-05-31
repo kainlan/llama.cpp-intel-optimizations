@@ -2912,8 +2912,8 @@ bool unified_cache::drop_expert_entry(ggml_sycl_cache_id key, const char * reaso
                         GGML_LOG_WARN(
                             "[UNIFIED-CACHE] drop_expert_entry refused: model=%llu name_hash=0x%llx layout=%d "
                             "in_use=%u reason=%s\n",
-                            (unsigned long long) key.model_id, (unsigned long long) key.name_hash,
-                            (int) entry.layout, live, reason ? reason : "");
+                            (unsigned long long) key.model_id, (unsigned long long) key.name_hash, (int) entry.layout,
+                            live, reason ? reason : "");
                     }
                     return false;
                 }
@@ -2928,8 +2928,8 @@ bool unified_cache::drop_expert_entry(ggml_sycl_cache_id key, const char * reaso
                 constexpr bool log_drops     = false;
                 if (log_drops) {
                     GGML_LOG_INFO("[UNIFIED-CACHE] drop expert model=%llu name_hash=0x%llx layout=%d reason=%s\n",
-                                  (unsigned long long) key.model_id, (unsigned long long) key.name_hash,
-                                  entry_layout, reason ? reason : "");
+                                  (unsigned long long) key.model_id, (unsigned long long) key.name_hash, entry_layout,
+                                  reason ? reason : "");
                 }
 
                 if (ptr && !host_resident) {
@@ -7167,9 +7167,9 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 "[UNIFIED-ALLOC] replacing stale pointer registration ptr=%p new_size=%zu new_tier=%s new_role=%d "
                 "new_category=%d new_zone=%d old_size=%zu old_tier=%s old_role=%d old_category=%d old_zone=%d "
                 "old_alloc_id=%llu old_cohort=%s\n",
-                ptr, alloc_size, alloc_tier_name(tier), (int) req.intent.role, (int) cat,
-                (int) rec.handle.vram_zone, old.size, alloc_tier_name(old.tier), (int) old.role, (int) old.category,
-                (int) old.vram_zone, (unsigned long long) old.alloc_id,
+                ptr, alloc_size, alloc_tier_name(tier), (int) req.intent.role, (int) cat, (int) rec.handle.vram_zone,
+                old.size, alloc_tier_name(old.tier), (int) old.role, (int) old.category, (int) old.vram_zone,
+                (unsigned long long) old.alloc_id,
                 dup->second.cohort_id.empty() ? "(none)" : dup->second.cohort_id.c_str());
             if (!dup->second.cohort_id.empty()) {
                 g_runtime_cohort_tier.erase(dup->second.cohort_id);
@@ -10815,9 +10815,8 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     // reenter ggml_sycl_info() and deadlock.  Caller passes 0 to opt out of the
     // cap entirely.
     if (device_total_vram > 0) {
-        constexpr size_t k_one_gib               = 1024ull * 1024ull * 1024ull;
-        const size_t caller_reserved_headroom =
-            device_total_vram > budget_bytes ? device_total_vram - budget_bytes : 0;
+        constexpr size_t k_one_gib            = 1024ull * 1024ull * 1024ull;
+        const size_t caller_reserved_headroom = device_total_vram > budget_bytes ? device_total_vram - budget_bytes : 0;
         constexpr size_t k_min_external_headroom = 512ull * 1024ull * 1024ull;
         constexpr size_t k_max_external_headroom = 2ull * k_one_gib;
         const size_t     queried_headroom =
@@ -10833,8 +10832,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
             "[VRAM-ARENA] External headroom %.0f MB (caller-reserved %.0f MB); internal zones runtime=%.0f MB "
             "oneDNN=%.0f MB scratch=%.0f MB\n",
             external_headroom / (1024.0 * 1024.0), caller_reserved_headroom / (1024.0 * 1024.0),
-            runtime_bytes / (1024.0 * 1024.0), onednn_bytes / (1024.0 * 1024.0),
-            scratch_bytes / (1024.0 * 1024.0));
+            runtime_bytes / (1024.0 * 1024.0), onednn_bytes / (1024.0 * 1024.0), scratch_bytes / (1024.0 * 1024.0));
         if (device_total_vram > external_headroom) {
             const size_t arena_cap = device_total_vram - external_headroom;
             if (alloc_size > arena_cap) {
@@ -12486,9 +12484,9 @@ static size_t add_single_moe_pp_executable_alternates(placement_plan &          
             "[PLACEMENT-MOE] PP executable alternate layouts: device=%d considered=%zu candidates=%zu "
             "soa_added=%zu already=%zu not_needed=%zu no_layout_bytes=%zu skipped_capacity=%zu "
             "charged=%.1f MB remaining=%.1f MB pp_tokens=%zu selected_rows=%zu envelope=%s\n",
-            device_id, considered, candidates, added, already_present, not_needed, no_layout_bytes,
-            skipped_capacity, charged_bytes / (1024.0 * 1024.0), remaining / (1024.0 * 1024.0), pp_tokens,
-            pp_rows, envelope != nullptr ? "yes" : "no");
+            device_id, considered, candidates, added, already_present, not_needed, no_layout_bytes, skipped_capacity,
+            charged_bytes / (1024.0 * 1024.0), remaining / (1024.0 * 1024.0), pp_tokens, pp_rows,
+            envelope != nullptr ? "yes" : "no");
     }
 
     return charged_bytes;
@@ -13975,6 +13973,151 @@ multi_gpu_mode get_multi_gpu_mode(bool is_moe) {
     return is_moe ? multi_gpu_mode::EXPERT : multi_gpu_mode::LAYER;
 }
 
+static void populate_multi_device_layer_blocks(placement_plan &                   plan,
+                                               int                                n_layers,
+                                               const std::vector<device_budget> & device_budgets,
+                                               const std::map<int, size_t> &      layer_weight_bytes,
+                                               const std::map<int, size_t> &      layer_weight_charge_bytes) {
+    plan.layer_blocks.clear();
+    plan.fastest_dense_device = -1;
+    plan.fastest_dense_score  = 0.0;
+
+    if (n_layers <= 0) {
+        return;
+    }
+
+    std::unordered_map<int, double> dense_scores;
+    for (const device_budget & db : device_budgets) {
+        dense_scores[db.device_id] = db.dense_score;
+        if (db.dense_supported && db.dense_score > plan.fastest_dense_score) {
+            plan.fastest_dense_device = db.device_id;
+            plan.fastest_dense_score  = db.dense_score;
+        }
+    }
+
+    std::map<int, std::map<int, size_t>> moe_device_bytes_by_layer;
+    std::map<int, size_t>                moe_host_bytes_by_layer;
+    for (const placement_entry & entry : plan.entries) {
+        if (entry.layer_id < 0 || !(entry.expert_id >= 0 || placement_priority_is_moe_weight(entry.priority))) {
+            continue;
+        }
+        if (entry.on_device && entry.target_device >= 0) {
+            moe_device_bytes_by_layer[entry.layer_id][entry.target_device] += entry.dst_size;
+        } else {
+            moe_host_bytes_by_layer[entry.layer_id] += entry.dst_size;
+        }
+    }
+
+    auto dense_score_for = [&](int device) {
+        const auto it = dense_scores.find(device);
+        return it == dense_scores.end() ? 0.0 : it->second;
+    };
+
+    auto append_block = [&](int start, int end, int dense_device) {
+        if (start < 0 || end < start) {
+            return;
+        }
+
+        placement_plan::layer_block block;
+        block.start_layer      = start;
+        block.end_layer        = end;
+        block.execution_device = dense_device;
+        block.dense_device     = dense_device;
+        block.dense_score      = dense_score_for(dense_device);
+        block.dense_on_fastest_device =
+            dense_device >= 0 && dense_device == plan.fastest_dense_device && plan.fastest_dense_score > 0.0;
+
+        bool kv_initialized = false;
+        int  kv_device      = -1;
+        for (int layer = start; layer <= end; ++layer) {
+            auto dense_it = layer_weight_bytes.find(layer);
+            if (dense_it != layer_weight_bytes.end()) {
+                block.dense_weight_bytes += dense_it->second;
+            }
+            auto charge_it = layer_weight_charge_bytes.find(layer);
+            if (charge_it != layer_weight_charge_bytes.end()) {
+                block.dense_vram_charge_bytes += charge_it->second;
+            }
+
+            const int    layer_kv_device = plan.get_kv_device(layer);
+            const size_t kv_bytes        = plan.kv_size_for_layer(static_cast<uint32_t>(layer));
+            if (kv_bytes > 0) {
+                block.kv_bytes += kv_bytes;
+                if (!kv_initialized) {
+                    kv_device      = layer_kv_device;
+                    kv_initialized = true;
+                } else if (kv_device != layer_kv_device) {
+                    kv_device = -2;
+                }
+            }
+
+            auto moe_dev_it = moe_device_bytes_by_layer.find(layer);
+            if (moe_dev_it != moe_device_bytes_by_layer.end()) {
+                for (const auto & [_, bytes] : moe_dev_it->second) {
+                    block.moe_device_weight_bytes += bytes;
+                }
+            }
+            auto moe_host_it = moe_host_bytes_by_layer.find(layer);
+            if (moe_host_it != moe_host_bytes_by_layer.end()) {
+                block.moe_host_weight_bytes += moe_host_it->second;
+            }
+        }
+        block.kv_device = kv_initialized ? kv_device : -1;
+
+        if (dense_device < 0) {
+            block.dense_policy_reason = "host-or-unplanned";
+        } else if (block.dense_on_fastest_device) {
+            block.dense_policy_reason = "fastest-dense-compatible";
+        } else if (plan.fastest_dense_device >= 0) {
+            block.dense_policy_reason = "fastest-dense-deferred-boundary-cost";
+        } else {
+            block.dense_policy_reason = "no-dense-capability-score";
+        }
+
+        plan.layer_blocks.push_back(std::move(block));
+    };
+
+    int block_start  = 0;
+    int block_device = plan.get_layer_device(0);
+    for (int layer = 1; layer < n_layers; ++layer) {
+        const int layer_device = plan.get_layer_device(layer);
+        if (layer_device == block_device) {
+            continue;
+        }
+        append_block(block_start, layer - 1, block_device);
+        block_start  = layer;
+        block_device = layer_device;
+    }
+    append_block(block_start, n_layers - 1, block_device);
+
+    char fastest_buf[32];
+    GGML_LOG_INFO(
+        "[PLACEMENT-BLOCK] fastest_dense=%s raw_score=%.2f blocks=%zu policy=complete-layer-blocks "
+        "note=dense-fastest-may-be-deferred-by-boundary-cost\n",
+        placement_target_name(plan.fastest_dense_device, fastest_buf, sizeof(fastest_buf)), plan.fastest_dense_score,
+        plan.layer_blocks.size());
+
+    for (size_t i = 0; i < plan.layer_blocks.size(); ++i) {
+        const auto & block = plan.layer_blocks[i];
+        char         exec_buf[32];
+        char         dense_buf[32];
+        char         kv_buf[32];
+        const char * kv_name =
+            block.kv_device == -2 ? "MIXED" : placement_target_name(block.kv_device, kv_buf, sizeof(kv_buf));
+        GGML_LOG_INFO(
+            "[PLACEMENT-BLOCK] block=%zu layers=[%d,%d] exec=%s dense=%s kv=%s dense_score=%.2f "
+            "fastest_dense=%d reason=%s dense=%.1f MB charge=%.1f MB kv=%.1f MB moe_device=%.1f MB "
+            "moe_host=%.1f MB\n",
+            i, block.start_layer, block.end_layer,
+            placement_target_name(block.execution_device, exec_buf, sizeof(exec_buf)),
+            placement_target_name(block.dense_device, dense_buf, sizeof(dense_buf)), kv_name, block.dense_score,
+            block.dense_on_fastest_device ? 1 : 0, block.dense_policy_reason.c_str(),
+            block.dense_weight_bytes / (1024.0 * 1024.0), block.dense_vram_charge_bytes / (1024.0 * 1024.0),
+            block.kv_bytes / (1024.0 * 1024.0), block.moe_device_weight_bytes / (1024.0 * 1024.0),
+            block.moe_host_weight_bytes / (1024.0 * 1024.0));
+    }
+}
+
 placement_plan compute_multi_device_plan(const std::vector<device_budget> &                  device_budgets,
                                          const std::vector<std::pair<std::string, size_t>> & tensor_inventory,
                                          int                                                 n_layers,
@@ -14789,6 +14932,8 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         const int eid                           = (entry.expert_id >= 0) ? entry.expert_id : 0;
         plan.expert_device[entry.layer_id][eid] = entry.target_device;
     }
+
+    populate_multi_device_layer_blocks(plan, n_layers, device_budgets, layer_weight_bytes, layer_weight_charge_bytes);
 
     // Log multi-device placement summary
     GGML_LOG_INFO("[PLACEMENT-MULTI] %zu devices, %d layers, hybrid parallelism\n", n_devs, n_layers);

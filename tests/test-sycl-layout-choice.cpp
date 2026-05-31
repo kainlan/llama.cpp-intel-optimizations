@@ -414,6 +414,47 @@ static bool run_moe_triplet_planner_test() {
     return true;
 }
 
+static bool run_multi_device_layer_block_plan_test() {
+    constexpr size_t mib = 1024u * 1024u;
+
+    const std::vector<std::pair<std::string, size_t>> inventory = {
+        { "blk.0.attn_q.weight", 4u * mib },
+        { "blk.1.attn_q.weight", 4u * mib },
+    };
+    const std::vector<ggml_sycl::device_budget> devices = {
+        { 0, 64u * mib, 64u * mib, 1.0, true },
+        { 1, 64u * mib, 64u * mib, 4.0, true },
+    };
+
+    ggml_sycl::placement_kv_info kv_info{};
+    kv_info.n_ubatch = 512;
+    auto plan = ggml_sycl::compute_multi_device_plan(devices, inventory, 2, ggml_sycl::multi_gpu_mode::LAYER, kv_info,
+                                                     nullptr, 0);
+
+    if (plan.fastest_dense_device != 1 || plan.fastest_dense_score != 4.0) {
+        printf("FAIL: expected raw fastest dense device 1, got device=%d score=%.2f\n", plan.fastest_dense_device,
+               plan.fastest_dense_score);
+        return false;
+    }
+    if (plan.layer_blocks.empty()) {
+        printf("FAIL: expected multi-device planner to emit explicit layer blocks\n");
+        return false;
+    }
+    if (plan.layer_blocks.front().start_layer != 0 || plan.layer_blocks.back().end_layer != 1) {
+        printf("FAIL: expected layer blocks to cover layers [0,1], got first=%d last=%d\n",
+               plan.layer_blocks.front().start_layer, plan.layer_blocks.back().end_layer);
+        return false;
+    }
+    if (plan.layer_blocks.front().dense_device == plan.fastest_dense_device &&
+        !plan.layer_blocks.front().dense_on_fastest_device) {
+        printf("FAIL: dense_on_fastest_device flag is inconsistent with block owner\n");
+        return false;
+    }
+
+    printf("PASS: multi-device planner records explicit layer blocks and raw fastest dense device\n");
+    return true;
+}
+
 static bool run_layout_choice_test() {
     ggml_backend_t backend = ggml_backend_sycl_init(0);
     if (!backend) {
@@ -585,6 +626,9 @@ int main() {
         return 1;
     }
     if (!run_moe_triplet_planner_test()) {
+        return 1;
+    }
+    if (!run_multi_device_layer_block_plan_test()) {
         return 1;
     }
     ggml_sycl::test_layout_override_guard guard(GGML_LAYOUT_SOA);

@@ -906,6 +906,33 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         TIMEOUT 120
     )
 
+    # Test: unified-cache layout and multi-device placement choices
+    add_executable(test-sycl-layout-choice
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-layout-choice.cpp
+    )
+    target_include_directories(test-sycl-layout-choice PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
+    )
+    target_compile_options(test-sycl-layout-choice PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_link_options(test-sycl-layout-choice PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_compile_definitions(test-sycl-layout-choice PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-sycl-layout-choice PRIVATE ggml-base ggml ggml-sycl)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-sycl-layout-choice PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME sycl-layout-choice COMMAND test-sycl-layout-choice)
+    set_tests_properties(sycl-layout-choice PROPERTIES
+        LABELS "sycl;cache;layout;planner;tdd"
+        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        TIMEOUT 180
+    )
+
     # mem_handle eviction-lifecycle tests (RESEARCH-A4, llama.cpp-2jmzn)
     # Verifies cache_generation bumps + entry removal across sync and async
     # eviction paths. Companion to llama.cpp-goegc.1.
