@@ -13796,6 +13796,9 @@ static void promote_single_moe_pp_gate_up_primary_layouts_to_soa(placement_plan 
         entry.vram_charge_size = new_charge;
         promoted++;
     }
+    if (promoted > 0) {
+        plan.moe_pp_soa_promoted = true;
+    }
 
     if (considered > 0 && (promoted > 0 || moe_direct_trace_enabled())) {
         GGML_LOG_INFO(
