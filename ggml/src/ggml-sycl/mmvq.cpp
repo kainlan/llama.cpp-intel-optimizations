@@ -4,6 +4,7 @@
 #include "convert.hpp"
 #include "ggml-sycl-bench.hpp"
 #include "ggml.h"
+#include "mem-ops.hpp"
 #include "quantize.hpp"
 #include "quants.hpp"
 #include "sycl-profiling.hpp"
@@ -21,6 +22,7 @@
 #include <limits>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 static thread_local mmvq_moe_dispatch_timing g_mmvq_moe_dispatch_timing;
@@ -73,6 +75,46 @@ static const char * mmvq_layout_name(ggml_layout_mode layout) {
     }
 }
 
+static bool mmvq_moe_trace_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_MMVQ_TRACE");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static void mmvq_moe_trace(const ggml_tensor * src0,
+                           const char *        reason,
+                           int                 device,
+                           int                 layout,
+                           bool                forced_layout,
+                           int64_t             batch,
+                           int64_t             threshold,
+                           bool                host_weights,
+                           bool                use_ptr_table,
+                           bool                placement_plan_active,
+                           bool                plan_has_host_experts,
+                           size_t              ptr_count       = 0,
+                           size_t              non_device_ptrs = 0,
+                           size_t              null_ptrs       = 0) {
+    if (!mmvq_moe_trace_enabled()) {
+        return;
+    }
+    static std::atomic<int> trace_count{ 0 };
+    const int              n = trace_count.fetch_add(1, std::memory_order_relaxed);
+    if (n >= 768) {
+        return;
+    }
+    const char * layout_text = layout >= 0 ? mmvq_layout_name(static_cast<ggml_layout_mode>(layout)) : "unknown";
+    fprintf(stderr,
+            "[MMVQ-TRACE] tensor=%s reason=%s dev=%d type=%s layout=%s forced=%d batch=%lld threshold=%lld "
+            "host=%d ptr_table=%d plan=%d plan_host=%d ptrs=%zu non_device=%zu null=%zu\n",
+            src0 && src0->name ? src0->name : "?", reason ? reason : "?", device, src0 ? ggml_type_name(src0->type) : "?",
+            layout_text, forced_layout ? 1 : 0, (long long) batch, (long long) threshold, host_weights ? 1 : 0,
+            use_ptr_table ? 1 : 0, placement_plan_active ? 1 : 0, plan_has_host_experts ? 1 : 0, ptr_count,
+            non_device_ptrs, null_ptrs);
+}
+
 static bool mmvq_moe_tg_profile_enabled() {
     static const bool enabled = []() {
         const char * env = std::getenv("GGML_SYCL_MXFP4_TG_PROFILE");
@@ -81,6 +123,16 @@ static bool mmvq_moe_tg_profile_enabled() {
     // This diagnostic inserts host waits to time individual MXFP4 MoE kernels.
     // Level Zero command-graph recording forbids queue/event waits, so profiling
     // must be silent while capture is active.
+    return enabled && !ggml_sycl_graph_recording_active();
+}
+
+static bool mmvq_moe_pp_profile_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_MXFP4_PP_PROFILE");
+        return env && std::atoi(env) != 0;
+    }();
+    // This diagnostic inserts host waits to split prompt MoE latency.  Do not
+    // run it during graph capture.
     return enabled && !ggml_sycl_graph_recording_active();
 }
 
@@ -108,6 +160,126 @@ static bool mxfp4_moe_xmx_tiled_pack_q8_enabled() {
     return enabled;
 }
 
+static uint8_t * mmvq_alloc_device_scratch(size_t                  bytes,
+                                           sycl::queue &           queue,
+                                           const char *            cohort_id,
+                                           ggml_sycl::mem_handle & owner) {
+    owner = {};
+    if (bytes == 0) {
+        return nullptr;
+    }
+
+    ggml_sycl::alloc_request req{};
+    req.queue                               = &queue;
+    req.device                              = ggml_sycl_get_device_id_from_queue(queue);
+    req.size                                = bytes;
+    req.intent.role                         = ggml_sycl::alloc_role::COMPUTE;
+    req.intent.category                     = ggml_sycl::runtime_category::COMPUTE;
+    req.intent.cohort_id                    = cohort_id;
+    req.intent.constraints.must_device      = true;
+    req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::SCRATCH;
+    req.suppress_failure_log                = true;
+
+    owner = ggml_sycl::unified_allocate(req);
+    if (!owner.valid()) {
+        return nullptr;
+    }
+
+    auto resolved = owner.resolve(req.device);
+    if (!resolved || !resolved.ptr || !resolved.on_device) {
+        owner = {};
+        return nullptr;
+    }
+
+    return static_cast<uint8_t *>(resolved.ptr);
+}
+
+struct ggml_sycl_mmvq_temp_release_marker_kernel;
+
+struct mmvq_deferred_temp_release {
+    sycl::queue *                      stream = nullptr;
+    std::vector<ggml_sycl::mem_handle> handles;
+    sycl::event                        event;
+    bool                               have_event = false;
+
+    explicit mmvq_deferred_temp_release(sycl::queue * stream) : stream(stream) {}
+
+    void add(ggml_sycl::mem_handle handle) {
+        if (handle.valid()) {
+            handles.push_back(std::move(handle));
+        }
+    }
+
+    void release_after(sycl::event done) {
+        event      = std::move(done);
+        have_event = true;
+    }
+
+    ~mmvq_deferred_temp_release() {
+        if (handles.empty() || !stream) {
+            return;
+        }
+        sycl::event done =
+            have_event ? std::move(event) : ggml_sycl_submit_marker<ggml_sycl_mmvq_temp_release_marker_kernel>(*stream);
+        ggml_sycl::retain_handles_until_event(std::move(handles), std::move(done));
+    }
+};
+
+static bool ggml_sycl_mmvq_alloc_host_stage(size_t                  bytes,
+                                            sycl::queue &           queue,
+                                            int                     device,
+                                            const char *            cohort_id,
+                                            ggml_sycl::mem_handle & owner) {
+    owner = {};
+    if (bytes == 0) {
+        return true;
+    }
+
+    ggml_sycl::alloc_request req{};
+    req.queue                               = &queue;
+    req.device                              = device;
+    req.size                                = bytes;
+    req.intent.role                         = ggml_sycl::alloc_role::STAGING;
+    req.intent.category                     = ggml_sycl::runtime_category::STAGING;
+    req.intent.cohort_id                    = cohort_id;
+    req.intent.constraints.must_host_pinned = true;
+    req.intent.constraints.use_pinned_pool  = true;
+    req.suppress_failure_log                = true;
+
+    owner = ggml_sycl::unified_allocate(req);
+    if (!owner.valid()) {
+        return false;
+    }
+
+    auto resolved = owner.resolve(device);
+    if (!resolved || !resolved.ptr || resolved.on_device) {
+        owner = {};
+        return false;
+    }
+    return true;
+}
+
+static ggml_sycl::mem_handle mmvq_host_direct_handle(void * ptr) {
+    return ggml_sycl::mem_handle::from_direct(ptr, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+}
+
+static void mmvq_debug_copy_to_host(sycl::queue & queue, int device, void * host_dst, const void * src, size_t bytes) {
+    if (!host_dst || !src || bytes == 0) {
+        return;
+    }
+
+    const ggml_sycl::memory_location loc           = ggml_sycl::query_location(src, device);
+    const bool                       src_on_device = loc.on_device();
+    const int                        src_device =
+        src_on_device && loc.device >= 0 ? loc.device : (src_on_device ? device : ggml_sycl::mem_handle::HOST_DEVICE);
+    ggml_sycl::mem_handle dst_handle = mmvq_host_direct_handle(host_dst);
+    ggml_sycl::mem_handle src_handle =
+        src_on_device ?
+            ggml_sycl::mem_handle::from_chunk_ptr(const_cast<void *>(src), src_device, GGML_LAYOUT_AOS, true) :
+            ggml_sycl::mem_handle::from_direct(const_cast<void *>(src), GGML_LAYOUT_AOS, false, src_device);
+    ggml_sycl::mem_copy(dst_handle, src_handle, bytes, queue);
+}
+
 static bool mxfp4_moe_tg_q8_artifact_enabled() {
     static const bool enabled = []() {
         const char * env = std::getenv("GGML_SYCL_MOE_NO_Q8_ARTIFACT");
@@ -118,7 +290,7 @@ static bool mxfp4_moe_tg_q8_artifact_enabled() {
 
 static bool mxfp4_moe_xmx_tiled_output_validate_take() {
     static std::atomic<int> remaining{ []() {
-        const char * env = std::getenv("GGML_SYCL_XMX_TILED_VALIDATE_OUTPUT");
+        const char *        env = std::getenv("GGML_SYCL_XMX_TILED_VALIDATE_OUTPUT");
         return env ? std::atoi(env) : 0;
     }() };
     if (ggml_sycl_graph_recording_active()) {
@@ -173,6 +345,29 @@ struct mmvq_moe_tg_profile_accum {
 };
 
 static thread_local mmvq_moe_tg_profile_accum g_mmvq_moe_tg_profile;
+
+struct mmvq_moe_pp_profile_accum {
+    double  quant_us         = 0.0;
+    double  group_host_us    = 0.0;
+    double  group_copy_us    = 0.0;
+    double  pack_us          = 0.0;
+    double  kernel_wall_us   = 0.0;
+    double  kernel_event_us  = 0.0;
+    double  artifact_us      = 0.0;
+    double  gateup_glu_us    = 0.0;
+    double  down_us          = 0.0;
+    int64_t calls            = 0;
+    int64_t gateup_glu_calls = 0;
+    int64_t down_calls       = 0;
+    int64_t entries          = 0;
+    int64_t batches          = 0;
+    int64_t packed_calls     = 0;
+    int64_t direct_calls     = 0;
+    int64_t chunked_calls    = 0;
+    int64_t other_calls      = 0;
+};
+
+static thread_local mmvq_moe_pp_profile_accum g_mmvq_moe_pp_profile;
 
 enum class mmvq_moe_tg_profile_kind : uint8_t {
     OTHER      = 0,
@@ -246,6 +441,74 @@ static void mmvq_moe_tg_profile_record(layout_mode              layout,
     p = {};
 }
 
+static void mmvq_moe_pp_profile_record(const char *             path,
+                                       int64_t                  entries,
+                                       int64_t                  total_batches,
+                                       double                   quant_us,
+                                       double                   group_host_us,
+                                       double                   group_copy_us,
+                                       double                   pack_us,
+                                       double                   kernel_wall_us,
+                                       double                   kernel_event_us,
+                                       double                   artifact_us,
+                                       mmvq_moe_tg_profile_kind kind,
+                                       int64_t                  logical_calls) {
+    auto & p = g_mmvq_moe_pp_profile;
+    p.quant_us += quant_us;
+    p.group_host_us += group_host_us;
+    p.group_copy_us += group_copy_us;
+    p.pack_us += pack_us;
+    p.kernel_wall_us += kernel_wall_us;
+    p.kernel_event_us += kernel_event_us;
+    p.artifact_us += artifact_us;
+    p.calls += logical_calls;
+    p.entries += entries;
+    p.batches += total_batches;
+
+    const double role_us = quant_us + group_host_us + group_copy_us + pack_us + kernel_event_us + artifact_us;
+    if (kind == mmvq_moe_tg_profile_kind::GATEUP_GLU) {
+        p.gateup_glu_us += role_us;
+        p.gateup_glu_calls += logical_calls;
+    } else if (kind == mmvq_moe_tg_profile_kind::DOWN) {
+        p.down_us += role_us;
+        p.down_calls += logical_calls;
+    }
+
+    if (path && std::strstr(path, "packed")) {
+        p.packed_calls += logical_calls;
+    } else if (path && std::strstr(path, "direct")) {
+        p.direct_calls += logical_calls;
+    } else if (path && std::strstr(path, "chunk")) {
+        p.chunked_calls += logical_calls;
+    } else {
+        p.other_calls += logical_calls;
+    }
+
+    // GPT-OSS 20B prompt MoE has 72 logical fused calls per graph:
+    // gate+up count as two logical calls, down counts as one, across 24 layers.
+    if (p.calls < 72 || p.calls % 72 != 0) {
+        return;
+    }
+
+    const double total_us =
+        p.quant_us + p.group_host_us + p.group_copy_us + p.pack_us + p.kernel_event_us + p.artifact_us;
+    fprintf(stderr,
+            "[MXFP4-MOE-PP-PROFILE] calls=%lld gateup=%lld down=%lld entries=%lld batches=%lld "
+            "paths packed=%lld direct=%lld chunked=%lld other=%lld total=%.3f ms "
+            "quant=%.3f ms group_host=%.3f ms group_copy=%.3f ms pack=%.3f ms "
+            "kernel_event=%.3f ms kernel_wall=%.3f ms artifact=%.3f ms "
+            "gateup_total=%.3f ms down_total=%.3f ms per_call_total=%.3f us per_entry_kernel=%.3f us "
+            "last_path=%s\n",
+            (long long) p.calls, (long long) p.gateup_glu_calls, (long long) p.down_calls, (long long) p.entries,
+            (long long) p.batches, (long long) p.packed_calls, (long long) p.direct_calls, (long long) p.chunked_calls,
+            (long long) p.other_calls, total_us / 1000.0, p.quant_us / 1000.0, p.group_host_us / 1000.0,
+            p.group_copy_us / 1000.0, p.pack_us / 1000.0, p.kernel_event_us / 1000.0, p.kernel_wall_us / 1000.0,
+            p.artifact_us / 1000.0, p.gateup_glu_us / 1000.0, p.down_us / 1000.0,
+            total_us / static_cast<double>(p.calls),
+            p.entries > 0 ? p.kernel_event_us / static_cast<double>(p.entries) : 0.0, path ? path : "unknown");
+    p = {};
+}
+
 enum class mxfp4_moe_role : uint8_t {
     OTHER = 0,
     GATE  = 1,
@@ -287,27 +550,38 @@ static int mxfp4_moe_layer_from_name(const char * name) {
 }
 
 struct mxfp4_moe_tg_reuse_cache {
-    bool                    valid           = false;
-    int                     device          = -1;
-    int                     layer           = -1;
-    mxfp4_moe_role          role            = mxfp4_moe_role::OTHER;
-    const void *            src1_ptr        = nullptr;
-    int64_t                 ne10            = 0;
-    int64_t                 total_src1_rows = 0;
-    int64_t                 ne10_padded     = 0;
-    int64_t                 q8_1_row_size   = 0;
-    size_t                  q8_bytes        = 0;
-    layout_mode             layout          = GGML_LAYOUT_AOS;
-    ggml_sycl::alloc_handle q8_alloc        = {};
-    ggml_sycl::mem_handle   q8_handle       = {};
-    ggml_sycl::mem_handle   src1_handle     = {};
-    ggml_sycl::alloc_handle dpas_b_alloc    = {};
-    ggml_sycl::alloc_handle dpas_y_alloc    = {};
-    ggml_sycl::mem_handle   dpas_b_handle   = {};
-    ggml_sycl::mem_handle   dpas_y_handle   = {};
+    bool                  valid           = false;
+    int                   device          = -1;
+    int                   layer           = -1;
+    mxfp4_moe_role        role            = mxfp4_moe_role::OTHER;
+    int64_t               ne10            = 0;
+    int64_t               total_src1_rows = 0;
+    int64_t               ne10_padded     = 0;
+    int64_t               q8_1_row_size   = 0;
+    size_t                q8_bytes        = 0;
+    size_t                q8_capacity     = 0;
+    int                   q8_device       = -1;
+    layout_mode           layout          = GGML_LAYOUT_AOS;
+    ggml_sycl::mem_handle q8_handle       = {};
+    ggml_sycl::mem_handle src1_handle     = {};
+    size_t                dpas_b_capacity = 0;
+    size_t                dpas_y_capacity = 0;
+    int                   dpas_b_device   = -1;
+    int                   dpas_y_device   = -1;
+    ggml_sycl::mem_handle dpas_b_handle   = {};
+    ggml_sycl::mem_handle dpas_y_handle   = {};
 };
 
 static thread_local mxfp4_moe_tg_reuse_cache g_mxfp4_moe_tg_reuse;
+
+static void * mxfp4_moe_tg_reuse_q8_ptr(int device) {
+    auto & cache = g_mxfp4_moe_tg_reuse;
+    if (!cache.q8_handle.valid() || cache.q8_device != device) {
+        return nullptr;
+    }
+    auto resolved = cache.q8_handle.resolve(device);
+    return resolved ? resolved.ptr : nullptr;
+}
 
 static ggml_sycl::mem_handle mxfp4_moe_tensor_mem_handle(const ggml_tensor * tensor,
                                                          int                 device,
@@ -363,18 +637,12 @@ static void mxfp4_moe_tg_reuse_invalidate() {
 
 static void * mxfp4_moe_tg_reuse_get_or_alloc_q8(sycl::queue * stream, int device, size_t required_size) {
     auto & cache = g_mxfp4_moe_tg_reuse;
-    if (cache.q8_alloc.ptr && cache.q8_alloc.size >= required_size && cache.q8_alloc.device == device) {
-        if (!cache.q8_handle.valid()) {
-            cache.q8_handle = cache.q8_alloc.as_mem_handle();
-        }
-        auto resolved = cache.q8_handle.resolve(device);
-        return resolved ? resolved.ptr : cache.q8_alloc.ptr;
+    if (cache.q8_handle.valid() && cache.q8_capacity >= required_size && cache.q8_device == device) {
+        return mxfp4_moe_tg_reuse_q8_ptr(device);
     }
-    if (cache.q8_alloc.ptr) {
-        cache.q8_handle = {};
-        (void) ggml_sycl::unified_free(cache.q8_alloc);
-        cache.q8_alloc = {};
-    }
+    cache.q8_handle   = {};
+    cache.q8_capacity = 0;
+    cache.q8_device   = -1;
     ggml_sycl::alloc_request req{};
     req.queue                          = stream;
     req.device                         = device;
@@ -382,36 +650,41 @@ static void * mxfp4_moe_tg_reuse_get_or_alloc_q8(sycl::queue * stream, int devic
     req.intent.role                    = ggml_sycl::alloc_role::EXPERT_STAGING;
     req.intent.category                = ggml_sycl::runtime_category::STAGING;
     req.intent.constraints.must_device = true;
-    if (!ggml_sycl::unified_alloc(req, &cache.q8_alloc)) {
-        cache.q8_alloc  = {};
-        cache.q8_handle = {};
+    cache.q8_handle                    = ggml_sycl::unified_allocate(req);
+    if (!cache.q8_handle.valid()) {
+        cache.q8_handle   = {};
+        cache.q8_capacity = 0;
+        cache.q8_device   = -1;
         return nullptr;
     }
-    cache.q8_handle = cache.q8_alloc.as_mem_handle();
-    auto resolved   = cache.q8_handle.resolve(device);
-    return resolved ? resolved.ptr : cache.q8_alloc.ptr;
+    auto resolved = cache.q8_handle.resolve(device);
+    if (!resolved || !resolved.ptr || !resolved.on_device) {
+        cache.q8_handle   = {};
+        cache.q8_capacity = 0;
+        cache.q8_device   = -1;
+        return nullptr;
+    }
+    cache.q8_capacity = cache.q8_handle.size();
+    cache.q8_device   = cache.q8_handle.device();
+    return mxfp4_moe_tg_reuse_q8_ptr(device);
 }
 
-static void * mxfp4_moe_tg_reuse_get_or_alloc_device_scratch(sycl::queue *             stream,
-                                                             int                       device,
-                                                             size_t                    required_size,
-                                                             ggml_sycl::alloc_handle & alloc,
-                                                             ggml_sycl::mem_handle &   handle) {
+static void * mxfp4_moe_tg_reuse_get_or_alloc_device_scratch(sycl::queue *           stream,
+                                                             int                     device,
+                                                             size_t                  required_size,
+                                                             size_t &                capacity,
+                                                             int &                   owner_device,
+                                                             ggml_sycl::mem_handle & handle) {
     if (required_size == 0) {
         return nullptr;
     }
-    if (alloc.ptr && alloc.size >= required_size && alloc.device == device) {
-        if (!handle.valid()) {
-            handle = alloc.as_mem_handle();
-        }
+    if (handle.valid() && capacity >= required_size && owner_device == device) {
         auto resolved = handle.resolve(device);
-        return resolved ? resolved.ptr : alloc.ptr;
+        return resolved ? resolved.ptr : nullptr;
     }
-    if (alloc.ptr) {
-        handle = {};
-        (void) ggml_sycl::unified_free(alloc);
-        alloc = {};
-    }
+    handle       = {};
+    capacity     = 0;
+    owner_device = -1;
 
     ggml_sycl::alloc_request req{};
     req.queue                          = stream;
@@ -420,14 +693,23 @@ static void * mxfp4_moe_tg_reuse_get_or_alloc_device_scratch(sycl::queue *      
     req.intent.role                    = ggml_sycl::alloc_role::EXPERT_STAGING;
     req.intent.category                = ggml_sycl::runtime_category::STAGING;
     req.intent.constraints.must_device = true;
-    if (!ggml_sycl::unified_alloc(req, &alloc)) {
-        alloc  = {};
-        handle = {};
+    handle                             = ggml_sycl::unified_allocate(req);
+    if (!handle.valid()) {
+        handle       = {};
+        capacity     = 0;
+        owner_device = -1;
         return nullptr;
     }
-    handle        = alloc.as_mem_handle();
     auto resolved = handle.resolve(device);
-    return resolved ? resolved.ptr : alloc.ptr;
+    if (!resolved || !resolved.ptr || !resolved.on_device) {
+        handle       = {};
+        capacity     = 0;
+        owner_device = -1;
+        return nullptr;
+    }
+    capacity     = handle.size();
+    owner_device = handle.device();
+    return resolved.ptr;
 }
 
 static bool mxfp4_moe_tg_reuse_can_use(int                           device,
@@ -444,16 +726,16 @@ static bool mxfp4_moe_tg_reuse_can_use(int                           device,
         return false;
     }
     const auto & cache = g_mxfp4_moe_tg_reuse;
-    if (!cache.valid || !cache.q8_alloc.ptr) {
+    if (!cache.valid || !cache.q8_handle.valid()) {
         return false;
     }
     const bool gate_up_pair = (cache.role == mxfp4_moe_role::GATE && role == mxfp4_moe_role::UP) ||
                               (cache.role == mxfp4_moe_role::UP && role == mxfp4_moe_role::GATE);
     const bool exact_role = cache.role == role && role == mxfp4_moe_role::DOWN && cache.layout == layout;
     return (gate_up_pair || exact_role) && cache.device == device && cache.layer == layer &&
-           cache.src1_handle == src1_handle && cache.ne10 == ne10 && cache.total_src1_rows == total_src1_rows &&
-           cache.ne10_padded == ne10_padded && cache.q8_1_row_size == q8_1_row_size && cache.q8_bytes >= q8_bytes &&
-           cache.layout == layout;
+           cache.src1_handle.stable_identity_equal(src1_handle) && cache.ne10 == ne10 &&
+           cache.total_src1_rows == total_src1_rows && cache.ne10_padded == ne10_padded &&
+           cache.q8_1_row_size == q8_1_row_size && cache.q8_bytes >= q8_bytes && cache.layout == layout;
 }
 
 static void mxfp4_moe_tg_reuse_store(int                           device,
@@ -471,7 +753,6 @@ static void mxfp4_moe_tg_reuse_store(int                           device,
     cache.device          = device;
     cache.layer           = layer;
     cache.role            = role;
-    cache.src1_ptr        = src1_handle.resolve().ptr;
     cache.src1_handle     = src1_handle;
     cache.ne10            = ne10;
     cache.total_src1_rows = total_src1_rows;
@@ -504,7 +785,7 @@ static bool mxfp4_moe_tg_store_down_q8_soa_artifact(int                         
     const int64_t q8_row_size = ne0_padded * sizeof(block_q8_1) / QK8_1;
     const size_t  q8_bytes    = static_cast<size_t>(total_rows) * static_cast<size_t>(q8_row_size);
     auto &        cache       = g_mxfp4_moe_tg_reuse;
-    if (!cache.q8_alloc.ptr || cache.q8_alloc.device != device || cache.q8_alloc.size < q8_bytes) {
+    if (!cache.q8_handle.valid() || cache.q8_device != device || cache.q8_capacity < q8_bytes) {
         return false;
     }
 
@@ -520,9 +801,9 @@ static bool mxfp4_moe_tg_publish_q8_soa(sycl::queue *                 stream,
                                         const float *                 src,
                                         int64_t                       ne0,
                                         int64_t                       total_rows,
-                                        double *                      quant_us_out        = nullptr,
-                                        const ggml_sycl::mem_handle * src_handle_override = nullptr,
-                                        sycl::event *                 completion_event    = nullptr,
+                                        double *                      quant_us_out         = nullptr,
+                                        const ggml_sycl::mem_handle * src_handle_override  = nullptr,
+                                        sycl::event *                 completion_event     = nullptr,
                                         bool *                        completion_event_set = nullptr) {
     if (completion_event_set) {
         *completion_event_set = false;
@@ -546,9 +827,9 @@ static bool mxfp4_moe_tg_publish_q8_soa(sycl::queue *                 stream,
     if (profile) {
         stream->wait();
     }
-    auto t_begin = std::chrono::high_resolution_clock::now();
-    sycl::event quant_event = quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
-        src, (char *) q8_buffer, ne0, total_rows, ne0_padded, stream);
+    auto        t_begin     = std::chrono::high_resolution_clock::now();
+    sycl::event quant_event = quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(src, (char *) q8_buffer, ne0,
+                                                                                    total_rows, ne0_padded, stream);
     if (profile) {
         stream->wait();
     }
@@ -1974,6 +2255,11 @@ static void convert_q4_0_to_coalesced_kernel(const uint8_t * __restrict__ src,  
     *((int *) (dst + dst_offset)) = *((const int *) (src + src_offset));
 }
 
+static ggml_sycl::mem_handle mmvq_coalesced_device_handle(void * ptr, dpct::queue_ptr stream) {
+    return ggml_sycl::mem_handle::from_chunk_ptr(ptr, ggml_sycl_get_device_id_from_queue(*stream), GGML_LAYOUT_AOS,
+                                                 true);
+}
+
 // Convert Q4_0 reordered tensor to coalesced layout in-place
 // Note: This modifies the tensor data directly. Only call once per tensor.
 // WARNING: This must be called OUTSIDE of graph recording mode (cannot use wait() during recording)
@@ -1988,10 +2274,13 @@ static void convert_q4_0_to_coalesced_sycl(void * data, const int ncols, const i
     const int bytes_per_row = ncols / 2;
     const int total_bytes   = nrows * bytes_per_row;
 
-    uint8_t * temp = ggml_sycl_malloc_device_tracked_t<uint8_t>(total_bytes, *stream, "mmvq_q4_coalesce");
+    ggml_sycl::mem_handle temp_handle;
+    uint8_t *             temp = mmvq_alloc_device_scratch(total_bytes, *stream, "mmvq_q4_coalesce", temp_handle);
+    GGML_ASSERT(temp != nullptr);
 
     // Copy original quants to temp
-    sycl::event copy_event = stream->memcpy(temp, data, total_bytes);
+    ggml_sycl::mem_handle data_handle = mmvq_coalesced_device_handle(data, stream);
+    sycl::event           copy_event  = ggml_sycl::mem_copy_async(temp_handle, data_handle, total_bytes, *stream);
 
     // Convert from temp to data (now coalesced)
     const int block_size = 256;
@@ -2007,11 +2296,9 @@ static void convert_q4_0_to_coalesced_sycl(void * data, const int ncols, const i
             });
     });
 
-    stream->submit([&](sycl::handler & cgh) {
-        cgh.depends_on(convert_event);
-        cgh.host_task(
-            [temp, total_bytes, stream]() { ggml_sycl_free_device_tracked_bytes(temp, total_bytes, *stream); });
-    });
+    std::vector<ggml_sycl::mem_handle> retained;
+    retained.push_back(std::move(temp_handle));
+    ggml_sycl::retain_handles_until_event(std::move(retained), std::move(convert_event));
 }
 
 // Forward declarations for type-specific coalesced conversion functions
@@ -2359,10 +2646,13 @@ static void convert_q8_0_to_coalesced_sycl(void * data, const int ncols, const i
     const size_t scale_bytes  = static_cast<size_t>(nrows) * static_cast<size_t>(blocks_per_row) * sizeof(ggml_half);
     const size_t total_src_bytes = src_qs_bytes + scale_bytes;
 
-    uint8_t * temp = ggml_sycl_malloc_device_tracked_t<uint8_t>(total_src_bytes, *stream, "mmvq_temp");
+    ggml_sycl::mem_handle temp_handle;
+    uint8_t *             temp = mmvq_alloc_device_scratch(total_src_bytes, *stream, "mmvq_q8_coalesce", temp_handle);
+    GGML_ASSERT(temp != nullptr);
 
     // Copy original SOA payload to temp before writing the padded coalesced layout.
-    sycl::event copy_event = stream->memcpy(temp, data, total_src_bytes);
+    ggml_sycl::mem_handle data_handle = mmvq_coalesced_device_handle(data, stream);
+    sycl::event           copy_event  = ggml_sycl::mem_copy_async(temp_handle, data_handle, total_src_bytes, *stream);
 
     // Convert from temp to data (now coalesced)
     const int block_size = 256;
@@ -2377,14 +2667,12 @@ static void convert_q8_0_to_coalesced_sycl(void * data, const int ncols, const i
             });
     });
 
-    sycl::event scales_event = stream->memcpy(static_cast<uint8_t *>(data) + dst_qs_bytes, temp + src_qs_bytes,
-                                              scale_bytes, { convert_event });
+    sycl::event scales_event = ggml_sycl::mem_copy_async(data_handle, dst_qs_bytes, temp_handle, src_qs_bytes,
+                                                         scale_bytes, *stream, { convert_event });
 
-    stream->submit([&](sycl::handler & cgh) {
-        cgh.depends_on(scales_event);
-        cgh.host_task(
-            [temp, total_src_bytes, stream]() { ggml_sycl_free_device_tracked_bytes(temp, total_src_bytes, *stream); });
-    });
+    std::vector<ggml_sycl::mem_handle> retained;
+    retained.push_back(std::move(temp_handle));
+    ggml_sycl::retain_handles_until_event(std::move(retained), std::move(scales_event));
 }
 
 // Public API for Q8_0 coalesced conversion - call at model load time, after reorder
@@ -2599,9 +2887,12 @@ static void convert_mxfp4_to_coalesced_sycl(void * data, const int ncols, const 
     const int bytes_per_row = ncols / 2;
     const int total_bytes   = nrows * bytes_per_row;
 
-    uint8_t * temp = ggml_sycl_malloc_device_tracked_t<uint8_t>(total_bytes, *stream, "mmvq_temp");
+    ggml_sycl::mem_handle temp_handle;
+    uint8_t *             temp = mmvq_alloc_device_scratch(total_bytes, *stream, "mmvq_mxfp4_coalesce", temp_handle);
+    GGML_ASSERT(temp != nullptr);
 
-    sycl::event copy_event = stream->memcpy(temp, data, total_bytes);
+    ggml_sycl::mem_handle data_handle = mmvq_coalesced_device_handle(data, stream);
+    sycl::event           copy_event  = ggml_sycl::mem_copy_async(temp_handle, data_handle, total_bytes, *stream);
 
     const int block_size = 256;
     const int num_blocks = (total_words + block_size - 1) / block_size;
@@ -2615,11 +2906,9 @@ static void convert_mxfp4_to_coalesced_sycl(void * data, const int ncols, const 
             });
     });
 
-    stream->submit([&](sycl::handler & cgh) {
-        cgh.depends_on(convert_event);
-        cgh.host_task(
-            [temp, total_bytes, stream]() { ggml_sycl_free_device_tracked_bytes(temp, total_bytes, *stream); });
-    });
+    std::vector<ggml_sycl::mem_handle> retained;
+    retained.push_back(std::move(temp_handle));
+    ggml_sycl::retain_handles_until_event(std::move(retained), std::move(convert_event));
 }
 
 // Q6_K Coalesced Conversion
@@ -2740,12 +3029,13 @@ static void convert_q6_k_to_coalesced_sycl(void * data, const int ncols, const i
     const size_t total_quant_bytes   = nrows * quant_bytes_per_row;
 
     // Allocate temp buffer for in-place conversion
-    const int runtime_device = ggml_sycl_get_device_id_from_queue(*stream);
-    uint8_t * temp           = (uint8_t *) ggml_sycl_malloc_device(total_quant_bytes, *stream, "mmvq_quant_temp");
+    ggml_sycl::mem_handle temp_handle;
+    uint8_t * temp = mmvq_alloc_device_scratch(total_quant_bytes, *stream, "mmvq_q6_k_coalesce", temp_handle);
     GGML_ASSERT(temp != nullptr);
 
     // Copy current data to temp
-    sycl::event copy_event = stream->memcpy(temp, data, total_quant_bytes);
+    ggml_sycl::mem_handle data_handle = mmvq_coalesced_device_handle(data, stream);
+    sycl::event           copy_event  = ggml_sycl::mem_copy_async(temp_handle, data_handle, total_quant_bytes, *stream);
 
     // Launch conversion kernel
     const int total_work = nrows * tiles_per_row * MMVQ_COALESCED_TILE_BLOCKS * 32;  // ql dominant
@@ -2761,12 +3051,9 @@ static void convert_q6_k_to_coalesced_sycl(void * data, const int ncols, const i
             });
     });
 
-    stream->submit([&](sycl::handler & cgh) {
-        cgh.depends_on(convert_event);
-        cgh.host_task([temp, stream, total_quant_bytes]() {
-            ggml_sycl_free_device_tracked_bytes(temp, total_quant_bytes, *stream);
-        });
-    });
+    std::vector<ggml_sycl::mem_handle> retained;
+    retained.push_back(std::move(temp_handle));
+    ggml_sycl::retain_handles_until_event(std::move(retained), std::move(convert_event));
 }
 
 // Public API for MXFP4 coalesced conversion
@@ -4384,24 +4671,24 @@ static void mul_mat_vec_mxfp4_q8_1_xmx_tiled_id_kernel(const uint8_t * const * _
 }
 
 template <int TILES_N, bool RAW_ACCUM = false>
-static void reorder_mul_mat_vec_mxfp4_q8_1_xmx_tiled_id_sycl(const void * const * expert_ptrs,
-                                                             const void *         vy,
-                                                             float *              dst,
-                                                             const int32_t *      ids,
-                                                             const int            ncols,
-                                                             const int            ncols_y,
-                                                             const int            nrows_per_expert,
-                                                             const int            total_batches,
-                                                             const int            n_ids,
-                                                             const int            n_tokens,
-                                                             const int            ne11,
-                                                             const int64_t        ids_nb0,
-                                                             const int64_t        ids_nb1,
-                                                             const int64_t        nb11,
-                                                             const int64_t        nb12,
-                                                             const int64_t        dst_nb1,
-                                                             const int64_t        dst_nb2,
-                                                             dpct::queue_ptr      stream,
+static void reorder_mul_mat_vec_mxfp4_q8_1_xmx_tiled_id_sycl(const void * const *             expert_ptrs,
+                                                             const void *                     vy,
+                                                             float *                          dst,
+                                                             const int32_t *                  ids,
+                                                             const int                        ncols,
+                                                             const int                        ncols_y,
+                                                             const int                        nrows_per_expert,
+                                                             const int                        total_batches,
+                                                             const int                        n_ids,
+                                                             const int                        n_tokens,
+                                                             const int                        ne11,
+                                                             const int64_t                    ids_nb0,
+                                                             const int64_t                    ids_nb1,
+                                                             const int64_t                    nb11,
+                                                             const int64_t                    nb12,
+                                                             const int64_t                    dst_nb1,
+                                                             const int64_t                    dst_nb2,
+                                                             dpct::queue_ptr                  stream,
                                                              const std::vector<sycl::event> * deps      = nullptr,
                                                              sycl::event *                    event_out = nullptr) {
     GGML_ASSERT(ncols % QK_MXFP4 == 0);
@@ -4433,7 +4720,7 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_xmx_tiled_id_sycl(const void * const 
                                  (const uint8_t * const *) expert_ptrs, vy, dst, ids, ncols, ncols_y, nrows_per_expert,
                                  n_output_tiles, n_tokens, ne11, ids_nb0, ids_nb1, nb11, nb12, dst_nb1, dst_nb2, item,
                                  slm_token, slm_weights, slm_kvalues, slm_weight_scales, slm_token_scale);
-                             });
+                         });
     });
     if (event_out) {
         *event_out = ev;
@@ -5303,6 +5590,157 @@ static sycl::event mxfp4_dpas_pack_q8_single_col_groups_sycl(sycl::queue & queue
     });
 }
 
+static bool mxfp4_grouped_pack_q8_vector_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_MXFP4_GROUPED_PACK_Q8_VECTOR");
+        return env ? std::atoi(env) != 0 : true;
+    }();
+    return enabled;
+}
+
+static sycl::event mxfp4_dpas_pack_q8_grouped_chunks_sycl(sycl::queue &                    queue,
+                                                          const void *                     q8_src,
+                                                          int8_t *                         b_packed,
+                                                          float *                          y_scales,
+                                                          const int32_t *                  group_offsets,
+                                                          const int32_t *                  group_row_slots,
+                                                          const int32_t *                  chunk_groups,
+                                                          const int32_t *                  chunk_row_starts,
+                                                          int                              ncols,
+                                                          int                              ncols_y,
+                                                          int                              n_chunks,
+                                                          int                              n_tokens,
+                                                          int                              ne11,
+                                                          int64_t                          q8_nb11,
+                                                          int64_t                          q8_nb12,
+                                                          const std::vector<sycl::event> & deps          = {},
+                                                          const int32_t *                  active_chunks = nullptr) {
+    constexpr int exec_n  = GGML_SYCL_MXFP4_MOE_XMX_N;
+    constexpr int k_per   = GGML_SYCL_MXFP4_MOE_XMX_K;
+    const int     k_tiles = ncols / k_per;
+
+    if (mxfp4_grouped_pack_q8_vector_enabled()) {
+        return queue.submit([&](sycl::handler & cgh) {
+            if (!deps.empty()) {
+                cgh.depends_on(deps);
+            }
+            cgh.parallel_for(
+                sycl::range<1>(static_cast<size_t>(n_chunks) * static_cast<size_t>(k_tiles) *
+                               static_cast<size_t>(exec_n)),
+                [=](sycl::id<1> idx) {
+                    const int64_t linear = static_cast<int64_t>(idx[0]);
+                    const int     lane   = static_cast<int>(linear % exec_n);
+                    const int64_t t0     = linear / exec_n;
+                    const int     kt     = static_cast<int>(t0 % k_tiles);
+                    const int     chunk  = static_cast<int>(t0 / k_tiles);
+                    if (active_chunks && chunk >= active_chunks[0]) {
+                        return;
+                    }
+
+                    int       id        = -1;
+                    int       iid1      = -1;
+                    const int group     = chunk_groups[chunk];
+                    const int row_begin = group_offsets[group] + chunk_row_starts[chunk];
+                    const int row_end   = group_offsets[group + 1];
+                    const int row_index = row_begin + lane;
+                    if (row_index < row_end) {
+                        const int slot = group_row_slots[row_index];
+                        id             = slot / n_tokens;
+                        iid1           = slot - id * n_tokens;
+                    }
+
+                    const size_t tile_base =
+                        (static_cast<size_t>(chunk) * static_cast<size_t>(k_tiles) + static_cast<size_t>(kt)) *
+                        static_cast<size_t>(k_per * exec_n);
+                    float scale = 0.0f;
+                    if (id >= 0 && iid1 >= 0) {
+                        const int64_t i11    = id % ne11;
+                        const int64_t i12    = iid1;
+                        const char *  q8_row = static_cast<const char *>(q8_src) + i11 * q8_nb11 + i12 * q8_nb12;
+                        const auto *  ds =
+                            reinterpret_cast<const sycl::half2 *>(q8_row + ncols_y + kt * sizeof(sycl::half2));
+                        scale = static_cast<float>(ds->x());
+#pragma unroll
+                        for (int kk = 0; kk < k_per; ++kk) {
+                            const int vnni_offset = (kk / 4) * exec_n * 4 + lane * 4 + (kk % 4);
+                            b_packed[tile_base + static_cast<size_t>(vnni_offset)] =
+                                reinterpret_cast<const int8_t *>(q8_row)[kt * k_per + kk];
+                        }
+                    } else {
+#pragma unroll
+                        for (int kk = 0; kk < k_per; ++kk) {
+                            const int vnni_offset = (kk / 4) * exec_n * 4 + lane * 4 + (kk % 4);
+                            b_packed[tile_base + static_cast<size_t>(vnni_offset)] = 0;
+                        }
+                    }
+
+                    y_scales[(static_cast<size_t>(chunk) * static_cast<size_t>(k_tiles) + static_cast<size_t>(kt)) *
+                                 static_cast<size_t>(exec_n) +
+                             static_cast<size_t>(lane)] = scale;
+                });
+        });
+    }
+
+    return queue.submit([&](sycl::handler & cgh) {
+        if (!deps.empty()) {
+            cgh.depends_on(deps);
+        }
+        cgh.parallel_for(
+            sycl::range<1>(static_cast<size_t>(n_chunks) * static_cast<size_t>(k_tiles) * static_cast<size_t>(exec_n) *
+                           static_cast<size_t>(k_per)),
+            [=](sycl::id<1> idx) {
+                const int64_t linear = static_cast<int64_t>(idx[0]);
+                const int     kk     = static_cast<int>(linear % k_per);
+                const int64_t t0     = linear / k_per;
+                const int     lane   = static_cast<int>(t0 % exec_n);
+                const int64_t t1     = t0 / exec_n;
+                const int     kt     = static_cast<int>(t1 % k_tiles);
+                const int     chunk  = static_cast<int>(t1 / k_tiles);
+                if (active_chunks && chunk >= active_chunks[0]) {
+                    return;
+                }
+
+                int       id        = -1;
+                int       iid1      = -1;
+                const int group     = chunk_groups[chunk];
+                const int row_begin = group_offsets[group] + chunk_row_starts[chunk];
+                const int row_end   = group_offsets[group + 1];
+                const int row_index = row_begin + lane;
+                if (row_index < row_end) {
+                    const int slot = group_row_slots[row_index];
+                    id             = slot / n_tokens;
+                    iid1           = slot - id * n_tokens;
+                }
+
+                int8_t q     = 0;
+                float  scale = 0.0f;
+                if (id >= 0 && iid1 >= 0) {
+                    const int64_t i11    = id % ne11;
+                    const int64_t i12    = iid1;
+                    const char *  q8_row = static_cast<const char *>(q8_src) + i11 * q8_nb11 + i12 * q8_nb12;
+                    q                    = reinterpret_cast<const int8_t *>(q8_row)[kt * k_per + kk];
+                    if (kk == 0) {
+                        const auto * ds =
+                            reinterpret_cast<const sycl::half2 *>(q8_row + ncols_y + kt * sizeof(sycl::half2));
+                        scale = static_cast<float>(ds->x());
+                    }
+                }
+
+                const size_t tile_base =
+                    (static_cast<size_t>(chunk) * static_cast<size_t>(k_tiles) + static_cast<size_t>(kt)) *
+                    static_cast<size_t>(k_per * exec_n);
+                const int vnni_offset                                  = (kk / 4) * exec_n * 4 + lane * 4 + (kk % 4);
+                b_packed[tile_base + static_cast<size_t>(vnni_offset)] = q;
+
+                if (kk == 0) {
+                    y_scales[(static_cast<size_t>(chunk) * static_cast<size_t>(k_tiles) + static_cast<size_t>(kt)) *
+                                 static_cast<size_t>(exec_n) +
+                             static_cast<size_t>(lane)] = scale;
+                }
+            });
+    });
+}
+
 template <int Repeat> struct mxfp4_dpas_down_single_col_kernel;
 
 template <int Repeat>
@@ -5651,21 +6089,27 @@ static bool reorder_mul_mat_vec_mxfp4_dpas_q8_1_id_sycl(ggml_backend_sycl_contex
     const size_t y_bytes =
         static_cast<size_t>(total_batches) * static_cast<size_t>(k_tiles) * static_cast<size_t>(exec_n) * sizeof(float);
 
-    ggml_sycl_pool_alloc<int8_t> b_pool(ctx.pool());
-    ggml_sycl_pool_alloc<float>  y_pool(ctx.pool());
-    b_pool.alloc(b_bytes);
-    y_pool.alloc(y_bytes);
-    int8_t * b_packed = b_pool.get();
-    float *  y_scales = y_pool.get();
+    sycl::queue * stream = ctx.stream();
+
+    ggml_sycl::mem_handle b_handle;
+    ggml_sycl::mem_handle y_handle;
+    int8_t *              b_packed =
+        reinterpret_cast<int8_t *>(mmvq_alloc_device_scratch(b_bytes, *stream, "mmvq_mxfp4_dpas_q8_b", b_handle));
+    float * y_scales =
+        reinterpret_cast<float *>(mmvq_alloc_device_scratch(y_bytes, *stream, "mmvq_mxfp4_dpas_q8_y", y_handle));
     if (!b_packed || !y_scales) {
         return false;
     }
 
-    sycl::queue * stream   = ctx.stream();
     sycl::event pack_event = mxfp4_dpas_pack_q8_single_col_groups_sycl(*stream, vy, b_packed, y_scales, ncols, ncols_y,
                                                                        total_batches, n_tokens, ne11, q8_nb11, q8_nb12);
-    mxfp4_dpas_down_single_col_sycl<repeat>(*stream, expert_ptrs, b_packed, y_scales, dst, ncols, nrows_per_expert,
-                                            total_batches, n_tokens, nb1, nb2, pack_event);
+    sycl::event down_event =
+        mxfp4_dpas_down_single_col_sycl<repeat>(*stream, expert_ptrs, b_packed, y_scales, dst, ncols, nrows_per_expert,
+                                                total_batches, n_tokens, nb1, nb2, pack_event);
+    std::vector<ggml_sycl::mem_handle> retained;
+    retained.push_back(std::move(b_handle));
+    retained.push_back(std::move(y_handle));
+    ggml_sycl::retain_handles_until_event(std::move(retained), std::move(down_event));
     return true;
 }
 
@@ -5717,28 +6161,28 @@ static void mxfp4_pair_glu_split_q8_kernel(const float * __restrict__ gate,
                                            const int32_t * __restrict__ ids,
                                            const float * __restrict__ gate_bias,
                                            const float * __restrict__ up_bias,
-                                           const int     nrows_per_expert,
-                                           const int     blocks_per_row,
-                                           const int     n_tokens,
-                                           const int64_t ids_nb0,
-                                           const int64_t ids_nb1,
-                                           const int64_t src_nb1,
-                                           const int64_t src_nb2,
-                                           const int64_t dst_nb1,
-                                           const int64_t dst_nb2,
-                                           const int64_t q8_row_size,
-                                           const int64_t gate_bias_nb1,
-                                           const int64_t up_bias_nb1,
-                                           const float   alpha,
-                                           const float   limit,
+                                           const int                nrows_per_expert,
+                                           const int                blocks_per_row,
+                                           const int                n_tokens,
+                                           const int64_t            ids_nb0,
+                                           const int64_t            ids_nb1,
+                                           const int64_t            src_nb1,
+                                           const int64_t            src_nb2,
+                                           const int64_t            dst_nb1,
+                                           const int64_t            dst_nb2,
+                                           const int64_t            q8_row_size,
+                                           const int64_t            gate_bias_nb1,
+                                           const int64_t            up_bias_nb1,
+                                           const float              alpha,
+                                           const float              limit,
                                            const sycl::nd_item<1> & item) {
-    const int block      = static_cast<int>(item.get_group(0));
-    const int lane       = static_cast<int>(item.get_local_id(0));
-    const int batch_idx  = block / blocks_per_row;
-    const int block_col  = block - batch_idx * blocks_per_row;
-    const int row        = block_col * QK8_1 + lane;
-    const int id         = batch_idx / n_tokens;
-    const int iid1       = batch_idx - id * n_tokens;
+    const int     block     = static_cast<int>(item.get_group(0));
+    const int     lane      = static_cast<int>(item.get_local_id(0));
+    const int     batch_idx = block / blocks_per_row;
+    const int     block_col = block - batch_idx * blocks_per_row;
+    const int     row       = block_col * QK8_1 + lane;
+    const int     id        = batch_idx / n_tokens;
+    const int     iid1      = batch_idx - id * n_tokens;
     const int32_t expert_id = *(const int32_t *) ((const char *) ids + iid1 * ids_nb1 + id * ids_nb0);
 
     float gate_value = 0.0f;
@@ -5754,7 +6198,7 @@ static void mxfp4_pair_glu_split_q8_kernel(const float * __restrict__ gate,
             up_value += *(const float *) ((const char *) up_bias + expert_id * up_bias_nb1 + row * sizeof(float));
         }
 
-        value = mmvq_moe_apply_pair_glu<GLU_OP>(gate_value, up_value, alpha, limit);
+        value           = mmvq_moe_apply_pair_glu<GLU_OP>(gate_value, up_value, alpha, limit);
         float * dst_out = (float *) ((char *) dst_glu + id * dst_nb1 + iid1 * dst_nb2);
         dst_out[row]    = value;
     }
@@ -5767,7 +6211,7 @@ static void mxfp4_pair_glu_split_q8_kernel(const float * __restrict__ gate,
     int   q    = sycl::round(value / d);
     d          = amax == 0.0f ? 0.0f : d;
 
-    char * q8_row = static_cast<char *>(dst_q8_soa) + static_cast<int64_t>(batch_idx) * q8_row_size;
+    char * q8_row                    = static_cast<char *>(dst_q8_soa) + static_cast<int64_t>(batch_idx) * q8_row_size;
     q8_row[block_col * QK8_1 + lane] = static_cast<int8_t>(q);
     if (lane == 0) {
         auto ds_ptr = reinterpret_cast<sycl::half2 *>(q8_row + nrows_per_expert + block_col * sizeof(sycl::half2));
@@ -5852,10 +6296,10 @@ static sycl::event mxfp4_pair_glu_split_q8_submit(const float *       gate,
                                                   const sycl::event & gate_event,
                                                   const sycl::event & up_event,
                                                   dpct::queue_ptr     stream) {
-    const int blocks_per_row = nrows_per_expert / QK8_1;
-    const size_t total_blocks = static_cast<size_t>(blocks_per_row) * static_cast<size_t>(total_batches);
-    const size_t local_range  = WARP_SIZE;
-    const size_t global_range = total_blocks * local_range;
+    const int    blocks_per_row = nrows_per_expert / QK8_1;
+    const size_t total_blocks   = static_cast<size_t>(blocks_per_row) * static_cast<size_t>(total_batches);
+    const size_t local_range    = WARP_SIZE;
+    const size_t global_range   = total_blocks * local_range;
 
     auto submit_glu_q8 = [&](auto glu_tag) -> sycl::event {
         constexpr int GLU_OP = decltype(glu_tag)::value;
@@ -5911,9 +6355,9 @@ static void reorder_mul_mat_vec_mxfp4_i8_q8_1_id_pair_glu_split_sycl_rows(
     int                              scale_stride_blocks,
     bool                             cache_y_local,
     dpct::queue_ptr                  stream,
-    sycl::event *                    event_out = nullptr,
-    const std::vector<sycl::event> * deps      = nullptr,
-    void *                           dst_q8_soa = nullptr,
+    sycl::event *                    event_out   = nullptr,
+    const std::vector<sycl::event> * deps        = nullptr,
+    void *                           dst_q8_soa  = nullptr,
     int64_t                          q8_row_size = 0) {
     sycl::event gate_event;
     sycl::event up_event;
@@ -5923,8 +6367,7 @@ static void reorder_mul_mat_vec_mxfp4_i8_q8_1_id_pair_glu_split_sycl_rows(
         &gate_event);
     reorder_mul_mat_vec_mxfp4_i8_q8_1_id_sycl_rows<MOE_MMV_Y, USE_WEIGHT_SCALE, SUBGROUP_SIZE>(
         up_ptrs, vy, up_tmp, ids, ncols, ncols_y, nrows_per_expert, num_experts, total_batches, n_ids, n_tokens, ne11,
-        ids_nb0, ids_nb1, nb11, nb12, dst_nb1, dst_nb2, scale_stride_blocks, cache_y_local, stream, deps,
-        &up_event);
+        ids_nb0, ids_nb1, nb11, nb12, dst_nb1, dst_nb2, scale_stride_blocks, cache_y_local, stream, deps, &up_event);
 
     sycl::event glu_event =
         dst_q8_soa ?
@@ -5941,43 +6384,42 @@ static void reorder_mul_mat_vec_mxfp4_i8_q8_1_id_pair_glu_split_sycl_rows(
 }
 
 template <int MOE_MMV_Y, bool USE_WEIGHT_SCALE = true, int SUBGROUP_SIZE = WARP_SIZE>
-static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_split_sycl_rows(
-    const void * const *             gate_ptrs,
-    const void * const *             up_ptrs,
-    const void *                     vy,
-    float *                          gate_tmp,
-    float *                          up_tmp,
-    float *                          dst_glu,
-    const int32_t *                  ids,
-    const float *                    gate_bias,
-    const float *                    up_bias,
-    const int                        ncols,
-    const int                        ncols_y,
-    const int                        nrows_per_expert,
-    const int                        num_experts,
-    const int                        total_batches,
-    const int                        n_ids,
-    const int                        n_tokens,
-    const int                        ne11,
-    const int64_t                    ids_nb0,
-    const int64_t                    ids_nb1,
-    const int64_t                    nb11,
-    const int64_t                    nb12,
-    const int64_t                    dst_nb1,
-    const int64_t                    dst_nb2,
-    const int64_t                    gate_bias_nb1,
-    const int64_t                    up_bias_nb1,
-    const int                        glu_op,
-    const float                      alpha,
-    const float                      limit,
-    bool                             vector_qs_load,
-    int                              scale_stride_blocks,
-    bool                             cache_y_local,
-    dpct::queue_ptr                  stream,
-    sycl::event *                    event_out = nullptr,
-    const std::vector<sycl::event> * deps      = nullptr,
-    void *                           dst_q8_soa = nullptr,
-    int64_t                          q8_row_size = 0) {
+static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_split_sycl_rows(const void * const * gate_ptrs,
+                                                                       const void * const * up_ptrs,
+                                                                       const void *         vy,
+                                                                       float *              gate_tmp,
+                                                                       float *              up_tmp,
+                                                                       float *              dst_glu,
+                                                                       const int32_t *      ids,
+                                                                       const float *        gate_bias,
+                                                                       const float *        up_bias,
+                                                                       const int            ncols,
+                                                                       const int            ncols_y,
+                                                                       const int            nrows_per_expert,
+                                                                       const int            num_experts,
+                                                                       const int            total_batches,
+                                                                       const int            n_ids,
+                                                                       const int            n_tokens,
+                                                                       const int            ne11,
+                                                                       const int64_t        ids_nb0,
+                                                                       const int64_t        ids_nb1,
+                                                                       const int64_t        nb11,
+                                                                       const int64_t        nb12,
+                                                                       const int64_t        dst_nb1,
+                                                                       const int64_t        dst_nb2,
+                                                                       const int64_t        gate_bias_nb1,
+                                                                       const int64_t        up_bias_nb1,
+                                                                       const int            glu_op,
+                                                                       const float          alpha,
+                                                                       const float          limit,
+                                                                       bool                 vector_qs_load,
+                                                                       int                  scale_stride_blocks,
+                                                                       bool                 cache_y_local,
+                                                                       dpct::queue_ptr      stream,
+                                                                       sycl::event *        event_out        = nullptr,
+                                                                       const std::vector<sycl::event> * deps = nullptr,
+                                                                       void *  dst_q8_soa                    = nullptr,
+                                                                       int64_t q8_row_size                   = 0) {
     sycl::event gate_event;
     sycl::event up_event;
     reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows<MOE_MMV_Y, USE_WEIGHT_SCALE, SUBGROUP_SIZE>(
@@ -6005,12 +6447,19 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_split_sycl_rows(
 
 template <int Repeat, int GLU_OP> struct mxfp4_pair_glu_xmx_tiled_dpas_kernel;
 template <int Repeat, int GLU_OP, bool Prefetch> struct mxfp4_pair_glu_xmx_tiled_dpas_m2_kernel;
+template <int Repeat, int GLU_OP> struct mxfp4_pair_glu_xmx_tiled_dpas_m4_kernel;
 template <int Repeat, int GLU_OP> struct mxfp4_pair_glu_xmx_tiled_dpas_direct_q8_kernel;
 template <int Repeat, int GLU_OP> struct mxfp4_pair_glu_xmx_tiled_dpas_m2_direct_q8_kernel;
 template <int Repeat> struct mxfp4_xmx_tiled_grouped_direct_q8_kernel;
 template <int Repeat> struct mxfp4_xmx_tiled_grouped_chunk_join_kernel;
 template <int Repeat> struct mxfp4_i8_grouped_direct_q8_kernel;
+template <int Repeat> struct mxfp4_i8_grouped_direct_q8_m2_kernel;
+template <int Repeat> struct mxfp4_i8_grouped_direct_q8_m4_kernel;
+template <int Repeat> struct mxfp4_i8_grouped_packed_q8_m4_kernel;
+template <int Repeat> struct mxfp4_i8_grouped_chunk_join_kernel;
 template <int Repeat, int GLU_OP> struct mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_kernel;
+template <int Repeat, int GLU_OP> struct mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_m2_kernel;
+template <int Repeat, int GLU_OP> struct mxfp4_pair_glu_xmx_tiled_grouped_packed_q8_m2_kernel;
 template <int Repeat> struct mxfp4_pair_glu_xmx_tiled_grouped_chunk_join_kernel;
 
 template <int Repeat, int GLU_OP>
@@ -6552,6 +7001,354 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_direct_q8_sycl(sycl::queue &
 }
 
 template <int Repeat, int GLU_OP>
+static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m4_sycl(sycl::queue &        queue,
+                                                         const void * const * gate_ptrs,
+                                                         const void * const * up_ptrs,
+                                                         const int8_t *       b_packed,
+                                                         const float *        y_scales,
+                                                         float *              dst_glu,
+                                                         const int32_t *      ids,
+                                                         const float *        gate_bias,
+                                                         const float *        up_bias,
+                                                         int                  ncols,
+                                                         int                  nrows_per_expert,
+                                                         int                  total_batches,
+                                                         int                  n_tokens,
+                                                         int64_t              ids_nb0,
+                                                         int64_t              ids_nb1,
+                                                         int64_t              dst_nb1,
+                                                         int64_t              dst_nb2,
+                                                         int64_t              gate_bias_nb1,
+                                                         int64_t              up_bias_nb1,
+                                                         float                alpha,
+                                                         float                limit,
+                                                         int                  tile_n_total,
+                                                         const sycl::event &  pack_event,
+                                                         void *               dst_q8_soa  = nullptr,
+                                                         int64_t              q8_row_size = 0) {
+    constexpr int exec_n = GGML_SYCL_MXFP4_MOE_XMX_N;
+    constexpr int k_per  = GGML_SYCL_MXFP4_MOE_XMX_K;
+    constexpr int an     = Repeat * k_per;
+    constexpr int bn     = k_per * exec_n;
+
+    const int64_t m_tiles       = (static_cast<int64_t>(nrows_per_expert) + Repeat - 1) / Repeat;
+    const int64_t m_tile_groups = (m_tiles + 3) / 4;
+    const int64_t k_tiles       = ncols / k_per;
+    const int64_t tiles         = static_cast<int64_t>(total_batches) * m_tile_groups;
+
+    return queue.submit([&](sycl::handler & h) {
+        h.depends_on(pack_event);
+        h.parallel_for<mxfp4_pair_glu_xmx_tiled_dpas_m4_kernel<Repeat, GLU_OP>>(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(tiles)), sycl::range<1>(1)),
+            [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
+                using namespace sycl::ext::intel::esimd;
+                const int64_t tile_idx = static_cast<int64_t>(item.get_global_id(0));
+                const int64_t group    = tile_idx / m_tile_groups;
+                const int64_t group_m  = tile_idx - group * m_tile_groups;
+                const int64_t tile_m0  = group_m * 4;
+                const int64_t tile_m1  = tile_m0 + 1;
+                const int64_t tile_m2  = tile_m0 + 2;
+                const int64_t tile_m3  = tile_m0 + 3;
+                const bool    have_m1  = tile_m1 < m_tiles;
+                const bool    have_m2  = tile_m2 < m_tiles;
+                const bool    have_m3  = tile_m3 < m_tiles;
+                const int     id       = static_cast<int>(group / n_tokens);
+                const int     iid1     = static_cast<int>(group - static_cast<int64_t>(id) * n_tokens);
+                const int32_t expert_id =
+                    ids ? *(const int32_t *) ((const char *) ids + static_cast<int64_t>(iid1) * ids_nb1 +
+                                              static_cast<int64_t>(id) * ids_nb0) :
+                          static_cast<int32_t>(group);
+
+                const uint8_t * gate_base = reinterpret_cast<const uint8_t *>(gate_ptrs[expert_id]);
+                const uint8_t * up_base   = reinterpret_cast<const uint8_t *>(up_ptrs[expert_id]);
+                if (!gate_base || !up_base) {
+                    return;
+                }
+
+                const int64_t n_tile_groups_n = (nrows_per_expert + tile_n_total - 1) / tile_n_total;
+                const int64_t group_bytes     = tile_n_total * (1 + k_per / 2);
+                const int64_t kt_group_stride = n_tile_groups_n * group_bytes;
+
+                const int64_t xmx_row_start0    = tile_m0 * Repeat;
+                const int64_t xmx_group_n0      = xmx_row_start0 / tile_n_total;
+                const int64_t xmx_row_in_group0 = xmx_row_start0 - xmx_group_n0 * tile_n_total;
+                const int64_t xmx_row_start1    = tile_m1 * Repeat;
+                const int64_t xmx_group_n1      = xmx_row_start1 / tile_n_total;
+                const int64_t xmx_row_in_group1 = xmx_row_start1 - xmx_group_n1 * tile_n_total;
+                const int64_t xmx_row_start2    = tile_m2 * Repeat;
+                const int64_t xmx_group_n2      = xmx_row_start2 / tile_n_total;
+                const int64_t xmx_row_in_group2 = xmx_row_start2 - xmx_group_n2 * tile_n_total;
+                const int64_t xmx_row_start3    = tile_m3 * Repeat;
+                const int64_t xmx_group_n3      = xmx_row_start3 / tile_n_total;
+                const int64_t xmx_row_in_group3 = xmx_row_start3 - xmx_group_n3 * tile_n_total;
+
+                const uint8_t * gate_group0 = gate_base + xmx_group_n0 * group_bytes;
+                const uint8_t * up_group0   = up_base + xmx_group_n0 * group_bytes;
+                const uint8_t * gate_group1 = gate_base + xmx_group_n1 * group_bytes;
+                const uint8_t * up_group1   = up_base + xmx_group_n1 * group_bytes;
+                const uint8_t * gate_group2 = gate_base + xmx_group_n2 * group_bytes;
+                const uint8_t * up_group2   = up_base + xmx_group_n2 * group_bytes;
+                const uint8_t * gate_group3 = gate_base + xmx_group_n3 * group_bytes;
+                const uint8_t * up_group3   = up_base + xmx_group_n3 * group_bytes;
+                const int8_t *  b_ptr       = b_packed + (group * k_tiles) * bn;
+
+                simd<float, Repeat> gate_acc0 = 0.0f;
+                simd<float, Repeat> up_acc0   = 0.0f;
+                simd<float, Repeat> gate_acc1 = 0.0f;
+                simd<float, Repeat> up_acc1   = 0.0f;
+                simd<float, Repeat> gate_acc2 = 0.0f;
+                simd<float, Repeat> up_acc2   = 0.0f;
+                simd<float, Repeat> gate_acc3 = 0.0f;
+                simd<float, Repeat> up_acc3   = 0.0f;
+                for (int64_t kt = 0; kt < k_tiles; ++kt) {
+                    simd<int8_t, bn> b_vec   = block_load<int8_t, bn>(b_ptr);
+                    simd<float, 1>   y_scale = block_load<float, 1>(y_scales + (group * k_tiles + kt) * exec_n);
+
+                    simd<int8_t, an>    gate_a_vec0;
+                    simd<int8_t, an>    up_a_vec0;
+                    simd<float, Repeat> gate_w_scale0;
+                    simd<float, Repeat> up_w_scale0;
+                    mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(gate_group0, tile_n_total, xmx_row_in_group0,
+                                                                  gate_a_vec0, gate_w_scale0);
+                    mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(up_group0, tile_n_total, xmx_row_in_group0, up_a_vec0,
+                                                                  up_w_scale0);
+                    simd<int, Repeat * exec_n> gate_part0 = 0;
+                    simd<int, Repeat * exec_n> up_part0   = 0;
+                    gate_part0 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(gate_part0, b_vec, gate_a_vec0);
+                    up_part0   = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(up_part0, b_vec, up_a_vec0);
+#pragma unroll
+                    for (int r = 0; r < Repeat; ++r) {
+                        simd<int, 1>   gate_i = gate_part0.template select<1, 1>(r * exec_n);
+                        simd<int, 1>   up_i   = up_part0.template select<1, 1>(r * exec_n);
+                        simd<float, 1> gate_f = convert<float>(gate_i) * (y_scale * gate_w_scale0[r]);
+                        simd<float, 1> up_f   = convert<float>(up_i) * (y_scale * up_w_scale0[r]);
+                        gate_acc0[r] += gate_f[0];
+                        up_acc0[r] += up_f[0];
+                    }
+
+                    if (have_m1) {
+                        simd<int8_t, an>    gate_a_vec1;
+                        simd<int8_t, an>    up_a_vec1;
+                        simd<float, Repeat> gate_w_scale1;
+                        simd<float, Repeat> up_w_scale1;
+                        mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(gate_group1, tile_n_total, xmx_row_in_group1,
+                                                                      gate_a_vec1, gate_w_scale1);
+                        mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(up_group1, tile_n_total, xmx_row_in_group1,
+                                                                      up_a_vec1, up_w_scale1);
+                        simd<int, Repeat * exec_n> gate_part1 = 0;
+                        simd<int, Repeat * exec_n> up_part1   = 0;
+                        gate_part1 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(gate_part1, b_vec, gate_a_vec1);
+                        up_part1   = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(up_part1, b_vec, up_a_vec1);
+#pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            simd<int, 1>   gate_i = gate_part1.template select<1, 1>(r * exec_n);
+                            simd<int, 1>   up_i   = up_part1.template select<1, 1>(r * exec_n);
+                            simd<float, 1> gate_f = convert<float>(gate_i) * (y_scale * gate_w_scale1[r]);
+                            simd<float, 1> up_f   = convert<float>(up_i) * (y_scale * up_w_scale1[r]);
+                            gate_acc1[r] += gate_f[0];
+                            up_acc1[r] += up_f[0];
+                        }
+                    }
+
+                    if (have_m2) {
+                        simd<int8_t, an>    gate_a_vec2;
+                        simd<int8_t, an>    up_a_vec2;
+                        simd<float, Repeat> gate_w_scale2;
+                        simd<float, Repeat> up_w_scale2;
+                        mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(gate_group2, tile_n_total, xmx_row_in_group2,
+                                                                      gate_a_vec2, gate_w_scale2);
+                        mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(up_group2, tile_n_total, xmx_row_in_group2,
+                                                                      up_a_vec2, up_w_scale2);
+                        simd<int, Repeat * exec_n> gate_part2 = 0;
+                        simd<int, Repeat * exec_n> up_part2   = 0;
+                        gate_part2 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(gate_part2, b_vec, gate_a_vec2);
+                        up_part2   = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(up_part2, b_vec, up_a_vec2);
+#pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            simd<int, 1>   gate_i = gate_part2.template select<1, 1>(r * exec_n);
+                            simd<int, 1>   up_i   = up_part2.template select<1, 1>(r * exec_n);
+                            simd<float, 1> gate_f = convert<float>(gate_i) * (y_scale * gate_w_scale2[r]);
+                            simd<float, 1> up_f   = convert<float>(up_i) * (y_scale * up_w_scale2[r]);
+                            gate_acc2[r] += gate_f[0];
+                            up_acc2[r] += up_f[0];
+                        }
+                    }
+
+                    if (have_m3) {
+                        simd<int8_t, an>    gate_a_vec3;
+                        simd<int8_t, an>    up_a_vec3;
+                        simd<float, Repeat> gate_w_scale3;
+                        simd<float, Repeat> up_w_scale3;
+                        mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(gate_group3, tile_n_total, xmx_row_in_group3,
+                                                                      gate_a_vec3, gate_w_scale3);
+                        mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(up_group3, tile_n_total, xmx_row_in_group3,
+                                                                      up_a_vec3, up_w_scale3);
+                        simd<int, Repeat * exec_n> gate_part3 = 0;
+                        simd<int, Repeat * exec_n> up_part3   = 0;
+                        gate_part3 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(gate_part3, b_vec, gate_a_vec3);
+                        up_part3   = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(up_part3, b_vec, up_a_vec3);
+#pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            simd<int, 1>   gate_i = gate_part3.template select<1, 1>(r * exec_n);
+                            simd<int, 1>   up_i   = up_part3.template select<1, 1>(r * exec_n);
+                            simd<float, 1> gate_f = convert<float>(gate_i) * (y_scale * gate_w_scale3[r]);
+                            simd<float, 1> up_f   = convert<float>(up_i) * (y_scale * up_w_scale3[r]);
+                            gate_acc3[r] += gate_f[0];
+                            up_acc3[r] += up_f[0];
+                        }
+                    }
+
+                    b_ptr += bn;
+                    gate_group0 += kt_group_stride;
+                    up_group0 += kt_group_stride;
+                    gate_group1 += kt_group_stride;
+                    up_group1 += kt_group_stride;
+                    gate_group2 += kt_group_stride;
+                    up_group2 += kt_group_stride;
+                    gate_group3 += kt_group_stride;
+                    up_group3 += kt_group_stride;
+                }
+
+                float * dst_out =
+                    reinterpret_cast<float *>(reinterpret_cast<char *>(dst_glu) + static_cast<int64_t>(id) * dst_nb1 +
+                                              static_cast<int64_t>(iid1) * dst_nb2);
+                simd<float, QK8_1> q8_values = 0.0f;
+#pragma unroll
+                for (int r = 0; r < Repeat; ++r) {
+                    const int row = static_cast<int>(tile_m0) * Repeat + r;
+                    if (row < nrows_per_expert) {
+                        float gate_value = gate_acc0[r];
+                        float up_value   = up_acc0[r];
+                        if (gate_bias) {
+                            gate_value += *(const float *) ((const char *) gate_bias +
+                                                            static_cast<int64_t>(expert_id) * gate_bias_nb1 +
+                                                            static_cast<int64_t>(row) * sizeof(float));
+                        }
+                        if (up_bias) {
+                            up_value += *(const float *) ((const char *) up_bias +
+                                                          static_cast<int64_t>(expert_id) * up_bias_nb1 +
+                                                          static_cast<int64_t>(row) * sizeof(float));
+                        }
+                        const float value = mmvq_moe_apply_pair_glu_esimd<GLU_OP>(gate_value, up_value, alpha, limit);
+                        q8_values[r]      = value;
+                        block_store<float, 1>(dst_out + row, value);
+                    }
+                }
+                if (have_m1) {
+#pragma unroll
+                    for (int r = 0; r < Repeat; ++r) {
+                        const int row = static_cast<int>(tile_m1) * Repeat + r;
+                        if (row < nrows_per_expert) {
+                            float gate_value = gate_acc1[r];
+                            float up_value   = up_acc1[r];
+                            if (gate_bias) {
+                                gate_value += *(const float *) ((const char *) gate_bias +
+                                                                static_cast<int64_t>(expert_id) * gate_bias_nb1 +
+                                                                static_cast<int64_t>(row) * sizeof(float));
+                            }
+                            if (up_bias) {
+                                up_value += *(const float *) ((const char *) up_bias +
+                                                              static_cast<int64_t>(expert_id) * up_bias_nb1 +
+                                                              static_cast<int64_t>(row) * sizeof(float));
+                            }
+                            const float value =
+                                mmvq_moe_apply_pair_glu_esimd<GLU_OP>(gate_value, up_value, alpha, limit);
+                            q8_values[Repeat + r] = value;
+                            block_store<float, 1>(dst_out + row, value);
+                        }
+                    }
+                }
+                if (have_m2) {
+#pragma unroll
+                    for (int r = 0; r < Repeat; ++r) {
+                        const int row = static_cast<int>(tile_m2) * Repeat + r;
+                        if (row < nrows_per_expert) {
+                            float gate_value = gate_acc2[r];
+                            float up_value   = up_acc2[r];
+                            if (gate_bias) {
+                                gate_value += *(const float *) ((const char *) gate_bias +
+                                                                static_cast<int64_t>(expert_id) * gate_bias_nb1 +
+                                                                static_cast<int64_t>(row) * sizeof(float));
+                            }
+                            if (up_bias) {
+                                up_value += *(const float *) ((const char *) up_bias +
+                                                              static_cast<int64_t>(expert_id) * up_bias_nb1 +
+                                                              static_cast<int64_t>(row) * sizeof(float));
+                            }
+                            const float value =
+                                mmvq_moe_apply_pair_glu_esimd<GLU_OP>(gate_value, up_value, alpha, limit);
+                            q8_values[2 * Repeat + r] = value;
+                            block_store<float, 1>(dst_out + row, value);
+                        }
+                    }
+                }
+                if (have_m3) {
+#pragma unroll
+                    for (int r = 0; r < Repeat; ++r) {
+                        const int row = static_cast<int>(tile_m3) * Repeat + r;
+                        if (row < nrows_per_expert) {
+                            float gate_value = gate_acc3[r];
+                            float up_value   = up_acc3[r];
+                            if (gate_bias) {
+                                gate_value += *(const float *) ((const char *) gate_bias +
+                                                                static_cast<int64_t>(expert_id) * gate_bias_nb1 +
+                                                                static_cast<int64_t>(row) * sizeof(float));
+                            }
+                            if (up_bias) {
+                                up_value += *(const float *) ((const char *) up_bias +
+                                                              static_cast<int64_t>(expert_id) * up_bias_nb1 +
+                                                              static_cast<int64_t>(row) * sizeof(float));
+                            }
+                            const float value =
+                                mmvq_moe_apply_pair_glu_esimd<GLU_OP>(gate_value, up_value, alpha, limit);
+                            q8_values[3 * Repeat + r] = value;
+                            block_store<float, 1>(dst_out + row, value);
+                        }
+                    }
+                }
+                if constexpr (Repeat == GGML_SYCL_MXFP4_MOE_XMX_M) {
+                    if (dst_q8_soa && q8_row_size > 0) {
+                        float amax = 0.0f;
+                        float sum  = 0.0f;
+#pragma unroll
+                        for (int i = 0; i < QK8_1; ++i) {
+                            const float value     = q8_values[i];
+                            const float abs_value = value < 0.0f ? -value : value;
+                            amax                  = abs_value > amax ? abs_value : amax;
+                            sum += value;
+                        }
+                        float d = amax == 0.0f ? 1.0f : amax / 127.0f;
+
+                        simd<int8_t, QK8_1> q8_quant = 0;
+#pragma unroll
+                        for (int i = 0; i < QK8_1; ++i) {
+                            const float scaled  = static_cast<float>(q8_values[i]) / d;
+                            const float rounded = scaled >= 0.0f ? scaled + 0.5f : scaled - 0.5f;
+                            q8_quant[i]         = static_cast<int8_t>(rounded);
+                        }
+                        d = amax == 0.0f ? 0.0f : d;
+
+                        const int64_t q8_row_offset =
+                            (static_cast<int64_t>(id) + static_cast<int64_t>(iid1) * (total_batches / n_tokens)) *
+                            q8_row_size;
+                        char *    q8_row    = static_cast<char *>(dst_q8_soa) + q8_row_offset;
+                        const int block_col = static_cast<int>(tile_m0 * Repeat / QK8_1);
+                        block_store<int8_t, QK8_1>(reinterpret_cast<int8_t *>(q8_row) + block_col * QK8_1, q8_quant);
+
+                        simd<sycl::half, 2> ds;
+                        ds[0] = sycl::half(d);
+                        ds[1] = sycl::half(sum);
+                        block_store<sycl::half, 2>(
+                            reinterpret_cast<sycl::half *>(q8_row + nrows_per_expert +
+                                                           static_cast<int64_t>(block_col) * sizeof(sycl::half2)),
+                            ds);
+                    }
+                }
+            });
+    });
+}
+
+template <int Repeat, int GLU_OP>
 static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_direct_q8_sycl(sycl::queue &        queue,
                                                                 const void * const * gate_ptrs,
                                                                 const void * const * up_ptrs,
@@ -6825,6 +7622,836 @@ static sycl::event mxfp4_xmx_tiled_grouped_direct_q8_sycl(sycl::queue &         
     });
 }
 
+template <int Repeat> static bool mxfp4_i8_grouped_m2_enabled() {
+    static const int enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_MXFP4_I8_GROUPED_M2");
+        return env ? (std::atoi(env) != 0 ? 1 : 0) : 1;
+    }();
+    return enabled != 0;
+}
+
+template <int Repeat> static int mxfp4_i8_grouped_m_tiles() {
+    static const int tiles = []() {
+        const char * env = std::getenv("GGML_SYCL_MXFP4_I8_GROUPED_M_TILES");
+        if (env) {
+            const int parsed = std::atoi(env);
+            if (parsed == 4) {
+                return 4;
+            }
+            if (parsed == 2) {
+                return 2;
+            }
+            if (parsed == 1) {
+                return 1;
+            }
+        }
+        return mxfp4_i8_grouped_m2_enabled<Repeat>() ? 4 : 1;
+    }();
+    return tiles;
+}
+
+static bool mxfp4_moe_device_grouping_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_MOE_DEVICE_GROUPING");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static bool mxfp4_moe_device_grouping_sync_chunks_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_MOE_DEVICE_GROUPING_SYNC_CHUNKS");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static int mxfp4_copy_active_chunks_to_host(sycl::queue &                    queue,
+                                            const int32_t *                  active_chunks_device,
+                                            const std::vector<sycl::event> & deps) {
+    int32_t   active_chunks_host = -1;
+    const int queue_device       = ggml_sycl_get_device_id_from_queue(queue);
+    auto      host_handle        = ggml_sycl::mem_handle::from_direct(&active_chunks_host, GGML_LAYOUT_AOS,
+                                                                      /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE);
+    auto      device_handle      = ggml_sycl::mem_handle::from_chunk_ptr(const_cast<int32_t *>(active_chunks_device),
+                                                                         queue_device, GGML_LAYOUT_AOS, /*on_device=*/true);
+    ggml_sycl::mem_copy(host_handle, device_handle, sizeof(active_chunks_host), queue, deps);
+    return active_chunks_host;
+}
+
+struct mxfp4_grouped_metadata_from_ids_kernel;
+
+static sycl::event mxfp4_build_grouped_metadata_from_ids_sycl(sycl::queue &                    queue,
+                                                              const int32_t *                  ids,
+                                                              int64_t                          ids_nb0,
+                                                              int64_t                          ids_nb1,
+                                                              int                              n_ids,
+                                                              int                              n_tokens,
+                                                              int                              n_experts,
+                                                              int                              exec_n,
+                                                              int32_t *                        group_expert_ids,
+                                                              int32_t *                        group_offsets,
+                                                              int32_t *                        group_row_slots,
+                                                              int32_t *                        chunk_groups,
+                                                              int32_t *                        chunk_row_starts,
+                                                              int32_t *                        active_chunks,
+                                                              const std::vector<sycl::event> & deps) {
+    return queue.submit([&](sycl::handler & h) {
+        if (!deps.empty()) {
+            h.depends_on(deps);
+        }
+        h.single_task<mxfp4_grouped_metadata_from_ids_kernel>([=]() {
+            if (!ids || !group_expert_ids || !group_offsets || !group_row_slots || !chunk_groups || !chunk_row_starts ||
+                !active_chunks || n_ids <= 0 || n_tokens <= 0 || n_experts <= 0 || exec_n <= 0) {
+                if (active_chunks) {
+                    active_chunks[0] = -1;
+                }
+                return;
+            }
+
+            for (int e = 0; e <= n_experts; ++e) {
+                group_offsets[e] = 0;
+            }
+
+            for (int iid1 = 0; iid1 < n_tokens; ++iid1) {
+                for (int id = 0; id < n_ids; ++id) {
+                    const char *  ids_row = reinterpret_cast<const char *>(ids) + static_cast<int64_t>(iid1) * ids_nb1;
+                    const int32_t eid =
+                        *reinterpret_cast<const int32_t *>(ids_row + static_cast<int64_t>(id) * ids_nb0);
+                    if (eid < 0 || eid >= n_experts) {
+                        active_chunks[0] = -1;
+                        return;
+                    }
+                    group_offsets[eid + 1]++;
+                }
+            }
+
+            int total = 0;
+            for (int e = 0; e < n_experts; ++e) {
+                const int count     = group_offsets[e + 1];
+                group_offsets[e]    = total;
+                chunk_groups[e]     = total;
+                group_expert_ids[e] = e;
+                total += count;
+            }
+            group_offsets[n_experts] = total;
+
+            for (int iid1 = 0; iid1 < n_tokens; ++iid1) {
+                for (int id = 0; id < n_ids; ++id) {
+                    const char *  ids_row = reinterpret_cast<const char *>(ids) + static_cast<int64_t>(iid1) * ids_nb1;
+                    const int32_t eid =
+                        *reinterpret_cast<const int32_t *>(ids_row + static_cast<int64_t>(id) * ids_nb0);
+                    const int pos        = chunk_groups[eid]++;
+                    group_row_slots[pos] = id * n_tokens + iid1;
+                }
+            }
+
+            int n_chunks = 0;
+            for (int e = 0; e < n_experts; ++e) {
+                const int rows_begin = group_offsets[e];
+                const int rows_end   = group_offsets[e + 1];
+                const int rows       = rows_end - rows_begin;
+                for (int row_start = 0; row_start < rows; row_start += exec_n) {
+                    chunk_groups[n_chunks]     = e;
+                    chunk_row_starts[n_chunks] = row_start;
+                    n_chunks++;
+                }
+            }
+            active_chunks[0] = n_chunks;
+        });
+    });
+}
+
+template <int Repeat>
+static sycl::event mxfp4_i8_grouped_direct_q8_m2_sycl(sycl::queue &                    queue,
+                                                      const void * const *             expert_ptrs,
+                                                      const void *                     q8_src,
+                                                      float *                          dst,
+                                                      const int32_t *                  group_expert_ids,
+                                                      const int32_t *                  group_offsets,
+                                                      const int32_t *                  group_row_slots,
+                                                      const int32_t *                  chunk_groups,
+                                                      const int32_t *                  chunk_row_starts,
+                                                      int                              ncols,
+                                                      int                              ncols_y,
+                                                      int                              nrows_per_expert,
+                                                      int                              n_chunks,
+                                                      int                              n_tokens,
+                                                      int                              ne11,
+                                                      int64_t                          q8_nb11,
+                                                      int64_t                          q8_nb12,
+                                                      int64_t                          dst_nb1,
+                                                      int64_t                          dst_nb2,
+                                                      int                              scale_stride_blocks,
+                                                      const std::vector<sycl::event> & deps          = {},
+                                                      const int32_t *                  active_chunks = nullptr) {
+    constexpr int exec_n = GGML_SYCL_MXFP4_MOE_XMX_N;
+    constexpr int k_per  = GGML_SYCL_MXFP4_MOE_XMX_K;
+    constexpr int an     = Repeat * k_per;
+    constexpr int bn     = k_per * exec_n;
+
+    const int64_t m_tiles              = (static_cast<int64_t>(nrows_per_expert) + Repeat - 1) / Repeat;
+    const int64_t m_tile_pairs         = (m_tiles + 1) / 2;
+    const int64_t k_tiles              = ncols / k_per;
+    const int64_t row_i8_stride        = static_cast<int64_t>(ncols);
+    const int64_t total_i8_size_expert = static_cast<int64_t>(nrows_per_expert) * row_i8_stride;
+    const int     scale_stride         = scale_stride_blocks > 0 ? scale_stride_blocks : static_cast<int>(k_tiles);
+    const int64_t tiles                = static_cast<int64_t>(n_chunks) * m_tile_pairs;
+
+    return queue.submit([&](sycl::handler & h) {
+        if (!deps.empty()) {
+            h.depends_on(deps);
+        }
+        h.parallel_for<mxfp4_i8_grouped_direct_q8_m2_kernel<Repeat>>(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(tiles)), sycl::range<1>(1)),
+            [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
+                using namespace sycl::ext::intel::esimd;
+                const int64_t tile_idx = static_cast<int64_t>(item.get_global_id(0));
+                const int64_t chunk    = tile_idx / m_tile_pairs;
+                const int64_t pair_m   = tile_idx - chunk * m_tile_pairs;
+                const int64_t tile_m0  = pair_m * 2;
+                const int64_t tile_m1  = tile_m0 + 1;
+                const bool    have_m1  = tile_m1 < m_tiles;
+                if (active_chunks && chunk >= active_chunks[0]) {
+                    return;
+                }
+                const int group = chunk_groups[chunk];
+
+                simd<int, exec_n> lane_id   = -1;
+                simd<int, exec_n> lane_iid1 = -1;
+                const int         expert_id = group_expert_ids[group];
+                const int         row_begin = group_offsets[group] + chunk_row_starts[chunk];
+                const int         row_end   = group_offsets[group + 1];
+#pragma unroll
+                for (int lane = 0; lane < exec_n; ++lane) {
+                    const int row_index = row_begin + lane;
+                    if (row_index >= row_end) {
+                        continue;
+                    }
+                    const int slot  = group_row_slots[row_index];
+                    const int id    = slot / n_tokens;
+                    lane_id[lane]   = id;
+                    lane_iid1[lane] = slot - id * n_tokens;
+                }
+
+                const int8_t * a_base = reinterpret_cast<const int8_t *>(expert_ptrs[expert_id]);
+                if (!a_base) {
+                    return;
+                }
+                const uint8_t * scale_base = reinterpret_cast<const uint8_t *>(a_base + total_i8_size_expert);
+
+                simd<float, Repeat * exec_n> acc0 = 0.0f;
+                simd<float, Repeat * exec_n> acc1 = 0.0f;
+                for (int64_t kt = 0; kt < k_tiles; ++kt) {
+                    simd<int8_t, bn>    b_vec       = 0;
+                    simd<float, exec_n> y_scale_vec = 0.0f;
+#pragma unroll
+                    for (int lane = 0; lane < exec_n; ++lane) {
+                        const int id   = lane_id[lane];
+                        const int iid1 = lane_iid1[lane];
+                        if (id < 0 || iid1 < 0) {
+                            continue;
+                        }
+                        const int64_t       i11    = id % ne11;
+                        const int64_t       i12    = iid1;
+                        const char *        q8_row = static_cast<const char *>(q8_src) + i11 * q8_nb11 + i12 * q8_nb12;
+                        simd<int8_t, k_per> q_vec =
+                            block_load<int8_t, k_per>(reinterpret_cast<const int8_t *>(q8_row) + kt * k_per);
+#pragma unroll
+                        for (int kk = 0; kk < k_per; ++kk) {
+                            b_vec[(kk / 4) * exec_n * 4 + lane * 4 + (kk % 4)] = q_vec[kk];
+                        }
+                        const sycl::half * y_scale_ptr =
+                            reinterpret_cast<const sycl::half *>(q8_row + ncols_y + kt * 2 * sizeof(sycl::half));
+                        simd<sycl::half, 1> y_half = block_load<sycl::half, 1>(y_scale_ptr);
+                        simd<float, 1>      y_f    = y_half;
+                        y_scale_vec[lane]          = y_f[0];
+                    }
+
+                    simd<int8_t, an>    a_vec0       = 0;
+                    simd<float, Repeat> w_scale_vec0 = 0.0f;
+#pragma unroll
+                    for (int r = 0; r < Repeat; ++r) {
+                        const int row = static_cast<int>(tile_m0) * Repeat + r;
+                        if (row < nrows_per_expert) {
+                            const int8_t * row_ptr = a_base + static_cast<int64_t>(row) * row_i8_stride + kt * k_per;
+                            a_vec0.template select<k_per, 1>(r * k_per) = block_load<int8_t, k_per>(row_ptr);
+                            w_scale_vec0[r]                             = mxfp4_e8m0_to_fp32_half_esimd(
+                                scale_base[static_cast<int64_t>(row) * scale_stride + kt]);
+                        }
+                    }
+
+                    simd<int, Repeat * exec_n> part0 = 0;
+                    part0 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(part0, b_vec, a_vec0);
+#pragma unroll
+                    for (int r = 0; r < Repeat; ++r) {
+                        simd<int, exec_n>   row_i                   = part0.template select<exec_n, 1>(r * exec_n);
+                        const float         scale                   = w_scale_vec0[r];
+                        simd<float, exec_n> row                     = convert<float>(row_i) * (y_scale_vec * scale);
+                        acc0.template select<exec_n, 1>(r * exec_n) = acc0.template select<exec_n, 1>(r * exec_n) + row;
+                    }
+
+                    if (have_m1) {
+                        simd<int8_t, an>    a_vec1       = 0;
+                        simd<float, Repeat> w_scale_vec1 = 0.0f;
+#pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            const int row = static_cast<int>(tile_m1) * Repeat + r;
+                            if (row < nrows_per_expert) {
+                                const int8_t * row_ptr =
+                                    a_base + static_cast<int64_t>(row) * row_i8_stride + kt * k_per;
+                                a_vec1.template select<k_per, 1>(r * k_per) = block_load<int8_t, k_per>(row_ptr);
+                                w_scale_vec1[r]                             = mxfp4_e8m0_to_fp32_half_esimd(
+                                    scale_base[static_cast<int64_t>(row) * scale_stride + kt]);
+                            }
+                        }
+
+                        simd<int, Repeat * exec_n> part1 = 0;
+                        part1 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(part1, b_vec, a_vec1);
+#pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            simd<int, exec_n>   row_i = part1.template select<exec_n, 1>(r * exec_n);
+                            const float         scale = w_scale_vec1[r];
+                            simd<float, exec_n> row   = convert<float>(row_i) * (y_scale_vec * scale);
+                            acc1.template select<exec_n, 1>(r * exec_n) =
+                                acc1.template select<exec_n, 1>(r * exec_n) + row;
+                        }
+                    }
+                }
+
+#pragma unroll
+                for (int lane = 0; lane < exec_n; ++lane) {
+                    const int id   = lane_id[lane];
+                    const int iid1 = lane_iid1[lane];
+                    if (id < 0 || iid1 < 0) {
+                        continue;
+                    }
+                    float * dst_out =
+                        reinterpret_cast<float *>(reinterpret_cast<char *>(dst) + static_cast<int64_t>(id) * dst_nb1 +
+                                                  static_cast<int64_t>(iid1) * dst_nb2);
+#pragma unroll
+                    for (int r = 0; r < Repeat; ++r) {
+                        const int row = static_cast<int>(tile_m0) * Repeat + r;
+                        if (row < nrows_per_expert) {
+                            block_store<float, 1>(dst_out + row, acc0.template select<1, 1>(r * exec_n + lane));
+                        }
+                    }
+                    if (have_m1) {
+#pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            const int row = static_cast<int>(tile_m1) * Repeat + r;
+                            if (row < nrows_per_expert) {
+                                block_store<float, 1>(dst_out + row, acc1.template select<1, 1>(r * exec_n + lane));
+                            }
+                        }
+                    }
+                }
+            });
+    });
+}
+
+template <int Repeat>
+static sycl::event mxfp4_i8_grouped_direct_q8_m4_sycl(sycl::queue &                    queue,
+                                                      const void * const *             expert_ptrs,
+                                                      const void *                     q8_src,
+                                                      float *                          dst,
+                                                      const int32_t *                  group_expert_ids,
+                                                      const int32_t *                  group_offsets,
+                                                      const int32_t *                  group_row_slots,
+                                                      const int32_t *                  chunk_groups,
+                                                      const int32_t *                  chunk_row_starts,
+                                                      int                              ncols,
+                                                      int                              ncols_y,
+                                                      int                              nrows_per_expert,
+                                                      int                              n_chunks,
+                                                      int                              n_tokens,
+                                                      int                              ne11,
+                                                      int64_t                          q8_nb11,
+                                                      int64_t                          q8_nb12,
+                                                      int64_t                          dst_nb1,
+                                                      int64_t                          dst_nb2,
+                                                      int                              scale_stride_blocks,
+                                                      const std::vector<sycl::event> & deps          = {},
+                                                      const int32_t *                  active_chunks = nullptr) {
+    constexpr int exec_n = GGML_SYCL_MXFP4_MOE_XMX_N;
+    constexpr int k_per  = GGML_SYCL_MXFP4_MOE_XMX_K;
+    constexpr int an     = Repeat * k_per;
+    constexpr int bn     = k_per * exec_n;
+
+    const int64_t m_tiles              = (static_cast<int64_t>(nrows_per_expert) + Repeat - 1) / Repeat;
+    const int64_t m_tile_groups        = (m_tiles + 3) / 4;
+    const int64_t k_tiles              = ncols / k_per;
+    const int64_t row_i8_stride        = static_cast<int64_t>(ncols);
+    const int64_t total_i8_size_expert = static_cast<int64_t>(nrows_per_expert) * row_i8_stride;
+    const int     scale_stride         = scale_stride_blocks > 0 ? scale_stride_blocks : static_cast<int>(k_tiles);
+    const int64_t tiles                = static_cast<int64_t>(n_chunks) * m_tile_groups;
+
+    return queue.submit([&](sycl::handler & h) {
+        if (!deps.empty()) {
+            h.depends_on(deps);
+        }
+        h.parallel_for<mxfp4_i8_grouped_direct_q8_m4_kernel<Repeat>>(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(tiles)), sycl::range<1>(1)),
+            [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
+                using namespace sycl::ext::intel::esimd;
+                const int64_t tile_idx = static_cast<int64_t>(item.get_global_id(0));
+                const int64_t chunk    = tile_idx / m_tile_groups;
+                const int64_t group_m  = tile_idx - chunk * m_tile_groups;
+                const int64_t tile_m0  = group_m * 4;
+                const int64_t tile_m1  = tile_m0 + 1;
+                const int64_t tile_m2  = tile_m0 + 2;
+                const int64_t tile_m3  = tile_m0 + 3;
+                const bool    have_m1  = tile_m1 < m_tiles;
+                const bool    have_m2  = tile_m2 < m_tiles;
+                const bool    have_m3  = tile_m3 < m_tiles;
+                if (active_chunks && chunk >= active_chunks[0]) {
+                    return;
+                }
+                const int group = chunk_groups[chunk];
+
+                simd<int, exec_n> lane_id   = -1;
+                simd<int, exec_n> lane_iid1 = -1;
+                const int         expert_id = group_expert_ids[group];
+                const int         row_begin = group_offsets[group] + chunk_row_starts[chunk];
+                const int         row_end   = group_offsets[group + 1];
+#pragma unroll
+                for (int lane = 0; lane < exec_n; ++lane) {
+                    const int row_index = row_begin + lane;
+                    if (row_index >= row_end) {
+                        continue;
+                    }
+                    const int slot  = group_row_slots[row_index];
+                    const int id    = slot / n_tokens;
+                    lane_id[lane]   = id;
+                    lane_iid1[lane] = slot - id * n_tokens;
+                }
+
+                const int8_t * a_base = reinterpret_cast<const int8_t *>(expert_ptrs[expert_id]);
+                if (!a_base) {
+                    return;
+                }
+                const uint8_t * scale_base = reinterpret_cast<const uint8_t *>(a_base + total_i8_size_expert);
+
+                simd<float, Repeat * exec_n> acc0 = 0.0f;
+                simd<float, Repeat * exec_n> acc1 = 0.0f;
+                simd<float, Repeat * exec_n> acc2 = 0.0f;
+                simd<float, Repeat * exec_n> acc3 = 0.0f;
+                for (int64_t kt = 0; kt < k_tiles; ++kt) {
+                    simd<int8_t, bn>    b_vec       = 0;
+                    simd<float, exec_n> y_scale_vec = 0.0f;
+#pragma unroll
+                    for (int lane = 0; lane < exec_n; ++lane) {
+                        const int id   = lane_id[lane];
+                        const int iid1 = lane_iid1[lane];
+                        if (id < 0 || iid1 < 0) {
+                            continue;
+                        }
+                        const int64_t       i11    = id % ne11;
+                        const int64_t       i12    = iid1;
+                        const char *        q8_row = static_cast<const char *>(q8_src) + i11 * q8_nb11 + i12 * q8_nb12;
+                        simd<int8_t, k_per> q_vec =
+                            block_load<int8_t, k_per>(reinterpret_cast<const int8_t *>(q8_row) + kt * k_per);
+#pragma unroll
+                        for (int kk = 0; kk < k_per; ++kk) {
+                            b_vec[(kk / 4) * exec_n * 4 + lane * 4 + (kk % 4)] = q_vec[kk];
+                        }
+                        const sycl::half * y_scale_ptr =
+                            reinterpret_cast<const sycl::half *>(q8_row + ncols_y + kt * 2 * sizeof(sycl::half));
+                        simd<sycl::half, 1> y_half = block_load<sycl::half, 1>(y_scale_ptr);
+                        simd<float, 1>      y_f    = y_half;
+                        y_scale_vec[lane]          = y_f[0];
+                    }
+
+                    simd<int8_t, an>    a_vec0       = 0;
+                    simd<float, Repeat> w_scale_vec0 = 0.0f;
+#pragma unroll
+                    for (int r = 0; r < Repeat; ++r) {
+                        const int row = static_cast<int>(tile_m0) * Repeat + r;
+                        if (row < nrows_per_expert) {
+                            const int8_t * row_ptr = a_base + static_cast<int64_t>(row) * row_i8_stride + kt * k_per;
+                            a_vec0.template select<k_per, 1>(r * k_per) = block_load<int8_t, k_per>(row_ptr);
+                            w_scale_vec0[r]                             = mxfp4_e8m0_to_fp32_half_esimd(
+                                scale_base[static_cast<int64_t>(row) * scale_stride + kt]);
+                        }
+                    }
+                    simd<int, Repeat * exec_n> part0 = 0;
+                    part0 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(part0, b_vec, a_vec0);
+#pragma unroll
+                    for (int r = 0; r < Repeat; ++r) {
+                        simd<int, exec_n>   row_i                   = part0.template select<exec_n, 1>(r * exec_n);
+                        const float         scale                   = w_scale_vec0[r];
+                        simd<float, exec_n> row                     = convert<float>(row_i) * (y_scale_vec * scale);
+                        acc0.template select<exec_n, 1>(r * exec_n) = acc0.template select<exec_n, 1>(r * exec_n) + row;
+                    }
+
+                    if (have_m1) {
+                        simd<int8_t, an>    a_vec1       = 0;
+                        simd<float, Repeat> w_scale_vec1 = 0.0f;
+#pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            const int row = static_cast<int>(tile_m1) * Repeat + r;
+                            if (row < nrows_per_expert) {
+                                const int8_t * row_ptr =
+                                    a_base + static_cast<int64_t>(row) * row_i8_stride + kt * k_per;
+                                a_vec1.template select<k_per, 1>(r * k_per) = block_load<int8_t, k_per>(row_ptr);
+                                w_scale_vec1[r]                             = mxfp4_e8m0_to_fp32_half_esimd(
+                                    scale_base[static_cast<int64_t>(row) * scale_stride + kt]);
+                            }
+                        }
+                        simd<int, Repeat * exec_n> part1 = 0;
+                        part1 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(part1, b_vec, a_vec1);
+#pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            simd<int, exec_n>   row_i = part1.template select<exec_n, 1>(r * exec_n);
+                            const float         scale = w_scale_vec1[r];
+                            simd<float, exec_n> row   = convert<float>(row_i) * (y_scale_vec * scale);
+                            acc1.template select<exec_n, 1>(r * exec_n) =
+                                acc1.template select<exec_n, 1>(r * exec_n) + row;
+                        }
+                    }
+
+                    if (have_m2) {
+                        simd<int8_t, an>    a_vec2       = 0;
+                        simd<float, Repeat> w_scale_vec2 = 0.0f;
+#pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            const int row = static_cast<int>(tile_m2) * Repeat + r;
+                            if (row < nrows_per_expert) {
+                                const int8_t * row_ptr =
+                                    a_base + static_cast<int64_t>(row) * row_i8_stride + kt * k_per;
+                                a_vec2.template select<k_per, 1>(r * k_per) = block_load<int8_t, k_per>(row_ptr);
+                                w_scale_vec2[r]                             = mxfp4_e8m0_to_fp32_half_esimd(
+                                    scale_base[static_cast<int64_t>(row) * scale_stride + kt]);
+                            }
+                        }
+                        simd<int, Repeat * exec_n> part2 = 0;
+                        part2 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(part2, b_vec, a_vec2);
+#pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            simd<int, exec_n>   row_i = part2.template select<exec_n, 1>(r * exec_n);
+                            const float         scale = w_scale_vec2[r];
+                            simd<float, exec_n> row   = convert<float>(row_i) * (y_scale_vec * scale);
+                            acc2.template select<exec_n, 1>(r * exec_n) =
+                                acc2.template select<exec_n, 1>(r * exec_n) + row;
+                        }
+                    }
+
+                    if (have_m3) {
+                        simd<int8_t, an>    a_vec3       = 0;
+                        simd<float, Repeat> w_scale_vec3 = 0.0f;
+#pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            const int row = static_cast<int>(tile_m3) * Repeat + r;
+                            if (row < nrows_per_expert) {
+                                const int8_t * row_ptr =
+                                    a_base + static_cast<int64_t>(row) * row_i8_stride + kt * k_per;
+                                a_vec3.template select<k_per, 1>(r * k_per) = block_load<int8_t, k_per>(row_ptr);
+                                w_scale_vec3[r]                             = mxfp4_e8m0_to_fp32_half_esimd(
+                                    scale_base[static_cast<int64_t>(row) * scale_stride + kt]);
+                            }
+                        }
+                        simd<int, Repeat * exec_n> part3 = 0;
+                        part3 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(part3, b_vec, a_vec3);
+#pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            simd<int, exec_n>   row_i = part3.template select<exec_n, 1>(r * exec_n);
+                            const float         scale = w_scale_vec3[r];
+                            simd<float, exec_n> row   = convert<float>(row_i) * (y_scale_vec * scale);
+                            acc3.template select<exec_n, 1>(r * exec_n) =
+                                acc3.template select<exec_n, 1>(r * exec_n) + row;
+                        }
+                    }
+                }
+
+#pragma unroll
+                for (int lane = 0; lane < exec_n; ++lane) {
+                    const int id   = lane_id[lane];
+                    const int iid1 = lane_iid1[lane];
+                    if (id < 0 || iid1 < 0) {
+                        continue;
+                    }
+                    float * dst_out =
+                        reinterpret_cast<float *>(reinterpret_cast<char *>(dst) + static_cast<int64_t>(id) * dst_nb1 +
+                                                  static_cast<int64_t>(iid1) * dst_nb2);
+#pragma unroll
+                    for (int r = 0; r < Repeat; ++r) {
+                        const int row = static_cast<int>(tile_m0) * Repeat + r;
+                        if (row < nrows_per_expert) {
+                            block_store<float, 1>(dst_out + row, acc0.template select<1, 1>(r * exec_n + lane));
+                        }
+                    }
+                    if (have_m1) {
+#pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            const int row = static_cast<int>(tile_m1) * Repeat + r;
+                            if (row < nrows_per_expert) {
+                                block_store<float, 1>(dst_out + row, acc1.template select<1, 1>(r * exec_n + lane));
+                            }
+                        }
+                    }
+                    if (have_m2) {
+#pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            const int row = static_cast<int>(tile_m2) * Repeat + r;
+                            if (row < nrows_per_expert) {
+                                block_store<float, 1>(dst_out + row, acc2.template select<1, 1>(r * exec_n + lane));
+                            }
+                        }
+                    }
+                    if (have_m3) {
+#pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            const int row = static_cast<int>(tile_m3) * Repeat + r;
+                            if (row < nrows_per_expert) {
+                                block_store<float, 1>(dst_out + row, acc3.template select<1, 1>(r * exec_n + lane));
+                            }
+                        }
+                    }
+                }
+            });
+    });
+}
+
+template <int Repeat>
+static sycl::event mxfp4_i8_grouped_packed_q8_m4_sycl(sycl::queue &                    queue,
+                                                      const void * const *             expert_ptrs,
+                                                      const int8_t *                   b_packed,
+                                                      const float *                    y_scales,
+                                                      float *                          dst,
+                                                      const int32_t *                  group_expert_ids,
+                                                      const int32_t *                  group_offsets,
+                                                      const int32_t *                  group_row_slots,
+                                                      const int32_t *                  chunk_groups,
+                                                      const int32_t *                  chunk_row_starts,
+                                                      int                              ncols,
+                                                      int                              nrows_per_expert,
+                                                      int                              n_chunks,
+                                                      int                              n_tokens,
+                                                      int64_t                          dst_nb1,
+                                                      int64_t                          dst_nb2,
+                                                      int                              scale_stride_blocks,
+                                                      const std::vector<sycl::event> & deps          = {},
+                                                      const int32_t *                  active_chunks = nullptr) {
+    constexpr int exec_n = GGML_SYCL_MXFP4_MOE_XMX_N;
+    constexpr int k_per  = GGML_SYCL_MXFP4_MOE_XMX_K;
+    constexpr int an     = Repeat * k_per;
+    constexpr int bn     = k_per * exec_n;
+
+    const int64_t m_tiles              = (static_cast<int64_t>(nrows_per_expert) + Repeat - 1) / Repeat;
+    const int64_t m_tile_groups        = (m_tiles + 3) / 4;
+    const int64_t k_tiles              = ncols / k_per;
+    const int64_t row_i8_stride        = static_cast<int64_t>(ncols);
+    const int64_t total_i8_size_expert = static_cast<int64_t>(nrows_per_expert) * row_i8_stride;
+    const int     scale_stride         = scale_stride_blocks > 0 ? scale_stride_blocks : static_cast<int>(k_tiles);
+    const int64_t tiles                = static_cast<int64_t>(n_chunks) * m_tile_groups;
+
+    return queue.submit([&](sycl::handler & h) {
+        if (!deps.empty()) {
+            h.depends_on(deps);
+        }
+        h.parallel_for<mxfp4_i8_grouped_packed_q8_m4_kernel<Repeat>>(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(tiles)), sycl::range<1>(1)),
+            [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
+                using namespace sycl::ext::intel::esimd;
+                const int64_t tile_idx = static_cast<int64_t>(item.get_global_id(0));
+                const int64_t chunk    = tile_idx / m_tile_groups;
+                const int64_t group_m  = tile_idx - chunk * m_tile_groups;
+                const int64_t tile_m0  = group_m * 4;
+                const int64_t tile_m1  = tile_m0 + 1;
+                const int64_t tile_m2  = tile_m0 + 2;
+                const int64_t tile_m3  = tile_m0 + 3;
+                const bool    have_m1  = tile_m1 < m_tiles;
+                const bool    have_m2  = tile_m2 < m_tiles;
+                const bool    have_m3  = tile_m3 < m_tiles;
+                if (active_chunks && chunk >= active_chunks[0]) {
+                    return;
+                }
+                const int group = chunk_groups[chunk];
+
+                simd<int, exec_n> lane_id   = -1;
+                simd<int, exec_n> lane_iid1 = -1;
+                const int         expert_id = group_expert_ids[group];
+                const int         row_begin = group_offsets[group] + chunk_row_starts[chunk];
+                const int         row_end   = group_offsets[group + 1];
+#pragma unroll
+                for (int lane = 0; lane < exec_n; ++lane) {
+                    const int row_index = row_begin + lane;
+                    if (row_index >= row_end) {
+                        continue;
+                    }
+                    const int slot  = group_row_slots[row_index];
+                    const int id    = slot / n_tokens;
+                    lane_id[lane]   = id;
+                    lane_iid1[lane] = slot - id * n_tokens;
+                }
+
+                const int8_t * a_base = reinterpret_cast<const int8_t *>(expert_ptrs[expert_id]);
+                if (!a_base) {
+                    return;
+                }
+                const uint8_t * scale_base = reinterpret_cast<const uint8_t *>(a_base + total_i8_size_expert);
+                const int8_t *  b_ptr      = b_packed + (chunk * k_tiles) * bn;
+
+                simd<float, Repeat * exec_n> acc0 = 0.0f;
+                simd<float, Repeat * exec_n> acc1 = 0.0f;
+                simd<float, Repeat * exec_n> acc2 = 0.0f;
+                simd<float, Repeat * exec_n> acc3 = 0.0f;
+                for (int64_t kt = 0; kt < k_tiles; ++kt) {
+                    simd<int8_t, bn>    b_vec = block_load<int8_t, bn>(b_ptr);
+                    simd<float, exec_n> y_scale_vec =
+                        block_load<float, exec_n>(y_scales + (chunk * k_tiles + kt) * exec_n);
+
+                    simd<int8_t, an>    a_vec0       = 0;
+                    simd<float, Repeat> w_scale_vec0 = 0.0f;
+#pragma unroll
+                    for (int r = 0; r < Repeat; ++r) {
+                        const int row = static_cast<int>(tile_m0) * Repeat + r;
+                        if (row < nrows_per_expert) {
+                            const int8_t * row_ptr = a_base + static_cast<int64_t>(row) * row_i8_stride + kt * k_per;
+                            a_vec0.template select<k_per, 1>(r * k_per) = block_load<int8_t, k_per>(row_ptr);
+                            w_scale_vec0[r]                             = mxfp4_e8m0_to_fp32_half_esimd(
+                                scale_base[static_cast<int64_t>(row) * scale_stride + kt]);
+                        }
+                    }
+                    simd<int, Repeat * exec_n> part0 = 0;
+                    part0 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(part0, b_vec, a_vec0);
+#pragma unroll
+                    for (int r = 0; r < Repeat; ++r) {
+                        simd<int, exec_n>   row_i                   = part0.template select<exec_n, 1>(r * exec_n);
+                        const float         scale                   = w_scale_vec0[r];
+                        simd<float, exec_n> row                     = convert<float>(row_i) * (y_scale_vec * scale);
+                        acc0.template select<exec_n, 1>(r * exec_n) = acc0.template select<exec_n, 1>(r * exec_n) + row;
+                    }
+
+                    if (have_m1) {
+                        simd<int8_t, an>    a_vec1       = 0;
+                        simd<float, Repeat> w_scale_vec1 = 0.0f;
+#pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            const int row = static_cast<int>(tile_m1) * Repeat + r;
+                            if (row < nrows_per_expert) {
+                                const int8_t * row_ptr =
+                                    a_base + static_cast<int64_t>(row) * row_i8_stride + kt * k_per;
+                                a_vec1.template select<k_per, 1>(r * k_per) = block_load<int8_t, k_per>(row_ptr);
+                                w_scale_vec1[r]                             = mxfp4_e8m0_to_fp32_half_esimd(
+                                    scale_base[static_cast<int64_t>(row) * scale_stride + kt]);
+                            }
+                        }
+                        simd<int, Repeat * exec_n> part1 = 0;
+                        part1 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(part1, b_vec, a_vec1);
+#pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            simd<int, exec_n>   row_i = part1.template select<exec_n, 1>(r * exec_n);
+                            const float         scale = w_scale_vec1[r];
+                            simd<float, exec_n> row   = convert<float>(row_i) * (y_scale_vec * scale);
+                            acc1.template select<exec_n, 1>(r * exec_n) =
+                                acc1.template select<exec_n, 1>(r * exec_n) + row;
+                        }
+                    }
+
+                    if (have_m2) {
+                        simd<int8_t, an>    a_vec2       = 0;
+                        simd<float, Repeat> w_scale_vec2 = 0.0f;
+#pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            const int row = static_cast<int>(tile_m2) * Repeat + r;
+                            if (row < nrows_per_expert) {
+                                const int8_t * row_ptr =
+                                    a_base + static_cast<int64_t>(row) * row_i8_stride + kt * k_per;
+                                a_vec2.template select<k_per, 1>(r * k_per) = block_load<int8_t, k_per>(row_ptr);
+                                w_scale_vec2[r]                             = mxfp4_e8m0_to_fp32_half_esimd(
+                                    scale_base[static_cast<int64_t>(row) * scale_stride + kt]);
+                            }
+                        }
+                        simd<int, Repeat * exec_n> part2 = 0;
+                        part2 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(part2, b_vec, a_vec2);
+#pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            simd<int, exec_n>   row_i = part2.template select<exec_n, 1>(r * exec_n);
+                            const float         scale = w_scale_vec2[r];
+                            simd<float, exec_n> row   = convert<float>(row_i) * (y_scale_vec * scale);
+                            acc2.template select<exec_n, 1>(r * exec_n) =
+                                acc2.template select<exec_n, 1>(r * exec_n) + row;
+                        }
+                    }
+
+                    if (have_m3) {
+                        simd<int8_t, an>    a_vec3       = 0;
+                        simd<float, Repeat> w_scale_vec3 = 0.0f;
+#pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            const int row = static_cast<int>(tile_m3) * Repeat + r;
+                            if (row < nrows_per_expert) {
+                                const int8_t * row_ptr =
+                                    a_base + static_cast<int64_t>(row) * row_i8_stride + kt * k_per;
+                                a_vec3.template select<k_per, 1>(r * k_per) = block_load<int8_t, k_per>(row_ptr);
+                                w_scale_vec3[r]                             = mxfp4_e8m0_to_fp32_half_esimd(
+                                    scale_base[static_cast<int64_t>(row) * scale_stride + kt]);
+                            }
+                        }
+                        simd<int, Repeat * exec_n> part3 = 0;
+                        part3 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(part3, b_vec, a_vec3);
+#pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            simd<int, exec_n>   row_i = part3.template select<exec_n, 1>(r * exec_n);
+                            const float         scale = w_scale_vec3[r];
+                            simd<float, exec_n> row   = convert<float>(row_i) * (y_scale_vec * scale);
+                            acc3.template select<exec_n, 1>(r * exec_n) =
+                                acc3.template select<exec_n, 1>(r * exec_n) + row;
+                        }
+                    }
+                    b_ptr += bn;
+                }
+
+#pragma unroll
+                for (int lane = 0; lane < exec_n; ++lane) {
+                    const int id   = lane_id[lane];
+                    const int iid1 = lane_iid1[lane];
+                    if (id < 0 || iid1 < 0) {
+                        continue;
+                    }
+                    float * dst_out =
+                        reinterpret_cast<float *>(reinterpret_cast<char *>(dst) + static_cast<int64_t>(id) * dst_nb1 +
+                                                  static_cast<int64_t>(iid1) * dst_nb2);
+#pragma unroll
+                    for (int r = 0; r < Repeat; ++r) {
+                        const int row = static_cast<int>(tile_m0) * Repeat + r;
+                        if (row < nrows_per_expert) {
+                            block_store<float, 1>(dst_out + row, acc0.template select<1, 1>(r * exec_n + lane));
+                        }
+                    }
+                    if (have_m1) {
+#pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            const int row = static_cast<int>(tile_m1) * Repeat + r;
+                            if (row < nrows_per_expert) {
+                                block_store<float, 1>(dst_out + row, acc1.template select<1, 1>(r * exec_n + lane));
+                            }
+                        }
+                    }
+                    if (have_m2) {
+#pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            const int row = static_cast<int>(tile_m2) * Repeat + r;
+                            if (row < nrows_per_expert) {
+                                block_store<float, 1>(dst_out + row, acc2.template select<1, 1>(r * exec_n + lane));
+                            }
+                        }
+                    }
+                    if (have_m3) {
+#pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            const int row = static_cast<int>(tile_m3) * Repeat + r;
+                            if (row < nrows_per_expert) {
+                                block_store<float, 1>(dst_out + row, acc3.template select<1, 1>(r * exec_n + lane));
+                            }
+                        }
+                    }
+                }
+            });
+    });
+}
+
 template <int Repeat>
 static sycl::event mxfp4_i8_grouped_direct_q8_sycl(sycl::queue &                    queue,
                                                    const void * const *             expert_ptrs,
@@ -6846,7 +8473,8 @@ static sycl::event mxfp4_i8_grouped_direct_q8_sycl(sycl::queue &                
                                                    int64_t                          dst_nb1,
                                                    int64_t                          dst_nb2,
                                                    int                              scale_stride_blocks,
-                                                   const std::vector<sycl::event> & deps = {}) {
+                                                   const std::vector<sycl::event> & deps          = {},
+                                                   const int32_t *                  active_chunks = nullptr) {
     constexpr int exec_n = GGML_SYCL_MXFP4_MOE_XMX_N;
     constexpr int k_per  = GGML_SYCL_MXFP4_MOE_XMX_K;
     constexpr int an     = Repeat * k_per;
@@ -6859,6 +8487,20 @@ static sycl::event mxfp4_i8_grouped_direct_q8_sycl(sycl::queue &                
     const int     scale_stride         = scale_stride_blocks > 0 ? scale_stride_blocks : static_cast<int>(k_tiles);
     const int64_t tiles                = static_cast<int64_t>(n_chunks) * m_tiles;
 
+    const int grouped_m_tiles = mxfp4_i8_grouped_m_tiles<Repeat>();
+    if (grouped_m_tiles == 4 && m_tiles > 3) {
+        return mxfp4_i8_grouped_direct_q8_m4_sycl<Repeat>(
+            queue, expert_ptrs, q8_src, dst, group_expert_ids, group_offsets, group_row_slots, chunk_groups,
+            chunk_row_starts, ncols, ncols_y, nrows_per_expert, n_chunks, n_tokens, ne11, q8_nb11, q8_nb12, dst_nb1,
+            dst_nb2, scale_stride_blocks, deps, active_chunks);
+    }
+    if (grouped_m_tiles >= 2 && m_tiles > 1) {
+        return mxfp4_i8_grouped_direct_q8_m2_sycl<Repeat>(
+            queue, expert_ptrs, q8_src, dst, group_expert_ids, group_offsets, group_row_slots, chunk_groups,
+            chunk_row_starts, ncols, ncols_y, nrows_per_expert, n_chunks, n_tokens, ne11, q8_nb11, q8_nb12, dst_nb1,
+            dst_nb2, scale_stride_blocks, deps, active_chunks);
+    }
+
     return queue.submit([&](sycl::handler & h) {
         if (!deps.empty()) {
             h.depends_on(deps);
@@ -6870,7 +8512,10 @@ static sycl::event mxfp4_i8_grouped_direct_q8_sycl(sycl::queue &                
                 const int64_t tile_idx = static_cast<int64_t>(item.get_global_id(0));
                 const int64_t chunk    = tile_idx / m_tiles;
                 const int64_t tile_m   = tile_idx - chunk * m_tiles;
-                const int     group    = chunk_groups[chunk];
+                if (active_chunks && chunk >= active_chunks[0]) {
+                    return;
+                }
+                const int group = chunk_groups[chunk];
 
                 simd<int, exec_n> lane_id   = -1;
                 simd<int, exec_n> lane_iid1 = -1;
@@ -6969,6 +8614,520 @@ static sycl::event mxfp4_i8_grouped_direct_q8_sycl(sycl::queue &                
     });
 }
 
+template <int Repeat, int GLU_OP> static bool mxfp4_pair_glu_grouped_m2_enabled() {
+    static const int enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_MXFP4_PAIR_GLU_GROUPED_M2");
+        return env ? (std::atoi(env) != 0 ? 1 : 0) : 1;
+    }();
+    return enabled != 0;
+}
+
+static bool mxfp4_i8_grouped_pack_q8_enabled(int64_t n_tokens) {
+    static const int enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_MXFP4_I8_GROUPED_PACK_Q8");
+        return env ? (std::atoi(env) != 0 ? 1 : 0) : -1;
+    }();
+    return enabled >= 0 ? enabled != 0 : n_tokens > 1;
+}
+
+static bool mxfp4_grouped_chunk_row_limit_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_MXFP4_GROUPED_CHUNK_ROW_LIMIT");
+        return !env || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static bool mxfp4_i8_down_grouped_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_MXFP4_I8_DOWN_GROUPED");
+        return !env || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static bool mxfp4_pair_glu_grouped_pack_q8_enabled() {
+    static const int enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_MXFP4_PAIR_GLU_GROUPED_PACK_Q8");
+        return env ? (std::atoi(env) != 0 ? 1 : 0) : 1;
+    }();
+    return enabled != 0;
+}
+
+template <int Repeat, int GLU_OP>
+static sycl::event mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_m2_sycl(sycl::queue &                    queue,
+                                                                      const void * const *             gate_ptrs,
+                                                                      const void * const *             up_ptrs,
+                                                                      const void *                     q8_src,
+                                                                      float *                          dst_glu,
+                                                                      const int32_t *                  group_expert_ids,
+                                                                      const int32_t *                  group_offsets,
+                                                                      const int32_t *                  group_row_slots,
+                                                                      const int32_t *                  chunk_groups,
+                                                                      const int32_t *                  chunk_row_starts,
+                                                                      const float *                    gate_bias,
+                                                                      const float *                    up_bias,
+                                                                      int                              ncols,
+                                                                      int                              ncols_y,
+                                                                      int                              nrows_per_expert,
+                                                                      int                              n_chunks,
+                                                                      int                              n_tokens,
+                                                                      int                              ne11,
+                                                                      int64_t                          q8_nb11,
+                                                                      int64_t                          q8_nb12,
+                                                                      int64_t                          dst_nb1,
+                                                                      int64_t                          dst_nb2,
+                                                                      int64_t                          gate_bias_nb1,
+                                                                      int64_t                          up_bias_nb1,
+                                                                      const std::vector<sycl::event> & deps,
+                                                                      float                            alpha,
+                                                                      float                            limit,
+                                                                      int                              tile_n_total,
+                                                                      const int32_t * active_chunks = nullptr) {
+    constexpr int exec_n = GGML_SYCL_MXFP4_MOE_XMX_N;
+    constexpr int k_per  = GGML_SYCL_MXFP4_MOE_XMX_K;
+    constexpr int an     = Repeat * k_per;
+    constexpr int bn     = k_per * exec_n;
+
+    const int64_t m_tiles      = (static_cast<int64_t>(nrows_per_expert) + Repeat - 1) / Repeat;
+    const int64_t m_tile_pairs = (m_tiles + 1) / 2;
+    const int64_t k_tiles      = ncols / k_per;
+    const int64_t tiles        = static_cast<int64_t>(n_chunks) * m_tile_pairs;
+
+    return queue.submit([&](sycl::handler & h) {
+        if (!deps.empty()) {
+            h.depends_on(deps);
+        }
+        h.parallel_for<mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_m2_kernel<Repeat, GLU_OP>>(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(tiles)), sycl::range<1>(1)),
+            [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
+                using namespace sycl::ext::intel::esimd;
+                const int64_t tile_idx = static_cast<int64_t>(item.get_global_id(0));
+                const int64_t chunk    = tile_idx / m_tile_pairs;
+                const int64_t pair_m   = tile_idx - chunk * m_tile_pairs;
+                const int64_t tile_m0  = pair_m * 2;
+                const int64_t tile_m1  = tile_m0 + 1;
+                const bool    have_m1  = tile_m1 < m_tiles;
+                if (active_chunks && chunk >= active_chunks[0]) {
+                    return;
+                }
+                const int group = chunk_groups[chunk];
+
+                simd<int, exec_n> lane_id   = -1;
+                simd<int, exec_n> lane_iid1 = -1;
+                const int         expert_id = group_expert_ids[group];
+                const int         row_begin = group_offsets[group] + chunk_row_starts[chunk];
+                const int         row_end   = group_offsets[group + 1];
+#pragma unroll
+                for (int lane = 0; lane < exec_n; ++lane) {
+                    const int row_index = row_begin + lane;
+                    if (row_index >= row_end) {
+                        continue;
+                    }
+                    const int slot  = group_row_slots[row_index];
+                    const int id    = slot / n_tokens;
+                    lane_id[lane]   = id;
+                    lane_iid1[lane] = slot - id * n_tokens;
+                }
+
+                const uint8_t * gate_base = reinterpret_cast<const uint8_t *>(gate_ptrs[expert_id]);
+                const uint8_t * up_base   = reinterpret_cast<const uint8_t *>(up_ptrs[expert_id]);
+                if (!gate_base || !up_base) {
+                    return;
+                }
+
+                const int64_t n_tile_groups_n = (nrows_per_expert + tile_n_total - 1) / tile_n_total;
+                const int64_t group_bytes     = tile_n_total * (1 + k_per / 2);
+                const int64_t kt_group_stride = n_tile_groups_n * group_bytes;
+
+                const int64_t xmx_row_start0    = tile_m0 * Repeat;
+                const int64_t xmx_group_n0      = xmx_row_start0 / tile_n_total;
+                const int64_t xmx_row_in_group0 = xmx_row_start0 - xmx_group_n0 * tile_n_total;
+                const int64_t xmx_row_start1    = tile_m1 * Repeat;
+                const int64_t xmx_group_n1      = xmx_row_start1 / tile_n_total;
+                const int64_t xmx_row_in_group1 = xmx_row_start1 - xmx_group_n1 * tile_n_total;
+
+                const uint8_t * gate_group0 = gate_base + xmx_group_n0 * group_bytes;
+                const uint8_t * up_group0   = up_base + xmx_group_n0 * group_bytes;
+                const uint8_t * gate_group1 = gate_base + xmx_group_n1 * group_bytes;
+                const uint8_t * up_group1   = up_base + xmx_group_n1 * group_bytes;
+
+                simd<float, Repeat * exec_n> gate_acc0 = 0.0f;
+                simd<float, Repeat * exec_n> up_acc0   = 0.0f;
+                simd<float, Repeat * exec_n> gate_acc1 = 0.0f;
+                simd<float, Repeat * exec_n> up_acc1   = 0.0f;
+                for (int64_t kt = 0; kt < k_tiles; ++kt) {
+                    simd<int8_t, bn>    b_vec       = 0;
+                    simd<float, exec_n> y_scale_vec = 0.0f;
+#pragma unroll
+                    for (int lane = 0; lane < exec_n; ++lane) {
+                        const int id   = lane_id[lane];
+                        const int iid1 = lane_iid1[lane];
+                        if (id < 0 || iid1 < 0) {
+                            continue;
+                        }
+                        const int64_t       i11    = id % ne11;
+                        const int64_t       i12    = iid1;
+                        const char *        q8_row = static_cast<const char *>(q8_src) + i11 * q8_nb11 + i12 * q8_nb12;
+                        simd<int8_t, k_per> q_vec =
+                            block_load<int8_t, k_per>(reinterpret_cast<const int8_t *>(q8_row) + kt * k_per);
+#pragma unroll
+                        for (int kk = 0; kk < k_per; ++kk) {
+                            b_vec[(kk / 4) * exec_n * 4 + lane * 4 + (kk % 4)] = q_vec[kk];
+                        }
+                        const sycl::half * y_scale_ptr =
+                            reinterpret_cast<const sycl::half *>(q8_row + ncols_y + kt * 2 * sizeof(sycl::half));
+                        simd<sycl::half, 1> y_half = block_load<sycl::half, 1>(y_scale_ptr);
+                        simd<float, 1>      y_f    = y_half;
+                        y_scale_vec[lane]          = y_f[0];
+                    }
+
+                    simd<int8_t, an>    gate_a_vec0;
+                    simd<int8_t, an>    up_a_vec0;
+                    simd<float, Repeat> gate_w_scale0;
+                    simd<float, Repeat> up_w_scale0;
+                    mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(gate_group0, tile_n_total, xmx_row_in_group0,
+                                                                  gate_a_vec0, gate_w_scale0);
+                    mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(up_group0, tile_n_total, xmx_row_in_group0, up_a_vec0,
+                                                                  up_w_scale0);
+
+                    simd<int, Repeat * exec_n> gate_part0 = 0;
+                    simd<int, Repeat * exec_n> up_part0   = 0;
+                    gate_part0 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(gate_part0, b_vec, gate_a_vec0);
+                    up_part0   = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(up_part0, b_vec, up_a_vec0);
+#pragma unroll
+                    for (int r = 0; r < Repeat; ++r) {
+                        simd<int, exec_n>   gate_i     = gate_part0.template select<exec_n, 1>(r * exec_n);
+                        simd<int, exec_n>   up_i       = up_part0.template select<exec_n, 1>(r * exec_n);
+                        const float         gate_scale = gate_w_scale0[r];
+                        const float         up_scale   = up_w_scale0[r];
+                        simd<float, exec_n> gate_f     = convert<float>(gate_i) * (y_scale_vec * gate_scale);
+                        simd<float, exec_n> up_f       = convert<float>(up_i) * (y_scale_vec * up_scale);
+                        gate_acc0.template select<exec_n, 1>(r * exec_n) =
+                            gate_acc0.template select<exec_n, 1>(r * exec_n) + gate_f;
+                        up_acc0.template select<exec_n, 1>(r * exec_n) =
+                            up_acc0.template select<exec_n, 1>(r * exec_n) + up_f;
+                    }
+
+                    if (have_m1) {
+                        simd<int8_t, an>    gate_a_vec1;
+                        simd<int8_t, an>    up_a_vec1;
+                        simd<float, Repeat> gate_w_scale1;
+                        simd<float, Repeat> up_w_scale1;
+                        mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(gate_group1, tile_n_total, xmx_row_in_group1,
+                                                                      gate_a_vec1, gate_w_scale1);
+                        mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(up_group1, tile_n_total, xmx_row_in_group1,
+                                                                      up_a_vec1, up_w_scale1);
+
+                        simd<int, Repeat * exec_n> gate_part1 = 0;
+                        simd<int, Repeat * exec_n> up_part1   = 0;
+                        gate_part1 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(gate_part1, b_vec, gate_a_vec1);
+                        up_part1   = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(up_part1, b_vec, up_a_vec1);
+#pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            simd<int, exec_n>   gate_i     = gate_part1.template select<exec_n, 1>(r * exec_n);
+                            simd<int, exec_n>   up_i       = up_part1.template select<exec_n, 1>(r * exec_n);
+                            const float         gate_scale = gate_w_scale1[r];
+                            const float         up_scale   = up_w_scale1[r];
+                            simd<float, exec_n> gate_f     = convert<float>(gate_i) * (y_scale_vec * gate_scale);
+                            simd<float, exec_n> up_f       = convert<float>(up_i) * (y_scale_vec * up_scale);
+                            gate_acc1.template select<exec_n, 1>(r * exec_n) =
+                                gate_acc1.template select<exec_n, 1>(r * exec_n) + gate_f;
+                            up_acc1.template select<exec_n, 1>(r * exec_n) =
+                                up_acc1.template select<exec_n, 1>(r * exec_n) + up_f;
+                        }
+                    }
+                    gate_group0 += kt_group_stride;
+                    up_group0 += kt_group_stride;
+                    gate_group1 += kt_group_stride;
+                    up_group1 += kt_group_stride;
+                }
+
+#pragma unroll
+                for (int lane = 0; lane < exec_n; ++lane) {
+                    const int id   = lane_id[lane];
+                    const int iid1 = lane_iid1[lane];
+                    if (id < 0 || iid1 < 0) {
+                        continue;
+                    }
+                    float * dst_out = reinterpret_cast<float *>(reinterpret_cast<char *>(dst_glu) +
+                                                                static_cast<int64_t>(id) * dst_nb1 +
+                                                                static_cast<int64_t>(iid1) * dst_nb2);
+#pragma unroll
+                    for (int r = 0; r < Repeat; ++r) {
+                        const int row = static_cast<int>(tile_m0) * Repeat + r;
+                        if (row < nrows_per_expert) {
+                            float gate_value = gate_acc0.template select<1, 1>(r * exec_n + lane)[0];
+                            float up_value   = up_acc0.template select<1, 1>(r * exec_n + lane)[0];
+                            if (gate_bias) {
+                                gate_value += *(const float *) ((const char *) gate_bias +
+                                                                static_cast<int64_t>(expert_id) * gate_bias_nb1 +
+                                                                static_cast<int64_t>(row) * sizeof(float));
+                            }
+                            if (up_bias) {
+                                up_value += *(const float *) ((const char *) up_bias +
+                                                              static_cast<int64_t>(expert_id) * up_bias_nb1 +
+                                                              static_cast<int64_t>(row) * sizeof(float));
+                            }
+                            const float value =
+                                mmvq_moe_apply_pair_glu_esimd<GLU_OP>(gate_value, up_value, alpha, limit);
+                            block_store<float, 1>(dst_out + row, simd<float, 1>(value));
+                        }
+                    }
+                    if (have_m1) {
+#pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            const int row = static_cast<int>(tile_m1) * Repeat + r;
+                            if (row < nrows_per_expert) {
+                                float gate_value = gate_acc1.template select<1, 1>(r * exec_n + lane)[0];
+                                float up_value   = up_acc1.template select<1, 1>(r * exec_n + lane)[0];
+                                if (gate_bias) {
+                                    gate_value += *(const float *) ((const char *) gate_bias +
+                                                                    static_cast<int64_t>(expert_id) * gate_bias_nb1 +
+                                                                    static_cast<int64_t>(row) * sizeof(float));
+                                }
+                                if (up_bias) {
+                                    up_value += *(const float *) ((const char *) up_bias +
+                                                                  static_cast<int64_t>(expert_id) * up_bias_nb1 +
+                                                                  static_cast<int64_t>(row) * sizeof(float));
+                                }
+                                const float value =
+                                    mmvq_moe_apply_pair_glu_esimd<GLU_OP>(gate_value, up_value, alpha, limit);
+                                block_store<float, 1>(dst_out + row, simd<float, 1>(value));
+                            }
+                        }
+                    }
+                }
+            });
+    });
+}
+
+template <int Repeat, int GLU_OP>
+static sycl::event mxfp4_pair_glu_xmx_tiled_grouped_packed_q8_m2_sycl(sycl::queue &                    queue,
+                                                                      const void * const *             gate_ptrs,
+                                                                      const void * const *             up_ptrs,
+                                                                      const int8_t *                   b_packed,
+                                                                      const float *                    y_scales,
+                                                                      float *                          dst_glu,
+                                                                      const int32_t *                  group_expert_ids,
+                                                                      const int32_t *                  group_offsets,
+                                                                      const int32_t *                  group_row_slots,
+                                                                      const int32_t *                  chunk_groups,
+                                                                      const int32_t *                  chunk_row_starts,
+                                                                      const float *                    gate_bias,
+                                                                      const float *                    up_bias,
+                                                                      int                              ncols,
+                                                                      int                              nrows_per_expert,
+                                                                      int                              n_chunks,
+                                                                      int                              n_tokens,
+                                                                      int64_t                          dst_nb1,
+                                                                      int64_t                          dst_nb2,
+                                                                      int64_t                          gate_bias_nb1,
+                                                                      int64_t                          up_bias_nb1,
+                                                                      const std::vector<sycl::event> & deps,
+                                                                      float                            alpha,
+                                                                      float                            limit,
+                                                                      int                              tile_n_total,
+                                                                      const int32_t * active_chunks = nullptr) {
+    constexpr int exec_n = GGML_SYCL_MXFP4_MOE_XMX_N;
+    constexpr int k_per  = GGML_SYCL_MXFP4_MOE_XMX_K;
+    constexpr int an     = Repeat * k_per;
+    constexpr int bn     = k_per * exec_n;
+
+    const int64_t m_tiles      = (static_cast<int64_t>(nrows_per_expert) + Repeat - 1) / Repeat;
+    const int64_t m_tile_pairs = (m_tiles + 1) / 2;
+    const int64_t k_tiles      = ncols / k_per;
+    const int64_t tiles        = static_cast<int64_t>(n_chunks) * m_tile_pairs;
+
+    return queue.submit([&](sycl::handler & h) {
+        if (!deps.empty()) {
+            h.depends_on(deps);
+        }
+        h.parallel_for<mxfp4_pair_glu_xmx_tiled_grouped_packed_q8_m2_kernel<Repeat, GLU_OP>>(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(tiles)), sycl::range<1>(1)),
+            [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
+                using namespace sycl::ext::intel::esimd;
+                const int64_t tile_idx = static_cast<int64_t>(item.get_global_id(0));
+                const int64_t chunk    = tile_idx / m_tile_pairs;
+                const int64_t pair_m   = tile_idx - chunk * m_tile_pairs;
+                const int64_t tile_m0  = pair_m * 2;
+                const int64_t tile_m1  = tile_m0 + 1;
+                const bool    have_m1  = tile_m1 < m_tiles;
+                if (active_chunks && chunk >= active_chunks[0]) {
+                    return;
+                }
+                const int group = chunk_groups[chunk];
+
+                simd<int, exec_n> lane_id   = -1;
+                simd<int, exec_n> lane_iid1 = -1;
+                const int         expert_id = group_expert_ids[group];
+                const int         row_begin = group_offsets[group] + chunk_row_starts[chunk];
+                const int         row_end   = group_offsets[group + 1];
+#pragma unroll
+                for (int lane = 0; lane < exec_n; ++lane) {
+                    const int row_index = row_begin + lane;
+                    if (row_index >= row_end) {
+                        continue;
+                    }
+                    const int slot  = group_row_slots[row_index];
+                    const int id    = slot / n_tokens;
+                    lane_id[lane]   = id;
+                    lane_iid1[lane] = slot - id * n_tokens;
+                }
+
+                const uint8_t * gate_base = reinterpret_cast<const uint8_t *>(gate_ptrs[expert_id]);
+                const uint8_t * up_base   = reinterpret_cast<const uint8_t *>(up_ptrs[expert_id]);
+                if (!gate_base || !up_base) {
+                    return;
+                }
+
+                const int64_t n_tile_groups_n = (nrows_per_expert + tile_n_total - 1) / tile_n_total;
+                const int64_t group_bytes     = tile_n_total * (1 + k_per / 2);
+                const int64_t kt_group_stride = n_tile_groups_n * group_bytes;
+
+                const int64_t xmx_row_start0    = tile_m0 * Repeat;
+                const int64_t xmx_group_n0      = xmx_row_start0 / tile_n_total;
+                const int64_t xmx_row_in_group0 = xmx_row_start0 - xmx_group_n0 * tile_n_total;
+                const int64_t xmx_row_start1    = tile_m1 * Repeat;
+                const int64_t xmx_group_n1      = xmx_row_start1 / tile_n_total;
+                const int64_t xmx_row_in_group1 = xmx_row_start1 - xmx_group_n1 * tile_n_total;
+
+                const uint8_t * gate_group0 = gate_base + xmx_group_n0 * group_bytes;
+                const uint8_t * up_group0   = up_base + xmx_group_n0 * group_bytes;
+                const uint8_t * gate_group1 = gate_base + xmx_group_n1 * group_bytes;
+                const uint8_t * up_group1   = up_base + xmx_group_n1 * group_bytes;
+                const int8_t *  b_ptr       = b_packed + (chunk * k_tiles) * bn;
+
+                simd<float, Repeat * exec_n> gate_acc0 = 0.0f;
+                simd<float, Repeat * exec_n> up_acc0   = 0.0f;
+                simd<float, Repeat * exec_n> gate_acc1 = 0.0f;
+                simd<float, Repeat * exec_n> up_acc1   = 0.0f;
+                for (int64_t kt = 0; kt < k_tiles; ++kt) {
+                    simd<int8_t, bn>    b_vec = block_load<int8_t, bn>(b_ptr);
+                    simd<float, exec_n> y_scale_vec =
+                        block_load<float, exec_n>(y_scales + (chunk * k_tiles + kt) * exec_n);
+
+                    simd<int8_t, an>    gate_a_vec0;
+                    simd<int8_t, an>    up_a_vec0;
+                    simd<float, Repeat> gate_w_scale0;
+                    simd<float, Repeat> up_w_scale0;
+                    mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(gate_group0, tile_n_total, xmx_row_in_group0,
+                                                                  gate_a_vec0, gate_w_scale0);
+                    mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(up_group0, tile_n_total, xmx_row_in_group0, up_a_vec0,
+                                                                  up_w_scale0);
+
+                    simd<int, Repeat * exec_n> gate_part0 = 0;
+                    simd<int, Repeat * exec_n> up_part0   = 0;
+                    gate_part0 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(gate_part0, b_vec, gate_a_vec0);
+                    up_part0   = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(up_part0, b_vec, up_a_vec0);
+#pragma unroll
+                    for (int r = 0; r < Repeat; ++r) {
+                        simd<int, exec_n>   gate_i     = gate_part0.template select<exec_n, 1>(r * exec_n);
+                        simd<int, exec_n>   up_i       = up_part0.template select<exec_n, 1>(r * exec_n);
+                        const float         gate_scale = gate_w_scale0[r];
+                        const float         up_scale   = up_w_scale0[r];
+                        simd<float, exec_n> gate_f     = convert<float>(gate_i) * (y_scale_vec * gate_scale);
+                        simd<float, exec_n> up_f       = convert<float>(up_i) * (y_scale_vec * up_scale);
+                        gate_acc0.template select<exec_n, 1>(r * exec_n) =
+                            gate_acc0.template select<exec_n, 1>(r * exec_n) + gate_f;
+                        up_acc0.template select<exec_n, 1>(r * exec_n) =
+                            up_acc0.template select<exec_n, 1>(r * exec_n) + up_f;
+                    }
+
+                    if (have_m1) {
+                        simd<int8_t, an>    gate_a_vec1;
+                        simd<int8_t, an>    up_a_vec1;
+                        simd<float, Repeat> gate_w_scale1;
+                        simd<float, Repeat> up_w_scale1;
+                        mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(gate_group1, tile_n_total, xmx_row_in_group1,
+                                                                      gate_a_vec1, gate_w_scale1);
+                        mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(up_group1, tile_n_total, xmx_row_in_group1,
+                                                                      up_a_vec1, up_w_scale1);
+
+                        simd<int, Repeat * exec_n> gate_part1 = 0;
+                        simd<int, Repeat * exec_n> up_part1   = 0;
+                        gate_part1 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(gate_part1, b_vec, gate_a_vec1);
+                        up_part1   = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(up_part1, b_vec, up_a_vec1);
+#pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            simd<int, exec_n>   gate_i     = gate_part1.template select<exec_n, 1>(r * exec_n);
+                            simd<int, exec_n>   up_i       = up_part1.template select<exec_n, 1>(r * exec_n);
+                            const float         gate_scale = gate_w_scale1[r];
+                            const float         up_scale   = up_w_scale1[r];
+                            simd<float, exec_n> gate_f     = convert<float>(gate_i) * (y_scale_vec * gate_scale);
+                            simd<float, exec_n> up_f       = convert<float>(up_i) * (y_scale_vec * up_scale);
+                            gate_acc1.template select<exec_n, 1>(r * exec_n) =
+                                gate_acc1.template select<exec_n, 1>(r * exec_n) + gate_f;
+                            up_acc1.template select<exec_n, 1>(r * exec_n) =
+                                up_acc1.template select<exec_n, 1>(r * exec_n) + up_f;
+                        }
+                    }
+                    b_ptr += bn;
+                    gate_group0 += kt_group_stride;
+                    up_group0 += kt_group_stride;
+                    gate_group1 += kt_group_stride;
+                    up_group1 += kt_group_stride;
+                }
+
+#pragma unroll
+                for (int lane = 0; lane < exec_n; ++lane) {
+                    const int id   = lane_id[lane];
+                    const int iid1 = lane_iid1[lane];
+                    if (id < 0 || iid1 < 0) {
+                        continue;
+                    }
+                    float * dst_out = reinterpret_cast<float *>(reinterpret_cast<char *>(dst_glu) +
+                                                                static_cast<int64_t>(id) * dst_nb1 +
+                                                                static_cast<int64_t>(iid1) * dst_nb2);
+#pragma unroll
+                    for (int r = 0; r < Repeat; ++r) {
+                        const int row = static_cast<int>(tile_m0) * Repeat + r;
+                        if (row < nrows_per_expert) {
+                            float gate_value = gate_acc0.template select<1, 1>(r * exec_n + lane)[0];
+                            float up_value   = up_acc0.template select<1, 1>(r * exec_n + lane)[0];
+                            if (gate_bias) {
+                                gate_value += *(const float *) ((const char *) gate_bias +
+                                                                static_cast<int64_t>(expert_id) * gate_bias_nb1 +
+                                                                static_cast<int64_t>(row) * sizeof(float));
+                            }
+                            if (up_bias) {
+                                up_value += *(const float *) ((const char *) up_bias +
+                                                              static_cast<int64_t>(expert_id) * up_bias_nb1 +
+                                                              static_cast<int64_t>(row) * sizeof(float));
+                            }
+                            const float value =
+                                mmvq_moe_apply_pair_glu_esimd<GLU_OP>(gate_value, up_value, alpha, limit);
+                            block_store<float, 1>(dst_out + row, simd<float, 1>(value));
+                        }
+                    }
+                    if (have_m1) {
+#pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            const int row = static_cast<int>(tile_m1) * Repeat + r;
+                            if (row < nrows_per_expert) {
+                                float gate_value = gate_acc1.template select<1, 1>(r * exec_n + lane)[0];
+                                float up_value   = up_acc1.template select<1, 1>(r * exec_n + lane)[0];
+                                if (gate_bias) {
+                                    gate_value += *(const float *) ((const char *) gate_bias +
+                                                                    static_cast<int64_t>(expert_id) * gate_bias_nb1 +
+                                                                    static_cast<int64_t>(row) * sizeof(float));
+                                }
+                                if (up_bias) {
+                                    up_value += *(const float *) ((const char *) up_bias +
+                                                                  static_cast<int64_t>(expert_id) * up_bias_nb1 +
+                                                                  static_cast<int64_t>(row) * sizeof(float));
+                                }
+                                const float value =
+                                    mmvq_moe_apply_pair_glu_esimd<GLU_OP>(gate_value, up_value, alpha, limit);
+                                block_store<float, 1>(dst_out + row, simd<float, 1>(value));
+                            }
+                        }
+                    }
+                }
+            });
+    });
+}
+
 template <int Repeat, int GLU_OP>
 static sycl::event mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_sycl(sycl::queue &                    queue,
                                                                    const void * const *             gate_ptrs,
@@ -6997,7 +9156,8 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_sycl(sycl::queue &
                                                                    const std::vector<sycl::event> & deps,
                                                                    float                            alpha,
                                                                    float                            limit,
-                                                                   int                              tile_n_total) {
+                                                                   int                              tile_n_total,
+                                                                   const int32_t * active_chunks = nullptr) {
     constexpr int exec_n = GGML_SYCL_MXFP4_MOE_XMX_N;
     constexpr int k_per  = GGML_SYCL_MXFP4_MOE_XMX_K;
     constexpr int an     = Repeat * k_per;
@@ -7006,6 +9166,13 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_sycl(sycl::queue &
     const int64_t m_tiles = (static_cast<int64_t>(nrows_per_expert) + Repeat - 1) / Repeat;
     const int64_t k_tiles = ncols / k_per;
     const int64_t tiles   = static_cast<int64_t>(n_chunks) * m_tiles;
+
+    if (mxfp4_pair_glu_grouped_m2_enabled<Repeat, GLU_OP>() && m_tiles > 1) {
+        return mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_m2_sycl<Repeat, GLU_OP>(
+            queue, gate_ptrs, up_ptrs, q8_src, dst_glu, group_expert_ids, group_offsets, group_row_slots, chunk_groups,
+            chunk_row_starts, gate_bias, up_bias, ncols, ncols_y, nrows_per_expert, n_chunks, n_tokens, ne11, q8_nb11,
+            q8_nb12, dst_nb1, dst_nb2, gate_bias_nb1, up_bias_nb1, deps, alpha, limit, tile_n_total, active_chunks);
+    }
 
     return queue.submit([&](sycl::handler & h) {
         if (!deps.empty()) {
@@ -7018,7 +9185,10 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_sycl(sycl::queue &
                 const int64_t tile_idx = static_cast<int64_t>(item.get_global_id(0));
                 const int64_t chunk    = tile_idx / m_tiles;
                 const int64_t tile_m   = tile_idx - chunk * m_tiles;
-                const int     group    = chunk_groups[chunk];
+                if (active_chunks && chunk >= active_chunks[0]) {
+                    return;
+                }
+                const int group = chunk_groups[chunk];
 
                 simd<int, exec_n> lane_id   = -1;
                 simd<int, exec_n> lane_iid1 = -1;
@@ -7222,6 +9392,45 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_submit(sycl::queue &        
 }
 
 template <int Repeat>
+static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m4_submit(sycl::queue &        queue,
+                                                           const void * const * gate_ptrs,
+                                                           const void * const * up_ptrs,
+                                                           const int8_t *       b_packed,
+                                                           const float *        y_scales,
+                                                           float *              dst_glu,
+                                                           const int32_t *      ids,
+                                                           const float *        gate_bias,
+                                                           const float *        up_bias,
+                                                           int                  ncols,
+                                                           int                  nrows_per_expert,
+                                                           int                  total_batches,
+                                                           int                  n_tokens,
+                                                           int64_t              ids_nb0,
+                                                           int64_t              ids_nb1,
+                                                           int64_t              dst_nb1,
+                                                           int64_t              dst_nb2,
+                                                           int64_t              gate_bias_nb1,
+                                                           int64_t              up_bias_nb1,
+                                                           int                  glu_op,
+                                                           float                alpha,
+                                                           float                limit,
+                                                           int                  tile_n_total,
+                                                           const sycl::event &  pack_event,
+                                                           void *               dst_q8_soa  = nullptr,
+                                                           int64_t              q8_row_size = 0) {
+    if (glu_op == GGML_GLU_OP_SWIGLU_OAI) {
+        return mxfp4_pair_glu_xmx_tiled_dpas_m4_sycl<Repeat, GGML_GLU_OP_SWIGLU_OAI>(
+            queue, gate_ptrs, up_ptrs, b_packed, y_scales, dst_glu, ids, gate_bias, up_bias, ncols, nrows_per_expert,
+            total_batches, n_tokens, ids_nb0, ids_nb1, dst_nb1, dst_nb2, gate_bias_nb1, up_bias_nb1, alpha, limit,
+            tile_n_total, pack_event, dst_q8_soa, q8_row_size);
+    }
+    return mxfp4_pair_glu_xmx_tiled_dpas_m4_sycl<Repeat, GGML_GLU_OP_SWIGLU>(
+        queue, gate_ptrs, up_ptrs, b_packed, y_scales, dst_glu, ids, gate_bias, up_bias, ncols, nrows_per_expert,
+        total_batches, n_tokens, ids_nb0, ids_nb1, dst_nb1, dst_nb2, gate_bias_nb1, up_bias_nb1, alpha, limit,
+        tile_n_total, pack_event, dst_q8_soa, q8_row_size);
+}
+
+template <int Repeat>
 static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_direct_q8_submit(sycl::queue &        queue,
                                                                   const void * const * gate_ptrs,
                                                                   const void * const * up_ptrs,
@@ -7328,17 +9537,18 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_submit(sycl::queue
                                                                      const std::vector<sycl::event> & deps,
                                                                      float                            alpha,
                                                                      float                            limit,
-                                                                     int                              tile_n_total) {
+                                                                     int                              tile_n_total,
+                                                                     const int32_t * active_chunks = nullptr) {
     if (glu_op == GGML_GLU_OP_SWIGLU_OAI) {
         return mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_sycl<Repeat, GGML_GLU_OP_SWIGLU_OAI>(
             queue, gate_ptrs, up_ptrs, q8_src, dst_glu, group_expert_ids, group_offsets, group_row_slots, chunk_groups,
             chunk_row_starts, gate_bias, up_bias, ncols, ncols_y, nrows_per_expert, n_chunks, n_tokens, ne11, q8_nb11,
-            q8_nb12, dst_nb1, dst_nb2, gate_bias_nb1, up_bias_nb1, deps, alpha, limit, tile_n_total);
+            q8_nb12, dst_nb1, dst_nb2, gate_bias_nb1, up_bias_nb1, deps, alpha, limit, tile_n_total, active_chunks);
     }
     return mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_sycl<Repeat, GGML_GLU_OP_SWIGLU>(
         queue, gate_ptrs, up_ptrs, q8_src, dst_glu, group_expert_ids, group_offsets, group_row_slots, chunk_groups,
         chunk_row_starts, gate_bias, up_bias, ncols, ncols_y, nrows_per_expert, n_chunks, n_tokens, ne11, q8_nb11,
-        q8_nb12, dst_nb1, dst_nb2, gate_bias_nb1, up_bias_nb1, deps, alpha, limit, tile_n_total);
+        q8_nb12, dst_nb1, dst_nb2, gate_bias_nb1, up_bias_nb1, deps, alpha, limit, tile_n_total, active_chunks);
 }
 
 static inline float mxfp4_e8m0_to_fp32_host(uint8_t e) {
@@ -7395,8 +9605,7 @@ static float mxfp4_xmx_tiled_dot_q8_soa_host(const uint8_t * xmx_base,
 
     float acc = 0.0f;
     for (int kt = 0; kt < k_tiles; ++kt) {
-        const uint8_t * group =
-            xmx_base + (static_cast<int64_t>(kt) * n_tile_groups_n + xmx_group_n) * group_bytes;
+        const uint8_t * group   = xmx_base + (static_cast<int64_t>(kt) * n_tile_groups_n + xmx_group_n) * group_bytes;
         const uint8_t * packed  = group + tile_n_total + xmx_row_in_group * packed_bytes;
         const float     w_scale = mxfp4_e8m0_to_fp32_host(group[xmx_row_in_group]);
 
@@ -7409,7 +9618,7 @@ static float mxfp4_xmx_tiled_dot_q8_soa_host(const uint8_t * xmx_base,
         for (int kk = 0; kk < k_per; ++kk) {
             const uint8_t packed_byte = packed[kk % packed_bytes];
             const uint8_t code        = kk < packed_bytes ? (packed_byte & 0x0fu) : (packed_byte >> 4);
-            const int8_t  q = reinterpret_cast<const int8_t *>(q8_row)[static_cast<int64_t>(kt) * k_per + kk];
+            const int8_t  q           = reinterpret_cast<const int8_t *>(q8_row)[static_cast<int64_t>(kt) * k_per + kk];
             dot += static_cast<int>(q) * static_cast<int>(mxfp4_code_value_host(code));
         }
         acc += static_cast<float>(dot) * y_scale * w_scale;
@@ -7460,8 +9669,8 @@ static bool mxfp4_moe_xmx_tiled_validate_output(ggml_backend_sycl_context & ctx,
     const int64_t n_experts        = gate_weight->ne[2];
     const int64_t total_batches    = n_ids * num_tokens;
     if (ncols <= 0 || nrows_per_expert <= 0 || n_experts <= 0 || total_batches <= 0 || ncols != up_weight->ne[0] ||
-        nrows_per_expert != up_weight->ne[1] || n_experts != up_weight->ne[2] ||
-        ncols_y < ncols || ncols_y > static_cast<int64_t>(std::numeric_limits<int>::max()) ||
+        nrows_per_expert != up_weight->ne[1] || n_experts != up_weight->ne[2] || ncols_y < ncols ||
+        ncols_y > static_cast<int64_t>(std::numeric_limits<int>::max()) ||
         ncols > static_cast<int64_t>(std::numeric_limits<int>::max()) ||
         nrows_per_expert > static_cast<int64_t>(std::numeric_limits<int>::max()) ||
         tile_n_total > std::numeric_limits<int>::max() || (ncols % GGML_SYCL_MXFP4_MOE_XMX_K) != 0) {
@@ -7483,16 +9692,17 @@ static bool mxfp4_moe_xmx_tiled_validate_output(ggml_backend_sycl_context & ctx,
             for (int64_t iid1 = 0; iid1 < num_tokens; ++iid1) {
                 const int64_t group = id * num_tokens + iid1;
                 const char *  src   = reinterpret_cast<const char *>(ids_device) + iid1 * ids_nb1 + id * ids_nb0;
-                stream->memcpy(&ids_host[static_cast<size_t>(group)], src, sizeof(int32_t)).wait_and_throw();
+                mmvq_debug_copy_to_host(*stream, ctx.device, &ids_host[static_cast<size_t>(group)], src,
+                                        sizeof(int32_t));
             }
         }
 
         std::vector<void *> gate_ptrs_host(static_cast<size_t>(n_experts), nullptr);
         std::vector<void *> up_ptrs_host(static_cast<size_t>(n_experts), nullptr);
-        stream->memcpy(gate_ptrs_host.data(), gate_ptrs_device, static_cast<size_t>(n_experts) * sizeof(void *))
-            .wait_and_throw();
-        stream->memcpy(up_ptrs_host.data(), up_ptrs_device, static_cast<size_t>(n_experts) * sizeof(void *))
-            .wait_and_throw();
+        mmvq_debug_copy_to_host(*stream, ctx.device, gate_ptrs_host.data(), gate_ptrs_device,
+                                static_cast<size_t>(n_experts) * sizeof(void *));
+        mmvq_debug_copy_to_host(*stream, ctx.device, up_ptrs_host.data(), up_ptrs_device,
+                                static_cast<size_t>(n_experts) * sizeof(void *));
 
         std::vector<int32_t> unique_experts = ids_host;
         std::sort(unique_experts.begin(), unique_experts.end());
@@ -7500,9 +9710,8 @@ static bool mxfp4_moe_xmx_tiled_validate_output(ggml_backend_sycl_context & ctx,
 
         const int64_t n_tile_groups_n = (nrows_per_expert + tile_n_total - 1) / tile_n_total;
         const int64_t k_tiles         = ncols / GGML_SYCL_MXFP4_MOE_XMX_K;
-        const int64_t expert_bytes =
-            k_tiles * n_tile_groups_n * static_cast<int64_t>(tile_n_total) *
-            (1 + static_cast<int64_t>(GGML_SYCL_MXFP4_MOE_XMX_K / 2));
+        const int64_t expert_bytes    = k_tiles * n_tile_groups_n * static_cast<int64_t>(tile_n_total) *
+                                     (1 + static_cast<int64_t>(GGML_SYCL_MXFP4_MOE_XMX_K / 2));
 
         std::vector<std::vector<uint8_t>> gate_xmx(static_cast<size_t>(n_experts));
         std::vector<std::vector<uint8_t>> up_xmx(static_cast<size_t>(n_experts));
@@ -7513,26 +9722,23 @@ static bool mxfp4_moe_xmx_tiled_validate_output(ggml_backend_sycl_context & ctx,
             }
             gate_xmx[static_cast<size_t>(eid)].resize(static_cast<size_t>(expert_bytes));
             up_xmx[static_cast<size_t>(eid)].resize(static_cast<size_t>(expert_bytes));
-            stream->memcpy(gate_xmx[static_cast<size_t>(eid)].data(), gate_ptrs_host[static_cast<size_t>(eid)],
-                           static_cast<size_t>(expert_bytes))
-                .wait_and_throw();
-            stream->memcpy(up_xmx[static_cast<size_t>(eid)].data(), up_ptrs_host[static_cast<size_t>(eid)],
-                           static_cast<size_t>(expert_bytes))
-                .wait_and_throw();
+            mmvq_debug_copy_to_host(*stream, ctx.device, gate_xmx[static_cast<size_t>(eid)].data(),
+                                    gate_ptrs_host[static_cast<size_t>(eid)], static_cast<size_t>(expert_bytes));
+            mmvq_debug_copy_to_host(*stream, ctx.device, up_xmx[static_cast<size_t>(eid)].data(),
+                                    up_ptrs_host[static_cast<size_t>(eid)], static_cast<size_t>(expert_bytes));
         }
 
         std::vector<char> q8_host(static_cast<size_t>(q8_bytes));
-        stream->memcpy(q8_host.data(), q8_1_buffer, static_cast<size_t>(q8_bytes)).wait_and_throw();
+        mmvq_debug_copy_to_host(*stream, ctx.device, q8_host.data(), q8_1_buffer, static_cast<size_t>(q8_bytes));
 
         std::vector<float> out_host(static_cast<size_t>(total_batches * rows_to_check), 0.0f);
         for (int64_t id = 0; id < n_ids; ++id) {
             for (int64_t iid1 = 0; iid1 < num_tokens; ++iid1) {
                 const int64_t group = id * num_tokens + iid1;
                 const char *  src   = reinterpret_cast<const char *>(glu_d) + id * dst_nb1 + iid1 * dst_nb2;
-                stream
-                    ->memcpy(out_host.data() + static_cast<size_t>(group * rows_to_check), src,
-                             static_cast<size_t>(rows_to_check) * sizeof(float))
-                    .wait_and_throw();
+                mmvq_debug_copy_to_host(*stream, ctx.device,
+                                        out_host.data() + static_cast<size_t>(group * rows_to_check), src,
+                                        static_cast<size_t>(rows_to_check) * sizeof(float));
             }
         }
 
@@ -7544,12 +9750,12 @@ static bool mxfp4_moe_xmx_tiled_validate_output(ggml_backend_sycl_context & ctx,
             const size_t bytes =
                 static_cast<size_t>((n_experts - 1) * nb1 + nrows_per_expert * static_cast<int64_t>(sizeof(float)));
             host.resize(bytes);
-            stream->memcpy(host.data(), device_ptr, bytes).wait_and_throw();
+            mmvq_debug_copy_to_host(*stream, ctx.device, host.data(), device_ptr, bytes);
             return host;
         };
         std::vector<char> gate_bias_host = copy_bias(gate_bias_device, gate_bias_nb1);
         std::vector<char> up_bias_host   = copy_bias(up_bias_device, up_bias_nb1);
-        auto bias_value = [](const std::vector<char> & bias, int64_t nb1, int32_t eid, int64_t row) {
+        auto              bias_value     = [](const std::vector<char> & bias, int64_t nb1, int32_t eid, int64_t row) {
             if (bias.empty() || nb1 <= 0) {
                 return 0.0f;
             }
@@ -7582,22 +9788,18 @@ static bool mxfp4_moe_xmx_tiled_validate_output(ggml_backend_sycl_context & ctx,
             const int64_t i12    = iid1;
             const char *  q8_row = q8_host.data() + i11 * q8_nb11 + i12 * q8_nb12;
             for (int64_t row = 0; row < rows_to_check; ++row) {
-                float gate_value =
-                    mxfp4_xmx_tiled_dot_q8_soa_host(gate_xmx[static_cast<size_t>(eid)].data(), q8_row,
-                                                    static_cast<int>(ncols), static_cast<int>(ncols_y),
-                                                    static_cast<int>(nrows_per_expert), static_cast<int>(row),
-                                                    tile_n_total);
-                float up_value =
-                    mxfp4_xmx_tiled_dot_q8_soa_host(up_xmx[static_cast<size_t>(eid)].data(), q8_row,
-                                                    static_cast<int>(ncols), static_cast<int>(ncols_y),
-                                                    static_cast<int>(nrows_per_expert), static_cast<int>(row),
-                                                    tile_n_total);
+                float gate_value = mxfp4_xmx_tiled_dot_q8_soa_host(
+                    gate_xmx[static_cast<size_t>(eid)].data(), q8_row, static_cast<int>(ncols),
+                    static_cast<int>(ncols_y), static_cast<int>(nrows_per_expert), static_cast<int>(row), tile_n_total);
+                float up_value = mxfp4_xmx_tiled_dot_q8_soa_host(
+                    up_xmx[static_cast<size_t>(eid)].data(), q8_row, static_cast<int>(ncols), static_cast<int>(ncols_y),
+                    static_cast<int>(nrows_per_expert), static_cast<int>(row), tile_n_total);
                 gate_value += bias_value(gate_bias_host, gate_bias_nb1, eid, row);
                 up_value += bias_value(up_bias_host, up_bias_nb1, eid, row);
-                const float expected = mmvq_moe_apply_pair_glu_host(gate_value, up_value, glu_op, alpha, limit);
-                const float actual   = out_host[static_cast<size_t>(group * rows_to_check + row)];
-                const double abs_err = std::fabs(static_cast<double>(actual) - static_cast<double>(expected));
-                const double tol     = 1e-2 + 1e-2 * std::fabs(static_cast<double>(expected));
+                const float  expected = mmvq_moe_apply_pair_glu_host(gate_value, up_value, glu_op, alpha, limit);
+                const float  actual   = out_host[static_cast<size_t>(group * rows_to_check + row)];
+                const double abs_err  = std::fabs(static_cast<double>(actual) - static_cast<double>(expected));
+                const double tol      = 1e-2 + 1e-2 * std::fabs(static_cast<double>(expected));
                 if (!std::isfinite(actual) || !std::isfinite(expected) || abs_err > tol) {
                     ++mismatches;
                     if (first_group < 0) {
@@ -7621,10 +9823,9 @@ static bool mxfp4_moe_xmx_tiled_validate_output(ggml_backend_sycl_context & ctx,
                 "checked=%lld mismatches=%lld max_abs=%.9g mean_abs=%.9g first_group=%lld first_row=%lld "
                 "first_expert=%d actual=%.9g expected=%.9g gate=%.9g up=%.9g\n",
                 gate_weight->name ? gate_weight->name : "?", path ? path : "?", (long long) total_batches,
-                (long long) rows_to_check, (long long) ncols, tile_n_total, (long long) checked,
-                (long long) mismatches, max_abs, checked > 0 ? sum_abs / static_cast<double>(checked) : 0.0,
-                (long long) first_group, (long long) first_row, first_expert, first_actual, first_expected,
-                first_gate_value, first_up_value);
+                (long long) rows_to_check, (long long) ncols, tile_n_total, (long long) checked, (long long) mismatches,
+                max_abs, checked > 0 ? sum_abs / static_cast<double>(checked) : 0.0, (long long) first_group,
+                (long long) first_row, first_expert, first_actual, first_expected, first_gate_value, first_up_value);
         return true;
     } catch (const std::exception & e) {
         fprintf(stderr, "[MOE-XMX-OUTPUT-VALIDATE] tensor=%s failed: %s\n",
@@ -7870,31 +10071,21 @@ static bool ggml_sycl_moe_ensure_compact_storage(ggml_backend_sycl_context & ctx
         extra->moe_expert_ptrs_compact_size[ctx.device] = bytes;
     } else {
         if (extra->moe_compact_ptr(ctx.device) != nullptr) {
-            if (!extra->moe_expert_ptrs_compact_from_prealloc[ctx.device]) {
-                if (extra->moe_expert_ptrs_compact_alloc[ctx.device].ptr) {
-                    ggml_sycl::unified_free(extra->moe_expert_ptrs_compact_alloc[ctx.device]);
-                    extra->moe_expert_ptrs_compact_alloc[ctx.device] = {};
-                } else {
-                    sycl::free(extra->moe_expert_ptrs_compact_device[ctx.device], *stream);
-                }
-            }
-            extra->moe_expert_ptrs_compact_device[ctx.device]        = nullptr;
+            extra->moe_expert_ptrs_compact_handle[ctx.device]        = {};
             extra->moe_expert_ptrs_compact_capacity[ctx.device]      = 0;
             extra->moe_expert_ptrs_compact_size[ctx.device]          = 0;
             extra->moe_expert_ptrs_compact_from_prealloc[ctx.device] = false;
-            extra->moe_expert_ptrs_compact_handle[ctx.device]        = {};
         }
 
         void * compact = ggml_sycl::moe_get_compact_ptrs(ctx.device, bytes);
         if (compact) {
             const auto * bufs                                        = ggml_sycl::moe_get_inference_buffers(ctx.device);
             const bool   on_device                                   = !bufs || bufs->compact_on_device;
-            extra->moe_expert_ptrs_compact_device[ctx.device]        = compact;
             extra->moe_expert_ptrs_compact_capacity[ctx.device]      = bytes;
             extra->moe_expert_ptrs_compact_size[ctx.device]          = bytes;
             extra->moe_expert_ptrs_compact_from_prealloc[ctx.device] = true;
-            extra->moe_expert_ptrs_compact_handle[ctx.device]        = ggml_sycl::mem_handle::from_direct(
-                compact, GGML_LAYOUT_AOS, on_device, on_device ? ctx.device : ggml_sycl::mem_handle::HOST_DEVICE);
+            extra->moe_expert_ptrs_compact_handle[ctx.device] =
+                ggml_sycl::mem_handle::from_chunk_ptr(compact, ctx.device, GGML_LAYOUT_AOS, on_device);
         } else if (!allow_alloc) {
             return false;
         } else {
@@ -7905,19 +10096,17 @@ static bool ggml_sycl_moe_ensure_compact_storage(ggml_backend_sycl_context & ctx
             req.intent.role                    = ggml_sycl::alloc_role::CONTROL;
             req.intent.category                = ggml_sycl::runtime_category::CONTROL;
             req.intent.constraints.must_device = true;
-            if (!ggml_sycl::unified_alloc(req, &extra->moe_expert_ptrs_compact_alloc[ctx.device]) ||
-                !extra->moe_expert_ptrs_compact_alloc[ctx.device].ptr) {
-                extra->moe_expert_ptrs_compact_alloc[ctx.device] = {};
+            ggml_sycl::mem_handle compact_handle = ggml_sycl::unified_allocate(req);
+            auto                  compact_resolved = compact_handle.resolve(ctx.device);
+            if (!compact_handle.valid() || !compact_resolved || !compact_resolved.ptr || !compact_resolved.on_device) {
                 GGML_LOG_ERROR("[MOE] Failed to allocate compact pointer list (%zu bytes)\n", bytes);
                 return false;
             }
-            compact                                             = extra->moe_expert_ptrs_compact_alloc[ctx.device].ptr;
-            extra->moe_expert_ptrs_compact_device[ctx.device]   = compact;
-            extra->moe_expert_ptrs_compact_capacity[ctx.device] = bytes;
-            extra->moe_expert_ptrs_compact_size[ctx.device]     = bytes;
+            compact                                                  = compact_resolved.ptr;
+            extra->moe_expert_ptrs_compact_capacity[ctx.device]      = bytes;
+            extra->moe_expert_ptrs_compact_size[ctx.device]          = bytes;
             extra->moe_expert_ptrs_compact_from_prealloc[ctx.device] = false;
-            extra->moe_expert_ptrs_compact_handle[ctx.device] =
-                extra->moe_expert_ptrs_compact_alloc[ctx.device].as_mem_handle();
+            extra->moe_expert_ptrs_compact_handle[ctx.device]        = std::move(compact_handle);
         }
     }
 
@@ -7926,10 +10115,9 @@ static bool ggml_sycl_moe_ensure_compact_storage(ggml_backend_sycl_context & ctx
         if (missing) {
             const auto * bufs                                        = ggml_sycl::moe_get_inference_buffers(ctx.device);
             const bool   on_device                                   = !bufs || bufs->compact_missing_on_device;
-            extra->moe_expert_ptrs_missing_device[ctx.device]        = missing;
             extra->moe_expert_ptrs_missing_from_prealloc[ctx.device] = true;
-            extra->moe_expert_ptrs_missing_handle[ctx.device]        = ggml_sycl::mem_handle::from_direct(
-                missing, GGML_LAYOUT_AOS, on_device, on_device ? ctx.device : ggml_sycl::mem_handle::HOST_DEVICE);
+            extra->moe_expert_ptrs_missing_handle[ctx.device] =
+                ggml_sycl::mem_handle::from_chunk_ptr(missing, ctx.device, GGML_LAYOUT_AOS, on_device);
         } else if (!allow_alloc) {
             return false;
         } else {
@@ -7940,17 +10128,16 @@ static bool ggml_sycl_moe_ensure_compact_storage(ggml_backend_sycl_context & ctx
             req.intent.role                    = ggml_sycl::alloc_role::CONTROL;
             req.intent.category                = ggml_sycl::runtime_category::CONTROL;
             req.intent.constraints.must_device = true;
-            if (!ggml_sycl::unified_alloc(req, &extra->moe_expert_ptrs_missing_alloc[ctx.device]) ||
-                !extra->moe_expert_ptrs_missing_alloc[ctx.device].ptr) {
-                extra->moe_expert_ptrs_missing_alloc[ctx.device] = {};
+            ggml_sycl::mem_handle missing_handle = ggml_sycl::unified_allocate(req);
+            auto                  missing_resolved = missing_handle.resolve(ctx.device);
+            if (!missing_handle.valid() || !missing_resolved || !missing_resolved.ptr ||
+                !missing_resolved.on_device) {
                 GGML_LOG_ERROR("[MOE] Failed to allocate compact list missing flag\n");
                 return false;
             }
-            missing = static_cast<int *>(extra->moe_expert_ptrs_missing_alloc[ctx.device].ptr);
-            extra->moe_expert_ptrs_missing_device[ctx.device]        = missing;
+            missing                                                  = static_cast<int *>(missing_resolved.ptr);
             extra->moe_expert_ptrs_missing_from_prealloc[ctx.device] = false;
-            extra->moe_expert_ptrs_missing_handle[ctx.device] =
-                extra->moe_expert_ptrs_missing_alloc[ctx.device].as_mem_handle();
+            extra->moe_expert_ptrs_missing_handle[ctx.device]        = std::move(missing_handle);
         }
     }
 
@@ -8125,8 +10312,9 @@ void ggml_sycl_moe_pre_allocate_buffers(ggml_backend_sycl_context & ctx, ggml_cg
     if (ctx.moe_buffers.initialized) {
         const bool count_ok = ctx.moe_buffers.q8_1_buffers.size() >= static_cast<size_t>(moe_count);
         const bool size_ok  = ctx.moe_buffers.max_ne10 >= max_ne10 && ctx.moe_buffers.max_src1_rows >= max_src1_rows;
-        const bool owner_ok = ctx.moe_buffers.q8_1_owner.ptr && ctx.moe_buffers.q8_1_bytes >= demand.total_bytes &&
-                              ctx.moe_buffers.q8_1_base == ctx.moe_buffers.q8_1_owner.ptr;
+        const auto owner_resolved = ctx.moe_buffers.q8_1_owner.resolve(ctx.device);
+        const bool owner_ok       = owner_resolved && ctx.moe_buffers.q8_1_bytes >= demand.total_bytes &&
+                              ctx.moe_buffers.q8_1_base == owner_resolved.ptr;
         if (count_ok && size_ok && owner_ok) {
             ctx.moe_buffers.reset_usage();
             return;
@@ -8134,8 +10322,17 @@ void ggml_sycl_moe_pre_allocate_buffers(ggml_backend_sycl_context & ctx, ggml_cg
         ctx.moe_buffers.free_buffers(stream);
     }
 
-    ggml_sycl::alloc_handle graph_owner{};
-    if (!ggml_sycl::unified_cache_allocate_moe_q8_1_graph_scratch(ctx.device, demand, &graph_owner)) {
+    ggml_sycl::alloc_request graph_req{};
+    graph_req.queue                               = stream;
+    graph_req.device                              = ctx.device;
+    graph_req.size                                = demand.total_bytes;
+    graph_req.intent.role                         = ggml_sycl::alloc_role::GRAPH_TMP;
+    graph_req.intent.category                     = ggml_sycl::runtime_category::GRAPH;
+    graph_req.intent.constraints.must_device      = true;
+    graph_req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::WEIGHT;
+
+    ggml_sycl::mem_handle graph_handle = ggml_sycl::unified_allocate(graph_req);
+    if (!graph_handle.valid()) {
         GGML_LOG_ERROR(
             "[MOE-GRAPH] Failed to allocate owned Q8_1 graph scratch "
             "(requested=%zu bytes, buffers=%d, bytes_per_buffer=%zu, device=%d, layout=%d, dtype=%d, "
@@ -8144,14 +10341,18 @@ void ggml_sycl_moe_pre_allocate_buffers(ggml_backend_sycl_context & ctx, ggml_cg
             demand.weight_type, demand.layer_id, demand.n_experts, demand.n_expert_used);
         return;
     }
+    auto graph_resolved = graph_handle.resolve(ctx.device);
+    if (!graph_resolved || !graph_resolved.ptr || !graph_resolved.on_device) {
+        GGML_LOG_ERROR("[MOE-GRAPH] Owned Q8_1 graph scratch did not resolve on device %d\n", ctx.device);
+        return;
+    }
 
     // Allocate buffers
     ctx.moe_buffers.q8_1_buffers.resize(moe_count);
     ctx.moe_buffers.q8_1_sizes.resize(moe_count);
-    ctx.moe_buffers.q8_1_owner = graph_owner;
-    ctx.moe_buffers.q8_1_base  = graph_owner.ptr;
-    ctx.moe_buffers.q8_1_bytes = graph_owner.size;
-    graph_owner                = {};
+    ctx.moe_buffers.q8_1_owner = std::move(graph_handle);
+    ctx.moe_buffers.q8_1_base  = graph_resolved.ptr;
+    ctx.moe_buffers.q8_1_bytes = ctx.moe_buffers.q8_1_owner.size();
 
     uint8_t * graph_base = static_cast<uint8_t *>(ctx.moe_buffers.q8_1_base);
     for (int i = 0; i < moe_count; i++) {
@@ -8303,7 +10504,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
     if (reuse_q8) {
         GGML_SYCL_DEBUG("[MOE-Q8-ARTIFACT] HIT role=%d layer=%d src=%p rows=%lld ne0=%lld bytes=%zu q8=%p\n",
                         (int) reuse_role, reuse_layer, (const void *) src1_d, (long long) total_src1_rows,
-                        (long long) ne10, required_size, g_mxfp4_moe_tg_reuse.q8_alloc.ptr);
+                        (long long) ne10, required_size, mxfp4_moe_tg_reuse_q8_ptr(runtime_device));
     }
 
     ggml_sycl_pool_alloc<int8_t> src1_q8_1_pool(ctx.pool());
@@ -8316,6 +10517,9 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
         q8_1_buffer = src1_q8_1_pool.get();
         if (reuse_candidate) {
             mxfp4_moe_tg_reuse_invalidate();
+        }
+        if (!q8_1_buffer) {
+            return false;
         }
     }
 
@@ -8342,7 +10546,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
         t_quant_begin = std::chrono::high_resolution_clock::now();
     }
     auto t_quant_end = std::chrono::high_resolution_clock::now();
-    if (reuse_candidate && !reuse_q8 && q8_1_buffer == g_mxfp4_moe_tg_reuse.q8_alloc.ptr) {
+    if (reuse_candidate && !reuse_q8 && q8_1_buffer == mxfp4_moe_tg_reuse_q8_ptr(runtime_device)) {
         mxfp4_moe_tg_reuse_store(runtime_device, reuse_layer, reuse_role, src1_handle, ne10, total_src1_rows,
                                  ne10_padded, q8_1_row_size, required_size, layout);
     } else if (reuse_q8) {
@@ -8404,10 +10608,11 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
             grouped_i8_policy_reason = "expert-id";
         }
     }
-    const bool prefer_grouped_i8 = src0->type == GGML_TYPE_MXFP4 && layout == GGML_LAYOUT_MXFP4_I8 && full_gpu_cover &&
-                                   ids_host != nullptr && ids_host_count == total_batches &&
-                                   total_batches >= static_cast<int64_t>(GGML_SYCL_MXFP4_MOE_XMX_N) &&
-                                   grouped_i8_occupancy.dispatch_ready;
+    const bool grouped_i8_enabled = mxfp4_i8_down_grouped_enabled();
+    const bool prefer_grouped_i8 =
+        grouped_i8_enabled && src0->type == GGML_TYPE_MXFP4 && layout == GGML_LAYOUT_MXFP4_I8 && full_gpu_cover &&
+        ids_host != nullptr && ids_host_count == total_batches &&
+        total_batches >= static_cast<int64_t>(GGML_SYCL_MXFP4_MOE_XMX_N) && grouped_i8_occupancy.dispatch_ready;
     if (src0->type == GGML_TYPE_MXFP4 && layout == GGML_LAYOUT_MXFP4_I8) {
         static std::atomic<int> probe_log{ 0 };
         const char *            row_agg_debug = std::getenv("GGML_SYCL_MOE_ROW_AGG_DEBUG");
@@ -8491,6 +10696,9 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
         ggml_sycl_pool_alloc<int32_t> ids_pool(ctx.pool());
         ids_pool.alloc(total_batches * sizeof(int32_t));
         ids_device = ids_pool.get();
+        if (!ids_device) {
+            return false;
+        }
         kernel_deps.push_back(
             submit_memcpy_with_deps(ids_device, batch_ids.data(), total_batches * sizeof(int32_t), kernel_deps));
     }
@@ -8516,6 +10724,25 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
     int32_t *                     grouped_chunk_starts_device = nullptr;
     int                           grouped_n_groups            = 0;
     int                           grouped_n_chunks            = 0;
+    auto                          alloc_i32_scratch           = [&](int32_t *& ptr, size_t count, const char * cohort) {
+        GGML_UNUSED(cohort);
+        ptr = nullptr;
+        ggml_sycl_pool_alloc<int32_t> * pool = nullptr;
+        if (!grouped_experts_device) {
+            pool = &grouped_experts_pool;
+        } else if (!grouped_offsets_device) {
+            pool = &grouped_offsets_pool;
+        } else if (!grouped_rows_device) {
+            pool = &grouped_rows_pool;
+        } else if (!grouped_chunk_groups_device) {
+            pool = &grouped_chunk_groups_pool;
+        } else {
+            pool = &grouped_chunk_starts_pool;
+        }
+        pool->alloc(count * sizeof(int32_t));
+        ptr = pool->get();
+        return ptr != nullptr;
+    };
 
     if (can_use_direct_ids && !prefer_grouped_i8 && layout != GGML_LAYOUT_XMX_TILED) {
         // Compact storage is owned by the tensor extra as a unified-cache
@@ -8599,10 +10826,9 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                                          caps.optimal_tiles_n);
                     }
                 };
-                const bool xmx_caps_ok =
-                    xmx_capabilities_match_int8_tile(caps, repeat, exec_n, k_per) &&
-                    xmx_capabilities_support_sub_group(caps, GGML_SYCL_MXFP4_MOE_XMX_SG) &&
-                    caps.optimal_tiles_n > 0;
+                const bool xmx_caps_ok = xmx_capabilities_match_int8_tile(caps, repeat, exec_n, k_per) &&
+                                         xmx_capabilities_support_sub_group(caps, GGML_SYCL_MXFP4_MOE_XMX_SG) &&
+                                         caps.optimal_tiles_n > 0;
                 const bool xmx_shape_ok = route_ids_device != nullptr && (ne00 % k_per) == 0;
                 if (!xmx_shape_ok || !xmx_caps_ok) {
                     log_xmx_reject(!xmx_shape_ok ? "shape" : "caps");
@@ -8613,9 +10839,9 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                     log_xmx_reject("tile-n-total");
                     return false;
                 }
-                const bool grouped_decode_shape = full_gpu_cover && total_batches >= exec_n;
+                const bool grouped_decode_shape = full_gpu_cover;
                 if (!grouped_decode_shape) {
-                    log_xmx_reject("small-decode");
+                    log_xmx_reject("coverage");
                     return false;
                 }
                 if (!full_gpu_cover || !xmx_capabilities_match_int8_tile(caps, repeat, exec_n, k_per) ||
@@ -8641,6 +10867,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                 grouped_slots.clear();
                 grouped_counts_host.clear();
                 grouped_slots.reserve(static_cast<size_t>(std::min<int64_t>(n_experts, n_gpu_entries)));
+                std::vector<int32_t> expert_to_group(static_cast<size_t>(n_experts), -1);
 
                 std::vector<uint8_t> seen_slots(static_cast<size_t>(total_batches), 0);
                 for (int i = 0; i < n_gpu_entries; ++i) {
@@ -8661,16 +10888,14 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                     }
                     seen_slots[slot] = 1;
 
-                    auto   it = std::find(grouped_experts_host.begin(), grouped_experts_host.end(), eid);
-                    size_t group_index;
-                    if (it == grouped_experts_host.end()) {
-                        group_index = grouped_experts_host.size();
+                    int32_t group_index = expert_to_group[static_cast<size_t>(eid)];
+                    if (group_index < 0) {
+                        group_index                               = grouped_experts_host.size();
+                        expert_to_group[static_cast<size_t>(eid)] = group_index;
                         grouped_experts_host.push_back(eid);
                         grouped_slots.emplace_back();
-                    } else {
-                        group_index = static_cast<size_t>(std::distance(grouped_experts_host.begin(), it));
                     }
-                    grouped_slots[group_index].push_back(static_cast<int32_t>(slot64));
+                    grouped_slots[static_cast<size_t>(group_index)].push_back(static_cast<int32_t>(slot64));
                 }
                 for (uint8_t seen : seen_slots) {
                     if (!seen) {
@@ -8707,8 +10932,12 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                     caps, grouped_counts_host.data(), grouped_counts_host.size(), row_limit);
                 bool                             chunked_row_limit = false;
                 std::vector<std::pair<int, int>> chunk_passes;
-                if (!occupancy.dispatch_ready) {
-                    if (std::strcmp(occupancy.reason, "kernel-row-limit") == 0 && row_limit >= exec_n) {
+                const bool                       sparse_xmx_batch =
+                    full_gpu_cover && (std::strcmp(occupancy.reason, "rows-per-expert") == 0 ||
+                                       std::strcmp(occupancy.reason, "occupancy") == 0);
+                if (!occupancy.dispatch_ready && !sparse_xmx_batch) {
+                    if (mxfp4_grouped_chunk_row_limit_enabled() &&
+                        std::strcmp(occupancy.reason, "kernel-row-limit") == 0 && row_limit >= exec_n) {
                         int    pass_begin = 0;
                         size_t pass_rows  = 0;
                         for (int c = 0; c < grouped_n_chunks; ++c) {
@@ -8742,18 +10971,16 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                     }
                 }
 
-                grouped_experts_pool.alloc(grouped_experts_host.size() * sizeof(int32_t));
-                grouped_offsets_pool.alloc(grouped_offsets_host.size() * sizeof(int32_t));
-                grouped_rows_pool.alloc(grouped_rows_host.size() * sizeof(int32_t));
-                grouped_chunk_groups_pool.alloc(grouped_chunk_groups_host.size() * sizeof(int32_t));
-                grouped_chunk_starts_pool.alloc(grouped_chunk_starts_host.size() * sizeof(int32_t));
-                grouped_experts_device      = grouped_experts_pool.get();
-                grouped_offsets_device      = grouped_offsets_pool.get();
-                grouped_rows_device         = grouped_rows_pool.get();
-                grouped_chunk_groups_device = grouped_chunk_groups_pool.get();
-                grouped_chunk_starts_device = grouped_chunk_starts_pool.get();
-                if (!grouped_experts_device || !grouped_offsets_device || !grouped_rows_device ||
-                    !grouped_chunk_groups_device || !grouped_chunk_starts_device) {
+                if (!alloc_i32_scratch(grouped_experts_device, grouped_experts_host.size(),
+                                       "mmvq_moe_batched_grouped_experts") ||
+                    !alloc_i32_scratch(grouped_offsets_device, grouped_offsets_host.size(),
+                                       "mmvq_moe_batched_grouped_offsets") ||
+                    !alloc_i32_scratch(grouped_rows_device, grouped_rows_host.size(),
+                                       "mmvq_moe_batched_grouped_rows") ||
+                    !alloc_i32_scratch(grouped_chunk_groups_device, grouped_chunk_groups_host.size(),
+                                       "mmvq_moe_batched_grouped_chunk_groups") ||
+                    !alloc_i32_scratch(grouped_chunk_starts_device, grouped_chunk_starts_host.size(),
+                                       "mmvq_moe_batched_grouped_chunk_starts")) {
                     log_xmx_reject("group-alloc");
                     return false;
                 }
@@ -8839,15 +11066,69 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                 };
                 const bool grouped_decode_shape = full_gpu_cover && total_batches >= exec_n && ids_host != nullptr &&
                                                   ids_host_count == total_batches && (ne00 % k_per) == 0;
-                if (grouped_decode_shape && grouped_i8_occupancy.dispatch_ready &&
+                const size_t grouped_i8_row_limit = ggml_sycl_mxfp4_grouped_dpas_row_list_limit(caps);
+                const bool   grouped_i8_chunkable = mxfp4_grouped_chunk_row_limit_enabled() &&
+                                                  std::strcmp(grouped_i8_policy_reason, "kernel-row-limit") == 0 &&
+                                                  grouped_i8_row_limit >= static_cast<size_t>(exec_n);
+                const bool device_grouped_i8_shape = mxfp4_moe_device_grouping_enabled() && full_gpu_cover &&
+                                                     can_use_direct_ids && ids_host == nullptr &&
+                                                     route_ids_device != nullptr && ids_nb0 > 0 && ids_nb1 > 0 &&
+                                                     total_batches >= exec_n && (ne00 % k_per) == 0;
+                if (grouped_i8_enabled && device_grouped_i8_shape &&
                     xmx_capabilities_match_int8_tile(caps, repeat, exec_n, k_per) &&
                     xmx_capabilities_support_sub_group(caps, GGML_SYCL_MXFP4_MOE_XMX_SG)) {
+                    const int n_experts_i = n_experts;
+                    const int max_chunks  = n_experts_i * ((static_cast<int>(total_batches) + exec_n - 1) / exec_n);
+                    int32_t * active_chunks_device = nullptr;
+                    if (!alloc_i32_scratch(grouped_experts_device, static_cast<size_t>(n_experts_i),
+                                           "mmvq_moe_batched_device_grouped_experts") ||
+                        !alloc_i32_scratch(grouped_offsets_device, static_cast<size_t>(n_experts_i + 1),
+                                           "mmvq_moe_batched_device_grouped_offsets") ||
+                        !alloc_i32_scratch(grouped_rows_device, static_cast<size_t>(total_batches),
+                                           "mmvq_moe_batched_device_grouped_rows") ||
+                        !alloc_i32_scratch(grouped_chunk_groups_device, static_cast<size_t>(max_chunks),
+                                           "mmvq_moe_batched_device_grouped_chunk_groups") ||
+                        !alloc_i32_scratch(grouped_chunk_starts_device, static_cast<size_t>(max_chunks),
+                                           "mmvq_moe_batched_device_grouped_chunk_starts") ||
+                        !alloc_i32_scratch(active_chunks_device, 1, "mmvq_moe_batched_device_grouped_active_chunks")) {
+                        return false;
+                    }
+                    std::vector<sycl::event> grouped_deps;
+                    grouped_deps.reserve(kernel_deps.size() + 1);
+                    grouped_deps.push_back(mxfp4_build_grouped_metadata_from_ids_sycl(
+                        *stream, route_ids_device, ids_nb0, ids_nb1, static_cast<int>(n_ids),
+                        static_cast<int>(num_tokens), n_experts_i, exec_n, grouped_experts_device,
+                        grouped_offsets_device, grouped_rows_device, grouped_chunk_groups_device,
+                        grouped_chunk_starts_device, active_chunks_device, kernel_deps));
+                    int             device_n_chunks   = max_chunks;
+                    const int32_t * active_chunks_arg = active_chunks_device;
+                    if (mxfp4_moe_device_grouping_sync_chunks_enabled()) {
+                        device_n_chunks = mxfp4_copy_active_chunks_to_host(*stream, active_chunks_device, grouped_deps);
+                        if (device_n_chunks <= 0 || device_n_chunks > max_chunks) {
+                            return false;
+                        }
+                        active_chunks_arg = nullptr;
+                    }
+                    kernel_event = mxfp4_i8_grouped_direct_q8_sycl<repeat>(
+                        *stream, expert_ptrs_device, q8_1_buffer, dst_d, grouped_experts_device, grouped_offsets_device,
+                        grouped_rows_device, grouped_chunk_groups_device, grouped_chunk_starts_device,
+                        static_cast<int>(ne00), static_cast<int>(ne10), static_cast<int>(ne01), device_n_chunks,
+                        static_cast<int>(num_tokens), static_cast<int>(ne11), q8_nb11, q8_nb12, nb1, nb2,
+                        /*scale_stride_blocks=*/0, grouped_deps, active_chunks_arg);
+                    have_kernel_event = true;
+                    used_grouped_i8   = true;
+                } else if (grouped_i8_enabled && grouped_decode_shape &&
+                           (grouped_i8_occupancy.dispatch_ready || grouped_i8_chunkable) &&
+                           xmx_capabilities_match_int8_tile(caps, repeat, exec_n, k_per) &&
+                           xmx_capabilities_support_sub_group(caps, GGML_SYCL_MXFP4_MOE_XMX_SG)) {
                     static thread_local std::vector<int32_t> grouped_experts_host;
                     static thread_local std::vector<int32_t> grouped_offsets_host;
                     static thread_local std::vector<int32_t> grouped_rows_host;
                     static thread_local std::vector<int32_t> grouped_chunk_groups_host;
                     static thread_local std::vector<int32_t> grouped_chunk_starts_host;
                     std::vector<std::vector<int32_t>>        grouped_slots;
+                    std::vector<std::pair<int, int>>         chunk_passes;
+                    bool                                     chunked_row_limit = false;
 
                     grouped_experts_host.clear();
                     grouped_offsets_host.clear();
@@ -8856,26 +11137,26 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                     grouped_chunk_starts_host.clear();
                     grouped_slots.clear();
                     grouped_slots.reserve(static_cast<size_t>(std::min<int64_t>(n_experts, total_batches)));
+                    std::vector<int32_t> expert_to_group(static_cast<size_t>(n_experts), -1);
 
                     bool grouping_ok = true;
-                    for (int64_t iid1 = 0; iid1 < num_tokens && grouping_ok; ++iid1) {
-                        for (int64_t id = 0; id < n_ids; ++id) {
+                    for (int64_t id = 0; id < n_ids && grouping_ok; ++id) {
+                        for (int64_t iid1 = 0; iid1 < num_tokens; ++iid1) {
                             const int64_t ci  = iid1 * n_ids + id;
                             const int32_t eid = ids_host[ci];
                             if (eid < 0 || eid >= n_experts) {
                                 grouping_ok = false;
                                 break;
                             }
-                            auto   it = std::find(grouped_experts_host.begin(), grouped_experts_host.end(), eid);
-                            size_t group_index;
-                            if (it == grouped_experts_host.end()) {
-                                group_index = grouped_experts_host.size();
+                            int32_t group_index = expert_to_group[static_cast<size_t>(eid)];
+                            if (group_index < 0) {
+                                group_index                               = grouped_experts_host.size();
+                                expert_to_group[static_cast<size_t>(eid)] = group_index;
                                 grouped_experts_host.push_back(eid);
                                 grouped_slots.emplace_back();
-                            } else {
-                                group_index = static_cast<size_t>(std::distance(grouped_experts_host.begin(), it));
                             }
-                            grouped_slots[group_index].push_back(static_cast<int32_t>(id * num_tokens + iid1));
+                            grouped_slots[static_cast<size_t>(group_index)].push_back(
+                                static_cast<int32_t>(id * num_tokens + iid1));
                         }
                     }
 
@@ -8883,7 +11164,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                         grouped_offsets_host.reserve(grouped_experts_host.size() + 1);
                         grouped_offsets_host.push_back(0);
                         for (size_t g = 0; g < grouped_slots.size(); ++g) {
-                            auto & rows = grouped_slots[g];
+                            auto &    rows       = grouped_slots[g];
                             std::sort(rows.begin(), rows.end());
                             const int rows_begin = static_cast<int>(grouped_rows_host.size());
                             grouped_rows_host.insert(grouped_rows_host.end(), rows.begin(), rows.end());
@@ -8901,19 +11182,48 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                                       grouped_rows_host.size() == static_cast<size_t>(total_batches);
                     }
 
+                    if (grouping_ok && grouped_i8_chunkable && !grouped_i8_occupancy.dispatch_ready) {
+                        int    pass_begin = 0;
+                        size_t pass_rows  = 0;
+                        for (int c = 0; c < grouped_n_chunks; ++c) {
+                            const int group = grouped_chunk_groups_host[static_cast<size_t>(c)];
+                            if (group < 0 || group >= grouped_n_groups) {
+                                grouping_ok = false;
+                                break;
+                            }
+                            const int row_start  = grouped_chunk_starts_host[static_cast<size_t>(c)];
+                            const int rows_begin = grouped_offsets_host[static_cast<size_t>(group)];
+                            const int rows_end   = grouped_offsets_host[static_cast<size_t>(group + 1)];
+                            const int group_rows = rows_end - rows_begin;
+                            if (row_start < 0 || row_start >= group_rows) {
+                                grouping_ok = false;
+                                break;
+                            }
+                            const size_t chunk_rows = static_cast<size_t>(std::min(exec_n, group_rows - row_start));
+                            if (pass_rows > 0 && pass_rows + chunk_rows > grouped_i8_row_limit) {
+                                chunk_passes.emplace_back(pass_begin, c - pass_begin);
+                                pass_begin = c;
+                                pass_rows  = 0;
+                            }
+                            pass_rows += chunk_rows;
+                        }
+                        if (grouping_ok && pass_rows > 0) {
+                            chunk_passes.emplace_back(pass_begin, grouped_n_chunks - pass_begin);
+                        }
+                        chunked_row_limit = grouping_ok && !chunk_passes.empty();
+                    }
+
                     if (grouping_ok) {
-                        grouped_experts_pool.alloc(grouped_experts_host.size() * sizeof(int32_t));
-                        grouped_offsets_pool.alloc(grouped_offsets_host.size() * sizeof(int32_t));
-                        grouped_rows_pool.alloc(grouped_rows_host.size() * sizeof(int32_t));
-                        grouped_chunk_groups_pool.alloc(grouped_chunk_groups_host.size() * sizeof(int32_t));
-                        grouped_chunk_starts_pool.alloc(grouped_chunk_starts_host.size() * sizeof(int32_t));
-                        grouped_experts_device      = grouped_experts_pool.get();
-                        grouped_offsets_device      = grouped_offsets_pool.get();
-                        grouped_rows_device         = grouped_rows_pool.get();
-                        grouped_chunk_groups_device = grouped_chunk_groups_pool.get();
-                        grouped_chunk_starts_device = grouped_chunk_starts_pool.get();
-                        grouping_ok = grouped_experts_device && grouped_offsets_device && grouped_rows_device &&
-                                      grouped_chunk_groups_device && grouped_chunk_starts_device;
+                        grouping_ok = alloc_i32_scratch(grouped_experts_device, grouped_experts_host.size(),
+                                                        "mmvq_moe_batched_i8_grouped_experts") &&
+                                      alloc_i32_scratch(grouped_offsets_device, grouped_offsets_host.size(),
+                                                        "mmvq_moe_batched_i8_grouped_offsets") &&
+                                      alloc_i32_scratch(grouped_rows_device, grouped_rows_host.size(),
+                                                        "mmvq_moe_batched_i8_grouped_rows") &&
+                                      alloc_i32_scratch(grouped_chunk_groups_device, grouped_chunk_groups_host.size(),
+                                                        "mmvq_moe_batched_i8_grouped_chunk_groups") &&
+                                      alloc_i32_scratch(grouped_chunk_starts_device, grouped_chunk_starts_host.size(),
+                                                        "mmvq_moe_batched_i8_grouped_chunk_starts");
                     }
 
                     if (grouping_ok) {
@@ -8946,17 +11256,31 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                             fprintf(stderr,
                                     "[MOE-ROW-AGG] stage=dispatch path=mxfp4_i8_grouped_dpas tensor=%s "
                                     "groups=%d chunks=%d rows=%lld max_rows=%d total_batches=%lld topk=%lld "
-                                    "tokens=%lld\n",
+                                    "tokens=%lld chunked=%d passes=%zu row_limit=%zu\n",
                                     src0->name ? src0->name : "?", grouped_n_groups, grouped_n_chunks,
                                     (long long) grouped_rows_host.size(), max_rows, (long long) total_batches,
-                                    (long long) n_ids, (long long) num_tokens);
+                                    (long long) n_ids, (long long) num_tokens, chunked_row_limit ? 1 : 0,
+                                    chunk_passes.size(), grouped_i8_row_limit);
                         }
-                        kernel_event = mxfp4_i8_grouped_direct_q8_sycl<repeat>(
-                            *stream, expert_ptrs_device, q8_1_buffer, dst_d, grouped_experts_device,
-                            grouped_offsets_device, grouped_rows_device, grouped_chunk_groups_device,
-                            grouped_chunk_starts_device, ne00, ne10, ne01, grouped_n_chunks,
-                            static_cast<int>(num_tokens), static_cast<int>(ne11), q8_nb11, q8_nb12, nb1, nb2,
-                            /*scale_stride_blocks=*/0, grouped_copy_events);
+                        auto submit_chunk_range = [&](int chunk_begin, int chunk_count) {
+                            return mxfp4_i8_grouped_direct_q8_sycl<repeat>(
+                                *stream, expert_ptrs_device, q8_1_buffer, dst_d, grouped_experts_device,
+                                grouped_offsets_device, grouped_rows_device, grouped_chunk_groups_device + chunk_begin,
+                                grouped_chunk_starts_device + chunk_begin, ne00, ne10, ne01, chunk_count,
+                                static_cast<int>(num_tokens), static_cast<int>(ne11), q8_nb11, q8_nb12, nb1, nb2,
+                                /*scale_stride_blocks=*/0, grouped_copy_events);
+                        };
+                        if (chunked_row_limit) {
+                            std::vector<sycl::event> chunk_events;
+                            chunk_events.reserve(chunk_passes.size());
+                            for (const auto & pass : chunk_passes) {
+                                chunk_events.push_back(submit_chunk_range(pass.first, pass.second));
+                            }
+                            kernel_event = ggml_sycl_submit_marker<mxfp4_i8_grouped_chunk_join_kernel<repeat>>(
+                                *stream, chunk_events);
+                        } else {
+                            kernel_event = submit_chunk_range(0, grouped_n_chunks);
+                        }
                         have_kernel_event = true;
                         used_grouped_i8   = true;
                     } else {
@@ -9064,7 +11388,6 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
             *completion_event_set = true;
         }
     }
-
     GGML_SYCL_DEBUG(
         "[MOE-BATCHED] Dispatched %d GPU experts in single kernel "
         "(type=%d, total_batches=%lld)\n",
@@ -9113,11 +11436,15 @@ bool mmvq_moe_batched_dispatch_pair_mxfp4_soa(ggml_backend_sycl_context & ctx,
     const int64_t total_src1_rows = ne11 * ne12;
     const size_t  required_size   = total_src1_rows * q8_1_row_size;
 
-    ggml_sycl_pool_alloc<int8_t> src1_q8_1_pool(ctx.pool());
-    void *                       q8_1_buffer = mxfp4_moe_tg_reuse_get_or_alloc_q8(stream, ctx.device, required_size);
+    mmvq_deferred_temp_release local_temps(stream);
+    void *                     q8_1_buffer = mxfp4_moe_tg_reuse_get_or_alloc_q8(stream, ctx.device, required_size);
     if (!q8_1_buffer) {
-        src1_q8_1_pool.alloc(required_size);
-        q8_1_buffer = src1_q8_1_pool.get();
+        ggml_sycl::mem_handle q8_handle;
+        q8_1_buffer = mmvq_alloc_device_scratch(required_size, *stream, "mmvq_moe_pair_q8_1", q8_handle);
+        if (!q8_1_buffer) {
+            return false;
+        }
+        local_temps.add(std::move(q8_handle));
         mxfp4_moe_tg_reuse_invalidate();
     }
 
@@ -9229,7 +11556,7 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
     const queue_ptr stream         = ctx.stream();
     const int       runtime_device = ctx.device;
     const float *   src1_d         = static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(src1, runtime_device));
-    float * glu_d = nullptr;
+    float *         glu_d          = nullptr;
     if (glu_dst_handle_override && glu_dst_handle_override->valid()) {
         auto resolved = glu_dst_handle_override->resolve(runtime_device);
         if (resolved && resolved.ptr && resolved.layout == GGML_LAYOUT_AOS) {
@@ -9252,30 +11579,56 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
     const int64_t glu_ne0_padded  = GGML_PAD(ne01, QK8_1);
     const int64_t glu_q8_row_size = glu_ne0_padded * sizeof(block_q8_1) / QK8_1;
     const size_t  glu_q8_bytes    = static_cast<size_t>(total_batches) * static_cast<size_t>(glu_q8_row_size);
-    const bool    glu_row_contig  = glu_dst->nb[0] == sizeof(float) &&
-                                 glu_dst->nb[1] == static_cast<size_t>(glu_dst->ne[0]) * sizeof(float);
-    const bool fused_glu_q8_candidate =
-        mxfp4_moe_fused_glu_q8_enabled() && ne12 == 1 && (ne01 % QK8_1) == 0 && total_batches > 0 &&
-        glu_row_contig && glu_dst_handle_override && glu_dst_handle_override->valid();
+    const bool    glu_row_contig =
+        glu_dst->nb[0] == sizeof(float) && glu_dst->nb[1] == static_cast<size_t>(glu_dst->ne[0]) * sizeof(float);
+    const bool fused_glu_q8_candidate = mxfp4_moe_fused_glu_q8_enabled() && ne12 == 1 && (ne01 % QK8_1) == 0 &&
+                                        total_batches > 0 && glu_row_contig && glu_dst_handle_override &&
+                                        glu_dst_handle_override->valid();
     const size_t q8_alloc_size = fused_glu_q8_candidate ? std::max(required_size, glu_q8_bytes) : required_size;
+
+    mmvq_deferred_temp_release local_temps(stream);
+    auto                       alloc_i32_scratch = [&](int32_t *& ptr, size_t count, const char * cohort) {
+        ptr = nullptr;
+        ggml_sycl::mem_handle handle;
+        ptr = reinterpret_cast<int32_t *>(mmvq_alloc_device_scratch(count * sizeof(int32_t), *stream, cohort, handle));
+        if (!ptr) {
+            return false;
+        }
+        local_temps.add(std::move(handle));
+        return true;
+    };
+    auto submit_memcpy_with_deps = [&](void * dst_ptr, const void * src_ptr, size_t bytes,
+                                       const std::vector<sycl::event> & copy_deps) -> sycl::event {
+        return stream->submit([&](sycl::handler & h) {
+            if (!copy_deps.empty()) {
+                h.depends_on(copy_deps);
+            }
+            h.memcpy(dst_ptr, src_ptr, bytes);
+        });
+    };
 
     ggml_sycl_pool_alloc<int8_t> src1_q8_1_pool(ctx.pool());
     void *                       q8_1_buffer = mxfp4_moe_tg_reuse_get_or_alloc_q8(stream, ctx.device, q8_alloc_size);
     if (!q8_1_buffer) {
         src1_q8_1_pool.alloc(q8_alloc_size);
         q8_1_buffer = src1_q8_1_pool.get();
+        if (!q8_1_buffer) {
+            return false;
+        }
         mxfp4_moe_tg_reuse_invalidate();
     }
 
-    const bool tg_profile    = mmvq_moe_tg_profile_enabled() && ne12 == 1;
-    auto       t_quant_begin = std::chrono::high_resolution_clock::now();
-    if (tg_profile) {
+    const bool tg_profile     = mmvq_moe_tg_profile_enabled() && ne12 == 1;
+    const bool pp_profile     = mmvq_moe_pp_profile_enabled() && ne12 > 1;
+    const bool detail_profile = tg_profile || pp_profile;
+    auto       t_quant_begin  = std::chrono::high_resolution_clock::now();
+    if (detail_profile) {
         stream->wait();
         t_quant_begin = std::chrono::high_resolution_clock::now();
     }
     sycl::event activation_q8_event = quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
         src1_d, (char *) q8_1_buffer, ne10, total_src1_rows, ne10_padded, stream);
-    if (tg_profile) {
+    if (detail_profile) {
         stream->wait();
     }
     auto t_quant_end = std::chrono::high_resolution_clock::now();
@@ -9283,15 +11636,20 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
     const int64_t q8_nb11 = q8_1_row_size;
     const int64_t q8_nb12 = ne11 * q8_1_row_size;
 
-    auto         t_kernel_begin      = std::chrono::high_resolution_clock::now();
-    bool         used_direct_xmx     = false;
-    bool         used_xmx_tiled_dpas = false;
-    bool         used_split_sg16     = false;
-    bool         fused_glu_q8_used   = false;
-    const char * xmx_tiled_path      = "none";
-    sycl::event  kernel_event;
-    bool         have_kernel_event = false;
-    const auto & xmx_caps          = ggml_sycl_info().devices[ctx.device].xmx_caps;
+    auto                     t_kernel_begin      = std::chrono::high_resolution_clock::now();
+    bool                     used_direct_xmx     = false;
+    bool                     used_xmx_tiled_dpas = false;
+    bool                     used_split_sg16     = false;
+    bool                     fused_glu_q8_used   = false;
+    const char *             xmx_tiled_path      = "none";
+    sycl::event              kernel_event;
+    bool                     have_kernel_event     = false;
+    const auto &             xmx_caps              = ggml_sycl_info().devices[ctx.device].xmx_caps;
+    double                   profile_group_host_us = 0.0;
+    const char *             profile_path          = "none";
+    std::vector<sycl::event> profile_group_copy_events;
+    sycl::event              profile_pack_event;
+    bool                     profile_pack_event_set = false;
 #if GGML_SYCL_XMX_JOINT_MATRIX_AVAILABLE
     if (weight_layout == GGML_LAYOUT_SOA && mmvq_moe_direct_xmx_glu_enabled() && direct_xmx_eligible &&
         xmx_caps.supported && xmx_caps.supports_int8) {
@@ -9324,7 +11682,57 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
         // mixed execution can publish the same logical GLU tensor.
         const bool grouped_decode_shape = xmx_tiled_grouped_eligible && total_batches >= exec_n &&
                                           n_gpu_entries == total_batches && ids_host && ids_host_count == total_batches;
-        if (grouped_decode_shape) {
+        const bool device_grouped_shape = mxfp4_moe_device_grouping_enabled() && xmx_tiled_grouped_eligible &&
+                                          total_batches >= exec_n && n_gpu_entries == total_batches && !ids_host &&
+                                          ids_device && ids_nb0 > 0 && ids_nb1 > 0 && gate_weight->ne[2] > 0;
+        if (device_grouped_shape) {
+            const int n_experts_i            = static_cast<int>(gate_weight->ne[2]);
+            const int max_chunks             = n_experts_i * ((static_cast<int>(total_batches) + exec_n - 1) / exec_n);
+            int32_t * grouped_experts_device = nullptr;
+            int32_t * grouped_offsets_device = nullptr;
+            int32_t * grouped_rows_device    = nullptr;
+            int32_t * grouped_chunk_groups_device = nullptr;
+            int32_t * grouped_chunk_starts_device = nullptr;
+            int32_t * active_chunks_device        = nullptr;
+            if (!alloc_i32_scratch(grouped_experts_device, static_cast<size_t>(n_experts_i),
+                                   "mmvq_moe_pair_glu_device_grouped_experts") ||
+                !alloc_i32_scratch(grouped_offsets_device, static_cast<size_t>(n_experts_i + 1),
+                                   "mmvq_moe_pair_glu_device_grouped_offsets") ||
+                !alloc_i32_scratch(grouped_rows_device, static_cast<size_t>(total_batches),
+                                   "mmvq_moe_pair_glu_device_grouped_rows") ||
+                !alloc_i32_scratch(grouped_chunk_groups_device, static_cast<size_t>(max_chunks),
+                                   "mmvq_moe_pair_glu_device_grouped_chunk_groups") ||
+                !alloc_i32_scratch(grouped_chunk_starts_device, static_cast<size_t>(max_chunks),
+                                   "mmvq_moe_pair_glu_device_grouped_chunk_starts") ||
+                !alloc_i32_scratch(active_chunks_device, 1, "mmvq_moe_pair_glu_device_grouped_active_chunks")) {
+                return false;
+            }
+
+            std::vector<sycl::event> grouped_deps;
+            grouped_deps.reserve(1);
+            grouped_deps.push_back(mxfp4_build_grouped_metadata_from_ids_sycl(
+                *stream, ids_device, ids_nb0, ids_nb1, static_cast<int>(n_ids), static_cast<int>(num_tokens),
+                n_experts_i, exec_n, grouped_experts_device, grouped_offsets_device, grouped_rows_device,
+                grouped_chunk_groups_device, grouped_chunk_starts_device, active_chunks_device, {}));
+            int             device_n_chunks   = max_chunks;
+            const int32_t * active_chunks_arg = active_chunks_device;
+            if (mxfp4_moe_device_grouping_sync_chunks_enabled()) {
+                device_n_chunks = mxfp4_copy_active_chunks_to_host(*stream, active_chunks_device, grouped_deps);
+                if (device_n_chunks <= 0 || device_n_chunks > max_chunks) {
+                    return false;
+                }
+                active_chunks_arg = nullptr;
+            }
+            kernel_event = mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_submit<repeat>(
+                *stream, gate_ptrs_device, up_ptrs_device, q8_1_buffer, glu_d, grouped_experts_device,
+                grouped_offsets_device, grouped_rows_device, grouped_chunk_groups_device, grouped_chunk_starts_device,
+                gate_bias_device, up_bias_device, ne00, ne10, ne01, device_n_chunks, static_cast<int>(num_tokens),
+                static_cast<int>(ne11), q8_nb11, q8_nb12, glu_dst->nb[1], glu_dst->nb[2], gate_bias_nb1, up_bias_nb1,
+                glu_op, grouped_deps, alpha, limit, tile_n_total, active_chunks_arg);
+            xmx_tiled_path = mxfp4_moe_device_grouping_sync_chunks_enabled() ? "grouped-direct-q8-device-sync" :
+                                                                               "grouped-direct-q8-device";
+        } else if (grouped_decode_shape) {
+            const auto                               t_group_begin = std::chrono::high_resolution_clock::now();
             static thread_local std::vector<int32_t> grouped_experts_host;
             static thread_local std::vector<int32_t> grouped_offsets_host;
             static thread_local std::vector<int32_t> grouped_rows_host;
@@ -9341,31 +11749,31 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
             grouped_slots.clear();
             grouped_counts_host.clear();
             grouped_slots.reserve(static_cast<size_t>(std::min<int64_t>(gate_weight->ne[2], total_batches)));
+            std::vector<int32_t> expert_to_group(static_cast<size_t>(gate_weight->ne[2]), -1);
 
-            for (int64_t iid1 = 0; iid1 < num_tokens; ++iid1) {
-                for (int64_t id = 0; id < n_ids; ++id) {
+            for (int64_t id = 0; id < n_ids; ++id) {
+                for (int64_t iid1 = 0; iid1 < num_tokens; ++iid1) {
                     const int64_t ci  = iid1 * n_ids + id;
                     const int32_t eid = ids_host[ci];
                     if (eid < 0 || eid >= gate_weight->ne[2]) {
                         return false;
                     }
-                    auto   it = std::find(grouped_experts_host.begin(), grouped_experts_host.end(), eid);
-                    size_t group_index;
-                    if (it == grouped_experts_host.end()) {
-                        group_index = grouped_experts_host.size();
+                    int32_t group_index = expert_to_group[static_cast<size_t>(eid)];
+                    if (group_index < 0) {
+                        group_index                               = grouped_experts_host.size();
+                        expert_to_group[static_cast<size_t>(eid)] = group_index;
                         grouped_experts_host.push_back(eid);
                         grouped_slots.emplace_back();
-                    } else {
-                        group_index = static_cast<size_t>(std::distance(grouped_experts_host.begin(), it));
                     }
-                    grouped_slots[group_index].push_back(static_cast<int32_t>(id * num_tokens + iid1));
+                    grouped_slots[static_cast<size_t>(group_index)].push_back(
+                        static_cast<int32_t>(id * num_tokens + iid1));
                 }
             }
 
             grouped_offsets_host.reserve(grouped_experts_host.size() + 1);
             grouped_offsets_host.push_back(0);
             for (size_t g = 0; g < grouped_slots.size(); ++g) {
-                auto & rows = grouped_slots[g];
+                auto &    rows       = grouped_slots[g];
                 std::sort(rows.begin(), rows.end());
                 const int rows_begin = static_cast<int>(grouped_rows_host.size());
                 grouped_rows_host.insert(grouped_rows_host.end(), rows.begin(), rows.end());
@@ -9389,8 +11797,12 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                                                                                    grouped_counts_host.size(), row_limit);
             bool         chunked_row_limit = false;
             std::vector<std::pair<int, int>> chunk_passes;
-            if (!occupancy.dispatch_ready) {
-                if (std::strcmp(occupancy.reason, "kernel-row-limit") == 0 && row_limit >= exec_n) {
+            const bool sparse_xmx_batch = total_batches >= exec_n && n_gpu_entries == total_batches &&
+                                          (std::strcmp(occupancy.reason, "rows-per-expert") == 0 ||
+                                           std::strcmp(occupancy.reason, "occupancy") == 0);
+            if (!occupancy.dispatch_ready && !sparse_xmx_batch) {
+                if (mxfp4_grouped_chunk_row_limit_enabled() && std::strcmp(occupancy.reason, "kernel-row-limit") == 0 &&
+                    row_limit >= exec_n) {
                     int    pass_begin = 0;
                     size_t pass_rows  = 0;
                     for (int c = 0; c < grouped_n_chunks; ++c) {
@@ -9430,6 +11842,10 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                     return false;
                 }
             }
+            const auto t_group_end = std::chrono::high_resolution_clock::now();
+            if (pp_profile) {
+                profile_group_host_us = std::chrono::duration<double, std::micro>(t_group_end - t_group_begin).count();
+            }
 
             ggml_sycl_pool_alloc<int32_t> grouped_experts_pool(ctx.pool());
             ggml_sycl_pool_alloc<int32_t> grouped_offsets_pool(ctx.pool());
@@ -9453,24 +11869,29 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
 
             std::vector<sycl::event> grouped_copy_events;
             grouped_copy_events.reserve(5);
-            grouped_copy_events.push_back(stream->memcpy(grouped_experts_device, grouped_experts_host.data(),
-                                                         grouped_experts_host.size() * sizeof(int32_t)));
-            grouped_copy_events.push_back(stream->memcpy(grouped_offsets_device, grouped_offsets_host.data(),
-                                                         grouped_offsets_host.size() * sizeof(int32_t)));
-            grouped_copy_events.push_back(stream->memcpy(grouped_rows_device, grouped_rows_host.data(),
-                                                         grouped_rows_host.size() * sizeof(int32_t)));
-            grouped_copy_events.push_back(stream->memcpy(grouped_chunk_groups_device, grouped_chunk_groups_host.data(),
-                                                         grouped_chunk_groups_host.size() * sizeof(int32_t)));
-            grouped_copy_events.push_back(stream->memcpy(grouped_chunk_starts_device, grouped_chunk_starts_host.data(),
-                                                         grouped_chunk_starts_host.size() * sizeof(int32_t)));
+            grouped_copy_events.push_back(submit_memcpy_with_deps(grouped_experts_device, grouped_experts_host.data(),
+                                                                  grouped_experts_host.size() * sizeof(int32_t), {}));
+            grouped_copy_events.push_back(submit_memcpy_with_deps(grouped_offsets_device, grouped_offsets_host.data(),
+                                                                  grouped_offsets_host.size() * sizeof(int32_t), {}));
+            grouped_copy_events.push_back(submit_memcpy_with_deps(grouped_rows_device, grouped_rows_host.data(),
+                                                                  grouped_rows_host.size() * sizeof(int32_t), {}));
+            grouped_copy_events.push_back(
+                submit_memcpy_with_deps(grouped_chunk_groups_device, grouped_chunk_groups_host.data(),
+                                        grouped_chunk_groups_host.size() * sizeof(int32_t), {}));
+            grouped_copy_events.push_back(
+                submit_memcpy_with_deps(grouped_chunk_starts_device, grouped_chunk_starts_host.data(),
+                                        grouped_chunk_starts_host.size() * sizeof(int32_t), {}));
+            if (pp_profile) {
+                profile_group_copy_events = grouped_copy_events;
+            }
 
             static std::atomic<int> grouped_glu_log{ 0 };
             const char *            row_agg_debug = std::getenv("GGML_SYCL_MOE_ROW_AGG_DEBUG");
             if (row_agg_debug && std::atoi(row_agg_debug) != 0 &&
                 grouped_glu_log.fetch_add(1, std::memory_order_relaxed) < 64) {
                 int max_rows = 0;
-                for (const auto & rows : grouped_slots) {
-                    max_rows = std::max<int>(max_rows, static_cast<int>(rows.size()));
+                for (const int rows : grouped_counts_host) {
+                    max_rows = std::max<int>(max_rows, rows);
                 }
                 fprintf(stderr,
                         "[MOE-ROW-AGG] stage=dispatch path=pair_glu_xmx_tiled_grouped tensor=%s "
@@ -9490,7 +11911,51 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                     glu_dst->nb[2], gate_bias_nb1, up_bias_nb1, glu_op, grouped_copy_events, alpha, limit,
                     tile_n_total);
             };
-            if (chunked_row_limit) {
+            if (!chunked_row_limit && mxfp4_pair_glu_grouped_pack_q8_enabled()) {
+                const int    k_tiles = ne00 / k_per;
+                const size_t b_bytes = static_cast<size_t>(grouped_n_chunks) * static_cast<size_t>(k_tiles) *
+                                       static_cast<size_t>(k_per * exec_n);
+                const size_t y_bytes = static_cast<size_t>(grouped_n_chunks) * static_cast<size_t>(k_tiles) *
+                                       static_cast<size_t>(exec_n) * sizeof(float);
+                auto &   reuse    = g_mxfp4_moe_tg_reuse;
+                int8_t * b_packed = static_cast<int8_t *>(mxfp4_moe_tg_reuse_get_or_alloc_device_scratch(
+                    stream, ctx.device, b_bytes, reuse.dpas_b_capacity, reuse.dpas_b_device, reuse.dpas_b_handle));
+                float *  y_scales = static_cast<float *>(mxfp4_moe_tg_reuse_get_or_alloc_device_scratch(
+                    stream, ctx.device, y_bytes, reuse.dpas_y_capacity, reuse.dpas_y_device, reuse.dpas_y_handle));
+                if (b_packed && y_scales) {
+                    sycl::event pack_event = mxfp4_dpas_pack_q8_grouped_chunks_sycl(
+                        *stream, q8_1_buffer, b_packed, y_scales, grouped_offsets_device, grouped_rows_device,
+                        grouped_chunk_groups_device, grouped_chunk_starts_device, ne00, ne10, grouped_n_chunks,
+                        static_cast<int>(num_tokens), static_cast<int>(ne11), q8_nb11, q8_nb12, grouped_copy_events);
+                    if (pp_profile) {
+                        profile_pack_event     = pack_event;
+                        profile_pack_event_set = true;
+                    }
+                    std::vector<sycl::event> packed_deps = { pack_event };
+                    if (glu_op == GGML_GLU_OP_SWIGLU_OAI) {
+                        kernel_event =
+                            mxfp4_pair_glu_xmx_tiled_grouped_packed_q8_m2_sycl<repeat, GGML_GLU_OP_SWIGLU_OAI>(
+                                *stream, gate_ptrs_device, up_ptrs_device, b_packed, y_scales, glu_d,
+                                grouped_experts_device, grouped_offsets_device, grouped_rows_device,
+                                grouped_chunk_groups_device, grouped_chunk_starts_device, gate_bias_device,
+                                up_bias_device, ne00, ne01, grouped_n_chunks, static_cast<int>(num_tokens),
+                                glu_dst->nb[1], glu_dst->nb[2], gate_bias_nb1, up_bias_nb1, packed_deps, alpha, limit,
+                                tile_n_total);
+                    } else {
+                        kernel_event = mxfp4_pair_glu_xmx_tiled_grouped_packed_q8_m2_sycl<repeat, GGML_GLU_OP_SWIGLU>(
+                            *stream, gate_ptrs_device, up_ptrs_device, b_packed, y_scales, glu_d,
+                            grouped_experts_device, grouped_offsets_device, grouped_rows_device,
+                            grouped_chunk_groups_device, grouped_chunk_starts_device, gate_bias_device, up_bias_device,
+                            ne00, ne01, grouped_n_chunks, static_cast<int>(num_tokens), glu_dst->nb[1], glu_dst->nb[2],
+                            gate_bias_nb1, up_bias_nb1, packed_deps, alpha, limit, tile_n_total);
+                    }
+                    xmx_tiled_path = "grouped-packed-q8-m2";
+                } else {
+                    kernel_event   = submit_chunk_range(0, grouped_n_chunks);
+                    xmx_tiled_path = "grouped-direct-q8";
+                }
+                profile_path = xmx_tiled_path;
+            } else if (chunked_row_limit) {
                 std::vector<sycl::event> chunk_events;
                 chunk_events.reserve(chunk_passes.size());
                 for (const auto & pass : chunk_passes) {
@@ -9498,10 +11963,13 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                 }
                 kernel_event = ggml_sycl_submit_marker<mxfp4_pair_glu_xmx_tiled_grouped_chunk_join_kernel<repeat>>(
                     *stream, chunk_events);
+                xmx_tiled_path = "grouped-direct-q8";
+                profile_path   = "grouped-direct-q8-chunked";
             } else {
-                kernel_event = submit_chunk_range(0, grouped_n_chunks);
+                kernel_event   = submit_chunk_range(0, grouped_n_chunks);
+                xmx_tiled_path = "grouped-direct-q8";
+                profile_path   = xmx_tiled_path;
             }
-            xmx_tiled_path = "grouped-direct-q8";
         } else {
             const int    k_tiles = ne00 / k_per;
             const size_t b_bytes =
@@ -9511,19 +11979,24 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
 
             auto &   reuse    = g_mxfp4_moe_tg_reuse;
             int8_t * b_packed = static_cast<int8_t *>(mxfp4_moe_tg_reuse_get_or_alloc_device_scratch(
-                stream, ctx.device, b_bytes, reuse.dpas_b_alloc, reuse.dpas_b_handle));
+                stream, ctx.device, b_bytes, reuse.dpas_b_capacity, reuse.dpas_b_device, reuse.dpas_b_handle));
             float *  y_scales = static_cast<float *>(mxfp4_moe_tg_reuse_get_or_alloc_device_scratch(
-                stream, ctx.device, y_bytes, reuse.dpas_y_alloc, reuse.dpas_y_handle));
+                stream, ctx.device, y_bytes, reuse.dpas_y_capacity, reuse.dpas_y_device, reuse.dpas_y_handle));
             if (ne12 == 1 && b_packed && y_scales && mxfp4_moe_xmx_tiled_pack_q8_enabled()) {
                 sycl::event pack_event = mxfp4_dpas_pack_q8_single_col_groups_sycl(
                     *stream, q8_1_buffer, b_packed, y_scales, ne00, ne10, static_cast<int>(total_batches),
                     static_cast<int>(num_tokens), static_cast<int>(ne11), q8_nb11, q8_nb12);
+                if (pp_profile) {
+                    profile_pack_event     = pack_event;
+                    profile_pack_event_set = true;
+                }
                 kernel_event = mxfp4_pair_glu_xmx_tiled_dpas_m2_submit<repeat>(
                     *stream, gate_ptrs_device, up_ptrs_device, b_packed, y_scales, glu_d, ids_device, gate_bias_device,
                     up_bias_device, ne00, ne01, static_cast<int>(total_batches), static_cast<int>(num_tokens), ids_nb0,
                     ids_nb1, glu_dst->nb[1], glu_dst->nb[2], gate_bias_nb1, up_bias_nb1, glu_op, alpha, limit,
                     tile_n_total, pack_event);
                 xmx_tiled_path = "packed-q8-m2";
+                profile_path   = xmx_tiled_path;
             } else {
                 kernel_event = mxfp4_pair_glu_xmx_tiled_dpas_direct_q8_submit<repeat>(
                     *stream, gate_ptrs_device, up_ptrs_device, q8_1_buffer, glu_d, ids_device, gate_bias_device,
@@ -9531,6 +12004,7 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                     static_cast<int>(ne11), ids_nb0, ids_nb1, q8_nb11, q8_nb12, glu_dst->nb[1], glu_dst->nb[2],
                     gate_bias_nb1, up_bias_nb1, glu_op, alpha, limit, tile_n_total);
                 xmx_tiled_path = "direct-q8";
+                profile_path   = xmx_tiled_path;
             }
         }
         used_xmx_tiled_dpas = true;
@@ -9553,7 +12027,7 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
             std::vector<sycl::event> split_deps;
             split_deps.push_back(activation_q8_event);
             const std::vector<sycl::event> * split_deps_ptr = split_deps.empty() ? nullptr : &split_deps;
-            void * split_down_q8 = fused_glu_q8_candidate ? q8_1_buffer : nullptr;
+            void *                           split_down_q8  = fused_glu_q8_candidate ? q8_1_buffer : nullptr;
             if (weight_layout == GGML_LAYOUT_MXFP4_I8) {
                 reorder_mul_mat_vec_mxfp4_i8_q8_1_id_pair_glu_split_sycl_rows<GGML_SYCL_MOE_MMV_Y, true, 16>(
                     gate_ptrs_device, up_ptrs_device, q8_1_buffer, gate_tmp_d, up_tmp_d, glu_d, ids_device,
@@ -9588,7 +12062,7 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
             have_kernel_event = true;
         }
     }
-    if (tg_profile) {
+    if (detail_profile) {
         if (have_kernel_event) {
             kernel_event.wait();
         } else {
@@ -9601,8 +12075,8 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
         (void) mxfp4_moe_xmx_tiled_validate_output(
             ctx, gate_weight, up_weight, glu_dst, ne10, kernel_event, xmx_tiled_path, gate_ptrs_device, up_ptrs_device,
             q8_1_buffer, glu_d, ids_device, gate_bias_device, up_bias_device, gate_bias_nb1, up_bias_nb1, n_ids,
-            num_tokens, ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, static_cast<int64_t>(required_size),
-            glu_dst->nb[1], glu_dst->nb[2], glu_op, alpha, limit, xmx_caps.N * xmx_caps.optimal_tiles_n);
+            num_tokens, ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, static_cast<int64_t>(required_size), glu_dst->nb[1],
+            glu_dst->nb[2], glu_op, alpha, limit, xmx_caps.N * xmx_caps.optimal_tiles_n);
     }
 
     auto us = [](std::chrono::high_resolution_clock::time_point a, std::chrono::high_resolution_clock::time_point b) {
@@ -9612,18 +12086,16 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
     double        down_q8_publish_us = 0.0;
     sycl::event   down_q8_event;
     bool          down_q8_event_set = false;
-    const int     down_layer         = mxfp4_moe_layer_from_name(gate_weight->name);
-    const int64_t glu_rows           = glu_dst->ne[1] * glu_dst->ne[2];
-    if (fused_glu_q8_used &&
-        mxfp4_moe_tg_store_down_q8_soa_artifact(ctx.device, down_layer, glu_d, glu_dst->ne[0], glu_rows,
-                                                glu_dst_handle_override)) {
+    const int     down_layer        = mxfp4_moe_layer_from_name(gate_weight->name);
+    const int64_t glu_rows          = glu_dst->ne[1] * glu_dst->ne[2];
+    if (fused_glu_q8_used && mxfp4_moe_tg_store_down_q8_soa_artifact(ctx.device, down_layer, glu_d, glu_dst->ne[0],
+                                                                     glu_rows, glu_dst_handle_override)) {
         down_q8_event     = kernel_event;
         down_q8_event_set = have_kernel_event;
         if (mxfp4_moe_fused_glu_q8_log_enabled()) {
             static std::atomic<int> fused_log{ 0 };
             if (fused_log.fetch_add(1, std::memory_order_relaxed) < 96) {
-                fprintf(stderr,
-                        "[MOE-FUSED-GLU-Q8] layer=%d device=%d rows=%lld ne0=%lld bytes=%zu event=%d\n",
+                fprintf(stderr, "[MOE-FUSED-GLU-Q8] layer=%d device=%d rows=%lld ne0=%lld bytes=%zu event=%d\n",
                         down_layer, ctx.device, (long long) glu_rows, (long long) glu_dst->ne[0], glu_q8_bytes,
                         down_q8_event_set ? 1 : 0);
             }
@@ -9633,11 +12105,29 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                                         glu_rows, &down_q8_publish_us, glu_dst_handle_override, &down_q8_event,
                                         &down_q8_event_set)) {
             quant_us += down_q8_publish_us;
+        } else {
+            // No fresh GLU q8 was produced for this dispatch; a previous
+            // token's artifact would otherwise pass the down reuse check
+            // (same buffer, same dims) and corrupt the down projection.
+            mxfp4_moe_tg_reuse_invalidate();
         }
+    } else {
+        mxfp4_moe_tg_reuse_invalidate();
     }
     const double kernel_wall_us    = us(t_kernel_begin, t_kernel_end);
     const double kernel_event_us   = have_kernel_event ? mmvq_sycl_event_duration_us(kernel_event) : -1.0;
     const double kernel_profile_us = kernel_event_us >= 0.0 ? kernel_event_us : kernel_wall_us;
+    double       group_copy_us     = 0.0;
+    if (pp_profile) {
+        for (const sycl::event & ev : profile_group_copy_events) {
+            const double ev_us = mmvq_sycl_event_duration_us(ev);
+            if (ev_us >= 0.0) {
+                group_copy_us += ev_us;
+            }
+        }
+    }
+    const double pack_us =
+        pp_profile && profile_pack_event_set ? std::max(0.0, mmvq_sycl_event_duration_us(profile_pack_event)) : 0.0;
     g_mmvq_moe_dispatch_timing.activation_quant_us += quant_us;
     g_mmvq_moe_dispatch_timing.kernel_submit_us += kernel_wall_us;
     g_mmvq_moe_dispatch_timing.calls++;
@@ -9646,11 +12136,20 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
         mmvq_moe_tg_profile_record(weight_layout, 2 * n_gpu_entries, 2 * total_batches, quant_us - down_q8_publish_us,
                                    0.0, kernel_profile_us, down_q8_publish_us, mmvq_moe_tg_profile_kind::GATEUP_GLU, 2);
     }
+    if (pp_profile) {
+        mmvq_moe_pp_profile_record(
+            profile_path && std::strcmp(profile_path, "none") != 0 ? profile_path : xmx_tiled_path, 2 * n_gpu_entries,
+            2 * total_batches, quant_us - down_q8_publish_us, profile_group_host_us, group_copy_us, pack_us,
+            kernel_wall_us, kernel_profile_us, down_q8_publish_us, mmvq_moe_tg_profile_kind::GATEUP_GLU, 2);
+    }
     if (completion_event && (down_q8_event_set || have_kernel_event)) {
         *completion_event = down_q8_event_set ? down_q8_event : kernel_event;
         if (completion_event_set) {
             *completion_event_set = true;
         }
+    }
+    if (have_kernel_event) {
+        local_temps.release_after(kernel_event);
     }
     GGML_SYCL_DEBUG("[MOE-PAIR-GLU] Dispatched %d GPU experts for MXFP4 %s gate/up/GLU (%s)\n", n_gpu_entries,
                     mmvq_layout_name(weight_layout),
@@ -9674,6 +12173,8 @@ bool mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4(ggml_backend_sycl_conte
                                                          ggml_layout_mode                 down_layout,
                                                          const ggml_sycl::mem_handle *    glu_src_handle_override,
                                                          const ggml_sycl::mem_handle *    down_dst_handle_override,
+                                                         const int32_t *                  ids_host,
+                                                         int64_t                          ids_host_count,
                                                          const std::vector<sycl::event> * deps,
                                                          sycl::event *                    completion_event,
                                                          bool *                           completion_event_set) {
@@ -9697,16 +12198,16 @@ bool mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4(ggml_backend_sycl_conte
         return false;
     }
 
-    const int64_t ncols              = down_weight->ne[0];
-    const int64_t nrows_per_expert   = down_weight->ne[1];
-    const int64_t n_experts          = down_weight->ne[2] > 0 ? down_weight->ne[2] : 1;
-    const int64_t ncols_y            = glu_src->ne[0];
-    const int64_t ne11               = glu_src->ne[1];
-    const int64_t n_tokens           = glu_src->ne[2];
-    const int64_t total_batches      = n_ids * n_tokens;
-    const int64_t ncols_y_padded     = GGML_PAD(ncols_y, QK8_1);
-    const int64_t q8_row_size        = ncols_y_padded * sizeof(block_q8_1) / QK8_1;
-    const size_t  required_q8_bytes  = static_cast<size_t>(total_batches) * static_cast<size_t>(q8_row_size);
+    const int64_t ncols             = down_weight->ne[0];
+    const int64_t nrows_per_expert  = down_weight->ne[1];
+    const int64_t n_experts         = down_weight->ne[2] > 0 ? down_weight->ne[2] : 1;
+    const int64_t ncols_y           = glu_src->ne[0];
+    const int64_t ne11              = glu_src->ne[1];
+    const int64_t n_tokens          = glu_src->ne[2];
+    const int64_t total_batches     = n_ids * n_tokens;
+    const int64_t ncols_y_padded    = GGML_PAD(ncols_y, QK8_1);
+    const int64_t q8_row_size       = ncols_y_padded * sizeof(block_q8_1) / QK8_1;
+    const size_t  required_q8_bytes = static_cast<size_t>(total_batches) * static_cast<size_t>(q8_row_size);
 
     const bool direct_ids = ids_device != nullptr;
     if (ncols <= 0 || nrows_per_expert <= 0 || n_experts <= 0 || ncols != ncols_y || ne11 <= 0 || n_tokens <= 0 ||
@@ -9720,7 +12221,7 @@ bool mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4(ggml_backend_sycl_conte
         return false;
     }
 
-    const float * glu_d = nullptr;
+    const float *         glu_d = nullptr;
     ggml_sycl::mem_handle glu_handle;
     if (glu_src_handle_override && glu_src_handle_override->valid()) {
         glu_handle        = *glu_src_handle_override;
@@ -9735,8 +12236,8 @@ bool mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4(ggml_backend_sycl_conte
         glu_d = static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(glu_src, runtime_device));
     }
     if (!glu_handle.valid() && glu_d) {
-        glu_handle = mxfp4_moe_tensor_mem_handle(glu_src, runtime_device, const_cast<float *>(glu_d),
-                                                 GGML_LAYOUT_AOS, true);
+        glu_handle =
+            mxfp4_moe_tensor_mem_handle(glu_src, runtime_device, const_cast<float *>(glu_d), GGML_LAYOUT_AOS, true);
     }
     if (!glu_d || !glu_handle.valid()) {
         return false;
@@ -9749,18 +12250,9 @@ bool mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4(ggml_backend_sycl_conte
         return false;
     }
 
-    auto & cache = g_mxfp4_moe_tg_reuse;
-    void * q8_buffer = nullptr;
-    if (cache.q8_handle.valid()) {
-        auto resolved = cache.q8_handle.resolve(runtime_device);
-        if (resolved && resolved.ptr) {
-            q8_buffer = resolved.ptr;
-        }
-    }
-    if (!q8_buffer) {
-        q8_buffer = cache.q8_alloc.ptr;
-    }
-    if (!q8_buffer || cache.q8_alloc.size < required_q8_bytes) {
+    auto & cache     = g_mxfp4_moe_tg_reuse;
+    void * q8_buffer = mxfp4_moe_tg_reuse_q8_ptr(runtime_device);
+    if (!q8_buffer || cache.q8_capacity < required_q8_bytes) {
         return false;
     }
 
@@ -9778,8 +12270,26 @@ bool mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4(ggml_backend_sycl_conte
         return false;
     }
 
+    auto submit_memcpy_with_deps = [&](void * dst_ptr, const void * src_ptr, size_t bytes,
+                                       const std::vector<sycl::event> & copy_deps) -> sycl::event {
+        return stream->submit([&](sycl::handler & h) {
+            if (!copy_deps.empty()) {
+                h.depends_on(copy_deps);
+            }
+            h.memcpy(dst_ptr, src_ptr, bytes);
+        });
+    };
+
+    const bool               pp_profile            = mmvq_moe_pp_profile_enabled() && n_tokens > 1;
+    const bool               detail_profile        = mmvq_moe_tg_profile_enabled() || pp_profile;
+    double                   profile_group_host_us = 0.0;
+    const char *             profile_path          = "down";
+    std::vector<sycl::event> profile_group_copy_events;
+    sycl::event              profile_pack_event;
+    bool                     profile_pack_event_set = false;
+
     auto t_kernel_begin = std::chrono::high_resolution_clock::now();
-    if (mmvq_moe_tg_profile_enabled()) {
+    if (detail_profile) {
         stream->wait();
         t_kernel_begin = std::chrono::high_resolution_clock::now();
     }
@@ -9787,49 +12297,290 @@ bool mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4(ggml_backend_sycl_conte
     sycl::event down_event;
     bool        have_down_event = false;
     if (down_layout == GGML_LAYOUT_MXFP4_I8) {
-        const auto & caps = ggml_sycl_info().devices[runtime_device].xmx_caps;
-        if (xmx_capabilities_support_sub_group(caps, 16)) {
+        const auto &  caps            = ggml_sycl_info().devices[runtime_device].xmx_caps;
+        constexpr int repeat          = GGML_SYCL_MXFP4_MOE_XMX_M;
+        constexpr int exec_n          = GGML_SYCL_MXFP4_MOE_XMX_N;
+        constexpr int k_per           = GGML_SYCL_MXFP4_MOE_XMX_K;
+        bool          used_grouped_i8 = false;
+        const bool    grouped_shape   = direct_ids && ids_host != nullptr && ids_host_count == total_batches &&
+                                   total_batches >= exec_n && (ncols % k_per) == 0 &&
+                                   xmx_capabilities_match_int8_tile(caps, repeat, exec_n, k_per) &&
+                                   xmx_capabilities_support_sub_group(caps, GGML_SYCL_MXFP4_MOE_XMX_SG);
+
+        if (grouped_shape && mxfp4_i8_down_grouped_enabled()) {
+            const auto                               t_group_begin = std::chrono::high_resolution_clock::now();
+            static thread_local std::vector<int32_t> grouped_experts_host;
+            static thread_local std::vector<int32_t> grouped_offsets_host;
+            static thread_local std::vector<int32_t> grouped_rows_host;
+            static thread_local std::vector<int32_t> grouped_chunk_groups_host;
+            static thread_local std::vector<int32_t> grouped_chunk_starts_host;
+            std::vector<std::vector<int32_t>>        grouped_slots;
+            std::vector<std::pair<int, int>>         chunk_passes;
+            std::vector<int32_t>                     grouped_counts_host;
+            bool                                     chunked_row_limit = false;
+
+            grouped_experts_host.clear();
+            grouped_offsets_host.clear();
+            grouped_rows_host.clear();
+            grouped_chunk_groups_host.clear();
+            grouped_chunk_starts_host.clear();
+            grouped_slots.clear();
+            grouped_counts_host.clear();
+            grouped_slots.reserve(static_cast<size_t>(std::min<int64_t>(n_experts, total_batches)));
+            std::vector<int32_t> expert_to_group(static_cast<size_t>(n_experts), -1);
+
+            bool grouping_ok = true;
+            for (int64_t id = 0; id < n_ids && grouping_ok; ++id) {
+                for (int64_t iid1 = 0; iid1 < n_tokens; ++iid1) {
+                    const int64_t ci  = iid1 * n_ids + id;
+                    const int32_t eid = ids_host[ci];
+                    if (eid < 0 || eid >= n_experts) {
+                        grouping_ok = false;
+                        break;
+                    }
+                    int32_t group_index = expert_to_group[static_cast<size_t>(eid)];
+                    if (group_index < 0) {
+                        group_index                               = static_cast<int32_t>(grouped_experts_host.size());
+                        expert_to_group[static_cast<size_t>(eid)] = group_index;
+                        grouped_experts_host.push_back(eid);
+                        grouped_slots.emplace_back();
+                    }
+                    grouped_slots[static_cast<size_t>(group_index)].push_back(
+                        static_cast<int32_t>(id * n_tokens + iid1));
+                }
+            }
+
+            if (grouping_ok) {
+                grouped_offsets_host.reserve(grouped_experts_host.size() + 1);
+                grouped_offsets_host.push_back(0);
+                for (size_t g = 0; g < grouped_slots.size(); ++g) {
+                    auto &    rows       = grouped_slots[g];
+                    std::sort(rows.begin(), rows.end());
+                    const int rows_begin = static_cast<int>(grouped_rows_host.size());
+                    grouped_rows_host.insert(grouped_rows_host.end(), rows.begin(), rows.end());
+                    const int n_rows = static_cast<int>(rows.size());
+                    grouped_counts_host.push_back(n_rows);
+                    for (int row_start = 0; row_start < n_rows; row_start += exec_n) {
+                        grouped_chunk_groups_host.push_back(static_cast<int32_t>(g));
+                        grouped_chunk_starts_host.push_back(row_start);
+                    }
+                    grouped_offsets_host.push_back(rows_begin + n_rows);
+                }
+
+                grouping_ok = !grouped_experts_host.empty() && !grouped_chunk_groups_host.empty() &&
+                              grouped_rows_host.size() == static_cast<size_t>(total_batches);
+            }
+
+            if (grouping_ok) {
+                const size_t row_limit = ggml_sycl_mxfp4_grouped_dpas_row_list_limit(caps);
+                const auto   occupancy = ggml_sycl_select_mxfp4_grouped_dpas_occupancy(
+                    caps, grouped_counts_host.data(), grouped_counts_host.size(), row_limit);
+                if (!occupancy.dispatch_ready) {
+                    if (mxfp4_grouped_chunk_row_limit_enabled() &&
+                        std::strcmp(occupancy.reason, "kernel-row-limit") == 0 && row_limit >= exec_n) {
+                        int       pass_begin       = 0;
+                        size_t    pass_rows        = 0;
+                        const int grouped_n_groups = static_cast<int>(grouped_experts_host.size());
+                        const int grouped_n_chunks = static_cast<int>(grouped_chunk_groups_host.size());
+                        for (int c = 0; c < grouped_n_chunks; ++c) {
+                            const int group = grouped_chunk_groups_host[static_cast<size_t>(c)];
+                            if (group < 0 || group >= grouped_n_groups) {
+                                grouping_ok = false;
+                                break;
+                            }
+                            const int row_start  = grouped_chunk_starts_host[static_cast<size_t>(c)];
+                            const int rows_begin = grouped_offsets_host[static_cast<size_t>(group)];
+                            const int rows_end   = grouped_offsets_host[static_cast<size_t>(group + 1)];
+                            const int group_rows = rows_end - rows_begin;
+                            if (row_start < 0 || row_start >= group_rows) {
+                                grouping_ok = false;
+                                break;
+                            }
+                            const size_t chunk_rows = static_cast<size_t>(std::min(exec_n, group_rows - row_start));
+                            if (pass_rows > 0 && pass_rows + chunk_rows > row_limit) {
+                                chunk_passes.emplace_back(pass_begin, c - pass_begin);
+                                pass_begin = c;
+                                pass_rows  = 0;
+                            }
+                            pass_rows += chunk_rows;
+                        }
+                        if (grouping_ok && pass_rows > 0) {
+                            chunk_passes.emplace_back(pass_begin, grouped_n_chunks - pass_begin);
+                        }
+                        chunked_row_limit = grouping_ok && !chunk_passes.empty();
+                    } else {
+                        grouping_ok = false;
+                    }
+                }
+            }
+            const auto t_group_end = std::chrono::high_resolution_clock::now();
+            if (pp_profile) {
+                profile_group_host_us = std::chrono::duration<double, std::micro>(t_group_end - t_group_begin).count();
+            }
+
+            if (grouping_ok) {
+                ggml_sycl_pool_alloc<int32_t> grouped_experts_pool(ctx.pool());
+                ggml_sycl_pool_alloc<int32_t> grouped_offsets_pool(ctx.pool());
+                ggml_sycl_pool_alloc<int32_t> grouped_rows_pool(ctx.pool());
+                ggml_sycl_pool_alloc<int32_t> grouped_chunk_groups_pool(ctx.pool());
+                ggml_sycl_pool_alloc<int32_t> grouped_chunk_starts_pool(ctx.pool());
+                grouped_experts_pool.alloc(grouped_experts_host.size() * sizeof(int32_t));
+                grouped_offsets_pool.alloc(grouped_offsets_host.size() * sizeof(int32_t));
+                grouped_rows_pool.alloc(grouped_rows_host.size() * sizeof(int32_t));
+                grouped_chunk_groups_pool.alloc(grouped_chunk_groups_host.size() * sizeof(int32_t));
+                grouped_chunk_starts_pool.alloc(grouped_chunk_starts_host.size() * sizeof(int32_t));
+                int32_t * grouped_experts_device      = grouped_experts_pool.get();
+                int32_t * grouped_offsets_device      = grouped_offsets_pool.get();
+                int32_t * grouped_rows_device         = grouped_rows_pool.get();
+                int32_t * grouped_chunk_groups_device = grouped_chunk_groups_pool.get();
+                int32_t * grouped_chunk_starts_device = grouped_chunk_starts_pool.get();
+                grouping_ok = grouped_experts_device && grouped_offsets_device && grouped_rows_device &&
+                              grouped_chunk_groups_device && grouped_chunk_starts_device;
+
+                if (grouping_ok) {
+                    std::vector<sycl::event> grouped_copy_events;
+                    grouped_copy_events.reserve(5 + (deps ? deps->size() : 0));
+                    if (deps) {
+                        grouped_copy_events.insert(grouped_copy_events.end(), deps->begin(), deps->end());
+                    }
+                    grouped_copy_events.push_back(submit_memcpy_with_deps(
+                        grouped_experts_device, grouped_experts_host.data(),
+                        grouped_experts_host.size() * sizeof(int32_t), deps ? *deps : std::vector<sycl::event>{}));
+                    grouped_copy_events.push_back(submit_memcpy_with_deps(
+                        grouped_offsets_device, grouped_offsets_host.data(),
+                        grouped_offsets_host.size() * sizeof(int32_t), deps ? *deps : std::vector<sycl::event>{}));
+                    grouped_copy_events.push_back(submit_memcpy_with_deps(grouped_rows_device, grouped_rows_host.data(),
+                                                                          grouped_rows_host.size() * sizeof(int32_t),
+                                                                          deps ? *deps : std::vector<sycl::event>{}));
+                    grouped_copy_events.push_back(submit_memcpy_with_deps(
+                        grouped_chunk_groups_device, grouped_chunk_groups_host.data(),
+                        grouped_chunk_groups_host.size() * sizeof(int32_t), deps ? *deps : std::vector<sycl::event>{}));
+                    grouped_copy_events.push_back(submit_memcpy_with_deps(
+                        grouped_chunk_starts_device, grouped_chunk_starts_host.data(),
+                        grouped_chunk_starts_host.size() * sizeof(int32_t), deps ? *deps : std::vector<sycl::event>{}));
+                    if (pp_profile) {
+                        profile_group_copy_events = grouped_copy_events;
+                    }
+
+                    const int grouped_n_chunks   = static_cast<int>(grouped_chunk_groups_host.size());
+                    auto      submit_chunk_range = [&](int chunk_begin, int chunk_count) {
+                        return mxfp4_i8_grouped_direct_q8_sycl<repeat>(
+                            *stream, down_ptrs_device, q8_buffer, dst_d, grouped_experts_device, grouped_offsets_device,
+                            grouped_rows_device, grouped_chunk_groups_device + chunk_begin,
+                            grouped_chunk_starts_device + chunk_begin, static_cast<int>(ncols),
+                            static_cast<int>(ncols_y), static_cast<int>(nrows_per_expert), chunk_count,
+                            static_cast<int>(n_tokens), static_cast<int>(ne11), q8_row_size, ne11 * q8_row_size,
+                            down_dst->nb[1], down_dst->nb[2], /*scale_stride_blocks=*/0, grouped_copy_events);
+                    };
+                    if (!chunked_row_limit && mxfp4_i8_grouped_pack_q8_enabled(n_tokens)) {
+                        const int    k_tiles = static_cast<int>(ncols) / k_per;
+                        const size_t b_bytes = static_cast<size_t>(grouped_n_chunks) * static_cast<size_t>(k_tiles) *
+                                               static_cast<size_t>(k_per * exec_n);
+                        const size_t y_bytes = static_cast<size_t>(grouped_n_chunks) * static_cast<size_t>(k_tiles) *
+                                               static_cast<size_t>(exec_n) * sizeof(float);
+                        auto &   reuse    = g_mxfp4_moe_tg_reuse;
+                        int8_t * b_packed = static_cast<int8_t *>(mxfp4_moe_tg_reuse_get_or_alloc_device_scratch(
+                            stream, ctx.device, b_bytes, reuse.dpas_b_capacity, reuse.dpas_b_device,
+                            reuse.dpas_b_handle));
+                        float *  y_scales = static_cast<float *>(mxfp4_moe_tg_reuse_get_or_alloc_device_scratch(
+                            stream, ctx.device, y_bytes, reuse.dpas_y_capacity, reuse.dpas_y_device,
+                            reuse.dpas_y_handle));
+                        if (b_packed && y_scales) {
+                            sycl::event pack_event = mxfp4_dpas_pack_q8_grouped_chunks_sycl(
+                                *stream, q8_buffer, b_packed, y_scales, grouped_offsets_device, grouped_rows_device,
+                                grouped_chunk_groups_device, grouped_chunk_starts_device, static_cast<int>(ncols),
+                                static_cast<int>(ncols_y), grouped_n_chunks, static_cast<int>(n_tokens),
+                                static_cast<int>(ne11), q8_row_size, ne11 * q8_row_size, grouped_copy_events);
+                            if (pp_profile) {
+                                profile_pack_event     = pack_event;
+                                profile_pack_event_set = true;
+                            }
+                            std::vector<sycl::event> packed_deps = { pack_event };
+                            down_event                           = mxfp4_i8_grouped_packed_q8_m4_sycl<repeat>(
+                                *stream, down_ptrs_device, b_packed, y_scales, dst_d, grouped_experts_device,
+                                grouped_offsets_device, grouped_rows_device, grouped_chunk_groups_device,
+                                grouped_chunk_starts_device, static_cast<int>(ncols),
+                                static_cast<int>(nrows_per_expert), grouped_n_chunks, static_cast<int>(n_tokens),
+                                down_dst->nb[1], down_dst->nb[2], /*scale_stride_blocks=*/0, packed_deps);
+                            profile_path = "down-grouped-packed-q8";
+                        } else {
+                            down_event   = submit_chunk_range(0, grouped_n_chunks);
+                            profile_path = "down-grouped-direct-q8";
+                        }
+                    } else if (chunked_row_limit) {
+                        std::vector<sycl::event> chunk_events;
+                        chunk_events.reserve(chunk_passes.size());
+                        for (const auto & pass : chunk_passes) {
+                            chunk_events.push_back(submit_chunk_range(pass.first, pass.second));
+                        }
+                        down_event =
+                            ggml_sycl_submit_marker<mxfp4_i8_grouped_chunk_join_kernel<repeat>>(*stream, chunk_events);
+                        profile_path = "down-grouped-direct-q8-chunked";
+                    } else {
+                        down_event   = submit_chunk_range(0, grouped_n_chunks);
+                        profile_path = "down-grouped-direct-q8";
+                    }
+                    have_down_event = true;
+                    used_grouped_i8 = true;
+                }
+            }
+        }
+
+        if (!used_grouped_i8 && xmx_capabilities_support_sub_group(caps, 16)) {
             reorder_mul_mat_vec_mxfp4_i8_q8_1_id_sycl_rows<1, true, 16>(
                 down_ptrs_device, q8_buffer, dst_d, ids_device, static_cast<int>(ncols), static_cast<int>(ncols_y),
                 static_cast<int>(nrows_per_expert), static_cast<int>(n_experts), static_cast<int>(total_batches),
-                static_cast<int>(n_ids), static_cast<int>(n_tokens), static_cast<int>(ne11),
-                direct_ids ? ids_nb0 : 0, direct_ids ? ids_nb1 : 0,
-                q8_row_size, ne11 * q8_row_size, down_dst->nb[1], down_dst->nb[2],
+                static_cast<int>(n_ids), static_cast<int>(n_tokens), static_cast<int>(ne11), direct_ids ? ids_nb0 : 0,
+                direct_ids ? ids_nb1 : 0, q8_row_size, ne11 * q8_row_size, down_dst->nb[1], down_dst->nb[2],
                 /*scale_stride_blocks=*/0, /*cache_y_local=*/false, stream, deps, &down_event);
+            have_down_event = true;
+            profile_path    = "down-i8-sg16";
         } else {
-            reorder_mul_mat_vec_mxfp4_i8_q8_1_id_sycl_rows<1, true>(
-                down_ptrs_device, q8_buffer, dst_d, ids_device, static_cast<int>(ncols), static_cast<int>(ncols_y),
-                static_cast<int>(nrows_per_expert), static_cast<int>(n_experts), static_cast<int>(total_batches),
-                static_cast<int>(n_ids), static_cast<int>(n_tokens), static_cast<int>(ne11),
-                direct_ids ? ids_nb0 : 0, direct_ids ? ids_nb1 : 0,
-                q8_row_size, ne11 * q8_row_size, down_dst->nb[1], down_dst->nb[2],
-                /*scale_stride_blocks=*/0, /*cache_y_local=*/false, stream, deps, &down_event);
+            if (!used_grouped_i8) {
+                reorder_mul_mat_vec_mxfp4_i8_q8_1_id_sycl_rows<1, true>(
+                    down_ptrs_device, q8_buffer, dst_d, ids_device, static_cast<int>(ncols), static_cast<int>(ncols_y),
+                    static_cast<int>(nrows_per_expert), static_cast<int>(n_experts), static_cast<int>(total_batches),
+                    static_cast<int>(n_ids), static_cast<int>(n_tokens), static_cast<int>(ne11),
+                    direct_ids ? ids_nb0 : 0, direct_ids ? ids_nb1 : 0, q8_row_size, ne11 * q8_row_size,
+                    down_dst->nb[1], down_dst->nb[2],
+                    /*scale_stride_blocks=*/0, /*cache_y_local=*/false, stream, deps, &down_event);
+                have_down_event = true;
+                profile_path    = "down-i8";
+            }
         }
-        have_down_event = true;
     } else {
-        reorder_mul_mat_vec_mxfp4_q8_1_id_sycl(nullptr, down_ptrs_device, q8_buffer, dst_d, ids_device,
-                                               static_cast<int>(ncols), static_cast<int>(ncols_y),
-                                               static_cast<int>(nrows_per_expert), static_cast<int>(n_experts),
-                                               static_cast<int>(total_batches), static_cast<int>(n_ids),
-                                               static_cast<int>(n_tokens), static_cast<int>(ne11),
-                                               direct_ids ? ids_nb0 : 0, direct_ids ? ids_nb1 : 0,
-                                               q8_row_size, ne11 * q8_row_size, down_dst->nb[1], down_dst->nb[2],
-                                               stream, deps, &down_event);
+        reorder_mul_mat_vec_mxfp4_q8_1_id_sycl(
+            nullptr, down_ptrs_device, q8_buffer, dst_d, ids_device, static_cast<int>(ncols), static_cast<int>(ncols_y),
+            static_cast<int>(nrows_per_expert), static_cast<int>(n_experts), static_cast<int>(total_batches),
+            static_cast<int>(n_ids), static_cast<int>(n_tokens), static_cast<int>(ne11), direct_ids ? ids_nb0 : 0,
+            direct_ids ? ids_nb1 : 0, q8_row_size, ne11 * q8_row_size, down_dst->nb[1], down_dst->nb[2], stream, deps,
+            &down_event);
         have_down_event = true;
+        profile_path    = "down-soa";
     }
 
-    if (mmvq_moe_tg_profile_enabled()) {
+    if (detail_profile) {
         if (have_down_event) {
             down_event.wait();
         } else {
             stream->wait();
         }
     }
-    const auto t_kernel_end = std::chrono::high_resolution_clock::now();
-    const double kernel_wall_us =
-        std::chrono::duration<double, std::micro>(t_kernel_end - t_kernel_begin).count();
+    const auto   t_kernel_end      = std::chrono::high_resolution_clock::now();
+    const double kernel_wall_us    = std::chrono::duration<double, std::micro>(t_kernel_end - t_kernel_begin).count();
     const double kernel_event_us   = have_down_event ? mmvq_sycl_event_duration_us(down_event) : -1.0;
     const double kernel_profile_us = kernel_event_us >= 0.0 ? kernel_event_us : kernel_wall_us;
+    double       group_copy_us     = 0.0;
+    if (pp_profile) {
+        for (const sycl::event & ev : profile_group_copy_events) {
+            const double ev_us = mmvq_sycl_event_duration_us(ev);
+            if (ev_us >= 0.0) {
+                group_copy_us += ev_us;
+            }
+        }
+    }
+    const double pack_us =
+        pp_profile && profile_pack_event_set ? std::max(0.0, mmvq_sycl_event_duration_us(profile_pack_event)) : 0.0;
 
     g_mmvq_moe_dispatch_timing.kernel_submit_us += kernel_wall_us;
     g_mmvq_moe_dispatch_timing.calls++;
@@ -9837,6 +12588,11 @@ bool mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4(ggml_backend_sycl_conte
     if (mmvq_moe_tg_profile_enabled()) {
         mmvq_moe_tg_profile_record(down_layout, n_gpu_entries, total_batches, 0.0, 0.0, kernel_profile_us, 0.0,
                                    mmvq_moe_tg_profile_kind::DOWN);
+    }
+    if (pp_profile) {
+        mmvq_moe_pp_profile_record(profile_path, n_gpu_entries, total_batches, 0.0, profile_group_host_us,
+                                   group_copy_us, pack_us, kernel_wall_us, kernel_profile_us, 0.0,
+                                   mmvq_moe_tg_profile_kind::DOWN, 1);
     }
 
     if (completion_event && have_down_event) {
@@ -9917,6 +12673,8 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
         if (batch_size > effective_threshold) {
             GGML_SYCL_DEBUG("[MMVQ] Batch %ld > threshold %ld, routing to batched GEMM path\n", (long) batch_size,
                             (long) effective_threshold);
+            mmvq_moe_trace(src0, "batch_gt_threshold", ctx.device, forced_layout ? (int) *forced_layout : -1,
+                           forced_layout != nullptr, batch_size, effective_threshold, false, false, false, false);
             return false;
         }
     }
@@ -9942,6 +12700,8 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
         if (resolved != *forced_layout) {
             GGML_SYCL_DEBUG("[MMVQ] Layout=%d unsupported for %s (resolved=%d)\n", (int) *forced_layout, src0->name,
                             (int) resolved);
+            mmvq_moe_trace(src0, "forced_layout_unsupported", ctx.device, (int) *forced_layout,
+                           forced_layout != nullptr, batch_size, -1, host_weights, false, false, false);
             return false;
         }
     }
@@ -9951,6 +12711,8 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
         if (effective != layout && !allow_aos_fallback) {
             GGML_SYCL_DEBUG("[MMVQ] Layout=%d mismatches effective=%d for %s\n", (int) layout, (int) effective,
                             src0->name ? src0->name : "?");
+            mmvq_moe_trace(src0, "layout_mismatch", ctx.device, (int) layout, forced_layout != nullptr, batch_size, -1,
+                           host_weights, false, false, false);
             return false;
         }
         if (effective != layout && allow_aos_fallback) {
@@ -9961,6 +12723,8 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
     if ((src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0) && layout != GGML_LAYOUT_AOS) {
         GGML_SYCL_DEBUG("[MMVQ] Layout=%d unsupported for MoE type=%d (%s)\n", (int) layout, src0->type,
                         src0->name ? src0->name : "?");
+        mmvq_moe_trace(src0, "quant_layout_unsupported", ctx.device, (int) layout, forced_layout != nullptr,
+                       batch_size, -1, host_weights, false, false, false);
         return false;
     }
     // MXFP4 MoE supports SoA/Coalesced layouts via unified cache staging + device ptr tables.
@@ -9974,6 +12738,8 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
     // XMX tiled layout is handled by XMX paths, not MMVQ
     if (layout == GGML_LAYOUT_XMX_TILED) {
         GGML_SYCL_DEBUG("[MMVQ] XMX tiled layout for %s, skipping MMVQ\n", src0->name);
+        mmvq_moe_trace(src0, "xmx_tiled", ctx.device, (int) layout, forced_layout != nullptr, batch_size, -1,
+                       host_weights, use_ptr_table, false, false);
         return false;
     }
 
@@ -9986,6 +12752,8 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
 
     // Only handle quantized types that have _id kernels
     if (!ggml_is_quantized(src0->type)) {
+        mmvq_moe_trace(src0, "not_quantized", ctx.device, (int) layout, forced_layout != nullptr, batch_size, -1,
+                       host_weights, use_ptr_table, false, false);
         return false;
     }
 
@@ -9996,6 +12764,8 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
         case GGML_TYPE_MXFP4:
             break;
         default:
+            mmvq_moe_trace(src0, "type_unsupported", ctx.device, (int) layout, forced_layout != nullptr, batch_size, -1,
+                           host_weights, use_ptr_table, false, false);
             return false;  // Fall back to host routing for other types
     }
 
@@ -10008,6 +12778,8 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
         plan_has_host_experts =
             route_cache->moe_tensor_has_host_experts(std::string(src0->name), n_experts, ctx.device);
     }
+    mmvq_moe_trace(src0, "candidate", ctx.device, (int) layout, forced_layout != nullptr, batch_size, -1,
+                   host_weights, use_ptr_table, placement_plan_active, plan_has_host_experts);
     // Previously returned false here when (placement_plan_active && use_ptr_table).
     // The mixed-ptr check at ~3870-3886 is the architecturally correct gate: it
     // inspects actual expert pointer residency after ggml_sycl_update_moe_ptr_table
@@ -10032,37 +12804,55 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
     const int32_t * ids_d   = ggml_sycl_get_moe_ids_device_ptr(ctx, ids, &ids_copy_event, &ids_nb0, &ids_nb1);
     if (!ids_d) {
         GGML_SYCL_DEBUG("[MMVQ] Missing ids device pointer for %s\n", src0->name);
+        mmvq_moe_trace(src0, "missing_ids", ctx.device, (int) layout, forced_layout != nullptr, batch_size, -1,
+                       host_weights, use_ptr_table, placement_plan_active, plan_has_host_experts);
         return false;
     }
     float * dst_d = static_cast<float *>(ggml_sycl_resolve_tensor_ptr(dst, ctx.device));
     if (!src1_d || !dst_d) {
         GGML_SYCL_DEBUG("[MMVQ] Missing resolved ptrs for MoE _id dispatch (%s)\n", src0->name);
+        mmvq_moe_trace(src0, "missing_src1_or_dst", ctx.device, (int) layout, forced_layout != nullptr, batch_size, -1,
+                       host_weights, use_ptr_table, placement_plan_active, plan_has_host_experts);
         return false;
     }
+    ggml_sycl::mem_handle src1_handle =
+        mxfp4_moe_tensor_mem_handle(src1, ctx.device, const_cast<float *>(src1_d), GGML_LAYOUT_AOS, true);
 
     const void * const * expert_ptrs = nullptr;
+    std::vector<void *>  expert_ptr_payload;
     sycl::event          table_event;
     bool                 has_table_event            = false;
     bool                 ptr_table_full_device_view = false;
     if (use_ptr_table) {
         if (g_ggml_sycl_graph_recording) {
             if (src0_extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES) {
-                expert_ptrs = static_cast<const void * const *>(src0_extra->moe_expert_ptrs_device[ctx.device]);
+                expert_ptrs = static_cast<const void * const *>(src0_extra->moe_ptrs_ptr(ctx.device));
             }
             if (!expert_ptrs) {
                 GGML_SYCL_DEBUG("[MMVQ] Missing expert pointer table during graph recording for %s\n", src0->name);
                 ctx.moe_graphs_disabled_once = true;
+                mmvq_moe_trace(src0, "graph_missing_ptr_table", ctx.device, (int) layout, forced_layout != nullptr,
+                               batch_size, -1, host_weights, use_ptr_table, placement_plan_active,
+                               plan_has_host_experts);
                 return false;
             }
             if (src0_extra) {
-                const auto & host_ptrs = src0_extra->moe_expert_ptrs_host[ctx.device];
-                if (host_ptrs.empty()) {
+                const size_t count = static_cast<size_t>(ne02 > 0 ? ne02 : 1);
+                if (!src0_extra->build_moe_ptr_payload_from_handles(ctx.device, count, expert_ptr_payload,
+                                                                    /*require_all=*/false,
+                                                                    /*require_device=*/false,
+                                                                    /*require_layout=*/true, layout)) {
                     GGML_SYCL_DEBUG("[MMVQ] Empty expert pointer table during graph recording for %s\n", src0->name);
                     ctx.moe_graphs_disabled_once = true;
+                    mmvq_moe_trace(src0, "graph_empty_ptr_table", ctx.device, (int) layout, forced_layout != nullptr,
+                                   batch_size, -1, host_weights, use_ptr_table, placement_plan_active,
+                                   plan_has_host_experts);
                     return false;
                 }
-                table_event     = stream->memcpy(src0_extra->moe_expert_ptrs_device[ctx.device], host_ptrs.data(),
-                                                 host_ptrs.size() * sizeof(void *));
+                ggml_sycl::mem_handle table_src = ggml_sycl::mem_handle::from_direct(
+                    expert_ptr_payload.data(), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+                table_event     = ggml_sycl::mem_copy_async(src0_extra->moe_expert_ptrs_handle[ctx.device], table_src,
+                                                            expert_ptr_payload.size() * sizeof(void *), *stream);
                 has_table_event = true;
             }
         } else {
@@ -10079,17 +12869,24 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                                                 /*skip_cpu_routed_experts=*/skip_cpu_routed_experts,
                                                 /*exact_layout_required=*/layout == GGML_LAYOUT_MXFP4_I8)) {
                 GGML_SYCL_DEBUG("[MMVQ] Failed to update expert pointer table for %s\n", src0->name);
+                mmvq_moe_trace(src0, "update_ptr_table_failed", ctx.device, (int) layout, forced_layout != nullptr,
+                               batch_size, -1, host_weights, use_ptr_table, placement_plan_active,
+                               plan_has_host_experts);
                 return false;
             }
             GGML_SYCL_DEBUG("[MMVQ] ggml_sycl_update_moe_ptr_table succeeded\n");
             has_table_event = true;
             if (src0_extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES) {
-                expert_ptrs = static_cast<const void * const *>(src0_extra->moe_expert_ptrs_device[ctx.device]);
+                expert_ptrs = static_cast<const void * const *>(src0_extra->moe_ptrs_ptr(ctx.device));
                 if (coverage == moe_ptr_table_coverage::AUTO_RESOLVED_VIEW) {
-                    const auto & host_ptrs = src0_extra->moe_expert_ptrs_host[ctx.device];
+                    const size_t count = static_cast<size_t>(ne02 > 0 ? ne02 : 1);
+                    src0_extra->build_moe_ptr_payload_from_handles(ctx.device, count, expert_ptr_payload,
+                                                                   /*require_all=*/true,
+                                                                   /*require_device=*/true,
+                                                                   /*require_layout=*/true, layout);
                     ptr_table_full_device_view =
-                        host_ptrs.size() == static_cast<size_t>(ne02) &&
-                        std::all_of(host_ptrs.begin(), host_ptrs.end(), [](const void * ptr) {
+                        expert_ptr_payload.size() == static_cast<size_t>(ne02) &&
+                        std::all_of(expert_ptr_payload.begin(), expert_ptr_payload.end(), [](const void * ptr) {
                             return ptr && ggml_sycl_get_alloc_type(ptr) == sycl::usm::alloc::device;
                         });
                 }
@@ -10099,12 +12896,24 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                 // so the caller can retry with CPU dispatch. Fire whenever the
                 // pointer table is mixed, regardless of planner state.
                 if (placement_plan_active || host_weights) {
-                    const auto & host_ptrs  = src0_extra->moe_expert_ptrs_host[ctx.device];
-                    bool         mixed_ptrs = false;
-                    for (const void * ptr : host_ptrs) {
-                        if (ptr && ggml_sycl_get_alloc_type(ptr) != sycl::usm::alloc::device) {
+                    const size_t count = static_cast<size_t>(ne02 > 0 ? ne02 : 1);
+                    src0_extra->build_moe_ptr_payload_from_handles(ctx.device, count, expert_ptr_payload,
+                                                                   /*require_all=*/false,
+                                                                   /*require_device=*/false,
+                                                                   /*require_layout=*/true, layout);
+                    bool mixed_ptrs = false;
+                    size_t ptr_count = 0;
+                    size_t non_device_ptrs = 0;
+                    size_t null_ptrs = 0;
+                    for (const void * ptr : expert_ptr_payload) {
+                        ptr_count++;
+                        if (!ptr) {
+                            null_ptrs++;
+                            continue;
+                        }
+                        if (ggml_sycl_get_alloc_type(ptr) != sycl::usm::alloc::device) {
+                            non_device_ptrs++;
                             mixed_ptrs = true;
-                            break;
                         }
                     }
                     if (mixed_ptrs) {
@@ -10112,12 +12921,19 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                             "[MMVQ] Mixed device/host expert pointers for %s (plan=%d host=%d); "
                             "falling back to hybrid dispatch\n",
                             src0->name ? src0->name : "?", placement_plan_active ? 1 : 0, host_weights ? 1 : 0);
+                        mmvq_moe_trace(src0, "mixed_expert_ptrs", ctx.device, (int) layout,
+                                       forced_layout != nullptr, batch_size, -1, host_weights, use_ptr_table,
+                                       placement_plan_active, plan_has_host_experts, ptr_count, non_device_ptrs,
+                                       null_ptrs);
                         return false;
                     }
                 }
             }
             if (!expert_ptrs) {
                 GGML_SYCL_DEBUG("[MMVQ] Missing expert pointer table for %s\n", src0->name);
+                mmvq_moe_trace(src0, "missing_ptr_table", ctx.device, (int) layout, forced_layout != nullptr,
+                               batch_size, -1, host_weights, use_ptr_table, placement_plan_active,
+                               plan_has_host_experts);
                 return false;
             }
             GGML_SYCL_DEBUG("[MMVQ] expert_ptrs=%p\n", (void *) expert_ptrs);
@@ -10130,6 +12946,9 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
         if (!resolved) {
             GGML_SYCL_DEBUG("[MMVQ] resolve_weight failed for %s (layout=%d)\n", src0->name ? src0->name : "?",
                             (int) layout);
+            mmvq_moe_trace(src0, "resolve_weight_failed", ctx.device, (int) layout, forced_layout != nullptr,
+                           batch_size, -1, host_weights, use_ptr_table, placement_plan_active,
+                           plan_has_host_experts);
             return false;
         }
         src0_d = resolved.ptr;
@@ -10140,18 +12959,19 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
     bool   using_cached       = false;
     bool   using_preallocated = false;
 
+    mmvq_deferred_temp_release local_temps(stream);
+
 #ifdef GGML_SYCL_GRAPH
     // Check cache first - avoids re-quantizing same input across MoE projections
-    if (ctx.moe_q8_cache.matches(src1_d, ne10, total_src1_rows)) {
+    if (ctx.moe_q8_cache.matches(src1_handle, ne10, total_src1_rows)) {
         q8_1_buffer  = ctx.moe_q8_cache.cached_q8_1;
         using_cached = true;
-        GGML_SYCL_DEBUG("[MOE-CACHE] Cache HIT: src1=%p, ne10=%lld, rows=%lld\n", src1_d, (long long) ne10,
-                        (long long) total_src1_rows);
+        GGML_SYCL_DEBUG("[MOE-CACHE] Cache HIT: src1_id=%zu, ne10=%lld, rows=%lld\n",
+                        src1_handle.stable_identity_hash(), (long long) ne10, (long long) total_src1_rows);
     }
 #endif
 
     // Fall back to allocation + quantization if cache miss
-    ggml_sycl_pool_alloc<int8_t> src1_q8_1_pool(ctx.pool());
     if (!using_cached) {
 #ifdef GGML_SYCL_GRAPH
         // Try pre-allocated buffer for graph recording
@@ -10166,8 +12986,12 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
 
         // Fall back to pool allocation if no pre-allocated buffer available
         if (!using_preallocated) {
-            src1_q8_1_pool.alloc(required_size);
-            q8_1_buffer = src1_q8_1_pool.get();
+            ggml_sycl::mem_handle q8_handle;
+            q8_1_buffer = mmvq_alloc_device_scratch(required_size, *stream, "mmvq_moe_generic_q8_1", q8_handle);
+            if (!q8_1_buffer) {
+                return false;
+            }
+            local_temps.add(std::move(q8_handle));
         }
 
         // Quantize all rows to Q8_1
@@ -10189,14 +13013,10 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
         // Cache the quantized result for subsequent gate/up/down calls
         // Only cache if using pre-allocated buffer (pool buffers get freed)
         if (using_preallocated) {
-            ctx.moe_q8_cache.cached_q8_1 = q8_1_buffer;
-            ctx.moe_q8_cache.cached_src  = src1_d;
-            ctx.moe_q8_cache.cached_ne10 = ne10;
-            ctx.moe_q8_cache.cached_rows = total_src1_rows;
-            ctx.moe_q8_cache.cached_size = required_size;
-            ctx.moe_q8_cache.valid       = true;
-            GGML_SYCL_DEBUG("[MOE-CACHE] Cache STORE: src1=%p, ne10=%lld, rows=%lld, buffer=%p\n", src1_d,
-                            (long long) ne10, (long long) total_src1_rows, q8_1_buffer);
+            ctx.moe_q8_cache.store(src1_handle, q8_1_buffer, ne10, total_src1_rows, required_size);
+            GGML_SYCL_DEBUG("[MOE-CACHE] Cache STORE: src1_id=%zu, ne10=%lld, rows=%lld, buffer=%p\n",
+                            src1_handle.stable_identity_hash(), (long long) ne10, (long long) total_src1_rows,
+                            q8_1_buffer);
         }
 #endif
     }
@@ -10246,8 +13066,18 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                 ggml_sycl_build_moe_compact_list(*stream, compact_ptrs, expert_ptrs, ids_d, n_ids, num_tokens, ne02,
                                                  ids_nb0, ids_nb1, missing_device, compact_deps);
             if (!g_ggml_sycl_graph_recording && missing_device) {
-                int missing_host = 0;
-                stream->memcpy(&missing_host, missing_device, sizeof(int), build_event).wait();
+                int  missing_host = 0;
+                auto missing_host_handle =
+                    ggml_sycl::mem_handle::from_direct(&missing_host, GGML_LAYOUT_AOS,
+                                                       /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE);
+                ggml_sycl::mem_handle missing_device_handle = extra_mut->moe_expert_ptrs_missing_handle[ctx.device];
+                if (!missing_device_handle.valid()) {
+                    const bool missing_on_device = ggml_sycl_get_alloc_type(missing_device) == sycl::usm::alloc::device;
+                    missing_device_handle        = ggml_sycl::mem_handle::from_chunk_ptr(missing_device, ctx.device,
+                                                                                         GGML_LAYOUT_AOS, missing_on_device);
+                }
+                ggml_sycl::mem_copy(missing_host_handle, missing_device_handle, sizeof(missing_host), *stream,
+                                    { build_event });
                 if (missing_host) {
                     GGML_SYCL_DEBUG("[MMVQ] Missing cached expert pointer(s) for %s, falling back\n", src0->name);
                     ctx.moe_graphs_disabled_once = g_ggml_sycl_graph_recording;
@@ -10312,13 +13142,17 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                     // miss or degradation), the pointer table may contain null entries
                     // or AOS host pointers.  Fall back to AOS dispatch in that case.
                     if (use_ptr_table && host_weights && src0_extra) {
-                        const auto & host_ptrs = src0_extra->moe_expert_ptrs_host[ctx.device];
-                        bool         ptrs_ok   = true;
-                        for (size_t ep = 0; ep < host_ptrs.size() && ptrs_ok; ep++) {
-                            if (!host_ptrs[ep]) {
+                        const size_t count = static_cast<size_t>(ne02 > 0 ? ne02 : 1);
+                        src0_extra->build_moe_ptr_payload_from_handles(ctx.device, count, expert_ptr_payload,
+                                                                       /*require_all=*/false,
+                                                                       /*require_device=*/false,
+                                                                       /*require_layout=*/true, layout);
+                        bool ptrs_ok = true;
+                        for (size_t ep = 0; ep < expert_ptr_payload.size() && ptrs_ok; ep++) {
+                            if (!expert_ptr_payload[ep]) {
                                 continue;  // null = expert not active this token
                             }
-                            auto alloc = ggml_sycl_get_alloc_type(host_ptrs[ep]);
+                            auto alloc = ggml_sycl_get_alloc_type(expert_ptr_payload[ep]);
                             if (alloc != sycl::usm::alloc::device) {
                                 ptrs_ok = false;
                             }
@@ -10340,7 +13174,7 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
 
                         // Read first bytes of X to verify layout
                         uint8_t x_sample[32];
-                        stream->memcpy(x_sample, src0_d, 32).wait();
+                        mmvq_debug_copy_to_host(*stream, ctx.device, x_sample, src0_d, sizeof(x_sample));
                         fprintf(
                             stderr,
                             "[VERIFY-X] First 16 bytes (should be qs): %02x %02x %02x %02x %02x %02x %02x %02x...\n",
@@ -10349,7 +13183,8 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
 
                         // Read scale region (at offset x_qs_size)
                         uint8_t x_scale_sample[8];
-                        stream->memcpy(x_scale_sample, (const uint8_t *) src0_d + x_qs_size, 8).wait();
+                        mmvq_debug_copy_to_host(*stream, ctx.device, x_scale_sample,
+                                                (const uint8_t *) src0_d + x_qs_size, sizeof(x_scale_sample));
                         fprintf(stderr,
                                 "[VERIFY-X] First 8 scales at offset %lld: %02x %02x %02x %02x %02x %02x %02x %02x\n",
                                 (long long) x_qs_size, x_scale_sample[0], x_scale_sample[1], x_scale_sample[2],
@@ -10358,14 +13193,16 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
 
                         // Read first bytes of Y (Q8_1) to verify layout
                         int8_t y_quant_sample[32];
-                        stream->memcpy(y_quant_sample, q8_1_buffer, 32).wait();
+                        mmvq_debug_copy_to_host(*stream, ctx.device, y_quant_sample, q8_1_buffer,
+                                                sizeof(y_quant_sample));
                         fprintf(stderr, "[VERIFY-Y] First 32 quants: %d %d %d %d %d %d %d %d...\n", y_quant_sample[0],
                                 y_quant_sample[1], y_quant_sample[2], y_quant_sample[3], y_quant_sample[4],
                                 y_quant_sample[5], y_quant_sample[6], y_quant_sample[7]);
 
                         // Read ds values (at offset ne10)
                         sycl::half2 y_ds_sample[4];
-                        stream->memcpy(y_ds_sample, (const char *) q8_1_buffer + ne10, sizeof(y_ds_sample)).wait();
+                        mmvq_debug_copy_to_host(*stream, ctx.device, y_ds_sample, (const char *) q8_1_buffer + ne10,
+                                                sizeof(y_ds_sample));
                         fprintf(stderr, "[VERIFY-Y] First 4 ds at offset %lld: d0=%.4f s0=%.4f, d1=%.4f s1=%.4f\n",
                                 (long long) ne10, (float) y_ds_sample[0][0], (float) y_ds_sample[0][1],
                                 (float) y_ds_sample[1][0], (float) y_ds_sample[1][1]);
@@ -10434,9 +13271,13 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
 
                             // Check expert pointers inside the table (first few)
                             if (dispatch_ptrs && src0_extra) {
-                                const auto & host_ptrs = src0_extra->moe_expert_ptrs_host[ctx.device];
-                                for (size_t e = 0; e < std::min(host_ptrs.size(), (size_t) 4); ++e) {
-                                    void * eptr   = host_ptrs[e];
+                                const size_t count = static_cast<size_t>(ne02 > 0 ? ne02 : 1);
+                                src0_extra->build_moe_ptr_payload_from_handles(ctx.device, count, expert_ptr_payload,
+                                                                               /*require_all=*/false,
+                                                                               /*require_device=*/false,
+                                                                               /*require_layout=*/true, layout);
+                                for (size_t e = 0; e < std::min(expert_ptr_payload.size(), (size_t) 4); ++e) {
+                                    void * eptr   = expert_ptr_payload[e];
                                     auto   ealloc = eptr ? ggml_sycl_get_alloc_type(eptr) : sycl::usm::alloc::unknown;
                                     GGML_SYCL_DEBUG("[MMVQ-USM-CHECK] expert[%zu]=%p alloc=%d\n", e, eptr,
                                                     (int) ealloc);
@@ -10753,7 +13594,7 @@ static void ggml_sycl_mmvq_dispatch(const ggml_tensor *     src0,
 
                         // Read first 64 bytes from GPU to check layout
                         uint8_t header[64];
-                        stream->memcpy(header, data_ptr, sizeof(header)).wait();
+                        mmvq_debug_copy_to_host(*stream, device_id, header, data_ptr, sizeof(header));
 
                         // AoS expects: [d0:2][qs0:32][d1:2][qs1:32]...
                         // SoA expects: [qs0:32][qs1:32]...[d0:2][d1:2]...
@@ -10765,7 +13606,8 @@ static void ggml_sycl_mmvq_dispatch(const ggml_tensor *     src0,
                         const size_t soa_d_offset   = nblocks * QK8_0;
                         uint8_t      soa_d_bytes[4] = { 0 };
                         if (soa_d_offset < ggml_nbytes(src0)) {
-                            stream->memcpy(soa_d_bytes, (const uint8_t *) data_ptr + soa_d_offset, 4).wait();
+                            mmvq_debug_copy_to_host(*stream, device_id, soa_d_bytes,
+                                                    (const uint8_t *) data_ptr + soa_d_offset, sizeof(soa_d_bytes));
                         }
                         ggml_half d_soa = *(ggml_half *) &soa_d_bytes[0];
 
@@ -10785,7 +13627,7 @@ static void ggml_sycl_mmvq_dispatch(const ggml_tensor *     src0,
 
                         // Read first 8 bytes of Y (should be quant values, int8 in range -127 to 127)
                         uint8_t y_header[8] = { 0 };
-                        stream->memcpy(y_header, src1_ddq_i_bs, sizeof(y_header)).wait();
+                        mmvq_debug_copy_to_host(*stream, device_id, y_header, src1_ddq_i_bs, sizeof(y_header));
                         fprintf(stderr, "  Y quants[0-7]: %d %d %d %d %d %d %d %d\n", (int) (int8_t) y_header[0],
                                 (int) (int8_t) y_header[1], (int) (int8_t) y_header[2], (int) (int8_t) y_header[3],
                                 (int) (int8_t) y_header[4], (int) (int8_t) y_header[5], (int) (int8_t) y_header[6],
@@ -10793,7 +13635,8 @@ static void ggml_sycl_mmvq_dispatch(const ggml_tensor *     src0,
 
                         // Read ds at Y SoA position (offset ne00 for first ds)
                         uint8_t y_ds_bytes[4] = { 0 };
-                        stream->memcpy(y_ds_bytes, (const uint8_t *) src1_ddq_i_bs + ne00, 4).wait();
+                        mmvq_debug_copy_to_host(*stream, device_id, y_ds_bytes, (const uint8_t *) src1_ddq_i_bs + ne00,
+                                                sizeof(y_ds_bytes));
                         sycl::half2 y_ds = *(sycl::half2 *) y_ds_bytes;
                         fprintf(stderr, "  Y ds at offset ne00=%lld: d=%.6f, s=%.6f\n", (long long) ne00,
                                 (float) y_ds.x(), (float) y_ds.y());
@@ -10914,7 +13757,7 @@ static void ggml_sycl_mmvq_dispatch(const ggml_tensor *     src0,
 
                         // Read first 2 blocks of Y
                         block_q8_1_debug y_blocks[2];
-                        stream->memcpy(y_blocks, src1_ddq_i_bs, sizeof(y_blocks)).wait();
+                        mmvq_debug_copy_to_host(*stream, device_id, y_blocks, src1_ddq_i_bs, sizeof(y_blocks));
 
                         fprintf(stderr, "\n[Q6K_Y_DEBUG #%d] ne00=%lld row_diff=%lld is_soa=%d\n", q6k_debug_count,
                                 (long long) ne00, (long long) row_diff, mmvq_mode == reorder_mode::SOA ? 1 : 0);
@@ -10931,7 +13774,7 @@ static void ggml_sycl_mmvq_dispatch(const ggml_tensor *     src0,
                         // Also check if Y looks like SoA format (all quants first, then all ds)
                         // If SoA, first 64 bytes would be all qs values (no ds embedded)
                         uint8_t raw_bytes[72];
-                        stream->memcpy(raw_bytes, src1_ddq_i_bs, sizeof(raw_bytes)).wait();
+                        mmvq_debug_copy_to_host(*stream, device_id, raw_bytes, src1_ddq_i_bs, sizeof(raw_bytes));
                         fprintf(stderr, "  Raw Y[0..35]: ");
                         for (int i = 0; i < 36; i++) {
                             fprintf(stderr, "%02x ", raw_bytes[i]);
@@ -11015,7 +13858,7 @@ static void ggml_sycl_mmvq_dispatch(const ggml_tensor *     src0,
         if (g_ggml_sycl_tp_debug && mmvq_out_dbg++ < 10 && src0->name && strstr(src0->name, "blk.0.attn_output")) {
             stream->wait();  // Wait for kernel to complete
             float out_vals[8];
-            stream->memcpy(out_vals, dst_dd_i_bs, 8 * sizeof(float)).wait();
+            mmvq_debug_copy_to_host(*stream, device_id, out_vals, dst_dd_i_bs, sizeof(out_vals));
             fprintf(stderr, "TP DEBUG MMVQ output device=%d %s col=%d dst[0..7]=[%f, %f, %f, %f, %f, %f, %f, %f]\n",
                     device_id, src0->name, i, out_vals[0], out_vals[1], out_vals[2], out_vals[3], out_vals[4],
                     out_vals[5], out_vals[6], out_vals[7]);
@@ -11027,7 +13870,7 @@ static void ggml_sycl_mmvq_dispatch(const ggml_tensor *     src0,
         if (g_ggml_sycl_tp_debug && ffn_down_dbg++ < 5 && src0->name && strstr(src0->name, "blk.0.ffn_down")) {
             stream->wait();
             float out_vals[8];
-            stream->memcpy(out_vals, dst_dd_i_bs, 8 * sizeof(float)).wait();
+            mmvq_debug_copy_to_host(*stream, device_id, out_vals, dst_dd_i_bs, sizeof(out_vals));
             fprintf(stderr,
                     "DEBUG FFN_DOWN layer0 device=%d col=%d ne00=%lld row_diff=%lld dst[0..7]=[%f, %f, %f, %f, %f, %f, "
                     "%f, %f]\n",
@@ -11047,9 +13890,16 @@ static sycl::event mmvq_stream_copy(sycl::queue &                    queue,
                                     const std::vector<sycl::event> & deps) {
     GGML_UNUSED(src_ptr);
     GGML_UNUSED(src_size);
-    const auto * ctx = static_cast<const mmvq_stream_ctx *>(ctx_void);
+    const auto * ctx          = static_cast<const mmvq_stream_ctx *>(ctx_void);
+    const int    queue_device = ggml_sycl_get_device_id_from_queue(queue);
     if (!ctx || ctx->segment_count == 0 || ctx->row_total_bytes == 0) {
-        return queue.memcpy(device_slice, static_cast<const char *>(src_ptr) + offset_bytes, slice_bytes, deps);
+        auto dst_handle =
+            ggml_sycl::mem_handle::from_chunk_ptr(device_slice, queue_device, GGML_LAYOUT_AOS, /*on_device=*/true);
+        const bool src_on_device = ggml_sycl_get_alloc_type(src_ptr) == sycl::usm::alloc::device;
+        auto       src_handle    = ggml_sycl::mem_handle::from_chunk_ptr(const_cast<void *>(src_ptr), queue_device,
+                                                                         GGML_LAYOUT_AOS, src_on_device);
+        GGML_ASSERT(dst_handle.valid() && src_handle.valid());
+        return ggml_sycl::mem_copy_async(dst_handle, 0, src_handle, offset_bytes, slice_bytes, queue, deps);
     }
     GGML_ASSERT(offset_bytes % ctx->row_total_bytes == 0);
     GGML_ASSERT(slice_bytes % ctx->row_total_bytes == 0);
@@ -11060,8 +13910,9 @@ static sycl::event mmvq_stream_copy(sycl::queue &                    queue,
 
     const sycl::usm::alloc src_alloc = ggml_sycl_get_alloc_type(ctx->src_base);
     if (src_alloc != sycl::usm::alloc::device) {
-        uint8_t * host_slice     = nullptr;
-        bool      use_persistent = (ctx->host_staging != nullptr && ctx->host_staging_size >= slice_bytes);
+        uint8_t *             host_slice = nullptr;
+        ggml_sycl::mem_handle host_stage_handle;
+        bool                  use_persistent = (ctx->host_staging != nullptr && ctx->host_staging_size >= slice_bytes);
         if (use_persistent) {
             // Wait for the previous DMA that used this staging buffer to complete
             // before overwriting (guards against multi-slice ring-buffer races).
@@ -11071,12 +13922,17 @@ static sycl::event mmvq_stream_copy(sycl::queue &                    queue,
             }
             host_slice = static_cast<uint8_t *>(ctx->host_staging);
         } else {
-            host_slice =
-                static_cast<uint8_t *>(ggml_sycl_malloc_host_tracked_bytes(slice_bytes, queue, "mmvq:host_stage"));
-            if (!host_slice) {
+            if (!ggml_sycl_mmvq_alloc_host_stage(slice_bytes, queue, queue_device, "mmvq:host_stage",
+                                                 host_stage_handle)) {
                 throw sycl::exception(sycl::make_error_code(sycl::errc::memory_allocation),
                                       "MMVQ stream: host staging allocation failed");
             }
+            const auto host_stage = host_stage_handle.resolve(queue_device);
+            if (!host_stage || !host_stage.ptr || host_stage.on_device) {
+                throw sycl::exception(sycl::make_error_code(sycl::errc::memory_allocation),
+                                      "MMVQ stream: host staging resolve failed");
+            }
+            host_slice = static_cast<uint8_t *>(host_stage.ptr);
         }
         size_t dst_offset = 0;
         for (int i = 0; i < ctx->segment_count; ++i) {
@@ -11090,17 +13946,17 @@ static sycl::event mmvq_stream_copy(sycl::queue &                    queue,
             dst_offset += bytes;
         }
         GGML_ASSERT(dst_offset == slice_bytes);
-        sycl::event evt = queue.memcpy(device_slice, host_slice, slice_bytes, deps);
+        auto dst_handle =
+            ggml_sycl::mem_handle::from_chunk_ptr(device_slice, queue_device, GGML_LAYOUT_AOS, /*on_device=*/true);
+        ggml_sycl::mem_handle src_handle =
+            use_persistent ?
+                ggml_sycl::mem_handle::from_chunk_ptr(host_slice, queue_device, GGML_LAYOUT_AOS, /*on_device=*/false) :
+                host_stage_handle;
+        GGML_ASSERT(dst_handle.valid() && src_handle.valid());
+        sycl::event evt = ggml_sycl::mem_copy_async(dst_handle, src_handle, slice_bytes, queue, deps);
         if (use_persistent) {
             ctx->prev_staging_evt     = evt;
             ctx->has_prev_staging_evt = true;
-        } else if (auto * cache = ggml_sycl::get_unified_cache(queue)) {
-            cache->defer_host_free(host_slice, slice_bytes, evt);
-        } else {
-            if (!ggml_sycl_graph_recording_active()) {
-                evt.wait();
-            }
-            ggml_sycl_free_host_tracked_bytes(host_slice, slice_bytes, queue);
         }
         return evt;
     }
@@ -11108,6 +13964,12 @@ static sycl::event mmvq_stream_copy(sycl::queue &                    queue,
     size_t                   dst_offset = 0;
     std::vector<sycl::event> cur_deps   = deps;
     sycl::event              last_evt;
+    auto                     src_handle =
+        ggml_sycl::mem_handle::from_chunk_ptr(const_cast<uint8_t *>(ctx->src_base), queue_device, GGML_LAYOUT_AOS,
+                                              /*on_device=*/true);
+    auto dst_handle =
+        ggml_sycl::mem_handle::from_chunk_ptr(device_slice, queue_device, GGML_LAYOUT_AOS, /*on_device=*/true);
+    GGML_ASSERT(src_handle.valid() && dst_handle.valid());
 
     for (int i = 0; i < ctx->segment_count; ++i) {
         const auto & seg   = ctx->segments[i];
@@ -11115,9 +13977,8 @@ static sycl::event mmvq_stream_copy(sycl::queue &                    queue,
         if (bytes == 0) {
             continue;
         }
-        const uint8_t * src = ctx->src_base + seg.src_base + src_row * seg.bytes_per_row;
-        void *          dst = static_cast<uint8_t *>(device_slice) + dst_offset;
-        last_evt            = queue.memcpy(dst, src, bytes, cur_deps);
+        const size_t src_offset = seg.src_base + src_row * seg.bytes_per_row;
+        last_evt = ggml_sycl::mem_copy_async(dst_handle, dst_offset, src_handle, src_offset, bytes, queue, cur_deps);
         cur_deps.assign(1, last_evt);
         dst_offset += bytes;
     }
@@ -11571,19 +14432,36 @@ bool ggml_sycl_mxfp4_pair_glu_bench_launch(const mxfp4_pair_glu_bench_args & arg
     if (args.xmx_tiled_pack_q8 && (!args.xmx_tiled || !args.dpas_b_packed || !args.dpas_y_scales)) {
         return false;
     }
-    if (args.xmx_tiled_m_tiles != 1 && args.xmx_tiled_m_tiles != 2) {
+    if (args.xmx_tiled_m_tiles != 1 && args.xmx_tiled_m_tiles != 2 && args.xmx_tiled_m_tiles != 4) {
         return false;
     }
     if (args.xmx_tiled_m_tiles != 1 && (!args.xmx_tiled || args.rows_per_wg != 8)) {
+        return false;
+    }
+    if (args.xmx_tiled_m_tiles == 4 && !args.xmx_tiled_pack_q8) {
         return false;
     }
     if (args.xmx_tiled_prefetch &&
         (!args.xmx_tiled || !args.xmx_tiled_pack_q8 || args.xmx_tiled_m_tiles != 2 || args.rows_per_wg != 8)) {
         return false;
     }
+    if (args.down_q8_soa && (!args.xmx_tiled || !args.xmx_tiled_pack_q8 || args.xmx_tiled_m_tiles != 4 ||
+                             args.rows_per_wg != 8 || args.down_q8_nb11 <= 0)) {
+        return false;
+    }
     if (args.ncols <= 0 || args.ncols_y <= 0 || args.nrows_per_expert <= 0 || args.n_ids <= 0 || args.n_tokens <= 0 ||
         args.ne11 <= 0) {
         return false;
+    }
+    if (args.down_q8_soa) {
+        if ((args.nrows_per_expert % QK8_1) != 0) {
+            return false;
+        }
+        const int64_t q8_row_size =
+            static_cast<int64_t>(args.nrows_per_expert) * static_cast<int64_t>(sizeof(block_q8_1)) / QK8_1;
+        if (args.down_q8_nb11 != q8_row_size) {
+            return false;
+        }
     }
     if (args.ncols % QK_MXFP4 != 0 || args.ids_nb0 <= 0 || args.ids_nb1 <= 0 || args.nb11 <= 0 || args.nb12 <= 0 ||
         args.dst_nb1 <= 0 || args.dst_nb2 <= 0) {
@@ -11757,7 +14635,17 @@ bool ggml_sycl_mxfp4_pair_glu_bench_launch(const mxfp4_pair_glu_bench_args & arg
                     sycl::event pack_event = mxfp4_dpas_pack_q8_single_col_groups_sycl(
                         *args.stream, args.activations_q8_soa, args.dpas_b_packed, args.dpas_y_scales, args.ncols,
                         args.ncols_y, total_batches, args.n_tokens, args.ne11, args.nb11, args.nb12);
-                    if (args.xmx_tiled_m_tiles == 2) {
+                    if (args.xmx_tiled_m_tiles == 4) {
+                        if (args.xmx_tiled_prefetch) {
+                            return false;
+                        }
+                        mxfp4_pair_glu_xmx_tiled_dpas_m4_submit<8>(
+                            *args.stream, args.gate_ptrs, args.up_ptrs, args.dpas_b_packed, args.dpas_y_scales,
+                            args.output, args.ids, args.gate_bias, args.up_bias, args.ncols, args.nrows_per_expert,
+                            total_batches, args.n_tokens, args.ids_nb0, args.ids_nb1, args.dst_nb1, args.dst_nb2,
+                            args.gate_bias_nb1, args.up_bias_nb1, args.glu_op, args.alpha, args.limit, tile_n_total,
+                            pack_event, args.down_q8_soa, args.down_q8_nb11);
+                    } else if (args.xmx_tiled_m_tiles == 2) {
                         if (args.xmx_tiled_prefetch) {
                             mxfp4_pair_glu_xmx_tiled_dpas_m2_submit<8, true>(
                                 *args.stream, args.gate_ptrs, args.up_ptrs, args.dpas_b_packed, args.dpas_y_scales,
@@ -12002,17 +14890,44 @@ bool ggml_sycl_mxfp4_layer_glu_down_bench_launch(const mxfp4_layer_glu_down_benc
          !args.grouped_row_slots || !args.grouped_chunks || !args.grouped_row_starts || args.grouped_n_chunks <= 0)) {
         return false;
     }
+    if (args.xmx_tiled_pack_q8 &&
+        (!args.xmx_tiled_gate_up || !args.dpas_b_packed || !args.dpas_y_scales || args.xmx_tiled_grouped)) {
+        return false;
+    }
+    if (args.xmx_tiled_prefetch && !args.xmx_tiled_pack_q8) {
+        return false;
+    }
+    if (args.xmx_tiled_m_tiles != 1 && args.xmx_tiled_m_tiles != 2 && args.xmx_tiled_m_tiles != 4) {
+        return false;
+    }
+    if (args.xmx_tiled_m_tiles != 1 && (!args.xmx_tiled_gate_up || args.rows_per_wg != 8)) {
+        return false;
+    }
+    if (args.xmx_tiled_m_tiles == 4 && !args.xmx_tiled_pack_q8) {
+        return false;
+    }
+    if (args.xmx_tiled_prefetch && args.xmx_tiled_m_tiles != 2) {
+        return false;
+    }
     const int down_blocks_per_row = args.intermediate_cols / QK_MXFP4;
     if (args.scale_stride_blocks > 0 && args.scale_stride_blocks < down_blocks_per_row) {
         return false;
     }
+    const int64_t total_batches = static_cast<int64_t>(args.n_ids) * static_cast<int64_t>(args.n_tokens);
+    const int64_t ne0_padded    = GGML_PAD(args.intermediate_cols, QK8_1);
+    const int64_t q8_row_size   = ne0_padded * sizeof(block_q8_1) / QK8_1;
+    if (args.down_q8_nb11 != q8_row_size) {
+        return false;
+    }
 
     mxfp4_pair_glu_bench_args pair_args{};
-    pair_args.stream              = args.stream;
-    pair_args.gate_ptrs           = args.gate_ptrs;
-    pair_args.up_ptrs             = args.up_ptrs;
-    pair_args.activations_q8_soa  = args.activations_q8_soa;
-    pair_args.output              = args.glu_f32;
+    pair_args.stream             = args.stream;
+    pair_args.gate_ptrs          = args.gate_ptrs;
+    pair_args.up_ptrs            = args.up_ptrs;
+    pair_args.activations_q8_soa = args.activations_q8_soa;
+    pair_args.output             = args.glu_f32;
+    pair_args.down_q8_soa =
+        args.xmx_tiled_gate_up && args.xmx_tiled_pack_q8 && args.xmx_tiled_m_tiles == 4 ? args.down_q8_soa : nullptr;
     pair_args.ids                 = args.ids;
     pair_args.gate_bias           = args.gate_bias;
     pair_args.up_bias             = args.up_bias;
@@ -12028,12 +14943,16 @@ bool ggml_sycl_mxfp4_layer_glu_down_bench_launch(const mxfp4_layer_glu_down_benc
     pair_args.nb12                = args.activation_nb12;
     pair_args.dst_nb1             = args.glu_nb1;
     pair_args.dst_nb2             = args.glu_nb2;
+    pair_args.down_q8_nb11        = args.down_q8_nb11;
     pair_args.gate_bias_nb1       = args.gate_bias_nb1;
     pair_args.up_bias_nb1         = args.up_bias_nb1;
     pair_args.rows_per_wg         = args.rows_per_wg;
     pair_args.cache_y             = args.cache_y;
     pair_args.xmx_tiled           = args.xmx_tiled_gate_up;
     pair_args.xmx_tiled_grouped   = args.xmx_tiled_grouped;
+    pair_args.xmx_tiled_pack_q8   = args.xmx_tiled_pack_q8;
+    pair_args.xmx_tiled_prefetch  = args.xmx_tiled_prefetch;
+    pair_args.xmx_tiled_m_tiles   = args.xmx_tiled_m_tiles;
     pair_args.xmx_tiles_n         = args.xmx_tiles_n;
     pair_args.vector_qs_load      = args.vector_qs_load;
     pair_args.ignore_weight_scale = args.ignore_weight_scale;
@@ -12045,6 +14964,8 @@ bool ggml_sycl_mxfp4_layer_glu_down_bench_launch(const mxfp4_layer_glu_down_benc
     pair_args.grouped_chunks      = args.grouped_chunks;
     pair_args.grouped_row_starts  = args.grouped_row_starts;
     pair_args.grouped_n_chunks    = args.grouped_n_chunks;
+    pair_args.dpas_b_packed       = args.dpas_b_packed;
+    pair_args.dpas_y_scales       = args.dpas_y_scales;
     pair_args.glu_op              = args.glu_op;
     pair_args.alpha               = args.alpha;
     pair_args.limit               = args.limit;
@@ -12052,15 +14973,12 @@ bool ggml_sycl_mxfp4_layer_glu_down_bench_launch(const mxfp4_layer_glu_down_benc
         return false;
     }
 
-    const int64_t total_batches = static_cast<int64_t>(args.n_ids) * static_cast<int64_t>(args.n_tokens);
-    const int64_t ne0_padded    = GGML_PAD(args.intermediate_cols, QK8_1);
-    const int64_t q8_row_size   = ne0_padded * sizeof(block_q8_1) / QK8_1;
-    if (args.down_q8_nb11 != q8_row_size) {
-        return false;
+    const bool down_q8_fused = pair_args.down_q8_soa != nullptr;
+    if (!down_q8_fused) {
+        quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(args.glu_f32, static_cast<char *>(args.down_q8_soa),
+                                                              args.intermediate_cols, total_batches, ne0_padded,
+                                                              args.stream);
     }
-    quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(args.glu_f32, static_cast<char *>(args.down_q8_soa),
-                                                          args.intermediate_cols, total_batches, ne0_padded,
-                                                          args.stream);
 
     mxfp4_mmv_id_bench_args down_args{};
     down_args.stream              = args.stream;
@@ -12339,7 +15257,7 @@ bool ggml_sycl_mxfp4_mmv_id_xmx_tiled_bench_launch(const mxfp4_mmv_id_xmx_tiled_
         constexpr int repeat = GGML_SYCL_MXFP4_MOE_XMX_M;
         constexpr int exec_n = GGML_SYCL_MXFP4_MOE_XMX_N;
         constexpr int k_per  = GGML_SYCL_MXFP4_MOE_XMX_K;
-        if (args.n_tokens != 1 || (args.ncols % k_per) != 0) {
+        if ((args.ncols % k_per) != 0) {
             return false;
         }
         const int device_id = ggml_sycl_get_device_id_from_queue(*args.stream);
@@ -12352,7 +15270,16 @@ bool ggml_sycl_mxfp4_mmv_id_xmx_tiled_bench_launch(const mxfp4_mmv_id_xmx_tiled_
             return false;
         }
         const int total_batches = args.n_ids * args.n_tokens;
-        if (!args.dpas_b_packed || !args.dpas_y_scales) {
+        if (args.grouped_expert_ids && args.grouped_offsets && args.grouped_row_slots && args.grouped_chunks &&
+            args.grouped_row_starts && args.grouped_n_chunks > 0) {
+            mxfp4_i8_grouped_direct_q8_sycl<repeat>(
+                *args.stream, args.expert_ptrs, args.activations_q8_soa, args.output, args.grouped_expert_ids,
+                args.grouped_offsets, args.grouped_row_slots, args.grouped_chunks, args.grouped_row_starts, args.ncols,
+                args.ncols_y, args.nrows_per_expert, args.grouped_n_chunks, args.n_tokens, args.ne11, args.nb11,
+                args.nb12, args.dst_nb1, args.dst_nb2, /*scale_stride_blocks=*/0);
+            return true;
+        }
+        if (args.n_tokens != 1 || !args.dpas_b_packed || !args.dpas_y_scales) {
             return false;
         }
         sycl::event pack_event = mxfp4_dpas_pack_q8_single_col_groups_sycl(
