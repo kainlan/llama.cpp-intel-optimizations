@@ -65,6 +65,11 @@ static std::atomic<uint64_t> g_runtime_alloc_id{ 1 };
 struct runtime_alloc_record {
     alloc_handle  handle{};
     sycl::queue * queue            = nullptr;
+    // Owning copy of *queue (sycl::queue is a shared handle). Frees can run
+    // long after the allocating queue object was destroyed (e.g. mem_handle
+    // owners released during backend-context teardown, or init-time probe
+    // staging buffers), so sycl::free must use this keepalive, never *queue.
+    std::optional<sycl::queue> queue_keepalive;
     bool          uses_pinned_pool = false;
     bool          zone_managed     = false;
     bool          from_arena       = false;                // True if sub-allocated from arena (KV/RUNTIME/etc zone)
@@ -7307,10 +7312,11 @@ static bool unified_free_record(const runtime_alloc_record & rec) {
                     }
                 }
             } else {
-                // Non-pinned pool: free each segment individually
+                // Non-pinned pool: free each segment individually.
+                // rec.queue may dangle by now; only the keepalive copy is safe.
                 for (const auto & seg : rec.handle.all_segments) {
-                    if (rec.queue != nullptr && seg.ptr != nullptr) {
-                        sycl::free(seg.ptr, *rec.queue);
+                    if (rec.queue_keepalive.has_value() && seg.ptr != nullptr) {
+                        sycl::free(seg.ptr, *rec.queue_keepalive);
                     } else if (seg.ptr != nullptr && rec.handle.device >= 0 &&
                                rec.handle.device < GGML_SYCL_MAX_DEVICES) {
                         auto & q = ggml_sycl_get_device(rec.handle.device).default_queue();
@@ -7338,8 +7344,9 @@ static bool unified_free_record(const runtime_alloc_record & rec) {
             }
             // Zone-managed host allocations are reclaimed by zone reset or pool
             // destruction, not individual free().
-        } else if (rec.queue != nullptr && rec.handle.ptr != nullptr) {
-            sycl::free(rec.handle.ptr, *rec.queue);
+        } else if (rec.queue_keepalive.has_value() && rec.handle.ptr != nullptr) {
+            // rec.queue may dangle by now; only the keepalive copy is safe.
+            sycl::free(rec.handle.ptr, *rec.queue_keepalive);
         } else if (rec.handle.ptr != nullptr && rec.handle.device >= 0 && rec.handle.device < GGML_SYCL_MAX_DEVICES) {
             auto & q = ggml_sycl_get_device(rec.handle.device).default_queue();
             sycl::free(rec.handle.ptr, q);
@@ -7798,6 +7805,9 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     rec.handle.host_zone    = out->host_zone;
     rec.handle.all_segments = std::move(out->all_segments);  // Preserve segments from zone alloc path
     rec.queue               = req.queue;
+    if (req.queue != nullptr) {
+        rec.queue_keepalive = *req.queue;
+    }
     rec.uses_pinned_pool    = uses_pinned_pool;
     rec.zone_managed        = zone_managed;
     rec.from_arena          = from_arena;
@@ -9963,6 +9973,7 @@ static alloc_handle unified_cache_adopt_raw_host_allocation(void *           ptr
     runtime_alloc_record rec{};
     rec.handle           = handle;
     rec.queue            = &queue;
+    rec.queue_keepalive  = queue;
     rec.uses_pinned_pool = false;
     rec.zone_managed     = false;
     rec.from_arena       = false;
@@ -9999,6 +10010,7 @@ static alloc_handle unified_cache_adopt_raw_device_allocation(void *           p
     runtime_alloc_record rec{};
     rec.handle           = handle;
     rec.queue            = &queue;
+    rec.queue_keepalive  = queue;
     rec.uses_pinned_pool = false;
     rec.zone_managed     = false;
     rec.from_arena       = false;
@@ -13324,6 +13336,17 @@ static bool planner_mxfp4_i8_supported(const placement_entry & entry, int device
     return caps.supports_int8 && xmx_capabilities_support_sub_group(caps, GGML_SYCL_MXFP4_MOE_XMX_SG);
 }
 
+// Mirrors ggml_sycl_xmx_moe_forced(): GGML_SYCL_XMX_MOE=1 re-enables the
+// diagnostic-only prompt XMX path, which consumes XMX_TILED primaries
+// directly, so the PP-safe SOA promotion must stand down.
+static bool planner_xmx_moe_forced() {
+    static const bool forced = [] {
+        const char * env = std::getenv("GGML_SYCL_XMX_MOE");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return forced;
+}
+
 static bool planner_xmx_tiled_moe_enabled() {
     const char * env = std::getenv("GGML_SYCL_XMX_MOE_TILED");
     if (env) {
@@ -15228,6 +15251,16 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
             }
         }
         maybe_upgrade_moe_down_layouts_to_i8(plan, remaining, device_id, n_experts);
+        // Promote XMX_TILED gate/up primaries to PP-safe SOA when the prompt
+        // XMX path cannot consume them (it is diagnostic-only unless
+        // GGML_SYCL_XMX_MOE=1). Without this, PP re-materializes ~97% of
+        // experts per op through a tiny staging window because the SOA
+        // alternates never fit after the down-I8 upgrade (B50 GPT-OSS pp512
+        // 1255 -> 322, bead llama.cpp-xb2ar).
+        if (!planner_xmx_moe_forced()) {
+            promote_single_moe_pp_gate_up_primary_layouts_to_soa(plan, remaining, device_id, kv_info, envelope,
+                                                                 nullptr);
+        }
         add_single_moe_pp_executable_alternates(plan, remaining, device_id, kv_info, envelope, nullptr);
         maybe_upgrade_moe_gate_up_layouts_to_i8(plan, remaining, device_id, n_experts);
         log_moe_triplet_pack_stats("PLACEMENT-MOE", stats, remaining);
