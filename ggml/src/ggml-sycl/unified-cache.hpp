@@ -1505,6 +1505,15 @@ class unified_cache {
     // pointer mirrors after the canonical entry is gone.
     bool drop_expert_entry(ggml_sycl_cache_id key, const char * reason = nullptr);
 
+    // Drop the given experts' entries whose materialized layout matches,
+    // releasing the direct-table insert handles that pin them first.
+    // Returns the number of cache entries dropped. Used by the phase-layout
+    // swap to release the SOA residency after a successful XMX_TILED
+    // rematerialization.
+    size_t drop_expert_entries_for_tensor_layout(const std::vector<ggml_sycl_cache_id> & expert_keys,
+                                                 ggml_layout_mode                        layout,
+                                                 const char *                            reason = nullptr);
+
     // Fast O(1) lookup for inference-time weight resolution.
     // Returns nullptr if not staged.  No allocation, no state machine.
     const weight_entry * lookup_weight(ggml_sycl_cache_id key) const;

@@ -3496,6 +3496,86 @@ bool unified_cache::drop_expert_entry(ggml_sycl_cache_id key, const char * reaso
     return dropped_any;
 }
 
+size_t unified_cache::drop_expert_entries_for_tensor_layout(const std::vector<ggml_sycl_cache_id> & expert_keys,
+                                                            ggml_layout_mode                        layout,
+                                                            const char *                            reason) {
+    // Phase 1: release the direct-table records. Each holds a
+    // shared_ptr<mem_handle> created at insert time that keeps the cache
+    // entry's in_use_count pinned; the handles must be destroyed outside
+    // both locks so their release callbacks cannot deadlock against us.
+    std::vector<std::shared_ptr<mem_handle>> doomed_handles;
+    {
+        std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_);
+        for (const ggml_sycl_cache_id & key : expert_keys) {
+            if (!key.valid) {
+                continue;
+            }
+            auto it = direct_expert_entries_.find(key);
+            if (it == direct_expert_entries_.end() || it->second.layout != layout) {
+                continue;
+            }
+            if (it->second.handle) {
+                doomed_handles.push_back(std::move(it->second.handle));
+            }
+            direct_expert_entries_.erase(it);
+        }
+    }
+    doomed_handles.clear();
+
+    // Phase 2: drop the now-unpinned cache entries.
+    size_t dropped        = 0;
+    size_t skipped_in_use = 0;
+    {
+        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+        for (const ggml_sycl_cache_id & key : expert_keys) {
+            if (!key.valid) {
+                continue;
+            }
+            std::vector<unified_cache_key> candidates;
+            candidates.push_back(make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, layout));
+            candidates.push_back(unified_cache_key{ cache_entry_type::MOE_EXPERT, key, -1, -1 });
+            auto mapped = id_to_key_.find(key);
+            if (mapped != id_to_key_.end()) {
+                candidates.push_back(mapped->second);
+            }
+            for (const unified_cache_key & ckey : candidates) {
+                auto it = entries_.find(ckey);
+                if (it == entries_.end() || it->second.layout != layout) {
+                    continue;
+                }
+                unified_cache_entry & entry = it->second;
+                if (entry.state == cache_entry_state::IN_PROGRESS && entry.has_ready_event &&
+                    !event_complete(entry.ready_event)) {
+                    continue;
+                }
+                if (entry.in_use_count.load() != 0) {
+                    skipped_in_use++;
+                    continue;
+                }
+                release_entry_allocation_locked(entry);
+                if (!entry.storage_owner && entry.device_ptr && !entry.host_resident) {
+                    has_evictions_.store(true, std::memory_order_release);
+                }
+                id_to_key_.erase(key);
+                entries_.erase(it);
+                dropped++;
+            }
+        }
+        if (dropped > 0) {
+            cache_generation_bump();
+        }
+    }
+    if ((dropped > 0 || skipped_in_use > 0 || !expert_keys.empty()) && moe_direct_trace_enabled()) {
+        fprintf(stderr,
+                "[MOE-DROP] tensor-layout keys=%zu layout=%d dropped=%zu skipped_in_use=%zu "
+                "reason=%s avail=%.1fMB largest=%.1fMB\n",
+                expert_keys.size(), (int) layout, dropped, skipped_in_use, reason ? reason : "",
+                zone_available(vram_zone_id::WEIGHT) / (1024.0 * 1024.0),
+                zone_largest_free(vram_zone_id::WEIGHT) / (1024.0 * 1024.0));
+    }
+    return dropped;
+}
+
 void unified_cache::register_host_expert(ggml_sycl_cache_id key,
                                          void *             ptr,
                                          size_t             size,
