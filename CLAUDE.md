@@ -165,6 +165,38 @@ const llama_rope_type rope_type;  // OK (no enum keyword)
 - **Public API types**: Use `int32_t` etc., `size_t` for allocation sizes
 - **File naming**: C/C++ lowercase with dashes (e.g., `unified-kernel.cpp`), Python lowercase with underscores
 
+## Hard-Won Rules (Workflow, Safety, Architecture)
+
+Confirmed lessons from prior work on this fork. Treat them as defaults.
+
+### Communication & Workflow
+- **The user reads Discord, not the terminal.** CLI output is invisible to them. Any question, confirmation, decision prompt, or status update intended for the user MUST go through the Discord reply tool (the harness injects the channel id each session). Terminal text is logging only — never "await a reply" there.
+- **Work in-place on the active feature branch** (currently `feature/sycl-coalescing`); skip git worktrees. A worktree forces a fresh `build/` and loses the ~10-min ccache-warm hit rate. When reviewing diffs, bound by BASE_SHA/HEAD_SHA, not "everything on the branch."
+- **Fix-forward, never revert.** If a build or correctness test fails mid-implementation, diagnose and fix in a new commit. Don't `git revert` or `git checkout --` to undo progress.
+- **Verify correctness before claiming any perf win.** `llama-bench` measures tok/s only — a change can boost throughput by silently skipping or mis-staging work and still emit garbage tokens. Before committing any change to kernel dispatch, weight staging, graph replay, or allocation routing, run the canonical completion gate and confirm the output. A fake +19.6% PP "win" shipped this way once and had to be reverted.
+
+  Canonical gate — output must end `6, 7, 8, 9, 10, 11, 12, 13, 14, 15`:
+  ```bash
+  ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
+    -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+    -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
+  ```
+  Anything else (`###...`, `!!!...`, repetition, `<unk>`) means the path is broken — fix or revert before commit, no matter the throughput number.
+
+### Safety (these have wedged or OOM-locked this host)
+- **Never run `test-backend-ops` in a subagent or background task.** It allocates hundreds of GPU BOs whose TTM shmem backing grows to 50–224 GB and trips the OOM killer (two lockups on 2026-04-06). For automated GPU testing use only `llama-bench`, `llama-completion`, or a targeted `ctest -R <name>`. Run `test-backend-ops` manually, with monitoring, only.
+- **Always `timeout 60` GPT-OSS 20B test runs.** The historical host-MoE-routing wedge (GuC `guc_id=6`, unrecoverable system death) was closed by commit `ec7f04ac4`, but keep the timeout as a guard. Distinguish the userspace wedge (`guc_id=6`, attributed `in <llama-bench>`, unrecoverable) from the benign environmental XE timeout (`guc_id=0`, `in no process [-1]`, auto-recovers).
+- **Benchmark numbers are invalid after any crash/kill on that card** (xe GT-reset cascades) — check `dmesg` first. `SAFE_MODE`/op-timing diagnostics can themselves wedge cards.
+
+### Architecture
+- **The unified cache owns all GPU/host memory** (decision Feb 9, 2026). Weight placement, eviction (device→pinned host→mmap), and budget tracking all flow through it.
+- **Use smart handles, never hold a raw `void*` from the cache.** A raw VRAM pointer becomes dangling the moment the cache evicts to host → DEVICE_LOST/corruption. Handles must resolve location on dereference so the cache can move data between tiers transparently.
+- **Host-resident weights → CPU dispatch, not GPU PCIe "zero-copy."** Measured CPU AOS = 18–30 GB/s vs GPU zero-copy = 11.3 GB/s (1.6–2.6x slower). Parallelize CPU work with GPU via `sycl::depends_on` (~9.7 µs cross-device latency). Never feed a host-pinned pointer to a GPU kernel as "zero-copy."
+- **The VRAM budget calc is correct by design** (`min(total*pct, free_at_init)`). Low free VRAM is a system problem (other GPUs active, driver overhead), not an app bug to "fix" by ignoring free VRAM — fix the root cause at the system level.
+- **Small-block dequant (Q4_0/Q8_0/Q4_K) belongs on standard SYCL, not ESIMD.** ESIMD measured 1.9x SLOWER on Arc B580 + oneAPI 2025.3 (block granularity too small to amortize LSC loads). The real dequant lever is structural — fuse dequant into the matmul. Opt-in retest hatch: `GGML_SYCL_ESIMD_DEQUANT=1`.
+
+> Live debugging state (active bug investigations, bisect results, perf-regression hunts) lives in **beads** (`bd ready`, `bd list`), not here. This section is for settled rules only.
+
 ## Development Workflow (Machine-Specific)
 
 ### Model Locations
@@ -230,9 +262,11 @@ sudo ldconfig
 ```
 
 Validation on 2026-05-30:
-`sycl-ls` reports B580 and B50 Level Zero devices on driver `1.15.38646`, and
-`ONEAPI_DEVICE_SELECTOR=level_zero:0,1` can run a full GPT-OSS bench through
-llama.cpp's isolated/host-bounce path. Raw SYCL and Level Zero direct
+`sycl-ls` historically reported B580 and B50 Level Zero devices on driver
+`1.15.38646`, and `ONEAPI_DEVICE_SELECTOR=level_zero:0,1` could run a full
+GPT-OSS bench through llama.cpp's isolated/host-bounce path. Do not use
+`sycl-ls` for B50 probing now; see the 2026-06-07 B50 safety note below. Raw
+SYCL and Level Zero direct
 device-to-device USM copy between B580 and B50 still fails
 (`UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` / `ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY`),
 and importing a B580 device allocation on the B50 returns
@@ -262,31 +296,29 @@ are display IDs, not valid selector values.
 
 This system has 3 GPUs: Arc B580 (device 0), Arc Pro B50 (device 1), iGPU (device 2).
 
-As of 2026-05-10 after the ECC-off reboot, the B50 initializes with
-`ONEAPI_DEVICE_SELECTOR=level_zero:1`, reports `Memory ECC: Current disabled /
-Pending disabled`, and can run the Mistral 7B Q4_0 completion gate. ECC-off is
-a workstation performance setting with a reliability tradeoff: it raises B50
-reported VRAM from ~14.3 GiB to ~16.3 GiB and improves Mistral 7B Q4_0 from
-~1053 PP512 / ~40 TG128 to ~1197 PP512 / ~44 TG128.
-
-GPT-OSS 20B now fits and runs on the B50-only path. The all-GPU
-`level_zero:0,1` / `level_zero:gpu` path still hits
-`UR_RESULT_ERROR_DEVICE_LOST` in `MUL_MAT`, so use a single-device selector for
-GPT-OSS quick gates.
+As of 2026-06-07 after a fresh reboot and removal of repo-side selector guards,
+single-GPU B50 validation can run with `ONEAPI_DEVICE_SELECTOR=level_zero:1`.
+Do not add backend or harness code that parses, rewrites, or refuses
+`ONEAPI_DEVICE_SELECTOR`; device selection belongs to oneAPI/SYCL. Previous-boot
+evidence and P2P topology warnings must not alter fresh-boot SYCL selection
+behavior. `sycl-ls` is still not a preferred B50 health probe because it has
+previously wedged this host in `ttm_resource_manager_usage -> drm_ioctl ->
+xe_drm_ioctl` after a reset/oops sequence.
 
 ```bash
-# List available devices
-sycl-ls
-
-# REQUIRED: Select Arc B580 (device 0) for stable operation
+# Select an explicit Level Zero device set.
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench ...
-
-# Select all Level Zero GPUs
-ONEAPI_DEVICE_SELECTOR=level_zero:gpu ./build/bin/llama-bench ...
+ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench ...
+ONEAPI_DEVICE_SELECTOR=level_zero:0,1 ./build/bin/llama-bench ... # host-bounce paths required
 
 # NOTE: GGML_SYCL_VISIBLE_DEVICES=0 does NOT work - it filters at llama.cpp level
 # but unified cache still sees all Level Zero devices. Use ONEAPI_DEVICE_SELECTOR.
 ```
+
+Current-boot B580/B50 P2P topology warnings are diagnostic only; direct
+peer-copy paths must stay disabled unless probed safe, but host-bounce
+validation may continue. Frigate QSV/OpenVINO jobs on the iGPU render node are
+not B580/B50 consumers.
 
 ### Performance Expectations (Mistral 7B Q4_0, Arc B580)
 
@@ -302,7 +334,7 @@ ONEAPI_DEVICE_SELECTOR=level_zero:gpu ./build/bin/llama-bench ...
 | TG128 (persistent TG, phase) | ~30 | `GGML_SYCL_PERSISTENT_TG=1` (experimental) |
 | TG128 (persistent TG, DAG) | ~19 | `GGML_SYCL_PERSISTENT_TG=1` + `PHASE=0 DAG=1` |
 
-### Performance Expectations (Arc Pro B50, ECC Disabled)
+### Historical Performance Expectations (Arc Pro B50, ECC Disabled)
 
 Mistral 7B Q4_0:
 
@@ -319,9 +351,9 @@ GPT-OSS 20B MXFP4:
 
 | Device selector | PP512 tok/s | TG128 tok/s | Notes |
 |-----------------|------------:|------------:|-------|
-| `level_zero:1` B50 ECC-off | ~169 | ~17 | Fits in 16.3 GiB reported VRAM |
+| `level_zero:1` B50 ECC-off | current ~926; target >1100 | current ~48; target ~50+ | Fresh-boot B50 smoke passes; PP target still unmet |
 | `level_zero:0` B580 | ~66 | ~17 | Smaller VRAM budget causes more pressure |
-| `level_zero:0,1` | fails | fails | `UR_RESULT_ERROR_DEVICE_LOST` multi-device L0 regression |
+| `level_zero:0,1` | TBD | TBD | Use isolated/host-bounce transfer paths; direct P2P is not available |
 
 ### SYCL Environment Variables
 
@@ -337,7 +369,7 @@ GPT-OSS 20B MXFP4:
 **Experimental (opt-in, off by default)**:
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `GGML_SYCL_PP_PIPELINE=1` | OFF | Enable double-buffered FP16 weight dequant prefetch. Correct after the layout-mismatch fix, but provides no measured throughput gain on Arc B580 (dequant + GEMM compete for the same compute engine — overlap doesn't materialize). Left opt-in for future overlap research. |
+| `GGML_SYCL_PP_PIPELINE=1` | OFF | Enable double-buffered FP16 weight dequant prefetch. B50 GPT-OSS `llama-bench` PP improves to ~1030-1043 tok/s, but GPT-OSS chat correctness currently fails with repeated `isNaN`, so keep this opt-in until fixed. |
 
 **Kernel dispatch tuning**:
 | Variable | Effect |
@@ -407,7 +439,6 @@ GGML_SYCL_PERSISTENT_TG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
 | `GGML_SYCL_NAN_CHECK=1` | Enable NaN detection in outputs |
 | `GGML_SYCL_VALIDATE=1` | Enable A/B validation between kernel paths |
 | `GGML_SYCL_GRAPH_RERECORD=1` | Use graph re-record instead of replay (very slow, diagnostic only) |
-| `GGML_SYCL_XMX_TILED_PP_PROOF=1` | Keep XMX-tiled GPT-OSS MoE gate/up layouts for PP proof runs; diagnostic only, not the intended default policy |
 | `GGML_SYCL_OP_TIMEOUT_MS=<N>` | Abort with diagnostic if no inference progress for N ms (default 30000, set to 0 to disable). Fires before the xe driver's 10s GT-reset cascade. Effective detection latency is `timeout + ~500 ms`. |
 | `GGML_SYCL_SAFE_MODE=1` | Drain the SYCL queue after every op submit so a fault surfaces at the op that caused it (2-3x slowdown, implies `GGML_SYCL_DISABLE_GRAPH=1`). Useful for CI canaries and correlating intermittent wedges 1:1 with their triggering op. |
 
@@ -419,8 +450,9 @@ GGML_SYCL_PERSISTENT_TG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
 1. Format code: `git clang-format` (preferred) or `clang-format-19 -i <files>`
 2. Build: `./scripts/sycl-build.sh`
 3. Test: `ctest --test-dir build --output-on-failure`
-4. For ggml changes: Run `test-backend-ops` on multiple backends
-5. Verify performance: `llama-bench` and `llama-perplexity` should not regress
+4. For ggml changes: Run `test-backend-ops` on multiple backends — **manually only, never in a subagent/background task (OOM hazard, see Hard-Won Rules)**
+5. Verify correctness: run the canonical completion gate (Hard-Won Rules) — tokens must be right, not just fast
+6. Verify performance: `llama-bench` and `llama-perplexity` should not regress
 
 ### Triggering Heavy CI
 Add `ggml-ci` to commit message to trigger extended CI workloads.
