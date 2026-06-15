@@ -10432,6 +10432,16 @@ void ggml_sycl_moe_pre_allocate_buffers(ggml_backend_sycl_context & ctx, ggml_cg
     GGML_SYCL_DEBUG("[MOE-GRAPH] Pre-allocating %d Q8_1 buffers, %zu bytes each (ne10=%lld, rows=%lld)\n", moe_count,
                     buffer_size, (long long) max_ne10, (long long) max_src1_rows);
 
+    if (!demand.supported || demand.total_bytes == 0 || demand.bytes_per_buffer == 0) {
+        ctx.moe_buffers.free_buffers(stream);
+        GGML_SYCL_DEBUG(
+            "[MOE-GRAPH] Skipping Q8_1 graph scratch preallocation for unsupported/empty demand "
+            "(buffers=%d, bytes_per_buffer=%zu, cols=%lld, rows=%lld, dtype=%d, layout=%d)\n",
+            demand.buffer_count, demand.bytes_per_buffer, (long long) demand.input_cols, (long long) demand.input_rows,
+            demand.weight_type, demand.layout);
+        return;
+    }
+
     // Skip if already initialized with sufficient stable scratch buffers.
     if (ctx.moe_buffers.initialized) {
         const bool count_ok = ctx.moe_buffers.q8_1_buffers.size() >= static_cast<size_t>(moe_count);
@@ -10585,8 +10595,8 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
     auto            submit_memcpy_with_deps = [&](void * dst_ptr, const void * src_ptr, size_t bytes,
                                        const std::vector<sycl::event> & copy_deps) -> sycl::event {
         return mmvq_submit_memcpy_with_deps(*stream, dst_ptr, src_ptr, bytes, copy_deps,
-                                            /*dst_fallback_on_device=*/true,
-                                            /*src_fallback_on_device=*/false);
+                                                       /*dst_fallback_on_device=*/true,
+                                                       /*src_fallback_on_device=*/false);
     };
     std::vector<sycl::event> ready_deps;
     if (deps) {
@@ -10600,6 +10610,11 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
     // For decode (ne12 == 1), there is exactly 1 token row
     const int64_t total_src1_rows = ne11 * ne12;
     const size_t  required_size   = total_src1_rows * q8_1_row_size;
+    if (ne10 <= 0 || ne11 <= 0 || ne12 <= 0 || total_src1_rows <= 0 || q8_1_row_size <= 0 ||
+        required_size == 0) {
+        log_dispatch_reject("invalid-q8-shape");
+        return false;
+    }
 
     const int     runtime_device = ctx.device;
     const float * src1_d         = static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(src1, runtime_device));
@@ -11651,6 +11666,9 @@ bool mmvq_moe_batched_dispatch_pair_mxfp4_soa(ggml_backend_sycl_context & ctx,
     const int64_t q8_1_row_size   = ne10_padded * sizeof(block_q8_1) / QK8_1;
     const int64_t total_src1_rows = ne11 * ne12;
     const size_t  required_size   = total_src1_rows * q8_1_row_size;
+    if (ne10 <= 0 || ne11 <= 0 || total_src1_rows <= 0 || q8_1_row_size <= 0 || required_size == 0) {
+        return false;
+    }
 
     mmvq_deferred_temp_release local_temps(stream);
     void *                     q8_1_buffer = mxfp4_moe_tg_reuse_get_or_alloc_q8(stream, ctx.device, required_size);
@@ -11799,6 +11817,10 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
     const int64_t glu_ne0_padded  = GGML_PAD(ne01, QK8_1);
     const int64_t glu_q8_row_size = glu_ne0_padded * sizeof(block_q8_1) / QK8_1;
     const size_t  glu_q8_bytes    = static_cast<size_t>(total_batches) * static_cast<size_t>(glu_q8_row_size);
+    if (ne10 <= 0 || ne11 <= 0 || total_src1_rows <= 0 || q8_1_row_size <= 0 || required_size == 0 ||
+        glu_q8_row_size <= 0) {
+        return false;
+    }
     const bool    glu_row_contig =
         glu_dst->nb[0] == sizeof(float) && glu_dst->nb[1] == static_cast<size_t>(glu_dst->ne[0]) * sizeof(float);
     const bool fused_glu_q8_candidate = mxfp4_moe_fused_glu_q8_enabled() && ne12 == 1 && (ne01 % QK8_1) == 0 &&
@@ -13108,8 +13130,8 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
         plan_has_host_experts =
             route_cache->moe_tensor_has_host_experts(std::string(src0->name), n_experts, ctx.device);
     }
-    mmvq_moe_trace(src0, "candidate", ctx.device, (int) layout, forced_layout != nullptr, batch_size, -1,
-                   host_weights, use_ptr_table, placement_plan_active, plan_has_host_experts);
+    mmvq_moe_trace(src0, "candidate", ctx.device, (int) layout, forced_layout != nullptr, batch_size, -1, host_weights,
+                   use_ptr_table, placement_plan_active, plan_has_host_experts);
     // Previously returned false here when (placement_plan_active && use_ptr_table).
     // The mixed-ptr check at ~3870-3886 is the architecturally correct gate: it
     // inspects actual expert pointer residency after ggml_sycl_update_moe_ptr_table
@@ -13126,6 +13148,16 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
     // Total rows = ne11 * ne12 (e.g., 4 expert outputs * 1 token = 4 rows)
     const int64_t total_src1_rows = ne11 * ne12;
     const size_t  required_size   = total_src1_rows * q8_1_row_size;
+    if (ne10 <= 0 || ne11 <= 0 || ne12 <= 0 || total_src1_rows <= 0 || q8_1_row_size <= 0 ||
+        required_size == 0) {
+        GGML_SYCL_DEBUG("[MMVQ] Invalid MoE Q8_1 shape for %s (ne10=%lld ne11=%lld ne12=%lld rows=%lld bytes=%zu)\n",
+                        src0->name ? src0->name : "?", (long long) ne10, (long long) ne11, (long long) ne12,
+                        (long long) total_src1_rows, required_size);
+        if (g_ggml_sycl_graph_recording) {
+            ctx.moe_graphs_disabled_once = true;
+        }
+        return false;
+    }
 
     const float *   src1_d = static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(src1, ctx.device));
     sycl::event     ids_copy_event;

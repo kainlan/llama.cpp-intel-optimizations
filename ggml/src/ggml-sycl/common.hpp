@@ -3868,6 +3868,19 @@ inline ggml_sycl::resolved_ptr ggml_sycl_resolve(const ggml_tensor * tensor, int
                     }
                 }
             }
+
+            const char * tensor_name = tensor->name ? tensor->name : "";
+            const bool   is_composite_moe_weight =
+                tensor->ne[2] > 1 && std::strstr(tensor_name, "_exps.weight") != nullptr &&
+                std::strstr(tensor_name, ".bias") == nullptr &&
+                ggml_sycl_get_tensor_usage(tensor) == tensor_usage::MOE_EXPERT_WEIGHT;
+            if (cache->has_placement_plan() && is_composite_moe_weight) {
+                GGML_SYCL_DEBUG(
+                    "[RESOLVE] refusing composite MoE expert tensor materialization for placement-planned '%s' "
+                    "device %d\n",
+                    tensor_name[0] ? tensor_name : "?", device);
+                return result;
+            }
         }
     }
 
@@ -3877,6 +3890,93 @@ inline ggml_sycl::resolved_ptr ggml_sycl_resolve(const ggml_tensor * tensor, int
     if (result.ptr) {
         result.on_device = (ggml_sycl_get_alloc_type(result.ptr) == sycl::usm::alloc::device);
     }
+    return result;
+}
+
+// Non-materializing probe for schedulers and route planners.  This mirrors the
+// smart-handle/cache portions of ggml_sycl_resolve(), but deliberately never
+// falls through to ggml_sycl_get_data_ptr_slow(), which may allocate and copy.
+inline ggml_sycl::resolved_ptr ggml_sycl_resolve_no_materialize(const ggml_tensor * tensor, int device) {
+    ggml_sycl::resolved_ptr result{};
+    if (!tensor || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return result;
+    }
+
+    size_t              view_offset = 0;
+    const ggml_tensor * root        = ggml_sycl_view_root_and_offset(tensor, view_offset);
+    if (!root) {
+        return result;
+    }
+
+    auto set_registered_ptr = [&](void * ptr, layout_mode layout, size_t offset) -> bool {
+        if (!ptr) {
+            return false;
+        }
+        const auto * info = ggml_sycl::alloc_registry::instance().lookup(ptr);
+        if (!info) {
+            return false;
+        }
+        const bool on_device =
+            info->type == ggml_sycl::alloc_type::DEVICE && info->device_id == device;
+        const bool host_accessible =
+            info->type == ggml_sycl::alloc_type::HOST_PINNED || info->type == ggml_sycl::alloc_type::SHARED;
+        if (!on_device && !host_accessible) {
+            return false;
+        }
+        result.ptr       = static_cast<char *>(ptr) + offset;
+        result.layout    = layout;
+        result.on_device = on_device;
+        return true;
+    };
+
+    auto resolve_extra = [&](const ggml_tensor * candidate, size_t offset) -> bool {
+        if (!candidate || !candidate->extra) {
+            return false;
+        }
+        auto *       extra  = static_cast<ggml_tensor_extra_gpu *>(candidate->extra);
+        const auto & handle = extra->data_handle[device];
+        if (handle.device() == device || handle.device() == ggml_sycl::mem_handle::HOST_DEVICE) {
+            auto resolved = handle.resolve(device);
+            if (resolved) {
+                result = resolved;
+                result.ptr = static_cast<char *>(resolved.ptr) + offset;
+                return true;
+            }
+        }
+        return set_registered_ptr(extra->data_device[device], get_effective_layout_mode(extra), offset);
+    };
+
+    if (resolve_extra(root, view_offset)) {
+        return result;
+    }
+    if (root != tensor && resolve_extra(tensor, 0)) {
+        return result;
+    }
+    if (set_registered_ptr(root->data, GGML_LAYOUT_AOS, view_offset)) {
+        return result;
+    }
+
+    const ggml_tensor * weight_tensor = ggml_sycl_tensor_is_weight(root) ? root : tensor;
+    if (ggml_sycl_tensor_is_weight(weight_tensor)) {
+        auto * cache = ggml_sycl::get_unified_cache_for_device(device);
+        if (cache) {
+            ggml_sycl_cache_id key = ggml_backend_sycl_get_weight_cache_key(weight_tensor, device);
+            if (key.valid) {
+                auto wpr = cache->get_weight_ptr(key);
+                if (wpr) {
+                    result.ptr       = wpr.ptr;
+                    result.layout    = wpr.layout;
+                    result.on_device = wpr.on_device;
+                    if (wpr.has_ready_event) {
+                        result.has_ready_event = true;
+                        result.ready_event     = wpr.ready_event;
+                    }
+                    return result;
+                }
+            }
+        }
+    }
+
     return result;
 }
 

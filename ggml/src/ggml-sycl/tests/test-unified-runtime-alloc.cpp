@@ -577,10 +577,57 @@ static bool host_zone_contiguous_alloc_skips_chunk_tail(sycl::queue & q) {
     return true;
 }
 
+static bool host_zone_reset_trims_released_offload_pool_slots(sycl::queue & q) {
+    TEST_BEGIN("host_zone_reset_trims_released_offload_pool_slots");
+    offload_buffer_pool_trim(-1);
+
+    constexpr size_t mib   = 1024ull * 1024ull;
+    unified_cache *  cache = get_unified_cache(q);
+    TEST_ASSERT(cache != nullptr, "cache unavailable");
+    if (!cache->host_zones_configured()) {
+        cache->configure_host_zones(4ull * mib, 4ull * mib, 16ull * mib, 4ull * mib);
+    } else if (cache->host_zone_capacity(host_zone_id::STAGING) < mib) {
+        TEST_ASSERT(cache->host_zone_grow(host_zone_id::STAGING, 16ull * mib), "failed to grow staging zone");
+    }
+    TEST_ASSERT(cache->host_zones_configured(), "host zones were not configured");
+    TEST_ASSERT(cache->host_zone_capacity(host_zone_id::STAGING) >= mib, "staging zone too small");
+
+    offload_buffer_request req{};
+    req.queue                               = &q;
+    req.device                              = -1;
+    req.size                                = 4096;
+    req.role                                = offload_buffer_role::SET_TENSOR_STAGE;
+    req.intent.role                         = alloc_role::STAGING;
+    req.intent.category                     = runtime_category::STAGING;
+    req.intent.cohort_id                    = "test:host_zone_reset";
+    req.intent.constraints.must_host_pinned = true;
+
+    offload_buffer_lease lease{};
+    TEST_ASSERT(acquire_offload_buffer(req, &lease), "acquire failed");
+    TEST_ASSERT(lease.valid && lease.handle.ptr != nullptr, "lease invalid");
+    TEST_ASSERT(lease.handle.zone_managed, "expected zone-managed staging allocation");
+    TEST_ASSERT(lease.handle.host_zone == host_zone_id::STAGING, "expected staging host-zone allocation");
+
+    void *       ptr = lease.handle.ptr;
+    alloc_handle looked{};
+    TEST_ASSERT(unified_lookup(ptr, &looked), "released lease should be registered before reset");
+    TEST_ASSERT(release_offload_buffer(lease), "release failed");
+
+    cache->host_zone_reset(host_zone_id::STAGING);
+    TEST_ASSERT(!unified_lookup(ptr, &looked), "reset should remove released offload-pool registration");
+
+    TEST_PASS();
+    return true;
+}
+
 int main() {
     fprintf(stderr, "===========================================\n");
     fprintf(stderr, "Unified Runtime Allocator Tests\n");
     fprintf(stderr, "===========================================\n");
+
+    if (std::getenv("GGML_SYCL_PINNED_CHUNK_MB") == nullptr) {
+        set_env_var("GGML_SYCL_PINNED_CHUNK_MB", "16");
+    }
 
     sycl::queue q;
     try {
@@ -620,6 +667,7 @@ int main() {
     ok &= offload_transition_wait_stats_split_by_phase();
     ok &= offload_host_alloc_stats_split_by_tag();
     ok &= host_zone_contiguous_alloc_skips_chunk_tail(q);
+    ok &= host_zone_reset_trims_released_offload_pool_slots(q);
 
     fprintf(stderr, "-------------------------------------------\n");
     fprintf(stderr, "Tests: %d run, %d passed\n", g_tests_run, g_tests_passed);

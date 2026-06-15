@@ -8364,6 +8364,33 @@ void offload_buffer_pool_trim(int device) {
     }
 }
 
+static size_t offload_buffer_pool_trim_host_zone(host_zone_id zone) {
+    std::vector<alloc_handle> free_list;
+    {
+        std::lock_guard<std::mutex> lock(g_offload_pool_mutex);
+        for (auto it = g_offload_pool_slots.begin(); it != g_offload_pool_slots.end();) {
+            const offload_pool_slot & slot = it->second;
+            if (!slot.in_use && slot.handle.zone_managed && slot.handle.host_zone == zone) {
+                free_list.push_back(slot.handle);
+                it = g_offload_pool_slots.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        g_offload_pool_free.clear();
+        for (const auto & kv : g_offload_pool_slots) {
+            if (!kv.second.in_use) {
+                g_offload_pool_free[kv.second.key].push_back(kv.first);
+            }
+        }
+    }
+
+    for (const alloc_handle & h : free_list) {
+        (void) unified_free(h);
+    }
+    return free_list.size();
+}
+
 mem_handle unified_allocate(const alloc_request & req) {
     alloc_handle handle;
     if (!unified_alloc(req, &handle) || !handle.ptr) {
@@ -10841,12 +10868,17 @@ void unified_cache::host_zone_reset(host_zone_id zone) {
     }
     GGML_ASSERT(zone != host_zone_id::WEIGHT && "WEIGHT host zone must not be reset");
 
+    // Released offload-pool leases are idle cache entries, not live users.
+    // Detach them before the strict live-allocation scan so the scan only
+    // catches genuinely retained handles/leases in the reset zone.
+    (void) offload_buffer_pool_trim_host_zone(zone);
+
     // Purge registry entries that belong to this host zone.  Without this,
     // zone_reset() recycles TLSF addresses while the registry still maps them,
     // causing duplicate-pointer rejection on retry.
     {
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-        bool live_allocations = false;
+        bool                        live_allocations = false;
         for (auto it = g_runtime_alloc_registry.begin(); it != g_runtime_alloc_registry.end(); ++it) {
             if (it->second.handle.host_zone == zone) {
                 runtime_reset_reclaimed_log_live_locked(it->second, "host-zone-reset");
@@ -10855,29 +10887,6 @@ void unified_cache::host_zone_reset(host_zone_id zone) {
         }
         if (live_allocations) {
             GGML_ABORT("unified_cache host_zone_reset: live registered allocations in reset zone");
-        }
-    }
-
-    // Purge offload pool entries whose backing memory came from this host zone.
-    // The offload pool caches (slot registry + free list) hold raw pointers into
-    // the TLSF arena.  zone_reset() recycles that memory, so any surviving pool
-    // entry becomes a dangling pointer.  Purge before zone_reset so that the
-    // next acquire_offload_buffer() allocates fresh memory from the reset zone.
-    {
-        std::lock_guard<std::mutex> lock(g_offload_pool_mutex);
-        for (auto it = g_offload_pool_slots.begin(); it != g_offload_pool_slots.end();) {
-            if (it->second.handle.host_zone == zone) {
-                it = g_offload_pool_slots.erase(it);
-            } else {
-                ++it;
-            }
-        }
-        // Rebuild free list from surviving slots to remove stale pointers.
-        g_offload_pool_free.clear();
-        for (const auto & kv : g_offload_pool_slots) {
-            if (!kv.second.in_use) {
-                g_offload_pool_free[kv.second.key].push_back(kv.first);
-            }
         }
     }
 
