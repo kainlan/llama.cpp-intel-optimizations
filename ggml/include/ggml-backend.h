@@ -246,6 +246,10 @@ extern "C" {
 
     GGML_API void ggml_backend_device_register(ggml_backend_dev_t device);
 
+    // Disable device backends before backend registry construction.
+    // Intended for explicit CPU-only runs such as --device none.
+    GGML_API void ggml_backend_disable_device_backends(void);
+
     // Backend (reg) enumeration
     GGML_API size_t             ggml_backend_reg_count(void);
     GGML_API ggml_backend_reg_t ggml_backend_reg_get(size_t index);

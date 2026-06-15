@@ -26,6 +26,7 @@
 #include <cinttypes>
 #include <climits>
 #include <cstdarg>
+#include <cstdlib>
 #include <fstream>
 #include <list>
 #include <regex>
@@ -831,6 +832,7 @@ static std::vector<ggml_backend_dev_t> parse_device_list(const std::string & val
         throw std::invalid_argument("no devices specified");
     }
     if (dev_names.size() == 1 && dev_names[0] == "none") {
+        ggml_backend_disable_device_backends();
         devices.push_back(nullptr);
     } else {
         ggml_backend_load_all();
@@ -1094,7 +1096,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params &) {
             fprintf(stderr, "version: %d (%s)\n", llama_build_number(), llama_commit());
             fprintf(stderr, "built with %s for %s\n", llama_compiler(), llama_build_target());
-            exit(0);
+            fflush(stderr);
+            std::_Exit(0);
         }
     ));
     add_opt(common_arg(
@@ -2358,7 +2361,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             } else {
                 params.n_gpu_layers = std::stoi(value);
             }
-            if (!llama_supports_gpu_offload()) {
+            if (params.n_gpu_layers != 0 && !llama_supports_gpu_offload()) {
                 fprintf(stderr, "warning: no usable GPU found, --gpu-layers option will be ignored\n");
                 fprintf(stderr, "warning: one possible reason is that llama.cpp was compiled without GPU support\n");
                 fprintf(stderr, "warning: consult docs/build.md for compilation instructions\n");

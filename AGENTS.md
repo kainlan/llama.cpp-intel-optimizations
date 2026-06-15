@@ -282,6 +282,15 @@ sudo ln -sfn libze_intel_gpu.so.1.14.37435.pre-single-device-default-ctx /usr/li
 sudo ldconfig
 ```
 
+As of 2026-06-15, unowned stale Level Zero loader/tracing/validation libraries
+from `/usr/local/lib` were moved to
+`/usr/local/lib/llama-backup-level-zero-20260615-100931` because they made new
+processes resolve `libze_loader.so.1.27.0` ahead of the packaged
+`/usr/lib/x86_64-linux-gnu` loader. Keep `libze_loader.so.1`,
+`libze_tracing_layer.so.1`, and `libze_validation_layer.so.1` absent from
+`/usr/local/lib`; `ldconfig -p` should resolve them from
+`/usr/lib/x86_64-linux-gnu`.
+
 Validation on 2026-05-30: `sycl-ls` historically reported the B580 and B50
 Level Zero devices on driver `1.15.38646`, and a full GPT-OSS multi-GPU
 llama.cpp bench ran through the isolated/host-bounce path. Do not use
