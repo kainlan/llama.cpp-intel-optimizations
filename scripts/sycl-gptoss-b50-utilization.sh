@@ -7,6 +7,9 @@ MODEL="${MODEL:-/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf}"
 SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:1}"
 OUTDIR="${OUTDIR:-/tmp/b50-gptoss-util.$(date +%Y%m%d-%H%M%S)}"
 
+# shellcheck disable=SC1091
+source "$ROOT/scripts/sycl-gpu-preflight.sh"
+
 PP_TOKENS="${PP_TOKENS:-512}"
 TG_TOKENS="${TG_TOKENS:-128}"
 LONG_TG_TOKENS="${LONG_TG_TOKENS:-1024}"
@@ -146,6 +149,7 @@ run_bench() {
     local log="$OUTDIR/${name}.log"
 
     echo "== $name =="
+    sycl_gpu_preflight_check "$SELECTOR"
     env ONEAPI_DEVICE_SELECTOR="$SELECTOR" GGML_SYCL_OP_TIMEOUT_MS=120000 "${env_args[@]}" \
         "$BENCH" -m "$MODEL" -p "$pp" -n "$tg" -ngl 99 -fa "$fa" -r "$REPS" \
         >"$log" 2>&1
@@ -240,6 +244,7 @@ run_bench_with_telemetry() {
     local telemetry_log="$OUTDIR/${name}.xpu-smi.csv"
 
     echo "== $name with xpu-smi telemetry =="
+    sycl_gpu_preflight_check "$SELECTOR"
     if [[ -z "$xpu_id" ]]; then
         echo "xpu-smi B50 device id not found; running benchmark without telemetry" >&2
         run_bench "$name" "$fa" "$pp" "$tg"

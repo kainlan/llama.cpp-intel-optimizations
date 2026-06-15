@@ -20,6 +20,7 @@
 #include "fattn-xmx-f16.hpp"
 #include "kv-cache-quant.hpp"
 #include "l144i-probe.hpp"
+#include "mem-ops.hpp"
 #include "sycl-profiling.hpp"
 
 #include <atomic>
@@ -62,9 +63,9 @@ ggml_sycl_fattn_xmx_packed_k & ggml_sycl_fattn_xmx_packed_k::operator=(ggml_sycl
     }
     reset();
 
-    alloc       = std::move(other.alloc);
     handle      = std::move(other.handle);
     ready_event = std::move(other.ready_event);
+    ptr         = other.ptr;
     device      = other.device;
     D           = other.D;
     n_kv        = other.n_kv;
@@ -73,9 +74,9 @@ ggml_sycl_fattn_xmx_packed_k & ggml_sycl_fattn_xmx_packed_k::operator=(ggml_sycl
     n_blocks    = other.n_blocks;
     total_bytes = other.total_bytes;
 
-    other.alloc       = {};
     other.handle      = {};
     other.ready_event = {};
+    other.ptr         = nullptr;
     other.device      = -1;
     other.D           = 0;
     other.n_kv        = 0;
@@ -87,18 +88,17 @@ ggml_sycl_fattn_xmx_packed_k & ggml_sycl_fattn_xmx_packed_k::operator=(ggml_sycl
 }
 
 void ggml_sycl_fattn_xmx_packed_k::reset() {
-    if (alloc.ptr != nullptr) {
+    if (handle.valid()) {
         try {
             ready_event.wait();
         } catch (const sycl::exception & e) {
             GGML_LOG_WARN("[SYCL] packed-K materializer event wait failed before free: %s\n", e.what());
         }
-        (void) ggml_sycl::unified_free(alloc);
     }
 
-    alloc       = {};
     handle      = {};
     ready_event = {};
+    ptr         = nullptr;
     device      = -1;
     D           = 0;
     n_kv        = 0;
@@ -111,15 +111,15 @@ void ggml_sycl_fattn_xmx_packed_k::reset() {
 namespace {
 
 struct ggml_sycl_fattn_xmx_packed_k_sidecar_entry {
-    const void *                    k_base = nullptr;
-    size_t                          k_bytes = 0;
-    ggml_sycl::mem_handle           k_handle{};
-    size_t                          k_handle_hash = 0;
-    ggml_sycl_fattn_xmx_packed_k    packed;
+    const void *                 k_base  = nullptr;
+    size_t                       k_bytes = 0;
+    ggml_sycl::mem_handle        k_handle{};
+    size_t                       k_handle_hash = 0;
+    ggml_sycl_fattn_xmx_packed_k packed;
 };
 
-std::mutex                                                                    g_packed_k_sidecar_mutex;
-std::vector<std::unique_ptr<ggml_sycl_fattn_xmx_packed_k_sidecar_entry>>      g_packed_k_sidecars;
+std::mutex                                                               g_packed_k_sidecar_mutex;
+std::vector<std::unique_ptr<ggml_sycl_fattn_xmx_packed_k_sidecar_entry>> g_packed_k_sidecars;
 
 static bool ggml_sycl_fattn_xmx_sidecar_enabled() {
     if (std::getenv("GGML_SYCL_PACKED_K_SIDECAR") != nullptr) {
@@ -152,11 +152,14 @@ static ggml_sycl::mem_handle ggml_sycl_fattn_xmx_root_data_handle(const ggml_ten
         return {};
     }
     if (root->extra != nullptr && target_device < GGML_SYCL_MAX_DEVICES) {
-        auto * extra = static_cast<ggml_tensor_extra_gpu *>(root->extra);
-        auto   h     = extra->data_handle[target_device];
-        auto   r     = h.resolve(target_device);
+        auto *       extra = static_cast<ggml_tensor_extra_gpu *>(root->extra);
+        const auto & h     = extra->data_handle[target_device];
+        if (h.is_weight()) {
+            return {};
+        }
+        auto r = h.resolve(target_device);
         if (r) {
-            return h;
+            return ggml_sycl::mem_handle::from_chunk_ptr(r.ptr, target_device, r.layout, r.on_device);
         }
     }
     if (root->data == nullptr) {
@@ -167,19 +170,18 @@ static ggml_sycl::mem_handle ggml_sycl_fattn_xmx_root_data_handle(const ggml_ten
         if (info->device_id != target_device) {
             return {};
         }
-        return ggml_sycl::mem_handle::from_direct(root->data, GGML_LAYOUT_AOS, true, info->device_id);
+        return ggml_sycl::mem_handle::from_chunk_ptr(root->data, info->device_id, GGML_LAYOUT_AOS, true);
     }
     if (info && (info->type == ggml_sycl::alloc_type::HOST_PINNED || info->type == ggml_sycl::alloc_type::SHARED)) {
-        return ggml_sycl::mem_handle::from_direct(root->data, GGML_LAYOUT_AOS, false,
-                                                  ggml_sycl::mem_handle::HOST_DEVICE);
+        return ggml_sycl::mem_handle::from_chunk_ptr(root->data, target_device, GGML_LAYOUT_AOS, false);
     }
     return {};
 }
 
-static bool ggml_sycl_fattn_xmx_compute_packed_k_bytes(int n_kv,
-                                                       int H_kv,
-                                                       int batch,
-                                                       int * n_blocks,
+static bool ggml_sycl_fattn_xmx_compute_packed_k_bytes(int      n_kv,
+                                                       int      H_kv,
+                                                       int      batch,
+                                                       int *    n_blocks,
                                                        size_t * total_bytes) {
     if (n_blocks) {
         *n_blocks = 0;
@@ -190,9 +192,9 @@ static bool ggml_sycl_fattn_xmx_compute_packed_k_bytes(int n_kv,
     if (n_kv <= 0 || H_kv <= 0 || batch <= 0) {
         return false;
     }
-    const int blocks = (n_kv + GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS - 1) / GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS;
-    const size_t sbatch = static_cast<size_t>(batch);
-    const size_t sheads = static_cast<size_t>(H_kv);
+    const int    blocks  = (n_kv + GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS - 1) / GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS;
+    const size_t sbatch  = static_cast<size_t>(batch);
+    const size_t sheads  = static_cast<size_t>(H_kv);
     const size_t sblocks = static_cast<size_t>(blocks);
     if (sbatch > std::numeric_limits<size_t>::max() / sheads) {
         return false;
@@ -214,35 +216,33 @@ static bool ggml_sycl_fattn_xmx_compute_packed_k_bytes(int n_kv,
     return true;
 }
 
-template <typename TIdx>
-class fattn_xmx_pack_k_set_rows_kernel;
+template <typename TIdx> class fattn_xmx_pack_k_set_rows_kernel;
 
 template <typename TIdx>
-static sycl::event ggml_sycl_fattn_xmx_submit_set_rows_update(
-    const ggml_tensor *                  src0,
-    const ggml_tensor *                  src1,
-    const void *                         src0_ptr,
-    const void *                         index_ptr,
-    int                                  row_offset,
-    int                                  n_kv,
-    int                                  H_kv,
-    int                                  batch,
-    int                                  n_blocks,
-    int                                  heads_per_i02,
-    sycl::half *                         packed_ptr,
-    dpct::queue_ptr                      stream,
-    const sycl::event &                  set_rows_event,
-    const sycl::event &                  zero_event,
-    const sycl::event &                  previous_sidecar_event,
-    bool                                 add_zero_dep,
-    bool                                 add_prev_dep) {
+static sycl::event ggml_sycl_fattn_xmx_submit_set_rows_update(const ggml_tensor * src0,
+                                                              const ggml_tensor * src1,
+                                                              const void *        src0_ptr,
+                                                              const void *        index_ptr,
+                                                              int                 row_offset,
+                                                              int                 n_kv,
+                                                              int                 H_kv,
+                                                              int                 batch,
+                                                              int                 n_blocks,
+                                                              int                 heads_per_i02,
+                                                              sycl::half *        packed_ptr,
+                                                              dpct::queue_ptr     stream,
+                                                              const sycl::event & set_rows_event,
+                                                              const sycl::event & zero_event,
+                                                              const sycl::event & previous_sidecar_event,
+                                                              bool                add_zero_dep,
+                                                              bool                add_prev_dep) {
     const char * src0_base  = static_cast<const char *>(src0_ptr);
     const char * index_base = static_cast<const char *>(index_ptr);
 
-    const int64_t ne00 = src0->ne[0];
-    const int64_t ne01 = src0->ne[1];
-    const int64_t ne02 = src0->ne[2];
-    const int64_t ne03 = src0->ne[3];
+    const int64_t ne00     = src0->ne[0];
+    const int64_t ne01     = src0->ne[1];
+    const int64_t ne02     = src0->ne[2];
+    const int64_t ne03     = src0->ne[3];
     const int64_t idx_ne11 = src1->ne[1] > 0 ? src1->ne[1] : 1;
     const int64_t idx_ne12 = src1->ne[2] > 0 ? src1->ne[2] : 1;
 
@@ -254,8 +254,8 @@ static sycl::event ggml_sycl_fattn_xmx_submit_set_rows_update(
     const int64_t nb12 = src1->nb[2];
 
     const int64_t total_elements = ne00 * ne01 * ne02 * ne03;
-    constexpr int block_size = 64;
-    const int64_t grid_size = (total_elements + block_size - 1) / block_size;
+    constexpr int block_size     = 64;
+    const int64_t grid_size      = (total_elements + block_size - 1) / block_size;
 
     const bool add_set_rows_dep = ggml_sycl_should_add_dependency(set_rows_event);
 
@@ -281,42 +281,40 @@ static sycl::event ggml_sycl_fattn_xmx_submit_set_rows_update(
                 const int64_t i01 = (i - i03 * ne00 * ne01 * ne02 - i02 * ne00 * ne01) / ne00;
                 const int64_t i00 = i - i03 * ne00 * ne01 * ne02 - i02 * ne00 * ne01 - i01 * ne00;
 
-                const int head = static_cast<int>(i02) * heads_per_i02 +
-                                 static_cast<int>(i00 / GGML_SYCL_FATTN_XMX_PACKED_K_D);
+                const int head =
+                    static_cast<int>(i02) * heads_per_i02 + static_cast<int>(i00 / GGML_SYCL_FATTN_XMX_PACKED_K_D);
                 const int d = static_cast<int>(i00 % GGML_SYCL_FATTN_XMX_PACKED_K_D);
 
                 if (head >= H_kv || i03 >= batch) {
                     return;
                 }
 
-                const int64_t i12 = i03 % idx_ne12;
-                const int64_t i11 = i02 % idx_ne11;
-                const int64_t i10 = i01;
-                const int64_t idx_off = i10 * nb10 + i11 * nb11 + i12 * nb12;
-                const int64_t dst_row = static_cast<int64_t>(*reinterpret_cast<const TIdx *>(index_base + idx_off));
+                const int64_t i12      = i03 % idx_ne12;
+                const int64_t i11      = i02 % idx_ne11;
+                const int64_t i10      = i01;
+                const int64_t idx_off  = i10 * nb10 + i11 * nb11 + i12 * nb12;
+                const int64_t dst_row  = static_cast<int64_t>(*reinterpret_cast<const TIdx *>(index_base + idx_off));
                 const int64_t kv_abs64 = static_cast<int64_t>(row_offset) + dst_row;
                 if (kv_abs64 < 0 || kv_abs64 >= n_kv) {
                     return;
                 }
 
-                const int kv_abs = static_cast<int>(kv_abs64);
-                const int block = kv_abs / GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS;
+                const int kv_abs   = static_cast<int>(kv_abs64);
+                const int block    = kv_abs / GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS;
                 const int kv_local = kv_abs - block * GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS;
                 if (block < 0 || block >= n_blocks) {
                     return;
                 }
 
-                const float src_val =
-                    *reinterpret_cast<const float *>(src0_base + i01 * nb01 + i02 * nb02 + i03 * nb03 +
-                                                     i00 * static_cast<int64_t>(sizeof(float)));
+                const float src_val = *reinterpret_cast<const float *>(
+                    src0_base + i01 * nb01 + i02 * nb02 + i03 * nb03 + i00 * static_cast<int64_t>(sizeof(float)));
                 const size_t block_base_half =
                     (((static_cast<size_t>(i03) * static_cast<size_t>(H_kv) + static_cast<size_t>(head)) *
                           static_cast<size_t>(n_blocks) +
                       static_cast<size_t>(block)) *
                      GGML_SYCL_FATTN_XMX_PACKED_K_BYTES_PER_BLOCK) /
                     sizeof(sycl::half);
-                const size_t elem_off_half =
-                    ggml_sycl_fattn_xmx_packed_k_element_offset_half(kv_local, d);
+                const size_t elem_off_half = ggml_sycl_fattn_xmx_packed_k_element_offset_half(kv_local, d);
                 if (elem_off_half != SIZE_MAX) {
                     packed_ptr[block_base_half + elem_off_half] = sycl::half(src_val);
                 }
@@ -328,21 +326,19 @@ static sycl::event ggml_sycl_fattn_xmx_submit_set_rows_update(
 
 ggml_sycl_fattn_xmx_packed_k * ggml_sycl_fattn_xmx_find_packed_k_sidecar(const fattn_params & params,
                                                                          int                  target_device) {
-    if (params.K == nullptr || target_device < 0 || params.ne10 != GGML_SYCL_FATTN_XMX_PACKED_K_D ||
-        params.ne11 <= 0 || params.ne12 <= 0 || params.ne13 <= 0 || !params.K_handle_valid ||
-        params.K_view_offs != 0) {
+    if (params.K == nullptr || target_device < 0 || params.ne10 != GGML_SYCL_FATTN_XMX_PACKED_K_D || params.ne11 <= 0 ||
+        params.ne12 <= 0 || params.ne13 <= 0 || !params.K_handle_valid || params.K_view_offs != 0) {
         return nullptr;
     }
-    const int n_partitions = (params.ne11 + GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS - 1) /
-                             GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS;
+    const int n_partitions =
+        (params.ne11 + GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS - 1) / GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS;
 
     std::lock_guard<std::mutex> lock(g_packed_k_sidecar_mutex);
     for (const auto & entry : g_packed_k_sidecars) {
         const auto & packed = entry->packed;
         if (entry->k_handle.valid() && entry->k_handle_hash == params.K_handle_hash && packed.device == target_device &&
-            packed.D == params.ne10 &&
-            packed.n_kv >= params.ne11 && packed.H_kv == params.ne12 && packed.batch == params.ne13 &&
-            packed.n_blocks >= n_partitions && packed.handle.valid()) {
+            packed.D == params.ne10 && packed.n_kv >= params.ne11 && packed.H_kv == params.ne12 &&
+            packed.batch == params.ne13 && packed.n_blocks >= n_partitions && packed.handle.valid()) {
             return &entry->packed;
         }
     }
@@ -367,10 +363,10 @@ bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows(const ggml_tensor * dst,
     auto debug_reject = [&](const char * reason, const ggml_tensor * root = nullptr) {
         if (std::getenv("GGML_SYCL_PACKED_K_DEBUG") || std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
             static std::atomic<int> count{ 0 };
-            const int limit = std::getenv("GGML_SYCL_PACKED_K_DEBUG_LIMIT") ?
-                                  std::atoi(std::getenv("GGML_SYCL_PACKED_K_DEBUG_LIMIT")) :
-                                  32;
-            const int idx = count.fetch_add(1, std::memory_order_relaxed);
+            const int               limit = std::getenv("GGML_SYCL_PACKED_K_DEBUG_LIMIT") ?
+                                                std::atoi(std::getenv("GGML_SYCL_PACKED_K_DEBUG_LIMIT")) :
+                                                32;
+            const int               idx   = count.fetch_add(1, std::memory_order_relaxed);
             if (idx < limit) {
                 fprintf(stderr,
                         "[SYCL] packed-K SET_ROWS sidecar reject[%d/%d]: %s dst=%s root=%s "
@@ -390,8 +386,8 @@ bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows(const ggml_tensor * dst,
         return debug_reject("unsupported-types");
     }
 
-    size_t view_offs = 0;
-    const ggml_tensor * root = ggml_sycl_fattn_xmx_root_tensor(dst, &view_offs);
+    size_t              view_offs = 0;
+    const ggml_tensor * root      = ggml_sycl_fattn_xmx_root_tensor(dst, &view_offs);
     if (!ggml_sycl_fattn_xmx_is_cache_k_tensor(root) || root->type != GGML_TYPE_F16 || src0->ne[0] <= 0 ||
         src0->ne[0] % GGML_SYCL_FATTN_XMX_PACKED_K_D != 0 || dst->ne[0] != src0->ne[0] || dst->ne[1] <= 0 ||
         src0->ne[2] <= 0 || dst->ne[3] <= 0) {
@@ -399,7 +395,7 @@ bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows(const ggml_tensor * dst,
     }
 
     const int heads_per_i02 = static_cast<int>(src0->ne[0] / GGML_SYCL_FATTN_XMX_PACKED_K_D);
-    const int packed_H_kv = static_cast<int>(src0->ne[2]) * heads_per_i02;
+    const int packed_H_kv   = static_cast<int>(src0->ne[2]) * heads_per_i02;
     if (packed_H_kv <= 0 || src0->ne[3] > dst->ne[3]) {
         return debug_reject("src-shape-exceeds-k-cache", root);
     }
@@ -423,21 +419,21 @@ bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows(const ggml_tensor * dst,
     if (!root_handle.valid()) {
         return debug_reject("missing-k-cache-handle", root);
     }
-    const size_t root_handle_hash = root_handle.hash();
+    const size_t root_handle_hash = root_handle.stable_identity_hash();
 
-    const int n_kv = static_cast<int>(dst->ne[1]);
-    const int H_kv = packed_H_kv;
-    const int batch = static_cast<int>(dst->ne[3]);
-    int n_blocks = 0;
-    size_t total_bytes = 0;
+    const int n_kv        = static_cast<int>(dst->ne[1]);
+    const int H_kv        = packed_H_kv;
+    const int batch       = static_cast<int>(dst->ne[3]);
+    int       n_blocks    = 0;
+    size_t    total_bytes = 0;
     if (!ggml_sycl_fattn_xmx_compute_packed_k_bytes(n_kv, H_kv, batch, &n_blocks, &total_bytes)) {
         return debug_reject("packed-size-overflow", root);
     }
 
     ggml_sycl_fattn_xmx_packed_k_sidecar_entry * entry = nullptr;
-    sycl::event zero_event;
-    bool add_zero_dep = false;
-    bool add_prev_dep = false;
+    sycl::event                                  zero_event;
+    bool                                         add_zero_dep = false;
+    bool                                         add_prev_dep = false;
     {
         std::lock_guard<std::mutex> lock(g_packed_k_sidecar_mutex);
         for (const auto & candidate : g_packed_k_sidecars) {
@@ -448,25 +444,24 @@ bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows(const ggml_tensor * dst,
             }
         }
         if (entry == nullptr) {
-            auto owned = std::make_unique<ggml_sycl_fattn_xmx_packed_k_sidecar_entry>();
-            owned->k_base = root->data;
-            owned->k_bytes = ggml_nbytes(root);
-            owned->k_handle = root_handle;
+            auto owned           = std::make_unique<ggml_sycl_fattn_xmx_packed_k_sidecar_entry>();
+            owned->k_base        = root->data;
+            owned->k_bytes       = ggml_nbytes(root);
+            owned->k_handle      = root_handle;
             owned->k_handle_hash = root_handle_hash;
-            entry = owned.get();
+            entry                = owned.get();
             g_packed_k_sidecars.push_back(std::move(owned));
         }
-        entry->k_base = root->data;
-        entry->k_bytes = ggml_nbytes(root);
-        entry->k_handle = root_handle;
+        entry->k_base        = root->data;
+        entry->k_bytes       = ggml_nbytes(root);
+        entry->k_handle      = root_handle;
         entry->k_handle_hash = root_handle_hash;
 
         ggml_sycl_fattn_xmx_packed_k & packed = entry->packed;
-        const bool reuse_alloc = packed.alloc.ptr != nullptr && packed.device == target_device &&
+        const bool reuse_alloc = packed.handle.valid() && packed.ptr != nullptr && packed.device == target_device &&
                                  packed.D == GGML_SYCL_FATTN_XMX_PACKED_K_D && packed.H_kv == H_kv &&
                                  packed.batch == batch && packed.n_kv >= n_kv && packed.n_blocks >= n_blocks &&
-                                 packed.alloc.tier == ggml_sycl::alloc_tier::DEVICE_VRAM &&
-                                 packed.alloc.size >= total_bytes;
+                                 packed.total_bytes >= total_bytes;
         if (!reuse_alloc) {
             packed.reset();
 
@@ -479,13 +474,22 @@ bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows(const ggml_tensor * dst,
             req.intent.cohort_id                    = "fattn_xmx_packed_k_sidecar";
             req.intent.constraints.must_device      = true;
             req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::KV;
-            if (!ggml_sycl::unified_alloc(req, &packed.alloc) || packed.alloc.ptr == nullptr ||
-                packed.alloc.tier != ggml_sycl::alloc_tier::DEVICE_VRAM) {
+            ggml_sycl::alloc_handle sidecar_owner{};
+            if (!ggml_sycl::unified_alloc(req, &sidecar_owner) || sidecar_owner.ptr == nullptr ||
+                sidecar_owner.tier != ggml_sycl::alloc_tier::DEVICE_VRAM) {
+                if (sidecar_owner.ptr != nullptr) {
+                    (void) ggml_sycl::unified_free(sidecar_owner);
+                }
                 packed.reset();
                 return debug_reject("sidecar-alloc-failed", root);
             }
-            packed.handle = packed.alloc.as_mem_handle();
-            zero_event = stream->memset(packed.alloc.ptr, 0, total_bytes);
+            packed.ptr    = sidecar_owner.ptr;
+            packed.handle = ggml_sycl::mem_handle::from_owned_alloc(std::move(sidecar_owner), GGML_LAYOUT_AOS);
+            if (!packed.handle.valid()) {
+                packed.reset();
+                return debug_reject("sidecar-handle-invalid", root);
+            }
+            zero_event   = ggml_sycl::mem_fill_async(packed.handle, 0, total_bytes, *stream);
             add_zero_dep = ggml_sycl_should_add_dependency(zero_event);
         } else {
             try {
@@ -501,19 +505,19 @@ bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows(const ggml_tensor * dst,
         packed.H_kv        = H_kv;
         packed.batch       = batch;
         packed.n_blocks    = n_blocks;
-        packed.total_bytes = packed.alloc.size;
+        packed.total_bytes = std::max(packed.total_bytes, total_bytes);
 
         try {
             sycl::event update_event =
                 src1->type == GGML_TYPE_I64 ?
                     ggml_sycl_fattn_xmx_submit_set_rows_update<int64_t>(
-                        src0, src1, src0_ptr, index_ptr, row_offset, n_kv, H_kv, batch, n_blocks,
-                        heads_per_i02, static_cast<sycl::half *>(packed.alloc.ptr), stream, set_rows_event, zero_event,
-                        packed.ready_event, add_zero_dep, add_prev_dep) :
+                        src0, src1, src0_ptr, index_ptr, row_offset, n_kv, H_kv, batch, n_blocks, heads_per_i02,
+                        static_cast<sycl::half *>(packed.ptr), stream, set_rows_event, zero_event, packed.ready_event,
+                        add_zero_dep, add_prev_dep) :
                     ggml_sycl_fattn_xmx_submit_set_rows_update<int32_t>(
-                        src0, src1, src0_ptr, index_ptr, row_offset, n_kv, H_kv, batch, n_blocks,
-                        heads_per_i02, static_cast<sycl::half *>(packed.alloc.ptr), stream, set_rows_event, zero_event,
-                        packed.ready_event, add_zero_dep, add_prev_dep);
+                        src0, src1, src0_ptr, index_ptr, row_offset, n_kv, H_kv, batch, n_blocks, heads_per_i02,
+                        static_cast<sycl::half *>(packed.ptr), stream, set_rows_event, zero_event, packed.ready_event,
+                        add_zero_dep, add_prev_dep);
             packed.ready_event = update_event;
             if (out_event) {
                 *out_event = update_event;
@@ -534,10 +538,10 @@ void ggml_sycl_fattn_xmx_unregister_packed_k_range(const void * ptr, size_t size
     if (!ptr || size == 0) {
         return;
     }
-    const uintptr_t begin = reinterpret_cast<uintptr_t>(ptr);
-    const uintptr_t end = begin + size;
+    const uintptr_t             begin = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t             end   = begin + size;
     std::lock_guard<std::mutex> lock(g_packed_k_sidecar_mutex);
-    auto it = g_packed_k_sidecars.begin();
+    auto                        it = g_packed_k_sidecars.begin();
     while (it != g_packed_k_sidecars.end()) {
         const uintptr_t k = reinterpret_cast<uintptr_t>((*it)->k_base);
         if (k >= begin && k < end) {
@@ -585,6 +589,93 @@ class fattn_v2_fill_seq_lens_kernel;
 static bool g_sycl_paged_v2_enabled     = false;
 static bool g_sycl_paged_v2_initialized = false;
 
+// Thread-local FA buffers are freed on normal thread exit, but intentionally
+// leaked during process teardown: SYCL runtime destruction order can make
+// late sycl::free/unified_free unsafe.
+static std::atomic<bool> g_fattn_shutting_down{ false };
+static std::atomic<bool> g_fattn_atexit_registered{ false };
+static std::atomic<int>  g_seq_id_buffer_instances{ 0 };
+static std::atomic<int>  g_seq_id_buffer_allocs{ 0 };
+
+static void fattn_atexit_handler() {
+    g_fattn_shutting_down.store(true);
+}
+
+static void register_fattn_atexit() {
+    bool expected = false;
+    if (g_fattn_atexit_registered.compare_exchange_strong(expected, true)) {
+        std::atexit(fattn_atexit_handler);
+    }
+}
+
+static bool ggml_sycl_fattn_alloc_device_owner(size_t                      bytes,
+                                               sycl::queue *               stream,
+                                               ggml_sycl::alloc_role       role,
+                                               ggml_sycl::runtime_category category,
+                                               const char *                cohort_id,
+                                               void **                     ptr,
+                                               ggml_sycl::mem_handle *&    owner) {
+    if (!stream || !ptr || bytes == 0) {
+        return false;
+    }
+
+    ggml_sycl::alloc_request req{};
+    req.queue                               = stream;
+    req.device                              = ggml_sycl_get_device_id_from_queue(*stream);
+    req.size                                = bytes;
+    req.intent.role                         = role;
+    req.intent.category                     = category;
+    req.intent.cohort_id                    = cohort_id;
+    req.intent.constraints.must_device      = true;
+    req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;
+    req.suppress_failure_log                = true;
+
+    ggml_sycl::alloc_handle device_buffer_owner{};
+    if (!ggml_sycl::unified_alloc(req, &device_buffer_owner) || !device_buffer_owner.ptr ||
+        device_buffer_owner.tier != ggml_sycl::alloc_tier::DEVICE_VRAM) {
+        return false;
+    }
+
+    ggml_sycl::mem_handle handle =
+        ggml_sycl::mem_handle::from_owned_alloc(std::move(device_buffer_owner), GGML_LAYOUT_AOS);
+    auto resolved = handle.resolve(req.device);
+    if (!resolved || !resolved.on_device || !resolved.ptr) {
+        handle = {};
+        return false;
+    }
+
+    owner = new ggml_sycl::mem_handle(std::move(handle));
+    *ptr  = resolved.ptr;
+    return true;
+}
+
+template <typename T>
+static bool ggml_sycl_fattn_alloc_device_owner_t(size_t                      count,
+                                                 sycl::queue *               stream,
+                                                 ggml_sycl::alloc_role       role,
+                                                 ggml_sycl::runtime_category category,
+                                                 const char *                cohort_id,
+                                                 T *&                        ptr,
+                                                 ggml_sycl::mem_handle *&    owner) {
+    void * raw = nullptr;
+    if (!ggml_sycl_fattn_alloc_device_owner(count * sizeof(T), stream, role, category, cohort_id, &raw, owner)) {
+        ptr = nullptr;
+        return false;
+    }
+    ptr = static_cast<T *>(raw);
+    return true;
+}
+
+template <typename T>
+static void ggml_sycl_fattn_release_owner(T *& ptr, size_t & capacity, ggml_sycl::mem_handle *& owner) {
+    if (owner) {
+        delete owner;
+        owner = nullptr;
+    }
+    ptr      = nullptr;
+    capacity = 0;
+}
+
 static void init_paged_v2_config() {
     if (g_sycl_paged_v2_initialized) {
         return;
@@ -607,28 +698,35 @@ static void init_paged_v2_config() {
 // to work with the existing contiguous 3D KV cache layout.
 
 struct v2_auto_buffers {
-    int32_t * block_table          = nullptr;  // Identity block table [num_seqs, max_blocks]
-    int32_t * seq_lens             = nullptr;  // Sequence lengths [num_seqs]
-    size_t    block_table_capacity = 0;        // Current capacity in elements
-    size_t    seq_lens_capacity    = 0;        // Current capacity in elements
+    int32_t *               block_table          = nullptr;  // Identity block table [num_seqs, max_blocks]
+    int32_t *               seq_lens             = nullptr;  // Sequence lengths [num_seqs]
+    size_t                  block_table_capacity = 0;        // Current capacity in elements
+    size_t                  seq_lens_capacity    = 0;        // Current capacity in elements
+    ggml_sycl::mem_handle * block_table_owner    = nullptr;
+    ggml_sycl::mem_handle * seq_lens_owner       = nullptr;
 
     // Persistent temp buffers for V2 kernel (avoids malloc/free during graph recording)
     // Layout: [exp_sums | max_logits | tmp_out]
-    void * temp_buf          = nullptr;
-    size_t temp_buf_capacity = 0;  // Current capacity in bytes
+    void *                  temp_buf          = nullptr;
+    size_t                  temp_buf_capacity = 0;  // Current capacity in bytes
+    ggml_sycl::mem_handle * temp_buf_owner    = nullptr;
 
     sycl::queue * alloc_queue = nullptr;
 
+    v2_auto_buffers() { register_fattn_atexit(); }
+
     ~v2_auto_buffers() {
-        if (block_table && alloc_queue) {
-            sycl::free(block_table, *alloc_queue);
+        if (g_fattn_shutting_down.load(std::memory_order_acquire)) {
+            return;
         }
-        if (seq_lens && alloc_queue) {
-            sycl::free(seq_lens, *alloc_queue);
-        }
-        if (temp_buf && alloc_queue) {
-            sycl::free(temp_buf, *alloc_queue);
-        }
+        free_all();
+    }
+
+    void free_all() {
+        ggml_sycl_fattn_release_owner(block_table, block_table_capacity, block_table_owner);
+        ggml_sycl_fattn_release_owner(seq_lens, seq_lens_capacity, seq_lens_owner);
+        ggml_sycl_fattn_release_owner(temp_buf, temp_buf_capacity, temp_buf_owner);
+        alloc_queue = nullptr;
     }
 };
 
@@ -636,32 +734,19 @@ static thread_local v2_auto_buffers g_v2_auto;
 
 // Thread-local buffers for multi-sequence flash attention
 // Freed on thread exit to avoid leaking device memory.
-static std::atomic<bool> g_fattn_shutting_down{ false };
-static std::atomic<bool> g_fattn_atexit_registered{ false };
-static std::atomic<int>  g_seq_id_buffer_instances{ 0 };
-static std::atomic<int>  g_seq_id_buffer_allocs{ 0 };
-
-// atexit handler to prevent SYCL cleanup during static destruction
-static void fattn_atexit_handler() {
-    g_fattn_shutting_down.store(true);
-}
-
-static void register_fattn_atexit() {
-    bool expected = false;
-    if (g_fattn_atexit_registered.compare_exchange_strong(expected, true)) {
-        std::atexit(fattn_atexit_handler);
-    }
-}
-
 struct tl_seq_id_buffers {
-    int32_t *     q_seq_ids_dev        = nullptr;
-    int32_t *     kv_seq_ids_dev       = nullptr;
-    size_t        q_seq_ids_size       = 0;
-    size_t        kv_seq_ids_size      = 0;
-    int32_t *     seq_q_offsets_dev    = nullptr;
-    int32_t *     seq_kv_offsets_dev   = nullptr;
-    size_t        seq_offsets_capacity = 0;
-    sycl::queue * alloc_queue          = nullptr;
+    int32_t *               q_seq_ids_dev        = nullptr;
+    int32_t *               kv_seq_ids_dev       = nullptr;
+    size_t                  q_seq_ids_size       = 0;
+    size_t                  kv_seq_ids_size      = 0;
+    int32_t *               seq_q_offsets_dev    = nullptr;
+    int32_t *               seq_kv_offsets_dev   = nullptr;
+    size_t                  seq_offsets_capacity = 0;
+    ggml_sycl::mem_handle * q_seq_ids_owner      = nullptr;
+    ggml_sycl::mem_handle * kv_seq_ids_owner     = nullptr;
+    ggml_sycl::mem_handle * seq_q_offsets_owner  = nullptr;
+    ggml_sycl::mem_handle * seq_kv_offsets_owner = nullptr;
+    sycl::queue *           alloc_queue          = nullptr;
 
     tl_seq_id_buffers() {
         register_fattn_atexit();
@@ -673,17 +758,21 @@ struct tl_seq_id_buffers {
         g_seq_id_buffer_instances.fetch_sub(1);
     }
 
-    void free_ptr(int32_t *& ptr, size_t bytes) {
-        if (ptr && alloc_queue) {
-            sycl::free(ptr, *alloc_queue);
-            ptr = nullptr;
+    void free_ptr(int32_t *& ptr, size_t & bytes, ggml_sycl::mem_handle *& owner) {
+        if (owner) {
+            delete owner;
+            owner = nullptr;
+            ptr   = nullptr;
             g_seq_id_buffer_allocs.fetch_sub(1);
         }
+        ptr   = nullptr;
+        bytes = 0;
     }
 
-    int32_t * alloc_ptr(size_t count, sycl::queue * stream) {
-        int32_t * ptr = ggml_sycl_malloc_device_t<int32_t>(count, *stream, "fattn_block_table");
-        if (ptr) {
+    int32_t * alloc_ptr(size_t count, sycl::queue * stream, ggml_sycl::mem_handle *& owner) {
+        int32_t * ptr = nullptr;
+        if (ggml_sycl_fattn_alloc_device_owner_t(count, stream, ggml_sycl::alloc_role::GRAPH_TMP,
+                                                 ggml_sycl::runtime_category::GRAPH, "fattn_seq_ids", ptr, owner)) {
             g_seq_id_buffer_allocs.fetch_add(1);
         }
         return ptr;
@@ -693,13 +782,12 @@ struct tl_seq_id_buffers {
         if (g_fattn_shutting_down.load(std::memory_order_acquire)) {
             return;
         }
-        free_ptr(q_seq_ids_dev, q_seq_ids_size);
-        free_ptr(kv_seq_ids_dev, kv_seq_ids_size);
-        free_ptr(seq_q_offsets_dev, seq_offsets_capacity);
-        free_ptr(seq_kv_offsets_dev, seq_offsets_capacity);
-        q_seq_ids_size       = 0;
-        kv_seq_ids_size      = 0;
+        free_ptr(q_seq_ids_dev, q_seq_ids_size, q_seq_ids_owner);
+        free_ptr(kv_seq_ids_dev, kv_seq_ids_size, kv_seq_ids_owner);
+        free_ptr(seq_q_offsets_dev, seq_offsets_capacity, seq_q_offsets_owner);
+        free_ptr(seq_kv_offsets_dev, seq_offsets_capacity, seq_kv_offsets_owner);
         seq_offsets_capacity = 0;
+        alloc_queue          = nullptr;
     }
 };
 
@@ -733,11 +821,13 @@ static thread_local tl_seq_id_buffers g_tl_seq_buffers;
 // it is correctly ordered before the FA kernel that reads it (in-order
 // queue) without an explicit barrier.
 struct tl_fattn_weight_stage {
-    void *        sinks_dev      = nullptr;
-    size_t        sinks_capacity = 0;
-    void *        mask_dev       = nullptr;
-    size_t        mask_capacity  = 0;
-    sycl::queue * alloc_queue    = nullptr;
+    void *                  sinks_dev      = nullptr;
+    size_t                  sinks_capacity = 0;
+    ggml_sycl::mem_handle * sinks_owner    = nullptr;
+    void *                  mask_dev       = nullptr;
+    size_t                  mask_capacity  = 0;
+    ggml_sycl::mem_handle * mask_owner     = nullptr;
+    sycl::queue *           alloc_queue    = nullptr;
 
     tl_fattn_weight_stage() { register_fattn_atexit(); }
 
@@ -747,16 +837,9 @@ struct tl_fattn_weight_stage {
         if (g_fattn_shutting_down.load(std::memory_order_acquire)) {
             return;
         }
-        if (sinks_dev && alloc_queue) {
-            sycl::free(sinks_dev, *alloc_queue);
-            sinks_dev      = nullptr;
-            sinks_capacity = 0;
-        }
-        if (mask_dev && alloc_queue) {
-            sycl::free(mask_dev, *alloc_queue);
-            mask_dev      = nullptr;
-            mask_capacity = 0;
-        }
+        ggml_sycl_fattn_release_owner(sinks_dev, sinks_capacity, sinks_owner);
+        ggml_sycl_fattn_release_owner(mask_dev, mask_capacity, mask_owner);
+        alloc_queue = nullptr;
     }
 };
 
@@ -772,12 +855,13 @@ static thread_local tl_fattn_weight_stage g_tl_fattn_weight_stage;
 //
 // `slot_ptr` / `slot_capacity` reference the staging-buffer slot to reuse
 // across calls (one slot per tensor role).
-static const char * ggml_sycl_fattn_stage_weight_src(const ggml_tensor * src,
-                                                     int                 device,
-                                                     sycl::queue *       stream,
-                                                     const char *        role,
-                                                     void *&             slot_ptr,
-                                                     size_t &            slot_capacity) {
+static const char * ggml_sycl_fattn_stage_weight_src(const ggml_tensor *      src,
+                                                     int                      device,
+                                                     sycl::queue *            stream,
+                                                     const char *             role,
+                                                     void *&                  slot_ptr,
+                                                     size_t &                 slot_capacity,
+                                                     ggml_sycl::mem_handle *& slot_owner) {
     if (!src || !stream) {
         return nullptr;
     }
@@ -812,11 +896,11 @@ static const char * ggml_sycl_fattn_stage_weight_src(const ggml_tensor * src,
 
     if (bytes > slot_capacity) {
         if (slot_ptr) {
-            sycl::free(slot_ptr, *stream);
-            slot_ptr      = nullptr;
-            slot_capacity = 0;
+            ggml_sycl_fattn_release_owner(slot_ptr, slot_capacity, slot_owner);
         }
-        slot_ptr = ggml_sycl_malloc_device(bytes, *stream, "fattn_weight_stage");
+        (void) ggml_sycl_fattn_alloc_device_owner(bytes, stream, ggml_sycl::alloc_role::STAGING,
+                                                  ggml_sycl::runtime_category::STAGING, "fattn_weight_stage", &slot_ptr,
+                                                  slot_owner);
         if (!slot_ptr) {
             static bool warned = false;
             if (!warned) {
@@ -835,7 +919,8 @@ static const char * ggml_sycl_fattn_stage_weight_src(const ggml_tensor * src,
     // submission that follows.  Tiny copy (attn_sinks is n_head * f32 =
     // 256 B for GPT-OSS 20B), so cost is dominated by submission overhead
     // not bandwidth.
-    stream->memcpy(slot_ptr, resolved, bytes);
+    ggml_sycl::mem_handle src_handle = ggml_sycl::mem_handle::from_chunk_ptr(resolved, device, GGML_LAYOUT_AOS, false);
+    (void) ggml_sycl::mem_copy_async(*slot_owner, src_handle, bytes, *stream);
 
     static std::atomic<int> staged_log_left{ 8 };
     if (staged_log_left.fetch_sub(1) > 0) {
@@ -872,18 +957,20 @@ extern "C" bool ggml_sycl_test_seq_id_buffers_touch(sycl::queue * stream) {
     g_tl_seq_buffers.alloc_queue = stream;
 
     if (!g_tl_seq_buffers.q_seq_ids_dev) {
-        g_tl_seq_buffers.q_seq_ids_dev  = g_tl_seq_buffers.alloc_ptr(1, stream);
+        g_tl_seq_buffers.q_seq_ids_dev  = g_tl_seq_buffers.alloc_ptr(1, stream, g_tl_seq_buffers.q_seq_ids_owner);
         g_tl_seq_buffers.q_seq_ids_size = sizeof(int32_t);
     }
     if (!g_tl_seq_buffers.kv_seq_ids_dev) {
-        g_tl_seq_buffers.kv_seq_ids_dev  = g_tl_seq_buffers.alloc_ptr(1, stream);
+        g_tl_seq_buffers.kv_seq_ids_dev  = g_tl_seq_buffers.alloc_ptr(1, stream, g_tl_seq_buffers.kv_seq_ids_owner);
         g_tl_seq_buffers.kv_seq_ids_size = sizeof(int32_t);
     }
     if (!g_tl_seq_buffers.seq_q_offsets_dev) {
-        g_tl_seq_buffers.seq_q_offsets_dev = g_tl_seq_buffers.alloc_ptr(1, stream);
+        g_tl_seq_buffers.seq_q_offsets_dev =
+            g_tl_seq_buffers.alloc_ptr(1, stream, g_tl_seq_buffers.seq_q_offsets_owner);
     }
     if (!g_tl_seq_buffers.seq_kv_offsets_dev) {
-        g_tl_seq_buffers.seq_kv_offsets_dev = g_tl_seq_buffers.alloc_ptr(1, stream);
+        g_tl_seq_buffers.seq_kv_offsets_dev =
+            g_tl_seq_buffers.alloc_ptr(1, stream, g_tl_seq_buffers.seq_kv_offsets_owner);
     }
 
     return g_tl_seq_buffers.q_seq_ids_dev && g_tl_seq_buffers.kv_seq_ids_dev && g_tl_seq_buffers.seq_q_offsets_dev &&
@@ -967,11 +1054,15 @@ void ggml_sycl_v2_pre_allocate_buffers(ggml_backend_sycl_context & ctx, ggml_cgr
     // Pre-allocate block_table if needed
     if (!g_v2_auto.block_table || g_v2_auto.alloc_queue != ctx.stream() ||
         g_v2_auto.block_table_capacity < (size_t) block_table_size) {
-        if (g_v2_auto.block_table && g_v2_auto.alloc_queue) {
-            sycl::free(g_v2_auto.block_table, *g_v2_auto.alloc_queue);
+        if (g_v2_auto.block_table) {
+            ggml_sycl_fattn_release_owner(g_v2_auto.block_table, g_v2_auto.block_table_capacity,
+                                          g_v2_auto.block_table_owner);
         }
-        g_v2_auto.block_table =
-            ggml_sycl_malloc_device_t<int32_t>(block_table_size, *ctx.stream(), "fattn_block_table");
+        if (!ggml_sycl_fattn_alloc_device_owner_t(block_table_size, ctx.stream(), ggml_sycl::alloc_role::GRAPH_TMP,
+                                                  ggml_sycl::runtime_category::GRAPH, "fattn_block_table",
+                                                  g_v2_auto.block_table, g_v2_auto.block_table_owner)) {
+            return;
+        }
         g_v2_auto.block_table_capacity = block_table_size;
         GGML_SYCL_DEBUG("[V2-PREALLOC] block_table allocated: %d elements\n", block_table_size);
     }
@@ -979,20 +1070,28 @@ void ggml_sycl_v2_pre_allocate_buffers(ggml_backend_sycl_context & ctx, ggml_cgr
     // Pre-allocate seq_lens if needed
     if (!g_v2_auto.seq_lens || g_v2_auto.alloc_queue != ctx.stream() ||
         g_v2_auto.seq_lens_capacity < (size_t) seq_lens_size) {
-        if (g_v2_auto.seq_lens && g_v2_auto.alloc_queue) {
-            sycl::free(g_v2_auto.seq_lens, *g_v2_auto.alloc_queue);
+        if (g_v2_auto.seq_lens) {
+            ggml_sycl_fattn_release_owner(g_v2_auto.seq_lens, g_v2_auto.seq_lens_capacity, g_v2_auto.seq_lens_owner);
         }
-        g_v2_auto.seq_lens = ggml_sycl_malloc_device_t<int32_t>(seq_lens_size, *ctx.stream(), "fattn_seq_lens");
+        if (!ggml_sycl_fattn_alloc_device_owner_t(seq_lens_size, ctx.stream(), ggml_sycl::alloc_role::GRAPH_TMP,
+                                                  ggml_sycl::runtime_category::GRAPH, "fattn_seq_lens",
+                                                  g_v2_auto.seq_lens, g_v2_auto.seq_lens_owner)) {
+            return;
+        }
         g_v2_auto.seq_lens_capacity = seq_lens_size;
         GGML_SYCL_DEBUG("[V2-PREALLOC] seq_lens allocated: %d elements\n", seq_lens_size);
     }
 
     // Pre-allocate temp buffer if needed
     if (!g_v2_auto.temp_buf || g_v2_auto.alloc_queue != ctx.stream() || g_v2_auto.temp_buf_capacity < temp_size) {
-        if (g_v2_auto.temp_buf && g_v2_auto.alloc_queue) {
-            sycl::free(g_v2_auto.temp_buf, *g_v2_auto.alloc_queue);
+        if (g_v2_auto.temp_buf) {
+            ggml_sycl_fattn_release_owner(g_v2_auto.temp_buf, g_v2_auto.temp_buf_capacity, g_v2_auto.temp_buf_owner);
         }
-        g_v2_auto.temp_buf          = ggml_sycl_malloc_device_t<uint8_t>(temp_size, *ctx.stream(), "fattn_temp");
+        if (!ggml_sycl_fattn_alloc_device_owner(temp_size, ctx.stream(), ggml_sycl::alloc_role::GRAPH_TMP,
+                                                ggml_sycl::runtime_category::GRAPH, "fattn_temp", &g_v2_auto.temp_buf,
+                                                g_v2_auto.temp_buf_owner)) {
+            return;
+        }
         g_v2_auto.temp_buf_capacity = temp_size;
         GGML_SYCL_DEBUG("[V2-PREALLOC] temp_buf allocated: %zu bytes\n", temp_size);
     }
@@ -1393,10 +1492,9 @@ bool ggml_sycl_fattn_xmx_materialize_packed_k(const fattn_params &              
         return false;
     }
 
-    const bool reuse_alloc = out->alloc.ptr != nullptr && out->device == target_device && out->D == desc.D &&
-                             out->H_kv == desc.H_kv && out->batch == desc.batch &&
-                             out->alloc.tier == ggml_sycl::alloc_tier::DEVICE_VRAM &&
-                             out->alloc.size >= desc.total_packed_bytes;
+    const bool reuse_alloc = out->handle.valid() && out->ptr != nullptr && out->device == target_device &&
+                             out->D == desc.D && out->H_kv == desc.H_kv && out->batch == desc.batch &&
+                             out->total_bytes >= desc.total_packed_bytes;
     if (!reuse_alloc) {
         out->reset();
 
@@ -1410,16 +1508,26 @@ bool ggml_sycl_fattn_xmx_materialize_packed_k(const fattn_params &              
         req.intent.constraints.must_device      = true;
         req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::KV;
 
-        if (!ggml_sycl::unified_alloc(req, &out->alloc) || out->alloc.ptr == nullptr ||
-            out->alloc.tier != ggml_sycl::alloc_tier::DEVICE_VRAM) {
+        ggml_sycl::alloc_handle packed_k_owner{};
+        if (!ggml_sycl::unified_alloc(req, &packed_k_owner) || packed_k_owner.ptr == nullptr ||
+            packed_k_owner.tier != ggml_sycl::alloc_tier::DEVICE_VRAM) {
+            if (packed_k_owner.ptr != nullptr) {
+                (void) ggml_sycl::unified_free(packed_k_owner);
+            }
             out->reset();
             return false;
         }
-        out->handle = out->alloc.as_mem_handle();
+        out->ptr         = packed_k_owner.ptr;
+        out->handle      = ggml_sycl::mem_handle::from_owned_alloc(std::move(packed_k_owner), GGML_LAYOUT_AOS);
+        out->total_bytes = desc.total_packed_bytes;
+        if (!out->handle.valid()) {
+            out->reset();
+            return false;
+        }
     }
 
-    sycl::half *      packed_ptr   = static_cast<sycl::half *>(out->alloc.ptr);
-    void *            packed_void  = out->alloc.ptr;
+    sycl::half *      packed_ptr   = static_cast<sycl::half *>(out->ptr);
+    void *            packed_void  = out->ptr;
     const sycl::event previous_use = out->ready_event;
     bool              add_prev_dep = false;
     if (reuse_alloc) {
@@ -1435,12 +1543,11 @@ bool ggml_sycl_fattn_xmx_materialize_packed_k(const fattn_params &              
     sycl::event zero_event;
     sycl::event pack_event;
     try {
-        zero_event = stream->submit([&](sycl::handler & cgh) {
-            if (add_prev_dep) {
-                cgh.depends_on(previous_use);
-            }
-            cgh.memset(packed_void, 0, desc.total_packed_bytes);
-        });
+        std::vector<sycl::event> zero_deps;
+        if (add_prev_dep) {
+            zero_deps.push_back(previous_use);
+        }
+        zero_event = ggml_sycl::mem_fill_async(out->handle, 0, desc.total_packed_bytes, *stream, zero_deps);
         pack_event = stream->submit([&](sycl::handler & cgh) {
             cgh.depends_on(zero_event);
             cgh.parallel_for<fattn_xmx_pack_k_materializer_kernel>(sycl::range<1>(total_work), [=](sycl::id<1> item) {
@@ -1487,33 +1594,24 @@ bool ggml_sycl_fattn_xmx_materialize_packed_k(const fattn_params &              
     out->H_kv        = desc.H_kv;
     out->batch       = desc.batch;
     out->n_blocks    = desc.n_blocks;
-    out->total_bytes = out->alloc.size;
+    out->total_bytes = std::max(out->total_bytes, desc.total_packed_bytes);
     return true;
 }
 
 static void ggml_sycl_fattn_xmx_v2_free_split_workspace(fattn_xmx_v2_device_cache & cache) {
-    if (cache.split_partial_max_alloc.ptr) {
-        (void) ggml_sycl::unified_free(cache.split_partial_max_alloc);
-    }
-    if (cache.split_partial_sum_alloc.ptr) {
-        (void) ggml_sycl::unified_free(cache.split_partial_sum_alloc);
-    }
-    if (cache.split_partial_out_alloc.ptr) {
-        (void) ggml_sycl::unified_free(cache.split_partial_out_alloc);
-    }
-    cache.split_partial_max_alloc = {};
-    cache.split_partial_sum_alloc = {};
-    cache.split_partial_out_alloc = {};
-    cache.split_partial_elems     = 0;
-    cache.split_partial_out_elems = 0;
-    cache.split_partial_device    = -1;
+    cache.split_partial_max_handle = {};
+    cache.split_partial_sum_handle = {};
+    cache.split_partial_out_handle = {};
+    cache.split_partial_elems      = 0;
+    cache.split_partial_out_elems  = 0;
+    cache.split_partial_device     = -1;
 }
 
-static bool ggml_sycl_fattn_xmx_v2_alloc_split_workspace_buffer(dpct::queue_ptr           stream,
-                                                                int                       device,
-                                                                size_t                    bytes,
-                                                                const char *              cohort_id,
-                                                                ggml_sycl::alloc_handle * out) {
+static bool ggml_sycl_fattn_xmx_v2_alloc_split_workspace_buffer(dpct::queue_ptr         stream,
+                                                                int                     device,
+                                                                size_t                  bytes,
+                                                                const char *            cohort_id,
+                                                                ggml_sycl::mem_handle * out) {
     ggml_sycl::alloc_request req{};
     req.queue                               = stream;
     req.device                              = device;
@@ -1523,7 +1621,16 @@ static bool ggml_sycl_fattn_xmx_v2_alloc_split_workspace_buffer(dpct::queue_ptr 
     req.intent.cohort_id                    = cohort_id;
     req.intent.constraints.must_device      = true;
     req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;
-    return ggml_sycl::unified_alloc(req, out) && out->ptr != nullptr && out->tier == ggml_sycl::alloc_tier::DEVICE_VRAM;
+    ggml_sycl::alloc_handle workspace_owner{};
+    if (!ggml_sycl::unified_alloc(req, &workspace_owner) || workspace_owner.ptr == nullptr ||
+        workspace_owner.tier != ggml_sycl::alloc_tier::DEVICE_VRAM) {
+        if (workspace_owner.ptr != nullptr) {
+            (void) ggml_sycl::unified_free(workspace_owner);
+        }
+        return false;
+    }
+    *out = ggml_sycl::mem_handle::from_owned_alloc(std::move(workspace_owner), GGML_LAYOUT_AOS);
+    return out->valid();
 }
 
 static bool ggml_sycl_fattn_xmx_v2_ensure_split_workspace(ggml_backend_sycl_context & ctx,
@@ -1561,13 +1668,13 @@ static bool ggml_sycl_fattn_xmx_v2_ensure_split_workspace(ggml_backend_sycl_cont
     }
 
     fattn_xmx_v2_device_cache * cache = fattn_xmx_v2_get_or_create_cache(ctx);
-    const bool                  need_alloc =
-        cache->split_partial_device != ctx.device || cache->split_partial_elems < partial_elems ||
-        cache->split_partial_out_elems < partial_out_elems || cache->split_partial_max_alloc.ptr == nullptr ||
-        cache->split_partial_sum_alloc.ptr == nullptr || cache->split_partial_out_alloc.ptr == nullptr;
+    const bool need_alloc = cache->split_partial_device != ctx.device || cache->split_partial_elems < partial_elems ||
+                            cache->split_partial_out_elems < partial_out_elems ||
+                            !cache->split_partial_max_handle.valid() || !cache->split_partial_sum_handle.valid() ||
+                            !cache->split_partial_out_handle.valid();
     if (need_alloc) {
-        if (cache->split_partial_max_alloc.ptr || cache->split_partial_sum_alloc.ptr ||
-            cache->split_partial_out_alloc.ptr) {
+        if (cache->split_partial_max_handle.valid() || cache->split_partial_sum_handle.valid() ||
+            cache->split_partial_out_handle.valid()) {
             try {
                 stream->wait_and_throw();
             } catch (const sycl::exception & e) {
@@ -1580,12 +1687,12 @@ static bool ggml_sycl_fattn_xmx_v2_ensure_split_workspace(ggml_backend_sycl_cont
         const size_t partial_bytes     = partial_elems * sizeof(float);
         const size_t partial_out_bytes = partial_out_elems * sizeof(float);
         if (!ggml_sycl_fattn_xmx_v2_alloc_split_workspace_buffer(
-                stream, ctx.device, partial_bytes, "fattn_xmx_split_partial_max", &cache->split_partial_max_alloc) ||
+                stream, ctx.device, partial_bytes, "fattn_xmx_split_partial_max", &cache->split_partial_max_handle) ||
             !ggml_sycl_fattn_xmx_v2_alloc_split_workspace_buffer(
-                stream, ctx.device, partial_bytes, "fattn_xmx_split_partial_sum", &cache->split_partial_sum_alloc) ||
+                stream, ctx.device, partial_bytes, "fattn_xmx_split_partial_sum", &cache->split_partial_sum_handle) ||
             !ggml_sycl_fattn_xmx_v2_alloc_split_workspace_buffer(stream, ctx.device, partial_out_bytes,
                                                                  "fattn_xmx_split_partial_out",
-                                                                 &cache->split_partial_out_alloc)) {
+                                                                 &cache->split_partial_out_handle)) {
             ggml_sycl_fattn_xmx_v2_free_split_workspace(*cache);
             return false;
         }
@@ -1594,9 +1701,16 @@ static bool ggml_sycl_fattn_xmx_v2_ensure_split_workspace(ggml_backend_sycl_cont
         cache->split_partial_device    = ctx.device;
     }
 
-    *partial_max = static_cast<float *>(cache->split_partial_max_alloc.ptr);
-    *partial_sum = static_cast<float *>(cache->split_partial_sum_alloc.ptr);
-    *partial_out = static_cast<float *>(cache->split_partial_out_alloc.ptr);
+    auto max_resolved = cache->split_partial_max_handle.resolve(ctx.device);
+    auto sum_resolved = cache->split_partial_sum_handle.resolve(ctx.device);
+    auto out_resolved = cache->split_partial_out_handle.resolve(ctx.device);
+    if (!max_resolved.ptr || !sum_resolved.ptr || !out_resolved.ptr) {
+        return false;
+    }
+
+    *partial_max = static_cast<float *>(max_resolved.ptr);
+    *partial_sum = static_cast<float *>(sum_resolved.ptr);
+    *partial_out = static_cast<float *>(out_resolved.ptr);
     return true;
 }
 
@@ -2264,15 +2378,15 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
                             ggml_sycl_probe_alloc_type_any_context(params.V) == sycl::usm::alloc::device;
                         const ggml_sycl_fattn_xmx_decode_kv_layout_plan plan =
                             ggml_sycl_flash_attn_ext_xmx_decode_kv_layout_plan(params, D, dev, k_device_resident,
-                                                                                       v_device_resident);
+                                                                               v_device_resident);
                         if (plan.kind == ggml_sycl_fattn_xmx_decode_kv_layout_kind::PACKED_K_MEM_HANDLE) {
                             fattn_xmx_v2_device_cache * cache = fattn_xmx_v2_get_or_create_cache(ctx);
                             const int                   n_partitions =
                                 (params.ne11 + XMX_V2_DECODE_BATCH_KV - 1) / XMX_V2_DECODE_BATCH_KV;
                             const int selected_tk = force_tk16 ? 16 : force_tk32 ? 32 : plan.preferred_tk;
-                            float * partial_max = nullptr;
-                            float * partial_sum = nullptr;
-                            float * partial_out = nullptr;
+                            float *   partial_max = nullptr;
+                            float *   partial_sum = nullptr;
+                            float *   partial_out = nullptr;
                             ggml_sycl_fattn_xmx_packed_k * packed_k =
                                 ggml_sycl_fattn_xmx_find_packed_k_sidecar(params, ctx.device);
                             if (packed_k == nullptr &&
@@ -2290,8 +2404,9 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
                                             "n_partitions=%d\n",
                                             selected_tk, (int) used_sidecar, params.K_view_offs, n_partitions);
                                 }
-                                GGML_SYCL_KTRACE("fattn FORCE=xmx-v2-gqa-split-packed", " D=%d ne01=%d tk=%d sidecar=%d",
-                                                 D, ne01, selected_tk, used_sidecar ? 1 : 0);
+                                GGML_SYCL_KTRACE("fattn FORCE=xmx-v2-gqa-split-packed",
+                                                 " D=%d ne01=%d tk=%d sidecar=%d", D, ne01, selected_tk,
+                                                 used_sidecar ? 1 : 0);
                                 if (logit_softcap == 0.0f) {
                                     decode_sent =
                                         selected_tk == 16 ?
@@ -2498,7 +2613,7 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
     // The v2 launcher still owns the per-device matrix/SLM fit check; rejection
     // falls through to ESIMD without requiring an environment override.
     if (can_use_xmx_v2_d64_batched_pp()) {
-        bool       v2_dispatched = false;
+        bool v2_dispatched = false;
         // D=64 batched PP is bandwidth/occupancy limited on Xe.  Microbenchmarks
         // for GPT-OSS-like sinks/softcap shapes show the build-time afloat
         // accumulator keeps public-layout error below 2e-4.  NCOLS=32 reuses
@@ -2759,7 +2874,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
                 return;
             }
             std::vector<char> buf(bytes);
-            ctx.stream()->memcpy(buf.data(), ptr, bytes).wait();
+            fattn_debug_copy_to_host(ctx.stream(), buf.data(), ptr, bytes);
             if (t->type == GGML_TYPE_F32) {
                 GGML_SYCL_L144I_PROBE_FLOATS(site, t->name[0] ? t->name : "?", -1, -1,
                                              reinterpret_cast<const float *>(buf.data()), bytes / sizeof(float));
@@ -2809,18 +2924,29 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     fattn_params params;
 
     // Use device-specific pointers for TP mode (KV cache is allocated per-device)
-    const int device         = ctx.device;
-    params.Q                 = static_cast<const char *>(Q_t.resolve_ptr());
-    params.K                 = static_cast<const char *>(K_t.resolve_ptr());
+    const int device = ctx.device;
+    params.Q         = static_cast<const char *>(Q_t.resolve_ptr());
+    params.K         = static_cast<const char *>(K_t.resolve_ptr());
     {
         size_t              k_view_offs = 0;
         const ggml_tensor * k_root      = ggml_sycl_fattn_xmx_root_tensor(K, &k_view_offs);
         auto                k_handle    = ggml_sycl_fattn_xmx_root_data_handle(k_root, device);
         params.K_handle_valid           = k_handle.valid();
-        params.K_handle_hash            = params.K_handle_valid ? k_handle.hash() : 0;
+        params.K_handle_hash            = params.K_handle_valid ? k_handle.stable_identity_hash() : 0;
         params.K_view_offs              = k_view_offs;
     }
-    params.V                 = static_cast<const char *>(V_t.resolve_ptr());
+    params.V                    = static_cast<const char *>(V_t.resolve_ptr());
+    auto graph_input_device_ptr = [&](const ggml_tensor * tensor) -> const char * {
+        if (!g_ggml_sycl_graph_recording || !tensor || !(tensor->flags & GGML_TENSOR_FLAG_INPUT) || !tensor->name[0]) {
+            return nullptr;
+        }
+        void * staged_ptr = nullptr;
+        if (ctx.graph_input_stage_lookup(tensor->name, ggml_nbytes(tensor), device, nullptr, &staged_ptr) &&
+            staged_ptr) {
+            return static_cast<const char *>(staged_ptr);
+        }
+        return nullptr;
+    };
     // llama.cpp-15li2 CRIT-1: FA's src[4] (`sinks`) is a per-layer WEIGHT
     // for GPT-OSS; with host-planned layers it resolves to host-pinned
     // USM.  Stage to device if the resolved pointer is not
@@ -2828,15 +2954,17 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     // even though today it is always a per-batch activation — if a
     // future model makes its mask weight-planned, this will keep working.
     sycl::queue * stream_ptr = ctx.stream();
-    params.mask =
-        mask ? ggml_sycl_fattn_stage_weight_src(mask, device, stream_ptr, "mask", g_tl_fattn_weight_stage.mask_dev,
-                                                g_tl_fattn_weight_stage.mask_capacity) :
-               nullptr;
-    params.sinks = sinks ? ggml_sycl_fattn_stage_weight_src(sinks, device, stream_ptr, "attn_sinks",
-                                                            g_tl_fattn_weight_stage.sinks_dev,
-                                                            g_tl_fattn_weight_stage.sinks_capacity) :
-                           nullptr;
-    params.dst   = safe_dst.resolve_as<float>();
+    const char *  graph_mask = graph_input_device_ptr(mask);
+    params.mask              = graph_mask ? graph_mask :
+                                            (mask ? ggml_sycl_fattn_stage_weight_src(
+                                           mask, device, stream_ptr, "mask", g_tl_fattn_weight_stage.mask_dev,
+                                           g_tl_fattn_weight_stage.mask_capacity, g_tl_fattn_weight_stage.mask_owner) :
+                                                    nullptr);
+    params.sinks             = sinks ? ggml_sycl_fattn_stage_weight_src(
+                               sinks, device, stream_ptr, "attn_sinks", g_tl_fattn_weight_stage.sinks_dev,
+                               g_tl_fattn_weight_stage.sinks_capacity, g_tl_fattn_weight_stage.sinks_owner) :
+                                       nullptr;
+    params.dst               = safe_dst.resolve_as<float>();
 
     // Source tensor types — consumers (e.g. oneDNN SDPA) need these to size byte
     // strides correctly and to build logical tensors with the right data_type.
@@ -2976,64 +3104,76 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
             // We have valid host pointers (either from tensor or from cache)
             // Need to copy from host to device for kernel access
             // Reallocate device buffers if size changed or first time
-            if (tl_buffers.alloc_queue != stream || tl_buffers.q_seq_ids_size < q_size) {
-                tl_buffers.free_ptr(tl_buffers.q_seq_ids_dev, tl_buffers.q_seq_ids_size);
-                tl_buffers.q_seq_ids_dev  = tl_buffers.alloc_ptr(q_seq_ids->ne[0], stream);
+            if (!tl_buffers.q_seq_ids_dev || tl_buffers.alloc_queue != stream || tl_buffers.q_seq_ids_size < q_size) {
+                tl_buffers.free_ptr(tl_buffers.q_seq_ids_dev, tl_buffers.q_seq_ids_size, tl_buffers.q_seq_ids_owner);
+                tl_buffers.q_seq_ids_dev  = tl_buffers.alloc_ptr(q_seq_ids->ne[0], stream, tl_buffers.q_seq_ids_owner);
                 tl_buffers.q_seq_ids_size = q_size;
             }
-            if (tl_buffers.alloc_queue != stream || tl_buffers.kv_seq_ids_size < kv_size) {
-                tl_buffers.free_ptr(tl_buffers.kv_seq_ids_dev, tl_buffers.kv_seq_ids_size);
-                tl_buffers.kv_seq_ids_dev  = tl_buffers.alloc_ptr(kv_seq_ids->ne[0], stream);
+            if (!tl_buffers.kv_seq_ids_dev || tl_buffers.alloc_queue != stream ||
+                tl_buffers.kv_seq_ids_size < kv_size) {
+                tl_buffers.free_ptr(tl_buffers.kv_seq_ids_dev, tl_buffers.kv_seq_ids_size, tl_buffers.kv_seq_ids_owner);
+                tl_buffers.kv_seq_ids_dev =
+                    tl_buffers.alloc_ptr(kv_seq_ids->ne[0], stream, tl_buffers.kv_seq_ids_owner);
                 tl_buffers.kv_seq_ids_size = kv_size;
             }
             tl_buffers.alloc_queue = stream;
 
-            // Copy from host (USM) to device using the correct host pointers
-            // Note: In-order queue ensures memcpy completes before subsequent kernel launch
-            ggml_sycl_trace_memcpy_during_recording("fattn.cpp:q_seq_ids", q_size);
-            ggml_sycl_graph_safe_memcpy(*stream, tl_buffers.q_seq_ids_dev, host_q_ptr, q_size);
-            ggml_sycl_trace_memcpy_during_recording("fattn.cpp:kv_seq_ids", kv_size);
-            ggml_sycl_graph_safe_memcpy(*stream, tl_buffers.kv_seq_ids_dev, host_kv_ptr, kv_size);
-
-            params.q_seq_ids  = tl_buffers.q_seq_ids_dev;
-            params.kv_seq_ids = tl_buffers.kv_seq_ids_dev;
-
-            // Compute sequence boundaries from the seq_ids arrays
-            // This enables the kernel to skip cross-sequence KV computation entirely
-            // Note: We use the HOST pointers for boundary computation (which happens on CPU)
-            int n_queries = static_cast<int>(q_seq_ids->ne[0]);
-            int n_kv      = static_cast<int>(kv_seq_ids->ne[0]);
-
-            int n_seqs = compute_sequence_boundaries_from_ids(host_q_ptr, n_queries, host_kv_ptr, n_kv,
-                                                              tl_seq_q_offsets, tl_seq_kv_offsets);
-
-            // Copy sequence boundary offsets to device memory for kernel access
-            // This enables the kernel to skip entire KV blocks for non-matching sequences
-            if (n_seqs > 1) {
-                const size_t offsets_size = (n_seqs + 1) * sizeof(int32_t);
-
-                // Reallocate device buffers if capacity is insufficient
-                if (tl_buffers.seq_offsets_capacity < offsets_size) {
-                    tl_buffers.free_ptr(tl_buffers.seq_q_offsets_dev, tl_buffers.seq_offsets_capacity);
-                    tl_buffers.free_ptr(tl_buffers.seq_kv_offsets_dev, tl_buffers.seq_offsets_capacity);
-                    tl_buffers.seq_q_offsets_dev    = tl_buffers.alloc_ptr(n_seqs + 1, stream);
-                    tl_buffers.seq_kv_offsets_dev   = tl_buffers.alloc_ptr(n_seqs + 1, stream);
-                    tl_buffers.seq_offsets_capacity = offsets_size;
-                }
-
-                // Copy offsets to device
+            if (tl_buffers.q_seq_ids_dev && tl_buffers.kv_seq_ids_dev) {
+                // Copy from host (USM) to device using the correct host pointers
                 // Note: In-order queue ensures memcpy completes before subsequent kernel launch
-                ggml_sycl_trace_memcpy_during_recording("fattn.cpp:seq_q_offsets", offsets_size);
-                ggml_sycl_graph_safe_memcpy(*stream, tl_buffers.seq_q_offsets_dev, tl_seq_q_offsets.data(),
-                                            offsets_size);
-                ggml_sycl_trace_memcpy_during_recording("fattn.cpp:seq_kv_offsets", offsets_size);
-                ggml_sycl_graph_safe_memcpy(*stream, tl_buffers.seq_kv_offsets_dev, tl_seq_kv_offsets.data(),
-                                            offsets_size);
+                ggml_sycl_trace_memcpy_during_recording("fattn.cpp:q_seq_ids", q_size);
+                ggml_sycl_graph_safe_memcpy(*stream, tl_buffers.q_seq_ids_dev, host_q_ptr, q_size);
+                ggml_sycl_trace_memcpy_during_recording("fattn.cpp:kv_seq_ids", kv_size);
+                ggml_sycl_graph_safe_memcpy(*stream, tl_buffers.kv_seq_ids_dev, host_kv_ptr, kv_size);
 
-                // Set params for kernel to use sequence boundary optimization
-                params.n_seqs         = n_seqs;
-                params.seq_q_offsets  = tl_buffers.seq_q_offsets_dev;
-                params.seq_kv_offsets = tl_buffers.seq_kv_offsets_dev;
+                params.q_seq_ids  = tl_buffers.q_seq_ids_dev;
+                params.kv_seq_ids = tl_buffers.kv_seq_ids_dev;
+
+                // Compute sequence boundaries from the seq_ids arrays
+                // This enables the kernel to skip cross-sequence KV computation entirely
+                // Note: We use the HOST pointers for boundary computation (which happens on CPU)
+                int n_queries = static_cast<int>(q_seq_ids->ne[0]);
+                int n_kv      = static_cast<int>(kv_seq_ids->ne[0]);
+
+                int n_seqs = compute_sequence_boundaries_from_ids(host_q_ptr, n_queries, host_kv_ptr, n_kv,
+                                                                  tl_seq_q_offsets, tl_seq_kv_offsets);
+
+                // Copy sequence boundary offsets to device memory for kernel access
+                // This enables the kernel to skip entire KV blocks for non-matching sequences
+                if (n_seqs > 1) {
+                    const size_t offsets_size = (n_seqs + 1) * sizeof(int32_t);
+
+                    // Reallocate device buffers if capacity is insufficient
+                    if (!tl_buffers.seq_q_offsets_dev || !tl_buffers.seq_kv_offsets_dev ||
+                        tl_buffers.seq_offsets_capacity < offsets_size) {
+                        tl_buffers.free_ptr(tl_buffers.seq_q_offsets_dev, tl_buffers.seq_offsets_capacity,
+                                            tl_buffers.seq_q_offsets_owner);
+                        tl_buffers.free_ptr(tl_buffers.seq_kv_offsets_dev, tl_buffers.seq_offsets_capacity,
+                                            tl_buffers.seq_kv_offsets_owner);
+                        tl_buffers.seq_q_offsets_dev =
+                            tl_buffers.alloc_ptr(n_seqs + 1, stream, tl_buffers.seq_q_offsets_owner);
+                        tl_buffers.seq_kv_offsets_dev =
+                            tl_buffers.alloc_ptr(n_seqs + 1, stream, tl_buffers.seq_kv_offsets_owner);
+                        tl_buffers.seq_offsets_capacity =
+                            (tl_buffers.seq_q_offsets_dev && tl_buffers.seq_kv_offsets_dev) ? offsets_size : 0;
+                    }
+
+                    if (tl_buffers.seq_q_offsets_dev && tl_buffers.seq_kv_offsets_dev) {
+                        // Copy offsets to device
+                        // Note: In-order queue ensures memcpy completes before subsequent kernel launch
+                        ggml_sycl_trace_memcpy_during_recording("fattn.cpp:seq_q_offsets", offsets_size);
+                        ggml_sycl_graph_safe_memcpy(*stream, tl_buffers.seq_q_offsets_dev, tl_seq_q_offsets.data(),
+                                                    offsets_size);
+                        ggml_sycl_trace_memcpy_during_recording("fattn.cpp:seq_kv_offsets", offsets_size);
+                        ggml_sycl_graph_safe_memcpy(*stream, tl_buffers.seq_kv_offsets_dev, tl_seq_kv_offsets.data(),
+                                                    offsets_size);
+
+                        // Set params for kernel to use sequence boundary optimization
+                        params.n_seqs         = n_seqs;
+                        params.seq_q_offsets  = tl_buffers.seq_q_offsets_dev;
+                        params.seq_kv_offsets = tl_buffers.seq_kv_offsets_dev;
+                    }
+                }
             }
         }
     } else {
@@ -3048,13 +3188,17 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
 
     if (block_table && seq_lens_tensor) {
         // Enable PagedAttention: K/V are stored in blocks, accessed via block_table
-        params.use_paged_attn     = true;
-        params.block_size         = 16;  // Fixed block size (matches vLLM and XMX tile size)
+        params.use_paged_attn          = true;
+        params.block_size              = 16;  // Fixed block size (matches vLLM and XMX tile size)
         // block_table shape: [max_blocks, n_seqs] where ne[0]=max_blocks (columns), ne[1]=n_seqs (rows)
         // Kernel access: block_table[seq * max_blocks + block] requires max_blocks = ne[0]
-        params.max_blocks_per_seq = static_cast<int32_t>(block_table->ne[0]);
-        params.block_table        = (const int32_t *) ggml_sycl_get_data_ptr(block_table, device);
-        params.seq_lens           = (const int32_t *) ggml_sycl_get_data_ptr(seq_lens_tensor, device);
+        params.max_blocks_per_seq      = static_cast<int32_t>(block_table->ne[0]);
+        const char * graph_block_table = graph_input_device_ptr(block_table);
+        const char * graph_seq_lens    = graph_input_device_ptr(seq_lens_tensor);
+        params.block_table =
+            (const int32_t *) (graph_block_table ? graph_block_table : ggml_sycl_get_data_ptr(block_table, device));
+        params.seq_lens =
+            (const int32_t *) (graph_seq_lens ? graph_seq_lens : ggml_sycl_get_data_ptr(seq_lens_tensor, device));
 
 #if 0  // Debug output disabled \
        // Print only once to avoid flooding output
@@ -3087,6 +3231,12 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
         snap.sinks       = params.sinks;
         snap.block_table = params.block_table;
         snap.seq_lens    = params.seq_lens;
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            snap.q_ne[i]   = Q ? Q->ne[i] : 0;
+            snap.k_ne[i]   = K ? K->ne[i] : 0;
+            snap.v_ne[i]   = V ? V->ne[i] : 0;
+            snap.dst_ne[i] = dst ? dst->ne[i] : 0;
+        }
         ctx.fa_graph_ptrs.push_back(snap);
     }
 
@@ -3207,40 +3357,54 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
                                                                       g_v2_auto.seq_lens_capacity < seq_lens_size);
 
             if (needs_realloc_block) {
-                if (g_v2_auto.block_table && g_v2_auto.alloc_queue) {
-                    sycl::free(g_v2_auto.block_table, *g_v2_auto.alloc_queue);
+                if (g_v2_auto.block_table) {
+                    ggml_sycl_fattn_release_owner(g_v2_auto.block_table, g_v2_auto.block_table_capacity,
+                                                  g_v2_auto.block_table_owner);
                 }
-                g_v2_auto.block_table =
-                    ggml_sycl_malloc_device_t<int32_t>(block_table_size, *ctx.stream(), "fattn_block_table");
-                g_v2_auto.block_table_capacity = block_table_size;
+                if (!ggml_sycl_fattn_alloc_device_owner_t(block_table_size, ctx.stream(),
+                                                          ggml_sycl::alloc_role::GRAPH_TMP,
+                                                          ggml_sycl::runtime_category::GRAPH, "fattn_block_table",
+                                                          g_v2_auto.block_table, g_v2_auto.block_table_owner)) {
+                    use_v2_dispatch = false;
+                } else {
+                    g_v2_auto.block_table_capacity = block_table_size;
+                }
             }
             if (needs_realloc_seq) {
-                if (g_v2_auto.seq_lens && g_v2_auto.alloc_queue) {
-                    sycl::free(g_v2_auto.seq_lens, *g_v2_auto.alloc_queue);
+                if (g_v2_auto.seq_lens) {
+                    ggml_sycl_fattn_release_owner(g_v2_auto.seq_lens, g_v2_auto.seq_lens_capacity,
+                                                  g_v2_auto.seq_lens_owner);
                 }
-                g_v2_auto.seq_lens = ggml_sycl_malloc_device_t<int32_t>(seq_lens_size, *ctx.stream(), "fattn_seq_lens");
-                g_v2_auto.seq_lens_capacity = seq_lens_size;
+                if (!ggml_sycl_fattn_alloc_device_owner_t(seq_lens_size, ctx.stream(), ggml_sycl::alloc_role::GRAPH_TMP,
+                                                          ggml_sycl::runtime_category::GRAPH, "fattn_seq_lens",
+                                                          g_v2_auto.seq_lens, g_v2_auto.seq_lens_owner)) {
+                    use_v2_dispatch = false;
+                } else {
+                    g_v2_auto.seq_lens_capacity = seq_lens_size;
+                }
             }
             if (needs_realloc_block || needs_realloc_seq) {
                 g_v2_auto.alloc_queue = ctx.stream();
             }
 
-            // Fill identity block table: block_table[i] = i
-            // Use a kernel for efficiency (parallel fill)
-            ctx.stream()->parallel_for<class fattn_v2_fill_block_table_runtime_kernel>(
-                sycl::range<1>(block_table_size), [block_table_ptr = g_v2_auto.block_table](sycl::id<1> idx) {
-                    block_table_ptr[idx] = static_cast<int32_t>(idx[0]);
-                });
+            if (use_v2_dispatch && g_v2_auto.block_table && g_v2_auto.seq_lens) {
+                // Fill identity block table: block_table[i] = i
+                // Use a kernel for efficiency (parallel fill)
+                ctx.stream()->parallel_for<class fattn_v2_fill_block_table_runtime_kernel>(
+                    sycl::range<1>(block_table_size), [block_table_ptr = g_v2_auto.block_table](sycl::id<1> idx) {
+                        block_table_ptr[idx] = static_cast<int32_t>(idx[0]);
+                    });
 
-            // Fill seq_lens: all sequences have the same context length
-            ctx.stream()->parallel_for<class fattn_v2_fill_seq_lens_kernel>(
-                sycl::range<1>(seq_lens_size), [seq_lens_ptr = g_v2_auto.seq_lens, ctx_len = max_context_len](
-                                                   sycl::id<1> idx) { seq_lens_ptr[idx] = ctx_len; });
+                // Fill seq_lens: all sequences have the same context length
+                ctx.stream()->parallel_for<class fattn_v2_fill_seq_lens_kernel>(
+                    sycl::range<1>(seq_lens_size), [seq_lens_ptr = g_v2_auto.seq_lens, ctx_len = max_context_len](
+                                                       sycl::id<1> idx) { seq_lens_ptr[idx] = ctx_len; });
 
-            // Note: In-order queue ensures parallel_for fills complete before V2 kernel
+                // Note: In-order queue ensures parallel_for fills complete before V2 kernel
 
-            v2_block_table = g_v2_auto.block_table;
-            v2_seq_lens    = g_v2_auto.seq_lens;
+                v2_block_table = g_v2_auto.block_table;
+                v2_seq_lens    = g_v2_auto.seq_lens;
+            }
         } else {
             // Paged V2: Use provided block_table and seq_lens
             v2_block_table = params.block_table;
@@ -3256,12 +3420,18 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
         bool needs_realloc_temp = !g_ggml_sycl_graph_recording &&
                                   (g_v2_auto.alloc_queue != ctx.stream() || g_v2_auto.temp_buf_capacity < temp_size);
         if (needs_realloc_temp) {
-            if (g_v2_auto.temp_buf && g_v2_auto.alloc_queue) {
-                sycl::free(g_v2_auto.temp_buf, *g_v2_auto.alloc_queue);
+            if (g_v2_auto.temp_buf) {
+                ggml_sycl_fattn_release_owner(g_v2_auto.temp_buf, g_v2_auto.temp_buf_capacity,
+                                              g_v2_auto.temp_buf_owner);
             }
-            g_v2_auto.temp_buf          = ggml_sycl_malloc_device_t<uint8_t>(temp_size, *ctx.stream(), "fattn_temp");
-            g_v2_auto.temp_buf_capacity = temp_size;
-            g_v2_auto.alloc_queue       = ctx.stream();
+            if (!ggml_sycl_fattn_alloc_device_owner(temp_size, ctx.stream(), ggml_sycl::alloc_role::GRAPH_TMP,
+                                                    ggml_sycl::runtime_category::GRAPH, "fattn_temp",
+                                                    &g_v2_auto.temp_buf, g_v2_auto.temp_buf_owner)) {
+                use_v2_dispatch = false;
+            } else {
+                g_v2_auto.temp_buf_capacity = temp_size;
+            }
+            g_v2_auto.alloc_queue = ctx.stream();
         }
 
         // If we're graph recording and buffers don't exist, we can't proceed
@@ -3448,7 +3618,7 @@ scalar_v2_dispatch:
                 float  host_vals[4]   = { 0 };
                 size_t total_elements = params.ne01 * params.ne02 * D;  // n_queries * n_heads * head_dim
                 if (total_elements >= 4) {
-                    stream->memcpy(host_vals, params.dst, 4 * sizeof(float)).wait();
+                    fattn_debug_copy_to_host(stream, host_vals, params.dst, sizeof(host_vals));
                 }
 
                 bool is_zeros =

@@ -7,14 +7,15 @@
 #ifndef GGML_SYCL_KV_OFFLOAD_HPP
 #define GGML_SYCL_KV_OFFLOAD_HPP
 
-#include <vector>
-#include <unordered_map>
-#include <set>
-#include <mutex>
+#include "dpct/helper.hpp"
+#include "mem-handle.hpp"
+
 #include <cstddef>
 #include <cstdint>
-
-#include "dpct/helper.hpp"
+#include <mutex>
+#include <set>
+#include <unordered_map>
+#include <vector>
 
 // Forward declaration - avoid including full headers
 struct ggml_tensor;
@@ -23,49 +24,53 @@ namespace ggml_sycl {
 
 // Configuration for KV cache offloading
 struct kv_offload_config {
-    size_t gpu_kv_budget;         // Maximum GPU bytes for KV cache
-    int32_t offload_threshold;    // Context length (tokens) to start offloading
-    int block_size = 64;          // Tokens per block (granularity of offload)
-    float prefetch_ratio = 1.5f;  // Prefetch this many blocks ahead of attention window
+    size_t  gpu_kv_budget;          // Maximum GPU bytes for KV cache
+    int32_t offload_threshold;      // Context length (tokens) to start offloading
+    int     block_size     = 64;    // Tokens per block (granularity of offload)
+    float   prefetch_ratio = 1.5f;  // Prefetch this many blocks ahead of attention window
 };
 
 // A block of KV cache entries for a specific layer
 struct kv_block {
-    int layer_id;
-    int32_t start_pos;          // Starting token position
-    int32_t end_pos;            // Ending token position (exclusive)
-    bool on_gpu;                // Currently on GPU?
-    void* gpu_ptr;              // GPU memory pointer (nullptr if offloaded)
-    void* cpu_ptr;              // Pinned host memory pointer
-    size_t size;                // Size of this block in bytes
-    int64_t last_access;        // Last access timestamp for LRU
-    sycl::event transfer_event; // Event for async transfers
+    int         layer_id;
+    int32_t     start_pos;       // Starting token position
+    int32_t     end_pos;         // Ending token position (exclusive)
+    bool        on_gpu;          // Currently on GPU?
+    void *      gpu_ptr;         // GPU memory pointer (nullptr if offloaded)
+    void *      cpu_ptr;         // Pinned host memory pointer
+    mem_handle  cpu_handle;      // Owning handle for pinned host memory
+    size_t      size;            // Size of this block in bytes
+    int64_t     last_access;     // Last access timestamp for LRU
+    sycl::event transfer_event;  // Event for async transfers
 };
 
 // Key for identifying a KV block
 struct kv_block_key {
-    int layer_id;
+    int     layer_id;
     int32_t block_idx;  // Block index within layer
 
-    bool operator==(const kv_block_key& other) const {
+    bool operator==(const kv_block_key & other) const {
         return layer_id == other.layer_id && block_idx == other.block_idx;
     }
 };
 
 struct kv_block_key_hash {
-    size_t operator()(const kv_block_key& k) const {
+    size_t operator()(const kv_block_key & k) const {
         return std::hash<int>()(k.layer_id) ^ (std::hash<int32_t>()(k.block_idx) << 16);
     }
 };
 
 // KV layer registration info
 struct kv_layer_info {
-    int layer_id;
-    size_t k_size_per_token;    // Bytes per token for K cache
-    size_t v_size_per_token;    // Bytes per token for V cache
-    void* k_base_gpu;           // Base GPU pointer for K cache
-    void* v_base_gpu;           // Base GPU pointer for V cache
-    int32_t max_tokens;         // Maximum context length
+    int        layer_id;
+    size_t     k_size_per_token;  // Bytes per token for K cache
+    size_t     v_size_per_token;  // Bytes per token for V cache
+    void *     k_base_gpu;        // Base GPU pointer for K cache
+    void *     v_base_gpu;        // Base GPU pointer for V cache
+    mem_handle k_handle;          // Owning/resolving handle for K cache
+    mem_handle v_handle;          // Owning/resolving handle for V cache
+    int        device;            // Owning SYCL device for K/V cache handles
+    int32_t    max_tokens;        // Maximum context length
 };
 
 // KV cache offload manager
@@ -83,23 +88,23 @@ struct kv_layer_info {
 // - prefetch_blocks() called to preload blocks for upcoming attention window
 // - offload_oldest() called when memory pressure requires freeing GPU memory
 class kv_offload_manager {
-public:
+  public:
     // Initialize manager with given SYCL queue and configuration
-    kv_offload_manager(sycl::queue& queue, const kv_offload_config& config);
+    kv_offload_manager(sycl::queue & queue, const kv_offload_config & config);
     ~kv_offload_manager();
 
     // Non-copyable, non-movable
-    kv_offload_manager(const kv_offload_manager&) = delete;
-    kv_offload_manager& operator=(const kv_offload_manager&) = delete;
-    kv_offload_manager(kv_offload_manager&&) = delete;
-    kv_offload_manager& operator=(kv_offload_manager&&) = delete;
+    kv_offload_manager(const kv_offload_manager &)             = delete;
+    kv_offload_manager & operator=(const kv_offload_manager &) = delete;
+    kv_offload_manager(kv_offload_manager &&)                  = delete;
+    kv_offload_manager & operator=(kv_offload_manager &&)      = delete;
 
     // === Layer Registration ===
 
     // Register KV cache tensors for a layer
     // Called during model/context initialization
     // k_cache, v_cache: ggml tensors for K and V caches
-    void register_layer(int layer_id, ggml_tensor* k_cache, ggml_tensor* v_cache);
+    void register_layer(int layer_id, ggml_tensor * k_cache, ggml_tensor * v_cache);
 
     // Check if a layer is registered
     bool is_layer_registered(int layer_id) const;
@@ -166,7 +171,9 @@ public:
     // === Stats ===
 
     size_t prefetch_hits() const { return prefetch_hits_; }
+
     size_t prefetch_misses() const { return prefetch_misses_; }
+
     float prefetch_hit_rate() const {
         size_t total = prefetch_hits_ + prefetch_misses_;
         return total > 0 ? float(prefetch_hits_) / total : 0.0f;
@@ -175,29 +182,29 @@ public:
     void print_stats() const;
     void reset_stats();
 
-private:
+  private:
     // Get or create block for a position
-    kv_block* get_block(int layer_id, int32_t pos);
+    kv_block * get_block(int layer_id, int32_t pos);
 
     // Calculate block index from token position
     int32_t pos_to_block_idx(int32_t pos) const;
 
     // Transfer block from CPU to GPU
-    sycl::event transfer_to_gpu(kv_block* block);
+    sycl::event transfer_to_gpu(kv_block * block);
 
     // Transfer block from GPU to CPU
-    sycl::event transfer_to_cpu(kv_block* block);
+    sycl::event transfer_to_cpu(kv_block * block);
 
     // Allocate CPU staging memory for a block
-    void* allocate_cpu_block(size_t size);
+    bool allocate_cpu_block(kv_block & block);
 
     // Free CPU staging memory
-    void free_cpu_block(void* ptr);
+    void free_cpu_block(kv_block & block);
 
     // Update access timestamp
-    void update_access(kv_block* block);
+    void update_access(kv_block * block);
 
-    sycl::queue& queue_;
+    sycl::queue &     queue_;
     kv_offload_config config_;
 
     // Layer registry
@@ -218,12 +225,12 @@ private:
     size_t cpu_memory_used_ = 0;
 
     // Stats
-    mutable size_t prefetch_hits_ = 0;
+    mutable size_t prefetch_hits_   = 0;
     mutable size_t prefetch_misses_ = 0;
 
     mutable std::mutex mutex_;
 };
 
-} // namespace ggml_sycl
+}  // namespace ggml_sycl
 
-#endif // GGML_SYCL_KV_OFFLOAD_HPP
+#endif  // GGML_SYCL_KV_OFFLOAD_HPP

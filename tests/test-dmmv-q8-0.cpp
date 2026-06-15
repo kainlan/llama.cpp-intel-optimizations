@@ -10,7 +10,7 @@
  * - Both DMMV (batch=1) and MMQ (batch=4) paths
  *
  * Build: cmake --build build --target test-dmmv-q8-0
- * Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-dmmv-q8-0
+ * Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-dmmv-q8-0
  */
 
 #include <cstdio>

@@ -2,7 +2,7 @@
 // This test runs SYCL kernels to load tiles using both methods and compares results
 //
 // Build: Requires SYCL, use cmake with GGML_SYCL=ON
-// Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-mmq-q8-0-tile-compare
+// Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-mmq-q8-0-tile-compare
 
 #include <cstdio>
 #include <cstdlib>

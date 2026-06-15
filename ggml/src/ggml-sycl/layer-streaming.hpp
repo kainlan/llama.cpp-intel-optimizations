@@ -7,16 +7,16 @@
 #ifndef GGML_SYCL_LAYER_STREAMING_HPP
 #define GGML_SYCL_LAYER_STREAMING_HPP
 
+#include "ggml.h"
+#include "mem-handle.hpp"
+#include "unified-cache.hpp"
+
 #include <cstddef>
 #include <mutex>
 #include <string>
+#include <sycl/sycl.hpp>
 #include <unordered_map>
 #include <vector>
-
-#include <sycl/sycl.hpp>
-
-#include "ggml.h"
-#include "unified-cache.hpp"
 
 namespace ggml_sycl {
 
@@ -38,7 +38,7 @@ class layer_stream_manager {
     ~layer_stream_manager();
 
     // Non-copyable, non-movable (owns device memory)
-    layer_stream_manager(const layer_stream_manager &)            = delete;
+    layer_stream_manager(const layer_stream_manager &)             = delete;
     layer_stream_manager & operator=(const layer_stream_manager &) = delete;
 
     // Build the layer weight map from tensor inventory.
@@ -103,7 +103,7 @@ class layer_stream_manager {
     struct weight_entry {
         std::string  name;
         size_t       size            = 0;
-        size_t       offset_in_layer = 0;  // Byte offset within layer buffer
+        size_t       offset_in_layer = 0;        // Byte offset within layer buffer
         const void * host_ptr        = nullptr;  // Host-resident data pointer (registered later)
     };
 
@@ -114,23 +114,22 @@ class layer_stream_manager {
     };
 
     // Layer data
-    std::vector<layer_info>                               layers_;         // Indexed by layer_id
-    size_t                                                max_layer_size_ = 0;
+    std::vector<layer_info>                                 layers_;            // Indexed by layer_id
+    size_t                                                  max_layer_size_ = 0;
     std::unordered_map<std::string, std::pair<int, size_t>> name_to_location_;  // name -> (layer_id, weight_idx)
 
     // Double buffers
-    void *                    buffers_[2]       = {nullptr, nullptr};
-    ggml_sycl::alloc_handle   buffer_allocs_[2] = {};   // Owns each buffer; unified_free on shutdown
-    size_t                    buffer_size_      = 0;
-    int                       loaded_layers_[2] = {-1, -1};
-    int                       device_id_        = -1;
-    sycl::context             ctx_;
+    void *     buffers_[2]        = { nullptr, nullptr };  // Cached raw ABI views; handles own lifetime.
+    mem_handle buffer_handles_[2] = {};
+    size_t     buffer_size_       = 0;
+    int        loaded_layers_[2]  = { -1, -1 };
+    int        device_id_         = -1;
 
     // Async prefetch state
-    int         prefetch_target_layer_ = -1;
-    int         prefetch_buffer_       = -1;
-    sycl::event prefetch_event_;
-    bool        prefetch_pending_      = false;
+    int                prefetch_target_layer_ = -1;
+    int                prefetch_buffer_       = -1;
+    sycl::event        prefetch_event_;
+    bool               prefetch_pending_ = false;
     mutable std::mutex prefetch_mutex_;
 
     // Host pointer registration
@@ -146,12 +145,12 @@ class layer_stream_manager {
 layer_stream_manager & get_layer_stream_manager(int device_id);
 
 // Free function API for use from ggml-sycl.cpp
-bool layer_streaming_active(int device_id);
+bool   layer_streaming_active(int device_id);
 void * layer_streaming_get_weight_ptr(int device_id, const char * name);
-void layer_streaming_ensure_layer(int device_id, int layer_id, sycl::queue & queue);
-void layer_streaming_prefetch_next(int device_id, int layer_id, sycl::queue & queue);
-void layer_streaming_await_prefetch(int device_id);
-void layer_streaming_register_host_ptr(int device_id, const char * name, const void * ptr, size_t size);
+void   layer_streaming_ensure_layer(int device_id, int layer_id, sycl::queue & queue);
+void   layer_streaming_prefetch_next(int device_id, int layer_id, sycl::queue & queue);
+void   layer_streaming_await_prefetch(int device_id);
+void   layer_streaming_register_host_ptr(int device_id, const char * name, const void * ptr, size_t size);
 
 }  // namespace ggml_sycl
 

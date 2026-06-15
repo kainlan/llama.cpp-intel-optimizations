@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <future>
+#include <utility>
 
 namespace ggml_sycl {
 
@@ -37,9 +38,7 @@ static int get_cpu_expert_thread_count() {
 // CpuExpertPool implementation
 // ---------------------------------------------------------------------------
 
-void CpuExpertPool::init(int n_threads, size_t max_experts,
-                          size_t act_dim, size_t out_dim,
-                          sycl::queue & q) {
+void CpuExpertPool::init(int n_threads, size_t max_experts, size_t act_dim, size_t out_dim, sycl::queue & q) {
     if (active_.load(std::memory_order_acquire)) {
         GGML_LOG_WARN("[CPU-EXPERT-POOL] init() called on already-active pool, ignoring\n");
         return;
@@ -66,21 +65,23 @@ void CpuExpertPool::init(int n_threads, size_t max_experts,
         req.size   = total;
         alloc_constraints c;
         c.must_host_pinned = true;
-        req.intent = { alloc_role::EXPERT_STAGING,
-                       runtime_category::EXPERT_CACHE, "cpu_expert_ring", c };
+        req.intent         = { alloc_role::EXPERT_STAGING, runtime_category::EXPERT_CACHE, "cpu_expert_ring", c };
 
-        if (!unified_alloc(req, &ring_alloc_)) {
-            GGML_LOG_WARN("[CPU-EXPERT-POOL] Failed to allocate ring buffer "
-                          "(%zu bytes), falling back to std::async\n", total);
+        ring_handle_    = unified_allocate(req);
+        auto   resolved = ring_handle_.resolve();
+        char * base     = static_cast<char *>(resolved.ptr);
+        if (!base) {
+            ring_handle_ = {};
+            GGML_LOG_WARN(
+                "[CPU-EXPERT-POOL] Failed to allocate ring buffer "
+                "(%zu bytes), falling back to std::async\n",
+                total);
             return;
         }
 
-        char * base = static_cast<char *>(ring_alloc_.ptr);
         for (int i = 0; i < RING_SLOTS; i++) {
-            ring_[i].act    = reinterpret_cast<float *>(
-                base + static_cast<size_t>(i) * per_slot);
-            ring_[i].out    = reinterpret_cast<float *>(
-                base + static_cast<size_t>(i) * per_slot + act_bytes_per_slot);
+            ring_[i].act    = reinterpret_cast<float *>(base + static_cast<size_t>(i) * per_slot);
+            ring_[i].out    = reinterpret_cast<float *>(base + static_cast<size_t>(i) * per_slot + act_bytes_per_slot);
             ring_[i].in_use = false;
         }
     }
@@ -93,12 +94,10 @@ void CpuExpertPool::init(int n_threads, size_t max_experts,
         threads_.emplace_back(&CpuExpertPool::worker_thread, this);
     }
 
-    GGML_LOG_INFO("[CPU-EXPERT-POOL] Initialized: %d threads, %d ring slots, "
-                  "%.1f KB/slot (act=%.1f KB, out=%.1f KB)\n",
-                  n_threads, RING_SLOTS,
-                  per_slot / 1024.0,
-                  act_bytes_per_slot / 1024.0,
-                  out_bytes_per_slot / 1024.0);
+    GGML_LOG_INFO(
+        "[CPU-EXPERT-POOL] Initialized: %d threads, %d ring slots, "
+        "%.1f KB/slot (act=%.1f KB, out=%.1f KB)\n",
+        n_threads, RING_SLOTS, per_slot / 1024.0, act_bytes_per_slot / 1024.0, out_bytes_per_slot / 1024.0);
 }
 
 void CpuExpertPool::worker_thread() {
@@ -106,12 +105,9 @@ void CpuExpertPool::worker_thread() {
         std::function<void()> task;
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait_for(lock, std::chrono::seconds(2), [this] {
-                return shutting_down_.load(std::memory_order_acquire)
-                       || !work_queue_.empty();
-            });
-            if (shutting_down_.load(std::memory_order_acquire)
-                && work_queue_.empty()) {
+            cv_.wait_for(lock, std::chrono::seconds(2),
+                         [this] { return shutting_down_.load(std::memory_order_acquire) || !work_queue_.empty(); });
+            if (shutting_down_.load(std::memory_order_acquire) && work_queue_.empty()) {
                 return;
             }
             // Spurious wakeup or timeout with empty queue -- loop back
@@ -138,8 +134,7 @@ std::future<void> CpuExpertPool::submit_batch(std::vector<cpu_expert_task> tasks
         // violated by several call sites, producing a UAF in the TBB
         // arena (simd_mxfp4_q8_0_16row reading a stale weight_host).
         work_queue_.push([tasks = std::move(tasks), promise]() mutable {
-            ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(),
-                                                  static_cast<int>(tasks.size()));
+            ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), static_cast<int>(tasks.size()));
             promise->set_value();
         });
     }
@@ -154,8 +149,7 @@ CpuExpertPool::StagingSlot CpuExpertPool::acquire_staging() {
             ring_[i].in_use = true;
             // Zero the output buffer for clean accumulation
             if (ring_[i].out && max_experts_ > 0 && out_stride_ > 0) {
-                std::memset(ring_[i].out, 0,
-                            max_experts_ * out_stride_ * sizeof(float));
+                std::memset(ring_[i].out, 0, max_experts_ * out_stride_ * sizeof(float));
             }
             return { ring_[i].act, ring_[i].out, i };
         }
@@ -195,10 +189,7 @@ void CpuExpertPool::shutdown() {
     threads_.clear();
     active_.store(false, std::memory_order_release);
 
-    if (ring_alloc_.ptr) {
-        unified_free(ring_alloc_);
-        ring_alloc_ = {};
-    }
+    ring_handle_ = {};
 
     // Reset ring entries
     for (int i = 0; i < RING_SLOTS; i++) {

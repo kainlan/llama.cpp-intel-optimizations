@@ -8,8 +8,40 @@
 
 #include "common.hpp"
 #include "ggml-impl.h"
+#include "mem-ops.hpp"
 
 namespace ggml_sycl {
+
+static void * dense_scheduler_alloc_slot(size_t size, sycl::queue & queue, int device_id, mem_handle & owner) {
+    owner = {};
+    if (size == 0) {
+        return nullptr;
+    }
+
+    alloc_request req{};
+    req.queue                               = &queue;
+    req.device                              = device_id;
+    req.size                                = size;
+    req.intent.role                         = alloc_role::WEIGHT;
+    req.intent.category                     = runtime_category::STAGING;
+    req.intent.cohort_id                    = "dense_scheduler_slot";
+    req.intent.constraints.must_device      = true;
+    req.intent.constraints.prefer_vram_zone = vram_zone_id::RUNTIME;
+    req.suppress_failure_log                = true;
+
+    owner = unified_allocate(req);
+    if (!owner.valid()) {
+        return nullptr;
+    }
+
+    auto resolved = owner.resolve(device_id);
+    if (!resolved || !resolved.ptr || !resolved.on_device) {
+        owner = {};
+        return nullptr;
+    }
+
+    return resolved.ptr;
+}
 
 dense_layer_scheduler::dense_layer_scheduler(sycl::queue & compute_queue, size_t max_layer_size) :
     compute_queue_(compute_queue),
@@ -17,18 +49,14 @@ dense_layer_scheduler::dense_layer_scheduler(sycl::queue & compute_queue, size_t
     device_id_(ggml_sycl_get_device_id_from_queue(compute_queue)),
     slot_size_(max_layer_size) {
     // Allocate two VRAM slots for double buffering
-    vram_slot_[0] = ggml_sycl_malloc_device(slot_size_, compute_queue_, "dense_scheduler_slot");
-    vram_slot_[1] = ggml_sycl_malloc_device(slot_size_, compute_queue_, "dense_scheduler_slot");
+    vram_slot_[0] = dense_scheduler_alloc_slot(slot_size_, compute_queue_, device_id_, vram_slot_handle_[0]);
+    vram_slot_[1] = dense_scheduler_alloc_slot(slot_size_, compute_queue_, device_id_, vram_slot_handle_[1]);
 
     if (!vram_slot_[0] || !vram_slot_[1]) {
         GGML_LOG_ERROR("[SYCL] Failed to allocate dense scheduler VRAM slots (%.1f MB each)\n",
                        slot_size_ / (1024.0 * 1024.0));
-        if (vram_slot_[0]) {
-            sycl::free(vram_slot_[0], compute_queue_);
-        }
-        if (vram_slot_[1]) {
-            sycl::free(vram_slot_[1], compute_queue_);
-        }
+        vram_slot_handle_[0] = {};
+        vram_slot_handle_[1] = {};
         vram_slot_[0] = vram_slot_[1] = nullptr;
         return;
     }
@@ -47,12 +75,10 @@ dense_layer_scheduler::~dense_layer_scheduler() {
     }
 
     // Free VRAM slots
-    if (vram_slot_[0]) {
-        sycl::free(vram_slot_[0], compute_queue_);
-    }
-    if (vram_slot_[1]) {
-        sycl::free(vram_slot_[1], compute_queue_);
-    }
+    vram_slot_[0]        = nullptr;
+    vram_slot_[1]        = nullptr;
+    vram_slot_handle_[0] = {};
+    vram_slot_handle_[1] = {};
 
     GGML_LOG_INFO("[SYCL] Dense scheduler destroyed (prefetch=%zu, sync_load=%zu)\n", prefetch_count_,
                   sync_load_count_);
@@ -114,7 +140,9 @@ void * dense_layer_scheduler::get_dense_layer(int layer_id, size_t size) {
         return nullptr;
     }
 
-    compute_queue_.memcpy(vram_slot_[current_slot_], host_ptr, size).wait();
+    mem_handle dst_handle = vram_slot_handle_[current_slot_];
+    mem_handle src_handle = ::ggml_sycl_memcpy_handle_for_raw_ptr(host_ptr, device_id_);
+    mem_copy(dst_handle, src_handle, size, compute_queue_);
     layer_in_slot_[current_slot_] = layer_id;
     sync_load_count_++;
 
@@ -159,8 +187,10 @@ void dense_layer_scheduler::prefetch_next(int next_layer_id, size_t size) {
         return;
     }
 
-    // Start async copy to prefetch slot
-    pending_prefetch_             = copy_queue_.memcpy(vram_slot_[prefetch_slot], host_ptr, size);
+    // Start async copy to prefetch slot through the canonical mem_handle copy helper.
+    mem_handle dst_handle         = vram_slot_handle_[prefetch_slot];
+    mem_handle src_handle         = ::ggml_sycl_memcpy_handle_for_raw_ptr(host_ptr, device_id_);
+    pending_prefetch_             = mem_copy_async(dst_handle, src_handle, size, copy_queue_);
     has_pending_prefetch_         = true;
     layer_in_slot_[prefetch_slot] = next_layer_id;
     prefetch_count_++;

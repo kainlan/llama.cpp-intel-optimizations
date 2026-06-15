@@ -4,7 +4,7 @@
 // MMVQ is used for batch sizes 2-32 (between DMMV batch=1 and MMQ batch>32).
 //
 // Build: cmake --build build --target test-mmvq-q6k-soa-rowslice
-// Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-mmvq-q6k-soa-rowslice
+// Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-mmvq-q6k-soa-rowslice
 
 #include <cstdio>
 #include <cstdlib>

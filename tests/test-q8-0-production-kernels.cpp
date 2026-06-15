@@ -9,7 +9,7 @@
  * This helps isolate whether the bug is in SoA reordering or kernel access.
  *
  * Build: cmake --build build --target test-q8-0-production-kernels
- * Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-q8-0-production-kernels
+ * Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-q8-0-production-kernels
  */
 
 #include <cstdio>

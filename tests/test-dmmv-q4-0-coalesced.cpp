@@ -8,7 +8,7 @@
 // better cache line utilization during DMMV operations.
 //
 // Build: cmake --build build --target test-dmmv-q4-0-coalesced
-// Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-dmmv-q4-0-coalesced
+// Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-dmmv-q4-0-coalesced
 
 #ifndef GGML_SYCL_WARP_SIZE
 #define GGML_SYCL_WARP_SIZE 32

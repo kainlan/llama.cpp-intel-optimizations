@@ -6,7 +6,7 @@
 //   icpx -fsycl -O2 -I../ggml/include -I../ggml/src tests/test_dmmv_soa.cpp -o test_dmmv_soa
 //
 // Run:
-//   ONEAPI_DEVICE_SELECTOR=level_zero:1 ./test_dmmv_soa
+//   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./test_dmmv_soa
 
 #include <sycl/sycl.hpp>
 #include <cstdio>

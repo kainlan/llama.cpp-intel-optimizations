@@ -5,7 +5,7 @@
 // inputs, using a single SYCL device.
 //
 // Usage:
-//   ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-mxfp4-xmx-tiled
+//   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-mxfp4-xmx-tiled
 
 #include <cstdio>
 #include <cstdlib>
@@ -70,7 +70,7 @@ static bool compare_buffers(const std::vector<uint8_t> & ref,
 
 int main() {
     if (!getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:1", 1);
+        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
     }
 
     const auto & info = ggml_sycl_info();

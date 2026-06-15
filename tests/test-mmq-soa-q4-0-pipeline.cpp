@@ -2,7 +2,7 @@
 // This test calls the same functions used by the real MMQ kernel to find where SoA diverges from AoS
 //
 // Build: cmake --build build --target test-mmq-soa-q4-0-pipeline
-// Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-mmq-soa-q4-0-pipeline
+// Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-mmq-soa-q4-0-pipeline
 
 #include <sycl/sycl.hpp>
 #include <cstdio>

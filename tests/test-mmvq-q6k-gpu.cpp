@@ -1,6 +1,6 @@
 // Unit test for Q6_K MMVQ kernel - compares GPU vs CPU reference
 // Build: icpx -fsycl -O2 -I../ggml/include -I../ggml/src tests/test-mmvq-q6k-gpu.cpp -o test-mmvq-q6k-gpu
-// Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./test-mmvq-q6k-gpu
+// Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./test-mmvq-q6k-gpu
 
 #include <cstdio>
 #include <cstdlib>

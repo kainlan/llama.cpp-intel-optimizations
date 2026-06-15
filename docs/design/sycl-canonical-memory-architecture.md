@@ -398,16 +398,15 @@ dispatch is tracked in:
 | `llama.cpp-32dg8.10` | Migrate remaining op call sites |
 | `llama.cpp-32dg8.15.17` | Build host-fallback coverage matrix, file per-op blockers |
 
-### 9.3 `unified_cache_enabled()` / `weights_evictable()` branches
+### 9.3 Optional cache branches
 
-52 sites branch on `unified_cache_enabled()` or `unified_cache_active()` equivalent
-guards (excluding `unified-cache.hpp` and `unified-cache.cpp` themselves; per
-`grep -rn 'unified_cache_enabled|unified_cache_active' ggml/src/ggml-sycl/`).
-These are temporarily allowed as the optional-cache mode is removed:
+The optional unified-cache mode has been removed. Remaining memory-routing branches
+should express concrete conditions such as weight eviction, placement-plan state, or
+host accessibility rather than cache enablement.
 
 | Owner bead | Action |
 |---|---|
-| `llama.cpp-32dg8.4` | Remove optional unified-cache mode branches (`unified_cache_enabled()` checks) |
+| `llama.cpp-32dg8.4` | Removed optional unified-cache mode branches |
 | `llama.cpp-32dg8.3` | Delete legacy host-weight fallback registration (precondition for T3) |
 
 ### 9.4 `mem_handle::from_direct` with implicit device 0
@@ -429,7 +428,7 @@ temporarily allowed but must be audited for multi-GPU callers:
 | `llama.cpp-32dg8.1` | T0 — this document | all |
 | `llama.cpp-32dg8.2` | T1 — S1-PRELOAD consumes `placement_plan` entries directly | §1.1, §5.1 |
 | `llama.cpp-32dg8.3` | T2 — Delete legacy host-weight fallback registration | §9.3 |
-| `llama.cpp-32dg8.4` | T3 — Remove optional unified-cache mode branches | §9.3 |
+| `llama.cpp-32dg8.4` | T3 — Removed optional unified-cache mode branches | §9.3 |
 | `llama.cpp-32dg8.5` | T4 — Planner covers all SYCL memory domains | §1.1, §5, §9.1 |
 | `llama.cpp-32dg8.6` | T5 — Unified cache as sole allocator | §1.2, §3, §9.1 |
 | `llama.cpp-32dg8.7` | T6 — Expand `mem_handle` into universal handle | §1.3, §4, §9.4 |

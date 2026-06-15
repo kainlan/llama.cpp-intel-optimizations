@@ -14,6 +14,7 @@
 
 #include "common.hpp"
 #include "ggml-sycl-bench.hpp"
+#include "mem-ops.hpp"
 #include "mmq-esimd.hpp"
 #include "mmq-xmx.hpp"
 #include "vecdotq.hpp"
@@ -80,6 +81,40 @@ enum class ggml_sycl_q6k_tune {
     spillfree,
     perf,
 };
+
+static bool ggml_sycl_mmq_alloc_host_stage(size_t                  bytes,
+                                           sycl::queue &           queue,
+                                           int                     device,
+                                           const char *            cohort_id,
+                                           ggml_sycl::mem_handle & owner) {
+    owner = {};
+    if (bytes == 0) {
+        return true;
+    }
+
+    ggml_sycl::alloc_request req{};
+    req.queue                               = &queue;
+    req.device                              = device;
+    req.size                                = bytes;
+    req.intent.role                         = ggml_sycl::alloc_role::STAGING;
+    req.intent.category                     = ggml_sycl::runtime_category::STAGING;
+    req.intent.cohort_id                    = cohort_id;
+    req.intent.constraints.must_host_pinned = true;
+    req.intent.constraints.use_pinned_pool  = true;
+    req.suppress_failure_log                = true;
+
+    owner = ggml_sycl::unified_allocate(req);
+    if (!owner.valid()) {
+        return false;
+    }
+
+    auto resolved = owner.resolve(device);
+    if (!resolved || !resolved.ptr || resolved.on_device) {
+        owner = {};
+        return false;
+    }
+    return true;
+}
 
 static bool ggml_sycl_env_equals(const char * value, const char * expected) {
     if (value == nullptr || expected == nullptr) {
@@ -214,8 +249,9 @@ static int get_tiles_per_batch() {
 
 // Static work counter for persistent kernel (per-device, lazily allocated)
 // Uses device memory for atomic operations
-static std::mutex s_mmq_persistent_mutex;
-static int32_t *  s_mmq_work_counters[GGML_SYCL_MAX_DEVICES] = { nullptr };
+static std::mutex              s_mmq_persistent_mutex;
+static int32_t *               s_mmq_work_counters[GGML_SYCL_MAX_DEVICES]        = { nullptr };
+static ggml_sycl::mem_handle * s_mmq_work_counter_handles[GGML_SYCL_MAX_DEVICES] = { nullptr };
 
 // Get or allocate work counter for a device
 static int32_t * get_mmq_work_counter(dpct::queue_ptr stream) {
@@ -232,9 +268,44 @@ static int32_t * get_mmq_work_counter(dpct::queue_ptr stream) {
     // Slow path: allocate with lock
     std::lock_guard<std::mutex> lock(s_mmq_persistent_mutex);
     if (s_mmq_work_counters[device_id] == nullptr) {
-        s_mmq_work_counters[device_id] = ggml_sycl_malloc_device_tracked_t<int32_t>(1, *stream, "mmq_work_counter");
+        ggml_sycl::alloc_request req{};
+        req.queue                               = stream;
+        req.device                              = device_id;
+        req.size                                = sizeof(int32_t);
+        req.intent.role                         = ggml_sycl::alloc_role::GRAPH_TMP;
+        req.intent.category                     = ggml_sycl::runtime_category::GRAPH;
+        req.intent.cohort_id                    = "mmq_work_counter";
+        req.intent.constraints.must_device      = true;
+        req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::SCRATCH;
+        req.suppress_failure_log                = true;
+
+        ggml_sycl::mem_handle owner = ggml_sycl::unified_allocate(req);
+        if (!owner.valid()) {
+            return nullptr;
+        }
+
+        auto ptr = owner.resolve(device_id);
+        if (!ptr || !ptr.ptr || !ptr.on_device) {
+            return nullptr;
+        }
+
+        // Process-lifetime owner: persistent kernels reuse this counter across
+        // dispatches, and freeing SYCL USM from static teardown is not safe.
+        s_mmq_work_counter_handles[device_id] = new ggml_sycl::mem_handle(std::move(owner));
+        s_mmq_work_counters[device_id]        = static_cast<int32_t *>(ptr.ptr);
     }
     return s_mmq_work_counters[device_id];
+}
+
+static ggml_sycl::mem_handle * get_mmq_work_counter_handle(dpct::queue_ptr stream) {
+    int device_id = ggml_sycl_get_device_id_from_queue(*stream);
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return nullptr;
+    }
+    if (s_mmq_work_counters[device_id] == nullptr && get_mmq_work_counter(stream) == nullptr) {
+        return nullptr;
+    }
+    return s_mmq_work_counter_handles[device_id];
 }
 
 template <typename KernelFunc, typename PropertiesT, int Dims> struct ggml_sycl_kernel_with_properties {
@@ -3025,7 +3096,7 @@ static void mul_mat_q4_0_soa_persistent(const uint8_t * __restrict__ qs_base,
     // Persistent loop - work until all tiles processed
     while (true) {
         // Work-stealing: thread 0 atomically acquires next tile
-        int work_idx;
+        int work_idx = 0;
         if (local_id == 0) {
             sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
                              sycl::access::address_space::global_space>
@@ -3464,7 +3535,7 @@ static void mul_mat_q4_0_coalesced_persistent(const uint8_t * __restrict__ qs_ba
 
     while (true) {
         // Work-stealing: thread 0 atomically acquires a batch of tiles
-        int batch_start;
+        int batch_start = 0;
         if (local_id == 0) {
             sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
                              sycl::access::address_space::global_space>
@@ -4538,7 +4609,7 @@ static void ggml_mul_mat_q4_0_q8_1_sycl(const void *    vx,
                                         const int       nrows_dst,
                                         dpct::queue_ptr stream) try {
     int id;
-    id = ggml_sycl_get_device_id_from_queue(*stream);
+    id                           = ggml_sycl_get_device_id_from_queue(*stream);
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
     int mmq_x, mmq_y, nwarps;
@@ -4710,7 +4781,7 @@ static void ggml_mul_mat_q6_K_q8_1_sycl_coalesced(const void *    vx,
                                                   const int       row_low,
                                                   dpct::queue_ptr stream) try {
     int id;
-    id = ggml_sycl_get_device_id_from_queue(*stream);
+    id                           = ggml_sycl_get_device_id_from_queue(*stream);
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
     const uint8_t * qs_base = (const uint8_t *) vx;
@@ -4789,7 +4860,7 @@ static void ggml_mul_mat_q4_0_q8_1_sycl_soa(const void *    vx,
                                             const int       row_low,
                                             dpct::queue_ptr stream) try {
     int id;
-    id = ggml_sycl_get_device_id_from_queue(*stream);
+    id                           = ggml_sycl_get_device_id_from_queue(*stream);
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
     // Get base pointer - don't pre-compute d_base to avoid graph capture issues
@@ -4811,21 +4882,22 @@ static void ggml_mul_mat_q4_0_q8_1_sycl_soa(const void *    vx,
 
         // Query hardware for optimal persistent group count
         int device_id;
-        device_id = ggml_sycl_get_device_id_from_queue(*stream);
+        device_id                              = ggml_sycl_get_device_id_from_queue(*stream);
         const int            persistent_groups = get_persistent_groups(device_id);
         const sycl::range<3> block_nums_persistent(1, 1, persistent_groups);
         const sycl::range<3> block_dims(1, nwarps, WARP_SIZE);
         const bool           need_check = (nrows_x % mmq_y != 0);
 
         // Get or allocate work counter for this device
-        int32_t * work_counter = get_mmq_work_counter(stream);
-        if (!work_counter) {
+        int32_t *               work_counter        = get_mmq_work_counter(stream);
+        ggml_sycl::mem_handle * work_counter_handle = get_mmq_work_counter_handle(stream);
+        if (!work_counter || !work_counter_handle) {
             // Fallback to static kernel if allocation fails
             goto static_kernel_path;
         }
 
         // Reset work counter to 0
-        stream->memset(work_counter, 0, sizeof(int32_t));
+        ggml_sycl::mem_fill(*work_counter_handle, 0, sizeof(int32_t), *stream);
 
         dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
         if (!need_check) {
@@ -4936,7 +5008,7 @@ static void ggml_mul_mat_q4_0_q8_1_sycl_coalesced(const void *    vx,
                                                   const int       row_low,
                                                   dpct::queue_ptr stream) try {
     int id;
-    id = ggml_sycl_get_device_id_from_queue(*stream);
+    id                           = ggml_sycl_get_device_id_from_queue(*stream);
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
     const uint8_t * qs_base = (const uint8_t *) vx;
@@ -4959,14 +5031,15 @@ static void ggml_mul_mat_q4_0_q8_1_sycl_coalesced(const void *    vx,
         const bool           need_check = (nrows_x % mmq_y != 0);
 
         // Get or allocate work counter for this device
-        int32_t * work_counter = get_mmq_work_counter(stream);
-        if (!work_counter) {
+        int32_t *               work_counter        = get_mmq_work_counter(stream);
+        ggml_sycl::mem_handle * work_counter_handle = get_mmq_work_counter_handle(stream);
+        if (!work_counter || !work_counter_handle) {
             // Fallback to static kernel if allocation fails
             goto static_kernel_path;
         }
 
         // Reset work counter to 0
-        stream->memset(work_counter, 0, sizeof(int32_t));
+        ggml_sycl::mem_fill(*work_counter_handle, 0, sizeof(int32_t), *stream);
 
         dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
         if (!need_check) {
@@ -5071,7 +5144,7 @@ static void ggml_mul_mat_q4_1_q8_1_sycl(const void *    vx,
                                         const int       nrows_dst,
                                         dpct::queue_ptr stream) try {
     int id;
-    id = ggml_sycl_get_device_id_from_queue(*stream);
+    id                           = ggml_sycl_get_device_id_from_queue(*stream);
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
     int mmq_x, mmq_y, nwarps;
@@ -5168,7 +5241,7 @@ static void ggml_mul_mat_q5_0_q8_1_sycl(const void *    vx,
                                         const int       nrows_dst,
                                         dpct::queue_ptr stream) try {
     int id;
-    id = ggml_sycl_get_device_id_from_queue(*stream);
+    id                           = ggml_sycl_get_device_id_from_queue(*stream);
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
     int mmq_x, mmq_y, nwarps;
@@ -5267,7 +5340,7 @@ static void ggml_mul_mat_q5_1_q8_1_sycl(const void *    vx,
                                         const int       nrows_dst,
                                         dpct::queue_ptr stream) try {
     int id;
-    id = ggml_sycl_get_device_id_from_queue(*stream);
+    id                           = ggml_sycl_get_device_id_from_queue(*stream);
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
     int mmq_x, mmq_y, nwarps;
@@ -5366,7 +5439,7 @@ static void ggml_mul_mat_q8_0_q8_1_sycl(const void *    vx,
                                         const int       nrows_dst,
                                         dpct::queue_ptr stream) try {
     int id;
-    id = ggml_sycl_get_device_id_from_queue(*stream);
+    id                           = ggml_sycl_get_device_id_from_queue(*stream);
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
     int mmq_x, mmq_y, nwarps;
@@ -5472,7 +5545,7 @@ static void ggml_mul_mat_q8_0_q8_1_sycl_soa(const void *    vx,
                                             const int       row_low,
                                             dpct::queue_ptr stream) try {
     int id;
-    id = ggml_sycl_get_device_id_from_queue(*stream);
+    id                           = ggml_sycl_get_device_id_from_queue(*stream);
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
     // Get base pointer - don't pre-compute d_base to avoid graph capture issues
@@ -5550,7 +5623,7 @@ static void ggml_mul_mat_q8_0_q8_1_sycl_coalesced(const void *    vx,
                                                   const int       row_low,
                                                   dpct::queue_ptr stream) try {
     int id;
-    id = ggml_sycl_get_device_id_from_queue(*stream);
+    id                           = ggml_sycl_get_device_id_from_queue(*stream);
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
     const int8_t * qs_base = (const int8_t *) vx;
@@ -5618,7 +5691,7 @@ static void ggml_mul_mat_q2_K_q8_1_sycl(const void *    vx,
                                         const int       nrows_dst,
                                         dpct::queue_ptr stream) try {
     int id;
-    id = ggml_sycl_get_device_id_from_queue(*stream);
+    id                           = ggml_sycl_get_device_id_from_queue(*stream);
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
     int mmq_x, mmq_y, nwarps;
@@ -5723,7 +5796,7 @@ static void ggml_mul_mat_q3_K_q8_1_sycl(const void *    vx,
 #if QK_K == 256
 
     int id;
-    id = ggml_sycl_get_device_id_from_queue(*stream);
+    id                           = ggml_sycl_get_device_id_from_queue(*stream);
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
     int mmq_x, mmq_y, nwarps;
@@ -5831,7 +5904,7 @@ static void ggml_mul_mat_q4_K_q8_1_sycl(const void *    vx,
                                         const int       nrows_dst,
                                         dpct::queue_ptr stream) try {
     int id;
-    id = ggml_sycl_get_device_id_from_queue(*stream);
+    id                           = ggml_sycl_get_device_id_from_queue(*stream);
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
     int mmq_x, mmq_y, nwarps;
@@ -5936,7 +6009,7 @@ static void ggml_mul_mat_q5_K_q8_1_sycl(const void *    vx,
                                         const int       nrows_dst,
                                         dpct::queue_ptr stream) try {
     int id;
-    id = ggml_sycl_get_device_id_from_queue(*stream);
+    id                           = ggml_sycl_get_device_id_from_queue(*stream);
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
     int mmq_x, mmq_y, nwarps;
@@ -6043,7 +6116,7 @@ static void ggml_mul_mat_q6_K_q8_1_sycl(const void *    vx,
                                         const int       nrows_dst,
                                         dpct::queue_ptr stream) try {
     int id;
-    id = ggml_sycl_get_device_id_from_queue(*stream);
+    id                           = ggml_sycl_get_device_id_from_queue(*stream);
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
 #if defined(GGML_SYCL_MMQ_Q6K_PERF)
@@ -6152,11 +6225,11 @@ static void ggml_mul_mat_q6_K_q8_1_sycl_soa(const void *    vx,
                                             const int       nrows_dst,
                                             const size_t    qh_offset,
                                             const size_t    scales_offset,
-    const size_t    d_offset,
-    const int       row_low,
-    dpct::queue_ptr stream) try {
+                                            const size_t    d_offset,
+                                            const int       row_low,
+                                            dpct::queue_ptr stream) try {
     int id;
-    id = ggml_sycl_get_device_id_from_queue(*stream);
+    id                           = ggml_sycl_get_device_id_from_queue(*stream);
     const int compute_capability = ggml_sycl_info().devices[id].cc;
 
     // Get base pointer - all offsets computed from ql base
@@ -6695,9 +6768,16 @@ static sycl::event mmq_stream_copy(sycl::queue &                    queue,
                                    const void *                     ctx_void,
                                    const std::vector<sycl::event> & deps) {
     GGML_UNUSED(src_size);
-    const auto * ctx = static_cast<const mmq_stream_ctx *>(ctx_void);
+    const auto * ctx          = static_cast<const mmq_stream_ctx *>(ctx_void);
+    const int    queue_device = ggml_sycl_get_device_id_from_queue(queue);
     if (!ctx || ctx->segment_count == 0 || ctx->row_total_bytes == 0) {
-        return queue.memcpy(device_slice, static_cast<const char *>(src_ptr) + offset_bytes, slice_bytes, deps);
+        auto dst_handle =
+            ggml_sycl::mem_handle::from_chunk_ptr(device_slice, queue_device, GGML_LAYOUT_AOS, /*on_device=*/true);
+        const bool src_on_device = ggml_sycl_get_alloc_type(src_ptr) == sycl::usm::alloc::device;
+        auto       src_handle    = ggml_sycl::mem_handle::from_chunk_ptr(const_cast<void *>(src_ptr), queue_device,
+                                                                         GGML_LAYOUT_AOS, src_on_device);
+        GGML_ASSERT(dst_handle.valid() && src_handle.valid());
+        return ggml_sycl::mem_copy_async(dst_handle, 0, src_handle, offset_bytes, slice_bytes, queue, deps);
     }
     GGML_ASSERT(offset_bytes % ctx->row_total_bytes == 0);
     GGML_ASSERT(slice_bytes % ctx->row_total_bytes == 0);
@@ -6708,8 +6788,9 @@ static sycl::event mmq_stream_copy(sycl::queue &                    queue,
 
     const sycl::usm::alloc src_alloc = ggml_sycl_get_alloc_type(ctx->src_base);
     if (src_alloc != sycl::usm::alloc::device) {
-        uint8_t * host_slice     = nullptr;
-        bool      use_persistent = (ctx->host_staging != nullptr && ctx->host_staging_size >= slice_bytes);
+        uint8_t *             host_slice = nullptr;
+        ggml_sycl::mem_handle host_stage_handle;
+        bool                  use_persistent = (ctx->host_staging != nullptr && ctx->host_staging_size >= slice_bytes);
         if (use_persistent) {
             if (ctx->has_prev_staging_evt) {
                 ctx->prev_staging_evt.wait();
@@ -6717,12 +6798,17 @@ static sycl::event mmq_stream_copy(sycl::queue &                    queue,
             }
             host_slice = static_cast<uint8_t *>(ctx->host_staging);
         } else {
-            host_slice =
-                static_cast<uint8_t *>(ggml_sycl_malloc_host_tracked_bytes(slice_bytes, queue, "mmq:host_stage"));
-            if (!host_slice) {
+            if (!ggml_sycl_mmq_alloc_host_stage(slice_bytes, queue, queue_device, "mmq:host_stage",
+                                                host_stage_handle)) {
                 throw sycl::exception(sycl::make_error_code(sycl::errc::memory_allocation),
                                       "MMQ stream: host staging allocation failed");
             }
+            const auto host_stage = host_stage_handle.resolve(queue_device);
+            if (!host_stage || !host_stage.ptr || host_stage.on_device) {
+                throw sycl::exception(sycl::make_error_code(sycl::errc::memory_allocation),
+                                      "MMQ stream: host staging resolve failed");
+            }
+            host_slice = static_cast<uint8_t *>(host_stage.ptr);
         }
         size_t dst_offset = 0;
         for (int i = 0; i < ctx->segment_count; ++i) {
@@ -6736,17 +6822,17 @@ static sycl::event mmq_stream_copy(sycl::queue &                    queue,
             dst_offset += bytes;
         }
         GGML_ASSERT(dst_offset == slice_bytes);
-        sycl::event evt = queue.memcpy(device_slice, host_slice, slice_bytes, deps);
+        auto dst_handle =
+            ggml_sycl::mem_handle::from_chunk_ptr(device_slice, queue_device, GGML_LAYOUT_AOS, /*on_device=*/true);
+        ggml_sycl::mem_handle src_handle =
+            use_persistent ?
+                ggml_sycl::mem_handle::from_chunk_ptr(host_slice, queue_device, GGML_LAYOUT_AOS, /*on_device=*/false) :
+                host_stage_handle;
+        GGML_ASSERT(dst_handle.valid() && src_handle.valid());
+        sycl::event evt = ggml_sycl::mem_copy_async(dst_handle, src_handle, slice_bytes, queue, deps);
         if (use_persistent) {
             ctx->prev_staging_evt     = evt;
             ctx->has_prev_staging_evt = true;
-        } else if (auto * cache = ggml_sycl::get_unified_cache(queue)) {
-            cache->defer_host_free(host_slice, slice_bytes, evt);
-        } else {
-            if (!ggml_sycl_graph_recording_active()) {
-                evt.wait();
-            }
-            ggml_sycl_free_host_tracked_bytes(host_slice, slice_bytes, queue);
         }
         return evt;
     }
@@ -6754,6 +6840,12 @@ static sycl::event mmq_stream_copy(sycl::queue &                    queue,
     size_t                   dst_offset = 0;
     std::vector<sycl::event> cur_deps   = deps;
     sycl::event              last_evt;
+    auto                     src_handle =
+        ggml_sycl::mem_handle::from_chunk_ptr(const_cast<uint8_t *>(ctx->src_base), queue_device, GGML_LAYOUT_AOS,
+                                              /*on_device=*/true);
+    auto dst_handle =
+        ggml_sycl::mem_handle::from_chunk_ptr(device_slice, queue_device, GGML_LAYOUT_AOS, /*on_device=*/true);
+    GGML_ASSERT(src_handle.valid() && dst_handle.valid());
 
     for (int i = 0; i < ctx->segment_count; ++i) {
         const auto & seg   = ctx->segments[i];
@@ -6761,9 +6853,8 @@ static sycl::event mmq_stream_copy(sycl::queue &                    queue,
         if (bytes == 0) {
             continue;
         }
-        const uint8_t * src = ctx->src_base + seg.src_base + src_row * seg.bytes_per_row;
-        void *          dst = static_cast<uint8_t *>(device_slice) + dst_offset;
-        last_evt            = queue.memcpy(dst, src, bytes, cur_deps);
+        const size_t src_offset = seg.src_base + src_row * seg.bytes_per_row;
+        last_evt = ggml_sycl::mem_copy_async(dst_handle, dst_offset, src_handle, src_offset, bytes, queue, cur_deps);
         cur_deps.assign(1, last_evt);
         dst_offset += bytes;
     }
@@ -6797,7 +6888,9 @@ static sycl::event mmq_stream_copy(sycl::queue &                    queue,
         }
 
         std::vector<sycl::event> verify_deps = cur_deps;
-        sycl::event              verify_evt  = queue.memcpy(actual.data(), device_slice, probe_bytes, verify_deps);
+        auto actual_handle     = ggml_sycl::mem_handle::from_direct(actual.data(), GGML_LAYOUT_AOS, /*on_device=*/false,
+                                                                    ggml_sycl::mem_handle::HOST_DEVICE);
+        sycl::event verify_evt = ggml_sycl::mem_copy_async(actual_handle, dst_handle, probe_bytes, queue, verify_deps);
         if (!g_ggml_sycl_graph_recording) {
             verify_evt.wait();
         }
@@ -6971,8 +7064,7 @@ void ggml_sycl_op_mul_mat_q(ggml_backend_sycl_context & ctx,
         return ggml_sycl::cache_location::HOST_MMAP;
     };
 
-    ggml_sycl::unified_cache * cache =
-        ggml_sycl::unified_cache_enabled() ? ggml_sycl::get_unified_cache(*stream) : nullptr;
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache(*stream);
     ggml_sycl_cache_id cache_key =
         cache ? ggml_backend_sycl_get_weight_cache_key(src0, device_id) : ggml_sycl_cache_id{};
 

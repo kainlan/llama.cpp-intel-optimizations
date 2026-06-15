@@ -611,7 +611,7 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_MXFP4> {
             sumi = ggml_sycl_dp4a(v.y(), q8[l + 4], sumi);
         }
 
-        const float d = ggml_sycl_e8m0_to_fp32(e8m0) * 0.5f * (*q8_1_ds)[0];
+        const float d = sycl_e8m0_to_fp32_half(e8m0) * (*q8_1_ds)[0];
         return d * sumi;
     };
 };
@@ -881,7 +881,7 @@ static __dpct_inline__ float vec_dot_mxfp4_q8_1(const void * __restrict__ vbq,
         sumi = ggml_sycl_dp4a(v.y(), q8[l + 4], sumi);
     }
 
-    const float d = ggml_sycl_e8m0_to_fp32(bq4->e) * 0.5f * (bq8_1->ds)[0];
+    const float d = sycl_e8m0_to_fp32_half(bq4->e) * (bq8_1->ds)[0];
     return d * sumi;
 }
 

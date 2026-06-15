@@ -20,10 +20,14 @@
 //
 
 #include "persistent-tg-kernel.hpp"
-#include "ggml.h"       // For GGML_TYPE_* constants
+
+#include "common.hpp"
 #include "ggml-impl.h"  // For GGML_LOG_WARN
+#include "ggml.h"       // For GGML_TYPE_* constants
+#include "mem-ops.hpp"
 
 #include <algorithm>
+#include <utility>
 #include <vector>
 
 namespace ggml_sycl {
@@ -98,8 +102,10 @@ template <int WORKGROUP_SIZE> class PersistentDMMVKernel {
     // @param config_    Kernel configuration (tile sizes, sync options)
     // @param slm_       Local memory accessor for shared storage
     // @param item_      SYCL nd_item for thread identification
-    PersistentDMMVKernel(const PersistentTGArgs args_, const PersistentTGConfig config_,
-                         sycl::local_accessor<float, 1> slm_, sycl::nd_item<1> item_) :
+    PersistentDMMVKernel(const PersistentTGArgs         args_,
+                         const PersistentTGConfig       config_,
+                         sycl::local_accessor<float, 1> slm_,
+                         sycl::nd_item<1>               item_) :
         args(args_),
         config(config_),
         slm(slm_),
@@ -298,12 +304,38 @@ sycl::event launch_persistent_tg_kernel(sycl::queue &                           
         }
     }
 
-    // Allocate device-accessible memory for the resolved weights array.
-    // The kernel reads layer_weights[i] on-device, so this must be in USM.
-    const size_t weights_bytes = args.n_layers * sizeof(LayerWeights);
-    LayerWeights * dev_weights = static_cast<LayerWeights *>(ggml_sycl_malloc_device(weights_bytes, q, "ptg_dev_weights"));
-    GGML_ASSERT(dev_weights != nullptr);
-    q.memcpy(dev_weights, resolved_weights.data(), weights_bytes).wait();
+    // Allocate device-accessible memory for the resolved weights array through
+    // unified-cache so the pointer table lifetime follows the submitted event.
+    const size_t  weights_bytes = args.n_layers * sizeof(LayerWeights);
+    alloc_request req{};
+    req.queue                               = &q;
+    req.device                              = ggml_sycl_get_device_id_from_queue(q);
+    req.size                                = weights_bytes;
+    req.intent.role                         = alloc_role::GRAPH_TMP;
+    req.intent.category                     = runtime_category::GRAPH;
+    req.intent.cohort_id                    = "ptg_dev_weights";
+    req.intent.constraints.must_device      = true;
+    req.intent.constraints.prefer_vram_zone = vram_zone_id::SCRATCH;
+    req.suppress_failure_log                = true;
+
+    alloc_handle weights_alloc{};
+    if (!unified_alloc(req, &weights_alloc) || !weights_alloc.ptr) {
+        GGML_LOG_WARN("[PERSISTENT-TG] Failed to allocate %zu-byte resolved weight table on device %d\n", weights_bytes,
+                      req.device);
+        return {};
+    }
+
+    mem_handle weights_owner = mem_handle::from_owned_alloc(std::move(weights_alloc), GGML_LAYOUT_AOS);
+    auto       weights_ptr   = weights_owner.resolve(req.device);
+    if (!weights_ptr || !weights_ptr.on_device) {
+        GGML_LOG_WARN("[PERSISTENT-TG] Failed to resolve resolved weight table on device %d\n", req.device);
+        return {};
+    }
+
+    LayerWeights * dev_weights = static_cast<LayerWeights *>(weights_ptr.ptr);
+    mem_handle     resolved_weights_host =
+        mem_handle::from_direct(resolved_weights.data(), GGML_LAYOUT_AOS, /*on_device=*/false, mem_handle::HOST_DEVICE);
+    mem_copy(weights_owner, resolved_weights_host, weights_bytes, q);
 
     PersistentTGArgs resolved_args = args;
     resolved_args.layer_weights    = dev_weights;
@@ -340,14 +372,9 @@ sycl::event launch_persistent_tg_kernel(sycl::queue &                           
         });
     });
 
-    // Free the device weights array after kernel completes.
-    // Use host_task to ensure async cleanup without blocking.
-    q.submit([&](sycl::handler & cgh) {
-        cgh.depends_on(e);
-        cgh.host_task([dev_weights_ptr = dev_weights, &q]() {
-            sycl::free(dev_weights_ptr, q);
-        });
-    });
+    std::vector<mem_handle> retained;
+    retained.emplace_back(std::move(weights_owner));
+    retain_handles_until_event(std::move(retained), e);
 
     return e;
 }
@@ -356,7 +383,9 @@ sycl::event launch_persistent_tg_kernel(sycl::queue &                           
 // can_use_persistent_tg Implementation
 // =============================================================================
 
-bool can_use_persistent_tg(int n_layers, int hidden_dim, int quant_type,
+bool can_use_persistent_tg(int                                  n_layers,
+                           int                                  hidden_dim,
+                           int                                  quant_type,
                            const ggml_sycl_unified::XMXConfig & xmx_config) {
     const auto & cfg = xmx_config;
 

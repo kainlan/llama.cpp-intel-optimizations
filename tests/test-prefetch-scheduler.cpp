@@ -12,6 +12,15 @@
 
 using namespace ggml_sycl;
 
+static ggml_sycl_cache_id make_prefetch_cache_id(uint64_t name_hash, size_t nbytes) {
+    ggml_sycl_cache_id id{};
+    id.valid     = true;
+    id.model_id  = 42;
+    id.nbytes    = nbytes;
+    id.name_hash = name_hash;
+    return id;
+}
+
 // Test 1: Default lookahead
 bool test_default_lookahead() {
     PrefetchScheduler scheduler;
@@ -141,7 +150,47 @@ bool test_is_prefetching() {
     return true;
 }
 
-// Test 9: Hit rate calculation
+// Test 9: Cache-ID based tracking
+bool test_cache_id_tracking() {
+    PrefetchScheduler scheduler;
+    scheduler.set_lookahead(2);
+
+    int                             data0, data1, data2;
+    std::vector<void *>             tensors = { &data0, &data1, &data2 };
+    std::vector<size_t>             sizes   = { 1024 * 1024, 2048 * 1024, 3072 * 1024 };
+    std::vector<int>                layers  = { 0, 1, 2 };
+    std::vector<ggml_sycl_cache_id> ids     = {
+        make_prefetch_cache_id(101, sizes[0]),
+        make_prefetch_cache_id(102, sizes[1]),
+        make_prefetch_cache_id(103, sizes[2]),
+    };
+
+    assert(scheduler.analyze_graph(tensors, sizes, layers, &ids) == 3);
+    assert(scheduler.needs_prefetch(ids[1], 1, 0) == true);
+    assert(scheduler.is_prefetching(ids[1]) == false);
+
+    auto requests = scheduler.on_kernel_start(0);
+    assert(requests.size() == 2);
+    assert(requests[0].cache_id.valid);
+    assert(requests[0].cache_id.name_hash == ids[1].name_hash);
+    assert(scheduler.is_prefetching(ids[1]) == true);
+    assert(scheduler.needs_prefetch(ids[1], 1, 0) == false);
+
+    scheduler.mark_completed(ids[1]);
+    assert(scheduler.is_prefetching(ids[1]) == false);
+    assert(scheduler.is_prefetching(ids[2]) == true);
+    assert(scheduler.get_active_count() == 1);
+    assert(scheduler.get_prefetch_hits() == 1);
+
+    scheduler.mark_completed(ids[2]);
+    assert(scheduler.get_active_count() == 0);
+    assert(scheduler.get_prefetch_hits() == 2);
+
+    std::cout << "[PASS] test_cache_id_tracking\n";
+    return true;
+}
+
+// Test 10: Hit rate calculation
 bool test_hit_rate() {
     PrefetchScheduler scheduler;
 
@@ -164,7 +213,7 @@ bool test_hit_rate() {
     return true;
 }
 
-// Test 10: Reset scheduler
+// Test 11: Reset scheduler
 bool test_reset() {
     PrefetchScheduler scheduler;
 
@@ -187,7 +236,7 @@ bool test_reset() {
     return true;
 }
 
-// Test 11: No prefetch for current or past layers
+// Test 12: No prefetch for current or past layers
 bool test_no_prefetch_for_past_layers() {
     PrefetchScheduler scheduler;
     scheduler.set_lookahead(2);
@@ -208,7 +257,7 @@ bool test_no_prefetch_for_past_layers() {
     return true;
 }
 
-// Test 12: No prefetch beyond lookahead
+// Test 13: No prefetch beyond lookahead
 bool test_no_prefetch_beyond_lookahead() {
     PrefetchScheduler scheduler;
     scheduler.set_lookahead(1);  // Only prefetch 1 layer ahead
@@ -229,7 +278,7 @@ bool test_no_prefetch_beyond_lookahead() {
     return true;
 }
 
-// Test 13: Priority ordering (closer layers = higher priority)
+// Test 14: Priority ordering (closer layers = higher priority)
 bool test_priority_ordering() {
     PrefetchScheduler scheduler;
     scheduler.set_lookahead(3);
@@ -255,7 +304,7 @@ bool test_priority_ordering() {
     return true;
 }
 
-// Test 14: Needs prefetch check
+// Test 15: Needs prefetch check
 bool test_needs_prefetch() {
     PrefetchScheduler scheduler;
     scheduler.set_lookahead(2);
@@ -284,7 +333,7 @@ bool test_needs_prefetch() {
     return true;
 }
 
-// Test 15: Multiple on_kernel_start calls (simulate layer progression)
+// Test 16: Multiple on_kernel_start calls (simulate layer progression)
 bool test_layer_progression() {
     PrefetchScheduler scheduler;
     scheduler.set_lookahead(2);
@@ -318,7 +367,7 @@ bool test_layer_progression() {
     return true;
 }
 
-// Test 16: Empty graph
+// Test 17: Empty graph
 bool test_empty_graph() {
     PrefetchScheduler scheduler;
 
@@ -335,7 +384,7 @@ bool test_empty_graph() {
     return true;
 }
 
-// Test 17: Reset stats
+// Test 18: Reset stats
 bool test_reset_stats() {
     PrefetchScheduler scheduler;
 
@@ -358,7 +407,7 @@ bool test_reset_stats() {
     return true;
 }
 
-// Test 18: Request contains correct data
+// Test 19: Request contains correct data
 bool test_request_data() {
     PrefetchScheduler scheduler;
     scheduler.set_lookahead(1);
@@ -381,7 +430,7 @@ bool test_request_data() {
     return true;
 }
 
-// Test 19: Hit rate with no operations returns 0
+// Test 20: Hit rate with no operations returns 0
 bool test_hit_rate_empty() {
     PrefetchScheduler scheduler;
     assert(scheduler.get_hit_rate() == 0.0f);
@@ -390,7 +439,7 @@ bool test_hit_rate_empty() {
     return true;
 }
 
-// Test 20: MIN_PREFETCH_SIZE boundary
+// Test 21: MIN_PREFETCH_SIZE boundary
 bool test_min_prefetch_size_boundary() {
     PrefetchScheduler scheduler;
 
@@ -446,6 +495,11 @@ int main() {
         failed++;
     }
     if (test_is_prefetching()) {
+        passed++;
+    } else {
+        failed++;
+    }
+    if (test_cache_id_tracking()) {
         passed++;
     } else {
         failed++;

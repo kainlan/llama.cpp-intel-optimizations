@@ -2,7 +2,7 @@
 // Tests actual GPU DMMV/MMQ kernels for Q4_0, Q8_0, and Q6_K
 //
 // Build: cmake --build build --target test-soa-roundtrip
-// Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-soa-roundtrip
+// Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-soa-roundtrip
 //
 // This test runs MUL_MAT on both SYCL (with SoA) and CPU (reference),
 // then compares results. They must match within tolerance.

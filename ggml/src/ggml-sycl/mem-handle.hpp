@@ -6,11 +6,13 @@
 
 #pragma once
 
-#include "unified-cache.hpp"  // unified_cache_key, ggml_layout_mode
+#include "unified-cache-key.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <sycl/sycl.hpp>
 #include <vector>
 
 namespace ggml_sycl {
@@ -37,6 +39,8 @@ struct resolved_ptr {
     void *           ptr       = nullptr;
     ggml_layout_mode layout    = GGML_LAYOUT_AOS;
     bool             on_device = false;
+    bool             has_ready_event = false;
+    sycl::event      ready_event;
 
     explicit operator bool() const { return ptr != nullptr; }
 };
@@ -63,10 +67,6 @@ enum class mem_handle_kind : uint8_t {
                         // sycl::free of the underlying chunk while this
                         // handle is alive.
 };
-
-// Forward declaration: the backing cache_entry type whose in_use_count we
-// hold a lease on.  Full definition in unified-cache.hpp.
-struct unified_cache_entry;
 
 class mem_handle {
   public:
@@ -164,6 +164,9 @@ class mem_handle {
     // queue submission.
     static mem_handle from_owned_alloc(alloc_handle handle, ggml_layout_mode layout = GGML_LAYOUT_AOS);
 
+    void set_ready_event(const sycl::event & event);
+    void clear_ready_event();
+
     // Resolve for a dispatch device. Device-resident pointers must belong to
     // that device; host-resident pointers are returned for any device. The
     // handle's device_ is the allocator/cache owner used for re-resolution.
@@ -216,6 +219,18 @@ class mem_handle {
     bool operator!=(const mem_handle & other) const { return !(*this == other); }
 
     size_t hash() const;
+
+    // Stable ownership identity for caches that should not key by transient
+    // resolved weight pointers.  Weight handles use their unified-cache key;
+    // arena handles use owner device/zone/offset/generation; chunk leases use
+    // the leased chunk plus the derived pointer inside it. DIRECT handles fall
+    // back to pointer identity because no stronger owner identity exists for
+    // external raw pointers.
+    size_t stable_identity_hash() const;
+
+    // Stable identity equality for retained caches.  Unlike operator==, this
+    // never resolves the current pointer and never aliases by transient pointer.
+    bool stable_identity_equal(const mem_handle & other) const;
 
   private:
     // Slow path: re-query the unified cache for the current pointer.
@@ -288,6 +303,14 @@ struct mem_handle_hash {
     size_t operator()(const mem_handle & h) const { return h.hash(); }
 };
 
+struct mem_handle_stable_identity_hash {
+    size_t operator()(const mem_handle & h) const { return h.stable_identity_hash(); }
+};
+
+struct mem_handle_stable_identity_equal {
+    bool operator()(const mem_handle & a, const mem_handle & b) const { return a.stable_identity_equal(b); }
+};
+
 // === layer_weight_handles ===
 // Smart handle version of layer_weight_pointers (unified-cache.hpp).
 // Holds mem_handle per weight field.  Call resolve_all() to produce a
@@ -326,10 +349,16 @@ bool build_layer_handles(int device, int layer_id, layer_weight_handles & out);
 // copies while the submitted event still depends on the backing pointer.
 void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event event);
 
-// Release completed event-bound handle leases.  When wait_all is true, wait for
-// every retained event before releasing.  Model-load replanning uses this after
-// draining queues so stale weight handles drop before cache entries are removed.
-void reap_retained_handles(bool wait_all = false);
+// During SYCL command-graph recording, events produced by recorded commands are
+// not waitable. The active backend context installs a per-thread sink so those
+// handles are retained for the executable graph lifetime instead.
+void set_graph_retained_handle_sink(std::vector<mem_handle> * sink);
+
+// Drain event-bound handle retainers. When wait_all is true, wait for every
+// retained event before dropping the retained mem_handle copies. This only runs
+// normal mem_handle destructors; backing memory is freed only when the last
+// refcounted owner is gone.
+void drain_retained_handles(bool wait_all = false);
 
 }  // namespace ggml_sycl
 

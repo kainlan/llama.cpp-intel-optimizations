@@ -16,12 +16,15 @@
 #   ./tests/test-tiered-memory-integration.sh [--skip-large]
 #
 # Environment:
-#   ONEAPI_DEVICE_SELECTOR - GPU device (default: level_zero:1)
+#   ONEAPI_DEVICE_SELECTOR - GPU device (default: level_zero:0)
 #   LLAMA_BIN_DIR - Path to build/bin directory (default: ./build/bin)
 #   MODEL_DIR - Path to model directory (default: /Storage/GenAI/models)
 #
 
 set -e
+
+TEST_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$TEST_DIR/.." && pwd)"
 
 # Colors for output
 RED='\033[0;31m'
@@ -45,7 +48,7 @@ else
     LLAMA_BIN_DIR="./build/bin"  # Fallback
 fi
 MODEL_DIR="${MODEL_DIR:-/Storage/GenAI/models}"
-DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:1}"
+DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:0}"
 
 # Model paths
 MISTRAL_MODEL="${MODEL_DIR}/mistral-7b-v0.1.Q4_0.gguf"

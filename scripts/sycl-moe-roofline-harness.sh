@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 BENCH="${BENCH:-$ROOT/build/bin/llama-bench}"
 GGUF_TOOL="${GGUF_TOOL:-$ROOT/build/bin/llama-gguf}"
 MODEL="${MODEL:-/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf}"
@@ -21,6 +22,9 @@ RUN_MISTRAL="${RUN_MISTRAL:-1}"
 THEORETICAL_BW_GBPS="${THEORETICAL_BW_GBPS:-}"
 MXFP4_ENTRY_BYTES="${MXFP4_ENTRY_BYTES:-}"
 MXFP4_ENTRIES_PER_TOKEN="${MXFP4_ENTRIES_PER_TOKEN:-}"
+
+# shellcheck disable=SC1091
+source "$ROOT/scripts/sycl-gpu-preflight.sh"
 
 usage() {
     cat <<'EOF'
@@ -320,6 +324,7 @@ run_case() {
     local log="$OUTDIR/${name}.log"
 
     echo "== $name =="
+    sycl_gpu_preflight_check "$selector"
     env ONEAPI_DEVICE_SELECTOR="$selector" "${env_args[@]}" \
         "$BENCH" -m "$model" -p "$prompt" -n "$tokens" -r "$reps" -ngl 99 -fa "$fa" --tg-batch "$tg_batch" \
         >"$log" 2>&1

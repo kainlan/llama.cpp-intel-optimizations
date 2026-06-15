@@ -87,7 +87,7 @@ struct output_data {
                 data_ptr = embd_norm.data();
             }
         } else {
-            const float * logits = llama_get_logits_ith(ctx, tokens.size() - 1);
+            const float * logits = llama_get_logits_ith(ctx, -1);
             const int n_logits = llama_vocab_n_tokens(vocab);
 
             data_ptr = const_cast<float*>(logits);
@@ -194,7 +194,15 @@ static bool run(llama_context * ctx, const common_params & params) {
         return false;
     }
 
-    if (llama_decode(ctx, llama_batch_get_one(tokens.data(), tokens.size()))) {
+    llama_batch batch = llama_batch_get_one(tokens.data(), tokens.size());
+    std::vector<int8_t> output;
+    if (params.save_logits) {
+        output.resize(tokens.size(), 0);
+        output.back() = 1;
+        batch.logits = output.data();
+    }
+
+    if (llama_decode(ctx, batch)) {
         LOG_ERR("%s : failed to eval\n", __func__);
         return false;
     }

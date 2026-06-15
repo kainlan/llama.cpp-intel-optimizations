@@ -80,6 +80,28 @@ size_t resolve_alloc_timeout_ms() {
     return static_cast<size_t>(ms);
 }
 
+mem_handle allocate_pinned_chunk_owner(sycl::queue & queue, size_t chunk_size, bool runtime_pool) {
+    alloc_request req{};
+    req.queue                                    = &queue;
+    req.device                                   = ggml_sycl_get_device_id_from_queue(queue);
+    req.size                                     = chunk_size;
+    req.intent.role                              = alloc_role::STAGING;
+    req.intent.category                          = runtime_category::HOST_COMPUTE;
+    req.intent.cohort_id                         = runtime_pool ? "pinned_chunk:runtime" : "pinned_chunk:base";
+    req.intent.constraints.must_host_pinned      = true;
+    // This pool is the backing arena for host-pinned suballocations.  Re-entering
+    // host_pool_alloc() here would recurse, so request a standalone USM base
+    // while still registering ownership through unified_alloc().
+    req.intent.constraints.require_host_usm_base = true;
+
+    mem_handle owner    = unified_allocate(req);
+    auto       resolved = owner.resolve();
+    if (!resolved.ptr || resolved.on_device) {
+        return {};
+    }
+    return owner;
+}
+
 }  // namespace
 
 const char * host_zone_name(host_zone_id zone) {
@@ -117,13 +139,13 @@ pinned_chunk_pool::~pinned_chunk_pool() {
     for (auto & c : chunks_) {
         if (c.base) {
             wait_for_chunk_drain_or_assert(c, "pinned-base");
-            sycl::free(c.base, queue_);
+            free_chunk_owner(c, "pinned-base");
         }
     }
     for (auto & c : runtime_chunks_) {
         if (c.base) {
             wait_for_chunk_drain_or_assert(c, "pinned-runtime");
-            sycl::free(c.base, queue_);
+            free_chunk_owner(c, "pinned-runtime");
         }
     }
     chunks_.clear();
@@ -568,13 +590,26 @@ bool pinned_chunk_pool::grow_zone(host_zone_id zone, size_t additional_bytes) {
 
     // Phase gate: early rejection without holding mutex.
     // Note: this is a best-effort check — the phase could transition between
-    // this check and the actual grow() call below. grow_into() has its own
-    // GGML_SYCL_HOST_ALLOC_PHASE_GATE guard as defense-in-depth.
-    const auto phase = ggml_sycl::offload_stats_phase();
-    if (phase == ggml_sycl::offload_phase::PP || phase == ggml_sycl::offload_phase::TG) {
-        GGML_LOG_WARN("[HOST-POOL] grow_zone(%s, %.1f MB) rejected during %s phase\n", host_zone_name(zone),
-                      additional_bytes / (1024.0 * 1024.0), ggml_sycl::offload_phase_name(phase));
-        return false;
+    // this check and the actual grow() call below. Match grow_into(): default
+    // mode warns only, while mode >= 2 is the strict audit path.
+    static std::atomic<int> s_phase_gate{ -1 };
+    int                     mode = s_phase_gate.load(std::memory_order_relaxed);
+    if (mode < 0) {
+        const char * env = std::getenv("GGML_SYCL_HOST_ALLOC_PHASE_GATE");
+        mode             = (env != nullptr) ? std::atoi(env) : 1;
+        s_phase_gate.store(mode, std::memory_order_relaxed);
+    }
+    if (mode > 0) {
+        const auto phase = ggml_sycl::offload_stats_phase();
+        if (phase == ggml_sycl::offload_phase::PP || phase == ggml_sycl::offload_phase::TG) {
+            GGML_LOG_WARN("[HOST-POOL] grow_zone(%s, %.1f MB) during %s phase; planner should pre-size\n",
+                          host_zone_name(zone), additional_bytes / (1024.0 * 1024.0),
+                          ggml_sycl::offload_phase_name(phase));
+            if (mode >= 2) {
+                GGML_ASSERT(false && "host pool zone growth during inference");
+                return false;
+            }
+        }
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
@@ -675,6 +710,22 @@ size_t pinned_chunk_pool::chunk_count() const {
     return chunks_.size() + runtime_chunks_.size();
 }
 
+void pinned_chunk_pool::free_chunk_owner(chunk & c, const char * ctx) {
+    if (!c.base) {
+        return;
+    }
+    if (c.owner.valid()) {
+        c.owner = {};
+        c.base  = nullptr;
+        return;
+    }
+
+    GGML_LOG_ERROR("[PINNED-POOL] %s chunk %p missing unified owner size=%.1f MB\n", ctx, c.base,
+                   c.size / (1024.0 * 1024.0));
+    GGML_ASSERT(false && "pinned chunk missing unified allocation owner");
+    c.base = nullptr;
+}
+
 bool pinned_chunk_pool::grow(size_t min_size) {
     return grow_into(chunks_, min_size, false);
 }
@@ -758,58 +809,80 @@ bool pinned_chunk_pool::grow_into(std::vector<chunk> & chunks, size_t min_size, 
         }
     }
 
-    void * ptr        = nullptr;
     // Use chunk_size_ as the default, but allow larger chunks when the
     // allocation exceeds chunk_size_ (e.g., 615 MB reorder buffers for
     // MoE models).  Level Zero's ~11 GB per-allocation limit is the
     // real cap, not chunk_size_.
-    size_t chunk_size = align_up(min_size, DEFAULT_ALIGNMENT);
-    if (chunk_size < chunk_size_) {
-        chunk_size = chunk_size_;
+    size_t usable_size = align_up(min_size, DEFAULT_ALIGNMENT);
+    if (usable_size < chunk_size_) {
+        usable_size = chunk_size_;
+    }
+    const size_t backing_size = usable_size + DEFAULT_ALIGNMENT;
+    if (total_allocated_ + backing_size > budget_) {
+        GGML_LOG_WARN("[SYCL] Pinned pool budget exceeded (%.1f GB used, %.1f GB budget)\n",
+                      total_allocated_ / (1024.0 * 1024.0 * 1024.0), budget_ / (1024.0 * 1024.0 * 1024.0));
+        return false;
     }
 
     if (alloc_timeout_ms_ > 0) {
         if (pinned_trace_enabled()) {
-            GGML_LOG_INFO("[SYCL] pinned chunk malloc_host begin: size=%zu timeout=%zu ms\n", chunk_size,
+            GGML_LOG_INFO("[SYCL] pinned chunk malloc_host begin: size=%zu timeout=%zu ms\n", backing_size,
                           alloc_timeout_ms_);
         }
-        auto ctx    = queue_.get_context();
-        auto future = std::async(std::launch::async,
-                                 [&, ctx]() { return ggml_sycl_malloc_host(chunk_size, ctx, "pinned_chunk"); });
+        auto future = std::async(std::launch::async, [&, backing_size]() {
+            return allocate_pinned_chunk_owner(queue_, backing_size, runtime_pool);
+        });
 
         const auto status = future.wait_for(std::chrono::milliseconds(alloc_timeout_ms_));
         if (status != std::future_status::ready) {
             GGML_LOG_ERROR("[SYCL] Pinned chunk allocation timed out after %zu ms (size=%zu). Aborting.\n",
-                           alloc_timeout_ms_, chunk_size);
+                           alloc_timeout_ms_, backing_size);
             std::fflush(stderr);
             std::abort();
         }
 
         try {
-            ptr = future.get();
+            auto owner    = future.get();
+            auto resolved = owner.resolve();
+            if (!resolved.ptr) {
+                GGML_LOG_ERROR("[SYCL] Failed to allocate pinned chunk (%zu bytes, nullptr)\n", backing_size);
+                return false;
+            }
+            chunks.emplace_back();
+            chunks.back().base      = static_cast<uint8_t *>(resolved.ptr) + DEFAULT_ALIGNMENT;
+            chunks.back().size      = usable_size;
+            chunks.back().allocator = std::make_unique<tlsf_allocator>(usable_size);
+            chunks.back().owner     = std::move(owner);
         } catch (const sycl::exception & e) {
-            GGML_LOG_ERROR("[SYCL] Failed to allocate pinned chunk (%zu bytes): %s\n", chunk_size, e.what());
+            GGML_LOG_ERROR("[SYCL] Failed to allocate pinned chunk (%zu bytes): %s\n", backing_size, e.what());
             return false;
         } catch (const std::exception & e) {
-            GGML_LOG_ERROR("[SYCL] Failed to allocate pinned chunk (%zu bytes): %s\n", chunk_size, e.what());
+            GGML_LOG_ERROR("[SYCL] Failed to allocate pinned chunk (%zu bytes): %s\n", backing_size, e.what());
             return false;
         }
     } else {
         if (pinned_trace_enabled()) {
-            GGML_LOG_INFO("[SYCL] pinned chunk malloc_host begin: size=%zu\n", chunk_size);
+            GGML_LOG_INFO("[SYCL] pinned chunk malloc_host begin: size=%zu\n", backing_size);
         }
         try {
-            ptr = ggml_sycl_malloc_host(chunk_size, queue_.get_context(), "pinned_chunk");
+            auto owner    = allocate_pinned_chunk_owner(queue_, backing_size, runtime_pool);
+            auto resolved = owner.resolve();
+            if (!resolved.ptr) {
+                GGML_LOG_ERROR("[SYCL] Failed to allocate pinned chunk (%zu bytes, nullptr)\n", backing_size);
+                return false;
+            }
+            chunks.emplace_back();
+            chunks.back().base      = static_cast<uint8_t *>(resolved.ptr) + DEFAULT_ALIGNMENT;
+            chunks.back().size      = usable_size;
+            chunks.back().allocator = std::make_unique<tlsf_allocator>(usable_size);
+            chunks.back().owner     = std::move(owner);
         } catch (const sycl::exception & e) {
-            GGML_LOG_ERROR("[SYCL] Failed to allocate pinned chunk (%zu bytes): %s\n", chunk_size, e.what());
+            GGML_LOG_ERROR("[SYCL] Failed to allocate pinned chunk (%zu bytes): %s\n", backing_size, e.what());
             return false;
         }
     }
 
-    if (!ptr) {
-        GGML_LOG_ERROR("[SYCL] Failed to allocate pinned chunk (%zu bytes, nullptr)\n", chunk_size);
-        return false;
-    }
+    void * ptr = chunks.back().base;
     if (pinned_trace_enabled()) {
         const sycl::usm::alloc alloc_type = ggml_sycl_get_alloc_type(ptr);
         const char *           alloc_name = alloc_type == sycl::usm::alloc::host   ? "host" :
@@ -817,20 +890,13 @@ bool pinned_chunk_pool::grow_into(std::vector<chunk> & chunks, size_t min_size, 
                                             alloc_type == sycl::usm::alloc::device ? "device" :
                                                                                      "unknown";
         GGML_LOG_INFO("[SYCL] pinned chunk malloc_host ok: ptr=%p type=%s size=%.1f MB\n", ptr, alloc_name,
-                      chunk_size / (1024.0 * 1024.0));
+                      backing_size / (1024.0 * 1024.0));
     }
 
-    auto alloc = std::make_unique<tlsf_allocator>(chunk_size);
-    // Note: chunk contains pool_atomic_u32 lease_count — default-construct it in place.
-    chunks.emplace_back();
-    chunks.back().base      = ptr;
-    chunks.back().size      = chunk_size;
-    chunks.back().allocator = std::move(alloc);
-    // lease_count default-initializes to 0.
-    total_allocated_ += chunk_size;
+    total_allocated_ += backing_size;
 
     GGML_LOG_INFO("[SYCL] Allocated pinned %s chunk %zu (size=%.1f MB, total=%.1f GB)\n",
-                  runtime_pool ? "runtime" : "base", chunks.size(), chunk_size / (1024.0 * 1024.0),
+                  runtime_pool ? "runtime" : "base", chunks.size(), usable_size / (1024.0 * 1024.0),
                   total_allocated_ / (1024.0 * 1024.0 * 1024.0));
 
     return true;

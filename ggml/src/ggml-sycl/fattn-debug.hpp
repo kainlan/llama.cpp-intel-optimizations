@@ -7,8 +7,12 @@
 #ifndef GGML_SYCL_FATTN_DEBUG_HPP
 #define GGML_SYCL_FATTN_DEBUG_HPP
 
+#include "common.hpp"
+#include "mem-ops.hpp"
+
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <cfloat>
 #include <cstdio>
 #include <cstdlib>
@@ -20,6 +24,28 @@
 // Environment variable to enable FA debug dumping
 // Set GGML_SYCL_FA_DEBUG=1 to enable
 // Set GGML_SYCL_FA_DEBUG=2 for verbose mode (dumps all heads)
+inline ggml_sycl::mem_handle fattn_debug_host_handle(void * ptr) {
+    return ggml_sycl::mem_handle::from_direct(ptr, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+}
+
+inline void fattn_debug_copy_to_host(dpct::queue_ptr stream, void * host_dst, const void * src, size_t bytes) {
+    if (!stream || !host_dst || !src || bytes == 0) {
+        return;
+    }
+
+    const int                        device        = ggml_sycl_get_device_id_from_queue(*stream);
+    const ggml_sycl::memory_location loc           = ggml_sycl::query_location(src, device);
+    const bool                       src_on_device = loc.on_device();
+    const int                        src_device =
+        src_on_device && loc.device >= 0 ? loc.device : (src_on_device ? device : ggml_sycl::mem_handle::HOST_DEVICE);
+    ggml_sycl::mem_handle dst_handle = fattn_debug_host_handle(host_dst);
+    ggml_sycl::mem_handle src_handle =
+        src_on_device ?
+            ggml_sycl::mem_handle::from_chunk_ptr(const_cast<void *>(src), src_device, GGML_LAYOUT_AOS, true) :
+            ggml_sycl::mem_handle::from_direct(const_cast<void *>(src), GGML_LAYOUT_AOS, false, src_device);
+    ggml_sycl::mem_copy(dst_handle, src_handle, bytes, *stream);
+}
+
 inline int fattn_debug_level() {
     static int level = -1;
     if (level < 0) {
@@ -113,11 +139,11 @@ inline void fattn_debug_dump_Q(dpct::queue_ptr stream,
             const char * q_row = Q_ptr + nb02 * h + nb01 * q;
 
             if (Q_type_size == sizeof(float)) {
-                stream->memcpy(host_Q.data(), q_row, D * sizeof(float)).wait();
+                fattn_debug_copy_to_host(stream, host_Q.data(), q_row, D * sizeof(float));
             } else {
                 // Half precision - need to convert
                 std::vector<sycl::half> host_Q_h(D);
-                stream->memcpy(host_Q_h.data(), q_row, D * sizeof(sycl::half)).wait();
+                fattn_debug_copy_to_host(stream, host_Q_h.data(), q_row, D * sizeof(sycl::half));
                 for (int d = 0; d < D; d++) {
                     host_Q[d] = static_cast<float>(host_Q_h[d]);
                 }
@@ -161,7 +187,7 @@ fattn_debug_dump_K(dpct::queue_ptr stream, const char * K_ptr, int D, int n_kv, 
     for (int kv_h = 0; kv_h < kv_heads_to_dump; kv_h++) {
         for (int kv = 0; kv < kv_to_dump; kv++) {
             const sycl::half * k_row = reinterpret_cast<const sycl::half *>(K_ptr + nb12 * kv_h + nb11 * kv);
-            stream->memcpy(host_K.data(), k_row, D * sizeof(sycl::half)).wait();
+            fattn_debug_copy_to_host(stream, host_K.data(), k_row, D * sizeof(sycl::half));
 
             fprintf(ctx.file, "K[kv_h=%d,kv=%d]: ", kv_h, kv);
             for (int d = 0; d < std::min(8, D); d++) {
@@ -200,7 +226,7 @@ fattn_debug_dump_V(dpct::queue_ptr stream, const char * V_ptr, int D, int n_kv, 
     for (int kv_h = 0; kv_h < kv_heads_to_dump; kv_h++) {
         for (int kv = 0; kv < kv_to_dump; kv++) {
             const sycl::half * v_row = reinterpret_cast<const sycl::half *>(V_ptr + nb22 * kv_h + nb21 * kv);
-            stream->memcpy(host_V.data(), v_row, D * sizeof(sycl::half)).wait();
+            fattn_debug_copy_to_host(stream, host_V.data(), v_row, D * sizeof(sycl::half));
 
             fprintf(ctx.file, "V[kv_h=%d,kv=%d]: ", kv_h, kv);
             for (int d = 0; d < std::min(8, D); d++) {
@@ -240,7 +266,7 @@ inline void fattn_debug_dump_mask(dpct::queue_ptr stream,
 
     for (int q = 0; q < n_queries; q++) {
         const sycl::half * mask_row = reinterpret_cast<const sycl::half *>(mask_ptr + nb31 * q);
-        stream->memcpy(host_mask.data(), mask_row, kv_to_dump * sizeof(sycl::half)).wait();
+        fattn_debug_copy_to_host(stream, host_mask.data(), mask_row, kv_to_dump * sizeof(sycl::half));
 
         fprintf(ctx.file, "mask[q=%d]: ", q);
         for (int kv = 0; kv < kv_to_dump; kv++) {
@@ -273,7 +299,7 @@ inline void fattn_debug_dump_output(dpct::queue_ptr stream, const float * dst_pt
     // Output layout: dst[d + D*(h + n_heads*q)]
     size_t             output_size = (size_t) D * n_queries * n_heads;
     std::vector<float> host_dst(output_size);
-    stream->memcpy(host_dst.data(), dst_ptr, output_size * sizeof(float)).wait();
+    fattn_debug_copy_to_host(stream, host_dst.data(), dst_ptr, output_size * sizeof(float));
 
     for (int h = 0; h < heads_to_dump; h++) {
         for (int q = 0; q < n_queries; q++) {
@@ -335,7 +361,7 @@ inline void fattn_debug_dump_QK(dpct::queue_ptr stream,
     fprintf(ctx.file, "\n=== QK SCORES [head=%d, kv_start=%d] ===\n", head, kv_start);
 
     std::vector<float> host_QK(n_queries * n_kv_batch);
-    stream->memcpy(host_QK.data(), QK_ptr, host_QK.size() * sizeof(float)).wait();
+    fattn_debug_copy_to_host(stream, host_QK.data(), QK_ptr, host_QK.size() * sizeof(float));
 
     for (int q = 0; q < n_queries; q++) {
         fprintf(ctx.file, "QK[q=%d]: ", q);
@@ -370,7 +396,7 @@ inline void fattn_debug_dump_softmax(dpct::queue_ptr    stream,
     fprintf(ctx.file, "\n=== SOFTMAX WEIGHTS [head=%d, kv_start=%d] ===\n", head, kv_start);
 
     std::vector<sycl::half> host_S(n_queries * S_stride);
-    stream->memcpy(host_S.data(), S_ptr, host_S.size() * sizeof(sycl::half)).wait();
+    fattn_debug_copy_to_host(stream, host_S.data(), S_ptr, host_S.size() * sizeof(sycl::half));
 
     for (int q = 0; q < n_queries; q++) {
         fprintf(ctx.file, "S[q=%d]: ", q);

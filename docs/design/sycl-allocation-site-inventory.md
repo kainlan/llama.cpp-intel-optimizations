@@ -4,6 +4,30 @@
 
 ---
 
+## Current Source Audit Update (2026-06-06)
+
+This inventory is historical. Current source policy is enforced by
+`scripts/check-sycl-alloc-usage.sh`.
+
+As of slices 153-157 on `llama.cpp-po3nd.2.46`:
+
+- external production calls to `unified_cache_allocate(...)`,
+  `unified_cache_deallocate(...)`, and `unified_free_ptr(...)` are banned
+  outside `ggml/src/ggml-sycl/unified-cache.{cpp,hpp}`;
+- `ggml_sycl_malloc_device(...)` and its tracked wrappers are removed from
+  production SYCL sources;
+- `common.hpp` no longer exposes `ggml_sycl_malloc_device(...)`,
+  `ggml_sycl_malloc_device_tracked_bytes(...)`, or
+  `ggml_sycl_free_device_tracked_bytes(...)`;
+- the allocation-policy fixture suite rejects new pointer-only device allocation
+  wrappers and pointer-only unified-cache frees.
+
+Use the policy script plus Beads comments after slice 157 as the authoritative
+current state before retrying any row below that mentions those removed wrapper
+APIs.
+
+---
+
 ## Summary
 
 | Category      | Count | Description |

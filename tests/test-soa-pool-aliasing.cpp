@@ -6,10 +6,10 @@
 // - Same pointer addresses returning different data with SoA on vs off
 //
 // Build: cmake --build build --target test-soa-pool-aliasing
-// Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-soa-pool-aliasing
+// Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-soa-pool-aliasing
 //
 // Compare:
-//   ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-soa-pool-aliasing  # Auto layout
+//   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-soa-pool-aliasing  # Auto layout
 //   Use ggml_sycl::test_set_layout_override() in this test to force AoS if needed
 
 #include <cstdio>

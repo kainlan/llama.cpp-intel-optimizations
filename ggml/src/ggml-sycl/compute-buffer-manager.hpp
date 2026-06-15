@@ -20,6 +20,7 @@
 #define GGML_SYCL_COMPUTE_BUFFER_MANAGER_HPP
 
 #include "eviction-policy.hpp"
+#include "mem-handle.hpp"
 #include "unified-cache.hpp"
 
 #include <atomic>
@@ -39,7 +40,7 @@ struct ComputeBuffer {
     bool         in_use     = false;    // Currently allocated to caller
     uint64_t     alloc_time = 0;        // Timestamp of allocation (for debugging)
     const char * name       = nullptr;  // Current user name (for debugging)
-    alloc_handle handle{};
+    mem_handle   handle{};
 };
 
 // Compute Buffer Manager
@@ -135,7 +136,7 @@ class ComputeBufferManager {
 
     // Allocate a new SYCL buffer
     // Returns nullptr on failure
-    void * allocate_new_buffer(size_t size);
+    mem_handle allocate_new_buffer(size_t size);
 
     // Grow scratch buffer to new_size
     void grow_scratch(size_t new_size);
@@ -153,8 +154,7 @@ class ComputeBufferManager {
     void *             scratch_ptr_      = nullptr;
     size_t             scratch_size_     = 0;  // Last requested size
     size_t             scratch_capacity_ = 0;  // Actual allocated size
-    // Use .as_mem_handle() for read/resolve access; unified_free(alloc_handle) for ownership
-    alloc_handle       scratch_handle_{};
+    mem_handle         scratch_handle_{};
     mutable std::mutex scratch_mutex_;
 
     // Monotonic time counter

@@ -2,7 +2,7 @@
 // This test uses real ggml functions to test the integration path
 //
 // Build: cmake --build build --target test-ggml-sycl-soa
-// Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-ggml-sycl-soa
+// Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-ggml-sycl-soa
 //
 // Test helper:
 //   Use --layout=<aos|soa|coalesced|xmx_tiled|xmx_gemm_tiled> to set a test-only layout override.

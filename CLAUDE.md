@@ -425,8 +425,7 @@ GGML_SYCL_PERSISTENT_TG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
 **Cache and memory**:
 | Variable | Effect |
 |----------|--------|
-| `GGML_SYCL_UNIFIED_CACHE=0` | Disable unified weight cache entirely |
-| `GGML_SYCL_UNIFIED_CACHE_MODE=<mode>` | Cache mode (auto, device, host, mmap) |
+| `GGML_SYCL_UNIFIED_CACHE_MODE=<mode>` | Cache topology: auto, global, per_device |
 | `GGML_SYCL_NO_PINNED=1` | Disable pinned host memory |
 | `GGML_SYCL_WEIGHTS_EVICTABLE=1` | Allow weight eviction under memory pressure |
 | `GGML_SYCL_MEM_BUDGET=<MB>` | Set VRAM budget in MB |

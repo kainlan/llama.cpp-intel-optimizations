@@ -355,6 +355,85 @@ static inline float half_to_float_device(ggml_half v) {
     }
 }
 
+static bool validate_q8_1_soa_from_f32_rows(const std::vector<float> &   src,
+                                            const std::vector<uint8_t> & q8_soa,
+                                            int64_t                      rows,
+                                            int64_t                      cols,
+                                            int64_t                      q8_row_bytes,
+                                            std::string &                error) {
+    if (rows <= 0 || cols <= 0 || (cols % QK8_1) != 0 || q8_row_bytes <= 0 ||
+        src.size() < static_cast<size_t>(rows) * static_cast<size_t>(cols) ||
+        q8_soa.size() < static_cast<size_t>(rows) * static_cast<size_t>(q8_row_bytes)) {
+        error = "Q8_1 SOA validation received invalid dimensions.";
+        return false;
+    }
+
+    const int64_t blocks_per_row = cols / QK8_1;
+    double        max_d_diff     = 0.0;
+    double        max_sum_diff   = 0.0;
+    for (int64_t row = 0; row < rows; ++row) {
+        const float *   src_row = src.data() + static_cast<size_t>(row) * static_cast<size_t>(cols);
+        const uint8_t * q8_row  = q8_soa.data() + static_cast<size_t>(row) * static_cast<size_t>(q8_row_bytes);
+
+        for (int64_t block = 0; block < blocks_per_row; ++block) {
+            const float * src_block = src_row + static_cast<size_t>(block) * QK8_1;
+            float         amax      = 0.0f;
+            float         sum       = 0.0f;
+            for (int lane = 0; lane < QK8_1; ++lane) {
+                const float value = src_block[lane];
+                if (!std::isfinite(value)) {
+                    error = "Q8_1 SOA validation failed: non-finite source value.";
+                    return false;
+                }
+                amax = std::max(amax, std::fabs(value));
+                sum += value;
+            }
+
+            float d = amax == 0.0f ? 1.0f : amax / 127.0f;
+            for (int lane = 0; lane < QK8_1; ++lane) {
+                const int expected = static_cast<int>(std::round(src_block[lane] / d));
+                const int actual   = static_cast<int>(
+                    reinterpret_cast<const int8_t *>(q8_row)[static_cast<size_t>(block) * QK8_1 + lane]);
+                if (actual != expected) {
+                    char msg[256];
+                    std::snprintf(msg, sizeof(msg),
+                                  "Q8_1 SOA validation failed at row=%lld block=%lld lane=%d: actual=%d expected=%d.",
+                                  static_cast<long long>(row), static_cast<long long>(block), lane, actual, expected);
+                    error = msg;
+                    return false;
+                }
+            }
+
+            d = amax == 0.0f ? 0.0f : d;
+            const uint8_t * ds_bytes =
+                q8_row + static_cast<size_t>(cols) + static_cast<size_t>(block) * sizeof(sycl::half2);
+            sycl::half2 ds_vals;
+            std::memcpy(&ds_vals, ds_bytes, sizeof(ds_vals));
+            const float  actual_d   = static_cast<float>(ds_vals.x());
+            const float  actual_sum = static_cast<float>(ds_vals.y());
+            const float  expected_d = static_cast<float>(sycl::half(d));
+            const float  expected_s = static_cast<float>(sycl::half(sum));
+            const double d_diff     = std::fabs(static_cast<double>(actual_d) - static_cast<double>(expected_d));
+            const double s_diff     = std::fabs(static_cast<double>(actual_sum) - static_cast<double>(expected_s));
+            const double d_tol      = std::max(1.0e-6, 1.0e-3 * std::fabs(static_cast<double>(expected_d)));
+            const double s_tol      = std::max(1.0e-3, 1.0e-3 * std::fabs(static_cast<double>(expected_s)));
+            max_d_diff              = std::max(max_d_diff, d_diff);
+            max_sum_diff            = std::max(max_sum_diff, s_diff);
+            if (d_diff > d_tol || s_diff > s_tol) {
+                char msg[320];
+                std::snprintf(msg, sizeof(msg),
+                              "Q8_1 SOA validation failed at row=%lld block=%lld: d actual=%.8g expected=%.8g, "
+                              "sum actual=%.8g expected=%.8g, max_d=%.8g max_sum=%.8g.",
+                              static_cast<long long>(row), static_cast<long long>(block), actual_d, expected_d,
+                              actual_sum, expected_s, max_d_diff, max_sum_diff);
+                error = msg;
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static bool validate_inline_dot(const GeneratedWeights &     weights,
                                 const GeneratedActivations & activations,
                                 const std::vector<float> &   actual,
@@ -1022,8 +1101,12 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
         error = "mxfp4_pair_glu prefetch variant requires packed XMX_TILED.";
         return false;
     }
-    if (xmx_tiled_m_tiles != 1 && xmx_tiled_m_tiles != 2) {
-        error = "mxfp4_pair_glu XMX_TILED M-tile grouping must be 1 or 2.";
+    if (xmx_tiled_prefetch && xmx_tiled_m_tiles != 2) {
+        error = "mxfp4_pair_glu prefetch variant is only implemented for M2.";
+        return false;
+    }
+    if (xmx_tiled_m_tiles != 1 && xmx_tiled_m_tiles != 2 && xmx_tiled_m_tiles != 4) {
+        error = "mxfp4_pair_glu XMX_TILED M-tile grouping must be 1, 2, or 4.";
         return false;
     }
     if (xmx_tiled_m_tiles != 1 && (!xmx_tiled || rows_per_wg != 8)) {
@@ -1091,14 +1174,19 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     const size_t  bias_count           = static_cast<size_t>(m) * expert_slots;
     const size_t  bias_bytes           = bias_count * sizeof(float);
     const int64_t q8_row_bytes         = static_cast<int64_t>(k * sizeof(block_q8_1) / QK8_1);
-    const int64_t k_tiles              = k / GGML_SYCL_MXFP4_MOE_XMX_K;
-    const size_t  dpas_b_bytes         = xmx_tiled_pack_q8 ?
-                                             ids_count * static_cast<size_t>(k_tiles) *
+    const bool    validate_fused_down_q8 =
+        validate && xmx_tiled && xmx_tiled_pack_q8 && xmx_tiled_m_tiles == 4 && (m % QK8_1) == 0;
+    const int64_t fused_down_q8_row_bytes = static_cast<int64_t>(m * sizeof(block_q8_1) / QK8_1);
+    const size_t  fused_down_q8_bytes =
+        validate_fused_down_q8 ? ids_count * static_cast<size_t>(fused_down_q8_row_bytes) : 0;
+    const int64_t k_tiles      = k / GGML_SYCL_MXFP4_MOE_XMX_K;
+    const size_t  dpas_b_bytes = xmx_tiled_pack_q8 ?
+                                     ids_count * static_cast<size_t>(k_tiles) *
                                         static_cast<size_t>(GGML_SYCL_MXFP4_MOE_XMX_K * GGML_SYCL_MXFP4_MOE_XMX_N) :
-                                             0;
-    const size_t  dpas_y_bytes         = xmx_tiled_pack_q8 ? ids_count * static_cast<size_t>(k_tiles) *
+                                     0;
+    const size_t  dpas_y_bytes = xmx_tiled_pack_q8 ? ids_count * static_cast<size_t>(k_tiles) *
                                                         static_cast<size_t>(GGML_SYCL_MXFP4_MOE_XMX_N) * sizeof(float) :
-                                                             0;
+                                                     0;
 
     std::vector<uint8_t> gate_slices(weight_bytes);
     std::vector<uint8_t> up_slices(weight_bytes);
@@ -1120,16 +1208,18 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
         needs_ref_weights ? sycl::malloc_device<const uint8_t *>(expert_slots, queue) : nullptr;
     const uint8_t ** d_ref_up_ptrs =
         needs_ref_weights ? sycl::malloc_device<const uint8_t *>(expert_slots, queue) : nullptr;
-    uint8_t *  d_act                = sycl::malloc_device<uint8_t>(act_bytes, queue);
-    int32_t *  d_ids                = sycl::malloc_device<int32_t>(ids_count, queue);
-    int32_t *  d_grouped_experts    = nullptr;
-    int32_t *  d_grouped_offsets    = nullptr;
-    int32_t *  d_grouped_rows       = nullptr;
-    int32_t *  d_grouped_chunks     = nullptr;
-    int32_t *  d_grouped_row_starts = nullptr;
-    float *    d_out                = sycl::malloc_device<float>(out_count, queue);
-    float *    d_gate_bias          = use_bias ? sycl::malloc_device<float>(bias_count, queue) : nullptr;
-    float *    d_up_bias            = use_bias ? sycl::malloc_device<float>(bias_count, queue) : nullptr;
+    uint8_t * d_act                = sycl::malloc_device<uint8_t>(act_bytes, queue);
+    int32_t * d_ids                = sycl::malloc_device<int32_t>(ids_count, queue);
+    int32_t * d_grouped_experts    = nullptr;
+    int32_t * d_grouped_offsets    = nullptr;
+    int32_t * d_grouped_rows       = nullptr;
+    int32_t * d_grouped_chunks     = nullptr;
+    int32_t * d_grouped_row_starts = nullptr;
+    float *   d_out                = sycl::malloc_device<float>(out_count, queue);
+    float *   d_gate_bias          = use_bias ? sycl::malloc_device<float>(bias_count, queue) : nullptr;
+    float *   d_up_bias            = use_bias ? sycl::malloc_device<float>(bias_count, queue) : nullptr;
+    uint8_t * d_fused_down_q8 =
+        validate_fused_down_q8 ? sycl::malloc_device<uint8_t>(fused_down_q8_bytes, queue) : nullptr;
     const bool need_ref_out =
         validate && (direct_xmx || xmx_tiled || xmx_tiled_grouped || split_gate_up || vector_qs_load);
     float *  d_ref_out  = need_ref_out ? sycl::malloc_device<float>(out_count, queue) : nullptr;
@@ -1197,6 +1287,9 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
         if (d_up_bias) {
             sycl::free(d_up_bias, queue);
         }
+        if (d_fused_down_q8) {
+            sycl::free(d_fused_down_q8, queue);
+        }
         if (d_ref_out) {
             sycl::free(d_ref_out, queue);
         }
@@ -1215,8 +1308,9 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     };
 
     if (!d_gate || !d_up || !d_gate_ptrs || !d_up_ptrs || !d_act || !d_ids || !d_out ||
-        (use_bias && (!d_gate_bias || !d_up_bias)) || (need_ref_out && !d_ref_out) ||
-        (split_gate_up && (!d_gate_tmp || !d_up_tmp)) || (xmx_tiled_pack_q8 && (!d_dpas_b || !d_dpas_y)) ||
+        (use_bias && (!d_gate_bias || !d_up_bias)) || (validate_fused_down_q8 && !d_fused_down_q8) ||
+        (need_ref_out && !d_ref_out) || (split_gate_up && (!d_gate_tmp || !d_up_tmp)) ||
+        (xmx_tiled_pack_q8 && (!d_dpas_b || !d_dpas_y)) ||
         (needs_ref_weights && (!d_ref_gate || !d_ref_up || !d_ref_gate_ptrs || !d_ref_up_ptrs))) {
         cleanup();
         error = "device allocation failed for mxfp4_pair_glu.";
@@ -1337,6 +1431,9 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
         queue.memcpy(d_up_bias, host_up_bias.data(), bias_bytes);
     }
     queue.memset(d_out, 0, out_bytes);
+    if (validate_fused_down_q8) {
+        queue.memset(d_fused_down_q8, 0, fused_down_q8_bytes);
+    }
     queue.wait_and_throw();
 
     ggml_sycl::mxfp4_pair_glu_bench_args args{};
@@ -1347,6 +1444,7 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     args.output              = d_out;
     args.gate_tmp            = d_gate_tmp;
     args.up_tmp              = d_up_tmp;
+    args.down_q8_soa         = validate_fused_down_q8 ? d_fused_down_q8 : nullptr;
     args.dpas_b_packed       = d_dpas_b;
     args.dpas_y_scales       = d_dpas_y;
     args.ids                 = d_ids;
@@ -1368,6 +1466,7 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     args.nb12                = q8_row_bytes;
     args.dst_nb1             = static_cast<int64_t>(m * sizeof(float));
     args.dst_nb2             = static_cast<int64_t>(selected_count * static_cast<size_t>(m) * sizeof(float));
+    args.down_q8_nb11        = validate_fused_down_q8 ? fused_down_q8_row_bytes : 0;
     args.gate_bias           = d_gate_bias;
     args.up_bias             = d_up_bias;
     args.gate_bias_nb1       = static_cast<int64_t>(m * sizeof(float));
@@ -1428,7 +1527,7 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     const double bytes =
         2.0 * selected_weight_bytes * static_cast<double>(n_tokens) +
         static_cast<double>(split_gate_up ? 2 : 1) * static_cast<double>(act_bytes) + static_cast<double>(out_bytes) +
-        (split_gate_up ? 4.0 * static_cast<double>(out_bytes) : 0.0) +
+        static_cast<double>(fused_down_q8_bytes) + (split_gate_up ? 4.0 * static_cast<double>(out_bytes) : 0.0) +
         (use_bias ? 2.0 * static_cast<double>(selected_count * static_cast<size_t>(m) * sizeof(float)) : 0.0) +
         2.0 * static_cast<double>(selected_count * sizeof(const uint8_t *)) +
         static_cast<double>(ids_count * sizeof(int32_t));
@@ -1441,6 +1540,15 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     if (validate) {
         std::vector<float> actual(out_count);
         queue.memcpy(actual.data(), d_out, out_bytes).wait();
+        if (validate_fused_down_q8) {
+            std::vector<uint8_t> fused_down_q8(fused_down_q8_bytes);
+            queue.memcpy(fused_down_q8.data(), d_fused_down_q8, fused_down_q8_bytes).wait();
+            if (!validate_q8_1_soa_from_f32_rows(actual, fused_down_q8, static_cast<int64_t>(ids_count), m,
+                                                 fused_down_q8_row_bytes, error)) {
+                cleanup();
+                return false;
+            }
+        }
         for (float value : actual) {
             if (!std::isfinite(value)) {
                 cleanup();
@@ -1466,6 +1574,8 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
             ref_args.predecoded_i8      = false;
             ref_args.gate_tmp           = nullptr;
             ref_args.up_tmp             = nullptr;
+            ref_args.down_q8_soa        = nullptr;
+            ref_args.down_q8_nb11       = 0;
             ref_args.dpas_b_packed      = nullptr;
             ref_args.dpas_y_scales      = nullptr;
             ref_args.grouped_expert_ids = nullptr;
@@ -1522,6 +1632,9 @@ bool run_mxfp4_layer_glu_down(const GeneratedWeights &     weights,
                               bool                         cache_y,
                               bool                         xmx_tiled_gate_up,
                               bool                         xmx_tiled_grouped,
+                              bool                         xmx_tiled_pack_q8,
+                              bool                         xmx_tiled_prefetch,
+                              int                          xmx_tiled_m_tiles,
                               int                          xmx_tiles_n,
                               bool                         vector_qs_load,
                               bool                         ignore_weight_scale,
@@ -1554,6 +1667,26 @@ bool run_mxfp4_layer_glu_down(const GeneratedWeights &     weights,
     }
     if (xmx_tiled_grouped && (!xmx_tiled_gate_up || rows_per_wg != 8)) {
         error = "mxfp4_layer_glu_down grouped XMX_TILED gate/up requires xmx_tiled r8.";
+        return false;
+    }
+    if (xmx_tiled_pack_q8 && (!xmx_tiled_gate_up || xmx_tiled_grouped)) {
+        error = "mxfp4_layer_glu_down packed-Q8 variant requires non-grouped XMX_TILED.";
+        return false;
+    }
+    if (xmx_tiled_prefetch && (!xmx_tiled_gate_up || !xmx_tiled_pack_q8)) {
+        error = "mxfp4_layer_glu_down prefetch variant requires packed XMX_TILED.";
+        return false;
+    }
+    if (xmx_tiled_prefetch && xmx_tiled_m_tiles != 2) {
+        error = "mxfp4_layer_glu_down prefetch variant is only implemented for M2.";
+        return false;
+    }
+    if (xmx_tiled_m_tiles != 1 && xmx_tiled_m_tiles != 2 && xmx_tiled_m_tiles != 4) {
+        error = "mxfp4_layer_glu_down XMX_TILED M-tile grouping must be 1, 2, or 4.";
+        return false;
+    }
+    if (xmx_tiled_m_tiles != 1 && (!xmx_tiled_gate_up || rows_per_wg != 8)) {
+        error = "mxfp4_layer_glu_down XMX_TILED M-tile grouping is only implemented for r8.";
         return false;
     }
     if (xmx_tiled_gate_up && (vector_qs_load || scale_stride_blocks > 0)) {
@@ -1601,21 +1734,30 @@ bool run_mxfp4_layer_glu_down(const GeneratedWeights &     weights,
     } else {
         gate_up_layout = expert_layout;
     }
-    const size_t  gate_up_expert_bytes = gate_up_layout.size();
-    const size_t  down_expert_bytes    = expert_layout.size();
-    const size_t  logical_expert_bytes = weights.layout.size();
-    const size_t  expert_slots         = sparse_expert_slots ? std::max<size_t>(32, selected_count) : selected_count;
-    const size_t  gate_up_weight_bytes = gate_up_expert_bytes * expert_slots;
-    const size_t  down_weight_bytes    = down_expert_bytes * expert_slots;
-    const size_t  act_bytes            = activations.q8_1.size();
-    const size_t  glu_count            = static_cast<size_t>(m) * selected_count * token_count;
-    const size_t  glu_bytes            = glu_count * sizeof(float);
-    const size_t  out_count            = glu_count;
-    const size_t  out_bytes            = out_count * sizeof(float);
-    const size_t  bias_count           = static_cast<size_t>(m) * expert_slots;
-    const size_t  bias_bytes           = bias_count * sizeof(float);
-    const int64_t q8_row_bytes         = static_cast<int64_t>(k * sizeof(block_q8_1) / QK8_1);
-    const size_t  down_q8_bytes        = ids_count * static_cast<size_t>(q8_row_bytes);
+    const size_t  gate_up_expert_bytes    = gate_up_layout.size();
+    const size_t  down_expert_bytes       = expert_layout.size();
+    const size_t  logical_expert_bytes    = weights.layout.size();
+    const size_t  expert_slots            = sparse_expert_slots ? std::max<size_t>(32, selected_count) : selected_count;
+    const size_t  gate_up_weight_bytes    = gate_up_expert_bytes * expert_slots;
+    const size_t  down_weight_bytes       = down_expert_bytes * expert_slots;
+    const size_t  act_bytes               = activations.q8_1.size();
+    const size_t  glu_count               = static_cast<size_t>(m) * selected_count * token_count;
+    const size_t  glu_bytes               = glu_count * sizeof(float);
+    const size_t  out_count               = glu_count;
+    const size_t  out_bytes               = out_count * sizeof(float);
+    const size_t  bias_count              = static_cast<size_t>(m) * expert_slots;
+    const size_t  bias_bytes              = bias_count * sizeof(float);
+    const int64_t activation_q8_row_bytes = static_cast<int64_t>(k * sizeof(block_q8_1) / QK8_1);
+    const int64_t down_q8_row_bytes       = static_cast<int64_t>(m * sizeof(block_q8_1) / QK8_1);
+    const size_t  down_q8_bytes           = ids_count * static_cast<size_t>(down_q8_row_bytes);
+    const int64_t k_tiles                 = k / GGML_SYCL_MXFP4_MOE_XMX_K;
+    const size_t  dpas_b_bytes            = xmx_tiled_pack_q8 ?
+                                                ids_count * static_cast<size_t>(k_tiles) *
+                                        static_cast<size_t>(GGML_SYCL_MXFP4_MOE_XMX_K * GGML_SYCL_MXFP4_MOE_XMX_N) :
+                                                0;
+    const size_t  dpas_y_bytes            = xmx_tiled_pack_q8 ? ids_count * static_cast<size_t>(k_tiles) *
+                                                        static_cast<size_t>(GGML_SYCL_MXFP4_MOE_XMX_N) * sizeof(float) :
+                                                                0;
 
     std::vector<uint8_t> gate_slices(gate_up_weight_bytes);
     std::vector<uint8_t> up_slices(gate_up_weight_bytes);
@@ -1644,6 +1786,12 @@ bool run_mxfp4_layer_glu_down(const GeneratedWeights &     weights,
     float *          d_out                = sycl::malloc_device<float>(out_count, queue);
     float *          d_gate_bias          = use_bias ? sycl::malloc_device<float>(bias_count, queue) : nullptr;
     float *          d_up_bias            = use_bias ? sycl::malloc_device<float>(bias_count, queue) : nullptr;
+    int8_t *         d_dpas_b =
+        xmx_tiled_pack_q8 ? sycl::malloc_device<int8_t>(dpas_b_bytes == 0 ? 1 : dpas_b_bytes, queue) : nullptr;
+    float * d_dpas_y =
+        xmx_tiled_pack_q8 ?
+            sycl::malloc_device<float>((dpas_y_bytes == 0 ? sizeof(float) : dpas_y_bytes) / sizeof(float), queue) :
+            nullptr;
 
     auto cleanup = [&]() {
         if (d_gate) {
@@ -1700,10 +1848,17 @@ bool run_mxfp4_layer_glu_down(const GeneratedWeights &     weights,
         if (d_up_bias) {
             sycl::free(d_up_bias, queue);
         }
+        if (d_dpas_b) {
+            sycl::free(d_dpas_b, queue);
+        }
+        if (d_dpas_y) {
+            sycl::free(d_dpas_y, queue);
+        }
     };
 
     if (!d_gate || !d_up || !d_down || !d_gate_ptrs || !d_up_ptrs || !d_down_ptrs || !d_act || !d_ids || !d_glu ||
-        !d_down_q8 || !d_out || (use_bias && (!d_gate_bias || !d_up_bias))) {
+        !d_down_q8 || !d_out || (use_bias && (!d_gate_bias || !d_up_bias)) ||
+        (xmx_tiled_pack_q8 && (!d_dpas_b || !d_dpas_y))) {
         cleanup();
         error = "device allocation failed for mxfp4_layer_glu_down.";
         return false;
@@ -1833,12 +1988,12 @@ bool run_mxfp4_layer_glu_down(const GeneratedWeights &     weights,
     args.ne11                   = 1;
     args.ids_nb0                = sizeof(int32_t);
     args.ids_nb1                = static_cast<int64_t>(selected_count * sizeof(int32_t));
-    args.activation_nb11        = q8_row_bytes;
-    args.activation_nb12        = q8_row_bytes;
+    args.activation_nb11        = activation_q8_row_bytes;
+    args.activation_nb12        = activation_q8_row_bytes;
     args.glu_nb1                = static_cast<int64_t>(m * sizeof(float));
     args.glu_nb2                = static_cast<int64_t>(selected_count * static_cast<size_t>(m) * sizeof(float));
-    args.down_q8_nb11           = q8_row_bytes;
-    args.down_q8_nb12           = static_cast<int64_t>(selected_count) * q8_row_bytes;
+    args.down_q8_nb11           = down_q8_row_bytes;
+    args.down_q8_nb12           = static_cast<int64_t>(selected_count) * down_q8_row_bytes;
     args.output_nb1             = static_cast<int64_t>(m * sizeof(float));
     args.output_nb2             = static_cast<int64_t>(selected_count * static_cast<size_t>(m) * sizeof(float));
     args.gate_bias_nb1          = static_cast<int64_t>(m * sizeof(float));
@@ -1847,6 +2002,9 @@ bool run_mxfp4_layer_glu_down(const GeneratedWeights &     weights,
     args.cache_y                = cache_y;
     args.xmx_tiled_gate_up      = xmx_tiled_gate_up;
     args.xmx_tiled_grouped      = xmx_tiled_grouped;
+    args.xmx_tiled_pack_q8      = xmx_tiled_pack_q8;
+    args.xmx_tiled_prefetch     = xmx_tiled_prefetch;
+    args.xmx_tiled_m_tiles      = xmx_tiled_m_tiles;
     args.xmx_tiles_n            = xmx_tiled_gate_up ? gate_up_tiles_n : xmx_tiles_n;
     args.vector_qs_load         = vector_qs_load;
     args.ignore_weight_scale    = ignore_weight_scale;
@@ -1858,6 +2016,8 @@ bool run_mxfp4_layer_glu_down(const GeneratedWeights &     weights,
     args.grouped_chunks         = d_grouped_chunks;
     args.grouped_row_starts     = d_grouped_row_starts;
     args.grouped_n_chunks       = static_cast<int>(grouped_chunks_host.size());
+    args.dpas_b_packed          = d_dpas_b;
+    args.dpas_y_scales          = d_dpas_y;
     args.glu_op                 = GGML_GLU_OP_SWIGLU_OAI;
     args.alpha                  = 1.702f;
     args.limit                  = 7.0f;
@@ -1908,8 +2068,17 @@ bool run_mxfp4_layer_glu_down(const GeneratedWeights &     weights,
     out.bandwidth_gbps = (mean_s > 0.0) ? (bytes / mean_s) / 1.0e9 : 0.0;
 
     if (validate) {
-        std::vector<float> actual(out_count);
+        std::vector<float>   glu(glu_count);
+        std::vector<uint8_t> down_q8(down_q8_bytes);
+        std::vector<float>   actual(out_count);
+        queue.memcpy(glu.data(), d_glu, glu_bytes).wait();
+        queue.memcpy(down_q8.data(), d_down_q8, down_q8_bytes).wait();
         queue.memcpy(actual.data(), d_out, out_bytes).wait();
+        if (!validate_q8_1_soa_from_f32_rows(glu, down_q8, static_cast<int64_t>(ids_count), m, down_q8_row_bytes,
+                                             error)) {
+            cleanup();
+            return false;
+        }
         for (float value : actual) {
             if (!std::isfinite(value)) {
                 cleanup();
@@ -5199,11 +5368,16 @@ bool run_mxfp4_mmv_id_xmx_tiled(const GeneratedWeights &     weights,
         std::copy(launch_layout.begin(), launch_layout.end(), launch_slices.begin() + slot * launch_expert_bytes);
     }
 
-    uint8_t *        d_tiled = sycl::malloc_device<uint8_t>(launch_weight_bytes, queue);
-    const uint8_t ** d_ptrs  = sycl::malloc_device<const uint8_t *>(expert_slots, queue);
-    uint8_t *        d_act   = sycl::malloc_device<uint8_t>(act_bytes, queue);
-    int32_t *        d_ids   = sycl::malloc_device<int32_t>(ids_count, queue);
-    float *          d_out   = sycl::malloc_device<float>(out_count, queue);
+    uint8_t *        d_tiled              = sycl::malloc_device<uint8_t>(launch_weight_bytes, queue);
+    const uint8_t ** d_ptrs               = sycl::malloc_device<const uint8_t *>(expert_slots, queue);
+    uint8_t *        d_act                = sycl::malloc_device<uint8_t>(act_bytes, queue);
+    int32_t *        d_ids                = sycl::malloc_device<int32_t>(ids_count, queue);
+    int32_t *        d_grouped_experts    = nullptr;
+    int32_t *        d_grouped_offsets    = nullptr;
+    int32_t *        d_grouped_rows       = nullptr;
+    int32_t *        d_grouped_chunks     = nullptr;
+    int32_t *        d_grouped_row_starts = nullptr;
+    float *          d_out                = sycl::malloc_device<float>(out_count, queue);
     int8_t *         d_dpas_b =
         i8_rowmajor ? sycl::malloc_device<int8_t>(dpas_b_bytes == 0 ? 1 : dpas_b_bytes, queue) : nullptr;
     float *   d_dpas_y = i8_rowmajor ? sycl::malloc_device<float>(
@@ -5226,6 +5400,21 @@ bool run_mxfp4_mmv_id_xmx_tiled(const GeneratedWeights &     weights,
         }
         if (d_ids) {
             sycl::free(d_ids, queue);
+        }
+        if (d_grouped_experts) {
+            sycl::free(d_grouped_experts, queue);
+        }
+        if (d_grouped_offsets) {
+            sycl::free(d_grouped_offsets, queue);
+        }
+        if (d_grouped_rows) {
+            sycl::free(d_grouped_rows, queue);
+        }
+        if (d_grouped_chunks) {
+            sycl::free(d_grouped_chunks, queue);
+        }
+        if (d_grouped_row_starts) {
+            sycl::free(d_grouped_row_starts, queue);
         }
         if (d_out) {
             sycl::free(d_out, queue);
@@ -5267,10 +5456,72 @@ bool run_mxfp4_mmv_id_xmx_tiled(const GeneratedWeights &     weights,
         }
     }
 
+    std::vector<int32_t> grouped_experts_host;
+    std::vector<int32_t> grouped_offsets_host;
+    std::vector<int32_t> grouped_rows_host;
+    std::vector<int32_t> grouped_chunks_host;
+    std::vector<int32_t> grouped_row_starts_host;
+    if (i8_rowmajor) {
+        constexpr int                     exec_n = GGML_SYCL_MXFP4_MOE_XMX_N;
+        std::vector<std::vector<int32_t>> grouped_slots;
+        grouped_slots.reserve(std::min(expert_slots, ids_count));
+        for (size_t token = 0; token < token_count; ++token) {
+            for (size_t sel = 0; sel < selected_count; ++sel) {
+                const int32_t eid = host_ids[token * selected_count + sel];
+                auto          it  = std::find(grouped_experts_host.begin(), grouped_experts_host.end(), eid);
+                size_t        group_index;
+                if (it == grouped_experts_host.end()) {
+                    group_index = grouped_experts_host.size();
+                    grouped_experts_host.push_back(eid);
+                    grouped_slots.emplace_back();
+                } else {
+                    group_index = static_cast<size_t>(std::distance(grouped_experts_host.begin(), it));
+                }
+                grouped_slots[group_index].push_back(static_cast<int32_t>(sel * token_count + token));
+            }
+        }
+        grouped_offsets_host.reserve(grouped_experts_host.size() + 1);
+        grouped_offsets_host.push_back(0);
+        for (size_t group = 0; group < grouped_slots.size(); ++group) {
+            auto & rows = grouped_slots[group];
+            std::sort(rows.begin(), rows.end());
+            const int rows_begin = static_cast<int>(grouped_rows_host.size());
+            grouped_rows_host.insert(grouped_rows_host.end(), rows.begin(), rows.end());
+            for (int row_start = 0; row_start < static_cast<int>(rows.size()); row_start += exec_n) {
+                grouped_chunks_host.push_back(static_cast<int32_t>(group));
+                grouped_row_starts_host.push_back(row_start);
+            }
+            grouped_offsets_host.push_back(rows_begin + static_cast<int>(rows.size()));
+        }
+        if (grouped_rows_host.size() != ids_count || grouped_chunks_host.empty()) {
+            cleanup();
+            error = "mxfp4_mmv_id_xmx_tiled grouped I8 setup failed.";
+            return false;
+        }
+        d_grouped_experts    = sycl::malloc_device<int32_t>(grouped_experts_host.size(), queue);
+        d_grouped_offsets    = sycl::malloc_device<int32_t>(grouped_offsets_host.size(), queue);
+        d_grouped_rows       = sycl::malloc_device<int32_t>(grouped_rows_host.size(), queue);
+        d_grouped_chunks     = sycl::malloc_device<int32_t>(grouped_chunks_host.size(), queue);
+        d_grouped_row_starts = sycl::malloc_device<int32_t>(grouped_row_starts_host.size(), queue);
+        if (!d_grouped_experts || !d_grouped_offsets || !d_grouped_rows || !d_grouped_chunks || !d_grouped_row_starts) {
+            cleanup();
+            error = "device allocation failed for grouped mxfp4_mmv_id_xmx_tiled.";
+            return false;
+        }
+    }
+
     queue.memcpy(d_tiled, launch_slices.data(), launch_weight_bytes);
     queue.memcpy(d_ptrs, host_ptrs.data(), expert_slots * sizeof(const uint8_t *));
     queue.memcpy(d_act, activations.q8_1.data(), act_bytes);
     queue.memcpy(d_ids, host_ids.data(), ids_count * sizeof(int32_t));
+    if (i8_rowmajor) {
+        queue.memcpy(d_grouped_experts, grouped_experts_host.data(), grouped_experts_host.size() * sizeof(int32_t));
+        queue.memcpy(d_grouped_offsets, grouped_offsets_host.data(), grouped_offsets_host.size() * sizeof(int32_t));
+        queue.memcpy(d_grouped_rows, grouped_rows_host.data(), grouped_rows_host.size() * sizeof(int32_t));
+        queue.memcpy(d_grouped_chunks, grouped_chunks_host.data(), grouped_chunks_host.size() * sizeof(int32_t));
+        queue.memcpy(d_grouped_row_starts, grouped_row_starts_host.data(),
+                     grouped_row_starts_host.size() * sizeof(int32_t));
+    }
     queue.memset(d_out, 0, out_bytes);
     if (compare_to_soa) {
         std::vector<uint8_t> ref_slices(logical_expert_bytes * expert_slots);
@@ -5295,6 +5546,11 @@ bool run_mxfp4_mmv_id_xmx_tiled(const GeneratedWeights &     weights,
     args.ids                = d_ids;
     args.dpas_b_packed      = d_dpas_b;
     args.dpas_y_scales      = d_dpas_y;
+    args.grouped_expert_ids = d_grouped_experts;
+    args.grouped_offsets    = d_grouped_offsets;
+    args.grouped_row_slots  = d_grouped_rows;
+    args.grouped_chunks     = d_grouped_chunks;
+    args.grouped_row_starts = d_grouped_row_starts;
     args.ncols              = static_cast<int>(k);
     args.ncols_y            = static_cast<int>(k);
     args.nrows_per_expert   = static_cast<int>(m);
@@ -5305,6 +5561,7 @@ bool run_mxfp4_mmv_id_xmx_tiled(const GeneratedWeights &     weights,
     args.xmx_tiles_n        = tiles_n;
     args.raw_accum          = raw_accum;
     args.i8_rowmajor        = i8_rowmajor;
+    args.grouped_n_chunks   = static_cast<int>(grouped_chunks_host.size());
     args.ids_nb0            = sizeof(int32_t);
     args.ids_nb1            = static_cast<int64_t>(selected_count * sizeof(int32_t));
     args.nb11               = q8_row_bytes;

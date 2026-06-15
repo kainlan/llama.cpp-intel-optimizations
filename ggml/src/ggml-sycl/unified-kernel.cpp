@@ -26,6 +26,7 @@
 
 #include <array>
 #include <chrono>
+#include <utility>
 
 // =============================================================================
 // Standalone Test Mode Support
@@ -80,13 +81,15 @@ const ggml_sycl_info_stub & ggml_sycl_info() {
 #else                      // !UNIFIED_KERNEL_TEST_STANDALONE
 
 #    include "common.hpp"  // For ggml_sycl_info() and GGML_SYCL_DEBUG
+#    include "mem-ops.hpp"
 
-#endif                     // UNIFIED_KERNEL_TEST_STANDALONE
+#endif  // UNIFIED_KERNEL_TEST_STANDALONE
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 
 namespace ggml_sycl_unified {
 
@@ -4830,16 +4833,12 @@ namespace ggml_sycl {
 // =============================================================================
 // Arena-Routed Allocation Helpers
 // =============================================================================
-// All helpers return alloc_handle. Callers call unified_free(handle) instead of
-// tracking from_pool/from_arena booleans. unified_free routes:
-//   - vram_zone != COUNT: zone_free(vram_zone, ptr) for TLSF reclaim
-//   - zone_managed host: freed by zone reset (no-op in unified_free)
-//   - raw device/host: sycl::free via registered record
+// Helpers return mem_handle for canonical allocation-time ownership. Raw
+// pointers are resolved from handles only for the final kernel/copy ABI.
 
 // Host-pinned allocation for persistent kernel data structures.
 // Routes through host SCRATCH zone when configured, runtime pool otherwise.
-// unified_free(handle) is a no-op for zone-managed host allocations (freed by zone reset).
-static alloc_handle pinned_alloc(size_t bytes, sycl::queue & queue, int device_id) {
+static mem_handle pinned_alloc(size_t bytes, sycl::queue & queue, int device_id) {
     if (bytes == 0) {
         return {};
     }
@@ -4850,8 +4849,8 @@ static alloc_handle pinned_alloc(size_t bytes, sycl::queue & queue, int device_i
     req.intent.role                         = alloc_role::COMPUTE;
     req.intent.category                     = runtime_category::COMPUTE;
     req.intent.constraints.must_host_pinned = true;
-    alloc_handle h{};
-    if (unified_alloc(req, &h) && h.ptr) {
+    mem_handle h = unified_allocate(req);
+    if (h.valid()) {
         return h;
     }
     GGML_LOG_WARN(
@@ -4863,7 +4862,7 @@ static alloc_handle pinned_alloc(size_t bytes, sycl::queue & queue, int device_i
 
 // Device allocation for persistent kernel state (not reset between tokens).
 // Routes through WEIGHT zone when arena is active; falls back to malloc_device.
-static alloc_handle device_alloc_persistent(size_t bytes, sycl::queue & queue, int device_id) {
+static mem_handle device_alloc_persistent(size_t bytes, sycl::queue & queue, int device_id) {
     if (bytes == 0) {
         return {};
     }
@@ -4875,20 +4874,18 @@ static alloc_handle device_alloc_persistent(size_t bytes, sycl::queue & queue, i
     req.intent.category                     = runtime_category::COMPUTE;
     req.intent.constraints.must_device      = true;
     req.intent.constraints.prefer_vram_zone = vram_zone_id::WEIGHT;
-    alloc_handle h{};
-    if (unified_alloc(req, &h) && h.ptr) {
+    mem_handle h = unified_allocate(req);
+    if (h.valid()) {
         return h;
     }
     // Zone routing failed — fall back to raw device allocation.
     req.intent.constraints.prefer_vram_zone = vram_zone_id::COUNT;
-    unified_alloc(req, &h);
-    return h;
+    return unified_allocate(req);
 }
 
 // Device allocation for per-token scratch (reset by arena_reset between tokens).
 // Routes through SCRATCH zone when arena active; falls back to malloc_device.
-// unified_free(handle) calls zone_free(SCRATCH) for TLSF reclaim when zone-managed.
-static alloc_handle device_alloc_scratch(size_t bytes, sycl::queue & queue, int device_id) {
+static mem_handle device_alloc_scratch(size_t bytes, sycl::queue & queue, int device_id) {
     if (bytes == 0) {
         return {};
     }
@@ -4900,14 +4897,13 @@ static alloc_handle device_alloc_scratch(size_t bytes, sycl::queue & queue, int 
     req.intent.category                     = runtime_category::COMPUTE;
     req.intent.constraints.must_device      = true;
     req.intent.constraints.prefer_vram_zone = vram_zone_id::SCRATCH;
-    alloc_handle h{};
-    if (unified_alloc(req, &h) && h.ptr) {
+    mem_handle h = unified_allocate(req);
+    if (h.valid()) {
         return h;
     }
     // Zone routing failed — fall back to raw device allocation.
     req.intent.constraints.prefer_vram_zone = vram_zone_id::COUNT;
-    unified_alloc(req, &h);
-    return h;
+    return unified_allocate(req);
 }
 
 static const char * persistent_op_type_name(OperationType type) {
@@ -7400,34 +7396,29 @@ UnifiedKernel::~UnifiedKernel() {
     // Free micro-graph resources
     micro_graph_.reset();
     if (micro_tile_counters_) {
-        (void) unified_free(micro_tile_counters_alloc_);
-        micro_tile_counters_alloc_ = {};
-        micro_tile_counters_       = nullptr;
-        micro_tile_counters_n_     = 0;
+        micro_tile_counters_handle_ = {};
+        micro_tile_counters_        = nullptr;
+        micro_tile_counters_n_      = 0;
     }
     if (micro_generation_) {
-        (void) unified_free(micro_gen_alloc_);
-        micro_gen_alloc_  = {};
+        micro_gen_handle_ = {};
         micro_generation_ = nullptr;
     }
     // Free MMVQ micro-graph Q8 and scratch buffers
     for (int i = 0; i < 2; i++) {
         if (mmvq_q8_bufs_[i]) {
-            (void) unified_free(mmvq_q8_buf_allocs_[i]);
-            mmvq_q8_buf_allocs_[i] = {};
-            mmvq_q8_bufs_[i]       = nullptr;
+            mmvq_q8_buf_handles_[i] = {};
+            mmvq_q8_bufs_[i]        = nullptr;
         }
     }
     mmvq_q8_buf_size_ = 0;
     if (mmvq_gate_scratch_) {
-        (void) unified_free(mmvq_gate_scratch_alloc_);
-        mmvq_gate_scratch_alloc_ = {};
-        mmvq_gate_scratch_       = nullptr;
+        mmvq_gate_scratch_handle_ = {};
+        mmvq_gate_scratch_        = nullptr;
     }
     if (mmvq_up_scratch_) {
-        (void) unified_free(mmvq_up_scratch_alloc_);
-        mmvq_up_scratch_alloc_ = {};
-        mmvq_up_scratch_       = nullptr;
+        mmvq_up_scratch_handle_ = {};
+        mmvq_up_scratch_        = nullptr;
     }
     mmvq_gate_scratch_sz_ = 0;
 }
@@ -7588,18 +7579,30 @@ void UnifiedKernel::allocate_persistent_buffers(int hidden_dim, int intermediate
     free_persistent_buffers();
 
     for (int i = 0; i < 4; i++) {
-        persistent_buf_allocs_[i] = device_alloc_persistent(required_size, queue_, device_id_);
-        persistent_buffers_[i]    = static_cast<void *>(persistent_buf_allocs_[i].ptr);
+        persistent_buf_handles_[i] = device_alloc_persistent(required_size, queue_, device_id_);
+        persistent_buffers_[i]     = persistent_buf_handles_[i].resolve().ptr;
+        if (!persistent_buffers_[i]) {
+            GGML_LOG_WARN("[UNIFIED-KERNEL] Failed to allocate persistent scratch buffer\n");
+            for (int j = 0; j <= i; j++) {
+                persistent_buf_handles_[j] = {};
+                persistent_buffers_[j]     = nullptr;
+            }
+            return;
+        }
     }
 
     if (!sync_block_) {
-        sync_block_alloc_ = device_alloc_persistent(3 * sizeof(int), queue_, device_id_);
-        sync_block_       = static_cast<int *>(sync_block_alloc_.ptr);
+        sync_block_handle_ = device_alloc_persistent(3 * sizeof(int), queue_, device_id_);
+        sync_block_        = static_cast<int *>(sync_block_handle_.resolve().ptr);
+        if (!sync_block_) {
+            GGML_LOG_WARN("[UNIFIED-KERNEL] Failed to allocate persistent sync block\n");
+            return;
+        }
     }
     tile_counter_    = sync_block_;
     barrier_counter_ = sync_block_ + 1;
     barrier_sense_   = sync_block_ + 2;
-    queue_.memset(sync_block_, 0, 3 * sizeof(int)).wait();
+    mem_fill(sync_block_handle_, 0, 3 * sizeof(int), queue_);
 
     persistent_buffer_size_ = required_size;
 
@@ -7622,37 +7625,29 @@ void UnifiedKernel::free_persistent_buffers() {
 
     for (int i = 0; i < 4; i++) {
         if (persistent_buffers_[i]) {
-            (void) unified_free(persistent_buf_allocs_[i]);
-            persistent_buf_allocs_[i] = {};
-            persistent_buffers_[i]    = nullptr;
+            persistent_buf_handles_[i] = {};
+            persistent_buffers_[i]     = nullptr;
         }
     }
     if (sync_block_) {
-        (void) unified_free(sync_block_alloc_);
-        sync_block_alloc_ = {};
-        sync_block_       = nullptr;
+        sync_block_handle_ = {};
+        sync_block_        = nullptr;
     }
     tile_counter_    = nullptr;
     barrier_counter_ = nullptr;
     barrier_sense_   = nullptr;
     if (d_ops_pool_) {
-        (void) unified_free(ops_pool_alloc_);
-        ops_pool_alloc_  = {};
+        ops_pool_handle_ = {};
         d_ops_pool_      = nullptr;
         d_ops_pool_size_ = 0;
     }
     for (size_t _i = 0; _i < get_rows_slots_.size(); _i++) {
         auto & slot = get_rows_slots_[_i];
         if (slot.ptr) {
-            // get_rows slots share a single alloc_handle (get_rows_alloc_) only
-            // when arena-backed; non-arena slots use slot.ptr directly.
-            slot.ptr  = nullptr;
-            slot.size = 0;
+            slot.handle = {};
+            slot.ptr    = nullptr;
+            slot.size   = 0;
         }
-    }
-    if (get_rows_alloc_.ptr) {
-        (void) unified_free(get_rows_alloc_);
-        get_rows_alloc_ = {};
     }
     get_rows_slots_.clear();
     // Free scratch output pool
@@ -7660,32 +7655,26 @@ void UnifiedKernel::free_persistent_buffers() {
     // Free DAG allocations
     if (dag_allocated_) {
         if (dag_state_.ready_counter) {
-            (void) unified_free(dag_ready_counter_alloc_);
-            dag_ready_counter_alloc_ = {};
+            dag_ready_counter_handle_ = {};
         }
         if (dag_state_.tile_claimed) {
-            (void) unified_free(dag_tile_claimed_alloc_);
-            dag_tile_claimed_alloc_ = {};
+            dag_tile_claimed_handle_ = {};
         }
         if (dag_state_.tiles_done) {
-            (void) unified_free(dag_tiles_done_alloc_);
-            dag_tiles_done_alloc_ = {};
+            dag_tiles_done_handle_ = {};
         }
         if (dag_state_.successor_offset) {
-            (void) unified_free(dag_successor_off_alloc_);
-            dag_successor_off_alloc_ = {};
+            dag_successor_off_handle_ = {};
         }
         if (dag_state_.successor_list) {
-            (void) unified_free(dag_successor_list_alloc_);
-            dag_successor_list_alloc_ = {};
+            dag_successor_list_handle_ = {};
         }
         if (dag_state_.n_tiles) {
-            (void) unified_free(dag_n_tiles_alloc_);
-            dag_n_tiles_alloc_ = {};
+            dag_n_tiles_handle_ = {};
         }
+        dag_initial_ready_counter_handle_ = {};
         if (dag_state_.completed_count) {
-            (void) unified_free(dag_completed_alloc_);
-            dag_completed_alloc_ = {};
+            dag_completed_handle_ = {};
         }
         dag_state_        = {};
         dag_allocated_    = false;
@@ -7695,20 +7684,16 @@ void UnifiedKernel::free_persistent_buffers() {
     // Free phase schedule allocations
     if (phase_allocated_) {
         if (phase_schedule_.entries) {
-            (void) unified_free(phase_entries_alloc_);
-            phase_entries_alloc_ = {};
+            phase_entries_handle_ = {};
         }
         if (phase_schedule_.phase_offset) {
-            (void) unified_free(phase_offset_alloc_);
-            phase_offset_alloc_ = {};
+            phase_offset_handle_ = {};
         }
         if (phase_schedule_.phase_tiles) {
-            (void) unified_free(phase_tiles_alloc_);
-            phase_tiles_alloc_ = {};
+            phase_tiles_handle_ = {};
         }
         if (phase_schedule_.phase_type) {
-            (void) unified_free(phase_type_alloc_);
-            phase_type_alloc_ = {};
+            phase_type_handle_ = {};
         }
 
         phase_schedule_      = {};
@@ -7718,24 +7703,20 @@ void UnifiedKernel::free_persistent_buffers() {
     }
     // Free light barrier flags
     if (light_flags_) {
-        (void) unified_free(light_flags_alloc_);
-        light_flags_alloc_ = {};
-        light_flags_       = nullptr;
-        light_flags_size_  = 0;
+        light_flags_handle_ = {};
+        light_flags_        = nullptr;
+        light_flags_size_   = 0;
     }
     // Free role schedule allocations
     if (role_allocated_) {
         if (role_schedule_.elem_segments) {
-            (void) unified_free(role_elem_alloc_);
-            role_elem_alloc_ = {};
+            role_elem_handle_ = {};
         }
         if (role_schedule_.matmul_segments) {
-            (void) unified_free(role_matmul_alloc_);
-            role_matmul_alloc_ = {};
+            role_matmul_handle_ = {};
         }
         if (role_schedule_.sync_flags) {
-            (void) unified_free(role_sync_alloc_);
-            role_sync_alloc_ = {};
+            role_sync_handle_ = {};
         }
 
         role_schedule_      = {};
@@ -7769,46 +7750,52 @@ void UnifiedKernel::build_dag(const std::vector<std::vector<int>> & successors, 
         }
         // Free old allocations
         if (dag_allocated_) {
-            (void) unified_free(dag_ready_counter_alloc_);
-            (void) unified_free(dag_tile_claimed_alloc_);
-            (void) unified_free(dag_tiles_done_alloc_);
-            (void) unified_free(dag_successor_off_alloc_);
-            (void) unified_free(dag_successor_list_alloc_);
-            (void) unified_free(dag_n_tiles_alloc_);
-            (void) unified_free(dag_completed_alloc_);
-            dag_ready_counter_alloc_  = {};
-            dag_tile_claimed_alloc_   = {};
-            dag_tiles_done_alloc_     = {};
-            dag_successor_off_alloc_  = {};
-            dag_successor_list_alloc_ = {};
-            dag_n_tiles_alloc_        = {};
-            dag_completed_alloc_      = {};
+            dag_ready_counter_handle_         = {};
+            dag_tile_claimed_handle_          = {};
+            dag_tiles_done_handle_            = {};
+            dag_successor_off_handle_         = {};
+            dag_successor_list_handle_        = {};
+            dag_n_tiles_handle_               = {};
+            dag_initial_ready_counter_handle_ = {};
+            dag_completed_handle_             = {};
         }
         // Allocate new with some headroom
-        const int alloc_ops         = n_ops + 64;
-        const int alloc_edges       = n_edges + 128;
-        dag_ready_counter_alloc_    = device_alloc_persistent(alloc_ops * sizeof(int), queue_, device_id_);
-        dag_state_.ready_counter    = static_cast<int *>(dag_ready_counter_alloc_.ptr);
-        dag_tile_claimed_alloc_     = device_alloc_persistent(alloc_ops * sizeof(int), queue_, device_id_);
-        dag_state_.tile_claimed     = static_cast<int *>(dag_tile_claimed_alloc_.ptr);
-        dag_tiles_done_alloc_       = device_alloc_persistent(alloc_ops * sizeof(int), queue_, device_id_);
-        dag_state_.tiles_done       = static_cast<int *>(dag_tiles_done_alloc_.ptr);
-        dag_successor_off_alloc_    = pinned_alloc((alloc_ops + 1) * sizeof(int), queue_, device_id_);
-        dag_state_.successor_offset = static_cast<int *>(dag_successor_off_alloc_.ptr);
-        dag_successor_list_alloc_   = pinned_alloc(std::max(alloc_edges, 1) * sizeof(int), queue_, device_id_);
-        dag_state_.successor_list   = static_cast<int *>(dag_successor_list_alloc_.ptr);
-        dag_n_tiles_alloc_          = pinned_alloc(alloc_ops * sizeof(int), queue_, device_id_);
-        dag_state_.n_tiles          = static_cast<int *>(dag_n_tiles_alloc_.ptr);
-        if (!dag_state_.successor_offset || !dag_state_.successor_list || !dag_state_.n_tiles) {
-            GGML_LOG_WARN("[PERSISTENT-TG] DAG pinned_alloc failed \u2014 persistent DAG kernel disabled\n");
-            dag_pool_n_ops_   = 0;
-            dag_pool_n_edges_ = 0;
+        const int    alloc_ops            = n_ops + 64;
+        const int    alloc_edges          = n_edges + 128;
+        dag_ready_counter_handle_  = device_alloc_persistent(alloc_ops * sizeof(int), queue_, device_id_);
+        dag_tile_claimed_handle_   = device_alloc_persistent(alloc_ops * sizeof(int), queue_, device_id_);
+        dag_tiles_done_handle_     = device_alloc_persistent(alloc_ops * sizeof(int), queue_, device_id_);
+        dag_successor_off_handle_  = pinned_alloc((alloc_ops + 1) * sizeof(int), queue_, device_id_);
+        dag_successor_list_handle_ = pinned_alloc(std::max(alloc_edges, 1) * sizeof(int), queue_, device_id_);
+        dag_n_tiles_handle_        = pinned_alloc(alloc_ops * sizeof(int), queue_, device_id_);
+        dag_initial_ready_counter_handle_ = pinned_alloc(alloc_ops * sizeof(int), queue_, device_id_);
+        dag_completed_handle_       = device_alloc_persistent(sizeof(int), queue_, device_id_);
+        dag_state_.ready_counter    = static_cast<int *>(dag_ready_counter_handle_.resolve().ptr);
+        dag_state_.tile_claimed     = static_cast<int *>(dag_tile_claimed_handle_.resolve().ptr);
+        dag_state_.tiles_done       = static_cast<int *>(dag_tiles_done_handle_.resolve().ptr);
+        dag_state_.successor_offset = static_cast<int *>(dag_successor_off_handle_.resolve().ptr);
+        dag_state_.successor_list   = static_cast<int *>(dag_successor_list_handle_.resolve().ptr);
+        dag_state_.n_tiles          = static_cast<int *>(dag_n_tiles_handle_.resolve().ptr);
+        dag_state_.completed_count  = static_cast<int *>(dag_completed_handle_.resolve().ptr);
+        if (!dag_state_.ready_counter || !dag_state_.tile_claimed || !dag_state_.tiles_done ||
+            !dag_state_.successor_offset || !dag_state_.successor_list || !dag_state_.n_tiles ||
+            !dag_initial_ready_counter_handle_.resolve().ptr || !dag_state_.completed_count) {
+            GGML_LOG_WARN("[PERSISTENT-TG] DAG allocation failed \u2014 persistent DAG kernel disabled\n");
+            dag_ready_counter_handle_         = {};
+            dag_tile_claimed_handle_          = {};
+            dag_tiles_done_handle_            = {};
+            dag_successor_off_handle_         = {};
+            dag_successor_list_handle_        = {};
+            dag_n_tiles_handle_               = {};
+            dag_initial_ready_counter_handle_ = {};
+            dag_completed_handle_             = {};
+            dag_state_                        = {};
+            dag_pool_n_ops_                   = 0;
+            dag_pool_n_edges_                 = 0;
             return;
         }
-        dag_completed_alloc_       = device_alloc_persistent(1 * sizeof(int), queue_, device_id_);
-        dag_state_.completed_count = static_cast<int *>(dag_completed_alloc_.ptr);
-        dag_pool_n_ops_            = alloc_ops;
-        dag_pool_n_edges_          = alloc_edges;
+        dag_pool_n_ops_   = alloc_ops;
+        dag_pool_n_edges_ = alloc_edges;
         // Track new DAG device bytes (3 arrays of alloc_ops + 1 completed_count)
         if (device_id_ >= 0) {
             const size_t new_dag_bytes = (3 * alloc_ops + 1) * sizeof(int);
@@ -7830,6 +7817,9 @@ void UnifiedKernel::build_dag(const std::vector<std::vector<int>> & successors, 
 
     // Cache host-side initial state for fast per-token reset
     host_initial_ready_counter_ = in_degree;
+    if (void * initial_ready = dag_initial_ready_counter_handle_.resolve().ptr) {
+        std::memcpy(initial_ready, in_degree.data(), n_ops * sizeof(int));
+    }
 
     // Copy static topology to host-pinned buffers (kernel reads via PCIe zero-copy)
     std::memcpy(dag_state_.successor_offset, offsets.data(), (n_ops + 1) * sizeof(int));
@@ -7854,11 +7844,28 @@ void UnifiedKernel::reset_dag_counters() {
     const int n_ops = dag_state_.n_ops;
 
     // Restore in-degree values (predecessors remaining) from cached initial state
+#ifdef UNIFIED_KERNEL_TEST_STANDALONE
     queue_.memcpy(dag_state_.ready_counter, host_initial_ready_counter_.data(), n_ops * sizeof(int));
+#else
+    auto ready_dst = dag_ready_counter_handle_;
+    auto ready_src = dag_initial_ready_counter_handle_;
+    GGML_ASSERT(ready_dst.valid() && ready_src.valid());
+    sycl::event ready_event = mem_copy_async(ready_dst, ready_src, n_ops * sizeof(int), queue_);
+#endif
     // Reset per-token mutable counters to zero
+#ifdef UNIFIED_KERNEL_TEST_STANDALONE
     queue_.memset(dag_state_.tile_claimed, 0, n_ops * sizeof(int));
     queue_.memset(dag_state_.tiles_done, 0, n_ops * sizeof(int));
     queue_.memset(dag_state_.completed_count, 0, sizeof(int));
+#else
+    auto tile_claimed_handle    = dag_tile_claimed_handle_;
+    auto tiles_done_handle      = dag_tiles_done_handle_;
+    auto completed_count_handle = dag_completed_handle_;
+    GGML_ASSERT(tile_claimed_handle.valid() && tiles_done_handle.valid() && completed_count_handle.valid());
+    sycl::event tile_event = mem_fill_async(tile_claimed_handle, 0, n_ops * sizeof(int), queue_, { ready_event });
+    sycl::event done_event = mem_fill_async(tiles_done_handle, 0, n_ops * sizeof(int), queue_, { ready_event });
+    (void) mem_fill_async(completed_count_handle, 0, sizeof(int), queue_, { tile_event, done_event });
+#endif
     queue_.wait();
 }
 
@@ -7944,15 +7951,11 @@ void UnifiedKernel::build_phase_schedule(const std::vector<std::vector<int>> & s
     // Allocate host-pinned arrays (grow-on-demand; kernel reads via PCIe zero-copy)
     if (n_ops > phase_pool_n_ops_ || n_phases > phase_pool_n_phases_) {
         if (phase_allocated_) {
-            (void) unified_free(phase_entries_alloc_);
-            phase_entries_alloc_ = {};
-            (void) unified_free(phase_offset_alloc_);
-            phase_offset_alloc_ = {};
-            (void) unified_free(phase_tiles_alloc_);
-            phase_tiles_alloc_ = {};
+            phase_entries_handle_ = {};
+            phase_offset_handle_  = {};
+            phase_tiles_handle_   = {};
             if (phase_schedule_.phase_type) {
-                (void) unified_free(phase_type_alloc_);
-                phase_type_alloc_ = {};
+                phase_type_handle_ = {};
             }
         }
         const int    alloc_ops           = n_ops + 64;
@@ -7961,19 +7964,25 @@ void UnifiedKernel::build_phase_schedule(const std::vector<std::vector<int>> & s
         const size_t phase_offset_bytes  = (alloc_phases + 1) * sizeof(int);
         const size_t phase_tiles_bytes   = alloc_phases * sizeof(int);
         const size_t phase_type_bytes    = alloc_phases * sizeof(int);
-        phase_entries_alloc_             = pinned_alloc(phase_entries_bytes, queue_, device_id_);
-        phase_offset_alloc_              = pinned_alloc(phase_offset_bytes, queue_, device_id_);
-        phase_tiles_alloc_               = pinned_alloc(phase_tiles_bytes, queue_, device_id_);
-        phase_type_alloc_                = pinned_alloc(phase_type_bytes, queue_, device_id_);
-        phase_schedule_.entries          = static_cast<DevicePhaseEntry *>(phase_entries_alloc_.ptr);
-        phase_schedule_.phase_offset     = static_cast<int *>(phase_offset_alloc_.ptr);
-        phase_schedule_.phase_tiles      = static_cast<int *>(phase_tiles_alloc_.ptr);
-        phase_schedule_.phase_type       = static_cast<int *>(phase_type_alloc_.ptr);
+        phase_entries_handle_            = pinned_alloc(phase_entries_bytes, queue_, device_id_);
+        phase_offset_handle_             = pinned_alloc(phase_offset_bytes, queue_, device_id_);
+        phase_tiles_handle_              = pinned_alloc(phase_tiles_bytes, queue_, device_id_);
+        phase_type_handle_               = pinned_alloc(phase_type_bytes, queue_, device_id_);
+        phase_schedule_.entries          = static_cast<DevicePhaseEntry *>(phase_entries_handle_.resolve().ptr);
+        phase_schedule_.phase_offset     = static_cast<int *>(phase_offset_handle_.resolve().ptr);
+        phase_schedule_.phase_tiles      = static_cast<int *>(phase_tiles_handle_.resolve().ptr);
+        phase_schedule_.phase_type       = static_cast<int *>(phase_type_handle_.resolve().ptr);
         if (!phase_schedule_.entries || !phase_schedule_.phase_offset || !phase_schedule_.phase_tiles ||
             !phase_schedule_.phase_type) {
             GGML_LOG_WARN("[PERSISTENT-TG] Phase pinned_alloc failed \u2014 persistent phase kernel disabled\n");
-            phase_pool_n_ops_    = 0;
-            phase_pool_n_phases_ = 0;
+            phase_entries_handle_ = {};
+            phase_offset_handle_  = {};
+            phase_tiles_handle_   = {};
+            phase_type_handle_    = {};
+            phase_schedule_       = {};
+            phase_allocated_      = false;
+            phase_pool_n_ops_     = 0;
+            phase_pool_n_phases_  = 0;
             return;
         }
         phase_pool_n_ops_    = alloc_ops;
@@ -8180,18 +8189,15 @@ void UnifiedKernel::build_role_schedule(const std::vector<DeviceOperation> & hos
         // Free old allocations
         if (role_allocated_) {
             if (role_schedule_.elem_segments) {
-                (void) unified_free(role_elem_alloc_);
-                role_elem_alloc_ = {};
+                role_elem_handle_ = {};
             }
             if (role_schedule_.matmul_segments) {
-                (void) unified_free(role_matmul_alloc_);
-                role_matmul_alloc_ = {};
+                role_matmul_handle_ = {};
             }
             // sync_flags is the base of a single contiguous device allocation;
             // role_tile_counter and barrier counters are offsets within it.
             if (role_schedule_.sync_flags) {
-                (void) unified_free(role_sync_alloc_);
-                role_sync_alloc_ = {};
+                role_sync_handle_ = {};
             }
             // Barrier counters are within the sync_flags allocation (contiguous block)
             // Actually let's use a single allocation for all sync ints
@@ -8204,20 +8210,32 @@ void UnifiedKernel::build_role_schedule(const std::vector<DeviceOperation> & hos
         const size_t role_elem_bytes   = alloc_elem * sizeof(RoleSegment);
         const size_t role_matmul_bytes = alloc_matmul * sizeof(RoleSegment);
 
-        role_elem_alloc_               = pinned_alloc(role_elem_bytes, queue_, device_id_);
-        role_matmul_alloc_             = pinned_alloc(role_matmul_bytes, queue_, device_id_);
-        role_schedule_.elem_segments   = static_cast<RoleSegment *>(role_elem_alloc_.ptr);
-        role_schedule_.matmul_segments = static_cast<RoleSegment *>(role_matmul_alloc_.ptr);
+        role_elem_handle_              = pinned_alloc(role_elem_bytes, queue_, device_id_);
+        role_matmul_handle_            = pinned_alloc(role_matmul_bytes, queue_, device_id_);
+        role_schedule_.elem_segments   = static_cast<RoleSegment *>(role_elem_handle_.resolve().ptr);
+        role_schedule_.matmul_segments = static_cast<RoleSegment *>(role_matmul_handle_.resolve().ptr);
 
         // Single allocation for all sync/counter/barrier ints.
         // Each atomic counter/sense pair is padded to 64 bytes (16 ints) to avoid
         // false sharing on GPU L2 cache lines. Without padding, the elem and matmul
         // barrier counters share a cache line, causing stale reads in spin-wait loops
         // and barrier malfunction with 3+ elementwise WGs.
-        constexpr int CL_INTS             = 16;                            // 64 bytes / 4 bytes per int
-        const int     total_ints          = alloc_sync * 2 + CL_INTS * 5;  // sync_flags + 5 padded slots
-        role_sync_alloc_                  = device_alloc_persistent(total_ints * sizeof(int), queue_, device_id_);
-        int * sync_block                  = static_cast<int *>(role_sync_alloc_.ptr);
+        constexpr int CL_INTS         = 16;                            // 64 bytes / 4 bytes per int
+        const int     total_ints      = alloc_sync * 2 + CL_INTS * 5;  // sync_flags + 5 padded slots
+        role_sync_handle_ = device_alloc_persistent(total_ints * sizeof(int), queue_, device_id_);
+        int * sync_block  = static_cast<int *>(role_sync_handle_.resolve().ptr);
+        if (!role_schedule_.elem_segments || !role_schedule_.matmul_segments || !sync_block) {
+            GGML_LOG_WARN("[PERSISTENT-TG] Role schedule allocation failed; role-specialized kernel disabled\n");
+            role_elem_handle_   = {};
+            role_matmul_handle_ = {};
+            role_sync_handle_   = {};
+            role_schedule_      = {};
+            role_pool_n_elem_   = 0;
+            role_pool_n_matmul_ = 0;
+            role_pool_n_sync_   = 0;
+            role_allocated_     = false;
+            return;
+        }
         role_schedule_.sync_flags         = sync_block;                                 // [0..2*alloc_sync)
         role_schedule_.role_tile_counter  = sync_block + alloc_sync * 2;                // CL-aligned slot 0
         role_schedule_.elem_barrier_cnt   = sync_block + alloc_sync * 2 + CL_INTS;      // CL-aligned slot 1
@@ -8245,8 +8263,7 @@ void UnifiedKernel::build_role_schedule(const std::vector<DeviceOperation> & hos
 
     // Zero sync flags + counters (these are device memory for kernel atomics)
     const int total_zero = n_sync * 2 + 1 + 4;
-    queue_.memset(role_schedule_.sync_flags, 0, total_zero * sizeof(int));
-    queue_.wait();
+    mem_fill(role_sync_handle_, 0, total_zero * sizeof(int), queue_);
 
     role_schedule_.n_elem_segments   = n_elem_segs;
     role_schedule_.n_matmul_segments = n_matmul_segs;
@@ -8739,19 +8756,12 @@ void UnifiedKernel::add_rope(int layer, const RopeDescriptor & desc, int64_t out
     current_plan_->operations.push_back(op);
 }
 
-void UnifiedKernel::add_temp_device_alloc(void * ptr, size_t bytes) {
-    if (current_plan_ && ptr) {
-        current_plan_->temp_device_allocs.push_back({ ptr, bytes });
-        current_plan_->temp_device_alloc_bytes += bytes;
-    }
-}
-
-void UnifiedKernel::add_temp_device_alloc_handle(const ggml_sycl::alloc_handle & handle) {
-    if (!current_plan_ || handle.ptr == nullptr) {
+void UnifiedKernel::add_temp_device_handle(ggml_sycl::mem_handle handle, size_t bytes) {
+    if (!current_plan_ || !handle.valid()) {
         return;
     }
-    current_plan_->temp_device_allocs.push_back({ handle.ptr, handle.size });
-    current_plan_->temp_device_alloc_handles[handle.ptr] = handle;
+    current_plan_->temp_device_handles.push_back(std::move(handle));
+    current_plan_->temp_device_alloc_bytes += bytes;
 }
 
 void UnifiedKernel::set_split_config(const KernelSplitConfig & config) {
@@ -8765,16 +8775,7 @@ void UnifiedKernel::get_split_config(KernelSplitConfig & out) const {
 
 void UnifiedKernel::cancel_persistent() {
     if (current_plan_) {
-        for (auto & [ptr, sz] : current_plan_->temp_device_allocs) {
-            auto hit = current_plan_->temp_device_alloc_handles.find(ptr);
-            if (hit != current_plan_->temp_device_alloc_handles.end()) {
-                (void) ggml_sycl::unified_free(hit->second);
-            } else {
-                sycl::free(ptr, queue_);
-            }
-        }
-        current_plan_->temp_device_allocs.clear();
-        current_plan_->temp_device_alloc_handles.clear();
+        current_plan_->temp_device_handles.clear();
         current_plan_->temp_device_alloc_bytes = 0;
     }
     current_plan_.reset();
@@ -8820,15 +8821,7 @@ OperationType UnifiedKernel::plan_op_type(int op_idx) const {
 void UnifiedKernel::begin_plan_update() {
     // Cancel any in-flight plan but DON'T free cached data
     if (current_plan_) {
-        for (auto & [ptr, sz] : current_plan_->temp_device_allocs) {
-            auto hit = current_plan_->temp_device_alloc_handles.find(ptr);
-            if (hit != current_plan_->temp_device_alloc_handles.end()) {
-                (void) ggml_sycl::unified_free(hit->second);
-            } else {
-                sycl::free(ptr, queue_);
-            }
-        }
-        current_plan_->temp_device_alloc_handles.clear();
+        current_plan_->temp_device_handles.clear();
         current_plan_.reset();
     }
 
@@ -8960,24 +8953,17 @@ void UnifiedKernel::finish_plan_update() {
 void UnifiedKernel::invalidate_plan_cache() {
     free_scratch_pool();
     deferred_copies_.clear();
-    final_output_ggml_dst_ = nullptr;
-    plan_cache_valid_      = false;
+    final_output_ggml_dst_        = nullptr;
+    final_output_ggml_dst_handle_ = {};
+    final_output_ggml_dst_offset_ = 0;
+    plan_cache_valid_             = false;
     cached_ops_.clear();
     cached_plan_template_ = {};
     // Clear original phase schedule data (rebuilt on next full build)
     orig_phase_entries_.clear();
     orig_phase_offset_.clear();
     orig_phase_tiles_.clear();
-    for (auto & [ptr, sz] : cached_temp_device_allocs_) {
-        auto hit = cached_temp_device_alloc_handles_.find(ptr);
-        if (hit != cached_temp_device_alloc_handles_.end()) {
-            (void) ggml_sycl::unified_free(hit->second);
-        } else if (ptr) {
-            sycl::free(ptr, queue_);
-        }
-    }
-    cached_temp_device_allocs_.clear();
-    cached_temp_device_alloc_handles_.clear();
+    cached_temp_device_handles_.clear();
     cached_temp_device_alloc_bytes_ = 0;
     // Also invalidate the update recipe when plan cache is invalidated
     update_recipe_.clear();
@@ -9017,12 +9003,13 @@ void * UnifiedKernel::get_rows_stable_ptr(int get_rows_index, size_t bytes) {
     }
     // Free old buffer and untrack
     if (slot.ptr) {
-        (void) unified_free(get_rows_alloc_);
-        get_rows_alloc_ = {};
+        slot.handle = {};
+        slot.ptr    = nullptr;
+        slot.size   = 0;
     }
-    get_rows_alloc_ = device_alloc_scratch(bytes, queue_, device_id_);
-    slot.ptr        = get_rows_alloc_.ptr;
-    slot.size       = slot.ptr ? bytes : 0;
+    slot.handle = device_alloc_scratch(bytes, queue_, device_id_);
+    slot.ptr    = slot.handle.resolve().ptr;
+    slot.size                   = slot.ptr ? bytes : 0;
     return slot.ptr;
 }
 
@@ -9047,6 +9034,7 @@ void UnifiedKernel::build_scratch_pool() {
     // Phase 1: compute total scratch needed
     size_t total_bytes = 0;
     scratch_outputs_.resize(n_ops, nullptr);
+    scratch_output_offsets_.resize(n_ops, 0);
 
     int n_with_bytes = 0;
     int n_skipped    = 0;
@@ -9055,7 +9043,8 @@ void UnifiedKernel::build_scratch_pool() {
         // Skip ops with dedicated buffer management or no output_bytes
         if (op.type == OperationType::SET_ROWS || op.type == OperationType::GET_ROWS ||
             op.type == OperationType::STRIDED_COPY || op.output_bytes <= 0) {
-            scratch_outputs_[i] = nullptr;
+            scratch_outputs_[i]        = nullptr;
+            scratch_output_offsets_[i] = 0;
             n_skipped++;
             continue;
         }
@@ -9075,11 +9064,12 @@ void UnifiedKernel::build_scratch_pool() {
     // Phase 2: grow-on-demand allocation
     if (total_bytes > scratch_pool_size_ || !scratch_pool_) {
         free_scratch_pool();
-        scratch_pool_alloc_ = device_alloc_scratch(total_bytes, queue_, device_id_);
-        scratch_pool_       = scratch_pool_alloc_.ptr;
-        scratch_pool_size_  = scratch_pool_ ? total_bytes : 0;
+        scratch_pool_handle_ = device_alloc_scratch(total_bytes, queue_, device_id_);
+        scratch_pool_        = scratch_pool_handle_.resolve().ptr;
+        scratch_pool_size_   = scratch_pool_ ? total_bytes : 0;
         // Re-initialize scratch_outputs_ after free_scratch_pool() cleared it
         scratch_outputs_.assign(n_ops, nullptr);
+        scratch_output_offsets_.assign(n_ops, 0);
     }
 
     if (!scratch_pool_) {
@@ -9153,12 +9143,15 @@ void UnifiedKernel::build_scratch_pool() {
             // Cache the ggml pointer on first sight so we always copy logits
             // back to the correct ggml buffer, not to scratch.
             if (op.output != scratch_ptr && final_output_ggml_dst_ == nullptr) {
-                final_output_ggml_dst_ = op.output;
+                final_output_ggml_dst_        = op.output;
+                final_output_ggml_dst_handle_ = op.output_handle;
+                final_output_ggml_dst_offset_ = op.output_offset;
             }
         }
 
-        op.output           = scratch_ptr;
-        scratch_outputs_[i] = scratch_ptr;
+        op.output                  = scratch_ptr;
+        scratch_outputs_[i]        = scratch_ptr;
+        scratch_output_offsets_[i] = offset - aligned;
     }
 
     GGML_SYCL_DEBUG("[SCRATCH-POOL] linkage stats: linked_input=%d linked_aux=%d\n", n_linked_input, n_linked_aux);
@@ -9175,7 +9168,17 @@ void UnifiedKernel::build_scratch_pool() {
             "dst=%p bytes=%zu scratch=%p\n",
             final_op_idx, (int) current_plan_->operations[final_op_idx].type, copy_back_dst, final_op_bytes,
             scratch_outputs_[final_op_idx]);
-        add_deferred_copy(final_op_idx, nullptr, copy_back_dst, final_op_bytes);
+#ifdef UNIFIED_KERNEL_TEST_STANDALONE
+        add_deferred_copy(final_op_idx, scratch_outputs_[final_op_idx], copy_back_dst, final_op_bytes);
+#else
+        mem_handle src_handle;
+        size_t     src_offset = 0;
+        GGML_ASSERT(scratch_output_source(final_op_idx, &src_handle, &src_offset));
+        mem_handle dst_handle = final_output_ggml_dst_handle_;
+        GGML_ASSERT(dst_handle.valid());
+        add_deferred_copy_handles(scratch_outputs_[final_op_idx], copy_back_dst, final_op_bytes, std::move(src_handle),
+                                  src_offset, std::move(dst_handle), final_output_ggml_dst_offset_);
+#endif
     }
 }
 
@@ -9186,10 +9189,53 @@ void * UnifiedKernel::scratch_output(int op_idx) const {
     return nullptr;
 }
 
+bool UnifiedKernel::scratch_output_source(int op_idx, mem_handle * handle, size_t * offset) const {
+    if (op_idx < 0 || op_idx >= static_cast<int>(scratch_outputs_.size()) ||
+        op_idx >= static_cast<int>(scratch_output_offsets_.size()) || scratch_outputs_[op_idx] == nullptr ||
+        !scratch_pool_handle_.valid()) {
+        return false;
+    }
+    if (handle) {
+        *handle = scratch_pool_handle_;
+    }
+    if (offset) {
+        *offset = scratch_output_offsets_[op_idx];
+    }
+    return true;
+}
+
+#ifdef UNIFIED_KERNEL_TEST_STANDALONE
 void UnifiedKernel::add_deferred_copy(int source_op_idx, void * src_ptr, void * dst, size_t bytes) {
     GGML_SYCL_DEBUG("[DEFERRED-CPY] Registered: op_idx=%d src_ptr=%p dst=%p bytes=%zu\n", source_op_idx, src_ptr, dst,
                     bytes);
-    deferred_copies_.push_back({ source_op_idx, src_ptr, dst, bytes });
+    deferred_copies_.push_back({ source_op_idx, src_ptr, dst, bytes, {}, 0, {}, 0 });
+}
+#endif
+
+void UnifiedKernel::add_deferred_copy_handles(void *     debug_src,
+                                              void *     debug_dst,
+                                              size_t     bytes,
+                                              mem_handle src_handle,
+                                              size_t     src_offset,
+                                              mem_handle dst_handle,
+                                              size_t     dst_offset) {
+    add_deferred_copy_handles(-1, debug_src, debug_dst, bytes, std::move(src_handle), src_offset, std::move(dst_handle),
+                              dst_offset);
+}
+
+void UnifiedKernel::add_deferred_copy_handles(int        source_op_idx,
+                                              void *     debug_src,
+                                              void *     debug_dst,
+                                              size_t     bytes,
+                                              mem_handle src_handle,
+                                              size_t     src_offset,
+                                              mem_handle dst_handle,
+                                              size_t     dst_offset) {
+    GGML_SYCL_DEBUG(
+        "[DEFERRED-CPY] Registered handles: op_idx=%d src=%p dst=%p bytes=%zu src_offset=%zu dst_offset=%zu\n",
+        source_op_idx, debug_src, debug_dst, bytes, src_offset, dst_offset);
+    deferred_copies_.push_back({ source_op_idx, debug_src, debug_dst, bytes, std::move(src_handle), src_offset,
+                                 std::move(dst_handle), dst_offset });
 }
 
 void UnifiedKernel::execute_deferred_copies() {
@@ -9210,7 +9256,21 @@ void UnifiedKernel::execute_deferred_copies() {
         GGML_SYCL_DEBUG("[DEFERRED-CPY] memcpy: src=%p dst=%p bytes=%zu (op_idx=%d)\n", src, dc.dst, dc.bytes,
                         dc.source_op_idx);
         if (src && dc.dst && dc.bytes > 0) {
+#ifdef UNIFIED_KERNEL_TEST_STANDALONE
             queue_.memcpy(dc.dst, src, dc.bytes);
+#else
+            mem_handle src_handle;
+            size_t     src_offset = dc.src_offset;
+            if (dc.source_op_idx >= 0 && scratch_output_source(dc.source_op_idx, &src_handle, &src_offset)) {
+                // The scratch pool is a single owning mem_handle; retain that owner
+                // instead of rebuilding ownership from the suballocation pointer.
+            } else {
+                src_handle = dc.src_handle;
+            }
+            mem_handle dst_handle = dc.dst_handle;
+            GGML_ASSERT(src_handle.valid() && dst_handle.valid());
+            (void) mem_copy_async(dst_handle, dc.dst_offset, src_handle, src_offset, dc.bytes, queue_);
+#endif
         }
         // No .wait() needed: queue_ is in-order, so each memcpy serializes
         // after the previous one (and after the micro-graph replay).
@@ -9221,14 +9281,16 @@ void UnifiedKernel::execute_deferred_copies() {
 }
 
 void UnifiedKernel::free_scratch_pool() {
-    final_output_ggml_dst_ = nullptr;
+    final_output_ggml_dst_        = nullptr;
+    final_output_ggml_dst_handle_ = {};
+    final_output_ggml_dst_offset_ = 0;
     if (scratch_pool_) {
-        (void) unified_free(scratch_pool_alloc_);
-        scratch_pool_alloc_ = {};
-        scratch_pool_       = nullptr;
-        scratch_pool_size_  = 0;
+        scratch_pool_handle_ = {};
+        scratch_pool_        = nullptr;
+        scratch_pool_size_   = 0;
     }
     scratch_outputs_.clear();
+    scratch_output_offsets_.clear();
 }
 
 // -----------------------------------------------------------------------------
@@ -9252,14 +9314,28 @@ void UnifiedKernel::benchmark_graph_overhead() {
     fprintf(stderr, "\n[GRAPH-OVERHEAD] === SYCL Graph Per-Node Overhead Benchmark ===\n");
     fprintf(stderr, "[GRAPH-OVERHEAD] Device: %s\n", queue_.get_device().get_info<sycl::info::device::name>().c_str());
 
-    // Allocate scratch for kernels (tracked via unified cache)
-    const int bench_device = ggml_sycl_get_device_id_from_queue(queue_);
-    int *     dummy = static_cast<int *>(ggml_sycl_malloc_device(4096 * sizeof(int), queue_, "graph_bench:dummy"));
-    if (!dummy) {
+    // Allocate scratch for kernels through unified-cache ownership.
+    const int     bench_device = ggml_sycl_get_device_id_from_queue(queue_);
+    alloc_request dummy_req{};
+    dummy_req.queue                               = &queue_;
+    dummy_req.device                              = bench_device;
+    dummy_req.size                                = 4096 * sizeof(int);
+    dummy_req.intent.role                         = alloc_role::GRAPH_TMP;
+    dummy_req.intent.category                     = runtime_category::GRAPH;
+    dummy_req.intent.constraints.must_device      = true;
+    dummy_req.intent.constraints.prefer_vram_zone = vram_zone_id::SCRATCH;
+    mem_handle dummy_handle = unified_allocate(dummy_req);
+    if (!dummy_handle.valid()) {
         fprintf(stderr, "[GRAPH-OVERHEAD] ERROR: failed to allocate device memory\n");
         return;
     }
-    queue_.memset(dummy, 0, 4096 * sizeof(int)).wait();
+    auto dummy_res = dummy_handle.resolve(bench_device);
+    int * dummy = (dummy_res && dummy_res.ptr && dummy_res.on_device) ? static_cast<int *>(dummy_res.ptr) : nullptr;
+    if (!dummy) {
+        fprintf(stderr, "[GRAPH-OVERHEAD] ERROR: failed to resolve device memory\n");
+        return;
+    }
+    mem_fill(dummy_handle, 0, 4096 * sizeof(int), queue_);
 
     // ---------- Test 1: Minimal single_task nodes ----------
     {
@@ -9502,7 +9578,8 @@ void UnifiedKernel::benchmark_graph_overhead() {
         }
     }
 
-    ggml_sycl::unified_cache_deallocate(dummy, bench_device);
+    queue_.wait();
+    dummy_handle = {};
 
     fprintf(stderr, "[GRAPH-OVERHEAD] === Benchmark Complete ===\n");
     fprintf(stderr, "[GRAPH-OVERHEAD] Decision: < 3us/node -> proceed, 3-10us -> grouped nodes, > 30us -> abandon\n\n");
@@ -10361,14 +10438,18 @@ void UnifiedKernel::record_micro_graph() {
     const int n_counters_needed = n_phases + total_phase_ops + 16;
     if (n_counters_needed > micro_tile_counters_n_) {
         if (micro_tile_counters_) {
-            (void) unified_free(micro_tile_counters_alloc_);
-            micro_tile_counters_alloc_ = {};
+            micro_tile_counters_handle_ = {};
         }
-        micro_tile_counters_alloc_ = device_alloc_scratch(n_counters_needed * sizeof(int), queue_, device_id_);
-        micro_tile_counters_       = static_cast<int *>(micro_tile_counters_alloc_.ptr);
-        micro_tile_counters_n_     = n_counters_needed;
+        micro_tile_counters_handle_ = device_alloc_scratch(n_counters_needed * sizeof(int), queue_, device_id_);
+        micro_tile_counters_        = static_cast<int *>(micro_tile_counters_handle_.resolve().ptr);
+        if (!micro_tile_counters_) {
+            micro_tile_counters_n_ = 0;
+            GGML_LOG_WARN("[MICRO-GRAPH] Failed to allocate tile counters; graph recording skipped\n");
+            return;
+        }
+        micro_tile_counters_n_ = n_counters_needed;
         // Zero counters once at allocation (generation starts at 0)
-        queue_.memset(micro_tile_counters_, 0, n_counters_needed * sizeof(int)).wait();
+        mem_fill(micro_tile_counters_handle_, 0, n_counters_needed * sizeof(int), queue_);
     }
 
     // ── Allocate generation counter (host-pinned, read by GPU via PCIe zero-copy) ──
@@ -10376,8 +10457,8 @@ void UnifiedKernel::record_micro_graph() {
     // zeroing all tile counters before each graph replay, we increment the
     // generation and kernels compute their tile range as [gen*n_tiles, (gen+1)*n_tiles).
     if (!micro_generation_) {
-        micro_gen_alloc_  = pinned_alloc(sizeof(int), queue_, device_id_);
-        micro_generation_ = static_cast<int *>(micro_gen_alloc_.ptr);
+        micro_gen_handle_             = pinned_alloc(sizeof(int), queue_, device_id_);
+        micro_generation_             = static_cast<int *>(micro_gen_handle_.resolve().ptr);
         if (micro_generation_) {
             *micro_generation_ = -1;  // First ++generation yields 0, matching zeroed counters
         }
@@ -10403,11 +10484,15 @@ void UnifiedKernel::record_micro_graph() {
         if (mmvq_q8_buf_size_ < q8_size) {
             for (int i = 0; i < 2; i++) {
                 if (mmvq_q8_bufs_[i]) {
-                    (void) unified_free(mmvq_q8_buf_allocs_[i]);
-                    mmvq_q8_buf_allocs_[i] = {};
+                    mmvq_q8_buf_handles_[i] = {};
                 }
-                mmvq_q8_buf_allocs_[i] = device_alloc_scratch(q8_size, queue_, device_id_);
-                mmvq_q8_bufs_[i]       = mmvq_q8_buf_allocs_[i].ptr;
+                mmvq_q8_buf_handles_[i] = device_alloc_scratch(q8_size, queue_, device_id_);
+                mmvq_q8_bufs_[i]        = mmvq_q8_buf_handles_[i].resolve().ptr;
+                if (!mmvq_q8_bufs_[i]) {
+                    mmvq_q8_buf_size_ = 0;
+                    GGML_LOG_WARN("[MICRO-GRAPH] Failed to allocate MMVQ Q8 buffer; graph recording skipped\n");
+                    return;
+                }
             }
             mmvq_q8_buf_size_ = q8_size;
         }
@@ -10415,18 +10500,25 @@ void UnifiedKernel::record_micro_graph() {
         const size_t gate_scratch_sz = intermediate_dim * sizeof(float);
         if (mmvq_gate_scratch_sz_ < gate_scratch_sz) {
             if (mmvq_gate_scratch_) {
-                (void) unified_free(mmvq_gate_scratch_alloc_);
-                mmvq_gate_scratch_alloc_ = {};
+                mmvq_gate_scratch_handle_ = {};
             }
             if (mmvq_up_scratch_) {
-                (void) unified_free(mmvq_up_scratch_alloc_);
-                mmvq_up_scratch_alloc_ = {};
+                mmvq_up_scratch_handle_ = {};
             }
-            mmvq_gate_scratch_alloc_ = device_alloc_scratch(gate_scratch_sz, queue_, device_id_);
-            mmvq_up_scratch_alloc_   = device_alloc_scratch(gate_scratch_sz, queue_, device_id_);
-            mmvq_gate_scratch_       = static_cast<float *>(mmvq_gate_scratch_alloc_.ptr);
-            mmvq_up_scratch_         = static_cast<float *>(mmvq_up_scratch_alloc_.ptr);
-            mmvq_gate_scratch_sz_    = gate_scratch_sz;
+            mmvq_gate_scratch_handle_ = device_alloc_scratch(gate_scratch_sz, queue_, device_id_);
+            mmvq_up_scratch_handle_   = device_alloc_scratch(gate_scratch_sz, queue_, device_id_);
+            mmvq_gate_scratch_        = static_cast<float *>(mmvq_gate_scratch_handle_.resolve().ptr);
+            mmvq_up_scratch_          = static_cast<float *>(mmvq_up_scratch_handle_.resolve().ptr);
+            if (!mmvq_gate_scratch_ || !mmvq_up_scratch_) {
+                mmvq_gate_scratch_sz_     = 0;
+                mmvq_gate_scratch_handle_ = {};
+                mmvq_up_scratch_handle_   = {};
+                mmvq_gate_scratch_        = nullptr;
+                mmvq_up_scratch_          = nullptr;
+                GGML_LOG_WARN("[MICRO-GRAPH] Failed to allocate MMVQ scratch buffers; graph recording skipped\n");
+                return;
+            }
+            mmvq_gate_scratch_sz_ = gate_scratch_sz;
         }
     }
 
@@ -10820,7 +10912,7 @@ void UnifiedKernel::execute_persistent() {
             // ops n_tiles is typically 1-64, but guard conservatively at 100K to
             // prevent overflow for any tile count up to ~21K (INT_MAX / 100K ≈ 21K).
             if (*micro_generation_ > 100000 && micro_tile_counters_ && micro_tile_counters_n_ > 0) {
-                queue_.memset(micro_tile_counters_, 0, micro_tile_counters_n_ * sizeof(int)).wait();
+                mem_fill(micro_tile_counters_handle_, 0, micro_tile_counters_n_ * sizeof(int), queue_);
                 *micro_generation_ = 0;
             }
         }
@@ -10848,12 +10940,9 @@ void UnifiedKernel::execute_persistent() {
     // are resolved fresh each token via begin_plan_update().
     if (!plan_cache_valid_) {
         copy_plan_shape(*current_plan_, cached_plan_template_);
-        cached_ops_                       = current_plan_->operations;
-        cached_temp_device_allocs_        = current_plan_->temp_device_allocs;
-        cached_temp_device_alloc_handles_ = current_plan_->temp_device_alloc_handles;
-        cached_temp_device_alloc_bytes_   = current_plan_->temp_device_alloc_bytes;
-        current_plan_->temp_device_allocs.clear();
-        current_plan_->temp_device_alloc_handles.clear();
+        cached_ops_                            = current_plan_->operations;
+        cached_temp_device_handles_            = std::move(current_plan_->temp_device_handles);
+        cached_temp_device_alloc_bytes_        = current_plan_->temp_device_alloc_bytes;
         current_plan_->temp_device_alloc_bytes = 0;
         // Budget stays reserved — ownership transfers to cached allocs
         plan_cache_valid_                      = true;
@@ -10861,16 +10950,7 @@ void UnifiedKernel::execute_persistent() {
     }
 
     // Free non-cached temp allocs
-    for (auto & [ptr, sz] : current_plan_->temp_device_allocs) {
-        auto hit = current_plan_->temp_device_alloc_handles.find(ptr);
-        if (hit != current_plan_->temp_device_alloc_handles.end()) {
-            (void) ggml_sycl::unified_free(hit->second);
-        } else {
-            sycl::free(ptr, queue_);
-        }
-    }
-    current_plan_->temp_device_allocs.clear();
-    current_plan_->temp_device_alloc_handles.clear();
+    current_plan_->temp_device_handles.clear();
     current_plan_->temp_device_alloc_bytes = 0;
 
     // Clear the plan after execution (cached copy remains)
@@ -11064,15 +11144,18 @@ void UnifiedKernel::execute_persistent_phased(phase_callback_t on_matmul_complet
         // Copy phase operations to host-pinned pool (kernel reads via PCIe zero-copy)
         if (phase.count > d_ops_pool_size_) {
             if (d_ops_pool_) {
-                (void) unified_free(ops_pool_alloc_);
-                ops_pool_alloc_ = {};
+                ops_pool_handle_ = {};
             }
             const size_t ops_pool_bytes = phase.count * sizeof(DeviceOperation);
-            ops_pool_alloc_             = pinned_alloc(ops_pool_bytes, queue_, device_id_);
-            d_ops_pool_                 = ops_pool_alloc_.ptr;
+            ops_pool_handle_            = pinned_alloc(ops_pool_bytes, queue_, device_id_);
+            d_ops_pool_                 = ops_pool_handle_.resolve().ptr;
             d_ops_pool_size_            = d_ops_pool_ ? phase.count : 0;
         }
         DeviceOperation * d_ops = static_cast<DeviceOperation *>(d_ops_pool_);
+        if (!d_ops) {
+            GGML_LOG_WARN("[PERSISTENT-TG-PHASED] Failed to allocate operation pool; phased execution skipped\n");
+            return;
+        }
         std::memcpy(d_ops, &host_ops[phase.start], phase.count * sizeof(DeviceOperation));
 
         // Compute tiles and work-groups for this phase
@@ -11094,7 +11177,7 @@ void UnifiedKernel::execute_persistent_phased(phase_callback_t on_matmul_complet
             persistent_num_workgroups(phase_tiles, phase_has_attention, phase_has_ffn, use_split_barrier);
 
         // Reset sync state before launch (no .wait() needed: in-order queue)
-        queue_.memset(sync_block_, 0, 3 * sizeof(int));
+        (void) mem_fill_async(sync_block_handle_, 0, 3 * sizeof(int), queue_);
 
         PersistentKernelArgs args  = {};
         args.operations            = d_ops;
@@ -11148,28 +11231,16 @@ void UnifiedKernel::execute_persistent_phased(phase_callback_t on_matmul_complet
     // are resolved fresh each token via begin_plan_update().
     if (!plan_cache_valid_) {
         copy_plan_shape(*current_plan_, cached_plan_template_);
-        cached_ops_                       = current_plan_->operations;
-        cached_temp_device_allocs_        = current_plan_->temp_device_allocs;
-        cached_temp_device_alloc_handles_ = current_plan_->temp_device_alloc_handles;
-        cached_temp_device_alloc_bytes_   = current_plan_->temp_device_alloc_bytes;
-        current_plan_->temp_device_allocs.clear();
-        current_plan_->temp_device_alloc_handles.clear();
+        cached_ops_                            = current_plan_->operations;
+        cached_temp_device_handles_            = std::move(current_plan_->temp_device_handles);
+        cached_temp_device_alloc_bytes_        = current_plan_->temp_device_alloc_bytes;
         current_plan_->temp_device_alloc_bytes = 0;
         plan_cache_valid_                      = true;
         GGML_SYCL_DEBUG("[PERSISTENT-TG-PHASED] Plan cached: %zu operations\n", cached_ops_.size());
     }
 
     // Free non-cached temp allocs
-    for (auto & [ptr, sz] : current_plan_->temp_device_allocs) {
-        auto hit = current_plan_->temp_device_alloc_handles.find(ptr);
-        if (hit != current_plan_->temp_device_alloc_handles.end()) {
-            (void) ggml_sycl::unified_free(hit->second);
-        } else {
-            sycl::free(ptr, queue_);
-        }
-    }
-    current_plan_->temp_device_allocs.clear();
-    current_plan_->temp_device_alloc_handles.clear();
+    current_plan_->temp_device_handles.clear();
     current_plan_->temp_device_alloc_bytes = 0;
 
     // Clear the plan after execution (cached copy remains)
@@ -11777,15 +11848,11 @@ void UnifiedKernel::launch_persistent_kernel(bool build_only) {
         const int final_n_ops    = phase_schedule_.total_ops;
         if (final_n_ops > phase_pool_n_ops_ || final_n_phases > phase_pool_n_phases_) {
             // Grow host-pinned arrays (rare: only if fusion increased beyond initial allocation)
-            (void) unified_free(phase_entries_alloc_);
-            phase_entries_alloc_ = {};
-            (void) unified_free(phase_offset_alloc_);
-            phase_offset_alloc_ = {};
-            (void) unified_free(phase_tiles_alloc_);
-            phase_tiles_alloc_ = {};
+            phase_entries_handle_ = {};
+            phase_offset_handle_  = {};
+            phase_tiles_handle_   = {};
             if (phase_schedule_.phase_type) {
-                (void) unified_free(phase_type_alloc_);
-                phase_type_alloc_ = {};
+                phase_type_handle_ = {};
             }
             const int    alloc_ops           = final_n_ops + 64;
             const int    alloc_phases        = final_n_phases + 16;
@@ -11793,16 +11860,30 @@ void UnifiedKernel::launch_persistent_kernel(bool build_only) {
             const size_t phase_offset_bytes  = (alloc_phases + 1) * sizeof(int);
             const size_t phase_tiles_bytes   = alloc_phases * sizeof(int);
             const size_t phase_type_bytes    = alloc_phases * sizeof(int);
-            phase_entries_alloc_             = pinned_alloc(phase_entries_bytes, queue_, device_id_);
-            phase_offset_alloc_              = pinned_alloc(phase_offset_bytes, queue_, device_id_);
-            phase_tiles_alloc_               = pinned_alloc(phase_tiles_bytes, queue_, device_id_);
-            phase_type_alloc_                = pinned_alloc(phase_type_bytes, queue_, device_id_);
-            phase_schedule_.entries          = static_cast<DevicePhaseEntry *>(phase_entries_alloc_.ptr);
-            phase_schedule_.phase_offset     = static_cast<int *>(phase_offset_alloc_.ptr);
-            phase_schedule_.phase_tiles      = static_cast<int *>(phase_tiles_alloc_.ptr);
-            phase_schedule_.phase_type       = static_cast<int *>(phase_type_alloc_.ptr);
-            phase_pool_n_ops_                = alloc_ops;
-            phase_pool_n_phases_             = alloc_phases;
+            phase_entries_handle_            = pinned_alloc(phase_entries_bytes, queue_, device_id_);
+            phase_offset_handle_             = pinned_alloc(phase_offset_bytes, queue_, device_id_);
+            phase_tiles_handle_              = pinned_alloc(phase_tiles_bytes, queue_, device_id_);
+            phase_type_handle_               = pinned_alloc(phase_type_bytes, queue_, device_id_);
+            phase_schedule_.entries          = static_cast<DevicePhaseEntry *>(phase_entries_handle_.resolve().ptr);
+            phase_schedule_.phase_offset     = static_cast<int *>(phase_offset_handle_.resolve().ptr);
+            phase_schedule_.phase_tiles      = static_cast<int *>(phase_tiles_handle_.resolve().ptr);
+            phase_schedule_.phase_type       = static_cast<int *>(phase_type_handle_.resolve().ptr);
+            if (!phase_schedule_.entries || !phase_schedule_.phase_offset || !phase_schedule_.phase_tiles ||
+                !phase_schedule_.phase_type) {
+                GGML_LOG_WARN(
+                    "[PERSISTENT-TG] Phase pinned_alloc failed after fusion; persistent kernel launch skipped\n");
+                phase_entries_handle_ = {};
+                phase_offset_handle_  = {};
+                phase_tiles_handle_   = {};
+                phase_type_handle_    = {};
+                phase_schedule_       = {};
+                phase_allocated_      = false;
+                phase_pool_n_ops_     = 0;
+                phase_pool_n_phases_  = 0;
+                return;
+            }
+            phase_pool_n_ops_    = alloc_ops;
+            phase_pool_n_phases_ = alloc_phases;
         }
 
         // Copy to host-pinned buffers (no queue memcpy needed, kernel reads via PCIe zero-copy)
@@ -11821,15 +11902,18 @@ void UnifiedKernel::launch_persistent_kernel(bool build_only) {
     const int n_ops_device = static_cast<int>(host_ops_.size());
     if (n_ops_device > d_ops_pool_size_) {
         if (d_ops_pool_) {
-            (void) unified_free(ops_pool_alloc_);
-            ops_pool_alloc_ = {};
+            ops_pool_handle_ = {};
         }
         const size_t ops_pool_bytes = n_ops_device * sizeof(DeviceOperation);
-        ops_pool_alloc_             = pinned_alloc(ops_pool_bytes, queue_, device_id_);
-        d_ops_pool_                 = ops_pool_alloc_.ptr;
+        ops_pool_handle_            = pinned_alloc(ops_pool_bytes, queue_, device_id_);
+        d_ops_pool_                 = ops_pool_handle_.resolve().ptr;
         d_ops_pool_size_            = d_ops_pool_ ? n_ops_device : 0;
     }
     DeviceOperation * d_ops = static_cast<DeviceOperation *>(d_ops_pool_);
+    if (!d_ops) {
+        GGML_LOG_WARN("[PERSISTENT-TG] Failed to allocate operation pool; persistent kernel launch skipped\n");
+        return;
+    }
     std::memcpy(d_ops, host_ops_.data(), host_ops_.size() * sizeof(DeviceOperation));
 
     // In build_only mode, we've finished preparing the ops table and phase
@@ -12042,15 +12126,17 @@ void UnifiedKernel::launch_persistent_kernel(bool build_only) {
                 runtime_tracked_bytes_ -= light_flags_size_ * sizeof(int);
             }
             if (light_flags_) {
-                (void) unified_free(light_flags_alloc_);
-                light_flags_alloc_ = {};
+                light_flags_handle_ = {};
             }
             const int alloc_size = n_final_phases + 16;
-            light_flags_alloc_   = device_alloc_persistent(alloc_size * sizeof(int), queue_, device_id_);
-            light_flags_         = static_cast<int *>(light_flags_alloc_.ptr);
-            light_flags_size_    = alloc_size;
+            light_flags_handle_ = device_alloc_persistent(alloc_size * sizeof(int), queue_, device_id_);
+            light_flags_        = static_cast<int *>(light_flags_handle_.resolve().ptr);
+            light_flags_size_   = light_flags_ ? alloc_size : 0;
+            if (!light_flags_) {
+                GGML_LOG_WARN("[PERSISTENT-TG] Light barrier flag allocation failed; light barriers disabled\n");
+            }
             // Track new allocation
-            if (device_id_ >= 0) {
+            if (light_flags_ && device_id_ >= 0) {
                 const size_t light_bytes = alloc_size * sizeof(int);
                 runtime_tracked_bytes_ += light_bytes;
             }
@@ -12093,16 +12179,16 @@ void UnifiedKernel::launch_persistent_kernel(bool build_only) {
             // leaving stale non-zero values from the previous token visible to the
             // kernel on its next invocation.
             // No .wait() needed: in-order queue ensures memset completes before kernel launch.
-            queue_.memset(sync_block_, 0, 3 * sizeof(int));
+            (void) mem_fill_async(sync_block_handle_, 0, 3 * sizeof(int), queue_);
         } else if (use_phase_mode) {
             // Phase mode: reset tile counter + barrier state before each launch.
             // No .wait() needed: in-order queue ensures memset completes before kernel launch.
-            queue_.memset(sync_block_, 0, 3 * sizeof(int));
+            (void) mem_fill_async(sync_block_handle_, 0, 3 * sizeof(int), queue_);
             // Reset light barrier flags (device memory) before each kernel launch.
             // Light flags are per-phase completion counters that accumulate during
             // the kernel and must start at 0.
             if (use_light_barriers && light_flags_ && phase_schedule_.n_phases > 0) {
-                queue_.memset(light_flags_, 0, phase_schedule_.n_phases * sizeof(int));
+                (void) mem_fill_async(light_flags_handle_, 0, phase_schedule_.n_phases * sizeof(int), queue_);
             }
         } else if (use_dag) {
             // Reset DAG scheduling counters for this token
@@ -12110,7 +12196,7 @@ void UnifiedKernel::launch_persistent_kernel(bool build_only) {
         } else {
             // Reset tile counter + barrier state (counter=0, sense=0) in single memset.
             // No .wait() needed: in-order queue ensures memset completes before kernel launch.
-            queue_.memset(sync_block_, 0, 3 * sizeof(int));
+            (void) mem_fill_async(sync_block_handle_, 0, 3 * sizeof(int), queue_);
         }
 
         PersistentKernelArgs args  = {};
@@ -12196,8 +12282,8 @@ void UnifiedKernel::launch_persistent_kernel(bool build_only) {
             }
 
             const size_t      profile_alloc_bytes = ops_by_type[idx].size() * sizeof(DeviceOperation);
-            alloc_handle      profile_alloc       = pinned_alloc(profile_alloc_bytes, queue_, device_id_);
-            DeviceOperation * d_ops_subset        = static_cast<DeviceOperation *>(profile_alloc.ptr);
+            mem_handle        profile_handle      = pinned_alloc(profile_alloc_bytes, queue_, device_id_);
+            DeviceOperation * d_ops_subset        = static_cast<DeviceOperation *>(profile_handle.resolve().ptr);
             if (!d_ops_subset) {
                 GGML_LOG_WARN("[PERSISTENT-TG] execute profile: alloc failed for op=%s\n",
                               persistent_op_type_name(static_cast<OperationType>(idx)));
@@ -12216,7 +12302,7 @@ void UnifiedKernel::launch_persistent_kernel(bool build_only) {
                 persistent_op_type_name(static_cast<OperationType>(idx)), ops_by_type[idx].size(), tiles_by_type[idx],
                 avg_ms, total_ms);
 
-            (void) unified_free(profile_alloc);
+            profile_handle = {};
         }
     }
 
@@ -12398,15 +12484,18 @@ void UnifiedKernel::launch_persistent_kernel_async() {
     const int n_ops_device = static_cast<int>(host_ops.size());
     if (n_ops_device > d_ops_pool_size_) {
         if (d_ops_pool_) {
-            (void) unified_free(ops_pool_alloc_);
-            ops_pool_alloc_ = {};
+            ops_pool_handle_ = {};
         }
         const size_t ops_pool_bytes = n_ops_device * sizeof(DeviceOperation);
-        ops_pool_alloc_             = pinned_alloc(ops_pool_bytes, queue_, device_id_);
-        d_ops_pool_                 = ops_pool_alloc_.ptr;
+        ops_pool_handle_            = pinned_alloc(ops_pool_bytes, queue_, device_id_);
+        d_ops_pool_                 = ops_pool_handle_.resolve().ptr;
         d_ops_pool_size_            = d_ops_pool_ ? n_ops_device : 0;
     }
     DeviceOperation * d_ops = static_cast<DeviceOperation *>(d_ops_pool_);
+    if (!d_ops) {
+        GGML_LOG_WARN("[PERSISTENT-TG-ASYNC] Failed to allocate operation pool; persistent async launch skipped\n");
+        return;
+    }
     std::memcpy(d_ops, host_ops.data(), host_ops.size() * sizeof(DeviceOperation));
 
     // Kernel configuration: use barrier mode (not DAG) for split compatibility
@@ -12419,7 +12508,7 @@ void UnifiedKernel::launch_persistent_kernel_async() {
     const bool use_attn_subgroup_dot = persistent_attention_subgroup_dot_enabled();
 
     // Reset sync state
-    queue_.memset(sync_block_, 0, 3 * sizeof(int)).wait();
+    mem_fill(sync_block_handle_, 0, 3 * sizeof(int), queue_);
 
     PersistentKernelArgs args  = {};
     args.operations            = d_ops;
@@ -12472,28 +12561,16 @@ void UnifiedKernel::finalize_persistent() {
     // are resolved fresh each token via begin_plan_update().
     if (!plan_cache_valid_) {
         copy_plan_shape(*current_plan_, cached_plan_template_);
-        cached_ops_                       = current_plan_->operations;
-        cached_temp_device_allocs_        = current_plan_->temp_device_allocs;
-        cached_temp_device_alloc_handles_ = current_plan_->temp_device_alloc_handles;
-        cached_temp_device_alloc_bytes_   = current_plan_->temp_device_alloc_bytes;
-        current_plan_->temp_device_allocs.clear();
-        current_plan_->temp_device_alloc_handles.clear();
+        cached_ops_                            = current_plan_->operations;
+        cached_temp_device_handles_            = std::move(current_plan_->temp_device_handles);
+        cached_temp_device_alloc_bytes_        = current_plan_->temp_device_alloc_bytes;
         current_plan_->temp_device_alloc_bytes = 0;
         plan_cache_valid_                      = true;
         GGML_SYCL_DEBUG("[PERSISTENT-TG] Plan cached (async finalize): %zu operations\n", cached_ops_.size());
     }
 
     // Free non-cached temp allocs
-    for (auto & [ptr, sz] : current_plan_->temp_device_allocs) {
-        auto hit = current_plan_->temp_device_alloc_handles.find(ptr);
-        if (hit != current_plan_->temp_device_alloc_handles.end()) {
-            (void) ggml_sycl::unified_free(hit->second);
-        } else {
-            sycl::free(ptr, queue_);
-        }
-    }
-    current_plan_->temp_device_allocs.clear();
-    current_plan_->temp_device_alloc_handles.clear();
+    current_plan_->temp_device_handles.clear();
     current_plan_->temp_device_alloc_bytes = 0;
 
     // Clear the plan after execution (cached copy remains)

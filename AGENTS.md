@@ -234,26 +234,28 @@ are display IDs, not valid selector values.
 This workstation has 3 GPUs: Arc B580 device 0, Arc Pro B50 device 1, and iGPU
 device 2.
 
-As of 2026-05-10 after the ECC-off reboot, the B50 initializes with
-`ONEAPI_DEVICE_SELECTOR=level_zero:1`, reports `Memory ECC: Current disabled /
-Pending disabled`, and can run the Mistral 7B Q4_0 completion gate. ECC-off is
-a workstation performance setting with a reliability tradeoff: it raises B50
-reported VRAM from ~14.3 GiB to ~16.3 GiB and improves Mistral 7B Q4_0 from
-~1053 PP512 / ~40 TG128 to ~1197 PP512 / ~44 TG128.
-
-GPT-OSS 20B now fits and runs on the B50-only path. The all-GPU
-`level_zero:0,1` / `level_zero:gpu` path still hits
-`UR_RESULT_ERROR_DEVICE_LOST` in `MUL_MAT`, so use a single-device selector for
-GPT-OSS quick gates.
+As of 2026-06-07 after a fresh reboot and removal of repo-side selector guards,
+single-GPU B50 validation can run with `ONEAPI_DEVICE_SELECTOR=level_zero:1`.
+Do not add backend or harness code that parses, rewrites, or refuses
+`ONEAPI_DEVICE_SELECTOR`; device selection belongs to oneAPI/SYCL. Previous-boot
+evidence and P2P topology warnings must not alter fresh-boot SYCL selection
+behavior. `sycl-ls` is still not a preferred B50 health probe because it has
+previously wedged this host in `ttm_resource_manager_usage -> drm_ioctl ->
+xe_drm_ioctl` after a reset/oops sequence.
 
 ```bash
-sycl-ls
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench ...
-ONEAPI_DEVICE_SELECTOR=level_zero:gpu ./build/bin/llama-bench ...   # all Level Zero GPUs
+ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench ...
+ONEAPI_DEVICE_SELECTOR=level_zero:0,1 ./build/bin/llama-bench ... # host-bounce paths required
 ```
 
 `GGML_SYCL_VISIBLE_DEVICES=0` is not sufficient for the unified cache. Use
 `ONEAPI_DEVICE_SELECTOR`.
+
+Current-boot B580/B50 P2P topology warnings are diagnostic only; direct
+peer-copy paths must stay disabled unless probed safe, but host-bounce
+validation may continue. Frigate QSV/OpenVINO jobs on the iGPU render node are
+not B580/B50 consumers.
 
 ### Patched compute-runtime
 
@@ -280,9 +282,11 @@ sudo ln -sfn libze_intel_gpu.so.1.14.37435.pre-single-device-default-ctx /usr/li
 sudo ldconfig
 ```
 
-Validation on 2026-05-30: `sycl-ls` reports the B580 and B50 Level Zero devices
-on driver `1.15.38646`, and a full GPT-OSS multi-GPU llama.cpp bench runs
-through the isolated/host-bounce path. Raw SYCL and Level Zero direct
+Validation on 2026-05-30: `sycl-ls` historically reported the B580 and B50
+Level Zero devices on driver `1.15.38646`, and a full GPT-OSS multi-GPU
+llama.cpp bench ran through the isolated/host-bounce path. Do not use
+`sycl-ls` for B50 probing now; see the 2026-06-07 B50 safety note above. Raw
+SYCL and Level Zero direct
 device-to-device USM copy between B580 and B50 still fails
 (`UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` / `ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY`),
 and importing a B580 device allocation on the B50 returns
@@ -311,7 +315,7 @@ Mistral 7B Q4_0 on Arc B580:
 | PP512 legacy | ~159 | `GGML_SYCL_UNIFIED_FORCE_LEGACY=1` |
 | TG128 3-device | ~27 | `GGML_SYCL_SPLIT_RATIO="60,32,8"` |
 
-Mistral 7B Q4_0 on Arc Pro B50 with ECC disabled:
+Historical Mistral 7B Q4_0 on Arc Pro B50 with ECC disabled:
 
 | Metric | Expected tok/s | Notes |
 |--------|----------------|-------|
@@ -326,9 +330,9 @@ GPT-OSS 20B MXFP4:
 
 | Device selector | PP512 tok/s | TG128 tok/s | Notes |
 |-----------------|------------:|------------:|-------|
-| `level_zero:1` B50 ECC-off | ~169 | ~17 | Fits in 16.3 GiB reported VRAM |
+| `level_zero:1` B50 ECC-off | current ~926; target >1100 | current ~48; target ~50+ | Fresh-boot B50 smoke passes; PP target still unmet |
 | `level_zero:0` B580 | ~66 | ~17 | Smaller VRAM budget causes more pressure |
-| `level_zero:0,1` | fails | fails | `UR_RESULT_ERROR_DEVICE_LOST` multi-device L0 regression |
+| `level_zero:0,1` | TBD | TBD | Use isolated/host-bounce transfer paths; direct P2P is not available |
 
 ## SYCL Environment Variables
 
@@ -346,7 +350,7 @@ Experimental:
 
 | Variable | Default behavior |
 |----------|------------------|
-| `GGML_SYCL_PP_PIPELINE=1` | Enable double-buffered FP16 dequant prefetch; default is OFF |
+| `GGML_SYCL_PP_PIPELINE=1` | Enable double-buffered FP16 dequant prefetch; default is OFF until GPT-OSS chat correctness is fixed |
 | `GGML_SYCL_PERSISTENT_TG=1` | Enable persistent TG kernel; default is OFF |
 | `GGML_SYCL_PERSISTENT_TG_PHASE=0` | Disable phase scheduling |
 | `GGML_SYCL_PERSISTENT_TG_DAG=0` | Disable DAG scheduling |
@@ -374,8 +378,7 @@ Memory and pressure:
 | `GGML_SYCL_KV_HOT_PCT=N` | Hot KV window percent |
 | `GGML_SYCL_FORCE_STREAMING=1` | Enable weight streaming |
 | `GGML_SYCL_HOST_COMPUTE=1` | Use host-pinned compute buffers |
-| `GGML_SYCL_UNIFIED_CACHE=0` | Disable unified cache |
-| `GGML_SYCL_UNIFIED_CACHE_MODE=<mode>` | auto, device, host, mmap |
+| `GGML_SYCL_UNIFIED_CACHE_MODE=<mode>` | Cache topology: auto, global, per_device |
 | `GGML_SYCL_NO_PINNED=1` | Disable pinned host memory |
 | `GGML_SYCL_WEIGHTS_EVICTABLE=1` | Allow weight eviction |
 | `GGML_SYCL_MEM_BUDGET=<MB>` | Set VRAM budget in MB |
@@ -389,7 +392,6 @@ Debugging:
 | `GGML_SYCL_NAN_CHECK=1` | Enable NaN detection |
 | `GGML_SYCL_VALIDATE=1` | A/B validation between kernel paths |
 | `GGML_SYCL_GRAPH_RERECORD=1` | Diagnostic graph re-record path |
-| `GGML_SYCL_XMX_TILED_PP_PROOF=1` | Keep XMX-tiled GPT-OSS MoE gate/up layouts for PP proof runs; diagnostic only |
 | `GGML_SYCL_OP_TIMEOUT_MS=<N>` | Abort if no inference progress for N ms |
 | `GGML_SYCL_SAFE_MODE=1` | Drain queue after every op; slow diagnostic mode |
 | `GGML_SYCL_LAYOUT_OVERRIDE=<mode>` | Force `aos`, `soa`, `coalesced`, or `xmx_tiled` |

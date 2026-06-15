@@ -5,7 +5,7 @@
  * is used for multiple operations (MMQ then DMMV, like real inference).
  *
  * Build: cmake --build build --target test-q8-0-reuse-weights
- * Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-q8-0-reuse-weights
+ * Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-q8-0-reuse-weights
  */
 
 #include <cstdio>

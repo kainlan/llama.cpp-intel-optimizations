@@ -328,26 +328,24 @@ The large-tile kernel MUST use the existing unified cache, not create new cachin
 ```cpp
 // In ggml-sycl.cpp, init_tensor() or compute_mul_mat():
 
-// 1. Weight lookup uses existing cache path
+// 1. Weight lookup uses existing mandatory cache path
 void * weight_ptr = nullptr;
-if (unified_cache_enabled()) {
-    // Fast path: try shared_lock lookup first
-    weight_ptr = cache.try_get_cached_fast(cache_id, data_layout);
+// Fast path: try shared_lock lookup first
+weight_ptr = cache.try_get_cached_fast(cache_id, data_layout);
 
-    if (!weight_ptr) {
-        // Slow path: ensure cached with layout conversion
-        auto result = cache.ensure_cached_layout({
-            .key = cache_id,
-            .src_ptr = tensor->data,
-            .src_size = ggml_nbytes(tensor),
-            .dst_size = dst_size,
-            .type = cache_entry_type::DENSE_WEIGHT,
-            .layer_id = layer_id,
-            .layout = data_layout,  // AOS or SOA based on batch size
-            // ... other fields
-        }, deps);
-        weight_ptr = result.device_ptr;
-    }
+if (!weight_ptr) {
+    // Slow path: ensure cached with layout conversion
+    auto result = cache.ensure_cached_layout({
+        .key = cache_id,
+        .src_ptr = tensor->data,
+        .src_size = ggml_nbytes(tensor),
+        .dst_size = dst_size,
+        .type = cache_entry_type::DENSE_WEIGHT,
+        .layer_id = layer_id,
+        .layout = data_layout,  // AOS or SOA based on batch size
+        // ... other fields
+    }, deps);
+    weight_ptr = result.device_ptr;
 }
 
 // 2. Pass to kernel via existing KernelArgs

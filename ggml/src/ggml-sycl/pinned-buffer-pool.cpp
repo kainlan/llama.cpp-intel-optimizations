@@ -25,8 +25,7 @@ PinnedBufferPool::~PinnedBufferPool() {
     }
 }
 
-void PinnedBufferPool::init(sycl::queue & q, int device_id, size_t max_experts,
-                             size_t act_dim, size_t out_dim) {
+void PinnedBufferPool::init(sycl::queue & q, int device_id, size_t max_experts, size_t act_dim, size_t out_dim) {
     if (is_initialized()) {
         return;
     }
@@ -49,41 +48,52 @@ void PinnedBufferPool::init(sycl::queue & q, int device_id, size_t max_experts,
     req_act.intent.cohort_id                    = "moe_act_pool";
     req_act.intent.constraints.must_host_pinned = true;
 
-    if (!unified_alloc(req_act, &act_alloc_)) {
+    act_handle_ = unified_allocate(req_act);
+    if (!act_handle_.valid()) {
         GGML_LOG_WARN("[MOE-POOL] Failed to allocate activation pool (%zu bytes)\n", act_bytes);
         return;
     }
-    act_pool_ = static_cast<float *>(act_alloc_.ptr);
+    auto act_resolved = act_handle_.resolve(device_id);
+    if (!act_resolved.ptr) {
+        GGML_LOG_WARN("[MOE-POOL] Activation pool allocation did not resolve on device %d (%zu bytes)\n", device_id,
+                      act_bytes);
+        act_handle_ = {};
+        return;
+    }
+    act_pool_ = static_cast<float *>(act_resolved.ptr);
 
     // Allocate output pool
     alloc_request req_out    = req_act;
     req_out.size             = out_bytes;
     req_out.intent.cohort_id = "moe_out_pool";
 
-    if (!unified_alloc(req_out, &out_alloc_)) {
+    out_handle_ = unified_allocate(req_out);
+    if (!out_handle_.valid()) {
         GGML_LOG_WARN("[MOE-POOL] Failed to allocate output pool (%zu bytes)\n", out_bytes);
-        unified_free(act_alloc_);
-        act_alloc_ = {};
-        act_pool_  = nullptr;
+        act_handle_ = {};
+        act_pool_   = nullptr;
         return;
     }
-    out_pool_ = static_cast<float *>(out_alloc_.ptr);
+    auto out_resolved = out_handle_.resolve(device_id);
+    if (!out_resolved.ptr) {
+        GGML_LOG_WARN("[MOE-POOL] Output pool allocation did not resolve on device %d (%zu bytes)\n", device_id,
+                      out_bytes);
+        out_handle_ = {};
+        act_handle_ = {};
+        act_pool_   = nullptr;
+        return;
+    }
+    out_pool_ = static_cast<float *>(out_resolved.ptr);
 
-    GGML_LOG_INFO("[MOE-POOL] Pinned buffer pool: act=%zu KB, out=%zu KB, max_experts=%zu\n",
-                  act_bytes / 1024, out_bytes / 1024, max_experts);
+    GGML_LOG_INFO("[MOE-POOL] Pinned buffer pool: act=%zu KB, out=%zu KB, max_experts=%zu\n", act_bytes / 1024,
+                  out_bytes / 1024, max_experts);
 }
 
 void PinnedBufferPool::shutdown() {
-    if (act_alloc_.ptr) {
-        unified_free(act_alloc_);
-        act_alloc_ = {};
-        act_pool_  = nullptr;
-    }
-    if (out_alloc_.ptr) {
-        unified_free(out_alloc_);
-        out_alloc_ = {};
-        out_pool_  = nullptr;
-    }
+    act_handle_ = {};
+    out_handle_ = {};
+    act_pool_   = nullptr;
+    out_pool_   = nullptr;
 }
 
 PinnedBufferPool::BufferPair PinnedBufferPool::acquire(size_t n_experts) {
@@ -96,6 +106,14 @@ void PinnedBufferPool::release(BufferPair) {
     // No-op: CPU vec_dot kernels write every output element that the scatter
     // loop reads back (n_cpu * N floats), so zeroing is unnecessary.
     // Stale data in unused pool slots is never accessed.
+}
+
+mem_handle PinnedBufferPool::act_handle() const {
+    return act_handle_;
+}
+
+mem_handle PinnedBufferPool::out_handle() const {
+    return out_handle_;
 }
 
 }  // namespace ggml_sycl

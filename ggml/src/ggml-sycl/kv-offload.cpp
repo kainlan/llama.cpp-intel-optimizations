@@ -5,40 +5,57 @@
 //
 
 #include "kv-offload.hpp"
+
 #include "common.hpp"
-#include "ggml-sycl.h"
 #include "ggml-impl.h"
+#include "ggml-sycl.h"
 #include "ggml.h"
+#include "mem-ops.hpp"
 
 #include <algorithm>
 #include <cstring>
 
 namespace ggml_sycl {
 
-kv_offload_manager::kv_offload_manager(sycl::queue& queue, const kv_offload_config& config)
-    : queue_(queue), config_(config) {
+static mem_handle kv_tensor_handle_for_device(const ggml_tensor * tensor, int device, void * ptr) {
+    if (!ptr || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return mem_handle{};
+    }
 
+    if (tensor && tensor->extra) {
+        const auto * extra  = static_cast<const ggml_tensor_extra_gpu *>(tensor->extra);
+        const auto & handle = extra->data_handle[device];
+        if (handle.valid()) {
+            auto resolved = handle.resolve(device);
+            if (resolved && resolved.ptr == ptr) {
+                return handle;
+            }
+        }
+    }
+
+    return mem_handle::from_chunk_ptr(ptr, device, GGML_LAYOUT_AOS, true);
+}
+
+kv_offload_manager::kv_offload_manager(sycl::queue & queue, const kv_offload_config & config) :
+    queue_(queue),
+    config_(config) {
     GGML_LOG_INFO("[KV-OFFLOAD] Initialized: threshold=%d tokens, budget=%.1f MB, block_size=%d tokens\n",
-                  config_.offload_threshold,
-                  config_.gpu_kv_budget / (1024.0f * 1024.0f),
-                  config_.block_size);
+                  config_.offload_threshold, config_.gpu_kv_budget / (1024.0f * 1024.0f), config_.block_size);
 }
 
 kv_offload_manager::~kv_offload_manager() {
     // Wait for all pending transfers
-    for (auto& [key, block] : blocks_) {
+    for (auto & [key, block] : blocks_) {
         try {
             block.transfer_event.wait();
-        } catch (...) {}
-
-        // Free CPU memory
-        if (block.cpu_ptr) {
-            try { sycl::free(block.cpu_ptr, queue_); } catch (...) {}
+        } catch (...) {
         }
+
+        free_cpu_block(block);
     }
 }
 
-void kv_offload_manager::register_layer(int layer_id, ggml_tensor* k_cache, ggml_tensor* v_cache) {
+void kv_offload_manager::register_layer(int layer_id, ggml_tensor * k_cache, ggml_tensor * v_cache) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (!k_cache || !v_cache) {
@@ -68,15 +85,22 @@ void kv_offload_manager::register_layer(int layer_id, ggml_tensor* k_cache, ggml
 
     info.k_size_per_token = k_total / max_tokens;
     info.v_size_per_token = v_total / max_tokens;
-    const int device = ggml_sycl_get_device_id_from_queue(queue_);
-    info.k_base_gpu = ggml_sycl_resolve_tensor_ptr(k_cache, device);
-    info.v_base_gpu = ggml_sycl_resolve_tensor_ptr(v_cache, device);
-    info.max_tokens = max_tokens;
+    const int device      = ggml_sycl_get_device_id_from_queue(queue_);
+    info.device           = device;
+    info.k_base_gpu       = ggml_sycl_resolve_tensor_ptr(k_cache, device);
+    info.v_base_gpu       = ggml_sycl_resolve_tensor_ptr(v_cache, device);
+    info.k_handle         = kv_tensor_handle_for_device(k_cache, device, info.k_base_gpu);
+    info.v_handle         = kv_tensor_handle_for_device(v_cache, device, info.v_base_gpu);
+    info.max_tokens       = max_tokens;
+
+    if (!info.k_handle.valid() || !info.v_handle.valid()) {
+        GGML_LOG_WARN("[KV-OFFLOAD] Layer %d registered without valid KV handles on device %d\n", layer_id, device);
+    }
 
     layers_[layer_id] = info;
 
-    GGML_SYCL_DEBUG("[KV-OFFLOAD] Registered layer %d: K=%zu B/tok, V=%zu B/tok, max=%d tokens\n",
-                    layer_id, info.k_size_per_token, info.v_size_per_token, max_tokens);
+    GGML_SYCL_DEBUG("[KV-OFFLOAD] Registered layer %d: K=%zu B/tok, V=%zu B/tok, max=%d tokens\n", layer_id,
+                    info.k_size_per_token, info.v_size_per_token, max_tokens);
 }
 
 bool kv_offload_manager::is_layer_registered(int layer_id) const {
@@ -92,7 +116,7 @@ size_t kv_offload_manager::registered_layer_count() const {
 sycl::event kv_offload_manager::ensure_on_gpu(int layer_id, int32_t pos) {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    kv_block* block = get_block(layer_id, pos);
+    kv_block * block = get_block(layer_id, pos);
     if (!block) {
         // Block doesn't exist yet - KV hasn't been computed for this position
         return sycl::event();
@@ -116,14 +140,16 @@ sycl::event kv_offload_manager::ensure_range_on_gpu(int layer_id, int32_t start_
     std::vector<sycl::event> events;
 
     int32_t start_block = pos_to_block_idx(start_pos);
-    int32_t end_block = pos_to_block_idx(end_pos - 1);
+    int32_t end_block   = pos_to_block_idx(end_pos - 1);
 
     for (int32_t block_idx = start_block; block_idx <= end_block; block_idx++) {
-        kv_block_key key{layer_id, block_idx};
-        auto it = blocks_.find(key);
-        if (it == blocks_.end()) continue;  // Block doesn't exist
+        kv_block_key key{ layer_id, block_idx };
+        auto         it = blocks_.find(key);
+        if (it == blocks_.end()) {
+            continue;  // Block doesn't exist
+        }
 
-        kv_block& block = it->second;
+        kv_block & block = it->second;
         if (!block.on_gpu) {
             events.push_back(transfer_to_gpu(&block));
             prefetch_misses_++;
@@ -139,7 +165,7 @@ sycl::event kv_offload_manager::ensure_range_on_gpu(int layer_id, int32_t start_
 
     // Return a barrier event that waits for all transfers
     // Note: SYCL doesn't have a direct barrier API, so we wait inline
-    for (auto& evt : events) {
+    for (auto & evt : events) {
         evt.wait();
     }
     return sycl::event();
@@ -149,19 +175,21 @@ void kv_offload_manager::prefetch_blocks(int layer_id, int32_t start_pos, int32_
     std::lock_guard<std::mutex> lock(mutex_);
 
     // Expand range by prefetch ratio
-    int32_t range = end_pos - start_pos;
+    int32_t range          = end_pos - start_pos;
     int32_t prefetch_extra = static_cast<int32_t>(range * (config_.prefetch_ratio - 1.0f));
-    end_pos = std::min(end_pos + prefetch_extra, context_length_);
+    end_pos                = std::min(end_pos + prefetch_extra, context_length_);
 
     int32_t start_block = pos_to_block_idx(start_pos);
-    int32_t end_block = pos_to_block_idx(end_pos - 1);
+    int32_t end_block   = pos_to_block_idx(end_pos - 1);
 
     for (int32_t block_idx = start_block; block_idx <= end_block; block_idx++) {
-        kv_block_key key{layer_id, block_idx};
-        auto it = blocks_.find(key);
-        if (it == blocks_.end()) continue;
+        kv_block_key key{ layer_id, block_idx };
+        auto         it = blocks_.find(key);
+        if (it == blocks_.end()) {
+            continue;
+        }
 
-        kv_block& block = it->second;
+        kv_block & block = it->second;
         if (!block.on_gpu && block.cpu_ptr) {
             // Schedule async transfer - don't wait
             transfer_to_gpu(&block);
@@ -171,7 +199,7 @@ void kv_offload_manager::prefetch_blocks(int layer_id, int32_t start_pos, int32_
 }
 
 void kv_offload_manager::prefetch_all_layers(int32_t start_pos, int32_t end_pos) {
-    for (const auto& [layer_id, info] : layers_) {
+    for (const auto & [layer_id, info] : layers_) {
         prefetch_blocks(layer_id, start_pos, end_pos);
     }
 }
@@ -181,28 +209,29 @@ size_t kv_offload_manager::offload_oldest(size_t bytes_needed) {
 
     // Collect all GPU-resident blocks with their access times
     std::vector<std::pair<int64_t, kv_block_key>> gpu_blocks;
-    for (auto& [key, block] : blocks_) {
+    for (auto & [key, block] : blocks_) {
         if (block.on_gpu) {
-            gpu_blocks.push_back({block.last_access, key});
+            gpu_blocks.push_back({ block.last_access, key });
         }
     }
 
     // Sort by access time (oldest first) - only compare access time, not the key
-    std::sort(gpu_blocks.begin(), gpu_blocks.end(),
-              [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::sort(gpu_blocks.begin(), gpu_blocks.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
 
     size_t freed = 0;
-    for (const auto& [access_time, key] : gpu_blocks) {
-        if (freed >= bytes_needed) break;
+    for (const auto & [access_time, key] : gpu_blocks) {
+        if (freed >= bytes_needed) {
+            break;
+        }
 
-        kv_block& block = blocks_[key];
-        sycl::event evt = transfer_to_cpu(&block);
+        kv_block &  block = blocks_[key];
+        sycl::event evt   = transfer_to_cpu(&block);
         evt.wait();  // Must wait to ensure memory is freed
 
         freed += block.size;
 
-        GGML_SYCL_DEBUG("[KV-OFFLOAD] Offloaded block L%d:B%d (%.2f MB) to CPU\n",
-                        key.layer_id, key.block_idx, block.size / (1024.0f * 1024.0f));
+        GGML_SYCL_DEBUG("[KV-OFFLOAD] Offloaded block L%d:B%d (%.2f MB) to CPU\n", key.layer_id, key.block_idx,
+                        block.size / (1024.0f * 1024.0f));
     }
 
     return freed;
@@ -213,7 +242,7 @@ void kv_offload_manager::offload_beyond(int32_t pos) {
 
     int32_t beyond_block = pos_to_block_idx(pos);
 
-    for (auto& [key, block] : blocks_) {
+    for (auto & [key, block] : blocks_) {
         if (key.block_idx > beyond_block && block.on_gpu) {
             sycl::event evt = transfer_to_cpu(&block);
             evt.wait();
@@ -257,18 +286,22 @@ size_t kv_offload_manager::cpu_memory_used() const {
 
 size_t kv_offload_manager::blocks_on_gpu() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    size_t count = 0;
-    for (const auto& [key, block] : blocks_) {
-        if (block.on_gpu) count++;
+    size_t                      count = 0;
+    for (const auto & [key, block] : blocks_) {
+        if (block.on_gpu) {
+            count++;
+        }
     }
     return count;
 }
 
 size_t kv_offload_manager::blocks_on_cpu() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    size_t count = 0;
-    for (const auto& [key, block] : blocks_) {
-        if (!block.on_gpu && block.cpu_ptr) count++;
+    size_t                      count = 0;
+    for (const auto & [key, block] : blocks_) {
+        if (!block.on_gpu && block.cpu_ptr) {
+            count++;
+        }
     }
     return count;
 }
@@ -277,30 +310,33 @@ void kv_offload_manager::print_stats() const {
     std::lock_guard<std::mutex> lock(mutex_);
 
     size_t total = prefetch_hits_ + prefetch_misses_;
-    float rate = total > 0 ? 100.0f * prefetch_hits_ / total : 0.0f;
+    float  rate  = total > 0 ? 100.0f * prefetch_hits_ / total : 0.0f;
 
     size_t gpu_blocks = 0, cpu_blocks = 0;
-    for (const auto& [key, block] : blocks_) {
-        if (block.on_gpu) gpu_blocks++;
-        else if (block.cpu_ptr) cpu_blocks++;
+    for (const auto & [key, block] : blocks_) {
+        if (block.on_gpu) {
+            gpu_blocks++;
+        } else if (block.cpu_ptr) {
+            cpu_blocks++;
+        }
     }
 
-    GGML_LOG_INFO("[KV-OFFLOAD] Stats: %zu prefetch hits, %zu misses (%.1f%% hit rate)\n",
-                  prefetch_hits_, prefetch_misses_, rate);
+    GGML_LOG_INFO("[KV-OFFLOAD] Stats: %zu prefetch hits, %zu misses (%.1f%% hit rate)\n", prefetch_hits_,
+                  prefetch_misses_, rate);
     GGML_LOG_INFO("[KV-OFFLOAD] Memory: %.1f MB GPU (%zu blocks), %.1f MB CPU (%zu blocks)\n",
-                  gpu_memory_used_ / (1024.0f * 1024.0f), gpu_blocks,
-                  cpu_memory_used_ / (1024.0f * 1024.0f), cpu_blocks);
+                  gpu_memory_used_ / (1024.0f * 1024.0f), gpu_blocks, cpu_memory_used_ / (1024.0f * 1024.0f),
+                  cpu_blocks);
 }
 
 void kv_offload_manager::reset_stats() {
     std::lock_guard<std::mutex> lock(mutex_);
-    prefetch_hits_ = 0;
+    prefetch_hits_   = 0;
     prefetch_misses_ = 0;
 }
 
-kv_block* kv_offload_manager::get_block(int layer_id, int32_t pos) {
-    int32_t block_idx = pos_to_block_idx(pos);
-    kv_block_key key{layer_id, block_idx};
+kv_block * kv_offload_manager::get_block(int layer_id, int32_t pos) {
+    int32_t      block_idx = pos_to_block_idx(pos);
+    kv_block_key key{ layer_id, block_idx };
 
     auto it = blocks_.find(key);
     if (it != blocks_.end()) {
@@ -313,22 +349,22 @@ kv_block* kv_offload_manager::get_block(int layer_id, int32_t pos) {
         return nullptr;  // Layer not registered
     }
 
-    const kv_layer_info& layer = layer_it->second;
+    const kv_layer_info & layer = layer_it->second;
 
     // Calculate block boundaries
     int32_t start_pos = block_idx * config_.block_size;
-    int32_t end_pos = std::min(start_pos + config_.block_size, layer.max_tokens);
+    int32_t end_pos   = std::min(start_pos + config_.block_size, layer.max_tokens);
 
     // Create new block
     kv_block block;
-    block.layer_id = layer_id;
-    block.start_pos = start_pos;
-    block.end_pos = end_pos;
-    block.on_gpu = true;  // Initially on GPU (KV is computed there)
-    block.gpu_ptr = nullptr;  // Points into KV cache tensor
-    block.cpu_ptr = nullptr;  // Allocated on first offload
-    block.size = (layer.k_size_per_token + layer.v_size_per_token) * (end_pos - start_pos);
-    block.last_access = current_time_++;
+    block.layer_id       = layer_id;
+    block.start_pos      = start_pos;
+    block.end_pos        = end_pos;
+    block.on_gpu         = true;     // Initially on GPU (KV is computed there)
+    block.gpu_ptr        = nullptr;  // Points into KV cache tensor
+    block.cpu_ptr        = nullptr;  // Allocated on first offload
+    block.size           = (layer.k_size_per_token + layer.v_size_per_token) * (end_pos - start_pos);
+    block.last_access    = current_time_++;
     block.transfer_event = sycl::event();
 
     // Calculate GPU pointer offset into KV cache
@@ -345,7 +381,7 @@ int32_t kv_offload_manager::pos_to_block_idx(int32_t pos) const {
     return pos / config_.block_size;
 }
 
-sycl::event kv_offload_manager::transfer_to_gpu(kv_block* block) {
+sycl::event kv_offload_manager::transfer_to_gpu(kv_block * block) {
     if (!block || block->on_gpu || !block->cpu_ptr) {
         return sycl::event();
     }
@@ -355,32 +391,32 @@ sycl::event kv_offload_manager::transfer_to_gpu(kv_block* block) {
         return sycl::event();
     }
 
-    const kv_layer_info& layer = layer_it->second;
+    const kv_layer_info & layer = layer_it->second;
 
     // Wait for any previous transfer to complete
     try {
         block->transfer_event.wait();
-    } catch (...) {}
+    } catch (...) {
+    }
 
     // Calculate destination offset in KV cache
     size_t k_offset = block->start_pos * layer.k_size_per_token;
     size_t v_offset = block->start_pos * layer.v_size_per_token;
-    size_t k_size = (block->end_pos - block->start_pos) * layer.k_size_per_token;
-    size_t v_size = (block->end_pos - block->start_pos) * layer.v_size_per_token;
+    size_t k_size   = (block->end_pos - block->start_pos) * layer.k_size_per_token;
+    size_t v_size   = (block->end_pos - block->start_pos) * layer.v_size_per_token;
 
-    char* k_dst = static_cast<char*>(layer.k_base_gpu) + k_offset;
-    char* v_dst = static_cast<char*>(layer.v_base_gpu) + v_offset;
-
-    // CPU buffer layout: K data followed by V data
-    char* k_src = static_cast<char*>(block->cpu_ptr);
-    char* v_src = k_src + k_size;
+    if (!layer.k_handle.valid() || !layer.v_handle.valid() || !block->cpu_handle.valid()) {
+        GGML_LOG_ERROR("[KV-OFFLOAD] Cannot transfer layer %d block [%d,%d) to GPU: invalid KV/CPU handle\n",
+                       block->layer_id, block->start_pos, block->end_pos);
+        return sycl::event();
+    }
 
     // Transfer K and V
-    sycl::event k_evt = queue_.memcpy(k_dst, k_src, k_size);
-    sycl::event v_evt = queue_.memcpy(v_dst, v_src, v_size, k_evt);
+    sycl::event k_evt = mem_copy_async(layer.k_handle, k_offset, block->cpu_handle, 0, k_size, queue_);
+    sycl::event v_evt = mem_copy_async(layer.v_handle, v_offset, block->cpu_handle, k_size, v_size, queue_, { k_evt });
 
     block->transfer_event = v_evt;
-    block->on_gpu = true;
+    block->on_gpu         = true;
 
     gpu_memory_used_ += block->size;
     update_access(block);
@@ -388,7 +424,7 @@ sycl::event kv_offload_manager::transfer_to_gpu(kv_block* block) {
     return v_evt;
 }
 
-sycl::event kv_offload_manager::transfer_to_cpu(kv_block* block) {
+sycl::event kv_offload_manager::transfer_to_cpu(kv_block * block) {
     if (!block || !block->on_gpu) {
         return sycl::event();
     }
@@ -398,12 +434,11 @@ sycl::event kv_offload_manager::transfer_to_cpu(kv_block* block) {
         return sycl::event();
     }
 
-    const kv_layer_info& layer = layer_it->second;
+    const kv_layer_info & layer = layer_it->second;
 
     // Allocate CPU buffer if needed
     if (!block->cpu_ptr) {
-        block->cpu_ptr = allocate_cpu_block(block->size);
-        if (!block->cpu_ptr) {
+        if (!allocate_cpu_block(*block)) {
             GGML_LOG_ERROR("[KV-OFFLOAD] Failed to allocate CPU buffer for block\n");
             return sycl::event();
         }
@@ -412,62 +447,83 @@ sycl::event kv_offload_manager::transfer_to_cpu(kv_block* block) {
     // Wait for any previous transfer to complete
     try {
         block->transfer_event.wait();
-    } catch (...) {}
+    } catch (...) {
+    }
 
     // Calculate source offset in KV cache
     size_t k_offset = block->start_pos * layer.k_size_per_token;
     size_t v_offset = block->start_pos * layer.v_size_per_token;
-    size_t k_size = (block->end_pos - block->start_pos) * layer.k_size_per_token;
-    size_t v_size = (block->end_pos - block->start_pos) * layer.v_size_per_token;
+    size_t k_size   = (block->end_pos - block->start_pos) * layer.k_size_per_token;
+    size_t v_size   = (block->end_pos - block->start_pos) * layer.v_size_per_token;
 
-    char* k_src = static_cast<char*>(layer.k_base_gpu) + k_offset;
-    char* v_src = static_cast<char*>(layer.v_base_gpu) + v_offset;
-
-    // CPU buffer layout: K data followed by V data
-    char* k_dst = static_cast<char*>(block->cpu_ptr);
-    char* v_dst = k_dst + k_size;
+    if (!layer.k_handle.valid() || !layer.v_handle.valid() || !block->cpu_handle.valid()) {
+        GGML_LOG_ERROR("[KV-OFFLOAD] Cannot transfer layer %d block [%d,%d) to CPU: invalid KV/CPU handle\n",
+                       block->layer_id, block->start_pos, block->end_pos);
+        return sycl::event();
+    }
 
     // Transfer K and V
-    sycl::event k_evt = queue_.memcpy(k_dst, k_src, k_size);
-    sycl::event v_evt = queue_.memcpy(v_dst, v_src, v_size, k_evt);
+    sycl::event k_evt = mem_copy_async(block->cpu_handle, 0, layer.k_handle, k_offset, k_size, queue_);
+    sycl::event v_evt = mem_copy_async(block->cpu_handle, k_size, layer.v_handle, v_offset, v_size, queue_, { k_evt });
 
     block->transfer_event = v_evt;
-    block->on_gpu = false;
+    block->on_gpu         = false;
 
     gpu_memory_used_ -= block->size;
 
     return v_evt;
 }
 
-void* kv_offload_manager::allocate_cpu_block(size_t size) {
-    void* ptr = ggml_sycl_malloc_host_tracked_bytes(size, queue_, "kv_offload:cpu_block");
-    if (ptr) {
-        cpu_memory_used_ += size;
+bool kv_offload_manager::allocate_cpu_block(kv_block & block) {
+    if (block.cpu_ptr) {
+        return true;
     }
-    return ptr;
+
+    const int device = ggml_sycl_get_device_id_from_queue(queue_);
+
+    alloc_request req{};
+    req.queue                                    = &queue_;
+    req.device                                   = device;
+    req.size                                     = block.size;
+    req.suppress_failure_log                     = true;
+    req.intent.role                              = alloc_role::KV;
+    req.intent.category                          = runtime_category::KV_CACHE;
+    req.intent.cohort_id                         = "kv_offload:cpu_block";
+    req.intent.constraints.must_host_pinned      = true;
+    req.intent.constraints.use_pinned_pool       = true;
+    req.intent.constraints.require_host_usm_base = true;
+
+    alloc_handle cpu_block_owner{};
+    if (!unified_alloc(req, &cpu_block_owner) || !cpu_block_owner.ptr) {
+        return false;
+    }
+
+    mem_handle owner    = mem_handle::from_owned_alloc(std::move(cpu_block_owner), GGML_LAYOUT_AOS);
+    auto       resolved = owner.resolve(device);
+    if (!resolved.ptr || resolved.on_device) {
+        return false;
+    }
+
+    block.cpu_handle = std::move(owner);
+    block.cpu_ptr    = resolved.ptr;
+    cpu_memory_used_ += block.size;
+    return true;
 }
 
-void kv_offload_manager::free_cpu_block(void* ptr) {
-    if (ptr) {
-        // Find block to get size
-        size_t block_size = 0;
-        for (auto& [key, block] : blocks_) {
-            if (block.cpu_ptr == ptr) {
-                cpu_memory_used_ -= block.size;
-                block_size = block.size;
-                break;
-            }
-        }
-        if (block_size > 0) {
-            ggml_sycl_free_host_tracked_bytes(ptr, block_size, queue_);
+void kv_offload_manager::free_cpu_block(kv_block & block) {
+    if (block.cpu_ptr || block.cpu_handle.valid()) {
+        if (cpu_memory_used_ >= block.size) {
+            cpu_memory_used_ -= block.size;
         } else {
-            ggml_sycl_free_host_tracked_bytes(ptr, 0, queue_);
+            cpu_memory_used_ = 0;
         }
+        block.cpu_ptr    = nullptr;
+        block.cpu_handle = mem_handle{};
     }
 }
 
-void kv_offload_manager::update_access(kv_block* block) {
+void kv_offload_manager::update_access(kv_block * block) {
     block->last_access = current_time_++;
 }
 
-} // namespace ggml_sycl
+}  // namespace ggml_sycl

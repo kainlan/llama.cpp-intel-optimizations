@@ -2,7 +2,7 @@
 // Test Q6_K MMVQ with exact Mistral model dimensions
 //
 // Build: cmake --build build --target test-mmvq-q6k-mistral-dims
-// Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-mmvq-q6k-mistral-dims
+// Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-mmvq-q6k-mistral-dims
 
 #include "../ggml/src/ggml-quants.h"
 #include "ggml-backend.h"

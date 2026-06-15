@@ -6,6 +6,8 @@ ggml-common.h
 **/*.swp
 !peg-parser
 !sycl-canary
+!sycl-alloc-policy-fixtures
+!sycl-alloc-policy-fixtures/**
 !e1-rca
 !data
 !data/planner-canaries

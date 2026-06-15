@@ -9,9 +9,11 @@
 #include "alloc-registry.hpp"
 #include "common.hpp"
 #include "ggml-impl.h"
+#include "mem-ops.hpp"
 #include "tensor-types.hpp"
 
 #include <algorithm>
+#include <utility>
 
 namespace ggml_sycl {
 
@@ -19,9 +21,7 @@ layer_stream_manager::~layer_stream_manager() {
     shutdown();
 }
 
-void layer_stream_manager::build_layer_map(
-    const std::pair<std::string, size_t> * inventory, size_t count) {
-
+void layer_stream_manager::build_layer_map(const std::pair<std::string, size_t> * inventory, size_t count) {
     layers_.clear();
     name_to_location_.clear();
     max_layer_size_ = 0;
@@ -45,23 +45,23 @@ void layer_stream_manager::build_layer_map(
     // Second pass: populate layer entries
     for (size_t i = 0; i < count; i++) {
         const auto & [name, size] = inventory[i];
-        int layer_id = extract_layer_id(name.c_str());
+        int layer_id              = extract_layer_id(name.c_str());
         if (layer_id < 0 || layer_id > max_layer) {
             continue;  // Non-layer tensor (embedding, output, etc.)
         }
 
-        auto & layer = layers_[layer_id];
+        auto &       layer = layers_[layer_id];
         weight_entry entry;
         entry.name            = name;
         entry.size            = size;
         entry.offset_in_layer = layer.total_size;  // Pack sequentially
-        entry.host_ptr        = nullptr;  // Registered later
+        entry.host_ptr        = nullptr;           // Registered later
 
         size_t weight_idx = layer.weights.size();
         layer.weights.push_back(std::move(entry));
         layer.total_size += size;
 
-        name_to_location_[name] = {layer_id, weight_idx};
+        name_to_location_[name] = { layer_id, weight_idx };
     }
 
     // Calculate max layer size
@@ -70,9 +70,7 @@ void layer_stream_manager::build_layer_map(
     }
 
     GGML_LOG_INFO("[LAYER-STREAM] Built layer map: %d layers, max_layer_size=%.1f MB, total_entries=%zu\n",
-                  static_cast<int>(layers_.size()),
-                  max_layer_size_ / (1024.0 * 1024.0),
-                  name_to_location_.size());
+                  static_cast<int>(layers_.size()), max_layer_size_ / (1024.0 * 1024.0), name_to_location_.size());
 }
 
 bool layer_stream_manager::allocate_buffers(sycl::queue & queue) {
@@ -83,15 +81,12 @@ bool layer_stream_manager::allocate_buffers(sycl::queue & queue) {
 
     // Round up to 2MB alignment for efficient DMA
     const size_t align = 2 * 1024 * 1024;
-    buffer_size_ = ((max_layer_size_ + align - 1) / align) * align;
-
-    // Store context for sycl::free() in shutdown()
-    ctx_ = queue.get_context();
+    buffer_size_       = ((max_layer_size_ + align - 1) / align) * align;
 
     device_id_ = ggml_sycl_get_device_id_from_queue(queue);
 
     for (int i = 0; i < 2; i++) {
-        // Allocate via unified_allocate (tries arena WEIGHT zone first, then sycl::malloc_device).
+        // Allocate through unified ownership; raw pointers are only the copy/submit ABI.
         alloc_request req{};
         req.queue                          = &queue;
         req.device                         = device_id_;
@@ -99,24 +94,25 @@ bool layer_stream_manager::allocate_buffers(sycl::queue & queue) {
         req.intent.role                    = alloc_role::WEIGHT;
         req.intent.category                = runtime_category::OTHER;
         req.intent.constraints.must_device = true;
-        if (!unified_alloc(req, &buffer_allocs_[i]) || !buffer_allocs_[i].ptr) {
-            GGML_LOG_ERROR("[LAYER-STREAM] Failed to allocate buffer %d (%.1f MB)\n",
-                           i, buffer_size_ / (1024.0 * 1024.0));
+        mem_handle buffer_handle           = unified_allocate(req);
+        auto       resolved                = buffer_handle.resolve(device_id_);
+        if (!resolved || !resolved.on_device) {
+            GGML_LOG_ERROR("[LAYER-STREAM] Failed to allocate buffer %d (%.1f MB)\n", i,
+                           buffer_size_ / (1024.0 * 1024.0));
             // Clean up buffer 0 if buffer 1 failed
-            if (i == 1 && buffer_allocs_[0].ptr) {
-                (void) unified_free(buffer_allocs_[0]);
-                buffer_allocs_[0] = {};
-                buffers_[0] = nullptr;
+            if (i == 1 && buffer_handles_[0].valid()) {
+                buffer_handles_[0] = {};
+                buffers_[0]        = nullptr;
             }
             return false;
         }
-        buffers_[i]       = buffer_allocs_[i].ptr;
-        loaded_layers_[i] = -1;
+        buffers_[i]        = resolved.ptr;
+        buffer_handles_[i] = std::move(buffer_handle);
+        loaded_layers_[i]  = -1;
     }
 
     GGML_LOG_INFO("[LAYER-STREAM] Allocated 2 x %.1f MB device buffers (%.1f MB total)\n",
-                  buffer_size_ / (1024.0 * 1024.0),
-                  (buffer_size_ * 2) / (1024.0 * 1024.0));
+                  buffer_size_ / (1024.0 * 1024.0), (buffer_size_ * 2) / (1024.0 * 1024.0));
     return true;
 }
 
@@ -125,34 +121,39 @@ void layer_stream_manager::shutdown() {
     if (prefetch_pending_) {
         try {
             prefetch_event_.wait();
-        } catch (...) {}
+        } catch (...) {
+        }
         prefetch_pending_ = false;
     }
 
     for (int i = 0; i < 2; i++) {
-        if (buffer_allocs_[i].ptr) {
-            (void) unified_free(buffer_allocs_[i]);
-            buffer_allocs_[i] = {};
-        }
-        buffers_[i]       = nullptr;
-        loaded_layers_[i] = -1;
+        buffer_handles_[i] = {};
+        buffers_[i]        = nullptr;
+        loaded_layers_[i]  = -1;
     }
     buffer_size_ = 0;
 }
 
-void layer_stream_manager::register_host_ptr(
-    const char * tensor_name, const void * host_ptr, size_t size) {
-    if (!tensor_name || !host_ptr) return;
+void layer_stream_manager::register_host_ptr(const char * tensor_name, const void * host_ptr, size_t size) {
+    if (!tensor_name || !host_ptr) {
+        return;
+    }
 
     std::lock_guard<std::mutex> lock(host_ptr_mutex_);
-    auto it = name_to_location_.find(tensor_name);
-    if (it == name_to_location_.end()) return;
+    auto                        it = name_to_location_.find(tensor_name);
+    if (it == name_to_location_.end()) {
+        return;
+    }
 
     auto [layer_id, weight_idx] = it->second;
-    if (layer_id < 0 || layer_id >= static_cast<int>(layers_.size())) return;
-    if (weight_idx >= layers_[layer_id].weights.size()) return;
+    if (layer_id < 0 || layer_id >= static_cast<int>(layers_.size())) {
+        return;
+    }
+    if (weight_idx >= layers_[layer_id].weights.size()) {
+        return;
+    }
 
-    auto & entry = layers_[layer_id].weights[weight_idx];
+    auto & entry   = layers_[layer_id].weights[weight_idx];
     entry.host_ptr = host_ptr;
     (void) size;  // Size already known from inventory
 }
@@ -160,7 +161,9 @@ void layer_stream_manager::register_host_ptr(
 int layer_stream_manager::pick_buffer_for_layer(int layer_id) const {
     // Check if already loaded
     for (int i = 0; i < 2; i++) {
-        if (loaded_layers_[i] == layer_id) return i;
+        if (loaded_layers_[i] == layer_id) {
+            return i;
+        }
     }
     // Pick the buffer NOT currently holding the adjacent layer
     // Simple heuristic: alternate by layer parity
@@ -168,12 +171,20 @@ int layer_stream_manager::pick_buffer_for_layer(int layer_id) const {
 }
 
 bool layer_stream_manager::load_layer_sync(int layer_id, int buffer_idx, sycl::queue & queue) {
-    if (layer_id < 0 || layer_id >= static_cast<int>(layers_.size())) return false;
-    if (buffer_idx < 0 || buffer_idx > 1) return false;
-    if (!buffers_[buffer_idx]) return false;
+    if (layer_id < 0 || layer_id >= static_cast<int>(layers_.size())) {
+        return false;
+    }
+    if (buffer_idx < 0 || buffer_idx > 1) {
+        return false;
+    }
+    if (!buffers_[buffer_idx]) {
+        return false;
+    }
 
     auto & layer = layers_[layer_id];
-    if (layer.weights.empty()) return false;
+    if (layer.weights.empty()) {
+        return false;
+    }
 
     char *      dst_base = static_cast<char *>(buffers_[buffer_idx]);
     int         copied   = 0;
@@ -185,12 +196,14 @@ bool layer_stream_manager::load_layer_sync(int layer_id, int buffer_idx, sycl::q
             w.host_ptr = ggml_sycl_lookup_host_weight_ptr_by_name(w.name.c_str());
         }
         if (!w.host_ptr) {
-            GGML_LOG_WARN("[LAYER-STREAM] No host pointer for %s (layer %d), skipping\n",
-                          w.name.c_str(), layer_id);
+            GGML_LOG_WARN("[LAYER-STREAM] No host pointer for %s (layer %d), skipping\n", w.name.c_str(), layer_id);
             skipped++;
             continue;
         }
-        last_event = queue.memcpy(dst_base + w.offset_in_layer, w.host_ptr, w.size);
+        const int  queue_device = ggml_sycl_get_device_id_from_queue(queue);
+        mem_handle dst_handle   = ::ggml_sycl_memcpy_handle_for_raw_ptr(dst_base + w.offset_in_layer, queue_device);
+        mem_handle src_handle   = ::ggml_sycl_memcpy_handle_for_raw_ptr(w.host_ptr, queue_device);
+        last_event              = mem_copy_async(dst_handle, src_handle, w.size, queue);
         copied++;
     }
 
@@ -201,17 +214,20 @@ bool layer_stream_manager::load_layer_sync(int layer_id, int buffer_idx, sycl::q
 
     loaded_layers_[buffer_idx] = layer_id;
 
-    GGML_LOG_DEBUG("[LAYER-STREAM] Loaded layer %d into buffer %d: %d tensors (%.1f MB), %d skipped\n",
-                   layer_id, buffer_idx, copied,
-                   layer.total_size / (1024.0 * 1024.0), skipped);
+    GGML_LOG_DEBUG("[LAYER-STREAM] Loaded layer %d into buffer %d: %d tensors (%.1f MB), %d skipped\n", layer_id,
+                   buffer_idx, copied, layer.total_size / (1024.0 * 1024.0), skipped);
     return true;
 }
 
 bool layer_stream_manager::ensure_layer(int layer_id, sycl::queue & queue) {
-    if (!is_active()) return false;
+    if (!is_active()) {
+        return false;
+    }
 
     // Already loaded?
-    if (is_layer_loaded(layer_id)) return true;
+    if (is_layer_loaded(layer_id)) {
+        return true;
+    }
 
     // Check if there's a pending prefetch for this layer
     {
@@ -223,7 +239,7 @@ bool layer_stream_manager::ensure_layer(int layer_id, sycl::queue & queue) {
             } catch (const sycl::exception & e) {
                 GGML_LOG_ERROR("[LAYER-STREAM] Prefetch wait failed: %s\n", e.what());
             }
-            prefetch_pending_ = false;
+            prefetch_pending_                = false;
             loaded_layers_[prefetch_buffer_] = layer_id;
             return true;
         }
@@ -235,9 +251,15 @@ bool layer_stream_manager::ensure_layer(int layer_id, sycl::queue & queue) {
 }
 
 void layer_stream_manager::prefetch_next_layer(int layer_id, sycl::queue & queue) {
-    if (!is_active()) return;
-    if (layer_id < 0 || layer_id >= static_cast<int>(layers_.size())) return;
-    if (is_layer_loaded(layer_id)) return;  // Already loaded
+    if (!is_active()) {
+        return;
+    }
+    if (layer_id < 0 || layer_id >= static_cast<int>(layers_.size())) {
+        return;
+    }
+    if (is_layer_loaded(layer_id)) {
+        return;  // Already loaded
+    }
 
     std::lock_guard<std::mutex> lock(prefetch_mutex_);
 
@@ -245,7 +267,8 @@ void layer_stream_manager::prefetch_next_layer(int layer_id, sycl::queue & queue
     if (prefetch_pending_ && prefetch_target_layer_ != layer_id) {
         try {
             prefetch_event_.wait();
-        } catch (...) {}
+        } catch (...) {
+        }
         prefetch_pending_ = false;
     }
 
@@ -265,7 +288,9 @@ void layer_stream_manager::prefetch_next_layer(int layer_id, sycl::queue & queue
     }
 
     const auto & layer = layers_[layer_id];
-    if (layer.weights.empty()) return;
+    if (layer.weights.empty()) {
+        return;
+    }
 
     char * dst_base = static_cast<char *>(buffers_[buf]);
 
@@ -273,8 +298,13 @@ void layer_stream_manager::prefetch_next_layer(int layer_id, sycl::queue & queue
     // In-order queue: last event implies all prior copies complete
     sycl::event last_event;
     for (const auto & w : layer.weights) {
-        if (!w.host_ptr) continue;
-        last_event = queue.memcpy(dst_base + w.offset_in_layer, w.host_ptr, w.size);
+        if (!w.host_ptr) {
+            continue;
+        }
+        const int  queue_device = ggml_sycl_get_device_id_from_queue(queue);
+        mem_handle dst_handle   = ::ggml_sycl_memcpy_handle_for_raw_ptr(dst_base + w.offset_in_layer, queue_device);
+        mem_handle src_handle   = ::ggml_sycl_memcpy_handle_for_raw_ptr(w.host_ptr, queue_device);
+        last_event              = mem_copy_async(dst_handle, src_handle, w.size, queue);
     }
 
     prefetch_target_layer_ = layer_id;
@@ -285,7 +315,9 @@ void layer_stream_manager::prefetch_next_layer(int layer_id, sycl::queue & queue
 
 void layer_stream_manager::await_prefetch() {
     std::lock_guard<std::mutex> lock(prefetch_mutex_);
-    if (!prefetch_pending_) return;
+    if (!prefetch_pending_) {
+        return;
+    }
 
     try {
         prefetch_event_.wait();
@@ -294,20 +326,26 @@ void layer_stream_manager::await_prefetch() {
     }
 
     loaded_layers_[prefetch_buffer_] = prefetch_target_layer_;
-    prefetch_pending_ = false;
+    prefetch_pending_                = false;
 }
 
 void * layer_stream_manager::get_weight_device_ptr(const char * tensor_name) const {
-    if (!tensor_name || !is_active()) return nullptr;
+    if (!tensor_name || !is_active()) {
+        return nullptr;
+    }
 
     auto it = name_to_location_.find(tensor_name);
-    if (it == name_to_location_.end()) return nullptr;
+    if (it == name_to_location_.end()) {
+        return nullptr;
+    }
 
     auto [layer_id, weight_idx] = it->second;
 
     // Find which buffer holds this layer
     int buf = buffer_for_layer(layer_id);
-    if (buf < 0) return nullptr;  // Layer not loaded
+    if (buf < 0) {
+        return nullptr;  // Layer not loaded
+    }
 
     const auto & entry = layers_[layer_id].weights[weight_idx];
     return static_cast<char *>(buffers_[buf]) + entry.offset_in_layer;
@@ -318,15 +356,19 @@ bool layer_stream_manager::is_layer_loaded(int layer_id) const {
 }
 
 int layer_stream_manager::buffer_for_layer(int layer_id) const {
-    if (loaded_layers_[0] == layer_id) return 0;
-    if (loaded_layers_[1] == layer_id) return 1;
+    if (loaded_layers_[0] == layer_id) {
+        return 0;
+    }
+    if (loaded_layers_[1] == layer_id) {
+        return 1;
+    }
     return -1;
 }
 
 // --- Global accessors ---
 
 static std::unordered_map<int, std::unique_ptr<layer_stream_manager>> g_layer_managers;
-static std::mutex g_layer_managers_mutex;
+static std::mutex                                                     g_layer_managers_mutex;
 
 layer_stream_manager & get_layer_stream_manager(int device_id) {
     std::lock_guard<std::mutex> lock(g_layer_managers_mutex);
@@ -339,14 +381,16 @@ layer_stream_manager & get_layer_stream_manager(int device_id) {
 
 bool layer_streaming_active(int device_id) {
     std::lock_guard<std::mutex> lock(g_layer_managers_mutex);
-    auto it = g_layer_managers.find(device_id);
+    auto                        it = g_layer_managers.find(device_id);
     return it != g_layer_managers.end() && it->second->is_active();
 }
 
 void * layer_streaming_get_weight_ptr(int device_id, const char * name) {
     std::lock_guard<std::mutex> lock(g_layer_managers_mutex);
-    auto it = g_layer_managers.find(device_id);
-    if (it == g_layer_managers.end()) return nullptr;
+    auto                        it = g_layer_managers.find(device_id);
+    if (it == g_layer_managers.end()) {
+        return nullptr;
+    }
     return it->second->get_weight_device_ptr(name);
 }
 
@@ -354,8 +398,10 @@ void layer_streaming_ensure_layer(int device_id, int layer_id, sycl::queue & que
     layer_stream_manager * mgr = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_layer_managers_mutex);
-        auto it = g_layer_managers.find(device_id);
-        if (it == g_layer_managers.end()) return;
+        auto                        it = g_layer_managers.find(device_id);
+        if (it == g_layer_managers.end()) {
+            return;
+        }
         mgr = it->second.get();
     }
     mgr->ensure_layer(layer_id, queue);
@@ -365,8 +411,10 @@ void layer_streaming_prefetch_next(int device_id, int layer_id, sycl::queue & qu
     layer_stream_manager * mgr = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_layer_managers_mutex);
-        auto it = g_layer_managers.find(device_id);
-        if (it == g_layer_managers.end()) return;
+        auto                        it = g_layer_managers.find(device_id);
+        if (it == g_layer_managers.end()) {
+            return;
+        }
         mgr = it->second.get();
     }
     mgr->prefetch_next_layer(layer_id, queue);
@@ -376,8 +424,10 @@ void layer_streaming_await_prefetch(int device_id) {
     layer_stream_manager * mgr = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_layer_managers_mutex);
-        auto it = g_layer_managers.find(device_id);
-        if (it == g_layer_managers.end()) return;
+        auto                        it = g_layer_managers.find(device_id);
+        if (it == g_layer_managers.end()) {
+            return;
+        }
         mgr = it->second.get();
     }
     mgr->await_prefetch();
@@ -387,8 +437,10 @@ void layer_streaming_register_host_ptr(int device_id, const char * name, const v
     layer_stream_manager * mgr = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_layer_managers_mutex);
-        auto it = g_layer_managers.find(device_id);
-        if (it == g_layer_managers.end()) return;
+        auto                        it = g_layer_managers.find(device_id);
+        if (it == g_layer_managers.end()) {
+            return;
+        }
         mgr = it->second.get();
     }
     mgr->register_host_ptr(name, ptr, size);

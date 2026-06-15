@@ -39,7 +39,7 @@ bool test_model_loads_with_xmx_moe(TestStats& stats) {
 
     char cmd[2048];
     snprintf(cmd, sizeof(cmd),
-        "ONEAPI_DEVICE_SELECTOR=level_zero:1 GGML_SYCL_XMX_MOE=1 %s "
+        "ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_XMX_MOE=1 %s "
         "-m %s -ngl 99 -p 'test' -n 5 --seed 42 --temp 0 2>&1",
         binary, model);
 
@@ -72,7 +72,7 @@ bool test_tiled_conversion_occurs(TestStats& stats) {
     // Run with GGML_SYCL_DEBUG=1
     char cmd[2048];
     snprintf(cmd, sizeof(cmd),
-        "ONEAPI_DEVICE_SELECTOR=level_zero:1 GGML_SYCL_XMX_MOE=1 GGML_SYCL_DEBUG=1 %s "
+        "ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_XMX_MOE=1 GGML_SYCL_DEBUG=1 %s "
         "-m %s -ngl 99 -p 'test' -n 5 --seed 42 --temp 0 2>&1",
         binary, model);
 
@@ -151,7 +151,7 @@ bool test_fallback_path(TestStats& stats) {
     // Run WITHOUT GGML_SYCL_XMX_MOE
     char cmd[2048];
     snprintf(cmd, sizeof(cmd),
-        "ONEAPI_DEVICE_SELECTOR=level_zero:1 %s "  // No GGML_SYCL_XMX_MOE
+        "ONEAPI_DEVICE_SELECTOR=level_zero:0 %s "  // No GGML_SYCL_XMX_MOE
         "-m %s -ngl 99 -p 'test' -n 5 --seed 42 --temp 0 2>&1",
         binary, model);
 
@@ -280,17 +280,17 @@ endif()
 
 ### Individual Test
 ```bash
-ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-tiled-weight-loading
+ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-tiled-weight-loading
 ```
 
 ### Via CTest
 ```bash
-ONEAPI_DEVICE_SELECTOR=level_zero:1 ctest -R test-tiled-weight-loading -V
+ONEAPI_DEVICE_SELECTOR=level_zero:0 ctest -R test-tiled-weight-loading -V
 ```
 
 ### All SYCL Tests
 ```bash
-ONEAPI_DEVICE_SELECTOR=level_zero:1 ctest -R SYCL -j 8
+ONEAPI_DEVICE_SELECTOR=level_zero:0 ctest -R SYCL -j 8
 ```
 
 ## Expected Output

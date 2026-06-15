@@ -1,5 +1,5 @@
 // Repro for SYCL ADD on strided views (broadcast-style MoE paths).
-// Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-sycl-add-strided-view
+// Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-sycl-add-strided-view
 
 #include "ggml-backend.h"
 #include "ggml-sycl.h"

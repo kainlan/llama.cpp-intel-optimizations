@@ -20,9 +20,13 @@
 set -e
 
 # Configuration
+TEST_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$TEST_DIR/.." && pwd)"
+
 LLAMA_CLI="./build/bin/llama-cli"
 MISTRAL_MODEL="/Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf"
 GPTOSS_MODEL="/Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf"
+DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:0}"
 
 # Parse arguments
 ITERATIONS=10
@@ -70,7 +74,7 @@ run_determinism_test() {
     local fail=0
 
     for i in $(seq 1 $iterations); do
-        output=$(GGML_SYCL_DISABLE_GRAPH=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
+        output=$(GGML_SYCL_DISABLE_GRAPH=1 ONEAPI_DEVICE_SELECTOR="$DEVICE_SELECTOR" \
             timeout 120 "$LLAMA_CLI" \
             -m "$model" \
             -ngl 99 --flash-attn on --no-conversation \
@@ -157,14 +161,14 @@ echo "----------------------------------------------"
 if [ -f "$GPTOSS_MODEL" ]; then
     echo "Testing FA ON vs FA OFF produce same output..."
 
-    fa_off=$(GGML_SYCL_DISABLE_GRAPH=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
+    fa_off=$(GGML_SYCL_DISABLE_GRAPH=1 ONEAPI_DEVICE_SELECTOR="$DEVICE_SELECTOR" \
         timeout 120 "$LLAMA_CLI" \
         -m "$GPTOSS_MODEL" \
         -ngl 99 --flash-attn off --no-conversation \
         -p "Count from 1 to 5:" -n 15 --seed 42 --temp 0 2>&1 \
         | grep -oE "1,2,3,4,5" | head -1 || echo "NO_MATCH")
 
-    fa_on=$(GGML_SYCL_DISABLE_GRAPH=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
+    fa_on=$(GGML_SYCL_DISABLE_GRAPH=1 ONEAPI_DEVICE_SELECTOR="$DEVICE_SELECTOR" \
         timeout 120 "$LLAMA_CLI" \
         -m "$GPTOSS_MODEL" \
         -ngl 99 --flash-attn on --no-conversation \

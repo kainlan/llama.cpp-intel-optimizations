@@ -136,7 +136,6 @@ static bool run_mul_mat_backend(ggml_backend_t backend,
 }
 
 int main() {
-    setenv("GGML_SYCL_UNIFIED_CACHE", "1", 1);
     setenv("GGML_SYCL_DMA_SLICE_MB", "1", 1);
     setenv("GGML_SYCL_DMA_BUFFERS", "2", 1);
 

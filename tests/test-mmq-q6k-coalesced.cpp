@@ -2,7 +2,7 @@
 // Tests the production MMQ kernel path using coalesced layout (batch > 1)
 //
 // Build: cmake --build build --target test-mmq-q6k-coalesced
-// Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-mmq-q6k-coalesced
+// Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-mmq-q6k-coalesced
 
 #include <cstdio>
 #include <cstdlib>

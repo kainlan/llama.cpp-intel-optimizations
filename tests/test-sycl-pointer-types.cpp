@@ -24,7 +24,7 @@ static bool expect_type(sycl::usm::alloc got, sycl::usm::alloc expected, const c
 
 int main() {
     if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:1", 1);
+        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
     }
 
     sycl::queue q;

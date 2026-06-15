@@ -12,7 +12,7 @@
 // - Built llama-completion binary
 //
 // Build: cmake --build build --target test-tiled-weight-loading
-// Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ctest -R test-tiled-weight-loading -V
+// Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ctest -R test-tiled-weight-loading -V
 
 #include <cstdio>
 #include <cstdlib>
@@ -161,7 +161,7 @@ bool test_model_loads_with_xmx_moe(TestStats& stats) {
     }
 
     // Run a simple completion with XMX_MOE enabled
-    std::string cmd = std::string("ONEAPI_DEVICE_SELECTOR=level_zero:1 GGML_SYCL_XMX_MOE=1 ") +
+    std::string cmd = std::string("ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_XMX_MOE=1 ") +
                        binary + " -m " + model + " -ngl 99 -p 'test' -n 5 --seed 42 --temp 0 2>&1";
 
     CommandResult result = run_command(cmd.c_str());
@@ -199,7 +199,7 @@ bool test_tiled_conversion_occurs(TestStats& stats) {
     }
 
     // Run with debug output enabled
-    std::string cmd = std::string("ONEAPI_DEVICE_SELECTOR=level_zero:1 GGML_SYCL_XMX_MOE=1 GGML_SYCL_DEBUG=1 ") +
+    std::string cmd = std::string("ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_XMX_MOE=1 GGML_SYCL_DEBUG=1 ") +
                        binary + " -m " + model + " -ngl 99 -p 'test' -n 5 --seed 42 --temp 0 2>&1";
 
     CommandResult result = run_command(cmd.c_str());
@@ -263,7 +263,7 @@ bool test_inference_correctness(TestStats& stats) {
     }
 
     // Run inference with a deterministic prompt
-    std::string cmd = std::string("ONEAPI_DEVICE_SELECTOR=level_zero:1 GGML_SYCL_XMX_MOE=1 ") +
+    std::string cmd = std::string("ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_XMX_MOE=1 ") +
                        binary + " -m " + model + " -ngl 99 -p 'The capital of France is' -n 5 --seed 42 --temp 0 2>&1";
 
     CommandResult result = run_command(cmd.c_str());
@@ -313,7 +313,7 @@ bool test_fallback_path(TestStats& stats) {
     }
 
     // Run without XMX_MOE (use fallback path)
-    std::string cmd = std::string("ONEAPI_DEVICE_SELECTOR=level_zero:1 ") +
+    std::string cmd = std::string("ONEAPI_DEVICE_SELECTOR=level_zero:0 ") +
                        binary + " -m " + model + " -ngl 99 -p 'test' -n 5 --seed 42 --temp 0 2>&1";
 
     CommandResult result = run_command(cmd.c_str());
@@ -349,7 +349,7 @@ bool test_no_crashes(TestStats& stats) {
         return false;
     }
 
-    std::string cmd = std::string("ONEAPI_DEVICE_SELECTOR=level_zero:1 GGML_SYCL_XMX_MOE=1 ") +
+    std::string cmd = std::string("ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_XMX_MOE=1 ") +
                        binary + " -m " + model + " -ngl 99 -p 'test' -n 10 --seed 42 --temp 0 2>&1";
 
     CommandResult result = run_command(cmd.c_str());
@@ -411,7 +411,7 @@ bool test_memory_allocation(TestStats& stats) {
         return false;
     }
 
-    std::string cmd = std::string("ONEAPI_DEVICE_SELECTOR=level_zero:1 GGML_SYCL_XMX_MOE=1 ") +
+    std::string cmd = std::string("ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_XMX_MOE=1 ") +
                        binary + " -m " + model + " -ngl 99 -p 'test' -n 10 --seed 42 --temp 0 2>&1";
 
     CommandResult result = run_command(cmd.c_str());
@@ -453,8 +453,8 @@ int main(int, char**) {
 
     // Check if SYCL backend is available
     if (!getenv("ONEAPI_DEVICE_SELECTOR")) {
-        fprintf(stderr, "[INFO] Setting ONEAPI_DEVICE_SELECTOR=level_zero:1\n");
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:1", 1);
+        fprintf(stderr, "[INFO] Setting ONEAPI_DEVICE_SELECTOR=level_zero:0\n");
+        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
     }
 
     TestStats stats;

@@ -208,7 +208,6 @@ int main() {
     fprintf(stderr, "XMX GEMM not enabled at build time; skipping test.\n");
     return 0;
 #else
-    setenv("GGML_SYCL_UNIFIED_CACHE", "1", 1);
     setenv("GGML_SYCL_DMA_SLICE_MB", "1", 1);
     setenv("GGML_SYCL_DMA_BUFFERS", "2", 1);
     setenv("GGML_SYCL_USE_XMX_GEMM", "1", 1);

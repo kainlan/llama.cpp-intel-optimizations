@@ -8,7 +8,7 @@
 #
 # Requirements:
 # - Intel oneAPI environment (source setvars.sh)
-# - Intel Arc GPU (ONEAPI_DEVICE_SELECTOR=level_zero:1)
+# - Intel Arc GPU (ONEAPI_DEVICE_SELECTOR=level_zero:0)
 # - A GGUF model file (default: Mistral-7B)
 #
 # Usage:
@@ -16,10 +16,14 @@
 
 set -e
 
+TEST_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$TEST_DIR/.." && pwd)"
+
 MODEL_PATH="${1:-/Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf}"
 PORT=8099
 SERVER_LOG="/tmp/test_unified_kv_server.log"
 RESULT_DIR="/tmp/test_unified_kv_results"
+DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:0}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -54,6 +58,7 @@ fi
 
 echo "Model: $MODEL_PATH"
 echo "Port: $PORT"
+echo "Selector: $DEVICE_SELECTOR"
 echo ""
 
 # Kill any existing server on this port
@@ -62,7 +67,7 @@ sleep 1
 
 # Start server with unified KV mode
 echo "Starting server with unified KV mode (-kvu)..."
-ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-server \
+ONEAPI_DEVICE_SELECTOR="$DEVICE_SELECTOR" ./build/bin/llama-server \
     -m "$MODEL_PATH" \
     --flash-attn on -kvu --parallel 4 -c 4096 --port $PORT -ngl 99 \
     2>&1 > "$SERVER_LOG" &

@@ -24,6 +24,7 @@
 #include "expert-key.hpp"
 #include "ggml-sycl.h"
 #include "ggml.h"
+#include "mem-handle.hpp"
 #include "unified-cache.hpp"
 
 #include <atomic>
@@ -361,10 +362,10 @@ class ExpertPredictor {
 
     // Pre-allocated device buffer for predict_pregate() GEMV output scores.
     // Avoids sycl::malloc_device/free per call (3 calls per MoE dispatch with 3-layer lookahead).
-    float *                 scores_dev_   = nullptr;
-    int                     scores_dev_n_ = 0;  // Number of floats allocated
-    sycl::queue *           scores_queue_ = nullptr;
-    ggml_sycl::alloc_handle scores_alloc_{};    // Owns the device buffer; unified_free on resize/dtor
+    float *               scores_dev_   = nullptr;
+    int                   scores_dev_n_ = 0;  // Number of floats allocated
+    sycl::queue *         scores_queue_ = nullptr;
+    ggml_sycl::mem_handle scores_handle_{};   // Owns the device buffer; scores_dev_ is a cached ABI view
 
     // Rolling accuracy stats (last ACCURACY_WINDOW predictions).
     static constexpr int ACCURACY_WINDOW = 100;

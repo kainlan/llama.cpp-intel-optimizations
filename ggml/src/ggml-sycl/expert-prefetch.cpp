@@ -11,11 +11,13 @@
 
 #include "common.hpp"
 #include "cpu-dispatch.hpp"   // expert_miss_precision, burst threshold config
+#include "mem-ops.hpp"
 #include "unified-cache.hpp"  // ggml_sycl_is_shutting_down()
 
 #include <algorithm>
 #include <cstdlib>
 #include <numeric>
+#include <utility>
 
 namespace ggml_sycl {
 
@@ -451,11 +453,9 @@ void ExpertPrefetcher::preload_experts(int layer_idx, const std::vector<int> & e
 // ============================================================================
 
 ExpertPredictor::~ExpertPredictor() {
-    // Free pre-allocated device scores buffer via unified_free (handles arena + non-arena).
-    if (scores_alloc_.ptr && !ggml_sycl_is_shutting_down()) {
-        (void) ggml_sycl::unified_free(scores_alloc_);
+    if (!ggml_sycl_is_shutting_down()) {
+        scores_handle_ = {};
     }
-    scores_alloc_ = {};
     scores_dev_   = nullptr;
     scores_dev_n_ = 0;
     scores_queue_ = nullptr;
@@ -794,12 +794,8 @@ std::vector<int> ExpertPredictor::predict_pregate(int           next_layer_idx,
     // This avoids sycl::malloc_device/free per call (3 calls with 3-layer lookahead).
     if (!scores_dev_ || scores_dev_n_ < M) {
         int scores_device = ggml_sycl_get_device_id_from_queue(compute_q);
-        // Free previous allocation (unified_free handles arena + non-arena).
-        if (scores_alloc_.ptr) {
-            (void) ggml_sycl::unified_free(scores_alloc_);
-            scores_alloc_ = {};
-            scores_dev_   = nullptr;
-        }
+        scores_handle_    = {};
+        scores_dev_       = nullptr;
         // Allocate via unified_allocate (tries arena first, falls back to sycl::malloc_device).
         {
             ggml_sycl::alloc_request req{};
@@ -809,8 +805,10 @@ std::vector<int> ExpertPredictor::predict_pregate(int           next_layer_idx,
             req.intent.role                    = ggml_sycl::alloc_role::COMPUTE;
             req.intent.category                = ggml_sycl::runtime_category::COMPUTE;
             req.intent.constraints.must_device = true;
-            if (ggml_sycl::unified_alloc(req, &scores_alloc_) && scores_alloc_.ptr) {
-                scores_dev_ = static_cast<float *>(scores_alloc_.ptr);
+            ggml_sycl::alloc_handle owner{};
+            if (ggml_sycl::unified_alloc(req, &owner) && owner.ptr) {
+                scores_dev_    = static_cast<float *>(owner.ptr);
+                scores_handle_ = ggml_sycl::mem_handle::from_owned_alloc(std::move(owner), GGML_LAYOUT_AOS);
             }
         }
         scores_dev_n_ = M;
@@ -873,7 +871,9 @@ std::vector<int> ExpertPredictor::predict_pregate(int           next_layer_idx,
         });
 
         // D2H copy of scores (tiny: M floats, e.g. 512 bytes for 128 experts)
-        compute_q.memcpy(scores_host.data(), scores_dev, M * sizeof(float), ev).wait();
+        ggml_sycl::mem_handle scores_host_handle = ggml_sycl::mem_handle::from_direct(
+            scores_host.data(), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+        ggml_sycl::mem_copy(scores_host_handle, scores_handle_, M * sizeof(float), compute_q, { ev });
 
     } catch (const sycl::exception & e) {
         GGML_LOG_WARN("[EXPERT-PREDICT] Pre-gate GEMV failed: %s, falling back to heuristic\n", e.what());

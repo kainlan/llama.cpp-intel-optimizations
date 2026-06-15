@@ -10,7 +10,7 @@
 // Run: ./build/bin/test-weight-loading
 //
 // For SYCL GPU tests:
-// ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-weight-loading
+// ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-weight-loading
 
 #include <cassert>
 #include <cstring>

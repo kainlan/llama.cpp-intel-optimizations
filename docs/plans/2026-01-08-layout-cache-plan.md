@@ -135,14 +135,13 @@
 ## Environment Variables
 - `GGML_SYCL_XMX_MOE=1` (enable XMX MoE paths)
 - `GGML_SYCL_XMX_MOE_TILED=1` (enable XMX tiled layout path)
-- `GGML_SYCL_UNIFIED_CACHE=0` (disable unified cache entirely; default is enabled)
 - `GGML_SYCL_UNIFIED_CACHE_MODE={global|per_device|auto}` (cache placement; default is `auto`)
 - `GGML_SYCL_LAYOUT_OVERRIDE={aos|soa|coalesced|xmx_tiled}` (forced layout; debug)
 - `GGML_SYCL_DISABLE_FINALIZE_LAYOUTS=1` (opt-out of eager finalization)
 - (proposed) `GGML_SYCL_LAYOUT_CACHE_STRATEGY={inplace|cache|hybrid}` (locks down Task 0 strategy)
 - (proposed) `GGML_SYCL_LAYOUT_CACHE_STRICT=1` (hard-fail on any layout fallback)
 - (proposed) `GGML_SYCL_LAYOUT_CACHE_LOG=1` (one-time summary of layouts + fallbacks)
-- `GGML_SYCL_WEIGHTS_EVICTABLE=0` (disable host-backed weights; default ON when unified cache is enabled)
+- `GGML_SYCL_WEIGHTS_EVICTABLE=0` (disable host-backed weights; default ON with mandatory unified cache)
 
 ## Command-line Arguments
 - `--unified-cache-pct <0..100>`: percent of *free* VRAM used for SYCL unified cache budget at init (default `90`).

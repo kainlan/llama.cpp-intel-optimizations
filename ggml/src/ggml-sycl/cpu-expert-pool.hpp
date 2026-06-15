@@ -6,6 +6,10 @@
 
 #pragma once
 
+#include "cpu-dispatch.hpp"
+#include "mem-handle.hpp"
+#include "unified-cache.hpp"
+
 #include <atomic>
 #include <condition_variable>
 #include <functional>
@@ -14,9 +18,6 @@
 #include <queue>
 #include <thread>
 #include <vector>
-
-#include "cpu-dispatch.hpp"
-#include "unified-cache.hpp"
 
 namespace ggml_sycl {
 
@@ -30,7 +31,7 @@ namespace ggml_sycl {
 // Ring buffer provides RING_SLOTS pre-allocated staging slots (pinned host
 // memory via unified_alloc) for activation inputs and output buffers.
 class CpuExpertPool {
-public:
+  public:
     CpuExpertPool() = default;
     ~CpuExpertPool();
 
@@ -45,8 +46,7 @@ public:
     //   act_dim:      activation vector dimension (floats)
     //   out_dim:      output vector dimension (floats)
     //   q:            SYCL queue for pinned host allocation
-    void init(int n_threads, size_t max_experts, size_t act_dim, size_t out_dim,
-              sycl::queue & q);
+    void init(int n_threads, size_t max_experts, size_t act_dim, size_t out_dim, sycl::queue & q);
 
     // Shut down all workers and free ring buffer memory.
     void shutdown();
@@ -65,35 +65,37 @@ public:
         float * out     = nullptr;  // Output buffer (pinned host)
         int     slot_id = -1;
     };
+
     StagingSlot acquire_staging();
     void        release_staging(int slot_id);
 
     bool is_active() const { return active_.load(std::memory_order_acquire); }
 
-private:
+  private:
     void worker_thread();
 
-    std::vector<std::thread>              threads_;
-    std::queue<std::function<void()>>     work_queue_;
-    std::mutex                            mutex_;
-    std::condition_variable               cv_;
-    std::atomic<bool>                     active_{false};
-    std::atomic<bool>                     shutting_down_{false};
+    std::vector<std::thread>          threads_;
+    std::queue<std::function<void()>> work_queue_;
+    std::mutex                        mutex_;
+    std::condition_variable           cv_;
+    std::atomic<bool>                 active_{ false };
+    std::atomic<bool>                 shutting_down_{ false };
 
     // Ring buffer for staging memory
     static constexpr int RING_SLOTS = 4;
+
     struct RingEntry {
         float * act    = nullptr;
         float * out    = nullptr;
         bool    in_use = false;
     };
-    RingEntry    ring_[RING_SLOTS] = {};
-    std::mutex   ring_mutex_;
-    size_t       act_stride_   = 0;  // floats per expert activation
-    size_t       out_stride_   = 0;  // floats per expert output
-    size_t       max_experts_  = 0;
-    // Use .as_mem_handle() for read/resolve access; unified_free(alloc_handle) for ownership
-    alloc_handle ring_alloc_;        // Single unified_alloc for all ring buffers
+
+    RingEntry  ring_[RING_SLOTS] = {};
+    std::mutex ring_mutex_;
+    size_t     act_stride_  = 0;  // floats per expert activation
+    size_t     out_stride_  = 0;  // floats per expert output
+    size_t     max_experts_ = 0;
+    mem_handle ring_handle_;      // Single unified_alloc-backed owner for all ring buffers
 };
 
 }  // namespace ggml_sycl

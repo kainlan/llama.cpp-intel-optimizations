@@ -1,6 +1,6 @@
 // Probe SYCL pinned host allocation limits and report device capabilities as JSON.
 // Usage:
-//   ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-pinned-probe --json --max-mb 4096
+//   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-pinned-probe --json --max-mb 4096
 
 #include <sycl/sycl.hpp>
 

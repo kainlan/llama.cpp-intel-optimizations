@@ -1,12 +1,48 @@
 #include "cpy.hpp"
 
-#include <float.h>
-
 #include "dequantize.hpp"
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/presets.hpp"
 #include "ggml.h"
 
+#include <float.h>
+
+#include <utility>
+
+static bool ggml_sycl_cpy_alloc_host_stage(size_t                  bytes,
+                                           sycl::queue &           queue,
+                                           int                     device,
+                                           const char *            cohort_id,
+                                           ggml_sycl::mem_handle & owner) {
+    owner = {};
+    if (bytes == 0) {
+        return true;
+    }
+
+    ggml_sycl::alloc_request req{};
+    req.queue                                    = &queue;
+    req.device                                   = device;
+    req.size                                     = bytes;
+    req.intent.role                              = ggml_sycl::alloc_role::EXPERT_STAGING;
+    req.intent.category                          = ggml_sycl::runtime_category::STAGING;
+    req.intent.cohort_id                         = cohort_id;
+    req.intent.constraints.must_host_pinned      = true;
+    req.intent.constraints.use_pinned_pool       = true;
+    req.intent.constraints.require_host_usm_base = true;
+    req.suppress_failure_log                     = true;
+
+    owner = ggml_sycl::unified_allocate(req);
+    if (!owner.valid()) {
+        return false;
+    }
+
+    auto resolved = owner.resolve(device);
+    if (!resolved || !resolved.ptr || resolved.on_device) {
+        owner = {};
+        return false;
+    }
+    return true;
+}
 
 static void cpy_1_f32_f32(const char * cxi, char * cdsti) {
     const float * xi   = (const float *) cxi;
@@ -65,15 +101,15 @@ static void cpy_1_i32_f32(const char * cxi, char * cdsti) {
 }
 
 static void cpy_1_f32_bf16(const char * cxi, char * cdsti) {
-    const float *                   xi   = (const float *) cxi;
-    sycl::ext::oneapi::bfloat16 *   dsti = (sycl::ext::oneapi::bfloat16 *) cdsti;
+    const float *                 xi   = (const float *) cxi;
+    sycl::ext::oneapi::bfloat16 * dsti = (sycl::ext::oneapi::bfloat16 *) cdsti;
 
     *dsti = sycl::ext::oneapi::bfloat16(*xi);
 }
 
 static void cpy_1_f16_bf16(const char * cxi, char * cdsti) {
-    const sycl::half *              xi   = (const sycl::half *) cxi;
-    sycl::ext::oneapi::bfloat16 *   dsti = (sycl::ext::oneapi::bfloat16 *) cdsti;
+    const sycl::half *            xi   = (const sycl::half *) cxi;
+    sycl::ext::oneapi::bfloat16 * dsti = (sycl::ext::oneapi::bfloat16 *) cdsti;
 
     *dsti = sycl::ext::oneapi::bfloat16(static_cast<float>(*xi));
 }
@@ -100,9 +136,23 @@ static void cpy_1_bf16_f32(const char * cxi, char * cdsti) {
 }
 
 template <cpy_kernel_t cpy_1>
-static void cpy_f32_f16(const char * cx, char * cdst, const int ne, const int ne00, const int ne01, const int ne02,
-                        const int nb00, const int nb01, const int nb02, const int nb03, const int ne10, const int ne11,
-                        const int ne12, const int nb10, const int nb11, const int nb12, const int nb13,
+static void cpy_f32_f16(const char *             cx,
+                        char *                   cdst,
+                        const int                ne,
+                        const int                ne00,
+                        const int                ne01,
+                        const int                ne02,
+                        const int                nb00,
+                        const int                nb01,
+                        const int                nb02,
+                        const int                nb03,
+                        const int                ne10,
+                        const int                ne11,
+                        const int                ne12,
+                        const int                nb10,
+                        const int                nb11,
+                        const int                nb12,
+                        const int                nb13,
                         const sycl::nd_item<3> & item_ct1) {
     const int i = item_ct1.get_local_range(2) * item_ct1.get_group(2) + item_ct1.get_local_id(2);
 
@@ -127,15 +177,12 @@ static void cpy_f32_f16(const char * cx, char * cdst, const int ne, const int ne
     cpy_1(cx + x_offset, cdst + dst_offset);
 }
 
-
 /* quantized type same copy */
-template<typename T>
-static void cpy_blck_q_q(const char * cxi, char * cdsti) {
-    const T * xi = (const T *) cxi;
-    T * dsti = (T *) cdsti;
-    *dsti = *xi;
+template <typename T> static void cpy_blck_q_q(const char * cxi, char * cdsti) {
+    const T * xi   = (const T *) cxi;
+    T *       dsti = (T *) cdsti;
+    *dsti          = *xi;
 }
-
 
 static void cpy_blck_q8_0_f32(const char * cxi, char * cdsti) {
     float * cdstf = (float *) (cdsti);
@@ -148,8 +195,6 @@ static void cpy_blck_q8_0_f32(const char * cxi, char * cdsti) {
     }
 }
 
-
-
 template <dequantize_kernel_t dequant, int qk> static void cpy_blck_q_f32(const char * cxi, char * cdsti) {
     float * cdstf = (float *) (cdsti);
 
@@ -161,12 +206,25 @@ template <dequantize_kernel_t dequant, int qk> static void cpy_blck_q_f32(const 
     }
 }
 
-
 template <typename T, int qk>
-static void cpy_q_q(const char * cx, char * cdst, const int ne, const int ne00, const int ne01, const int ne02,
-                      const int nb00, const int nb01, const int nb02, const int nb03, const int ne10, const int ne11,
-                      const int ne12, const int nb10, const int nb11, const int nb12, const int nb13,
-                      const sycl::nd_item<3> & item_ct1) {
+static void cpy_q_q(const char *             cx,
+                    char *                   cdst,
+                    const int                ne,
+                    const int                ne00,
+                    const int                ne01,
+                    const int                ne02,
+                    const int                nb00,
+                    const int                nb01,
+                    const int                nb02,
+                    const int                nb03,
+                    const int                ne10,
+                    const int                ne11,
+                    const int                ne12,
+                    const int                nb10,
+                    const int                nb11,
+                    const int                nb12,
+                    const int                nb13,
+                    const sycl::nd_item<3> & item_ct1) {
     const int i = (item_ct1.get_local_range(2) * item_ct1.get_group(2) + item_ct1.get_local_id(2)) * qk;
 
     if (i >= ne) {
@@ -179,7 +237,6 @@ static void cpy_q_q(const char * cx, char * cdst, const int ne, const int ne00, 
     const int i00      = i - i03 * ne00 * ne01 * ne02 - i02 * ne01 * ne00 - i01 * ne00;
     const int x_offset = (i00 / qk) * nb00 + i01 * nb01 + i02 * nb02 + i03 * nb03;
 
-
     const int i13        = i / (ne10 * ne11 * ne12);
     const int i12        = (i - i13 * ne10 * ne11 * ne12) / (ne10 * ne11);
     const int i11        = (i - i13 * ne10 * ne11 * ne12 - i12 * ne10 * ne11) / ne10;
@@ -190,16 +247,29 @@ static void cpy_q_q(const char * cx, char * cdst, const int ne, const int ne00, 
 }
 
 template <cpy_kernel_t cpy_blck, int qk>
-static void cpy_f32_q(const char * cx, char * cdst, const int ne, const int ne00, const int ne01, const int ne02,
-                      const int nb00, const int nb01, const int nb02, const int nb03, const int ne10, const int ne11,
-                      const int ne12, const int nb10, const int nb11, const int nb12, const int nb13,
+static void cpy_f32_q(const char *             cx,
+                      char *                   cdst,
+                      const int                ne,
+                      const int                ne00,
+                      const int                ne01,
+                      const int                ne02,
+                      const int                nb00,
+                      const int                nb01,
+                      const int                nb02,
+                      const int                nb03,
+                      const int                ne10,
+                      const int                ne11,
+                      const int                ne12,
+                      const int                nb10,
+                      const int                nb11,
+                      const int                nb12,
+                      const int                nb13,
                       const sycl::nd_item<3> & item_ct1) {
     const int i = (item_ct1.get_local_range(2) * item_ct1.get_group(2) + item_ct1.get_local_id(2)) * qk;
 
     if (i >= ne) {
         return;
     }
-
 
     const int i03      = i / (ne00 * ne01 * ne02);
     const int i02      = (i - i03 * ne00 * ne01 * ne02) / (ne00 * ne01);
@@ -217,9 +287,23 @@ static void cpy_f32_q(const char * cx, char * cdst, const int ne, const int ne00
 }
 
 template <cpy_kernel_t cpy_blck, int qk>
-static void cpy_q_f32(const char * cx, char * cdst, const int ne, const int ne00, const int ne01, const int ne02,
-                      const int nb00, const int nb01, const int nb02, const int nb03, const int ne10, const int ne11,
-                      const int ne12, const int nb10, const int nb11, const int nb12, const int nb13,
+static void cpy_q_f32(const char *             cx,
+                      char *                   cdst,
+                      const int                ne,
+                      const int                ne00,
+                      const int                ne01,
+                      const int                ne02,
+                      const int                nb00,
+                      const int                nb01,
+                      const int                nb02,
+                      const int                nb03,
+                      const int                ne10,
+                      const int                ne11,
+                      const int                ne12,
+                      const int                nb10,
+                      const int                nb11,
+                      const int                nb12,
+                      const int                nb13,
                       const sycl::nd_item<3> & item_ct1) {
     const int i = (item_ct1.get_local_range(2) * item_ct1.get_group(2) + item_ct1.get_local_id(2)) * qk;
 
@@ -242,10 +326,24 @@ static void cpy_q_f32(const char * cx, char * cdst, const int ne, const int ne00
     cpy_blck(cx + x_offset, cdst + dst_offset);
 }
 
-static void ggml_cpy_f16_f32_sycl(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
-                                  const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
-                                  const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                                  const int nb12, const int nb13, queue_ptr stream) {
+static void ggml_cpy_f16_f32_sycl(const char * cx,
+                                  char *       cdst,
+                                  const int    ne,
+                                  const int    ne00,
+                                  const int    ne01,
+                                  const int    ne02,
+                                  const int    nb00,
+                                  const int    nb01,
+                                  const int    nb02,
+                                  const int    nb03,
+                                  const int    ne10,
+                                  const int    ne11,
+                                  const int    ne12,
+                                  const int    nb10,
+                                  const int    nb11,
+                                  const int    nb12,
+                                  const int    nb13,
+                                  queue_ptr    stream) {
     const int num_blocks = (ne + SYCL_CPY_BLOCK_SIZE - 1) / SYCL_CPY_BLOCK_SIZE;
     {
         dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
@@ -260,10 +358,24 @@ static void ggml_cpy_f16_f32_sycl(const char * cx, char * cdst, const int ne, co
     }
 }
 
-static void ggml_cpy_f32_f32_sycl(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
-                                  const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
-                                  const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                                  const int nb12, const int nb13, queue_ptr stream) {
+static void ggml_cpy_f32_f32_sycl(const char * cx,
+                                  char *       cdst,
+                                  const int    ne,
+                                  const int    ne00,
+                                  const int    ne01,
+                                  const int    ne02,
+                                  const int    nb00,
+                                  const int    nb01,
+                                  const int    nb02,
+                                  const int    nb03,
+                                  const int    ne10,
+                                  const int    ne11,
+                                  const int    ne12,
+                                  const int    nb10,
+                                  const int    nb11,
+                                  const int    nb12,
+                                  const int    nb13,
+                                  queue_ptr    stream) {
     const int num_blocks = (ne + SYCL_CPY_BLOCK_SIZE - 1) / SYCL_CPY_BLOCK_SIZE;
     {
         dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
@@ -278,10 +390,24 @@ static void ggml_cpy_f32_f32_sycl(const char * cx, char * cdst, const int ne, co
     }
 }
 
-static void ggml_cpy_f32_f16_sycl(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
-                                  const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
-                                  const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                                  const int nb12, const int nb13, queue_ptr stream) {
+static void ggml_cpy_f32_f16_sycl(const char * cx,
+                                  char *       cdst,
+                                  const int    ne,
+                                  const int    ne00,
+                                  const int    ne01,
+                                  const int    ne02,
+                                  const int    nb00,
+                                  const int    nb01,
+                                  const int    nb02,
+                                  const int    nb03,
+                                  const int    ne10,
+                                  const int    ne11,
+                                  const int    ne12,
+                                  const int    nb10,
+                                  const int    nb11,
+                                  const int    nb12,
+                                  const int    nb13,
+                                  queue_ptr    stream) {
     const int num_blocks = (ne + SYCL_CPY_BLOCK_SIZE - 1) / SYCL_CPY_BLOCK_SIZE;
     {
         dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
@@ -296,10 +422,24 @@ static void ggml_cpy_f32_f16_sycl(const char * cx, char * cdst, const int ne, co
     }
 }
 
-static void ggml_cpy_f32_q8_0_sycl(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
-                                   const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
-                                   const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                                   const int nb12, const int nb13, queue_ptr stream) {
+static void ggml_cpy_f32_q8_0_sycl(const char * cx,
+                                   char *       cdst,
+                                   const int    ne,
+                                   const int    ne00,
+                                   const int    ne01,
+                                   const int    ne02,
+                                   const int    nb00,
+                                   const int    nb01,
+                                   const int    nb02,
+                                   const int    nb03,
+                                   const int    ne10,
+                                   const int    ne11,
+                                   const int    ne12,
+                                   const int    nb10,
+                                   const int    nb11,
+                                   const int    nb12,
+                                   const int    nb13,
+                                   queue_ptr    stream) {
     GGML_ASSERT(ne % QK8_0 == 0);
     const int num_blocks = ne / QK8_0;
     stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks), sycl::range<3>(1, 1, 1)),
@@ -309,10 +449,24 @@ static void ggml_cpy_f32_q8_0_sycl(const char * cx, char * cdst, const int ne, c
                          });
 }
 
-static void ggml_cpy_q8_0_f32_sycl(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
-                                   const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
-                                   const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                                   const int nb12, const int nb13, queue_ptr stream) {
+static void ggml_cpy_q8_0_f32_sycl(const char * cx,
+                                   char *       cdst,
+                                   const int    ne,
+                                   const int    ne00,
+                                   const int    ne01,
+                                   const int    ne02,
+                                   const int    nb00,
+                                   const int    nb01,
+                                   const int    nb02,
+                                   const int    nb03,
+                                   const int    ne10,
+                                   const int    ne11,
+                                   const int    ne12,
+                                   const int    nb10,
+                                   const int    nb11,
+                                   const int    nb12,
+                                   const int    nb13,
+                                   queue_ptr    stream) {
     const int num_blocks = ne;
     stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks), sycl::range<3>(1, 1, 1)),
                          [=](sycl::nd_item<3> item_ct1) {
@@ -321,10 +475,24 @@ static void ggml_cpy_q8_0_f32_sycl(const char * cx, char * cdst, const int ne, c
                          });
 }
 
-static void ggml_cpy_f32_q4_0_sycl(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
-                                   const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
-                                   const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                                   const int nb12, const int nb13, queue_ptr stream) {
+static void ggml_cpy_f32_q4_0_sycl(const char * cx,
+                                   char *       cdst,
+                                   const int    ne,
+                                   const int    ne00,
+                                   const int    ne01,
+                                   const int    ne02,
+                                   const int    nb00,
+                                   const int    nb01,
+                                   const int    nb02,
+                                   const int    nb03,
+                                   const int    ne10,
+                                   const int    ne11,
+                                   const int    ne12,
+                                   const int    nb10,
+                                   const int    nb11,
+                                   const int    nb12,
+                                   const int    nb13,
+                                   queue_ptr    stream) {
     GGML_ASSERT(ne % QK4_0 == 0);
     const int num_blocks = ne / QK4_0;
     stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks), sycl::range<3>(1, 1, 1)),
@@ -334,10 +502,24 @@ static void ggml_cpy_f32_q4_0_sycl(const char * cx, char * cdst, const int ne, c
                          });
 }
 
-static void ggml_cpy_q4_0_f32_sycl(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
-                                   const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
-                                   const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                                   const int nb12, const int nb13, queue_ptr stream) {
+static void ggml_cpy_q4_0_f32_sycl(const char * cx,
+                                   char *       cdst,
+                                   const int    ne,
+                                   const int    ne00,
+                                   const int    ne01,
+                                   const int    ne02,
+                                   const int    nb00,
+                                   const int    nb01,
+                                   const int    nb02,
+                                   const int    nb03,
+                                   const int    ne10,
+                                   const int    ne11,
+                                   const int    ne12,
+                                   const int    nb10,
+                                   const int    nb11,
+                                   const int    nb12,
+                                   const int    nb13,
+                                   queue_ptr    stream) {
     const int num_blocks = ne;
     stream->parallel_for(
         sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks), sycl::range<3>(1, 1, 1)), [=](sycl::nd_item<3> item_ct1) {
@@ -347,10 +529,24 @@ static void ggml_cpy_q4_0_f32_sycl(const char * cx, char * cdst, const int ne, c
         });
 }
 
-static void ggml_cpy_f32_q4_1_sycl(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
-                                   const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
-                                   const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                                   const int nb12, const int nb13, queue_ptr stream) {
+static void ggml_cpy_f32_q4_1_sycl(const char * cx,
+                                   char *       cdst,
+                                   const int    ne,
+                                   const int    ne00,
+                                   const int    ne01,
+                                   const int    ne02,
+                                   const int    nb00,
+                                   const int    nb01,
+                                   const int    nb02,
+                                   const int    nb03,
+                                   const int    ne10,
+                                   const int    ne11,
+                                   const int    ne12,
+                                   const int    nb10,
+                                   const int    nb11,
+                                   const int    nb12,
+                                   const int    nb13,
+                                   queue_ptr    stream) {
     GGML_ASSERT(ne % QK4_1 == 0);
     const int num_blocks = ne / QK4_1;
     stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks), sycl::range<3>(1, 1, 1)),
@@ -360,10 +556,24 @@ static void ggml_cpy_f32_q4_1_sycl(const char * cx, char * cdst, const int ne, c
                          });
 }
 
-static void ggml_cpy_q4_1_f32_sycl(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
-                                   const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
-                                   const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                                   const int nb12, const int nb13, queue_ptr stream) {
+static void ggml_cpy_q4_1_f32_sycl(const char * cx,
+                                   char *       cdst,
+                                   const int    ne,
+                                   const int    ne00,
+                                   const int    ne01,
+                                   const int    ne02,
+                                   const int    nb00,
+                                   const int    nb01,
+                                   const int    nb02,
+                                   const int    nb03,
+                                   const int    ne10,
+                                   const int    ne11,
+                                   const int    ne12,
+                                   const int    nb10,
+                                   const int    nb11,
+                                   const int    nb12,
+                                   const int    nb13,
+                                   queue_ptr    stream) {
     const int num_blocks = ne;
     stream->parallel_for(
         sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks), sycl::range<3>(1, 1, 1)), [=](sycl::nd_item<3> item_ct1) {
@@ -373,10 +583,24 @@ static void ggml_cpy_q4_1_f32_sycl(const char * cx, char * cdst, const int ne, c
         });
 }
 
-static void ggml_cpy_f32_q5_0_sycl(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
-                                   const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
-                                   const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                                   const int nb12, const int nb13, queue_ptr stream) {
+static void ggml_cpy_f32_q5_0_sycl(const char * cx,
+                                   char *       cdst,
+                                   const int    ne,
+                                   const int    ne00,
+                                   const int    ne01,
+                                   const int    ne02,
+                                   const int    nb00,
+                                   const int    nb01,
+                                   const int    nb02,
+                                   const int    nb03,
+                                   const int    ne10,
+                                   const int    ne11,
+                                   const int    ne12,
+                                   const int    nb10,
+                                   const int    nb11,
+                                   const int    nb12,
+                                   const int    nb13,
+                                   queue_ptr    stream) {
     GGML_ASSERT(ne % QK5_0 == 0);
     const int num_blocks = ne / QK5_0;
     stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks), sycl::range<3>(1, 1, 1)),
@@ -386,10 +610,24 @@ static void ggml_cpy_f32_q5_0_sycl(const char * cx, char * cdst, const int ne, c
                          });
 }
 
-static void ggml_cpy_q5_0_f32_sycl(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
-                                   const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
-                                   const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                                   const int nb12, const int nb13, queue_ptr stream) {
+static void ggml_cpy_q5_0_f32_sycl(const char * cx,
+                                   char *       cdst,
+                                   const int    ne,
+                                   const int    ne00,
+                                   const int    ne01,
+                                   const int    ne02,
+                                   const int    nb00,
+                                   const int    nb01,
+                                   const int    nb02,
+                                   const int    nb03,
+                                   const int    ne10,
+                                   const int    ne11,
+                                   const int    ne12,
+                                   const int    nb10,
+                                   const int    nb11,
+                                   const int    nb12,
+                                   const int    nb13,
+                                   queue_ptr    stream) {
     const int num_blocks = ne;
     stream->parallel_for(
         sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks), sycl::range<3>(1, 1, 1)), [=](sycl::nd_item<3> item_ct1) {
@@ -399,10 +637,24 @@ static void ggml_cpy_q5_0_f32_sycl(const char * cx, char * cdst, const int ne, c
         });
 }
 
-static void ggml_cpy_f32_q5_1_sycl(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
-                                   const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
-                                   const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                                   const int nb12, const int nb13, queue_ptr stream) {
+static void ggml_cpy_f32_q5_1_sycl(const char * cx,
+                                   char *       cdst,
+                                   const int    ne,
+                                   const int    ne00,
+                                   const int    ne01,
+                                   const int    ne02,
+                                   const int    nb00,
+                                   const int    nb01,
+                                   const int    nb02,
+                                   const int    nb03,
+                                   const int    ne10,
+                                   const int    ne11,
+                                   const int    ne12,
+                                   const int    nb10,
+                                   const int    nb11,
+                                   const int    nb12,
+                                   const int    nb13,
+                                   queue_ptr    stream) {
     GGML_ASSERT(ne % QK5_1 == 0);
     const int num_blocks = ne / QK5_1;
     stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks), sycl::range<3>(1, 1, 1)),
@@ -412,10 +664,24 @@ static void ggml_cpy_f32_q5_1_sycl(const char * cx, char * cdst, const int ne, c
                          });
 }
 
-static void ggml_cpy_q5_1_f32_sycl(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
-                                   const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
-                                   const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                                   const int nb12, const int nb13, queue_ptr stream) {
+static void ggml_cpy_q5_1_f32_sycl(const char * cx,
+                                   char *       cdst,
+                                   const int    ne,
+                                   const int    ne00,
+                                   const int    ne01,
+                                   const int    ne02,
+                                   const int    nb00,
+                                   const int    nb01,
+                                   const int    nb02,
+                                   const int    nb03,
+                                   const int    ne10,
+                                   const int    ne11,
+                                   const int    ne12,
+                                   const int    nb10,
+                                   const int    nb11,
+                                   const int    nb12,
+                                   const int    nb13,
+                                   queue_ptr    stream) {
     const int num_blocks = ne;
     stream->parallel_for(
         sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks), sycl::range<3>(1, 1, 1)), [=](sycl::nd_item<3> item_ct1) {
@@ -425,10 +691,24 @@ static void ggml_cpy_q5_1_f32_sycl(const char * cx, char * cdst, const int ne, c
         });
 }
 
-static void ggml_cpy_f32_iq4_nl_sycl(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
-                                     const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
-                                     const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                                     const int nb12, const int nb13, queue_ptr stream) {
+static void ggml_cpy_f32_iq4_nl_sycl(const char * cx,
+                                     char *       cdst,
+                                     const int    ne,
+                                     const int    ne00,
+                                     const int    ne01,
+                                     const int    ne02,
+                                     const int    nb00,
+                                     const int    nb01,
+                                     const int    nb02,
+                                     const int    nb03,
+                                     const int    ne10,
+                                     const int    ne11,
+                                     const int    ne12,
+                                     const int    nb10,
+                                     const int    nb11,
+                                     const int    nb12,
+                                     const int    nb13,
+                                     queue_ptr    stream) {
     GGML_ASSERT(ne % QK4_NL == 0);
     const int num_blocks = ne / QK4_NL;
     stream->parallel_for(
@@ -438,10 +718,24 @@ static void ggml_cpy_f32_iq4_nl_sycl(const char * cx, char * cdst, const int ne,
         });
 }
 
-static void ggml_cpy_f16_f16_sycl(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
-                                  const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
-                                  const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                                  const int nb12, const int nb13, queue_ptr stream) {
+static void ggml_cpy_f16_f16_sycl(const char * cx,
+                                  char *       cdst,
+                                  const int    ne,
+                                  const int    ne00,
+                                  const int    ne01,
+                                  const int    ne02,
+                                  const int    nb00,
+                                  const int    nb01,
+                                  const int    nb02,
+                                  const int    nb03,
+                                  const int    ne10,
+                                  const int    ne11,
+                                  const int    ne12,
+                                  const int    nb10,
+                                  const int    nb11,
+                                  const int    nb12,
+                                  const int    nb13,
+                                  queue_ptr    stream) {
     const int num_blocks = (ne + SYCL_CPY_BLOCK_SIZE - 1) / SYCL_CPY_BLOCK_SIZE;
     {
         dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
@@ -456,10 +750,24 @@ static void ggml_cpy_f16_f16_sycl(const char * cx, char * cdst, const int ne, co
     }
 }
 
-static void ggml_cpy_i16_i16_sycl(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
-                                  const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
-                                  const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                                  const int nb12, const int nb13, queue_ptr stream) {
+static void ggml_cpy_i16_i16_sycl(const char * cx,
+                                  char *       cdst,
+                                  const int    ne,
+                                  const int    ne00,
+                                  const int    ne01,
+                                  const int    ne02,
+                                  const int    nb00,
+                                  const int    nb01,
+                                  const int    nb02,
+                                  const int    nb03,
+                                  const int    ne10,
+                                  const int    ne11,
+                                  const int    ne12,
+                                  const int    nb10,
+                                  const int    nb11,
+                                  const int    nb12,
+                                  const int    nb13,
+                                  queue_ptr    stream) {
     const int num_blocks = (ne + SYCL_CPY_BLOCK_SIZE - 1) / SYCL_CPY_BLOCK_SIZE;
     {
         // dpct::has_capability_or_fail(stream->get_device(),
@@ -475,10 +783,24 @@ static void ggml_cpy_i16_i16_sycl(const char * cx, char * cdst, const int ne, co
     }
 }
 
-static void ggml_cpy_i32_i32_sycl(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
-                                  const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
-                                  const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                                  const int nb12, const int nb13, queue_ptr stream) {
+static void ggml_cpy_i32_i32_sycl(const char * cx,
+                                  char *       cdst,
+                                  const int    ne,
+                                  const int    ne00,
+                                  const int    ne01,
+                                  const int    ne02,
+                                  const int    nb00,
+                                  const int    nb01,
+                                  const int    nb02,
+                                  const int    nb03,
+                                  const int    ne10,
+                                  const int    ne11,
+                                  const int    ne12,
+                                  const int    nb10,
+                                  const int    nb11,
+                                  const int    nb12,
+                                  const int    nb13,
+                                  queue_ptr    stream) {
     const int num_blocks = (ne + SYCL_CPY_BLOCK_SIZE - 1) / SYCL_CPY_BLOCK_SIZE;
     {
         // dpct::has_capability_or_fail(stream->get_device(),
@@ -494,168 +816,331 @@ static void ggml_cpy_i32_i32_sycl(const char * cx, char * cdst, const int ne, co
     }
 }
 
-static void ggml_cpy_f32_i32_sycl(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
-                                  const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
-                                  const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                                  const int nb12, const int nb13, queue_ptr stream) {
+static void ggml_cpy_f32_i32_sycl(const char * cx,
+                                  char *       cdst,
+                                  const int    ne,
+                                  const int    ne00,
+                                  const int    ne01,
+                                  const int    ne02,
+                                  const int    nb00,
+                                  const int    nb01,
+                                  const int    nb02,
+                                  const int    nb03,
+                                  const int    ne10,
+                                  const int    ne11,
+                                  const int    ne12,
+                                  const int    nb10,
+                                  const int    nb11,
+                                  const int    nb12,
+                                  const int    nb13,
+                                  queue_ptr    stream) {
     const int num_blocks = (ne + SYCL_CPY_BLOCK_SIZE - 1) / SYCL_CPY_BLOCK_SIZE;
-    stream->parallel_for(
-        sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
-                          sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
-        [=](sycl::nd_item<3> item_ct1) {
-            cpy_f32_f16<cpy_1_f32_i32>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12,
-                                       nb10, nb11, nb12, nb13, item_ct1);
-        });
+    stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
+                                           sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
+                         [=](sycl::nd_item<3> item_ct1) {
+                             cpy_f32_f16<cpy_1_f32_i32>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10,
+                                                        ne11, ne12, nb10, nb11, nb12, nb13, item_ct1);
+                         });
 }
 
-static void ggml_cpy_i32_f32_sycl(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
-                                  const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
-                                  const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                                  const int nb12, const int nb13, queue_ptr stream) {
+static void ggml_cpy_i32_f32_sycl(const char * cx,
+                                  char *       cdst,
+                                  const int    ne,
+                                  const int    ne00,
+                                  const int    ne01,
+                                  const int    ne02,
+                                  const int    nb00,
+                                  const int    nb01,
+                                  const int    nb02,
+                                  const int    nb03,
+                                  const int    ne10,
+                                  const int    ne11,
+                                  const int    ne12,
+                                  const int    nb10,
+                                  const int    nb11,
+                                  const int    nb12,
+                                  const int    nb13,
+                                  queue_ptr    stream) {
     const int num_blocks = (ne + SYCL_CPY_BLOCK_SIZE - 1) / SYCL_CPY_BLOCK_SIZE;
-    stream->parallel_for(
-        sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
-                          sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
-        [=](sycl::nd_item<3> item_ct1) {
-            cpy_f32_f16<cpy_1_i32_f32>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12,
-                                       nb10, nb11, nb12, nb13, item_ct1);
-        });
+    stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
+                                           sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
+                         [=](sycl::nd_item<3> item_ct1) {
+                             cpy_f32_f16<cpy_1_i32_f32>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10,
+                                                        ne11, ne12, nb10, nb11, nb12, nb13, item_ct1);
+                         });
 }
 
-static void ggml_cpy_f32_bf16_sycl(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
-                                   const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
-                                   const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                                   const int nb12, const int nb13, queue_ptr stream) {
+static void ggml_cpy_f32_bf16_sycl(const char * cx,
+                                   char *       cdst,
+                                   const int    ne,
+                                   const int    ne00,
+                                   const int    ne01,
+                                   const int    ne02,
+                                   const int    nb00,
+                                   const int    nb01,
+                                   const int    nb02,
+                                   const int    nb03,
+                                   const int    ne10,
+                                   const int    ne11,
+                                   const int    ne12,
+                                   const int    nb10,
+                                   const int    nb11,
+                                   const int    nb12,
+                                   const int    nb13,
+                                   queue_ptr    stream) {
     const int num_blocks = (ne + SYCL_CPY_BLOCK_SIZE - 1) / SYCL_CPY_BLOCK_SIZE;
-    stream->parallel_for(
-        sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
-                          sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
-        [=](sycl::nd_item<3> item_ct1) {
-            cpy_f32_f16<cpy_1_f32_bf16>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12,
-                                        nb10, nb11, nb12, nb13, item_ct1);
-        });
+    stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
+                                           sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
+                         [=](sycl::nd_item<3> item_ct1) {
+                             cpy_f32_f16<cpy_1_f32_bf16>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10,
+                                                         ne11, ne12, nb10, nb11, nb12, nb13, item_ct1);
+                         });
 }
 
-static void ggml_cpy_f16_bf16_sycl(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
-                                   const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
-                                   const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                                   const int nb12, const int nb13, queue_ptr stream) {
+static void ggml_cpy_f16_bf16_sycl(const char * cx,
+                                   char *       cdst,
+                                   const int    ne,
+                                   const int    ne00,
+                                   const int    ne01,
+                                   const int    ne02,
+                                   const int    nb00,
+                                   const int    nb01,
+                                   const int    nb02,
+                                   const int    nb03,
+                                   const int    ne10,
+                                   const int    ne11,
+                                   const int    ne12,
+                                   const int    nb10,
+                                   const int    nb11,
+                                   const int    nb12,
+                                   const int    nb13,
+                                   queue_ptr    stream) {
     const int num_blocks = (ne + SYCL_CPY_BLOCK_SIZE - 1) / SYCL_CPY_BLOCK_SIZE;
     dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
-    stream->parallel_for(
-        sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
-                          sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
-        [=](sycl::nd_item<3> item_ct1) {
-            cpy_f32_f16<cpy_1_f16_bf16>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12,
-                                        nb10, nb11, nb12, nb13, item_ct1);
-        });
+    stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
+                                           sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
+                         [=](sycl::nd_item<3> item_ct1) {
+                             cpy_f32_f16<cpy_1_f16_bf16>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10,
+                                                         ne11, ne12, nb10, nb11, nb12, nb13, item_ct1);
+                         });
 }
 
-static void ggml_cpy_bf16_bf16_sycl(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
-                                    const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
-                                    const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                                    const int nb12, const int nb13, queue_ptr stream) {
+static void ggml_cpy_bf16_bf16_sycl(const char * cx,
+                                    char *       cdst,
+                                    const int    ne,
+                                    const int    ne00,
+                                    const int    ne01,
+                                    const int    ne02,
+                                    const int    nb00,
+                                    const int    nb01,
+                                    const int    nb02,
+                                    const int    nb03,
+                                    const int    ne10,
+                                    const int    ne11,
+                                    const int    ne12,
+                                    const int    nb10,
+                                    const int    nb11,
+                                    const int    nb12,
+                                    const int    nb13,
+                                    queue_ptr    stream) {
     const int num_blocks = (ne + SYCL_CPY_BLOCK_SIZE - 1) / SYCL_CPY_BLOCK_SIZE;
-    stream->parallel_for(
-        sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
-                          sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
-        [=](sycl::nd_item<3> item_ct1) {
-            cpy_f32_f16<cpy_1_bf16_bf16>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12,
-                                         nb10, nb11, nb12, nb13, item_ct1);
-        });
+    stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
+                                           sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
+                         [=](sycl::nd_item<3> item_ct1) {
+                             cpy_f32_f16<cpy_1_bf16_bf16>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10,
+                                                          ne11, ne12, nb10, nb11, nb12, nb13, item_ct1);
+                         });
 }
 
-static void ggml_cpy_bf16_f16_sycl(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
-                                   const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
-                                   const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                                   const int nb12, const int nb13, queue_ptr stream) {
+static void ggml_cpy_bf16_f16_sycl(const char * cx,
+                                   char *       cdst,
+                                   const int    ne,
+                                   const int    ne00,
+                                   const int    ne01,
+                                   const int    ne02,
+                                   const int    nb00,
+                                   const int    nb01,
+                                   const int    nb02,
+                                   const int    nb03,
+                                   const int    ne10,
+                                   const int    ne11,
+                                   const int    ne12,
+                                   const int    nb10,
+                                   const int    nb11,
+                                   const int    nb12,
+                                   const int    nb13,
+                                   queue_ptr    stream) {
     const int num_blocks = (ne + SYCL_CPY_BLOCK_SIZE - 1) / SYCL_CPY_BLOCK_SIZE;
     dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
-    stream->parallel_for(
-        sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
-                          sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
-        [=](sycl::nd_item<3> item_ct1) {
-            cpy_f32_f16<cpy_1_bf16_f16>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12,
-                                        nb10, nb11, nb12, nb13, item_ct1);
-        });
+    stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
+                                           sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
+                         [=](sycl::nd_item<3> item_ct1) {
+                             cpy_f32_f16<cpy_1_bf16_f16>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10,
+                                                         ne11, ne12, nb10, nb11, nb12, nb13, item_ct1);
+                         });
 }
 
-static void ggml_cpy_bf16_f32_sycl(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
-                                   const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
-                                   const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                                   const int nb12, const int nb13, queue_ptr stream) {
+static void ggml_cpy_bf16_f32_sycl(const char * cx,
+                                   char *       cdst,
+                                   const int    ne,
+                                   const int    ne00,
+                                   const int    ne01,
+                                   const int    ne02,
+                                   const int    nb00,
+                                   const int    nb01,
+                                   const int    nb02,
+                                   const int    nb03,
+                                   const int    ne10,
+                                   const int    ne11,
+                                   const int    ne12,
+                                   const int    nb10,
+                                   const int    nb11,
+                                   const int    nb12,
+                                   const int    nb13,
+                                   queue_ptr    stream) {
     const int num_blocks = (ne + SYCL_CPY_BLOCK_SIZE - 1) / SYCL_CPY_BLOCK_SIZE;
-    stream->parallel_for(
-        sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
-                          sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
-        [=](sycl::nd_item<3> item_ct1) {
-            cpy_f32_f16<cpy_1_bf16_f32>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12,
-                                        nb10, nb11, nb12, nb13, item_ct1);
-        });
+    stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
+                                           sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
+                         [=](sycl::nd_item<3> item_ct1) {
+                             cpy_f32_f16<cpy_1_bf16_f32>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10,
+                                                         ne11, ne12, nb10, nb11, nb12, nb13, item_ct1);
+                         });
 }
 
-static void ggml_cpy_q8_0_q8_0(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
-                                   const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
-                                   const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                                   const int nb12, const int nb13, queue_ptr stream) {
+static void ggml_cpy_q8_0_q8_0(const char * cx,
+                               char *       cdst,
+                               const int    ne,
+                               const int    ne00,
+                               const int    ne01,
+                               const int    ne02,
+                               const int    nb00,
+                               const int    nb01,
+                               const int    nb02,
+                               const int    nb03,
+                               const int    ne10,
+                               const int    ne11,
+                               const int    ne12,
+                               const int    nb10,
+                               const int    nb11,
+                               const int    nb12,
+                               const int    nb13,
+                               queue_ptr    stream) {
     const int num_blocks = ceil_div(ne, SYCL_CPY_BLOCK_SIZE);
-    stream->parallel_for(
-        sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
-                              sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)), [=](sycl::nd_item<3> item_ct1) {
-            cpy_q_q<block_q8_0, QK8_0>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, item_ct1);
-        });
+    stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
+                                           sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
+                         [=](sycl::nd_item<3> item_ct1) {
+                             cpy_q_q<block_q8_0, QK8_0>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10,
+                                                        ne11, ne12, nb10, nb11, nb12, nb13, item_ct1);
+                         });
 }
 
-
-static void ggml_cpy_q5_0_q5_0(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
-                                   const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
-                                   const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                                   const int nb12, const int nb13, queue_ptr stream) {
+static void ggml_cpy_q5_0_q5_0(const char * cx,
+                               char *       cdst,
+                               const int    ne,
+                               const int    ne00,
+                               const int    ne01,
+                               const int    ne02,
+                               const int    nb00,
+                               const int    nb01,
+                               const int    nb02,
+                               const int    nb03,
+                               const int    ne10,
+                               const int    ne11,
+                               const int    ne12,
+                               const int    nb10,
+                               const int    nb11,
+                               const int    nb12,
+                               const int    nb13,
+                               queue_ptr    stream) {
     const int num_blocks = ceil_div(ne, SYCL_CPY_BLOCK_SIZE);
-    stream->parallel_for(
-        sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
-                              sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)), [=](sycl::nd_item<3> item_ct1) {
-            cpy_q_q<block_q5_0, QK5_0>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, item_ct1);
-        });
+    stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
+                                           sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
+                         [=](sycl::nd_item<3> item_ct1) {
+                             cpy_q_q<block_q5_0, QK5_0>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10,
+                                                        ne11, ne12, nb10, nb11, nb12, nb13, item_ct1);
+                         });
 }
 
-
-static void ggml_cpy_q5_1_q5_1(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
-                                   const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
-                                   const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                                   const int nb12, const int nb13, queue_ptr stream) {
+static void ggml_cpy_q5_1_q5_1(const char * cx,
+                               char *       cdst,
+                               const int    ne,
+                               const int    ne00,
+                               const int    ne01,
+                               const int    ne02,
+                               const int    nb00,
+                               const int    nb01,
+                               const int    nb02,
+                               const int    nb03,
+                               const int    ne10,
+                               const int    ne11,
+                               const int    ne12,
+                               const int    nb10,
+                               const int    nb11,
+                               const int    nb12,
+                               const int    nb13,
+                               queue_ptr    stream) {
     const int num_blocks = ceil_div(ne, SYCL_CPY_BLOCK_SIZE);
 
-    stream->parallel_for(
-        sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
-                              sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)), [=](sycl::nd_item<3> item_ct1) {
-            cpy_q_q<block_q5_1, QK5_1>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, item_ct1);
-        });
+    stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
+                                           sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
+                         [=](sycl::nd_item<3> item_ct1) {
+                             cpy_q_q<block_q5_1, QK5_1>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10,
+                                                        ne11, ne12, nb10, nb11, nb12, nb13, item_ct1);
+                         });
 }
 
-
-static void ggml_cpy_q4_0_q4_0(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
-                                   const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
-                                   const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                                   const int nb12, const int nb13, queue_ptr stream) {
+static void ggml_cpy_q4_0_q4_0(const char * cx,
+                               char *       cdst,
+                               const int    ne,
+                               const int    ne00,
+                               const int    ne01,
+                               const int    ne02,
+                               const int    nb00,
+                               const int    nb01,
+                               const int    nb02,
+                               const int    nb03,
+                               const int    ne10,
+                               const int    ne11,
+                               const int    ne12,
+                               const int    nb10,
+                               const int    nb11,
+                               const int    nb12,
+                               const int    nb13,
+                               queue_ptr    stream) {
     const int num_blocks = ceil_div(ne, SYCL_CPY_BLOCK_SIZE);
-    stream->parallel_for(
-        sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE), sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)), [=](sycl::nd_item<3> item_ct1) {
-            cpy_q_q<block_q4_0, QK4_0>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, item_ct1);
-        });
+    stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
+                                           sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
+                         [=](sycl::nd_item<3> item_ct1) {
+                             cpy_q_q<block_q4_0, QK4_0>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10,
+                                                        ne11, ne12, nb10, nb11, nb12, nb13, item_ct1);
+                         });
 }
 
-
-static void ggml_cpy_q4_1_q4_1(const char * cx, char * cdst, const int ne, const int ne00, const int ne01,
-                                   const int ne02, const int nb00, const int nb01, const int nb02, const int nb03,
-                                   const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                                   const int nb12, const int nb13, queue_ptr stream) {
-
-   const int num_blocks = ceil_div(ne, SYCL_CPY_BLOCK_SIZE);
-   stream->parallel_for(
-        sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE), sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)), [=](sycl::nd_item<3> item_ct1) {
-            cpy_q_q<block_q4_1, QK4_1>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, item_ct1);
-        });
+static void ggml_cpy_q4_1_q4_1(const char * cx,
+                               char *       cdst,
+                               const int    ne,
+                               const int    ne00,
+                               const int    ne01,
+                               const int    ne02,
+                               const int    nb00,
+                               const int    nb01,
+                               const int    nb02,
+                               const int    nb03,
+                               const int    ne10,
+                               const int    ne11,
+                               const int    ne12,
+                               const int    nb10,
+                               const int    nb11,
+                               const int    nb12,
+                               const int    nb13,
+                               queue_ptr    stream) {
+    const int num_blocks = ceil_div(ne, SYCL_CPY_BLOCK_SIZE);
+    stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE),
+                                           sycl::range<3>(1, 1, SYCL_CPY_BLOCK_SIZE)),
+                         [=](sycl::nd_item<3> item_ct1) {
+                             cpy_q_q<block_q4_1, QK4_1>(cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10,
+                                                        ne11, ne12, nb10, nb11, nb12, nb13, item_ct1);
+                         });
 }
 
 void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) try {
@@ -663,30 +1148,28 @@ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) 
     const ggml_tensor * src1 = dst.raw();
 
     scope_op_debug_print scope_dbg_print(__func__, src1, /*num_src=*/0, debug_get_tensor_str("\tsrc0", src0));
-    const int64_t ne = ggml_nelements(src0);
+    const int64_t        ne = ggml_nelements(src0);
     GGML_ASSERT(ne == ggml_nelements(src1));
 
     GGML_TENSOR_BINARY_OP_LOCALS01;
 
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
-    queue_ptr main_stream = ctx.stream();
-    const int device = ctx.device;
+    queue_ptr     main_stream = ctx.stream();
+    const int     device      = ctx.device;
     // Debug: check if stream is using TP context
-    sycl::queue * tp_queue = ggml_sycl_get_tp_queue(device);
-    GGML_SYCL_DEBUG("[CPY] device=%d main_stream=%p tp_queue=%p (match=%d)\n",
-            device, (void*)main_stream, (void*)tp_queue, main_stream == tp_queue);
+    sycl::queue * tp_queue    = ggml_sycl_get_tp_queue(device);
+    GGML_SYCL_DEBUG("[CPY] device=%d main_stream=%p tp_queue=%p (match=%d)\n", device, (void *) main_stream,
+                    (void *) tp_queue, main_stream == tp_queue);
 
     // Use device-specific pointers for TP mode (KV cache is allocated per-device)
     char * src0_ddc = (char *) ggml_sycl_get_data_ptr(src0, device);
     char * src1_ddc = (char *) ggml_sycl_get_data_ptr(src1, device);
 
-    // Check memory types - use shared context in TP mode since staging allocates there
-    sycl::context * tp_ctx = ggml_sycl_get_tp_context();
-    const sycl::context & query_ctx = (tp_ctx != nullptr) ? *tp_ctx : main_stream->get_context();
-    GGML_SYCL_DEBUG("[CPY] tp_ctx=%p (%s)\n", (void*)tp_ctx, tp_ctx ? "TP shared" : "stream");
+    // Check memory types. Staging allocation below uses the TP queue when one
+    // is active so host-pinned USM is allocated from the shared TP context.
     // Fast path: if data_device is cached, the pointer is device USM.
     // Avoids expensive sycl::get_pointer_type() driver round-trips.
-    auto fast_alloc = [device, &query_ctx](const ggml_tensor * t, const void * ptr) -> sycl::usm::alloc {
+    auto fast_alloc = [device](const ggml_tensor * t, const void * ptr) -> sycl::usm::alloc {
         if (t && t->extra) {
             auto * extra = static_cast<ggml_tensor_extra_gpu *>(t->extra);
             if (extra->data_device_ptr(device) != nullptr) {
@@ -697,11 +1180,9 @@ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) 
     };
     sycl::usm::alloc src0_type = fast_alloc(src0, src0_ddc);
     sycl::usm::alloc src1_type = fast_alloc(src1, src1_ddc);
-    GGML_SYCL_DEBUG("[CPY DEBUG] device=%d src0=%s(%p, usm=%d) -> src1=%s(%p, usm=%d) size=%zu\n",
-            device,
-            src0->name ? src0->name : "?", (void*)src0_ddc, (int)src0_type,
-            src1->name ? src1->name : "?", (void*)src1_ddc, (int)src1_type,
-            ggml_nbytes(src0));
+    GGML_SYCL_DEBUG("[CPY DEBUG] device=%d src0=%s(%p, usm=%d) -> src1=%s(%p, usm=%d) size=%zu\n", device,
+                    src0->name[0] ? src0->name : "?", (void *) src0_ddc, (int) src0_type,
+                    src1->name[0] ? src1->name : "?", (void *) src1_ddc, (int) src1_type, ggml_nbytes(src0));
 
     // Handle non-USM source memory (regular CPU memory that device can't access directly)
     // This can happen with graph input tensors in TP mode
@@ -710,52 +1191,46 @@ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) 
     // The pointer type check is unreliable because Level Zero may report mmap'd memory
     // as "host" type. Instead, check if the source came from the raw host field
     // rather than a GPU-specific device pointer.
-    char * staged_src = nullptr;
-    bool   staged_is_host = false;
-    bool   staged_is_shared = false;
-    bool dst_is_device = (src1_type == sycl::usm::alloc::device);
+    char *                staged_src = nullptr;
+    ggml_sycl::mem_handle staged_owner{};
+    bool                  dst_is_device = (src1_type == sycl::usm::alloc::device);
 
     // Source needs staging if:
     // 1. We're in TP mode with shared-context queues
     // 2. Source is using the raw host field (not GPU-specific extra->data_device)
     // 3. Destination is device memory
     bool src_is_from_tensor_data = (src0_ddc == static_cast<const char *>(ggml_sycl_host_data(src0)));
-    bool needs_staging = (src_is_from_tensor_data && dst_is_device &&
-                          g_sycl_tp_config.enabled && g_sycl_tp_config.world_size > 1);
-    GGML_SYCL_DEBUG("[CPY STAGING CHECK] device=%d needs_staging=%d src0_type=%d dst_is_device=%d\n",
-            device, needs_staging, (int)src0_type, dst_is_device);
+    bool needs_staging =
+        (src_is_from_tensor_data && dst_is_device && g_sycl_tp_config.enabled && g_sycl_tp_config.world_size > 1);
+    GGML_SYCL_DEBUG("[CPY STAGING CHECK] device=%d needs_staging=%d src0_type=%d dst_is_device=%d\n", device,
+                    needs_staging, (int) src0_type, dst_is_device);
     if (needs_staging) {
-        // Source is not USM, destination is USM - stage through shared USM memory
-        // Use malloc_host in the shared TP context so all devices can access it
+        // Source is not USM, destination is USM - stage through host-pinned USM
+        // owned by unified_alloc/mem_handle. In TP mode, prefer the TP queue so
+        // the allocation uses the shared TP context.
         size_t nbytes = ggml_nbytes(src0);
         GGML_SYCL_DEBUG("[CPY] Staging %zu bytes for device %d\n", nbytes, device);
 
-        try {
-            // Allocate host memory in the shared TP context (if available)
-            // This is accessible from all TP devices
-            if (tp_ctx != nullptr) {
-                staged_src = (char *) ggml_sycl_host_malloc(nbytes);
-                staged_is_host = staged_src != nullptr;
-            } else {
-                staged_src = (char *) ggml_sycl_malloc_shared(nbytes, *main_stream, "cpy_staging");
-                if (staged_src) {
-                    staged_is_shared = true;
-                }
-            }
-            GGML_SYCL_DEBUG("[CPY] Allocated staging buffer at %p for device %d\n", (void*)staged_src, device);
-            // Copy from CPU memory to USM memory
-            std::memcpy(staged_src, src0_ddc, nbytes);
-            GGML_SYCL_DEBUG("[CPY] memcpy to staging buffer completed\n");
-            // Use staged buffer as source for the rest of the copy
-            src0_ddc = staged_src;
-        } catch (const sycl::exception& e) {
-            GGML_LOG_ERROR("[CPY] Failed to allocate staging buffer: %s\n", e.what());
+        sycl::queue * alloc_stream = tp_queue ? tp_queue : main_stream;
+        if (!alloc_stream ||
+            !ggml_sycl_cpy_alloc_host_stage(nbytes, *alloc_stream, device, "cpy_staging", staged_owner)) {
+            GGML_LOG_ERROR("[CPY] Failed to allocate staging buffer: %.1f MB for device %d\n",
+                           nbytes / (1024.0 * 1024.0), device);
             return;
         }
+        auto resolved = staged_owner.resolve(device);
+        staged_src    = static_cast<char *>(resolved.ptr);
+        GGML_SYCL_DEBUG("[CPY] Allocated staging buffer at %p for device %d\n", (void *) staged_src, device);
+        // Copy from CPU memory to USM memory
+        std::memcpy(staged_src, src0_ddc, nbytes);
+        GGML_SYCL_DEBUG("[CPY] memcpy to staging buffer completed\n");
+        // Use staged buffer as source for the rest of the copy
+        src0_ddc = staged_src;
     }
 
     if ((src0->type == src1->type) && (ggml_is_contiguous(src0) && ggml_is_contiguous(src1))) {
-        GGML_SYCL_DEBUG("[CPY device=%d] memcpy path: %p -> %p (%zu bytes)\n", device, (void*)src0_ddc, (void*)src1_ddc, ggml_nbytes(src0));
+        GGML_SYCL_DEBUG("[CPY device=%d] memcpy path: %p -> %p (%zu bytes)\n", device, (void *) src0_ddc,
+                        (void *) src1_ddc, ggml_nbytes(src0));
         ggml_sycl_graph_safe_memcpy(*main_stream, src1_ddc, src0_ddc, ggml_nbytes(src0));
         GGML_SYCL_DEBUG("[CPY device=%d] memcpy submitted\n", device);
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
@@ -798,8 +1273,8 @@ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) 
         ggml_cpy_f16_bf16_sycl(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10,
                                nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_BF16) {
-        ggml_cpy_bf16_bf16_sycl(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10,
-                                nb11, nb12, nb13, main_stream);
+        ggml_cpy_bf16_bf16_sycl(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12,
+                                nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F16) {
         ggml_cpy_bf16_f16_sycl(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10,
                                nb11, nb12, nb13, main_stream);
@@ -831,15 +1306,20 @@ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) 
         ggml_cpy_f32_iq4_nl_sycl(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12,
                                  nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_Q8_0) {
-        ggml_cpy_q8_0_q8_0(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+        ggml_cpy_q8_0_q8_0(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10,
+                           nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_Q5_0 && src1->type == GGML_TYPE_Q5_0) {
-        ggml_cpy_q5_0_q5_0(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+        ggml_cpy_q5_0_q5_0(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10,
+                           nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_Q5_1 && src1->type == GGML_TYPE_Q5_1) {
-        ggml_cpy_q5_1_q5_1(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+        ggml_cpy_q5_1_q5_1(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10,
+                           nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_Q4_0 && src1->type == GGML_TYPE_Q4_0) {
-        ggml_cpy_q4_0_q4_0(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+        ggml_cpy_q4_0_q4_0(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10,
+                           nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_Q4_1 && src1->type == GGML_TYPE_Q4_1) {
-        ggml_cpy_q4_1_q4_1(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+        ggml_cpy_q4_1_q4_1(src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10,
+                           nb11, nb12, nb13, main_stream);
     } else {
         GGML_LOG_ERROR("%s: unsupported type combination (%s to %s)\n", __func__, ggml_type_name(src0->type),
                        ggml_type_name(src1->type));
@@ -849,11 +1329,7 @@ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) 
     // Free staging buffer if used (need to wait for kernel to complete first)
     if (staged_src != nullptr) {
         main_stream->wait();
-        if (staged_is_host) {
-            ggml_sycl_host_free(staged_src);
-        } else {
-            sycl::free(staged_src, query_ctx);
-        }
+        staged_owner = {};
     }
 } catch (const sycl::exception & exc) {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;

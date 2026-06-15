@@ -1,6 +1,6 @@
 // Test to compare MMQ SoA vs AoS kernels
 // Compile: icpx -fsycl -I../ggml/include -I../ggml/src test_mmq_soa.cpp -o test_mmq_soa
-// Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./test_mmq_soa
+// Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./test_mmq_soa
 
 #include <CL/sycl.hpp>
 #include <cstdio>

@@ -1,7 +1,7 @@
 // Unit test for flash-attn thread-local device buffer cleanup
 //
 // Usage:
-//   ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-fattn-thread-local
+//   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-fattn-thread-local
 
 #include "ggml-sycl.h"
 #include "ggml.h"
@@ -29,7 +29,7 @@ bool ggml_sycl_test_seq_id_buffers_touch(sycl::queue * stream);
 
 int main() {
     if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:1", 1);
+        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
     }
 
     sycl::queue q;

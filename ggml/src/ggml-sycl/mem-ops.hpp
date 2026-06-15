@@ -16,7 +16,22 @@ sycl::event mem_copy_async(const mem_handle &               dst,
                            sycl::queue &                    queue,
                            const std::vector<sycl::event> & deps = {});
 
+sycl::event mem_copy_async(const mem_handle &               dst,
+                           size_t                           dst_offset,
+                           const mem_handle &               src,
+                           size_t                           src_offset,
+                           size_t                           size,
+                           sycl::queue &                    queue,
+                           const std::vector<sycl::event> & deps = {});
+
 sycl::event mem_fill_async(const mem_handle &               h,
+                           int                              value,
+                           size_t                           size,
+                           sycl::queue &                    queue,
+                           const std::vector<sycl::event> & deps = {});
+
+sycl::event mem_fill_async(const mem_handle &               h,
+                           size_t                           offset,
                            int                              value,
                            size_t                           size,
                            sycl::queue &                    queue,
@@ -28,7 +43,22 @@ void mem_copy(const mem_handle &               dst,
               sycl::queue &                    queue,
               const std::vector<sycl::event> & deps = {});
 
+void mem_copy(const mem_handle &               dst,
+              size_t                           dst_offset,
+              const mem_handle &               src,
+              size_t                           src_offset,
+              size_t                           size,
+              sycl::queue &                    queue,
+              const std::vector<sycl::event> & deps = {});
+
 void mem_fill(const mem_handle &               h,
+              int                              value,
+              size_t                           size,
+              sycl::queue &                    queue,
+              const std::vector<sycl::event> & deps = {});
+
+void mem_fill(const mem_handle &               h,
+              size_t                           offset,
               int                              value,
               size_t                           size,
               sycl::queue &                    queue,

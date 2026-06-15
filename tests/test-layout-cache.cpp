@@ -1,7 +1,7 @@
 // Unit tests for SYCL layout selection and unified cache behavior
 //
 // Usage:
-//   ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-layout-cache
+//   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-layout-cache
 
 #include <cstdio>
 #include <cstdlib>
@@ -666,7 +666,7 @@ static bool test_model_load_preload_caches_weight(int device_id) {
 
 int main() {
     if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:1", 1);
+        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
     }
 
     ggml_sycl::test_clear_layout_override();

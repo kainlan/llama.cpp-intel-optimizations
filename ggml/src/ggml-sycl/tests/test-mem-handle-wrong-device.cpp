@@ -229,6 +229,16 @@ static bool test_chunk_lease_tripwire_and_wrong_device_resolve(int n_gpu_devices
     TEST_ASSERT(h.kind() == ggml_sycl::mem_handle_kind::CHUNK_LEASE,
                 "from_chunk_ptr must produce CHUNK_LEASE for ptr in pinned pool");
 
+    void * host_ptr_offset = static_cast<char *>(host_ptr) + 64;
+    ggml_sycl::mem_handle h_offset =
+        ggml_sycl::mem_handle::from_chunk_ptr(host_ptr_offset, 0, GGML_LAYOUT_AOS, false);
+    TEST_ASSERT(h_offset.kind() == ggml_sycl::mem_handle_kind::CHUNK_LEASE,
+                "from_chunk_ptr must produce CHUNK_LEASE for offset ptr in pinned pool");
+    TEST_ASSERT(!h.stable_identity_equal(h_offset),
+                "CHUNK_LEASE stable identity must distinguish different ptrs inside the same leased chunk");
+    TEST_ASSERT(h.stable_identity_hash() != h_offset.stable_identity_hash(),
+                "CHUNK_LEASE stable hash must distinguish different ptrs inside the same leased chunk");
+
     // Same-device resolve must return the pointer.
     ggml_sycl::resolved_ptr r0 = h.resolve(0);
     TEST_ASSERT(r0.ptr == host_ptr, "same-device CHUNK_LEASE resolve must return the ptr");
@@ -353,6 +363,72 @@ static bool test_mem_handle_hash_identity() {
     return true;
 }
 
+static bool test_mem_handle_stable_identity() {
+    TEST_BEGIN("mem_handle_stable_identity");
+
+    int    marker = 123;
+    void * ptr    = &marker;
+
+    ggml_sycl::mem_handle device_a = ggml_sycl::mem_handle::from_direct(ptr, GGML_LAYOUT_AOS, true, 0);
+    ggml_sycl::mem_handle device_b = ggml_sycl::mem_handle::from_direct(ptr, GGML_LAYOUT_SOA, true, 0);
+    TEST_ASSERT(device_a.stable_identity_equal(device_b),
+                "same-device DIRECT handles over the same external pointer must share stable identity");
+    TEST_ASSERT(device_a.stable_identity_hash() == device_b.stable_identity_hash(),
+                "stable hash must match stable identity equality");
+
+    ggml_sycl::mem_handle other_device = ggml_sycl::mem_handle::from_direct(ptr, GGML_LAYOUT_AOS, true, 1);
+    TEST_ASSERT(!device_a.stable_identity_equal(other_device), "device owner participates in DIRECT stable identity");
+
+    ggml_sycl::mem_handle arena_a =
+        ggml_sycl::mem_handle::from_arena_zone(static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), 4096, 8192, 0, 7);
+    ggml_sycl::mem_handle arena_b =
+        ggml_sycl::mem_handle::from_arena_zone(static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), 4096, 8192, 0, 7);
+    ggml_sycl::mem_handle arena_new_gen =
+        ggml_sycl::mem_handle::from_arena_zone(static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), 4096, 8192, 0, 8);
+    TEST_ASSERT(arena_a.stable_identity_equal(arena_b),
+                "arena handles with same owner/zone/offset/size/generation must share stable identity");
+    TEST_ASSERT(arena_a.stable_identity_hash() == arena_b.stable_identity_hash(),
+                "arena stable hash must match stable identity equality");
+    TEST_ASSERT(!arena_a.stable_identity_equal(arena_new_gen),
+                "arena generation participates in retained-cache stable identity");
+
+    ggml_sycl_cache_id id = {};
+    id.valid              = true;
+    id.model_id           = 4242;
+    id.aux_id             = 9;
+    id.nbytes             = 2048;
+    id.name_hash          = id.model_id ^ id.aux_id;
+    id.type               = GGML_TYPE_Q8_0;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        id.ne[i]           = (i == 0) ? 256 : 1;
+        id.tp_local_ne[i]  = id.ne[i];
+        id.tp_offset_ne[i] = 0;
+    }
+
+    ggml_sycl::mem_handle weight_a = ggml_sycl::mem_handle::from_cache_id(id, 0);
+    ggml_sycl::mem_handle weight_b = ggml_sycl::mem_handle::from_cache_id(id, 0);
+    id.aux_id++;
+    ggml_sycl::mem_handle weight_other = ggml_sycl::mem_handle::from_cache_id(id, 0);
+    TEST_ASSERT(weight_a.stable_identity_equal(weight_b),
+                "weight handles with same cache ID must share stable identity");
+    TEST_ASSERT(weight_a.stable_identity_hash() == weight_b.stable_identity_hash(),
+                "weight stable hash must match stable identity equality");
+    TEST_ASSERT(!weight_a.stable_identity_equal(weight_other), "weight cache ID participates in stable identity");
+
+    std::unordered_set<ggml_sycl::mem_handle,
+                       ggml_sycl::mem_handle_stable_identity_hash,
+                       ggml_sycl::mem_handle_stable_identity_equal>
+        stable_set;
+    stable_set.insert(weight_a);
+    TEST_ASSERT(stable_set.find(weight_b) != stable_set.end(),
+                "stable identity hasher/equality must support retained cache lookup by equivalent mem_handle");
+    TEST_ASSERT(stable_set.find(weight_other) == stable_set.end(),
+                "stable identity hasher/equality must reject different backing identities");
+
+    TEST_PASS();
+    return true;
+}
+
 // =============================================================================
 // Main
 // =============================================================================
@@ -394,10 +470,10 @@ int main(int argc, char ** argv) {
     all_passed &= test_chunk_lease_tripwire_and_wrong_device_resolve(n_gpu_devices);
     all_passed &= test_wrong_device_weight_handle_fails(n_gpu_devices);
     all_passed &= test_mem_handle_hash_identity();
+    all_passed &= test_mem_handle_stable_identity();
 
     fprintf(stderr, "-------------------------------------------------\n");
-    fprintf(stderr, "Tests: %d run, %d passed, %d skipped\n",
-            g_tests_run, g_tests_passed, g_tests_skipped);
+    fprintf(stderr, "Tests: %d run, %d passed, %d skipped\n", g_tests_run, g_tests_passed, g_tests_skipped);
 
     if (!all_passed) {
         fprintf(stderr, "SOME TESTS FAILED\n");

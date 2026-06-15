@@ -7,6 +7,8 @@
 #ifndef GGML_SYCL_VRAM_POOL_HPP
 #define GGML_SYCL_VRAM_POOL_HPP
 
+#include "mem-handle.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -58,12 +60,12 @@ class vram_pool {
 
   private:
     struct allocation {
-        void * ptr;
-        size_t size;
+        mem_handle handle;
+        size_t     size;
     };
 
     sycl::queue &                            queue_;
-    int                                     device_id_ = -1;
+    int                                      device_id_ = -1;
     size_t                                   budget_;
     size_t                                   used_ = 0;
     std::unordered_map<uint64_t, allocation> allocations_;

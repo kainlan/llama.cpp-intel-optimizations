@@ -9,6 +9,8 @@
 #include "common.hpp"
 #include "ggml-impl.h"
 
+#include <utility>
+
 namespace ggml_sycl {
 
 vram_pool::vram_pool(sycl::queue & queue, size_t budget) :
@@ -20,25 +22,16 @@ vram_pool::vram_pool(sycl::queue & queue, size_t budget) :
 
 vram_pool::~vram_pool() {
     std::lock_guard<std::mutex> lock(mutex_);
-    size_t                      count  = allocations_.size();
-    size_t                      failed = 0;
+    size_t                      count = allocations_.size();
 
-    for (auto & [id, alloc] : allocations_) {
-        if (alloc.ptr) {
-            try {
-                sycl::free(alloc.ptr, queue_);
-            } catch (const sycl::exception & e) {
-                GGML_LOG_ERROR("[SYCL] Failed to free tensor_id %llu: %s\n", (unsigned long long) id, e.what());
-                failed++;
-            }
-        }
+    for (auto & entry : allocations_) {
+        entry.second.handle = {};
     }
     allocations_.clear();
     used_ = 0;
 
     if (count > 0) {
-        GGML_LOG_INFO("[SYCL] VRAM pool destroyed, released %zu allocations%s\n", count,
-                      failed > 0 ? " (some failed)" : "");
+        GGML_LOG_INFO("[SYCL] VRAM pool destroyed, released %zu allocations\n", count);
     }
 }
 
@@ -69,7 +62,7 @@ void * vram_pool::allocate(size_t size, uint64_t tensor_id, size_t alignment) {
                            (unsigned long long) tensor_id, it->second.size, size);
             return nullptr;
         }
-        return it->second.ptr;  // Return existing allocation
+        return it->second.handle.resolve().ptr;  // Return existing allocation
     }
 
     // Check budget
@@ -78,21 +71,24 @@ void * vram_pool::allocate(size_t size, uint64_t tensor_id, size_t alignment) {
         return nullptr;
     }
 
-    // Allocate device memory
-    void * ptr = nullptr;
-    try {
-        ptr = ggml_sycl_malloc_device_raw(size, queue_, "vram_pool");
-    } catch (const sycl::exception & e) {
-        GGML_LOG_ERROR("[SYCL] VRAM allocation failed: %s\n", e.what());
+    alloc_request req{};
+    req.queue                               = &queue_;
+    req.device                              = device_id_;
+    req.size                                = size;
+    req.intent.role                         = alloc_role::WEIGHT;
+    req.intent.category                     = runtime_category::EXPERT_CACHE;
+    req.intent.constraints.must_device      = true;
+    req.intent.constraints.prefer_vram_zone = vram_zone_id::WEIGHT;
+
+    alloc_handle handle{};
+    if (!unified_alloc(req, &handle) || !handle.ptr) {
+        GGML_LOG_ERROR("[SYCL] unified VRAM allocation returned nullptr for size %zu\n", size);
         return nullptr;
     }
 
-    if (!ptr) {
-        GGML_LOG_ERROR("[SYCL] malloc_device returned nullptr for size %zu\n", size);
-        return nullptr;
-    }
-
-    allocations_[tensor_id] = { ptr, size };
+    void *     ptr          = handle.ptr;
+    mem_handle owner        = mem_handle::from_owned_alloc(std::move(handle), GGML_LAYOUT_AOS);
+    allocations_[tensor_id] = { std::move(owner), size };
     used_ += size;
 
     return ptr;
@@ -107,11 +103,7 @@ void vram_pool::deallocate(uint64_t tensor_id) {
         return;
     }
 
-    try {
-        sycl::free(it->second.ptr, queue_);
-    } catch (const sycl::exception & e) {
-        GGML_LOG_ERROR("[SYCL] Failed to deallocate tensor_id %llu: %s\n", (unsigned long long) tensor_id, e.what());
-    }
+    it->second.handle = {};
     used_ -= it->second.size;
     allocations_.erase(it);
 }
@@ -124,7 +116,7 @@ bool vram_pool::is_allocated(uint64_t tensor_id) const {
 void * vram_pool::get(uint64_t tensor_id) const {
     std::lock_guard<std::mutex> lock(mutex_);
     auto                        it = allocations_.find(tensor_id);
-    return it != allocations_.end() ? it->second.ptr : nullptr;
+    return it != allocations_.end() ? it->second.handle.resolve().ptr : nullptr;
 }
 
 size_t vram_pool::allocation_count() const {

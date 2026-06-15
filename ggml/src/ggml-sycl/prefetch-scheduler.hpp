@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include "unified-cache-key.hpp"
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -20,11 +22,12 @@ enum class PrefetchStatus { NOT_STARTED, IN_PROGRESS, COMPLETED, CANCELLED };
 
 // Prefetch request
 struct PrefetchRequest {
-    const void *   tensor_data;
-    size_t         size_bytes;
-    int            priority;     // Higher = more urgent
-    int            layer_index;  // Which layer this belongs to
-    PrefetchStatus status = PrefetchStatus::NOT_STARTED;
+    const void *       tensor_data;
+    ggml_sycl_cache_id cache_id{};
+    size_t             size_bytes;
+    int                priority;     // Higher = more urgent
+    int                layer_index;  // Which layer this belongs to
+    PrefetchStatus     status = PrefetchStatus::NOT_STARTED;
 };
 
 // PrefetchScheduler: Manages predictive prefetching of weight tensors during inference.
@@ -62,6 +65,13 @@ class PrefetchScheduler {
     int analyze_graph(const std::vector<void *> & weight_tensors,
                       const std::vector<size_t> & tensor_sizes,
                       const std::vector<int> &    layer_indices) {
+        return analyze_graph(weight_tensors, tensor_sizes, layer_indices, nullptr);
+    }
+
+    int analyze_graph(const std::vector<void *> &             weight_tensors,
+                      const std::vector<size_t> &             tensor_sizes,
+                      const std::vector<int> &                layer_indices,
+                      const std::vector<ggml_sycl_cache_id> * cache_ids) {
         prefetch_queue_.clear();
         active_prefetches_.clear();
 
@@ -69,6 +79,9 @@ class PrefetchScheduler {
             if (tensor_sizes[i] >= MIN_PREFETCH_SIZE) {
                 PrefetchRequest req;
                 req.tensor_data = weight_tensors[i];
+                if (cache_ids && i < cache_ids->size()) {
+                    req.cache_id = (*cache_ids)[i];
+                }
                 req.size_bytes  = tensor_sizes[i];
                 req.layer_index = layer_indices[i];
                 req.priority    = layer_indices[i];  // Earlier layers = lower priority initially
@@ -84,15 +97,16 @@ class PrefetchScheduler {
     std::vector<PrefetchRequest> on_kernel_start(int current_layer) {
         std::vector<PrefetchRequest> to_prefetch;
 
-        for (auto & req : prefetch_queue_) {
+        for (size_t i = 0; i < prefetch_queue_.size(); ++i) {
+            auto & req      = prefetch_queue_[i];
             // Prefetch layers within lookahead window
-            int distance = req.layer_index - current_layer;
+            int    distance = req.layer_index - current_layer;
             if (distance > 0 && distance <= lookahead_) {
                 if (req.status == PrefetchStatus::NOT_STARTED) {
                     req.status   = PrefetchStatus::IN_PROGRESS;
                     req.priority = lookahead_ - distance + 1;  // Closer = higher priority
                     to_prefetch.push_back(req);
-                    active_prefetches_.insert(req.tensor_data);
+                    active_prefetches_.insert(i);
                 }
             }
         }
@@ -102,10 +116,23 @@ class PrefetchScheduler {
 
     // Mark prefetch as completed
     void mark_completed(const void * tensor_data) {
-        for (auto & req : prefetch_queue_) {
+        for (size_t i = 0; i < prefetch_queue_.size(); ++i) {
+            auto & req = prefetch_queue_[i];
             if (req.tensor_data == tensor_data) {
                 req.status = PrefetchStatus::COMPLETED;
-                active_prefetches_.erase(tensor_data);
+                active_prefetches_.erase(i);
+                prefetch_hits_++;
+                break;
+            }
+        }
+    }
+
+    void mark_completed(const ggml_sycl_cache_id & cache_id) {
+        for (size_t i = 0; i < prefetch_queue_.size(); ++i) {
+            auto & req = prefetch_queue_[i];
+            if (req.cache_id.valid && ggml_sycl::detail::cache_id_equal(req.cache_id, cache_id)) {
+                req.status = PrefetchStatus::COMPLETED;
+                active_prefetches_.erase(i);
                 prefetch_hits_++;
                 break;
             }
@@ -124,7 +151,24 @@ class PrefetchScheduler {
     }
 
     // Check if tensor is being prefetched
-    bool is_prefetching(const void * tensor_data) const { return active_prefetches_.count(tensor_data) > 0; }
+    bool is_prefetching(const void * tensor_data) const {
+        for (size_t i = 0; i < prefetch_queue_.size(); ++i) {
+            if (prefetch_queue_[i].tensor_data == tensor_data) {
+                return active_prefetches_.count(i) > 0;
+            }
+        }
+        return false;
+    }
+
+    bool is_prefetching(const ggml_sycl_cache_id & cache_id) const {
+        for (size_t i = 0; i < prefetch_queue_.size(); ++i) {
+            const auto & req = prefetch_queue_[i];
+            if (req.cache_id.valid && ggml_sycl::detail::cache_id_equal(req.cache_id, cache_id)) {
+                return active_prefetches_.count(i) > 0;
+            }
+        }
+        return false;
+    }
 
     // Check if tensor needs prefetch (not started and not completed)
     bool needs_prefetch(const void * tensor_data, int layer_index, int current_layer) const {
@@ -139,6 +183,20 @@ class PrefetchScheduler {
             }
         }
         return true;  // Not in queue, could benefit from prefetch
+    }
+
+    bool needs_prefetch(const ggml_sycl_cache_id & cache_id, int layer_index, int current_layer) const {
+        int distance = layer_index - current_layer;
+        if (distance <= 0 || distance > lookahead_) {
+            return false;
+        }
+
+        for (const auto & req : prefetch_queue_) {
+            if (req.cache_id.valid && ggml_sycl::detail::cache_id_equal(req.cache_id, cache_id)) {
+                return req.status == PrefetchStatus::NOT_STARTED;
+            }
+        }
+        return true;
     }
 
     // Get statistics
@@ -171,11 +229,11 @@ class PrefetchScheduler {
     size_t get_queue_size() const { return prefetch_queue_.size(); }
 
   private:
-    int                              lookahead_ = DEFAULT_LOOKAHEAD;
-    std::vector<PrefetchRequest>     prefetch_queue_;
-    std::unordered_set<const void *> active_prefetches_;
-    int                              prefetch_hits_    = 0;
-    int                              prefetch_cancels_ = 0;
+    int                          lookahead_ = DEFAULT_LOOKAHEAD;
+    std::vector<PrefetchRequest> prefetch_queue_;
+    std::unordered_set<size_t>   active_prefetches_;
+    int                          prefetch_hits_    = 0;
+    int                          prefetch_cancels_ = 0;
 };
 
 }  // namespace ggml_sycl

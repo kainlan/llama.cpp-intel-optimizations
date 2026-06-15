@@ -1,6 +1,6 @@
 // Benchmark: MMVQ Q8_0 streaming DMA vs CPU on pinned host memory.
 // Run (opt-in):
-//   GGML_SYCL_MMVQ_BENCH=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
+//   GGML_SYCL_MMVQ_BENCH=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
 //   ./build/bin/test-mmvq-q8-0-streaming-bench
 //
 // Env knobs:
@@ -505,7 +505,6 @@ static int run_mmq_bench() {
     } override_guard{ owned_override };
 
     setenv("GGML_SYCL_FORCE_MMQ", "1", 1);
-    setenv("GGML_SYCL_UNIFIED_CACHE", "1", 1);
     if (std::getenv("GGML_SYCL_DMA_SLICE_MB") == nullptr) {
         setenv("GGML_SYCL_DMA_SLICE_MB", "2", 1);
     }

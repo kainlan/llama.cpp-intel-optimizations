@@ -840,7 +840,7 @@ In `ggml-sycl.cpp`, find `ggml_backend_sycl_set_tensor_inventory()` at line 2030
 
 ```cpp
     g_model_exceeds_vram.store(model_exceeds_vram, std::memory_order_release);
-    g_tiered_enabled.store(ggml_sycl::unified_cache_enabled(), std::memory_order_release);
+    g_tiered_enabled.store(true, std::memory_order_release);
 
     // Initialize double-buffered layer streaming when model exceeds VRAM
     if (model_exceeds_vram) {

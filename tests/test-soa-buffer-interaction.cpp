@@ -6,7 +6,7 @@
 // or interferes with F32 tensor data during the decode phase
 //
 // Build: cmake --build build --target test-soa-buffer-interaction
-// Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-soa-buffer-interaction
+// Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-soa-buffer-interaction
 
 #include <sycl/sycl.hpp>
 #include <cstdio>

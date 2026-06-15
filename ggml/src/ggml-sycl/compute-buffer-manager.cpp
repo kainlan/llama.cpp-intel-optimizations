@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <utility>
 
 namespace ggml_sycl {
 
@@ -26,10 +27,8 @@ ComputeBufferManager::~ComputeBufferManager() {
     std::lock_guard<std::mutex> lock(pool_mutex_);
     for (auto & buf : pool_) {
         if (buf.ptr != nullptr) {
-            if (!ggml_sycl::unified_free(buf.handle)) {
-                fprintf(stderr, "[ComputeBufferManager] Warning: failed to free buffer %p (%zu bytes)\n",
-                        buf.ptr, buf.size);
-            }
+            buf.handle = {};
+            buf.ptr    = nullptr;
         }
     }
     pool_.clear();
@@ -38,10 +37,6 @@ ComputeBufferManager::~ComputeBufferManager() {
     {
         std::lock_guard<std::mutex> scratch_lock(scratch_mutex_);
         if (scratch_ptr_ != nullptr) {
-            if (!ggml_sycl::unified_free(scratch_handle_)) {
-                fprintf(stderr, "[ComputeBufferManager] Warning: failed to free scratch %p (%zu bytes)\n",
-                        scratch_ptr_, scratch_capacity_);
-            }
             scratch_ptr_      = nullptr;
             scratch_size_     = 0;
             scratch_capacity_ = 0;
@@ -70,10 +65,15 @@ void * ComputeBufferManager::allocate(size_t size, const char * name) {
 
     // No suitable buffer in pool - allocate new one
     pool_misses_++;
-    void * ptr = allocate_new_buffer(size);
-    if (ptr == nullptr) {
+    mem_handle handle = allocate_new_buffer(size);
+    if (!handle.valid()) {
         return nullptr;  // OOM
     }
+    auto resolved = handle.resolve(device_id_);
+    if (!resolved.ptr) {
+        return nullptr;
+    }
+    void * ptr = resolved.ptr;
 
     // Add to pool
     ComputeBuffer new_buf;
@@ -82,7 +82,7 @@ void * ComputeBufferManager::allocate(size_t size, const char * name) {
     new_buf.in_use     = true;
     new_buf.alloc_time = current_time();
     new_buf.name       = name;
-    unified_lookup(ptr, &new_buf.handle);
+    new_buf.handle     = std::move(handle);
     pool_.push_back(new_buf);
 
     return ptr;
@@ -242,7 +242,7 @@ ComputeBuffer * ComputeBufferManager::find_free_buffer(size_t size) {
     return best;
 }
 
-void * ComputeBufferManager::allocate_new_buffer(size_t size) {
+mem_handle ComputeBufferManager::allocate_new_buffer(size_t size) {
     ggml_sycl::alloc_request req;
     req.queue                          = &queue_;
     req.device                         = device_id_;
@@ -254,15 +254,15 @@ void * ComputeBufferManager::allocate_new_buffer(size_t size) {
     ggml_sycl::mem_handle h = ggml_sycl::unified_allocate(req);
     if (!h.valid()) {
         fprintf(stderr, "[ComputeBufferManager] allocation failed for %zu bytes\n", size);
-        return nullptr;
+        return {};
     }
     auto resolved = h.resolve(device_id_);
-    if (!resolved) {
+    if (!resolved.ptr) {
         fprintf(stderr, "[ComputeBufferManager] allocation for %zu bytes did not resolve on device %d\n", size,
                 device_id_);
-        return nullptr;
+        return {};
     }
-    return resolved.ptr;
+    return h;
 }
 
 void ComputeBufferManager::grow_scratch(size_t new_size) {
@@ -272,10 +272,6 @@ void ComputeBufferManager::grow_scratch(size_t new_size) {
 
     // Free old scratch if exists
     if (scratch_ptr_ != nullptr) {
-        if (!ggml_sycl::unified_free(scratch_handle_)) {
-            fprintf(stderr, "[ComputeBufferManager] Warning: failed to free old scratch %p (%zu bytes)\n",
-                    scratch_ptr_, scratch_capacity_);
-        }
         scratch_ptr_    = nullptr;
         scratch_handle_ = {};
     }
@@ -289,7 +285,8 @@ void ComputeBufferManager::grow_scratch(size_t new_size) {
     req.intent.category                = ggml_sycl::runtime_category::COMPUTE;
     req.intent.constraints.must_device = true;
 
-    if (!ggml_sycl::unified_alloc(req, &scratch_handle_) || scratch_handle_.ptr == nullptr) {
+    scratch_handle_ = ggml_sycl::unified_allocate(req);
+    if (!scratch_handle_.valid()) {
         fprintf(stderr, "[ComputeBufferManager] scratch allocation failed for %zu bytes\n", new_size);
         scratch_ptr_      = nullptr;
         scratch_capacity_ = 0;
@@ -297,7 +294,17 @@ void ComputeBufferManager::grow_scratch(size_t new_size) {
         scratch_handle_   = {};
         return;
     }
-    scratch_ptr_      = scratch_handle_.ptr;
+    auto resolved = scratch_handle_.resolve(device_id_);
+    if (!resolved.ptr) {
+        fprintf(stderr, "[ComputeBufferManager] scratch allocation for %zu bytes did not resolve on device %d\n",
+                new_size, device_id_);
+        scratch_ptr_      = nullptr;
+        scratch_capacity_ = 0;
+        scratch_size_     = 0;
+        scratch_handle_   = {};
+        return;
+    }
+    scratch_ptr_      = resolved.ptr;
     scratch_capacity_ = new_size;
     scratch_size_     = new_size;
 }

@@ -13,6 +13,8 @@
 #include <mutex>
 #include <sycl/sycl.hpp>
 
+#include "mem-handle.hpp"
+
 namespace ggml_sycl {
 
 // Double-buffered scheduler for dense layers when VRAM is insufficient.
@@ -83,6 +85,7 @@ class dense_layer_scheduler {
     // All mutations still happen under mutex_ for event/callback safety.
     std::atomic<int> current_slot_{ 0 };
     int    layer_in_slot_[2] = { -1, -1 };
+    mem_handle vram_slot_handle_[2];
 
     sycl::event       pending_prefetch_;
     std::atomic<bool> has_pending_prefetch_{ false };

@@ -17,7 +17,10 @@
 #endif
 
 #include <cassert>
+#include <cinttypes>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -64,6 +67,14 @@ static bool can_reuse_kq_mask(
 }
 
 // impl
+
+static bool llama_warmup_topk_only() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("LLAMA_WARMUP_TOPK_ONLY");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
 
 static ggml_tensor * ggml_mul_mat_aux(
         ggml_context * ctx,
@@ -239,6 +250,14 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
         if (ubatch->output[i]) {
             data[n_outputs++] = i;
         }
+    }
+
+    if (const char * env = std::getenv("LLAMA_DECODE_TRACE"); env && std::atoi(env) != 0) {
+        std::fprintf(stderr, "[DECODE-TRACE] out_ids n_tokens=%" PRId64 " n_outputs=%d values=", n_tokens, n_outputs);
+        for (int i = 0; i < n_outputs; ++i) {
+            std::fprintf(stderr, "%s%d", i == 0 ? "" : ",", data[i]);
+        }
+        std::fprintf(stderr, "\n");
     }
 }
 
@@ -1019,7 +1038,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     n_embd_head_v    (hparams.n_embd_head_v()),
     n_embd_v_gqa     (hparams.n_embd_v_gqa()),
     n_expert         (hparams.n_expert),
-    n_expert_used    (cparams.warmup ? hparams.n_expert : hparams.n_expert_used),
+    n_expert_used    ((cparams.warmup && !llama_warmup_topk_only()) ? hparams.n_expert : hparams.n_expert_used),
     freq_base        (cparams.rope_freq_base),
     freq_scale       (cparams.rope_freq_scale),
     ext_factor       (cparams.yarn_ext_factor),

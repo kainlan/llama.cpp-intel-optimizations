@@ -1,16 +1,18 @@
 #include "ccl-comm.hpp"
+
 #include "common.hpp"
+#include "mem-ops.hpp"
 
 #if GGML_SYCL_CCL
 
-#include <cstdio>
-#include <cstdlib>
-#include <fstream>
-#include <thread>
-#include <chrono>
+#    include <chrono>
+#    include <cstdio>
+#    include <cstdlib>
+#    include <fstream>
+#    include <thread>
 
 // File-based KVS address sharing for multi-process CCL
-static const char* KVS_ADDR_FILE = "/tmp/ggml_sycl_ccl_kvs_address.bin";
+static const char * KVS_ADDR_FILE = "/tmp/ggml_sycl_ccl_kvs_address.bin";
 
 // Global CCL context
 ggml_sycl_ccl_context g_ccl_ctx;
@@ -20,13 +22,18 @@ static int g_ccl_debug = -1;
 
 static bool ccl_debug_enabled() {
     if (g_ccl_debug < 0) {
-        const char* env = std::getenv("GGML_SYCL_CCL_DEBUG");
-        g_ccl_debug = (env && std::string(env) == "1") ? 1 : 0;
+        const char * env = std::getenv("GGML_SYCL_CCL_DEBUG");
+        g_ccl_debug      = (env && std::string(env) == "1") ? 1 : 0;
     }
     return g_ccl_debug == 1;
 }
 
-void ggml_sycl_ccl_init(int world_size, queue_ptr* queues) {
+static ggml_sycl::mem_handle ccl_host_handle(void * ptr) {
+    return ggml_sycl::mem_handle::from_direct(ptr, GGML_LAYOUT_AOS, /*on_device=*/false,
+                                              ggml_sycl::mem_handle::HOST_DEVICE);
+}
+
+void ggml_sycl_ccl_init(int world_size, queue_ptr * queues) {
     if (g_ccl_ctx.initialized) {
         return;  // Already initialized
     }
@@ -49,10 +56,11 @@ void ggml_sycl_ccl_init(int world_size, queue_ptr* queues) {
     // To enable CCL (requires multi-process launcher like mpirun):
     //   export GGML_SYCL_CCL_ENABLE=1
 
-    const char* ccl_enable = std::getenv("GGML_SYCL_CCL_ENABLE");
+    const char * ccl_enable = std::getenv("GGML_SYCL_CCL_ENABLE");
     if (!ccl_enable || std::string(ccl_enable) != "1") {
         if (ccl_debug_enabled()) {
-            fprintf(stderr, "SYCL CCL: Skipping CCL init (single-process mode, set GGML_SYCL_CCL_ENABLE=1 with mpirun)\n");
+            fprintf(stderr,
+                    "SYCL CCL: Skipping CCL init (single-process mode, set GGML_SYCL_CCL_ENABLE=1 with mpirun)\n");
         }
         GGML_UNUSED(queues);
         return;
@@ -84,7 +92,7 @@ void ggml_sycl_ccl_init(int world_size, queue_ptr* queues) {
             auto sycl_dev = queues[rank]->get_device();
             auto sycl_ctx = queues[rank]->get_context();
 
-            ccl::device ccl_dev = ccl::create_device(sycl_dev);
+            ccl::device  ccl_dev = ccl::create_device(sycl_dev);
             ccl::context ccl_ctx = ccl::create_context(sycl_ctx);
 
             // Create communicator for this rank
@@ -101,14 +109,14 @@ void ggml_sycl_ccl_init(int world_size, queue_ptr* queues) {
             }
         }
 
-        g_ccl_ctx.world_size = world_size;
+        g_ccl_ctx.world_size  = world_size;
         g_ccl_ctx.initialized = true;
 
         if (ccl_debug_enabled()) {
             fprintf(stderr, "SYCL CCL: Initialized successfully with %d devices\n", world_size);
         }
 
-    } catch (const std::exception& e) {
+    } catch (const std::exception & e) {
         fprintf(stderr, "SYCL CCL: ERROR during initialization: %s\n", e.what());
         g_ccl_ctx.initialized = false;
     }
@@ -120,8 +128,7 @@ void ggml_sycl_ccl_init_multiprocess(int rank, int world_size, queue_ptr queue) 
     }
 
     if (world_size < 2 || rank < 0 || rank >= world_size) {
-        fprintf(stderr, "SYCL CCL: Invalid multi-process config (rank=%d, world_size=%d)\n",
-                rank, world_size);
+        fprintf(stderr, "SYCL CCL: Invalid multi-process config (rank=%d, world_size=%d)\n", rank, world_size);
         return;
     }
 
@@ -131,7 +138,7 @@ void ggml_sycl_ccl_init_multiprocess(int rank, int world_size, queue_ptr queue) 
     }
 
     // Check if CCL should be enabled (default: enabled in multi-process mode)
-    const char* ccl_disable = std::getenv("GGML_SYCL_CCL_DISABLE");
+    const char * ccl_disable = std::getenv("GGML_SYCL_CCL_DISABLE");
     if (ccl_disable && std::string(ccl_disable) == "1") {
         if (ccl_debug_enabled()) {
             fprintf(stderr, "SYCL CCL: Multi-process CCL disabled by GGML_SYCL_CCL_DISABLE=1\n");
@@ -156,11 +163,11 @@ void ggml_sycl_ccl_init_multiprocess(int rank, int world_size, queue_ptr queue) 
         // - Rank 0 creates main KVS and writes address to file
         // - Other ranks read address from file and connect to the same KVS
         ccl::shared_ptr_class<ccl::kvs> kvs;
-        ccl::kvs::address_type kvs_addr;
+        ccl::kvs::address_type          kvs_addr;
 
         if (rank == 0) {
             // Rank 0: Create main KVS and write address to file
-            kvs = ccl::create_main_kvs();
+            kvs      = ccl::create_main_kvs();
             kvs_addr = kvs->get_address();
 
             // Write address to file for other ranks
@@ -169,7 +176,7 @@ void ggml_sycl_ccl_init_multiprocess(int rank, int world_size, queue_ptr queue) 
                 fprintf(stderr, "SYCL CCL: ERROR - cannot write KVS address file\n");
                 return;
             }
-            ofs.write(reinterpret_cast<const char*>(kvs_addr.data()), kvs_addr.size());
+            ofs.write(reinterpret_cast<const char *>(kvs_addr.data()), kvs_addr.size());
             ofs.close();
 
             if (ccl_debug_enabled()) {
@@ -182,8 +189,8 @@ void ggml_sycl_ccl_init_multiprocess(int rank, int world_size, queue_ptr queue) 
             }
 
             // Wait for file to exist (with timeout)
-            int wait_count = 0;
-            const int max_wait = 100;  // 10 second timeout
+            int       wait_count = 0;
+            const int max_wait   = 100;  // 10 second timeout
             while (wait_count < max_wait) {
                 std::ifstream test(KVS_ADDR_FILE);
                 if (test.good()) {
@@ -208,7 +215,7 @@ void ggml_sycl_ccl_init_multiprocess(int rank, int world_size, queue_ptr queue) 
                 fprintf(stderr, "SYCL CCL: ERROR - cannot read KVS address file\n");
                 return;
             }
-            ifs.read(reinterpret_cast<char*>(kvs_addr.data()), 256);
+            ifs.read(reinterpret_cast<char *>(kvs_addr.data()), 256);
             ifs.close();
 
             // Create KVS from address
@@ -223,7 +230,7 @@ void ggml_sycl_ccl_init_multiprocess(int rank, int world_size, queue_ptr queue) 
         auto sycl_dev = queue->get_device();
         auto sycl_ctx = queue->get_context();
 
-        ccl::device ccl_dev = ccl::create_device(sycl_dev);
+        ccl::device  ccl_dev = ccl::create_device(sycl_dev);
         ccl::context ccl_ctx = ccl::create_context(sycl_ctx);
 
         // Create single communicator for this process
@@ -241,8 +248,8 @@ void ggml_sycl_ccl_init_multiprocess(int rank, int world_size, queue_ptr queue) 
         g_ccl_ctx.streams.clear();
         g_ccl_ctx.streams.push_back(std::move(stream));
 
-        g_ccl_ctx.world_size = world_size;
-        g_ccl_ctx.rank = rank;
+        g_ccl_ctx.world_size  = world_size;
+        g_ccl_ctx.rank        = rank;
         g_ccl_ctx.initialized = true;
 
         // Register atexit handler to ensure CCL resources are freed before MPI finalization
@@ -255,8 +262,7 @@ void ggml_sycl_ccl_init_multiprocess(int rank, int world_size, queue_ptr queue) 
         }
 
         if (ccl_debug_enabled()) {
-            fprintf(stderr, "SYCL CCL: Multi-process initialized - rank %d/%d ready\n",
-                    rank, world_size);
+            fprintf(stderr, "SYCL CCL: Multi-process initialized - rank %d/%d ready\n", rank, world_size);
         }
 
         // Cleanup KVS file after all ranks have connected
@@ -266,18 +272,18 @@ void ggml_sycl_ccl_init_multiprocess(int rank, int world_size, queue_ptr queue) 
             std::remove(KVS_ADDR_FILE);
         }
 
-    } catch (const std::exception& e) {
+    } catch (const std::exception & e) {
         fprintf(stderr, "SYCL CCL: ERROR during multi-process init: %s\n", e.what());
         g_ccl_ctx.initialized = false;
     }
 }
 
-void ggml_sycl_ccl_allreduce_sum_f32(float* buf, size_t count, int device) {
+void ggml_sycl_ccl_allreduce_sum_f32(float * buf, size_t count, int device) {
     // In-place version: send_buf == recv_buf
     ggml_sycl_ccl_allreduce_sum_f32(buf, buf, count, device);
 }
 
-void ggml_sycl_ccl_allreduce_sum_f32(const float* send_buf, float* recv_buf, size_t count, int device) {
+void ggml_sycl_ccl_allreduce_sum_f32(const float * send_buf, float * recv_buf, size_t count, int device) {
     if (!g_ccl_ctx.initialized) {
         if (ccl_debug_enabled()) {
             fprintf(stderr, "SYCL CCL: allreduce called but CCL not initialized\n");
@@ -291,105 +297,123 @@ void ggml_sycl_ccl_allreduce_sum_f32(const float* send_buf, float* recv_buf, siz
     if (g_ccl_ctx.comms.size() > 1) {
         // Single-process multi-device mode (legacy, not currently used)
         comm_idx = device;
-        if (device < 0 || device >= (int)g_ccl_ctx.comms.size()) {
-            fprintf(stderr, "SYCL CCL: ERROR - invalid device %d (num_comms=%zu)\n",
-                    device, g_ccl_ctx.comms.size());
+        if (device < 0 || device >= (int) g_ccl_ctx.comms.size()) {
+            fprintf(stderr, "SYCL CCL: ERROR - invalid device %d (num_comms=%zu)\n", device, g_ccl_ctx.comms.size());
             return;
         }
     }
 
     try {
-        auto& comm = g_ccl_ctx.comms[comm_idx];
-        auto& stream = g_ccl_ctx.streams[comm_idx];
+        auto & comm   = g_ccl_ctx.comms[comm_idx];
+        auto & stream = g_ccl_ctx.streams[comm_idx];
 
         // Get the SYCL queue from CCL stream to check pointer types
         // CCL requires device memory for GPU allreduce
         // CRITICAL: Stage ALL non-device memory due to Level Zero driver bug that reports
         // mmap'd memory as "shared" (type=3) instead of "unknown" (type=0), causing DEVICE_LOST
-        sycl::queue& q = stream.get_native();
-        sycl::context ctx = q.get_context();
+        sycl::queue & q = stream.get_native();
 
         auto send_ptr_type = ggml_sycl_get_alloc_type(send_buf);
         auto recv_ptr_type = ggml_sycl_get_alloc_type(recv_buf);
 
-        bool need_staging = (send_ptr_type != sycl::usm::alloc::device ||
-                            recv_ptr_type != sycl::usm::alloc::device);
+        bool need_staging = (send_ptr_type != sycl::usm::alloc::device || recv_ptr_type != sycl::usm::alloc::device);
 
         if (ccl_debug_enabled()) {
-            const char* send_type_str = (send_ptr_type == sycl::usm::alloc::device) ? "device" :
-                                        (send_ptr_type == sycl::usm::alloc::shared) ? "shared" :
-                                        (send_ptr_type == sycl::usm::alloc::host) ? "host" : "unknown";
-            const char* recv_type_str = (recv_ptr_type == sycl::usm::alloc::device) ? "device" :
-                                        (recv_ptr_type == sycl::usm::alloc::shared) ? "shared" :
-                                        (recv_ptr_type == sycl::usm::alloc::host) ? "host" : "unknown";
-            fprintf(stderr, "SYCL CCL: allreduce count=%zu send=%p(%s) recv=%p(%s) staging=%d\n",
-                    count, (void*)send_buf, send_type_str, (void*)recv_buf, recv_type_str, need_staging);
+            const char * send_type_str = (send_ptr_type == sycl::usm::alloc::device) ? "device" :
+                                         (send_ptr_type == sycl::usm::alloc::shared) ? "shared" :
+                                         (send_ptr_type == sycl::usm::alloc::host)   ? "host" :
+                                                                                       "unknown";
+            const char * recv_type_str = (recv_ptr_type == sycl::usm::alloc::device) ? "device" :
+                                         (recv_ptr_type == sycl::usm::alloc::shared) ? "shared" :
+                                         (recv_ptr_type == sycl::usm::alloc::host)   ? "host" :
+                                                                                       "unknown";
+            fprintf(stderr, "SYCL CCL: allreduce count=%zu send=%p(%s) recv=%p(%s) staging=%d\n", count,
+                    (void *) send_buf, send_type_str, (void *) recv_buf, recv_type_str, need_staging);
         }
 
         if (need_staging) {
-            // Allocate shared memory staging buffer
-            size_t buf_size = count * sizeof(float);
-            float* staging = ggml_sycl_malloc_shared_t<float>(count, q, "ccl_allreduce_staging");
-            if (!staging) {
+            // Allocate device staging through unified_alloc; raw pointer is only
+            // the CCL/copy ABI view while staging_handle retains ownership.
+            size_t                   buf_size = count * sizeof(float);
+            ggml_sycl::alloc_request staging_req{};
+            staging_req.queue                          = &q;
+            staging_req.device                         = ggml_sycl_get_device_id_from_queue(q);
+            staging_req.size                           = buf_size;
+            staging_req.intent.role                    = ggml_sycl::alloc_role::STAGING;
+            staging_req.intent.category                = ggml_sycl::runtime_category::STAGING;
+            staging_req.intent.cohort_id               = "ccl_allreduce_staging";
+            staging_req.intent.constraints.must_device = true;
+
+            ggml_sycl::alloc_handle staging_owner{};
+            if (!ggml_sycl::unified_alloc(staging_req, &staging_owner) || !staging_owner.ptr) {
                 fprintf(stderr, "SYCL CCL: ERROR - failed to allocate staging buffer (%zu bytes)\n", buf_size);
                 return;
             }
+            ggml_sycl::mem_handle staging_handle =
+                ggml_sycl::mem_handle::from_owned_alloc(std::move(staging_owner), GGML_LAYOUT_AOS);
+            auto    resolved = staging_handle.resolve(staging_req.device);
+            float * staging  = resolved ? static_cast<float *>(resolved.ptr) : nullptr;
+            if (!staging) {
+                fprintf(stderr, "SYCL CCL: ERROR - failed to resolve staging buffer (%zu bytes)\n", buf_size);
+                return;
+            }
+
+            const bool send_on_device = send_ptr_type == sycl::usm::alloc::device;
+            const bool recv_on_device = recv_ptr_type == sycl::usm::alloc::device;
+            auto send_handle = ggml_sycl::mem_handle::from_chunk_ptr(const_cast<float *>(send_buf), staging_req.device,
+                                                                     GGML_LAYOUT_AOS, send_on_device);
+            auto recv_handle =
+                ggml_sycl::mem_handle::from_chunk_ptr(recv_buf, staging_req.device, GGML_LAYOUT_AOS, recv_on_device);
+            GGML_ASSERT(send_handle.valid());
+            GGML_ASSERT(recv_handle.valid());
 
             // Copy input to staging buffer
-            q.memcpy(staging, send_buf, buf_size).wait();
+            ggml_sycl::mem_copy(staging_handle, send_handle, buf_size, q);
 
             // Debug: show values before allreduce
             if (ccl_debug_enabled()) {
                 static int val_dbg = 0;
                 if (val_dbg++ < 5) {
-                    fprintf(stderr, "SYCL CCL: rank=%d BEFORE allreduce: [%.4f,%.4f,%.4f,%.4f]\n",
-                            g_ccl_ctx.rank, staging[0], staging[1], staging[2], staging[3]);
+                    float  dbg_vals[4] = {};
+                    size_t dbg_bytes   = ((count < 4) ? count : 4) * sizeof(float);
+                    if (dbg_bytes > 0) {
+                        ggml_sycl::mem_copy(ccl_host_handle(dbg_vals), staging_handle, dbg_bytes, q);
+                    }
+                    fprintf(stderr, "SYCL CCL: rank=%d BEFORE allreduce: [%.4f,%.4f,%.4f,%.4f]\n", g_ccl_ctx.rank,
+                            dbg_vals[0], dbg_vals[1], dbg_vals[2], dbg_vals[3]);
                 }
             }
 
             // Perform in-place allreduce on staging buffer
-            ccl::allreduce(
-                staging,
-                staging,
-                count,
-                ccl::datatype::float32,
-                ccl::reduction::sum,
-                comm,
-                stream
-            ).wait();
+            ccl::allreduce(staging, staging, count, ccl::datatype::float32, ccl::reduction::sum, comm, stream).wait();
 
             // Debug: show values after allreduce
             if (ccl_debug_enabled()) {
                 static int val_dbg2 = 0;
                 if (val_dbg2++ < 5) {
-                    fprintf(stderr, "SYCL CCL: rank=%d AFTER allreduce: [%.4f,%.4f,%.4f,%.4f]\n",
-                            g_ccl_ctx.rank, staging[0], staging[1], staging[2], staging[3]);
+                    float  dbg_vals[4] = {};
+                    size_t dbg_bytes   = ((count < 4) ? count : 4) * sizeof(float);
+                    if (dbg_bytes > 0) {
+                        ggml_sycl::mem_copy(ccl_host_handle(dbg_vals), staging_handle, dbg_bytes, q);
+                    }
+                    fprintf(stderr, "SYCL CCL: rank=%d AFTER allreduce: [%.4f,%.4f,%.4f,%.4f]\n", g_ccl_ctx.rank,
+                            dbg_vals[0], dbg_vals[1], dbg_vals[2], dbg_vals[3]);
                 }
             }
 
             // Copy result back to recv buffer
-            q.memcpy(recv_buf, staging, buf_size).wait();
+            ggml_sycl::mem_copy(recv_handle, staging_handle, buf_size, q);
 
-            // Free staging buffer
-            sycl::free(staging, q);
         } else {
             // Direct allreduce - buffers already in device/shared memory
-            ccl::allreduce(
-                send_buf,
-                recv_buf,
-                count,
-                ccl::datatype::float32,
-                ccl::reduction::sum,
-                comm,
-                stream
-            ).wait();
+            ccl::allreduce(send_buf, recv_buf, count, ccl::datatype::float32, ccl::reduction::sum, comm, stream).wait();
         }
 
         if (ccl_debug_enabled()) {
             fprintf(stderr, "SYCL CCL: allreduce completed\n");
         }
 
-    } catch (const std::exception& e) {
+    } catch (const std::exception & e) {
         fprintf(stderr, "SYCL CCL: ERROR during allreduce: %s\n", e.what());
     }
 }
@@ -425,7 +449,7 @@ void ggml_sycl_ccl_free() {
 
     try {
         // Wait for any pending operations to complete
-        for (auto& stream : g_ccl_ctx.streams) {
+        for (auto & stream : g_ccl_ctx.streams) {
             try {
                 // Get the underlying SYCL queue and wait
                 stream.get_native().wait();
@@ -443,14 +467,14 @@ void ggml_sycl_ccl_free() {
         if (ccl_debug_enabled()) {
             fprintf(stderr, "SYCL CCL: Rank %d - CCL resources freed successfully\n", g_ccl_ctx.rank);
         }
-    } catch (const std::exception& e) {
+    } catch (const std::exception & e) {
         fprintf(stderr, "SYCL CCL: Warning - exception during cleanup: %s\n", e.what());
     } catch (...) {
         fprintf(stderr, "SYCL CCL: Warning - unknown exception during cleanup\n");
     }
 
     g_ccl_ctx.world_size = 0;
-    g_ccl_ctx.rank = 0;
+    g_ccl_ctx.rank       = 0;
 }
 
-#endif // GGML_SYCL_CCL
+#endif  // GGML_SYCL_CCL

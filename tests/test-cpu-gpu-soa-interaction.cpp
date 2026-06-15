@@ -3,7 +3,7 @@
 // from dequantize.hpp and the reorder kernel from ggml-sycl.cpp
 //
 // Build: cmake --build build --target test-cpu-gpu-soa-interaction
-// Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-cpu-gpu-soa-interaction
+// Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-cpu-gpu-soa-interaction
 
 #include <sycl/sycl.hpp>
 #include <cstdio>

@@ -1,9 +1,9 @@
 // Stress test for unpin_on_event via binbcast ops.
 //
 // Usage:
-//   ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-unified-cache-unpin-event --mode=safe
-//   ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-unified-cache-unpin-event --mode=barrier
-//   ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-unified-cache-unpin-event --mode=compare
+//   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-unified-cache-unpin-event --mode=safe
+//   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-unified-cache-unpin-event --mode=barrier
+//   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-unified-cache-unpin-event --mode=compare
 
 #include <cstdio>
 #include <cstdlib>
@@ -174,7 +174,7 @@ static bool run_binbcast_stress(event_mode mode, int iters) {
 
 int main(int argc, char ** argv) {
     if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:1", 1);
+        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
     }
 
     const char * mode_arg  = get_arg(argc, argv, "--mode=");

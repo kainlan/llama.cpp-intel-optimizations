@@ -227,7 +227,7 @@ static bool test_stats_tracking() {
 
 int main() {
     if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:1", 1);
+        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
     }
     printf("SYCL Compute Buffer Management Tests\n");
     printf("=====================================\n\n");

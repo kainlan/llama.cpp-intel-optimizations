@@ -370,24 +370,12 @@ struct fattn_xmx_v2_device_cache {
     bool           slm_ok         = false;
 
     ggml_sycl_fattn_xmx_packed_k forced_split_packed_k;
-    ggml_sycl::alloc_handle      split_partial_max_alloc;
-    ggml_sycl::alloc_handle      split_partial_sum_alloc;
-    ggml_sycl::alloc_handle      split_partial_out_alloc;
+    ggml_sycl::mem_handle        split_partial_max_handle;
+    ggml_sycl::mem_handle        split_partial_sum_handle;
+    ggml_sycl::mem_handle        split_partial_out_handle;
     size_t                       split_partial_elems     = 0;
     size_t                       split_partial_out_elems = 0;
     int                          split_partial_device    = -1;
-
-    ~fattn_xmx_v2_device_cache() {
-        if (split_partial_max_alloc.ptr) {
-            (void) ggml_sycl::unified_free(split_partial_max_alloc);
-        }
-        if (split_partial_sum_alloc.ptr) {
-            (void) ggml_sycl::unified_free(split_partial_sum_alloc);
-        }
-        if (split_partial_out_alloc.ptr) {
-            (void) ggml_sycl::unified_free(split_partial_out_alloc);
-        }
-    }
 };
 
 // Bytes of SLM required for the fallback leaf's worst case (D=256, NCOLS=32).

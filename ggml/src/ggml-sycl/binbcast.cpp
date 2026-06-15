@@ -2,8 +2,10 @@
 
 #include "dnnl-ops.hpp"
 #include "ggml.h"
+#include "mem-ops.hpp"
 
 #include <cmath>
+#include <cstdarg>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -17,6 +19,29 @@ enum class ggml_sycl_binbcast_event_mode {
     SAFE,
 };
 
+static ggml_sycl::mem_handle ggml_sycl_binbcast_copy_handle_for_raw_ptr(void * ptr, int fallback_device) {
+    ggml_sycl::memory_location loc = ggml_sycl::query_location(ptr, fallback_device);
+    if (loc.on_device()) {
+        const int owner = loc.device >= 0 ? loc.device : fallback_device;
+        return ggml_sycl::mem_handle::from_chunk_ptr(ptr, owner, GGML_LAYOUT_AOS, true);
+    }
+    if (loc.tier == ggml_sycl::alloc_tier::HOST_PINNED && fallback_device >= 0) {
+        return ggml_sycl::mem_handle::from_chunk_ptr(ptr, fallback_device, GGML_LAYOUT_AOS, false);
+    }
+    return ggml_sycl::mem_handle::from_direct(ptr, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+}
+
+static void ggml_sycl_binbcast_debug_read_f32(sycl::queue & queue,
+                                              int           device,
+                                              float *       dst,
+                                              const void *  src,
+                                              size_t        count) {
+    ggml_sycl::mem_handle dst_handle =
+        ggml_sycl::mem_handle::from_direct(dst, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+    ggml_sycl::mem_handle src_handle = ggml_sycl_binbcast_copy_handle_for_raw_ptr(const_cast<void *>(src), device);
+    ggml_sycl::mem_copy(dst_handle, 0, src_handle, 0, count * sizeof(float), queue);
+}
+
 static const char * ggml_sycl_binbcast_event_mode_name(ggml_sycl_binbcast_event_mode mode) {
     switch (mode) {
         case ggml_sycl_binbcast_event_mode::BARRIER:
@@ -26,6 +51,26 @@ static const char * ggml_sycl_binbcast_event_mode_name(ggml_sycl_binbcast_event_
         default:
             return "unknown";
     }
+}
+
+static bool ggml_sycl_binbcast_trace_enabled() {
+    static const bool enabled = [] {
+        const char * v = std::getenv("GGML_SYCL_BINBCAST_TRACE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+static void ggml_sycl_binbcast_tracef(const char * fmt, ...) {
+    if (!ggml_sycl_binbcast_trace_enabled()) {
+        return;
+    }
+    std::fprintf(stderr, "[BINBCAST] ");
+    va_list args;
+    va_start(args, fmt);
+    std::vfprintf(stderr, fmt, args);
+    va_end(args);
+    std::fprintf(stderr, "\n");
 }
 
 static ggml_sycl_binbcast_event_mode ggml_sycl_get_binbcast_event_mode() {
@@ -506,22 +551,75 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
     }
 
     // Use device-specific data pointers for TP support
-    const int device = ctx.device;
-    void *    src0_d = ggml_sycl_resolve_tensor_ptr(src0, device);
-    void *    src1_d = ggml_sycl_resolve_tensor_ptr(src1, device);
-    void *    dst_d  = ggml_sycl_resolve_tensor_ptr(dst, device);
+    const int device        = ctx.device;
+    auto      src0_resolved = ggml_sycl_resolve(src0, device);
+    auto      src1_resolved = ggml_sycl_resolve(src1, device);
+    void *    src0_d        = src0_resolved ? src0_resolved.ptr : ggml_sycl_resolve_tensor_ptr(src0, device);
+    void *    src1_d        = src1_resolved ? src1_resolved.ptr : ggml_sycl_resolve_tensor_ptr(src1, device);
+    void *    dst_d         = ggml_sycl_resolve_tensor_ptr(dst, device);
+    if (src0_resolved && src0_resolved.has_ready_event) {
+        ggml_sycl_chain_ready_event_if_needed(*main_stream, src0_resolved);
+    }
+    if (src1_resolved && src1_resolved.has_ready_event) {
+        ggml_sycl_chain_ready_event_if_needed(*main_stream, src1_resolved);
+    }
 
-    ggml_sycl::scoped_unified_alloc src0_stage;
-    ggml_sycl::scoped_unified_alloc src1_stage;
+    ggml_sycl_binbcast_tracef("entry op=%s device=%d dst=%s src0=%s src1=%s src0_d=%p src1_d=%p dst_d=%p",
+                              dst ? ggml_op_name(dst->op) : "(null)", device, dst ? dst->name : "(null)",
+                              src0 ? src0->name : "(null)", src1 ? src1->name : "(null)", src0_d, src1_d, dst_d);
+
+    ggml_sycl::mem_handle src0_stage;
+    ggml_sycl::mem_handle src1_stage;
+    ggml_sycl::mem_handle src0_weight_stage;
+    ggml_sycl::mem_handle src1_weight_stage;
     bool                            staged_raw_host = false;
 
     auto stage_raw_host_source = [&](const ggml_tensor * tensor, void * resolved_ptr, size_t span_bytes,
-                                     ggml_sycl::scoped_unified_alloc & stage) -> void * {
-        if (!ggml_sycl_binbcast_needs_raw_host_staging(tensor, resolved_ptr, device)) {
-            return resolved_ptr;
+                                     ggml_sycl::mem_handle & stage, ggml_sycl::mem_handle & weight_stage) -> void * {
+        void * source_ptr = resolved_ptr;
+        if (source_ptr == nullptr) {
+            source_ptr = ggml_sycl_resolve_or_host_tensor_ptr(tensor, device);
+            ggml_sycl_binbcast_tracef("fallback tensor=%s resolved=%p source=%p span=%zu",
+                                      tensor ? tensor->name : "(null)", resolved_ptr, source_ptr, span_bytes);
+        }
+        if (!ggml_sycl_binbcast_needs_raw_host_staging(tensor, source_ptr, device)) {
+            ggml_sycl_binbcast_tracef("no-stage tensor=%s ptr=%p span=%zu", tensor ? tensor->name : "(null)",
+                                      source_ptr, span_bytes);
+            return source_ptr;
         }
         if (span_bytes == 0) {
-            return resolved_ptr;
+            ggml_sycl_binbcast_tracef("zero-stage tensor=%s ptr=%p", tensor ? tensor->name : "(null)", source_ptr);
+            return source_ptr;
+        }
+
+        if (ggml_sycl_tensor_is_weight(tensor) && !g_ggml_sycl_graph_recording && span_bytes <= 1024ull * 1024ull) {
+            ggml_sycl_cache_id cache_key = ggml_backend_sycl_get_weight_cache_key(tensor, device);
+            ggml_sycl_binbcast_tracef(
+                "cache-stage-try tensor=%s bytes=%zu device=%d src=%p key_valid=%d model=%llu name_hash=0x%llx",
+                tensor ? tensor->name : "(null)", span_bytes, device, source_ptr, cache_key.valid ? 1 : 0,
+                (unsigned long long) cache_key.model_id, (unsigned long long) cache_key.name_hash);
+            if (cache_key.valid) {
+                ggml_sycl::mem_handle handle;
+                auto   result = ggml_sycl::unified_cache_direct_stage_weight(device, cache_key, source_ptr, span_bytes,
+                                                                             span_bytes, GGML_LAYOUT_AOS, nullptr,
+                                                                             nullptr, main_stream, &handle);
+                void * handle_ptr = handle.valid() ? handle.resolve(device).ptr : nullptr;
+                ggml_sycl_binbcast_tracef(
+                    "cache-stage-result tensor=%s ok=%d fill_failed=%d ptr=%p handle_valid=%d handle_ptr=%p",
+                    tensor ? tensor->name : "(null)", result.ok ? 1 : 0, result.fill_failed ? 1 : 0, result.ptr,
+                    handle.valid() ? 1 : 0, handle_ptr);
+                if (result.ok && result.ptr && handle.valid()) {
+                    if (result.event != sycl::event{}) {
+                        result.event.wait_and_throw();
+                    }
+                    weight_stage    = std::move(handle);
+                    staged_raw_host = true;
+                    ggml_sycl_binbcast_tracef("cache-stage tensor=%s bytes=%zu device=%d src=%p dst=%p",
+                                              tensor ? tensor->name : "(null)", span_bytes, device, source_ptr,
+                                              result.ptr);
+                    return result.ptr;
+                }
+            }
         }
 
         ggml_sycl::alloc_request req{};
@@ -531,31 +629,42 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
         req.intent.role                    = ggml_sycl::alloc_role::STAGING;
         req.intent.category                = ggml_sycl::runtime_category::COMPUTE;
         req.intent.constraints.must_device = true;
-        if (!stage.allocate(req) || stage.get() == nullptr) {
+        stage              = ggml_sycl::unified_allocate(req);
+        auto staged_result = stage.resolve(device);
+        if (!staged_result || !staged_result.on_device || staged_result.ptr == nullptr) {
             GGML_LOG_ERROR("[SYCL-BINBCAST] failed to stage raw host tensor=%s bytes=%zu device=%d\n",
                            tensor ? tensor->name : "(null)", span_bytes, device);
+            stage = {};
             return resolved_ptr;
         }
 
+        ggml_sycl_binbcast_tracef("stage tensor=%s bytes=%zu device=%d src=%p dst=%p", tensor ? tensor->name : "(null)",
+                                  span_bytes, device, source_ptr, staged_result.ptr);
         GGML_SYCL_DEBUG("[SYCL-BINBCAST] staging raw host tensor=%s bytes=%zu device=%d src=%p dst=%p\n",
-                        tensor ? tensor->name : "(null)", span_bytes, device, resolved_ptr, stage.get());
+                        tensor ? tensor->name : "(null)", span_bytes, device, source_ptr, staged_result.ptr);
         if (g_ggml_sycl_graph_recording) {
             throw std::runtime_error("bin-broadcast raw host staging is not graph-recordable");
         }
-        ggml_sycl_graph_safe_memcpy(*main_stream, stage.get(), resolved_ptr, span_bytes).wait();
+        ggml_sycl_graph_safe_memcpy(*main_stream, staged_result.ptr, source_ptr, span_bytes).wait();
+        ggml_sycl_binbcast_tracef("stage-copied tensor=%s dst=%p", tensor ? tensor->name : "(null)",
+                                  staged_result.ptr);
         staged_raw_host = true;
-        return stage.get();
+        return staged_result.ptr;
     };
 
     const size_t src0_need = max_end_bytes(ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03);
     const size_t src1_need = max_end_bytes(ne10, ne11, ne12, ne13, nb10, nb11, nb12, nb13);
-    src0_d                 = stage_raw_host_source(src0, src0_d, src0_need, src0_stage);
-    src1_d                 = stage_raw_host_source(src1, src1_d, src1_need, src1_stage);
+    src0_d                 = stage_raw_host_source(src0, src0_d, src0_need, src0_stage, src0_weight_stage);
+    src1_d                 = stage_raw_host_source(src1, src1_d, src1_need, src1_stage, src1_weight_stage);
 
     GGML_SYCL_DEBUG("[BINBCAST-PTR] src0=%s src0_host=%p src0_d=%p\n", src0 ? src0->name : "(null)",
                     src0 ? const_cast<void *>(ggml_sycl_host_data(src0)) : nullptr, src0_d);
     GGML_SYCL_DEBUG("[BINBCAST-PTR] src1=%s src1_host=%p src1_d=%p\n", src1 ? src1->name : "(null)",
                     src1 ? const_cast<void *>(ggml_sycl_host_data(src1)) : nullptr, src1_d);
+    ggml_sycl_binbcast_tracef("launch op=%s dst=%s src0_d=%p src1_d=%p dst_d=%p types=%s/%s/%s",
+                              dst ? ggml_op_name(dst->op) : "(null)", dst ? dst->name : "(null)", src0_d, src1_d, dst_d,
+                              src0 ? ggml_type_name(src0->type) : "(null)",
+                              src1 ? ggml_type_name(src1->type) : "(null)", dst ? ggml_type_name(dst->type) : "(null)");
 
     ggml_sycl::unified_cache * cache = nullptr;
 
@@ -641,6 +750,26 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
         GGML_ABORT("fatal error");
     }
 
+    sycl::event done_event;
+    bool        done_event_set = false;
+    auto ensure_done_event     = [&]() -> sycl::event {
+        if (!done_event_set) {
+            done_event     = ggml_sycl_submit_binbcast_event(*main_stream, ggml_sycl_get_binbcast_event_mode());
+            done_event_set = true;
+        }
+        return done_event;
+    };
+
+    if (dst && dst->op == GGML_OP_MUL && !g_ggml_sycl_graph_recording) {
+        try {
+            ggml_sycl_set_tensor_ready_event(dst, device, ensure_done_event());
+        } catch (...) {
+            // The op itself has already been submitted.  If event publication
+            // fails, leave the tensor without an async ready edge rather than
+            // converting a diagnostic synchronization aid into a hard failure.
+        }
+    }
+
     if (pin_count > 0 && cache) {
         try {
             const auto mode = ggml_sycl_get_binbcast_event_mode();
@@ -648,7 +777,10 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
                 GGML_LOG_INFO("[SYCL-BINBCAST] unpin event mode=%s pins=%d\n", ggml_sycl_binbcast_event_mode_name(mode),
                               pin_count);
             }
-            sycl::event done_event = ggml_sycl_submit_binbcast_event(*main_stream, mode);
+            if (!done_event_set) {
+                done_event     = ggml_sycl_submit_binbcast_event(*main_stream, mode);
+                done_event_set = true;
+            }
             for (int i = 0; i < pin_count; ++i) {
                 if (!pins[i].keep_pinned) {
                     cache->unpin_on_event(pins[i].key, pins[i].layout, done_event);
@@ -812,7 +944,7 @@ void ggml_sycl_mul(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) 
         if (g_ggml_sycl_tp_debug && raw_dst->ne[1] == 1 && layer == 0 && mul_b1_dbg++ < 5) {
             ctx.stream()->wait();
             float check[4];
-            ctx.stream()->memcpy(check, dst_ptr, 4 * sizeof(float)).wait();
+            ggml_sycl_binbcast_debug_read_f32(*ctx.stream(), ctx.device, check, dst_ptr, 4);
             fprintf(stderr, "TP DEBUG MUL ffn_norm-0 batch=1: caching dst_ptr=%p dst[0..3]=[%f,%f,%f,%f]\n", dst_ptr,
                     check[0], check[1], check[2], check[3]);
         }

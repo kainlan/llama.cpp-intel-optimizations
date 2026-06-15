@@ -8,7 +8,7 @@
 // This suggests the bug is in multi-tile coordination, not individual tile ops.
 //
 // Build: cmake --build build --target test-mmq-q6k-tile-boundary
-// Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-mmq-q6k-tile-boundary
+// Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-mmq-q6k-tile-boundary
 
 #include <cstdio>
 #include <cstdlib>

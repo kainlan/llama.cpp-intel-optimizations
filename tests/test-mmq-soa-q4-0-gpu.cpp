@@ -2,7 +2,7 @@
 // This test runs actual SYCL kernels to compare SoA vs AoS output
 //
 // Build: cmake --build build --target test-mmq-soa-q4-0-gpu
-// Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-mmq-soa-q4-0-gpu
+// Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-mmq-soa-q4-0-gpu
 
 #include <sycl/sycl.hpp>
 #include <cstdio>

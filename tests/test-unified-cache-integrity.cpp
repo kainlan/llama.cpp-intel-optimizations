@@ -1,7 +1,7 @@
 // Stress test for unified cache map integrity during layout caching.
 //
 // Usage:
-//   ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-unified-cache-integrity
+//   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-unified-cache-integrity
 
 #include <cstdio>
 #include <cstdlib>
@@ -137,7 +137,7 @@ static bool stress_layout_cache(ggml_context * ctx,
 
 int main() {
     if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:1", 1);
+        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
     }
 
     try {

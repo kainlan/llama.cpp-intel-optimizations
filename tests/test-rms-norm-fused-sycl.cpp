@@ -1,7 +1,7 @@
 // Test for SYCL fused RMS_NORM + MUL kernel.
 //
 // Build: cmake --build build --target test-rms-norm-fused-sycl
-// Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-rms-norm-fused-sycl
+// Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-rms-norm-fused-sycl
 
 #include <cmath>
 #include <cstdio>

@@ -188,9 +188,7 @@ static void build_layer_device_map(ggml_backend_sycl_context & ctx, int n_layers
     }
     g_layer_on_cpu.resize(n_layers, false);
 
-    auto * cache = ggml_sycl::unified_cache_enabled()
-                 ? ggml_sycl::get_unified_cache_for_device(ctx.device)
-                 : nullptr;
+    auto * cache = ggml_sycl::get_unified_cache_for_device(ctx.device);
     if (!cache) {
         g_layer_map_initialized.store(true, std::memory_order_release);
         return;

@@ -6,6 +6,7 @@
 #include "mmq_xmx.hpp"
 
 #include "common.hpp"
+#include "mem-ops.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -39,6 +40,44 @@ constexpr int XMX_SG_SIZE = 16;  // Sub-group size for Intel XMX
 constexpr int WG_M = XMX_M;  // 8 rows per work-group
 constexpr int WG_N = XMX_N;  // 16 cols per work-group
 
+static bool ggml_sycl_xmx_alloc_device_scratch(size_t                  bytes,
+                                               sycl::queue &           q,
+                                               int                     device,
+                                               const char *            cohort_id,
+                                               void **                 ptr,
+                                               ggml_sycl::mem_handle & owner) {
+    *ptr  = nullptr;
+    owner = {};
+    if (bytes == 0) {
+        return true;
+    }
+
+    ggml_sycl::alloc_request req{};
+    req.queue                               = &q;
+    req.device                              = device;
+    req.size                                = bytes;
+    req.intent.role                         = ggml_sycl::alloc_role::GRAPH_TMP;
+    req.intent.category                     = ggml_sycl::runtime_category::GRAPH;
+    req.intent.cohort_id                    = cohort_id;
+    req.intent.constraints.must_device      = true;
+    req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::SCRATCH;
+    req.suppress_failure_log                = true;
+
+    owner = ggml_sycl::unified_allocate(req);
+    if (!owner.valid()) {
+        return false;
+    }
+
+    auto resolved = owner.resolve(device);
+    if (!resolved || !resolved.ptr || !resolved.on_device) {
+        owner = {};
+        return false;
+    }
+
+    *ptr = resolved.ptr;
+    return true;
+}
+
 // =============================================================================
 // Q4_0 x Q8_1 XMX GEMM Kernel - Single-Tile with Vectorized Loads
 // Computes: C[M,N] = A[M,K] * B[K,N] where A is Q4_0 weights, B is Q8_1 activations
@@ -65,10 +104,10 @@ constexpr int SLM_SCALES_A_SIZE_DB = SLM_SCALES_A_SIZE * 2;  // 16 floats
 constexpr int SLM_SCALES_B_SIZE_DB = SLM_SCALES_B_SIZE * 2;  // 32 floats
 constexpr int SLM_SUMS_B_SIZE_DB   = SLM_SUMS_B_SIZE * 2;    // 32 floats
 
-static inline int64_t xmx_gemm_weight_block_index(int row,
-                                                  int block_idx,
-                                                  int blocks_per_row,
-                                                  int tile_m,
+static inline int64_t xmx_gemm_weight_block_index(int  row,
+                                                  int  block_idx,
+                                                  int  blocks_per_row,
+                                                  int  tile_m,
                                                   bool use_tiled) {
     if (!use_tiled) {
         return static_cast<int64_t>(row) * blocks_per_row + block_idx;
@@ -97,8 +136,8 @@ void mul_mat_q4_0_q8_1_xmx_kernel(
     float * __restrict__ slm_scales_A,  // SLM for A scales [8]
     float * __restrict__ slm_scales_B,  // SLM for B scales [16]
     float * __restrict__ slm_sums_B,    // SLM for B sums [16] - for Q8_1 sum field
-    const int tile_m,
-    const bool use_tiled,
+    const int        tile_m,
+    const bool       use_tiled,
     sycl::nd_item<2> item) {
     const auto sg      = item.get_sub_group();
     const int  lane_id = sg.get_local_id()[0];
@@ -130,7 +169,7 @@ void mul_mat_q4_0_q8_1_xmx_kernel(
             int row = row_base + lane_id;
             if (row < nrows_x) {
                 const int64_t block_idx = xmx_gemm_weight_block_index(row, k_block, num_k_blocks, tile_m, use_tiled);
-                const char * block_ptr = src0 + block_idx * Q4_0_BLOCK_SIZE;
+                const char *  block_ptr = src0 + block_idx * Q4_0_BLOCK_SIZE;
 
                 // Load scale
                 sycl::half d          = *reinterpret_cast<const sycl::half *>(block_ptr);
@@ -262,8 +301,8 @@ void mul_mat_q4_0_q8_1_xmx_doublebuf_kernel(
     float * __restrict__ slm_scales_A,  // SLM for A scales [2 × 8]
     float * __restrict__ slm_scales_B,  // SLM for B scales [2 × 16]
     float * __restrict__ slm_sums_B,    // SLM for B sums [2 × 16]
-    const int tile_m,
-    const bool use_tiled,
+    const int        tile_m,
+    const bool       use_tiled,
     sycl::nd_item<2> item) {
     const auto sg      = item.get_sub_group();
     const int  lane_id = sg.get_local_id()[0];
@@ -298,8 +337,8 @@ void mul_mat_q4_0_q8_1_xmx_doublebuf_kernel(
             int row = row_base + lane_id;
             if (row < nrows_x) {
                 const int64_t block_idx = xmx_gemm_weight_block_index(row, 0, num_k_blocks, tile_m, use_tiled);
-                const char * block_ptr = src0 + block_idx * Q4_0_BLOCK_SIZE;
-                sycl::half   d         = *reinterpret_cast<const sycl::half *>(block_ptr);
+                const char *  block_ptr = src0 + block_idx * Q4_0_BLOCK_SIZE;
+                sycl::half    d         = *reinterpret_cast<const sycl::half *>(block_ptr);
                 slm_scales_A[buf_load * SLM_SCALES_A_SIZE + lane_id] = float(d);
 
                 // Load and unpack Q4_0 nibbles (simple scalar - memory bound anyway)
@@ -367,8 +406,8 @@ void mul_mat_q4_0_q8_1_xmx_doublebuf_kernel(
                 int row = row_base + lane_id;
                 if (row < nrows_x) {
                     const int64_t block_idx = xmx_gemm_weight_block_index(row, next_k, num_k_blocks, tile_m, use_tiled);
-                    const char * block_ptr = src0 + block_idx * Q4_0_BLOCK_SIZE;
-                    sycl::half   d         = *reinterpret_cast<const sycl::half *>(block_ptr);
+                    const char *  block_ptr = src0 + block_idx * Q4_0_BLOCK_SIZE;
+                    sycl::half    d         = *reinterpret_cast<const sycl::half *>(block_ptr);
                     slm_scales_A[buf_load * SLM_SCALES_A_SIZE + lane_id] = float(d);
 
                     // Load and unpack Q4_0 nibbles
@@ -505,8 +544,8 @@ void mul_mat_q4_0_q8_1_xmx_multitile_kernel(
     float * __restrict__ slm_scales_A,  // SLM for A scales [2 × 8]
     float * __restrict__ slm_scales_B,  // SLM for shared B scales [16]
     float * __restrict__ slm_sums_B,    // SLM for shared B sums [16]
-    const int tile_m,
-    const bool use_tiled,
+    const int        tile_m,
+    const bool       use_tiled,
     sycl::nd_item<2> item) {
     const auto sg      = item.get_sub_group();
     const int  sg_id   = sg.get_group_id()[0];  // Which sub-group (0 or 1)
@@ -544,7 +583,7 @@ void mul_mat_q4_0_q8_1_xmx_multitile_kernel(
             int row = row_base + lane_id;
             if (row < nrows_x) {
                 const int64_t block_idx = xmx_gemm_weight_block_index(row, k_block, num_k_blocks, tile_m, use_tiled);
-                const char * block_ptr = src0 + block_idx * Q4_0_BLOCK_SIZE;
+                const char *  block_ptr = src0 + block_idx * Q4_0_BLOCK_SIZE;
 
                 // Load scale
                 sycl::half d             = *reinterpret_cast<const sycl::half *>(block_ptr);
@@ -682,8 +721,8 @@ void mul_mat_q4_0_q8_1_xmx_largetile_kernel(const void * __restrict__ vx,       
                                             float * __restrict__ slm_scales_A,  // SLM for A scales [8 × 8]
                                             float * __restrict__ slm_scales_B,  // SLM for B scales [4 × 16]
                                             float * __restrict__ slm_sums_B,    // SLM for B sums [4 × 16]
-                                            const int tile_m,
-                                            const bool use_tiled,
+                                            const int        tile_m,
+                                            const bool       use_tiled,
                                             sycl::nd_item<2> item) {
     const auto sg      = item.get_sub_group();
     const int  sg_id   = sg.get_group_id()[0];  // Which sub-group (0-31)
@@ -729,9 +768,9 @@ void mul_mat_q4_0_q8_1_xmx_largetile_kernel(const void * __restrict__ vx,       
         if (sg_col == 0 && lane_id < XMX_M) {
             int row = row_base + lane_id;
             if (row < nrows_x) {
-                const int64_t block_idx = xmx_gemm_weight_block_index(row, k_block, num_k_blocks, tile_m, use_tiled);
-                const char * block_ptr = src0 + block_idx * Q4_0_BLOCK_SIZE;
-                sycl::half   d           = *reinterpret_cast<const sycl::half *>(block_ptr);
+                const int64_t block_idx  = xmx_gemm_weight_block_index(row, k_block, num_k_blocks, tile_m, use_tiled);
+                const char *  block_ptr  = src0 + block_idx * Q4_0_BLOCK_SIZE;
+                sycl::half    d          = *reinterpret_cast<const sycl::half *>(block_ptr);
                 my_slm_scales_A[lane_id] = float(d);
 
                 // Vectorized nibble unpacking: load 16 bytes as 4x uint32, unpack to 32 int8
@@ -871,8 +910,8 @@ void mul_mat_q4_0_q8_1_xmx_multitile_db_kernel(const void * __restrict__ vx,    
                                                float * __restrict__ slm_scales_A,  // SLM for A scales [2 × 4 × 8]
                                                float * __restrict__ slm_scales_B,  // SLM for B scales [2 × 16]
                                                float * __restrict__ slm_sums_B,    // SLM for B sums [2 × 16]
-                                               const int tile_m,
-                                               const bool use_tiled,
+                                               const int        tile_m,
+                                               const bool       use_tiled,
                                                sycl::nd_item<2> item) {
     const auto sg      = item.get_sub_group();
     const int  sg_id   = sg.get_group_id()[0];
@@ -907,9 +946,9 @@ void mul_mat_q4_0_q8_1_xmx_multitile_db_kernel(const void * __restrict__ vx,    
             int row = row_base + lane_id;
             if (row < nrows_x) {
                 const int64_t block_idx = xmx_gemm_weight_block_index(row, k_block, num_k_blocks, tile_m, use_tiled);
-                const char * block_ptr = src0 + block_idx * Q4_0_BLOCK_SIZE;
-                sycl::half   d         = *reinterpret_cast<const sycl::half *>(block_ptr);
-                buf_scales_A[lane_id]  = float(d);
+                const char *  block_ptr = src0 + block_idx * Q4_0_BLOCK_SIZE;
+                sycl::half    d         = *reinterpret_cast<const sycl::half *>(block_ptr);
+                buf_scales_A[lane_id]   = float(d);
 
                 const uint8_t * nibbles  = reinterpret_cast<const uint8_t *>(block_ptr + 2);
                 int             base_idx = lane_id * XMX_K;
@@ -1062,8 +1101,8 @@ void mul_mat_q4_0_q8_1_xmx_colfused_kernel(const void * __restrict__ vx,       /
                                            float * __restrict__ slm_scales_A,  // SLM for A scales [8] - SHARED
                                            float * __restrict__ slm_scales_B,  // SLM for B scales [2 × 16]
                                            float * __restrict__ slm_sums_B,    // SLM for B sums [2 × 16]
-                                           const int tile_m,
-                                           const bool use_tiled,
+                                           const int        tile_m,
+                                           const bool       use_tiled,
                                            sycl::nd_item<2> item) {
     const auto sg      = item.get_sub_group();
     const int  sg_id   = item.get_local_id(0);  // Which sub-group (0-1)
@@ -1107,9 +1146,9 @@ void mul_mat_q4_0_q8_1_xmx_colfused_kernel(const void * __restrict__ vx,       /
             int row = row_base + lane_id;
             if (row < nrows_x) {
                 const int64_t block_idx = xmx_gemm_weight_block_index(row, k_block, num_k_blocks, tile_m, use_tiled);
-                const char * block_ptr = src0 + block_idx * Q4_0_BLOCK_SIZE;
-                sycl::half   d         = *reinterpret_cast<const sycl::half *>(block_ptr);
-                slm_scales_A[lane_id]  = float(d);
+                const char *  block_ptr = src0 + block_idx * Q4_0_BLOCK_SIZE;
+                sycl::half    d         = *reinterpret_cast<const sycl::half *>(block_ptr);
+                slm_scales_A[lane_id]   = float(d);
 
                 const uint8_t * nibbles  = reinterpret_cast<const uint8_t *>(block_ptr + 2);
                 int             base_idx = lane_id * XMX_K;
@@ -1304,8 +1343,8 @@ void mul_mat_q4_0_q8_1_xmx_colfused_4tile_kernel(const void * __restrict__ vx,
                                                  float * __restrict__ slm_scales_A,
                                                  float * __restrict__ slm_scales_B,
                                                  float * __restrict__ slm_sums_B,
-                                                 const int tile_m,
-                                                 const bool use_tiled,
+                                                 const int        tile_m,
+                                                 const bool       use_tiled,
                                                  sycl::nd_item<2> item) {
     const auto sg      = item.get_sub_group();
     const int  lane_id = sg.get_local_id()[0];
@@ -1342,9 +1381,9 @@ void mul_mat_q4_0_q8_1_xmx_colfused_4tile_kernel(const void * __restrict__ vx,
             int row = row_base + lane_id;
             if (row < nrows_x) {
                 const int64_t block_idx = xmx_gemm_weight_block_index(row, k_block, num_k_blocks, tile_m, use_tiled);
-                const char * block_ptr = src0 + block_idx * Q4_0_BLOCK_SIZE;
-                sycl::half   d         = *reinterpret_cast<const sycl::half *>(block_ptr);
-                slm_scales_A[lane_id]  = float(d);
+                const char *  block_ptr = src0 + block_idx * Q4_0_BLOCK_SIZE;
+                sycl::half    d         = *reinterpret_cast<const sycl::half *>(block_ptr);
+                slm_scales_A[lane_id]   = float(d);
 
                 const uint8_t * nibbles  = reinterpret_cast<const uint8_t *>(block_ptr + 2);
                 int             base_idx = lane_id * XMX_K;
@@ -1452,15 +1491,15 @@ void mul_mat_q4_0_q8_1_xmx_colfused_4tile_kernel(const void * __restrict__ vx,
 
 // 4-tile sequential launcher
 static void ggml_mul_mat_q4_0_q8_1_xmx_colfused_4tile_sycl(const void *    vx,
-                                                          const void *    vy,
-                                                          float *         dst,
-                                                          const int       ncols_x,
-                                                          const int       nrows_x,
-                                                          const int       ncols_y,
-                                                          const int       nrows_dst,
-                                                          const int       tile_m,
-                                                          const bool      use_tiled,
-                                                          dpct::queue_ptr stream) {
+                                                           const void *    vy,
+                                                           float *         dst,
+                                                           const int       ncols_x,
+                                                           const int       nrows_x,
+                                                           const int       ncols_y,
+                                                           const int       nrows_dst,
+                                                           const int       tile_m,
+                                                           const bool      use_tiled,
+                                                           dpct::queue_ptr stream) {
     const int num_row_tiles  = (nrows_x + XMX_M - 1) / XMX_M;
     const int cols_per_wg    = CF4_MAX_COL_TILES * XMX_N;  // 64 columns per work-group
     const int num_col_groups = (ncols_y + cols_per_wg - 1) / cols_per_wg;
@@ -1501,10 +1540,9 @@ static void ggml_mul_mat_q4_0_q8_1_xmx_colfused_4tile_sycl(const void *    vx,
                            offset += CF4_SLM_SCALES_B_SIZE;
                            float * slm_sums_B = reinterpret_cast<float *>(shared + offset);
 
-                           mul_mat_q4_0_q8_1_xmx_colfused_4tile_kernel(vx, vy, dst, ncols_x, nrows_x, ncols_y,
-                                                                       nrows_dst, slm_A, slm_B, slm_C, slm_scales_A,
-                                                                       slm_scales_B, slm_sums_B, tile_m, use_tiled,
-                                                                       item);
+                           mul_mat_q4_0_q8_1_xmx_colfused_4tile_kernel(
+                               vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_dst, slm_A, slm_B, slm_C, slm_scales_A,
+                               slm_scales_B, slm_sums_B, tile_m, use_tiled, item);
                        });
     });
 }
@@ -1525,8 +1563,8 @@ void mul_mat_q8_0_q8_1_xmx_kernel(const void * __restrict__ vx,       // Q8_0 we
                                   int32_t * __restrict__ slm_C,       // SLM for C tile [8 × 16]
                                   float * __restrict__ slm_scales_A,  // SLM for A scales [8]
                                   float * __restrict__ slm_scales_B,  // SLM for B scales [16]
-                                  const int tile_m,
-                                  const bool use_tiled,
+                                  const int        tile_m,
+                                  const bool       use_tiled,
                                   sycl::nd_item<2> item) {
     const auto sg      = item.get_sub_group();
     const int  lane_id = sg.get_local_id()[0];
@@ -1557,7 +1595,7 @@ void mul_mat_q8_0_q8_1_xmx_kernel(const void * __restrict__ vx,       // Q8_0 we
             int row = row_base + lane_id;
             if (row < nrows_x) {
                 const int64_t block_idx = xmx_gemm_weight_block_index(row, k_block, num_k_blocks, tile_m, use_tiled);
-                const char * block_ptr = src0 + block_idx * Q8_0_BLOCK_SIZE;
+                const char *  block_ptr = src0 + block_idx * Q8_0_BLOCK_SIZE;
 
                 // Load scale
                 sycl::half d          = *reinterpret_cast<const sycl::half *>(block_ptr);
@@ -1688,8 +1726,8 @@ void mul_mat_q8_0_q8_1_xmx_largetile_kernel(const void * __restrict__ vx,       
                                             int32_t * __restrict__ slm_C,       // SLM for C tiles [32 × 8 × 16]
                                             float * __restrict__ slm_scales_A,  // SLM for A scales [8 × 8]
                                             float * __restrict__ slm_scales_B,  // SLM for B scales [4 × 16]
-                                            const int tile_m,
-                                            const bool use_tiled,
+                                            const int        tile_m,
+                                            const bool       use_tiled,
                                             sycl::nd_item<2> item) {
     const auto sg      = item.get_sub_group();
     const int  sg_id   = sg.get_group_id()[0];  // Which sub-group (0-31)
@@ -1736,9 +1774,9 @@ void mul_mat_q8_0_q8_1_xmx_largetile_kernel(const void * __restrict__ vx,       
         if (sg_col == 0 && lane_id < XMX_M) {
             int row = row_base + lane_id;
             if (row < nrows_x) {
-                const int64_t block_idx = xmx_gemm_weight_block_index(row, k_block, num_k_blocks, tile_m, use_tiled);
-                const char * block_ptr = src0 + block_idx * Q8_0_BLOCK_SIZE;
-                sycl::half   d           = *reinterpret_cast<const sycl::half *>(block_ptr);
+                const int64_t block_idx  = xmx_gemm_weight_block_index(row, k_block, num_k_blocks, tile_m, use_tiled);
+                const char *  block_ptr  = src0 + block_idx * Q8_0_BLOCK_SIZE;
+                sycl::half    d          = *reinterpret_cast<const sycl::half *>(block_ptr);
                 my_slm_scales_A[lane_id] = float(d);
 
                 // Load 32 int8 values directly (no unpacking needed for Q8_0!)
@@ -1851,8 +1889,8 @@ void mul_mat_q4_1_q8_1_xmx_kernel(const void * __restrict__ vx,       // Q4_1 we
                                   float * __restrict__ slm_scales_B,  // SLM for B scales [16]
                                   float * __restrict__ slm_mins_A,    // SLM for A mins [8]
                                   float * __restrict__ slm_sums_B,    // SLM for B sums [16]
-                                  const int tile_m,
-                                  const bool use_tiled,
+                                  const int        tile_m,
+                                  const bool       use_tiled,
                                   sycl::nd_item<2> item) {
     const auto sg      = item.get_sub_group();
     const int  lane_id = sg.get_local_id()[0];
@@ -1879,7 +1917,7 @@ void mul_mat_q4_1_q8_1_xmx_kernel(const void * __restrict__ vx,       // Q4_1 we
             int row = row_base + lane_id;
             if (row < nrows_x) {
                 const int64_t block_idx = xmx_gemm_weight_block_index(row, k_block, num_k_blocks, tile_m, use_tiled);
-                const char * block_ptr = src0 + block_idx * Q4_1_BLOCK_SIZE;
+                const char *  block_ptr = src0 + block_idx * Q4_1_BLOCK_SIZE;
 
                 sycl::half d          = *reinterpret_cast<const sycl::half *>(block_ptr);
                 sycl::half m          = *reinterpret_cast<const sycl::half *>(block_ptr + 2);
@@ -2058,8 +2096,8 @@ void mul_mat_q5_0_q8_1_xmx_kernel(const void * __restrict__ vx,       // Q5_0 we
                                   int32_t * __restrict__ slm_C,       // SLM for C tile [8 × 16]
                                   float * __restrict__ slm_scales_A,  // SLM for A scales [8]
                                   float * __restrict__ slm_scales_B,  // SLM for B scales [16]
-                                  const int tile_m,
-                                  const bool use_tiled,
+                                  const int        tile_m,
+                                  const bool       use_tiled,
                                   sycl::nd_item<2> item) {
     const auto sg      = item.get_sub_group();
     const int  lane_id = sg.get_local_id()[0];
@@ -2086,7 +2124,7 @@ void mul_mat_q5_0_q8_1_xmx_kernel(const void * __restrict__ vx,       // Q5_0 we
             int row = row_base + lane_id;
             if (row < nrows_x) {
                 const int64_t block_idx = xmx_gemm_weight_block_index(row, k_block, num_k_blocks, tile_m, use_tiled);
-                const char * block_ptr = src0 + block_idx * Q5_0_BLOCK_SIZE;
+                const char *  block_ptr = src0 + block_idx * Q5_0_BLOCK_SIZE;
 
                 sycl::half d          = *reinterpret_cast<const sycl::half *>(block_ptr);
                 slm_scales_A[lane_id] = float(d);
@@ -2266,8 +2304,8 @@ void mul_mat_q5_1_q8_1_xmx_kernel(const void * __restrict__ vx,       // Q5_1 we
                                   float * __restrict__ slm_scales_B,  // SLM for B scales [16]
                                   float * __restrict__ slm_mins_A,    // SLM for A mins [8]
                                   float * __restrict__ slm_sums_B,    // SLM for B sums [16]
-                                  const int tile_m,
-                                  const bool use_tiled,
+                                  const int        tile_m,
+                                  const bool       use_tiled,
                                   sycl::nd_item<2> item) {
     const auto sg      = item.get_sub_group();
     const int  lane_id = sg.get_local_id()[0];
@@ -2294,7 +2332,7 @@ void mul_mat_q5_1_q8_1_xmx_kernel(const void * __restrict__ vx,       // Q5_1 we
             int row = row_base + lane_id;
             if (row < nrows_x) {
                 const int64_t block_idx = xmx_gemm_weight_block_index(row, k_block, num_k_blocks, tile_m, use_tiled);
-                const char * block_ptr = src0 + block_idx * Q5_1_BLOCK_SIZE;
+                const char *  block_ptr = src0 + block_idx * Q5_1_BLOCK_SIZE;
 
                 sycl::half d          = *reinterpret_cast<const sycl::half *>(block_ptr);
                 sycl::half m          = *reinterpret_cast<const sycl::half *>(block_ptr + 2);
@@ -2483,8 +2521,8 @@ void mul_mat_q3_K_q8_1_xmx_kernel(const void * __restrict__ vx,  // Q3_K weights
                                   int32_t * __restrict__ slm_C,  // SLM for C tile [8 × 16]
                                   float * __restrict__ slm_scales_A,  // SLM for A scales [8]
                                   float * __restrict__ slm_scales_B,  // SLM for B scales [16]
-                                  const int tile_m,
-                                  const bool use_tiled,
+                                  const int        tile_m,
+                                  const bool       use_tiled,
                                   sycl::nd_item<2> item) {
     const auto sg      = item.get_sub_group();
     const int  lane_id = sg.get_local_id()[0];
@@ -2518,7 +2556,8 @@ void mul_mat_q3_K_q8_1_xmx_kernel(const void * __restrict__ vx,  // Q3_K weights
         if (lane_id < XMX_M) {
             int row = row_base + lane_id;
             if (row < nrows_x) {
-                const int64_t block_idx = xmx_gemm_weight_block_index(row, super_block_idx, num_super_blocks, tile_m, use_tiled);
+                const int64_t block_idx =
+                    xmx_gemm_weight_block_index(row, super_block_idx, num_super_blocks, tile_m, use_tiled);
                 const char * sb_ptr = src0 + block_idx * Q3_K_BLOCK_SIZE;
 
                 // Super-block scale
@@ -2742,8 +2781,8 @@ void mul_mat_q5_K_q8_1_xmx_kernel(const void * __restrict__ vx,  // Q5_K weights
                                   float * __restrict__ slm_scales_B,  // SLM for B scales [16]
                                   float * __restrict__ slm_mins_A,    // SLM for A mins [8]
                                   float * __restrict__ slm_sums_B,    // SLM for B sums [16]
-                                  const int tile_m,
-                                  const bool use_tiled,
+                                  const int        tile_m,
+                                  const bool       use_tiled,
                                   sycl::nd_item<2> item) {
     const auto sg      = item.get_sub_group();
     const int  lane_id = sg.get_local_id()[0];
@@ -2778,7 +2817,8 @@ void mul_mat_q5_K_q8_1_xmx_kernel(const void * __restrict__ vx,  // Q5_K weights
         if (lane_id < XMX_M) {
             int row = row_base + lane_id;
             if (row < nrows_x) {
-                const int64_t block_idx = xmx_gemm_weight_block_index(row, super_block_idx, num_super_blocks, tile_m, use_tiled);
+                const int64_t block_idx =
+                    xmx_gemm_weight_block_index(row, super_block_idx, num_super_blocks, tile_m, use_tiled);
                 const char * sb_ptr = src0 + block_idx * Q5_K_BLOCK_SIZE;
 
                 // Super-block scales (d and dmin)
@@ -2994,8 +3034,8 @@ void mul_mat_q4_K_q8_1_xmx_kernel(const void * __restrict__ vx,  // Q4_K weights
                                   float * __restrict__ slm_scales_B,  // SLM for B scales [16]
                                   float * __restrict__ slm_mins_A,    // SLM for A mins [8]
                                   float * __restrict__ slm_sums_B,    // SLM for B sums [16]
-                                  const int tile_m,
-                                  const bool use_tiled,
+                                  const int        tile_m,
+                                  const bool       use_tiled,
                                   sycl::nd_item<2> item) {
     const auto sg      = item.get_sub_group();
     const int  lane_id = sg.get_local_id()[0];
@@ -3032,7 +3072,8 @@ void mul_mat_q4_K_q8_1_xmx_kernel(const void * __restrict__ vx,  // Q4_K weights
         if (lane_id < XMX_M) {
             int row = row_base + lane_id;
             if (row < nrows_x) {
-                const int64_t block_idx = xmx_gemm_weight_block_index(row, super_block_idx, num_super_blocks, tile_m, use_tiled);
+                const int64_t block_idx =
+                    xmx_gemm_weight_block_index(row, super_block_idx, num_super_blocks, tile_m, use_tiled);
                 const char * sb_ptr = src0 + block_idx * Q4_K_BLOCK_SIZE;
 
                 // Super-block scales
@@ -3238,8 +3279,8 @@ void mul_mat_q2_K_q8_1_xmx_kernel(const void * __restrict__ vx,
                                   float * __restrict__ slm_scales_B,
                                   float * __restrict__ slm_mins_A,
                                   float * __restrict__ slm_sums_B,
-                                  const int tile_m,
-                                  const bool use_tiled,
+                                  const int        tile_m,
+                                  const bool       use_tiled,
                                   sycl::nd_item<2> item) {
     const auto sg      = item.get_sub_group();
     const int  lane_id = sg.get_local_id()[0];
@@ -3273,7 +3314,8 @@ void mul_mat_q2_K_q8_1_xmx_kernel(const void * __restrict__ vx,
         if (lane_id < XMX_M) {
             int row = row_base + lane_id;
             if (row < nrows_x) {
-                const int64_t block_idx = xmx_gemm_weight_block_index(row, super_block_idx, num_super_blocks, tile_m, use_tiled);
+                const int64_t block_idx =
+                    xmx_gemm_weight_block_index(row, super_block_idx, num_super_blocks, tile_m, use_tiled);
                 const char * sb_ptr = src0 + block_idx * Q2_K_BLOCK_SIZE;
 
                 // dm[0] = dall, dm[1] = dmin
@@ -3462,8 +3504,8 @@ void mul_mat_q6_K_q8_1_xmx_kernel(const void * __restrict__ vx,
                                   int32_t * __restrict__ slm_C,
                                   float * __restrict__ slm_scales_A,
                                   float * __restrict__ slm_scales_B,
-                                  const int tile_m,
-                                  const bool use_tiled,
+                                  const int        tile_m,
+                                  const bool       use_tiled,
                                   sycl::nd_item<2> item) {
     const auto sg      = item.get_sub_group();
     const int  lane_id = sg.get_local_id()[0];
@@ -3497,7 +3539,8 @@ void mul_mat_q6_K_q8_1_xmx_kernel(const void * __restrict__ vx,
         if (lane_id < XMX_M) {
             int row = row_base + lane_id;
             if (row < nrows_x) {
-                const int64_t block_idx = xmx_gemm_weight_block_index(row, super_block_idx, num_super_blocks, tile_m, use_tiled);
+                const int64_t block_idx =
+                    xmx_gemm_weight_block_index(row, super_block_idx, num_super_blocks, tile_m, use_tiled);
                 const char * sb_ptr = src0 + block_idx * Q6_K_BLOCK_SIZE;
 
                 const uint8_t * ql     = reinterpret_cast<const uint8_t *>(sb_ptr);
@@ -3928,7 +3971,7 @@ static void ggml_mul_mat_q4_0_q8_1_xmx_sycl(const void *    vx,
     if (ncols_y > 32) {
         // 4-tile sequential is better for batch 33-64 (handles 3-4 column tiles efficiently)
         ggml_mul_mat_q4_0_q8_1_xmx_colfused_4tile_sycl(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_dst, tile_m,
-                                                      use_tiled, stream);
+                                                       use_tiled, stream);
         return;
     }
     if (ncols_y > 16) {
@@ -4016,8 +4059,8 @@ void ggml_sycl_op_mul_mat_q_xmx(ggml_backend_sycl_context & ctx,
     int device_id;
     SYCL_CHECK(CHECK_TRY_ERROR(device_id = get_current_device_id()));
 
-    const auto & caps = ggml_sycl_info().devices[device_id].xmx_caps;
-    int          tile_m = static_cast<int>(caps.M);
+    const auto & caps      = ggml_sycl_info().devices[device_id].xmx_caps;
+    int          tile_m    = static_cast<int>(caps.M);
     bool         use_tiled = false;
     if (const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra)) {
         use_tiled = get_effective_layout_mode(extra) == GGML_LAYOUT_XMX_GEMM_TILED;
@@ -4127,15 +4170,34 @@ bool ggml_sycl_xmx_supports_type(ggml_type type) {
 
 void xmx_test_kernel(sycl::queue & q) {
     constexpr int M = 8, N = 16, K = 32;
-    int8_t *      d_A = ggml_sycl_malloc_device_tracked_t<int8_t>(M * K, q, "mmq_xmx_test");
-    int8_t *      d_B = ggml_sycl_malloc_device_tracked_t<int8_t>(K * N, q, "mmq_xmx_test");
-    int32_t *     d_C = ggml_sycl_malloc_device_tracked_t<int32_t>(M * N, q, "mmq_xmx_test");
+    const int     device = ggml_sycl_get_device_id_from_queue(q);
+    int8_t *      d_A    = nullptr;
+    int8_t *      d_B    = nullptr;
+    int32_t *     d_C    = nullptr;
 
-    std::vector<int8_t> h_A(M * K, 1);
-    std::vector<int8_t> h_B(K * N, 2);
-    q.memcpy(d_A, h_A.data(), M * K * sizeof(int8_t));
-    q.memcpy(d_B, h_B.data(), K * N * sizeof(int8_t));
-    q.wait();
+    ggml_sycl::mem_handle d_A_owner;
+    ggml_sycl::mem_handle d_B_owner;
+    ggml_sycl::mem_handle d_C_owner;
+
+    const bool alloc_ok = ggml_sycl_xmx_alloc_device_scratch(M * K * sizeof(int8_t), q, device, "mmq_xmx_test_A",
+                                                             (void **) &d_A, d_A_owner) &&
+                          ggml_sycl_xmx_alloc_device_scratch(K * N * sizeof(int8_t), q, device, "mmq_xmx_test_B",
+                                                             (void **) &d_B, d_B_owner) &&
+                          ggml_sycl_xmx_alloc_device_scratch(M * N * sizeof(int32_t), q, device, "mmq_xmx_test_C",
+                                                             (void **) &d_C, d_C_owner);
+    if (!alloc_ok) {
+        GGML_LOG_WARN("XMX Int8 test skipped: failed to allocate unified-cache device scratch\n");
+        return;
+    }
+
+    std::vector<int8_t>   h_A(M * K, 1);
+    std::vector<int8_t>   h_B(K * N, 2);
+    ggml_sycl::mem_handle h_A_handle =
+        ggml_sycl::mem_handle::from_direct(h_A.data(), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+    ggml_sycl::mem_handle h_B_handle =
+        ggml_sycl::mem_handle::from_direct(h_B.data(), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+    ggml_sycl::mem_copy(d_A_owner, h_A_handle, M * K * sizeof(int8_t), q);
+    ggml_sycl::mem_copy(d_B_owner, h_B_handle, K * N * sizeof(int8_t), q);
 
     q.submit([&](sycl::handler & h) {
          h.parallel_for(sycl::nd_range<1>(16, 16), [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
@@ -4164,8 +4226,10 @@ void xmx_test_kernel(sycl::queue & q) {
          });
      }).wait();
 
-    std::vector<int32_t> h_C(M * N);
-    q.memcpy(h_C.data(), d_C, M * N * sizeof(int32_t)).wait();
+    std::vector<int32_t>  h_C(M * N);
+    ggml_sycl::mem_handle h_C_handle =
+        ggml_sycl::mem_handle::from_direct(h_C.data(), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+    ggml_sycl::mem_copy(h_C_handle, d_C_owner, M * N * sizeof(int32_t), q);
 
     bool pass     = true;
     int  expected = 1 * 2 * K;
@@ -4182,9 +4246,9 @@ void xmx_test_kernel(sycl::queue & q) {
         GGML_LOG_WARN("XMX Int8 test FAILED: got %d, expected %d\n", h_C[0], expected);
     }
 
-    ggml_sycl_free_device_tracked_t(d_A, M * K, q);
-    ggml_sycl_free_device_tracked_t(d_B, K * N, q);
-    ggml_sycl_free_device_tracked_t(d_C, M * N, q);
+    d_C_owner = {};
+    d_B_owner = {};
+    d_A_owner = {};
 }
 
 void ggml_sycl_xmx_test_func(ggml_backend_sycl_context & ctx) {

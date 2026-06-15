@@ -5,7 +5,7 @@
  * between SoA kernel variants (reorder/simple/direct).
  *
  * Build: cmake --build build --target test-q8-0-dmmv-soa-bisect
- * Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-q8-0-dmmv-soa-bisect
+ * Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-q8-0-dmmv-soa-bisect
  */
 
 #include <cstdio>

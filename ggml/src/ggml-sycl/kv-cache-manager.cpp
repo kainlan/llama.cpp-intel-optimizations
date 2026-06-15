@@ -18,6 +18,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace ggml_sycl {
@@ -34,13 +35,25 @@ struct KVHeadEntry {
     bool             pinned;
     MemoryTier       tier;
 
-    // Data pointers
-    void * device_ptr;
-    void * host_ptr;
+    // Simulated storage for the stub implementation.  Real device/host
+    // placement will be owned by unified-cache handles in the production path.
+    std::vector<uint8_t> device_storage;
+    std::vector<uint8_t> host_storage;
 
     // Size in bytes
-    size_t size;
+    size_t size = 0;
 };
+
+static void * kv_storage_ptr(std::vector<uint8_t> & storage) {
+    return storage.empty() ? nullptr : storage.data();
+}
+
+static void * kv_active_storage_ptr(KVHeadEntry & entry) {
+    if (entry.tier == MemoryTier::VRAM && !entry.device_storage.empty()) {
+        return entry.device_storage.data();
+    }
+    return kv_storage_ptr(entry.host_storage);
+}
 
 struct KVCacheManager::Impl {
     // Configuration
@@ -69,16 +82,6 @@ struct KVCacheManager::Impl {
 KVCacheManager::KVCacheManager() : impl_(new Impl()) {}
 
 KVCacheManager::~KVCacheManager() {
-    // Free any allocated memory
-    for (auto & [id, entry] : impl_->entries) {
-        if (entry.device_ptr) {
-            // In real impl: sycl::free(entry.device_ptr, queue)
-            free(entry.device_ptr);
-        }
-        if (entry.host_ptr) {
-            free(entry.host_ptr);
-        }
-    }
     delete impl_;
 }
 
@@ -130,13 +133,13 @@ KVHandle KVCacheManager::allocate(uint32_t layer, uint32_t head, size_t seq_pos,
     entry.size        = size;
 
     // Allocate host memory
-    entry.host_ptr   = malloc(size);
-    entry.device_ptr = nullptr;
+    entry.host_storage.resize(size);
 
-    impl_->entries[entry.id] = entry;
+    const uint64_t id  = entry.id;
+    impl_->entries[id] = std::move(entry);
     impl_->total_host += size;
 
-    return KVHandle{ entry.id };
+    return KVHandle{ id };
 }
 
 KVHandle KVCacheManager::extend(KVHandle handle, size_t additional_tokens) {
@@ -163,13 +166,13 @@ KVHandle KVCacheManager::extend(KVHandle handle, size_t additional_tokens) {
     entry.tier        = MemoryTier::HOST;
     entry.size        = size;
 
-    entry.host_ptr   = malloc(size);
-    entry.device_ptr = nullptr;
+    entry.host_storage.resize(size);
 
-    impl_->entries[entry.id] = entry;
+    const uint64_t id  = entry.id;
+    impl_->entries[id] = std::move(entry);
     impl_->total_host += size;
 
-    return KVHandle{ entry.id };
+    return KVHandle{ id };
 }
 
 bool KVCacheManager::is_valid_handle(KVHandle handle) const {
@@ -255,10 +258,10 @@ void * KVCacheManager::get_k_data(KVHandle handle) {
     entry.last_access = impl_->now();
 
     // Return appropriate pointer based on tier
-    if (entry.tier == MemoryTier::VRAM && entry.device_ptr) {
-        return entry.device_ptr;
+    if (entry.tier == MemoryTier::VRAM && !entry.device_storage.empty()) {
+        return entry.device_storage.data();
     }
-    return entry.host_ptr;
+    return kv_storage_ptr(entry.host_storage);
 }
 
 void * KVCacheManager::get_v_data(KVHandle handle) {
@@ -275,7 +278,7 @@ void * KVCacheManager::get_v_data(KVHandle handle) {
     // K size = seq_len * head_dim * type_size
     const size_t k_size = entry.seq_len * impl_->head_dim * ggml_type_size(impl_->kv_type);
 
-    void * base = (entry.tier == MemoryTier::VRAM && entry.device_ptr) ? entry.device_ptr : entry.host_ptr;
+    void * base = kv_active_storage_ptr(entry);
 
     return base ? static_cast<uint8_t *>(base) + k_size : nullptr;
 }
@@ -299,7 +302,7 @@ std::vector<KVPtrs> KVCacheManager::get_layer_kv(uint32_t                      l
             if (entry.layer_id == layer && entry.head_id == head) {
                 entry.last_access = impl_->now();
 
-                void * base = (entry.tier == MemoryTier::VRAM && entry.device_ptr) ? entry.device_ptr : entry.host_ptr;
+                void * base = kv_active_storage_ptr(entry);
 
                 if (base) {
                     const size_t k_size = entry.seq_len * impl_->head_dim * ggml_type_size(impl_->kv_type);
@@ -427,15 +430,14 @@ void KVCacheManager::evict_to_host(KVHandle handle) {
         return;  // Already in host or other tier
     }
 
-    // In real impl: copy device -> host, then free device memory
+    // In real impl: copy device -> host, then release device memory
     // For now, just update tracking
-    if (entry.device_ptr) {
-        if (!entry.host_ptr) {
-            entry.host_ptr = malloc(entry.size);
+    if (!entry.device_storage.empty()) {
+        if (entry.host_storage.empty()) {
+            entry.host_storage.resize(entry.size);
         }
-        memcpy(entry.host_ptr, entry.device_ptr, entry.size);
-        free(entry.device_ptr);
-        entry.device_ptr = nullptr;
+        memcpy(entry.host_storage.data(), entry.device_storage.data(), entry.size);
+        std::vector<uint8_t>().swap(entry.device_storage);
     }
 
     impl_->total_vram -= entry.size;
@@ -456,16 +458,17 @@ void KVCacheManager::prefetch_to_vram(KVHandle handle) {
     }
 
     // In real impl: allocate device memory, copy host -> device
-    // For now, simulate with malloc (tests don't use actual GPU)
-    if (!entry.device_ptr) {
-        entry.device_ptr = malloc(entry.size);
+    // For now, simulate with vector storage (tests don't use actual GPU)
+    if (entry.device_storage.empty()) {
+        entry.device_storage.resize(entry.size);
     }
-    if (entry.host_ptr) {
-        memcpy(entry.device_ptr, entry.host_ptr, entry.size);
+    if (!entry.host_storage.empty()) {
+        memcpy(entry.device_storage.data(), entry.host_storage.data(), entry.size);
     }
 
     if (entry.tier == MemoryTier::HOST) {
         impl_->total_host -= entry.size;
+        std::vector<uint8_t>().swap(entry.host_storage);
     }
     impl_->total_vram += entry.size;
     entry.tier = MemoryTier::VRAM;
@@ -563,7 +566,7 @@ size_t KVCacheManager::evict_cold_heads(size_t bytes_needed) {
         });
     }
 
-    // Evict candidates until we free enough space
+    // Evict candidates until we release enough space
     for (const auto & handle : vram_candidates) {
         if (evicted >= bytes_needed) {
             break;

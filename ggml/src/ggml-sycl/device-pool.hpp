@@ -17,26 +17,30 @@
 #ifndef GGML_SYCL_DEVICE_POOL_HPP
 #define GGML_SYCL_DEVICE_POOL_HPP
 
+#include "alloc-registry.hpp"
+#include "ggml-impl.h"
+
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
-#include <vector>
-
 #include <sycl/sycl.hpp>
-
-#include "ggml-impl.h"
-#include "alloc-registry.hpp"
-
-// Forward-declare to avoid circular include with common.hpp
-void * ggml_sycl_malloc_device(size_t size, const sycl::queue & queue, const char * tag);
-void * ggml_sycl_malloc_device_raw(size_t size, const sycl::queue & queue, const char * tag);
+#include <vector>
 
 namespace ggml_sycl {
 
 // Forward-declare to avoid circular include with unified-cache.hpp
 size_t unified_cache_total_available_bytes(int device);
+struct alloc_handle;
 class unified_cache;
 enum class vram_zone_id : uint8_t;
+
+struct device_pool_chunk_owner {
+    void *                        ptr = nullptr;
+    std::shared_ptr<alloc_handle> handle;
+
+    explicit operator bool() const { return ptr != nullptr; }
+};
 
 // Arena-backed allocation helper (defined in unified-cache.cpp where unified_cache is complete).
 // Returns nullptr if the arena is inactive or the zone is full.
@@ -45,13 +49,19 @@ void * device_pool_arena_alloc(unified_cache * cache, size_t size, size_t align)
 // Arena-backed ownership check (defined in unified-cache.cpp).
 bool device_pool_arena_owns(const unified_cache * cache, const void * ptr);
 
+// Chunk ownership helpers (defined in unified-cache.cpp where alloc_handle is complete).
+device_pool_chunk_owner device_pool_alloc_chunk(sycl::queue & queue, int device_id, size_t size, const char * tag);
+bool                    device_pool_free_chunk(const device_pool_chunk_owner & owner);
+
 class sycl_device_pool {
   public:
     // chunk_size: default size for each large allocation (256 MB).
     // Requests larger than chunk_size get their own dedicated chunk.
     // device_id: logical device index for VRAM budget queries (-1 = no budget check).
-    sycl_device_pool(sycl::queue & queue, int device_id = -1, size_t chunk_size = 256 * 1024 * 1024)
-        : queue_(queue), device_id_(device_id), default_chunk_size_(chunk_size) {}
+    sycl_device_pool(sycl::queue & queue, int device_id = -1, size_t chunk_size = 256 * 1024 * 1024) :
+        queue_(queue),
+        device_id_(device_id),
+        default_chunk_size_(chunk_size) {}
 
     ~sycl_device_pool() {
         if (!abandoned_) {
@@ -154,17 +164,18 @@ class sycl_device_pool {
         // Need a new chunk
         size_t chunk_size = default_chunk_size_;
         // For oversized requests, allocate a chunk that exactly fits
-        size_t padded = size + align;  // worst-case alignment padding
+        size_t padded     = size + align;  // worst-case alignment padding
         if (padded > chunk_size) {
             chunk_size = padded;
         }
+        const size_t backing_size = chunk_size + align;
 
         // Check if we have enough VRAM for a new chunk
         if (device_id_ >= 0) {
             size_t available = unified_cache_total_available_bytes(device_id_);
-            if (chunk_size > available) {
+            if (backing_size > available) {
                 GGML_LOG_WARN("[DEVICE-POOL] chunk would exceed VRAM budget (need %.1f MB, have %.1f MB)\n",
-                              chunk_size / (1024.0 * 1024.0), available / (1024.0 * 1024.0));
+                              backing_size / (1024.0 * 1024.0), available / (1024.0 * 1024.0));
                 return {};
             }
         }
@@ -172,31 +183,35 @@ class sycl_device_pool {
         // Drain ALL queues before allocating device memory.
         // sycl::malloc_device commits GPU pages, stalling BCS permanently
         // if H2D transfers are pending.
-        try { queue_.wait(); } catch (...) {}
+        try {
+            queue_.wait();
+        } catch (...) {
+        }
         if (bcs_queue_) {
-            try { bcs_queue_->wait(); } catch (...) {}
+            try {
+                bcs_queue_->wait();
+            } catch (...) {
+            }
         }
 
-        // Use _raw to bypass unified_cache_allocate routing — the layout pool
-        // is managed by the cache itself and tracked through used_, not runtime_bytes.
-        void * base = ggml_sycl_malloc_device_raw(chunk_size, queue_, "layout_pool:chunk");
-        if (!base) {
+        auto owner = device_pool_alloc_chunk(queue_, device_id_, backing_size, "layout_pool:chunk");
+        if (!owner) {
             GGML_LOG_ERROR("[DEVICE-POOL] chunk alloc failed (%zu bytes)\n", chunk_size);
             return {};
         }
+        void * base = static_cast<uint8_t *>(owner.ptr) + align;
 
-        chunks_.push_back({ base, chunk_size, 0 });
-        chunk_bytes_ += chunk_size;
+        chunks_.push_back({ base, chunk_size, 0, std::move(owner) });
+        chunk_bytes_ += backing_size;
 
-        GGML_LOG_INFO("[DEVICE-POOL] new chunk #%zu: %.1f MB (total %.1f MB in %zu chunks)\n",
-                      chunks_.size(), chunk_size / (1024.0 * 1024.0),
-                      chunk_bytes_ / (1024.0 * 1024.0), chunks_.size());
+        GGML_LOG_INFO("[DEVICE-POOL] new chunk #%zu: %.1f MB (total %.1f MB in %zu chunks)\n", chunks_.size(),
+                      chunk_size / (1024.0 * 1024.0), chunk_bytes_ / (1024.0 * 1024.0), chunks_.size());
 
         void * ptr = try_suballoc(chunks_.back(), size, align);
         if (ptr) {
             alloc_count_++;
         }
-        return { ptr, chunk_size };
+        return { ptr, backing_size };
     }
 
     // Check if a pointer was allocated from this pool.
@@ -225,15 +240,17 @@ class sycl_device_pool {
     // external budget counters like unified_cache::used_).
     size_t reset() {
         std::lock_guard<std::mutex> lock(mutex_);
-        const size_t freed = chunk_bytes_;
+        const size_t                freed = chunk_bytes_;
         for (auto & c : chunks_) {
-            if (c.base) {
-                try {
-                    ggml_sycl::alloc_registry::instance().unregister_alloc(c.base);
-                    sycl::free(c.base, queue_);
-                } catch (...) {
+            if (c.owner) {
+                if (!device_pool_free_chunk(c.owner)) {
+                    GGML_LOG_ERROR("[DEVICE-POOL] failed to free chunk owner ptr=%p size=%.1f MB\n", c.owner.ptr,
+                                   c.size / (1024.0 * 1024.0));
+                    GGML_ASSERT(false && "layout pool unified_free failed");
                 }
+                c.owner = {};
             }
+            c.base = nullptr;
         }
         chunks_.clear();
         chunk_bytes_ = 0;
@@ -283,24 +300,32 @@ class sycl_device_pool {
         if (sealed_) {
             return 0;
         }
-        const size_t chunk_size = default_chunk_size_;
+        const size_t chunk_size   = default_chunk_size_;
+        const size_t backing_size = chunk_size + 256;
         if (device_id_ >= 0) {
             size_t available = unified_cache_total_available_bytes(device_id_);
-            if (chunk_size > available) {
+            if (backing_size > available) {
                 return 0;
             }
         }
-        try { queue_.wait(); } catch (...) {}
-        if (bcs_queue_) {
-            try { bcs_queue_->wait(); } catch (...) {}
+        try {
+            queue_.wait();
+        } catch (...) {
         }
-        void * base = ggml_sycl_malloc_device_raw(chunk_size, queue_, "layout_pool:pre_grow");
-        if (!base) {
+        if (bcs_queue_) {
+            try {
+                bcs_queue_->wait();
+            } catch (...) {
+            }
+        }
+        auto owner = device_pool_alloc_chunk(queue_, device_id_, backing_size, "layout_pool:pre_grow");
+        if (!owner) {
             return 0;
         }
-        chunks_.push_back({ base, chunk_size, 0 });
-        chunk_bytes_ += chunk_size;
-        return chunk_size;
+        void * base = static_cast<uint8_t *>(owner.ptr) + 256;
+        chunks_.push_back({ base, chunk_size, 0, std::move(owner) });
+        chunk_bytes_ += backing_size;
+        return backing_size;
     }
 
     // Statistics
@@ -308,18 +333,21 @@ class sycl_device_pool {
         std::lock_guard<std::mutex> lock(mutex_);
         return chunks_.size();
     }
+
     size_t total_chunk_bytes() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return chunk_bytes_;
     }
+
     size_t total_used_bytes() const {
         std::lock_guard<std::mutex> lock(mutex_);
-        size_t used = 0;
+        size_t                      used = 0;
         for (const auto & c : chunks_) {
             used += c.used;
         }
         return used;
     }
+
     int alloc_count() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return alloc_count_;
@@ -327,9 +355,10 @@ class sycl_device_pool {
 
   private:
     struct chunk {
-        void * base = nullptr;
-        size_t size = 0;
-        size_t used = 0;  // bump pointer offset
+        void *                  base = nullptr;
+        size_t                  size = 0;
+        size_t                  used = 0;  // bump pointer offset
+        device_pool_chunk_owner owner;
     };
 
     // Try to sub-allocate from a chunk. Returns nullptr if not enough space.
@@ -343,17 +372,17 @@ class sycl_device_pool {
         return ptr;
     }
 
-    sycl::queue &        queue_;
-    int                  device_id_;
-    size_t               default_chunk_size_;
-    std::vector<chunk>   chunks_;
-    size_t               chunk_bytes_ = 0;
-    int                  alloc_count_ = 0;
-    bool                 abandoned_   = false;
-    bool                 sealed_     = false;
-    unified_cache *      arena_      = nullptr;  // Optional arena backing (set by unified_cache)
-    sycl::queue *        bcs_queue_  = nullptr;  // BCS queue for drain before chunk alloc
-    mutable std::mutex   mutex_;
+    sycl::queue &      queue_;
+    int                device_id_;
+    size_t             default_chunk_size_;
+    std::vector<chunk> chunks_;
+    size_t             chunk_bytes_ = 0;
+    int                alloc_count_ = 0;
+    bool               abandoned_   = false;
+    bool               sealed_      = false;
+    unified_cache *    arena_       = nullptr;  // Optional arena backing (set by unified_cache)
+    sycl::queue *      bcs_queue_   = nullptr;  // BCS queue for drain before chunk alloc
+    mutable std::mutex mutex_;
 };
 
 }  // namespace ggml_sycl

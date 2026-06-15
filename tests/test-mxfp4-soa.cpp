@@ -2,7 +2,7 @@
 // Tests the CPU-side reorder and GPU kernel computation for correctness
 //
 // Usage:
-//   ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-mxfp4-soa
+//   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-mxfp4-soa
 //
 // Expected: All tests pass, AoS and SoA produce identical results
 

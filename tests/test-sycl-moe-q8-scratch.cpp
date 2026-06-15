@@ -72,7 +72,7 @@ static bool test_unsupported_dense_dtype_has_zero_demand() {
 #if defined(GGML_USE_SYCL)
 static bool test_graph_scratch_owner_survives_pool_reset_and_growth() {
     if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:1", 1);
+        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
     }
 
     ggml_backend_t backend = ggml_backend_sycl_init(0);

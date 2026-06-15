@@ -18,6 +18,10 @@ set -e
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+
+# shellcheck disable=SC1091
+source "$PROJECT_DIR/scripts/sycl-gpu-preflight.sh"
+
 RESULTS_DIR="${PROJECT_DIR}/benchmark_results"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 RESULTS_FILE="${RESULTS_DIR}/benchmark_${TIMESTAMP}.txt"
@@ -30,7 +34,7 @@ MODEL_GPT_OSS_20B="/Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf"
 MODEL_GPT2="/Storage/GenAI/models/gpt2.Q8_0.gguf"
 
 # GPU selector for Intel Arc
-export ONEAPI_DEVICE_SELECTOR=level_zero:1
+export ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:1}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -98,6 +102,7 @@ run_benchmark() {
     [ "$flash_attn" = "1" ] && fa_str="FA_ON"
 
     log "  [${model_name}] p=${prompt_tokens} n=${gen_tokens} ${fa_str} ${extra_args}"
+    sycl_gpu_preflight_check "$ONEAPI_DEVICE_SELECTOR"
 
     local cmd="${PROJECT_DIR}/build/bin/llama-bench \
         -m \"$model\" \
@@ -202,7 +207,7 @@ benchmark_batch() {
 run_quick_benchmarks() {
     log "=== Quick Benchmark Mode ==="
     log "Timestamp: $(date)"
-    log "GPU: Intel Arc (level_zero:1)"
+    log "GPU selector: ${ONEAPI_DEVICE_SELECTOR}"
     log ""
 
     # GPT-2 (tiny, fast)
@@ -216,7 +221,7 @@ run_quick_benchmarks() {
 run_full_benchmarks() {
     log "=== Full Benchmark Suite ==="
     log "Timestamp: $(date)"
-    log "GPU: Intel Arc (level_zero:1)"
+    log "GPU selector: ${ONEAPI_DEVICE_SELECTOR}"
     log "Build: $(cd "$PROJECT_DIR" && git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
     log ""
 

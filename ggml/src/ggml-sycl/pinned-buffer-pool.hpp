@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include "mem-handle.hpp"
 #include "unified-cache.hpp"
 
 #include <cstddef>
@@ -20,7 +21,7 @@ class PinnedBufferPool {
     PinnedBufferPool() = default;
     ~PinnedBufferPool();
 
-    // Non-copyable, non-movable (owns unified_alloc handles)
+    // Non-copyable, non-movable (owns unified_alloc-backed mem_handles)
     PinnedBufferPool(const PinnedBufferPool &)             = delete;
     PinnedBufferPool & operator=(const PinnedBufferPool &) = delete;
     PinnedBufferPool(PinnedBufferPool &&)                  = delete;
@@ -50,17 +51,20 @@ class PinnedBufferPool {
     // Release buffers back to pool (no zeroing -- CPU kernels write all read elements).
     void release(BufferPair);
 
+    mem_handle act_handle() const;
+    mem_handle out_handle() const;
+
     bool is_initialized() const { return act_pool_ != nullptr && out_pool_ != nullptr; }
 
   private:
-    float *      act_pool_    = nullptr;
-    float *      out_pool_    = nullptr;
-    size_t       act_stride_  = 0;  // floats per expert (K)
-    size_t       out_stride_  = 0;  // floats per expert (N)
-    size_t       max_experts_ = 0;
-    int          device_id_   = -1;
-    alloc_handle act_alloc_;
-    alloc_handle out_alloc_;
+    float *    act_pool_    = nullptr;
+    float *    out_pool_    = nullptr;
+    size_t     act_stride_  = 0;  // floats per expert (K)
+    size_t     out_stride_  = 0;  // floats per expert (N)
+    size_t     max_experts_ = 0;
+    int        device_id_   = -1;
+    mem_handle act_handle_;
+    mem_handle out_handle_;
 };
 
 }  // namespace ggml_sycl

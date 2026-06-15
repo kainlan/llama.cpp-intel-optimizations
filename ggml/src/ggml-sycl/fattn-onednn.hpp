@@ -24,9 +24,6 @@
 #    include <unordered_map>
 
 struct ggml_sycl_onednn_fa_materialized_kv {
-    ggml_sycl::scoped_unified_alloc Q_alloc;
-    ggml_sycl::scoped_unified_alloc K_alloc;
-    ggml_sycl::scoped_unified_alloc V_alloc;
     ggml_sycl::mem_handle           Q;
     ggml_sycl::mem_handle           K;
     ggml_sycl::mem_handle           V;
@@ -108,8 +105,9 @@ struct sdpa_shape_key_hash {
 // Per-shape cache entry: compiled_partition + port lists + a per-shape USM
 // scratch for the scalar Divide op.
 //
-// `scale_usm` is a scalar buffer matching the Q dtype (sycl::malloc_host,
-// pinned + GPU-accessible via PCIe zero-copy). It is allocated AND populated
+// `scale_usm` is a scalar buffer matching the Q dtype. `scale_owner` owns the
+// host-pinned USM allocation through unified-cache/mem_handle; `scale_usm` is
+// only the oneDNN graph tensor ABI pointer. It is allocated AND populated
 // exactly once inside build_and_compile_sdpa() — which runs under the cache
 // mutex — so the execute path only READS it; there is no WRITE race.
 //
@@ -119,26 +117,19 @@ struct sdpa_shape_key_hash {
 // follow the 1/sqrt(D) convention fails loudly instead of silently producing
 // wrong outputs.
 //
-// `usm_queue` is a non-owning pointer to the sycl::queue used for allocation;
-// it is valid for the full lifetime of the entry because the queue is owned
-// by the global device registry (ggml_sycl_get_device()), which outlives
-// every backend context.
+// `scale_owner` holds the unified-cache allocation alive for the full lifetime
+// of the entry.
 struct sdpa_compiled_entry {
     dnnl::graph::compiled_partition          cp;
     std::vector<dnnl::graph::logical_tensor> in_ports;
     std::vector<dnnl::graph::logical_tensor> out_ports;
+    ggml_sycl::mem_handle                    scale_owner;
     void *                                   scale_usm = nullptr;
-    sycl::queue *                            usm_queue = nullptr;
 
     sdpa_compiled_entry()                                        = default;
     sdpa_compiled_entry(const sdpa_compiled_entry &)             = delete;
     sdpa_compiled_entry & operator=(const sdpa_compiled_entry &) = delete;
-
-    ~sdpa_compiled_entry() {
-        if (scale_usm && usm_queue) {
-            sycl::free(scale_usm, *usm_queue);
-        }
-    }
+    ~sdpa_compiled_entry()                                       = default;
 };
 
 // SDPA compiled_partition cache owned by backend context (one per device).
@@ -190,11 +181,10 @@ bool ggml_sycl_flash_attn_ext_onednn_eligible(const fattn_params & params,
 // Returns true if oneDNN executed, false if fell through.
 bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fattn_params & params);
 
-bool ggml_sycl_flash_attn_ext_onednn_materialize_kv(
-    const ggml_sycl_onednn_fa_materialization_desc & desc,
-    const fattn_params &                            params,
-    sycl::queue &                                   stream,
-    ggml_sycl_onednn_fa_materialized_kv *           out);
+bool ggml_sycl_flash_attn_ext_onednn_materialize_kv(const ggml_sycl_onednn_fa_materialization_desc & desc,
+                                                    const fattn_params &                             params,
+                                                    sycl::queue &                                    stream,
+                                                    ggml_sycl_onednn_fa_materialized_kv *            out);
 
 #endif  // GGML_SYCL_DNNL
 #endif  // GGML_SYCL_FATTN_ONEDNN_HPP

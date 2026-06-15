@@ -14,7 +14,6 @@
 #    include <cmath>
 #    include <cstdio>
 #    include <mutex>
-#    include <thread>
 
 using namespace dnnl::graph;
 using lt       = logical_tensor;
@@ -23,9 +22,9 @@ using dim_t    = lt::dim;
 using dims_t   = lt::dims;
 using dt       = lt::data_type;
 
-// Per-context SDPA cache. Stored via a raw pointer inside ggml_backend_sycl_context
-// to avoid pulling graph headers into common.hpp. Created on first use, freed at
-// context teardown via ggml_sycl_sdpa_cache_destroy().
+// Per-context SDPA cache. Stored as an opaque unique_ptr inside
+// ggml_backend_sycl_context to avoid pulling graph headers into common.hpp.
+// Created on first use, freed at context teardown via SdpaCacheDeleter.
 //
 // This global mutex guards ONLY the cache allocation race (first call on a given
 // context). Once the cache exists, all further accesses use the per-cache
@@ -36,13 +35,14 @@ static std::mutex g_sdpa_cache_init_mutex;
 static sdpa_partition_cache * get_or_create_cache(ggml_backend_sycl_context & ctx) {
     std::lock_guard<std::mutex> lock(g_sdpa_cache_init_mutex);
     if (!ctx.sdpa_cache) {
-        ctx.sdpa_cache = new sdpa_partition_cache();
+        auto cache = std::make_unique<sdpa_partition_cache>();
+        ctx.sdpa_cache.reset(cache.release());
     }
-    return static_cast<sdpa_partition_cache *>(ctx.sdpa_cache);
+    return static_cast<sdpa_partition_cache *>(ctx.sdpa_cache.get());
 }
 
 void ggml_sycl_sdpa_cache_destroy(void * ptr) {
-    auto * cache = static_cast<sdpa_partition_cache *>(ptr);
+    std::unique_ptr<sdpa_partition_cache> cache(static_cast<sdpa_partition_cache *>(ptr));
     // Two separate safety claims at play here:
     //   1. The CACHE (this object) is never destroyed concurrently with an
     //      inflight FA dispatch — ggml's backend-teardown contract runs
@@ -53,10 +53,9 @@ void ggml_sycl_sdpa_cache_destroy(void * ptr) {
     //      holds its own shared_ptr across the unlock, so the entry
     //      outlives the map even if the map or cache were mutated. That
     //      property is used by the dispatch entry, NOT by this destroy —
-    //      it is not what makes `delete cache` below legal.
-    // Per-entry USM scratch (`scale_usm`) is freed by sdpa_compiled_entry's
-    // destructor when the last shared_ptr drops during `delete cache`.
-    delete cache;
+    //      it is not what makes `cache` destruction below legal.
+    // Per-entry USM scratch (`scale_owner`) is released by sdpa_compiled_entry's
+    // mem_handle when the last shared_ptr drops during `cache` destruction.
 }
 
 // -------------------------------------------------------------------
@@ -273,30 +272,6 @@ static sycl::event ggml_sycl_onednn_fa_materialize_one(sycl::queue &            
         });
 }
 
-static void ggml_sycl_release_materialized_after_event(ggml_sycl::alloc_handle q,
-                                                       ggml_sycl::alloc_handle k,
-                                                       ggml_sycl::alloc_handle v,
-                                                       sycl::event             event) {
-    std::thread([q = std::move(q), k = std::move(k), v = std::move(v), event = std::move(event)]() mutable {
-        try {
-            event.wait_and_throw();
-        } catch (const std::exception & e) {
-            GGML_LOG_ERROR("[SYCL] oneDNN FA materialized Q/K/V event wait failed: %s\n", e.what());
-        } catch (...) {
-            GGML_LOG_ERROR("[SYCL] oneDNN FA materialized Q/K/V event wait failed with unknown exception\n");
-        }
-        if (q.ptr) {
-            (void) ggml_sycl::unified_free(q);
-        }
-        if (k.ptr) {
-            (void) ggml_sycl::unified_free(k);
-        }
-        if (v.ptr) {
-            (void) ggml_sycl::unified_free(v);
-        }
-    }).detach();
-}
-
 static bool ggml_sycl_flash_attn_ext_onednn_materialize_q_f32(const fattn_params &                  params,
                                                               int                                   target_device,
                                                               sycl::queue &                         stream,
@@ -311,13 +286,13 @@ static bool ggml_sycl_flash_attn_ext_onednn_materialize_q_f32(const fattn_params
         return false;
     }
 
-    const int64_t D        = params.ne00;
-    const int64_t n_q      = params.ne01;
-    const int64_t H_q      = params.ne02;
-    const int64_t dst_nb1  = D * (int64_t) sizeof(sycl::half);
-    const int64_t dst_nb2  = dst_nb1 * n_q;
-    const int64_t dst_nb3  = dst_nb2 * H_q;
-    const size_t  q_bytes  = (size_t) dst_nb3;
+    const int64_t D       = params.ne00;
+    const int64_t n_q     = params.ne01;
+    const int64_t H_q     = params.ne02;
+    const int64_t dst_nb1 = D * (int64_t) sizeof(sycl::half);
+    const int64_t dst_nb2 = dst_nb1 * n_q;
+    const int64_t dst_nb3 = dst_nb2 * H_q;
+    const size_t  q_bytes = (size_t) dst_nb3;
 
     ggml_sycl::alloc_request req{};
     req.queue                               = &stream;
@@ -329,47 +304,47 @@ static bool ggml_sycl_flash_attn_ext_onednn_materialize_q_f32(const fattn_params
     req.intent.constraints.must_device      = true;
     req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;
 
-    if (!out->Q_alloc.allocate(req) || !out->Q_alloc.get()) {
+    out->Q = ggml_sycl::unified_allocate(req);
+    if (!out->Q.valid()) {
         return false;
     }
-    out->Q          = out->Q_alloc.as_mem_handle();
     auto q_resolved = out->Q.resolve(target_device);
     if (!q_resolved || !q_resolved.on_device) {
-        out->Q_alloc.reset();
         out->Q = {};
         return false;
     }
 
-    char *       dst     = static_cast<char *>(q_resolved.ptr);
-    const char * src     = params.Q;
+    char *        dst     = static_cast<char *>(q_resolved.ptr);
+    const char *  src     = params.Q;
     const int64_t src_nb1 = params.nb01;
     const int64_t src_nb2 = params.nb02;
 
     try {
-        stream.parallel_for<onednn_fa_materialize_q_f32_kernel>(
-            sycl::range<3>((size_t) H_q, (size_t) n_q, (size_t) D), [=](sycl::id<3> idx) {
-                const int64_t h = (int64_t) idx[0];
-                const int64_t t = (int64_t) idx[1];
-                const int64_t d = (int64_t) idx[2];
-                const size_t  src_off =
-                    (size_t) h * (size_t) src_nb2 + (size_t) t * (size_t) src_nb1 + (size_t) d * sizeof(float);
-                const size_t dst_off =
-                    (size_t) h * (size_t) dst_nb2 + (size_t) t * (size_t) dst_nb1 + (size_t) d * sizeof(sycl::half);
-                reinterpret_cast<sycl::half *>(dst + dst_off)[0] =
-                    static_cast<sycl::half>(reinterpret_cast<const float *>(src + src_off)[0]);
-            }).wait_and_throw();
+        stream
+            .parallel_for<onednn_fa_materialize_q_f32_kernel>(
+                sycl::range<3>((size_t) H_q, (size_t) n_q, (size_t) D),
+                [=](sycl::id<3> idx) {
+                    const int64_t h = (int64_t) idx[0];
+                    const int64_t t = (int64_t) idx[1];
+                    const int64_t d = (int64_t) idx[2];
+                    const size_t  src_off =
+                        (size_t) h * (size_t) src_nb2 + (size_t) t * (size_t) src_nb1 + (size_t) d * sizeof(float);
+                    const size_t dst_off =
+                        (size_t) h * (size_t) dst_nb2 + (size_t) t * (size_t) dst_nb1 + (size_t) d * sizeof(sycl::half);
+                    reinterpret_cast<sycl::half *>(dst + dst_off)[0] =
+                        static_cast<sycl::half>(reinterpret_cast<const float *>(src + src_off)[0]);
+                })
+            .wait_and_throw();
     } catch (const std::exception & e) {
         if (std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
             fprintf(stderr, "[SYCL] fattn: oneDNN materialized Q repack failed: %s\n", e.what());
         }
-        out->Q_alloc.reset();
         out->Q = {};
         return false;
     } catch (...) {
         if (std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
             fprintf(stderr, "[SYCL] fattn: oneDNN materialized Q repack failed with unknown exception\n");
         }
-        out->Q_alloc.reset();
         out->Q = {};
         return false;
     }
@@ -405,21 +380,19 @@ bool ggml_sycl_flash_attn_ext_onednn_materialize_kv(const ggml_sycl_onednn_fa_ma
     req.intent.constraints.must_device      = true;
     req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;
 
-    if (!out->K_alloc.allocate(req) || !out->K_alloc.get()) {
+    out->K = ggml_sycl::unified_allocate(req);
+    if (!out->K.valid()) {
         return false;
     }
-    if (!out->V_alloc.allocate(req) || !out->V_alloc.get()) {
-        out->K_alloc.reset();
+    out->V = ggml_sycl::unified_allocate(req);
+    if (!out->V.valid()) {
+        out->K = {};
         return false;
     }
 
-    out->K          = out->K_alloc.as_mem_handle();
-    out->V          = out->V_alloc.as_mem_handle();
     auto k_resolved = out->K.resolve(desc.target_device);
     auto v_resolved = out->V.resolve(desc.target_device);
     if (!k_resolved || !v_resolved || !k_resolved.on_device || !v_resolved.on_device) {
-        out->K_alloc.reset();
-        out->V_alloc.reset();
         out->K = {};
         out->V = {};
         return false;
@@ -436,8 +409,6 @@ bool ggml_sycl_flash_attn_ext_onednn_materialize_kv(const ggml_sycl_onednn_fa_ma
         if (std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
             fprintf(stderr, "[SYCL] fattn: oneDNN materialized K/V repack failed: %s\n", e.what());
         }
-        out->K_alloc.reset();
-        out->V_alloc.reset();
         out->K = {};
         out->V = {};
         return false;
@@ -445,8 +416,6 @@ bool ggml_sycl_flash_attn_ext_onednn_materialize_kv(const ggml_sycl_onednn_fa_ma
         if (std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
             fprintf(stderr, "[SYCL] fattn: oneDNN materialized K/V repack failed with unknown exception\n");
         }
-        out->K_alloc.reset();
-        out->V_alloc.reset();
         out->K = {};
         out->V = {};
         return false;
@@ -467,17 +436,17 @@ bool ggml_sycl_flash_attn_ext_onednn_materialize_kv(const ggml_sycl_onednn_fa_ma
 // For GQA     (H_q != H_kv): Q is 5-D (batch, H_kv, N_rep, S, D);
 //                              K/V are 5-D (batch, H_kv, 1, S, D).
 // The same pointer is used — only the logical_tensor dims/strides differ.
-// RAII wrapper for build output. Owns `scale_usm` until the caller transfers
-// it into `sdpa_compiled_entry` (by nulling out these fields). If any
-// exception fires between build_and_compile_sdpa returning and the transfer
-// completing (e.g. std::make_shared bad_alloc), the destructor frees the
-// buffer instead of leaking.
+// RAII wrapper for build output. Owns `scale_usm` through `scale_owner` until
+// the caller transfers it into `sdpa_compiled_entry`. If any exception fires
+// between build_and_compile_sdpa returning and the transfer completing (e.g.
+// std::make_shared bad_alloc), the mem_handle destructor releases the buffer
+// instead of leaking.
 struct build_result {
     std::vector<lt>                 in_ports;
     std::vector<lt>                 out_ports;
     dnnl::graph::compiled_partition cp;
+    ggml_sycl::mem_handle           scale_owner;
     void *                          scale_usm = nullptr;
-    sycl::queue *                   usm_queue = nullptr;
 
     build_result()                                 = default;
     build_result(const build_result &)             = delete;
@@ -487,33 +456,24 @@ struct build_result {
         in_ports(std::move(o.in_ports)),
         out_ports(std::move(o.out_ports)),
         cp(std::move(o.cp)),
-        scale_usm(o.scale_usm),
-        usm_queue(o.usm_queue) {
+        scale_owner(std::move(o.scale_owner)),
+        scale_usm(o.scale_usm) {
         o.scale_usm = nullptr;
-        o.usm_queue = nullptr;
     }
 
     build_result & operator=(build_result && o) noexcept {
         if (this != &o) {
-            if (scale_usm && usm_queue) {
-                sycl::free(scale_usm, *usm_queue);
-            }
             in_ports    = std::move(o.in_ports);
             out_ports   = std::move(o.out_ports);
             cp          = std::move(o.cp);
+            scale_owner = std::move(o.scale_owner);
             scale_usm   = o.scale_usm;
-            usm_queue   = o.usm_queue;
             o.scale_usm = nullptr;
-            o.usm_queue = nullptr;
         }
         return *this;
     }
 
-    ~build_result() {
-        if (scale_usm && usm_queue) {
-            sycl::free(scale_usm, *usm_queue);
-        }
-    }
+    ~build_result() = default;
 };
 
 static build_result build_and_compile_sdpa(const sdpa_shape_key & key, const dnnl::engine & eng, sycl::queue * stream) {
@@ -765,8 +725,32 @@ static build_result build_and_compile_sdpa(const sdpa_shape_key & key, const dnn
     // determined and a single buffer per compiled partition is correct for
     // all calls that reuse the partition.
     const size_t scale_bytes = (q_dt == dt::f32) ? sizeof(float) : sizeof(sycl::half);
-    void *       scale_usm   = sycl::malloc_host(scale_bytes, *stream);
-    GGML_ASSERT(scale_usm && "oneDNN SDPA: failed to allocate USM scale buffer");
+    const int    device      = ggml_sycl_get_device_id_from_queue(*stream);
+
+    ggml_sycl::alloc_request scale_req{};
+    scale_req.queue                                    = stream;
+    scale_req.device                                   = device;
+    scale_req.size                                     = scale_bytes;
+    scale_req.intent.role                              = ggml_sycl::alloc_role::CONTROL;
+    scale_req.intent.category                          = ggml_sycl::runtime_category::CONTROL;
+    scale_req.intent.cohort_id                         = "onednn_sdpa_scale";
+    scale_req.intent.constraints.must_host_pinned      = true;
+    scale_req.intent.constraints.use_pinned_pool       = true;
+    scale_req.intent.constraints.require_host_usm_base = true;
+
+    ggml_sycl::alloc_handle scale_alloc{};
+    if (!ggml_sycl::unified_alloc(scale_req, &scale_alloc) || !scale_alloc.ptr) {
+        throw std::runtime_error("oneDNN SDPA: failed to allocate USM scale buffer");
+    }
+
+    ggml_sycl::mem_handle scale_owner =
+        ggml_sycl::mem_handle::from_owned_alloc(std::move(scale_alloc), GGML_LAYOUT_AOS);
+    auto scale_r = scale_owner.resolve(device);
+    if (!scale_r.ptr || scale_r.on_device) {
+        throw std::runtime_error("oneDNN SDPA: scale buffer is not host-pinned USM");
+    }
+
+    void * scale_usm = scale_r.ptr;
     if (q_dt == dt::f32) {
         *static_cast<float *>(scale_usm) = sqrtf(static_cast<float>(key.D));
     } else {
@@ -774,11 +758,11 @@ static build_result build_and_compile_sdpa(const sdpa_shape_key & key, const dnn
     }
 
     build_result r;
-    r.in_ports  = std::move(in_ports);
-    r.out_ports = std::move(out_ports);
-    r.cp        = std::move(cp);
-    r.scale_usm = scale_usm;
-    r.usm_queue = stream;
+    r.in_ports    = std::move(in_ports);
+    r.out_ports   = std::move(out_ports);
+    r.cp          = std::move(cp);
+    r.scale_owner = std::move(scale_owner);
+    r.scale_usm   = scale_usm;
     return r;
 }
 
@@ -879,9 +863,8 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
         if (!ggml_sycl_flash_attn_ext_onednn_materialize_q_f32(active_params, ctx.device, *stream, &materialized,
                                                                &q_nb1, &q_nb2, &q_nb3)) {
             if (std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
-                fprintf(stderr,
-                        "[SYCL] fattn: oneDNN Q_F32_MATERIALIZE_FAILED D=%d ne01=%d H_q=%d\n",
-                        D, active_params.ne01, H_q);
+                fprintf(stderr, "[SYCL] fattn: oneDNN Q_F32_MATERIALIZE_FAILED D=%d ne01=%d H_q=%d\n", D,
+                        active_params.ne01, H_q);
             }
             return false;
         }
@@ -889,11 +872,11 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
         if (!q_resolved || !q_resolved.on_device) {
             return false;
         }
-        active_params.Q       = static_cast<const char *>(q_resolved.ptr);
-        active_params.Q_type  = GGML_TYPE_F16;
-        active_params.nb01    = q_nb1;
-        active_params.nb02    = q_nb2;
-        active_params.nb03    = q_nb3;
+        active_params.Q      = static_cast<const char *>(q_resolved.ptr);
+        active_params.Q_type = GGML_TYPE_F16;
+        active_params.nb01   = q_nb1;
+        active_params.nb02   = q_nb2;
+        active_params.nb03   = q_nb3;
     }
 
     sdpa_shape_key key;
@@ -972,14 +955,12 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
                 ent->cp          = std::move(r.cp);
                 ent->in_ports    = std::move(r.in_ports);
                 ent->out_ports   = std::move(r.out_ports);
-                // Transfer per-shape USM scratch ownership to the entry. The
-                // entry's destructor frees it when the last shared_ptr drops
-                // (cache teardown). Nulling r's fields prevents the build_result
-                // destructor from double-freeing on scope exit.
+                // Transfer per-shape USM scratch ownership to the entry.
+                // `scale_usm` remains only the oneDNN ABI pointer; the mem_handle
+                // releases the allocation when the last shared_ptr drops.
+                ent->scale_owner = std::move(r.scale_owner);
                 ent->scale_usm   = r.scale_usm;
-                ent->usm_queue   = r.usm_queue;
                 r.scale_usm      = nullptr;
-                r.usm_queue      = nullptr;
                 // Store under the key, retain our own shared_ptr copy for use
                 // below (entry survives any future cache mutation).
                 cache->hits[key] = ent;
@@ -1066,10 +1047,20 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
     try {
         dnnl::stream dnnl_stream = ctx.stream_dnnl(stream);
         dnnl::graph::sycl_interop::execute(entry->cp, dnnl_stream, in_tensors, out_tensors);
-        if (materialized.Q_alloc || materialized.K_alloc || materialized.V_alloc) {
+        if (materialized.Q.valid() || materialized.K.valid() || materialized.V.valid()) {
+            std::vector<ggml_sycl::mem_handle> retained;
+            retained.reserve(3);
+            if (materialized.Q.valid()) {
+                retained.push_back(std::move(materialized.Q));
+            }
+            if (materialized.K.valid()) {
+                retained.push_back(std::move(materialized.K));
+            }
+            if (materialized.V.valid()) {
+                retained.push_back(std::move(materialized.V));
+            }
             sycl::event done = ggml_sycl_submit_marker<onednn_fa_materialized_release_marker_kernel>(*stream);
-            ggml_sycl_release_materialized_after_event(materialized.Q_alloc.release(), materialized.K_alloc.release(),
-                                                       materialized.V_alloc.release(), std::move(done));
+            ggml_sycl::retain_handles_until_event(std::move(retained), std::move(done));
         }
     } catch (std::exception & e) {
         fprintf(stderr, "[SYCL] oneDNN SDPA execute failed: %s\n", e.what());

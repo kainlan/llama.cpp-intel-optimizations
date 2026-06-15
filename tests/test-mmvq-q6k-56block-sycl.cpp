@@ -2,7 +2,7 @@
 // Test Q6_K MMVQ with 56 blocks (variable tile) using actual SYCL kernel
 //
 // Build: cmake --build build --target test-mmvq-q6k-56block-sycl
-// Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-mmvq-q6k-56block-sycl
+// Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-mmvq-q6k-56block-sycl
 
 #include "../ggml/src/ggml-quants.h"
 #include "ggml-backend.h"

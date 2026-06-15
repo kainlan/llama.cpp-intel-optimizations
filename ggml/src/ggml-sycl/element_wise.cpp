@@ -1,23 +1,55 @@
+#include "element_wise.hpp"
+
 #include "common.hpp"
 #include "ggml-sycl/presets.hpp"
 #include "ggml.h"
-#include "element_wise.hpp"
+#include "mem-ops.hpp"
 #include "sycl-profiling.hpp"
 
 #if GGML_SYCL_DNNL
-#include "dnnl-ops.hpp"
+#    include "dnnl-ops.hpp"
 #endif
 
-#define SYCL_GLOBAL_ID_LOOP(K, ITEM) \
-    for (auto i = ITEM.get_global_id(0); i < (size_t)K; i += ITEM.get_global_range(0))
+#ifdef GGML_SYCL_FFN_PATH_DEBUG
+static ggml_sycl::mem_handle ggml_sycl_element_copy_handle_for_raw_ptr(void * ptr, int fallback_device) {
+    ggml_sycl::memory_location loc = ggml_sycl::query_location(ptr, fallback_device);
+    if (loc.on_device()) {
+        const int owner = loc.device >= 0 ? loc.device : fallback_device;
+        return ggml_sycl::mem_handle::from_chunk_ptr(ptr, owner, GGML_LAYOUT_AOS, true);
+    }
+    if (loc.tier == ggml_sycl::alloc_tier::HOST_PINNED && fallback_device >= 0) {
+        return ggml_sycl::mem_handle::from_chunk_ptr(ptr, fallback_device, GGML_LAYOUT_AOS, false);
+    }
+    return ggml_sycl::mem_handle::from_direct(ptr, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+}
 
-#define SYCL_LOCAL_ID_CALC(ITEM, IDX) \
-    (ITEM.get_local_range(IDX) * ITEM.get_group(IDX) + ITEM.get_local_id(IDX))
+static void ggml_sycl_element_debug_read_f32(sycl::queue & queue,
+                                             int           device,
+                                             float *       dst,
+                                             const float * src,
+                                             size_t        count) {
+    ggml_sycl::mem_handle dst_handle =
+        ggml_sycl::mem_handle::from_direct(dst, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+    ggml_sycl::mem_handle src_handle = ggml_sycl_element_copy_handle_for_raw_ptr(const_cast<float *>(src), device);
+    ggml_sycl::mem_copy(dst_handle, 0, src_handle, 0, count * sizeof(float), queue);
+}
+#endif
 
+#define SYCL_GLOBAL_ID_LOOP(K, ITEM) for (auto i = ITEM.get_global_id(0); i < (size_t) K; i += ITEM.get_global_range(0))
 
-static void acc_f32(const float * x, const float * y, float * dst, const int ne,
-    const int ne10, const int ne11, const int ne12,
-    const int nb1, const int nb2, int offset, const sycl::nd_item<1> &item_ct1) {
+#define SYCL_LOCAL_ID_CALC(ITEM, IDX) (ITEM.get_local_range(IDX) * ITEM.get_group(IDX) + ITEM.get_local_id(IDX))
+
+static void acc_f32(const float *            x,
+                    const float *            y,
+                    float *                  dst,
+                    const int                ne,
+                    const int                ne10,
+                    const int                ne11,
+                    const int                ne12,
+                    const int                nb1,
+                    const int                nb2,
+                    int                      offset,
+                    const sycl::nd_item<1> & item_ct1) {
     const int i = SYCL_LOCAL_ID_CALC(item_ct1, 0);
     if (i >= ne) {
         return;
@@ -1256,9 +1288,9 @@ void ggml_sycl_swiglu(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor ds
         ctx.stream()->wait();
 
         float gate_vals[8], up_vals[8];
-        ctx.stream()->memcpy(gate_vals, gate.resolve_as<const float>(), 8 * sizeof(float)).wait();
+        ggml_sycl_element_debug_read_f32(*ctx.stream(), ctx.device, gate_vals, gate.resolve_as<const float>(), 8);
         if (up) {
-            ctx.stream()->memcpy(up_vals, up.resolve_as<const float>(), 8 * sizeof(float)).wait();
+            ggml_sycl_element_debug_read_f32(*ctx.stream(), ctx.device, up_vals, up.resolve_as<const float>(), 8);
         }
 
         fprintf(stderr, "[SWIGLU BASELINE] call %d: gate ne=[%lld,%lld] gate[0:7]=%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",

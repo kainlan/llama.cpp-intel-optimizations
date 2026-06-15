@@ -1276,7 +1276,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     auto register_sycl_tensor_metadata = [&](ggml_tensor * tensor) {
 #ifdef GGML_USE_SYCL
-        if (!tensor || selected_bias || !selected_layer_dev) {
+        if (!tensor || !selected_layer_dev) {
             return;
         }
         if (ggml_backend_dev_backend_reg(selected_layer_dev) != ggml_backend_sycl_reg()) {

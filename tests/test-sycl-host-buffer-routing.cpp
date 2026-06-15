@@ -1,6 +1,6 @@
 // Validate SYCL host buffer routing (pinned vs CPU fallback).
 // Run (opt-in):
-//   GGML_SYCL_HOST_BUFFER_TEST=1 ONEAPI_DEVICE_SELECTOR=level_zero:1 \
+//   GGML_SYCL_HOST_BUFFER_TEST=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
 //   ./build/bin/test-sycl-host-buffer-routing
 
 #include <cstdio>

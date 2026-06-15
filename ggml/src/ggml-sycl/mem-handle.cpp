@@ -3,12 +3,18 @@
 
 #include "mem-handle.hpp"
 
+#include "common.hpp"
 #include "pinned-pool.hpp"    // pinned_chunk_pool chunk-lease API (dyhdl)
 #include "unified-cache.hpp"  // get_unified_cache_for_device, unified_cache
 
 #include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <exception>
+#include <iterator>
 #include <mutex>
+#include <string>
+#include <thread>
 #include <utility>
 
 namespace ggml_sycl {
@@ -29,21 +35,92 @@ void cache_generation_bump() {
 
 namespace {
 
+bool valid_cache_device_id(int device) {
+    return device >= 0 && device < GGML_SYCL_MAX_DEVICES;
+}
+
 struct retained_handle_record {
     std::vector<mem_handle> handles;
     sycl::event             event;
 };
 
-std::mutex                          g_retained_handles_mutex;
-std::vector<retained_handle_record> g_retained_handles;
+struct retained_handle_state {
+    std::mutex                         mutex;
+    std::condition_variable            cv;
+    std::deque<retained_handle_record> queue;
+    std::vector<mem_handle>            graph_unwaitable;
+    size_t                             active = 0;
+};
 
-bool retained_event_complete(const sycl::event & event) {
-    try {
-        return event.get_info<sycl::info::event::command_execution_status>() ==
-               sycl::info::event_command_status::complete;
-    } catch (...) {
-        return false;
+// The detached drain worker can still be waiting while process shutdown tears down
+// static objects.  Keep the synchronization state alive until process exit.
+retained_handle_state *                g_retained_handles_state = new retained_handle_state();
+std::once_flag                         g_retained_drain_worker_once;
+thread_local std::vector<mem_handle> * g_graph_retained_handle_sink = nullptr;
+
+void retain_handles_for_current_graph(std::vector<mem_handle> handles) {
+    if (handles.empty()) {
+        return;
     }
+
+    if (g_graph_retained_handle_sink) {
+        g_graph_retained_handle_sink->insert(g_graph_retained_handle_sink->end(),
+                                             std::make_move_iterator(handles.begin()),
+                                             std::make_move_iterator(handles.end()));
+        return;
+    }
+
+    auto &                      state = *g_retained_handles_state;
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.graph_unwaitable.insert(state.graph_unwaitable.end(), std::make_move_iterator(handles.begin()),
+                                  std::make_move_iterator(handles.end()));
+}
+
+void retained_handle_drain_loop() {
+    for (;;) {
+        retained_handle_record record;
+        {
+            auto &                       state = *g_retained_handles_state;
+            std::unique_lock<std::mutex> lock(state.mutex);
+            state.cv.wait(lock, [&state] { return !state.queue.empty(); });
+            record = std::move(state.queue.front());
+            state.queue.pop_front();
+            ++state.active;
+        }
+
+        try {
+            record.event.wait_and_throw();
+        } catch (const std::exception & e) {
+            const std::string msg = e.what();
+            if (msg.find("command graph") != std::string::npos || msg.find("Command Graph") != std::string::npos) {
+                auto &                      state = *g_retained_handles_state;
+                std::lock_guard<std::mutex> lock(state.mutex);
+                state.graph_unwaitable.insert(state.graph_unwaitable.end(),
+                                              std::make_move_iterator(record.handles.begin()),
+                                              std::make_move_iterator(record.handles.end()));
+                record.handles.clear();
+                GGML_SYCL_DEBUG(
+                    "[MEM-HANDLE] retained %zu leases for command-graph lifetime; graph events are not waitable\n",
+                    state.graph_unwaitable.size());
+            } else {
+                GGML_LOG_ERROR("[MEM-HANDLE] event-bound lease wait failed: %s\n", e.what());
+            }
+        } catch (...) {
+            GGML_LOG_ERROR("[MEM-HANDLE] event-bound lease wait failed with unknown exception\n");
+        }
+        record.handles.clear();
+
+        {
+            auto &                      state = *g_retained_handles_state;
+            std::lock_guard<std::mutex> lock(state.mutex);
+            --state.active;
+        }
+        g_retained_handles_state->cv.notify_all();
+    }
+}
+
+void start_retained_handle_drain_worker() {
+    std::thread(retained_handle_drain_loop).detach();
 }
 
 }  // namespace
@@ -111,9 +188,13 @@ mem_handle mem_handle::from_weight_lease(const unified_cache_key & key,
     h.key_          = key;
     h.gen_          = cache_generation();  // Fresh — no slow-path re-query
     h.cached_       = { ptr, layout, on_device };
+    if (entry && entry->has_ready_event) {
+        h.cached_.has_ready_event = true;
+        h.cached_.ready_event     = entry->ready_event;
+    }
     h.leased_entry_ = entry;               // ownership of the refcount bump transferred
 
-    if (ptr != nullptr && device >= 0) {
+    if (ptr != nullptr && valid_cache_device_id(device)) {
         unified_cache * cache = get_unified_cache_for_device(device);
         if (cache) {
             const int vram_idx = cache->arena_acquire_chunk_lease(ptr);
@@ -199,7 +280,7 @@ mem_handle mem_handle::from_chunk_ptr(void * ptr, int device, ggml_layout_mode l
         return h;
     }
 
-    unified_cache * cache = get_unified_cache_for_device(device);
+    unified_cache * cache = valid_cache_device_id(device) ? get_unified_cache_for_device(device) : nullptr;
     if (cache) {
         // Priority 1: VRAM arena (pointer is device-resident).
         const int vram_idx = cache->arena_acquire_chunk_lease(ptr);
@@ -237,16 +318,8 @@ void release_owned_alloc_handle(alloc_handle * handle) {
     if (!handle) {
         return;
     }
-    if (handle->ptr) {
+    if (handle->ptr && !ggml_sycl_is_shutting_down()) {
         bool released = unified_free(*handle);
-        if (!released && handle->zone_managed && handle->vram_zone != vram_zone_id::COUNT && handle->device >= 0) {
-            // Some legacy arena callers still construct alloc_handle directly
-            // from zone_alloc() without registering it in runtime_alloc_registry.
-            // The mem_handle remains the lifetime owner; release the zone block
-            // through the unified cache when the registry has no record.
-            unified_cache_zone_free(handle->device, handle->vram_zone, handle->ptr);
-            released = true;
-        }
         if (!released) {
             GGML_LOG_WARN("[MEM-HANDLE] owning alloc release failed ptr=%p size=%zu device=%d\n", handle->ptr,
                           handle->size, handle->device);
@@ -264,8 +337,19 @@ mem_handle mem_handle::from_owned_alloc(alloc_handle handle, ggml_layout_mode la
 
     const bool on_device = handle.tier == alloc_tier::DEVICE_VRAM;
     mem_handle h         = from_direct(handle.ptr, layout, on_device, on_device ? handle.device : HOST_DEVICE);
-    h.owned_alloc_       = std::shared_ptr<alloc_handle>(new alloc_handle(std::move(handle)), release_owned_alloc_handle);
+    h.size_              = handle.size;
+    h.owned_alloc_ = std::shared_ptr<alloc_handle>(new alloc_handle(std::move(handle)), release_owned_alloc_handle);
     return h;
+}
+
+void mem_handle::set_ready_event(const sycl::event & event) {
+    cached_.has_ready_event = true;
+    cached_.ready_event     = event;
+}
+
+void mem_handle::clear_ready_event() {
+    cached_.has_ready_event = false;
+    cached_.ready_event     = {};
 }
 
 // === resolve ===
@@ -331,6 +415,13 @@ resolved_ptr mem_handle::resolve(int device_id) const {
 // entry instance, and leak tracking breaks.
 
 resolved_ptr mem_handle::resolve_slow() const {
+    if (!valid_cache_device_id(device_)) {
+        cached_       = {};
+        gen_          = cache_generation();
+        leased_entry_ = nullptr;
+        return {};
+    }
+
     unified_cache * cache = get_unified_cache_for_device(device_);
     if (!cache) {
         return {};
@@ -360,6 +451,10 @@ resolved_ptr mem_handle::resolve_slow() const {
     }
 
     cached_       = { result.ptr, result.layout, result.on_device };
+    if (result.has_ready_event) {
+        cached_.has_ready_event = true;
+        cached_.ready_event     = result.ready_event;
+    }
     gen_          = cache_generation();
     leased_entry_ = result.entry;  // may be nullptr for S1-PRELOAD direct entries
 
@@ -406,7 +501,8 @@ void mem_handle::release_lease() noexcept {
     // (cache_entry + its backing arena chunk), a CHUNK_LEASE handle holds
     // only the chunk.
     if (chunk_source_ != 0 && chunk_device_ >= 0) {
-        unified_cache * cache = get_unified_cache_for_device(chunk_device_);
+        unified_cache * cache =
+            valid_cache_device_id(chunk_device_) ? get_existing_unified_cache_for_device(chunk_device_) : nullptr;
         if (cache) {
             if (chunk_source_ == 1) {
                 cache->host_release_chunk_lease(host_chunk_handle_);
@@ -454,6 +550,56 @@ size_t mem_handle::hash() const {
     return h;
 }
 
+size_t mem_handle::stable_identity_hash() const {
+    size_t h = 0;
+    h        = mem_handle_hash_combine(h, std::hash<int>()(static_cast<int>(kind_)));
+    h        = mem_handle_hash_combine(h, std::hash<int>()(device_));
+
+    if (is_weight()) {
+        h = mem_handle_hash_combine(h, unified_cache_key_hash{}(key_));
+    } else if (is_arena()) {
+        h = mem_handle_hash_combine(h, std::hash<int>()(zone_id_));
+        h = mem_handle_hash_combine(h, std::hash<size_t>()(offset_));
+        h = mem_handle_hash_combine(h, std::hash<size_t>()(size_));
+        h = mem_handle_hash_combine(h, std::hash<uint64_t>()(arena_gen_));
+    } else if (kind_ == mem_handle_kind::CHUNK_LEASE) {
+        h = mem_handle_hash_combine(h, std::hash<int>()(chunk_device_));
+        h = mem_handle_hash_combine(h, std::hash<uint8_t>()(chunk_source_));
+        h = mem_handle_hash_combine(h, std::hash<uint64_t>()(host_chunk_handle_));
+        h = mem_handle_hash_combine(h, std::hash<int32_t>()(vram_chunk_idx_));
+        h = mem_handle_hash_combine(h, std::hash<void *>()(cached_.ptr));
+        h = mem_handle_hash_combine(h, std::hash<size_t>()(size_));
+    } else {
+        h = mem_handle_hash_combine(h, std::hash<void *>()(cached_.ptr));
+        h = mem_handle_hash_combine(h, std::hash<size_t>()(size_));
+    }
+
+    return h;
+}
+
+bool mem_handle::stable_identity_equal(const mem_handle & other) const {
+    if (kind_ != other.kind_ || device_ != other.device_) {
+        return false;
+    }
+
+    if (is_weight()) {
+        return key_ == other.key_;
+    }
+
+    if (is_arena()) {
+        return zone_id_ == other.zone_id_ && offset_ == other.offset_ && size_ == other.size_ &&
+               arena_gen_ == other.arena_gen_;
+    }
+
+    if (kind_ == mem_handle_kind::CHUNK_LEASE) {
+        return chunk_device_ == other.chunk_device_ && chunk_source_ == other.chunk_source_ &&
+               host_chunk_handle_ == other.host_chunk_handle_ && vram_chunk_idx_ == other.vram_chunk_idx_ &&
+               cached_.ptr == other.cached_.ptr && size_ == other.size_;
+    }
+
+    return cached_.ptr == other.cached_.ptr && size_ == other.size_;
+}
+
 // === destructor / copy / move ===
 
 mem_handle::~mem_handle() {
@@ -475,7 +621,7 @@ static void bump_chunk_lease_for_copy(uint8_t      chunk_source,
         out_vram_idx    = -1;
         return;
     }
-    unified_cache * cache = get_unified_cache_for_device(chunk_device);
+    unified_cache * cache = valid_cache_device_id(chunk_device) ? get_unified_cache_for_device(chunk_device) : nullptr;
     if (!cache) {
         out_host_handle = UINT64_MAX;
         out_vram_idx    = -1;
@@ -624,6 +770,10 @@ mem_handle & mem_handle::operator=(mem_handle && other) noexcept {
 
 resolved_ptr mem_handle::resolve_arena() const {
     // Device arena: query unified_cache for arena methods.
+    if (!valid_cache_device_id(device_)) {
+        return {};
+    }
+
     unified_cache * cache = get_unified_cache_for_device(device_);
     if (!cache) {
         return {};
@@ -731,39 +881,17 @@ bool build_layer_handles(int device, int layer_id, layer_weight_handles & out) {
     return true;
 }
 
-void reap_retained_handles(bool wait_all) {
-    std::vector<retained_handle_record> ready;
-
-    {
-        std::lock_guard<std::mutex> lock(g_retained_handles_mutex);
-        if (wait_all) {
-            ready.swap(g_retained_handles);
-        } else {
-            std::vector<retained_handle_record> pending;
-            pending.reserve(g_retained_handles.size());
-            for (auto & record : g_retained_handles) {
-                if (retained_event_complete(record.event)) {
-                    ready.push_back(std::move(record));
-                } else {
-                    pending.push_back(std::move(record));
-                }
-            }
-            g_retained_handles.swap(pending);
-        }
+void drain_retained_handles(bool wait_all) {
+    if (!wait_all) {
+        // Retained handles are released by the background drain worker.  Avoid
+        // get_info(command_execution_status) polling on inference threads:
+        // that Level Zero query can block on in-flight events.
+        return;
     }
 
-    for (auto & record : ready) {
-        if (wait_all) {
-            try {
-                record.event.wait_and_throw();
-            } catch (const std::exception & e) {
-                GGML_LOG_ERROR("[MEM-HANDLE] event-bound lease wait failed: %s\n", e.what());
-            } catch (...) {
-                GGML_LOG_ERROR("[MEM-HANDLE] event-bound lease wait failed with unknown exception\n");
-            }
-        }
-        // record.handles is destroyed here, releasing cache-entry/chunk leases.
-    }
+    auto &                       state = *g_retained_handles_state;
+    std::unique_lock<std::mutex> lock(state.mutex);
+    state.cv.wait(lock, [&state] { return state.queue.empty() && state.active == 0; });
 }
 
 void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event event) {
@@ -771,13 +899,23 @@ void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event eve
         return;
     }
 
-    reap_retained_handles(false);
-    if (retained_event_complete(event)) {
+    if (ggml_sycl_graph_recording_active()) {
+        retain_handles_for_current_graph(std::move(handles));
         return;
     }
 
-    std::lock_guard<std::mutex> lock(g_retained_handles_mutex);
-    g_retained_handles.push_back({ std::move(handles), std::move(event) });
+    std::call_once(g_retained_drain_worker_once, start_retained_handle_drain_worker);
+
+    {
+        auto &                      state = *g_retained_handles_state;
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.queue.push_back({ std::move(handles), std::move(event) });
+    }
+    g_retained_handles_state->cv.notify_one();
+}
+
+void set_graph_retained_handle_sink(std::vector<mem_handle> * sink) {
+    g_graph_retained_handle_sink = sink;
 }
 
 }  // namespace ggml_sycl

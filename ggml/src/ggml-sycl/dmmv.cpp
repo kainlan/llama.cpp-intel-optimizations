@@ -5,18 +5,91 @@
 #include "dequantize.hpp"
 #include "dmmv-esimd.hpp"
 #include "ggml-sycl/quantize.hpp"
+#include "mem-ops.hpp"
 #include "presets.hpp"
 #include "quants.hpp"
 #include "unified-kernel.hpp"  // For split barrier support
 
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 static inline void ggml_sycl_add_deps(sycl::handler & cgh, const std::vector<sycl::event> * deps) {
     if (deps && !deps->empty()) {
         cgh.depends_on(*deps);
     }
+}
+
+static bool ggml_sycl_dmmv_alloc_host_stage(size_t                  bytes,
+                                            sycl::queue &           queue,
+                                            int                     device,
+                                            const char *            cohort_id,
+                                            ggml_sycl::mem_handle & owner) {
+    owner = {};
+    if (bytes == 0) {
+        return true;
+    }
+
+    ggml_sycl::alloc_request req{};
+    req.queue                               = &queue;
+    req.device                              = device;
+    req.size                                = bytes;
+    req.intent.role                         = ggml_sycl::alloc_role::STAGING;
+    req.intent.category                     = ggml_sycl::runtime_category::STAGING;
+    req.intent.cohort_id                    = cohort_id;
+    req.intent.constraints.must_host_pinned = true;
+    req.intent.constraints.use_pinned_pool  = true;
+    req.suppress_failure_log                = true;
+
+    owner = ggml_sycl::unified_allocate(req);
+    if (!owner.valid()) {
+        return false;
+    }
+
+    auto resolved = owner.resolve(device);
+    if (!resolved || !resolved.ptr || resolved.on_device) {
+        owner = {};
+        return false;
+    }
+    return true;
+}
+
+static bool ggml_sycl_dmmv_alloc_device_scratch(size_t                  bytes,
+                                                sycl::queue &           queue,
+                                                int                     device,
+                                                const char *            cohort_id,
+                                                void **                 ptr,
+                                                ggml_sycl::mem_handle & owner) {
+    *ptr  = nullptr;
+    owner = {};
+    if (bytes == 0) {
+        return true;
+    }
+
+    ggml_sycl::alloc_request req{};
+    req.queue                               = &queue;
+    req.device                              = device;
+    req.size                                = bytes;
+    req.intent.role                         = ggml_sycl::alloc_role::GRAPH_TMP;
+    req.intent.category                     = ggml_sycl::runtime_category::GRAPH;
+    req.intent.cohort_id                    = cohort_id;
+    req.intent.constraints.must_device      = true;
+    req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::SCRATCH;
+    req.suppress_failure_log                = true;
+
+    owner = ggml_sycl::unified_allocate(req);
+    if (!owner.valid()) {
+        return false;
+    }
+
+    auto resolved = owner.resolve(device);
+    if (!resolved || !resolved.ptr || !resolved.on_device) {
+        owner = {};
+        return false;
+    }
+    *ptr = resolved.ptr;
+    return true;
 }
 
 // Q4_0 SoA DMMV kernel - follows Q6_K pattern exactly
@@ -2712,13 +2785,20 @@ static void dequantize_mul_mat_vec_q8_0_sycl(const void *    vx,
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
 
     // Debug buffer for GPU-side debugging - no limit, always debug when env set
-    static int aos_kernel_debug_count = 0;
-    float *    debug_buf              = nullptr;
-    bool       do_debug               = std::getenv("GGML_SYCL_DMMV_SOA_DEBUG") != nullptr;
+    static int            aos_kernel_debug_count = 0;
+    float *               debug_buf              = nullptr;
+    ggml_sycl::mem_handle debug_owner;
+    bool                  do_debug = std::getenv("GGML_SYCL_DMMV_SOA_DEBUG") != nullptr;
 
     if (do_debug) {
-        debug_buf = ggml_sycl_malloc_device_tracked_t<float>(256, *stream, "dmmv_debug");
-        stream->memset(debug_buf, 0, 256 * sizeof(float)).wait();
+        void * raw_debug = nullptr;
+        do_debug         = ggml_sycl_dmmv_alloc_device_scratch(256 * sizeof(float), *stream,
+                                                               ggml_sycl_get_device_id_from_queue(*stream), "dmmv_debug",
+                                                               &raw_debug, debug_owner);
+        debug_buf        = static_cast<float *>(raw_debug);
+        if (do_debug) {
+            ggml_sycl::mem_fill(debug_owner, 0, 256 * sizeof(float), *stream);
+        }
     }
 
     {
@@ -2744,9 +2824,11 @@ static void dequantize_mul_mat_vec_q8_0_sycl(const void *    vx,
 
     if (do_debug) {
         aos_kernel_debug_count++;
-        std::vector<float> h(256);
-        stream->memcpy(h.data(), debug_buf, 256 * sizeof(float)).wait();
-        ggml_sycl_free_device_tracked_t(debug_buf, (size_t) 256, *stream);
+        std::vector<float>    h(256);
+        ggml_sycl::mem_handle host_handle =
+            ggml_sycl::mem_handle::from_direct(h.data(), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+        ggml_sycl::mem_copy(host_handle, debug_owner, 256 * sizeof(float), *stream);
+        debug_owner = {};
 
         fprintf(stderr, "\n========== GPU KERNEL AoS DEBUG #%d ==========\n", aos_kernel_debug_count);
         fprintf(stderr, "ncols=%d nrows=%d iter_stride=%d vals_per_iter=%d\n", (int) h[0], (int) h[1], (int) h[2],
@@ -3372,9 +3454,25 @@ static sycl::event dmmv_stream_copy(sycl::queue &                    queue,
                                     const void *                     ctx_void,
                                     const std::vector<sycl::event> & deps) {
     GGML_UNUSED(src_size);
-    const auto * ctx = static_cast<const dmmv_stream_ctx *>(ctx_void);
+    auto copy_handle_for_raw_ptr = [](void * ptr, int fallback_device, bool default_device,
+                                      ggml_layout_mode layout = GGML_LAYOUT_AOS) {
+        ggml_sycl::memory_location loc = ggml_sycl::query_location(ptr, fallback_device);
+        if (loc.on_device()) {
+            const int owner = loc.device >= 0 ? loc.device : fallback_device;
+            return ggml_sycl::mem_handle::from_chunk_ptr(ptr, owner, layout, true);
+        }
+        if (loc.tier == ggml_sycl::alloc_tier::HOST_PINNED && fallback_device >= 0) {
+            return ggml_sycl::mem_handle::from_chunk_ptr(ptr, fallback_device, layout, false);
+        }
+        return ggml_sycl::mem_handle::from_direct(ptr, layout, default_device, fallback_device);
+    };
+    const int    queue_device = ggml_sycl_get_device_id_from_queue(queue);
+    const auto * ctx          = static_cast<const dmmv_stream_ctx *>(ctx_void);
     if (!ctx || ctx->segment_count == 0 || ctx->row_total_bytes == 0) {
-        return queue.memcpy(device_slice, static_cast<const char *>(src_ptr) + offset_bytes, slice_bytes, deps);
+        auto dst_handle = copy_handle_for_raw_ptr(device_slice, queue_device, true);
+        auto src_handle = copy_handle_for_raw_ptr(const_cast<char *>(static_cast<const char *>(src_ptr) + offset_bytes),
+                                                  queue_device, false);
+        return ggml_sycl::mem_copy_async(dst_handle, src_handle, slice_bytes, queue, deps);
     }
     GGML_ASSERT(offset_bytes % ctx->row_total_bytes == 0);
     GGML_ASSERT(slice_bytes % ctx->row_total_bytes == 0);
@@ -3385,8 +3483,9 @@ static sycl::event dmmv_stream_copy(sycl::queue &                    queue,
 
     const sycl::usm::alloc src_alloc = ggml_sycl_get_alloc_type(ctx->src_base);
     if (src_alloc != sycl::usm::alloc::device) {
-        uint8_t * host_slice     = nullptr;
-        bool      use_persistent = (ctx->host_staging != nullptr && ctx->host_staging_size >= slice_bytes);
+        uint8_t *             host_slice = nullptr;
+        ggml_sycl::mem_handle host_stage_handle;
+        bool                  use_persistent = (ctx->host_staging != nullptr && ctx->host_staging_size >= slice_bytes);
         if (use_persistent) {
             if (ctx->has_prev_staging_evt) {
                 ctx->prev_staging_evt.wait();
@@ -3394,12 +3493,17 @@ static sycl::event dmmv_stream_copy(sycl::queue &                    queue,
             }
             host_slice = static_cast<uint8_t *>(ctx->host_staging);
         } else {
-            host_slice =
-                static_cast<uint8_t *>(ggml_sycl_malloc_host_tracked_bytes(slice_bytes, queue, "dmmv:host_stage"));
-            if (!host_slice) {
+            if (!ggml_sycl_dmmv_alloc_host_stage(slice_bytes, queue, queue_device, "dmmv:host_stage",
+                                                 host_stage_handle)) {
                 throw sycl::exception(sycl::make_error_code(sycl::errc::memory_allocation),
                                       "DMMV stream: host staging allocation failed");
             }
+            const auto host_stage = host_stage_handle.resolve(queue_device);
+            if (!host_stage || !host_stage.ptr || host_stage.on_device) {
+                throw sycl::exception(sycl::make_error_code(sycl::errc::memory_allocation),
+                                      "DMMV stream: host staging resolve failed");
+            }
+            host_slice = static_cast<uint8_t *>(host_stage.ptr);
         }
         size_t dst_offset = 0;
         for (int i = 0; i < ctx->segment_count; ++i) {
@@ -3413,17 +3517,12 @@ static sycl::event dmmv_stream_copy(sycl::queue &                    queue,
             dst_offset += bytes;
         }
         GGML_ASSERT(dst_offset == slice_bytes);
-        sycl::event evt = queue.memcpy(device_slice, host_slice, slice_bytes, deps);
+        auto dst_handle = copy_handle_for_raw_ptr(device_slice, queue_device, true);
+        auto src_handle = use_persistent ? copy_handle_for_raw_ptr(host_slice, queue_device, false) : host_stage_handle;
+        sycl::event evt = ggml_sycl::mem_copy_async(dst_handle, src_handle, slice_bytes, queue, deps);
         if (use_persistent) {
             ctx->prev_staging_evt     = evt;
             ctx->has_prev_staging_evt = true;
-        } else if (auto * cache = ggml_sycl::get_unified_cache(queue)) {
-            cache->defer_host_free(host_slice, slice_bytes, evt);
-        } else {
-            if (!ggml_sycl_graph_recording_active()) {
-                evt.wait();
-            }
-            ggml_sycl_free_host_tracked_bytes(host_slice, slice_bytes, queue);
         }
         return evt;
     }
@@ -3438,9 +3537,11 @@ static sycl::event dmmv_stream_copy(sycl::queue &                    queue,
         if (bytes == 0) {
             continue;
         }
-        const uint8_t * src = ctx->src_base + seg.src_base + src_row * seg.bytes_per_row;
-        void *          dst = static_cast<uint8_t *>(device_slice) + dst_offset;
-        last_evt            = queue.memcpy(dst, src, bytes, cur_deps);
+        const uint8_t * src        = ctx->src_base + seg.src_base + src_row * seg.bytes_per_row;
+        void *          dst        = static_cast<uint8_t *>(device_slice) + dst_offset;
+        auto            dst_handle = copy_handle_for_raw_ptr(dst, queue_device, true);
+        auto            src_handle = copy_handle_for_raw_ptr(const_cast<uint8_t *>(src), queue_device, true);
+        last_evt                   = ggml_sycl::mem_copy_async(dst_handle, src_handle, bytes, queue, cur_deps);
         cur_deps.assign(1, last_evt);
         dst_offset += bytes;
     }
@@ -3513,9 +3614,9 @@ void ggml_sycl_op_dequantize_mul_mat_vec(ggml_backend_sycl_context & ctx,
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     // on some GPUs it is faster to convert src1 to half and to use half precision intrinsics
+    ggml_sycl::mem_handle src1_dfloat_owner;
 #ifdef GGML_SYCL_F16
-    ggml_sycl_pool_alloc<sycl::half> src1_dfloat_a(ctx.pool());
-    sycl::half *                     src1_dfloat = nullptr;  // dfloat == half
+    sycl::half * src1_dfloat = nullptr;  // dfloat == half
 
     bool src1_convert_f16 = src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_1 ||
                             src0->type == GGML_TYPE_Q5_0 || src0->type == GGML_TYPE_Q5_1 ||
@@ -3524,7 +3625,13 @@ void ggml_sycl_op_dequantize_mul_mat_vec(ggml_backend_sycl_context & ctx,
     if (src1_convert_f16) {
         scope_op_debug_print scope_dbg_print(__func__, "/to_fp16_sycl", dst, /*num_src=*/2,
                                              " : converting src1 to fp16");
-        src1_dfloat                       = src1_dfloat_a.alloc(ne00);
+        void *               src1_dfloat_ptr = nullptr;
+        if (!ggml_sycl_dmmv_alloc_device_scratch(static_cast<size_t>(ne00) * sizeof(sycl::half), *stream,
+                                                 ggml_sycl_get_device_id_from_queue(*stream), "dmmv:src1_f16",
+                                                 &src1_dfloat_ptr, src1_dfloat_owner)) {
+            GGML_ABORT("[DMMV] src1 FP16 scratch allocation failed");
+        }
+        src1_dfloat                       = static_cast<sycl::half *>(src1_dfloat_ptr);
         const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src1->type, dst);
         GGML_ASSERT(to_fp16_sycl != nullptr);
         to_fp16_sycl(src1_ddf_i, src1_dfloat, ne00, stream);
@@ -3630,8 +3737,7 @@ void ggml_sycl_op_dequantize_mul_mat_vec(ggml_backend_sycl_context & ctx,
         return ggml_sycl::cache_location::HOST_MMAP;
     };
 
-    ggml_sycl::unified_cache * cache =
-        ggml_sycl::unified_cache_enabled() ? ggml_sycl::get_unified_cache(*stream) : nullptr;
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache(*stream);
     ggml_sycl_cache_id cache_key =
         cache ? ggml_backend_sycl_get_weight_cache_key(src0, device_id) : ggml_sycl_cache_id{};
     ggml_sycl::cache_ptr_view view{};
@@ -3686,6 +3792,20 @@ void ggml_sycl_op_dequantize_mul_mat_vec(ggml_backend_sycl_context & ctx,
         if (!cache) {
             GGML_ABORT("DMMV streaming requires unified cache");
         }
+        auto retain_dmmv_temps_until = [&](sycl::event done) {
+            std::vector<ggml_sycl::mem_handle> retained;
+            if (src1_dfloat_owner.valid()) {
+                retained.push_back(std::move(src1_dfloat_owner));
+            }
+            if (!retained.empty()) {
+                ggml_sycl::retain_handles_until_event(std::move(retained), std::move(done));
+            }
+        };
+        auto retain_dmmv_temps = [&]() {
+            if (src1_dfloat_owner.valid()) {
+                retain_dmmv_temps_until(ggml_sycl_submit_marker<ggml_sycl_dmmv_marker_kernel>(*stream));
+            }
+        };
         size_t slice_bytes  = 0;
         size_t buffer_count = 0;
         dmmv_resolve_dma_params(stream_ctx.row_total_bytes, slice_bytes, buffer_count);
@@ -3716,6 +3836,7 @@ void ggml_sycl_op_dequantize_mul_mat_vec(ggml_backend_sycl_context & ctx,
                 GGML_LOG_WARN("[DMMV] DMA from mmap failed, falling back to CPU (%s)\n",
                               src0->name ? src0->name : "unknown");
                 if (ggml_sycl_cpu_fallback_graph(ctx, dst, "dmmv streaming")) {
+                    retain_dmmv_temps();
                     return;
                 }
             }
@@ -3726,24 +3847,30 @@ void ggml_sycl_op_dequantize_mul_mat_vec(ggml_backend_sycl_context & ctx,
         GGML_UNUSED(src1_ncols);
         GGML_UNUSED(src1_padded_row_size);
         GGML_UNUSED(ctx);
+        retain_dmmv_temps_until(result.event);
         return;
     }
 
-    const block_q8_0 *         src1_q8 = nullptr;
-    ggml_sycl_pool_alloc<char> src1_q8_alloc(ctx.pool());
-    std::vector<sycl::event>   dmmv_deps;
+    const block_q8_0 *       src1_q8 = nullptr;
+    ggml_sycl::mem_handle    src1_q8_owner;
+    std::vector<sycl::event> dmmv_deps;
     // Q8_0 input quantization disabled by default: adds overhead making TG ~15x slower.
     // Non-Q8 path uses direct F32 input like master branch.
     // Enable with GGML_SYCL_DMMV_USE_Q8=1 for integer math testing.
-    static const bool          use_q8_input = (std::getenv("GGML_SYCL_DMMV_USE_Q8") != nullptr);
+    static const bool        use_q8_input = (std::getenv("GGML_SYCL_DMMV_USE_Q8") != nullptr);
     if (use_q8_input && src0->type == GGML_TYPE_Q4_0) {
         const int64_t blocks = ne00 / QK8_0;
         if (blocks > 0) {
-            src1_q8 =
-                reinterpret_cast<block_q8_0 *>(src1_q8_alloc.alloc(static_cast<size_t>(blocks) * sizeof(block_q8_0)));
+            void *       src1_q8_ptr   = nullptr;
+            const size_t src1_q8_bytes = static_cast<size_t>(blocks) * sizeof(block_q8_0);
+            if (!ggml_sycl_dmmv_alloc_device_scratch(src1_q8_bytes, *stream, device_id, "dmmv:src1_q8", &src1_q8_ptr,
+                                                     src1_q8_owner)) {
+                GGML_ABORT("[DMMV] Q8 input scratch allocation failed");
+            }
+            src1_q8 = reinterpret_cast<block_q8_0 *>(src1_q8_ptr);
             if (std::getenv("GGML_SYCL_DMMV_Q8_DEBUG")) {
-                fprintf(stderr, "[DMMV] q8 alloc: blocks=%lld bytes=%zu ptr=%p\n", (long long) blocks,
-                        static_cast<size_t>(blocks) * sizeof(block_q8_0), (void *) src1_q8);
+                fprintf(stderr, "[DMMV] q8 alloc: blocks=%lld bytes=%zu ptr=%p\n", (long long) blocks, src1_q8_bytes,
+                        (void *) src1_q8);
             }
             sycl::event quant_evt = quantize_row_q8_0_sycl(src1_ddf_i, (void *) src1_q8, static_cast<int>(ne00), 1,
                                                            static_cast<int>(ne00), stream);
@@ -3758,6 +3885,19 @@ void ggml_sycl_op_dequantize_mul_mat_vec(ggml_backend_sycl_context & ctx,
     ggml_sycl_dmmv_dispatch(src0, dispatch_ptr, dispatch_base, dispatch_layout, src1_q8, src1_dfloat, src1_ddf_i,
                             dst_dd_i, row_low, row_high, layout_rows, layout_row_low, stream,
                             dmmv_deps.empty() ? nullptr : &dmmv_deps);
+    {
+        std::vector<ggml_sycl::mem_handle> retained;
+        if (src1_dfloat_owner.valid()) {
+            retained.push_back(std::move(src1_dfloat_owner));
+        }
+        if (src1_q8_owner.valid()) {
+            retained.push_back(std::move(src1_q8_owner));
+        }
+        if (!retained.empty()) {
+            sycl::event done = ggml_sycl_submit_marker<ggml_sycl_dmmv_marker_kernel>(*stream);
+            ggml_sycl::retain_handles_until_event(std::move(retained), std::move(done));
+        }
+    }
     GGML_UNUSED(src1);
     GGML_UNUSED(dst);
     GGML_UNUSED(src1_ddq_i);

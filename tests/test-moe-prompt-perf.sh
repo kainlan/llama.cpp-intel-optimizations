@@ -7,10 +7,14 @@
 
 set -e
 
+TEST_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$TEST_DIR/.." && pwd)"
+
 source /opt/intel/oneapi/setvars.sh --force 2>/dev/null
 
 MODEL="/Storage/GenAI/models/gpt-oss-20b-Q8_0.gguf"
 BASELINE=250  # t/s - conservative threshold (master achieves ~280 t/s)
+DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:0}"
 
 if [ ! -f "$MODEL" ]; then
     echo "SKIP: Model not found: $MODEL"
@@ -25,7 +29,7 @@ fi
 # Run benchmark and extract pp512 performance
 # Output format: | model | size | params | backend | ngl | fa | test | t/s |
 # Extract field 9 (t/s column), then get just the first number (before ±)
-RESULT=$(ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
+RESULT=$(ONEAPI_DEVICE_SELECTOR="$DEVICE_SELECTOR" ./build/bin/llama-bench \
   -m "$MODEL" \
   -p 512 -n 0 -ngl 99 -fa 1 2>&1 | grep "pp512" | awk -F'|' '{print $9}' | awk '{print $1}')
 

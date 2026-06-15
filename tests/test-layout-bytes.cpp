@@ -1,7 +1,7 @@
 // Validate layout-specific byte calculations for SYCL layouts.
 //
 // Usage:
-//   ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-layout-bytes
+//   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-layout-bytes
 
 #include <cstdio>
 #include <cstdlib>
@@ -32,7 +32,7 @@ static bool expect_eq(const char * label, size_t got, size_t expected) {
 
 int main() {
     if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:1", 1);
+        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
     }
 
     ggml_backend_t backend = ggml_backend_sycl_init(0);

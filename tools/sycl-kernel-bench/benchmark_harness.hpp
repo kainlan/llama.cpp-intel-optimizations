@@ -1202,7 +1202,9 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                 const bool xmx_tiled_grouped   = config.kernel_name.find("_grouped") != std::string::npos;
                 const bool xmx_tiled_pack_q8   = config.kernel_name.find("_packed") != std::string::npos;
                 const bool xmx_tiled_prefetch  = config.kernel_name.find("_prefetch") != std::string::npos;
-                const int  xmx_tiled_m_tiles   = config.kernel_name.find("_m2") != std::string::npos ? 2 : 1;
+                const int  xmx_tiled_m_tiles   = config.kernel_name.find("_m4") != std::string::npos ? 4 :
+                                                 config.kernel_name.find("_m2") != std::string::npos ? 2 :
+                                                                                                       1;
                 const bool direct_xmx          = config.kernel_name.find("_xmx_soa") != std::string::npos;
                 const bool split_gate_up       = config.kernel_name.find("_split") != std::string::npos;
                 const bool predecoded_i8       = config.kernel_name.find("_predecoded") != std::string::npos;
@@ -1382,6 +1384,11 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                                      config.kernel_name.find("_nocache") == std::string::npos;
                 const bool xmx_tiled_gate_up   = config.kernel_name.find("_xmx_tiled") != std::string::npos;
                 const bool xmx_tiled_grouped   = config.kernel_name.find("_grouped") != std::string::npos;
+                const bool xmx_tiled_pack_q8   = config.kernel_name.find("_packed") != std::string::npos;
+                const bool xmx_tiled_prefetch  = config.kernel_name.find("_prefetch") != std::string::npos;
+                const int  xmx_tiled_m_tiles   = config.kernel_name.find("_m4") != std::string::npos ? 4 :
+                                                 config.kernel_name.find("_m2") != std::string::npos ? 2 :
+                                                                                                       1;
                 const int  xmx_tiles_n         = parse_moe_xmx_tiles_n(config.kernel_name);
                 const bool vector_qs_load      = config.kernel_name.find("_vecq") != std::string::npos;
                 const bool ignore_weight_scale = config.kernel_name.find("_noscale") != std::string::npos;
@@ -1390,8 +1397,9 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                 const bool sparse_expert_slots = config.kernel_name.find("_sparse32") != std::string::npos;
                 const bool use_bias            = config.kernel_name.find("_bias") != std::string::npos;
                 if (!run_mxfp4_layer_glu_down(weights, activations, m, selected_count, k, token_rows, rows_per_wg,
-                                              cache_y, xmx_tiled_gate_up, xmx_tiled_grouped, xmx_tiles_n,
-                                              vector_qs_load, ignore_weight_scale, scale_stride_blocks, subgroup_size,
+                                              cache_y, xmx_tiled_gate_up, xmx_tiled_grouped, xmx_tiled_pack_q8,
+                                              xmx_tiled_prefetch, xmx_tiled_m_tiles, xmx_tiles_n, vector_qs_load,
+                                              ignore_weight_scale, scale_stride_blocks, subgroup_size,
                                               sparse_expert_slots, use_bias, config.validate, config.warmup_iterations,
                                               config.measure_iterations, queue, metrics, error)) {
                     out.error = error;

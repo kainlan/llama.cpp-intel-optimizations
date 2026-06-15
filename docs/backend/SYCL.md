@@ -938,7 +938,7 @@ Use the helper script to run PP/TG separately with unified-cache CPU offload and
 
 Defaults used by the script:
 - `ONEAPI_DEVICE_SELECTOR='level_zero:0;opencl:cpu'`
-- `GGML_SYCL_UNIFIED_CACHE=1`
+- Unified cache is mandatory; no enable flag is required.
 - `GGML_SYCL_CPU_OFFLOAD=1`
 - `GGML_SYCL_CPU_OFFLOAD_ASYNC=1`
 - `GGML_SYCL_CPU_BATCH_THRESHOLD_PP=4`

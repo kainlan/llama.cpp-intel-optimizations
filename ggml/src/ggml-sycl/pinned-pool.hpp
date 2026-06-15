@@ -7,6 +7,7 @@
 #ifndef GGML_SYCL_PINNED_POOL_HPP
 #define GGML_SYCL_PINNED_POOL_HPP
 
+#include "mem-handle.hpp"
 #include "tlsf-allocator.hpp"
 
 #include <array>
@@ -33,23 +34,28 @@ struct pool_atomic_u32 {
     std::atomic<uint32_t> v{ 0 };
 
     pool_atomic_u32() = default;
-    pool_atomic_u32(const pool_atomic_u32 & o) :
-        v(o.v.load(std::memory_order_relaxed)) {}
-    pool_atomic_u32(pool_atomic_u32 && o) noexcept :
-        v(o.v.load(std::memory_order_relaxed)) {}
+
+    pool_atomic_u32(const pool_atomic_u32 & o) : v(o.v.load(std::memory_order_relaxed)) {}
+
+    pool_atomic_u32(pool_atomic_u32 && o) noexcept : v(o.v.load(std::memory_order_relaxed)) {}
+
     pool_atomic_u32 & operator=(const pool_atomic_u32 & o) {
         v.store(o.v.load(std::memory_order_relaxed), std::memory_order_relaxed);
         return *this;
     }
+
     pool_atomic_u32 & operator=(pool_atomic_u32 && o) noexcept {
         v.store(o.v.load(std::memory_order_relaxed), std::memory_order_relaxed);
         return *this;
     }
 
     uint32_t fetch_add(uint32_t n) { return v.fetch_add(n, std::memory_order_acq_rel); }
+
     uint32_t fetch_sub(uint32_t n) { return v.fetch_sub(n, std::memory_order_acq_rel); }
-    uint32_t load() const          { return v.load(std::memory_order_acquire); }
-    void     store(uint32_t x)     { v.store(x, std::memory_order_release); }
+
+    uint32_t load() const { return v.load(std::memory_order_acquire); }
+
+    void store(uint32_t x) { v.store(x, std::memory_order_release); }
 };
 
 // Host memory zone identifiers. Mirrors the VRAM arena zoning model.
@@ -231,9 +237,10 @@ class pinned_chunk_pool {
 
   private:
     struct chunk {
-        void *                          base;       // malloc_host result
-        size_t                          size;       // Chunk capacity in bytes
-        std::unique_ptr<tlsf_allocator> allocator;  // Per-chunk TLSF for runtime/pre-zone allocs
+        void *                          base;         // aligned pointer into backing host allocation
+        size_t                          size;         // Chunk capacity in bytes
+        std::unique_ptr<tlsf_allocator> allocator;    // Per-chunk TLSF for runtime/pre-zone allocs
+        mem_handle                      owner;        // owning handle for the backing chunk
         pool_atomic_u32                 lease_count;  // llama.cpp-dyhdl: live raw-ptr refs
     };
 
@@ -265,22 +272,24 @@ class pinned_chunk_pool {
     // Allocate a new chunk (>= min_size). Returns false if over budget or allocation fails.
     bool grow(size_t min_size);
 
+    void free_chunk_owner(chunk & c, const char * ctx);
+
     // Internal free without acquiring mutex_ (caller must hold it).
     void zone_free_unlocked(host_zone_id zone, void * ptr, size_t size);
 
-    sycl::queue &                                                    queue_;
-    size_t                                                           budget_;
-    size_t                                                           total_allocated_  = 0;
-    size_t                                                           chunk_size_       = CHUNK_SIZE;
-    size_t                                                           alloc_timeout_ms_ = 0;
-    std::vector<chunk>                                               chunks_;
-    std::vector<chunk>                                               runtime_chunks_;
-    std::array<host_zone, static_cast<size_t>(host_zone_id::COUNT)>  zones_{};
-    bool                                                             zones_configured_ = false;
-    std::vector<flat_span_info>                                      flat_spans_;
+    sycl::queue &                                                   queue_;
+    size_t                                                          budget_;
+    size_t                                                          total_allocated_  = 0;
+    size_t                                                          chunk_size_       = CHUNK_SIZE;
+    size_t                                                          alloc_timeout_ms_ = 0;
+    std::vector<chunk>                                              chunks_;
+    std::vector<chunk>                                              runtime_chunks_;
+    std::array<host_zone, static_cast<size_t>(host_zone_id::COUNT)> zones_{};
+    bool                                                            zones_configured_ = false;
+    std::vector<flat_span_info>                                     flat_spans_;
     // Per-zone, per-chunk TLSF allocators
     std::vector<zone_chunk_state> zone_allocators_[static_cast<size_t>(host_zone_id::COUNT)];
-    mutable std::mutex                                               mutex_;
+    mutable std::mutex            mutex_;
 };
 
 }  // namespace ggml_sycl

@@ -1,4 +1,4 @@
-# Unified Memory Manager Design for llama.cpp SYCL Backend
+#Unified Memory Manager Design for llama.cpp SYCL Backend
 
 **Date**: 2026-04-03
 **Status**: Design Document (Pre-Implementation)
@@ -36,9 +36,16 @@ The current unified cache already implements roughly 60-70% of this vision. The 
 
 **Workspace/Activation**: Uses CUDA's stream-ordered memory allocator (cuMemAllocAsync) via the BufferManager, which pools allocations through the CUDA driver's default memory pool. Activations (intermediate tensors) are workspace that gets reused across layers.
 
-**Memory pressure**: TRT-LLM implements priority-based KV block eviction. When a new blank block is needed and the pool is full, the runtime evicts the lowest-priority blocks first. Each block carries a priority score (0-100); within a priority tier, eviction follows LRU ordering. Host offloading is supported via the `host_cache_size` parameter (disabled by default) -- evicted blocks are copied to pinned host memory and can be restored on demand. If eviction cannot free sufficient space, the request is rejected or the batch size is reduced.
+**Memory pressure**: TRT-LLM implements priority-based KV block eviction. When a new blank block is needed and the pool is full, the runtime evicts the lowest-priority blocks first. Each block carries a priority score (0-100);
+within a priority                         tier,
+    eviction follows LRU                  ordering
+        .Host offloading is supported via the `host_cache_size` parameter(disabled by default)-- evicted blocks are
+    copied to pinned host memory and can be restored on demand.If eviction cannot free sufficient space,
+    the request is rejected or the batch size is reduced.
 
-**Key takeaway**: Single-owner model. The engine statically owns weight memory; KV cache is pre-allocated as a fixed pool with priority-based eviction and optional host offloading; activations use stream-ordered recycling. No runtime malloc during inference.
+                                       **Key takeaway ** : Single
+                                   - owner model.The engine statically owns weight memory;
+KV cache is pre - allocated as a fixed pool with priority - based eviction and optional host offloading; activations use stream-ordered recycling. No runtime malloc during inference.
 
 ### 2.2 vLLM / PagedAttention
 
@@ -106,16 +113,23 @@ Freed blocks return to the free pool via LRU ordering. The free queue maintains 
 
 | System | Pre-allocate VRAM? | Eviction mechanism | Location transparent? | "Data moved" handling |
 |--------|-------------------|--------------------|-----------------------|----------------------|
-| TensorRT-LLM | Yes (KV pool) | Yes (priority-based + host offload) | No | Evicted blocks copied to host; restored on demand |
-| vLLM | Yes (block pool) | Swap to CPU or recompute | Yes (block table) | Block table updated atomically |
-| vAttention | Yes (virtual range) | Physical page reclaim | Yes (virtual addresses stable) | Physical pages remapped |
-| FlexGen | Yes (LP-planned) | Static placement | No (placement fixed at init) | N/A |
-| DeepSpeed ZeRO | No (stream from CPU) | N/A (nothing cached) | No | N/A |
-| KTransformers | Partial (GPU-resident fixed) | No (CPU weights stay on CPU) | No | N/A |
-| llama.cpp CUDA | No (pool_leg caches) | LRU pool eviction | No | Stale pointers crash |
-| **Our target** | **Yes (single alloc)** | **Priority-based async DMA** | **Yes (re-query API)** | **Callers re-query; kernel dispatch adapts** |
+| TensorRT-LLM | Yes (KV pool) | Yes (priority-based + host offload) | No | Evicted blocks copied to host;
+restored on demand | | vLLM | Yes(block pool) | Swap to CPU
+    or recompute | Yes(block table) | Block table updated atomically | | vAttention |
+           Yes(virtual range) | Physical page reclaim | Yes(virtual addresses stable) | Physical pages remapped |
+           | FlexGen | Yes(LP - planned) | Static placement | No(placement fixed at init) | N / A | | DeepSpeed ZeRO |
+           No(stream from CPU) | N / A(nothing cached) | No | N / A | | KTransformers | Partial(GPU - resident fixed) |
+           No(CPU weights stay on CPU) | No | N / A | | llama.cpp CUDA | No(pool_leg caches) | LRU pool eviction | No
+           | Stale pointers crash | | **Our target ** | **Yes(single alloc) * *| **Priority - based async DMA ** |
+           **Yes(re - query API) * *| **Callers re - query;
+kernel dispatch adapts ** |
 
-**Critical insight**: No production system does exactly what we want. vLLM comes closest with its block pool + swap, but it only applies to KV cache. Our design is more ambitious: ALL memory types (weights, KV, compute scratch, staging) in one unified pool with priority-based migration.
+    **Critical insight ** : No production system does exactly what we want.vLLM comes closest with its block pool +
+        swap,
+    but it only applies to KV cache.Our design is more ambitious : ALL memory types(weights,
+                                                                                    KV,
+                                                                                    compute scratch,
+                                                                                    staging) in one unified pool with priority-based migration.
 
 ---
 
@@ -327,7 +341,9 @@ The `unified_cache` class (unified-cache.hpp/cpp, ~1400 lines header, ~9100 line
 
 **Host-side pools**:
 - `host_cache`: Parallel host-side cache with pinned_chunk_pool for host-pinned memory
-- `staging_` buffer + `copy_stage_slots_`: Pre-allocated pinned staging for DMA
+- Host-pinned staging allocations are owned by smart `mem_handle`s and copied
+  through `mem-ops`; the cache no longer keeps a parallel cache-local DMA slot
+  pool.
 
 **Budget tracking**:
 - `budget_` = `base_budget_` - `reserved_` (reserved tracks runtime non-weight allocations)
@@ -361,7 +377,8 @@ KV cache is allocated in `ggml-sycl.cpp` via `unified_cache_allocate()` with `al
 `ggml_sycl_resolve_weight()` in common.hpp is the location-transparent weight lookup:
 1. Non-weight tensors: return raw data pointer
 2. Weight tensors: query unified cache for the best available entry
-3. Returns `{ptr, layout, on_device}` so callers can dispatch to appropriate kernel
+3. Returns `{
+    ptr, layout, on_device}` so callers can dispatch to appropriate kernel
 
 This pattern already exists and works correctly. It needs to be extended to non-weight allocations.
 
@@ -562,7 +579,7 @@ This is essentially what `resolve_weight` + the dispatch logic in `unified-kerne
 | `unified-cache.hpp` | `unified_cache` class | Add `vram_arena_ptr_`, `vram_arena_size_`, `vram_arena_weight_off_` (right-to-left bump for weights) |
 | `unified-cache.cpp` | Constructor | Call `reserve_vram_arena(budget_bytes)` to pre-allocate single block |
 | `unified-cache.cpp` | `reserve_vram_arena()` | NEW: Single `sycl::malloc_device(budget_bytes, queue_)`. On BMG (B580), maxMemAllocSize covers 100% VRAM so a single allocation works. On older hardware (Alchemist), split into 2-3 chunks if needed. Track in `vram_arena_chunks_[]` |
-| `unified-cache.cpp` | `allocate_slot()` | Replace `layout_pool_->allocate()` and `ggml_sycl_malloc_device_raw()` with sub-allocation from vram_arena |
+| `unified-cache.cpp` | `allocate_slot()` | Replace `layout_pool_->allocate()` and cache-local tracked raw-device allocation with sub-allocation from vram_arena |
 | `unified-cache.cpp` | `reserve_compute_arena()` | Sub-allocate from vram_arena instead of separate malloc_device |
 | `unified-cache.cpp` | `reserve_scratch_pool()` | Sub-allocate from vram_arena instead of separate malloc_device |
 | `unified-cache.cpp` | `reserve_onednn_scratch()` | Sub-allocate from vram_arena |
@@ -574,20 +591,23 @@ This is essentially what `resolve_weight` + the dispatch logic in `unified-kerne
 
 ```
 struct vram_zone {
-    size_t start;    // Offset from arena base
-    size_t size;     // Zone capacity
-    size_t used;     // Bump pointer (atomic for lock-free alloc)
+    size_t start;  // Offset from arena base
+    size_t size;   // Zone capacity
+    size_t used;   // Bump pointer (atomic for lock-free alloc)
 };
 
 struct vram_arena {
-    void *    base;           // Single malloc_device result
-    size_t    total;          // Total arena size
-    vram_zone compute;        // Left side, bump right
-    vram_zone kv;             // After compute, bump right
-    vram_zone onednn;         // Fixed block after KV
-    vram_zone weights;        // Right side, bump LEFT (grows toward KV)
+    void *    base;     // Single malloc_device result
+    size_t    total;    // Total arena size
+    vram_zone compute;  // Left side, bump right
+    vram_zone kv;       // After compute, bump right
+    vram_zone onednn;   // Fixed block after KV
+    vram_zone weights;  // Right side, bump LEFT (grows toward KV)
     // Free list for reclaimed weight space:
-    struct free_block { size_t offset; size_t size; };
+    struct free_block {
+        size_t offset;
+        size_t size;
+    };
     std::vector<free_block> weight_free_list;
 };
 ```

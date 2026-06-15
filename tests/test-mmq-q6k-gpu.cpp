@@ -2,7 +2,7 @@
 // Tests the production MMQ kernel path used during prompt processing (batch > 1)
 //
 // Build: cmake --build build --target test-mmq-q6k-gpu
-// Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-mmq-q6k-gpu
+// Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-mmq-q6k-gpu
 //
 // This test verifies that the MMQ Q6_K kernel produces correct results
 // for multi-token batches (used during prompt processing).

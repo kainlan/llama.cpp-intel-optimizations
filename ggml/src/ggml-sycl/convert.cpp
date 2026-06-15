@@ -3,7 +3,12 @@
 #include "common.hpp"
 #include "convert-esimd.hpp"
 #include "dequantize.hpp"
+#include "mem-handle.hpp"
+#include "mem-ops.hpp"
 #include "presets.hpp"
+
+#include <utility>
+#include <vector>
 
 #if defined(__INTEL_LLVM_COMPILER)
 #    if __has_include(<sycl/ext/oneapi/bfloat16.hpp>)
@@ -25,6 +30,52 @@ static bool g_esimd_dequant_enabled = []() {
     }
     return false;
 }();
+
+static uint8_t * convert_alloc_device_scratch(size_t                  bytes,
+                                              sycl::queue &           queue,
+                                              const char *            cohort_id,
+                                              ggml_sycl::mem_handle & owner) {
+    owner = {};
+    if (bytes == 0) {
+        return nullptr;
+    }
+
+    ggml_sycl::alloc_request req{};
+    req.queue                               = &queue;
+    req.device                              = ggml_sycl_get_device_id_from_queue(queue);
+    req.size                                = bytes;
+    req.intent.role                         = ggml_sycl::alloc_role::COMPUTE;
+    req.intent.category                     = ggml_sycl::runtime_category::COMPUTE;
+    req.intent.cohort_id                    = cohort_id;
+    req.intent.constraints.must_device      = true;
+    req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::SCRATCH;
+    req.suppress_failure_log                = true;
+
+    owner = ggml_sycl::unified_allocate(req);
+    if (!owner.valid()) {
+        return nullptr;
+    }
+
+    auto resolved = owner.resolve(req.device);
+    if (!resolved || !resolved.ptr || !resolved.on_device) {
+        owner = {};
+        return nullptr;
+    }
+    return static_cast<uint8_t *>(resolved.ptr);
+}
+
+static sycl::event convert_copy_to_temp(sycl::queue &                 queue,
+                                        uint8_t *                     temp,
+                                        const ggml_sycl::mem_handle & temp_handle,
+                                        const void *                  src,
+                                        size_t                        bytes) {
+    if (g_ggml_sycl_graph_recording) {
+        return ggml_sycl_graph_safe_memcpy(queue, temp, src, bytes);
+    }
+    const int             queue_device = ggml_sycl_get_device_id_from_queue(queue);
+    ggml_sycl::mem_handle src_handle   = ggml_sycl_memcpy_handle_for_raw_ptr(src, queue_device);
+    return ggml_sycl::mem_copy_async(temp_handle, src_handle, bytes, queue);
+}
 
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static void dequantize_block(const void * __restrict__ vx,
@@ -563,8 +614,10 @@ void reorder_q4_0_aos_to_coalesced_sycl(const void *    src,
     const size_t total_bytes    = total_blocks * sizeof(block_q4_0);
 
     // Always use a temp buffer to support in-place conversion safely
-    uint8_t *   temp       = ggml_sycl_malloc_device_tracked_t<uint8_t>(total_bytes, *stream, "convert_temp");
-    sycl::event copy_event = ggml_sycl_graph_safe_memcpy(*stream, temp, src, total_bytes);
+    ggml_sycl::mem_handle temp_handle;
+    uint8_t * temp = convert_alloc_device_scratch(total_bytes, *stream, "convert_q4_0_coalesced", temp_handle);
+    GGML_ASSERT(temp != nullptr);
+    sycl::event copy_event = convert_copy_to_temp(*stream, temp, temp_handle, src, total_bytes);
 
     sycl::event convert_event = stream->submit([&](sycl::handler & cgh) {
         cgh.depends_on(copy_event);
@@ -576,11 +629,9 @@ void reorder_q4_0_aos_to_coalesced_sycl(const void *    src,
             });
     });
 
-    stream->submit([&](sycl::handler & cgh) {
-        cgh.depends_on(convert_event);
-        cgh.host_task(
-            [temp, total_bytes, stream]() { ggml_sycl_free_device_tracked_bytes(temp, total_bytes, *stream); });
-    });
+    std::vector<ggml_sycl::mem_handle> retained;
+    retained.emplace_back(std::move(temp_handle));
+    ggml_sycl::retain_handles_until_event(std::move(retained), std::move(convert_event));
 }
 
 // =============================================================================
@@ -643,8 +694,10 @@ void reorder_q8_0_aos_to_coalesced_sycl(const void *    src,
     const size_t total_blocks   = (size_t) blocks_per_row * (size_t) nrows;
     const size_t total_bytes    = total_blocks * sizeof(block_q8_0);
 
-    uint8_t *   temp       = ggml_sycl_malloc_device_tracked_t<uint8_t>(total_bytes, *stream, "convert_temp");
-    sycl::event copy_event = ggml_sycl_graph_safe_memcpy(*stream, temp, src, total_bytes);
+    ggml_sycl::mem_handle temp_handle;
+    uint8_t * temp = convert_alloc_device_scratch(total_bytes, *stream, "convert_q8_0_coalesced", temp_handle);
+    GGML_ASSERT(temp != nullptr);
+    sycl::event copy_event = convert_copy_to_temp(*stream, temp, temp_handle, src, total_bytes);
 
     sycl::event convert_event = stream->submit([&](sycl::handler & cgh) {
         cgh.depends_on(copy_event);
@@ -656,11 +709,9 @@ void reorder_q8_0_aos_to_coalesced_sycl(const void *    src,
             });
     });
 
-    stream->submit([&](sycl::handler & cgh) {
-        cgh.depends_on(convert_event);
-        cgh.host_task(
-            [temp, total_bytes, stream]() { ggml_sycl_free_device_tracked_bytes(temp, total_bytes, *stream); });
-    });
+    std::vector<ggml_sycl::mem_handle> retained;
+    retained.emplace_back(std::move(temp_handle));
+    ggml_sycl::retain_handles_until_event(std::move(retained), std::move(convert_event));
 }
 
 // =============================================================================
@@ -722,8 +773,10 @@ void reorder_mxfp4_aos_to_coalesced_sycl(const void *    src,
     const size_t total_blocks   = (size_t) blocks_per_row * (size_t) nrows;
     const size_t total_bytes    = total_blocks * sizeof(block_mxfp4);
 
-    uint8_t *   temp       = ggml_sycl_malloc_device_tracked_t<uint8_t>(total_bytes, *stream, "convert_temp");
-    sycl::event copy_event = ggml_sycl_graph_safe_memcpy(*stream, temp, src, total_bytes);
+    ggml_sycl::mem_handle temp_handle;
+    uint8_t * temp = convert_alloc_device_scratch(total_bytes, *stream, "convert_mxfp4_coalesced", temp_handle);
+    GGML_ASSERT(temp != nullptr);
+    sycl::event copy_event = convert_copy_to_temp(*stream, temp, temp_handle, src, total_bytes);
 
     sycl::event convert_event = stream->submit([&](sycl::handler & cgh) {
         cgh.depends_on(copy_event);
@@ -735,11 +788,9 @@ void reorder_mxfp4_aos_to_coalesced_sycl(const void *    src,
             });
     });
 
-    stream->submit([&](sycl::handler & cgh) {
-        cgh.depends_on(convert_event);
-        cgh.host_task(
-            [temp, total_bytes, stream]() { ggml_sycl_free_device_tracked_bytes(temp, total_bytes, *stream); });
-    });
+    std::vector<ggml_sycl::mem_handle> retained;
+    retained.emplace_back(std::move(temp_handle));
+    ggml_sycl::retain_handles_until_event(std::move(retained), std::move(convert_event));
 }
 
 // =============================================================================
@@ -825,8 +876,10 @@ void reorder_q6_k_aos_to_coalesced_sycl(const void *    src,
     const size_t total_blocks   = (size_t) blocks_per_row * (size_t) nrows;
     const size_t total_bytes    = total_blocks * sizeof(block_q6_K);
 
-    uint8_t *   temp       = ggml_sycl_malloc_device_tracked_t<uint8_t>(total_bytes, *stream, "convert_temp");
-    sycl::event copy_event = ggml_sycl_graph_safe_memcpy(*stream, temp, src, total_bytes);
+    ggml_sycl::mem_handle temp_handle;
+    uint8_t * temp = convert_alloc_device_scratch(total_bytes, *stream, "convert_q6_k_coalesced", temp_handle);
+    GGML_ASSERT(temp != nullptr);
+    sycl::event copy_event = convert_copy_to_temp(*stream, temp, temp_handle, src, total_bytes);
 
     sycl::event convert_event = stream->submit([&](sycl::handler & cgh) {
         cgh.depends_on(copy_event);
@@ -838,11 +891,9 @@ void reorder_q6_k_aos_to_coalesced_sycl(const void *    src,
             });
     });
 
-    stream->submit([&](sycl::handler & cgh) {
-        cgh.depends_on(convert_event);
-        cgh.host_task(
-            [temp, total_bytes, stream]() { ggml_sycl_free_device_tracked_bytes(temp, total_bytes, *stream); });
-    });
+    std::vector<ggml_sycl::mem_handle> retained;
+    retained.emplace_back(std::move(temp_handle));
+    ggml_sycl::retain_handles_until_event(std::move(retained), std::move(convert_event));
 }
 
 // =============================================================================
@@ -1062,6 +1113,107 @@ void dequantize_row_q4_0_coalesced_to_fp16_rowmajor(const void *    src,
         return;
     }
     dequantize_row_q4_0_sycl_coalesced_rowmajor(src, dst, blocks_per_row, nrows, stream);
+}
+
+static void dequantize_block_q8_0_soa_rowmajor(const void * __restrict__ vx,
+                                               sycl::half * __restrict__ yy,
+                                               const int                blocks_per_row,
+                                               const int                total_blocks,
+                                               const sycl::nd_item<3> & item) {
+    const int64_t block_i      = item.get_group(2) * item.get_local_range(2) + item.get_local_id(2);
+    const int64_t row          = block_i / blocks_per_row;
+    const int64_t block        = block_i - row * blocks_per_row;
+    if (block >= blocks_per_row) {
+        return;
+    }
+
+    const int8_t *    qs = static_cast<const int8_t *>(vx);
+    const sycl::half * d  = reinterpret_cast<const sycl::half *>(qs + total_blocks * QK8_0);
+    sycl::half *       y  = yy + block_i * QK8_0;
+    const float        df = static_cast<float>(d[block_i]);
+
+#pragma unroll
+    for (int j = 0; j < QK8_0; ++j) {
+        y[j] = sycl::half(df * static_cast<float>(qs[block_i * QK8_0 + j]));
+    }
+}
+
+static void dequantize_block_q8_0_coalesced_rowmajor(const void * __restrict__ vx,
+                                                     sycl::half * __restrict__ yy,
+                                                     const int                blocks_per_row,
+                                                     const int                nrows,
+                                                     const sycl::nd_item<2> & item) {
+    constexpr int TILE_BLOCKS       = MMVQ_COALESCED_TILE_BLOCKS;
+    constexpr int WORDS_PER_BLOCK   = 8;
+    constexpr int WORD_PLANE_STRIDE = TILE_BLOCKS * 4;
+
+    const int row  = item.get_global_id(0);
+    const int tid  = item.get_local_id(1);
+    const int tile = item.get_group(1);
+    if (row >= nrows) {
+        return;
+    }
+
+    const uint8_t * src                 = static_cast<const uint8_t *>(vx);
+    const int64_t   row_quants_bytes    = static_cast<int64_t>(ggml_sycl_q8_0_coalesced_row_quants_bytes(blocks_per_row));
+    const int64_t   total_quants_bytes  = static_cast<int64_t>(nrows) * row_quants_bytes;
+    const int64_t   tile_qs_base        = static_cast<int64_t>(row) * row_quants_bytes +
+                                    static_cast<int64_t>(tile) * MMVQ_COALESCED_TILE_BYTES_Q8_0;
+    const int       block_in_tile       = tid;
+    const int       block_idx           = tile * TILE_BLOCKS + block_in_tile;
+    if (block_idx >= blocks_per_row) {
+        return;
+    }
+
+    const int64_t      block_i = static_cast<int64_t>(row) * blocks_per_row + block_idx;
+    const sycl::half * d       = reinterpret_cast<const sycl::half *>(src + total_quants_bytes);
+    sycl::half *       y       = yy + block_i * QK8_0;
+    const float        df      = static_cast<float>(d[block_i]);
+
+#pragma unroll
+    for (int word = 0; word < WORDS_PER_BLOCK; ++word) {
+        const int64_t word_offset = tile_qs_base + word * WORD_PLANE_STRIDE + block_in_tile * 4;
+        const int8_t * q          = reinterpret_cast<const int8_t *>(src + word_offset);
+        y[word * 4 + 0]           = sycl::half(df * static_cast<float>(q[0]));
+        y[word * 4 + 1]           = sycl::half(df * static_cast<float>(q[1]));
+        y[word * 4 + 2]           = sycl::half(df * static_cast<float>(q[2]));
+        y[word * 4 + 3]           = sycl::half(df * static_cast<float>(q[3]));
+    }
+}
+
+void dequantize_row_q8_0_soa_to_fp16_rowmajor(const void *    src,
+                                              sycl::half *    dst,
+                                              int             blocks_per_row,
+                                              int             nrows,
+                                              dpct::queue_ptr stream) {
+    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+
+    const int total_blocks = nrows * blocks_per_row;
+    constexpr int WG_SIZE  = 256;
+    const int n_wgs        = (total_blocks + WG_SIZE - 1) / WG_SIZE;
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, n_wgs * WG_SIZE), sycl::range<3>(1, 1, WG_SIZE)),
+        [=](sycl::nd_item<3> item) {
+            const int64_t block_i = item.get_group(2) * item.get_local_range(2) + item.get_local_id(2);
+            if (block_i < total_blocks) {
+                dequantize_block_q8_0_soa_rowmajor(src, dst, blocks_per_row, total_blocks, item);
+            }
+        });
+}
+
+void dequantize_row_q8_0_coalesced_to_fp16_rowmajor(const void *    src,
+                                                    sycl::half *    dst,
+                                                    int             blocks_per_row,
+                                                    int             nrows,
+                                                    dpct::queue_ptr stream) {
+    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+
+    const int tiles_per_row = ggml_sycl_coalesced_fixed_tile_count(blocks_per_row);
+    stream->parallel_for(
+        sycl::nd_range<2>(sycl::range<2>(nrows, tiles_per_row * WARP_SIZE), sycl::range<2>(1, WARP_SIZE)),
+        [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            dequantize_block_q8_0_coalesced_rowmajor(src, dst, blocks_per_row, nrows, item);
+        });
 }
 
 // SOA→row-major FP16 dequant for oneDNN PP path.
@@ -1316,7 +1468,7 @@ to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor * dst, bool ful
     }
 }
 
-to_fp16_nc_sycl_t get_to_fp16_nc_sycl(ggml_type type) {
+to_fp16_nc_sycl_t ggml_get_to_fp16_nc_sycl(ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
             return convert_unary_nc_sycl<float>;

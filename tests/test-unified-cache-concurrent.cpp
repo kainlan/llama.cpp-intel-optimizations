@@ -1,7 +1,7 @@
 // Stress tests for unified_cache concurrent access.
 //
 // Usage:
-//   ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-unified-cache-concurrent
+//   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-unified-cache-concurrent
 
 #include "ggml-sycl.h"
 #include "ggml-sycl/unified-cache.hpp"
@@ -216,7 +216,7 @@ static bool test_mixed_ops(sycl::queue & q) {
 
 int main() {
     if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:1", 1);
+        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
     }
 
     sycl::queue q;

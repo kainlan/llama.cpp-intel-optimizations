@@ -7,6 +7,13 @@ GPTOSS_MODEL="${GPTOSS_MODEL:-/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf}"
 MISTRAL_MODEL="${MISTRAL_MODEL:-/Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf}"
 OUT_DIR="${OUT_DIR:-$ROOT_DIR/benchmark_results/sycl-dual-gpu-gate-$(date +%Y%m%d-%H%M%S)}"
 BENCH_TIMEOUT="${BENCH_TIMEOUT:-900}"
+GPTOSS_B50_MIN_PP512="${GPTOSS_B50_MIN_PP512:-1100}"
+GPTOSS_B50_MIN_TG128="${GPTOSS_B50_MIN_TG128:-50}"
+MISTRAL_B580_MIN_PP512="${MISTRAL_B580_MIN_PP512:-2000}"
+MISTRAL_B580_MIN_TG128="${MISTRAL_B580_MIN_TG128:-84}"
+
+# shellcheck disable=SC1091
+source "$ROOT_DIR/scripts/sycl-gpu-preflight.sh"
 
 set +u
 source /opt/intel/oneapi/setvars.sh --force >/tmp/oneapi-setvars.log 2>&1
@@ -97,6 +104,7 @@ run_case() {
     fi
 
     printf "[gate] %s selector=%s fa=%s\n" "$name" "$selector" "$fa" | tee "$log"
+    sycl_gpu_preflight_check "$selector"
     set +e
     timeout "$BENCH_TIMEOUT" env "${env_args[@]}" "$LLAMA_BENCH" -m "$model" -p 512 -n 128 -fa "$fa" -ngl 99 2>&1 | tee -a "$log"
     local rc=${PIPESTATUS[0]}
@@ -178,6 +186,52 @@ write_comparison() {
     ' "$SUMMARY" > "$comparison"
 }
 
+validate_guardrails() {
+    local guardrails="$OUT_DIR/guardrails.tsv"
+    awk -F'\t' \
+        -v gpt_pp="$GPTOSS_B50_MIN_PP512" \
+        -v gpt_tg="$GPTOSS_B50_MIN_TG128" \
+        -v mistral_pp="$MISTRAL_B580_MIN_PP512" \
+        -v mistral_tg="$MISTRAL_B580_MIN_TG128" '
+        BEGIN {
+            OFS = "\t"
+            print "guard", "case", "fa", "rc", "pp512_tps", "min_pp512", "tg128_tps", "min_tg128", "pass"
+        }
+        NR == 1 {
+            next
+        }
+        function numeric(value) {
+            return value != "" && value != "NA" && value ~ /^[0-9]+([.][0-9]+)?$/
+        }
+        function check_guard(guard, min_pp, min_tg) {
+            pass = (($5 + 0) == 0 && numeric($6) && numeric($7) && ($6 + 0) >= min_pp && ($7 + 0) >= min_tg) ? "yes" : "no"
+            print guard, $1, $4, $5, $6, min_pp, $7, min_tg, pass
+            if (pass != "yes") {
+                failures++
+            }
+        }
+        $1 == "gptoss-b50" && $4 == "1" {
+            check_guard("gptoss_b50_fa1", gpt_pp, gpt_tg)
+            seen_gpt = 1
+        }
+        $1 == "mistral-b580" && $4 == "1" {
+            check_guard("mistral_b580_fa1", mistral_pp, mistral_tg)
+            seen_mistral = 1
+        }
+        END {
+            if (!seen_gpt) {
+                print "gptoss_b50_fa1", "missing", "1", "NA", "NA", gpt_pp, "NA", gpt_tg, "no"
+                failures++
+            }
+            if (!seen_mistral) {
+                print "mistral_b580_fa1", "missing", "1", "NA", "NA", mistral_pp, "NA", mistral_tg, "no"
+                failures++
+            }
+            exit failures ? 1 : 0
+        }
+    ' "$SUMMARY" > "$guardrails"
+}
+
 for fa in 1 0; do
     run_case "gptoss-b580" "level_zero:0" "$GPTOSS_MODEL" "$fa"
     run_case "gptoss-b50" "level_zero:1" "$GPTOSS_MODEL" "$fa"
@@ -193,3 +247,10 @@ write_comparison
 column -t -s $'\t' "$SUMMARY" | tee "$OUT_DIR/summary.txt"
 printf "\nComparison:\n" | tee -a "$OUT_DIR/summary.txt"
 column -t -s $'\t' "$OUT_DIR/comparison.tsv" | tee -a "$OUT_DIR/summary.txt"
+printf "\nGuardrails:\n" | tee -a "$OUT_DIR/summary.txt"
+if ! validate_guardrails; then
+    column -t -s $'\t' "$OUT_DIR/guardrails.tsv" | tee -a "$OUT_DIR/summary.txt"
+    echo "gate failed: single-card performance guardrail missed" >&2
+    exit 1
+fi
+column -t -s $'\t' "$OUT_DIR/guardrails.tsv" | tee -a "$OUT_DIR/summary.txt"

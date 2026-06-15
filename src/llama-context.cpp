@@ -16,7 +16,10 @@
 #include "llama.h"
 
 #include <cinttypes>
+#include <atomic>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -32,6 +35,10 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     }
     throw std::runtime_error("Unsupported ctx type");
 }
+
+static bool llama_decode_trace_enabled();
+static int  llama_decode_trace_limit();
+static int  llama_decode_trace_next();
 
 llama_context::llama_context(
         const llama_model & model,
@@ -844,7 +851,31 @@ float * llama_context::get_logits_ith(int32_t i) {
         }
 
         const int64_t j = output_resolve_row(i);
-        return logits.data + j*model.vocab.n_tokens();
+        float * row = logits.data + j*model.vocab.n_tokens();
+
+        if (llama_decode_trace_enabled()) {
+            const int trace_idx = llama_decode_trace_next();
+            if (trace_idx < llama_decode_trace_limit()) {
+                const int64_t n_vocab = model.vocab.n_tokens();
+                int64_t nonzero = 0;
+                float min_v = row[0];
+                float max_v = row[0];
+                double sum_abs = 0.0;
+                for (int64_t t = 0; t < n_vocab; ++t) {
+                    const float v = row[t];
+                    nonzero += v != 0.0f;
+                    min_v = std::min(min_v, v);
+                    max_v = std::max(max_v, v);
+                    sum_abs += std::abs((double) v);
+                }
+                std::fprintf(stderr,
+                        "[DECODE-TRACE] get_logits_ith i=%d row=%" PRId64 " n_outputs=%d n_vocab=%" PRId64
+                        " nonzero=%" PRId64 " min=%g max=%g sum_abs=%g\n",
+                        i, j, n_outputs, n_vocab, nonzero, min_v, max_v, sum_abs);
+            }
+        }
+
+        return row;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
 #ifndef NDEBUG
@@ -1139,8 +1170,10 @@ void llama_context::set_warmup(bool value) {
 
     cparams.warmup = value;
 
-    // warmups are usually with small batches, so no need to reserve
-    //sched_need_reserve = true;
+    // Warmup changes graph construction for MoE models: it uses all experts
+    // instead of the normal top-k expert count. Re-reserve when entering and
+    // leaving warmup so cached scheduler allocations match the graph shape.
+    sched_need_reserve = true;
 }
 
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
@@ -1634,6 +1667,27 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+static bool llama_decode_trace_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("LLAMA_DECODE_TRACE");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static int llama_decode_trace_limit() {
+    static const int limit = [] {
+        const char * env = std::getenv("LLAMA_DECODE_TRACE_LIMIT");
+        return env && *env ? std::max(0, std::atoi(env)) : 16;
+    }();
+    return limit;
+}
+
+static int llama_decode_trace_next() {
+    static std::atomic<int> counter{ 0 };
+    return counter.fetch_add(1, std::memory_order_relaxed);
+}
+
 int llama_context::decode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_pre_norm row),
     // so accept either present rather than requiring exactly one.
@@ -1844,7 +1898,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+        const bool raw_logits_needed = needs_raw_logits(ubatch, sampling.samplers);
+        if (llama_decode_trace_enabled()) {
+            const int trace_idx = llama_decode_trace_next();
+            if (trace_idx < llama_decode_trace_limit()) {
+                int32_t output_count = 0;
+                for (uint32_t ti = 0; ti < ubatch.n_tokens; ++ti) {
+                    output_count += (int32_t) (ubatch.output[ti] != 0);
+                }
+                std::fprintf(stderr,
+                        "[DECODE-TRACE] ubatch tokens=%u outputs=%d counted_outputs=%d n_outputs_prev=%" PRId64
+                        " n_outputs_all=%u samplers=%zu raw_needed=%d logits_data=%p t_logits=%p\n",
+                        ubatch.n_tokens, n_outputs, output_count, n_outputs_prev, n_outputs_all,
+                        sampling.samplers.size(), raw_logits_needed ? 1 : 0, (void *) logits.data, (void *) t_logits);
+            }
+        }
+        if (logits.data && t_logits && n_outputs > 0 && raw_logits_needed) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -1852,6 +1921,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
             float * logits_out = logits.data + n_outputs_prev*n_vocab;
 
             if (n_outputs) {
+                if (llama_decode_trace_enabled()) {
+                    const int trace_idx = llama_decode_trace_next();
+                    if (trace_idx < llama_decode_trace_limit()) {
+                        std::fprintf(stderr,
+                                "[DECODE-TRACE] logits-copy backend=%s t_logits=%p ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64
+                                "] nb=[%zu,%zu,%zu,%zu] dst=%p bytes=%zu\n",
+                                ggml_backend_name(backend_res), (void *) t_logits,
+                                t_logits->ne[0], t_logits->ne[1], t_logits->ne[2], t_logits->ne[3],
+                                t_logits->nb[0], t_logits->nb[1], t_logits->nb[2], t_logits->nb[3],
+                                (void *) logits_out, (size_t) n_outputs*n_vocab*sizeof(float));
+                    }
+                }
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));

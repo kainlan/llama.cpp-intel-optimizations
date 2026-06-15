@@ -1,14 +1,18 @@
 #include "count-equal.hpp"
 
+#include "mem-ops.hpp"
+
 #include <cstdint>
 
 template <typename T>
-static void count_equal(const T *__restrict__ x, const T *__restrict__ y,
-                        int64_t *__restrict__ dst, const int64_t dk,
+static void count_equal(const T * __restrict__ x,
+                        const T * __restrict__ y,
+                        int64_t * __restrict__ dst,
+                        const int64_t dk,
                         const int64_t k) {
-    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    const int64_t i0 = (int64_t)item_ct1.get_group(2) * dk;
-    const int64_t i1 = sycl::min(i0 + dk, k);
+    auto          item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t i0       = (int64_t) item_ct1.get_group(2) * dk;
+    const int64_t i1       = sycl::min(i0 + dk, k);
 
     int nequal = 0;
 
@@ -24,14 +28,13 @@ static void count_equal(const T *__restrict__ x, const T *__restrict__ y,
         return;
     }
 
-    dpct::atomic_fetch_add<sycl::access::address_space::generic_space>(
-        (int *)dst, nequal);
+    dpct::atomic_fetch_add<sycl::access::address_space::generic_space>((int *) dst, nequal);
 }
 
-void ggml_sycl_count_equal(ggml_backend_sycl_context &ctx, ggml_sycl::sycl_tensor dst) {
+void ggml_sycl_count_equal(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst.raw(), /*num_src=*/2);
-    auto src0 = dst.src(0);
-    auto src1 = dst.src(1);
+    auto                 src0 = dst.src(0);
+    auto                 src1 = dst.src(1);
 
     GGML_ASSERT(src0.type() == src1.type());
     GGML_ASSERT(dst.type() == GGML_TYPE_I64);
@@ -41,39 +44,43 @@ void ggml_sycl_count_equal(ggml_backend_sycl_context &ctx, ggml_sycl::sycl_tenso
     GGML_ASSERT(src1.is_contiguous());
     GGML_ASSERT(dst.is_contiguous());
 
-    int64_t * dst_d  = dst.resolve_as<int64_t>();
+    int64_t * dst_d = dst.resolve_as<int64_t>();
 
     dpct::queue_ptr stream = ctx.stream();
-    const int id       = get_current_device_id();
-    const int nsm = ggml_sycl_info().devices[id].nsm;
+    const int       id     = get_current_device_id();
+    const int       nsm    = ggml_sycl_info().devices[id].nsm;
 
     const int64_t ne = src0.nelements();
     GGML_ASSERT(ne < (1 << 30) && "atomicAdd implementation only supports int");
-    const int64_t dne =
-        GGML_PAD((ne + 4 * nsm - 1) / (4 * nsm), SYCL_COUNT_EQUAL_CHUNK_SIZE);
+    const int64_t dne = GGML_PAD((ne + 4 * nsm - 1) / (4 * nsm), SYCL_COUNT_EQUAL_CHUNK_SIZE);
 
-    SYCL_CHECK(CHECK_TRY_ERROR(stream->memset(dst_d, 0, dst.nbytes())));
+    const ggml_sycl::memory_location dst_loc       = ggml_sycl::query_location(dst_d, ctx.device);
+    const bool                       dst_on_device = dst_loc.on_device();
+    const int                        dst_device    = dst_on_device && dst_loc.device >= 0 ?
+                                                         dst_loc.device :
+                                                         (dst_on_device ? ctx.device : ggml_sycl::mem_handle::HOST_DEVICE);
+    const ggml_sycl::mem_handle      dst_handle =
+        ggml_sycl::mem_handle::from_direct(dst_d, GGML_LAYOUT_AOS, dst_on_device, dst_device);
+    ggml_sycl::mem_fill(dst_handle, 0, dst.nbytes(), *stream);
 
     const dpct::dim3 block_dims(WARP_SIZE, 1, 1);
     const dpct::dim3 block_nums(
-        std::min((int64_t)4 * nsm, (ne + SYCL_COUNT_EQUAL_CHUNK_SIZE - 1) /
-                                       SYCL_COUNT_EQUAL_CHUNK_SIZE),
-        1, 1);
+        std::min((int64_t) 4 * nsm, (ne + SYCL_COUNT_EQUAL_CHUNK_SIZE - 1) / SYCL_COUNT_EQUAL_CHUNK_SIZE), 1, 1);
 
     switch (src0.type()) {
-    case GGML_TYPE_I32: {
-        const int *src0_d = src0.resolve_as<const int>();
-        const int *src1_d = src1.resolve_as<const int>();
-        stream->parallel_for(
-            sycl::nd_range<3>(block_nums * block_dims, block_dims),
-            [=](sycl::nd_item<3> item_ct1) {
-                count_equal(src0_d, src1_d, dst_d, dne, ne);
-                GGML_UNUSED(item_ct1);
-            });
-
-    } break;
-    default:
-        GGML_ASSERT(false);
-        break;
+        case GGML_TYPE_I32:
+            {
+                const int * src0_d = src0.resolve_as<const int>();
+                const int * src1_d = src1.resolve_as<const int>();
+                stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                                     [=](sycl::nd_item<3> item_ct1) {
+                                         count_equal(src0_d, src1_d, dst_d, dne, ne);
+                                         GGML_UNUSED(item_ct1);
+                                     });
+            }
+            break;
+        default:
+            GGML_ASSERT(false);
+            break;
     }
 }

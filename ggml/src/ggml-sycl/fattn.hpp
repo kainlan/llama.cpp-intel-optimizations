@@ -160,10 +160,10 @@ struct ggml_sycl_fattn_xmx_packed_k_materialization_desc {
 };
 
 struct ggml_sycl_fattn_xmx_packed_k {
-    ggml_sycl::alloc_handle alloc{};
-    ggml_sycl::mem_handle   handle{};
-    sycl::event             ready_event{};
+    ggml_sycl::mem_handle handle{};
+    sycl::event           ready_event{};
 
+    void * ptr         = nullptr;  // Cached raw ABI view; handle owns lifetime.
     int    device      = -1;
     int    D           = 0;
     int    n_kv        = 0;

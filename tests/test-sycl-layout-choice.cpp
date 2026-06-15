@@ -440,18 +440,303 @@ static bool run_multi_device_layer_block_plan_test() {
         printf("FAIL: expected multi-device planner to emit explicit layer blocks\n");
         return false;
     }
+    if (plan.get_layer_device(0) != plan.fastest_dense_device ||
+        plan.get_layer_device(1) != plan.fastest_dense_device) {
+        printf("FAIL: expected dense layers to prefer fastest dense device %d, got layer0=%d layer1=%d\n",
+               plan.fastest_dense_device, plan.get_layer_device(0), plan.get_layer_device(1));
+        return false;
+    }
     if (plan.layer_blocks.front().start_layer != 0 || plan.layer_blocks.back().end_layer != 1) {
         printf("FAIL: expected layer blocks to cover layers [0,1], got first=%d last=%d\n",
                plan.layer_blocks.front().start_layer, plan.layer_blocks.back().end_layer);
         return false;
     }
-    if (plan.layer_blocks.front().dense_device == plan.fastest_dense_device &&
+    if (plan.layer_blocks.size() != 1 || plan.layer_blocks.front().dense_device != plan.fastest_dense_device ||
         !plan.layer_blocks.front().dense_on_fastest_device) {
-        printf("FAIL: dense_on_fastest_device flag is inconsistent with block owner\n");
+        printf("FAIL: expected one fastest-dense layer block, blocks=%zu dense=%d fastest=%d flag=%d\n",
+               plan.layer_blocks.size(), plan.layer_blocks.front().dense_device, plan.fastest_dense_device,
+               plan.layer_blocks.front().dense_on_fastest_device ? 1 : 0);
         return false;
     }
 
     printf("PASS: multi-device planner records explicit layer blocks and raw fastest dense device\n");
+    return true;
+}
+
+static bool run_multi_device_layer_boundary_metadata_test() {
+    constexpr size_t   mib        = 1024u * 1024u;
+    constexpr int64_t  hidden_dim = 4096;
+    constexpr uint32_t tokens     = 512;
+
+    std::vector<ggml_sycl::placement_tensor_info> inventory;
+    ggml_sycl::placement_tensor_info              expert_block{ "blk.0.ffn_gate_exps.weight", 1 };
+    expert_block.type  = GGML_TYPE_MXFP4;
+    expert_block.ne[0] = 32;
+    expert_block.ne[1] = hidden_dim;
+    inventory.push_back(expert_block);
+
+    ggml_sycl::placement_tensor_info layer0{ "blk.0.attn_q.weight", 4u * mib };
+    layer0.type  = GGML_TYPE_F16;
+    layer0.ne[0] = hidden_dim;
+    layer0.ne[1] = 512;
+    inventory.push_back(layer0);
+
+    ggml_sycl::placement_tensor_info layer1{ "blk.1.attn_q.weight", 4u * mib };
+    layer1.type  = GGML_TYPE_F16;
+    layer1.ne[0] = hidden_dim;
+    layer1.ne[1] = 512;
+    inventory.push_back(layer1);
+
+    const std::vector<ggml_sycl::device_budget> devices = {
+        { 0, 64u * mib, 64u * mib, 1.0, true },
+        { 1, 6u * mib,  6u * mib,  4.0, true },
+    };
+
+    ggml_sycl::placement_kv_info kv_info{};
+    kv_info.n_ubatch = tokens;
+    auto plan = ggml_sycl::compute_multi_device_plan(devices, inventory, 2, ggml_sycl::multi_gpu_mode::LAYER, kv_info,
+                                                     nullptr, 0);
+
+    if (plan.layer_blocks.size() != 2) {
+        printf("FAIL: expected two layer blocks after fastest-device capacity spill, got %zu\n",
+               plan.layer_blocks.size());
+        return false;
+    }
+    const auto & first  = plan.layer_blocks[0];
+    const auto & second = plan.layer_blocks[1];
+    if (first.execution_device == second.execution_device) {
+        printf("FAIL: expected cross-device block boundary, got both blocks on %d\n", first.execution_device);
+        return false;
+    }
+
+    const size_t expected_bytes = static_cast<size_t>(hidden_dim) * static_cast<size_t>(tokens) * sizeof(float);
+    if (first.boundary_to_next_bytes != expected_bytes || second.boundary_from_prev_bytes != expected_bytes) {
+        printf("FAIL: expected boundary bytes %zu, got out=%zu in=%zu\n", expected_bytes, first.boundary_to_next_bytes,
+               second.boundary_from_prev_bytes);
+        return false;
+    }
+    if (first.boundary_batch_tokens != tokens || second.boundary_batch_tokens != tokens ||
+        first.boundary_activation_hidden_dim != hidden_dim || second.boundary_activation_hidden_dim != hidden_dim) {
+        printf("FAIL: boundary shape metadata mismatch tokens=[%u,%u] hidden=[%lld,%lld]\n",
+               first.boundary_batch_tokens, second.boundary_batch_tokens,
+               (long long) first.boundary_activation_hidden_dim, (long long) second.boundary_activation_hidden_dim);
+        return false;
+    }
+    if (first.next_execution_device != second.execution_device ||
+        second.previous_execution_device != first.execution_device) {
+        printf("FAIL: boundary adjacency mismatch first.next=%d second.prev=%d\n", first.next_execution_device,
+               second.previous_execution_device);
+        return false;
+    }
+    if (first.boundary_to_next_est_us <= 0.0 || second.boundary_from_prev_est_us <= 0.0) {
+        printf("FAIL: expected positive boundary transfer estimate, got out=%.2f in=%.2f\n",
+               first.boundary_to_next_est_us, second.boundary_from_prev_est_us);
+        return false;
+    }
+
+    printf("PASS: multi-device planner records boundary activation metadata and transfer cost\n");
+    return true;
+}
+
+static bool run_multi_device_moe_i8_executor_support_test() {
+    constexpr size_t mib       = 1024u * 1024u;
+    constexpr int    n_experts = 2;
+    constexpr int    ncols     = 2880;
+    constexpr int    nrows     = 2880;
+
+    auto make_mxfp4 = [&](const char * name) {
+        ggml_sycl::placement_tensor_info tensor;
+        tensor.name  = name;
+        tensor.type  = GGML_TYPE_MXFP4;
+        tensor.ne[0] = ncols;
+        tensor.ne[1] = nrows;
+        tensor.ne[2] = n_experts;
+        tensor.ne[3] = 1;
+        tensor.size =
+            ggml_row_size(GGML_TYPE_MXFP4, ncols) * static_cast<size_t>(nrows) * static_cast<size_t>(n_experts);
+        return tensor;
+    };
+
+    const std::vector<ggml_sycl::placement_tensor_info> inventory = {
+        make_mxfp4("blk.0.ffn_gate_exps.weight"),
+        make_mxfp4("blk.0.ffn_up_exps.weight"),
+        make_mxfp4("blk.0.ffn_down_exps.weight"),
+    };
+    const std::vector<ggml_sycl::device_budget> devices = {
+        { 0, 512u * mib, 512u * mib, 4.0, true },
+        { 1, 1u * mib,   1u * mib,   1.0, true },
+    };
+
+    ggml_sycl::placement_kv_info kv_info{};
+    kv_info.n_ubatch = 512;
+    auto plan = ggml_sycl::compute_multi_device_plan(devices, inventory, 1, ggml_sycl::multi_gpu_mode::EXPERT, kv_info,
+                                                     nullptr, n_experts);
+
+    for (int e = 0; e < n_experts; ++e) {
+        const auto down = plan.lookup_expert_placement(0, e, ggml_sycl::expert_tensor_role::DOWN);
+        if (!down.found() || !down.on_device || down.target_device != 0) {
+            printf("FAIL: expected down expert %d to stay on primary device0, found=%d on_device=%d target=%d\n", e,
+                   down.found() ? 1 : 0, down.on_device ? 1 : 0, down.target_device);
+            return false;
+        }
+        if (down.layout == GGML_LAYOUT_MXFP4_I8) {
+            printf("FAIL: multi-device planner must not static-plan MXFP4_I8 down without executor support\n");
+            return false;
+        }
+
+        const auto gate = plan.lookup_expert_placement(0, e, ggml_sycl::expert_tensor_role::GATE);
+        const auto up   = plan.lookup_expert_placement(0, e, ggml_sycl::expert_tensor_role::UP);
+        if (!gate.found() || !up.found() || !gate.on_device || !up.on_device || gate.target_device != 0 ||
+            up.target_device != 0) {
+            printf("FAIL: expected gate/up expert %d to stay on primary device0, gate=%d/%d/%d up=%d/%d/%d\n", e,
+                   gate.found() ? 1 : 0, gate.on_device ? 1 : 0, gate.target_device, up.found() ? 1 : 0,
+                   up.on_device ? 1 : 0, up.target_device);
+            return false;
+        }
+        if (gate.layout == GGML_LAYOUT_XMX_TILED || up.layout == GGML_LAYOUT_XMX_TILED) {
+            printf("FAIL: multi-device planner must not static-plan XMX_TILED gate/up without executor support\n");
+            return false;
+        }
+    }
+
+    printf("PASS: multi-device MoE planner does not advertise I8/XMX layouts without executor support\n");
+    return true;
+}
+
+static bool run_single_device_xmx_pp_executor_no_soa_alt_test() {
+    const auto & info = ggml_sycl_info();
+    if (info.device_count <= 0 ||
+        !xmx_capabilities_match_int8_tile(info.devices[0].xmx_caps, GGML_SYCL_MXFP4_MOE_XMX_M,
+                                          GGML_SYCL_MXFP4_MOE_XMX_N, GGML_SYCL_MXFP4_MOE_XMX_K) ||
+        !xmx_capabilities_support_sub_group(info.devices[0].xmx_caps, GGML_SYCL_MXFP4_MOE_XMX_SG)) {
+        printf("PASS: single-device XMX PP alternate test skipped on non-XMX device\n");
+        return true;
+    }
+
+    constexpr size_t mib       = 1024u * 1024u;
+    constexpr int    n_experts = 2;
+    constexpr int    ncols     = 2880;
+    constexpr int    nrows     = 2880;
+
+    auto make_mxfp4 = [&](const char * name) {
+        ggml_sycl::placement_tensor_info tensor;
+        tensor.name  = name;
+        tensor.type  = GGML_TYPE_MXFP4;
+        tensor.ne[0] = ncols;
+        tensor.ne[1] = nrows;
+        tensor.ne[2] = n_experts;
+        tensor.ne[3] = 1;
+        tensor.size =
+            ggml_row_size(GGML_TYPE_MXFP4, ncols) * static_cast<size_t>(nrows) * static_cast<size_t>(n_experts);
+        return tensor;
+    };
+
+    const std::vector<ggml_sycl::placement_tensor_info> inventory = {
+        make_mxfp4("blk.0.ffn_gate_exps.weight"),
+        make_mxfp4("blk.0.ffn_up_exps.weight"),
+        make_mxfp4("blk.0.ffn_down_exps.weight"),
+    };
+    const std::vector<ggml_sycl::device_budget> devices = {
+        { 0, 1024u * mib, 1024u * mib, 4.0, true },
+    };
+
+    ggml_sycl::placement_kv_info kv_info{};
+    kv_info.n_ubatch      = 512;
+    kv_info.n_expert_used = 4;
+    auto plan = ggml_sycl::compute_multi_device_plan(devices, inventory, 1, ggml_sycl::multi_gpu_mode::EXPERT, kv_info,
+                                                     nullptr, n_experts);
+
+    auto has_soa_alt = [](const ggml_sycl::expert_placement_result & placement) {
+        for (const auto & alt : placement.alternate_layouts) {
+            const int alt_target = alt.target_device >= 0 ? alt.target_device : placement.target_device;
+            if (alt.layout == GGML_LAYOUT_SOA && alt_target == placement.target_device) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    for (int e = 0; e < n_experts; ++e) {
+        const auto gate = plan.lookup_expert_placement(0, e, ggml_sycl::expert_tensor_role::GATE);
+        const auto up   = plan.lookup_expert_placement(0, e, ggml_sycl::expert_tensor_role::UP);
+        const bool gate_local_accelerated =
+            gate.found() && (gate.layout == GGML_LAYOUT_XMX_TILED || gate.layout == GGML_LAYOUT_MXFP4_I8);
+        const bool up_local_accelerated =
+            up.found() && (up.layout == GGML_LAYOUT_XMX_TILED || up.layout == GGML_LAYOUT_MXFP4_I8);
+        if (!gate_local_accelerated || !up_local_accelerated) {
+            printf(
+                "FAIL: expected single-device gate/up expert %d to use a local accelerated primary layout, gate=%d "
+                "up=%d\n",
+                e, gate.found() ? (int) gate.layout : -1, up.found() ? (int) up.layout : -1);
+            return false;
+        }
+        if (has_soa_alt(gate) || has_soa_alt(up)) {
+            printf("FAIL: accelerated gate/up expert %d should not need an eager SOA PP alternate\n", e);
+            return false;
+        }
+    }
+
+    printf("PASS: single-device accelerated PP path avoids unnecessary SOA alternates\n");
+    return true;
+}
+
+static bool run_multi_device_no_p2p_cohesive_moe_layer_test() {
+    constexpr size_t mib       = 1024u * 1024u;
+    constexpr int    n_experts = 2;
+
+    const std::vector<std::pair<std::string, size_t>> inventory = {
+        { "blk.0.attn_q.weight",        4u * mib },
+        { "blk.0.ffn_gate_exps.weight", 8u * mib },
+        { "blk.0.ffn_up_exps.weight",   8u * mib },
+        { "blk.0.ffn_down_exps.weight", 8u * mib },
+        { "blk.1.attn_q.weight",        4u * mib },
+        { "blk.1.ffn_gate_exps.weight", 8u * mib },
+        { "blk.1.ffn_up_exps.weight",   8u * mib },
+        { "blk.1.ffn_down_exps.weight", 8u * mib },
+    };
+    const std::vector<ggml_sycl::device_budget> devices = {
+        { 0, 128u * mib, 128u * mib, 1.0, true },
+        { 1, 40u * mib,  40u * mib,  4.0, true },
+    };
+
+    ggml_sycl::placement_kv_info kv_info{};
+    kv_info.n_ubatch = 512;
+    auto plan = ggml_sycl::compute_multi_device_plan(devices, inventory, 2, ggml_sycl::multi_gpu_mode::EXPERT, kv_info,
+                                                     nullptr, n_experts);
+
+    if (plan.fastest_dense_device != 1) {
+        printf("FAIL: expected fastest dense device 1, got %d\n", plan.fastest_dense_device);
+        return false;
+    }
+    if (plan.get_layer_device(0) != 1 || plan.get_layer_device(1) != 0) {
+        printf("FAIL: expected cohesive layer spill device sequence [1,0], got [%d,%d]\n", plan.get_layer_device(0),
+               plan.get_layer_device(1));
+        return false;
+    }
+    if (plan.layer_blocks.size() != 2 || plan.layer_blocks[0].dense_device != 1 ||
+        plan.layer_blocks[1].dense_device != 0) {
+        printf("FAIL: expected two contiguous layer blocks on devices [1,0], blocks=%zu\n", plan.layer_blocks.size());
+        return false;
+    }
+
+    for (int layer = 0; layer < 2; ++layer) {
+        const int expected_device = plan.get_layer_device(layer);
+        for (int expert = 0; expert < n_experts; ++expert) {
+            for (ggml_sycl::expert_tensor_role role :
+                 { ggml_sycl::expert_tensor_role::GATE, ggml_sycl::expert_tensor_role::UP,
+                   ggml_sycl::expert_tensor_role::DOWN }) {
+                const auto placement = plan.lookup_expert_placement(layer, expert, role);
+                if (!placement.found() || !placement.on_device || placement.target_device != expected_device) {
+                    printf("FAIL: layer %d expert %d role %d expected target %d, found=%d on_device=%d target=%d\n",
+                           layer, expert, static_cast<int>(role), expected_device, placement.found() ? 1 : 0,
+                           placement.on_device ? 1 : 0, placement.target_device);
+                    return false;
+                }
+            }
+        }
+    }
+
+    printf("PASS: no-P2P multi-device MoE planner keeps dense/KV/experts cohesive by layer block\n");
     return true;
 }
 
@@ -629,6 +914,18 @@ int main() {
         return 1;
     }
     if (!run_multi_device_layer_block_plan_test()) {
+        return 1;
+    }
+    if (!run_multi_device_layer_boundary_metadata_test()) {
+        return 1;
+    }
+    if (!run_multi_device_moe_i8_executor_support_test()) {
+        return 1;
+    }
+    if (!run_single_device_xmx_pp_executor_no_soa_alt_test()) {
+        return 1;
+    }
+    if (!run_multi_device_no_p2p_cohesive_moe_layer_test()) {
         return 1;
     }
     ggml_sycl::test_layout_override_guard guard(GGML_LAYOUT_SOA);

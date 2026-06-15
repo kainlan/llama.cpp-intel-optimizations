@@ -21,9 +21,12 @@
 #define GGML_SYCL_MMVQ_RMSNORM_HPP
 
 #include "common.hpp"
-#include "vecdotq.hpp"
 #include "fused-norm-gemm.hpp"  // For compute_rms_scales_sycl
+#include "mem-ops.hpp"
+#include "vecdotq.hpp"
+
 #include <sycl/sycl.hpp>
+#include <utility>
 
 // Maximum SLM size for Q8 buffer (in bytes)
 // For 4096 hidden dim: 4096 + 128*4 = 4608 bytes
@@ -282,8 +285,15 @@ static void mul_mat_vec_q4_0_f32_rmsnorm_sycl(
     const sycl::range<3> block_nums(1, 1, block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
 
-    // DEBUG: Try even simpler - use sycl::memset
-    stream->memset(dst, 0, nrows * batch_size * sizeof(float));
+    const int queue_device = ggml_sycl_get_device_id_from_queue(*stream);
+    const ggml_sycl::memory_location dst_loc = ggml_sycl::query_location(dst, queue_device);
+    const bool dst_on_device = dst_loc.on_device();
+    const int dst_device = dst_on_device && dst_loc.device >= 0 ?
+        dst_loc.device :
+        (dst_on_device ? queue_device : ggml_sycl::mem_handle::HOST_DEVICE);
+    const ggml_sycl::mem_handle dst_handle =
+        ggml_sycl::mem_handle::from_direct(dst, GGML_LAYOUT_AOS, dst_on_device, dst_device);
+    ggml_sycl::mem_fill(dst_handle, 0, nrows * batch_size * sizeof(float), *stream);
 }
 
 static void mul_mat_vec_q8_0_f32_rmsnorm_sycl(
@@ -359,10 +369,28 @@ static void ggml_sycl_mul_mat_vec_rmsnorm(
     dpct::queue_ptr stream = ctx.stream();
 
     // DEBUG: Skip RMS scale computation and use constant 1.0
-    ggml_sycl_pool_alloc<float> scales_buf(ctx.pool(), batch_size);
+    ggml_sycl::alloc_request scales_req{};
+    scales_req.queue                               = stream;
+    scales_req.device                              = ctx.device;
+    scales_req.size                                = static_cast<size_t>(batch_size) * sizeof(float);
+    scales_req.intent.role                         = ggml_sycl::alloc_role::COMPUTE;
+    scales_req.intent.category                     = ggml_sycl::runtime_category::COMPUTE;
+    scales_req.intent.cohort_id                    = "mmvq_rmsnorm_scales";
+    scales_req.intent.constraints.must_device      = true;
+    scales_req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::SCRATCH;
+    scales_req.suppress_failure_log                = true;
+
+    ggml_sycl::mem_handle scales_owner    = ggml_sycl::unified_allocate(scales_req);
+    auto                  scales_resolved = scales_owner.resolve(ctx.device);
+    if (!scales_resolved || !scales_resolved.ptr || !scales_resolved.on_device) {
+        GGML_ABORT("[MMVQ_RMSNORM] scales scratch resolve failed");
+    }
+    float * scales_buf = static_cast<float *>(scales_resolved.ptr);
 
     std::vector<float> ones(batch_size, 1.0f);
-    stream->memcpy(scales_buf.get(), ones.data(), batch_size * sizeof(float)).wait();
+    ggml_sycl::mem_handle ones_handle =
+        ggml_sycl::mem_handle::from_direct(ones.data(), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+    ggml_sycl::mem_copy(scales_owner, ones_handle, batch_size * sizeof(float), *stream);
 
     // SKIP: compute_rms_scales_sycl
 
@@ -381,19 +409,24 @@ static void ggml_sycl_mul_mat_vec_rmsnorm(
     switch (W->type) {
         case GGML_TYPE_Q4_0:
             mul_mat_vec_q4_0_f32_rmsnorm_sycl(
-                W_data, f32_input, gamma_data, scales_buf.get(),
+                W_data, f32_input, gamma_data, scales_buf,
                 dst_data, ncols, nrows, batch_size, stream
             );
             break;
         case GGML_TYPE_Q8_0:
             mul_mat_vec_q8_0_f32_rmsnorm_sycl(
-                W_data, f32_input, gamma_data, scales_buf.get(),
+                W_data, f32_input, gamma_data, scales_buf,
                 dst_data, ncols, nrows, batch_size, stream
             );
             break;
         default:
             GGML_ABORT("Fused RMSNorm+MMVQ not supported for weight type %d\n", W->type);
     }
+
+    sycl::event done = ggml_sycl_submit_marker<class ggml_sycl_mmvq_rmsnorm_scales_release_kernel>(*stream);
+    std::vector<ggml_sycl::mem_handle> retained;
+    retained.push_back(std::move(scales_owner));
+    ggml_sycl::retain_handles_until_event(std::move(retained), std::move(done));
 }
 
 #endif // GGML_SYCL_MMVQ_RMSNORM_HPP

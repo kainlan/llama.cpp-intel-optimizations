@@ -6,6 +6,7 @@
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
+#include "../src/llama-ext.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
@@ -16,6 +17,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -58,6 +60,33 @@
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
+
+static bool common_model_is_sycl_moe(const llama_model * model) {
+    if (model == nullptr || llama_model_n_expert(model) <= 0) {
+        return false;
+    }
+
+    const int32_t n_devices = llama_model_n_devices(model);
+    for (int32_t i = 0; i < n_devices; ++i) {
+        ggml_backend_dev_t dev = llama_model_get_device(model, i);
+        if (dev == nullptr) {
+            continue;
+        }
+
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+        if (reg_name != nullptr && std::strcmp(reg_name, "SYCL") == 0) {
+            return true;
+        }
+
+        const char * dev_name = ggml_backend_dev_name(dev);
+        if (dev_name != nullptr && std::strncmp(dev_name, "SYCL", 4) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
 
 common_time_meas::common_time_meas(int64_t & t_acc, bool disable) : t_start_us(disable ? -1 : ggml_time_us()), t_acc(t_acc) {}
 
@@ -1390,7 +1419,12 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         common_set_adapter_lora(lctx, params.lora_adapters);
     }
 
-    if (params.warmup) {
+    const bool skip_sycl_moe_predecode = common_model_is_sycl_moe(model);
+
+    if (params.warmup && skip_sycl_moe_predecode) {
+        LOG_INF("%s: skipping warmup for SYCL MoE model; synthetic pre-decodes are disabled for this backend\n",
+                __func__);
+    } else if (params.warmup) {
         LOG_INF("%s: warming up the model with an empty run - please wait ... (--no-warmup to disable)\n", __func__);
 
         llama_set_warmup(lctx, true);
@@ -1422,6 +1456,9 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         if (llama_model_has_decoder(model)) {
             llama_decode(lctx, llama_batch_get_one(tmp.data(), std::min(tmp.size(), (size_t) params.n_batch)));
         }
+        // llama_decode() is asynchronous. Finish the warmup graph before
+        // clearing memory state used by backend KV/cache tensors.
+        llama_synchronize(lctx);
         llama_memory_clear(llama_get_memory(lctx), true);
         llama_synchronize(lctx);
         llama_perf_context_reset(lctx);
@@ -1452,6 +1489,12 @@ std::string common_get_model_endpoint() {
 }
 
 common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
+    const llama_model * model = llama_get_model(ctx);
+    if (common_model_is_sycl_moe(model)) {
+        LOG_INF("%s: skipping synthetic sequence-removal probe for SYCL MoE model\n", __func__);
+        return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+    }
+
     auto * mem = llama_get_memory(ctx);
     if (mem == nullptr) {
         return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -1472,6 +1515,10 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
         res = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
         goto done;
     }
+    // llama_decode() is asynchronous. Finish the probe before mutating or
+    // clearing memory state; otherwise GPU backends can race in-flight KV work
+    // against the sequence-removal probe cleanup.
+    llama_synchronize(ctx);
 
     if (llama_n_rs_seq(ctx) > 0) {
         LOG_INF("%s: the context supports bounded partial sequence removal\n", __func__);

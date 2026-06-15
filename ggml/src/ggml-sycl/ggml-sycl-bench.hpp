@@ -65,6 +65,7 @@ struct mxfp4_pair_glu_bench_args {
     float *              output             = nullptr;
     float *              gate_tmp           = nullptr;
     float *              up_tmp             = nullptr;
+    void *               down_q8_soa        = nullptr;
     int8_t *             dpas_b_packed      = nullptr;
     float *              dpas_y_scales      = nullptr;
     const int32_t *      ids                = nullptr;
@@ -90,6 +91,7 @@ struct mxfp4_pair_glu_bench_args {
     int64_t nb12          = 0;
     int64_t dst_nb1       = 0;
     int64_t dst_nb2       = 0;
+    int64_t down_q8_nb11  = 0;
     int64_t gate_bias_nb1 = 0;
     int64_t up_bias_nb1   = 0;
 
@@ -158,6 +160,9 @@ struct mxfp4_layer_glu_down_bench_args {
     bool  cache_y             = true;
     bool  xmx_tiled_gate_up   = false;
     bool  xmx_tiled_grouped   = false;
+    bool  xmx_tiled_pack_q8   = false;
+    bool  xmx_tiled_prefetch  = false;
+    int   xmx_tiled_m_tiles   = 1;
     int   xmx_tiles_n         = 1;
     bool  vector_qs_load      = false;
     bool  ignore_weight_scale = false;
@@ -173,6 +178,8 @@ struct mxfp4_layer_glu_down_bench_args {
     const int32_t * grouped_row_slots  = nullptr;
     const int32_t * grouped_chunks     = nullptr;
     const int32_t * grouped_row_starts = nullptr;
+    int8_t *        dpas_b_packed      = nullptr;
+    float *         dpas_y_scales      = nullptr;
 };
 
 bool ggml_sycl_mxfp4_layer_glu_down_bench_launch(const mxfp4_layer_glu_down_bench_args & args);
@@ -225,6 +232,11 @@ struct mxfp4_mmv_id_xmx_tiled_bench_args {
     const int32_t *      ids                = nullptr;
     int8_t *             dpas_b_packed      = nullptr;
     float *              dpas_y_scales      = nullptr;
+    const int32_t *      grouped_expert_ids = nullptr;
+    const int32_t *      grouped_offsets    = nullptr;
+    const int32_t *      grouped_row_slots  = nullptr;
+    const int32_t *      grouped_chunks     = nullptr;
+    const int32_t *      grouped_row_starts = nullptr;
 
     int  ncols            = 0;
     int  ncols_y          = 0;
@@ -236,6 +248,7 @@ struct mxfp4_mmv_id_xmx_tiled_bench_args {
     int  xmx_tiles_n      = 4;
     bool raw_accum        = false;
     bool i8_rowmajor      = false;
+    int  grouped_n_chunks = 0;
 
     int64_t ids_nb0 = 0;
     int64_t ids_nb1 = 0;

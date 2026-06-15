@@ -1,7 +1,7 @@
 // Unit tests for unified cache bug fixes (evict accounting, realloc failure handling, unaligned hash)
 //
 // Usage:
-//   ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-unified-cache-bugs
+//   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-unified-cache-bugs
 
 #include "ggml-sycl.h"
 #include "ggml-sycl/unified-cache.hpp"
@@ -795,7 +795,7 @@ static bool test_direct_stage_weight_lookup_miss(sycl::queue & q) {
 
 int main() {
     if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:1", 1);
+        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
     }
 
     sycl::queue q;

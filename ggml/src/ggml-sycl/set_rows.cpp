@@ -3,6 +3,9 @@
 #include "common.hpp"
 #include "cpy.hpp"
 #include "fattn.hpp"
+#include "mem-ops.hpp"
+
+#include <utility>
 
 static constexpr int GGML_SYCL_SET_ROWS_UNKNOWN_DEVICE_USM = -2;
 
@@ -17,6 +20,49 @@ static int ggml_sycl_set_rows_ptr_device(const void * ptr) {
     }
 
     return ggml_sycl::mem_handle::HOST_DEVICE;
+}
+
+static ggml_sycl::mem_handle ggml_sycl_set_rows_copy_handle_for_raw_ptr(void * ptr,
+                                                                        int    fallback_device,
+                                                                        bool   fallback_on_device) {
+    return ggml_sycl_memcpy_handle_for_raw_ptr(ptr, fallback_device, GGML_LAYOUT_AOS, fallback_on_device,
+                                               /*fallback_unknown=*/true);
+}
+
+static bool ggml_sycl_set_rows_alloc_host_stage(size_t                  bytes,
+                                                sycl::queue &           queue,
+                                                int                     device,
+                                                const char *            cohort_id,
+                                                bool                    require_host_usm_base,
+                                                ggml_sycl::mem_handle & owner) {
+    owner = {};
+    if (bytes == 0) {
+        return true;
+    }
+
+    ggml_sycl::alloc_request req{};
+    req.queue                                    = &queue;
+    req.device                                   = device;
+    req.size                                     = bytes;
+    req.intent.role                              = ggml_sycl::alloc_role::EXPERT_STAGING;
+    req.intent.category                          = ggml_sycl::runtime_category::STAGING;
+    req.intent.cohort_id                         = cohort_id;
+    req.intent.constraints.must_host_pinned      = true;
+    req.intent.constraints.use_pinned_pool       = true;
+    req.intent.constraints.require_host_usm_base = require_host_usm_base;
+    req.suppress_failure_log                     = true;
+
+    owner = ggml_sycl::unified_allocate(req);
+    if (!owner.valid()) {
+        return false;
+    }
+
+    auto resolved = owner.resolve(device);
+    if (!resolved || !resolved.ptr || resolved.on_device) {
+        owner = {};
+        return false;
+    }
+    return true;
 }
 
 static bool ggml_sycl_set_rows_ptr_needs_staging(const void * ptr,
@@ -352,6 +398,8 @@ bool ggml_sycl_plan_set_rows(const ggml_tensor * dst, int fallback_device, ggml_
     }
     if ((out.src0_needs_staging && out.src0_device == GGML_SYCL_SET_ROWS_UNKNOWN_DEVICE_USM) ||
         (out.index_needs_staging && out.index_device == GGML_SYCL_SET_ROWS_UNKNOWN_DEVICE_USM)) {
+        ggml_sycl_set_rows_log_plan_failure(dst, out, src0_on_owner, index_on_owner, dst_on_owner,
+                                            /*dst_device_accessible=*/false);
         return false;
     }
 
@@ -367,12 +415,12 @@ bool ggml_sycl_plan_set_rows(const ggml_tensor * dst, int fallback_device, ggml_
     return true;
 }
 
-static const void * ggml_sycl_set_rows_stage_ptr(ggml_backend_sycl_context &            ctx,
-                                                 const void *                           ptr,
-                                                 size_t                                 bytes,
-                                                 int                                    owner_device,
-                                                 int                                    src_device,
-                                                 std::vector<ggml_sycl::alloc_handle> & staged_allocs) {
+static const void * ggml_sycl_set_rows_stage_ptr(ggml_backend_sycl_context &          ctx,
+                                                 const void *                         ptr,
+                                                 size_t                               bytes,
+                                                 int                                  owner_device,
+                                                 int                                  src_device,
+                                                 std::vector<ggml_sycl::mem_handle> & staged_handles) {
     if (!ptr || bytes == 0) {
         return ptr;
     }
@@ -386,8 +434,9 @@ static const void * ggml_sycl_set_rows_stage_ptr(ggml_backend_sycl_context &    
     req.intent.role                    = ggml_sycl::alloc_role::GRAPH_TMP;
     req.intent.category                = ggml_sycl::runtime_category::GRAPH;
     req.intent.constraints.must_device = true;
-    ggml_sycl::scoped_unified_alloc scoped_alloc(req);
-    if (!scoped_alloc) {
+    ggml_sycl::mem_handle staged_handle = ggml_sycl::unified_allocate(req);
+    auto                  staged_res    = staged_handle.resolve(owner_device);
+    if (!staged_res || !staged_res.on_device || !staged_res.ptr) {
         GGML_LOG_ERROR("[SYCL] SET_ROWS failed to stage %zu bytes to owner device %d\n", bytes, owner_device);
         return nullptr;
     }
@@ -395,47 +444,32 @@ static const void * ggml_sycl_set_rows_stage_ptr(ggml_backend_sycl_context &    
     if (src_device >= 0 && src_device != owner_device) {
         queue_ptr src_stream = ctx.stream(src_device, 0);
 
-        struct host_tmp_guard {
-            void *        ptr   = nullptr;
-            size_t        bytes = 0;
-            sycl::queue * queue = nullptr;
-
-            ~host_tmp_guard() {
-                if (ptr && queue) {
-                    ggml_sycl_free_host_tracked_bytes(ptr, bytes, *queue);
-                }
-            }
-        } host_tmp;
-
-        host_tmp.ptr   = ggml_sycl_malloc_host_tracked_bytes(bytes, *src_stream, "set_rows_cross_device_stage");
-        host_tmp.bytes = bytes;
-        host_tmp.queue = src_stream;
-        if (!host_tmp.ptr) {
+        ggml_sycl::mem_handle host_handle;
+        if (!ggml_sycl_set_rows_alloc_host_stage(bytes, *src_stream, src_device, "set_rows_cross_device_stage",
+                                                 /*require_host_usm_base=*/true, host_handle)) {
             GGML_LOG_ERROR("[SYCL] SET_ROWS failed to allocate host bounce for %zu bytes from device %d to %d\n", bytes,
                            src_device, owner_device);
             return nullptr;
         }
-        src_stream->memcpy(host_tmp.ptr, ptr, bytes).wait_and_throw();
-        stream->memcpy(scoped_alloc.get(), host_tmp.ptr, bytes).wait_and_throw();
+        auto resolved_host = host_handle.resolve(src_device);
+        GGML_ASSERT(resolved_host && !resolved_host.on_device);
+
+        auto src_handle = ggml_sycl_set_rows_copy_handle_for_raw_ptr(const_cast<void *>(ptr), src_device, true);
+        ggml_sycl::mem_copy(host_handle, src_handle, bytes, *src_stream);
+
+        ggml_sycl::mem_copy(staged_handle, host_handle, bytes, *stream);
     } else {
-        stream->memcpy(scoped_alloc.get(), ptr, bytes).wait_and_throw();
+        auto src_handle =
+            ggml_sycl_set_rows_copy_handle_for_raw_ptr(const_cast<void *>(ptr), owner_device, src_device >= 0);
+        ggml_sycl::mem_copy(staged_handle, src_handle, bytes, *stream);
     }
-    ggml_sycl::alloc_handle alloc = scoped_alloc.release();
-    staged_allocs.push_back(alloc);
-    return alloc.ptr;
+    const void * staged = staged_res.ptr;
+    staged_handles.push_back(std::move(staged_handle));
+    return staged;
 }
 
-static void ggml_sycl_set_rows_free_staged(std::vector<ggml_sycl::alloc_handle> & staged_allocs) {
-    for (auto & alloc : staged_allocs) {
-        (void) ggml_sycl::unified_free(alloc);
-    }
-    staged_allocs.clear();
-}
-
-struct ggml_sycl_set_rows_staged_alloc_guard {
-    std::vector<ggml_sycl::alloc_handle> handles;
-
-    ~ggml_sycl_set_rows_staged_alloc_guard() { ggml_sycl_set_rows_free_staged(handles); }
+struct ggml_sycl_set_rows_staged_handle_guard {
+    std::vector<ggml_sycl::mem_handle> handles;
 };
 
 namespace utils {
@@ -782,18 +816,26 @@ static sycl::event set_rows_sycl(ggml_backend_sycl_context &     ctx,
         }
 
         // Check src0 first values
-        float * check_buf =
-            (float *) ggml_sycl_malloc_host_tracked_bytes(32 * sizeof(float), *ctx.stream(), "set_rows_debug");
-        ctx.stream()->memcpy(check_buf, src0_d, 32 * sizeof(float)).wait();
-        int zeros = 0;
-        for (int i = 0; i < 32; i++) {
-            if (check_buf[i] == 0.0f) {
-                zeros++;
+        ggml_sycl::mem_handle check_handle;
+        dpct::queue_ptr       debug_stream = ctx.stream(device, 0);
+        if (ggml_sycl_set_rows_alloc_host_stage(32 * sizeof(float), *debug_stream, device, "set_rows_debug",
+                                                /*require_host_usm_base=*/false, check_handle)) {
+            auto                  resolved_check = check_handle.resolve(device);
+            float *               check_buf      = static_cast<float *>(resolved_check.ptr);
+            ggml_sycl::mem_handle src0_handle =
+                ggml_sycl_set_rows_copy_handle_for_raw_ptr(const_cast<char *>(src0_d), device, true);
+            ggml_sycl::mem_copy(check_handle, 0, src0_handle, 0, 32 * sizeof(float), *debug_stream);
+            int zeros = 0;
+            for (int i = 0; i < 32; i++) {
+                if (check_buf[i] == 0.0f) {
+                    zeros++;
+                }
             }
+            fprintf(stderr, "  src0 data[0..4]=%.4f,%.4f,%.4f,%.4f,%.4f zeros=%d/32\n", check_buf[0], check_buf[1],
+                    check_buf[2], check_buf[3], check_buf[4], zeros);
+        } else {
+            fprintf(stderr, "  src0 debug readback allocation failed\n");
         }
-        fprintf(stderr, "  src0 data[0..4]=%.4f,%.4f,%.4f,%.4f,%.4f zeros=%d/32\n", check_buf[0], check_buf[1],
-                check_buf[2], check_buf[3], check_buf[4], zeros);
-        ggml_sycl_free_host_tracked_bytes(check_buf, 32 * sizeof(float), *ctx.stream());
         set_rows_debug++;
     }
 
@@ -867,17 +909,26 @@ void ggml_sycl_op_set_rows(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tens
     GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
 
     ggml_sycl_set_rows_plan plan{};
-    GGML_ASSERT(ggml_sycl_plan_set_rows(dst.raw(), ctx.device, &plan));
+    const bool              plan_ok = ggml_sycl_plan_set_rows(dst.raw(), ctx.device, &plan);
+    if (!plan_ok) {
+        fprintf(stderr,
+                "[SYCL] SET_ROWS unresolved op dst=%s ctx_device=%d owner=%d src0=%s src0_ptr=%p src0_stage=%d "
+                "src0_device=%d index=%s index_ptr=%p index_stage=%d index_device=%d dst_ptr=%p\n",
+                dst.raw()->name, ctx.device, plan.owner_device, src0->name, plan.src0_ptr,
+                plan.src0_needs_staging ? 1 : 0, plan.src0_device, src1->name, plan.index_ptr,
+                plan.index_needs_staging ? 1 : 0, plan.index_device, plan.dst_ptr);
+    }
+    GGML_ASSERT(plan_ok);
 
-    ggml_sycl_set_rows_staged_alloc_guard staged_allocs;
+    ggml_sycl_set_rows_staged_handle_guard staged_handles;
     if (plan.src0_needs_staging) {
         plan.src0_ptr = ggml_sycl_set_rows_stage_ptr(ctx, plan.src0_ptr, ggml_nbytes(src0), plan.owner_device,
-                                                     plan.src0_device, staged_allocs.handles);
+                                                     plan.src0_device, staged_handles.handles);
         GGML_ASSERT(plan.src0_ptr != nullptr);
     }
     if (plan.index_needs_staging) {
         plan.index_ptr = ggml_sycl_set_rows_stage_ptr(ctx, plan.index_ptr, ggml_nbytes(src1), plan.owner_device,
-                                                      plan.index_device, staged_allocs.handles);
+                                                      plan.index_device, staged_handles.handles);
         GGML_ASSERT(plan.index_ptr != nullptr);
     }
 
@@ -897,7 +948,7 @@ void ggml_sycl_op_set_rows(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tens
 
     // Note: KV cache synchronization is now handled via barrier-based sync in llama-context.cpp
     // The barrier approach provides ~2% better prompt eval performance than full queue sync
-    if (!staged_allocs.handles.empty()) {
+    if (!staged_handles.handles.empty()) {
         evt.wait_and_throw();
     } else {
         (void) evt;

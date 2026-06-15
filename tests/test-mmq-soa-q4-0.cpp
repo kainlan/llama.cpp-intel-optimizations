@@ -2,7 +2,7 @@
 // This test verifies that SoA reordering and MMQ produce the same results as AoS
 //
 // Build: cmake --build build --target test-mmq-soa-q4-0
-// Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-mmq-soa-q4-0
+// Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-mmq-soa-q4-0
 
 #include "ggml.h"
 #include "ggml-sycl.h"

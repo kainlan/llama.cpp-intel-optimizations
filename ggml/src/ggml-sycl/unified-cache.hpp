@@ -378,39 +378,48 @@ struct placement_plan {
     size_t                       host_zone_staging_bytes  = 0;
     size_t                       host_zone_scratch_bytes  = 0;
     size_t                       max_tensor_bytes         = 0;
+    size_t                       max_staging_pair_bytes   = 0;
 
     // --- Inference memory categories (computed by populate_host_zone_sizing) ---
     // oneDNN reorder: one temp buffer (max weight tensor size) reused per layer.
-    size_t onednn_reorder_bytes         = 0;  // Zone: SCRATCH (device VRAM)
+    size_t   onednn_reorder_bytes                = 0;  // Zone: SCRATCH (device VRAM)
     // MoE Q8_1 workspace: quantized activations for batched expert dispatch.
-    size_t moe_q8_workspace_bytes       = 0;  // Zone: SCRATCH (device VRAM)
+    size_t   moe_q8_workspace_bytes              = 0;  // Zone: SCRATCH (device VRAM)
     // CPU expert fallback act/out staging. EXPERT_STAGING HOST_COMPUTE uses
     // smart-handle scoped ownership and routes to host SCRATCH.
-    size_t moe_cpu_expert_staging_bytes = 0;  // Zone: SCRATCH (host pinned)
+    size_t   moe_cpu_expert_staging_bytes        = 0;  // Zone: SCRATCH (host pinned)
     // Expert bias D2H copy: float bias tensors staged to host for gate computation.
-    size_t expert_bias_bytes            = 0;  // Zone: STAGING (host pinned)
+    size_t   expert_bias_bytes                   = 0;  // Zone: STAGING (host pinned)
     // MoE routing: per-batch expert ID control buffer (n_expert * max_batch_tokens * sizeof(int32_t)).
-    size_t moe_routing_ids_bytes        = 0;  // Zone: HOST_CONTROL (shared-context host pinned)
+    size_t   moe_routing_ids_bytes               = 0;  // Zone: HOST_CONTROL (shared-context host pinned)
     // MoE expert pointer tables: void* per expert per MoE layer (MAX_EXPERTS * n_moe_layers * sizeof(void*)).
-    size_t moe_expert_ptrs_bytes        = 0;  // Zone: RUNTIME (device VRAM)
+    size_t   moe_expert_ptrs_bytes               = 0;  // Zone: RUNTIME (device VRAM)
     // Combined VRAM RUNTIME reservation for MoE device routing buffers (expert_ptrs only;
     // routing IDs are HOST_CONTROL and are accounted in host pinned planning).
     // 0 when model has no MoE layers.
-    size_t moe_vram_runtime_bytes       = 0;  // Zone: RUNTIME (device VRAM)
+    size_t   moe_vram_runtime_bytes              = 0;  // Zone: RUNTIME (device VRAM)
     // DMA staging pool: device-resident double-buffer for host→device weight streaming.
     // Sized as max_tensor_bytes × k_dma_pipeline_depth (2 buffers). 0 when streaming disabled.
-    size_t dma_staging_pool_bytes       = 0;  // Zone: RUNTIME (device VRAM)
+    size_t   dma_staging_pool_bytes              = 0;  // Zone: RUNTIME (device VRAM)
     // oneDNN scratchpad: workspace for matmul weight reorder (weights) + activation buffer.
     // Sized as max_tensor_bytes × 2. Must fit within the ONEDNN zone (default 256 MB).
-    size_t onednn_scratchpad_bytes      = 0;  // Zone: ONEDNN (device VRAM)
+    size_t   onednn_scratchpad_bytes             = 0;  // Zone: ONEDNN (device VRAM)
     // PP pipeline scratch: double-buffered FP16 weight staging for prompt-processing
     // dequant prefetch. Computed from the largest quantized weight tensor as
     // 2 x (n_elements * sizeof(fp16)). Lives in the RUNTIME zone.
-    size_t pp_pipeline_scratch_bytes    = 0;  // Zone: RUNTIME (device VRAM)
+    size_t   pp_pipeline_scratch_bytes           = 0;  // Zone: RUNTIME (device VRAM)
+    // PP MoE oneDNN scratch ring: future pipeline slots for the MXFP4 SOA prompt
+    // path. Slot 0 is usable by the serialized path today; additional slots are
+    // reserved so later pipelining does not change the placement budget.
+    size_t   pp_moe_onednn_weight_slot_bytes     = 0;  // Zone: RUNTIME (device VRAM)
+    size_t   pp_moe_onednn_activation_slot_bytes = 0;  // Zone: RUNTIME (device VRAM)
+    size_t   pp_moe_onednn_output_slot_bytes     = 0;  // Zone: RUNTIME (device VRAM)
+    size_t   pp_moe_onednn_scratch_bytes         = 0;  // Zone: RUNTIME (device VRAM)
+    uint32_t pp_moe_onednn_ring_depth            = 0;
     // CPU quantization temp buffers: pre-allocated by T1 cpu_dispatch_buffers.
-    size_t cpu_quant_buffer_bytes       = 0;  // Zone: HOST (system heap)
+    size_t   cpu_quant_buffer_bytes              = 0;  // Zone: HOST (system heap)
     // Graph metadata: layer classification vectors and MoE routing tables.
-    size_t graph_metadata_bytes         = 0;  // Zone: HOST (system heap)
+    size_t   graph_metadata_bytes                = 0;  // Zone: HOST (system heap)
 
     // --- Tensor Parallelism buffer estimates (0 when TP is disabled) ---
     // Per-layer FFN compute buffers on secondary TP devices (device VRAM).
@@ -880,8 +889,18 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                                          const ggml_sycl_placement_envelope *       envelope,
                                          int                                        n_experts = 0);
 
-void   unified_cache_set_planned_pp_pipeline_scratch_bytes(int device_id, size_t bytes);
-size_t unified_cache_get_planned_pp_pipeline_scratch_bytes(int device_id);
+void     unified_cache_set_planned_pp_pipeline_scratch_bytes(int device_id, size_t bytes);
+size_t   unified_cache_get_planned_pp_pipeline_scratch_bytes(int device_id);
+void     unified_cache_set_planned_pp_moe_onednn_scratch(int      device_id,
+                                                         size_t   weight_slot_bytes,
+                                                         size_t   activation_slot_bytes,
+                                                         size_t   output_slot_bytes,
+                                                         uint32_t ring_depth);
+size_t   unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(int device_id);
+size_t   unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(int device_id);
+size_t   unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(int device_id);
+size_t   unified_cache_get_planned_pp_moe_onednn_scratch_bytes(int device_id);
+uint32_t unified_cache_get_planned_pp_moe_onednn_ring_depth(int device_id);
 
 // Parse GGML_SYCL_MULTI_GPU_MODE env var.
 // Returns HYBRID for MoE models, LAYER for dense-only, unless overridden.
@@ -1051,17 +1070,19 @@ struct cache_layout_xmx_info {
     int64_t n_tile_groups = 0;
 };
 
-struct cache_ptr_view {
-    void *                ptr           = nullptr;
-    size_t                size          = 0;
-    ggml_layout_mode      layout        = GGML_LAYOUT_AOS;
-    int64_t               onednn_pack_m = 0;
-    cache_location        location      = cache_location::DEVICE;
-    cache_entry_type      type          = cache_entry_type::DENSE_WEIGHT;
-    int                   layer_id      = -1;
-    int                   expert_id     = -1;
-    cache_layout_xmx_info xmx_info      = {};
-};
+    struct cache_ptr_view {
+        void *                ptr           = nullptr;
+        size_t                size          = 0;
+        ggml_layout_mode      layout        = GGML_LAYOUT_AOS;
+        int64_t               onednn_pack_m = 0;
+        cache_location        location      = cache_location::DEVICE;
+        cache_entry_type      type          = cache_entry_type::DENSE_WEIGHT;
+        int                   layer_id      = -1;
+        int                   expert_id     = -1;
+        cache_layout_xmx_info xmx_info      = {};
+        bool                  has_ready_event = false;
+        sycl::event           ready_event;
+    };
 
 struct cache_layout_request;
 using cache_layout_fill_fn = sycl::event (*)(sycl::queue &                    queue,
@@ -1252,6 +1273,7 @@ struct unified_cache_entry {
     cache_location        location;         // DEVICE/HOST_PINNED/HOST_MMAP
     bool                  pool_allocated;   // True if device_ptr was sub-allocated from layout_pool_
     bool                  cache_budget_charged = false;  // True if this entry incremented cache used_
+    bool                  retired = false;  // Hidden from routing; erased after in_use_count reaches zero.
     sycl::event           last_write_event;              // Event from last fill/reorder that wrote to device_ptr
     bool                  has_write_event = false;       // Whether last_write_event is valid
     // Optional shared allocation owner for entries that are views into a
@@ -1357,6 +1379,8 @@ class unified_cache {
         void *           ptr       = nullptr;
         ggml_layout_mode layout    = GGML_LAYOUT_AOS;
         bool             on_device = false;
+        bool             has_ready_event = false;
+        sycl::event      ready_event;
 
         explicit operator bool() const { return ptr != nullptr; }
     };
@@ -1380,6 +1404,8 @@ class unified_cache {
         ggml_layout_mode      layout    = GGML_LAYOUT_AOS;
         bool                  on_device = false;
         unified_cache_entry * entry     = nullptr;  // opaque handle for lease release
+        bool                  has_ready_event = false;
+        sycl::event           ready_event;
 
         explicit operator bool() const { return ptr != nullptr; }
     };
@@ -1564,24 +1590,24 @@ class unified_cache {
     // row_start:   first row in the original full tensor
     // row_count:   number of rows in this partial range
     // device_idx:  resolved ggml SYCL device index
-    void * load_partial_rows(const char * tensor_name,
+    void * load_partial_rows(const char *               tensor_name,
                              const ggml_sycl_cache_id & tensor_id,
-                             const void * src_host,
-                             ggml_type    type,
-                             int64_t      ncols,
-                             int64_t      row_start,
-                             int64_t      row_count,
-                             int          device_idx);
+                             const void *               src_host,
+                             ggml_type                  type,
+                             int64_t                    ncols,
+                             int64_t                    row_start,
+                             int64_t                    row_count,
+                             int                        device_idx);
 
     // Look up a previously loaded partial weight for a given tensor/device/range.
     // Returns the device pointer, or nullptr if not loaded yet.
-    void * get_split_weight_ptr(const char * tensor_name,
+    void * get_split_weight_ptr(const char *               tensor_name,
                                 const ggml_sycl_cache_id & tensor_id,
-                                ggml_type    type,
-                                int64_t      ncols,
-                                int64_t      row_start,
-                                int64_t      row_count,
-                                int          device_idx);
+                                ggml_type                  type,
+                                int64_t                    ncols,
+                                int64_t                    row_start,
+                                int64_t                    row_count,
+                                int                        device_idx);
 
     // Free all partial row entries (called during cache shutdown or device cleanup).
     void free_partial_entries();
@@ -2136,6 +2162,24 @@ class unified_cache {
 
     size_t onednn_activations_scratch_size() const { return onednn_activations_scratch_size_; }
 
+    struct pp_moe_onednn_scratch_slot {
+        void *     weight          = nullptr;
+        void *     activation      = nullptr;
+        void *     output          = nullptr;
+        size_t     weight_size     = 0;
+        size_t     activation_size = 0;
+        size_t     output_size     = 0;
+        mem_handle weight_owner;
+        mem_handle activation_owner;
+        mem_handle output_owner;
+    };
+
+    bool reserve_pp_moe_onednn_scratch(size_t   weight_slot_bytes,
+                                       size_t   activation_slot_bytes,
+                                       size_t   output_slot_bytes,
+                                       uint32_t ring_depth);
+    bool get_pp_moe_onednn_scratch_slot(uint32_t slot, pp_moe_onednn_scratch_slot & out);
+
     // === GPU Reorder Temp Buffer ===
     // Pre-allocated device VRAM buffer reused by GPU-side AOS→SOA reorder.
     // Avoids per-expert sycl::malloc_device that fails when VRAM is tight.
@@ -2391,6 +2435,7 @@ class unified_cache {
     sycl::event submit_barrier(const std::vector<sycl::event> & deps);
     sycl::event submit_barrier_all();
     void        process_deferred_frees();
+    size_t      finalize_retired_entries_locked();
     void        enqueue_deferred_free(void * ptr, size_t size);
     void        enqueue_deferred_free(const managed_alloc_ref & handle);
     void        enqueue_deferred_host_free(void * ptr, size_t size, const sycl::event & event);
@@ -2526,6 +2571,13 @@ class unified_cache {
     mem_handle onednn_weights_scratch_owner_;
     mem_handle onednn_activations_scratch_owner_;
     std::mutex onednn_scratch_mutex_;
+
+    std::vector<pp_moe_onednn_scratch_slot> pp_moe_onednn_scratch_slots_;
+    size_t                                  pp_moe_onednn_weight_slot_size_     = 0;
+    size_t                                  pp_moe_onednn_activation_slot_size_ = 0;
+    size_t                                  pp_moe_onednn_output_slot_size_     = 0;
+    uint32_t                                pp_moe_onednn_ring_depth_           = 0;
+    std::mutex                              pp_moe_onednn_scratch_mutex_;
 
     // Persistent scratch buffers for TG optimization (persistent kernels).
     // Keyed by name for flexibility (e.g., "activations", "work_counter", "temp").
@@ -2676,7 +2728,7 @@ class unified_cache {
     };
 
     std::unordered_map<partial_rows_key, partial_entry, partial_rows_key_hash> partial_cache_;
-    std::mutex                                                               partial_mutex_;
+    std::mutex                                                                 partial_mutex_;
 
     // === Placement Plan (P4) ===
     placement_plan   placement_plan_;
@@ -2801,9 +2853,6 @@ unified_cache * get_unified_cache_for_device(int    device_id,
                                              size_t free_mem,
                                              size_t total_mem,
                                              size_t free_vram_at_init);
-
-// Check if unified cache is enabled (via env var or auto-detection)
-bool unified_cache_enabled();
 
 // S1 preload runs during model load and materializes unified-cache weight
 // handles. Keep the default serialized: current Level Zero stacks can wedge
@@ -3301,6 +3350,26 @@ size_t compute_moe_effective_weight_bytes(size_t total_weight_bytes,
 // The buffers are reserved from the unified cache budget and reused across all matmuls.
 bool unified_cache_reserve_onednn_scratch(int device_id, size_t weights_size, size_t activations_size);
 
+struct pp_moe_onednn_scratch_result {
+    void *     weight          = nullptr;
+    void *     activation      = nullptr;
+    void *     output          = nullptr;
+    size_t     weight_size     = 0;
+    size_t     activation_size = 0;
+    size_t     output_size     = 0;
+    mem_handle weight_owner;
+    mem_handle activation_owner;
+    mem_handle output_owner;
+    bool       ok = false;
+};
+
+bool                         unified_cache_reserve_pp_moe_onednn_scratch(int      device_id,
+                                                                         size_t   weight_slot_bytes,
+                                                                         size_t   activation_slot_bytes,
+                                                                         size_t   output_slot_bytes,
+                                                                         uint32_t ring_depth);
+pp_moe_onednn_scratch_result unified_cache_get_pp_moe_onednn_scratch_slot(int device_id, uint32_t slot);
+
 // Get scratch buffers for oneDNN FP16 path. Returns pointers and acquires lock.
 // Caller must call unified_cache_release_onednn_scratch() when done.
 // Returns false if scratch not reserved or sizes exceed reserved.
@@ -3428,23 +3497,23 @@ void unpin_routed_experts(const int32_t * expert_ids,
 
 // Load a contiguous row range to a device with SOA reorder.
 // Automatically routes to the correct unified_cache instance for the target device.
-void * unified_cache_load_partial_rows(const char * tensor_name,
+void * unified_cache_load_partial_rows(const char *               tensor_name,
                                        const ggml_sycl_cache_id & tensor_id,
-                                       const void * src_host,
-                                       ggml_type    type,
-                                       int64_t      ncols,
-                                       int64_t      row_start,
-                                       int64_t      row_count,
-                                       int          target_device);
+                                       const void *               src_host,
+                                       ggml_type                  type,
+                                       int64_t                    ncols,
+                                       int64_t                    row_start,
+                                       int64_t                    row_count,
+                                       int                        target_device);
 
 // Look up a previously loaded partial weight on a specific device/range.
-void * unified_cache_get_split_weight_ptr(const char * tensor_name,
+void * unified_cache_get_split_weight_ptr(const char *               tensor_name,
                                           const ggml_sycl_cache_id & tensor_id,
-                                          ggml_type    type,
-                                          int64_t      ncols,
-                                          int64_t      row_start,
-                                          int64_t      row_count,
-                                          int          device);
+                                          ggml_type                  type,
+                                          int64_t                    ncols,
+                                          int64_t                    row_start,
+                                          int64_t                    row_count,
+                                          int                        device);
 
 // Free all partial row entries on a device.
 void unified_cache_free_partial_entries(int device);

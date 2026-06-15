@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 MODEL="${MODEL:-/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf}"
 BENCH="${BENCH:-./build/bin/llama-bench}"
 SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:1}"
@@ -13,6 +15,9 @@ BENCH_REPS="${BENCH_REPS:-3}"
 
 DO_BENCH=0
 BENCH_INVALID=0
+
+# shellcheck disable=SC1091
+source "$ROOT/scripts/sycl-gpu-preflight.sh"
 
 usage() {
     cat <<'EOF'
@@ -79,6 +84,7 @@ run_case() {
     echo "== $name =="
     echo "requested=$expected selector=$SELECTOR log=$profile_log"
 
+    sycl_gpu_preflight_check "$SELECTOR"
     env ONEAPI_DEVICE_SELECTOR="$SELECTOR" \
         GGML_SYCL_MXFP4_TG_PROFILE=1 \
         "${env_args[@]}" \
@@ -122,6 +128,7 @@ run_case() {
 
     if (( DO_BENCH == 1 )) && { (( valid == 1 )) || (( BENCH_INVALID == 1 )); }; then
         echo "bench_log=$bench_log"
+        sycl_gpu_preflight_check "$SELECTOR"
         env ONEAPI_DEVICE_SELECTOR="$SELECTOR" \
             "${env_args[@]}" \
             "$BENCH" -m "$MODEL" -p "$PROMPT_TOKENS" -n "$BENCH_TOKENS" -r "$BENCH_REPS" \

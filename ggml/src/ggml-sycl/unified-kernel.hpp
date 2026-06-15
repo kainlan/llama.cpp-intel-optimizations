@@ -28,16 +28,17 @@
 #ifndef GGML_SYCL_UNIFIED_KERNEL_HPP
 #define GGML_SYCL_UNIFIED_KERNEL_HPP
 
+#include "mem-handle.hpp"
+#include "unified-cache.hpp"
+
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
-#include <string>
 #include <memory>
+#include <string>
+#include <sycl/sycl.hpp>
 #include <unordered_map>
 #include <vector>
-#include <sycl/sycl.hpp>
-
-#include "unified-cache.hpp"
 
 // Check for joint_matrix support
 #if __has_include(<sycl/ext/oneapi/matrix/matrix.hpp>)
@@ -111,10 +112,12 @@ namespace xmx   = sycl::ext::intel::esimd::xmx;
 // Requires: -Xspirv-translator "--spirv-ext=+SPV_INTEL_split_barrier"
 
 #ifdef __SYCL_DEVICE_ONLY__
-SYCL_EXTERNAL __attribute__((convergent)) void __spirv_ControlBarrierArriveINTEL(
-    int execution_scope, int memory_scope, int memory_semantics);
-SYCL_EXTERNAL __attribute__((convergent)) void __spirv_ControlBarrierWaitINTEL(
-    int execution_scope, int memory_scope, int memory_semantics);
+SYCL_EXTERNAL __attribute__((convergent)) void __spirv_ControlBarrierArriveINTEL(int execution_scope,
+                                                                                 int memory_scope,
+                                                                                 int memory_semantics);
+SYCL_EXTERNAL __attribute__((convergent)) void __spirv_ControlBarrierWaitINTEL(int execution_scope,
+                                                                               int memory_scope,
+                                                                               int memory_semantics);
 #endif
 
 // SPIR-V scope constants (from SPV_INTEL_split_barrier extension)
@@ -138,11 +141,11 @@ enum class SPIRVMemorySemantics : int {
 };
 
 // Convenience aliases
-constexpr int ScopeWorkgroup    = static_cast<int>(SPIRVScope::Workgroup);
-constexpr int ScopeSubgroup     = static_cast<int>(SPIRVScope::Subgroup);
-constexpr int ScopeDevice       = static_cast<int>(SPIRVScope::Device);
-constexpr int SemanticsNone     = static_cast<int>(SPIRVMemorySemantics::None);
-constexpr int SemanticsWGMem    = static_cast<int>(SPIRVMemorySemantics::WorkgroupMemory);
+constexpr int ScopeWorkgroup     = static_cast<int>(SPIRVScope::Workgroup);
+constexpr int ScopeSubgroup      = static_cast<int>(SPIRVScope::Subgroup);
+constexpr int ScopeDevice        = static_cast<int>(SPIRVScope::Device);
+constexpr int SemanticsNone      = static_cast<int>(SPIRVMemorySemantics::None);
+constexpr int SemanticsWGMem     = static_cast<int>(SPIRVMemorySemantics::WorkgroupMemory);
 constexpr int SemanticsGlobalMem = static_cast<int>(SPIRVMemorySemantics::CrossWorkgroup);
 
 // Split barrier helper functions for cleaner kernel code
@@ -153,13 +156,12 @@ constexpr int SemanticsGlobalMem = static_cast<int>(SPIRVMemorySemantics::CrossW
  * Call this when work-item has finished its contribution.
  * Does NOT wait for other work-items.
  */
-inline void split_barrier_arrive(int scope = ScopeWorkgroup,
-                                  int memory_semantics = SemanticsWGMem) {
+inline void split_barrier_arrive(int scope = ScopeWorkgroup, int memory_semantics = SemanticsWGMem) {
 #ifdef __SYCL_DEVICE_ONLY__
     __spirv_ControlBarrierArriveINTEL(scope, scope, memory_semantics);
 #else
-    (void)scope;
-    (void)memory_semantics;
+    (void) scope;
+    (void) memory_semantics;
 #endif
 }
 
@@ -167,13 +169,12 @@ inline void split_barrier_arrive(int scope = ScopeWorkgroup,
  * Wait at a split barrier for all arrivals.
  * Blocks until all work-items in the scope have called split_barrier_arrive().
  */
-inline void split_barrier_wait(int scope = ScopeWorkgroup,
-                                int memory_semantics = SemanticsWGMem) {
+inline void split_barrier_wait(int scope = ScopeWorkgroup, int memory_semantics = SemanticsWGMem) {
 #ifdef __SYCL_DEVICE_ONLY__
     __spirv_ControlBarrierWaitINTEL(scope, scope, memory_semantics);
 #else
-    (void)scope;
-    (void)memory_semantics;
+    (void) scope;
+    (void) memory_semantics;
 #endif
 }
 
@@ -181,8 +182,7 @@ inline void split_barrier_wait(int scope = ScopeWorkgroup,
  * Combined arrive-and-wait (equivalent to esimd::barrier() but using split barrier API).
  * Use when you need immediate synchronization without overlapping work.
  */
-inline void split_barrier_sync(int scope = ScopeWorkgroup,
-                                int memory_semantics = SemanticsWGMem) {
+inline void split_barrier_sync(int scope = ScopeWorkgroup, int memory_semantics = SemanticsWGMem) {
     split_barrier_arrive(scope, memory_semantics);
     split_barrier_wait(scope, memory_semantics);
 }
@@ -227,23 +227,10 @@ enum class KvCacheType {
 };
 
 // Matmul type classification
-enum class MatmulType {
-    Q_PROJ,
-    K_PROJ,
-    V_PROJ,
-    OUT_PROJ,
-    GATE,
-    UP,
-    DOWN,
-    GENERIC
-};
+enum class MatmulType { Q_PROJ, K_PROJ, V_PROJ, OUT_PROJ, GATE, UP, DOWN, GENERIC };
 
 // Prefetch priority for cache streaming
-enum class PrefetchPriority {
-    LOW,
-    NORMAL,
-    HIGH
-};
+enum class PrefetchPriority { LOW, NORMAL, HIGH };
 
 // =============================================================================
 // Operation Descriptors
@@ -283,7 +270,7 @@ struct AttentionDescriptor {
     int64_t      v_nb2;
     int64_t      v_nb3;
     float        scale;
-    int          mask_type;   // 0 = F32, 1 = F16, -1 = none
+    int          mask_type;  // 0 = F32, 1 = F16, -1 = none
     int64_t      mask_nb0;
     int64_t      mask_nb1;
     int64_t      mask_nb2;
@@ -293,23 +280,23 @@ struct AttentionDescriptor {
 };
 
 struct RopeDescriptor {
-    void *        q;          // Q data pointer (or source tensor for single-tensor mode)
-    void *        k;          // K data pointer (nullptr for single-tensor mode)
-    void *        rope_dst;   // Output pointer for single-tensor mode (ignored in dual mode)
+    void *        q;         // Q data pointer (or source tensor for single-tensor mode)
+    void *        k;         // K data pointer (nullptr for single-tensor mode)
+    void *        rope_dst;  // Output pointer for single-tensor mode (ignored in dual mode)
     const float * cos_cache;
     const float * sin_cache;
     int           n_heads;
     int           head_dim;
     int           position;
-    bool          is_neox;    // true = NEOX layout (split pairs), false = NORMAL (adjacent pairs)
+    bool          is_neox;  // true = NEOX layout (split pairs), false = NORMAL (adjacent pairs)
 };
 
 // Metadata for materializing strided/view tensors into contiguous buffers.
 struct StridedCopyMeta {
     int64_t ne[4];
     int64_t nb[4];
-    int32_t src_type;   // 0=F32/raw, 1=F16
-    int32_t dst_type;   // 0=F32/raw, 1=F16
+    int32_t src_type;  // 0=F32/raw, 1=F16
+    int32_t dst_type;  // 0=F32/raw, 1=F16
     int32_t src_size;
     int32_t dst_size;
 };
@@ -341,42 +328,44 @@ struct SetRowsMeta {
 };
 
 struct OperationDescriptor {
-    OperationType type;
-    int           layer;
-    const void *  weights;
-    const void *  input;
-    void *        output;
-    void *        aux;
-    const void *  mask;
-    int64_t       q_nb0;
-    int64_t       q_nb1;
-    int64_t       q_nb2;
-    int64_t       q_nb3;
-    int64_t       k_nb0;
-    int64_t       k_nb1;
-    int64_t       k_nb2;
-    int64_t       k_nb3;
-    int64_t       v_nb0;
-    int64_t       v_nb1;
-    int64_t       v_nb2;
-    int64_t       v_nb3;
-    int           M, N, K;
-    int64_t       output_bytes;
-    int           hidden_dim;
-    int           intermediate_dim;
-    float         eps;
-    float         scale;
-    int           quant_type;
-    int           weight_layout;
-    int           n_kv_heads;   // For GQA support in attention (0 = same as n_heads)
-    int           q_type;       // GGML_TYPE_F32 or GGML_TYPE_F16 for attention Q
-    int           mask_type;
-    int64_t       mask_nb0;
-    int64_t       mask_nb1;
-    int64_t       mask_nb2;
-    int64_t       mask_nb3;
-    int           mask_ne2;
-    int           mask_ne3;
+    OperationType         type;
+    int                   layer;
+    const void *          weights;
+    const void *          input;
+    void *                output;
+    void *                aux;
+    const void *          mask;
+    ggml_sycl::mem_handle output_handle;
+    size_t                output_offset = 0;
+    int64_t               q_nb0;
+    int64_t               q_nb1;
+    int64_t               q_nb2;
+    int64_t               q_nb3;
+    int64_t               k_nb0;
+    int64_t               k_nb1;
+    int64_t               k_nb2;
+    int64_t               k_nb3;
+    int64_t               v_nb0;
+    int64_t               v_nb1;
+    int64_t               v_nb2;
+    int64_t               v_nb3;
+    int                   M, N, K;
+    int64_t               output_bytes;
+    int                   hidden_dim;
+    int                   intermediate_dim;
+    float                 eps;
+    float                 scale;
+    int                   quant_type;
+    int                   weight_layout;
+    int                   n_kv_heads;  // For GQA support in attention (0 = same as n_heads)
+    int                   q_type;      // GGML_TYPE_F32 or GGML_TYPE_F16 for attention Q
+    int                   mask_type;
+    int64_t               mask_nb0;
+    int64_t               mask_nb1;
+    int64_t               mask_nb2;
+    int64_t               mask_nb3;
+    int                   mask_ne2;
+    int                   mask_ne3;
 
     // Scratch pool linkage: which plan operation produces this op's input/aux.
     // -1 means the pointer comes from an external source (weights, KV cache,
@@ -385,17 +374,18 @@ struct OperationDescriptor {
     // be used as this op's input/aux after scratch pool allocation.
     // This replaces the broken pointer-based remap that fails when ggml's memory
     // allocator recycles buffer addresses across non-overlapping tensor lifetimes.
-    int           input_source_op  = -1;
-    int           aux_source_op    = -1;
+    int input_source_op = -1;
+    int aux_source_op   = -1;
 
     // Embedded per-op metadata for SET_ROWS and STRIDED_COPY operations.
     // Stored here to avoid separate device allocations and per-token memcpy uploads.
     // The union overlaps with no other fields; only the relevant member is used
     // based on the operation type.
     union {
-        SetRowsMeta       set_rows_meta;
-        StridedCopyMeta   strided_copy_meta;
+        SetRowsMeta     set_rows_meta;
+        StridedCopyMeta strided_copy_meta;
     };
+
     bool has_embedded_meta = false;  // True when set_rows_meta/strided_copy_meta is populated
 };
 
@@ -419,14 +409,14 @@ enum class PtrSource : uint8_t {
 // Per-op entry in the update recipe.  Only ops with at least one non-STABLE
 // field appear in the "mutable ops" list; fully-stable ops are skipped entirely.
 struct UpdateRecipeEntry {
-    int           plan_op_idx;       // Index into cached_ops_ / current_plan_->operations
-    OperationType op_type;           // Cached for quick dispatch
-    PtrSource     input_src;         // How to resolve op.input
-    PtrSource     output_src;        // How to resolve op.output
-    PtrSource     aux_src;           // How to resolve op.aux
-    PtrSource     mask_src;          // How to resolve op.mask
-    int           graph_node_idx;    // ggml graph node index (for tensor access)
-    int           get_rows_idx;      // GET_ROWS slot index (for GET_ROWS ops)
+    int           plan_op_idx;     // Index into cached_ops_ / current_plan_->operations
+    OperationType op_type;         // Cached for quick dispatch
+    PtrSource     input_src;       // How to resolve op.input
+    PtrSource     output_src;      // How to resolve op.output
+    PtrSource     aux_src;         // How to resolve op.aux
+    PtrSource     mask_src;        // How to resolve op.mask
+    int           graph_node_idx;  // ggml graph node index (for tensor access)
+    int           get_rows_idx;    // GET_ROWS slot index (for GET_ROWS ops)
 };
 
 // =============================================================================
@@ -437,18 +427,18 @@ struct UpdateRecipeEntry {
 // Replaces device-scope barriers with per-operation atomic dependency counters.
 struct DeviceDAGState {
     // Per-op scheduling state (n_ops elements, reset every token)
-    int * ready_counter;      // atomic: predecessors remaining (0 = ready to run)
-    int * tile_claimed;       // atomic: work-stealing counter per op
-    int * tiles_done;         // atomic: completed tile count per op
+    int * ready_counter;  // atomic: predecessors remaining (0 = ready to run)
+    int * tile_claimed;   // atomic: work-stealing counter per op
+    int * tiles_done;     // atomic: completed tile count per op
 
     // Static DAG topology (set once during plan build, reused across tokens)
-    int * successor_offset;   // [n_ops+1] CSR index into successor_list
-    int * successor_list;     // [total_edges] successor op indices
-    int * n_tiles;            // [n_ops] tile count per op
+    int * successor_offset;  // [n_ops+1] CSR index into successor_list
+    int * successor_list;    // [total_edges] successor op indices
+    int * n_tiles;           // [n_ops] tile count per op
 
     // Termination
-    int * completed_count;    // [1] atomic: number of fully completed ops
-    int   n_ops;              // total operation count
+    int * completed_count;  // [1] atomic: number of fully completed ops
+    int   n_ops;            // total operation count
 };
 
 // Phase-based scheduling: pre-computed topological levels for O(1) tile claiming.
@@ -456,8 +446,8 @@ struct DeviceDAGState {
 // Each phase contains ops that are fully independent (all predecessors are in
 // earlier phases), so within a phase all tiles can run in any order.
 struct DevicePhaseEntry {
-    int op_idx;        // Index into the DeviceOperation array
-    int tile_offset;   // Cumulative tile offset within this phase (for reverse-mapping flat tile → op)
+    int op_idx;       // Index into the DeviceOperation array
+    int tile_offset;  // Cumulative tile offset within this phase (for reverse-mapping flat tile → op)
 };
 
 struct DevicePhaseSchedule {
@@ -483,35 +473,35 @@ enum class OpRole : int {
 
 // A sync point between roles: one role completes a segment, the other waits.
 struct RoleSyncPoint {
-    int op_before;   // Last op index in the completing role's segment
-    int op_after;    // First op index in the waiting role's segment
-    int from_role;   // Role that signals (0=ELEM, 1=MATMUL)
+    int op_before;  // Last op index in the completing role's segment
+    int op_after;   // First op index in the waiting role's segment
+    int from_role;  // Role that signals (0=ELEM, 1=MATMUL)
 };
 
 // Per-role segment: a contiguous range of ops assigned to one role.
 struct RoleSegment {
-    int first_op;    // First op index (into device ops array)
-    int last_op;     // Last op index (inclusive)
-    int role;        // 0=ELEM, 1=MATMUL
-    int total_tiles; // Sum of tiles across all ops in this segment
-    int sync_before; // Sync point index to wait on before starting (-1 = none)
-    int sync_after;  // Sync point index to signal after completing (-1 = none)
+    int first_op;     // First op index (into device ops array)
+    int last_op;      // Last op index (inclusive)
+    int role;         // 0=ELEM, 1=MATMUL
+    int total_tiles;  // Sum of tiles across all ops in this segment
+    int sync_before;  // Sync point index to wait on before starting (-1 = none)
+    int sync_after;   // Sync point index to signal after completing (-1 = none)
 };
 
 // Device-side role schedule passed to the kernel.
 struct DeviceRoleSchedule {
-    const RoleSegment *  elem_segments;     // [n_elem_segments] Segments for elementwise WGs
-    const RoleSegment *  matmul_segments;   // [n_matmul_segments] Segments for matmul WGs
-    int *                sync_flags;        // [n_sync_points * 2] Pairs: elem_done, matmul_done
-    int *                role_tile_counter; // [1] Atomic tile counter for elem role work stealing
-    int *                elem_barrier_cnt;  // [1] Atomic counter for elem-role intra-barrier
-    int *                elem_barrier_sense;// [1] Sense flag for elem-role intra-barrier
-    int *                mm_barrier_cnt;    // [1] Atomic counter for matmul-role intra-barrier
-    int *                mm_barrier_sense;  // [1] Sense flag for matmul-role intra-barrier
-    int                  n_elem_segments;   // Number of elementwise segments
-    int                  n_matmul_segments; // Number of matmul segments
-    int                  n_sync_points;     // Number of cross-role sync points
-    int                  n_elem_wgs;        // Number of WGs assigned to elementwise role
+    const RoleSegment * elem_segments;       // [n_elem_segments] Segments for elementwise WGs
+    const RoleSegment * matmul_segments;     // [n_matmul_segments] Segments for matmul WGs
+    int *               sync_flags;          // [n_sync_points * 2] Pairs: elem_done, matmul_done
+    int *               role_tile_counter;   // [1] Atomic tile counter for elem role work stealing
+    int *               elem_barrier_cnt;    // [1] Atomic counter for elem-role intra-barrier
+    int *               elem_barrier_sense;  // [1] Sense flag for elem-role intra-barrier
+    int *               mm_barrier_cnt;      // [1] Atomic counter for matmul-role intra-barrier
+    int *               mm_barrier_sense;    // [1] Sense flag for matmul-role intra-barrier
+    int                 n_elem_segments;     // Number of elementwise segments
+    int                 n_matmul_segments;   // Number of matmul segments
+    int                 n_sync_points;       // Number of cross-role sync points
+    int                 n_elem_wgs;          // Number of WGs assigned to elementwise role
 };
 
 // =============================================================================
@@ -542,28 +532,27 @@ struct PersistentPlan {
     int *  tile_counter;
     void * weight_table;
 
-    float * debug_attn_ptr = nullptr;
-    int     debug_attn_layer = -1;
-    int     debug_attn_floats = 0;
-    float * debug_rms_ptr = nullptr;
-    int     debug_rms_layer = -1;
-    int     debug_rms_dim = 0;
-    int *   debug_rms_flag = nullptr;
-    float * debug_matmul_ptr = nullptr;
-    int     debug_matmul_layer = -1;
-    int     debug_matmul_type = -1;
-    int     debug_matmul_dim = 0;
-    int *   debug_matmul_flag = nullptr;
-    int     rms_base_wg_size = 0;
-    int     rms_match_base = 0;
-    uint64_t * debug_hash_ptr = nullptr;
-    int        debug_hash_bytes = 0;
+    float *    debug_attn_ptr     = nullptr;
+    int        debug_attn_layer   = -1;
+    int        debug_attn_floats  = 0;
+    float *    debug_rms_ptr      = nullptr;
+    int        debug_rms_layer    = -1;
+    int        debug_rms_dim      = 0;
+    int *      debug_rms_flag     = nullptr;
+    float *    debug_matmul_ptr   = nullptr;
+    int        debug_matmul_layer = -1;
+    int        debug_matmul_type  = -1;
+    int        debug_matmul_dim   = 0;
+    int *      debug_matmul_flag  = nullptr;
+    int        rms_base_wg_size   = 0;
+    int        rms_match_base     = 0;
+    uint64_t * debug_hash_ptr     = nullptr;
+    int        debug_hash_bytes   = 0;
 
     // Device memory allocations made during plan building (e.g. RoPE cos/sin caches).
     // These are freed after execute_persistent() completes.
-    std::vector<std::pair<void *, size_t>> temp_device_allocs;
-    std::unordered_map<void *, ggml_sycl::alloc_handle> temp_device_alloc_handles;
-    size_t                                               temp_device_alloc_bytes = 0;
+    std::vector<ggml_sycl::mem_handle> temp_device_handles;
+    size_t                             temp_device_alloc_bytes = 0;
 
     bool is_valid() const { return n_layers > 0 && !operations.empty(); }
 };
@@ -589,9 +578,9 @@ constexpr int XMX_TILE_K = 16;  // K step per dpas instruction (for half precisi
 
 // Large-tile ESIMD kernel dimensions - these are the MAXIMUM values
 // Actual values used depend on hardware (see LargeTileConfig)
-constexpr int LARGE_TILE_M_MAX = 64;   // Max M dimension (limited by registers/SLM)
-constexpr int LARGE_TILE_N_MAX = 64;   // Max N dimension
-constexpr int LARGE_TILE_K     = 32;   // K step per iteration (fixed for Q4_0 alignment)
+constexpr int LARGE_TILE_M_MAX = 64;  // Max M dimension (limited by registers/SLM)
+constexpr int LARGE_TILE_N_MAX = 64;  // Max N dimension
+constexpr int LARGE_TILE_K     = 32;  // K step per iteration (fixed for Q4_0 alignment)
 
 // Legacy constants for backward compatibility (Arc B580 configuration)
 constexpr int LARGE_TILE_M = 32;  // M dimension for 64 work-item config
@@ -638,25 +627,25 @@ struct LargeTileConfig {
 
         if (max_esimd_wg >= 256) {
             // PVC-class: 256 work-items = 16 sub-groups = 4×4 grid = 64×64 output
-            cfg.wg_size  = 256;
-            cfg.sg_cols  = 4;
-            cfg.sg_rows  = 4;
-            cfg.tile_m   = 64;
-            cfg.tile_n   = 64;
+            cfg.wg_size = 256;
+            cfg.sg_cols = 4;
+            cfg.sg_rows = 4;
+            cfg.tile_m  = 64;
+            cfg.tile_n  = 64;
         } else if (max_esimd_wg >= 128) {
             // Mid-range: 128 work-items = 8 sub-groups = 4×2 grid = 32×64 output
-            cfg.wg_size  = 128;
-            cfg.sg_cols  = 4;
-            cfg.sg_rows  = 2;
-            cfg.tile_m   = 32;
-            cfg.tile_n   = 64;
+            cfg.wg_size = 128;
+            cfg.sg_cols = 4;
+            cfg.sg_rows = 2;
+            cfg.tile_m  = 32;
+            cfg.tile_n  = 64;
         } else {
             // Arc/DG2-class: 64 work-items = 4 sub-groups = 2×2 grid = 32×32 output
-            cfg.wg_size  = 64;
-            cfg.sg_cols  = 2;
-            cfg.sg_rows  = 2;
-            cfg.tile_m   = 32;
-            cfg.tile_n   = 32;
+            cfg.wg_size = 64;
+            cfg.sg_cols = 2;
+            cfg.sg_rows = 2;
+            cfg.tile_m  = 32;
+            cfg.tile_n  = 32;
         }
 
         cfg.slm_weights = cfg.tile_n * cfg.tile_k;  // half count
@@ -668,9 +657,7 @@ struct LargeTileConfig {
     /**
      * Check if this configuration can be used for given dimensions.
      */
-    bool can_use(int64_t M, int64_t N, int64_t K) const {
-        return M >= tile_m && N >= tile_n && K >= tile_k;
-    }
+    bool can_use(int64_t M, int64_t N, int64_t K) const { return M >= tile_m && N >= tile_n && K >= tile_k; }
 };
 
 // =============================================================================
@@ -1108,9 +1095,9 @@ struct XMXConfig {
     // Hardware Resources
     // =========================================================================
 
-    size_t slm_size              = 65536;  // SLM bytes per work-group (default 64KB)
-    int    nsm                   = 20;     // Compute units (streaming multiprocessors)
-    int    max_esimd_workgroup   = 64;     // Max work-group size for ESIMD kernels (Arc: 64, PVC: 1024)
+    size_t slm_size            = 65536;  // SLM bytes per work-group (default 64KB)
+    int    nsm                 = 20;     // Compute units (streaming multiprocessors)
+    int    max_esimd_workgroup = 64;     // Max work-group size for ESIMD kernels (Arc: 64, PVC: 1024)
 
     // =========================================================================
     // Capability Flags (from hardware query)
@@ -1355,14 +1342,13 @@ static_assert(sizeof(block_q4_0_unified) == 18,
 constexpr int UNIFIED_QK6_K = 256;  // Weights per Q6_K block
 
 struct block_q6_K_unified {
-    uint8_t    ql[UNIFIED_QK6_K / 2];   // Lower 4 bits
-    uint8_t    qh[UNIFIED_QK6_K / 4];   // Upper 2 bits
+    uint8_t    ql[UNIFIED_QK6_K / 2];  // Lower 4 bits
+    uint8_t    qh[UNIFIED_QK6_K / 4];  // Upper 2 bits
     int8_t     scales[UNIFIED_QK6_K / 16];
-    sycl::half d;                       // Super-block scale
+    sycl::half d;                      // Super-block scale
 };
 
-static_assert(sizeof(block_q6_K_unified) ==
-                  sizeof(sycl::half) + UNIFIED_QK6_K / 16 + 3 * UNIFIED_QK6_K / 4,
+static_assert(sizeof(block_q6_K_unified) == sizeof(sycl::half) + UNIFIED_QK6_K / 16 + 3 * UNIFIED_QK6_K / 4,
               "wrong q6_K block size");
 
 // =============================================================================
@@ -1380,8 +1366,8 @@ constexpr int UNIFIED_QK_MXFP4 = 32;  // Weights per MXFP4 block
 constexpr int QUANT_TYPE_MXFP4 = 39;  // GGML_TYPE_MXFP4
 
 struct block_mxfp4_unified {
-    uint8_t e;                          // E8M0 shared exponent
-    uint8_t qs[UNIFIED_QK_MXFP4 / 2];   // Quantized values: 16 bytes = 32 nibbles (E2M1)
+    uint8_t e;                         // E8M0 shared exponent
+    uint8_t qs[UNIFIED_QK_MXFP4 / 2];  // Quantized values: 16 bytes = 32 nibbles (E2M1)
 };
 
 static_assert(sizeof(block_mxfp4_unified) == sizeof(uint8_t) + UNIFIED_QK_MXFP4 / 2, "wrong mxfp4 block size");
@@ -1392,7 +1378,7 @@ static_assert(sizeof(block_mxfp4_unified) == 17,
 // Positive: 0, 1, 2, 3, 4, 6, 8, 12 (indices 0-7)
 // Negative: 0, -1, -2, -3, -4, -6, -8, -12 (indices 8-15)
 constexpr int8_t kvalues_mxfp4_unified[16] = {
-    0, 1, 2, 3, 4, 6, 8, 12,     // Positive values (doubled)
+    0, 1,  2,  3,  4,  6,  8,  12,  // Positive values (doubled)
     0, -1, -2, -3, -4, -6, -8, -12  // Negative values (doubled)
 };
 
@@ -1873,7 +1859,7 @@ SYCL_EXTERNAL inline float e8m0_to_float_half(uint8_t e) {
     } else {
         // Normal case: scale by 0.5 by subtracting 1 from exponent
         // 2^(e-127) * 0.5 = 2^(e-128)
-        bits = (uint32_t)(e - 1) << 23;
+        bits = (uint32_t) (e - 1) << 23;
     }
     float result;
     std::memcpy(&result, &bits, sizeof(float));
@@ -1906,7 +1892,6 @@ SYCL_EXTERNAL inline void dequant_mxfp4_to_half(const block_mxfp4_unified * bloc
     }
 }
 
-
 /**
  * Reference (4-byte-aligned) variant of the vectorized per-block MXFP4
  * dequant helper. Mirrors the Q4_0 helper dequant_q4_0_block_half8 in
@@ -1934,9 +1919,7 @@ SYCL_EXTERNAL inline void dequant_mxfp4_to_half(const block_mxfp4_unified * bloc
  * @param e       E8M0 shared exponent.
  * @param slm_row Pointer to 32 contiguous halves to fill.
  */
-SYCL_EXTERNAL inline void dequant_mxfp4_block_half8(const uint8_t * qs,
-                                                    uint8_t         e,
-                                                    sycl::half *    slm_row) {
+SYCL_EXTERNAL inline void dequant_mxfp4_block_half8(const uint8_t * qs, uint8_t e, sycl::half * slm_row) {
     const float scale = e8m0_to_float_half(e);
 
     // Note: plain multiply (no `-8` bias like Q4_0's `d*nibble + dm` FMA form).
@@ -1952,48 +1935,44 @@ SYCL_EXTERNAL inline void dequant_mxfp4_block_half8(const uint8_t * qs,
     // Low nibbles: slm_row[0..15] = kvalues[qs[i] & 0x0F] * scale
     //   w0 packs qs[0..3], w1 packs qs[4..7], w2 packs qs[8..11], w3 packs qs[12..15].
     //   Byte i of word w is (w >> (8*i)) & 0xFF; low nibble is (w >> (8*i)) & 0x0F.
-    sycl::vec<float, 8> lo0_f(
-        static_cast<float>(kvalues_mxfp4_unified[ w0        & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w0 >>  8) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w0 >> 16) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w0 >> 24) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[ w1        & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w1 >>  8) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w1 >> 16) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w1 >> 24) & 0xF]) * scale);
-    sycl::vec<float, 8> lo1_f(
-        static_cast<float>(kvalues_mxfp4_unified[ w2        & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w2 >>  8) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w2 >> 16) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w2 >> 24) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[ w3        & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w3 >>  8) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w3 >> 16) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w3 >> 24) & 0xF]) * scale);
+    sycl::vec<float, 8> lo0_f(static_cast<float>(kvalues_mxfp4_unified[w0 & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w0 >> 8) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w0 >> 16) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w0 >> 24) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[w1 & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w1 >> 8) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w1 >> 16) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w1 >> 24) & 0xF]) * scale);
+    sycl::vec<float, 8> lo1_f(static_cast<float>(kvalues_mxfp4_unified[w2 & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w2 >> 8) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w2 >> 16) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w2 >> 24) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[w3 & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w3 >> 8) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w3 >> 16) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w3 >> 24) & 0xF]) * scale);
 
     // High nibbles: slm_row[16..31] = kvalues[qs[i] >> 4] * scale
-    sycl::vec<float, 8> hi0_f(
-        static_cast<float>(kvalues_mxfp4_unified[(w0 >>  4) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w0 >> 12) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w0 >> 20) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w0 >> 28) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w1 >>  4) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w1 >> 12) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w1 >> 20) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w1 >> 28) & 0xF]) * scale);
-    sycl::vec<float, 8> hi1_f(
-        static_cast<float>(kvalues_mxfp4_unified[(w2 >>  4) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w2 >> 12) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w2 >> 20) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w2 >> 28) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w3 >>  4) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w3 >> 12) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w3 >> 20) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w3 >> 28) & 0xF]) * scale);
+    sycl::vec<float, 8> hi0_f(static_cast<float>(kvalues_mxfp4_unified[(w0 >> 4) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w0 >> 12) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w0 >> 20) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w0 >> 28) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w1 >> 4) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w1 >> 12) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w1 >> 20) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w1 >> 28) & 0xF]) * scale);
+    sycl::vec<float, 8> hi1_f(static_cast<float>(kvalues_mxfp4_unified[(w2 >> 4) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w2 >> 12) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w2 >> 20) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w2 >> 28) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w3 >> 4) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w3 >> 12) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w3 >> 20) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w3 >> 28) & 0xF]) * scale);
 
-    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row +  0) =
+    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 0) =
         lo0_f.convert<sycl::half, sycl::rounding_mode::automatic>();
-    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row +  8) =
+    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 8) =
         lo1_f.convert<sycl::half, sycl::rounding_mode::automatic>();
     *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 16) =
         hi0_f.convert<sycl::half, sycl::rounding_mode::automatic>();
@@ -2025,61 +2004,55 @@ SYCL_EXTERNAL inline void dequant_mxfp4_block_half8(const uint8_t * qs,
  * helper above is the reference-only companion that assumes aligned
  * qs — see its doc-comment for the scope split.
  */
-SYCL_EXTERNAL inline void dequant_mxfp4_block_half8_unaligned(const uint8_t * qs,
-                                                              uint8_t         e,
-                                                              sycl::half *    slm_row) {
+SYCL_EXTERNAL inline void dequant_mxfp4_block_half8_unaligned(const uint8_t * qs, uint8_t e, sycl::half * slm_row) {
     const float scale = e8m0_to_float_half(e);
 
     uint32_t w0;
     uint32_t w1;
     uint32_t w2;
     uint32_t w3;
-    std::memcpy(&w0, qs +  0, sizeof(uint32_t));
-    std::memcpy(&w1, qs +  4, sizeof(uint32_t));
-    std::memcpy(&w2, qs +  8, sizeof(uint32_t));
+    std::memcpy(&w0, qs + 0, sizeof(uint32_t));
+    std::memcpy(&w1, qs + 4, sizeof(uint32_t));
+    std::memcpy(&w2, qs + 8, sizeof(uint32_t));
     std::memcpy(&w3, qs + 12, sizeof(uint32_t));
 
-    sycl::vec<float, 8> lo0_f(
-        static_cast<float>(kvalues_mxfp4_unified[ w0        & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w0 >>  8) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w0 >> 16) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w0 >> 24) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[ w1        & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w1 >>  8) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w1 >> 16) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w1 >> 24) & 0xF]) * scale);
-    sycl::vec<float, 8> lo1_f(
-        static_cast<float>(kvalues_mxfp4_unified[ w2        & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w2 >>  8) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w2 >> 16) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w2 >> 24) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[ w3        & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w3 >>  8) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w3 >> 16) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w3 >> 24) & 0xF]) * scale);
+    sycl::vec<float, 8> lo0_f(static_cast<float>(kvalues_mxfp4_unified[w0 & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w0 >> 8) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w0 >> 16) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w0 >> 24) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[w1 & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w1 >> 8) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w1 >> 16) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w1 >> 24) & 0xF]) * scale);
+    sycl::vec<float, 8> lo1_f(static_cast<float>(kvalues_mxfp4_unified[w2 & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w2 >> 8) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w2 >> 16) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w2 >> 24) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[w3 & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w3 >> 8) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w3 >> 16) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w3 >> 24) & 0xF]) * scale);
 
-    sycl::vec<float, 8> hi0_f(
-        static_cast<float>(kvalues_mxfp4_unified[(w0 >>  4) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w0 >> 12) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w0 >> 20) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w0 >> 28) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w1 >>  4) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w1 >> 12) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w1 >> 20) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w1 >> 28) & 0xF]) * scale);
-    sycl::vec<float, 8> hi1_f(
-        static_cast<float>(kvalues_mxfp4_unified[(w2 >>  4) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w2 >> 12) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w2 >> 20) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w2 >> 28) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w3 >>  4) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w3 >> 12) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w3 >> 20) & 0xF]) * scale,
-        static_cast<float>(kvalues_mxfp4_unified[(w3 >> 28) & 0xF]) * scale);
+    sycl::vec<float, 8> hi0_f(static_cast<float>(kvalues_mxfp4_unified[(w0 >> 4) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w0 >> 12) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w0 >> 20) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w0 >> 28) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w1 >> 4) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w1 >> 12) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w1 >> 20) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w1 >> 28) & 0xF]) * scale);
+    sycl::vec<float, 8> hi1_f(static_cast<float>(kvalues_mxfp4_unified[(w2 >> 4) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w2 >> 12) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w2 >> 20) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w2 >> 28) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w3 >> 4) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w3 >> 12) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w3 >> 20) & 0xF]) * scale,
+                              static_cast<float>(kvalues_mxfp4_unified[(w3 >> 28) & 0xF]) * scale);
 
-    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row +  0) =
+    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 0) =
         lo0_f.convert<sycl::half, sycl::rounding_mode::automatic>();
-    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row +  8) =
+    *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 8) =
         lo1_f.convert<sycl::half, sycl::rounding_mode::automatic>();
     *reinterpret_cast<sycl::vec<sycl::half, 8> *>(slm_row + 16) =
         hi0_f.convert<sycl::half, sycl::rounding_mode::automatic>();
@@ -2095,8 +2068,7 @@ SYCL_EXTERNAL inline void dequant_mxfp4_block_half8_unaligned(const uint8_t * qs
  * variant. Matches the Q4_0 AOS wrapper pattern (dequant_q4_0_block_half8_aos
  * → dequant_q4_0_block_half8_unaligned) in unified-kernel.cpp:588.
  */
-SYCL_EXTERNAL inline void dequant_mxfp4_block_half8_aos(const block_mxfp4_unified * block,
-                                                        sycl::half *                slm_row) {
+SYCL_EXTERNAL inline void dequant_mxfp4_block_half8_aos(const block_mxfp4_unified * block, sycl::half * slm_row) {
     dequant_mxfp4_block_half8_unaligned(block->qs, block->e, slm_row);
 }
 
@@ -2133,8 +2105,8 @@ inline void load_weights_aos(sycl::local_accessor<sycl::half, 1> & slm,
                              int                                   quant_type,
                              const sycl::nd_item<3> &              item) {
     // Both Q4_0 and MXFP4 have 32 weights per block
-    constexpr int QK        = 32;
-    const int blocks_per_row = static_cast<int>(K / QK);
+    constexpr int QK             = 32;
+    const int     blocks_per_row = static_cast<int>(K / QK);
 
     const int local_id   = item.get_local_linear_id();
     const int local_size = item.get_local_range().size();
@@ -2879,31 +2851,31 @@ struct DeviceOperation;
 // Per-operation multi-device split metadata, passed to UnifiedKernel::set_split_config()
 // to populate DeviceOperation cross-device fields during launch_persistent_kernel().
 struct SplitOpMeta {
-    int     op_idx;          // Matmul index for progress/merge addressing
-    int     row_start;       // First output row this device computes
-    int     row_count;       // Number of output rows
-    int     merge_count;     // Floats to merge from other device (0 = none)
-    void *  merge_src;       // Host-pinned buffer for secondary partial output
-    void *  merge_dst;       // Device pointer where merged output goes (primary only)
-    float * input_staging;   // Host-pinned activation staging buffer (both devices share)
-    int     input_K;         // K dimension for activation staging (floats to copy)
+    int     op_idx;         // Matmul index for progress/merge addressing
+    int     row_start;      // First output row this device computes
+    int     row_count;      // Number of output rows
+    int     merge_count;    // Floats to merge from other device (0 = none)
+    void *  merge_src;      // Host-pinned buffer for secondary partial output
+    void *  merge_dst;      // Device pointer where merged output goes (primary only)
+    float * input_staging;  // Host-pinned activation staging buffer (both devices share)
+    int     input_K;        // K dimension for activation staging (floats to copy)
 };
 
 // Kernel-level split configuration, set once and applied to all ops during launch.
 struct KernelSplitConfig {
-    int *  progress_counter; // Device-local (malloc_device): kernel writes via atomic_ref, host reads via D2H BCS
-    int *  merge_complete;   // Device-local (malloc_device): host writes via H2D, kernel reads via atomic_ref
-    int    device_idx;       // 0=primary, 1=secondary
-    int    n_devices;        // Total GPU devices in split (0 or 1 = no split)
+    int * progress_counter;  // Device-local (malloc_device): kernel writes via atomic_ref, host reads via D2H BCS
+    int * merge_complete;    // Device-local (malloc_device): host writes via H2D, kernel reads via atomic_ref
+    int   device_idx;        // 0=primary, 1=secondary
+    int   n_devices;         // Total GPU devices in split (0 or 1 = no split)
     std::vector<SplitOpMeta> op_meta;  // Per-matmul split metadata (indexed by plan op_idx)
 };
 
 class UnifiedKernel {
-public:
+  public:
     explicit UnifiedKernel(sycl::queue & queue);
     ~UnifiedKernel();
 
-    UnifiedKernel(const UnifiedKernel &)            = delete;
+    UnifiedKernel(const UnifiedKernel &)             = delete;
     UnifiedKernel & operator=(const UnifiedKernel &) = delete;
 
     void configure(const ggml_sycl_unified::XMXConfig & xmx_config);
@@ -2916,48 +2888,112 @@ public:
     void softmax(const void * input, void * output, int n, int stride);
 
     // Persistent Execution API
-    void begin_persistent(int n_layers, int batch_size, int hidden_dim,
-                          int intermediate_dim, int n_heads, int n_kv_heads,
-                          int head_dim, int quant_type);
-    void add_rms_norm(int layer, const void * weights, const void * input, void * output,
-                      float eps, int hidden_dim, int64_t output_bytes = 0);
-    void add_matmul(int layer, const void * weights, const void * input,
-                    void * output, MatmulType type, int M, int N, int K,
-                    int quant_type, int weight_layout,
-                    const int64_t * weight_nb = nullptr,
-                    const int64_t * input_nb = nullptr,
-                    const int64_t * output_nb = nullptr,
-                    int weight_ne2 = 1, int weight_ne3 = 1,
-                    int input_ne2 = 1, int input_ne3 = 1,
-                    int64_t output_bytes = 0);
+    void begin_persistent(int n_layers,
+                          int batch_size,
+                          int hidden_dim,
+                          int intermediate_dim,
+                          int n_heads,
+                          int n_kv_heads,
+                          int head_dim,
+                          int quant_type);
+    void add_rms_norm(int          layer,
+                      const void * weights,
+                      const void * input,
+                      void *       output,
+                      float        eps,
+                      int          hidden_dim,
+                      int64_t      output_bytes = 0);
+    void add_matmul(int             layer,
+                    const void *    weights,
+                    const void *    input,
+                    void *          output,
+                    MatmulType      type,
+                    int             M,
+                    int             N,
+                    int             K,
+                    int             quant_type,
+                    int             weight_layout,
+                    const int64_t * weight_nb    = nullptr,
+                    const int64_t * input_nb     = nullptr,
+                    const int64_t * output_nb    = nullptr,
+                    int             weight_ne2   = 1,
+                    int             weight_ne3   = 1,
+                    int             input_ne2    = 1,
+                    int             input_ne3    = 1,
+                    int64_t         output_bytes = 0);
     void add_attention(int layer, const AttentionDescriptor & desc, int64_t output_bytes = 0);
     void add_silu_mul(int layer, const void * gate, const void * up, void * output, int64_t output_bytes = 0);
-    void add_add(int layer, const void * src0, const void * src1, void * output, int n_elements, int64_t output_bytes = 0);
-    void add_mul(int layer, const void * src0, const void * src1, void * output, int n_elements, int64_t output_bytes = 0);
-    void add_get_rows(int layer, const void * src0, const void * indices, void * output,
-                      int n_elements, int64_t ne00, int64_t ne10, int64_t ne11, int64_t ne12,
-                      int64_t nb01, int64_t nb02, int64_t nb03,
-                      int64_t s10, int64_t s11, int64_t s12,
-                      int64_t s1, int64_t s2, int64_t s3, int src0_type);
-    void add_set_rows(int layer, const void * src0, const void * indices,
-                      void * dst, const SetRowsMeta & meta, int n_elements,
-                      const void * debug_ptr = nullptr, int64_t output_bytes = -1);
-    void add_strided_copy(int layer, const void * src, void * dst,
-                          const StridedCopyMeta & meta, int n_elements,
-                          int64_t output_bytes = -1);
-    void add_softmax(int layer, const void * input, const void * mask,
-                     const void * sinks, void * output, int n_rows, int n_cols,
-                     int ne01, int ne02, int ne03, float scale, float max_bias,
-                     int mask_type, int64_t mask_nb0, int64_t mask_nb1,
-                     int64_t mask_nb2, int64_t mask_nb3, int mask_ne2, int mask_ne3,
-                     int64_t output_bytes = 0);
+    void add_add(int          layer,
+                 const void * src0,
+                 const void * src1,
+                 void *       output,
+                 int          n_elements,
+                 int64_t      output_bytes = 0);
+    void add_mul(int          layer,
+                 const void * src0,
+                 const void * src1,
+                 void *       output,
+                 int          n_elements,
+                 int64_t      output_bytes = 0);
+    void add_get_rows(int          layer,
+                      const void * src0,
+                      const void * indices,
+                      void *       output,
+                      int          n_elements,
+                      int64_t      ne00,
+                      int64_t      ne10,
+                      int64_t      ne11,
+                      int64_t      ne12,
+                      int64_t      nb01,
+                      int64_t      nb02,
+                      int64_t      nb03,
+                      int64_t      s10,
+                      int64_t      s11,
+                      int64_t      s12,
+                      int64_t      s1,
+                      int64_t      s2,
+                      int64_t      s3,
+                      int          src0_type);
+    void add_set_rows(int                 layer,
+                      const void *        src0,
+                      const void *        indices,
+                      void *              dst,
+                      const SetRowsMeta & meta,
+                      int                 n_elements,
+                      const void *        debug_ptr    = nullptr,
+                      int64_t             output_bytes = -1);
+    void add_strided_copy(int                     layer,
+                          const void *            src,
+                          void *                  dst,
+                          const StridedCopyMeta & meta,
+                          int                     n_elements,
+                          int64_t                 output_bytes = -1);
+    void add_softmax(int          layer,
+                     const void * input,
+                     const void * mask,
+                     const void * sinks,
+                     void *       output,
+                     int          n_rows,
+                     int          n_cols,
+                     int          ne01,
+                     int          ne02,
+                     int          ne03,
+                     float        scale,
+                     float        max_bias,
+                     int          mask_type,
+                     int64_t      mask_nb0,
+                     int64_t      mask_nb1,
+                     int64_t      mask_nb2,
+                     int64_t      mask_nb3,
+                     int          mask_ne2,
+                     int          mask_ne3,
+                     int64_t      output_bytes = 0);
     void add_rope(int layer, const RopeDescriptor & desc, int64_t output_bytes = 0);
     void set_persistent_debug_attn(float * debug_ptr, int layer, int debug_floats);
     void set_persistent_debug_rms(float * debug_ptr, int layer, int hidden_dim, int * flag);
     void set_persistent_debug_matmul(float * debug_ptr, int layer, MatmulType type, int out_dim, int * flag);
     void set_persistent_debug_hash(uint64_t * debug_ptr, int debug_bytes);
-    void add_temp_device_alloc(void * ptr, size_t bytes);
-    void add_temp_device_alloc_handle(const ggml_sycl::alloc_handle & handle);
+    void add_temp_device_handle(ggml_sycl::mem_handle handle, size_t bytes);
     void execute_persistent();
     // Graph overhead benchmark: measures per-node SYCL graph replay latency.
     // Called once on first persistent token to determine if micro-graph approach
@@ -2974,32 +3010,55 @@ public:
     void cancel_persistent();
 
     // Plan caching: reuse operation sequence between TG tokens
-    bool has_cached_plan() const;
-    void begin_plan_update();
-    void update_op_pointers(int op_idx, const void * input, void * output,
-                            const void * aux = nullptr, const void * mask = nullptr);
-    void update_op_attention(int op_idx, const void * q, const void * k_cache,
-                             const void * v_cache, const void * mask,
-                             void * output,
-                             int64_t q_nb0, int64_t q_nb1, int64_t q_nb2, int64_t q_nb3,
-                             int64_t k_nb0, int64_t k_nb1, int64_t k_nb2, int64_t k_nb3,
-                             int64_t v_nb0, int64_t v_nb1, int64_t v_nb2, int64_t v_nb3,
-                             int seq_len);
-    void update_op_rope(int op_idx, void * q, void * k, void * rope_dst,
-                        const float * cos_cache, const float * sin_cache, int position);
-    void finish_plan_update();    // API bookend; no-op currently, validates plan readiness in future
-    void invalidate_plan_cache();
-    void * get_rows_stable_ptr(int get_rows_index, size_t bytes);
-    int cached_op_count() const;
-    OperationType plan_op_type(int op_idx) const;
-    bool get_op_descriptor(int op_idx, OperationDescriptor & out) const;
-    bool update_op_descriptor(int op_idx, const OperationDescriptor & desc);
+    bool                  has_cached_plan() const;
+    void                  begin_plan_update();
+    void                  update_op_pointers(int          op_idx,
+                                             const void * input,
+                                             void *       output,
+                                             const void * aux  = nullptr,
+                                             const void * mask = nullptr);
+    void                  update_op_attention(int          op_idx,
+                                              const void * q,
+                                              const void * k_cache,
+                                              const void * v_cache,
+                                              const void * mask,
+                                              void *       output,
+                                              int64_t      q_nb0,
+                                              int64_t      q_nb1,
+                                              int64_t      q_nb2,
+                                              int64_t      q_nb3,
+                                              int64_t      k_nb0,
+                                              int64_t      k_nb1,
+                                              int64_t      k_nb2,
+                                              int64_t      k_nb3,
+                                              int64_t      v_nb0,
+                                              int64_t      v_nb1,
+                                              int64_t      v_nb2,
+                                              int64_t      v_nb3,
+                                              int          seq_len);
+    void                  update_op_rope(int           op_idx,
+                                         void *        q,
+                                         void *        k,
+                                         void *        rope_dst,
+                                         const float * cos_cache,
+                                         const float * sin_cache,
+                                         int           position);
+    void                  finish_plan_update();  // API bookend; no-op currently, validates plan readiness in future
+    void                  invalidate_plan_cache();
+    void *                get_rows_stable_ptr(int get_rows_index, size_t bytes);
+    int                   cached_op_count() const;
+    OperationType         plan_op_type(int op_idx) const;
+    bool                  get_op_descriptor(int op_idx, OperationDescriptor & out) const;
+    bool                  update_op_descriptor(int op_idx, const OperationDescriptor & desc);
     OperationDescriptor * get_op_descriptor_mut(int op_idx);  // Direct mutable access (no copy)
 
     // Update recipe: compact per-token refresh that skips the full ggml graph walk
     bool has_update_recipe() const { return update_recipe_valid_; }
+
     void set_update_recipe(std::vector<UpdateRecipeEntry> && recipe);
+
     const std::vector<UpdateRecipeEntry> & get_update_recipe() const { return update_recipe_; }
+
     void invalidate_update_recipe();
 
     // Multi-device split: set/get per-kernel split config that populates
@@ -3008,15 +3067,18 @@ public:
     void get_split_config(KernelSplitConfig & out) const;
 
     // DAG scheduling for barrier-free persistent kernel
-    void build_dag(const std::vector<std::vector<int>> & successors,
-                   const std::vector<int> & in_degree);
-    void build_phase_schedule(const std::vector<std::vector<int>> & successors,
-                              const std::vector<int> & in_degree);
+    void build_dag(const std::vector<std::vector<int>> & successors, const std::vector<int> & in_degree);
+    void build_phase_schedule(const std::vector<std::vector<int>> & successors, const std::vector<int> & in_degree);
     void reset_dag_counters();
+
     bool has_dag() const { return dag_allocated_; }
+
     const DeviceDAGState & dag_state() const { return dag_state_; }
+
     bool has_phase_schedule() const { return phase_allocated_; }
+
     const DevicePhaseSchedule & phase_schedule() const { return phase_schedule_; }
+
     bool uses_micro_graph() const { return micro_graph_valid_; }
 
     // Scratch pool: single contiguous device allocation for all persistent op outputs.
@@ -3024,13 +3086,18 @@ public:
     // Forward-pass remap rewires the plan's data-flow chain during full_build.
     void   build_scratch_pool();
     void * scratch_output(int op_idx) const;
+    bool   scratch_output_source(int op_idx, ggml_sycl::mem_handle * handle, size_t * offset) const;
     void   free_scratch_pool();
 
     // Debug accessor: get the current plan's operations for diagnostic inspection.
     const std::vector<OperationDescriptor> & get_plan_operations() const {
         static const std::vector<OperationDescriptor> empty;
-        if (current_plan_) return current_plan_->operations;
-        if (!cached_ops_.empty()) return cached_ops_;
+        if (current_plan_) {
+            return current_plan_->operations;
+        }
+        if (!cached_ops_.empty()) {
+            return cached_ops_;
+        }
         return empty;
     }
 
@@ -3038,7 +3105,9 @@ public:
     // Used by extract_persistent_plan to set input_source_op/aux_source_op.
     std::vector<OperationDescriptor> & get_plan_operations_mut() {
         static std::vector<OperationDescriptor> empty;
-        if (current_plan_) return current_plan_->operations;
+        if (current_plan_) {
+            return current_plan_->operations;
+        }
         return empty;
     }
 
@@ -3046,13 +3115,37 @@ public:
     // plan extraction.  The source is identified by plan op index so that
     // build_scratch_pool() remap is handled transparently via scratch_outputs_.
     struct DeferredCopy {
-        int    source_op_idx;  // plan op whose scratch output is the copy source (-1 = use src_ptr)
-        void * src_ptr;        // fallback source pointer when source_op_idx < 0
-        void * dst;            // destination pointer (ggml output buffer, not remapped)
-        size_t bytes;          // number of bytes to copy
+        int                   source_op_idx;  // plan op whose scratch output is the copy source (-1 = use src_ptr)
+        void *                src_ptr;        // fallback source pointer when source_op_idx < 0
+        void *                dst;            // destination pointer (ggml output buffer, not remapped)
+        size_t                bytes;          // number of bytes to copy
+        ggml_sycl::mem_handle src_handle;     // fallback source owner when source_op_idx < 0
+        size_t                src_offset;     // byte offset within src_handle
+        ggml_sycl::mem_handle dst_handle;     // destination owner retained by the async copy
+        size_t                dst_offset;     // byte offset within dst_handle
     };
+
+#ifdef UNIFIED_KERNEL_TEST_STANDALONE
     void add_deferred_copy(int source_op_idx, void * src_ptr, void * dst, size_t bytes);
+#endif
+    void add_deferred_copy_handles(void *                debug_src,
+                                   void *                debug_dst,
+                                   size_t                bytes,
+                                   ggml_sycl::mem_handle src_handle,
+                                   size_t                src_offset,
+                                   ggml_sycl::mem_handle dst_handle,
+                                   size_t                dst_offset);
+    void add_deferred_copy_handles(int                   source_op_idx,
+                                   void *                debug_src,
+                                   void *                debug_dst,
+                                   size_t                bytes,
+                                   ggml_sycl::mem_handle src_handle,
+                                   size_t                src_offset,
+                                   ggml_sycl::mem_handle dst_handle,
+                                   size_t                dst_offset);
+
     void clear_deferred_copies() { deferred_copies_.clear(); }
+
     void execute_deferred_copies();
 
     // Launch persistent kernel asynchronously (does NOT wait for completion).
@@ -3071,27 +3164,26 @@ public:
     bool            is_building_plan() const;
     PersistentStats get_last_stats() const;
 
-private:
-    sycl::queue &                    queue_;
-    int                              device_id_ = -1;
-    size_t                           runtime_tracked_bytes_ = 0;
-    ggml_sycl_unified::XMXConfig     xmx_config_;
-    bool                             xmx_configured_ = false;
+  private:
+    sycl::queue &                queue_;
+    int                          device_id_             = -1;
+    size_t                       runtime_tracked_bytes_ = 0;
+    ggml_sycl_unified::XMXConfig xmx_config_;
+    bool                         xmx_configured_ = false;
 
-    std::unique_ptr<PersistentPlan>  current_plan_;
-    PersistentStats                  last_stats_;
+    std::unique_ptr<PersistentPlan> current_plan_;
+    PersistentStats                 last_stats_;
 
     // Plan caching
-    std::vector<OperationDescriptor> cached_ops_;
-    PersistentPlan                   cached_plan_template_;
-    std::vector<std::pair<void *, size_t>> cached_temp_device_allocs_;
-    std::unordered_map<void *, ggml_sycl::alloc_handle> cached_temp_device_alloc_handles_;
-    size_t                                               cached_temp_device_alloc_bytes_ = 0;
-    bool                             plan_cache_valid_ = false;
+    std::vector<OperationDescriptor>   cached_ops_;
+    PersistentPlan                     cached_plan_template_;
+    std::vector<ggml_sycl::mem_handle> cached_temp_device_handles_;
+    size_t                             cached_temp_device_alloc_bytes_ = 0;
+    bool                               plan_cache_valid_               = false;
 
     // Update recipe: compact per-token refresh (see UpdateRecipeEntry)
-    std::vector<UpdateRecipeEntry>   update_recipe_;
-    bool                             update_recipe_valid_ = false;
+    std::vector<UpdateRecipeEntry> update_recipe_;
+    bool                           update_recipe_valid_ = false;
 
     // Device ops table pool (DeviceOperation * — defined in unified-kernel.cpp)
     void * d_ops_pool_      = nullptr;
@@ -3112,57 +3204,62 @@ private:
     int              cached_total_tiles_  = 0;
 
     // Batched sync counter (tile_counter + barrier_counter + barrier_sense)
-    int *  sync_block_      = nullptr;
+    int * sync_block_ = nullptr;
 
     // GET_ROWS stable copy pools (one per GET_ROWS node in graph).
     // Multiple GET_ROWS can appear in the graph (token embedding + intermediate lookups).
     // Each needs its own buffer to avoid data clobbering.
     struct GetRowsSlot {
-        void * ptr  = nullptr;
-        size_t size = 0;
+        void *     ptr  = nullptr;
+        size_t     size = 0;
+        mem_handle handle;
     };
+
     std::vector<GetRowsSlot> get_rows_slots_;
 
     // Scratch pool for persistent kernel — eliminates ggml buffer aliasing
     void *              scratch_pool_      = nullptr;
     size_t              scratch_pool_size_ = 0;
-    std::vector<void *> scratch_outputs_;    // per-op scratch pointers (nullptr = use ggml)
+    std::vector<void *> scratch_outputs_;  // per-op scratch pointers (nullptr = use ggml)
+    std::vector<size_t> scratch_output_offsets_;
 
     // Final output copy-back: the ggml buffer destination for logits.
     // Set once during the first build_scratch_pool (full_build) when op.output
     // still points to the ggml tensor buffer. On subsequent fast-path tokens,
     // op.output is already remapped to scratch, so we reuse this cached pointer.
-    void *              final_output_ggml_dst_ = nullptr;
+    void *     final_output_ggml_dst_ = nullptr;
+    mem_handle final_output_ggml_dst_handle_;
+    size_t     final_output_ggml_dst_offset_ = 0;
 
     // Deferred CPY nodes — executed after persistent kernel, sources remapped by scratch pool
     std::vector<DeferredCopy> deferred_copies_;
 
-    void *  persistent_buffers_[4] = {nullptr, nullptr, nullptr, nullptr};
-    int *   tile_counter_          = nullptr;
-    int *   barrier_counter_       = nullptr;
-    int *   barrier_sense_         = nullptr;
-    size_t  persistent_buffer_size_ = 0;
+    void * persistent_buffers_[4]  = { nullptr, nullptr, nullptr, nullptr };
+    int *  tile_counter_           = nullptr;
+    int *  barrier_counter_        = nullptr;
+    int *  barrier_sense_          = nullptr;
+    size_t persistent_buffer_size_ = 0;
 
     // Multi-device split configuration (set by set_split_config, consumed by launch)
-    KernelSplitConfig      split_config_;
-    bool                   split_config_set_   = false;
+    KernelSplitConfig split_config_;
+    bool              split_config_set_ = false;
 
     // DAG scheduling state
-    DeviceDAGState         dag_state_          = {};
-    bool                   dag_allocated_      = false;
-    int                    dag_pool_n_ops_     = 0;
-    int                    dag_pool_n_edges_   = 0;
-    std::vector<int>       host_initial_ready_counter_;
-    std::vector<int>       host_n_tiles_;
+    DeviceDAGState   dag_state_        = {};
+    bool             dag_allocated_    = false;
+    int              dag_pool_n_ops_   = 0;
+    int              dag_pool_n_edges_ = 0;
+    std::vector<int> host_initial_ready_counter_;
+    std::vector<int> host_n_tiles_;
 
     // Phase-based scheduling state (replaces DAG scan with O(1) tile claiming)
-    DevicePhaseSchedule    phase_schedule_     = {};
-    bool                   phase_allocated_    = false;
-    int                    phase_pool_n_ops_   = 0;
-    int                    phase_pool_n_phases_ = 0;
+    DevicePhaseSchedule           phase_schedule_      = {};
+    bool                          phase_allocated_     = false;
+    int                           phase_pool_n_ops_    = 0;
+    int                           phase_pool_n_phases_ = 0;
     std::vector<DevicePhaseEntry> host_phase_entries_;
-    std::vector<int>       host_phase_offset_;
-    std::vector<int>       host_phase_tiles_;
+    std::vector<int>              host_phase_offset_;
+    std::vector<int>              host_phase_tiles_;
     // Original (pre-fusion-remapping) phase data from build_phase_schedule.
     // launch_persistent_kernel remaps plan indices -> device indices each token,
     // modifying host_phase_entries/offset/tiles. Without these originals,
@@ -3173,16 +3270,16 @@ private:
     std::vector<int>              orig_phase_tiles_;
 
     // Two-tier light barrier state
-    std::vector<int>       host_phase_type_;      // [n_phases] 0=HEAVY, 1=LIGHT
-    int *                  light_flags_         = nullptr;  // [max_phases] device-alloc completion flags
-    int                    light_flags_size_    = 0;        // Current allocation size in elements
+    std::vector<int> host_phase_type_;             // [n_phases] 0=HEAVY, 1=LIGHT
+    int *            light_flags_      = nullptr;  // [max_phases] device-alloc completion flags
+    int              light_flags_size_ = 0;        // Current allocation size in elements
 
     // Role-based WG specialization state
-    DeviceRoleSchedule     role_schedule_       = {};
-    bool                   role_allocated_       = false;
-    int                    role_pool_n_elem_     = 0;
-    int                    role_pool_n_matmul_   = 0;
-    int                    role_pool_n_sync_     = 0;
+    DeviceRoleSchedule         role_schedule_      = {};
+    bool                       role_allocated_     = false;
+    int                        role_pool_n_elem_   = 0;
+    int                        role_pool_n_matmul_ = 0;
+    int                        role_pool_n_sync_   = 0;
     std::vector<RoleSegment>   host_elem_segments_;
     std::vector<RoleSegment>   host_matmul_segments_;
     std::vector<RoleSyncPoint> host_sync_points_;
@@ -3192,8 +3289,8 @@ private:
     void free_persistent_buffers();
     bool persistent_use_split_barrier() const;
     bool persistent_dispatch_uses_dag() const;
-    int persistent_matmul_tile_cols(OperationType type, int N, int K) const;
-    int persistent_num_workgroups(int total_tiles, bool has_attention, bool has_ffn, bool use_split_barrier) const;
+    int  persistent_matmul_tile_cols(OperationType type, int N, int K) const;
+    int  persistent_num_workgroups(int total_tiles, bool has_attention, bool has_ffn, bool use_split_barrier) const;
     void launch_persistent_kernel(bool build_only = false);
     void build_role_schedule(const std::vector<DeviceOperation> & host_ops);
 
@@ -3206,17 +3303,17 @@ private:
     // Forward-declared opaque type to avoid exposing SYCL graph extension headers in the .hpp
     struct MicroGraphState;
     std::unique_ptr<MicroGraphState> micro_graph_;
-    int *  micro_tile_counters_     = nullptr;  // [n_phases] per-phase tile counters (device alloc)
-    int    micro_tile_counters_n_   = 0;        // Allocated count
-    int *  micro_generation_        = nullptr;  // Generation counter (malloc_host), incremented per token
-    bool   micro_graph_valid_       = false;    // True when recorded graph matches current plan
+    int * micro_tile_counters_   = nullptr;  // [n_phases] per-phase tile counters (device alloc)
+    int   micro_tile_counters_n_ = 0;        // Allocated count
+    int * micro_generation_      = nullptr;  // Generation counter (malloc_host), incremented per token
+    bool  micro_graph_valid_     = false;    // True when recorded graph matches current plan
 
     // MMVQ micro-graph: Q8_1 SOA activation buffers for MMVQ kernel dispatch
     // Allocated once when MMVQ graph mode is enabled, reused across tokens.
     // Two buffers for ping-pong: attn_norm→{Q,K,V,O} uses buf[0],
     // ffn_norm→{gate,up,down} uses buf[1].  Lifetimes don't overlap within a layer.
-    void * mmvq_q8_bufs_[2]       = {nullptr, nullptr};
-    size_t mmvq_q8_buf_size_      = 0;   // Size of each buffer in bytes
+    void * mmvq_q8_bufs_[2]  = { nullptr, nullptr };
+    size_t mmvq_q8_buf_size_ = 0;  // Size of each buffer in bytes
 
     // Temporary scratch for split GATE_UP_SILU: gate_output and up_output
     // Each is intermediate_dim floats.  Allocated alongside Q8 buffers.
@@ -3227,31 +3324,31 @@ private:
     // Allocation handles — replace from_arena/from_pool routing booleans.
     // unified_free(handle) dispatches to zone_free (TLSF), pool free, or sycl::free.
     // An empty handle (ptr==nullptr) is a no-op in unified_free.
-    alloc_handle persistent_buf_allocs_[4] = {};    // persistent_buffers_[4]
-    alloc_handle sync_block_alloc_         = {};    // sync_block_ (3 ints)
-    alloc_handle dag_ready_counter_alloc_  = {};    // dag_state_.ready_counter
-    alloc_handle dag_tile_claimed_alloc_   = {};    // dag_state_.tile_claimed
-    alloc_handle dag_tiles_done_alloc_     = {};    // dag_state_.tiles_done
-    alloc_handle dag_completed_alloc_      = {};    // dag_state_.completed_count
-    alloc_handle dag_successor_off_alloc_  = {};    // dag_state_.successor_offset (pinned)
-    alloc_handle dag_successor_list_alloc_ = {};    // dag_state_.successor_list (pinned)
-    alloc_handle dag_n_tiles_alloc_        = {};    // dag_state_.n_tiles (pinned)
-    alloc_handle scratch_pool_alloc_       = {};    // scratch_pool_
-    alloc_handle get_rows_alloc_           = {};    // get_rows_slots_ (per-slot, shared handle)
-    alloc_handle role_sync_alloc_          = {};    // role_schedule_.sync_flags
-    alloc_handle role_elem_alloc_          = {};    // role_schedule_.elem_segments (pinned)
-    alloc_handle role_matmul_alloc_        = {};    // role_schedule_.matmul_segments (pinned)
-    alloc_handle micro_tile_counters_alloc_= {};    // micro_tile_counters_
-    alloc_handle micro_gen_alloc_          = {};    // micro_generation_ (pinned)
-    alloc_handle mmvq_q8_buf_allocs_[2]   = {};    // mmvq_q8_bufs_[2]
-    alloc_handle mmvq_gate_scratch_alloc_  = {};    // mmvq_gate_scratch_
-    alloc_handle mmvq_up_scratch_alloc_    = {};    // mmvq_up_scratch_
-    alloc_handle light_flags_alloc_        = {};    // light_flags_
-    alloc_handle phase_entries_alloc_      = {};    // phase_schedule_.entries (pinned)
-    alloc_handle phase_offset_alloc_       = {};    // phase_schedule_.phase_offset (pinned)
-    alloc_handle phase_tiles_alloc_        = {};    // phase_schedule_.phase_tiles (pinned)
-    alloc_handle phase_type_alloc_         = {};    // phase_schedule_.phase_type (pinned)
-    alloc_handle ops_pool_alloc_           = {};    // d_ops_pool_ (pinned)
+    mem_handle dag_ready_counter_handle_;          // dag_state_.ready_counter
+    mem_handle dag_tile_claimed_handle_;           // dag_state_.tile_claimed
+    mem_handle dag_tiles_done_handle_;             // dag_state_.tiles_done
+    mem_handle dag_completed_handle_;              // dag_state_.completed_count
+    mem_handle dag_successor_off_handle_;          // dag_state_.successor_offset (pinned)
+    mem_handle dag_successor_list_handle_;         // dag_state_.successor_list (pinned)
+    mem_handle dag_n_tiles_handle_;                // dag_state_.n_tiles (pinned)
+    mem_handle dag_initial_ready_counter_handle_;  // host-pinned reset source for ready_counter
+    mem_handle persistent_buf_handles_[4];         // persistent_buffers_[4]
+    mem_handle sync_block_handle_;                 // sync_block_ (3 ints)
+    mem_handle scratch_pool_handle_;               // scratch_pool_
+    mem_handle role_sync_handle_;                  // role_schedule_.sync_flags
+    mem_handle role_elem_handle_;                  // role_schedule_.elem_segments (pinned)
+    mem_handle role_matmul_handle_;                // role_schedule_.matmul_segments (pinned)
+    mem_handle micro_tile_counters_handle_;        // micro_tile_counters_
+    mem_handle micro_gen_handle_;                  // micro_generation_ (pinned)
+    mem_handle mmvq_q8_buf_handles_[2];            // mmvq_q8_bufs_[2]
+    mem_handle mmvq_gate_scratch_handle_;          // mmvq_gate_scratch_
+    mem_handle mmvq_up_scratch_handle_;            // mmvq_up_scratch_
+    mem_handle light_flags_handle_;                // light_flags_
+    mem_handle phase_entries_handle_;              // phase_schedule_.entries (pinned)
+    mem_handle phase_offset_handle_;               // phase_schedule_.phase_offset (pinned)
+    mem_handle phase_tiles_handle_;                // phase_schedule_.phase_tiles (pinned)
+    mem_handle phase_type_handle_;                 // phase_schedule_.phase_type (pinned)
+    mem_handle ops_pool_handle_;                   // d_ops_pool_ (pinned)
 };
 
 }  // namespace ggml_sycl

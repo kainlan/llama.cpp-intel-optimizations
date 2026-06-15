@@ -108,10 +108,10 @@ cmake --build build --target test-tiled-weight-loading -j 8
 ### Run
 ```bash
 # Run directly
-ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-tiled-weight-loading
+ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-tiled-weight-loading
 
 # Run via ctest
-ONEAPI_DEVICE_SELECTOR=level_zero:1 ctest -R test-tiled-weight-loading -V
+ONEAPI_DEVICE_SELECTOR=level_zero:0 ctest -R test-tiled-weight-loading -V
 ```
 
 ## Requirements

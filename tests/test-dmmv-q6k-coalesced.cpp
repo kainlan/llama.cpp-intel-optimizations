@@ -2,7 +2,7 @@
 // Test that Q6_K DMMV with coalesced layout produces same output as CPU backend.
 //
 // Build: cmake --build build --target test-dmmv-q6k-coalesced
-// Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-dmmv-q6k-coalesced
+// Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-dmmv-q6k-coalesced
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"

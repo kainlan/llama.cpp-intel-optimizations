@@ -1215,14 +1215,24 @@ private:
             // 1. It's not explicitly disabled via --reasoning off
             // 2. The chat template supports it
             const bool template_supports_thinking = params_base.use_jinja && common_chat_templates_support_enable_thinking(chat_templates.get());
-            const bool enable_thinking = params_base.enable_reasoning != 0 && template_supports_thinking;
+            const bool budget_disables_thinking = params_base.sampling.reasoning_budget_tokens == 0;
+            const bool enable_thinking = params_base.enable_reasoning != 0 && !budget_disables_thinking && template_supports_thinking;
             SRV_INF("%s: chat template, thinking = %d\n", __func__, enable_thinking);
+
+            std::map<std::string, std::string> chat_template_kwargs = params_base.default_template_kwargs;
+            if (budget_disables_thinking && params_base.enable_reasoning != 1) {
+                chat_template_kwargs["enable_thinking"] = "false";
+                chat_template_kwargs["llama_force_final_channel"] = "true";
+            }
+            if (budget_disables_thinking && chat_template_kwargs.find("reasoning_effort") == chat_template_kwargs.end()) {
+                chat_template_kwargs["reasoning_effort"] = "\"low\"";
+            }
 
             chat_params = {
                 /* use_jinja             */ params_base.use_jinja,
                 /* prefill_assistant     */ params_base.prefill_assistant,
                 /* reasoning_format      */ params_base.reasoning_format,
-                /* chat_template_kwargs  */ params_base.default_template_kwargs,
+                /* chat_template_kwargs  */ std::move(chat_template_kwargs),
                 /* tmpls                 */ std::move(chat_templates),
                 /* allow_image           */ mctx ? mtmd_support_vision(mctx) : false,
                 /* allow_audio           */ mctx ? mtmd_support_audio (mctx) : false,

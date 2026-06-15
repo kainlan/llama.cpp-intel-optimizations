@@ -166,6 +166,13 @@ struct ggml_sycl_tensor_inventory {
     // Double-buffered FP16 weight staging needed by the PP dequant prefetch pipeline.
     // Computed from the largest quantized weight tensor as 2 x (n_elements * sizeof(fp16)).
     size_t                         pp_pipeline_scratch_bytes;
+    // Ring-backed PP MoE oneDNN staging planned from the model inventory.
+    // Slots hold one dequantized expert weight, one f16 activation tile, and one f32 output tile.
+    size_t                         pp_moe_onednn_weight_slot_bytes;
+    size_t                         pp_moe_onednn_activation_slot_bytes;
+    size_t                         pp_moe_onednn_output_slot_bytes;
+    size_t                         pp_moe_onednn_scratch_bytes;
+    uint32_t                       pp_moe_onednn_ring_depth;
     int                            n_expert;       // Total experts per layer (0 for dense models)
     int                            n_expert_used;  // Experts activated per token (0 for dense models)
     // Model hparams for KV cache size estimation (used by VRAM budget coordination)

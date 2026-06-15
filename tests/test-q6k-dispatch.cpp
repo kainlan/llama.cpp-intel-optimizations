@@ -2,7 +2,7 @@
 // This test exercises the full dispatch path including SoA/AoS handling
 //
 // Build: cmake --build build --target test-q6k-dispatch
-// Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-q6k-dispatch
+// Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-q6k-dispatch
 //
 // Environment variables:
 //   GGML_SYCL_DISABLE_GRAPH=1 - Disable SYCL graphs

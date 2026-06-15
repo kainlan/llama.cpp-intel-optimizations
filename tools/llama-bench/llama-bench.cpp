@@ -408,6 +408,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("\n");
     printf("options:\n");
     printf("  -h, --help\n");
+    printf("  --version                                  show version and build info\n");
     printf("  --numa <distribute|isolate|numactl>         numa mode (default: disabled)\n");
     printf("  -r, --repetitions <n>                       number of times to repeat each test (default: %d)\n", cmd_params_defaults.reps);
     printf("  --prio <-1|0|1|2|3>                         process/thread priority (default: %d)\n", cmd_params_defaults.prio);
@@ -425,9 +426,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
 #endif
-    if (llama_supports_rpc()) {
-        printf("  -rpc, --rpc <rpc_servers>                   register RPC devices (comma separated)\n");
-    }
+    printf("  -rpc, --rpc <rpc_servers>                   register RPC devices (comma separated, when RPC is supported)\n");
     printf("\n");
     printf("test parameters:\n");
     printf("  -m, --model <filename>                      (default: %s)\n", join(cmd_params_defaults.model, ",").c_str());
@@ -471,6 +470,24 @@ static void print_usage(int /* argc */, char ** argv) {
         "Multiple values can be given for each parameter by separating them with ','\n"
         "or by specifying the parameter multiple times. Ranges can be given as\n"
         "'first-last' or 'first-last+step' or 'first-last*mult'.\n");
+}
+
+static bool handle_early_exit_args(int argc, char ** argv) {
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg.compare(0, 2, "--") == 0) {
+            std::replace(arg.begin(), arg.end(), '_', '-');
+        }
+        if (arg == "-h" || arg == "--help") {
+            print_usage(argc, argv);
+            return true;
+        }
+        if (arg == "--version") {
+            fprintf(stdout, "version: %d (%s)\n", llama_build_number(), llama_commit());
+            return true;
+        }
+    }
+    return false;
 }
 
 static ggml_type ggml_type_from_name(const std::string & s) {
@@ -2148,6 +2165,10 @@ int llama_bench(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
     // try to set locale for unicode characters in markdown
     std::setlocale(LC_CTYPE, ".UTF-8");
+
+    if (handle_early_exit_args(argc, argv)) {
+        return 0;
+    }
 
 #if !defined(NDEBUG)
     fprintf(stderr, "warning: asserts enabled, performance may be affected\n");

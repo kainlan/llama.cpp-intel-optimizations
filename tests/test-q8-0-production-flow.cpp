@@ -9,7 +9,7 @@
  * 2. Decode phase: Generate tokens one at a time (DMMV, batch = 1)
  *
  * Build: cmake --build build --target test-q8-0-production-flow
- * Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-q8-0-production-flow
+ * Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-q8-0-production-flow
  */
 
 #include <cstdio>

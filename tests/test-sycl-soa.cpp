@@ -2,7 +2,7 @@
 // Tests: CPU reference vs SYCL with SoA auto-conversion
 //
 // Build: cmake --build build --target test-sycl-soa
-// Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-sycl-soa
+// Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-sycl-soa
 
 #include <cstdio>
 #include <cstdlib>

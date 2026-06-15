@@ -28,6 +28,9 @@ SMOKE_CTX="${SMOKE_CTX:-512}"
 ONEAPI_SETVARS="${ONEAPI_SETVARS:-/opt/intel/oneapi/setvars.sh}"
 LOCK_FILE="${LOCK_FILE:-/tmp/sycl-moe-regression-harness.lock}"
 
+# shellcheck disable=SC1091
+source "$ROOT/scripts/sycl-gpu-preflight.sh"
+
 usage() {
     cat <<'EOF'
 Usage: scripts/sycl-moe-regression-harness.sh
@@ -141,6 +144,7 @@ run_case() {
     local log="$OUTDIR/${name}.log"
 
     echo "== $name =="
+    sycl_gpu_preflight_check "$selector"
     env ONEAPI_DEVICE_SELECTOR="$selector" "${env_args[@]}" \
         "$BENCH" -m "$model" -p "$prompt" -n "$tokens" -ngl "$NGL" -r "$reps" -fa "$fa" --tg-batch "$tg_batch" \
         >"$log" 2>&1
@@ -161,6 +165,7 @@ run_smoke() {
     local log="$OUTDIR/${name}.log"
 
     echo "== $name =="
+    sycl_gpu_preflight_check "$selector"
     if env ONEAPI_DEVICE_SELECTOR="$selector" "$COMPLETION" -m "$model" "$@" >"$log" 2>&1; then
         printf "%s\t%s\tpass\t%s\n" "$name" "$selector" "$log" | tee -a "$smoke_summary"
     else

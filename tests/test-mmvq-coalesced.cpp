@@ -1,6 +1,6 @@
 // Unit tests for coalesced MMVQ kernels (Q4_0 and Q6_K)
 // Build: cmake --build build --target test-mmvq-coalesced
-// Run: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-mmvq-coalesced
+// Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-mmvq-coalesced
 
 #include <cassert>
 #include <cmath>
