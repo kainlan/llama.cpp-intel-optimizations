@@ -1,6 +1,7 @@
 #include "llama-model-loader.h"
 
 #include "ggml-alloc.h"
+#include "ggml-backend.h"
 #include "ggml.h"
 #ifdef GGML_USE_SYCL
 #    include "ggml-sycl.h"
@@ -19,6 +20,17 @@
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
+
+#ifdef GGML_USE_SYCL
+static bool llama_model_loader_sycl_hooks_enabled() {
+    return !ggml_backend_device_backends_disabled();
+}
+
+static bool llama_model_loader_dev_is_sycl(ggml_backend_dev_t dev) {
+    return llama_model_loader_sycl_hooks_enabled() && dev != nullptr &&
+           ggml_backend_dev_backend_reg(dev) == ggml_backend_sycl_reg();
+}
+#endif
 
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
@@ -901,7 +913,7 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
     }
 
 #ifdef GGML_USE_SYCL
-    if (ggml_backend_dev_backend_reg(dev) == ggml_backend_sycl_reg() && ggml_backend_sycl_weights_evictable()) {
+    if (llama_model_loader_dev_is_sycl(dev) && ggml_backend_sycl_weights_evictable()) {
         ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
         if (host_buft && buft == host_buft) {
             return true;
@@ -1050,7 +1062,7 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
 #ifdef GGML_USE_SYCL
     if (prefer_host_weights) {
         ggml_backend_dev_t dev = buft_list->front().first;
-        if (ggml_backend_dev_backend_reg(dev) == ggml_backend_sycl_reg()) {
+        if (llama_model_loader_dev_is_sycl(dev)) {
             ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
             if (host_buft && ggml_backend_buft_is_host(host_buft) &&
                 weight_buft_supported(hparams, tensor, op, host_buft, dev)) {
@@ -1203,7 +1215,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         bool prefer_host_weights = false;
 #ifdef GGML_USE_SYCL
-        if (ggml_backend_dev_backend_reg(layer_dev) == ggml_backend_sycl_reg()) {
+        if (llama_model_loader_dev_is_sycl(layer_dev)) {
             prefer_host_weights = ggml_backend_sycl_weights_evictable();
         }
 #endif
@@ -1249,7 +1261,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         auto * buft_dev = ggml_backend_buft_get_device(buft);
         bool   allow_host_buft_with_mmap = false;
 #ifdef GGML_USE_SYCL
-        if (prefer_host_weights && buft_dev && ggml_backend_dev_backend_reg(buft_dev) == ggml_backend_sycl_reg()) {
+        if (prefer_host_weights && llama_model_loader_dev_is_sycl(buft_dev)) {
             allow_host_buft_with_mmap = true;
         }
 #endif
@@ -1279,7 +1291,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         if (!tensor || !selected_layer_dev) {
             return;
         }
-        if (ggml_backend_dev_backend_reg(selected_layer_dev) != ggml_backend_sycl_reg()) {
+        if (!llama_model_loader_dev_is_sycl(selected_layer_dev)) {
             return;
         }
 

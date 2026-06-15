@@ -92,7 +92,7 @@ namespace fs = std::filesystem;
 
 static std::atomic<bool> g_disable_device_backends{false};
 
-static bool ggml_backend_device_backends_disabled() {
+bool ggml_backend_device_backends_disabled(void) {
     if (g_disable_device_backends.load(std::memory_order_acquire)) {
         return true;
     }

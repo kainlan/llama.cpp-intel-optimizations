@@ -52,10 +52,19 @@ static bool llama_model_buft_is_sycl(ggml_backend_buffer_type_t buft) {
     return name != nullptr && std::strncmp(name, GGML_SYCL_NAME, std::strlen(GGML_SYCL_NAME)) == 0;
 }
 
+static bool llama_model_sycl_hooks_enabled() {
+    return !ggml_backend_device_backends_disabled();
+}
+
+static bool llama_model_dev_is_sycl(ggml_backend_dev_t dev) {
+    return llama_model_sycl_hooks_enabled() && dev != nullptr &&
+           ggml_backend_dev_backend_reg(dev) == ggml_backend_sycl_reg();
+}
+
 struct llama_model_sycl_loading_guard {
     bool active = false;
 
-    explicit llama_model_sycl_loading_guard(bool enabled) : active(enabled) {
+    explicit llama_model_sycl_loading_guard(bool enabled) : active(enabled && llama_model_sycl_hooks_enabled()) {
         if (active) {
             ggml_backend_sycl_set_model_loading(true);
         }
@@ -73,7 +82,7 @@ struct llama_model_sycl_loading_guard {
 
 static bool llama_model_buft_backend_is_sycl(ggml_backend_buffer_type_t buft) {
     ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-    return dev != nullptr && ggml_backend_dev_backend_reg(dev) == ggml_backend_sycl_reg();
+    return llama_model_dev_is_sycl(dev);
 }
 
 static ggml_sycl_placement_envelope llama_model_sycl_make_placement_envelope() {
@@ -168,6 +177,10 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
 static void llama_model_sycl_apply_inventory(const ggml_sycl_tensor_inventory &   inventory,
                                              const ggml_sycl_placement_envelope & envelope,
                                              bool                                 early) {
+    if (!llama_model_sycl_hooks_enabled()) {
+        return;
+    }
+
     for (int i = 0; i < ggml_backend_sycl_get_device_count(); ++i) {
         ggml_backend_t sycl_backend = ggml_backend_sycl_init(i);
         if (!sycl_backend) {
@@ -213,6 +226,9 @@ static void llama_model_sycl_add_tensor_info(std::vector<ggml_sycl_tensor_info> 
 static void llama_model_sycl_compute_early_plan(llama_model_loader &  ml,
                                                 const llama_hparams & hparams,
                                                 const char *          log_func) {
+    if (!llama_model_sycl_hooks_enabled()) {
+        return;
+    }
     if (ml.no_alloc || ml.weights_map.empty()) {
         return;
     }
@@ -246,6 +262,9 @@ static void llama_model_sycl_compute_early_plan(llama_model_loader &  ml,
 static void llama_model_sycl_set_late_inventory(llama_model_loader &  ml,
                                                 const llama_hparams & hparams,
                                                 const char *          log_func) {
+    if (!llama_model_sycl_hooks_enabled()) {
+        return;
+    }
     if (ml.no_alloc) {
         return;
     }
@@ -1307,7 +1326,7 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
     buft_list.emplace_back(dev, ggml_backend_dev_buffer_type(dev));
 
 #ifdef GGML_USE_SYCL
-    if (ggml_backend_dev_backend_reg(dev) == ggml_backend_sycl_reg() && ggml_backend_sycl_weights_evictable()) {
+    if (llama_model_dev_is_sycl(dev) && ggml_backend_sycl_weights_evictable()) {
         ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
         if (host_buft != nullptr) {
             buft_list.emplace_back(dev, host_buft);

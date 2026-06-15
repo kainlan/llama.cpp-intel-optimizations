@@ -1,5 +1,6 @@
 #include "llama-context.h"
 
+#include "ggml-backend.h"
 #include "ggml.h"
 #ifdef GGML_USE_SYCL
 #    include "ggml-sycl.h"
@@ -39,6 +40,17 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
 static bool llama_decode_trace_enabled();
 static int  llama_decode_trace_limit();
 static int  llama_decode_trace_next();
+
+#ifdef GGML_USE_SYCL
+static bool llama_context_sycl_hooks_enabled() {
+    return !ggml_backend_device_backends_disabled();
+}
+
+static bool llama_context_dev_is_sycl(ggml_backend_dev_t dev) {
+    return llama_context_sycl_hooks_enabled() && dev != nullptr &&
+           ggml_backend_dev_backend_reg(dev) == ggml_backend_sycl_reg();
+}
+#endif
 
 llama_context::llama_context(
         const llama_model & model,
@@ -261,7 +273,7 @@ llama_context::llama_context(
 #ifdef GGML_USE_SYCL
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
-            if (dev != nullptr && ggml_backend_dev_backend_reg(dev) == ggml_backend_sycl_reg()) {
+            if (llama_context_dev_is_sycl(dev)) {
                 ggml_backend_sycl_set_runtime_context(backend.get(), cparams.n_ctx, cparams.n_ubatch,
                                                       cparams.n_seq_max);
             }

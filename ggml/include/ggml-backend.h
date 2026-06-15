@@ -250,6 +250,9 @@ extern "C" {
     // Intended for explicit CPU-only runs such as --device none.
     GGML_API void ggml_backend_disable_device_backends(void);
 
+    // Returns true when device backends have been disabled for this process.
+    GGML_API bool ggml_backend_device_backends_disabled(void);
+
     // Backend (reg) enumeration
     GGML_API size_t             ggml_backend_reg_count(void);
     GGML_API ggml_backend_reg_t ggml_backend_reg_get(size_t index);

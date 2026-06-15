@@ -1,5 +1,6 @@
 #include "llama-kv-cache.h"
 
+#include "ggml-backend.h"
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-model.h"
@@ -16,6 +17,17 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+
+#ifdef GGML_USE_SYCL
+static bool llama_kv_cache_sycl_hooks_enabled() {
+    return !ggml_backend_device_backends_disabled();
+}
+
+static bool llama_kv_cache_dev_is_sycl(ggml_backend_dev_t dev) {
+    return llama_kv_cache_sycl_hooks_enabled() && dev != nullptr &&
+           ggml_backend_dev_backend_reg(dev) == ggml_backend_sycl_reg();
+}
+#endif
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -201,7 +213,11 @@ llama_kv_cache::llama_kv_cache(
         if (offload) {
             auto * dev = model.dev_layer(il);
 #ifdef GGML_USE_SYCL
-            buft = ggml_backend_sycl_kv_buffer_type_from_dev(dev);
+            if (llama_kv_cache_dev_is_sycl(dev)) {
+                buft = ggml_backend_sycl_kv_buffer_type_from_dev(dev);
+            } else {
+                buft = ggml_backend_dev_buffer_type(dev);
+            }
 #else
             buft = ggml_backend_dev_buffer_type(dev);
 #endif
@@ -218,7 +234,7 @@ llama_kv_cache::llama_kv_cache(
 
 #ifdef GGML_USE_SYCL
         ggml_backend_dev_t buft_dev = ggml_backend_buft_get_device(buft);
-        if (buft_dev != nullptr && ggml_backend_dev_backend_reg(buft_dev) == ggml_backend_sycl_reg()) {
+        if (llama_kv_cache_dev_is_sycl(buft_dev)) {
             auto & mask = sycl_kv_layer_masks[buft];
             if (mask.empty()) {
                 mask.assign(hparams.n_layer, 0);
@@ -287,8 +303,8 @@ llama_kv_cache::llama_kv_cache(
 #ifdef GGML_USE_SYCL
             ggml_backend_dev_t buft_dev = ggml_backend_buft_get_device(buft);
             auto               mask_it  = sycl_kv_layer_masks.find(buft);
-            if (buft_dev != nullptr && ggml_backend_dev_backend_reg(buft_dev) == ggml_backend_sycl_reg() &&
-                mask_it != sycl_kv_layer_masks.end() && !mask_it->second.empty()) {
+            if (llama_kv_cache_dev_is_sycl(buft_dev) && mask_it != sycl_kv_layer_masks.end() &&
+                !mask_it->second.empty()) {
                 ggml_backend_sycl_push_kv_layer_mask_from_dev(buft_dev, mask_it->second.data(),
                                                               static_cast<uint32_t>(mask_it->second.size()));
             }
