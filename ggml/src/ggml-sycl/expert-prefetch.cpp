@@ -112,6 +112,9 @@ bool ExpertPrefetcher::hint_locked(int layer_idx, int expert_idx) {
     if (!moe_get_expert_stage_info(layer_idx, expert_idx, device_id_, info)) {
         return false;
     }
+    if (!info.valid || !info.src_ptr || info.src_size == 0 || info.dst_size == 0 || info.layout != GGML_LAYOUT_SOA) {
+        return false;
+    }
 
     // Step 2: Check unified cache -- may already be READY.
     unified_cache * cache = get_unified_cache_for_device(device_id_);

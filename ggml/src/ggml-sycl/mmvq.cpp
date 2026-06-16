@@ -13218,10 +13218,15 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                 has_table_event = true;
             }
         } else {
-            const auto coverage = (!host_weights && placement_plan_active && layout != GGML_LAYOUT_MXFP4_I8) ?
-                                      moe_ptr_table_coverage::AUTO_RESOLVED_VIEW :
-                                      moe_ptr_table_coverage::SELECTED_IDS;
-            const bool skip_cpu_routed_experts = host_weights || plan_has_host_experts;
+            const bool plan_device_only =
+                placement_plan_active && !plan_has_host_experts && layout != GGML_LAYOUT_MXFP4_I8;
+            const auto coverage =
+                plan_device_only ? moe_ptr_table_coverage::AUTO_RESOLVED_VIEW : moe_ptr_table_coverage::SELECTED_IDS;
+            // Host-resident storage is not itself a CPU-route decision. When the
+            // placement plan says selected experts belong on this device, the
+            // pointer table must be derived from materialized mem_handles. Only
+            // skip missing slots when the plan actually contains host experts.
+            const bool skip_cpu_routed_experts = plan_has_host_experts;
             // force_cache_aos=true ensures experts are staged to GPU memory even for AoS layout
             // This is critical for mmap'd weights which cannot be accessed directly by GPU kernels
             GGML_SYCL_DEBUG("[MMVQ] About to call ggml_sycl_update_moe_ptr_table layout=%d\n", (int) layout);
@@ -13280,13 +13285,13 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                     }
                     if (mixed_ptrs) {
                         GGML_SYCL_DEBUG(
-                            "[MMVQ] Mixed device/host expert pointers for %s (plan=%d host=%d); "
+                            "[MMVQ] Incomplete device expert pointer table for %s (plan=%d host=%d mixed=%d null=%zu); "
                             "falling back to hybrid dispatch\n",
-                            src0->name ? src0->name : "?", placement_plan_active ? 1 : 0, host_weights ? 1 : 0);
-                        mmvq_moe_trace(src0, "mixed_expert_ptrs", ctx.device, (int) layout,
-                                       forced_layout != nullptr, batch_size, -1, host_weights, use_ptr_table,
-                                       placement_plan_active, plan_has_host_experts, ptr_count, non_device_ptrs,
-                                       null_ptrs);
+                            src0->name ? src0->name : "?", placement_plan_active ? 1 : 0, host_weights ? 1 : 0,
+                            mixed_ptrs ? 1 : 0, null_ptrs);
+                        mmvq_moe_trace(src0, "mixed_expert_ptrs", ctx.device, (int) layout, forced_layout != nullptr,
+                                       batch_size, -1, host_weights, use_ptr_table, placement_plan_active,
+                                       plan_has_host_experts, ptr_count, non_device_ptrs, null_ptrs);
                         return false;
                     }
                 }

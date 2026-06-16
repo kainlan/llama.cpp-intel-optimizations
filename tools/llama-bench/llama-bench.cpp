@@ -315,6 +315,60 @@ static std::vector<int> parse_int_range(const std::string & s) {
     return result;
 }
 
+static std::string n_gpu_layers_str(int n_gpu_layers) {
+    if (n_gpu_layers == -1) {
+        return "auto";
+    }
+    if (n_gpu_layers <= -2) {
+        return "all";
+    }
+    return std::to_string(n_gpu_layers);
+}
+
+static std::vector<int> parse_n_gpu_layers(const std::string & s) {
+    std::vector<int> result;
+
+    size_t begin = 0;
+    while (begin < s.size()) {
+        size_t      end   = s.find(',', begin);
+        std::string token = s.substr(begin, end == std::string::npos ? end : end - begin);
+
+        if (token.empty()) {
+            if (end == std::string::npos || end + 1 != s.size()) {
+                throw std::invalid_argument("invalid gpu layer count");
+            }
+            break;
+        }
+
+        if (token == "auto") {
+            result.push_back(-1);
+        } else if (token == "all") {
+            result.push_back(-2);
+        } else if (token[0] == '-') {
+            size_t pos   = 0;
+            int    value = std::stoi(token, &pos);
+            if (pos != token.size()) {
+                throw std::invalid_argument("invalid gpu layer count");
+            }
+            result.push_back(value);
+        } else {
+            auto values = parse_int_range(token);
+            result.insert(result.end(), values.begin(), values.end());
+        }
+
+        if (end == std::string::npos) {
+            break;
+        }
+        begin = end + 1;
+    }
+
+    if (result.empty()) {
+        throw std::invalid_argument("invalid gpu layer count");
+    }
+
+    return result;
+}
+
 struct cmd_params {
     std::vector<std::string>         model;
     std::vector<std::string>         hf_repo;
@@ -376,7 +430,7 @@ static const cmd_params cmd_params_defaults = {
     /* cpu_mask             */ { "0x0" },
     /* cpu_strict           */ { false },
     /* poll                 */ { 50 },
-    /* n_gpu_layers         */ { 99 },
+    /* n_gpu_layers         */ { -1 },
     /* n_cpu_moe            */ { 0 },
     /* split_mode           */ { LLAMA_SPLIT_MODE_LAYER },
     /* main_gpu             */ { 0 },
@@ -450,7 +504,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -C, --cpu-mask <hex,hex>                    (default: %s)\n", join(cmd_params_defaults.cpu_mask, ",").c_str());
     printf("  --cpu-strict <0|1>                          (default: %s)\n", join(cmd_params_defaults.cpu_strict, ",").c_str());
     printf("  --poll <0...100>                            (default: %s)\n", join(cmd_params_defaults.poll, ",").c_str());
-    printf("  -ngl, --n-gpu-layers <n>                    (default: %s)\n", join(cmd_params_defaults.n_gpu_layers, ",").c_str());
+    printf("  -ngl, --n-gpu-layers <n|auto|all>           max. number of layers to store in VRAM (default: %s)\n",
+           join(transform_to_str(cmd_params_defaults.n_gpu_layers, n_gpu_layers_str), ",").c_str());
     printf("  -ncmoe, --n-cpu-moe <n>                     (default: %s)\n", join(cmd_params_defaults.n_cpu_moe, ",").c_str());
     printf("  -sm, --split-mode <none|layer|row|tensor>   (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                         (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
@@ -732,7 +787,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     invalid_param = true;
                     break;
                 }
-                auto p = parse_int_range(argv[i]);
+                auto p = parse_n_gpu_layers(argv[i]);
                 params.n_gpu_layers.insert(params.n_gpu_layers.end(), p.begin(), p.end());
             } else if (arg == "-ncmoe" || arg == "--n-cpu-moe") {
                 if (++i >= argc) {
@@ -1783,7 +1838,7 @@ struct markdown_printer : public printer {
             return 10;
         }
         if (field == "n_gpu_layers") {
-            return 3;
+            return 4;
         }
         if (field == "n_threads") {
             return 7;
@@ -2001,6 +2056,8 @@ struct markdown_printer : public printer {
                 value = buf;
             } else if (field == "backend") {
                 value = test::get_backend();
+            } else if (field == "n_gpu_layers") {
+                value = n_gpu_layers_str(t.n_gpu_layers);
             } else if (field == "test") {
                 if (t.n_prompt > 0 && t.n_gen == 0) {
                     snprintf(buf, sizeof(buf), "pp%d", t.n_prompt);
