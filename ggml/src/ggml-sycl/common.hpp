@@ -186,13 +186,6 @@ inline bool ggml_sycl_mem_handle_has_identity(const ggml_sycl::mem_handle & hand
     return handle.valid() || handle.is_weight();
 }
 
-inline ggml_sycl::mem_handle ggml_sycl_mem_handle_identity_view(const ggml_sycl::mem_handle & handle) {
-    if (handle.is_weight()) {
-        return ggml_sycl::mem_handle::from_weight(handle.key(), handle.device());
-    }
-    return handle;
-}
-
 // Graph-safe memcpy: uses kernel-based copy during SYCL graph recording
 // to avoid memcpy nodes that L0 Mutable Command List cannot update.
 // Outside recording, use canonical mem_handle copy submission.
@@ -3085,7 +3078,7 @@ struct ggml_tensor_extra_gpu {
             return;
         }
         moe_expert_storage_record record;
-        record.handle = ggml_sycl_mem_handle_identity_view(h);
+        record.handle = std::move(h);
         if (ready_event) {
             record.has_ready_event = true;
             record.ready_event     = *ready_event;

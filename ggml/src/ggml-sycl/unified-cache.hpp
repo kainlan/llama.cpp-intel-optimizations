@@ -408,9 +408,9 @@ struct placement_plan {
     // dequant prefetch. Computed from the largest quantized weight tensor as
     // 2 x (n_elements * sizeof(fp16)). Lives in the RUNTIME zone.
     size_t   pp_pipeline_scratch_bytes           = 0;  // Zone: RUNTIME (device VRAM)
-    // PP MoE oneDNN scratch ring: future pipeline slots for the MXFP4 SOA prompt
-    // path. Slot 0 is usable by the serialized path today; additional slots are
-    // reserved so later pipelining does not change the placement budget.
+    // PP MoE oneDNN scratch ring for the MXFP4 SOA prompt path. The current
+    // prompt path serializes slot use, so the default plan budgets one reusable
+    // slot; future pipelining must raise this only when it actually overlaps use.
     size_t   pp_moe_onednn_weight_slot_bytes     = 0;  // Zone: RUNTIME (device VRAM)
     size_t   pp_moe_onednn_activation_slot_bytes = 0;  // Zone: RUNTIME (device VRAM)
     size_t   pp_moe_onednn_output_slot_bytes     = 0;  // Zone: RUNTIME (device VRAM)
@@ -1070,19 +1070,19 @@ struct cache_layout_xmx_info {
     int64_t n_tile_groups = 0;
 };
 
-    struct cache_ptr_view {
-        void *                ptr           = nullptr;
-        size_t                size          = 0;
-        ggml_layout_mode      layout        = GGML_LAYOUT_AOS;
-        int64_t               onednn_pack_m = 0;
-        cache_location        location      = cache_location::DEVICE;
-        cache_entry_type      type          = cache_entry_type::DENSE_WEIGHT;
-        int                   layer_id      = -1;
-        int                   expert_id     = -1;
-        cache_layout_xmx_info xmx_info      = {};
-        bool                  has_ready_event = false;
-        sycl::event           ready_event;
-    };
+struct cache_ptr_view {
+    void *                ptr             = nullptr;
+    size_t                size            = 0;
+    ggml_layout_mode      layout          = GGML_LAYOUT_AOS;
+    int64_t               onednn_pack_m   = 0;
+    cache_location        location        = cache_location::DEVICE;
+    cache_entry_type      type            = cache_entry_type::DENSE_WEIGHT;
+    int                   layer_id        = -1;
+    int                   expert_id       = -1;
+    cache_layout_xmx_info xmx_info        = {};
+    bool                  has_ready_event = false;
+    sycl::event           ready_event;
+};
 
 struct cache_layout_request;
 using cache_layout_fill_fn = sycl::event (*)(sycl::queue &                    queue,
@@ -1273,7 +1273,7 @@ struct unified_cache_entry {
     cache_location        location;         // DEVICE/HOST_PINNED/HOST_MMAP
     bool                  pool_allocated;   // True if device_ptr was sub-allocated from layout_pool_
     bool                  cache_budget_charged = false;  // True if this entry incremented cache used_
-    bool                  retired = false;  // Hidden from routing; erased after in_use_count reaches zero.
+    bool                  retired              = false;  // Hidden from routing; erased after in_use_count reaches zero.
     sycl::event           last_write_event;              // Event from last fill/reorder that wrote to device_ptr
     bool                  has_write_event = false;       // Whether last_write_event is valid
     // Optional shared allocation owner for entries that are views into a
@@ -1376,9 +1376,9 @@ class unified_cache {
 
     // Result of a layout-agnostic weight pointer lookup.
     struct weight_ptr_result {
-        void *           ptr       = nullptr;
-        ggml_layout_mode layout    = GGML_LAYOUT_AOS;
-        bool             on_device = false;
+        void *           ptr             = nullptr;
+        ggml_layout_mode layout          = GGML_LAYOUT_AOS;
+        bool             on_device       = false;
         bool             has_ready_event = false;
         sycl::event      ready_event;
 
@@ -1400,10 +1400,10 @@ class unified_cache {
     // This is the refcount-safe entry point for mem_handle::resolve_slow().
     // See llama.cpp-vtf7f rootcause for the lifetime contract.
     struct weight_ptr_lease_result {
-        void *                ptr       = nullptr;
-        ggml_layout_mode      layout    = GGML_LAYOUT_AOS;
-        bool                  on_device = false;
-        unified_cache_entry * entry     = nullptr;  // opaque handle for lease release
+        void *                ptr             = nullptr;
+        ggml_layout_mode      layout          = GGML_LAYOUT_AOS;
+        bool                  on_device       = false;
+        unified_cache_entry * entry           = nullptr;  // opaque handle for lease release
         bool                  has_ready_event = false;
         sycl::event           ready_event;
 
@@ -2436,6 +2436,7 @@ class unified_cache {
     sycl::event submit_barrier_all();
     void        process_deferred_frees();
     size_t      finalize_retired_entries_locked();
+    void        remap_or_erase_id_mapping_locked(const ggml_sycl_cache_id & id, const unified_cache_key & removed_key);
     void        enqueue_deferred_free(void * ptr, size_t size);
     void        enqueue_deferred_free(const managed_alloc_ref & handle);
     void        enqueue_deferred_host_free(void * ptr, size_t size, const sycl::event & event);

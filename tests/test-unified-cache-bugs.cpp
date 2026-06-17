@@ -3,11 +3,11 @@
 // Usage:
 //   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-unified-cache-bugs
 
-#include "ggml-sycl.h"
-#include "ggml-sycl/unified-cache.hpp"
-#include "ggml-sycl/ggml-sycl-test.hpp"
-#include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-sycl.h"
+#include "ggml-sycl/ggml-sycl-test.hpp"
+#include "ggml-sycl/unified-cache.hpp"
+#include "ggml.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -68,8 +68,8 @@ static bool test_realloc_failure_keeps_entry(sycl::queue & q) {
 
     bool   needs_fill = false;
     void * ptr =
-        cache.ensure_cached_alloc(key, data.data(), orig_size, orig_size, ggml_sycl::cache_entry_type::DENSE_WEIGHT,
-                                  -1, -1, GGML_LAYOUT_AOS, false, &needs_fill);
+        cache.ensure_cached_alloc(key, data.data(), orig_size, orig_size, ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1,
+                                  -1, GGML_LAYOUT_AOS, false, &needs_fill);
     if (!ptr) {
         fprintf(stderr, "Failed to allocate initial cache entry\n");
         return false;
@@ -78,9 +78,9 @@ static bool test_realloc_failure_keeps_entry(sycl::queue & q) {
     const size_t used_before = cache.used();
     const size_t huge_alloc  = 1ULL << 40;  // 1 TB, should fail on all current devices
 
-    void * realloc_ptr = cache.ensure_cached_alloc(key, data.data(), orig_size, huge_alloc,
-                                                   ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS,
-                                                   false, &needs_fill);
+    void * realloc_ptr =
+        cache.ensure_cached_alloc(key, data.data(), orig_size, huge_alloc, ggml_sycl::cache_entry_type::DENSE_WEIGHT,
+                                  -1, -1, GGML_LAYOUT_AOS, false, &needs_fill);
     if (realloc_ptr) {
         fprintf(stderr, "Unexpectedly succeeded in huge realloc\n");
         return false;
@@ -108,9 +108,9 @@ static bool test_realloc_eviction_failure_keeps_entry(sycl::queue & q) {
     ggml_sycl_cache_id       key = ggml_sycl::test_make_cache_id(data.data());
 
     bool   needs_fill = false;
-    void * ptr        = cache.ensure_cached_alloc(key, data.data(), data.size(), data.size(),
-                                                  ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS, false,
-                                                  &needs_fill);
+    void * ptr =
+        cache.ensure_cached_alloc(key, data.data(), data.size(), data.size(), ggml_sycl::cache_entry_type::DENSE_WEIGHT,
+                                  -1, -1, GGML_LAYOUT_AOS, false, &needs_fill);
     if (!ptr) {
         fprintf(stderr, "Failed to allocate initial cache entry for eviction test\n");
         return false;
@@ -120,8 +120,8 @@ static bool test_realloc_eviction_failure_keeps_entry(sycl::queue & q) {
     const size_t used_before = cache.used();
 
     void * realloc_ptr =
-        cache.ensure_cached_alloc(key, data.data(), data.size(), 2048, ggml_sycl::cache_entry_type::DENSE_WEIGHT,
-                                  -1, -1, GGML_LAYOUT_AOS, false, &needs_fill);
+        cache.ensure_cached_alloc(key, data.data(), data.size(), 2048, ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1,
+                                  -1, GGML_LAYOUT_AOS, false, &needs_fill);
 
     if (realloc_ptr) {
         fprintf(stderr, "Unexpectedly succeeded in realloc with eviction failure\n");
@@ -150,8 +150,8 @@ static bool test_direct_stage_weight_basic(sycl::queue & q) {
 
     ggml_sycl_cache_id key = ggml_sycl::test_make_cache_id(data.data());
 
-    auto result = cache.direct_stage_weight(key, data.data(), data.size(), data.size(),
-                                            GGML_LAYOUT_AOS, nullptr, nullptr, &q);
+    auto result =
+        cache.direct_stage_weight(key, data.data(), data.size(), data.size(), GGML_LAYOUT_AOS, nullptr, nullptr, &q);
     if (!result.ok || !result.ptr) {
         fprintf(stderr, "direct_stage_weight failed\n");
         return false;
@@ -178,10 +178,10 @@ static bool test_direct_stage_expert_basic(sycl::queue & q) {
     std::vector<uint8_t>     data(128, 0xbe);
 
     ggml_sycl_cache_id key = ggml_sycl::test_make_cache_id(data.data());
-    key.aux_id = 42;  // expert_id
+    key.aux_id             = 42;  // expert_id
 
-    auto result = cache.direct_stage_expert(key, data.data(), data.size(), data.size(),
-                                            GGML_LAYOUT_AOS, nullptr, nullptr, &q);
+    auto result =
+        cache.direct_stage_expert(key, data.data(), data.size(), data.size(), GGML_LAYOUT_AOS, nullptr, nullptr, &q);
     if (!result.ok || !result.ptr) {
         fprintf(stderr, "direct_stage_expert failed\n");
         return false;
@@ -193,6 +193,91 @@ static bool test_direct_stage_expert_basic(sycl::queue & q) {
         fprintf(stderr, "lookup_expert failed after staging\n");
         return false;
     }
+    if (!entry->handle) {
+        fprintf(stderr, "direct expert mirror did not retain a mem_handle lease\n");
+        return false;
+    }
+
+    return true;
+}
+
+static bool test_multi_layout_id_mapping_survives_drop(sycl::queue & q) {
+    printf("\n=== Test: multi-layout id mapping survives layout drop ===\n");
+
+    ggml_sycl::unified_cache cache(q, 64 * 1024);
+    std::vector<uint8_t>     data(128, 0x8d);
+
+    ggml_sycl_cache_id key = ggml_sycl::test_make_cache_id(data.data());
+    key.aux_id             = 17;
+
+    auto soa =
+        cache.direct_stage_expert(key, data.data(), data.size(), data.size(), GGML_LAYOUT_SOA, nullptr, nullptr, &q);
+    if (!soa.ok || !soa.ptr) {
+        fprintf(stderr, "direct_stage_expert failed for SOA layout\n");
+        return false;
+    }
+    soa.event.wait();
+
+    auto i8 = cache.direct_stage_expert(key, data.data(), data.size(), data.size(), GGML_LAYOUT_MXFP4_I8, nullptr,
+                                        nullptr, &q);
+    if (!i8.ok || !i8.ptr) {
+        fprintf(stderr, "direct_stage_expert failed for MXFP4_I8 layout\n");
+        return false;
+    }
+    i8.event.wait();
+
+    if (!cache.is_cached(key, GGML_LAYOUT_SOA) || !cache.is_cached(key, GGML_LAYOUT_MXFP4_I8)) {
+        fprintf(stderr, "Expected both SOA and MXFP4_I8 entries to be cached before drop\n");
+        return false;
+    }
+    if (!cache.lookup_device_only(key, GGML_LAYOUT_SOA) || !cache.lookup_device_only(key, GGML_LAYOUT_MXFP4_I8)) {
+        fprintf(stderr, "Expected exact-layout device lookups for both cached layouts\n");
+        return false;
+    }
+    if (!cache.validate()) {
+        fprintf(stderr, "Cache validation rejected valid multi-layout entries before drop\n");
+        return false;
+    }
+
+    const size_t dropped_i8 =
+        cache.drop_expert_entries_for_tensor_layout({ key }, GGML_LAYOUT_MXFP4_I8, "unit-test-drop-i8");
+    if (dropped_i8 != 1) {
+        fprintf(stderr, "Expected to drop one MXFP4_I8 entry, dropped %zu\n", dropped_i8);
+        return false;
+    }
+    if (!cache.is_cached_any(key) || !cache.is_cached(key, GGML_LAYOUT_SOA) ||
+        !cache.lookup_device_only(key, GGML_LAYOUT_SOA) || cache.is_cached(key, GGML_LAYOUT_MXFP4_I8)) {
+        fprintf(stderr, "SOA entry was not preserved after dropping mapped MXFP4_I8 entry\n");
+        return false;
+    }
+    if (!cache.validate()) {
+        fprintf(stderr, "Cache validation rejected SOA survivor after MXFP4_I8 drop\n");
+        return false;
+    }
+
+    i8 = cache.direct_stage_expert(key, data.data(), data.size(), data.size(), GGML_LAYOUT_MXFP4_I8, nullptr, nullptr,
+                                   &q);
+    if (!i8.ok || !i8.ptr) {
+        fprintf(stderr, "direct_stage_expert failed restaging MXFP4_I8 layout\n");
+        return false;
+    }
+    i8.event.wait();
+
+    const size_t dropped_soa =
+        cache.drop_expert_entries_for_tensor_layout({ key }, GGML_LAYOUT_SOA, "unit-test-drop-soa");
+    if (dropped_soa != 1) {
+        fprintf(stderr, "Expected to drop one SOA entry, dropped %zu\n", dropped_soa);
+        return false;
+    }
+    if (!cache.is_cached_any(key) || !cache.is_cached(key, GGML_LAYOUT_MXFP4_I8) ||
+        !cache.lookup_device_only(key, GGML_LAYOUT_MXFP4_I8) || cache.is_cached(key, GGML_LAYOUT_SOA)) {
+        fprintf(stderr, "MXFP4_I8 entry was not preserved after dropping SOA alternate\n");
+        return false;
+    }
+    if (!cache.validate()) {
+        fprintf(stderr, "Cache validation rejected MXFP4_I8 survivor after SOA drop\n");
+        return false;
+    }
 
     return true;
 }
@@ -200,7 +285,7 @@ static bool test_direct_stage_expert_basic(sycl::queue & q) {
 static bool test_planned_materialization_guard(sycl::queue & q) {
     printf("\n=== Test: planned materialization guard ===\n");
 
-    ggml_sycl::unified_cache cache(q, 4096);
+    ggml_sycl::unified_cache  cache(q, 4096);
     ggml_sycl::placement_plan plan{};
     plan.build_index();
     cache.set_placement_plan(std::move(plan));
@@ -208,8 +293,8 @@ static bool test_planned_materialization_guard(sycl::queue & q) {
     std::vector<uint8_t> data(128, 0xcd);
     ggml_sycl_cache_id   key = ggml_sycl::test_make_cache_id(data.data());
 
-    auto rejected = cache.direct_stage_weight(key, data.data(), data.size(), data.size(),
-                                              GGML_LAYOUT_AOS, nullptr, nullptr, &q);
+    auto rejected =
+        cache.direct_stage_weight(key, data.data(), data.size(), data.size(), GGML_LAYOUT_AOS, nullptr, nullptr, &q);
     if (rejected.ok || rejected.ptr || cache.lookup_weight(key) != nullptr) {
         fprintf(stderr, "direct_stage_weight mutated planned cache without materialization token\n");
         return false;
@@ -222,7 +307,7 @@ static bool test_planned_materialization_guard(sycl::queue & q) {
 
     std::vector<uint8_t> host_data(64, 0xef);
     ggml_sycl_cache_id   host_key = ggml_sycl::test_make_cache_id(host_data.data());
-    host_key.aux_id = 7;
+    host_key.aux_id               = 7;
 
     cache.register_host_expert(host_key, host_data.data(), host_data.size(), GGML_LAYOUT_AOS);
     if (cache.lookup_expert(host_key) != nullptr) {
@@ -248,18 +333,22 @@ static bool test_planned_materialization_guard(sycl::queue & q) {
         fprintf(stderr, "register_host_expert failed under materialization token\n");
         return false;
     }
+    if (!cache.lookup_expert(host_key)->handle) {
+        fprintf(stderr, "host expert mirror did not retain a mem_handle lease\n");
+        return false;
+    }
 
     return true;
 }
 
-static bool alloc_tensor_buffer(ggml_backend_buffer_type_t buft,
-                                ggml_tensor *             tensor,
-                                ggml_backend_buffer_usage usage,
+static bool alloc_tensor_buffer(ggml_backend_buffer_type_t           buft,
+                                ggml_tensor *                        tensor,
+                                ggml_backend_buffer_usage            usage,
                                 std::vector<ggml_backend_buffer_t> & buffers) {
     if (tensor->view_src) {
         return ggml_backend_view_init(tensor) == GGML_STATUS_SUCCESS;
     }
-    const size_t size = ggml_backend_buft_get_alloc_size(buft, tensor);
+    const size_t          size   = ggml_backend_buft_get_alloc_size(buft, tensor);
     ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, size);
     if (!buffer) {
         return false;
@@ -273,10 +362,16 @@ static bool alloc_tensor_buffer(ggml_backend_buffer_type_t buft,
 static bool test_graph_pins_host_weights() {
     printf("\n=== Test: graph pins host MoE weights ===\n");
 
-#if !defined(GGML_SYCL_GRAPH)
+#    if !defined(GGML_SYCL_GRAPH)
     printf("SKIP: GGML_SYCL_GRAPH not enabled\n");
     return true;
-#else
+#    else
+    const char * run_graph_test = std::getenv("GGML_SYCL_TEST_UNIFIED_CACHE_GRAPH");
+    if (!run_graph_test || std::atoi(run_graph_test) == 0) {
+        printf("SKIP: set GGML_SYCL_TEST_UNIFIED_CACHE_GRAPH=1 to run graph/BCS host-weight pinning test\n");
+        return true;
+    }
+
     setenv("GGML_SYCL_DISABLE_GRAPH", "0", 1);
 
     ggml_backend_t sycl_backend = ggml_backend_sycl_init(0);
@@ -371,7 +466,7 @@ static bool test_graph_pins_host_weights() {
         ggml_backend_sycl_register_host_weight_tensor(dev, moe_w);
     }
 
-    std::vector<float> tok_embd_data(static_cast<size_t>(vocab) * n_embd, 0.25f);
+    std::vector<float>   tok_embd_data(static_cast<size_t>(vocab) * n_embd, 0.25f);
     std::vector<int32_t> token_ids_data(n_tokens);
     for (int i = 0; i < n_tokens; ++i) {
         token_ids_data[i] = i % vocab;
@@ -420,7 +515,7 @@ static bool test_graph_pins_host_weights() {
     ggml_free(ctx);
     ggml_backend_free(sycl_backend);
     return true;
-#endif
+#    endif
 }
 
 class stream_dma_noop_kernel;
@@ -459,8 +554,7 @@ static bool test_stream_dma_mmap_fail(sycl::queue & q) {
         return false;
     }
     if (!result.used_mmap_direct || !result.mmap_direct_failed) {
-        fprintf(stderr, "Expected mmap failure flags (used=%d failed=%d)\n",
-                result.used_mmap_direct ? 1 : 0,
+        fprintf(stderr, "Expected mmap failure flags (used=%d failed=%d)\n", result.used_mmap_direct ? 1 : 0,
                 result.mmap_direct_failed ? 1 : 0);
         return false;
     }
@@ -477,18 +571,12 @@ static bool test_all_pinned_eviction_failure_new_entry(sycl::queue & q) {
     std::vector<uint8_t>     data_c(512, 0x77);
 
     bool   needs_fill = false;
-    void * ptr_a      = cache.ensure_cached_alloc(ggml_sycl::test_make_cache_id(data_a.data()),
-                                                  data_a.data(),
-                                                  data_a.size(),
-                                                  data_a.size(),
-                                                  ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS, false,
-                                                  &needs_fill);
-    void * ptr_b      = cache.ensure_cached_alloc(ggml_sycl::test_make_cache_id(data_b.data()),
-                                                  data_b.data(),
-                                                  data_b.size(),
-                                                  data_b.size(),
-                                                  ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS, false,
-                                                  &needs_fill);
+    void * ptr_a = cache.ensure_cached_alloc(ggml_sycl::test_make_cache_id(data_a.data()), data_a.data(), data_a.size(),
+                                             data_a.size(), ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1,
+                                             GGML_LAYOUT_AOS, false, &needs_fill);
+    void * ptr_b = cache.ensure_cached_alloc(ggml_sycl::test_make_cache_id(data_b.data()), data_b.data(), data_b.size(),
+                                             data_b.size(), ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1,
+                                             GGML_LAYOUT_AOS, false, &needs_fill);
 
     if (!ptr_a || !ptr_b) {
         fprintf(stderr, "Failed to allocate pinned entries for eviction test\n");
@@ -499,12 +587,9 @@ static bool test_all_pinned_eviction_failure_new_entry(sycl::queue & q) {
     cache.pin(ggml_sycl::test_make_cache_id(data_b.data()), GGML_LAYOUT_AOS);
     const size_t used_before = cache.used();
 
-    void * ptr_c = cache.ensure_cached_alloc(ggml_sycl::test_make_cache_id(data_c.data()),
-                                             data_c.data(),
-                                             data_c.size(),
-                                             data_c.size(),
-                                             ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS, false,
-                                             &needs_fill);
+    void * ptr_c = cache.ensure_cached_alloc(ggml_sycl::test_make_cache_id(data_c.data()), data_c.data(), data_c.size(),
+                                             data_c.size(), ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1,
+                                             GGML_LAYOUT_AOS, false, &needs_fill);
 
     if (ptr_c) {
         fprintf(stderr, "Unexpectedly succeeded allocating with all entries pinned\n");
@@ -535,18 +620,12 @@ static bool test_partial_eviction_insufficient(sycl::queue & q) {
     std::vector<uint8_t>     data_c(1024, 0xaa);
 
     bool   needs_fill = false;
-    void * ptr_a      = cache.ensure_cached_alloc(ggml_sycl::test_make_cache_id(data_a.data()),
-                                                  data_a.data(),
-                                                  data_a.size(),
-                                                  data_a.size(),
-                                                  ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS, false,
-                                                  &needs_fill);
-    void * ptr_b      = cache.ensure_cached_alloc(ggml_sycl::test_make_cache_id(data_b.data()),
-                                                  data_b.data(),
-                                                  data_b.size(),
-                                                  data_b.size(),
-                                                  ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS, false,
-                                                  &needs_fill);
+    void * ptr_a = cache.ensure_cached_alloc(ggml_sycl::test_make_cache_id(data_a.data()), data_a.data(), data_a.size(),
+                                             data_a.size(), ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1,
+                                             GGML_LAYOUT_AOS, false, &needs_fill);
+    void * ptr_b = cache.ensure_cached_alloc(ggml_sycl::test_make_cache_id(data_b.data()), data_b.data(), data_b.size(),
+                                             data_b.size(), ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1,
+                                             GGML_LAYOUT_AOS, false, &needs_fill);
 
     if (!ptr_a || !ptr_b) {
         fprintf(stderr, "Failed to allocate initial entries for partial eviction test\n");
@@ -556,12 +635,9 @@ static bool test_partial_eviction_insufficient(sycl::queue & q) {
     cache.pin(ggml_sycl::test_make_cache_id(data_a.data()), GGML_LAYOUT_AOS);
     const size_t used_before = cache.used();
 
-    void * ptr_c = cache.ensure_cached_alloc(ggml_sycl::test_make_cache_id(data_c.data()),
-                                             data_c.data(),
-                                             data_c.size(),
-                                             data_c.size(),
-                                             ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS, false,
-                                             &needs_fill);
+    void * ptr_c = cache.ensure_cached_alloc(ggml_sycl::test_make_cache_id(data_c.data()), data_c.data(), data_c.size(),
+                                             data_c.size(), ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1,
+                                             GGML_LAYOUT_AOS, false, &needs_fill);
 
     if (ptr_c) {
         fprintf(stderr, "Unexpectedly succeeded allocating with insufficient eviction\n");
@@ -596,12 +672,9 @@ static bool test_allocation_failure_new_entry(sycl::queue & q) {
     const size_t         huge_alloc = 1ULL << 40;
 
     bool   needs_fill = false;
-    void * ptr        = cache.ensure_cached_alloc(ggml_sycl::test_make_cache_id(data.data()),
-                                                  data.data(),
-                                                  data.size(),
-                                                  huge_alloc,
-                                                  ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS, false,
-                                                  &needs_fill);
+    void * ptr        = cache.ensure_cached_alloc(ggml_sycl::test_make_cache_id(data.data()), data.data(), data.size(),
+                                                  huge_alloc, ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1,
+                                                  GGML_LAYOUT_AOS, false, &needs_fill);
 
     if (ptr) {
         fprintf(stderr, "Unexpectedly succeeded allocating huge entry\n");
@@ -629,12 +702,9 @@ static bool test_deferred_free_stress(sycl::queue & q) {
 
     bool needs_fill = false;
     for (auto & payload : payloads) {
-        void * ptr = cache.ensure_cached_alloc(ggml_sycl::test_make_cache_id(payload.data()),
-                                               payload.data(),
-                                               payload.size(),
-                                               payload.size(),
-                                               ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS,
-                                               false, &needs_fill);
+        void * ptr = cache.ensure_cached_alloc(
+            ggml_sycl::test_make_cache_id(payload.data()), payload.data(), payload.size(), payload.size(),
+            ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS, false, &needs_fill);
         if (!ptr) {
             fprintf(stderr, "Failed to allocate entry during deferred free stress\n");
             return false;
@@ -642,10 +712,7 @@ static bool test_deferred_free_stress(sycl::queue & q) {
     }
 
     for (auto & payload : payloads) {
-        cache.remove(ggml_sycl::test_make_cache_id(payload.data()),
-                     ggml_sycl::cache_entry_type::DENSE_WEIGHT,
-                     -1,
-                     -1,
+        cache.remove(ggml_sycl::test_make_cache_id(payload.data()), ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1,
                      GGML_LAYOUT_AOS);
     }
 
@@ -670,14 +737,8 @@ static bool test_unaligned_hash(sycl::queue & q) {
     uint8_t *            misaligned = raw.data() + 1;
     const size_t         size       = 127;
 
-    void * ptr = cache.ensure_cached(ggml_sycl::test_make_cache_id(misaligned),
-                                     misaligned,
-                                     size,
-                                     ggml_sycl::cache_entry_type::DENSE_WEIGHT,
-                                     -1,
-                                     -1,
-                                     GGML_LAYOUT_AOS,
-                                     true);
+    void * ptr = cache.ensure_cached(ggml_sycl::test_make_cache_id(misaligned), misaligned, size,
+                                     ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS, true);
 
     if (!ptr) {
         fprintf(stderr, "ensure_cached failed for misaligned input\n");
@@ -700,20 +761,14 @@ static bool test_unpin_experts(sycl::queue & q) {
     std::vector<uint8_t>     expert(128, 0x6c);
 
     bool needs_fill = false;
-    if (!cache.ensure_cached_alloc(ggml_sycl::test_make_cache_id(dense.data()),
-                                   dense.data(),
-                                   dense.size(),
-                                   dense.size(),
-                                   ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS, false,
-                                   &needs_fill)) {
+    if (!cache.ensure_cached_alloc(ggml_sycl::test_make_cache_id(dense.data()), dense.data(), dense.size(),
+                                   dense.size(), ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS,
+                                   false, &needs_fill)) {
         fprintf(stderr, "Failed to allocate dense entry for unpin test\n");
         return false;
     }
-    if (!cache.ensure_cached_alloc(ggml_sycl::test_make_cache_id(expert.data()),
-                                   expert.data(),
-                                   expert.size(),
-                                   expert.size(),
-                                   ggml_sycl::cache_entry_type::MOE_EXPERT, 0, 0, GGML_LAYOUT_AOS, false,
+    if (!cache.ensure_cached_alloc(ggml_sycl::test_make_cache_id(expert.data()), expert.data(), expert.size(),
+                                   expert.size(), ggml_sycl::cache_entry_type::MOE_EXPERT, 0, 0, GGML_LAYOUT_AOS, false,
                                    &needs_fill)) {
         fprintf(stderr, "Failed to allocate expert entry for unpin test\n");
         return false;
@@ -746,14 +801,14 @@ static bool test_direct_stage_expert_distinct_keys(sycl::queue & q) {
     std::vector<uint8_t> data_b(128, 0x2b);
 
     ggml_sycl_cache_id key_a = ggml_sycl::test_make_cache_id(data_a.data());
-    key_a.aux_id = 0;
+    key_a.aux_id             = 0;
     ggml_sycl_cache_id key_b = ggml_sycl::test_make_cache_id(data_b.data());
-    key_b.aux_id = 1;
+    key_b.aux_id             = 1;
 
-    auto ra = cache.direct_stage_expert(key_a, data_a.data(), data_a.size(), data_a.size(),
-                                        GGML_LAYOUT_AOS, nullptr, nullptr, &q);
-    auto rb = cache.direct_stage_expert(key_b, data_b.data(), data_b.size(), data_b.size(),
-                                        GGML_LAYOUT_AOS, nullptr, nullptr, &q);
+    auto ra = cache.direct_stage_expert(key_a, data_a.data(), data_a.size(), data_a.size(), GGML_LAYOUT_AOS, nullptr,
+                                        nullptr, &q);
+    auto rb = cache.direct_stage_expert(key_b, data_b.data(), data_b.size(), data_b.size(), GGML_LAYOUT_AOS, nullptr,
+                                        nullptr, &q);
     if (!ra.ok || !rb.ok) {
         fprintf(stderr, "direct_stage_expert failed for distinct keys\n");
         return false;
@@ -812,6 +867,7 @@ int main() {
     ok &= test_realloc_eviction_failure_keeps_entry(q);
     ok &= test_direct_stage_weight_basic(q);
     ok &= test_direct_stage_expert_basic(q);
+    ok &= test_multi_layout_id_mapping_survives_drop(q);
     ok &= test_planned_materialization_guard(q);
     ok &= test_graph_pins_host_weights();
     ok &= test_stream_dma_mmap_fail(q);

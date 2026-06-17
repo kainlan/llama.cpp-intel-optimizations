@@ -168,6 +168,7 @@ struct ggml_sycl_tensor_inventory {
     size_t                         pp_pipeline_scratch_bytes;
     // Ring-backed PP MoE oneDNN staging planned from the model inventory.
     // Slots hold one dequantized expert weight, one f16 activation tile, and one f32 output tile.
+    // The current PP path serializes slot use, so the default plan reserves one reusable slot.
     size_t                         pp_moe_onednn_weight_slot_bytes;
     size_t                         pp_moe_onednn_activation_slot_bytes;
     size_t                         pp_moe_onednn_output_slot_bytes;

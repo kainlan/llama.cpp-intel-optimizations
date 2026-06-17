@@ -894,6 +894,14 @@ void drain_retained_handles(bool wait_all) {
     state.cv.wait(lock, [&state] { return state.queue.empty() && state.active == 0; });
 }
 
+void release_graph_retained_handles() {
+    auto &                      state = *g_retained_handles_state;
+    std::lock_guard<std::mutex> lock(state.mutex);
+    const size_t                n = state.graph_unwaitable.size();
+    state.graph_unwaitable.clear();
+    GGML_SYCL_DEBUG("[MEM-HANDLE] released %zu command-graph retained leases\n", n);
+}
+
 void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event event) {
     if (handles.empty()) {
         return;

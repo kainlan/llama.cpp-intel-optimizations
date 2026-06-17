@@ -32,6 +32,88 @@ static XMXCapabilities test_mxfp4_caps() {
     return caps;
 }
 
+static ggml_sycl_device_info make_mock_sycl_info(int requested_device_count = 2) {
+    ggml_sycl_device_info info{};
+    int                   device_count = requested_device_count;
+    if (device_count < 1) {
+        device_count = 1;
+    }
+    if (device_count > GGML_SYCL_MAX_DEVICES) {
+        device_count = GGML_SYCL_MAX_DEVICES;
+    }
+
+    info.device_count        = device_count;
+    info.total_gpu_count     = device_count;
+    info.host_max_alloc_size = 128ull * 1024ull * 1024ull * 1024ull;
+
+    for (int d = 0; d < device_count; ++d) {
+        const size_t total_vram = d == 0 ? 12ull * 1024ull * 1024ull * 1024ull : 16ull * 1024ull * 1024ull * 1024ull;
+
+        sycl_device_info & dev           = info.devices[d];
+        dev.cc                           = 1200;
+        dev.nsm                          = d == 0 ? 160 : 96;
+        dev.smpbo                        = 64ull * 1024ull;
+        dev.vmm                          = true;
+        dev.total_vram                   = total_vram;
+        dev.free_vram_at_init            = total_vram;
+        dev.max_alloc_size               = total_vram - 512ull * 1024ull * 1024ull;
+        dev.safe_max_alloc_size          = dev.max_alloc_size;
+        dev.supports_soa_reorder         = true;
+        dev.xmx_caps                     = test_mxfp4_caps();
+        dev.xmx_caps.compute_units       = dev.nsm;
+        dev.xmx_caps.global_mem_size     = total_vram;
+        dev.xmx_caps.max_mem_alloc_size  = dev.max_alloc_size;
+        dev.xmx_caps.supports_usm_device = true;
+        std::snprintf(dev.device_name, sizeof(dev.device_name), "mock-bmg-xmx-%d", d);
+
+        info.max_work_group_sizes[d] = 256;
+        info.default_tensor_split[d] = static_cast<float>(d + 1) / static_cast<float>(device_count);
+        info.gpu_dpct_ids[d]         = d;
+    }
+
+    for (int src = 0; src < device_count; ++src) {
+        for (int dst = 0; dst < device_count; ++dst) {
+            sycl_peer_link_info & link   = info.peer_links[src][dst];
+            link.valid                   = true;
+            link.src_device              = src;
+            link.dst_device              = dst;
+            link.same_device             = src == dst;
+            link.same_backend            = true;
+            link.same_platform           = true;
+            link.same_sycl_context       = src == dst;
+            link.level_zero              = true;
+            link.l0_peer_query_supported = true;
+            link.l0_can_access_peer      = src == dst;
+            std::snprintf(link.preferred_transfer, sizeof(link.preferred_transfer), "%s",
+                          src == dst ? "same-device" : "host-bounce");
+            std::snprintf(link.unsupported_reason, sizeof(link.unsupported_reason), "%s",
+                          src == dst ? "" : "mock-no-p2p");
+        }
+    }
+
+    return info;
+}
+
+static size_t planned_weight_charge_for_device(const ggml_sycl::placement_plan & plan, int device_id) {
+    size_t total = 0;
+    for (const ggml_sycl::placement_entry & entry : plan.entries) {
+        if (!entry.on_device || entry.target_device != device_id) {
+            continue;
+        }
+        total += entry.vram_charge_size != 0 ? entry.vram_charge_size :
+                                               ggml_sycl::placement_vram_charge_bytes(entry.dst_size);
+        for (const ggml_sycl::placement_alternate_layout & alt : entry.alternate_layouts) {
+            const int alt_target = alt.target_device >= 0 ? alt.target_device : entry.target_device;
+            if (alt_target != device_id) {
+                continue;
+            }
+            total +=
+                alt.vram_charge_size != 0 ? alt.vram_charge_size : ggml_sycl::placement_vram_charge_bytes(alt.dst_size);
+        }
+    }
+    return total;
+}
+
 static bool run_mxfp4_moe_policy_test() {
     XMXCapabilities caps = test_mxfp4_caps();
 
@@ -603,7 +685,7 @@ static bool run_multi_device_moe_i8_executor_support_test() {
     return true;
 }
 
-static bool run_single_device_xmx_pp_executor_no_soa_alt_test() {
+static bool run_single_device_moe_pp_complete_soa_layout_test() {
     const auto & info = ggml_sycl_info();
     if (info.device_count <= 0 ||
         !xmx_capabilities_match_int8_tile(info.devices[0].xmx_caps, GGML_SYCL_MXFP4_MOE_XMX_M,
@@ -646,7 +728,10 @@ static bool run_single_device_xmx_pp_executor_no_soa_alt_test() {
     auto plan = ggml_sycl::compute_multi_device_plan(devices, inventory, 1, ggml_sycl::multi_gpu_mode::EXPERT, kv_info,
                                                      nullptr, n_experts);
 
-    auto has_soa_alt = [](const ggml_sycl::expert_placement_result & placement) {
+    auto has_soa_layout_on_target = [](const ggml_sycl::expert_placement_result & placement) {
+        if (placement.layout == GGML_LAYOUT_SOA) {
+            return true;
+        }
         for (const auto & alt : placement.alternate_layouts) {
             const int alt_target = alt.target_device >= 0 ? alt.target_device : placement.target_device;
             if (alt.layout == GGML_LAYOUT_SOA && alt_target == placement.target_device) {
@@ -659,24 +744,133 @@ static bool run_single_device_xmx_pp_executor_no_soa_alt_test() {
     for (int e = 0; e < n_experts; ++e) {
         const auto gate = plan.lookup_expert_placement(0, e, ggml_sycl::expert_tensor_role::GATE);
         const auto up   = plan.lookup_expert_placement(0, e, ggml_sycl::expert_tensor_role::UP);
-        const bool gate_local_accelerated =
-            gate.found() && (gate.layout == GGML_LAYOUT_XMX_TILED || gate.layout == GGML_LAYOUT_MXFP4_I8);
-        const bool up_local_accelerated =
-            up.found() && (up.layout == GGML_LAYOUT_XMX_TILED || up.layout == GGML_LAYOUT_MXFP4_I8);
-        if (!gate_local_accelerated || !up_local_accelerated) {
-            printf(
-                "FAIL: expected single-device gate/up expert %d to use a local accelerated primary layout, gate=%d "
-                "up=%d\n",
-                e, gate.found() ? (int) gate.layout : -1, up.found() ? (int) up.layout : -1);
+        const auto down = plan.lookup_expert_placement(0, e, ggml_sycl::expert_tensor_role::DOWN);
+        if (!gate.found() || !up.found() || !down.found() || !gate.on_device || !up.on_device || !down.on_device ||
+            gate.target_device != 0 || up.target_device != 0 || down.target_device != 0) {
+            printf("FAIL: expected complete local MoE triplet for expert %d, gate=%d/%d/%d up=%d/%d/%d down=%d/%d/%d\n",
+                   e, gate.found() ? 1 : 0, gate.on_device ? 1 : 0, gate.target_device, up.found() ? 1 : 0,
+                   up.on_device ? 1 : 0, up.target_device, down.found() ? 1 : 0, down.on_device ? 1 : 0,
+                   down.target_device);
             return false;
         }
-        if (has_soa_alt(gate) || has_soa_alt(up)) {
-            printf("FAIL: accelerated gate/up expert %d should not need an eager SOA PP alternate\n", e);
+        if (gate.layout != GGML_LAYOUT_SOA || up.layout != GGML_LAYOUT_SOA) {
+            printf("FAIL: prompt gate/up expert %d must use PP-safe SOA primaries, gate=%d up=%d\n", e,
+                   (int) gate.layout, (int) up.layout);
+            return false;
+        }
+        if (!has_soa_layout_on_target(gate) || !has_soa_layout_on_target(up) || !has_soa_layout_on_target(down)) {
+            printf("FAIL: expert %d is missing complete SOA PP executable coverage, gate=%d up=%d down=%d\n", e,
+                   (int) gate.layout, (int) up.layout, (int) down.layout);
+            return false;
+        }
+        if (down.layout != GGML_LAYOUT_MXFP4_I8) {
+            printf("FAIL: down expert %d should retain MXFP4_I8 TG primary after reserving SOA PP alternate, got %d\n",
+                   e, (int) down.layout);
             return false;
         }
     }
+    if (!plan.moe_pp_soa_promoted) {
+        printf("FAIL: planner should record PP SOA promotion for prompt-incompatible gate/up primaries\n");
+        return false;
+    }
+    const size_t planned_charge = planned_weight_charge_for_device(plan, 0);
+    if (plan.weight_vram_bytes != planned_charge || plan.vram_bytes != planned_charge) {
+        printf("FAIL: planner under/over-counted PP-safe MoE layout charge, plan weight=%zu vram=%zu actual=%zu\n",
+               plan.weight_vram_bytes, plan.vram_bytes, planned_charge);
+        return false;
+    }
+    if (planned_charge > devices[0].vram_budget) {
+        printf("FAIL: planner charged beyond device budget, charged=%zu budget=%zu\n", planned_charge,
+               devices[0].vram_budget);
+        return false;
+    }
 
-    printf("PASS: single-device accelerated PP path avoids unnecessary SOA alternates\n");
+    const std::vector<ggml_sycl::device_budget> tight_devices = {
+        { 0, planned_charge - mib, planned_charge - mib, 4.0, true },
+    };
+    auto tight_plan = ggml_sycl::compute_multi_device_plan(
+        tight_devices, inventory, 1, ggml_sycl::multi_gpu_mode::EXPERT, kv_info, nullptr, n_experts);
+    const size_t tight_charge = planned_weight_charge_for_device(tight_plan, 0);
+    if (tight_plan.weight_vram_bytes != tight_charge || tight_plan.vram_bytes != tight_charge) {
+        printf(
+            "FAIL: tight-budget planner under/over-counted PP-safe MoE layout charge, plan weight=%zu vram=%zu "
+            "actual=%zu\n",
+            tight_plan.weight_vram_bytes, tight_plan.vram_bytes, tight_charge);
+        return false;
+    }
+    if (tight_charge > tight_devices[0].vram_budget) {
+        printf("FAIL: tight-budget planner exceeded budget, charged=%zu budget=%zu\n", tight_charge,
+               tight_devices[0].vram_budget);
+        return false;
+    }
+
+    ggml_tensor down_tensor{};
+    down_tensor.type  = GGML_TYPE_MXFP4;
+    down_tensor.ne[0] = ncols;
+    down_tensor.ne[1] = nrows;
+    down_tensor.ne[2] = n_experts;
+    down_tensor.ne[3] = 1;
+    ggml_set_name(&down_tensor, "blk.0.ffn_down_exps.weight");
+
+    struct probe_override_guard {
+        ~probe_override_guard() { ggml_sycl::test_clear_moe_planned_layout_probe_overrides(); }
+    } probe_guard;
+
+    ggml_sycl::test_clear_moe_planned_layout_probe_overrides();
+    ggml_sycl::test_set_moe_planned_layout_probe_override(&down_tensor, 0, GGML_LAYOUT_MXFP4_I8, n_experts, 0, 0, 0);
+    if (ggml_sycl::test_prompt_down_specialized_layout_proven(&down_tensor, 0, GGML_LAYOUT_MXFP4_I8,
+                                                              /*n_tokens=*/512)) {
+        printf("FAIL: prompt-down I8 should not be proven without complete SOA fallback coverage\n");
+        return false;
+    }
+    if (ggml_sycl::test_moe_layout_for_selected_rows(&down_tensor, 0, GGML_LAYOUT_MXFP4_I8,
+                                                     /*selected_rows=*/512, /*exact_override=*/false,
+                                                     /*n_tokens=*/512) != GGML_LAYOUT_SOA) {
+        printf("FAIL: prompt-down I8 should fall back to SOA until specialized and SOA layouts are complete\n");
+        return false;
+    }
+
+    ggml_sycl::test_set_moe_planned_layout_probe_override(&down_tensor, 0, GGML_LAYOUT_SOA, n_experts, 0, 0, 0);
+    if (!ggml_sycl::test_prompt_down_specialized_layout_proven(&down_tensor, 0, GGML_LAYOUT_MXFP4_I8,
+                                                               /*n_tokens=*/512)) {
+        printf("FAIL: prompt-down I8 should be proven when I8 and SOA coverage are both complete\n");
+        return false;
+    }
+    if (ggml_sycl::test_moe_layout_for_selected_rows(&down_tensor, 0, GGML_LAYOUT_MXFP4_I8,
+                                                     /*selected_rows=*/512, /*exact_override=*/false,
+                                                     /*n_tokens=*/512) != GGML_LAYOUT_MXFP4_I8) {
+        printf("FAIL: prompt-down I8 should remain selected after proof-gated SOA fallback coverage is complete\n");
+        return false;
+    }
+
+    ggml_sycl::test_clear_moe_planned_layout_probe_overrides();
+    ggml_sycl::test_set_moe_planned_layout_probe_override(&down_tensor, 0, GGML_LAYOUT_MXFP4_DPAS, n_experts, 0, 0, 0);
+    if (ggml_sycl::test_prompt_down_specialized_layout_proven(&down_tensor, 0, GGML_LAYOUT_MXFP4_DPAS,
+                                                              /*n_tokens=*/512)) {
+        printf("FAIL: prompt-down DPAS should not be proven without complete SOA fallback coverage\n");
+        return false;
+    }
+    if (ggml_sycl::test_moe_layout_for_selected_rows(&down_tensor, 0, GGML_LAYOUT_MXFP4_DPAS,
+                                                     /*selected_rows=*/512, /*exact_override=*/false,
+                                                     /*n_tokens=*/512) != GGML_LAYOUT_SOA) {
+        printf("FAIL: prompt-down DPAS should fall back to SOA until specialized and SOA layouts are complete\n");
+        return false;
+    }
+
+    ggml_sycl::test_set_moe_planned_layout_probe_override(&down_tensor, 0, GGML_LAYOUT_SOA, n_experts, 0, 0, 0);
+    if (!ggml_sycl::test_prompt_down_specialized_layout_proven(&down_tensor, 0, GGML_LAYOUT_MXFP4_DPAS,
+                                                               /*n_tokens=*/512)) {
+        printf("FAIL: prompt-down DPAS should be proven when DPAS and SOA coverage are both complete\n");
+        return false;
+    }
+    if (ggml_sycl::test_moe_layout_for_selected_rows(&down_tensor, 0, GGML_LAYOUT_MXFP4_DPAS,
+                                                     /*selected_rows=*/512, /*exact_override=*/false,
+                                                     /*n_tokens=*/512) != GGML_LAYOUT_MXFP4_DPAS) {
+        printf("FAIL: prompt-down DPAS should remain selected after proof-gated SOA fallback coverage is complete\n");
+        return false;
+    }
+
+    printf("PASS: single-device MoE planner budgets and proves complete PP-safe SOA executable layouts\n");
     return true;
 }
 
@@ -708,14 +902,14 @@ static bool run_multi_device_no_p2p_cohesive_moe_layer_test() {
         printf("FAIL: expected fastest dense device 1, got %d\n", plan.fastest_dense_device);
         return false;
     }
-    if (plan.get_layer_device(0) != 1 || plan.get_layer_device(1) != 0) {
-        printf("FAIL: expected cohesive layer spill device sequence [1,0], got [%d,%d]\n", plan.get_layer_device(0),
-               plan.get_layer_device(1));
+    if (plan.get_layer_device(0) != 0 || plan.get_layer_device(1) != 0) {
+        printf("FAIL: expected no-P2P cohesive layer set to stay on primary [0,0], got [%d,%d]\n",
+               plan.get_layer_device(0), plan.get_layer_device(1));
         return false;
     }
-    if (plan.layer_blocks.size() != 2 || plan.layer_blocks[0].dense_device != 1 ||
-        plan.layer_blocks[1].dense_device != 0) {
-        printf("FAIL: expected two contiguous layer blocks on devices [1,0], blocks=%zu\n", plan.layer_blocks.size());
+    if (plan.layer_blocks.size() != 1 || plan.layer_blocks[0].dense_device != 0) {
+        printf("FAIL: expected one primary cohesive layer block for no-P2P fit, blocks=%zu device=%d\n",
+               plan.layer_blocks.size(), plan.layer_blocks.empty() ? -1 : plan.layer_blocks[0].dense_device);
         return false;
     }
 
@@ -737,6 +931,87 @@ static bool run_multi_device_no_p2p_cohesive_moe_layer_test() {
     }
 
     printf("PASS: no-P2P multi-device MoE planner keeps dense/KV/experts cohesive by layer block\n");
+    return true;
+}
+
+static bool run_regression_guard_policy_test() {
+    if (ggml_sycl::test_moe_primary_uses_expert_handles(
+            /*planner_primary_fastpath_guard_active=*/false,
+            /*planner_has_moe_plan_for_primary=*/true,
+            /*is_moe_expert_weight=*/true)) {
+        printf("FAIL: single-GPU MoE should keep direct resolve instead of forcing expert handles\n");
+        return false;
+    }
+    if (!ggml_sycl::test_moe_primary_uses_expert_handles(
+            /*planner_primary_fastpath_guard_active=*/true,
+            /*planner_has_moe_plan_for_primary=*/true,
+            /*is_moe_expert_weight=*/true)) {
+        printf("FAIL: planner-owned multi-device MoE should use expert handles\n");
+        return false;
+    }
+    if (ggml_sycl::test_moe_primary_uses_expert_handles(
+            /*planner_primary_fastpath_guard_active=*/true,
+            /*planner_has_moe_plan_for_primary=*/false,
+            /*is_moe_expert_weight=*/true)) {
+        printf("FAIL: MoE expert handles require an active primary plan\n");
+        return false;
+    }
+    if (ggml_sycl::test_moe_primary_uses_expert_handles(
+            /*planner_primary_fastpath_guard_active=*/true,
+            /*planner_has_moe_plan_for_primary=*/true,
+            /*is_moe_expert_weight=*/false)) {
+        printf("FAIL: non-MoE tensors should not use MoE expert handles\n");
+        return false;
+    }
+
+    constexpr size_t mib                = 1024ull * 1024ull;
+    constexpr size_t b50_total          = 16304ull * mib;
+    constexpr size_t caller_reserved    = 565ull * mib;
+    constexpr size_t b50_public_budget  = b50_total - caller_reserved;
+    const size_t     b50_full_headroom  = b50_total / 10;
+    const size_t     b50_clamped_headroom =
+        ggml_sycl::test_arena_external_headroom_bytes(b50_total, b50_public_budget);
+    if (b50_clamped_headroom != caller_reserved) {
+        printf("FAIL: arena headroom should preserve caller-reserved B50 slack, got %zu expected %zu\n",
+               b50_clamped_headroom, caller_reserved);
+        return false;
+    }
+    const size_t b50_default_headroom = ggml_sycl::test_arena_external_headroom_bytes(b50_total, b50_total);
+    if (b50_default_headroom != b50_full_headroom) {
+        printf("FAIL: arena headroom should use proportional B50 default, got %zu expected %zu\n",
+               b50_default_headroom, b50_full_headroom);
+        return false;
+    }
+    if (ggml_sycl::test_arena_external_headroom_bytes(0, b50_total) != 0) {
+        printf("FAIL: zero VRAM total should opt out of arena headroom capping\n");
+        return false;
+    }
+
+    constexpr size_t weight_slot = 64ull * mib;
+    constexpr size_t act_slot    = 16ull * mib;
+    constexpr size_t out_slot    = 32ull * mib;
+    if (ggml_sycl::test_pp_moe_onednn_runtime_ring_depth(0) != 1) {
+        printf("FAIL: missing PP MoE oneDNN scratch plan should fall back to one serialized slot\n");
+        return false;
+    }
+    if (ggml_sycl::test_pp_moe_onednn_runtime_ring_depth(2) != 2) {
+        printf("FAIL: explicit PP MoE oneDNN scratch plan should be preserved\n");
+        return false;
+    }
+    if (ggml_sycl::test_pp_moe_onednn_effective_ring_depth(4) != 1) {
+        printf("FAIL: serialized PP MoE oneDNN scratch should budget one reusable slot\n");
+        return false;
+    }
+    const size_t planned_pp_moe_scratch =
+        ggml_sycl::test_pp_moe_onednn_planned_scratch_bytes(weight_slot, act_slot, out_slot, 4);
+    const size_t expected_pp_moe_scratch = weight_slot + act_slot + out_slot;
+    if (planned_pp_moe_scratch != expected_pp_moe_scratch) {
+        printf("FAIL: PP MoE oneDNN scratch should not reserve unused future slots, got %zu expected %zu\n",
+               planned_pp_moe_scratch, expected_pp_moe_scratch);
+        return false;
+    }
+
+    printf("PASS: SYCL regression guards preserve single-GPU MoE resolve and arena headroom\n");
     return true;
 }
 
@@ -901,32 +1176,49 @@ static bool run_layout_choice_test() {
 }
 
 int main() {
-    if (!run_mxfp4_moe_policy_test()) {
-        return 1;
+    {
+        const ggml_sycl_device_info              mock_info = make_mock_sycl_info();
+        ggml_sycl::test_sycl_info_override_guard info_guard(mock_info);
+
+        if (!run_mxfp4_moe_policy_test()) {
+            return 1;
+        }
+        if (!run_mxfp4_grouped_dpas_policy_test()) {
+            return 1;
+        }
+        if (!run_moe_device_policy_mock_test()) {
+            return 1;
+        }
+        if (!run_moe_triplet_planner_test()) {
+            return 1;
+        }
+        if (!run_multi_device_layer_block_plan_test()) {
+            return 1;
+        }
+        if (!run_multi_device_layer_boundary_metadata_test()) {
+            return 1;
+        }
+        if (!run_multi_device_moe_i8_executor_support_test()) {
+            return 1;
+        }
+        if (!run_single_device_moe_pp_complete_soa_layout_test()) {
+            return 1;
+        }
+        if (!run_multi_device_no_p2p_cohesive_moe_layer_test()) {
+            return 1;
+        }
+        if (!run_regression_guard_policy_test()) {
+            return 1;
+        }
     }
-    if (!run_mxfp4_grouped_dpas_policy_test()) {
-        return 1;
+
+    const char * run_backend_layout_test = std::getenv("GGML_SYCL_TEST_LAYOUT_CHOICE_BACKEND");
+    if (!run_backend_layout_test || std::atoi(run_backend_layout_test) == 0) {
+        printf("SKIP: backend layout choice purge requires GGML_SYCL_TEST_LAYOUT_CHOICE_BACKEND=1\n");
+        return 0;
     }
-    if (!run_moe_device_policy_mock_test()) {
-        return 1;
-    }
-    if (!run_moe_triplet_planner_test()) {
-        return 1;
-    }
-    if (!run_multi_device_layer_block_plan_test()) {
-        return 1;
-    }
-    if (!run_multi_device_layer_boundary_metadata_test()) {
-        return 1;
-    }
-    if (!run_multi_device_moe_i8_executor_support_test()) {
-        return 1;
-    }
-    if (!run_single_device_xmx_pp_executor_no_soa_alt_test()) {
-        return 1;
-    }
-    if (!run_multi_device_no_p2p_cohesive_moe_layer_test()) {
-        return 1;
+    if (!std::getenv("GGML_SYCL_VRAM_BUDGET_PCT")) {
+        setenv("GGML_SYCL_VRAM_BUDGET_PCT", "20", 0);
     }
     ggml_sycl::test_layout_override_guard guard(GGML_LAYOUT_SOA);
     bool                                  ok = run_layout_choice_test();

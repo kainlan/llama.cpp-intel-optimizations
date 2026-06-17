@@ -18,6 +18,13 @@ endif()
 message(STATUS "SYCL found")
 #todo: AOT
 
+if (CMAKE_GENERATOR STREQUAL "Ninja" AND CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+    # Intel's SYCL link step records transient icpx/ocloc objects in the linker
+    # depfile. Those files are deleted after linking, so Ninja considers
+    # libggml-sycl dirty on every build and repeats the expensive device link.
+    set(CMAKE_CXX_LINK_DEPENDS_USE_LINKER FALSE)
+endif()
+
 ggml_add_backend_library(ggml-sycl
                          ggml-sycl.cpp
                          kv-tier-manager.cpp
@@ -904,6 +911,32 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
     set_tests_properties(unified-cache-fast-path PROPERTIES
         LABELS "sycl;cache;fast-path;tdd"
         TIMEOUT 120
+    )
+
+    add_executable(test-unified-cache-bugs
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-unified-cache-bugs.cpp
+    )
+    target_include_directories(test-unified-cache-bugs PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
+    )
+    target_compile_options(test-unified-cache-bugs PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_link_options(test-unified-cache-bugs PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_compile_definitions(test-unified-cache-bugs PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-unified-cache-bugs PRIVATE ggml-base ggml ggml-sycl)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-unified-cache-bugs PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME unified-cache-bugs COMMAND test-unified-cache-bugs)
+    set_tests_properties(unified-cache-bugs PROPERTIES
+        LABELS "sycl;cache;bugfix;tdd"
+        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        TIMEOUT 180
     )
 
     # Test: unified-cache layout and multi-device placement choices

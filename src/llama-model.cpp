@@ -148,7 +148,11 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
             max_weight_slot = std::max(max_weight_slot, llama_model_sycl_align_up(k * n * sizeof(ggml_fp16_t), 256));
         }
         if (max_weight_slot > 0 && max_k > 0 && max_n > 0) {
-            constexpr uint32_t pp_moe_onednn_ring_depth = 4;
+            // Current PP MoE oneDNN staging is serialized through a claimed slot
+            // and completion event, so the plan should reserve one reusable
+            // slot. Reserving future pipeline slots here steals B50 weight
+            // arena from GPT-OSS 20B before those slots can improve throughput.
+            constexpr uint32_t pp_moe_onednn_ring_depth = 1;
             const size_t       max_rows =
                 static_cast<size_t>(inventory.n_ubatch) * static_cast<size_t>(hparams.n_expert_used);
             inventory.pp_moe_onednn_weight_slot_bytes = max_weight_slot;

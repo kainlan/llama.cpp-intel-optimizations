@@ -360,6 +360,11 @@ void set_graph_retained_handle_sink(std::vector<mem_handle> * sink);
 // refcounted owner is gone.
 void drain_retained_handles(bool wait_all = false);
 
+// Release handles retained for command-graph lifetime when the executable graph
+// is invalidated. These handles are not event-waitable, so drain_retained_handles()
+// intentionally does not touch them.
+void release_graph_retained_handles();
+
 }  // namespace ggml_sycl
 
 namespace std {
