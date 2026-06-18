@@ -6,10 +6,12 @@
 // physical device, and resolving one device must not poison another.
 
 #include "ggml-sycl/common.hpp"
+#include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml.h"
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 void ggml_sycl_data_ptr_cache_new_graph();
@@ -62,6 +64,48 @@ static void init_tensor(ggml_tensor & tensor, const char * name) {
     tensor.nb[2] = tensor.nb[1] * tensor.ne[1];
     tensor.nb[3] = tensor.nb[2] * tensor.ne[2];
     std::snprintf(tensor.name, sizeof(tensor.name), "%s", name);
+}
+
+static ggml_sycl_device_info make_mock_sycl_info(bool direct_peer = false) {
+    ggml_sycl_device_info info{};
+    info.device_count    = 2;
+    info.total_gpu_count = 2;
+    for (int d = 0; d < info.total_gpu_count; ++d) {
+        info.devices[d].cc                       = 1200;
+        info.devices[d].total_vram               = 16ull * 1024ull * 1024ull * 1024ull;
+        info.devices[d].free_vram_at_init        = info.devices[d].total_vram;
+        info.devices[d].max_alloc_size           = info.devices[d].total_vram;
+        info.devices[d].safe_max_alloc_size      = info.devices[d].total_vram;
+        info.devices[d].supports_soa_reorder     = true;
+        info.gpu_dpct_ids[d]                     = d;
+        info.max_work_group_sizes[d]             = 256;
+        info.default_tensor_split[d]             = d == 0 ? 0.5f : 1.0f;
+        info.devices[d].xmx_caps.supported       = true;
+        info.devices[d].xmx_caps.supports_int8   = true;
+        info.devices[d].xmx_caps.compute_units   = d == 0 ? 160 : 96;
+        info.devices[d].xmx_caps.global_mem_size = info.devices[d].total_vram;
+    }
+    for (int src = 0; src < info.total_gpu_count; ++src) {
+        for (int dst = 0; dst < info.total_gpu_count; ++dst) {
+            sycl_peer_link_info & link   = info.peer_links[src][dst];
+            link.valid                   = true;
+            link.src_device              = src;
+            link.dst_device              = dst;
+            link.same_device             = src == dst;
+            link.same_backend            = true;
+            link.same_platform           = true;
+            link.same_sycl_context       = src == dst || direct_peer;
+            link.level_zero              = true;
+            link.l0_peer_query_supported = true;
+            link.l0_can_access_peer      = src == dst || direct_peer;
+            link.direct_copy_measured    = src != dst && direct_peer;
+            std::snprintf(link.preferred_transfer, sizeof(link.preferred_transfer), "%s",
+                          src == dst ? "same-device" : (direct_peer ? "direct" : "host-bounce"));
+            std::snprintf(link.unsupported_reason, sizeof(link.unsupported_reason), "%s",
+                          src == dst || direct_peer ? "" : "mock-no-p2p");
+        }
+    }
+    return info;
 }
 
 static bool test_view_prefers_root_requested_device_over_stale_view_handle() {
@@ -401,7 +445,7 @@ static bool test_published_remote_dst_is_authoritative_for_immediate_consumer() 
     void *     dev1      = ggml_sycl_resolve_tensor_ptr(&dst, 1);
 
     ggml_sycl_test_consumer_device_plan plan{};
-    const bool                          planned = ggml_sycl_test_plan_real_simple_consumer_dispatch(&add, 0, &plan);
+    const bool                          planned = ggml_sycl_test_plan_simple_consumer_device(&add, 0, -1, &plan);
 
     ggml_sycl::alloc_registry::instance().unregister_alloc(stale_dst_dev0);
     ggml_sycl::alloc_registry::instance().unregister_alloc(produced_dev1);
@@ -410,11 +454,11 @@ static bool test_published_remote_dst_is_authoritative_for_immediate_consumer() 
     TEST_ASSERT(published, "remote dst publication should succeed");
     TEST_ASSERT(dev0 == nullptr, "immediate ctx-device resolve must not see stale dst output");
     TEST_ASSERT(dev1 == produced_dev1, "immediate producer-device resolve should see published output");
-    TEST_ASSERT(planned, "real simple consumer dispatch plan should resolve");
-    TEST_ASSERT(plan.execution_device == 1, "real ADD dispatch should move to the producing device");
-    TEST_ASSERT(plan.src_owner[0] == 1 && plan.src_owner[1] == 1, "real ADD dispatch should use producer ownership");
-    TEST_ASSERT(!plan.src_needs_staging[0] && !plan.src_needs_staging[1],
-                "real ADD dispatch should not stage inputs already on producer device");
+    TEST_ASSERT(planned, "simple consumer dispatch plan should resolve");
+    TEST_ASSERT(plan.execution_device == 0, "host-bounce ADD dispatch should stay on the current device");
+    TEST_ASSERT(plan.src_owner[0] == 1 && plan.src_owner[1] == 1, "ADD dispatch should preserve producer ownership");
+    TEST_ASSERT(plan.src_needs_staging[0] && plan.src_needs_staging[1],
+                "host-bounce ADD dispatch should stage remote producer inputs");
 
     return true;
 }
@@ -471,8 +515,8 @@ static bool test_remote_view_dst_publication_clears_stale_view_slot() {
     return true;
 }
 
-static bool test_simple_consumer_prefers_remote_producer_owner() {
-    printf("\n=== Test: simple consumer can execute on remote producer owner ===\n");
+static bool test_simple_consumer_prefers_remote_producer_owner_with_direct_peer() {
+    printf("\n=== Test: simple consumer can execute on remote producer owner with direct peer ===\n");
 
     alignas(64) std::uint8_t produced_dev1[4096] = {};
     alignas(64) std::uint8_t rhs_dev1[4096]      = {};
@@ -743,6 +787,12 @@ static bool test_resolve_or_host_rejects_registered_wrong_device_data() {
 static bool test_untracked_device_usm_fails_common_resolver() {
     printf("\n=== Test: common resolver rejects untracked device USM ===\n");
 
+    const char * run_runtime = std::getenv("GGML_SYCL_TEST_KV_VIEW_RUNTIME");
+    if (!run_runtime || std::atoi(run_runtime) == 0) {
+        printf("  SKIP: runtime USM probe requires GGML_SYCL_TEST_KV_VIEW_RUNTIME=1\n");
+        return true;
+    }
+
     if (ggml_sycl_info().device_count <= 0) {
         printf("  SKIP: no SYCL devices visible\n");
         return true;
@@ -799,6 +849,10 @@ static bool test_binbcast_stages_only_raw_host_storage() {
 }
 
 int main() {
+    const ggml_sycl_device_info              no_peer_mock_info     = make_mock_sycl_info(false);
+    const ggml_sycl_device_info              direct_peer_mock_info = make_mock_sycl_info(true);
+    ggml_sycl::test_sycl_info_override_guard info_guard(no_peer_mock_info);
+
     bool ok = true;
     ok &= test_view_prefers_root_requested_device_over_stale_view_handle();
     ok &= test_permuted_kv_view_resolves_root_device_and_fails_closed_elsewhere();
@@ -810,7 +864,9 @@ int main() {
     ok &= test_f16_remote_dst_publication_sets_producer_handle();
     ok &= test_published_remote_dst_is_authoritative_for_immediate_consumer();
     ok &= test_remote_view_dst_publication_clears_stale_view_slot();
-    ok &= test_simple_consumer_prefers_remote_producer_owner();
+    ggml_sycl::test_set_sycl_info_override(direct_peer_mock_info);
+    ok &= test_simple_consumer_prefers_remote_producer_owner_with_direct_peer();
+    ggml_sycl::test_set_sycl_info_override(no_peer_mock_info);
     ok &= test_simple_consumer_ignores_nonexistent_device_slots();
     ok &= test_simple_consumer_prefers_current_activation_over_remote_weight();
     ok &= test_simple_consumer_stages_host_backed_broadcast_weight();

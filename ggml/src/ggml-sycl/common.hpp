@@ -1099,6 +1099,10 @@ size_t                        ggml_sycl_get_host_max_alloc_size();
 const sycl_peer_link_info *   ggml_sycl_get_peer_link_info(int src_device, int dst_device);
 void                          ggml_sycl_dump_peer_link_info();
 
+namespace ggml_sycl {
+bool test_sycl_info_override_active();
+}
+
 // Access a device by logical GPU index using the full (pre-scheduler-hiding) map.
 // ggml_sycl_get_device() uses the same full map for GPU logical IDs; this helper
 // is useful during initialization and in paths that need the saved map explicitly.
@@ -2260,6 +2264,9 @@ inline sycl::usm::alloc ggml_sycl_probe_alloc_type_any_context(const void * ptr)
     if (alloc_type != sycl::usm::alloc::unknown || ptr == nullptr) {
         return alloc_type;
     }
+    if (ggml_sycl::test_sycl_info_override_active()) {
+        return sycl::usm::alloc::unknown;
+    }
 
     const auto & info         = ggml_sycl_info();
     const int    device_count = std::min(std::max(info.device_count, info.total_gpu_count), GGML_SYCL_MAX_DEVICES);
@@ -3417,6 +3424,7 @@ inline void * ggml_sycl_get_data_ptr(const ggml_tensor * tensor, int device) {
         const ggml_tensor * base      = ggml_sycl_view_root_and_offset(tensor, view_offs);
 
         void * base_ptr             = nullptr;
+        bool   base_on_device       = false;
         bool   base_owned_elsewhere = false;
 
         if (base->extra != nullptr && device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
@@ -3425,16 +3433,19 @@ inline void * ggml_sycl_get_data_ptr(const ggml_tensor * tensor, int device) {
             if (handle.device() == device || handle.device() == ggml_sycl::mem_handle::HOST_DEVICE) {
                 auto resolved = handle.resolve(device);
                 if (resolved) {
-                    base_ptr = resolved.ptr;
+                    base_ptr       = resolved.ptr;
+                    base_on_device = resolved.on_device;
                 }
             }
             if (base_ptr == nullptr && base_extra->data_device[device] != nullptr) {
                 const auto * info = ggml_sycl::alloc_registry::instance().lookup(base_extra->data_device[device]);
                 if (info && info->type == ggml_sycl::alloc_type::DEVICE && info->device_id == device) {
-                    base_ptr = base_extra->data_device[device];
+                    base_ptr       = base_extra->data_device[device];
+                    base_on_device = true;
                 } else if (info && (info->type == ggml_sycl::alloc_type::HOST_PINNED ||
                                     info->type == ggml_sycl::alloc_type::SHARED)) {
-                    base_ptr = base_extra->data_device[device];
+                    base_ptr       = base_extra->data_device[device];
+                    base_on_device = false;
                 }
             }
             for (int d = 0; d < GGML_SYCL_MAX_DEVICES && base_ptr == nullptr; ++d) {
@@ -3461,10 +3472,12 @@ inline void * ggml_sycl_get_data_ptr(const ggml_tensor * tensor, int device) {
         if (base_ptr == nullptr && base->data != nullptr) {
             const auto * info = ggml_sycl::alloc_registry::instance().lookup(base->data);
             if (info && info->type == ggml_sycl::alloc_type::DEVICE && info->device_id == device) {
-                base_ptr = base->data;
+                base_ptr       = base->data;
+                base_on_device = true;
             } else if (info && (info->type == ggml_sycl::alloc_type::HOST_PINNED ||
                                 info->type == ggml_sycl::alloc_type::SHARED)) {
-                base_ptr = base->data;
+                base_ptr       = base->data;
+                base_on_device = false;
             }
         }
 
@@ -3474,6 +3487,10 @@ inline void * ggml_sycl_get_data_ptr(const ggml_tensor * tensor, int device) {
 
         if (base_ptr != nullptr) {
             void * ptr = static_cast<char *>(base_ptr) + view_offs;
+            if (tensor->extra != nullptr && device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
+                auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
+                extra->set_data_device(device, ptr, GGML_LAYOUT_AOS, base_on_device);
+            }
             return ptr;
         }
         return ggml_sycl_get_data_ptr_slow(tensor, device);

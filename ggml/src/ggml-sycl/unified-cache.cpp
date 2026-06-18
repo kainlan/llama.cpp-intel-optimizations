@@ -72,6 +72,18 @@ static size_t arena_caller_reserved_headroom(size_t device_total_vram, size_t bu
     return device_total_vram > budget_bytes ? device_total_vram - budget_bytes : 0;
 }
 
+static constexpr size_t k_sycl_mib                            = 1024ull * 1024ull;
+static constexpr size_t k_graph_compute_min_external_headroom = 512ull * k_sycl_mib;
+static constexpr size_t k_runtime_external_headroom_margin    = 64ull * k_sycl_mib;
+
+static size_t arena_min_safe_external_headroom(size_t device_total_vram) {
+    if (device_total_vram == 0) {
+        return 0;
+    }
+    const size_t desired = k_graph_compute_min_external_headroom + k_runtime_external_headroom_margin;
+    return std::min(desired, device_total_vram / 2);
+}
+
 static size_t arena_default_external_headroom(size_t device_total_vram, size_t budget_bytes) {
     if (device_total_vram == 0) {
         return 0;
@@ -87,6 +99,7 @@ static size_t arena_default_external_headroom(size_t device_total_vram, size_t b
     if (caller_reserved_headroom > 0) {
         external_headroom = std::min(external_headroom, caller_reserved_headroom);
     }
+    external_headroom = std::max(external_headroom, arena_min_safe_external_headroom(device_total_vram));
     return external_headroom;
 }
 
@@ -7502,7 +7515,7 @@ static unified_cache * create_cache_for_device(int                     device_id
         // cushion covers other out-of-cache runtime consumers such as driver
         // overhead, transient kernel temporaries, and allocations that still
         // bypass zone management.
-        constexpr size_t device_runtime_slack_headroom = 512ull * 1024ull * 1024ull;
+        const size_t device_runtime_slack_headroom = arena_min_safe_external_headroom(base_mem);
         if (budget > device_runtime_slack_headroom) {
             budget -= device_runtime_slack_headroom;
             GGML_LOG_INFO(

@@ -966,6 +966,33 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         TIMEOUT 180
     )
 
+    # Test: synthetic KV/view pointer resolution and handle publication
+    add_executable(test-sycl-kv-view-resolution
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-kv-view-resolution.cpp
+    )
+    target_include_directories(test-sycl-kv-view-resolution PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
+    )
+    target_compile_options(test-sycl-kv-view-resolution PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_link_options(test-sycl-kv-view-resolution PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_compile_definitions(test-sycl-kv-view-resolution PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-sycl-kv-view-resolution PRIVATE ggml-base ggml ggml-sycl)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-sycl-kv-view-resolution PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME sycl-kv-view-resolution COMMAND test-sycl-kv-view-resolution)
+    set_tests_properties(sycl-kv-view-resolution PROPERTIES
+        LABELS "sycl;kv;view;mem-handle;tdd"
+        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH};GGML_SYCL_TEST_KV_VIEW_RUNTIME=0"
+        TIMEOUT 120
+    )
+
     # mem_handle eviction-lifecycle tests (RESEARCH-A4, llama.cpp-2jmzn)
     # Verifies cache_generation bumps + entry removal across sync and async
     # eviction paths. Companion to llama.cpp-goegc.1.

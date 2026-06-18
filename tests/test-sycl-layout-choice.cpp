@@ -877,16 +877,40 @@ static bool run_single_device_moe_pp_complete_soa_layout_test() {
 static bool run_multi_device_no_p2p_cohesive_moe_layer_test() {
     constexpr size_t mib       = 1024u * 1024u;
     constexpr int    n_experts = 2;
+    constexpr int    ncols     = 4096;
+    constexpr int    nrows     = 1928;
 
-    const std::vector<std::pair<std::string, size_t>> inventory = {
-        { "blk.0.attn_q.weight",        4u * mib },
-        { "blk.0.ffn_gate_exps.weight", 8u * mib },
-        { "blk.0.ffn_up_exps.weight",   8u * mib },
-        { "blk.0.ffn_down_exps.weight", 8u * mib },
-        { "blk.1.attn_q.weight",        4u * mib },
-        { "blk.1.ffn_gate_exps.weight", 8u * mib },
-        { "blk.1.ffn_up_exps.weight",   8u * mib },
-        { "blk.1.ffn_down_exps.weight", 8u * mib },
+    auto make_dense = [](const char * name) {
+        constexpr int hidden_dim = 4096;
+        constexpr int tokens     = 512;
+
+        ggml_sycl::placement_tensor_info tensor;
+        tensor.name  = name;
+        tensor.type  = GGML_TYPE_F16;
+        tensor.ne[0] = hidden_dim;
+        tensor.ne[1] = tokens;
+        tensor.size  = ggml_row_size(GGML_TYPE_F16, hidden_dim) * static_cast<size_t>(tokens);
+        return tensor;
+    };
+
+    auto make_mxfp4 = [&](const char * name) {
+        ggml_sycl::placement_tensor_info tensor;
+        tensor.name  = name;
+        tensor.type  = GGML_TYPE_MXFP4;
+        tensor.ne[0] = ncols;
+        tensor.ne[1] = nrows;
+        tensor.ne[2] = n_experts;
+        tensor.ne[3] = 1;
+        tensor.size =
+            ggml_row_size(GGML_TYPE_MXFP4, ncols) * static_cast<size_t>(nrows) * static_cast<size_t>(n_experts);
+        return tensor;
+    };
+
+    const std::vector<ggml_sycl::placement_tensor_info> inventory = {
+        make_dense("blk.0.attn_q.weight"),      make_mxfp4("blk.0.ffn_gate_exps.weight"),
+        make_mxfp4("blk.0.ffn_up_exps.weight"), make_mxfp4("blk.0.ffn_down_exps.weight"),
+        make_dense("blk.1.attn_q.weight"),      make_mxfp4("blk.1.ffn_gate_exps.weight"),
+        make_mxfp4("blk.1.ffn_up_exps.weight"), make_mxfp4("blk.1.ffn_down_exps.weight"),
     };
     const std::vector<ggml_sycl::device_budget> devices = {
         { 0, 128u * mib, 128u * mib, 1.0, true },
@@ -964,22 +988,30 @@ static bool run_regression_guard_policy_test() {
         return false;
     }
 
-    constexpr size_t mib                = 1024ull * 1024ull;
-    constexpr size_t b50_total          = 16304ull * mib;
-    constexpr size_t caller_reserved    = 565ull * mib;
-    constexpr size_t b50_public_budget  = b50_total - caller_reserved;
-    const size_t     b50_full_headroom  = b50_total / 10;
-    const size_t     b50_clamped_headroom =
-        ggml_sycl::test_arena_external_headroom_bytes(b50_total, b50_public_budget);
-    if (b50_clamped_headroom != caller_reserved) {
-        printf("FAIL: arena headroom should preserve caller-reserved B50 slack, got %zu expected %zu\n",
-               b50_clamped_headroom, caller_reserved);
+    constexpr size_t mib                  = 1024ull * 1024ull;
+    constexpr size_t b50_total            = 16304ull * mib;
+    constexpr size_t caller_reserved      = 565ull * mib;
+    constexpr size_t safe_headroom        = 576ull * mib;
+    constexpr size_t b50_public_budget    = b50_total - caller_reserved;
+    const size_t     b50_full_headroom    = b50_total / 10;
+    const size_t     b50_clamped_headroom = ggml_sycl::test_arena_external_headroom_bytes(b50_total, b50_public_budget);
+    if (b50_clamped_headroom != safe_headroom) {
+        printf("FAIL: arena headroom should raise undersized caller slack to the safe floor, got %zu expected %zu\n",
+               b50_clamped_headroom, safe_headroom);
         return false;
     }
     const size_t b50_default_headroom = ggml_sycl::test_arena_external_headroom_bytes(b50_total, b50_total);
     if (b50_default_headroom != b50_full_headroom) {
-        printf("FAIL: arena headroom should use proportional B50 default, got %zu expected %zu\n",
-               b50_default_headroom, b50_full_headroom);
+        printf("FAIL: arena headroom should use proportional B50 default, got %zu expected %zu\n", b50_default_headroom,
+               b50_full_headroom);
+        return false;
+    }
+    constexpr size_t b580_total         = 12288ull * mib;
+    constexpr size_t b580_public_budget = b580_total - 512ull * mib;
+    const size_t     b580_headroom      = ggml_sycl::test_arena_external_headroom_bytes(b580_total, b580_public_budget);
+    if (b580_headroom != safe_headroom) {
+        printf("FAIL: arena headroom should not leave only the exact graph scratch floor, got %zu expected %zu\n",
+               b580_headroom, safe_headroom);
         return false;
     }
     if (ggml_sycl::test_arena_external_headroom_bytes(0, b50_total) != 0) {

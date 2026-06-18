@@ -195,7 +195,7 @@ mem_handle mem_handle::from_weight_lease(const unified_cache_key & key,
     h.leased_entry_ = entry;               // ownership of the refcount bump transferred
 
     if (ptr != nullptr && valid_cache_device_id(device)) {
-        unified_cache * cache = get_unified_cache_for_device(device);
+        unified_cache * cache = get_existing_unified_cache_for_device(device);
         if (cache) {
             const int vram_idx = cache->arena_acquire_chunk_lease(ptr);
             if (vram_idx >= 0) {
@@ -280,7 +280,7 @@ mem_handle mem_handle::from_chunk_ptr(void * ptr, int device, ggml_layout_mode l
         return h;
     }
 
-    unified_cache * cache = valid_cache_device_id(device) ? get_unified_cache_for_device(device) : nullptr;
+    unified_cache * cache = valid_cache_device_id(device) ? get_existing_unified_cache_for_device(device) : nullptr;
     if (cache) {
         // Priority 1: VRAM arena (pointer is device-resident).
         const int vram_idx = cache->arena_acquire_chunk_lease(ptr);
@@ -621,7 +621,8 @@ static void bump_chunk_lease_for_copy(uint8_t      chunk_source,
         out_vram_idx    = -1;
         return;
     }
-    unified_cache * cache = valid_cache_device_id(chunk_device) ? get_unified_cache_for_device(chunk_device) : nullptr;
+    unified_cache * cache =
+        valid_cache_device_id(chunk_device) ? get_existing_unified_cache_for_device(chunk_device) : nullptr;
     if (!cache) {
         out_host_handle = UINT64_MAX;
         out_vram_idx    = -1;
@@ -774,7 +775,7 @@ resolved_ptr mem_handle::resolve_arena() const {
         return {};
     }
 
-    unified_cache * cache = get_unified_cache_for_device(device_);
+    unified_cache * cache = get_existing_unified_cache_for_device(device_);
     if (!cache) {
         return {};
     }
