@@ -22,13 +22,13 @@ Environment overrides:
   CONCISE_MAX_LINES
                   Maximum non-debug model-run log lines (default: 2500)
   MISTRAL_B580_MIN_PP / MISTRAL_B580_MIN_TG
-                  Minimum B580 pp512/tg128 tok/s (default: 1680 / 78)
+                  Minimum B580 pp512/tg128 tok/s (default: 1700 / 81)
   MISTRAL_B580_FA_MIN_PP / MISTRAL_B580_FA_MIN_TG
-                  Minimum B580 -fa 1 pp512/tg128 tok/s (default: 2000 / 78)
+                  Minimum B580 -fa 1 pp512/tg128 tok/s (default: 2000 / 85)
   MISTRAL_FA_BLOCKED_OK
-                  Mark slow -fa 1 as BLOCKED with proof instead of failing (default: 1)
+                  Mark slow -fa 1 as BLOCKED with proof instead of failing (default: 0)
   MISTRAL_B50_MIN_PP / MISTRAL_B50_MIN_TG
-                  Minimum B50 pp512/tg128 tok/s (default: 1050 / 38)
+                  Minimum B50 pp512/tg128 tok/s (default: 1150 / 44)
   MISTRAL_UNSAFE_ONEDNN_REPRO_LOG
                   Optional historical pre-fix unsafe oneDNN completion log
 EOF
@@ -46,13 +46,13 @@ QUICK_TIMEOUT="${QUICK_TIMEOUT:-5m}"
 SMOKE_TIMEOUT="${SMOKE_TIMEOUT:-20m}"
 FULL_TIMEOUT="${FULL_TIMEOUT:-60m}"
 CONCISE_MAX_LINES="${CONCISE_MAX_LINES:-2500}"
-MISTRAL_B580_MIN_PP="${MISTRAL_B580_MIN_PP:-1680}"
-MISTRAL_B580_MIN_TG="${MISTRAL_B580_MIN_TG:-78}"
+MISTRAL_B580_MIN_PP="${MISTRAL_B580_MIN_PP:-1700}"
+MISTRAL_B580_MIN_TG="${MISTRAL_B580_MIN_TG:-81}"
 MISTRAL_B580_FA_MIN_PP="${MISTRAL_B580_FA_MIN_PP:-2000}"
-MISTRAL_B580_FA_MIN_TG="${MISTRAL_B580_FA_MIN_TG:-78}"
-MISTRAL_FA_BLOCKED_OK="${MISTRAL_FA_BLOCKED_OK:-1}"
-MISTRAL_B50_MIN_PP="${MISTRAL_B50_MIN_PP:-1050}"
-MISTRAL_B50_MIN_TG="${MISTRAL_B50_MIN_TG:-38}"
+MISTRAL_B580_FA_MIN_TG="${MISTRAL_B580_FA_MIN_TG:-85}"
+MISTRAL_FA_BLOCKED_OK="${MISTRAL_FA_BLOCKED_OK:-0}"
+MISTRAL_B50_MIN_PP="${MISTRAL_B50_MIN_PP:-1150}"
+MISTRAL_B50_MIN_TG="${MISTRAL_B50_MIN_TG:-44}"
 MISTRAL_UNSAFE_ONEDNN_REPRO_LOG="${MISTRAL_UNSAFE_ONEDNN_REPRO_LOG:-/tmp/mistral-completion-onednn-allow.log}"
 
 while [[ $# -gt 0 ]]; do
@@ -516,7 +516,7 @@ if [[ "${mode}" == "smoke" || "${mode}" == "full" ]]; then
         GGML_SYCL_OP_TIMEOUT_MS=60000 \
         timeout "${SMOKE_TIMEOUT}" \
         "${BUILD_PATH}/bin/llama-bench" \
-        -m "${GPT_OSS_MODEL}" -p 16 -n 4 -ngl 99 -fa 1
+        -m "${GPT_OSS_MODEL}" -p 16 -n 4 -fa 1
     GPT_OSS_HYBRID_LOGS+=("${LOG_DIR}/gpt-oss-hybrid-p16-n4.log")
     reject_device_lost_errors "${LOG_DIR}/gpt-oss-hybrid-p16-n4.log"
     summarize_bench_log "gpt-oss-hybrid-p16-n4" "${LOG_DIR}/gpt-oss-hybrid-p16-n4.log"
@@ -529,7 +529,7 @@ if [[ "${mode}" == "smoke" || "${mode}" == "full" ]]; then
         GGML_SYCL_OP_TIMEOUT_MS=60000 \
         timeout "${SMOKE_TIMEOUT}" \
         "${BUILD_PATH}/bin/llama-bench" \
-        -m "${GPT_OSS_MODEL}" -p 16 -n 4 -ngl 99 -fa 1
+        -m "${GPT_OSS_MODEL}" -p 16 -n 4 -fa 1
     require_log_pattern "default auto expert mode" "${LOG_DIR}/gpt-oss-default-auto-p16-n4.log" \
         'Multi-GPU auto mode: using expert parallelism|Mode:[[:space:]]*EXPERT'
     reject_device_lost_errors "${LOG_DIR}/gpt-oss-default-auto-p16-n4.log"
@@ -549,7 +549,7 @@ if [[ "${mode}" == "full" ]]; then
         GGML_SYCL_OP_TIMEOUT_MS=60000 \
         timeout "${FULL_TIMEOUT}" \
         "${BUILD_PATH}/bin/llama-bench" \
-        -m "${GPT_OSS_MODEL}" -p 512 -n 128 -ngl 99 -fa 1
+        -m "${GPT_OSS_MODEL}" -p 512 -n 128 -fa 1
     GPT_OSS_HYBRID_LOGS+=("${LOG_DIR}/gpt-oss-hybrid-pp512-tg128.log")
     reject_device_lost_errors "${LOG_DIR}/gpt-oss-hybrid-pp512-tg128.log"
     summarize_bench_log "gpt-oss-hybrid-pp512-tg128" "${LOG_DIR}/gpt-oss-hybrid-pp512-tg128.log"
@@ -562,7 +562,7 @@ if [[ "${mode}" == "full" ]]; then
         GGML_SYCL_OP_TIMEOUT_MS=60000 \
         timeout "${FULL_TIMEOUT}" \
         "${BUILD_PATH}/bin/llama-bench" \
-        -m "${GPT_OSS_MODEL}" -p 512 -n 128 -ngl 99 -fa 1
+        -m "${GPT_OSS_MODEL}" -p 512 -n 128 -fa 1
     require_log_pattern "default auto expert mode" "${LOG_DIR}/gpt-oss-default-auto-pp512-tg128.log" \
         'Multi-GPU auto mode: using expert parallelism|Mode:[[:space:]]*EXPERT'
     reject_device_lost_errors "${LOG_DIR}/gpt-oss-default-auto-pp512-tg128.log"
@@ -603,7 +603,7 @@ if [[ "${mode}" == "full" ]]; then
             ONEAPI_DEVICE_SELECTOR="${selector}" \
             timeout "${SMOKE_TIMEOUT}" \
             "${BUILD_PATH}/bin/llama-bench" \
-            -m "${MISTRAL_MODEL}" -p 512 -n 128 -ngl 99
+            -m "${MISTRAL_MODEL}" -p 512 -n 128
         reject_device_lost_errors "${LOG_DIR}/mistral-${device_label}-pp512-tg128.log"
         summarize_bench_log "mistral-${device_label}-pp512-tg128" \
             "${LOG_DIR}/mistral-${device_label}-pp512-tg128.log"
@@ -644,7 +644,7 @@ if [[ "${mode}" == "full" ]]; then
                 GGML_SYCL_FA_DISPATCH_DEBUG_LIMIT=4 \
                 timeout "${SMOKE_TIMEOUT}" \
                 "${BUILD_PATH}/bin/llama-bench" \
-                -m "${MISTRAL_MODEL}" -p 512 -n 0 -ngl 99 -fa 1
+                -m "${MISTRAL_MODEL}" -p 512 -n 0 -fa 1
             require_log_pattern "FA dispatch reaches prompt path" \
                 "${LOG_DIR}/mistral-${device_label}-fa-dispatch-proof.log" \
                 'fattn dispatch .*D=128 ne1>16 xmx=1'
@@ -661,7 +661,7 @@ if [[ "${mode}" == "full" ]]; then
                 ONEAPI_DEVICE_SELECTOR="${selector}" \
                 timeout "${SMOKE_TIMEOUT}" \
                 "${BUILD_PATH}/bin/llama-bench" \
-                -m "${MISTRAL_MODEL}" -p 512 -n 128 -ngl 99 -fa 1
+                -m "${MISTRAL_MODEL}" -p 512 -n 128 -fa 1
             reject_device_lost_errors "${LOG_DIR}/mistral-${device_label}-fa-pp512-tg128.log"
             reject_log_pattern "unsafe oneDNN nc!=D bypass" "${LOG_DIR}/mistral-${device_label}-fa-pp512-tg128.log" \
                 'nc!=D contiguity gate bypassed'

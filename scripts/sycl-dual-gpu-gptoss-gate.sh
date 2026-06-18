@@ -3,6 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LLAMA_BENCH="${LLAMA_BENCH:-$ROOT_DIR/build/bin/llama-bench}"
+LLAMA_CLI="${LLAMA_CLI:-$ROOT_DIR/build/bin/llama-cli}"
+LLAMA_COMPLETION="${LLAMA_COMPLETION:-$ROOT_DIR/build/bin/llama-completion}"
 GPTOSS_MODEL="${GPTOSS_MODEL:-/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf}"
 MISTRAL_MODEL="${MISTRAL_MODEL:-/Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf}"
 OUT_DIR="${OUT_DIR:-$ROOT_DIR/benchmark_results/sycl-dual-gpu-gate-$(date +%Y%m%d-%H%M%S)}"
@@ -10,7 +12,8 @@ BENCH_TIMEOUT="${BENCH_TIMEOUT:-900}"
 GPTOSS_B50_MIN_PP512="${GPTOSS_B50_MIN_PP512:-1100}"
 GPTOSS_B50_MIN_TG128="${GPTOSS_B50_MIN_TG128:-50}"
 MISTRAL_B580_MIN_PP512="${MISTRAL_B580_MIN_PP512:-2000}"
-MISTRAL_B580_MIN_TG128="${MISTRAL_B580_MIN_TG128:-84}"
+MISTRAL_B580_MIN_TG128="${MISTRAL_B580_MIN_TG128:-85}"
+RUN_CORRECTNESS="${RUN_CORRECTNESS:-1}"
 
 # shellcheck disable=SC1091
 source "$ROOT_DIR/scripts/sycl-gpu-preflight.sh"
@@ -22,6 +25,19 @@ set -u
 mkdir -p "$OUT_DIR"
 SUMMARY="$OUT_DIR/summary.tsv"
 printf "case\tselector\tmodel\tfa\trc\tpp512_tps\ttg128_tps\tmoe_ms\tgpu_expert_ms\tnon_moe_ms\troute_dev0\troute_secondary\troute_host\troute_unavailable\thost_routing\tlog\n" > "$SUMMARY"
+CORRECTNESS="$OUT_DIR/correctness.tsv"
+printf "case\tselector\trc\tpass\tlog\n" > "$CORRECTNESS"
+
+if [[ "$RUN_CORRECTNESS" == "1" ]]; then
+    if [[ ! -x "$LLAMA_CLI" ]]; then
+        echo "llama-cli not executable: $LLAMA_CLI" >&2
+        exit 2
+    fi
+    if [[ ! -x "$LLAMA_COMPLETION" ]]; then
+        echo "llama-completion not executable: $LLAMA_COMPLETION" >&2
+        exit 2
+    fi
+fi
 
 parse_tps() {
     local log="$1"
@@ -106,7 +122,7 @@ run_case() {
     printf "[gate] %s selector=%s fa=%s\n" "$name" "$selector" "$fa" | tee "$log"
     sycl_gpu_preflight_check "$selector"
     set +e
-    timeout "$BENCH_TIMEOUT" env "${env_args[@]}" "$LLAMA_BENCH" -m "$model" -p 512 -n 128 -fa "$fa" -ngl 99 2>&1 | tee -a "$log"
+    timeout "$BENCH_TIMEOUT" env "${env_args[@]}" "$LLAMA_BENCH" -m "$model" -p 512 -n 128 -fa "$fa" 2>&1 | tee -a "$log"
     local rc=${PIPESTATUS[0]}
     set -e
 
@@ -134,6 +150,60 @@ run_case() {
         "$rc" "${pp:-NA}" "${tg:-NA}" "${moe_ms:-NA}" "${gpu_expert_ms:-NA}" "${non_moe_ms:-NA}" \
         "${route_dev0:-NA}" "${route_secondary:-NA}" "${route_host:-NA}" "${route_unavailable:-NA}" \
         "${host_routing:-NA}" "$log" >> "$SUMMARY"
+}
+
+run_correctness_case() {
+    local name="$1"
+    local selector="$2"
+    shift 2
+    local log="$OUT_DIR/${name}.log"
+    local -a cmd=("$@")
+
+    printf "[correctness] %s selector=%s\n" "$name" "$selector" | tee "$log"
+    sycl_gpu_preflight_check "$selector"
+    set +e
+    timeout "$BENCH_TIMEOUT" env ONEAPI_DEVICE_SELECTOR="$selector" "${cmd[@]}" 2>&1 | tee -a "$log"
+    local rc=${PIPESTATUS[0]}
+    set -e
+
+    local pass="no"
+    case "$name" in
+        gptoss-b50-count)
+            if grep -Eq '1, 2, 3, 4, 5' "$log"; then
+                pass="yes"
+            fi
+            ;;
+        mistral-b580-count)
+            if grep -Eq '1, 2, 3, 4, 5, 6, 7, 8, 9, 10' "$log"; then
+                pass="yes"
+            fi
+            ;;
+    esac
+
+    printf "%s\t%s\t%s\t%s\t%s\n" "$name" "$selector" "$rc" "$pass" "$log" >> "$CORRECTNESS"
+    if [[ "$rc" != "0" || "$pass" != "yes" ]]; then
+        echo "correctness gate failed: $name" >&2
+        return 1
+    fi
+}
+
+run_correctness_gates() {
+    if [[ "$RUN_CORRECTNESS" != "1" ]]; then
+        return 0
+    fi
+
+    run_correctness_case "mistral-b580-count" "level_zero:0" \
+        "$LLAMA_COMPLETION" \
+        -m "$MISTRAL_MODEL" \
+        -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
+
+    run_correctness_case "gptoss-b50-count" "level_zero:1" \
+        "$LLAMA_CLI" \
+        -m "$GPTOSS_MODEL" \
+        -cnv -st --simple-io --no-display-prompt \
+        --reasoning-format none --reasoning-budget 0 \
+        -p 'Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5' \
+        -n 48 --seed 42 --temp 0
 }
 
 write_comparison() {
@@ -232,6 +302,8 @@ validate_guardrails() {
     ' "$SUMMARY" > "$guardrails"
 }
 
+run_correctness_gates
+
 for fa in 1 0; do
     run_case "gptoss-b580" "level_zero:0" "$GPTOSS_MODEL" "$fa"
     run_case "gptoss-b50" "level_zero:1" "$GPTOSS_MODEL" "$fa"
@@ -245,6 +317,10 @@ done
 
 write_comparison
 column -t -s $'\t' "$SUMMARY" | tee "$OUT_DIR/summary.txt"
+if [[ "$RUN_CORRECTNESS" == "1" ]]; then
+    printf "\nCorrectness:\n" | tee -a "$OUT_DIR/summary.txt"
+    column -t -s $'\t' "$CORRECTNESS" | tee -a "$OUT_DIR/summary.txt"
+fi
 printf "\nComparison:\n" | tee -a "$OUT_DIR/summary.txt"
 column -t -s $'\t' "$OUT_DIR/comparison.tsv" | tee -a "$OUT_DIR/summary.txt"
 printf "\nGuardrails:\n" | tee -a "$OUT_DIR/summary.txt"
