@@ -577,6 +577,13 @@ size_t mem_handle::stable_identity_hash() const {
         h = mem_handle_hash_combine(h, std::hash<int32_t>()(vram_chunk_idx_));
         h = mem_handle_hash_combine(h, std::hash<void *>()(cached_.ptr));
         h = mem_handle_hash_combine(h, std::hash<size_t>()(size_));
+    } else if (owned_alloc_) {
+        h = mem_handle_hash_combine(h, std::hash<uint64_t>()(owned_alloc_->alloc_id));
+        h = mem_handle_hash_combine(h, std::hash<int>()(owned_alloc_->device));
+        h = mem_handle_hash_combine(h, std::hash<int>()(static_cast<int>(owned_alloc_->tier)));
+        h = mem_handle_hash_combine(h, std::hash<int>()(static_cast<int>(owned_alloc_->role)));
+        h = mem_handle_hash_combine(h, std::hash<int>()(static_cast<int>(owned_alloc_->category)));
+        h = mem_handle_hash_combine(h, std::hash<size_t>()(owned_alloc_->size));
     } else {
         h = mem_handle_hash_combine(h, std::hash<void *>()(cached_.ptr));
         h = mem_handle_hash_combine(h, std::hash<size_t>()(size_));
@@ -605,7 +612,18 @@ bool mem_handle::stable_identity_equal(const mem_handle & other) const {
                cached_.ptr == other.cached_.ptr && size_ == other.size_;
     }
 
+    if (owned_alloc_ || other.owned_alloc_) {
+        return owned_alloc_ && other.owned_alloc_ && owned_alloc_->alloc_id == other.owned_alloc_->alloc_id &&
+               owned_alloc_->device == other.owned_alloc_->device && owned_alloc_->tier == other.owned_alloc_->tier &&
+               owned_alloc_->role == other.owned_alloc_->role &&
+               owned_alloc_->category == other.owned_alloc_->category && owned_alloc_->size == other.owned_alloc_->size;
+    }
+
     return cached_.ptr == other.cached_.ptr && size_ == other.size_;
+}
+
+bool mem_handle::has_stable_owner_identity() const {
+    return is_weight() || is_arena() || kind_ == mem_handle_kind::CHUNK_LEASE || owned_alloc_ != nullptr;
 }
 
 // === destructor / copy / move ===

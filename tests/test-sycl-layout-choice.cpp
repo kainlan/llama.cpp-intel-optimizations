@@ -1168,6 +1168,23 @@ static bool run_regression_guard_policy_test() {
         return false;
     }
 
+    uint8_t               abi_a = 0;
+    uint8_t               abi_b = 0;
+    ggml_sycl_cache_id    id    = ggml_sycl::test_make_cache_id(&abi_a);
+    ggml_sycl::mem_handle weight_a =
+        ggml_sycl::mem_handle::from_weight_lease(id, 0, &abi_a, GGML_LAYOUT_SOA, true, nullptr);
+    ggml_sycl::mem_handle weight_b =
+        ggml_sycl::mem_handle::from_weight_lease(id, 0, &abi_b, GGML_LAYOUT_SOA, true, nullptr);
+    if (weight_a.hash() == weight_b.hash()) {
+        printf("FAIL: test setup expected distinct ABI pointer hashes for moved weight handles\n");
+        return false;
+    }
+    if (weight_a.stable_identity_hash() != weight_b.stable_identity_hash() ||
+        !weight_a.stable_identity_equal(weight_b) || !weight_a.has_stable_owner_identity()) {
+        printf("FAIL: MoE graphlet signatures must use stable weight identity, not resolved ABI pointers\n");
+        return false;
+    }
+
     printf("PASS: SYCL regression guards preserve single-GPU MoE resolve and arena headroom\n");
     return true;
 }

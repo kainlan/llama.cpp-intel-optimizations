@@ -4537,7 +4537,8 @@ struct ggml_backend_sycl_context {
     struct moe_graph_moe_dispatch {
         int      node_idx;      // Fused MoE dispatch boundary in cgraph->nodes[]
         uint64_t graph_hash;    // Structural cgraph signature at record time
-        uint64_t pointer_hash;  // Resolved operand/handle signature at record time
+        uint64_t                           identity_hash;  // Smart-handle operand/descriptor signature at record time
+        std::vector<ggml_sycl::mem_handle> retained_handles;
         std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph;
     };
 
@@ -4545,11 +4546,12 @@ struct ggml_backend_sycl_context {
         int              start_node;  // Inclusive start index in cgraph->nodes[]
         int              end_node;    // Exclusive end index in cgraph->nodes[]
         uint64_t         graph_hash;
-        uint64_t         pointer_hash;
+        uint64_t                           identity_hash;
         // Fused MoE dispatch nodes captured by this recorded safe subrange.
         // The subrange may also contain non-MoE ops, or be a non-MoE range
         // recorded to amortize direct dispatch around GET_ROWS/FA gaps.
         std::vector<int> moe_nodes;
+        std::vector<ggml_sycl::mem_handle> retained_handles;
         std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph;
     };
 

@@ -232,6 +232,10 @@ class mem_handle {
     // never resolves the current pointer and never aliases by transient pointer.
     bool stable_identity_equal(const mem_handle & other) const;
 
+    // True when stable_identity_hash()/stable_identity_equal() are backed by a
+    // unified-cache/allocator identity rather than a raw external pointer.
+    bool has_stable_owner_identity() const;
+
   private:
     // Slow path: re-query the unified cache for the current pointer.
     resolved_ptr resolve_slow() const;
