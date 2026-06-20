@@ -3178,6 +3178,55 @@ struct ggml_tensor_extra_gpu {
         return erased;
     }
 
+    bool take_moe_storage_handle_on_device(int                         expert_id,
+                                           ggml_layout_mode            layout,
+                                           int                         owner_device,
+                                           moe_expert_storage_record * out_record) {
+        if (expert_id < 0 || !out_record) {
+            return false;
+        }
+
+        auto it = moe_expert_storage_handles.find(moe_storage_handle_key(expert_id, layout));
+        if (it == moe_expert_storage_handles.end()) {
+            return false;
+        }
+
+        auto & records = it->second;
+        auto   rec_it  = std::find_if(records.begin(), records.end(), [&](const moe_expert_storage_record & record) {
+            return record.handle.device() == owner_device;
+        });
+        if (rec_it == records.end()) {
+            return false;
+        }
+
+        *out_record = std::move(*rec_it);
+        records.erase(rec_it);
+        if (records.empty()) {
+            moe_expert_storage_handles.erase(it);
+        }
+
+        if (owner_device >= 0 && owner_device < GGML_SYCL_MAX_DEVICES) {
+            const size_t slot = static_cast<size_t>(expert_id);
+            if (slot < moe_expert_handles[owner_device].size()) {
+                ggml_sycl::mem_handle table_handle = moe_expert_handles[owner_device][slot];
+                auto                  resolved     = table_handle.resolve(owner_device);
+                if (resolved.ptr && resolved.layout == layout && table_handle.device() == owner_device) {
+                    moe_expert_handles[owner_device][slot] = ggml_sycl::mem_handle{};
+                    if (slot < moe_expert_ptr_payload[owner_device].size()) {
+                        moe_expert_ptr_payload[owner_device][slot] = nullptr;
+                    }
+                    moe_device_table_valid[owner_device]          = false;
+                    moe_full_local_probe_generation[owner_device] = 0;
+                    moe_full_local_probe_layout[owner_device]     = GGML_LAYOUT_AOS;
+                    moe_full_local_probe_ok[owner_device]         = false;
+                }
+            }
+        }
+
+        ++moe_expert_storage_generation;
+        return true;
+    }
+
     void clear_moe_storage_handles() {
         moe_expert_storage_handles.clear();
         ++moe_expert_storage_generation;
