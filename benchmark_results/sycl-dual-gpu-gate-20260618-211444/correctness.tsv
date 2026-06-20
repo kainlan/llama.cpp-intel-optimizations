@@ -1,0 +1,3 @@
+case	selector	rc	pass	log
+mistral-b580-count	level_zero:0	0	yes	/Apps/llama.cpp/benchmark_results/sycl-dual-gpu-gate-20260618-211444/mistral-b580-count.log
+gptoss-b50-count	level_zero:1	0	yes	/Apps/llama.cpp/benchmark_results/sycl-dual-gpu-gate-20260618-211444/gptoss-b50-count.log

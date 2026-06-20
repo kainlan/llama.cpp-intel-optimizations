@@ -728,13 +728,13 @@ static bool run_single_device_moe_pp_complete_soa_layout_test() {
     auto plan = ggml_sycl::compute_multi_device_plan(devices, inventory, 1, ggml_sycl::multi_gpu_mode::EXPERT, kv_info,
                                                      nullptr, n_experts);
 
-    auto has_soa_layout_on_target = [](const ggml_sycl::expert_placement_result & placement) {
-        if (placement.layout == GGML_LAYOUT_SOA) {
+    auto has_layout_on_target = [](const ggml_sycl::expert_placement_result & placement, ggml_layout_mode layout) {
+        if (placement.layout == layout) {
             return true;
         }
         for (const auto & alt : placement.alternate_layouts) {
             const int alt_target = alt.target_device >= 0 ? alt.target_device : placement.target_device;
-            if (alt.layout == GGML_LAYOUT_SOA && alt_target == placement.target_device) {
+            if (alt.layout == layout && alt_target == placement.target_device) {
                 return true;
             }
         }
@@ -758,7 +758,8 @@ static bool run_single_device_moe_pp_complete_soa_layout_test() {
                    (int) gate.layout, (int) up.layout);
             return false;
         }
-        if (!has_soa_layout_on_target(gate) || !has_soa_layout_on_target(up) || !has_soa_layout_on_target(down)) {
+        if (!has_layout_on_target(gate, GGML_LAYOUT_SOA) || !has_layout_on_target(up, GGML_LAYOUT_SOA) ||
+            !has_layout_on_target(down, GGML_LAYOUT_SOA)) {
             printf("FAIL: expert %d is missing complete SOA PP executable coverage, gate=%d up=%d down=%d\n", e,
                    (int) gate.layout, (int) up.layout, (int) down.layout);
             return false;
@@ -769,10 +770,6 @@ static bool run_single_device_moe_pp_complete_soa_layout_test() {
             return false;
         }
     }
-    if (!plan.moe_pp_soa_promoted) {
-        printf("FAIL: planner should record PP SOA promotion for prompt-incompatible gate/up primaries\n");
-        return false;
-    }
     const size_t planned_charge = planned_weight_charge_for_device(plan, 0);
     if (plan.weight_vram_bytes != planned_charge || plan.vram_bytes != planned_charge) {
         printf("FAIL: planner under/over-counted PP-safe MoE layout charge, plan weight=%zu vram=%zu actual=%zu\n",
@@ -782,6 +779,10 @@ static bool run_single_device_moe_pp_complete_soa_layout_test() {
     if (planned_charge > devices[0].vram_budget) {
         printf("FAIL: planner charged beyond device budget, charged=%zu budget=%zu\n", planned_charge,
                devices[0].vram_budget);
+        return false;
+    }
+    if (!plan.moe_pp_soa_promoted) {
+        printf("FAIL: planner should record PP SOA promotion for prompt-incompatible gate/up primaries\n");
         return false;
     }
 
@@ -867,6 +868,46 @@ static bool run_single_device_moe_pp_complete_soa_layout_test() {
                                                      /*selected_rows=*/512, /*exact_override=*/false,
                                                      /*n_tokens=*/512) != GGML_LAYOUT_MXFP4_DPAS) {
         printf("FAIL: prompt-down DPAS should remain selected after proof-gated SOA fallback coverage is complete\n");
+        return false;
+    }
+
+    ggml_tensor gate_tensor{};
+    gate_tensor.type  = GGML_TYPE_MXFP4;
+    gate_tensor.ne[0] = ncols;
+    gate_tensor.ne[1] = nrows;
+    gate_tensor.ne[2] = n_experts;
+    gate_tensor.ne[3] = 1;
+    ggml_set_name(&gate_tensor, "blk.0.ffn_gate_exps.weight");
+
+    if (ggml_sycl::test_xmx_moe_allow_unsafe_pp_from_env(nullptr, nullptr)) {
+        printf("FAIL: prompt XMX MoE PP must be disabled by default\n");
+        return false;
+    }
+    if (ggml_sycl::test_xmx_moe_allow_unsafe_pp_from_env("0", "1")) {
+        printf("FAIL: explicit unsafe-PP env=0 must override legacy env=1\n");
+        return false;
+    }
+    if (!ggml_sycl::test_xmx_moe_allow_unsafe_pp_from_env("1", nullptr) ||
+        !ggml_sycl::test_xmx_moe_allow_unsafe_pp_from_env(nullptr, "1")) {
+        printf("FAIL: prompt XMX MoE PP should remain opt-in through explicit or legacy env\n");
+        return false;
+    }
+
+    setenv("GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP", "0", 1);
+    setenv("GGML_SYCL_XMX_MOE_PP", "0", 1);
+    ggml_sycl::test_clear_moe_planned_layout_probe_overrides();
+    ggml_sycl::test_set_moe_planned_layout_probe_override(&gate_tensor, 0, GGML_LAYOUT_XMX_TILED, n_experts, 0, 0, 0);
+    ggml_sycl::test_set_moe_planned_layout_probe_override(&gate_tensor, 0, GGML_LAYOUT_SOA, n_experts, 0, 0, 0);
+    if (ggml_sycl::test_moe_layout_for_selected_rows(&gate_tensor, 0, GGML_LAYOUT_XMX_TILED,
+                                                     /*selected_rows=*/512, /*exact_override=*/false,
+                                                     /*n_tokens=*/512) != GGML_LAYOUT_SOA) {
+        printf("FAIL: prompt gate XMX_TILED should fall back to planned SOA by default\n");
+        return false;
+    }
+    if (ggml_sycl::test_moe_layout_for_selected_rows(&gate_tensor, 0, GGML_LAYOUT_XMX_TILED,
+                                                     /*selected_rows=*/4, /*exact_override=*/false,
+                                                     /*n_tokens=*/1) != GGML_LAYOUT_XMX_TILED) {
+        printf("FAIL: decode gate XMX_TILED should preserve the planned XMX primary\n");
         return false;
     }
 
@@ -1040,6 +1081,90 @@ static bool run_regression_guard_policy_test() {
     if (planned_pp_moe_scratch != expected_pp_moe_scratch) {
         printf("FAIL: PP MoE oneDNN scratch should not reserve unused future slots, got %zu expected %zu\n",
                planned_pp_moe_scratch, expected_pp_moe_scratch);
+        return false;
+    }
+    constexpr int planned_scratch_device = 0;
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(planned_scratch_device, weight_slot, act_slot, out_slot,
+                                                               4);
+    if (ggml_sycl::unified_cache_get_planned_pp_moe_onednn_ring_depth(planned_scratch_device) != 1) {
+        printf("FAIL: planned PP MoE oneDNN scratch should store the effective serialized ring depth\n");
+        return false;
+    }
+    if (ggml_sycl::unified_cache_get_planned_pp_moe_onednn_scratch_bytes(planned_scratch_device) !=
+        expected_pp_moe_scratch) {
+        printf("FAIL: planned PP MoE oneDNN scratch bytes should match one reusable slot\n");
+        return false;
+    }
+    if (ggml_sycl::unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(planned_scratch_device) != weight_slot ||
+        ggml_sycl::unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(planned_scratch_device) != act_slot ||
+        ggml_sycl::unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(planned_scratch_device) != out_slot) {
+        printf("FAIL: planned PP MoE oneDNN scratch should preserve per-slot byte sizes\n");
+        return false;
+    }
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(planned_scratch_device, 0, 0, 0, 0);
+
+    const uint32_t same_phase_actions = ggml_sycl::test_graph_boundary_policy_actions(
+        /*active_graph_valid=*/true,
+        /*same_phase=*/true,
+        /*graph_key_matches=*/true);
+    if (same_phase_actions != ggml_sycl::TEST_GRAPH_BOUNDARY_DRAIN_RETAINED) {
+        printf("FAIL: same-phase graph replay must drain retained handles without resetting scratch, got 0x%x\n",
+               same_phase_actions);
+        return false;
+    }
+
+    const uint32_t phase_change_actions = ggml_sycl::test_graph_boundary_policy_actions(
+        /*active_graph_valid=*/true,
+        /*same_phase=*/false,
+        /*graph_key_matches=*/true);
+    const uint32_t clear_and_reset =
+        ggml_sycl::TEST_GRAPH_BOUNDARY_CLEAR_ACTIVE | ggml_sycl::TEST_GRAPH_BOUNDARY_RESET_ARENAS;
+    if (phase_change_actions != clear_and_reset) {
+        printf("FAIL: graph phase change must clear active graph and reset scratch, got 0x%x expected 0x%x\n",
+               phase_change_actions, clear_and_reset);
+        return false;
+    }
+
+    const uint32_t signature_miss_actions = ggml_sycl::test_graph_boundary_policy_actions(
+        /*active_graph_valid=*/true,
+        /*same_phase=*/true,
+        /*graph_key_matches=*/false);
+    if (signature_miss_actions != clear_and_reset) {
+        printf("FAIL: graph signature miss must clear active graph and reset scratch, got 0x%x expected 0x%x\n",
+               signature_miss_actions, clear_and_reset);
+        return false;
+    }
+
+    const uint32_t no_graph_actions = ggml_sycl::test_graph_boundary_policy_actions(
+        /*active_graph_valid=*/false,
+        /*same_phase=*/false,
+        /*graph_key_matches=*/false);
+    if (no_graph_actions != ggml_sycl::TEST_GRAPH_BOUNDARY_RESET_ARENAS) {
+        printf("FAIL: graph entry without an active replay graph must reset scratch, got 0x%x\n", no_graph_actions);
+        return false;
+    }
+
+    if (ggml_sycl::test_moe_block_graphlet_requested_size_from_env(nullptr, nullptr) != 0 ||
+        ggml_sycl::test_moe_block_graphlet_requested_size_from_env("0", "4") != 0) {
+        printf("FAIL: MoE block graphlets must be opt-in even when a size is configured\n");
+        return false;
+    }
+    if (ggml_sycl::test_moe_block_graphlet_requested_size_from_env("1", nullptr) != 2) {
+        printf("FAIL: MoE block graphlets should default to block size 2 once explicitly enabled\n");
+        return false;
+    }
+    if (ggml_sycl::test_moe_block_graphlet_requested_size_from_env("1", "4") != 4 ||
+        ggml_sycl::test_moe_block_graphlet_requested_size_from_env("1", "0") != 1) {
+        printf("FAIL: MoE block graphlet size override should clamp to at least one block\n");
+        return false;
+    }
+    if (!ggml_sycl::test_moe_block_graphlet_bulk_xmx_phase_disabled_from_env("1", "1", "1") ||
+        ggml_sycl::test_moe_block_graphlet_bulk_xmx_phase_disabled_from_env("0", "1", "1") ||
+        ggml_sycl::test_moe_block_graphlet_bulk_xmx_phase_disabled_from_env("1", "0", "1") ||
+        ggml_sycl::test_moe_block_graphlet_bulk_xmx_phase_disabled_from_env("1", "1", "0") ||
+        ggml_sycl::test_moe_block_graphlet_bulk_xmx_phase_disabled_from_env("1", nullptr, "1") ||
+        ggml_sycl::test_moe_block_graphlet_bulk_xmx_phase_disabled_from_env("1", "1", nullptr)) {
+        printf("FAIL: MoE block graphlets must be disabled only for bulk-XMX phase materialization\n");
         return false;
     }
 

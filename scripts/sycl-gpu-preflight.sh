@@ -25,13 +25,13 @@ sycl_preflight_selector_may_use_b50() {
 sycl_preflight_journal_has_current_boot_gpu_faults() {
     command -v journalctl >/dev/null 2>&1 || return 1
     journalctl -k -b --no-pager 2>/dev/null |
-        grep -Eiq 'xe .*Engine reset|xe .*Timedout job|xe .*Kernel-submitted job timed out|Xe device coredump|guc_exec_queue_timedout_job|drm_sched_job_timedout|soft lockup|RCU.*stall|BUG:|Oops|ttm_resource_manager_usage|xe_drm_ioctl|xe_pt_zap_ptes'
+        grep -Eiq 'xe .*Engine reset|xe .*Schedule disable failed|xe .*reset (queued|started)|xe .*Timedout job|xe .*Kernel-submitted job timed out|Xe device coredump|guc_exec_queue_timedout_job|drm_sched_job_timedout|soft lockup|RCU.*stall|BUG:|Oops|ttm_resource_manager_usage|xe_drm_ioctl|xe_pt_zap_ptes'
 }
 
 sycl_preflight_journal_has_previous_boot_gpu_faults() {
     command -v journalctl >/dev/null 2>&1 || return 1
     journalctl -k -b -1 --no-pager 2>/dev/null |
-        grep -Eiq 'xe .*Engine reset|xe .*Timedout job|xe .*Kernel-submitted job timed out|Xe device coredump|guc_exec_queue_timedout_job|drm_sched_job_timedout|soft lockup|RCU.*stall|BUG:|Oops|ttm_resource_manager_usage|xe_drm_ioctl|xe_pt_zap_ptes'
+        grep -Eiq 'xe .*Engine reset|xe .*Schedule disable failed|xe .*reset (queued|started)|xe .*Timedout job|xe .*Kernel-submitted job timed out|Xe device coredump|guc_exec_queue_timedout_job|drm_sched_job_timedout|soft lockup|RCU.*stall|BUG:|Oops|ttm_resource_manager_usage|xe_drm_ioctl|xe_pt_zap_ptes'
 }
 
 sycl_preflight_b50_sysfs_bad() {

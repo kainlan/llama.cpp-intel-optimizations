@@ -50,6 +50,36 @@ static bool llama_context_dev_is_sycl(ggml_backend_dev_t dev) {
     return llama_context_sycl_hooks_enabled() && dev != nullptr &&
            ggml_backend_dev_backend_reg(dev) == ggml_backend_sycl_reg();
 }
+
+static bool llama_context_backend_is_sycl(ggml_backend_t backend) {
+    return backend != nullptr && llama_context_dev_is_sycl(ggml_backend_get_device(backend));
+}
+
+static int llama_context_sycl_device_index(ggml_backend_dev_t dev, int fallback) {
+    const char * name = ggml_backend_dev_name(dev);
+    if (name != nullptr && std::strncmp(name, GGML_SYCL_NAME, std::strlen(GGML_SYCL_NAME)) == 0) {
+        const char * p = name + std::strlen(GGML_SYCL_NAME);
+        if (*p >= '0' && *p <= '9') {
+            return std::atoi(p);
+        }
+    }
+    return fallback;
+}
+
+static bool llama_context_has_sycl_backend(const std::vector<ggml_backend_ptr> & backends) {
+    for (const auto & backend : backends) {
+        if (llama_context_backend_is_sycl(backend.get())) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void llama_context_sycl_attach_sched_plan(ggml_backend_sched_t sched, const std::vector<ggml_backend_ptr> & backends) {
+    if (llama_context_sycl_hooks_enabled() && sched != nullptr && llama_context_has_sycl_backend(backends)) {
+        ggml_backend_sycl_set_sched_placement_plan(sched);
+    }
+}
 #endif
 
 llama_context::llama_context(
@@ -345,9 +375,13 @@ llama_context::llama_context(
         backend_ptrs.clear();
         backend_buf_exp_size.clear();
 
+#ifdef GGML_USE_SYCL
+        int sycl_gpu_idx = 0;
+#endif
         for (auto & backend : backends) {
             auto * buft = ggml_backend_get_default_buffer_type(backend.get());
-            auto backend_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
+            auto * dev = ggml_backend_get_device(backend.get());
+            auto backend_type = ggml_backend_dev_type(dev);
 
             if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {
                 // use the host buffer of the first device CPU for faster transfer of the intermediate state
@@ -357,6 +391,49 @@ llama_context::llama_context(
                     buft = host_buft;
                 }
             }
+#ifdef GGML_USE_SYCL
+            else if (backend_type == GGML_BACKEND_DEVICE_TYPE_GPU && llama_context_dev_is_sycl(dev)) {
+                const int sycl_dev = llama_context_sycl_device_index(dev, sycl_gpu_idx);
+
+                if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+                    buft = ggml_backend_sycl_host_compute_buffer_type(sycl_dev);
+                    LLAMA_LOG_DEBUG("%s: using SYCL host compute buffer for GPU %d in tensor split mode\n",
+                                    __func__, sycl_dev);
+                } else {
+                    bool use_host_compute = false;
+                    const char * env_host_compute = std::getenv("GGML_SYCL_HOST_COMPUTE");
+                    if (env_host_compute != nullptr) {
+                        use_host_compute = std::atoi(env_host_compute) != 0;
+                    } else {
+                        const char * env_cpu_offload = std::getenv("GGML_SYCL_CPU_OFFLOAD");
+                        if (env_cpu_offload != nullptr && std::atoi(env_cpu_offload) != 0) {
+                            if (!ggml_backend_sycl_cpu_offload_available()) {
+                                static bool warned_cpu_offload_unavailable = false;
+                                if (!warned_cpu_offload_unavailable) {
+                                    LLAMA_LOG_WARN("%s: GGML_SYCL_CPU_OFFLOAD=1 but no SYCL CPU device is available; "
+                                                   "keeping GPU compute buffers device-local\n", __func__);
+                                    warned_cpu_offload_unavailable = true;
+                                }
+                            } else {
+                                static bool warned_host_compute_opt_in = false;
+                                if (!warned_host_compute_opt_in) {
+                                    LLAMA_LOG_INFO("%s: GGML_SYCL_CPU_OFFLOAD=1 active; host-pinned compute buffers "
+                                                   "remain opt-in (set GGML_SYCL_HOST_COMPUTE=1 to force)\n", __func__);
+                                    warned_host_compute_opt_in = true;
+                                }
+                            }
+                        }
+                    }
+                    if (use_host_compute) {
+                        buft = ggml_backend_sycl_cpu_offload_compute_buffer_type(sycl_dev);
+                        LLAMA_LOG_INFO("%s: using SYCL host-pinned compute buffer for GPU %d\n",
+                                       __func__, sycl_dev);
+                    }
+                }
+
+                sycl_gpu_idx++;
+            }
+#endif
 
             backend_buft.push_back(buft);
             backend_ptrs.push_back(backend.get());
@@ -373,6 +450,12 @@ llama_context::llama_context(
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
             !model.has_tensor_overrides();
+
+#ifdef GGML_USE_SYCL
+        if (pipeline_parallel && llama_context_sycl_hooks_enabled() && ggml_backend_sycl_has_active_placement_plan()) {
+            pipeline_parallel = false;
+        }
+#endif
 
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
@@ -464,6 +547,9 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+#ifdef GGML_USE_SYCL
+    llama_context_sycl_attach_sched_plan(sched.get(), backends);
+#endif
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -618,6 +704,9 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+#ifdef GGML_USE_SYCL
+                llama_context_sycl_attach_sched_plan(sched.get(), backends);
+#endif
                 gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get());
             }
             if (!gf) {
@@ -664,6 +753,15 @@ void llama_context::sched_reserve() {
                     backend_buf_exp_size[i] / 1024.0 / 1024.0);
         }
     }
+
+#ifdef GGML_USE_SYCL
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        if (llama_context_backend_is_sycl(backend_ptrs[i])) {
+            const size_t size = backend_buf_exp_size[i];
+            ggml_backend_sycl_notify_compute_buffer_sizes(backend_ptrs[i], &size, 1);
+        }
+    }
+#endif
 
     if (n_nodes_pp == n_nodes_tg) {
         LLAMA_LOG_INFO("%s: graph nodes  = %d\n", __func__, n_nodes_pp);

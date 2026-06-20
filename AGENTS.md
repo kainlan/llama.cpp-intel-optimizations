@@ -104,13 +104,50 @@ Key SYCL files:
 
 - `ggml-sycl.cpp`: main backend, graph compute, mul_mat dispatch, buffer ops
 - `unified-kernel.cpp/hpp`: unified MUL_MAT kernel with XMX/ESIMD/MMVQ dispatch
-- `unified-cache.cpp/hpp`: tiered weight cache
+- `unified-cache.cpp/hpp`: tiered weight cache and SYCL memory allocator
+- `mem-handle.cpp/hpp`: ref-counted allocation and cache-entry handles
 - `common.hpp/cpp`: shared types, `extra_gpu`, layout policy, device management
 - `mmvq.cpp`: matrix-vector quantized kernels for batch=1 TG fast path
 - `mmq.cpp`: matrix-matrix quantized kernels
 - `fattn.cpp`: flash attention implementation
 - `dispatch.hpp`: kernel dispatch policy
 - `quants.hpp`: SOA block offset calculations
+
+### SYCL Memory Ownership
+
+The unified cache is the memory allocator for the SYCL backend. All SYCL
+backend GPU, host-pinned, staging, scratch, graph-temporary, KV, oneDNN, and
+weight-layout allocations must flow through the unified-cache allocation APIs
+(`unified_alloc`, `unified_allocate`, cache materialization helpers, or wrappers
+that return `mem_handle`). Do not introduce direct `sycl::malloc_device`,
+`sycl::malloc_host`, `sycl::free`, raw TLSF allocation, or side caches outside
+the unified-cache implementation. Any low-level allocation implementation detail
+must remain inside unified-cache code and surface to the rest of the backend as
+a `mem_handle`.
+
+`mem_handle` is the ownership and lifetime token. Code that uses an allocation
+must hold a `mem_handle` (or an object that owns one) until the CPU thread,
+SYCL event, command graph, or pointer table is finished with that allocation.
+When the last handle/reference is released, the allocation is freed through the
+unified cache (`unified_free`, `zone_free`, cache-entry lease release, etc.).
+Do not add forced eviction, forced reap, or zone-reset logic to reclaim memory
+that still has a live handle; a live allocation at cleanup means a leaked
+reference or stale owner that must be fixed.
+
+Raw pointers are not ownership tokens and must not model allocation state. They
+are only transient ABI views resolved from `mem_handle` for
+immediate kernel submission, oneDNN primitive calls, or tightly scoped CPU
+access. Do not store raw pointers as the source of truth, use pointer addresses
+as cache keys, or let pointers outlive their owning handle. Pointer tables and
+dispatch caches must be derived from the stable identity/hash carried by
+`mem_handle`, not from raw device addresses; if a table contains raw device
+pointers for a kernel ABI, retain the corresponding handles for at least the
+lifetime of the queued work or executable graph.
+
+Weight cache entries are ref-counted through `mem_handle` leases. Eviction may
+only remove entries whose in-use count is zero. If the cache cannot evict
+because handles are still referenced, fix the missing release instead of
+forcing eviction.
 
 ## Intel Arc GPU Memory Architecture (Critical for Multi-GPU)
 
@@ -205,6 +242,7 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-cli \
   -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -ngl 99 \
   -cnv -st --simple-io --no-display-prompt \
+  --chat-template-kwargs '{"reasoning_effort":"medium"}' \
   --reasoning-format none --reasoning-budget 0 \
   -p 'Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5' \
   -n 48 --seed 42 --temp 0
@@ -216,6 +254,84 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
 # Backend operations after modifying ggml operators
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-backend-ops
 ```
+
+### GPT-OSS Prompt Template Rule
+
+Use the exact gate below for GPT-OSS correctness tests. The prompt is:
+
+```text
+Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5
+```
+
+Use `llama-cli -cnv` so the CLI applies the model's embedded GGUF/Jinja chat
+template to that text as a user message. Do not hand-render a raw Harmony
+prompt, and do not pass `--chat-template gpt-oss` or a custom template unless
+the test is explicitly about that formatter. `llama-cli --help` reports Jinja
+enabled by default and `--chat-template` as a custom override whose default is
+the template from model metadata.
+
+Web and local verification rechecked on 2026-06-19:
+
+- GPT-OSS models were trained for OpenAI's Harmony response format and should
+  not be run with raw text or a generic chat format.
+- OpenAI's implementation-verification guide warns that inference providers
+  must map inputs to Harmony correctly; wrong prompt formatting can cause
+  cascading generation issues.
+- OpenAI's GPT-OSS Transformers guide says prompts should be built with the
+  tokenizer chat template or `openai-harmony`.
+- The OpenAI Hugging Face model card says the Transformers chat template
+  automatically applies Harmony and direct `model.generate` callers must apply
+  Harmony manually.
+- The `openai/gpt-oss-20b` Jinja template accepts `reasoning_effort`, defaults
+  it to `medium`, renders `Reasoning: medium` in the Harmony system message,
+  renders the user prompt as a Harmony user message, and appends
+  `<|start|>assistant` as the generation prompt.
+- The llama.cpp GPT-OSS guide says `--jinja` uses the Jinja chat template
+  embedded in the GGUF and that the `ggml-org/gpt-oss` GGUFs have a built-in
+  chat template used by default; manual template overrides are only for known
+  template bugs or specialized experiments.
+- Local `llama-cli --help` confirms `--jinja` defaults to enabled and the chat
+  template defaults to the one taken from model metadata.
+
+For cross-branch regression tests, pin the Harmony `reasoning_effort` template
+argument to `medium` with `--chat-template-kwargs`. The known-good B50
+GPT-OSS prompt rendered `Reasoning: medium`; pinning prevents accidental
+changes in template metadata, CLI defaults, or test harness behavior from
+moving the prompt while comparing backend performance. `--reasoning-format
+none` controls how reasoning output is shown or hidden and is not a substitute
+for pinning the template argument. The deterministic count gate deliberately
+uses `--reasoning-budget 0` with hidden reasoning so the expected answer is a
+short final-channel string; for normal GPT-OSS chat/server parser validation,
+use llama.cpp's automatic reasoning handling instead of treating `none` as a
+model-format requirement.
+
+Sources checked 2026-06-19:
+
+- `https://developers.openai.com/cookbook/articles/openai-harmony`
+- `https://developers.openai.com/cookbook/articles/gpt-oss/verifying-implementations`
+- `https://developers.openai.com/cookbook/articles/gpt-oss/run-transformers`
+- `https://developers.openai.com/cookbook/articles/gpt-oss/handle-raw-cot`
+- `https://huggingface.co/openai/gpt-oss-20b`
+- `https://huggingface.co/openai/gpt-oss-20b/blob/main/chat_template.jinja`
+- `https://github.com/ggml-org/llama.cpp/discussions/15396`
+
+Canonical B50 GPT-OSS correctness gate:
+
+```bash
+source /opt/intel/oneapi/setvars.sh --force
+ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-cli \
+  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -ngl 99 \
+  -cnv -st --simple-io --no-display-prompt \
+  --chat-template-kwargs '{"reasoning_effort":"medium"}' \
+  --reasoning-format none --reasoning-budget 0 \
+  -p 'Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5' \
+  -n 48 --seed 42 --temp 0
+```
+
+Expected output starts with `: 1, 2, 3, 4, 5`. The leading colon is normal for
+this CLI/Harmony rendering. `llama-bench` is valid for PP/TG throughput, but it
+does not prove chat-template correctness; use the gate above before trusting
+GPT-OSS performance numbers.
 
 If binaries fail to load colocated libraries, use:
 
@@ -242,6 +358,18 @@ evidence and P2P topology warnings must not alter fresh-boot SYCL selection
 behavior. `sycl-ls` is still not a preferred B50 health probe because it has
 previously wedged this host in `ttm_resource_manager_usage -> drm_ioctl ->
 xe_drm_ioctl` after a reset/oops sequence.
+
+Do not run old comparison binaries such as the `60a8c042` known-good build with
+metadata-only helper commands (`--help`, `--version`, or `lsof /dev/dri/*`) on
+the discrete render nodes. On 2026-06-19, `llama-cli --help` from that build
+initialized SYCL and left a process stuck in `xe_vm_destroy_ioctl ->
+drm_exec_lock_obj`; an `lsof` probe then stuck in `xe_bo_lock`. Sysfs PCI FLR
+and debugfs GT reset returned successfully but did not clear the D-state tasks.
+Use the canonical gated inference command for cross-build comparisons after a
+fresh reboot, and avoid DRM fdinfo probes while a SYCL process is wedged.
+Current `common_params_parse()` must keep `--help`, `--version`, cache-list, and
+completion generation metadata-only even when `LLAMA_ARG_*` GPU env vars are
+set; verify with `test-arg-parser` after parser changes.
 
 ```bash
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench ...
@@ -343,6 +471,39 @@ GPT-OSS 20B MXFP4:
 | `level_zero:0` B580 | ~66 | ~17 | Smaller VRAM budget causes more pressure |
 | `level_zero:0,1` | TBD | TBD | Use isolated/host-bounce transfer paths; direct P2P is not available |
 
+### Current Regression Baselines And Suspect Delta
+
+Do not accept lower post-merge or post-debug numbers as new baselines. Beads
+`llama.cpp-aqzz3.1`, `llama.cpp-po3nd.2.45`, `llama.cpp-po3nd.2.46`, and
+`llama.cpp-ix58x` record the hard guardrails:
+
+- B50 GPT-OSS20B MXFP4 FA-on should restore/maintain >1100 PP512 and about
+  50+ TG128; older restored-fast-path evidence was about 1255 PP512 / 52
+  TG128, with the canonical GGUF chat-template count gate passing.
+- B580 Mistral 7B Q4_0 FA-on should restore/maintain >2000 PP512 and >85
+  TG128. `docs/backend/SYCL.md` records build `5b206c499-dirty` at PP512
+  `2173.92 +/- 10.01` and TG128 `88.42 +/- 0.47`, with the deterministic
+  count gate correct.
+
+For the latest regression hunt, use `581babb476b726665a03345feb1a9ebcabe630db`
+as the close pre-regression comparison point. The first-parent delta to
+`f7a332578` is:
+
+- `06f8887a6` restore unified-cache prompt headroom
+- `a42a4c9a3` harden unified-cache view ownership
+- `129a04fcb` tighten gpu performance gates
+- `feae906b4` restore default MoE block graphlets
+- `f7a332578` prefer MoE block graphlets for decode
+
+The most suspicious default-on change in that small delta is the MoE block
+command-graphlet path. It must stay opt-in via
+`GGML_SYCL_MOE_BLOCK_GRAPHLETS=1` until same-build B50 GPT-OSS and B580
+Mistral correctness/performance gates pass on a clean boot. Prompt XMX MoE PP
+is also unsafe as a default; keep `GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP` /
+`GGML_SYCL_XMX_MOE_PP` opt-in only. `GGML_SYCL_PP_PIPELINE=1` remains a
+diagnostic proof knob, not a default, because it has shown GPT-OSS chat
+correctness failures.
+
 ## SYCL Environment Variables
 
 Performance-critical defaults:
@@ -364,6 +525,7 @@ Experimental:
 | `GGML_SYCL_PERSISTENT_TG_PHASE=0` | Disable phase scheduling |
 | `GGML_SYCL_PERSISTENT_TG_DAG=0` | Disable DAG scheduling |
 | `GGML_SYCL_PERSISTENT_SPLIT=1` | Enable persistent split kernel |
+| `GGML_SYCL_MOE_BLOCK_GRAPHLETS=1` | Enable experimental MoE block command graphlets; default is OFF |
 
 Kernel dispatch tuning:
 

@@ -1,0 +1,53 @@
+timestamp	2026-06-19T07:09:03-04:00
+root	/Apps/llama.cpp
+boot_id	2cedadc9-8fa5-4c57-be01-8370ba5e2972
+uptime_start	2026-06-19 07:00:01
+head	f7a33257890a4ac589e405d482de0b058bf0a1ca
+describe	gguf-v0.19.0-2093-gf7a332578-dirty
+branch	feature/sycl-coalescing
+models_gptoss	/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf
+models_mistral	/Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf
+bench_ngl	99
+run_full_matrix	0
+run_correctness	1
+
+[git status --short]
+ M .beads/beads.db
+ M .beads/last-touched
+ M AGENTS.md
+ M CLAUDE.md
+ M ggml/src/ggml-sycl/fattn.cpp
+ M ggml/src/ggml-sycl/ggml-sycl-test.hpp
+ M ggml/src/ggml-sycl/ggml-sycl.cpp
+ M ggml/src/ggml-sycl/mmvq.cpp
+ M ggml/src/ggml-sycl/unified-cache.cpp
+ M ggml/src/ggml-sycl/unified-cache.hpp
+ M scripts/sycl-dual-gpu-gptoss-gate.sh
+ M scripts/sycl-gpu-preflight.sh
+ M src/llama-context.cpp
+ M tests/test-chat.cpp
+ M tests/test-sycl-layout-choice.cpp
+?? benchmark_results/sycl-dual-gpu-gate-20260609-194354/
+?? benchmark_results/sycl-dual-gpu-gate-20260618-211444/
+?? benchmark_results/sycl-dual-gpu-gate-20260619-070903/
+?? node_modules/
+?? package-lock.json
+?? package.json
+
+[git diff --stat]
+ .beads/beads.db                       | Bin 24219648 -> 24219648 bytes
+ .beads/last-touched                   |   2 +-
+ AGENTS.md                             | 152 +++++++++++++++-
+ CLAUDE.md                             | 152 +++++++++++++++-
+ ggml/src/ggml-sycl/fattn.cpp          |  10 ++
+ ggml/src/ggml-sycl/ggml-sycl-test.hpp | 114 ++++++------
+ ggml/src/ggml-sycl/ggml-sycl.cpp      | 318 +++++++++++++++++++++++-----------
+ ggml/src/ggml-sycl/mmvq.cpp           |   5 +-
+ ggml/src/ggml-sycl/unified-cache.cpp  | 290 +++++++++++++++----------------
+ ggml/src/ggml-sycl/unified-cache.hpp  |  15 +-
+ scripts/sycl-dual-gpu-gptoss-gate.sh  | 148 ++++++++++++++--
+ scripts/sycl-gpu-preflight.sh         |   4 +-
+ src/llama-context.cpp                 |  91 +++++++++-
+ tests/test-chat.cpp                   |  13 ++
+ tests/test-sycl-layout-choice.cpp     | 119 +++++++++++--
+ 15 files changed, 1080 insertions(+), 353 deletions(-)

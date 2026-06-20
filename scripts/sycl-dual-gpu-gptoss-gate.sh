@@ -9,20 +9,84 @@ GPTOSS_MODEL="${GPTOSS_MODEL:-/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf}"
 MISTRAL_MODEL="${MISTRAL_MODEL:-/Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf}"
 OUT_DIR="${OUT_DIR:-$ROOT_DIR/benchmark_results/sycl-dual-gpu-gate-$(date +%Y%m%d-%H%M%S)}"
 BENCH_TIMEOUT="${BENCH_TIMEOUT:-900}"
+BENCH_NGL="${BENCH_NGL:-99}"
+GGML_SYCL_OP_TIMEOUT_MS="${GGML_SYCL_OP_TIMEOUT_MS:-60000}"
 GPTOSS_B50_MIN_PP512="${GPTOSS_B50_MIN_PP512:-1100}"
 GPTOSS_B50_MIN_TG128="${GPTOSS_B50_MIN_TG128:-50}"
 MISTRAL_B580_MIN_PP512="${MISTRAL_B580_MIN_PP512:-2000}"
 MISTRAL_B580_MIN_TG128="${MISTRAL_B580_MIN_TG128:-85}"
 RUN_CORRECTNESS="${RUN_CORRECTNESS:-1}"
+RUN_FULL_MATRIX="${RUN_FULL_MATRIX:-0}"
+
+write_run_metadata() {
+    local metadata="$OUT_DIR/run-metadata.txt"
+    local baselines="$OUT_DIR/baselines.tsv"
+    local suspects="$OUT_DIR/suspect-delta.tsv"
+
+    {
+        printf "timestamp\t%s\n" "$(date -Is)"
+        printf "root\t%s\n" "$ROOT_DIR"
+        printf "boot_id\t%s\n" "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || printf unknown)"
+        printf "uptime_start\t%s\n" "$(uptime -s 2>/dev/null || printf unknown)"
+        printf "head\t%s\n" "$(git -C "$ROOT_DIR" rev-parse HEAD)"
+        printf "describe\t%s\n" "$(git -C "$ROOT_DIR" describe --always --dirty --long 2>/dev/null || git -C "$ROOT_DIR" rev-parse --short HEAD)"
+        printf "branch\t%s\n" "$(git -C "$ROOT_DIR" rev-parse --abbrev-ref HEAD)"
+        printf "models_gptoss\t%s\n" "$GPTOSS_MODEL"
+        printf "models_mistral\t%s\n" "$MISTRAL_MODEL"
+        printf "bench_ngl\t%s\n" "$BENCH_NGL"
+        printf "run_full_matrix\t%s\n" "$RUN_FULL_MATRIX"
+        printf "run_correctness\t%s\n" "$RUN_CORRECTNESS"
+        printf "\n[git status --short]\n"
+        git -C "$ROOT_DIR" status --short
+        printf "\n[git diff --stat]\n"
+        git -C "$ROOT_DIR" diff --stat
+    } > "$metadata"
+
+    {
+        printf "case\tselector\tmetric_pp512\tmetric_tg128\tcommit_or_build\tevidence\n"
+        printf "mistral-b580-fa1\tlevel_zero:0\t2173.92 +/- 10.01\t88.42 +/- 0.47\t5b206c499-dirty\tdocs/backend/SYCL.md; deterministic count gate correct\n"
+        printf "gptoss-b50-fa1\tlevel_zero:1\t1043.87\t50.07\t60a8c042f8a1de1c5ed2c2f1183f8f87e82b51e8\tbeads/AGENTS historical known-good; GGUF chat-template count gate correct\n"
+        printf "gptoss-b50-restored-fa1\tlevel_zero:1\t~1255\t~52\tclosed pre/post-merge optimization beads\tllama.cpp-aqzz3.1 and related perf-gate beads; target guardrail, not lower current baseline\n"
+        printf "gptoss-b50-close-regression-base\tlevel_zero:1\t1256.37\t33.30\t581babb476b726665a03345feb1a9ebcabe630db\tclose pre-regression baseline from prior same-branch notes\n"
+    } > "$baselines"
+
+    {
+        printf "order\tcommit\tsummary\trisk\n"
+        printf "1\t06f8887a6\trestore unified-cache prompt headroom\tmemory/headroom accounting; keep if validated\n"
+        printf "2\ta42a4c9a3\tharden unified-cache view ownership\townership fix; should keep unless tests contradict\n"
+        printf "3\t129a04fcb\ttighten gpu performance gates\tgate-only; keep\n"
+        printf "4\tfeae906b4\trestore default MoE block graphlets\tsuspect default-on command graph path; must be opt-in until clean-boot proof\n"
+        printf "5\tf7a332578\tprefer MoE block graphlets for decode\tsuspect default-on command graph path; must be opt-in until clean-boot proof\n"
+    } > "$suspects"
+}
+
+require_gpu_preflight() {
+    local selector="$1"
+    if ! "$ROOT_DIR/scripts/sycl-gpu-preflight.sh" "$selector"; then
+        echo "gate refused before workload startup: selector=$selector" >&2
+        exit 4
+    fi
+}
+
+run_required_preflights() {
+    require_gpu_preflight "level_zero:0"
+    require_gpu_preflight "level_zero:1"
+    if [[ "$RUN_FULL_MATRIX" == "1" ]]; then
+        require_gpu_preflight "level_zero:0,1"
+    fi
+}
 
 # shellcheck disable=SC1091
 source "$ROOT_DIR/scripts/sycl-gpu-preflight.sh"
+
+mkdir -p "$OUT_DIR"
+write_run_metadata
+run_required_preflights
 
 set +u
 source /opt/intel/oneapi/setvars.sh --force >/tmp/oneapi-setvars.log 2>&1
 set -u
 
-mkdir -p "$OUT_DIR"
 SUMMARY="$OUT_DIR/summary.tsv"
 printf "case\tselector\tmodel\tfa\trc\tpp512_tps\ttg128_tps\tmoe_ms\tgpu_expert_ms\tnon_moe_ms\troute_dev0\troute_secondary\troute_host\troute_unavailable\thost_routing\tlog\n" > "$SUMMARY"
 CORRECTNESS="$OUT_DIR/correctness.tsv"
@@ -107,22 +171,60 @@ parse_route_metric() {
     ' "$log" | tail -1
 }
 
+gptoss_count_output_passes() {
+    local log="$1"
+
+    awk '
+        /^> Count from 1 to 5[.]/ {
+            in_answer = 1
+            next
+        }
+        in_answer && /^\[/ {
+            in_answer = 0
+        }
+        in_answer && /^Exiting[.][.][.]$/ {
+            in_answer = 0
+        }
+        in_answer {
+            line = $0
+            gsub(/\r/, "", line)
+            if (line ~ /Error: Failed to update streamed response/) {
+                bad = 1
+            }
+            if (line ~ /^[[:space:]]*:?[[:space:]]*1, 2, 3, 4, 5[[:space:]]*$/) {
+                found = 1
+            }
+        }
+        END {
+            exit((found && !bad) ? 0 : 1)
+        }
+    ' "$log"
+}
+
+mistral_count_output_passes() {
+    local log="$1"
+
+    grep -Eq '^[[:space:]]*1, 2, 3, 4, 5, 6, 7, 8, 9, 10([[:space:]]|$)' "$log"
+}
+
 run_case() {
     local name="$1"
     local selector="$2"
     local model="$3"
     local fa="$4"
     local log="$OUT_DIR/${name}-fa${fa}.log"
-    local -a env_args=("ONEAPI_DEVICE_SELECTOR=$selector")
+    local -a env_args=("ONEAPI_DEVICE_SELECTOR=$selector" "GGML_SYCL_OP_TIMEOUT_MS=$GGML_SYCL_OP_TIMEOUT_MS")
 
     if [[ "$name" == gptoss-dual* ]]; then
         env_args+=("GGML_SYCL_MOE_PROFILE=1" "GGML_SYCL_MOE_PATH_TRACE=1")
     fi
 
     printf "[gate] %s selector=%s fa=%s\n" "$name" "$selector" "$fa" | tee "$log"
-    sycl_gpu_preflight_check "$selector"
+    if ! "$ROOT_DIR/scripts/sycl-gpu-preflight.sh" "$selector"; then
+        return 4
+    fi
     set +e
-    timeout "$BENCH_TIMEOUT" env "${env_args[@]}" "$LLAMA_BENCH" -m "$model" -p 512 -n 128 -fa "$fa" 2>&1 | tee -a "$log"
+    timeout "$BENCH_TIMEOUT" env "${env_args[@]}" "$LLAMA_BENCH" -m "$model" -p 512 -n 128 -ngl "$BENCH_NGL" -fa "$fa" 2>&1 | tee -a "$log"
     local rc=${PIPESTATUS[0]}
     set -e
 
@@ -160,21 +262,23 @@ run_correctness_case() {
     local -a cmd=("$@")
 
     printf "[correctness] %s selector=%s\n" "$name" "$selector" | tee "$log"
-    sycl_gpu_preflight_check "$selector"
+    if ! "$ROOT_DIR/scripts/sycl-gpu-preflight.sh" "$selector"; then
+        return 4
+    fi
     set +e
-    timeout "$BENCH_TIMEOUT" env ONEAPI_DEVICE_SELECTOR="$selector" "${cmd[@]}" 2>&1 | tee -a "$log"
+    timeout "$BENCH_TIMEOUT" env ONEAPI_DEVICE_SELECTOR="$selector" GGML_SYCL_OP_TIMEOUT_MS="$GGML_SYCL_OP_TIMEOUT_MS" "${cmd[@]}" 2>&1 | tee -a "$log"
     local rc=${PIPESTATUS[0]}
     set -e
 
     local pass="no"
     case "$name" in
         gptoss-b50-count)
-            if grep -Eq '1, 2, 3, 4, 5' "$log"; then
+            if gptoss_count_output_passes "$log"; then
                 pass="yes"
             fi
             ;;
         mistral-b580-count)
-            if grep -Eq '1, 2, 3, 4, 5, 6, 7, 8, 9, 10' "$log"; then
+            if mistral_count_output_passes "$log"; then
                 pass="yes"
             fi
             ;;
@@ -194,13 +298,14 @@ run_correctness_gates() {
 
     run_correctness_case "mistral-b580-count" "level_zero:0" \
         "$LLAMA_COMPLETION" \
-        -m "$MISTRAL_MODEL" \
+        -m "$MISTRAL_MODEL" -ngl "$BENCH_NGL" \
         -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 
     run_correctness_case "gptoss-b50-count" "level_zero:1" \
         "$LLAMA_CLI" \
-        -m "$GPTOSS_MODEL" \
+        -m "$GPTOSS_MODEL" -ngl "$BENCH_NGL" \
         -cnv -st --simple-io --no-display-prompt \
+        --chat-template-kwargs '{"reasoning_effort":"medium"}' \
         --reasoning-format none --reasoning-budget 0 \
         -p 'Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5' \
         -n 48 --seed 42 --temp 0
@@ -304,16 +409,21 @@ validate_guardrails() {
 
 run_correctness_gates
 
-for fa in 1 0; do
-    run_case "gptoss-b580" "level_zero:0" "$GPTOSS_MODEL" "$fa"
-    run_case "gptoss-b50" "level_zero:1" "$GPTOSS_MODEL" "$fa"
-    run_case "gptoss-dual-b580-b50" "level_zero:0,1" "$GPTOSS_MODEL" "$fa"
-done
+if [[ "$RUN_FULL_MATRIX" == "1" ]]; then
+    for fa in 1 0; do
+        run_case "gptoss-b580" "level_zero:0" "$GPTOSS_MODEL" "$fa"
+        run_case "gptoss-b50" "level_zero:1" "$GPTOSS_MODEL" "$fa"
+        run_case "gptoss-dual-b580-b50" "level_zero:0,1" "$GPTOSS_MODEL" "$fa"
+    done
 
-for fa in 1 0; do
-    run_case "mistral-b580" "level_zero:0" "$MISTRAL_MODEL" "$fa"
-    run_case "mistral-b50" "level_zero:1" "$MISTRAL_MODEL" "$fa"
-done
+    for fa in 1 0; do
+        run_case "mistral-b580" "level_zero:0" "$MISTRAL_MODEL" "$fa"
+        run_case "mistral-b50" "level_zero:1" "$MISTRAL_MODEL" "$fa"
+    done
+else
+    run_case "gptoss-b50" "level_zero:1" "$GPTOSS_MODEL" "1"
+    run_case "mistral-b580" "level_zero:0" "$MISTRAL_MODEL" "1"
+fi
 
 write_comparison
 column -t -s $'\t' "$SUMMARY" | tee "$OUT_DIR/summary.txt"

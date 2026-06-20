@@ -643,13 +643,13 @@ int llama_cli(int argc, char ** argv) {
 
     console::set_display(DISPLAY_TYPE_RESET);
 
-    console::log("\nExiting...\n");
-    ctx_cli.ctx_server.terminate();
-    inference_thread.join();
-
     // bump the log level to display timings
     common_log_set_verbosity_thold(LOG_LEVEL_INFO);
     common_memory_breakdown_print(ctx_cli.ctx_server.get_llama_context());
+
+    console::log("\nExiting...\n");
+    ctx_cli.ctx_server.terminate();
+    inference_thread.join();
 
     return 0;
 }

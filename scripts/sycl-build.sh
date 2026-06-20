@@ -131,6 +131,13 @@ if [[ -f "${BUILD_DIR}/CMakeCache.txt" ]] && ! grep -q '^CMAKE_CXX_COMPILER:FILE
     needs_configure=1
 fi
 
+if [[ -f "${BUILD_DIR}/CMakeCache.txt" ]] && {
+    ! grep -q '^CMAKE_C_FLAGS_RELEASE:STRING=.*DNDEBUG' "${BUILD_DIR}/CMakeCache.txt" ||
+        ! grep -q '^CMAKE_CXX_FLAGS_RELEASE:STRING=.*DNDEBUG' "${BUILD_DIR}/CMakeCache.txt";
+}; then
+    needs_configure=1
+fi
+
 if (( force_reconfigure )) || cmake_input_changed; then
     needs_configure=1
 fi
@@ -140,6 +147,8 @@ configure_args=(
     -B "${BUILD_DIR}"
     -G Ninja
     -DCMAKE_BUILD_TYPE=Release
+    '-DCMAKE_C_FLAGS_RELEASE=-O3 -DNDEBUG'
+    '-DCMAKE_CXX_FLAGS_RELEASE=-O3 -DNDEBUG'
     -DGGML_SYCL=ON
     -DGGML_SYCL_TARGET=INTEL
     -DGGML_SYCL_ONECCL=ON

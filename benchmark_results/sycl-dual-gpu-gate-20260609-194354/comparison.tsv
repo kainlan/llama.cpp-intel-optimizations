@@ -1,0 +1,3 @@
+fa	best_single_case	best_single_pp512	dual_pp512	dual_vs_best_pp512_pct	target_110pct_pp512	beats_best_by_10pct	best_single_tg128	dual_tg128	dual_vs_best_tg128_pct
+0	gptoss-b50	168.88	NA	NA	NA	no	44.4	NA	NA
+1	gptoss-b50	323.16	NA	NA	NA	no	45.93	NA	NA

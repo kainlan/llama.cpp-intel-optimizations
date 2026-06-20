@@ -2638,6 +2638,16 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
         return;
     }
 
+    if constexpr (D == 128) {
+        // B580 driver timeouts were reproduced on the Mistral warmup shape
+        // D=128/ne01=2 through XMX-v2. Keep these small ragged multi-query
+        // batches on TILE; PP512 still reaches oneDNN/XMX and TG ne01=1 uses VEC.
+        if (use_xmx && !params.kv_is_fp8 && ne01 > 1 && ne01 < 8) {
+            use_xmx = false;
+            dispatch_debug_kernel("tile_guard_d128_small_multiquery");
+        }
+    }
+
     // Dispatch remaining shapes based on GPU capabilities.
     // XMX-v2 (fattn-xmx-f16-v2.hpp) has no SLM aliasing and remains the
     // XMX-capable path for shapes not claimed by the proven fast paths above.

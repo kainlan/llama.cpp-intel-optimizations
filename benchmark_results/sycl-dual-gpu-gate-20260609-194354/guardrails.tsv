@@ -1,0 +1,3 @@
+guard	case	fa	rc	pp512_tps	min_pp512	tg128_tps	min_tg128	pass
+gptoss_b50_fa1	gptoss-b50	1	0	323.16	1100	45.93	50	no
+mistral_b580_fa1	mistral-b580	1	0	162.68	2000	88.27	84	no

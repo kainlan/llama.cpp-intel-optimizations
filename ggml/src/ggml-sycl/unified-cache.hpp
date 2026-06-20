@@ -891,6 +891,8 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
 
 void     unified_cache_set_planned_pp_pipeline_scratch_bytes(int device_id, size_t bytes);
 size_t   unified_cache_get_planned_pp_pipeline_scratch_bytes(int device_id);
+void     unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t bytes);
+size_t   unified_cache_get_planned_onednn_scratchpad_bytes(int device_id);
 void     unified_cache_set_planned_pp_moe_onednn_scratch(int      device_id,
                                                          size_t   weight_slot_bytes,
                                                          size_t   activation_slot_bytes,
@@ -1973,6 +1975,12 @@ class unified_cache {
                        size_t        runtime_bytes,
                        size_t        device_total_vram);
 
+    // Ensure the VRAM arena's fixed zones match the latest planner inputs.
+    // If an early arena exists but has no live zone allocations or chunk
+    // leases, it may be rebuilt with larger planned zones. Live arenas are
+    // never force-reset or force-freed.
+    bool ensure_planned_arena_zones();
+
     // Is arena active?
     bool arena_active() const { return arena_base_ != nullptr; }
 
@@ -2002,6 +2010,7 @@ class unified_cache {
     size_t zone_used(vram_zone_id zone) const;
     size_t zone_available(vram_zone_id zone) const;
     size_t zone_largest_free(vram_zone_id zone) const;
+    void   dump_live_zone_allocations(vram_zone_id zone, const char * where, size_t max_entries = 32) const;
 
     const vram_zone & get_zone(vram_zone_id zone) const { return arena_zones_[static_cast<int>(zone)]; }
 
@@ -2465,6 +2474,7 @@ class unified_cache {
     size_t                       budget_;                   // Total GPU memory budget (after reservations)
     size_t                       base_budget_;              // Raw cache budget before reservations
     size_t                       reserved_;                 // Runtime reservation applied to budget_
+    size_t                       device_total_vram_ = 0;    // Total VRAM snapshot passed by backend init
     bool                         budget_exceeded_ = false;  // Set when used > budget after eviction
     std::atomic<size_t>          used_{ 0 };                // Current usage
     std::atomic<int64_t>         time_{ 0 };                // Monotonic counter
@@ -2558,8 +2568,9 @@ class unified_cache {
     // Reusable temp VRAM buffer for GPU-side AOS→SOA reorder during MoE prestage.
     // Pre-allocated at cache init to avoid per-expert malloc_device that fails
     // when VRAM is full after S1-PRELOAD fills it with dense weights.
-    void * reorder_temp_buffer_ = nullptr;
-    size_t reorder_temp_size_   = 0;
+    void *     reorder_temp_buffer_ = nullptr;
+    size_t     reorder_temp_size_   = 0;
+    mem_handle reorder_temp_owner_;
 
     // OneDNN FP16 scratch buffers for prompt processing.
     // Pre-allocated to avoid per-op allocations that cause OOM with large contexts.
@@ -3565,6 +3576,7 @@ bool unified_cache_copy_from_host_async(int                              device_
 // Reserve the compute arena (pre-reserved VRAM for compute scratch).
 // Must be called BEFORE S1-PRELOAD to guarantee VRAM availability.
 bool unified_cache_reserve_compute_arena(int device_id, size_t arena_bytes);
+bool unified_cache_ensure_planned_arena_zones(int device_id);
 
 // Try to sub-allocate from the compute arena.
 // Returns nullptr if arena is not reserved or has insufficient space.
@@ -3596,6 +3608,11 @@ size_t unified_cache_kv_arena_used(int device_id);
 // Sum of zone_used(KV) + zone_used(ONEDNN) + zone_used(RUNTIME) + zone_used(SCRATCH).
 // Returns 0 when arena is inactive.
 size_t unified_cache_arena_non_weight_used(int device);
+
+// Diagnostic only: log live unified_alloc records in a VRAM zone without
+// reclaiming anything. Use this to find leaked mem_handle owners before
+// changing lifetime logic.
+void unified_cache_dump_live_zone_allocations(int device, vram_zone_id zone, const char * where, size_t max_entries = 32);
 
 // Sub-allocate from the arena's KV zone for per-layer KV cache placement.
 // Returns nullptr if arena is inactive or KV zone is exhausted.

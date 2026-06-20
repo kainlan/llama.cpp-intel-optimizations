@@ -1,0 +1,21 @@
+case                  selector        model                      fa  rc   pp512_tps  tg128_tps  moe_ms  gpu_expert_ms  non_moe_ms  route_dev0  route_secondary  route_host  route_unavailable  host_routing  log
+gptoss-b580           level_zero:0    gpt-oss-20b-mxfp4.gguf     1   134  NA         NA         NA      NA             NA          NA          NA               NA          NA                 NA            /Apps/llama.cpp/benchmark_results/sycl-dual-gpu-gate-20260609-194354/gptoss-b580-fa1.log
+gptoss-b50            level_zero:1    gpt-oss-20b-mxfp4.gguf     1   0    323.16     45.93      NA      NA             NA          NA          NA               NA          NA                 NA            /Apps/llama.cpp/benchmark_results/sycl-dual-gpu-gate-20260609-194354/gptoss-b50-fa1.log
+gptoss-dual-b580-b50  level_zero:0,1  gpt-oss-20b-mxfp4.gguf     1   124  NA         NA         NA      NA             NA          NA          NA               NA          NA                 NA            /Apps/llama.cpp/benchmark_results/sycl-dual-gpu-gate-20260609-194354/gptoss-dual-b580-b50-fa1.log
+gptoss-b580           level_zero:0    gpt-oss-20b-mxfp4.gguf     0   134  NA         NA         NA      NA             NA          NA          NA               NA          NA                 NA            /Apps/llama.cpp/benchmark_results/sycl-dual-gpu-gate-20260609-194354/gptoss-b580-fa0.log
+gptoss-b50            level_zero:1    gpt-oss-20b-mxfp4.gguf     0   0    168.88     44.40      NA      NA             NA          NA          NA               NA          NA                 NA            /Apps/llama.cpp/benchmark_results/sycl-dual-gpu-gate-20260609-194354/gptoss-b50-fa0.log
+gptoss-dual-b580-b50  level_zero:0,1  gpt-oss-20b-mxfp4.gguf     0   15   NA         NA         NA      NA             NA          NA          NA               NA          NA                 NA            /Apps/llama.cpp/benchmark_results/sycl-dual-gpu-gate-20260609-194354/gptoss-dual-b580-b50-fa0.log
+mistral-b580          level_zero:0    mistral-7b-v0.1.Q4_0.gguf  1   0    162.68     88.27      NA      NA             NA          NA          NA               NA          NA                 NA            /Apps/llama.cpp/benchmark_results/sycl-dual-gpu-gate-20260609-194354/mistral-b580-fa1.log
+mistral-b50           level_zero:1    mistral-7b-v0.1.Q4_0.gguf  1   0    1130.23    47.26      NA      NA             NA          NA          NA               NA          NA                 NA            /Apps/llama.cpp/benchmark_results/sycl-dual-gpu-gate-20260609-194354/mistral-b50-fa1.log
+mistral-b580          level_zero:0    mistral-7b-v0.1.Q4_0.gguf  0   1    NA         NA         NA      NA             NA          NA          NA               NA          NA                 NA            /Apps/llama.cpp/benchmark_results/sycl-dual-gpu-gate-20260609-194354/mistral-b580-fa0.log
+mistral-b50           level_zero:1    mistral-7b-v0.1.Q4_0.gguf  0   1    NA         NA         NA      NA             NA          NA          NA               NA          NA                 NA            /Apps/llama.cpp/benchmark_results/sycl-dual-gpu-gate-20260609-194354/mistral-b50-fa0.log
+
+Comparison:
+fa  best_single_case  best_single_pp512  dual_pp512  dual_vs_best_pp512_pct  target_110pct_pp512  beats_best_by_10pct  best_single_tg128  dual_tg128  dual_vs_best_tg128_pct
+0   gptoss-b50        168.88             NA          NA                      NA                   no                   44.4               NA          NA
+1   gptoss-b50        323.16             NA          NA                      NA                   no                   45.93              NA          NA
+
+Guardrails:
+guard             case          fa  rc  pp512_tps  min_pp512  tg128_tps  min_tg128  pass
+gptoss_b50_fa1    gptoss-b50    1   0   323.16     1100       45.93      50         no
+mistral_b580_fa1  mistral-b580  1   0   162.68     2000       88.27      84         no

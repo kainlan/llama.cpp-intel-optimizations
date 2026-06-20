@@ -20,6 +20,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -344,6 +345,9 @@ void * ggml_sycl_get_staged_ptr_device(const void * src, size_t size, int device
         std::lock_guard<std::mutex> lock(g_runtime_staging_mutex);
         auto                        it = g_runtime_staging_cache.find(key);
         if (it != g_runtime_staging_cache.end() && it->second.size >= size) {
+            // Runtime tensors are mutable; the cache owns reusable staging
+            // storage, not immutable content.
+            std::memcpy(it->second.ptr, src, size);
             return it->second.ptr;
         }
         if (it != g_runtime_staging_cache.end()) {
@@ -579,6 +583,7 @@ static constexpr int64_t watchdog_ns_per_ms = 1000000;
 
 static std::atomic<int64_t> g_watchdog_last_tick_ns{ 0 };
 static std::atomic<bool>    g_watchdog_active{ false };
+static std::atomic<int>     g_watchdog_non_graph_inflight{ 0 };
 static std::thread          g_watchdog_thread;
 
 static inline int64_t ggml_sycl_watchdog_now_ns() {
@@ -590,6 +595,15 @@ void ggml_sycl_watchdog_heartbeat() {
     g_watchdog_last_tick_ns.store(ggml_sycl_watchdog_now_ns(), std::memory_order_relaxed);
 }
 
+void ggml_sycl_watchdog_non_graph_begin() {
+    g_watchdog_non_graph_inflight.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void ggml_sycl_watchdog_non_graph_end() {
+    g_watchdog_non_graph_inflight.fetch_sub(1, std::memory_order_acq_rel);
+    ggml_sycl_watchdog_heartbeat();
+}
+
 static void watchdog_thread_fn(int64_t timeout_ms) {
     const int64_t timeout_ns = timeout_ms * watchdog_ns_per_ms;
     while (g_watchdog_active.load(std::memory_order_acquire)) {
@@ -597,7 +611,8 @@ static void watchdog_thread_fn(int64_t timeout_ms) {
         if (!g_watchdog_active.load(std::memory_order_acquire)) {
             break;
         }
-        if (ggml_sycl_graph_inflight_count() <= 0) {
+        if (ggml_sycl_graph_inflight_count() <= 0 &&
+            g_watchdog_non_graph_inflight.load(std::memory_order_acquire) <= 0) {
             ggml_sycl_watchdog_heartbeat();
             continue;
         }
@@ -666,23 +681,20 @@ static int64_t ggml_sycl_parse_op_timeout_ms() {
 }
 
 void ggml_sycl_watchdog_start() {
-    static bool started = false;
-    if (started) {
-        return;
-    }
-    const int64_t timeout_ms = ggml_sycl_parse_op_timeout_ms();
-    if (timeout_ms == 0) {
-        GGML_LOG_INFO("[SYCL] Watchdog disabled (GGML_SYCL_OP_TIMEOUT_MS=0)\n");
-        started = true;
-        return;
-    }
-    GGML_LOG_INFO("[SYCL] Watchdog started (GGML_SYCL_OP_TIMEOUT_MS=%lld, poll=%lld ms)\n", (long long) timeout_ms,
-                  (long long) watchdog_poll_ms);
-    g_watchdog_last_tick_ns.store(ggml_sycl_watchdog_now_ns(), std::memory_order_relaxed);
-    g_watchdog_active.store(true, std::memory_order_release);
-    g_watchdog_thread = std::thread(watchdog_thread_fn, timeout_ms);
-    g_watchdog_thread.detach();  // Don't join — might deadlock if main thread is stuck
-    started = true;
+    static std::once_flag start_once;
+    std::call_once(start_once, [] {
+        const int64_t timeout_ms = ggml_sycl_parse_op_timeout_ms();
+        if (timeout_ms == 0) {
+            GGML_LOG_INFO("[SYCL] Watchdog disabled (GGML_SYCL_OP_TIMEOUT_MS=0)\n");
+            return;
+        }
+        GGML_LOG_INFO("[SYCL] Watchdog started (GGML_SYCL_OP_TIMEOUT_MS=%lld, poll=%lld ms)\n", (long long) timeout_ms,
+                      (long long) watchdog_poll_ms);
+        g_watchdog_last_tick_ns.store(ggml_sycl_watchdog_now_ns(), std::memory_order_relaxed);
+        g_watchdog_active.store(true, std::memory_order_release);
+        g_watchdog_thread = std::thread(watchdog_thread_fn, timeout_ms);
+        g_watchdog_thread.detach();  // Don't join — might deadlock if main thread is stuck
+    });
 }
 
 void ggml_sycl_watchdog_stop() {

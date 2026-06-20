@@ -1,0 +1,6 @@
+order	commit	summary	risk
+1	06f8887a6	restore unified-cache prompt headroom	memory/headroom accounting; keep if validated
+2	a42a4c9a3	harden unified-cache view ownership	ownership fix; should keep unless tests contradict
+3	129a04fcb	tighten gpu performance gates	gate-only; keep
+4	feae906b4	restore default MoE block graphlets	suspect default-on command graph path; must be opt-in until clean-boot proof
+5	f7a332578	prefer MoE block graphlets for decode	suspect default-on command graph path; must be opt-in until clean-boot proof

@@ -1,0 +1,5 @@
+case	selector	metric_pp512	metric_tg128	commit_or_build	evidence
+mistral-b580-fa1	level_zero:0	2173.92 +/- 10.01	88.42 +/- 0.47	5b206c499-dirty	docs/backend/SYCL.md; deterministic count gate correct
+gptoss-b50-fa1	level_zero:1	1043.87	50.07	60a8c042f8a1de1c5ed2c2f1183f8f87e82b51e8	beads/AGENTS historical known-good; GGUF chat-template count gate correct
+gptoss-b50-restored-fa1	level_zero:1	~1255	~52	closed pre/post-merge optimization beads	llama.cpp-aqzz3.1 and related perf-gate beads; target guardrail, not lower current baseline
+gptoss-b50-close-regression-base	level_zero:1	1256.37	33.30	581babb476b726665a03345feb1a9ebcabe630db	close pre-regression baseline from prior same-branch notes

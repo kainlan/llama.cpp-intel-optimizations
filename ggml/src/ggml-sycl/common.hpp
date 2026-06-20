@@ -4546,6 +4546,9 @@ struct ggml_backend_sycl_context {
         int              end_node;    // Exclusive end index in cgraph->nodes[]
         uint64_t         graph_hash;
         uint64_t         pointer_hash;
+        // Fused MoE dispatch nodes captured by this recorded safe subrange.
+        // The subrange may also contain non-MoE ops, or be a non-MoE range
+        // recorded to amortize direct dispatch around GET_ROWS/FA gaps.
         std::vector<int> moe_nodes;
         std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph;
     };
@@ -5794,6 +5797,8 @@ static inline bool ggml_sycl_type_is_fp8_e4m3(ggml_type type) {
 void ggml_sycl_watchdog_start();
 void ggml_sycl_watchdog_stop();
 void ggml_sycl_watchdog_heartbeat();
+void ggml_sycl_watchdog_non_graph_begin();
+void ggml_sycl_watchdog_non_graph_end();
 
 // Standard property list for all directly-created GPU in-order queues.
 // Includes enable_profiling to activate counter-based events on L0 (~15% TG speedup).

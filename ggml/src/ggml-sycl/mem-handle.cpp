@@ -89,6 +89,14 @@ void retained_handle_drain_loop() {
         }
 
         try {
+            struct event_wait_watchdog_guard {
+                event_wait_watchdog_guard() {
+                    ggml_sycl_watchdog_start();
+                    ggml_sycl_watchdog_heartbeat();
+                    ggml_sycl_watchdog_non_graph_begin();
+                }
+                ~event_wait_watchdog_guard() { ggml_sycl_watchdog_non_graph_end(); }
+            } watchdog_guard;
             record.event.wait_and_throw();
         } catch (const std::exception & e) {
             const std::string msg = e.what();

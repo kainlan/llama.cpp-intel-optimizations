@@ -30,6 +30,29 @@
 
 using json = nlohmann::ordered_json;
 
+static bool common_chat_extra_context_true(const json & extra_context, const std::string & key) {
+    if (!extra_context.is_object()) {
+        return false;
+    }
+
+    auto it = extra_context.find(key);
+    if (it == extra_context.end()) {
+        return false;
+    }
+
+    if (it->is_boolean()) {
+        return it->get<bool>();
+    }
+    if (it->is_string()) {
+        const auto value = it->get<std::string>();
+        return value == "true" || value == "1";
+    }
+    if (it->is_number_integer()) {
+        return it->get<int>() != 0;
+    }
+    return false;
+}
+
 static std::string format_time(const std::chrono::system_clock::time_point & now, const std::string & format) {
     auto               time       = std::chrono::system_clock::to_time_t(now);
     auto               local_time = *std::localtime(&time);
@@ -1081,7 +1104,18 @@ static common_chat_params common_chat_params_init_gpt_oss(const common_chat_temp
 
     data.prompt            = prompt;
     data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs, /* messages_override= */ adjusted_messages);
-    data.message_spans = common_chat_split_by_role(prompt, {
+
+    if (inputs.add_generation_prompt && common_chat_extra_context_true(inputs.extra_context, "llama_force_final_channel")) {
+        static constexpr std::string_view final_channel = "<|channel|>final<|message|>";
+        if (!string_ends_with(data.generation_prompt, final_channel)) {
+            data.generation_prompt += final_channel;
+        }
+        if (!string_ends_with(data.prompt, final_channel)) {
+            data.prompt += final_channel;
+        }
+    }
+
+    data.message_spans = common_chat_split_by_role(data.prompt, {
         { "assistant", "<|start|>assistant" },
         { "user",      "<|start|>user"      },
         { "system",    "<|start|>developer" },
@@ -1089,8 +1123,10 @@ static common_chat_params common_chat_params_init_gpt_oss(const common_chat_temp
         { "tool",      "<|start|>functions" },
     });
 
-    data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
-    data.supports_thinking = true;
+    data.format             = COMMON_CHAT_FORMAT_PEG_NATIVE;
+    data.supports_thinking  = true;
+    data.thinking_start_tag = "<|start|>assistant";
+    data.thinking_end_tag   = "<|channel|>final<|message|>";
 
     // These special tokens are required to parse properly, so we include them
     // even if parse_tool_calls is false.

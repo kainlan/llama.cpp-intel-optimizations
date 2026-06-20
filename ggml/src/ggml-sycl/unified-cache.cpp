@@ -55,6 +55,7 @@ static std::atomic<size_t>   g_runtime_reserved_host_bytes{};
 static std::atomic<size_t>   g_runtime_host_cat_bytes[static_cast<int>(runtime_category::COUNT)]{};
 static std::atomic<size_t>   g_runtime_managed_reserved_host_bytes{};
 static std::atomic<size_t>   g_planned_pp_pipeline_scratch_bytes[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<size_t>   g_planned_onednn_scratchpad_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_pp_moe_onednn_weight_slot_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_pp_moe_onednn_activation_slot_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_pp_moe_onednn_output_slot_bytes[GGML_SYCL_MAX_DEVICES]{};
@@ -252,6 +253,20 @@ size_t unified_cache_get_planned_pp_pipeline_scratch_bytes(int device_id) {
         return 0;
     }
     return g_planned_pp_pipeline_scratch_bytes[device_id].load(std::memory_order_acquire);
+}
+
+void unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t bytes) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    g_planned_onednn_scratchpad_bytes[device_id].store(bytes, std::memory_order_release);
+}
+
+size_t unified_cache_get_planned_onednn_scratchpad_bytes(int device_id) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return g_planned_onednn_scratchpad_bytes[device_id].load(std::memory_order_acquire);
 }
 
 void unified_cache_set_planned_pp_moe_onednn_scratch(int      device_id,
@@ -1281,6 +1296,7 @@ unified_cache::unified_cache(sycl::queue & queue,
     budget_(budget_bytes),
     base_budget_(budget_bytes),
     reserved_(0),
+    device_total_vram_(device_total_vram),
     dma_reserved_bytes_(dma_reserved_bytes) {
     // Register atexit handler once to set shutdown flag before static destructors run
     // This prevents the destructor from calling sycl::free() on invalid queue
@@ -1321,82 +1337,12 @@ unified_cache::unified_cache(sycl::queue & queue,
     // contiguous chunks (reduces GPU TLB misses from scattered USM mappings).
     layout_pool_ = std::make_unique<sycl_device_pool>(queue_, ggml_sycl_get_device_id_from_queue(queue_));
 
-    // VRAM Arena: pre-allocate a single VRAM block when GGML_SYCL_VRAM_ARENA=1.
-    if (vram_arena_enabled()) {
-        const int    dev_id        = ggml_sycl_get_device_id_from_queue(queue_);
-        // Per-allocation caps from the runtime's reported max_mem_alloc_size.
-        // The raw cap is the API limit; the safe cap mirrors ggml_sycl_info()
-        // by leaving a small margin below that limit.  Arena reservations keep
-        // the full budget by using multiple chunks when the total exceeds the
-        // safe cap, so this does not force host fallback for models that fit.
-        const size_t max_alloc     = queue_.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
-        const double safety_margin = 0.95;
-        size_t       safe_max_alloc =
-            max_alloc > 0 ? static_cast<size_t>(std::floor(static_cast<double>(max_alloc) * safety_margin)) : 0;
-        if (safe_max_alloc == 0) {
-            safe_max_alloc = max_alloc;
-        }
-
-        // Default zone sizes.  Scratch covers per-op temporary buffers and must
-        // stay large enough for prompt-processing paths that use oneDNN/XMX
-        // staging alongside MoE routing buffers.
-        size_t       scratch_zone = 256 * 1024 * 1024;
-        const char * arena_mb_env = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB");
-        if (arena_mb_env) {
-            scratch_zone = static_cast<size_t>(std::max(0, std::atoi(arena_mb_env))) * 1024 * 1024;
-        }
-
-        // oneDNN scratch: 0 by default, sized later by reserve_onednn_scratch.
-        // Pre-reserve a generous 256 MB for oneDNN to avoid later realloc.
-        size_t onednn_zone = 256 * 1024 * 1024;
-
-        // Runtime zone: fixed-address compute buffers, staging, and MoE pools.
-        // Keep this conservatively sized by default; under-allocating the
-        // runtime zone pushes hot prompt paths into slower fallback allocation
-        // behavior even when there is enough total VRAM.
-        // For TP-enabled models, the placement_plan::tp_vram_runtime_bytes field
-        // documents the additional RUNTIME bytes needed for secondary devices;
-        // the secondary device planner is expected to pass that value here.
-        // Zone size is fixed at arena creation — cannot grow after freezing.
-        size_t runtime_zone = 512 * 1024 * 1024;
-        if (const char * env = std::getenv("GGML_SYCL_RUNTIME_ARENA_MB")) {
-            runtime_zone = static_cast<size_t>(std::max(0, std::atoi(env))) * 1024 * 1024;
-        }
-        const size_t planned_pp_pipeline     = unified_cache_get_planned_pp_pipeline_scratch_bytes(dev_id);
-        const size_t planned_pp_moe_onednn   = unified_cache_get_planned_pp_moe_onednn_scratch_bytes(dev_id);
-        const size_t planned_runtime_scratch = planned_pp_pipeline + planned_pp_moe_onednn;
-        if (planned_runtime_scratch > 0 && runtime_zone < planned_runtime_scratch) {
-            runtime_zone = planned_runtime_scratch;
-            GGML_LOG_INFO(
-                "[UNIFIED-CACHE] Runtime zone raised to %.1f MB for PP scratch planning "
-                "(pipeline=%.1f MB, moe_onednn=%.1f MB)\n",
-                runtime_zone / (1024.0 * 1024.0), planned_pp_pipeline / (1024.0 * 1024.0),
-                planned_pp_moe_onednn / (1024.0 * 1024.0));
-        }
-
-        if (arena_reserve(queue_, budget_bytes, max_alloc, safe_max_alloc, scratch_zone, onednn_zone, runtime_zone,
-                          device_total_vram)) {
-            // Point compute_arena at the arena's SCRATCH zone immediately so
-            // pool_leg can route through it.  Without this, pool_leg falls back
-            // to sycl::malloc_device which can return low-VA pointers that the
-            // L0 driver doesn't recognize as USM (compute-runtime bug).
-            const auto & cz_info = get_zone(vram_zone_id::SCRATCH);
-            compute_arena_owner_ = {};
-            compute_arena_ptr_   = offset_to_ptr(cz_info.start);
-            compute_arena_size_  = cz_info.size;
-            compute_arena_off_.store(0, std::memory_order_relaxed);
-            GGML_LOG_INFO("[VRAM-ARENA] Active on device %d: %d chunk(s), %.1f MB total\n", dev_id, chunk_count(),
-                          arena_total_size() / (1024.0 * 1024.0));
-            GGML_LOG_INFO("[VRAM-ARENA] Scratch zone: %p + %.1f MB (offset %.1f MB from base)\n", compute_arena_ptr_,
-                          compute_arena_size_ / (1024.0 * 1024.0), cz_info.start / (1024.0 * 1024.0));
-            // Bind layout pool to the arena so new layout allocations come from the
-            // arena's weight zone instead of allocating separate chunks.
-            if (layout_pool_) {
-                layout_pool_->set_arena(this);
-            }
-        } else {
-            GGML_LOG_WARN("[VRAM-ARENA] Failed on device %d, falling back to per-entry allocation\n", dev_id);
-        }
+    // VRAM Arena: pre-allocate a block when enabled.  Inventory-derived zone
+    // sizes are not available during first backend init, so the same helper is
+    // called again after the planner records them.
+    if (vram_arena_enabled() && !ensure_planned_arena_zones()) {
+        const int dev_id = ggml_sycl_get_device_id_from_queue(queue_);
+        GGML_LOG_WARN("[VRAM-ARENA] Failed on device %d, falling back to per-entry allocation\n", dev_id);
     }
 
     // Create a separate in-order DMA queue for cache operations (CCS engine).
@@ -1516,6 +1462,131 @@ unified_cache::unified_cache(sycl::queue & queue,
     // Ensure unordered_map has buckets before any find() calls.
     entries_.rehash(1);
     id_to_key_.rehash(1);
+}
+
+bool unified_cache::ensure_planned_arena_zones() {
+    if (!vram_arena_enabled()) {
+        return true;
+    }
+
+    const int dev_id = ggml_sycl_get_device_id_from_queue(queue_);
+
+    const size_t max_alloc     = queue_.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+    const double safety_margin = 0.95;
+    size_t       safe_max_alloc =
+        max_alloc > 0 ? static_cast<size_t>(std::floor(static_cast<double>(max_alloc) * safety_margin)) : 0;
+    if (safe_max_alloc == 0) {
+        safe_max_alloc = max_alloc;
+    }
+
+    size_t       scratch_zone = 512 * 1024 * 1024;
+    const char * arena_mb_env = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB");
+    if (arena_mb_env) {
+        scratch_zone = static_cast<size_t>(std::max(0, std::atoi(arena_mb_env))) * 1024 * 1024;
+    }
+
+    size_t       onednn_zone         = 256 * 1024 * 1024;
+    const size_t planned_onednn_zone = unified_cache_get_planned_onednn_scratchpad_bytes(dev_id);
+    if (planned_onednn_zone > onednn_zone) {
+        onednn_zone = planned_onednn_zone;
+        GGML_LOG_INFO("[UNIFIED-CACHE] ONEDNN zone raised to %.1f MB from placement scratch estimate\n",
+                      onednn_zone / (1024.0 * 1024.0));
+    }
+
+    size_t runtime_zone = 512 * 1024 * 1024;
+    if (const char * env = std::getenv("GGML_SYCL_RUNTIME_ARENA_MB")) {
+        runtime_zone = static_cast<size_t>(std::max(0, std::atoi(env))) * 1024 * 1024;
+    }
+    const size_t planned_pp_pipeline     = unified_cache_get_planned_pp_pipeline_scratch_bytes(dev_id);
+    const size_t planned_pp_moe_onednn   = unified_cache_get_planned_pp_moe_onednn_scratch_bytes(dev_id);
+    const size_t planned_runtime_scratch = planned_pp_pipeline + planned_pp_moe_onednn;
+    if (planned_runtime_scratch > 0 && runtime_zone < planned_runtime_scratch) {
+        runtime_zone = planned_runtime_scratch;
+        GGML_LOG_INFO(
+            "[UNIFIED-CACHE] Runtime zone raised to %.1f MB for PP scratch planning "
+            "(pipeline=%.1f MB, moe_onednn=%.1f MB)\n",
+            runtime_zone / (1024.0 * 1024.0), planned_pp_pipeline / (1024.0 * 1024.0),
+            planned_pp_moe_onednn / (1024.0 * 1024.0));
+    }
+
+    auto bind_compute_arena = [&]() {
+        const auto & cz_info = get_zone(vram_zone_id::SCRATCH);
+        compute_arena_owner_ = {};
+        compute_arena_ptr_   = offset_to_ptr(cz_info.start);
+        compute_arena_size_  = cz_info.size;
+        compute_arena_off_.store(0, std::memory_order_relaxed);
+        GGML_LOG_INFO("[VRAM-ARENA] Active on device %d: %d chunk(s), %.1f MB total\n", dev_id, chunk_count(),
+                      arena_total_size() / (1024.0 * 1024.0));
+        GGML_LOG_INFO("[VRAM-ARENA] Scratch zone: %p + %.1f MB (offset %.1f MB from base)\n", compute_arena_ptr_,
+                      compute_arena_size_ / (1024.0 * 1024.0), cz_info.start / (1024.0 * 1024.0));
+        if (layout_pool_) {
+            layout_pool_->set_arena(this);
+        }
+    };
+
+    if (arena_active()) {
+        const bool zones_sufficient = zone_capacity(vram_zone_id::SCRATCH) >= scratch_zone &&
+                                      zone_capacity(vram_zone_id::ONEDNN) >= onednn_zone &&
+                                      zone_capacity(vram_zone_id::RUNTIME) >= runtime_zone;
+        if (zones_sufficient) {
+            if (!compute_arena_ptr_ || !vram_owns(compute_arena_ptr_)) {
+                bind_compute_arena();
+            }
+            return true;
+        }
+
+        size_t live_zone_bytes = 0;
+        for (size_t z = 0; z < static_cast<size_t>(vram_zone_id::COUNT); ++z) {
+            live_zone_bytes += zone_used(static_cast<vram_zone_id>(z));
+        }
+
+        bool     has_chunk_leases = false;
+        uint32_t chunk_leases     = 0;
+        for (const arena_chunk & chunk : arena_chunks_) {
+            const uint32_t leases = chunk.lease_count.load();
+            chunk_leases += leases;
+            has_chunk_leases = has_chunk_leases || leases != 0;
+        }
+
+        const bool has_live_scratch =
+            compute_arena_used() != 0 || scratch_pool_ptr_ != nullptr || onednn_weights_scratch_ != nullptr ||
+            onednn_activations_scratch_ != nullptr || reorder_temp_buffer_ != nullptr ||
+            !persistent_scratches_.empty() || !pp_moe_onednn_scratch_slots_.empty();
+        if (live_zone_bytes != 0 || has_chunk_leases || has_live_scratch) {
+            GGML_LOG_ERROR(
+                "[VRAM-ARENA] planned zones exceed active arena but live allocations prevent rebuild: "
+                "need scratch=%.1f MB oneDNN=%.1f MB runtime=%.1f MB; have scratch=%.1f MB oneDNN=%.1f MB "
+                "runtime=%.1f MB; live_zone=%.1f MB chunk_leases=%u\n",
+                scratch_zone / (1024.0 * 1024.0), onednn_zone / (1024.0 * 1024.0),
+                runtime_zone / (1024.0 * 1024.0), zone_capacity(vram_zone_id::SCRATCH) / (1024.0 * 1024.0),
+                zone_capacity(vram_zone_id::ONEDNN) / (1024.0 * 1024.0),
+                zone_capacity(vram_zone_id::RUNTIME) / (1024.0 * 1024.0),
+                live_zone_bytes / (1024.0 * 1024.0), chunk_leases);
+            return false;
+        }
+
+        GGML_LOG_INFO(
+            "[VRAM-ARENA] Rebuilding unused early arena for planned zones: "
+            "scratch %.1f->%.1f MB, oneDNN %.1f->%.1f MB, runtime %.1f->%.1f MB\n",
+            zone_capacity(vram_zone_id::SCRATCH) / (1024.0 * 1024.0), scratch_zone / (1024.0 * 1024.0),
+            zone_capacity(vram_zone_id::ONEDNN) / (1024.0 * 1024.0), onednn_zone / (1024.0 * 1024.0),
+            zone_capacity(vram_zone_id::RUNTIME) / (1024.0 * 1024.0), runtime_zone / (1024.0 * 1024.0));
+        if (layout_pool_) {
+            layout_pool_->set_arena(nullptr);
+        }
+        compute_arena_ptr_   = nullptr;
+        compute_arena_size_  = 0;
+        compute_arena_owner_ = {};
+        compute_arena_off_.store(0, std::memory_order_relaxed);
+        arena_destroy();
+    }
+
+    if (!arena_reserve(queue_, budget_, max_alloc, safe_max_alloc, scratch_zone, onednn_zone, runtime_zone,
+                       device_total_vram_)) {
+        return false;
+    }
+    bind_compute_arena();
+    return true;
 }
 
 unified_cache::~unified_cache() {
@@ -1656,13 +1727,16 @@ unified_cache::~unified_cache() {
 
     // Free reorder temp buffer BEFORE arena destroy.
     if (reorder_temp_buffer_) {
-        if (!(had_arena && vram_owns(reorder_temp_buffer_))) {
+        if (reorder_temp_owner_.valid()) {
+            reorder_temp_owner_ = {};
+        } else if (!(had_arena && vram_owns(reorder_temp_buffer_))) {
             GGML_LOG_ERROR("[UNIFIED-CACHE] direct reorder temp buffer missing alloc_handle owner ptr=%p\n",
                            reorder_temp_buffer_);
             GGML_ASSERT(false && "direct reorder temp buffer missing alloc_handle owner");
         }
         reorder_temp_buffer_ = nullptr;
         reorder_temp_size_   = 0;
+        reorder_temp_owner_  = {};
     }
 
     // Free persistent scratch buffers BEFORE arena destroy.
@@ -8900,6 +8974,16 @@ bool unified_alloc_validate_registry(int device, const char * where) {
     return ok;
 }
 
+void unified_cache_dump_live_zone_allocations(int device, vram_zone_id zone, const char * where, size_t max_entries) {
+    unified_cache * cache = get_unified_cache_for_device(device);
+    if (!cache) {
+        GGML_LOG_WARN("[UNIFIED-ALLOC] live-zone-dump%s%s device=%d zone=%d cache unavailable\n",
+                      where ? " at " : "", where ? where : "", device, static_cast<int>(zone));
+        return;
+    }
+    cache->dump_live_zone_allocations(zone, where, max_entries);
+}
+
 void unified_cache_set_graph_compute_active(bool active) {
     g_graph_compute_active.store(active, std::memory_order_release);
 }
@@ -9703,10 +9787,11 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
             // Reset zone on partial failure.
             zone_reset(vram_zone_id::ONEDNN);
         }
-        GGML_LOG_WARN(
+        GGML_LOG_ERROR(
             "[UNIFIED-CACHE] oneDNN scratch arena zone too small (need %.1f MB, have %.1f MB), "
-            "falling back to direct alloc\n",
+            "refusing direct fallback because arena planning is authoritative\n",
             total_needed / (1024.0f * 1024.0f), zone_cap / (1024.0f * 1024.0f));
+        return finish(false);
     }
     direct_attempt = true;
 
@@ -9973,26 +10058,49 @@ bool unified_cache::reserve_reorder_temp(size_t size_bytes) {
 
     // Free existing if resizing
     if (reorder_temp_buffer_) {
-        if (!vram_owns(reorder_temp_buffer_)) {
+        if (reorder_temp_owner_.valid()) {
+            reorder_temp_owner_ = {};
+        } else if (vram_owns(reorder_temp_buffer_)) {
+            zone_free(vram_zone_id::SCRATCH, reorder_temp_buffer_);
+        } else {
             GGML_LOG_ERROR("[UNIFIED-CACHE] direct reorder temp buffer missing alloc_handle owner ptr=%p\n",
                            reorder_temp_buffer_);
             GGML_ASSERT(false && "direct reorder temp buffer missing alloc_handle owner");
         }
         reorder_temp_buffer_ = nullptr;
         reorder_temp_size_   = 0;
+        reorder_temp_owner_  = {};
     }
 
     // Allocate temp buffer for GPU-side AOS→SOA reorder.
     // Called from moe_hybrid_init_once under std::call_once — single-threaded.
     if (arena_active()) {
-        reorder_temp_buffer_ = zone_alloc(vram_zone_id::SCRATCH, size_bytes);
-        if (!reorder_temp_buffer_) {
-            GGML_LOG_WARN("[UNIFIED-CACHE] Arena SCRATCH zone full for reorder temp (%.1f MB)\n",
+        alloc_request req{};
+        req.queue                               = &queue_;
+        req.device                              = ggml_sycl_get_device_id_from_queue(queue_);
+        req.size                                = size_bytes;
+        req.intent.role                         = alloc_role::STAGING;
+        req.intent.category                     = runtime_category::STAGING;
+        req.intent.cohort_id                    = "moe-reorder-temp";
+        req.intent.constraints.must_device      = true;
+        req.intent.constraints.prefer_vram_zone = vram_zone_id::RUNTIME;
+        alloc_handle owner{};
+        if (!unified_alloc(req, &owner) || !owner.ptr) {
+            GGML_LOG_WARN("[UNIFIED-CACHE] failed to reserve GPU reorder temp buffer (%.1f MB)\n",
                           size_bytes / (1024.0f * 1024.0f));
             return false;
         }
-        reorder_temp_size_ = size_bytes;
-        GGML_LOG_INFO("[UNIFIED-CACHE] Reserved GPU reorder temp buffer (arena): %.1f MB\n",
+        reorder_temp_owner_ = mem_handle::from_owned_alloc(std::move(owner), GGML_LAYOUT_AOS);
+        auto resolved       = reorder_temp_owner_.resolve(req.device);
+        if (!resolved || !resolved.on_device) {
+            GGML_LOG_WARN("[UNIFIED-CACHE] failed to resolve GPU reorder temp buffer owner (%.1f MB)\n",
+                          size_bytes / (1024.0f * 1024.0f));
+            reorder_temp_owner_ = {};
+            return false;
+        }
+        reorder_temp_buffer_ = resolved.ptr;
+        reorder_temp_size_   = size_bytes;
+        GGML_LOG_INFO("[UNIFIED-CACHE] Reserved GPU reorder temp buffer (unified): %.1f MB\n",
                       size_bytes / (1024.0f * 1024.0f));
         return true;
     }
@@ -11404,21 +11512,10 @@ bool unified_cache::reserve_compute_arena(size_t arena_bytes) {
             // Budget already charged when arena was reserved — don't double-count.
             return true;
         }
-        // Arena owns ALL VRAM — no raw malloc_device possible.
-        // Use the available zone capacity even if smaller than requested.
-        if (zone_cap > 0) {
-            const auto & szone   = get_zone(vram_zone_id::SCRATCH);
-            compute_arena_owner_ = {};
-            compute_arena_ptr_   = offset_to_ptr(szone.start);
-            compute_arena_size_  = zone_cap;
-            compute_arena_off_.store(0, std::memory_order_relaxed);
-            GGML_LOG_WARN(
-                "[COMPUTE-ARENA] Arena scratch zone (%.1f MB) < requested (%.1f MB), "
-                "using available capacity\n",
-                zone_cap / (1024.0 * 1024.0), arena_bytes / (1024.0 * 1024.0));
-            return true;
-        }
-        GGML_LOG_ERROR("[COMPUTE-ARENA] Arena scratch zone is 0 bytes, cannot reserve\n");
+        GGML_LOG_ERROR(
+            "[COMPUTE-ARENA] Arena scratch zone (%.1f MB) < requested (%.1f MB); "
+            "refusing undersized scratch allocation\n",
+            zone_cap / (1024.0 * 1024.0), arena_bytes / (1024.0 * 1024.0));
         return false;
     }
 
@@ -11868,6 +11965,14 @@ bool unified_cache_reserve_compute_arena(int device_id, size_t arena_bytes) {
         return false;
     }
     return cache->reserve_compute_arena(arena_bytes);
+}
+
+bool unified_cache_ensure_planned_arena_zones(int device_id) {
+    auto * cache = get_unified_cache_for_device(device_id);
+    if (!cache) {
+        return false;
+    }
+    return cache->ensure_planned_arena_zones();
 }
 
 void * unified_cache_arena_alloc(int device_id, size_t size) {
@@ -13490,6 +13595,64 @@ size_t unified_cache::zone_available(vram_zone_id zone) const {
     return z.size > used ? z.size - used : 0;
 }
 
+void unified_cache::dump_live_zone_allocations(vram_zone_id zone, const char * where, size_t max_entries) const {
+    const auto & z = arena_zones_[static_cast<int>(zone)];
+    const void * zone_base_ptr = (arena_base_ && z.size > 0) ? offset_to_ptr(z.start) : nullptr;
+    const auto   zone_base     = reinterpret_cast<uintptr_t>(zone_base_ptr);
+    const auto   zone_hi       = zone_base + z.size;
+    const size_t used          = zone_used(zone);
+    const size_t available     = zone_available(zone);
+    const size_t largest_free  = zone_largest_free(zone);
+    const int    cache_device  = ggml_sycl_get_device_id_from_queue(queue_);
+
+    fprintf(stderr,
+        "[UNIFIED-ALLOC] live-zone-dump%s%s device=%d zone=%d used=%.1f MB available=%.1f MB "
+        "capacity=%.1f MB largest_free=%.1f MB base=%p\n",
+        where ? " at " : "", where ? where : "", cache_device, static_cast<int>(zone), used / (1024.0 * 1024.0),
+        available / (1024.0 * 1024.0), z.size / (1024.0 * 1024.0), largest_free / (1024.0 * 1024.0),
+        zone_base_ptr);
+    fflush(stderr);
+
+    if (!zone_base_ptr || z.size == 0) {
+        return;
+    }
+
+    size_t total_count = 0;
+    size_t total_bytes = 0;
+    size_t logged      = 0;
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    for (const auto & kv : g_runtime_alloc_registry) {
+        const runtime_alloc_record & rec = kv.second;
+        const alloc_handle &         h   = rec.handle;
+        if (!h.ptr) {
+            continue;
+        }
+        const auto p = reinterpret_cast<uintptr_t>(h.ptr);
+        if (p < zone_base || p >= zone_hi) {
+            continue;
+        }
+        total_count++;
+        total_bytes += h.size;
+        if (logged >= max_entries) {
+            continue;
+        }
+        logged++;
+        fprintf(stderr,
+                "[UNIFIED-ALLOC] live-zone-dump%s%s ptr=%p alloc_id=%llu size=%zu device=%d tier=%s role=%d "
+                "category=%d vram_zone=%d host_zone=%d zone_managed=%d from_arena=%d cohort=%s\n",
+                where ? " at " : "", where ? where : "", h.ptr, static_cast<unsigned long long>(h.alloc_id), h.size,
+                h.device, alloc_tier_name(h.tier), static_cast<int>(h.role), static_cast<int>(h.category),
+                static_cast<int>(h.vram_zone), static_cast<int>(h.host_zone), h.zone_managed ? 1 : 0,
+                rec.from_arena ? 1 : 0, rec.cohort_id.empty() ? "(none)" : rec.cohort_id.c_str());
+    }
+
+    fprintf(stderr,
+            "[UNIFIED-ALLOC] live-zone-dump%s%s device=%d zone=%d address-live=%zu bytes=%.1f MB logged=%zu/%zu\n",
+            where ? " at " : "", where ? where : "", cache_device, static_cast<int>(zone), total_count,
+            total_bytes / (1024.0 * 1024.0), logged, total_count);
+    fflush(stderr);
+}
+
 size_t unified_cache::zone_largest_free(vram_zone_id zone) const {
     const auto & z = arena_zones_[static_cast<int>(zone)];
 
@@ -14045,8 +14208,7 @@ static bool planner_mxfp4_i8_supported(const placement_entry & entry, int device
 }
 
 // Mirrors ggml_sycl_xmx_moe_forced(): GGML_SYCL_XMX_MOE=1 re-enables the
-// diagnostic-only prompt XMX path, which consumes XMX_TILED primaries
-// directly, so the PP-safe SOA promotion must stand down.
+// diagnostic prompt XMX path, which consumes XMX_TILED primaries directly.
 static bool planner_xmx_moe_forced() {
     static const bool forced = [] {
         const char * env = std::getenv("GGML_SYCL_XMX_MOE");
@@ -14060,6 +14222,22 @@ static bool planner_xmx_moe_forced() {
 static bool planner_moe_prompt_down_specialized_layouts_enabled() {
     static const bool enabled = [] {
         const char * env = std::getenv("GGML_SYCL_MOE_PP_DOWN_SPECIALIZED_LAYOUTS");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static bool planner_moe_prompt_down_transient_soa_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_MOE_PROMPT_DOWN_TRANSIENT");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static bool planner_moe_xmx_tiled_pp_proof_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_XMX_TILED_PP_PROOF");
         return env != nullptr && std::atoi(env) != 0;
     }();
     return enabled;
@@ -14401,12 +14579,12 @@ static size_t planner_expected_moe_pp_rows(const placement_kv_info &            
     return pp_tokens * top_k;
 }
 
-static bool planner_moe_primary_executor_supports_pp_layout(const placement_entry &              entry,
-                                                            ggml_layout_mode                     layout,
-                                                            int                                  device_id,
-                                                            const placement_kv_info &            kv_info,
-                                                            const ggml_sycl_placement_envelope * envelope) {
-    if (!planner_moe_primary_executor_supports_layout(entry, layout, device_id)) {
+static bool planner_moe_primary_executor_supports_pp_layout_on_device(const placement_entry &              entry,
+                                                                      ggml_layout_mode                     layout,
+                                                                      int                                  device_id,
+                                                                      const placement_kv_info &            kv_info,
+                                                                      const ggml_sycl_placement_envelope * envelope) {
+    if (!planner_moe_primary_executor_supports_layout_on_device(entry, layout, device_id)) {
         return false;
     }
 
@@ -14437,6 +14615,17 @@ static bool planner_moe_primary_executor_supports_pp_layout(const placement_entr
     return true;
 }
 
+static bool planner_moe_primary_executor_supports_pp_layout(const placement_entry &              entry,
+                                                            ggml_layout_mode                     layout,
+                                                            int                                  device_id,
+                                                            const placement_kv_info &            kv_info,
+                                                            const ggml_sycl_placement_envelope * envelope) {
+    if (!entry.on_device || entry.target_device != device_id) {
+        return false;
+    }
+    return planner_moe_primary_executor_supports_pp_layout_on_device(entry, layout, device_id, kv_info, envelope);
+}
+
 static bool planner_moe_layout_needs_pp_soa_on_device(const placement_entry &              entry,
                                                       ggml_layout_mode                     layout,
                                                       int                                  device_id,
@@ -14459,8 +14648,12 @@ static bool planner_moe_layout_needs_pp_soa_on_device(const placement_entry &   
         return false;
     }
 
-    if (layout == GGML_LAYOUT_XMX_TILED) {
+    if (layout == GGML_LAYOUT_XMX_TILED && !planner_moe_xmx_tiled_pp_proof_enabled()) {
         return true;
+    }
+
+    if (layout == GGML_LAYOUT_XMX_TILED) {
+        return !planner_moe_primary_executor_supports_pp_layout_on_device(entry, layout, device_id, kv_info, envelope);
     }
 
     if (layout == GGML_LAYOUT_MXFP4_I8) {
@@ -14562,92 +14755,6 @@ static size_t planner_moe_group_pp_soa_alternate_charge(const placement_plan &  
         charge += soa_charge;
     }
     return charge;
-}
-
-static void promote_single_moe_pp_gate_up_primary_layouts_to_soa(placement_plan &                     plan,
-                                                                 size_t &                             remaining,
-                                                                 int                                  device_id,
-                                                                 const placement_kv_info &            kv_info,
-                                                                 const ggml_sycl_placement_envelope * envelope,
-                                                                 size_t *                             per_device_vram) {
-    if (device_id < 0 || device_id >= ggml_sycl_info().device_count) {
-        return;
-    }
-
-    const size_t pp_tokens = static_cast<size_t>(planner_effective_ubatch_for_moe_pp(kv_info, envelope));
-    const size_t pp_rows   = planner_expected_moe_pp_rows(kv_info, envelope);
-
-    size_t  considered       = 0;
-    size_t  candidates       = 0;
-    size_t  promoted         = 0;
-    size_t  skipped_capacity = 0;
-    size_t  no_layout_bytes  = 0;
-    int64_t charged_delta    = 0;
-
-    for (placement_entry & entry : plan.entries) {
-        if (entry.expert_id < 0) {
-            continue;
-        }
-        considered++;
-        if (entry.expert_role != expert_tensor_role::GATE && entry.expert_role != expert_tensor_role::UP) {
-            continue;
-        }
-        if (!planner_moe_layout_needs_pp_soa(entry, entry.layout, device_id, kv_info, envelope)) {
-            continue;
-        }
-        candidates++;
-
-        const size_t new_size = planner_layout_bytes_for_entry(entry, GGML_LAYOUT_SOA, device_id);
-        if (new_size == 0) {
-            no_layout_bytes++;
-            continue;
-        }
-
-        const size_t old_charge =
-            entry.vram_charge_size != 0 ? entry.vram_charge_size : placement_vram_charge_bytes(entry.dst_size);
-        const size_t new_charge = placement_vram_charge_bytes(new_size);
-        if (new_charge > old_charge) {
-            const size_t extra = new_charge - old_charge;
-            if (remaining < extra) {
-                skipped_capacity++;
-                continue;
-            }
-            remaining -= extra;
-            plan.weight_vram_bytes += extra;
-            plan.vram_bytes += extra;
-            if (per_device_vram != nullptr) {
-                *per_device_vram += extra;
-            }
-            charged_delta += static_cast<int64_t>(extra);
-        } else if (old_charge > new_charge) {
-            const size_t freed = old_charge - new_charge;
-            remaining += freed;
-            plan.weight_vram_bytes = plan.weight_vram_bytes > freed ? plan.weight_vram_bytes - freed : 0;
-            plan.vram_bytes        = plan.vram_bytes > freed ? plan.vram_bytes - freed : 0;
-            if (per_device_vram != nullptr) {
-                *per_device_vram = *per_device_vram > freed ? *per_device_vram - freed : 0;
-            }
-            charged_delta -= static_cast<int64_t>(freed);
-        }
-
-        entry.layout           = GGML_LAYOUT_SOA;
-        entry.dst_size         = new_size;
-        entry.vram_charge_size = new_charge;
-        promoted++;
-    }
-    if (promoted > 0) {
-        plan.moe_pp_soa_promoted = true;
-    }
-
-    if (considered > 0 && (promoted > 0 || moe_direct_trace_enabled())) {
-        GGML_LOG_INFO(
-            "[PLACEMENT-MOE] PP primary gate/up layouts: device=%d considered=%zu candidates=%zu "
-            "promoted_soa=%zu no_layout_bytes=%zu skipped_capacity=%zu delta=%.1f MB remaining=%.1f MB "
-            "pp_tokens=%zu selected_rows=%zu envelope=%s\n",
-            device_id, considered, candidates, promoted, no_layout_bytes, skipped_capacity,
-            static_cast<double>(charged_delta) / (1024.0 * 1024.0), remaining / (1024.0 * 1024.0), pp_tokens, pp_rows,
-            envelope != nullptr ? "yes" : "no");
-    }
 }
 
 static size_t add_single_moe_pp_executable_alternates(placement_plan &                     plan,
@@ -15319,6 +15426,11 @@ static size_t maybe_upgrade_moe_down_layouts_to_i8(placement_plan & plan,
                                                    bool             static_i8_executor_supported = true) {
     constexpr size_t k_layout_upgrade_guard = 64ull * 1024ull * 1024ull;
 
+    // Default prompt processing still consumes SOA down weights, but single-
+    // device plans can materialize the selected prompt experts transiently.
+    // Multi-device plans keep persistent SOA coverage until the transient path
+    // is proven for secondary dispatch as well.
+
     struct down_candidate {
         std::string         name;
         int                 layer_id = -1;
@@ -15326,6 +15438,9 @@ static size_t maybe_upgrade_moe_down_layouts_to_i8(placement_plan & plan,
         size_t              extra_bytes  = 0;
         size_t              extra_charge = 0;
     };
+    const bool prompt_down_uses_transient_soa = !plan.multi_device &&
+                                                planner_moe_prompt_down_transient_soa_enabled() &&
+                                                !planner_moe_prompt_down_specialized_layouts_enabled();
 
     std::map<std::string, down_candidate> by_tensor;
     size_t                                considered       = 0;
@@ -15392,12 +15507,14 @@ static size_t maybe_upgrade_moe_down_layouts_to_i8(placement_plan & plan,
             const bool has_soa_coverage =
                 entry.layout == GGML_LAYOUT_SOA ||
                 planner_entry_has_alternate_layout_on_device(entry, GGML_LAYOUT_SOA, device_id);
-            if (!planner_moe_prompt_down_specialized_layouts_enabled() && !has_soa_coverage) {
+            if (!planner_moe_prompt_down_specialized_layouts_enabled() && !prompt_down_uses_transient_soa &&
+                !has_soa_coverage) {
                 complete = false;
                 break;
             }
             const bool preserve_primary_soa =
-                !planner_moe_prompt_down_specialized_layouts_enabled() && entry.layout == GGML_LAYOUT_SOA &&
+                !planner_moe_prompt_down_specialized_layouts_enabled() && !prompt_down_uses_transient_soa &&
+                entry.layout == GGML_LAYOUT_SOA &&
                 !planner_entry_has_alternate_layout_on_device(entry, GGML_LAYOUT_SOA, device_id);
             const size_t old_charge =
                 entry.vram_charge_size != 0 ? entry.vram_charge_size : placement_vram_charge_bytes(entry.dst_size);
@@ -15437,7 +15554,8 @@ static size_t maybe_upgrade_moe_down_layouts_to_i8(placement_plan & plan,
 
         for (size_t idx : candidate.indices) {
             placement_entry & entry = plan.entries[idx];
-            if (!planner_moe_prompt_down_specialized_layouts_enabled() && entry.layout == GGML_LAYOUT_SOA) {
+            if (!planner_moe_prompt_down_specialized_layouts_enabled() && !prompt_down_uses_transient_soa &&
+                entry.layout == GGML_LAYOUT_SOA) {
                 const size_t soa_charge =
                     entry.vram_charge_size != 0 ? entry.vram_charge_size : placement_vram_charge_bytes(entry.dst_size);
                 if (planner_entry_add_alternate_layout_on_device(entry, GGML_LAYOUT_SOA, device_id, entry.dst_size,
@@ -15825,12 +15943,21 @@ static void populate_host_zone_sizing(placement_plan &                          
             plan.pp_moe_onednn_output_slot_bytes / (1024.0 * 1024.0));
     }
 
-    constexpr size_t k_onednn_zone_bytes = 256ull * 1024ull * 1024ull;
-    if (plan.onednn_scratchpad_bytes > k_onednn_zone_bytes) {
+    size_t onednn_zone_bytes = 256ull * 1024ull * 1024ull;
+    if (vram_arena_enabled()) {
+        auto * cache = get_existing_cache_for_device(plan.device_id);
+        if (cache && cache->arena_active()) {
+            onednn_zone_bytes = cache->zone_capacity(vram_zone_id::ONEDNN);
+        } else {
+            onednn_zone_bytes =
+                std::max(onednn_zone_bytes, unified_cache_get_planned_onednn_scratchpad_bytes(plan.device_id));
+        }
+    }
+    if (plan.onednn_scratchpad_bytes > onednn_zone_bytes) {
         GGML_LOG_WARN(
             "[SYCL-PLAN] oneDNN scratchpad estimate (%.1f MB) exceeds zone (%.1f MB) — "
-            "oneDNN may fall back to direct alloc\n",
-            plan.onednn_scratchpad_bytes / (1024.0 * 1024.0), k_onednn_zone_bytes / (1024.0 * 1024.0));
+            "oneDNN prompt paths will fall back unless the arena is re-sized\n",
+            plan.onednn_scratchpad_bytes / (1024.0 * 1024.0), onednn_zone_bytes / (1024.0 * 1024.0));
     }
 
     // --- Host zone sizing (uses inference category fields computed above) ---
@@ -16225,16 +16352,10 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                 }
             }
         }
-        // Promote XMX_TILED gate/up primaries to PP-safe SOA when the prompt
-        // XMX path cannot consume them (it is diagnostic-only unless
-        // GGML_SYCL_XMX_MOE=1). Without this, PP re-materializes ~97% of
-        // experts per op through a tiny staging window because the SOA
-        // alternates never fit after the down-I8 upgrade (B50 GPT-OSS pp512
-        // 1255 -> 322, bead llama.cpp-xb2ar).
-        if (!planner_xmx_moe_forced()) {
-            promote_single_moe_pp_gate_up_primary_layouts_to_soa(plan, remaining, device_id, kv_info, envelope,
-                                                                 nullptr);
-        }
+        // Prompt cannot consume XMX_TILED gate/up by default. The planner
+        // rewrites those primaries to SOA before packing so single-B50 GPT-OSS
+        // does not budget duplicate full-model PP alternates and spill experts.
+        // Decode rematerializes XMX_TILED from the prompt-SOA plan when proven.
         if (!planner_moe_prompt_down_specialized_layouts_enabled()) {
             add_single_moe_pp_executable_alternates(plan, remaining, device_id, kv_info, envelope, nullptr,
                                                     /*charge_budget=*/false);

@@ -804,6 +804,10 @@ enum common_params_fit_status common_fit_params(
 }
 
 void common_memory_breakdown_print(const struct llama_context * ctx) {
+    if (ctx == nullptr) {
+        return;
+    }
+
     //const auto & devices = ctx->get_model().devices;
     const auto * model = llama_get_model(ctx);
 

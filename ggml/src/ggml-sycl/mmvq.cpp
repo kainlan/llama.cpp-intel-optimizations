@@ -2,6 +2,7 @@
 
 #include "common.hpp"
 #include "convert.hpp"
+#include "cpu-dispatch.hpp"
 #include "ggml-sycl-bench.hpp"
 #include "ggml.h"
 #include "mem-ops.hpp"
@@ -530,6 +531,19 @@ static mxfp4_moe_role mxfp4_moe_role_from_name(const char * name) {
         return mxfp4_moe_role::DOWN;
     }
     return mxfp4_moe_role::OTHER;
+}
+
+static const char * mxfp4_moe_role_name(mxfp4_moe_role role) {
+    switch (role) {
+        case mxfp4_moe_role::GATE:
+            return "gate";
+        case mxfp4_moe_role::UP:
+            return "up";
+        case mxfp4_moe_role::DOWN:
+            return "down";
+        default:
+            return "other";
+    }
 }
 
 static int mxfp4_moe_layer_from_name(const char * name) {
@@ -13227,8 +13241,9 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
             // pointer table must be derived from materialized mem_handles. Only
             // skip missing slots when the plan actually contains host experts.
             const bool skip_cpu_routed_experts = plan_has_host_experts;
-            // force_cache_aos=true ensures experts are staged to GPU memory even for AoS layout
-            // This is critical for mmap'd weights which cannot be accessed directly by GPU kernels
+            // force_cache_aos=host_weights ensures experts are staged to GPU memory even for AoS layout.
+            // This is critical for mmap'd weights which cannot be accessed directly by GPU kernels.
+            // XMX kernels cannot consume host-routed experts, so selected experts must be staged instead of skipped.
             GGML_SYCL_DEBUG("[MMVQ] About to call ggml_sycl_update_moe_ptr_table layout=%d\n", (int) layout);
             if (!ggml_sycl_update_moe_ptr_table(ctx, src0, ids, layout, &table_event, coverage, nullptr,
                                                 /*skip_device_copy=*/false,
@@ -13712,6 +13727,192 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
     }
 
     if (have_kernel_event) {
+        static const bool mmvq_id_validate = [] {
+            const char * env = std::getenv("GGML_SYCL_MMVQ_ID_VALIDATE");
+            return env && std::atoi(env) != 0;
+        }();
+        static const int mmvq_id_validate_limit = [] {
+            const char * env = std::getenv("GGML_SYCL_MMVQ_ID_VALIDATE_LIMIT");
+            return env ? std::max(1, std::atoi(env)) : 8;
+        }();
+        static const int mmvq_id_validate_batches = [] {
+            const char * env = std::getenv("GGML_SYCL_MMVQ_ID_VALIDATE_BATCHES");
+            return env ? std::max(1, std::atoi(env)) : 2;
+        }();
+        static const int mmvq_id_validate_layer = [] {
+            const char * env = std::getenv("GGML_SYCL_MMVQ_ID_VALIDATE_LAYER");
+            return env ? std::atoi(env) : -1;
+        }();
+        static std::atomic<int> mmvq_id_validate_count{ 0 };
+        const int               validate_layer = mxfp4_moe_layer_from_name(src0 ? src0->name : nullptr);
+        if (mmvq_id_validate && src0->type == GGML_TYPE_MXFP4 &&
+            (mmvq_id_validate_layer < 0 || mmvq_id_validate_layer == validate_layer) && ne10 > 0 && ne01 > 0 &&
+            ne02 > 0 && n_ids > 0 && num_tokens > 0 && total_batches > 0) {
+            const int validate_idx = mmvq_id_validate_count.fetch_add(1, std::memory_order_relaxed);
+            if (validate_idx < mmvq_id_validate_limit) {
+                const char * weight_base =
+                    src0 && src0->name ? static_cast<const char *>(ggml_sycl_cpu_dispatch_get_host_ptr(src0->name)) :
+                                         nullptr;
+                if (!weight_base) {
+                    weight_base = static_cast<const char *>(ggml_sycl_host_data(src0));
+                }
+                if (!weight_base) {
+                    fprintf(stderr,
+                            "[MMVQ-ID-VALIDATE] tensor=%s layer=%d role=%s layout=%s failed=weight-host\n",
+                            src0 && src0->name ? src0->name : "?", validate_layer,
+                            mxfp4_moe_role_name(mxfp4_moe_role_from_name(src0 ? src0->name : nullptr)),
+                            mmvq_layout_name(layout));
+                } else {
+                    const int sample_count =
+                        std::min<int64_t>(std::max(1, mmvq_id_validate_batches), total_batches);
+                    std::vector<int64_t> sample_batches;
+                    sample_batches.reserve(static_cast<size_t>(sample_count));
+                    for (int s = 0; s < sample_count; ++s) {
+                        const int64_t batch =
+                            sample_count == 1 ? 0 : (static_cast<int64_t>(s) * (total_batches - 1)) / (sample_count - 1);
+                        if (sample_batches.empty() || sample_batches.back() != batch) {
+                            sample_batches.push_back(batch);
+                        }
+                    }
+
+                    const size_t         act_cols = static_cast<size_t>(ne10);
+                    const size_t         out_cols = static_cast<size_t>(ne01);
+                    std::vector<float>   act(act_cols * sample_batches.size());
+                    std::vector<float>   gpu(out_cols * sample_batches.size());
+                    std::vector<float>   cpu(out_cols * sample_batches.size());
+                    std::vector<int32_t> expert_ids(sample_batches.size(), -1);
+                    std::vector<cpu_expert_task> tasks;
+                    tasks.reserve(sample_batches.size());
+
+                    bool copy_ok = true;
+                    try {
+                        kernel_event.wait_and_throw();
+                        for (size_t s = 0; s < sample_batches.size(); ++s) {
+                            const int64_t batch = sample_batches[s];
+                            const int64_t id    = batch / num_tokens;
+                            const int64_t iid1  = batch - id * num_tokens;
+                            int32_t       eid   = -1;
+                            mmvq_debug_copy_to_host(*stream, ctx.device, &eid,
+                                                    reinterpret_cast<const char *>(ids_d) +
+                                                        static_cast<size_t>(iid1) * ids_nb1 +
+                                                        static_cast<size_t>(id) * ids_nb0,
+                                                    sizeof(eid));
+                            expert_ids[s] = eid;
+                            if (eid < 0 || eid >= ne02) {
+                                continue;
+                            }
+                            const int64_t i11 = id % ne11;
+                            const char *  act_row =
+                                reinterpret_cast<const char *>(src1_d) + static_cast<size_t>(i11) * nb11 +
+                                static_cast<size_t>(iid1) * nb12;
+                            const char * dst_row =
+                                reinterpret_cast<const char *>(dst_d) + static_cast<size_t>(id) * nb1 +
+                                static_cast<size_t>(iid1) * nb2;
+                            mmvq_debug_copy_to_host(*stream, ctx.device, act.data() + s * act_cols, act_row,
+                                                    act_cols * sizeof(float));
+                            mmvq_debug_copy_to_host(*stream, ctx.device, gpu.data() + s * out_cols, dst_row,
+                                                    out_cols * sizeof(float));
+
+                            cpu_expert_task task{};
+                            task.weight_host =
+                                weight_base + static_cast<size_t>(eid) * static_cast<size_t>(src0->nb[2]);
+                            task.act_host    = act.data() + s * act_cols;
+                            task.output_host = cpu.data() + s * out_cols;
+                            task.type        = src0->type;
+                            task.K           = static_cast<int>(ne10);
+                            task.N           = static_cast<int>(ne01);
+                            tasks.push_back(task);
+                        }
+                    } catch (const std::exception & e) {
+                        copy_ok = false;
+                        fprintf(stderr,
+                                "[MMVQ-ID-VALIDATE] tensor=%s layer=%d role=%s layout=%s failed=copy err=%s\n",
+                                src0 && src0->name ? src0->name : "?", validate_layer,
+                                mxfp4_moe_role_name(mxfp4_moe_role_from_name(src0 ? src0->name : nullptr)),
+                                mmvq_layout_name(layout), e.what());
+                    }
+
+                    if (copy_ok && !tasks.empty()) {
+                        ggml_sycl_cpu_dispatch_buffers_init();
+                        ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), static_cast<int>(tasks.size()));
+
+                        double max_abs            = 0.0;
+                        double max_rel            = 0.0;
+                        size_t max_sample         = 0;
+                        size_t max_col            = 0;
+                        float  max_gpu            = 0.0f;
+                        float  max_cpu            = 0.0f;
+                        size_t actual_nonfinite   = 0;
+                        size_t expect_nonfinite   = 0;
+                        size_t nonfinite_mismatch = 0;
+
+                        for (size_t s = 0; s < sample_batches.size(); ++s) {
+                            if (expert_ids[s] < 0 || expert_ids[s] >= ne02) {
+                                continue;
+                            }
+                            for (size_t c = 0; c < out_cols; ++c) {
+                                const size_t idx = s * out_cols + c;
+                                const float  a   = gpu[idx];
+                                const float  b   = cpu[idx];
+                                const bool   af  = std::isfinite(static_cast<double>(a));
+                                const bool   bf  = std::isfinite(static_cast<double>(b));
+                                if (!af) {
+                                    ++actual_nonfinite;
+                                }
+                                if (!bf) {
+                                    ++expect_nonfinite;
+                                }
+                                if (!af || !bf) {
+                                    if (af != bf || std::signbit(a) != std::signbit(b)) {
+                                        ++nonfinite_mismatch;
+                                        if (!std::isinf(max_abs)) {
+                                            max_abs    = std::numeric_limits<double>::infinity();
+                                            max_rel    = std::numeric_limits<double>::infinity();
+                                            max_sample = s;
+                                            max_col    = c;
+                                            max_gpu    = a;
+                                            max_cpu    = b;
+                                        }
+                                    }
+                                    continue;
+                                }
+                                const double diff = std::fabs(static_cast<double>(a) - static_cast<double>(b));
+                                if (diff > max_abs) {
+                                    max_abs    = diff;
+                                    max_rel    = diff / std::max(1.0, std::fabs(static_cast<double>(b)));
+                                    max_sample = s;
+                                    max_col    = c;
+                                    max_gpu    = a;
+                                    max_cpu    = b;
+                                }
+                            }
+                        }
+
+                        const int64_t max_batch = max_sample < sample_batches.size() ? sample_batches[max_sample] : -1;
+                        const int64_t max_id    = max_batch >= 0 ? max_batch / num_tokens : -1;
+                        const int64_t max_iid1  = max_batch >= 0 ? max_batch - max_id * num_tokens : -1;
+                        fprintf(stderr,
+                                "[MMVQ-ID-VALIDATE] tensor=%s layer=%d role=%s layout=%s samples=%zu batch=%lld "
+                                "id=%lld token=%lld expert=%d max_abs=%.8g max_rel=%.8g col=%zu gpu=%.8g cpu=%.8g "
+                                "actual_nonfinite=%zu expect_nonfinite=%zu nonfinite_mismatch=%zu\n",
+                                src0 && src0->name ? src0->name : "?", validate_layer,
+                                mxfp4_moe_role_name(mxfp4_moe_role_from_name(src0 ? src0->name : nullptr)),
+                                mmvq_layout_name(layout), sample_batches.size(), (long long) max_batch,
+                                (long long) max_id, (long long) max_iid1,
+                                max_sample < expert_ids.size() ? expert_ids[max_sample] : -1, max_abs, max_rel, max_col,
+                                static_cast<double>(max_gpu), static_cast<double>(max_cpu), actual_nonfinite,
+                                expect_nonfinite, nonfinite_mismatch);
+                    } else if (copy_ok) {
+                        fprintf(stderr,
+                                "[MMVQ-ID-VALIDATE] tensor=%s layer=%d role=%s layout=%s failed=no-valid-samples "
+                                "sampled=%zu\n",
+                                src0 && src0->name ? src0->name : "?", validate_layer,
+                                mxfp4_moe_role_name(mxfp4_moe_role_from_name(src0 ? src0->name : nullptr)),
+                                mmvq_layout_name(layout), sample_batches.size());
+                    }
+                }
+            }
+        }
         local_temps.release_after(kernel_event);
     }
 

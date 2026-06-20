@@ -1,0 +1,2 @@
+case	selector	model	fa	rc	pp512_tps	tg128_tps	moe_ms	gpu_expert_ms	non_moe_ms	route_dev0	route_secondary	route_host	route_unavailable	host_routing	log
+gptoss-b50	level_zero:1	gpt-oss-20b-mxfp4.gguf	1	134	NA	NA	NA	NA	NA	NA	NA	NA	NA	NA	/Apps/llama.cpp/benchmark_results/sycl-dual-gpu-gate-20260618-211444/gptoss-b50-fa1.log
