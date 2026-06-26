@@ -69,12 +69,12 @@ Hard constraints:
 | --- | --- | --- |
 | A | 1 | Capability-driven aggressive TG policy and source contracts |
 | B | 2 | Parser/harness gates for TG>=45, PP regression, and portability validation |
-| C | 3 | M2 GLU-Q8 artifact handoff optimization for current partial route |
+| C | 3 | M4 GLU-Q8 artifact handoff optimization for current partial route |
 | D | 4 | Segmented graph replay activation/evidence for aggressive TG |
 | E | 5 | Lane-compacted fused partial TG kernel candidate using queried capabilities |
 | Lead | 6 | End-to-end B50/B580 validation and tracker closure decision |
 
-Tasks 1 and 2 can run in parallel. Tasks 3 and 4 depend on Task 1 because they consume the aggressive policy labels/env. Task 5 depends on Tasks 1 and 3 because it needs the capability policy and M2 artifact seam. Task 6 depends on all implementation/review tasks.
+Tasks 1 and 2 can run in parallel. Tasks 3 and 4 depend on Task 1 because they consume the aggressive policy labels/env. Task 5 depends on Tasks 1 and 3 because it needs the capability policy and M4 artifact seam. Task 6 depends on all implementation/review tasks.
 
 ### Dependency Graph
 
@@ -83,7 +83,7 @@ digraph sycl_moe_aggressive_tg {
   rankdir=LR;
   T1 [label="Task 1 Capability policy"];
   T2 [label="Task 2 Harness/parser gates"];
-  T3 [label="Task 3 M2 artifact"];
+  T3 [label="Task 3 M4 artifact"];
   T4 [label="Task 4 Segmented replay"];
   T5 [label="Task 5 Fused partial TG"];
   T6 [label="Task 6 Lead E2E validation"];
@@ -120,7 +120,7 @@ digraph sycl_moe_aggressive_tg {
 4. Aggressive TG parser/harness can require `tg128 >= 45`.
 5. Aggressive TG parser/harness can enforce `PP512 >= 95%` of same-build safe env.
 6. Harness runs B50 GPT-OSS speed gate and B580 Mistral correctness/no-regression gates.
-7. M2 packed-Q8 path can publish a GLU-Q8 artifact, changing diagnostics from `fused_reject=no-kernel-q8` to `saved_launches=1` when eligible.
+7. M4 packed-Q8 path can publish a GLU-Q8 artifact, changing diagnostics from `fused_reject=no-kernel-q8` to `saved_launches=1` when eligible.
 8. Aggressive TG graph replay must prove segmented or fused saved-submit evidence; direct per-node graphlet replay alone is insufficient.
 9. Lane-compacted partial TG kernel is selected only when capability and shape gates pass; otherwise fallback is current `partial-packed-q8-m2-device` / `partial-direct-q8-device`.
 10. Lead end-to-end validation records B50 `TG128 >= 45`, `PP512` within 5% of safe env, B580/Mistral no-fatal/no-regression, and no catastrophic path labels.
@@ -559,52 +559,61 @@ git commit -m "test: gate aggressive sycl moe tg performance"
 
 ---
 
-### Task 3: M2 GLU-Q8 Artifact Handoff For Partial TG
+### Task 3: M4 GLU-Q8 Artifact Handoff For Partial TG
 
 **Track:** C
 
 **Depends on:** Task 1
 
 **File scope:**
-- Modify: `ggml/src/ggml-sycl/mmvq.cpp:6880-7090`
-- Modify: `ggml/src/ggml-sycl/mmvq.cpp:10516-10548`
+- Modify: `ggml/src/ggml-sycl/mmvq.cpp:7300-7647`
+- Modify: `ggml/src/ggml-sycl/mmvq.cpp:10556-10588`
 - Modify: `ggml/src/ggml-sycl/mmvq.cpp:13415-13445`
 - Modify: `ggml/src/ggml-sycl/mmvq.cpp:13539-13622`
 - Modify: `tests/test-sycl-moe-sequence-graphlet-policy.cpp:992-1025`
 
-**Description:** Current validation showed `diag.fused_reject.no-kernel-q8=72`, so the M2 packed-Q8 partial path still publishes a GLU tensor without saving the down-stage launch. Add an M2 artifact overload by copying the existing direct-Q8 Q8_1 artifact store pattern. This task does not change final math; it stores the same GLU values already written to `dst_glu` into the existing Q8_1 artifact buffer when the shape is eligible.
+**Description:** Current validation showed `diag.fused_reject.no-kernel-q8=72`, so the partial packed-Q8 path still publishes a GLU tensor without saving the down-stage launch. A read-only prep review found the earlier M2 artifact idea unsafe: `QK8_1 == 32`, while M2 with `Repeat=8` covers only `2 * Repeat == 16` rows per work-item, so M2 would create half-block/race hazards. Use the existing M4 artifact-capable path instead because M4 covers `4 * Repeat == 32` rows and already writes the Q8_1 artifact layout correctly.
 
 **Acceptance Criteria:**
-- [ ] M2 kernel and submit wrapper accept optional `dst_q8_soa` and `q8_row_size` like the existing M4 overload.
-- [ ] Q8_1 artifact layout matches existing direct-Q8 store pattern: q bytes followed by half2 `{d, sum}` per block.
-- [ ] Artifact path only activates when `Repeat == GGML_SYCL_MXFP4_MOE_XMX_M`, `dst_q8_soa != nullptr`, `q8_row_size > 0`, and `(nrows_per_expert % QK8_1) == 0`.
-- [ ] Aggressive partial path label becomes `aggressive-partial-packed-q8-m2-artifact` when artifact store succeeds.
-- [ ] Diagnostics report `saved_launches=1` when artifact is used; otherwise existing fallback labels remain.
+- [ ] The source contract explicitly forbids adding a Q8_1 artifact store to M2 unless a future implementation proves a true 32-row M2-derived variant.
+- [ ] Aggressive artifact path uses existing `mxfp4_pair_glu_xmx_tiled_dpas_m4_submit<repeat>` with non-null `dst_q8_soa` and positive `q8_row_size`, or an equivalently 32-row-safe submit.
+- [ ] Artifact path only activates when `aggressive_tg_cfg.eligible`, `num_tokens == 1`, `0 < total_batches < exec_n`, `n_gpu_entries == total_batches`, valid device ids/strides, `grouped_down_q8 != nullptr`, and `(ne01 % QK8_1) == 0`.
+- [ ] Aggressive partial path label becomes `aggressive-partial-packed-q8-m4-artifact` when artifact store succeeds.
+- [ ] Diagnostics report `saved_launches=1` only when a real Q8 artifact destination is passed; otherwise existing fallback labels remain.
+- [ ] Aggressive artifact allocation does not rely on quarantined `GGML_SYCL_MOE_GLU_Q8_FUSED_XMX_UNSAFE`.
 
 #### RED: Write These Failing Tests
 
 Add this function to `tests/test-sycl-moe-sequence-graphlet-policy.cpp`:
 
 ```cpp
-static int test_aggressive_tg_m2_artifact_handoff_contract() {
-    const std::string mmvq = read_file("ggml/src/ggml-sycl/mmvq.cpp");
+static int test_aggressive_tg_m4_artifact_handoff_contract() {
+    const std::string mmvq = read_required_file("ggml/src/ggml-sycl/mmvq.cpp");
     const std::string m2_kernel = required_region(
-        mmvq, "static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl", "template <int Repeat>");
-    const std::string m2_submit = required_region(
-        mmvq, "static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_submit", "template <int Repeat>");
+        mmvq, "static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl", "template <int Repeat>",
+        "M2 kernel region");
+    const std::string m4_submit = required_region(
+        mmvq, "static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m4_submit", "template <int Repeat>",
+        "M4 submit region");
+    const std::string xmx_branch = required_region(
+        mmvq, "if (!used_direct_xmx && weight_layout == GGML_LAYOUT_XMX_TILED)",
+        "if (weight_layout == GGML_LAYOUT_XMX_TILED && !used_xmx_tiled_dpas)",
+        "XMX tiled branch");
 
-    CHECK(contains(m2_kernel, "void *") && contains(m2_kernel, "dst_q8_soa") && contains(m2_kernel, "q8_row_size"),
-          "M2 kernel must accept optional Q8 artifact destination");
-    CHECK(contains(m2_kernel, "simd<int8_t, QK8_1>") && contains(m2_kernel, "simd<sycl::half, 2>") &&
-              contains(m2_kernel, "block_store<int8_t, QK8_1>") && contains(m2_kernel, "block_store<sycl::half, 2>"),
-          "M2 artifact store must use existing Q8_1 q bytes + half2 scale/sum layout");
-    CHECK(contains(m2_kernel, "if constexpr (Repeat == GGML_SYCL_MXFP4_MOE_XMX_M)") &&
-              contains(m2_kernel, "dst_q8_soa && q8_row_size > 0") && contains(m2_kernel, "nrows_per_expert % QK8_1"),
-          "M2 artifact store must be guarded by repeat and Q8 block shape");
-    CHECK(contains(m2_submit, "dst_q8_soa") && contains(m2_submit, "q8_row_size"),
-          "M2 submit wrapper must forward artifact destination");
-    CHECK(contains(mmvq, "aggressive-partial-packed-q8-m2-artifact") && contains(mmvq, "saved_launches=1"),
-          "aggressive M2 artifact path must be labeled and counted as a saved launch");
+    CHECK(!contains(m2_kernel, "dst_q8_soa") && !contains(m2_kernel, "q8_row_size"),
+          "M2 must not write Q8_1 artifacts because it covers only 16 rows for Repeat=8");
+    CHECK(contains(m4_submit, "dst_q8_soa") && contains(m4_submit, "q8_row_size"),
+          "M4 submit must remain the artifact-capable 32-row path");
+    CHECK(contains(xmx_branch, "aggressive-partial-packed-q8-m4-artifact"),
+          "aggressive artifact path must use a stable M4 artifact label");
+    CHECK(contains(xmx_branch, "aggressive_tg_cfg.eligible") && contains(xmx_branch, "num_tokens == 1") &&
+              contains(xmx_branch, "total_batches < exec_n") && contains(xmx_branch, "n_gpu_entries == total_batches") &&
+              contains(xmx_branch, "ne01 % QK8_1"),
+          "aggressive M4 artifact route must be capability, partial-shape, and Q8-block gated");
+    CHECK(!contains(required_region(xmx_branch, "aggressive-partial-packed-q8-m4-artifact",
+                                    "partial-packed-q8-m2-device", "aggressive artifact route"),
+                    "GGML_SYCL_MOE_GLU_Q8_FUSED_XMX_UNSAFE"),
+          "aggressive artifact route must not depend on quarantined unsafe fused-XMX env");
     return 0;
 }
 ```
@@ -618,82 +627,62 @@ Call it from `main()`.
 ./build/bin/test-sycl-moe-sequence-graphlet-policy
 ```
 
-Expected RED: test fails because M2 lacks `dst_q8_soa` and the artifact label.
+Expected RED: test fails because the aggressive M4 artifact route and label do not exist.
 
 #### GREEN: Implement Minimal Code
 
-1. In `mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl()` at `mmvq.cpp:6880`, add parameters after `pack_event`:
+1. Do **not** modify `mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl()` to write Q8 artifacts. Leave M2 artifact-free.
+
+2. Add a safe aggressive-only artifact destination in the XMX tiled branch around `mmvq.cpp:12960-12975`, before the current `grouped_down_q8`/activation buffer logic. Use existing `mmvq_alloc_device_scratch()` and `local_temps.add()` ownership, not raw SYCL allocation:
 
 ```cpp
-                                                         const sycl::event &  pack_event,
-                                                         void *               dst_q8_soa  = nullptr,
-                                                         int64_t              q8_row_size = 0)
+    const bool aggressive_tg_requested_local = mxfp4_moe_aggressive_tg_requested();
+    void * aggressive_down_q8 = nullptr;
+    ggml_sycl::mem_handle aggressive_down_q8_handle;
+    if (aggressive_tg_requested_local && fused_glu_q8_candidate && grouped_down_q8 == nullptr) {
+        aggressive_down_q8 = mmvq_alloc_device_scratch(required_size, *stream,
+                                                       "mmvq_moe_aggressive_partial_down_q8",
+                                                       aggressive_down_q8_handle);
+        if (aggressive_down_q8) {
+            local_temps.add(std::move(aggressive_down_q8_handle));
+        }
+    }
 ```
 
-2. In the kernel body, introduce `simd<float, QK8_1> q8_values = 0.0f;` before the two store loops. In the first store loop, assign `q8_values[r] = value;`. In the second store loop, assign `q8_values[Repeat + r] = value;`. This is valid because M2 covers two `Repeat` groups and current `Repeat == 8`, so `2 * Repeat == QK8_1`.
-
-3. After the second store loop, copy the existing artifact store pattern from `mmvq.cpp:7601-7647`, adjusted to M2 rows:
+3. In the non-grouped partial packed path near `mmvq.cpp:13420`, add:
 
 ```cpp
-                if constexpr (Repeat == GGML_SYCL_MXFP4_MOE_XMX_M) {
-                    if (dst_q8_soa && q8_row_size > 0 && (nrows_per_expert % QK8_1) == 0) {
-                        float amax = 0.0f;
-                        float sum  = 0.0f;
-#pragma unroll
-                        for (int i = 0; i < QK8_1; ++i) {
-                            const float value     = q8_values[i];
-                            const float abs_value = value < 0.0f ? -value : value;
-                            amax                  = abs_value > amax ? abs_value : amax;
-                            sum += value;
-                        }
-                        float d = amax == 0.0f ? 1.0f : amax / 127.0f;
-                        simd<int8_t, QK8_1> q8_quant = 0;
-#pragma unroll
-                        for (int i = 0; i < QK8_1; ++i) {
-                            const float scaled  = q8_values[i] / d;
-                            const float rounded = scaled >= 0.0f ? scaled + 0.5f : scaled - 0.5f;
-                            q8_quant[i]         = static_cast<int8_t>(rounded);
-                        }
-                        d = amax == 0.0f ? 0.0f : d;
+                const bool aggressive_partial_artifact = aggressive_tg_cfg.eligible && partial_device_grouped_route &&
+                                                         aggressive_down_q8 != nullptr && num_tokens == 1 &&
+                                                         total_batches > 0 && total_batches < exec_n &&
+                                                         n_gpu_entries == total_batches && ids_device && ids_nb0 > 0 &&
+                                                         ids_nb1 > 0 && (ne01 % QK8_1) == 0;
+```
 
-                        const int64_t q8_row_offset =
-                            (static_cast<int64_t>(id) + static_cast<int64_t>(iid1) * (total_batches / n_tokens)) *
-                            q8_row_size;
-                        char * q8_row = static_cast<char *>(dst_q8_soa) + q8_row_offset;
-                        const int block_col = static_cast<int>(tile_m0 * Repeat / QK8_1);
-                        block_store<int8_t, QK8_1>(reinterpret_cast<int8_t *>(q8_row) + block_col * QK8_1, q8_quant);
+4. If `aggressive_partial_artifact` is true, submit the existing M4 artifact path instead of M2:
 
-                        simd<sycl::half, 2> ds;
-                        ds[0] = sycl::half(d);
-                        ds[1] = sycl::half(sum);
-                        block_store<sycl::half, 2>(
-                            reinterpret_cast<sycl::half *>(q8_row + nrows_per_expert +
-                                                           static_cast<int64_t>(block_col) * sizeof(sycl::half2)),
-                            ds);
-                    }
+```cpp
+                if (aggressive_partial_artifact) {
+                    kernel_event = mxfp4_pair_glu_xmx_tiled_dpas_m4_submit<repeat>(
+                        *stream, gate_ptrs_device, up_ptrs_device, b_packed, y_scales, glu_d, ids_device,
+                        gate_bias_device, up_bias_device, ne00, ne01, static_cast<int>(total_batches),
+                        static_cast<int>(num_tokens), ids_nb0, ids_nb1, glu_dst->nb[1], glu_dst->nb[2],
+                        gate_bias_nb1, up_bias_nb1, glu_op, alpha, limit, tile_n_total, pack_event,
+                        aggressive_down_q8, glu_q8_row_size);
+                    fused_glu_q8_used = true;
+                    grouped_down_q8 = aggressive_down_q8;
+                    xmx_tiled_path = "aggressive-partial-packed-q8-m4-artifact";
+                } else {
+                    kernel_event = mxfp4_pair_glu_xmx_tiled_dpas_m2_submit<repeat>(
+                        *stream, gate_ptrs_device, up_ptrs_device, b_packed, y_scales, glu_d, ids_device,
+                        gate_bias_device, up_bias_device, ne00, ne01, static_cast<int>(total_batches),
+                        static_cast<int>(num_tokens), ids_nb0, ids_nb1, glu_dst->nb[1], glu_dst->nb[2], gate_bias_nb1,
+                        up_bias_nb1, glu_op, alpha, limit, tile_n_total, pack_event);
+                    xmx_tiled_path = partial_device_grouped_route ? "partial-packed-q8-m2-device" : "packed-q8-m2";
                 }
 ```
 
-4. Add the same optional parameters to `mxfp4_pair_glu_xmx_tiled_dpas_m2_submit()` at `mmvq.cpp:10516-10548` and forward them to both `SWIGLU_OAI` and `SWIGLU` calls.
-
-5. In the partial packed path at `mmvq.cpp:13420-13432`, compute:
-
-```cpp
-                const bool aggressive_artifact = aggressive_tg_cfg.eligible && grouped_down_q8 != nullptr &&
-                                                 (ne01 % QK8_1) == 0;
-```
-
-Pass `aggressive_artifact ? grouped_down_q8 : nullptr` and `aggressive_artifact ? glu_q8_row_size : 0` to the M2 submit wrapper.
-
-6. Set:
-
-```cpp
-                fused_glu_q8_used = aggressive_artifact;
-                xmx_tiled_path = aggressive_artifact ? "aggressive-partial-packed-q8-m2-artifact" :
-                                  (partial_device_grouped_route ? "partial-packed-q8-m2-device" : "packed-q8-m2");
-```
-
-7. Keep fallback unchanged if artifact conditions fail.
+5. Ensure existing GLU-Q8 diagnostics see `fused_glu_q8_used=true` and the aggressive label, so `saved_launches=1` is emitted only for the artifact route.
 
 **Verify GREEN:**
 
@@ -708,20 +697,21 @@ Expected: all pass. No hardware/model gates by worker.
 
 #### REFACTOR
 
-If the M2 and direct-Q8 artifact store blocks become identical enough to duplicate bugs, extract a tiny ESIMD inline helper in the same file that takes `simd<float, QK8_1>`, `dst_q8_soa`, `q8_row_size`, `nrows_per_expert`, `id`, `iid1`, `total_batches`, `n_tokens`, and `block_col`. Keep it local to `mmvq.cpp`.
+If the M4 artifact route is correct but slower than M2 in lead hardware logs, file a new spike for a true 32-row M2-derived artifact design. Do not implement a 16-row Q8_1 writer in this task.
 
 #### Gotchas
 
-- Do not store Q8 artifact when `nrows_per_expert % QK8_1 != 0`.
-- Do not alias `q8_src` and `dst_q8_soa`; current comments near `mmvq.cpp:12963` warn that aliasing can corrupt activation Q8.
+- `QK8_1 == 32`; M2 with `Repeat=8` covers only 16 rows. Do not write Q8_1 from M2.
+- Do not alias `q8_src` and `dst_q8_soa`; comments near `mmvq.cpp:12963` warn that aliasing can corrupt activation Q8.
 - Ensure `fused_glu_q8_used` is true only when an artifact destination was actually passed.
-- `saved_launches=1` must be real, not a diagnostic-only lie.
+- `saved_launches=1` must be real, not a diagnostic-only label.
+- The aggressive artifact destination must be mem_handle-owned through `mmvq_alloc_device_scratch()`/`local_temps`, not raw allocation.
 
 #### Commit
 
 ```bash
 git add ggml/src/ggml-sycl/mmvq.cpp tests/test-sycl-moe-sequence-graphlet-policy.cpp
-git commit -m "sycl: publish q8 artifact from mxfp4 m2 tg path"
+git commit -m "sycl: publish q8 artifact from aggressive mxfp4 tg path"
 ```
 
 ---
@@ -790,7 +780,7 @@ def test_parser_aggressive_optimized_substrate_accepts_segmented_or_saved_launch
         tmp.write_text(
             "[GRAPH-DIAG] phase=TG sequence_graphlet_direct_replay_calls=12 "
             "sequence_graphlet_segmented_replay_calls=48 sequence_graphlet_replay=60\n"
-            "[MOE-GLU-Q8-DIAG] action=fused-store path=aggressive-partial-packed-q8-m2-artifact saved_launches=1\n"
+            "[MOE-GLU-Q8-DIAG] action=fused-store path=aggressive-partial-packed-q8-m4-artifact saved_launches=1\n"
         )
         out = run_parser(tmp, "--require-aggressive-optimized-substrate")
         assert "counter.sequence_graphlet_segmented_replay_calls 48" in out
@@ -879,7 +869,7 @@ git commit -m "test: require optimized substrate for aggressive moe tg"
 - Modify: `ggml/src/ggml-sycl/mmvq.cpp:13539-13622`
 - Modify: `tests/test-sycl-moe-sequence-graphlet-policy.cpp:992-1025`
 
-**Description:** Add the actual aggressive candidate: a lane-compacted partial TG path that avoids full grouped `exec_n` lane waste and uses capability-derived tile settings. The first version may reuse the existing pack kernel plus M2 artifact path from Task 3; if that does not reach 45, this task adds a fused `pack+pair-GLU+artifact` submit that still writes the same `dst_glu` and Q8_1 artifact outputs.
+**Description:** Add the actual aggressive candidate: a lane-compacted partial TG path that avoids full grouped `exec_n` lane waste and uses capability-derived tile settings. The first version may reuse the existing pack kernel plus M4 artifact path from Task 3; if that does not reach 45, this task adds a fused `pack+pair-GLU+artifact` submit that still writes the same `dst_glu` and Q8_1 artifact outputs.
 
 **Acceptance Criteria:**
 - [ ] New label `aggressive-partial-fused-tg` exists and is only reachable under `GGML_SYCL_MOE_AGGRESSIVE_TG=1`.
@@ -910,7 +900,7 @@ static int test_aggressive_partial_fused_tg_contract() {
           "aggressive partial fused TG must not build grouped metadata");
     CHECK(contains(mmvq, "mxfp4_pair_glu_xmx_tiled_partial_fused_tg_submit") ||
               contains(mmvq, "aggressive_artifact"),
-          "aggressive path must either submit fused partial TG kernel or use M2 artifact fast path");
+          "aggressive path must either submit fused partial TG kernel or use M4 artifact fast path");
     CHECK(contains(mmvq, "active_rows=") && contains(mmvq, "tile_n_total="),
           "aggressive diagnostics must expose active rows and capability-derived tile_n_total");
     return 0;
@@ -932,7 +922,7 @@ Expected RED: fails because the fused label and diagnostics do not exist.
 
 Implement the candidate in two steps inside one task; stop after step 1 only if local non-hardware gates fail.
 
-**Step 1: Aggressive artifact fast path label.** In `mmvq.cpp:13420-13445`, after Task 3 adds M2 artifact, route the aggressive-eligible artifact path:
+**Step 1: Aggressive artifact fast path label.** In `mmvq.cpp:13420-13445`, after Task 3 adds the M4 artifact route, route the aggressive-eligible artifact path:
 
 ```cpp
                 const bool aggressive_partial_fast_path = aggressive_tg_cfg.eligible && partial_device_grouped_route;
@@ -1067,7 +1057,7 @@ scripts/sycl-b50-gptoss-moe-gates.sh --mode aggressive-suite --logdir /tmp/sycl_
 Expected GREEN:
 - `generated.count_exact.true 1` for GPT-OSS count gate.
 - `fatal.total 0` across B50/B580 aggressive logs.
-- `diag.path.aggressive-partial-fused-tg > 0` or `diag.path.aggressive-partial-packed-q8-m2-artifact > 0`.
+- `diag.path.aggressive-partial-fused-tg > 0` or `diag.path.aggressive-partial-packed-q8-m4-artifact > 0`.
 - `diag.path.grouped-packed-q8-m2-device` absent.
 - `bench.tg128.tps_x100 >= 4500` for B50 aggressive perf.
 - B50 aggressive `pp512` is at least 95% of `b50_aggressive_safe_perf`.
@@ -1147,7 +1137,7 @@ Every approved design element has an owning task:
 - No hardware-name branches: Task 1 source contract
 - Standard speed/correctness gates: Task 2 and Task 6
 - PP <=5% regression check: Task 2 and Task 6
-- M2 Q8 artifact optimization: Task 3
+- M4 Q8 artifact optimization: Task 3
 - Segmented/fused optimized evidence: Task 4
 - Lane-compacted/fused partial TG candidate: Task 5
 - B50/B580 real validation: Task 6
