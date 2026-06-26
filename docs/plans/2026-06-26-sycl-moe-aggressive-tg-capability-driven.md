@@ -937,26 +937,9 @@ Set label:
                                   (partial_device_grouped_route ? "partial-packed-q8-m2-device" : "packed-q8-m2");
 ```
 
-This is allowed because after Task 3 the M2 path fuses pair-GLU output and Q8 artifact publishing in one kernel, saving the downstream publish/launch.
+This is allowed only when the selected code path is the Task 3 M4 artifact-capable submit (or an equivalently 32-row-safe submit) that publishes a valid `QK8_1` artifact while producing pair-GLU output, saving the downstream publish/launch.
 
-**Step 2: If code review requires a distinct submit symbol, add a thin wrapper.** Add near `mxfp4_pair_glu_xmx_tiled_dpas_m2_submit()`:
-
-```cpp
-template <int Repeat>
-static sycl::event mxfp4_pair_glu_xmx_tiled_partial_fused_tg_submit(
-    sycl::queue & queue, const void * const * gate_ptrs, const void * const * up_ptrs, const int8_t * b_packed,
-    const float * y_scales, float * dst_glu, void * dst_q8_soa, const int32_t * ids, const float * gate_bias,
-    const float * up_bias, int ncols, int nrows_per_expert, int total_batches, int n_tokens, int64_t ids_nb0,
-    int64_t ids_nb1, int64_t dst_nb1, int64_t dst_nb2, int64_t gate_bias_nb1, int64_t up_bias_nb1, int glu_op,
-    float alpha, float limit, int tile_n_total, const sycl::event & pack_event, int64_t q8_row_size) {
-    return mxfp4_pair_glu_xmx_tiled_dpas_m2_submit<Repeat>(
-        queue, gate_ptrs, up_ptrs, b_packed, y_scales, dst_glu, ids, gate_bias, up_bias, ncols, nrows_per_expert,
-        total_batches, n_tokens, ids_nb0, ids_nb1, dst_nb1, dst_nb2, gate_bias_nb1, up_bias_nb1, glu_op, alpha,
-        limit, tile_n_total, pack_event, dst_q8_soa, q8_row_size);
-}
-```
-
-Use the wrapper only for `aggressive_artifact`; otherwise call the existing M2 submit.
+**Step 2: If code review requires a distinct submit symbol, add a thin wrapper around the M4 artifact-capable submit.** The wrapper must forward to `mxfp4_pair_glu_xmx_tiled_dpas_m4_submit<Repeat>` (or the Task 3 helper around it) with non-null `dst_q8_soa` and positive `q8_row_size`. Do not wrap `mxfp4_pair_glu_xmx_tiled_dpas_m2_submit()` for Q8 artifact publishing; M2 remains artifact-free unless a future task proves a true 32-row M2-derived variant.
 
 Add a bounded diagnostic line next to `mxfp4_moe_partial_device_grouping_log()` or in the existing Q8 diagnostic block:
 
@@ -982,7 +965,7 @@ Expected: all pass.
 
 #### REFACTOR
 
-If Step 1 reaches the target in lead validation, do not add a larger kernel in this sprint. If Step 1 is correct but below 45, create a follow-up task that fuses `mxfp4_dpas_pack_q8_single_col_groups_sycl()` with the M2 compute loop so Q8 pack and pair-GLU/artifact become one submit. That follow-up must start with a new source contract and lead profile evidence showing pack submit overhead is material.
+If Step 1 reaches the target in lead validation, do not add a larger kernel in this sprint. If Step 1 is correct but below 45, create a follow-up task that fuses `mxfp4_dpas_pack_q8_single_col_groups_sycl()` with a 32-row-safe compute/artifact loop so Q8 pack and pair-GLU/artifact become one submit. That follow-up must start with a new source contract and lead profile evidence showing pack submit overhead is material.
 
 #### Gotchas
 
@@ -1145,7 +1128,7 @@ Every approved design element has an owning task:
 
 ### Junior-implementable scan
 
-Each task names exact files and current line anchors, includes RED test code, GREEN implementation edits, verify commands, gotchas, and commit commands. Task 5 explicitly uses the existing M2 path plus artifact store as the first fused candidate, avoiding an unbounded new-kernel gap.
+Each task names exact files and current line anchors, includes RED test code, GREEN implementation edits, verify commands, gotchas, and commit commands. Task 5 explicitly uses the Task 3 M4 artifact-capable path as the first fused candidate, avoiding an unbounded new-kernel gap.
 
 ### Placeholder scan
 
