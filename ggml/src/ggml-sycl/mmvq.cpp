@@ -683,6 +683,23 @@ static uint64_t mxfp4_gateup_prepack_selected_hash(const int32_t * selected_expe
     return h;
 }
 
+static bool mxfp4_gateup_prepack_mul_size_overflow(uint64_t a, uint64_t b, uint64_t max_size, uint64_t * result) {
+    if (result) {
+        *result = 0;
+    }
+    if (a != 0 && b > std::numeric_limits<uint64_t>::max() / a) {
+        return true;
+    }
+    const uint64_t product = a * b;
+    if (product > max_size) {
+        return true;
+    }
+    if (result) {
+        *result = product;
+    }
+    return false;
+}
+
 static mxfp4_moe_gateup_prepack_key mxfp4_gateup_prepack_make_key(const mxfp4_moe_gateup_prepack_request & request,
                                                                   const mxfp4_moe_gateup_prepack_layout &  layout) {
     mxfp4_moe_gateup_prepack_key key;
@@ -771,6 +788,8 @@ const char * mxfp4_moe_gateup_prepack_status_name(mxfp4_moe_gateup_prepack_statu
             return "invalid-selection";
         case mxfp4_moe_gateup_prepack_status::SCRATCH_TOO_SMALL:
             return "scratch-too-small";
+        case mxfp4_moe_gateup_prepack_status::LAYOUT_OVERFLOW:
+            return "layout-overflow";
     }
     return "unknown";
 }
@@ -809,17 +828,30 @@ mxfp4_moe_gateup_prepack_status mxfp4_moe_gateup_prepack_layout_for_shape(int64_
         return mxfp4_moe_gateup_prepack_status::INVALID_SHAPE;
     }
 
-    const uint64_t max_size = std::numeric_limits<size_t>::max();
+    const uint64_t max_size = static_cast<uint64_t>(std::numeric_limits<size_t>::max());
     const uint64_t k_tiles  = static_cast<uint64_t>(ncols / static_cast<int64_t>(GGML_SYCL_MXFP4_MOE_XMX_K));
     const uint64_t tile_groups_n =
         (static_cast<uint64_t>(nrows_per_expert) + GGML_SYCL_MXFP4_MOE_XMX_N - 1) / GGML_SYCL_MXFP4_MOE_XMX_N;
-    const uint64_t group_bytes = GGML_SYCL_MXFP4_MOE_XMX_N * (1 + GGML_SYCL_MXFP4_MOE_XMX_K / 2);
-    const uint64_t role_bytes  = k_tiles * tile_groups_n * group_bytes;
-    const uint64_t entry_bytes = 2 * role_bytes;
-    const uint64_t total_bytes = static_cast<uint64_t>(selected_count) * entry_bytes;
-    const bool     overflow    = role_bytes > max_size || entry_bytes > max_size || total_bytes > max_size ||
-                          role_bytes == 0 || entry_bytes == 0 || total_bytes == 0;
-    if (overflow) {
+
+    uint64_t   group_bytes     = 0;
+    uint64_t   role_tile_bytes = 0;
+    uint64_t   role_bytes      = 0;
+    uint64_t   entry_bytes     = 0;
+    uint64_t   total_bytes     = 0;
+    const bool group_overflow  = mxfp4_gateup_prepack_mul_size_overflow(
+        static_cast<uint64_t>(GGML_SYCL_MXFP4_MOE_XMX_N), static_cast<uint64_t>(1 + GGML_SYCL_MXFP4_MOE_XMX_K / 2),
+        max_size, &group_bytes);
+    const bool role_overflow =
+        mxfp4_gateup_prepack_mul_size_overflow(k_tiles, tile_groups_n, max_size, &role_tile_bytes) ||
+        mxfp4_gateup_prepack_mul_size_overflow(role_tile_bytes, group_bytes, max_size, &role_bytes);
+    const bool entry_overflow  = mxfp4_gateup_prepack_mul_size_overflow(2, role_bytes, max_size, &entry_bytes);
+    const bool total_overflow  = mxfp4_gateup_prepack_mul_size_overflow(static_cast<uint64_t>(selected_count),
+                                                                        entry_bytes, max_size, &total_bytes);
+    const bool layout_overflow = group_overflow || role_overflow || entry_overflow || total_overflow;
+    if (layout_overflow) {
+        return mxfp4_moe_gateup_prepack_status::LAYOUT_OVERFLOW;
+    }
+    if (role_bytes == 0 || entry_bytes == 0 || total_bytes == 0) {
         return mxfp4_moe_gateup_prepack_status::INVALID_SHAPE;
     }
 

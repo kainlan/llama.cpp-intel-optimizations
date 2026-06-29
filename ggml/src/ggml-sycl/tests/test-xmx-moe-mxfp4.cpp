@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <sycl/sycl.hpp>
 #include <vector>
@@ -539,6 +540,30 @@ bool test_gateup_prepack_reference_layout() {
     TEST_ASSERT(ggml_sycl::mxfp4_moe_gateup_prepack_selected_rows_reference(bad_shape_request).status ==
                     ggml_sycl::mxfp4_moe_gateup_prepack_status::INVALID_SHAPE,
                 "non-MXFP4-K-aligned shape should be rejected");
+
+    ggml_sycl::mxfp4_moe_gateup_prepack_layout overflow_layout;
+    const uint64_t                             max_size = static_cast<uint64_t>(std::numeric_limits<size_t>::max());
+    constexpr uint64_t group_bytes = GGML_SYCL_MXFP4_MOE_XMX_N * (1 + GGML_SYCL_MXFP4_MOE_XMX_K / 2);
+    const int64_t      huge_aligned_ncols =
+        (std::numeric_limits<int64_t>::max() / static_cast<int64_t>(GGML_SYCL_MXFP4_MOE_XMX_K)) *
+        static_cast<int64_t>(GGML_SYCL_MXFP4_MOE_XMX_K);
+    TEST_ASSERT(ggml_sycl::mxfp4_moe_gateup_prepack_layout_for_shape(1, 1024, huge_aligned_ncols, &overflow_layout) ==
+                    ggml_sycl::mxfp4_moe_gateup_prepack_status::LAYOUT_OVERFLOW,
+                "huge role byte layout should reject overflow");
+
+    const uint64_t entry_overflow_k_tiles = max_size / (2 * group_bytes) + 1;
+    const int64_t  entry_overflow_ncols =
+        static_cast<int64_t>(entry_overflow_k_tiles) * static_cast<int64_t>(GGML_SYCL_MXFP4_MOE_XMX_K);
+    TEST_ASSERT(ggml_sycl::mxfp4_moe_gateup_prepack_layout_for_shape(1, 1, entry_overflow_ncols, &overflow_layout) ==
+                    ggml_sycl::mxfp4_moe_gateup_prepack_status::LAYOUT_OVERFLOW,
+                "entry byte layout should reject overflow");
+
+    const uint64_t total_overflow_k_tiles = max_size / (4 * group_bytes) + 1;
+    const int64_t  total_overflow_ncols =
+        static_cast<int64_t>(total_overflow_k_tiles) * static_cast<int64_t>(GGML_SYCL_MXFP4_MOE_XMX_K);
+    TEST_ASSERT(ggml_sycl::mxfp4_moe_gateup_prepack_layout_for_shape(3, 1, total_overflow_ncols, &overflow_layout) ==
+                    ggml_sycl::mxfp4_moe_gateup_prepack_status::LAYOUT_OVERFLOW,
+                "total byte layout should reject overflow");
 
     fprintf(stderr, "(selected experts: %d,%d,%d; role_bytes=%zu) ", selected[0], selected[1], selected[2], role_bytes);
     TEST_PASS();

@@ -180,6 +180,7 @@ enum class mxfp4_moe_gateup_prepack_status : uint8_t {
     INVALID_SHAPE,
     INVALID_SELECTION,
     SCRATCH_TOO_SMALL,
+    LAYOUT_OVERFLOW,
 };
 
 const char * mxfp4_moe_gateup_prepack_status_name(mxfp4_moe_gateup_prepack_status status);
