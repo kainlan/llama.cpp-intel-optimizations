@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CHECKER="$ROOT_DIR/scripts/check-sycl-alloc-usage.sh"
 
 "$CHECKER" "$ROOT_DIR/tests/sycl-alloc-policy-fixtures/good"
+"$CHECKER" "$ROOT_DIR/ggml/src/ggml-sycl"
 
 if "$CHECKER" "$ROOT_DIR/tests/sycl-alloc-policy-fixtures/bad-alloc" >/dev/null 2>&1; then
     echo "expected bad alloc fixture to fail policy check" >&2

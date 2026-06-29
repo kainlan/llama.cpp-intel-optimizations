@@ -16,6 +16,41 @@
 #include <utility>
 #include <vector>
 
+#if defined(GGML_SYCL_TEST_MOE_XMX_FUSED_HELPERS)
+#include <cmath>
+
+namespace ggml_sycl {
+struct test_moe_token_major_metadata_view {
+    const int32_t * token_ids        = nullptr;
+    const int32_t * expert_ids       = nullptr;
+    const float *   weights          = nullptr;
+    int64_t         entries          = 0;
+    int64_t         expected_entries = 0;
+};
+
+static inline bool test_moe_token_major_metadata_is_complete(const test_moe_token_major_metadata_view & view) {
+    if (!view.token_ids || !view.expert_ids || !view.weights || view.entries <= 0 ||
+        view.entries != view.expected_entries) {
+        return false;
+    }
+    int32_t last_token = -1;
+    for (int64_t i = 0; i < view.entries; ++i) {
+        if (view.token_ids[i] < 0 || view.token_ids[i] < last_token) {
+            return false;
+        }
+        if (view.expert_ids[i] < 0) {
+            return false;
+        }
+        if (!std::isfinite(view.weights[i]) || view.weights[i] < 0.0f) {
+            return false;
+        }
+        last_token = view.token_ids[i];
+    }
+    return true;
+}
+}  // namespace ggml_sycl
+#endif
+
 #if SYCL_XMX_MOE_AVAILABLE
 
 namespace moe_xmx_fused {

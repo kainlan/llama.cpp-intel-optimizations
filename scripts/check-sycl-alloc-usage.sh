@@ -12,7 +12,7 @@ if ! command -v rg >/dev/null 2>&1; then
     exit 2
 fi
 
-PATTERN='sycl::malloc_(device|host|shared)\s*\(|sycl_aligned_malloc_device\s*\(|sycl::free\s*\(|ggml_sycl_(malloc|free)_device_raw\s*\(|unified_cache_raw_(malloc_(device|host)|free_device)\s*\('
+PATTERN='sycl::malloc_(device|host|shared)\s*\(|sycl_aligned_malloc_device\s*\(|sycl::free\s*\(|zeMemAlloc[^[:space:]]*\s*\(|zeMemFree\s*\(|ggml_sycl_(malloc|free)_device_raw\s*\(|unified_cache_raw_(malloc_(device|host)|free_device)\s*\('
 ALLOW_RE='^ggml/src/ggml-sycl/unified-cache\.cpp$'
 HOST_ALLOC_PATTERN='std::(malloc|calloc|realloc|aligned_alloc|free)\s*\(|(^|[^[:alnum:]_:])(malloc|calloc|aligned_alloc)\s*\('
 VM_ALLOC_PATTERN='(^|[^[:alnum:]_:])(posix_memalign|mmap|munmap)\s*\('

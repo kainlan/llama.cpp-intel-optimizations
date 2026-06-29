@@ -100,6 +100,7 @@ struct mxfp4_pair_glu_bench_args {
     bool  direct_xmx          = false;
     bool  xmx_tiled           = false;
     bool  xmx_tiled_grouped   = false;
+    bool  device_grouped      = false;
     bool  xmx_tiled_pack_q8   = false;
     bool  xmx_tiled_prefetch  = false;
     int   xmx_tiled_m_tiles   = 1;

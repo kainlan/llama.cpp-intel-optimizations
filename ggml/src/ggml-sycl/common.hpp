@@ -147,6 +147,7 @@ extern std::atomic<bool> g_ggml_sycl_debug_forced_off;
 
 // Track when SYCL graph recording is active
 extern thread_local bool g_ggml_sycl_graph_recording;
+extern thread_local bool g_moe_descriptor_dispatch_graph_recording_active;
 extern std::atomic<int>  g_ggml_sycl_graph_recording_depth;
 extern std::atomic<int>  g_sycl_submit_count_during_recording;        // DIAG: operation dispatches during recording
 extern std::atomic<int>  g_sycl_extra_submit_count_during_recording;  // DIAG: extra markers/events during recording
@@ -3657,6 +3658,10 @@ inline void * ggml_sycl_host_data(ggml_tensor * tensor) {
 }
 
 const void * ggml_sycl_lookup_host_weight_ptr_by_name(const char * name);
+bool         ggml_sycl_lookup_moe_expert_source_by_name(const char *  name,
+                                                        int           expert_idx,
+                                                        const void ** ptr,
+                                                        size_t *      bytes);
 
 // raw-ok: centralized setter for host-side fallback code that needs to
 // redirect tensor storage temporarily.
@@ -4592,16 +4597,39 @@ struct ggml_backend_sycl_context {
     };
 
     struct moe_graph_block {
-        int              start_node;  // Inclusive start index in cgraph->nodes[]
-        int              end_node;    // Exclusive end index in cgraph->nodes[]
-        uint64_t         graph_hash;
+        int      start_node;  // Inclusive start index in cgraph->nodes[]
+        int      end_node;    // Exclusive end index in cgraph->nodes[]
+        uint64_t graph_hash;
+        uint64_t mode_hash;
         uint64_t                           identity_hash;
         // Fused MoE dispatch nodes captured by this recorded safe subrange.
         // The subrange may also contain non-MoE ops, or be a non-MoE range
         // recorded to amortize direct dispatch around GET_ROWS/FA gaps.
-        std::vector<int> moe_nodes;
+        std::vector<int>      moe_nodes;
+        std::vector<uint64_t> dispatch_identities;
         std::vector<ggml_sycl::mem_handle> retained_handles;
         std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph;
+    };
+
+    struct moe_sequence_graph {
+        int      node_idx      = -1;  // Fused MoE dispatch boundary in cgraph->nodes[]
+        uint64_t graph_hash    = 0;
+        uint64_t identity_hash = 0;
+        uint64_t mode_hash     = 0;
+        std::vector<ggml_sycl::mem_handle> retained_handles;
+        std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph;
+    };
+
+    struct moe_sequence_graph_reject_key {
+        int      node_idx      = -1;
+        uint64_t graph_hash    = 0;
+        uint64_t identity_hash = 0;
+        uint64_t mode_hash     = 0;
+
+        bool operator==(const moe_sequence_graph_reject_key & other) const {
+            return node_idx == other.node_idx && graph_hash == other.graph_hash &&
+                   identity_hash == other.identity_hash && mode_hash == other.mode_hash;
+        }
     };
 
     std::vector<moe_graph_segment>      moe_segments;
@@ -4630,10 +4658,26 @@ struct ggml_backend_sycl_context {
     std::vector<moe_graph_block> moe_block_graphs;
     int                          moe_block_graphs_n_nodes    = 0;
     uint64_t                     moe_block_graphs_hash       = 0;
+    uint64_t                     moe_block_graphs_mode_hash  = 0;
     bool                         moe_block_graphs_is_decode  = false;
     int                          moe_block_graphs_block_size = 0;
     bool                         moe_block_graphs_valid      = false;
     bool                         moe_block_graphs_disabled   = false;
+    std::vector<uint64_t>        moe_block_graphs_dispatch_identities;
+
+    std::vector<moe_sequence_graph>            moe_sequence_graphs;
+    std::vector<int>                           moe_sequence_graph_failed_nodes;
+    std::vector<moe_sequence_graph_reject_key> moe_sequence_graph_ineligible_nodes;
+    int                             moe_sequence_graphs_n_nodes   = 0;
+    uint64_t                        moe_sequence_graphs_hash      = 0;
+    uint64_t                        moe_sequence_graphs_mode_hash = 0;
+    bool                            moe_sequence_graphs_is_decode = false;
+    bool                            moe_sequence_graphs_valid     = false;
+    bool                            moe_sequence_graphs_disabled  = false;
+    const char *                    moe_aggregation_last_decision  = nullptr;
+    const char *                    moe_aggregation_last_reject    = nullptr;
+    bool                            moe_default_fast_path_quarantined = false;
+    const char *                    moe_default_fast_path_quarantine_reason = nullptr;
 
     void invalidate_moe_segments() {
         moe_segments.clear();
@@ -4655,9 +4699,22 @@ struct ggml_backend_sycl_context {
         moe_block_graphs.clear();
         moe_block_graphs_n_nodes    = 0;
         moe_block_graphs_hash       = 0;
+        moe_block_graphs_mode_hash  = 0;
         moe_block_graphs_is_decode  = false;
         moe_block_graphs_block_size = 0;
         moe_block_graphs_valid      = false;
+        moe_block_graphs_dispatch_identities.clear();
+    }
+
+    void invalidate_moe_sequence_graphs() {
+        moe_sequence_graphs.clear();
+        moe_sequence_graph_failed_nodes.clear();
+        moe_sequence_graph_ineligible_nodes.clear();
+        moe_sequence_graphs_n_nodes   = 0;
+        moe_sequence_graphs_hash      = 0;
+        moe_sequence_graphs_mode_hash = 0;
+        moe_sequence_graphs_is_decode = false;
+        moe_sequence_graphs_valid     = false;
     }
 
     // === Cached per-graph computations (reset when n_nodes changes) ===

@@ -100,60 +100,151 @@ bool mmvq_moe_batched_dispatch_pair_mxfp4_soa(ggml_backend_sycl_context & ctx,
                                               int64_t                     ids_nb0,
                                               int64_t                     ids_nb1);
 
-bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &      ctx,
-                                                  const ggml_tensor *              gate_weight,
-                                                  const ggml_tensor *              up_weight,
-                                                  const ggml_tensor *              src1,
-                                                  ggml_tensor *                    glu_dst,
-                                                  const void * const *             gate_ptrs_device,
-                                                  const void * const *             up_ptrs_device,
-                                                  const int32_t *                  ids_device,
-                                                  const float *                    gate_bias_device,
-                                                  const float *                    up_bias_device,
-                                                  int64_t                          gate_bias_nb1,
-                                                  int64_t                          up_bias_nb1,
-                                                  int                              n_gpu_entries,
-                                                  int64_t                          n_ids,
-                                                  int64_t                          ids_nb0,
-                                                  int64_t                          ids_nb1,
-                                                  int                              glu_op,
-                                                  float                            alpha,
-                                                  float                            limit,
-                                                  ggml_layout_mode                 weight_layout,
-                                                  const ggml_sycl::mem_handle *    glu_dst_handle_override    = nullptr,
-                                                  bool                             direct_xmx_eligible        = false,
-                                                  bool                             xmx_tiled_grouped_eligible = false,
-                                                  ggml_tensor *                    gate_tmp                   = nullptr,
-                                                  ggml_tensor *                    up_tmp                     = nullptr,
-                                                  const int32_t *                  ids_host                   = nullptr,
-                                                  int64_t                          ids_host_count             = 0,
-                                                  sycl::event *                    completion_event           = nullptr,
-                                                  bool *                           completion_event_set       = nullptr);
+bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   ctx,
+                                                  const ggml_tensor *           gate_weight,
+                                                  const ggml_tensor *           up_weight,
+                                                  const ggml_tensor *           src1,
+                                                  ggml_tensor *                 glu_dst,
+                                                  const void * const *          gate_ptrs_device,
+                                                  const void * const *          up_ptrs_device,
+                                                  const int32_t *               ids_device,
+                                                  const float *                 gate_bias_device,
+                                                  const float *                 up_bias_device,
+                                                  int64_t                       gate_bias_nb1,
+                                                  int64_t                       up_bias_nb1,
+                                                  int                           n_gpu_entries,
+                                                  int64_t                       n_ids,
+                                                  int64_t                       ids_nb0,
+                                                  int64_t                       ids_nb1,
+                                                  int                           glu_op,
+                                                  float                         alpha,
+                                                  float                         limit,
+                                                  ggml_layout_mode              weight_layout,
+                                                  const ggml_sycl::mem_handle * glu_dst_handle_override    = nullptr,
+                                                  bool                          direct_xmx_eligible        = false,
+                                                  bool                          xmx_tiled_grouped_eligible = false,
+                                                  ggml_tensor *                 gate_tmp                   = nullptr,
+                                                  ggml_tensor *                 up_tmp                     = nullptr,
+                                                  const int32_t *               ids_host                   = nullptr,
+                                                  int64_t                       ids_host_count             = 0,
+                                                  sycl::event *                 completion_event           = nullptr,
+                                                  bool *                        completion_event_set       = nullptr);
 
 // Fast all-local decode down projection that consumes the Q8_1 GLU artifact
 // published by mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa().  When ids_device
 // is null, down_ptrs_device is a selected pointer table in batch order. Ownership
 // of weight/output/control memory stays with mem_handles; pointers here are
-// transient launch ABI values resolved by the caller from those handles.
-bool mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4(
-    ggml_backend_sycl_context &            ctx,
-    const ggml_tensor *                    down_weight,
-    const ggml_tensor *                    glu_src,
-    ggml_tensor *                          down_dst,
-    const void * const *                   down_ptrs_device,
-    const int32_t *                        ids_device,
-    int                                    n_gpu_entries,
-    int64_t                                n_ids,
-    int64_t                                ids_nb0,
-    int64_t                                ids_nb1,
-    ggml_layout_mode                       down_layout,
-    const ggml_sycl::mem_handle *          glu_src_handle_override,
-    const ggml_sycl::mem_handle *          down_dst_handle_override,
-    const int32_t *                        ids_host             = nullptr,
-    int64_t                                ids_host_count       = 0,
-    const std::vector<sycl::event> * deps                 = nullptr,
-    sycl::event *                    completion_event     = nullptr,
-    bool *                           completion_event_set = nullptr);
+// transient launch ABI values resolved by the caller from those handles.  The
+// XMX_TILED variant is opt-in at the layout planner level and uses the same
+// handle-owned expert pointer table; this function only consumes transient ABI
+// pointers and never owns allocation state.
+bool mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4(ggml_backend_sycl_context &      ctx,
+                                                         const ggml_tensor *              down_weight,
+                                                         const ggml_tensor *              glu_src,
+                                                         ggml_tensor *                    down_dst,
+                                                         const void * const *             down_ptrs_device,
+                                                         const int32_t *                  ids_device,
+                                                         int                              n_gpu_entries,
+                                                         int64_t                          n_ids,
+                                                         int64_t                          ids_nb0,
+                                                         int64_t                          ids_nb1,
+                                                         ggml_layout_mode                 down_layout,
+                                                         const ggml_sycl::mem_handle *    glu_src_handle_override,
+                                                         const ggml_sycl::mem_handle *    down_dst_handle_override,
+                                                         const int32_t *                  ids_host         = nullptr,
+                                                         int64_t                          ids_host_count   = 0,
+                                                         const std::vector<sycl::event> * deps             = nullptr,
+                                                         sycl::event *                    completion_event = nullptr,
+                                                         bool * completion_event_set                       = nullptr);
+
+struct mxfp4_moe_direct_final_metadata {
+    const int32_t * expert_ids_device          = nullptr;
+    int64_t         expert_ids_nb0             = 0;
+    int64_t         expert_ids_nb1             = 0;
+    const int32_t * expert_ids_host            = nullptr;
+    int64_t         entries                    = 0;
+    int64_t         expected_entries           = 0;
+    bool            token_major_deterministic  = false;
+    bool            route_weights_device_valid = false;
+};
+
+// Prototype fused down projection + router weighted reduce.  Consumes the cached
+// Q8 GLU artifact and writes the final MoE output directly, avoiding the
+// normal down_dst + ADD_ID/MUL/ADD reduction chain.  SOA can write final
+// directly; XMX_TILED uses down_tmp as a weighted projection scratch followed by
+// a small top-k reduce.
+int          ggml_sycl_moe_down_sum_q8_soa_tg_rows_per_group_from_env(const char * env);
+int          ggml_sycl_moe_down_sum_q8_soa_tg_active_rows_per_group_from_env(const char * env,
+                                                                             bool         is_down_role,
+                                                                             int64_t      n_tokens);
+const char * ggml_sycl_moe_down_sum_q8_soa_tg_variant_label(int rows_per_group);
+int          ggml_sycl_moe_down_cached_q8_soa_tg_variant_from_env(const char * env);
+int          ggml_sycl_moe_down_cached_q8_soa_tg_active_variant_from_env(const char * env,
+                                                                         bool         is_down_role,
+                                                                         bool         is_soa_layout,
+                                                                         int64_t      n_tokens);
+const char * ggml_sycl_moe_down_cached_q8_soa_tg_variant_label(int variant);
+bool         ggml_sycl_moe_down_cached_q8_soa_tg_variant_vector_qs_load(int variant);
+bool         ggml_sycl_moe_down_cached_q8_soa_tg_variant_cache_y_local(int variant);
+
+bool mmvq_moe_batched_dispatch_down_sum_from_cached_q8_mxfp4(
+    ggml_backend_sycl_context &             ctx,
+    const ggml_tensor *                     down_weight,
+    const ggml_tensor *                     glu_src,
+    ggml_tensor *                           final_dst,
+    ggml_tensor *                           down_tmp,
+    const void * const *                    down_ptrs_device,
+    const int32_t *                         ids_device,
+    const ggml_tensor *                     moe_weights,
+    const ggml_tensor *                     down_bias,
+    int                                     n_gpu_entries,
+    int64_t                                 n_ids,
+    int64_t                                 ids_nb0,
+    int64_t                                 ids_nb1,
+    ggml_layout_mode                        down_layout,
+    const ggml_sycl::mem_handle *           glu_src_handle_override,
+    const ggml_sycl::mem_handle *           final_dst_handle_override,
+    const ggml_sycl::mem_handle *           down_tmp_handle_override = nullptr,
+    const int32_t *                         ids_host                 = nullptr,
+    int64_t                                 ids_host_count           = 0,
+    const mxfp4_moe_direct_final_metadata * direct_final_metadata    = nullptr,
+    const std::vector<sycl::event> *        deps                     = nullptr,
+    sycl::event *                           completion_event         = nullptr,
+    bool *                                  completion_event_set     = nullptr);
+
+bool ggml_sycl_moe_down_sum_cached_q8_capacity_ok(const ggml_tensor *           down_weight,
+                                                  const ggml_sycl::mem_handle & glu_handle,
+                                                  int                           device,
+                                                  int64_t                       ncols_y,
+                                                  int64_t                       total_batches);
+
+bool ggml_sycl_moe_down_sum_xmx_direct_final_mxfp4(const ggml_tensor *              src0,
+                                                   const ggml_tensor *              src1,
+                                                   ggml_tensor *                    dst,
+                                                   const void * const *             expert_ptrs,
+                                                   const void *                     q8_rows,
+                                                   float *                          dst_data,
+                                                   const int32_t *                  token_ids,
+                                                   const int32_t *                  expert_ids,
+                                                   const int32_t *                  expert_ids_host,
+                                                   const float *                    weights,
+                                                   const float *                    bias,
+                                                   int64_t                          entries,
+                                                   int64_t                          n_ids,
+                                                   int64_t                          n_tokens,
+                                                   int64_t                          ids_nb0,
+                                                   int64_t                          ids_nb1,
+                                                   int64_t                          q8_nb11,
+                                                   int64_t                          q8_nb12,
+                                                   int64_t                          weights_nb1,
+                                                   int64_t                          weights_nb2,
+                                                   int64_t                          bias_nb1,
+                                                   int64_t                          dst_token_stride,
+                                                   ggml_layout_mode                 down_layout,
+                                                   const std::vector<sycl::event> * deps,
+                                                   sycl::event *                    completion_event,
+                                                   sycl::queue &                    queue,
+                                                   int                              device);
 
 struct mmvq_moe_dispatch_timing {
     double activation_quant_us = 0.0;
@@ -272,5 +363,32 @@ inline size_t mmvq_q8_1_soa_size(int K) {
     constexpr size_t Q6K_DS_OVERFLOW_PAD = 8 * sizeof(sycl::half2);  // 32 bytes
     return static_cast<size_t>(K) + (K / QK8_1) * sizeof(sycl::half2) + Q6K_DS_OVERFLOW_PAD;
 }
+
+#if defined(XMX_TEST_STANDALONE)
+namespace ggml_sycl {
+inline void test_moe_down_sum_direct_final_reduce_reference(const float * weighted_tmp,
+                                                            float *       dst,
+                                                            int           nrows,
+                                                            int           n_ids,
+                                                            int           n_tokens,
+                                                            int64_t       tmp_nb1,
+                                                            int64_t       tmp_nb2,
+                                                            int64_t       dst_token_stride) {
+    for (int token = 0; token < n_tokens; ++token) {
+        for (int row = 0; row < nrows; ++row) {
+            float acc = 0.0f;
+            for (int id = 0; id < n_ids; ++id) {
+                const float * src = reinterpret_cast<const float *>(reinterpret_cast<const char *>(weighted_tmp) +
+                                                                    static_cast<int64_t>(id) * tmp_nb1 +
+                                                                    static_cast<int64_t>(token) * tmp_nb2);
+                acc += src[row];
+            }
+            *reinterpret_cast<float *>(reinterpret_cast<char *>(dst) + static_cast<int64_t>(row) * sizeof(float) +
+                                       static_cast<int64_t>(token) * dst_token_stride) = acc;
+        }
+    }
+}
+}  // namespace ggml_sycl
+#endif
 
 #endif  // GGML_SYCL_MMVQ_HPP

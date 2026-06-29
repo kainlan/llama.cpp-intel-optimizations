@@ -12,6 +12,7 @@
 #include "ggml-sycl.h"
 #include "mem-handle.hpp"
 #include "pinned-pool.hpp"
+#include "residency-plan.hpp"
 #include "tlsf-allocator.hpp"
 #include "unified-cache-key.hpp"
 
@@ -1752,6 +1753,13 @@ class unified_cache {
                              0.0f;
     }
 
+    // Validate an optimized-path residency request against current WEIGHT-zone
+    // capacity/fragmentation.  Rejection is structured and side-effect free:
+    // no partial materialization, no forced eviction, and no forced free of live
+    // handles.  Accepted plans retain any handles supplied by the request so
+    // callers can attach the plan to descriptor/pointer-table lifetime.
+    residency_plan reserve_residency(const residency_request & req);
+
     // Drain pending deferred frees at safe sync points (public accessor).
     // NEVER call during graph_compute — sycl::free() unmaps GPU page table
     // entries while in-flight kernels may still reference those addresses.
@@ -2415,8 +2423,10 @@ class unified_cache {
         void *            ptr  = nullptr;
         size_t            size = 0;
         managed_alloc_ref handle{};
-        bool              managed   = false;
-        bool              has_event = false;
+        bool              managed      = false;
+        bool              zone_managed = false;
+        vram_zone_id      zone         = vram_zone_id::COUNT;
+        bool              has_event    = false;
         sycl::event       event;
     };
 
@@ -2448,6 +2458,8 @@ class unified_cache {
     void        remap_or_erase_id_mapping_locked(const ggml_sycl_cache_id & id, const unified_cache_key & removed_key);
     void        enqueue_deferred_free(void * ptr, size_t size);
     void        enqueue_deferred_free(const managed_alloc_ref & handle);
+    void        enqueue_deferred_free(const managed_alloc_ref & handle, const sycl::event & event);
+    void        enqueue_deferred_zone_free(vram_zone_id zone, void * ptr, size_t size, const sycl::event & event);
     void        enqueue_deferred_host_free(void * ptr, size_t size, const sycl::event & event);
     void release_entry_allocation_locked(unified_cache_entry & entry, vram_zone_id arena_zone = vram_zone_id::WEIGHT);
 
@@ -2468,16 +2480,16 @@ class unified_cache {
     }
 
     sycl::queue &                queue_;
-    sycl::queue *                compute_queue_ = nullptr;  // Inference compute queue (for deferred free barriers)
-    std::unique_ptr<sycl::queue> dma_queue_;                // Separate in-order queue for cache DMA ops (CCS)
-    std::unique_ptr<sycl::queue> bcs_queue_;                // Copy-only queue targeting BCS engine (ordinal 1)
-    size_t                       budget_;                   // Total GPU memory budget (after reservations)
-    size_t                       base_budget_;              // Raw cache budget before reservations
-    size_t                       reserved_;                 // Runtime reservation applied to budget_
-    size_t                       device_total_vram_ = 0;    // Total VRAM snapshot passed by backend init
-    bool                         budget_exceeded_ = false;  // Set when used > budget after eviction
-    std::atomic<size_t>          used_{ 0 };                // Current usage
-    std::atomic<int64_t>         time_{ 0 };                // Monotonic counter
+    sycl::queue *                compute_queue_ = nullptr;    // Inference compute queue (for deferred free barriers)
+    std::unique_ptr<sycl::queue> dma_queue_;                  // Separate in-order queue for cache DMA ops (CCS)
+    std::unique_ptr<sycl::queue> bcs_queue_;                  // Copy-only queue targeting BCS engine (ordinal 1)
+    size_t                       budget_;                     // Total GPU memory budget (after reservations)
+    size_t                       base_budget_;                // Raw cache budget before reservations
+    size_t                       reserved_;                   // Runtime reservation applied to budget_
+    size_t                       device_total_vram_ = 0;      // Total VRAM snapshot passed by backend init
+    bool                         budget_exceeded_   = false;  // Set when used > budget after eviction
+    std::atomic<size_t>          used_{ 0 };                  // Current usage
+    std::atomic<int64_t>         time_{ 0 };                  // Monotonic counter
     // P7: async DMA eviction state
     bool                         async_evict_enabled_ = false;  // Set during init from env var
     std::atomic<int>             evictions_in_flight_{ 0 };     // Count of EVICTING entries
@@ -3160,6 +3172,10 @@ struct offload_stats_snapshot {
     uint64_t host_alloc_bytes_host_malloc              = 0;
     uint64_t host_alloc_calls_other                    = 0;
     uint64_t host_alloc_bytes_other                    = 0;
+    uint64_t raw_device_alloc_call_count               = 0;
+    uint64_t raw_device_alloc_bytes                    = 0;
+    uint64_t host_fallback_attempt_count               = 0;
+    uint64_t host_fallback_attempt_bytes               = 0;
 };
 
 enum class offload_phase : uint8_t {
@@ -3184,6 +3200,8 @@ void                   offload_stats_note_cross_domain_transfer(size_t bytes);
 void                   offload_stats_note_dispatch(bool cpu, bool gpu_island = false);
 void                   offload_stats_note_transition_wait(bool waited);
 void                   offload_stats_note_host_alloc(const char * tag, size_t bytes);
+void                   offload_stats_note_raw_device_alloc(size_t bytes);
+void                   offload_stats_note_host_fallback_attempt(size_t bytes);
 offload_stats_snapshot offload_stats_get();
 void                   offload_stats_log_summary(const char * tag, int device);
 void                   zero_alloc_check(const char * tag, int device);
@@ -3612,7 +3630,10 @@ size_t unified_cache_arena_non_weight_used(int device);
 // Diagnostic only: log live unified_alloc records in a VRAM zone without
 // reclaiming anything. Use this to find leaked mem_handle owners before
 // changing lifetime logic.
-void unified_cache_dump_live_zone_allocations(int device, vram_zone_id zone, const char * where, size_t max_entries = 32);
+void unified_cache_dump_live_zone_allocations(int          device,
+                                              vram_zone_id zone,
+                                              const char * where,
+                                              size_t       max_entries = 32);
 
 // Sub-allocate from the arena's KV zone for per-layer KV cache placement.
 // Returns nullptr if arena is inactive or KV zone is exhausted.

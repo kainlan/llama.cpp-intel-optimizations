@@ -7,11 +7,14 @@
 //
 
 #include "../unified-cache.hpp"
+#include "../ggml-sycl-test.hpp"
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <string>
+#include <vector>
 #include <sycl/sycl.hpp>
 
 static int g_tests_run    = 0;
@@ -548,6 +551,51 @@ static bool offload_host_alloc_stats_split_by_tag() {
     return true;
 }
 
+static bool offload_raw_alloc_and_fallback_stats_are_counted() {
+    TEST_BEGIN("offload_raw_alloc_and_fallback_stats_are_counted");
+    offload_stats_reset();
+    offload_stats_note_raw_device_alloc(4096);
+    offload_stats_note_raw_device_alloc(8192);
+    offload_stats_note_host_fallback_attempt(16384);
+    const offload_stats_snapshot stats = offload_stats_get();
+    TEST_ASSERT(stats.raw_device_alloc_call_count == 2, "unexpected raw device alloc calls");
+    TEST_ASSERT(stats.raw_device_alloc_bytes == 12288, "unexpected raw device alloc bytes");
+    TEST_ASSERT(stats.host_fallback_attempt_count == 1, "unexpected host fallback attempts");
+    TEST_ASSERT(stats.host_fallback_attempt_bytes == 16384, "unexpected host fallback bytes");
+    TEST_PASS();
+    return true;
+}
+
+static bool direct_stage_host_fallback_counts_attempt(sycl::queue & q) {
+    TEST_BEGIN("direct_stage_host_fallback_counts_attempt");
+    unified_cache * cache = get_unified_cache(q);
+    TEST_ASSERT(cache != nullptr, "cache unavailable");
+
+    constexpr size_t src_size = 4096;
+    void *           src      = sycl::malloc_host(src_size, q);
+    TEST_ASSERT(src != nullptr, "failed to allocate tiny host source");
+    std::memset(src, 0x5a, src_size);
+
+    static int key_tag;
+    const ggml_sycl_cache_id key      = test_make_cache_id(&key_tag, 0xfeed);
+    const size_t             dst_size = (size_t) 1 << 50;
+
+    offload_stats_reset();
+    const direct_stage_result result = cache->direct_stage_expert(key, src, src_size, dst_size, GGML_LAYOUT_SOA,
+                                                                  nullptr, nullptr, &q);
+    const offload_stats_snapshot stats = offload_stats_get();
+    const size_t dropped = cache->drop_expert_entries_for_tensor_layout(
+        std::vector<ggml_sycl_cache_id>{ key }, GGML_LAYOUT_AOS, "test-direct-stage-host-fallback-counts-attempt");
+    sycl::free(src, q);
+
+    TEST_ASSERT(result.ok && result.ptr == src, "direct-stage should fall back to the host-USM source");
+    TEST_ASSERT(dropped == 1, "direct-stage fallback entry should be dropped before freeing source");
+    TEST_ASSERT(stats.host_fallback_attempt_count == 1, "direct-stage fallback attempt was not counted once");
+    TEST_ASSERT(stats.host_fallback_attempt_bytes == dst_size, "direct-stage fallback bytes should report dst size");
+    TEST_PASS();
+    return true;
+}
+
 static bool host_zone_contiguous_alloc_skips_chunk_tail(sycl::queue & q) {
     TEST_BEGIN("host_zone_contiguous_alloc_skips_chunk_tail");
 
@@ -666,6 +714,8 @@ int main() {
     ok &= offload_phase_roundtrip();
     ok &= offload_transition_wait_stats_split_by_phase();
     ok &= offload_host_alloc_stats_split_by_tag();
+    ok &= offload_raw_alloc_and_fallback_stats_are_counted();
+    ok &= direct_stage_host_fallback_counts_attempt(q);
     ok &= host_zone_contiguous_alloc_skips_chunk_tail(q);
     ok &= host_zone_reset_trims_released_offload_pool_slots(q);
 

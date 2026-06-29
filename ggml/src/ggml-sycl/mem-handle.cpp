@@ -95,8 +95,10 @@ void retained_handle_drain_loop() {
                     ggml_sycl_watchdog_heartbeat();
                     ggml_sycl_watchdog_non_graph_begin();
                 }
+
                 ~event_wait_watchdog_guard() { ggml_sycl_watchdog_non_graph_end(); }
             } watchdog_guard;
+
             record.event.wait_and_throw();
         } catch (const std::exception & e) {
             const std::string msg = e.what();
@@ -191,16 +193,16 @@ mem_handle mem_handle::from_weight_lease(const unified_cache_key & key,
                                          bool                      on_device,
                                          unified_cache_entry *     entry) {
     mem_handle h;
-    h.kind_         = mem_handle_kind::WEIGHT;
-    h.device_       = device;
-    h.key_          = key;
-    h.gen_          = cache_generation();  // Fresh — no slow-path re-query
-    h.cached_       = { ptr, layout, on_device };
+    h.kind_   = mem_handle_kind::WEIGHT;
+    h.device_ = device;
+    h.key_    = key;
+    h.gen_    = cache_generation();  // Fresh — no slow-path re-query
+    h.cached_ = { ptr, layout, on_device };
     if (entry && entry->has_ready_event) {
         h.cached_.has_ready_event = true;
         h.cached_.ready_event     = entry->ready_event;
     }
-    h.leased_entry_ = entry;               // ownership of the refcount bump transferred
+    h.leased_entry_ = entry;  // ownership of the refcount bump transferred
 
     if (ptr != nullptr && valid_cache_device_id(device)) {
         unified_cache * cache = get_existing_unified_cache_for_device(device);
@@ -345,8 +347,30 @@ mem_handle mem_handle::from_owned_alloc(alloc_handle handle, ggml_layout_mode la
 
     const bool on_device = handle.tier == alloc_tier::DEVICE_VRAM;
     mem_handle h         = from_direct(handle.ptr, layout, on_device, on_device ? handle.device : HOST_DEVICE);
+    h.offset_            = 0;
     h.size_              = handle.size;
     h.owned_alloc_ = std::shared_ptr<alloc_handle>(new alloc_handle(std::move(handle)), release_owned_alloc_handle);
+    return h;
+}
+
+mem_handle mem_handle::slice(size_t byte_offset, size_t byte_size) const {
+    if (!owned_alloc_) {
+        return {};
+    }
+    if (byte_offset > size_ || byte_size > size_ - byte_offset) {
+        return {};
+    }
+
+    resolved_ptr base = resolve();
+    if (!base.ptr) {
+        return {};
+    }
+
+    mem_handle h = *this;
+    h.cached_    = base;
+    h.cached_.ptr = static_cast<void *>(static_cast<uint8_t *>(base.ptr) + byte_offset);
+    h.offset_ += byte_offset;
+    h.size_ = byte_size;
     return h;
 }
 
@@ -458,7 +482,7 @@ resolved_ptr mem_handle::resolve_slow() const {
         return {};
     }
 
-    cached_       = { result.ptr, result.layout, result.on_device };
+    cached_ = { result.ptr, result.layout, result.on_device };
     if (result.has_ready_event) {
         cached_.has_ready_event = true;
         cached_.ready_event     = result.ready_event;
@@ -584,6 +608,8 @@ size_t mem_handle::stable_identity_hash() const {
         h = mem_handle_hash_combine(h, std::hash<int>()(static_cast<int>(owned_alloc_->role)));
         h = mem_handle_hash_combine(h, std::hash<int>()(static_cast<int>(owned_alloc_->category)));
         h = mem_handle_hash_combine(h, std::hash<size_t>()(owned_alloc_->size));
+        h = mem_handle_hash_combine(h, std::hash<size_t>()(offset_));
+        h = mem_handle_hash_combine(h, std::hash<size_t>()(size_));
     } else {
         h = mem_handle_hash_combine(h, std::hash<void *>()(cached_.ptr));
         h = mem_handle_hash_combine(h, std::hash<size_t>()(size_));
@@ -616,7 +642,8 @@ bool mem_handle::stable_identity_equal(const mem_handle & other) const {
         return owned_alloc_ && other.owned_alloc_ && owned_alloc_->alloc_id == other.owned_alloc_->alloc_id &&
                owned_alloc_->device == other.owned_alloc_->device && owned_alloc_->tier == other.owned_alloc_->tier &&
                owned_alloc_->role == other.owned_alloc_->role &&
-               owned_alloc_->category == other.owned_alloc_->category && owned_alloc_->size == other.owned_alloc_->size;
+               owned_alloc_->category == other.owned_alloc_->category && owned_alloc_->size == other.owned_alloc_->size &&
+               offset_ == other.offset_ && size_ == other.size_;
     }
 
     return cached_.ptr == other.cached_.ptr && size_ == other.size_;
@@ -624,6 +651,26 @@ bool mem_handle::stable_identity_equal(const mem_handle & other) const {
 
 bool mem_handle::has_stable_owner_identity() const {
     return is_weight() || is_arena() || kind_ == mem_handle_kind::CHUNK_LEASE || owned_alloc_ != nullptr;
+}
+
+void mem_handle::set_debug_owner(const char * owner_tag) {
+    debug_owner_tag_ = owner_tag ? owner_tag : "";
+}
+
+mem_handle_debug_info mem_handle::debug_info() const {
+    mem_handle_debug_info info;
+    info.valid                = valid();
+    info.kind                 = kind_;
+    info.device               = device_;
+    info.zone_id              = zone_id_;
+    info.offset               = offset_;
+    info.size                 = size_;
+    info.generation           = arena_gen_;
+    info.stable_identity_hash = stable_identity_hash();
+    info.has_stable_identity  = has_stable_owner_identity();
+    info.has_ready_event      = cached_.has_ready_event;
+    info.owner_tag            = debug_owner_tag_ ? debug_owner_tag_ : "";
+    return info;
 }
 
 // === destructor / copy / move ===
@@ -681,7 +728,8 @@ mem_handle::mem_handle(const mem_handle & other) :
     chunk_source_(other.chunk_source_),
     host_chunk_handle_(UINT64_MAX),
     vram_chunk_idx_(-1),
-    chunk_device_(other.chunk_device_) {
+    chunk_device_(other.chunk_device_),
+    debug_owner_tag_(other.debug_owner_tag_) {
     // Bump the cache_entry lease refcount so each handle independently keeps
     // the entry alive.  fetch_add on copyable_atomic_u32 is lock-free.
     if (leased_entry_) {
@@ -714,7 +762,8 @@ mem_handle::mem_handle(mem_handle && other) noexcept :
     chunk_source_(other.chunk_source_),
     host_chunk_handle_(other.host_chunk_handle_),
     vram_chunk_idx_(other.vram_chunk_idx_),
-    chunk_device_(other.chunk_device_) {
+    chunk_device_(other.chunk_device_),
+    debug_owner_tag_(other.debug_owner_tag_) {
     // Transfer ownership — no refcount change.  Null `other` so its dtor
     // does not release our leases.
     other.leased_entry_      = nullptr;
@@ -744,6 +793,7 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
     leased_entry_      = other.leased_entry_;
     chunk_source_      = other.chunk_source_;
     chunk_device_      = other.chunk_device_;
+    debug_owner_tag_   = other.debug_owner_tag_;
     host_chunk_handle_ = UINT64_MAX;
     vram_chunk_idx_    = -1;
     if (leased_entry_) {
@@ -782,6 +832,7 @@ mem_handle & mem_handle::operator=(mem_handle && other) noexcept {
     host_chunk_handle_       = other.host_chunk_handle_;
     vram_chunk_idx_          = other.vram_chunk_idx_;
     chunk_device_            = other.chunk_device_;
+    debug_owner_tag_         = other.debug_owner_tag_;
     other.leased_entry_      = nullptr;
     other.chunk_source_      = 0;
     other.host_chunk_handle_ = UINT64_MAX;

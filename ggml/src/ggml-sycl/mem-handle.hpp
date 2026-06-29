@@ -36,9 +36,9 @@ void cache_generation_bump();
 // metadata needed by the caller.
 
 struct resolved_ptr {
-    void *           ptr       = nullptr;
-    ggml_layout_mode layout    = GGML_LAYOUT_AOS;
-    bool             on_device = false;
+    void *           ptr             = nullptr;
+    ggml_layout_mode layout          = GGML_LAYOUT_AOS;
+    bool             on_device       = false;
     bool             has_ready_event = false;
     sycl::event      ready_event;
 
@@ -67,6 +67,8 @@ enum class mem_handle_kind : uint8_t {
                         // sycl::free of the underlying chunk while this
                         // handle is alive.
 };
+
+struct mem_handle_debug_info;
 
 class mem_handle {
   public:
@@ -164,6 +166,11 @@ class mem_handle {
     // queue submission.
     static mem_handle from_owned_alloc(alloc_handle handle, ggml_layout_mode layout = GGML_LAYOUT_AOS);
 
+    // Return a retained view into an owning allocation.  The slice shares the
+    // same allocation owner but resolves to base + byte_offset and carries its
+    // own stable offset/size identity for replay tables.
+    mem_handle slice(size_t byte_offset, size_t byte_size) const;
+
     void set_ready_event(const sycl::event & event);
     void clear_ready_event();
 
@@ -223,7 +230,8 @@ class mem_handle {
     // Stable ownership identity for caches that should not key by transient
     // resolved weight pointers.  Weight handles use their unified-cache key;
     // arena handles use owner device/zone/offset/generation; chunk leases use
-    // the leased chunk plus the derived pointer inside it. DIRECT handles fall
+    // the leased chunk plus the derived pointer inside it; owned allocations use
+    // allocation id plus slice offset/size. DIRECT handles without an owner fall
     // back to pointer identity because no stronger owner identity exists for
     // external raw pointers.
     size_t stable_identity_hash() const;
@@ -235,6 +243,12 @@ class mem_handle {
     // True when stable_identity_hash()/stable_identity_equal() are backed by a
     // unified-cache/allocator identity rather than a raw external pointer.
     bool has_stable_owner_identity() const;
+
+    // Lightweight debug metadata for diagnostics.  Owner tags are expected to
+    // be string literals or other externally-owned stable strings; mem_handle
+    // deliberately does not allocate/copy strings on hot paths.
+    void                  set_debug_owner(const char * owner_tag);
+    mem_handle_debug_info debug_info() const;
 
   private:
     // Slow path: re-query the unified cache for the current pointer.
@@ -301,6 +315,22 @@ class mem_handle {
     mutable uint64_t host_chunk_handle_ = UINT64_MAX;  // pinned_chunk_pool::INVALID_CHUNK_HANDLE
     mutable int32_t  vram_chunk_idx_    = -1;
     mutable int32_t  chunk_device_      = -1;
+
+    const char * debug_owner_tag_ = "";
+};
+
+struct mem_handle_debug_info {
+    bool            valid                = false;
+    mem_handle_kind kind                 = mem_handle_kind::DIRECT;
+    int             device               = mem_handle::HOST_DEVICE;
+    int             zone_id              = -1;
+    size_t          offset               = 0;
+    size_t          size                 = 0;
+    uint64_t        generation           = 0;
+    size_t          stable_identity_hash = 0;
+    bool            has_stable_identity  = false;
+    bool            has_ready_event      = false;
+    const char *    owner_tag            = "";
 };
 
 struct mem_handle_hash {

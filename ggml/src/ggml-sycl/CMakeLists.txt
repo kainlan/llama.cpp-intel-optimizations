@@ -537,6 +537,7 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
         XMX_TEST_STANDALONE=1
     )
+    target_link_libraries(test-xmx-moe-mxfp4 PRIVATE ggml-base ggml ggml-sycl)
     if (IntelSYCL_FOUND)
         target_link_libraries(test-xmx-moe-mxfp4 PRIVATE IntelSYCL::SYCL_CXX)
     endif()
@@ -1164,6 +1165,107 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         TIMEOUT 300
     )
 endif()
+
+set(RESIDENCY_TEST_SYCL_OPTIONS
+    "-fsycl"
+    "-Wno-narrowing"
+)
+foreach(_residency_test
+    test-sycl-mem-handle-lifetime
+    test-sycl-residency-reservation
+    test-sycl-descriptor-retention
+    test-sycl-moe-residency-preflight
+    test-sycl-residency-diagnostics
+    test-sycl-moe-fused-down-sum-policy
+    test-sycl-moe-token-major-metadata
+    test-sycl-moe-direct-final-token-major-bridge
+    test-sycl-moe-direct-final-scratch-plan
+    test-sycl-moe-same-expert-grouping
+    test-sycl-moe-glu-q8-artifact-policy
+    test-sycl-moe-glu-q8-fused-store-policy
+    test-sycl-moe-fusion-noactivation
+    test-sycl-moe-sequence-graphlet-policy
+)
+    add_executable(${_residency_test}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/${_residency_test}.cpp
+    )
+    target_include_directories(${_residency_test} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
+    )
+    target_compile_options(${_residency_test} PRIVATE ${RESIDENCY_TEST_SYCL_OPTIONS})
+    target_link_options(${_residency_test} PRIVATE ${RESIDENCY_TEST_SYCL_OPTIONS})
+    target_compile_definitions(${_residency_test} PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(${_residency_test} PRIVATE ggml-base ggml ggml-sycl)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(${_residency_test} PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME ${_residency_test} COMMAND ${_residency_test})
+    set_tests_properties(${_residency_test} PROPERTIES
+        LABELS "sycl;cache;residency;mem-handle;tdd"
+        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        TIMEOUT 120
+    )
+endforeach()
+
+add_executable(test-sycl-esimd-float-atomic-compile
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-esimd-float-atomic-compile.cpp
+)
+target_compile_options(test-sycl-esimd-float-atomic-compile PRIVATE -fsycl -Wno-narrowing)
+target_link_options(test-sycl-esimd-float-atomic-compile PRIVATE -fsycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-esimd-float-atomic-compile PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-esimd-float-atomic-compile COMMAND test-sycl-esimd-float-atomic-compile)
+set_tests_properties(test-sycl-esimd-float-atomic-compile PROPERTIES LABELS "sycl;esimd;compile;tdd" TIMEOUT 120)
+
+find_library(LEVEL_ZERO_LOADER ze_loader REQUIRED)
+add_executable(test-sycl-level-zero-vmem-feasibility
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-level-zero-vmem-feasibility.cpp
+)
+target_link_libraries(test-sycl-level-zero-vmem-feasibility PRIVATE ${LEVEL_ZERO_LOADER})
+add_test(NAME test-sycl-level-zero-vmem-feasibility COMMAND test-sycl-level-zero-vmem-feasibility)
+set_tests_properties(test-sycl-level-zero-vmem-feasibility PROPERTIES
+    LABELS "sycl;level-zero;vmem;tdd"
+    TIMEOUT 120
+)
+
+set(ONEDNN_MXFP4_FEASIBILITY_SYCL_OPTIONS
+    "-fsycl"
+    "-Wno-narrowing"
+)
+add_executable(test-sycl-onednn-mxfp4-feasibility
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-onednn-mxfp4-feasibility.cpp
+)
+target_include_directories(test-sycl-onednn-mxfp4-feasibility PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-onednn-mxfp4-feasibility PRIVATE ${ONEDNN_MXFP4_FEASIBILITY_SYCL_OPTIONS})
+target_link_options(test-sycl-onednn-mxfp4-feasibility PRIVATE ${ONEDNN_MXFP4_FEASIBILITY_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-onednn-mxfp4-feasibility PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+if (GGML_SYCL_DNNL)
+    target_link_libraries(test-sycl-onednn-mxfp4-feasibility PRIVATE DNNL::dnnl)
+endif()
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-onednn-mxfp4-feasibility PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-onednn-mxfp4-feasibility COMMAND test-sycl-onednn-mxfp4-feasibility)
+set_tests_properties(test-sycl-onednn-mxfp4-feasibility PROPERTIES
+    LABELS "sycl;onednn;mxfp4;tdd"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
 
 # Standalone oneDNN vs SYCL kernel microbenchmark
 if (GGML_SYCL_DNNL)

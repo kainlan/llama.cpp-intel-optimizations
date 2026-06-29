@@ -37,6 +37,236 @@
 
 namespace ggml_sycl {
 
+const char * residency_reject_reason_name(residency_reject_reason reason) {
+    switch (reason) {
+        case residency_reject_reason::NONE:
+            return "none";
+        case residency_reject_reason::BUDGET:
+            return "budget";
+        case residency_reject_reason::FRAGMENTATION:
+            return "fragmentation";
+        case residency_reject_reason::MISSING_LAYOUT:
+            return "missing-layout";
+        case residency_reject_reason::LIVE_LEASE_PRESSURE:
+            return "live-lease-pressure";
+        case residency_reject_reason::UNSUPPORTED:
+            return "unsupported";
+    }
+    return "unknown";
+}
+
+namespace {
+
+std::mutex                     g_residency_diag_mutex;
+residency_diagnostics_snapshot g_residency_diag;
+
+void apply_forced_residency_budget(residency_budget & budget) {
+    const char * env = std::getenv("GGML_SYCL_RESIDENCY_FORCE_BUDGET_BYTES");
+    if (!env) {
+        return;
+    }
+    char *                   end    = nullptr;
+    const unsigned long long forced = std::strtoull(env, &end, 10);
+    if (end == env || forced == 0) {
+        return;
+    }
+    const size_t forced_bytes = static_cast<size_t>(forced);
+    budget.bytes_available    = std::min(budget.bytes_available, forced_bytes);
+    budget.largest_free_block = std::min(budget.largest_free_block, forced_bytes);
+}
+
+residency_plan evaluate_residency_budget(const residency_request & req, residency_budget budget) {
+    apply_forced_residency_budget(budget);
+
+    residency_plan plan;
+    plan.bytes_available    = budget.bytes_available;
+    plan.largest_free_block = budget.largest_free_block;
+
+    for (const residency_entry_request & entry : req.entries) {
+        plan.bytes_requested += entry.bytes;
+    }
+
+    if (plan.bytes_requested > budget.bytes_available) {
+        plan.accepted = false;
+        plan.reason   = residency_reject_reason::BUDGET;
+        return plan;
+    }
+
+    for (const residency_entry_request & entry : req.entries) {
+        if (entry.bytes > budget.largest_free_block) {
+            plan.accepted = false;
+            plan.reason   = residency_reject_reason::FRAGMENTATION;
+            return plan;
+        }
+    }
+
+    plan.accepted       = true;
+    plan.reason         = residency_reject_reason::NONE;
+    plan.bytes_reserved = plan.bytes_requested;
+    for (const residency_entry_request & entry : req.entries) {
+        residency_plan_entry out;
+        out.request = entry;
+        out.handle  = entry.handle;
+        plan.entries.push_back(out);
+    }
+    return plan;
+}
+
+void validate_residency_plan_handles(const residency_request & req, residency_plan & plan) {
+    if (!plan.accepted) {
+        return;
+    }
+
+    for (const residency_plan_entry & entry : plan.entries) {
+        const bool handle_requested =
+            entry.request.require_handle || entry.handle.valid() || entry.handle.has_stable_owner_identity();
+        if (!handle_requested) {
+            continue;
+        }
+        if (!entry.handle.has_stable_owner_identity()) {
+            plan.accepted = false;
+            plan.reason   = residency_reject_reason::MISSING_LAYOUT;
+            plan.entries.clear();
+            return;
+        }
+        resolved_ptr resolved = entry.handle.resolve(req.device);
+        if (!resolved.ptr || resolved.layout != entry.request.layout) {
+            plan.accepted = false;
+            plan.reason   = residency_reject_reason::MISSING_LAYOUT;
+            plan.entries.clear();
+            return;
+        }
+        if (entry.request.require_handle && req.device >= 0 &&
+            (!resolved.on_device || entry.handle.device() != req.device)) {
+            plan.accepted = false;
+            plan.reason   = residency_reject_reason::MISSING_LAYOUT;
+            plan.entries.clear();
+            return;
+        }
+        if (resolved.on_device && req.device >= 0 && entry.handle.device() != mem_handle::HOST_DEVICE &&
+            entry.handle.device() != req.device) {
+            plan.accepted = false;
+            plan.reason   = residency_reject_reason::MISSING_LAYOUT;
+            plan.entries.clear();
+            return;
+        }
+    }
+}
+
+void residency_diagnostics_record_locked(residency_reject_reason reason,
+                                         size_t                  bytes_requested,
+                                         size_t                  bytes_available,
+                                         size_t                  largest_free_block) {
+    g_residency_diag.last_bytes_requested    = bytes_requested;
+    g_residency_diag.last_bytes_available    = bytes_available;
+    g_residency_diag.last_largest_free_block = largest_free_block;
+    switch (reason) {
+        case residency_reject_reason::NONE:
+            ++g_residency_diag.accept_count;
+            break;
+        case residency_reject_reason::BUDGET:
+            ++g_residency_diag.reject_budget;
+            break;
+        case residency_reject_reason::FRAGMENTATION:
+            ++g_residency_diag.reject_fragmentation;
+            break;
+        case residency_reject_reason::MISSING_LAYOUT:
+            ++g_residency_diag.reject_missing_layout;
+            break;
+        case residency_reject_reason::LIVE_LEASE_PRESSURE:
+            ++g_residency_diag.reject_live_lease_pressure;
+            break;
+        case residency_reject_reason::UNSUPPORTED:
+            ++g_residency_diag.reject_unsupported;
+            break;
+    }
+}
+
+}  // namespace
+
+residency_plan evaluate_residency_request_for_test(const residency_request & req, const residency_budget & budget) {
+    residency_plan plan = evaluate_residency_budget(req, budget);
+    validate_residency_plan_handles(req, plan);
+    if (plan.accepted) {
+        residency_diagnostics_record_accept_for_test(plan.bytes_requested, plan.bytes_available,
+                                                     plan.largest_free_block);
+    } else {
+        residency_diagnostics_record_reject_for_test(plan.reason, plan.bytes_requested, plan.bytes_available,
+                                                     plan.largest_free_block);
+    }
+    return plan;
+}
+
+void residency_diagnostics_reset_for_test() {
+    std::lock_guard<std::mutex> lock(g_residency_diag_mutex);
+    g_residency_diag = residency_diagnostics_snapshot{};
+}
+
+void residency_diagnostics_record_accept_for_test(size_t bytes_requested,
+                                                  size_t bytes_available,
+                                                  size_t largest_free_block) {
+    std::lock_guard<std::mutex> lock(g_residency_diag_mutex);
+    residency_diagnostics_record_locked(residency_reject_reason::NONE, bytes_requested, bytes_available,
+                                        largest_free_block);
+}
+
+void residency_diagnostics_record_reject_for_test(residency_reject_reason reason,
+                                                  size_t                  bytes_requested,
+                                                  size_t                  bytes_available,
+                                                  size_t                  largest_free_block) {
+    std::lock_guard<std::mutex> lock(g_residency_diag_mutex);
+    residency_diagnostics_record_locked(reason, bytes_requested, bytes_available, largest_free_block);
+}
+
+void residency_diagnostics_record_live_handle_for_test(const char * owner_tag, const char * allocation_class, size_t) {
+    std::lock_guard<std::mutex> lock(g_residency_diag_mutex);
+    ++g_residency_diag.live_handle_count;
+    std::snprintf(g_residency_diag.last_live_owner_tag, sizeof(g_residency_diag.last_live_owner_tag), "%s",
+                  owner_tag ? owner_tag : "");
+    std::snprintf(g_residency_diag.last_live_allocation_class, sizeof(g_residency_diag.last_live_allocation_class),
+                  "%s", allocation_class ? allocation_class : "");
+}
+
+void residency_diagnostics_record_stale_descriptor_for_test() {
+    std::lock_guard<std::mutex> lock(g_residency_diag_mutex);
+    ++g_residency_diag.stale_descriptor_rejects;
+}
+
+void residency_diagnostics_record_stale_descriptor_invalid_handle_for_test() {
+    std::lock_guard<std::mutex> lock(g_residency_diag_mutex);
+    ++g_residency_diag.stale_descriptor_rejects;
+    ++g_residency_diag.stale_descriptor_invalid_handle;
+}
+
+void residency_diagnostics_record_stale_descriptor_identity_mismatch_for_test() {
+    std::lock_guard<std::mutex> lock(g_residency_diag_mutex);
+    ++g_residency_diag.stale_descriptor_rejects;
+    ++g_residency_diag.stale_descriptor_identity_mismatch;
+}
+
+void residency_diagnostics_record_stale_descriptor_generation_mismatch_for_test() {
+    std::lock_guard<std::mutex> lock(g_residency_diag_mutex);
+    ++g_residency_diag.stale_descriptor_rejects;
+    ++g_residency_diag.stale_descriptor_generation_mismatch;
+}
+
+void residency_diagnostics_record_stale_descriptor_layout_mismatch_for_test() {
+    std::lock_guard<std::mutex> lock(g_residency_diag_mutex);
+    ++g_residency_diag.stale_descriptor_rejects;
+    ++g_residency_diag.stale_descriptor_layout_mismatch;
+}
+
+void residency_diagnostics_record_stale_descriptor_device_mismatch_for_test() {
+    std::lock_guard<std::mutex> lock(g_residency_diag_mutex);
+    ++g_residency_diag.stale_descriptor_rejects;
+    ++g_residency_diag.stale_descriptor_device_mismatch;
+}
+
+residency_diagnostics_snapshot residency_diagnostics_snapshot_for_test() {
+    std::lock_guard<std::mutex> lock(g_residency_diag_mutex);
+    return g_residency_diag;
+}
+
 // Per-device cache storage (for PER_DEVICE and AUTO modes)
 static std::unordered_map<int, std::unique_ptr<unified_cache>> g_device_caches;
 static std::shared_mutex                                       g_cache_rw_mutex;
@@ -278,8 +508,8 @@ void unified_cache_set_planned_pp_moe_onednn_scratch(int      device_id,
         return;
     }
     const uint32_t effective_ring_depth = pp_moe_onednn_effective_ring_depth(ring_depth);
-    const size_t   total = pp_moe_onednn_planned_scratch_bytes(weight_slot_bytes, activation_slot_bytes,
-                                                               output_slot_bytes, ring_depth);
+    const size_t   total =
+        pp_moe_onednn_planned_scratch_bytes(weight_slot_bytes, activation_slot_bytes, output_slot_bytes, ring_depth);
     g_planned_pp_moe_onednn_weight_slot_bytes[device_id].store(weight_slot_bytes, std::memory_order_release);
     g_planned_pp_moe_onednn_activation_slot_bytes[device_id].store(activation_slot_bytes, std::memory_order_release);
     g_planned_pp_moe_onednn_output_slot_bytes[device_id].store(output_slot_bytes, std::memory_order_release);
@@ -351,6 +581,10 @@ static std::atomic<uint64_t> g_offload_host_alloc_calls_host_malloc{ 0 };
 static std::atomic<uint64_t> g_offload_host_alloc_bytes_host_malloc{ 0 };
 static std::atomic<uint64_t> g_offload_host_alloc_calls_other{ 0 };
 static std::atomic<uint64_t> g_offload_host_alloc_bytes_other{ 0 };
+static std::atomic<uint64_t> g_offload_raw_device_alloc_call_count{ 0 };
+static std::atomic<uint64_t> g_offload_raw_device_alloc_bytes{ 0 };
+static std::atomic<uint64_t> g_offload_host_fallback_attempt_count{ 0 };
+static std::atomic<uint64_t> g_offload_host_fallback_attempt_bytes{ 0 };
 static std::mutex            g_offload_host_alloc_by_tag_mutex;
 static std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> g_offload_host_alloc_by_tag;
 static std::atomic<int> g_offload_phase{ static_cast<int>(offload_phase::UNKNOWN) };
@@ -489,6 +723,10 @@ void offload_stats_reset() {
     g_offload_host_alloc_bytes_host_malloc.store(0, std::memory_order_relaxed);
     g_offload_host_alloc_calls_other.store(0, std::memory_order_relaxed);
     g_offload_host_alloc_bytes_other.store(0, std::memory_order_relaxed);
+    g_offload_raw_device_alloc_call_count.store(0, std::memory_order_relaxed);
+    g_offload_raw_device_alloc_bytes.store(0, std::memory_order_relaxed);
+    g_offload_host_fallback_attempt_count.store(0, std::memory_order_relaxed);
+    g_offload_host_fallback_attempt_bytes.store(0, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lock(g_offload_host_alloc_by_tag_mutex);
         g_offload_host_alloc_by_tag.clear();
@@ -694,6 +932,22 @@ void offload_stats_note_host_alloc(const char * tag, size_t bytes) {
     g_offload_host_alloc_bytes_other.fetch_add(bytes, std::memory_order_relaxed);
 }
 
+void offload_stats_note_raw_device_alloc(size_t bytes) {
+    if (bytes == 0) {
+        return;
+    }
+    g_offload_raw_device_alloc_call_count.fetch_add(1, std::memory_order_relaxed);
+    g_offload_raw_device_alloc_bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void offload_stats_note_host_fallback_attempt(size_t bytes) {
+    if (bytes == 0) {
+        return;
+    }
+    g_offload_host_fallback_attempt_count.fetch_add(1, std::memory_order_relaxed);
+    g_offload_host_fallback_attempt_bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
 offload_stats_snapshot offload_stats_get() {
     offload_stats_snapshot s{};
     s.wait_count                      = g_offload_wait_count.load(std::memory_order_relaxed);
@@ -742,6 +996,10 @@ offload_stats_snapshot offload_stats_get() {
     s.host_alloc_bytes_host_malloc = g_offload_host_alloc_bytes_host_malloc.load(std::memory_order_relaxed);
     s.host_alloc_calls_other       = g_offload_host_alloc_calls_other.load(std::memory_order_relaxed);
     s.host_alloc_bytes_other       = g_offload_host_alloc_bytes_other.load(std::memory_order_relaxed);
+    s.raw_device_alloc_call_count  = g_offload_raw_device_alloc_call_count.load(std::memory_order_relaxed);
+    s.raw_device_alloc_bytes       = g_offload_raw_device_alloc_bytes.load(std::memory_order_relaxed);
+    s.host_fallback_attempt_count  = g_offload_host_fallback_attempt_count.load(std::memory_order_relaxed);
+    s.host_fallback_attempt_bytes  = g_offload_host_fallback_attempt_bytes.load(std::memory_order_relaxed);
     return s;
 }
 
@@ -867,6 +1125,13 @@ void offload_stats_log_summary(const char * tag, int device) {
         (unsigned long long) s.host_alloc_bytes_unified_cache_host_chunk,
         (unsigned long long) s.host_alloc_calls_host_malloc, (unsigned long long) s.host_alloc_bytes_host_malloc,
         (unsigned long long) s.host_alloc_calls_other, (unsigned long long) s.host_alloc_bytes_other);
+
+    fprintf(stderr,
+            "[UNIFIED-CACHE-STATS] tag=%s device=%d raw_device_alloc_calls=%llu raw_device_alloc_bytes=%llu "
+            "host_fallback_attempts=%llu host_fallback_bytes=%llu\n",
+            tag ? tag : "graph", device, (unsigned long long) s.raw_device_alloc_call_count,
+            (unsigned long long) s.raw_device_alloc_bytes, (unsigned long long) s.host_fallback_attempt_count,
+            (unsigned long long) s.host_fallback_attempt_bytes);
 
     int top_n = 5;
     if (const char * env = std::getenv("GGML_SYCL_HOST_ALLOC_TOP")) {
@@ -1548,20 +1813,26 @@ bool unified_cache::ensure_planned_arena_zones() {
             has_chunk_leases = has_chunk_leases || leases != 0;
         }
 
-        const bool has_live_scratch =
-            compute_arena_used() != 0 || scratch_pool_ptr_ != nullptr || onednn_weights_scratch_ != nullptr ||
-            onednn_activations_scratch_ != nullptr || reorder_temp_buffer_ != nullptr ||
-            !persistent_scratches_.empty() || !pp_moe_onednn_scratch_slots_.empty();
+        const bool has_live_scratch = compute_arena_used() != 0 || scratch_pool_ptr_ != nullptr ||
+                                      onednn_weights_scratch_ != nullptr || onednn_activations_scratch_ != nullptr ||
+                                      reorder_temp_buffer_ != nullptr || !persistent_scratches_.empty() ||
+                                      !pp_moe_onednn_scratch_slots_.empty();
         if (live_zone_bytes != 0 || has_chunk_leases || has_live_scratch) {
+            const size_t blocked_bytes =
+                live_zone_bytes != 0 ? live_zone_bytes : (scratch_zone + onednn_zone + runtime_zone);
+            residency_diagnostics_record_live_handle_for_test("arena-rebuild", "VRAM_ARENA", blocked_bytes);
+            residency_diagnostics_record_reject_for_test(residency_reject_reason::LIVE_LEASE_PRESSURE, blocked_bytes,
+                                                         zone_available(vram_zone_id::WEIGHT),
+                                                         zone_largest_free(vram_zone_id::WEIGHT));
             GGML_LOG_ERROR(
                 "[VRAM-ARENA] planned zones exceed active arena but live allocations prevent rebuild: "
                 "need scratch=%.1f MB oneDNN=%.1f MB runtime=%.1f MB; have scratch=%.1f MB oneDNN=%.1f MB "
                 "runtime=%.1f MB; live_zone=%.1f MB chunk_leases=%u\n",
-                scratch_zone / (1024.0 * 1024.0), onednn_zone / (1024.0 * 1024.0),
-                runtime_zone / (1024.0 * 1024.0), zone_capacity(vram_zone_id::SCRATCH) / (1024.0 * 1024.0),
+                scratch_zone / (1024.0 * 1024.0), onednn_zone / (1024.0 * 1024.0), runtime_zone / (1024.0 * 1024.0),
+                zone_capacity(vram_zone_id::SCRATCH) / (1024.0 * 1024.0),
                 zone_capacity(vram_zone_id::ONEDNN) / (1024.0 * 1024.0),
-                zone_capacity(vram_zone_id::RUNTIME) / (1024.0 * 1024.0),
-                live_zone_bytes / (1024.0 * 1024.0), chunk_leases);
+                zone_capacity(vram_zone_id::RUNTIME) / (1024.0 * 1024.0), live_zone_bytes / (1024.0 * 1024.0),
+                chunk_leases);
             return false;
         }
 
@@ -1821,8 +2092,16 @@ unified_cache::~unified_cache() {
 
     // Free any deferred frees that haven't been released yet.
     for (auto & entry : deferred_frees_) {
+        if (entry.has_event) {
+            try {
+                entry.event.wait_and_throw();
+            } catch (...) {
+            }
+        }
         if (entry.ptr) {
-            if (entry.managed) {
+            if (entry.zone_managed && entry.zone != vram_zone_id::COUNT) {
+                zone_free(entry.zone, entry.ptr);
+            } else if (entry.managed) {
                 if (entry.handle.owner.valid()) {
                     entry.handle.owner = {};
                 } else {
@@ -2049,6 +2328,10 @@ static const char * usm_alloc_name(sycl::usm::alloc alloc) {
     }
 }
 
+static bool can_replace_cache_entry_locked(const unified_cache_key &   key,
+                                           const unified_cache_entry & old,
+                                           const char *                path);
+
 void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
                                     const void *               src_ptr,
                                     size_t                     size,
@@ -2106,6 +2389,10 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
             bool     content_changed = (it->second.content_hash != new_hash);
 
             if (need_realloc) {
+                if (!can_replace_cache_entry_locked(key, it->second, "ensure_cached-realloc")) {
+                    return nullptr;
+                }
+
                 // Size changed - need to reallocate device buffer
                 GGML_SYCL_DEBUG(
                     "[UNIFIED-CACHE] Size changed for model=%llu name_hash=0x%llx (%zu -> %zu bytes), reallocating\n",
@@ -2124,6 +2411,7 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
                             "[UNIFIED-CACHE] Cannot evict for realloc (used=%.1f MB, need=%.1f MB), trying host "
                             "fallback\n",
                             used_.load() / (1024.0f * 1024.0f), size / (1024.0f * 1024.0f));
+                        offload_stats_note_host_fallback_attempt(size);
                         use_host_fallback = true;
                         break;
                     }
@@ -2141,12 +2429,14 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
                     } catch (const sycl::exception & e) {
                         GGML_SYCL_DEBUG("[UNIFIED-CACHE] realloc malloc_device failed: %s, trying host fallback\n",
                                         e.what());
+                        offload_stats_note_host_fallback_attempt(size);
                         use_host_fallback = true;
                     }
 
                     if (!new_device_ptr && !use_host_fallback) {
                         GGML_SYCL_DEBUG(
                             "[UNIFIED-CACHE] realloc malloc_device returned nullptr, trying host fallback\n");
+                        offload_stats_note_host_fallback_attempt(size);
                         use_host_fallback = true;
                     }
 
@@ -2229,7 +2519,12 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
                 }
                 it->second.pinned = was_pinned;
             } else if (content_changed) {
-                // Same size but content changed - just re-upload
+                // Same size but content changed - just re-upload.  This still
+                // replaces bytes observed through existing mem_handle leases,
+                // so it must obey the same live/retired refusal as realloc.
+                if (!can_replace_cache_entry_locked(key, it->second, "ensure_cached-recopy")) {
+                    return nullptr;
+                }
                 GGML_SYCL_DEBUG(
                     "[UNIFIED-CACHE] Content changed for model=%llu name_hash=0x%llx (hash %llx -> %llx), "
                     "re-uploading\n",
@@ -2264,6 +2559,7 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
             GGML_SYCL_DEBUG(
                 "[UNIFIED-CACHE] Cannot evict: all entries pinned (used=%.1f MB, need=%.1f MB), trying host fallback\n",
                 used_.load() / (1024.0f * 1024.0f), size / (1024.0f * 1024.0f));
+            offload_stats_note_host_fallback_attempt(size);
             use_host_fallback = true;
             break;
         }
@@ -2282,11 +2578,13 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
             device_ptr = unified_cache_malloc_device_tracked(size, queue_, "unified_cache:alloc");
         } catch (const sycl::exception & e) {
             GGML_SYCL_DEBUG("[UNIFIED-CACHE] malloc_device failed: %s, trying host fallback\n", e.what());
+            offload_stats_note_host_fallback_attempt(size);
             use_host_fallback = true;
         }
 
         if (!device_ptr && !use_host_fallback) {
             GGML_SYCL_DEBUG("[UNIFIED-CACHE] malloc_device returned nullptr, trying host fallback\n");
+            offload_stats_note_host_fallback_attempt(size);
             use_host_fallback = true;
         }
 
@@ -2472,9 +2770,11 @@ static bool can_replace_cache_entry_locked(const unified_cache_key &   key,
                                            const unified_cache_entry & old,
                                            const char *                path) {
     const uint32_t live = old.in_use_count.load();
-    if (live == 0) {
+    if (live == 0 && !old.retired) {
         return true;
     }
+    residency_diagnostics_record_live_handle_for_test(path ? path : "replace", "WEIGHT", old.size);
+    residency_diagnostics_record_reject_for_test(residency_reject_reason::LIVE_LEASE_PRESSURE, old.size, 0, 0);
     GGML_LOG_WARN(
         "[UNIFIED-CACHE] %s refused replacement with live/retired entry type=%d model=%llu name_hash=0x%llx "
         "aux=0x%llx layout=%d leases=%u retired=%d\n",
@@ -2482,6 +2782,21 @@ static bool can_replace_cache_entry_locked(const unified_cache_key &   key,
         (unsigned long long) key.id.name_hash, (unsigned long long) key.id.aux_id, (int) old.layout, live,
         old.retired ? 1 : 0);
     return false;
+}
+
+bool test_cache_replacement_allowed_for_test(uint32_t live_leases, bool retired) {
+    ggml_sycl_cache_id id{};
+    id.valid     = true;
+    id.model_id  = 1;
+    id.name_hash = 0xCACE;
+    id.aux_id    = 0xFEED;
+    unified_cache_key   key{ cache_entry_type::DENSE_WEIGHT, id, -1, -1 };
+    unified_cache_entry entry{};
+    entry.size    = 4096;
+    entry.layout  = GGML_LAYOUT_AOS;
+    entry.retired = retired;
+    entry.in_use_count.store(live_leases);
+    return can_replace_cache_entry_locked(key, entry, "test-replacement");
 }
 
 void unified_cache::remap_or_erase_id_mapping_locked(const ggml_sycl_cache_id & id,
@@ -2621,6 +2936,22 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
         }
         ptr = nullptr;
     };
+    auto defer_unpublished_ptr_until_event = [&](const sycl::event & event) {
+        if (!ptr) {
+            return;
+        }
+        if (direct_alloc_owner.valid()) {
+            managed_alloc_ref ref{};
+            ref.ptr    = ptr;
+            ref.size   = dst_size;
+            ref.device = direct_alloc_owner.device();
+            ref.owner  = std::move(direct_alloc_owner);
+            enqueue_deferred_free(ref, event);
+        } else {
+            enqueue_deferred_zone_free(vram_zone_id::WEIGHT, ptr, dst_size, event);
+        }
+        ptr = nullptr;
+    };
 
     // 2. Fill: reorder or plain copy.  AoS model weights often originate from
     // mmap'd GGUF pages, which are not USM pointers.  Route host/mmap sources
@@ -2699,7 +3030,7 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
         auto old                 = entries_.find(cache_key);
         if (old != entries_.end() && old->second.device_ptr && old->second.device_ptr != ptr) {
             if (!can_replace_cache_entry_locked(cache_key, old->second, "direct_stage_weight")) {
-                release_unpublished_ptr();
+                defer_unpublished_ptr_until_event(last_event);
                 return result;
             }
             release_entry_allocation_locked(old->second);
@@ -2855,6 +3186,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
             return result;
         }
 
+        offload_stats_note_host_fallback_attempt(dst_size);
         static std::atomic<int> host_fallback_log{ 0 };
         if (host_fallback_log.fetch_add(1, std::memory_order_relaxed) < 10) {
             GGML_LOG_WARN("[DIRECT-STAGE] WEIGHT zone full (%zu bytes) — host arena fallback\n", dst_size);
@@ -2946,6 +3278,22 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         }
         ptr = nullptr;
     };
+    auto defer_unpublished_ptr_until_event = [&](const sycl::event & event) {
+        if (!ptr) {
+            return;
+        }
+        if (direct_alloc_owner.valid()) {
+            managed_alloc_ref ref{};
+            ref.ptr    = ptr;
+            ref.size   = dst_size;
+            ref.device = direct_alloc_owner.device();
+            ref.owner  = std::move(direct_alloc_owner);
+            enqueue_deferred_free(ref, event);
+        } else {
+            enqueue_deferred_zone_free(vram_zone_id::WEIGHT, ptr, dst_size, event);
+        }
+        ptr = nullptr;
+    };
 
     // 2. Fill: reorder or plain memcpy
     mem_handle dst_handle =
@@ -3020,7 +3368,7 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         auto old                 = entries_.find(cache_key);
         if (old != entries_.end() && old->second.device_ptr && old->second.device_ptr != ptr) {
             if (!can_replace_cache_entry_locked(cache_key, old->second, "direct_stage_expert")) {
-                release_unpublished_ptr();
+                defer_unpublished_ptr_until_event(last_event);
                 return result;
             }
             release_entry_allocation_locked(old->second);
@@ -3128,7 +3476,15 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
             if (it == entries_.end()) {
                 continue;
             }
-            if (it->second.retired || it->second.in_use_count.load() != 0) {
+            const uint32_t live = it->second.in_use_count.load();
+            if (it->second.retired || live != 0) {
+                if (live != 0) {
+                    residency_diagnostics_record_live_handle_for_test("direct-stage-tensor-existing", "WEIGHT",
+                                                                      it->second.size);
+                    residency_diagnostics_record_reject_for_test(residency_reject_reason::LIVE_LEASE_PRESSURE,
+                                                                 it->second.size, zone_available(vram_zone_id::WEIGHT),
+                                                                 zone_largest_free(vram_zone_id::WEIGHT));
+                }
                 return result;
             }
         }
@@ -3187,13 +3543,15 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
             "[DIRECT-STAGE] tensor-bulk expert fill failed; aborting before inference can use a failed SYCL queue");
     }
 
-    void * allocation_base = ptr;
-    auto   storage_owner   = std::shared_ptr<void>(allocation_base, [device = cache_device](void * p) {
-        if (!p || g_sycl_shutting_down.load(std::memory_order_acquire)) {
+    void * allocation_base                    = ptr;
+    auto   defer_unpublished_bulk_until_event = [&]() {
+        if (!allocation_base) {
             return;
         }
-        unified_cache_zone_free(device, vram_zone_id::WEIGHT, p);
-    });
+        enqueue_deferred_zone_free(vram_zone_id::WEIGHT, allocation_base, total_dst_size, fill_event);
+        allocation_base = nullptr;
+        ptr             = nullptr;
+    };
 
     if (out_handles) {
         out_handles->clear();
@@ -3203,9 +3561,10 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
     direct_entries.reserve(expert_count);
     {
         std::unique_lock<std::shared_mutex> lock(rw_mutex_);
-        for (const ggml_sycl_cache_id & key : keys) {
-            const unified_cache_key cache_key = make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, layout);
-            auto                    old       = entries_.find(cache_key);
+        for (size_t i = 0; i < expert_count; ++i) {
+            const ggml_sycl_cache_id & key       = keys[i];
+            const unified_cache_key    cache_key = make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, layout);
+            auto                       old       = entries_.find(cache_key);
             if (old == entries_.end()) {
                 continue;
             }
@@ -3216,9 +3575,28 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
                     "name_hash=0x%llx leases=%u retired=%d\n",
                     (unsigned long long) key.model_id, (unsigned long long) key.name_hash, live,
                     old->second.retired ? 1 : 0);
+                if (live != 0) {
+                    residency_diagnostics_record_live_handle_for_test("direct-stage-tensor-bulk-replace", "WEIGHT",
+                                                                      old->second.size);
+                    residency_diagnostics_record_reject_for_test(residency_reject_reason::LIVE_LEASE_PRESSURE,
+                                                                 old->second.size, zone_available(vram_zone_id::WEIGHT),
+                                                                 zone_largest_free(vram_zone_id::WEIGHT));
+                }
+                defer_unpublished_bulk_until_event();
                 return result;
             }
         }
+        auto storage_owner =
+            std::shared_ptr<void>(allocation_base, [device = cache_device, fill_event](void * p) mutable {
+                if (!p || g_sycl_shutting_down.load(std::memory_order_acquire)) {
+                    return;
+                }
+                try {
+                    fill_event.wait_and_throw();
+                } catch (...) {
+                }
+                unified_cache_zone_free(device, vram_zone_id::WEIGHT, p);
+            });
         for (size_t i = 0; i < expert_count; ++i) {
             const ggml_sycl_cache_id & key      = keys[i];
             void *                     view_ptr = static_cast<uint8_t *>(allocation_base) + i * expert_dst_size;
@@ -3249,18 +3627,8 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
 
             auto old = entries_.find(cache_key);
             if (old != entries_.end() && old->second.device_ptr && old->second.device_ptr != view_ptr) {
-                const uint32_t live = old->second.in_use_count.load();
-                if (live != 0 || old->second.retired) {
-                    GGML_LOG_WARN(
-                        "[DIRECT-STAGE] unexpected tensor-bulk expert replacement conflict model=%llu "
-                        "name_hash=0x%llx leases=%u retired=%d\n",
-                        (unsigned long long) key.model_id, (unsigned long long) key.name_hash, live,
-                        old->second.retired ? 1 : 0);
-                    return result;
-                }
                 release_entry_allocation_locked(old->second);
             }
-
             entries_[cache_key] = std::move(entry);
             auto &       stored = entries_[cache_key];
             weight_entry direct_entry{};
@@ -3703,6 +4071,10 @@ bool unified_cache::drop_expert_entry(ggml_sycl_cache_id key, const char * reaso
                     const uint32_t live = entry.in_use_count.load();
                     if (live != 0) {
                         static std::atomic<int> refused_log{ 0 };
+                        residency_diagnostics_record_live_handle_for_test(reason ? reason : "drop_expert_entry",
+                                                                          "WEIGHT", entry.size);
+                        residency_diagnostics_record_reject_for_test(residency_reject_reason::LIVE_LEASE_PRESSURE,
+                                                                     entry.size, 0, 0);
                         if (refused_log.fetch_add(1, std::memory_order_relaxed) < 40) {
                             GGML_LOG_WARN(
                                 "[UNIFIED-CACHE] drop_expert_entry refused: model=%llu name_hash=0x%llx layout=%d "
@@ -3845,6 +4217,10 @@ size_t unified_cache::drop_expert_entries_for_tensor_layout(const std::vector<gg
                 }
                 unified_cache_entry & entry = it->second;
                 if (entry.in_use_count.load() != 0) {
+                    residency_diagnostics_record_live_handle_for_test("drop_expert_entries_for_tensor_layout", "WEIGHT",
+                                                                      entry.size);
+                    residency_diagnostics_record_reject_for_test(residency_reject_reason::LIVE_LEASE_PRESSURE,
+                                                                 entry.size, 0, 0);
                     skipped_in_use++;
                     continue;
                 }
@@ -4281,6 +4657,10 @@ void * unified_cache::allocate_slot(const ggml_sycl_cache_id & key,
                 "[UNIFIED-CACHE] allocate_slot refused reclaim: model=%llu name_hash=0x%llx "
                 "in_use=%u (returning nullptr so caller retries)\n",
                 (unsigned long long) key.model_id, (unsigned long long) key.name_hash, alloc_slot_leases);
+            residency_diagnostics_record_live_handle_for_test("allocate_slot", "WEIGHT", entry.size);
+            residency_diagnostics_record_reject_for_test(residency_reject_reason::LIVE_LEASE_PRESSURE, entry.size,
+                                                         zone_available(vram_zone_id::WEIGHT),
+                                                         zone_largest_free(vram_zone_id::WEIGHT));
             return nullptr;
         }
         if (entry.device_ptr) {
@@ -4847,13 +5227,20 @@ size_t unified_cache::evict_coldest_expert_group(const std::unordered_map<int64_
         if (entry_it == entries_.end()) {
             return { false, 0, 0, 0, false };
         }
-        const auto & e    = entry_it->second;
+        const auto &   e    = entry_it->second;
         // llama.cpp-vtf7f: treat live mem_handle leases as pinned for the
         // purposes of group eviction.  evict_expert_group() below issues
         // per-tensor remove() which itself refuses on in_use_count > 0, so
         // this is defence-in-depth — without it, the scoring loop might
         // select a leased group only to have the actual remove() skip.
-        const bool   held = e.pinned || e.in_use_count.load() > 0;
+        const uint32_t live = e.in_use_count.load();
+        if (live > 0) {
+            residency_diagnostics_record_live_handle_for_test("evict-coldest-expert-group-scan", "WEIGHT", e.size);
+            residency_diagnostics_record_reject_for_test(residency_reject_reason::LIVE_LEASE_PRESSURE, e.size,
+                                                         zone_available(vram_zone_id::WEIGHT),
+                                                         zone_largest_free(vram_zone_id::WEIGHT));
+        }
+        const bool held = e.pinned || live > 0;
         return { true, e.access_count, e.last_access, e.size, held };
     };
 
@@ -5229,6 +5616,10 @@ void unified_cache::remove(const ggml_sycl_cache_id & key_id,
         GGML_LOG_WARN("[UNIFIED-CACHE] remove refused: model=%llu name_hash=0x%llx layout=%d in_use=%u (entry kept)\n",
                       (unsigned long long) key_id.model_id, (unsigned long long) key_id.name_hash,
                       (int) it->second.layout, remove_leases);
+        residency_diagnostics_record_live_handle_for_test("remove", "WEIGHT", it->second.size);
+        residency_diagnostics_record_reject_for_test(residency_reject_reason::LIVE_LEASE_PRESSURE, it->second.size,
+                                                     zone_available(vram_zone_id::WEIGHT),
+                                                     zone_largest_free(vram_zone_id::WEIGHT));
         return;
     }
 
@@ -5784,6 +6175,10 @@ size_t unified_cache::evict_one(size_t /* new_size */) {
             GGML_SYCL_DEBUG("[UNIFIED-CACHE] evict skip: model=%llu name_hash=0x%llx layout=%d in_use=%u size=%zu\n",
                             (unsigned long long) pair.first.id.model_id, (unsigned long long) pair.first.id.name_hash,
                             (int) entry.layout, entry_leases, entry.size);
+            residency_diagnostics_record_live_handle_for_test("evict_one-scan", "WEIGHT", entry.size);
+            residency_diagnostics_record_reject_for_test(residency_reject_reason::LIVE_LEASE_PRESSURE, entry.size,
+                                                         zone_available(vram_zone_id::WEIGHT),
+                                                         zone_largest_free(vram_zone_id::WEIGHT));
             continue;
         }
 
@@ -5842,6 +6237,10 @@ size_t unified_cache::evict_one(size_t /* new_size */) {
                 "skipping to prevent UAF.  This is a bug; please report.\n",
                 (unsigned long long) evict_key.id.model_id, (unsigned long long) evict_key.id.name_hash,
                 (int) it->second.layout, live_leases, it->second.size);
+            residency_diagnostics_record_live_handle_for_test("evict_one-free-path", "WEIGHT", it->second.size);
+            residency_diagnostics_record_reject_for_test(residency_reject_reason::LIVE_LEASE_PRESSURE, it->second.size,
+                                                         zone_available(vram_zone_id::WEIGHT),
+                                                         zone_largest_free(vram_zone_id::WEIGHT));
             GGML_ASSERT(live_leases == 0 &&
                         "evict_one: attempted to free a WEIGHT entry with outstanding mem_handle leases");
             return 0;  // Unreachable if GGML_ASSERT aborts; fallback if asserts disabled.
@@ -5995,6 +6394,10 @@ size_t unified_cache::finalize_evictions_locked() {
                 "in_use=%u\n",
                 (unsigned long long) pair.first.id.model_id, (unsigned long long) pair.first.id.name_hash,
                 (int) entry.layout, live);
+            residency_diagnostics_record_live_handle_for_test("async-eviction-finalize", "WEIGHT", entry.size);
+            residency_diagnostics_record_reject_for_test(residency_reject_reason::LIVE_LEASE_PRESSURE, entry.size,
+                                                         zone_available(vram_zone_id::WEIGHT),
+                                                         zone_largest_free(vram_zone_id::WEIGHT));
             continue;
         }
 
@@ -6325,8 +6728,53 @@ void unified_cache::enqueue_deferred_free(const managed_alloc_ref & handle) {
     }
 
     deferred_frees_.push_back(entry);
-    GGML_SYCL_DEBUG("[UNIFIED-CACHE] deferred managed free: ptr=%p size=%zu alloc_id=%llu\n", handle.ptr, handle.size,
-                    static_cast<unsigned long long>(handle.alloc_id));
+    GGML_SYCL_DEBUG("[UNIFIED-CACHE] deferred managed free: ptr=%p size=%zu\n", handle.ptr, handle.size);
+}
+
+void unified_cache::enqueue_deferred_free(const managed_alloc_ref & handle, const sycl::event & event) {
+    if (handle.ptr == nullptr || handle.size == 0) {
+        return;
+    }
+
+    deferred_free_entry entry{};
+    entry.ptr     = handle.ptr;
+    entry.size    = handle.size;
+    entry.handle  = handle;
+    entry.managed = true;
+    try {
+        (void) event.get_info<sycl::info::event::command_execution_status>();
+        entry.has_event = true;
+        entry.event     = event;
+    } catch (...) {
+        entry.has_event = false;
+    }
+
+    deferred_frees_.push_back(entry);
+    GGML_SYCL_DEBUG("[UNIFIED-CACHE] deferred managed free after event: ptr=%p size=%zu alloc_id=%llu\n", handle.ptr,
+                    handle.size, static_cast<unsigned long long>(handle.alloc_id));
+}
+
+void unified_cache::enqueue_deferred_zone_free(vram_zone_id zone, void * ptr, size_t size, const sycl::event & event) {
+    if (!ptr || size == 0 || zone == vram_zone_id::COUNT) {
+        return;
+    }
+
+    deferred_free_entry entry{};
+    entry.ptr          = ptr;
+    entry.size         = size;
+    entry.zone_managed = true;
+    entry.zone         = zone;
+    try {
+        (void) event.get_info<sycl::info::event::command_execution_status>();
+        entry.has_event = true;
+        entry.event     = event;
+    } catch (...) {
+        entry.has_event = false;
+    }
+
+    deferred_frees_.push_back(entry);
+    GGML_SYCL_DEBUG("[UNIFIED-CACHE] deferred zone free after event: zone=%s ptr=%p size=%zu\n", arena_zone_name(zone),
+                    ptr, size);
 }
 
 void unified_cache::enqueue_deferred_host_free(void * ptr, size_t size, const sycl::event & event) {
@@ -6365,7 +6813,12 @@ size_t unified_cache::finalize_retired_entries_locked() {
         if (!entry.retired) {
             continue;
         }
-        if (entry.in_use_count.load() != 0) {
+        const uint32_t live = entry.in_use_count.load();
+        if (live != 0) {
+            residency_diagnostics_record_live_handle_for_test("finalize-retired-entry", "WEIGHT", entry.size);
+            residency_diagnostics_record_reject_for_test(residency_reject_reason::LIVE_LEASE_PRESSURE, entry.size,
+                                                         zone_available(vram_zone_id::WEIGHT),
+                                                         zone_largest_free(vram_zone_id::WEIGHT));
             continue;
         }
         if (entry.state == cache_entry_state::IN_PROGRESS) {
@@ -6428,7 +6881,11 @@ void unified_cache::process_deferred_frees() {
         if (it->ptr) {
             const bool is_arena = vram_owns(it->ptr);
             const bool is_pool  = !is_arena && layout_pool_ && layout_pool_->owns(it->ptr);
-            if (is_arena) {
+            if (it->zone_managed) {
+                if (it->zone != vram_zone_id::COUNT) {
+                    zone_free(it->zone, it->ptr);
+                }
+            } else if (is_arena) {
                 // Arena entries: just remove from deferred list, no sycl::free needed.
                 GGML_SYCL_DEBUG("[UNIFIED-CACHE] deferred free skip arena ptr=%p size=%zu\n", it->ptr, it->size);
             } else if (it->managed) {
@@ -6737,6 +7194,10 @@ void unified_cache::reset_model_weight_entries() {
             entries_seen++;
             if (live != 0) {
                 entries_preserved++;
+                residency_diagnostics_record_live_handle_for_test("reset_model_weight_entries", "WEIGHT", entry.size);
+                residency_diagnostics_record_reject_for_test(residency_reject_reason::LIVE_LEASE_PRESSURE, entry.size,
+                                                             zone_available(vram_zone_id::WEIGHT),
+                                                             zone_largest_free(vram_zone_id::WEIGHT));
                 GGML_LOG_ERROR(
                     "[UNIFIED-CACHE] reset_model_weight_entries found stale model weight with live mem_handle leases "
                     "model=%llu name_hash=0x%llx layout=%d leases=%u\n",
@@ -8197,6 +8658,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                         "[UNIFIED-ALLOC] KV arena zone full (need %.1f MB, avail %.1f MB), "
                         "falling back to host-pinned KV\n",
                         alloc_size / (1024.0 * 1024.0), cache->zone_available(vram_zone_id::KV) / (1024.0 * 1024.0));
+                    offload_stats_note_host_fallback_attempt(alloc_size);
                     kv_spill_to_host = true;
                 }
             }
@@ -8913,6 +9375,7 @@ unified_alloc_result unified_cache_allocate(int device, size_t size, alloc_categ
 
     // VRAM allocation failed — try host-pinned fallback for eligible categories.
     if (category_allows_host_fallback(category) && !req.intent.constraints.must_device) {
+        offload_stats_note_host_fallback_attempt(size);
         req.intent.constraints.must_host_pinned = true;
         req.intent.constraints.must_device      = false;
         if (unified_alloc(req, &handle)) {
@@ -8977,8 +9440,8 @@ bool unified_alloc_validate_registry(int device, const char * where) {
 void unified_cache_dump_live_zone_allocations(int device, vram_zone_id zone, const char * where, size_t max_entries) {
     unified_cache * cache = get_unified_cache_for_device(device);
     if (!cache) {
-        GGML_LOG_WARN("[UNIFIED-ALLOC] live-zone-dump%s%s device=%d zone=%d cache unavailable\n",
-                      where ? " at " : "", where ? where : "", device, static_cast<int>(zone));
+        GGML_LOG_WARN("[UNIFIED-ALLOC] live-zone-dump%s%s device=%d zone=%d cache unavailable\n", where ? " at " : "",
+                      where ? where : "", device, static_cast<int>(zone));
         return;
     }
     cache->dump_live_zone_allocations(zone, where, max_entries);
@@ -10766,6 +11229,7 @@ static void * unified_cache_malloc_device_tracked(size_t size, const sycl::queue
 
     const int dev_id = ggml_sycl_get_device_id_from_queue(const_cast<sycl::queue &>(queue));
     alloc_registry::instance().register_alloc(ptr, size, dev_id, alloc_type::DEVICE);
+    offload_stats_note_raw_device_alloc(size);
     ggml_sycl_alloc_trace_record("device", size, tag);
     if (size >= 1024 * 1024) {
         GGML_SYCL_DEBUG("[ALLOC] device %.1f MB  tag=%s\n", size / (1024.0f * 1024.0f), tag ? tag : "unknown");
@@ -10953,13 +11417,27 @@ void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
             // that pointer.  Fall through to "same layout" handling below.
             const uint32_t ensure_leases = it->second.in_use_count.load();
             if (ensure_leases > 0) {
+                residency_diagnostics_record_live_handle_for_test("ensure_cached_alloc-layout-switch", "WEIGHT",
+                                                                  it->second.size);
+                residency_diagnostics_record_reject_for_test(residency_reject_reason::LIVE_LEASE_PRESSURE,
+                                                             it->second.size, zone_available(vram_zone_id::WEIGHT),
+                                                             zone_largest_free(vram_zone_id::WEIGHT));
                 GGML_LOG_WARN(
                     "[UNIFIED-CACHE] ensure_cached_alloc: layout switch refused "
-                    "model=%llu name_hash=0x%llx in_use=%u have=%d want=%d (reusing old layout)\n",
+                    "model=%llu name_hash=0x%llx in_use=%u have=%d want=%d\n",
                     (unsigned long long) key_id.model_id, (unsigned long long) key_id.name_hash, ensure_leases,
                     (int) it->second.layout, (int) layout);
-                // Fall through: use existing entry as-is under its current layout.
+                if (needs_fill) {
+                    *needs_fill = false;
+                }
+                return nullptr;
             } else {
+                if (!can_replace_cache_entry_locked(key, it->second, "ensure_cached_alloc-layout-switch")) {
+                    if (needs_fill) {
+                        *needs_fill = false;
+                    }
+                    return nullptr;
+                }
                 if (it->second.pinned) {
                     GGML_SYCL_DEBUG(
                         "[UNIFIED-CACHE] layout switch: unpinning model=%llu name_hash=0x%llx have=%d want=%d\n",
@@ -10987,6 +11465,12 @@ void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
                 validate_content || (it->second.src_ptr != src_ptr) || (it->second.content_hash != new_hash);
 
             if (need_realloc) {
+                if (!can_replace_cache_entry_locked(key, it->second, "ensure_cached_alloc-realloc")) {
+                    if (needs_fill) {
+                        *needs_fill = false;
+                    }
+                    return nullptr;
+                }
                 const bool   was_pinned = it->second.pinned;
                 const size_t old_size   = it->second.size;
                 it->second.pinned       = true;
@@ -11045,6 +11529,14 @@ void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
                 it->second.cache_budget_charged = true;
                 used_.fetch_add(alloc_size, std::memory_order_relaxed);
                 content_changed = true;
+            }
+
+            if (!need_realloc && content_changed &&
+                !can_replace_cache_entry_locked(key, it->second, "ensure_cached_alloc-recopy")) {
+                if (needs_fill) {
+                    *needs_fill = false;
+                }
+                return nullptr;
             }
 
             it->second.src_ptr      = src_ptr;
@@ -11329,6 +11821,13 @@ unified_cache::vram_alloc_result unified_cache::allocate(size_t size, alloc_life
     }
 
     const char * label = tag ? tag : "unified_cache::allocate";
+    bool         host_fallback_counted = false;
+    auto         note_host_fallback_once = [&]() {
+        if (!host_fallback_counted) {
+            offload_stats_note_host_fallback_attempt(size);
+            host_fallback_counted = true;
+        }
+    };
 
     // Step 1: Check budget headroom (available() = budget_ - used_,
     // where budget_ = base_budget_ - reserved_, and reserved_ tracks
@@ -11344,6 +11843,7 @@ unified_cache::vram_alloc_result unified_cache::allocate(size_t size, alloc_life
                 "%.1f MB (need %.1f MB, avail %.1f MB)\n",
                 label, freed / (1024.0 * 1024.0), size / (1024.0 * 1024.0), available() / (1024.0 * 1024.0));
             try_device = false;
+            note_host_fallback_once();
         }
     }
 
@@ -11356,6 +11856,7 @@ unified_cache::vram_alloc_result unified_cache::allocate(size_t size, alloc_life
                 "(need %.1f MB, L0 avail %.1f MB), falling back\n",
                 label, size / (1024.0 * 1024.0), hw_avail / (1024.0 * 1024.0));
             try_device = false;
+            note_host_fallback_once();
         }
     }
 
@@ -11382,6 +11883,8 @@ unified_cache::vram_alloc_result unified_cache::allocate(size_t size, alloc_life
         managed_allocs_[ptr] = { size, true, false, host_zone_id::COUNT, lifetime };
         return result;
     }
+
+    note_host_fallback_once();
 
     // Step 4: Host-pinned fallback — route through the pre-allocated pinned pool.
     // All host-pinned memory is pre-allocated at init; zero runtime malloc_host.
@@ -13595,8 +14098,38 @@ size_t unified_cache::zone_available(vram_zone_id zone) const {
     return z.size > used ? z.size - used : 0;
 }
 
+residency_plan unified_cache::reserve_residency(const residency_request & req) {
+    residency_budget budget;
+    if (arena_active()) {
+        budget.bytes_available    = zone_available(vram_zone_id::WEIGHT);
+        budget.largest_free_block = zone_largest_free(vram_zone_id::WEIGHT);
+    } else {
+        budget.bytes_available    = available();
+        budget.largest_free_block = budget.bytes_available;
+    }
+
+    residency_plan plan = evaluate_residency_budget(req, budget);
+    validate_residency_plan_handles(req, plan);
+    if (plan.accepted) {
+        residency_diagnostics_record_accept_for_test(plan.bytes_requested, plan.bytes_available,
+                                                     plan.largest_free_block);
+        return plan;
+    }
+
+    residency_diagnostics_record_reject_for_test(plan.reason, plan.bytes_requested, plan.bytes_available,
+                                                 plan.largest_free_block);
+    fprintf(stderr,
+            "[SYCL-RESIDENCY] reject name=%s device=%d phase=%d reason=%s requested=%.1f MB "
+            "available=%.1f MB largest_free=%.1f MB\n",
+            req.debug_name ? req.debug_name : "", req.device, static_cast<int>(req.phase),
+            residency_reject_reason_name(plan.reason), plan.bytes_requested / (1024.0 * 1024.0),
+            plan.bytes_available / (1024.0 * 1024.0), plan.largest_free_block / (1024.0 * 1024.0));
+    fflush(stderr);
+    return plan;
+}
+
 void unified_cache::dump_live_zone_allocations(vram_zone_id zone, const char * where, size_t max_entries) const {
-    const auto & z = arena_zones_[static_cast<int>(zone)];
+    const auto & z             = arena_zones_[static_cast<int>(zone)];
     const void * zone_base_ptr = (arena_base_ && z.size > 0) ? offset_to_ptr(z.start) : nullptr;
     const auto   zone_base     = reinterpret_cast<uintptr_t>(zone_base_ptr);
     const auto   zone_hi       = zone_base + z.size;
@@ -13606,20 +14139,19 @@ void unified_cache::dump_live_zone_allocations(vram_zone_id zone, const char * w
     const int    cache_device  = ggml_sycl_get_device_id_from_queue(queue_);
 
     fprintf(stderr,
-        "[UNIFIED-ALLOC] live-zone-dump%s%s device=%d zone=%d used=%.1f MB available=%.1f MB "
-        "capacity=%.1f MB largest_free=%.1f MB base=%p\n",
-        where ? " at " : "", where ? where : "", cache_device, static_cast<int>(zone), used / (1024.0 * 1024.0),
-        available / (1024.0 * 1024.0), z.size / (1024.0 * 1024.0), largest_free / (1024.0 * 1024.0),
-        zone_base_ptr);
+            "[UNIFIED-ALLOC] live-zone-dump%s%s device=%d zone=%d used=%.1f MB available=%.1f MB "
+            "capacity=%.1f MB largest_free=%.1f MB base=%p\n",
+            where ? " at " : "", where ? where : "", cache_device, static_cast<int>(zone), used / (1024.0 * 1024.0),
+            available / (1024.0 * 1024.0), z.size / (1024.0 * 1024.0), largest_free / (1024.0 * 1024.0), zone_base_ptr);
     fflush(stderr);
 
     if (!zone_base_ptr || z.size == 0) {
         return;
     }
 
-    size_t total_count = 0;
-    size_t total_bytes = 0;
-    size_t logged      = 0;
+    size_t                      total_count = 0;
+    size_t                      total_bytes = 0;
+    size_t                      logged      = 0;
     std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
     for (const auto & kv : g_runtime_alloc_registry) {
         const runtime_alloc_record & rec = kv.second;
@@ -15438,8 +15970,8 @@ static size_t maybe_upgrade_moe_down_layouts_to_i8(placement_plan & plan,
         size_t              extra_bytes  = 0;
         size_t              extra_charge = 0;
     };
-    const bool prompt_down_uses_transient_soa = !plan.multi_device &&
-                                                planner_moe_prompt_down_transient_soa_enabled() &&
+
+    const bool prompt_down_uses_transient_soa = !plan.multi_device && planner_moe_prompt_down_transient_soa_enabled() &&
                                                 !planner_moe_prompt_down_specialized_layouts_enabled();
 
     std::map<std::string, down_candidate> by_tensor;

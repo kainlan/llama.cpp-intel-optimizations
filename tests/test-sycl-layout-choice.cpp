@@ -915,6 +915,68 @@ static bool run_single_device_moe_pp_complete_soa_layout_test() {
     return true;
 }
 
+static bool run_moe_decode_down_phase_split_policy_test() {
+    ggml_sycl::test_moe_decode_down_layout_policy_input in{};
+    in.n_tokens                          = 1;
+    in.selected_dpas_materialize_enabled = true;
+    in.effective_layout_is_dpas          = false;
+    in.explicit_decode_dpas_enabled      = false;
+    auto result = ggml_sycl::test_moe_decode_down_layout_policy(in);
+    if (result.layout != GGML_LAYOUT_SOA || std::strcmp(result.reason, "decode-dpas-requires-explicit-env") != 0) {
+        printf("FAIL: selected DPAS materialization alone must not select decode DPAS, got layout=%d reason=%s\n",
+               (int) result.layout, result.reason);
+        return false;
+    }
+
+    in.selected_dpas_materialize_enabled = false;
+    in.effective_layout_is_dpas          = true;
+    result                               = ggml_sycl::test_moe_decode_down_layout_policy(in);
+    if (result.layout != GGML_LAYOUT_SOA || std::strcmp(result.reason, "decode-dpas-requires-explicit-env") != 0) {
+        printf("FAIL: effective planner DPAS alone must not select decode DPAS, got layout=%d reason=%s\n",
+               (int) result.layout, result.reason);
+        return false;
+    }
+
+    in.explicit_decode_dpas_enabled = true;
+    result                          = ggml_sycl::test_moe_decode_down_layout_policy(in);
+    if (result.layout != GGML_LAYOUT_MXFP4_DPAS || std::strcmp(result.reason, "decode-dpas-explicit") != 0) {
+        printf("FAIL: explicit decode DPAS env should allow eligible DPAS, got layout=%d reason=%s\n",
+               (int) result.layout, result.reason);
+        return false;
+    }
+
+    in.dpas_shape_eligible = false;
+    result                 = ggml_sycl::test_moe_decode_down_layout_policy(in);
+    if (result.layout != GGML_LAYOUT_SOA || std::strcmp(result.reason, "decode-dpas-shape") != 0) {
+        printf("FAIL: explicit decode DPAS must still reject ineligible shape, got layout=%d reason=%s\n",
+               (int) result.layout, result.reason);
+        return false;
+    }
+
+    in.dpas_shape_eligible               = true;
+    in.decode_i8_candidate               = true;
+    in.effective_layout_is_dpas          = false;
+    in.selected_dpas_materialize_enabled = false;
+    in.explicit_decode_dpas_enabled      = false;
+    result                               = ggml_sycl::test_moe_decode_down_layout_policy(in);
+    if (result.layout != GGML_LAYOUT_MXFP4_I8 || std::strcmp(result.reason, "decode-i8-selected") != 0) {
+        printf("FAIL: existing decode I8 candidate should remain selected, got layout=%d reason=%s\n",
+               (int) result.layout, result.reason);
+        return false;
+    }
+
+    in.selected_dpas_materialize_enabled = true;
+    in.explicit_decode_dpas_enabled      = true;
+    result                               = ggml_sycl::test_moe_decode_down_layout_policy(in);
+    if (result.layout != GGML_LAYOUT_MXFP4_DPAS || std::strcmp(result.reason, "decode-dpas-explicit") != 0) {
+        printf("FAIL: explicit decode DPAS should take precedence over I8 candidate, got layout=%d reason=%s\n",
+               (int) result.layout, result.reason);
+        return false;
+    }
+
+    return true;
+}
+
 static bool run_multi_device_no_p2p_cohesive_moe_layer_test() {
     constexpr size_t mib       = 1024u * 1024u;
     constexpr int    n_experts = 2;
@@ -1376,6 +1438,9 @@ int main() {
             return 1;
         }
         if (!run_single_device_moe_pp_complete_soa_layout_test()) {
+            return 1;
+        }
+        if (!run_moe_decode_down_phase_split_policy_test()) {
             return 1;
         }
         if (!run_multi_device_no_p2p_cohesive_moe_layer_test()) {

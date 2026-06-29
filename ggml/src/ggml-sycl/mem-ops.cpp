@@ -165,7 +165,11 @@ static bool alloc_pinned_stage_handle(size_t           size,
     req.intent.cohort_id                    = cohort_id ? cohort_id : "mem-copy-stage";
     req.intent.constraints.must_host_pinned = true;
     req.intent.constraints.use_pinned_pool  = true;
-    req.intent.constraints.require_host_usm_base = require_host_usm_base;
+    // A command graph captures the staging pointer in its memcpy node and may
+    // replay it after graph-boundary host-zone resets.  Keep graph-recorded
+    // staging allocations as standalone unified-cache-owned host USM bases
+    // rather than reset-scoped SCRATCH/STAGING zone slices.
+    req.intent.constraints.require_host_usm_base = require_host_usm_base || ggml_sycl_graph_recording_active();
 
     *out = unified_allocate(req);
     if (!out->valid()) {
