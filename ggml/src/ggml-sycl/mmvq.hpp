@@ -185,6 +185,42 @@ enum class mxfp4_moe_gateup_prepack_status : uint8_t {
 
 const char * mxfp4_moe_gateup_prepack_status_name(mxfp4_moe_gateup_prepack_status status);
 bool         mxfp4_moe_gateup_prepack_enabled_from_env(const char * env);
+const char * mxfp4_moe_gateup_prepack_route_label();
+
+struct mxfp4_moe_gateup_prepack_runtime_policy_input {
+    const char * env                         = nullptr;
+    int64_t      ne12                        = 0;
+    int          layer                       = -1;
+    int64_t      selected_entries            = 0;
+    int64_t      selected_batches            = 0;
+    bool         metadata_complete           = false;
+    bool         metadata_deterministic      = false;
+    bool         gate_handle_valid           = false;
+    bool         gate_handle_device          = false;
+    bool         up_handle_valid             = false;
+    bool         up_handle_device            = false;
+    bool         source_handle_valid         = false;
+    bool         source_handle_device        = false;
+    bool         route_metadata_handle_valid  = false;
+    bool         route_metadata_handle_device = false;
+    bool         scratch_handle_valid         = false;
+    bool         scratch_handle_device       = false;
+    size_t       scratch_required_bytes      = 0;
+    size_t       scratch_capacity_bytes      = 0;
+    bool         graph_recording             = false;
+    bool         direct_down_sum_compatible  = false;
+    bool         prepack_supported           = false;
+    bool         compute_supported           = false;
+};
+
+struct mxfp4_moe_gateup_prepack_runtime_policy_result {
+    bool         accepted       = false;
+    const char * reason         = "env";
+    const char * selected_route = "fallback";
+};
+
+mxfp4_moe_gateup_prepack_runtime_policy_result mxfp4_moe_gateup_prepack_runtime_policy(
+    const mxfp4_moe_gateup_prepack_runtime_policy_input & in);
 
 struct mxfp4_moe_gateup_prepack_layout {
     int64_t selected_count           = 0;
@@ -221,6 +257,8 @@ struct mxfp4_moe_gateup_prepack_request {
     uint8_t *                                     scratch                  = nullptr;
     size_t                                        scratch_bytes            = 0;
     const int32_t *                               selected_experts         = nullptr;
+    const int32_t *                               selected_experts_host    = nullptr;
+    uint64_t                                      selected_experts_hash    = 0;
     int64_t                                       selected_count           = 0;
     int64_t                                       n_experts                = 0;
     int64_t                                       nrows_per_expert         = 0;

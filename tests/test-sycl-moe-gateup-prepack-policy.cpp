@@ -1,4 +1,5 @@
 #include "ggml-sycl/ggml-sycl-test.hpp"
+#include "ggml-sycl/mmvq.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -130,6 +131,76 @@ static int test_rejects_metadata_handle_capacity_and_graph_recording() {
     return 0;
 }
 
+static ggml_sycl::mxfp4_moe_gateup_prepack_runtime_policy_input base_runtime_input() {
+    ggml_sycl::mxfp4_moe_gateup_prepack_runtime_policy_input in{};
+    in.env                          = "1";
+    in.ne12                         = 1;
+    in.layer                        = 7;
+    in.selected_entries             = 4;
+    in.selected_batches             = 4;
+    in.metadata_complete            = true;
+    in.metadata_deterministic       = true;
+    in.gate_handle_valid            = true;
+    in.gate_handle_device           = true;
+    in.up_handle_valid              = true;
+    in.up_handle_device             = true;
+    in.source_handle_valid          = true;
+    in.source_handle_device         = true;
+    in.route_metadata_handle_valid  = true;
+    in.route_metadata_handle_device = true;
+    in.scratch_handle_valid         = true;
+    in.scratch_handle_device        = true;
+    in.scratch_required_bytes       = 2048;
+    in.scratch_capacity_bytes       = 4096;
+    in.graph_recording              = false;
+    in.direct_down_sum_compatible   = true;
+    in.prepack_supported            = true;
+    in.compute_supported            = true;
+    return in;
+}
+
+static int test_runtime_policy_contract() {
+    CHECK(std::strcmp(ggml_sycl::mxfp4_moe_gateup_prepack_route_label(), "gateup-prepack-dpas") == 0,
+          "runtime route label must identify gate/up prepack DPAS path");
+
+    auto in = base_runtime_input();
+    in.env  = nullptr;
+    auto out = ggml_sycl::mxfp4_moe_gateup_prepack_runtime_policy(in);
+    CHECK(!out.accepted, "runtime policy must preserve default-off fallback");
+    CHECK(std::strcmp(out.reason, "env") == 0, "runtime default-off reason must be env");
+    CHECK(std::strcmp(out.selected_route, "fallback") == 0, "env-off must not select a new route");
+
+    out = ggml_sycl::mxfp4_moe_gateup_prepack_runtime_policy(base_runtime_input());
+    CHECK(out.accepted, "runtime policy must accept valid opt-in input");
+    CHECK(std::strcmp(out.selected_route, "gateup-prepack-dpas") == 0,
+          "accepted runtime route label must be gateup-prepack-dpas");
+
+    in                              = base_runtime_input();
+    in.direct_down_sum_compatible  = false;
+    out                             = ggml_sycl::mxfp4_moe_gateup_prepack_runtime_policy(in);
+    CHECK(!out.accepted && std::strcmp(out.reason, "down-sum") == 0,
+          "missing direct down-sum compatibility must reject before route selection");
+
+    in                    = base_runtime_input();
+    in.prepack_supported  = false;
+    out                   = ggml_sycl::mxfp4_moe_gateup_prepack_runtime_policy(in);
+    CHECK(!out.accepted && std::strcmp(out.reason, "prepack") == 0,
+          "prepack failure must reject before publishing route artifacts");
+
+    in                   = base_runtime_input();
+    in.compute_supported = false;
+    out                  = ggml_sycl::mxfp4_moe_gateup_prepack_runtime_policy(in);
+    CHECK(!out.accepted && std::strcmp(out.reason, "compute") == 0,
+          "compute submission preflight failure must reject before route selection");
+
+    in                             = base_runtime_input();
+    in.route_metadata_handle_valid = false;
+    out                            = ggml_sycl::mxfp4_moe_gateup_prepack_runtime_policy(in);
+    CHECK(!out.accepted && std::strcmp(out.reason, "handle") == 0,
+          "missing route metadata handle must reject as handle failure");
+    return 0;
+}
+
 static int test_accepts_valid_enabled_case_and_counts() {
     ggml_sycl::test_moe_gateup_prepack_policy_counters_reset();
     auto out = ggml_sycl::test_moe_gateup_prepack_policy(base_input());
@@ -159,6 +230,9 @@ int main() {
         return 1;
     }
     if (test_accepts_valid_enabled_case_and_counts() != 0) {
+        return 1;
+    }
+    if (test_runtime_policy_contract() != 0) {
         return 1;
     }
     std::puts("PASS: MoE gate/up prepack policy");
