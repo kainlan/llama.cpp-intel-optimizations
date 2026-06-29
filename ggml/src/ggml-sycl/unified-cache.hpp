@@ -144,6 +144,78 @@ inline expert_tensor_role expert_tensor_role_from_tensor_name(const char * name)
     return expert_tensor_role::UNKNOWN;
 }
 
+struct mxfp4_moe_single_gateup_layout_policy_input {
+    const char *       env_value        = nullptr;
+    ggml_type          type             = GGML_TYPE_COUNT;
+    expert_tensor_role role             = expert_tensor_role::UNKNOWN;
+    ggml_layout_mode   requested_layout = GGML_LAYOUT_AOS;
+    bool               device_resident  = false;
+    bool               xmx_int8_ok      = false;
+    bool               shape_aligned    = false;
+    size_t             pp_rows          = 0;
+    bool               pp_supported     = false;
+    bool               tg_supported     = false;
+};
+
+struct mxfp4_moe_single_gateup_layout_policy_result {
+    bool             accepted               = false;
+    bool             requires_soa_alternate = true;
+    ggml_layout_mode layout                 = GGML_LAYOUT_SOA;
+    const char *     reason                 = "env";
+    const char *     route_label            = "fallback";
+};
+
+static inline bool mxfp4_moe_single_gateup_layout_env_enabled(const char * env_value) {
+    return env_value != nullptr && std::atoi(env_value) != 0;
+}
+
+static inline bool mxfp4_moe_gateup_role(expert_tensor_role role) {
+    return role == expert_tensor_role::GATE || role == expert_tensor_role::UP;
+}
+
+static inline mxfp4_moe_single_gateup_layout_policy_result mxfp4_moe_single_gateup_layout_policy(
+    const mxfp4_moe_single_gateup_layout_policy_input & in) {
+    mxfp4_moe_single_gateup_layout_policy_result out{};
+    if (!mxfp4_moe_single_gateup_layout_env_enabled(in.env_value)) {
+        out.reason = "env";
+        return out;
+    }
+    if (in.type != GGML_TYPE_MXFP4) {
+        out.reason = "type";
+        return out;
+    }
+    if (!mxfp4_moe_gateup_role(in.role)) {
+        out.reason = "role";
+        return out;
+    }
+    if (in.requested_layout != GGML_LAYOUT_XMX_TILED) {
+        out.reason = "layout";
+        return out;
+    }
+    if (!in.device_resident || !in.xmx_int8_ok) {
+        out.reason = "device";
+        return out;
+    }
+    if (!in.shape_aligned) {
+        out.reason = "shape";
+        return out;
+    }
+    if (in.pp_rows > 1 && !in.pp_supported) {
+        out.reason = "pp";
+        return out;
+    }
+    if (!in.tg_supported) {
+        out.reason = "tg";
+        return out;
+    }
+    out.accepted               = true;
+    out.requires_soa_alternate = false;
+    out.layout                 = GGML_LAYOUT_XMX_TILED;
+    out.reason                 = "none";
+    out.route_label            = "xmx-tiled-single-gateup";
+    return out;
+}
+
 inline int expert_layer_from_tensor_name(const char * name) {
     if (!name) {
         return -1;
