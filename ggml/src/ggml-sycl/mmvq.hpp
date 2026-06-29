@@ -193,19 +193,19 @@ bool         mxfp4_moe_gateup_prepack_enabled_from_env(const char * env);
 const char * mxfp4_moe_gateup_prepack_route_label();
 
 struct mxfp4_moe_gateup_prepack_runtime_policy_input {
-    const char * env                         = nullptr;
-    int64_t      ne12                        = 0;
-    int          layer                       = -1;
-    int64_t      selected_entries            = 0;
-    int64_t      selected_batches            = 0;
-    bool         metadata_complete           = false;
-    bool         metadata_deterministic      = false;
-    bool         gate_handle_valid           = false;
-    bool         gate_handle_device          = false;
-    bool         up_handle_valid             = false;
-    bool         up_handle_device            = false;
-    bool         source_handle_valid         = false;
-    bool         source_handle_device        = false;
+    const char * env                            = nullptr;
+    int64_t      ne12                           = 0;
+    int          layer                          = -1;
+    int64_t      selected_entries               = 0;
+    int64_t      selected_batches               = 0;
+    bool         metadata_complete              = false;
+    bool         metadata_deterministic         = false;
+    bool         gate_handle_valid              = false;
+    bool         gate_handle_device             = false;
+    bool         up_handle_valid                = false;
+    bool         up_handle_device               = false;
+    bool         source_handle_valid            = false;
+    bool         source_handle_device           = false;
     bool         route_metadata_handle_valid    = false;
     bool         route_metadata_handle_device   = false;
     bool         scratch_handle_valid           = false;
@@ -258,32 +258,31 @@ struct mxfp4_moe_gateup_prepack_key {
 };
 
 struct mxfp4_moe_gateup_prepack_request {
-    const moe_gateup_prepack_scratch_descriptor * descriptor               = nullptr;
-    mxfp4_moe_gateup_prepack_source_kind          source_kind              =
-        mxfp4_moe_gateup_prepack_source_kind::BASE_ARRAY;
-    const uint8_t *                               gate_base                = nullptr;
-    const uint8_t *                               up_base                  = nullptr;
-    const uint8_t * const *                       gate_ptrs                = nullptr;
-    const uint8_t * const *                       up_ptrs                  = nullptr;
-    bool                                          expert_ptrs_on_device    = false;
-    uint8_t *                                     scratch                  = nullptr;
-    size_t                                        scratch_bytes            = 0;
-    const int32_t *                               selected_experts         = nullptr;
-    const int32_t *                               selected_experts_host    = nullptr;
-    uint64_t                                      selected_experts_hash    = 0;
-    int64_t                                       selected_count           = 0;
-    int64_t                                       n_experts                = 0;
-    int64_t                                       nrows_per_expert         = 0;
-    int64_t                                       ncols                    = 0;
-    int                                           layer                    = -1;
-    int                                           submit_device            = -1;
-    uint64_t                                      route_metadata_signature = 0;
+    const moe_gateup_prepack_scratch_descriptor * descriptor  = nullptr;
+    mxfp4_moe_gateup_prepack_source_kind          source_kind = mxfp4_moe_gateup_prepack_source_kind::BASE_ARRAY;
+    const uint8_t *                               gate_base   = nullptr;
+    const uint8_t *                               up_base     = nullptr;
+    const uint8_t * const *                       gate_ptrs   = nullptr;
+    const uint8_t * const *                       up_ptrs     = nullptr;
+    bool                                          expert_ptrs_on_device        = false;
+    uint8_t *                                     scratch                      = nullptr;
+    size_t                                        scratch_bytes                = 0;
+    const int32_t *                               selected_experts             = nullptr;
+    const int32_t *                               selected_experts_host        = nullptr;
+    uint64_t                                      selected_experts_hash        = 0;
+    int64_t                                       selected_count               = 0;
+    int64_t                                       n_experts                    = 0;
+    int64_t                                       nrows_per_expert             = 0;
+    int64_t                                       ncols                        = 0;
+    int                                           layer                        = -1;
+    int                                           submit_device                = -1;
+    uint64_t                                      route_metadata_signature     = 0;
     size_t                                        gate_identity_hash           = 0;
     size_t                                        up_identity_hash             = 0;
     size_t                                        gate_ptr_table_identity_hash = 0;
     size_t                                        up_ptr_table_identity_hash   = 0;
     size_t                                        scratch_identity_hash        = 0;
-    bool                                          env_enabled              = false;
+    bool                                          env_enabled                  = false;
 };
 
 struct mxfp4_moe_gateup_prepack_result {
