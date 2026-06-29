@@ -1,20 +1,6 @@
 #include "tg_bench_common.hpp"
 
-#include <cmath>
-
 namespace sycl_mxfp4_moe_bench {
-
-[[maybe_unused]] static float swiglu(float gate, float up) {
-    return up * gate / (1.0f + std::exp(-gate));
-}
-
-[[maybe_unused]] static float row_dot_i8_f32(const int8_t * w, const float * x, int64_t n) {
-    float acc = 0.0f;
-    for (int64_t i = 0; i < n; ++i) {
-        acc += static_cast<float>(w[i]) * x[i];
-    }
-    return acc;
-}
 
 static bench_record make_row_parallel_record(const bench_config & cfg,
                                              const char *         mode,
