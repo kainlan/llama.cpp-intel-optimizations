@@ -69,10 +69,9 @@ def validate_record(record: Any, index: int) -> dict[str, Any]:
     if total_gateup <= 0.0:
         raise ValueError(f"record {index} has non-positive metrics.total_gateup_equiv_ms")
 
-    try:
-        fatal_total = int(fatal["total"])
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"record {index} has invalid fatal.total") from exc
+    fatal_total = fatal["total"]
+    if isinstance(fatal_total, bool) or not isinstance(fatal_total, (int, float)):
+        raise ValueError(f"record {index} has invalid fatal.total")
     if fatal_total != 0:
         raise ValueError(f"record {index} fatal.total is non-zero")
 

@@ -84,6 +84,14 @@ def test_rejects_fatal_marker(tmp_path: Path) -> None:
     assert "error: record 1 fatal.total is non-zero" in result.stderr
 
 
+def test_rejects_fractional_fatal_marker(tmp_path: Path) -> None:
+    record = valid_record()
+    record["fatal"]["total"] = 0.5
+    result = run_parser(write_jsonl(tmp_path, [record]))
+    assert result.returncode != 0
+    assert "error: record 1 fatal.total is non-zero" in result.stderr
+
+
 def test_requires_named_route(tmp_path: Path) -> None:
     result = run_parser(write_jsonl(tmp_path, [valid_record("row-parallel")]), "--require-route", "baseline")
     assert result.returncode != 0
