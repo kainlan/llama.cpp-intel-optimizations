@@ -39,6 +39,22 @@ static bool prepack_row_to_i8_vnni32_self_check() {
     return true;
 }
 
+static bench_record make_prepack_record(const bench_config & cfg,
+                                        const char * mode,
+                                        double prepack_us,
+                                        double compute_us,
+                                        double total_ms) {
+    bench_record rec = dry_run_record(cfg, "prepack", "selected-expert-prepack", total_ms);
+    rec.mode = mode;
+    rec.prepack_us = prepack_us;
+    rec.compute_us = compute_us;
+    rec.saving_vs_baseline_ms = 6.0 - total_ms;
+    rec.p50_us = total_ms * 1000.0;
+    rec.p90_us = total_ms * 1000.0;
+    rec.p99_us = total_ms * 1000.0;
+    return rec;
+}
+
 bool run_route_prepack(const bench_config & cfg, std::vector<bench_record> & records, std::string & error) {
     if (!cfg.dry_run) {
         error = "route prepack requires a route-specific implementation before non-dry-run execution";
@@ -49,13 +65,9 @@ bool run_route_prepack(const bench_config & cfg, std::vector<bench_record> & rec
         return false;
     }
 
-    bench_record rec = dry_run_record(cfg, "prepack", "selected-expert-prepack", 6.0);
-    rec.prepack_us = 1200.0;
-    rec.compute_us = 0.0;
-    rec.p50_us     = 1200.0;
-    rec.p90_us     = 1200.0;
-    rec.p99_us     = 1200.0;
-    records.push_back(rec);
+    records.push_back(make_prepack_record(cfg, "prepack-only", 1200.0, 0.0, 6.0));
+    records.push_back(make_prepack_record(cfg, "compute-only", 0.0, 2500.0, 2.5));
+    records.push_back(make_prepack_record(cfg, "cache-combined", 200.0, 2500.0, 2.7));
     return true;
 }
 
