@@ -292,6 +292,43 @@ test_moe_glu_q8_fused_store_result   test_moe_glu_q8_fused_store_policy(const te
 void                                 test_moe_glu_q8_fused_store_counters_reset();
 test_moe_glu_q8_fused_store_counters test_moe_glu_q8_fused_store_counters_snapshot();
 
+struct test_moe_gateup_prepack_policy_input {
+    const char * prepack_env             = nullptr;
+    int64_t      ne12                    = 0;
+    int          layer                   = -1;
+    int64_t      selected_entries        = 0;
+    int64_t      selected_batches        = 0;
+    bool         metadata_complete       = false;
+    bool         metadata_deterministic  = false;
+    bool         gate_handle_valid       = false;
+    bool         gate_handle_device      = false;
+    bool         up_handle_valid         = false;
+    bool         up_handle_device        = false;
+    bool         scratch_handle_valid    = false;
+    size_t       scratch_required_bytes  = 0;
+    size_t       scratch_capacity_bytes  = 0;
+    bool         graph_recording         = false;
+};
+
+struct test_moe_gateup_prepack_policy_result {
+    bool         accepted       = false;
+    const char * reason         = "none";
+    const char * selected_route = "fallback";
+};
+
+struct test_moe_gateup_prepack_policy_counters {
+    uint64_t candidates = 0;
+    uint64_t accepted   = 0;
+    uint64_t rejected   = 0;
+};
+
+const char *                             test_moe_gateup_prepack_env_name();
+bool                                     test_moe_gateup_prepack_enabled_from_env(const char * env);
+test_moe_gateup_prepack_policy_result   test_moe_gateup_prepack_policy(
+    const test_moe_gateup_prepack_policy_input & in);
+void                                     test_moe_gateup_prepack_policy_counters_reset();
+test_moe_gateup_prepack_policy_counters test_moe_gateup_prepack_policy_counters_snapshot();
+
 size_t           test_arena_external_headroom_bytes(size_t device_total_vram, size_t budget_bytes);
 uint32_t         test_pp_moe_onednn_effective_ring_depth(uint32_t requested_ring_depth);
 size_t           test_pp_moe_onednn_planned_scratch_bytes(size_t   weight_slot_bytes,
