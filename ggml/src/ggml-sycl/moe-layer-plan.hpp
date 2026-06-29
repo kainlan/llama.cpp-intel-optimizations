@@ -359,6 +359,178 @@ struct moe_layer_persistent_descriptor {
     }
 };
 
+enum class moe_gateup_prepack_artifact_role : uint8_t {
+    SOURCE_ACTIVATION = 0,
+    GATE_WEIGHT       = 1,
+    UP_WEIGHT         = 2,
+    SCRATCH           = 3,
+    ROUTE_METADATA    = 4,
+};
+
+inline const char * moe_gateup_prepack_artifact_role_name(moe_gateup_prepack_artifact_role role) {
+    switch (role) {
+        case moe_gateup_prepack_artifact_role::SOURCE_ACTIVATION:
+            return "source-activation";
+        case moe_gateup_prepack_artifact_role::GATE_WEIGHT:
+            return "gate-weight";
+        case moe_gateup_prepack_artifact_role::UP_WEIGHT:
+            return "up-weight";
+        case moe_gateup_prepack_artifact_role::SCRATCH:
+            return "scratch";
+        case moe_gateup_prepack_artifact_role::ROUTE_METADATA:
+            return "route-metadata";
+    }
+    return "unknown";
+}
+
+struct moe_gateup_prepack_scratch_artifact {
+    moe_gateup_prepack_artifact_role role = moe_gateup_prepack_artifact_role::SOURCE_ACTIVATION;
+    mem_handle                       handle;
+    size_t                           bytes                = 0;
+    int                              device               = mem_handle::HOST_DEVICE;
+    size_t                           stable_identity_hash = 0;
+};
+
+class moe_gateup_prepack_scratch_descriptor {
+  public:
+    void configure(int      layer,
+                   int      submit_device,
+                   int64_t  selected_entries,
+                   int64_t  selected_batches,
+                   size_t   scratch_bytes,
+                   uint64_t route_metadata_signature) {
+        layer_                    = layer;
+        submit_device_            = submit_device;
+        selected_entries_         = selected_entries;
+        selected_batches_         = selected_batches;
+        scratch_bytes_            = scratch_bytes;
+        route_metadata_signature_ = route_metadata_signature;
+    }
+
+    bool add_artifact(moe_gateup_prepack_artifact_role role, const mem_handle & handle, size_t bytes = 0) {
+        if (!handle.has_stable_owner_identity()) {
+            return false;
+        }
+
+        moe_gateup_prepack_scratch_artifact artifact;
+        artifact.role                 = role;
+        artifact.handle               = handle;
+        artifact.bytes                = bytes;
+        artifact.device               = handle.device();
+        artifact.stable_identity_hash = handle.stable_identity_hash();
+        artifacts_.push_back(artifact);
+        return true;
+    }
+
+    bool add_dependency(const sycl::event & event) {
+        deps_.push_back(event);
+        return true;
+    }
+
+    void reset() {
+        layer_                    = -1;
+        submit_device_            = -1;
+        selected_entries_         = 0;
+        selected_batches_         = 0;
+        scratch_bytes_            = 0;
+        route_metadata_signature_ = 0;
+        artifacts_.clear();
+        deps_.clear();
+    }
+
+    bool empty() const { return artifacts_.empty() && deps_.empty(); }
+
+    bool valid() const {
+        return layer_ >= 0 && submit_device_ >= 0 && selected_entries_ > 0 && selected_batches_ > 0 &&
+               scratch_bytes_ > 0 && route_metadata_signature_ != 0 && has_artifact(source_role()) &&
+               has_artifact(moe_gateup_prepack_artifact_role::GATE_WEIGHT) &&
+               has_artifact(moe_gateup_prepack_artifact_role::UP_WEIGHT) &&
+               has_artifact(moe_gateup_prepack_artifact_role::SCRATCH) &&
+               has_artifact(moe_gateup_prepack_artifact_role::ROUTE_METADATA);
+    }
+
+    size_t retained_handle_count() const { return artifacts_.size(); }
+
+    size_t dependency_count() const { return deps_.size(); }
+
+    size_t artifact_count(moe_gateup_prepack_artifact_role role) const {
+        size_t n = 0;
+        for (const moe_gateup_prepack_scratch_artifact & artifact : artifacts_) {
+            if (artifact.role == role) {
+                ++n;
+            }
+        }
+        return n;
+    }
+
+    bool has_artifact(moe_gateup_prepack_artifact_role role) const { return artifact_count(role) > 0; }
+
+    size_t identity_hash() const {
+        size_t h = 0;
+        h        = hash_combine(h, static_cast<size_t>(layer_));
+        h        = hash_combine(h, static_cast<size_t>(submit_device_));
+        h        = hash_combine(h, static_cast<size_t>(selected_entries_));
+        h        = hash_combine(h, static_cast<size_t>(selected_batches_));
+        h        = hash_combine(h, scratch_bytes_);
+        h        = hash_combine(h, static_cast<size_t>(route_metadata_signature_));
+        for (const moe_gateup_prepack_scratch_artifact & artifact : artifacts_) {
+            h = hash_combine(h, static_cast<size_t>(artifact.role));
+            h = hash_combine(h, artifact.bytes);
+            h = hash_combine(h, artifact.stable_identity_hash);
+        }
+        return h;
+    }
+
+    bool same_identity_as(const moe_gateup_prepack_scratch_descriptor & other) const {
+        if (layer_ != other.layer_ || submit_device_ != other.submit_device_ ||
+            selected_entries_ != other.selected_entries_ || selected_batches_ != other.selected_batches_ ||
+            scratch_bytes_ != other.scratch_bytes_ || route_metadata_signature_ != other.route_metadata_signature_ ||
+            artifacts_.size() != other.artifacts_.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < artifacts_.size(); ++i) {
+            const moe_gateup_prepack_scratch_artifact & a = artifacts_[i];
+            const moe_gateup_prepack_scratch_artifact & b = other.artifacts_[i];
+            if (a.role != b.role || a.bytes != b.bytes || a.device != b.device ||
+                a.stable_identity_hash != b.stable_identity_hash || !a.handle.stable_identity_equal(b.handle)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool uses_raw_pointer_identity_for_test() const {
+        for (const moe_gateup_prepack_scratch_artifact & artifact : artifacts_) {
+            if (!artifact.handle.has_stable_owner_identity()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    const std::vector<moe_gateup_prepack_scratch_artifact> & artifacts() const { return artifacts_; }
+
+    const std::vector<sycl::event> & dependencies() const { return deps_; }
+
+  private:
+    static constexpr moe_gateup_prepack_artifact_role source_role() {
+        return moe_gateup_prepack_artifact_role::SOURCE_ACTIVATION;
+    }
+
+    static size_t hash_combine(size_t seed, size_t value) {
+        return seed ^ (value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2));
+    }
+
+    int                                              layer_                    = -1;
+    int                                              submit_device_            = -1;
+    int64_t                                          selected_entries_         = 0;
+    int64_t                                          selected_batches_         = 0;
+    size_t                                           scratch_bytes_            = 0;
+    uint64_t                                         route_metadata_signature_ = 0;
+    std::vector<moe_gateup_prepack_scratch_artifact> artifacts_;
+    std::vector<sycl::event>                         deps_;
+};
+
 struct moe_layer_decode_plan {
     int                      layer           = -1;
     int                      layer_hash      = -1;

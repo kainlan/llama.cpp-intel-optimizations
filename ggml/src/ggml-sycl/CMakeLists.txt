@@ -1184,6 +1184,7 @@ foreach(_residency_test
     test-sycl-moe-glu-q8-artifact-policy
     test-sycl-moe-glu-q8-fused-store-policy
     test-sycl-moe-gateup-prepack-policy
+    test-sycl-moe-gateup-prepack-scratch
     test-sycl-moe-fusion-noactivation
     test-sycl-moe-sequence-graphlet-policy
 )
