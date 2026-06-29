@@ -19,6 +19,7 @@ REQUIRED_KEYS = (
 
 RELATIVE_L2_LIMIT = 1e-3
 TOP10_LOGIT_MAE_LIMIT = 1e-2
+MAX_SAFE_ABS = math.sqrt(sys.float_info.max)
 
 
 def fail(message: str) -> int:
@@ -54,9 +55,17 @@ def require_keys(capture: dict[str, Any]) -> None:
 
 
 def require_finite_number(value: Any, name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"invalid {name}")
-    return float(value)
+    try:
+        number = float(value)
+    except OverflowError as exc:
+        raise ValueError(f"invalid {name}: numeric value is too large") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"invalid {name}")
+    if abs(number) > MAX_SAFE_ABS:
+        raise ValueError(f"invalid {name}: numeric value is too large")
+    return number
 
 
 def require_number_list(value: Any, name: str) -> list[float]:
