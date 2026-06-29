@@ -64,3 +64,19 @@ def test_algorithmic_study_rejects_zero_candidate_ms_without_traceback(tmp_path:
     assert result.returncode != 0
     assert "error: candidate_ms_per_token must be positive" in result.stderr
     assert "Traceback" not in result.stderr
+
+
+def test_algorithmic_study_rejects_reciprocal_overflow_without_accepting_inf(tmp_path: Path) -> None:
+    capture = tmp_path / "tiny-ms.json"
+    data = valid_capture()
+    data["candidate_ms_per_token"] = 1e-310
+    write_capture(capture, data)
+    result = subprocess.run(["python3", str(SCRIPT), str(capture)], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    assert result.returncode != 0
+    assert "error:" in result.stderr
+    assert "candidate_ms_per_token is too small" in result.stderr
+    assert "speed_ceiling_tok_s inf" not in result.stdout
+    assert "speedup_vs_baseline inf" not in result.stdout
+    assert "recommendation pass" not in result.stdout
+    assert "inf" not in result.stdout.lower()
+    assert "Traceback" not in result.stderr

@@ -77,6 +77,22 @@ def require_number_list(value: Any, name: str) -> list[float]:
     return numbers
 
 
+def require_finite_metric(value: float, name: str) -> float:
+    if not math.isfinite(value):
+        raise ValueError(f"{name} is not finite")
+    return value
+
+
+def divide_finite(numerator: float, denominator: float, name: str) -> float:
+    try:
+        value = numerator / denominator
+    except OverflowError as exc:
+        raise ValueError(f"{name} exceeds numeric range; candidate_ms_per_token is too small") from exc
+    if not math.isfinite(value):
+        raise ValueError(f"{name} exceeds numeric range; candidate_ms_per_token is too small")
+    return value
+
+
 def relative_l2(baseline: list[float], candidate: list[float]) -> float:
     numerator = sum((a - b) * (a - b) for a, b in zip(baseline, candidate))
     denominator = max(sum(a * a for a in baseline), 1e-30)
@@ -109,10 +125,10 @@ def analyze(capture: dict[str, Any]) -> dict[str, float | str]:
     if candidate_ms <= 0.0:
         raise ValueError("candidate_ms_per_token must be positive")
 
-    rel_l2 = relative_l2(baseline_output, candidate_output)
-    logit_mae = mean_abs_error(baseline_logits, candidate_logits)
-    speed_ceiling = 1000.0 / candidate_ms
-    speedup = baseline_ms / candidate_ms
+    rel_l2 = require_finite_metric(relative_l2(baseline_output, candidate_output), "relative_l2")
+    logit_mae = require_finite_metric(mean_abs_error(baseline_logits, candidate_logits), "top10_logit_mae")
+    speed_ceiling = divide_finite(1000.0, candidate_ms, "speed_ceiling_tok_s")
+    speedup = divide_finite(baseline_ms, candidate_ms, "speedup_vs_baseline")
     recommendation = "pass"
     if rel_l2 > RELATIVE_L2_LIMIT or logit_mae > TOP10_LOGIT_MAE_LIMIT:
         recommendation = "kill"
