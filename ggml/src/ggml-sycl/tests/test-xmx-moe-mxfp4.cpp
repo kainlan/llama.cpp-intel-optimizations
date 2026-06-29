@@ -515,17 +515,43 @@ bool test_gateup_prepack_reference_layout() {
     TEST_ASSERT(result.key.stable_hash() != changed_key_result.key.stable_hash(),
                 "prepack key did not change when explicit metadata identity changed");
 
+    const int32_t * unusable_selected = reinterpret_cast<const int32_t *>(static_cast<uintptr_t>(1));
+
     ggml_sycl::mxfp4_moe_gateup_prepack_request env_off_request = request;
     env_off_request.env_enabled                                 = false;
-    TEST_ASSERT(ggml_sycl::mxfp4_moe_gateup_prepack_selected_rows_reference(env_off_request).status ==
-                    ggml_sycl::mxfp4_moe_gateup_prepack_status::ENV_DISABLED,
+    env_off_request.selected_experts                            = unusable_selected;
+    env_off_request.selected_count                              = std::numeric_limits<int64_t>::max();
+    ggml_sycl::mxfp4_moe_gateup_prepack_result env_off_result =
+        ggml_sycl::mxfp4_moe_gateup_prepack_selected_rows_reference(env_off_request);
+    TEST_ASSERT(env_off_result.status == ggml_sycl::mxfp4_moe_gateup_prepack_status::ENV_DISABLED,
                 "gate/up prepack helper must be default-off");
+    TEST_ASSERT(env_off_result.key.selected_experts_hash == 0,
+                "env-disabled prepack rejection should not hash selected experts");
 
     ggml_sycl::mxfp4_moe_gateup_prepack_request empty_request = request;
     empty_request.selected_count                              = 0;
     TEST_ASSERT(ggml_sycl::mxfp4_moe_gateup_prepack_selected_rows_reference(empty_request).status ==
                     ggml_sycl::mxfp4_moe_gateup_prepack_status::INVALID_SELECTION,
                 "empty selected expert list should be rejected");
+
+    ggml_sycl::mxfp4_moe_gateup_prepack_request huge_count_request = request;
+    huge_count_request.selected_experts                            = unusable_selected;
+    huge_count_request.selected_count                              = std::numeric_limits<int64_t>::max();
+    ggml_sycl::mxfp4_moe_gateup_prepack_result huge_count_result =
+        ggml_sycl::mxfp4_moe_gateup_prepack_selected_rows_reference(huge_count_request);
+    TEST_ASSERT(huge_count_result.status == ggml_sycl::mxfp4_moe_gateup_prepack_status::INVALID_SELECTION,
+                "huge selected expert count should reject before hashing");
+    TEST_ASSERT(huge_count_result.key.selected_experts_hash == 0,
+                "huge-count rejection should not hash selected experts");
+
+    ggml_sycl::mxfp4_moe_gateup_prepack_request null_selected_request = request;
+    null_selected_request.selected_experts                            = nullptr;
+    ggml_sycl::mxfp4_moe_gateup_prepack_result null_selected_result =
+        ggml_sycl::mxfp4_moe_gateup_prepack_selected_rows_reference(null_selected_request);
+    TEST_ASSERT(null_selected_result.status == ggml_sycl::mxfp4_moe_gateup_prepack_status::INVALID_ARGUMENT,
+                "null selected expert pointer should reject before hashing");
+    TEST_ASSERT(null_selected_result.key.selected_experts_hash == 0,
+                "null-selected rejection should not hash selected experts");
 
     int32_t                                     bad_selected[] = { 1, 4 };
     ggml_sycl::mxfp4_moe_gateup_prepack_request bad_id_request = request;
@@ -550,6 +576,15 @@ bool test_gateup_prepack_reference_layout() {
     TEST_ASSERT(ggml_sycl::mxfp4_moe_gateup_prepack_layout_for_shape(1, 1024, huge_aligned_ncols, &overflow_layout) ==
                     ggml_sycl::mxfp4_moe_gateup_prepack_status::LAYOUT_OVERFLOW,
                 "huge role byte layout should reject overflow");
+
+    ggml_sycl::mxfp4_moe_gateup_prepack_request overflow_request = request;
+    overflow_request.selected_experts                            = unusable_selected;
+    overflow_request.ncols                                       = huge_aligned_ncols;
+    ggml_sycl::mxfp4_moe_gateup_prepack_result overflow_result =
+        ggml_sycl::mxfp4_moe_gateup_prepack_selected_rows_reference(overflow_request);
+    TEST_ASSERT(overflow_result.status == ggml_sycl::mxfp4_moe_gateup_prepack_status::LAYOUT_OVERFLOW,
+                "overflow request should reject before hashing selected experts");
+    TEST_ASSERT(overflow_result.key.selected_experts_hash == 0, "overflow rejection should not hash selected experts");
 
     const uint64_t entry_overflow_k_tiles = max_size / (2 * group_bytes) + 1;
     const int64_t  entry_overflow_ncols =

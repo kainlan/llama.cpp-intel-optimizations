@@ -683,6 +683,8 @@ static uint64_t mxfp4_gateup_prepack_selected_hash(const int32_t * selected_expe
     return h;
 }
 
+static constexpr int64_t MXFP4_GATEUP_PREPACK_MAX_SELECTED = 4096;
+
 static bool mxfp4_gateup_prepack_mul_size_overflow(uint64_t a, uint64_t b, uint64_t max_size, uint64_t * result) {
     if (result) {
         *result = 0;
@@ -715,52 +717,55 @@ static mxfp4_moe_gateup_prepack_key mxfp4_gateup_prepack_make_key(const mxfp4_mo
     key.nrows_per_expert         = layout.nrows_per_expert;
     key.ncols                    = layout.ncols;
     key.selected_count           = layout.selected_count;
-    key.selected_experts_hash = request.selected_experts ? mxfp4_gateup_prepack_selected_hash(request.selected_experts,
-                                                                                              request.selected_count) :
-                                                           0;
+    key.selected_experts_hash =
+        request.selected_experts ? mxfp4_gateup_prepack_selected_hash(request.selected_experts, layout.selected_count) :
+                                   0;
     return key;
 }
 
 static mxfp4_moe_gateup_prepack_result mxfp4_gateup_prepack_reject(
-    mxfp4_moe_gateup_prepack_status          status,
-    const mxfp4_moe_gateup_prepack_request & request,
-    const mxfp4_moe_gateup_prepack_layout &  layout = {}) {
+    mxfp4_moe_gateup_prepack_status         status,
+    const mxfp4_moe_gateup_prepack_layout & layout = {}) {
     mxfp4_moe_gateup_prepack_result result;
     result.status = status;
     result.layout = layout;
-    result.key    = mxfp4_gateup_prepack_make_key(request, layout);
     return result;
 }
 
 static mxfp4_moe_gateup_prepack_result mxfp4_gateup_prepack_validate(const mxfp4_moe_gateup_prepack_request & request) {
     if (!request.env_enabled) {
-        return mxfp4_gateup_prepack_reject(mxfp4_moe_gateup_prepack_status::ENV_DISABLED, request);
+        return mxfp4_gateup_prepack_reject(mxfp4_moe_gateup_prepack_status::ENV_DISABLED);
     }
-    if (!request.descriptor || !request.descriptor->valid()) {
-        return mxfp4_gateup_prepack_reject(mxfp4_moe_gateup_prepack_status::INVALID_DESCRIPTOR, request);
+    if (request.selected_count <= 0 || request.selected_count > MXFP4_GATEUP_PREPACK_MAX_SELECTED) {
+        return mxfp4_gateup_prepack_reject(mxfp4_moe_gateup_prepack_status::INVALID_SELECTION);
     }
-    if (!request.gate_base || !request.up_base || !request.scratch || !request.selected_experts || request.layer < 0 ||
-        request.submit_device < 0 || request.route_metadata_signature == 0 || request.gate_identity_hash == 0 ||
-        request.up_identity_hash == 0) {
-        return mxfp4_gateup_prepack_reject(mxfp4_moe_gateup_prepack_status::INVALID_ARGUMENT, request);
+    if (!request.selected_experts) {
+        return mxfp4_gateup_prepack_reject(mxfp4_moe_gateup_prepack_status::INVALID_ARGUMENT);
     }
 
     mxfp4_moe_gateup_prepack_layout       layout;
     const mxfp4_moe_gateup_prepack_status layout_status = mxfp4_moe_gateup_prepack_layout_for_shape(
         request.selected_count, request.nrows_per_expert, request.ncols, &layout);
     if (layout_status != mxfp4_moe_gateup_prepack_status::OK) {
-        return mxfp4_gateup_prepack_reject(layout_status, request, layout);
+        return mxfp4_gateup_prepack_reject(layout_status, layout);
+    }
+    if (!request.descriptor || !request.descriptor->valid()) {
+        return mxfp4_gateup_prepack_reject(mxfp4_moe_gateup_prepack_status::INVALID_DESCRIPTOR, layout);
+    }
+    if (!request.gate_base || !request.up_base || !request.scratch || request.layer < 0 || request.submit_device < 0 ||
+        request.route_metadata_signature == 0 || request.gate_identity_hash == 0 || request.up_identity_hash == 0) {
+        return mxfp4_gateup_prepack_reject(mxfp4_moe_gateup_prepack_status::INVALID_ARGUMENT, layout);
     }
     if (request.n_experts <= 0) {
-        return mxfp4_gateup_prepack_reject(mxfp4_moe_gateup_prepack_status::INVALID_SHAPE, request, layout);
+        return mxfp4_gateup_prepack_reject(mxfp4_moe_gateup_prepack_status::INVALID_SHAPE, layout);
     }
     for (int64_t i = 0; i < request.selected_count; ++i) {
         if (request.selected_experts[i] < 0 || request.selected_experts[i] >= request.n_experts) {
-            return mxfp4_gateup_prepack_reject(mxfp4_moe_gateup_prepack_status::INVALID_SELECTION, request, layout);
+            return mxfp4_gateup_prepack_reject(mxfp4_moe_gateup_prepack_status::INVALID_SELECTION, layout);
         }
     }
     if (request.scratch_bytes < layout.total_bytes) {
-        return mxfp4_gateup_prepack_reject(mxfp4_moe_gateup_prepack_status::SCRATCH_TOO_SMALL, request, layout);
+        return mxfp4_gateup_prepack_reject(mxfp4_moe_gateup_prepack_status::SCRATCH_TOO_SMALL, layout);
     }
 
     mxfp4_moe_gateup_prepack_result result;
@@ -821,7 +826,7 @@ mxfp4_moe_gateup_prepack_status mxfp4_moe_gateup_prepack_layout_for_shape(int64_
     if (layout) {
         *layout = {};
     }
-    if (selected_count <= 0) {
+    if (selected_count <= 0 || selected_count > MXFP4_GATEUP_PREPACK_MAX_SELECTED) {
         return mxfp4_moe_gateup_prepack_status::INVALID_SELECTION;
     }
     if (nrows_per_expert <= 0 || ncols <= 0 || (ncols % static_cast<int64_t>(GGML_SYCL_MXFP4_MOE_XMX_K)) != 0) {
