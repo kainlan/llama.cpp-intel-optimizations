@@ -10,6 +10,7 @@
 #include "common.hpp"
 #include "expert-prefetch.hpp"
 #include "ggml-impl.h"
+#include "ggml-sycl-test.hpp"
 #include "ggml-sycl.h"
 #include "kv-tier-manager.hpp"
 #include "mem-handle.hpp"
@@ -11820,8 +11821,8 @@ unified_cache::vram_alloc_result unified_cache::allocate(size_t size, alloc_life
         return result;
     }
 
-    const char * label = tag ? tag : "unified_cache::allocate";
-    bool         host_fallback_counted = false;
+    const char * label                   = tag ? tag : "unified_cache::allocate";
+    bool         host_fallback_counted   = false;
     auto         note_host_fallback_once = [&]() {
         if (!host_fallback_counted) {
             offload_stats_note_host_fallback_attempt(size);
@@ -15158,6 +15159,69 @@ static bool planner_moe_primary_executor_supports_pp_layout(const placement_entr
     return planner_moe_primary_executor_supports_pp_layout_on_device(entry, layout, device_id, kv_info, envelope);
 }
 
+test_moe_single_xmx_planner_result test_moe_single_xmx_planner_decision(const test_moe_single_xmx_planner_input & in) {
+    mxfp4_moe_single_gateup_layout_policy_input policy{};
+    policy.env_value        = in.single_xmx_env;
+    policy.type             = in.type;
+    policy.role             = in.role;
+    policy.requested_layout = in.current_layout;
+    policy.device_resident  = in.device_resident;
+    policy.xmx_int8_ok      = in.device_xmx_int8_ok;
+    policy.shape_aligned    = in.shape_aligned;
+    policy.pp_rows          = in.pp_rows;
+    policy.pp_supported     = in.pp_xmx_supported;
+    policy.tg_supported     = in.tg_xmx_supported;
+    const auto p            = mxfp4_moe_single_gateup_layout_policy(policy);
+
+    test_moe_single_xmx_planner_result out{};
+    out.single_xmx_selected = p.accepted;
+    out.needs_pp_soa        = p.accepted ? false : in.current_default_wants_pp_soa;
+    out.adds_soa_alternate  = p.accepted ? false : in.current_default_wants_pp_soa;
+    out.reason              = p.reason;
+    return out;
+}
+
+static mxfp4_moe_single_gateup_layout_policy_result planner_single_xmx_gateup_policy(
+    const placement_entry &              entry,
+    ggml_layout_mode                     layout,
+    int                                  device_id,
+    const placement_kv_info &            kv_info,
+    const ggml_sycl_placement_envelope * envelope,
+    bool                                 pp_supported,
+    bool                                 tg_supported,
+    bool                                 device_resident) {
+    mxfp4_moe_single_gateup_layout_policy_input in{};
+    in.env_value        = std::getenv("GGML_SYCL_MOE_GATEUP_SINGLE_XMX");
+    in.type             = entry.type;
+    in.role             = entry.expert_role;
+    in.requested_layout = layout;
+    in.device_resident  = device_resident;
+    in.xmx_int8_ok      = device_id >= 0 && device_id < ggml_sycl_info().device_count &&
+                     ggml_sycl_info().devices[device_id].xmx_caps.supports_int8;
+    in.shape_aligned = entry.ne[0] > 0 && (entry.ne[0] % QK_MXFP4) == 0;
+    in.pp_rows       = planner_expected_moe_pp_rows(kv_info, envelope);
+    in.pp_supported  = pp_supported;
+    in.tg_supported  = tg_supported;
+    return mxfp4_moe_single_gateup_layout_policy(in);
+}
+
+static bool planner_single_xmx_gateup_selected_on_device(const placement_entry &              entry,
+                                                         ggml_layout_mode                     layout,
+                                                         int                                  device_id,
+                                                         const placement_kv_info &            kv_info,
+                                                         const ggml_sycl_placement_envelope * envelope,
+                                                         bool                                 device_resident) {
+    if (layout != GGML_LAYOUT_XMX_TILED) {
+        return false;
+    }
+    const bool pp_supported =
+        planner_moe_primary_executor_supports_pp_layout_on_device(entry, layout, device_id, kv_info, envelope);
+    const bool tg_supported = planner_moe_primary_executor_supports_layout_on_device(entry, layout, device_id);
+    return planner_single_xmx_gateup_policy(entry, layout, device_id, kv_info, envelope, pp_supported, tg_supported,
+                                            device_resident)
+        .accepted;
+}
+
 static bool planner_moe_layout_needs_pp_soa_on_device(const placement_entry &              entry,
                                                       ggml_layout_mode                     layout,
                                                       int                                  device_id,
@@ -15180,12 +15244,19 @@ static bool planner_moe_layout_needs_pp_soa_on_device(const placement_entry &   
         return false;
     }
 
-    if (layout == GGML_LAYOUT_XMX_TILED && !planner_moe_xmx_tiled_pp_proof_enabled()) {
-        return true;
-    }
-
     if (layout == GGML_LAYOUT_XMX_TILED) {
-        return !planner_moe_primary_executor_supports_pp_layout_on_device(entry, layout, device_id, kv_info, envelope);
+        const bool pp_supported =
+            planner_moe_primary_executor_supports_pp_layout_on_device(entry, layout, device_id, kv_info, envelope);
+        const bool tg_supported = planner_moe_primary_executor_supports_layout_on_device(entry, layout, device_id);
+        const auto single_xmx   = planner_single_xmx_gateup_policy(entry, layout, device_id, kv_info, envelope,
+                                                                   pp_supported, tg_supported, true);
+        if (single_xmx.accepted) {
+            return false;
+        }
+        if (!planner_moe_xmx_tiled_pp_proof_enabled()) {
+            return true;
+        }
+        return !pp_supported;
     }
 
     if (layout == GGML_LAYOUT_MXFP4_I8) {
@@ -15229,10 +15300,20 @@ static size_t prepare_single_moe_pp_gate_up_primary_layouts_for_pack(placement_p
         return 0;
     }
 
-    size_t promoted        = 0;
-    size_t no_layout_bytes = 0;
+    size_t promoted          = 0;
+    size_t no_layout_bytes   = 0;
+    size_t single_xmx_gateup = 0;
     for (placement_entry & entry : plan.entries) {
         if (entry.expert_role != expert_tensor_role::GATE && entry.expert_role != expert_tensor_role::UP) {
+            continue;
+        }
+        if (planner_single_xmx_gateup_selected_on_device(entry, entry.layout, device_id, kv_info, envelope, true)) {
+            single_xmx_gateup++;
+            GGML_LOG_INFO(
+                "[PLACEMENT-MOE] single_xmx_gateup=1 tensor=%s layer=%d expert=%d role=%s device=%d "
+                "layout=%s soa_alternate=0\n",
+                entry.name.c_str(), entry.layer_id, entry.expert_id, expert_tensor_role_name(entry.expert_role),
+                device_id, scratch_layout_name(entry.layout));
             continue;
         }
         if (!planner_moe_layout_needs_pp_soa_on_device(entry, entry.layout, device_id, kv_info, envelope)) {
@@ -15253,10 +15334,12 @@ static size_t prepare_single_moe_pp_gate_up_primary_layouts_for_pack(placement_p
     }
     if (promoted > 0) {
         plan.moe_pp_soa_promoted = true;
+    }
+    if (promoted > 0 || single_xmx_gateup > 0) {
         GGML_LOG_INFO(
             "[PLACEMENT-MOE] PP primary gate/up layouts prepared before packing: device=%d promoted_soa=%zu "
-            "no_layout_bytes=%zu\n",
-            device_id, promoted, no_layout_bytes);
+            "single_xmx_gateup=%zu no_layout_bytes=%zu\n",
+            device_id, promoted, single_xmx_gateup, no_layout_bytes);
     }
     return promoted;
 }
@@ -15315,14 +15398,15 @@ static size_t add_single_moe_pp_executable_alternates(placement_plan &          
         size_t                   charge = 0;
     };
 
-    size_t considered       = 0;
-    size_t candidates       = 0;
-    size_t already_present  = 0;
-    size_t not_needed       = 0;
-    size_t no_layout_bytes  = 0;
-    size_t added            = 0;
-    size_t skipped_capacity = 0;
-    size_t charged_bytes    = 0;
+    size_t considered        = 0;
+    size_t candidates        = 0;
+    size_t already_present   = 0;
+    size_t not_needed        = 0;
+    size_t no_layout_bytes   = 0;
+    size_t added             = 0;
+    size_t skipped_capacity  = 0;
+    size_t charged_bytes     = 0;
+    size_t single_xmx_gateup = 0;
 
     std::map<std::string, size_t> tensor_index;
     std::vector<pending_tensor>   pending;
@@ -15332,6 +15416,12 @@ static size_t add_single_moe_pp_executable_alternates(placement_plan &          
             continue;
         }
         considered++;
+        if (planner_single_xmx_gateup_selected_on_device(entry, entry.layout, device_id, kv_info, envelope,
+                                                         entry.on_device && entry.target_device == device_id)) {
+            not_needed++;
+            single_xmx_gateup++;
+            continue;
+        }
         if (!planner_moe_entry_needs_pp_soa_alternate(entry, device_id, kv_info, envelope)) {
             not_needed++;
             continue;
@@ -15390,13 +15480,13 @@ static size_t add_single_moe_pp_executable_alternates(placement_plan &          
         }
     }
 
-    if (considered > 0 && (candidates > 0 || moe_direct_trace_enabled())) {
+    if (considered > 0 && (candidates > 0 || single_xmx_gateup > 0 || moe_direct_trace_enabled())) {
         GGML_LOG_INFO(
             "[PLACEMENT-MOE] PP executable alternate layouts: device=%d considered=%zu candidates=%zu "
-            "soa_added=%zu already=%zu not_needed=%zu no_layout_bytes=%zu skipped_capacity=%zu "
+            "soa_added=%zu already=%zu not_needed=%zu single_xmx_gateup=%zu no_layout_bytes=%zu skipped_capacity=%zu "
             "charged=%.1f MB remaining=%.1f MB pp_tokens=%zu selected_rows=%zu envelope=%s precharged=%d\n",
-            device_id, considered, candidates, added, already_present, not_needed, no_layout_bytes, skipped_capacity,
-            charged_bytes / (1024.0 * 1024.0), remaining / (1024.0 * 1024.0), pp_tokens, pp_rows,
+            device_id, considered, candidates, added, already_present, not_needed, single_xmx_gateup, no_layout_bytes,
+            skipped_capacity, charged_bytes / (1024.0 * 1024.0), remaining / (1024.0 * 1024.0), pp_tokens, pp_rows,
             envelope != nullptr ? "yes" : "no", charge_budget ? 0 : 1);
     }
 
@@ -15421,22 +15511,23 @@ static void add_multi_moe_pp_executable_alternates(placement_plan &             
     const size_t pp_tokens = static_cast<size_t>(planner_effective_ubatch_for_moe_pp(kv_info, envelope));
     const size_t pp_rows   = planner_expected_moe_pp_rows(kv_info, envelope);
 
-    size_t considered       = 0;
-    size_t candidates       = 0;
-    size_t already_present  = 0;
-    size_t not_needed       = 0;
-    size_t no_layout_bytes  = 0;
-    size_t added            = 0;
-    size_t skipped_capacity = 0;
-    size_t charged_bytes    = 0;
-    size_t skip_non_moe     = 0;
-    size_t skip_not_device  = 0;
-    size_t skip_non_mxfp4   = 0;
-    size_t skip_already_soa = 0;
-    size_t skip_bad_role    = 0;
-    size_t skip_no_soa      = 0;
-    size_t skip_no_caps     = 0;
-    size_t skip_rows_ok     = 0;
+    size_t considered        = 0;
+    size_t candidates        = 0;
+    size_t already_present   = 0;
+    size_t not_needed        = 0;
+    size_t no_layout_bytes   = 0;
+    size_t added             = 0;
+    size_t skipped_capacity  = 0;
+    size_t charged_bytes     = 0;
+    size_t skip_non_moe      = 0;
+    size_t skip_not_device   = 0;
+    size_t skip_non_mxfp4    = 0;
+    size_t skip_already_soa  = 0;
+    size_t skip_bad_role     = 0;
+    size_t skip_no_soa       = 0;
+    size_t skip_no_caps      = 0;
+    size_t skip_rows_ok      = 0;
+    size_t single_xmx_gateup = 0;
     for (placement_entry & entry : plan.entries) {
         if (entry.expert_id < 0) {
             skip_non_moe++;
@@ -15463,6 +15554,12 @@ static void add_multi_moe_pp_executable_alternates(placement_plan &             
             if (!(pp_tokens > 1 && (xmx_needs_soa || non_xmx_needs_soa))) {
                 skip_rows_ok++;
             }
+        }
+        if (planner_single_xmx_gateup_selected_on_device(entry, entry.layout, entry.target_device, kv_info, envelope,
+                                                         entry.on_device && entry.target_device >= 0)) {
+            not_needed++;
+            single_xmx_gateup++;
+            continue;
         }
         if (!planner_moe_entry_needs_pp_soa_alternate(entry, entry.target_device, kv_info, envelope)) {
             not_needed++;
@@ -15509,19 +15606,19 @@ static void add_multi_moe_pp_executable_alternates(placement_plan &             
 
     GGML_LOG_INFO(
         "[PLACEMENT-MOE-MULTI] PP executable alternate layouts: considered=%zu candidates=%zu soa_added=%zu "
-        "already=%zu not_needed=%zu no_layout_bytes=%zu skipped_capacity=%zu charged=%.1f MB "
+        "already=%zu not_needed=%zu single_xmx_gateup=%zu no_layout_bytes=%zu skipped_capacity=%zu charged=%.1f MB "
         "pp_tokens=%zu selected_rows=%zu envelope=%s\n",
-        considered, candidates, added, already_present, not_needed, no_layout_bytes, skipped_capacity,
-        charged_bytes / (1024.0 * 1024.0), pp_tokens, pp_rows, envelope != nullptr ? "yes" : "no");
+        considered, candidates, added, already_present, not_needed, single_xmx_gateup, no_layout_bytes,
+        skipped_capacity, charged_bytes / (1024.0 * 1024.0), pp_tokens, pp_rows, envelope != nullptr ? "yes" : "no");
     if (moe_direct_trace_enabled()) {
         fprintf(stderr,
                 "[PLACEMENT-MOE-MULTI-ALT-TRACE] considered=%zu candidates=%zu added=%zu already=%zu "
-                "not_needed=%zu non_moe=%zu not_device=%zu non_mxfp4=%zu already_soa=%zu bad_role=%zu "
-                "no_soa=%zu no_caps=%zu rows_ok=%zu no_layout_bytes=%zu skipped_capacity=%zu charged=%.1fMB "
-                "pp_tokens=%zu selected_rows=%zu envelope=%d\n",
-                considered, candidates, added, already_present, not_needed, skip_non_moe, skip_not_device,
-                skip_non_mxfp4, skip_already_soa, skip_bad_role, skip_no_soa, skip_no_caps, skip_rows_ok,
-                no_layout_bytes, skipped_capacity, charged_bytes / (1024.0 * 1024.0), pp_tokens, pp_rows,
+                "not_needed=%zu single_xmx_gateup=%zu non_moe=%zu not_device=%zu non_mxfp4=%zu already_soa=%zu "
+                "bad_role=%zu no_soa=%zu no_caps=%zu rows_ok=%zu no_layout_bytes=%zu skipped_capacity=%zu "
+                "charged=%.1fMB pp_tokens=%zu selected_rows=%zu envelope=%d\n",
+                considered, candidates, added, already_present, not_needed, single_xmx_gateup, skip_non_moe,
+                skip_not_device, skip_non_mxfp4, skip_already_soa, skip_bad_role, skip_no_soa, skip_no_caps,
+                skip_rows_ok, no_layout_bytes, skipped_capacity, charged_bytes / (1024.0 * 1024.0), pp_tokens, pp_rows,
                 envelope != nullptr ? 1 : 0);
     }
 }
@@ -16887,6 +16984,8 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         // Prompt cannot consume XMX_TILED gate/up by default. The planner
         // rewrites those primaries to SOA before packing so single-B50 GPT-OSS
         // does not budget duplicate full-model PP alternates and spill experts.
+        // GGML_SYCL_MOE_GATEUP_SINGLE_XMX=1 is the explicit proof path that skips
+        // prompt-SOA promotion only when PP and TG XMX_TILED support are both proven.
         // Decode rematerializes XMX_TILED from the prompt-SOA plan when proven.
         if (!planner_moe_prompt_down_specialized_layouts_enabled()) {
             add_single_moe_pp_executable_alternates(plan, remaining, device_id, kv_info, envelope, nullptr,

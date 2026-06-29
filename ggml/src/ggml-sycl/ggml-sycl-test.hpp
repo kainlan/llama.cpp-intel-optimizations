@@ -3,6 +3,7 @@
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
 #include "ggml.h"
+#include "unified-cache.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -59,17 +60,40 @@ bool               test_moe_primary_uses_expert_handles(bool planner_primary_fas
 uint32_t           test_pp_moe_onednn_runtime_ring_depth(uint32_t planned_ring_depth);
 bool               test_xmx_moe_allow_unsafe_pp_from_env(const char * unsafe_env, const char * legacy_env);
 
+struct test_moe_single_xmx_planner_input {
+    const char *       single_xmx_env               = nullptr;
+    expert_tensor_role role                         = expert_tensor_role::UNKNOWN;
+    ggml_type          type                         = GGML_TYPE_COUNT;
+    ggml_layout_mode   current_layout               = GGML_LAYOUT_AOS;
+    bool               device_resident              = false;
+    bool               device_xmx_int8_ok           = false;
+    bool               shape_aligned                = false;
+    size_t             pp_rows                      = 0;
+    bool               pp_xmx_supported             = false;
+    bool               tg_xmx_supported             = false;
+    bool               current_default_wants_pp_soa = false;
+};
+
+struct test_moe_single_xmx_planner_result {
+    bool         single_xmx_selected = false;
+    bool         needs_pp_soa        = true;
+    bool         adds_soa_alternate  = true;
+    const char * reason              = "env";
+};
+
+test_moe_single_xmx_planner_result test_moe_single_xmx_planner_decision(const test_moe_single_xmx_planner_input & in);
+
 struct test_moe_default_fast_path_policy_input {
     bool default_fast_path_enabled = false;
-    bool decode_phase = false;
-    bool has_limited_graph = false;
-    bool safe_baseline_enabled = false;
-    bool sequence_identity_stable = false;
-    bool aggregation_available = true;
-    bool fusion_metadata_complete = false;
-    bool fusion_kernel_proven = false;
+    bool decode_phase              = false;
+    bool has_limited_graph         = false;
+    bool safe_baseline_enabled     = false;
+    bool sequence_identity_stable  = false;
+    bool aggregation_available     = true;
+    bool fusion_metadata_complete  = false;
+    bool fusion_kernel_proven      = false;
     bool unsafe_fused_q8_requested = false;
-    bool context_quarantined = false;
+    bool context_quarantined       = false;
 };
 
 struct test_moe_default_fast_path_policy_result {
@@ -83,7 +107,7 @@ test_moe_default_fast_path_policy_result test_moe_default_fast_path_policy(
     const test_moe_default_fast_path_policy_input & in);
 
 struct test_moe_down_sum_direct_final_input {
-    bool             env_enabled                        = false;
+    bool             env_enabled                                    = false;
     bool             dpas_direct_final_env_enabled                  = false;
     bool             dpas_direct_final_i8_enabled                   = false;
     bool             dpas_direct_final_dpas_enabled                 = false;
@@ -91,27 +115,27 @@ struct test_moe_down_sum_direct_final_input {
     bool             dpas_direct_final_scratch_reduce_enabled       = false;
     bool             dpas_direct_final_same_expert_grouped_enabled  = false;
     int64_t          n_tokens                                       = 0;
-    ggml_layout_mode down_layout                        = GGML_LAYOUT_AOS;
-    bool             cached_q8_direct_ids               = false;
-    bool             has_ids_host                       = false;
-    int64_t          ids_host_count                     = 0;
-    int64_t          down_entries                       = 0;
-    bool             has_weighted_dst                   = false;
-    bool             has_moe_weights                    = false;
-    bool             has_down_sum_final                 = false;
-    int              down_sum_final_index               = -1;
-    bool             glu_handle_device                  = false;
-    bool             final_handle_device                = false;
-    bool             down_weight_resident               = false;
-    bool             fused_q8_quarantined               = false;
-    bool             q8_capacity_ok                     = true;
-    bool             device_xmx_ok                      = true;
-    bool             token_major_deterministic_metadata        = false;
-    int64_t          token_major_entries                       = 0;
-    int64_t          token_major_expected_entries              = 0;
-    bool             token_major_weights_valid                 = false;
-    bool             same_expert_grouping_metadata             = false;
-    bool             same_expert_grouping_has_lane_filled_group = false;
+    ggml_layout_mode down_layout                                    = GGML_LAYOUT_AOS;
+    bool             cached_q8_direct_ids                           = false;
+    bool             has_ids_host                                   = false;
+    int64_t          ids_host_count                                 = 0;
+    int64_t          down_entries                                   = 0;
+    bool             has_weighted_dst                               = false;
+    bool             has_moe_weights                                = false;
+    bool             has_down_sum_final                             = false;
+    int              down_sum_final_index                           = -1;
+    bool             glu_handle_device                              = false;
+    bool             final_handle_device                            = false;
+    bool             down_weight_resident                           = false;
+    bool             fused_q8_quarantined                           = false;
+    bool             q8_capacity_ok                                 = true;
+    bool             device_xmx_ok                                  = true;
+    bool             token_major_deterministic_metadata             = false;
+    int64_t          token_major_entries                            = 0;
+    int64_t          token_major_expected_entries                   = 0;
+    bool             token_major_weights_valid                      = false;
+    bool             same_expert_grouping_metadata                  = false;
+    bool             same_expert_grouping_has_lane_filled_group     = false;
 };
 
 struct test_moe_down_sum_direct_final_result {
@@ -293,21 +317,21 @@ void                                 test_moe_glu_q8_fused_store_counters_reset(
 test_moe_glu_q8_fused_store_counters test_moe_glu_q8_fused_store_counters_snapshot();
 
 struct test_moe_gateup_prepack_policy_input {
-    const char * prepack_env             = nullptr;
-    int64_t      ne12                    = 0;
-    int          layer                   = -1;
-    int64_t      selected_entries        = 0;
-    int64_t      selected_batches        = 0;
-    bool         metadata_complete       = false;
-    bool         metadata_deterministic  = false;
-    bool         gate_handle_valid       = false;
-    bool         gate_handle_device      = false;
-    bool         up_handle_valid         = false;
-    bool         up_handle_device        = false;
-    bool         scratch_handle_valid    = false;
-    size_t       scratch_required_bytes  = 0;
-    size_t       scratch_capacity_bytes  = 0;
-    bool         graph_recording         = false;
+    const char * prepack_env            = nullptr;
+    int64_t      ne12                   = 0;
+    int          layer                  = -1;
+    int64_t      selected_entries       = 0;
+    int64_t      selected_batches       = 0;
+    bool         metadata_complete      = false;
+    bool         metadata_deterministic = false;
+    bool         gate_handle_valid      = false;
+    bool         gate_handle_device     = false;
+    bool         up_handle_valid        = false;
+    bool         up_handle_device       = false;
+    bool         scratch_handle_valid   = false;
+    size_t       scratch_required_bytes = 0;
+    size_t       scratch_capacity_bytes = 0;
+    bool         graph_recording        = false;
 };
 
 struct test_moe_gateup_prepack_policy_result {
@@ -322,11 +346,10 @@ struct test_moe_gateup_prepack_policy_counters {
     uint64_t rejected   = 0;
 };
 
-const char *                             test_moe_gateup_prepack_env_name();
-bool                                     test_moe_gateup_prepack_enabled_from_env(const char * env);
-test_moe_gateup_prepack_policy_result   test_moe_gateup_prepack_policy(
-    const test_moe_gateup_prepack_policy_input & in);
-void                                     test_moe_gateup_prepack_policy_counters_reset();
+const char *                            test_moe_gateup_prepack_env_name();
+bool                                    test_moe_gateup_prepack_enabled_from_env(const char * env);
+test_moe_gateup_prepack_policy_result   test_moe_gateup_prepack_policy(const test_moe_gateup_prepack_policy_input & in);
+void                                    test_moe_gateup_prepack_policy_counters_reset();
 test_moe_gateup_prepack_policy_counters test_moe_gateup_prepack_policy_counters_snapshot();
 
 size_t           test_arena_external_headroom_bytes(size_t device_total_vram, size_t budget_bytes);
@@ -360,14 +383,14 @@ struct test_moe_decode_down_layout_policy_result {
 
 test_moe_decode_down_layout_policy_result test_moe_decode_down_layout_policy(
     const test_moe_decode_down_layout_policy_input & in);
-void             test_reset_orchestrator_call_count();
-int              test_get_orchestrator_call_count();
-int              test_physical_device_count();
-void             test_set_kv_placement_plan(const placement_plan & plan, uint32_t n_layers, size_t kv_per_layer);
-void             test_clear_kv_placement_plan();
-bool             test_cache_replacement_allowed_for_test(uint32_t live_leases, bool retired);
-void             test_set_sycl_info_override(const ggml_sycl_device_info & info);
-void             test_clear_sycl_info_override();
+void test_reset_orchestrator_call_count();
+int  test_get_orchestrator_call_count();
+int  test_physical_device_count();
+void test_set_kv_placement_plan(const placement_plan & plan, uint32_t n_layers, size_t kv_per_layer);
+void test_clear_kv_placement_plan();
+bool test_cache_replacement_allowed_for_test(uint32_t live_leases, bool retired);
+void test_set_sycl_info_override(const ggml_sycl_device_info & info);
+void test_clear_sycl_info_override();
 
 inline ggml_sycl_cache_id test_make_cache_id(const void * tag, uint64_t model_id = 1) {
     ggml_sycl_cache_id id{};
