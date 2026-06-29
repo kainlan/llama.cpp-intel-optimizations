@@ -168,6 +168,96 @@ struct mxfp4_moe_direct_final_metadata {
     bool            route_weights_device_valid = false;
 };
 
+namespace ggml_sycl {
+
+class moe_gateup_prepack_scratch_descriptor;
+
+enum class mxfp4_moe_gateup_prepack_status : uint8_t {
+    OK = 0,
+    ENV_DISABLED,
+    INVALID_ARGUMENT,
+    INVALID_DESCRIPTOR,
+    INVALID_SHAPE,
+    INVALID_SELECTION,
+    SCRATCH_TOO_SMALL,
+};
+
+const char * mxfp4_moe_gateup_prepack_status_name(mxfp4_moe_gateup_prepack_status status);
+bool         mxfp4_moe_gateup_prepack_enabled_from_env(const char * env);
+
+struct mxfp4_moe_gateup_prepack_layout {
+    int64_t selected_count           = 0;
+    int64_t nrows_per_expert         = 0;
+    int64_t ncols                    = 0;
+    int64_t k_tiles                  = 0;
+    int64_t tile_groups_n            = 0;
+    size_t  group_bytes              = 0;
+    size_t  single_expert_role_bytes = 0;
+    size_t  entry_bytes              = 0;
+    size_t  total_bytes              = 0;
+};
+
+struct mxfp4_moe_gateup_prepack_key {
+    int      layer                    = -1;
+    int      submit_device            = -1;
+    uint64_t route_metadata_signature = 0;
+    size_t   gate_identity_hash       = 0;
+    size_t   up_identity_hash         = 0;
+    size_t   scratch_identity_hash    = 0;
+    int64_t  n_experts                = 0;
+    int64_t  nrows_per_expert         = 0;
+    int64_t  ncols                    = 0;
+    int64_t  selected_count           = 0;
+    uint64_t selected_experts_hash    = 0;
+
+    size_t stable_hash() const;
+};
+
+struct mxfp4_moe_gateup_prepack_request {
+    const moe_gateup_prepack_scratch_descriptor * descriptor               = nullptr;
+    const uint8_t *                               gate_base                = nullptr;
+    const uint8_t *                               up_base                  = nullptr;
+    uint8_t *                                     scratch                  = nullptr;
+    size_t                                        scratch_bytes            = 0;
+    const int32_t *                               selected_experts         = nullptr;
+    int64_t                                       selected_count           = 0;
+    int64_t                                       n_experts                = 0;
+    int64_t                                       nrows_per_expert         = 0;
+    int64_t                                       ncols                    = 0;
+    int                                           layer                    = -1;
+    int                                           submit_device            = -1;
+    uint64_t                                      route_metadata_signature = 0;
+    size_t                                        gate_identity_hash       = 0;
+    size_t                                        up_identity_hash         = 0;
+    size_t                                        scratch_identity_hash    = 0;
+    bool                                          env_enabled              = false;
+};
+
+struct mxfp4_moe_gateup_prepack_result {
+    mxfp4_moe_gateup_prepack_status status = mxfp4_moe_gateup_prepack_status::INVALID_ARGUMENT;
+    mxfp4_moe_gateup_prepack_layout layout;
+    mxfp4_moe_gateup_prepack_key    key;
+    sycl::event                     event;
+    bool                            event_set = false;
+
+    bool ok() const { return status == mxfp4_moe_gateup_prepack_status::OK; }
+};
+
+mxfp4_moe_gateup_prepack_status mxfp4_moe_gateup_prepack_layout_for_shape(int64_t selected_count,
+                                                                          int64_t nrows_per_expert,
+                                                                          int64_t ncols,
+                                                                          mxfp4_moe_gateup_prepack_layout * layout);
+
+mxfp4_moe_gateup_prepack_result mxfp4_moe_gateup_prepack_selected_rows_reference(
+    const mxfp4_moe_gateup_prepack_request & request);
+
+mxfp4_moe_gateup_prepack_result mxfp4_moe_gateup_prepack_selected_rows_submit(
+    sycl::queue &                            queue,
+    const mxfp4_moe_gateup_prepack_request & request,
+    const std::vector<sycl::event> *         deps = nullptr);
+
+}  // namespace ggml_sycl
+
 // Prototype fused down projection + router weighted reduce.  Consumes the cached
 // Q8 GLU artifact and writes the final MoE output directly, avoiding the
 // normal down_dst + ADD_ID/MUL/ADD reduction chain.  SOA can write final

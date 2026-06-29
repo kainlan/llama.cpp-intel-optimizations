@@ -6,6 +6,7 @@
 #include "ggml-sycl-bench.hpp"
 #include "ggml.h"
 #include "mem-ops.hpp"
+#include "moe-layer-plan.hpp"
 #include "moe-xmx-fused.hpp"
 #include "quantize.hpp"
 #include "quants.hpp"
@@ -21,6 +22,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <string>
 #include <type_traits>
@@ -664,6 +666,236 @@ static bool mxfp4_moe_xmx_tiled_pack_q8_enabled() {
     return enabled;
 }
 
+namespace ggml_sycl {
+
+namespace {
+
+static size_t mxfp4_gateup_prepack_hash_combine(size_t seed, size_t value) {
+    return seed ^ (value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2));
+}
+
+static uint64_t mxfp4_gateup_prepack_selected_hash(const int32_t * selected_experts, int64_t selected_count) {
+    uint64_t h = 1469598103934665603ULL;
+    for (int64_t i = 0; i < selected_count; ++i) {
+        h ^= static_cast<uint32_t>(selected_experts[i]);
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static mxfp4_moe_gateup_prepack_key mxfp4_gateup_prepack_make_key(const mxfp4_moe_gateup_prepack_request & request,
+                                                                  const mxfp4_moe_gateup_prepack_layout &  layout) {
+    mxfp4_moe_gateup_prepack_key key;
+    key.layer                    = request.layer;
+    key.submit_device            = request.submit_device;
+    key.route_metadata_signature = request.route_metadata_signature;
+    key.gate_identity_hash       = request.gate_identity_hash;
+    key.up_identity_hash         = request.up_identity_hash;
+    key.scratch_identity_hash    = request.scratch_identity_hash ?
+                                       request.scratch_identity_hash :
+                                       (request.descriptor ? request.descriptor->identity_hash() : 0);
+    key.n_experts                = request.n_experts;
+    key.nrows_per_expert         = layout.nrows_per_expert;
+    key.ncols                    = layout.ncols;
+    key.selected_count           = layout.selected_count;
+    key.selected_experts_hash = request.selected_experts ? mxfp4_gateup_prepack_selected_hash(request.selected_experts,
+                                                                                              request.selected_count) :
+                                                           0;
+    return key;
+}
+
+static mxfp4_moe_gateup_prepack_result mxfp4_gateup_prepack_reject(
+    mxfp4_moe_gateup_prepack_status          status,
+    const mxfp4_moe_gateup_prepack_request & request,
+    const mxfp4_moe_gateup_prepack_layout &  layout = {}) {
+    mxfp4_moe_gateup_prepack_result result;
+    result.status = status;
+    result.layout = layout;
+    result.key    = mxfp4_gateup_prepack_make_key(request, layout);
+    return result;
+}
+
+static mxfp4_moe_gateup_prepack_result mxfp4_gateup_prepack_validate(const mxfp4_moe_gateup_prepack_request & request) {
+    if (!request.env_enabled) {
+        return mxfp4_gateup_prepack_reject(mxfp4_moe_gateup_prepack_status::ENV_DISABLED, request);
+    }
+    if (!request.descriptor || !request.descriptor->valid()) {
+        return mxfp4_gateup_prepack_reject(mxfp4_moe_gateup_prepack_status::INVALID_DESCRIPTOR, request);
+    }
+    if (!request.gate_base || !request.up_base || !request.scratch || !request.selected_experts || request.layer < 0 ||
+        request.submit_device < 0 || request.route_metadata_signature == 0 || request.gate_identity_hash == 0 ||
+        request.up_identity_hash == 0) {
+        return mxfp4_gateup_prepack_reject(mxfp4_moe_gateup_prepack_status::INVALID_ARGUMENT, request);
+    }
+
+    mxfp4_moe_gateup_prepack_layout       layout;
+    const mxfp4_moe_gateup_prepack_status layout_status = mxfp4_moe_gateup_prepack_layout_for_shape(
+        request.selected_count, request.nrows_per_expert, request.ncols, &layout);
+    if (layout_status != mxfp4_moe_gateup_prepack_status::OK) {
+        return mxfp4_gateup_prepack_reject(layout_status, request, layout);
+    }
+    if (request.n_experts <= 0) {
+        return mxfp4_gateup_prepack_reject(mxfp4_moe_gateup_prepack_status::INVALID_SHAPE, request, layout);
+    }
+    for (int64_t i = 0; i < request.selected_count; ++i) {
+        if (request.selected_experts[i] < 0 || request.selected_experts[i] >= request.n_experts) {
+            return mxfp4_gateup_prepack_reject(mxfp4_moe_gateup_prepack_status::INVALID_SELECTION, request, layout);
+        }
+    }
+    if (request.scratch_bytes < layout.total_bytes) {
+        return mxfp4_gateup_prepack_reject(mxfp4_moe_gateup_prepack_status::SCRATCH_TOO_SMALL, request, layout);
+    }
+
+    mxfp4_moe_gateup_prepack_result result;
+    result.status = mxfp4_moe_gateup_prepack_status::OK;
+    result.layout = layout;
+    result.key    = mxfp4_gateup_prepack_make_key(request, layout);
+    return result;
+}
+
+}  // namespace
+
+const char * mxfp4_moe_gateup_prepack_status_name(mxfp4_moe_gateup_prepack_status status) {
+    switch (status) {
+        case mxfp4_moe_gateup_prepack_status::OK:
+            return "ok";
+        case mxfp4_moe_gateup_prepack_status::ENV_DISABLED:
+            return "env-disabled";
+        case mxfp4_moe_gateup_prepack_status::INVALID_ARGUMENT:
+            return "invalid-argument";
+        case mxfp4_moe_gateup_prepack_status::INVALID_DESCRIPTOR:
+            return "invalid-descriptor";
+        case mxfp4_moe_gateup_prepack_status::INVALID_SHAPE:
+            return "invalid-shape";
+        case mxfp4_moe_gateup_prepack_status::INVALID_SELECTION:
+            return "invalid-selection";
+        case mxfp4_moe_gateup_prepack_status::SCRATCH_TOO_SMALL:
+            return "scratch-too-small";
+    }
+    return "unknown";
+}
+
+bool mxfp4_moe_gateup_prepack_enabled_from_env(const char * env) {
+    return env && std::atoi(env) != 0;
+}
+
+size_t mxfp4_moe_gateup_prepack_key::stable_hash() const {
+    size_t h = 0;
+    h        = mxfp4_gateup_prepack_hash_combine(h, std::hash<int>()(layer));
+    h        = mxfp4_gateup_prepack_hash_combine(h, std::hash<int>()(submit_device));
+    h        = mxfp4_gateup_prepack_hash_combine(h, std::hash<uint64_t>()(route_metadata_signature));
+    h        = mxfp4_gateup_prepack_hash_combine(h, gate_identity_hash);
+    h        = mxfp4_gateup_prepack_hash_combine(h, up_identity_hash);
+    h        = mxfp4_gateup_prepack_hash_combine(h, scratch_identity_hash);
+    h        = mxfp4_gateup_prepack_hash_combine(h, std::hash<int64_t>()(n_experts));
+    h        = mxfp4_gateup_prepack_hash_combine(h, std::hash<int64_t>()(nrows_per_expert));
+    h        = mxfp4_gateup_prepack_hash_combine(h, std::hash<int64_t>()(ncols));
+    h        = mxfp4_gateup_prepack_hash_combine(h, std::hash<int64_t>()(selected_count));
+    h        = mxfp4_gateup_prepack_hash_combine(h, std::hash<uint64_t>()(selected_experts_hash));
+    return h;
+}
+
+mxfp4_moe_gateup_prepack_status mxfp4_moe_gateup_prepack_layout_for_shape(int64_t selected_count,
+                                                                          int64_t nrows_per_expert,
+                                                                          int64_t ncols,
+                                                                          mxfp4_moe_gateup_prepack_layout * layout) {
+    if (layout) {
+        *layout = {};
+    }
+    if (selected_count <= 0) {
+        return mxfp4_moe_gateup_prepack_status::INVALID_SELECTION;
+    }
+    if (nrows_per_expert <= 0 || ncols <= 0 || (ncols % static_cast<int64_t>(GGML_SYCL_MXFP4_MOE_XMX_K)) != 0) {
+        return mxfp4_moe_gateup_prepack_status::INVALID_SHAPE;
+    }
+
+    const uint64_t max_size = std::numeric_limits<size_t>::max();
+    const uint64_t k_tiles  = static_cast<uint64_t>(ncols / static_cast<int64_t>(GGML_SYCL_MXFP4_MOE_XMX_K));
+    const uint64_t tile_groups_n =
+        (static_cast<uint64_t>(nrows_per_expert) + GGML_SYCL_MXFP4_MOE_XMX_N - 1) / GGML_SYCL_MXFP4_MOE_XMX_N;
+    const uint64_t group_bytes = GGML_SYCL_MXFP4_MOE_XMX_N * (1 + GGML_SYCL_MXFP4_MOE_XMX_K / 2);
+    const uint64_t role_bytes  = k_tiles * tile_groups_n * group_bytes;
+    const uint64_t entry_bytes = 2 * role_bytes;
+    const uint64_t total_bytes = static_cast<uint64_t>(selected_count) * entry_bytes;
+    const bool     overflow    = role_bytes > max_size || entry_bytes > max_size || total_bytes > max_size ||
+                          role_bytes == 0 || entry_bytes == 0 || total_bytes == 0;
+    if (overflow) {
+        return mxfp4_moe_gateup_prepack_status::INVALID_SHAPE;
+    }
+
+    if (layout) {
+        layout->selected_count           = selected_count;
+        layout->nrows_per_expert         = nrows_per_expert;
+        layout->ncols                    = ncols;
+        layout->k_tiles                  = static_cast<int64_t>(k_tiles);
+        layout->tile_groups_n            = static_cast<int64_t>(tile_groups_n);
+        layout->group_bytes              = static_cast<size_t>(group_bytes);
+        layout->single_expert_role_bytes = static_cast<size_t>(role_bytes);
+        layout->entry_bytes              = static_cast<size_t>(entry_bytes);
+        layout->total_bytes              = static_cast<size_t>(total_bytes);
+    }
+    return mxfp4_moe_gateup_prepack_status::OK;
+}
+
+mxfp4_moe_gateup_prepack_result mxfp4_moe_gateup_prepack_selected_rows_reference(
+    const mxfp4_moe_gateup_prepack_request & request) {
+    mxfp4_moe_gateup_prepack_result result = mxfp4_gateup_prepack_validate(request);
+    if (!result.ok()) {
+        return result;
+    }
+
+    const size_t role_bytes  = result.layout.single_expert_role_bytes;
+    const size_t entry_bytes = result.layout.entry_bytes;
+    for (int64_t entry = 0; entry < request.selected_count; ++entry) {
+        const int32_t expert = request.selected_experts[entry];
+        const size_t  src    = static_cast<size_t>(expert) * role_bytes;
+        uint8_t *     dst    = request.scratch + static_cast<size_t>(entry) * entry_bytes;
+        std::memcpy(dst, request.gate_base + src, role_bytes);
+        std::memcpy(dst + role_bytes, request.up_base + src, role_bytes);
+    }
+    return result;
+}
+
+struct mxfp4_moe_gateup_prepack_selected_rows_kernel;
+
+mxfp4_moe_gateup_prepack_result mxfp4_moe_gateup_prepack_selected_rows_submit(
+    sycl::queue &                            queue,
+    const mxfp4_moe_gateup_prepack_request & request,
+    const std::vector<sycl::event> *         deps) {
+    mxfp4_moe_gateup_prepack_result result = mxfp4_gateup_prepack_validate(request);
+    if (!result.ok()) {
+        return result;
+    }
+
+    const uint8_t * gate_base        = request.gate_base;
+    const uint8_t * up_base          = request.up_base;
+    uint8_t *       scratch          = request.scratch;
+    const int32_t * selected_experts = request.selected_experts;
+    const size_t    role_bytes       = result.layout.single_expert_role_bytes;
+    const size_t    entry_bytes      = result.layout.entry_bytes;
+    const size_t    total_bytes      = result.layout.total_bytes;
+
+    result.event     = queue.submit([&](sycl::handler & h) {
+        if (deps && !deps->empty()) {
+            h.depends_on(*deps);
+        }
+        h.parallel_for<mxfp4_moe_gateup_prepack_selected_rows_kernel>(
+            sycl::range<1>(total_bytes), [=](sycl::id<1> item) {
+                const size_t    idx       = item[0];
+                const size_t    entry     = idx / entry_bytes;
+                const size_t    entry_off = idx - entry * entry_bytes;
+                const bool      up_role   = entry_off >= role_bytes;
+                const size_t    role_off  = up_role ? entry_off - role_bytes : entry_off;
+                const int32_t   expert    = selected_experts[entry];
+                const uint8_t * src_base  = up_role ? up_base : gate_base;
+                scratch[idx]              = src_base[static_cast<size_t>(expert) * role_bytes + role_off];
+            });
+    });
+    result.event_set = true;
+    return result;
+}
+
+}  // namespace ggml_sycl
 
 static uint8_t * mmvq_alloc_device_scratch(size_t                  bytes,
                                            sycl::queue &           queue,
@@ -6562,7 +6794,6 @@ SYCL_ESIMD_FUNCTION inline void mxfp4_xmx_tiled_load_a_vec_from_group(
     }
 }
 
-
 template <int Repeat>
 SYCL_ESIMD_FUNCTION inline void mxfp4_xmx_tiled_load_a_vec(
     const uint8_t *                                                             gate_or_up_base,
@@ -8763,7 +8994,6 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl(sycl::queue &        qu
             });
     });
 }
-
 
 template <int Repeat, int GLU_OP>
 static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_direct_q8_sycl(sycl::queue &                    queue,
@@ -12619,7 +12849,6 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_submit(sycl::queue &        
         total_batches, n_tokens, ids_nb0, ids_nb1, dst_nb1, dst_nb2, gate_bias_nb1, up_bias_nb1, alpha, limit,
         tile_n_total, pack_event);
 }
-
 
 template <int Repeat>
 static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m4_submit(sycl::queue &        queue,

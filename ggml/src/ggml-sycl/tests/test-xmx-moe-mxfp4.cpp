@@ -17,6 +17,7 @@
 
 #include "ggml-sycl-bench.hpp"
 #include "mmvq.hpp"
+#include "moe-layer-plan.hpp"
 #include "quantize.hpp"
 
 #include <cassert>
@@ -396,6 +397,150 @@ bool test_weighted_topk_direct_final_reference(sycl::queue & q) {
         TEST_ASSERT_NEAR(got[0][row], expected[0][row], 1e-6f, "deterministic weighted final mismatch");
     }
 
+    TEST_PASS();
+    return true;
+}
+
+static ggml_sycl::mem_handle test_gateup_prepack_fake_handle(size_t offset, size_t size) {
+    return ggml_sycl::mem_handle::from_arena_zone(4, offset, size, 0, 1);
+}
+
+static ggml_sycl::moe_gateup_prepack_scratch_descriptor test_gateup_prepack_descriptor(size_t   scratch_bytes,
+                                                                                       int64_t  selected_count,
+                                                                                       uint64_t route_signature) {
+    ggml_sycl::moe_gateup_prepack_scratch_descriptor descriptor;
+    descriptor.configure(7, 0, selected_count, 1, scratch_bytes, route_signature);
+    descriptor.add_artifact(ggml_sycl::moe_gateup_prepack_artifact_role::SOURCE_ACTIVATION,
+                            test_gateup_prepack_fake_handle(0x1000, 4096), 4096);
+    descriptor.add_artifact(ggml_sycl::moe_gateup_prepack_artifact_role::GATE_WEIGHT,
+                            test_gateup_prepack_fake_handle(0x2000, 8192), 8192);
+    descriptor.add_artifact(ggml_sycl::moe_gateup_prepack_artifact_role::UP_WEIGHT,
+                            test_gateup_prepack_fake_handle(0x4000, 8192), 8192);
+    descriptor.add_artifact(ggml_sycl::moe_gateup_prepack_artifact_role::SCRATCH,
+                            test_gateup_prepack_fake_handle(0x8000, scratch_bytes), scratch_bytes);
+    descriptor.add_artifact(ggml_sycl::moe_gateup_prepack_artifact_role::ROUTE_METADATA,
+                            test_gateup_prepack_fake_handle(0xC000, 256), 256);
+    return descriptor;
+}
+
+bool test_gateup_prepack_reference_layout() {
+    TEST_BEGIN("MXFP4MoE.GateUpPrepackReferenceLayout");
+
+    constexpr int64_t  n_experts        = 4;
+    constexpr int64_t  nrows_per_expert = 17;
+    constexpr int64_t  ncols            = 64;
+    const int32_t      selected[]       = { 2, 0, 3 };
+    constexpr int64_t  selected_count   = sizeof(selected) / sizeof(selected[0]);
+    constexpr uint64_t route_signature  = 0x13579BDF2468ACE0ULL;
+
+    ggml_sycl::mxfp4_moe_gateup_prepack_layout layout;
+    TEST_ASSERT(ggml_sycl::mxfp4_moe_gateup_prepack_layout_for_shape(
+                    selected_count, nrows_per_expert, ncols, &layout) == ggml_sycl::mxfp4_moe_gateup_prepack_status::OK,
+                "valid gate/up prepack shape rejected");
+    TEST_ASSERT(layout.k_tiles == 2, "expected two K tiles in synthetic MXFP4 prepack");
+    TEST_ASSERT(layout.tile_groups_n == 2, "expected two row tile groups in synthetic MXFP4 prepack");
+
+    const size_t         role_bytes = layout.single_expert_role_bytes;
+    std::vector<uint8_t> gate(static_cast<size_t>(n_experts) * role_bytes);
+    std::vector<uint8_t> up(static_cast<size_t>(n_experts) * role_bytes);
+    std::vector<uint8_t> scratch(layout.total_bytes, 0xEE);
+    std::vector<uint8_t> scratch_same_key(layout.total_bytes, 0xCC);
+    std::vector<uint8_t> gate_same_bytes(gate.size());
+    std::vector<uint8_t> up_same_bytes(up.size());
+
+    for (int64_t expert = 0; expert < n_experts; ++expert) {
+        for (size_t i = 0; i < role_bytes; ++i) {
+            gate[static_cast<size_t>(expert) * role_bytes + i] = static_cast<uint8_t>((0x31 + expert * 17 + i) & 0xFF);
+            up[static_cast<size_t>(expert) * role_bytes + i]   = static_cast<uint8_t>((0xA7 + expert * 29 + i) & 0xFF);
+        }
+    }
+    gate_same_bytes = gate;
+    up_same_bytes   = up;
+
+    auto descriptor = test_gateup_prepack_descriptor(layout.total_bytes, selected_count, route_signature);
+    TEST_ASSERT(descriptor.valid(), "synthetic Task 2 scratch descriptor should be valid");
+    TEST_ASSERT(!descriptor.uses_raw_pointer_identity_for_test(), "descriptor should use stable owner identities");
+
+    ggml_sycl::mxfp4_moe_gateup_prepack_request request;
+    request.descriptor               = &descriptor;
+    request.gate_base                = gate.data();
+    request.up_base                  = up.data();
+    request.scratch                  = scratch.data();
+    request.scratch_bytes            = scratch.size();
+    request.selected_experts         = selected;
+    request.selected_count           = selected_count;
+    request.n_experts                = n_experts;
+    request.nrows_per_expert         = nrows_per_expert;
+    request.ncols                    = ncols;
+    request.layer                    = 7;
+    request.submit_device            = 0;
+    request.route_metadata_signature = route_signature;
+    request.gate_identity_hash       = 0x1111222233334444ULL;
+    request.up_identity_hash         = 0x5555666677778888ULL;
+    request.scratch_identity_hash    = descriptor.identity_hash();
+    request.env_enabled              = true;
+
+    ggml_sycl::mxfp4_moe_gateup_prepack_result result =
+        ggml_sycl::mxfp4_moe_gateup_prepack_selected_rows_reference(request);
+    TEST_ASSERT(result.ok(), ggml_sycl::mxfp4_moe_gateup_prepack_status_name(result.status));
+
+    for (int64_t entry = 0; entry < selected_count; ++entry) {
+        const int32_t   expert   = selected[entry];
+        const uint8_t * gate_src = gate.data() + static_cast<size_t>(expert) * role_bytes;
+        const uint8_t * up_src   = up.data() + static_cast<size_t>(expert) * role_bytes;
+        const uint8_t * packed   = scratch.data() + static_cast<size_t>(entry) * layout.entry_bytes;
+        TEST_ASSERT(memcmp(packed, gate_src, role_bytes) == 0, "packed gate role does not match selected expert order");
+        TEST_ASSERT(memcmp(packed + role_bytes, up_src, role_bytes) == 0,
+                    "packed up role does not match selected expert order");
+    }
+    TEST_ASSERT(memcmp(scratch.data(), scratch.data() + layout.entry_bytes, role_bytes) != 0,
+                "non-sorted selected experts should preserve distinct entry order");
+
+    ggml_sycl::mxfp4_moe_gateup_prepack_request same_key_request = request;
+    same_key_request.gate_base                                   = gate_same_bytes.data();
+    same_key_request.up_base                                     = up_same_bytes.data();
+    same_key_request.scratch                                     = scratch_same_key.data();
+    ggml_sycl::mxfp4_moe_gateup_prepack_result same_key_result =
+        ggml_sycl::mxfp4_moe_gateup_prepack_selected_rows_reference(same_key_request);
+    TEST_ASSERT(same_key_result.ok(), "same-key prepack should succeed from different raw backing addresses");
+    TEST_ASSERT(result.key.stable_hash() == same_key_result.key.stable_hash(),
+                "prepack key changed when only raw backing addresses changed");
+    TEST_ASSERT(scratch == scratch_same_key, "same-key raw backing change altered packed bytes");
+
+    same_key_request.gate_identity_hash ^= 0x10ULL;
+    ggml_sycl::mxfp4_moe_gateup_prepack_result changed_key_result =
+        ggml_sycl::mxfp4_moe_gateup_prepack_selected_rows_reference(same_key_request);
+    TEST_ASSERT(changed_key_result.ok(), "changed-key prepack should still pack valid bytes");
+    TEST_ASSERT(result.key.stable_hash() != changed_key_result.key.stable_hash(),
+                "prepack key did not change when explicit metadata identity changed");
+
+    ggml_sycl::mxfp4_moe_gateup_prepack_request env_off_request = request;
+    env_off_request.env_enabled                                 = false;
+    TEST_ASSERT(ggml_sycl::mxfp4_moe_gateup_prepack_selected_rows_reference(env_off_request).status ==
+                    ggml_sycl::mxfp4_moe_gateup_prepack_status::ENV_DISABLED,
+                "gate/up prepack helper must be default-off");
+
+    ggml_sycl::mxfp4_moe_gateup_prepack_request empty_request = request;
+    empty_request.selected_count                              = 0;
+    TEST_ASSERT(ggml_sycl::mxfp4_moe_gateup_prepack_selected_rows_reference(empty_request).status ==
+                    ggml_sycl::mxfp4_moe_gateup_prepack_status::INVALID_SELECTION,
+                "empty selected expert list should be rejected");
+
+    int32_t                                     bad_selected[] = { 1, 4 };
+    ggml_sycl::mxfp4_moe_gateup_prepack_request bad_id_request = request;
+    bad_id_request.selected_experts                            = bad_selected;
+    bad_id_request.selected_count                              = 2;
+    TEST_ASSERT(ggml_sycl::mxfp4_moe_gateup_prepack_selected_rows_reference(bad_id_request).status ==
+                    ggml_sycl::mxfp4_moe_gateup_prepack_status::INVALID_SELECTION,
+                "out-of-range expert id should be rejected");
+
+    ggml_sycl::mxfp4_moe_gateup_prepack_request bad_shape_request = request;
+    bad_shape_request.ncols                                       = 48;
+    TEST_ASSERT(ggml_sycl::mxfp4_moe_gateup_prepack_selected_rows_reference(bad_shape_request).status ==
+                    ggml_sycl::mxfp4_moe_gateup_prepack_status::INVALID_SHAPE,
+                "non-MXFP4-K-aligned shape should be rejected");
+
+    fprintf(stderr, "(selected experts: %d,%d,%d; role_bytes=%zu) ", selected[0], selected[1], selected[2], role_bytes);
     TEST_PASS();
     return true;
 }
@@ -1317,8 +1462,8 @@ bool test_device_grouped_pair_glu_multi_expert_launch(sycl::queue & q) {
 
     const int64_t q8_row_size      = static_cast<int64_t>(ncols_y) * static_cast<int64_t>(sizeof(block_q8_1)) / QK8_1;
     const int64_t down_q8_row_size = static_cast<int64_t>(nrows) * static_cast<int64_t>(sizeof(block_q8_1)) / QK8_1;
-    const size_t  expert_bytes     = static_cast<size_t>(n_experts) * static_cast<size_t>(tile_groups_n) *
-                                static_cast<size_t>(group_bytes);
+    const size_t  expert_bytes =
+        static_cast<size_t>(n_experts) * static_cast<size_t>(tile_groups_n) * static_cast<size_t>(group_bytes);
     const size_t output_bytes  = static_cast<size_t>(n_tokens * nrows) * sizeof(float);
     const size_t q8_bytes      = static_cast<size_t>(n_tokens) * static_cast<size_t>(q8_row_size);
     const size_t down_q8_bytes = static_cast<size_t>(n_tokens * n_ids) * static_cast<size_t>(down_q8_row_size);
@@ -1470,8 +1615,8 @@ bool test_device_grouped_pair_glu_multi_expert_launch(sycl::queue & q) {
     int nonzero_qs    = 0;
     int finite_scales = 0;
     for (int token = 0; token < n_tokens; ++token) {
-        const char * row = reinterpret_cast<const char *>(h_down_q8.data()) +
-                           static_cast<int64_t>(token) * down_q8_row_size;
+        const char * row =
+            reinterpret_cast<const char *>(h_down_q8.data()) + static_cast<int64_t>(token) * down_q8_row_size;
         for (int i = 0; i < nrows; ++i) {
             nonzero_qs += row[i] != 0 ? 1 : 0;
         }
@@ -1494,14 +1639,25 @@ bool test_device_grouped_pair_glu_multi_expert_launch(sycl::queue & q) {
 // =============================================================================
 
 int main(int argc, char ** argv) {
-    (void) argc;
-    (void) argv;
+    const bool cpu_reference_only = argc > 1 && std::strcmp(argv[1], "--cpu-reference-only") == 0;
 
     fprintf(stderr, "=== MXFP4 MoE XMX Fused Kernel Tests ===\n");
 
 #if !SYCL_XMX_MOE_AVAILABLE
     fprintf(stderr, "WARNING: joint_matrix header not available, XMX tests will be skipped.\n\n");
 #endif
+
+    bool all_passed = true;
+
+    // CPU-only reference coverage that does not require selecting or probing a GPU.
+    all_passed &= test_gateup_prepack_reference_layout();
+
+    if (cpu_reference_only) {
+        fprintf(stderr, "\n=== Summary ===\n");
+        fprintf(stderr, "Tests run: %d, Passed: %d, Skipped: %d, Failed: %d\n", g_tests_run, g_tests_passed,
+                g_tests_skipped, g_tests_run - g_tests_passed - g_tests_skipped);
+        return all_passed ? 0 : 1;
+    }
 
     // Create SYCL queue
     sycl::queue  q;
@@ -1518,7 +1674,6 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "\n");
 
     // Run all required tests
-    bool all_passed = true;
 
     // Test 1: E8M0ExponentCorrect
     all_passed &= test_e8m0_exponent_correct(q);
