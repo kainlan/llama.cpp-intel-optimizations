@@ -141,4 +141,4 @@ The plan is a selected-expert gate/up prepack route:
 - default off behind a new env gate;
 - fail closed to the current safe route if metadata, handles, events, or capacity are not valid.
 
-Promotion remains blocked until lead-owned evidence shows exact count, fatal-free logs, required route evidence, `PP512 >= 1100`, and `TG128 >= 45` or an explicitly accepted near-target result.
+Promotion remains blocked until lead-owned evidence shows exact count, fatal-free logs, required route evidence, `PP512 >= 1100`, and `TG128 >= 45`. A near-target result is only non-promotional follow-up evidence when `42.0 <= TG128 < 45.0`, route evidence is clean, and the profile shows gate/up+GLU `<= 4.2 ms/token`; it does not authorize default-on promotion.

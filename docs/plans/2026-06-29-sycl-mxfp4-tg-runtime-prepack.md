@@ -238,8 +238,8 @@ export GGML_SYCL_MOE_PROFILE=1
 - Required route label `gateup-prepack-dpas` is missing when env is enabled.
 - Fallback path silently runs while claiming prepack route success.
 - `PP512 < 1100`.
-- `TG128 < 40.0 tok/s` after optimization, or `TG128 <= 37.05 tok/s` relative to the current direct baseline.
-- `40.0 <= TG128 < 42.0 tok/s` after two implementation iterations; keep only as a documented negative probe, not an active route.
+- Kill immediately on the first lead-owned Task 4 PP/TG validation if `TG128 < 40.0 tok/s` or `TG128 <= 37.05 tok/s` relative to the current direct baseline.
+- If the first lead-owned Task 4 PP/TG validation is `40.0 <= TG128 < 42.0 tok/s`, allow exactly one fix iteration; kill after the second lead-owned PP/TG validation if it remains `< 42.0 tok/s`. Keep the result only as a documented negative probe, not an active route.
 - Prepack+compute gate/up+GLU profile bucket remains `> 4.8 ms/token`, or saves `< 0.8 ms/token` versus the `5.6 ms/token` direct-route baseline. Promotion-quality evidence should show gate/up+GLU `<= 4.2 ms/token` unless TG throughput already reaches `>= 45 tok/s`.
 
 ## Initial Expected Outcome
