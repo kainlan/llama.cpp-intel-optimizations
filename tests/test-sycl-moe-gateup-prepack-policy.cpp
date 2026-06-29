@@ -1,8 +1,10 @@
 #include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml-sycl/mmvq.hpp"
 
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 #define CHECK(cond, msg)                                                        \
     do {                                                                        \
@@ -154,6 +156,8 @@ static ggml_sycl::mxfp4_moe_gateup_prepack_runtime_policy_input base_runtime_inp
     in.scratch_capacity_bytes       = 4096;
     in.graph_recording              = false;
     in.direct_down_sum_compatible   = true;
+    in.runtime_pointer_table_source = true;
+    in.pointer_table_source_available = true;
     in.prepack_supported            = true;
     in.compute_supported            = true;
     return in;
@@ -181,6 +185,12 @@ static int test_runtime_policy_contract() {
     CHECK(!out.accepted && std::strcmp(out.reason, "down-sum") == 0,
           "missing direct down-sum compatibility must reject before route selection");
 
+    in                                 = base_runtime_input();
+    in.pointer_table_source_available = false;
+    out                                = ggml_sycl::mxfp4_moe_gateup_prepack_runtime_policy(in);
+    CHECK(!out.accepted && std::strcmp(out.reason, "pointer-table") == 0,
+          "runtime XMX_TILED source must reject when retained pointer-table source is unavailable");
+
     in                    = base_runtime_input();
     in.prepack_supported  = false;
     out                   = ggml_sycl::mxfp4_moe_gateup_prepack_runtime_policy(in);
@@ -198,6 +208,104 @@ static int test_runtime_policy_contract() {
     out                            = ggml_sycl::mxfp4_moe_gateup_prepack_runtime_policy(in);
     CHECK(!out.accepted && std::strcmp(out.reason, "handle") == 0,
           "missing route metadata handle must reject as handle failure");
+    return 0;
+}
+
+static ggml_sycl::mem_handle fake_prepack_handle(size_t offset, size_t size) {
+    return ggml_sycl::mem_handle::from_arena_zone(4, offset, size, 0, 1);
+}
+
+static ggml_sycl::moe_gateup_prepack_scratch_descriptor fake_prepack_descriptor(size_t   scratch_bytes,
+                                                                                int64_t  selected_count,
+                                                                                uint64_t route_signature) {
+    ggml_sycl::moe_gateup_prepack_scratch_descriptor descriptor;
+    descriptor.configure(7, 0, selected_count, selected_count, scratch_bytes, route_signature);
+    descriptor.add_artifact(ggml_sycl::moe_gateup_prepack_artifact_role::SOURCE_ACTIVATION,
+                            fake_prepack_handle(0x1000, 4096), 4096);
+    descriptor.add_artifact(ggml_sycl::moe_gateup_prepack_artifact_role::GATE_WEIGHT,
+                            fake_prepack_handle(0x2000, 1024), 1024);
+    descriptor.add_artifact(ggml_sycl::moe_gateup_prepack_artifact_role::UP_WEIGHT,
+                            fake_prepack_handle(0x3000, 1024), 1024);
+    descriptor.add_artifact(ggml_sycl::moe_gateup_prepack_artifact_role::SCRATCH,
+                            fake_prepack_handle(0x4000, scratch_bytes), scratch_bytes);
+    descriptor.add_artifact(ggml_sycl::moe_gateup_prepack_artifact_role::ROUTE_METADATA,
+                            fake_prepack_handle(0x5000, selected_count * sizeof(int32_t)),
+                            selected_count * sizeof(int32_t));
+    return descriptor;
+}
+
+static int test_pointer_table_reference_source_contract() {
+    constexpr int64_t n_experts        = 4;
+    constexpr int64_t nrows_per_expert = 17;
+    constexpr int64_t ncols            = 64;
+    constexpr int64_t selected_count   = 3;
+    int32_t           selected[]       = { 2, 0, 3 };
+
+    ggml_sycl::mxfp4_moe_gateup_prepack_layout layout;
+    CHECK(ggml_sycl::mxfp4_moe_gateup_prepack_layout_for_shape(selected_count, nrows_per_expert, ncols, &layout) ==
+              ggml_sycl::mxfp4_moe_gateup_prepack_status::OK,
+          "pointer-table test shape must be valid");
+
+    std::vector<std::vector<uint8_t>> gate_storage(static_cast<size_t>(n_experts));
+    std::vector<std::vector<uint8_t>> up_storage(static_cast<size_t>(n_experts));
+    std::vector<const uint8_t *>      gate_ptrs(static_cast<size_t>(n_experts), nullptr);
+    std::vector<const uint8_t *>      up_ptrs(static_cast<size_t>(n_experts), nullptr);
+    for (int64_t expert = 0; expert < n_experts; ++expert) {
+        gate_storage[static_cast<size_t>(expert)].resize(layout.single_expert_role_bytes);
+        up_storage[static_cast<size_t>(expert)].resize(layout.single_expert_role_bytes);
+        for (size_t i = 0; i < layout.single_expert_role_bytes; ++i) {
+            gate_storage[static_cast<size_t>(expert)][i] = static_cast<uint8_t>(0x10 + expert * 7 + (i % 251));
+            up_storage[static_cast<size_t>(expert)][i]   = static_cast<uint8_t>(0x80 + expert * 5 + (i % 127));
+        }
+        gate_ptrs[static_cast<size_t>(expert)] = gate_storage[static_cast<size_t>(expert)].data();
+        up_ptrs[static_cast<size_t>(expert)]   = up_storage[static_cast<size_t>(expert)].data();
+    }
+
+    std::vector<uint8_t> scratch(layout.total_bytes, 0);
+    auto descriptor = fake_prepack_descriptor(layout.total_bytes, selected_count, 0x3456);
+
+    ggml_sycl::mxfp4_moe_gateup_prepack_request request;
+    request.descriptor                    = &descriptor;
+    request.source_kind                   = ggml_sycl::mxfp4_moe_gateup_prepack_source_kind::EXPERT_POINTER_TABLE;
+    request.gate_ptrs                     = gate_ptrs.data();
+    request.up_ptrs                       = up_ptrs.data();
+    request.scratch                       = scratch.data();
+    request.scratch_bytes                 = scratch.size();
+    request.selected_experts              = selected;
+    request.selected_experts_host         = selected;
+    request.selected_experts_hash         = 0x4567;
+    request.selected_count                = selected_count;
+    request.n_experts                     = n_experts;
+    request.nrows_per_expert              = nrows_per_expert;
+    request.ncols                         = ncols;
+    request.layer                         = 7;
+    request.submit_device                 = 0;
+    request.route_metadata_signature      = 0x3456;
+    request.gate_ptr_table_identity_hash  = 0x6789;
+    request.up_ptr_table_identity_hash    = 0x789a;
+    request.scratch_identity_hash         = descriptor.identity_hash();
+    request.env_enabled                   = true;
+
+    const auto result = ggml_sycl::mxfp4_moe_gateup_prepack_selected_rows_reference(request);
+    CHECK(result.ok(), ggml_sycl::mxfp4_moe_gateup_prepack_status_name(result.status));
+    CHECK(result.key.gate_identity_hash == request.gate_ptr_table_identity_hash,
+          "pointer-table source key must use pointer-table identity, not raw expert data base");
+
+    for (int64_t entry = 0; entry < selected_count; ++entry) {
+        const int32_t expert = selected[entry];
+        const uint8_t * dst  = scratch.data() + static_cast<size_t>(entry) * layout.entry_bytes;
+        CHECK(std::memcmp(dst, gate_storage[static_cast<size_t>(expert)].data(), layout.single_expert_role_bytes) == 0,
+              "pointer-table gate bytes were not packed from selected expert pointer");
+        CHECK(std::memcmp(dst + layout.single_expert_role_bytes, up_storage[static_cast<size_t>(expert)].data(),
+                          layout.single_expert_role_bytes) == 0,
+              "pointer-table up bytes were not packed from selected expert pointer");
+    }
+
+    auto missing_ptr_table = request;
+    missing_ptr_table.gate_ptrs = nullptr;
+    CHECK(ggml_sycl::mxfp4_moe_gateup_prepack_selected_rows_reference(missing_ptr_table).status ==
+              ggml_sycl::mxfp4_moe_gateup_prepack_status::INVALID_ARGUMENT,
+          "runtime pointer-table source must fail closed when pointer table is unavailable");
     return 0;
 }
 
@@ -233,6 +341,9 @@ int main() {
         return 1;
     }
     if (test_runtime_policy_contract() != 0) {
+        return 1;
+    }
+    if (test_pointer_table_reference_source_contract() != 0) {
         return 1;
     }
     std::puts("PASS: MoE gate/up prepack policy");

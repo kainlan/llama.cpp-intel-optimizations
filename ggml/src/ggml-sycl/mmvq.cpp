@@ -708,8 +708,12 @@ static mxfp4_moe_gateup_prepack_key mxfp4_gateup_prepack_make_key(const mxfp4_mo
     key.layer                    = request.layer;
     key.submit_device            = request.submit_device;
     key.route_metadata_signature = request.route_metadata_signature;
-    key.gate_identity_hash       = request.gate_identity_hash;
-    key.up_identity_hash         = request.up_identity_hash;
+    const size_t gate_identity = request.gate_ptr_table_identity_hash ? request.gate_ptr_table_identity_hash :
+                                                                        request.gate_identity_hash;
+    const size_t up_identity   = request.up_ptr_table_identity_hash ? request.up_ptr_table_identity_hash :
+                                                                      request.up_identity_hash;
+    key.gate_identity_hash       = gate_identity;
+    key.up_identity_hash         = up_identity;
     key.scratch_identity_hash    = request.scratch_identity_hash ?
                                        request.scratch_identity_hash :
                                        (request.descriptor ? request.descriptor->identity_hash() : 0);
@@ -756,8 +760,19 @@ static mxfp4_moe_gateup_prepack_result mxfp4_gateup_prepack_validate(const mxfp4
     if (!request.descriptor || !request.descriptor->valid()) {
         return mxfp4_gateup_prepack_reject(mxfp4_moe_gateup_prepack_status::INVALID_DESCRIPTOR, layout);
     }
-    if (!request.gate_base || !request.up_base || !request.scratch || request.layer < 0 || request.submit_device < 0 ||
-        request.route_metadata_signature == 0 || request.gate_identity_hash == 0 || request.up_identity_hash == 0) {
+    if (!request.scratch || request.layer < 0 || request.submit_device < 0 || request.route_metadata_signature == 0) {
+        return mxfp4_gateup_prepack_reject(mxfp4_moe_gateup_prepack_status::INVALID_ARGUMENT, layout);
+    }
+    if (request.source_kind == mxfp4_moe_gateup_prepack_source_kind::BASE_ARRAY) {
+        if (!request.gate_base || !request.up_base || request.gate_identity_hash == 0 || request.up_identity_hash == 0) {
+            return mxfp4_gateup_prepack_reject(mxfp4_moe_gateup_prepack_status::INVALID_ARGUMENT, layout);
+        }
+    } else if (request.source_kind == mxfp4_moe_gateup_prepack_source_kind::EXPERT_POINTER_TABLE) {
+        if (!request.gate_ptrs || !request.up_ptrs || !request.selected_experts_host ||
+            request.gate_ptr_table_identity_hash == 0 || request.up_ptr_table_identity_hash == 0) {
+            return mxfp4_gateup_prepack_reject(mxfp4_moe_gateup_prepack_status::INVALID_ARGUMENT, layout);
+        }
+    } else {
         return mxfp4_gateup_prepack_reject(mxfp4_moe_gateup_prepack_status::INVALID_ARGUMENT, layout);
     }
     if (request.n_experts <= 0) {
@@ -766,8 +781,13 @@ static mxfp4_moe_gateup_prepack_result mxfp4_gateup_prepack_validate(const mxfp4
     const int32_t * selected_experts_for_validation =
         request.selected_experts_host ? request.selected_experts_host : request.selected_experts;
     for (int64_t i = 0; i < request.selected_count; ++i) {
-        if (selected_experts_for_validation[i] < 0 || selected_experts_for_validation[i] >= request.n_experts) {
+        const int32_t expert = selected_experts_for_validation[i];
+        if (expert < 0 || expert >= request.n_experts) {
             return mxfp4_gateup_prepack_reject(mxfp4_moe_gateup_prepack_status::INVALID_SELECTION, layout);
+        }
+        if (request.source_kind == mxfp4_moe_gateup_prepack_source_kind::EXPERT_POINTER_TABLE &&
+            !request.expert_ptrs_on_device && (!request.gate_ptrs[expert] || !request.up_ptrs[expert])) {
+            return mxfp4_gateup_prepack_reject(mxfp4_moe_gateup_prepack_status::INVALID_ARGUMENT, layout);
         }
     }
     if (request.scratch_bytes < layout.total_bytes) {
@@ -844,6 +864,10 @@ mxfp4_moe_gateup_prepack_runtime_policy_result mxfp4_moe_gateup_prepack_runtime_
     }
     if (!in.direct_down_sum_compatible) {
         result.reason = "down-sum";
+        return result;
+    }
+    if (in.runtime_pointer_table_source && !in.pointer_table_source_available) {
+        result.reason = "pointer-table";
         return result;
     }
     if (!in.prepack_supported) {
@@ -945,10 +969,19 @@ mxfp4_moe_gateup_prepack_result mxfp4_moe_gateup_prepack_selected_rows_reference
         request.selected_experts_host ? request.selected_experts_host : request.selected_experts;
     for (int64_t entry = 0; entry < request.selected_count; ++entry) {
         const int32_t expert = selected_experts[entry];
-        const size_t  src    = static_cast<size_t>(expert) * role_bytes;
-        uint8_t *     dst    = request.scratch + static_cast<size_t>(entry) * entry_bytes;
-        std::memcpy(dst, request.gate_base + src, role_bytes);
-        std::memcpy(dst + role_bytes, request.up_base + src, role_bytes);
+        const uint8_t * gate_src = nullptr;
+        const uint8_t * up_src   = nullptr;
+        if (request.source_kind == mxfp4_moe_gateup_prepack_source_kind::EXPERT_POINTER_TABLE) {
+            gate_src = request.gate_ptrs[expert];
+            up_src   = request.up_ptrs[expert];
+        } else {
+            const size_t src = static_cast<size_t>(expert) * role_bytes;
+            gate_src         = request.gate_base + src;
+            up_src           = request.up_base + src;
+        }
+        uint8_t * dst = request.scratch + static_cast<size_t>(entry) * entry_bytes;
+        std::memcpy(dst, gate_src, role_bytes);
+        std::memcpy(dst + role_bytes, up_src, role_bytes);
     }
     return result;
 }
@@ -964,8 +997,12 @@ mxfp4_moe_gateup_prepack_result mxfp4_moe_gateup_prepack_selected_rows_submit(
         return result;
     }
 
-    const uint8_t * gate_base        = request.gate_base;
-    const uint8_t * up_base          = request.up_base;
+    const uint8_t *         gate_base        = request.gate_base;
+    const uint8_t *         up_base          = request.up_base;
+    const uint8_t * const * gate_ptrs        = request.gate_ptrs;
+    const uint8_t * const * up_ptrs          = request.up_ptrs;
+    const bool              pointer_source   =
+        request.source_kind == mxfp4_moe_gateup_prepack_source_kind::EXPERT_POINTER_TABLE;
     uint8_t *       scratch          = request.scratch;
     const int32_t * selected_experts = request.selected_experts;
     const size_t    role_bytes       = result.layout.single_expert_role_bytes;
@@ -983,9 +1020,15 @@ mxfp4_moe_gateup_prepack_result mxfp4_moe_gateup_prepack_selected_rows_submit(
                 const size_t    entry_off = idx - entry * entry_bytes;
                 const bool      up_role   = entry_off >= role_bytes;
                 const size_t    role_off  = up_role ? entry_off - role_bytes : entry_off;
-                const int32_t   expert    = selected_experts[entry];
-                const uint8_t * src_base  = up_role ? up_base : gate_base;
-                scratch[idx]              = src_base[static_cast<size_t>(expert) * role_bytes + role_off];
+                const int32_t   expert   = selected_experts[entry];
+                const uint8_t * src_base = nullptr;
+                if (pointer_source) {
+                    src_base = up_role ? up_ptrs[expert] : gate_ptrs[expert];
+                } else {
+                    src_base = up_role ? up_base : gate_base;
+                    src_base += static_cast<size_t>(expert) * role_bytes;
+                }
+                scratch[idx] = src_base[role_off];
             });
     });
     result.event_set = true;
@@ -1462,6 +1505,46 @@ static ggml_sycl::mem_handle mxfp4_moe_tensor_mem_handle(const ggml_tensor * ten
         return {};
     }
     return ggml_sycl::mem_handle::from_chunk_ptr(ptr, device, layout, on_device);
+}
+
+static bool mxfp4_moe_ptr_table_handle_for_tensor(const ggml_tensor *                    tensor,
+                                                  int                                    device,
+                                                  const void * const *                   ptrs,
+                                                  ggml_sycl::mem_handle *                table_handle_out,
+                                                  std::vector<ggml_sycl::mem_handle> *   retained_leases_out) {
+    if (table_handle_out) {
+        *table_handle_out = {};
+    }
+    if (retained_leases_out) {
+        retained_leases_out->clear();
+    }
+    if (!tensor || tensor->view_src != nullptr || !tensor->extra || !ptrs || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return false;
+    }
+
+    auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
+    if (!extra->moe_device_table_valid[device] || !extra->moe_expert_ptrs_handle[device].valid()) {
+        return false;
+    }
+    auto resolved = extra->moe_expert_ptrs_handle[device].resolve(device);
+    if (!resolved || resolved.ptr != ptrs || !resolved.on_device) {
+        return false;
+    }
+    const size_t min_table_bytes = static_cast<size_t>(std::max<int64_t>(tensor->ne[2], 1)) * sizeof(void *);
+    if (extra->moe_expert_ptrs_size[device] < min_table_bytes ||
+        extra->moe_expert_ptrs_handle[device].size() < min_table_bytes) {
+        return false;
+    }
+
+    if (table_handle_out) {
+        *table_handle_out = extra->moe_expert_ptrs_handle[device];
+    }
+    if (retained_leases_out) {
+        const auto & leases = !extra->moe_expert_ptrs_leases[device].empty() ? extra->moe_expert_ptrs_leases[device] :
+                                                                               extra->moe_expert_handles[device];
+        retained_leases_out->insert(retained_leases_out->end(), leases.begin(), leases.end());
+    }
+    return true;
 }
 
 static ggml_sycl::mem_handle mmvq_memcpy_handle_for_raw_ptr(void * ptr, int device, bool fallback_on_device) {
@@ -16132,15 +16215,17 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                 ggml_sycl::mxfp4_moe_gateup_prepack_layout_for_shape(
                     total_batches, ne01, ne00, &prepack_layout);
 
-            const void * gate_base_raw = ggml_sycl_resolve_tensor_ptr(gate_weight, runtime_device);
-            const void * up_base_raw   = ggml_sycl_resolve_tensor_ptr(up_weight, runtime_device);
-            ggml_sycl::mem_handle gate_handle = mxfp4_moe_tensor_mem_handle(
-                gate_weight, runtime_device, const_cast<void *>(gate_base_raw), weight_layout, true);
-            ggml_sycl::mem_handle up_handle =
-                mxfp4_moe_tensor_mem_handle(up_weight, runtime_device, const_cast<void *>(up_base_raw), weight_layout, true);
-            auto gate_resolved = gate_handle.resolve(runtime_device);
-            auto up_resolved   = up_handle.resolve(runtime_device);
-            auto src_resolved  = q8_1_owner.resolve(runtime_device);
+            ggml_sycl::mem_handle              gate_ptr_table_handle;
+            ggml_sycl::mem_handle              up_ptr_table_handle;
+            std::vector<ggml_sycl::mem_handle> gate_ptr_table_leases;
+            std::vector<ggml_sycl::mem_handle> up_ptr_table_leases;
+            const bool gate_ptr_table_ok = mxfp4_moe_ptr_table_handle_for_tensor(
+                gate_weight, runtime_device, gate_ptrs_device, &gate_ptr_table_handle, &gate_ptr_table_leases);
+            const bool up_ptr_table_ok = mxfp4_moe_ptr_table_handle_for_tensor(
+                up_weight, runtime_device, up_ptrs_device, &up_ptr_table_handle, &up_ptr_table_leases);
+            auto gate_ptr_table_resolved = gate_ptr_table_handle.resolve(runtime_device);
+            auto up_ptr_table_resolved   = up_ptr_table_handle.resolve(runtime_device);
+            auto src_resolved            = q8_1_owner.resolve(runtime_device);
 
             ggml_sycl::mem_handle route_metadata_handle = ggml_sycl::mem_handle::from_chunk_ptr(
                 const_cast<int32_t *>(ids_device), runtime_device, GGML_LAYOUT_AOS, /*on_device=*/true);
@@ -16157,12 +16242,12 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
             const bool metadata_complete = ids_host && ids_host_count == total_batches && ids_device &&
                                            ids_nb0 == static_cast<int64_t>(sizeof(int32_t)) && ids_nb1 > 0;
             const bool metadata_deterministic = metadata_complete && n_gpu_entries == total_batches;
-            const bool handles_ok = gate_resolved && gate_resolved.ptr && gate_resolved.on_device &&
-                                    gate_resolved.layout == weight_layout && up_resolved && up_resolved.ptr &&
-                                    up_resolved.on_device && up_resolved.layout == weight_layout && src_resolved &&
-                                    src_resolved.ptr && src_resolved.on_device && route_metadata_resolved &&
-                                    route_metadata_resolved.ptr && route_metadata_resolved.on_device &&
-                                    scratch_resolved && scratch_resolved.ptr && scratch_resolved.on_device;
+            const bool pointer_table_source_available =
+                gate_ptr_table_ok && up_ptr_table_ok && gate_ptr_table_resolved && gate_ptr_table_resolved.ptr &&
+                gate_ptr_table_resolved.on_device && up_ptr_table_resolved && up_ptr_table_resolved.ptr &&
+                up_ptr_table_resolved.on_device && src_resolved && src_resolved.ptr && src_resolved.on_device &&
+                route_metadata_resolved && route_metadata_resolved.ptr && route_metadata_resolved.on_device &&
+                scratch_resolved && scratch_resolved.ptr && scratch_resolved.on_device;
             const int  gateup_layer = mxfp4_moe_layer_from_name(gate_weight->name);
             uint64_t route_metadata_signature = 1469598103934665603ULL;
             uint64_t selected_experts_hash    = 1469598103934665603ULL;
@@ -16185,7 +16270,8 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
             const bool direct_down_sum_compatible = glu_row_contig && gateup_layer >= 0 && glu_dst_handle_override &&
                                                     glu_dst_handle_override->valid();
             const bool prepack_supported = layout_status == ggml_sycl::mxfp4_moe_gateup_prepack_status::OK &&
-                                           handles_ok && prepack_layout.total_bytes <= prepack_scratch_handle.size();
+                                           pointer_table_source_available &&
+                                           prepack_layout.total_bytes <= prepack_scratch_handle.size();
             const bool compute_supported = prepack_supported && ne12 == 1 && total_batches == n_ids &&
                                            n_gpu_entries == total_batches && total_batches > 0 &&
                                            total_batches <= INT_MAX && ne00 <= INT_MAX && ne10 <= INT_MAX &&
@@ -16199,10 +16285,10 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
             policy_input.selected_batches             = total_batches;
             policy_input.metadata_complete            = metadata_complete;
             policy_input.metadata_deterministic       = metadata_deterministic;
-            policy_input.gate_handle_valid            = gate_handle.valid();
-            policy_input.gate_handle_device           = gate_resolved && gate_resolved.on_device;
-            policy_input.up_handle_valid              = up_handle.valid();
-            policy_input.up_handle_device             = up_resolved && up_resolved.on_device;
+            policy_input.gate_handle_valid            = gate_ptr_table_handle.valid();
+            policy_input.gate_handle_device           = gate_ptr_table_resolved && gate_ptr_table_resolved.on_device;
+            policy_input.up_handle_valid              = up_ptr_table_handle.valid();
+            policy_input.up_handle_device             = up_ptr_table_resolved && up_ptr_table_resolved.on_device;
             policy_input.source_handle_valid          = q8_1_owner.valid();
             policy_input.source_handle_device         = src_resolved && src_resolved.on_device;
             policy_input.route_metadata_handle_valid  = route_metadata_handle.valid();
@@ -16213,6 +16299,8 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
             policy_input.scratch_capacity_bytes       = prepack_scratch_handle.size();
             policy_input.graph_recording              = ggml_sycl_graph_recording_active();
             policy_input.direct_down_sum_compatible   = direct_down_sum_compatible;
+            policy_input.runtime_pointer_table_source = true;
+            policy_input.pointer_table_source_available = pointer_table_source_available;
             policy_input.prepack_supported            = prepack_supported;
             policy_input.compute_supported            = compute_supported;
             const auto policy = ggml_sycl::mxfp4_moe_gateup_prepack_runtime_policy(policy_input);
@@ -16225,10 +16313,10 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                 const bool descriptor_ok =
                     descriptor.add_artifact(ggml_sycl::moe_gateup_prepack_artifact_role::SOURCE_ACTIVATION,
                                             q8_1_owner, required_size) &&
-                    descriptor.add_artifact(ggml_sycl::moe_gateup_prepack_artifact_role::GATE_WEIGHT, gate_handle,
-                                            gate_handle.size()) &&
-                    descriptor.add_artifact(ggml_sycl::moe_gateup_prepack_artifact_role::UP_WEIGHT, up_handle,
-                                            up_handle.size()) &&
+                    descriptor.add_artifact(ggml_sycl::moe_gateup_prepack_artifact_role::GATE_WEIGHT,
+                                            gate_ptr_table_handle, gate_ptr_table_handle.size()) &&
+                    descriptor.add_artifact(ggml_sycl::moe_gateup_prepack_artifact_role::UP_WEIGHT,
+                                            up_ptr_table_handle, up_ptr_table_handle.size()) &&
                     descriptor.add_artifact(ggml_sycl::moe_gateup_prepack_artifact_role::SCRATCH,
                                             prepack_scratch_handle, prepack_layout.total_bytes) &&
                     descriptor.add_artifact(ggml_sycl::moe_gateup_prepack_artifact_role::ROUTE_METADATA,
@@ -16237,8 +16325,11 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                 if (descriptor_ok) {
                     ggml_sycl::mxfp4_moe_gateup_prepack_request request;
                     request.descriptor               = &descriptor;
-                    request.gate_base                = static_cast<const uint8_t *>(gate_resolved.ptr);
-                    request.up_base                  = static_cast<const uint8_t *>(up_resolved.ptr);
+                    request.source_kind              =
+                        ggml_sycl::mxfp4_moe_gateup_prepack_source_kind::EXPERT_POINTER_TABLE;
+                    request.gate_ptrs                = reinterpret_cast<const uint8_t * const *>(gate_ptrs_device);
+                    request.up_ptrs                  = reinterpret_cast<const uint8_t * const *>(up_ptrs_device);
+                    request.expert_ptrs_on_device    = true;
                     request.scratch                  = prepack_scratch;
                     request.scratch_bytes            = prepack_layout.total_bytes;
                     request.selected_experts         = ids_device;
@@ -16251,18 +16342,22 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                     request.layer                    = gateup_layer;
                     request.submit_device            = runtime_device;
                     request.route_metadata_signature = route_metadata_signature;
-                    request.gate_identity_hash       = gate_handle.stable_identity_hash();
-                    request.up_identity_hash         = up_handle.stable_identity_hash();
-                    request.scratch_identity_hash    = prepack_scratch_handle.stable_identity_hash();
+                    request.gate_ptr_table_identity_hash = gate_ptr_table_handle.stable_identity_hash();
+                    request.up_ptr_table_identity_hash   = up_ptr_table_handle.stable_identity_hash();
+                    request.scratch_identity_hash        = prepack_scratch_handle.stable_identity_hash();
                     request.env_enabled              = true;
 
                     std::vector<ggml_sycl::mem_handle> prepack_retained_handles;
-                    prepack_retained_handles.reserve(5);
+                    prepack_retained_handles.reserve(5 + gate_ptr_table_leases.size() + up_ptr_table_leases.size());
                     prepack_retained_handles.push_back(q8_1_owner);
-                    prepack_retained_handles.push_back(gate_handle);
-                    prepack_retained_handles.push_back(up_handle);
+                    prepack_retained_handles.push_back(gate_ptr_table_handle);
+                    prepack_retained_handles.push_back(up_ptr_table_handle);
                     prepack_retained_handles.push_back(route_metadata_handle);
                     prepack_retained_handles.push_back(prepack_scratch_handle);
+                    prepack_retained_handles.insert(prepack_retained_handles.end(), gate_ptr_table_leases.begin(),
+                                                    gate_ptr_table_leases.end());
+                    prepack_retained_handles.insert(prepack_retained_handles.end(), up_ptr_table_leases.begin(),
+                                                    up_ptr_table_leases.end());
 
                     ggml_sycl::mxfp4_moe_gateup_prepack_result prepack_result;
                     try {

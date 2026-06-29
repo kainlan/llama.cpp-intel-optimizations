@@ -183,6 +183,11 @@ enum class mxfp4_moe_gateup_prepack_status : uint8_t {
     LAYOUT_OVERFLOW,
 };
 
+enum class mxfp4_moe_gateup_prepack_source_kind : uint8_t {
+    BASE_ARRAY           = 0,
+    EXPERT_POINTER_TABLE = 1,
+};
+
 const char * mxfp4_moe_gateup_prepack_status_name(mxfp4_moe_gateup_prepack_status status);
 bool         mxfp4_moe_gateup_prepack_enabled_from_env(const char * env);
 const char * mxfp4_moe_gateup_prepack_route_label();
@@ -201,16 +206,18 @@ struct mxfp4_moe_gateup_prepack_runtime_policy_input {
     bool         up_handle_device            = false;
     bool         source_handle_valid         = false;
     bool         source_handle_device        = false;
-    bool         route_metadata_handle_valid  = false;
-    bool         route_metadata_handle_device = false;
-    bool         scratch_handle_valid         = false;
-    bool         scratch_handle_device       = false;
-    size_t       scratch_required_bytes      = 0;
-    size_t       scratch_capacity_bytes      = 0;
-    bool         graph_recording             = false;
-    bool         direct_down_sum_compatible  = false;
-    bool         prepack_supported           = false;
-    bool         compute_supported           = false;
+    bool         route_metadata_handle_valid    = false;
+    bool         route_metadata_handle_device   = false;
+    bool         scratch_handle_valid           = false;
+    bool         scratch_handle_device          = false;
+    size_t       scratch_required_bytes         = 0;
+    size_t       scratch_capacity_bytes         = 0;
+    bool         graph_recording                = false;
+    bool         direct_down_sum_compatible     = false;
+    bool         runtime_pointer_table_source   = false;
+    bool         pointer_table_source_available = false;
+    bool         prepack_supported              = false;
+    bool         compute_supported              = false;
 };
 
 struct mxfp4_moe_gateup_prepack_runtime_policy_result {
@@ -252,8 +259,13 @@ struct mxfp4_moe_gateup_prepack_key {
 
 struct mxfp4_moe_gateup_prepack_request {
     const moe_gateup_prepack_scratch_descriptor * descriptor               = nullptr;
+    mxfp4_moe_gateup_prepack_source_kind          source_kind              =
+        mxfp4_moe_gateup_prepack_source_kind::BASE_ARRAY;
     const uint8_t *                               gate_base                = nullptr;
     const uint8_t *                               up_base                  = nullptr;
+    const uint8_t * const *                       gate_ptrs                = nullptr;
+    const uint8_t * const *                       up_ptrs                  = nullptr;
+    bool                                          expert_ptrs_on_device    = false;
     uint8_t *                                     scratch                  = nullptr;
     size_t                                        scratch_bytes            = 0;
     const int32_t *                               selected_experts         = nullptr;
@@ -266,9 +278,11 @@ struct mxfp4_moe_gateup_prepack_request {
     int                                           layer                    = -1;
     int                                           submit_device            = -1;
     uint64_t                                      route_metadata_signature = 0;
-    size_t                                        gate_identity_hash       = 0;
-    size_t                                        up_identity_hash         = 0;
-    size_t                                        scratch_identity_hash    = 0;
+    size_t                                        gate_identity_hash           = 0;
+    size_t                                        up_identity_hash             = 0;
+    size_t                                        gate_ptr_table_identity_hash = 0;
+    size_t                                        up_ptr_table_identity_hash   = 0;
+    size_t                                        scratch_identity_hash        = 0;
     bool                                          env_enabled              = false;
 };
 
