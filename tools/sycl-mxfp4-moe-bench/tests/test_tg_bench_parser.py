@@ -76,6 +76,27 @@ def test_rejects_zero_total_gateup(tmp_path: Path) -> None:
     assert "error: record 1 has non-positive metrics.total_gateup_equiv_ms" in result.stderr
 
 
+def test_rejects_nonstandard_json_constants_total_gateup(tmp_path: Path) -> None:
+    for constant in ("NaN", "Infinity", "-Infinity"):
+        path = tmp_path / f"{constant}.jsonl"
+        text = json.dumps(valid_record())
+        text = text.replace('"total_gateup_equiv_ms": 6.0', f'"total_gateup_equiv_ms": {constant}')
+        path.write_text(text + "\n", encoding="utf-8")
+        result = run_parser(path)
+        assert result.returncode != 0
+        assert "error: record 1 malformed JSON" in result.stderr
+
+
+def test_rejects_nonfinite_saving_metric(tmp_path: Path) -> None:
+    path = tmp_path / "inf.jsonl"
+    text = json.dumps(valid_record())
+    text = text.replace('"saving_vs_baseline_ms": 0.0', '"saving_vs_baseline_ms": 1e999')
+    path.write_text(text + "\n", encoding="utf-8")
+    result = run_parser(path)
+    assert result.returncode != 0
+    assert "error: record 1 has invalid metrics.saving_vs_baseline_ms" in result.stderr
+
+
 def test_rejects_fatal_marker(tmp_path: Path) -> None:
     record = valid_record()
     record["fatal"]["total"] = 1

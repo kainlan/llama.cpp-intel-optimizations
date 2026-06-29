@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,30 @@ def require_keys(obj: dict[str, Any], keys: tuple[str, ...], prefix: str, index:
             raise ValueError(f"record {index} missing key: {name}")
 
 
+def field_name(prefix: str, key: str) -> str:
+    return key if not prefix else f"{prefix}.{key}"
+
+
+def require_int_field(obj: dict[str, Any], prefix: str, key: str, index: int) -> int:
+    value = obj[key]
+    name = field_name(prefix, key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"record {index} has invalid {name}")
+    return value
+
+
+def require_finite_number(obj: dict[str, Any], prefix: str, key: str, index: int) -> float:
+    value = obj[key]
+    name = field_name(prefix, key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"record {index} has invalid {name}")
+    return float(value)
+
+
+def reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
 def validate_record(record: Any, index: int) -> dict[str, Any]:
     if not isinstance(record, dict):
         raise ValueError(f"record {index} is not a JSON object")
@@ -62,16 +87,19 @@ def validate_record(record: Any, index: int) -> dict[str, Any]:
     if not isinstance(record["route"], str) or not record["route"]:
         raise ValueError(f"record {index} has invalid route")
 
-    try:
-        total_gateup = float(metrics["total_gateup_equiv_ms"])
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"record {index} has invalid metrics.total_gateup_equiv_ms") from exc
+    for key in REQUIRED_SHAPE:
+        if require_int_field(shape, "shape", key, index) <= 0:
+            raise ValueError(f"record {index} has invalid shape.{key}")
+
+    metric_values = {key: require_finite_number(metrics, "metrics", key, index) for key in REQUIRED_METRICS}
+    for key in REQUIRED_CORRECT:
+        require_finite_number(correct, "correct", key, index)
+
+    total_gateup = metric_values["total_gateup_equiv_ms"]
     if total_gateup <= 0.0:
         raise ValueError(f"record {index} has non-positive metrics.total_gateup_equiv_ms")
 
-    fatal_total = fatal["total"]
-    if isinstance(fatal_total, bool) or not isinstance(fatal_total, (int, float)):
-        raise ValueError(f"record {index} has invalid fatal.total")
+    fatal_total = require_finite_number(fatal, "fatal", "total", index)
     if fatal_total != 0:
         raise ValueError(f"record {index} fatal.total is non-zero")
 
@@ -86,9 +114,11 @@ def load_records(path: Path) -> list[dict[str, Any]]:
             if not stripped:
                 continue
             try:
-                parsed = json.loads(stripped)
+                parsed = json.loads(stripped, parse_constant=reject_json_constant)
             except json.JSONDecodeError as exc:
                 raise ValueError(f"record {line_no} malformed JSON: {exc.msg}") from exc
+            except ValueError as exc:
+                raise ValueError(f"record {line_no} malformed JSON: {exc}") from exc
             records.append(validate_record(parsed, line_no))
     return records
 
