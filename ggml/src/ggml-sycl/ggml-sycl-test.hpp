@@ -83,6 +83,26 @@ struct test_moe_single_xmx_planner_result {
 
 test_moe_single_xmx_planner_result test_moe_single_xmx_planner_decision(const test_moe_single_xmx_planner_input & in);
 
+struct test_moe_xmx_tiled_materialization_input {
+    int              n_experts                 = 0;
+    ggml_layout_mode expected_layout           = GGML_LAYOUT_AOS;
+    int              handles_present           = 0;
+    int              handles_device_resident   = 0;
+    int              handles_matching_layout   = 0;
+    int              ready_events_present      = 0;
+    bool             single_xmx_mode           = false;
+    bool             materialization_succeeded = false;
+};
+
+struct test_moe_xmx_tiled_materialization_result {
+    bool complete              = false;
+    bool release_soa_after_xmx = false;
+    int  reason_code           = 0;
+};
+
+test_moe_xmx_tiled_materialization_result test_moe_xmx_tiled_materialization_invariants(
+    const test_moe_xmx_tiled_materialization_input & in);
+
 struct test_moe_default_fast_path_policy_input {
     bool default_fast_path_enabled = false;
     bool decode_phase              = false;

@@ -1187,6 +1187,7 @@ foreach(_residency_test
     test-sycl-moe-gateup-prepack-scratch
     test-sycl-moe-xmx-tiled-single-layout-policy
     test-sycl-moe-xmx-tiled-single-layout-planner
+    test-sycl-moe-xmx-tiled-materialization
     test-sycl-moe-fusion-noactivation
     test-sycl-moe-sequence-graphlet-policy
 )
