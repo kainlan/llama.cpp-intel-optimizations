@@ -175,6 +175,8 @@ def gate_args_requested(args: argparse.Namespace) -> bool:
         or args.forbid_diag_path
         or args.require_down_dpas_direct_final
         or args.require_mxfp4_profile_evidence
+        or args.require_single_xmx_gateup
+        or args.forbid_gateup_soa_fallback
         or args.forbid_down_dpas_direct_final
         or args.require_bench_min
         or args.require_bench_test
@@ -227,6 +229,8 @@ XMX_ORIGINAL_VALIDATE_RE = re.compile(
     r"\[MOE-XMX-OUTPUT-ORIGINAL-VALIDATE\].*?checked=(?P<checked>\d+)"
     r".*?mismatches=(?P<mismatches>\d+)"
 )
+SINGLE_XMX_GATEUP_RE = re.compile(r"\bsingle_xmx_gateup=(?P<value>[01])\b")
+PROMOTED_SOA_RE = re.compile(r"\bpromoted_soa=(?P<count>\d+)\b")
 FATAL_MARKER_PATTERNS = (
     (re.compile(r"^\[HARNESS-TIMEOUT\](?:\s|$)", re.IGNORECASE), "fatal.harness_timeout"),
     (
@@ -419,15 +423,34 @@ def summarize_file(path: pathlib.Path) -> tuple[collections.Counter[str], list[s
         for key in fatal_keys_seen:
             counters[key] += 1
         phase_match = PHASE_RE.search(line)
+        single_xmx_gateup = SINGLE_XMX_GATEUP_RE.search(line)
+        if single_xmx_gateup:
+            counters[f"single_xmx_gateup.{single_xmx_gateup.group('value')}"] += 1
+        if "[PLACEMENT-MOE]" in line and single_xmx_gateup:
+            counters[f"placement.single_xmx_gateup.{single_xmx_gateup.group('value')}"] += 1
+            if single_xmx_gateup.group("value") == "1":
+                counters["placement.single_xmx_gateup"] += 1
+        if (
+            "[MOE-PHASE-LAYOUT]" in line
+            and single_xmx_gateup
+            and single_xmx_gateup.group("value") == "1"
+            and "complete=1" in line
+        ):
+            counters["phase.single_xmx_gateup.complete"] += 1
+        promoted_soa = PROMOTED_SOA_RE.search(line)
+        if promoted_soa and int(promoted_soa.group("count")) > 0:
+            counters["placement.gateup.promoted_soa"] += int(promoted_soa.group("count"))
         if any(marker in line for marker in PROFILE_MARKERS):
             lines.append(line)
         tg_profile = MXFP4_TG_PROFILE_RE.search(line)
         if "[MXFP4-MOE-TG-PROFILE]" in line:
-            path_match = PATH_RE.search(line)
+            path_match = PATH_RE.search(line) or MXFP4_PP_PROFILE_LAST_PATH_RE.search(line)
             if path_match:
                 profile_path = path_match.group(1)
                 counters[f"diag.path.{profile_path}"] += 1
                 counters[f"profile.mxfp4_tg.path.{profile_path}"] += 1
+                if profile_path == "packed-q8-m2":
+                    counters["profile.gateup.soa_fallback_path"] += 1
         if line.startswith("[UNIFIED-CACHE-STATS]"):
             for cache_key, cache_value in KEY_VALUE_RE.findall(line):
                 if cache_key in (
@@ -477,6 +500,8 @@ def summarize_file(path: pathlib.Path) -> tuple[collections.Counter[str], list[s
             if last_path_match:
                 last_path = last_path_match.group(1)
                 counters[f"profile.mxfp4_pp.path.{last_path}"] += 1
+                if last_path == "packed-q8-m2":
+                    counters["profile.gateup.soa_fallback_path"] += 1
         xmx_original = XMX_ORIGINAL_VALIDATE_RE.search(line)
         if xmx_original:
             checked = int(xmx_original.group("checked"))
@@ -611,6 +636,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="exit nonzero unless MXFP4 TG/PP profile counters or profile path labels were parsed",
     )
     parser.add_argument(
+        "--require-single-xmx-gateup",
+        action="store_true",
+        help="exit nonzero unless single persistent XMX_TILED gate/up evidence was parsed",
+    )
+    parser.add_argument(
+        "--forbid-gateup-soa-fallback",
+        action="store_true",
+        help="exit nonzero if single-layout proof logs show gate/up SOA fallback evidence",
+    )
+    parser.add_argument(
         "--forbid-down-dpas-direct-final",
         action="store_true",
         help="exit nonzero if any down-dpas-direct-final diagnostic path appears",
@@ -726,6 +761,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.require_mxfp4_profile_evidence and mxfp4_profile_evidence_count(total) <= 0:
         print("error: MXFP4 profile evidence missing")
         return 16
+    if args.require_single_xmx_gateup:
+        if total.get("placement.single_xmx_gateup", 0) <= 0 and total.get("phase.single_xmx_gateup.complete", 0) <= 0:
+            print("error: single XMX_TILED gate/up evidence missing")
+            return 18
+        if (
+            total.get("profile.mxfp4_tg.path.xmx-tiled-single-gateup", 0) <= 0
+            or total.get("profile.mxfp4_pp.path.xmx-tiled-single-gateup", 0) <= 0
+        ):
+            print("error: single XMX_TILED gate/up profile path evidence missing")
+            return 18
+    if args.forbid_gateup_soa_fallback:
+        if (
+            total.get("single_xmx_gateup.0", 0) > 0
+            or total.get("placement.gateup.promoted_soa", 0) > 0
+            or total.get("profile.gateup.soa_fallback_path", 0) > 0
+        ):
+            print("error: gate/up SOA fallback present in single-layout proof mode")
+            return 19
     direct_final_count = diag_path_prefix_match_count(total, "down-dpas-direct-final")
     direct_final_success_count = down_dpas_direct_final_success_count(total)
     print(f"diag.down_dpas_direct_final.present.{str(direct_final_count > 0).lower()} 1")

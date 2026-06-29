@@ -1330,5 +1330,85 @@ def test_default_fast_path_optimized_accepts_proven_direct_final_saved_submit() 
         assert "optimized.default_fast_path.true 1" in out
 
 
+
+def test_parser_requires_single_xmx_gateup_evidence() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        (tmp / "profile.stderr").write_text(
+            "[PLACEMENT-MOE] single_xmx_gateup=1 tensor=blk.0.ffn_gate_exps.weight layout=xmx_tiled soa_alternate=0\n"
+            "[MOE-PHASE-LAYOUT] tensor=blk.0.ffn_gate_exps.weight target=xmx_tiled single_xmx_gateup=1 materialized=32/32 complete=1\n"
+            "[MXFP4-MOE-TG-PROFILE] calls=72 soa=0 coalesced=0 aos=0 dpas=48 i8=0 total=6.000 ms quant=0.100 ms "
+            "artifact=0.100 ms batch_ids=0.000 ms kernel=5.500 ms gateup_glu=4.100 ms/48 down=0.700 ms/24 "
+            "last_path=xmx-tiled-single-gateup\n"
+            "[MXFP4-MOE-PP-PROFILE] calls=24 gateup=48 down=24 entries=8192 batches=8192 last_path=xmx-tiled-single-gateup\n"
+        )
+        out = run_parser(tmp, "--require-single-xmx-gateup")
+        assert "placement.single_xmx_gateup 1" in out
+        assert "phase.single_xmx_gateup.complete 1" in out
+        assert "profile.mxfp4_tg.path.xmx-tiled-single-gateup 1" in out
+        assert "profile.mxfp4_pp.path.xmx-tiled-single-gateup 1" in out
+
+
+def test_parser_rejects_missing_single_xmx_gateup_when_required() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        (tmp / "profile.stderr").write_text(
+            "[MXFP4-MOE-TG-PROFILE] calls=72 soa=18 coalesced=0 aos=0 dpas=48 i8=0 total=6.000 ms "
+            "quant=0.100 ms artifact=0.100 ms batch_ids=0.000 ms kernel=5.500 ms gateup_glu=5.700 ms/48 "
+            "down=0.700 ms/24 last_path=packed-q8-m2\n"
+        )
+        result = run_parser_result(tmp, "--require-single-xmx-gateup")
+        assert result.returncode != 0
+        assert "error: single XMX_TILED gate/up evidence missing" in result.stdout
+
+
+def test_parser_rejects_single_xmx_without_direct_pp_and_tg_paths() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        (tmp / "profile.stderr").write_text(
+            "[PLACEMENT-MOE] single_xmx_gateup=1 tensor=blk.0.ffn_gate_exps.weight layout=xmx_tiled soa_alternate=0\n"
+            "[MOE-PHASE-LAYOUT] tensor=blk.0.ffn_gate_exps.weight target=soa single_xmx_gateup=0 materialized=32/32 complete=1\n"
+            "[MXFP4-MOE-TG-PROFILE] calls=72 soa=18 coalesced=0 aos=0 dpas=48 i8=0 total=6.000 ms "
+            "quant=0.100 ms artifact=0.100 ms batch_ids=0.000 ms kernel=5.500 ms gateup_glu=5.700 ms/48 "
+            "down=0.700 ms/24 last_path=packed-q8-m2\n"
+        )
+        result = run_parser_result(tmp, "--require-single-xmx-gateup")
+        assert result.returncode != 0
+        assert "error: single XMX_TILED gate/up profile path evidence missing" in result.stdout
+
+
+def test_parser_forbids_gateup_soa_fallback_in_single_xmx_mode() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        (tmp / "profile.stderr").write_text(
+            "[PLACEMENT-MOE] PP primary gate/up layouts prepared before packing: device=1 promoted_soa=64 no_layout_bytes=0\n"
+            "[MXFP4-MOE-TG-PROFILE] calls=72 soa=18 coalesced=0 aos=0 dpas=48 i8=0 total=6.000 ms "
+            "quant=0.100 ms artifact=0.100 ms batch_ids=0.000 ms kernel=5.500 ms gateup_glu=5.700 ms/48 "
+            "down=0.700 ms/24 last_path=packed-q8-m2\n"
+        )
+        result = run_parser_result(tmp, "--forbid-gateup-soa-fallback")
+        assert result.returncode != 0
+        assert "error: gate/up SOA fallback present in single-layout proof mode" in result.stdout
+
+
+def test_harness_dry_run_single_xmx_gateup_mode_includes_required_gates() -> None:
+    out = run_harness_dry_run("single-xmx-gateup")
+    assert "GGML_SYCL_MOE_GATEUP_SINGLE_XMX=1" in out
+    assert "--require-single-xmx-gateup" in out
+    assert "--forbid-gateup-soa-fallback" in out
+
+
+def test_parser_forbids_explicit_single_xmx_gateup_zero() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        (tmp / "profile.stderr").write_text(
+            "[PLACEMENT-MOE] single_xmx_gateup=0 tensor=blk.0.ffn_gate_exps.weight layout=soa soa_alternate=1\n"
+        )
+        result = run_parser_result(tmp, "--forbid-gateup-soa-fallback")
+        assert result.returncode != 0
+        assert "placement.single_xmx_gateup.0 1" in result.stdout
+        assert "error: gate/up SOA fallback present in single-layout proof mode" in result.stdout
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

@@ -23,7 +23,7 @@ Lead-only B50 GPT-OSS MoE correctness/performance gates. Workers must use
 --dry-run only. The script never probes devices with sycl-ls or DRM/fdinfo.
 
 Options:
-  --mode default|safe-optin|sequence-graphlet|profile|b50-profile-matrix|b50-aggressive-tg|aggressive-suite|down-dpas-direct-final|down-dpas-rank-parallel-atomic|down-dpas-scratch-reduce|down-dpas-same-expert-grouped|b50-pp-materialize-tg-safe|b50-default-candidate|b580-default-candidate|promotion-candidate|promotion-suite|all
+  --mode default|safe-optin|sequence-graphlet|profile|b50-profile-matrix|b50-aggressive-tg|aggressive-suite|down-dpas-direct-final|down-dpas-rank-parallel-atomic|down-dpas-scratch-reduce|down-dpas-same-expert-grouped|b50-pp-materialize-tg-safe|single-xmx-gateup|b50-default-candidate|b580-default-candidate|promotion-candidate|promotion-suite|all
       default                Run default canonical B50 GPT-OSS count + PP512/TG128 bench
       safe-optin             Run safe phase/down-XMX weighted-reduce B50 count + bench
       sequence-graphlet      Run active sequence graphlets (explicit unsafe replay+record gates) B50 count + bench
@@ -40,6 +40,7 @@ Options:
                               Run B50 diagnostic down DPAS same-expert grouped short profile and parser evidence check
       b50-pp-materialize-tg-safe
                               Run B50 PP selected-materialization with TG direct-final forbidden
+      single-xmx-gateup       Run B50 single persistent XMX_TILED gate/up proof gates
       b50-default-candidate  Run B50 GPT-OSS default fast-path candidate count/diag + no-diag perf bench
       b580-default-candidate Run B580 Mistral default fast-path candidate count/diag + no-diag perf bench
       promotion-candidate    Run B50 and B580 default-candidate gates serially; grouped decode only with --grouped-decode-candidate
@@ -518,7 +519,7 @@ parse_args() {
     done
 
     case "$MODE" in
-        default|safe-optin|sequence-graphlet|profile|b50-profile-matrix|b50-aggressive-tg|aggressive-suite|down-dpas-direct-final|down-dpas-rank-parallel-atomic|down-dpas-scratch-reduce|down-dpas-same-expert-grouped|b50-pp-materialize-tg-safe|b50-default-candidate|b580-default-candidate|promotion-candidate|promotion-suite|all) ;;
+        default|safe-optin|sequence-graphlet|profile|b50-profile-matrix|b50-aggressive-tg|aggressive-suite|down-dpas-direct-final|down-dpas-rank-parallel-atomic|down-dpas-scratch-reduce|down-dpas-same-expert-grouped|b50-pp-materialize-tg-safe|single-xmx-gateup|b50-default-candidate|b580-default-candidate|promotion-candidate|promotion-suite|all) ;;
         *)
             echo "bad mode: $MODE" >&2
             usage >&2
@@ -622,6 +623,15 @@ main() {
         GGML_SYCL_MXFP4_PP_PROFILE=1
         GGML_SYCL_MOE_PROFILE=1
     )
+    local -a single_xmx_gateup_env=(
+        GGML_SYCL_MOE_GATEUP_SINGLE_XMX=1
+        GGML_SYCL_MOE_PHASE_MATERIALIZE=1
+        GGML_SYCL_MOE_PHASE_BULK_XMX=1
+        GGML_SYCL_MOE_DOWN_SUM_DIRECT=1
+        GGML_SYCL_MXFP4_TG_PROFILE=1
+        GGML_SYCL_MXFP4_PP_PROFILE=1
+        GGML_SYCL_MOE_PROFILE=1
+    )
 
     if mode_selected default; then
         run_count_gate default_count
@@ -679,6 +689,27 @@ main() {
         run_b50_pp_materialize_tg_safe_path_check b50_pp_materialize_tg_safe_path_check b50_pp_materialize_tg_safe_diag
         run_b50_gptoss_bench b50_pp_materialize_tg_safe_perf "${pp_materialize_tg_safe_env[@]}"
         run_b50_pp_materialize_tg_safe_perf_check b50_pp_materialize_tg_safe_perf_check b50_pp_materialize_tg_safe_perf
+    fi
+
+    if [[ "$MODE" == "single-xmx-gateup" ]]; then
+        run_b50_count_gate single_xmx_gateup_count "${single_xmx_gateup_env[@]}"
+        run_b50_count_output_check single_xmx_gateup_count_output_check single_xmx_gateup_count
+        run_b50_gptoss_diag_bench single_xmx_gateup_diag "${single_xmx_gateup_env[@]}"
+        run_cmd single_xmx_gateup_path_check python3 scripts/parse-sycl-moe-profile.py --no-lines \
+            --require-no-fatal-markers \
+            --require-mxfp4-profile-evidence \
+            --require-single-xmx-gateup \
+            --forbid-gateup-soa-fallback \
+            "$LOGDIR/single_xmx_gateup_count.stderr" "$LOGDIR/single_xmx_gateup_diag.stderr"
+        run_b50_gptoss_bench single_xmx_gateup_perf "${single_xmx_gateup_env[@]}"
+        run_cmd single_xmx_gateup_perf_check python3 scripts/parse-sycl-moe-profile.py --no-lines \
+            --require-no-fatal-markers \
+            --require-mxfp4-profile-evidence \
+            --require-single-xmx-gateup \
+            --forbid-gateup-soa-fallback \
+            --require-bench-test pp512 --require-bench-min pp512 1100 \
+            --require-bench-test tg128 --require-bench-min tg128 45 \
+            "$LOGDIR/single_xmx_gateup_perf.stdout" "$LOGDIR/single_xmx_gateup_perf.stderr"
     fi
 
 
