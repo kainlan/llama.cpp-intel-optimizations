@@ -1,7 +1,7 @@
 # MXFP4 TG Runtime Baseline Evidence
 
-Worktree: `/Apps/llama.cpp-mxfp4-tg-runtime`  
-Branch: `feature/sycl-mxfp4-tg-runtime`  
+Worktree: `/Apps/llama.cpp-mxfp4-tg-runtime`
+Branch: `feature/sycl-mxfp4-tg-runtime`
 Baseline commit: `b08e732cd chore(sycl): isolate MXFP4 TG runtime baseline`
 
 This worktree combines the pushed dry-run microbench suite with the previously dirty runtime baseline that contains `GGML_SYCL_MOE_DOWN_SUM_DIRECT`.

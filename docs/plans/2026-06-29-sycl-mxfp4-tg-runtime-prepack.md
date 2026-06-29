@@ -164,7 +164,7 @@ Acceptance:
 
 - Document exact lead-only commands for count, PP/TG, profile, fatal-marker scans, route-label requirement, and fallback-absence requirement.
 - Workers do not run these commands.
-- Promotion checklist repeats: exact count, fatal.total 0, required route label, forbidden fallback absence, MXFP4 profile evidence, `PP512 >= 1100`, `TG128 >= 45` or explicit near-target acceptance.
+- Promotion checklist repeats: exact count, fatal.total 0, required route label, forbidden fallback absence, MXFP4 profile evidence, `PP512 >= 1100`, and `TG128 >= 45`. A lead may record a near-target result only as non-promoted follow-up evidence when `42.0 <= TG128 < 45.0`, route evidence is clean, and the profile shows gate/up+GLU `<= 4.2 ms/token`; that does not authorize default-on promotion.
 
 ### Task 6: Docs and final review handoff
 
@@ -238,8 +238,9 @@ export GGML_SYCL_MOE_PROFILE=1
 - Required route label `gateup-prepack-dpas` is missing when env is enabled.
 - Fallback path silently runs while claiming prepack route success.
 - `PP512 < 1100`.
-- `TG128 <= current direct baseline` after optimization.
-- Prepack+compute cannot reduce the gate/up+GLU profile bucket materially below `5.6 ms/token`.
+- `TG128 < 40.0 tok/s` after optimization, or `TG128 <= 37.05 tok/s` relative to the current direct baseline.
+- `40.0 <= TG128 < 42.0 tok/s` after two implementation iterations; keep only as a documented negative probe, not an active route.
+- Prepack+compute gate/up+GLU profile bucket remains `> 4.8 ms/token`, or saves `< 0.8 ms/token` versus the `5.6 ms/token` direct-route baseline. Promotion-quality evidence should show gate/up+GLU `<= 4.2 ms/token` unless TG throughput already reaches `>= 45 tok/s`.
 
 ## Initial Expected Outcome
 
