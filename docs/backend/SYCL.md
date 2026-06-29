@@ -833,6 +833,20 @@ use 1 SYCL GPUs: [0] with Max compute units:512
 | ZES_ENABLE_SYSMAN | 0 (default) or 1 | Support to get free memory of GPU by sycl::aspect::ext_intel_free_memory.<br>Recommended to use when --split-mode = layer |
 | UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS | 0 (default) or 1 | Support malloc device memory more than 4GB.|
 
+### MXFP4 MoE TG Microbench Suite
+
+`sycl-mxfp4-moe-bench` is a synthetic research tool for B50 GPT-OSS MXFP4 token-generation route screening. It does not change llama runtime dispatch and is worker-safe only when used in `--dry-run` mode.
+
+Worker-safe smoke commands:
+
+```bash
+./scripts/sycl-build.sh sycl-mxfp4-moe-bench
+python3 scripts/run-sycl-mxfp4-tg-microbenches.py --dry-run --out-dir /tmp/mxfp4_tg_dryrun
+python3 scripts/parse-sycl-mxfp4-tg-bench.py /tmp/mxfp4_tg_dryrun/baseline.jsonl --require-route baseline
+```
+
+Lead-only non-dry-run and model validation are documented in activation/mxfp4-tg-microbench-lead-validation.md.
+
 ## Memory placement
 
 SYCL builds use the unified cache as the memory placement authority. Model
