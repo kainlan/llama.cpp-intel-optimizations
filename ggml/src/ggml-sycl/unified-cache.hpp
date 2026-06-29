@@ -165,6 +165,10 @@ struct mxfp4_moe_single_gateup_layout_policy_result {
     const char *     route_label            = "fallback";
 };
 
+static inline const char * mxfp4_moe_single_gateup_route_label() {
+    return "xmx-tiled-single-gateup";
+}
+
 static inline bool mxfp4_moe_single_gateup_layout_env_enabled(const char * env_value) {
     return env_value != nullptr && std::atoi(env_value) != 0;
 }
@@ -212,7 +216,7 @@ static inline mxfp4_moe_single_gateup_layout_policy_result mxfp4_moe_single_gate
     out.requires_soa_alternate = false;
     out.layout                 = GGML_LAYOUT_XMX_TILED;
     out.reason                 = "none";
-    out.route_label            = "xmx-tiled-single-gateup";
+    out.route_label            = mxfp4_moe_single_gateup_route_label();
     return out;
 }
 

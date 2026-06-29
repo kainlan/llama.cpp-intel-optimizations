@@ -11,6 +11,7 @@
 #include "quantize.hpp"
 #include "quants.hpp"
 #include "sycl-profiling.hpp"
+#include "unified-cache.hpp"
 #include "unified-kernel.hpp"  // For split barrier support
 #include "vecdotq.hpp"
 
@@ -664,6 +665,18 @@ static bool mxfp4_moe_xmx_tiled_pack_q8_enabled() {
         return !(env && std::atoi(env) != 0);
     }();
     return enabled;
+}
+
+static bool mxfp4_moe_gateup_single_xmx_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_MOE_GATEUP_SINGLE_XMX");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static bool mxfp4_moe_xmx_tiled_profile_path_is_direct(const char * path) {
+    return path && std::strstr(path, "direct-q8") != nullptr && std::strstr(path, "packed-q8") == nullptr;
 }
 
 namespace ggml_sycl {
@@ -1544,6 +1557,23 @@ static bool mxfp4_moe_ptr_table_handle_for_tensor(const ggml_tensor *           
         const auto & leases = !extra->moe_expert_ptrs_leases[device].empty() ? extra->moe_expert_ptrs_leases[device] :
                                                                                extra->moe_expert_handles[device];
         retained_leases_out->insert(retained_leases_out->end(), leases.begin(), leases.end());
+    }
+    return true;
+}
+
+static bool mxfp4_moe_ptr_table_has_device_layout_leases(const ggml_tensor *  tensor,
+                                                         int                  device,
+                                                         const void * const * ptrs,
+                                                         ggml_layout_mode     layout) {
+    std::vector<ggml_sycl::mem_handle> leases;
+    if (!mxfp4_moe_ptr_table_handle_for_tensor(tensor, device, ptrs, nullptr, &leases) || leases.empty()) {
+        return false;
+    }
+    for (const ggml_sycl::mem_handle & lease : leases) {
+        auto resolved = lease.resolve(device);
+        if (!resolved || !resolved.ptr || !resolved.on_device || resolved.layout != layout) {
+            return false;
+        }
     }
     return true;
 }
@@ -15999,6 +16029,17 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
         return false;
     }
 
+    const bool single_xmx_gateup_requested =
+        mxfp4_moe_gateup_single_xmx_enabled() && weight_layout == GGML_LAYOUT_XMX_TILED;
+    const bool single_xmx_gateup_ptr_tables_ok =
+        !single_xmx_gateup_requested || (mxfp4_moe_ptr_table_has_device_layout_leases(
+                                             gate_weight, runtime_device, gate_ptrs_device, GGML_LAYOUT_XMX_TILED) &&
+                                         mxfp4_moe_ptr_table_has_device_layout_leases(
+                                             up_weight, runtime_device, up_ptrs_device, GGML_LAYOUT_XMX_TILED));
+    if (!single_xmx_gateup_ptr_tables_ok) {
+        return false;
+    }
+
     const int64_t num_tokens      = ne12;
     const int64_t total_batches   = n_ids * num_tokens;
     const int64_t ne10_padded     = GGML_PAD(ne10, QK8_1);
@@ -16843,6 +16884,13 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
         }
         used_xmx_tiled_dpas = true;
         have_kernel_event   = true;
+    }
+    const char * effective_xmx_tiled_path =
+        profile_path && std::strcmp(profile_path, "none") != 0 ? profile_path : xmx_tiled_path;
+    if (single_xmx_gateup_requested && single_xmx_gateup_ptr_tables_ok && used_xmx_tiled_dpas &&
+        !used_gateup_prepack_dpas && mxfp4_moe_xmx_tiled_profile_path_is_direct(effective_xmx_tiled_path)) {
+        xmx_tiled_path = ggml_sycl::mxfp4_moe_single_gateup_route_label();
+        profile_path   = ggml_sycl::mxfp4_moe_single_gateup_route_label();
     }
     if (weight_layout == GGML_LAYOUT_XMX_TILED && !used_xmx_tiled_dpas) {
         return false;

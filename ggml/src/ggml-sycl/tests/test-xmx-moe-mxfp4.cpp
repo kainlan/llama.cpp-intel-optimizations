@@ -19,6 +19,7 @@
 #include "mmvq.hpp"
 #include "moe-layer-plan.hpp"
 #include "quantize.hpp"
+#include "unified-cache.hpp"
 
 #include <cassert>
 #include <cmath>
@@ -422,6 +423,31 @@ static ggml_sycl::moe_gateup_prepack_scratch_descriptor test_gateup_prepack_desc
     descriptor.add_artifact(ggml_sycl::moe_gateup_prepack_artifact_role::ROUTE_METADATA,
                             test_gateup_prepack_fake_handle(0xC000, 256), 256);
     return descriptor;
+}
+
+static bool test_single_xmx_gateup_route_label_contract() {
+    TEST_BEGIN("MXFP4MoE.SingleXmxGateupRouteLabelContract");
+
+    ggml_sycl::mxfp4_moe_single_gateup_layout_policy_input in{};
+    in.env_value        = "1";
+    in.type             = GGML_TYPE_MXFP4;
+    in.role             = ggml_sycl::expert_tensor_role::GATE;
+    in.requested_layout = GGML_LAYOUT_XMX_TILED;
+    in.device_resident  = true;
+    in.xmx_int8_ok      = true;
+    in.shape_aligned    = true;
+    in.pp_rows          = 2048;
+    in.pp_supported     = true;
+    in.tg_supported     = true;
+
+    const auto out = ggml_sycl::mxfp4_moe_single_gateup_layout_policy(in);
+    TEST_ASSERT(out.accepted, "single XMX gate/up policy should accept proof input");
+    TEST_ASSERT(std::strcmp(out.route_label, ggml_sycl::mxfp4_moe_single_gateup_route_label()) == 0,
+                "single XMX route label must be stable for parser/harness evidence");
+    TEST_ASSERT(!out.requires_soa_alternate, "single XMX route must not require SOA alternate");
+
+    TEST_PASS();
+    return true;
 }
 
 bool test_gateup_prepack_reference_layout() {
@@ -1710,6 +1736,7 @@ int main(int argc, char ** argv) {
     bool all_passed = true;
 
     // CPU-only reference coverage that does not require selecting or probing a GPU.
+    all_passed &= test_single_xmx_gateup_route_label_contract();
     all_passed &= test_gateup_prepack_reference_layout();
 
     if (cpu_reference_only) {
