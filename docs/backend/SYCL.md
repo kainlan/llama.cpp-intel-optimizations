@@ -824,6 +824,7 @@ use 1 SYCL GPUs: [0] with Max compute units:512
 | GGML_SYCL_OFFLOAD_CROSS_COST | phase-aware default (PP=2, TG=1) | Additional penalty for short CPU segments when locality smoothing is enabled. |
 | GGML_SYCL_OFFLOAD_BOUNDARY_WAIT_BYTES | 1048576 (default) | In async offload mode, only force GPU→CPU boundary queue wait when tracked boundary bytes are at least this threshold. |
 | GGML_SYCL_OFFLOAD_PLAN_DUMP | 0 (default) or 1 | Dump CPU/GPU segment plan, boundary count, and estimated boundary bytes for each graph. |
+| GGML_SYCL_MOE_GATEUP_SINGLE_XMX | 0 (default) or 1 | Experimental GPT-OSS MXFP4 gate/up proof mode. Requires gate/up experts to use one persistent `GGML_LAYOUT_XMX_TILED` VRAM layout consumed by both PP and TG. No persistent SOA gate/up duplicate and no per-token gate/up prepack are allowed. Parser validation must include `--require-single-xmx-gateup --forbid-gateup-soa-fallback`. Lead-only non-dry-run B50/B580/model validation is required before promotion; workers must use dry-run-only gates. |
 | GGML_SYCL_DMA_SLICE_MB | 1024 (default) | Unified-cache DMA streaming slice size in MB (aligned to row size). |
 | GGML_SYCL_DMA_BUFFERS | 2 (default) | Unified-cache DMA streaming buffer count (staging buffers). Alias: `GGML_SYCL_DMA_SLICES`. |
 | GGML_SYCL_DMA_RESERVE_MB | (auto) | VRAM headroom reserved for DMA staging buffers; overrides slice/buffer-derived default. |

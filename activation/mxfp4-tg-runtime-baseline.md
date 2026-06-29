@@ -130,15 +130,31 @@ But the canonical count output was incorrect (`1, 2, 3.`). Decision: rejected fo
 
 ## Runtime Route Decision
 
-Do not promote existing layer-executor, fused-GLU-Q8, or from-bias down-sum fusion paths. The next runtime implementation should target a new, explicit opt-in gate/up route that attacks the `~5.6 ms/token` gate/up+GLU bucket directly.
+Do not promote existing layer-executor, fused-GLU-Q8, from-bias down-sum fusion, or selected-expert prepack paths. Any new gate/up route remains explicit opt-in/default-off until lead-owned evidence shows exact count, fatal-free logs, required route evidence, `PP512 >= 1100`, and `TG128 >= 45`.
 
-The plan is a selected-expert gate/up prepack route:
+### Rejected selected-expert gate/up prepack route
 
-- prepack only the active experts for a decode token/layer;
-- store prepacked scratch through unified-cache `mem_handle` ownership;
-- feed a compact DPAS-friendly gate+up+GLU compute kernel;
-- keep current direct down-sum path as the downstream path;
-- default off behind a new env gate;
-- fail closed to the current safe route if metadata, handles, events, or capacity are not valid.
+`GGML_SYCL_MOE_GATEUP_PREPACK=1` was implemented as a selected-expert scratch route and rejected after lead validation. The route was count-correct and fatal-free, but performance regressed below baseline:
+
+```text
+Log dir: /tmp/mxfp4_gateup_prepack_b50_20260629_120612
+PP512: 1230.05 ± 9.33 tok/s
+TG128:   36.21 ± 0.42 tok/s
+Baseline TG128: 37.05 ± 0.06 tok/s
+```
+
+Accepted-route profiling showed why it is not viable: the route copied `35,251,200` bytes per layer/token, adding about `1.07 ms/layer` and about `25.7 ms/token` across 24 layers, while gate/up compute did not improve. This route must remain rejected/default-off.
+
+### Single persistent XMX_TILED gate/up proof route
+
+The next approved route is `GGML_SYCL_MOE_GATEUP_SINGLE_XMX=1`: materialize gate/up experts once as one persistent `GGML_LAYOUT_XMX_TILED` VRAM layout, rebuild pointer tables from XMX_TILED `mem_handle` leases, and require PP/TG route evidence that no SOA gate/up fallback is used. This mode allows transient scratch but forbids a persistent SOA gate/up duplicate and forbids per-token gate/up prepack.
+
+Required parser gates for non-dry-run lead validation are:
+
+```bash
+--require-single-xmx-gateup --forbid-gateup-soa-fallback
+```
+
+Workers must not run B50/B580/model gates for this route. Worker-owned checks are build/unit/parser/dry-run-only; lead owns B50/B580/model validation.
 
 Promotion remains blocked until lead-owned evidence shows exact count, fatal-free logs, required route evidence, `PP512 >= 1100`, and `TG128 >= 45`. A near-target result is only non-promotional follow-up evidence when `42.0 <= TG128 < 45.0`, route evidence is clean, and the profile shows gate/up+GLU `<= 4.2 ms/token`; it does not authorize default-on promotion.

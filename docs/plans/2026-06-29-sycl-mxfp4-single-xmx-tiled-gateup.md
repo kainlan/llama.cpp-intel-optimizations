@@ -1216,6 +1216,29 @@ git commit -m "docs(sycl): document single XMX_TILED gateup proof mode"
 
 ---
 
+## Implementation Status After Tasks 1-6
+
+Tasks 1-5 have landed and passed fresh SPEC then QUALITY review; Task 6 is this documentation update. The proof mode remains opt-in/default-off and is not promoted until Task 7 lead validation passes.
+
+| Task | Commit / evidence | Status |
+|------|-------------------|--------|
+| 1 policy contract | `d78dbe7a8 test(sycl): add MXFP4 single XMX_TILED gateup policy`; lead checks `/tmp/lead_t1_test.out`, `/tmp/lead_t1_clang_format.out` | SPEC PASS, QUALITY PASS |
+| 2 planner integration | `271b064c0 feat(sycl): gate MoE gateup planner on single XMX layout proof`; lead checks `/tmp/lead_t2_fix_build.log`, `/tmp/lead_t2_fix_test.out` | SPEC PASS, QUALITY PASS |
+| 3 materialization invariants | `a0c2e9ccf test(sycl): prove single XMX_TILED gateup materialization invariants`; lead checks `/tmp/lead_t3_build.log`, `/tmp/lead_t3_test.out` | SPEC PASS, QUALITY PASS |
+| 4 parser and dry-run gates | `dcea51cc8 test(sycl): gate single XMX_TILED gateup evidence`; lead checks `/tmp/lead_t4_fix_pytest.out`, `/tmp/lead_t4_fix_dryrun.out`, dry-run log dir `/tmp/single_xmx_dryrun_lead_fix` | SPEC PASS, QUALITY PASS |
+| 5 runtime PP/TG route evidence | `be0fb8379 feat(sycl): label direct single XMX_TILED gateup route`; lead checks `/tmp/lead_t5_fix_build.log`, `/tmp/lead_t5_final_cpu.out` | SPEC PASS, QUALITY PASS |
+| 6 docs and validation handoff | `docs(sycl): document single XMX_TILED gateup proof mode` | in this commit; pending SPEC/QUALITY review |
+| 7 B50/B580 validation | lead-only real B50/B580/model gates | pending; not worker-runnable |
+
+Current proof-mode contract:
+
+- `GGML_SYCL_MOE_GATEUP_SINGLE_XMX=1` is the only new proof-mode env and is default OFF.
+- Gate/up MXFP4 experts must use one persistent `GGML_LAYOUT_XMX_TILED` VRAM layout consumed by both PP and TG.
+- Persistent SOA gate/up duplicates and per-token gate/up prepack are forbidden in this mode; transient scratch remains allowed.
+- Non-dry-run validation must pass `--require-single-xmx-gateup --forbid-gateup-soa-fallback`.
+- Workers must not run B50/B580/model gates; lead owns Task 7.
+- Rejected prepack evidence is preserved: `GGML_SYCL_MOE_GATEUP_PREPACK=1` copied `35,251,200` bytes/layer/token and added about `25.7 ms/token` across 24 layers.
+
 ### Task 7: Lead-owned end-to-end validation on B50, then B580 if B50 passes
 
 **Track:** Lead
