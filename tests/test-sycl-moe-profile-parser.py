@@ -13,6 +13,12 @@ PARSER = ROOT / "scripts" / "parse-sycl-moe-profile.py"
 HARNESS = ROOT / "scripts" / "sycl-b50-gptoss-moe-gates.sh"
 
 
+def write_log(path: str | pathlib.Path, text: str) -> None:
+    tmp = pathlib.Path(path)
+    tmp.mkdir(parents=True, exist_ok=True)
+    (tmp / "profile.stderr").write_text(text)
+
+
 def run_parser(path: pathlib.Path, *extra_args: str) -> str:
     return subprocess.check_output([sys.executable, str(PARSER), "--no-lines", *extra_args, str(path)], text=True)
 
@@ -1033,6 +1039,48 @@ def test_parser_extracts_mxfp4_tg_down_pack_profile_counter() -> None:
         out = run_parser(tmp)
         assert "profile.mxfp4_tg.pack_ms_x1000 250" in out
         assert "profile.mxfp4_tg.path.down-grouped-packed-q8 1" in out
+
+
+def test_parser_extracts_e2e_tg_stage_ledger() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        write_log(
+            tmp,
+            "[SYCL-E2E-TG-PROFILE] tokens=1 ops=512 moe_calls=72 total_host=18.250 ms total_device=7.125 ms\n"
+            "[SYCL-E2E-TG-STAGE] stage=moe calls=72 host=0.900 ms device=6.500 ms bytes=0 last_path=packed-q8-m2\n"
+            "[SYCL-E2E-TG-STAGE] stage=attention calls=32 host=0.450 ms device=0.500 ms bytes=1048576 last_path=xmx_v2_f16_pp_ncols32\n"
+            "[SYCL-E2E-TG-STAGE] stage=graph calls=1 host=0.125 ms device=0.000 ms bytes=0 last_path=use_graph_0\n",
+        )
+        out = run_parser(tmp, "--require-e2e-profile-evidence", "--require-e2e-stage", "moe", "--require-e2e-stage", "attention")
+        assert "profile.e2e_tg.tokens 1" in out
+        assert "profile.e2e_tg.ops 512" in out
+        assert "profile.e2e_tg.moe_calls 72" in out
+        assert "profile.e2e_tg.host_ms_x1000 18250" in out
+        assert "profile.e2e_tg.device_ms_x1000 7125" in out
+        assert "profile.e2e_tg.stage.moe.calls 72" in out
+        assert "profile.e2e_tg.stage.moe.device_ms_x1000 6500" in out
+        assert "profile.e2e_tg.stage.attention.bytes 1048576" in out
+        assert "profile.e2e_tg.path.packed-q8-m2 1" in out
+        assert "profile.e2e_tg.path.xmx_v2_f16_pp_ncols32 1" in out
+
+
+def test_parser_require_e2e_profile_evidence_fails_closed() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        write_log(tmp, "[MXFP4-MOE-TG-PROFILE] calls=72 soa=0 coalesced=0 aos=0 dpas=48 i8=6 total=6.000 ms quant=0.100 ms artifact=0.000 ms batch_ids=0.000 ms pack=0.050 ms kernel=5.850 ms gateup_glu=5.400 ms/48 down=0.450 ms/24 last_path=packed-q8-m2\n")
+        result = run_parser_result(tmp, "--require-e2e-profile-evidence")
+        assert result.returncode == 1
+        assert "error: E2E TG profile evidence missing" in result.stdout
+
+
+def test_parser_require_e2e_stage_fails_closed() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        write_log(
+            tmp,
+            "[SYCL-E2E-TG-PROFILE] tokens=1 ops=512 moe_calls=72 total_host=18.250 ms total_device=7.125 ms\n"
+            "[SYCL-E2E-TG-STAGE] stage=moe calls=72 host=0.900 ms device=6.500 ms bytes=0 last_path=packed-q8-m2\n",
+        )
+        result = run_parser_result(tmp, "--require-e2e-stage", "attention")
+        assert result.returncode == 1
+        assert "error: required E2E TG stage missing: attention" in result.stdout
 
 
 def test_tg_profile_source_records_down_pack_timing() -> None:

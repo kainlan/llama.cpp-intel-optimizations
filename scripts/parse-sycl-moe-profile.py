@@ -175,6 +175,8 @@ def gate_args_requested(args: argparse.Namespace) -> bool:
         or args.forbid_diag_path
         or args.require_down_dpas_direct_final
         or args.require_mxfp4_profile_evidence
+        or args.require_e2e_profile_evidence
+        or args.require_e2e_stage
         or args.require_single_xmx_gateup
         or args.forbid_gateup_soa_fallback
         or args.forbid_down_dpas_direct_final
@@ -224,6 +226,17 @@ MXFP4_TG_PROFILE_RE = re.compile(
     r"(?:.*?pack=(?P<pack>[0-9.]+) ms)?"
     r".*?kernel=(?P<kernel>[0-9.]+) ms.*?gateup_glu=(?P<gateup>[0-9.]+) ms(?:/\d+)?"
     r".*?down=(?P<down>[0-9.]+) ms(?:/\d+)?"
+)
+E2E_TG_PROFILE_RE = re.compile(
+    r"\[SYCL-E2E-TG-PROFILE\]\s+tokens=(?P<tokens>\d+)\s+ops=(?P<ops>\d+)"
+    r"\s+moe_calls=(?P<moe_calls>\d+)\s+total_host=(?P<host>[0-9.]+) ms"
+    r"\s+total_device=(?P<device>[0-9.]+) ms"
+)
+E2E_TG_STAGE_RE = re.compile(
+    r"\[SYCL-E2E-TG-STAGE\]\s+stage=(?P<stage>[A-Za-z0-9_+-]+)"
+    r"\s+calls=(?P<calls>\d+)\s+host=(?P<host>[0-9.]+) ms"
+    r"\s+device=(?P<device>[0-9.]+) ms\s+bytes=(?P<bytes>\d+)"
+    r"(?:\s+last_path=(?P<path>[A-Za-z0-9_./+-]+))?"
 )
 MXFP4_PP_PROFILE_LAST_PATH_RE = re.compile(r"\blast_path=([A-Za-z0-9_./+-]+)")
 XMX_ORIGINAL_VALIDATE_RE = re.compile(
@@ -488,6 +501,24 @@ def summarize_file(path: pathlib.Path) -> tuple[collections.Counter[str], list[s
                 output_key = "gateup_glu" if metric == "gateup" else metric
                 key = f"profile.mxfp4_tg.{output_key}_ms_x1000"
                 counters[key] = max(counters[key], ms_to_x1000(tg_profile.group(metric)))
+        e2e_profile = E2E_TG_PROFILE_RE.search(line)
+        if e2e_profile:
+            counters["profile.e2e_tg.tokens"] += int(e2e_profile.group("tokens"))
+            counters["profile.e2e_tg.ops"] += int(e2e_profile.group("ops"))
+            counters["profile.e2e_tg.moe_calls"] += int(e2e_profile.group("moe_calls"))
+            counters["profile.e2e_tg.host_ms_x1000"] += int(round(float(e2e_profile.group("host")) * 1000.0))
+            counters["profile.e2e_tg.device_ms_x1000"] += int(round(float(e2e_profile.group("device")) * 1000.0))
+
+        e2e_stage = E2E_TG_STAGE_RE.search(line)
+        if e2e_stage:
+            stage = e2e_stage.group("stage")
+            counters[f"profile.e2e_tg.stage.{stage}.calls"] += int(e2e_stage.group("calls"))
+            counters[f"profile.e2e_tg.stage.{stage}.host_ms_x1000"] += int(round(float(e2e_stage.group("host")) * 1000.0))
+            counters[f"profile.e2e_tg.stage.{stage}.device_ms_x1000"] += int(round(float(e2e_stage.group("device")) * 1000.0))
+            counters[f"profile.e2e_tg.stage.{stage}.bytes"] += int(e2e_stage.group("bytes"))
+            path = e2e_stage.group("path")
+            if path:
+                counters[f"profile.e2e_tg.path.{path}"] += 1
         if "[MXFP4-MOE-PP-PROFILE]" in line:
             pp_values = dict(KEY_VALUE_RE.findall(line))
             if "calls" in pp_values:
@@ -638,6 +669,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="exit nonzero unless MXFP4 TG/PP profile counters or profile path labels were parsed",
     )
+    parser.add_argument("--require-e2e-profile-evidence", action="store_true")
+    parser.add_argument("--require-e2e-stage", action="append", default=[])
     parser.add_argument(
         "--require-single-xmx-gateup",
         action="store_true",
@@ -764,6 +797,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.require_mxfp4_profile_evidence and mxfp4_profile_evidence_count(total) <= 0:
         print("error: MXFP4 profile evidence missing")
         return 16
+    if args.require_e2e_profile_evidence and total.get("profile.e2e_tg.tokens", 0) <= 0:
+        print("error: E2E TG profile evidence missing")
+        return 1
+    for stage in args.require_e2e_stage:
+        if total.get(f"profile.e2e_tg.stage.{stage}.calls", 0) <= 0:
+            print(f"error: required E2E TG stage missing: {stage}")
+            return 1
     if args.require_single_xmx_gateup:
         if total.get("placement.single_xmx_gateup", 0) <= 0 and total.get("phase.single_xmx_gateup.complete", 0) <= 0:
             print("error: single XMX_TILED gate/up evidence missing")
