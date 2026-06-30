@@ -71,6 +71,20 @@ static int test_down_and_missing_pp_proof_stay_safe() {
     return 0;
 }
 
+static int test_pp_runtime_optins_require_forced_and_unsafe() {
+    CHECK(!ggml_sycl::test_moe_single_xmx_pp_runtime_optins_from_env(nullptr, nullptr, nullptr),
+          "default env must not allow prompt XMX proof");
+    CHECK(!ggml_sycl::test_moe_single_xmx_pp_runtime_optins_from_env("1", nullptr, nullptr),
+          "forced prompt XMX alone must not bypass submit watchdog");
+    CHECK(!ggml_sycl::test_moe_single_xmx_pp_runtime_optins_from_env(nullptr, "1", nullptr),
+          "unsafe PP alone must not force prompt XMX selection");
+    CHECK(ggml_sycl::test_moe_single_xmx_pp_runtime_optins_from_env("1", "1", nullptr),
+          "forced prompt XMX plus unsafe PP must allow diagnostic proof");
+    CHECK(ggml_sycl::test_moe_single_xmx_pp_runtime_optins_from_env("1", nullptr, "1"),
+          "legacy unsafe PP knob must still be honored with forced prompt XMX");
+    return 0;
+}
+
 int main() {
     if (test_default_keeps_pp_soa_rewrite() != 0) {
         return 1;
@@ -79,6 +93,9 @@ int main() {
         return 1;
     }
     if (test_down_and_missing_pp_proof_stay_safe() != 0) {
+        return 1;
+    }
+    if (test_pp_runtime_optins_require_forced_and_unsafe() != 0) {
         return 1;
     }
     std::puts("single-layout XMX_TILED planner tests passed");

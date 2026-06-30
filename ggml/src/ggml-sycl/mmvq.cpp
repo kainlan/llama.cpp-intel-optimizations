@@ -667,12 +667,23 @@ static bool mxfp4_moe_xmx_tiled_pack_q8_enabled() {
     return enabled;
 }
 
+static bool mxfp4_moe_gateup_single_xmx_enabled_from_env(const char * env_value) {
+    return env_value && std::atoi(env_value) != 0;
+}
+
 static bool mxfp4_moe_gateup_single_xmx_enabled() {
     static const bool enabled = []() {
-        const char * env = std::getenv("GGML_SYCL_MOE_GATEUP_SINGLE_XMX");
-        return env && std::atoi(env) != 0;
+        return mxfp4_moe_gateup_single_xmx_enabled_from_env(std::getenv("GGML_SYCL_MOE_GATEUP_SINGLE_XMX"));
     }();
     return enabled;
+}
+
+static bool mxfp4_moe_xmx_tiled_pack_q8_allowed(bool single_xmx_gateup_requested, bool packed_q8_default_enabled) {
+    return packed_q8_default_enabled && !single_xmx_gateup_requested;
+}
+
+static bool mxfp4_moe_xmx_tiled_pack_q8_allowed(bool single_xmx_gateup_requested) {
+    return mxfp4_moe_xmx_tiled_pack_q8_allowed(single_xmx_gateup_requested, mxfp4_moe_xmx_tiled_pack_q8_enabled());
 }
 
 static bool mxfp4_moe_xmx_tiled_profile_path_is_direct(const char * path) {
@@ -680,6 +691,11 @@ static bool mxfp4_moe_xmx_tiled_profile_path_is_direct(const char * path) {
 }
 
 namespace ggml_sycl {
+
+bool test_moe_single_xmx_allows_packed_q8(const char * env_value, bool packed_q8_default_enabled) {
+    return mxfp4_moe_xmx_tiled_pack_q8_allowed(mxfp4_moe_gateup_single_xmx_enabled_from_env(env_value),
+                                               packed_q8_default_enabled);
+}
 
 namespace {
 
@@ -1226,6 +1242,7 @@ static double mmvq_sycl_event_duration_us(const sycl::event & ev) {
 struct mmvq_moe_tg_profile_accum {
     double       quant_us         = 0.0;
     double       batch_ids_us     = 0.0;
+    double       pack_us          = 0.0;
     double       kernel_us        = 0.0;
     double       artifact_us      = 0.0;
     double       gateup_glu_us    = 0.0;
@@ -1285,10 +1302,12 @@ static void mmvq_moe_tg_profile_record(layout_mode              layout,
                                        double                   artifact_us   = 0.0,
                                        mmvq_moe_tg_profile_kind kind          = mmvq_moe_tg_profile_kind::OTHER,
                                        int64_t                  logical_calls = 1,
-                                       const char *             path          = nullptr) {
+                                       const char *             path          = nullptr,
+                                       double                   pack_us       = 0.0) {
     auto & p = g_mmvq_moe_tg_profile;
     p.quant_us += quant_us;
     p.batch_ids_us += batch_ids_us;
+    p.pack_us += pack_us;
     p.kernel_us += kernel_us;
     p.artifact_us += artifact_us;
     p.calls += logical_calls;
@@ -1297,7 +1316,7 @@ static void mmvq_moe_tg_profile_record(layout_mode              layout,
     if (path && path[0] != '\0') {
         p.last_path = path;
     }
-    const double role_us = quant_us + batch_ids_us + kernel_us;
+    const double role_us = quant_us + batch_ids_us + pack_us + kernel_us;
     if (kind == mmvq_moe_tg_profile_kind::GATEUP_GLU) {
         p.gateup_glu_us += role_us;
         p.gateup_glu_calls += logical_calls;
@@ -1327,18 +1346,19 @@ static void mmvq_moe_tg_profile_record(layout_mode              layout,
         return;
     }
 
-    const double total_us = p.quant_us + p.batch_ids_us + p.kernel_us + p.artifact_us;
+    const double total_us = p.quant_us + p.batch_ids_us + p.pack_us + p.kernel_us + p.artifact_us;
     fprintf(stderr,
             "[MXFP4-MOE-TG-PROFILE] calls=%lld soa=%lld coalesced=%lld aos=%lld dpas=%lld i8=%lld "
             "entries=%lld batches=%lld total=%.3f ms quant=%.3f ms artifact=%.3f ms "
-            "batch_ids=%.3f ms kernel=%.3f ms "
+            "batch_ids=%.3f ms pack=%.3f ms kernel=%.3f ms "
             "gateup_glu=%.3f ms/%lld down=%.3f ms/%lld other=%.3f ms/%lld "
             "per_call total=%.3f us quant=%.3f us batch_ids=%.3f us kernel=%.3f us "
             "per_entry kernel=%.3f us last_path=%s\n",
             (long long) p.calls, (long long) p.soa_calls, (long long) p.coalesced_calls, (long long) p.aos_calls,
             (long long) p.dpas_calls, (long long) p.i8_calls, (long long) p.entries, (long long) p.total_batches,
             total_us / 1000.0, p.quant_us / 1000.0, p.artifact_us / 1000.0, p.batch_ids_us / 1000.0,
-            p.kernel_us / 1000.0, p.gateup_glu_us / 1000.0, (long long) p.gateup_glu_calls, p.down_us / 1000.0,
+            p.pack_us / 1000.0, p.kernel_us / 1000.0, p.gateup_glu_us / 1000.0,
+            (long long) p.gateup_glu_calls, p.down_us / 1000.0,
             (long long) p.down_calls, p.other_us / 1000.0, (long long) p.other_calls,
             total_us / static_cast<double>(p.calls), p.quant_us / static_cast<double>(p.calls),
             p.batch_ids_us / static_cast<double>(p.calls), p.kernel_us / static_cast<double>(p.calls),
@@ -16513,7 +16533,9 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                 }
                 const bool device_grouped_fused_store_requested = grouped_down_q8 != nullptr;
                 bool       device_grouped_packed_q8_used        = false;
-                if (!device_grouped_fused_store_requested && mxfp4_pair_glu_grouped_pack_q8_enabled()) {
+                if (!device_grouped_fused_store_requested &&
+                    mxfp4_moe_xmx_tiled_pack_q8_allowed(single_xmx_gateup_requested) &&
+                    mxfp4_pair_glu_grouped_pack_q8_enabled()) {
                     const int    k_tiles = ne00 / k_per;
                     const size_t b_bytes = static_cast<size_t>(device_n_chunks) * static_cast<size_t>(k_tiles) *
                                            static_cast<size_t>(k_per * exec_n);
@@ -16530,7 +16552,7 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                             grouped_chunk_groups_device, grouped_chunk_starts_device, ne00, ne10, device_n_chunks,
                             static_cast<int>(num_tokens), static_cast<int>(ne11), q8_nb11, q8_nb12, grouped_deps,
                             active_chunks_arg);
-                        if (pp_profile) {
+                        if (detail_profile) {
                             profile_pack_event     = pack_event;
                             profile_pack_event_set = true;
                         }
@@ -16757,7 +16779,9 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                         limit, tile_n_total, nullptr, grouped_down_q8, glu_q8_row_size);
                 };
                 const bool grouped_fused_store_requested = grouped_down_q8 != nullptr;
-                if (!chunked_row_limit && !grouped_fused_store_requested && mxfp4_pair_glu_grouped_pack_q8_enabled()) {
+                if (!chunked_row_limit && !grouped_fused_store_requested &&
+                    mxfp4_moe_xmx_tiled_pack_q8_allowed(single_xmx_gateup_requested) &&
+                    mxfp4_pair_glu_grouped_pack_q8_enabled()) {
                     const int    k_tiles = ne00 / k_per;
                     const size_t b_bytes = static_cast<size_t>(grouped_n_chunks) * static_cast<size_t>(k_tiles) *
                                            static_cast<size_t>(k_per * exec_n);
@@ -16774,7 +16798,7 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                             grouped_chunk_groups_device, grouped_chunk_starts_device, ne00, ne10, grouped_n_chunks,
                             static_cast<int>(num_tokens), static_cast<int>(ne11), q8_nb11, q8_nb12,
                             grouped_copy_events);
-                        if (pp_profile) {
+                        if (detail_profile) {
                             profile_pack_event     = pack_event;
                             profile_pack_event_set = true;
                         }
@@ -16833,7 +16857,8 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                     stream, ctx.device, b_bytes, reuse.dpas_b_capacity, reuse.dpas_b_device, reuse.dpas_b_handle));
                 float *  y_scales = static_cast<float *>(mxfp4_moe_tg_reuse_get_or_alloc_device_scratch(
                     stream, ctx.device, y_bytes, reuse.dpas_y_capacity, reuse.dpas_y_device, reuse.dpas_y_handle));
-                if (ne12 == 1 && b_packed && y_scales && mxfp4_moe_xmx_tiled_pack_q8_enabled()) {
+                if (ne12 == 1 && b_packed && y_scales &&
+                    mxfp4_moe_xmx_tiled_pack_q8_allowed(single_xmx_gateup_requested)) {
                     const bool aggressive_partial_artifact =
                         aggressive_tg_cfg.eligible && partial_device_grouped_route && aggressive_down_q8 != nullptr &&
                         num_tokens == 1 && total_batches > 0 && total_batches < exec_n &&
@@ -16842,7 +16867,7 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                     sycl::event pack_event = mxfp4_dpas_pack_q8_single_col_groups_sycl(
                         *stream, q8_1_buffer, b_packed, y_scales, ne00, ne10, static_cast<int>(total_batches),
                         static_cast<int>(num_tokens), static_cast<int>(ne11), q8_nb11, q8_nb12, kernel_deps);
-                    if (pp_profile) {
+                    if (detail_profile) {
                         profile_pack_event     = pack_event;
                         profile_pack_event_set = true;
                     }
@@ -17085,7 +17110,7 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
         }
     }
     const double pack_us =
-        pp_profile && profile_pack_event_set ? std::max(0.0, mmvq_sycl_event_duration_us(profile_pack_event)) : 0.0;
+        detail_profile && profile_pack_event_set ? std::max(0.0, mmvq_sycl_event_duration_us(profile_pack_event)) : 0.0;
     g_mmvq_moe_dispatch_timing.activation_quant_us += quant_us;
     g_mmvq_moe_dispatch_timing.kernel_submit_us += kernel_wall_us;
     g_mmvq_moe_dispatch_timing.calls++;
@@ -17094,7 +17119,7 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
         mmvq_moe_tg_profile_record(
             weight_layout, 2 * n_gpu_entries, 2 * total_batches, quant_us - down_q8_publish_us, 0.0, kernel_profile_us,
             down_q8_publish_us, mmvq_moe_tg_profile_kind::GATEUP_GLU, 2,
-            profile_path && std::strcmp(profile_path, "none") != 0 ? profile_path : xmx_tiled_path);
+            profile_path && std::strcmp(profile_path, "none") != 0 ? profile_path : xmx_tiled_path, pack_us);
     }
     if (pp_profile) {
         mmvq_moe_pp_profile_record(
@@ -17568,7 +17593,7 @@ bool mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4(ggml_backend_sycl_conte
                                 grouped_chunk_groups_device, grouped_chunk_starts_device, static_cast<int>(ncols),
                                 static_cast<int>(ncols_y), grouped_n_chunks, static_cast<int>(n_tokens),
                                 static_cast<int>(ne11), q8_row_size, ne11 * q8_row_size, grouped_copy_events);
-                            if (pp_profile) {
+                            if (detail_profile) {
                                 profile_pack_event     = pack_event;
                                 profile_pack_event_set = true;
                             }
@@ -17729,7 +17754,7 @@ bool mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4(ggml_backend_sycl_conte
         }
     }
     const double pack_us =
-        pp_profile && profile_pack_event_set ? std::max(0.0, mmvq_sycl_event_duration_us(profile_pack_event)) : 0.0;
+        detail_profile && profile_pack_event_set ? std::max(0.0, mmvq_sycl_event_duration_us(profile_pack_event)) : 0.0;
 
     g_mmvq_moe_dispatch_timing.kernel_submit_us += kernel_wall_us;
     g_mmvq_moe_dispatch_timing.calls++;
@@ -17744,7 +17769,7 @@ bool mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4(ggml_backend_sycl_conte
                     profile_path, n_gpu_entries, (long long) total_batches);
         }
         mmvq_moe_tg_profile_record(down_layout, n_gpu_entries, total_batches, 0.0, 0.0, kernel_profile_us, 0.0,
-                                   mmvq_moe_tg_profile_kind::DOWN);
+                                   mmvq_moe_tg_profile_kind::DOWN, 1, profile_path, pack_us);
     }
     if (pp_profile) {
         mmvq_moe_pp_profile_record(profile_path, n_gpu_entries, total_batches, 0.0, profile_group_host_us,

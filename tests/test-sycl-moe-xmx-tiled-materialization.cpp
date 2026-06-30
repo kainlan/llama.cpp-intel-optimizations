@@ -76,6 +76,32 @@ static int test_no_soa_release_until_success() {
     return 0;
 }
 
+static int test_chunked_fallback_policy() {
+    CHECK(
+        ggml_sycl::test_moe_single_xmx_chunked_fallback_policy("1", "blk.3.ffn_gate_exps.weight", GGML_LAYOUT_XMX_TILED,
+                                                               /*bulk_materialization_ok=*/false),
+        "opt-in gate XMX_TILED bulk failure should allow chunked fallback");
+    CHECK(ggml_sycl::test_moe_single_xmx_chunked_fallback_policy("1", "blk.3.ffn_up_exps.weight", GGML_LAYOUT_XMX_TILED,
+                                                                 /*bulk_materialization_ok=*/false),
+          "opt-in up XMX_TILED bulk failure should allow chunked fallback");
+    CHECK(!ggml_sycl::test_moe_single_xmx_chunked_fallback_policy("0", "blk.3.ffn_gate_exps.weight",
+                                                                  GGML_LAYOUT_XMX_TILED,
+                                                                  /*bulk_materialization_ok=*/false),
+          "default-off mode must not allow chunked fallback");
+    CHECK(!ggml_sycl::test_moe_single_xmx_chunked_fallback_policy("1", "blk.3.ffn_down_exps.weight",
+                                                                  GGML_LAYOUT_XMX_TILED,
+                                                                  /*bulk_materialization_ok=*/false),
+          "down tensors must not use gate/up single-XMX fallback");
+    CHECK(!ggml_sycl::test_moe_single_xmx_chunked_fallback_policy("1", "blk.3.ffn_gate_exps.weight", GGML_LAYOUT_SOA,
+                                                                  /*bulk_materialization_ok=*/false),
+          "non-XMX target must not use chunked fallback");
+    CHECK(!ggml_sycl::test_moe_single_xmx_chunked_fallback_policy("1", "blk.3.ffn_gate_exps.weight",
+                                                                  GGML_LAYOUT_XMX_TILED,
+                                                                  /*bulk_materialization_ok=*/true),
+          "successful bulk materialization must not report fallback");
+    return 0;
+}
+
 int main() {
     if (test_complete_xmx_handle_set() != 0) {
         return 1;
@@ -84,6 +110,9 @@ int main() {
         return 1;
     }
     if (test_no_soa_release_until_success() != 0) {
+        return 1;
+    }
+    if (test_chunked_fallback_policy() != 0) {
         return 1;
     }
     std::puts("single-layout XMX_TILED materialization invariant tests passed");

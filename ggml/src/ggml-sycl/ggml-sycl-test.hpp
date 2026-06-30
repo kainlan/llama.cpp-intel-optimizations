@@ -82,6 +82,9 @@ struct test_moe_single_xmx_planner_result {
 };
 
 test_moe_single_xmx_planner_result test_moe_single_xmx_planner_decision(const test_moe_single_xmx_planner_input & in);
+bool test_moe_single_xmx_pp_runtime_optins_from_env(const char * force_env,
+                                                    const char * unsafe_env,
+                                                    const char * legacy_env);
 
 struct test_moe_xmx_tiled_materialization_input {
     int              n_experts                 = 0;
@@ -102,6 +105,11 @@ struct test_moe_xmx_tiled_materialization_result {
 
 test_moe_xmx_tiled_materialization_result test_moe_xmx_tiled_materialization_invariants(
     const test_moe_xmx_tiled_materialization_input & in);
+bool test_moe_single_xmx_chunked_fallback_policy(const char *     env_value,
+                                                 const char *     tensor_name,
+                                                 ggml_layout_mode target_layout,
+                                                 bool             bulk_materialization_ok);
+bool test_moe_single_xmx_allows_packed_q8(const char * env_value, bool packed_q8_default_enabled);
 
 struct test_moe_default_fast_path_policy_input {
     bool default_fast_path_enabled = false;

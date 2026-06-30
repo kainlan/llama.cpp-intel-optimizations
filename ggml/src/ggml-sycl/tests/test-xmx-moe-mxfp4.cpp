@@ -16,6 +16,7 @@
 //
 
 #include "ggml-sycl-bench.hpp"
+#include "ggml-sycl-test.hpp"
 #include "mmvq.hpp"
 #include "moe-layer-plan.hpp"
 #include "quantize.hpp"
@@ -445,6 +446,12 @@ static bool test_single_xmx_gateup_route_label_contract() {
     TEST_ASSERT(std::strcmp(out.route_label, ggml_sycl::mxfp4_moe_single_gateup_route_label()) == 0,
                 "single XMX route label must be stable for parser/harness evidence");
     TEST_ASSERT(!out.requires_soa_alternate, "single XMX route must not require SOA alternate");
+    TEST_ASSERT(!ggml_sycl::test_moe_single_xmx_allows_packed_q8("1", true),
+                "single XMX proof mode must not use packed-q8-m2 evidence path");
+    TEST_ASSERT(ggml_sycl::test_moe_single_xmx_allows_packed_q8("0", true),
+                "default path should preserve packed-Q8 behavior");
+    TEST_ASSERT(!ggml_sycl::test_moe_single_xmx_allows_packed_q8("0", false),
+                "disabled packed-Q8 knob must remain respected");
 
     TEST_PASS();
     return true;

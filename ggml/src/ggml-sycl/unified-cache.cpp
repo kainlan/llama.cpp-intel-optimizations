@@ -14776,6 +14776,38 @@ static bool planner_moe_xmx_tiled_pp_proof_enabled() {
     return enabled;
 }
 
+static bool planner_moe_xmx_moe_forced_from_env(const char * env) {
+    return env != nullptr && std::atoi(env) != 0;
+}
+
+static bool planner_moe_xmx_moe_forced() {
+    static const bool enabled = planner_moe_xmx_moe_forced_from_env(std::getenv("GGML_SYCL_XMX_MOE"));
+    return enabled;
+}
+
+static bool planner_moe_xmx_moe_allow_unsafe_pp_from_env(const char * unsafe_env, const char * legacy_env) {
+    if (unsafe_env) {
+        return std::atoi(unsafe_env) != 0;
+    }
+    if (legacy_env) {
+        return std::atoi(legacy_env) != 0;
+    }
+    return false;
+}
+
+static bool planner_moe_xmx_moe_allow_unsafe_pp() {
+    static const bool enabled = planner_moe_xmx_moe_allow_unsafe_pp_from_env(
+        std::getenv("GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP"), std::getenv("GGML_SYCL_XMX_MOE_PP"));
+    return enabled;
+}
+
+bool test_moe_single_xmx_pp_runtime_optins_from_env(const char * force_env,
+                                                    const char * unsafe_env,
+                                                    const char * legacy_env) {
+    return planner_moe_xmx_moe_forced_from_env(force_env) &&
+           planner_moe_xmx_moe_allow_unsafe_pp_from_env(unsafe_env, legacy_env);
+}
+
 static bool planner_xmx_tiled_moe_enabled() {
     const char * env = std::getenv("GGML_SYCL_XMX_MOE_TILED");
     if (env) {
@@ -15199,9 +15231,14 @@ static mxfp4_moe_single_gateup_layout_policy_result planner_single_xmx_gateup_po
     in.xmx_int8_ok      = device_id >= 0 && device_id < ggml_sycl_info().device_count &&
                      ggml_sycl_info().devices[device_id].xmx_caps.supports_int8;
     in.shape_aligned = entry.ne[0] > 0 && (entry.ne[0] % QK_MXFP4) == 0;
-    in.pp_rows       = planner_expected_moe_pp_rows(kv_info, envelope);
-    in.pp_supported  = pp_supported;
-    in.tg_supported  = tg_supported;
+    in.pp_rows = planner_expected_moe_pp_rows(kv_info, envelope);
+    // Single-layout gate/up proof is stricter than the legacy planner PP-proof
+    // knob: it may only suppress PP SOA when the runtime's existing prompt-XMX
+    // forced-selection knob and submit watchdog opt-in are both enabled.
+    // Otherwise PP would immediately demote XMX_TILED back to SOA and violate
+    // the single persistent layout contract.
+    in.pp_supported = pp_supported && planner_moe_xmx_moe_forced() && planner_moe_xmx_moe_allow_unsafe_pp();
+    in.tg_supported = tg_supported;
     return mxfp4_moe_single_gateup_layout_policy(in);
 }
 

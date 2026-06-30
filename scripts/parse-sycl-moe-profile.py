@@ -221,6 +221,7 @@ MXFP4_TG_PROFILE_RE = re.compile(
     r".*?dpas=(?P<dpas>\d+).*?i8=(?P<i8>\d+)"
     r".*?total=(?P<total>[0-9.]+) ms.*?quant=(?P<quant>[0-9.]+) ms"
     r".*?artifact=(?P<artifact>[0-9.]+) ms.*?batch_ids=(?P<batch_ids>[0-9.]+) ms"
+    r"(?:.*?pack=(?P<pack>[0-9.]+) ms)?"
     r".*?kernel=(?P<kernel>[0-9.]+) ms.*?gateup_glu=(?P<gateup>[0-9.]+) ms(?:/\d+)?"
     r".*?down=(?P<down>[0-9.]+) ms(?:/\d+)?"
 )
@@ -481,7 +482,9 @@ def summarize_file(path: pathlib.Path) -> tuple[collections.Counter[str], list[s
             for layout_key in ("soa", "coalesced", "aos", "dpas", "i8"):
                 key = f"profile.mxfp4_tg.layout.{layout_key}"
                 counters[key] = max(counters[key], int(tg_profile.group(layout_key)))
-            for metric in ("total", "quant", "artifact", "batch_ids", "kernel", "gateup", "down"):
+            for metric in ("total", "quant", "artifact", "batch_ids", "pack", "kernel", "gateup", "down"):
+                if tg_profile.group(metric) is None:
+                    continue
                 output_key = "gateup_glu" if metric == "gateup" else metric
                 key = f"profile.mxfp4_tg.{output_key}_ms_x1000"
                 counters[key] = max(counters[key], ms_to_x1000(tg_profile.group(metric)))

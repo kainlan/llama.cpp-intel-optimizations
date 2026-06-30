@@ -1227,17 +1227,33 @@ Tasks 1-5 have landed and passed fresh SPEC then QUALITY review; Task 6 is this 
 | 3 materialization invariants | `a0c2e9ccf test(sycl): prove single XMX_TILED gateup materialization invariants`; lead checks `/tmp/lead_t3_build.log`, `/tmp/lead_t3_test.out` | SPEC PASS, QUALITY PASS |
 | 4 parser and dry-run gates | `dcea51cc8 test(sycl): gate single XMX_TILED gateup evidence`; lead checks `/tmp/lead_t4_fix_pytest.out`, `/tmp/lead_t4_fix_dryrun.out`, dry-run log dir `/tmp/single_xmx_dryrun_lead_fix` | SPEC PASS, QUALITY PASS |
 | 5 runtime PP/TG route evidence | `be0fb8379 feat(sycl): label direct single XMX_TILED gateup route`; lead checks `/tmp/lead_t5_fix_build.log`, `/tmp/lead_t5_final_cpu.out` | SPEC PASS, QUALITY PASS |
-| 6 docs and validation handoff | `docs(sycl): document single XMX_TILED gateup proof mode` | in this commit; pending SPEC/QUALITY review |
-| 7 B50/B580 validation | lead-only real B50/B580/model gates | pending; not worker-runnable |
+| 6 docs and validation handoff | `296989dd0 docs(sycl): document single XMX_TILED gateup proof mode` | SPEC PASS, QUALITY PASS |
+| 7 B50/B580 validation | lead-only real B50/B580/model gates | blocked; B50 proof failed closed on missing PP direct-XMX evidence |
 
 Current proof-mode contract:
 
 - `GGML_SYCL_MOE_GATEUP_SINGLE_XMX=1` is the only new proof-mode env and is default OFF.
-- Gate/up MXFP4 experts must use one persistent `GGML_LAYOUT_XMX_TILED` VRAM layout consumed by both PP and TG.
+- This proof env does **not** silently bypass the existing prompt-XMX PP safety gates. PP direct XMX remains behind the existing explicit opt-ins `GGML_SYCL_XMX_MOE=1` and `GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP=1` / `GGML_SYCL_XMX_MOE_PP=1`.
+- Gate/up MXFP4 experts must use one persistent `GGML_LAYOUT_XMX_TILED` VRAM layout consumed by both PP and TG before the route can be promoted.
 - Persistent SOA gate/up duplicates and per-token gate/up prepack are forbidden in this mode; transient scratch remains allowed.
 - Non-dry-run validation must pass `--require-single-xmx-gateup --forbid-gateup-soa-fallback`.
 - Workers must not run B50/B580/model gates; lead owns Task 7.
 - Rejected prepack evidence is preserved: `GGML_SYCL_MOE_GATEUP_PREPACK=1` copied `35,251,200` bytes/layer/token and added about `25.7 ms/token` across 24 layers.
+
+### Task 7 Lead Validation Status (2026-06-29)
+
+Task 7 is blocked, and the proof mode must remain default-off/not promoted.
+
+Lead checks completed:
+
+- Parser RED check on missing input failed as expected: `error: missing log inputs: /tmp/nonexistent-single-xmx-proof-log`.
+- CPU/build checks after the Task 7 candidate fixes passed: `git diff --check`, `test-sycl-moe-xmx-tiled-single-layout-planner`, `test-sycl-moe-xmx-tiled-materialization`, `test-xmx-moe-mxfp4`, and `tests/test-sycl-moe-profile-parser.py`.
+- Latest B50 harness with route logging: `/tmp/sycl_single_xmx_gateup_b50_routelog_20260629_201925`, `HARNESS_STATUS=18`.
+- Count gate was fatal-free and generated the canonical answer `1, 2, 3, 4, 5`.
+- Parser count output reported `fatal.total 0`, `diag.path.xmx-tiled-single-gateup 13`, and `phase.single_xmx_gateup.complete 48`.
+- Short diag reported `pp64 52.56 ± 0.24` and `tg32 34.24 ± 0.11`; full PP512/TG128 perf did not run because the path proof failed first, and the `tg32` result remained below target directionally.
+- Path parser failed with `error: single XMX_TILED gate/up profile path evidence missing` because TG direct labels were present but PP `xmx-tiled-single-gateup` profile evidence was absent.
+- Route logs showed TG materialization/direct use of XMX_TILED, but PP still selected/relied on SOA unless the existing unsafe prompt-XMX opt-ins are explicitly enabled. Do not add those unsafe PP opt-ins to the promotion harness without a new SPEC/QUALITY-reviewed task and fresh correctness evidence.
 
 ### Task 7: Lead-owned end-to-end validation on B50, then B580 if B50 passes
 
@@ -1289,6 +1305,7 @@ GGML_SYCL_MOE_GATEUP_SINGLE_XMX=1 \
 GGML_SYCL_MOE_PHASE_MATERIALIZE=1 \
 GGML_SYCL_MOE_PHASE_BULK_XMX=1 \
 GGML_SYCL_MOE_DOWN_SUM_DIRECT=1 \
+GGML_SYCL_MOE_ROUTE_LOG=1 \
 GGML_SYCL_MXFP4_TG_PROFILE=1 \
 GGML_SYCL_MXFP4_PP_PROFILE=1 \
 ./build/bin/llama-cli \
@@ -1312,6 +1329,7 @@ GGML_SYCL_MOE_GATEUP_SINGLE_XMX=1 \
 GGML_SYCL_MOE_PHASE_MATERIALIZE=1 \
 GGML_SYCL_MOE_PHASE_BULK_XMX=1 \
 GGML_SYCL_MOE_DOWN_SUM_DIRECT=1 \
+GGML_SYCL_MOE_ROUTE_LOG=1 \
 GGML_SYCL_MXFP4_TG_PROFILE=1 \
 GGML_SYCL_MXFP4_PP_PROFILE=1 \
 ./build/bin/llama-bench \

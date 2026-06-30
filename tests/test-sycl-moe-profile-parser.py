@@ -1005,6 +1005,53 @@ def test_parser_extracts_mxfp4_tg_profile_counters() -> None:
         assert "profile.mxfp4_tg.down_ms_x1000 6438" in out
 
 
+def test_parser_extracts_mxfp4_tg_pack_profile_counter() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        (tmp / "profile.stderr").write_text(
+            "[MXFP4-MOE-TG-PROFILE] calls=72 soa=0 coalesced=0 aos=0 dpas=48 i8=6 "
+            "entries=288 batches=288 total=7.100 ms quant=0.200 ms artifact=0.100 ms "
+            "batch_ids=0.000 ms pack=1.250 ms kernel=5.550 ms gateup_glu=6.800 ms/48 down=0.700 ms/24 "
+            "other=0.000 ms/0 per_call total=98.611 us quant=2.778 us "
+            "batch_ids=0.000 us kernel=77.083 us per_entry kernel=19.271 us last_path=packed-q8-m2\n"
+        )
+        out = run_parser(tmp)
+        assert "profile.mxfp4_tg.pack_ms_x1000 1250" in out
+        assert "profile.mxfp4_tg.path.packed-q8-m2 1" in out
+
+
+def test_parser_extracts_mxfp4_tg_down_pack_profile_counter() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        (tmp / "profile.stderr").write_text(
+            "[MXFP4-MOE-TG-PROFILE] calls=24 soa=0 coalesced=0 aos=0 dpas=0 i8=24 "
+            "entries=96 batches=96 total=1.100 ms quant=0.000 ms artifact=0.000 ms "
+            "batch_ids=0.000 ms pack=0.250 ms kernel=0.850 ms gateup_glu=0.000 ms/0 down=1.100 ms/24 "
+            "other=0.000 ms/0 per_call total=45.833 us quant=0.000 us "
+            "batch_ids=0.000 us kernel=35.417 us per_entry kernel=8.854 us last_path=down-grouped-packed-q8\n"
+        )
+        out = run_parser(tmp)
+        assert "profile.mxfp4_tg.pack_ms_x1000 250" in out
+        assert "profile.mxfp4_tg.path.down-grouped-packed-q8 1" in out
+
+
+def test_tg_profile_source_records_down_pack_timing() -> None:
+    mmvq = (ROOT / "ggml" / "src" / "ggml-sycl" / "mmvq.cpp").read_text()
+    down_begin = mmvq.index("bool mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4")
+    down_end = mmvq.index("class mxfp4_down_sum_q8_soa_kernel", down_begin)
+    down_dispatch = mmvq[down_begin:down_end]
+    route_begin = down_dispatch.index("if (!chunked_row_limit && mxfp4_i8_grouped_pack_q8_enabled(n_tokens))")
+    route_end = down_dispatch.index('profile_path = "down-grouped-packed-q8";', route_begin)
+    down_pack_route = down_dispatch[route_begin:route_end]
+    assert "if (detail_profile)" in down_pack_route
+    assert "profile_pack_event     = pack_event" in down_pack_route
+    assert "if (pp_profile)" not in down_pack_route
+    record_begin = down_dispatch.index("if (mmvq_moe_tg_profile_enabled())")
+    record_end = down_dispatch.index("if (pp_profile)", record_begin)
+    down_tg_record = down_dispatch[record_begin:record_end]
+    assert "profile_path, pack_us" in down_tg_record
+
+
 def test_down_dpas_direct_final_labels_are_counted() -> None:
     with tempfile.TemporaryDirectory() as tmp_raw:
         tmp = pathlib.Path(tmp_raw)
