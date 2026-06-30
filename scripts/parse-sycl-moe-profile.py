@@ -92,18 +92,20 @@ def bench_tps_key(test: str) -> str:
 
 
 BENCH_TPS_KEY_RE = re.compile(r"^bench\.(?:pp|tg)\d+\.tps_x100$")
+MXFP4_PROFILE_TIMING_KEY_RE = re.compile(r"^profile\.mxfp4_(?:tg|pp)\.[A-Za-z0-9_]+_ms_x1000$")
 
 
 def merge_counters_for_totals(dst: collections.Counter[str], src: collections.Counter[str]) -> None:
     """Merge parsed counters while preserving best observed bench throughput.
 
-    Most counters are counts and should sum across files.  Bench throughput keys
-    encode the best t/s observed in a file, so summing them across multiple log
-    files can make several sub-threshold runs look like one passing run.
+    Most counters are counts and should sum across files.  Bench throughput and
+    MXFP4 timing keys encode the best/max value observed in a file, so summing
+    them across multiple log files can make several individually valid runs look
+    invalid or several sub-threshold runs look valid.
     """
 
     for key, value in src.items():
-        if BENCH_TPS_KEY_RE.fullmatch(key):
+        if BENCH_TPS_KEY_RE.fullmatch(key) or MXFP4_PROFILE_TIMING_KEY_RE.fullmatch(key):
             dst[key] = max(dst.get(key, 0), value)
         else:
             dst[key] += value
@@ -175,6 +177,8 @@ def gate_args_requested(args: argparse.Namespace) -> bool:
         or args.forbid_diag_path
         or args.require_down_dpas_direct_final
         or args.require_mxfp4_profile_evidence
+        or args.require_mxfp4_tg_path
+        or args.require_mxfp4_gateup_max_ms is not None
         or args.require_e2e_profile_evidence
         or args.require_e2e_stage
         or args.require_single_xmx_gateup
@@ -674,6 +678,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="exit nonzero unless MXFP4 TG/PP profile counters or profile path labels were parsed",
     )
     parser.add_argument(
+        "--require-mxfp4-tg-path",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="exit nonzero unless an MXFP4 TG profile path label appears",
+    )
+    parser.add_argument(
+        "--require-mxfp4-gateup-max-ms",
+        type=float,
+        default=None,
+        metavar="MS",
+        help="exit nonzero if max parsed MXFP4 gate/up+GLU profile time exceeds MS",
+    )
+    parser.add_argument(
         "--require-e2e-profile-evidence",
         action="store_true",
         help="exit nonzero unless SYCL end-to-end TG profile counters were parsed",
@@ -811,6 +829,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.require_mxfp4_profile_evidence and mxfp4_profile_evidence_count(total) <= 0:
         print("error: MXFP4 profile evidence missing")
         return 16
+    for required_path in args.require_mxfp4_tg_path:
+        if total.get(f"profile.mxfp4_tg.path.{required_path}", 0) <= 0:
+            print(f"error: required MXFP4 TG path missing: {required_path}")
+            return 1
+    if args.require_mxfp4_gateup_max_ms is not None:
+        if not math.isfinite(args.require_mxfp4_gateup_max_ms) or args.require_mxfp4_gateup_max_ms <= 0.0:
+            print(f"error: MXFP4 gate/up maximum must be finite and positive: {args.require_mxfp4_gateup_max_ms}")
+            return 1
+        actual_ms = total.get("profile.mxfp4_tg.gateup_glu_ms_x1000", 0) / 1000.0
+        if actual_ms <= 0.0:
+            print("error: MXFP4 gate/up profile evidence missing for maximum check")
+            return 1
+        if actual_ms > args.require_mxfp4_gateup_max_ms:
+            print(
+                f"error: MXFP4 gate/up above maximum: "
+                f"actual={actual_ms:.3f} ms required<={args.require_mxfp4_gateup_max_ms:.3f} ms"
+            )
+            return 1
     if args.require_e2e_profile_evidence and total.get("profile.e2e_tg.tokens", 0) <= 0:
         print("error: E2E TG profile evidence missing")
         return 1

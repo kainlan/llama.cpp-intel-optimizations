@@ -1051,6 +1051,78 @@ def test_parser_extracts_mxfp4_tg_pack_profile_counter() -> None:
         assert "profile.mxfp4_tg.path.packed-q8-m2 1" in out
 
 
+def test_parser_requires_mxfp4_tg_path() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        (tmp / "profile.stderr").write_text(
+            "[MXFP4-MOE-TG-PROFILE] calls=72 soa=0 coalesced=0 aos=0 dpas=48 i8=6 "
+            "entries=288 batches=288 total=4.300 ms quant=0.120 ms artifact=0.050 ms "
+            "batch_ids=0.000 ms pack=0.040 ms kernel=4.090 ms gateup_glu=4.100 ms/48 down=0.500 ms/24 "
+            "other=0.000 ms/0 per_call total=59.722 us quant=1.667 us "
+            "batch_ids=0.000 us kernel=56.806 us per_entry kernel=14.201 us last_path=singlecol-gateup\n"
+        )
+        out = run_parser(tmp, "--require-mxfp4-tg-path", "singlecol-gateup")
+        assert "profile.mxfp4_tg.path.singlecol-gateup 1" in out
+
+
+def test_parser_require_mxfp4_tg_path_fails_closed() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        (tmp / "profile.stderr").write_text(
+            "[MXFP4-MOE-TG-PROFILE] calls=72 soa=0 coalesced=0 aos=0 dpas=48 i8=6 "
+            "entries=288 batches=288 total=6.800 ms quant=0.200 ms artifact=0.100 ms "
+            "batch_ids=0.000 ms pack=0.070 ms kernel=6.430 ms gateup_glu=5.950 ms/48 down=0.790 ms/24 "
+            "other=0.000 ms/0 last_path=packed-q8-m2\n"
+        )
+        result = run_parser_result(tmp, "--require-mxfp4-tg-path", "singlecol-gateup")
+        assert result.returncode == 1
+        assert "error: required MXFP4 TG path missing: singlecol-gateup" in result.stdout
+
+
+def test_parser_requires_mxfp4_gateup_max_ms() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        (tmp / "profile.stderr").write_text(
+            "[MXFP4-MOE-TG-PROFILE] calls=72 soa=0 coalesced=0 aos=0 dpas=24 i8=6 "
+            "entries=288 batches=288 total=4.250 ms quant=0.100 ms artifact=0.050 ms "
+            "batch_ids=0.000 ms pack=0.000 ms kernel=4.100 ms gateup_glu=4.150 ms/48 down=0.650 ms/24 "
+            "other=0.000 ms/0 last_path=singlecol-gateup\n"
+        )
+        out = run_parser(tmp, "--require-mxfp4-gateup-max-ms", "4.2")
+        assert "profile.mxfp4_tg.gateup_glu_ms_x1000 4150" in out
+
+
+def test_parser_require_mxfp4_gateup_max_ms_uses_max_observed_not_sum() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        profile = (
+            "[MXFP4-MOE-TG-PROFILE] calls=72 soa=0 coalesced=0 aos=0 dpas=24 i8=6 "
+            "entries=288 batches=288 total=3.250 ms quant=0.100 ms artifact=0.050 ms "
+            "batch_ids=0.000 ms pack=0.000 ms kernel=3.100 ms gateup_glu=3.000 ms/48 down=0.650 ms/24 "
+            "other=0.000 ms/0 last_path=singlecol-gateup\n"
+        )
+        (tmp / "profile-a.stderr").write_text(profile)
+        (tmp / "profile-b.stderr").write_text(profile)
+        out = run_parser(tmp, "--require-mxfp4-gateup-max-ms", "4.2")
+        assert "== TOTAL ==" in out
+        assert "profile.mxfp4_tg.gateup_glu_ms_x1000 3000" in out
+        assert "profile.mxfp4_tg.gateup_glu_ms_x1000 6000" not in out
+
+
+def test_parser_require_mxfp4_gateup_max_ms_fails_closed() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        (tmp / "profile.stderr").write_text(
+            "[MXFP4-MOE-TG-PROFILE] calls=72 soa=0 coalesced=0 aos=0 dpas=48 i8=6 "
+            "entries=288 batches=288 total=6.850 ms quant=0.200 ms artifact=0.100 ms "
+            "batch_ids=0.000 ms pack=0.070 ms kernel=6.480 ms gateup_glu=5.950 ms/48 down=0.790 ms/24 "
+            "other=0.000 ms/0 last_path=packed-q8-m2\n"
+        )
+        result = run_parser_result(tmp, "--require-mxfp4-gateup-max-ms", "4.2")
+        assert result.returncode == 1
+        assert "error: MXFP4 gate/up above maximum: actual=5.950 ms required<=4.200 ms" in result.stdout
+
+
 def test_parser_extracts_mxfp4_tg_down_pack_profile_counter() -> None:
     with tempfile.TemporaryDirectory() as tmp_raw:
         tmp = pathlib.Path(tmp_raw)
