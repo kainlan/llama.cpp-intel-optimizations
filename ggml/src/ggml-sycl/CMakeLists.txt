@@ -1190,6 +1190,7 @@ foreach(_residency_test
     test-sycl-moe-xmx-tiled-materialization
     test-sycl-moe-fusion-noactivation
     test-sycl-moe-sequence-graphlet-policy
+    test-sycl-e2e-profile
 )
     add_executable(${_residency_test}
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/${_residency_test}.cpp
