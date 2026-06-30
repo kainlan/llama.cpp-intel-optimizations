@@ -7,6 +7,7 @@
 #include "fattn.hpp"
 
 #include "common.hpp"
+#include "e2e-profile.hpp"
 #include "fattn-debug.hpp"
 #include "fattn-esimd-f16.hpp"
 #include "fattn-mma.hpp"
@@ -519,6 +520,14 @@ bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows(const ggml_tensor * dst,
                         static_cast<sycl::half *>(packed.ptr), stream, set_rows_event, zero_event, packed.ready_event,
                         add_zero_dep, add_prev_dep);
             packed.ready_event = update_event;
+            if (ggml_sycl::e2e_tg_profile_enabled()) {
+                ggml_sycl::e2e_tg_profile_record(ggml_sycl::e2e_tg_stage::KV,
+                                                 "packed_k_sidecar",
+                                                 0.0,
+                                                 0.0,
+                                                 total_bytes,
+                                                 1);
+            }
             if (out_event) {
                 *out_event = update_event;
             }
@@ -2099,6 +2108,9 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
                     dispatch_debug_counter, debug_limit, kernel, D, ne01, (int) safe_decode,
                     (int) fast_decode_policy.fast_esimd_safe);
         }
+        if (ggml_sycl::e2e_tg_profile_enabled()) {
+            ggml_sycl::e2e_tg_profile_record(ggml_sycl::e2e_tg_stage::ATTENTION, kernel, 0.0, 0.0, 0, 1);
+        }
     };
     if (dispatch_debug_enabled) {
         const char * selected = safe_decode ? "(safe)" :
@@ -2796,6 +2808,9 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
 // Main flash attention entry point
 void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor safe_dst) {
     GGML_SYCL_PROFILE_SCOPE_FA("flash_attn");
+    ggml_sycl::e2e_tg_scope e2e_scope(ggml_sycl::e2e_tg_stage::ATTENTION,
+                                      "flash_attn_ext",
+                                      ggml_sycl::e2e_tg_profile_enabled());
 // Initialize configuration on first call
 #if GGML_SYCL_FA_V2_ENABLED
 #endif
