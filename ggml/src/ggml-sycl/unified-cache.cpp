@@ -8,6 +8,7 @@
 
 #include "alloc-registry.hpp"
 #include "common.hpp"
+#include "e2e-profile.hpp"
 #include "expert-prefetch.hpp"
 #include "ggml-impl.h"
 #include "ggml-sycl-test.hpp"
@@ -2413,6 +2414,9 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
                             "fallback\n",
                             used_.load() / (1024.0f * 1024.0f), size / (1024.0f * 1024.0f));
                         offload_stats_note_host_fallback_attempt(size);
+                        if (e2e_tg_profile_enabled()) {
+                            e2e_tg_profile_record_cache_event("host_fallback", size, 0.0);
+                        }
                         use_host_fallback = true;
                         break;
                     }
@@ -2431,6 +2435,9 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
                         GGML_SYCL_DEBUG("[UNIFIED-CACHE] realloc malloc_device failed: %s, trying host fallback\n",
                                         e.what());
                         offload_stats_note_host_fallback_attempt(size);
+                        if (e2e_tg_profile_enabled()) {
+                            e2e_tg_profile_record_cache_event("host_fallback", size, 0.0);
+                        }
                         use_host_fallback = true;
                     }
 
@@ -2438,6 +2445,9 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
                         GGML_SYCL_DEBUG(
                             "[UNIFIED-CACHE] realloc malloc_device returned nullptr, trying host fallback\n");
                         offload_stats_note_host_fallback_attempt(size);
+                        if (e2e_tg_profile_enabled()) {
+                            e2e_tg_profile_record_cache_event("host_fallback", size, 0.0);
+                        }
                         use_host_fallback = true;
                     }
 
@@ -2561,6 +2571,9 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
                 "[UNIFIED-CACHE] Cannot evict: all entries pinned (used=%.1f MB, need=%.1f MB), trying host fallback\n",
                 used_.load() / (1024.0f * 1024.0f), size / (1024.0f * 1024.0f));
             offload_stats_note_host_fallback_attempt(size);
+            if (e2e_tg_profile_enabled()) {
+                e2e_tg_profile_record_cache_event("host_fallback", size, 0.0);
+            }
             use_host_fallback = true;
             break;
         }
@@ -2580,12 +2593,18 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
         } catch (const sycl::exception & e) {
             GGML_SYCL_DEBUG("[UNIFIED-CACHE] malloc_device failed: %s, trying host fallback\n", e.what());
             offload_stats_note_host_fallback_attempt(size);
+            if (e2e_tg_profile_enabled()) {
+                e2e_tg_profile_record_cache_event("host_fallback", size, 0.0);
+            }
             use_host_fallback = true;
         }
 
         if (!device_ptr && !use_host_fallback) {
             GGML_SYCL_DEBUG("[UNIFIED-CACHE] malloc_device returned nullptr, trying host fallback\n");
             offload_stats_note_host_fallback_attempt(size);
+            if (e2e_tg_profile_enabled()) {
+                e2e_tg_profile_record_cache_event("host_fallback", size, 0.0);
+            }
             use_host_fallback = true;
         }
 
@@ -3188,6 +3207,9 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         }
 
         offload_stats_note_host_fallback_attempt(dst_size);
+        if (e2e_tg_profile_enabled()) {
+            e2e_tg_profile_record_cache_event("host_fallback", dst_size, 0.0);
+        }
         static std::atomic<int> host_fallback_log{ 0 };
         if (host_fallback_log.fetch_add(1, std::memory_order_relaxed) < 10) {
             GGML_LOG_WARN("[DIRECT-STAGE] WEIGHT zone full (%zu bytes) — host arena fallback\n", dst_size);
@@ -8660,6 +8682,9 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                         "falling back to host-pinned KV\n",
                         alloc_size / (1024.0 * 1024.0), cache->zone_available(vram_zone_id::KV) / (1024.0 * 1024.0));
                     offload_stats_note_host_fallback_attempt(alloc_size);
+                    if (e2e_tg_profile_enabled()) {
+                        e2e_tg_profile_record_cache_event("host_fallback", alloc_size, 0.0);
+                    }
                     kv_spill_to_host = true;
                 }
             }
@@ -9377,6 +9402,9 @@ unified_alloc_result unified_cache_allocate(int device, size_t size, alloc_categ
     // VRAM allocation failed — try host-pinned fallback for eligible categories.
     if (category_allows_host_fallback(category) && !req.intent.constraints.must_device) {
         offload_stats_note_host_fallback_attempt(size);
+        if (e2e_tg_profile_enabled()) {
+            e2e_tg_profile_record_cache_event("host_fallback", size, 0.0);
+        }
         req.intent.constraints.must_host_pinned = true;
         req.intent.constraints.must_device      = false;
         if (unified_alloc(req, &handle)) {
@@ -11826,6 +11854,9 @@ unified_cache::vram_alloc_result unified_cache::allocate(size_t size, alloc_life
     auto         note_host_fallback_once = [&]() {
         if (!host_fallback_counted) {
             offload_stats_note_host_fallback_attempt(size);
+            if (e2e_tg_profile_enabled()) {
+                e2e_tg_profile_record_cache_event("host_fallback", size, 0.0);
+            }
             host_fallback_counted = true;
         }
     };
@@ -13768,6 +13799,9 @@ void * unified_cache::zone_alloc(vram_zone_id zone, size_t size, size_t align) {
             t_arena_pp_profile.zone_alloc_bytes[idx] += size;
             t_arena_pp_profile.zone_alloc_us[idx] += arena_profile_elapsed_us(t0);
         }
+        if (e2e_tg_profile_enabled()) {
+            e2e_tg_profile_record_cache_event("zone_alloc_failed", size, 0.0);
+        }
         return nullptr;
     }
 
@@ -13812,6 +13846,9 @@ void * unified_cache::zone_alloc(vram_zone_id zone, size_t size, size_t align) {
         t_arena_pp_profile.zone_alloc_us[idx] += arena_profile_elapsed_us(t0);
         t_arena_pp_profile.zone_largest_free_min[idx] =
             std::min(t_arena_pp_profile.zone_largest_free_min[idx], alloc->largest_free_block());
+    }
+    if (e2e_tg_profile_enabled()) {
+        e2e_tg_profile_record_cache_event("zone_alloc_failed", size, 0.0);
     }
     return nullptr;
 }
