@@ -24,7 +24,7 @@ def matching_brace(source: str, open_brace: int) -> int:
 def test_fattn_has_e2e_attention_scope() -> None:
     src = read_source()
     assert '#include "e2e-profile.hpp"' in src
-    begin = src.index("void ggml_sycl_flash_attn_ext")
+    begin = src.index("void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx")
     end = src.index("const ggml_tensor * mask", begin)
     body = src[begin:end]
     assert "ggml_sycl::e2e_tg_scope e2e_scope" in body
@@ -40,9 +40,12 @@ def test_fattn_dispatch_records_selected_path() -> None:
     debug_if_open = body.index("{", debug_if)
     debug_if_close = matching_brace(body, debug_if_open)
     record = body.index("ggml_sycl::e2e_tg_profile_record(ggml_sycl::e2e_tg_stage::ATTENTION")
+    record_gate = body.rindex("if (ggml_sycl::e2e_tg_profile_enabled())", 0, record)
+    record_gate_close = matching_brace(body, body.index("{", record_gate))
     assert debug_if < debug_if_close < record
+    assert record_gate < record < record_gate_close
     assert "ggml_sycl::e2e_tg_profile_record" not in body[debug_if:debug_if_close]
-    assert "kernel" in body[record:]
+    assert "kernel" in body[record:record_gate_close]
 
 
 def test_packed_k_sidecar_records_kv_bytes_without_ownership_change() -> None:
@@ -53,7 +56,10 @@ def test_packed_k_sidecar_records_kv_bytes_without_ownership_change() -> None:
     handle = body.index("packed.handle = ggml_sycl::mem_handle::from_owned_alloc")
     event_update = body.index("packed.ready_event = update_event")
     record = body.index("ggml_sycl::e2e_tg_profile_record(ggml_sycl::e2e_tg_stage::KV")
-    assert handle < event_update < record
-    assert "packed_k_sidecar" in body[record:]
+    record_gate = body.rindex("if (ggml_sycl::e2e_tg_profile_enabled())", 0, record)
+    record_gate_close = matching_brace(body, body.index("{", record_gate))
+    assert handle < event_update < record_gate < record < record_gate_close
+    assert "packed_k_sidecar" in body[record:record_gate_close]
+    assert "total_bytes" in body[record:record_gate_close]
     assert ".wait(" not in body
     assert ".wait_and_throw(" not in body
