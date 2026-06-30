@@ -1404,7 +1404,7 @@ git commit -m "test(sycl): add GPT-OSS E2E decode profiling matrix"
 **File scope:**
 - Modify: `docs/backend/SYCL.md` by adding a section named `GPT-OSS MXFP4 end-to-end TG profile ledger`
 - Modify: `docs/plans/2026-06-30-sycl-gptoss-mxfp4-e2e-decode-profiling.md` by appending a final `Execution Evidence Template` section
-- Update tracker task `llama.cpp-px5a` with a comment containing the final dry-run path and, when lead has run it, the real log directory
+- Update tracker task `llama.cpp-zwpo` with a comment containing the final dry-run path and, when lead has run it, the real log directory
 
 **Description:**
 Document how the new ledger is used and define the decision gate for the next optimization plan. This task intentionally does not select or implement a runtime optimization; it creates the evidence standard that must be met before choosing graph replay, attention/KV, non-MoE matmul, MoE DPAS, CPU/offload, or multi-GPU work.
@@ -1543,7 +1543,7 @@ Expected GREEN output: no output and exit code 0.
 
 4. **Tracker update.**
 
-Add a task comment to `llama.cpp-px5a` after the dry-run and after any lead-owned real run. The comment body must include:
+Add a task comment to `llama.cpp-zwpo` after the dry-run and after any lead-owned real run. The comment body must include:
 
 ```text
 E2E decode profiling plan implemented. Dry-run harness: scripts/sycl-gptoss-e2e-profile-matrix.sh --dry-run. Lead validation log dir: not run. Parser gates: --require-e2e-profile-evidence --require-e2e-stage moe --require-e2e-stage attention. Next optimization target remains blocked until the evidence table is filled.
