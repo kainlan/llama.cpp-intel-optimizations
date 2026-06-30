@@ -1205,9 +1205,10 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                 const int  xmx_tiled_m_tiles   = config.kernel_name.find("_m4") != std::string::npos ? 4 :
                                                  config.kernel_name.find("_m2") != std::string::npos ? 2 :
                                                                                                        1;
-                const bool direct_xmx          = config.kernel_name.find("_xmx_soa") != std::string::npos;
-                const bool split_gate_up       = config.kernel_name.find("_split") != std::string::npos;
-                const bool predecoded_i8       = config.kernel_name.find("_predecoded") != std::string::npos;
+                const bool direct_xmx           = config.kernel_name.find("_xmx_soa") != std::string::npos;
+                const bool split_gate_up        = config.kernel_name.find("_split") != std::string::npos;
+                const bool single_column_gateup = config.kernel_name.find("_singlecol") != std::string::npos;
+                const bool predecoded_i8        = config.kernel_name.find("_predecoded") != std::string::npos;
                 const int  xmx_tiles_n         = parse_moe_xmx_tiles_n(config.kernel_name);
                 const bool vector_qs_load      = config.kernel_name.find("_vecq") != std::string::npos;
                 const bool ignore_weight_scale = config.kernel_name.find("_noscale") != std::string::npos;
@@ -1217,8 +1218,9 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                 const bool use_bias            = config.kernel_name.find("_bias") != std::string::npos;
                 if (!run_mxfp4_pair_glu(weights, activations, m, selected_count, k, token_rows, rows_per_wg, cache_y,
                                         direct_xmx, xmx_tiled, xmx_tiled_grouped, xmx_tiled_pack_q8, xmx_tiled_prefetch,
-                                        xmx_tiled_m_tiles, split_gate_up, predecoded_i8, xmx_tiles_n, vector_qs_load,
-                                        ignore_weight_scale, scale_stride_blocks, subgroup_size, sparse_expert_slots,
+                                        xmx_tiled_m_tiles, split_gate_up, single_column_gateup, predecoded_i8,
+                                        xmx_tiles_n, vector_qs_load, ignore_weight_scale, scale_stride_blocks,
+                                        subgroup_size, sparse_expert_slots,
                                         use_bias, config.validate, config.warmup_iterations, config.measure_iterations,
                                         queue, metrics, error)) {
                     out.error = error;

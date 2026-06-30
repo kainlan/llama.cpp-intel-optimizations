@@ -1054,6 +1054,7 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
                         bool                         xmx_tiled_prefetch,
                         int                          xmx_tiled_m_tiles,
                         bool                         split_gate_up,
+                        bool                         single_column_gateup,
                         bool                         predecoded_i8,
                         int                          xmx_tiles_n,
                         bool                         vector_qs_load,
@@ -1082,6 +1083,12 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     }
     if (predecoded_i8 && !split_gate_up) {
         error = "mxfp4_pair_glu predecoded_i8 requires split gate/up.";
+        return false;
+    }
+    if (single_column_gateup &&
+        (!xmx_tiled || xmx_tiled_grouped || xmx_tiled_pack_q8 || xmx_tiled_prefetch || xmx_tiled_m_tiles != 1 ||
+         (rows_per_wg != 1 && rows_per_wg != 2 && rows_per_wg != 4))) {
+        error = "mxfp4_pair_glu single-column gate/up requires un-packed XMX_TILED r1/r2/r4.";
         return false;
     }
     if (xmx_tiled && (direct_xmx || split_gate_up || predecoded_i8 || vector_qs_load || scale_stride_blocks > 0)) {
@@ -1480,6 +1487,7 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     args.xmx_tiled_prefetch  = xmx_tiled_prefetch;
     args.xmx_tiled_m_tiles   = xmx_tiled_m_tiles;
     args.split_gate_up       = split_gate_up;
+    args.single_column_gateup = single_column_gateup;
     args.predecoded_i8       = predecoded_i8;
     args.xmx_tiles_n         = xmx_tiled ? tiles_n : xmx_tiles_n;
     args.vector_qs_load      = vector_qs_load;
@@ -1570,8 +1578,9 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
             ref_args.xmx_tiled_pack_q8  = false;
             ref_args.xmx_tiled_prefetch = false;
             ref_args.xmx_tiled_m_tiles  = 1;
-            ref_args.split_gate_up      = false;
-            ref_args.predecoded_i8      = false;
+            ref_args.split_gate_up       = false;
+            ref_args.single_column_gateup = false;
+            ref_args.predecoded_i8       = false;
             ref_args.gate_tmp           = nullptr;
             ref_args.up_tmp             = nullptr;
             ref_args.down_q8_soa        = nullptr;

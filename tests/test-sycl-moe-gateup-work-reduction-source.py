@@ -89,12 +89,34 @@ def test_current_m2_gateup_uses_separate_gate_and_up_dpas_calls() -> None:
     assert "up_part0.template select<1, 1>(r * exec_n)" in body
 
 
-def test_singlecol_route_is_absent_before_candidate_task() -> None:
+def test_singlecol_route_label_and_env_are_default_off() -> None:
     mmvq = MMVQ.read_text(encoding="utf-8")
+    assert "singlecol-gateup" in mmvq
+    assert "GGML_SYCL_MOE_GATEUP_SINGLECOL" in mmvq
+    assert "static bool mxfp4_moe_gateup_singlecol_enabled()" in mmvq
+    helper_start = mmvq.index("static bool mxfp4_moe_gateup_singlecol_enabled()")
+    helper_end = mmvq.index("}", helper_start)
+    helper = mmvq[helper_start:helper_end]
+    assert "getenv(\"GGML_SYCL_MOE_GATEUP_SINGLECOL\")" in helper
+    assert "std::atoi" in helper
+
+
+def test_singlecol_candidate_has_its_own_kernel_not_prepack_only() -> None:
+    mmvq = MMVQ.read_text(encoding="utf-8")
+    assert "mxfp4_pair_glu_singlecol_sycl" in mmvq
+    assert "mxfp4_pair_glu_singlecol_submit" in mmvq
+    singlecol_start = mmvq.index("mxfp4_pair_glu_singlecol_sycl")
+    singlecol_end = mmvq.index("mxfp4_pair_glu_singlecol_submit", singlecol_start)
+    singlecol_body = strip_cpp_comments(mmvq[singlecol_start:singlecol_end])
+    assert "mxfp4_xmx_tiled_load_a_vec_from_group" in singlecol_body
+    assert "mmvq_moe_apply_pair_glu_esimd" in singlecol_body
+    assert "prepack" not in singlecol_body.lower()
+
+
+def test_bench_args_expose_singlecol_without_runtime_default() -> None:
     bench = BENCH_HPP.read_text(encoding="utf-8")
-    assert "GGML_SYCL_MOE_GATEUP_SINGLECOL" not in mmvq
-    assert "singlecol-gateup" not in mmvq
-    assert "single_column_gateup" not in bench
+    assert "bool  single_column_gateup" in bench
+    assert "single_column_gateup = false" in bench
 
 
 def test_e2e_evidence_names_moe_as_dominant_bucket() -> None:
