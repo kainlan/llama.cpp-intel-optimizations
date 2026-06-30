@@ -263,6 +263,31 @@ def test_parser_accepts_generic_model_name_in_bench_rows() -> None:
         assert "bench.tg32.tps_x100 1250" in out
 
 
+def test_parser_handles_profile_only_stderr_without_benchmark_regex_backtracking() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        profile_line = (
+            "[MXFP4-MOE-TG-PROFILE] calls=72 soa=18 coalesced=0 aos=0 dpas=48 i8=6 entries=288 "
+            "batches=288 total=6.583 ms quant=0.152 ms artifact=0.159 ms batch_ids=0.000 ms "
+            "pack=0.053 ms kernel=6.219 ms gateup_glu=5.697 ms/48 down=0.727 ms/24 "
+            "other=0.000 ms/0 per_call total=91.433 us quant=2.110 us batch_ids=0.000 us "
+            "kernel=86.379 us per_entry kernel=21.595 us last_path=packed-q8-m2\n"
+        )
+        (tmp / "bench.stderr").write_text(profile_line * 512)
+        result = subprocess.run(
+            [sys.executable, str(PARSER), "--no-lines", str(tmp / "bench.stderr")],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=5,
+        )
+        assert result.returncode == 0, result.stdout
+        assert "profile.mxfp4_tg.calls 72" in result.stdout
+        assert "profile.mxfp4_tg.path.packed-q8-m2 512" in result.stdout
+        assert "profile.mxfp4_tg.gateup_glu_ms_x1000 5697" in result.stdout
+
+
 def test_parser_bench_min_uses_best_throughput_not_sum_across_logs() -> None:
     with tempfile.TemporaryDirectory() as tmp_raw:
         tmp = pathlib.Path(tmp_raw)

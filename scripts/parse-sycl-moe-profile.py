@@ -217,16 +217,8 @@ BENCH_RE = re.compile(
     r"\|\s*(?P<model>[^|]*\S[^|]*)\|[^|]*\|[^|]*\|[^|]*\|\s*(?P<ngl>\d+)\s*\|\s*(?P<fa>\d+)\s*\|\s*(?P<test>(?:pp|tg)\d+)\s*\|\s*(?P<tps>[0-9.]+)\s*(?:±|\+/-)\s*(?P<err>[0-9.]+)\s*\|"
 )
 KEY_VALUE_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)=([0-9]+(?:\.[0-9]+)?)")
-MXFP4_TG_PROFILE_RE = re.compile(
-    r"\[MXFP4-MOE-TG-PROFILE\].*?calls=(?P<calls>\d+)"
-    r".*?soa=(?P<soa>\d+).*?coalesced=(?P<coalesced>\d+).*?aos=(?P<aos>\d+)"
-    r".*?dpas=(?P<dpas>\d+).*?i8=(?P<i8>\d+)"
-    r".*?total=(?P<total>[0-9.]+) ms.*?quant=(?P<quant>[0-9.]+) ms"
-    r".*?artifact=(?P<artifact>[0-9.]+) ms.*?batch_ids=(?P<batch_ids>[0-9.]+) ms"
-    r"(?:.*?pack=(?P<pack>[0-9.]+) ms)?"
-    r".*?kernel=(?P<kernel>[0-9.]+) ms.*?gateup_glu=(?P<gateup>[0-9.]+) ms(?:/\d+)?"
-    r".*?down=(?P<down>[0-9.]+) ms(?:/\d+)?"
-)
+MXFP4_TG_LAYOUT_KEYS = ("soa", "coalesced", "aos", "dpas", "i8")
+MXFP4_TG_METRIC_KEYS = ("total", "quant", "artifact", "batch_ids", "pack", "kernel", "gateup_glu", "down")
 E2E_TG_PROFILE_RE = re.compile(
     r"\[SYCL-E2E-TG-PROFILE\]\s+tokens=(?P<tokens>\d+)\s+ops=(?P<ops>\d+)"
     r"\s+moe_calls=(?P<moe_calls>\d+)\s+total_host=(?P<host>[0-9.]+) ms"
@@ -314,6 +306,13 @@ def parse_counter_value(raw: str) -> int:
     value = float(raw)
     rounded = int(round(value))
     return 1 if rounded == 0 and value > 0.0 else rounded
+
+
+def first_numeric_key_values(line: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for key, value in KEY_VALUE_RE.findall(line):
+        values.setdefault(key, value)
+    return values
 
 
 def ms_to_x1000(raw: str) -> int:
@@ -422,14 +421,17 @@ def summarize_file(path: pathlib.Path) -> tuple[collections.Counter[str], list[s
         lines.append(f"generated_mistral_count {mistral_count!r}")
         lines.append(f"generated_mistral_count_prefix {prefix_ok}")
 
-    for match in BENCH_RE.finditer(text):
-        group = match.groupdict()
-        lines.append("bench {test} {tps} +/- {err} ngl={ngl} fa={fa} model={model}".format(**group))
-        test = group["test"]
-        counters[f"bench.{test}.count"] += 1
-        counters[bench_tps_key(test)] = max(counters[bench_tps_key(test)], int(round(float(group["tps"]) * 100.0)))
-
     for line in text.splitlines():
+        if line.startswith("|"):
+            bench_match = BENCH_RE.match(line)
+            if bench_match:
+                group = bench_match.groupdict()
+                lines.append("bench {test} {tps} +/- {err} ngl={ngl} fa={fa} model={model}".format(**group))
+                test = group["test"]
+                counters[f"bench.{test}.count"] += 1
+                counters[bench_tps_key(test)] = max(
+                    counters[bench_tps_key(test)], int(round(float(group["tps"]) * 100.0))
+                )
         fatal_keys_seen: set[str] = set()
         for pattern, key in FATAL_MARKER_PATTERNS:
             if pattern.search(line):
@@ -456,8 +458,9 @@ def summarize_file(path: pathlib.Path) -> tuple[collections.Counter[str], list[s
             counters["placement.gateup.promoted_soa"] += int(promoted_soa.group("count"))
         if any(marker in line for marker in PROFILE_MARKERS):
             lines.append(line)
-        tg_profile = MXFP4_TG_PROFILE_RE.search(line)
+        tg_profile_values: dict[str, str] = {}
         if "[MXFP4-MOE-TG-PROFILE]" in line:
+            tg_profile_values = first_numeric_key_values(line)
             path_match = PATH_RE.search(line) or MXFP4_PP_PROFILE_LAST_PATH_RE.search(line)
             if path_match:
                 profile_path = path_match.group(1)
@@ -488,19 +491,20 @@ def summarize_file(path: pathlib.Path) -> tuple[collections.Counter[str], list[s
             if config_match:
                 counters[f"kernel_runtime.config.{config_match.group(1)}"] += 1
             lines.append(line)
-        if tg_profile:
-            counters["profile.mxfp4_tg.calls"] = max(
-                counters["profile.mxfp4_tg.calls"], int(tg_profile.group("calls"))
-            )
-            for layout_key in ("soa", "coalesced", "aos", "dpas", "i8"):
-                key = f"profile.mxfp4_tg.layout.{layout_key}"
-                counters[key] = max(counters[key], int(tg_profile.group(layout_key)))
-            for metric in ("total", "quant", "artifact", "batch_ids", "pack", "kernel", "gateup", "down"):
-                if tg_profile.group(metric) is None:
+        if tg_profile_values:
+            if "calls" in tg_profile_values:
+                counters["profile.mxfp4_tg.calls"] = max(
+                    counters["profile.mxfp4_tg.calls"], parse_counter_value(tg_profile_values["calls"])
+                )
+            for layout_key in MXFP4_TG_LAYOUT_KEYS:
+                if layout_key in tg_profile_values:
+                    key = f"profile.mxfp4_tg.layout.{layout_key}"
+                    counters[key] = max(counters[key], parse_counter_value(tg_profile_values[layout_key]))
+            for metric in MXFP4_TG_METRIC_KEYS:
+                if metric not in tg_profile_values:
                     continue
-                output_key = "gateup_glu" if metric == "gateup" else metric
-                key = f"profile.mxfp4_tg.{output_key}_ms_x1000"
-                counters[key] = max(counters[key], ms_to_x1000(tg_profile.group(metric)))
+                key = f"profile.mxfp4_tg.{metric}_ms_x1000"
+                counters[key] = max(counters[key], ms_to_x1000(tg_profile_values[metric]))
         e2e_profile = E2E_TG_PROFILE_RE.search(line)
         if e2e_profile:
             counters["profile.e2e_tg.tokens"] += int(e2e_profile.group("tokens"))
