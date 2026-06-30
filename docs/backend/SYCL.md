@@ -917,6 +917,14 @@ PP512/TG128 GPT-OSS B50 benchmark is currently blocked before decode by a
 separate MoE CPU expert host-zone allocation abort in `MUL_MAT_ID`; see
 `/tmp/kkxtv7.7-gptoss20b-b50-fa-op-relax-pp512-tg128.log`.
 
+`GGML_SYCL_MOE_GATEUP_SINGLECOL=1` is an experimental GPT-OSS MXFP4 TG-only
+gate/up candidate. It remains default-off: JD32 synthetic proof on B50 showed
+`singlecol` rows were numerically exact but slower than the packed-Q8 M2
+synthetic baseline, so full-model promotion was skipped. Promotion would still
+require exact count correctness, `fatal.total 0`, `PP512 >= 1200`, `TG128 >=
+45`, `singlecol-gateup` route evidence, and gate/up profile `<= 4.2 ms`. This
+flag does not authorize prompt XMX or persistent duplicate gate/up layouts.
+
 The planner-owned materialization contract is implemented separately from the
 oneDNN execute gate:
 

@@ -120,6 +120,18 @@ digraph dependencies {
 
 ---
 
+## Lead Validation Evidence
+
+The default-off `singlecol-gateup` candidate compiled and passed source/CPU-only gates, but failed the lead-only B50 synthetic proof gate. The synthetic baseline was `mxfp4_pair_glu_xmx_tiled_packed_r8_m2_sparse32_bias` at `235.721145 us`. A candidate needed to be at least 20% faster than that baseline before any full-model B50 run; the best single-column row was `mxfp4_pair_glu_xmx_tiled_singlecol_r4` at `575.753035 us`, so the full-model correctness/PP/TG gate was intentionally skipped.
+
+| Case | Log dir | PP512 tok/s | TG128 tok/s | Route evidence | gate/up max ms | Fatal markers | Decision |
+|------|---------|-------------|-------------|----------------|----------------|---------------|----------|
+| Baseline packed-Q8 M2 | `/tmp/sycl_gptoss_e2e_profile_lead_20260630_054416/baseline` | `1237.64` | `36.29` | `packed-q8-m2` | `5.949 ms` | `0` | Baseline remains the current safe default. |
+| Synthetic packed-Q8 M2 proof baseline | `/tmp/jd32_singlecol_synth.jsonl` | `skipped: synthetic proof only` | `skipped: synthetic proof only` | `mxfp4_pair_glu_xmx_tiled_packed_r8_m2_sparse32_bias`, `max_abs_error=0.000000` | `235.721145 us synthetic latency` | `0 synthetic fatal markers observed` | Synthetic comparator for the 20% faster threshold. |
+| Synthetic `singlecol-gateup` candidate | `/tmp/jd32_singlecol_synth.jsonl` | `skipped: synthetic gate failed` | `skipped: synthetic gate failed` | `mxfp4_pair_glu_xmx_tiled_singlecol_r1/r2/r4`, each `max_abs_error=0.000000` | Best row `575.753035 us` (`r4`), slower than baseline `235.721145 us` | `0 synthetic fatal markers observed` | Rejected for JD32 promotion; route stays default-off, and full-model B50 run was not executed. |
+
+---
+
 ## Task 1: Parser Gates for Gate/Up Work-Reduction Evidence
 
 **Track:** A
