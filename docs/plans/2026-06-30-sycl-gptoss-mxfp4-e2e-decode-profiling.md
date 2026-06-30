@@ -1480,7 +1480,10 @@ For command generation, use dry-run mode first:
 bash scripts/sycl-gptoss-e2e-profile-matrix.sh --dry-run
 ```
 
-Real B50/B580/model validation is lead-owned and requires:
+Real model validation is lead-owned and validates the explicitly selected device.
+The harness defaults to `ONEAPI_DEVICE_SELECTOR=level_zero:1` (B50 on this
+workstation); use `--device-selector level_zero:0` for B580 or another explicit
+selector. Real execution requires:
 
 ```bash
 bash scripts/sycl-gptoss-e2e-profile-matrix.sh --run --i-understand-this-runs-gpu-models
@@ -1565,7 +1568,7 @@ git commit -m "docs(sycl): document GPT-OSS E2E decode profile ledger"
 **Gotchas:**
 
 - The evidence table intentionally requires exact lead-owned values; do not replace it with worker guesses.
-- Do not close `llama.cpp-px5a` until the plan implementation, parser gates, reviews, and lead-owned validation evidence are complete.
+- Do not close `llama.cpp-zwpo` until the plan implementation, parser gates, reviews, and lead-owned validation evidence are complete.
 - The next optimization task must be created after evidence is available. Do not revive rejected copy/prepack-only routes unless they reduce actual DPAS work or launch count.
 
 ---
@@ -1618,3 +1621,31 @@ Expected: both `rg` commands print matches.
 - No persistent duplicate gate/up VRAM layout.
 - No forced eviction or zone reset while a live `mem_handle` exists.
 - No selection of the next optimization before the E2E evidence table is filled.
+
+---
+
+## Execution Evidence Template
+
+Fill this table after lead-owned validation. Worker dry-run output is not performance evidence.
+
+| Case | Log dir | PP512 tok/s | TG128 tok/s | Required E2E stages present | Dominant stage | Fatal markers | Decision |
+|------|---------|-------------|-------------|-----------------------------|----------------|---------------|----------|
+| baseline | record exact lead log directory | record parser `bench.pp512.tps_x100` converted to tok/s | record parser `bench.tg128.tps_x100` converted to tok/s | moe, attention | record largest `profile.e2e_tg.stage.*.host_ms_x1000` or device counter | 0 required | record chosen next target |
+| graph_disabled | record exact lead log directory | record parser `bench.pp512.tps_x100` converted to tok/s | record parser `bench.tg128.tps_x100` converted to tok/s | moe, attention | record largest stage counter | 0 required | compare against baseline graph cost |
+| fa_kv_detail | record exact lead log directory | record parser `bench.pp512.tps_x100` converted to tok/s | record parser `bench.tg128.tps_x100` converted to tok/s | moe, attention, kv if present | record attention or KV stage share | 0 required | decide whether attention/KV plan is justified |
+| vram_pressure | record exact lead log directory | record parser `bench.pp512.tps_x100` converted to tok/s | record parser `bench.tg128.tps_x100` converted to tok/s | moe, attention, cache if fallback occurs | record cache or transfer stage share | 0 required | decide whether residency/offload plan is justified |
+| cpu_sharing | record exact lead log directory | record parser `bench.pp512.tps_x100` converted to tok/s | record parser `bench.tg128.tps_x100` converted to tok/s | moe, attention, cpu_dispatch if CPU path is used | record CPU dispatch stage share | 0 required | decide whether CPU overlap plan is justified |
+| multigpu_host_bounce | record exact lead log directory when optional run is approved | record parser `bench.pp512.tps_x100` converted to tok/s | record parser `bench.tg128.tps_x100` converted to tok/s | moe, attention, transfer if host-bounce measurement occurs | record transfer stage share | 0 required | decide whether host-bounce scheduling plan is justified |
+
+### Optimization decision gate
+
+The next optimization plan may target only the largest proven stage bucket from the E2E ledger. If the largest bucket is graph/dispatch, write a default-off command-graph or command-list replay plan. If the largest bucket is attention/KV, write a flash-decode/KV residency plan. If the largest bucket is non-MoE matmul, write a dense MXFP4 GEMV/DPAS plan. If the largest bucket remains MoE gate/up, write a gate/up DPAS work-reduction plan. If cache, CPU dispatch, or transfer dominates under pressure or multi-GPU, write an offload/host-bounce scheduling plan.
+
+Any optimization plan must preserve:
+
+- unified-cache allocation APIs and `mem_handle` ownership;
+- raw pointers as transient ABI views only;
+- host fallback for out-of-VRAM support;
+- CPU execution sharing and deferred scatter behavior;
+- host-bounce multi-GPU execution when direct P2P is unsafe;
+- default-off runtime flags until SPEC review, QUALITY review, parser gates, correctness gates, and lead-owned B50/B580 performance gates pass.

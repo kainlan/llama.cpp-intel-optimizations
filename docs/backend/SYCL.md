@@ -1072,6 +1072,53 @@ Diagnostics for future cross-device KV tasks must report, at minimum, the planne
 ### **GitHub contribution**:
 Please add the `SYCL :` prefix/tag in issues/PRs titles to help the SYCL contributors to check/address them without delay.
 
+### GPT-OSS MXFP4 end-to-end TG profile ledger
+
+`GGML_SYCL_E2E_TG_PROFILE=1` enables a default-off decode ledger for GPT-OSS MXFP4 token generation. The ledger complements `[MXFP4-MOE-TG-PROFILE]` by reporting full decode stage evidence rather than MoE-only timing.
+
+The summary line is:
+
+```text
+[SYCL-E2E-TG-PROFILE] tokens=1 ops=512 moe_calls=72 total_host=18.250 ms total_device=7.125 ms
+```
+
+Stage rows are:
+
+```text
+[SYCL-E2E-TG-STAGE] stage=moe calls=72 host=0.900 ms device=6.500 ms bytes=0 last_path=packed-q8-m2
+[SYCL-E2E-TG-STAGE] stage=attention calls=32 host=0.450 ms device=0.500 ms bytes=1048576 last_path=xmx_v2_f16_pp_ncols32
+```
+
+Parse logs with:
+
+```bash
+python3 scripts/parse-sycl-moe-profile.py \
+  --require-no-fatal-markers \
+  --require-mxfp4-profile-evidence \
+  --require-e2e-profile-evidence \
+  --require-e2e-stage moe \
+  --require-e2e-stage attention \
+  /tmp/sycl_gptoss_e2e_profile_lead_20260630_000000/baseline/bench.stdout \
+  /tmp/sycl_gptoss_e2e_profile_lead_20260630_000000/baseline/bench.stderr
+```
+
+For command generation, use dry-run mode first:
+
+```bash
+bash scripts/sycl-gptoss-e2e-profile-matrix.sh --dry-run
+```
+
+Real model validation is lead-owned and validates the explicitly selected device.
+The harness defaults to `ONEAPI_DEVICE_SELECTOR=level_zero:1` (B50 on this
+workstation); use `--device-selector level_zero:0` for B580 or another explicit
+selector. Real execution requires:
+
+```bash
+bash scripts/sycl-gptoss-e2e-profile-matrix.sh --run --i-understand-this-runs-gpu-models
+```
+
+Do not use this ledger to bypass existing safety gates. Runtime optimization remains default-off until the canonical GPT-OSS correctness gate, fatal-marker parser gates, PP preservation, and TG improvement are all proven on lead-owned hardware.
+
 ## TODO
 
 - Review ZES_ENABLE_SYSMAN: https://github.com/intel/compute-runtime/blob/master/programmers-guide/SYSMAN.md#support-and-limitations
