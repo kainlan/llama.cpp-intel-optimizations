@@ -299,17 +299,18 @@ include(GNUInstallDirs)
 # build the library
 #
 
+# Enable CTest before backend subdirectories call add_test().  The top-level
+# project includes CTest after adding ggml, so backend tests registered while
+# configuring ggml/src would otherwise be omitted from CTest discovery.
+if (BUILD_TESTING)
+    enable_testing()
+endif ()
+
 add_subdirectory(src)
 
 #
 # tests and examples
 #
-
-# Enable CTest when ggml tests are requested or when SYCL XMX tests are enabled.
-# This allows SYCL add_test() entries to be discoverable without requiring ggml/tests.
-if (GGML_BUILD_TESTS OR GGML_SYCL_BUILD_XMX_TESTS)
-    enable_testing()
-endif ()
 
 if (GGML_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
     add_subdirectory(tests)
