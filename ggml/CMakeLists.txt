@@ -300,9 +300,9 @@ include(GNUInstallDirs)
 #
 
 # Enable CTest before backend subdirectories call add_test().  The top-level
-# project includes CTest after adding ggml, so backend tests registered while
-# configuring ggml/src would otherwise be omitted from CTest discovery.
-if (BUILD_TESTING)
+# llama.cpp build includes CTest before adding ggml; keep this path for
+# standalone ggml builds that request tests directly.
+if (BUILD_TESTING OR GGML_BUILD_TESTS OR GGML_SYCL_BUILD_XMX_TESTS)
     enable_testing()
 endif ()
 

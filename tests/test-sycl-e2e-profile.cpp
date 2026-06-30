@@ -78,7 +78,8 @@ int main() {
     const std::string flushed = read_tmp_file(out);
     std::fclose(out);
 
-    assert_contains(flushed, "[SYCL-E2E-TG-PROFILE] tokens=1 ops=3 moe_calls=2 total_host=0.013 ms total_device=0.024 ms\n");
+    assert_contains(flushed,
+                    "[SYCL-E2E-TG-PROFILE] tokens=1 ops=3 moe_calls=2 total_host=0.013 ms total_device=0.024 ms\n");
     assert_contains(flushed,
                     "[SYCL-E2E-TG-STAGE] stage=moe calls=2 host=0.010 ms device=0.020 ms bytes=64 "
                     "last_path=packed-q8-m2\n");

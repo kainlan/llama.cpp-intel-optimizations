@@ -31,18 +31,30 @@ bool e2e_tg_profile_enabled() {
 
 const char * e2e_tg_stage_name(e2e_tg_stage stage) {
     switch (stage) {
-        case e2e_tg_stage::DISPATCH:       return "dispatch";
-        case e2e_tg_stage::CPU_DISPATCH:   return "cpu_dispatch";
-        case e2e_tg_stage::NON_MOE_MATMUL: return "non_moe_matmul";
-        case e2e_tg_stage::MOE:            return "moe";
-        case e2e_tg_stage::ATTENTION:      return "attention";
-        case e2e_tg_stage::KV:             return "kv";
-        case e2e_tg_stage::ELEMENTWISE:    return "elementwise";
-        case e2e_tg_stage::GRAPH:          return "graph";
-        case e2e_tg_stage::CACHE:          return "cache";
-        case e2e_tg_stage::TRANSFER:       return "transfer";
-        case e2e_tg_stage::OTHER:          return "other";
-        case e2e_tg_stage::COUNT:          return "count";
+        case e2e_tg_stage::DISPATCH:
+            return "dispatch";
+        case e2e_tg_stage::CPU_DISPATCH:
+            return "cpu_dispatch";
+        case e2e_tg_stage::NON_MOE_MATMUL:
+            return "non_moe_matmul";
+        case e2e_tg_stage::MOE:
+            return "moe";
+        case e2e_tg_stage::ATTENTION:
+            return "attention";
+        case e2e_tg_stage::KV:
+            return "kv";
+        case e2e_tg_stage::ELEMENTWISE:
+            return "elementwise";
+        case e2e_tg_stage::GRAPH:
+            return "graph";
+        case e2e_tg_stage::CACHE:
+            return "cache";
+        case e2e_tg_stage::TRANSFER:
+            return "transfer";
+        case e2e_tg_stage::OTHER:
+            return "other";
+        case e2e_tg_stage::COUNT:
+            return "count";
     }
     return "unknown";
 }
@@ -92,9 +104,7 @@ void e2e_tg_profile_record(e2e_tg_stage stage,
     slot.host_us += std::max(0.0, host_us);
     slot.device_us += std::max(0.0, device_us);
     slot.bytes += bytes;
-    if (path && path[0] != '\0') {
-        slot.last_path = path;
-    }
+    slot.last_path = path && path[0] != '\0' ? path : "unknown";
     g_e2e_tg_profile.ops += calls;
     if (stage == e2e_tg_stage::MOE) {
         g_e2e_tg_profile.moe_calls += calls;
@@ -126,8 +136,7 @@ void e2e_tg_profile_force_flush(FILE * out) {
     std::fprintf(out,
                  "[SYCL-E2E-TG-PROFILE] tokens=%llu ops=%llu moe_calls=%llu total_host=%.3f ms total_device=%.3f ms\n",
                  (unsigned long long) g_e2e_tg_profile.tokens, (unsigned long long) g_e2e_tg_profile.ops,
-                 (unsigned long long) g_e2e_tg_profile.moe_calls, total_host_us / 1000.0,
-                 total_device_us / 1000.0);
+                 (unsigned long long) g_e2e_tg_profile.moe_calls, total_host_us / 1000.0, total_device_us / 1000.0);
     for (size_t i = 0; i < static_cast<size_t>(e2e_tg_stage::COUNT); ++i) {
         const auto & stage_accum = g_e2e_tg_profile.stages[i];
         if (stage_accum.calls == 0) {
@@ -137,7 +146,7 @@ void e2e_tg_profile_force_flush(FILE * out) {
                      "[SYCL-E2E-TG-STAGE] stage=%s calls=%llu host=%.3f ms device=%.3f ms bytes=%llu last_path=%s\n",
                      e2e_tg_stage_name(static_cast<e2e_tg_stage>(i)), (unsigned long long) stage_accum.calls,
                      stage_accum.host_us / 1000.0, stage_accum.device_us / 1000.0,
-                     (unsigned long long) stage_accum.bytes, stage_accum.last_path ? stage_accum.last_path : "unknown");
+                     (unsigned long long) stage_accum.bytes, stage_accum.last_path.c_str());
     }
     g_e2e_tg_profile = {};
 }

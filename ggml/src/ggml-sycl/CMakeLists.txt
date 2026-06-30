@@ -1190,7 +1190,6 @@ foreach(_residency_test
     test-sycl-moe-xmx-tiled-materialization
     test-sycl-moe-fusion-noactivation
     test-sycl-moe-sequence-graphlet-policy
-    test-sycl-e2e-profile
 )
     add_executable(${_residency_test}
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/${_residency_test}.cpp
@@ -1218,6 +1217,21 @@ foreach(_residency_test
         TIMEOUT 120
     )
 endforeach()
+
+add_executable(test-sycl-e2e-profile
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-e2e-profile.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/e2e-profile.cpp
+)
+target_include_directories(test-sycl-e2e-profile PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+add_test(NAME test-sycl-e2e-profile COMMAND test-sycl-e2e-profile)
+set_tests_properties(test-sycl-e2e-profile PROPERTIES
+    LABELS "sycl;profile;tdd"
+    TIMEOUT 120
+)
 
 add_executable(test-sycl-esimd-float-atomic-compile
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-esimd-float-atomic-compile.cpp
