@@ -23,8 +23,12 @@ def test_fattn_dispatch_records_selected_path() -> None:
     begin = src.index("auto dispatch_debug_kernel = [&](const char * kernel)")
     end = src.index("};\n    if (dispatch_debug_enabled)", begin)
     body = src[begin:end]
-    assert "ggml_sycl::e2e_tg_profile_record(ggml_sycl::e2e_tg_stage::ATTENTION" in body
-    assert "kernel" in body
+    debug_if = body.index("if (dispatch_debug_enabled)")
+    debug_if_close = body.index("(int) fast_decode_policy.fast_esimd_safe);\n        }", debug_if)
+    record = body.index("ggml_sycl::e2e_tg_profile_record(ggml_sycl::e2e_tg_stage::ATTENTION")
+    assert debug_if < debug_if_close < record
+    assert "ggml_sycl::e2e_tg_profile_record" not in body[debug_if:debug_if_close]
+    assert "kernel" in body[record:]
 
 
 def test_packed_k_sidecar_records_kv_bytes_without_ownership_change() -> None:
@@ -32,7 +36,10 @@ def test_packed_k_sidecar_records_kv_bytes_without_ownership_change() -> None:
     begin = src.index("ggml_sycl_fattn_xmx_packed_k_sidecar_entry * entry = nullptr")
     end = src.index("void ggml_sycl_fattn_xmx_unregister_packed_k_range", begin)
     body = src[begin:end]
-    assert "packed.handle = ggml_sycl::mem_handle::from_owned_alloc" in body
-    assert "ggml_sycl::e2e_tg_profile_record(ggml_sycl::e2e_tg_stage::KV" in body
-    assert "packed_k_sidecar" in body
-    assert "packed.ready_event.wait()" not in body
+    handle = body.index("packed.handle = ggml_sycl::mem_handle::from_owned_alloc")
+    event_update = body.index("packed.ready_event = update_event")
+    record = body.index("ggml_sycl::e2e_tg_profile_record(ggml_sycl::e2e_tg_stage::KV")
+    assert handle < event_update < record
+    assert "packed_k_sidecar" in body[record:]
+    assert ".wait(" not in body
+    assert ".wait_and_throw(" not in body
