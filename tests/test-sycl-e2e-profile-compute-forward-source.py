@@ -45,6 +45,9 @@ def test_compute_forward_records_and_flushes_early_handled_routes() -> None:
     body = src[begin:end]
     assert "ggml_sycl::e2e_tg_stage_from_op(dst->op, dst->name)" in body
     assert "ggml_sycl::e2e_tg_profile_flush_if_ready(stderr);" in body
+    tp_skip_pos = body.index("// Skip ALL ops except TP MUL_MAT on secondary devices")
+    tp_return_pos = body.index("return true;  // Op \"succeeded\" by being skipped", tp_skip_pos)
+    assert "e2e_record_early_handled_route();" in body[tp_skip_pos:tp_return_pos]
     for route in (
         "ggml_sycl_try_route_simple_consumer",
         "ggml_sycl_try_route_flash_attn_ext",
