@@ -8,6 +8,19 @@ def read_source() -> str:
     return FATTN.read_text(encoding="utf-8")
 
 
+def matching_brace(source: str, open_brace: int) -> int:
+    depth = 0
+    for index in range(open_brace, len(source)):
+        char = source[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+    raise AssertionError("no matching brace")
+
+
 def test_fattn_has_e2e_attention_scope() -> None:
     src = read_source()
     assert '#include "e2e-profile.hpp"' in src
@@ -24,7 +37,8 @@ def test_fattn_dispatch_records_selected_path() -> None:
     end = src.index("};\n    if (dispatch_debug_enabled)", begin)
     body = src[begin:end]
     debug_if = body.index("if (dispatch_debug_enabled)")
-    debug_if_close = body.index("(int) fast_decode_policy.fast_esimd_safe);\n        }", debug_if)
+    debug_if_open = body.index("{", debug_if)
+    debug_if_close = matching_brace(body, debug_if_open)
     record = body.index("ggml_sycl::e2e_tg_profile_record(ggml_sycl::e2e_tg_stage::ATTENTION")
     assert debug_if < debug_if_close < record
     assert "ggml_sycl::e2e_tg_profile_record" not in body[debug_if:debug_if_close]
