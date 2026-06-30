@@ -669,8 +669,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="exit nonzero unless MXFP4 TG/PP profile counters or profile path labels were parsed",
     )
-    parser.add_argument("--require-e2e-profile-evidence", action="store_true")
-    parser.add_argument("--require-e2e-stage", action="append", default=[])
+    parser.add_argument(
+        "--require-e2e-profile-evidence",
+        action="store_true",
+        help="exit nonzero unless SYCL end-to-end TG profile counters were parsed",
+    )
+    parser.add_argument(
+        "--require-e2e-stage",
+        action="append",
+        default=[],
+        metavar="STAGE",
+        help="exit nonzero unless an end-to-end TG profile row for STAGE appears, e.g. moe or attention",
+    )
     parser.add_argument(
         "--require-single-xmx-gateup",
         action="store_true",
