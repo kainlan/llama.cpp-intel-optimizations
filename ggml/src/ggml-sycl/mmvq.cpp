@@ -4,6 +4,7 @@
 #include "convert.hpp"
 #include "cpu-dispatch.hpp"
 #include "ggml-sycl-bench.hpp"
+#include "ggml-sycl-test.hpp"
 #include "ggml.h"
 #include "mem-ops.hpp"
 #include "moe-layer-plan.hpp"
@@ -16381,6 +16382,7 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
     bool                     used_direct_xmx          = false;
     bool                     used_xmx_tiled_dpas      = false;
     bool                     used_gateup_prepack_dpas = false;
+    bool                     used_singlecol_gateup    = false;
     bool                     used_split_sg16          = false;
     bool                     fused_glu_q8_used        = false;
     const char *             xmx_tiled_path           = "none";
@@ -16391,6 +16393,7 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
     kernel_deps.push_back(activation_q8_event);
     double                   profile_group_host_us = 0.0;
     const char *             profile_path          = "none";
+    ggml_layout_mode         profile_layout        = weight_layout;
     std::vector<sycl::event> profile_group_copy_events;
     sycl::event              profile_pack_event;
     bool                     profile_pack_event_set = false;
@@ -17050,34 +17053,57 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                         num_tokens == 1 && total_batches > 0 && total_batches < exec_n &&
                         n_gpu_entries == total_batches && !ids_host && ids_device && ids_nb0 > 0 && ids_nb1 > 0 &&
                         (ne01 % QK8_1) == 0;
-                    sycl::event pack_event = mxfp4_dpas_pack_q8_single_col_groups_sycl(
-                        *stream, q8_1_buffer, b_packed, y_scales, ne00, ne10, static_cast<int>(total_batches),
-                        static_cast<int>(num_tokens), static_cast<int>(ne11), q8_nb11, q8_nb12, kernel_deps);
-                    if (detail_profile) {
-                        profile_pack_event     = pack_event;
-                        profile_pack_event_set = true;
-                    }
-                    if (aggressive_partial_artifact) {
-                        kernel_event = mxfp4_pair_glu_xmx_tiled_dpas_m4_submit<repeat>(
-                            *stream, gate_ptrs_device, up_ptrs_device, b_packed, y_scales, glu_d, ids_device,
-                            gate_bias_device, up_bias_device, ne00, ne01, static_cast<int>(total_batches),
-                            static_cast<int>(num_tokens), ids_nb0, ids_nb1, glu_dst->nb[1], glu_dst->nb[2],
-                            gate_bias_nb1, up_bias_nb1, glu_op, alpha, limit, tile_n_total, pack_event,
-                            aggressive_down_q8, glu_q8_row_size);
-                        grouped_down_q8   = aggressive_down_q8;
-                        fused_glu_q8_used = true;
-                        xmx_tiled_path    = "aggressive-partial-fused-tg";
-                        mxfp4_moe_aggressive_tg_log_accept(xmx_tiled_path, total_batches, exec_n, tile_n_total,
-                                                           /*saved_launches=*/1);
+
+                    ggml_sycl::test_moe_gateup_singlecol_policy_input singlecol_policy_in{};
+                    singlecol_policy_in.env_enabled         = mxfp4_moe_gateup_singlecol_enabled();
+                    singlecol_policy_in.is_tg               = ne12 == 1 && !pp_profile;
+                    singlecol_policy_in.packed_q8_m2_route  = !aggressive_partial_artifact;
+                    singlecol_policy_in.has_gate_up_handles = gate_ptrs_device && up_ptrs_device;
+                    singlecol_policy_in.graph_recording     = ggml_sycl_graph_recording_active();
+                    const auto singlecol_policy = ggml_sycl::test_moe_gateup_singlecol_policy(singlecol_policy_in);
+
+                    if (singlecol_policy.accepted) {
+                        kernel_event = mxfp4_pair_glu_singlecol_submit<4>(
+                            *stream, gate_ptrs_device, up_ptrs_device, q8_1_buffer, glu_d, ids_device, gate_bias_device,
+                            up_bias_device, ne00, ne10, ne01, static_cast<int>(total_batches),
+                            static_cast<int>(num_tokens), static_cast<int>(ne11), ids_nb0, ids_nb1, q8_nb11, q8_nb12,
+                            glu_dst->nb[1], glu_dst->nb[2], gate_bias_nb1, up_bias_nb1, glu_op, alpha, limit,
+                            kernel_deps);
+                        used_singlecol_gateup = true;
+                        xmx_tiled_path        = MXFP4_MOE_GATEUP_SINGLECOL_ROUTE;
+                        profile_path          = MXFP4_MOE_GATEUP_SINGLECOL_ROUTE;
+                        profile_layout        = GGML_LAYOUT_SOA;
                     } else {
-                        kernel_event = mxfp4_pair_glu_xmx_tiled_dpas_m2_submit<repeat>(
-                            *stream, gate_ptrs_device, up_ptrs_device, b_packed, y_scales, glu_d, ids_device,
-                            gate_bias_device, up_bias_device, ne00, ne01, static_cast<int>(total_batches),
-                            static_cast<int>(num_tokens), ids_nb0, ids_nb1, glu_dst->nb[1], glu_dst->nb[2],
-                            gate_bias_nb1, up_bias_nb1, glu_op, alpha, limit, tile_n_total, pack_event);
-                        xmx_tiled_path = partial_device_grouped_route ? "partial-packed-q8-m2-device" : "packed-q8-m2";
+                        sycl::event pack_event = mxfp4_dpas_pack_q8_single_col_groups_sycl(
+                            *stream, q8_1_buffer, b_packed, y_scales, ne00, ne10, static_cast<int>(total_batches),
+                            static_cast<int>(num_tokens), static_cast<int>(ne11), q8_nb11, q8_nb12, kernel_deps);
+                        if (detail_profile) {
+                            profile_pack_event     = pack_event;
+                            profile_pack_event_set = true;
+                        }
+                        if (aggressive_partial_artifact) {
+                            kernel_event = mxfp4_pair_glu_xmx_tiled_dpas_m4_submit<repeat>(
+                                *stream, gate_ptrs_device, up_ptrs_device, b_packed, y_scales, glu_d, ids_device,
+                                gate_bias_device, up_bias_device, ne00, ne01, static_cast<int>(total_batches),
+                                static_cast<int>(num_tokens), ids_nb0, ids_nb1, glu_dst->nb[1], glu_dst->nb[2],
+                                gate_bias_nb1, up_bias_nb1, glu_op, alpha, limit, tile_n_total, pack_event,
+                                aggressive_down_q8, glu_q8_row_size);
+                            grouped_down_q8   = aggressive_down_q8;
+                            fused_glu_q8_used = true;
+                            xmx_tiled_path    = "aggressive-partial-fused-tg";
+                            mxfp4_moe_aggressive_tg_log_accept(xmx_tiled_path, total_batches, exec_n, tile_n_total,
+                                                               /*saved_launches=*/1);
+                        } else {
+                            kernel_event = mxfp4_pair_glu_xmx_tiled_dpas_m2_submit<repeat>(
+                                *stream, gate_ptrs_device, up_ptrs_device, b_packed, y_scales, glu_d, ids_device,
+                                gate_bias_device, up_bias_device, ne00, ne01, static_cast<int>(total_batches),
+                                static_cast<int>(num_tokens), ids_nb0, ids_nb1, glu_dst->nb[1], glu_dst->nb[2],
+                                gate_bias_nb1, up_bias_nb1, glu_op, alpha, limit, tile_n_total, pack_event);
+                            xmx_tiled_path =
+                                partial_device_grouped_route ? "partial-packed-q8-m2-device" : "packed-q8-m2";
+                        }
+                        profile_path = xmx_tiled_path;
                     }
-                    profile_path = xmx_tiled_path;
                 } else {
                     kernel_event = mxfp4_pair_glu_xmx_tiled_dpas_direct_q8_submit<repeat>(
                         *stream, gate_ptrs_device, up_ptrs_device, q8_1_buffer, glu_d, ids_device, gate_bias_device,
@@ -17303,7 +17329,7 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
     g_mmvq_moe_dispatch_timing.entries += 2 * n_gpu_entries;
     if (tg_profile) {
         mmvq_moe_tg_profile_record(
-            weight_layout, 2 * n_gpu_entries, 2 * total_batches, quant_us - down_q8_publish_us, 0.0, kernel_profile_us,
+            profile_layout, 2 * n_gpu_entries, 2 * total_batches, quant_us - down_q8_publish_us, 0.0, kernel_profile_us,
             down_q8_publish_us, mmvq_moe_tg_profile_kind::GATEUP_GLU, 2,
             profile_path && std::strcmp(profile_path, "none") != 0 ? profile_path : xmx_tiled_path, pack_us);
     }
@@ -17324,10 +17350,11 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
     }
     GGML_SYCL_DEBUG("[MOE-PAIR-GLU] Dispatched %d GPU experts for MXFP4 %s gate/up/GLU (%s)\n", n_gpu_entries,
                     mmvq_layout_name(weight_layout),
-                    used_direct_xmx     ? "direct-xmx" :
-                    used_xmx_tiled_dpas ? "xmx-tiled-dpas" :
-                    used_split_sg16     ? "split-sg16" :
-                                          "fused-pair");
+                    used_singlecol_gateup ? "singlecol-gateup" :
+                    used_direct_xmx       ? "direct-xmx" :
+                    used_xmx_tiled_dpas   ? "xmx-tiled-dpas" :
+                    used_split_sg16       ? "split-sg16" :
+                                            "fused-pair");
     return true;
 }
 

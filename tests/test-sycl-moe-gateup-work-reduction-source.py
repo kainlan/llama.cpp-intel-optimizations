@@ -125,3 +125,25 @@ def test_e2e_evidence_names_moe_as_dominant_bucket() -> None:
     assert "attention 685.619 ms" in plan
     assert "KV 140.835 ms" in plan
     assert "Next target must remain MoE gate/up DPAS work-reduction" in plan
+
+
+def test_runtime_dispatch_is_default_off_and_records_route() -> None:
+    mmvq = MMVQ.read_text(encoding="utf-8")
+    dispatch_start = mmvq.index("bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa")
+    dispatch_end = mmvq.index("bool mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4", dispatch_start)
+    dispatch = strip_cpp_comments(mmvq[dispatch_start:dispatch_end])
+    assert "mxfp4_moe_gateup_singlecol_enabled()" in dispatch
+    assert "test_moe_gateup_singlecol_policy" in dispatch
+    assert "singlecol_policy_in.is_tg" in dispatch and "ne12 == 1" in dispatch and "!pp_profile" in dispatch
+    assert "singlecol_policy_in.graph_recording" in dispatch and "ggml_sycl_graph_recording_active()" in dispatch
+    branch_start = dispatch.index("if (singlecol_policy.accepted)")
+    branch_end = dispatch.index("} else {", branch_start)
+    singlecol_branch = " ".join(dispatch[branch_start:branch_end].split())
+    assert "kernel_event = mxfp4_pair_glu_singlecol_submit" in singlecol_branch
+    assert "used_singlecol_gateup = true" in singlecol_branch
+    assert "xmx_tiled_path = MXFP4_MOE_GATEUP_SINGLECOL_ROUTE" in singlecol_branch
+    assert "profile_path = MXFP4_MOE_GATEUP_SINGLECOL_ROUTE" in singlecol_branch
+    assert "profile_layout = GGML_LAYOUT_SOA" in singlecol_branch
+    profile_call_start = dispatch.index("mmvq_moe_tg_profile_record", branch_end)
+    profile_call_end = dispatch.index(";", profile_call_start)
+    assert "profile_layout" in dispatch[profile_call_start:profile_call_end]
