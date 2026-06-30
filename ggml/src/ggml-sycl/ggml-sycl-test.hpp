@@ -314,6 +314,22 @@ enum class test_moe_glu_q8_kernel_path {
     GROUPED_PACKED_Q8_M2,
 };
 
+struct test_moe_gateup_singlecol_policy_input {
+    bool env_enabled         = false;
+    bool is_tg               = false;
+    bool packed_q8_m2_route  = false;
+    bool has_gate_up_handles = false;
+    bool graph_recording     = false;
+};
+
+struct test_moe_gateup_singlecol_policy_result {
+    bool         accepted = false;
+    const char * reason   = "none";
+};
+
+test_moe_gateup_singlecol_policy_result test_moe_gateup_singlecol_policy(
+    const test_moe_gateup_singlecol_policy_input & in);
+
 struct test_moe_glu_q8_fused_store_input {
     bool                        env_enabled       = false;
     bool                        artifact_enabled  = false;

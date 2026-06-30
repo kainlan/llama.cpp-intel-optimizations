@@ -457,6 +457,36 @@ static bool test_single_xmx_gateup_route_label_contract() {
     return true;
 }
 
+static bool test_singlecol_gateup_policy_contract() {
+    TEST_BEGIN("MXFP4MoE.SingleColumnGateupPolicy");
+    ggml_sycl::test_moe_gateup_singlecol_policy_input in{};
+    auto                                              out = ggml_sycl::test_moe_gateup_singlecol_policy(in);
+    TEST_ASSERT(!out.accepted && std::strcmp(out.reason, "env") == 0, "default-off policy must reject with env reason");
+
+    in.env_enabled = true;
+    out            = ggml_sycl::test_moe_gateup_singlecol_policy(in);
+    TEST_ASSERT(!out.accepted && std::strcmp(out.reason, "phase") == 0, "non-TG policy must reject");
+
+    in.is_tg = true;
+    out      = ggml_sycl::test_moe_gateup_singlecol_policy(in);
+    TEST_ASSERT(!out.accepted && std::strcmp(out.reason, "route") == 0, "non-packed route must reject");
+
+    in.packed_q8_m2_route = true;
+    out                   = ggml_sycl::test_moe_gateup_singlecol_policy(in);
+    TEST_ASSERT(!out.accepted && std::strcmp(out.reason, "handles") == 0, "missing handles must reject");
+
+    in.has_gate_up_handles = true;
+    out                    = ggml_sycl::test_moe_gateup_singlecol_policy(in);
+    TEST_ASSERT(out.accepted && std::strcmp(out.reason, "none") == 0, "valid TG packed route must accept");
+
+    in.graph_recording = true;
+    out                = ggml_sycl::test_moe_gateup_singlecol_policy(in);
+    TEST_ASSERT(!out.accepted && std::strcmp(out.reason, "graph") == 0,
+                "graph recording must reject first implementation");
+    TEST_PASS();
+    return true;
+}
+
 bool test_gateup_prepack_reference_layout() {
     TEST_BEGIN("MXFP4MoE.GateUpPrepackReferenceLayout");
 
@@ -1744,6 +1774,7 @@ int main(int argc, char ** argv) {
 
     // CPU-only reference coverage that does not require selecting or probing a GPU.
     all_passed &= test_single_xmx_gateup_route_label_contract();
+    all_passed &= test_singlecol_gateup_policy_contract();
     all_passed &= test_gateup_prepack_reference_layout();
 
     if (cpu_reference_only) {
