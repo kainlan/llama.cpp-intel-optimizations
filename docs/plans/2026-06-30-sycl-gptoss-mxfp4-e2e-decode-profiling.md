@@ -1626,16 +1626,16 @@ Expected: both `rg` commands print matches.
 
 ## Execution Evidence Template
 
-Fill this table after lead-owned validation. Worker dry-run output is not performance evidence.
+Lead-owned B50 validation was run on 2026-06-30 with build `cbd24bb77` after SPEC and QUALITY reviews passed. Worker dry-run output is not performance evidence. Correctness gate log: `/tmp/sycl_gptoss_e2e_correctness_b50_20260630_054725` (`generated.count_exact.true 1`, `fatal.total 0`).
 
 | Case | Log dir | PP512 tok/s | TG128 tok/s | Required E2E stages present | Dominant stage | Fatal markers | Decision |
 |------|---------|-------------|-------------|-----------------------------|----------------|---------------|----------|
-| baseline | record exact lead log directory | record parser `bench.pp512.tps_x100` converted to tok/s | record parser `bench.tg128.tps_x100` converted to tok/s | moe, attention | record largest `profile.e2e_tg.stage.*.host_ms_x1000` or device counter | 0 required | record chosen next target |
-| graph_disabled | record exact lead log directory | record parser `bench.pp512.tps_x100` converted to tok/s | record parser `bench.tg128.tps_x100` converted to tok/s | moe, attention | record largest stage counter | 0 required | compare against baseline graph cost |
-| fa_kv_detail | record exact lead log directory | record parser `bench.pp512.tps_x100` converted to tok/s | record parser `bench.tg128.tps_x100` converted to tok/s | moe, attention, kv if present | record attention or KV stage share | 0 required | decide whether attention/KV plan is justified |
-| vram_pressure | record exact lead log directory | record parser `bench.pp512.tps_x100` converted to tok/s | record parser `bench.tg128.tps_x100` converted to tok/s | moe, attention, cache if fallback occurs | record cache or transfer stage share | 0 required | decide whether residency/offload plan is justified |
-| cpu_sharing | record exact lead log directory | record parser `bench.pp512.tps_x100` converted to tok/s | record parser `bench.tg128.tps_x100` converted to tok/s | moe, attention, cpu_dispatch if CPU path is used | record CPU dispatch stage share | 0 required | decide whether CPU overlap plan is justified |
-| multigpu_host_bounce | record exact lead log directory when optional run is approved | record parser `bench.pp512.tps_x100` converted to tok/s | record parser `bench.tg128.tps_x100` converted to tok/s | moe, attention, transfer if host-bounce measurement occurs | record transfer stage share | 0 required | decide whether host-bounce scheduling plan is justified |
+| baseline | `/tmp/sycl_gptoss_e2e_profile_lead_20260630_054416/baseline` | 1237.64 | 36.29 | moe, attention | moe host 7112.910 ms; attention 685.619 ms; KV 140.835 ms | 0 | Next target must remain MoE gate/up DPAS work-reduction, not copy/prepack-only work. |
+| graph_disabled | `/tmp/sycl_gptoss_e2e_profile_lead_20260630_054416/graph_disabled` | 1230.24 | 36.12 | moe, attention | moe host 7164.594 ms; graph host 0 ms; `use_graph_0` only | 0 | Graph replay is not the dominant proven TG bucket in this run. |
+| fa_kv_detail | `/tmp/sycl_gptoss_e2e_profile_lead_20260630_054416/fa_kv_detail` | 1225.81 | 36.11 | moe, attention, kv | moe host 7167.969 ms; attention 676.120 ms; KV 143.509 ms | 0 | Attention/KV detail does not justify the first optimization target. |
+| vram_pressure | `/tmp/sycl_gptoss_e2e_profile_lead_20260630_054416/vram_pressure` | 664.31 | 23.15 | moe, attention, cache | moe host 10440.031 ms; cache calls 137; KV 144.646 ms | 0 | Residency/offload remains important under pressure, but the default-safe fast-path target remains MoE. |
+| cpu_sharing | `/tmp/sycl_gptoss_e2e_profile_lead_20260630_054416/cpu_sharing` | 1220.41 | 35.89 | moe, attention | moe host 7214.910 ms; `cpu_dispatch` stage absent | 0 | CPU sharing did not expose a dominant CPU-dispatch bucket. |
+| multigpu_host_bounce | not run; optional lead approval required | n/a | n/a | n/a | n/a | n/a | Do not infer host-bounce scheduling priority without an approved multi-GPU run. |
 
 ### Optimization decision gate
 
