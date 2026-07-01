@@ -947,6 +947,22 @@ B50 run because `ids_host` was not available. No V2 runtime route, graphlet
 promotion, grouped-reuse route, or persistent duplicate gate/up layout is
 authorized by this evidence.
 
+The benchmark-only `bundle4` MXFP4 gate/up layout candidate was also rejected
+for runtime follow-up after lead-owned synthetic and VTune checks in
+`/tmp/sycl_mxfp4_gateup_bundle4_20260701_152716`. It was exact, but only
+`1.14%` faster than the refreshed packed-Q8 M2 baseline: baseline
+`274.483888 us`, V2 `282.588609 us`, and bundle4 `271.363688 us`, all with
+`max_abs_error=0.000000`. VTune instruction-count mode reported baseline
+`100224000` GPU instructions and bundle4 `101151360`; both had spill memory
+`0`, `SIMD Utilization(%)=91.3`, `dpas.8x8=4`, and `send.ugm=65` from ocloc
+assembly summaries. VTune stdout labeled the GPU as `Battlemage G21 [Arc B580]`
+despite the process running with `ONEAPI_DEVICE_SELECTOR=level_zero:1`, so this
+record uses the VTune data only for relative instruction/disassembly evidence
+and does not make B50-specific absolute VTune claims. Decision:
+`bundle4-rejected`; no runtime route, default-on behavior, production promotion,
+graphlet route, or persistent duplicate gate/up layout is authorized by this
+evidence.
+
 The planner-owned materialization contract is implemented separately from the
 oneDNN execute gate:
 

@@ -1059,6 +1059,46 @@ git commit -m "docs(sycl): record MXFP4 gateup bundle4 layout evidence"
 
 ---
 
+## Validation Results
+
+Lead-owned validation ran on 2026-07-01 and wrote evidence to
+`/tmp/sycl_mxfp4_gateup_bundle4_20260701_152716`.
+
+Source and build gates:
+
+- `python3 -m pytest tests/test-sycl-vtune-asm-parser.py tests/test-sycl-moe-gateup-bundle4-layout-source.py -q` passed with `8 passed`.
+- `./scripts/sycl-build.sh sycl-kernel-bench` passed after sourcing oneAPI.
+
+Synthetic comparison (`ONEAPI_DEVICE_SELECTOR=level_zero:1`, `--validate`,
+`--iterations=1000`, `--warmup=100`):
+
+| Kernel | Latency us | Bandwidth GB/s | max_abs_error |
+|--------|-----------:|---------------:|--------------:|
+| `mxfp4_pair_glu_xmx_tiled_packed_r8_m2_sparse32_bias` | 274.483888 | 128.942942 | 0.000000 |
+| `mxfp4_pair_glu_xmx_tiled_v2_packed_r8_m2_sparse32_bias` | 282.588609 | 125.244822 | 0.000000 |
+| `mxfp4_pair_glu_xmx_tiled_bundle4_packed_r8_m2_sparse32_bias` | 271.363688 | 130.425556 | 0.000000 |
+
+Bundle4 was exact but only `1.14%` faster than the refreshed baseline, below the
+required `10%` promotion gate.
+
+VTune instruction-count collection used this VTune build's supported knobs,
+`gpu-profiling-mode=characterization` and `characterization-mode=instruction-count`,
+because the originally planned `analyze-instruction-count` source-analysis knob
+was not available. VTune stdout labeled the GPU as `Battlemage G21 [Arc B580]`
+despite `ONEAPI_DEVICE_SELECTOR=level_zero:1`, so the VTune output below is used
+only as relative instruction/disassembly evidence and not as a B50-specific
+absolute adapter claim. Ocloc disassembly plus
+`scripts/parse-sycl-vtune-kernel-asm.py` produced:
+
+| Kernel | GPU instructions | Spill memory | SIMD utilization | dpas.8x8 | send.ugm | mul | mad |
+|--------|-----------------:|-------------:|-----------------:|---------:|---------:|----:|----:|
+| baseline M2 | 100224000 | 0 | 91.3 | 4 | 65 | 141 | 36 |
+| bundle4 M2 | 101151360 | 0 | 91.3 | 4 | 65 | 139 | 36 |
+
+Decision: `bundle4-rejected`. The benchmark-only route does not authorize a
+runtime follow-up, production default, graphlet promotion, or persistent
+duplicate gate/up layout.
+
 ## Final Review Checklist
 
 - [ ] Task 1 parser tests pass.
