@@ -124,6 +124,10 @@ static inline bool parse_moe_xmx_tiled_v2(const std::string & kernel_name) {
     return kernel_name.find("_xmx_tiled_v2") != std::string::npos;
 }
 
+static inline bool parse_moe_xmx_tiled_bundle4(const std::string & kernel_name) {
+    return kernel_name.find("_xmx_tiled_bundle4") != std::string::npos;
+}
+
 static inline int64_t parse_moe_token_rows(const std::string & kernel_name) {
     for (size_t pos = 0; (pos = kernel_name.find("_t", pos)) != std::string::npos; pos += 2) {
         const size_t digit_pos = pos + 2;
@@ -1224,9 +1228,11 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                 const bool single_column_gateup     = config.kernel_name.find("_singlecol") != std::string::npos;
                 const bool multi_rhs_gateup         = config.kernel_name.find("_multirhs") != std::string::npos;
                 const int  multi_rhs_cols           = parse_moe_multirhs_cols(config.kernel_name);
-                const bool xmx_tiled_v2             = parse_moe_xmx_tiled_v2(config.kernel_name);
-                const int  xmx_tiled_v2_group_bytes = 320;
-                const bool predecoded_i8            = config.kernel_name.find("_predecoded") != std::string::npos;
+                const bool xmx_tiled_v2                  = parse_moe_xmx_tiled_v2(config.kernel_name);
+                const int  xmx_tiled_v2_group_bytes      = 320;
+                const bool xmx_tiled_bundle4             = parse_moe_xmx_tiled_bundle4(config.kernel_name);
+                const int  xmx_tiled_bundle4_group_bytes = xmx_tiled_bundle4 ? 1088 : 0;
+                const bool predecoded_i8                 = config.kernel_name.find("_predecoded") != std::string::npos;
                 const int  xmx_tiles_n              = parse_moe_xmx_tiles_n(config.kernel_name);
                 const bool vector_qs_load           = config.kernel_name.find("_vecq") != std::string::npos;
                 const bool ignore_weight_scale      = config.kernel_name.find("_noscale") != std::string::npos;
@@ -1236,7 +1242,8 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                 const bool use_bias                 = config.kernel_name.find("_bias") != std::string::npos;
                 if (!run_mxfp4_pair_glu(weights, activations, m, selected_count, k, token_rows, rows_per_wg, cache_y,
                                         direct_xmx, xmx_tiled, xmx_tiled_grouped, xmx_tiled_pack_q8, xmx_tiled_prefetch,
-                                        xmx_tiled_m_tiles, xmx_tiled_v2, xmx_tiled_v2_group_bytes, split_gate_up,
+                                        xmx_tiled_m_tiles, xmx_tiled_v2, xmx_tiled_v2_group_bytes,
+                                        xmx_tiled_bundle4, xmx_tiled_bundle4_group_bytes, split_gate_up,
                                         single_column_gateup, multi_rhs_gateup, multi_rhs_cols, predecoded_i8,
                                         xmx_tiles_n, vector_qs_load, ignore_weight_scale, scale_stride_blocks,
                                         subgroup_size, sparse_expert_slots, use_bias, config.validate,

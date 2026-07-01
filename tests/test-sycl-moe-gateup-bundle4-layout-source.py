@@ -50,3 +50,59 @@ def test_reference_bundle4_layout_helper_exists() -> None:
     normalized = " ".join(helper.split())
     assert "new_payload = new_bundle + group_in_bundle * payload_group_bytes" in normalized
     assert "new_scale = new_bundle + payload_slab_bytes + group_in_bundle * tile_n_total" in normalized
+
+
+def test_bundle4_benchmark_route_is_registered_and_parsed() -> None:
+    registry = REGISTRY.read_text(encoding="utf-8")
+    main = MAIN.read_text(encoding="utf-8")
+    harness = HARNESS.read_text(encoding="utf-8")
+    bench_args = BENCH_ARGS.read_text(encoding="utf-8")
+    reference_header = REFERENCE_HEADER.read_text(encoding="utf-8")
+    reference = REFERENCE.read_text(encoding="utf-8")
+    route = "mxfp4_pair_glu_xmx_tiled_bundle4_packed_r8_m2_sparse32_bias"
+    assert route in registry
+    assert route in main
+    assert "parse_moe_xmx_tiled_bundle4" in harness
+    assert "const bool xmx_tiled_bundle4             = parse_moe_xmx_tiled_bundle4(config.kernel_name)" in harness
+    assert "const int  xmx_tiled_bundle4_group_bytes = xmx_tiled_bundle4 ? 1088 : 0" in harness
+    assert "bool  xmx_tiled_bundle4" in bench_args
+    assert "int   xmx_tiled_bundle4_group_bytes" in bench_args
+    assert "bool                         xmx_tiled_bundle4" in reference_header
+    assert "int                          xmx_tiled_bundle4_group_bytes" in reference_header
+    assert "xmx_tiled_bundle4, xmx_tiled_bundle4_group_bytes" in reference
+
+
+def test_reference_bundle4_route_is_fail_closed_before_layout_allocation() -> None:
+    reference = REFERENCE.read_text(encoding="utf-8")
+    invalid = slice_between(
+        reference,
+        "if (xmx_tiled_bundle4 &&",
+        "const size_t         selected_count",
+    )
+    assert "!xmx_tiled" in invalid
+    assert "!xmx_tiled_pack_q8" in invalid
+    assert "xmx_tiled_grouped" in invalid
+    assert "xmx_tiled_prefetch" in invalid
+    assert "xmx_tiled_m_tiles != 2" in invalid
+    assert "rows_per_wg != 8" in invalid
+    assert "xmx_tiles_n != 1" in invalid
+    assert "xmx_tiled_bundle4_group_bytes != 1088" in invalid
+    assert "mxfp4_pair_glu XMX_TILED_BUNDLE4 requires packed XMX_TILED r8 m2 and 1088-byte bundles." in invalid
+    layout_block = slice_between(reference, "if (xmx_tiled_v2)", "const size_t  expert_bytes")
+    assert "if (xmx_tiled_bundle4)" in layout_block
+    assert "make_xmx_tiled_bundle4_payload_layout(launch_layout, m, k)" in layout_block
+
+
+def test_sycl_bundle4_bench_launcher_fails_closed_before_v2_and_packed_dispatch() -> None:
+    mmvq = MMVQ.read_text(encoding="utf-8")
+    launcher = slice_between(
+        mmvq,
+        "bool ggml_sycl_mxfp4_pair_glu_bench_launch",
+        "bool ggml_sycl_mxfp4_mmv_id_bench_launch",
+    )
+    bundle4_pos = launcher.index("if (args.xmx_tiled_bundle4)")
+    v2_pos = launcher.index("if (args.xmx_tiled_v2)")
+    packed_pos = launcher.index("if (args.xmx_tiled_pack_q8)")
+    bundle4_guard = slice_between(launcher, "if (args.xmx_tiled_bundle4)", "if (args.xmx_tiled_v2)")
+    assert bundle4_pos < v2_pos < packed_pos
+    assert "return false" in bundle4_guard

@@ -104,9 +104,11 @@ struct mxfp4_pair_glu_bench_args {
     bool  xmx_tiled_pack_q8        = false;
     bool  xmx_tiled_prefetch       = false;
     int   xmx_tiled_m_tiles        = 1;
-    bool  xmx_tiled_v2             = false;
-    int   xmx_tiled_v2_group_bytes = 320;
-    bool  split_gate_up            = false;
+    bool  xmx_tiled_v2                  = false;
+    int   xmx_tiled_v2_group_bytes      = 320;
+    bool  xmx_tiled_bundle4             = false;
+    int   xmx_tiled_bundle4_group_bytes = 0;
+    bool  split_gate_up                 = false;
     bool  single_column_gateup     = false;
     bool  multi_rhs_gateup         = false;
     int   multi_rhs_cols           = 1;

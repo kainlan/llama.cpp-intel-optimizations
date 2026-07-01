@@ -21274,6 +21274,9 @@ bool ggml_sycl_mxfp4_pair_glu_bench_launch(const mxfp4_pair_glu_bench_args & arg
         (!args.xmx_tiled || !args.xmx_tiled_pack_q8 || args.xmx_tiled_m_tiles != 2 || args.rows_per_wg != 8)) {
         return false;
     }
+    if (args.xmx_tiled_bundle4) {
+        return false;
+    }
     if (args.xmx_tiled_v2) {
         const bool valid_v2 = args.xmx_tiled && args.xmx_tiled_pack_q8 && !args.xmx_tiled_grouped &&
                               !args.xmx_tiled_prefetch && args.xmx_tiled_m_tiles == 2 && args.rows_per_wg == 8 &&

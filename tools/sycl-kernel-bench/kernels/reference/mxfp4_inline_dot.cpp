@@ -1119,6 +1119,8 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
                         int                          xmx_tiled_m_tiles,
                         bool                         xmx_tiled_v2,
                         int                          xmx_tiled_v2_group_bytes,
+                        bool                         xmx_tiled_bundle4,
+                        int                          xmx_tiled_bundle4_group_bytes,
                         bool                         split_gate_up,
                         bool                         single_column_gateup,
                         bool                         multi_rhs_gateup,
@@ -1223,9 +1225,20 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
         error = "mxfp4_pair_glu XMX_TILED tile count must be 1, 2, or 4.";
         return false;
     }
+    // Bundle4 route arguments: xmx_tiled_bundle4, xmx_tiled_bundle4_group_bytes.
     if (xmx_tiled_v2 && (!xmx_tiled || !xmx_tiled_pack_q8 || xmx_tiled_grouped || xmx_tiled_prefetch ||
                          xmx_tiled_m_tiles != 2 || rows_per_wg != 8 || xmx_tiled_v2_group_bytes != 320)) {
         error = "mxfp4_pair_glu XMX_TILED_V2 requires packed XMX_TILED r8 m2 and 320-byte groups.";
+        return false;
+    }
+    if (xmx_tiled_bundle4 && (!xmx_tiled || !xmx_tiled_pack_q8 || xmx_tiled_grouped || xmx_tiled_prefetch ||
+                              xmx_tiled_m_tiles != 2 || rows_per_wg != 8 || xmx_tiles_n != 1 ||
+                              xmx_tiled_bundle4_group_bytes != 1088)) {
+        error = "mxfp4_pair_glu XMX_TILED_BUNDLE4 requires packed XMX_TILED r8 m2 and 1088-byte bundles.";
+        return false;
+    }
+    if (xmx_tiled_v2 && xmx_tiled_bundle4) {
+        error = "mxfp4_pair_glu XMX_TILED_V2 and XMX_TILED_BUNDLE4 are mutually exclusive.";
         return false;
     }
 
@@ -1255,6 +1268,9 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     }
     if (xmx_tiled_v2) {
         launch_layout = make_xmx_tiled_v2_aligned_payload_layout(launch_layout, m, k);
+    }
+    if (xmx_tiled_bundle4) {
+        launch_layout = make_xmx_tiled_bundle4_payload_layout(launch_layout, m, k);
     }
     const size_t  expert_bytes         = launch_layout.size();
     const size_t  logical_expert_bytes = predecoded_i8 ? launch_layout.size() : weights.layout.size();
@@ -1579,9 +1595,11 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     args.xmx_tiled_pack_q8        = xmx_tiled_pack_q8;
     args.xmx_tiled_prefetch       = xmx_tiled_prefetch;
     args.xmx_tiled_m_tiles        = xmx_tiled_m_tiles;
-    args.xmx_tiled_v2             = xmx_tiled_v2;
-    args.xmx_tiled_v2_group_bytes = xmx_tiled_v2_group_bytes;
-    args.split_gate_up            = split_gate_up;
+    args.xmx_tiled_v2                  = xmx_tiled_v2;
+    args.xmx_tiled_v2_group_bytes      = xmx_tiled_v2_group_bytes;
+    args.xmx_tiled_bundle4             = xmx_tiled_bundle4;
+    args.xmx_tiled_bundle4_group_bytes = xmx_tiled_bundle4_group_bytes;
+    args.split_gate_up                 = split_gate_up;
     args.single_column_gateup     = single_column_gateup;
     args.multi_rhs_gateup         = multi_rhs_gateup;
     args.multi_rhs_cols           = multi_rhs_cols;
@@ -1675,9 +1693,11 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
             ref_args.xmx_tiled_pack_q8        = false;
             ref_args.xmx_tiled_prefetch       = false;
             ref_args.xmx_tiled_m_tiles        = 1;
-            ref_args.xmx_tiled_v2             = false;
-            ref_args.xmx_tiled_v2_group_bytes = 320;
-            ref_args.split_gate_up            = false;
+            ref_args.xmx_tiled_v2                  = false;
+            ref_args.xmx_tiled_v2_group_bytes      = 320;
+            ref_args.xmx_tiled_bundle4             = false;
+            ref_args.xmx_tiled_bundle4_group_bytes = 0;
+            ref_args.split_gate_up                 = false;
             ref_args.single_column_gateup     = false;
             ref_args.multi_rhs_gateup         = false;
             ref_args.multi_rhs_cols           = 1;
