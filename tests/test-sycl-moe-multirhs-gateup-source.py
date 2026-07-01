@@ -61,3 +61,17 @@ def test_multirhs_requires_same_expert_contract_text() -> None:
     )
     assert "same expert" in contract
     assert "same gate/up A matrices" in contract
+
+
+def test_multirhs_benchmark_kernel_uses_rhs_columns_not_role_columns() -> None:
+    mmvq = MMVQ.read_text(encoding="utf-8")
+    assert "mxfp4_pair_glu_multirhs_sycl" in mmvq
+    assert "mxfp4_pair_glu_multirhs_submit" in mmvq
+    start = mmvq.index("mxfp4_pair_glu_multirhs_sycl")
+    end = mmvq.index("mxfp4_pair_glu_multirhs_submit", start)
+    body = mmvq[start:end]
+    assert "MultiRhsCols" in body
+    assert "rhs_col" in body
+    assert "r * exec_n + rhs_col" in body
+    assert "gate_part" in body and "up_part" in body
+    assert "GGML_SYCL_MOE_GATEUP_ROLECOL" not in body

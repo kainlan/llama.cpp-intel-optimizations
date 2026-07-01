@@ -8887,6 +8887,7 @@ template <int Repeat, int GLU_OP> struct mxfp4_pair_glu_soa_dpas_m4_kernel;
 template <int Repeat, int GLU_OP> struct mxfp4_pair_glu_xmx_tiled_dpas_direct_q8_kernel;
 template <int Repeat, int GLU_OP> struct mxfp4_pair_glu_xmx_tiled_dpas_m2_direct_q8_kernel;
 template <int RowsPerItem, int GLU_OP> struct mxfp4_pair_glu_singlecol_kernel;
+template <int Repeat, int GLU_OP, int MultiRhsCols> struct mxfp4_pair_glu_multirhs_kernel;
 template <int Repeat, int GLU_OP> struct mxfp4_pair_glu_gateup_prepack_dpas_kernel;
 template <int Repeat> struct mxfp4_xmx_tiled_grouped_direct_q8_kernel;
 template <int Repeat> struct mxfp4_xmx_tiled_grouped_direct_q8_m2_kernel;
@@ -9653,6 +9654,219 @@ static sycl::event mxfp4_pair_glu_singlecol_submit(sycl::queue &                
         queue, gate_ptrs, up_ptrs, q8_src, dst_glu, ids, gate_bias, up_bias, ncols, ncols_y, nrows_per_expert,
         total_batches, n_tokens, ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, gate_bias_nb1,
         up_bias_nb1, alpha, limit, deps);
+}
+
+template <int Repeat, int GLU_OP, int MultiRhsCols>
+static sycl::event mxfp4_pair_glu_multirhs_sycl(sycl::queue &                    queue,
+                                                const void * const *             gate_ptrs,
+                                                const void * const *             up_ptrs,
+                                                const void *                     q8_src,
+                                                float *                          dst_glu,
+                                                const int32_t *                  ids,
+                                                const float *                    gate_bias,
+                                                const float *                    up_bias,
+                                                int                              ncols,
+                                                int                              ncols_y,
+                                                int                              nrows_per_expert,
+                                                int                              total_batches,
+                                                int                              n_tokens,
+                                                int                              ne11,
+                                                int64_t                          ids_nb0,
+                                                int64_t                          ids_nb1,
+                                                int64_t                          q8_nb11,
+                                                int64_t                          q8_nb12,
+                                                int64_t                          dst_nb1,
+                                                int64_t                          dst_nb2,
+                                                int64_t                          gate_bias_nb1,
+                                                int64_t                          up_bias_nb1,
+                                                float                            alpha,
+                                                float                            limit,
+                                                int                              tile_n_total,
+                                                const std::vector<sycl::event> & deps = {}) {
+    static_assert(MultiRhsCols == 2 || MultiRhsCols == 4, "multi-RHS supports 2 or 4 RHS columns");
+    constexpr int exec_n = GGML_SYCL_MXFP4_MOE_XMX_N;
+    constexpr int k_per  = GGML_SYCL_MXFP4_MOE_XMX_K;
+    constexpr int an     = Repeat * k_per;
+    constexpr int bn     = k_per * exec_n;
+    GGML_ASSERT((ncols % k_per) == 0);
+    GGML_ASSERT((total_batches % MultiRhsCols) == 0);
+
+    const int64_t groups  = total_batches / MultiRhsCols;
+    const int64_t m_tiles = (static_cast<int64_t>(nrows_per_expert) + Repeat - 1) / Repeat;
+    const int64_t k_tiles = ncols / k_per;
+    const int64_t tiles   = groups * m_tiles;
+
+    return queue.submit([&](sycl::handler & h) {
+        if (!deps.empty()) {
+            h.depends_on(deps);
+        }
+        h.parallel_for<mxfp4_pair_glu_multirhs_kernel<Repeat, GLU_OP, MultiRhsCols>>(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(tiles)), sycl::range<1>(1)),
+            [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
+                using namespace sycl::ext::intel::esimd;
+                const int64_t tile_idx   = static_cast<int64_t>(item.get_global_id(0));
+                const int64_t group      = tile_idx / m_tiles;
+                const int64_t tile_m     = tile_idx - group * m_tiles;
+                const int64_t base_batch = group * MultiRhsCols;
+                const int     base_id    = static_cast<int>(base_batch / n_tokens);
+                const int     base_iid1  = static_cast<int>(base_batch - static_cast<int64_t>(base_id) * n_tokens);
+                const int32_t expert_id =
+                    ids ? *(const int32_t *) ((const char *) ids + static_cast<int64_t>(base_iid1) * ids_nb1 +
+                                              static_cast<int64_t>(base_id) * ids_nb0) :
+                          static_cast<int32_t>(base_batch);
+
+                const uint8_t * gate_base = reinterpret_cast<const uint8_t *>(gate_ptrs[expert_id]);
+                const uint8_t * up_base   = reinterpret_cast<const uint8_t *>(up_ptrs[expert_id]);
+                if (!gate_base || !up_base) {
+                    return;
+                }
+
+                const int64_t   n_tile_groups_n  = (nrows_per_expert + tile_n_total - 1) / tile_n_total;
+                const int64_t   group_bytes      = tile_n_total * (1 + k_per / 2);
+                const int64_t   kt_group_stride  = n_tile_groups_n * group_bytes;
+                const int64_t   xmx_row_start    = tile_m * Repeat;
+                const int64_t   xmx_group_n      = xmx_row_start / tile_n_total;
+                const int64_t   xmx_row_in_group = xmx_row_start - xmx_group_n * tile_n_total;
+                const uint8_t * gate_group       = gate_base + xmx_group_n * group_bytes;
+                const uint8_t * up_group         = up_base + xmx_group_n * group_bytes;
+
+                simd<float, Repeat * MultiRhsCols> gate_acc = 0.0f;
+                simd<float, Repeat * MultiRhsCols> up_acc   = 0.0f;
+                for (int64_t kt = 0; kt < k_tiles; ++kt) {
+                    simd<int8_t, bn>          b_vec   = 0;
+                    simd<float, MultiRhsCols> y_scale = 0.0f;
+#pragma unroll
+                    for (int rhs_col = 0; rhs_col < MultiRhsCols; ++rhs_col) {
+                        const int64_t batch = base_batch + rhs_col;
+                        const int     id    = static_cast<int>(batch / n_tokens);
+                        const int     iid1  = static_cast<int>(batch - static_cast<int64_t>(id) * n_tokens);
+                        if (ids) {
+                            const int32_t rhs_expert =
+                                *(const int32_t *) ((const char *) ids + static_cast<int64_t>(iid1) * ids_nb1 +
+                                                    static_cast<int64_t>(id) * ids_nb0);
+                            if (rhs_expert != expert_id) {
+                                return;
+                            }
+                        }
+                        const char * q8_row = static_cast<const char *>(q8_src) +
+                                              static_cast<int64_t>(id % ne11) * q8_nb11 +
+                                              static_cast<int64_t>(iid1) * q8_nb12;
+                        simd<int8_t, k_per> q_vec =
+                            block_load<int8_t, k_per>(reinterpret_cast<const int8_t *>(q8_row) + kt * k_per);
+#pragma unroll
+                        for (int kk = 0; kk < k_per; ++kk) {
+                            b_vec[(kk / 4) * exec_n * 4 + rhs_col * 4 + (kk % 4)] = q_vec[kk];
+                        }
+                        const sycl::half * y_scale_ptr =
+                            reinterpret_cast<const sycl::half *>(q8_row + ncols_y + kt * 2 * sizeof(sycl::half));
+                        simd<sycl::half, 1> y_half  = block_load<sycl::half, 1>(y_scale_ptr);
+                        simd<float, 1>      y_float = y_half;
+                        y_scale[rhs_col]            = y_float[0];
+                    }
+
+                    simd<int8_t, an>    gate_a_vec;
+                    simd<int8_t, an>    up_a_vec;
+                    simd<float, Repeat> gate_w_scale;
+                    simd<float, Repeat> up_w_scale;
+                    mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(gate_group, tile_n_total, xmx_row_in_group,
+                                                                  gate_a_vec, gate_w_scale);
+                    mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(up_group, tile_n_total, xmx_row_in_group, up_a_vec,
+                                                                  up_w_scale);
+
+                    simd<int, Repeat * exec_n> gate_part = 0;
+                    simd<int, Repeat * exec_n> up_part   = 0;
+                    gate_part = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(gate_part, b_vec, gate_a_vec);
+                    up_part   = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(up_part, b_vec, up_a_vec);
+#pragma unroll
+                    for (int r = 0; r < Repeat; ++r) {
+#pragma unroll
+                        for (int rhs_col = 0; rhs_col < MultiRhsCols; ++rhs_col) {
+                            const int      out_idx = r * MultiRhsCols + rhs_col;
+                            simd<int, 1>   gate_i  = gate_part.template select<1, 1>(r * exec_n + rhs_col);
+                            simd<int, 1>   up_i    = up_part.template select<1, 1>(r * exec_n + rhs_col);
+                            simd<float, 1> gate_f  = convert<float>(gate_i) * (y_scale[rhs_col] * gate_w_scale[r]);
+                            simd<float, 1> up_f    = convert<float>(up_i) * (y_scale[rhs_col] * up_w_scale[r]);
+                            gate_acc[out_idx] += gate_f[0];
+                            up_acc[out_idx] += up_f[0];
+                        }
+                    }
+                    gate_group += kt_group_stride;
+                    up_group += kt_group_stride;
+                }
+
+#pragma unroll
+                for (int rhs_col = 0; rhs_col < MultiRhsCols; ++rhs_col) {
+                    const int64_t batch   = base_batch + rhs_col;
+                    const int     id      = static_cast<int>(batch / n_tokens);
+                    const int     iid1    = static_cast<int>(batch - static_cast<int64_t>(id) * n_tokens);
+                    float *       dst_out = reinterpret_cast<float *>(reinterpret_cast<char *>(dst_glu) +
+                                                                      static_cast<int64_t>(id) * dst_nb1 +
+                                                                      static_cast<int64_t>(iid1) * dst_nb2);
+#pragma unroll
+                    for (int r = 0; r < Repeat; ++r) {
+                        const int row = static_cast<int>(tile_m) * Repeat + r;
+                        if (row >= nrows_per_expert) {
+                            continue;
+                        }
+                        const int acc_idx    = r * MultiRhsCols + rhs_col;
+                        float     gate_value = gate_acc[acc_idx];
+                        float     up_value   = up_acc[acc_idx];
+                        if (gate_bias) {
+                            gate_value += *(const float *) ((const char *) gate_bias +
+                                                            static_cast<int64_t>(expert_id) * gate_bias_nb1 +
+                                                            static_cast<int64_t>(row) * sizeof(float));
+                        }
+                        if (up_bias) {
+                            up_value += *(const float *) ((const char *) up_bias +
+                                                          static_cast<int64_t>(expert_id) * up_bias_nb1 +
+                                                          static_cast<int64_t>(row) * sizeof(float));
+                        }
+                        block_store<float, 1>(
+                            dst_out + row, mmvq_moe_apply_pair_glu_esimd<GLU_OP>(gate_value, up_value, alpha, limit));
+                    }
+                }
+            });
+    });
+}
+
+template <int Repeat, int MultiRhsCols>
+static sycl::event mxfp4_pair_glu_multirhs_submit(sycl::queue &                    queue,
+                                                  const void * const *             gate_ptrs,
+                                                  const void * const *             up_ptrs,
+                                                  const void *                     q8_src,
+                                                  float *                          dst_glu,
+                                                  const int32_t *                  ids,
+                                                  const float *                    gate_bias,
+                                                  const float *                    up_bias,
+                                                  int                              ncols,
+                                                  int                              ncols_y,
+                                                  int                              nrows_per_expert,
+                                                  int                              total_batches,
+                                                  int                              n_tokens,
+                                                  int                              ne11,
+                                                  int64_t                          ids_nb0,
+                                                  int64_t                          ids_nb1,
+                                                  int64_t                          q8_nb11,
+                                                  int64_t                          q8_nb12,
+                                                  int64_t                          dst_nb1,
+                                                  int64_t                          dst_nb2,
+                                                  int64_t                          gate_bias_nb1,
+                                                  int64_t                          up_bias_nb1,
+                                                  int                              glu_op,
+                                                  float                            alpha,
+                                                  float                            limit,
+                                                  int                              tile_n_total,
+                                                  const std::vector<sycl::event> & deps = {}) {
+    if (glu_op == GGML_GLU_OP_SWIGLU_OAI) {
+        return mxfp4_pair_glu_multirhs_sycl<Repeat, GGML_GLU_OP_SWIGLU_OAI, MultiRhsCols>(
+            queue, gate_ptrs, up_ptrs, q8_src, dst_glu, ids, gate_bias, up_bias, ncols, ncols_y, nrows_per_expert,
+            total_batches, n_tokens, ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, gate_bias_nb1,
+            up_bias_nb1, alpha, limit, tile_n_total, deps);
+    }
+    return mxfp4_pair_glu_multirhs_sycl<Repeat, GGML_GLU_OP_SWIGLU, MultiRhsCols>(
+        queue, gate_ptrs, up_ptrs, q8_src, dst_glu, ids, gate_bias, up_bias, ncols, ncols_y, nrows_per_expert,
+        total_batches, n_tokens, ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, gate_bias_nb1, up_bias_nb1,
+        alpha, limit, tile_n_total, deps);
 }
 
 template <int Repeat, int GLU_OP>
@@ -20723,6 +20937,46 @@ bool ggml_sycl_mxfp4_pair_glu_bench_launch(const mxfp4_pair_glu_bench_args & arg
 
     const int total_batches = args.n_ids * args.n_tokens;
     const int num_experts   = args.num_experts > 0 ? args.num_experts : args.n_ids;
+    if (args.multi_rhs_gateup) {
+#if GGML_SYCL_XMX_JOINT_MATRIX_AVAILABLE
+        if (!args.xmx_tiled || args.xmx_tiled_grouped || args.xmx_tiled_pack_q8 || args.xmx_tiled_prefetch ||
+            args.direct_xmx || args.split_gate_up || args.predecoded_i8 || args.vector_qs_load ||
+            args.scale_stride_blocks > 0 || args.xmx_tiled_m_tiles != 1 || args.rows_per_wg != 8 || !args.ids ||
+            !(args.multi_rhs_cols == 2 || args.multi_rhs_cols == 4) || (args.n_ids % args.multi_rhs_cols) != 0 ||
+            (total_batches % args.multi_rhs_cols) != 0) {
+            return false;
+        }
+        constexpr int exec_n       = GGML_SYCL_MXFP4_MOE_XMX_N;
+        constexpr int k_per        = GGML_SYCL_MXFP4_MOE_XMX_K;
+        const int     tile_n_total = exec_n * args.xmx_tiles_n;
+        if ((args.xmx_tiles_n != 1 && args.xmx_tiles_n != 2 && args.xmx_tiles_n != 4) || (args.ncols % k_per) != 0 ||
+            tile_n_total <= 0) {
+            return false;
+        }
+        switch (args.multi_rhs_cols) {
+            case 2:
+                mxfp4_pair_glu_multirhs_submit<8, 2>(
+                    *args.stream, args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids,
+                    args.gate_bias, args.up_bias, args.ncols, args.ncols_y, args.nrows_per_expert, total_batches,
+                    args.n_tokens, args.ne11, args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1,
+                    args.dst_nb2, args.gate_bias_nb1, args.up_bias_nb1, args.glu_op, args.alpha, args.limit,
+                    tile_n_total);
+                return true;
+            case 4:
+                mxfp4_pair_glu_multirhs_submit<8, 4>(
+                    *args.stream, args.gate_ptrs, args.up_ptrs, args.activations_q8_soa, args.output, args.ids,
+                    args.gate_bias, args.up_bias, args.ncols, args.ncols_y, args.nrows_per_expert, total_batches,
+                    args.n_tokens, args.ne11, args.ids_nb0, args.ids_nb1, args.nb11, args.nb12, args.dst_nb1,
+                    args.dst_nb2, args.gate_bias_nb1, args.up_bias_nb1, args.glu_op, args.alpha, args.limit,
+                    tile_n_total);
+                return true;
+            default:
+                return false;
+        }
+#else
+        return false;
+#endif
+    }
     if (args.single_column_gateup) {
         switch (args.rows_per_wg) {
             case 1:
