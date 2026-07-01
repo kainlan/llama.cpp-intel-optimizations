@@ -934,6 +934,19 @@ packed-Q8 M2 baseline at `235.588515 us`. No production
 result does not authorize role-column gate/up fusion or persistent duplicate
 gate/up layouts.
 
+The benchmark-only `XMX_TILED_V2` aligned-payload MXFP4 gate/up layout candidate
+was rejected before runtime wiring. On B50, `/tmp/v2_gateup_synth.jsonl` showed
+the current packed-Q8 M2 synthetic baseline at `237.084865 us` with
+`max_abs_error=0.000000`, while
+`mxfp4_pair_glu_xmx_tiled_v2_packed_r8_m2_sparse32_bias` validated exactly but
+measured `251.179255 us` with `max_abs_error=0.000000`, missing the `<= 188.47
+us` continue gate. Launch-timing diagnostics then showed non-device launch/drain
+overhead at only `3.19%` of raw summed gate/up time, and host-only expert
+histogram diagnostics produced no histogram lines in the canonical single-stream
+B50 run because `ids_host` was not available. No V2 runtime route, graphlet
+promotion, grouped-reuse route, or persistent duplicate gate/up layout is
+authorized by this evidence.
+
 The planner-owned materialization contract is implemented separately from the
 oneDNN execute gate:
 

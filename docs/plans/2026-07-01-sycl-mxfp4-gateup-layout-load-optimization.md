@@ -1662,6 +1662,22 @@ Expected: push succeeds and final status is clean.
 - Restore `.beads/beads.db` and `.beads/issues.jsonl` after `bd sync` if tracker export dirties the worktree.
 - Remove `.codescout` artifacts before final status.
 
+## Final Validation Evidence
+
+| Evidence | Result |
+| --- | --- |
+| V2 synthetic log | `/tmp/v2_gateup_synth.jsonl` |
+| Baseline latency | `237.084865 us` for `mxfp4_pair_glu_xmx_tiled_packed_r8_m2_sparse32_bias` |
+| Baseline max absolute error | `0.000000` |
+| V2 latency | `251.179255 us` for `mxfp4_pair_glu_xmx_tiled_v2_packed_r8_m2_sparse32_bias` |
+| V2 max absolute error | `0.000000` |
+| V2 synthetic decision | `layout-v2-rejected`: V2 was exact but slower than baseline and missed the `<= 188.47 us` continue gate. |
+| Launch timing evidence | `/tmp/sycl_gptoss_launch_timing_20260701_091536`; baseline parse reported `launch_submit_us=73723.231`, `launch_device_us=3504298.096`, `launch_wait_us=3546877.552`, and derived non-device launch/drain overhead `3.19%` of raw summed gate/up time. Decision: `launch-graphlets-not-first-target`. |
+| Grouped histogram evidence | `/tmp/sycl_gptoss_expert_hist_20260701_095825`; no `[MOE-EXPERT-HIST]` lines were emitted in baseline or fallback harness cases because the host-only logger requires existing `ids_host`. Decision: `server-grouping-not-single-stream-fix`. |
+| Layout lifecycle evidence | Not run; Task 11 depends on `layout-v2-authorized`, but Task 6 produced `layout-v2-rejected`. |
+| Runtime route | None authorized. `XMX_TILED_V2` remains benchmark-only; launch timing and expert histogram paths are default-off diagnostics only. |
+| Final decision | Do not promote V2, graphlets, grouped reuse, or persistent duplicate gate/up layouts from this plan. A future runtime/planner plan must start from new evidence and still prove correctness, route evidence, performance gates, and unified-cache/mem_handle lifecycle safety. |
+
 ---
 
 ## Execution Notes
