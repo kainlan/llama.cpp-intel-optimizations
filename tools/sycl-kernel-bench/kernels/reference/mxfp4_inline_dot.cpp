@@ -184,6 +184,43 @@ static std::vector<uint8_t> make_xmx_tiled_v2_aligned_payload_layout(const std::
     return out;
 }
 
+static std::vector<uint8_t> make_xmx_tiled_bundle4_payload_layout(const std::vector<uint8_t> & current,
+                                                                  int64_t                      m,
+                                                                  int64_t                      k) {
+    constexpr size_t tile_n_total        = GGML_SYCL_MXFP4_MOE_XMX_N;
+    constexpr size_t k_per               = GGML_SYCL_MXFP4_MOE_XMX_K;
+    constexpr size_t packed_bytes        = k_per / 2;
+    constexpr size_t bundle_groups       = 4;
+    const size_t     old_group_bytes     = tile_n_total * (1 + packed_bytes);
+    const size_t     payload_group_bytes = tile_n_total * packed_bytes;
+    const size_t     payload_slab_bytes  = bundle_groups * payload_group_bytes;
+    const size_t     scale_slab_bytes    = bundle_groups * tile_n_total;
+    const size_t     bundle_bytes        = payload_slab_bytes + scale_slab_bytes;
+    GGML_ASSERT(bundle_bytes == bundle_groups * old_group_bytes);
+    const size_t n_groups_n =
+        static_cast<size_t>((m + static_cast<int64_t>(tile_n_total) - 1) / static_cast<int64_t>(tile_n_total));
+    const size_t n_bundles_n = (n_groups_n + bundle_groups - 1) / bundle_groups;
+    const size_t k_tiles     = static_cast<size_t>(k / static_cast<int64_t>(k_per));
+
+    std::vector<uint8_t> out(k_tiles * n_bundles_n * bundle_bytes, 0);
+    for (size_t kt = 0; kt < k_tiles; ++kt) {
+        for (size_t group_n = 0; group_n < n_groups_n; ++group_n) {
+            const size_t    bundle          = group_n / bundle_groups;
+            const size_t    group_in_bundle = group_n % bundle_groups;
+            const uint8_t * old_group       = current.data() + (kt * n_groups_n + group_n) * old_group_bytes;
+            uint8_t *       new_bundle      = out.data() + (kt * n_bundles_n + bundle) * bundle_bytes;
+            uint8_t *       new_payload     = new_bundle + group_in_bundle * payload_group_bytes;
+            uint8_t *       new_scale       = new_bundle + payload_slab_bytes + group_in_bundle * tile_n_total;
+            for (size_t row = 0; row < tile_n_total; ++row) {
+                const uint8_t * old_payload = old_group + tile_n_total + row * packed_bytes;
+                std::copy(old_payload, old_payload + packed_bytes, new_payload + row * packed_bytes);
+                new_scale[row] = *(old_group + row);
+            }
+        }
+    }
+    return out;
+}
+
 static int normalize_supported_xmx_tiles_n(int value) {
     if (value >= 4) {
         return 4;
