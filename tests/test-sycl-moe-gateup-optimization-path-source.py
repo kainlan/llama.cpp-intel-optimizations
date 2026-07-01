@@ -69,3 +69,37 @@ def test_rejected_dpas_column_candidates_stay_rejected() -> None:
     assert "No production" in sycl_doc
     assert "GGML_SYCL_MOE_GATEUP_MULTIRHS" in sycl_doc
     assert "route is authorized or wired" in sycl_doc
+
+
+def v2_payload_offset(row: int, packed_bytes: int = 16) -> int:
+    return row * packed_bytes
+
+
+def v2_scale_offset(row: int, tile_n_total: int = 16, packed_bytes: int = 16) -> int:
+    return tile_n_total * packed_bytes + row
+
+
+def v2_group_bytes(tile_n_total: int = 16, packed_bytes: int = 16) -> int:
+    payload_bytes = tile_n_total * packed_bytes
+    scale_slab_bytes = 64
+    return payload_bytes + scale_slab_bytes
+
+
+def test_v2_aligned_payload_layout_contract() -> None:
+    assert v2_group_bytes() == 320
+    assert v2_payload_offset(0) == 0
+    assert v2_payload_offset(8) == 128
+    assert v2_payload_offset(0) % 64 == 0
+    assert v2_payload_offset(8) % 64 == 0
+    assert v2_scale_offset(0) == 256
+    assert v2_scale_offset(15) == 271
+    assert v2_scale_offset(0) >= 256
+
+
+def test_v2_markers_not_implemented_before_scaffolding() -> None:
+    joined = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in [MMVQ, REGISTRY, ROOT / "ggml" / "src" / "ggml-sycl" / "ggml-sycl-bench.hpp"]
+    )
+    assert "xmx_tiled_v2" not in joined
+    assert "mxfp4_pair_glu_xmx_tiled_v2_packed_r8_m2_sparse32_bias" not in joined
