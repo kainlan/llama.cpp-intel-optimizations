@@ -155,3 +155,14 @@ def test_v2_mmvq_load_helper_and_bench_branch_exist() -> None:
     assert "if (args.xmx_tiled_v2)" in launch
     assert "args.xmx_tiled_v2_group_bytes == 320" in launch
     assert "mxfp4_pair_glu_xmx_tiled_v2_dpas_m2_submit<8" in launch
+
+
+def test_launch_timing_instrumentation_is_default_off_when_implemented() -> None:
+    mmvq = MMVQ.read_text(encoding="utf-8")
+    if "GGML_SYCL_MOE_TG_PROFILE_LAUNCH" not in mmvq:
+        return
+    assert "mxfp4_moe_tg_profile_launch_enabled" in mmvq
+    assert "std::getenv(\"GGML_SYCL_MOE_TG_PROFILE_LAUNCH\")" in mmvq
+    assert "launch_submit_us" in mmvq
+    assert "launch_device_us" in mmvq
+    assert "launch_wait_us" in mmvq

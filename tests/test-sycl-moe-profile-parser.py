@@ -1615,5 +1615,21 @@ def test_parser_forbids_explicit_single_xmx_gateup_zero() -> None:
         assert "error: gate/up SOA fallback present in single-layout proof mode" in result.stdout
 
 
+
+def test_parser_sums_mxfp4_tg_launch_timing_fields(tmp_path: pathlib.Path) -> None:
+    log = tmp_path / "profile.log"
+    log.write_text(
+        "[MXFP4-MOE-TG-PROFILE] calls=1 total=6.0 ms pack=0.05 ms kernel=5.5 ms "
+        "last_path=packed-q8-m2 launch_submit_us=120.5 launch_device_us=5100.25 launch_wait_us=80.0\n"
+        "[MXFP4-MOE-TG-PROFILE] calls=1 total=6.2 ms pack=0.06 ms kernel=5.7 ms "
+        "last_path=packed-q8-m2 launch_submit_us=100.0 launch_device_us=5200.0 launch_wait_us=70.0\n",
+        encoding="utf-8",
+    )
+    out = run_parser(log)
+    assert "profile.mxfp4_tg.launch.submit_us 220.500" in out
+    assert "profile.mxfp4_tg.launch.device_us 10300.250" in out
+    assert "profile.mxfp4_tg.launch.wait_us 150.000" in out
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

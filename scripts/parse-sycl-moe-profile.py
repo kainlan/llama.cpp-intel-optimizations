@@ -223,6 +223,12 @@ BENCH_RE = re.compile(
 KEY_VALUE_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)=([0-9]+(?:\.[0-9]+)?)")
 MXFP4_TG_LAYOUT_KEYS = ("soa", "coalesced", "aos", "dpas", "i8")
 MXFP4_TG_METRIC_KEYS = ("total", "quant", "artifact", "batch_ids", "pack", "kernel", "gateup_glu", "down")
+MXFP4_TG_LAUNCH_US_KEYS = {
+    "launch_submit_us": "profile.mxfp4_tg.launch.submit_us",
+    "launch_device_us": "profile.mxfp4_tg.launch.device_us",
+    "launch_wait_us": "profile.mxfp4_tg.launch.wait_us",
+}
+FLOAT_COUNTER_KEYS = frozenset(MXFP4_TG_LAUNCH_US_KEYS.values())
 E2E_TG_PROFILE_RE = re.compile(
     r"\[SYCL-E2E-TG-PROFILE\]\s+tokens=(?P<tokens>\d+)\s+ops=(?P<ops>\d+)"
     r"\s+moe_calls=(?P<moe_calls>\d+)\s+total_host=(?P<host>[0-9.]+) ms"
@@ -321,6 +327,12 @@ def first_numeric_key_values(line: str) -> dict[str, str]:
 
 def ms_to_x1000(raw: str) -> int:
     return int(round(float(raw) * 1000.0))
+
+
+def format_counter_value(key: str, value: float) -> str:
+    if key in FLOAT_COUNTER_KEYS:
+        return f"{value:.3f}"
+    return str(value)
 
 
 def iter_log_files(paths: Iterable[str]) -> list[pathlib.Path]:
@@ -509,6 +521,9 @@ def summarize_file(path: pathlib.Path) -> tuple[collections.Counter[str], list[s
                     continue
                 key = f"profile.mxfp4_tg.{metric}_ms_x1000"
                 counters[key] = max(counters[key], ms_to_x1000(tg_profile_values[metric]))
+            for profile_key, counter_key in MXFP4_TG_LAUNCH_US_KEYS.items():
+                if profile_key in tg_profile_values:
+                    counters[counter_key] += float(tg_profile_values[profile_key])
         e2e_profile = E2E_TG_PROFILE_RE.search(line)
         if e2e_profile:
             counters["profile.e2e_tg.tokens"] += int(e2e_profile.group("tokens"))
@@ -772,7 +787,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(optimized_aggressive_substrate_line(counters))
         print(f"fatal.total {fatal_marker_count(counters)}")
         for key in sorted(counters):
-            print(f"{key} {counters[key]}")
+            print(f"{key} {format_counter_value(key, counters[key])}")
 
     if missing_inputs and gate_args_requested(args):
         print(f"error: missing log inputs: {', '.join(missing_inputs)}")
@@ -784,7 +799,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(optimized_aggressive_substrate_line(total))
         print(f"fatal.total {fatal_marker_count(total)}")
         for key in sorted(total):
-            print(f"{key} {total[key]}")
+            print(f"{key} {format_counter_value(key, total[key])}")
     if args.require_default_fast_path_optimized and not optimized_default_fast_path(total):
         print(
             "error: default fast path optimized substrate missing "
