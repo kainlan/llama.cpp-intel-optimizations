@@ -927,6 +927,24 @@ git commit -m "docs(sycl): record MXFP4 gateup V2 synthetic decision"
 
 ---
 
+## Lead V2 Synthetic Evidence
+
+| Field | Value |
+| --- | --- |
+| Decision | `layout-v2-rejected` |
+| Synthetic log path | `/tmp/v2_gateup_synth.jsonl` |
+| Baseline kernel name | `mxfp4_pair_glu_xmx_tiled_packed_r8_m2_sparse32_bias` |
+| Baseline latency (us) | `237.084865` |
+| Baseline max absolute error | `0.000000` |
+| V2 kernel name | `mxfp4_pair_glu_xmx_tiled_v2_packed_r8_m2_sparse32_bias` |
+| V2 latency (us) | `251.179255` |
+| V2 max absolute error | `0.000000` |
+| Pass/fail reason | V2 validated exactly, but it was slower than baseline and missed the authorization threshold `<= 188.47 us`; do not wire runtime dispatch. |
+
+Safe gates before the synthetic proof passed on 2026-07-01: `python3 -m pytest tests/test-sycl-moe-gateup-optimization-path-source.py -q` (`8 passed`), `./scripts/sycl-build.sh sycl-kernel-bench`, and `git diff --check`. The synthetic command used `ONEAPI_DEVICE_SELECTOR=level_zero:1` and did not run full-model commands.
+
+---
+
 ## Task 7: Launch Timing Parser And Source Gates
 
 **Track:** C
