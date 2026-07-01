@@ -1041,6 +1041,28 @@ git commit -m "docs(sycl): record multi-RHS gateup synthetic decision"
 - Do not run full-model commands here.
 - Do not wire production dispatch in this task.
 
+## Lead Synthetic Evidence
+
+Decision: `runtime-rejected`.
+
+Lead-owned safe gates passed on 2026-06-30 before the synthetic run:
+
+- `python3 -m pytest tests/test-sycl-moe-rolecol-dpas-feasibility-source.py tests/test-sycl-moe-multirhs-gateup-source.py tests/test-sycl-moe-profile-parser.py tests/test-sycl-gptoss-moe-multirhs-gateup-harness.py -q`
+- `./scripts/sycl-build.sh sycl-kernel-bench`
+- `GGML_SYCL_BUILD_XMX_TESTS=ON ./scripts/sycl-build.sh test-xmx-moe-mxfp4`
+- `./build/bin/test-xmx-moe-mxfp4 --cpu-reference-only`
+- `git diff --check`
+
+Synthetic log: `/tmp/multirhs_gateup_synth.jsonl`.
+
+| Kernel | Validated | Latency us | Result |
+|--------|-----------|-----------:|--------|
+| `mxfp4_pair_glu_xmx_tiled_packed_r8_m2_sparse32_bias` | yes, `max_abs_error=0.000000` | 235.588515 | baseline |
+| `mxfp4_pair_glu_xmx_tiled_multirhs_n2_r8` | yes, `max_abs_error=0.000000` | 605.034755 | rejected: 2.57x slower than baseline |
+| `mxfp4_pair_glu_xmx_tiled_multirhs_n4_r8` | yes, `max_abs_error=0.000000` | 1323.299220 | rejected: 5.62x slower than baseline |
+
+The benchmark-only multi-RHS rows validated exactly after the validation reference path was fixed to disable candidate mode for scalar reference launches (`18d028bb0`). Neither candidate met the synthetic continue gate of at least 20% faster than the packed M2 baseline. Runtime dispatch is therefore not authorized; Task 7 is skipped, and Task 8 must record rejection without running full-model gates.
+
 ---
 
 ## Task 7: Default-Off Runtime Policy and Dispatch for Multi-RHS
