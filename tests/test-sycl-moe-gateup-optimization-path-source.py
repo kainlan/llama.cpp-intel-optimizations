@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import pathlib
+import re
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 MMVQ = ROOT / "ggml" / "src" / "ggml-sycl" / "mmvq.cpp"
@@ -96,10 +97,18 @@ def test_v2_aligned_payload_layout_contract() -> None:
     assert v2_scale_offset(0) >= 256
 
 
-def test_v2_markers_not_implemented_before_scaffolding() -> None:
-    joined = "\n".join(
-        path.read_text(encoding="utf-8")
-        for path in [MMVQ, REGISTRY, ROOT / "ggml" / "src" / "ggml-sycl" / "ggml-sycl-bench.hpp"]
+def test_v2_benchmark_cli_scaffolding_exists() -> None:
+    bench = (ROOT / "ggml" / "src" / "ggml-sycl" / "ggml-sycl-bench.hpp").read_text(encoding="utf-8")
+    harness = (ROOT / "tools" / "sycl-kernel-bench" / "benchmark_harness.hpp").read_text(encoding="utf-8")
+    registry = REGISTRY.read_text(encoding="utf-8")
+    main = (ROOT / "tools" / "sycl-kernel-bench" / "main.cpp").read_text(encoding="utf-8")
+    reference = (ROOT / "tools" / "sycl-kernel-bench" / "kernels" / "reference" / "mxfp4_inline_dot.cpp").read_text(
+        encoding="utf-8"
     )
-    assert "xmx_tiled_v2" not in joined
-    assert "mxfp4_pair_glu_xmx_tiled_v2_packed_r8_m2_sparse32_bias" not in joined
+    assert re.search(r"\bbool\s+xmx_tiled_v2\s*=\s*false\s*;", bench)
+    assert re.search(r"\bint\s+xmx_tiled_v2_group_bytes\s*=\s*320\s*;", bench)
+    assert "parse_moe_xmx_tiled_v2" in harness
+    assert "mxfp4_pair_glu_xmx_tiled_v2_packed_r8_m2_sparse32_bias" in registry
+    assert "mxfp4_pair_glu_xmx_tiled_v2_packed_r8_m2_sparse32_bias" in main
+    assert "args.xmx_tiled_v2" in reference
+    assert "args.xmx_tiled_v2_group_bytes" in reference

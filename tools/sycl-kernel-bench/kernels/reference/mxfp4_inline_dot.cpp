@@ -1053,6 +1053,8 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
                         bool                         xmx_tiled_pack_q8,
                         bool                         xmx_tiled_prefetch,
                         int                          xmx_tiled_m_tiles,
+                        bool                         xmx_tiled_v2,
+                        int                          xmx_tiled_v2_group_bytes,
                         bool                         split_gate_up,
                         bool                         single_column_gateup,
                         bool                         multi_rhs_gateup,
@@ -1093,9 +1095,8 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
         error = "mxfp4_pair_glu single-column gate/up requires un-packed XMX_TILED r1/r2/r4.";
         return false;
     }
-    if (multi_rhs_gateup &&
-        (!xmx_tiled || xmx_tiled_grouped || xmx_tiled_pack_q8 || xmx_tiled_prefetch || xmx_tiled_m_tiles != 1 ||
-         rows_per_wg != 8)) {
+    if (multi_rhs_gateup && (!xmx_tiled || xmx_tiled_grouped || xmx_tiled_pack_q8 || xmx_tiled_prefetch ||
+                             xmx_tiled_m_tiles != 1 || rows_per_wg != 8)) {
         error = "mxfp4_pair_glu multi-RHS gate/up requires un-packed XMX_TILED r8.";
         return false;
     }
@@ -1355,8 +1356,8 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
         for (size_t sel = 0; sel < selected_count; ++sel) {
             size_t slot;
             if (multi_rhs_gateup) {
-                const size_t group_base_sel = (sel / static_cast<size_t>(multi_rhs_cols)) *
-                                              static_cast<size_t>(multi_rhs_cols);
+                const size_t group_base_sel =
+                    (sel / static_cast<size_t>(multi_rhs_cols)) * static_cast<size_t>(multi_rhs_cols);
                 slot = sparse_expert_slots ? sparse_expert_slot(group_base_sel, selected_count, expert_slots) :
                                              group_base_sel;
             } else {
@@ -1464,62 +1465,64 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     queue.wait_and_throw();
 
     ggml_sycl::mxfp4_pair_glu_bench_args args{};
-    args.stream              = &queue;
-    args.gate_ptrs           = reinterpret_cast<const void * const *>(d_gate_ptrs);
-    args.up_ptrs             = reinterpret_cast<const void * const *>(d_up_ptrs);
-    args.activations_q8_soa  = d_act;
-    args.output              = d_out;
-    args.gate_tmp            = d_gate_tmp;
-    args.up_tmp              = d_up_tmp;
-    args.down_q8_soa         = validate_fused_down_q8 ? d_fused_down_q8 : nullptr;
-    args.dpas_b_packed       = d_dpas_b;
-    args.dpas_y_scales       = d_dpas_y;
-    args.ids                 = d_ids;
-    args.grouped_expert_ids  = d_grouped_experts;
-    args.grouped_offsets     = d_grouped_offsets;
-    args.grouped_row_slots   = d_grouped_rows;
-    args.grouped_chunks      = d_grouped_chunks;
-    args.grouped_row_starts  = d_grouped_row_starts;
-    args.ncols               = static_cast<int>(k);
-    args.ncols_y             = static_cast<int>(k);
-    args.nrows_per_expert    = static_cast<int>(m);
-    args.num_experts         = static_cast<int>(expert_slots);
-    args.n_ids               = static_cast<int>(n_selected);
-    args.n_tokens            = static_cast<int>(n_tokens);
-    args.ne11                = 1;
-    args.ids_nb0             = sizeof(int32_t);
-    args.ids_nb1             = static_cast<int64_t>(selected_count * sizeof(int32_t));
-    args.nb11                = q8_row_bytes;
-    args.nb12                = q8_row_bytes;
-    args.dst_nb1             = static_cast<int64_t>(m * sizeof(float));
-    args.dst_nb2             = static_cast<int64_t>(selected_count * static_cast<size_t>(m) * sizeof(float));
-    args.down_q8_nb11        = validate_fused_down_q8 ? fused_down_q8_row_bytes : 0;
-    args.gate_bias           = d_gate_bias;
-    args.up_bias             = d_up_bias;
-    args.gate_bias_nb1       = static_cast<int64_t>(m * sizeof(float));
-    args.up_bias_nb1         = static_cast<int64_t>(m * sizeof(float));
-    args.rows_per_wg         = rows_per_wg;
-    args.cache_y             = cache_y;
-    args.direct_xmx          = direct_xmx;
-    args.xmx_tiled           = xmx_tiled;
-    args.xmx_tiled_grouped   = xmx_tiled_grouped;
-    args.xmx_tiled_pack_q8   = xmx_tiled_pack_q8;
-    args.xmx_tiled_prefetch   = xmx_tiled_prefetch;
-    args.xmx_tiled_m_tiles    = xmx_tiled_m_tiles;
-    args.split_gate_up        = split_gate_up;
-    args.single_column_gateup = single_column_gateup;
-    args.multi_rhs_gateup     = multi_rhs_gateup;
-    args.multi_rhs_cols       = multi_rhs_cols;
-    args.predecoded_i8        = predecoded_i8;
-    args.xmx_tiles_n          = xmx_tiled ? tiles_n : xmx_tiles_n;
-    args.vector_qs_load      = vector_qs_load;
-    args.ignore_weight_scale = ignore_weight_scale;
-    args.scale_stride_blocks = scale_stride_blocks;
-    args.subgroup_size       = subgroup_size;
-    args.grouped_n_chunks    = static_cast<int>(grouped_chunks_host.size());
-    args.glu_op              = GGML_GLU_OP_SWIGLU_OAI;
-    args.alpha               = 1.702f;
-    args.limit               = 7.0f;
+    args.stream                   = &queue;
+    args.gate_ptrs                = reinterpret_cast<const void * const *>(d_gate_ptrs);
+    args.up_ptrs                  = reinterpret_cast<const void * const *>(d_up_ptrs);
+    args.activations_q8_soa       = d_act;
+    args.output                   = d_out;
+    args.gate_tmp                 = d_gate_tmp;
+    args.up_tmp                   = d_up_tmp;
+    args.down_q8_soa              = validate_fused_down_q8 ? d_fused_down_q8 : nullptr;
+    args.dpas_b_packed            = d_dpas_b;
+    args.dpas_y_scales            = d_dpas_y;
+    args.ids                      = d_ids;
+    args.grouped_expert_ids       = d_grouped_experts;
+    args.grouped_offsets          = d_grouped_offsets;
+    args.grouped_row_slots        = d_grouped_rows;
+    args.grouped_chunks           = d_grouped_chunks;
+    args.grouped_row_starts       = d_grouped_row_starts;
+    args.ncols                    = static_cast<int>(k);
+    args.ncols_y                  = static_cast<int>(k);
+    args.nrows_per_expert         = static_cast<int>(m);
+    args.num_experts              = static_cast<int>(expert_slots);
+    args.n_ids                    = static_cast<int>(n_selected);
+    args.n_tokens                 = static_cast<int>(n_tokens);
+    args.ne11                     = 1;
+    args.ids_nb0                  = sizeof(int32_t);
+    args.ids_nb1                  = static_cast<int64_t>(selected_count * sizeof(int32_t));
+    args.nb11                     = q8_row_bytes;
+    args.nb12                     = q8_row_bytes;
+    args.dst_nb1                  = static_cast<int64_t>(m * sizeof(float));
+    args.dst_nb2                  = static_cast<int64_t>(selected_count * static_cast<size_t>(m) * sizeof(float));
+    args.down_q8_nb11             = validate_fused_down_q8 ? fused_down_q8_row_bytes : 0;
+    args.gate_bias                = d_gate_bias;
+    args.up_bias                  = d_up_bias;
+    args.gate_bias_nb1            = static_cast<int64_t>(m * sizeof(float));
+    args.up_bias_nb1              = static_cast<int64_t>(m * sizeof(float));
+    args.rows_per_wg              = rows_per_wg;
+    args.cache_y                  = cache_y;
+    args.direct_xmx               = direct_xmx;
+    args.xmx_tiled                = xmx_tiled;
+    args.xmx_tiled_grouped        = xmx_tiled_grouped;
+    args.xmx_tiled_pack_q8        = xmx_tiled_pack_q8;
+    args.xmx_tiled_prefetch       = xmx_tiled_prefetch;
+    args.xmx_tiled_m_tiles        = xmx_tiled_m_tiles;
+    args.xmx_tiled_v2             = xmx_tiled_v2;
+    args.xmx_tiled_v2_group_bytes = xmx_tiled_v2_group_bytes;
+    args.split_gate_up            = split_gate_up;
+    args.single_column_gateup     = single_column_gateup;
+    args.multi_rhs_gateup         = multi_rhs_gateup;
+    args.multi_rhs_cols           = multi_rhs_cols;
+    args.predecoded_i8            = predecoded_i8;
+    args.xmx_tiles_n              = xmx_tiled ? tiles_n : xmx_tiles_n;
+    args.vector_qs_load           = vector_qs_load;
+    args.ignore_weight_scale      = ignore_weight_scale;
+    args.scale_stride_blocks      = scale_stride_blocks;
+    args.subgroup_size            = subgroup_size;
+    args.grouped_n_chunks         = static_cast<int>(grouped_chunks_host.size());
+    args.glu_op                   = GGML_GLU_OP_SWIGLU_OAI;
+    args.alpha                    = 1.702f;
+    args.limit                    = 7.0f;
 
     auto launch = [&]() {
         if (!ggml_sycl::ggml_sycl_mxfp4_pair_glu_bench_launch(args)) {
@@ -1594,33 +1597,35 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
                 ref_args.gate_ptrs = reinterpret_cast<const void * const *>(d_ref_gate_ptrs);
                 ref_args.up_ptrs   = reinterpret_cast<const void * const *>(d_ref_up_ptrs);
             }
-            ref_args.direct_xmx         = false;
-            ref_args.xmx_tiled          = false;
-            ref_args.xmx_tiled_grouped  = false;
-            ref_args.xmx_tiled_pack_q8  = false;
-            ref_args.xmx_tiled_prefetch = false;
-            ref_args.xmx_tiled_m_tiles  = 1;
-            ref_args.split_gate_up       = false;
-            ref_args.single_column_gateup = false;
-            ref_args.multi_rhs_gateup    = false;
-            ref_args.multi_rhs_cols      = 1;
-            ref_args.predecoded_i8       = false;
-            ref_args.gate_tmp           = nullptr;
-            ref_args.up_tmp             = nullptr;
-            ref_args.down_q8_soa        = nullptr;
-            ref_args.down_q8_nb11       = 0;
-            ref_args.dpas_b_packed      = nullptr;
-            ref_args.dpas_y_scales      = nullptr;
-            ref_args.grouped_expert_ids = nullptr;
-            ref_args.grouped_offsets    = nullptr;
-            ref_args.grouped_row_slots  = nullptr;
-            ref_args.grouped_chunks     = nullptr;
-            ref_args.grouped_row_starts = nullptr;
-            ref_args.grouped_n_chunks   = 0;
-            ref_args.xmx_tiles_n        = 1;
-            ref_args.vector_qs_load     = false;
-            ref_args.rows_per_wg        = 1;
-            ref_args.cache_y            = false;
+            ref_args.direct_xmx               = false;
+            ref_args.xmx_tiled                = false;
+            ref_args.xmx_tiled_grouped        = false;
+            ref_args.xmx_tiled_pack_q8        = false;
+            ref_args.xmx_tiled_prefetch       = false;
+            ref_args.xmx_tiled_m_tiles        = 1;
+            ref_args.xmx_tiled_v2             = false;
+            ref_args.xmx_tiled_v2_group_bytes = 320;
+            ref_args.split_gate_up            = false;
+            ref_args.single_column_gateup     = false;
+            ref_args.multi_rhs_gateup         = false;
+            ref_args.multi_rhs_cols           = 1;
+            ref_args.predecoded_i8            = false;
+            ref_args.gate_tmp                 = nullptr;
+            ref_args.up_tmp                   = nullptr;
+            ref_args.down_q8_soa              = nullptr;
+            ref_args.down_q8_nb11             = 0;
+            ref_args.dpas_b_packed            = nullptr;
+            ref_args.dpas_y_scales            = nullptr;
+            ref_args.grouped_expert_ids       = nullptr;
+            ref_args.grouped_offsets          = nullptr;
+            ref_args.grouped_row_slots        = nullptr;
+            ref_args.grouped_chunks           = nullptr;
+            ref_args.grouped_row_starts       = nullptr;
+            ref_args.grouped_n_chunks         = 0;
+            ref_args.xmx_tiles_n              = 1;
+            ref_args.vector_qs_load           = false;
+            ref_args.rows_per_wg              = 1;
+            ref_args.cache_y                  = false;
             if (!ggml_sycl::ggml_sycl_mxfp4_pair_glu_bench_launch(ref_args)) {
                 cleanup();
                 error = "mxfp4_pair_glu reference launch rejected.";
