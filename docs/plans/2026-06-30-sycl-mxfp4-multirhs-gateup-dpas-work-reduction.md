@@ -1349,6 +1349,37 @@ git commit -m "docs(sycl): record multi-RHS gateup validation evidence"
 - If full-model gate fails, leave route default-off or revert it before push.
 - Final completion requires `git pull --rebase`, `bd sync`, `git push`, and clean `git status`.
 
+## Lead Validation Evidence
+
+Final decision: `runtime-rejected`.
+
+Safe gates passed on 2026-06-30:
+
+- `python3 -m pytest tests/test-sycl-moe-rolecol-dpas-feasibility-source.py tests/test-sycl-moe-multirhs-gateup-source.py tests/test-sycl-moe-profile-parser.py tests/test-sycl-gptoss-moe-multirhs-gateup-harness.py -q`
+- `./scripts/sycl-build.sh llama-bench`
+- `./scripts/sycl-build.sh sycl-kernel-bench`
+- `GGML_SYCL_BUILD_XMX_TESTS=ON ./scripts/sycl-build.sh test-xmx-moe-mxfp4`
+- `./build/bin/test-xmx-moe-mxfp4 --cpu-reference-only`
+- `OUT_DIR=/tmp/multirhs_final_dryrun_no_side_effect bash scripts/sycl-gptoss-moe-multirhs-gateup-gates.sh --dry-run >/tmp/multirhs_final_dryrun.txt` plus `test ! -e /tmp/multirhs_final_dryrun_no_side_effect`
+- `git diff --check`
+
+| Evidence | Value |
+|----------|-------|
+| Synthetic log | `/tmp/multirhs_gateup_synth.jsonl` |
+| Synthetic baseline | `mxfp4_pair_glu_xmx_tiled_packed_r8_m2_sparse32_bias`, `235.588515 us`, `max_abs_error=0.000000` |
+| Best multi-RHS row | `mxfp4_pair_glu_xmx_tiled_multirhs_n2_r8`, `605.034755 us`, `max_abs_error=0.000000` |
+| Full-model log | not run; Task 6 failed the synthetic continue gate |
+| Correctness log | not run; Task 6 failed the synthetic continue gate |
+| PP512 | not run; runtime was not authorized |
+| TG128 | not run; runtime was not authorized |
+| Route evidence | not run; no production `multirhs-gateup` route was wired |
+| Gate/up max ms | not run; runtime was not authorized |
+| Decision | `runtime-rejected`; Task 7 skipped |
+
+The benchmark-only same-expert multi-RHS candidate is mathematically valid but
+slower than the packed-Q8 M2 synthetic baseline on the lead B50 proof command.
+No production `GGML_SYCL_MOE_GATEUP_MULTIRHS` route is authorized or wired.
+
 ---
 
 ## Execution Notes

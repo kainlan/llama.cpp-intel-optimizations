@@ -925,6 +925,15 @@ require exact count correctness, `fatal.total 0`, `PP512 >= 1200`, `TG128 >=
 45`, `singlecol-gateup` route evidence, and gate/up profile `<= 4.2 ms`. This
 flag does not authorize prompt XMX or persistent duplicate gate/up layouts.
 
+A same-expert multi-RHS MXFP4 gate/up benchmark-only candidate was also
+rejected before runtime wiring. B50 synthetic rows validated exactly, but
+`mxfp4_pair_glu_xmx_tiled_multirhs_n2_r8` measured `605.034755 us` and
+`mxfp4_pair_glu_xmx_tiled_multirhs_n4_r8` measured `1323.299220 us` versus the
+packed-Q8 M2 baseline at `235.588515 us`. No production
+`GGML_SYCL_MOE_GATEUP_MULTIRHS` route is authorized or wired; the benchmark
+result does not authorize role-column gate/up fusion or persistent duplicate
+gate/up layouts.
+
 The planner-owned materialization contract is implemented separately from the
 oneDNN execute gate:
 
