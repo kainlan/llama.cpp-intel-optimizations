@@ -8,19 +8,38 @@ MMVQ = ROOT / "ggml" / "src" / "ggml-sycl" / "mmvq.cpp"
 BENCH_HPP = ROOT / "ggml" / "src" / "ggml-sycl" / "ggml-sycl-bench.hpp"
 HARNESS = ROOT / "tools" / "sycl-kernel-bench" / "benchmark_harness.hpp"
 REGISTRY = ROOT / "tools" / "sycl-kernel-bench" / "kernel_registry.hpp"
+REFERENCE = ROOT / "tools" / "sycl-kernel-bench" / "kernels" / "reference" / "mxfp4_inline_dot.cpp"
 
 
-def test_benchmark_harness_has_pair_glu_name_parser_to_extend() -> None:
-    harness = HARNESS.read_text(encoding="utf-8")
-    assert "config.kernel_name.find(\"_singlecol\") != std::string::npos" in harness
-    assert "KernelKind::MXFP4_PAIR_GLU" in REGISTRY.read_text(encoding="utf-8")
-    assert "_multirhs" not in harness
-
-
-def test_bench_args_do_not_expose_multirhs_before_candidate() -> None:
+def test_multirhs_bench_cli_scaffolding_exists() -> None:
     bench = BENCH_HPP.read_text(encoding="utf-8")
-    assert "single_column_gateup = false" in bench
-    assert "multi_rhs_gateup" not in bench
+    harness = HARNESS.read_text(encoding="utf-8")
+    registry = REGISTRY.read_text(encoding="utf-8")
+    main = (ROOT / "tools" / "sycl-kernel-bench" / "main.cpp").read_text(encoding="utf-8")
+    assert "bool  multi_rhs_gateup" in bench
+    assert "int   multi_rhs_cols" in bench
+    assert "multi_rhs_gateup = false" in bench
+    assert "multi_rhs_cols = 1" in bench
+    assert "_multirhs" in harness
+    assert "parse_moe_multirhs_cols" in harness
+    assert "mxfp4_pair_glu_xmx_tiled_multirhs_n2_r8" in registry
+    assert "mxfp4_pair_glu_xmx_tiled_multirhs_n4_r8" in registry
+    assert "mxfp4_pair_glu_xmx_tiled_multirhs_n2_r8" in main
+    assert "mxfp4_pair_glu_xmx_tiled_multirhs_n4_r8" in main
+
+
+def test_multirhs_bench_args_default_off() -> None:
+    bench = BENCH_HPP.read_text(encoding="utf-8")
+    assert "bool  multi_rhs_gateup" in bench
+    assert "int   multi_rhs_cols" in bench
+    assert "multi_rhs_gateup = false" in bench
+    assert "multi_rhs_cols = 1" in bench
+
+
+def test_multirhs_reference_path_bounds_group_columns() -> None:
+    reference = REFERENCE.read_text(encoding="utf-8")
+    assert "multi_rhs_gateup && multi_rhs_cols != 2 && multi_rhs_cols != 4" in reference
+    assert "multi-RHS gate/up requires n2 or n4" in reference
 
 
 def test_production_dispatch_has_inputs_needed_for_same_expert_policy() -> None:

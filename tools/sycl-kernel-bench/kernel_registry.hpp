@@ -147,6 +147,8 @@ inline const std::vector<KernelInfo> & kernel_list() {
         { "mxfp4_pair_glu_xmx_tiled_singlecol_r1",                     GGML_LAYOUT_SOA,       KernelKind::MXFP4_PAIR_GLU          },
         { "mxfp4_pair_glu_xmx_tiled_singlecol_r2",                     GGML_LAYOUT_SOA,       KernelKind::MXFP4_PAIR_GLU          },
         { "mxfp4_pair_glu_xmx_tiled_singlecol_r4",                     GGML_LAYOUT_SOA,       KernelKind::MXFP4_PAIR_GLU          },
+        { "mxfp4_pair_glu_xmx_tiled_multirhs_n2_r8",                   GGML_LAYOUT_SOA,       KernelKind::MXFP4_PAIR_GLU          },
+        { "mxfp4_pair_glu_xmx_tiled_multirhs_n4_r8",                   GGML_LAYOUT_SOA,       KernelKind::MXFP4_PAIR_GLU          },
         { "mxfp4_pair_glu_xmx_tiled_r8_bias",                          GGML_LAYOUT_SOA,       KernelKind::MXFP4_PAIR_GLU          },
         { "mxfp4_pair_glu_xmx_tiled_direct_r8_m2",                     GGML_LAYOUT_SOA,       KernelKind::MXFP4_PAIR_GLU          },
         { "mxfp4_pair_glu_xmx_tiled_direct_r8_m2_bias",                GGML_LAYOUT_SOA,       KernelKind::MXFP4_PAIR_GLU          },

@@ -110,6 +110,16 @@ static inline int parse_moe_rows_per_wg(const std::string & kernel_name) {
     return 4;
 }
 
+static inline int parse_moe_multirhs_cols(const std::string & kernel_name) {
+    if (kernel_name.find("_multirhs_n4") != std::string::npos) {
+        return 4;
+    }
+    if (kernel_name.find("_multirhs_n2") != std::string::npos) {
+        return 2;
+    }
+    return 1;
+}
+
 static inline int64_t parse_moe_token_rows(const std::string & kernel_name) {
     for (size_t pos = 0; (pos = kernel_name.find("_t", pos)) != std::string::npos; pos += 2) {
         const size_t digit_pos = pos + 2;
@@ -1208,8 +1218,10 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                 const bool direct_xmx           = config.kernel_name.find("_xmx_soa") != std::string::npos;
                 const bool split_gate_up        = config.kernel_name.find("_split") != std::string::npos;
                 const bool single_column_gateup = config.kernel_name.find("_singlecol") != std::string::npos;
+                const bool multi_rhs_gateup     = config.kernel_name.find("_multirhs") != std::string::npos;
+                const int  multi_rhs_cols       = parse_moe_multirhs_cols(config.kernel_name);
                 const bool predecoded_i8        = config.kernel_name.find("_predecoded") != std::string::npos;
-                const int  xmx_tiles_n         = parse_moe_xmx_tiles_n(config.kernel_name);
+                const int  xmx_tiles_n          = parse_moe_xmx_tiles_n(config.kernel_name);
                 const bool vector_qs_load      = config.kernel_name.find("_vecq") != std::string::npos;
                 const bool ignore_weight_scale = config.kernel_name.find("_noscale") != std::string::npos;
                 const int  scale_stride_blocks = parse_moe_scale_stride_blocks(config.kernel_name, k);
@@ -1218,11 +1230,11 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                 const bool use_bias            = config.kernel_name.find("_bias") != std::string::npos;
                 if (!run_mxfp4_pair_glu(weights, activations, m, selected_count, k, token_rows, rows_per_wg, cache_y,
                                         direct_xmx, xmx_tiled, xmx_tiled_grouped, xmx_tiled_pack_q8, xmx_tiled_prefetch,
-                                        xmx_tiled_m_tiles, split_gate_up, single_column_gateup, predecoded_i8,
-                                        xmx_tiles_n, vector_qs_load, ignore_weight_scale, scale_stride_blocks,
-                                        subgroup_size, sparse_expert_slots,
-                                        use_bias, config.validate, config.warmup_iterations, config.measure_iterations,
-                                        queue, metrics, error)) {
+                                        xmx_tiled_m_tiles, split_gate_up, single_column_gateup, multi_rhs_gateup,
+                                        multi_rhs_cols, predecoded_i8, xmx_tiles_n, vector_qs_load, ignore_weight_scale,
+                                        scale_stride_blocks, subgroup_size, sparse_expert_slots, use_bias,
+                                        config.validate, config.warmup_iterations, config.measure_iterations, queue,
+                                        metrics, error)) {
                     out.error = error;
                     return false;
                 }

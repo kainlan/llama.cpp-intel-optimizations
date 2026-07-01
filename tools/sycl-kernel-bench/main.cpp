@@ -139,6 +139,7 @@ static void print_usage(const char * argv0) {
                  "mxfp4_pair_glu_xmx_tiled_r1|mxfp4_pair_glu_xmx_tiled_r4|mxfp4_pair_glu_xmx_tiled_r8|"
                  "mxfp4_pair_glu_xmx_tiled_singlecol_r1|mxfp4_pair_glu_xmx_tiled_singlecol_r2|"
                  "mxfp4_pair_glu_xmx_tiled_singlecol_r4|"
+                 "mxfp4_pair_glu_xmx_tiled_multirhs_n2_r8|mxfp4_pair_glu_xmx_tiled_multirhs_n4_r8|"
                  "mxfp4_pair_glu_xmx_tiled_r8_bias|mxfp4_pair_glu_xmx_tiled_direct_r8_m2|"
                  "mxfp4_pair_glu_xmx_tiled_direct_r8_m2_bias|"
                  "mxfp4_pair_glu_xmx_tiled_direct_r8_m2_sparse32_bias|"

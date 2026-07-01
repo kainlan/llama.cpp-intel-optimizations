@@ -1055,6 +1055,8 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
                         int                          xmx_tiled_m_tiles,
                         bool                         split_gate_up,
                         bool                         single_column_gateup,
+                        bool                         multi_rhs_gateup,
+                        int                          multi_rhs_cols,
                         bool                         predecoded_i8,
                         int                          xmx_tiles_n,
                         bool                         vector_qs_load,
@@ -1089,6 +1091,16 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
         (!xmx_tiled || xmx_tiled_grouped || xmx_tiled_pack_q8 || xmx_tiled_prefetch || xmx_tiled_m_tiles != 1 ||
          (rows_per_wg != 1 && rows_per_wg != 2 && rows_per_wg != 4))) {
         error = "mxfp4_pair_glu single-column gate/up requires un-packed XMX_TILED r1/r2/r4.";
+        return false;
+    }
+    if (multi_rhs_gateup &&
+        (!xmx_tiled || xmx_tiled_grouped || xmx_tiled_pack_q8 || xmx_tiled_prefetch || xmx_tiled_m_tiles != 1 ||
+         rows_per_wg != 8)) {
+        error = "mxfp4_pair_glu multi-RHS gate/up requires un-packed XMX_TILED r8.";
+        return false;
+    }
+    if (multi_rhs_gateup && multi_rhs_cols != 2 && multi_rhs_cols != 4) {
+        error = "mxfp4_pair_glu multi-RHS gate/up requires n2 or n4.";
         return false;
     }
     if (xmx_tiled && (direct_xmx || split_gate_up || predecoded_i8 || vector_qs_load || scale_stride_blocks > 0)) {
@@ -1341,7 +1353,15 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     }
     for (size_t token = 0; token < token_count; ++token) {
         for (size_t sel = 0; sel < selected_count; ++sel) {
-            const size_t slot = sparse_expert_slots ? sparse_expert_slot(sel, selected_count, expert_slots) : sel;
+            size_t slot;
+            if (multi_rhs_gateup) {
+                const size_t group_base_sel = (sel / static_cast<size_t>(multi_rhs_cols)) *
+                                              static_cast<size_t>(multi_rhs_cols);
+                slot = sparse_expert_slots ? sparse_expert_slot(group_base_sel, selected_count, expert_slots) :
+                                             group_base_sel;
+            } else {
+                slot = sparse_expert_slots ? sparse_expert_slot(sel, selected_count, expert_slots) : sel;
+            }
             host_ids[token * selected_count + sel] = static_cast<int32_t>(slot);
         }
     }
@@ -1484,12 +1504,14 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     args.xmx_tiled           = xmx_tiled;
     args.xmx_tiled_grouped   = xmx_tiled_grouped;
     args.xmx_tiled_pack_q8   = xmx_tiled_pack_q8;
-    args.xmx_tiled_prefetch  = xmx_tiled_prefetch;
-    args.xmx_tiled_m_tiles   = xmx_tiled_m_tiles;
-    args.split_gate_up       = split_gate_up;
+    args.xmx_tiled_prefetch   = xmx_tiled_prefetch;
+    args.xmx_tiled_m_tiles    = xmx_tiled_m_tiles;
+    args.split_gate_up        = split_gate_up;
     args.single_column_gateup = single_column_gateup;
-    args.predecoded_i8       = predecoded_i8;
-    args.xmx_tiles_n         = xmx_tiled ? tiles_n : xmx_tiles_n;
+    args.multi_rhs_gateup     = multi_rhs_gateup;
+    args.multi_rhs_cols       = multi_rhs_cols;
+    args.predecoded_i8        = predecoded_i8;
+    args.xmx_tiles_n          = xmx_tiled ? tiles_n : xmx_tiles_n;
     args.vector_qs_load      = vector_qs_load;
     args.ignore_weight_scale = ignore_weight_scale;
     args.scale_stride_blocks = scale_stride_blocks;
