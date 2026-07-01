@@ -11723,6 +11723,14 @@ static bool mxfp4_moe_grouped_decode_enabled() {
     return enabled;
 }
 
+static bool mxfp4_moe_expert_hist_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_MOE_EXPERT_HIST");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static bool mxfp4_moe_device_grouping_enabled() {
     static const bool enabled = []() {
         const char * env = std::getenv("GGML_SYCL_MOE_DEVICE_GROUPING");
@@ -17202,6 +17210,35 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                 !partial_device_grouped_route) {
                 mxfp4_moe_partial_device_grouping_log("reject", "ineligible", "none", total_batches, exec_n,
                                                       n_gpu_entries, n_ids);
+            }
+            if (mxfp4_moe_expert_hist_enabled() && ids_host && ids_host_count == total_batches &&
+                gate_weight->ne[2] > 0 && n_ids > 0 && num_tokens > 0) {
+                std::vector<int32_t> counts(static_cast<size_t>(gate_weight->ne[2]), 0);
+                for (int64_t row = 0; row < total_batches; ++row) {
+                    const int32_t eid = ids_host[row];
+                    if (eid >= 0 && eid < gate_weight->ne[2]) {
+                        counts[static_cast<size_t>(eid)]++;
+                    }
+                }
+                int groups     = 0;
+                int max_group  = 0;
+                int groups_ge2 = 0;
+                for (const int32_t count : counts) {
+                    if (count > 0) {
+                        groups++;
+                        max_group = std::max(max_group, static_cast<int>(count));
+                        if (count >= 2) {
+                            groups_ge2++;
+                        }
+                    }
+                }
+                const double avg_group = groups > 0 ? static_cast<double>(total_batches) / static_cast<double>(groups) :
+                                                       0.0;
+                fprintf(stderr,
+                        "[MOE-EXPERT-HIST] tensor=%s tokens=%lld topk=%lld total_batches=%lld groups=%d "
+                        "max_group=%d avg_group=%.3f groups_ge2=%d\n",
+                        gate_weight->name, (long long) num_tokens, (long long) n_ids, (long long) total_batches,
+                        groups, max_group, avg_group, groups_ge2);
             }
             const bool grouped_decode_shape = xmx_tiled_grouped_eligible && total_batches >= exec_n &&
                                               n_gpu_entries == total_batches && ids_host &&

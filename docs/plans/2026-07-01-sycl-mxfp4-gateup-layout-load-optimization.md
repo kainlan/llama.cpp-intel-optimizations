@@ -1443,6 +1443,24 @@ git commit -m "feat(sycl): add default-off MoE expert histogram profile"
 - Do not force host ID copies to make the histogram work.
 - Do not change `grouped_decode_shape` eligibility.
 
+## Lead Grouped-Reuse Histogram Evidence
+
+| Field | Value |
+| --- | --- |
+| Decision | `server-grouping-not-single-stream-fix` |
+| Output directory | `/tmp/sycl_gptoss_expert_hist_20260701_095825` |
+| Baseline parse path | `/tmp/sycl_gptoss_expert_hist_20260701_095825/baseline/parse.stdout` |
+| Baseline model result | `pp512 1237.30 +/- 4.48 tok/s`, `tg128 36.18 +/- 0.05 tok/s` |
+| Baseline `diag.path.packed-q8-m2` | `641` |
+| Raw `[MOE-EXPERT-HIST]` lines, baseline | `0` |
+| Raw `[MOE-EXPERT-HIST]` lines, all harness cases | `0` for `baseline`, `graph_disabled`, `fa_kv_detail`, `vram_pressure`, and `cpu_sharing` |
+| Parsed `profile.moe_expert_hist.lines` | not emitted because no histogram lines were present |
+| Parsed `profile.moe_expert_hist.max_group` | not emitted because no histogram lines were present |
+| Parsed `profile.moe_expert_hist.groups_ge2` | not emitted because no histogram lines were present |
+| Parsed `profile.moe_expert_hist.avg_group` | not emitted because no histogram lines were present |
+
+`GGML_SYCL_MOE_EXPERT_HIST=1` was enabled for the acknowledged B50/model profile, but the host-only logger intentionally does nothing unless `ids_host` is already available. The canonical single-stream B50 run continued through the `packed-q8-m2` path and produced no host-ID histogram evidence. Per the task constraint, no host ID copies were forced and `grouped_decode_shape` eligibility was not changed. This evidence does not rule out future server/continuous-batching work with host IDs, but it does not identify a grouped-reuse fix for the current single-stream TG128 gap.
+
 ---
 
 ## Task 11: Layout Lifecycle Proof For Non-Duplicate Runtime Planning
