@@ -157,6 +157,33 @@ static bool make_mxfp4_xmx_tiled_layout(const std::vector<uint8_t> & src,
     return true;
 }
 
+static std::vector<uint8_t> make_xmx_tiled_v2_aligned_payload_layout(const std::vector<uint8_t> & current,
+                                                                     int64_t                      m,
+                                                                     int64_t                      k) {
+    constexpr size_t tile_n_total    = GGML_SYCL_MXFP4_MOE_XMX_N;
+    constexpr size_t k_per           = GGML_SYCL_MXFP4_MOE_XMX_K;
+    constexpr size_t packed_bytes    = k_per / 2;
+    const size_t     old_group_bytes = tile_n_total * (1 + packed_bytes);
+    const size_t     new_group_bytes = tile_n_total * packed_bytes + 64;
+    const size_t     n_groups_n =
+        static_cast<size_t>((m + static_cast<int64_t>(tile_n_total) - 1) / static_cast<int64_t>(tile_n_total));
+    const size_t         k_tiles = static_cast<size_t>(k / static_cast<int64_t>(k_per));
+    std::vector<uint8_t> out(k_tiles * n_groups_n * new_group_bytes, 0);
+    for (size_t kt = 0; kt < k_tiles; ++kt) {
+        for (size_t group_n = 0; group_n < n_groups_n; ++group_n) {
+            const uint8_t * old_group = current.data() + (kt * n_groups_n + group_n) * old_group_bytes;
+            uint8_t *       new_group = out.data() + (kt * n_groups_n + group_n) * new_group_bytes;
+            for (size_t row = 0; row < tile_n_total; ++row) {
+                const uint8_t * old_payload = old_group + tile_n_total + row * packed_bytes;
+                uint8_t *       new_payload = new_group + row * packed_bytes;
+                std::copy(old_payload, old_payload + packed_bytes, new_payload);
+                *(new_group + tile_n_total * packed_bytes + row) = *(old_group + row);
+            }
+        }
+    }
+    return out;
+}
+
 static int normalize_supported_xmx_tiles_n(int value) {
     if (value >= 4) {
         return 4;
@@ -1159,6 +1186,11 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
         error = "mxfp4_pair_glu XMX_TILED tile count must be 1, 2, or 4.";
         return false;
     }
+    if (xmx_tiled_v2 && (!xmx_tiled || !xmx_tiled_pack_q8 || xmx_tiled_grouped || xmx_tiled_prefetch ||
+                         xmx_tiled_m_tiles != 2 || rows_per_wg != 8 || xmx_tiled_v2_group_bytes != 320)) {
+        error = "mxfp4_pair_glu XMX_TILED_V2 requires packed XMX_TILED r8 m2 and 320-byte groups.";
+        return false;
+    }
 
     const size_t         selected_count = static_cast<size_t>(n_selected);
     const size_t         token_count    = static_cast<size_t>(n_tokens);
@@ -1183,6 +1215,9 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
         }
     } else {
         launch_layout = expert_layout;
+    }
+    if (xmx_tiled_v2) {
+        launch_layout = make_xmx_tiled_v2_aligned_payload_layout(launch_layout, m, k);
     }
     const size_t  expert_bytes         = launch_layout.size();
     const size_t  logical_expert_bytes = predecoded_i8 ? launch_layout.size() : weights.layout.size();

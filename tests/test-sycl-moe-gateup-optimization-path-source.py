@@ -112,3 +112,16 @@ def test_v2_benchmark_cli_scaffolding_exists() -> None:
     assert "mxfp4_pair_glu_xmx_tiled_v2_packed_r8_m2_sparse32_bias" in main
     assert "args.xmx_tiled_v2" in reference
     assert "args.xmx_tiled_v2_group_bytes" in reference
+
+
+def test_v2_reference_generator_transforms_current_xmx_layout() -> None:
+    reference = (ROOT / "tools" / "sycl-kernel-bench" / "kernels" / "reference" / "mxfp4_inline_dot.cpp").read_text(
+        encoding="utf-8"
+    )
+    assert "make_xmx_tiled_v2_aligned_payload_layout" in reference
+    assert re.search(r"\bold_group_bytes\s*=\s*tile_n_total\s*\*\s*\(1\s*\+\s*packed_bytes\)", reference)
+    assert re.search(r"\bnew_group_bytes\s*=\s*tile_n_total\s*\*\s*packed_bytes\s*\+\s*64", reference)
+    assert "new_group + row * packed_bytes" in reference
+    assert "new_group + tile_n_total * packed_bytes + row" in reference
+    assert "make_xmx_tiled_v2_aligned_payload_layout(launch_layout, m, k)" in reference
+    assert "logical_expert_bytes = predecoded_i8 ? launch_layout.size() : weights.layout.size()" in reference
