@@ -125,3 +125,33 @@ def test_v2_reference_generator_transforms_current_xmx_layout() -> None:
     assert "new_group + tile_n_total * packed_bytes + row" in reference
     assert "make_xmx_tiled_v2_aligned_payload_layout(launch_layout, m, k)" in reference
     assert "logical_expert_bytes = predecoded_i8 ? launch_layout.size() : weights.layout.size()" in reference
+
+
+def test_v2_mmvq_load_helper_and_bench_branch_exist() -> None:
+    mmvq = MMVQ.read_text(encoding="utf-8")
+    assert "mxfp4_xmx_tiled_v2_load_a_vec_from_group" in mmvq
+    assert "struct mxfp4_pair_glu_xmx_tiled_v2_dpas_m2_kernel" in mmvq
+    assert "mxfp4_pair_glu_xmx_tiled_v2_dpas_m2_sycl" in mmvq
+    helper = slice_between(
+        mmvq,
+        "mxfp4_xmx_tiled_v2_load_a_vec_from_group",
+        "template <int Repeat>\nSYCL_ESIMD_FUNCTION inline void mxfp4_xmx_tiled_load_a_vec_from_group",
+    )
+    assert "const uint8_t * packed_ptr = group + xmx_row_in_group * packed_bytes" in helper
+    assert "const uint8_t * scale_ptr  = group + tile_n_total * packed_bytes + xmx_row_in_group" in helper
+    body = slice_between(
+        mmvq,
+        "mxfp4_pair_glu_xmx_tiled_v2_dpas_m2_sycl",
+        "static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl",
+    )
+    assert "const int64_t group_bytes     = 320" in body
+    assert "mxfp4_xmx_tiled_v2_load_a_vec_from_group<Repeat>(gate_group0" in body
+    assert "mxfp4_xmx_tiled_v2_load_a_vec_from_group<Repeat>(up_group0" in body
+    assert "parallel_for<mxfp4_pair_glu_xmx_tiled_v2_dpas_m2_kernel" in body
+    assert "gate_part0 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>" in body
+    assert "up_part0   = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>" in body
+    launch = slice_between(mmvq, "case 8:\n                if (args.xmx_tiled_grouped)", "if (args.xmx_tiled_m_tiles == 4)")
+    assert "mxfp4_dpas_pack_q8_single_col_groups_sycl" in launch
+    assert "if (args.xmx_tiled_v2)" in launch
+    assert "args.xmx_tiled_v2_group_bytes == 320" in launch
+    assert "mxfp4_pair_glu_xmx_tiled_v2_dpas_m2_submit<8" in launch
