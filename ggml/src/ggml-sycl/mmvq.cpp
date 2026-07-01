@@ -132,6 +132,14 @@ static bool mmvq_moe_tg_profile_enabled() {
     return enabled && !ggml_sycl_graph_recording_active();
 }
 
+static bool mxfp4_moe_tg_profile_launch_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_MOE_TG_PROFILE_LAUNCH");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static bool mmvq_moe_pp_profile_enabled() {
     static const bool enabled = []() {
         const char * env = std::getenv("GGML_SYCL_MXFP4_PP_PROFILE");
@@ -1246,6 +1254,9 @@ struct mmvq_moe_tg_profile_accum {
     double       pack_us          = 0.0;
     double       kernel_us        = 0.0;
     double       artifact_us      = 0.0;
+    double       launch_submit_us = 0.0;
+    double       launch_device_us = 0.0;
+    double       launch_wait_us   = 0.0;
     double       gateup_glu_us    = 0.0;
     double       down_us          = 0.0;
     double       other_us         = 0.0;
@@ -1302,15 +1313,21 @@ static void mmvq_moe_tg_profile_record(layout_mode              layout,
                                        double                   kernel_us,
                                        double                   artifact_us   = 0.0,
                                        mmvq_moe_tg_profile_kind kind          = mmvq_moe_tg_profile_kind::OTHER,
-                                       int64_t                  logical_calls = 1,
-                                       const char *             path          = nullptr,
-                                       double                   pack_us       = 0.0) {
+                                       int64_t                  logical_calls     = 1,
+                                       const char *             path              = nullptr,
+                                       double                   pack_us           = 0.0,
+                                       double                   launch_submit_us  = 0.0,
+                                       double                   launch_device_us  = 0.0,
+                                       double                   launch_wait_us    = 0.0) {
     auto & p = g_mmvq_moe_tg_profile;
     p.quant_us += quant_us;
     p.batch_ids_us += batch_ids_us;
     p.pack_us += pack_us;
     p.kernel_us += kernel_us;
     p.artifact_us += artifact_us;
+    p.launch_submit_us += launch_submit_us;
+    p.launch_device_us += launch_device_us;
+    p.launch_wait_us += launch_wait_us;
     p.calls += logical_calls;
     p.entries += entries;
     p.total_batches += total_batches;
@@ -1348,21 +1365,44 @@ static void mmvq_moe_tg_profile_record(layout_mode              layout,
     }
 
     const double total_us = p.quant_us + p.batch_ids_us + p.pack_us + p.kernel_us + p.artifact_us;
-    fprintf(stderr,
-            "[MXFP4-MOE-TG-PROFILE] calls=%lld soa=%lld coalesced=%lld aos=%lld dpas=%lld i8=%lld "
-            "entries=%lld batches=%lld total=%.3f ms quant=%.3f ms artifact=%.3f ms "
-            "batch_ids=%.3f ms pack=%.3f ms kernel=%.3f ms "
-            "gateup_glu=%.3f ms/%lld down=%.3f ms/%lld other=%.3f ms/%lld "
-            "per_call total=%.3f us quant=%.3f us batch_ids=%.3f us kernel=%.3f us "
-            "per_entry kernel=%.3f us last_path=%s\n",
-            (long long) p.calls, (long long) p.soa_calls, (long long) p.coalesced_calls, (long long) p.aos_calls,
-            (long long) p.dpas_calls, (long long) p.i8_calls, (long long) p.entries, (long long) p.total_batches,
-            total_us / 1000.0, p.quant_us / 1000.0, p.artifact_us / 1000.0, p.batch_ids_us / 1000.0, p.pack_us / 1000.0,
-            p.kernel_us / 1000.0, p.gateup_glu_us / 1000.0, (long long) p.gateup_glu_calls, p.down_us / 1000.0,
-            (long long) p.down_calls, p.other_us / 1000.0, (long long) p.other_calls,
-            total_us / static_cast<double>(p.calls), p.quant_us / static_cast<double>(p.calls),
-            p.batch_ids_us / static_cast<double>(p.calls), p.kernel_us / static_cast<double>(p.calls),
-            p.entries > 0 ? p.kernel_us / static_cast<double>(p.entries) : 0.0, p.last_path ? p.last_path : "unknown");
+    if (!mxfp4_moe_tg_profile_launch_enabled()) {
+        fprintf(stderr,
+                "[MXFP4-MOE-TG-PROFILE] calls=%lld soa=%lld coalesced=%lld aos=%lld dpas=%lld i8=%lld "
+                "entries=%lld batches=%lld total=%.3f ms quant=%.3f ms artifact=%.3f ms "
+                "batch_ids=%.3f ms pack=%.3f ms kernel=%.3f ms "
+                "gateup_glu=%.3f ms/%lld down=%.3f ms/%lld other=%.3f ms/%lld "
+                "per_call total=%.3f us quant=%.3f us batch_ids=%.3f us kernel=%.3f us "
+                "per_entry kernel=%.3f us last_path=%s\n",
+                (long long) p.calls, (long long) p.soa_calls, (long long) p.coalesced_calls, (long long) p.aos_calls,
+                (long long) p.dpas_calls, (long long) p.i8_calls, (long long) p.entries, (long long) p.total_batches,
+                total_us / 1000.0, p.quant_us / 1000.0, p.artifact_us / 1000.0, p.batch_ids_us / 1000.0,
+                p.pack_us / 1000.0, p.kernel_us / 1000.0, p.gateup_glu_us / 1000.0,
+                (long long) p.gateup_glu_calls, p.down_us / 1000.0, (long long) p.down_calls, p.other_us / 1000.0,
+                (long long) p.other_calls, total_us / static_cast<double>(p.calls),
+                p.quant_us / static_cast<double>(p.calls), p.batch_ids_us / static_cast<double>(p.calls),
+                p.kernel_us / static_cast<double>(p.calls),
+                p.entries > 0 ? p.kernel_us / static_cast<double>(p.entries) : 0.0,
+                p.last_path ? p.last_path : "unknown");
+    } else {
+        fprintf(stderr,
+                "[MXFP4-MOE-TG-PROFILE] calls=%lld soa=%lld coalesced=%lld aos=%lld dpas=%lld i8=%lld "
+                "entries=%lld batches=%lld total=%.3f ms quant=%.3f ms artifact=%.3f ms "
+                "batch_ids=%.3f ms pack=%.3f ms kernel=%.3f ms "
+                "gateup_glu=%.3f ms/%lld down=%.3f ms/%lld other=%.3f ms/%lld "
+                "per_call total=%.3f us quant=%.3f us batch_ids=%.3f us kernel=%.3f us "
+                "per_entry kernel=%.3f us last_path=%s "
+                "launch_submit_us=%.3f launch_device_us=%.3f launch_wait_us=%.3f\n",
+                (long long) p.calls, (long long) p.soa_calls, (long long) p.coalesced_calls, (long long) p.aos_calls,
+                (long long) p.dpas_calls, (long long) p.i8_calls, (long long) p.entries, (long long) p.total_batches,
+                total_us / 1000.0, p.quant_us / 1000.0, p.artifact_us / 1000.0, p.batch_ids_us / 1000.0,
+                p.pack_us / 1000.0, p.kernel_us / 1000.0, p.gateup_glu_us / 1000.0,
+                (long long) p.gateup_glu_calls, p.down_us / 1000.0, (long long) p.down_calls, p.other_us / 1000.0,
+                (long long) p.other_calls, total_us / static_cast<double>(p.calls),
+                p.quant_us / static_cast<double>(p.calls), p.batch_ids_us / static_cast<double>(p.calls),
+                p.kernel_us / static_cast<double>(p.calls),
+                p.entries > 0 ? p.kernel_us / static_cast<double>(p.entries) : 0.0,
+                p.last_path ? p.last_path : "unknown", p.launch_submit_us, p.launch_device_us, p.launch_wait_us);
+    }
     p = {};
 }
 
@@ -16886,7 +16926,10 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
     ggml_layout_mode         profile_layout        = weight_layout;
     std::vector<sycl::event> profile_group_copy_events;
     sycl::event              profile_pack_event;
-    bool                     profile_pack_event_set = false;
+    bool                     profile_pack_event_set    = false;
+    double                   profile_launch_submit_us = 0.0;
+    double                   profile_launch_device_us = 0.0;
+    double                   profile_launch_wait_us   = 0.0;
     if (weight_layout == GGML_LAYOUT_SOA && mxfp4_moe_aggressive_soa_m4_enabled() && aggressive_tg_cfg.eligible &&
         fused_glu_q8_candidate && aggressive_down_q8 != nullptr && num_tokens == 1 && total_batches > 0 &&
         total_batches < aggressive_tg_cfg.exec_n && n_gpu_entries == total_batches && !ids_host && ids_device &&
@@ -17584,11 +17627,34 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
                             mxfp4_moe_aggressive_tg_log_accept(xmx_tiled_path, total_batches, exec_n, tile_n_total,
                                                                /*saved_launches=*/1);
                         } else {
-                            kernel_event = mxfp4_pair_glu_xmx_tiled_dpas_m2_submit<repeat>(
-                                *stream, gate_ptrs_device, up_ptrs_device, b_packed, y_scales, glu_d, ids_device,
-                                gate_bias_device, up_bias_device, ne00, ne01, static_cast<int>(total_batches),
-                                static_cast<int>(num_tokens), ids_nb0, ids_nb1, glu_dst->nb[1], glu_dst->nb[2],
-                                gate_bias_nb1, up_bias_nb1, glu_op, alpha, limit, tile_n_total, pack_event);
+                            const bool profile_launch = tg_profile && mxfp4_moe_tg_profile_launch_enabled();
+                            if (profile_launch) {
+                                const auto launch_submit_begin = std::chrono::high_resolution_clock::now();
+                                kernel_event = mxfp4_pair_glu_xmx_tiled_dpas_m2_submit<repeat>(
+                                    *stream, gate_ptrs_device, up_ptrs_device, b_packed, y_scales, glu_d, ids_device,
+                                    gate_bias_device, up_bias_device, ne00, ne01, static_cast<int>(total_batches),
+                                    static_cast<int>(num_tokens), ids_nb0, ids_nb1, glu_dst->nb[1], glu_dst->nb[2],
+                                    gate_bias_nb1, up_bias_nb1, glu_op, alpha, limit, tile_n_total, pack_event);
+                                const auto launch_submit_end = std::chrono::high_resolution_clock::now();
+                                profile_launch_submit_us +=
+                                    std::chrono::duration<double, std::micro>(launch_submit_end - launch_submit_begin)
+                                        .count();
+                                const auto wait_begin = std::chrono::high_resolution_clock::now();
+                                kernel_event.wait_and_throw();
+                                const auto wait_end = std::chrono::high_resolution_clock::now();
+                                profile_launch_wait_us +=
+                                    std::chrono::duration<double, std::micro>(wait_end - wait_begin).count();
+                                const double device_us = mmvq_sycl_event_duration_us(kernel_event);
+                                if (device_us >= 0.0) {
+                                    profile_launch_device_us += device_us;
+                                }
+                            } else {
+                                kernel_event = mxfp4_pair_glu_xmx_tiled_dpas_m2_submit<repeat>(
+                                    *stream, gate_ptrs_device, up_ptrs_device, b_packed, y_scales, glu_d, ids_device,
+                                    gate_bias_device, up_bias_device, ne00, ne01, static_cast<int>(total_batches),
+                                    static_cast<int>(num_tokens), ids_nb0, ids_nb1, glu_dst->nb[1], glu_dst->nb[2],
+                                    gate_bias_nb1, up_bias_nb1, glu_op, alpha, limit, tile_n_total, pack_event);
+                            }
                             xmx_tiled_path =
                                 partial_device_grouped_route ? "partial-packed-q8-m2-device" : "packed-q8-m2";
                         }
@@ -17821,7 +17887,8 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
         mmvq_moe_tg_profile_record(
             profile_layout, 2 * n_gpu_entries, 2 * total_batches, quant_us - down_q8_publish_us, 0.0, kernel_profile_us,
             down_q8_publish_us, mmvq_moe_tg_profile_kind::GATEUP_GLU, 2,
-            profile_path && std::strcmp(profile_path, "none") != 0 ? profile_path : xmx_tiled_path, pack_us);
+            profile_path && std::strcmp(profile_path, "none") != 0 ? profile_path : xmx_tiled_path, pack_us,
+            profile_launch_submit_us, profile_launch_device_us, profile_launch_wait_us);
     }
     if (pp_profile) {
         mmvq_moe_pp_profile_record(

@@ -1186,6 +1186,23 @@ git commit -m "feat(sycl): add default-off MXFP4 gateup launch timing profile"
 - Do not enable graphlets or persistent kernels in this task.
 - The profiling wait changes timing; it is diagnostic-only and must be env-gated.
 
+## Lead Launch Timing Evidence
+
+| Field | Value |
+| --- | --- |
+| Decision | `launch-graphlets-not-first-target` |
+| Output directory | `/tmp/sycl_gptoss_launch_timing_20260701_091536` |
+| Baseline parse path | `/tmp/sycl_gptoss_launch_timing_20260701_091536/baseline/parse.stdout` |
+| Baseline model result | `pp512 1238.87 +/- 8.32 tok/s`, `tg128 36.03 +/- 0.08 tok/s` |
+| Parsed `profile.mxfp4_tg.launch.submit_us` | `73723.231` |
+| Parsed `profile.mxfp4_tg.launch.device_us` | `3504298.096` |
+| Parsed `profile.mxfp4_tg.launch.wait_us` | `3546877.552` |
+| Raw summed gate/up time | `3642520.000 us` from 641 `[MXFP4-MOE-TG-PROFILE]` lines in `baseline/bench.stderr` |
+| Derived non-device launch/drain overhead | `116302.687 us` = submit + max(wait - device, 0) |
+| Derived overhead ratio | `3.19%` of raw summed gate/up time |
+
+The literal `submit_us + wait_us` total is larger than 20% of gate/up time, but the measured `wait_us` is the diagnostic drain around each kernel and is almost entirely covered by `device_us`. Treating the full wait as launch overhead would misclassify device execution as host launch overhead. The non-device launch/drain component is only `3.19%`, so graphlets/persistent launch reduction is not the first target for the TG128 gap.
+
 ---
 
 ## Task 9: Grouped-Reuse Histogram Parser And Source Gates
