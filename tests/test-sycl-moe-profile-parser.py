@@ -1065,6 +1065,19 @@ def test_parser_requires_mxfp4_tg_path() -> None:
         assert "profile.mxfp4_tg.path.singlecol-gateup 1" in out
 
 
+def test_parser_requires_multirhs_mxfp4_tg_path() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        (tmp / "profile.stderr").write_text(
+            "[MXFP4-MOE-TG-PROFILE] calls=72 soa=0 coalesced=0 aos=0 dpas=24 i8=6 "
+            "entries=288 batches=288 total=4.100 ms quant=0.120 ms artifact=0.050 ms "
+            "batch_ids=0.000 ms pack=0.040 ms kernel=3.890 ms gateup_glu=4.000 ms/24 down=0.500 ms/24 "
+            "other=0.000 ms/0 last_path=multirhs-gateup\n"
+        )
+        out = run_parser(tmp, "--require-mxfp4-tg-path", "multirhs-gateup")
+        assert "profile.mxfp4_tg.path.multirhs-gateup 1" in out
+
+
 def test_parser_require_mxfp4_tg_path_fails_closed() -> None:
     with tempfile.TemporaryDirectory() as tmp_raw:
         tmp = pathlib.Path(tmp_raw)
