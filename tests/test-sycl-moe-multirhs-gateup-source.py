@@ -63,6 +63,15 @@ def test_multirhs_requires_same_expert_contract_text() -> None:
     assert "same gate/up A matrices" in contract
 
 
+def test_multirhs_validation_reference_disables_candidate_mode() -> None:
+    reference = REFERENCE.read_text(encoding="utf-8")
+    start = reference.index("ggml_sycl::mxfp4_pair_glu_bench_args ref_args = args")
+    end = reference.index("if (!ggml_sycl::ggml_sycl_mxfp4_pair_glu_bench_launch(ref_args))", start)
+    ref_setup = reference[start:end]
+    assert "ref_args.multi_rhs_gateup    = false" in ref_setup
+    assert "ref_args.multi_rhs_cols      = 1" in ref_setup
+
+
 def test_multirhs_benchmark_kernel_uses_rhs_columns_not_role_columns() -> None:
     mmvq = MMVQ.read_text(encoding="utf-8")
     assert "mxfp4_pair_glu_multirhs_sycl" in mmvq

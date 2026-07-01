@@ -1602,6 +1602,8 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
             ref_args.xmx_tiled_m_tiles  = 1;
             ref_args.split_gate_up       = false;
             ref_args.single_column_gateup = false;
+            ref_args.multi_rhs_gateup    = false;
+            ref_args.multi_rhs_cols      = 1;
             ref_args.predecoded_i8       = false;
             ref_args.gate_tmp           = nullptr;
             ref_args.up_tmp             = nullptr;
