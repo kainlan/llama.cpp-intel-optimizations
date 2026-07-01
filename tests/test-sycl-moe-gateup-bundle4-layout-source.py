@@ -93,16 +93,41 @@ def test_reference_bundle4_route_is_fail_closed_before_layout_allocation() -> No
     assert "make_xmx_tiled_bundle4_payload_layout(launch_layout, m, k)" in layout_block
 
 
-def test_sycl_bundle4_bench_launcher_fails_closed_before_v2_and_packed_dispatch() -> None:
+def test_sycl_bundle4_loader_and_kernel_route_exist() -> None:
     mmvq = MMVQ.read_text(encoding="utf-8")
-    launcher = slice_between(
+    assert "mxfp4_xmx_tiled_bundle4_load_a_vec_from_bundle" in mmvq
+    assert "struct mxfp4_pair_glu_xmx_tiled_bundle4_dpas_m2_kernel" in mmvq
+    assert "mxfp4_pair_glu_xmx_tiled_bundle4_dpas_m2_sycl" in mmvq
+    helper = slice_between(
         mmvq,
-        "bool ggml_sycl_mxfp4_pair_glu_bench_launch",
-        "bool ggml_sycl_mxfp4_mmv_id_bench_launch",
+        "mxfp4_xmx_tiled_bundle4_load_a_vec_from_bundle",
+        "template <int Repeat>\nSYCL_ESIMD_FUNCTION inline void mxfp4_xmx_tiled_v2_load_a_vec_from_group",
     )
-    bundle4_pos = launcher.index("if (args.xmx_tiled_bundle4)")
-    v2_pos = launcher.index("if (args.xmx_tiled_v2)")
-    packed_pos = launcher.index("if (args.xmx_tiled_pack_q8)")
-    bundle4_guard = slice_between(launcher, "if (args.xmx_tiled_bundle4)", "if (args.xmx_tiled_v2)")
-    assert bundle4_pos < v2_pos < packed_pos
-    assert "return false" in bundle4_guard
+    assert "constexpr int bundle_groups" in helper
+    assert "payload_group_bytes" in helper
+    assert "payload_slab_bytes" in helper
+    assert "scale_slab_bytes" in helper
+    assert "group_in_bundle * payload_group_bytes" in helper
+    assert "payload_slab_bytes + group_in_bundle * scale_slab_bytes" in helper
+
+
+def test_sycl_bundle4_launch_is_fail_closed_before_pack_enqueue() -> None:
+    mmvq = MMVQ.read_text(encoding="utf-8")
+    validation = slice_between(mmvq, "if (args.xmx_tiled_bundle4)", "if (args.xmx_tiled_v2)")
+    assert "args.xmx_tiled_bundle4_group_bytes == 1088" in validation
+    assert "args.xmx_tiled_m_tiles == 2" in validation
+    assert "args.rows_per_wg == 8" in validation
+    assert "args.xmx_tiles_n == 1" in validation
+    assert "!args.xmx_tiled_v2" in validation
+    launch = slice_between(
+        mmvq,
+        "if (args.xmx_tiled_pack_q8)",
+        "if (args.xmx_tiled_m_tiles == 4)",
+    )
+    bundle4_pos = launch.index("if (args.xmx_tiled_bundle4)")
+    pack_pos = launch.index("mxfp4_dpas_pack_q8_single_col_groups_sycl", bundle4_pos)
+    submit_pos = launch.index("mxfp4_pair_glu_xmx_tiled_bundle4_dpas_m2_submit<8", bundle4_pos)
+    dispatch_validation = launch[bundle4_pos:pack_pos]
+    assert "!args.xmx_tiled_v2" in dispatch_validation
+    assert bundle4_pos < pack_pos < submit_pos
+    assert "return true" in launch[submit_pos:]
