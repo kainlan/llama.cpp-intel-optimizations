@@ -138,3 +138,6 @@ poetry.toml
 # emscripten
 a.out.*
 .worktrees/
+
+# Beads issue tracker retired in favor of codescout task tracker
+.beads/

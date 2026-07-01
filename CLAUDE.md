@@ -210,15 +210,7 @@ Confirmed lessons from prior work on this fork. Treat them as defaults.
 - **The user reads Discord, not the terminal.** CLI output is invisible to them. Any question, confirmation, decision prompt, or status update intended for the user MUST go through the Discord reply tool (the harness injects the channel id each session). Terminal text is logging only — never "await a reply" there.
 - **Work in-place on the active feature branch** (currently `feature/sycl-coalescing`); skip git worktrees. A worktree forces a fresh `build/` and loses the ~10-min ccache-warm hit rate. When reviewing diffs, bound by BASE_SHA/HEAD_SHA, not "everything on the branch."
 - **Fix-forward, never revert.** If a build or correctness test fails mid-implementation, diagnose and fix in a new commit. Don't `git revert` or `git checkout --` to undo progress.
-- **Verify correctness before claiming any perf win.** `llama-bench` measures tok/s only — a change can boost throughput by silently skipping or mis-staging work and still emit garbage tokens. Before committing any change to kernel dispatch, weight staging, graph replay, or allocation routing, run the canonical completion gate and confirm the output. A fake +19.6% PP "win" shipped this way once and had to be reverted.
-
-  Canonical gate — output must end `6, 7, 8, 9, 10, 11, 12, 13, 14, 15`:
-  ```bash
-  ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
-    -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
-    -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
-  ```
-  Anything else (`###...`, `!!!...`, repetition, `<unk>`) means the path is broken — fix or revert before commit, no matter the throughput number.
+- **Verify correctness before claiming any perf win.** `llama-bench` measures tok/s only — a change can boost throughput by silently skipping or mis-staging work and still emit garbage tokens. Before committing any change to kernel dispatch, weight staging, graph replay, or allocation routing, run the canonical Mistral completion gate (see "Verification Commands & Correctness Gates") and confirm the output. A fake +19.6% PP "win" shipped this way once and had to be reverted.
 
 ### Safety (these have wedged or OOM-locked this host)
 - **Never run `test-backend-ops` in a subagent or background task.** It allocates hundreds of GPU BOs whose TTM shmem backing grows to 50–224 GB and trips the OOM killer (two lockups on 2026-04-06). For automated GPU testing use only `llama-bench`, `llama-completion`, or a targeted `ctest -R <name>`. Run `test-backend-ops` manually, with monitoring, only.
@@ -232,7 +224,7 @@ Confirmed lessons from prior work on this fork. Treat them as defaults.
 - **The VRAM budget calc is correct by design** (`min(total*pct, free_at_init)`). Low free VRAM is a system problem (other GPUs active, driver overhead), not an app bug to "fix" by ignoring free VRAM — fix the root cause at the system level.
 - **Small-block dequant (Q4_0/Q8_0/Q4_K) belongs on standard SYCL, not ESIMD.** ESIMD measured 1.9x SLOWER on Arc B580 + oneAPI 2025.3 (block granularity too small to amortize LSC loads). The real dequant lever is structural — fuse dequant into the matmul. Opt-in retest hatch: `GGML_SYCL_ESIMD_DEQUANT=1`.
 
-> Live debugging state (active bug investigations, bisect results, perf-regression hunts) lives in **beads** (`bd ready`, `bd list`), not here. This section is for settled rules only.
+> Live debugging state (active bug investigations, bisect results, perf-regression hunts) lives in the **codescout task tracker** (`task_ready`, `task_list`), not here. This section is for settled rules only.
 
 ## Development Workflow (Machine-Specific)
 
@@ -249,11 +241,13 @@ Models are stored in `/Storage/GenAI/models/`:
 - `gpt-oss-20b-mxfp4.gguf` (12G) - Smaller variant
 - `gpt-oss-120b-mxfp4-*.gguf` (60G total, 3-part split) - Full model
 
-### Verification Commands
+### Verification Commands & Correctness Gates
 ```bash
 source /opt/intel/oneapi/setvars.sh --force
 
-# Non-interactive completion (deterministic output for testing)
+# Mistral completion gate — deterministic; output must end:
+#   6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+# Any other output (###..., repetition, <unk>) = broken path; fix before commit.
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
   -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
@@ -280,182 +274,67 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-backend-ops
 
 ### GPT-OSS Prompt Template Rule
 
-Use the exact gate below for GPT-OSS correctness tests. The prompt is:
+Use `llama-cli -cnv` (the GPT-OSS gate above) so the CLI applies the model's
+embedded GGUF/Jinja chat template. Do **not** pass `--chat-template gpt-oss` (it
+selects the older native formatter) or hand-render a raw Harmony prompt. Always
+pin `reasoning_effort=medium` via `--chat-template-kwargs` so template metadata,
+CLI defaults, or harness changes can't move the prompt across regression
+comparisons; `--reasoning-format none` is not a substitute for pinning. GPT-OSS
+was trained for OpenAI's Harmony format — wrong formatting causes cascading
+generation failures, and `llama-bench` proves throughput only, never chat
+correctness. Full rationale and sources: `docs/backend/gpt-oss-testing.md`.
 
-```text
-Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5
-```
+### Patched compute-runtime & P2P topology
 
-Use `llama-cli -cnv` so the CLI applies the model's embedded GGUF/Jinja chat
-template to that text as a user message. Do not hand-render a raw Harmony
-prompt, and do not pass `--chat-template gpt-oss` or a custom template unless
-the test is explicitly about that formatter. `llama-cli --help` reports Jinja
-enabled by default and `--chat-template` as a custom override whose default is
-the template from model metadata.
+The system `libze_intel_gpu.so.1` is a patched 26.22/BMG-only build (from
+`/Apps/compute-runtime-26.22-llama`, branch `llama/26.22-cross-device`) carrying
+the wedged-i915 discovery fix, cross-device in-order dependency fixes, and the
+PR 930 USM compression fix. Stock `1.14.37020` is preserved alongside for
+rollback. Reverting to stock without restoring the old allocation probe can
+reintroduce silent oversized-allocation hangs (the m09zb `event.wait()` hang).
 
-Web and local verification rechecked on 2026-06-19:
+**Durable rule — B580↔B50 have no direct P2P.** Direct device-to-device USM copy
+fails (`OUT_OF_DEVICE_MEMORY`) and importing a B580 allocation on the B50 returns
+`INVALID_ARGUMENT`; the kernel refuses P2PDMA because the cards share no upstream
+bridge. This is a PCI topology restriction, not a selector bug. Keep direct
+peer-copy / shared-context paths disabled unless a runtime probe proves them safe
+on the live hardware; host-bounce (`level_zero:0,1`) validation may continue.
 
-- GPT-OSS models were trained for OpenAI's Harmony response format and should
-  not be run with raw text or a generic chat format.
-- OpenAI's implementation-verification guide warns that inference providers
-  must map inputs to Harmony correctly; wrong prompt formatting can cause
-  cascading generation issues.
-- OpenAI's GPT-OSS Transformers guide says prompts should be built with the
-  tokenizer chat template or `openai-harmony`.
-- The OpenAI Hugging Face model card says the Transformers chat template
-  automatically applies Harmony and direct `model.generate` callers must apply
-  Harmony manually.
-- The `openai/gpt-oss-20b` Jinja template accepts `reasoning_effort`, defaults
-  it to `medium`, renders `Reasoning: medium` in the Harmony system message,
-  renders the user prompt as a Harmony user message, and appends
-  `<|start|>assistant` as the generation prompt.
-- The llama.cpp GPT-OSS guide says `--jinja` uses the Jinja chat template
-  embedded in the GGUF and that the `ggml-org/gpt-oss` GGUFs have a built-in
-  chat template used by default; manual template overrides are only for known
-  template bugs or specialized experiments.
-- Local `llama-cli --help` confirms `--jinja` defaults to enabled and the chat
-  template defaults to the one taken from model metadata.
-
-For cross-branch regression tests, pin the Harmony `reasoning_effort` template
-argument to `medium` with `--chat-template-kwargs`. The known-good B50
-GPT-OSS prompt rendered `Reasoning: medium`; pinning prevents accidental
-changes in template metadata, CLI defaults, or test harness behavior from
-moving the prompt while comparing backend performance. `--reasoning-format
-none` controls how reasoning output is shown or hidden and is not a substitute
-for pinning the template argument. The deterministic count gate deliberately
-uses `--reasoning-budget 0` with hidden reasoning so the expected answer is a
-short final-channel string; for normal GPT-OSS chat/server parser validation,
-use llama.cpp's automatic reasoning handling instead of treating `none` as a
-model-format requirement.
-
-Sources checked 2026-06-19:
-
-- `https://developers.openai.com/cookbook/articles/openai-harmony`
-- `https://developers.openai.com/cookbook/articles/gpt-oss/verifying-implementations`
-- `https://developers.openai.com/cookbook/articles/gpt-oss/run-transformers`
-- `https://developers.openai.com/cookbook/articles/gpt-oss/handle-raw-cot`
-- `https://huggingface.co/openai/gpt-oss-20b`
-- `https://huggingface.co/openai/gpt-oss-20b/blob/main/chat_template.jinja`
-- `https://github.com/ggml-org/llama.cpp/discussions/15396`
-
-Canonical B50 GPT-OSS correctness gate:
-
-```bash
-source /opt/intel/oneapi/setvars.sh --force
-ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-cli \
-  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -ngl 99 \
-  -cnv -st --simple-io --no-display-prompt \
-  --chat-template-kwargs '{"reasoning_effort":"medium"}' \
-  --reasoning-format none --reasoning-budget 0 \
-  -p 'Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5' \
-  -n 48 --seed 42 --temp 0
-```
-
-Expected output starts with `: 1, 2, 3, 4, 5`. The leading colon is normal for
-this CLI/Harmony rendering. `llama-bench` is valid for PP/TG throughput, but it
-does not prove chat-template correctness; use the gate above before trusting
-GPT-OSS performance numbers.
-
-### Patched compute-runtime (system default as of 2026-05-30)
-
-The system `libze_intel_gpu.so.1` is the patched 26.22/BMG-only build installed at
-`/usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1.15.38646` from
-`/Apps/compute-runtime-26.22-llama` branch `llama/26.22-cross-device`. The build
-is based on `upstream/releases/26.22` and carries the local wedged-i915 discovery
-fix, the cross-device in-order dependency fixes, and the upstream PR 930 USM
-compression fix. It was configured with `SUPPORT_GEN_DEFAULT=FALSE`,
-`SUPPORT_PLATFORM_DEFAULT=FALSE`, and `SUPPORT_BMG=TRUE` because the installed
-IGC/ocloc does not recognize 26.22's future Xe3p/NVLP built-ins.
-
-The install still uses the diverted system library path; stock `1.14.37020` is
-preserved at `/usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1.14.37020.stock`.
-The previous patched 26.09 files are also preserved. To roll back to the prior
-patched runtime without removing the diversion:
-
-```bash
-sudo ln -sfn libze_intel_gpu.so.1.14.37435.pre-single-device-default-ctx /usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1
-sudo ldconfig
-```
-
-As of 2026-06-15, unowned stale Level Zero loader/tracing/validation libraries
-from `/usr/local/lib` were moved to
-`/usr/local/lib/llama-backup-level-zero-20260615-100931` because they made new
-processes resolve `libze_loader.so.1.27.0` ahead of the packaged
-`/usr/lib/x86_64-linux-gnu` loader. Keep `libze_loader.so.1`,
-`libze_tracing_layer.so.1`, and `libze_validation_layer.so.1` absent from
-`/usr/local/lib`; `ldconfig -p` should resolve them from
-`/usr/lib/x86_64-linux-gnu`.
-
-Validation on 2026-05-30:
-`sycl-ls` historically reported B580 and B50 Level Zero devices on driver
-`1.15.38646`, and `ONEAPI_DEVICE_SELECTOR=level_zero:0,1` could run a full
-GPT-OSS bench through llama.cpp's isolated/host-bounce path. Do not use
-`sycl-ls` for B50 probing now; see the 2026-06-07 B50 safety note below. Raw
-SYCL and Level Zero direct
-device-to-device USM copy between B580 and B50 still fails
-(`UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` / `ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY`),
-and importing a B580 device allocation on the B50 returns
-`ZE_RESULT_ERROR_INVALID_ARGUMENT`. Kernel logs report:
-
-```text
-xe 0000:03:00.0: cannot be used for peer-to-peer DMA as the client and provider (0000:07:00.0) do not share an upstream bridge or whitelisted host bridge
-```
-
-This is a PCI P2PDMA/topology restriction, not just a compute-runtime selector
-bug. Do not enable direct peer-copy or shared-context transfer paths by default
-unless a runtime probe proves they are safe on the active hardware, kernel, and
-driver.
-
-The patched runtime still fixes the m09zb `event.wait()` post-init hang during
-alloc-probe and cleanly enforces per-allocation hardware caps. Reverting to stock
-without restoring the old allocation probe can reintroduce silent oversized
-allocation hangs.
+Install history, rollback commands, and loader-path notes:
+`docs/backend/compute-runtime.md`.
 
 ### SYCL Device Selection
 
-On multi-GPU systems, use `ONEAPI_DEVICE_SELECTOR` to choose the visible Level
-Zero devices. Selector syntax is `backend:devices`: use `level_zero:0` for one
-device, `level_zero:0,1` for a numeric multi-device set, or `level_zero:gpu` for
-all Level Zero GPU devices. The `level_zero:gpu:0` strings printed by some tools
-are display IDs, not valid selector values.
-
-This system has 3 GPUs: Arc B580 (device 0), Arc Pro B50 (device 1), iGPU (device 2).
-
-As of 2026-06-07 after a fresh reboot and removal of repo-side selector guards,
-single-GPU B50 validation can run with `ONEAPI_DEVICE_SELECTOR=level_zero:1`.
-Do not add backend or harness code that parses, rewrites, or refuses
-`ONEAPI_DEVICE_SELECTOR`; device selection belongs to oneAPI/SYCL. Previous-boot
-evidence and P2P topology warnings must not alter fresh-boot SYCL selection
-behavior. `sycl-ls` is still not a preferred B50 health probe because it has
-previously wedged this host in `ttm_resource_manager_usage -> drm_ioctl ->
-xe_drm_ioctl` after a reset/oops sequence.
-
-Do not run old comparison binaries such as the `60a8c042` known-good build with
-metadata-only helper commands (`--help`, `--version`, or `lsof /dev/dri/*`) on
-the discrete render nodes. On 2026-06-19, `llama-cli --help` from that build
-initialized SYCL and left a process stuck in `xe_vm_destroy_ioctl ->
-drm_exec_lock_obj`; an `lsof` probe then stuck in `xe_bo_lock`. Sysfs PCI FLR
-and debugfs GT reset returned successfully but did not clear the D-state tasks.
-Use the canonical gated inference command for cross-build comparisons after a
-fresh reboot, and avoid DRM fdinfo probes while a SYCL process is wedged.
-Current `common_params_parse()` must keep `--help`, `--version`, cache-list, and
-completion generation metadata-only even when `LLAMA_ARG_*` GPU env vars are
-set; verify with `test-arg-parser` after parser changes.
+Use `ONEAPI_DEVICE_SELECTOR` (syntax `backend:devices`): `level_zero:0` for one
+device, `level_zero:0,1` for a numeric multi-device set, `level_zero:gpu` for all
+GPUs. The `level_zero:gpu:0` strings some tools print are display IDs, not valid
+selector values. This system: Arc B580 (device 0), Arc Pro B50 (device 1), iGPU
+(device 2). Single-GPU B50 validation runs with `level_zero:1`.
 
 ```bash
-# Select an explicit Level Zero device set.
-ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench ...
-ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench ...
+ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench ...   # B580
+ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench ...   # B50
 ONEAPI_DEVICE_SELECTOR=level_zero:0,1 ./build/bin/llama-bench ... # host-bounce paths required
-
-# NOTE: GGML_SYCL_VISIBLE_DEVICES=0 does NOT work - it filters at llama.cpp level
-# but unified cache still sees all Level Zero devices. Use ONEAPI_DEVICE_SELECTOR.
 ```
 
-Current-boot B580/B50 P2P topology warnings are diagnostic only; direct
-peer-copy paths must stay disabled unless probed safe, but host-bounce
-validation may continue. Frigate QSV/OpenVINO jobs on the iGPU render node are
-not B580/B50 consumers.
+Rules:
+- Device selection belongs to oneAPI/SYCL — do not add code that parses,
+  rewrites, or refuses `ONEAPI_DEVICE_SELECTOR`, and don't let previous-boot
+  evidence alter fresh-boot behavior. `GGML_SYCL_VISIBLE_DEVICES` does **not**
+  work (filters at llama.cpp level; unified cache still sees all L0 devices).
+- `common_params_parse()` must keep `--help`, `--version`, cache-list, and
+  completion generation metadata-only even with `LLAMA_ARG_*` GPU env vars set;
+  verify with `test-arg-parser` after parser changes.
+- **Wedge hazards (unrecoverable D-state):** `sycl-ls` is not a safe B50 health
+  probe (has wedged this host in `xe_drm_ioctl` after a reset/oops). Do not run
+  old comparison binaries (e.g. the `60a8c042` build) with `--help`/`--version`/
+  `lsof /dev/dri/*` on the discrete render nodes — SYCL init alone left a process
+  stuck in `xe_vm_destroy_ioctl` that FLR/GT-reset could not clear. Use the
+  canonical gated inference command for cross-build comparisons after a fresh
+  reboot, and avoid DRM fdinfo probes while a SYCL process is wedged.
+
+Current-boot B580/B50 P2P topology warnings are diagnostic only. Frigate
+QSV/OpenVINO jobs on the iGPU render node are not B580/B50 consumers.
 
 ### Performance Expectations (Mistral 7B Q4_0, Arc B580)
 
@@ -492,38 +371,23 @@ GPT-OSS 20B MXFP4:
 | `level_zero:0` B580 | ~66 | ~17 | Smaller VRAM budget causes more pressure |
 | `level_zero:0,1` | TBD | TBD | Use isolated/host-bounce transfer paths; direct P2P is not available |
 
-### Current Regression Baselines And Suspect Delta
+### Regression Baselines (hard guardrails)
 
-Do not accept lower post-merge or post-debug numbers as new baselines. Beads
-`llama.cpp-aqzz3.1`, `llama.cpp-po3nd.2.45`, `llama.cpp-po3nd.2.46`, and
-`llama.cpp-ix58x` record the hard guardrails:
+Do not accept lower post-merge/post-debug numbers as new baselines (codescout
+tasks `llama.cpp-aqzz3.1`, `llama.cpp-po3nd.2.45/.46`, `llama.cpp-ix58x`):
 
-- B50 GPT-OSS20B MXFP4 FA-on should restore/maintain >1100 PP512 and about
-  50+ TG128; older restored-fast-path evidence was about 1255 PP512 / 52
-  TG128, with the canonical GGUF chat-template count gate passing.
-- B580 Mistral 7B Q4_0 FA-on should restore/maintain >2000 PP512 and >85
-  TG128. `docs/backend/SYCL.md` records build `5b206c499-dirty` at PP512
-  `2173.92 +/- 10.01` and TG128 `88.42 +/- 0.47`, with the deterministic
-  count gate correct.
+- **B50 GPT-OSS20B MXFP4 FA-on:** ≥1100 PP512, ~50+ TG128 (restored-fast-path
+  evidence: ~1255 PP512 / 52 TG128), count gate passing.
+- **B580 Mistral 7B Q4_0 FA-on:** >2000 PP512, >85 TG128 (`docs/backend/SYCL.md`
+  records `5b206c499-dirty` at 2173.92 PP512 / 88.42 TG128), count gate correct.
 
-For the latest regression hunt, use `581babb476b726665a03345feb1a9ebcabe630db`
-as the close pre-regression comparison point. The first-parent delta to
-`f7a332578` is:
+Keep these opt-in until same-build B50 GPT-OSS + B580 Mistral gates pass on a
+clean boot: `GGML_SYCL_MOE_BLOCK_GRAPHLETS`, `GGML_SYCL_XMX_MOE_PP` /
+`GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP`, `GGML_SYCL_PP_PIPELINE` (the last has shown
+GPT-OSS chat correctness failures).
 
-- `06f8887a6` restore unified-cache prompt headroom
-- `a42a4c9a3` harden unified-cache view ownership
-- `129a04fcb` tighten gpu performance gates
-- `feae906b4` restore default MoE block graphlets
-- `f7a332578` prefer MoE block graphlets for decode
-
-The most suspicious default-on change in that small delta is the MoE block
-command-graphlet path. It must stay opt-in via
-`GGML_SYCL_MOE_BLOCK_GRAPHLETS=1` until same-build B50 GPT-OSS and B580
-Mistral correctness/performance gates pass on a clean boot. Prompt XMX MoE PP
-is also unsafe as a default; keep `GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP` /
-`GGML_SYCL_XMX_MOE_PP` opt-in only. `GGML_SYCL_PP_PIPELINE=1` remains a
-diagnostic proof knob, not a default, because it has shown GPT-OSS chat
-correctness failures.
+Active regression-hunt state (commit deltas, suspect changes) lives in the
+codescout task tracker — see `llama.cpp-p92r`.
 
 ### SYCL Environment Variables
 
@@ -575,7 +439,7 @@ GGML_SYCL_PERSISTENT_TG=1 GGML_SYCL_PERSISTENT_TG_PHASE=0 GGML_SYCL_PERSISTENT_T
   ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -n 128
 
-# Correctness check (must output "6, 7, 8, 9, 10")
+# Correctness check — must pass the Mistral completion gate (ends 6..15)
 GGML_SYCL_PERSISTENT_TG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
@@ -631,6 +495,8 @@ Add `ggml-ci` to commit message to trigger extended CI workloads.
 
 - **Build Details**: `docs/build.md`
 - **Backend SYCL**: `docs/backend/SYCL.md`
+- **GPT-OSS testing rationale**: `docs/backend/gpt-oss-testing.md`
+- **Patched compute-runtime & P2P**: `docs/backend/compute-runtime.md`
 - **Add New Model**: `docs/development/HOWTO-add-model.md`
 - **Contributing**: `CONTRIBUTING.md` (coding/naming guidelines, PR process)
 - **Copilot Instructions**: `.github/copilot-instructions.md` (cross-platform build/test patterns)
