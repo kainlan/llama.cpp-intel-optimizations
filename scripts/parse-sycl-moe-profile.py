@@ -107,6 +107,8 @@ def merge_counters_for_totals(dst: collections.Counter[str], src: collections.Co
     for key, value in src.items():
         if BENCH_TPS_KEY_RE.fullmatch(key) or MXFP4_PROFILE_TIMING_KEY_RE.fullmatch(key):
             dst[key] = max(dst.get(key, 0), value)
+        elif key == MOE_EXPERT_HIST_MAX_KEY:
+            dst[key] = max(dst.get(key, 0), value)
         else:
             dst[key] += value
 
@@ -229,6 +231,16 @@ MXFP4_TG_LAUNCH_US_KEYS = {
     "launch_wait_us": "profile.mxfp4_tg.launch.wait_us",
 }
 FLOAT_COUNTER_KEYS = frozenset(MXFP4_TG_LAUNCH_US_KEYS.values())
+MOE_EXPERT_HIST_PREFIX = "[MOE-EXPERT-HIST]"
+MOE_EXPERT_HIST_FIELDS = ("tokens", "topk", "total_batches", "groups", "max_group", "avg_group", "groups_ge2")
+MOE_EXPERT_HIST_OUTPUT_KEYS = (
+    "profile.moe_expert_hist.lines",
+    "profile.moe_expert_hist.total_batches",
+    "profile.moe_expert_hist.groups",
+    "profile.moe_expert_hist.max_group",
+    "profile.moe_expert_hist.groups_ge2",
+)
+MOE_EXPERT_HIST_MAX_KEY = "profile.moe_expert_hist.max_group"
 E2E_TG_PROFILE_RE = re.compile(
     r"\[SYCL-E2E-TG-PROFILE\]\s+tokens=(?P<tokens>\d+)\s+ops=(?P<ops>\d+)"
     r"\s+moe_calls=(?P<moe_calls>\d+)\s+total_host=(?P<host>[0-9.]+) ms"
@@ -333,6 +345,24 @@ def format_counter_value(key: str, value: float) -> str:
     if key in FLOAT_COUNTER_KEYS:
         return f"{value:.3f}"
     return str(value)
+
+
+def moe_expert_hist_avg_group(counters: collections.Counter[str]) -> float:
+    groups = counters.get("profile.moe_expert_hist.groups", 0)
+    if groups <= 0:
+        return 0.0
+    return counters.get("profile.moe_expert_hist.total_batches", 0) / groups
+
+
+def print_counter_lines(counters: collections.Counter[str]) -> None:
+    for key in sorted(counters):
+        if key in MOE_EXPERT_HIST_OUTPUT_KEYS:
+            continue
+        print(f"{key} {format_counter_value(key, counters[key])}")
+    if counters.get("profile.moe_expert_hist.lines", 0) > 0:
+        for key in MOE_EXPERT_HIST_OUTPUT_KEYS:
+            print(f"{key} {format_counter_value(key, counters[key])}")
+        print(f"profile.moe_expert_hist.avg_group {moe_expert_hist_avg_group(counters):.3f}")
 
 
 def iter_log_files(paths: Iterable[str]) -> list[pathlib.Path]:
@@ -474,6 +504,16 @@ def summarize_file(path: pathlib.Path) -> tuple[collections.Counter[str], list[s
             counters["placement.gateup.promoted_soa"] += int(promoted_soa.group("count"))
         if any(marker in line for marker in PROFILE_MARKERS):
             lines.append(line)
+        if line.startswith(MOE_EXPERT_HIST_PREFIX):
+            hist_values = first_numeric_key_values(line)
+            if all(field in hist_values for field in MOE_EXPERT_HIST_FIELDS):
+                counters["profile.moe_expert_hist.lines"] += 1
+                counters["profile.moe_expert_hist.total_batches"] += parse_counter_value(hist_values["total_batches"])
+                counters["profile.moe_expert_hist.groups"] += parse_counter_value(hist_values["groups"])
+                counters[MOE_EXPERT_HIST_MAX_KEY] = max(
+                    counters[MOE_EXPERT_HIST_MAX_KEY], parse_counter_value(hist_values["max_group"])
+                )
+                counters["profile.moe_expert_hist.groups_ge2"] += parse_counter_value(hist_values["groups_ge2"])
         tg_profile_values: dict[str, str] = {}
         if "[MXFP4-MOE-TG-PROFILE]" in line:
             tg_profile_values = first_numeric_key_values(line)
@@ -786,8 +826,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(optimized_default_fast_path_line(counters))
         print(optimized_aggressive_substrate_line(counters))
         print(f"fatal.total {fatal_marker_count(counters)}")
-        for key in sorted(counters):
-            print(f"{key} {format_counter_value(key, counters[key])}")
+        print_counter_lines(counters)
 
     if missing_inputs and gate_args_requested(args):
         print(f"error: missing log inputs: {', '.join(missing_inputs)}")
@@ -798,8 +837,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(optimized_default_fast_path_line(total))
         print(optimized_aggressive_substrate_line(total))
         print(f"fatal.total {fatal_marker_count(total)}")
-        for key in sorted(total):
-            print(f"{key} {format_counter_value(key, total[key])}")
+        print_counter_lines(total)
     if args.require_default_fast_path_optimized and not optimized_default_fast_path(total):
         print(
             "error: default fast path optimized substrate missing "

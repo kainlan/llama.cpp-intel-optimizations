@@ -166,3 +166,12 @@ def test_launch_timing_instrumentation_is_default_off_when_implemented() -> None
     assert "launch_submit_us" in mmvq
     assert "launch_device_us" in mmvq
     assert "launch_wait_us" in mmvq
+
+
+def test_expert_histogram_instrumentation_is_default_off_when_implemented() -> None:
+    mmvq = MMVQ.read_text(encoding="utf-8")
+    if "GGML_SYCL_MOE_EXPERT_HIST" not in mmvq:
+        return
+    assert "mxfp4_moe_expert_hist_enabled" in mmvq
+    assert "std::getenv(\"GGML_SYCL_MOE_EXPERT_HIST\")" in mmvq
+    assert "[MOE-EXPERT-HIST]" in mmvq

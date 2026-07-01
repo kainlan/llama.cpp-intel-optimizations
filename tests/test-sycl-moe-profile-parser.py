@@ -1631,5 +1631,23 @@ def test_parser_sums_mxfp4_tg_launch_timing_fields(tmp_path: pathlib.Path) -> No
     assert "profile.mxfp4_tg.launch.wait_us 150.000" in out
 
 
+def test_parser_summarizes_moe_expert_histograms(tmp_path: pathlib.Path) -> None:
+    log = tmp_path / "hist.log"
+    log.write_text(
+        "[MOE-EXPERT-HIST] tensor=blk.0.ffn_gate_exps tokens=4 topk=4 total_batches=16 groups=10 "
+        "max_group=3 avg_group=1.600 groups_ge2=4\n"
+        "[MOE-EXPERT-HIST] tensor=blk.1.ffn_gate_exps tokens=8 topk=4 total_batches=32 groups=18 "
+        "max_group=5 avg_group=1.778 groups_ge2=9\n",
+        encoding="utf-8",
+    )
+    out = run_parser(log)
+    assert "profile.moe_expert_hist.lines 2" in out
+    assert "profile.moe_expert_hist.total_batches 48" in out
+    assert "profile.moe_expert_hist.groups 28" in out
+    assert "profile.moe_expert_hist.max_group 5" in out
+    assert "profile.moe_expert_hist.groups_ge2 13" in out
+    assert "profile.moe_expert_hist.avg_group 1.714" in out
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
