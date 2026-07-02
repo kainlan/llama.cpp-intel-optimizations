@@ -7083,6 +7083,39 @@ SYCL_ESIMD_FUNCTION inline void mxfp4_xmx_tiled_bundle4_load_a_vec_from_bundle(
 }
 
 template <int Repeat>
+SYCL_ESIMD_FUNCTION inline void mxfp4_xmx_tiled_bundle4_load_a_full_group_from_bundle(
+    const uint8_t *                                                                 bundle,
+    int64_t                                                                         group_in_bundle,
+    sycl::ext::intel::esimd::simd<int8_t, 2 * Repeat * GGML_SYCL_MXFP4_MOE_XMX_K> & a_vec,
+    sycl::ext::intel::esimd::simd<float, 2 * Repeat> &                              w_scale_vec) {
+    using namespace sycl::ext::intel::esimd;
+    static_assert(Repeat == 8, "bundle4 full-group loader is specialized for the current r8 m2 benchmark path");
+    constexpr int k_per               = GGML_SYCL_MXFP4_MOE_XMX_K;
+    constexpr int tile_n_total        = GGML_SYCL_MXFP4_MOE_XMX_N;
+    constexpr int packed_bytes        = k_per / 2;
+    constexpr int rows                = 2 * Repeat;
+    constexpr int bundle_groups       = 4;
+    constexpr int payload_group_bytes = tile_n_total * packed_bytes;
+    constexpr int payload_slab_bytes  = bundle_groups * payload_group_bytes;
+    constexpr int scale_slab_bytes    = tile_n_total;
+
+    const uint8_t * packed_ptr = bundle + group_in_bundle * payload_group_bytes;
+    const uint8_t * scale_ptr  = bundle + payload_slab_bytes + group_in_bundle * scale_slab_bytes;
+
+    simd<uint8_t, 256> packed      = block_load<uint8_t, 256>(packed_ptr);
+    simd<uint8_t, 16>  scale_bytes = block_load<uint8_t, 16>(scale_ptr);
+    w_scale_vec                       = mxfp4_e8m0_to_fp32_esimd<rows>(scale_bytes);
+#pragma unroll
+    for (int r = 0; r < rows; ++r) {
+        simd<uint8_t, packed_bytes> row = packed.template select<packed_bytes, 1>(r * packed_bytes);
+        simd<uint8_t, k_per>        codes;
+        codes.template select<packed_bytes, 1>(0)            = row & uint8_t{ 0x0f };
+        codes.template select<packed_bytes, 1>(packed_bytes) = row >> 4;
+        a_vec.template select<k_per, 1>(r * k_per)           = mxfp4_code_values_esimd<k_per>(codes);
+    }
+}
+
+template <int Repeat>
 SYCL_ESIMD_FUNCTION inline void mxfp4_xmx_tiled_v2_load_a_vec_from_group(
     const uint8_t *                                                             group,
     int64_t                                                                     tile_n_total,
