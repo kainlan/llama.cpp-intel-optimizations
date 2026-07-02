@@ -11,6 +11,7 @@
 #include "moe-xmx-fused.hpp"
 #include "quantize.hpp"
 #include "quants.hpp"
+#include "sycl-kernel-profiler.hpp"
 #include "sycl-profiling.hpp"
 #include "unified-cache.hpp"
 #include "unified-kernel.hpp"  // For split barrier support
@@ -40,6 +41,21 @@ void ggml_sycl_mmvq_set_fused_add(const ggml_sycl_mmvq_fused_add & add) {
 
 void ggml_sycl_mmvq_clear_fused_add() {
     g_mmvq_fused_add = {};
+}
+
+static ggml_sycl_profile_label mmvq_profile_label(sycl::queue & queue,
+                                                  const char *  name,
+                                                  const char *  metadata,
+                                                  const char *  category = "mmvq",
+                                                  size_t        bytes    = 0) {
+    ggml_sycl_profile_label label{};
+    label.name       = name;
+    label.category   = category;
+    label.queue_kind = "compute";
+    label.metadata   = metadata;
+    label.device     = ggml_sycl_get_device_id_from_queue(queue);
+    label.bytes      = bytes;
+    return label;
 }
 
 static __dpct_inline__ float mmvq_fused_add_value(const float * add,
@@ -1657,7 +1673,15 @@ static sycl::event mmvq_submit_memcpy_with_deps(sycl::queue &                   
     ggml_sycl::mem_handle dst_handle   = mmvq_memcpy_handle_for_raw_ptr(dst, queue_device, dst_fallback_on_device);
     ggml_sycl::mem_handle src_handle =
         mmvq_memcpy_handle_for_raw_ptr(const_cast<void *>(src), queue_device, src_fallback_on_device);
-    return ggml_sycl::mem_copy_async(dst_handle, src_handle, bytes, queue, deps);
+
+    ggml_sycl_profile_label label{};
+    label.name       = "sycl.memcpy.mmvq_with_deps";
+    label.category   = "memory";
+    label.queue_kind = "compute";
+    label.metadata   = deps.empty() ? "deps=0" : "deps=1";
+    label.device     = queue_device;
+    label.bytes      = bytes;
+    return ggml_sycl_profile_record_returned_event(label, ggml_sycl::mem_copy_async(dst_handle, src_handle, bytes, queue, deps));
 }
 
 static void mmvq_memcpy_sync(sycl::queue & queue,
@@ -6433,7 +6457,10 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows(const void *         vx,
     auto submit_mmv = [&](auto cache_tag, auto vec_tag) -> sycl::event {
         constexpr bool CACHE_Y_LOCAL  = decltype(cache_tag)::value;
         constexpr bool VECTOR_QS_LOAD = decltype(vec_tag)::value;
-        return stream->submit([&](sycl::handler & cgh) {
+        ggml_sycl_profile_label profile_label =
+            mmvq_profile_label(*stream, "mxfp4.soa.batched", "path=soa;role=matvec");
+        return ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+            return profiled_queue.submit([&](sycl::handler & cgh) {
             if (deps && !deps->empty()) {
                 cgh.depends_on(*deps);
             }
@@ -6450,6 +6477,7 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows(const void *         vx,
                                      total_qs_size_per_expert, ids_nb0, ids_nb1, nb11, nb12, nb1, nb2, scale_stride,
                                      item_ct1, SYCL_LOCAL_ACC_PTR(slm_y_qs), SYCL_LOCAL_ACC_PTR(slm_y_ds));
                              });
+            });
         });
     };
 
@@ -7393,7 +7421,10 @@ static sycl::event mxfp4_down_sum_i8_direct_final_q8_sycl(sycl::queue &         
     const int     scale_stride         = static_cast<int>(k_tiles);
     const int64_t tiles                = static_cast<int64_t>(n_tokens) * m_tiles;
 
-    return queue.submit([&](sycl::handler & h) {
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(queue, "mxfp4.down.direct_final_i8", "path=down-dpas-direct-final-i8;role=down");
+    return ggml_sycl_profile_submit(queue, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & h) {
         if (!deps.empty()) {
             h.depends_on(deps);
         }
@@ -7486,6 +7517,7 @@ static sycl::event mxfp4_down_sum_i8_direct_final_q8_sycl(sycl::queue &         
                     }
                 }
             });
+        });
     });
 }
 
@@ -8101,7 +8133,10 @@ static sycl::event mxfp4_down_sum_i8_direct_final_same_expert_grouped_q8_sycl(sy
     const int     scale_stride         = static_cast<int>(k_tiles);
     const int64_t tiles                = static_cast<int64_t>(n_groups) * m_tiles;
 
-    return queue.submit([&](sycl::handler & h) {
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(queue, "mxfp4.down.same_expert_grouped", "path=down-dpas-direct-final-same-expert-grouped;role=down");
+    return ggml_sycl_profile_submit(queue, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & h) {
         if (!deps.empty()) {
             h.depends_on(deps);
         }
@@ -8232,6 +8267,7 @@ static sycl::event mxfp4_down_sum_i8_direct_final_same_expert_grouped_q8_sycl(sy
                     }
                 }
             });
+        });
     });
 }
 
@@ -8474,7 +8510,10 @@ static sycl::event mxfp4_down_sum_dpas_direct_final_q8_sycl(sycl::queue &       
     const int64_t scale_offset = m_tiles * k_tiles * an;
     const int64_t tiles        = static_cast<int64_t>(n_tokens) * m_tiles;
 
-    return queue.submit([&](sycl::handler & h) {
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(queue, "mxfp4.down.direct_final_dpas", "path=down-dpas-direct-final-dpas;role=down");
+    return ggml_sycl_profile_submit(queue, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & h) {
         if (!deps.empty()) {
             h.depends_on(deps);
         }
@@ -8558,6 +8597,7 @@ static sycl::event mxfp4_down_sum_dpas_direct_final_q8_sycl(sycl::queue &       
                     }
                 }
             });
+        });
     });
 }
 
@@ -9467,7 +9507,10 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_bundle4_dpas_m2_sycl(sycl::queue &  
     const int64_t k_tiles      = ncols / k_per;
     const int64_t tiles        = static_cast<int64_t>(total_batches) * m_tile_pairs;
 
-    return queue.submit([&](sycl::handler & h) {
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(queue, "mxfp4.gateup.xmx_tiled_bundle4_m2", "path=bundle4-packed-q8-m2;role=gateup");
+    return ggml_sycl_profile_submit(queue, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & h) {
         h.depends_on(pack_event);
         h.parallel_for<mxfp4_pair_glu_xmx_tiled_bundle4_dpas_m2_kernel<Repeat, GLU_OP, Prefetch>>(
             sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(tiles)), sycl::range<1>(1)),
@@ -9626,6 +9669,7 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_bundle4_dpas_m2_sycl(sycl::queue &  
                         static_cast<int>(tile_m1) * Repeat, nrows_per_expert, alpha, limit);
                 }
             });
+        });
     });
 }
 
@@ -9663,7 +9707,10 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl(sycl::queue &        qu
     const int64_t k_tiles      = ncols / k_per;
     const int64_t tiles        = static_cast<int64_t>(total_batches) * m_tile_pairs;
 
-    return queue.submit([&](sycl::handler & h) {
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(queue, "mxfp4.gateup.xmx_tiled_dpas_m2", "path=packed-q8-m2;role=gateup;tiles=static;total_batches=runtime");
+    return ggml_sycl_profile_submit(queue, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & h) {
         h.depends_on(pack_event);
         h.parallel_for<mxfp4_pair_glu_xmx_tiled_dpas_m2_kernel<Repeat, GLU_OP, Prefetch>>(
             sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(tiles)), sycl::range<1>(1)),
@@ -9837,6 +9884,7 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl(sycl::queue &        qu
                     }
                 }
             });
+        });
     });
 }
 
@@ -10707,7 +10755,10 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m4_sycl(sycl::queue &        qu
     const int64_t k_tiles       = ncols / k_per;
     const int64_t tiles         = static_cast<int64_t>(total_batches) * m_tile_groups;
 
-    return queue.submit([&](sycl::handler & h) {
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(queue, "mxfp4.gateup.xmx_tiled_dpas_m4", "path=packed-q8-m4;role=gateup");
+    return ggml_sycl_profile_submit(queue, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & h) {
         h.depends_on(pack_event);
         h.parallel_for<mxfp4_pair_glu_xmx_tiled_dpas_m4_kernel<Repeat, GLU_OP>>(
             sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(tiles)), sycl::range<1>(1)),
@@ -11016,6 +11067,7 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m4_sycl(sycl::queue &        qu
                     }
                 }
             });
+        });
     });
 }
 
@@ -15331,7 +15383,10 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows(const void * co
         constexpr int  GLU_OP         = decltype(glu_tag)::value;
         constexpr bool CACHE_Y_LOCAL  = decltype(cache_tag)::value;
         constexpr bool VECTOR_QS_LOAD = decltype(vec_tag)::value;
-        return stream->submit([&](sycl::handler & cgh) {
+        ggml_sycl_profile_label profile_label =
+            mmvq_profile_label(*stream, "mxfp4.soa.pair_glu_batched", "path=soa;role=gateup");
+        return ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+            return profiled_queue.submit([&](sycl::handler & cgh) {
             if (deps && !deps->empty()) {
                 cgh.depends_on(*deps);
             }
@@ -15349,6 +15404,7 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows(const void * co
                                      dst_nb2, gate_bias_nb1, up_bias_nb1, alpha, limit, scale_stride, item_ct1,
                                      SYCL_LOCAL_ACC_PTR(slm_y_qs), SYCL_LOCAL_ACC_PTR(slm_y_ds));
                              });
+            });
         });
     };
     auto submit_for_cache = [&](auto glu_tag, auto cache_tag) -> sycl::event {
