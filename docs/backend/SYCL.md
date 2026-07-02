@@ -963,6 +963,33 @@ and does not make B50-specific absolute VTune claims. Decision:
 graphlet route, or persistent duplicate gate/up layout is authorized by this
 evidence.
 
+A follow-up benchmark-only bundle4 opportunity pass added a non-bias route,
+full-group A loads, and vectorized full-tile bias/output stores, then recorded
+lead-owned evidence in
+`/tmp/sycl_mxfp4_bundle4_opportunities_20260701_221449`. All synthetic rows were
+exact, but the fastest route still missed the `10%` runtime-followup gate:
+packed-Q8 M2 sparse/bias baseline `272.495794 us`, non-bias bundle4
+`249.225306 us` (`9.34%` faster), and sparse/bias bundle4 `251.723551 us`
+(`8.25%` faster), all with `max_abs_error=0.000000`. VTune compute-extended
+active-kernel rows reported XMX-active / read-bandwidth values of `0.0%` /
+`0.0 GB/s` for baseline, `0.0%` / `0.0 GB/s` for non-bias bundle4, and `6.9%`
+/ `224.411295 GB/s` for sparse/bias bundle4; the zeroed baseline/non-bias rows
+are retained as collected evidence but are not overinterpreted. VTune
+mem-latency reported active-kernel read latency / estimated GPU cycles of
+`318 cycles` / `469561326` for baseline, `526 cycles` / `479885090` for
+non-bias bundle4, and `471 cycles` / `432343346` for sparse/bias bundle4. ocloc
+assembly summaries kept `dpas.8x8=4` and spill memory `0`; baseline had
+`send.ugm=65`, `16` scalar store comments, and no vector-store comments, while
+optimized bundle4 had `send.ugm=75`, `16` scalar store comments from the
+retained tail fallback, and `2` vector-store comments for the full-tile path.
+VTune summaries again labeled
+the target as `Battlemage G21 [Arc B580]` despite
+`ONEAPI_DEVICE_SELECTOR=level_zero:1` and `target-gpu=0:7:0.0`, so these numbers
+are relative benchmark evidence and not B50-specific absolute VTune claims.
+Decision: `bundle4-opportunity-rejected`; no runtime route, default-on behavior,
+production promotion, graphlet route, or persistent duplicate gate/up layout is
+authorized by this evidence.
+
 The planner-owned materialization contract is implemented separately from the
 oneDNN execute gate:
 

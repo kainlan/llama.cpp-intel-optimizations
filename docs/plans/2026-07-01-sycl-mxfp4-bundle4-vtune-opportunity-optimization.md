@@ -901,15 +901,82 @@ Expected: pytest passes, `git diff --check` emits no output, and the docs commit
 
 ---
 
+## Validation Results
+
+Lead-owned Task 5 validation recorded evidence in
+`/tmp/sycl_mxfp4_bundle4_opportunities_20260701_221449`.
+
+Source/build gates:
+
+- `python3 -m pytest tests/test-sycl-moe-gateup-bundle4-route-source.py tests/test-sycl-moe-gateup-bundle4-fullgroup-source.py tests/test-sycl-moe-gateup-bundle4-layout-source.py tests/test-sycl-vtune-asm-parser.py -q`:
+  `13 passed`.
+- `set +u; source /opt/intel/oneapi/setvars.sh --force; set -u; ./scripts/sycl-build.sh sycl-kernel-bench`:
+  linked `bin/sycl-kernel-bench` successfully.
+
+Synthetic comparison (`--dim_m=2880 --dim_n=4 --dim_k=2880 --iterations=1000 --warmup=100 --validate`):
+
+| Kernel | Latency us | Bandwidth GB/s | max_abs_error | Speedup vs baseline |
+|--------|-----------:|---------------:|--------------:|--------------------:|
+| `mxfp4_pair_glu_xmx_tiled_packed_r8_m2_sparse32_bias` | `272.495794` | `129.883693` | `0.000000` | `1.000000` (`0.00%`) |
+| `mxfp4_pair_glu_xmx_tiled_bundle4_packed_r8_m2` | `249.225306` | `141.641315` | `0.000000` | `1.093371` (`9.34%`) |
+| `mxfp4_pair_glu_xmx_tiled_bundle4_packed_r8_m2_sparse32_bias` | `251.723551` | `140.601703` | `0.000000` | `1.082520` (`8.25%`) |
+
+The fastest optimized bundle4 route is exact but below the required `10%`
+speedup gate, so this plan records `bundle4-opportunity-rejected`, not
+`bundle4-opportunity-runtime-followup-authorized`.
+
+VTune caveat: collections used `ONEAPI_DEVICE_SELECTOR=level_zero:1` and
+`-knob target-gpu=0:7:0.0`, but VTune summaries label the target as
+`Battlemage G21 [Arc B580]`; use these as relative benchmark/disassembly
+evidence only and avoid B50-specific absolute VTune claims.
+
+VTune compute-extended active-kernel rows:
+
+| Route | Average time s | XMX active % | Memory read bandwidth GB/s | Memory write bandwidth GB/s |
+|-------|---------------:|-------------:|----------------------------:|-----------------------------:|
+| baseline | `0.000275` | `0.0` | `0.0` | `0.0` |
+| bundle4 non-bias | `0.000254` | `0.0` | `0.0` | `0.0` |
+| bundle4 sparse/bias | `0.000255` | `6.9` | `224.411295` | `0.515634` |
+
+The zeroed baseline and non-bias compute-extended counter rows are kept as
+collected evidence and are not treated as proof of no XMX or no memory traffic;
+ocloc disassembly below remains the XMX proof source.
+
+VTune mem-latency active-kernel rows:
+
+| Route | Average time s | Read latency cycles | Estimated GPU cycles |
+|-------|---------------:|--------------------:|---------------------:|
+| baseline | `0.000331` | `318` | `469561326` |
+| bundle4 non-bias | `0.000312` | `526` | `479885090` |
+| bundle4 sparse/bias | `0.000304` | `471` | `432343346` |
+
+ocloc assembly summaries for active kernels:
+
+| Route | `dpas.8x8` | `send.ugm` | Spill memory | Scalar store comments | Vector store comments |
+|-------|-----------:|-----------:|-------------:|----------------------:|----------------------:|
+| baseline | `4` | `65` | `0` | `16` | `0` |
+| bundle4 non-bias | `4` | `75` | `0` | `16` | `2` |
+| bundle4 sparse/bias | `4` | `75` | `0` | `16` | `2` |
+
+Send-comment details are stored in `baseline.asm_summary.json`,
+`bundle4_nonbias.asm_summary.json`, and `bundle4_bias.asm_summary.json` under
+the evidence directory. The optimized route emits vector-store comments for the
+full-tile path, but static assembly still includes scalar store comments for the
+retained tail fallback and total `send.ugm` increased versus baseline.
+
+Decision: `bundle4-opportunity-rejected`. No runtime route, default-on behavior,
+production promotion, graphlet route, or persistent duplicate gate/up layout is
+authorized by this evidence.
+
 ## Final Review Checklist
 
-- [ ] Task 1 non-bias route source tests pass.
-- [ ] Task 2 full-group helper source tests pass.
-- [ ] Task 3 full-group load wiring source tests pass and build-only gate succeeds.
-- [ ] Task 4 vectorized bias/store source tests pass and build-only gate succeeds.
-- [ ] Task 5 lead synthetic correctness passes or records a rejection.
-- [ ] Runtime defaults remain unchanged.
-- [ ] No production environment variable is added.
-- [ ] No persistent duplicate gate/up VRAM layout is added to production runtime.
-- [ ] Unified-cache `mem_handle` ownership rules remain untouched.
-- [ ] `git diff --check` passes.
+- [x] Task 1 non-bias route source tests pass.
+- [x] Task 2 full-group helper source tests pass.
+- [x] Task 3 full-group load wiring source tests pass and build-only gate succeeds.
+- [x] Task 4 vectorized bias/store source tests pass and build-only gate succeeds.
+- [x] Task 5 lead synthetic correctness passes or records a rejection.
+- [x] Runtime defaults remain unchanged.
+- [x] No production environment variable is added.
+- [x] No persistent duplicate gate/up VRAM layout is added to production runtime.
+- [x] Unified-cache `mem_handle` ownership rules remain untouched.
+- [x] `git diff --check` passes.
