@@ -1681,7 +1681,8 @@ static sycl::event mmvq_submit_memcpy_with_deps(sycl::queue &                   
     label.metadata   = deps.empty() ? "deps=0" : "deps=1";
     label.device     = queue_device;
     label.bytes      = bytes;
-    return ggml_sycl_profile_record_returned_event(label, ggml_sycl::mem_copy_async(dst_handle, src_handle, bytes, queue, deps));
+    return ggml_sycl_profile_record_returned_event(
+        label, ggml_sycl::mem_copy_async(dst_handle, src_handle, bytes, queue, deps));
 }
 
 static void mmvq_memcpy_sync(sycl::queue & queue,
@@ -6459,6 +6460,7 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows(const void *         vx,
         constexpr bool VECTOR_QS_LOAD = decltype(vec_tag)::value;
         ggml_sycl_profile_label profile_label =
             mmvq_profile_label(*stream, "mxfp4.soa.batched", "path=soa;role=matvec");
+        // clang-format off
         return ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
             return profiled_queue.submit([&](sycl::handler & cgh) {
             if (deps && !deps->empty()) {
@@ -6479,6 +6481,7 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_sycl_rows(const void *         vx,
                              });
             });
         });
+        // clang-format on
     };
 
     sycl::event ev;
@@ -7423,6 +7426,7 @@ static sycl::event mxfp4_down_sum_i8_direct_final_q8_sycl(sycl::queue &         
 
     ggml_sycl_profile_label profile_label =
         mmvq_profile_label(queue, "mxfp4.down.direct_final_i8", "path=down-dpas-direct-final-i8;role=down");
+    // clang-format off
     return ggml_sycl_profile_submit(queue, profile_label, [&](sycl::queue & profiled_queue) {
         return profiled_queue.submit([&](sycl::handler & h) {
         if (!deps.empty()) {
@@ -7519,6 +7523,7 @@ static sycl::event mxfp4_down_sum_i8_direct_final_q8_sycl(sycl::queue &         
             });
         });
     });
+    // clang-format on
 }
 
 template <int Repeat> struct mxfp4_down_sum_direct_final_zero_dst_kernel;
@@ -8135,6 +8140,7 @@ static sycl::event mxfp4_down_sum_i8_direct_final_same_expert_grouped_q8_sycl(sy
 
     ggml_sycl_profile_label profile_label =
         mmvq_profile_label(queue, "mxfp4.down.same_expert_grouped", "path=down-dpas-direct-final-same-expert-grouped;role=down");
+    // clang-format off
     return ggml_sycl_profile_submit(queue, profile_label, [&](sycl::queue & profiled_queue) {
         return profiled_queue.submit([&](sycl::handler & h) {
         if (!deps.empty()) {
@@ -8269,6 +8275,7 @@ static sycl::event mxfp4_down_sum_i8_direct_final_same_expert_grouped_q8_sycl(sy
             });
         });
     });
+    // clang-format on
 }
 
 static bool mxfp4_copy_i32_vector_to_device(sycl::queue &                queue,
@@ -8512,6 +8519,7 @@ static sycl::event mxfp4_down_sum_dpas_direct_final_q8_sycl(sycl::queue &       
 
     ggml_sycl_profile_label profile_label =
         mmvq_profile_label(queue, "mxfp4.down.direct_final_dpas", "path=down-dpas-direct-final-dpas;role=down");
+    // clang-format off
     return ggml_sycl_profile_submit(queue, profile_label, [&](sycl::queue & profiled_queue) {
         return profiled_queue.submit([&](sycl::handler & h) {
         if (!deps.empty()) {
@@ -8599,6 +8607,7 @@ static sycl::event mxfp4_down_sum_dpas_direct_final_q8_sycl(sycl::queue &       
             });
         });
     });
+    // clang-format on
 }
 
 static bool mxfp4_down_sum_dpas_direct_final_q8(sycl::queue &                    queue,
@@ -9509,6 +9518,7 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_bundle4_dpas_m2_sycl(sycl::queue &  
 
     ggml_sycl_profile_label profile_label =
         mmvq_profile_label(queue, "mxfp4.gateup.xmx_tiled_bundle4_m2", "path=bundle4-packed-q8-m2;role=gateup");
+    // clang-format off
     return ggml_sycl_profile_submit(queue, profile_label, [&](sycl::queue & profiled_queue) {
         return profiled_queue.submit([&](sycl::handler & h) {
         h.depends_on(pack_event);
@@ -9671,6 +9681,7 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_bundle4_dpas_m2_sycl(sycl::queue &  
             });
         });
     });
+    // clang-format on
 }
 
 template <int Repeat, int GLU_OP, bool Prefetch>
@@ -9709,6 +9720,7 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl(sycl::queue &        qu
 
     ggml_sycl_profile_label profile_label =
         mmvq_profile_label(queue, "mxfp4.gateup.xmx_tiled_dpas_m2", "path=packed-q8-m2;role=gateup;tiles=static;total_batches=runtime");
+    // clang-format off
     return ggml_sycl_profile_submit(queue, profile_label, [&](sycl::queue & profiled_queue) {
         return profiled_queue.submit([&](sycl::handler & h) {
         h.depends_on(pack_event);
@@ -9886,6 +9898,7 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl(sycl::queue &        qu
             });
         });
     });
+    // clang-format on
 }
 
 template <int Repeat, int GLU_OP>
@@ -10757,6 +10770,7 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m4_sycl(sycl::queue &        qu
 
     ggml_sycl_profile_label profile_label =
         mmvq_profile_label(queue, "mxfp4.gateup.xmx_tiled_dpas_m4", "path=packed-q8-m4;role=gateup");
+    // clang-format off
     return ggml_sycl_profile_submit(queue, profile_label, [&](sycl::queue & profiled_queue) {
         return profiled_queue.submit([&](sycl::handler & h) {
         h.depends_on(pack_event);
@@ -11069,6 +11083,7 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m4_sycl(sycl::queue &        qu
             });
         });
     });
+    // clang-format on
 }
 
 template <int Repeat, int GLU_OP>
@@ -15385,6 +15400,7 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows(const void * co
         constexpr bool VECTOR_QS_LOAD = decltype(vec_tag)::value;
         ggml_sycl_profile_label profile_label =
             mmvq_profile_label(*stream, "mxfp4.soa.pair_glu_batched", "path=soa;role=gateup");
+        // clang-format off
         return ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
             return profiled_queue.submit([&](sycl::handler & cgh) {
             if (deps && !deps->empty()) {
@@ -15406,6 +15422,7 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows(const void * co
                              });
             });
         });
+        // clang-format on
     };
     auto submit_for_cache = [&](auto glu_tag, auto cache_tag) -> sycl::event {
         return vector_qs_load ? submit_glu(glu_tag, cache_tag, std::true_type{}) :

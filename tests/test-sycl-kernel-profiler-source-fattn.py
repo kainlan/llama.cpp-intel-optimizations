@@ -30,3 +30,13 @@ def test_fattn_major_submits_have_named_profile_labels() -> None:
     assert "ggml_sycl_profile_submit(*stream" in set_rows
     assert "cgh.depends_on(set_rows_event)" in set_rows
     assert ".wait(" not in set_rows
+
+    pack_body = slice_between(
+        fattn,
+        "bool ggml_sycl_fattn_xmx_materialize_packed_k",
+        "static bool ggml_sycl_fattn_xmx_v2_alloc_split_workspace_buffer",
+    )
+    assert "fattn.pack" in pack_body
+    assert "ggml_sycl_profile_submit(*stream" in pack_body
+    assert "cgh.depends_on(zero_event)" in pack_body
+    assert ".wait(" not in pack_body
