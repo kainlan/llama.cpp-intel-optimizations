@@ -130,5 +130,38 @@ int main() {
     CHECK(!ggml_sycl_kernel_profile_effective_wait_for_test(false), "flush=final should preserve requested wait=false");
 
     ggml_sycl_kernel_profile_reset_for_test();
+    int                     submit_calls = 0;
+    ggml_sycl_profile_label wrapper_label{};
+    wrapper_label.name       = "unit.wrapper.submit";
+    wrapper_label.category   = "unit";
+    wrapper_label.queue_kind = "compute";
+    wrapper_label.metadata   = "case=disabled";
+
+    ggml_sycl_kernel_profile_config disabled_cfg{};
+    disabled_cfg.enabled = false;
+    ggml_sycl_kernel_profile_set_config_for_test(disabled_cfg);
+    const int disabled_result = ggml_sycl_profile_submit_for_test(wrapper_label, [&]() {
+        submit_calls++;
+        return 7;
+    });
+    CHECK(disabled_result == 7, "disabled wrapper did not return lambda result");
+    CHECK(submit_calls == 1, "disabled wrapper did not call lambda exactly once");
+    CHECK(ggml_sycl_kernel_profile_format_csv_for_test().find("unit.wrapper.submit") == std::string::npos,
+          "disabled wrapper recorded a profile row");
+
+    ggml_sycl_kernel_profile_config enabled_cfg{};
+    enabled_cfg.enabled = true;
+    ggml_sycl_kernel_profile_set_config_for_test(enabled_cfg);
+    wrapper_label.metadata   = "case=enabled";
+    const int enabled_result = ggml_sycl_profile_submit_for_test(wrapper_label, [&]() {
+        submit_calls++;
+        return 11;
+    });
+    CHECK(enabled_result == 11, "enabled wrapper did not return lambda result");
+    CHECK(submit_calls == 2, "enabled wrapper did not call lambda exactly once");
+    CHECK(contains(ggml_sycl_kernel_profile_format_csv_for_test(), "unit.wrapper.submit,unit,case=enabled"),
+          "enabled wrapper did not record test row");
+
+    ggml_sycl_kernel_profile_reset_for_test();
     return 0;
 }
