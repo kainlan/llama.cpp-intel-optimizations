@@ -181,6 +181,6 @@ Phase 2 (fused kernel)     → Zero-penalty cache misses (medium effort)
 | Bug | Fix | Commit |
 |-----|-----|--------|
 | 120B inference deadlock | Deferred free in layout switch (was `queue_.wait()`) | `ac5393b8a` |
-| GPU lockup after kill | SIGTERM/SIGINT/SIGHUP signal handlers free GGTT mappings | `b30e1e37b` |
+| GPU hang after process termination | SIGTERM/SIGINT/SIGHUP signal handlers free GGTT mappings | `b30e1e37b` |
 | `sycl::malloc_host` hang | Cap at iGPU's 4 GB `max_mem_alloc_size`, ggml auto-chunks | `03dd78bab` |
 | Host buffer staging segfault | Skip staging for host-pinned USM (direct DMA) | `78c51ffc1` |

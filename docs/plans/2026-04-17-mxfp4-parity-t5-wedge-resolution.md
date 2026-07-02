@@ -34,7 +34,7 @@ GPT-OSS 20B MoE layer, host-resident MXFP4 expert →
           kernel wall-time exceeds GuC scheduler budget →
             guc_id=6 userspace-queue hang →
               kworker blocked 120+ seconds →
-                system death (power-cycle required)
+                unrecoverable hang (power-cycle required)
 ```
 
 ### Post-T4 (current state on `feature/sycl-coalescing` @ `ec7f04ac4`)
