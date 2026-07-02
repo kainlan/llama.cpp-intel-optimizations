@@ -207,19 +207,19 @@ const llama_rope_type rope_type;  // OK (no enum keyword)
 Confirmed lessons from prior work on this fork. Treat them as defaults.
 
 ### Communication & Workflow
-- **The user reads Discord, not the terminal.** CLI output is invisible to them. Any question, confirmation, decision prompt, or status update intended for the user MUST go through the Discord reply tool (the harness injects the channel id each session). Terminal text is logging only — never "await a reply" there.
+- **The user reads Discord, not the terminal.** CLI output is invisible to them. Any question, confirmation, decision prompt, or status update intended for the user MUST go through the Discord reply tool (the harness supplies the channel id each session). Terminal text is logging only — never "await a reply" there.
 - **Work in-place on the active feature branch** (currently `feature/sycl-coalescing`); skip git worktrees. A worktree forces a fresh `build/` and loses the ~10-min ccache-warm hit rate. When reviewing diffs, bound by BASE_SHA/HEAD_SHA, not "everything on the branch."
 - **Fix-forward, never revert.** If a build or correctness test fails mid-implementation, diagnose and fix in a new commit. Don't `git revert` or `git checkout --` to undo progress.
 - **Verify correctness before claiming any perf win.** `llama-bench` measures tok/s only — a change can boost throughput by silently skipping or mis-staging work and still emit garbage tokens. Before committing any change to kernel dispatch, weight staging, graph replay, or allocation routing, run the canonical Mistral completion gate (see "Verification Commands & Correctness Gates") and confirm the output. A fake +19.6% PP "win" shipped this way once and had to be reverted.
 
-### Safety (these have wedged or OOM-locked this host)
-- **Never run `test-backend-ops` in a subagent or background task.** It allocates hundreds of GPU BOs whose TTM shmem backing grows to 50–224 GB and trips the OOM killer (two lockups on 2026-04-06). For automated GPU testing use only `llama-bench`, `llama-completion`, or a targeted `ctest -R <name>`. Run `test-backend-ops` manually, with monitoring, only.
-- **Always `timeout 60` GPT-OSS 20B test runs.** The historical host-MoE-routing wedge (GuC `guc_id=6`, unrecoverable system death) was closed by commit `ec7f04ac4`, but keep the timeout as a guard. Distinguish the userspace wedge (`guc_id=6`, attributed `in <llama-bench>`, unrecoverable) from the benign environmental XE timeout (`guc_id=0`, `in no process [-1]`, auto-recovers).
-- **Benchmark numbers are invalid after any crash/kill on that card** (xe GT-reset cascades) — check `dmesg` first. `SAFE_MODE`/op-timing diagnostics can themselves wedge cards.
+### Safety (these have hung or exhausted memory on this host)
+- **Never run `test-backend-ops` in a subagent or background task.** It allocates hundreds of GPU BOs whose TTM shmem backing grows to 50–224 GB and exhausts memory, so the kernel out-of-memory handler stops the process (two hangs on 2026-04-06). For automated GPU testing use only `llama-bench`, `llama-completion`, or a targeted `ctest -R <name>`. Run `test-backend-ops` manually, with monitoring, only.
+- **Always `timeout 60` GPT-OSS 20B test runs.** The historical host-MoE-routing hang (GuC `guc_id=6`, unrecoverable, requires reboot) was closed by commit `ec7f04ac4`, but keep the timeout as a guard. Distinguish the userspace hang (`guc_id=6`, attributed `in <llama-bench>`, unrecoverable) from the benign environmental XE timeout (`guc_id=0`, `in no process [-1]`, auto-recovers).
+- **Benchmark numbers are invalid after any crash or forced stop on that card** (xe GT reset cascades) — check `dmesg` first. `SAFE_MODE`/op-timing diagnostics can themselves stall cards.
 
 ### Architecture
 - **The unified cache owns all GPU/host memory** (decision Feb 9, 2026). Weight placement, eviction (device→pinned host→mmap), and budget tracking all flow through it.
-- **Use smart handles, never hold a raw `void*` from the cache.** A raw VRAM pointer becomes dangling the moment the cache evicts to host → DEVICE_LOST/corruption. Handles must resolve location on dereference so the cache can move data between tiers transparently.
+- **Use smart handles, never hold a raw `void*` from the cache.** A raw VRAM pointer becomes dangling the moment the cache evicts to host → DEVICE_LOST errors or corrupted results. Handles must resolve location on dereference so the cache can move data between tiers transparently.
 - **Host-resident weights → CPU dispatch, not GPU PCIe "zero-copy."** Measured CPU AOS = 18–30 GB/s vs GPU zero-copy = 11.3 GB/s (1.6–2.6x slower). Parallelize CPU work with GPU via `sycl::depends_on` (~9.7 µs cross-device latency). Never feed a host-pinned pointer to a GPU kernel as "zero-copy."
 - **The VRAM budget calc is correct by design** (`min(total*pct, free_at_init)`). Low free VRAM is a system problem (other GPUs active, driver overhead), not an app bug to "fix" by ignoring free VRAM — fix the root cause at the system level.
 - **Small-block dequant (Q4_0/Q8_0/Q4_K) belongs on standard SYCL, not ESIMD.** ESIMD measured 1.9x SLOWER on Arc B580 + oneAPI 2025.3 (block granularity too small to amortize LSC loads). The real dequant lever is structural — fuse dequant into the matmul. Opt-in retest hatch: `GGML_SYCL_ESIMD_DEQUANT=1`.
@@ -288,16 +288,16 @@ correctness. Full rationale and sources: `docs/backend/gpt-oss-testing.md`.
 
 The system `libze_intel_gpu.so.1` is a patched 26.22/BMG-only build (from
 `/Apps/compute-runtime-26.22-llama`, branch `llama/26.22-cross-device`) carrying
-the wedged-i915 discovery fix, cross-device in-order dependency fixes, and the
+the hung-i915 discovery fix, cross-device in-order dependency fixes, and the
 PR 930 USM compression fix. Stock `1.14.37020` is preserved alongside for
-rollback. Reverting to stock without restoring the old allocation probe can
+rollback. Reverting to stock without restoring the old allocation check can
 reintroduce silent oversized-allocation hangs (the m09zb `event.wait()` hang).
 
 **Durable rule — B580↔B50 have no direct P2P.** Direct device-to-device USM copy
 fails (`OUT_OF_DEVICE_MEMORY`) and importing a B580 allocation on the B50 returns
 `INVALID_ARGUMENT`; the kernel refuses P2PDMA because the cards share no upstream
 bridge. This is a PCI topology restriction, not a selector bug. Keep direct
-peer-copy / shared-context paths disabled unless a runtime probe proves them safe
+peer-copy / shared-context paths disabled unless a runtime check confirms them safe
 on the live hardware; host-bounce (`level_zero:0,1`) validation may continue.
 
 Install history, rollback commands, and loader-path notes:
@@ -325,13 +325,13 @@ Rules:
 - `common_params_parse()` must keep `--help`, `--version`, cache-list, and
   completion generation metadata-only even with `LLAMA_ARG_*` GPU env vars set;
   verify with `test-arg-parser` after parser changes.
-- **Wedge hazards (unrecoverable D-state):** `sycl-ls` is not a safe B50 health
-  probe (has wedged this host in `xe_drm_ioctl` after a reset/oops). Do not run
+- **Hang hazards (unrecoverable D-state):** `sycl-ls` is not a safe B50 health
+  check (has hung this host in `xe_drm_ioctl` after a reset/oops). Do not run
   old comparison binaries (e.g. the `60a8c042` build) with `--help`/`--version`/
   `lsof /dev/dri/*` on the discrete render nodes — SYCL init alone left a process
-  stuck in `xe_vm_destroy_ioctl` that FLR/GT-reset could not clear. Use the
+  stuck in `xe_vm_destroy_ioctl` that FLR/GT reset could not clear. Use the
   canonical gated inference command for cross-build comparisons after a fresh
-  reboot, and avoid DRM fdinfo probes while a SYCL process is wedged.
+  reboot, and avoid DRM fdinfo checks while a SYCL process is hung.
 
 Current-boot B580/B50 P2P topology warnings are diagnostic only. Frigate
 QSV/OpenVINO jobs on the iGPU render node are not B580/B50 consumers.
@@ -361,7 +361,7 @@ Mistral 7B Q4_0:
 
 Do not use `GGML_SYCL_FA_ONEDNN_ALLOW=1` to restore Mistral PP numbers. It can
 raise PP throughput, but the deterministic completion gate produces incorrect
-output with the current nc!=D contiguity bypass.
+output with the current nc!=D contiguity fast-path.
 
 GPT-OSS 20B MXFP4:
 
@@ -395,10 +395,10 @@ codescout task tracker — see `llama.cpp-p92r`.
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `GGML_SYCL_UNIFIED_SOA=0` | ON | Disable SOA memory layout (AOS fallback, ~4x slower TG) |
-| `GGML_SYCL_TG_FAST=0` | ON | Disable MMVQ fast-path bypass (slower TG) |
+| `GGML_SYCL_TG_FAST=0` | ON | Disable MMVQ fast-path (slower TG) |
 | `GGML_SYCL_DISABLE_GRAPH=1` | OFF | Disable SYCL graph replay (minimal TG impact ~3%, mainly helps PP) |
 | `GGML_SYCL_ONEDNN_PP=0` | ON | Disable oneDNN for prompt processing |
-| `GGML_SYCL_UNIFIED_FORCE_LEGACY=1` | OFF | Force legacy kernel dispatch (bypass unified kernel) |
+| `GGML_SYCL_UNIFIED_FORCE_LEGACY=1` | OFF | Force legacy kernel dispatch (skip unified kernel) |
 
 **Experimental (opt-in, off by default)**:
 | Variable | Default | Effect |
@@ -473,8 +473,8 @@ GGML_SYCL_PERSISTENT_TG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
 | `GGML_SYCL_NAN_CHECK=1` | Enable NaN detection in outputs |
 | `GGML_SYCL_VALIDATE=1` | Enable A/B validation between kernel paths |
 | `GGML_SYCL_GRAPH_RERECORD=1` | Use graph re-record instead of replay (very slow, diagnostic only) |
-| `GGML_SYCL_OP_TIMEOUT_MS=<N>` | Abort with diagnostic if no inference progress for N ms (default 30000, set to 0 to disable). Fires before the xe driver's 10s GT-reset cascade. Effective detection latency is `timeout + ~500 ms`. |
-| `GGML_SYCL_SAFE_MODE=1` | Drain the SYCL queue after every op submit so a fault surfaces at the op that caused it (2-3x slowdown, implies `GGML_SYCL_DISABLE_GRAPH=1`). Useful for CI canaries and correlating intermittent wedges 1:1 with their triggering op. |
+| `GGML_SYCL_OP_TIMEOUT_MS=<N>` | Abort with diagnostic if no inference progress for N ms (default 30000, set to 0 to disable). Fires before the xe driver's 10s GT reset cascade. Effective detection latency is `timeout + ~500 ms`. |
+| `GGML_SYCL_SAFE_MODE=1` | Drain the SYCL queue after every op submit so a fault surfaces at the op that caused it (2-3x slowdown, implies `GGML_SYCL_DISABLE_GRAPH=1`). Useful for CI canaries and correlating intermittent hangs 1:1 with their triggering op. |
 
 **Note**: There are 100+ additional debug/tuning env vars (GGML_SYCL_*). Search with `grep -r 'getenv("GGML_SYCL' ggml/src/ggml-sycl/` to find them all.
 
@@ -484,7 +484,7 @@ GGML_SYCL_PERSISTENT_TG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
 1. Format code: `git clang-format` (preferred) or `clang-format-19 -i <files>`
 2. Build: `./scripts/sycl-build.sh`
 3. Test: `ctest --test-dir build --output-on-failure`
-4. For ggml changes: Run `test-backend-ops` on multiple backends — **manually only, never in a subagent/background task (OOM hazard, see Hard-Won Rules)**
+4. For ggml changes: Run `test-backend-ops` on multiple backends — **manually only, never in a subagent/background task (memory-exhaustion hazard, see Hard-Won Rules)**
 5. Verify correctness: run the canonical completion gate (Hard-Won Rules) — tokens must be right, not just fast
 6. Verify performance: `llama-bench` and `llama-perplexity` should not regress
 

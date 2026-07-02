@@ -10,7 +10,7 @@ and the B580↔B50 P2P restriction) live in `CLAUDE.md` ("Patched compute-runtim
 The system `libze_intel_gpu.so.1` is the patched 26.22/BMG-only build installed
 at `/usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1.15.38646` from
 `/Apps/compute-runtime-26.22-llama` branch `llama/26.22-cross-device`. The build
-is based on `upstream/releases/26.22` and carries the local wedged-i915 discovery
+is based on `upstream/releases/26.22` and carries the local hung-i915 discovery
 fix, the cross-device in-order dependency fixes, and the upstream PR 930 USM
 compression fix. It was configured with `SUPPORT_GEN_DEFAULT=FALSE`,
 `SUPPORT_PLATFORM_DEFAULT=FALSE`, and `SUPPORT_BMG=TRUE` because the installed
@@ -27,9 +27,9 @@ sudo ldconfig
 ```
 
 The patched runtime fixes the m09zb `event.wait()` post-init hang during
-alloc-probe and cleanly enforces per-allocation hardware caps. Reverting to stock
-without restoring the old allocation probe can reintroduce silent oversized
-allocation hangs.
+allocation checking and cleanly enforces per-allocation hardware caps. Reverting
+to stock without restoring the old allocation check can reintroduce silent
+oversized allocation hangs.
 
 ## Level Zero loader path (2026-06-15)
 
@@ -47,7 +47,7 @@ processes resolve `libze_loader.so.1.27.0` ahead of the packaged
 `sycl-ls` historically reported B580 and B50 Level Zero devices on driver
 `1.15.38646`, and `ONEAPI_DEVICE_SELECTOR=level_zero:0,1` could run a full
 GPT-OSS bench through llama.cpp's isolated/host-bounce path. Do not use `sycl-ls`
-for B50 probing now (see the B50 safety note in `CLAUDE.md`). Raw SYCL and Level
+for checking B50 now (see the B50 safety note in `CLAUDE.md`). Raw SYCL and Level
 Zero direct device-to-device USM copy between B580 and B50 still fails
 (`UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` / `ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY`),
 and importing a B580 device allocation on the B50 returns
@@ -59,5 +59,5 @@ xe 0000:03:00.0: cannot be used for peer-to-peer DMA as the client and provider 
 
 This is a PCI P2PDMA/topology restriction, not just a compute-runtime selector
 bug. Do not enable direct peer-copy or shared-context transfer paths by default
-unless a runtime probe proves they are safe on the active hardware, kernel, and
+unless a runtime check confirms they are safe on the active hardware, kernel, and
 driver.
