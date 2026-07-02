@@ -204,7 +204,12 @@ Next safe route should target launch/kernel count or a genuinely faster gate/up 
 
 `GGML_SYCL_MOE_GATEUP_BUNDLE4=1` was implemented as a default-off runtime hook for the optimized MXFP4 gate/up bundle4 physical layout. The implementation keeps a separate `GGML_LAYOUT_XMX_TILED_BUNDLE4` layout/cache identity, limits support to MXFP4 MoE gate/up tensors, demotes PP to SOA, and fails closed on invalid materialization or pointer-table leases.
 
-Evidence directory: `/tmp/sycl_mxfp4_bundle4_runtime_20260702_010118`.
+Evidence directories:
+
+- Initial correctness/route proof: `/tmp/sycl_mxfp4_bundle4_runtime_20260702_010118`
+- Corrected `-fa 1` A/B: `/tmp/sycl_mxfp4_bundle4_corrected_ab_20260702_081250`
+
+Note: an earlier A/B was run without `-fa 1` and produced an invalid low baseline (`pp512 ~1140`, `tg128 ~27`). The historical B50 GPT-OSS baseline is FA-on, so the valid comparison below uses `-fa 1`.
 
 Source/review gates:
 
@@ -225,16 +230,18 @@ Correctness and route proof:
   - `reason=pair-glu-device-ids layout=xmx_tiled_bundle4 entries=4`
 - The same trace showed unified-cache pressure/drops and later layers falling back to SOA, so the route cannot persist across the full 24-layer GPT-OSS B50 decode with this duplicate gate/up layout strategy.
 
-Actual B50 `llama-bench -p 512 -n 128 -ngl 99` A/B:
+Actual B50 `llama-bench -p 512 -n 128 -ngl 99 -fa 1` A/B with the documented safe baseline env (`GGML_SYCL_MOE_PHASE_MATERIALIZE=1 GGML_SYCL_MOE_PHASE_BULK_XMX=1 GGML_SYCL_MOE_DOWN_SUM_DIRECT=1`):
 
 ```text
 Baseline:
-pp512 1139.20 ± 9.16 tok/s
-tg128   22.09 ± 0.09 tok/s
+pp512 1230.26 ± 8.44 tok/s
+tg128   36.97 ± 0.08 tok/s
 
 GGML_SYCL_MOE_GATEUP_BUNDLE4=1:
-pp512 1131.63 ± 6.91 tok/s
-tg128   10.45 ± 4.07 tok/s
+pp512 1222.62 ± 7.71 tok/s
+tg128   12.11 ± 4.93 tok/s
 ```
 
-Decision: reject for performance. The hook remains default-off/experimental only and must not be promoted. Although the route is count-correct and can exercise bundle4 for early decode layers, duplicate bundle4 gate/up materialization creates enough VRAM pressure to trigger repeated drops and regresses TG128 far below both baseline and the `>=45 tok/s` target. A viable follow-up would need a different residency or streaming design rather than another persistent duplicate gate/up layout.
+Cross-check: rebuilding the documented baseline commit `b08e732cd` and rerunning the same `-fa 1` safe-env command produced `pp512 1229.55 ± 9.09` and `tg128 37.09 ± 0.11`, confirming the baseline is intact and the earlier low baseline was a command mismatch.
+
+Decision: reject for performance. The hook remains default-off/experimental only and must not be promoted. Although the route is count-correct and can exercise bundle4 for early decode layers, duplicate bundle4 gate/up materialization creates enough VRAM pressure to trigger repeated drops and regresses TG128 far below both the FA-on baseline and the `>=45 tok/s` target. A viable follow-up would need a different residency or streaming design rather than another persistent duplicate gate/up layout.
