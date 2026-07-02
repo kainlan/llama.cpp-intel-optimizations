@@ -22,6 +22,7 @@
 #include "kv-cache-quant.hpp"
 #include "l144i-probe.hpp"
 #include "mem-ops.hpp"
+#include "sycl-kernel-profiler.hpp"
 #include "sycl-profiling.hpp"
 
 #include <atomic>
@@ -260,7 +261,16 @@ static sycl::event ggml_sycl_fattn_xmx_submit_set_rows_update(const ggml_tensor 
 
     const bool add_set_rows_dep = ggml_sycl_should_add_dependency(set_rows_event);
 
-    return stream->submit([&](sycl::handler & cgh) {
+    ggml_sycl_profile_label profile_label{};
+    profile_label.name       = "fattn.xmx_pack_k_set_rows";
+    profile_label.category   = "fattn";
+    profile_label.queue_kind = "compute";
+    profile_label.metadata   = "role=packed_k_set_rows";
+    profile_label.device     = ggml_sycl_get_device_id_from_queue(*stream);
+    profile_label.bytes      = static_cast<size_t>(total_elements) * sizeof(float);
+
+    return ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
         if (add_set_rows_dep) {
             cgh.depends_on(set_rows_event);
         }
@@ -320,6 +330,7 @@ static sycl::event ggml_sycl_fattn_xmx_submit_set_rows_update(const ggml_tensor 
                     packed_ptr[block_base_half + elem_off_half] = sycl::half(src_val);
                 }
             });
+        });
     });
 }
 
@@ -1553,7 +1564,15 @@ bool ggml_sycl_fattn_xmx_materialize_packed_k(const fattn_params &              
             zero_deps.push_back(previous_use);
         }
         zero_event = ggml_sycl::mem_fill_async(out->handle, 0, desc.total_packed_bytes, *stream, zero_deps);
-        pack_event = stream->submit([&](sycl::handler & cgh) {
+        ggml_sycl_profile_label profile_label{};
+        profile_label.name       = "fattn.pack";
+        profile_label.category   = "fattn";
+        profile_label.queue_kind = "compute";
+        profile_label.metadata   = "role=pack";
+        profile_label.device     = ggml_sycl_get_device_id_from_queue(*stream);
+        profile_label.bytes      = 0;
+        pack_event = ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+            return profiled_queue.submit([&](sycl::handler & cgh) {
             cgh.depends_on(zero_event);
             cgh.parallel_for<fattn_xmx_pack_k_materializer_kernel>(sycl::range<1>(total_work), [=](sycl::id<1> item) {
                 const size_t linear   = item[0];
@@ -1582,6 +1601,7 @@ bool ggml_sycl_fattn_xmx_materialize_packed_k(const fattn_params &              
                 const size_t block_base_half = block_base_bytes / sizeof(sycl::half);
                 const size_t elem_off_half   = ggml_sycl_fattn_xmx_packed_k_element_offset_half(kv_local, d);
                 packed_ptr[block_base_half + elem_off_half] = k_val;
+            });
             });
         });
     } catch (const sycl::exception & e) {
