@@ -10,11 +10,15 @@
 
 **Test Infrastructure:** Python source tests live under `tests/` and run with `python3 -m pytest`. C++ tests are registered in `tests/CMakeLists.txt` with `llama_build` / `llama_test` and run through `ctest --test-dir build -R test-sycl-kernel-profiler`. Existing SYCL queues already request `sycl::property::queue::enable_profiling{}` in `ggml/src/ggml-sycl/common.hpp:5919`, so event timestamp reads are available on normal backend queues.
 
+**Working checkout:** All implementation happens in the git worktree `/Apps/llama.cpp-mxfp4-tg-runtime` on branch `feature/sycl-mxfp4-tg-runtime` (a worktree of `/Apps/llama.cpp`). Every `file:line` reference in this plan resolves against this checkout as of commit `06cc42ee3`. Do not implement in the main `/Apps/llama.cpp` checkout — its files differ and the cited line numbers do not apply there.
+
+**Line-reference policy:** Line numbers are hints valid at planning time, not ground truth. Locate every edit site by the named symbol (codescout `find_symbol` / `read_symbol`), since tasks landing earlier can shift line numbers in shared files.
+
 ---
 
 ## Team Topology
 
-**Recommended implementers:** 4
+**Recommended implementers:** 3 (maximum parallel width is Tasks 3/4/5; Tasks 1→2 and 6→E2E are sequential)
 **Reviewers:** spec + quality reviewers spawned fresh per task in team-driven-development.
 
 ### Parallel Tracks
@@ -27,7 +31,7 @@
 | D | 5 | FlashAttention submit integration |
 | E | 6 | Output parser/docs and final validation harness polish |
 
-Tasks 3, 4, and 5 depend on Task 2 because they use the wrapper API. Task 6 depends on Task 1 for the output contract and on Tasks 3-5 for integration evidence.
+Tasks 3, 4, and 5 depend on Task 2 because they use the wrapper API. They run in parallel and therefore own strictly disjoint files: each writes its own per-task source-test file (`tests/test-sycl-kernel-profiler-source-{copy,mmvq,fattn}.py`) instead of appending to a shared one, and `mmvq.cpp` is owned by Task 4 alone (including its copy helper). Task 6 depends on Task 1 for the output contract and on Tasks 3-5 for integration evidence.
 
 ### Dependency Graph
 
@@ -61,12 +65,15 @@ digraph sycl_kernel_profiler_plan {
 | `ggml/src/ggml-sycl/sycl-kernel-profiler.hpp` | 1, 2 | Sequential: Task 2 depends on Task 1 |
 | `ggml/src/ggml-sycl/sycl-kernel-profiler.cpp` | 1, 2 | Sequential: Task 2 depends on Task 1 |
 | `tests/test-sycl-kernel-profiler.cpp` | 1, 2 | Sequential: Task 2 appends wrapper tests |
-| `tests/test-sycl-kernel-profiler-source.py` | 2, 3, 4, 5 | Sequential append-only assertions; later tasks depend on Task 2 |
+| `tests/test-sycl-kernel-profiler-source.py` | 2, 6 | Sequential: Task 2 creates; Task 6 appends docs assertions after Tasks 3-5 close |
+| `tests/test-sycl-kernel-profiler-source-copy.py` | 3 | New file (per-task; copies the preamble from Task 2's file) |
+| `tests/test-sycl-kernel-profiler-source-mmvq.py` | 4 | New file (per-task; copies the preamble from Task 2's file) |
+| `tests/test-sycl-kernel-profiler-source-fattn.py` | 5 | New file (per-task; copies the preamble from Task 2's file) |
 | `tests/CMakeLists.txt` | 1 | Low: one test registration block |
 | `ggml/src/ggml-sycl/common.hpp` | 3 | Medium: central copy helper at `common.hpp:194` |
 | `ggml/src/ggml-sycl/ggml-sycl.cpp` | 3 | Medium: backend teardown at `ggml-sycl.cpp:72094` |
 | `tools/sycl-kernel-bench/main.cpp` | 3 | Low: final flush before `main.cpp:1121` return |
-| `ggml/src/ggml-sycl/mmvq.cpp` | 4 | High: hot path; isolated to wrappers around existing submit sites |
+| `ggml/src/ggml-sycl/mmvq.cpp` | 4 | High: hot path; single-owner (Task 4), including the `mmvq_submit_memcpy_with_deps` copy helper |
 | `ggml/src/ggml-sycl/fattn.cpp` | 5 | Medium: wrapper around existing FA submit sites |
 | `scripts/parse-sycl-kernel-profile.py` | 6 | New file |
 | `tests/test-sycl-kernel-profile-parser.py` | 6 | New file |
@@ -312,7 +319,7 @@ git commit -m "feat(sycl): add named kernel profile aggregation core"
 - Modify: `tests/test-sycl-kernel-profiler.cpp`
 - Create: `tests/test-sycl-kernel-profiler-source.py`
 
-**Description:** Add the central queue wrapper layer selected in design. The wrapper must return the same `sycl::event` as the raw submit path and must not alter dependency behavior. This task proves disabled/default path source shape and enabled recording with synthetic test helpers.
+**Description:** Add the central queue wrapper layer selected in design. The wrapper must return the same `sycl::event` as the raw submit path and must not alter dependency behavior. This task proves disabled/default path source shape and enabled recording with synthetic test helpers. The `tests/test-sycl-kernel-profiler-source.py` file created here is also the preamble template for Tasks 3-5: each of those tasks creates its own `tests/test-sycl-kernel-profiler-source-{copy,mmvq,fattn}.py` and copies the path-constant/`slice_between` preamble verbatim (the dashed filename cannot be imported as a Python module).
 
 **Acceptance Criteria:**
 - [ ] Header exposes `ggml_sycl_profile_submit` template.
@@ -485,25 +492,38 @@ git commit -m "feat(sycl): add profiler-aware submit wrapper"
 
 **File scope:**
 - Modify: `ggml/src/ggml-sycl/common.hpp:194-218`
-- Modify: `ggml/src/ggml-sycl/mmvq.cpp:1646-1664`
 - Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp:72094-72248`
 - Modify: `tools/sycl-kernel-bench/main.cpp:1118-1121`
-- Modify: `tests/test-sycl-kernel-profiler-source.py`
+- Create: `tests/test-sycl-kernel-profiler-source-copy.py`
 
-**Description:** Route existing central copy helpers and final flush points through the profiler. `ggml_sycl_graph_safe_memcpy()` is already the canonical copy helper in `common.hpp:194`; this task records memcopies there without changing graph recording behavior. Backend free and `sycl-kernel-bench` main get explicit profiler flushes, avoiding `atexit`.
+**Description:** Route existing central copy helpers and final flush points through the profiler. `ggml_sycl_graph_safe_memcpy()` is already the canonical copy helper in `common.hpp:194`; this task records memcopies there without changing graph recording behavior. Backend free and `sycl-kernel-bench` main get explicit profiler flushes, avoiding `atexit`. (The MMVQ-local copy helper `mmvq_submit_memcpy_with_deps` is wrapped by Task 4, which solely owns `mmvq.cpp`.)
 
 **Acceptance Criteria:**
 - [ ] `ggml_sycl_graph_safe_memcpy()` includes `sycl-kernel-profiler.hpp` and records `sycl.memcpy.graph_safe` events.
 - [ ] Graph-recording copy kernels keep returning `sycl::event{}` as before.
-- [ ] `mmvq_submit_memcpy_with_deps()` records `sycl.memcpy.mmvq_with_deps`.
 - [ ] `ggml_backend_sycl_free()` calls `ggml_sycl_kernel_profile_flush(true, "backend-free")` before `delete sycl_ctx`.
 - [ ] `tools/sycl-kernel-bench/main.cpp` calls `ggml_sycl_kernel_profile_flush(true, "sycl-kernel-bench")` before returning success.
 
 #### RED: Write These Failing Tests
 
-Append to `tests/test-sycl-kernel-profiler-source.py`:
+Create `tests/test-sycl-kernel-profiler-source-copy.py`. Copy the preamble (path constants and `slice_between`) verbatim from `tests/test-sycl-kernel-profiler-source.py` — the dashed filename cannot be imported as a module — then add the tests:
 
 ```python
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import pathlib
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+CPP = ROOT / "ggml" / "src" / "ggml-sycl" / "sycl-kernel-profiler.cpp"
+COMMON = ROOT / "ggml" / "src" / "ggml-sycl" / "common.hpp"
+
+
+def slice_between(text: str, start: str, end: str) -> str:
+    begin = text.index(start)
+    finish = text.index(end, begin + len(start))
+    return text[begin:finish]
+
 
 def test_graph_safe_memcpy_is_profiled_without_changing_graph_return_contract() -> None:
     common = COMMON.read_text(encoding="utf-8")
@@ -512,14 +532,6 @@ def test_graph_safe_memcpy_is_profiled_without_changing_graph_return_contract() 
     assert "sycl.memcpy.graph_safe" in body
     assert "ggml_sycl_profile_record_returned_event" in body
     assert "return sycl::event{};" in body
-    assert "ggml_sycl::mem_copy_async" in body
-
-
-def test_mmvq_copy_helper_records_named_copy_event() -> None:
-    mmvq = MMVQ.read_text(encoding="utf-8")
-    body = slice_between(mmvq, "static sycl::event mmvq_submit_memcpy_with_deps", "static void mmvq_memcpy_sync")
-    assert "sycl.memcpy.mmvq_with_deps" in body
-    assert "ggml_sycl_profile_record_returned_event" in body
     assert "ggml_sycl::mem_copy_async" in body
 
 
@@ -537,7 +549,7 @@ def test_profile_flush_points_are_explicit_not_atexit() -> None:
 **Verify RED:**
 
 ```bash
-python3 -m pytest tests/test-sycl-kernel-profiler-source.py -q
+python3 -m pytest tests/test-sycl-kernel-profiler-source-copy.py -q
 ```
 
 Expected RED result: new assertions fail because copy helpers and flush points are not wired.
@@ -588,19 +600,6 @@ sycl::event tail_event = q.parallel_for(sycl::range<1>(tail), [=](sycl::id<1> i)
 ggml_sycl_profile_record_returned_event(profile_label, tail_event);
 ```
 
-In `mmvq.cpp:1646-1664`, wrap the `mem_copy_async` return:
-
-```cpp
-ggml_sycl_profile_label label{};
-label.name       = "sycl.memcpy.mmvq_with_deps";
-label.category   = "memory";
-label.queue_kind = "compute";
-label.metadata   = deps.empty() ? "deps=0" : "deps=1";
-label.device     = queue_device;
-label.bytes      = bytes;
-return ggml_sycl_profile_record_returned_event(label, ggml_sycl::mem_copy_async(dst_handle, src_handle, bytes, queue, deps));
-```
-
 In `ggml-sycl.cpp`, include `sycl-kernel-profiler.hpp` if not already visible, then insert before `delete sycl_ctx;` in `ggml_backend_sycl_free()`:
 
 ```cpp
@@ -624,7 +623,7 @@ return 0;
 **Verify GREEN:**
 
 ```bash
-python3 -m pytest tests/test-sycl-kernel-profiler-source.py -q
+python3 -m pytest tests/test-sycl-kernel-profiler-source-copy.py -q
 ./scripts/sycl-build.sh sycl-kernel-bench test-sycl-kernel-profiler
 ctest --test-dir build -R test-sycl-kernel-profiler -V
 ```
@@ -646,7 +645,7 @@ If `common.hpp` include ordering causes circular includes, move only the small l
 #### Commit
 
 ```bash
-git add ggml/src/ggml-sycl/common.hpp ggml/src/ggml-sycl/mmvq.cpp ggml/src/ggml-sycl/ggml-sycl.cpp tools/sycl-kernel-bench/main.cpp tests/test-sycl-kernel-profiler-source.py
+git add ggml/src/ggml-sycl/common.hpp ggml/src/ggml-sycl/ggml-sycl.cpp tools/sycl-kernel-bench/main.cpp tests/test-sycl-kernel-profiler-source-copy.py
 git commit -m "feat(sycl): profile central copy paths and flush points"
 ```
 
@@ -661,22 +660,38 @@ git commit -m "feat(sycl): profile central copy paths and flush points"
 - Modify: `ggml/src/ggml-sycl/mmvq.cpp:9470-11990` for MXFP4 gate/up/down submit helpers
 - Modify: `ggml/src/ggml-sycl/mmvq.cpp:6580-6756` for SOA batched submit helpers
 - Modify: `ggml/src/ggml-sycl/mmvq.cpp:18075-18333` for active packed-Q8 runtime profiling context
-- Modify: `tests/test-sycl-kernel-profiler-source.py`
+- Modify: `ggml/src/ggml-sycl/mmvq.cpp:1646-1664` for the MMVQ copy helper `mmvq_submit_memcpy_with_deps` (owned here, not by Task 3, so `mmvq.cpp` has a single owner)
+- Create: `tests/test-sycl-kernel-profiler-source-mmvq.py`
 
-**Description:** Move the active MMVQ/MXFP4 hot submits through the central wrapper with stable labels. This is the primary answer to “which exact kernel name consumed time” for current MXFP4 TG work. Do not alter kernel bodies, launch shapes, dependency edges, or route selection.
+**Description:** Move the active MMVQ/MXFP4 hot submits through the central wrapper with stable labels, and record the MMVQ-local copy helper as a named copy event. This is the primary answer to “which exact kernel name consumed time” for current MXFP4 TG work. Do not alter kernel bodies, launch shapes, dependency edges, or route selection.
 
 **Acceptance Criteria:**
 - [ ] Active packed-Q8 M2 gate/up path labels include `mxfp4.gateup.xmx_tiled_dpas_m2` and metadata `path=packed-q8-m2`.
 - [ ] M4/bundle4/default-off variants get distinct labels so rejected experiments can be measured if enabled.
 - [ ] Down direct-final variants get distinct labels under category `mmvq`.
 - [ ] SOA pair GLU and SOA batched helpers use labels under category `mmvq`.
+- [ ] `mmvq_submit_memcpy_with_deps()` records `sycl.memcpy.mmvq_with_deps` under category `memory`.
 - [ ] Existing `mmvq_moe_tg_profile_record()` route-level logging remains intact.
 
 #### RED: Write These Failing Tests
 
-Append to `tests/test-sycl-kernel-profiler-source.py`:
+Create `tests/test-sycl-kernel-profiler-source-mmvq.py`. Copy the preamble (path constants and `slice_between`) verbatim from `tests/test-sycl-kernel-profiler-source.py` — the dashed filename cannot be imported as a module — then add the tests:
 
 ```python
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import pathlib
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+MMVQ = ROOT / "ggml" / "src" / "ggml-sycl" / "mmvq.cpp"
+
+
+def slice_between(text: str, start: str, end: str) -> str:
+    begin = text.index(start)
+    finish = text.index(end, begin + len(start))
+    return text[begin:finish]
+
 
 def test_mmvq_mxfp4_hot_submits_have_named_profile_labels() -> None:
     mmvq = MMVQ.read_text(encoding="utf-8")
@@ -708,12 +723,20 @@ def test_active_packed_q8_m2_metadata_preserves_route_context() -> None:
     assert "total_batches=" in body
     assert "ggml_sycl_profile_submit(queue" in body
     assert "h.depends_on(pack_event)" in body
+
+
+def test_mmvq_copy_helper_records_named_copy_event() -> None:
+    mmvq = MMVQ.read_text(encoding="utf-8")
+    body = slice_between(mmvq, "static sycl::event mmvq_submit_memcpy_with_deps", "static void mmvq_memcpy_sync")
+    assert "sycl.memcpy.mmvq_with_deps" in body
+    assert "ggml_sycl_profile_record_returned_event" in body
+    assert "ggml_sycl::mem_copy_async" in body
 ```
 
 **Verify RED:**
 
 ```bash
-python3 -m pytest tests/test-sycl-kernel-profiler-source.py -q
+python3 -m pytest tests/test-sycl-kernel-profiler-source-mmvq.py -q
 ```
 
 Expected RED result: assertions fail because MMVQ labels and wrappers are absent.
@@ -770,10 +793,23 @@ Use the same wrapper pattern without altering lambda bodies for these functions 
 
 For dynamic shape metadata, keep the first implementation stable and low-risk by encoding static route/path metadata only. Do not allocate `std::string` per submit in the hot path for dynamic tile counts. A later task can add a fixed small stack formatter if needed.
 
+In `mmvq_submit_memcpy_with_deps()` (locate by symbol; near `mmvq.cpp:1646`), wrap the `mem_copy_async` return:
+
+```cpp
+ggml_sycl_profile_label label{};
+label.name       = "sycl.memcpy.mmvq_with_deps";
+label.category   = "memory";
+label.queue_kind = "compute";
+label.metadata   = deps.empty() ? "deps=0" : "deps=1";
+label.device     = queue_device;
+label.bytes      = bytes;
+return ggml_sycl_profile_record_returned_event(label, ggml_sycl::mem_copy_async(dst_handle, src_handle, bytes, queue, deps));
+```
+
 **Verify GREEN:**
 
 ```bash
-python3 -m pytest tests/test-sycl-kernel-profiler-source.py -q
+python3 -m pytest tests/test-sycl-kernel-profiler-source-mmvq.py -q
 ./scripts/sycl-build.sh sycl-kernel-bench test-sycl-kernel-profiler
 ```
 
@@ -809,7 +845,7 @@ Use it only to construct labels; do not hide `ggml_sycl_profile_submit` calls be
 #### Commit
 
 ```bash
-git add ggml/src/ggml-sycl/mmvq.cpp tests/test-sycl-kernel-profiler-source.py
+git add ggml/src/ggml-sycl/mmvq.cpp tests/test-sycl-kernel-profiler-source-mmvq.py
 git commit -m "feat(sycl): profile named MMVQ and MXFP4 submits"
 ```
 
@@ -823,7 +859,7 @@ git commit -m "feat(sycl): profile named MMVQ and MXFP4 submits"
 **File scope:**
 - Modify: `ggml/src/ggml-sycl/fattn.cpp:220-324`
 - Modify: `ggml/src/ggml-sycl/fattn.cpp:1556`
-- Modify: `tests/test-sycl-kernel-profiler-source.py`
+- Create: `tests/test-sycl-kernel-profiler-source-fattn.py`
 
 **Description:** Route major FlashAttention submit helpers through the central wrapper so profile reports can distinguish MoE/MMVQ time from attention and packed-K maintenance work. This keeps the profiler backend-wide instead of MXFP4-only.
 
@@ -835,9 +871,23 @@ git commit -m "feat(sycl): profile named MMVQ and MXFP4 submits"
 
 #### RED: Write These Failing Tests
 
-Append to `tests/test-sycl-kernel-profiler-source.py`:
+Create `tests/test-sycl-kernel-profiler-source-fattn.py`. Copy the preamble (path constants and `slice_between`) verbatim from `tests/test-sycl-kernel-profiler-source.py` — the dashed filename cannot be imported as a module — then add the test:
 
 ```python
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import pathlib
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+FATTN = ROOT / "ggml" / "src" / "ggml-sycl" / "fattn.cpp"
+
+
+def slice_between(text: str, start: str, end: str) -> str:
+    begin = text.index(start)
+    finish = text.index(end, begin + len(start))
+    return text[begin:finish]
+
 
 def test_fattn_major_submits_have_named_profile_labels() -> None:
     fattn = FATTN.read_text(encoding="utf-8")
@@ -857,7 +907,7 @@ def test_fattn_major_submits_have_named_profile_labels() -> None:
 **Verify RED:**
 
 ```bash
-python3 -m pytest tests/test-sycl-kernel-profiler-source.py -q
+python3 -m pytest tests/test-sycl-kernel-profiler-source-fattn.py -q
 ```
 
 Expected RED result: FA labels/wrappers are absent.
@@ -911,7 +961,7 @@ and close with `});` after the existing submit lambda.
 **Verify GREEN:**
 
 ```bash
-python3 -m pytest tests/test-sycl-kernel-profiler-source.py -q
+python3 -m pytest tests/test-sycl-kernel-profiler-source-fattn.py -q
 ./scripts/sycl-build.sh sycl-kernel-bench test-sycl-kernel-profiler
 ```
 
@@ -932,7 +982,7 @@ Do not wrap every FA helper in this first pass. Only the two named submit region
 #### Commit
 
 ```bash
-git add ggml/src/ggml-sycl/fattn.cpp tests/test-sycl-kernel-profiler-source.py
+git add ggml/src/ggml-sycl/fattn.cpp tests/test-sycl-kernel-profiler-source-fattn.py
 git commit -m "feat(sycl): profile named FlashAttention submits"
 ```
 
@@ -1196,10 +1246,10 @@ python3 scripts/parse-sycl-kernel-profile.py \
 **Verify GREEN:**
 
 ```bash
-python3 -m pytest tests/test-sycl-kernel-profile-parser.py tests/test-sycl-kernel-profiler-source.py -q
+python3 -m pytest tests/test-sycl-kernel-profile*.py -q
 ```
 
-Expected: tests pass.
+Expected: tests pass (the glob covers the parser tests plus every per-task source-test file from Tasks 2-5).
 
 #### REFACTOR
 
@@ -1234,7 +1284,7 @@ git commit -m "docs(sycl): document named kernel profile artifacts"
 cd /Apps/llama.cpp-mxfp4-tg-runtime
 set +u; source /opt/intel/oneapi/setvars.sh --force; set -u
 ./scripts/sycl-build.sh sycl-kernel-bench test-sycl-kernel-profiler
-python3 -m pytest tests/test-sycl-kernel-profiler-source.py tests/test-sycl-kernel-profile-parser.py -q
+python3 -m pytest tests/test-sycl-kernel-profile*.py -q
 ctest --test-dir build -R test-sycl-kernel-profiler -V
 OUT=/tmp/sycl_named_kernel_profile_$(date +%Y%m%d_%H%M%S)
 mkdir -p "$OUT"
@@ -1296,7 +1346,7 @@ The plan contains no task-level gaps requiring design decisions. The only future
 
 ### Internal consistency
 
-The dependency graph matches file ownership: shared profiler files are sequential through Tasks 1 and 2; later integration tasks depend on the wrapper. `tests/test-sycl-kernel-profiler-source.py` is intentionally append-only after Task 2.
+The dependency graph matches file ownership: shared profiler files are sequential through Tasks 1 and 2; later integration tasks depend on the wrapper. Parallel Tasks 3-5 own strictly disjoint files — each writes its own per-task source-test file, and `mmvq.cpp` (including its copy helper) belongs to Task 4 alone. `tests/test-sycl-kernel-profiler-source.py` is touched only by sequential Tasks 2 (create) and 6 (append docs assertions after Tasks 3-5 close).
 
 ### Scope check
 
