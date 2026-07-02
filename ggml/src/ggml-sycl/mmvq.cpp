@@ -9457,7 +9457,11 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_bundle4_dpas_m2_sycl(sycl::queue &  
                 const uint8_t * up_bundle0   = up_base + xmx_bundle_n0 * bundle_bytes;
                 const uint8_t * gate_bundle1 = gate_base + xmx_bundle_n1 * bundle_bytes;
                 const uint8_t * up_bundle1   = up_base + xmx_bundle_n1 * bundle_bytes;
-                const int8_t *  b_ptr        = b_packed + (group * k_tiles) * bn;
+                const int8_t * b_ptr = b_packed + (group * k_tiles) * bn;
+                const bool use_full_group_load =
+                    have_m1 && tile_n_total == 2 * Repeat && xmx_group_n0 == xmx_group_n1 &&
+                    xmx_bundle_n0 == xmx_bundle_n1 && xmx_group_in_bundle0 == xmx_group_in_bundle1 &&
+                    xmx_row_in_group0 == 0 && xmx_row_in_group1 == Repeat;
 
                 simd<float, Repeat> gate_acc0 = 0.0f;
                 simd<float, Repeat> up_acc0   = 0.0f;
@@ -9482,10 +9486,40 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_bundle4_dpas_m2_sycl(sycl::queue &  
                     simd<int8_t, an>    up_a_vec0;
                     simd<float, Repeat> gate_w_scale0;
                     simd<float, Repeat> up_w_scale0;
-                    mxfp4_xmx_tiled_bundle4_load_a_vec_from_bundle<Repeat>(
-                        gate_bundle0, xmx_group_in_bundle0, xmx_row_in_group0, gate_a_vec0, gate_w_scale0);
-                    mxfp4_xmx_tiled_bundle4_load_a_vec_from_bundle<Repeat>(up_bundle0, xmx_group_in_bundle0,
-                                                                           xmx_row_in_group0, up_a_vec0, up_w_scale0);
+                    simd<int8_t, an>    gate_a_vec1;
+                    simd<int8_t, an>    up_a_vec1;
+                    simd<float, Repeat> gate_w_scale1;
+                    simd<float, Repeat> up_w_scale1;
+
+                    if (use_full_group_load) {
+                        simd<int8_t, 2 * an>    gate_a_vec_full;
+                        simd<int8_t, 2 * an>    up_a_vec_full;
+                        simd<float, 2 * Repeat> gate_w_scale_full;
+                        simd<float, 2 * Repeat> up_w_scale_full;
+                        mxfp4_xmx_tiled_bundle4_load_a_full_group_from_bundle<Repeat>(
+                            gate_bundle0, xmx_group_in_bundle0, gate_a_vec_full, gate_w_scale_full);
+                        mxfp4_xmx_tiled_bundle4_load_a_full_group_from_bundle<Repeat>(
+                            up_bundle0, xmx_group_in_bundle0, up_a_vec_full, up_w_scale_full);
+                        gate_a_vec0   = gate_a_vec_full.template select<an, 1>(0);
+                        up_a_vec0     = up_a_vec_full.template select<an, 1>(0);
+                        gate_w_scale0 = gate_w_scale_full.template select<Repeat, 1>(0);
+                        up_w_scale0   = up_w_scale_full.template select<Repeat, 1>(0);
+                        gate_a_vec1   = gate_a_vec_full.template select<an, 1>(an);
+                        up_a_vec1     = up_a_vec_full.template select<an, 1>(an);
+                        gate_w_scale1 = gate_w_scale_full.template select<Repeat, 1>(Repeat);
+                        up_w_scale1   = up_w_scale_full.template select<Repeat, 1>(Repeat);
+                    } else {
+                        mxfp4_xmx_tiled_bundle4_load_a_vec_from_bundle<Repeat>(
+                            gate_bundle0, xmx_group_in_bundle0, xmx_row_in_group0, gate_a_vec0, gate_w_scale0);
+                        mxfp4_xmx_tiled_bundle4_load_a_vec_from_bundle<Repeat>(
+                            up_bundle0, xmx_group_in_bundle0, xmx_row_in_group0, up_a_vec0, up_w_scale0);
+                        if (have_m1) {
+                            mxfp4_xmx_tiled_bundle4_load_a_vec_from_bundle<Repeat>(
+                                gate_bundle1, xmx_group_in_bundle1, xmx_row_in_group1, gate_a_vec1, gate_w_scale1);
+                            mxfp4_xmx_tiled_bundle4_load_a_vec_from_bundle<Repeat>(
+                                up_bundle1, xmx_group_in_bundle1, xmx_row_in_group1, up_a_vec1, up_w_scale1);
+                        }
+                    }
 
                     simd<int, Repeat * exec_n> gate_part0 = 0;
                     simd<int, Repeat * exec_n> up_part0   = 0;
@@ -9502,15 +9536,6 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_bundle4_dpas_m2_sycl(sycl::queue &  
                     }
 
                     if (have_m1) {
-                        simd<int8_t, an>    gate_a_vec1;
-                        simd<int8_t, an>    up_a_vec1;
-                        simd<float, Repeat> gate_w_scale1;
-                        simd<float, Repeat> up_w_scale1;
-                        mxfp4_xmx_tiled_bundle4_load_a_vec_from_bundle<Repeat>(
-                            gate_bundle1, xmx_group_in_bundle1, xmx_row_in_group1, gate_a_vec1, gate_w_scale1);
-                        mxfp4_xmx_tiled_bundle4_load_a_vec_from_bundle<Repeat>(
-                            up_bundle1, xmx_group_in_bundle1, xmx_row_in_group1, up_a_vec1, up_w_scale1);
-
                         simd<int, Repeat * exec_n> gate_part1 = 0;
                         simd<int, Repeat * exec_n> up_part1   = 0;
                         gate_part1 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(gate_part1, b_vec, gate_a_vec1);
