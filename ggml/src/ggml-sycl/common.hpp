@@ -839,11 +839,13 @@ static inline mxfp4_grouped_dpas_decision ggml_sycl_select_mxfp4_grouped_dpas(co
     d.shape_eligible = true;
     d.n_tile_repeat  = grouped_rows >= 4 * caps.N ? 2 : 1;
     d.reason         = "layout-not-materialized";
-    if (layout == GGML_LAYOUT_MXFP4_DPAS || layout == GGML_LAYOUT_XMX_TILED || layout == GGML_LAYOUT_MXFP4_I8) {
+    if (layout == GGML_LAYOUT_MXFP4_DPAS || layout == GGML_LAYOUT_XMX_TILED ||
+        layout == GGML_LAYOUT_XMX_TILED_BUNDLE4 || layout == GGML_LAYOUT_MXFP4_I8) {
         d.layout_ready = true;
-        d.reason       = layout == GGML_LAYOUT_MXFP4_DPAS ? "layout-ready" :
-                         layout == GGML_LAYOUT_XMX_TILED  ? "layout-ready-xmx-tiled" :
-                                                            "layout-ready-i8";
+        d.reason       = layout == GGML_LAYOUT_MXFP4_DPAS            ? "layout-ready" :
+                         layout == GGML_LAYOUT_XMX_TILED            ? "layout-ready-xmx-tiled" :
+                         layout == GGML_LAYOUT_XMX_TILED_BUNDLE4    ? "layout-ready-xmx-tiled-bundle4" :
+                                                                       "layout-ready-i8";
     }
     return d;
 }
@@ -3339,6 +3341,7 @@ static inline reorder_mode get_effective_reorder_mode(const ggml_tensor_extra_gp
         case GGML_LAYOUT_MXFP4_I8:
         case GGML_LAYOUT_MXFP4_DPAS:
         case GGML_LAYOUT_XMX_TILED:
+        case GGML_LAYOUT_XMX_TILED_BUNDLE4:
         case GGML_LAYOUT_XMX_GEMM_TILED:
         case GGML_LAYOUT_ONEDNN_PACKED:
         case GGML_LAYOUT_ONEDNN_WOQ:
@@ -3357,7 +3360,8 @@ static inline bool ggml_sycl_layout_is_coalesced(const ggml_tensor_extra_gpu * e
 }
 
 static inline bool ggml_sycl_layout_is_tiled(const ggml_tensor_extra_gpu * extra) {
-    return get_effective_layout_mode(extra) == GGML_LAYOUT_XMX_TILED;
+    const layout_mode mode = get_effective_layout_mode(extra);
+    return mode == GGML_LAYOUT_XMX_TILED || mode == GGML_LAYOUT_XMX_TILED_BUNDLE4;
 }
 
 static inline bool ggml_sycl_layout_is_reordered(const ggml_tensor_extra_gpu * extra) {

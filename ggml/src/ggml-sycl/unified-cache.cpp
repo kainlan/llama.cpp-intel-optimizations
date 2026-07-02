@@ -2844,7 +2844,7 @@ void unified_cache::remap_or_erase_id_mapping_locked(const ggml_sycl_cache_id & 
         if (entry.layout == GGML_LAYOUT_MXFP4_I8 || entry.layout == GGML_LAYOUT_MXFP4_DPAS) {
             score += 5;
         } else if (entry.layout == GGML_LAYOUT_SOA || entry.layout == GGML_LAYOUT_COALESCED ||
-                   entry.layout == GGML_LAYOUT_XMX_TILED) {
+                   entry.layout == GGML_LAYOUT_XMX_TILED || entry.layout == GGML_LAYOUT_XMX_TILED_BUNDLE4) {
             score += 3;
         } else if (entry.layout == GGML_LAYOUT_AOS) {
             score += 1;
@@ -4020,8 +4020,9 @@ bool unified_cache::drop_expert_entry(ggml_sycl_cache_id key, const char * reaso
     add_candidate(unified_cache_key{ cache_entry_type::MOE_EXPERT, key, -1, -1 });
     static constexpr ggml_layout_mode k_direct_stage_layouts[] = {
         GGML_LAYOUT_AOS,           GGML_LAYOUT_SOA,        GGML_LAYOUT_COALESCED,
-        GGML_LAYOUT_MXFP4_I8,      GGML_LAYOUT_XMX_TILED,  GGML_LAYOUT_XMX_GEMM_TILED,
-        GGML_LAYOUT_ONEDNN_PACKED, GGML_LAYOUT_ONEDNN_WOQ, GGML_LAYOUT_MXFP4_DPAS,
+        GGML_LAYOUT_MXFP4_I8,      GGML_LAYOUT_XMX_TILED,         GGML_LAYOUT_XMX_TILED_BUNDLE4,
+        GGML_LAYOUT_XMX_GEMM_TILED, GGML_LAYOUT_ONEDNN_PACKED,      GGML_LAYOUT_ONEDNN_WOQ,
+        GGML_LAYOUT_MXFP4_DPAS,
     };
     for (ggml_layout_mode layout : k_direct_stage_layouts) {
         add_candidate(make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, layout));
@@ -7150,7 +7151,7 @@ void unified_cache::print_stats() const {
     GGML_LOG_INFO(
         "[UNIFIED-CACHE] Layouts: aos=%zu (%.1f MB), soa=%zu (%.1f MB), coalesced=%zu (%.1f MB), "
         "mxfp4_i8=%zu (%.1f MB), mxfp4_dpas=%zu (%.1f MB), "
-        "xmx_tiled=%zu (%.1f MB), xmx_gemm_tiled=%zu (%.1f MB), "
+        "xmx_tiled=%zu (%.1f MB), xmx_tiled_bundle4=%zu (%.1f MB), xmx_gemm_tiled=%zu (%.1f MB), "
         "onednn_packed=%zu (%.1f MB), onednn_woq=%zu (%.1f MB)\n",
         layout_counts[GGML_LAYOUT_AOS], layout_bytes[GGML_LAYOUT_AOS] / (1024.0f * 1024.0f),
         layout_counts[GGML_LAYOUT_SOA], layout_bytes[GGML_LAYOUT_SOA] / (1024.0f * 1024.0f),
@@ -7158,6 +7159,8 @@ void unified_cache::print_stats() const {
         layout_counts[GGML_LAYOUT_MXFP4_I8], layout_bytes[GGML_LAYOUT_MXFP4_I8] / (1024.0f * 1024.0f),
         layout_counts[GGML_LAYOUT_MXFP4_DPAS], layout_bytes[GGML_LAYOUT_MXFP4_DPAS] / (1024.0f * 1024.0f),
         layout_counts[GGML_LAYOUT_XMX_TILED], layout_bytes[GGML_LAYOUT_XMX_TILED] / (1024.0f * 1024.0f),
+        layout_counts[GGML_LAYOUT_XMX_TILED_BUNDLE4],
+        layout_bytes[GGML_LAYOUT_XMX_TILED_BUNDLE4] / (1024.0f * 1024.0f),
         layout_counts[GGML_LAYOUT_XMX_GEMM_TILED], layout_bytes[GGML_LAYOUT_XMX_GEMM_TILED] / (1024.0f * 1024.0f),
         layout_counts[GGML_LAYOUT_ONEDNN_PACKED], layout_bytes[GGML_LAYOUT_ONEDNN_PACKED] / (1024.0f * 1024.0f),
         layout_counts[GGML_LAYOUT_ONEDNN_WOQ], layout_bytes[GGML_LAYOUT_ONEDNN_WOQ] / (1024.0f * 1024.0f));
@@ -10073,6 +10076,7 @@ prestage_result prestage_routed_experts(void *          queue_ptr,
         GGML_LAYOUT_SOA,
         GGML_LAYOUT_COALESCED,
         GGML_LAYOUT_XMX_TILED,
+        GGML_LAYOUT_XMX_TILED_BUNDLE4,
     };
     for (int32_t expert_id : unique_experts) {
         ggml_sycl_cache_id key =
@@ -12755,6 +12759,8 @@ static const char * scratch_layout_name(ggml_layout_mode layout) {
             return "mxfp4_dpas";
         case GGML_LAYOUT_XMX_TILED:
             return "xmx_tiled";
+        case GGML_LAYOUT_XMX_TILED_BUNDLE4:
+            return "xmx_tiled_bundle4";
         case GGML_LAYOUT_XMX_GEMM_TILED:
             return "xmx_gemm_tiled";
         case GGML_LAYOUT_ONEDNN_PACKED:
@@ -14854,6 +14860,14 @@ static bool planner_xmx_tiled_moe_enabled() {
     return env ? std::atoi(env) != 0 : true;
 }
 
+static bool planner_moe_gateup_bundle4_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_MOE_GATEUP_BUNDLE4");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static size_t planner_layout_bytes_xmx_tiled_for_dims(ggml_type type, int64_t ncols, int64_t nrows, int device_id) {
     if (type != GGML_TYPE_MXFP4 || ncols <= 0 || nrows <= 0 || device_id < 0 ||
         device_id >= ggml_sycl_info().device_count) {
@@ -14875,6 +14889,30 @@ static size_t planner_layout_bytes_xmx_tiled_for_dims(ggml_type type, int64_t nc
     const size_t n_tile_groups_n      = (static_cast<size_t>(nrows) + tile_n_total - 1) / tile_n_total;
     const size_t bytes_per_tile_group = tile_n_total * (1 + caps.K / 2);
     return n_tile_groups_k * n_tile_groups_n * bytes_per_tile_group;
+}
+
+static size_t planner_layout_bytes_xmx_tiled_bundle4_for_dims(ggml_type type,
+                                                              int64_t   ncols,
+                                                              int64_t   nrows,
+                                                              int       device_id) {
+    if (type != GGML_TYPE_MXFP4 || ncols <= 0 || nrows <= 0 || device_id < 0 ||
+        device_id >= ggml_sycl_info().device_count) {
+        return 0;
+    }
+
+    const auto & caps = ggml_sycl_info().devices[device_id].xmx_caps;
+    const size_t tile_n_total = caps.N * static_cast<size_t>(std::max(caps.optimal_tiles_n, 0));
+    if (!caps.supported || !caps.supports_int8 || caps.K != GGML_SYCL_MXFP4_MOE_XMX_K ||
+        tile_n_total != GGML_SYCL_MXFP4_MOE_XMX_N || (ncols % static_cast<int64_t>(caps.K)) != 0) {
+        return 0;
+    }
+
+    constexpr size_t bundle_groups = 4;
+    constexpr size_t bundle_bytes  = 1088;
+    const size_t     n_tile_groups_k = static_cast<size_t>(ncols / static_cast<int64_t>(caps.K));
+    const size_t     n_tile_groups_n = (static_cast<size_t>(nrows) + tile_n_total - 1) / tile_n_total;
+    const size_t     n_bundles_n     = (n_tile_groups_n + bundle_groups - 1) / bundle_groups;
+    return n_tile_groups_k * n_bundles_n * bundle_bytes;
 }
 
 static bool planner_mxfp4_xmx_tiled_supported(const placement_tensor_info & tensor,
@@ -14915,6 +14953,22 @@ static bool planner_mxfp4_xmx_tiled_supported(const placement_entry & entry, int
                                          /*tiled_kernel_validated=*/true);
     return policy.mxfp4_device_layout.layout == GGML_LAYOUT_XMX_TILED &&
            planner_layout_bytes_xmx_tiled_for_dims(entry.type, entry.ne[0], entry.ne[1], device_id) != 0;
+}
+
+static bool planner_mxfp4_xmx_tiled_bundle4_supported(const placement_tensor_info & tensor,
+                                                      expert_tensor_role            role,
+                                                      int                           device_id) {
+    return planner_moe_gateup_bundle4_enabled() &&
+           (role == expert_tensor_role::GATE || role == expert_tensor_role::UP) &&
+           planner_mxfp4_xmx_tiled_supported(tensor, role, device_id) &&
+           planner_layout_bytes_xmx_tiled_bundle4_for_dims(tensor.type, tensor.ne[0], tensor.ne[1], device_id) != 0;
+}
+
+static bool planner_mxfp4_xmx_tiled_bundle4_supported(const placement_entry & entry, int device_id) {
+    return planner_moe_gateup_bundle4_enabled() &&
+           (entry.expert_role == expert_tensor_role::GATE || entry.expert_role == expert_tensor_role::UP) &&
+           planner_mxfp4_xmx_tiled_supported(entry, device_id) &&
+           planner_layout_bytes_xmx_tiled_bundle4_for_dims(entry.type, entry.ne[0], entry.ne[1], device_id) != 0;
 }
 
 static size_t planner_layout_bytes_for_dims(ggml_type        type,
@@ -14960,6 +15014,11 @@ static size_t planner_layout_bytes_for_expert(const placement_tensor_info & tens
             planner_layout_bytes_xmx_tiled_for_dims(tensor.type, tensor.ne[0], tensor.ne[1], device_id);
         return bytes != 0 ? bytes : fallback_bytes;
     }
+    if (layout == GGML_LAYOUT_XMX_TILED_BUNDLE4) {
+        const size_t bytes =
+            planner_layout_bytes_xmx_tiled_bundle4_for_dims(tensor.type, tensor.ne[0], tensor.ne[1], device_id);
+        return bytes != 0 ? bytes : fallback_bytes;
+    }
     return planner_layout_bytes_for_dims(tensor.type, tensor.ne[0], tensor.ne[1], layout, fallback_bytes);
 }
 
@@ -14971,6 +15030,9 @@ static ggml_layout_mode planner_default_device_layout(const placement_tensor_inf
     }
     if (usage == tensor_usage::MOE_EXPERT_WEIGHT) {
         const expert_tensor_role role = expert_tensor_role_from_tensor_name(tensor.name.c_str());
+        if (planner_mxfp4_xmx_tiled_bundle4_supported(tensor, role, device_id)) {
+            return GGML_LAYOUT_XMX_TILED_BUNDLE4;
+        }
         if (planner_mxfp4_xmx_tiled_supported(tensor, role, device_id)) {
             return GGML_LAYOUT_XMX_TILED;
         }
@@ -14992,6 +15054,9 @@ static ggml_layout_mode planner_default_device_layout(const placement_tensor_inf
 
 static ggml_layout_mode planner_default_device_layout(const placement_entry & entry, int device_id) {
     if (entry.expert_id >= 0) {
+        if (planner_mxfp4_xmx_tiled_bundle4_supported(entry, device_id)) {
+            return GGML_LAYOUT_XMX_TILED_BUNDLE4;
+        }
         if (planner_mxfp4_xmx_tiled_supported(entry, device_id)) {
             return GGML_LAYOUT_XMX_TILED;
         }
@@ -15064,6 +15129,11 @@ static size_t planner_layout_bytes_for_entry(const placement_entry & entry, ggml
         const size_t bytes = planner_layout_bytes_xmx_tiled_for_dims(entry.type, entry.ne[0], entry.ne[1], device_id);
         return bytes != 0 ? bytes : entry.dst_size;
     }
+    if (layout == GGML_LAYOUT_XMX_TILED_BUNDLE4) {
+        const size_t bytes =
+            planner_layout_bytes_xmx_tiled_bundle4_for_dims(entry.type, entry.ne[0], entry.ne[1], device_id);
+        return bytes != 0 ? bytes : entry.dst_size;
+    }
     return planner_layout_bytes_for_dims(entry.type, entry.ne[0], entry.ne[1], layout, entry.dst_size);
 }
 
@@ -15083,7 +15153,9 @@ static ggml_layout_mode planner_multi_device_moe_layout_for_target(const placeme
     }
 
     const ggml_layout_mode preferred = planner_default_device_layout(entry, device_id);
-    if (device_id == primary_device_id && preferred == GGML_LAYOUT_XMX_TILED && !static_xmx_executor_supported) {
+    if (device_id == primary_device_id &&
+        (preferred == GGML_LAYOUT_XMX_TILED || preferred == GGML_LAYOUT_XMX_TILED_BUNDLE4) &&
+        !static_xmx_executor_supported) {
         if (planner_moe_primary_executor_supports_layout_on_device(entry, GGML_LAYOUT_SOA, device_id)) {
             return GGML_LAYOUT_SOA;
         }
@@ -15115,6 +15187,9 @@ static bool planner_moe_primary_executor_supports_layout_on_device(const placeme
     }
     if (layout == GGML_LAYOUT_XMX_TILED) {
         return planner_mxfp4_xmx_tiled_supported(entry, device_id);
+    }
+    if (layout == GGML_LAYOUT_XMX_TILED_BUNDLE4) {
+        return planner_mxfp4_xmx_tiled_bundle4_supported(entry, device_id);
     }
     if (layout == GGML_LAYOUT_MXFP4_I8) {
         return entry.expert_role == expert_tensor_role::DOWN && planner_mxfp4_i8_supported(entry, device_id);
@@ -15195,9 +15270,12 @@ static bool planner_moe_primary_executor_supports_pp_layout_on_device(const plac
         return true;
     }
 
-    if (layout == GGML_LAYOUT_XMX_TILED) {
+    if (layout == GGML_LAYOUT_XMX_TILED || layout == GGML_LAYOUT_XMX_TILED_BUNDLE4) {
         if (entry.type != GGML_TYPE_MXFP4 ||
             (entry.expert_role != expert_tensor_role::GATE && entry.expert_role != expert_tensor_role::UP)) {
+            return false;
+        }
+        if (layout == GGML_LAYOUT_XMX_TILED_BUNDLE4) {
             return false;
         }
         if (device_id < 0 || device_id >= ggml_sycl_info().device_count) {
@@ -15318,7 +15396,10 @@ static bool planner_moe_layout_needs_pp_soa_on_device(const placement_entry &   
         return false;
     }
 
-    if (layout == GGML_LAYOUT_XMX_TILED) {
+    if (layout == GGML_LAYOUT_XMX_TILED || layout == GGML_LAYOUT_XMX_TILED_BUNDLE4) {
+        if (layout == GGML_LAYOUT_XMX_TILED_BUNDLE4) {
+            return true;
+        }
         const bool pp_supported =
             planner_moe_primary_executor_supports_pp_layout_on_device(entry, layout, device_id, kv_info, envelope);
         const bool tg_supported = planner_moe_primary_executor_supports_layout_on_device(entry, layout, device_id);
@@ -15994,6 +16075,7 @@ static void apply_multi_moe_per_target_layouts(placement_plan &                 
 
         switch (target_layout) {
             case GGML_LAYOUT_XMX_TILED:
+            case GGML_LAYOUT_XMX_TILED_BUNDLE4:
                 xmx_entries++;
                 break;
             case GGML_LAYOUT_MXFP4_I8:
@@ -16099,7 +16181,7 @@ static void maybe_upgrade_multi_moe_primary_layouts(placement_plan & plan,
         entry.dst_size         = new_size;
         entry.vram_charge_size = new_charge;
         upgraded_entries++;
-        if (target_layout == GGML_LAYOUT_XMX_TILED) {
+        if (target_layout == GGML_LAYOUT_XMX_TILED || target_layout == GGML_LAYOUT_XMX_TILED_BUNDLE4) {
             xmx_entries++;
         } else if (target_layout == GGML_LAYOUT_SOA) {
             soa_entries++;

@@ -17101,7 +17101,7 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
         return false;
     }
     if (weight_layout != GGML_LAYOUT_SOA && weight_layout != GGML_LAYOUT_MXFP4_I8 &&
-        weight_layout != GGML_LAYOUT_XMX_TILED) {
+        weight_layout != GGML_LAYOUT_XMX_TILED && weight_layout != GGML_LAYOUT_XMX_TILED_BUNDLE4) {
         return false;
     }
 
@@ -17339,7 +17339,59 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
         have_kernel_event = true;
     }
 #endif
-    if (!used_direct_xmx && weight_layout == GGML_LAYOUT_XMX_TILED) {
+    if (!used_direct_xmx && weight_layout == GGML_LAYOUT_XMX_TILED_BUNDLE4) {
+        constexpr int repeat = GGML_SYCL_MXFP4_MOE_XMX_M;
+        constexpr int exec_n = GGML_SYCL_MXFP4_MOE_XMX_N;
+        constexpr int k_per  = GGML_SYCL_MXFP4_MOE_XMX_K;
+        const bool    xmx_tiled_eligible =
+            (ne00 % k_per) == 0 && xmx_capabilities_match_int8_tile(xmx_caps, repeat, exec_n, k_per) &&
+            xmx_capabilities_support_sub_group(xmx_caps, GGML_SYCL_MXFP4_MOE_XMX_SG) && xmx_caps.optimal_tiles_n > 0;
+        const int tile_n_total = xmx_caps.N * xmx_caps.optimal_tiles_n;
+        const bool bundle4_shape = xmx_tiled_eligible && tile_n_total == exec_n && ne12 == 1 && total_batches > 0 &&
+                                   n_gpu_entries == total_batches && !ids_host && ids_device && ids_nb0 > 0 &&
+                                   ids_nb1 > 0;
+        const bool bundle4_ptr_tables_ok =
+            mxfp4_moe_ptr_table_has_device_layout_leases(gate_weight, runtime_device, gate_ptrs_device,
+                                                         GGML_LAYOUT_XMX_TILED_BUNDLE4) &&
+            mxfp4_moe_ptr_table_has_device_layout_leases(up_weight, runtime_device, up_ptrs_device,
+                                                         GGML_LAYOUT_XMX_TILED_BUNDLE4);
+        if (!bundle4_shape || !bundle4_ptr_tables_ok) {
+            return false;
+        }
+
+        const int    k_tiles = ne00 / k_per;
+        const size_t b_bytes = static_cast<size_t>(total_batches) * static_cast<size_t>(k_tiles) *
+                               static_cast<size_t>(k_per * exec_n);
+        const size_t y_bytes = static_cast<size_t>(total_batches) * static_cast<size_t>(k_tiles) *
+                               static_cast<size_t>(exec_n) * sizeof(float);
+        auto &   reuse    = g_mxfp4_moe_tg_reuse;
+        int8_t * b_packed = static_cast<int8_t *>(mxfp4_moe_tg_reuse_get_or_alloc_device_scratch(
+            stream, ctx.device, b_bytes, reuse.dpas_b_capacity, reuse.dpas_b_device, reuse.dpas_b_handle));
+        float * y_scales = static_cast<float *>(mxfp4_moe_tg_reuse_get_or_alloc_device_scratch(
+            stream, ctx.device, y_bytes, reuse.dpas_y_capacity, reuse.dpas_y_device, reuse.dpas_y_handle));
+        if (!b_packed || !y_scales) {
+            return false;
+        }
+
+        sycl::event pack_event = mxfp4_dpas_pack_q8_single_col_groups_sycl(
+            *stream, q8_1_buffer, b_packed, y_scales, ne00, ne10, static_cast<int>(total_batches),
+            static_cast<int>(num_tokens), static_cast<int>(ne11), q8_nb11, q8_nb12, kernel_deps);
+        if (detail_profile) {
+            profile_pack_event     = pack_event;
+            profile_pack_event_set = true;
+        }
+        kernel_event = mxfp4_pair_glu_xmx_tiled_bundle4_dpas_m2_submit<repeat, false>(
+            *stream, gate_ptrs_device, up_ptrs_device, b_packed, y_scales, glu_d, ids_device, gate_bias_device,
+            up_bias_device, ne00, ne01, static_cast<int>(total_batches), static_cast<int>(num_tokens), ids_nb0,
+            ids_nb1, glu_dst->nb[1], glu_dst->nb[2], gate_bias_nb1, up_bias_nb1, glu_op, alpha, limit,
+            tile_n_total, pack_event);
+        xmx_tiled_path      = "bundle4-packed-q8-m2";
+        profile_path        = xmx_tiled_path;
+        profile_layout      = GGML_LAYOUT_XMX_TILED_BUNDLE4;
+        used_xmx_tiled_dpas = true;
+        have_kernel_event   = true;
+    }
+    if (!used_direct_xmx && !used_xmx_tiled_dpas && weight_layout == GGML_LAYOUT_XMX_TILED) {
         constexpr int repeat = GGML_SYCL_MXFP4_MOE_XMX_M;
         constexpr int exec_n = GGML_SYCL_MXFP4_MOE_XMX_N;
         constexpr int k_per  = GGML_SYCL_MXFP4_MOE_XMX_K;
@@ -18078,7 +18130,8 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
         xmx_tiled_path = ggml_sycl::mxfp4_moe_single_gateup_route_label();
         profile_path   = ggml_sycl::mxfp4_moe_single_gateup_route_label();
     }
-    if (weight_layout == GGML_LAYOUT_XMX_TILED && !used_xmx_tiled_dpas) {
+    if ((weight_layout == GGML_LAYOUT_XMX_TILED || weight_layout == GGML_LAYOUT_XMX_TILED_BUNDLE4) &&
+        !used_xmx_tiled_dpas) {
         return false;
     }
     const bool split_sg16_eligible =

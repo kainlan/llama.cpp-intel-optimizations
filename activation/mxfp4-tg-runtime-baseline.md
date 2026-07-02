@@ -199,3 +199,42 @@ Rejected/no-op follow-up probes:
 - `GGML_SYCL_MOE_PARTIAL_DEVICE_GROUPING=1` without aggressive env: `/tmp/mxfp4_partial_device_m2_profile_20260629_215333`, fatal-free but route stayed `packed-q8-m2` and performance was within noise/slightly lower (`tg32 34.53 tok/s`).
 
 Next safe route should target launch/kernel count or a genuinely faster gate/up DPAS kernel for the existing `packed-q8-m2` route while keeping PP untouched and default-off. Graph diagnostics on `/tmp/mxfp4_safe_packed_q8_graph_diag_20260629_212522` showed no SYCL graph replay active for the short safe path (`use_graph=0`, graphlet counters zero), so a future graphlet/launch-consolidation task must be reviewed carefully against the known MoE graphlet regression before any promotion attempt.
+
+## 2026-07-02 default-off bundle4 runtime hook rejection
+
+`GGML_SYCL_MOE_GATEUP_BUNDLE4=1` was implemented as a default-off runtime hook for the optimized MXFP4 gate/up bundle4 physical layout. The implementation keeps a separate `GGML_LAYOUT_XMX_TILED_BUNDLE4` layout/cache identity, limits support to MXFP4 MoE gate/up tensors, demotes PP to SOA, and fails closed on invalid materialization or pointer-table leases.
+
+Evidence directory: `/tmp/sycl_mxfp4_bundle4_runtime_20260702_010118`.
+
+Source/review gates:
+
+```text
+python3 -m pytest -q tests/test-sycl-moe-gateup-bundle4-layout-source.py -> 9 passed
+git diff --check -> clean
+./scripts/sycl-build.sh llama-bench -> passed (existing SYCL warnings only)
+/tmp/spec-review-bundle4-runtime-final-r2.md -> PASS
+/tmp/quality-review-bundle4-runtime-final-r2.md -> PASS
+```
+
+Correctness and route proof:
+
+- Canonical GPT-OSS count gate with `GGML_SYCL_MOE_GATEUP_BUNDLE4=1 GGML_SYCL_MXFP4_TG_PROFILE=1` produced the expected final text `1, 2, 3, 4, 5`.
+- Short route trace (`bundle4_trace_n4.stderr`) showed bundle4 decode materialization and pair routing for early layers:
+  - `reason=decode-bundle4-phase-complete`
+  - `layout=xmx_tiled_bundle4`
+  - `reason=pair-glu-device-ids layout=xmx_tiled_bundle4 entries=4`
+- The same trace showed unified-cache pressure/drops and later layers falling back to SOA, so the route cannot persist across the full 24-layer GPT-OSS B50 decode with this duplicate gate/up layout strategy.
+
+Actual B50 `llama-bench -p 512 -n 128 -ngl 99` A/B:
+
+```text
+Baseline:
+pp512 1139.20 ± 9.16 tok/s
+tg128   22.09 ± 0.09 tok/s
+
+GGML_SYCL_MOE_GATEUP_BUNDLE4=1:
+pp512 1131.63 ± 6.91 tok/s
+tg128   10.45 ± 4.07 tok/s
+```
+
+Decision: reject for performance. The hook remains default-off/experimental only and must not be promoted. Although the route is count-correct and can exercise bundle4 for early decode layers, duplicate bundle4 gate/up materialization creates enough VRAM pressure to trigger repeated drops and regresses TG128 far below both baseline and the `>=45 tok/s` target. A viable follow-up would need a different residency or streaming design rather than another persistent duplicate gate/up layout.
