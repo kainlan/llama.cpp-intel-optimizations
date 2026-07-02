@@ -3,6 +3,7 @@
 #include "ggml-sycl.h"
 #include "ggml.h"
 #include "kernel_registry.hpp"
+#include "ggml-sycl/sycl-kernel-profiler.hpp"
 #include "model_shapes.hpp"
 #include "output_formats.hpp"
 
@@ -1118,5 +1119,6 @@ int main(int argc, char ** argv) {
     }
 
     write_summary_json(params.emit_json_path, summaries);
+    ggml_sycl_kernel_profile_flush(true, "sycl-kernel-bench");
     return 0;
 }

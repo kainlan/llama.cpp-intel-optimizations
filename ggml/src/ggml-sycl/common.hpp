@@ -23,6 +23,7 @@
 #include "moe-layer-plan.hpp"
 #include "orchestrator.hpp"
 #include "presets.hpp"
+#include "sycl-kernel-profiler.hpp"
 #include "sycl_hw.hpp"
 #include "tensor-types.hpp"
 #include "unified-cache.hpp"
@@ -192,30 +193,44 @@ inline bool ggml_sycl_mem_handle_has_identity(const ggml_sycl::mem_handle & hand
 // Outside recording, use canonical mem_handle copy submission.
 // ALL queue memcpy calls in op dispatch code should use this instead of raw queue.memcpy.
 inline sycl::event ggml_sycl_graph_safe_memcpy(sycl::queue & q, void * dst, const void * src, size_t nbytes) {
+    if (nbytes == 0) {
+        return sycl::event{};
+    }
+
+    const int queue_device = ggml_sycl_get_device_id_from_queue(q);
+
+    ggml_sycl_profile_label profile_label{};
+    profile_label.name       = "sycl.memcpy.graph_safe";
+    profile_label.category   = "memory";
+    profile_label.queue_kind = "compute";
+    profile_label.metadata   = g_ggml_sycl_graph_recording ? "graph_recording=1" : "graph_recording=0";
+    profile_label.device     = queue_device;
+    profile_label.bytes      = nbytes;
+
 #ifdef GGML_SYCL_GRAPH
-    if (g_ggml_sycl_graph_recording && nbytes > 0) {
+    if (g_ggml_sycl_graph_recording) {
         const size_t n_i32 = nbytes / sizeof(int32_t);
         auto *       d     = static_cast<int32_t *>(dst);
         const auto * s     = static_cast<const int32_t *>(src);
         if (n_i32 > 0) {
-            q.parallel_for(sycl::range<1>(n_i32), [=](sycl::id<1> i) { d[i] = s[i]; });
+            sycl::event body_event = q.parallel_for(sycl::range<1>(n_i32), [=](sycl::id<1> i) { d[i] = s[i]; });
+            ggml_sycl_profile_record_returned_event(profile_label, body_event);
         }
         const size_t tail = nbytes % sizeof(int32_t);
         if (tail > 0) {
             auto *       dc = static_cast<char *>(dst) + n_i32 * sizeof(int32_t);
             const auto * sc = static_cast<const char *>(src) + n_i32 * sizeof(int32_t);
-            q.parallel_for(sycl::range<1>(tail), [=](sycl::id<1> i) { dc[i] = sc[i]; });
+            sycl::event  tail_event = q.parallel_for(sycl::range<1>(tail), [=](sycl::id<1> i) { dc[i] = sc[i]; });
+            ggml_sycl_profile_record_returned_event(profile_label, tail_event);
         }
         return sycl::event{};
     }
 #endif
-    if (nbytes == 0) {
-        return sycl::event{};
-    }
-    const int             queue_device = ggml_sycl_get_device_id_from_queue(q);
-    ggml_sycl::mem_handle dst_handle   = ggml_sycl_memcpy_handle_for_raw_ptr(dst, queue_device);
-    ggml_sycl::mem_handle src_handle   = ggml_sycl_memcpy_handle_for_raw_ptr(const_cast<void *>(src), queue_device);
-    return ggml_sycl::mem_copy_async(dst_handle, src_handle, nbytes, q);
+
+    ggml_sycl::mem_handle dst_handle = ggml_sycl_memcpy_handle_for_raw_ptr(dst, queue_device);
+    ggml_sycl::mem_handle src_handle = ggml_sycl_memcpy_handle_for_raw_ptr(const_cast<void *>(src), queue_device);
+    return ggml_sycl_profile_record_returned_event(profile_label,
+                                                   ggml_sycl::mem_copy_async(dst_handle, src_handle, nbytes, q));
 }
 
 inline bool ggml_sycl_graph_recording_active() {
