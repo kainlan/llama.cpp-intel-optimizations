@@ -55,3 +55,25 @@ def test_bundle4_kernel_uses_full_group_loader_with_half_group_fallback() -> Non
     assert "else" in kernel
     fallback = kernel[kernel.index("else"):kernel.index("simd<int, Repeat * exec_n> gate_part0")]
     assert "mxfp4_xmx_tiled_bundle4_load_a_vec_from_bundle<Repeat>" in fallback
+
+
+def test_bundle4_kernel_vectorizes_full_tile_bias_loads_and_output_stores() -> None:
+    mmvq = MMVQ.read_text(encoding="utf-8")
+    helper = slice_between(
+        mmvq,
+        "mxfp4_bundle4_store_glu_tile",
+        "template <int Repeat, int GLU_OP, bool Prefetch>\nstatic sycl::event mxfp4_pair_glu_xmx_tiled_bundle4_dpas_m2_sycl",
+    )
+    kernel = slice_between(
+        mmvq,
+        "mxfp4_pair_glu_xmx_tiled_bundle4_dpas_m2_sycl",
+        "static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl",
+    )
+
+    assert "const bool full_tile = row_start + Repeat <= nrows_per_expert" in helper
+    assert "block_load<float, Repeat>(gate_bias_row)" in helper
+    assert "block_load<float, Repeat>(up_bias_row)" in helper
+    assert "block_store<float, Repeat>(dst_out + row_start, values)" in helper
+    assert "block_store<float, 1>(dst_out + row, simd<float, 1>(values[r]))" in helper
+    assert "mxfp4_bundle4_store_glu_tile<Repeat, GLU_OP>(" in kernel
+    assert kernel.count("mxfp4_bundle4_store_glu_tile<Repeat, GLU_OP>(") == 2

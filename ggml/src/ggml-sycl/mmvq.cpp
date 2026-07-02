@@ -9377,6 +9377,62 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_v2_dpas_m2_sycl(sycl::queue &       
     });
 }
 
+template <int Repeat, int GLU_OP>
+SYCL_ESIMD_FUNCTION inline void mxfp4_bundle4_store_glu_tile(
+    float * dst_out, sycl::ext::intel::esimd::simd<float, Repeat> gate_acc,
+    sycl::ext::intel::esimd::simd<float, Repeat> up_acc, const float * gate_bias, const float * up_bias,
+    int64_t gate_bias_nb1, int64_t up_bias_nb1, int32_t expert_id, int row_start, int nrows_per_expert, float alpha,
+    float limit) {
+    using namespace sycl::ext::intel::esimd;
+    const bool full_tile = row_start + Repeat <= nrows_per_expert;
+    simd<float, Repeat> gate_values = gate_acc;
+    simd<float, Repeat> up_values   = up_acc;
+    if (full_tile && gate_bias) {
+        const float * gate_bias_row = reinterpret_cast<const float *>(
+            reinterpret_cast<const char *>(gate_bias) + static_cast<int64_t>(expert_id) * gate_bias_nb1 +
+            static_cast<int64_t>(row_start) * sizeof(float));
+        gate_values += block_load<float, Repeat>(gate_bias_row);
+    }
+    if (full_tile && up_bias) {
+        const float * up_bias_row = reinterpret_cast<const float *>(
+            reinterpret_cast<const char *>(up_bias) + static_cast<int64_t>(expert_id) * up_bias_nb1 +
+            static_cast<int64_t>(row_start) * sizeof(float));
+        up_values += block_load<float, Repeat>(up_bias_row);
+    }
+
+    simd<float, Repeat> values;
+#pragma unroll
+    for (int r = 0; r < Repeat; ++r) {
+        float     gate_value = gate_values[r];
+        float     up_value   = up_values[r];
+        const int row        = row_start + r;
+        if (!full_tile && row < nrows_per_expert) {
+            if (gate_bias) {
+                gate_value += *(const float *) ((const char *) gate_bias +
+                                                static_cast<int64_t>(expert_id) * gate_bias_nb1 +
+                                                static_cast<int64_t>(row) * sizeof(float));
+            }
+            if (up_bias) {
+                up_value += *(const float *) ((const char *) up_bias + static_cast<int64_t>(expert_id) * up_bias_nb1 +
+                                              static_cast<int64_t>(row) * sizeof(float));
+            }
+        }
+        values[r] = mmvq_moe_apply_pair_glu_esimd<GLU_OP>(gate_value, up_value, alpha, limit);
+    }
+
+    if (full_tile) {
+        block_store<float, Repeat>(dst_out + row_start, values);
+    } else {
+#pragma unroll
+        for (int r = 0; r < Repeat; ++r) {
+            const int row = row_start + r;
+            if (row < nrows_per_expert) {
+                block_store<float, 1>(dst_out + row, simd<float, 1>(values[r]));
+            }
+        }
+    }
+}
+
 template <int Repeat, int GLU_OP, bool Prefetch>
 static sycl::event mxfp4_pair_glu_xmx_tiled_bundle4_dpas_m2_sycl(sycl::queue &        queue,
                                                                  const void * const * gate_ptrs,
@@ -9561,48 +9617,13 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_bundle4_dpas_m2_sycl(sycl::queue &  
                 float * dst_out =
                     reinterpret_cast<float *>(reinterpret_cast<char *>(dst_glu) + static_cast<int64_t>(id) * dst_nb1 +
                                               static_cast<int64_t>(iid1) * dst_nb2);
-#pragma unroll
-                for (int r = 0; r < Repeat; ++r) {
-                    const int row = static_cast<int>(tile_m0) * Repeat + r;
-                    if (row < nrows_per_expert) {
-                        float gate_value = gate_acc0[r];
-                        float up_value   = up_acc0[r];
-                        if (gate_bias) {
-                            gate_value += *(const float *) ((const char *) gate_bias +
-                                                            static_cast<int64_t>(expert_id) * gate_bias_nb1 +
-                                                            static_cast<int64_t>(row) * sizeof(float));
-                        }
-                        if (up_bias) {
-                            up_value += *(const float *) ((const char *) up_bias +
-                                                          static_cast<int64_t>(expert_id) * up_bias_nb1 +
-                                                          static_cast<int64_t>(row) * sizeof(float));
-                        }
-                        const float value = mmvq_moe_apply_pair_glu_esimd<GLU_OP>(gate_value, up_value, alpha, limit);
-                        block_store<float, 1>(dst_out + row, value);
-                    }
-                }
+                mxfp4_bundle4_store_glu_tile<Repeat, GLU_OP>(
+                    dst_out, gate_acc0, up_acc0, gate_bias, up_bias, gate_bias_nb1, up_bias_nb1, expert_id,
+                    static_cast<int>(tile_m0) * Repeat, nrows_per_expert, alpha, limit);
                 if (have_m1) {
-#pragma unroll
-                    for (int r = 0; r < Repeat; ++r) {
-                        const int row = static_cast<int>(tile_m1) * Repeat + r;
-                        if (row < nrows_per_expert) {
-                            float gate_value = gate_acc1[r];
-                            float up_value   = up_acc1[r];
-                            if (gate_bias) {
-                                gate_value += *(const float *) ((const char *) gate_bias +
-                                                                static_cast<int64_t>(expert_id) * gate_bias_nb1 +
-                                                                static_cast<int64_t>(row) * sizeof(float));
-                            }
-                            if (up_bias) {
-                                up_value += *(const float *) ((const char *) up_bias +
-                                                              static_cast<int64_t>(expert_id) * up_bias_nb1 +
-                                                              static_cast<int64_t>(row) * sizeof(float));
-                            }
-                            const float value =
-                                mmvq_moe_apply_pair_glu_esimd<GLU_OP>(gate_value, up_value, alpha, limit);
-                            block_store<float, 1>(dst_out + row, value);
-                        }
-                    }
+                    mxfp4_bundle4_store_glu_tile<Repeat, GLU_OP>(
+                        dst_out, gate_acc1, up_acc1, gate_bias, up_bias, gate_bias_nb1, up_bias_nb1, expert_id,
+                        static_cast<int>(tile_m1) * Repeat, nrows_per_expert, alpha, limit);
                 }
             });
     });
