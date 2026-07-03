@@ -5,6 +5,8 @@
 #include <string>
 #include <sycl/sycl.hpp>
 
+#include "sycl-timeline.hpp"
+
 enum class ggml_sycl_kernel_profile_output_format : uint8_t {
     STDERR = 0,
     CSV    = 1,
@@ -51,14 +53,27 @@ std::string ggml_sycl_kernel_profile_format_summary_for_test(int top_n);
 bool        ggml_sycl_kernel_profile_effective_wait_for_test(bool requested_wait);
 
 template <typename SubmitFn>
-inline sycl::event ggml_sycl_profile_submit(sycl::queue &                   q,
-                                            const ggml_sycl_profile_label & label,
-                                            SubmitFn &&                     submit_fn) {
+inline sycl::event ggml_sycl_profile_submit_impl(sycl::queue &                     q,
+                                                 const ggml_sycl_profile_label &   label,
+                                                 SubmitFn &&                       submit_fn,
+                                                 ggml_sycl::sycl_timeline_callsite callsite) {
+    (void) callsite;
     sycl::event event = submit_fn(q);
     if (ggml_sycl_kernel_profile_enabled()) {
         ggml_sycl_kernel_profile_record_event(label, event);
     }
     return event;
+}
+
+template <typename SubmitFn>
+inline sycl::event ggml_sycl_profile_submit(sycl::queue &                   q,
+                                            const ggml_sycl_profile_label & label,
+                                            SubmitFn &&                     submit_fn,
+                                            const char *                    file     = __builtin_FILE(),
+                                            int                             line     = __builtin_LINE(),
+                                            const char *                    function = __builtin_FUNCTION()) {
+    return ggml_sycl_profile_submit_impl(q, label, static_cast<SubmitFn &&>(submit_fn),
+                                         ggml_sycl::sycl_timeline_callsite{ file, line, function });
 }
 
 // Test-only helper used by `tests/test-sycl-kernel-profiler.cpp` to verify wrapper semantics without
