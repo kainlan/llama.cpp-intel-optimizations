@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "scripts" / "sycl-gptoss-decode-timeline-profile.sh"
 DOC = ROOT / "docs" / "backend" / "SYCL.md"
 
 
@@ -17,9 +19,58 @@ REQUIRED_DOC_STRINGS = [
     "workers must not run",
 ]
 
+REQUIRED_DRY_RUN_STRINGS = [
+    "DRY RUN",
+    "ONEAPI_DEVICE_SELECTOR=level_zero:1",
+    "GGML_SYCL_TIMELINE=timeline+events",
+    "GGML_SYCL_TIMELINE_OUTPUT=",
+    "GGML_SYCL_TIMELINE_TOKEN_START=1",
+    "GGML_SYCL_KERNEL_PROFILE=1",
+    "GGML_SYCL_KERNEL_PROFILE_FORMAT=both",
+    "GGML_SYCL_KERNEL_PROFILE_RAW=1",
+    "GGML_SYCL_KERNEL_PROFILE_TOP_N=80",
+    "GGML_SYCL_MOE_PHASE_MATERIALIZE=1",
+    "GGML_SYCL_MOE_PHASE_BULK_XMX=1",
+    "GGML_SYCL_MOE_DOWN_SUM_DIRECT=1",
+    "/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf",
+    "./build/bin/llama-bench",
+    "-ngl 99",
+    "-fa 1",
+    "-p 512",
+    "-n 128",
+    "-r 1",
+]
+
 
 def _doc_text() -> str:
     return DOC.read_text(encoding="utf-8")
+
+
+def test_timeline_profile_script_is_dry_run_by_default() -> None:
+    result = subprocess.run(
+        ["bash", str(SCRIPT)],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout
+    for required in REQUIRED_DRY_RUN_STRINGS:
+        assert required in result.stdout
+
+
+def test_timeline_profile_script_refuses_execute_without_ack() -> None:
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--execute"],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "requires --i-understand-this-runs-gpu-models" in result.stdout
 
 
 def test_decode_timeline_profiler_docs_contain_required_contract_terms() -> None:
