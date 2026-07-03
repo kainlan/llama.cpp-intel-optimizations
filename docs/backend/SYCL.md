@@ -825,7 +825,7 @@ use 1 SYCL GPUs: [0] with Max compute units:512
 | GGML_SYCL_OFFLOAD_BOUNDARY_WAIT_BYTES | 1048576 (default) | In async offload mode, only force GPU→CPU boundary queue wait when tracked boundary bytes are at least this threshold. |
 | GGML_SYCL_OFFLOAD_PLAN_DUMP | 0 (default) or 1 | Dump CPU/GPU segment plan, boundary count, and estimated boundary bytes for each graph. |
 | GGML_SYCL_MOE_GATEUP_SINGLE_XMX | 0 (default) or 1 | Experimental GPT-OSS MXFP4 gate/up proof mode. Requires gate/up experts to use one persistent `GGML_LAYOUT_XMX_TILED` VRAM layout consumed by both PP and TG. No persistent SOA gate/up duplicate and no per-token gate/up prepack are allowed. Parser validation must include `--require-single-xmx-gateup --forbid-gateup-soa-fallback`. Lead-only non-dry-run B50/B580/model validation is required before promotion; workers must use dry-run-only gates. |
-| GGML_SYCL_MOE_GATEUP_M2_TG1_INDEX | 0 (default) or 1 | Default-off GPT-OSS MXFP4 decode-only proof knob for the packed-Q8 M2 gate/up route. When enabled it may specialize `mxfp4.gateup.xmx_tiled_dpas_m2` indexing for `n_tokens == 1`; it must not affect prompt processing or authorize V2, bundle4, M4, prefetch, direct-q8, or default-on behavior without lead-owned correctness and throughput evidence. |
+| GGML_SYCL_MOE_GATEUP_M2_TG1_INDEX | planned, default-off | Current-campaign planned GPT-OSS MXFP4 decode-only proof knob for the packed-Q8 M2 gate/up route; it is not available until the implementation task lands. Once implemented, enabling it may specialize `mxfp4.gateup.xmx_tiled_dpas_m2` indexing for `n_tokens == 1`; it must not affect prompt processing or authorize V2, bundle4, M4, prefetch, direct-q8, or default-on behavior without lead-owned correctness and throughput evidence. |
 | GGML_SYCL_DMA_SLICE_MB | 1024 (default) | Unified-cache DMA streaming slice size in MB (aligned to row size). |
 | GGML_SYCL_DMA_BUFFERS | 2 (default) | Unified-cache DMA streaming buffer count (staging buffers). Alias: `GGML_SYCL_DMA_SLICES`. |
 | GGML_SYCL_DMA_RESERVE_MB | (auto) | VRAM headroom reserved for DMA staging buffers; overrides slice/buffer-derived default. |
@@ -1182,7 +1182,7 @@ python3 scripts/parse-sycl-kernel-profile.py \
 
 ### MXFP4 down-variant named profile matrix
 
-`scripts/sycl-gptoss-down-variant-profile-matrix.sh` is a lead-only helper for comparing default-off GPT-OSS MXFP4 decode down variants with the named SYCL event profiler. It is dry-run by default and must not launch real model work unless the lead passes `--execute`.
+`scripts/sycl-gptoss-down-variant-profile-matrix.sh` is the current-campaign planned lead-only helper for comparing default-off GPT-OSS MXFP4 decode down variants with the named SYCL event profiler once added by this campaign. It must be dry-run by default and must not launch real model work unless the lead passes `--execute`.
 
 The baseline, row-group, and atomic rows use the valid FA-on B50 GPT-OSS baseline environment: `-fa 1`, `GGML_SYCL_MOE_PHASE_MATERIALIZE=1`, `GGML_SYCL_MOE_PHASE_BULK_XMX=1`, and `GGML_SYCL_MOE_DOWN_SUM_DIRECT=1`. Cached q8-SOA rows are diagnostic only and explicitly set `GGML_SYCL_MOE_DOWN_SUM_DIRECT=0`; they are not promotion candidates for the current FA-on direct-sum baseline.
 
