@@ -54,6 +54,31 @@ def parse_min_total(raw: str) -> tuple[str, float]:
         raise argparse.ArgumentTypeError(f"invalid millisecond value: {raw}") from exc
 
 
+def parse_wall_ms(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid wall millisecond value: {raw}") from exc
+    if value <= 0:
+        raise argparse.ArgumentTypeError("--wall-ms must be greater than zero")
+    return value
+
+
+def parse_kernel_bytes(raw: str) -> tuple[str, int]:
+    if "=" not in raw:
+        raise argparse.ArgumentTypeError("expected NAME=BYTES")
+    name, value = raw.split("=", 1)
+    if not name:
+        raise argparse.ArgumentTypeError("expected NAME=BYTES")
+    try:
+        bytes_per_event = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid byte count: {raw}") from exc
+    if bytes_per_event < 0:
+        raise argparse.ArgumentTypeError("kernel bytes must be non-negative")
+    return name, bytes_per_event
+
+
 def aggregate_rows(rows: list[dict[str, Any]]) -> tuple[dict[str, Counter[str]], Counter[str]]:
     """Aggregate rows by kernel name and category.
 
@@ -84,6 +109,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("profile", type=pathlib.Path)
     parser.add_argument("--require-kernel", action="append", default=[])
     parser.add_argument("--min-total-ms", action="append", type=parse_min_total, default=[])
+    parser.add_argument("--wall-ms", type=parse_wall_ms)
+    parser.add_argument("--kernel-bytes", action="append", type=parse_kernel_bytes, default=[])
     args = parser.parse_args(argv)
 
     try:
@@ -111,11 +138,33 @@ def main(argv: list[str]) -> int:
             print(f"kernel below total_ms threshold: {name} observed={total_ms:.3f} required={threshold_ms:.3f}")
             ok = False
 
+    kernel_bytes = dict(args.kernel_bytes)
+    for name in kernel_bytes:
+        if name not in kernel_totals:
+            print(f"missing bytes kernel: {name}")
+            ok = False
+
+    kernel_sum_total_ns = sum(totals["total_ns"] for totals in kernel_totals.values())
+    print(f"profile.kernel_sum_total_ms_x1000 {ns_to_ms_x1000(kernel_sum_total_ns)}")
+    if args.wall_ms is not None:
+        kernel_sum_ms = kernel_sum_total_ns / 1_000_000.0
+        print(f"profile.decode_wall_ms_x1000 {int(round(args.wall_ms * 1000.0))}")
+        print(f"profile.kernel_coverage_pct_x1000 {int(round(100000.0 * kernel_sum_ms / args.wall_ms))}")
+
     for name, totals in sorted(kernel_totals.items(), key=lambda item: item[1]["total_ns"], reverse=True):
         metric = metric_name(name)
         print(f"kernel.{metric}.count {totals['count']}")
         print(f"kernel.{metric}.total_ms_x1000 {ns_to_ms_x1000(totals['total_ns'])}")
         print(f"kernel.{metric}.failed_timestamps {totals['failed_timestamps']}")
+        if name in kernel_bytes:
+            total_ns = totals["total_ns"]
+            # `--kernel-bytes` is bytes per profiler event. Achieved GB/s is
+            # (bytes_per_event * event_count) / total_ns because bytes/ns has
+            # the same 10^9 scale as GB/s; the printed metric is x1000 scaled.
+            achieved_gbps_x1000 = (
+                0 if total_ns == 0 else int(round(1000.0 * kernel_bytes[name] * totals["count"] / total_ns))
+            )
+            print(f"kernel.{metric}.achieved_gbps_x1000 {achieved_gbps_x1000}")
 
     for category, total_ns in sorted(category_totals.items()):
         print(f"category.{category}.total_ms_x1000 {ns_to_ms_x1000(total_ns)}")
