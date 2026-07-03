@@ -90,3 +90,24 @@ def test_compute_impl_guard_records_timeline_scopes_around_bcs_and_dma_drains() 
         assert f"{span_name}_timeline_scope.emplace" in preceding
         assert f"queue={queue_name}" in preceding
         assert "catch (...)" in following
+
+
+def test_moe_sequence_graphlet_records_timeline_scopes_around_refresh_record_replay() -> None:
+    src = read_source()
+    begin = src.index("const char * ptr_table_reject = nullptr;")
+    invalidate_call = "sycl_ctx->invalidate_moe_sequence_graphs();"
+    end = src.index(invalidate_call, begin) + len(invalidate_call)
+    sequence_graphlet = src[begin:end]
+
+    assert 'GGML_SYCL_TIMELINE_SCOPE("sycl.graph", "moe_sequence_pointer_table_refresh"' in sequence_graphlet
+    assert 'GGML_SYCL_TIMELINE_SCOPE("sycl.graph", "moe_sequence_graphlet_record"' in sequence_graphlet
+    assert 'GGML_SYCL_TIMELINE_SCOPE("sycl.graph", "moe_sequence_graphlet_replay"' in sequence_graphlet
+    assert "ggml_sycl_timeline_node_metadata" in sequence_graphlet
+    assert "sycl_ctx->device" in sequence_graphlet
+    assert "node_idx" in sequence_graphlet
+    assert "cgraph->n_nodes" in sequence_graphlet
+    assert "node->name" in sequence_graphlet
+    assert "ggml_op_name(node->op)" in sequence_graphlet
+    assert "moe_sequence_graphlet_prepare_pointer_tables" in sequence_graphlet
+    assert "moe_graph_record_moe_dispatch_graph" in sequence_graphlet
+    assert "ext_oneapi_graph(*exec_graph)" in sequence_graphlet
