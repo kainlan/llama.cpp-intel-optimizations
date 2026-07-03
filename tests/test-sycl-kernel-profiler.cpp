@@ -107,7 +107,7 @@ int main() {
           "missing memcpy aggregate row");
 
     ggml_sycl_kernel_profile_add_raw_event_for_test(slow, 42, 100, 110, 1000, 1200, 1800, "test",
-                                                    "tests/test-sycl-kernel-profiler.cpp", 123, "main", false);
+                                                    "tests/test-sycl-kernel-profiler.cpp", 123, "main", true);
 
     const std::string json = ggml_sycl_kernel_profile_format_json_for_test();
     CHECK(contains(json, "\"kernels\""), "missing kernels JSON array");
@@ -118,9 +118,25 @@ int main() {
     CHECK(contains(json, "\"event_id\":42"), "missing raw event id");
     CHECK(contains(json, "\"host_submit_begin_us\":100"), "missing raw host submit begin");
     CHECK(contains(json, "\"host_submit_end_us\":110"), "missing raw host submit end");
+    CHECK(contains(json, "\"device_submit_ns\":1000"), "missing raw device submit");
+    CHECK(contains(json, "\"device_start_ns\":1200"), "missing raw device start");
+    CHECK(contains(json, "\"device_end_ns\":1800"), "missing raw device end");
+    CHECK(!contains(json, "command_submit_ns"), "raw JSON should not use legacy command_submit_ns field");
+    CHECK(!contains(json, "command_start_ns"), "raw JSON should not use legacy command_start_ns field");
+    CHECK(!contains(json, "command_end_ns"), "raw JSON should not use legacy command_end_ns field");
+    CHECK(contains(json, "\"duration_ns\":600"), "missing raw duration");
     CHECK(contains(json, "\"timestamp_status\":\"test\""), "missing raw timestamp status");
     CHECK(contains(json, "\"file\":\"tests/test-sycl-kernel-profiler.cpp\""), "missing raw file");
     CHECK(contains(json, "\"function\":\"main\""), "missing raw function");
+    CHECK(contains(json, "\"graph_recorded\":1"), "missing raw graph flag");
+
+    cfg.raw_events = false;
+    ggml_sycl_kernel_profile_set_config_for_test(cfg);
+    const std::string json_without_raw_events = ggml_sycl_kernel_profile_format_json_for_test();
+    CHECK(contains(json_without_raw_events, "\"kernels\""), "raw-events-disabled JSON lost kernels array");
+    CHECK(!contains(json_without_raw_events, "\"raw_events\""), "raw_events=false should omit raw events JSON array");
+    cfg.raw_events = true;
+    ggml_sycl_kernel_profile_set_config_for_test(cfg);
 
     const std::string summary = ggml_sycl_kernel_profile_format_summary_for_test(2);
     CHECK(summary.find("mxfp4.gateup.packed_q8_m2") < summary.find("sycl.memcpy.graph_safe"),

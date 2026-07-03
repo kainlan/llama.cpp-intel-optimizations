@@ -67,6 +67,42 @@ def test_top_abbreviation_is_rejected(tmp_path: pathlib.Path) -> None:
     assert "Traceback" not in result.stdout
 
 
+def test_parser_reads_device_ranges_from_timeline_metadata(tmp_path: pathlib.Path) -> None:
+    trace = {
+        "traceEvents": [
+            {
+                "name": "event-a",
+                "cat": "sycl.event",
+                "ph": "X",
+                "ts": 0,
+                "dur": 3,
+                "args": {
+                    "metadata": "device=2;queue_kind=copy;device_start_ns=1000;device_end_ns=4000",
+                },
+            },
+            {
+                "name": "event-b",
+                "cat": "sycl.event",
+                "ph": "X",
+                "ts": 0,
+                "dur": 2,
+                "args": {
+                    "metadata": "device=2;queue_kind=copy;device_start_ns=7000;device_end_ns=9000",
+                },
+            },
+        ]
+    }
+    path = tmp_path / "metadata-timeline.json"
+    path.write_text(json.dumps(trace), encoding="utf-8")
+
+    result = run_parser(path, "--wall-ms", "1")
+
+    assert result.returncode == 0, result.stdout
+    assert "timeline.gpu_event_total_ms_x1000 5" in result.stdout
+    assert "gap.device2.copy.count 1" in result.stdout
+    assert "gap.device2.copy.total_ms_x1000 3" in result.stdout
+
+
 def test_parser_summarizes_wall_categories_and_callsites() -> None:
     trace = {
         "traceEvents": [

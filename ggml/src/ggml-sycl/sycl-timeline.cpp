@@ -265,6 +265,15 @@ bool sycl_timeline_records_spans() {
     return timeline_records_spans();
 }
 
+bool sycl_timeline_records_events() {
+    sycl_timeline_state &       state = get_timeline_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+
+    const sycl_timeline_config & cfg = current_config(state);
+    return cfg.enabled && cfg.mode == sycl_timeline_mode::TIMELINE_EVENTS && cfg.max_events > 0 &&
+           static_cast<int>(state.events.size()) < cfg.max_events;
+}
+
 sycl_timeline_config sycl_timeline_config_from_env() {
     return read_env_config();
 }

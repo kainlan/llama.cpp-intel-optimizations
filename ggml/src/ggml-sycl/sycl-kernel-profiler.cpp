@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -70,9 +71,9 @@ struct raw_profile_event {
     uint64_t               event_id             = 0;
     uint64_t               host_submit_begin_us = 0;
     uint64_t               host_submit_end_us   = 0;
-    uint64_t               command_submit_ns    = 0;
-    uint64_t               command_start_ns     = 0;
-    uint64_t               command_end_ns       = 0;
+    uint64_t               device_submit_ns     = 0;
+    uint64_t               device_start_ns      = 0;
+    uint64_t               device_end_ns        = 0;
     std::string            timestamp_status;
     callsite_snapshot      callsite;
     bool                   graph_recorded = false;
@@ -384,19 +385,19 @@ std::string format_json_rows(const std::vector<profile_row> &       rows,
                 out << ',';
             }
             const uint64_t duration_ns =
-                event.command_end_ns >= event.command_start_ns ? event.command_end_ns - event.command_start_ns : 0;
+                event.device_end_ns >= event.device_start_ns ? event.device_end_ns - event.device_start_ns : 0;
             out << '{' << "\"event_id\":" << event.event_id << ',' << "\"name\":\"" << json_escape(event.label.key.name)
                 << "\"," << "\"category\":\"" << json_escape(event.label.key.category) << "\"," << "\"metadata\":\""
                 << json_escape(event.label.key.metadata) << "\"," << "\"device\":" << event.label.device << ','
                 << "\"queue_kind\":\"" << json_escape(event.label.queue_kind) << "\","
                 << "\"bytes\":" << event.label.bytes << ',' << "\"host_submit_begin_us\":" << event.host_submit_begin_us
                 << ',' << "\"host_submit_end_us\":" << event.host_submit_end_us << ','
-                << "\"command_submit_ns\":" << event.command_submit_ns << ','
-                << "\"command_start_ns\":" << event.command_start_ns << ','
-                << "\"command_end_ns\":" << event.command_end_ns << ',' << "\"duration_ns\":" << duration_ns << ','
-                << "\"timestamp_status\":\"" << json_escape(event.timestamp_status) << "\"," << "\"file\":\""
-                << json_escape(event.callsite.file) << "\"," << "\"line\":" << event.callsite.line << ','
-                << "\"function\":\"" << json_escape(event.callsite.function) << "\","
+                << "\"device_submit_ns\":" << event.device_submit_ns << ','
+                << "\"device_start_ns\":" << event.device_start_ns << ',' << "\"device_end_ns\":" << event.device_end_ns
+                << ',' << "\"duration_ns\":" << duration_ns << ',' << "\"timestamp_status\":\""
+                << json_escape(event.timestamp_status) << "\"," << "\"file\":\"" << json_escape(event.callsite.file)
+                << "\"," << "\"line\":" << event.callsite.line << ',' << "\"function\":\""
+                << json_escape(event.callsite.function) << "\","
                 << "\"graph_recorded\":" << (event.graph_recorded ? 1 : 0) << '}';
         }
         out << ']';
@@ -435,10 +436,47 @@ ggml_sycl_kernel_profile_config current_config() {
     return state.env_config;
 }
 
+std::chrono::steady_clock::time_point steady_time_point_from_us(uint64_t value_us) {
+    return std::chrono::steady_clock::time_point(
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::microseconds(value_us)));
+}
+
+std::chrono::steady_clock::duration steady_duration_from_ns(uint64_t value_ns) {
+    return std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::nanoseconds(value_ns));
+}
+
+ggml_sycl::sycl_timeline_callsite to_timeline_callsite(const callsite_snapshot & callsite) {
+    return ggml_sycl::sycl_timeline_callsite{ callsite.file.c_str(), callsite.line, callsite.function.c_str() };
+}
+
+std::string timeline_metadata_common(const profile_label_snapshot & label, uint64_t event_id) {
+    std::ostringstream out;
+    out << "event_id=" << event_id << ";profile_category=" << label.key.category << ";queue_kind=" << label.queue_kind
+        << ";device=" << label.device << ";bytes=" << label.bytes;
+    if (!label.key.metadata.empty()) {
+        out << ";metadata=" << label.key.metadata;
+    }
+    return out.str();
+}
+
+void record_timeline_submit_span(const pending_profile_event & pending_event) {
+    if (pending_event.host_submit_begin_us == 0 || pending_event.host_submit_end_us == 0 ||
+        pending_event.host_submit_end_us < pending_event.host_submit_begin_us ||
+        !ggml_sycl::sycl_timeline_records_spans()) {
+        return;
+    }
+
+    const std::string metadata = timeline_metadata_common(pending_event.label, pending_event.event_id);
+    ggml_sycl::sycl_timeline_record_span("sycl.submit", pending_event.label.key.name.c_str(), metadata.c_str(),
+                                         to_timeline_callsite(pending_event.callsite),
+                                         steady_time_point_from_us(pending_event.host_submit_begin_us),
+                                         steady_time_point_from_us(pending_event.host_submit_end_us));
+}
+
 raw_profile_event make_raw_event(const pending_profile_event & pending_event,
-                                 uint64_t                      command_submit_ns,
-                                 uint64_t                      command_start_ns,
-                                 uint64_t                      command_end_ns,
+                                 uint64_t                      device_submit_ns,
+                                 uint64_t                      device_start_ns,
+                                 uint64_t                      device_end_ns,
                                  const char *                  timestamp_status,
                                  bool                          graph_recorded) {
     raw_profile_event raw_event;
@@ -446,13 +484,37 @@ raw_profile_event make_raw_event(const pending_profile_event & pending_event,
     raw_event.event_id             = pending_event.event_id;
     raw_event.host_submit_begin_us = pending_event.host_submit_begin_us;
     raw_event.host_submit_end_us   = pending_event.host_submit_end_us;
-    raw_event.command_submit_ns    = command_submit_ns;
-    raw_event.command_start_ns     = command_start_ns;
-    raw_event.command_end_ns       = command_end_ns;
+    raw_event.device_submit_ns     = device_submit_ns;
+    raw_event.device_start_ns      = device_start_ns;
+    raw_event.device_end_ns        = device_end_ns;
     raw_event.timestamp_status     = string_from_cstr(timestamp_status, "unknown");
     raw_event.callsite             = pending_event.callsite;
     raw_event.graph_recorded       = graph_recorded;
     return raw_event;
+}
+
+uint64_t raw_event_duration_ns(const raw_profile_event & event) {
+    return event.device_end_ns >= event.device_start_ns ? event.device_end_ns - event.device_start_ns : 0;
+}
+
+void record_timeline_event_span(const raw_profile_event & event) {
+    const uint64_t duration_ns = raw_event_duration_ns(event);
+    if (duration_ns == 0 || !ggml_sycl::sycl_timeline_records_events()) {
+        return;
+    }
+
+    std::ostringstream metadata;
+    metadata << timeline_metadata_common(event.label, event.event_id) << ";timestamp_status=" << event.timestamp_status
+             << ";device_clock=sycl_event_profiling_ns"
+             << ";timeline_anchor=device_zero;device_submit_ns=" << event.device_submit_ns
+             << ";device_start_ns=" << event.device_start_ns << ";device_end_ns=" << event.device_end_ns
+             << ";duration_ns=" << duration_ns << ";graph_recorded=" << (event.graph_recorded ? 1 : 0);
+
+    const auto        start           = std::chrono::steady_clock::time_point{};
+    const std::string metadata_string = metadata.str();
+    ggml_sycl::sycl_timeline_record_span("sycl.event", event.label.key.name.c_str(), metadata_string.c_str(),
+                                         to_timeline_callsite(event.callsite), start,
+                                         start + steady_duration_from_ns(duration_ns));
 }
 
 void add_raw_event_locked(profiler_state & state, raw_profile_event raw_event) {
@@ -461,12 +523,12 @@ void add_raw_event_locked(profiler_state & state, raw_profile_event raw_event) {
 
 void add_raw_event_locked(profiler_state &              state,
                           const pending_profile_event & pending_event,
-                          uint64_t                      command_submit_ns,
-                          uint64_t                      command_start_ns,
-                          uint64_t                      command_end_ns,
+                          uint64_t                      device_submit_ns,
+                          uint64_t                      device_start_ns,
+                          uint64_t                      device_end_ns,
                           const char *                  timestamp_status,
                           bool                          graph_recorded) {
-    add_raw_event_locked(state, make_raw_event(pending_event, command_submit_ns, command_start_ns, command_end_ns,
+    add_raw_event_locked(state, make_raw_event(pending_event, device_submit_ns, device_start_ns, device_end_ns,
                                                timestamp_status, graph_recorded));
 }
 
@@ -521,23 +583,32 @@ void drain_pending_events(bool wait_for_events, bool store_raw_events) {
                 timestamp_status = "submit_unavailable";
             }
 
-            std::lock_guard<std::mutex> lock(state.mutex);
-            if (end >= start) {
-                add_sample_locked(state, pending_event.label, end - start);
-                if (store_raw_events) {
-                    add_raw_event_locked(state, pending_event, submit, start, end, timestamp_status, false);
+            raw_profile_event raw_event = make_raw_event(pending_event, submit, start, end, timestamp_status, false);
+            bool              valid     = false;
+            {
+                std::lock_guard<std::mutex> lock(state.mutex);
+                if (end >= start) {
+                    valid = true;
+                    add_sample_locked(state, pending_event.label, end - start);
+                    if (store_raw_events) {
+                        add_raw_event_locked(state, raw_event);
+                    }
+                } else {
+                    raw_event.timestamp_status = "invalid_range";
+                    add_failed_timestamp_locked(state, pending_event.label, false);
+                    if (store_raw_events) {
+                        add_raw_event_locked(state, raw_event);
+                    }
                 }
-            } else {
-                add_failed_timestamp_locked(state, pending_event.label, false);
-                if (store_raw_events) {
-                    add_raw_event_locked(state, pending_event, submit, start, end, "invalid_range", false);
-                }
+            }
+            if (valid) {
+                record_timeline_event_span(raw_event);
             }
         } catch (...) {
             std::lock_guard<std::mutex> lock(state.mutex);
             add_failed_timestamp_locked(state, pending_event.label, false);
             if (store_raw_events) {
-                add_raw_event_locked(state, pending_event, 0, 0, 0, "timestamp_error", false);
+                add_raw_event_locked(state, pending_event, 0, 0, 0, "query_failed", false);
             }
         }
     }
@@ -649,6 +720,8 @@ void ggml_sycl_kernel_profile_record_event(const ggml_sycl_profile_label &   lab
     pending_event.host_submit_end_us   = host_submit_end_us;
     pending_event.callsite             = snapshot_callsite(callsite);
 
+    record_timeline_submit_span(pending_event);
+
     std::lock_guard<std::mutex> lock(state.mutex);
     state.pending_events.push_back(std::move(pending_event));
 }
@@ -727,9 +800,9 @@ void ggml_sycl_kernel_profile_add_raw_event_for_test(const ggml_sycl_profile_lab
                                                      uint64_t                        event_id,
                                                      uint64_t                        host_submit_begin_us,
                                                      uint64_t                        host_submit_end_us,
-                                                     uint64_t                        command_submit_ns,
-                                                     uint64_t                        command_start_ns,
-                                                     uint64_t                        command_end_ns,
+                                                     uint64_t                        device_submit_ns,
+                                                     uint64_t                        device_start_ns,
+                                                     uint64_t                        device_end_ns,
                                                      const char *                    timestamp_status,
                                                      const char *                    file,
                                                      int                             line,
@@ -740,9 +813,9 @@ void ggml_sycl_kernel_profile_add_raw_event_for_test(const ggml_sycl_profile_lab
     raw_event.event_id             = event_id;
     raw_event.host_submit_begin_us = host_submit_begin_us;
     raw_event.host_submit_end_us   = host_submit_end_us;
-    raw_event.command_submit_ns    = command_submit_ns;
-    raw_event.command_start_ns     = command_start_ns;
-    raw_event.command_end_ns       = command_end_ns;
+    raw_event.device_submit_ns     = device_submit_ns;
+    raw_event.device_start_ns      = device_start_ns;
+    raw_event.device_end_ns        = device_end_ns;
     raw_event.timestamp_status     = string_from_cstr(timestamp_status, "unknown");
     raw_event.callsite             = snapshot_callsite(ggml_sycl::sycl_timeline_callsite{ file, line, function });
     raw_event.graph_recorded       = graph_recorded;
@@ -757,10 +830,11 @@ std::string ggml_sycl_kernel_profile_format_csv_for_test() {
 }
 
 std::string ggml_sycl_kernel_profile_format_json_for_test() {
-    const ggml_sycl_kernel_profile_config cfg        = current_config();
-    const std::vector<profile_row>        rows       = collect_rows();
-    const std::vector<raw_profile_event>  raw_events = collect_raw_events();
-    return format_json_rows(rows, (cfg.raw_events || !raw_events.empty()) ? &raw_events : nullptr);
+    const ggml_sycl_kernel_profile_config cfg  = current_config();
+    const std::vector<profile_row>        rows = collect_rows();
+    const std::vector<raw_profile_event>  raw_events =
+        cfg.raw_events ? collect_raw_events() : std::vector<raw_profile_event>{};
+    return format_json_rows(rows, cfg.raw_events ? &raw_events : nullptr);
 }
 
 std::string ggml_sycl_kernel_profile_format_summary_for_test(int top_n) {

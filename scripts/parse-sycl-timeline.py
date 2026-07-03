@@ -73,11 +73,34 @@ def ns_to_ms_x1000(ns: float) -> int:
     return int(round(ns / 1000.0))
 
 
-def numeric_arg_field(event: dict[str, Any], name: str) -> float:
+def metadata_arg_fields(event: dict[str, Any]) -> dict[str, str]:
     args = event.get("args")
     if not isinstance(args, dict):
-        raise ValueError(f"missing args for event {event.get('name', 'unknown')}")
+        return {}
+    metadata = args.get("metadata")
+    if not isinstance(metadata, str):
+        return {}
+
+    fields: dict[str, str] = {}
+    for part in metadata.split(";"):
+        key, separator, value = part.partition("=")
+        if separator and key:
+            fields.setdefault(key, value)
+    return fields
+
+
+def arg_or_metadata_field(event: dict[str, Any], name: str) -> Any:
+    args = event.get("args")
+    if not isinstance(args, dict):
+        return None
     raw = args.get(name)
+    if raw not in (None, ""):
+        return raw
+    return metadata_arg_fields(event).get(name)
+
+
+def numeric_arg_field(event: dict[str, Any], name: str) -> float:
+    raw = arg_or_metadata_field(event, name)
     if isinstance(raw, bool):
         raise ValueError(f"invalid boolean args.{name} for event {event.get('name', 'unknown')}")
     try:
@@ -93,11 +116,15 @@ def device_range(event: dict[str, Any]) -> tuple[str, str, float, float] | None:
     args = event.get("args")
     if not isinstance(args, dict):
         return None
-    if any(args.get(name) in (None, "") for name in ("device", "queue_kind", "device_start_ns", "device_end_ns")):
+    device_raw = arg_or_metadata_field(event, "device")
+    queue_kind_raw = arg_or_metadata_field(event, "queue_kind")
+    if any(value in (None, "") for value in (device_raw, queue_kind_raw,
+                                             arg_or_metadata_field(event, "device_start_ns"),
+                                             arg_or_metadata_field(event, "device_end_ns"))):
         return None
 
-    device = str(args["device"])
-    queue_kind = str(args["queue_kind"])
+    device = str(device_raw)
+    queue_kind = str(queue_kind_raw)
     start_ns = numeric_arg_field(event, "device_start_ns")
     end_ns = numeric_arg_field(event, "device_end_ns")
     if end_ns < start_ns:
