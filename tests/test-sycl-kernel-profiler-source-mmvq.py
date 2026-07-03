@@ -88,3 +88,26 @@ def test_mmvq_active_blind_spots_have_named_profile_labels() -> None:
     assert "ggml_sycl_profile_submit(queue" in down_body
     assert "path=q8-soa;role=down" in down_body
     assert ".wait(" not in down_body
+
+
+def test_mmvq_active_direct_q8_soa_down_honors_row_group_variants() -> None:
+    mmvq = MMVQ.read_text(encoding="utf-8")
+    direct_body = slice_between(
+        mmvq,
+        "static const bool atomic_reduce = []() {\n        const char * env = std::getenv(\"GGML_SYCL_MOE_DOWN_SUM_DIRECT_ATOMIC\");",
+        "    if (completion_event) {\n        *completion_event = event;\n    }",
+    )
+    assert "GGML_SYCL_MOE_DOWN_SUM_DIRECT_ATOMIC" in direct_body
+    assert direct_body.index("if (atomic_reduce)") < direct_body.index("mxfp4_down_sum_q8_soa_atomic_sycl")
+
+    assert "mxfp4_moe_down_sum_q8_soa_tg_active_rows_per_group" in direct_body
+    assert "/*is_down_role=*/true, n_tokens" in direct_body
+    assert "mxfp4_down_sum_q8_soa_row_group_sycl<2>" in direct_body
+    assert "mxfp4_down_sum_q8_soa_row_group_sycl<4>" in direct_body
+    assert "mxfp4_down_sum_q8_soa_sycl" in direct_body
+    assert direct_body.index("mxfp4_down_sum_q8_soa_atomic_sycl") < direct_body.index(
+        "mxfp4_moe_down_sum_q8_soa_tg_active_rows_per_group"
+    )
+    assert direct_body.index("mxfp4_down_sum_q8_soa_row_group_sycl<2>") < direct_body.index(
+        "mxfp4_down_sum_q8_soa_sycl"
+    )

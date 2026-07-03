@@ -19719,12 +19719,30 @@ bool mmvq_moe_batched_dispatch_down_sum_from_cached_q8_mxfp4(
             static_cast<int>(n_ids), static_cast<int>(n_tokens), ids_nb0, ids_nb1, q8_row_size, ne11 * q8_row_size,
             moe_weights->nb[1], moe_weights->nb[2], down_bias ? down_bias->nb[1] : 0, final_token_stride, &atomic_deps);
     } else {
-        event = mxfp4_down_sum_q8_soa_sycl(*stream, reinterpret_cast<const uint8_t * const *>(down_ptrs_device),
-                                           q8_buffer, dst_d, ids_device, weights_d, bias_d, static_cast<int>(ncols),
-                                           static_cast<int>(ncols_y), static_cast<int>(nrows_per_expert),
-                                           static_cast<int>(n_ids), static_cast<int>(n_tokens), ids_nb0, ids_nb1,
-                                           q8_row_size, ne11 * q8_row_size, moe_weights->nb[1], moe_weights->nb[2],
-                                           down_bias ? down_bias->nb[1] : 0, final_token_stride, dispatch_deps_ptr);
+        const int row_group_variant = mxfp4_moe_down_sum_q8_soa_tg_active_rows_per_group(
+            /*is_down_role=*/true, n_tokens);
+        if (row_group_variant == 2) {
+            event = mxfp4_down_sum_q8_soa_row_group_sycl<2>(
+                *stream, reinterpret_cast<const uint8_t * const *>(down_ptrs_device), q8_buffer, dst_d, ids_device,
+                weights_d, bias_d, static_cast<int>(ncols), static_cast<int>(ncols_y),
+                static_cast<int>(nrows_per_expert), static_cast<int>(n_ids), static_cast<int>(n_tokens), ids_nb0,
+                ids_nb1, q8_row_size, ne11 * q8_row_size, moe_weights->nb[1], moe_weights->nb[2],
+                down_bias ? down_bias->nb[1] : 0, final_token_stride, dispatch_deps_ptr);
+        } else if (row_group_variant == 4) {
+            event = mxfp4_down_sum_q8_soa_row_group_sycl<4>(
+                *stream, reinterpret_cast<const uint8_t * const *>(down_ptrs_device), q8_buffer, dst_d, ids_device,
+                weights_d, bias_d, static_cast<int>(ncols), static_cast<int>(ncols_y),
+                static_cast<int>(nrows_per_expert), static_cast<int>(n_ids), static_cast<int>(n_tokens), ids_nb0,
+                ids_nb1, q8_row_size, ne11 * q8_row_size, moe_weights->nb[1], moe_weights->nb[2],
+                down_bias ? down_bias->nb[1] : 0, final_token_stride, dispatch_deps_ptr);
+        } else {
+            event = mxfp4_down_sum_q8_soa_sycl(*stream, reinterpret_cast<const uint8_t * const *>(down_ptrs_device),
+                                               q8_buffer, dst_d, ids_device, weights_d, bias_d, static_cast<int>(ncols),
+                                               static_cast<int>(ncols_y), static_cast<int>(nrows_per_expert),
+                                               static_cast<int>(n_ids), static_cast<int>(n_tokens), ids_nb0, ids_nb1,
+                                               q8_row_size, ne11 * q8_row_size, moe_weights->nb[1], moe_weights->nb[2],
+                                               down_bias ? down_bias->nb[1] : 0, final_token_stride, dispatch_deps_ptr);
+        }
     }
     if (completion_event) {
         *completion_event = event;
