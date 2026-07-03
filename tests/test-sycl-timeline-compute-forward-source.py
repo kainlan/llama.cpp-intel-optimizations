@@ -28,6 +28,11 @@ def graph_compute_impl_body(src: str) -> str:
     return src[open_brace:close_brace]
 
 
+def assert_no_waits(source: str) -> None:
+    assert ".wait(" not in source
+    assert "wait_and_throw" not in source
+
+
 def test_graph_compute_impl_has_timeline_scope_after_reentry_guard() -> None:
     src = read_source()
     assert '#include "sycl-timeline.hpp"' in src
@@ -40,8 +45,48 @@ def test_graph_compute_impl_has_timeline_scope_after_reentry_guard() -> None:
 
     assert guard < scope < compute_start
     scope_setup = body[guard:compute_start]
-    assert ".wait(" not in scope_setup
-    assert "wait_and_throw" not in scope_setup
+    assert_no_waits(scope_setup)
+
+
+def test_compute_forward_early_handled_route_has_timeline_scope_metadata() -> None:
+    src = read_source()
+    begin = src.index("auto e2e_record_early_handled_route")
+    helper_open = src.index("{", begin)
+    helper_close = matching_brace(src, helper_open)
+    helper = src[begin:helper_close]
+
+    assert "g_sycl_timeline_graph_spans_enabled" in src
+    gate = helper.index("if (g_sycl_timeline_graph_spans_enabled)")
+    gate_close = matching_brace(helper, helper.index("{", gate))
+    metadata = helper.index("ggml_sycl_timeline_tensor_metadata", gate)
+    scope = helper.index('"ggml.op", "early_handled_route"', metadata)
+    e2e_record = helper.index("ggml_sycl::e2e_tg_profile_record", gate_close)
+
+    assert gate < metadata < scope < gate_close < e2e_record
+    assert "std::optional<ggml_sycl::sycl_timeline_scope>" in helper[:gate]
+    assert "ctx.device" in helper[gate:gate_close]
+    assert "dst ? dst->name : nullptr" in helper[gate:gate_close]
+    assert "dst ? ggml_op_name(dst->op) : nullptr" in helper[gate:gate_close]
+    assert_no_waits(helper[gate:gate_close])
+
+
+def test_compute_forward_switch_has_timeline_scope_metadata() -> None:
+    src = read_source()
+    begin = src.index("static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst) try {")
+    switch = src.index("switch (dst->op)", begin)
+    preceding_window = src[max(0, switch - 2500) : switch]
+
+    assert "timeline_graph_span_flag_guard" in src
+    gate = preceding_window.index("if (g_sycl_timeline_graph_spans_enabled)")
+    gate_close = matching_brace(preceding_window, preceding_window.index("{", gate))
+    metadata = preceding_window.index("ggml_sycl_timeline_tensor_metadata", gate)
+    scope = preceding_window.index('"ggml.op", "compute_forward"', metadata)
+
+    assert gate < metadata < scope < gate_close
+    assert "std::optional<ggml_sycl::sycl_timeline_scope>" in preceding_window
+    assert "ggml_sycl_timeline_tensor_metadata(dst, ctx.device, dst->name" in preceding_window
+    assert "ggml_op_name(dst->op)" in preceding_window
+    assert_no_waits(preceding_window)
 
 
 def test_node_loop_compute_forward_has_timeline_scope_metadata() -> None:
@@ -74,5 +119,4 @@ def test_node_loop_compute_forward_has_timeline_scope_metadata() -> None:
         assert "ggml_sycl_timeline_node_metadata" in preceding_window
         assert "node->name" in preceding_window
         assert "ggml_op_name(node->op)" in preceding_window
-        assert ".wait(" not in preceding_window
-        assert "wait_and_throw" not in preceding_window
+        assert_no_waits(preceding_window)
