@@ -9,6 +9,7 @@
 #include "alloc-registry.hpp"
 #include "common.hpp"
 #include "e2e-profile.hpp"
+#include "sycl-timeline.hpp"
 #include "expert-prefetch.hpp"
 #include "ggml-impl.h"
 #include "ggml-sycl-test.hpp"
@@ -2417,6 +2418,12 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
                         if (e2e_tg_profile_enabled()) {
                             e2e_tg_profile_record_cache_event("host_fallback", size, 0.0);
                         }
+                        if (sycl_timeline_enabled()) {
+                            char timeline_metadata[128];
+                            std::snprintf(timeline_metadata, sizeof(timeline_metadata), "bytes=%zu",
+                                          static_cast<size_t>(size));
+                            GGML_SYCL_TIMELINE_SCOPE("cache", "host_fallback", timeline_metadata);
+                        }
                         use_host_fallback = true;
                         break;
                     }
@@ -2438,6 +2445,12 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
                         if (e2e_tg_profile_enabled()) {
                             e2e_tg_profile_record_cache_event("host_fallback", size, 0.0);
                         }
+                        if (sycl_timeline_enabled()) {
+                            char timeline_metadata[128];
+                            std::snprintf(timeline_metadata, sizeof(timeline_metadata), "bytes=%zu",
+                                          static_cast<size_t>(size));
+                            GGML_SYCL_TIMELINE_SCOPE("cache", "host_fallback", timeline_metadata);
+                        }
                         use_host_fallback = true;
                     }
 
@@ -2447,6 +2460,12 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
                         offload_stats_note_host_fallback_attempt(size);
                         if (e2e_tg_profile_enabled()) {
                             e2e_tg_profile_record_cache_event("host_fallback", size, 0.0);
+                        }
+                        if (sycl_timeline_enabled()) {
+                            char timeline_metadata[128];
+                            std::snprintf(timeline_metadata, sizeof(timeline_metadata), "bytes=%zu",
+                                          static_cast<size_t>(size));
+                            GGML_SYCL_TIMELINE_SCOPE("cache", "host_fallback", timeline_metadata);
                         }
                         use_host_fallback = true;
                     }
@@ -2574,6 +2593,12 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
             if (e2e_tg_profile_enabled()) {
                 e2e_tg_profile_record_cache_event("host_fallback", size, 0.0);
             }
+            if (sycl_timeline_enabled()) {
+                char timeline_metadata[128];
+                std::snprintf(timeline_metadata, sizeof(timeline_metadata), "bytes=%zu",
+                              static_cast<size_t>(size));
+                GGML_SYCL_TIMELINE_SCOPE("cache", "host_fallback", timeline_metadata);
+            }
             use_host_fallback = true;
             break;
         }
@@ -2596,6 +2621,12 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
             if (e2e_tg_profile_enabled()) {
                 e2e_tg_profile_record_cache_event("host_fallback", size, 0.0);
             }
+            if (sycl_timeline_enabled()) {
+                char timeline_metadata[128];
+                std::snprintf(timeline_metadata, sizeof(timeline_metadata), "bytes=%zu",
+                              static_cast<size_t>(size));
+                GGML_SYCL_TIMELINE_SCOPE("cache", "host_fallback", timeline_metadata);
+            }
             use_host_fallback = true;
         }
 
@@ -2604,6 +2635,12 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
             offload_stats_note_host_fallback_attempt(size);
             if (e2e_tg_profile_enabled()) {
                 e2e_tg_profile_record_cache_event("host_fallback", size, 0.0);
+            }
+            if (sycl_timeline_enabled()) {
+                char timeline_metadata[128];
+                std::snprintf(timeline_metadata, sizeof(timeline_metadata), "bytes=%zu",
+                              static_cast<size_t>(size));
+                GGML_SYCL_TIMELINE_SCOPE("cache", "host_fallback", timeline_metadata);
             }
             use_host_fallback = true;
         }
@@ -3209,6 +3246,12 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         offload_stats_note_host_fallback_attempt(dst_size);
         if (e2e_tg_profile_enabled()) {
             e2e_tg_profile_record_cache_event("host_fallback", dst_size, 0.0);
+        }
+        if (sycl_timeline_enabled()) {
+            char timeline_metadata[128];
+            std::snprintf(timeline_metadata, sizeof(timeline_metadata), "bytes=%zu",
+                          static_cast<size_t>(dst_size));
+            GGML_SYCL_TIMELINE_SCOPE("cache", "host_fallback", timeline_metadata);
         }
         static std::atomic<int> host_fallback_log{ 0 };
         if (host_fallback_log.fetch_add(1, std::memory_order_relaxed) < 10) {
@@ -8688,6 +8731,12 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                     if (e2e_tg_profile_enabled()) {
                         e2e_tg_profile_record_cache_event("host_fallback", alloc_size, 0.0);
                     }
+                    if (sycl_timeline_enabled()) {
+                        char timeline_metadata[128];
+                        std::snprintf(timeline_metadata, sizeof(timeline_metadata), "bytes=%zu",
+                                      static_cast<size_t>(alloc_size));
+                        GGML_SYCL_TIMELINE_SCOPE("cache", "host_fallback", timeline_metadata);
+                    }
                     kv_spill_to_host = true;
                 }
             }
@@ -9407,6 +9456,12 @@ unified_alloc_result unified_cache_allocate(int device, size_t size, alloc_categ
         offload_stats_note_host_fallback_attempt(size);
         if (e2e_tg_profile_enabled()) {
             e2e_tg_profile_record_cache_event("host_fallback", size, 0.0);
+        }
+        if (sycl_timeline_enabled()) {
+            char timeline_metadata[128];
+            std::snprintf(timeline_metadata, sizeof(timeline_metadata), "bytes=%zu",
+                          static_cast<size_t>(size));
+            GGML_SYCL_TIMELINE_SCOPE("cache", "host_fallback", timeline_metadata);
         }
         req.intent.constraints.must_host_pinned = true;
         req.intent.constraints.must_device      = false;
@@ -11860,6 +11915,12 @@ unified_cache::vram_alloc_result unified_cache::allocate(size_t size, alloc_life
             offload_stats_note_host_fallback_attempt(size);
             if (e2e_tg_profile_enabled()) {
                 e2e_tg_profile_record_cache_event("host_fallback", size, 0.0);
+            }
+            if (sycl_timeline_enabled()) {
+                char timeline_metadata[128];
+                std::snprintf(timeline_metadata, sizeof(timeline_metadata), "bytes=%zu",
+                              static_cast<size_t>(size));
+                GGML_SYCL_TIMELINE_SCOPE("cache", "host_fallback", timeline_metadata);
             }
             host_fallback_counted = true;
         }
