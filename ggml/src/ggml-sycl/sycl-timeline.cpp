@@ -7,17 +7,31 @@
 #include <cstring>
 #include <mutex>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace ggml_sycl {
 namespace {
 
+struct sycl_timeline_span_event {
+    std::string category;
+    std::string name;
+    std::string metadata;
+    std::string file;
+    int         line = 0;
+    std::string function;
+    int64_t     ts_us  = 0;
+    int64_t     dur_us = 0;
+};
+
 struct sycl_timeline_state {
     std::mutex mutex;
 
-    bool                 env_config_loaded   = false;
-    sycl_timeline_config env_config          = {};
-    bool                 test_config_enabled = false;
-    sycl_timeline_config test_config         = {};
+    bool                                  env_config_loaded   = false;
+    sycl_timeline_config                  env_config          = {};
+    bool                                  test_config_enabled = false;
+    sycl_timeline_config                  test_config         = {};
+    std::vector<sycl_timeline_span_event> events;
 };
 
 sycl_timeline_state & get_timeline_state() {
@@ -128,6 +142,96 @@ const sycl_timeline_config & current_config(sycl_timeline_state & state) {
     return state.env_config;
 }
 
+bool config_records_spans(const sycl_timeline_config & cfg) {
+    return cfg.enabled && (cfg.mode == sycl_timeline_mode::TIMELINE || cfg.mode == sycl_timeline_mode::TIMELINE_EVENTS);
+}
+
+std::string string_or_empty(const char * value) {
+    return value != nullptr ? value : "";
+}
+
+int64_t time_point_to_us(std::chrono::steady_clock::time_point time_point) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(time_point.time_since_epoch()).count();
+}
+
+int64_t duration_to_us(std::chrono::steady_clock::duration duration) {
+    const int64_t duration_us = std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
+    return duration_us >= 0 ? duration_us : 0;
+}
+
+void append_json_escaped(std::string & out, std::string_view value) {
+    static constexpr char hex[] = "0123456789abcdef";
+
+    out.push_back('"');
+    for (const char ch : value) {
+        const unsigned char uch = static_cast<unsigned char>(ch);
+        switch (ch) {
+            case '"':
+                out += "\\\"";
+                break;
+            case '\\':
+                out += "\\\\";
+                break;
+            case '\b':
+                out += "\\b";
+                break;
+            case '\f':
+                out += "\\f";
+                break;
+            case '\n':
+                out += "\\n";
+                break;
+            case '\r':
+                out += "\\r";
+                break;
+            case '\t':
+                out += "\\t";
+                break;
+            default:
+                if (uch < 0x20) {
+                    out += "\\u00";
+                    out.push_back(hex[(uch >> 4) & 0x0f]);
+                    out.push_back(hex[uch & 0x0f]);
+                } else {
+                    out.push_back(ch);
+                }
+                break;
+        }
+    }
+    out.push_back('"');
+}
+
+std::string format_trace_json(const std::vector<sycl_timeline_span_event> & events) {
+    std::string out;
+    out.reserve(events.size() * 192 + 18);
+    out += "{\"traceEvents\":[";
+    for (size_t i = 0; i < events.size(); ++i) {
+        const sycl_timeline_span_event & event = events[i];
+        if (i != 0) {
+            out.push_back(',');
+        }
+        out += "{\"ph\":\"X\",\"cat\":";
+        append_json_escaped(out, event.category);
+        out += ",\"name\":";
+        append_json_escaped(out, event.name);
+        out += ",\"ts\":";
+        out += std::to_string(event.ts_us);
+        out += ",\"dur\":";
+        out += std::to_string(event.dur_us);
+        out += ",\"args\":{\"file\":";
+        append_json_escaped(out, event.file);
+        out += ",\"line\":";
+        out += std::to_string(event.line);
+        out += ",\"function\":";
+        append_json_escaped(out, event.function);
+        out += ",\"metadata\":";
+        append_json_escaped(out, event.metadata);
+        out += "}}";
+    }
+    out += "]}";
+    return out;
+}
+
 }  // namespace
 
 bool sycl_timeline_enabled_from_env(const char * value) {
@@ -161,6 +265,72 @@ sycl_timeline_config sycl_timeline_config_from_values(const char * mode,
     return cfg;
 }
 
+sycl_timeline_scope::sycl_timeline_scope(const char *           category,
+                                         const char *           name,
+                                         const char *           metadata,
+                                         sycl_timeline_callsite callsite) :
+    active_(sycl_timeline_enabled()),
+    start_time_(std::chrono::steady_clock::now()) {
+    if (!active_) {
+        return;
+    }
+
+    category_ = string_or_empty(category);
+    name_     = string_or_empty(name);
+    metadata_ = string_or_empty(metadata);
+    callsite_ = callsite;
+}
+
+sycl_timeline_scope::~sycl_timeline_scope() {
+    if (!active_) {
+        return;
+    }
+
+    try {
+        sycl_timeline_record_span(category_.c_str(), name_.c_str(), metadata_.c_str(), callsite_, start_time_,
+                                  std::chrono::steady_clock::now());
+    } catch (...) {
+    }
+}
+
+void sycl_timeline_record_span(const char *                          category,
+                               const char *                          name,
+                               const char *                          metadata,
+                               sycl_timeline_callsite                callsite,
+                               std::chrono::steady_clock::time_point start_time,
+                               std::chrono::steady_clock::time_point end_time) {
+    sycl_timeline_state &       state = get_timeline_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+
+    const sycl_timeline_config & cfg = current_config(state);
+    if (!config_records_spans(cfg) || cfg.max_events <= 0 || static_cast<int>(state.events.size()) >= cfg.max_events) {
+        return;
+    }
+
+    sycl_timeline_span_event event;
+    event.category = string_or_empty(category);
+    event.name     = string_or_empty(name);
+    event.metadata = string_or_empty(metadata);
+    event.file     = string_or_empty(callsite.file);
+    event.line     = callsite.line;
+    event.function = string_or_empty(callsite.function);
+    event.ts_us    = time_point_to_us(start_time);
+    event.dur_us   = duration_to_us(end_time - start_time);
+
+    state.events.push_back(std::move(event));
+}
+
+std::string sycl_timeline_format_json_for_tests() {
+    sycl_timeline_state &       state = get_timeline_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+
+    if (!config_records_spans(current_config(state)) || state.events.empty()) {
+        return "{\"traceEvents\":[]}";
+    }
+
+    return format_trace_json(state.events);
+}
+
 void sycl_timeline_reset_for_tests() {
     sycl_timeline_state &       state = get_timeline_state();
     std::lock_guard<std::mutex> lock(state.mutex);
@@ -169,6 +339,7 @@ void sycl_timeline_reset_for_tests() {
     state.env_config          = {};
     state.test_config_enabled = false;
     state.test_config         = {};
+    state.events.clear();
 }
 
 void sycl_timeline_set_config_for_tests(const sycl_timeline_config & cfg) {
@@ -177,6 +348,7 @@ void sycl_timeline_set_config_for_tests(const sycl_timeline_config & cfg) {
 
     state.test_config_enabled = true;
     state.test_config         = cfg;
+    state.events.clear();
 }
 
 }  // namespace ggml_sycl
