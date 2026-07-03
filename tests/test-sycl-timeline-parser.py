@@ -61,15 +61,35 @@ def test_parser_summarizes_wall_categories_and_callsites() -> None:
                 },
             },
             {
-                "name": "device event",
+                "name": "device event 1",
                 "cat": "sycl.event",
                 "ph": "X",
                 "ts": 3000,
-                "dur": 5000,
+                "dur": 3000,
                 "args": {
                     "file": "ggml/src/ggml-sycl/ggml-sycl.cpp",
                     "line": 140,
                     "function": "device_event",
+                    "device": 1,
+                    "queue_kind": "compute",
+                    "device_start_ns": 10000,
+                    "device_end_ns": 13000,
+                },
+            },
+            {
+                "name": "device event 2",
+                "cat": "sycl.event",
+                "ph": "X",
+                "ts": 6000,
+                "dur": 2000,
+                "args": {
+                    "file": "ggml/src/ggml-sycl/ggml-sycl.cpp",
+                    "line": 140,
+                    "function": "device_event",
+                    "device": 1,
+                    "queue_kind": "compute",
+                    "device_start_ns": 16000,
+                    "device_end_ns": 18000,
                 },
             },
             {"name": "instant", "cat": "sycl.submit", "ph": "i", "ts": 4000},
@@ -83,6 +103,11 @@ def test_parser_summarizes_wall_categories_and_callsites() -> None:
 
     assert result.returncode == 0, result.stdout
     assert "timeline.wall_ms_x1000 10000" in result.stdout
+    assert "timeline.gpu_event_total_ms_x1000 5" in result.stdout
+    assert "timeline.gpu_event_coverage_pct_x1000 50" in result.stdout
+    assert "timeline.unattributed_ms_x1000 9995" in result.stdout
+    assert "gap.device1.compute.count 1" in result.stdout
+    assert "gap.device1.compute.total_ms_x1000 3" in result.stdout
     assert "category.ggml.graph.host_ms_x1000 10000" in result.stdout
     assert "category.sycl.submit.host_ms_x1000 100" in result.stdout
     assert "category.sycl.wait.host_ms_x1000 1500" in result.stdout

@@ -8,7 +8,7 @@ import json
 import math
 import pathlib
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import Any
 
 
@@ -67,9 +67,71 @@ def us_to_ms_x1000(us: float) -> int:
     return int(round(us))
 
 
-def summarize_events(events: list[dict[str, Any]]) -> tuple[Counter[str], Counter[str], float]:
+def ns_to_ms_x1000(ns: float) -> int:
+    # Device timestamps are reported in nanoseconds.  x1000-ms is the same
+    # scale as microseconds, so convert nanoseconds to microseconds.
+    return int(round(ns / 1000.0))
+
+
+def numeric_arg_field(event: dict[str, Any], name: str) -> float:
+    args = event.get("args")
+    if not isinstance(args, dict):
+        raise ValueError(f"missing args for event {event.get('name', 'unknown')}")
+    raw = args.get(name)
+    if isinstance(raw, bool):
+        raise ValueError(f"invalid boolean args.{name} for event {event.get('name', 'unknown')}")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid numeric args.{name} for event {event.get('name', 'unknown')}: {raw!r}") from exc
+    if not math.isfinite(value):
+        raise ValueError(f"invalid non-finite args.{name} for event {event.get('name', 'unknown')}: {raw!r}")
+    return value
+
+
+def device_range(event: dict[str, Any]) -> tuple[str, str, float, float] | None:
+    args = event.get("args")
+    if not isinstance(args, dict):
+        return None
+    if any(args.get(name) in (None, "") for name in ("device", "queue_kind", "device_start_ns", "device_end_ns")):
+        return None
+
+    device = str(args["device"])
+    queue_kind = str(args["queue_kind"])
+    start_ns = numeric_arg_field(event, "device_start_ns")
+    end_ns = numeric_arg_field(event, "device_end_ns")
+    if end_ns < start_ns:
+        return None
+    return device, queue_kind, start_ns, end_ns
+
+
+def summarize_queue_gaps(
+    ranges_by_queue: dict[tuple[str, str], list[tuple[float, float]]],
+) -> dict[tuple[str, str], tuple[int, int]]:
+    gaps: dict[tuple[str, str], tuple[int, int]] = {}
+    for queue, ranges in ranges_by_queue.items():
+        if not ranges:
+            continue
+        sorted_ranges = sorted(ranges)
+        previous_end = sorted_ranges[0][1]
+        gap_count = 0
+        gap_ns = 0.0
+        for start_ns, end_ns in sorted_ranges[1:]:
+            if start_ns > previous_end:
+                gap_count += 1
+                gap_ns += start_ns - previous_end
+            previous_end = max(previous_end, end_ns)
+        gaps[queue] = (gap_count, ns_to_ms_x1000(gap_ns))
+    return gaps
+
+
+def summarize_events(
+    events: list[dict[str, Any]],
+) -> tuple[Counter[str], Counter[str], float, int, dict[tuple[str, str], tuple[int, int]]]:
     category_totals: Counter[str] = Counter()
     callsite_totals: Counter[str] = Counter()
+    ranges_by_queue: dict[tuple[str, str], list[tuple[float, float]]] = defaultdict(list)
+    gpu_event_total_us = 0.0
     span_start: float | None = None
     span_end: float | None = None
 
@@ -78,6 +140,13 @@ def summarize_events(events: list[dict[str, Any]]) -> tuple[Counter[str], Counte
             continue
         category = str(event.get("cat", "unknown"))
         if is_sycl_event_category(category):
+            event_range = device_range(event)
+            if event_range is not None:
+                device, queue_kind, start_ns, end_ns = event_range
+                ranges_by_queue[(device, queue_kind)].append((start_ns, end_ns))
+                gpu_event_total_us += max(0.0, end_ns - start_ns) / 1000.0
+            else:
+                gpu_event_total_us += numeric_field(event, "dur")
             continue
         dur_us = numeric_field(event, "dur")
         ts_us = numeric_field(event, "ts")
@@ -96,7 +165,7 @@ def summarize_events(events: list[dict[str, Any]]) -> tuple[Counter[str], Counte
         wall_us = 0.0
     else:
         wall_us = max(0.0, span_end - span_start)
-    return category_totals, callsite_totals, wall_us
+    return category_totals, callsite_totals, wall_us, us_to_ms_x1000(gpu_event_total_us), summarize_queue_gaps(ranges_by_queue)
 
 
 def main(argv: list[str]) -> int:
@@ -111,13 +180,24 @@ def main(argv: list[str]) -> int:
 
     try:
         events = load_trace_events(args.trace)
-        category_totals, callsite_totals, envelope_wall_us = summarize_events(events)
+        category_totals, callsite_totals, envelope_wall_us, gpu_event_total, queue_gaps = summarize_events(events)
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         print(f"failed to parse timeline: {exc}")
         return 2
 
     wall_us = args.wall_ms * 1000.0 if args.wall_ms is not None else envelope_wall_us
-    print(f"timeline.wall_ms_x1000 {us_to_ms_x1000(wall_us)}")
+    wall_total = us_to_ms_x1000(wall_us)
+    gpu_event_coverage = int(round(gpu_event_total / wall_total * 100000.0)) if wall_total > 0 else 0
+    unattributed_total = max(0, wall_total - gpu_event_total)
+
+    print(f"timeline.wall_ms_x1000 {wall_total}")
+    print(f"timeline.gpu_event_total_ms_x1000 {gpu_event_total}")
+    print(f"timeline.gpu_event_coverage_pct_x1000 {gpu_event_coverage}")
+    print(f"timeline.unattributed_ms_x1000 {unattributed_total}")
+
+    for (device, queue_kind), (gap_count, gap_total) in sorted(queue_gaps.items()):
+        print(f"gap.device{device}.{queue_kind}.count {gap_count}")
+        print(f"gap.device{device}.{queue_kind}.total_ms_x1000 {gap_total}")
 
     for category, total in sorted(category_totals.items()):
         print(f"category.{category}.host_ms_x1000 {total}")
