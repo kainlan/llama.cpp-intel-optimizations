@@ -39,11 +39,33 @@ REQUIRED_DRY_RUN_STRINGS = [
     "-p 512",
     "-n 128",
     "-r 1",
+    "sycl-timeline.json",
+    "sycl-kernels",
+    "bench.stdout",
+    "bench.stderr",
+    "timeline.parse",
+    "kernels.parse",
+    "scripts/parse-sycl-timeline.py",
+    "scripts/parse-sycl-kernel-profile.py",
+]
+
+
+EXECUTE_BRANCH_STRINGS = [
+    "mkdir -p \"${OUT_ROOT}\"",
+    "print_cmd >\"${OUT_ROOT}/command.txt\"",
+    "env \"${env_args[@]}\" \"${bench_args[@]}\" >\"${OUT_ROOT}/bench.stdout\" 2>\"${OUT_ROOT}/bench.stderr\"",
+    "python3 scripts/parse-sycl-timeline.py \"${OUT_ROOT}/sycl-timeline.json\" >\"${OUT_ROOT}/timeline.parse\"",
+    "python3 scripts/parse-sycl-kernel-profile.py \"${OUT_ROOT}/sycl-kernels.csv\" >\"${OUT_ROOT}/kernels.parse\"",
+    "printf 'Artifacts: %s\\n' \"${OUT_ROOT}\"",
 ]
 
 
 def _doc_text() -> str:
     return DOC.read_text(encoding="utf-8")
+
+
+def _script_text() -> str:
+    return SCRIPT.read_text(encoding="utf-8")
 
 
 def test_timeline_profile_script_is_dry_run_by_default() -> None:
@@ -58,6 +80,16 @@ def test_timeline_profile_script_is_dry_run_by_default() -> None:
     assert result.returncode == 0, result.stdout
     for required in REQUIRED_DRY_RUN_STRINGS:
         assert required in result.stdout
+
+
+def test_timeline_profile_script_execute_branch_wires_artifact_layout() -> None:
+    text = _script_text()
+    execute_start = 'mkdir -p "${OUT_ROOT}"'
+    assert execute_start in text
+    execute_branch = text[text.index(execute_start) :]
+    assert "--top" not in execute_branch
+    for required in EXECUTE_BRANCH_STRINGS:
+        assert required in execute_branch
 
 
 def test_timeline_profile_script_refuses_execute_without_ack() -> None:
