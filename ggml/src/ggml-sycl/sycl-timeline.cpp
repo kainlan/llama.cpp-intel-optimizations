@@ -37,6 +37,7 @@ struct sycl_timeline_state {
     bool                                  test_config_enabled     = false;
     sycl_timeline_config                  test_config             = {};
     int64_t                               next_graph_compute_step = 0;
+    uint64_t                              successful_file_flushes = 0;
     std::vector<sycl_timeline_span_event> events;
 };
 
@@ -302,6 +303,13 @@ bool sycl_timeline_records_events() {
            cfg.max_events > 0 && static_cast<int>(state.events.size()) < cfg.max_events;
 }
 
+bool sycl_timeline_has_flushed_file() {
+    sycl_timeline_state &       state = get_timeline_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+
+    return state.successful_file_flushes > 0;
+}
+
 int64_t sycl_timeline_current_graph_compute_step() {
     sycl_timeline_state &       state = get_timeline_state();
     std::lock_guard<std::mutex> lock(state.mutex);
@@ -453,7 +461,7 @@ void sycl_timeline_flush(const char * reason) {
     std::lock_guard<std::mutex> lock(state.mutex);
 
     const sycl_timeline_config & cfg = current_config(state);
-    if (!cfg.enabled || cfg.output_path.empty()) {
+    if (!cfg.enabled || cfg.output_path.empty() || state.events.empty() || state.successful_file_flushes > 0) {
         return;
     }
 
@@ -468,8 +476,9 @@ void sycl_timeline_flush(const char * reason) {
         return;
     }
 
-    // Flush is one-shot: successful explicit file writes consume the buffered spans;
-    // failed or disabled/pathless flushes leave the buffer untouched for retry/tests.
+    // Flush is one-shot: successful explicit non-empty file writes consume the buffered spans and lock the output file.
+    // Failed, disabled, pathless, empty, or duplicate flushes leave the buffer/file untouched for retry/tests.
+    state.successful_file_flushes++;
     state.events.clear();
 }
 
@@ -493,6 +502,7 @@ void sycl_timeline_reset_for_tests() {
     state.test_config_enabled     = false;
     state.test_config             = {};
     state.next_graph_compute_step = 0;
+    state.successful_file_flushes = 0;
     state.events.clear();
     g_current_graph_compute_step = -1;
 }
@@ -504,6 +514,7 @@ void sycl_timeline_set_config_for_tests(const sycl_timeline_config & cfg) {
     state.test_config_enabled     = true;
     state.test_config             = cfg;
     state.next_graph_compute_step = 0;
+    state.successful_file_flushes = 0;
     state.events.clear();
     g_current_graph_compute_step = -1;
 }

@@ -38,3 +38,21 @@ def test_decode_teardown_flushes_timeline_near_e2e_force_flush_without_waits() -
     assert "std::atexit" not in window
     assert ".wait(" not in window
     assert "wait_and_throw" not in window
+
+
+def test_backend_free_flushes_timeline_after_kernel_profile_drain_without_waits() -> None:
+    src = read_source()
+    kernel_flush = 'ggml_sycl_kernel_profile_flush(true, "backend-free");'
+    timeline_flush = 'ggml_sycl::sycl_timeline_flush("backend-free");'
+    delete_backend = "delete sycl_ctx;"
+
+    begin = src.index(kernel_flush)
+    window = src[begin : begin + 500]
+
+    assert timeline_flush in window
+    assert window.index(kernel_flush) < window.index(timeline_flush) < window.index(delete_backend)
+    assert "ggml_sycl::sycl_timeline_enabled()" in window
+    assert "!ggml_sycl::sycl_timeline_has_flushed_file()" in window
+    assert "std::atexit" not in window
+    assert ".wait(" not in window
+    assert "wait_and_throw" not in window

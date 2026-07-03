@@ -53,6 +53,7 @@ bool                 sycl_timeline_enabled_from_env(const char * value);
 bool                 sycl_timeline_enabled();
 bool                 sycl_timeline_records_spans();
 bool                 sycl_timeline_records_events();
+bool                 sycl_timeline_has_flushed_file();
 int64_t              sycl_timeline_current_graph_compute_step();
 bool                 sycl_timeline_records_events_for_step(int64_t step);
 void                 sycl_timeline_note_graph_compute();

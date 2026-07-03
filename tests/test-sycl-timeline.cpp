@@ -152,8 +152,17 @@ int main() {
     const std::string file_json = read_file(trace_path);
     require(contains(file_json, "\"traceEvents\""), "flushed trace file must contain traceEvents");
     require(contains(file_json, "\"name\":\"flush-span\""), "flushed trace file must contain span name");
+    require(sycl_timeline_has_flushed_file(), "successful flush must mark the file as written");
     require(sycl_timeline_format_json_for_tests() == "{\"traceEvents\":[]}",
             "successful flush must consume buffered events");
+    {
+        GGML_SYCL_TIMELINE_SCOPE("unit", "late-backend-free-span", "case=second-flush");
+    }
+    sycl_timeline_flush("backend-free");
+    const std::string second_file_json = read_file(trace_path);
+    require(second_file_json == file_json, "second flush must not clobber the first trace file");
+    require(!contains(second_file_json, "\"name\":\"late-backend-free-span\""),
+            "second flush must not replace the first trace with late spans");
     std::remove(trace_path.c_str());
     rmdir(trace_dir.c_str());
 
