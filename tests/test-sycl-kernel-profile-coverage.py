@@ -70,3 +70,11 @@ def test_parser_reports_missing_kernel_bytes_as_exit_2() -> None:
     assert result.returncode == 2
     assert "missing bytes kernel: missing.kernel" in result.stdout
     assert "Traceback" not in result.stdout
+
+
+def test_parser_rejects_non_finite_wall_ms_without_traceback() -> None:
+    result = run_parser_for_csv("--wall-ms", "nan")
+
+    assert result.returncode == 2
+    assert "argument --wall-ms: --wall-ms must be finite and greater than zero" in result.stdout
+    assert "Traceback" not in result.stdout

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import pathlib
 import sys
 from collections import Counter
@@ -59,8 +60,8 @@ def parse_wall_ms(raw: str) -> float:
         value = float(raw)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"invalid wall millisecond value: {raw}") from exc
-    if value <= 0:
-        raise argparse.ArgumentTypeError("--wall-ms must be greater than zero")
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError("--wall-ms must be finite and greater than zero")
     return value
 
 
