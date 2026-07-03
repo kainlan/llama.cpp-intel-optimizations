@@ -58,6 +58,14 @@ static ggml_sycl_profile_label mmvq_profile_label(sycl::queue & queue,
     return label;
 }
 
+static sycl::event mmvq_profile_record_quantize_activation_q8_soa(sycl::queue &       queue,
+                                                                  const sycl::event & event,
+                                                                  size_t              bytes) {
+    ggml_sycl_profile_label label =
+        mmvq_profile_label(queue, "mxfp4.quantize.activation_q8_soa", "role=activation;layout=q8_soa", "mmvq", bytes);
+    return ggml_sycl_profile_record_returned_event(label, event);
+}
+
 static __dpct_inline__ float mmvq_fused_add_value(const float * add,
                                                   const int64_t add_ne0,
                                                   const int64_t add_nb0,
@@ -6748,41 +6756,43 @@ static sycl::event mxfp4_dpas_pack_q8_single_col_groups_sycl(sycl::queue &      
 
     // Single-column DPAS consumers read only column 0 from the packed B tile.
     // The other columns can remain unspecified; clearing them is pure overhead.
-    GGML_UNUSED(b_bytes);
-    GGML_UNUSED(y_bytes);
-    return queue.submit([&](sycl::handler & cgh) {
-        if (!deps.empty()) {
-            cgh.depends_on(deps);
-        }
-        cgh.parallel_for(
-            sycl::range<1>(static_cast<size_t>(groups) * static_cast<size_t>(k_tiles) * static_cast<size_t>(k_per)),
-            [=](sycl::id<1> idx) {
-                const int64_t linear = static_cast<int64_t>(idx[0]);
-                const int     kk     = static_cast<int>(linear % k_per);
-                const int64_t t0     = linear / k_per;
-                const int     kt     = static_cast<int>(t0 % k_tiles);
-                const int     group  = static_cast<int>(t0 / k_tiles);
-                const int     id     = group / n_tokens;
-                const int     iid1   = group - id * n_tokens;
-                const int64_t i11    = id % ne11;
-                const int64_t i12    = iid1;
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(queue, "mxfp4.pack_q8.single_col", "path=packed-q8;role=pack", "mmvq", b_bytes + y_bytes);
+    return ggml_sycl_profile_submit(queue, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            if (!deps.empty()) {
+                cgh.depends_on(deps);
+            }
+            cgh.parallel_for(
+                sycl::range<1>(static_cast<size_t>(groups) * static_cast<size_t>(k_tiles) * static_cast<size_t>(k_per)),
+                [=](sycl::id<1> idx) {
+                    const int64_t linear = static_cast<int64_t>(idx[0]);
+                    const int     kk     = static_cast<int>(linear % k_per);
+                    const int64_t t0     = linear / k_per;
+                    const int     kt     = static_cast<int>(t0 % k_tiles);
+                    const int     group  = static_cast<int>(t0 / k_tiles);
+                    const int     id     = group / n_tokens;
+                    const int     iid1   = group - id * n_tokens;
+                    const int64_t i11    = id % ne11;
+                    const int64_t i12    = iid1;
 
-                const char * q8_row = static_cast<const char *>(q8_src) + i11 * q8_nb11 + i12 * q8_nb12;
-                const int8_t q      = reinterpret_cast<const int8_t *>(q8_row)[kt * k_per + kk];
+                    const char * q8_row = static_cast<const char *>(q8_src) + i11 * q8_nb11 + i12 * q8_nb12;
+                    const int8_t q      = reinterpret_cast<const int8_t *>(q8_row)[kt * k_per + kk];
 
-                const size_t tile_base =
-                    (static_cast<size_t>(group) * static_cast<size_t>(k_tiles) + static_cast<size_t>(kt)) *
-                    static_cast<size_t>(k_per * exec_n);
-                const int vnni_offset                                  = (kk / 4) * exec_n * 4 + (kk % 4);
-                b_packed[tile_base + static_cast<size_t>(vnni_offset)] = q;
+                    const size_t tile_base =
+                        (static_cast<size_t>(group) * static_cast<size_t>(k_tiles) + static_cast<size_t>(kt)) *
+                        static_cast<size_t>(k_per * exec_n);
+                    const int vnni_offset                                  = (kk / 4) * exec_n * 4 + (kk % 4);
+                    b_packed[tile_base + static_cast<size_t>(vnni_offset)] = q;
 
-                if (kk == 0) {
-                    const auto * ds =
-                        reinterpret_cast<const sycl::half2 *>(q8_row + ncols_y + kt * sizeof(sycl::half2));
-                    y_scales[(static_cast<size_t>(group) * static_cast<size_t>(k_tiles) + static_cast<size_t>(kt)) *
-                             static_cast<size_t>(exec_n)] = static_cast<float>(ds->x());
-                }
-            });
+                    if (kk == 0) {
+                        const auto * ds =
+                            reinterpret_cast<const sycl::half2 *>(q8_row + ncols_y + kt * sizeof(sycl::half2));
+                        y_scales[(static_cast<size_t>(group) * static_cast<size_t>(k_tiles) + static_cast<size_t>(kt)) *
+                                 static_cast<size_t>(exec_n)] = static_cast<float>(ds->x());
+                    }
+                });
+        });
     });
 }
 
@@ -6814,21 +6824,97 @@ static sycl::event mxfp4_dpas_pack_q8_grouped_chunks_sycl(sycl::queue &         
     constexpr int exec_n  = GGML_SYCL_MXFP4_MOE_XMX_N;
     constexpr int k_per   = GGML_SYCL_MXFP4_MOE_XMX_K;
     const int     k_tiles = ncols / k_per;
+    const size_t  b_bytes =
+        static_cast<size_t>(n_chunks) * static_cast<size_t>(k_tiles) * static_cast<size_t>(k_per * exec_n);
+    const size_t y_bytes =
+        static_cast<size_t>(n_chunks) * static_cast<size_t>(k_tiles) * static_cast<size_t>(exec_n) * sizeof(float);
 
     if (mxfp4_grouped_pack_q8_vector_enabled()) {
-        return queue.submit([&](sycl::handler & cgh) {
+        ggml_sycl_profile_label profile_label =
+            mmvq_profile_label(queue, "mxfp4.pack_q8.grouped_chunks", "path=grouped-packed-q8;role=pack;variant=vector",
+                               "mmvq", b_bytes + y_bytes);
+        return ggml_sycl_profile_submit(queue, profile_label, [&](sycl::queue & profiled_queue) {
+            return profiled_queue.submit([&](sycl::handler & cgh) {
+                if (!deps.empty()) {
+                    cgh.depends_on(deps);
+                }
+                cgh.parallel_for(
+                    sycl::range<1>(static_cast<size_t>(n_chunks) * static_cast<size_t>(k_tiles) *
+                                   static_cast<size_t>(exec_n)),
+                    [=](sycl::id<1> idx) {
+                        const int64_t linear = static_cast<int64_t>(idx[0]);
+                        const int     lane   = static_cast<int>(linear % exec_n);
+                        const int64_t t0     = linear / exec_n;
+                        const int     kt     = static_cast<int>(t0 % k_tiles);
+                        const int     chunk  = static_cast<int>(t0 / k_tiles);
+                        if (active_chunks && chunk >= active_chunks[0]) {
+                            return;
+                        }
+
+                        int       id        = -1;
+                        int       iid1      = -1;
+                        const int group     = chunk_groups[chunk];
+                        const int row_begin = group_offsets[group] + chunk_row_starts[chunk];
+                        const int row_end   = group_offsets[group + 1];
+                        const int row_index = row_begin + lane;
+                        if (row_index < row_end) {
+                            const int slot = group_row_slots[row_index];
+                            id             = slot / n_tokens;
+                            iid1           = slot - id * n_tokens;
+                        }
+
+                        const size_t tile_base =
+                            (static_cast<size_t>(chunk) * static_cast<size_t>(k_tiles) + static_cast<size_t>(kt)) *
+                            static_cast<size_t>(k_per * exec_n);
+                        float scale = 0.0f;
+                        if (id >= 0 && iid1 >= 0) {
+                            const int64_t i11    = id % ne11;
+                            const int64_t i12    = iid1;
+                            const char *  q8_row = static_cast<const char *>(q8_src) + i11 * q8_nb11 + i12 * q8_nb12;
+                            const auto *  ds =
+                                reinterpret_cast<const sycl::half2 *>(q8_row + ncols_y + kt * sizeof(sycl::half2));
+                            scale = static_cast<float>(ds->x());
+#pragma unroll
+                            for (int kk = 0; kk < k_per; ++kk) {
+                                const int vnni_offset = (kk / 4) * exec_n * 4 + lane * 4 + (kk % 4);
+                                b_packed[tile_base + static_cast<size_t>(vnni_offset)] =
+                                    reinterpret_cast<const int8_t *>(q8_row)[kt * k_per + kk];
+                            }
+                        } else {
+#pragma unroll
+                            for (int kk = 0; kk < k_per; ++kk) {
+                                const int vnni_offset = (kk / 4) * exec_n * 4 + lane * 4 + (kk % 4);
+                                b_packed[tile_base + static_cast<size_t>(vnni_offset)] = 0;
+                            }
+                        }
+
+                        y_scales[(static_cast<size_t>(chunk) * static_cast<size_t>(k_tiles) + static_cast<size_t>(kt)) *
+                                     static_cast<size_t>(exec_n) +
+                                 static_cast<size_t>(lane)] = scale;
+                    });
+            });
+        });
+    }
+
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(queue, "mxfp4.pack_q8.grouped_chunks", "path=grouped-packed-q8;role=pack;variant=scalar",
+                           "mmvq", b_bytes + y_bytes);
+    return ggml_sycl_profile_submit(queue, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
             if (!deps.empty()) {
                 cgh.depends_on(deps);
             }
             cgh.parallel_for(
                 sycl::range<1>(static_cast<size_t>(n_chunks) * static_cast<size_t>(k_tiles) *
-                               static_cast<size_t>(exec_n)),
+                               static_cast<size_t>(exec_n) * static_cast<size_t>(k_per)),
                 [=](sycl::id<1> idx) {
                     const int64_t linear = static_cast<int64_t>(idx[0]);
-                    const int     lane   = static_cast<int>(linear % exec_n);
-                    const int64_t t0     = linear / exec_n;
-                    const int     kt     = static_cast<int>(t0 % k_tiles);
-                    const int     chunk  = static_cast<int>(t0 / k_tiles);
+                    const int     kk     = static_cast<int>(linear % k_per);
+                    const int64_t t0     = linear / k_per;
+                    const int     lane   = static_cast<int>(t0 % exec_n);
+                    const int64_t t1     = t0 / exec_n;
+                    const int     kt     = static_cast<int>(t1 % k_tiles);
+                    const int     chunk  = static_cast<int>(t1 / k_tiles);
                     if (active_chunks && chunk >= active_chunks[0]) {
                         return;
                     }
@@ -6845,95 +6931,33 @@ static sycl::event mxfp4_dpas_pack_q8_grouped_chunks_sycl(sycl::queue &         
                         iid1           = slot - id * n_tokens;
                     }
 
-                    const size_t tile_base =
-                        (static_cast<size_t>(chunk) * static_cast<size_t>(k_tiles) + static_cast<size_t>(kt)) *
-                        static_cast<size_t>(k_per * exec_n);
-                    float scale = 0.0f;
+                    int8_t q     = 0;
+                    float  scale = 0.0f;
                     if (id >= 0 && iid1 >= 0) {
                         const int64_t i11    = id % ne11;
                         const int64_t i12    = iid1;
                         const char *  q8_row = static_cast<const char *>(q8_src) + i11 * q8_nb11 + i12 * q8_nb12;
-                        const auto *  ds =
-                            reinterpret_cast<const sycl::half2 *>(q8_row + ncols_y + kt * sizeof(sycl::half2));
-                        scale = static_cast<float>(ds->x());
-#pragma unroll
-                        for (int kk = 0; kk < k_per; ++kk) {
-                            const int vnni_offset = (kk / 4) * exec_n * 4 + lane * 4 + (kk % 4);
-                            b_packed[tile_base + static_cast<size_t>(vnni_offset)] =
-                                reinterpret_cast<const int8_t *>(q8_row)[kt * k_per + kk];
-                        }
-                    } else {
-#pragma unroll
-                        for (int kk = 0; kk < k_per; ++kk) {
-                            const int vnni_offset = (kk / 4) * exec_n * 4 + lane * 4 + (kk % 4);
-                            b_packed[tile_base + static_cast<size_t>(vnni_offset)] = 0;
+                        q                    = reinterpret_cast<const int8_t *>(q8_row)[kt * k_per + kk];
+                        if (kk == 0) {
+                            const auto * ds =
+                                reinterpret_cast<const sycl::half2 *>(q8_row + ncols_y + kt * sizeof(sycl::half2));
+                            scale = static_cast<float>(ds->x());
                         }
                     }
 
-                    y_scales[(static_cast<size_t>(chunk) * static_cast<size_t>(k_tiles) + static_cast<size_t>(kt)) *
-                                 static_cast<size_t>(exec_n) +
-                             static_cast<size_t>(lane)] = scale;
+                    const size_t tile_base =
+                        (static_cast<size_t>(chunk) * static_cast<size_t>(k_tiles) + static_cast<size_t>(kt)) *
+                        static_cast<size_t>(k_per * exec_n);
+                    const int vnni_offset = (kk / 4) * exec_n * 4 + lane * 4 + (kk % 4);
+                    b_packed[tile_base + static_cast<size_t>(vnni_offset)] = q;
+
+                    if (kk == 0) {
+                        y_scales[(static_cast<size_t>(chunk) * static_cast<size_t>(k_tiles) + static_cast<size_t>(kt)) *
+                                     static_cast<size_t>(exec_n) +
+                                 static_cast<size_t>(lane)] = scale;
+                    }
                 });
         });
-    }
-
-    return queue.submit([&](sycl::handler & cgh) {
-        if (!deps.empty()) {
-            cgh.depends_on(deps);
-        }
-        cgh.parallel_for(
-            sycl::range<1>(static_cast<size_t>(n_chunks) * static_cast<size_t>(k_tiles) * static_cast<size_t>(exec_n) *
-                           static_cast<size_t>(k_per)),
-            [=](sycl::id<1> idx) {
-                const int64_t linear = static_cast<int64_t>(idx[0]);
-                const int     kk     = static_cast<int>(linear % k_per);
-                const int64_t t0     = linear / k_per;
-                const int     lane   = static_cast<int>(t0 % exec_n);
-                const int64_t t1     = t0 / exec_n;
-                const int     kt     = static_cast<int>(t1 % k_tiles);
-                const int     chunk  = static_cast<int>(t1 / k_tiles);
-                if (active_chunks && chunk >= active_chunks[0]) {
-                    return;
-                }
-
-                int       id        = -1;
-                int       iid1      = -1;
-                const int group     = chunk_groups[chunk];
-                const int row_begin = group_offsets[group] + chunk_row_starts[chunk];
-                const int row_end   = group_offsets[group + 1];
-                const int row_index = row_begin + lane;
-                if (row_index < row_end) {
-                    const int slot = group_row_slots[row_index];
-                    id             = slot / n_tokens;
-                    iid1           = slot - id * n_tokens;
-                }
-
-                int8_t q     = 0;
-                float  scale = 0.0f;
-                if (id >= 0 && iid1 >= 0) {
-                    const int64_t i11    = id % ne11;
-                    const int64_t i12    = iid1;
-                    const char *  q8_row = static_cast<const char *>(q8_src) + i11 * q8_nb11 + i12 * q8_nb12;
-                    q                    = reinterpret_cast<const int8_t *>(q8_row)[kt * k_per + kk];
-                    if (kk == 0) {
-                        const auto * ds =
-                            reinterpret_cast<const sycl::half2 *>(q8_row + ncols_y + kt * sizeof(sycl::half2));
-                        scale = static_cast<float>(ds->x());
-                    }
-                }
-
-                const size_t tile_base =
-                    (static_cast<size_t>(chunk) * static_cast<size_t>(k_tiles) + static_cast<size_t>(kt)) *
-                    static_cast<size_t>(k_per * exec_n);
-                const int vnni_offset                                  = (kk / 4) * exec_n * 4 + lane * 4 + (kk % 4);
-                b_packed[tile_base + static_cast<size_t>(vnni_offset)] = q;
-
-                if (kk == 0) {
-                    y_scales[(static_cast<size_t>(chunk) * static_cast<size_t>(k_tiles) + static_cast<size_t>(kt)) *
-                                 static_cast<size_t>(exec_n) +
-                             static_cast<size_t>(lane)] = scale;
-                }
-            });
     });
 }
 
@@ -17083,8 +17107,11 @@ bool mmvq_moe_batched_dispatch_pair_mxfp4_soa(ggml_backend_sycl_context & ctx,
         stream->wait();
         t_quant_begin = std::chrono::high_resolution_clock::now();
     }
-    sycl::event activation_q8_event = quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
-        src1_d, (char *) q8_1_buffer, ne10, total_src1_rows, ne10_padded, stream);
+    sycl::event activation_q8_event = mmvq_profile_record_quantize_activation_q8_soa(
+        *stream,
+        quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(src1_d, (char *) q8_1_buffer, ne10, total_src1_rows,
+                                                              ne10_padded, stream),
+        required_size);
     if (tg_profile) {
         stream->wait();
     }
@@ -17334,8 +17361,11 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
         stream->wait();
         t_quant_begin = std::chrono::high_resolution_clock::now();
     }
-    sycl::event activation_q8_event = quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
-        src1_d, (char *) q8_1_buffer, ne10, total_src1_rows, ne10_padded, stream);
+    sycl::event activation_q8_event = mmvq_profile_record_quantize_activation_q8_soa(
+        *stream,
+        quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(src1_d, (char *) q8_1_buffer, ne10, total_src1_rows,
+                                                              ne10_padded, stream),
+        required_size);
     if (detail_profile) {
         stream->wait();
     }
@@ -19090,18 +19120,23 @@ static sycl::event mxfp4_down_sum_zero_sycl(sycl::queue &                    que
                                             int                              n_tokens,
                                             int64_t                          dst_token_stride,
                                             const std::vector<sycl::event> * deps) {
-    return queue.submit([&](sycl::handler & cgh) {
-        if (deps && !deps->empty()) {
-            cgh.depends_on(*deps);
-        }
-        cgh.parallel_for<mxfp4_down_sum_zero_kernel>(
-            sycl::range<1>(static_cast<size_t>(nrows) * static_cast<size_t>(n_tokens)), [=](sycl::id<1> it) {
-                const int linear                                            = static_cast<int>(it[0]);
-                const int token                                             = linear / nrows;
-                const int row                                               = linear - token * nrows;
-                *(float *) ((char *) dst + static_cast<int64_t>(row) * sizeof(float) +
-                            static_cast<int64_t>(token) * dst_token_stride) = 0.0f;
-            });
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(queue, "mxfp4.down.zero", "path=q8-soa;role=down;stage=zero", "mmvq",
+                           static_cast<size_t>(nrows) * static_cast<size_t>(n_tokens) * sizeof(float));
+    return ggml_sycl_profile_submit(queue, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            if (deps && !deps->empty()) {
+                cgh.depends_on(*deps);
+            }
+            cgh.parallel_for<mxfp4_down_sum_zero_kernel>(
+                sycl::range<1>(static_cast<size_t>(nrows) * static_cast<size_t>(n_tokens)), [=](sycl::id<1> it) {
+                    const int linear                                            = static_cast<int>(it[0]);
+                    const int token                                             = linear / nrows;
+                    const int row                                               = linear - token * nrows;
+                    *(float *) ((char *) dst + static_cast<int64_t>(row) * sizeof(float) +
+                                static_cast<int64_t>(token) * dst_token_stride) = 0.0f;
+                });
+        });
     });
 }
 
@@ -19115,25 +19150,30 @@ static sycl::event mxfp4_down_sum_weighted_tmp_reduce_sycl(sycl::queue &        
                                                            int64_t                          tmp_nb2,
                                                            int64_t                          dst_token_stride,
                                                            const std::vector<sycl::event> * deps) {
-    return queue.submit([&](sycl::handler & cgh) {
-        if (deps && !deps->empty()) {
-            cgh.depends_on(*deps);
-        }
-        cgh.parallel_for<mxfp4_down_sum_weighted_tmp_reduce_kernel>(
-            sycl::range<1>(static_cast<size_t>(nrows) * static_cast<size_t>(n_tokens)), [=](sycl::id<1> it) {
-                const int linear = static_cast<int>(it[0]);
-                const int token  = linear / nrows;
-                const int row    = linear - token * nrows;
-                float     acc    = 0.0f;
-                for (int id = 0; id < n_ids; ++id) {
-                    const float * src = reinterpret_cast<const float *>(reinterpret_cast<const char *>(weighted_tmp) +
-                                                                        static_cast<int64_t>(id) * tmp_nb1 +
-                                                                        static_cast<int64_t>(token) * tmp_nb2);
-                    acc += src[row];
-                }
-                *(float *) ((char *) dst + static_cast<int64_t>(row) * sizeof(float) +
-                            static_cast<int64_t>(token) * dst_token_stride) = acc;
-            });
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(queue, "mxfp4.down.weighted_tmp_reduce", "path=q8-soa;role=down;stage=reduce", "mmvq",
+                           static_cast<size_t>(nrows) * static_cast<size_t>(n_tokens) * sizeof(float));
+    return ggml_sycl_profile_submit(queue, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            if (deps && !deps->empty()) {
+                cgh.depends_on(*deps);
+            }
+            cgh.parallel_for<mxfp4_down_sum_weighted_tmp_reduce_kernel>(
+                sycl::range<1>(static_cast<size_t>(nrows) * static_cast<size_t>(n_tokens)), [=](sycl::id<1> it) {
+                    const int linear = static_cast<int>(it[0]);
+                    const int token  = linear / nrows;
+                    const int row    = linear - token * nrows;
+                    float     acc    = 0.0f;
+                    for (int id = 0; id < n_ids; ++id) {
+                        const float * src = reinterpret_cast<const float *>(
+                            reinterpret_cast<const char *>(weighted_tmp) + static_cast<int64_t>(id) * tmp_nb1 +
+                            static_cast<int64_t>(token) * tmp_nb2);
+                        acc += src[row];
+                    }
+                    *(float *) ((char *) dst + static_cast<int64_t>(row) * sizeof(float) +
+                                static_cast<int64_t>(token) * dst_token_stride) = acc;
+                });
+        });
     });
 }
 
@@ -19169,58 +19209,64 @@ static sycl::event mxfp4_down_sum_q8_soa_atomic_sycl(sycl::queue &              
                                     static_cast<size_t>(block_num_z));
     const sycl::range<3> block_dims(1, block_rows, SUBGROUP_SIZE);
 
-    return queue.submit([&](sycl::handler & cgh) {
-        if (deps && !deps->empty()) {
-            cgh.depends_on(*deps);
-        }
-        cgh.parallel_for<mxfp4_down_sum_q8_soa_atomic_kernel>(
-            sycl::nd_range<3>(block_nums * block_dims, block_dims),
-            [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(SUBGROUP_SIZE)]] {
-                const int batch_idx = item.get_group(1);
-                const int row       = item.get_group(2) * item.get_local_range(1) + item.get_local_id(1);
-                const int lane      = item.get_local_id(2);
-                if (row >= nrows_per_expert) {
-                    return;
-                }
-                const int     id        = batch_idx / n_tokens;
-                const int     token     = batch_idx - id * n_tokens;
-                const int32_t expert_id = *(const int32_t *) ((const char *) ids + static_cast<int64_t>(id) * ids_nb0 +
-                                                              static_cast<int64_t>(token) * ids_nb1);
-                float         partial   = 0.0f;
-                if (expert_id >= 0) {
-                    const uint8_t * base = expert_ptrs[expert_id];
-                    if (base != nullptr) {
-                        const char * global_y_base = (const char *) q8_rows + static_cast<int64_t>(id) * q8_nb11 +
-                                                     static_cast<int64_t>(token) * q8_nb12;
-                        const int64_t row_qs_offset = static_cast<int64_t>(row) * blocks_per_row * (QK_MXFP4 / 2);
-                        const int64_t row_scale_offset =
-                            total_qs_size_per_expert + static_cast<int64_t>(row) * scale_stride;
-                        const uint8_t * qs_row    = base + row_qs_offset;
-                        const uint8_t * scale_row = base + row_scale_offset;
-                        for (int b = lane; b < blocks_per_row; b += SUBGROUP_SIZE) {
-                            partial +=
-                                mxfp4_soa_q8_1_block_dot<true, false>(qs_row, scale_row, global_y_base, ncols_y, b);
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(queue, "mxfp4.down.q8_soa_atomic", "path=q8-soa;role=down;variant=atomic", "mmvq",
+                           static_cast<size_t>(nrows_per_expert) * static_cast<size_t>(n_tokens) * sizeof(float));
+    return ggml_sycl_profile_submit(queue, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            if (deps && !deps->empty()) {
+                cgh.depends_on(*deps);
+            }
+            cgh.parallel_for<mxfp4_down_sum_q8_soa_atomic_kernel>(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(SUBGROUP_SIZE)]] {
+                    const int batch_idx = item.get_group(1);
+                    const int row       = item.get_group(2) * item.get_local_range(1) + item.get_local_id(1);
+                    const int lane      = item.get_local_id(2);
+                    if (row >= nrows_per_expert) {
+                        return;
+                    }
+                    const int     id    = batch_idx / n_tokens;
+                    const int     token = batch_idx - id * n_tokens;
+                    const int32_t expert_id =
+                        *(const int32_t *) ((const char *) ids + static_cast<int64_t>(id) * ids_nb0 +
+                                            static_cast<int64_t>(token) * ids_nb1);
+                    float partial = 0.0f;
+                    if (expert_id >= 0) {
+                        const uint8_t * base = expert_ptrs[expert_id];
+                        if (base != nullptr) {
+                            const char * global_y_base = (const char *) q8_rows + static_cast<int64_t>(id) * q8_nb11 +
+                                                         static_cast<int64_t>(token) * q8_nb12;
+                            const int64_t row_qs_offset = static_cast<int64_t>(row) * blocks_per_row * (QK_MXFP4 / 2);
+                            const int64_t row_scale_offset =
+                                total_qs_size_per_expert + static_cast<int64_t>(row) * scale_stride;
+                            const uint8_t * qs_row    = base + row_qs_offset;
+                            const uint8_t * scale_row = base + row_scale_offset;
+                            for (int b = lane; b < blocks_per_row; b += SUBGROUP_SIZE) {
+                                partial +=
+                                    mxfp4_soa_q8_1_block_dot<true, false>(qs_row, scale_row, global_y_base, ncols_y, b);
+                            }
                         }
                     }
-                }
-                const float dot = sycl::reduce_over_group(item.get_sub_group(), partial, sycl::plus<float>());
-                if (lane == 0) {
-                    const float route_weight =
-                        *(const float *) ((const char *) weights + static_cast<int64_t>(id) * weights_nb1 +
-                                          static_cast<int64_t>(token) * weights_nb2);
-                    const float bias_value =
-                        (bias && expert_id >= 0) ?
-                            *(const float *) ((const char *) bias + static_cast<int64_t>(expert_id) * bias_nb1 +
-                                              static_cast<int64_t>(row) * sizeof(float)) :
-                            0.0f;
-                    float * out = (float *) ((char *) dst + static_cast<int64_t>(row) * sizeof(float) +
-                                             static_cast<int64_t>(token) * dst_token_stride);
-                    sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device,
-                                     sycl::access::address_space::global_space>
-                        atomic_out(*out);
-                    atomic_out.fetch_add((dot + bias_value) * route_weight);
-                }
-            });
+                    const float dot = sycl::reduce_over_group(item.get_sub_group(), partial, sycl::plus<float>());
+                    if (lane == 0) {
+                        const float route_weight =
+                            *(const float *) ((const char *) weights + static_cast<int64_t>(id) * weights_nb1 +
+                                              static_cast<int64_t>(token) * weights_nb2);
+                        const float bias_value =
+                            (bias && expert_id >= 0) ?
+                                *(const float *) ((const char *) bias + static_cast<int64_t>(expert_id) * bias_nb1 +
+                                                  static_cast<int64_t>(row) * sizeof(float)) :
+                                0.0f;
+                        float * out = (float *) ((char *) dst + static_cast<int64_t>(row) * sizeof(float) +
+                                                 static_cast<int64_t>(token) * dst_token_stride);
+                        sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                         sycl::access::address_space::global_space>
+                            atomic_out(*out);
+                        atomic_out.fetch_add((dot + bias_value) * route_weight);
+                    }
+                });
+        });
     });
 }
 
@@ -19253,57 +19299,64 @@ static sycl::event mxfp4_down_sum_q8_soa_sycl(sycl::queue &                    q
     const sycl::range<3> block_nums(static_cast<size_t>(n_tokens), static_cast<size_t>(nrows_per_expert), 1);
     const sycl::range<3> block_dims(1, 1, SUBGROUP_SIZE);
 
-    return queue.submit([&](sycl::handler & cgh) {
-        if (deps && !deps->empty()) {
-            cgh.depends_on(*deps);
-        }
-        cgh.parallel_for<mxfp4_down_sum_q8_soa_kernel>(
-            sycl::nd_range<3>(block_nums * block_dims, block_dims),
-            [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(SUBGROUP_SIZE)]] {
-                const int token = item.get_group(0);
-                const int row   = item.get_group(1);
-                const int lane  = item.get_local_id(2);
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(queue, "mxfp4.down.q8_soa", "path=q8-soa;role=down;variant=serial", "mmvq",
+                           static_cast<size_t>(nrows_per_expert) * static_cast<size_t>(n_tokens) * sizeof(float));
+    return ggml_sycl_profile_submit(queue, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            if (deps && !deps->empty()) {
+                cgh.depends_on(*deps);
+            }
+            cgh.parallel_for<mxfp4_down_sum_q8_soa_kernel>(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(SUBGROUP_SIZE)]] {
+                    const int token = item.get_group(0);
+                    const int row   = item.get_group(1);
+                    const int lane  = item.get_local_id(2);
 
-                float out_acc = 0.0f;
-                for (int id = 0; id < n_ids; ++id) {
-                    const int32_t expert_id =
-                        *(const int32_t *) ((const char *) ids + static_cast<int64_t>(id) * ids_nb0 +
-                                            static_cast<int64_t>(token) * ids_nb1);
-                    float partial = 0.0f;
-                    if (expert_id >= 0) {
-                        const uint8_t * base = expert_ptrs[expert_id];
-                        if (base != nullptr) {
-                            const char * global_y_base = (const char *) q8_rows + static_cast<int64_t>(id) * q8_nb11 +
-                                                         static_cast<int64_t>(token) * q8_nb12;
-                            const int64_t row_qs_offset = static_cast<int64_t>(row) * blocks_per_row * (QK_MXFP4 / 2);
-                            const int64_t row_scale_offset =
-                                total_qs_size_per_expert + static_cast<int64_t>(row) * scale_stride;
-                            const uint8_t * qs_row    = base + row_qs_offset;
-                            const uint8_t * scale_row = base + row_scale_offset;
-                            for (int b = lane; b < blocks_per_row; b += SUBGROUP_SIZE) {
-                                partial +=
-                                    mxfp4_soa_q8_1_block_dot<true, false>(qs_row, scale_row, global_y_base, ncols_y, b);
+                    float out_acc = 0.0f;
+                    for (int id = 0; id < n_ids; ++id) {
+                        const int32_t expert_id =
+                            *(const int32_t *) ((const char *) ids + static_cast<int64_t>(id) * ids_nb0 +
+                                                static_cast<int64_t>(token) * ids_nb1);
+                        float partial = 0.0f;
+                        if (expert_id >= 0) {
+                            const uint8_t * base = expert_ptrs[expert_id];
+                            if (base != nullptr) {
+                                const char * global_y_base = (const char *) q8_rows +
+                                                             static_cast<int64_t>(id) * q8_nb11 +
+                                                             static_cast<int64_t>(token) * q8_nb12;
+                                const int64_t row_qs_offset =
+                                    static_cast<int64_t>(row) * blocks_per_row * (QK_MXFP4 / 2);
+                                const int64_t row_scale_offset =
+                                    total_qs_size_per_expert + static_cast<int64_t>(row) * scale_stride;
+                                const uint8_t * qs_row    = base + row_qs_offset;
+                                const uint8_t * scale_row = base + row_scale_offset;
+                                for (int b = lane; b < blocks_per_row; b += SUBGROUP_SIZE) {
+                                    partial += mxfp4_soa_q8_1_block_dot<true, false>(qs_row, scale_row, global_y_base,
+                                                                                     ncols_y, b);
+                                }
                             }
                         }
+                        const float dot = sycl::reduce_over_group(item.get_sub_group(), partial, sycl::plus<float>());
+                        if (lane == 0) {
+                            const float route_weight =
+                                *(const float *) ((const char *) weights + static_cast<int64_t>(id) * weights_nb1 +
+                                                  static_cast<int64_t>(token) * weights_nb2);
+                            const float bias_value =
+                                (bias && expert_id >= 0) ?
+                                    *(const float *) ((const char *) bias + static_cast<int64_t>(expert_id) * bias_nb1 +
+                                                      static_cast<int64_t>(row) * sizeof(float)) :
+                                    0.0f;
+                            out_acc += (dot + bias_value) * route_weight;
+                        }
                     }
-                    const float dot = sycl::reduce_over_group(item.get_sub_group(), partial, sycl::plus<float>());
                     if (lane == 0) {
-                        const float route_weight =
-                            *(const float *) ((const char *) weights + static_cast<int64_t>(id) * weights_nb1 +
-                                              static_cast<int64_t>(token) * weights_nb2);
-                        const float bias_value =
-                            (bias && expert_id >= 0) ?
-                                *(const float *) ((const char *) bias + static_cast<int64_t>(expert_id) * bias_nb1 +
-                                                  static_cast<int64_t>(row) * sizeof(float)) :
-                                0.0f;
-                        out_acc += (dot + bias_value) * route_weight;
+                        *(float *) ((char *) dst + static_cast<int64_t>(row) * sizeof(float) +
+                                    static_cast<int64_t>(token) * dst_token_stride) = out_acc;
                     }
-                }
-                if (lane == 0) {
-                    *(float *) ((char *) dst + static_cast<int64_t>(row) * sizeof(float) +
-                                static_cast<int64_t>(token) * dst_token_stride) = out_acc;
-                }
-            });
+                });
+        });
     });
 }
 
@@ -19339,60 +19392,69 @@ static sycl::event mxfp4_down_sum_q8_soa_row_group_sycl(sycl::queue &           
     const sycl::range<3> block_nums(static_cast<size_t>(n_tokens), static_cast<size_t>(row_groups), 1);
     const sycl::range<3> block_dims(1, ROWS_PER_GROUP, SUBGROUP_SIZE);
 
-    return queue.submit([&](sycl::handler & cgh) {
-        if (deps && !deps->empty()) {
-            cgh.depends_on(*deps);
-        }
-        cgh.parallel_for<mxfp4_down_sum_q8_soa_row_group_kernel<ROWS_PER_GROUP>>(
-            sycl::nd_range<3>(block_nums * block_dims, block_dims),
-            [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(SUBGROUP_SIZE)]] {
-                const int token = item.get_group(0);
-                const int row   = item.get_group(1) * ROWS_PER_GROUP + item.get_local_id(1);
-                const int lane  = item.get_local_id(2);
-                if (row >= nrows_per_expert) {
-                    return;
-                }
+    const char * profile_metadata = ROWS_PER_GROUP == 2 ? "path=q8-soa;role=down;variant=row-group;rows_per_group=2" :
+                                                          "path=q8-soa;role=down;variant=row-group;rows_per_group=4";
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(queue, "mxfp4.down.q8_soa_row_group", profile_metadata, "mmvq",
+                           static_cast<size_t>(nrows_per_expert) * static_cast<size_t>(n_tokens) * sizeof(float));
+    return ggml_sycl_profile_submit(queue, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            if (deps && !deps->empty()) {
+                cgh.depends_on(*deps);
+            }
+            cgh.parallel_for<mxfp4_down_sum_q8_soa_row_group_kernel<ROWS_PER_GROUP>>(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(SUBGROUP_SIZE)]] {
+                    const int token = item.get_group(0);
+                    const int row   = item.get_group(1) * ROWS_PER_GROUP + item.get_local_id(1);
+                    const int lane  = item.get_local_id(2);
+                    if (row >= nrows_per_expert) {
+                        return;
+                    }
 
-                float out_acc = 0.0f;
-                for (int id = 0; id < n_ids; ++id) {
-                    const int32_t expert_id =
-                        *(const int32_t *) ((const char *) ids + static_cast<int64_t>(id) * ids_nb0 +
-                                            static_cast<int64_t>(token) * ids_nb1);
-                    float partial = 0.0f;
-                    if (expert_id >= 0) {
-                        const uint8_t * base = expert_ptrs[expert_id];
-                        if (base != nullptr) {
-                            const char * global_y_base = (const char *) q8_rows + static_cast<int64_t>(id) * q8_nb11 +
-                                                         static_cast<int64_t>(token) * q8_nb12;
-                            const int64_t row_qs_offset = static_cast<int64_t>(row) * blocks_per_row * (QK_MXFP4 / 2);
-                            const int64_t row_scale_offset =
-                                total_qs_size_per_expert + static_cast<int64_t>(row) * scale_stride;
-                            const uint8_t * qs_row    = base + row_qs_offset;
-                            const uint8_t * scale_row = base + row_scale_offset;
-                            for (int b = lane; b < blocks_per_row; b += SUBGROUP_SIZE) {
-                                partial +=
-                                    mxfp4_soa_q8_1_block_dot<true, false>(qs_row, scale_row, global_y_base, ncols_y, b);
+                    float out_acc = 0.0f;
+                    for (int id = 0; id < n_ids; ++id) {
+                        const int32_t expert_id =
+                            *(const int32_t *) ((const char *) ids + static_cast<int64_t>(id) * ids_nb0 +
+                                                static_cast<int64_t>(token) * ids_nb1);
+                        float partial = 0.0f;
+                        if (expert_id >= 0) {
+                            const uint8_t * base = expert_ptrs[expert_id];
+                            if (base != nullptr) {
+                                const char * global_y_base = (const char *) q8_rows +
+                                                             static_cast<int64_t>(id) * q8_nb11 +
+                                                             static_cast<int64_t>(token) * q8_nb12;
+                                const int64_t row_qs_offset =
+                                    static_cast<int64_t>(row) * blocks_per_row * (QK_MXFP4 / 2);
+                                const int64_t row_scale_offset =
+                                    total_qs_size_per_expert + static_cast<int64_t>(row) * scale_stride;
+                                const uint8_t * qs_row    = base + row_qs_offset;
+                                const uint8_t * scale_row = base + row_scale_offset;
+                                for (int b = lane; b < blocks_per_row; b += SUBGROUP_SIZE) {
+                                    partial += mxfp4_soa_q8_1_block_dot<true, false>(qs_row, scale_row, global_y_base,
+                                                                                     ncols_y, b);
+                                }
                             }
                         }
+                        const float dot = sycl::reduce_over_group(item.get_sub_group(), partial, sycl::plus<float>());
+                        if (lane == 0) {
+                            const float route_weight =
+                                *(const float *) ((const char *) weights + static_cast<int64_t>(id) * weights_nb1 +
+                                                  static_cast<int64_t>(token) * weights_nb2);
+                            const float bias_value =
+                                (bias && expert_id >= 0) ?
+                                    *(const float *) ((const char *) bias + static_cast<int64_t>(expert_id) * bias_nb1 +
+                                                      static_cast<int64_t>(row) * sizeof(float)) :
+                                    0.0f;
+                            out_acc += (dot + bias_value) * route_weight;
+                        }
                     }
-                    const float dot = sycl::reduce_over_group(item.get_sub_group(), partial, sycl::plus<float>());
                     if (lane == 0) {
-                        const float route_weight =
-                            *(const float *) ((const char *) weights + static_cast<int64_t>(id) * weights_nb1 +
-                                              static_cast<int64_t>(token) * weights_nb2);
-                        const float bias_value =
-                            (bias && expert_id >= 0) ?
-                                *(const float *) ((const char *) bias + static_cast<int64_t>(expert_id) * bias_nb1 +
-                                                  static_cast<int64_t>(row) * sizeof(float)) :
-                                0.0f;
-                        out_acc += (dot + bias_value) * route_weight;
+                        *(float *) ((char *) dst + static_cast<int64_t>(row) * sizeof(float) +
+                                    static_cast<int64_t>(token) * dst_token_stride) = out_acc;
                     }
-                }
-                if (lane == 0) {
-                    *(float *) ((char *) dst + static_cast<int64_t>(row) * sizeof(float) +
-                                static_cast<int64_t>(token) * dst_token_stride) = out_acc;
-                }
-            });
+                });
+        });
     });
 }
 

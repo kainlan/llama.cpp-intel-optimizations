@@ -24,6 +24,19 @@
 
 namespace sycl_xmx = sycl::ext::oneapi::experimental::matrix;
 
+static inline ggml_sycl_profile_label fattn_xmx_f16_profile_label(sycl::queue & queue,
+                                                                  const char *  name,
+                                                                  const char *  metadata) {
+    ggml_sycl_profile_label label{};
+    label.name       = name;
+    label.category   = "fattn";
+    label.queue_kind = "compute";
+    label.metadata   = metadata;
+    label.device     = ggml_sycl_get_device_id_from_queue(queue);
+    label.bytes      = 0;
+    return label;
+}
+
 // =============================================================================
 // FP8 E4M3 Dequantization for KV Cache
 // =============================================================================
@@ -1339,7 +1352,10 @@ void launch_fattn_xmx_f16(const fattn_params & params, dpct::queue_ptr stream) {
     sycl::range<3> grid(params.ne02 * params.ne03, 1, n_query_blocks);
     sycl::range<3> block(1, 1, XMX_NTHREADS);
 
-    stream->submit([&](sycl::handler & cgh) {
+    ggml_sycl_profile_label profile_label =
+        fattn_xmx_f16_profile_label(*stream, "fattn.compute.xmx_f16", "role=compute;path=xmx-f16");
+    (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
         sycl::local_accessor<sycl::half, 1> shared_acc(sycl::range<1>(shared_mem_size), cgh);
 
         const char *   Q_ptr             = params.Q;
@@ -1410,6 +1426,7 @@ void launch_fattn_xmx_f16(const fattn_params & params, dpct::queue_ptr stream) {
                         shared);
                 }
             });
+        });
     });
 #else
     GGML_UNUSED(params);

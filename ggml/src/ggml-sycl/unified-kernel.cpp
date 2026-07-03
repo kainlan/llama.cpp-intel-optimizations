@@ -3990,6 +3990,21 @@ static xmx_tile_override get_xmx_tile_override() {
 // Kernel Launcher
 // =============================================================================
 
+static ggml_sycl_profile_label unified_matmul_profile_label(sycl::queue &          queue,
+                                                                  const UnifiedKernelArgs & args,
+                                                                  const char *         name,
+                                                                  const char *         metadata) {
+    ggml_sycl_profile_label label{};
+    label.name       = name;
+    label.category   = "unified_matmul";
+    label.queue_kind = "compute";
+    label.metadata   = metadata;
+    label.device     = ggml_sycl_get_device_id_from_queue(queue);
+    label.bytes      = static_cast<size_t>(std::max<int64_t>(args.M, 0)) *
+                  static_cast<size_t>(std::max<int64_t>(args.N, 0)) * sizeof(float);
+    return label;
+}
+
 // XMX kernel dispatch helper for Phase B tile experiments.
 // Templated on (TM, TN, TK) — emits both production-path submit and the
 // GGML_SYCL_XMX_DETAIL 3-kernel timing sequence using this tile size, so
@@ -4067,7 +4082,10 @@ template <int TM, int TN, int TK> static void dispatch_xmx_kernel(sycl::queue & 
     }
 
     // Production path
-    q.submit([&](sycl::handler & cgh) {
+    ggml_sycl_profile_label profile_label =
+        unified_matmul_profile_label(q, args, "unified.matmul.xmx", "role=matmul;path=xmx");
+    (void) ggml_sycl_profile_submit(q, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
         sycl::local_accessor<sycl::half, 1> slm_w(TN * TK, cgh);
         sycl::local_accessor<sycl::half, 1> slm_a(TM * TK, cgh);
         sycl::local_accessor<float, 1>      slm_acc_out(XMX_TILE_M * XMX_TILE_N, cgh);
@@ -4075,6 +4093,7 @@ template <int TM, int TN, int TK> static void dispatch_xmx_kernel(sycl::queue & 
             xmx_range, [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(XMX_SUBGROUP_SIZE)]] {
                 unified_matmul_xmx_kernel_impl<TM, TN, TK>(item, args, slm_w, slm_a, slm_acc_out);
             });
+        });
     });
 }
 #endif  // GGML_SYCL_XMX_JOINT_MATRIX_AVAILABLE
@@ -4345,7 +4364,10 @@ cooperative_path:;  // Fallthrough label for large-tile to cooperative path
             fflush(stderr);
         }
 
-        q.submit([&](sycl::handler & cgh) {
+        ggml_sycl_profile_label profile_label = unified_matmul_profile_label(
+            q, args, "unified.matmul.esimd_int8", "role=matmul;path=esimd-int8");
+        (void) ggml_sycl_profile_submit(q, profile_label, [&](sycl::queue & profiled_queue) {
+            return profiled_queue.submit([&](sycl::handler & cgh) {
             // ESIMD kernel: one work-item per output tile (no work-group cooperation)
             // Total work items = grid_m * grid_n
             sycl::range<2> global(esimd_grid_m, esimd_grid_n);
@@ -4363,6 +4385,7 @@ cooperative_path:;  // Fallthrough label for large-tile to cooperative path
                     // Call ESIMD INT8 kernel implementation
                     esimd_matmul_int8_kernel_impl<ESIMD_TM, ESIMD_TN>(args, m_start, n_start);
                 });
+            });
         });
         return;
     }
@@ -4394,7 +4417,10 @@ cooperative_path:;  // Fallthrough label for large-tile to cooperative path
         // The wg_size variable is checked but always returns 32 for now
         (void) wg_size;  // Suppress unused variable warning
 
-        q.submit([&](sycl::handler & cgh) {
+        ggml_sycl_profile_label profile_label = unified_matmul_profile_label(
+            q, args, "unified.matmul.esimd_cooperative", "role=matmul;path=esimd-cooperative");
+        (void) ggml_sycl_profile_submit(q, profile_label, [&](sycl::queue & profiled_queue) {
+            return profiled_queue.submit([&](sycl::handler & cgh) {
             constexpr int  WG_SIZE = 32;
             sycl::range<2> global(coop_grid_m * WG_SIZE, coop_grid_n);
             sycl::range<2> local(WG_SIZE, 1);
@@ -4406,6 +4432,7 @@ cooperative_path:;  // Fallthrough label for large-tile to cooperative path
                     const int lane     = local_id % COOP_SUBGROUP_SIZE;
                     esimd_matmul_fp16_cooperative_impl<WG_SIZE>(item, args, local_id, sg_id, lane);
                 });
+            });
         });
         return;
     }
@@ -4433,7 +4460,11 @@ cooperative_path:;  // Fallthrough label for large-tile to cooperative path
 
         // Use double-buffered kernel if enabled and SLM permits
         if (cfg.use_double_buffer) {
-            q.submit([&](sycl::handler & cgh) {
+            ggml_sycl_profile_label profile_label = unified_matmul_profile_label(
+                q, args, "unified.matmul.esimd_fp16_double_buffered",
+                "role=matmul;path=esimd-fp16;variant=double-buffered");
+            (void) ggml_sycl_profile_submit(q, profile_label, [&](sycl::queue & profiled_queue) {
+                return profiled_queue.submit([&](sycl::handler & cgh) {
                 // ESIMD kernel: one work-item per output tile (no work-group cooperation)
                 sycl::range<2> global(esimd_grid_m, esimd_grid_n);
                 sycl::range<2> local(1, 1);  // Single work-item per work-group for ESIMD
@@ -4453,10 +4484,14 @@ cooperative_path:;  // Fallthrough label for large-tile to cooperative path
                         // Call double-buffered ESIMD FP16 kernel implementation
                         esimd_matmul_fp16_double_buffered_impl<ESIMD_TM, ESIMD_TN>(args, m_start, n_start, cfg_copy);
                     });
+                });
             });
         } else {
             // Fall back to non-buffered path
-            q.submit([&](sycl::handler & cgh) {
+            ggml_sycl_profile_label profile_label = unified_matmul_profile_label(
+                q, args, "unified.matmul.esimd_fp16", "role=matmul;path=esimd-fp16");
+            (void) ggml_sycl_profile_submit(q, profile_label, [&](sycl::queue & profiled_queue) {
+                return profiled_queue.submit([&](sycl::handler & cgh) {
                 // ESIMD kernel: one work-item per output tile (no work-group cooperation)
                 sycl::range<2> global(esimd_grid_m, esimd_grid_n);
                 sycl::range<2> local(1, 1);  // Single work-item per work-group for ESIMD
@@ -4473,6 +4508,7 @@ cooperative_path:;  // Fallthrough label for large-tile to cooperative path
                         // Call ESIMD FP16 kernel implementation
                         esimd_matmul_fp16_kernel_impl<ESIMD_TM, ESIMD_TN>(args, m_start, n_start);
                     });
+                });
             });
         }
         return;
@@ -4523,7 +4559,10 @@ cooperative_path:;  // Fallthrough label for large-tile to cooperative path
         const int64_t total_blocks   = args.N * (args.K / DMMV_BLOCK_SIZE);
         const int64_t qs_total_bytes = total_blocks * (DMMV_BLOCK_SIZE / 2);  // Byte offset to scale/exponent values
 
-        q.submit([&](sycl::handler & cgh) {
+        ggml_sycl_profile_label profile_label =
+            unified_matmul_profile_label(q, args, "unified.matmul.dmmv", "role=matmul;path=dmmv");
+        (void) ggml_sycl_profile_submit(q, profile_label, [&](sycl::queue & profiled_queue) {
+            return profiled_queue.submit([&](sycl::handler & cgh) {
             sycl::nd_range<1> range(sycl::range<1>(grid_n * DMMV_WARP_SIZE),  // Global: N * WARP_SIZE threads
                                     sycl::range<1>(DMMV_WARP_SIZE)            // Local: WARP_SIZE threads per work-group
             );
@@ -4701,6 +4740,7 @@ cooperative_path:;  // Fallthrough label for large-tile to cooperative path
                         args.output[n] = partial_sum;
                     }
                 });
+            });
         });
         return;
     }
@@ -4725,7 +4765,10 @@ cooperative_path:;  // Fallthrough label for large-tile to cooperative path
         const int wg_m = 1;
         const int wg_n = std::min(TN, 16);
 
-        q.submit([&](sycl::handler & cgh) {
+        ggml_sycl_profile_label profile_label = unified_matmul_profile_label(
+            q, args, "unified.matmul.scalar", "role=matmul;path=scalar;tile=1x64x32");
+        (void) ggml_sycl_profile_submit(q, profile_label, [&](sycl::queue & profiled_queue) {
+            return profiled_queue.submit([&](sycl::handler & cgh) {
             sycl::local_accessor<float, 1> slm_w(TN * TK, cgh);
             sycl::local_accessor<float, 1> slm_a(TM * TK, cgh);
 
@@ -4735,6 +4778,7 @@ cooperative_path:;  // Fallthrough label for large-tile to cooperative path
                 range, [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
                     unified_matmul_kernel_impl<TM, TN, TK, false>(item, args, slm_w, slm_a);
                 });
+            });
         });
     } else if (tile_m <= 8 && tile_n <= 16 && tile_k <= 32) {
         // Small tiles: 8x16x32
@@ -4742,7 +4786,10 @@ cooperative_path:;  // Fallthrough label for large-tile to cooperative path
         constexpr int TN = 16;
         constexpr int TK = 32;
 
-        q.submit([&](sycl::handler & cgh) {
+        ggml_sycl_profile_label profile_label = unified_matmul_profile_label(
+            q, args, "unified.matmul.scalar", "role=matmul;path=scalar;tile=8x16x32");
+        (void) ggml_sycl_profile_submit(q, profile_label, [&](sycl::queue & profiled_queue) {
+            return profiled_queue.submit([&](sycl::handler & cgh) {
             // Allocate SLM
             // GGML: weights[N,K] -> slm_w[TN * TK]
             // GGML: activations[M,K] -> slm_a[TM * TK]
@@ -4756,6 +4803,7 @@ cooperative_path:;  // Fallthrough label for large-tile to cooperative path
                 range, [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
                     unified_matmul_kernel_impl<TM, TN, TK, false>(item, args, slm_w, slm_a);
                 });
+            });
         });
     } else if (tile_m <= 16 && tile_n <= 32 && tile_k <= 32) {
         // Medium tiles: 16x32x32
@@ -4776,7 +4824,10 @@ cooperative_path:;  // Fallthrough label for large-tile to cooperative path
             fflush(stderr);
         }
 
-        q.submit([&](sycl::handler & cgh) {
+        ggml_sycl_profile_label profile_label = unified_matmul_profile_label(
+            q, args, "unified.matmul.scalar", "role=matmul;path=scalar;tile=16x32x32");
+        (void) ggml_sycl_profile_submit(q, profile_label, [&](sycl::queue & profiled_queue) {
+            return profiled_queue.submit([&](sycl::handler & cgh) {
             // GGML: weights[N,K] -> slm_w[TN * TK]
             // GGML: activations[M,K] -> slm_a[TM * TK]
             sycl::local_accessor<float, 1> slm_w(TN * TK, cgh);  // Weights [TN x TK]
@@ -4788,6 +4839,7 @@ cooperative_path:;  // Fallthrough label for large-tile to cooperative path
                 range, [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
                     unified_matmul_kernel_impl<TM, TN, TK, false>(item, args, slm_w, slm_a);
                 });
+            });
         });
         // NOTE: Don't call q.wait_and_throw() here - incompatible with SYCL command graphs.
         // Errors will be caught when the queue is synchronized elsewhere.
@@ -4806,7 +4858,10 @@ cooperative_path:;  // Fallthrough label for large-tile to cooperative path
         const int wg_m = std::min(TM, 8);
         const int wg_n = std::min(TN, 16);
 
-        q.submit([&](sycl::handler & cgh) {
+        ggml_sycl_profile_label profile_label = unified_matmul_profile_label(
+            q, args, "unified.matmul.scalar", "role=matmul;path=scalar;tile=32x32x32");
+        (void) ggml_sycl_profile_submit(q, profile_label, [&](sycl::queue & profiled_queue) {
+            return profiled_queue.submit([&](sycl::handler & cgh) {
             // GGML: weights[N,K] -> slm_w[TN * TK]
             // GGML: activations[M,K] -> slm_a[TM * TK]
             sycl::local_accessor<float, 1> slm_w(TN * TK, cgh);  // Weights [TN x TK]
@@ -4818,6 +4873,7 @@ cooperative_path:;  // Fallthrough label for large-tile to cooperative path
                 range, [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
                     unified_matmul_kernel_impl<TM, TN, TK, false>(item, args, slm_w, slm_a);
                 });
+            });
         });
     }
 }

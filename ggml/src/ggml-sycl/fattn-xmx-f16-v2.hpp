@@ -68,6 +68,19 @@
 
 namespace sycl_xmx = sycl::ext::oneapi::experimental::matrix;
 
+static inline ggml_sycl_profile_label fattn_xmx_v2_profile_label(sycl::queue & queue,
+                                                                 const char *  name,
+                                                                 const char *  metadata) {
+    ggml_sycl_profile_label label{};
+    label.name       = name;
+    label.category   = "fattn";
+    label.queue_kind = "compute";
+    label.metadata   = metadata;
+    label.device     = ggml_sycl_get_device_id_from_queue(queue);
+    label.bytes      = 0;
+    return label;
+}
+
 // =============================================================================
 // Compile-time configuration (shared by every variant)
 // =============================================================================
@@ -989,7 +1002,10 @@ static void launch_fattn_xmx_v2_f16_leaf(const fattn_params & params, dpct::queu
     const int      nb31 = params.nb31, nb32 = params.nb32;
     const int64_t  nb33 = params.nb33;
 
-    stream->submit([&](sycl::handler & cgh) {
+    ggml_sycl_profile_label profile_label =
+        fattn_xmx_v2_profile_label(*stream, "fattn.compute.xmx_v2", "role=compute;path=xmx-v2");
+    (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
         sycl::local_accessor<sycl::half, 1> slm(sycl::range<1>(slm_layout::TOTAL), cgh);
 
         cgh.parallel_for(
@@ -1000,6 +1016,7 @@ static void launch_fattn_xmx_v2_f16_leaf(const fattn_params & params, dpct::queu
                     ne01, ne02, nb01, nb02, nb03, ne11, ne12, nb11, nb12, nb13, nb21, nb22, nb23, ne30, ne32, ne33,
                     nb31, nb32, nb33, item, slm.get_multi_ptr<sycl::access::decorated::no>().get());
             });
+        });
     });
 }
 
@@ -1297,7 +1314,10 @@ static void launch_fattn_xmx_v2_decode_m1n64_leaf(const fattn_params & params, d
     const int      nb31 = params.nb31, nb32 = params.nb32;
     const int64_t  nb33 = params.nb33;
 
-    stream->submit([&](sycl::handler & cgh) {
+    ggml_sycl_profile_label profile_label = fattn_xmx_v2_profile_label(
+        *stream, "fattn.compute.xmx_v2_decode_m1n64", "role=compute;path=xmx-v2;variant=decode-m1n64");
+    (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
         sycl::local_accessor<sycl::half, 1> slm(sycl::range<1>(slm_layout::TOTAL), cgh);
 
         cgh.parallel_for(sycl::nd_range<3>(grid * block, block),
@@ -1308,6 +1328,7 @@ static void launch_fattn_xmx_v2_decode_m1n64_leaf(const fattn_params & params, d
                                  nb21, nb22, nb23, ne30, ne32, ne33, nb31, nb32, nb33, item,
                                  slm.get_multi_ptr<sycl::access::decorated::no>().get());
                          });
+        });
     });
 }
 
@@ -1984,7 +2005,10 @@ static void launch_fattn_xmx_v2_decode_gqa_leaf(const fattn_params & params, dpc
     const int      nb31 = params.nb31, nb32 = params.nb32;
     const int64_t  nb33 = params.nb33;
 
-    stream->submit([&](sycl::handler & cgh) {
+    ggml_sycl_profile_label profile_label = fattn_xmx_v2_profile_label(
+        *stream, "fattn.compute.xmx_v2_decode_gqa", "role=compute;path=xmx-v2;variant=decode-gqa");
+    (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
         sycl::local_accessor<sycl::half, 1> slm(sycl::range<1>(slm_layout::TOTAL), cgh);
 
         cgh.parallel_for(sycl::nd_range<3>(grid * block, block),
@@ -1995,6 +2019,7 @@ static void launch_fattn_xmx_v2_decode_gqa_leaf(const fattn_params & params, dpc
                                  nb21, nb22, nb23, ne30, ne32, ne33, nb31, nb32, nb33, item,
                                  slm.get_multi_ptr<sycl::access::decorated::no>().get());
                          });
+        });
     });
 }
 
@@ -2044,7 +2069,11 @@ static sycl::event launch_fattn_xmx_v2_decode_gqa_split_leaf(const fattn_params 
     sycl::range<3> first_grid(params.ne12 * params.ne03, n_partitions, n_query_blocks);
     sycl::range<3> first_block(1, 1, nthreads);
 
-    sycl::event first_event = stream->submit([&](sycl::handler & cgh) {
+    ggml_sycl_profile_label first_profile_label = fattn_xmx_v2_profile_label(
+        *stream, "fattn.compute.xmx_v2_decode_gqa_split_first",
+        "role=compute;path=xmx-v2;variant=decode-gqa-split-first");
+    sycl::event first_event = ggml_sycl_profile_submit(*stream, first_profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
         if constexpr (PACKED_K) {
             if (add_packed_dep) {
                 cgh.depends_on(*packed_k_ready_event);
@@ -2061,12 +2090,17 @@ static sycl::event launch_fattn_xmx_v2_decode_gqa_split_leaf(const fattn_params 
                     nb21, nb22, nb23, ne30, ne32, ne33, nb31, nb32, nb33, packed_batch_stride, packed_head_stride,
                     packed_block_stride, n_partitions, item, slm.get_multi_ptr<sycl::access::decorated::no>().get());
             });
+        });
     });
 
     sycl::range<3> merge_grid(params.ne02 * params.ne03, 1, n_query_blocks);
     sycl::range<3> merge_block(1, 1, XMX_V2_SG);
 
-    sycl::event merge_event = stream->submit([&](sycl::handler & cgh) {
+    ggml_sycl_profile_label merge_profile_label = fattn_xmx_v2_profile_label(
+        *stream, "fattn.compute.xmx_v2_decode_gqa_split_merge",
+        "role=compute;path=xmx-v2;variant=decode-gqa-split-merge");
+    sycl::event merge_event = ggml_sycl_profile_submit(*stream, merge_profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
         cgh.depends_on(first_event);
         cgh.parallel_for(sycl::nd_range<3>(merge_grid * merge_block, merge_block),
                          [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(XMX_V2_SG)]] {
@@ -2074,6 +2108,7 @@ static sycl::event launch_fattn_xmx_v2_decode_gqa_split_leaf(const fattn_params 
                                                                                 partial_out, dst_ptr, ne01, ne02, ne03,
                                                                                 n_partitions, item);
                          });
+        });
     });
     return merge_event;
 }
