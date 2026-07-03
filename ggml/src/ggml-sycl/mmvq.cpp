@@ -174,6 +174,14 @@ static bool mmvq_moe_pp_profile_enabled() {
     return enabled && !ggml_sycl_graph_recording_active();
 }
 
+static bool mxfp4_moe_gateup_m2_tg1_index_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_MOE_GATEUP_M2_TG1_INDEX");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 int ggml_sycl_moe_down_sum_q8_soa_tg_rows_per_group_from_env(const char * env) {
     if (!env || env[0] == '\0') {
         return 1;
@@ -9087,7 +9095,8 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_split_sycl_rows(const voi
 }
 
 template <int Repeat, int GLU_OP> struct mxfp4_pair_glu_xmx_tiled_dpas_kernel;
-template <int Repeat, int GLU_OP, bool Prefetch> struct mxfp4_pair_glu_xmx_tiled_dpas_m2_kernel;
+template <int Repeat, int GLU_OP, bool Prefetch, bool TG1Index>
+struct mxfp4_pair_glu_xmx_tiled_dpas_m2_kernel;
 template <int Repeat, int GLU_OP, bool Prefetch> struct mxfp4_pair_glu_xmx_tiled_v2_dpas_m2_kernel;
 template <int Repeat, int GLU_OP, bool Prefetch> struct mxfp4_pair_glu_xmx_tiled_bundle4_dpas_m2_kernel;
 template <int Repeat, int GLU_OP> struct mxfp4_pair_glu_xmx_tiled_dpas_m4_kernel;
@@ -9708,7 +9717,7 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_bundle4_dpas_m2_sycl(sycl::queue &  
     // clang-format on
 }
 
-template <int Repeat, int GLU_OP, bool Prefetch>
+template <int Repeat, int GLU_OP, bool Prefetch, bool TG1Index>
 static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl(sycl::queue &        queue,
                                                          const void * const * gate_ptrs,
                                                          const void * const * up_ptrs,
@@ -9743,12 +9752,16 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl(sycl::queue &        qu
     const int64_t tiles        = static_cast<int64_t>(total_batches) * m_tile_pairs;
 
     ggml_sycl_profile_label profile_label =
-        mmvq_profile_label(queue, "mxfp4.gateup.xmx_tiled_dpas_m2", "path=packed-q8-m2;role=gateup;tiles=static;total_batches=runtime");
+        TG1Index ?
+            mmvq_profile_label(queue, "mxfp4.gateup.xmx_tiled_dpas_m2_tg1_index",
+                               "path=packed-q8-m2;role=gateup;tiles=static;total_batches=runtime;index=tg1") :
+            mmvq_profile_label(queue, "mxfp4.gateup.xmx_tiled_dpas_m2",
+                               "path=packed-q8-m2;role=gateup;tiles=static;total_batches=runtime");
     // clang-format off
     return ggml_sycl_profile_submit(queue, profile_label, [&](sycl::queue & profiled_queue) {
         return profiled_queue.submit([&](sycl::handler & h) {
         h.depends_on(pack_event);
-        h.parallel_for<mxfp4_pair_glu_xmx_tiled_dpas_m2_kernel<Repeat, GLU_OP, Prefetch>>(
+        h.parallel_for<mxfp4_pair_glu_xmx_tiled_dpas_m2_kernel<Repeat, GLU_OP, Prefetch, TG1Index>>(
             sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(tiles)), sycl::range<1>(1)),
             [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
                 using namespace sycl::ext::intel::esimd;
@@ -9758,8 +9771,15 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl(sycl::queue &        qu
                 const int64_t tile_m0  = pair_m * 2;
                 const int64_t tile_m1  = tile_m0 + 1;
                 const bool    have_m1  = tile_m1 < m_tiles;
-                const int     id       = static_cast<int>(group / n_tokens);
-                const int     iid1     = static_cast<int>(group - static_cast<int64_t>(id) * n_tokens);
+                int           id;
+                int           iid1;
+                if constexpr (TG1Index) {
+                    id   = static_cast<int>(group);
+                    iid1 = 0;
+                } else {
+                    id   = static_cast<int>(group / n_tokens);
+                    iid1 = static_cast<int>(group - static_cast<int64_t>(id) * n_tokens);
+                }
                 const int32_t expert_id =
                     ids ? *(const int32_t *) ((const char *) ids + static_cast<int64_t>(iid1) * ids_nb1 +
                                               static_cast<int64_t>(id) * ids_nb0) :
@@ -14409,13 +14429,25 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_submit(sycl::queue &        
                                                            float                limit,
                                                            int                  tile_n_total,
                                                            const sycl::event &  pack_event) {
-    if (glu_op == GGML_GLU_OP_SWIGLU_OAI) {
-        return mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl<Repeat, GGML_GLU_OP_SWIGLU_OAI, Prefetch>(
+    if (mxfp4_moe_gateup_m2_tg1_index_enabled() && n_tokens == 1) {
+        if (glu_op == GGML_GLU_OP_SWIGLU_OAI) {
+            return mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl<Repeat, GGML_GLU_OP_SWIGLU_OAI, Prefetch, true>(
+                queue, gate_ptrs, up_ptrs, b_packed, y_scales, dst_glu, ids, gate_bias, up_bias, ncols,
+                nrows_per_expert, total_batches, n_tokens, ids_nb0, ids_nb1, dst_nb1, dst_nb2, gate_bias_nb1,
+                up_bias_nb1, alpha, limit, tile_n_total, pack_event);
+        }
+        return mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl<Repeat, GGML_GLU_OP_SWIGLU, Prefetch, true>(
             queue, gate_ptrs, up_ptrs, b_packed, y_scales, dst_glu, ids, gate_bias, up_bias, ncols, nrows_per_expert,
             total_batches, n_tokens, ids_nb0, ids_nb1, dst_nb1, dst_nb2, gate_bias_nb1, up_bias_nb1, alpha, limit,
             tile_n_total, pack_event);
     }
-    return mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl<Repeat, GGML_GLU_OP_SWIGLU, Prefetch>(
+    if (glu_op == GGML_GLU_OP_SWIGLU_OAI) {
+        return mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl<Repeat, GGML_GLU_OP_SWIGLU_OAI, Prefetch, false>(
+            queue, gate_ptrs, up_ptrs, b_packed, y_scales, dst_glu, ids, gate_bias, up_bias, ncols, nrows_per_expert,
+            total_batches, n_tokens, ids_nb0, ids_nb1, dst_nb1, dst_nb2, gate_bias_nb1, up_bias_nb1, alpha, limit,
+            tile_n_total, pack_event);
+    }
+    return mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl<Repeat, GGML_GLU_OP_SWIGLU, Prefetch, false>(
         queue, gate_ptrs, up_ptrs, b_packed, y_scales, dst_glu, ids, gate_bias, up_bias, ncols, nrows_per_expert,
         total_batches, n_tokens, ids_nb0, ids_nb1, dst_nb1, dst_nb2, gate_bias_nb1, up_bias_nb1, alpha, limit,
         tile_n_total, pack_event);
