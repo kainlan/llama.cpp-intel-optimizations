@@ -356,7 +356,7 @@ void sycl_timeline_flush(const char * reason) {
     }
 
     out << format_trace_json(state.events);
-    out.flush();
+    out.close();
     if (!out) {
         return;
     }

@@ -1,6 +1,8 @@
 #include "sycl-timeline.hpp"
 
-#include <chrono>
+#include <unistd.h>
+
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -18,11 +20,11 @@ static void require(bool condition, const char * message) {
     }
 }
 
-static std::string make_temp_trace_path() {
-    const auto now_us =
-        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch())
-            .count();
-    return "/tmp/test-sycl-timeline-" + std::to_string(now_us) + ".json";
+static std::string make_temp_trace_dir() {
+    std::array<char, sizeof("/tmp/test-sycl-timeline-XXXXXX")> tmpl = { "/tmp/test-sycl-timeline-XXXXXX" };
+    char *                                                     dir  = mkdtemp(tmpl.data());
+    require(dir != nullptr, "temporary trace directory must be created");
+    return dir;
 }
 
 static std::string read_file(const std::string & path) {
@@ -90,10 +92,10 @@ int main() {
     require(contains(same_line_json, "\"name\":\"same-line-a\""), "first same-line-safe scope must be recorded");
     require(contains(same_line_json, "\"name\":\"same-line-b\""), "second same-line-safe scope must be recorded");
 
-    const std::string trace_path = make_temp_trace_path();
-    std::remove(trace_path.c_str());
-    sycl_timeline_config file_cfg = cfg;
-    file_cfg.output_path          = trace_path;
+    const std::string    trace_dir  = make_temp_trace_dir();
+    const std::string    trace_path = trace_dir + "/trace.json";
+    sycl_timeline_config file_cfg   = cfg;
+    file_cfg.output_path            = trace_path;
     sycl_timeline_reset_for_tests();
     sycl_timeline_set_config_for_tests(file_cfg);
     {
@@ -106,6 +108,7 @@ int main() {
     require(sycl_timeline_format_json_for_tests() == "{\"traceEvents\":[]}",
             "successful flush must consume buffered events");
     std::remove(trace_path.c_str());
+    rmdir(trace_dir.c_str());
 
     sycl_timeline_config pathless_cfg = cfg;
     pathless_cfg.output_path.clear();
