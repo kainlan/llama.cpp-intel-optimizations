@@ -1233,6 +1233,21 @@ set_tests_properties(test-sycl-e2e-profile PROPERTIES
     TIMEOUT 120
 )
 
+add_executable(test-sycl-timeline
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-timeline.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/sycl-timeline.cpp
+)
+target_include_directories(test-sycl-timeline PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+add_test(NAME test-sycl-timeline COMMAND test-sycl-timeline)
+set_tests_properties(test-sycl-timeline PROPERTIES
+    LABELS "sycl;profile;timeline;tdd"
+    TIMEOUT 120
+)
+
 add_executable(test-sycl-esimd-float-atomic-compile
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-esimd-float-atomic-compile.cpp
 )
