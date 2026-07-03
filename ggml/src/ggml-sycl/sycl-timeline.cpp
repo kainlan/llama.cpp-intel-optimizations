@@ -261,6 +261,10 @@ bool sycl_timeline_enabled() {
     return current_config(state).enabled;
 }
 
+bool sycl_timeline_records_spans() {
+    return timeline_records_spans();
+}
+
 sycl_timeline_config sycl_timeline_config_from_env() {
     return read_env_config();
 }

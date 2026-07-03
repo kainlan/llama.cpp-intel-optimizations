@@ -21,14 +21,18 @@ def matching_brace(source: str, open_brace: int) -> int:
     raise AssertionError("no matching brace")
 
 
+def graph_compute_impl_body(src: str) -> str:
+    begin = src.index("static void ggml_backend_sycl_graph_compute_impl")
+    open_brace = src.index("{", begin)
+    close_brace = matching_brace(src, open_brace)
+    return src[open_brace:close_brace]
+
+
 def test_graph_compute_impl_has_timeline_scope_after_reentry_guard() -> None:
     src = read_source()
     assert '#include "sycl-timeline.hpp"' in src
 
-    begin = src.index("static void ggml_backend_sycl_graph_compute_impl")
-    open_brace = src.index("{", begin)
-    close_brace = matching_brace(src, open_brace)
-    body = src[open_brace:close_brace]
+    body = graph_compute_impl_body(src)
 
     guard = body.index("compute_impl_guard _reentry_guard")
     scope = body.index('GGML_SYCL_TIMELINE_SCOPE("ggml.graph", "graph_compute_impl"', guard)
@@ -38,3 +42,37 @@ def test_graph_compute_impl_has_timeline_scope_after_reentry_guard() -> None:
     scope_setup = body[guard:compute_start]
     assert ".wait(" not in scope_setup
     assert "wait_and_throw" not in scope_setup
+
+
+def test_node_loop_compute_forward_has_timeline_scope_metadata() -> None:
+    src = read_source()
+    body = graph_compute_impl_body(src)
+
+    loop_marker = "impl_phase_log(\"pre_loop\");"
+    loop_start = body.index("for (int i = 0; i < cgraph->n_nodes; i++) {", body.index(loop_marker))
+    loop_open = body.index("{", loop_start)
+    loop_close = matching_brace(body, loop_open)
+    loop_body = body[loop_open:loop_close]
+
+    compute_line = "bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);"
+    positions = []
+    search_from = 0
+    while True:
+        try:
+            position = loop_body.index(compute_line, search_from)
+        except ValueError:
+            break
+        positions.append(position)
+        search_from = position + len(compute_line)
+
+    assert positions
+    for position in positions:
+        preceding_window = loop_body[max(0, position - 1000) : position]
+        assert "std::optional<ggml_sycl::sycl_timeline_scope>" in preceding_window
+        assert "timeline_spans_enabled" in preceding_window
+        assert '"ggml.op", "compute_forward_node"' in preceding_window
+        assert "ggml_sycl_timeline_node_metadata" in preceding_window
+        assert "node->name" in preceding_window
+        assert "ggml_op_name(node->op)" in preceding_window
+        assert ".wait(" not in preceding_window
+        assert "wait_and_throw" not in preceding_window

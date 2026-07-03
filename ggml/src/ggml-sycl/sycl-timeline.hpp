@@ -50,6 +50,7 @@ class sycl_timeline_scope {
 
 bool                 sycl_timeline_enabled_from_env(const char * value);
 bool                 sycl_timeline_enabled();
+bool                 sycl_timeline_records_spans();
 sycl_timeline_config sycl_timeline_config_from_env();
 sycl_timeline_config sycl_timeline_config_from_values(const char * mode,
                                                       const char * output,
