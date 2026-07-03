@@ -1145,6 +1145,40 @@ Diagnostics for future cross-device KV tasks must report, at minimum, the planne
 ### **GitHub contribution**:
 Please add the `SYCL :` prefix/tag in issues/PRs titles to help the SYCL contributors to check/address them without delay.
 
+### Named SYCL kernel event profiler
+
+Set `GGML_SYCL_KERNEL_PROFILE=1` to enable the backend-wide named kernel profiler. The profiler records SYCL event profiling timestamps under human labels assigned by llama.cpp, not VTune task names. VTune computing-task attribution is not the source of truth for this route; SYCL event profiling timestamps are.
+
+Useful variables:
+
+| Variable | Effect |
+|---|---|
+| `GGML_SYCL_KERNEL_PROFILE=1` | Enable named event collection. |
+| `GGML_SYCL_KERNEL_PROFILE_OUTPUT=/tmp/sycl-kernels` | Write scriptable artifacts. `.csv` and/or `.json` suffixes are added for `both`. |
+| `GGML_SYCL_KERNEL_PROFILE_FORMAT=csv,json,both` | Select artifact format. |
+| `GGML_SYCL_KERNEL_PROFILE_TOP_N=40` | Number of rows in the stderr top-k summary. |
+| `GGML_SYCL_KERNEL_PROFILE_FLUSH=final,window,none` | `final` harvests at explicit teardown/tool flushes, `window` waits at requested profiler flush points, and `none` records opportunistically without forcing completeness. |
+| `GGML_SYCL_KERNEL_PROFILE_RAW=1` | Include raw per-event rows when supported. |
+
+Model-free smoke command:
+
+```bash
+set +u; source /opt/intel/oneapi/setvars.sh --force; set -u
+ONEAPI_DEVICE_SELECTOR=level_zero:1 \
+GGML_SYCL_KERNEL_PROFILE=1 \
+GGML_SYCL_KERNEL_PROFILE_OUTPUT=/tmp/sycl-kernels \
+GGML_SYCL_KERNEL_PROFILE_FORMAT=both \
+GGML_SYCL_KERNEL_PROFILE_FLUSH=window \
+./build/bin/sycl-kernel-bench \
+  --kernel=mxfp4_pair_glu_xmx_tiled_packed_r8_m2 \
+  --quant=MXFP4 --dim_m=2880 --dim_n=4 --dim_k=2880 \
+  --iterations=10 --warmup=2 --output=json
+
+python3 scripts/parse-sycl-kernel-profile.py \
+  --require-kernel mxfp4.gateup.xmx_tiled_dpas_m2 \
+  /tmp/sycl-kernels.csv
+```
+
 ### GPT-OSS MXFP4 end-to-end TG profile ledger
 
 `GGML_SYCL_E2E_TG_PROFILE=1` enables a default-off decode ledger for GPT-OSS MXFP4 token generation. The ledger complements `[MXFP4-MOE-TG-PROFILE]` by reporting full decode stage evidence rather than MoE-only timing.

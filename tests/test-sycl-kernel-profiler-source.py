@@ -39,3 +39,12 @@ def test_profiler_env_names_are_stable() -> None:
         "GGML_SYCL_KERNEL_PROFILE_FLUSH",
     ]:
         assert name in cpp
+
+
+def test_sycl_docs_describe_named_kernel_profiler_contract() -> None:
+    doc = (ROOT / "docs" / "backend" / "SYCL.md").read_text(encoding="utf-8")
+    assert "GGML_SYCL_KERNEL_PROFILE" in doc
+    assert "GGML_SYCL_KERNEL_PROFILE_OUTPUT" in doc
+    assert "GGML_SYCL_KERNEL_PROFILE_FLUSH" in doc
+    assert "SYCL event profiling timestamps" in doc
+    assert "VTune computing-task attribution is not the source of truth" in doc
