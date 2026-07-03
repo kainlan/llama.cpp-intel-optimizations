@@ -62,6 +62,7 @@ void                 sycl_timeline_record_span(const char *                     
                                                sycl_timeline_callsite                callsite,
                                                std::chrono::steady_clock::time_point start_time,
                                                std::chrono::steady_clock::time_point end_time);
+void                 sycl_timeline_flush(const char * reason);
 std::string          sycl_timeline_format_json_for_tests();
 void                 sycl_timeline_reset_for_tests();
 void                 sycl_timeline_set_config_for_tests(const sycl_timeline_config & cfg);

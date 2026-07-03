@@ -1,7 +1,10 @@
 #include "sycl-timeline.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <iterator>
 #include <string>
 
 static bool contains(const std::string & haystack, const char * needle) {
@@ -13,6 +16,19 @@ static void require(bool condition, const char * message) {
         std::fprintf(stderr, "test-sycl-timeline: %s\n", message);
         std::abort();
     }
+}
+
+static std::string make_temp_trace_path() {
+    const auto now_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    return "/tmp/test-sycl-timeline-" + std::to_string(now_us) + ".json";
+}
+
+static std::string read_file(const std::string & path) {
+    std::ifstream in(path, std::ios::binary);
+    require(static_cast<bool>(in), "trace file must be readable");
+    return { std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>() };
 }
 
 int main() {
@@ -73,6 +89,34 @@ int main() {
     const std::string same_line_json = sycl_timeline_format_json_for_tests();
     require(contains(same_line_json, "\"name\":\"same-line-a\""), "first same-line-safe scope must be recorded");
     require(contains(same_line_json, "\"name\":\"same-line-b\""), "second same-line-safe scope must be recorded");
+
+    const std::string trace_path = make_temp_trace_path();
+    std::remove(trace_path.c_str());
+    sycl_timeline_config file_cfg = cfg;
+    file_cfg.output_path          = trace_path;
+    sycl_timeline_reset_for_tests();
+    sycl_timeline_set_config_for_tests(file_cfg);
+    {
+        GGML_SYCL_TIMELINE_SCOPE("unit", "flush-span", "case=flush");
+    }
+    sycl_timeline_flush("unit-test");
+    const std::string file_json = read_file(trace_path);
+    require(contains(file_json, "\"traceEvents\""), "flushed trace file must contain traceEvents");
+    require(contains(file_json, "\"name\":\"flush-span\""), "flushed trace file must contain span name");
+    require(sycl_timeline_format_json_for_tests() == "{\"traceEvents\":[]}",
+            "successful flush must consume buffered events");
+    std::remove(trace_path.c_str());
+
+    sycl_timeline_config pathless_cfg = cfg;
+    pathless_cfg.output_path.clear();
+    sycl_timeline_reset_for_tests();
+    sycl_timeline_set_config_for_tests(pathless_cfg);
+    {
+        GGML_SYCL_TIMELINE_SCOPE("unit", "pathless-flush-span", "case=pathless");
+    }
+    sycl_timeline_flush("unit-test-pathless");
+    require(contains(sycl_timeline_format_json_for_tests(), "\"name\":\"pathless-flush-span\""),
+            "pathless flush must be a no-op");
 
     sycl_timeline_reset_for_tests();
 

@@ -5,6 +5,7 @@
 #include <climits>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <mutex>
 #include <string_view>
@@ -336,6 +337,33 @@ void sycl_timeline_record_span(const char *                          category,
     event.dur_us   = duration_to_us(end_time - start_time);
 
     state.events.push_back(std::move(event));
+}
+
+void sycl_timeline_flush(const char * reason) {
+    (void) reason;
+
+    sycl_timeline_state &       state = get_timeline_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+
+    const sycl_timeline_config & cfg = current_config(state);
+    if (!cfg.enabled || cfg.output_path.empty()) {
+        return;
+    }
+
+    std::ofstream out(cfg.output_path, std::ios::binary | std::ios::out | std::ios::trunc);
+    if (!out) {
+        return;
+    }
+
+    out << format_trace_json(state.events);
+    out.flush();
+    if (!out) {
+        return;
+    }
+
+    // Flush is one-shot: successful explicit file writes consume the buffered spans;
+    // failed or disabled/pathless flushes leave the buffer untouched for retry/tests.
+    state.events.clear();
 }
 
 std::string sycl_timeline_format_json_for_tests() {
