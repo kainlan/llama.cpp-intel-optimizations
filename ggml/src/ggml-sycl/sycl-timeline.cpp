@@ -21,8 +21,8 @@ struct sycl_timeline_state {
 };
 
 sycl_timeline_state & get_timeline_state() {
-    static sycl_timeline_state state;
-    return state;
+    static sycl_timeline_state * state = new sycl_timeline_state();
+    return *state;
 }
 
 bool is_space(char ch) {
