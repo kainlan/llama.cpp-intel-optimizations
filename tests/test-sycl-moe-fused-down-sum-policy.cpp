@@ -313,6 +313,23 @@ static int test_cached_down_q8_soa_tg_variant_parser_labels_and_scope() {
     return 0;
 }
 
+static int test_down_q8_soa_variants_do_not_enable_direct_final() {
+    const std::string mmvq = read_required_file("ggml/src/ggml-sycl/mmvq.cpp");
+    CHECK(contains(mmvq, "GGML_SYCL_MOE_DOWN_SUM_XMX_DIRECT_FINAL"),
+          "direct-final env knob must remain explicit");
+    CHECK(contains(mmvq, "GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL"),
+          "DPAS direct-final env knob must remain explicit");
+    CHECK(contains(mmvq, "GGML_SYCL_MOE_DOWN_SUM_Q8_SOA_TG_VARIANT"),
+          "q8-SOA row-group env must remain separate from direct-final envs");
+    CHECK(contains(mmvq, "GGML_SYCL_MOE_DOWN_CACHED_Q8_SOA_TG_VARIANT"),
+          "cached q8-SOA env must remain separate from direct-final envs");
+    CHECK(!contains(mmvq, "GGML_SYCL_MOE_DOWN_SUM_Q8_SOA_TG_VARIANT=direct-final"),
+          "row-group env must not grow a direct-final string alias");
+    CHECK(!contains(mmvq, "GGML_SYCL_MOE_DOWN_CACHED_Q8_SOA_TG_VARIANT=direct-final"),
+          "cached q8-SOA env must not grow a direct-final string alias");
+    return 0;
+}
+
 static int test_dpas_concurrency_variants_are_explicit_and_exclusive() {
     auto in                          = base_input();
     in.down_layout                   = GGML_LAYOUT_MXFP4_I8;
@@ -428,6 +445,9 @@ int main() {
         return 1;
     }
     if (test_cached_down_q8_soa_tg_variant_parser_labels_and_scope() != 0) {
+        return 1;
+    }
+    if (test_down_q8_soa_variants_do_not_enable_direct_final() != 0) {
         return 1;
     }
     if (test_dpas_concurrency_variants_are_explicit_and_exclusive() != 0) {
