@@ -56,6 +56,25 @@ common_env=(
     "GGML_SYCL_MOE_DOWN_SUM_DIRECT=1"
 )
 
+variant_env_clear_names=(
+    "GGML_SYCL_MOE_DOWN_SUM_DIRECT"
+    "GGML_SYCL_MOE_DOWN_SUM_Q8_SOA_TG_VARIANT"
+    "GGML_SYCL_MOE_DOWN_CACHED_Q8_SOA_TG_VARIANT"
+    "GGML_SYCL_MOE_DOWN_SUM_DIRECT_ATOMIC"
+    "GGML_SYCL_MOE_DOWN_SUM_XMX_DIRECT_FINAL"
+    "GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL"
+    "GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL_I8"
+    "GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL_DPAS"
+    "GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL_RANK_PARALLEL_ATOMIC"
+    "GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL_SCRATCH_REDUCE"
+    "GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL_SAME_EXPERT_GROUPED"
+)
+
+variant_env_clear_args=()
+for name in "${variant_env_clear_names[@]}"; do
+    variant_env_clear_args+=("-u" "${name}")
+done
+
 bench_args=(
     "${BENCH}"
     -m "${MODEL}"
@@ -78,6 +97,9 @@ print_env_command() {
     local -n env_ref=$1
     shift
     printf 'env'
+    for item in "${variant_env_clear_args[@]}"; do
+        printf ' %q' "${item}"
+    done
     for item in "${env_ref[@]}"; do
         printf ' %q' "${item}"
     done
@@ -111,7 +133,7 @@ run_one() {
     if [[ "${EXECUTE}" -eq 1 ]]; then
         mkdir -p "${case_dir}"
         printf '%s\n' "variant=${name}" "profile=${profile_base}.csv" "model=${MODEL}" >"${case_dir}/metadata.txt"
-        env "${cmd_env[@]}" "${bench_args[@]}" >"${stdout}" 2>"${stderr}"
+        env "${variant_env_clear_args[@]}" "${cmd_env[@]}" "${bench_args[@]}" >"${stdout}" 2>"${stderr}"
         python3 "${ROOT_DIR}/scripts/parse-sycl-kernel-profile.py" "${profile_base}.csv" >"${parse_out}"
     fi
 }

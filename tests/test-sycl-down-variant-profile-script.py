@@ -30,14 +30,40 @@ BASELINE_ENVS = [
     "ONEAPI_DEVICE_SELECTOR=level_zero:1",
 ]
 
+HARNESS_OVERRIDE_ENVS = [
+    "SYCL_LLAMA_BENCH",
+    "SYCL_GPTOSS_MODEL",
+    "SYCL_DOWN_VARIANT_PROFILE_OUT",
+]
+
+VARIANT_CLEAR_ENVS = [
+    "GGML_SYCL_MOE_DOWN_SUM_DIRECT",
+    "GGML_SYCL_MOE_DOWN_SUM_Q8_SOA_TG_VARIANT",
+    "GGML_SYCL_MOE_DOWN_CACHED_Q8_SOA_TG_VARIANT",
+    "GGML_SYCL_MOE_DOWN_SUM_DIRECT_ATOMIC",
+    "GGML_SYCL_MOE_DOWN_SUM_XMX_DIRECT_FINAL",
+    "GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL",
+    "GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL_I8",
+    "GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL_DPAS",
+    "GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL_RANK_PARALLEL_ATOMIC",
+    "GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL_SCRATCH_REDUCE",
+    "GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL_SAME_EXPERT_GROUPED",
+]
+
 
 def _script_text() -> str:
     return SCRIPT.read_text()
 
 
-def _run_script(*args: str, out_dir: Path) -> subprocess.CompletedProcess[str]:
+def _run_script(
+    *args: str, out_dir: Path, extra_env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
-    env["SYCL_DOWN_VARIANT_PROFILE_OUT"] = str(out_dir)
+    for name in HARNESS_OVERRIDE_ENVS:
+        env.pop(name, None)
+    if extra_env is not None:
+        env.update(extra_env)
+    env.setdefault("SYCL_DOWN_VARIANT_PROFILE_OUT", str(out_dir))
     return subprocess.run(
         [str(SCRIPT), *args],
         cwd=ROOT,
@@ -98,6 +124,20 @@ def test_dry_run_has_no_side_effects_and_does_not_source_oneapi(tmp_path: Path) 
     assert "source /opt/intel/oneapi" not in out
 
 
+def test_dry_run_clears_inherited_variant_knobs_per_command(tmp_path: Path) -> None:
+    completed = _run_script(
+        "--dry-run",
+        out_dir=tmp_path / "dry-run",
+        extra_env={name: "tainted" for name in VARIANT_CLEAR_ENVS},
+    )
+    out = _combined_output(completed)
+    assert completed.returncode == 0, out
+    baseline = _section(out, "baseline")
+    for name in VARIANT_CLEAR_ENVS:
+        assert f"-u {name}" in baseline
+        assert f"{name}=tainted" not in out
+
+
 def test_dry_run_lists_all_variants_in_order(tmp_path: Path) -> None:
     completed = _run_script("--dry-run", out_dir=tmp_path / "dry-run")
     out = _combined_output(completed)
@@ -145,9 +185,10 @@ def test_row_and_atomic_variant_envs_do_not_leak_between_rows(tmp_path: Path) ->
     out = _combined_output(completed)
     assert completed.returncode == 0, out
     baseline = _section(out, "baseline")
-    assert "GGML_SYCL_MOE_DOWN_SUM_Q8_SOA_TG_VARIANT" not in baseline
+    assert "GGML_SYCL_MOE_DOWN_SUM_Q8_SOA_TG_VARIANT=row2" not in baseline
+    assert "GGML_SYCL_MOE_DOWN_SUM_Q8_SOA_TG_VARIANT=row4" not in baseline
     assert "GGML_SYCL_MOE_DOWN_SUM_DIRECT_ATOMIC=1" not in baseline
-    assert "GGML_SYCL_MOE_DOWN_CACHED_Q8_SOA_TG_VARIANT" not in baseline
+    assert "GGML_SYCL_MOE_DOWN_CACHED_Q8_SOA_TG_VARIANT=" not in baseline
     assert "GGML_SYCL_MOE_DOWN_SUM_Q8_SOA_TG_VARIANT=row2" in _section(out, "row2")
     assert "GGML_SYCL_MOE_DOWN_SUM_Q8_SOA_TG_VARIANT=row4" in _section(out, "row4")
     assert "GGML_SYCL_MOE_DOWN_SUM_DIRECT_ATOMIC=1" in _section(out, "atomic")
