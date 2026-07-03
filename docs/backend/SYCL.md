@@ -1235,6 +1235,41 @@ bash scripts/sycl-gptoss-e2e-profile-matrix.sh --run --i-understand-this-runs-gp
 
 Do not use this ledger to bypass existing safety gates. Runtime optimization remains default-off until the canonical GPT-OSS correctness gate, fatal-marker parser gates, PP preservation, and TG improvement are all proven on lead-owned hardware.
 
+### SYCL decode timeline profiler
+
+`GGML_SYCL_TIMELINE` enables the decode timeline profiler for host-side attribution around SYCL graph-compute work. Use it with the existing FA-on GPT-OSS baseline guidance above; the timeline is diagnostic evidence and does not make no-FA profiling a valid replacement for the canonical GPT-OSS correctness, fatal-marker, PP-preservation, and TG-throughput gates.
+
+Runtime knobs:
+
+| Variable | Effect |
+|---|---|
+| `GGML_SYCL_TIMELINE=summary` | Enable the profiler configuration without recording Chrome Trace spans. This is useful for confirming the code path is active with minimal artifact volume. |
+| `GGML_SYCL_TIMELINE=timeline` | Record host spans to the timeline artifact. |
+| `GGML_SYCL_TIMELINE=timeline+events` | Record host spans plus GPU `sycl.event` profiling spans harvested from named SYCL events. |
+| `GGML_SYCL_TIMELINE_OUTPUT=/tmp/sycl-decode-timeline.json` | Write the Chrome Trace JSON artifact at profiler flush. |
+| `GGML_SYCL_TIMELINE_TOKEN_START=N` | Start recording at graph-compute invocation index `N`. This limit is enforced. |
+| `GGML_SYCL_TIMELINE_TOKEN_COUNT=N` | Record at most `N` graph-compute invocations after the start index. This limit is enforced; `0` means unbounded. |
+| `GGML_SYCL_TIMELINE_MAX_EVENTS=N` | Cap buffered timeline events; use a large enough value for the selected token window. |
+
+`GGML_SYCL_TIMELINE_TOKEN_START` and `GGML_SYCL_TIMELINE_TOKEN_COUNT` count graph-compute invocations, not text tokens. Prefill also consumes graph-compute indices, so set `GGML_SYCL_TIMELINE_TOKEN_START` past the prefill graph-compute count when you need to isolate pure decode.
+
+Parse the artifact with `scripts/parse-sycl-timeline.py`:
+
+```bash
+python3 scripts/parse-sycl-timeline.py \
+  --wall-ms 1000 \
+  --top-callsites 40 \
+  /tmp/sycl-decode-timeline.json
+```
+
+The parser reports `category.*` host totals, `callsite.*` host-side file:line attribution, GPU event coverage, and reconstructed `gap.*` metrics. `--top-callsites` is supported for limiting host callsite rows.
+
+Open the same JSON in Perfetto for visual inspection. Host spans are the visual timeline. GPU `sycl.event` spans are anchored at `ts=0` because their timestamps use device profiling clocks; the device nanosecond fields are carried in event args (`device_submit_ns`, `device_start_ns`, `device_end_ns`) and do not visually interleave with host spans. Use `scripts/parse-sycl-timeline.py` for GPU gap metrics because it reconstructs `gap.*` from that event metadata.
+
+Default attribution is host-side file:line callsites. VTune GPU source-line attribution is an optional deep dive only, not a prerequisite for using the decode timeline profiler and not the source of truth for default callsite attribution.
+
+Real model/GPU validation is lead-owned. Under delegated documentation/source-test work, workers must not run real model/GPU validation, llama-bench, sycl-kernel-bench, VTune, sycl-ls, DRM, lsof, or P2P probes.
+
 ## TODO
 
 - Review ZES_ENABLE_SYSMAN: https://github.com/intel/compute-runtime/blob/master/programmers-guide/SYSMAN.md#support-and-limitations
