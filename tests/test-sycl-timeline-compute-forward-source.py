@@ -33,6 +33,26 @@ def assert_no_waits(source: str) -> None:
     assert "wait_and_throw" not in source
 
 
+def assert_no_waits_or_flush(source: str) -> None:
+    assert_no_waits(source)
+    assert "flush" not in source
+
+
+def test_graph_compute_impl_notes_timeline_decode_step_once_without_waits() -> None:
+    src = read_source()
+    body = graph_compute_impl_body(src)
+
+    hook = "ggml_sycl::sycl_timeline_note_graph_compute();"
+    assert body.count(hook) == 1
+    hook_pos = body.index(hook)
+    spans_enabled = body.index("const bool timeline_spans_enabled", hook_pos)
+    guard = body.index("compute_impl_guard _reentry_guard")
+    local_hook_window = body[max(0, hook_pos - 200) : min(len(body), hook_pos + 400)]
+
+    assert hook_pos < spans_enabled < guard
+    assert_no_waits_or_flush(local_hook_window)
+
+
 def test_graph_compute_impl_has_timeline_scope_after_reentry_guard() -> None:
     src = read_source()
     assert '#include "sycl-timeline.hpp"' in src

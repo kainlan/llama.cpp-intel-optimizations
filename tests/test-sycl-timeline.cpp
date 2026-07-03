@@ -3,6 +3,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -11,6 +12,15 @@
 
 static bool contains(const std::string & haystack, const char * needle) {
     return haystack.find(needle) != std::string::npos;
+}
+
+static int count_occurrences(const std::string & haystack, const char * needle) {
+    int          count = 0;
+    const size_t len   = std::string(needle).size();
+    for (size_t pos = haystack.find(needle); pos != std::string::npos; pos = haystack.find(needle, pos + len)) {
+        ++count;
+    }
+    return count;
 }
 
 static void require(bool condition, const char * message) {
@@ -89,6 +99,7 @@ int main() {
 
     sycl_timeline_reset_for_tests();
     sycl_timeline_set_config_for_tests(cfg);
+    sycl_timeline_begin_decode_step_for_tests(3);
     require(sycl_timeline_enabled(), "test override config must enable timeline");
 
     {
@@ -110,6 +121,7 @@ int main() {
     disabled_cfg.enabled              = false;
     sycl_timeline_reset_for_tests();
     sycl_timeline_set_config_for_tests(disabled_cfg);
+    sycl_timeline_begin_decode_step_for_tests(3);
     {
         GGML_SYCL_TIMELINE_SCOPE("unit", "disabled-span", "case=disabled");
     }
@@ -118,6 +130,7 @@ int main() {
 
     sycl_timeline_reset_for_tests();
     sycl_timeline_set_config_for_tests(cfg);
+    sycl_timeline_begin_decode_step_for_tests(3);
     // clang-format off
     { GGML_SYCL_TIMELINE_SCOPE("unit", "same-line-a", ""); GGML_SYCL_TIMELINE_SCOPE("unit", "same-line-b", ""); }
     // clang-format on
@@ -131,6 +144,7 @@ int main() {
     file_cfg.output_path            = trace_path;
     sycl_timeline_reset_for_tests();
     sycl_timeline_set_config_for_tests(file_cfg);
+    sycl_timeline_begin_decode_step_for_tests(3);
     {
         GGML_SYCL_TIMELINE_SCOPE("unit", "flush-span", "case=flush");
     }
@@ -147,12 +161,58 @@ int main() {
     pathless_cfg.output_path.clear();
     sycl_timeline_reset_for_tests();
     sycl_timeline_set_config_for_tests(pathless_cfg);
+    sycl_timeline_begin_decode_step_for_tests(3);
     {
         GGML_SYCL_TIMELINE_SCOPE("unit", "pathless-flush-span", "case=pathless");
     }
     sycl_timeline_flush("unit-test-pathless");
     require(contains(sycl_timeline_format_json_for_tests(), "\"name\":\"pathless-flush-span\""),
             "pathless flush must be a no-op");
+
+    sycl_timeline_config window_cfg = cfg;
+    window_cfg.token_start          = 2;
+    window_cfg.token_count          = 1;
+    sycl_timeline_reset_for_tests();
+    sycl_timeline_set_config_for_tests(window_cfg);
+    for (int step = 0; step < 5; ++step) {
+        sycl_timeline_begin_decode_step_for_tests(step);
+        std::string metadata = "step=" + std::to_string(step);
+        {
+            GGML_SYCL_TIMELINE_SCOPE("unit", "step-span", metadata.c_str());
+        }
+    }
+    sycl_timeline_begin_decode_step_for_tests(2);
+    {
+        sycl_timeline_scope captured_scope("unit", "captured-window-scope", "captured_step=2", {});
+        sycl_timeline_begin_decode_step_for_tests(4);
+    }
+    const std::string step_json = sycl_timeline_format_json_for_tests();
+    require(count_occurrences(step_json, "\"name\":\"step-span\"") == 1,
+            "token window must record exactly one step-span");
+    require(contains(step_json, "\"name\":\"captured-window-scope\""),
+            "timeline scope must use construction-time graph-compute step");
+    require(contains(step_json, "\"metadata\":\"step=2\""), "token window must record step 2 metadata");
+    require(!contains(step_json, "\"metadata\":\"step=0\""), "token window must skip step 0 metadata");
+    require(!contains(step_json, "\"metadata\":\"step=1\""), "token window must skip step 1 metadata");
+    require(!contains(step_json, "\"metadata\":\"step=3\""), "token window must skip step 3 metadata");
+    require(!contains(step_json, "\"metadata\":\"step=4\""), "token window must skip step 4 metadata");
+
+    sycl_timeline_config event_window_cfg = sycl_timeline_config_from_values("timeline+events", "", "2", "1", "10");
+    sycl_timeline_reset_for_tests();
+    sycl_timeline_set_config_for_tests(event_window_cfg);
+    sycl_timeline_begin_decode_step_for_tests(4);
+    require(sycl_timeline_records_events_for_step(2), "event gate must allow captured in-window step");
+    require(!sycl_timeline_records_events_for_step(4), "event gate must reject captured out-of-window step");
+    const auto delayed_start = std::chrono::steady_clock::now();
+    sycl_timeline_record_span_for_step("sycl.event", "delayed-in-window", "captured_step=2", {}, delayed_start,
+                                       delayed_start + std::chrono::microseconds(1), 2);
+    sycl_timeline_record_span_for_step("sycl.event", "delayed-out-of-window", "captured_step=4", {}, delayed_start,
+                                       delayed_start + std::chrono::microseconds(1), 4);
+    const std::string delayed_json = sycl_timeline_format_json_for_tests();
+    require(contains(delayed_json, "\"name\":\"delayed-in-window\""),
+            "captured in-window event span must record after current step advances");
+    require(!contains(delayed_json, "\"name\":\"delayed-out-of-window\""),
+            "captured out-of-window event span must stay filtered");
 
     sycl_timeline_reset_for_tests();
 
