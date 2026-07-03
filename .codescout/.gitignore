@@ -1,0 +1,8 @@
+# BEGIN codescout-tasks local-only
+# Task tracking is machine-local by default; opt in with [tasks] shared = true
+# in .codescout.toml to commit these. Note: git does not UNTRACK an already-tracked
+# file, so flipping a previously-shared repo to local needs a manual
+# `git rm --cached .codescout/tasks.jsonl`.
+tasks.jsonl
+.tasks.jsonl.lock
+# END codescout-tasks local-only
