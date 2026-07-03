@@ -5,8 +5,10 @@
 #include <climits>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -20,6 +22,8 @@ struct sycl_timeline_span_event {
     std::string file;
     int         line = 0;
     std::string function;
+    uint64_t    pid    = 1;
+    uint64_t    tid    = 0;
     int64_t     ts_us  = 0;
     int64_t     dur_us = 0;
 };
@@ -146,6 +150,14 @@ bool config_records_spans(const sycl_timeline_config & cfg) {
     return cfg.enabled && (cfg.mode == sycl_timeline_mode::TIMELINE || cfg.mode == sycl_timeline_mode::TIMELINE_EVENTS);
 }
 
+bool timeline_records_spans() {
+    sycl_timeline_state &       state = get_timeline_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+
+    const sycl_timeline_config & cfg = current_config(state);
+    return config_records_spans(cfg) && cfg.max_events > 0 && static_cast<int>(state.events.size()) < cfg.max_events;
+}
+
 std::string string_or_empty(const char * value) {
     return value != nullptr ? value : "";
 }
@@ -214,6 +226,10 @@ std::string format_trace_json(const std::vector<sycl_timeline_span_event> & even
         append_json_escaped(out, event.category);
         out += ",\"name\":";
         append_json_escaped(out, event.name);
+        out += ",\"pid\":";
+        out += std::to_string(event.pid);
+        out += ",\"tid\":";
+        out += std::to_string(event.tid);
         out += ",\"ts\":";
         out += std::to_string(event.ts_us);
         out += ",\"dur\":";
@@ -268,17 +284,17 @@ sycl_timeline_config sycl_timeline_config_from_values(const char * mode,
 sycl_timeline_scope::sycl_timeline_scope(const char *           category,
                                          const char *           name,
                                          const char *           metadata,
-                                         sycl_timeline_callsite callsite) :
-    active_(sycl_timeline_enabled()),
-    start_time_(std::chrono::steady_clock::now()) {
+                                         sycl_timeline_callsite callsite) {
+    active_ = timeline_records_spans();
     if (!active_) {
         return;
     }
 
-    category_ = string_or_empty(category);
-    name_     = string_or_empty(name);
-    metadata_ = string_or_empty(metadata);
-    callsite_ = callsite;
+    start_time_ = std::chrono::steady_clock::now();
+    category_   = string_or_empty(category);
+    name_       = string_or_empty(name);
+    metadata_   = string_or_empty(metadata);
+    callsite_   = callsite;
 }
 
 sycl_timeline_scope::~sycl_timeline_scope() {
@@ -314,6 +330,8 @@ void sycl_timeline_record_span(const char *                          category,
     event.file     = string_or_empty(callsite.file);
     event.line     = callsite.line;
     event.function = string_or_empty(callsite.function);
+    event.pid      = 1;
+    event.tid      = static_cast<uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
     event.ts_us    = time_point_to_us(start_time);
     event.dur_us   = duration_to_us(end_time - start_time);
 

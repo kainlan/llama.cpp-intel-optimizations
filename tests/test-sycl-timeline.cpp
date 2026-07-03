@@ -46,6 +46,8 @@ int main() {
     const std::string json = sycl_timeline_format_json_for_tests();
     require(contains(json, "\"traceEvents\""), "JSON must contain traceEvents");
     require(contains(json, "\"ph\":\"X\""), "JSON must contain complete events");
+    require(contains(json, "\"pid\":"), "JSON must contain pid");
+    require(contains(json, "\"tid\":"), "JSON must contain tid");
     require(contains(json, "\"cat\":\"unit\""), "JSON must contain category");
     require(contains(json, "\"name\":\"enabled-span\""), "JSON must contain span name");
     require(contains(json, "\"file\":\""), "JSON must contain file");
@@ -65,13 +67,12 @@ int main() {
 
     sycl_timeline_reset_for_tests();
     sycl_timeline_set_config_for_tests(cfg);
-    {
-        GGML_SYCL_TIMELINE_SCOPE("unit", "twin-a", "");
-        GGML_SYCL_TIMELINE_SCOPE("unit", "twin-b", "");
-    }
-    const std::string twin_json = sycl_timeline_format_json_for_tests();
-    require(contains(twin_json, "\"name\":\"twin-a\""), "first same-line-safe scope must be recorded");
-    require(contains(twin_json, "\"name\":\"twin-b\""), "second same-line-safe scope must be recorded");
+    // clang-format off
+    { GGML_SYCL_TIMELINE_SCOPE("unit", "same-line-a", ""); GGML_SYCL_TIMELINE_SCOPE("unit", "same-line-b", ""); }
+    // clang-format on
+    const std::string same_line_json = sycl_timeline_format_json_for_tests();
+    require(contains(same_line_json, "\"name\":\"same-line-a\""), "first same-line-safe scope must be recorded");
+    require(contains(same_line_json, "\"name\":\"same-line-b\""), "second same-line-safe scope must be recorded");
 
     sycl_timeline_reset_for_tests();
 

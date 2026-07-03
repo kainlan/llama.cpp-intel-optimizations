@@ -68,8 +68,9 @@ void                 sycl_timeline_set_config_for_tests(const sycl_timeline_conf
 
 }  // namespace ggml_sycl
 
-#define GGML_SYCL_TL_CONCAT_(a, b) a##b
-#define GGML_SYCL_TL_CONCAT(a, b)  GGML_SYCL_TL_CONCAT_(a, b)
-#define GGML_SYCL_TIMELINE_SCOPE(cat, name, metadata)                                        \
-    ggml_sycl::sycl_timeline_scope GGML_SYCL_TL_CONCAT(ggml_sycl_timeline_scope_, __LINE__)( \
+#define GGML_SYCL_TL_CONCAT_(a, b)       a##b
+#define GGML_SYCL_TL_CONCAT(a, b)        GGML_SYCL_TL_CONCAT_(a, b)
+#define GGML_SYCL_TL_SCOPE_NAME(counter) GGML_SYCL_TL_CONCAT(ggml_sycl_timeline_scope_, counter)
+#define GGML_SYCL_TIMELINE_SCOPE(cat, name, metadata)                    \
+    ggml_sycl::sycl_timeline_scope GGML_SYCL_TL_SCOPE_NAME(__COUNTER__)( \
         (cat), (name), (metadata), ggml_sycl::sycl_timeline_callsite{ __FILE__, __LINE__, __func__ })
