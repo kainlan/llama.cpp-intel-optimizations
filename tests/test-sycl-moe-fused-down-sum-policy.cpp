@@ -228,6 +228,8 @@ static int test_soa_tg_row_group_variant_parser_and_labels() {
           "zero SOA TG row-group env must fail closed");
     CHECK(ggml_sycl_moe_down_sum_q8_soa_tg_rows_per_group_from_env("bogus") == 1,
           "unknown SOA TG row-group env must fail closed");
+    CHECK(ggml_sycl_moe_down_sum_q8_soa_tg_rows_per_group_from_env("direct-final") == 1,
+          "direct-final must not be accepted as a SOA TG row-group alias");
     CHECK(ggml_sycl_moe_down_sum_q8_soa_tg_rows_per_group_from_env("2") == 1,
           "numeric row2 SOA TG row-group alias must fail closed");
     CHECK(ggml_sycl_moe_down_sum_q8_soa_tg_rows_per_group_from_env("row2") == 2,
@@ -267,6 +269,8 @@ static int test_cached_down_q8_soa_tg_variant_parser_labels_and_scope() {
           "numeric cached-Q8 SOA TG variant aliases must fail closed");
     CHECK(ggml_sycl_moe_down_cached_q8_soa_tg_variant_from_env("bogus") == 0,
           "unknown cached-Q8 SOA TG variant env must fail closed");
+    CHECK(ggml_sycl_moe_down_cached_q8_soa_tg_variant_from_env("direct-final") == 0,
+          "direct-final must not be accepted as a cached-Q8 SOA TG variant alias");
     CHECK(ggml_sycl_moe_down_cached_q8_soa_tg_variant_from_env("vector-qs") == 1,
           "vector-qs cached-Q8 SOA TG variant must parse");
     CHECK(ggml_sycl_moe_down_cached_q8_soa_tg_variant_from_env("cache-y") == 2,
