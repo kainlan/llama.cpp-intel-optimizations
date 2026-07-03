@@ -54,6 +54,39 @@ int main() {
     require(cfg.token_count == 4, "token_count parse failed");
     require(cfg.max_events == 99, "max_events parse failed");
 
+    unsetenv("GGML_SYCL_TIMELINE");
+    unsetenv("GGML_SYCL_TIMELINE_OUTPUT");
+    unsetenv("GGML_SYCL_TIMELINE_TOKEN_START");
+    unsetenv("GGML_SYCL_TIMELINE_TOKEN_COUNT");
+    unsetenv("GGML_SYCL_TIMELINE_MAX_EVENTS");
+    sycl_timeline_config env_cfg = sycl_timeline_config_from_env();
+    require(!env_cfg.enabled, "unset timeline env must disable timeline");
+    require(env_cfg.output_path.empty(), "unset output env must leave output path empty");
+
+    setenv("GGML_SYCL_TIMELINE", "timeline+events", 1);
+    setenv("GGML_SYCL_TIMELINE_OUTPUT", "/tmp/env-trace.json", 1);
+    setenv("GGML_SYCL_TIMELINE_TOKEN_START", "7", 1);
+    setenv("GGML_SYCL_TIMELINE_TOKEN_COUNT", "8", 1);
+    setenv("GGML_SYCL_TIMELINE_MAX_EVENTS", "123", 1);
+    env_cfg = sycl_timeline_config_from_env();
+    require(env_cfg.enabled, "env config must enable timeline");
+    require(env_cfg.mode == sycl_timeline_mode::TIMELINE_EVENTS, "env mode parse failed");
+    require(env_cfg.output_path == "/tmp/env-trace.json", "env output path parse failed");
+    require(env_cfg.token_start == 7, "env token_start parse failed");
+    require(env_cfg.token_count == 8, "env token_count parse failed");
+    require(env_cfg.max_events == 123, "env max_events parse failed");
+
+    unsetenv("GGML_SYCL_TIMELINE_OUTPUT");
+    unsetenv("GGML_SYCL_TIMELINE_TOKEN_START");
+    unsetenv("GGML_SYCL_TIMELINE_TOKEN_COUNT");
+    unsetenv("GGML_SYCL_TIMELINE_MAX_EVENTS");
+    env_cfg = sycl_timeline_config_from_env();
+    require(env_cfg.output_path.empty(), "unset env output path must read as empty");
+    require(env_cfg.token_start == 0, "unset env token_start must use default");
+    require(env_cfg.token_count == 0, "unset env token_count must use default");
+    require(env_cfg.max_events == 200000, "unset env max_events must use default");
+    unsetenv("GGML_SYCL_TIMELINE");
+
     sycl_timeline_reset_for_tests();
     sycl_timeline_set_config_for_tests(cfg);
     require(sycl_timeline_enabled(), "test override config must enable timeline");

@@ -129,11 +129,18 @@ int parse_int_or_default(const char * value, int default_value, int min_value) {
     return static_cast<int>(parsed);
 }
 
+constexpr const char * SYCL_TIMELINE_ENV_MODE        = "GGML_SYCL_TIMELINE";
+constexpr const char * SYCL_TIMELINE_ENV_OUTPUT      = "GGML_SYCL_TIMELINE_OUTPUT";
+constexpr const char * SYCL_TIMELINE_ENV_TOKEN_START = "GGML_SYCL_TIMELINE_TOKEN_START";
+constexpr const char * SYCL_TIMELINE_ENV_TOKEN_COUNT = "GGML_SYCL_TIMELINE_TOKEN_COUNT";
+constexpr const char * SYCL_TIMELINE_ENV_MAX_EVENTS  = "GGML_SYCL_TIMELINE_MAX_EVENTS";
+
 sycl_timeline_config read_env_config() {
-    return sycl_timeline_config_from_values(std::getenv("GGML_SYCL_TIMELINE"), std::getenv("GGML_SYCL_TIMELINE_OUTPUT"),
-                                            std::getenv("GGML_SYCL_TIMELINE_TOKEN_START"),
-                                            std::getenv("GGML_SYCL_TIMELINE_TOKEN_COUNT"),
-                                            std::getenv("GGML_SYCL_TIMELINE_MAX_EVENTS"));
+    return sycl_timeline_config_from_values(std::getenv(SYCL_TIMELINE_ENV_MODE),
+                                            std::getenv(SYCL_TIMELINE_ENV_OUTPUT),
+                                            std::getenv(SYCL_TIMELINE_ENV_TOKEN_START),
+                                            std::getenv(SYCL_TIMELINE_ENV_TOKEN_COUNT),
+                                            std::getenv(SYCL_TIMELINE_ENV_MAX_EVENTS));
 }
 
 const sycl_timeline_config & current_config(sycl_timeline_state & state) {
