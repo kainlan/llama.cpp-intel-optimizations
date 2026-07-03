@@ -13869,6 +13869,11 @@ void * unified_cache::zone_alloc(vram_zone_id zone, size_t size, size_t align) {
         if (e2e_tg_profile_enabled()) {
             e2e_tg_profile_record_cache_event("zone_alloc_failed", size, 0.0);
         }
+        if (sycl_timeline_enabled()) {
+            char timeline_metadata[128];
+            std::snprintf(timeline_metadata, sizeof(timeline_metadata), "bytes=%zu", static_cast<size_t>(size));
+            GGML_SYCL_TIMELINE_SCOPE("cache", "zone_alloc_failed", timeline_metadata);
+        }
         return nullptr;
     }
 
@@ -13916,6 +13921,11 @@ void * unified_cache::zone_alloc(vram_zone_id zone, size_t size, size_t align) {
     }
     if (e2e_tg_profile_enabled()) {
         e2e_tg_profile_record_cache_event("zone_alloc_failed", size, 0.0);
+    }
+    if (sycl_timeline_enabled()) {
+        char timeline_metadata[128];
+        std::snprintf(timeline_metadata, sizeof(timeline_metadata), "bytes=%zu", static_cast<size_t>(size));
+        GGML_SYCL_TIMELINE_SCOPE("cache", "zone_alloc_failed", timeline_metadata);
     }
     return nullptr;
 }
