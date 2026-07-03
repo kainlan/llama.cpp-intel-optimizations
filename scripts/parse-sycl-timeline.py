@@ -17,8 +17,8 @@ def parse_wall_ms(raw: str) -> float:
         value = float(raw)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"invalid wall millisecond value: {raw}") from exc
-    if not math.isfinite(value) or value < 0.0:
-        raise argparse.ArgumentTypeError("--wall-ms must be finite and non-negative")
+    if not math.isfinite(value) or value <= 0.0:
+        raise argparse.ArgumentTypeError("--wall-ms must be finite and greater than zero")
     return value
 
 
@@ -169,7 +169,7 @@ def summarize_events(
 
 
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description="Summarize SYCL Chrome Trace timeline complete events")
+    parser = argparse.ArgumentParser(description="Summarize SYCL Chrome Trace timeline complete events", allow_abbrev=False)
     parser.add_argument("trace", type=pathlib.Path)
     parser.add_argument("--wall-ms", type=parse_wall_ms)
     parser.add_argument("--top-callsites", type=int, default=20, help="number of callsite totals to print; use 0 for all")

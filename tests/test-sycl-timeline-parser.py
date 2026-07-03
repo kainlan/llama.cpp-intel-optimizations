@@ -21,6 +21,52 @@ def run_parser(path: pathlib.Path, *args: str) -> subprocess.CompletedProcess[st
     )
 
 
+def write_trace(tmp_path: pathlib.Path, raw: str) -> pathlib.Path:
+    path = tmp_path / "timeline.json"
+    path.write_text(raw, encoding="utf-8")
+    return path
+
+
+def test_wall_ms_nan_reports_clean_argparse_error(tmp_path: pathlib.Path) -> None:
+    path = write_trace(tmp_path, '{"traceEvents": []}')
+
+    result = run_parser(path, "--wall-ms", "nan")
+
+    assert result.returncode == 2
+    assert "--wall-ms must be finite and greater than zero" in result.stdout
+    assert "Traceback" not in result.stdout
+
+
+def test_malformed_json_reports_clean_timeline_error(tmp_path: pathlib.Path) -> None:
+    path = write_trace(tmp_path, '{"traceEvents": [')
+
+    result = run_parser(path)
+
+    assert result.returncode == 2
+    assert "failed to parse timeline" in result.stdout
+    assert "Traceback" not in result.stdout
+
+
+def test_missing_trace_events_reports_clean_timeline_error(tmp_path: pathlib.Path) -> None:
+    path = write_trace(tmp_path, '{"metadata": []}')
+
+    result = run_parser(path)
+
+    assert result.returncode == 2
+    assert "failed to parse timeline" in result.stdout
+    assert "Traceback" not in result.stdout
+
+
+def test_top_abbreviation_is_rejected(tmp_path: pathlib.Path) -> None:
+    path = write_trace(tmp_path, '{"traceEvents": []}')
+
+    result = run_parser(path, "--top", "20")
+
+    assert result.returncode == 2
+    assert "unrecognized arguments: --top" in result.stdout
+    assert "Traceback" not in result.stdout
+
+
 def test_parser_summarizes_wall_categories_and_callsites() -> None:
     trace = {
         "traceEvents": [
