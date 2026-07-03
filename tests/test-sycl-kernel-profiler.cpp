@@ -106,11 +106,21 @@ int main() {
     CHECK(contains(csv, "sycl.memcpy.graph_safe,memory,bytes=1024,1,compute,1,500,500,500,500,500,500,1024,2,1"),
           "missing memcpy aggregate row");
 
+    ggml_sycl_kernel_profile_add_raw_event_for_test(slow, 42, 100, 110, 1000, 1200, 1800, "test",
+                                                    "tests/test-sycl-kernel-profiler.cpp", 123, "main", false);
+
     const std::string json = ggml_sycl_kernel_profile_format_json_for_test();
     CHECK(contains(json, "\"kernels\""), "missing kernels JSON array");
     CHECK(contains(json, "\"name\":\"mxfp4.gateup.packed_q8_m2\""), "missing slow JSON name");
     CHECK(contains(json, "\"total_ns\":4000"), "missing slow JSON total");
     CHECK(contains(json, "\"failed_timestamps\":2"), "missing failed timestamp count");
+    CHECK(contains(json, "\"raw_events\""), "missing raw events JSON array");
+    CHECK(contains(json, "\"event_id\":42"), "missing raw event id");
+    CHECK(contains(json, "\"host_submit_begin_us\":100"), "missing raw host submit begin");
+    CHECK(contains(json, "\"host_submit_end_us\":110"), "missing raw host submit end");
+    CHECK(contains(json, "\"timestamp_status\":\"test\""), "missing raw timestamp status");
+    CHECK(contains(json, "\"file\":\"tests/test-sycl-kernel-profiler.cpp\""), "missing raw file");
+    CHECK(contains(json, "\"function\":\"main\""), "missing raw function");
 
     const std::string summary = ggml_sycl_kernel_profile_format_summary_for_test(2);
     CHECK(summary.find("mxfp4.gateup.packed_q8_m2") < summary.find("sycl.memcpy.graph_safe"),

@@ -1,11 +1,12 @@
 #pragma once
 
+#include "sycl-timeline.hpp"
+
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <sycl/sycl.hpp>
-
-#include "sycl-timeline.hpp"
 
 enum class ggml_sycl_kernel_profile_output_format : uint8_t {
     STDERR = 0,
@@ -40,13 +41,29 @@ struct ggml_sycl_profile_label {
 
 bool                            ggml_sycl_kernel_profile_enabled();
 ggml_sycl_kernel_profile_config ggml_sycl_kernel_profile_config_from_env();
-void ggml_sycl_kernel_profile_record_event(const ggml_sycl_profile_label & label, const sycl::event & event);
-void ggml_sycl_kernel_profile_flush(bool wait_for_events, const char * reason);
+void                            ggml_sycl_kernel_profile_record_event(const ggml_sycl_profile_label &   label,
+                                                                      const sycl::event &               event,
+                                                                      ggml_sycl::sycl_timeline_callsite callsite = {},
+                                                                      uint64_t                          host_submit_begin_us = 0,
+                                                                      uint64_t                          host_submit_end_us = 0);
+void                            ggml_sycl_kernel_profile_flush(bool wait_for_events, const char * reason);
 
 void ggml_sycl_kernel_profile_reset_for_test();
 void ggml_sycl_kernel_profile_set_config_for_test(const ggml_sycl_kernel_profile_config & cfg);
 void ggml_sycl_kernel_profile_add_sample_for_test(const ggml_sycl_profile_label & label, uint64_t duration_ns);
 void ggml_sycl_kernel_profile_add_failed_timestamp_for_test(const ggml_sycl_profile_label & label, bool graph_recorded);
+void ggml_sycl_kernel_profile_add_raw_event_for_test(const ggml_sycl_profile_label & label,
+                                                     uint64_t                        event_id,
+                                                     uint64_t                        host_submit_begin_us,
+                                                     uint64_t                        host_submit_end_us,
+                                                     uint64_t                        command_submit_ns,
+                                                     uint64_t                        command_start_ns,
+                                                     uint64_t                        command_end_ns,
+                                                     const char *                    timestamp_status,
+                                                     const char *                    file,
+                                                     int                             line,
+                                                     const char *                    function,
+                                                     bool                            graph_recorded);
 std::string ggml_sycl_kernel_profile_format_csv_for_test();
 std::string ggml_sycl_kernel_profile_format_json_for_test();
 std::string ggml_sycl_kernel_profile_format_summary_for_test(int top_n);
@@ -57,10 +74,18 @@ inline sycl::event ggml_sycl_profile_submit_impl(sycl::queue &                  
                                                  const ggml_sycl_profile_label &   label,
                                                  SubmitFn &&                       submit_fn,
                                                  ggml_sycl::sycl_timeline_callsite callsite) {
-    (void) callsite;
+    const bool     profile_enabled = ggml_sycl_kernel_profile_enabled();
+    const uint64_t host_submit_begin_us =
+        profile_enabled ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                    std::chrono::steady_clock::now().time_since_epoch())
+                                                    .count()) :
+                          0;
     sycl::event event = submit_fn(q);
-    if (ggml_sycl_kernel_profile_enabled()) {
-        ggml_sycl_kernel_profile_record_event(label, event);
+    if (profile_enabled) {
+        const uint64_t host_submit_end_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        ggml_sycl_kernel_profile_record_event(label, event, callsite, host_submit_begin_us, host_submit_end_us);
     }
     return event;
 }
