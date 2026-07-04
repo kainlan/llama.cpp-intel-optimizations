@@ -178,3 +178,112 @@ This confirms the broadened named profiler coverage is working. These newly clas
 2. Prioritize MXFP4 MoE gate/up and down paths; together they account for ~85% of named kernel time.
 3. Investigate why the timeline JSON omits most named kernel events even though the kernel profile CSV/JSON contains them. A follow-up should make timeline event coverage agree with kernel profile totals or explicitly document/report the split.
 4. If continuing runtime optimization, avoid spending effort on pack/activation quantization unless a later run shows a new regression.
+
+---
+
+## Task 8 full-attribution rerun — 2026-07-04 11:40 UTC
+
+A later run after the full-attribution parser/script tasks used the same lead-only GPT-OSS profile harness and added `cost-ranking.parse` plus `wall-ledger.parse`.
+
+Artifact root:
+
+```text
+/tmp/sycl_decode_profile_full_20260704_114044
+```
+
+Binary-reported build:
+
+```text
+ad978813f (11373)
+```
+
+### Throughput
+
+| Test | tok/s |
+| --- | ---: |
+| PP512 | `1189.49 ± 0.00` |
+| TG128 | `31.84 ± 0.00` |
+
+Interpretation:
+
+- TG remains below the `>=45 tok/s` objective.
+- PP is near but slightly below the previous `1214.85 tok/s` run; do not treat this as a new PP baseline without repeated same-build measurements.
+
+### Full wall-time ledger
+
+`wall-ledger.parse` reports:
+
+| Ledger row | Value |
+| --- | ---: |
+| `ledger.wall_ms_x1000` | `4671780` |
+| `ledger.timeline_gpu_event_ms_x1000` | `143491` |
+| `ledger.kernel_profile_total_ms_x1000` | `1567156` |
+| `ledger.timeline_kernel_delta_ms_x1000` | `1423665` |
+| `ledger.timeline_kernel_ratio_pct_x1000` | `9156` |
+| `ledger.coverage_status` | `coverage_mismatch` |
+| `ledger.gap_class.host_overlap_ms_x1000` | `1178705` |
+| `ledger.gap_class.queue_serialization_ms_x1000` | `0` |
+| `ledger.gap_class.runtime_idle_ms_x1000` | `935601` |
+| `ledger.unknown_wall_residual_ms_x1000` | `2413983` |
+
+Because coverage status is `coverage_mismatch`, the timeline still does not carry enough named event duration to replace the kernel profiler as the ranked GPU-cost source. `sycl-kernels.csv/json` and `cost-ranking.parse` remain authoritative for named device cost. The `unknown_wall_residual` row is intentionally explicit; it must not be relabeled as idle time without additional evidence.
+
+### Cost ranking
+
+`cost-ranking.parse` reports named kernel-profile total time of `1567.156 ms`.
+
+| Rank | Kernel | Count | Total ms | Share |
+| ---: | --- | ---: | ---: | ---: |
+| 1 | `mxfp4.gateup.xmx_tiled_dpas_m2` | 3096 | 706.354 | 45.1% |
+| 2 | `mxfp4.down.q8_soa` | 2324 | 618.590 | 39.5% |
+| 3 | `fattn.compute.xmx_v2` | 48 | 97.730 | 6.2% |
+| 4 | `sycl.binbcast.mul` | 7108 | 33.818 | 2.2% |
+| 5 | `sycl.rope` | 6288 | 24.815 | 1.6% |
+| 6 | `sycl.set_rows.generic` | 6288 | 24.389 | 1.6% |
+| 7 | `sycl.binbcast.add` | 2698 | 21.148 | 1.3% |
+| 8 | `sycl.memcpy.mem_ops` | 3533 | 9.377 | 0.6% |
+| 9 | `sycl.softmax.forward` | 3144 | 8.551 | 0.5% |
+| 10 | `mxfp4.pack_q8.single_col` | 3096 | 6.871 | 0.4% |
+
+The two MXFP4 MoE kernels account for `1324.944 ms`, about `84.5%` of named kernel-profile time.
+
+### Source-region and bound-type attribution
+
+The top labels map to these source regions:
+
+| Kernel label | Source region | Label line | Attribution status |
+| --- | --- | ---: | --- |
+| `mxfp4.gateup.xmx_tiled_dpas_m2` | `ggml/src/ggml-sycl/mmvq.cpp:9730-9955` (`mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl`) | `9767` | Region attribution only; exact device line unavailable. |
+| `mxfp4.down.q8_soa` | `ggml/src/ggml-sycl/mmvq.cpp:19308-19392` (`mxfp4_down_sum_q8_soa_sycl`) | `19338` | Region attribution only; exact device line unavailable. |
+
+Bound-type verdict for this run is fail-closed: `unknown_with_static_xmx_region`.
+
+The gate/up source region is visibly an ESIMD/XMX DPAS kernel and the down region is a Q8 SOA dot/reduction kernel, but this Task 8 artifact set does not contain successful ocloc/asm or resolved VTune per-source metrics for either top kernel. Therefore the report does not claim a definitive memory-bound vs compute-bound classification from this run.
+
+### Exact GPU source-line feasibility spike
+
+Microbench-only exact source-line artifact root:
+
+```text
+/tmp/sycl_vtune_source_line_20260704_114136
+```
+
+The script exited with code `2` because the fail-closed checker reported:
+
+```text
+source_line.debug_line_present 0
+source_line.non_unknown_rows 0
+source_line.status fail
+```
+
+Supporting evidence:
+
+- `zebin-debug-sections.txt` contains `.symtab`, `.ze_info`, and `.strtab`, but no `.debug_line`.
+- `vtune-gpu-source-line.csv` contains only `Source Line = [Unknown]` for the captured row.
+- `profiling-debug-build.log` warns: `VCDebugInfo: only modules with one CU are supported at the moment, the debug information for Module will be dropped out.`
+
+Result: the exact GPU source-line B-spike failed closed at the microbench stage. Full GPT-OSS exact-line profiling remains blocked until the microbench proof produces non-unknown GPU source-line rows and dumped `.zebin` files with `.debug_line`.
+
+### Updated conclusion
+
+The new ledger/reporting path is working and exposes the remaining coverage mismatch directly. Optimization triage should still focus on the MXFP4 MoE gate/up and down kernels, but exact device source lines and definitive bound-type classification are not yet available from the current toolchain artifacts.
