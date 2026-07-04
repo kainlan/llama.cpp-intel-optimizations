@@ -74,6 +74,7 @@ def main(argv: list[str]) -> int:
         ur_summary = layer_ledger.read_parse_file(args.ur_summary)
         vtune_summary = layer_ledger.read_parse_file(args.vtune_summary)
         source_line_rows = summary_lines(args.source_line)
+        source_line_summary = layer_ledger.read_parse_file(args.source_line)
         source_attribution_rows = summary_lines(args.source_attribution)
         source_attribution_summary = layer_ledger.read_parse_file(args.source_attribution)
 
@@ -88,12 +89,27 @@ def main(argv: list[str]) -> int:
                 print(line)
             print("failed to merge staged ledger: source attribution incomplete")
             return 2
-        if status == "source_region_plus_ablation" and "source_attribution.ablation_delta_ms_x1000" not in source_attribution_summary:
+        if status == "exact_source_line" and source_line_summary.get("source_line.status") != "pass":
             print("coverage.layer_status source_attribution_incomplete")
+            for line in source_line_rows:
+                print(line)
             for line in source_attribution_rows:
                 print(line)
-            print("failed to merge staged ledger: missing source_attribution.ablation_delta_ms_x1000")
+            print("failed to merge staged ledger: exact source attribution requires source_line.status pass")
             return 2
+        if status == "source_region_plus_ablation":
+            try:
+                layer_ledger.int_metric(
+                    source_attribution_summary,
+                    "source_attribution.ablation_delta_ms_x1000",
+                    args.source_attribution,
+                )
+            except ValueError as exc:
+                print("coverage.layer_status source_attribution_incomplete")
+                for line in source_attribution_rows:
+                    print(line)
+                print(f"failed to merge staged ledger: {exc}")
+                return 2
 
         e2e_host_total = layer_ledger.parse_e2e_stderr(args.bench_stderr)
     except (OSError, json.JSONDecodeError, ValueError, RuntimeError, AttributeError) as exc:

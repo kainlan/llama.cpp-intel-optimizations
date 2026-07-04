@@ -141,6 +141,39 @@ def test_staged_merger_emits_ok_layer_status_and_unknown_wall() -> None:
         assert "source_attribution.status source_region_plus_ablation" in result.stdout
 
 
+def test_staged_merger_accepts_exact_source_line_when_source_line_passes() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        paths = write_fixture(pathlib.Path(tmp_raw))
+        paths["source_line"].write_text("source_line.status pass\nsource_line.blocker none\n", encoding="utf-8")
+        paths["source_attr"].write_text(
+            "source_attribution.status exact_source_line\n"
+            "source_attribution.kernel mxfp4.gateup.xmx_tiled_dpas_m2\n",
+            encoding="utf-8",
+        )
+        result = run_merger(paths)
+        assert result.returncode == 0, result.stdout
+        assert "coverage.layer_status ok" in result.stdout
+        assert "source_line.status pass" in result.stdout
+        assert "source_attribution.status exact_source_line" in result.stdout
+
+
+def test_staged_merger_rejects_exact_source_line_when_source_line_fails() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        paths = write_fixture(pathlib.Path(tmp_raw))
+        paths["source_attr"].write_text(
+            "source_attribution.status exact_source_line\n"
+            "source_attribution.kernel mxfp4.gateup.xmx_tiled_dpas_m2\n",
+            encoding="utf-8",
+        )
+        result = run_merger(paths)
+        assert result.returncode == 2
+        assert "coverage.layer_status source_attribution_incomplete" in result.stdout
+        assert "source_line.status fail" in result.stdout
+        assert "source_attribution.status exact_source_line" in result.stdout
+        assert "exact source attribution requires source_line.status pass" in result.stdout
+        assert "Traceback" not in result.stdout
+
+
 def test_staged_merger_rejects_metadata_mismatch_without_traceback() -> None:
     with tempfile.TemporaryDirectory() as tmp_raw:
         paths = write_fixture(pathlib.Path(tmp_raw), mismatch=True)
@@ -176,5 +209,22 @@ def test_staged_merger_requires_ablation_delta_for_plus_ablation_status() -> Non
         result = run_merger(paths)
         assert result.returncode == 2
         assert "coverage.layer_status source_attribution_incomplete" in result.stdout
-        assert "missing source_attribution.ablation_delta_ms_x1000" in result.stdout
+        assert "missing integer metric source_attribution.ablation_delta_ms_x1000" in result.stdout
+        assert "Traceback" not in result.stdout
+
+
+def test_staged_merger_rejects_non_integer_ablation_delta_for_plus_ablation_status() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        paths = write_fixture(pathlib.Path(tmp_raw))
+        paths["source_attr"].write_text(
+            "source_attribution.status source_region_plus_ablation\n"
+            "source_attribution.kernel mxfp4.gateup.xmx_tiled_dpas_m2\n"
+            "source_attribution.ablation_delta_ms_x1000 bogus\n",
+            encoding="utf-8",
+        )
+        result = run_merger(paths)
+        assert result.returncode == 2
+        assert "coverage.layer_status source_attribution_incomplete" in result.stdout
+        assert "source_attribution.ablation_delta_ms_x1000 bogus" in result.stdout
+        assert "missing integer metric source_attribution.ablation_delta_ms_x1000" in result.stdout
         assert "Traceback" not in result.stdout
