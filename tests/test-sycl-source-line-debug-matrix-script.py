@@ -22,6 +22,22 @@ def test_debug_matrix_script_is_dry_run_by_default() -> None:
     assert "sycl-kernel-bench" not in result.stdout
 
 
+def test_debug_matrix_script_handles_absolute_out_root_in_dry_run(tmp_path: Path) -> None:
+    out_root = tmp_path / "source line matrix"
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--out-root", str(out_root)],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout
+    expected_probe = out_root / "build-matrix" / "release_split" / "build" / "bin" / "sycl-source-line-probe"
+    assert str(expected_probe).replace(" ", "\\ ") in result.stdout
+    assert ".//tmp" not in result.stdout
+
+
 def test_debug_matrix_script_refuses_execute_without_ack() -> None:
     result = subprocess.run(["bash", str(SCRIPT), "--execute"], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
     assert result.returncode == 2

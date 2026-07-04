@@ -95,7 +95,7 @@ make_probe_cmd() {
     local name="$1"
     local dir
     dir="$(case_dir "${name}")"
-    PROBE_CMD=("./${dir}/build/bin/sycl-source-line-probe" --iterations 100 --size 1048576 --json "${dir}/probe.json")
+    PROBE_CMD=("${dir}/build/bin/sycl-source-line-probe" --iterations 100 --size 1048576 --json "${dir}/probe.json")
 }
 
 print_plan() {
