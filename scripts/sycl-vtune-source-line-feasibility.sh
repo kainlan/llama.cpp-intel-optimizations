@@ -8,9 +8,10 @@ BUILD_DIR="build-vtune-line"
 DEVICE_SELECTOR="level_zero:1"
 TARGET_KERNEL="mxfp4_pair_glu_xmx_tiled_packed_r8_m2_sparse32_bias"
 TASK_GLOB="*mxfp4_pair_glu_xmx_tiled*"
+REQUIRE_MATRIX_PASS=""
 
 usage() {
-    printf 'usage: %s [--dry-run|--execute] [--i-understand-this-runs-gpu-microbenchmarks] [--out-root DIR] [--build-dir DIR] [--device-selector SELECTOR] [--target-kernel NAME]\n' "$0"
+    printf 'usage: %s [--dry-run|--execute] [--i-understand-this-runs-gpu-microbenchmarks] [--out-root DIR] [--build-dir DIR] [--device-selector SELECTOR] [--target-kernel NAME] [--require-matrix-pass PATH]\n' "$0"
 }
 
 require_value() {
@@ -31,6 +32,7 @@ while [[ $# -gt 0 ]]; do
         --build-dir) require_value "$1" "${2-}"; BUILD_DIR="$2"; shift ;;
         --device-selector) require_value "$1" "${2-}"; DEVICE_SELECTOR="$2"; shift ;;
         --target-kernel) require_value "$1" "${2-}"; TARGET_KERNEL="$2"; TASK_GLOB="*$2*"; shift ;;
+        --require-matrix-pass) require_value "$1" "${2-}"; REQUIRE_MATRIX_PASS="$2"; shift ;;
         --help|-h) usage; exit 0 ;;
         *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
@@ -56,12 +58,21 @@ print_plan() {
     printf '%q ' "${bench_cmd[@]}"; printf '> %q 2> %q\n' "${OUT_ROOT}/bench.stdout" "${OUT_ROOT}/bench.stderr"
     printf 'readelf -S %q > %q\n' "${vtune_dir}/data.0/<first-zebin>" "${OUT_ROOT}/zebin-debug-sections.txt"
     printf 'vtune -report hotspots -r %q -group-by gpu-source-line -format csv > %q\n' "${vtune_dir}" "${OUT_ROOT}/vtune-gpu-source-line.csv"
+    if [[ -n "${REQUIRE_MATRIX_PASS}" ]]; then
+        printf 'matrix gate: require %q to contain source_line.status pass\n' "${REQUIRE_MATRIX_PASS}"
+        printf 'grep -qx %q %q\n' "source_line.status pass" "${REQUIRE_MATRIX_PASS}"
+    fi
     printf 'python3 scripts/check-sycl-vtune-source-lines.py --readelf-sections %q --vtune-csv %q --require-kernel %q > %q\n' "${OUT_ROOT}/zebin-debug-sections.txt" "${OUT_ROOT}/vtune-gpu-source-line.csv" "mxfp4_pair_glu_xmx_tiled" "${OUT_ROOT}/source-line-feasibility.parse"
 }
 
 if [[ "${EXECUTE}" -ne 1 ]]; then
     print_plan
     exit 0
+fi
+
+if [[ -n "${REQUIRE_MATRIX_PASS}" ]] && ! grep -qx "source_line.status pass" "${REQUIRE_MATRIX_PASS}"; then
+    printf 'error: MXFP4 source-line matrix gate failed: %s must contain source_line.status pass\n' "${REQUIRE_MATRIX_PASS}" >&2
+    exit 2
 fi
 
 mkdir -p "${OUT_ROOT}"

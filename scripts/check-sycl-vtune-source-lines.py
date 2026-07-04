@@ -57,8 +57,18 @@ def main(argv: list[str]) -> int:
         return 2
 
     passed = debug_line_present and non_unknown_rows > 0
+    if passed:
+        blocker = "none"
+    elif not debug_line_present:
+        blocker = "missing_debug_line"
+    else:
+        blocker = "vtune_unknown_source"
+
     print(f"source_line.debug_line_present {1 if debug_line_present else 0}")
     print(f"source_line.non_unknown_rows {non_unknown_rows}")
+    if args.require_kernel is not None:
+        print(f"source_line.required_kernel {args.require_kernel}")
+    print(f"source_line.blocker {blocker}")
     print(f"source_line.status {'pass' if passed else 'fail'}")
     return 0 if passed else 2
 

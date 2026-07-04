@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import subprocess
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +33,27 @@ def test_source_line_feasibility_script_refuses_execute_without_ack() -> None:
     assert "requires --i-understand-this-runs-gpu-microbenchmarks" in result.stdout
 
 
+def test_source_line_feasibility_script_supports_matrix_pass_gate() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        matrix_parse = Path(tmp_raw) / "source-line-feasibility.parse"
+        result = subprocess.run(
+            ["bash", str(SCRIPT), "--require-matrix-pass", str(matrix_parse)],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout
+        assert "DRY RUN" in result.stdout
+        assert str(matrix_parse) in result.stdout
+        assert "matrix gate" in result.stdout
+        assert "grep -qx" in result.stdout
+        assert "source_line.status pass" in result.stdout
+        assert "/Storage" not in result.stdout
+        assert "llama-bench" not in result.stdout
+
+
 def test_source_line_feasibility_execute_branch_writes_expected_artifacts() -> None:
     text = script_text()
     assert "profiling-debug-build.log" in text
@@ -42,3 +64,6 @@ def test_source_line_feasibility_execute_branch_writes_expected_artifacts() -> N
     assert "vtune -report hotspots" in text
     assert "readelf -S" in text
     assert "scripts/check-sycl-vtune-source-lines.py" in text
+    assert "REQUIRE_MATRIX_PASS" in text
+    assert "! grep -qx \"source_line.status pass\" \"${REQUIRE_MATRIX_PASS}\"" in text
+    assert "MXFP4 source-line matrix gate failed" in text
