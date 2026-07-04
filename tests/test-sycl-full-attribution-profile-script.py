@@ -29,6 +29,10 @@ REQUIRED_DRY_RUN_STRINGS = [
     "GGML_SYCL_MOE_PHASE_MATERIALIZE=1",
     "GGML_SYCL_MOE_PHASE_BULK_XMX=1",
     "GGML_SYCL_MOE_DOWN_SUM_DIRECT=1",
+    "ZE_ENABLE_TRACING_LAYER=1",
+    "SYCL_UR_TRACE=2",
+    "PTI_L0_TRACE_OUTPUT=",
+    "SYCL_UR_TRACE_LOG=",
     "-fa 1",
     "raw/timeline/sycl-timeline.json",
     "raw/kernel/sycl-kernels.csv",
@@ -149,6 +153,10 @@ def test_execute_branch_sets_required_profile_envs_and_fa_on() -> None:
         "GGML_SYCL_MOE_PHASE_MATERIALIZE=1",
         "GGML_SYCL_MOE_PHASE_BULK_XMX=1",
         "GGML_SYCL_MOE_DOWN_SUM_DIRECT=1",
+        "ZE_ENABLE_TRACING_LAYER=1",
+        "SYCL_UR_TRACE=2",
+        "PTI_L0_TRACE_OUTPUT=",
+        "SYCL_UR_TRACE_LOG=",
         "-fa 1",
     ]:
         assert required in text
@@ -157,6 +165,7 @@ def test_execute_branch_sets_required_profile_envs_and_fa_on() -> None:
 def test_execute_branch_runs_bench_command_once_and_fails_for_missing_external_traces() -> None:
     text = _script_text()
     assert text.count('-- env "${env_args[@]}" "${bench_args[@]}"') == 1
+    assert "grep '^UR_TRACE ' \"${OUT_ROOT}/bench.stderr\" >\"${ur_trace}\" || true" in text
     for path in [
         "${pti_dir}/level-zero-api.jsonl",
         "${ur_dir}/sycl-ur-trace.log",

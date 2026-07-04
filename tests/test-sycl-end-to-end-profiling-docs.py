@@ -16,6 +16,9 @@ def test_full_attribution_docs_describe_layered_closure_contract() -> None:
         "source_region_plus_ablation",
         "set +u",
         "source /opt/intel/oneapi/setvars.sh --force",
+        "ZE_ENABLE_TRACING_LAYER=1",
+        "SYCL_UR_TRACE=2",
+        "fails closed",
         "workers must not run",
     ):
         assert required in text

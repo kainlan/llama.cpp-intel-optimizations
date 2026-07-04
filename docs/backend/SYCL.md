@@ -1301,8 +1301,8 @@ Artifact root defaults to `$SYCL_GPTOSS_FULL_ATTRIBUTION_OUT` or `/tmp/sycl_gpto
 | Path under artifact root | Contents | Primary parser output |
 |---|---|---|
 | `raw/` | llama-bench stdout/stderr-adjacent timeline and named SYCL kernel profiler outputs (`raw/timeline/sycl-timeline.json`, `raw/kernel/sycl-kernels.csv/json`). | `parsed/timeline.parse`, `parsed/kernel-cost.parse` |
-| `pti/` | Level Zero API trace, normally `pti/level-zero-api.jsonl`. | `parsed/l0.parse` |
-| `ur/` | Unified Runtime trace log, normally `ur/sycl-ur-trace.log`. | `parsed/ur.parse` |
+| `pti/` | Level Zero API trace, normally `pti/level-zero-api.jsonl`. The runner enables the external trace hook with `ZE_ENABLE_TRACING_LAYER=1` and advertises `PTI_L0_TRACE_OUTPUT`; if the active PTI/Level Zero tracing layer does not produce the JSONL file, execute mode fails closed before ledger parsing. | `parsed/l0.parse` |
+| `ur/` | Unified Runtime trace log, normally `ur/sycl-ur-trace.log`. The runner enables `SYCL_UR_TRACE=2`, captures `UR_TRACE` rows from stderr when a separate log file is not produced, and fails closed if no UR trace evidence remains. | `parsed/ur.parse` |
 | `vtune/` | VTune result directory and exported kernel/source CSVs. | `parsed/vtune.parse` |
 | `source-line/` | Source-line debug matrix probe, dumped ZEBin section list, and VTune GPU source-line CSV. | `parsed/source-line.parse` |
 | `parsed/` | Consolidated parser summaries and final attribution rows. | `parsed/layer-ledger.parse`, `parsed/source-attribution.parse` |

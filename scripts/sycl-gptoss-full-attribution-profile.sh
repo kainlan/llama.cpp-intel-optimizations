@@ -133,7 +133,9 @@ env_args=(
     "GGML_SYCL_MOE_PHASE_MATERIALIZE=1"
     "GGML_SYCL_MOE_PHASE_BULK_XMX=1"
     "GGML_SYCL_MOE_DOWN_SUM_DIRECT=1"
+    "ZE_ENABLE_TRACING_LAYER=1"
     "PTI_L0_TRACE_OUTPUT=${pti_l0_trace}"
+    "SYCL_UR_TRACE=2"
     "SYCL_UR_TRACE_LOG=${ur_trace}"
 )
 
@@ -212,6 +214,9 @@ vtune -collect gpu-hotspots \
     -knob dump-compute-task-binaries=true \
     -result-dir "${vtune_result_dir}" \
     -- env "${env_args[@]}" "${bench_args[@]}" >"${OUT_ROOT}/bench.stdout" 2>"${OUT_ROOT}/bench.stderr"
+if [[ ! -s "${ur_trace}" ]]; then
+    grep '^UR_TRACE ' "${OUT_ROOT}/bench.stderr" >"${ur_trace}" || true
+fi
 vtune -report gpu-compute-media-hotspots -r "${vtune_result_dir}" -format csv >"${vtune_kernel_csv}"
 vtune -report hotspots -r "${vtune_result_dir}" -group-by gpu-source-line -format csv >"${vtune_source_csv}"
 bash scripts/sycl-source-line-debug-matrix.sh \
