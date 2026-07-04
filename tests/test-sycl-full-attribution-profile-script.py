@@ -53,6 +53,9 @@ REQUIRED_DRY_RUN_STRINGS = [
     "scripts/parse-sycl-layer-ledger.py",
     "scripts/check-sycl-vtune-source-lines.py",
     "scripts/parse-sycl-source-attribution.py",
+    "scripts/sycl-source-line-debug-matrix.sh",
+    "vtune -collect gpu-hotspots",
+    "dump-compute-task-binaries=true",
 ]
 
 EXECUTE_BRANCH_STRINGS = [
@@ -60,7 +63,7 @@ EXECUTE_BRANCH_STRINGS = [
     "set +u",
     "source /opt/intel/oneapi/setvars.sh --force >\"${OUT_ROOT}/setvars.log\" 2>&1",
     "set -u",
-    "env \"${env_args[@]}\" \"${bench_args[@]}\" >\"${OUT_ROOT}/bench.stdout\" 2>\"${OUT_ROOT}/bench.stderr\"",
+    "-- env \"${env_args[@]}\" \"${bench_args[@]}\" >\"${OUT_ROOT}/bench.stdout\" 2>\"${OUT_ROOT}/bench.stderr\"",
     "require_file \"${raw_timeline_dir}/sycl-timeline.json\"",
     "require_file \"${raw_kernel_dir}/sycl-kernels.csv\"",
     "require_file \"${pti_dir}/level-zero-api.jsonl\"",
@@ -74,7 +77,9 @@ EXECUTE_BRANCH_STRINGS = [
     "python3 scripts/parse-sycl-vtune-exports.py \\",
     "python3 scripts/parse-sycl-layer-ledger.py \\",
     "python3 scripts/check-sycl-vtune-source-lines.py \\",
+    "if [[ -f scripts/parse-sycl-source-attribution.py && -f \"${source_region_map}\" ]]; then",
     "python3 scripts/parse-sycl-source-attribution.py \\",
+    "source_attribution.status missing_parser",
 ]
 
 
@@ -151,7 +156,7 @@ def test_execute_branch_sets_required_profile_envs_and_fa_on() -> None:
 
 def test_execute_branch_runs_bench_command_once_and_fails_for_missing_external_traces() -> None:
     text = _script_text()
-    assert text.count('env "${env_args[@]}" "${bench_args[@]}"') == 1
+    assert text.count('-- env "${env_args[@]}" "${bench_args[@]}"') == 1
     for path in [
         "${pti_dir}/level-zero-api.jsonl",
         "${ur_dir}/sycl-ur-trace.log",

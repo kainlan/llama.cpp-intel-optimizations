@@ -113,7 +113,11 @@ ur_trace=${ur_dir}/sycl-ur-trace.log
 vtune_result_dir=${vtune_dir}/result
 vtune_kernel_csv=${vtune_dir}/exported-kernels.csv
 vtune_source_csv=${vtune_dir}/exported-source-lines.csv
-source_line_sections=${source_line_build_matrix}/readelf-sections.txt
+source_line_case=${source_line_build_matrix}/debug_full
+source_line_sections=${source_line_case}/zebin-debug-sections.txt
+source_line_vtune_csv=${source_line_case}/vtune-gpu-source-line.csv
+source_region_map=activation/sycl-source-region-map.json
+source_line_probe_kernel=sycl_source_line_probe
 
 env_args=(
     "ONEAPI_DEVICE_SELECTOR=${DEVICE_SELECTOR}"
@@ -161,8 +165,9 @@ print_parse_plan() {
     printf 'python3 %q %q >%q\n' "scripts/parse-sycl-ur-trace.py" "${ur_trace}" "${parsed_dir}/ur.parse"
     printf 'python3 %q --kernel-csv %q --source-csv %q >%q\n' "scripts/parse-sycl-vtune-exports.py" "${vtune_kernel_csv}" "${vtune_source_csv}" "${parsed_dir}/vtune.parse"
     printf 'python3 %q --timeline %q --kernel-profile %q --l0-summary %q --ur-summary %q --vtune-summary %q --bench-stderr %q >%q\n' "scripts/parse-sycl-layer-ledger.py" "${raw_timeline}" "${raw_kernel_csv}" "${parsed_dir}/l0.parse" "${parsed_dir}/ur.parse" "${parsed_dir}/vtune.parse" "${OUT_ROOT}/bench.stderr" "${parsed_dir}/layer-ledger.parse"
-    printf 'python3 %q --readelf-sections %q --vtune-csv %q --require-kernel %q >%q\n' "scripts/check-sycl-vtune-source-lines.py" "${source_line_sections}" "${vtune_source_csv}" "${SOURCE_KERNEL}" "${parsed_dir}/source-line.parse"
-    printf 'python3 %q --timeline %q --kernel-profile %q --vtune-kernels %q --vtune-source %q --build-matrix %q >%q\n' "scripts/parse-sycl-source-attribution.py" "${raw_timeline}" "${raw_kernel_csv}" "${vtune_kernel_csv}" "${vtune_source_csv}" "${source_line_build_matrix}" "${parsed_dir}/source-attribution.parse"
+    printf 'bash %q --execute --i-understand-this-runs-gpu-source-probe --out-root %q --device-selector %q\n' "scripts/sycl-source-line-debug-matrix.sh" "${source_line_dir}" "${DEVICE_SELECTOR}"
+    printf 'python3 %q --readelf-sections %q --vtune-csv %q --require-kernel %q >%q\n' "scripts/check-sycl-vtune-source-lines.py" "${source_line_sections}" "${source_line_vtune_csv}" "${source_line_probe_kernel}" "${parsed_dir}/source-line.parse"
+    printf 'if [[ -f %q && -f %q ]]; then python3 %q --cost-ranking %q --source-line %q --region-map %q >%q; else printf "source_attribution.status missing_parser\\nsource_attribution.blocker missing_parse_sycl_source_attribution_or_region_map\\n" >%q; fi\n' "scripts/parse-sycl-source-attribution.py" "${source_region_map}" "scripts/parse-sycl-source-attribution.py" "${parsed_dir}/kernel-cost.parse" "${parsed_dir}/source-line.parse" "${source_region_map}" "${parsed_dir}/source-attribution.parse" "${parsed_dir}/source-attribution.parse"
 }
 
 require_file() {
@@ -184,6 +189,7 @@ if [[ "${EXECUTE}" -ne 1 ]]; then
     printf '# VTune source export: %s\n' "${vtune_source_csv}"
     printf '# source-line build matrix: %s\n' "${source_line_build_matrix}"
     printf '# parsed layer ledger: %s\n' "${parsed_dir}/layer-ledger.parse"
+    printf 'vtune -collect gpu-hotspots -knob gpu-profiling-mode=source-analysis -knob source-analysis=mem-latency -knob dump-compute-task-binaries=true -result-dir %q -- ' "${vtune_result_dir}"
     print_cmd
     printf ' >%q 2>%q\n' "${OUT_ROOT}/bench.stdout" "${OUT_ROOT}/bench.stderr"
     printf 'vtune -report gpu-compute-media-hotspots -r %q -format csv >%q\n' "${vtune_result_dir}" "${vtune_kernel_csv}"
@@ -200,9 +206,19 @@ source /opt/intel/oneapi/setvars.sh --force >"${OUT_ROOT}/setvars.log" 2>&1
 set -u
 print_cmd >"${OUT_ROOT}/command.txt"
 printf ' >%q 2>%q\n' "${OUT_ROOT}/bench.stdout" "${OUT_ROOT}/bench.stderr" >>"${OUT_ROOT}/command.txt"
-env "${env_args[@]}" "${bench_args[@]}" >"${OUT_ROOT}/bench.stdout" 2>"${OUT_ROOT}/bench.stderr"
+vtune -collect gpu-hotspots \
+    -knob gpu-profiling-mode=source-analysis \
+    -knob source-analysis=mem-latency \
+    -knob dump-compute-task-binaries=true \
+    -result-dir "${vtune_result_dir}" \
+    -- env "${env_args[@]}" "${bench_args[@]}" >"${OUT_ROOT}/bench.stdout" 2>"${OUT_ROOT}/bench.stderr"
 vtune -report gpu-compute-media-hotspots -r "${vtune_result_dir}" -format csv >"${vtune_kernel_csv}"
 vtune -report hotspots -r "${vtune_result_dir}" -group-by gpu-source-line -format csv >"${vtune_source_csv}"
+bash scripts/sycl-source-line-debug-matrix.sh \
+    --execute \
+    --i-understand-this-runs-gpu-source-probe \
+    --out-root "${source_line_dir}" \
+    --device-selector "${DEVICE_SELECTOR}"
 
 require_file "${raw_timeline_dir}/sycl-timeline.json"
 require_file "${raw_kernel_dir}/sycl-kernels.csv"
@@ -210,7 +226,8 @@ require_file "${pti_dir}/level-zero-api.jsonl"
 require_file "${ur_dir}/sycl-ur-trace.log"
 require_file "${vtune_dir}/exported-kernels.csv"
 require_file "${vtune_dir}/exported-source-lines.csv"
-require_file "${source_line_build_matrix}/readelf-sections.txt"
+require_file "${source_line_sections}"
+require_file "${source_line_vtune_csv}"
 
 python3 scripts/parse-sycl-timeline.py "${raw_timeline_dir}/sycl-timeline.json" >"${parsed_dir}/timeline.parse"
 python3 scripts/parse-sycl-kernel-profile.py --top-kernels 40 "${raw_kernel_dir}/sycl-kernels.csv" >"${parsed_dir}/kernel-cost.parse"
@@ -227,13 +244,16 @@ python3 scripts/parse-sycl-layer-ledger.py \
     --vtune-summary "${parsed_dir}/vtune.parse" \
     --bench-stderr "${OUT_ROOT}/bench.stderr" >"${parsed_dir}/layer-ledger.parse"
 python3 scripts/check-sycl-vtune-source-lines.py \
-    --readelf-sections "${source_line_build_matrix}/readelf-sections.txt" \
-    --vtune-csv "${vtune_dir}/exported-source-lines.csv" \
-    --require-kernel "${SOURCE_KERNEL}" >"${parsed_dir}/source-line.parse"
-python3 scripts/parse-sycl-source-attribution.py \
-    --timeline "${raw_timeline_dir}/sycl-timeline.json" \
-    --kernel-profile "${raw_kernel_dir}/sycl-kernels.csv" \
-    --vtune-kernels "${vtune_dir}/exported-kernels.csv" \
-    --vtune-source "${vtune_dir}/exported-source-lines.csv" \
-    --build-matrix "${source_line_build_matrix}" >"${parsed_dir}/source-attribution.parse"
+    --readelf-sections "${source_line_sections}" \
+    --vtune-csv "${source_line_vtune_csv}" \
+    --require-kernel "${source_line_probe_kernel}" >"${parsed_dir}/source-line.parse"
+if [[ -f scripts/parse-sycl-source-attribution.py && -f "${source_region_map}" ]]; then
+    python3 scripts/parse-sycl-source-attribution.py \
+        --cost-ranking "${parsed_dir}/kernel-cost.parse" \
+        --source-line "${parsed_dir}/source-line.parse" \
+        --region-map "${source_region_map}" >"${parsed_dir}/source-attribution.parse"
+else
+    printf 'source_attribution.status missing_parser\n' >"${parsed_dir}/source-attribution.parse"
+    printf 'source_attribution.blocker missing_parse_sycl_source_attribution_or_region_map\n' >>"${parsed_dir}/source-attribution.parse"
+fi
 printf 'Artifacts: %s\n' "${OUT_ROOT}"
