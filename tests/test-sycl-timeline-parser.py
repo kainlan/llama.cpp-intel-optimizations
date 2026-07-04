@@ -67,6 +67,16 @@ def test_top_abbreviation_is_rejected(tmp_path: pathlib.Path) -> None:
     assert "Traceback" not in result.stdout
 
 
+def test_top_gaps_negative_is_rejected(tmp_path: pathlib.Path) -> None:
+    path = write_trace(tmp_path, '{"traceEvents": []}')
+
+    result = run_parser(path, "--top-gaps", "-1")
+
+    assert result.returncode == 2
+    assert "--top-gaps must be non-negative" in result.stdout
+    assert "Traceback" not in result.stdout
+
+
 def test_parser_reads_device_ranges_from_timeline_metadata(tmp_path: pathlib.Path) -> None:
     trace = {
         "traceEvents": [
@@ -101,6 +111,80 @@ def test_parser_reads_device_ranges_from_timeline_metadata(tmp_path: pathlib.Pat
     assert "timeline.gpu_event_total_ms_x1000 5" in result.stdout
     assert "gap.device2.copy.count 1" in result.stdout
     assert "gap.device2.copy.total_ms_x1000 3" in result.stdout
+    assert "gap_transition." not in result.stdout
+
+
+def test_parser_reports_top_gap_transitions(tmp_path: pathlib.Path) -> None:
+    trace = {
+        "traceEvents": [
+            {
+                "name": "a.kernel",
+                "cat": "sycl.event",
+                "ph": "X",
+                "ts": 0,
+                "dur": 1,
+                "args": {
+                    "metadata": "device=0;queue_kind=compute;device_start_ns=1000;device_end_ns=2000",
+                },
+            },
+            {
+                "name": "b.kernel",
+                "cat": "sycl.event",
+                "ph": "X",
+                "ts": 0,
+                "dur": 1,
+                "args": {
+                    "metadata": "device=0;queue_kind=compute;device_start_ns=7000;device_end_ns=9000",
+                },
+            },
+            {
+                "name": "a.kernel",
+                "cat": "sycl.event",
+                "ph": "X",
+                "ts": 0,
+                "dur": 1,
+                "args": {
+                    "metadata": "device=0;queue_kind=compute;device_start_ns=10000;device_end_ns=11000",
+                },
+            },
+            {
+                "name": "b.kernel",
+                "cat": "sycl.event",
+                "ph": "X",
+                "ts": 0,
+                "dur": 1,
+                "args": {
+                    "metadata": "device=0;queue_kind=compute;device_start_ns=15000;device_end_ns=16000",
+                },
+            },
+            {
+                "name": "copy.kernel",
+                "cat": "sycl.event",
+                "ph": "X",
+                "ts": 0,
+                "dur": 1,
+                "args": {
+                    "metadata": "device=1;queue_kind=copy;device_start_ns=2000;device_end_ns=3000",
+                },
+            },
+        ]
+    }
+    path = tmp_path / "gap-transition-timeline.json"
+    path.write_text(json.dumps(trace), encoding="utf-8")
+
+    result = run_parser(path, "--wall-ms", "1", "--top-gaps", "10")
+
+    assert result.returncode == 0, result.stdout
+    assert "gap.device0.compute.count 3" in result.stdout
+    assert "gap_transition.device0.compute.a.kernel--to--b.kernel.count 2" in result.stdout
+    assert "gap_transition.device0.compute.a.kernel--to--b.kernel.total_ms_x1000 9" in result.stdout
+    assert "gap_transition.device0.compute.a.kernel--to--b.kernel.max_ms_x1000 5" in result.stdout
+    assert "gap_transition.device0.compute.b.kernel--to--a.kernel.count 1" in result.stdout
+    assert "gap_transition.device0.compute.b.kernel--to--a.kernel.total_ms_x1000 1" in result.stdout
+    assert result.stdout.index("gap_transition.device0.compute.a.kernel--to--b.kernel.count") < result.stdout.index(
+        "gap_transition.device0.compute.b.kernel--to--a.kernel.count"
+    )
+    assert "gap_transition.device1.copy" not in result.stdout
 
 
 def test_parser_summarizes_wall_categories_and_callsites() -> None:
