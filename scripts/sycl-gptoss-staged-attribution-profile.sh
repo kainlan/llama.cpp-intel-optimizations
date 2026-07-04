@@ -313,8 +313,12 @@ run_vtune_source_stage() {
         printf 'stage=vtune-source\n'
         print_stage_layout "${root}"
         printf 'bash %q --execute --i-understand-this-runs-gpu-source-probe --out-root %q --device-selector %q\n' "scripts/sycl-source-line-debug-matrix.sh" "${root}/source-line-matrix" "${DEVICE_SELECTOR}"
-        printf 'python3 %q --kernel-csv %q --source-csv %q >%q\n' "scripts/parse-sycl-vtune-exports.py" "${root}/exported-kernels.csv" "${root}/exported-source-lines.csv" "${root}/vtune.parse"
-        printf 'python3 %q --readelf-sections %q --vtune-csv %q --require-kernel %q >%q\n' "scripts/check-sycl-vtune-source-lines.py" "${root}/source-line-matrix/readelf-sections.txt" "${root}/source-line-matrix/vtune-source-lines.csv" "${ABLATION_KERNEL}" "${root}/source-line.parse"
+        printf '#   matrix outputs: %s/source-line-matrix/build-matrix/<case>/source-line-feasibility.parse\n' "${root}"
+        printf '#   matrix outputs: %s/source-line-matrix/build-matrix/<case>/zebin-debug-sections.txt\n' "${root}"
+        printf '#   matrix outputs: %s/source-line-matrix/build-matrix/<case>/vtune-gpu-source-line.csv\n' "${root}"
+        printf '#   selection: prefer source_line.status pass; else source_line.blocker vtune_unknown_source; else first source-line-feasibility.parse\n'
+        printf 'cp %q %q\n' "${root}/source-line-matrix/build-matrix/<selected-case>/source-line-feasibility.parse" "${root}/source-line.parse"
+        printf 'python3 %q --source-csv %q >%q\n' "scripts/parse-sycl-vtune-exports.py" "${root}/source-line-matrix/build-matrix/<selected-case>/vtune-gpu-source-line.csv" "${root}/vtune.parse"
         return 0
     fi
 
@@ -324,13 +328,51 @@ run_vtune_source_stage() {
         --i-understand-this-runs-gpu-source-probe \
         --out-root "${root}/source-line-matrix" \
         --device-selector "${DEVICE_SELECTOR}"
+
+    local matrix_root
+    local selected_parse=""
+    local vtune_unknown_parse=""
+    local fallback_parse=""
+    local parse
+    local selected_dir
+    local selected_source_csv
+    matrix_root="${root}/source-line-matrix/build-matrix"
+    shopt -s nullglob
+    local -a source_line_parses=("${matrix_root}"/*/source-line-feasibility.parse)
+    shopt -u nullglob
+    if [[ "${#source_line_parses[@]}" -eq 0 ]]; then
+        printf 'error: vtune-source stage found no matrix source-line-feasibility.parse files under %s\n' "${matrix_root}" >&2
+        return 2
+    fi
+    for parse in "${source_line_parses[@]}"; do
+        if [[ -z "${fallback_parse}" ]]; then
+            fallback_parse="${parse}"
+        fi
+        if grep -qx 'source_line.status pass' "${parse}"; then
+            selected_parse="${parse}"
+            break
+        fi
+        if [[ -z "${vtune_unknown_parse}" ]] && grep -qx 'source_line.blocker vtune_unknown_source' "${parse}"; then
+            vtune_unknown_parse="${parse}"
+        fi
+    done
+    if [[ -z "${selected_parse}" ]]; then
+        if [[ -n "${vtune_unknown_parse}" ]]; then
+            selected_parse="${vtune_unknown_parse}"
+        else
+            selected_parse="${fallback_parse}"
+        fi
+    fi
+
+    selected_dir="$(dirname "${selected_parse}")"
+    selected_source_csv="${selected_dir}/vtune-gpu-source-line.csv"
+    if [[ ! -f "${selected_source_csv}" ]]; then
+        printf 'error: vtune-source stage selected %s but missing %s\n' "${selected_parse}" "${selected_source_csv}" >&2
+        return 2
+    fi
+    cp "${selected_parse}" "${root}/source-line.parse"
     python3 scripts/parse-sycl-vtune-exports.py \
-        --kernel-csv "${root}/exported-kernels.csv" \
-        --source-csv "${root}/exported-source-lines.csv" >"${root}/vtune.parse"
-    python3 scripts/check-sycl-vtune-source-lines.py \
-        --readelf-sections "${root}/source-line-matrix/readelf-sections.txt" \
-        --vtune-csv "${root}/source-line-matrix/vtune-source-lines.csv" \
-        --require-kernel "${ABLATION_KERNEL}" >"${root}/source-line.parse"
+        --source-csv "${selected_source_csv}" >"${root}/vtune.parse"
     write_manifest vtune-source "${root}" source_line "${root}/source-line.parse"
 }
 

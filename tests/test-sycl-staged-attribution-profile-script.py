@@ -48,3 +48,41 @@ def test_staged_runner_execute_branch_uses_safe_gptoss_knobs_without_monolithic_
     ):
         assert required in text
     assert "vtune -collect gpu-hotspots" not in text[text.index("run_base_stage") : text.index("run_ur_stage")]
+
+
+def test_vtune_source_dry_run_reports_matrix_artifact_contract(tmp_path: Path) -> None:
+    out_root = tmp_path / "staged"
+    result = run_script("--stage", "vtune-source", out_root=out_root)
+    assert result.returncode == 0, result.stdout
+    assert "source-line-matrix/build-matrix/<case>/source-line-feasibility.parse" in result.stdout
+    assert "source-line-matrix/build-matrix/<case>/zebin-debug-sections.txt" in result.stdout
+    assert "source-line-matrix/build-matrix/<case>/vtune-gpu-source-line.csv" in result.stdout
+    assert "source_line.status pass" in result.stdout
+    assert "source_line.blocker vtune_unknown_source" in result.stdout
+    assert "exported-kernels.csv" not in result.stdout
+    assert "exported-source-lines.csv" not in result.stdout
+    assert "source-line-matrix/readelf-sections.txt" not in result.stdout
+    assert "source-line-matrix/vtune-source-lines.csv" not in result.stdout
+    assert not out_root.exists()
+
+
+def test_vtune_source_execute_branch_consumes_matrix_artifacts() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    for required in (
+        "source-line-matrix/build-matrix",
+        "source-line-feasibility.parse",
+        "vtune-gpu-source-line.csv",
+        "source_line.status pass",
+        "source_line.blocker vtune_unknown_source",
+        "found no matrix source-line-feasibility.parse files",
+        "cp \"${selected_parse}\" \"${root}/source-line.parse\"",
+        "--source-csv \"${selected_source_csv}\" >\"${root}/vtune.parse\"",
+    ):
+        assert required in text
+    for invented in (
+        "exported-kernels.csv",
+        "exported-source-lines.csv",
+        "source-line-matrix/readelf-sections.txt",
+        "source-line-matrix/vtune-source-lines.csv",
+    ):
+        assert invented not in text
