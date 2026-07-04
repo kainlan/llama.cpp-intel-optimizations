@@ -24,6 +24,12 @@ CSV_WITH_BAD_INTEGER = """name,category,metadata,device,queue_kind,count,total_n
 mxfp4.gateup.xmx_tiled_dpas_m2,mmvq,path=packed-q8-m2,1,compute,not-an-int,4000000,2000000,1000000,1000000,3000000,3000000,8192,0,0
 """
 
+CSV_WITH_TIED_TOTALS = """name,category,metadata,device,queue_kind,count,total_ns,mean_ns,min_ns,p50_ns,p95_ns,max_ns,bytes,failed_timestamps,graph_recorded
+z.kernel,mmvq,,1,compute,1,4000000,4000000,4000000,4000000,4000000,4000000,0,0,0
+a.kernel,mmvq,,1,compute,1,4000000,4000000,4000000,4000000,4000000,4000000,0,0,0
+b.kernel,mmvq,,1,compute,1,1000000,1000000,1000000,1000000,1000000,1000000,0,0,0
+"""
+
 JSON_OBJ = {
     "kernels": [
         {
@@ -113,3 +119,58 @@ def test_parser_reports_malformed_integer_fields_without_traceback() -> None:
         assert result.returncode == 2
         assert "failed to parse profile: invalid integer field count" in result.stdout
         assert "Traceback" not in result.stdout
+
+
+def test_parser_rejects_negative_top_kernels() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        path = pathlib.Path(tmp_raw) / "profile.csv"
+        path.write_text(CSV_TEXT, encoding="utf-8")
+        result = run_parser(path, "--top-kernels", "-1")
+        assert result.returncode == 2
+        assert "--top-kernels must be non-negative" in result.stdout
+        assert "Traceback" not in result.stdout
+
+
+def test_parser_emits_ranked_top_kernel_rows() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        path = pathlib.Path(tmp_raw) / "profile.csv"
+        path.write_text(CSV_WITH_DUPLICATE_KERNEL, encoding="utf-8")
+        result = run_parser(path, "--top-kernels", "1")
+        assert result.returncode == 0, result.stdout
+        assert "cost.kernel.rank.1.name mxfp4.gateup.xmx_tiled_dpas_m2" in result.stdout
+        assert "cost.kernel.rank.1.total_ms_x1000 5000" in result.stdout
+        assert "cost.kernel.rank.1.count 3" in result.stdout
+        assert "cost.kernel.rank.1.failed_timestamps 1" in result.stdout
+        assert "cost.top1_kernel mxfp4.gateup.xmx_tiled_dpas_m2 5000" in result.stdout
+        assert "cost.kernel.rank.2" not in result.stdout
+
+
+def test_parser_top_kernels_zero_emits_top1_without_rank_rows() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        path = pathlib.Path(tmp_raw) / "profile.csv"
+        path.write_text(CSV_TEXT, encoding="utf-8")
+        result = run_parser(path, "--top-kernels", "0")
+        assert result.returncode == 0, result.stdout
+        assert "cost.top1_kernel mxfp4.gateup.xmx_tiled_dpas_m2 4000" in result.stdout
+        assert "cost.kernel.rank.1" not in result.stdout
+
+
+def test_parser_top_kernels_two_sorts_by_total_then_name() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        path = pathlib.Path(tmp_raw) / "profile.csv"
+        path.write_text(CSV_WITH_TIED_TOTALS, encoding="utf-8")
+        result = run_parser(path, "--top-kernels", "2")
+        assert result.returncode == 0, result.stdout
+        assert "cost.kernel.rank.1.name a.kernel" in result.stdout
+        assert "cost.kernel.rank.2.name z.kernel" in result.stdout
+        assert "cost.kernel.rank.3" not in result.stdout
+
+
+def test_parser_omits_cost_rows_when_top_kernels_option_is_absent() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        path = pathlib.Path(tmp_raw) / "profile.csv"
+        path.write_text(CSV_TEXT, encoding="utf-8")
+        result = run_parser(path)
+        assert result.returncode == 0, result.stdout
+        assert "cost.top1_kernel" not in result.stdout
+        assert "cost.kernel.rank." not in result.stdout

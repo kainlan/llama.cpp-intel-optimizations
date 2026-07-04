@@ -80,6 +80,16 @@ def parse_kernel_bytes(raw: str) -> tuple[str, int]:
     return name, bytes_per_event
 
 
+def parse_top_n(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid top-kernels value: {raw}") from exc
+    if value < 0:
+        raise argparse.ArgumentTypeError("--top-kernels must be non-negative")
+    return value
+
+
 def aggregate_rows(rows: list[dict[str, Any]]) -> tuple[dict[str, Counter[str]], Counter[str]]:
     """Aggregate rows by kernel name and category.
 
@@ -112,6 +122,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--min-total-ms", action="append", type=parse_min_total, default=[])
     parser.add_argument("--wall-ms", type=parse_wall_ms)
     parser.add_argument("--kernel-bytes", action="append", type=parse_kernel_bytes, default=[])
+    parser.add_argument("--top-kernels", type=parse_top_n)
     args = parser.parse_args(argv)
 
     try:
@@ -147,6 +158,16 @@ def main(argv: list[str]) -> int:
 
     kernel_sum_total_ns = sum(totals["total_ns"] for totals in kernel_totals.values())
     print(f"profile.kernel_sum_total_ms_x1000 {ns_to_ms_x1000(kernel_sum_total_ns)}")
+    ranked_kernels = sorted(kernel_totals.items(), key=lambda item: (-item[1]["total_ns"], item[0]))
+    if args.top_kernels is not None and ranked_kernels:
+        top_name, top_totals = ranked_kernels[0]
+        print(f"cost.top1_kernel {top_name} {ns_to_ms_x1000(top_totals['total_ns'])}")
+    if args.top_kernels is not None:
+        for rank, (name, totals) in enumerate(ranked_kernels[: args.top_kernels], start=1):
+            print(f"cost.kernel.rank.{rank}.name {name}")
+            print(f"cost.kernel.rank.{rank}.total_ms_x1000 {ns_to_ms_x1000(totals['total_ns'])}")
+            print(f"cost.kernel.rank.{rank}.count {totals['count']}")
+            print(f"cost.kernel.rank.{rank}.failed_timestamps {totals['failed_timestamps']}")
     if args.wall_ms is not None:
         kernel_sum_ms = kernel_sum_total_ns / 1_000_000.0
         print(f"profile.decode_wall_ms_x1000 {int(round(args.wall_ms * 1000.0))}")
