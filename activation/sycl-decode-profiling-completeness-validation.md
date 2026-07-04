@@ -2,8 +2,8 @@
 
 Date: 2026-07-04
 Branch: `feature/sycl-mxfp4-tg-runtime`
-Validated commit: `ec6a01b3f` (`tasks(sycl): claim profiling integration gates`)
-Artifact root: `/tmp/sycl_profile_gates_20260704_020802`
+Validated commit: `5832bfc33` (`docs(sycl): record profiling completeness safe gates`)
+Artifact root: `/tmp/sycl_profile_gates_20260704_021951`
 
 ## Scope
 
@@ -12,14 +12,18 @@ The profile script was exercised in dry-run mode only; the printed command still
 references `/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf`, but dry-run does not
 execute `llama-bench` or access the model.
 
+This rerun includes the remote code commit `b77374210` (`fix(sycl): label
+binbcast ops by operation`) that landed before this validation record was
+finalized.
+
 ## Gates
 
 | Gate | Result | Artifact |
 | --- | --- | --- |
-| Selected Python/source tests | PASS: `47 passed in 0.45s` | `/tmp/sycl_profile_gates_20260704_020802/pytest.log` |
-| Build `test-sycl-timeline test-sycl-kernel-profiler llama-bench` | PASS | `/tmp/sycl_profile_gates_20260704_020802/build.log` |
-| CTest `test-sycl-timeline` and `test-sycl-kernel-profiler` | PASS: `2/2` | `/tmp/sycl_profile_gates_20260704_020802/ctest.log` |
-| GPT-OSS decode profile script dry-run | PASS | `/tmp/sycl_profile_gates_20260704_020802/dry-run.log` |
+| Selected Python/source tests | PASS: `47 passed in 0.41s` | `/tmp/sycl_profile_gates_20260704_021951/pytest.log` |
+| Build `test-sycl-timeline test-sycl-kernel-profiler llama-bench` | PASS | `/tmp/sycl_profile_gates_20260704_021951/build.log` |
+| CTest `test-sycl-timeline` and `test-sycl-kernel-profiler` | PASS: `2/2` | `/tmp/sycl_profile_gates_20260704_021951/ctest.log` |
+| GPT-OSS decode profile script dry-run | PASS | `/tmp/sycl_profile_gates_20260704_021951/dry-run.log` |
 
 ## Python tests
 
@@ -40,7 +44,7 @@ python3 -m pytest \
 Result:
 
 ```text
-47 passed in 0.45s
+47 passed in 0.41s
 ```
 
 ## Build and CTest
@@ -71,16 +75,16 @@ Command:
 ```bash
 ./scripts/sycl-gptoss-decode-timeline-profile.sh \
   --dry-run \
-  --out-root /tmp/sycl_profile_gates_20260704_020802/dry-run-artifacts \
+  --out-root /tmp/sycl_profile_gates_20260704_021951/dry-run-artifacts \
   --device-selector level_zero:1
 ```
 
 Dry-run output included the expected artifact parse commands:
 
 ```text
-python3 scripts/parse-sycl-timeline.py /tmp/sycl_profile_gates_20260704_020802/dry-run-artifacts/sycl-timeline.json >/tmp/sycl_profile_gates_20260704_020802/dry-run-artifacts/timeline.parse
-python3 scripts/parse-sycl-timeline.py --top-gaps 20 --top-host-gap-overlaps 40 /tmp/sycl_profile_gates_20260704_020802/dry-run-artifacts/sycl-timeline.json >/tmp/sycl_profile_gates_20260704_020802/dry-run-artifacts/timeline.gaps.parse
-python3 scripts/parse-sycl-kernel-profile.py /tmp/sycl_profile_gates_20260704_020802/dry-run-artifacts/sycl-kernels.csv >/tmp/sycl_profile_gates_20260704_020802/dry-run-artifacts/kernels.parse
+python3 scripts/parse-sycl-timeline.py /tmp/sycl_profile_gates_20260704_021951/dry-run-artifacts/sycl-timeline.json >/tmp/sycl_profile_gates_20260704_021951/dry-run-artifacts/timeline.parse
+python3 scripts/parse-sycl-timeline.py --top-gaps 20 --top-host-gap-overlaps 40 /tmp/sycl_profile_gates_20260704_021951/dry-run-artifacts/sycl-timeline.json >/tmp/sycl_profile_gates_20260704_021951/dry-run-artifacts/timeline.gaps.parse
+python3 scripts/parse-sycl-kernel-profile.py /tmp/sycl_profile_gates_20260704_021951/dry-run-artifacts/sycl-kernels.csv >/tmp/sycl_profile_gates_20260704_021951/dry-run-artifacts/kernels.parse
 ```
 
 ## Conclusion
