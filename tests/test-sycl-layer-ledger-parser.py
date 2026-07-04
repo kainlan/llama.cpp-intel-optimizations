@@ -29,7 +29,13 @@ def write_inputs(tmp: pathlib.Path) -> dict[str, pathlib.Path]:
     ur = tmp / "ur.parse"
     ur.write_text("ur.total_ms_x1000 50\nur.bucket.enqueue.ms_x1000 45\n", encoding="utf-8")
     vtune = tmp / "vtune.parse"
-    vtune.write_text("vtune.kernel_total_ms_x1000 310\nvtune.api_total_ms_x1000 120\nvtune.source.known_rows 0\n", encoding="utf-8")
+    vtune.write_text(
+        "vtune.kernel_total_ms_x1000 310\n"
+        "vtune.api_total_ms_x1000 120\n"
+        "vtune.source.known_rows 0\n"
+        "vtune.kernel.rank.1.name kernel name with spaces\n",
+        encoding="utf-8",
+    )
     stderr = tmp / "bench.stderr"
     stderr.write_text("[SYCL-E2E-TG-STAGE] stage=moe calls=72 host=200.000 ms device=0.000 ms bytes=0 last_path=MUL_MAT_ID\n", encoding="utf-8")
     return {"timeline": timeline, "kernels": kernels, "l0": l0, "ur": ur, "vtune": vtune, "stderr": stderr}
@@ -55,7 +61,7 @@ def test_layer_ledger_closes_wall_time_with_explicit_unknown() -> None:
         assert "layer.level_zero_api_ms_x1000 80" in result.stdout
         assert "layer.gpu_kernel_ms_x1000 300" in result.stdout
         assert "layer.vtune_gpu_ms_x1000 310" in result.stdout
-        assert "layer.unknown_wall_ms_x1000 350" in result.stdout
+        assert "layer.unknown_wall_ms_x1000 550" in result.stdout
         assert "coverage.layer_status ok" in result.stdout
 
 

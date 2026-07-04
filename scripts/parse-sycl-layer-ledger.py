@@ -35,10 +35,9 @@ def read_parse_file(path: pathlib.Path) -> dict[str, int | str]:
         stripped = line.strip()
         if not stripped:
             continue
-        fields = stripped.split()
-        if len(fields) != 2:
+        key, separator, value = stripped.partition(" ")
+        if not separator or not key or not value:
             raise ValueError(f"{path}:{line_number}: expected key value row")
-        key, value = fields
         result[key] = int(value) if INTEGER_RE.fullmatch(value) else value
     return result
 
@@ -101,7 +100,7 @@ def main(argv: list[str]) -> int:
     else:
         app_host = min(wall_total, e2e_host_total)
     gpu_kernel = kernel_parser.ns_to_ms_x1000(sum(totals["total_ns"] for totals in kernel_totals.values()))
-    unknown = max(0, wall_total - app_host - sycl_submit_host - ur_api - l0_api - gpu_kernel)
+    unknown = max(0, wall_total - sycl_submit_host - ur_api - l0_api - gpu_kernel)
 
     missing_layers = []
     if missing_l0:
