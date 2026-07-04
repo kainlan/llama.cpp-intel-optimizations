@@ -112,7 +112,11 @@ static sycl::event ggml_sycl_submit_binbcast_event(sycl::queue &                
     label.bytes      = 0;
 
     if (mode == ggml_sycl_binbcast_event_mode::BARRIER) {
-        return ggml_sycl_profile_record_returned_event(label, q.ext_oneapi_submit_barrier());
+        return ggml_sycl_profile_submit(q, label,
+                                        [](sycl::queue & profiled_queue) {
+                                            return profiled_queue.ext_oneapi_submit_barrier();
+                                        },
+                                        file, line, function);
     }
     return ggml_sycl_profile_submit(
         q, label,
@@ -121,6 +125,25 @@ static sycl::event ggml_sycl_submit_binbcast_event(sycl::queue &                
                 [&](sycl::handler & cgh) { cgh.single_task<ggml_sycl_binbcast_unpin_event_kernel>([] {}); });
         },
         file, line, function);
+}
+
+template <typename SubmitFn>
+static sycl::event ggml_sycl_submit_binbcast_kernel(sycl::queue & q,
+                                                    const char *  name,
+                                                    const char *  metadata,
+                                                    SubmitFn &&   submit_fn,
+                                                    const char *  file     = __builtin_FILE(),
+                                                    int           line     = __builtin_LINE(),
+                                                    const char *  function = __builtin_FUNCTION()) {
+    ggml_sycl_profile_label label{};
+    label.name       = name;
+    label.category   = "binbcast";
+    label.queue_kind = "compute";
+    label.metadata   = metadata;
+    label.device     = ggml_sycl_get_device_id_from_queue(q);
+    label.bytes      = 0;
+
+    return ggml_sycl_profile_submit(q, label, static_cast<SubmitFn &&>(submit_fn), file, line, function);
 }
 
 static inline const char * ggml_sycl_layout_mode_name(ggml_layout_mode mode) {
@@ -383,7 +406,10 @@ template <float (*bin_op)(const float, const float)> struct bin_bcast_sycl {
                     const bool     src0_is_contiguous,
                     const bool     src1_is_contiguous,
                     const bool     dst_is_contiguous,
-                    queue_ptr      stream) {
+                    queue_ptr      stream,
+                    const char *   file     = __builtin_FILE(),
+                    int            line     = __builtin_LINE(),
+                    const char *   function = __builtin_FUNCTION()) {
         int nr0 = ne10 / ne0;
         int nr1 = ne11 / ne1;
         int nr2 = ne12 / ne2;
@@ -508,13 +534,19 @@ template <float (*bin_op)(const float, const float)> struct bin_bcast_sycl {
                 {
                     dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
 
-                    stream->parallel_for(
-                        sycl::nd_range<3>(sycl::range<3>(1, 1, block_num) * sycl::range<3>(1, 1, block_size),
-                                          sycl::range<3>(1, 1, block_size)),
-                        [=](sycl::nd_item<3> item_ct1) {
-                            k_bin_bcast_unravel<bin_op>(src0_dd, src1_dd, dst_dd, ne0, ne1, ne2, ne3, ne10, ne11, ne12,
-                                                        ne13, s1, s2, s3, s01, s02, s03, s11, s12, s13, item_ct1);
-                        });
+                    ggml_sycl_submit_binbcast_kernel(
+                        *stream, "sycl.binbcast.kernel", "role=binbcast;mode=kernel;variant=unravel",
+                        [&](sycl::queue & profiled_queue) {
+                            return profiled_queue.parallel_for(
+                                sycl::nd_range<3>(sycl::range<3>(1, 1, block_num) * sycl::range<3>(1, 1, block_size),
+                                                  sycl::range<3>(1, 1, block_size)),
+                                [=](sycl::nd_item<3> item_ct1) {
+                                    k_bin_bcast_unravel<bin_op>(src0_dd, src1_dd, dst_dd, ne0, ne1, ne2, ne3, ne10,
+                                                                ne11, ne12, ne13, s1, s2, s3, s01, s02, s03, s11, s12,
+                                                                s13, item_ct1);
+                                });
+                        },
+                        file, line, function);
                 }
             } else {
                 /*
@@ -525,11 +557,16 @@ template <float (*bin_op)(const float, const float)> struct bin_bcast_sycl {
                 */
                 dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
 
-                stream->parallel_for(
-                    sycl::nd_range<3>(block_nums * block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
-                        k_bin_bcast<bin_op>(src0_dd, src1_dd, dst_dd, ne0, ne1, ne2, ne3, ne10, ne11, ne12, ne13, s1,
-                                            s2, s3, s01, s02, s03, s11, s12, s13, item_ct1);
-                    });
+                ggml_sycl_submit_binbcast_kernel(
+                    *stream, "sycl.binbcast.kernel", "role=binbcast;mode=kernel;variant=nd",
+                    [&](sycl::queue & profiled_queue) {
+                        return profiled_queue.parallel_for(
+                            sycl::nd_range<3>(block_nums * block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
+                                k_bin_bcast<bin_op>(src0_dd, src1_dd, dst_dd, ne0, ne1, ne2, ne3, ne10, ne11, ne12,
+                                                    ne13, s1, s2, s3, s01, s02, s03, s11, s12, s13, item_ct1);
+                            });
+                    },
+                    file, line, function);
             }
         }
     }
@@ -539,7 +576,10 @@ template <class op>
 inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
                                    const ggml_tensor *         src0,
                                    const ggml_tensor *         src1,
-                                   ggml_tensor *               dst) {
+                                   ggml_tensor *               dst,
+                                   const char *                file     = __builtin_FILE(),
+                                   int                         line     = __builtin_LINE(),
+                                   const char *                function = __builtin_FUNCTION()) {
     dpct::queue_ptr main_stream = ctx.stream();
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -593,7 +633,7 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
     ggml_sycl::mem_handle src1_stage;
     ggml_sycl::mem_handle src0_weight_stage;
     ggml_sycl::mem_handle src1_weight_stage;
-    bool                            staged_raw_host = false;
+    bool                  staged_raw_host = false;
 
     auto stage_raw_host_source = [&](const ggml_tensor * tensor, void * resolved_ptr, size_t span_bytes,
                                      ggml_sycl::mem_handle & stage, ggml_sycl::mem_handle & weight_stage) -> void * {
@@ -650,8 +690,8 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
         req.intent.role                    = ggml_sycl::alloc_role::STAGING;
         req.intent.category                = ggml_sycl::runtime_category::COMPUTE;
         req.intent.constraints.must_device = true;
-        stage              = ggml_sycl::unified_allocate(req);
-        auto staged_result = stage.resolve(device);
+        stage                              = ggml_sycl::unified_allocate(req);
+        auto staged_result                 = stage.resolve(device);
         if (!staged_result || !staged_result.on_device || staged_result.ptr == nullptr) {
             GGML_LOG_ERROR("[SYCL-BINBCAST] failed to stage raw host tensor=%s bytes=%zu device=%d\n",
                            tensor ? tensor->name : "(null)", span_bytes, device);
@@ -667,8 +707,7 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
             throw std::runtime_error("bin-broadcast raw host staging is not graph-recordable");
         }
         ggml_sycl_graph_safe_memcpy(*main_stream, staged_result.ptr, source_ptr, span_bytes).wait();
-        ggml_sycl_binbcast_tracef("stage-copied tensor=%s dst=%p", tensor ? tensor->name : "(null)",
-                                  staged_result.ptr);
+        ggml_sycl_binbcast_tracef("stage-copied tensor=%s dst=%p", tensor ? tensor->name : "(null)", staged_result.ptr);
         staged_raw_host = true;
         return staged_result.ptr;
     };
@@ -748,23 +787,28 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
     if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         op()((const float *) src0_d, (const float *) src1_d, (float *) dst_d, ne00, ne01, ne02, ne03, ne10, ne11, ne12,
              ne13, ne0, ne1, ne2, ne3, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13, nb0, nb1, nb2, nb3,
-             ggml_is_contiguous(src0), ggml_is_contiguous(src1), ggml_is_contiguous(dst), main_stream);
+             ggml_is_contiguous(src0), ggml_is_contiguous(src1), ggml_is_contiguous(dst), main_stream, file, line,
+             function);
     } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
         op()((const sycl::half *) src0_d, (const sycl::half *) src1_d, (sycl::half *) dst_d, ne00, ne01, ne02, ne03,
              ne10, ne11, ne12, ne13, ne0, ne1, ne2, ne3, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13, nb0, nb1, nb2,
-             nb3, ggml_is_contiguous(src0), ggml_is_contiguous(src1), ggml_is_contiguous(dst), main_stream);
+             nb3, ggml_is_contiguous(src0), ggml_is_contiguous(src1), ggml_is_contiguous(dst), main_stream, file, line,
+             function);
     } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) {
         op()((const sycl::half *) src0_d, (const float *) src1_d, (sycl::half *) dst_d, ne00, ne01, ne02, ne03, ne10,
              ne11, ne12, ne13, ne0, ne1, ne2, ne3, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13, nb0, nb1, nb2, nb3,
-             ggml_is_contiguous(src0), ggml_is_contiguous(src1), ggml_is_contiguous(dst), main_stream);
+             ggml_is_contiguous(src0), ggml_is_contiguous(src1), ggml_is_contiguous(dst), main_stream, file, line,
+             function);
     } else if (src0->type == GGML_TYPE_I32 && src1->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32) {
         op()((const int32_t *) src0_d, (const int32_t *) src1_d, (int32_t *) dst_d, ne00, ne01, ne02, ne03, ne10, ne11,
              ne12, ne13, ne0, ne1, ne2, ne3, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13, nb0, nb1, nb2, nb3,
-             ggml_is_contiguous(src0), ggml_is_contiguous(src1), ggml_is_contiguous(dst), main_stream);
+             ggml_is_contiguous(src0), ggml_is_contiguous(src1), ggml_is_contiguous(dst), main_stream, file, line,
+             function);
     } else if (src0->type == GGML_TYPE_I16 && src1->type == GGML_TYPE_I16 && dst->type == GGML_TYPE_I16) {
         op()((const int16_t *) src0_d, (const int16_t *) src1_d, (int16_t *) dst_d, ne00, ne01, ne02, ne03, ne10, ne11,
              ne12, ne13, ne0, ne1, ne2, ne3, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13, nb0, nb1, nb2, nb3,
-             ggml_is_contiguous(src0), ggml_is_contiguous(src1), ggml_is_contiguous(dst), main_stream);
+             ggml_is_contiguous(src0), ggml_is_contiguous(src1), ggml_is_contiguous(dst), main_stream, file, line,
+             function);
     } else {
         fprintf(stderr, "%s: unsupported types: dst: %s, src0: %s, src1: %s\n", __func__, ggml_type_name(dst->type),
                 ggml_type_name(src0->type), ggml_type_name(src1->type));
@@ -772,8 +816,8 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
     }
 
     sycl::event done_event;
-    bool        done_event_set = false;
-    auto ensure_done_event     = [&]() -> sycl::event {
+    bool        done_event_set    = false;
+    auto        ensure_done_event = [&]() -> sycl::event {
         if (!done_event_set) {
             done_event     = ggml_sycl_submit_binbcast_event(*main_stream, ggml_sycl_get_binbcast_event_mode());
             done_event_set = true;
@@ -1030,9 +1074,13 @@ void ggml_sycl_add1(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst)
         const int block_size = 256;
         const int num_blocks = (n + block_size - 1) / block_size;
 
-        stream->parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks * block_size), sycl::range<3>(1, 1, block_size)),
-            [=](sycl::nd_item<3> item) { k_add1(src0_d, scalar, dst_d, n, item); });
+        ggml_sycl_submit_binbcast_kernel(
+            *stream, "sycl.binbcast.add1", "role=binbcast;mode=kernel;op=add1;type=f32",
+            [&](sycl::queue & profiled_queue) {
+                return profiled_queue.parallel_for(
+                    sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks * block_size), sycl::range<3>(1, 1, block_size)),
+                    [=](sycl::nd_item<3> item) { k_add1(src0_d, scalar, dst_d, n, item); });
+            });
     } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && raw_dst->type == GGML_TYPE_F16) {
         const sycl::half * src0_d = (const sycl::half *) ggml_sycl_get_data_ptr(src0, device);
         sycl::half *       dst_d  = (sycl::half *) ggml_sycl_get_data_ptr(raw_dst, device);
@@ -1049,9 +1097,13 @@ void ggml_sycl_add1(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst)
         const int block_size = 256;
         const int num_blocks = (n + block_size - 1) / block_size;
 
-        stream->parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks * block_size), sycl::range<3>(1, 1, block_size)),
-            [=](sycl::nd_item<3> item) { k_add1(src0_d, scalar, dst_d, n, item); });
+        ggml_sycl_submit_binbcast_kernel(
+            *stream, "sycl.binbcast.add1", "role=binbcast;mode=kernel;op=add1;type=f16_from_f32",
+            [&](sycl::queue & profiled_queue) {
+                return profiled_queue.parallel_for(
+                    sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks * block_size), sycl::range<3>(1, 1, block_size)),
+                    [=](sycl::nd_item<3> item) { k_add1(src0_d, scalar, dst_d, n, item); });
+            });
     } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16 && raw_dst->type == GGML_TYPE_F16) {
         const sycl::half * src0_d = (const sycl::half *) ggml_sycl_get_data_ptr(src0, device);
         sycl::half *       dst_d  = (sycl::half *) ggml_sycl_get_data_ptr(raw_dst, device);
@@ -1067,9 +1119,13 @@ void ggml_sycl_add1(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst)
         const int block_size = 256;
         const int num_blocks = (n + block_size - 1) / block_size;
 
-        stream->parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks * block_size), sycl::range<3>(1, 1, block_size)),
-            [=](sycl::nd_item<3> item) { k_add1(src0_d, scalar, dst_d, n, item); });
+        ggml_sycl_submit_binbcast_kernel(
+            *stream, "sycl.binbcast.add1", "role=binbcast;mode=kernel;op=add1;type=f16",
+            [&](sycl::queue & profiled_queue) {
+                return profiled_queue.parallel_for(
+                    sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks * block_size), sycl::range<3>(1, 1, block_size)),
+                    [=](sycl::nd_item<3> item) { k_add1(src0_d, scalar, dst_d, n, item); });
+            });
     } else {
         // Fallback to generic broadcast for unsupported types
         ggml_sycl_op_add(ctx, dst);
@@ -1153,7 +1209,11 @@ void ggml_sycl_op_mul_add_fused(ggml_backend_sycl_context & ctx, ggml_tensor * m
     sycl::range<3> block_dims(1, 1, block_size);
     sycl::range<3> grid_dims(1, grid_y, grid_x * block_size);
 
-    stream->parallel_for(sycl::nd_range<3>(grid_dims, block_dims), [=](sycl::nd_item<3> item) {
-        k_mul_add_fused(x_d, scale_d, bias_d, dst_d, ne0, ne1, ne_scale0, ne_bias0, item);
-    });
+    ggml_sycl_submit_binbcast_kernel(
+        *stream, "sycl.binbcast.mul_add_fused", "role=binbcast;mode=kernel;op=mul_add_fused",
+        [&](sycl::queue & profiled_queue) {
+            return profiled_queue.parallel_for(sycl::nd_range<3>(grid_dims, block_dims), [=](sycl::nd_item<3> item) {
+                k_mul_add_fused(x_d, scale_d, bias_d, dst_d, ne0, ne1, ne_scale0, ne_bias0, item);
+            });
+        });
 }
