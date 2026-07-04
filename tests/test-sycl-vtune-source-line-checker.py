@@ -58,3 +58,16 @@ def test_checker_fails_without_debug_line() -> None:
         assert result.returncode == 2
         assert "source_line.debug_line_present 0" in result.stdout
         assert "source_line.status fail" in result.stdout
+
+
+def test_checker_reports_malformed_surplus_csv_fields_without_traceback() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        sections = tmp / "sections.txt"
+        csv = tmp / "source.csv"
+        sections.write_text("[12] .debug_line PROGBITS\n", encoding="utf-8")
+        csv.write_text("Source Line,Source Computing Task\nmmvq.cpp:123,mxfp4_pair_glu_xmx_tiled_packed_r8_m2,extra-field\n", encoding="utf-8")
+        result = run_checker(sections, csv, "--require-kernel", "mxfp4_pair_glu_xmx_tiled")
+        assert result.returncode == 2
+        assert "failed to check source lines" in result.stdout
+        assert "Traceback" not in result.stdout

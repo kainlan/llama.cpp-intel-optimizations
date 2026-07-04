@@ -9,6 +9,17 @@ import sys
 UNKNOWN_VALUES = {"", "[Unknown]", "[Unknown source file]"}
 
 
+def validate_row_shape(row: dict[str | None, str | list[str] | None]) -> dict[str, str]:
+    if None in row:
+        raise ValueError("malformed CSV row contains surplus fields")
+    normalized: dict[str, str] = {}
+    for key, value in row.items():
+        if key is None or isinstance(value, list):
+            raise ValueError("malformed CSV row shape")
+        normalized[key] = "" if value is None else value
+    return normalized
+
+
 def row_matches_kernel(row: dict[str, str], required: str | None) -> bool:
     if required is None:
         return True
@@ -36,8 +47,12 @@ def main(argv: list[str]) -> int:
             handle.seek(0)
             dialect = csv.excel_tab if "\t" in sample.splitlines()[0] else csv.excel
             reader = csv.DictReader(handle, dialect=dialect)
-            non_unknown_rows = sum(1 for row in reader if row_matches_kernel(row, args.require_kernel) and row_has_known_source(row))
-    except (OSError, csv.Error, IndexError) as exc:
+            non_unknown_rows = 0
+            for raw_row in reader:
+                row = validate_row_shape(raw_row)
+                if row_matches_kernel(row, args.require_kernel) and row_has_known_source(row):
+                    non_unknown_rows += 1
+    except (OSError, csv.Error, IndexError, TypeError, ValueError) as exc:
         print(f"failed to check source lines: {exc}")
         return 2
 
