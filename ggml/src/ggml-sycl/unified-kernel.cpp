@@ -23,6 +23,7 @@
 
 #include "mmvq.hpp"
 #include "quantize.hpp"
+#include "sycl-kernel-profiler.hpp"
 
 #include <array>
 #include <chrono>
@@ -3990,10 +3991,10 @@ static xmx_tile_override get_xmx_tile_override() {
 // Kernel Launcher
 // =============================================================================
 
-static ggml_sycl_profile_label unified_matmul_profile_label(sycl::queue &          queue,
-                                                                  const UnifiedKernelArgs & args,
-                                                                  const char *         name,
-                                                                  const char *         metadata) {
+static ggml_sycl_profile_label unified_matmul_profile_label(sycl::queue &             queue,
+                                                            const UnifiedKernelArgs & args,
+                                                            const char *              name,
+                                                            const char *              metadata) {
     ggml_sycl_profile_label label{};
     label.name       = name;
     label.category   = "unified_matmul";
@@ -4002,6 +4003,20 @@ static ggml_sycl_profile_label unified_matmul_profile_label(sycl::queue &       
     label.device     = ggml_sycl_get_device_id_from_queue(queue);
     label.bytes      = static_cast<size_t>(std::max<int64_t>(args.M, 0)) *
                   static_cast<size_t>(std::max<int64_t>(args.N, 0)) * sizeof(float);
+    return label;
+}
+
+static ggml_sycl_profile_label unified_micro_profile_label(sycl::queue & queue,
+                                                           const char *  name,
+                                                           const char *  metadata,
+                                                           size_t        bytes = 0) {
+    ggml_sycl_profile_label label{};
+    label.name       = name;
+    label.category   = "unified";
+    label.queue_kind = "compute";
+    label.metadata   = metadata;
+    label.device     = ggml_sycl_get_device_id_from_queue(queue);
+    label.bytes      = bytes;
     return label;
 }
 
@@ -9751,23 +9766,37 @@ static void micro_submit_add(sycl::queue & q, const DeviceOperation * d_ops, int
 }
 
 // MUL: output[i] = src0[i] * src1[i]
-static void micro_submit_mul(sycl::queue & q, const DeviceOperation * d_ops, int op_idx) {
-    constexpr int WG_SIZE    = 256;
-    const int     n_elements = d_ops[op_idx].M;
-    const int     n_wgs      = (n_elements + WG_SIZE - 1) / WG_SIZE;
-    q.submit([&](sycl::handler & cgh) {
-        cgh.parallel_for<micro_graph_mul_tag>(sycl::nd_range<1>(n_wgs * WG_SIZE, WG_SIZE), [=](sycl::nd_item<1> item) {
-            const int idx = item.get_global_linear_id();
-            if (idx >= n_elements) {
-                return;
-            }
-            const DeviceOperation & op = d_ops[op_idx];
-            const float *           a  = static_cast<const float *>(op.input);
-            const float *           b  = static_cast<const float *>(op.aux);
-            float *                 y  = static_cast<float *>(op.output);
-            y[idx]                     = a[idx] * b[idx];
-        });
-    });
+static void micro_submit_mul(sycl::queue &           q,
+                             const DeviceOperation * d_ops,
+                             int                     op_idx,
+                             const char *            file     = __builtin_FILE(),
+                             int                     line     = __builtin_LINE(),
+                             const char *            function = __builtin_FUNCTION()) {
+    constexpr int           WG_SIZE       = 256;
+    const int               n_elements    = d_ops[op_idx].M;
+    const int               n_wgs         = (n_elements + WG_SIZE - 1) / WG_SIZE;
+    ggml_sycl_profile_label profile_label = ggml_sycl_unified::unified_micro_profile_label(
+        q, "sycl.unified.mul", "role=unified_micro;op=MUL;micro_submit=1;graph_recorded=1",
+        static_cast<size_t>(std::max(n_elements, 0)) * 3 * sizeof(float));
+    (void) ggml_sycl_profile_submit(
+        q, profile_label,
+        [&](sycl::queue & profiled_queue) {
+            return profiled_queue.submit([&](sycl::handler & cgh) {
+                cgh.parallel_for<micro_graph_mul_tag>(sycl::nd_range<1>(n_wgs * WG_SIZE, WG_SIZE),
+                                                      [=](sycl::nd_item<1> item) {
+                                                          const int idx = item.get_global_linear_id();
+                                                          if (idx >= n_elements) {
+                                                              return;
+                                                          }
+                                                          const DeviceOperation & op = d_ops[op_idx];
+                                                          const float * a = static_cast<const float *>(op.input);
+                                                          const float * b = static_cast<const float *>(op.aux);
+                                                          float *       y = static_cast<float *>(op.output);
+                                                          y[idx]          = a[idx] * b[idx];
+                                                      });
+            });
+        },
+        file, line, function);
 }
 
 // RMS_NORM: cooperative single-WG reduction + normalize
@@ -9835,87 +9864,102 @@ static void micro_submit_rms_norm(sycl::queue & q, const DeviceOperation * d_ops
 // Handles both dual-tensor (Q+K, n_kv_heads>0) and single-tensor modes.
 // The mode (dual vs single) is determined at record time from op.n_kv_heads.
 // Pointers are read live from the ops table at replay time.
-static void micro_submit_rope(sycl::queue & q, const DeviceOperation * d_ops, int op_idx, bool is_dual_mode) {
+static void micro_submit_rope(sycl::queue &           q,
+                              const DeviceOperation * d_ops,
+                              int                     op_idx,
+                              bool                    is_dual_mode,
+                              const char *            file     = __builtin_FILE(),
+                              int                     line     = __builtin_LINE(),
+                              const char *            function = __builtin_FUNCTION()) {
     constexpr int WG_SIZE = 256;
 
-    q.submit([&](sycl::handler & cgh) {
-        cgh.parallel_for<micro_graph_rope_tag>(sycl::nd_range<1>(WG_SIZE, WG_SIZE), [=](sycl::nd_item<1> item) {
-            const int               tid = item.get_local_id(0);
-            const DeviceOperation & op  = d_ops[op_idx];
+    const char * metadata = is_dual_mode ? "role=unified_micro;op=ROPE;micro_submit=1;graph_recorded=1;mode=dual" :
+                                           "role=unified_micro;op=ROPE;micro_submit=1;graph_recorded=1;mode=single";
+    ggml_sycl_profile_label profile_label =
+        ggml_sycl_unified::unified_micro_profile_label(q, "sycl.unified.rope", metadata);
+    (void) ggml_sycl_profile_submit(
+        q, profile_label,
+        [&](sycl::queue & profiled_queue) {
+            return profiled_queue.submit([&](sycl::handler & cgh) {
+                cgh.parallel_for<micro_graph_rope_tag>(sycl::nd_range<1>(WG_SIZE, WG_SIZE), [=](sycl::nd_item<1> item) {
+                    const int               tid = item.get_local_id(0);
+                    const DeviceOperation & op  = d_ops[op_idx];
 
-            const int     n_heads    = op.N;
-            const int     head_dim   = op.K;
-            const int     n_kv_heads = op.n_kv_heads;
-            const int     half_dim   = head_dim / 2;
-            const bool    is_neox    = (op.scale > 0.5f);
-            const float * cos_cache  = static_cast<const float *>(op.weights);
+                    const int     n_heads    = op.N;
+                    const int     head_dim   = op.K;
+                    const int     n_kv_heads = op.n_kv_heads;
+                    const int     half_dim   = head_dim / 2;
+                    const bool    is_neox    = (op.scale > 0.5f);
+                    const float * cos_cache  = static_cast<const float *>(op.weights);
 
-            if (is_dual_mode) {
-                // Dual-tensor mode: rotate both Q and K in-place
-                float *       q_data      = const_cast<float *>(static_cast<const float *>(op.input));
-                float *       k_data      = static_cast<float *>(op.aux);
-                const float * sin_cache   = static_cast<const float *>(op.output);
-                const int     total_heads = n_heads + n_kv_heads;
-                const int     total_pairs = total_heads * half_dim;
+                    if (is_dual_mode) {
+                        // Dual-tensor mode: rotate both Q and K in-place
+                        float *       q_data      = const_cast<float *>(static_cast<const float *>(op.input));
+                        float *       k_data      = static_cast<float *>(op.aux);
+                        const float * sin_cache   = static_cast<const float *>(op.output);
+                        const int     total_heads = n_heads + n_kv_heads;
+                        const int     total_pairs = total_heads * half_dim;
 
-                for (int idx = tid; idx < total_pairs; idx += WG_SIZE) {
-                    const int head_idx = idx / half_dim;
-                    const int dim_idx  = idx % half_dim;
+                        for (int idx = tid; idx < total_pairs; idx += WG_SIZE) {
+                            const int head_idx = idx / half_dim;
+                            const int dim_idx  = idx % half_dim;
 
-                    float * data;
-                    if (head_idx < n_heads) {
-                        data = q_data + head_idx * head_dim;
+                            float * data;
+                            if (head_idx < n_heads) {
+                                data = q_data + head_idx * head_dim;
+                            } else {
+                                data = k_data + (head_idx - n_heads) * head_dim;
+                            }
+
+                            const float cos_val = cos_cache[dim_idx];
+                            const float sin_val = sin_cache[dim_idx];
+
+                            if (is_neox) {
+                                const float x0           = data[dim_idx];
+                                const float x1           = data[dim_idx + half_dim];
+                                data[dim_idx]            = x0 * cos_val - x1 * sin_val;
+                                data[dim_idx + half_dim] = x0 * sin_val + x1 * cos_val;
+                            } else {
+                                const float x0        = data[2 * dim_idx];
+                                const float x1        = data[2 * dim_idx + 1];
+                                data[2 * dim_idx]     = x0 * cos_val - x1 * sin_val;
+                                data[2 * dim_idx + 1] = x0 * sin_val + x1 * cos_val;
+                            }
+                        }
                     } else {
-                        data = k_data + (head_idx - n_heads) * head_dim;
+                        // Single-tensor mode: read from input, write to output
+                        const float * src_data    = static_cast<const float *>(op.input);
+                        float *       dst_data    = static_cast<float *>(op.output);
+                        const float * sin_cache   = static_cast<const float *>(op.aux);
+                        const int     total_pairs = n_heads * half_dim;
+
+                        for (int idx = tid; idx < total_pairs; idx += WG_SIZE) {
+                            const int head_idx = idx / half_dim;
+                            const int dim_idx  = idx % half_dim;
+
+                            const float * src = src_data + head_idx * head_dim;
+                            float *       dst = dst_data + head_idx * head_dim;
+
+                            const float cos_val = cos_cache[dim_idx];
+                            const float sin_val = sin_cache[dim_idx];
+
+                            if (is_neox) {
+                                const float x0          = src[dim_idx];
+                                const float x1          = src[dim_idx + half_dim];
+                                dst[dim_idx]            = x0 * cos_val - x1 * sin_val;
+                                dst[dim_idx + half_dim] = x0 * sin_val + x1 * cos_val;
+                            } else {
+                                const float x0       = src[2 * dim_idx];
+                                const float x1       = src[2 * dim_idx + 1];
+                                dst[2 * dim_idx]     = x0 * cos_val - x1 * sin_val;
+                                dst[2 * dim_idx + 1] = x0 * sin_val + x1 * cos_val;
+                            }
+                        }
                     }
-
-                    const float cos_val = cos_cache[dim_idx];
-                    const float sin_val = sin_cache[dim_idx];
-
-                    if (is_neox) {
-                        const float x0           = data[dim_idx];
-                        const float x1           = data[dim_idx + half_dim];
-                        data[dim_idx]            = x0 * cos_val - x1 * sin_val;
-                        data[dim_idx + half_dim] = x0 * sin_val + x1 * cos_val;
-                    } else {
-                        const float x0        = data[2 * dim_idx];
-                        const float x1        = data[2 * dim_idx + 1];
-                        data[2 * dim_idx]     = x0 * cos_val - x1 * sin_val;
-                        data[2 * dim_idx + 1] = x0 * sin_val + x1 * cos_val;
-                    }
-                }
-            } else {
-                // Single-tensor mode: read from input, write to output
-                const float * src_data    = static_cast<const float *>(op.input);
-                float *       dst_data    = static_cast<float *>(op.output);
-                const float * sin_cache   = static_cast<const float *>(op.aux);
-                const int     total_pairs = n_heads * half_dim;
-
-                for (int idx = tid; idx < total_pairs; idx += WG_SIZE) {
-                    const int head_idx = idx / half_dim;
-                    const int dim_idx  = idx % half_dim;
-
-                    const float * src = src_data + head_idx * head_dim;
-                    float *       dst = dst_data + head_idx * head_dim;
-
-                    const float cos_val = cos_cache[dim_idx];
-                    const float sin_val = sin_cache[dim_idx];
-
-                    if (is_neox) {
-                        const float x0          = src[dim_idx];
-                        const float x1          = src[dim_idx + half_dim];
-                        dst[dim_idx]            = x0 * cos_val - x1 * sin_val;
-                        dst[dim_idx + half_dim] = x0 * sin_val + x1 * cos_val;
-                    } else {
-                        const float x0       = src[2 * dim_idx];
-                        const float x1       = src[2 * dim_idx + 1];
-                        dst[2 * dim_idx]     = x0 * cos_val - x1 * sin_val;
-                        dst[2 * dim_idx + 1] = x0 * sin_val + x1 * cos_val;
-                    }
-                }
-            }
-        });
-    });
+                });
+            });
+        },
+        file, line, function);
 }
 
 // STRIDED_COPY: generic strided memcpy
@@ -10014,7 +10058,12 @@ static void micro_submit_silu_mul(sycl::queue & q, const DeviceOperation * d_ops
 
 // SOFTMAX: cooperative multi-WG (one WG per row), uses group_barrier for reduction.
 // Reads all data pointers live from ops table for graph replay correctness.
-static void micro_submit_softmax(sycl::queue & q, const DeviceOperation * d_ops, int op_idx) {
+static void micro_submit_softmax(sycl::queue &           q,
+                                 const DeviceOperation * d_ops,
+                                 int                     op_idx,
+                                 const char *            file     = __builtin_FILE(),
+                                 int                     line     = __builtin_LINE(),
+                                 const char *            function = __builtin_FUNCTION()) {
     constexpr int           WG_SIZE = 256;
     const DeviceOperation & op_rec  = d_ops[op_idx];
     const int               n_rows  = op_rec.M;
@@ -10023,81 +10072,96 @@ static void micro_submit_softmax(sycl::queue & q, const DeviceOperation * d_ops,
         return;
     }
 
-    q.submit([&](sycl::handler & cgh) {
-        cgh.parallel_for<micro_graph_softmax_tag>(
-            sycl::nd_range<1>(n_rows * WG_SIZE, WG_SIZE), [=](sycl::nd_item<1> item) {
-                const int row = item.get_group_linear_id();
-                if (row >= n_rows) {
-                    return;
-                }
-                const int tid = item.get_local_id(0);
+    ggml_sycl_profile_label profile_label = ggml_sycl_unified::unified_micro_profile_label(
+        q, "sycl.unified.softmax", "role=unified_micro;op=SOFT_MAX;micro_submit=1;graph_recorded=1",
+        static_cast<size_t>(std::max(n_rows, 0)) * static_cast<size_t>(std::max(n_cols, 0)) * 2 * sizeof(float));
+    (void) ggml_sycl_profile_submit(
+        q, profile_label,
+        [&](sycl::queue & profiled_queue) {
+            return profiled_queue.submit([&](sycl::handler & cgh) {
+                cgh.parallel_for<micro_graph_softmax_tag>(
+                    sycl::nd_range<1>(n_rows * WG_SIZE, WG_SIZE), [=](sycl::nd_item<1> item) {
+                        const int row = item.get_group_linear_id();
+                        if (row >= n_rows) {
+                            return;
+                        }
+                        const int tid = item.get_local_id(0);
 
-                // Read all pointers and metadata live from ops table
-                const DeviceOperation & op        = d_ops[op_idx];
-                const float *           x         = static_cast<const float *>(op.input);
-                float *                 y         = static_cast<float *>(op.output);
-                const float             scale     = op.scale;
-                const void *            mask      = op.mask;
-                const int               mask_type = op.mask_type;
-                const int64_t           mask_nb0  = op.mask_nb0;
-                const int64_t           mask_nb1  = op.mask_nb1;
-                const int64_t           mask_nb2  = op.mask_nb2;
-                const int64_t           mask_nb3  = op.mask_nb3;
-                const int               mask_ne2  = op.mask_ne2;
-                const int               mask_ne3  = op.mask_ne3;
-                const int64_t           ne01      = op.q_nb0 > 0 ? op.q_nb0 : 1;
-                const int64_t           ne02      = op.q_nb1 > 0 ? op.q_nb1 : 1;
+                        // Read all pointers and metadata live from ops table
+                        const DeviceOperation & op        = d_ops[op_idx];
+                        const float *           x         = static_cast<const float *>(op.input);
+                        float *                 y         = static_cast<float *>(op.output);
+                        const float             scale     = op.scale;
+                        const void *            mask      = op.mask;
+                        const int               mask_type = op.mask_type;
+                        const int64_t           mask_nb0  = op.mask_nb0;
+                        const int64_t           mask_nb1  = op.mask_nb1;
+                        const int64_t           mask_nb2  = op.mask_nb2;
+                        const int64_t           mask_nb3  = op.mask_nb3;
+                        const int               mask_ne2  = op.mask_ne2;
+                        const int               mask_ne3  = op.mask_ne3;
+                        const int64_t           ne01      = op.q_nb0 > 0 ? op.q_nb0 : 1;
+                        const int64_t           ne02      = op.q_nb1 > 0 ? op.q_nb1 : 1;
 
-                const int64_t i03     = row / (ne01 * ne02);
-                const int64_t r1      = row - i03 * ne01 * ne02;
-                const int64_t i02     = r1 / ne01;
-                const int64_t i01     = r1 - i02 * ne01;
-                const int64_t row_off = (int64_t) row * n_cols;
+                        const int64_t i03     = row / (ne01 * ne02);
+                        const int64_t r1      = row - i03 * ne01 * ne02;
+                        const int64_t i02     = r1 / ne01;
+                        const int64_t i01     = r1 - i02 * ne01;
+                        const int64_t row_off = (int64_t) row * n_cols;
 
-                // Load softmax mask helper (inlined)
-                auto load_mask = [&](int col) -> float {
-                    if (!mask || mask_type < 0) {
-                        return 0.0f;
-                    }
-                    const int64_t m_ne2  = mask_ne2 > 0 ? mask_ne2 : 1;
-                    const int64_t m_ne3  = mask_ne3 > 0 ? mask_ne3 : 1;
-                    const int64_t m02    = m_ne2 > 0 ? (i02 % m_ne2) : 0;
-                    const int64_t m03    = m_ne3 > 0 ? (i03 % m_ne3) : 0;
-                    const int64_t off    = i01 * mask_nb1 + m02 * mask_nb2 + m03 * mask_nb3 + (int64_t) col * mask_nb0;
-                    const char *  mask_b = static_cast<const char *>(mask);
-                    if (mask_type == 1) {
-                        return static_cast<float>(*reinterpret_cast<const sycl::half *>(mask_b + off));
-                    }
-                    return *reinterpret_cast<const float *>(mask_b + off);
-                };
+                        // Load softmax mask helper (inlined)
+                        auto load_mask = [&](int col) -> float {
+                            if (!mask || mask_type < 0) {
+                                return 0.0f;
+                            }
+                            const int64_t m_ne2 = mask_ne2 > 0 ? mask_ne2 : 1;
+                            const int64_t m_ne3 = mask_ne3 > 0 ? mask_ne3 : 1;
+                            const int64_t m02   = m_ne2 > 0 ? (i02 % m_ne2) : 0;
+                            const int64_t m03   = m_ne3 > 0 ? (i03 % m_ne3) : 0;
+                            const int64_t off =
+                                i01 * mask_nb1 + m02 * mask_nb2 + m03 * mask_nb3 + (int64_t) col * mask_nb0;
+                            const char * mask_b = static_cast<const char *>(mask);
+                            if (mask_type == 1) {
+                                return static_cast<float>(*reinterpret_cast<const sycl::half *>(mask_b + off));
+                            }
+                            return *reinterpret_cast<const float *>(mask_b + off);
+                        };
 
-                float local_max = -INFINITY;
-                for (int col = tid; col < n_cols; col += WG_SIZE) {
-                    float v   = x[row_off + col] * scale + load_mask(col);
-                    local_max = sycl::fmax(local_max, v);
-                }
-                const float row_max = sycl::reduce_over_group(item.get_group(), local_max, sycl::maximum<float>());
+                        float local_max = -INFINITY;
+                        for (int col = tid; col < n_cols; col += WG_SIZE) {
+                            float v   = x[row_off + col] * scale + load_mask(col);
+                            local_max = sycl::fmax(local_max, v);
+                        }
+                        const float row_max =
+                            sycl::reduce_over_group(item.get_group(), local_max, sycl::maximum<float>());
 
-                float local_sum = 0.0f;
-                for (int col = tid; col < n_cols; col += WG_SIZE) {
-                    float v = x[row_off + col] * scale + load_mask(col);
-                    local_sum += sycl::exp(v - row_max);
-                }
-                const float row_sum = sycl::reduce_over_group(item.get_group(), local_sum, sycl::plus<float>());
-                const float inv_sum = row_sum > 0.0f ? (1.0f / row_sum) : 0.0f;
+                        float local_sum = 0.0f;
+                        for (int col = tid; col < n_cols; col += WG_SIZE) {
+                            float v = x[row_off + col] * scale + load_mask(col);
+                            local_sum += sycl::exp(v - row_max);
+                        }
+                        const float row_sum = sycl::reduce_over_group(item.get_group(), local_sum, sycl::plus<float>());
+                        const float inv_sum = row_sum > 0.0f ? (1.0f / row_sum) : 0.0f;
 
-                for (int col = tid; col < n_cols; col += WG_SIZE) {
-                    float v          = x[row_off + col] * scale + load_mask(col);
-                    y[row_off + col] = sycl::exp(v - row_max) * inv_sum;
-                }
+                        for (int col = tid; col < n_cols; col += WG_SIZE) {
+                            float v          = x[row_off + col] * scale + load_mask(col);
+                            y[row_off + col] = sycl::exp(v - row_max) * inv_sum;
+                        }
+                    });
             });
-    });
+        },
+        file, line, function);
 }
 
 // SET_ROWS: scatter-write elements from src0 into dst at rows indexed by src1.
 // Metadata (SetRowsMeta) is stable across tokens — captured at record time.
 // Data pointers (input, aux, output) read live from ops table.
-static void micro_submit_set_rows(sycl::queue & q, const DeviceOperation * d_ops, int op_idx) {
+static void micro_submit_set_rows(sycl::queue &           q,
+                                  const DeviceOperation * d_ops,
+                                  int                     op_idx,
+                                  const char *            file     = __builtin_FILE(),
+                                  int                     line     = __builtin_LINE(),
+                                  const char *            function = __builtin_FUNCTION()) {
     constexpr int           WG_SIZE    = 256;
     const DeviceOperation & op_rec     = d_ops[op_idx];
     const int               n_elements = op_rec.M;
@@ -10109,75 +10173,85 @@ static void micro_submit_set_rows(sycl::queue & q, const DeviceOperation * d_ops
     // Capture stable SetRowsMeta fields at record time (structural, don't change per token)
     const SetRowsMeta meta = op_rec.set_rows_meta;
 
-    q.submit([&](sycl::handler & cgh) {
-        cgh.parallel_for<micro_graph_set_rows_tag>(
-            sycl::nd_range<1>(n_wgs * WG_SIZE, WG_SIZE), [=](sycl::nd_item<1> item) {
-                const int idx = item.get_global_linear_id();
-                if (idx >= n_elements) {
-                    return;
-                }
+    ggml_sycl_profile_label profile_label = ggml_sycl_unified::unified_micro_profile_label(
+        q, "sycl.unified.set_rows", "role=unified_micro;op=SET_ROWS;micro_submit=1;graph_recorded=1",
+        static_cast<size_t>(std::max(n_elements, 0)) * 2 * sizeof(float));
+    (void) ggml_sycl_profile_submit(
+        q, profile_label,
+        [&](sycl::queue & profiled_queue) {
+            return profiled_queue.submit([&](sycl::handler & cgh) {
+                cgh.parallel_for<micro_graph_set_rows_tag>(
+                    sycl::nd_range<1>(n_wgs * WG_SIZE, WG_SIZE), [=](sycl::nd_item<1> item) {
+                        const int idx = item.get_global_linear_id();
+                        if (idx >= n_elements) {
+                            return;
+                        }
 
-                // Read data pointers live from ops table
-                const DeviceOperation & op = d_ops[op_idx];
-                if (!op.input || !op.aux || !op.output) {
-                    return;
-                }
+                        // Read data pointers live from ops table
+                        const DeviceOperation & op = d_ops[op_idx];
+                        if (!op.input || !op.aux || !op.output) {
+                            return;
+                        }
 
-                const int64_t ne00 = meta.nc;
-                const int64_t ne01 = meta.nr;
-                const int64_t ne02 = meta.ne02;
-                const int64_t ne03 = meta.ne03;
-                if (ne00 <= 0 || ne01 <= 0 || ne02 <= 0 || ne03 <= 0) {
-                    return;
-                }
+                        const int64_t ne00 = meta.nc;
+                        const int64_t ne01 = meta.nr;
+                        const int64_t ne02 = meta.ne02;
+                        const int64_t ne03 = meta.ne03;
+                        if (ne00 <= 0 || ne01 <= 0 || ne02 <= 0 || ne03 <= 0) {
+                            return;
+                        }
 
-                const int64_t i03 = idx / (ne00 * ne01 * ne02);
-                const int64_t r1  = idx - i03 * ne00 * ne01 * ne02;
-                const int64_t i02 = r1 / (ne00 * ne01);
-                const int64_t r2  = r1 - i02 * ne00 * ne01;
-                const int64_t i01 = r2 / ne00;
-                const int64_t i00 = r2 - i01 * ne00;
+                        const int64_t i03 = idx / (ne00 * ne01 * ne02);
+                        const int64_t r1  = idx - i03 * ne00 * ne01 * ne02;
+                        const int64_t i02 = r1 / (ne00 * ne01);
+                        const int64_t r2  = r1 - i02 * ne00 * ne01;
+                        const int64_t i01 = r2 / ne00;
+                        const int64_t i00 = r2 - i01 * ne00;
 
-                const int64_t i10 = i01;
-                const int64_t i11 = meta.ne11 > 0 ? (i02 % meta.ne11) : 0;
-                const int64_t i12 = meta.ne12 > 0 ? (i03 % meta.ne12) : 0;
+                        const int64_t i10 = i01;
+                        const int64_t i11 = meta.ne11 > 0 ? (i02 % meta.ne11) : 0;
+                        const int64_t i12 = meta.ne12 > 0 ? (i03 % meta.ne12) : 0;
 
-                const char * src0 = static_cast<const char *>(op.input);
-                const char * src1 = static_cast<const char *>(op.aux);
-                char *       dst  = static_cast<char *>(op.output);
+                        const char * src0 = static_cast<const char *>(op.input);
+                        const char * src1 = static_cast<const char *>(op.aux);
+                        char *       dst  = static_cast<char *>(op.output);
 
-                const int64_t idx_off = i10 * meta.nb10 + i11 * meta.nb11 + i12 * meta.nb12;
+                        const int64_t idx_off = i10 * meta.nb10 + i11 * meta.nb11 + i12 * meta.nb12;
 
-                // Inline load_idx
-                int64_t dst_row;
-                if (meta.idx_type == 1) {
-                    dst_row = *reinterpret_cast<const int64_t *>(src1 + idx_off);
-                } else {
-                    dst_row = static_cast<int64_t>(*reinterpret_cast<const int32_t *>(src1 + idx_off));
-                }
-                if (dst_row < 0 || dst_row >= meta.ne1) {
-                    return;
-                }
+                        // Inline load_idx
+                        int64_t dst_row;
+                        if (meta.idx_type == 1) {
+                            dst_row = *reinterpret_cast<const int64_t *>(src1 + idx_off);
+                        } else {
+                            dst_row = static_cast<int64_t>(*reinterpret_cast<const int32_t *>(src1 + idx_off));
+                        }
+                        if (dst_row < 0 || dst_row >= meta.ne1) {
+                            return;
+                        }
 
-                const int     src_elem_size = (meta.src_type == 1) ? (int) sizeof(sycl::half) : (int) sizeof(float);
-                const int     dst_elem_size = (meta.dst_type == 1) ? (int) sizeof(sycl::half) : (int) sizeof(float);
-                const int64_t src_off       = i01 * meta.nb01 + i02 * meta.nb02 + i03 * meta.nb03 + i00 * src_elem_size;
-                const int64_t dst_off = dst_row * meta.nb1 + i02 * meta.nb2 + i03 * meta.nb3 + i00 * dst_elem_size;
+                        const int src_elem_size = (meta.src_type == 1) ? (int) sizeof(sycl::half) : (int) sizeof(float);
+                        const int dst_elem_size = (meta.dst_type == 1) ? (int) sizeof(sycl::half) : (int) sizeof(float);
+                        const int64_t src_off =
+                            i01 * meta.nb01 + i02 * meta.nb02 + i03 * meta.nb03 + i00 * src_elem_size;
+                        const int64_t dst_off =
+                            dst_row * meta.nb1 + i02 * meta.nb2 + i03 * meta.nb3 + i00 * dst_elem_size;
 
-                // Inline load_f32_or_f16 + store_f32_or_f16
-                float v;
-                if (meta.src_type == 1) {
-                    v = static_cast<float>(*reinterpret_cast<const sycl::half *>(src0 + src_off));
-                } else {
-                    v = *reinterpret_cast<const float *>(src0 + src_off);
-                }
-                if (meta.dst_type == 1) {
-                    *reinterpret_cast<sycl::half *>(dst + dst_off) = sycl::half(v);
-                } else {
-                    *reinterpret_cast<float *>(dst + dst_off) = v;
-                }
+                        // Inline load_f32_or_f16 + store_f32_or_f16
+                        float v;
+                        if (meta.src_type == 1) {
+                            v = static_cast<float>(*reinterpret_cast<const sycl::half *>(src0 + src_off));
+                        } else {
+                            v = *reinterpret_cast<const float *>(src0 + src_off);
+                        }
+                        if (meta.dst_type == 1) {
+                            *reinterpret_cast<sycl::half *>(dst + dst_off) = sycl::half(v);
+                        } else {
+                            *reinterpret_cast<float *>(dst + dst_off) = v;
+                        }
+                    });
             });
-    });
+        },
+        file, line, function);
 }
 
 // ATTENTION: standalone two-pass online softmax attention kernel.
