@@ -81,8 +81,19 @@ def main(argv: list[str]) -> int:
         ur_api = layer_ledger.int_metric(ur_summary, "ur.total_ms_x1000", args.ur_summary)
         vtune_gpu = layer_ledger.int_metric(vtune_summary, "vtune.kernel_total_ms_x1000", args.vtune_summary)
 
-        if source_attribution_summary.get("source_attribution.status") != "source_region_plus_ablation":
-            raise ValueError(f"{args.source_attribution}: source attribution is not closure-ready")
+        status = source_attribution_summary.get("source_attribution.status")
+        if status not in {"exact_source_line", "source_region_plus_ablation"}:
+            print("coverage.layer_status source_attribution_incomplete")
+            for line in source_attribution_rows:
+                print(line)
+            print("failed to merge staged ledger: source attribution incomplete")
+            return 2
+        if status == "source_region_plus_ablation" and "source_attribution.ablation_delta_ms_x1000" not in source_attribution_summary:
+            print("coverage.layer_status source_attribution_incomplete")
+            for line in source_attribution_rows:
+                print(line)
+            print("failed to merge staged ledger: missing source_attribution.ablation_delta_ms_x1000")
+            return 2
 
         e2e_host_total = layer_ledger.parse_e2e_stderr(args.bench_stderr)
     except (OSError, json.JSONDecodeError, ValueError, RuntimeError, AttributeError) as exc:

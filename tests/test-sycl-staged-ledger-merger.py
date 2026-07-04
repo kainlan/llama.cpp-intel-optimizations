@@ -148,3 +148,33 @@ def test_staged_merger_rejects_metadata_mismatch_without_traceback() -> None:
         assert result.returncode == 2
         assert "coverage.layer_status metadata_mismatch" in result.stdout
         assert "Traceback" not in result.stdout
+
+
+def test_staged_merger_rejects_plain_source_region_for_strict_closure() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        paths = write_fixture(pathlib.Path(tmp_raw))
+        paths["source_attr"].write_text(
+            "source_attribution.status source_region\n"
+            "source_attribution.kernel mxfp4.gateup.xmx_tiled_dpas_m2\n",
+            encoding="utf-8",
+        )
+        result = run_merger(paths)
+        assert result.returncode == 2
+        assert "coverage.layer_status source_attribution_incomplete" in result.stdout
+        assert "source_attribution.status source_region" in result.stdout
+        assert "Traceback" not in result.stdout
+
+
+def test_staged_merger_requires_ablation_delta_for_plus_ablation_status() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        paths = write_fixture(pathlib.Path(tmp_raw))
+        paths["source_attr"].write_text(
+            "source_attribution.status source_region_plus_ablation\n"
+            "source_attribution.kernel mxfp4.gateup.xmx_tiled_dpas_m2\n",
+            encoding="utf-8",
+        )
+        result = run_merger(paths)
+        assert result.returncode == 2
+        assert "coverage.layer_status source_attribution_incomplete" in result.stdout
+        assert "missing source_attribution.ablation_delta_ms_x1000" in result.stdout
+        assert "Traceback" not in result.stdout
