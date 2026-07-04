@@ -27,6 +27,22 @@ def test_source_line_feasibility_script_is_dry_run_by_default() -> None:
     assert "llama-bench" not in result.stdout
 
 
+def test_source_line_feasibility_script_handles_absolute_build_dir_in_dry_run(tmp_path: Path) -> None:
+    build_dir = tmp_path / "source line build"
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--build-dir", str(build_dir)],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout
+    expected_bench = build_dir / "bin" / "sycl-kernel-bench"
+    assert str(expected_bench).replace(" ", "\\ ") in result.stdout
+    assert ".//tmp" not in result.stdout
+
+
 def test_source_line_feasibility_script_refuses_execute_without_ack() -> None:
     result = subprocess.run(["bash", str(SCRIPT), "--execute"], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
     assert result.returncode == 2

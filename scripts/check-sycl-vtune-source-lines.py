@@ -4,9 +4,11 @@ from __future__ import annotations
 import argparse
 import csv
 import pathlib
+import re
 import sys
 
 UNKNOWN_VALUES = {"", "[Unknown]", "[Unknown source file]"}
+DEBUG_LINE_SECTION_RE = re.compile(r"(?m)^\s*\[\s*\d+\]\s+\.debug_line(?:\s|$)")
 
 
 def validate_row_shape(row: dict[str | None, str | list[str] | None]) -> dict[str, str]:
@@ -41,7 +43,7 @@ def main(argv: list[str]) -> int:
 
     try:
         sections = args.readelf_sections.read_text(encoding="utf-8", errors="replace")
-        debug_line_present = ".debug_line" in sections
+        debug_line_present = DEBUG_LINE_SECTION_RE.search(sections) is not None
         with args.vtune_csv.open("r", encoding="utf-8", errors="replace", newline="") as handle:
             sample = handle.read(4096)
             handle.seek(0)

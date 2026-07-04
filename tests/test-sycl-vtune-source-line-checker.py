@@ -99,6 +99,20 @@ def test_checker_fails_without_debug_line() -> None:
         assert "source_line.status fail" in result.stdout
 
 
+def test_checker_does_not_treat_debug_line_str_as_debug_line() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        sections = tmp / "sections.txt"
+        csv = tmp / "source.csv"
+        sections.write_text("[12] .debug_line_str PROGBITS\n", encoding="utf-8")
+        csv.write_text("Source Line\tSource Computing Task\nmmvq.cpp:123\tmxfp4_pair_glu_xmx_tiled_packed_r8_m2\n", encoding="utf-8")
+        result = run_checker(sections, csv, "--require-kernel", "mxfp4_pair_glu_xmx_tiled")
+        assert result.returncode == 2
+        assert "source_line.debug_line_present 0" in result.stdout
+        assert "source_line.blocker missing_debug_line" in result.stdout
+        assert "source_line.status fail" in result.stdout
+
+
 def test_checker_reports_blocker_reason_for_missing_debug_line() -> None:
     with tempfile.TemporaryDirectory() as tmp_raw:
         tmp = pathlib.Path(tmp_raw)
