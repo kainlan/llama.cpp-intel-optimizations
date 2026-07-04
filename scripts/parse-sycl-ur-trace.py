@@ -27,6 +27,8 @@ def parse_number(raw: str | None, field: str, name: str) -> float | None:
         raise ValueError(f"invalid {field} for {name}: {raw!r}") from exc
     if not math.isfinite(value):
         raise ValueError(f"invalid non-finite {field} for {name}: {raw!r}")
+    if value < 0:
+        raise ValueError(f"negative {field} for {name}")
     return value
 
 

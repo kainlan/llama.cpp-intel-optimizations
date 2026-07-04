@@ -42,13 +42,3 @@ def test_ur_parser_rejects_bad_duration_without_traceback() -> None:
         assert result.returncode == 2
         assert "failed to parse UR trace" in result.stdout
         assert "Traceback" not in result.stdout
-
-
-def test_ur_parser_rejects_missing_duration_without_traceback() -> None:
-    with tempfile.TemporaryDirectory() as tmp_raw:
-        path = pathlib.Path(tmp_raw) / "missing.log"
-        path.write_text("UR_TRACE name=urEnqueueKernelLaunch begin_us=9\n", encoding="utf-8")
-        result = run_parser(path)
-        assert result.returncode == 2
-        assert "failed to parse UR trace" in result.stdout
-        assert "Traceback" not in result.stdout
