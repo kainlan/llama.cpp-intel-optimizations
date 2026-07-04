@@ -40,12 +40,12 @@ struct ggml_sycl_profile_label {
 };
 
 struct ggml_sycl_kernel_profile_node_context {
-    bool         active     = false;
-    int64_t      step       = -1;
-    int          node_idx   = -1;
-    int          node_count = 0;
-    const char * op         = "";
-    const char * tensor     = "";
+    bool               active     = false;
+    int64_t            step       = -1;
+    int                node_idx   = -1;
+    int                node_count = 0;
+    std::string        op;
+    std::string        tensor;
 };
 
 void ggml_sycl_kernel_profile_set_node_context(const ggml_sycl_kernel_profile_node_context & ctx);

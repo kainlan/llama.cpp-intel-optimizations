@@ -225,8 +225,8 @@ void append_node_context_metadata(std::ostringstream & out, const ggml_sycl_kern
     if (!ctx.active) {
         return;
     }
-    out << ";node_step=" << ctx.step << ";node_idx=" << ctx.node_idx << ";node_op=" << string_from_cstr(ctx.op, "")
-        << ";node_tensor=" << string_from_cstr(ctx.tensor, "") << ";node_count=" << ctx.node_count;
+    out << ";node_step=" << ctx.step << ";node_idx=" << ctx.node_idx << ";node_op=" << ctx.op
+        << ";node_tensor=" << ctx.tensor << ";node_count=" << ctx.node_count;
 }
 
 profile_aggregate & ensure_aggregate_locked(profiler_state & state, const profile_label_snapshot & label) {
@@ -420,8 +420,8 @@ std::string format_json_rows(const std::vector<profile_row> &       rows,
             if (event.node_context.active) {
                 out << ",\"node_step\":" << event.node_context.step << ",\"node_idx\":" << event.node_context.node_idx
                     << ",\"node_count\":" << event.node_context.node_count << ",\"node_op\":\""
-                    << json_escape(string_from_cstr(event.node_context.op, "")) << "\",\"node_tensor\":\""
-                    << json_escape(string_from_cstr(event.node_context.tensor, "")) << '"';
+                    << json_escape(event.node_context.op) << "\",\"node_tensor\":\""
+                    << json_escape(event.node_context.tensor) << '"';
             }
             out << '}';
         }
@@ -715,8 +715,8 @@ ggml_sycl_kernel_profile_node_scope::ggml_sycl_kernel_profile_node_scope(int64_t
     ctx.step       = step;
     ctx.node_idx   = node_idx;
     ctx.node_count = node_count;
-    ctx.op         = op != nullptr ? op : "";
-    ctx.tensor     = tensor != nullptr ? tensor : "";
+    ctx.op         = string_from_cstr(op, "");
+    ctx.tensor     = string_from_cstr(tensor, "");
     ggml_sycl_kernel_profile_set_node_context(ctx);
 }
 

@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 
 #define CHECK(cond, msg)                                                        \
@@ -144,6 +145,22 @@ int main() {
     CHECK(contains(node_json, "\"node_tensor\":\"ffn_gate_exps\""), "missing raw node tensor");
     CHECK(!contains(ggml_sycl_kernel_profile_format_csv_for_test(), "node_op"),
           "node context should not enter CSV keys");
+
+    char stack_op[32]     = "STACK_OP";
+    char stack_tensor[32] = "stack_tensor";
+    {
+        ggml_sycl_kernel_profile_node_scope node_scope(6, 43, 1374, stack_op, stack_tensor);
+        ggml_sycl_kernel_profile_add_raw_event_for_test(slow, 44, 300, 310, 3000, 3200, 3600, "test-node-owned",
+                                                        "tests/test-sycl-kernel-profiler.cpp", 125, "main", false);
+    }
+    std::strcpy(stack_op, "MUTATED");
+    std::strcpy(stack_tensor, "mutated_tensor");
+    const std::string owned_node_json = ggml_sycl_kernel_profile_format_json_for_test();
+    CHECK(contains(owned_node_json, "\"node_op\":\"STACK_OP\""), "raw node op was not snapshotted");
+    CHECK(contains(owned_node_json, "\"node_tensor\":\"stack_tensor\""), "raw node tensor was not snapshotted");
+    CHECK(!contains(owned_node_json, "\"node_op\":\"MUTATED\""), "raw node op kept a mutable pointer");
+    CHECK(!contains(owned_node_json, "\"node_tensor\":\"mutated_tensor\""),
+          "raw node tensor kept a mutable pointer");
 
     cfg.raw_events = false;
     ggml_sycl_kernel_profile_set_config_for_test(cfg);
