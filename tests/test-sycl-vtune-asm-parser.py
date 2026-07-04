@@ -50,3 +50,39 @@ def test_tsv_parser_extracts_gpu_instruction_count() -> None:
         assert data["instr_tsv"][0]["gpu_instructions"] == 100224000
         assert data["instr_tsv"][0]["simd_width"] == 1
         assert data["instr_tsv"][0]["spill_memory_size"] == 0
+
+
+def test_asm_parser_classifies_high_send_dpas_as_memory_or_address_bound() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        asm = pathlib.Path(tmp_raw) / "kernel.asm"
+        asm.write_text(
+            "\n".join(
+                ["send.ugm r1 r2 r3 // wr:1+0, rd:4; load.ugm.d32x64t.a64"] * 40
+                + ["dpas.8x8 r4:d null:d r5:b r6:b"] * 2
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        data = run_parser("--classify-bound", "--asm", str(asm))
+        assert data["asm"]["bound"]["verdict"] == "memory_or_address_bound"
+        assert data["asm"]["bound"]["dpas"] == 2
+        assert data["asm"]["bound"]["send_ugm"] == 40
+
+
+def test_asm_parser_classifies_dpas_heavy_low_send_as_compute_bound() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        asm = pathlib.Path(tmp_raw) / "kernel.asm"
+        asm.write_text(
+            "\n".join(["dpas.8x8 r4:d null:d r5:b r6:b"] * 16 + ["send.ugm r1 r2 r3"] * 2) + "\n",
+            encoding="utf-8",
+        )
+        data = run_parser("--classify-bound", "--asm", str(asm))
+        assert data["asm"]["bound"]["verdict"] == "compute_xmx_bound"
+
+
+def test_asm_parser_classifies_send_only_as_memory_bound() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        asm = pathlib.Path(tmp_raw) / "kernel.asm"
+        asm.write_text("send.ugm r1 r2 r3\nsend.ugm r4 r5 r6\n", encoding="utf-8")
+        data = run_parser("--classify-bound", "--asm", str(asm))
+        assert data["asm"]["bound"]["verdict"] == "memory_bound"

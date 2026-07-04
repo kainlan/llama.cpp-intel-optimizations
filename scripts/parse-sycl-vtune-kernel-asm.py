@@ -32,6 +32,31 @@ def parse_asm(path: pathlib.Path) -> dict[str, Any]:
     }
 
 
+def classify_bound(opcodes: dict[str, int]) -> dict[str, Any]:
+    dpas = int(opcodes.get("dpas.8x8", 0))
+    send_ugm = int(opcodes.get("send.ugm", 0))
+    math_exp = int(opcodes.get("math.exp", 0))
+    math_inv = int(opcodes.get("math.inv", 0))
+    if dpas > 0 and send_ugm >= dpas * 16:
+        verdict = "memory_or_address_bound"
+    elif dpas > 0:
+        verdict = "compute_xmx_bound"
+    elif send_ugm > 0:
+        verdict = "memory_bound"
+    elif math_exp + math_inv > 0:
+        verdict = "math_bound"
+    else:
+        verdict = "unknown"
+    return {
+        "verdict": verdict,
+        "dpas": dpas,
+        "send_ugm": send_ugm,
+        "math_exp": math_exp,
+        "math_inv": math_inv,
+        "send_per_dpas_x1000": 0 if dpas == 0 else int(round(1000.0 * send_ugm / dpas)),
+    }
+
+
 def parse_int(raw: str | None) -> int | None:
     if raw is None:
         return None
@@ -67,11 +92,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Summarize VTune/ocloc SYCL kernel evidence")
     parser.add_argument("--asm", action="append", default=[], help="ocloc/IGA assembly file to summarize")
     parser.add_argument("--instr-tsv", action="append", default=[], help="VTune instruction-count TSV report")
+    parser.add_argument("--classify-bound", action="store_true")
     args = parser.parse_args()
 
     output: dict[str, Any] = {}
     if args.asm:
         summaries = [parse_asm(pathlib.Path(path)) for path in args.asm]
+        if args.classify_bound:
+            for summary in summaries:
+                summary["bound"] = classify_bound(summary.get("opcodes", {}))
         output["asm"] = summaries[0] if len(summaries) == 1 else summaries
     if args.instr_tsv:
         rows: list[dict[str, Any]] = []
