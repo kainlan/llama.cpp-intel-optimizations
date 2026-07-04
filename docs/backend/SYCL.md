@@ -1272,7 +1272,50 @@ Default attribution is host-side file:line callsites plus named GPU kernel label
 
 VTune GPU source-line attribution is an optional deep dive only, not a prerequisite for using the decode timeline profiler and not the source of truth for default callsite attribution. Exact GPU source-line profiling is gated by the microbench-only script `scripts/sycl-vtune-source-line-feasibility.sh`; run it in dry-run mode first and execute it only with `--execute --i-understand-this-runs-gpu-microbenchmarks`. The pass condition is fail-closed: dumped `.zebin` sections must contain `.debug_line`, and the exported VTune `gpu-source-line` CSV must contain non-`[Unknown]` rows for the target MXFP4 kernel. As of the 2026-07-04 B-spike, the microbench still failed this gate (`debug_line_present 0`, `non_unknown_rows 0`), so full GPT-OSS exact-line profiling remains blocked.
 
-Real model/GPU validation is lead-owned. Under delegated documentation/source-test work, workers must not run real model/GPU validation, llama-bench, sycl-kernel-bench, VTune, sycl-ls, DRM, lsof, or P2P probes.
+### Full layered SYCL profiling closure
+
+`scripts/sycl-gptoss-full-attribution-profile.sh` is the lead-owned runner for closing GPT-OSS MXFP4 SYCL decode attribution across application spans, SYCL event profiling, Level Zero, Unified Runtime, VTune, and source-attribution fallback evidence. It is dry-run by default and prints the artifact root plus every real model/profiler command before anything is executed.
+
+Dry-run command:
+
+```bash
+bash scripts/sycl-gptoss-full-attribution-profile.sh \
+  --dry-run \
+  --out-root /tmp/sycl_gptoss_full_attribution_dryrun
+```
+
+Lead-only real command. Keep the oneAPI wrapper exactly around the environment source step so `set -u` shells do not fail inside Intel's setup script:
+
+```bash
+set +u
+source /opt/intel/oneapi/setvars.sh --force
+set -u
+bash scripts/sycl-gptoss-full-attribution-profile.sh \
+  --execute \
+  --i-understand-this-runs-gpu-models-and-profilers \
+  --out-root /tmp/sycl_gptoss_full_attribution_$(date +%Y%m%d_%H%M%S)
+```
+
+Artifact root defaults to `$SYCL_GPTOSS_FULL_ATTRIBUTION_OUT` or `/tmp/sycl_gptoss_full_attribution_<timestamp>`. The runner writes raw artifacts, profiler exports, and parsed summaries under that root:
+
+| Path under artifact root | Contents | Primary parser output |
+|---|---|---|
+| `raw/` | llama-bench stdout/stderr-adjacent timeline and named SYCL kernel profiler outputs (`raw/timeline/sycl-timeline.json`, `raw/kernel/sycl-kernels.csv/json`). | `parsed/timeline.parse`, `parsed/kernel-cost.parse` |
+| `pti/` | Level Zero API trace, normally `pti/level-zero-api.jsonl`. | `parsed/l0.parse` |
+| `ur/` | Unified Runtime trace log, normally `ur/sycl-ur-trace.log`. | `parsed/ur.parse` |
+| `vtune/` | VTune result directory and exported kernel/source CSVs. | `parsed/vtune.parse` |
+| `source-line/` | Source-line debug matrix probe, dumped ZEBin section list, and VTune GPU source-line CSV. | `parsed/source-line.parse` |
+| `parsed/` | Consolidated parser summaries and final attribution rows. | `parsed/layer-ledger.parse`, `parsed/source-attribution.parse` |
+
+The main closure evidence is `parsed/layer-ledger.parse` plus `parsed/source-line.parse` and `parsed/source-attribution.parse`. Interpret status rows as follows:
+
+| Status row | PASS / accepted value | Failure or blocked value | Meaning |
+|---|---|---|---|
+| `coverage.layer_status` | `ok` | `missing_layers`; treat any future `coverage_mismatch` or `unknown_wall_residual` row as incomplete until the numeric reason rows are reviewed. | `ok` means required raw timeline/kernel, Level Zero, Unified Runtime, and VTune parse inputs were present for the wall-time ledger. Missing layers mean the run is not full-attribution evidence. |
+| `source_line.status` | `pass` | `fail` with `source_line.blocker` such as `missing_debug_line` or `vtune_unknown_source`. | Exact GPU source-line PASS requires both `.debug_line` in dumped ZEBin sections and non-unknown VTune GPU source-line rows for the required kernel. One without the other is not exact-line attribution. |
+| `source_attribution.status` | `exact_source_line` or `source_region_plus_ablation` | `source_region`, `missing_parser`, or parse failure. | `exact_source_line` is preferred. The fallback `source_region_plus_ablation` is accepted when `source_line.status fail` records the exact-line blocker and the region map plus ablation delta identify the hot kernel region. Plain `source_region` is useful triage but is not closure-quality evidence by itself. |
+
+Real model/GPU validation is lead-owned. Under delegated documentation/source-test work, workers must not run this runner with `--execute`, real model/GPU validation, llama-bench, sycl-kernel-bench, VTune, sycl-ls, DRM, lsof, or P2P probes. Workers may run documentation/source-only tests such as pytest checks for this section.
 
 ## TODO
 
