@@ -108,7 +108,7 @@ static sycl::event ggml_sycl_submit_binbcast_event(sycl::queue &                
     label.queue_kind = "compute";
     label.metadata   = mode == ggml_sycl_binbcast_event_mode::BARRIER ? "role=binbcast;mode=marker;event_mode=barrier" :
                                                                         "role=binbcast;mode=kernel;event_mode=safe";
-    label.device     = ggml_sycl_get_device_id_from_queue(q);
+    label.device     = ggml_sycl_kernel_profile_enabled() ? ggml_sycl_get_device_id_from_queue(q) : -1;
     label.bytes      = 0;
 
     if (mode == ggml_sycl_binbcast_event_mode::BARRIER) {
@@ -127,6 +127,69 @@ static sycl::event ggml_sycl_submit_binbcast_event(sycl::queue &                
         file, line, function);
 }
 
+template <float (*bin_op)(const float, const float)>
+static const char * ggml_sycl_binbcast_kernel_profile_name() {
+    if (bin_op == op_add) {
+        return "sycl.binbcast.add";
+    }
+    if (bin_op == op_mul) {
+        return "sycl.binbcast.mul";
+    }
+    if (bin_op == op_sub) {
+        return "sycl.binbcast.sub";
+    }
+    if (bin_op == op_div) {
+        return "sycl.binbcast.div";
+    }
+    if (bin_op == op_repeat) {
+        return "sycl.binbcast.repeat";
+    }
+    return "sycl.binbcast.kernel";
+}
+
+enum class ggml_sycl_binbcast_kernel_variant {
+    UNRAVEL,
+    ND,
+};
+
+template <float (*bin_op)(const float, const float)>
+static const char * ggml_sycl_binbcast_kernel_profile_metadata(ggml_sycl_binbcast_kernel_variant variant) {
+    if (variant == ggml_sycl_binbcast_kernel_variant::UNRAVEL) {
+        if (bin_op == op_add) {
+            return "role=binbcast;mode=kernel;op=add;variant=unravel";
+        }
+        if (bin_op == op_mul) {
+            return "role=binbcast;mode=kernel;op=mul;variant=unravel";
+        }
+        if (bin_op == op_sub) {
+            return "role=binbcast;mode=kernel;op=sub;variant=unravel";
+        }
+        if (bin_op == op_div) {
+            return "role=binbcast;mode=kernel;op=div;variant=unravel";
+        }
+        if (bin_op == op_repeat) {
+            return "role=binbcast;mode=kernel;op=repeat;variant=unravel";
+        }
+        return "role=binbcast;mode=kernel;op=kernel;variant=unravel";
+    }
+    if (bin_op == op_add) {
+        return "role=binbcast;mode=kernel;op=add;variant=nd";
+    }
+    if (bin_op == op_mul) {
+        return "role=binbcast;mode=kernel;op=mul;variant=nd";
+    }
+    if (bin_op == op_sub) {
+        return "role=binbcast;mode=kernel;op=sub;variant=nd";
+    }
+    if (bin_op == op_div) {
+        return "role=binbcast;mode=kernel;op=div;variant=nd";
+    }
+    if (bin_op == op_repeat) {
+        return "role=binbcast;mode=kernel;op=repeat;variant=nd";
+    }
+    return "role=binbcast;mode=kernel;op=kernel;variant=nd";
+}
+
 template <typename SubmitFn>
 static sycl::event ggml_sycl_submit_binbcast_kernel(sycl::queue & q,
                                                     const char *  name,
@@ -140,7 +203,7 @@ static sycl::event ggml_sycl_submit_binbcast_kernel(sycl::queue & q,
     label.category   = "binbcast";
     label.queue_kind = "compute";
     label.metadata   = metadata;
-    label.device     = ggml_sycl_get_device_id_from_queue(q);
+    label.device     = ggml_sycl_kernel_profile_enabled() ? ggml_sycl_get_device_id_from_queue(q) : -1;
     label.bytes      = 0;
 
     return ggml_sycl_profile_submit(q, label, static_cast<SubmitFn &&>(submit_fn), file, line, function);
@@ -535,7 +598,9 @@ template <float (*bin_op)(const float, const float)> struct bin_bcast_sycl {
                     dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
 
                     ggml_sycl_submit_binbcast_kernel(
-                        *stream, "sycl.binbcast.kernel", "role=binbcast;mode=kernel;variant=unravel",
+                        *stream, ggml_sycl_binbcast_kernel_profile_name<bin_op>(),
+                        ggml_sycl_binbcast_kernel_profile_metadata<bin_op>(
+                            ggml_sycl_binbcast_kernel_variant::UNRAVEL),
                         [&](sycl::queue & profiled_queue) {
                             return profiled_queue.parallel_for(
                                 sycl::nd_range<3>(sycl::range<3>(1, 1, block_num) * sycl::range<3>(1, 1, block_size),
@@ -558,7 +623,8 @@ template <float (*bin_op)(const float, const float)> struct bin_bcast_sycl {
                 dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
 
                 ggml_sycl_submit_binbcast_kernel(
-                    *stream, "sycl.binbcast.kernel", "role=binbcast;mode=kernel;variant=nd",
+                    *stream, ggml_sycl_binbcast_kernel_profile_name<bin_op>(),
+                    ggml_sycl_binbcast_kernel_profile_metadata<bin_op>(ggml_sycl_binbcast_kernel_variant::ND),
                     [&](sycl::queue & profiled_queue) {
                         return profiled_queue.parallel_for(
                             sycl::nd_range<3>(block_nums * block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {

@@ -18,7 +18,7 @@ def binbcast_event_helper() -> str:
     return slice_between(
         src,
         "static sycl::event ggml_sycl_submit_binbcast_event",
-        "template <typename SubmitFn>",
+        "template <float (*bin_op)(const float, const float)>",
     )
 
 
@@ -100,6 +100,7 @@ def test_binbcast_kernel_submit_helper_is_named_and_forwards_callsite() -> None:
     assert 'label.category   = "binbcast"' in body
     assert 'label.queue_kind = "compute"' in body
     assert "ggml_sycl_profile_submit(q" in body
+    assert "ggml_sycl_kernel_profile_enabled() ? ggml_sycl_get_device_id_from_queue(q) : -1" in body
     assert "__builtin_FILE()" in body
     assert "__builtin_LINE()" in body
     assert "__builtin_FUNCTION()" in body
@@ -108,13 +109,17 @@ def test_binbcast_kernel_submit_helper_is_named_and_forwards_callsite() -> None:
 
 
 def test_generic_binbcast_parallel_for_submits_are_named_profiled_and_wait_free() -> None:
+    src = BINBCAST.read_text(encoding="utf-8")
     body = binbcast_kernel_launcher()
-    assert "sycl.binbcast.kernel" in body
-    assert "role=binbcast;mode=kernel" in body
-    assert "variant=unravel" in body
-    assert "variant=nd" in body
+    assert "ggml_sycl_binbcast_kernel_profile_name<bin_op>()" in body
+    assert "ggml_sycl_binbcast_kernel_profile_metadata<bin_op>" in body
+    assert "ggml_sycl_binbcast_kernel_variant::UNRAVEL" in body
+    assert "ggml_sycl_binbcast_kernel_variant::ND" in body
     assert body.count("ggml_sycl_submit_binbcast_kernel(\n") >= 2
-    assert body.count("*stream, \"sycl.binbcast.kernel\"") >= 2
+    assert "sycl.binbcast.add" in src
+    assert "sycl.binbcast.mul" in src
+    assert "role=binbcast;mode=kernel;op=add;variant=nd" in src
+    assert "role=binbcast;mode=kernel;op=mul;variant=nd" in src
     assert "profiled_queue.parallel_for" in body
     assert "stream->parallel_for(" not in body
     assert ".wait(" not in body
