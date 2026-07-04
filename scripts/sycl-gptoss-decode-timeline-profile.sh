@@ -100,6 +100,8 @@ bench_args=(
 )
 
 timeline_gaps_parse="${OUT_ROOT}/timeline.gaps.parse"
+cost_ranking_parse="${OUT_ROOT}/cost-ranking.parse"
+wall_ledger_parse="${OUT_ROOT}/wall-ledger.parse"
 
 print_cmd() {
     printf 'env'
@@ -120,6 +122,8 @@ if [[ "${EXECUTE}" -ne 1 ]]; then
     printf 'python3 %q %q >%q\n' "scripts/parse-sycl-timeline.py" "${OUT_ROOT}/sycl-timeline.json" "${OUT_ROOT}/timeline.parse"
     printf 'python3 %q --top-gaps 20 --top-host-gap-overlaps 40 %q >%q\n' "scripts/parse-sycl-timeline.py" "${OUT_ROOT}/sycl-timeline.json" "${timeline_gaps_parse}"
     printf 'python3 %q %q >%q\n' "scripts/parse-sycl-kernel-profile.py" "${OUT_ROOT}/sycl-kernels.csv" "${OUT_ROOT}/kernels.parse"
+    printf 'python3 %q --top-kernels 30 %q >%q\n' "scripts/parse-sycl-kernel-profile.py" "${OUT_ROOT}/sycl-kernels.csv" "${cost_ranking_parse}"
+    printf 'python3 %q %q %q >%q\n' "scripts/parse-sycl-profile-ledger.py" "${OUT_ROOT}/sycl-timeline.json" "${OUT_ROOT}/sycl-kernels.csv" "${wall_ledger_parse}"
     exit 0
 fi
 
@@ -133,4 +137,6 @@ python3 scripts/parse-sycl-timeline.py \
     --top-host-gap-overlaps 40 \
     "${OUT_ROOT}/sycl-timeline.json" >"${timeline_gaps_parse}"
 python3 scripts/parse-sycl-kernel-profile.py "${OUT_ROOT}/sycl-kernels.csv" >"${OUT_ROOT}/kernels.parse"
+python3 scripts/parse-sycl-kernel-profile.py --top-kernels 30 "${OUT_ROOT}/sycl-kernels.csv" >"${OUT_ROOT}/cost-ranking.parse"
+python3 scripts/parse-sycl-profile-ledger.py "${OUT_ROOT}/sycl-timeline.json" "${OUT_ROOT}/sycl-kernels.csv" >"${OUT_ROOT}/wall-ledger.parse"
 printf 'Artifacts: %s\n' "${OUT_ROOT}"

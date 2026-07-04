@@ -50,10 +50,14 @@ REQUIRED_DRY_RUN_STRINGS = [
     "timeline.parse",
     "timeline.gaps.parse",
     "kernels.parse",
+    "cost-ranking.parse",
+    "wall-ledger.parse",
     "scripts/parse-sycl-timeline.py",
     "scripts/parse-sycl-kernel-profile.py",
+    "scripts/parse-sycl-profile-ledger.py",
     "--top-gaps 20",
     "--top-host-gap-overlaps 40",
+    "--top-kernels 30",
 ]
 
 
@@ -67,6 +71,8 @@ EXECUTE_BRANCH_STRINGS = [
     "--top-host-gap-overlaps 40 \\",
     "\"${OUT_ROOT}/sycl-timeline.json\" >\"${timeline_gaps_parse}\"",
     "python3 scripts/parse-sycl-kernel-profile.py \"${OUT_ROOT}/sycl-kernels.csv\" >\"${OUT_ROOT}/kernels.parse\"",
+    "python3 scripts/parse-sycl-kernel-profile.py --top-kernels 30 \"${OUT_ROOT}/sycl-kernels.csv\" >\"${OUT_ROOT}/cost-ranking.parse\"",
+    "python3 scripts/parse-sycl-profile-ledger.py \"${OUT_ROOT}/sycl-timeline.json\" \"${OUT_ROOT}/sycl-kernels.csv\" >\"${OUT_ROOT}/wall-ledger.parse\"",
     "printf 'Artifacts: %s\\n' \"${OUT_ROOT}\"",
 ]
 
