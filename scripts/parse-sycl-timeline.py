@@ -12,6 +12,21 @@ from collections import Counter, defaultdict
 from typing import Any
 
 
+GAP_CLASS_NAMES = ("host_overlap", "queue_serialization", "runtime_idle")
+HOST_OVERLAP_MIN_FRACTION = 0.5
+QUEUE_SERIALIZATION_EPSILON_NS = 1000.0
+DEPENDENCY_FIELD_NAMES = (
+    "depends_on",
+    "depends_on_event_id",
+    "depends_on_event_ids",
+    "dependency_event_id",
+    "dependency_event_ids",
+    "dep_event_id",
+    "dep_event_ids",
+    "deps",
+)
+
+
 def parse_wall_ms(raw: str) -> float:
     try:
         value = float(raw)
@@ -99,6 +114,47 @@ def arg_or_metadata_field(event: dict[str, Any], name: str) -> Any:
     return metadata_arg_fields(event).get(name)
 
 
+def metric_identifier(raw: Any) -> str | None:
+    if raw in (None, "") or isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return str(raw)
+    if isinstance(raw, float):
+        if not math.isfinite(raw):
+            return None
+        return str(int(raw)) if raw.is_integer() else str(raw)
+    return str(raw)
+
+
+def string_arg_field(event: dict[str, Any], name: str) -> str | None:
+    return metric_identifier(arg_or_metadata_field(event, name))
+
+
+def event_id(event: dict[str, Any]) -> str | None:
+    return string_arg_field(event, "event_id")
+
+
+def event_dependency_ids(event: dict[str, Any]) -> set[str]:
+    dependencies: set[str] = set()
+    for name in DEPENDENCY_FIELD_NAMES:
+        raw = arg_or_metadata_field(event, name)
+        if raw in (None, "") or isinstance(raw, bool):
+            continue
+        if isinstance(raw, list):
+            for item in raw:
+                item_id = metric_identifier(item)
+                if item_id is not None:
+                    dependencies.add(item_id)
+            continue
+        raw_id = metric_identifier(raw)
+        if raw_id is None:
+            continue
+        for token in raw_id.replace(",", " ").replace("|", " ").replace("[", " ").replace("]", " ").split():
+            if token:
+                dependencies.add(token)
+    return dependencies
+
+
 def numeric_arg_field(event: dict[str, Any], name: str) -> float:
     raw = arg_or_metadata_field(event, name)
     if isinstance(raw, bool):
@@ -160,6 +216,186 @@ def sanitize_metric_token(value: str) -> str:
         else:
             result.append("_")
     return "".join(result) if result else "unknown"
+
+
+def event_metadata_op(event: dict[str, Any]) -> str:
+    return sanitize_metric_token(metadata_arg_fields(event).get("op") or "unknown_op")
+
+
+def collect_submit_spans(
+    events: list[dict[str, Any]],
+) -> tuple[
+    list[tuple[float, float, str, dict[str, Any], str | None]],
+    dict[str, tuple[float, float, str, dict[str, Any], str | None]],
+]:
+    submits: list[tuple[float, float, str, dict[str, Any], str | None]] = []
+    submits_by_event_id: dict[str, tuple[float, float, str, dict[str, Any], str | None]] = {}
+    for event in events:
+        if event.get("ph") != "X" or str(event.get("cat", "unknown")) != "sycl.submit":
+            continue
+        ts = numeric_field(event, "ts")
+        dur = numeric_field(event, "dur")
+        submit_event_id = event_id(event)
+        submit = (ts, ts + dur, sanitize_metric_token(str(event.get("name", "unknown"))), event, submit_event_id)
+        submits.append(submit)
+        if submit_event_id is not None:
+            submits_by_event_id.setdefault(submit_event_id, submit)
+    submits.sort(key=lambda item: (item[0], item[1], item[2]))
+    return submits, submits_by_event_id
+
+
+def collect_host_nodes(events: list[dict[str, Any]]) -> list[tuple[float, float, str]]:
+    nodes: list[tuple[float, float, str]] = []
+    for event in events:
+        if (
+            event.get("ph") != "X"
+            or str(event.get("cat", "unknown")) != "ggml.op"
+            or str(event.get("name", "unknown")) != "compute_forward_node"
+        ):
+            continue
+        ts = numeric_field(event, "ts")
+        dur = numeric_field(event, "dur")
+        nodes.append((ts, ts + dur, event_metadata_op(event)))
+    nodes.sort(key=lambda item: (item[0], item[1], item[2]))
+    return nodes
+
+
+def host_node_overlaps_by_op(nodes: list[tuple[float, float, str]], start_us: float, end_us: float) -> Counter[str]:
+    totals: Counter[str] = Counter()
+    if end_us <= start_us:
+        return totals
+    for node_start, node_end, op in nodes:
+        if node_end <= start_us:
+            continue
+        if node_start >= end_us:
+            break
+        overlap = max(0.0, min(node_end, end_us) - max(node_start, start_us))
+        overlap_total = us_to_ms_x1000(overlap)
+        if overlap_total > 0:
+            totals[op] += overlap_total
+    return totals
+
+
+def max_host_node_overlap_us(nodes: list[tuple[float, float, str]], start_us: float, end_us: float) -> float:
+    max_overlap = 0.0
+    if end_us <= start_us:
+        return max_overlap
+    for node_start, node_end, _ in nodes:
+        if node_end <= start_us:
+            continue
+        if node_start >= end_us:
+            break
+        max_overlap = max(max_overlap, min(node_end, end_us) - max(node_start, start_us))
+    return max_overlap
+
+
+def summarize_host_gap_overlaps(events: list[dict[str, Any]]) -> Counter[tuple[str, str, str]]:
+    submits, _ = collect_submit_spans(events)
+    nodes = collect_host_nodes(events)
+    totals: Counter[tuple[str, str, str]] = Counter()
+    for (_, previous_end, previous_name, _, _), (next_start, _, next_name, _, _) in zip(submits, submits[1:]):
+        if next_start <= previous_end:
+            continue
+        for op, total in host_node_overlaps_by_op(nodes, previous_end, next_start).items():
+            totals[(previous_name, next_name, op)] += total
+    return totals
+
+
+def submit_span_for_event(
+    event: dict[str, Any],
+    submits_by_event_id: dict[str, tuple[float, float, str, dict[str, Any], str | None]],
+) -> tuple[float, float, str, dict[str, Any], str | None] | None:
+    current_event_id = event_id(event)
+    if current_event_id is not None and current_event_id in submits_by_event_id:
+        return submits_by_event_id[current_event_id]
+
+    begin_raw = arg_or_metadata_field(event, "host_submit_begin_us")
+    end_raw = arg_or_metadata_field(event, "host_submit_end_us")
+    if begin_raw in (None, "") or end_raw in (None, ""):
+        return None
+    begin_us = numeric_arg_field(event, "host_submit_begin_us")
+    end_us = numeric_arg_field(event, "host_submit_end_us")
+    if end_us < begin_us:
+        return None
+    return (begin_us, end_us, sanitize_metric_token(str(event.get("name", "unknown"))), event, current_event_id)
+
+
+def device_gap_has_host_overlap(
+    previous_event: dict[str, Any],
+    next_event: dict[str, Any],
+    gap_ns: float,
+    submits_by_event_id: dict[str, tuple[float, float, str, dict[str, Any], str | None]],
+    nodes: list[tuple[float, float, str]],
+) -> bool:
+    previous_submit = submit_span_for_event(previous_event, submits_by_event_id)
+    next_submit = submit_span_for_event(next_event, submits_by_event_id)
+    if previous_submit is None or next_submit is None:
+        return False
+    previous_end_us = previous_submit[1]
+    next_start_us = next_submit[0]
+    if next_start_us <= previous_end_us:
+        return False
+    required_overlap_us = (gap_ns / 1000.0) * HOST_OVERLAP_MIN_FRACTION
+    return max_host_node_overlap_us(nodes, previous_end_us, next_start_us) >= required_overlap_us
+
+
+def device_gap_has_dependency(
+    previous_event: dict[str, Any],
+    next_event: dict[str, Any],
+    submits_by_event_id: dict[str, tuple[float, float, str, dict[str, Any], str | None]],
+) -> bool:
+    previous_event_id = event_id(previous_event)
+    if previous_event_id is None:
+        return False
+    if previous_event_id == event_id(next_event):
+        return True
+    dependency_ids = event_dependency_ids(next_event)
+    next_submit = submit_span_for_event(next_event, submits_by_event_id)
+    if next_submit is not None:
+        dependency_ids.update(event_dependency_ids(next_submit[3]))
+    return previous_event_id in dependency_ids
+
+
+def summarize_queue_gap_classes(events: list[dict[str, Any]]) -> dict[tuple[str, str], Counter[str]]:
+    _, submits_by_event_id = collect_submit_spans(events)
+    nodes = collect_host_nodes(events)
+    ranges_by_queue: dict[tuple[str, str], list[tuple[float, float, str, dict[str, Any]]]] = defaultdict(list)
+    for event in events:
+        if event.get("ph") != "X" or not is_sycl_event_category(str(event.get("cat", "unknown"))):
+            continue
+        event_range = device_range(event)
+        if event_range is None:
+            continue
+        device, queue_kind, start_ns, end_ns = event_range
+        ranges_by_queue[(device, queue_kind)].append((start_ns, end_ns, str(event.get("name", "unknown")), event))
+
+    result: dict[tuple[str, str], Counter[str]] = {}
+    for queue, ranges in ranges_by_queue.items():
+        totals: Counter[str] = Counter()
+        sorted_ranges = sorted(ranges, key=lambda item: (item[0], item[1], item[2]))
+        if not sorted_ranges:
+            result[queue] = totals
+            continue
+        previous_end = sorted_ranges[0][1]
+        previous_event = sorted_ranges[0][3]
+        for start_ns, end_ns, _, event in sorted_ranges[1:]:
+            if start_ns > previous_end:
+                gap_ns = start_ns - previous_end
+                gap_total = ns_to_ms_x1000(gap_ns)
+                if device_gap_has_host_overlap(previous_event, event, gap_ns, submits_by_event_id, nodes):
+                    gap_class = "host_overlap"
+                elif gap_ns <= QUEUE_SERIALIZATION_EPSILON_NS or device_gap_has_dependency(
+                    previous_event, event, submits_by_event_id
+                ):
+                    gap_class = "queue_serialization"
+                else:
+                    gap_class = "runtime_idle"
+                totals[gap_class] += gap_total
+            if end_ns >= previous_end:
+                previous_end = end_ns
+                previous_event = event
+        result[queue] = totals
+    return result
 
 
 def summarize_queue_gap_transitions(
@@ -265,18 +501,30 @@ def main(argv: list[str]) -> int:
         default=0,
         help="number of per-queue event-transition gap totals to print; 0 disables",
     )
+    parser.add_argument(
+        "--top-host-gap-overlaps",
+        type=int,
+        default=0,
+        help="number of submit-gap host op overlap totals to print; 0 disables",
+    )
     args = parser.parse_args(argv)
 
     if args.top_callsites < 0:
         parser.error("--top-callsites must be non-negative")
     if args.top_gaps < 0:
         parser.error("--top-gaps must be non-negative")
+    if args.top_host_gap_overlaps < 0:
+        parser.error("--top-host-gap-overlaps must be non-negative")
 
     try:
         events = load_trace_events(args.trace)
         category_totals, callsite_totals, envelope_wall_us, gpu_event_total, queue_gaps, queue_gap_transitions = summarize_events(
             events
         )
+        queue_gap_classes = summarize_queue_gap_classes(events)
+        host_gap_overlaps: Counter[tuple[str, str, str]] = Counter()
+        if args.top_host_gap_overlaps > 0:
+            host_gap_overlaps = summarize_host_gap_overlaps(events)
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         print(f"failed to parse timeline: {exc}")
         return 2
@@ -294,6 +542,16 @@ def main(argv: list[str]) -> int:
     for (device, queue_kind), (gap_count, gap_total) in sorted(queue_gaps.items()):
         print(f"gap.device{device}.{queue_kind}.count {gap_count}")
         print(f"gap.device{device}.{queue_kind}.total_ms_x1000 {gap_total}")
+        gap_classes = queue_gap_classes.get((device, queue_kind), Counter())
+        gap_class_totals = {gap_class: gap_classes[gap_class] for gap_class in GAP_CLASS_NAMES}
+        rounding_delta = gap_total - sum(gap_class_totals.values())
+        if rounding_delta != 0:
+            adjustment_class = "runtime_idle"
+            if gap_class_totals[adjustment_class] + rounding_delta < 0:
+                adjustment_class = max(GAP_CLASS_NAMES, key=lambda gap_class: gap_class_totals[gap_class])
+            gap_class_totals[adjustment_class] += rounding_delta
+        for gap_class in GAP_CLASS_NAMES:
+            print(f"gap_class.device{device}.{queue_kind}.{gap_class}.total_ms_x1000 {gap_class_totals[gap_class]}")
 
     if args.top_gaps > 0:
         for (device, queue_kind), transitions in sorted(queue_gap_transitions.items()):
@@ -314,6 +572,11 @@ def main(argv: list[str]) -> int:
         sorted_callsites = sorted_callsites[: args.top_callsites]
     for callsite, total in sorted_callsites:
         print(f"callsite.{callsite}.host_ms_x1000 {total}")
+
+    if args.top_host_gap_overlaps > 0:
+        rows = sorted(host_gap_overlaps.items(), key=lambda item: (-item[1], item[0]))[: args.top_host_gap_overlaps]
+        for (previous_name, next_name, op), total in rows:
+            print(f"host_gap_overlap.{previous_name}--to--{next_name}.{op}.host_ms_x1000 {total}")
 
     return 0
 

@@ -77,6 +77,16 @@ def test_top_gaps_negative_is_rejected(tmp_path: pathlib.Path) -> None:
     assert "Traceback" not in result.stdout
 
 
+def test_top_host_gap_overlaps_negative_is_rejected(tmp_path: pathlib.Path) -> None:
+    path = write_trace(tmp_path, '{"traceEvents": []}')
+
+    result = run_parser(path, "--top-host-gap-overlaps", "-1")
+
+    assert result.returncode == 2
+    assert "--top-host-gap-overlaps must be non-negative" in result.stdout
+    assert "Traceback" not in result.stdout
+
+
 def test_parser_reads_device_ranges_from_timeline_metadata(tmp_path: pathlib.Path) -> None:
     trace = {
         "traceEvents": [
@@ -185,6 +195,168 @@ def test_parser_reports_top_gap_transitions(tmp_path: pathlib.Path) -> None:
         "gap_transition.device0.compute.b.kernel--to--a.kernel.count"
     )
     assert "gap_transition.device1.copy" not in result.stdout
+
+
+def test_parser_reports_host_gap_node_overlaps(tmp_path: pathlib.Path) -> None:
+    trace = {
+        "traceEvents": [
+            {
+                "name": "first.kernel",
+                "cat": "sycl.submit",
+                "ph": "X",
+                "ts": 1000,
+                "dur": 100,
+                "args": {"file": "a.cpp", "line": 1, "function": "first", "metadata": "event_id=1"},
+            },
+            {
+                "name": "compute_forward_node",
+                "cat": "ggml.op",
+                "ph": "X",
+                "ts": 1200,
+                "dur": 300,
+                "args": {"metadata": "device=0;op=ADD_ID;tensor=x;node_idx=7;nodes=9"},
+            },
+            {
+                "name": "compute_forward_node",
+                "cat": "ggml.op",
+                "ph": "X",
+                "ts": 1400,
+                "dur": 500,
+                "args": {"metadata": "device=0;op=ROPE;tensor=y;node_idx=8;nodes=9"},
+            },
+            {
+                "name": "compute_forward_node",
+                "cat": "ggml.op",
+                "ph": "X",
+                "ts": 2200,
+                "dur": 100,
+                "args": {"metadata": "device=0;op=NO_OVERLAP;tensor=z;node_idx=9;nodes=9"},
+            },
+            {
+                "name": "second.kernel",
+                "cat": "sycl.submit",
+                "ph": "X",
+                "ts": 2000,
+                "dur": 100,
+                "args": {"file": "b.cpp", "line": 2, "function": "second", "metadata": "event_id=2"},
+            },
+        ]
+    }
+    path = tmp_path / "host-overlap-timeline.json"
+    path.write_text(json.dumps(trace), encoding="utf-8")
+
+    result = run_parser(path, "--wall-ms", "2", "--top-host-gap-overlaps", "10")
+
+    assert result.returncode == 0, result.stdout
+    rope_line = "host_gap_overlap.first.kernel--to--second.kernel.ROPE.host_ms_x1000 500"
+    add_line = "host_gap_overlap.first.kernel--to--second.kernel.ADD_ID.host_ms_x1000 300"
+    assert rope_line in result.stdout
+    assert add_line in result.stdout
+    assert result.stdout.index(rope_line) < result.stdout.index(add_line)
+    assert "NO_OVERLAP" not in result.stdout
+
+
+def test_parser_reports_gap_classification_buckets(tmp_path: pathlib.Path) -> None:
+    trace = {
+        "traceEvents": [
+            {
+                "name": "prev.host",
+                "cat": "sycl.submit",
+                "ph": "X",
+                "ts": 1000,
+                "dur": 100,
+                "args": {"metadata": "event_id=1"},
+            },
+            {
+                "name": "next.host",
+                "cat": "sycl.submit",
+                "ph": "X",
+                "ts": 1120,
+                "dur": 10,
+                "args": {"metadata": "event_id=2"},
+            },
+            {
+                "name": "next.serial",
+                "cat": "sycl.submit",
+                "ph": "X",
+                "ts": 1200,
+                "dur": 10,
+                "args": {"metadata": "event_id=3;depends_on=2"},
+            },
+            {
+                "name": "next.idle",
+                "cat": "sycl.submit",
+                "ph": "X",
+                "ts": 1300,
+                "dur": 10,
+                "args": {"metadata": "event_id=4"},
+            },
+            {
+                "name": "compute_forward_node",
+                "cat": "ggml.op",
+                "ph": "X",
+                "ts": 1100,
+                "dur": 10,
+                "args": {"metadata": "device=0;op=MUL_MAT_ID;tensor=x;node_idx=1;nodes=4"},
+            },
+            {
+                "name": "prev.host",
+                "cat": "sycl.event",
+                "ph": "X",
+                "ts": 0,
+                "dur": 1,
+                "args": {
+                    "metadata": "event_id=1;device=0;queue_kind=compute;device_start_ns=0;device_end_ns=1000",
+                },
+            },
+            {
+                "name": "next.host",
+                "cat": "sycl.event",
+                "ph": "X",
+                "ts": 0,
+                "dur": 1,
+                "args": {
+                    "metadata": "event_id=2;device=0;queue_kind=compute;device_start_ns=11000;device_end_ns=12000",
+                },
+            },
+            {
+                "name": "next.serial",
+                "cat": "sycl.event",
+                "ph": "X",
+                "ts": 0,
+                "dur": 1,
+                "args": {
+                    "metadata": "event_id=3;depends_on=2;device=0;queue_kind=compute;device_start_ns=33000;device_end_ns=34000",
+                },
+            },
+            {
+                "name": "next.idle",
+                "cat": "sycl.event",
+                "ph": "X",
+                "ts": 0,
+                "dur": 1,
+                "args": {
+                    "metadata": "event_id=4;device=0;queue_kind=compute;device_start_ns=74000;device_end_ns=75000",
+                },
+            },
+        ]
+    }
+    path = tmp_path / "gap-class-timeline.json"
+    path.write_text(json.dumps(trace), encoding="utf-8")
+
+    result = run_parser(path, "--wall-ms", "1")
+
+    assert result.returncode == 0, result.stdout
+    assert "gap.device0.compute.total_ms_x1000 71" in result.stdout
+    assert "gap_class.device0.compute.host_overlap.total_ms_x1000 10" in result.stdout
+    assert "gap_class.device0.compute.queue_serialization.total_ms_x1000 21" in result.stdout
+    assert "gap_class.device0.compute.runtime_idle.total_ms_x1000 40" in result.stdout
+
+    metrics = dict(line.rsplit(" ", 1) for line in result.stdout.splitlines() if " " in line)
+    assert sum(
+        int(metrics[f"gap_class.device0.compute.{gap_class}.total_ms_x1000"])
+        for gap_class in ("host_overlap", "queue_serialization", "runtime_idle")
+    ) == int(metrics["gap.device0.compute.total_ms_x1000"])
 
 
 def test_parser_summarizes_wall_categories_and_callsites() -> None:
