@@ -67,3 +67,29 @@ def test_ablation_delta_parser_rejects_missing_route_without_traceback() -> None
         assert "failed to parse ablation deltas" in result.stdout
         assert "route not found: prepack" in result.stdout
         assert "Traceback" not in result.stdout
+
+
+def test_ablation_delta_parser_rejects_non_finite_saving_without_traceback() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        micro = pathlib.Path(tmp_raw) / "micro.jsonl"
+        micro.write_text(json.dumps(record("prepack", float("nan"))) + "\n", encoding="utf-8")
+        result = subprocess.run([sys.executable, str(PARSER), "--microbench-jsonl", str(micro), "--kernel", "mxfp4.gateup.xmx_tiled_dpas_m2", "--route", "prepack"], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+        assert result.returncode == 2
+        assert "failed to parse ablation deltas" in result.stdout
+        assert "non-standard JSON constant" in result.stdout
+        assert "Traceback" not in result.stdout
+
+
+def test_ablation_delta_parser_rejects_nonzero_fatal_without_traceback() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        micro = pathlib.Path(tmp_raw) / "micro.jsonl"
+        bad = record("prepack", 1.0)
+        fatal = bad["fatal"]
+        assert isinstance(fatal, dict)
+        fatal["total"] = 1
+        micro.write_text(json.dumps(bad) + "\n", encoding="utf-8")
+        result = subprocess.run([sys.executable, str(PARSER), "--microbench-jsonl", str(micro), "--kernel", "mxfp4.gateup.xmx_tiled_dpas_m2", "--route", "prepack"], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+        assert result.returncode == 2
+        assert "failed to parse ablation deltas" in result.stdout
+        assert "fatal.total is non-zero" in result.stdout
+        assert "Traceback" not in result.stdout
