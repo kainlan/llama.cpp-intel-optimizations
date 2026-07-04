@@ -24,3 +24,11 @@ def test_source_line_probe_is_single_cu_with_named_hot_line() -> None:
     assert "--iterations" in main
     assert "--size" in main
     assert "--json" in main
+
+
+def test_source_line_probe_rejects_signed_or_whitespace_numeric_args_in_source() -> None:
+    main = PROBE_MAIN.read_text(encoding="utf-8")
+    assert "static bool is_ascii_digit_string" in main
+    assert "std::isdigit(static_cast<unsigned char>(ch))" in main
+    assert "if (!is_ascii_digit_string(text))" in main
+    assert "std::stoull" in main

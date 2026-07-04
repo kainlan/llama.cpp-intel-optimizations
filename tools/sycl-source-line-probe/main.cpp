@@ -1,5 +1,4 @@
-#include <sycl/sycl.hpp>
-
+#include <cctype>
 #include <cstddef>
 #include <cstdlib>
 #include <fstream>
@@ -8,11 +7,12 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <sycl/sycl.hpp>
 #include <vector>
 
 struct probe_config {
-    int iterations = 100;
-    std::size_t size = 1 << 20;
+    int         iterations = 100;
+    std::size_t size       = 1 << 20;
     std::string json_path;
 };
 
@@ -20,9 +20,25 @@ static void print_usage(const char * argv0) {
     std::cerr << "usage: " << argv0 << " [--iterations N] [--size N] [--json PATH]\n";
 }
 
+static bool is_ascii_digit_string(const std::string & text) {
+    if (text.empty()) {
+        return false;
+    }
+    for (const char ch : text) {
+        if (std::isdigit(static_cast<unsigned char>(ch)) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static std::size_t parse_size_value(const std::string & text, const char * name) {
+    if (!is_ascii_digit_string(text)) {
+        throw std::invalid_argument(std::string(name) + " must be a positive integer");
+    }
+
     std::size_t parsed = 0;
-    std::size_t pos = 0;
+    std::size_t pos    = 0;
 
     try {
         parsed = static_cast<std::size_t>(std::stoull(text, &pos, 10));
@@ -80,7 +96,7 @@ static probe_config parse_args(int argc, char ** argv) {
 }
 
 static void write_json(const probe_config & config, double checksum) {
-    std::ofstream file;
+    std::ofstream  file;
     std::ostream * out = &std::cout;
 
     if (!config.json_path.empty()) {
@@ -117,7 +133,7 @@ int main(int argc, char ** argv) {
             input[i] = static_cast<float>((i % 251) + 1) * 0.001f;
         }
 
-        sycl::queue queue;
+        sycl::queue          queue;
         const sycl::range<1> range(config.size);
 
         {
@@ -131,7 +147,7 @@ int main(int argc, char ** argv) {
 
                     cgh.parallel_for<class sycl_source_line_probe_kernel>(range, [=](sycl::id<1> idx) {
                         const std::size_t i = idx[0];
-                        out[i] = in[i] * 1.0009765625f + 0.25f;  // SOURCE_LINE_PROBE_HOT_LINE
+                        out[i]              = in[i] * 1.0009765625f + 0.25f;  // SOURCE_LINE_PROBE_HOT_LINE
                     });
                 });
             }
