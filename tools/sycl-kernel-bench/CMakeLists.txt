@@ -45,6 +45,15 @@ if (GGML_SYCL)
     target_link_options(${TARGET} PRIVATE "-fsycl" "-fsycl-device-code-split=per_kernel")
     target_compile_definitions(${TARGET} PRIVATE GGML_SYCL_WARP_SIZE=32)
 
+    if (GGML_SYCL_PROFILING_DEBUG)
+        target_compile_options(${TARGET} PRIVATE
+            "-g"
+            "-gline-tables-only"
+            "-fdebug-info-for-profiling"
+            "-fsycl-instrument-device-code")
+        target_link_options(${TARGET} PRIVATE "-fsycl-instrument-device-code")
+    endif()
+
     if (GGML_SYCL_TARGET STREQUAL "INTEL")
         find_package(DNNL REQUIRED)
         target_link_libraries(${TARGET} PRIVATE DNNL::dnnl)
