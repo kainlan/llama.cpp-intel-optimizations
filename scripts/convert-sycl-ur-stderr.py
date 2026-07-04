@@ -8,8 +8,8 @@ import pathlib
 import re
 import sys
 
-ENTER_RE = re.compile(r"^\s*--->\s+([A-Za-z_][A-Za-z0-9_]*)")
-EXIT_RE = re.compile(r"^\s*<---\s+([A-Za-z_][A-Za-z0-9_]*).*->\s*(UR_RESULT_[A-Z_]+);")
+ENTER_RE = re.compile(r"^\s*--->\s+(ur[A-Za-z0-9_]*)\b")
+EXIT_RE = re.compile(r"^\s*<---\s+(ur[A-Za-z0-9_]*)\s*\(.*\)\s*->\s*(UR_RESULT_[A-Z_]+);")
 
 
 class ConvertError(ValueError):

@@ -39,6 +39,22 @@ def test_converter_normalizes_real_ur_trace_lines_for_existing_parser() -> None:
         assert "ur.api.urEnqueueKernelLaunch.count 1" in parsed.stdout
 
 
+def test_converter_ignores_unrelated_arrow_debug_lines() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        raw = pathlib.Path(tmp_raw) / "bench.stderr"
+        raw.write_text(
+            "   ---> NonUrDebugLine\n"
+            "   <--- NonUrDebugLine(.x = 1) -> UR_RESULT_SUCCESS;\n",
+            encoding="utf-8",
+        )
+        result = run_converter(raw)
+        assert result.returncode == 2
+        assert "failed to convert UR stderr" in result.stdout
+        assert "no UR API rows found" in result.stdout
+        assert "NonUrDebugLine" not in result.stdout
+        assert "Traceback" not in result.stdout
+
+
 def test_converter_rejects_files_without_ur_rows_without_traceback() -> None:
     with tempfile.TemporaryDirectory() as tmp_raw:
         raw = pathlib.Path(tmp_raw) / "bench.stderr"
