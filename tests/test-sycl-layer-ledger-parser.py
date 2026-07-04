@@ -25,7 +25,7 @@ def write_inputs(tmp: pathlib.Path) -> dict[str, pathlib.Path]:
     kernels = tmp / "kernels.csv"
     kernels.write_text("name,category,metadata,device,queue_kind,count,total_ns,mean_ns,min_ns,p50_ns,p95_ns,max_ns,bytes,failed_timestamps,graph_recorded\nmxfp4.gateup,mmvq,,0,compute,1,300000,300000,300000,300000,300000,300000,0,0,0\n", encoding="utf-8")
     l0 = tmp / "l0.parse"
-    l0.write_text("l0.total_ms_x1000 80\nl0.bucket.queue_submit.ms_x1000 70\n", encoding="utf-8")
+    l0.write_text("l0.total_ms_x1000    80\nl0.bucket.queue_submit.ms_x1000 70\n", encoding="utf-8")
     ur = tmp / "ur.parse"
     ur.write_text("ur.total_ms_x1000 50\nur.bucket.enqueue.ms_x1000 45\n", encoding="utf-8")
     vtune = tmp / "vtune.parse"
@@ -37,7 +37,7 @@ def write_inputs(tmp: pathlib.Path) -> dict[str, pathlib.Path]:
         encoding="utf-8",
     )
     stderr = tmp / "bench.stderr"
-    stderr.write_text("[SYCL-E2E-TG-STAGE] stage=moe calls=72 host=200.000 ms device=0.000 ms bytes=0 last_path=MUL_MAT_ID\n", encoding="utf-8")
+    stderr.write_text("[SYCL-E2E-TG-STAGE] stage=moe calls=72 host=0.200 ms device=0.000 ms bytes=0 last_path=MUL_MAT_ID\n", encoding="utf-8")
     return {"timeline": timeline, "kernels": kernels, "l0": l0, "ur": ur, "vtune": vtune, "stderr": stderr}
 
 

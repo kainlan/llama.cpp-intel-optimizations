@@ -35,9 +35,10 @@ def read_parse_file(path: pathlib.Path) -> dict[str, int | str]:
         stripped = line.strip()
         if not stripped:
             continue
-        key, separator, value = stripped.partition(" ")
-        if not separator or not key or not value:
+        fields = stripped.split(maxsplit=1)
+        if len(fields) != 2:
             raise ValueError(f"{path}:{line_number}: expected key value row")
+        key, value = fields[0], fields[1].strip()
         result[key] = int(value) if INTEGER_RE.fullmatch(value) else value
     return result
 
@@ -51,7 +52,7 @@ def parse_e2e_stderr(path: pathlib.Path) -> int:
         if match is None:
             raise ValueError(f"{path}:{line_number}: malformed SYCL-E2E-TG-STAGE row")
         total += float(match.group(1))
-    return int(round(total))
+    return int(round(total * 1000.0))
 
 
 def int_metric(summary: dict[str, int | str], key: str, path: pathlib.Path) -> int:
