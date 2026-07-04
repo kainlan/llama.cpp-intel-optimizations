@@ -1,3 +1,4 @@
+#include "sycl-itt.hpp"
 #include "sycl-timeline.hpp"
 
 #include <unistd.h>
@@ -222,6 +223,28 @@ int main() {
             "captured in-window event span must record after current step advances");
     require(!contains(delayed_json, "\"name\":\"delayed-out-of-window\""),
             "captured out-of-window event span must stay filtered");
+
+    setenv("GGML_SYCL_VTUNE_ITT", "1", 1);
+    sycl_itt_reset_for_tests();
+    sycl_timeline_reset_for_tests();
+    sycl_timeline_set_config_for_tests(cfg);
+    sycl_timeline_begin_decode_step_for_tests(3);
+    {
+        GGML_SYCL_TIMELINE_SCOPE("unit", "itt-enabled-span", "case=itt");
+    }
+    require(sycl_itt_begin_count_for_tests() == 1, "ITT enabled span must record one begin");
+    require(sycl_itt_end_count_for_tests() == 1, "ITT enabled span must record one end");
+
+    unsetenv("GGML_SYCL_VTUNE_ITT");
+    sycl_itt_reset_for_tests();
+    sycl_timeline_reset_for_tests();
+    sycl_timeline_set_config_for_tests(cfg);
+    sycl_timeline_begin_decode_step_for_tests(3);
+    {
+        GGML_SYCL_TIMELINE_SCOPE("unit", "itt-disabled-span", "case=itt-disabled");
+    }
+    require(sycl_itt_begin_count_for_tests() == 0, "disabled ITT env must not record begin");
+    require(sycl_itt_end_count_for_tests() == 0, "disabled ITT env must not record end");
 
     sycl_timeline_reset_for_tests();
 

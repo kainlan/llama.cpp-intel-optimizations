@@ -1236,6 +1236,7 @@ set_tests_properties(test-sycl-e2e-profile PROPERTIES
 add_executable(test-sycl-timeline
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-timeline.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sycl-timeline.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/sycl-itt.cpp
 )
 target_include_directories(test-sycl-timeline PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}

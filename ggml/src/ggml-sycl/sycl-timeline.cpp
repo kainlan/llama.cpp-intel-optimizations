@@ -1,5 +1,7 @@
 #include "sycl-timeline.hpp"
 
+#include "sycl-itt.hpp"
+
 #include <cctype>
 #include <cerrno>
 #include <climits>
@@ -373,9 +375,10 @@ sycl_timeline_scope::sycl_timeline_scope(const char *           category,
         return;
     }
 
-    start_time_         = std::chrono::steady_clock::now();
-    category_           = string_or_empty(category);
-    name_               = string_or_empty(name);
+    start_time_ = std::chrono::steady_clock::now();
+    category_   = string_or_empty(category);
+    name_       = string_or_empty(name);
+    sycl_itt_task_begin(category_.c_str(), name_.c_str());
     metadata_           = string_or_empty(metadata);
     callsite_           = callsite;
     graph_compute_step_ = sycl_timeline_current_graph_compute_step();
@@ -391,6 +394,7 @@ sycl_timeline_scope::~sycl_timeline_scope() {
                                            std::chrono::steady_clock::now(), graph_compute_step_);
     } catch (...) {
     }
+    sycl_itt_task_end();
 }
 
 void sycl_timeline_record_span(const char *                          category,
