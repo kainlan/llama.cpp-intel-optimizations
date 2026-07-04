@@ -34,6 +34,23 @@ def test_checker_passes_with_debug_line_and_non_unknown_source_rows() -> None:
         assert "source_line.status pass" in result.stdout
 
 
+def test_checker_accepts_comma_separated_vtune_csv() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        sections = tmp / "sections.txt"
+        csv = tmp / "source.csv"
+        sections.write_text("[12] .debug_line PROGBITS\n", encoding="utf-8")
+        csv.write_text(
+            "Source Line,Source Computing Task\n"
+            "mmvq.cpp:123,mxfp4_pair_glu_xmx_tiled_packed_r8_m2\n",
+            encoding="utf-8",
+        )
+        result = run_checker(sections, csv, "--require-kernel", "mxfp4_pair_glu_xmx_tiled")
+        assert result.returncode == 0, result.stdout
+        assert "source_line.non_unknown_rows 1" in result.stdout
+        assert "source_line.status pass" in result.stdout
+
+
 def test_checker_fails_when_source_rows_are_unknown() -> None:
     with tempfile.TemporaryDirectory() as tmp_raw:
         tmp = pathlib.Path(tmp_raw)
