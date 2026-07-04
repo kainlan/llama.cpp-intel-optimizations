@@ -17,6 +17,10 @@ REQUIRED_DOC_STRINGS = [
     "host-side file:line",
     "VTune GPU source-line",
     "workers must not run",
+    "timeline.gaps.parse",
+    "gap_transition.",
+    "host_gap_overlap.",
+    "not by itself proof of GPU idle",
 ]
 
 REQUIRED_DRY_RUN_STRINGS = [
@@ -44,9 +48,12 @@ REQUIRED_DRY_RUN_STRINGS = [
     "bench.stdout",
     "bench.stderr",
     "timeline.parse",
+    "timeline.gaps.parse",
     "kernels.parse",
     "scripts/parse-sycl-timeline.py",
     "scripts/parse-sycl-kernel-profile.py",
+    "--top-gaps 20",
+    "--top-host-gap-overlaps 40",
 ]
 
 
@@ -55,6 +62,10 @@ EXECUTE_BRANCH_STRINGS = [
     "print_cmd >\"${OUT_ROOT}/command.txt\"",
     "env \"${env_args[@]}\" \"${bench_args[@]}\" >\"${OUT_ROOT}/bench.stdout\" 2>\"${OUT_ROOT}/bench.stderr\"",
     "python3 scripts/parse-sycl-timeline.py \"${OUT_ROOT}/sycl-timeline.json\" >\"${OUT_ROOT}/timeline.parse\"",
+    "python3 scripts/parse-sycl-timeline.py \\",
+    "--top-gaps 20 \\",
+    "--top-host-gap-overlaps 40 \\",
+    "\"${OUT_ROOT}/sycl-timeline.json\" >\"${timeline_gaps_parse}\"",
     "python3 scripts/parse-sycl-kernel-profile.py \"${OUT_ROOT}/sycl-kernels.csv\" >\"${OUT_ROOT}/kernels.parse\"",
     "printf 'Artifacts: %s\\n' \"${OUT_ROOT}\"",
 ]
@@ -86,8 +97,8 @@ def test_timeline_profile_script_execute_branch_wires_artifact_layout() -> None:
     text = _script_text()
     execute_start = 'mkdir -p "${OUT_ROOT}"'
     assert execute_start in text
+    assert 'timeline_gaps_parse="${OUT_ROOT}/timeline.gaps.parse"' in text
     execute_branch = text[text.index(execute_start) :]
-    assert "--top" not in execute_branch
     for required in EXECUTE_BRANCH_STRINGS:
         assert required in execute_branch
 

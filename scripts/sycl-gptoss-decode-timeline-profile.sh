@@ -99,6 +99,8 @@ bench_args=(
     -r 1
 )
 
+timeline_gaps_parse="${OUT_ROOT}/timeline.gaps.parse"
+
 print_cmd() {
     printf 'env'
     local item
@@ -116,6 +118,7 @@ if [[ "${EXECUTE}" -ne 1 ]]; then
     print_cmd
     printf ' >%q 2>%q\n' "${OUT_ROOT}/bench.stdout" "${OUT_ROOT}/bench.stderr"
     printf 'python3 %q %q >%q\n' "scripts/parse-sycl-timeline.py" "${OUT_ROOT}/sycl-timeline.json" "${OUT_ROOT}/timeline.parse"
+    printf 'python3 %q --top-gaps 20 --top-host-gap-overlaps 40 %q >%q\n' "scripts/parse-sycl-timeline.py" "${OUT_ROOT}/sycl-timeline.json" "${timeline_gaps_parse}"
     printf 'python3 %q %q >%q\n' "scripts/parse-sycl-kernel-profile.py" "${OUT_ROOT}/sycl-kernels.csv" "${OUT_ROOT}/kernels.parse"
     exit 0
 fi
@@ -125,5 +128,9 @@ print_cmd >"${OUT_ROOT}/command.txt"
 printf ' >%q 2>%q\n' "${OUT_ROOT}/bench.stdout" "${OUT_ROOT}/bench.stderr" >>"${OUT_ROOT}/command.txt"
 env "${env_args[@]}" "${bench_args[@]}" >"${OUT_ROOT}/bench.stdout" 2>"${OUT_ROOT}/bench.stderr"
 python3 scripts/parse-sycl-timeline.py "${OUT_ROOT}/sycl-timeline.json" >"${OUT_ROOT}/timeline.parse"
+python3 scripts/parse-sycl-timeline.py \
+    --top-gaps 20 \
+    --top-host-gap-overlaps 40 \
+    "${OUT_ROOT}/sycl-timeline.json" >"${timeline_gaps_parse}"
 python3 scripts/parse-sycl-kernel-profile.py "${OUT_ROOT}/sycl-kernels.csv" >"${OUT_ROOT}/kernels.parse"
 printf 'Artifacts: %s\n' "${OUT_ROOT}"

@@ -1264,6 +1264,8 @@ python3 scripts/parse-sycl-timeline.py \
 
 The parser reports `category.*` host totals, `callsite.*` host-side file:line attribution, GPU event coverage, and reconstructed `gap.*` metrics. `--top-callsites` is supported for limiting host callsite rows.
 
+`timeline.gaps.parse` is the first artifact to inspect when `timeline.unattributed_ms_x1000` is large. Generate it with `scripts/parse-sycl-timeline.py --top-gaps 20 --top-host-gap-overlaps 40`. The `gap_transition.*` rows show adjacent named SYCL events that bound device-timestamp gaps. The `host_gap_overlap.*` rows show host `compute_forward_node` ops that overlap gaps between adjacent submit spans. A residual `gap.device*` total is not by itself proof of GPU idle; it may be unprofiled kernels, runtime queue scheduling, graph replay work, or host-side dispatch between named events.
+
 Open the same JSON in Perfetto for visual inspection. Host spans are the visual timeline. GPU `sycl.event` spans are anchored at `ts=0` because their timestamps use device profiling clocks; the device nanosecond fields are carried in event args (`device_submit_ns`, `device_start_ns`, `device_end_ns`) and do not visually interleave with host spans. Use `scripts/parse-sycl-timeline.py` for GPU gap metrics because it reconstructs `gap.*` from that event metadata.
 
 Default attribution is host-side file:line callsites. VTune GPU source-line attribution is an optional deep dive only, not a prerequisite for using the decode timeline profiler and not the source of truth for default callsite attribution.
