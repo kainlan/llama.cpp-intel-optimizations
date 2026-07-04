@@ -115,3 +115,16 @@ def test_ledger_reports_malformed_input_without_traceback() -> None:
         assert result.returncode == 2
         assert "failed to parse profile ledger" in result.stdout
         assert "Traceback" not in result.stdout
+
+
+def test_ledger_reports_malformed_kernel_profile_without_traceback() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        timeline = tmp / "timeline.json"
+        kernels = tmp / "kernels.json"
+        timeline.write_text('{"traceEvents": []}', encoding="utf-8")
+        kernels.write_text("[]", encoding="utf-8")
+        result = run_parser(timeline, kernels)
+        assert result.returncode == 2
+        assert "failed to parse profile ledger" in result.stdout
+        assert "Traceback" not in result.stdout

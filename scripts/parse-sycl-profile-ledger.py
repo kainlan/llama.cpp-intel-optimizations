@@ -51,7 +51,7 @@ def main(argv: list[str]) -> int:
         gap_classes_by_queue = timeline_parser.summarize_queue_gap_classes(events)
         rows = kernel_parser.load_rows(args.kernel_profile)
         kernel_totals, _ = kernel_parser.aggregate_rows(rows)
-    except (OSError, json.JSONDecodeError, ValueError, RuntimeError) as exc:
+    except (OSError, json.JSONDecodeError, ValueError, RuntimeError, AttributeError) as exc:
         print(f"failed to parse profile ledger: {exc}")
         return 2
 
