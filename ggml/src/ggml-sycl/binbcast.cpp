@@ -3,6 +3,7 @@
 #include "dnnl-ops.hpp"
 #include "ggml.h"
 #include "mem-ops.hpp"
+#include "sycl-kernel-profiler.hpp"
 
 #include <cmath>
 #include <cstdarg>
@@ -89,17 +90,37 @@ static ggml_sycl_binbcast_event_mode ggml_sycl_get_binbcast_event_mode() {
 
 struct ggml_sycl_binbcast_unpin_event_kernel;
 
-static sycl::event ggml_sycl_submit_binbcast_event(sycl::queue & q, ggml_sycl_binbcast_event_mode mode) {
+static sycl::event ggml_sycl_submit_binbcast_event(sycl::queue &                 q,
+                                                   ggml_sycl_binbcast_event_mode mode,
+                                                   const char *                  file     = __builtin_FILE(),
+                                                   int                           line     = __builtin_LINE(),
+                                                   const char *                  function = __builtin_FUNCTION()) {
     if (g_ggml_sycl_graph_recording) {
         g_sycl_extra_submit_count_during_recording.fetch_add(1, std::memory_order_relaxed);
     }
     if (mode == ggml_sycl_binbcast_event_mode::BARRIER && q.has_property<sycl::property::queue::in_order>()) {
         mode = ggml_sycl_binbcast_event_mode::SAFE;
     }
+
+    ggml_sycl_profile_label label{};
+    label.name       = "sycl.binbcast.event";
+    label.category   = "binbcast";
+    label.queue_kind = "compute";
+    label.metadata   = mode == ggml_sycl_binbcast_event_mode::BARRIER ? "role=binbcast;mode=marker;event_mode=barrier" :
+                                                                        "role=binbcast;mode=kernel;event_mode=safe";
+    label.device     = ggml_sycl_get_device_id_from_queue(q);
+    label.bytes      = 0;
+
     if (mode == ggml_sycl_binbcast_event_mode::BARRIER) {
-        return q.ext_oneapi_submit_barrier();
+        return ggml_sycl_profile_record_returned_event(label, q.ext_oneapi_submit_barrier());
     }
-    return q.submit([&](sycl::handler & cgh) { cgh.single_task<ggml_sycl_binbcast_unpin_event_kernel>([] {}); });
+    return ggml_sycl_profile_submit(
+        q, label,
+        [&](sycl::queue & profiled_queue) {
+            return profiled_queue.submit(
+                [&](sycl::handler & cgh) { cgh.single_task<ggml_sycl_binbcast_unpin_event_kernel>([] {}); });
+        },
+        file, line, function);
 }
 
 static inline const char * ggml_sycl_layout_mode_name(ggml_layout_mode mode) {
