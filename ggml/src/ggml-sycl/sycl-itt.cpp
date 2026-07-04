@@ -37,23 +37,6 @@ std::string_view trim_ascii(const char * value) {
     return { first, static_cast<size_t>(last - first) };
 }
 
-bool equals_ignore_case(std::string_view value, const char * literal) {
-    const size_t literal_len = std::strlen(literal);
-    if (value.size() != literal_len) {
-        return false;
-    }
-
-    for (size_t i = 0; i < literal_len; ++i) {
-        const unsigned char lhs = static_cast<unsigned char>(value[i]);
-        const unsigned char rhs = static_cast<unsigned char>(literal[i]);
-        if (std::tolower(lhs) != std::tolower(rhs)) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
 #if defined(__GNUC__) || defined(__clang__)
 struct __itt_domain;
 struct __itt_string_handle;
@@ -140,7 +123,7 @@ void itt_runtime_task_end() {
 
 bool sycl_itt_enabled_from_env(const char * value) {
     const std::string_view trimmed = trim_ascii(value);
-    return !(trimmed.empty() || equals_ignore_case(trimmed, "0") || equals_ignore_case(trimmed, "off"));
+    return trimmed == "1";
 }
 
 bool sycl_itt_enabled() {

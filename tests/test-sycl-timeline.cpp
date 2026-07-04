@@ -246,6 +246,18 @@ int main() {
     require(sycl_itt_begin_count_for_tests() == 0, "disabled ITT env must not record begin");
     require(sycl_itt_end_count_for_tests() == 0, "disabled ITT env must not record end");
 
+    setenv("GGML_SYCL_VTUNE_ITT", "2", 1);
+    sycl_itt_reset_for_tests();
+    sycl_timeline_reset_for_tests();
+    sycl_timeline_set_config_for_tests(cfg);
+    sycl_timeline_begin_decode_step_for_tests(3);
+    {
+        GGML_SYCL_TIMELINE_SCOPE("unit", "itt-non-one-span", "case=itt-non-one");
+    }
+    require(sycl_itt_begin_count_for_tests() == 0, "non-1 ITT env must not record begin");
+    require(sycl_itt_end_count_for_tests() == 0, "non-1 ITT env must not record end");
+    unsetenv("GGML_SYCL_VTUNE_ITT");
+
     sycl_timeline_reset_for_tests();
 
     return 0;
