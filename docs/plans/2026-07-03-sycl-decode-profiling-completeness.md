@@ -12,8 +12,10 @@
 
 ## Team Topology
 
-**Recommended implementers:** 3 concurrent (based on 3 parallel tracks — execution spawns one ephemeral implementer PER TASK)
+**Recommended implementers:** 3 concurrent (based on parallel tracks A/B/C — execution spawns one ephemeral implementer PER TASK)
 **Reviewers:** spec + quality, spawned FRESH per review (not a standing pair; see team-driven-development)
+
+> **Goal scope (revised 2026-07-03):** the original 12 tasks deliver *attribution completeness* — every gap/event named at op/kernel/callsite/node granularity. Two additional tracks were added so the plan also delivers the two things "profile down to which line of code is most expensive" literally requires: **Track F (Task 13)** produces a single ranked cost table that names *the* most expensive callsite/op/kernel, and **Track G (Tasks 14–15)** attributes device time to the *hottest region inside* the top MXFP4 kernels via **microbench region-ablation** (`run-sycl-mxfp4-tg-microbenches.py`) corroborated by ocloc instruction/`dpas`/`send.ugm` deltas. VTune is **corroboration only, not the deliverable**: prior VTune runs on this host mislabel the B50 as `Arc B580` and are recorded in `docs/backend/SYCL.md` as *relative* evidence only ("VTune GPU source-line attribution is an optional deep dive only... not the source of truth" — `docs/backend/SYCL.md:1269`); that VTune limitation is precisely why the named-profiler timeline route exists, so Track G does not depend on VTune resolving reliable per-device source lines. The **Cross-Cutting Rules** section below (callsite fidelity, bracket-required, gap taxonomy) closes correctness gaps found reviewing the original 12 tasks.
 
 ### Parallel Tracks
 
@@ -24,6 +26,8 @@
 | C | 5, 6, 7, 8, 9 | Named-event coverage for the decode hot-path submit families |
 | D | 10 | Profile script/docs artifact plumbing after parser output exists |
 | E | 11, 12 | Safe integration gates and lead-only B50 validation |
+| F | 13 | Ranked "most expensive" cost table (host+device) naming the top cost site |
+| G | 14, 15 | Lead-only intra-kernel hotspot attribution via microbench region-ablation + ocloc deltas (VTune corroboration only) |
 
 ### Dependency Graph
 
@@ -42,6 +46,9 @@ digraph dependencies {
     10 [label="Task 10: script/docs gap artifacts"];
     11 [label="Task 11: safe integration gates"];
     12 [label="Task 12: lead-only B50 validation"];
+    13 [label="Task 13: ranked most-expensive cost table"];
+    14 [label="Task 14: lead-only VTune kernel-line collection"];
+    15 [label="Task 15: lead-only VTune line correlation + report"];
 
     1 -> 2;
     1 -> 10;
@@ -59,8 +66,15 @@ digraph dependencies {
     9 -> 11;
     10 -> 11;
     11 -> 12;
+    1 -> 13;
+    11 -> 13;
+    13 -> 12;
+    12 -> 14;
+    14 -> 15;
 }
 ```
+
+Notes on the added edges: Task 13 (ranked table) needs the parser gap work (Task 1) and the coverage instrumentation merged (Task 11), and its output feeds the Task 12 completeness decision, so 12 now runs after 13. Tasks 14–15 (VTune) are lead-only and run after the Task 12 real B50 run has named the hottest kernels to target.
 
 ### File Ownership Map
 
@@ -89,7 +103,12 @@ digraph dependencies {
 | `scripts/sycl-gptoss-decode-timeline-profile.sh` | 10 | None after Task 1/2 |
 | `tests/test-sycl-decode-timeline-profile-script.py` | 10 | None |
 | `docs/backend/SYCL.md` | 10 | None |
-| `activation/sycl-decode-profiling-completeness-validation.md` | 11, 12 | Sequential Track E |
+| `activation/sycl-decode-profiling-completeness-validation.md` | 11, 12, 15 | Sequential — Task 15 appends a new section only |
+| `scripts/parse-sycl-kernel-profile.py` | 13 | None |
+| `scripts/parse-sycl-timeline.py` (`--cost-ranking`) | 13 | Sequential after Task 1/2 on same file — Track F runs after Track A merges |
+| `tests/test-sycl-kernel-profile-parser.py` | 13 | None |
+| `scripts/run-sycl-mxfp4-tg-microbenches.py` | 14 | None (extend existing runner) |
+| `activation/sycl-decode-hottest-kernel-line-attribution.md` | 14, 15 | Sequential Track G |
 
 ---
 
@@ -142,6 +161,50 @@ set +u; source /opt/intel/oneapi/setvars.sh --force; set -u
 
 - Valid GPT-OSS/B50 validation remains FA-on with the existing script’s phase envs.
 - Do not add default-on profiler overhead. All new timeline/kernel event work must stay behind existing `GGML_SYCL_TIMELINE` and/or `GGML_SYCL_KERNEL_PROFILE` gates.
+
+---
+
+## Cross-Cutting Rules (apply to every instrumentation task 5–9 and 13)
+
+These three rules were added after reviewing the original tasks against the literal goal "which *line* of code is most expensive." They are binding acceptance criteria for every task they name; a task that violates one is not done.
+
+### Rule C1 — Callsite fidelity (helpers must forward the caller's line)
+
+`ggml_sycl_profile_submit()` captures the source location from its **default arguments** `file=__builtin_FILE()`, `line=__builtin_LINE()`, `function=__builtin_FUNCTION()` (`ggml/src/ggml-sycl/sycl-kernel-profiler.hpp:94-102`). Those builtins resolve **at the textual call to `ggml_sycl_profile_submit`**. Therefore, if a task wraps the submit inside a file-local helper (Task 5's `mmvq_profile_submit_quantize_activation_q8_soa`, Task 6's `ggml_sycl_submit_binbcast_event`, Task 9's `unified_micro_*`), the recorded callsite becomes **the helper's line**, and every distinct call to that helper collapses to one source line — defeating "which line."
+
+Any helper that internally calls `ggml_sycl_profile_submit` MUST forward the caller's location by adding its own trailing defaulted params and passing them through:
+
+```cpp
+static sycl::event my_profile_submit_helper(sycl::queue & q, /* ... */,
+                                            const char * file     = __builtin_FILE(),
+                                            int          line     = __builtin_LINE(),
+                                            const char * function = __builtin_FUNCTION()) {
+    ggml_sycl_profile_label label = /* ... */;
+    return ggml_sycl_profile_submit(q, label, [&](sycl::queue & pq) { /* ... */ },
+                                    file, line, function);   // forward, do NOT let builtins re-fire here
+}
+```
+
+When the same helper is reached from several call sites (e.g. the two Task-5 quantize call sites at `mmvq.cpp:17142` and `mmvq.cpp:17396`), each recorded event then carries its own distinct callsite. Where a single label legitimately covers several ops (Task 6 folds ADD/MUL/GLU under `sycl.binbcast.event`), source-line disambiguation comes from the **node context** (`node_op`/`node_tensor`, Tasks 3–4), not the label — so Rule C1 and node context together are what make per-op ranking possible in Task 13.
+
+Every source test in Tasks 5, 6, 9 (and 13's consumer test) MUST assert the helper carries `__builtin_FILE()`/`__builtin_LINE()` forwarding params, e.g. `assert "__builtin_FILE()" in helper` and `assert "file, line, function" in helper`.
+
+### Rule C2 — Bracket + attribution required (constrains `record_returned_event`)
+
+`ggml_sycl_profile_record_returned_event()` (`sycl-kernel-profiler.hpp:115-121`) records **no host submit bracket and no callsite** — it was exactly the deficiency Task 5 exists to remove from the quantize event. So it must not be the default. Binding rule for Tasks 6, 8 (which the original draft allowed to use either API):
+
+- If the code path performs a real `queue.submit(...)`, it MUST use `ggml_sycl_profile_submit` (bracket + forwarded callsite per C1). "`ggml_sycl_profile_submit` OR `ggml_sycl_profile_record_returned_event`" in those tasks' acceptance criteria is **narrowed to `ggml_sycl_profile_submit`** for submit paths.
+- `record_returned_event` is permitted ONLY for events that are already-complete markers / barriers with no owning submit (e.g. a `get_rows` fast-return marker). In that case the event MUST still be reached inside an active node scope (Tasks 3–4) so it carries `node_op`/`node_tensor`, and the task's source test MUST document why no submit bracket exists.
+
+### Rule C3 — Gap taxonomy (idle vs serialization vs host overlap)
+
+A large `gap.device*` total is **not** proof of GPU idle. Every device-timestamp gap surfaced by Task 1 must be classifiable into exactly one of three buckets, and Task 2 + Task 12 must report the split, not a single "unknown":
+
+- `host_overlap` — a `compute_forward_node` host op runs across the gap (Task 2 already computes this). The gap is host-side work, and Task 13's ranking must attribute it to that op.
+- `queue_serialization` — the next event's start is bounded by a dependency on the previous event (same `event_id` chain / `depends_on`), i.e. the GPU could not start earlier. Detect via adjacent events whose device windows abut within a small epsilon or whose submit records show a dependency; label `gap_class=queue_serialization`.
+- `runtime_idle` — no host op overlaps and no dependency explains the gap: genuine queue/runtime scheduling latency or an uninstrumented submit. This is the only bucket that may remain "unexplained," and Task 12 must report its total separately and, if it dominates, open a follow-up naming the suspected uninstrumented file.
+
+Task 12's completeness decision may NOT PASS on relabeling alone: PASS requires that the single largest cost bucket is either a named kernel/op (actionable — feeds Track G) or an explicitly classified `runtime_idle` with a named follow-up. "Large classified gap, no identified top cost" is a FAIL.
 
 ---
 
@@ -283,7 +346,9 @@ def sanitize_metric_token(value: str) -> str:
 
 def summarize_queue_gap_transitions(
     events: list[dict[str, Any]],
-) -> dict[tuple[str, str], Counter[tuple[str, str]]]:
+) -> dict[tuple[str, str], dict[tuple[str, str], tuple[int, int, int]]]:
+    """Per (device, queue_kind): map each adjacent (prev_name, next_name) event pair to
+    (count, total_ms_x1000, max_ms_x1000) of the device-timestamp gaps between them."""
     ranges_by_queue: dict[tuple[str, str], list[tuple[float, float, str]]] = defaultdict(list)
     for event in events:
         if event.get("ph") != "X" or not is_sycl_event_category(str(event.get("cat", "unknown"))):
@@ -294,30 +359,29 @@ def summarize_queue_gap_transitions(
         device, queue_kind, start_ns, end_ns = event_range
         ranges_by_queue[(device, queue_kind)].append((start_ns, end_ns, str(event.get("name", "unknown"))))
 
-    transitions: dict[tuple[str, str], Counter[tuple[str, str]]] = {}
+    result: dict[tuple[str, str], dict[tuple[str, str], tuple[int, int, int]]] = {}
     for queue, ranges in ranges_by_queue.items():
+        rows: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0, 0])  # [count, total, max]
         sorted_ranges = sorted(ranges)
         if not sorted_ranges:
             continue
         previous_end = sorted_ranges[0][1]
         previous_name = sorted_ranges[0][2]
-        queue_transitions: Counter[tuple[str, str]] = Counter()
-        queue_max: Counter[tuple[str, str]] = Counter()
         for start_ns, end_ns, name in sorted_ranges[1:]:
             if start_ns > previous_end:
-                key = (previous_name, name)
-                gap_us = ns_to_ms_x1000(start_ns - previous_end)
-                queue_transitions[key] += gap_us
-                queue_max[key] = max(queue_max[key], gap_us)
+                gap_total = ns_to_ms_x1000(start_ns - previous_end)
+                row = rows[(previous_name, name)]
+                row[0] += 1
+                row[1] += gap_total
+                row[2] = max(row[2], gap_total)
             if end_ns >= previous_end:
                 previous_end = end_ns
                 previous_name = name
-        # Store max values using synthetic keys consumed below.
-        for key, max_value in queue_max.items():
-            queue_transitions[(key[0], key[1] + "\0max")] = max_value
-        transitions[queue] = queue_transitions
-    return transitions
+        result[queue] = {key: (value[0], value[1], value[2]) for key, value in rows.items()}
+    return result
 ```
+
+> **Overlap caveat (Rule C3):** `sorted(ranges)` orders by device start time; a "gap" is only counted when `start_ns > previous_end`, and `previous_end` advances by `max()` so a long-running event that overlaps several shorter ones does not manufacture phantom gaps. Events whose device windows overlap (concurrent in-flight submits on the same `queue_kind`) therefore contribute **zero** gap, which is correct — they are not idle. A non-zero transition gap is a real device-timestamp gap that Task 2/Rule C3 then classifies as `host_overlap`, `queue_serialization`, or `runtime_idle`.
 
 Change `summarize_events()` return type at `scripts/parse-sycl-timeline.py:156-195` so it also returns transition data:
 
@@ -357,62 +421,7 @@ Change the unpack to:
         category_totals, callsite_totals, envelope_wall_us, gpu_event_total, queue_gaps, queue_gap_transitions = summarize_events(events)
 ```
 
-After printing lines that begin with `gap.device`, add:
-
-```python
-    if args.top_gaps > 0:
-        for (device, queue_kind), totals in sorted(queue_gap_transitions.items()):
-            transition_rows: list[tuple[tuple[str, str], int, int, int]] = []
-            for (previous_name, next_name), total in totals.items():
-                if next_name.endswith("\0max"):
-                    continue
-                count = 0
-                max_total = totals.get((previous_name, next_name + "\0max"), 0)
-                # Re-count deterministically from total map by matching printed transition.  The test data only needs count;
-                # real count is recomputed by a helper below in Task 2 if exact per-gap rows are needed.
-                # For Task 1, count is derived by a second pass in summarize_queue_gap_transition_counts.
-                transition_rows.append(((previous_name, next_name), count, total, max_total))
-```
-
-Do not commit the incomplete snippet above. Instead implement the final complete form with counts, totals, and max in one helper. Use this exact complete helper instead of the intermediate version if implementing directly:
-
-```python
-def summarize_queue_gap_transitions(
-    events: list[dict[str, Any]],
-) -> dict[tuple[str, str], dict[tuple[str, str], tuple[int, int, int]]]:
-    ranges_by_queue: dict[tuple[str, str], list[tuple[float, float, str]]] = defaultdict(list)
-    for event in events:
-        if event.get("ph") != "X" or not is_sycl_event_category(str(event.get("cat", "unknown"))):
-            continue
-        event_range = device_range(event)
-        if event_range is None:
-            continue
-        device, queue_kind, start_ns, end_ns = event_range
-        ranges_by_queue[(device, queue_kind)].append((start_ns, end_ns, str(event.get("name", "unknown"))))
-
-    result: dict[tuple[str, str], dict[tuple[str, str], tuple[int, int, int]]] = {}
-    for queue, ranges in ranges_by_queue.items():
-        rows: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0, 0])
-        sorted_ranges = sorted(ranges)
-        if not sorted_ranges:
-            continue
-        previous_end = sorted_ranges[0][1]
-        previous_name = sorted_ranges[0][2]
-        for start_ns, end_ns, name in sorted_ranges[1:]:
-            if start_ns > previous_end:
-                gap_total = ns_to_ms_x1000(start_ns - previous_end)
-                row = rows[(previous_name, name)]
-                row[0] += 1
-                row[1] += gap_total
-                row[2] = max(row[2], gap_total)
-            if end_ns >= previous_end:
-                previous_end = end_ns
-                previous_name = name
-        result[queue] = {key: (value[0], value[1], value[2]) for key, value in rows.items()}
-    return result
-```
-
-Then print:
+After printing lines that begin with `gap.device`, print the ranked transitions directly from the `(count, total, max)` tuples returned by `summarize_queue_gap_transitions()` — there is only one canonical helper (above); do not add a second placeholder variant:
 
 ```python
     if args.top_gaps > 0:
@@ -475,6 +484,7 @@ Add host-side overlap classification for the gaps reported by Task 1. The parser
 - [ ] Parser accepts `--top-host-gap-overlaps N` with clean negative-value error.
 - [ ] Parser prints `host_gap_overlap.<previous>--to--<next>.<op>.host_ms_x1000` lines for gaps between adjacent `sycl.submit` spans.
 - [ ] The overlap code reads op names from the `compute_forward_node` metadata key named `op`, matching metadata emitted at `ggml/src/ggml-sycl/ggml-sycl.cpp:80157-80163`.
+- [ ] Per **Rule C3**: the parser also emits a three-way `gap_class.device<id>.<queue>.{host_overlap,queue_serialization,runtime_idle}.total_ms_x1000` summary. A transition gap is `host_overlap` when a `compute_forward_node` op covers ≥50% of it; else `queue_serialization` when the next event's device window abuts the previous within an epsilon or a submit dependency links them; else `runtime_idle`. Add a unit test asserting a fabricated trace splits into the three buckets and that the three totals sum to the `gap.device*` total.
 - [ ] Tests cover overlapping nodes, non-overlapping nodes, and deterministic sort order.
 
 **Implementation Guide:**
@@ -1114,7 +1124,8 @@ The gap overlap analysis shows `ADD_ID`, `ADD`, `MUL`, and `GLU` host nodes betw
 
 **Acceptance Criteria:**
 
-- [ ] `ggml_sycl_submit_binbcast_event()` uses a profile label and wrapper or returned-event recorder with a non-unknown callsite.
+- [ ] Per **Rule C2**: the KERNEL-mode path (a real `queue.submit`) MUST use `ggml_sycl_profile_submit` with a forwarded callsite (**Rule C1**); `record_returned_event` is allowed ONLY for the marker/barrier mode that has no owning submit, and that event must be reached inside an active node scope (Tasks 3–4) so it still carries `node_op`/`node_tensor`.
+- [ ] Per **Rule C1**: `ggml_sycl_submit_binbcast_event()` adds trailing `__builtin_FILE()`/`__builtin_LINE()`/`__builtin_FUNCTION()` params and forwards them into `ggml_sycl_profile_submit`, so the recorded callsite is the caller, not the helper line; the source test asserts the forwarding params are present.
 - [ ] Labels include operation role metadata such as `role=binbcast;mode=<mode>`.
 - [ ] `ggml_sycl_op_mul()` and `ggml_sycl_op_mul_add_fused()` retain their behavior and dependency handling.
 - [ ] Source tests prove `.submit(` inside the binbcast marker helper is profiled.
@@ -1375,6 +1386,7 @@ GET_ROWS, SET_ROWS, and CPY nodes appear in host gaps. Add named event coverage 
 - [ ] GET_ROWS marker/slice submits emit labels starting `sycl.get_rows.`.
 - [ ] SET_ROWS submits emit labels starting `sycl.set_rows.`.
 - [ ] `mem-ops.cpp` copy submit paths emit `sycl.memcpy.*` labels with `queue_kind` set to `copy` or `compute` based on the queue used.
+- [ ] Per **Rule C2**: real `queue.submit` copy/row paths (SET_ROWS generic/fp8, `mem-ops` copy submit) MUST use `ggml_sycl_profile_submit` with a forwarded callsite (**Rule C1**). `record_returned_event` is permitted ONLY for the GET_ROWS already-complete fast-return marker, which must run inside an active node scope so it carries `node_op`/`node_tensor`; the source test documents why that one path has no submit bracket.
 - [ ] Source tests prove all three files include `sycl-kernel-profiler.hpp` and named labels.
 - [ ] No waits are added.
 
@@ -1850,11 +1862,13 @@ Lead reruns the approved B50 GPT-OSS FA-on profile script and determines whether
 
 - [ ] Real run produces non-empty `sycl-timeline.json`, `sycl-kernels.csv`, `sycl-kernels.json`, `timeline.parse`, `timeline.gaps.parse`, and `kernels.parse`.
 - [ ] Validation markdown records PP512/TG128 throughput.
-- [ ] `timeline.gaps.parse` records top `gap_transition.*` and `host_gap_overlap.*` rows.
-- [ ] Completeness decision is explicit:
-  - PASS if named GPU event coverage is >=90% of timeline wall, or
-  - PASS if residual gap total is still large but every top residual bucket is classified as named host overlap, named queue/runtime gap, or explicitly uninstrumentable runtime idle, or
-  - FAIL with follow-up tasks listing exact remaining unprofiled labels/files.
+- [ ] `timeline.gaps.parse` records top `gap_transition.*`, `host_gap_overlap.*`, and the **Rule C3** `gap_class.*` three-way split.
+- [ ] `cost-ranking.parse` (Task 13) records the single most expensive cost site and the ranked top-N; the decision quotes the #1 line.
+- [ ] Completeness decision is explicit (per **Rule C3**, relabeling alone is NOT a PASS):
+  - PASS if named GPU event coverage is >=90% of timeline wall AND the Task 13 ranked table names an actionable #1 cost site (a named kernel/op or an explicitly classified `runtime_idle` with a named follow-up), or
+  - PASS if residual gap total is still large but the `gap_class.*` split accounts for all of it and the #1 residual bucket is either a named host op/kernel or a `runtime_idle` bucket with a named suspected-uninstrumented file follow-up, or
+  - FAIL if the largest cost bucket is unidentified/unclassified, listing exact remaining unprofiled labels/files.
+- [ ] The named #1 kernel(s) from `cost-ranking.parse` are recorded as the target set for the Track G VTune tasks (14–15).
 - [ ] Branch is pushed after validation.
 
 **Implementation Guide:**
@@ -1925,6 +1939,264 @@ Expected: push succeeds. Do not finish with local-only commits.
 
 ---
 
+### Task 13: Emit a ranked "most expensive cost site" table
+
+**Track:** F
+**Depends on:** Task 1 (parser gap infra), Task 11 (instrumentation merged so coverage is real)
+**File scope:**
+- Modify: `scripts/parse-sycl-kernel-profile.py`
+- Modify: `scripts/parse-sycl-timeline.py`
+- Modify: `tests/test-sycl-kernel-profile-parser.py`
+
+**Description:**
+
+The original 12 tasks produce coverage % and gap transitions but no single ranked answer to "which line/op/kernel is most expensive." Add a deterministic ranked cost table so the completeness decision (Task 12) can quote an actionable #1. The kernel-profiler CSV is already emitted sorted by `total_ns` descending with columns `name,category,count,total_ns,mean_ns` (`ggml/src/ggml-sycl/sycl-kernel-profiler.cpp:260-280`; aggregation in `scripts/parse-sycl-kernel-profile.py:83-105`), so the device-side ranking is a presentation layer over existing data. The host-side ranking reuses Task 2's `host_gap_overlap` op totals.
+
+**Acceptance Criteria:**
+
+- [ ] `parse-sycl-kernel-profile.py` accepts `--top-kernels N` (`allow_abbrev=False`, negative rejected cleanly) and prints, ranked by `total_ns` desc: `cost.kernel.<name>.total_ms_x1000`, `.count`, `.mean_us_x1000`, and `.pct_x1000` (percent of the summed `total_ns` across all kernels).
+- [ ] It prints one summary line `cost.top1_kernel <name> <total_ms_x1000>` naming the single most expensive kernel.
+- [ ] `parse-sycl-timeline.py` accepts `--cost-ranking N` that merges device kernel event totals with `host_gap_overlap` op totals into a unified ranked list `cost.site.<domain>.<name>.total_ms_x1000` where `<domain>` is `device` or `host`, plus a `cost.top1_site <domain> <name> <total_ms_x1000>` line.
+- [ ] Output is deterministic (ties broken by name) and existing output is unchanged when the new flags are omitted.
+- [ ] Tests cover ranking order, percentage math, the top1 line, and negative-arg rejection.
+
+**Implementation Guide:**
+
+1. **RED: add parser test**
+
+Append to `tests/test-sycl-kernel-profile-parser.py`:
+
+```python
+def test_top_kernels_ranks_by_total_ns_with_pct_and_top1(tmp_path):
+    csv_text = (
+        "name,category,count,total_ns,mean_ns,failed_timestamps\n"
+        "mxfp4.down.q8_soa,mmvq,2321,1685400000,726000,0\n"
+        "mxfp4.gateup.xmx_tiled_dpas_m2,mmvq,774,605600000,782000,0\n"
+    )
+    path = tmp_path / "sycl-kernels.csv"
+    path.write_text(csv_text, encoding="utf-8")
+
+    result = run_parser(path, "--top-kernels", "10")
+
+    assert result.returncode == 0, result.stdout
+    assert "cost.kernel.mxfp4.down.q8_soa.total_ms_x1000 1685400" in result.stdout
+    assert "cost.kernel.mxfp4.down.q8_soa.count 2321" in result.stdout
+    # 1685.4 / (1685.4 + 605.6) = 73.56% -> 73560 (x1000 of a percent)
+    assert "cost.kernel.mxfp4.down.q8_soa.pct_x1000 73560" in result.stdout
+    assert "cost.top1_kernel mxfp4.down.q8_soa 1685400" in result.stdout
+
+
+def test_top_kernels_negative_is_rejected(tmp_path):
+    path = tmp_path / "sycl-kernels.csv"
+    path.write_text("name,category,count,total_ns,mean_ns,failed_timestamps\n", encoding="utf-8")
+    result = run_parser(path, "--top-kernels", "-1")
+    assert result.returncode == 2
+    assert "--top-kernels must be non-negative" in result.stdout
+    assert "Traceback" not in result.stdout
+```
+
+If the existing test helper is not named `run_parser`, use the module's existing subprocess helper (match the pattern already in the file).
+
+Run:
+
+```bash
+cd /Apps/llama.cpp-mxfp4-tg-runtime
+python3 -m pytest tests/test-sycl-kernel-profile-parser.py -q
+```
+
+Expected RED: `--top-kernels` unrecognized.
+
+2. **GREEN: rank in `parse-sycl-kernel-profile.py`**
+
+`aggregate_rows()` (`scripts/parse-sycl-kernel-profile.py:83-105`) already returns `kernel_totals[name] = Counter({count, total_ns, failed_timestamps})`. After the existing argument setup in `main()`, add:
+
+```python
+    parser.add_argument("--top-kernels", type=int, default=0,
+                        help="print the N most expensive kernels ranked by total_ns; 0 disables")
+```
+
+After the existing `--min-total-ms`/require validation, add:
+
+```python
+    if args.top_kernels < 0:
+        parser.error("--top-kernels must be non-negative")
+```
+
+After the existing summary printing, add:
+
+```python
+    if args.top_kernels > 0:
+        summed_ns = sum(t["total_ns"] for t in kernel_totals.values()) or 1
+        ranked = sorted(kernel_totals.items(), key=lambda kv: (-kv[1]["total_ns"], kv[0]))
+        for name, totals in ranked[: args.top_kernels]:
+            total_ns = totals["total_ns"]
+            count = totals["count"]
+            token = metric_name(name)
+            print(f"cost.kernel.{token}.total_ms_x1000 {total_ns // 1000}")
+            print(f"cost.kernel.{token}.count {count}")
+            print(f"cost.kernel.{token}.mean_us_x1000 {(total_ns * 1000 // count) if count else 0}")
+            print(f"cost.kernel.{token}.pct_x1000 {total_ns * 100000 // summed_ns}")
+        if ranked:
+            top_name, top_totals = ranked[0]
+            print(f"cost.top1_kernel {metric_name(top_name)} {top_totals['total_ns'] // 1000}")
+```
+
+Reuse the module's existing `metric_name()` sanitizer so tokens match the rest of the parser. `total_ms_x1000` here is `total_ns // 1000` (i.e. microseconds), matching the existing `_x1000` fixed-point convention used across these parsers — keep that convention; do not switch units.
+
+3. **GREEN: unified `--cost-ranking` in `parse-sycl-timeline.py`**
+
+Add `--cost-ranking N` (same non-negative validation). Build the ranked list by merging: (a) device event totals per event name (sum of each `sycl.event` device duration), and (b) the `host_gap_overlap` per-op totals from `summarize_host_gap_overlaps()` (Task 2). Emit:
+
+```python
+    if args.cost_ranking > 0:
+        sites: list[tuple[str, str, int]] = []  # (domain, name, total_ms_x1000)
+        for name, total in device_event_totals.items():
+            sites.append(("device", sanitize_metric_token(name), total))
+        for (_prev, _next, op), total in summarize_host_gap_overlaps(events).items():
+            sites.append(("host", op, total))
+        ranked = sorted(sites, key=lambda s: (-s[2], s[0], s[1]))
+        for domain, name, total in ranked[: args.cost_ranking]:
+            print(f"cost.site.{domain}.{name}.total_ms_x1000 {total}")
+        if ranked:
+            domain, name, total = ranked[0]
+            print(f"cost.top1_site {domain} {name} {total}")
+```
+
+`device_event_totals` is a `Counter[str]` you accumulate in `summarize_events()` alongside the existing category totals (sum `us_to_ms_x1000(device_end - device_start)` per event name). If a suitable per-event-name total already exists, reuse it rather than adding a second accumulator.
+
+4. **GREEN: run tests**
+
+```bash
+python3 -m pytest tests/test-sycl-kernel-profile-parser.py tests/test-sycl-timeline-parser.py -q
+python3 scripts/parse-sycl-kernel-profile.py /tmp/sycl_decode_timeline_lead_20260703_150450/sycl-kernels.csv --top-kernels 15
+```
+
+Expected PASS; the smoke print names `mxfp4.down.q8_soa` (or the current hottest kernel) as `cost.top1_kernel`.
+
+**Commit:**
+
+```bash
+git add scripts/parse-sycl-kernel-profile.py scripts/parse-sycl-timeline.py tests/test-sycl-kernel-profile-parser.py
+git commit -m "feat(sycl): rank most expensive kernels and cost sites"
+```
+
+**Gotchas:**
+
+- Keep the `_x1000` fixed-point convention; the whole parser suite compares integers, never floats.
+- The CSV is emitted already sorted, but do not rely on file order — re-sort in the parser so a re-ordered or merged CSV still ranks correctly.
+- `--cost-ranking` mixes device kernel time and host op time; label the domain so a reader never confuses a host `MUL_MAT_ID` node with a device kernel event. These are complementary views, not additive into one wall clock.
+
+**Wire into the profile script (Task 10 owns the script, but Task 13 must not leave the artifact unproduced):** add a one-line note in Task 10's script section that the execute branch also runs `parse-sycl-kernel-profile.py --top-kernels 30` and `parse-sycl-timeline.py --cost-ranking 30 ... > cost-ranking.parse`. If Task 10 has already merged, Task 13's implementer appends these two lines to `scripts/sycl-gptoss-decode-timeline-profile.sh` and its test, otherwise leaves a checklist note for the Task 10 implementer. Either way `cost-ranking.parse` must be an emitted artifact before Task 12 runs.
+
+---
+
+### Task 14: Lead-only microbench region-ablation collection for the hottest kernels
+
+**Track:** G
+**Depends on:** Task 12 (real B50 run has named the #1 kernel(s) via `cost.top1_kernel`)
+**File scope:**
+- Modify: `scripts/run-sycl-mxfp4-tg-microbenches.py`
+- Create: `activation/sycl-decode-hottest-kernel-line-attribution.md`
+
+**Description:**
+
+The named profiler and Task 13 rank cost at kernel granularity; SYCL event timestamps cannot see *inside* a single kernel (one kernel = one device event).
+
+> **Why not VTune (do not re-attempt it for source lines):** VTune was tried before and re-verified empirically on **VTune 2025.10** (2026-07-03, `gpu-hotspots` on B580 Mistral Q4_0). It fails at the one thing "which line" needs and succeeds at a different, still-useful thing:
+> - **No source-line localization (the blocker).** Grouping the GPU hotspots by source line returns `Source File = [Unknown source file]`, `Source Line = [Unknown]` for *all* GPU work — the SYCL device code is JIT-compiled without debug line tables, so VTune has nothing to map to. Valid `group-by` for a GPU result is only `function`/`basic-block`/`computing-task`; there is no usable source-line dimension. This is exactly what `docs/backend/SYCL.md:1269` records ("not the source of truth"). Getting source lines out of VTune would require rebuilding device code with `-gline-tables-only`, and even then likely resolves to assembly/basic-block, not our source.
+> - **Kernel identity is JIT names, not our labels.** Computing tasks show as `gemm_kernel`, `ggml_sycl_binbcast_unpin_event_kernel`, `zeCommandListAppendMemoryCopy` — not `mxfp4.down.q8_soa`. Our named-profiler labels (Task 13) are the only place the MXFP4 kernels are named as such.
+> - **Per-device attribution caveat.** VTune *enumerates* the B50 correctly (`GPU 2: Battlemage G21 [Arc Pro B50]`), but prior records show it mislabels the *active target* as `Arc B580` under `level_zero:1` (`docs/backend/SYCL.md:959-989`); treat its absolute per-device numbers as relative only.
+> - **What VTune IS good for (Task 15 corroboration): bound-type *classification*, not *localization*.** The per-kernel hardware metrics are rich and trustworthy as relative evidence — `XVE Array Stalled(%)`, stall reasons (e.g. `SBID 60.8%`), `XMX active(%)`/`XMX instructions`, `GPU Memory Bandwidth GB/s`, occupancy, SIMD utilization. That answers "is this kernel compute-bound (XMX), memory-bound (bandwidth/Send), or stall-bound (SBID)?" — the compute-vs-memory verdict Task 15 wants — even though it cannot say *which line*.
+>
+> So Track G **localizes** the hot region with microbench ablation (below) and **classifies** its bound-type with VTune's kernel metrics; VTune is never the source-line deliverable.
+
+So intra-kernel attribution here is done the way the team already attributes the `bundle4`/`M2` kernel work: **region ablation in the microbench** (`scripts/run-sycl-mxfp4-tg-microbenches.py`). Build variants of the top-ranked kernel (`mxfp4.down.q8_soa`, `mxfp4.gateup.xmx_tiled_dpas_m2`, or whatever Task 12 named #1) that each disable/alter one code region — the load, the `dpas`/XMX inner loop, the dequant, the store — measure the device-time delta per variant with `max_abs_error` guarding correctness, and corroborate each delta with the ocloc `dpas.8x8`/`send.ugm`/scalar-vs-vector-store instruction deltas (the same disassembly summary already used in SYCL.md). The region whose removal moves device time the most is the most expensive region; ocloc confirms it is compute-bound (`dpas`) vs memory-bound (`send.ugm`).
+
+**Acceptance Criteria:**
+
+- [ ] The microbench isolates the Task-12-named #1 kernel and runs it standalone on B50 FA-on, reporting per-variant device time and `max_abs_error` (every variant must keep `max_abs_error=0` for a valid comparison, or be flagged as a diagnostic-only variant).
+- [ ] At least one ablation variant exists per kernel region (load / inner `dpas` loop / dequant / store), each toggled by a `--region` (or equivalent) microbench flag — no default-on backend change; all variants stay behind the microbench/profile gates.
+- [ ] ocloc assembly summary (`dpas.8x8`, `send.ugm`, scalar/vector store counts, spill) is captured per variant so instruction deltas corroborate the timing delta.
+- [ ] Runner is dry-run-safe for workers: it prints the planned variants and commands and creates nothing unless the lead passes the existing execute/understand gate; workers never run it.
+- [ ] `activation/sycl-decode-hottest-kernel-line-attribution.md` `## Collection` section records the exact commands, variant list, per-variant device time + `max_abs_error`, and ocloc summaries.
+
+**Implementation Guide:**
+
+1. **Extend the existing microbench runner** (`scripts/run-sycl-mxfp4-tg-microbenches.py`) to accept the target kernel name (from `cost.top1_kernel` in Task 12's `cost-ranking.parse`, passed via a `--target-kernel`/`--cost-ranking-file` flag) and a set of region-ablation variants. Reuse the runner's existing device-time + `max_abs_error` reporting (the same mechanism the `bundle4` opportunity passes used) rather than adding a new measurement path.
+
+2. **Author the ablation variants** as the smallest one-region-at-a-time changes to the isolated kernel so each measured delta is attributable to one region. Keep every variant behind the microbench build/gate; do not alter default backend behavior.
+
+3. **Capture ocloc per variant.** Use ocloc/IGC disassembly the same way the existing SYCL.md `bundle4` records did (ocloc device disassembly + `IGC_ShaderDumpEnable=1` if used previously in this repo — match the existing invocation, do not invent a `GGML_SYCL_DUMP_ISA` env that does not exist). Save `dpas.8x8`, `send.ugm`, scalar/vector store, and spill counts per variant.
+
+4. **Record collection** in `activation/sycl-decode-hottest-kernel-line-attribution.md` `## Collection`: exact commands, the resolved output dir, the target kernel names from `cost.top1_kernel`, and the per-variant timing + `max_abs_error` + ocloc table.
+
+**Commit:**
+
+```bash
+git add scripts/run-sycl-mxfp4-tg-microbenches.py activation/sycl-decode-hottest-kernel-line-attribution.md
+git commit -m "feat(sycl): microbench region ablation for hottest kernel"
+```
+
+**Gotchas:**
+
+- Lead-only: runs real GPU kernels on B50. Workers must not run it.
+- Do not run `sycl-ls`, DRM/`/dev/dri` probes, `lsof`, or P2P probes (host hang hazards).
+- A variant with non-zero `max_abs_error` is a broken comparison, not a speedup — flag it diagnostic-only; never conclude a region is "cheap" from a variant that also produced wrong output.
+- VTune is optional corroboration only (Task 15) and only in the instruction-count/ocloc mode that actually produced data before; every VTune number stays labeled relative and B50-mislabeled.
+
+---
+
+### Task 15: Lead-only correlation and final most-expensive-region report
+
+**Track:** G
+**Depends on:** Task 14
+**File scope:**
+- Modify: `activation/sycl-decode-hottest-kernel-line-attribution.md`
+
+**Description:**
+
+Turn the Task 14 ablation-delta + ocloc data into the plan's final deliverable: a report that names, for each top-ranked kernel, the specific code **region** (source `file:line` range of that region — load / inner `dpas` loop / dequant / store) consuming the most device time, cross-referenced to the named timeline event and its callsite from Task 13. This closes the loop from "most expensive named kernel" (Task 13) to "most expensive region inside it" (Task 15) using measured ablation deltas rather than VTune's per-device source view (which is not reliable on this host).
+
+**Acceptance Criteria:**
+
+- [ ] For each kernel named by `cost.top1_kernel` / top-N, the report ranks its regions by measured device-time delta (variant-with-region minus variant-without), each region cited as a `file:line` range in the kernel source, with the corroborating ocloc instruction delta.
+- [ ] Each entry is cross-referenced to the named SYCL event label and the Task 13 `cost.site` ranking, so the reader can trace host-callsite → named kernel → hottest region.
+- [ ] The report states an explicit "single most expensive region" conclusion and classifies it compute-bound (`dpas`/XMX) vs memory-bound (`send.ugm`/bandwidth) from the ocloc instruction mix.
+- [ ] Any region whose ablation could not be made correctness-preserving (`max_abs_error≠0`) is reported honestly as instruction-mix evidence only, not a timing conclusion.
+- [ ] VTune's role, if run, is **bound-type classification only** — pull the per-kernel `XVE Array Stalled(%)` + stall reasons (`SBID`/`Send`/`Pipe`), `XMX active(%)`, and `GPU Memory Bandwidth GB/s` for the target kernel to state compute- vs memory- vs stall-bound. It is explicitly NOT used for source-line localization (empirically `Source File=[Unknown]`) and every number stays labeled relative/B50-mislabeled. Localization comes from the ablation deltas, not VTune.
+- [ ] Branch is committed and pushed.
+
+**Implementation Guide:**
+
+1. Rank the Task 14 variants by device-time delta per kernel; the largest correctness-preserving delta identifies the most expensive region. Map each region back to its `file:line` range in the kernel source (e.g. in `mmvq.cpp` / `unified-kernel.cpp`).
+
+2. Append a `## Most expensive region attribution` section to `activation/sycl-decode-hottest-kernel-line-attribution.md` containing, per target kernel:
+   - the named event label + Task 13 `cost.kernel.*` total and pct,
+   - a table of regions with their measured device-time delta, `max_abs_error`, the corroborating ocloc `dpas`/`send.ugm`/store delta, and the region's `file:line` range,
+   - the compute-vs-memory verdict from the ocloc instruction mix,
+   - one bold sentence naming THE single most expensive region across all kernels, with its `file:line`.
+
+3. (Optional corroboration) If VTune instruction-count mode is run, record it only as a relative cross-check under a clearly-labeled subsection; do not treat its per-device timing or source lines as authoritative. If VTune again fails to resolve what is needed, note that outcome so the dead end is not re-attempted a third time.
+
+**Commit + push:**
+
+```bash
+git add activation/sycl-decode-hottest-kernel-line-attribution.md
+git commit -m "docs(sycl): report most expensive kernel region attribution"
+git pull --rebase && git push
+git status --short
+```
+
+Expected: push succeeds; no local-only commits.
+
+**Gotchas:**
+
+- The ablation delta is the timing truth; ocloc is the instruction corroboration; VTune (if used) is relative-only. Keep these tiers explicit in the report.
+- Do not conclude a region is cheap from a variant that produced wrong output (`max_abs_error≠0`).
+- This report — not a green test — is the answer to "which region of code is most expensive." Tests prove the tooling; this artifact is the finding.
+
+---
+
 ## Coverage Cross-Check
 
 Spec item → owning task:
@@ -1933,8 +2205,11 @@ Spec item → owning task:
 |-------------|-------------|
 | Explain top device event gaps instead of one aggregate bucket | 1 |
 | Attribute host work overlapping submit gaps | 2 |
+| Classify gaps as host_overlap / queue_serialization / runtime_idle (Rule C3) | 2, 12 |
 | Attach graph node context to events | 3, 4 |
 | Fix quantize activation missing host callsite/brackets | 5 |
+| Helper callsite fidelity — forward caller file:line (Rule C1) | 5, 6, 9, 13 |
+| Constrain record_returned_event to markers only (Rule C2) | 6, 8 |
 | Name ADD/MUL/GLU/binbcast submits | 6 |
 | Name ROPE/SOFT_MAX submits | 7 |
 | Name GET_ROWS/SET_ROWS/CPY/memcpy submits | 8 |
@@ -1942,7 +2217,11 @@ Spec item → owning task:
 | Script emits gap artifacts | 10 |
 | Docs explain residual gaps correctly | 10 |
 | Safe tests/builds/dry-run before model validation | 11 |
+| Ranked "most expensive" cost table naming the #1 site | 13 |
+| `cost-ranking.parse` emitted as an artifact | 13 (+ Task 10 script) |
 | Lead-only real B50 GPT-OSS validation and decision | 12 |
-| Push final branch | 12 |
+| Intra-kernel hotspot attribution via microbench region-ablation + ocloc (VTune corroboration only) | 14, 15 |
+| Final "single most expensive region" report | 15 |
+| Push final branch | 12, 15 |
 
-No behavior is intentionally left unowned. Workers stop at safe gates; lead owns the real model/hardware validation.
+No behavior is intentionally left unowned. Workers stop at safe gates; lead owns the real model/hardware validation (Tasks 12, 14, 15). VTune is corroboration only, never the deliverable — it was already shown insufficient on this host (B50 mislabel, "not the source of truth"), which is the reason this named-profiler route exists.
