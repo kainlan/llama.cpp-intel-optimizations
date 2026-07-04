@@ -70,6 +70,21 @@ def test_source_line_feasibility_script_supports_matrix_pass_gate() -> None:
         assert "llama-bench" not in result.stdout
 
 
+def test_source_line_feasibility_script_propagates_target_kernel_to_checker() -> None:
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--target-kernel", "custom_kernel"],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout
+    assert "--kernel=custom_kernel" in result.stdout
+    assert "computing-tasks-of-interest=\\*custom_kernel\\*#1#1#20" in result.stdout
+    assert "--require-kernel custom_kernel" in result.stdout
+
+
 def test_source_line_feasibility_execute_branch_writes_expected_artifacts() -> None:
     text = script_text()
     assert "profiling-debug-build.log" in text

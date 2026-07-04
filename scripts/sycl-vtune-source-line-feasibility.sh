@@ -62,7 +62,7 @@ print_plan() {
         printf 'matrix gate: require %q to contain source_line.status pass\n' "${REQUIRE_MATRIX_PASS}"
         printf 'grep -qx %q %q\n' "source_line.status pass" "${REQUIRE_MATRIX_PASS}"
     fi
-    printf 'python3 scripts/check-sycl-vtune-source-lines.py --readelf-sections %q --vtune-csv %q --require-kernel %q > %q\n' "${OUT_ROOT}/zebin-debug-sections.txt" "${OUT_ROOT}/vtune-gpu-source-line.csv" "mxfp4_pair_glu_xmx_tiled" "${OUT_ROOT}/source-line-feasibility.parse"
+    printf 'python3 scripts/check-sycl-vtune-source-lines.py --readelf-sections %q --vtune-csv %q --require-kernel %q > %q\n' "${OUT_ROOT}/zebin-debug-sections.txt" "${OUT_ROOT}/vtune-gpu-source-line.csv" "${TARGET_KERNEL}" "${OUT_ROOT}/source-line-feasibility.parse"
 }
 
 if [[ "${EXECUTE}" -ne 1 ]]; then
@@ -95,5 +95,5 @@ vtune -report hotspots -r "${vtune_dir}" -group-by gpu-source-line -format csv >
 python3 scripts/check-sycl-vtune-source-lines.py \
     --readelf-sections "${OUT_ROOT}/zebin-debug-sections.txt" \
     --vtune-csv "${OUT_ROOT}/vtune-gpu-source-line.csv" \
-    --require-kernel "mxfp4_pair_glu_xmx_tiled" >"${OUT_ROOT}/source-line-feasibility.parse"
+    --require-kernel "${TARGET_KERNEL}" >"${OUT_ROOT}/source-line-feasibility.parse"
 printf 'Artifacts: %s\n' "${OUT_ROOT}"
