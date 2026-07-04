@@ -170,11 +170,15 @@ for index in "${!CASE_NAMES[@]}"; do
     fi
 
     readelf -S "${first_zebin}" >"${dir}/zebin-debug-sections.txt"
-    vtune -report hotspots -r "${vtune_dir}" -group-by gpu-source-line -format csv >"${dir}/vtune-gpu-source-line.csv"
-    python3 scripts/check-sycl-vtune-source-lines.py \
+    if ! vtune -report hotspots -r "${vtune_dir}" -group-by gpu-source-line -format csv >"${dir}/vtune-gpu-source-line.csv"; then
+        printf 'warning: VTune gpu-source-line report failed for matrix row %s; writing fail-closed checker output\n' "${name}" >>"${dir}/probe.stderr"
+    fi
+    if ! python3 scripts/check-sycl-vtune-source-lines.py \
         --readelf-sections "${dir}/zebin-debug-sections.txt" \
         --vtune-csv "${dir}/vtune-gpu-source-line.csv" \
-        --require-kernel "${TARGET_KERNEL}" >"${dir}/source-line-feasibility.parse"
+        --require-kernel "${TARGET_KERNEL}" >"${dir}/source-line-feasibility.parse"; then
+        printf 'warning: source-line checker reported failure for matrix row %s; see %s\n' "${name}" "${dir}/source-line-feasibility.parse" >&2
+    fi
 done
 
 printf 'Artifacts: %s/build-matrix\n' "${OUT_ROOT}"

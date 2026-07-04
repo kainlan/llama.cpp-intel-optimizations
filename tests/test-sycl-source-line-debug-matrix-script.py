@@ -52,6 +52,8 @@ def test_debug_matrix_execute_branch_writes_expected_artifacts() -> None:
         "vtune-gpu-source-line.csv",
         "source-line-feasibility.parse",
         "check-sycl-vtune-source-lines.py",
+        "VTune gpu-source-line report failed",
+        "source-line checker reported failure",
         "set +u",
         "source /opt/intel/oneapi/setvars.sh --force",
         "set -u",

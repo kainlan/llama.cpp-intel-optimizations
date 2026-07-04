@@ -127,6 +127,22 @@ def test_checker_reports_blocker_reason_for_missing_debug_line() -> None:
         assert "source_line.status fail" in result.stdout
 
 
+def test_checker_reports_empty_vtune_csv_as_unknown_source_without_traceback() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        sections = tmp / "sections.txt"
+        csv = tmp / "source.csv"
+        sections.write_text("[12] .debug_line PROGBITS\n", encoding="utf-8")
+        csv.write_text("", encoding="utf-8")
+        result = run_checker(sections, csv, "--require-kernel", "mxfp4_pair_glu_xmx_tiled")
+        assert result.returncode == 2
+        assert "source_line.debug_line_present 1" in result.stdout
+        assert "source_line.non_unknown_rows 0" in result.stdout
+        assert "source_line.blocker vtune_unknown_source" in result.stdout
+        assert "source_line.status fail" in result.stdout
+        assert "Traceback" not in result.stdout
+
+
 def test_checker_reports_malformed_surplus_csv_fields_without_traceback() -> None:
     with tempfile.TemporaryDirectory() as tmp_raw:
         tmp = pathlib.Path(tmp_raw)

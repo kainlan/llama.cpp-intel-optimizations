@@ -47,7 +47,8 @@ def main(argv: list[str]) -> int:
         with args.vtune_csv.open("r", encoding="utf-8", errors="replace", newline="") as handle:
             sample = handle.read(4096)
             handle.seek(0)
-            dialect = csv.excel_tab if "\t" in sample.splitlines()[0] else csv.excel
+            sample_lines = sample.splitlines()
+            dialect = csv.excel_tab if sample_lines and "\t" in sample_lines[0] else csv.excel
             reader = csv.DictReader(handle, dialect=dialect)
             non_unknown_rows = 0
             for raw_row in reader:
