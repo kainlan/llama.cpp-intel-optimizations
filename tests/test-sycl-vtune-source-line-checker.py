@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import pathlib
+import subprocess
+import sys
+import tempfile
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+CHECKER = ROOT / "scripts" / "check-sycl-vtune-source-lines.py"
+
+
+def run_checker(sections: pathlib.Path, csv: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(CHECKER), "--readelf-sections", str(sections), "--vtune-csv", str(csv), *args],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+
+
+def test_checker_passes_with_debug_line_and_non_unknown_source_rows() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        sections = tmp / "sections.txt"
+        csv = tmp / "source.csv"
+        sections.write_text("[12] .debug_line PROGBITS\n", encoding="utf-8")
+        csv.write_text("Source Line\tSource Computing Task\tComputing Task:Total Time\nmmvq.cpp:123\tmxfp4_pair_glu_xmx_tiled_packed_r8_m2\t0.1\n", encoding="utf-8")
+        result = run_checker(sections, csv, "--require-kernel", "mxfp4_pair_glu_xmx_tiled")
+        assert result.returncode == 0, result.stdout
+        assert "source_line.debug_line_present 1" in result.stdout
+        assert "source_line.non_unknown_rows 1" in result.stdout
+        assert "source_line.status pass" in result.stdout
+
+
+def test_checker_fails_when_source_rows_are_unknown() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        sections = tmp / "sections.txt"
+        csv = tmp / "source.csv"
+        sections.write_text("[12] .debug_line PROGBITS\n", encoding="utf-8")
+        csv.write_text("Source Line\tSource Computing Task\n[Unknown]\tmxfp4_pair_glu_xmx_tiled_packed_r8_m2\n", encoding="utf-8")
+        result = run_checker(sections, csv, "--require-kernel", "mxfp4_pair_glu_xmx_tiled")
+        assert result.returncode == 2
+        assert "source_line.non_unknown_rows 0" in result.stdout
+        assert "source_line.status fail" in result.stdout
+
+
+def test_checker_fails_without_debug_line() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        sections = tmp / "sections.txt"
+        csv = tmp / "source.csv"
+        sections.write_text("[12] .ze_info LOUSER\n", encoding="utf-8")
+        csv.write_text("Source Line\tSource Computing Task\nmmvq.cpp:123\tmxfp4_pair_glu_xmx_tiled_packed_r8_m2\n", encoding="utf-8")
+        result = run_checker(sections, csv, "--require-kernel", "mxfp4_pair_glu_xmx_tiled")
+        assert result.returncode == 2
+        assert "source_line.debug_line_present 0" in result.stdout
+        assert "source_line.status fail" in result.stdout
