@@ -44,6 +44,26 @@ def test_l0_parser_rejects_malformed_rows_without_traceback() -> None:
         assert "Traceback" not in result.stdout
 
 
+def test_l0_parser_rejects_dur_us_without_ts_us_without_traceback() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        path = pathlib.Path(tmp_raw) / "missing-ts.jsonl"
+        path.write_text('{"name":"zeEventHostSynchronize","dur_us":5}\n', encoding="utf-8")
+        result = run_parser(path)
+        assert result.returncode == 2
+        assert "failed to parse Level Zero trace" in result.stdout
+        assert "Traceback" not in result.stdout
+
+
+def test_l0_parser_rejects_dur_us_with_nonnumeric_ts_us_without_traceback() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        path = pathlib.Path(tmp_raw) / "bad-ts.jsonl"
+        path.write_text('{"name":"zeEventHostSynchronize","ts_us":"not-a-number","dur_us":5}\n', encoding="utf-8")
+        result = run_parser(path)
+        assert result.returncode == 2
+        assert "failed to parse Level Zero trace" in result.stdout
+        assert "Traceback" not in result.stdout
+
+
 def test_l0_parser_rejects_bad_json_and_non_object_rows_without_traceback() -> None:
     with tempfile.TemporaryDirectory() as tmp_raw:
         bad_json = pathlib.Path(tmp_raw) / "bad-json.jsonl"

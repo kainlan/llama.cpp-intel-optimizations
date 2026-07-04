@@ -42,6 +42,9 @@ def row_duration_us(row: dict[str, Any]) -> float:
             raise ValueError(f"negative duration for {row.get('name', 'unknown')}")
         return end - begin
     if dur is not None:
+        ts = finite_number(row, "ts_us")
+        if ts is None:
+            raise ValueError(f"missing numeric ts_us for {row.get('name', 'unknown')}")
         if dur < 0:
             raise ValueError(f"negative duration for {row.get('name', 'unknown')}")
         return dur
