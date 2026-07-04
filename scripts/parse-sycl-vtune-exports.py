@@ -8,7 +8,6 @@ import collections
 import csv
 import pathlib
 import sys
-from typing import Any
 
 UNKNOWN_VALUES = {"", "[Unknown]", "[Unknown source file]"}
 
