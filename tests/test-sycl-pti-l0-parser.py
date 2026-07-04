@@ -42,3 +42,20 @@ def test_l0_parser_rejects_malformed_rows_without_traceback() -> None:
         assert result.returncode == 2
         assert "failed to parse Level Zero trace" in result.stdout
         assert "Traceback" not in result.stdout
+
+
+def test_l0_parser_rejects_bad_json_and_non_object_rows_without_traceback() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        bad_json = pathlib.Path(tmp_raw) / "bad-json.jsonl"
+        bad_json.write_text('{"name":"zeEventHostSynchronize",\n', encoding="utf-8")
+        result = run_parser(bad_json)
+        assert result.returncode == 2
+        assert "failed to parse Level Zero trace" in result.stdout
+        assert "Traceback" not in result.stdout
+
+        non_object = pathlib.Path(tmp_raw) / "non-object.jsonl"
+        non_object.write_text('["zeEventHostSynchronize"]\n', encoding="utf-8")
+        result = run_parser(non_object)
+        assert result.returncode == 2
+        assert "failed to parse Level Zero trace" in result.stdout
+        assert "Traceback" not in result.stdout
