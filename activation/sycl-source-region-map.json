@@ -1,0 +1,18 @@
+{
+  "kernels": {
+    "mxfp4.gateup.xmx_tiled_dpas_m2": {
+      "file": "ggml/src/ggml-sycl/mmvq.cpp",
+      "line_start": 9730,
+      "line_end": 9955,
+      "label_line": 9767,
+      "notes": "MXFP4 gate/up XMX tiled DPAS m2 decode hot path"
+    },
+    "mxfp4.down.q8_soa": {
+      "file": "ggml/src/ggml-sycl/mmvq.cpp",
+      "line_start": 19308,
+      "line_end": 19392,
+      "label_line": 19338,
+      "notes": "MXFP4 down projection Q8 SOA decode hot path"
+    }
+  }
+}
