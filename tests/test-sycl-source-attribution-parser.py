@@ -149,3 +149,72 @@ def test_source_attribution_reports_missing_top_kernel_without_traceback() -> No
         assert result.returncode == 2
         assert "failed to parse source attribution" in result.stdout
         assert "Traceback" not in result.stdout
+
+
+def test_source_attribution_rejects_invalid_source_line_status_without_traceback() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        p = write_common(pathlib.Path(tmp_raw))
+        p["source"].write_text("source_line.blocker missing_debug_line\nsource_line.status maybe\n", encoding="utf-8")
+        result = run_parser(
+            "--cost-ranking",
+            str(p["cost"]),
+            "--source-line",
+            str(p["source"]),
+            "--region-map",
+            str(p["region"]),
+        )
+        assert result.returncode == 2
+        assert "failed to parse source attribution" in result.stdout
+        assert "invalid source_line.status maybe" in result.stdout
+        assert "Traceback" not in result.stdout
+
+
+def test_source_attribution_rejects_non_integer_region_and_ablation_numbers() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        p = write_common(pathlib.Path(tmp_raw))
+        p["region"].write_text(
+            json.dumps(
+                {
+                    "kernels": {
+                        "mxfp4.gateup.xmx_tiled_dpas_m2": {
+                            "file": "ggml/src/ggml-sycl/mmvq.cpp",
+                            "line_start": 9730.5,
+                            "line_end": 9955,
+                            "label_line": True,
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = run_parser(
+            "--cost-ranking",
+            str(p["cost"]),
+            "--source-line",
+            str(p["source"]),
+            "--region-map",
+            str(p["region"]),
+        )
+        assert result.returncode == 2
+        assert "must be an integer" in result.stdout
+        assert "Traceback" not in result.stdout
+
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        p = write_common(pathlib.Path(tmp_raw))
+        p["ablation"].write_text(
+            json.dumps({"deltas": [{"kernel": "mxfp4.gateup.xmx_tiled_dpas_m2", "delta_ms_x1000": 120000.5}]}),
+            encoding="utf-8",
+        )
+        result = run_parser(
+            "--cost-ranking",
+            str(p["cost"]),
+            "--source-line",
+            str(p["source"]),
+            "--region-map",
+            str(p["region"]),
+            "--ablation-json",
+            str(p["ablation"]),
+        )
+        assert result.returncode == 2
+        assert "must be an integer" in result.stdout
+        assert "Traceback" not in result.stdout

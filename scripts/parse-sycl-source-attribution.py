@@ -51,6 +51,12 @@ def load_region_map(path: pathlib.Path) -> dict[str, Any]:
     return kernels
 
 
+def require_json_int(value: Any, description: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise SourceAttributionError(f"{description} must be an integer")
+    return value
+
+
 def validate_region(kernel: str, raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise SourceAttributionError(f"invalid region entry for {kernel}")
@@ -61,10 +67,7 @@ def validate_region(kernel: str, raw: Any) -> dict[str, Any]:
     if not isinstance(region["file"], str) or not region["file"]:
         raise SourceAttributionError(f"region entry for {kernel} has invalid file")
     for name in ("line_start", "line_end", "label_line"):
-        try:
-            region[name] = int(region[name])
-        except (TypeError, ValueError) as exc:
-            raise SourceAttributionError(f"region entry for {kernel} has invalid {name}") from exc
+        region[name] = require_json_int(region[name], f"region entry for {kernel} {name}")
     return region
 
 
@@ -80,10 +83,7 @@ def load_ablation_delta(path: pathlib.Path | None, kernel: str) -> int | None:
             continue
         if "delta_ms_x1000" not in item:
             raise SourceAttributionError(f"ablation delta for {kernel} missing delta_ms_x1000")
-        try:
-            return int(item["delta_ms_x1000"])
-        except (TypeError, ValueError) as exc:
-            raise SourceAttributionError(f"ablation delta for {kernel} has invalid delta_ms_x1000") from exc
+        return require_json_int(item["delta_ms_x1000"], f"ablation delta for {kernel} delta_ms_x1000")
     return None
 
 
@@ -103,6 +103,8 @@ def main(argv: list[str]) -> int:
         source_status = source_rows.get("source_line.status", "")
         if not source_status:
             raise SourceAttributionError("missing source_line.status")
+        if source_status not in {"pass", "fail"}:
+            raise SourceAttributionError(f"invalid source_line.status {source_status}")
         exact_pass = source_status == "pass"
         exact_blocker = source_rows.get("source_line.blocker", "unknown")
 
