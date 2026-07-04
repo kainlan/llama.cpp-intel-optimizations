@@ -19,6 +19,7 @@
 #include "ggml-cpu/ops.h"
 #include "ggml-impl.h"
 #include "mem-ops.hpp"
+#include "sycl-kernel-profiler.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -32,6 +33,41 @@
 #include <vector>
 
 struct ggml_sycl_get_rows_marker_kernel;
+
+static ggml_sycl_profile_label make_get_rows_profile_label(sycl::queue & queue,
+                                                           const char *  name,
+                                                           const char *  metadata,
+                                                           size_t        bytes = 0) {
+    ggml_sycl_profile_label label{};
+    label.name       = name;
+    label.category   = "memory";
+    label.queue_kind = "compute";
+    label.metadata   = metadata;
+    label.device     = ggml_sycl_get_device_id_from_queue(queue);
+    label.bytes      = bytes;
+    return label;
+}
+
+template <typename MarkerKernel>
+static sycl::event ggml_sycl_get_rows_profile_marker(sycl::queue &                    queue,
+                                                     const std::vector<sycl::event> & deps,
+                                                     const char *                     name,
+                                                     const char *                     metadata,
+                                                     size_t                           bytes    = 0,
+                                                     const char *                     file     = __builtin_FILE(),
+                                                     int                              line     = __builtin_LINE(),
+                                                     const char *                     function = __builtin_FUNCTION()) {
+    // GET_ROWS markers submit real marker/barrier commands, so record_returned_event
+    // would lose the host submit bracket and callsite required for node-context attribution.
+    if (!ggml_sycl_kernel_profile_enabled()) {
+        return ggml_sycl_submit_marker<MarkerKernel>(queue, deps);
+    }
+
+    ggml_sycl_profile_label label = make_get_rows_profile_label(queue, name, metadata, bytes);
+    return ggml_sycl_profile_submit(queue, label, [&](sycl::queue & profiled_queue) {
+        return ggml_sycl_submit_marker<MarkerKernel>(profiled_queue, deps);
+    }, file, line, function);
+}
 
 static const ggml_tensor * get_storage_tensor(const ggml_tensor * t) {
     const ggml_tensor * current = t;
@@ -2073,7 +2109,8 @@ static sycl::event get_rows_stream_copy(sycl::queue &                    queue,
     GGML_UNUSED(src_size);
     const auto * ctx = static_cast<const get_rows_stream_ctx *>(ctx_void);
     if (!ctx || ctx->row_total_bytes == 0 || ctx->segment_count == 0) {
-        return ggml_sycl_submit_marker<ggml_sycl_get_rows_marker_kernel>(queue);
+        return ggml_sycl_get_rows_profile_marker<ggml_sycl_get_rows_marker_kernel>(
+            queue, {}, "sycl.get_rows.marker", "role=get_rows;kind=marker");
     }
 
     GGML_ASSERT(offset_bytes % ctx->row_total_bytes == 0);
@@ -2160,11 +2197,13 @@ static sycl::event get_rows_stream_slice(sycl::queue &                    queue,
                                          const std::vector<sycl::event> & deps) {
     const auto * ctx = static_cast<const get_rows_stream_ctx *>(ctx_void);
     if (!ctx || ctx->row_total_bytes == 0) {
-        return ggml_sycl_submit_marker<ggml_sycl_get_rows_marker_kernel>(queue);
+        return ggml_sycl_get_rows_profile_marker<ggml_sycl_get_rows_marker_kernel>(
+            queue, {}, "sycl.get_rows.marker", "role=get_rows;kind=marker");
     }
 
     if (!deps.empty()) {
-        sycl::event dep_evt = ggml_sycl_submit_marker<ggml_sycl_get_rows_marker_kernel>(queue, deps);
+        sycl::event dep_evt = ggml_sycl_get_rows_profile_marker<ggml_sycl_get_rows_marker_kernel>(
+            queue, deps, "sycl.get_rows.marker", "role=get_rows;kind=marker;path=deps");
         if (!queue.has_property<sycl::property::queue::in_order>() && !ggml_sycl_graph_recording_active()) {
             // Category C: synchronous wait required — out-of-order queue needs
             // explicit drain to honour deps before launching the slice kernel.
@@ -2201,7 +2240,8 @@ static sycl::event get_rows_stream_slice(sycl::queue &                    queue,
         throw;
     }
 
-    return ggml_sycl_submit_marker<ggml_sycl_get_rows_marker_kernel>(queue);
+    return ggml_sycl_get_rows_profile_marker<ggml_sycl_get_rows_marker_kernel>(
+        queue, {}, "sycl.get_rows.slice", "role=get_rows;kind=stream_slice", slice_bytes);
 }
 
 void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor tensor) {
@@ -2562,8 +2602,9 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tens
                         }
                         if (streamed_ok) {
                             std::vector<sycl::event> done_deps{ result.event };
-                            result.event =
-                                ggml_sycl_submit_marker<ggml_sycl_get_rows_marker_kernel>(*ctx.stream(), done_deps);
+                            result.event = ggml_sycl_get_rows_profile_marker<ggml_sycl_get_rows_marker_kernel>(
+                                *ctx.stream(), done_deps, "sycl.get_rows.marker",
+                                "role=get_rows;kind=marker;path=stream_done", total_bytes);
                             cache->unpin_on_event(cache_key, layout, result.event);
                         } else {
                             cache->unpin(cache_key, layout);
@@ -2854,7 +2895,8 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tens
     }
 
     if (staged_indices_handle.valid()) {
-        sycl::event done = ggml_sycl_submit_marker<ggml_sycl_get_rows_marker_kernel>(*ctx.stream());
+        sycl::event done = ggml_sycl_get_rows_profile_marker<ggml_sycl_get_rows_marker_kernel>(
+            *ctx.stream(), {}, "sycl.get_rows.marker", "role=get_rows;kind=marker;path=indices_release");
         std::vector<ggml_sycl::mem_handle> retained;
         retained.push_back(std::move(staged_indices_handle));
         ggml_sycl::retain_handles_until_event(std::move(retained), std::move(done));

@@ -4,10 +4,42 @@
 #include "cpy.hpp"
 #include "fattn.hpp"
 #include "mem-ops.hpp"
+#include "sycl-kernel-profiler.hpp"
 
 #include <utility>
 
 static constexpr int GGML_SYCL_SET_ROWS_UNKNOWN_DEVICE_USM = -2;
+
+static ggml_sycl_profile_label make_set_rows_profile_label(sycl::queue & queue,
+                                                           const char *  name,
+                                                           const char *  metadata,
+                                                           size_t        bytes = 0) {
+    ggml_sycl_profile_label label{};
+    label.name       = name;
+    label.category   = "memory";
+    label.queue_kind = "compute";
+    label.metadata   = metadata;
+    label.device     = ggml_sycl_get_device_id_from_queue(queue);
+    label.bytes      = bytes;
+    return label;
+}
+
+template <typename SubmitFn>
+static sycl::event ggml_sycl_set_rows_profile_submit(sycl::queue & queue,
+                                                     const char *  name,
+                                                     const char *  metadata,
+                                                     size_t        bytes,
+                                                     SubmitFn &&   submit_fn,
+                                                     const char *  file     = __builtin_FILE(),
+                                                     int           line     = __builtin_LINE(),
+                                                     const char *  function = __builtin_FUNCTION()) {
+    if (!ggml_sycl_kernel_profile_enabled()) {
+        return submit_fn(queue);
+    }
+
+    ggml_sycl_profile_label label = make_set_rows_profile_label(queue, name, metadata, bytes);
+    return ggml_sycl_profile_submit(queue, label, static_cast<SubmitFn &&>(submit_fn), file, line, function);
+}
 
 static int ggml_sycl_set_rows_ptr_device(const void * ptr) {
     if (!ptr) {
@@ -579,30 +611,38 @@ static sycl::event set_rows_sycl_q(const char * __restrict__ src0_d,
     constexpr int block_size   = 256;
     const int64_t grid_size    = ceil_div(total_blocks, block_size);
 
-    sycl::event evt =
-        stream->parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> item_ct1) {
-            const int64_t i = item_ct1.get_global_linear_id();
-            if (i >= total_blocks) {
-                return;
-            }
-            const int64_t i_base      = i * qk;
-            const int64_t i03         = i_base / (ne00 * ne01 * ne02);
-            const int64_t rem1        = i_base - i03 * (ne00 * ne01 * ne02);
-            const int64_t i02         = rem1 / (ne00 * ne01);
-            const int64_t rem2        = rem1 - i02 * ne00 * ne01;
-            const int64_t i01         = rem2 / ne00;
-            const int64_t i00         = rem2 - i01 * ne00;
-            const int64_t i12         = i03 % ne12;
-            const int64_t i11         = i02 % ne11;
-            const int64_t i10         = i01;
-            const size_t  src_offset  = calculate_offset<3>({ nb01, nb02, nb03 }, { i01, i02, i03 });
-            const char *  src_block   = src0_d + src_offset + i00 * sizeof(float);
-            const size_t  src1_offset = calculate_offset<3>({ nb10, nb11, nb12 }, { i10, i11, i12 });
-            const int64_t dst_row     = src1_d[src1_offset / sizeof(TIdx)];
-            const size_t  dst_offset =
-                calculate_offset<3>({ nb1, nb2, nb3 }, { dst_row, i02, i03 }) + (i00 / qk) * sizeof(blockType);
-            char * dst_block = reinterpret_cast<char *>(reinterpret_cast<char *>(dst_d) + dst_offset);
-            cpyblck(src_block, dst_block);
+    sycl::event evt = ggml_sycl_set_rows_profile_submit(
+        *stream, "sycl.set_rows.quantized", "role=set_rows;kind=quantized",
+        static_cast<size_t>(total_blocks) * sizeof(blockType), [&](sycl::queue & profiled_queue) {
+            return profiled_queue.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size),
+                                               [=](sycl::nd_item<1> item_ct1) {
+                                                   const int64_t i = item_ct1.get_global_linear_id();
+                                                   if (i >= total_blocks) {
+                                                       return;
+                                                   }
+                                                   const int64_t i_base      = i * qk;
+                                                   const int64_t i03         = i_base / (ne00 * ne01 * ne02);
+                                                   const int64_t rem1        = i_base - i03 * (ne00 * ne01 * ne02);
+                                                   const int64_t i02         = rem1 / (ne00 * ne01);
+                                                   const int64_t rem2        = rem1 - i02 * ne00 * ne01;
+                                                   const int64_t i01         = rem2 / ne00;
+                                                   const int64_t i00         = rem2 - i01 * ne00;
+                                                   const int64_t i12         = i03 % ne12;
+                                                   const int64_t i11         = i02 % ne11;
+                                                   const int64_t i10         = i01;
+                                                   const size_t  src_offset  = calculate_offset<3>({ nb01, nb02, nb03 },
+                                                                                                  { i01, i02, i03 });
+                                                   const char * src_block = src0_d + src_offset + i00 * sizeof(float);
+                                                   const size_t src1_offset =
+                                                       calculate_offset<3>({ nb10, nb11, nb12 }, { i10, i11, i12 });
+                                                   const int64_t dst_row = src1_d[src1_offset / sizeof(TIdx)];
+                                                   const size_t  dst_offset =
+                                                       calculate_offset<3>({ nb1, nb2, nb3 }, { dst_row, i02, i03 }) +
+                                                       (i00 / qk) * sizeof(blockType);
+                                                   char * dst_block = reinterpret_cast<char *>(
+                                                       reinterpret_cast<char *>(dst_d) + dst_offset);
+                                                   cpyblck(src_block, dst_block);
+                                               });
         });
     GGML_UNUSED(ne10);
     GGML_UNUSED(ne13);
@@ -685,10 +725,17 @@ static sycl::event set_rows_sycl(const char *  src0_d,
     constexpr int block_size = 64;
     const int64_t grid_size  = ceil_div(total_elements, block_size);
 
-    return stream->parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> item_ct1) {
-        k_set_rows<TIn, TIdx, TOut>(src0_d, src1_d, dst_d, ne00, ne01, ne02, ne11, ne12, nb01, nb02, nb03, nb10, nb11,
-                                    nb12, nb1, nb2, nb3, src_type_size, dst_type_size, total_elements, item_ct1);
-    });
+    return ggml_sycl_set_rows_profile_submit(
+        *stream, "sycl.set_rows.generic", "role=set_rows;kind=generic",
+        static_cast<size_t>(total_elements) * dst_type_size, [&](sycl::queue & profiled_queue) {
+            return profiled_queue.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size),
+                                               [=](sycl::nd_item<1> item_ct1) {
+                                                   k_set_rows<TIn, TIdx, TOut>(
+                                                       src0_d, src1_d, dst_d, ne00, ne01, ne02, ne11, ne12, nb01, nb02,
+                                                       nb03, nb10, nb11, nb12, nb1, nb2, nb3, src_type_size,
+                                                       dst_type_size, total_elements, item_ct1);
+                                               });
+        });
 }
 
 // FP8 E4M3 specific kernel (can't use templated convert with non-SYCL type)
@@ -762,10 +809,16 @@ static sycl::event set_rows_sycl_fp8(const char *  src0_d,
     constexpr int block_size = 64;
     const int64_t grid_size  = ceil_div(total_elements, block_size);
 
-    return stream->parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> item_ct1) {
-        k_set_rows_fp8<TIdx>(src0_d, src1_d, dst_d, ne00, ne01, ne02, ne11, ne12, nb01, nb02, nb03, nb10, nb11, nb12,
-                             nb1, nb2, nb3, total_elements, item_ct1);
-    });
+    return ggml_sycl_set_rows_profile_submit(
+        *stream, "sycl.set_rows.fp8", "role=set_rows;kind=fp8",
+        static_cast<size_t>(total_elements) * sizeof(fp8_e4m3_t), [&](sycl::queue & profiled_queue) {
+            return profiled_queue.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size),
+                                               [=](sycl::nd_item<1> item_ct1) {
+                                                   k_set_rows_fp8<TIdx>(src0_d, src1_d, dst_d, ne00, ne01, ne02, ne11,
+                                                                        ne12, nb01, nb02, nb03, nb10, nb11, nb12, nb1,
+                                                                        nb2, nb3, total_elements, item_ct1);
+                                               });
+        });
 }
 
 template <typename TIn, typename TIdx>

@@ -2,6 +2,7 @@
 
 #include "common.hpp"
 #include "ggml-impl.h"
+#include "sycl-kernel-profiler.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -30,6 +31,39 @@ static int queue_device_or_host(sycl::queue & queue) {
     } catch (...) {
         return mem_handle::HOST_DEVICE;
     }
+}
+
+static ggml_sycl_profile_label make_memcpy_profile_label(sycl::queue & queue,
+                                                         const char *  name,
+                                                         const char *  metadata,
+                                                         const char *  queue_kind,
+                                                         size_t        bytes) {
+    ggml_sycl_profile_label label{};
+    label.name       = name;
+    label.category   = "memory";
+    label.queue_kind = queue_kind;
+    label.metadata   = metadata;
+    label.device     = queue_device_or_host(queue);
+    label.bytes      = bytes;
+    return label;
+}
+
+template <typename SubmitFn>
+static sycl::event ggml_sycl_memcpy_profile_submit(sycl::queue & queue,
+                                                   const char *  name,
+                                                   const char *  metadata,
+                                                   const char *  queue_kind,
+                                                   size_t        bytes,
+                                                   SubmitFn &&   submit_fn,
+                                                   const char *  file     = __builtin_FILE(),
+                                                   int           line     = __builtin_LINE(),
+                                                   const char *  function = __builtin_FUNCTION()) {
+    if (!ggml_sycl_kernel_profile_enabled()) {
+        return submit_fn(queue);
+    }
+
+    ggml_sycl_profile_label label = make_memcpy_profile_label(queue, name, metadata, queue_kind, bytes);
+    return ggml_sycl_profile_submit(queue, label, static_cast<SubmitFn &&>(submit_fn), file, line, function);
 }
 
 static sycl::queue & queue_for_device_or_fallback(int device, sycl::queue & fallback) {
@@ -184,7 +218,13 @@ static sycl::event mem_copy_direct_submit(const mem_handle &               dst,
                                           size_t                           src_offset,
                                           size_t                           size,
                                           sycl::queue &                    queue,
-                                          const std::vector<sycl::event> & deps) {
+                                          const std::vector<sycl::event> & deps,
+                                          const char *                     profile_name = "sycl.memcpy.mem_ops",
+                                          const char * profile_metadata = "role=memcpy;path=mem_ops",
+                                          const char * profile_queue_kind = "copy",
+                                          const char * file               = __builtin_FILE(),
+                                          int          line               = __builtin_LINE(),
+                                          const char * function           = __builtin_FUNCTION()) {
     const int    queue_device = queue_device_or_host(queue);
     resolved_ptr d            = dst.resolve(queue_device);
     resolved_ptr s            = src.resolve(queue_device);
@@ -199,12 +239,13 @@ static sycl::event mem_copy_direct_submit(const mem_handle &               dst,
         return sycl::event{};
     }
 
-    sycl::event event;
-    event = queue.submit([&](sycl::handler & cgh) {
-        add_deps(cgh, deps);
-        cgh.memcpy(dst_ptr, src_ptr, size);
-    });
-    return event;
+    return ggml_sycl_memcpy_profile_submit(
+        queue, profile_name, profile_metadata, profile_queue_kind, size, [&](sycl::queue & profiled_q) {
+            return profiled_q.submit([&](sycl::handler & cgh) {
+                add_deps(cgh, deps);
+                cgh.memcpy(dst_ptr, src_ptr, size);
+            });
+        }, file, line, function);
 }
 
 static sycl::event mem_copy_submit(const mem_handle &               dst,
@@ -239,14 +280,15 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
         }
 
         trace_mem_copy_submit("cross-d2h", src_stage, 0, src, src_offset, size, src_queue);
-        sycl::event d2h =
-            mem_copy_direct_submit(src_stage, 0, src, src_offset, size, src_queue, deps);
+        sycl::event d2h = mem_copy_direct_submit(src_stage, 0, src, src_offset, size, src_queue, deps,
+                                                 "sycl.memcpy.cross_device", "role=memcpy;path=cross_device");
 
         if (queues_share_context(src_queue, dst_queue)) {
             std::vector<sycl::event> h2d_deps;
             h2d_deps.push_back(d2h);
             trace_mem_copy_submit("cross-h2d", dst, dst_offset, src_stage, 0, size, dst_queue);
-            sycl::event h2d = mem_copy_direct_submit(dst, dst_offset, src_stage, 0, size, dst_queue, h2d_deps);
+            sycl::event h2d = mem_copy_direct_submit(dst, dst_offset, src_stage, 0, size, dst_queue, h2d_deps,
+                                                     "sycl.memcpy.cross_device", "role=memcpy;path=cross_device");
             if (retain_until_event) {
                 retain_handles_until_event({ dst, src, src_stage }, h2d);
             } else {
@@ -271,7 +313,8 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
         std::memcpy(dst_stage_ptr.ptr, src_stage_ptr.ptr, size);
 
         trace_mem_copy_submit("cross-h2d", dst, dst_offset, dst_stage, 0, size, dst_queue);
-        sycl::event h2d = mem_copy_direct_submit(dst, dst_offset, dst_stage, 0, size, dst_queue, {});
+        sycl::event h2d = mem_copy_direct_submit(dst, dst_offset, dst_stage, 0, size, dst_queue, {},
+                                                 "sycl.memcpy.cross_device", "role=memcpy;path=cross_device");
         if (retain_until_event) {
             retain_handles_until_event({ dst, src, src_stage, dst_stage }, h2d);
         } else {
@@ -366,7 +409,10 @@ static sycl::event mem_fill_direct_submit(const mem_handle &               h,
                                           int                              value,
                                           size_t                           size,
                                           sycl::queue &                    queue,
-                                          const std::vector<sycl::event> & deps) {
+                                          const std::vector<sycl::event> & deps,
+                                          const char *                     file     = __builtin_FILE(),
+                                          int                              line     = __builtin_LINE(),
+                                          const char *                     function = __builtin_FUNCTION()) {
     const int    queue_device = queue_device_or_host(queue);
     resolved_ptr r            = h.resolve(queue_device);
     GGML_ASSERT(r && "mem_fill_async on unresolved handle");
@@ -380,12 +426,13 @@ static sycl::event mem_fill_direct_submit(const mem_handle &               h,
         return sycl::event{};
     }
 
-    sycl::event event;
-    event = queue.submit([&](sycl::handler & cgh) {
-        add_deps(cgh, deps);
-        cgh.memset(ptr, value, size);
-    });
-    return event;
+    return ggml_sycl_memcpy_profile_submit(
+        queue, "sycl.memcpy.mem_fill", "role=memfill;path=mem_ops", "copy", size, [&](sycl::queue & profiled_q) {
+            return profiled_q.submit([&](sycl::handler & cgh) {
+                add_deps(cgh, deps);
+                cgh.memset(ptr, value, size);
+            });
+        }, file, line, function);
 }
 
 static sycl::event mem_fill_submit(const mem_handle &               h,
