@@ -129,6 +129,21 @@ int main() {
     CHECK(contains(json, "\"file\":\"tests/test-sycl-kernel-profiler.cpp\""), "missing raw file");
     CHECK(contains(json, "\"function\":\"main\""), "missing raw function");
     CHECK(contains(json, "\"graph_recorded\":1"), "missing raw graph flag");
+    CHECK(!contains(json, "\"node_op\""), "node context should be absent before a node scope is active");
+
+    {
+        ggml_sycl_kernel_profile_node_scope node_scope(5, 42, 1374, "MUL_MAT_ID", "ffn_gate_exps");
+        ggml_sycl_kernel_profile_add_raw_event_for_test(slow, 43, 200, 210, 2000, 2200, 2600, "test-node",
+                                                        "tests/test-sycl-kernel-profiler.cpp", 124, "main", false);
+    }
+    const std::string node_json = ggml_sycl_kernel_profile_format_json_for_test();
+    CHECK(contains(node_json, "\"node_step\":5"), "missing raw node step");
+    CHECK(contains(node_json, "\"node_idx\":42"), "missing raw node index");
+    CHECK(contains(node_json, "\"node_count\":1374"), "missing raw node count");
+    CHECK(contains(node_json, "\"node_op\":\"MUL_MAT_ID\""), "missing raw node op");
+    CHECK(contains(node_json, "\"node_tensor\":\"ffn_gate_exps\""), "missing raw node tensor");
+    CHECK(!contains(ggml_sycl_kernel_profile_format_csv_for_test(), "node_op"),
+          "node context should not enter CSV keys");
 
     cfg.raw_events = false;
     ggml_sycl_kernel_profile_set_config_for_test(cfg);

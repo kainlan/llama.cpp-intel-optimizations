@@ -39,6 +39,34 @@ struct ggml_sycl_profile_label {
     size_t       bytes      = 0;
 };
 
+struct ggml_sycl_kernel_profile_node_context {
+    bool         active     = false;
+    int64_t      step       = -1;
+    int          node_idx   = -1;
+    int          node_count = 0;
+    const char * op         = "";
+    const char * tensor     = "";
+};
+
+void ggml_sycl_kernel_profile_set_node_context(const ggml_sycl_kernel_profile_node_context & ctx);
+void ggml_sycl_kernel_profile_clear_node_context();
+
+class ggml_sycl_kernel_profile_node_scope {
+  public:
+    ggml_sycl_kernel_profile_node_scope(int64_t      step,
+                                        int          node_idx,
+                                        int          node_count,
+                                        const char * op,
+                                        const char * tensor);
+    ~ggml_sycl_kernel_profile_node_scope();
+
+    ggml_sycl_kernel_profile_node_scope(const ggml_sycl_kernel_profile_node_scope &)             = delete;
+    ggml_sycl_kernel_profile_node_scope & operator=(const ggml_sycl_kernel_profile_node_scope &) = delete;
+
+  private:
+    ggml_sycl_kernel_profile_node_context previous_;
+};
+
 bool                            ggml_sycl_kernel_profile_enabled();
 ggml_sycl_kernel_profile_config ggml_sycl_kernel_profile_config_from_env();
 void                            ggml_sycl_kernel_profile_record_event(const ggml_sycl_profile_label &   label,

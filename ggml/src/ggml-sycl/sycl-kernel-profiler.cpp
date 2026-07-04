@@ -58,27 +58,29 @@ struct profile_aggregate {
 };
 
 struct pending_profile_event {
-    profile_label_snapshot label;
-    sycl::event            event;
-    uint64_t               event_id                    = 0;
-    uint64_t               host_submit_begin_us        = 0;
-    uint64_t               host_submit_end_us          = 0;
-    int64_t                timeline_graph_compute_step = -1;
-    callsite_snapshot      callsite;
+    profile_label_snapshot                label;
+    sycl::event                           event;
+    uint64_t                              event_id                    = 0;
+    uint64_t                              host_submit_begin_us        = 0;
+    uint64_t                              host_submit_end_us          = 0;
+    int64_t                               timeline_graph_compute_step = -1;
+    callsite_snapshot                     callsite;
+    ggml_sycl_kernel_profile_node_context node_context;
 };
 
 struct raw_profile_event {
-    profile_label_snapshot label;
-    uint64_t               event_id                    = 0;
-    uint64_t               host_submit_begin_us        = 0;
-    uint64_t               host_submit_end_us          = 0;
-    uint64_t               device_submit_ns            = 0;
-    uint64_t               device_start_ns             = 0;
-    uint64_t               device_end_ns               = 0;
-    int64_t                timeline_graph_compute_step = -1;
-    std::string            timestamp_status;
-    callsite_snapshot      callsite;
-    bool                   graph_recorded = false;
+    profile_label_snapshot                label;
+    uint64_t                              event_id                    = 0;
+    uint64_t                              host_submit_begin_us        = 0;
+    uint64_t                              host_submit_end_us          = 0;
+    uint64_t                              device_submit_ns            = 0;
+    uint64_t                              device_start_ns             = 0;
+    uint64_t                              device_end_ns               = 0;
+    int64_t                               timeline_graph_compute_step = -1;
+    std::string                           timestamp_status;
+    callsite_snapshot                     callsite;
+    ggml_sycl_kernel_profile_node_context node_context;
+    bool                                  graph_recorded = false;
 };
 
 struct profile_row {
@@ -118,6 +120,8 @@ profiler_state & get_profiler_state() {
     static profiler_state * state = new profiler_state();
     return *state;
 }
+
+thread_local ggml_sycl_kernel_profile_node_context g_kernel_profile_node_context;
 
 std::string string_from_cstr(const char * value, const char * fallback) {
     return value != nullptr ? std::string(value) : std::string(fallback);
@@ -211,6 +215,18 @@ callsite_snapshot snapshot_callsite(ggml_sycl::sycl_timeline_callsite callsite) 
     snapshot.line     = callsite.line;
     snapshot.function = string_from_cstr(callsite.function, "unknown");
     return snapshot;
+}
+
+ggml_sycl_kernel_profile_node_context snapshot_node_context() {
+    return g_kernel_profile_node_context;
+}
+
+void append_node_context_metadata(std::ostringstream & out, const ggml_sycl_kernel_profile_node_context & ctx) {
+    if (!ctx.active) {
+        return;
+    }
+    out << ";node_step=" << ctx.step << ";node_idx=" << ctx.node_idx << ";node_op=" << string_from_cstr(ctx.op, "")
+        << ";node_tensor=" << string_from_cstr(ctx.tensor, "") << ";node_count=" << ctx.node_count;
 }
 
 profile_aggregate & ensure_aggregate_locked(profiler_state & state, const profile_label_snapshot & label) {
@@ -400,7 +416,14 @@ std::string format_json_rows(const std::vector<profile_row> &       rows,
                 << json_escape(event.timestamp_status) << "\"," << "\"file\":\"" << json_escape(event.callsite.file)
                 << "\"," << "\"line\":" << event.callsite.line << ',' << "\"function\":\""
                 << json_escape(event.callsite.function) << "\","
-                << "\"graph_recorded\":" << (event.graph_recorded ? 1 : 0) << '}';
+                << "\"graph_recorded\":" << (event.graph_recorded ? 1 : 0);
+            if (event.node_context.active) {
+                out << ",\"node_step\":" << event.node_context.step << ",\"node_idx\":" << event.node_context.node_idx
+                    << ",\"node_count\":" << event.node_context.node_count << ",\"node_op\":\""
+                    << json_escape(string_from_cstr(event.node_context.op, "")) << "\",\"node_tensor\":\""
+                    << json_escape(string_from_cstr(event.node_context.tensor, "")) << '"';
+            }
+            out << '}';
         }
         out << ']';
     }
@@ -451,13 +474,16 @@ ggml_sycl::sycl_timeline_callsite to_timeline_callsite(const callsite_snapshot &
     return ggml_sycl::sycl_timeline_callsite{ callsite.file.c_str(), callsite.line, callsite.function.c_str() };
 }
 
-std::string timeline_metadata_common(const profile_label_snapshot & label, uint64_t event_id) {
+std::string timeline_metadata_common(const profile_label_snapshot &                label,
+                                     uint64_t                                      event_id,
+                                     const ggml_sycl_kernel_profile_node_context & node_context = {}) {
     std::ostringstream out;
     out << "event_id=" << event_id << ";profile_category=" << label.key.category << ";queue_kind=" << label.queue_kind
         << ";device=" << label.device << ";bytes=" << label.bytes;
     if (!label.key.metadata.empty()) {
         out << ";metadata=" << label.key.metadata;
     }
+    append_node_context_metadata(out, node_context);
     return out.str();
 }
 
@@ -468,7 +494,8 @@ void record_timeline_submit_span(const pending_profile_event & pending_event) {
         return;
     }
 
-    const std::string metadata = timeline_metadata_common(pending_event.label, pending_event.event_id);
+    const std::string metadata =
+        timeline_metadata_common(pending_event.label, pending_event.event_id, pending_event.node_context);
     ggml_sycl::sycl_timeline_record_span("sycl.submit", pending_event.label.key.name.c_str(), metadata.c_str(),
                                          to_timeline_callsite(pending_event.callsite),
                                          steady_time_point_from_us(pending_event.host_submit_begin_us),
@@ -492,6 +519,7 @@ raw_profile_event make_raw_event(const pending_profile_event & pending_event,
     raw_event.device_end_ns               = device_end_ns;
     raw_event.timestamp_status            = string_from_cstr(timestamp_status, "unknown");
     raw_event.callsite                    = pending_event.callsite;
+    raw_event.node_context                = pending_event.node_context;
     raw_event.graph_recorded              = graph_recorded;
     return raw_event;
 }
@@ -507,8 +535,8 @@ void record_timeline_event_span(const raw_profile_event & event) {
     }
 
     std::ostringstream metadata;
-    metadata << timeline_metadata_common(event.label, event.event_id) << ";timestamp_status=" << event.timestamp_status
-             << ";device_clock=sycl_event_profiling_ns"
+    metadata << timeline_metadata_common(event.label, event.event_id, event.node_context)
+             << ";timestamp_status=" << event.timestamp_status << ";device_clock=sycl_event_profiling_ns"
              << ";timeline_anchor=device_zero;device_submit_ns=" << event.device_submit_ns
              << ";device_start_ns=" << event.device_start_ns << ";device_end_ns=" << event.device_end_ns
              << ";duration_ns=" << duration_ns << ";graph_recorded=" << (event.graph_recorded ? 1 : 0);
@@ -668,6 +696,34 @@ bool effective_wait_for_flush(const ggml_sycl_kernel_profile_config & cfg, bool 
 
 }  // namespace
 
+void ggml_sycl_kernel_profile_set_node_context(const ggml_sycl_kernel_profile_node_context & ctx) {
+    g_kernel_profile_node_context = ctx;
+}
+
+void ggml_sycl_kernel_profile_clear_node_context() {
+    g_kernel_profile_node_context = {};
+}
+
+ggml_sycl_kernel_profile_node_scope::ggml_sycl_kernel_profile_node_scope(int64_t      step,
+                                                                         int          node_idx,
+                                                                         int          node_count,
+                                                                         const char * op,
+                                                                         const char * tensor) :
+    previous_(g_kernel_profile_node_context) {
+    ggml_sycl_kernel_profile_node_context ctx;
+    ctx.active     = true;
+    ctx.step       = step;
+    ctx.node_idx   = node_idx;
+    ctx.node_count = node_count;
+    ctx.op         = op != nullptr ? op : "";
+    ctx.tensor     = tensor != nullptr ? tensor : "";
+    ggml_sycl_kernel_profile_set_node_context(ctx);
+}
+
+ggml_sycl_kernel_profile_node_scope::~ggml_sycl_kernel_profile_node_scope() {
+    g_kernel_profile_node_context = previous_;
+}
+
 ggml_sycl_kernel_profile_config ggml_sycl_kernel_profile_config_from_env() {
     ggml_sycl_kernel_profile_config cfg;
 
@@ -723,6 +779,7 @@ void ggml_sycl_kernel_profile_record_event(const ggml_sycl_profile_label &   lab
     pending_event.host_submit_end_us          = host_submit_end_us;
     pending_event.timeline_graph_compute_step = ggml_sycl::sycl_timeline_current_graph_compute_step();
     pending_event.callsite                    = snapshot_callsite(callsite);
+    pending_event.node_context                = snapshot_node_context();
 
     record_timeline_submit_span(pending_event);
 
@@ -766,6 +823,8 @@ void ggml_sycl_kernel_profile_flush(bool wait_for_events, const char * reason) {
 }
 
 void ggml_sycl_kernel_profile_reset_for_test() {
+    ggml_sycl_kernel_profile_clear_node_context();
+
     profiler_state &            state = get_profiler_state();
     std::lock_guard<std::mutex> lock(state.mutex);
     state.env_config_loaded   = false;
@@ -823,6 +882,7 @@ void ggml_sycl_kernel_profile_add_raw_event_for_test(const ggml_sycl_profile_lab
     raw_event.device_end_ns               = device_end_ns;
     raw_event.timestamp_status            = string_from_cstr(timestamp_status, "unknown");
     raw_event.callsite       = snapshot_callsite(ggml_sycl::sycl_timeline_callsite{ file, line, function });
+    raw_event.node_context   = snapshot_node_context();
     raw_event.graph_recorded = graph_recorded;
 
     profiler_state &            state = get_profiler_state();
