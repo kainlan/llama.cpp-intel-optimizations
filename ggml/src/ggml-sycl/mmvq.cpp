@@ -58,12 +58,21 @@ static ggml_sycl_profile_label mmvq_profile_label(sycl::queue & queue,
     return label;
 }
 
-static sycl::event mmvq_profile_record_quantize_activation_q8_soa(sycl::queue &       queue,
-                                                                  const sycl::event & event,
-                                                                  size_t              bytes) {
+static sycl::event mmvq_profile_submit_quantize_activation_q8_soa(sycl::queue & queue,
+                                                                  const float * src,
+                                                                  char *        dst,
+                                                                  int64_t       k,
+                                                                  int64_t       nr,
+                                                                  int64_t       padded_k,
+                                                                  size_t        bytes,
+                                                                  const char *  file     = __builtin_FILE(),
+                                                                  int           line     = __builtin_LINE(),
+                                                                  const char *  function = __builtin_FUNCTION()) {
     ggml_sycl_profile_label label =
         mmvq_profile_label(queue, "mxfp4.quantize.activation_q8_soa", "role=activation;layout=q8_soa", "mmvq", bytes);
-    return ggml_sycl_profile_record_returned_event(label, event);
+    return ggml_sycl_profile_submit(queue, label, [&](sycl::queue & profiled_queue) {
+        return quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(src, dst, k, nr, padded_k, &profiled_queue);
+    }, file, line, function);
 }
 
 static __dpct_inline__ float mmvq_fused_add_value(const float * add,
@@ -17139,11 +17148,8 @@ bool mmvq_moe_batched_dispatch_pair_mxfp4_soa(ggml_backend_sycl_context & ctx,
         stream->wait();
         t_quant_begin = std::chrono::high_resolution_clock::now();
     }
-    sycl::event activation_q8_event = mmvq_profile_record_quantize_activation_q8_soa(
-        *stream,
-        quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(src1_d, (char *) q8_1_buffer, ne10, total_src1_rows,
-                                                              ne10_padded, stream),
-        required_size);
+    sycl::event activation_q8_event = mmvq_profile_submit_quantize_activation_q8_soa(
+        *stream, src1_d, (char *) q8_1_buffer, ne10, total_src1_rows, ne10_padded, required_size);
     if (tg_profile) {
         stream->wait();
     }
@@ -17393,11 +17399,8 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
         stream->wait();
         t_quant_begin = std::chrono::high_resolution_clock::now();
     }
-    sycl::event activation_q8_event = mmvq_profile_record_quantize_activation_q8_soa(
-        *stream,
-        quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(src1_d, (char *) q8_1_buffer, ne10, total_src1_rows,
-                                                              ne10_padded, stream),
-        required_size);
+    sycl::event activation_q8_event = mmvq_profile_submit_quantize_activation_q8_soa(
+        *stream, src1_d, (char *) q8_1_buffer, ne10, total_src1_rows, ne10_padded, required_size);
     if (detail_profile) {
         stream->wait();
     }

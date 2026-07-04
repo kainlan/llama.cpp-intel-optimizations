@@ -90,6 +90,27 @@ def test_mmvq_copy_helper_records_named_copy_event() -> None:
     assert "ggml_sycl::mem_copy_async" in body
 
 
+def test_mmvq_activation_quantize_uses_submit_wrapper_for_host_brackets() -> None:
+    mmvq = MMVQ.read_text(encoding="utf-8")
+    helper = slice_between(
+        mmvq,
+        "static sycl::event mmvq_profile_",
+        "static __dpct_inline__ float mmvq_fused_add_value",
+    )
+    assert "static sycl::event mmvq_profile_submit_quantize_activation_q8_soa" in helper
+    assert "mxfp4.quantize.activation_q8_soa" in helper
+    assert "__builtin_FILE()" in helper
+    assert "__builtin_LINE()" in helper
+    assert "__builtin_FUNCTION()" in helper
+    assert "ggml_sycl_profile_submit(queue" in helper
+    assert "file, line, function" in helper
+    assert "quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>" in helper
+    assert "ggml_sycl_profile_record_returned_event" not in helper
+    assert ".wait(" not in helper
+    assert "mmvq_profile_record_quantize_activation_q8_soa" not in mmvq
+    assert mmvq.count("mmvq_profile_submit_quantize_activation_q8_soa(") == 3
+
+
 def test_mmvq_active_blind_spots_have_named_profile_labels() -> None:
     mmvq = MMVQ.read_text(encoding="utf-8")
     for label in [
