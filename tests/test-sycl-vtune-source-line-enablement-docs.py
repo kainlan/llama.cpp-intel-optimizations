@@ -29,11 +29,14 @@ def test_source_line_enablement_docs_define_three_evidence_layers() -> None:
     assert section.index("VTune computing-task selection") < section.index("VTune `gpu-source-line`")
 
 
-def test_probe_matrix_must_pass_before_mxfp4_feasibility() -> None:
+def test_probe_matrix_must_produce_accepted_status_before_mxfp4_feasibility() -> None:
     section = source_line_section()
     assert "sycl-source-line-probe" in section
     assert "scripts/sycl-vtune-source-line-feasibility.sh" in section
-    assert "matrix must pass before MXFP4 exact-line feasibility runs" in section
+    assert "matrix must produce an accepted source-line status before MXFP4 source-line feasibility runs" in section
+    assert "source_line.status pass" in section
+    assert "source_line.status asm-line-static-cost" in section
+    assert "source_line.status dwarf-line-table-only" in section
     assert section.index("sycl-source-line-probe") < section.index("scripts/sycl-vtune-source-line-feasibility.sh")
     assert "--require-matrix-pass /tmp/sycl_source_line_matrix_20260705_120000/build-matrix/debug_full/source-line-feasibility.parse" in section
 
