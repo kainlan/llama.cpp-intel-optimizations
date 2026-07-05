@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import posixpath
 import re
@@ -15,6 +16,7 @@ FILE_RE = re.compile(r"^\s*file_names\[\s*(\d+)\s*\]:\s*$")
 NAME_RE = re.compile(r"^\s*name:\s*(.*?)\s*$")
 DIR_INDEX_RE = re.compile(r"^\s*dir_index:\s*(\d+)\s*$")
 ROW_RE = re.compile(r"^\s*0x[0-9a-fA-F]+\s+(\d+)\s+(\d+)\s+(\d+)\s+")
+TABLE_START_RE = re.compile(r"^\s*(?:\.debug_line contents:|debug_line\[[^\]]+\])\s*$")
 
 
 class LineTableError(Exception):
@@ -25,6 +27,18 @@ class LineTableError(Exception):
 class FileEntry:
     name: str = ""
     dir_index: int = 0
+
+
+def unquote_llvm_string(value: str) -> str:
+    stripped = value.strip()
+    if len(stripped) >= 2 and stripped[0] in {'"', "'"} and stripped[-1] == stripped[0]:
+        try:
+            parsed = ast.literal_eval(stripped)
+        except (SyntaxError, ValueError):
+            return stripped[1:-1]
+        if isinstance(parsed, str):
+            return parsed
+    return stripped
 
 
 def normalize_path(path: str) -> str:
@@ -58,25 +72,32 @@ def parse_line_table(text: str, require_path: str | None = None) -> dict[str, ob
     include_directories: dict[int, str] = {}
     file_entries: dict[int, FileEntry] = {}
     current_file_index: int | None = None
-    source_row_file_ids: list[int] = []
+    source_rows = 0
+    row_files: set[str] = set()
 
     for line in text.splitlines():
+        if TABLE_START_RE.match(line):
+            include_directories = {}
+            file_entries = {}
+            current_file_index = None
+            continue
+
         include_match = INCLUDE_RE.match(line)
         if include_match:
-            include_directories[int(include_match.group(1))] = normalize_path(include_match.group(2))
+            include_directories[int(include_match.group(1))] = normalize_path(unquote_llvm_string(include_match.group(2)))
             current_file_index = None
             continue
 
         file_match = FILE_RE.match(line)
         if file_match:
             current_file_index = int(file_match.group(1))
-            file_entries.setdefault(current_file_index, FileEntry())
+            file_entries[current_file_index] = FileEntry()
             continue
 
         if current_file_index is not None:
             name_match = NAME_RE.match(line)
             if name_match:
-                file_entries[current_file_index].name = name_match.group(1).strip()
+                file_entries[current_file_index].name = unquote_llvm_string(name_match.group(1))
                 continue
             dir_index_match = DIR_INDEX_RE.match(line)
             if dir_index_match:
@@ -88,18 +109,15 @@ def parse_line_table(text: str, require_path: str | None = None) -> dict[str, ob
             line_number = int(row_match.group(1))
             file_id = int(row_match.group(3))
             if line_number > 0:
-                source_row_file_ids.append(file_id)
+                entry = file_entries.get(file_id)
+                if entry is None:
+                    raise LineTableError(f"source row references unknown file id {file_id}")
+                row_files.add(resolve_file_path(entry, include_directories))
+                source_rows += 1
             current_file_index = None
 
-    if not source_row_file_ids:
+    if not source_rows:
         raise LineTableError("no source rows found")
-
-    row_files: set[str] = set()
-    for file_id in source_row_file_ids:
-        entry = file_entries.get(file_id)
-        if entry is None:
-            raise LineTableError(f"source row references unknown file id {file_id}")
-        row_files.add(resolve_file_path(entry, include_directories))
 
     files = sorted(row_files)
     if not files:
@@ -113,7 +131,7 @@ def parse_line_table(text: str, require_path: str | None = None) -> dict[str, ob
         "files": files,
         "required_path": required_path,
         "required_path_present": required_path_present,
-        "source_rows": len(source_row_file_ids),
+        "source_rows": source_rows,
         "status": "ok",
     }
 

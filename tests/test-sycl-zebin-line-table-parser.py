@@ -42,6 +42,55 @@ Address            Line   Column File   ISA Discriminator Flags
     assert data["files"] == ["/Apps/llama.cpp/tools/sycl-source-line-probe/main.cpp"]
 
 
+def test_zebin_line_table_unquotes_llvm_string_fields() -> None:
+    decoded_dump = """
+.debug_line contents:
+include_directories[  1] = "/Apps/llama.cpp/tools/sycl-source-line-probe"
+file_names[  1]:
+           name: "main.cpp"
+      dir_index: 1
+Address            Line   Column File   ISA Discriminator Flags
+------------------ ------ ------ ------ --- ------------- -------------
+0x0000000000000040  150      17     1     0             0  is_stmt
+"""
+    result = run_parser(decoded_dump, "--require-path", "tools/sycl-source-line-probe/main.cpp")
+
+    assert result.returncode == 0, result.stdout
+    data = json.loads(result.stdout)
+    assert data["required_path_present"] is True
+    assert data["files"] == ["/Apps/llama.cpp/tools/sycl-source-line-probe/main.cpp"]
+
+
+def test_zebin_line_table_scopes_reused_file_indices_per_table() -> None:
+    decoded_dump = """
+.debug_line contents:
+debug_line[0x00000000]
+include_directories[  1] = /Apps/llama.cpp/tools/sycl-source-line-probe
+file_names[  1]:
+           name: main.cpp
+      dir_index: 1
+Address            Line   Column File   ISA Discriminator Flags
+------------------ ------ ------ ------ --- ------------- -------------
+0x0000000000000040  150      17     1     0             0  is_stmt
+debug_line[0x00000080]
+include_directories[  1] = /Apps/llama.cpp/ggml/src/ggml-sycl
+file_names[  1]:
+           name: mmvq.cpp
+      dir_index: 1
+Address            Line   Column File   ISA Discriminator Flags
+------------------ ------ ------ ------ --- ------------- -------------
+0x0000000000000080  200      11     1     0             0  is_stmt
+"""
+    result = run_parser(decoded_dump, "--require-path", "tools/sycl-source-line-probe/main.cpp")
+
+    assert result.returncode == 0, result.stdout
+    data = json.loads(result.stdout)
+    assert data["source_rows"] == 2
+    assert data["required_path_present"] is True
+    assert "/Apps/llama.cpp/tools/sycl-source-line-probe/main.cpp" in data["files"]
+    assert "/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp" in data["files"]
+
+
 def test_zebin_line_table_reports_missing_source_rows_without_traceback() -> None:
     decoded_dump = """
 .debug_line contents:
