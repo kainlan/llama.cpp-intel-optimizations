@@ -1317,6 +1317,58 @@ The main closure evidence is `parsed/layer-ledger.parse` plus `parsed/source-lin
 
 Real model/GPU validation is lead-owned. Under delegated documentation/source-test work, workers must not run this runner with `--execute`, real model/GPU validation, llama-bench, sycl-kernel-bench, VTune, sycl-ls, DRM, lsof, or P2P probes. Workers may run documentation/source-only tests such as pytest checks for this section.
 
+### Staged layered SYCL profiling closure
+
+`scripts/sycl-gptoss-staged-attribution-profile.sh` is the preferred closure pipeline when the monolithic full runner cannot collect stable all-in-one VTune, Unified Runtime, Level Zero, timeline, kernel, and ablation evidence. It keeps profiling perturbation low by collecting independent stages, writing a `stage-manifest.json` for each stage, and then merging only metadata-matched evidence with `scripts/merge-sycl-staged-ledger.py`. It is dry-run by default; real execution requires both `--execute --i-understand-this-runs-staged-gpu-profiling` and lead ownership.
+
+Dry-run command:
+
+```bash
+bash scripts/sycl-gptoss-staged-attribution-profile.sh \
+  --dry-run \
+  --out-root /tmp/sycl_gptoss_staged_attribution_dryrun
+```
+
+Lead-only real command. Keep the oneAPI wrapper exactly around the environment source step so `set -u` shells do not fail inside Intel's setup script:
+
+```bash
+set +u
+source /opt/intel/oneapi/setvars.sh --force
+set -u
+bash scripts/sycl-gptoss-staged-attribution-profile.sh \
+  --execute \
+  --i-understand-this-runs-staged-gpu-profiling \
+  --out-root /tmp/sycl_gptoss_staged_attribution_$(date +%Y%m%d_%H%M%S)
+```
+
+Use the canonical GPT-OSS FA-on staged knobs for this closure path: `-fa 1`, `GGML_SYCL_MOE_PHASE_MATERIALIZE=1`, `GGML_SYCL_MOE_PHASE_BULK_XMX=1`, and `GGML_SYCL_MOE_DOWN_SUM_DIRECT=1`. PP/TG measurements collected by the staged runner are guardrails only; this workflow closes attribution evidence and does not optimize TG performance.
+
+Each stage writes its own root plus manifest, and the merger rejects cross-run evidence unless all stage manifests metadata-match on build/model/device/FA/MoE/prompt/gen/repeat:
+
+| Stage directory | Evidence role |
+|---|---|
+| `base/` | Baseline timeline, named SYCL kernel profiler output, E2E stderr, and `base/stage-manifest.json`. |
+| `l0/` | Level Zero API trace conversion plus `l0/stage-manifest.json`. |
+| `ur/` | Unified Runtime trace conversion plus `ur/stage-manifest.json`. |
+| `vtune-source/` | VTune/source-line feasibility matrix verdict, exact-line blocker if any, and `vtune-source/stage-manifest.json`. |
+| `ablation/` | MXFP4 source-region ablation deltas and `ablation/stage-manifest.json`. |
+| `merged/` | Strict ledger emitted by `merge-sycl-staged-ledger.py` after manifest and source-attribution checks. |
+
+Strict staged closure is accepted only when the merged ledger reports all required layers and one closure-quality source-attribution path:
+
+| Status or metric | Accepted value | Meaning |
+|---|---|---|
+| `coverage.layer_status` | `ok` | All required staged layers have real observed evidence after manifest metadata matching. |
+| `layer.unknown_wall_ms_x1000` | Present integer metric | Residual wall time remains explicit in the ledger instead of being hidden or treated as success by omission. |
+| Exact source-line attribution | `source_line.status pass` with `source_attribution.status exact_source_line` | Preferred closure path when VTune/source-line evidence can name concrete GPU source lines. |
+| Source-region fallback | `source_line.status fail`, a recorded `source_line.blocker`, `source_attribution.status source_region_plus_ablation`, and `source_attribution.ablation_delta_ms_x1000` | Accepted only when exact source lines fail for a documented blocker and the fallback reaches source-region-plus-ablation evidence with a measured ablation delta. |
+| `metadata_mismatch` | Reject | One or more stage manifests differ; rerun or recollect matching stages rather than merging mixed evidence. |
+| `source_attribution_incomplete` | Reject | Exact source lines did not pass and the fallback did not reach `source_region_plus_ablation` with `source_attribution.ablation_delta_ms_x1000`. |
+
+Exact source lines may fail only when the blocker is recorded in the source-line verdict and the fallback reaches `source_region_plus_ablation`; plain source-region mapping is triage evidence, not closure. All stage manifests must metadata-match before interpreting `coverage.layer_status ok` as a staged closure result.
+
+Worker safety: workers must not run staged profiling with `--execute`, real model/GPU validation, `/Storage` models, llama-bench, sycl-kernel-bench, VTune, sycl-ls, `/dev/dri` or other DRM probes, lsof, P2P probes, or any real harness execution. Workers may run source/doc assertions and script dry-runs only; lead validation owns the real oneAPI/GPU execution.
+
 ## TODO
 
 - Review ZES_ENABLE_SYSMAN: https://github.com/intel/compute-runtime/blob/master/programmers-guide/SYSMAN.md#support-and-limitations
