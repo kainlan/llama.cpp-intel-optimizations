@@ -8,6 +8,7 @@ import csv
 import importlib.util
 import pathlib
 import posixpath
+import re
 import sys
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -40,9 +41,26 @@ ATTRIBUTION_MODE = "asm-line-static"
 ATTRIBUTION_STATUS = "asm_line_static_cost"
 NO_MATCH_BLOCKER = "no_asm_source_matches"
 
+ASM_KERNEL_MARKER_PATTERNS = (
+    re.compile(r"^\s*\.kernel\s+\"?([^\"\s]+)\"?", re.IGNORECASE),
+    re.compile(r"^\s*(?://\s*)?(?:kernel(?:\s+name)?|function|computing\s+task)\s*[:=]\s*(.+?)\s*$", re.IGNORECASE),
+    re.compile(r"^\s*(?://\s*)?disassembly\s+of\s+(?:kernel|function)\s+(.+?)\s*$", re.IGNORECASE),
+    re.compile(r"^\s*disassembly\s+of\s+section\s+\.text(?:[.$])?([^:]+):\s*$", re.IGNORECASE),
+)
+DWARF_KERNEL_MARKER_PATTERNS = (
+    re.compile(r"^\s*(?://\s*)?(?:kernel(?:\s+name)?|function|computing\s+task)\s*[:=]\s*(.+?)\s*$", re.IGNORECASE),
+    re.compile(r"^\s*(?://\s*)?debug[_ -]?line\s+(?:for|kernel|function)\s+(.+?)\s*$", re.IGNORECASE),
+)
+
 
 class ResolveError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class NamedTextSection:
+    name: str | None
+    text: str
 
 
 @dataclass
@@ -85,23 +103,88 @@ def require_existing_file(path: pathlib.Path, label: str) -> None:
         raise ResolveError(f"{label} file does not exist: {path}")
 
 
-def load_source_rows(dwarf_line_dump: pathlib.Path) -> list[Any]:
-    require_existing_file(dwarf_line_dump, "DWARF line dump")
-    module = load_module("parse_sycl_zebin_line_table", "parse-sycl-zebin-line-table.py")
+def normalize_task_text(raw: str) -> str:
+    return raw.strip().strip('"\'').rstrip(":")
+
+
+def task_matches(name: str | None, required_task: str) -> bool:
+    if not required_task:
+        return True
+    if name is None:
+        return False
+    name_text = normalize_task_text(name)
+    required_text = normalize_task_text(required_task)
+    return required_text in name_text or name_text in required_text
+
+
+def kernel_marker_name(raw: str, patterns: tuple[re.Pattern[str], ...]) -> str | None:
+    for pattern in patterns:
+        match = pattern.match(raw)
+        if match:
+            return normalize_task_text(match.group(1))
+    return None
+
+
+def split_named_sections(text: str, patterns: tuple[re.Pattern[str], ...]) -> tuple[list[NamedTextSection], bool]:
+    sections: list[NamedTextSection] = []
+    current_name: str | None = None
+    current_lines: list[str] = []
+    found_named_section = False
+
+    for raw in text.splitlines():
+        marker_name = kernel_marker_name(raw, patterns)
+        if marker_name is not None:
+            if current_name is not None or current_lines:
+                sections.append(NamedTextSection(current_name, "\n".join(current_lines) + "\n"))
+            current_name = marker_name
+            current_lines = [raw]
+            found_named_section = True
+            continue
+        current_lines.append(raw)
+
+    if current_name is not None or current_lines:
+        sections.append(NamedTextSection(current_name, "\n".join(current_lines) + "\n"))
+    return sections, found_named_section
+
+
+def select_text_for_task(text: str, patterns: tuple[re.Pattern[str], ...], source_computing_task: str) -> str:
+    sections, found_named_section = split_named_sections(text, patterns)
+    if not found_named_section:
+        return text
+    return "".join(section.text for section in sections if task_matches(section.name, source_computing_task))
+
+
+def parse_source_rows(module: Any, text: str, allow_empty: bool = False) -> list[Any]:
     try:
-        rows = module.parse_line_table_rows(dwarf_line_dump.read_text(encoding="utf-8", errors="replace"))
+        return module.parse_line_table_rows(text)
     except Exception as exc:
         line_table_error = getattr(module, "LineTableError", None)
         if isinstance(line_table_error, type) and isinstance(exc, line_table_error):
+            if allow_empty and str(exc) == "no source rows found":
+                return []
             raise ResolveError(str(exc)) from None
         raise
+
+
+def load_source_rows(dwarf_line_dump: pathlib.Path, source_computing_task: str) -> list[Any]:
+    require_existing_file(dwarf_line_dump, "DWARF line dump")
+    module = load_module("parse_sycl_zebin_line_table", "parse-sycl-zebin-line-table.py")
+    text = dwarf_line_dump.read_text(encoding="utf-8", errors="replace")
+    selected_text = select_text_for_task(text, DWARF_KERNEL_MARKER_PATTERNS, source_computing_task)
+    if not selected_text.strip():
+        return []
+    rows = parse_source_rows(module, selected_text, allow_empty=selected_text != text)
     return sorted(rows, key=lambda row: parse_hex_address(row.address))
 
 
-def load_instructions(asm_path: pathlib.Path) -> list[Any]:
+def load_instructions(asm_path: pathlib.Path, source_computing_task: str) -> list[Any]:
     require_existing_file(asm_path, "ASM")
     module = load_module("parse_sycl_vtune_kernel_asm", "parse-sycl-vtune-kernel-asm.py")
-    return sorted(module.parse_asm_instructions(asm_path), key=lambda row: row.address)
+    text = asm_path.read_text(encoding="utf-8", errors="replace")
+    selected_text = select_text_for_task(text, ASM_KERNEL_MARKER_PATTERNS, source_computing_task)
+    if not selected_text.strip():
+        return []
+    return sorted(module.parse_asm_instructions_text(selected_text), key=lambda row: row.address)
 
 
 def path_matches(path: str, required_path: str) -> bool:
@@ -259,8 +342,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        source_rows = load_source_rows(args.dwarf_line_dump)
-        instructions = load_instructions(args.asm)
+        source_rows = load_source_rows(args.dwarf_line_dump, args.source_computing_task)
+        instructions = load_instructions(args.asm, args.source_computing_task)
         rows, mapped, unmapped = aggregate_rows(source_rows, instructions, args.require_source_path)
         write_csv(rows, args.output, args.source_computing_task)
         write_summary(rows, args.summary_output, mapped, unmapped)

@@ -192,6 +192,121 @@ def test_resolver_filters_to_required_source_path_and_writes_output_file() -> No
         assert all(row["Source Computing Task"] == "mxfp4_pair_glu_xmx_tiled" for row in rows)
 
 
+def test_resolver_filters_dwarf_and_asm_sections_by_source_computing_task() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        dwarf = tmp / "zebin-debug-line.txt"
+        dwarf.write_text(
+            "\n".join(
+                [
+                    "// Kernel: selected_kernel",
+                    ".debug_line contents:",
+                    "include_directories[  1] = /Apps/llama.cpp/ggml/src/ggml-sycl",
+                    "file_names[  1]:",
+                    "           name: selected.cpp",
+                    "      dir_index: 1",
+                    "Address            Line   Column File   ISA Discriminator Flags",
+                    "0x0000000000000040  7000     12     1     0             0  is_stmt",
+                    "0x0000000000000080  7001     20     1     0             0  is_stmt",
+                    "// Kernel: other_kernel",
+                    ".debug_line contents:",
+                    "include_directories[  1] = /Apps/llama.cpp/ggml/src/ggml-sycl",
+                    "file_names[  1]:",
+                    "           name: other.cpp",
+                    "      dir_index: 1",
+                    "Address            Line   Column File   ISA Discriminator Flags",
+                    "0x0000000000000040  8000     12     1     0             0  is_stmt",
+                    "0x0000000000000080  8001     20     1     0             0  is_stmt",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        asm = tmp / "kernels.asm"
+        asm.write_text(
+            "\n".join(
+                [
+                    "// Kernel: selected_kernel",
+                    "0x00000040: dpas.8x8 (16|M0) r28:d null:d r52:b r24.0:b",
+                    "0x00000050: send.ugm (1|M0) r52 r49 null:0 0x0 0x0240F580 // wr:1+0, rd:4; load.ugm.d32x64t.a64",
+                    "// Kernel: other_kernel",
+                    "0x00000040: math.exp (1|M0) r1.2<1>:f r1.2<0;1,0>:f",
+                    "0x00000050: add (1|M0) r2:d r3:d r4:d",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        result = run_resolver(
+            "--dwarf-line-dump",
+            str(dwarf),
+            "--asm",
+            str(asm),
+            "--source-computing-task",
+            "selected_kernel",
+        )
+        assert result.returncode == 0, result.stdout
+        rows = list(csv.DictReader(io.StringIO(result.stdout)))
+        assert len(rows) == 1
+        assert rows[0]["Source Line"] == "/Apps/llama.cpp/ggml/src/ggml-sycl/selected.cpp:7000"
+        assert rows[0]["Source Computing Task"] == "selected_kernel"
+        assert rows[0]["kernel"] == "selected_kernel"
+        assert rows[0]["Static Instruction Count"] == "2"
+        assert rows[0]["Static Dpas Count"] == "1"
+        assert rows[0]["Static Send Ugm Count"] == "1"
+        assert rows[0]["Static Math Count"] == "0"
+        assert rows[0]["Static Score"] == "14"
+        assert "other.cpp" not in result.stdout
+
+
+def test_resolver_writes_empty_csv_and_no_match_summary_for_missing_task() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        dwarf = tmp / "zebin-debug-line.txt"
+        dwarf.write_text(
+            "\n".join(
+                [
+                    "// Kernel: selected_kernel",
+                    ".debug_line contents:",
+                    "include_directories[  1] = /Apps/llama.cpp/ggml/src/ggml-sycl",
+                    "file_names[  1]:",
+                    "           name: selected.cpp",
+                    "      dir_index: 1",
+                    "Address            Line   Column File   ISA Discriminator Flags",
+                    "0x0000000000000040  7000     12     1     0             0  is_stmt",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        asm = tmp / "kernels.asm"
+        asm.write_text(
+            "// Kernel: selected_kernel\n0x00000040: dpas.8x8 (16|M0) r28:d null:d r52:b r24.0:b\n",
+            encoding="utf-8",
+        )
+        summary = tmp / "asm-source-lines.parse"
+        result = run_resolver(
+            "--dwarf-line-dump",
+            str(dwarf),
+            "--asm",
+            str(asm),
+            "--summary-output",
+            str(summary),
+            "--source-computing-task",
+            "missing_kernel",
+        )
+        assert result.returncode == 0, result.stdout
+        rows = list(csv.DictReader(io.StringIO(result.stdout)))
+        assert rows == []
+        assert "Source Line,Source File" in result.stdout
+        summary_text = summary.read_text(encoding="utf-8")
+        assert "asm_source.status no_asm_source_matches" in summary_text
+        assert "asm_source.blocker no_asm_source_matches" in summary_text
+        assert "asm_source.mapped_instruction_count 0" in summary_text
+        assert "asm_source.unmapped_instruction_count 0" in summary_text
+        assert "Traceback" not in result.stdout
+
+
 def test_resolver_writes_empty_csv_and_no_match_summary() -> None:
     with tempfile.TemporaryDirectory() as tmp_raw:
         tmp = pathlib.Path(tmp_raw)
