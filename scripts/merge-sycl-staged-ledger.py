@@ -83,19 +83,28 @@ def main(argv: list[str]) -> int:
         vtune_gpu = layer_ledger.int_metric(vtune_summary, "vtune.kernel_total_ms_x1000", args.vtune_summary)
 
         status = source_attribution_summary.get("source_attribution.status")
-        if status not in {"exact_source_line", "source_region_plus_ablation"}:
+        source_line_status = source_line_summary.get("source_line.status")
+        if status not in {"exact_source_line", "source_region_plus_ablation", "dwarf_line_table_only"}:
             print("coverage.layer_status source_attribution_incomplete")
             for line in source_attribution_rows:
                 print(line)
             print("failed to merge staged ledger: source attribution incomplete")
             return 2
-        if status == "exact_source_line" and source_line_summary.get("source_line.status") != "pass":
+        if status == "exact_source_line" and source_line_status != "pass":
             print("coverage.layer_status source_attribution_incomplete")
             for line in source_line_rows:
                 print(line)
             for line in source_attribution_rows:
                 print(line)
             print("failed to merge staged ledger: exact source attribution requires source_line.status pass")
+            return 2
+        if status == "dwarf_line_table_only" and source_line_status != "dwarf-line-table-only":
+            print("coverage.layer_status source_attribution_incomplete")
+            for line in source_line_rows:
+                print(line)
+            for line in source_attribution_rows:
+                print(line)
+            print("failed to merge staged ledger: DWARF line-table attribution requires source_line.status dwarf-line-table-only")
             return 2
         if status == "source_region_plus_ablation":
             try:

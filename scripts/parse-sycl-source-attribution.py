@@ -103,9 +103,10 @@ def main(argv: list[str]) -> int:
         source_status = source_rows.get("source_line.status", "")
         if not source_status:
             raise SourceAttributionError("missing source_line.status")
-        if source_status not in {"pass", "fail"}:
+        if source_status not in {"pass", "fail", "dwarf-line-table-only"}:
             raise SourceAttributionError(f"invalid source_line.status {source_status}")
         exact_pass = source_status == "pass"
+        dwarf_line_table_only = source_status == "dwarf-line-table-only"
         exact_blocker = source_rows.get("source_line.blocker", "unknown")
 
         regions = load_region_map(args.region_map)
@@ -115,6 +116,8 @@ def main(argv: list[str]) -> int:
         delta = load_ablation_delta(args.ablation_json, top_kernel)
         if exact_pass:
             status = "exact_source_line"
+        elif dwarf_line_table_only:
+            status = "dwarf_line_table_only"
         else:
             if region is None:
                 raise SourceAttributionError(f"missing source-region map entry for top kernel {top_kernel}")
@@ -122,12 +125,14 @@ def main(argv: list[str]) -> int:
 
         print(f"source_attribution.status {status}")
         print(f"source_attribution.kernel {top_kernel}")
+        if dwarf_line_table_only:
+            print("source_attribution.source_line_status dwarf-line-table-only")
         if region is not None:
             print(f"source_attribution.file {region['file']}")
             print(f"source_attribution.line_start {region['line_start']}")
             print(f"source_attribution.line_end {region['line_end']}")
             print(f"source_attribution.label_line {region['label_line']}")
-        if not exact_pass:
+        if not exact_pass and not dwarf_line_table_only:
             print(f"source_attribution.exact_line_blocker {exact_blocker}")
         if delta is not None:
             print(f"source_attribution.ablation_delta_ms_x1000 {delta}")

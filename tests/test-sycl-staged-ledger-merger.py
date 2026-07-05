@@ -174,6 +174,42 @@ def test_staged_merger_rejects_exact_source_line_when_source_line_fails() -> Non
         assert "Traceback" not in result.stdout
 
 
+def test_staged_merger_accepts_dwarf_line_table_only_when_source_line_matches() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        paths = write_fixture(pathlib.Path(tmp_raw))
+        paths["source_line"].write_text("source_line.status dwarf-line-table-only\nsource_line.blocker none\n", encoding="utf-8")
+        paths["source_attr"].write_text(
+            "source_attribution.status dwarf_line_table_only\n"
+            "source_attribution.source_line_status dwarf-line-table-only\n"
+            "source_attribution.kernel mxfp4.gateup.xmx_tiled_dpas_m2\n",
+            encoding="utf-8",
+        )
+        result = run_merger(paths)
+        assert result.returncode == 0, result.stdout
+        assert "coverage.layer_status ok" in result.stdout
+        assert "source_line.status dwarf-line-table-only" in result.stdout
+        assert "source_attribution.status dwarf_line_table_only" in result.stdout
+
+
+def test_staged_merger_rejects_dwarf_line_table_only_when_source_line_mismatches() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        paths = write_fixture(pathlib.Path(tmp_raw))
+        paths["source_line"].write_text("source_line.status pass\nsource_line.blocker none\n", encoding="utf-8")
+        paths["source_attr"].write_text(
+            "source_attribution.status dwarf_line_table_only\n"
+            "source_attribution.source_line_status dwarf-line-table-only\n"
+            "source_attribution.kernel mxfp4.gateup.xmx_tiled_dpas_m2\n",
+            encoding="utf-8",
+        )
+        result = run_merger(paths)
+        assert result.returncode == 2
+        assert "coverage.layer_status source_attribution_incomplete" in result.stdout
+        assert "source_line.status pass" in result.stdout
+        assert "source_attribution.status dwarf_line_table_only" in result.stdout
+        assert "DWARF line-table attribution requires source_line.status dwarf-line-table-only" in result.stdout
+        assert "Traceback" not in result.stdout
+
+
 def test_staged_merger_rejects_metadata_mismatch_without_traceback() -> None:
     with tempfile.TemporaryDirectory() as tmp_raw:
         paths = write_fixture(pathlib.Path(tmp_raw), mismatch=True)

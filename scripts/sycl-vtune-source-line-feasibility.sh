@@ -58,8 +58,8 @@ print_plan() {
     printf 'DRY RUN: would execute lead-only SYCL VTune source-line microbench feasibility.\n'
     printf '# output root: %s\n' "${OUT_ROOT}"
     if [[ -n "${REQUIRE_MATRIX_PASS}" ]]; then
-        printf 'matrix gate: require %q to contain source_line.status pass\n' "${REQUIRE_MATRIX_PASS}"
-        printf 'grep -qx %q %q\n' "source_line.status pass" "${REQUIRE_MATRIX_PASS}"
+        printf 'matrix gate: require %q to contain source_line.status pass (VTune sampled exact) or source_line.status dwarf-line-table-only (DWARF line-table fallback)\n' "${REQUIRE_MATRIX_PASS}"
+        printf 'grep -Eq %q %q\n' "^source_line.status (pass|dwarf-line-table-only)$" "${REQUIRE_MATRIX_PASS}"
     fi
     printf '%q ' "${configure_cmd[@]}"; printf '> %q 2>&1\n' "${OUT_ROOT}/profiling-debug-build.log"
     printf '%q ' "${build_cmd[@]}"; printf '>> %q 2>&1\n' "${OUT_ROOT}/profiling-debug-build.log"
@@ -77,8 +77,9 @@ print_plan() {
     printf 'python3 scripts/parse-sycl-vtune-tasks.py %q --match %q > %q || printf %q %q >&2\n' "${OUT_ROOT}/vtune-computing-tasks.csv" "${TASK_MATCH}" "${OUT_ROOT}/vtune-task.parse" "warning: failed to parse VTune computing tasks for match %s\\n" "${TASK_MATCH}"
     printf 'readelf -S %q > %q\n' "${vtune_dir}/data.0/<first-zebin>" "${OUT_ROOT}/zebin-debug-sections.txt"
     printf 'llvm-dwarfdump --debug-line %q > %q\n' "${vtune_dir}/data.0/<first-zebin>" "${OUT_ROOT}/zebin-debug-line.txt"
+    printf 'python3 scripts/convert-sycl-zebin-line-table-to-source-csv.py --input %q --output %q --source-computing-task %q\n' "${OUT_ROOT}/zebin-debug-line.txt" "${OUT_ROOT}/dwarf-source-lines.csv" "${TARGET_KERNEL}"
     printf 'vtune -report hotspots -r %q -group-by gpu-source-line -format csv > %q\n' "${vtune_dir}" "${OUT_ROOT}/vtune-gpu-source-line.csv"
-    printf 'python3 scripts/check-sycl-vtune-source-lines.py --readelf-sections %q --vtune-csv %q --require-kernel %q --dwarf-line-dump %q --require-source-path %q --vtune-stdout %q --vtune-stderr %q > %q\n' "${OUT_ROOT}/zebin-debug-sections.txt" "${OUT_ROOT}/vtune-gpu-source-line.csv" "${TARGET_KERNEL}" "${OUT_ROOT}/zebin-debug-line.txt" "ggml/src/ggml-sycl/mmvq.cpp" "${OUT_ROOT}/bench.stdout" "${OUT_ROOT}/bench.stderr" "${OUT_ROOT}/source-line-feasibility.parse"
+    printf 'python3 scripts/check-sycl-vtune-source-lines.py --readelf-sections %q --vtune-csv %q --require-kernel %q --dwarf-line-dump %q --dwarf-source-lines-csv %q --allow-dwarf-line-table-only --require-source-path %q --vtune-stdout %q --vtune-stderr %q > %q\n' "${OUT_ROOT}/zebin-debug-sections.txt" "${OUT_ROOT}/vtune-gpu-source-line.csv" "${TARGET_KERNEL}" "${OUT_ROOT}/zebin-debug-line.txt" "${OUT_ROOT}/dwarf-source-lines.csv" "ggml/src/ggml-sycl/mmvq.cpp" "${OUT_ROOT}/bench.stdout" "${OUT_ROOT}/bench.stderr" "${OUT_ROOT}/source-line-feasibility.parse"
 }
 
 if [[ "${EXECUTE}" -ne 1 ]]; then
@@ -86,8 +87,8 @@ if [[ "${EXECUTE}" -ne 1 ]]; then
     exit 0
 fi
 
-if [[ -n "${REQUIRE_MATRIX_PASS}" ]] && ! grep -qx "source_line.status pass" "${REQUIRE_MATRIX_PASS}"; then
-    printf 'error: MXFP4 source-line matrix gate failed: %s must contain source_line.status pass\n' "${REQUIRE_MATRIX_PASS}" >&2
+if [[ -n "${REQUIRE_MATRIX_PASS}" ]] && ! grep -Eq "^source_line.status (pass|dwarf-line-table-only)$" "${REQUIRE_MATRIX_PASS}"; then
+    printf 'error: MXFP4 source-line matrix gate failed: %s must contain source_line.status pass (VTune sampled exact) or source_line.status dwarf-line-table-only (DWARF line-table fallback)\n' "${REQUIRE_MATRIX_PASS}" >&2
     exit 2
 fi
 
@@ -127,12 +128,21 @@ if [[ -z "${first_zebin}" ]]; then
 fi
 readelf -S "${first_zebin}" >"${OUT_ROOT}/zebin-debug-sections.txt"
 llvm-dwarfdump --debug-line "${first_zebin}" >"${OUT_ROOT}/zebin-debug-line.txt"
+rm -f "${OUT_ROOT}/dwarf-source-lines.csv"
+if ! python3 scripts/convert-sycl-zebin-line-table-to-source-csv.py \
+    --input "${OUT_ROOT}/zebin-debug-line.txt" \
+    --output "${OUT_ROOT}/dwarf-source-lines.csv" \
+    --source-computing-task "${TARGET_KERNEL}"; then
+    printf 'warning: DWARF source-line CSV conversion failed; checker will fail closed unless %s exists\n' "${OUT_ROOT}/dwarf-source-lines.csv" >&2
+fi
 vtune -report hotspots -r "${vtune_dir}" -group-by gpu-source-line -format csv >"${OUT_ROOT}/vtune-gpu-source-line.csv"
 python3 scripts/check-sycl-vtune-source-lines.py \
     --readelf-sections "${OUT_ROOT}/zebin-debug-sections.txt" \
     --vtune-csv "${OUT_ROOT}/vtune-gpu-source-line.csv" \
     --require-kernel "${TARGET_KERNEL}" \
     --dwarf-line-dump "${OUT_ROOT}/zebin-debug-line.txt" \
+    --dwarf-source-lines-csv "${OUT_ROOT}/dwarf-source-lines.csv" \
+    --allow-dwarf-line-table-only \
     --require-source-path "ggml/src/ggml-sycl/mmvq.cpp" \
     --vtune-stdout "${OUT_ROOT}/bench.stdout" \
     --vtune-stderr "${OUT_ROOT}/bench.stderr" >"${OUT_ROOT}/source-line-feasibility.parse"

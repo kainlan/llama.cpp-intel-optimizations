@@ -148,8 +148,9 @@ print_plan() {
         printf 'vtune -report hotspots -r %q -group-by computing-task -format csv > %q\n' "${vtune_dir}" "${dir}/vtune-computing-tasks.csv"
         printf 'python3 scripts/parse-sycl-vtune-tasks.py %q --match %q > %q\n' "${dir}/vtune-computing-tasks.csv" "${TASK_MATCH}" "${dir}/vtune-task.parse"
         printf 'llvm-dwarfdump --debug-line %q > %q\n' "${vtune_dir}/data.0/<first-zebin>" "${dir}/zebin-debug-line.txt"
+        printf 'python3 scripts/convert-sycl-zebin-line-table-to-source-csv.py --input %q --output %q --source-computing-task %q\n' "${dir}/zebin-debug-line.txt" "${dir}/dwarf-source-lines.csv" "${TARGET_KERNEL}"
         printf 'vtune -report hotspots -r %q -group-by gpu-source-line -format csv > %q\n' "${vtune_dir}" "${dir}/vtune-gpu-source-line.csv"
-        printf 'python3 scripts/check-sycl-vtune-source-lines.py --readelf-sections %q --vtune-csv %q --require-kernel %q --dwarf-line-dump %q --require-source-path %q --vtune-stdout %q --vtune-stderr %q > %q\n' "${dir}/zebin-debug-sections.txt" "${dir}/vtune-gpu-source-line.csv" "${TARGET_KERNEL}" "${dir}/zebin-debug-line.txt" "main.cpp" "${dir}/probe.stdout" "${dir}/probe.stderr" "${dir}/source-line-feasibility.parse"
+        printf 'python3 scripts/check-sycl-vtune-source-lines.py --readelf-sections %q --vtune-csv %q --require-kernel %q --dwarf-line-dump %q --dwarf-source-lines-csv %q --allow-dwarf-line-table-only --require-source-path %q --vtune-stdout %q --vtune-stderr %q > %q\n' "${dir}/zebin-debug-sections.txt" "${dir}/vtune-gpu-source-line.csv" "${TARGET_KERNEL}" "${dir}/zebin-debug-line.txt" "${dir}/dwarf-source-lines.csv" "main.cpp" "${dir}/probe.stdout" "${dir}/probe.stderr" "${dir}/source-line-feasibility.parse"
     done
 }
 
@@ -210,6 +211,13 @@ for index in "${!CASE_NAMES[@]}"; do
 
     readelf -S "${first_zebin}" >"${dir}/zebin-debug-sections.txt"
     llvm-dwarfdump --debug-line "${first_zebin}" >"${dir}/zebin-debug-line.txt"
+    rm -f "${dir}/dwarf-source-lines.csv"
+    if ! python3 scripts/convert-sycl-zebin-line-table-to-source-csv.py \
+        --input "${dir}/zebin-debug-line.txt" \
+        --output "${dir}/dwarf-source-lines.csv" \
+        --source-computing-task "${TARGET_KERNEL}"; then
+        printf 'warning: DWARF source-line CSV conversion failed for matrix row %s; checker will fail closed unless %s exists\n' "${name}" "${dir}/dwarf-source-lines.csv" >>"${dir}/probe.stderr"
+    fi
     if ! vtune -report hotspots -r "${vtune_dir}" -group-by gpu-source-line -format csv >"${dir}/vtune-gpu-source-line.csv"; then
         printf 'warning: VTune gpu-source-line report failed for matrix row %s; writing fail-closed checker output\n' "${name}" >>"${dir}/probe.stderr"
     fi
@@ -218,6 +226,8 @@ for index in "${!CASE_NAMES[@]}"; do
         --vtune-csv "${dir}/vtune-gpu-source-line.csv" \
         --require-kernel "${TARGET_KERNEL}" \
         --dwarf-line-dump "${dir}/zebin-debug-line.txt" \
+        --dwarf-source-lines-csv "${dir}/dwarf-source-lines.csv" \
+        --allow-dwarf-line-table-only \
         --require-source-path "main.cpp" \
         --vtune-stdout "${dir}/probe.stdout" \
         --vtune-stderr "${dir}/probe.stderr" >"${dir}/source-line-feasibility.parse"; then

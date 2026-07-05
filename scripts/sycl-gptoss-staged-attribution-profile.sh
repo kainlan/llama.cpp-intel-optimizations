@@ -315,8 +315,12 @@ run_vtune_source_stage() {
         printf 'bash %q --execute --i-understand-this-runs-gpu-source-probe --out-root %q --device-selector %q\n' "scripts/sycl-source-line-debug-matrix.sh" "${root}/source-line-matrix" "${DEVICE_SELECTOR}"
         printf '#   matrix outputs: %s/source-line-matrix/build-matrix/<case>/source-line-feasibility.parse\n' "${root}"
         printf '#   matrix outputs: %s/source-line-matrix/build-matrix/<case>/zebin-debug-sections.txt\n' "${root}"
+        printf '#   matrix outputs: %s/source-line-matrix/build-matrix/<case>/zebin-debug-line.txt\n' "${root}"
+        printf '#   matrix outputs: %s/source-line-matrix/build-matrix/<case>/dwarf-source-lines.csv\n' "${root}"
         printf '#   matrix outputs: %s/source-line-matrix/build-matrix/<case>/vtune-gpu-source-line.csv\n' "${root}"
-        printf '#   selection: prefer source_line.status pass; else source_line.blocker vtune_no_gpu_side_trace or vtune_unknown_source; else first source-line-feasibility.parse\n'
+        printf '#   matrix conversion: python3 %q --input %q --output %q --source-computing-task %q\n' "scripts/convert-sycl-zebin-line-table-to-source-csv.py" "${root}/source-line-matrix/build-matrix/<case>/zebin-debug-line.txt" "${root}/source-line-matrix/build-matrix/<case>/dwarf-source-lines.csv" "sycl_source_line_probe"
+        printf '#   matrix checker: python3 %q --dwarf-source-lines-csv %q --allow-dwarf-line-table-only ...\n' "scripts/check-sycl-vtune-source-lines.py" "${root}/source-line-matrix/build-matrix/<case>/dwarf-source-lines.csv"
+        printf '#   selection: prefer source_line.status pass (VTune sampled exact); else source_line.status dwarf-line-table-only (DWARF line-table fallback); else source_line.blocker vtune_no_gpu_side_trace or vtune_unknown_source; else first source-line-feasibility.parse\n'
         printf 'cp %q %q\n' "${root}/source-line-matrix/build-matrix/<selected-case>/source-line-feasibility.parse" "${root}/source-line.parse"
         printf 'python3 %q --source-csv %q >%q\n' "scripts/parse-sycl-vtune-exports.py" "${root}/source-line-matrix/build-matrix/<selected-case>/vtune-gpu-source-line.csv" "${root}/vtune.parse"
         return 0
@@ -333,6 +337,7 @@ run_vtune_source_stage() {
     local selected_parse=""
     local vtune_no_gpu_trace_parse=""
     local vtune_unknown_parse=""
+    local dwarf_line_table_parse=""
     local fallback_parse=""
     local parse
     local selected_dir
@@ -353,6 +358,9 @@ run_vtune_source_stage() {
             selected_parse="${parse}"
             break
         fi
+        if [[ -z "${dwarf_line_table_parse}" ]] && grep -qx 'source_line.status dwarf-line-table-only' "${parse}"; then
+            dwarf_line_table_parse="${parse}"
+        fi
         if [[ -z "${vtune_no_gpu_trace_parse}" ]] && grep -qx 'source_line.blocker vtune_no_gpu_side_trace' "${parse}"; then
             vtune_no_gpu_trace_parse="${parse}"
         fi
@@ -361,7 +369,9 @@ run_vtune_source_stage() {
         fi
     done
     if [[ -z "${selected_parse}" ]]; then
-        if [[ -n "${vtune_no_gpu_trace_parse}" ]]; then
+        if [[ -n "${dwarf_line_table_parse}" ]]; then
+            selected_parse="${dwarf_line_table_parse}"
+        elif [[ -n "${vtune_no_gpu_trace_parse}" ]]; then
             selected_parse="${vtune_no_gpu_trace_parse}"
         elif [[ -n "${vtune_unknown_parse}" ]]; then
             selected_parse="${vtune_unknown_parse}"

@@ -26,7 +26,12 @@ def test_debug_matrix_script_is_dry_run_by_default() -> None:
     assert "vtune-computing-tasks.csv" in result.stdout
     assert "parse-sycl-vtune-tasks.py" in result.stdout
     assert "zebin-debug-line.txt" in result.stdout
+    assert "dwarf-source-lines.csv" in result.stdout
+    assert "convert-sycl-zebin-line-table-to-source-csv.py" in result.stdout
+    assert "--source-computing-task sycl_source_line_probe" in result.stdout
     assert "--dwarf-line-dump" in result.stdout
+    assert "--dwarf-source-lines-csv" in result.stdout
+    assert "--allow-dwarf-line-table-only" in result.stdout
     assert "--require-source-path main.cpp" in result.stdout
     assert "--vtune-stdout" in result.stdout
     assert "--vtune-stderr" in result.stdout
@@ -109,6 +114,8 @@ def test_debug_matrix_requires_probe_dwarf_basename() -> None:
     assert '"tools/sycl-source-line-probe/main.cpp"' not in text
     assert '--require-source-path "main.cpp"' in text
     assert '--require-source-path "main.cpp" \\' in text
+    assert '--dwarf-source-lines-csv "${dir}/dwarf-source-lines.csv" \\' in text
+    assert '--allow-dwarf-line-table-only \\' in text
     assert '--vtune-stdout "${dir}/probe.stdout" \\' in text
     assert '--vtune-stderr "${dir}/probe.stderr" >"${dir}/source-line-feasibility.parse"' in text
 
@@ -122,10 +129,14 @@ def test_debug_matrix_execute_branch_writes_expected_artifacts() -> None:
         "vtune-task.parse",
         "parse-sycl-vtune-tasks.py",
         "zebin-debug-line.txt",
+        "dwarf-source-lines.csv",
         "vtune-gpu-source-line.csv",
         "source-line-feasibility.parse",
+        "convert-sycl-zebin-line-table-to-source-csv.py",
         "check-sycl-vtune-source-lines.py",
         "--dwarf-line-dump",
+        "--dwarf-source-lines-csv",
+        "--allow-dwarf-line-table-only",
         "--require-source-path",
         "--vtune-stdout",
         "--vtune-stderr",
