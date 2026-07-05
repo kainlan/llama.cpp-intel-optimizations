@@ -40,7 +40,7 @@ def first_present(row: dict[str, str], names: tuple[str, ...]) -> str:
 def parse_time_ms_x1000(raw: str) -> int:
     cleaned = raw.replace(",", "").strip()
     if not cleaned:
-        raise ValueError("missing task time value")
+        return 0
     return int(round(float(cleaned) * 1000.0))
 
 
