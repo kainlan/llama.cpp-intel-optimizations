@@ -49,6 +49,19 @@ if [[ "${EXECUTE}" -eq 1 && "${ACK}" -ne 1 ]]; then
     exit 2
 fi
 
+find_asm_for_task() {
+    local asm_dir="$1"
+    local task="$2"
+    local candidate
+    while IFS= read -r candidate; do
+        if [[ "$(basename "${candidate}")" == *"${task}"* ]]; then
+            printf '%s\n' "${candidate}"
+            return 0
+        fi
+    done < <(find "${asm_dir}" -type f -name '*.asm' -print)
+    find "${asm_dir}" -type f -name '*.asm' -print -quit
+}
+
 configure_cmd=(cmake -S . -B "${BUILD_DIR}" -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_SYCL=ON -DGGML_SYCL_TARGET=INTEL -DGGML_SYCL_F16=ON -DGGML_SYCL_PROFILING_DEBUG=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx)
 build_cmd=(cmake --build "${BUILD_DIR}" --config Release --target sycl-kernel-bench -j "${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc)}")
 bench_cmd=("${BUILD_DIR}/bin/sycl-kernel-bench" --kernel="${TARGET_KERNEL}" --quant=MXFP4 --dim_m=2880 --dim_n=4 --dim_k=2880 --iterations=100 --warmup=10 --validate --output=json)
@@ -79,7 +92,8 @@ print_plan() {
     printf 'llvm-dwarfdump --debug-line %q > %q\n' "${vtune_dir}/data.0/<first-zebin>" "${OUT_ROOT}/zebin-debug-line.txt"
     printf 'python3 scripts/convert-sycl-zebin-line-table-to-source-csv.py --input %q --output %q --source-computing-task %q\n' "${OUT_ROOT}/zebin-debug-line.txt" "${OUT_ROOT}/dwarf-source-lines.csv" "${TARGET_KERNEL}"
     printf 'mkdir -p %q && cp %q %q && (cd %q && ocloc disasm -file kernel.zebin > ocloc.stdout 2> ocloc.stderr || true)\n' "${OUT_ROOT}/zebin-disasm" "${vtune_dir}/data.0/example.zebin" "${OUT_ROOT}/zebin-disasm/kernel.zebin" "${OUT_ROOT}/zebin-disasm"
-    printf 'first_asm="$(find %q -type f -name '\''*.asm'\'' -print -quit)"\n' "${OUT_ROOT}/zebin-disasm"
+    printf 'first_asm="$(find %q -type f -name '\''*%s*.asm'\'' -print -quit)"\n' "${OUT_ROOT}/zebin-disasm" "${TARGET_KERNEL}"
+    printf 'if [[ -z "${first_asm}" ]]; then first_asm="$(find %q -type f -name '\''*.asm'\'' -print -quit)"; fi  # resolver rejects unmarked or mismatched ASM\n' "${OUT_ROOT}/zebin-disasm"
     printf 'python3 scripts/resolve-sycl-zebin-asm-source-lines.py --dwarf-line-dump %q --asm "${first_asm}" --output %q --summary-output %q --source-computing-task %q --require-source-path %q\n' "${OUT_ROOT}/zebin-debug-line.txt" "${OUT_ROOT}/asm-source-lines.csv" "${OUT_ROOT}/asm-source-lines.parse" "${TARGET_KERNEL}" "mmvq.cpp"
     printf 'vtune -report hotspots -r %q -group-by gpu-source-line -format csv > %q\n' "${vtune_dir}" "${OUT_ROOT}/vtune-gpu-source-line.csv"
     printf 'python3 scripts/check-sycl-vtune-source-lines.py --readelf-sections %q --vtune-csv %q --require-kernel %q --asm-source-lines-csv %q --allow-asm-line-static-cost --dwarf-line-dump %q --dwarf-source-lines-csv %q --allow-dwarf-line-table-only --require-source-path %q --vtune-stdout %q --vtune-stderr %q > %q\n' "${OUT_ROOT}/zebin-debug-sections.txt" "${OUT_ROOT}/vtune-gpu-source-line.csv" "${TARGET_KERNEL}" "${OUT_ROOT}/asm-source-lines.csv" "${OUT_ROOT}/zebin-debug-line.txt" "${OUT_ROOT}/dwarf-source-lines.csv" "mmvq.cpp" "${OUT_ROOT}/bench.stdout" "${OUT_ROOT}/bench.stderr" "${OUT_ROOT}/source-line-feasibility.parse"
@@ -147,7 +161,7 @@ cp "${first_zebin}" "${asm_dir}/kernel.zebin"
 if ! (cd "${asm_dir}" && ocloc disasm -file kernel.zebin >ocloc.stdout 2>ocloc.stderr); then
     printf 'warning: ocloc disasm failed; checker will use VTune/DWARF evidence if available\n' >&2
 fi
-first_asm="$(find "${asm_dir}" -type f -name '*.asm' -print -quit)"
+first_asm="$(find_asm_for_task "${asm_dir}" "${TARGET_KERNEL}")"
 rm -f "${OUT_ROOT}/asm-source-lines.csv" "${OUT_ROOT}/asm-source-lines.parse"
 if [[ -n "${first_asm}" ]]; then
     if ! python3 scripts/resolve-sycl-zebin-asm-source-lines.py \

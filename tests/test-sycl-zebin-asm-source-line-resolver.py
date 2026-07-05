@@ -46,6 +46,7 @@ def write_fixture(tmp: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
     asm.write_text(
         "\n".join(
             [
+                "// Kernel: mxfp4_pair_glu_xmx_tiled",
                 "0x00000020: add (1|M0) r0:d r0:d r0:d",
                 "0x00000040: dpas.8x8 (16|M0) r28:d null:d r52:b r24.0:b",
                 "0x00000050: send.ugm (1|M0) r52 r49 null:0 0x0 0x0240F580 // wr:1+0, rd:4; load.ugm.d32x64t.a64",
@@ -122,6 +123,7 @@ def test_resolver_aggregates_same_file_and_line_across_different_columns() -> No
         )
         asm = tmp / "kernel.asm"
         asm.write_text(
+            "// Kernel: mxfp4_pair_glu_xmx_tiled\n"
             "0x00000040: dpas.8x8 (16|M0) r28:d null:d r52:b r24.0:b\n"
             "0x00000080: math.exp (1|M0) r1.2<1>:f r1.2<0;1,0>:f\n",
             encoding="utf-8",
@@ -375,7 +377,11 @@ def test_resolver_writes_empty_csv_and_no_match_summary() -> None:
         tmp = pathlib.Path(tmp_raw)
         dwarf, _ = write_fixture(tmp)
         asm = tmp / "kernel.asm"
-        asm.write_text("0x00000010: dpas.8x8 r1:d null:d r2:b r3:b\n", encoding="utf-8")
+        asm.write_text(
+            "// Kernel: mxfp4_pair_glu_xmx_tiled\n"
+            "0x00000010: dpas.8x8 r1:d null:d r2:b r3:b\n",
+            encoding="utf-8",
+        )
         summary = tmp / "asm-source-lines.parse"
         result = run_resolver(
             "--dwarf-line-dump",
@@ -396,6 +402,25 @@ def test_resolver_writes_empty_csv_and_no_match_summary() -> None:
         assert "asm_source.blocker no_asm_source_matches" in summary_text
         assert "asm_source.mapped_instruction_count 0" in summary_text
         assert "asm_source.unmapped_instruction_count 1" in summary_text
+        assert "Traceback" not in result.stdout
+
+
+def test_resolver_rejects_unmarked_asm_when_task_is_required() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        dwarf, _ = write_fixture(tmp)
+        asm = tmp / "kernel.asm"
+        asm.write_text("0x00000040: add (1|M0) r2:d r3:d r4:d\n", encoding="utf-8")
+        result = run_resolver(
+            "--dwarf-line-dump",
+            str(dwarf),
+            "--asm",
+            str(asm),
+            "--source-computing-task",
+            "mxfp4_pair_glu_xmx_tiled",
+        )
+        assert result.returncode == 2
+        assert "ASM does not identify required source-computing-task mxfp4_pair_glu_xmx_tiled" in result.stdout
         assert "Traceback" not in result.stdout
 
 

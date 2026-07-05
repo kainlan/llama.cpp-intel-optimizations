@@ -147,9 +147,20 @@ def split_named_sections(text: str, patterns: tuple[re.Pattern[str], ...]) -> tu
     return sections, found_named_section
 
 
-def select_text_for_task(text: str, patterns: tuple[re.Pattern[str], ...], source_computing_task: str) -> str:
+def select_text_for_task(
+    text: str,
+    patterns: tuple[re.Pattern[str], ...],
+    source_computing_task: str,
+    *,
+    require_named_section: bool = False,
+    section_label: str = "input",
+) -> str:
     sections, found_named_section = split_named_sections(text, patterns)
     if not found_named_section:
+        if require_named_section and source_computing_task:
+            raise ResolveError(
+                f"{section_label} does not identify required source-computing-task {source_computing_task}"
+            )
         return text
     return "".join(section.text for section in sections if task_matches(section.name, source_computing_task))
 
@@ -181,7 +192,13 @@ def load_instructions(asm_path: pathlib.Path, source_computing_task: str) -> lis
     require_existing_file(asm_path, "ASM")
     module = load_module("parse_sycl_vtune_kernel_asm", "parse-sycl-vtune-kernel-asm.py")
     text = asm_path.read_text(encoding="utf-8", errors="replace")
-    selected_text = select_text_for_task(text, ASM_KERNEL_MARKER_PATTERNS, source_computing_task)
+    selected_text = select_text_for_task(
+        text,
+        ASM_KERNEL_MARKER_PATTERNS,
+        source_computing_task,
+        require_named_section=True,
+        section_label="ASM",
+    )
     if not selected_text.strip():
         return []
     return sorted(module.parse_asm_instructions_text(selected_text), key=lambda row: row.address)
