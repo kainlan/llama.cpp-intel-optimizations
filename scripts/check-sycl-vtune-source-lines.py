@@ -10,6 +10,8 @@ import sys
 from typing import Any
 
 UNKNOWN_VALUES = {"", "[Unknown]", "[Unknown source file]"}
+DWARF_ATTRIBUTION_MODE = "dwarf-line-table"
+VTUNE_ATTRIBUTION_MODE = "vtune-sampled-exact"
 DEBUG_LINE_SECTION_RE = re.compile(r"(?m)^\s*\[\s*\d+\]\s+\.debug_line(?:\s|$)")
 
 
@@ -47,6 +49,40 @@ def row_has_known_source(row: dict[str, str]) -> bool:
     return any(candidate not in UNKNOWN_VALUES for candidate in candidates)
 
 
+def row_attribution_mode(row: dict[str, str]) -> str:
+    return row.get("Source Attribution Mode", "").strip()
+
+
+def row_is_dwarf_line_table(row: dict[str, str]) -> bool:
+    return row_attribution_mode(row) == DWARF_ATTRIBUTION_MODE
+
+
+def read_source_csv(path: pathlib.Path) -> list[dict[str, str]]:
+    with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+        sample = handle.read(4096)
+        handle.seek(0)
+        sample_lines = sample.splitlines()
+        dialect = csv.excel_tab if sample_lines and "\t" in sample_lines[0] else csv.excel
+        reader = csv.DictReader(handle, dialect=dialect)
+        return [validate_row_shape(raw_row) for raw_row in reader]
+
+
+def count_vtune_sampled_known_rows(rows: list[dict[str, str]], required_kernel: str | None) -> int:
+    return sum(
+        1
+        for row in rows
+        if row_matches_kernel(row, required_kernel) and row_has_known_source(row) and not row_is_dwarf_line_table(row)
+    )
+
+
+def count_dwarf_line_table_known_rows(rows: list[dict[str, str]], required_kernel: str | None) -> int:
+    return sum(
+        1
+        for row in rows
+        if row_matches_kernel(row, required_kernel) and row_has_known_source(row) and row_is_dwarf_line_table(row)
+    )
+
+
 def parse_dwarf_line_table(module: Any, text: str, require_path: str | None) -> dict[str, object]:
     try:
         return module.parse_line_table(text, require_path)
@@ -60,26 +96,34 @@ def parse_dwarf_line_table(module: Any, text: str, require_path: str | None) -> 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Check VTune GPU source-line feasibility for SYCL kernels")
     parser.add_argument("--readelf-sections", required=True, type=pathlib.Path)
-    parser.add_argument("--vtune-csv", required=True, type=pathlib.Path)
+    parser.add_argument("--vtune-csv", type=pathlib.Path)
     parser.add_argument("--require-kernel")
     parser.add_argument("--dwarf-line-dump", type=pathlib.Path)
     parser.add_argument("--require-source-path")
+    parser.add_argument(
+        "--dwarf-source-lines-csv",
+        type=pathlib.Path,
+        help="checker-compatible CSV generated from decoded ZEBin DWARF line tables",
+    )
+    parser.add_argument(
+        "--allow-dwarf-line-table-only",
+        action="store_true",
+        help="allow DWARF line-table CSV rows to pass with source_line.status dwarf-line-table-only when VTune rows are unavailable",
+    )
     args = parser.parse_args(argv)
+
+    if args.vtune_csv is None and not (args.allow_dwarf_line_table_only and args.dwarf_source_lines_csv is not None):
+        print("failed to check source lines: --vtune-csv is required unless --allow-dwarf-line-table-only and --dwarf-source-lines-csv are both provided")
+        return 2
 
     try:
         sections = args.readelf_sections.read_text(encoding="utf-8", errors="replace")
         debug_line_present = DEBUG_LINE_SECTION_RE.search(sections) is not None
-        with args.vtune_csv.open("r", encoding="utf-8", errors="replace", newline="") as handle:
-            sample = handle.read(4096)
-            handle.seek(0)
-            sample_lines = sample.splitlines()
-            dialect = csv.excel_tab if sample_lines and "\t" in sample_lines[0] else csv.excel
-            reader = csv.DictReader(handle, dialect=dialect)
-            non_unknown_rows = 0
-            for raw_row in reader:
-                row = validate_row_shape(raw_row)
-                if row_matches_kernel(row, args.require_kernel) and row_has_known_source(row):
-                    non_unknown_rows += 1
+        non_unknown_rows = 0
+        if args.vtune_csv is not None:
+            vtune_rows = read_source_csv(args.vtune_csv)
+            non_unknown_rows = count_vtune_sampled_known_rows(vtune_rows, args.require_kernel)
+
         dwarf_status = "not_checked"
         dwarf_source_rows = 0
         dwarf_required_path_present = True
@@ -93,34 +137,50 @@ def main(argv: list[str]) -> int:
             dwarf_status = str(parsed["status"])
             dwarf_source_rows = int(parsed["source_rows"])
             dwarf_required_path_present = bool(parsed["required_path_present"])
+
+        dwarf_source_line_rows = 0
+        if args.dwarf_source_lines_csv is not None:
+            dwarf_source_line_rows = count_dwarf_line_table_known_rows(
+                read_source_csv(args.dwarf_source_lines_csv),
+                args.require_kernel,
+            )
     except (OSError, csv.Error, IndexError, TypeError, ValueError) as exc:
         print(f"failed to check source lines: {exc}")
         return 2
 
+    source_attribution_mode = "none"
+    status = "fail"
     if not debug_line_present:
-        passed = False
         blocker = "missing_debug_line"
     elif args.dwarf_line_dump is not None and not dwarf_required_path_present:
-        passed = False
         blocker = "missing_dwarf_source_path"
     elif non_unknown_rows > 0:
-        passed = True
         blocker = "none"
+        status = "pass"
+        source_attribution_mode = VTUNE_ATTRIBUTION_MODE
+    elif args.allow_dwarf_line_table_only and dwarf_source_line_rows > 0:
+        blocker = "none"
+        status = "dwarf-line-table-only"
+        source_attribution_mode = DWARF_ATTRIBUTION_MODE
     else:
-        passed = False
         blocker = "vtune_unknown_source"
 
     print(f"source_line.debug_line_present {1 if debug_line_present else 0}")
     print(f"source_line.non_unknown_rows {non_unknown_rows}")
+    print(f"source_line.vtune_sampled_non_unknown_rows {non_unknown_rows}")
     if args.require_kernel is not None:
         print(f"source_line.required_kernel {args.require_kernel}")
     if args.dwarf_line_dump is not None:
         print(f"source_line.dwarf_status {dwarf_status}")
         print(f"source_line.dwarf_source_rows {dwarf_source_rows}")
         print(f"source_line.dwarf_required_path_present {1 if dwarf_required_path_present else 0}")
+    if args.dwarf_source_lines_csv is not None:
+        print(f"source_line.dwarf_source_line_rows {dwarf_source_line_rows}")
+        print(f"source_line.allow_dwarf_line_table_only {1 if args.allow_dwarf_line_table_only else 0}")
+    print(f"source_line.source_attribution_mode {source_attribution_mode}")
     print(f"source_line.blocker {blocker}")
-    print(f"source_line.status {'pass' if passed else 'fail'}")
-    return 0 if passed else 2
+    print(f"source_line.status {status}")
+    return 0 if status in {"pass", "dwarf-line-table-only"} else 2
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ INCLUDE_RE = re.compile(r"^\s*include_directories\[\s*(\d+)\s*\]\s*=\s*(.*?)\s*$
 FILE_RE = re.compile(r"^\s*file_names\[\s*(\d+)\s*\]:\s*$")
 NAME_RE = re.compile(r"^\s*name:\s*(.*?)\s*$")
 DIR_INDEX_RE = re.compile(r"^\s*dir_index:\s*(\d+)\s*$")
-ROW_RE = re.compile(r"^\s*0x[0-9a-fA-F]+\s+(\d+)\s+(\d+)\s+(\d+)\s+")
+ROW_RE = re.compile(r"^\s*(0x[0-9a-fA-F]+)\s+(\d+)\s+(\d+)\s+(\d+)\s+")
 TABLE_START_RE = re.compile(r"^\s*(?:\.debug_line contents:|debug_line\[[^\]]+\])\s*$")
 
 
@@ -27,6 +27,15 @@ class LineTableError(Exception):
 class FileEntry:
     name: str = ""
     dir_index: int = 0
+
+
+@dataclass(frozen=True)
+class SourceRow:
+    address: str
+    line: int
+    column: int
+    file_id: int
+    file_path: str
 
 
 def unquote_llvm_string(value: str) -> str:
@@ -68,12 +77,11 @@ def path_matches(path: str, required_path: str) -> bool:
     return candidate == required or candidate.endswith("/" + required)
 
 
-def parse_line_table(text: str, require_path: str | None = None) -> dict[str, object]:
+def parse_line_table_rows(text: str) -> list[SourceRow]:
     include_directories: dict[int, str] = {}
     file_entries: dict[int, FileEntry] = {}
     current_file_index: int | None = None
-    source_rows = 0
-    row_files: set[str] = set()
+    rows: list[SourceRow] = []
 
     for line in text.splitlines():
         if TABLE_START_RE.match(line):
@@ -106,20 +114,34 @@ def parse_line_table(text: str, require_path: str | None = None) -> dict[str, ob
 
         row_match = ROW_RE.match(line)
         if row_match:
-            line_number = int(row_match.group(1))
-            file_id = int(row_match.group(3))
+            address = row_match.group(1)
+            line_number = int(row_match.group(2))
+            column_number = int(row_match.group(3))
+            file_id = int(row_match.group(4))
             if line_number > 0:
                 entry = file_entries.get(file_id)
                 if entry is None:
                     raise LineTableError(f"source row references unknown file id {file_id}")
-                row_files.add(resolve_file_path(entry, include_directories))
-                source_rows += 1
+                rows.append(
+                    SourceRow(
+                        address=address,
+                        line=line_number,
+                        column=column_number,
+                        file_id=file_id,
+                        file_path=resolve_file_path(entry, include_directories),
+                    )
+                )
             current_file_index = None
 
-    if not source_rows:
+    if not rows:
         raise LineTableError("no source rows found")
 
-    files = sorted(row_files)
+    return rows
+
+
+def parse_line_table(text: str, require_path: str | None = None) -> dict[str, object]:
+    rows = parse_line_table_rows(text)
+    files = sorted({row.file_path for row in rows})
     if not files:
         raise LineTableError("no files found")
 
@@ -131,7 +153,7 @@ def parse_line_table(text: str, require_path: str | None = None) -> dict[str, ob
         "files": files,
         "required_path": required_path,
         "required_path_present": required_path_present,
-        "source_rows": source_rows,
+        "source_rows": len(rows),
         "status": "ok",
     }
 

@@ -244,3 +244,90 @@ def test_checker_reports_missing_dwarf_source_path_when_line_table_lacks_require
         assert "source_line.dwarf_required_path_present 0" in result.stdout
         assert "source_line.blocker missing_dwarf_source_path" in result.stdout
         assert "source_line.status fail" in result.stdout
+
+
+def test_checker_does_not_count_dwarf_line_table_csv_as_vtune_sampled_rows() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        sections = tmp / "sections.txt"
+        csv = tmp / "source.csv"
+        sections.write_text("[12] .debug_line PROGBITS\n", encoding="utf-8")
+        csv.write_text(
+            "Source Line,Source File,Source File Path,Source Computing Task,Source Attribution Mode,Source Attribution Status\n"
+            "/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp:9730,mmvq.cpp,/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp,mxfp4_pair_glu_xmx_tiled,dwarf-line-table,dwarf_line_table_only\n",
+            encoding="utf-8",
+        )
+        result = run_checker(sections, csv, "--require-kernel", "mxfp4_pair_glu_xmx_tiled")
+        assert result.returncode == 2
+        assert "source_line.non_unknown_rows 0" in result.stdout
+        assert "source_line.vtune_sampled_non_unknown_rows 0" in result.stdout
+        assert "source_line.source_attribution_mode none" in result.stdout
+        assert "source_line.blocker vtune_unknown_source" in result.stdout
+        assert "source_line.status fail" in result.stdout
+
+
+def test_checker_allows_dwarf_line_table_only_with_explicit_flag_and_no_vtune_csv() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        sections = tmp / "sections.txt"
+        dwarf_csv = tmp / "dwarf-source.csv"
+        sections.write_text("[12] .debug_line PROGBITS\n", encoding="utf-8")
+        dwarf_csv.write_text(
+            "Source Line,Source File,Source File Path,Source Computing Task,Source Attribution Mode,Source Attribution Status\n"
+            "/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp:9730,mmvq.cpp,/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp,mxfp4_pair_glu_xmx_tiled,dwarf-line-table,dwarf_line_table_only\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(CHECKER),
+                "--readelf-sections",
+                str(sections),
+                "--dwarf-source-lines-csv",
+                str(dwarf_csv),
+                "--allow-dwarf-line-table-only",
+                "--require-kernel",
+                "mxfp4_pair_glu_xmx_tiled",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout
+        assert "source_line.non_unknown_rows 0" in result.stdout
+        assert "source_line.vtune_sampled_non_unknown_rows 0" in result.stdout
+        assert "source_line.dwarf_source_line_rows 1" in result.stdout
+        assert "source_line.allow_dwarf_line_table_only 1" in result.stdout
+        assert "source_line.source_attribution_mode dwarf-line-table" in result.stdout
+        assert "source_line.blocker none" in result.stdout
+        assert "source_line.status dwarf-line-table-only" in result.stdout
+
+
+def test_checker_requires_explicit_allow_for_dwarf_line_table_only_csv() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        sections = tmp / "sections.txt"
+        csv = tmp / "source.csv"
+        dwarf_csv = tmp / "dwarf-source.csv"
+        sections.write_text("[12] .debug_line PROGBITS\n", encoding="utf-8")
+        csv.write_text("Source Line\tSource Computing Task\n[Unknown]\tmxfp4_pair_glu_xmx_tiled\n", encoding="utf-8")
+        dwarf_csv.write_text(
+            "Source Line,Source File,Source File Path,Source Computing Task,Source Attribution Mode,Source Attribution Status\n"
+            "/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp:9730,mmvq.cpp,/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp,mxfp4_pair_glu_xmx_tiled,dwarf-line-table,dwarf_line_table_only\n",
+            encoding="utf-8",
+        )
+        result = run_checker(
+            sections,
+            csv,
+            "--require-kernel",
+            "mxfp4_pair_glu_xmx_tiled",
+            "--dwarf-source-lines-csv",
+            str(dwarf_csv),
+        )
+        assert result.returncode == 2
+        assert "source_line.dwarf_source_line_rows 1" in result.stdout
+        assert "source_line.allow_dwarf_line_table_only 0" in result.stdout
+        assert "source_line.source_attribution_mode none" in result.stdout
+        assert "source_line.blocker vtune_unknown_source" in result.stdout
+        assert "source_line.status fail" in result.stdout
