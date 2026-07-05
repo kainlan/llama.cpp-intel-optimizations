@@ -2,7 +2,8 @@
 
 Date: 2026-07-05
 Branch: `feature/sycl-mxfp4-tg-runtime`
-Tracker: `llama.cpp-040b`
+Execution task: `llama.cpp-qku5`
+Follow-up tracker: `llama.cpp-040b`
 
 ## Safe gates
 
