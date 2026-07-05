@@ -149,7 +149,7 @@ print_plan() {
         printf 'python3 scripts/parse-sycl-vtune-tasks.py %q --match %q > %q\n' "${dir}/vtune-computing-tasks.csv" "${TASK_MATCH}" "${dir}/vtune-task.parse"
         printf 'llvm-dwarfdump --debug-line %q > %q\n' "${vtune_dir}/data.0/<first-zebin>" "${dir}/zebin-debug-line.txt"
         printf 'vtune -report hotspots -r %q -group-by gpu-source-line -format csv > %q\n' "${vtune_dir}" "${dir}/vtune-gpu-source-line.csv"
-        printf 'python3 scripts/check-sycl-vtune-source-lines.py --readelf-sections %q --vtune-csv %q --require-kernel %q --dwarf-line-dump %q --require-source-path %q > %q\n' "${dir}/zebin-debug-sections.txt" "${dir}/vtune-gpu-source-line.csv" "${TARGET_KERNEL}" "${dir}/zebin-debug-line.txt" "tools/sycl-source-line-probe/main.cpp" "${dir}/source-line-feasibility.parse"
+        printf 'python3 scripts/check-sycl-vtune-source-lines.py --readelf-sections %q --vtune-csv %q --require-kernel %q --dwarf-line-dump %q --require-source-path %q > %q\n' "${dir}/zebin-debug-sections.txt" "${dir}/vtune-gpu-source-line.csv" "${TARGET_KERNEL}" "${dir}/zebin-debug-line.txt" "main.cpp" "${dir}/source-line-feasibility.parse"
     done
 }
 
@@ -218,7 +218,7 @@ for index in "${!CASE_NAMES[@]}"; do
         --vtune-csv "${dir}/vtune-gpu-source-line.csv" \
         --require-kernel "${TARGET_KERNEL}" \
         --dwarf-line-dump "${dir}/zebin-debug-line.txt" \
-        --require-source-path "tools/sycl-source-line-probe/main.cpp" >"${dir}/source-line-feasibility.parse"; then
+        --require-source-path "main.cpp" >"${dir}/source-line-feasibility.parse"; then
         printf 'warning: source-line checker reported failure for matrix row %s; see %s\n' "${name}" "${dir}/source-line-feasibility.parse" >&2
     fi
 done

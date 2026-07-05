@@ -27,7 +27,8 @@ def test_debug_matrix_script_is_dry_run_by_default() -> None:
     assert "parse-sycl-vtune-tasks.py" in result.stdout
     assert "zebin-debug-line.txt" in result.stdout
     assert "--dwarf-line-dump" in result.stdout
-    assert "--require-source-path" in result.stdout
+    assert "--require-source-path main.cpp" in result.stdout
+    assert "tools/sycl-source-line-probe/main.cpp" not in result.stdout
     assert "computing-tasks-of-interest" not in result.stdout
     assert "/Storage" not in result.stdout
     assert "llama-bench" not in result.stdout
@@ -99,6 +100,13 @@ def test_debug_matrix_task_glob_with_single_quote_is_shell_escaped() -> None:
     assert result.returncode == 0, result.stdout
     assert "computing-tasks-of-interest=a\\'b#1#1#20" in result.stdout
     assert "computing-tasks-of-interest='a'b#1#1#20'" not in result.stdout
+
+
+def test_debug_matrix_requires_probe_dwarf_basename() -> None:
+    text = script_text()
+    assert '"tools/sycl-source-line-probe/main.cpp"' not in text
+    assert '--require-source-path "main.cpp"' in text
+    assert '"main.cpp" "${dir}/source-line-feasibility.parse"' in text
 
 
 def test_debug_matrix_execute_branch_writes_expected_artifacts() -> None:
