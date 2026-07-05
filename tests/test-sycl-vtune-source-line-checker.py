@@ -156,6 +156,28 @@ def test_checker_reports_malformed_surplus_csv_fields_without_traceback() -> Non
         assert "Traceback" not in result.stdout
 
 
+def test_checker_reports_empty_dwarf_line_dump_without_traceback() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        sections = tmp / "sections.txt"
+        csv = tmp / "source.csv"
+        dwarf = tmp / "dwarf.txt"
+        sections.write_text("[12] .debug_line PROGBITS\n", encoding="utf-8")
+        csv.write_text("Source Line\tSource Computing Task\n[Unknown]\tmxfp4_pair_glu_xmx_tiled\n", encoding="utf-8")
+        dwarf.write_text("", encoding="utf-8")
+        result = run_checker(
+            sections,
+            csv,
+            "--dwarf-line-dump",
+            str(dwarf),
+            "--require-source-path",
+            "ggml/src/ggml-sycl/mmvq.cpp",
+        )
+        assert result.returncode == 2
+        assert "failed to check source lines: no source rows found" in result.stdout
+        assert "Traceback" not in result.stdout
+
+
 def test_checker_reports_useful_dwarf_table_when_vtune_rows_are_unknown() -> None:
     with tempfile.TemporaryDirectory() as tmp_raw:
         tmp = pathlib.Path(tmp_raw)

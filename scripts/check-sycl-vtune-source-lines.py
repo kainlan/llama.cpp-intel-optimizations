@@ -47,6 +47,16 @@ def row_has_known_source(row: dict[str, str]) -> bool:
     return any(candidate not in UNKNOWN_VALUES for candidate in candidates)
 
 
+def parse_dwarf_line_table(module: Any, text: str, require_path: str | None) -> dict[str, object]:
+    try:
+        return module.parse_line_table(text, require_path)
+    except Exception as exc:
+        line_table_error = getattr(module, "LineTableError", None)
+        if isinstance(line_table_error, type) and isinstance(exc, line_table_error):
+            raise ValueError(str(exc)) from None
+        raise
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Check VTune GPU source-line feasibility for SYCL kernels")
     parser.add_argument("--readelf-sections", required=True, type=pathlib.Path)
@@ -75,7 +85,8 @@ def main(argv: list[str]) -> int:
         dwarf_required_path_present = True
         if args.dwarf_line_dump is not None:
             module = load_line_table_parser()
-            parsed = module.parse_line_table(
+            parsed = parse_dwarf_line_table(
+                module,
                 args.dwarf_line_dump.read_text(encoding="utf-8", errors="replace"),
                 args.require_source_path,
             )
