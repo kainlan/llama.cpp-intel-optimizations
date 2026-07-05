@@ -54,6 +54,33 @@ def test_parser_reads_iga_json_pc_rows() -> None:
         assert rows[0]["source"] == "iga-json"
 
 
+def test_parser_reads_actual_iga_json_v2_top_level_elems() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        p = tmp / "kernel.iga.json"
+        p.write_text(
+            json.dumps(
+                {
+                    "version": "2.0",
+                    "platform": "xe2",
+                    "elems": [
+                        {"kind": "L", "id": 1, "pc": 0, "symbol": "L0000"},
+                        {"kind": "I", "id": 1, "pc": 0, "op": "mov", "dst": {"kind": "RD"}},
+                        {"kind": "I", "id": 2, "pc": 16, "op": "send", "srcs": []},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = run_parser("--input", str(p), "--format", "json", "--kernel", "target_kernel")
+        assert result.returncode == 0, result.stdout
+        rows = list(csv.DictReader(io.StringIO(result.stdout)))
+        assert [row["pc"] for row in rows] == ["0", "16"]
+        assert [row["opcode"] for row in rows] == ["mov", "send"]
+        assert rows[0]["kernel"] == "target_kernel"
+        assert rows[0]["source"] == "iga-json"
+
+
 def test_parser_rejects_label_only_text_without_pc_rows() -> None:
     with tempfile.TemporaryDirectory() as tmp_raw:
         tmp = pathlib.Path(tmp_raw)

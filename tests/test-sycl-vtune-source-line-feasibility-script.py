@@ -158,8 +158,14 @@ def test_source_line_feasibility_script_propagates_target_kernel_to_checker() ->
     assert "--require-kernel custom_kernel" in result.stdout
 
 
-def test_source_line_feasibility_execute_branch_uses_pipe_free_archived_zebin_probe() -> None:
+def test_source_line_feasibility_execute_branch_selects_zebin_by_vtune_task_section() -> None:
     text = script_text()
+    assert "selected_task_from_parse" in text
+    assert "iga_section_match_from_task" in text
+    assert "find_zebin_for_section_match" in text
+    assert "selected_zebin" in text
+    assert "iga-section-selection.parse" in text
+    assert "--kernel-match \"${iga_section_match}\"" in text
     assert "find \"${vtune_dir}\" -name '*.zebin' -type f -print -quit" in text
     assert "-path '*/data.0/*.zebin'" not in text
     assert "| head -n 1" not in text

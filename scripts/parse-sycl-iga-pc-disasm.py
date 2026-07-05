@@ -75,17 +75,18 @@ def parse_json_rows(text: str, kernel: str) -> list[PcInstruction]:
         if name != kernel:
             continue
         for elem in item.get("elems", []):
-            if elem.get("kind") not in {"inst", "instruction"}:
+            if elem.get("kind") not in {"inst", "instruction", "I"}:
                 continue
             pc = parse_pc(elem.get("pc"))
             if pc is None:
                 continue
-            text_row = str(elem.get("syntax") or elem.get("text") or elem.get("op") or "")
+            opcode = str(elem.get("op") or "").lower()
+            text_row = str(elem.get("syntax") or elem.get("text") or opcode or "")
             rows.append(
                 PcInstruction(
                     kernel=kernel,
                     pc=pc,
-                    opcode=str(elem.get("op") or opcode_from_text(text_row)).lower(),
+                    opcode=opcode or opcode_from_text(text_row),
                     text=text_row,
                     raw=json.dumps(elem, sort_keys=True),
                     send_comment=send_comment(text_row),
