@@ -154,6 +154,8 @@ Disassembly artifacts:
 
 Observation: `ocloc disasm` produced non-empty ASM files, but the lines use labels (`L0:`, `L304:`) rather than numeric instruction addresses. The current address-based resolver therefore finds no mapped ASM source rows and correctly falls back to DWARF-only evidence.
 
+`asm-line-static-cost blocked: disassembly address format unavailable`; see `ocloc.stderr` at `/tmp/sycl_mxfp4_asm_source_line_20260705_130742/zebin-disasm/ocloc.stderr`.
+
 ## Interpretation
 
 - `pass` means sampled VTune exact source-line rows.
