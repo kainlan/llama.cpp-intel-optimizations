@@ -117,11 +117,13 @@ vtune_collect_cmd+=(
     -- "${bench_cmd[@]}"
 )
 "${vtune_collect_cmd[@]}" >"${OUT_ROOT}/bench.stdout" 2>"${OUT_ROOT}/bench.stderr"
-vtune -report hotspots -r "${vtune_dir}" -group-by computing-task -format csv >"${OUT_ROOT}/vtune-computing-tasks.csv"
+if ! vtune -report hotspots -r "${vtune_dir}" -group-by computing-task -format csv >"${OUT_ROOT}/vtune-computing-tasks.csv"; then
+    printf 'warning: VTune computing-task report failed; task parser will fail closed if the CSV is empty\n' >&2
+fi
 if ! python3 scripts/parse-sycl-vtune-tasks.py "${OUT_ROOT}/vtune-computing-tasks.csv" --match "${TASK_MATCH}" >"${OUT_ROOT}/vtune-task.parse"; then
     printf 'warning: failed to parse VTune computing tasks for match %s\n' "${TASK_MATCH}" >&2
 fi
-first_zebin="$(find "${vtune_dir}" -path '*/data.0/*.zebin' -type f -print -quit)"
+first_zebin="$(find "${vtune_dir}" -name '*.zebin' -type f -print -quit)"
 if [[ -z "${first_zebin}" ]]; then
     printf 'error: no .zebin found in %s\n' "${vtune_dir}" >&2
     exit 1
@@ -135,7 +137,9 @@ if ! python3 scripts/convert-sycl-zebin-line-table-to-source-csv.py \
     --source-computing-task "${TARGET_KERNEL}"; then
     printf 'warning: DWARF source-line CSV conversion failed; checker will fail closed unless %s exists\n' "${OUT_ROOT}/dwarf-source-lines.csv" >&2
 fi
-vtune -report hotspots -r "${vtune_dir}" -group-by gpu-source-line -format csv >"${OUT_ROOT}/vtune-gpu-source-line.csv"
+if ! vtune -report hotspots -r "${vtune_dir}" -group-by gpu-source-line -format csv >"${OUT_ROOT}/vtune-gpu-source-line.csv"; then
+    printf 'warning: VTune gpu-source-line report failed; checker will use explicit blockers and DWARF fallback if available\n' >&2
+fi
 python3 scripts/check-sycl-vtune-source-lines.py \
     --readelf-sections "${OUT_ROOT}/zebin-debug-sections.txt" \
     --vtune-csv "${OUT_ROOT}/vtune-gpu-source-line.csv" \

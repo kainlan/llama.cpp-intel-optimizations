@@ -137,11 +137,21 @@ def test_source_line_feasibility_script_propagates_target_kernel_to_checker() ->
     assert "--require-kernel custom_kernel" in result.stdout
 
 
-def test_source_line_feasibility_execute_branch_uses_pipe_free_zebin_probe() -> None:
+def test_source_line_feasibility_execute_branch_uses_pipe_free_archived_zebin_probe() -> None:
     text = script_text()
-    assert "-print -quit" in text
+    assert "find \"${vtune_dir}\" -name '*.zebin' -type f -print -quit" in text
+    assert "-path '*/data.0/*.zebin'" not in text
     assert "| head -n 1" not in text
     assert "error: no .zebin found" in text
+
+
+def test_source_line_feasibility_execute_branch_tolerates_empty_vtune_report_exports() -> None:
+    text = script_text()
+    assert "if ! vtune -report hotspots -r \"${vtune_dir}\" -group-by computing-task" in text
+    assert "warning: VTune computing-task report failed" in text
+    assert "if ! vtune -report hotspots -r \"${vtune_dir}\" -group-by gpu-source-line" in text
+    assert "warning: VTune gpu-source-line report failed" in text
+    assert "checker will use explicit blockers and DWARF fallback" in text
 
 
 def test_source_line_feasibility_execute_branch_writes_expected_artifacts() -> None:
