@@ -498,6 +498,29 @@ def test_resolver_rejects_iga_rows_for_wrong_kernel() -> None:
         assert "Traceback" not in result.stdout
 
 
+def test_resolver_rejects_iga_rows_with_no_source_matches() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        dwarf, _ = write_fixture(tmp)
+        iga_csv = tmp / "iga-pc.csv"
+        iga_csv.write_text(
+            "kernel,pc,pc_hex,opcode,text,raw,send_comment,source\n"
+            "mxfp4_pair_glu_xmx_tiled,0,0x0,dpas.8x8,dpas.8x8 r1 r2 r3,raw,,iga-json\n",
+            encoding="utf-8",
+        )
+        result = run_resolver(
+            "--dwarf-line-dump",
+            str(dwarf),
+            "--iga-instructions-csv",
+            str(iga_csv),
+            "--source-computing-task",
+            "mxfp4_pair_glu_xmx_tiled",
+        )
+        assert result.returncode == 2
+        assert "no mapped ASM source rows (no_asm_source_matches)" in result.stdout
+        assert "Traceback" not in result.stdout
+
+
 def test_resolver_rejects_both_asm_and_iga_instruction_inputs() -> None:
     with tempfile.TemporaryDirectory() as tmp_raw:
         tmp = pathlib.Path(tmp_raw)
