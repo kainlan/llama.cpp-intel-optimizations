@@ -34,6 +34,23 @@ def test_debug_matrix_script_is_dry_run_by_default() -> None:
     assert "sycl-kernel-bench" not in result.stdout
 
 
+def test_debug_matrix_vtune_target_gpu_is_explicit_opt_in() -> None:
+    explicit = subprocess.run(
+        ["bash", str(SCRIPT), "--vtune-target-gpu", "0:7:0.0"],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    assert explicit.returncode == 0, explicit.stdout
+    assert "target-gpu=0:7:0.0" in explicit.stdout
+
+    default = subprocess.run(["bash", str(SCRIPT)], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+    assert default.returncode == 0, default.stdout
+    assert "target-gpu=" not in default.stdout
+
+
 def test_debug_matrix_script_handles_absolute_out_root_in_dry_run(tmp_path: Path) -> None:
     out_root = tmp_path / "source line matrix"
     result = subprocess.run(

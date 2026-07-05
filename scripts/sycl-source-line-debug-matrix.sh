@@ -6,6 +6,7 @@ ACK=0
 OUT_ROOT="source-line"
 DEFAULT_MATRIX_ROOT="source-line/build-matrix"
 DEVICE_SELECTOR="level_zero:1"
+VTUNE_TARGET_GPU=""
 TARGET_KERNEL="sycl_source_line_probe"
 TASK_GLOB=""
 TASK_MATCH="sycl_source_line_probe"
@@ -26,7 +27,7 @@ CASE_LINK_FLAGS=(
 )
 
 usage() {
-    printf 'usage: %s [--dry-run|--execute] [--i-understand-this-runs-gpu-source-probe] [--out-root DIR] [--device-selector SELECTOR] [--task-glob GLOB] [--task-match TEXT]\n' "$0"
+    printf 'usage: %s [--dry-run|--execute] [--i-understand-this-runs-gpu-source-probe] [--out-root DIR] [--device-selector SELECTOR] [--vtune-target-gpu VALUE] [--task-glob GLOB] [--task-match TEXT]\n' "$0"
 }
 
 require_value() {
@@ -45,6 +46,7 @@ while [[ $# -gt 0 ]]; do
         --i-understand-this-runs-gpu-source-probe) ACK=1 ;;
         --out-root) require_value "$1" "${2-}"; OUT_ROOT="$2"; shift ;;
         --device-selector) require_value "$1" "${2-}"; DEVICE_SELECTOR="$2"; shift ;;
+        --vtune-target-gpu) require_value "$1" "${2-}"; VTUNE_TARGET_GPU="$2"; shift ;;
         --task-glob) require_value "$1" "${2-}"; TASK_GLOB="$2"; shift ;;
         --task-match) require_value "$1" "${2-}"; TASK_MATCH="$2"; shift ;;
         --help|-h) usage; exit 0 ;;
@@ -103,7 +105,11 @@ make_probe_cmd() {
 
 print_vtune_collect_prefix() {
     local vtune_dir="$1"
-    printf 'env ONEAPI_DEVICE_SELECTOR=%q vtune -collect gpu-hotspots -knob gpu-profiling-mode=source-analysis -knob source-analysis=mem-latency -knob dump-compute-task-binaries=true' "${DEVICE_SELECTOR}"
+    printf 'env ONEAPI_DEVICE_SELECTOR=%q vtune -collect gpu-hotspots' "${DEVICE_SELECTOR}"
+    if [[ -n "${VTUNE_TARGET_GPU}" ]]; then
+        printf ' -knob %q' "target-gpu=${VTUNE_TARGET_GPU}"
+    fi
+    printf ' -knob gpu-profiling-mode=source-analysis -knob source-analysis=mem-latency -knob dump-compute-task-binaries=true'
     if [[ -n "${TASK_GLOB}" ]]; then
         local task_knob
         task_knob="computing-tasks-of-interest=${TASK_GLOB}#1#1#20"
@@ -174,6 +180,11 @@ for index in "${!CASE_NAMES[@]}"; do
     "${BUILD_CMD[@]}" >"${dir}/build.log" 2>&1
     vtune_collect_cmd=(
         env ONEAPI_DEVICE_SELECTOR="${DEVICE_SELECTOR}" vtune -collect gpu-hotspots
+    )
+    if [[ -n "${VTUNE_TARGET_GPU}" ]]; then
+        vtune_collect_cmd+=(-knob "target-gpu=${VTUNE_TARGET_GPU}")
+    fi
+    vtune_collect_cmd+=(
         -knob gpu-profiling-mode=source-analysis
         -knob source-analysis=mem-latency
         -knob dump-compute-task-binaries=true
