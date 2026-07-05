@@ -12,6 +12,12 @@ def script_text() -> str:
     return SCRIPT.read_text(encoding="utf-8")
 
 
+def test_debug_matrix_zebin_lookup_is_pipe_free() -> None:
+    text = script_text()
+    assert "-print -quit" in text
+    assert "| head -n 1" not in text
+
+
 def test_debug_matrix_script_is_dry_run_by_default() -> None:
     result = subprocess.run(["bash", str(SCRIPT)], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
     assert result.returncode == 0, result.stdout
@@ -61,7 +67,21 @@ def test_debug_matrix_task_filter_is_opt_in() -> None:
     )
     assert result.returncode == 0, result.stdout
     assert "computing-tasks-of-interest" in result.stdout
-    assert "*sycl_source_line_probe*#1#1#20" in result.stdout
+    assert "\\*sycl_source_line_probe\\*#1#1#20" in result.stdout
+
+
+def test_debug_matrix_task_glob_with_single_quote_is_shell_escaped() -> None:
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--task-glob", "a'b"],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout
+    assert "computing-tasks-of-interest=a\\'b#1#1#20" in result.stdout
+    assert "computing-tasks-of-interest='a'b#1#1#20'" not in result.stdout
 
 
 def test_debug_matrix_execute_branch_writes_expected_artifacts() -> None:

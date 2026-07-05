@@ -105,7 +105,9 @@ print_vtune_collect_prefix() {
     local vtune_dir="$1"
     printf 'env ONEAPI_DEVICE_SELECTOR=%q vtune -collect gpu-hotspots -knob gpu-profiling-mode=source-analysis -knob source-analysis=mem-latency -knob dump-compute-task-binaries=true' "${DEVICE_SELECTOR}"
     if [[ -n "${TASK_GLOB}" ]]; then
-        printf " -knob computing-tasks-of-interest='%s'" "${TASK_GLOB}#1#1#20"
+        local task_knob
+        task_knob="computing-tasks-of-interest=${TASK_GLOB}#1#1#20"
+        printf ' -knob %q' "${task_knob}"
     fi
     printf ' -result-dir %q -- ' "${vtune_dir}"
 }
@@ -189,7 +191,7 @@ for index in "${!CASE_NAMES[@]}"; do
         printf 'warning: VTune task selection failed for matrix row %s; see %s\n' "${name}" "${dir}/vtune-task.parse" >&2
     fi
 
-    first_zebin="$(find "${vtune_dir}" -name '*.zebin' -type f -print | head -n 1)"
+    first_zebin="$(find "${vtune_dir}" -name '*.zebin' -type f -print -quit)"
     if [[ -z "${first_zebin}" ]]; then
         printf 'error: no .zebin found for matrix row %s in %s\n' "${name}" "${vtune_dir}" >&2
         exit 1
