@@ -672,3 +672,55 @@ def test_checker_rejects_contradictory_sampled_pc_schema() -> None:
         assert "source_line.sampled_source_line_rows 0" in result.stdout
         assert "source_line.source_attribution_mode none" in result.stdout
         assert "source_line.status fail" in result.stdout
+
+
+def test_checker_does_not_promote_contradictory_sampled_pc_vtune_row_to_pass() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        sections = tmp / "sections.txt"
+        csv = tmp / "source.csv"
+        sections.write_text("[12] .debug_line PROGBITS\n", encoding="utf-8")
+        csv.write_text(
+            "Source Line,Source Computing Task,Source Attribution Mode,Source Attribution Status\n"
+            "mmvq.cpp:123,mxfp4_pair_glu_xmx_tiled,sampled-pc-line,asm_line_static_cost\n",
+            encoding="utf-8",
+        )
+        result = run_checker(sections, csv, "--require-kernel", "mxfp4_pair_glu_xmx_tiled")
+        assert result.returncode == 2
+        assert "source_line.non_unknown_rows 0" in result.stdout
+        assert "source_line.source_attribution_mode none" in result.stdout
+        assert "source_line.status fail" in result.stdout
+
+
+def test_checker_does_not_promote_contradictory_sampled_pc_row_to_asm_static() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        sections = tmp / "sections.txt"
+        asm_csv = tmp / "asm-source.csv"
+        sections.write_text("[12] .debug_line PROGBITS\n", encoding="utf-8")
+        asm_csv.write_text(
+            "Source Line,Source File,Source File Path,Source Computing Task,Static Dpas Count,Static Score,Source Attribution Mode,Source Attribution Status\n"
+            "/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp:6800,mmvq.cpp,/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp,mxfp4_pair_glu_xmx_tiled,2,14,sampled-pc-line,asm_line_static_cost\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(CHECKER),
+                "--readelf-sections",
+                str(sections),
+                "--asm-source-lines-csv",
+                str(asm_csv),
+                "--allow-asm-line-static-cost",
+                "--require-kernel",
+                "mxfp4_pair_glu_xmx_tiled",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        assert result.returncode == 2
+        assert "source_line.asm_source_line_rows 0" in result.stdout
+        assert "source_line.source_attribution_mode none" in result.stdout
+        assert "source_line.status fail" in result.stdout

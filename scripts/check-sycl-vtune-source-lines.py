@@ -60,19 +60,36 @@ def row_attribution_mode(row: dict[str, str]) -> str:
     return row.get("Source Attribution Mode", "").strip()
 
 
+def row_attribution_status(row: dict[str, str]) -> str:
+    return row.get("Source Attribution Status", "").strip()
+
+
 def row_is_dwarf_line_table(row: dict[str, str]) -> bool:
-    return row_attribution_mode(row) == DWARF_ATTRIBUTION_MODE
+    return row_attribution_mode(row) == DWARF_ATTRIBUTION_MODE and row_attribution_status(row) not in {
+        ASM_ATTRIBUTION_STATUS,
+        SAMPLED_PC_ATTRIBUTION_STATUS,
+    }
 
 
 def row_is_asm_line_static(row: dict[str, str]) -> bool:
-    return row_attribution_mode(row) == ASM_ATTRIBUTION_MODE or row.get("Source Attribution Status", "").strip() == ASM_ATTRIBUTION_STATUS
+    mode = row_attribution_mode(row)
+    status = row_attribution_status(row)
+    return (mode == ASM_ATTRIBUTION_MODE and status in {"", ASM_ATTRIBUTION_STATUS}) or (
+        status == ASM_ATTRIBUTION_STATUS and mode in {"", ASM_ATTRIBUTION_MODE}
+    )
 
 
 def row_is_sampled_pc_line(row: dict[str, str]) -> bool:
-    return (
-        row_attribution_mode(row) == SAMPLED_PC_ATTRIBUTION_MODE
-        and row.get("Source Attribution Status", "").strip() == SAMPLED_PC_ATTRIBUTION_STATUS
-    )
+    return row_attribution_mode(row) == SAMPLED_PC_ATTRIBUTION_MODE and row_attribution_status(row) == SAMPLED_PC_ATTRIBUTION_STATUS
+
+
+def row_has_non_vtune_attribution_marker(row: dict[str, str]) -> bool:
+    mode = row_attribution_mode(row)
+    status = row_attribution_status(row)
+    return mode in {DWARF_ATTRIBUTION_MODE, ASM_ATTRIBUTION_MODE, SAMPLED_PC_ATTRIBUTION_MODE} or status in {
+        ASM_ATTRIBUTION_STATUS,
+        SAMPLED_PC_ATTRIBUTION_STATUS,
+    }
 
 
 def parse_int_field(row: dict[str, str], field: str) -> int:
@@ -101,9 +118,7 @@ def count_vtune_sampled_known_rows(rows: list[dict[str, str]], required_kernel: 
         for row in rows
         if row_matches_kernel(row, required_kernel)
         and row_has_known_source_line(row)
-        and not row_is_dwarf_line_table(row)
-        and not row_is_asm_line_static(row)
-        and not row_is_sampled_pc_line(row)
+        and not row_has_non_vtune_attribution_marker(row)
     )
 
 
