@@ -11,11 +11,12 @@ PROMPT_TOKENS="512"
 GEN_TOKENS="128"
 REPEAT="1"
 SOURCE_KERNEL="mxfp4_pair_glu_xmx_tiled"
+IGA_PLATFORM="${SYCL_IGA_PLATFORM:-xe2}"
 
 usage() {
     printf 'usage: %s [--dry-run|--execute] [--i-understand-this-runs-gpu-models-and-profilers] [options]\n' "$0"
     printf 'default mode is dry-run; real execution requires --execute --i-understand-this-runs-gpu-models-and-profilers\n'
-    printf 'options: --out-root DIR --device-selector SELECTOR --model GGUF --bench PATH --prompt-tokens N --gen-tokens N --repeat N --source-kernel NAME\n'
+    printf 'options: --out-root DIR --device-selector SELECTOR --model GGUF --bench PATH --prompt-tokens N --gen-tokens N --repeat N --source-kernel NAME --iga-platform PLATFORM\n'
 }
 
 require_value() {
@@ -78,6 +79,11 @@ while [[ $# -gt 0 ]]; do
             SOURCE_KERNEL="$2"
             shift
             ;;
+        --iga-platform)
+            require_value "$1" "${2-}"
+            IGA_PLATFORM="$2"
+            shift
+            ;;
         --help|-h)
             usage
             exit 0
@@ -119,6 +125,8 @@ source_line_dwarf_dump=${source_line_case}/zebin-debug-line.txt
 source_line_dwarf_csv=${source_line_case}/dwarf-source-lines.csv
 source_line_asm_csv=${source_line_case}/asm-source-lines.csv
 source_line_asm_summary=${source_line_case}/asm-source-lines.parse
+source_line_iga_dir=${source_line_case}/iga-disasm
+source_line_iga_csv=${source_line_case}/iga-pc-instructions.csv
 source_line_vtune_csv=${source_line_case}/vtune-gpu-source-line.csv
 source_region_map=activation/sycl-source-region-map.json
 source_line_probe_kernel=sycl_source_line_probe
@@ -171,8 +179,12 @@ print_parse_plan() {
     printf 'python3 %q %q >%q\n' "scripts/parse-sycl-ur-trace.py" "${ur_trace}" "${parsed_dir}/ur.parse"
     printf 'python3 %q --kernel-csv %q --source-csv %q >%q\n' "scripts/parse-sycl-vtune-exports.py" "${vtune_kernel_csv}" "${vtune_source_csv}" "${parsed_dir}/vtune.parse"
     printf 'python3 %q --timeline %q --kernel-profile %q --l0-summary %q --ur-summary %q --vtune-summary %q --bench-stderr %q >%q\n' "scripts/parse-sycl-layer-ledger.py" "${raw_timeline}" "${raw_kernel_csv}" "${parsed_dir}/l0.parse" "${parsed_dir}/ur.parse" "${parsed_dir}/vtune.parse" "${OUT_ROOT}/bench.stderr" "${parsed_dir}/layer-ledger.parse"
-    printf 'bash %q --execute --i-understand-this-runs-gpu-source-probe --out-root %q --device-selector %q\n' "scripts/sycl-source-line-debug-matrix.sh" "${source_line_dir}" "${DEVICE_SELECTOR}"
+    printf 'bash %q --execute --i-understand-this-runs-gpu-source-probe --out-root %q --device-selector %q --iga-platform %q\n' "scripts/sycl-source-line-debug-matrix.sh" "${source_line_dir}" "${DEVICE_SELECTOR}" "${IGA_PLATFORM}"
     printf '# source-line matrix conversion: python3 %q --input %q --output %q --source-computing-task %q\n' "scripts/convert-sycl-zebin-line-table-to-source-csv.py" "${source_line_dwarf_dump}" "${source_line_dwarf_csv}" "${source_line_probe_kernel}"
+    printf '# source-line matrix IGA prepare: llvm-readelf --sections --wide <first-zebin> > %q; python3 %q --readelf-sections %q --zebin <first-zebin> --kernel-match %q --platform "${SYCL_IGA_PLATFORM:-xe2}" --out-dir %q\n' "${source_line_sections}" "scripts/prepare-sycl-iga-disasm-inputs.py" "${source_line_sections}" "${source_line_probe_kernel}" "${source_line_iga_dir}"
+    printf '# source-line matrix IGA disasm: (cd %q && bash run-iga-disasm.sh)  # iga64 -Xprint-json -Xprint-pc\n' "${source_line_iga_dir}"
+    printf '# source-line matrix IGA parser: python3 %q --input %q --format json --kernel %q > %q\n' "scripts/parse-sycl-iga-pc-disasm.py" "${source_line_iga_dir}/kernel.iga.json" "${source_line_probe_kernel}" "${source_line_iga_csv}"
+    printf '# source-line matrix IGA resolver: python3 %q --dwarf-line-dump %q --iga-instructions-csv %q --pc-base "${section_addr}" --output %q --summary-output %q --source-computing-task %q\n' "scripts/resolve-sycl-zebin-asm-source-lines.py" "${source_line_dwarf_dump}" "${source_line_iga_csv}" "${source_line_asm_csv}" "${source_line_asm_summary}" "${source_line_probe_kernel}"
     printf '# source-line matrix disasm: mkdir -p %q && cp %q %q && (cd %q && ocloc disasm -file kernel.zebin > ocloc.stdout 2> ocloc.stderr || true)\n' "${source_line_case}/zebin-disasm" "${source_line_case}/example.zebin" "${source_line_case}/zebin-disasm/kernel.zebin" "${source_line_case}/zebin-disasm"
     printf '# source-line matrix ASM selection: first_asm="$(find %q -type f -name '\''*%s*.asm'\'' -print -quit)"\n' "${source_line_case}/zebin-disasm" "${source_line_probe_kernel}"
     printf '# source-line matrix ASM fallback: if [[ -z "${first_asm}" ]]; then first_asm="$(find %q -type f -name '\''*.asm'\'' -print -quit)"; fi  # resolver rejects unmarked or mismatched ASM\n' "${source_line_case}/zebin-disasm"
@@ -232,7 +244,8 @@ bash scripts/sycl-source-line-debug-matrix.sh \
     --execute \
     --i-understand-this-runs-gpu-source-probe \
     --out-root "${source_line_dir}" \
-    --device-selector "${DEVICE_SELECTOR}"
+    --device-selector "${DEVICE_SELECTOR}" \
+    --iga-platform "${IGA_PLATFORM}"
 
 require_file "${raw_timeline_dir}/sycl-timeline.json"
 require_file "${raw_kernel_dir}/sycl-kernels.csv"

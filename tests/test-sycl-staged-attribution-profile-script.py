@@ -61,6 +61,19 @@ def test_vtune_source_dry_run_reports_matrix_artifact_contract(tmp_path: Path) -
     assert "source-line-matrix/build-matrix/<case>/asm-source-lines.csv" in result.stdout
     assert "source-line-matrix/build-matrix/<case>/vtune-gpu-source-line.csv" in result.stdout
     assert "convert-sycl-zebin-line-table-to-source-csv.py" in result.stdout
+    for required in (
+        "prepare-sycl-iga-disasm-inputs.py",
+        "iga64",
+        "-Xprint-json",
+        "-Xprint-pc",
+        "parse-sycl-iga-pc-disasm.py",
+        "iga-pc-instructions.csv",
+        "--iga-instructions-csv",
+        "--pc-base",
+        "--iga-platform",
+        "llvm-readelf --sections --wide",
+    ):
+        assert required in result.stdout
     assert "ocloc disasm -file kernel.zebin" in result.stdout
     assert "asm-source-lines.csv" in result.stdout
     assert "resolve-sycl-zebin-asm-source-lines.py" in result.stdout

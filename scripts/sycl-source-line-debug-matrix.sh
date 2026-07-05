@@ -10,6 +10,7 @@ VTUNE_TARGET_GPU=""
 TARGET_KERNEL="sycl_source_line_probe"
 TASK_GLOB=""
 TASK_MATCH="sycl_source_line_probe"
+IGA_PLATFORM="${SYCL_IGA_PLATFORM:-xe2}"
 
 CASE_NAMES=(release_split debug_line_tables debug_full debug_no_inline)
 CASE_BUILD_TYPES=(Release Release RelWithDebInfo RelWithDebInfo)
@@ -27,7 +28,7 @@ CASE_LINK_FLAGS=(
 )
 
 usage() {
-    printf 'usage: %s [--dry-run|--execute] [--i-understand-this-runs-gpu-source-probe] [--out-root DIR] [--device-selector SELECTOR] [--vtune-target-gpu VALUE] [--task-glob GLOB] [--task-match TEXT]\n' "$0"
+    printf 'usage: %s [--dry-run|--execute] [--i-understand-this-runs-gpu-source-probe] [--out-root DIR] [--device-selector SELECTOR] [--vtune-target-gpu VALUE] [--task-glob GLOB] [--task-match TEXT] [--iga-platform PLATFORM]\n' "$0"
 }
 
 require_value() {
@@ -49,6 +50,7 @@ while [[ $# -gt 0 ]]; do
         --vtune-target-gpu) require_value "$1" "${2-}"; VTUNE_TARGET_GPU="$2"; shift ;;
         --task-glob) require_value "$1" "${2-}"; TASK_GLOB="$2"; shift ;;
         --task-match) require_value "$1" "${2-}"; TASK_MATCH="$2"; shift ;;
+        --iga-platform) require_value "$1" "${2-}"; IGA_PLATFORM="$2"; shift ;;
         --help|-h) usage; exit 0 ;;
         *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
@@ -135,6 +137,7 @@ print_plan() {
     printf 'DRY RUN: source-line debug-info matrix; no commands are executed.\n'
     printf '# output root: %s\n' "${OUT_ROOT}"
     printf '# default matrix root: %s\n' "${DEFAULT_MATRIX_ROOT}"
+    printf '# IGA platform: %s (override with --iga-platform or SYCL_IGA_PLATFORM)\n' "${IGA_PLATFORM}"
 
     for index in "${!CASE_NAMES[@]}"; do
         local name="${CASE_NAMES[$index]}"
@@ -157,11 +160,17 @@ print_plan() {
         quote_cmd "${BUILD_CMD[@]}"; printf '> %q 2>&1\n' "${dir}/build.log"
         print_vtune_collect_prefix "${vtune_dir}"
         quote_cmd "${PROBE_CMD[@]}"; printf '> %q 2> %q\n' "${dir}/probe.stdout" "${dir}/probe.stderr"
-        printf 'readelf -S %q > %q\n' "${vtune_dir}/data.0/<first-zebin>" "${dir}/zebin-debug-sections.txt"
+        printf 'first_zebin="$(find %q -name '\''*.zebin'\'' -type f -print -quit)"\n' "${vtune_dir}"
+        printf 'llvm-readelf --sections --wide "${first_zebin}" > %q\n' "${dir}/zebin-debug-sections.txt"
         printf 'vtune -report hotspots -r %q -group-by computing-task -format csv > %q\n' "${vtune_dir}" "${dir}/vtune-computing-tasks.csv"
         printf 'python3 scripts/parse-sycl-vtune-tasks.py %q --match %q > %q\n' "${dir}/vtune-computing-tasks.csv" "${TASK_MATCH}" "${dir}/vtune-task.parse"
         printf 'llvm-dwarfdump --debug-line %q > %q\n' "${vtune_dir}/data.0/<first-zebin>" "${dir}/zebin-debug-line.txt"
         printf 'python3 scripts/convert-sycl-zebin-line-table-to-source-csv.py --input %q --output %q --source-computing-task %q\n' "${dir}/zebin-debug-line.txt" "${dir}/dwarf-source-lines.csv" "${TARGET_KERNEL}"
+        printf 'python3 scripts/prepare-sycl-iga-disasm-inputs.py --readelf-sections %q --zebin "${first_zebin}" --kernel-match %q --platform %q --out-dir %q || true\n' "${dir}/zebin-debug-sections.txt" "${TARGET_KERNEL}" "${IGA_PLATFORM}" "${dir}/iga-disasm"
+        printf '(cd %q && bash run-iga-disasm.sh) || true  # emits kernel.iga.json using iga64 -Xprint-json -Xprint-pc\n' "${dir}/iga-disasm"
+        printf 'python3 scripts/parse-sycl-iga-pc-disasm.py --input %q --format json --kernel %q > %q || true\n' "${dir}/iga-disasm/kernel.iga.json" "${TARGET_KERNEL}" "${dir}/iga-pc-instructions.csv"
+        printf 'section_addr="$(python3 -c %q %q)"\n' 'import json,sys; print(json.load(open(sys.argv[1]))["extract.section_addr"])' "${dir}/iga-disasm/iga-disasm-manifest.json"
+        printf 'python3 scripts/resolve-sycl-zebin-asm-source-lines.py --dwarf-line-dump %q --iga-instructions-csv %q --pc-base "${section_addr}" --output %q --summary-output %q --source-computing-task %q --require-source-path %q\n' "${dir}/zebin-debug-line.txt" "${dir}/iga-pc-instructions.csv" "${dir}/asm-source-lines.csv" "${dir}/asm-source-lines.parse" "${TARGET_KERNEL}" "main.cpp"
         printf 'mkdir -p %q && cp %q %q && (cd %q && ocloc disasm -file kernel.zebin > ocloc.stdout 2> ocloc.stderr || true)\n' "${dir}/zebin-disasm" "${vtune_dir}/data.0/example.zebin" "${dir}/zebin-disasm/kernel.zebin" "${dir}/zebin-disasm"
         printf 'first_asm="$(find %q -type f -name '\''*%s*.asm'\'' -print -quit)"\n' "${dir}/zebin-disasm" "${TARGET_KERNEL}"
         printf 'if [[ -z "${first_asm}" ]]; then first_asm="$(find %q -type f -name '\''*.asm'\'' -print -quit)"; fi  # resolver rejects unmarked or mismatched ASM\n' "${dir}/zebin-disasm"
@@ -226,7 +235,7 @@ for index in "${!CASE_NAMES[@]}"; do
         exit 1
     fi
 
-    readelf -S "${first_zebin}" >"${dir}/zebin-debug-sections.txt"
+    llvm-readelf --sections --wide "${first_zebin}" >"${dir}/zebin-debug-sections.txt"
     llvm-dwarfdump --debug-line "${first_zebin}" >"${dir}/zebin-debug-line.txt"
     rm -f "${dir}/dwarf-source-lines.csv"
     if ! python3 scripts/convert-sycl-zebin-line-table-to-source-csv.py \
@@ -235,27 +244,59 @@ for index in "${!CASE_NAMES[@]}"; do
         --source-computing-task "${TARGET_KERNEL}"; then
         printf 'warning: DWARF source-line CSV conversion failed for matrix row %s; checker will fail closed unless %s exists\n' "${name}" "${dir}/dwarf-source-lines.csv" >>"${dir}/probe.stderr"
     fi
-    asm_dir="${dir}/zebin-disasm"
-    rm -rf "${asm_dir}"
-    mkdir -p "${asm_dir}"
-    cp "${first_zebin}" "${asm_dir}/kernel.zebin"
-    if ! (cd "${asm_dir}" && ocloc disasm -file kernel.zebin >ocloc.stdout 2>ocloc.stderr); then
-        printf 'warning: ocloc disasm failed for matrix row %s; checker will use VTune/DWARF evidence if available\n' "${name}" >>"${dir}/probe.stderr"
-    fi
-    first_asm="$(find_asm_for_task "${asm_dir}" "${TARGET_KERNEL}")"
     rm -f "${dir}/asm-source-lines.csv" "${dir}/asm-source-lines.parse"
-    if [[ -n "${first_asm}" ]]; then
-        if ! python3 scripts/resolve-sycl-zebin-asm-source-lines.py \
-            --dwarf-line-dump "${dir}/zebin-debug-line.txt" \
-            --asm "${first_asm}" \
-            --output "${dir}/asm-source-lines.csv" \
-            --summary-output "${dir}/asm-source-lines.parse" \
-            --source-computing-task "${TARGET_KERNEL}" \
-            --require-source-path "main.cpp"; then
-            printf 'warning: ASM source-line resolver failed for matrix row %s; checker will use VTune/DWARF evidence if available\n' "${name}" >>"${dir}/probe.stderr"
+    iga_dir="${dir}/iga-disasm"
+    rm -rf "${iga_dir}"
+    rm -f "${dir}/iga-pc-instructions.csv"
+    if python3 scripts/prepare-sycl-iga-disasm-inputs.py \
+        --readelf-sections "${dir}/zebin-debug-sections.txt" \
+        --zebin "${first_zebin}" \
+        --kernel-match "${TARGET_KERNEL}" \
+        --platform "${IGA_PLATFORM}" \
+        --out-dir "${iga_dir}" >>"${dir}/probe.stderr" 2>&1; then
+        if (cd "${iga_dir}" && bash run-iga-disasm.sh >>iga.stdout 2>>iga.stderr) && \
+           python3 scripts/parse-sycl-iga-pc-disasm.py --input "${iga_dir}/kernel.iga.json" --format json --kernel "${TARGET_KERNEL}" >"${dir}/iga-pc-instructions.csv"; then
+            section_addr="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["extract.section_addr"])' "${iga_dir}/iga-disasm-manifest.json")"
+            if ! python3 scripts/resolve-sycl-zebin-asm-source-lines.py \
+                --dwarf-line-dump "${dir}/zebin-debug-line.txt" \
+                --iga-instructions-csv "${dir}/iga-pc-instructions.csv" \
+                --pc-base "${section_addr}" \
+                --output "${dir}/asm-source-lines.csv" \
+                --summary-output "${dir}/asm-source-lines.parse" \
+                --source-computing-task "${TARGET_KERNEL}" \
+                --require-source-path "main.cpp"; then
+                rm -f "${dir}/asm-source-lines.csv"
+                printf 'warning: IGA PC resolver failed for matrix row %s; checker will use ocloc/DWARF evidence if available\n' "${name}" >>"${dir}/probe.stderr"
+            fi
+        else
+            printf 'warning: IGA PC disassembly failed for matrix row %s; checker will use ocloc/DWARF evidence if available\n' "${name}" >>"${dir}/probe.stderr"
         fi
     else
-        printf 'warning: no .asm file found after ocloc disasm for matrix row %s\n' "${name}" >>"${dir}/probe.stderr"
+        printf 'warning: IGA input preparation failed for matrix row %s; checker will use ocloc/DWARF evidence if available\n' "${name}" >>"${dir}/probe.stderr"
+    fi
+    if [[ ! -f "${dir}/asm-source-lines.parse" ]] || ! grep -qx 'asm_source.status ok' "${dir}/asm-source-lines.parse"; then
+        rm -f "${dir}/asm-source-lines.csv"
+        asm_dir="${dir}/zebin-disasm"
+        rm -rf "${asm_dir}"
+        mkdir -p "${asm_dir}"
+        cp "${first_zebin}" "${asm_dir}/kernel.zebin"
+        if ! (cd "${asm_dir}" && ocloc disasm -file kernel.zebin >ocloc.stdout 2>ocloc.stderr); then
+            printf 'warning: ocloc disasm failed for matrix row %s; checker will use VTune/DWARF evidence if available\n' "${name}" >>"${dir}/probe.stderr"
+        fi
+        first_asm="$(find_asm_for_task "${asm_dir}" "${TARGET_KERNEL}")"
+        if [[ -n "${first_asm}" ]]; then
+            if ! python3 scripts/resolve-sycl-zebin-asm-source-lines.py \
+                --dwarf-line-dump "${dir}/zebin-debug-line.txt" \
+                --asm "${first_asm}" \
+                --output "${dir}/asm-source-lines.csv" \
+                --summary-output "${dir}/asm-source-lines.parse" \
+                --source-computing-task "${TARGET_KERNEL}" \
+                --require-source-path "main.cpp"; then
+                printf 'warning: ASM source-line resolver failed for matrix row %s; checker will use VTune/DWARF evidence if available\n' "${name}" >>"${dir}/probe.stderr"
+            fi
+        else
+            printf 'warning: no .asm file found after ocloc disasm for matrix row %s\n' "${name}" >>"${dir}/probe.stderr"
+        fi
     fi
     if ! vtune -report hotspots -r "${vtune_dir}" -group-by gpu-source-line -format csv >"${dir}/vtune-gpu-source-line.csv"; then
         printf 'warning: VTune gpu-source-line report failed for matrix row %s; writing fail-closed checker output\n' "${name}" >>"${dir}/probe.stderr"

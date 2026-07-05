@@ -14,6 +14,7 @@ BENCH="./build/bin/llama-bench"
 SOURCE_REGION_MAP="activation/sycl-source-region-map.json"
 ABLATION_ROUTE="prepack"
 ABLATION_KERNEL="mxfp4.gateup.xmx_tiled_dpas_m2"
+IGA_PLATFORM="${SYCL_IGA_PLATFORM:-xe2}"
 
 usage() {
     printf 'usage: %s [--dry-run|--execute] [--i-understand-this-runs-staged-gpu-profiling] [options]\n' "$0"
@@ -24,6 +25,7 @@ usage() {
     printf '  --device-selector SELECTOR\n'
     printf '  --model GGUF\n'
     printf '  --prompt-tokens N --gen-tokens N --repeat N\n'
+    printf '  --iga-platform PLATFORM\n'
 }
 
 require_value() {
@@ -79,6 +81,11 @@ while [[ $# -gt 0 ]]; do
         --repeat)
             require_value "$1" "${2-}"
             REPEAT="$2"
+            shift
+            ;;
+        --iga-platform)
+            require_value "$1" "${2-}"
+            IGA_PLATFORM="$2"
             shift
             ;;
         --help|-h)
@@ -312,7 +319,7 @@ run_vtune_source_stage() {
     if [[ "${EXECUTE}" -ne 1 ]]; then
         printf 'stage=vtune-source\n'
         print_stage_layout "${root}"
-        printf 'bash %q --execute --i-understand-this-runs-gpu-source-probe --out-root %q --device-selector %q\n' "scripts/sycl-source-line-debug-matrix.sh" "${root}/source-line-matrix" "${DEVICE_SELECTOR}"
+        printf 'bash %q --execute --i-understand-this-runs-gpu-source-probe --out-root %q --device-selector %q --iga-platform %q\n' "scripts/sycl-source-line-debug-matrix.sh" "${root}/source-line-matrix" "${DEVICE_SELECTOR}" "${IGA_PLATFORM}"
         printf '#   matrix outputs: %s/source-line-matrix/build-matrix/<case>/source-line-feasibility.parse\n' "${root}"
         printf '#   matrix outputs: %s/source-line-matrix/build-matrix/<case>/zebin-debug-sections.txt\n' "${root}"
         printf '#   matrix outputs: %s/source-line-matrix/build-matrix/<case>/zebin-debug-line.txt\n' "${root}"
@@ -320,6 +327,10 @@ run_vtune_source_stage() {
         printf '#   matrix outputs: %s/source-line-matrix/build-matrix/<case>/asm-source-lines.csv\n' "${root}"
         printf '#   matrix outputs: %s/source-line-matrix/build-matrix/<case>/vtune-gpu-source-line.csv\n' "${root}"
         printf '#   matrix conversion: python3 %q --input %q --output %q --source-computing-task %q\n' "scripts/convert-sycl-zebin-line-table-to-source-csv.py" "${root}/source-line-matrix/build-matrix/<case>/zebin-debug-line.txt" "${root}/source-line-matrix/build-matrix/<case>/dwarf-source-lines.csv" "sycl_source_line_probe"
+        printf '#   matrix IGA prepare: llvm-readelf --sections --wide <first-zebin> > %q; python3 %q --readelf-sections %q --zebin <first-zebin> --kernel-match %q --platform "${SYCL_IGA_PLATFORM:-xe2}" --out-dir %q\n' "${root}/source-line-matrix/build-matrix/debug_full/zebin-debug-sections.txt" "scripts/prepare-sycl-iga-disasm-inputs.py" "${root}/source-line-matrix/build-matrix/debug_full/zebin-debug-sections.txt" "sycl_source_line_probe" "${root}/source-line-matrix/build-matrix/debug_full/iga-disasm"
+        printf '#   matrix IGA disasm: (cd %q && bash run-iga-disasm.sh)  # iga64 -Xprint-json -Xprint-pc\n' "${root}/source-line-matrix/build-matrix/debug_full/iga-disasm"
+        printf '#   matrix IGA parser: python3 %q --input %q --format json --kernel %q > %q\n' "scripts/parse-sycl-iga-pc-disasm.py" "${root}/source-line-matrix/build-matrix/debug_full/iga-disasm/kernel.iga.json" "sycl_source_line_probe" "${root}/source-line-matrix/build-matrix/debug_full/iga-pc-instructions.csv"
+        printf '#   matrix IGA resolver: python3 %q --dwarf-line-dump %q --iga-instructions-csv %q --pc-base "${section_addr}" --output %q --summary-output %q --source-computing-task %q\n' "scripts/resolve-sycl-zebin-asm-source-lines.py" "${root}/source-line-matrix/build-matrix/debug_full/zebin-debug-line.txt" "${root}/source-line-matrix/build-matrix/debug_full/iga-pc-instructions.csv" "${root}/source-line-matrix/build-matrix/debug_full/asm-source-lines.csv" "${root}/source-line-matrix/build-matrix/debug_full/asm-source-lines.parse" "sycl_source_line_probe"
         printf '#   matrix disasm: mkdir -p %q && cp %q %q && (cd %q && ocloc disasm -file kernel.zebin > ocloc.stdout 2> ocloc.stderr || true)\n' "${root}/source-line-matrix/build-matrix/debug_full/zebin-disasm" "${root}/source-line-matrix/build-matrix/debug_full/example.zebin" "${root}/source-line-matrix/build-matrix/debug_full/zebin-disasm/kernel.zebin" "${root}/source-line-matrix/build-matrix/debug_full/zebin-disasm"
         printf '#   matrix ASM selection: first_asm="$(find %q -type f -name '\''*%s*.asm'\'' -print -quit)"\n' "${root}/source-line-matrix/build-matrix/debug_full/zebin-disasm" "sycl_source_line_probe"
         printf '#   matrix ASM fallback: if [[ -z "${first_asm}" ]]; then first_asm="$(find %q -type f -name '\''*.asm'\'' -print -quit)"; fi  # resolver rejects unmarked or mismatched ASM\n' "${root}/source-line-matrix/build-matrix/debug_full/zebin-disasm"
@@ -336,7 +347,8 @@ run_vtune_source_stage() {
         --execute \
         --i-understand-this-runs-gpu-source-probe \
         --out-root "${root}/source-line-matrix" \
-        --device-selector "${DEVICE_SELECTOR}"
+        --device-selector "${DEVICE_SELECTOR}" \
+        --iga-platform "${IGA_PLATFORM}"
 
     local matrix_root
     local selected_parse=""

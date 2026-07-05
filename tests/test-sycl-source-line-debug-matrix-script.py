@@ -21,7 +21,7 @@ def test_debug_matrix_zebin_lookup_is_pipe_free() -> None:
 def test_debug_matrix_script_is_dry_run_by_default() -> None:
     result = subprocess.run(["bash", str(SCRIPT)], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
     assert result.returncode == 0, result.stdout
-    for required in ("DRY RUN", "release_split", "debug_line_tables", "debug_full", "debug_no_inline", "sycl-source-line-probe", "readelf -S", "gpu-source-line"):
+    for required in ("DRY RUN", "release_split", "debug_line_tables", "debug_full", "debug_no_inline", "sycl-source-line-probe", "llvm-readelf --sections --wide", "gpu-source-line"):
         assert required in result.stdout
     assert "vtune-computing-tasks.csv" in result.stdout
     assert "parse-sycl-vtune-tasks.py" in result.stdout
@@ -29,6 +29,19 @@ def test_debug_matrix_script_is_dry_run_by_default() -> None:
     assert "dwarf-source-lines.csv" in result.stdout
     assert "convert-sycl-zebin-line-table-to-source-csv.py" in result.stdout
     assert "--source-computing-task sycl_source_line_probe" in result.stdout
+    for required in (
+        "prepare-sycl-iga-disasm-inputs.py",
+        "iga64",
+        "-Xprint-json",
+        "-Xprint-pc",
+        "parse-sycl-iga-pc-disasm.py",
+        "iga-pc-instructions.csv",
+        "--iga-instructions-csv",
+        "--pc-base",
+        "--iga-platform",
+        "llvm-readelf --sections --wide",
+    ):
+        assert required in result.stdout
     assert "ocloc disasm -file kernel.zebin" in result.stdout
     assert "asm-source-lines.csv" in result.stdout
     assert "resolve-sycl-zebin-asm-source-lines.py" in result.stdout
@@ -140,6 +153,16 @@ def test_debug_matrix_execute_branch_writes_expected_artifacts() -> None:
         "asm-source-lines.csv",
         "asm-source-lines.parse",
         "zebin-disasm",
+        "iga-disasm",
+        "run-iga-disasm.sh",
+        "iga-pc-instructions.csv",
+        "prepare-sycl-iga-disasm-inputs.py",
+        "parse-sycl-iga-pc-disasm.py",
+        "--iga-instructions-csv",
+        "--pc-base",
+        "llvm-readelf --sections --wide",
+        "warning: IGA PC disassembly failed",
+        "checker will use ocloc/DWARF evidence if available",
         "ocloc disasm -file kernel.zebin",
         "resolve-sycl-zebin-asm-source-lines.py",
         "vtune-gpu-source-line.csv",

@@ -29,6 +29,19 @@ def test_source_line_feasibility_script_is_dry_run_by_default() -> None:
     assert "dwarf-source-lines.csv" in result.stdout
     assert "convert-sycl-zebin-line-table-to-source-csv.py" in result.stdout
     assert "--source-computing-task mxfp4_pair_glu_xmx_tiled_packed_r8_m2_sparse32_bias" in result.stdout
+    for required in (
+        "prepare-sycl-iga-disasm-inputs.py",
+        "iga64",
+        "-Xprint-json",
+        "-Xprint-pc",
+        "parse-sycl-iga-pc-disasm.py",
+        "iga-pc-instructions.csv",
+        "--iga-instructions-csv",
+        "--pc-base",
+        "--iga-platform",
+        "llvm-readelf --sections --wide",
+    ):
+        assert required in result.stdout
     assert "ocloc disasm -file kernel.zebin" in result.stdout
     assert "asm-source-lines.csv" in result.stdout
     assert "resolve-sycl-zebin-asm-source-lines.py" in result.stdout
@@ -173,6 +186,15 @@ def test_source_line_feasibility_execute_branch_writes_expected_artifacts() -> N
     assert "asm-source-lines.csv" in text
     assert "asm-source-lines.parse" in text
     assert "zebin-disasm" in text
+    assert "iga-disasm" in text
+    assert "run-iga-disasm.sh" in text
+    assert "iga-pc-instructions.csv" in text
+    assert "prepare-sycl-iga-disasm-inputs.py" in text
+    assert "parse-sycl-iga-pc-disasm.py" in text
+    assert "--iga-instructions-csv" in text
+    assert "--pc-base" in text
+    assert "warning: IGA PC disassembly failed" in text
+    assert "checker will use ocloc/DWARF evidence if available" in text
     assert "ocloc disasm -file kernel.zebin" in text
     assert "resolve-sycl-zebin-asm-source-lines.py" in text
     assert "source-line-feasibility.parse" in text
@@ -187,7 +209,7 @@ def test_source_line_feasibility_execute_branch_writes_expected_artifacts() -> N
     assert "vtune-task.parse" in text
     assert "vtune -collect gpu-hotspots" in text
     assert "vtune -report hotspots" in text
-    assert "readelf -S" in text
+    assert "llvm-readelf --sections --wide" in text
     assert "llvm-dwarfdump --debug-line" in text
     assert "scripts/parse-sycl-vtune-tasks.py" in text
     assert "scripts/check-sycl-vtune-source-lines.py" in text
