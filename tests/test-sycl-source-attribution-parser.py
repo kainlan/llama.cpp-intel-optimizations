@@ -188,6 +188,33 @@ def test_source_attribution_accepts_asm_line_static_cost_as_distinct_status() ->
         assert "source_attribution.status exact_source_line" not in result.stdout
 
 
+def test_source_attribution_accepts_sampled_line_cost_as_distinct_status() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        p = write_common(pathlib.Path(tmp_raw))
+        p["source"].write_text(
+            "source_line.required_kernel mxfp4.gateup.xmx_tiled_dpas_m2\n"
+            "source_line.blocker none\n"
+            "source_line.status sampled-line-cost\n"
+            "source_line.sampled_top_source_line ggml/src/ggml-sycl/mmvq.cpp:6800\n"
+            "source_line.sampled_top_sample_count 7\n",
+            encoding="utf-8",
+        )
+        result = run_parser(
+            "--cost-ranking",
+            str(p["cost"]),
+            "--source-line",
+            str(p["source"]),
+            "--region-map",
+            str(p["region"]),
+        )
+        assert result.returncode == 0, result.stdout
+        assert "source_attribution.status sampled_line_cost" in result.stdout
+        assert "source_attribution.source_line_status sampled-line-cost" in result.stdout
+        assert "source_attribution.sampled_top_source_line ggml/src/ggml-sycl/mmvq.cpp:6800" in result.stdout
+        assert "source_attribution.sampled_top_sample_count 7" in result.stdout
+        assert "source_attribution.status exact_source_line" not in result.stdout
+
+
 def test_source_attribution_does_not_claim_dwarf_line_table_when_source_line_kernel_mismatches_top_kernel() -> None:
     with tempfile.TemporaryDirectory() as tmp_raw:
         p = write_common(pathlib.Path(tmp_raw))
@@ -233,6 +260,31 @@ def test_source_attribution_does_not_claim_asm_static_when_source_line_kernel_mi
         assert "source_attribution.status source_region" in result.stdout
         assert "source_attribution.exact_line_blocker source_line_kernel_mismatch:sycl_source_line_probe" in result.stdout
         assert "source_attribution.status asm_line_static_cost" not in result.stdout
+
+
+def test_source_attribution_does_not_claim_sampled_line_cost_when_source_line_kernel_mismatches_top_kernel() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        p = write_common(pathlib.Path(tmp_raw))
+        p["source"].write_text(
+            "source_line.required_kernel sycl_source_line_probe\n"
+            "source_line.blocker none\n"
+            "source_line.status sampled-line-cost\n"
+            "source_line.sampled_top_source_line main.cpp:148\n"
+            "source_line.sampled_top_sample_count 7\n",
+            encoding="utf-8",
+        )
+        result = run_parser(
+            "--cost-ranking",
+            str(p["cost"]),
+            "--source-line",
+            str(p["source"]),
+            "--region-map",
+            str(p["region"]),
+        )
+        assert result.returncode == 0, result.stdout
+        assert "source_attribution.status source_region" in result.stdout
+        assert "source_attribution.exact_line_blocker source_line_kernel_mismatch:sycl_source_line_probe" in result.stdout
+        assert "source_attribution.status sampled_line_cost" not in result.stdout
 
 
 def test_source_attribution_reports_missing_region_without_traceback() -> None:

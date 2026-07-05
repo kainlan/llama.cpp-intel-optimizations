@@ -208,6 +208,40 @@ def test_staged_merger_accepts_asm_line_static_cost_when_source_line_matches() -
         assert "source_attribution.status asm_line_static_cost" in result.stdout
 
 
+def test_staged_merger_accepts_sampled_line_cost_when_source_line_matches() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        paths = write_fixture(pathlib.Path(tmp_raw))
+        paths["source_line"].write_text("source_line.status sampled-line-cost\nsource_line.blocker none\n", encoding="utf-8")
+        paths["source_attr"].write_text(
+            "source_attribution.status sampled_line_cost\n"
+            "source_attribution.source_line_status sampled-line-cost\n"
+            "source_attribution.kernel mxfp4.gateup.xmx_tiled_dpas_m2\n",
+            encoding="utf-8",
+        )
+        result = run_merger(paths)
+        assert result.returncode == 0, result.stdout
+        assert "coverage.layer_status ok" in result.stdout
+        assert "source_line.status sampled-line-cost" in result.stdout
+        assert "source_attribution.status sampled_line_cost" in result.stdout
+
+
+def test_staged_merger_rejects_sampled_line_cost_when_source_line_mismatches() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        paths = write_fixture(pathlib.Path(tmp_raw))
+        paths["source_line"].write_text("source_line.status pass\nsource_line.blocker none\n", encoding="utf-8")
+        paths["source_attr"].write_text(
+            "source_attribution.status sampled_line_cost\n"
+            "source_attribution.source_line_status sampled-line-cost\n"
+            "source_attribution.kernel mxfp4.gateup.xmx_tiled_dpas_m2\n",
+            encoding="utf-8",
+        )
+        result = run_merger(paths)
+        assert result.returncode == 2
+        assert "coverage.layer_status source_attribution_incomplete" in result.stdout
+        assert "sampled PC source attribution requires source_line.status sampled-line-cost" in result.stdout
+        assert "Traceback" not in result.stdout
+
+
 def test_staged_merger_rejects_asm_line_static_cost_when_source_line_mismatches() -> None:
     with tempfile.TemporaryDirectory() as tmp_raw:
         paths = write_fixture(pathlib.Path(tmp_raw))

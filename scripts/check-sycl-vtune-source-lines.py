@@ -13,6 +13,8 @@ UNKNOWN_VALUES = {"", "[Unknown]", "[Unknown source file]"}
 DWARF_ATTRIBUTION_MODE = "dwarf-line-table"
 ASM_ATTRIBUTION_MODE = "asm-line-static"
 ASM_ATTRIBUTION_STATUS = "asm_line_static_cost"
+SAMPLED_PC_ATTRIBUTION_MODE = "sampled-pc-line"
+SAMPLED_PC_ATTRIBUTION_STATUS = "sampled_line_cost"
 VTUNE_ATTRIBUTION_MODE = "vtune-sampled-exact"
 DEBUG_LINE_SECTION_RE = re.compile(r"(?m)^\s*\[\s*\d+\]\s+\.debug_line(?:\s|$)")
 NO_GPU_SIDE_TRACE_RE = re.compile(r"no GPU-side trace.{0,120}data was collected", re.IGNORECASE | re.DOTALL)
@@ -66,6 +68,13 @@ def row_is_asm_line_static(row: dict[str, str]) -> bool:
     return row_attribution_mode(row) == ASM_ATTRIBUTION_MODE or row.get("Source Attribution Status", "").strip() == ASM_ATTRIBUTION_STATUS
 
 
+def row_is_sampled_pc_line(row: dict[str, str]) -> bool:
+    return (
+        row_attribution_mode(row) == SAMPLED_PC_ATTRIBUTION_MODE
+        or row.get("Source Attribution Status", "").strip() == SAMPLED_PC_ATTRIBUTION_STATUS
+    )
+
+
 def parse_int_field(row: dict[str, str], field: str) -> int:
     raw = row.get(field, "").replace(",", "").strip()
     if not raw:
@@ -94,6 +103,7 @@ def count_vtune_sampled_known_rows(rows: list[dict[str, str]], required_kernel: 
         and row_has_known_source_line(row)
         and not row_is_dwarf_line_table(row)
         and not row_is_asm_line_static(row)
+        and not row_is_sampled_pc_line(row)
     )
 
 
@@ -111,6 +121,23 @@ def asm_line_static_rows(rows: list[dict[str, str]], required_kernel: str | None
         for row in rows
         if row_matches_kernel(row, required_kernel) and row_has_known_source_line(row) and row_is_asm_line_static(row)
     ]
+
+
+def sampled_pc_line_rows(rows: list[dict[str, str]], required_kernel: str | None) -> list[dict[str, str]]:
+    return [
+        row
+        for row in rows
+        if row_matches_kernel(row, required_kernel)
+        and row_has_known_source_line(row)
+        and row_is_sampled_pc_line(row)
+        and (parse_int_field(row, "Sample Count") > 0 or parse_int_field(row, "sample_count") > 0)
+    ]
+
+
+def top_sampled_pc_line_row(rows: list[dict[str, str]]) -> dict[str, str] | None:
+    if not rows:
+        return None
+    return max(rows, key=lambda row: (parse_int_field(row, "Sample Count"), parse_int_field(row, "sample_count")))
 
 
 def top_asm_line_static_row(rows: list[dict[str, str]]) -> dict[str, str] | None:
@@ -154,6 +181,11 @@ def main(argv: list[str]) -> int:
         help="allow DWARF line-table CSV rows to pass with source_line.status dwarf-line-table-only when VTune rows are unavailable",
     )
     parser.add_argument(
+        "--sampled-source-lines-csv",
+        type=pathlib.Path,
+        help="checker-compatible CSV generated from dynamic PC samples plus ZEBin DWARF line tables",
+    )
+    parser.add_argument(
         "--asm-source-lines-csv",
         type=pathlib.Path,
         help="checker-compatible CSV generated from ZEBin DWARF plus assembly instruction addresses",
@@ -169,10 +201,11 @@ def main(argv: list[str]) -> int:
 
     has_allowed_dwarf_only = args.allow_dwarf_line_table_only and args.dwarf_source_lines_csv is not None
     has_allowed_asm_static = args.allow_asm_line_static_cost and args.asm_source_lines_csv is not None
-    if args.vtune_csv is None and not (has_allowed_asm_static or has_allowed_dwarf_only):
+    has_sampled_pc_lines = args.sampled_source_lines_csv is not None
+    if args.vtune_csv is None and not (has_sampled_pc_lines or has_allowed_asm_static or has_allowed_dwarf_only):
         print(
-            "failed to check source lines: --vtune-csv is required unless an explicitly allowed "
-            "--asm-source-lines-csv or --dwarf-source-lines-csv fallback is provided"
+            "failed to check source lines: --vtune-csv is required unless --sampled-source-lines-csv or an explicitly "
+            "allowed --asm-source-lines-csv or --dwarf-source-lines-csv fallback is provided"
         )
         return 2
 
@@ -209,6 +242,17 @@ def main(argv: list[str]) -> int:
                 args.require_kernel,
             )
 
+        sampled_source_line_rows = 0
+        sampled_top_row: dict[str, str] | None = None
+        if (
+            args.sampled_source_lines_csv is not None
+            and args.sampled_source_lines_csv.is_file()
+            and args.sampled_source_lines_csv.stat().st_size > 0
+        ):
+            sampled_rows = sampled_pc_line_rows(read_source_csv(args.sampled_source_lines_csv), args.require_kernel)
+            sampled_source_line_rows = len(sampled_rows)
+            sampled_top_row = top_sampled_pc_line_row(sampled_rows)
+
         asm_source_line_rows = 0
         asm_top_row: dict[str, str] | None = None
         if args.asm_source_lines_csv is not None and args.asm_source_lines_csv.is_file() and args.asm_source_lines_csv.stat().st_size > 0:
@@ -229,6 +273,10 @@ def main(argv: list[str]) -> int:
         blocker = "none"
         status = "pass"
         source_attribution_mode = VTUNE_ATTRIBUTION_MODE
+    elif sampled_source_line_rows > 0:
+        blocker = "none"
+        status = "sampled-line-cost"
+        source_attribution_mode = SAMPLED_PC_ATTRIBUTION_MODE
     elif args.allow_asm_line_static_cost and asm_source_line_rows > 0:
         blocker = "none"
         status = "asm-line-static-cost"
@@ -257,6 +305,14 @@ def main(argv: list[str]) -> int:
     if args.dwarf_source_lines_csv is not None:
         print(f"source_line.dwarf_source_line_rows {dwarf_source_line_rows}")
         print(f"source_line.allow_dwarf_line_table_only {1 if args.allow_dwarf_line_table_only else 0}")
+    if args.sampled_source_lines_csv is not None:
+        print(f"source_line.sampled_source_line_rows {sampled_source_line_rows}")
+        if sampled_top_row is not None:
+            print(f"source_line.sampled_top_source_line {sampled_top_row.get('Source Line', '')}")
+            print(
+                "source_line.sampled_top_sample_count "
+                f"{max(parse_int_field(sampled_top_row, 'Sample Count'), parse_int_field(sampled_top_row, 'sample_count'))}"
+            )
     if args.asm_source_lines_csv is not None:
         print(f"source_line.asm_source_line_rows {asm_source_line_rows}")
         print(f"source_line.allow_asm_line_static_cost {1 if args.allow_asm_line_static_cost else 0}")
@@ -267,7 +323,7 @@ def main(argv: list[str]) -> int:
     print(f"source_line.source_attribution_mode {source_attribution_mode}")
     print(f"source_line.blocker {blocker}")
     print(f"source_line.status {status}")
-    return 0 if status in {"pass", "asm-line-static-cost", "dwarf-line-table-only"} else 2
+    return 0 if status in {"pass", "sampled-line-cost", "asm-line-static-cost", "dwarf-line-table-only"} else 2
 
 
 if __name__ == "__main__":

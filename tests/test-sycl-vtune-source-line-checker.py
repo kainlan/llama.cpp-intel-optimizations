@@ -570,3 +570,72 @@ def test_checker_prefers_asm_static_cost_over_dwarf_line_table_only() -> None:
         assert "source_line.source_attribution_mode asm-line-static" in result.stdout
         assert "source_line.status asm-line-static-cost" in result.stdout
         assert "source_line.status dwarf-line-table-only" not in result.stdout
+
+
+def test_checker_accepts_sampled_pc_line_cost_from_positive_samples() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        sections = tmp / "sections.txt"
+        sampled_csv = tmp / "sampled-source.csv"
+        sections.write_text("[12] .debug_line PROGBITS\n", encoding="utf-8")
+        sampled_csv.write_text(
+            "Source Line,Source File,Source File Path,Source Computing Task,Sample Count,Sample Kind,Source Attribution Mode,Source Attribution Status,sample_count,kernel\n"
+            "/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp:6800,mmvq.cpp,/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp,mxfp4_pair_glu_xmx_tiled,7,cycles,sampled-pc-line,sampled_line_cost,7,mxfp4_pair_glu_xmx_tiled\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(CHECKER),
+                "--readelf-sections",
+                str(sections),
+                "--sampled-source-lines-csv",
+                str(sampled_csv),
+                "--require-kernel",
+                "mxfp4_pair_glu_xmx_tiled",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout
+        assert "source_line.non_unknown_rows 0" in result.stdout
+        assert "source_line.vtune_sampled_non_unknown_rows 0" in result.stdout
+        assert "source_line.sampled_source_line_rows 1" in result.stdout
+        assert "source_line.sampled_top_sample_count 7" in result.stdout
+        assert "source_line.source_attribution_mode sampled-pc-line" in result.stdout
+        assert "source_line.status sampled-line-cost" in result.stdout
+
+
+def test_checker_rejects_sampled_pc_line_cost_without_positive_samples() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        sections = tmp / "sections.txt"
+        sampled_csv = tmp / "sampled-source.csv"
+        sections.write_text("[12] .debug_line PROGBITS\n", encoding="utf-8")
+        sampled_csv.write_text(
+            "Source Line,Source File,Source File Path,Source Computing Task,Sample Count,Sample Kind,Source Attribution Mode,Source Attribution Status,sample_count,kernel\n"
+            "/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp:6800,mmvq.cpp,/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp,mxfp4_pair_glu_xmx_tiled,0,cycles,sampled-pc-line,sampled_line_cost,0,mxfp4_pair_glu_xmx_tiled\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(CHECKER),
+                "--readelf-sections",
+                str(sections),
+                "--sampled-source-lines-csv",
+                str(sampled_csv),
+                "--require-kernel",
+                "mxfp4_pair_glu_xmx_tiled",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        assert result.returncode == 2
+        assert "source_line.sampled_source_line_rows 0" in result.stdout
+        assert "source_line.source_attribution_mode none" in result.stdout
+        assert "source_line.status fail" in result.stdout
