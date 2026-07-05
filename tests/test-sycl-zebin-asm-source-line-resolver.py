@@ -76,8 +76,8 @@ def test_resolver_maps_asm_addresses_to_dwarf_source_lines() -> None:
         rows = list(csv.DictReader(io.StringIO(result.stdout)))
         assert [row["Source Line"] for row in rows] == [
             "/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp:6800",
-            "/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp:6801",
             "/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp:6802",
+            "/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp:6801",
         ]
         first = rows[0]
         assert first["Source Computing Task"] == "mxfp4_pair_glu_xmx_tiled"
@@ -92,6 +92,11 @@ def test_resolver_maps_asm_addresses_to_dwarf_source_lines() -> None:
         assert first["static_score"] == "14"
         assert first["Source Attribution Mode"] == "asm-line-static"
         assert first["Source Attribution Status"] == "asm_line_static_cost"
+        final_row = rows[1]
+        assert final_row["Source Line"] == "/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp:6802"
+        assert final_row["Static Instruction Count"] == "2"
+        assert final_row["Static Send Ugm Count"] == "1"
+        assert final_row["Static Score"] == "6"
 
 
 def test_resolver_aggregates_same_file_and_line_across_different_columns() -> None:
@@ -157,12 +162,14 @@ def test_resolver_ignores_unknown_and_out_of_range_instruction_addresses() -> No
         )
         assert result.returncode == 0, result.stdout
         rows = list(csv.DictReader(io.StringIO(result.stdout)))
-        assert rows[-1]["Source Line"] == "/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp:6802"
-        assert rows[-1]["Static Instruction Count"] == "1"
+        rows_by_source_line = {row["Source Line"]: row for row in rows}
+        final_row = rows_by_source_line["/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp:6802"]
+        assert final_row["Static Instruction Count"] == "2"
+        assert final_row["Static Send Ugm Count"] == "1"
         summary_text = summary.read_text(encoding="utf-8")
         assert "asm_source.status ok" in summary_text
-        assert "asm_source.mapped_instruction_count 4" in summary_text
-        assert "asm_source.unmapped_instruction_count 2" in summary_text
+        assert "asm_source.mapped_instruction_count 5" in summary_text
+        assert "asm_source.unmapped_instruction_count 1" in summary_text
         assert "asm_source.source_line_rows 3" in summary_text
         assert "asm_source.top_source_line /Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp:6800" in summary_text
         assert "asm_source.top_static_score 14" in summary_text
@@ -259,6 +266,62 @@ def test_resolver_filters_dwarf_and_asm_sections_by_source_computing_task() -> N
         assert "other.cpp" not in result.stdout
 
 
+def test_resolver_matches_source_computing_task_exactly_not_by_substring() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        dwarf = tmp / "zebin-debug-line.txt"
+        dwarf.write_text(
+            "\n".join(
+                [
+                    "// Kernel: foo",
+                    ".debug_line contents:",
+                    "include_directories[  1] = /tmp/src",
+                    "file_names[  1]:",
+                    "           name: foo.cpp",
+                    "      dir_index: 1",
+                    "Address            Line   Column File   ISA Discriminator Flags",
+                    "0x0000000000000040   100      1     1     0             0  is_stmt",
+                    "// Kernel: foobar",
+                    ".debug_line contents:",
+                    "include_directories[  1] = /tmp/src",
+                    "file_names[  1]:",
+                    "           name: foobar.cpp",
+                    "      dir_index: 1",
+                    "Address            Line   Column File   ISA Discriminator Flags",
+                    "0x0000000000000040   200      1     1     0             0  is_stmt",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        asm = tmp / "kernels.asm"
+        asm.write_text(
+            "\n".join(
+                [
+                    "// Kernel: foo",
+                    "0x00000040: add (1|M0) r2:d r3:d r4:d",
+                    "// Kernel: foobar",
+                    "0x00000040: send.ugm (1|M0) null r6 r62:1 0x0 0x04000584 // wr:2+1, rd:0",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        result = run_resolver(
+            "--dwarf-line-dump",
+            str(dwarf),
+            "--asm",
+            str(asm),
+            "--source-computing-task",
+            "foo",
+        )
+        assert result.returncode == 0, result.stdout
+        rows = list(csv.DictReader(io.StringIO(result.stdout)))
+        assert len(rows) == 1
+        assert rows[0]["Source Line"] == "/tmp/src/foo.cpp:100"
+        assert "foobar.cpp" not in result.stdout
+
+
 def test_resolver_writes_empty_csv_and_no_match_summary_for_missing_task() -> None:
     with tempfile.TemporaryDirectory() as tmp_raw:
         tmp = pathlib.Path(tmp_raw)
@@ -295,10 +358,10 @@ def test_resolver_writes_empty_csv_and_no_match_summary_for_missing_task() -> No
             "--source-computing-task",
             "missing_kernel",
         )
-        assert result.returncode == 0, result.stdout
-        rows = list(csv.DictReader(io.StringIO(result.stdout)))
-        assert rows == []
-        assert "Source Line,Source File" in result.stdout
+        assert result.returncode == 2, result.stdout
+        assert result.stdout.startswith("Source Line,Source File")
+        assert "no mapped ASM source rows" in result.stdout
+        assert "no_asm_source_matches" in result.stdout
         summary_text = summary.read_text(encoding="utf-8")
         assert "asm_source.status no_asm_source_matches" in summary_text
         assert "asm_source.blocker no_asm_source_matches" in summary_text
@@ -324,10 +387,10 @@ def test_resolver_writes_empty_csv_and_no_match_summary() -> None:
             "--source-computing-task",
             "mxfp4_pair_glu_xmx_tiled",
         )
-        assert result.returncode == 0, result.stdout
-        rows = list(csv.DictReader(io.StringIO(result.stdout)))
-        assert rows == []
-        assert "Source Line,Source File" in result.stdout
+        assert result.returncode == 2, result.stdout
+        assert result.stdout.startswith("Source Line,Source File")
+        assert "no mapped ASM source rows" in result.stdout
+        assert "no_asm_source_matches" in result.stdout
         summary_text = summary.read_text(encoding="utf-8")
         assert "asm_source.status no_asm_source_matches" in summary_text
         assert "asm_source.blocker no_asm_source_matches" in summary_text

@@ -114,7 +114,7 @@ def task_matches(name: str | None, required_task: str) -> bool:
         return False
     name_text = normalize_task_text(name)
     required_text = normalize_task_text(required_task)
-    return required_text in name_text or name_text in required_text
+    return name_text == required_text
 
 
 def kernel_marker_name(raw: str, patterns: tuple[re.Pattern[str], ...]) -> str | None:
@@ -205,9 +205,7 @@ def source_row_for_instruction(source_rows: list[Any], addresses: list[int], ins
         if instruction_address < addresses[index + 1]:
             return source_rows[index]
         return None
-    if instruction_address == addresses[index]:
-        return source_rows[index]
-    return None
+    return source_rows[index]
 
 
 def aggregate_rows(source_rows: list[Any], instructions: list[Any], require_source_path: str) -> tuple[list[LineAggregate], int, int]:
@@ -299,6 +297,7 @@ def write_csv(rows: list[LineAggregate], output_path: pathlib.Path | None, sourc
         writer.writeheader()
         for row in rows:
             writer.writerow(row_to_csv(row, source_computing_task))
+        handle.flush()
 
 
 def write_summary(rows: list[LineAggregate], summary_output: pathlib.Path | None, mapped: int, unmapped: int) -> None:
@@ -328,9 +327,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Resolve addressed ZEBin EU assembly instructions to DWARF debug-line source rows. "
-            "Instruction addresses are matched to closed known line-table ranges: each row covers "
-            "addresses from its address up to the next row address, and the final row only covers "
-            "an instruction at that exact address."
+            "Instruction addresses are matched to nearest-preceding line-table ranges: each row covers "
+            "addresses from its address up to the next row address, and the final row covers later "
+            "instructions until another row is present."
         )
     )
     parser.add_argument("--dwarf-line-dump", required=True, type=pathlib.Path)
@@ -347,6 +346,12 @@ def main(argv: list[str] | None = None) -> int:
         rows, mapped, unmapped = aggregate_rows(source_rows, instructions, args.require_source_path)
         write_csv(rows, args.output, args.source_computing_task)
         write_summary(rows, args.summary_output, mapped, unmapped)
+        if mapped == 0:
+            print(
+                f"failed to resolve ZEBin ASM source lines: no mapped ASM source rows ({NO_MATCH_BLOCKER})",
+                file=sys.stderr,
+            )
+            return 2
     except (OSError, UnicodeDecodeError, ResolveError) as exc:
         print(f"failed to resolve ZEBin ASM source lines: {exc}")
         return 2
