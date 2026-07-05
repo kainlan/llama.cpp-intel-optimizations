@@ -109,14 +109,15 @@ def main(argv: list[str]) -> int:
         source_status = source_rows.get("source_line.status", "")
         if not source_status:
             raise SourceAttributionError("missing source_line.status")
-        if source_status not in {"pass", "fail", "dwarf-line-table-only"}:
+        if source_status not in {"pass", "fail", "asm-line-static-cost", "dwarf-line-table-only"}:
             raise SourceAttributionError(f"invalid source_line.status {source_status}")
         source_line_kernel = source_rows.get("source_line.required_kernel", "")
         source_line_matches_top_kernel = source_line_kernel_matches(source_line_kernel, top_kernel)
         exact_pass = source_status == "pass" and source_line_matches_top_kernel
+        asm_line_static_cost = source_status == "asm-line-static-cost" and source_line_matches_top_kernel
         dwarf_line_table_only = source_status == "dwarf-line-table-only" and source_line_matches_top_kernel
         exact_blocker = source_rows.get("source_line.blocker", "unknown")
-        if source_status in {"pass", "dwarf-line-table-only"} and not source_line_matches_top_kernel:
+        if source_status in {"pass", "asm-line-static-cost", "dwarf-line-table-only"} and not source_line_matches_top_kernel:
             exact_blocker = f"source_line_kernel_mismatch:{source_line_kernel}"
 
         regions = load_region_map(args.region_map)
@@ -126,6 +127,8 @@ def main(argv: list[str]) -> int:
         delta = load_ablation_delta(args.ablation_json, top_kernel)
         if exact_pass:
             status = "exact_source_line"
+        elif asm_line_static_cost:
+            status = "asm_line_static_cost"
         elif dwarf_line_table_only:
             status = "dwarf_line_table_only"
         else:
@@ -137,6 +140,14 @@ def main(argv: list[str]) -> int:
         print(f"source_attribution.kernel {top_kernel}")
         if source_line_kernel:
             print(f"source_attribution.source_line_kernel {source_line_kernel}")
+        if asm_line_static_cost:
+            print("source_attribution.source_line_status asm-line-static-cost")
+            asm_top_source_line = source_rows.get("source_line.asm_top_source_line", "")
+            asm_top_static_score = source_rows.get("source_line.asm_top_static_score", "")
+            if asm_top_source_line:
+                print(f"source_attribution.asm_top_source_line {asm_top_source_line}")
+            if asm_top_static_score:
+                print(f"source_attribution.asm_top_static_score {asm_top_static_score}")
         if dwarf_line_table_only:
             print("source_attribution.source_line_status dwarf-line-table-only")
         if region is not None:
@@ -144,7 +155,7 @@ def main(argv: list[str]) -> int:
             print(f"source_attribution.line_start {region['line_start']}")
             print(f"source_attribution.line_end {region['line_end']}")
             print(f"source_attribution.label_line {region['label_line']}")
-        if not exact_pass and not dwarf_line_table_only:
+        if not exact_pass and not asm_line_static_cost and not dwarf_line_table_only:
             print(f"source_attribution.exact_line_blocker {exact_blocker}")
         if delta is not None:
             print(f"source_attribution.ablation_delta_ms_x1000 {delta}")
