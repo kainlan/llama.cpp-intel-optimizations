@@ -54,6 +54,10 @@ vtune_dir="${OUT_ROOT}/vtune-source-line"
 print_plan() {
     printf 'DRY RUN: would execute lead-only SYCL VTune source-line microbench feasibility.\n'
     printf '# output root: %s\n' "${OUT_ROOT}"
+    if [[ -n "${REQUIRE_MATRIX_PASS}" ]]; then
+        printf 'matrix gate: require %q to contain source_line.status pass\n' "${REQUIRE_MATRIX_PASS}"
+        printf 'grep -qx %q %q\n' "source_line.status pass" "${REQUIRE_MATRIX_PASS}"
+    fi
     printf '%q ' "${configure_cmd[@]}"; printf '> %q 2>&1\n' "${OUT_ROOT}/profiling-debug-build.log"
     printf '%q ' "${build_cmd[@]}"; printf '>> %q 2>&1\n' "${OUT_ROOT}/profiling-debug-build.log"
     printf 'env ONEAPI_DEVICE_SELECTOR=%q vtune -collect gpu-hotspots' "${DEVICE_SELECTOR}"
@@ -64,10 +68,6 @@ print_plan() {
     printf '%q ' "${bench_cmd[@]}"; printf '> %q 2> %q\n' "${OUT_ROOT}/bench.stdout" "${OUT_ROOT}/bench.stderr"
     printf 'readelf -S %q > %q\n' "${vtune_dir}/data.0/<first-zebin>" "${OUT_ROOT}/zebin-debug-sections.txt"
     printf 'vtune -report hotspots -r %q -group-by gpu-source-line -format csv > %q\n' "${vtune_dir}" "${OUT_ROOT}/vtune-gpu-source-line.csv"
-    if [[ -n "${REQUIRE_MATRIX_PASS}" ]]; then
-        printf 'matrix gate: require %q to contain source_line.status pass\n' "${REQUIRE_MATRIX_PASS}"
-        printf 'grep -qx %q %q\n' "source_line.status pass" "${REQUIRE_MATRIX_PASS}"
-    fi
     printf 'python3 scripts/check-sycl-vtune-source-lines.py --readelf-sections %q --vtune-csv %q --require-kernel %q > %q\n' "${OUT_ROOT}/zebin-debug-sections.txt" "${OUT_ROOT}/vtune-gpu-source-line.csv" "${TARGET_KERNEL}" "${OUT_ROOT}/source-line-feasibility.parse"
 }
 
@@ -102,7 +102,11 @@ vtune_collect_cmd+=(
     -- "${bench_cmd[@]}"
 )
 "${vtune_collect_cmd[@]}" >"${OUT_ROOT}/bench.stdout" 2>"${OUT_ROOT}/bench.stderr"
-first_zebin="$(find "${vtune_dir}" -path '*/data.0/*.zebin' -type f | head -n 1)"
+first_zebin="$(find "${vtune_dir}" -path '*/data.0/*.zebin' -type f -print -quit)"
+if [[ -z "${first_zebin}" ]]; then
+    printf 'error: no .zebin found in %s\n' "${vtune_dir}" >&2
+    exit 1
+fi
 readelf -S "${first_zebin}" >"${OUT_ROOT}/zebin-debug-sections.txt"
 vtune -report hotspots -r "${vtune_dir}" -group-by gpu-source-line -format csv >"${OUT_ROOT}/vtune-gpu-source-line.csv"
 python3 scripts/check-sycl-vtune-source-lines.py \

@@ -83,6 +83,9 @@ def test_source_line_feasibility_script_supports_matrix_pass_gate() -> None:
         assert "matrix gate" in result.stdout
         assert "grep -qx" in result.stdout
         assert "source_line.status pass" in result.stdout
+        matrix_index = result.stdout.index("matrix gate")
+        assert matrix_index < result.stdout.index("cmake -S")
+        assert matrix_index < result.stdout.index("profiling-debug-build.log")
         assert "/Storage" not in result.stdout
         assert "llama-bench" not in result.stdout
 
@@ -100,6 +103,13 @@ def test_source_line_feasibility_script_propagates_target_kernel_to_checker() ->
     assert "--kernel=custom_kernel" in result.stdout
     assert "computing-tasks-of-interest=\\*custom_kernel\\*#1#1#20" in result.stdout
     assert "--require-kernel custom_kernel" in result.stdout
+
+
+def test_source_line_feasibility_execute_branch_uses_pipe_free_zebin_probe() -> None:
+    text = script_text()
+    assert "-print -quit" in text
+    assert "| head -n 1" not in text
+    assert "error: no .zebin found" in text
 
 
 def test_source_line_feasibility_execute_branch_writes_expected_artifacts() -> None:
