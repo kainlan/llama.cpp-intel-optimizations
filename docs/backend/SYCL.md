@@ -1326,6 +1326,8 @@ The SYCL source-line tooling keeps sampled VTune timing separate from non-VTUNE 
 
 When VTune/GTPin cannot provide gpu-source-line rows, prefer `asm-line-static-cost` for line-ranked optimization and keep `pass` reserved for sampled VTune rows.
 
+`asm-line-static-cost` should be produced from IGA PC rows when available. The runner extracts or selects one kernel `.text.*` section, runs Intel IGA with `-Xprint-json -Xprint-pc`, parses the resulting instruction PCs, applies the section base address, and joins those PCs to ZEBin DWARF line-table ranges. This is an exact static source-line cost from kernel-matched IGA PC rows, not sampled VTune exact timing. Label-only `ocloc` assembly such as `L0:` is not address evidence and must remain a blocker or fallback path rather than being reported as static line cost.
+
 ### Full layered SYCL profiling closure
 
 `scripts/sycl-gptoss-full-attribution-profile.sh` is the lead-owned runner for closing GPT-OSS MXFP4 SYCL decode attribution across application spans, SYCL event profiling, Level Zero, Unified Runtime, VTune, and source-attribution fallback evidence. It is dry-run by default and prints the artifact root plus every real model/profiler command before anything is executed.

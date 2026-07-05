@@ -73,3 +73,12 @@ def test_sycl_docs_describe_asm_line_static_cost_status() -> None:
         "dwarf-line-table-only",
     ):
         assert phrase in section
+
+
+def test_sycl_docs_describe_iga_pc_static_source_line_path() -> None:
+    section = source_line_section()
+    assert "IGA PC" in section
+    assert "-Xprint-json" in section
+    assert "-Xprint-pc" in section
+    assert "asm-line-static-cost" in section
+    assert "not sampled VTune exact" in section
