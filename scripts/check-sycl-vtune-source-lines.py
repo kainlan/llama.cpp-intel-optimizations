@@ -47,9 +47,9 @@ def row_matches_kernel(row: dict[str, str], required: str | None) -> bool:
     return required in joined
 
 
-def row_has_known_source(row: dict[str, str]) -> bool:
-    candidates = [row.get("Source Line", ""), row.get("Source File", ""), row.get("Source File Path", "")]
-    return any(candidate not in UNKNOWN_VALUES for candidate in candidates)
+def row_has_known_source_line(row: dict[str, str]) -> bool:
+    source_line = row.get("Source Line", "").strip()
+    return source_line not in UNKNOWN_VALUES
 
 
 def row_attribution_mode(row: dict[str, str]) -> str:
@@ -74,7 +74,7 @@ def count_vtune_sampled_known_rows(rows: list[dict[str, str]], required_kernel: 
     return sum(
         1
         for row in rows
-        if row_matches_kernel(row, required_kernel) and row_has_known_source(row) and not row_is_dwarf_line_table(row)
+        if row_matches_kernel(row, required_kernel) and row_has_known_source_line(row) and not row_is_dwarf_line_table(row)
     )
 
 
@@ -82,7 +82,7 @@ def count_dwarf_line_table_known_rows(rows: list[dict[str, str]], required_kerne
     return sum(
         1
         for row in rows
-        if row_matches_kernel(row, required_kernel) and row_has_known_source(row) and row_is_dwarf_line_table(row)
+        if row_matches_kernel(row, required_kernel) and row_has_known_source_line(row) and row_is_dwarf_line_table(row)
     )
 
 
@@ -152,7 +152,7 @@ def main(argv: list[str]) -> int:
             )
             dwarf_status = str(parsed["status"])
             dwarf_source_rows = int(parsed["source_rows"])
-            dwarf_required_path_present = bool(parsed["required_path_present"])
+            dwarf_required_path_present = True if args.require_source_path is None else bool(parsed["required_path_present"])
 
         dwarf_source_line_rows = 0
         if args.dwarf_source_lines_csv is not None:

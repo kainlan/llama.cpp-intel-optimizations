@@ -71,6 +71,12 @@ def validate_region(kernel: str, raw: Any) -> dict[str, Any]:
     return region
 
 
+def source_line_kernel_matches(source_line_kernel: str, top_kernel: str) -> bool:
+    if not source_line_kernel:
+        return True
+    return source_line_kernel == top_kernel or source_line_kernel in top_kernel or top_kernel in source_line_kernel
+
+
 def load_ablation_delta(path: pathlib.Path | None, kernel: str) -> int | None:
     if path is None:
         return None
@@ -105,9 +111,13 @@ def main(argv: list[str]) -> int:
             raise SourceAttributionError("missing source_line.status")
         if source_status not in {"pass", "fail", "dwarf-line-table-only"}:
             raise SourceAttributionError(f"invalid source_line.status {source_status}")
-        exact_pass = source_status == "pass"
-        dwarf_line_table_only = source_status == "dwarf-line-table-only"
+        source_line_kernel = source_rows.get("source_line.required_kernel", "")
+        source_line_matches_top_kernel = source_line_kernel_matches(source_line_kernel, top_kernel)
+        exact_pass = source_status == "pass" and source_line_matches_top_kernel
+        dwarf_line_table_only = source_status == "dwarf-line-table-only" and source_line_matches_top_kernel
         exact_blocker = source_rows.get("source_line.blocker", "unknown")
+        if source_status in {"pass", "dwarf-line-table-only"} and not source_line_matches_top_kernel:
+            exact_blocker = f"source_line_kernel_mismatch:{source_line_kernel}"
 
         regions = load_region_map(args.region_map)
         raw_region = regions.get(top_kernel)
@@ -125,6 +135,8 @@ def main(argv: list[str]) -> int:
 
         print(f"source_attribution.status {status}")
         print(f"source_attribution.kernel {top_kernel}")
+        if source_line_kernel:
+            print(f"source_attribution.source_line_kernel {source_line_kernel}")
         if dwarf_line_table_only:
             print("source_attribution.source_line_status dwarf-line-table-only")
         if region is not None:

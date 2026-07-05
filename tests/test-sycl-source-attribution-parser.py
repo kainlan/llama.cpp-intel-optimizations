@@ -117,6 +117,30 @@ def test_source_attribution_keeps_exact_source_line_status_when_exact_lines_pass
         assert "source_attribution.exact_line_blocker" not in result.stdout
 
 
+def test_source_attribution_does_not_claim_exact_when_source_line_kernel_mismatches_top_kernel() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        p = write_common(pathlib.Path(tmp_raw))
+        p["source"].write_text(
+            "source_line.required_kernel sycl_source_line_probe\nsource_line.blocker none\nsource_line.status pass\n",
+            encoding="utf-8",
+        )
+        result = run_parser(
+            "--cost-ranking",
+            str(p["cost"]),
+            "--source-line",
+            str(p["source"]),
+            "--region-map",
+            str(p["region"]),
+            "--ablation-json",
+            str(p["ablation"]),
+        )
+        assert result.returncode == 0, result.stdout
+        assert "source_attribution.status source_region_plus_ablation" in result.stdout
+        assert "source_attribution.source_line_kernel sycl_source_line_probe" in result.stdout
+        assert "source_attribution.exact_line_blocker source_line_kernel_mismatch:sycl_source_line_probe" in result.stdout
+        assert "source_attribution.status exact_source_line" not in result.stdout
+
+
 def test_source_attribution_accepts_dwarf_line_table_only_as_distinct_status() -> None:
     with tempfile.TemporaryDirectory() as tmp_raw:
         p = write_common(pathlib.Path(tmp_raw))
@@ -135,6 +159,28 @@ def test_source_attribution_accepts_dwarf_line_table_only_as_distinct_status() -
         assert "source_attribution.file ggml/src/ggml-sycl/mmvq.cpp" in result.stdout
         assert "source_attribution.status exact_source_line" not in result.stdout
         assert "source_attribution.exact_line_blocker" not in result.stdout
+
+
+def test_source_attribution_does_not_claim_dwarf_line_table_when_source_line_kernel_mismatches_top_kernel() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        p = write_common(pathlib.Path(tmp_raw))
+        p["source"].write_text(
+            "source_line.required_kernel sycl_source_line_probe\nsource_line.blocker none\nsource_line.status dwarf-line-table-only\n",
+            encoding="utf-8",
+        )
+        result = run_parser(
+            "--cost-ranking",
+            str(p["cost"]),
+            "--source-line",
+            str(p["source"]),
+            "--region-map",
+            str(p["region"]),
+        )
+        assert result.returncode == 0, result.stdout
+        assert "source_attribution.status source_region" in result.stdout
+        assert "source_attribution.source_line_kernel sycl_source_line_probe" in result.stdout
+        assert "source_attribution.exact_line_blocker source_line_kernel_mismatch:sycl_source_line_probe" in result.stdout
+        assert "source_attribution.status dwarf_line_table_only" not in result.stdout
 
 
 def test_source_attribution_reports_missing_region_without_traceback() -> None:
