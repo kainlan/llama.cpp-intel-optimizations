@@ -80,6 +80,24 @@ def test_vtune_source_dry_run_reports_matrix_artifact_contract(tmp_path: Path) -
     assert not out_root.exists()
 
 
+def test_vtune_source_dry_run_quotes_asm_paths_with_spaces(tmp_path: Path) -> None:
+    out_root = tmp_path / "source line staged"
+    result = run_script("--stage", "vtune-source", "--out-root", str(out_root), out_root=tmp_path / "ignored")
+    assert result.returncode == 0, result.stdout
+
+    asm_lines = [line for line in result.stdout.splitlines() if "matrix ASM" in line or "matrix disasm" in line]
+    assert asm_lines
+    raw_root_prefix = f"{out_root}/"
+    raw_asm_dir = f"{out_root}/vtune-source/source-line-matrix/build-matrix/debug_full/zebin-disasm"
+    escaped_asm_dir = raw_asm_dir.replace(" ", "\\ ")
+    for line in asm_lines:
+        assert raw_root_prefix not in line
+    assert any(f"mkdir -p {escaped_asm_dir}" in line for line in asm_lines)
+    assert any(f'first_asm="$(find {escaped_asm_dir} -type f -name' in line for line in asm_lines)
+    assert any('--asm "${first_asm}"' in line for line in asm_lines)
+    assert not out_root.exists()
+
+
 def test_vtune_source_execute_branch_consumes_matrix_artifacts() -> None:
     text = SCRIPT.read_text(encoding="utf-8")
     for required in (
