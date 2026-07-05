@@ -79,7 +79,7 @@ print_plan() {
     printf 'llvm-dwarfdump --debug-line %q > %q\n' "${vtune_dir}/data.0/<first-zebin>" "${OUT_ROOT}/zebin-debug-line.txt"
     printf 'python3 scripts/convert-sycl-zebin-line-table-to-source-csv.py --input %q --output %q --source-computing-task %q\n' "${OUT_ROOT}/zebin-debug-line.txt" "${OUT_ROOT}/dwarf-source-lines.csv" "${TARGET_KERNEL}"
     printf 'vtune -report hotspots -r %q -group-by gpu-source-line -format csv > %q\n' "${vtune_dir}" "${OUT_ROOT}/vtune-gpu-source-line.csv"
-    printf 'python3 scripts/check-sycl-vtune-source-lines.py --readelf-sections %q --vtune-csv %q --require-kernel %q --dwarf-line-dump %q --dwarf-source-lines-csv %q --allow-dwarf-line-table-only --require-source-path %q --vtune-stdout %q --vtune-stderr %q > %q\n' "${OUT_ROOT}/zebin-debug-sections.txt" "${OUT_ROOT}/vtune-gpu-source-line.csv" "${TARGET_KERNEL}" "${OUT_ROOT}/zebin-debug-line.txt" "${OUT_ROOT}/dwarf-source-lines.csv" "ggml/src/ggml-sycl/mmvq.cpp" "${OUT_ROOT}/bench.stdout" "${OUT_ROOT}/bench.stderr" "${OUT_ROOT}/source-line-feasibility.parse"
+    printf 'python3 scripts/check-sycl-vtune-source-lines.py --readelf-sections %q --vtune-csv %q --require-kernel %q --dwarf-line-dump %q --dwarf-source-lines-csv %q --allow-dwarf-line-table-only --require-source-path %q --vtune-stdout %q --vtune-stderr %q > %q\n' "${OUT_ROOT}/zebin-debug-sections.txt" "${OUT_ROOT}/vtune-gpu-source-line.csv" "${TARGET_KERNEL}" "${OUT_ROOT}/zebin-debug-line.txt" "${OUT_ROOT}/dwarf-source-lines.csv" "mmvq.cpp" "${OUT_ROOT}/bench.stdout" "${OUT_ROOT}/bench.stderr" "${OUT_ROOT}/source-line-feasibility.parse"
 }
 
 if [[ "${EXECUTE}" -ne 1 ]]; then
@@ -147,7 +147,7 @@ python3 scripts/check-sycl-vtune-source-lines.py \
     --dwarf-line-dump "${OUT_ROOT}/zebin-debug-line.txt" \
     --dwarf-source-lines-csv "${OUT_ROOT}/dwarf-source-lines.csv" \
     --allow-dwarf-line-table-only \
-    --require-source-path "ggml/src/ggml-sycl/mmvq.cpp" \
+    --require-source-path "mmvq.cpp" \
     --vtune-stdout "${OUT_ROOT}/bench.stdout" \
     --vtune-stderr "${OUT_ROOT}/bench.stderr" >"${OUT_ROOT}/source-line-feasibility.parse"
 printf 'Artifacts: %s\n' "${OUT_ROOT}"

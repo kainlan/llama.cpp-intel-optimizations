@@ -179,7 +179,8 @@ def test_source_line_feasibility_execute_branch_writes_expected_artifacts() -> N
     assert "--dwarf-line-dump" in text
     assert "--vtune-stdout" in text
     assert "--vtune-stderr" in text
-    assert "--require-source-path \"ggml/src/ggml-sycl/mmvq.cpp\"" in text
+    assert "--require-source-path \"mmvq.cpp\"" in text
+    assert "--require-source-path \"ggml/src/ggml-sycl/mmvq.cpp\"" not in text
     assert "REQUIRE_MATRIX_PASS" in text
     assert "! grep -Eq \"^source_line.status (pass|dwarf-line-table-only)$\" \"${REQUIRE_MATRIX_PASS}\"" in text
     assert "MXFP4 source-line matrix gate failed" in text
