@@ -8,11 +8,12 @@ BUILD_DIR="build-vtune-line"
 DEVICE_SELECTOR="level_zero:1"
 VTUNE_TARGET_GPU=""
 TARGET_KERNEL="mxfp4_pair_glu_xmx_tiled_packed_r8_m2_sparse32_bias"
-TASK_GLOB="*mxfp4_pair_glu_xmx_tiled*"
+TASK_GLOB=""
+TASK_MATCH="mxfp4_pair_glu_xmx_tiled"
 REQUIRE_MATRIX_PASS=""
 
 usage() {
-    printf 'usage: %s [--dry-run|--execute] [--i-understand-this-runs-gpu-microbenchmarks] [--out-root DIR] [--build-dir DIR] [--device-selector SELECTOR] [--vtune-target-gpu VALUE] [--target-kernel NAME] [--require-matrix-pass PATH]\n' "$0"
+    printf 'usage: %s [--dry-run|--execute] [--i-understand-this-runs-gpu-microbenchmarks] [--out-root DIR] [--build-dir DIR] [--device-selector SELECTOR] [--vtune-target-gpu VALUE] [--target-kernel NAME] [--task-glob GLOB] [--task-match TEXT] [--require-matrix-pass PATH]\n' "$0"
 }
 
 require_value() {
@@ -33,7 +34,9 @@ while [[ $# -gt 0 ]]; do
         --build-dir) require_value "$1" "${2-}"; BUILD_DIR="$2"; shift ;;
         --device-selector) require_value "$1" "${2-}"; DEVICE_SELECTOR="$2"; shift ;;
         --vtune-target-gpu) require_value "$1" "${2-}"; VTUNE_TARGET_GPU="$2"; shift ;;
-        --target-kernel) require_value "$1" "${2-}"; TARGET_KERNEL="$2"; TASK_GLOB="*$2*"; shift ;;
+        --target-kernel) require_value "$1" "${2-}"; TARGET_KERNEL="$2"; TASK_MATCH="$2"; shift ;;
+        --task-glob) require_value "$1" "${2-}"; TASK_GLOB="$2"; shift ;;
+        --task-match) require_value "$1" "${2-}"; TASK_MATCH="$2"; shift ;;
         --require-matrix-pass) require_value "$1" "${2-}"; REQUIRE_MATRIX_PASS="$2"; shift ;;
         --help|-h) usage; exit 0 ;;
         *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
@@ -64,11 +67,18 @@ print_plan() {
     if [[ -n "${VTUNE_TARGET_GPU}" ]]; then
         printf ' -knob %q' "target-gpu=${VTUNE_TARGET_GPU}"
     fi
-    printf ' -knob gpu-profiling-mode=source-analysis -knob source-analysis=mem-latency -knob dump-compute-task-binaries=true -knob computing-tasks-of-interest=%q -result-dir %q -- ' "${TASK_GLOB}#1#1#20" "${vtune_dir}"
+    printf ' -knob gpu-profiling-mode=source-analysis -knob source-analysis=mem-latency -knob dump-compute-task-binaries=true'
+    if [[ -n "${TASK_GLOB}" ]]; then
+        printf ' -knob computing-tasks-of-interest=%q' "${TASK_GLOB}#1#1#20"
+    fi
+    printf ' -result-dir %q -- ' "${vtune_dir}"
     printf '%q ' "${bench_cmd[@]}"; printf '> %q 2> %q\n' "${OUT_ROOT}/bench.stdout" "${OUT_ROOT}/bench.stderr"
+    printf 'vtune -report hotspots -r %q -group-by computing-task -format csv > %q\n' "${vtune_dir}" "${OUT_ROOT}/vtune-computing-tasks.csv"
+    printf 'python3 scripts/parse-sycl-vtune-tasks.py %q --match %q > %q || printf %q %q >&2\n' "${OUT_ROOT}/vtune-computing-tasks.csv" "${TASK_MATCH}" "${OUT_ROOT}/vtune-task.parse" "warning: failed to parse VTune computing tasks for match %s\\n" "${TASK_MATCH}"
     printf 'readelf -S %q > %q\n' "${vtune_dir}/data.0/<first-zebin>" "${OUT_ROOT}/zebin-debug-sections.txt"
+    printf 'llvm-dwarfdump --debug-line %q > %q\n' "${vtune_dir}/data.0/<first-zebin>" "${OUT_ROOT}/zebin-debug-line.txt"
     printf 'vtune -report hotspots -r %q -group-by gpu-source-line -format csv > %q\n' "${vtune_dir}" "${OUT_ROOT}/vtune-gpu-source-line.csv"
-    printf 'python3 scripts/check-sycl-vtune-source-lines.py --readelf-sections %q --vtune-csv %q --require-kernel %q > %q\n' "${OUT_ROOT}/zebin-debug-sections.txt" "${OUT_ROOT}/vtune-gpu-source-line.csv" "${TARGET_KERNEL}" "${OUT_ROOT}/source-line-feasibility.parse"
+    printf 'python3 scripts/check-sycl-vtune-source-lines.py --readelf-sections %q --vtune-csv %q --require-kernel %q --dwarf-line-dump %q --require-source-path %q > %q\n' "${OUT_ROOT}/zebin-debug-sections.txt" "${OUT_ROOT}/vtune-gpu-source-line.csv" "${TARGET_KERNEL}" "${OUT_ROOT}/zebin-debug-line.txt" "ggml/src/ggml-sycl/mmvq.cpp" "${OUT_ROOT}/source-line-feasibility.parse"
 }
 
 if [[ "${EXECUTE}" -ne 1 ]]; then
@@ -97,20 +107,31 @@ vtune_collect_cmd+=(
     -knob gpu-profiling-mode=source-analysis
     -knob source-analysis=mem-latency
     -knob dump-compute-task-binaries=true
-    -knob "computing-tasks-of-interest=${TASK_GLOB}#1#1#20"
+)
+if [[ -n "${TASK_GLOB}" ]]; then
+    vtune_collect_cmd+=(-knob "computing-tasks-of-interest=${TASK_GLOB}#1#1#20")
+fi
+vtune_collect_cmd+=(
     -result-dir "${vtune_dir}"
     -- "${bench_cmd[@]}"
 )
 "${vtune_collect_cmd[@]}" >"${OUT_ROOT}/bench.stdout" 2>"${OUT_ROOT}/bench.stderr"
+vtune -report hotspots -r "${vtune_dir}" -group-by computing-task -format csv >"${OUT_ROOT}/vtune-computing-tasks.csv"
+if ! python3 scripts/parse-sycl-vtune-tasks.py "${OUT_ROOT}/vtune-computing-tasks.csv" --match "${TASK_MATCH}" >"${OUT_ROOT}/vtune-task.parse"; then
+    printf 'warning: failed to parse VTune computing tasks for match %s\n' "${TASK_MATCH}" >&2
+fi
 first_zebin="$(find "${vtune_dir}" -path '*/data.0/*.zebin' -type f -print -quit)"
 if [[ -z "${first_zebin}" ]]; then
     printf 'error: no .zebin found in %s\n' "${vtune_dir}" >&2
     exit 1
 fi
 readelf -S "${first_zebin}" >"${OUT_ROOT}/zebin-debug-sections.txt"
+llvm-dwarfdump --debug-line "${first_zebin}" >"${OUT_ROOT}/zebin-debug-line.txt"
 vtune -report hotspots -r "${vtune_dir}" -group-by gpu-source-line -format csv >"${OUT_ROOT}/vtune-gpu-source-line.csv"
 python3 scripts/check-sycl-vtune-source-lines.py \
     --readelf-sections "${OUT_ROOT}/zebin-debug-sections.txt" \
     --vtune-csv "${OUT_ROOT}/vtune-gpu-source-line.csv" \
-    --require-kernel "${TARGET_KERNEL}" >"${OUT_ROOT}/source-line-feasibility.parse"
+    --require-kernel "${TARGET_KERNEL}" \
+    --dwarf-line-dump "${OUT_ROOT}/zebin-debug-line.txt" \
+    --require-source-path "ggml/src/ggml-sycl/mmvq.cpp" >"${OUT_ROOT}/source-line-feasibility.parse"
 printf 'Artifacts: %s\n' "${OUT_ROOT}"

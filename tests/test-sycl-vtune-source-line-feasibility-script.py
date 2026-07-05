@@ -22,6 +22,12 @@ def test_source_line_feasibility_script_is_dry_run_by_default() -> None:
     assert "gpu-profiling-mode=source-analysis" in result.stdout
     assert "source-analysis=mem-latency" in result.stdout
     assert "dump-compute-task-binaries=true" in result.stdout
+    assert "computing-tasks-of-interest" not in result.stdout
+    assert "vtune-computing-tasks.csv" in result.stdout
+    assert "parse-sycl-vtune-tasks.py" in result.stdout
+    assert "zebin-debug-line.txt" in result.stdout
+    assert "--dwarf-line-dump" in result.stdout
+    assert "--require-source-path" in result.stdout
     assert "check-sycl-vtune-source-lines.py" in result.stdout
     assert "/Storage" not in result.stdout
     assert "llama-bench" not in result.stdout
@@ -42,6 +48,20 @@ def test_mxfp4_feasibility_vtune_target_gpu_is_explicit_opt_in() -> None:
     default = subprocess.run(["bash", str(SCRIPT)], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
     assert default.returncode == 0, default.stdout
     assert "target-gpu=" not in default.stdout
+
+
+def test_source_line_feasibility_script_supports_opt_in_task_filter() -> None:
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--task-glob", "*mxfp4_pair_glu_xmx_tiled*"],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout
+    assert "computing-tasks-of-interest" in result.stdout
+    assert r"\*mxfp4_pair_glu_xmx_tiled\*#1#1#20" in result.stdout
 
 
 def test_source_line_feasibility_script_handles_absolute_build_dir_in_dry_run(tmp_path: Path) -> None:
@@ -101,7 +121,9 @@ def test_source_line_feasibility_script_propagates_target_kernel_to_checker() ->
     )
     assert result.returncode == 0, result.stdout
     assert "--kernel=custom_kernel" in result.stdout
-    assert "computing-tasks-of-interest=\\*custom_kernel\\*#1#1#20" in result.stdout
+    assert "computing-tasks-of-interest" not in result.stdout
+    assert "parse-sycl-vtune-tasks.py" in result.stdout
+    assert "--match custom_kernel" in result.stdout
     assert "--require-kernel custom_kernel" in result.stdout
 
 
@@ -116,12 +138,19 @@ def test_source_line_feasibility_execute_branch_writes_expected_artifacts() -> N
     text = script_text()
     assert "profiling-debug-build.log" in text
     assert "vtune-gpu-source-line.csv" in text
+    assert "vtune-computing-tasks.csv" in text
     assert "zebin-debug-sections.txt" in text
+    assert "zebin-debug-line.txt" in text
     assert "source-line-feasibility.parse" in text
+    assert "vtune-task.parse" in text
     assert "vtune -collect gpu-hotspots" in text
     assert "vtune -report hotspots" in text
     assert "readelf -S" in text
+    assert "llvm-dwarfdump --debug-line" in text
+    assert "scripts/parse-sycl-vtune-tasks.py" in text
     assert "scripts/check-sycl-vtune-source-lines.py" in text
+    assert "--dwarf-line-dump" in text
+    assert "--require-source-path \"ggml/src/ggml-sycl/mmvq.cpp\"" in text
     assert "REQUIRE_MATRIX_PASS" in text
     assert "! grep -qx \"source_line.status pass\" \"${REQUIRE_MATRIX_PASS}\"" in text
     assert "MXFP4 source-line matrix gate failed" in text
