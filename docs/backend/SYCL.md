@@ -1316,6 +1316,15 @@ bash scripts/sycl-vtune-source-line-feasibility.sh \
 
 Lead-owned MXFP4 execution changes `--dry-run` to `--execute` and must add `--i-understand-this-runs-gpu-microbenchmarks`. Workers must not run GPU/model/profiler commands, VTune collection, `sycl-source-line-probe`, `sycl-kernel-bench`, MXFP4 feasibility execution, or any `--execute` runner; workers may update these docs and run doc-only tests.
 
+### Non-VTUNE source-line row statuses
+
+The SYCL source-line tooling keeps sampled VTune timing separate from non-VTUNE static/coverage evidence. Source Attribution Mode `asm-line-static` is static assembly/source evidence, not sampled VTune exact timing.
+
+- `source_line.status pass` = VTune sampled GPU source-line rows; only status that may become `source_attribution.status exact_source_line`.
+- `source_line.status asm-line-static-cost` = ZEBin DWARF line-table rows joined with EU assembly instruction addresses and aggregated by source line; exact static source-line cost rows, but not sampled VTune exact timing.
+- `source_line.status dwarf-line-table-only` = decoded line-table coverage without instruction-level or sampled cost rows.
+
+When VTune/GTPin cannot provide gpu-source-line rows, prefer `asm-line-static-cost` for line-ranked optimization and keep `pass` reserved for sampled VTune rows.
 
 ### Full layered SYCL profiling closure
 

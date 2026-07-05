@@ -59,3 +59,14 @@ def test_lead_only_acknowledgements_and_worker_ban_are_documented() -> None:
     execute_pos = section.index("Lead-only execute command")
     worker_ban_pos = section.index("Workers must not run")
     assert dry_run_pos < execute_pos < worker_ban_pos
+
+
+def test_sycl_docs_describe_asm_line_static_cost_status() -> None:
+    section = source_line_section()
+    for phrase in (
+        "asm-line-static-cost",
+        "asm-line-static",
+        "not sampled VTune exact",
+        "dwarf-line-table-only",
+    ):
+        assert phrase in section
