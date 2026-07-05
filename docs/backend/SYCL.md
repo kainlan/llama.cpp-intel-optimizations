@@ -1318,13 +1318,21 @@ Lead-owned MXFP4 execution changes `--dry-run` to `--execute` and must add `--i-
 
 ### Non-VTUNE source-line row statuses
 
-The SYCL source-line tooling keeps sampled VTune timing separate from non-VTUNE static/coverage evidence. Source Attribution Mode `asm-line-static` is static assembly/source evidence, not sampled VTune exact timing.
+The SYCL source-line tooling keeps VTune exact source rows, runtime sampled PC rows, static assembly rows, and DWARF coverage as separate evidence levels. Source Attribution Mode `asm-line-static` is static assembly/source evidence, not sampled VTune exact timing.
+
+| Evidence | Runtime sampled? | Source-line ranked? | Accepted status |
+|---|---:|---:|---|
+| VTune GPU source rows | yes | yes | `source_line.status pass` |
+| PC sample CSV mapped through DWARF | yes | yes | `source_line.status sampled-line-cost` |
+| IGA PC static instruction rows mapped through DWARF | no | yes | `source_line.status asm-line-static-cost` |
+| DWARF line-table coverage only | no | no cost ranking | `source_line.status dwarf-line-table-only` |
 
 - `source_line.status pass` = VTune sampled GPU source-line rows; only status that may become `source_attribution.status exact_source_line`.
+- `source_line.status sampled-line-cost` = real runtime PC sample rows from a `pc-samples.csv` producer mapped through DWARF; sampled and line-ranked, but still distinct from VTune exact source rows and does not become `exact_source_line`.
 - `source_line.status asm-line-static-cost` = ZEBin DWARF line-table rows joined with EU assembly instruction addresses and aggregated by source line; exact static source-line cost rows, but not sampled VTune exact timing.
 - `source_line.status dwarf-line-table-only` = decoded line-table coverage without instruction-level or sampled cost rows.
 
-When VTune/GTPin cannot provide gpu-source-line rows, prefer `asm-line-static-cost` for line-ranked optimization and keep `pass` reserved for sampled VTune rows.
+When VTune/GTPin cannot provide gpu-source-line rows, prefer `sampled-line-cost` if a real positive-count PC sample CSV exists; otherwise prefer `asm-line-static-cost` for line-ranked optimization and keep `pass` reserved for VTune exact source rows.
 
 `asm-line-static-cost` should be produced from IGA PC rows when available. The runner extracts or selects one kernel `.text.*` section, runs Intel IGA with `-Xprint-json -Xprint-pc`, parses the resulting instruction PCs, applies the section base address, and joins those PCs to ZEBin DWARF line-table ranges. This is an exact static source-line cost from kernel-matched IGA PC rows, not sampled VTune exact timing. Label-only `ocloc` assembly such as `L0:` is not address evidence and must remain a blocker or fallback path rather than being reported as static line cost.
 
@@ -1368,8 +1376,8 @@ The main closure evidence is `parsed/layer-ledger.parse` plus `parsed/source-lin
 | Status row | PASS / accepted value | Failure or blocked value | Meaning |
 |---|---|---|---|
 | `coverage.layer_status` | `ok` | `missing_layers`; treat any future `coverage_mismatch` or `unknown_wall_residual` row as incomplete until the numeric reason rows are reviewed. | `ok` means required raw timeline/kernel, Level Zero, Unified Runtime, and VTune parse inputs were present for the wall-time ledger. Missing layers mean the run is not full-attribution evidence. |
-| `source_line.status` | `pass`, `asm-line-static-cost`, or `dwarf-line-table-only` | `fail` with `source_line.blocker` such as `missing_debug_line` or `vtune_unknown_source`. | `pass` is sampled VTune exact source-line evidence. `asm-line-static-cost` is non-sampled static source-line cost from DWARF plus addressed assembly. `dwarf-line-table-only` is line-table coverage without sampled or static instruction cost rows. |
-| `source_attribution.status` | `exact_source_line`, `asm_line_static_cost`, `dwarf_line_table_only`, or `source_region_plus_ablation` | `source_region`, `missing_parser`, or parse failure. | `exact_source_line` is preferred and requires `source_line.status pass`. `asm_line_static_cost` requires `source_line.status asm-line-static-cost`; `dwarf_line_table_only` requires `source_line.status dwarf-line-table-only`. The fallback `source_region_plus_ablation` is accepted when exact/static/DWARF source-line evidence is unavailable and the region map plus ablation delta identify the hot kernel region. Plain `source_region` is useful triage but is not closure-quality evidence by itself. |
+| `source_line.status` | `pass`, `sampled-line-cost`, `asm-line-static-cost`, or `dwarf-line-table-only` | `fail` with `source_line.blocker` such as `missing_debug_line` or `vtune_unknown_source`. | `pass` is sampled VTune exact source-line evidence. `sampled-line-cost` is runtime sampled PC evidence mapped through DWARF, but not VTune exact source rows. `asm-line-static-cost` is non-sampled static source-line cost from DWARF plus addressed assembly. `dwarf-line-table-only` is line-table coverage without sampled or static instruction cost rows. |
+| `source_attribution.status` | `exact_source_line`, `sampled_line_cost`, `asm_line_static_cost`, `dwarf_line_table_only`, or `source_region_plus_ablation` | `source_region`, `missing_parser`, or parse failure. | `exact_source_line` is preferred and requires `source_line.status pass`. `sampled_line_cost` requires `source_line.status sampled-line-cost` and a kernel match. `asm_line_static_cost` requires `source_line.status asm-line-static-cost`; `dwarf_line_table_only` requires `source_line.status dwarf-line-table-only`. The fallback `source_region_plus_ablation` is accepted when exact/sampled/static/DWARF source-line evidence is unavailable and the region map plus ablation delta identify the hot kernel region. Plain `source_region` is useful triage but is not closure-quality evidence by itself. |
 
 Real model/GPU validation is lead-owned. Under delegated documentation/source-test work, workers must not run this runner with `--execute`, real model/GPU validation, llama-bench, sycl-kernel-bench, VTune, sycl-ls, DRM, lsof, or P2P probes. Workers may run documentation/source-only tests such as pytest checks for this section.
 
@@ -1417,13 +1425,14 @@ Strict staged closure is accepted only when the merged ledger reports all requir
 | `coverage.layer_status` | `ok` | All required staged layers have real observed evidence after manifest metadata matching. |
 | `layer.unknown_wall_ms_x1000` | Present integer metric | Residual wall time remains explicit in the ledger instead of being hidden or treated as success by omission. |
 | Exact sampled source-line attribution | `source_line.status pass` with `source_attribution.status exact_source_line` | Preferred closure path when VTune sampled source-line evidence can name concrete GPU source lines. |
+| Runtime sampled PC source-line cost | `source_line.status sampled-line-cost` with `source_attribution.status sampled_line_cost` | Accepted sampled PC path only when a real positive-count `pc-samples.csv` is mapped through DWARF for the required kernel. This is line-ranked sampled cost, but `exact_source_line` remains reserved for VTune `pass`. |
 | ASM static source-line attribution | `source_line.status asm-line-static-cost` with `source_attribution.status asm_line_static_cost` | Accepted non-VTUNE path when DWARF line-table rows join to addressed EU assembly rows. This is static instruction/source evidence, not sampled timing. |
 | DWARF line-table source coverage | `source_line.status dwarf-line-table-only` with `source_attribution.status dwarf_line_table_only` | Accepted fallback when line-table rows identify source coverage but neither sampled VTune rows nor addressable ASM static-cost rows are available. |
 | Source-region fallback | `source_line.status fail`, a recorded `source_line.blocker`, `source_attribution.status source_region_plus_ablation`, and `source_attribution.ablation_delta_ms_x1000` | Accepted only when exact/static/DWARF source-line paths are unavailable for a documented blocker and the fallback reaches source-region-plus-ablation evidence with a measured ablation delta. |
 | `metadata_mismatch` | Reject | One or more stage manifests differ; rerun or recollect matching stages rather than merging mixed evidence. |
-| `source_attribution_incomplete` | Reject | No accepted source-attribution path was reached: exact sampled source lines, ASM static source lines, DWARF line-table-only source coverage, or source-region-plus-ablation with `source_attribution.ablation_delta_ms_x1000`. |
+| `source_attribution_incomplete` | Reject | No accepted source-attribution path was reached: exact sampled VTune source lines, runtime sampled PC source-line cost, ASM static source lines, DWARF line-table-only source coverage, or source-region-plus-ablation with `source_attribution.ablation_delta_ms_x1000`. |
 
-Exact sampled source lines may fail or be unavailable when the blocker is recorded in the source-line verdict and an accepted fallback path is present. `asm_line_static_cost` and `dwarf_line_table_only` keep their non-sampled semantics; plain source-region mapping is triage evidence, not closure. All stage manifests must metadata-match before interpreting `coverage.layer_status ok` as a staged closure result.
+Exact sampled VTune source lines may fail or be unavailable when the blocker is recorded in the source-line verdict and an accepted fallback path is present. `sampled_line_cost` requires real runtime PC samples and stays distinct from `exact_source_line`; `asm_line_static_cost` and `dwarf_line_table_only` keep their non-sampled semantics; plain source-region mapping is triage evidence, not closure. All stage manifests must metadata-match before interpreting `coverage.layer_status ok` as a staged closure result.
 
 Worker safety: workers must not run staged profiling with `--execute`, real model/GPU validation, `/Storage` models, llama-bench, sycl-kernel-bench, VTune, sycl-ls, `/dev/dri` or other DRM probes, lsof, P2P probes, or any real harness execution. Workers may run source/doc assertions and script dry-runs only; lead validation owns the real oneAPI/GPU execution.
 
