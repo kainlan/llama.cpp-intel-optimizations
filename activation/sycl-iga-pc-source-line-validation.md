@@ -2,53 +2,137 @@
 
 Date: 2026-07-05
 Tracker issue: `llama.cpp-xame`
-Scope: Task 5 source/doc scaffold only
+Validation owner: lead
 
-## Status
+## Summary
 
-Lead validation is not yet executed in this worktree. This note is a validation report template and status record for the IGA PC static source-line attribution path. It intentionally records only source-only gates until the lead runs the real GPU/profiler/model validation.
+Lead validation was executed on B50 (`ONEAPI_DEVICE_SELECTOR=level_zero:1`) with oneAPI sourced via:
 
-Required semantics:
+```bash
+set +u
+source /opt/intel/oneapi/setvars.sh --force
+set -u
+```
+
+Result: **`asm-line-static-cost` did not validate**. Both the probe matrix and MXFP4 run ended at `source_line.status dwarf-line-table-only`.
+
+Required semantics remain:
 
 ```text
 source_line.status asm-line-static-cost means exact static source-line cost from IGA PC rows, not sampled runtime timing.
 source_line.status pass remains the only sampled VTune exact status.
 ```
 
-## Source-only gates
+## Probe matrix validation
 
-Allowed source-only command:
-
-```bash
-bash -n scripts/sycl-source-line-debug-matrix.sh scripts/sycl-vtune-source-line-feasibility.sh scripts/sycl-gptoss-full-attribution-profile.sh scripts/sycl-gptoss-staged-attribution-profile.sh && \
-python3 -m pytest tests/test-sycl-iga-pc-disasm-parser.py tests/test-sycl-iga-zebin-extractor.py tests/test-sycl-zebin-asm-source-line-resolver.py tests/test-sycl-vtune-source-line-enablement-docs.py -q
-```
-
-Result for this scaffold change:
+Artifact root:
 
 ```text
-/home/kainlan/miniconda3/lib/python3.13/site-packages/requests/__init__.py:113: RequestsDependencyWarning: urllib3 (2.3.0) or chardet (6.0.0.post1)/charset_normalizer (3.4.7) doesn't match a supported version!
-  warnings.warn(
-.........................                                                [100%]
-25 passed in 0.80s
+/tmp/sycl_source_line_iga_matrix_20260705_173448
 ```
 
-## Lead-only validation template
+Selected parse:
 
-Do not fill this section from worker source-only runs. The lead-owned run should record:
+```text
+/tmp/sycl_source_line_iga_matrix_20260705_173448/build-matrix/debug_full/source-line-feasibility.parse
+```
 
-- Artifact roots for the probe matrix and MXFP4 feasibility run.
-- IGA tool path and version/help evidence, if available.
-- IGA platform string passed through `--iga-platform` / `SYCL_IGA_PLATFORM`.
-- Selected `.text.*` section name and section base address from `iga-disasm/iga-disasm-manifest.json`.
-- Whether `iga-pc-instructions.csv` exists and is non-empty.
-- Selected matrix parse path and exact parse contents.
-- MXFP4 `source-line-feasibility.parse` contents, including `source_line.status asm-line-static-cost` if IGA PC rows validate.
-- Exact blocker text if validation does not reach `asm-line-static-cost`.
+Selected parse contents:
 
-## Interpretation guide
+```text
+source_line.debug_line_present 1
+source_line.non_unknown_rows 0
+source_line.vtune_sampled_non_unknown_rows 0
+source_line.vtune_no_gpu_side_trace 1
+source_line.gtpin_no_kernels 0
+source_line.gtpin_register_pressure 0
+source_line.required_kernel sycl_source_line_probe
+source_line.dwarf_status ok
+source_line.dwarf_source_rows 17
+source_line.dwarf_required_path_present 1
+source_line.dwarf_source_line_rows 17
+source_line.allow_dwarf_line_table_only 1
+source_line.source_attribution_mode dwarf-line-table
+source_line.blocker none
+source_line.status dwarf-line-table-only
+```
 
-- `source_line.status asm-line-static-cost` is acceptable static line-ranked optimization evidence when it comes from kernel-matched IGA PC rows joined to DWARF ranges.
-- `source_line.status pass` is still required for sampled VTune exact source-line timing.
-- Label-only `ocloc` rows such as `L0:` are not byte PC evidence and must not be promoted to static source-line cost.
-- If IGA preparation, disassembly, parsing, or resolver mapping fails, record the blocker and keep the issue open for follow-up validation.
+IGA manifest for selected row:
+
+```json
+{
+  "extract.kernel_match": "sycl_source_line_probe",
+  "extract.platform": "xe2",
+  "extract.section": ".text._ZTSZZ4mainENKUlRN4sycl3_V17handlerEE_clES2_E29sycl_source_line_probe_kernel",
+  "extract.section_addr": "0x0",
+  "extract.status": "ok"
+}
+```
+
+IGA PC parser output for selected row:
+
+```text
+kernel,pc,pc_hex,opcode,text,raw,send_comment,source
+iga_pc.status no_pc_rows
+```
+
+Interpretation: IGA text-section selection succeeded for the probe, but the IGA disassembly/parser path produced no PC instruction rows. The checker correctly rejected static attribution and accepted only DWARF coverage.
+
+## MXFP4 feasibility validation
+
+Artifact roots:
+
+```text
+/tmp/sycl_mxfp4_iga_source_line_20260705_173611
+/tmp/sycl_mxfp4_iga_source_line_build_20260705_173611
+```
+
+MXFP4 parse contents:
+
+```text
+source_line.debug_line_present 1
+source_line.non_unknown_rows 0
+source_line.vtune_sampled_non_unknown_rows 0
+source_line.vtune_no_gpu_side_trace 0
+source_line.gtpin_no_kernels 0
+source_line.gtpin_register_pressure 1
+source_line.required_kernel mxfp4_pair_glu_xmx_tiled_packed_r8_m2_sparse32_bias
+source_line.dwarf_status ok
+source_line.dwarf_source_rows 923
+source_line.dwarf_required_path_present 1
+source_line.dwarf_source_line_rows 923
+source_line.allow_dwarf_line_table_only 1
+source_line.source_attribution_mode dwarf-line-table
+source_line.blocker none
+source_line.status dwarf-line-table-only
+```
+
+MXFP4 IGA manifest:
+
+```json
+{
+  "extract.kernel_match": "mxfp4_pair_glu_xmx_tiled_packed_r8_m2_sparse32_bias",
+  "extract.platform": "xe2",
+  "extract.section": "",
+  "extract.section_addr": "",
+  "extract.status": "missing_kernel_text_section"
+}
+```
+
+Interpretation: MXFP4 DWARF line coverage is present (`923` DWARF source rows), but IGA section selection failed because no `.text.*` section matched the required kernel name. VTune/GTPin also reported register pressure (`source_line.gtpin_register_pressure 1`). The run therefore did not produce static source-line cost rows.
+
+## Final status
+
+- Static IGA line attribution: **blocked**.
+- Current accepted status: `source_line.status dwarf-line-table-only`.
+- `llama.cpp-040b` should remain open for a follow-up that can map the MXFP4 required kernel to the correct ZEBin `.text.*` section name and/or produce usable IGA PC rows.
+
+## Follow-up blocker
+
+The next fix should address at least one of:
+
+1. IGA disassembly/parser emits no PC rows for the probe even when section extraction succeeds.
+2. MXFP4 required kernel name does not match a `.text.*` section (`extract.status missing_kernel_text_section`).
+3. VTune sampled exact source rows remain unavailable and GTPin reports register pressure on MXFP4 kernels.
+
+Label-only `ocloc` rows such as `L0:` are still not byte PC evidence and must not be promoted to `asm-line-static-cost`.
