@@ -58,11 +58,18 @@ def test_vtune_source_dry_run_reports_matrix_artifact_contract(tmp_path: Path) -
     assert "source-line-matrix/build-matrix/<case>/zebin-debug-sections.txt" in result.stdout
     assert "source-line-matrix/build-matrix/<case>/zebin-debug-line.txt" in result.stdout
     assert "source-line-matrix/build-matrix/<case>/dwarf-source-lines.csv" in result.stdout
+    assert "source-line-matrix/build-matrix/<case>/asm-source-lines.csv" in result.stdout
     assert "source-line-matrix/build-matrix/<case>/vtune-gpu-source-line.csv" in result.stdout
     assert "convert-sycl-zebin-line-table-to-source-csv.py" in result.stdout
+    assert "ocloc disasm -file kernel.zebin" in result.stdout
+    assert "asm-source-lines.csv" in result.stdout
+    assert "resolve-sycl-zebin-asm-source-lines.py" in result.stdout
+    assert "--asm-source-lines-csv" in result.stdout
+    assert "--allow-asm-line-static-cost" in result.stdout
     assert "--dwarf-source-lines-csv" in result.stdout
     assert "--allow-dwarf-line-table-only" in result.stdout
     assert "source_line.status pass" in result.stdout
+    assert "source_line.status asm-line-static-cost" in result.stdout
     assert "source_line.status dwarf-line-table-only" in result.stdout
     assert "DWARF line-table fallback" in result.stdout
     assert "source_line.blocker vtune_no_gpu_side_trace or vtune_unknown_source" in result.stdout
@@ -80,8 +87,11 @@ def test_vtune_source_execute_branch_consumes_matrix_artifacts() -> None:
         "source-line-feasibility.parse",
         "vtune-gpu-source-line.csv",
         "dwarf-source-lines.csv",
+        "asm-source-lines.csv",
         "source_line.status pass",
+        "source_line.status asm-line-static-cost",
         "source_line.status dwarf-line-table-only",
+        "asm_line_static_parse",
         "dwarf_line_table_parse",
         "source_line.blocker vtune_no_gpu_side_trace",
         "source_line.blocker vtune_unknown_source",

@@ -317,10 +317,14 @@ run_vtune_source_stage() {
         printf '#   matrix outputs: %s/source-line-matrix/build-matrix/<case>/zebin-debug-sections.txt\n' "${root}"
         printf '#   matrix outputs: %s/source-line-matrix/build-matrix/<case>/zebin-debug-line.txt\n' "${root}"
         printf '#   matrix outputs: %s/source-line-matrix/build-matrix/<case>/dwarf-source-lines.csv\n' "${root}"
+        printf '#   matrix outputs: %s/source-line-matrix/build-matrix/<case>/asm-source-lines.csv\n' "${root}"
         printf '#   matrix outputs: %s/source-line-matrix/build-matrix/<case>/vtune-gpu-source-line.csv\n' "${root}"
         printf '#   matrix conversion: python3 %q --input %q --output %q --source-computing-task %q\n' "scripts/convert-sycl-zebin-line-table-to-source-csv.py" "${root}/source-line-matrix/build-matrix/<case>/zebin-debug-line.txt" "${root}/source-line-matrix/build-matrix/<case>/dwarf-source-lines.csv" "sycl_source_line_probe"
-        printf '#   matrix checker: python3 %q --dwarf-source-lines-csv %q --allow-dwarf-line-table-only ...\n' "scripts/check-sycl-vtune-source-lines.py" "${root}/source-line-matrix/build-matrix/<case>/dwarf-source-lines.csv"
-        printf '#   selection: prefer source_line.status pass (VTune sampled exact); else source_line.status dwarf-line-table-only (DWARF line-table fallback); else source_line.blocker vtune_no_gpu_side_trace or vtune_unknown_source; else first source-line-feasibility.parse\n'
+        printf '#   matrix disasm: mkdir -p %s/source-line-matrix/build-matrix/debug_full/zebin-disasm && cp %s/source-line-matrix/build-matrix/debug_full/example.zebin %s/source-line-matrix/build-matrix/debug_full/zebin-disasm/kernel.zebin && (cd %s/source-line-matrix/build-matrix/debug_full/zebin-disasm && ocloc disasm -file kernel.zebin > ocloc.stdout 2> ocloc.stderr || true)\n' "${root}" "${root}" "${root}" "${root}"
+        printf '#   matrix ASM selection: first_asm="$(find %s/source-line-matrix/build-matrix/debug_full/zebin-disasm -type f -name '\''*.asm'\'' -print -quit)"\n' "${root}"
+        printf '#   matrix ASM resolver: python3 %q --dwarf-line-dump %q --asm "${first_asm}" --output %q --summary-output %q --source-computing-task %q\n' "scripts/resolve-sycl-zebin-asm-source-lines.py" "${root}/source-line-matrix/build-matrix/debug_full/zebin-debug-line.txt" "${root}/source-line-matrix/build-matrix/debug_full/asm-source-lines.csv" "${root}/source-line-matrix/build-matrix/debug_full/asm-source-lines.parse" "sycl_source_line_probe"
+        printf '#   matrix checker: python3 %q --asm-source-lines-csv %q --allow-asm-line-static-cost --dwarf-source-lines-csv %q --allow-dwarf-line-table-only\n' "scripts/check-sycl-vtune-source-lines.py" "${root}/source-line-matrix/build-matrix/debug_full/asm-source-lines.csv" "${root}/source-line-matrix/build-matrix/debug_full/dwarf-source-lines.csv"
+        printf '#   selection: prefer source_line.status pass (VTune sampled exact); else source_line.status asm-line-static-cost (ASM static source-line cost); else source_line.status dwarf-line-table-only (DWARF line-table fallback); else source_line.blocker vtune_no_gpu_side_trace or vtune_unknown_source; else first source-line-feasibility.parse\n'
         printf 'cp %q %q\n' "${root}/source-line-matrix/build-matrix/<selected-case>/source-line-feasibility.parse" "${root}/source-line.parse"
         printf 'python3 %q --source-csv %q >%q\n' "scripts/parse-sycl-vtune-exports.py" "${root}/source-line-matrix/build-matrix/<selected-case>/vtune-gpu-source-line.csv" "${root}/vtune.parse"
         return 0
@@ -337,6 +341,7 @@ run_vtune_source_stage() {
     local selected_parse=""
     local vtune_no_gpu_trace_parse=""
     local vtune_unknown_parse=""
+    local asm_line_static_parse=""
     local dwarf_line_table_parse=""
     local fallback_parse=""
     local parse
@@ -358,6 +363,9 @@ run_vtune_source_stage() {
             selected_parse="${parse}"
             break
         fi
+        if [[ -z "${asm_line_static_parse}" ]] && grep -qx 'source_line.status asm-line-static-cost' "${parse}"; then
+            asm_line_static_parse="${parse}"
+        fi
         if [[ -z "${dwarf_line_table_parse}" ]] && grep -qx 'source_line.status dwarf-line-table-only' "${parse}"; then
             dwarf_line_table_parse="${parse}"
         fi
@@ -369,7 +377,9 @@ run_vtune_source_stage() {
         fi
     done
     if [[ -z "${selected_parse}" ]]; then
-        if [[ -n "${dwarf_line_table_parse}" ]]; then
+        if [[ -n "${asm_line_static_parse}" ]]; then
+            selected_parse="${asm_line_static_parse}"
+        elif [[ -n "${dwarf_line_table_parse}" ]]; then
             selected_parse="${dwarf_line_table_parse}"
         elif [[ -n "${vtune_no_gpu_trace_parse}" ]]; then
             selected_parse="${vtune_no_gpu_trace_parse}"

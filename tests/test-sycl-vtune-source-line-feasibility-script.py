@@ -29,10 +29,16 @@ def test_source_line_feasibility_script_is_dry_run_by_default() -> None:
     assert "dwarf-source-lines.csv" in result.stdout
     assert "convert-sycl-zebin-line-table-to-source-csv.py" in result.stdout
     assert "--source-computing-task mxfp4_pair_glu_xmx_tiled_packed_r8_m2_sparse32_bias" in result.stdout
+    assert "ocloc disasm -file kernel.zebin" in result.stdout
+    assert "asm-source-lines.csv" in result.stdout
+    assert "resolve-sycl-zebin-asm-source-lines.py" in result.stdout
+    assert "--asm-source-lines-csv" in result.stdout
+    assert "--allow-asm-line-static-cost" in result.stdout
     assert "--dwarf-line-dump" in result.stdout
     assert "--dwarf-source-lines-csv" in result.stdout
     assert "--allow-dwarf-line-table-only" in result.stdout
     assert "--require-source-path" in result.stdout
+    assert "--require-source-path mmvq.cpp" in result.stdout
     assert "--vtune-stdout" in result.stdout
     assert "--vtune-stderr" in result.stdout
     assert "check-sycl-vtune-source-lines.py" in result.stdout
@@ -110,9 +116,11 @@ def test_source_line_feasibility_script_supports_matrix_pass_gate() -> None:
         assert "matrix gate" in result.stdout
         assert "grep -Eq" in result.stdout
         assert "source_line.status pass" in result.stdout
+        assert "source_line.status asm-line-static-cost" in result.stdout
         assert "source_line.status dwarf-line-table-only" in result.stdout
+        assert "ASM static source-line cost" in result.stdout
         assert "DWARF line-table fallback" in result.stdout
-        assert r"\^source_line.status\ \(pass\|dwarf-line-table-only\)\$" in result.stdout
+        assert r"\^source_line.status\ \(pass\|asm-line-static-cost\|dwarf-line-table-only\)\$" in result.stdout
         matrix_index = result.stdout.index("matrix gate")
         assert matrix_index < result.stdout.index("cmake -S")
         assert matrix_index < result.stdout.index("profiling-debug-build.log")
@@ -162,11 +170,18 @@ def test_source_line_feasibility_execute_branch_writes_expected_artifacts() -> N
     assert "zebin-debug-sections.txt" in text
     assert "zebin-debug-line.txt" in text
     assert "dwarf-source-lines.csv" in text
+    assert "asm-source-lines.csv" in text
+    assert "asm-source-lines.parse" in text
+    assert "zebin-disasm" in text
+    assert "ocloc disasm -file kernel.zebin" in text
+    assert "resolve-sycl-zebin-asm-source-lines.py" in text
     assert "source-line-feasibility.parse" in text
     assert "scripts/parse-sycl-vtune-tasks.py" in text
     assert "scripts/convert-sycl-zebin-line-table-to-source-csv.py" in text
     assert "scripts/check-sycl-vtune-source-lines.py" in text
     assert "--dwarf-line-dump" in text
+    assert "--asm-source-lines-csv" in text
+    assert "--allow-asm-line-static-cost" in text
     assert "--dwarf-source-lines-csv" in text
     assert "--allow-dwarf-line-table-only" in text
     assert "vtune-task.parse" in text
@@ -182,6 +197,6 @@ def test_source_line_feasibility_execute_branch_writes_expected_artifacts() -> N
     assert "--require-source-path \"mmvq.cpp\"" in text
     assert "--require-source-path \"ggml/src/ggml-sycl/mmvq.cpp\"" not in text
     assert "REQUIRE_MATRIX_PASS" in text
-    assert "! grep -Eq \"^source_line.status (pass|dwarf-line-table-only)$\" \"${REQUIRE_MATRIX_PASS}\"" in text
+    assert "! grep -Eq \"^source_line.status (pass|asm-line-static-cost|dwarf-line-table-only)$\" \"${REQUIRE_MATRIX_PASS}\"" in text
     assert "MXFP4 source-line matrix gate failed" in text
-    assert "source_line.status pass (VTune sampled exact) or source_line.status dwarf-line-table-only" in text
+    assert "source_line.status pass (VTune sampled exact), source_line.status asm-line-static-cost" in text

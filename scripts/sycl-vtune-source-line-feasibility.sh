@@ -58,8 +58,8 @@ print_plan() {
     printf 'DRY RUN: would execute lead-only SYCL VTune source-line microbench feasibility.\n'
     printf '# output root: %s\n' "${OUT_ROOT}"
     if [[ -n "${REQUIRE_MATRIX_PASS}" ]]; then
-        printf 'matrix gate: require %q to contain source_line.status pass (VTune sampled exact) or source_line.status dwarf-line-table-only (DWARF line-table fallback)\n' "${REQUIRE_MATRIX_PASS}"
-        printf 'grep -Eq %q %q\n' "^source_line.status (pass|dwarf-line-table-only)$" "${REQUIRE_MATRIX_PASS}"
+        printf 'matrix gate: require %q to contain source_line.status pass (VTune sampled exact), source_line.status asm-line-static-cost (ASM static source-line cost), or source_line.status dwarf-line-table-only (DWARF line-table fallback)\n' "${REQUIRE_MATRIX_PASS}"
+        printf 'grep -Eq %q %q\n' "^source_line.status (pass|asm-line-static-cost|dwarf-line-table-only)$" "${REQUIRE_MATRIX_PASS}"
     fi
     printf '%q ' "${configure_cmd[@]}"; printf '> %q 2>&1\n' "${OUT_ROOT}/profiling-debug-build.log"
     printf '%q ' "${build_cmd[@]}"; printf '>> %q 2>&1\n' "${OUT_ROOT}/profiling-debug-build.log"
@@ -78,8 +78,11 @@ print_plan() {
     printf 'readelf -S %q > %q\n' "${vtune_dir}/data.0/<first-zebin>" "${OUT_ROOT}/zebin-debug-sections.txt"
     printf 'llvm-dwarfdump --debug-line %q > %q\n' "${vtune_dir}/data.0/<first-zebin>" "${OUT_ROOT}/zebin-debug-line.txt"
     printf 'python3 scripts/convert-sycl-zebin-line-table-to-source-csv.py --input %q --output %q --source-computing-task %q\n' "${OUT_ROOT}/zebin-debug-line.txt" "${OUT_ROOT}/dwarf-source-lines.csv" "${TARGET_KERNEL}"
+    printf 'mkdir -p %q && cp %q %q && (cd %q && ocloc disasm -file kernel.zebin > ocloc.stdout 2> ocloc.stderr || true)\n' "${OUT_ROOT}/zebin-disasm" "${vtune_dir}/data.0/example.zebin" "${OUT_ROOT}/zebin-disasm/kernel.zebin" "${OUT_ROOT}/zebin-disasm"
+    printf 'first_asm="$(find %q -type f -name '\''*.asm'\'' -print -quit)"\n' "${OUT_ROOT}/zebin-disasm"
+    printf 'python3 scripts/resolve-sycl-zebin-asm-source-lines.py --dwarf-line-dump %q --asm "${first_asm}" --output %q --summary-output %q --source-computing-task %q --require-source-path %q\n' "${OUT_ROOT}/zebin-debug-line.txt" "${OUT_ROOT}/asm-source-lines.csv" "${OUT_ROOT}/asm-source-lines.parse" "${TARGET_KERNEL}" "mmvq.cpp"
     printf 'vtune -report hotspots -r %q -group-by gpu-source-line -format csv > %q\n' "${vtune_dir}" "${OUT_ROOT}/vtune-gpu-source-line.csv"
-    printf 'python3 scripts/check-sycl-vtune-source-lines.py --readelf-sections %q --vtune-csv %q --require-kernel %q --dwarf-line-dump %q --dwarf-source-lines-csv %q --allow-dwarf-line-table-only --require-source-path %q --vtune-stdout %q --vtune-stderr %q > %q\n' "${OUT_ROOT}/zebin-debug-sections.txt" "${OUT_ROOT}/vtune-gpu-source-line.csv" "${TARGET_KERNEL}" "${OUT_ROOT}/zebin-debug-line.txt" "${OUT_ROOT}/dwarf-source-lines.csv" "mmvq.cpp" "${OUT_ROOT}/bench.stdout" "${OUT_ROOT}/bench.stderr" "${OUT_ROOT}/source-line-feasibility.parse"
+    printf 'python3 scripts/check-sycl-vtune-source-lines.py --readelf-sections %q --vtune-csv %q --require-kernel %q --asm-source-lines-csv %q --allow-asm-line-static-cost --dwarf-line-dump %q --dwarf-source-lines-csv %q --allow-dwarf-line-table-only --require-source-path %q --vtune-stdout %q --vtune-stderr %q > %q\n' "${OUT_ROOT}/zebin-debug-sections.txt" "${OUT_ROOT}/vtune-gpu-source-line.csv" "${TARGET_KERNEL}" "${OUT_ROOT}/asm-source-lines.csv" "${OUT_ROOT}/zebin-debug-line.txt" "${OUT_ROOT}/dwarf-source-lines.csv" "mmvq.cpp" "${OUT_ROOT}/bench.stdout" "${OUT_ROOT}/bench.stderr" "${OUT_ROOT}/source-line-feasibility.parse"
 }
 
 if [[ "${EXECUTE}" -ne 1 ]]; then
@@ -87,8 +90,8 @@ if [[ "${EXECUTE}" -ne 1 ]]; then
     exit 0
 fi
 
-if [[ -n "${REQUIRE_MATRIX_PASS}" ]] && ! grep -Eq "^source_line.status (pass|dwarf-line-table-only)$" "${REQUIRE_MATRIX_PASS}"; then
-    printf 'error: MXFP4 source-line matrix gate failed: %s must contain source_line.status pass (VTune sampled exact) or source_line.status dwarf-line-table-only (DWARF line-table fallback)\n' "${REQUIRE_MATRIX_PASS}" >&2
+if [[ -n "${REQUIRE_MATRIX_PASS}" ]] && ! grep -Eq "^source_line.status (pass|asm-line-static-cost|dwarf-line-table-only)$" "${REQUIRE_MATRIX_PASS}"; then
+    printf 'error: MXFP4 source-line matrix gate failed: %s must contain source_line.status pass (VTune sampled exact), source_line.status asm-line-static-cost (ASM static source-line cost), or source_line.status dwarf-line-table-only (DWARF line-table fallback)\n' "${REQUIRE_MATRIX_PASS}" >&2
     exit 2
 fi
 
@@ -137,6 +140,28 @@ if ! python3 scripts/convert-sycl-zebin-line-table-to-source-csv.py \
     --source-computing-task "${TARGET_KERNEL}"; then
     printf 'warning: DWARF source-line CSV conversion failed; checker will fail closed unless %s exists\n' "${OUT_ROOT}/dwarf-source-lines.csv" >&2
 fi
+asm_dir="${OUT_ROOT}/zebin-disasm"
+rm -rf "${asm_dir}"
+mkdir -p "${asm_dir}"
+cp "${first_zebin}" "${asm_dir}/kernel.zebin"
+if ! (cd "${asm_dir}" && ocloc disasm -file kernel.zebin >ocloc.stdout 2>ocloc.stderr); then
+    printf 'warning: ocloc disasm failed; checker will use VTune/DWARF evidence if available\n' >&2
+fi
+first_asm="$(find "${asm_dir}" -type f -name '*.asm' -print -quit)"
+rm -f "${OUT_ROOT}/asm-source-lines.csv" "${OUT_ROOT}/asm-source-lines.parse"
+if [[ -n "${first_asm}" ]]; then
+    if ! python3 scripts/resolve-sycl-zebin-asm-source-lines.py \
+        --dwarf-line-dump "${OUT_ROOT}/zebin-debug-line.txt" \
+        --asm "${first_asm}" \
+        --output "${OUT_ROOT}/asm-source-lines.csv" \
+        --summary-output "${OUT_ROOT}/asm-source-lines.parse" \
+        --source-computing-task "${TARGET_KERNEL}" \
+        --require-source-path "mmvq.cpp"; then
+        printf 'warning: ASM source-line resolver failed; checker will use VTune/DWARF evidence if available\n' >&2
+    fi
+else
+    printf 'warning: no .asm file found after ocloc disasm\n' >&2
+fi
 if ! vtune -report hotspots -r "${vtune_dir}" -group-by gpu-source-line -format csv >"${OUT_ROOT}/vtune-gpu-source-line.csv"; then
     printf 'warning: VTune gpu-source-line report failed; checker will use explicit blockers and DWARF fallback if available\n' >&2
 fi
@@ -144,6 +169,8 @@ python3 scripts/check-sycl-vtune-source-lines.py \
     --readelf-sections "${OUT_ROOT}/zebin-debug-sections.txt" \
     --vtune-csv "${OUT_ROOT}/vtune-gpu-source-line.csv" \
     --require-kernel "${TARGET_KERNEL}" \
+    --asm-source-lines-csv "${OUT_ROOT}/asm-source-lines.csv" \
+    --allow-asm-line-static-cost \
     --dwarf-line-dump "${OUT_ROOT}/zebin-debug-line.txt" \
     --dwarf-source-lines-csv "${OUT_ROOT}/dwarf-source-lines.csv" \
     --allow-dwarf-line-table-only \
