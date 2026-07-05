@@ -3,12 +3,25 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib.util
 import pathlib
 import re
 import sys
+from typing import Any
 
 UNKNOWN_VALUES = {"", "[Unknown]", "[Unknown source file]"}
 DEBUG_LINE_SECTION_RE = re.compile(r"(?m)^\s*\[\s*\d+\]\s+\.debug_line(?:\s|$)")
+
+
+def load_line_table_parser() -> Any:
+    path = pathlib.Path(__file__).resolve().with_name("parse-sycl-zebin-line-table.py")
+    spec = importlib.util.spec_from_file_location("parse_sycl_zebin_line_table", path)
+    if spec is None or spec.loader is None:
+        raise ValueError(f"failed to load ZEBin line-table parser: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def validate_row_shape(row: dict[str | None, str | list[str] | None]) -> dict[str, str]:
@@ -39,6 +52,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--readelf-sections", required=True, type=pathlib.Path)
     parser.add_argument("--vtune-csv", required=True, type=pathlib.Path)
     parser.add_argument("--require-kernel")
+    parser.add_argument("--dwarf-line-dump", type=pathlib.Path)
+    parser.add_argument("--require-source-path")
     args = parser.parse_args(argv)
 
     try:
@@ -55,22 +70,43 @@ def main(argv: list[str]) -> int:
                 row = validate_row_shape(raw_row)
                 if row_matches_kernel(row, args.require_kernel) and row_has_known_source(row):
                     non_unknown_rows += 1
+        dwarf_status = "not_checked"
+        dwarf_source_rows = 0
+        dwarf_required_path_present = True
+        if args.dwarf_line_dump is not None:
+            module = load_line_table_parser()
+            parsed = module.parse_line_table(
+                args.dwarf_line_dump.read_text(encoding="utf-8", errors="replace"),
+                args.require_source_path,
+            )
+            dwarf_status = str(parsed["status"])
+            dwarf_source_rows = int(parsed["source_rows"])
+            dwarf_required_path_present = bool(parsed["required_path_present"])
     except (OSError, csv.Error, IndexError, TypeError, ValueError) as exc:
         print(f"failed to check source lines: {exc}")
         return 2
 
-    passed = debug_line_present and non_unknown_rows > 0
-    if passed:
-        blocker = "none"
-    elif not debug_line_present:
+    if not debug_line_present:
+        passed = False
         blocker = "missing_debug_line"
+    elif args.dwarf_line_dump is not None and not dwarf_required_path_present:
+        passed = False
+        blocker = "missing_dwarf_source_path"
+    elif non_unknown_rows > 0:
+        passed = True
+        blocker = "none"
     else:
+        passed = False
         blocker = "vtune_unknown_source"
 
     print(f"source_line.debug_line_present {1 if debug_line_present else 0}")
     print(f"source_line.non_unknown_rows {non_unknown_rows}")
     if args.require_kernel is not None:
         print(f"source_line.required_kernel {args.require_kernel}")
+    if args.dwarf_line_dump is not None:
+        print(f"source_line.dwarf_status {dwarf_status}")
+        print(f"source_line.dwarf_source_rows {dwarf_source_rows}")
+        print(f"source_line.dwarf_required_path_present {1 if dwarf_required_path_present else 0}")
     print(f"source_line.blocker {blocker}")
     print(f"source_line.status {'pass' if passed else 'fail'}")
     return 0 if passed else 2

@@ -154,3 +154,71 @@ def test_checker_reports_malformed_surplus_csv_fields_without_traceback() -> Non
         assert result.returncode == 2
         assert "failed to check source lines" in result.stdout
         assert "Traceback" not in result.stdout
+
+
+def test_checker_reports_useful_dwarf_table_when_vtune_rows_are_unknown() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        sections = tmp / "sections.txt"
+        csv = tmp / "source.csv"
+        dwarf = tmp / "dwarf.txt"
+        sections.write_text("[12] .debug_line PROGBITS\n", encoding="utf-8")
+        csv.write_text("Source Line\tSource Computing Task\n[Unknown]\tmxfp4_pair_glu_xmx_tiled\n", encoding="utf-8")
+        dwarf.write_text(
+            "include_directories[  1] = /Apps/llama.cpp/ggml/src/ggml-sycl\n"
+            "file_names[  1]:\n"
+            "           name: mmvq.cpp\n"
+            "      dir_index: 1\n"
+            "Address Line Column File ISA Discriminator Flags\n"
+            "0x00000040 9730 1 1 0 0 is_stmt\n",
+            encoding="utf-8",
+        )
+        result = run_checker(
+            sections,
+            csv,
+            "--require-kernel",
+            "mxfp4_pair_glu_xmx_tiled",
+            "--dwarf-line-dump",
+            str(dwarf),
+            "--require-source-path",
+            "ggml/src/ggml-sycl/mmvq.cpp",
+        )
+        assert result.returncode == 2
+        assert "source_line.dwarf_status ok" in result.stdout
+        assert "source_line.dwarf_source_rows 1" in result.stdout
+        assert "source_line.dwarf_required_path_present 1" in result.stdout
+        assert "source_line.blocker vtune_unknown_source" in result.stdout
+        assert "source_line.status fail" in result.stdout
+
+
+def test_checker_reports_missing_dwarf_source_path_when_line_table_lacks_required_file() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        sections = tmp / "sections.txt"
+        csv = tmp / "source.csv"
+        dwarf = tmp / "dwarf.txt"
+        sections.write_text("[12] .debug_line PROGBITS\n", encoding="utf-8")
+        csv.write_text("Source Line\tSource Computing Task\n[Unknown]\tmxfp4_pair_glu_xmx_tiled\n", encoding="utf-8")
+        dwarf.write_text(
+            "include_directories[  1] = /tmp/generated\n"
+            "file_names[  1]:\n"
+            "           name: generated.cpp\n"
+            "      dir_index: 1\n"
+            "Address Line Column File ISA Discriminator Flags\n"
+            "0x00000040 1 1 1 0 0 is_stmt\n",
+            encoding="utf-8",
+        )
+        result = run_checker(
+            sections,
+            csv,
+            "--require-kernel",
+            "mxfp4_pair_glu_xmx_tiled",
+            "--dwarf-line-dump",
+            str(dwarf),
+            "--require-source-path",
+            "ggml/src/ggml-sycl/mmvq.cpp",
+        )
+        assert result.returncode == 2
+        assert "source_line.dwarf_required_path_present 0" in result.stdout
+        assert "source_line.blocker missing_dwarf_source_path" in result.stdout
+        assert "source_line.status fail" in result.stdout
