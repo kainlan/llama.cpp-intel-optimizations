@@ -63,6 +63,15 @@ class NamedTextSection:
     text: str
 
 
+@dataclass(frozen=True)
+class PcInstructionRow:
+    address: int
+    opcode: str
+    text: str
+    raw: str
+    send_comment: str
+
+
 @dataclass
 class LineAggregate:
     file_path: str
@@ -202,6 +211,32 @@ def load_instructions(asm_path: pathlib.Path, source_computing_task: str) -> lis
     if not selected_text.strip():
         return []
     return sorted(module.parse_asm_instructions_text(selected_text), key=lambda row: row.address)
+
+
+def load_iga_instructions(csv_path: pathlib.Path, source_computing_task: str, pc_base: int) -> list[PcInstructionRow]:
+    require_existing_file(csv_path, "IGA PC instruction CSV")
+    rows: list[PcInstructionRow] = []
+    with csv_path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            row_kernel = row.get("kernel") or ""
+            if row_kernel != source_computing_task:
+                raise ResolveError(
+                    f"IGA PC instruction CSV contains kernel {row_kernel} but expected {source_computing_task}"
+                )
+            pc_raw = row.get("pc") or ""
+            if not pc_raw.isdigit():
+                continue
+            rows.append(
+                PcInstructionRow(
+                    address=int(pc_raw) + pc_base,
+                    opcode=(row.get("opcode") or "").lower(),
+                    text=row.get("text") or "",
+                    raw=row.get("raw") or "",
+                    send_comment=row.get("send_comment") or "",
+                )
+            )
+    return sorted(rows, key=lambda row: row.address)
 
 
 def path_matches(path: str, required_path: str) -> bool:
@@ -350,7 +385,9 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     parser.add_argument("--dwarf-line-dump", required=True, type=pathlib.Path)
-    parser.add_argument("--asm", required=True, type=pathlib.Path)
+    parser.add_argument("--asm", type=pathlib.Path)
+    parser.add_argument("--iga-instructions-csv", type=pathlib.Path)
+    parser.add_argument("--pc-base", default="0", help="base address added to IGA section-relative PCs")
     parser.add_argument("--output", type=pathlib.Path, help="CSV output path; defaults to stdout")
     parser.add_argument("--summary-output", type=pathlib.Path, help="optional parse-style summary output")
     parser.add_argument("--source-computing-task", required=True, help="required kernel/task name to write into output rows")
@@ -358,8 +395,18 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
+        if bool(args.asm) == bool(args.iga_instructions_csv):
+            raise ResolveError("pass exactly one of --asm or --iga-instructions-csv")
         source_rows = load_source_rows(args.dwarf_line_dump, args.source_computing_task)
-        instructions = load_instructions(args.asm, args.source_computing_task)
+        instructions = (
+            load_instructions(args.asm, args.source_computing_task)
+            if args.asm
+            else load_iga_instructions(
+                args.iga_instructions_csv,
+                args.source_computing_task,
+                parse_hex_address(args.pc_base),
+            )
+        )
         rows, mapped, unmapped = aggregate_rows(source_rows, instructions, args.require_source_path)
         write_csv(rows, args.output, args.source_computing_task)
         write_summary(rows, args.summary_output, mapped, unmapped)

@@ -439,3 +439,85 @@ def test_resolver_fails_closed_on_missing_required_input() -> None:
         assert result.returncode == 2
         assert "failed to resolve ZEBin ASM source lines: ASM file does not exist" in result.stdout
         assert "Traceback" not in result.stdout
+
+
+def test_resolver_maps_iga_pc_rows_to_dwarf_source_lines() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        dwarf, _ = write_fixture(tmp)
+        iga_csv = tmp / "iga-pc.csv"
+        iga_csv.write_text(
+            "kernel,pc,pc_hex,opcode,text,raw,send_comment,source\n"
+            "mxfp4_pair_glu_xmx_tiled,0,0x0,dpas.8x8,dpas.8x8 r1 r2 r3,raw,,iga-json\n"
+            "mxfp4_pair_glu_xmx_tiled,16,0x10,send.ugm,send.ugm r4 r5,raw,wr:1+0; rd:4,iga-json\n"
+            "mxfp4_pair_glu_xmx_tiled,136,0x88,send.ugm,send.ugm r6 r7,raw,wr:1+0; rd:0,iga-json\n",
+            encoding="utf-8",
+        )
+        result = run_resolver(
+            "--dwarf-line-dump",
+            str(dwarf),
+            "--iga-instructions-csv",
+            str(iga_csv),
+            "--source-computing-task",
+            "mxfp4_pair_glu_xmx_tiled",
+            "--pc-base",
+            "0x40",
+        )
+        assert result.returncode == 0, result.stdout
+        rows = list(csv.DictReader(io.StringIO(result.stdout)))
+        assert rows[0]["Source Line"] == "/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp:6800"
+        assert rows[0]["Static Dpas Count"] == "1"
+        assert rows[0]["Static Send Ugm Count"] == "1"
+        assert any(row["Source Line"].endswith("mmvq.cpp:6802") for row in rows)
+
+
+def test_resolver_rejects_iga_rows_for_wrong_kernel() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        dwarf, _ = write_fixture(tmp)
+        iga_csv = tmp / "iga-pc.csv"
+        iga_csv.write_text(
+            "kernel,pc,pc_hex,opcode,text,raw,send_comment,source\n"
+            "mxfp4_pair_glu_xmx_tiled,0,0x0,dpas.8x8,dpas.8x8 r1 r2 r3,raw,,iga-json\n"
+            "other_kernel,16,0x10,send.ugm,send.ugm r4 r5,raw,wr:1+0; rd:4,iga-json\n",
+            encoding="utf-8",
+        )
+        result = run_resolver(
+            "--dwarf-line-dump",
+            str(dwarf),
+            "--iga-instructions-csv",
+            str(iga_csv),
+            "--source-computing-task",
+            "mxfp4_pair_glu_xmx_tiled",
+        )
+        assert result.returncode == 2
+        assert (
+            "IGA PC instruction CSV contains kernel other_kernel but expected mxfp4_pair_glu_xmx_tiled"
+            in result.stdout
+        )
+        assert "Traceback" not in result.stdout
+
+
+def test_resolver_rejects_both_asm_and_iga_instruction_inputs() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        dwarf, asm = write_fixture(tmp)
+        iga_csv = tmp / "iga-pc.csv"
+        iga_csv.write_text(
+            "kernel,pc,pc_hex,opcode,text,raw,send_comment,source\n"
+            "mxfp4_pair_glu_xmx_tiled,0,0x0,dpas.8x8,dpas.8x8 r1 r2 r3,raw,,iga-json\n",
+            encoding="utf-8",
+        )
+        result = run_resolver(
+            "--dwarf-line-dump",
+            str(dwarf),
+            "--asm",
+            str(asm),
+            "--iga-instructions-csv",
+            str(iga_csv),
+            "--source-computing-task",
+            "mxfp4_pair_glu_xmx_tiled",
+        )
+        assert result.returncode == 2
+        assert "pass exactly one of --asm or --iga-instructions-csv" in result.stdout
+        assert "Traceback" not in result.stdout
