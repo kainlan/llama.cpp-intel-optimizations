@@ -418,3 +418,155 @@ def test_checker_requires_explicit_allow_for_dwarf_line_table_only_csv() -> None
         assert "source_line.source_attribution_mode none" in result.stdout
         assert "source_line.blocker vtune_unknown_source" in result.stdout
         assert "source_line.status fail" in result.stdout
+
+
+def test_checker_allows_asm_line_static_cost_with_explicit_flag() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        sections = tmp / "sections.txt"
+        asm_csv = tmp / "asm-source.csv"
+        sections.write_text("[12] .debug_line PROGBITS\n", encoding="utf-8")
+        asm_csv.write_text(
+            "Source Line,Source File,Source File Path,Source Computing Task,Static Instruction Count,Static Score,Source Attribution Mode,Source Attribution Status\n"
+            "/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp:6800,mmvq.cpp,/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp,mxfp4_pair_glu_xmx_tiled,2,14,asm-line-static,asm_line_static_cost\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(CHECKER),
+                "--readelf-sections",
+                str(sections),
+                "--asm-source-lines-csv",
+                str(asm_csv),
+                "--allow-asm-line-static-cost",
+                "--require-kernel",
+                "mxfp4_pair_glu_xmx_tiled",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout
+        assert "source_line.non_unknown_rows 0" in result.stdout
+        assert "source_line.vtune_sampled_non_unknown_rows 0" in result.stdout
+        assert "source_line.asm_source_line_rows 1" in result.stdout
+        assert "source_line.allow_asm_line_static_cost 1" in result.stdout
+        assert "source_line.asm_top_source_line /Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp:6800" in result.stdout
+        assert "source_line.asm_top_static_score 14" in result.stdout
+        assert "source_line.asm_top_instruction_count 2" in result.stdout
+        assert "source_line.source_attribution_mode asm-line-static" in result.stdout
+        assert "source_line.blocker none" in result.stdout
+        assert "source_line.status asm-line-static-cost" in result.stdout
+
+
+def test_checker_requires_explicit_allow_for_asm_line_static_cost() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        sections = tmp / "sections.txt"
+        vtune_csv = tmp / "vtune-source.csv"
+        asm_csv = tmp / "asm-source.csv"
+        sections.write_text("[12] .debug_line PROGBITS\n", encoding="utf-8")
+        vtune_csv.write_text("Source Line\tSource Computing Task\n[Unknown]\tmxfp4_pair_glu_xmx_tiled\n", encoding="utf-8")
+        asm_csv.write_text(
+            "Source Line,Source File,Source File Path,Source Computing Task,Static Instruction Count,Static Score,Source Attribution Mode,Source Attribution Status\n"
+            "/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp:6800,mmvq.cpp,/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp,mxfp4_pair_glu_xmx_tiled,2,14,asm-line-static,asm_line_static_cost\n",
+            encoding="utf-8",
+        )
+        result = run_checker(
+            sections,
+            vtune_csv,
+            "--require-kernel",
+            "mxfp4_pair_glu_xmx_tiled",
+            "--asm-source-lines-csv",
+            str(asm_csv),
+        )
+        assert result.returncode == 2
+        assert "source_line.asm_source_line_rows 1" in result.stdout
+        assert "source_line.allow_asm_line_static_cost 0" in result.stdout
+        assert "source_line.source_attribution_mode none" in result.stdout
+        assert "source_line.status fail" in result.stdout
+
+
+def test_checker_missing_optional_asm_csv_does_not_block_dwarf_fallback() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        sections = tmp / "sections.txt"
+        dwarf_csv = tmp / "dwarf-source.csv"
+        missing_asm_csv = tmp / "missing-asm-source.csv"
+        sections.write_text("[12] .debug_line PROGBITS\n", encoding="utf-8")
+        dwarf_csv.write_text(
+            "Source Line,Source File,Source File Path,Source Computing Task,Source Attribution Mode,Source Attribution Status\n"
+            "/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp:6800,mmvq.cpp,/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp,mxfp4_pair_glu_xmx_tiled,dwarf-line-table,dwarf_line_table_only\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(CHECKER),
+                "--readelf-sections",
+                str(sections),
+                "--asm-source-lines-csv",
+                str(missing_asm_csv),
+                "--allow-asm-line-static-cost",
+                "--dwarf-source-lines-csv",
+                str(dwarf_csv),
+                "--allow-dwarf-line-table-only",
+                "--require-kernel",
+                "mxfp4_pair_glu_xmx_tiled",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout
+        assert "source_line.asm_source_line_rows 0" in result.stdout
+        assert "source_line.dwarf_source_line_rows 1" in result.stdout
+        assert "source_line.status dwarf-line-table-only" in result.stdout
+
+
+def test_checker_prefers_asm_static_cost_over_dwarf_line_table_only() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        sections = tmp / "sections.txt"
+        asm_csv = tmp / "asm-source.csv"
+        dwarf_csv = tmp / "dwarf-source.csv"
+        sections.write_text("[12] .debug_line PROGBITS\n", encoding="utf-8")
+        asm_csv.write_text(
+            "Source Line,Source File,Source File Path,Source Computing Task,Static Instruction Count,Static Score,Source Attribution Mode,Source Attribution Status\n"
+            "/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp:6800,mmvq.cpp,/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp,mxfp4_pair_glu_xmx_tiled,2,14,asm-line-static,asm_line_static_cost\n",
+            encoding="utf-8",
+        )
+        dwarf_csv.write_text(
+            "Source Line,Source File,Source File Path,Source Computing Task,Source Attribution Mode,Source Attribution Status\n"
+            "/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp:6800,mmvq.cpp,/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp,mxfp4_pair_glu_xmx_tiled,dwarf-line-table,dwarf_line_table_only\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(CHECKER),
+                "--readelf-sections",
+                str(sections),
+                "--asm-source-lines-csv",
+                str(asm_csv),
+                "--allow-asm-line-static-cost",
+                "--dwarf-source-lines-csv",
+                str(dwarf_csv),
+                "--allow-dwarf-line-table-only",
+                "--require-kernel",
+                "mxfp4_pair_glu_xmx_tiled",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout
+        assert "source_line.dwarf_source_line_rows 1" in result.stdout
+        assert "source_line.asm_source_line_rows 1" in result.stdout
+        assert "source_line.source_attribution_mode asm-line-static" in result.stdout
+        assert "source_line.status asm-line-static-cost" in result.stdout
+        assert "source_line.status dwarf-line-table-only" not in result.stdout
