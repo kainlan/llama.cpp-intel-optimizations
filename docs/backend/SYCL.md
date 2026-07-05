@@ -1270,7 +1270,52 @@ Open the same JSON in Perfetto for visual inspection. Host spans are the visual 
 
 Default attribution is host-side file:line callsites plus named GPU kernel labels. `scripts/sycl-gptoss-decode-timeline-profile.sh` now writes `cost-ranking.parse` and `wall-ledger.parse` in addition to `timeline.parse`, `timeline.gaps.parse`, and `kernels.parse`. Use `cost-ranking.parse` for the ranked named-kernel table, and use `wall-ledger.parse` to compare timeline `sycl.event` coverage against the kernel-profile total. If `ledger.coverage_status` is `coverage_mismatch`, keep `sycl-kernels.csv/json` authoritative for named GPU cost and treat `ledger.unknown_wall_residual_ms_x1000` as unknown time, not proof of GPU idle.
 
-VTune GPU source-line attribution is an optional deep dive only, not a prerequisite for using the decode timeline profiler and not the source of truth for default callsite attribution. Exact GPU source-line profiling is gated by the microbench-only script `scripts/sycl-vtune-source-line-feasibility.sh`; run it in dry-run mode first and execute it only with `--execute --i-understand-this-runs-gpu-microbenchmarks`. The pass condition is fail-closed: dumped `.zebin` sections must contain `.debug_line`, and the exported VTune `gpu-source-line` CSV must contain non-`[Unknown]` rows for the target MXFP4 kernel. As of the 2026-07-04 B-spike, the microbench still failed this gate (`debug_line_present 0`, `non_unknown_rows 0`), so full GPT-OSS exact-line profiling remains blocked.
+### VTune GPU source-line attribution enablement
+
+VTune GPU source-line attribution is an optional deep dive only, not a prerequisite for using the decode timeline profiler and not the source of truth for default host callsite attribution. Exact GPU source-line profiling is enabled only when three independent evidence layers agree:
+
+1. **ZEBin DWARF line table** evidence: the dumped `.zebin` contains a usable DWARF `.debug_line` section for the selected kernel. `.debug_line` is necessary but not sufficient, because VTune can still report unknown source rows if it cannot map samples back through the compute task.
+2. **VTune computing-task selection** evidence: the VTune computing-task report identifies the intended kernel/task, and any `computing-tasks-of-interest` filter matches that task instead of accidentally profiling a neighboring SYCL kernel.
+3. **VTune `gpu-source-line`** evidence: the exported VTune `gpu-source-line` CSV contains non-`[Unknown]` rows for the target kernel. The final parser must report `source_line.status pass`; otherwise keep exact-line attribution blocked and use the existing named-kernel and host-callsite evidence.
+
+Probe-first order is mandatory: the `sycl-source-line-probe` matrix must pass before MXFP4 exact-line feasibility runs. Use `scripts/sycl-source-line-debug-matrix.sh` to prove the debug flag/build/VTune workflow on the tiny probe first, then use `scripts/sycl-vtune-source-line-feasibility.sh` for the MXFP4 microbench only after the matrix artifact contains `source_line.status pass`.
+
+Safe dry-run command for the probe matrix:
+
+```bash
+bash scripts/sycl-source-line-debug-matrix.sh \
+  --dry-run \
+  --out-root /tmp/sycl_source_line_matrix_dryrun \
+  --device-selector level_zero:1
+```
+
+Lead-only execute command for the probe matrix. Keep the oneAPI wrapper exactly around the environment source step so `set -u` shells do not fail inside Intel's setup script:
+
+```bash
+set +u
+source /opt/intel/oneapi/setvars.sh --force
+set -u
+bash scripts/sycl-source-line-debug-matrix.sh \
+  --execute \
+  --i-understand-this-runs-gpu-source-probe \
+  --out-root /tmp/sycl_source_line_matrix_$(date +%Y%m%d_%H%M%S) \
+  --device-selector level_zero:1
+```
+
+On multi-GPU hosts, add a VTune target such as `--vtune-target-gpu 0:7:0.0` only after confirming it is the same physical device selected by `ONEAPI_DEVICE_SELECTOR`. Do not hard-code target GPU values across hosts or boots; bus/function IDs and VTune ordering can change.
+
+After a passing probe matrix, dry-run the MXFP4 feasibility gate with the matrix parse file wired in explicitly:
+
+```bash
+bash scripts/sycl-vtune-source-line-feasibility.sh \
+  --dry-run \
+  --out-root /tmp/sycl_vtune_source_line_mxfp4_dryrun \
+  --device-selector level_zero:1 \
+  --require-matrix-pass /tmp/sycl_source_line_matrix_20260705_120000/build-matrix/debug_full/source-line-feasibility.parse
+```
+
+Lead-owned MXFP4 execution changes `--dry-run` to `--execute` and must add `--i-understand-this-runs-gpu-microbenchmarks`. Workers must not run GPU/model/profiler commands, VTune collection, `sycl-source-line-probe`, `sycl-kernel-bench`, MXFP4 feasibility execution, or any `--execute` runner; workers may update these docs and run doc-only tests.
+
 
 ### Full layered SYCL profiling closure
 
