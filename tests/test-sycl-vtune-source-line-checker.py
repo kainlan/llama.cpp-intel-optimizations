@@ -639,3 +639,36 @@ def test_checker_rejects_sampled_pc_line_cost_without_positive_samples() -> None
         assert "source_line.sampled_source_line_rows 0" in result.stdout
         assert "source_line.source_attribution_mode none" in result.stdout
         assert "source_line.status fail" in result.stdout
+
+
+def test_checker_rejects_contradictory_sampled_pc_schema() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        sections = tmp / "sections.txt"
+        sampled_csv = tmp / "sampled-source.csv"
+        sections.write_text("[12] .debug_line PROGBITS\n", encoding="utf-8")
+        sampled_csv.write_text(
+            "Source Line,Source File,Source File Path,Source Computing Task,Sample Count,Sample Kind,Source Attribution Mode,Source Attribution Status,sample_count,kernel\n"
+            "/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp:6800,mmvq.cpp,/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp,mxfp4_pair_glu_xmx_tiled,7,cycles,sampled-pc-line,asm_line_static_cost,7,mxfp4_pair_glu_xmx_tiled\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(CHECKER),
+                "--readelf-sections",
+                str(sections),
+                "--sampled-source-lines-csv",
+                str(sampled_csv),
+                "--require-kernel",
+                "mxfp4_pair_glu_xmx_tiled",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        assert result.returncode == 2
+        assert "source_line.sampled_source_line_rows 0" in result.stdout
+        assert "source_line.source_attribution_mode none" in result.stdout
+        assert "source_line.status fail" in result.stdout

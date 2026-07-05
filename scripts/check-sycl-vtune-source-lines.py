@@ -71,7 +71,7 @@ def row_is_asm_line_static(row: dict[str, str]) -> bool:
 def row_is_sampled_pc_line(row: dict[str, str]) -> bool:
     return (
         row_attribution_mode(row) == SAMPLED_PC_ATTRIBUTION_MODE
-        or row.get("Source Attribution Status", "").strip() == SAMPLED_PC_ATTRIBUTION_STATUS
+        and row.get("Source Attribution Status", "").strip() == SAMPLED_PC_ATTRIBUTION_STATUS
     )
 
 

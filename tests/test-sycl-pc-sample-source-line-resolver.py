@@ -46,7 +46,7 @@ def test_sample_resolver_maps_pc_samples_to_source_lines() -> None:
         samples.write_text(
             "kernel,pc,sample_count,sample_kind\n"
             "target_kernel,64,7,cycles\n"
-            "target_kernel,80,3,cycles\n",
+            "target_kernel,0x80,3,cycles\n",
             encoding="utf-8",
         )
         result = run_resolver(
@@ -62,6 +62,34 @@ def test_sample_resolver_maps_pc_samples_to_source_lines() -> None:
         assert rows[0]["Source Attribution Mode"] == "sampled-pc-line"
         assert rows[0]["Source Attribution Status"] == "sampled_line_cost"
         assert rows[0]["Sample Count"] == "7"
+        assert rows[0]["Source Line"].endswith("mmvq.cpp:6800")
+        assert rows[1]["Sample Count"] == "3"
+        assert rows[1]["Source Line"].endswith("mmvq.cpp:6801")
+
+
+def test_sample_resolver_keeps_bare_numeric_pc_decimal() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        dwarf = write_dwarf(tmp)
+        samples = tmp / "pc-samples.csv"
+        samples.write_text(
+            "kernel,pc,sample_count,sample_kind\n"
+            "target_kernel,64,7,cycles\n"
+            "target_kernel,80,3,cycles\n",
+            encoding="utf-8",
+        )
+        result = run_resolver(
+            "--dwarf-line-dump",
+            str(dwarf),
+            "--pc-samples",
+            str(samples),
+            "--source-computing-task",
+            "target_kernel",
+        )
+        assert result.returncode == 0, result.stdout
+        rows = list(csv.DictReader(io.StringIO(result.stdout)))
+        assert len(rows) == 1
+        assert rows[0]["Sample Count"] == "10"
         assert rows[0]["Source Line"].endswith("mmvq.cpp:6800")
 
 

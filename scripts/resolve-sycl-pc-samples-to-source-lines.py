@@ -41,7 +41,6 @@ class ResolveError(ValueError):
 class PcSample:
     kernel: str
     pc: int
-    pc_raw: str
     sample_count: int
     sample_kind: str
 
@@ -130,12 +129,10 @@ def load_samples(path: pathlib.Path, source_computing_task: str) -> list[PcSampl
             sample_count = parse_int(row["sample_count"], "sample_count")
             if sample_count <= 0:
                 raise ResolveError("sample_count must be positive")
-            pc_raw = row["pc"].strip()
             samples.append(
                 PcSample(
                     kernel=kernel,
-                    pc=parse_int(pc_raw, "pc"),
-                    pc_raw=pc_raw,
+                    pc=parse_int(row["pc"], "pc"),
                     sample_count=sample_count,
                     sample_kind=sample_kind,
                 )
@@ -168,29 +165,14 @@ def source_row_for_pc(source_rows: list[Any], addresses: list[int], pc: int) -> 
     return source_rows[index]
 
 
-def sample_pc_for_addresses(sample: PcSample, address_set: set[int]) -> int:
-    text = sample.pc_raw.strip().lower()
-    if text.startswith("0x") or not text:
-        return sample.pc
-    try:
-        hex_pc = int(text, 16)
-    except ValueError:
-        return sample.pc
-    if sample.pc not in address_set and hex_pc in address_set:
-        return hex_pc
-    return sample.pc
-
-
 def aggregate_rows(source_rows: list[Any], samples: list[PcSample], require_source_path: str) -> tuple[list[LineAggregate], int, int]:
     addresses = [parse_int(row.address, "DWARF address") for row in source_rows]
-    address_set = set(addresses)
     aggregates: dict[tuple[str, int, str], LineAggregate] = {}
     mapped = 0
     unmapped = 0
 
     for sample in samples:
-        pc = sample_pc_for_addresses(sample, address_set)
-        source_row = source_row_for_pc(source_rows, addresses, pc)
+        source_row = source_row_for_pc(source_rows, addresses, sample.pc)
         if source_row is None:
             unmapped += sample.sample_count
             continue
