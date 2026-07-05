@@ -13,6 +13,9 @@ UNKNOWN_VALUES = {"", "[Unknown]", "[Unknown source file]"}
 DWARF_ATTRIBUTION_MODE = "dwarf-line-table"
 VTUNE_ATTRIBUTION_MODE = "vtune-sampled-exact"
 DEBUG_LINE_SECTION_RE = re.compile(r"(?m)^\s*\[\s*\d+\]\s+\.debug_line(?:\s|$)")
+NO_GPU_SIDE_TRACE_RE = re.compile(r"no GPU-side trace.{0,120}data was collected", re.IGNORECASE | re.DOTALL)
+GTPIN_NO_KERNELS_RE = re.compile(r"GTPin didn't find any kernels", re.IGNORECASE)
+GTPIN_REGISTER_PRESSURE_RE = re.compile(r"Not enough free registers", re.IGNORECASE)
 
 
 def load_line_table_parser() -> Any:
@@ -93,6 +96,13 @@ def parse_dwarf_line_table(module: Any, text: str, require_path: str | None) -> 
         raise
 
 
+def read_optional_text(paths: list[pathlib.Path]) -> str:
+    chunks: list[str] = []
+    for path in paths:
+        chunks.append(path.read_text(encoding="utf-8", errors="replace"))
+    return "\n".join(chunks)
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Check VTune GPU source-line feasibility for SYCL kernels")
     parser.add_argument("--readelf-sections", required=True, type=pathlib.Path)
@@ -110,6 +120,8 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="allow DWARF line-table CSV rows to pass with source_line.status dwarf-line-table-only when VTune rows are unavailable",
     )
+    parser.add_argument("--vtune-stdout", action="append", default=[], type=pathlib.Path)
+    parser.add_argument("--vtune-stderr", action="append", default=[], type=pathlib.Path)
     args = parser.parse_args(argv)
 
     if args.vtune_csv is None and not (args.allow_dwarf_line_table_only and args.dwarf_source_lines_csv is not None):
@@ -117,6 +129,10 @@ def main(argv: list[str]) -> int:
         return 2
 
     try:
+        vtune_log_text = read_optional_text([*args.vtune_stdout, *args.vtune_stderr])
+        vtune_no_gpu_side_trace = NO_GPU_SIDE_TRACE_RE.search(vtune_log_text) is not None
+        gtpin_no_kernels = GTPIN_NO_KERNELS_RE.search(vtune_log_text) is not None
+        gtpin_register_pressure = GTPIN_REGISTER_PRESSURE_RE.search(vtune_log_text) is not None
         sections = args.readelf_sections.read_text(encoding="utf-8", errors="replace")
         debug_line_present = DEBUG_LINE_SECTION_RE.search(sections) is not None
         non_unknown_rows = 0
@@ -162,12 +178,17 @@ def main(argv: list[str]) -> int:
         blocker = "none"
         status = "dwarf-line-table-only"
         source_attribution_mode = DWARF_ATTRIBUTION_MODE
+    elif vtune_no_gpu_side_trace:
+        blocker = "vtune_no_gpu_side_trace"
     else:
         blocker = "vtune_unknown_source"
 
     print(f"source_line.debug_line_present {1 if debug_line_present else 0}")
     print(f"source_line.non_unknown_rows {non_unknown_rows}")
     print(f"source_line.vtune_sampled_non_unknown_rows {non_unknown_rows}")
+    print(f"source_line.vtune_no_gpu_side_trace {1 if vtune_no_gpu_side_trace else 0}")
+    print(f"source_line.gtpin_no_kernels {1 if gtpin_no_kernels else 0}")
+    print(f"source_line.gtpin_register_pressure {1 if gtpin_register_pressure else 0}")
     if args.require_kernel is not None:
         print(f"source_line.required_kernel {args.require_kernel}")
     if args.dwarf_line_dump is not None:

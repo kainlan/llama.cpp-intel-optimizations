@@ -316,7 +316,7 @@ run_vtune_source_stage() {
         printf '#   matrix outputs: %s/source-line-matrix/build-matrix/<case>/source-line-feasibility.parse\n' "${root}"
         printf '#   matrix outputs: %s/source-line-matrix/build-matrix/<case>/zebin-debug-sections.txt\n' "${root}"
         printf '#   matrix outputs: %s/source-line-matrix/build-matrix/<case>/vtune-gpu-source-line.csv\n' "${root}"
-        printf '#   selection: prefer source_line.status pass; else source_line.blocker vtune_unknown_source; else first source-line-feasibility.parse\n'
+        printf '#   selection: prefer source_line.status pass; else source_line.blocker vtune_no_gpu_side_trace or vtune_unknown_source; else first source-line-feasibility.parse\n'
         printf 'cp %q %q\n' "${root}/source-line-matrix/build-matrix/<selected-case>/source-line-feasibility.parse" "${root}/source-line.parse"
         printf 'python3 %q --source-csv %q >%q\n' "scripts/parse-sycl-vtune-exports.py" "${root}/source-line-matrix/build-matrix/<selected-case>/vtune-gpu-source-line.csv" "${root}/vtune.parse"
         return 0
@@ -331,6 +331,7 @@ run_vtune_source_stage() {
 
     local matrix_root
     local selected_parse=""
+    local vtune_no_gpu_trace_parse=""
     local vtune_unknown_parse=""
     local fallback_parse=""
     local parse
@@ -352,12 +353,17 @@ run_vtune_source_stage() {
             selected_parse="${parse}"
             break
         fi
+        if [[ -z "${vtune_no_gpu_trace_parse}" ]] && grep -qx 'source_line.blocker vtune_no_gpu_side_trace' "${parse}"; then
+            vtune_no_gpu_trace_parse="${parse}"
+        fi
         if [[ -z "${vtune_unknown_parse}" ]] && grep -qx 'source_line.blocker vtune_unknown_source' "${parse}"; then
             vtune_unknown_parse="${parse}"
         fi
     done
     if [[ -z "${selected_parse}" ]]; then
-        if [[ -n "${vtune_unknown_parse}" ]]; then
+        if [[ -n "${vtune_no_gpu_trace_parse}" ]]; then
+            selected_parse="${vtune_no_gpu_trace_parse}"
+        elif [[ -n "${vtune_unknown_parse}" ]]; then
             selected_parse="${vtune_unknown_parse}"
         else
             selected_parse="${fallback_parse}"

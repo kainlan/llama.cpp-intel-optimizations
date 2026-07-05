@@ -168,7 +168,7 @@ print_parse_plan() {
     printf 'python3 %q --kernel-csv %q --source-csv %q >%q\n' "scripts/parse-sycl-vtune-exports.py" "${vtune_kernel_csv}" "${vtune_source_csv}" "${parsed_dir}/vtune.parse"
     printf 'python3 %q --timeline %q --kernel-profile %q --l0-summary %q --ur-summary %q --vtune-summary %q --bench-stderr %q >%q\n' "scripts/parse-sycl-layer-ledger.py" "${raw_timeline}" "${raw_kernel_csv}" "${parsed_dir}/l0.parse" "${parsed_dir}/ur.parse" "${parsed_dir}/vtune.parse" "${OUT_ROOT}/bench.stderr" "${parsed_dir}/layer-ledger.parse"
     printf 'bash %q --execute --i-understand-this-runs-gpu-source-probe --out-root %q --device-selector %q\n' "scripts/sycl-source-line-debug-matrix.sh" "${source_line_dir}" "${DEVICE_SELECTOR}"
-    printf 'python3 %q --readelf-sections %q --vtune-csv %q --require-kernel %q >%q\n' "scripts/check-sycl-vtune-source-lines.py" "${source_line_sections}" "${source_line_vtune_csv}" "${source_line_probe_kernel}" "${parsed_dir}/source-line.parse"
+    printf 'python3 %q --readelf-sections %q --vtune-csv %q --require-kernel %q --vtune-stdout %q --vtune-stderr %q >%q\n' "scripts/check-sycl-vtune-source-lines.py" "${source_line_sections}" "${source_line_vtune_csv}" "${source_line_probe_kernel}" "${source_line_case}/probe.stdout" "${source_line_case}/probe.stderr" "${parsed_dir}/source-line.parse"
     printf 'if [[ -f %q && -f %q ]]; then python3 %q --cost-ranking %q --source-line %q --region-map %q >%q; else printf "source_attribution.status missing_parser\\nsource_attribution.blocker missing_parse_sycl_source_attribution_or_region_map\\n" >%q; fi\n' "scripts/parse-sycl-source-attribution.py" "${source_region_map}" "scripts/parse-sycl-source-attribution.py" "${parsed_dir}/kernel-cost.parse" "${parsed_dir}/source-line.parse" "${source_region_map}" "${parsed_dir}/source-attribution.parse" "${parsed_dir}/source-attribution.parse"
 }
 
@@ -251,7 +251,9 @@ python3 scripts/parse-sycl-layer-ledger.py \
 python3 scripts/check-sycl-vtune-source-lines.py \
     --readelf-sections "${source_line_sections}" \
     --vtune-csv "${source_line_vtune_csv}" \
-    --require-kernel "${source_line_probe_kernel}" >"${parsed_dir}/source-line.parse"
+    --require-kernel "${source_line_probe_kernel}" \
+    --vtune-stdout "${source_line_case}/probe.stdout" \
+    --vtune-stderr "${source_line_case}/probe.stderr" >"${parsed_dir}/source-line.parse"
 if [[ -f scripts/parse-sycl-source-attribution.py && -f "${source_region_map}" ]]; then
     python3 scripts/parse-sycl-source-attribution.py \
         --cost-ranking "${parsed_dir}/kernel-cost.parse" \

@@ -28,6 +28,8 @@ def test_source_line_feasibility_script_is_dry_run_by_default() -> None:
     assert "zebin-debug-line.txt" in result.stdout
     assert "--dwarf-line-dump" in result.stdout
     assert "--require-source-path" in result.stdout
+    assert "--vtune-stdout" in result.stdout
+    assert "--vtune-stderr" in result.stdout
     assert "check-sycl-vtune-source-lines.py" in result.stdout
     assert "/Storage" not in result.stdout
     assert "llama-bench" not in result.stdout
@@ -150,6 +152,8 @@ def test_source_line_feasibility_execute_branch_writes_expected_artifacts() -> N
     assert "scripts/parse-sycl-vtune-tasks.py" in text
     assert "scripts/check-sycl-vtune-source-lines.py" in text
     assert "--dwarf-line-dump" in text
+    assert "--vtune-stdout" in text
+    assert "--vtune-stderr" in text
     assert "--require-source-path \"ggml/src/ggml-sycl/mmvq.cpp\"" in text
     assert "REQUIRE_MATRIX_PASS" in text
     assert "! grep -qx \"source_line.status pass\" \"${REQUIRE_MATRIX_PASS}\"" in text

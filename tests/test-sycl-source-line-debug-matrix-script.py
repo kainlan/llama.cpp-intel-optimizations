@@ -28,6 +28,8 @@ def test_debug_matrix_script_is_dry_run_by_default() -> None:
     assert "zebin-debug-line.txt" in result.stdout
     assert "--dwarf-line-dump" in result.stdout
     assert "--require-source-path main.cpp" in result.stdout
+    assert "--vtune-stdout" in result.stdout
+    assert "--vtune-stderr" in result.stdout
     assert "tools/sycl-source-line-probe/main.cpp" not in result.stdout
     assert "computing-tasks-of-interest" not in result.stdout
     assert "/Storage" not in result.stdout
@@ -106,7 +108,9 @@ def test_debug_matrix_requires_probe_dwarf_basename() -> None:
     text = script_text()
     assert '"tools/sycl-source-line-probe/main.cpp"' not in text
     assert '--require-source-path "main.cpp"' in text
-    assert '"main.cpp" "${dir}/source-line-feasibility.parse"' in text
+    assert '--require-source-path "main.cpp" \\' in text
+    assert '--vtune-stdout "${dir}/probe.stdout" \\' in text
+    assert '--vtune-stderr "${dir}/probe.stderr" >"${dir}/source-line-feasibility.parse"' in text
 
 
 def test_debug_matrix_execute_branch_writes_expected_artifacts() -> None:
@@ -123,6 +127,8 @@ def test_debug_matrix_execute_branch_writes_expected_artifacts() -> None:
         "check-sycl-vtune-source-lines.py",
         "--dwarf-line-dump",
         "--require-source-path",
+        "--vtune-stdout",
+        "--vtune-stderr",
         "VTune gpu-source-line report failed",
         "source-line checker reported failure",
         "set +u",

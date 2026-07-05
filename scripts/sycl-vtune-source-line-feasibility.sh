@@ -78,7 +78,7 @@ print_plan() {
     printf 'readelf -S %q > %q\n' "${vtune_dir}/data.0/<first-zebin>" "${OUT_ROOT}/zebin-debug-sections.txt"
     printf 'llvm-dwarfdump --debug-line %q > %q\n' "${vtune_dir}/data.0/<first-zebin>" "${OUT_ROOT}/zebin-debug-line.txt"
     printf 'vtune -report hotspots -r %q -group-by gpu-source-line -format csv > %q\n' "${vtune_dir}" "${OUT_ROOT}/vtune-gpu-source-line.csv"
-    printf 'python3 scripts/check-sycl-vtune-source-lines.py --readelf-sections %q --vtune-csv %q --require-kernel %q --dwarf-line-dump %q --require-source-path %q > %q\n' "${OUT_ROOT}/zebin-debug-sections.txt" "${OUT_ROOT}/vtune-gpu-source-line.csv" "${TARGET_KERNEL}" "${OUT_ROOT}/zebin-debug-line.txt" "ggml/src/ggml-sycl/mmvq.cpp" "${OUT_ROOT}/source-line-feasibility.parse"
+    printf 'python3 scripts/check-sycl-vtune-source-lines.py --readelf-sections %q --vtune-csv %q --require-kernel %q --dwarf-line-dump %q --require-source-path %q --vtune-stdout %q --vtune-stderr %q > %q\n' "${OUT_ROOT}/zebin-debug-sections.txt" "${OUT_ROOT}/vtune-gpu-source-line.csv" "${TARGET_KERNEL}" "${OUT_ROOT}/zebin-debug-line.txt" "ggml/src/ggml-sycl/mmvq.cpp" "${OUT_ROOT}/bench.stdout" "${OUT_ROOT}/bench.stderr" "${OUT_ROOT}/source-line-feasibility.parse"
 }
 
 if [[ "${EXECUTE}" -ne 1 ]]; then
@@ -133,5 +133,7 @@ python3 scripts/check-sycl-vtune-source-lines.py \
     --vtune-csv "${OUT_ROOT}/vtune-gpu-source-line.csv" \
     --require-kernel "${TARGET_KERNEL}" \
     --dwarf-line-dump "${OUT_ROOT}/zebin-debug-line.txt" \
-    --require-source-path "ggml/src/ggml-sycl/mmvq.cpp" >"${OUT_ROOT}/source-line-feasibility.parse"
+    --require-source-path "ggml/src/ggml-sycl/mmvq.cpp" \
+    --vtune-stdout "${OUT_ROOT}/bench.stdout" \
+    --vtune-stderr "${OUT_ROOT}/bench.stderr" >"${OUT_ROOT}/source-line-feasibility.parse"
 printf 'Artifacts: %s\n' "${OUT_ROOT}"

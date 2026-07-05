@@ -58,7 +58,7 @@ def test_vtune_source_dry_run_reports_matrix_artifact_contract(tmp_path: Path) -
     assert "source-line-matrix/build-matrix/<case>/zebin-debug-sections.txt" in result.stdout
     assert "source-line-matrix/build-matrix/<case>/vtune-gpu-source-line.csv" in result.stdout
     assert "source_line.status pass" in result.stdout
-    assert "source_line.blocker vtune_unknown_source" in result.stdout
+    assert "source_line.blocker vtune_no_gpu_side_trace or vtune_unknown_source" in result.stdout
     assert "exported-kernels.csv" not in result.stdout
     assert "exported-source-lines.csv" not in result.stdout
     assert "source-line-matrix/readelf-sections.txt" not in result.stdout
@@ -73,6 +73,7 @@ def test_vtune_source_execute_branch_consumes_matrix_artifacts() -> None:
         "source-line-feasibility.parse",
         "vtune-gpu-source-line.csv",
         "source_line.status pass",
+        "source_line.blocker vtune_no_gpu_side_trace",
         "source_line.blocker vtune_unknown_source",
         "found no matrix source-line-feasibility.parse files",
         "cp \"${selected_parse}\" \"${root}/source-line.parse\"",

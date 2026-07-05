@@ -138,7 +138,45 @@ def test_checker_reports_empty_vtune_csv_as_unknown_source_without_traceback() -
         assert result.returncode == 2
         assert "source_line.debug_line_present 1" in result.stdout
         assert "source_line.non_unknown_rows 0" in result.stdout
+        assert "source_line.vtune_no_gpu_side_trace 0" in result.stdout
         assert "source_line.blocker vtune_unknown_source" in result.stdout
+        assert "source_line.status fail" in result.stdout
+        assert "Traceback" not in result.stdout
+
+
+def test_checker_reports_vtune_no_gpu_side_trace_from_logs() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        sections = tmp / "sections.txt"
+        csv = tmp / "source.csv"
+        stdout = tmp / "probe.stdout"
+        stderr = tmp / "probe.stderr"
+        sections.write_text("[12] .debug_line PROGBITS\n", encoding="utf-8")
+        csv.write_text("", encoding="utf-8")
+        stdout.write_text(
+            '"Trace GPU programming APIs" option was turned ON, but no GPU-side trace data was collected.\n',
+            encoding="utf-8",
+        )
+        stderr.write_text(
+            "GTPin: kernel: Not enough free registers while memory-mapped registers (SREGs) are disabled\n"
+            "GTPin didn't find any kernels... Exiting without doing anything.\n",
+            encoding="utf-8",
+        )
+        result = run_checker(
+            sections,
+            csv,
+            "--require-kernel",
+            "mxfp4_pair_glu_xmx_tiled",
+            "--vtune-stdout",
+            str(stdout),
+            "--vtune-stderr",
+            str(stderr),
+        )
+        assert result.returncode == 2
+        assert "source_line.vtune_no_gpu_side_trace 1" in result.stdout
+        assert "source_line.gtpin_no_kernels 1" in result.stdout
+        assert "source_line.gtpin_register_pressure 1" in result.stdout
+        assert "source_line.blocker vtune_no_gpu_side_trace" in result.stdout
         assert "source_line.status fail" in result.stdout
         assert "Traceback" not in result.stdout
 
