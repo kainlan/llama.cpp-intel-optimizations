@@ -220,16 +220,19 @@ fi
 if ! vtune -report hotspots -r "${vtune_dir}" -group-by gpu-source-line -format csv >"${OUT_ROOT}/vtune-gpu-source-line.csv"; then
     printf 'warning: VTune gpu-source-line report failed; checker will use explicit blockers and DWARF fallback if available\n' >&2
 fi
-python3 scripts/check-sycl-vtune-source-lines.py \
-    --readelf-sections "${OUT_ROOT}/zebin-debug-sections.txt" \
-    --vtune-csv "${OUT_ROOT}/vtune-gpu-source-line.csv" \
-    --require-kernel "${TARGET_KERNEL}" \
-    --asm-source-lines-csv "${OUT_ROOT}/asm-source-lines.csv" \
-    --allow-asm-line-static-cost \
-    --dwarf-line-dump "${OUT_ROOT}/zebin-debug-line.txt" \
-    --dwarf-source-lines-csv "${OUT_ROOT}/dwarf-source-lines.csv" \
-    --allow-dwarf-line-table-only \
-    --require-source-path "mmvq.cpp" \
-    --vtune-stdout "${OUT_ROOT}/bench.stdout" \
-    --vtune-stderr "${OUT_ROOT}/bench.stderr" >"${OUT_ROOT}/source-line-feasibility.parse"
+checker_args=(
+    --readelf-sections "${OUT_ROOT}/zebin-debug-sections.txt"
+    --vtune-csv "${OUT_ROOT}/vtune-gpu-source-line.csv"
+    --require-kernel "${TARGET_KERNEL}"
+    --dwarf-line-dump "${OUT_ROOT}/zebin-debug-line.txt"
+    --dwarf-source-lines-csv "${OUT_ROOT}/dwarf-source-lines.csv"
+    --allow-dwarf-line-table-only
+    --require-source-path "mmvq.cpp"
+    --vtune-stdout "${OUT_ROOT}/bench.stdout"
+    --vtune-stderr "${OUT_ROOT}/bench.stderr"
+)
+if [[ -f "${OUT_ROOT}/asm-source-lines.parse" ]] && grep -qx 'asm_source.status ok' "${OUT_ROOT}/asm-source-lines.parse"; then
+    checker_args+=(--asm-source-lines-csv "${OUT_ROOT}/asm-source-lines.csv" --allow-asm-line-static-cost)
+fi
+python3 scripts/check-sycl-vtune-source-lines.py "${checker_args[@]}" >"${OUT_ROOT}/source-line-feasibility.parse"
 printf 'Artifacts: %s\n' "${OUT_ROOT}"

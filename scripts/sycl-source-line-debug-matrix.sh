@@ -301,18 +301,21 @@ for index in "${!CASE_NAMES[@]}"; do
     if ! vtune -report hotspots -r "${vtune_dir}" -group-by gpu-source-line -format csv >"${dir}/vtune-gpu-source-line.csv"; then
         printf 'warning: VTune gpu-source-line report failed for matrix row %s; writing fail-closed checker output\n' "${name}" >>"${dir}/probe.stderr"
     fi
-    if ! python3 scripts/check-sycl-vtune-source-lines.py \
-        --readelf-sections "${dir}/zebin-debug-sections.txt" \
-        --vtune-csv "${dir}/vtune-gpu-source-line.csv" \
-        --require-kernel "${TARGET_KERNEL}" \
-        --asm-source-lines-csv "${dir}/asm-source-lines.csv" \
-        --allow-asm-line-static-cost \
-        --dwarf-line-dump "${dir}/zebin-debug-line.txt" \
-        --dwarf-source-lines-csv "${dir}/dwarf-source-lines.csv" \
-        --allow-dwarf-line-table-only \
-        --require-source-path "main.cpp" \
-        --vtune-stdout "${dir}/probe.stdout" \
-        --vtune-stderr "${dir}/probe.stderr" >"${dir}/source-line-feasibility.parse"; then
+    checker_args=(
+        --readelf-sections "${dir}/zebin-debug-sections.txt"
+        --vtune-csv "${dir}/vtune-gpu-source-line.csv"
+        --require-kernel "${TARGET_KERNEL}"
+        --dwarf-line-dump "${dir}/zebin-debug-line.txt"
+        --dwarf-source-lines-csv "${dir}/dwarf-source-lines.csv"
+        --allow-dwarf-line-table-only
+        --require-source-path "main.cpp"
+        --vtune-stdout "${dir}/probe.stdout"
+        --vtune-stderr "${dir}/probe.stderr"
+    )
+    if [[ -f "${dir}/asm-source-lines.parse" ]] && grep -qx 'asm_source.status ok' "${dir}/asm-source-lines.parse"; then
+        checker_args+=(--asm-source-lines-csv "${dir}/asm-source-lines.csv" --allow-asm-line-static-cost)
+    fi
+    if ! python3 scripts/check-sycl-vtune-source-lines.py "${checker_args[@]}" >"${dir}/source-line-feasibility.parse"; then
         printf 'warning: source-line checker reported failure for matrix row %s; see %s\n' "${name}" "${dir}/source-line-feasibility.parse" >&2
     fi
 done

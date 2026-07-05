@@ -131,13 +131,14 @@ def test_debug_matrix_requires_probe_dwarf_basename() -> None:
     text = script_text()
     assert '"tools/sycl-source-line-probe/main.cpp"' not in text
     assert '--require-source-path "main.cpp"' in text
-    assert '--require-source-path "main.cpp" \\' in text
-    assert '--asm-source-lines-csv "${dir}/asm-source-lines.csv" \\' in text
-    assert '--allow-asm-line-static-cost \\' in text
-    assert '--dwarf-source-lines-csv "${dir}/dwarf-source-lines.csv" \\' in text
-    assert '--allow-dwarf-line-table-only \\' in text
-    assert '--vtune-stdout "${dir}/probe.stdout" \\' in text
-    assert '--vtune-stderr "${dir}/probe.stderr" >"${dir}/source-line-feasibility.parse"' in text
+    assert '--require-source-path "main.cpp"' in text
+    assert 'grep -qx \'asm_source.status ok\' "${dir}/asm-source-lines.parse"' in text
+    assert 'checker_args+=(--asm-source-lines-csv "${dir}/asm-source-lines.csv" --allow-asm-line-static-cost)' in text
+    assert '--dwarf-source-lines-csv "${dir}/dwarf-source-lines.csv"' in text
+    assert '--allow-dwarf-line-table-only' in text
+    assert '--vtune-stdout "${dir}/probe.stdout"' in text
+    assert '--vtune-stderr "${dir}/probe.stderr"' in text
+    assert 'python3 scripts/check-sycl-vtune-source-lines.py "${checker_args[@]}" >"${dir}/source-line-feasibility.parse"' in text
 
 
 def test_debug_matrix_execute_branch_writes_expected_artifacts() -> None:
