@@ -7,29 +7,109 @@ import csv
 import json
 import pathlib
 import re
+from dataclasses import dataclass
 from typing import Any
 
 
+ADDRESS_PATTERNS = (
+    re.compile(r"^\s*(?:0x)?([0-9A-Fa-f]+):\s*(.*)$"),
+    re.compile(r"^\s*/\*\s*(?:0x)?([0-9A-Fa-f]+)\s*\*/\s*(.*)$"),
+    re.compile(r"^\s*\[\s*(?:0x)?([0-9A-Fa-f]+)\s*\]\s*(.*)$"),
+)
+
+
+@dataclass(frozen=True)
+class AsmInstruction:
+    address: int
+    opcode: str
+    text: str
+    raw: str
+    send_comment: str
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "address": self.address,
+            "address_hex": hex(self.address),
+            "opcode": self.opcode,
+            "text": self.text,
+            "raw": self.raw,
+            "send_comment": self.send_comment,
+        }
+
+
+def split_address(raw: str) -> tuple[int | None, str]:
+    for pattern in ADDRESS_PATTERNS:
+        match = pattern.match(raw)
+        if match:
+            return int(match.group(1), 16), match.group(2).strip()
+    return None, raw.strip()
+
+
+def strip_predicate(text: str) -> str:
+    return re.sub(r"^\([^)]*\)\s*", "", text.strip())
+
+
+def parse_opcode(text: str) -> str | None:
+    cleaned = strip_predicate(text)
+    match = re.match(r"([A-Za-z][A-Za-z0-9_.]*)", cleaned)
+    return match.group(1).lower() if match else None
+
+
+def extract_send_comment(raw: str) -> str:
+    if "//" not in raw:
+        return ""
+    comment = raw.split("//", 1)[1].strip()
+    return comment if comment.startswith("wr:") else ""
+
+
+def parse_asm_instructions_text(text: str) -> list[AsmInstruction]:
+    rows: list[AsmInstruction] = []
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("//") or stripped.endswith(":"):
+            continue
+        address, instruction_text = split_address(raw)
+        if address is None:
+            continue
+        opcode = parse_opcode(instruction_text)
+        if opcode is None:
+            continue
+        rows.append(
+            AsmInstruction(
+                address=address,
+                opcode=opcode,
+                text=instruction_text,
+                raw=raw.rstrip("\n"),
+                send_comment=extract_send_comment(raw),
+            )
+        )
+    return rows
+
+
 def parse_asm(path: pathlib.Path) -> dict[str, Any]:
+    text = path.read_text(encoding="utf-8", errors="replace")
     opcodes: collections.Counter[str] = collections.Counter()
     send_comments: collections.Counter[str] = collections.Counter()
-    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("//") or line.endswith(":"):
             continue
-        line = re.sub(r"^\([^)]*\)\s*", "", line)
-        match = re.match(r"([A-Za-z][A-Za-z0-9_.]*)", line)
-        if match:
-            opcodes[match.group(1).lower()] += 1
-        if "//" in raw:
-            comment = raw.split("//", 1)[1].strip()
-            if comment.startswith("wr:"):
-                send_comments[comment] += 1
+        _, instruction_text = split_address(raw)
+        opcode = parse_opcode(instruction_text)
+        if opcode:
+            opcodes[opcode] += 1
+        send_comment = extract_send_comment(raw)
+        if send_comment:
+            send_comments[send_comment] += 1
     return {
         "path": str(path),
         "opcodes": dict(sorted(opcodes.items())),
         "send_comments": dict(sorted(send_comments.items())),
     }
+
+
+def parse_asm_instructions(path: pathlib.Path) -> list[AsmInstruction]:
+    return parse_asm_instructions_text(path.read_text(encoding="utf-8", errors="replace"))
 
 
 def classify_bound(opcodes: dict[str, int]) -> dict[str, Any]:
@@ -93,6 +173,7 @@ def main() -> int:
     parser.add_argument("--asm", action="append", default=[], help="ocloc/IGA assembly file to summarize")
     parser.add_argument("--instr-tsv", action="append", default=[], help="VTune instruction-count TSV report")
     parser.add_argument("--classify-bound", action="store_true")
+    parser.add_argument("--emit-instructions", action="store_true", help="emit addressed assembly instruction rows")
     args = parser.parse_args()
 
     output: dict[str, Any] = {}
@@ -102,6 +183,11 @@ def main() -> int:
             for summary in summaries:
                 summary["bound"] = classify_bound(summary.get("opcodes", {}))
         output["asm"] = summaries[0] if len(summaries) == 1 else summaries
+        if args.emit_instructions:
+            instruction_rows: list[dict[str, Any]] = []
+            for path in args.asm:
+                instruction_rows.extend(row.to_json() for row in parse_asm_instructions(pathlib.Path(path)))
+            output["instructions"] = instruction_rows
     if args.instr_tsv:
         rows: list[dict[str, Any]] = []
         for path in args.instr_tsv:
