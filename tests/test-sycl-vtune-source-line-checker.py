@@ -575,6 +575,91 @@ def test_checker_prefers_asm_static_cost_over_dwarf_line_table_only() -> None:
         assert "source_line.status dwarf-line-table-only" not in result.stdout
 
 
+def test_checker_accepts_gtpin_bbl_runtime_cost_with_explicit_flag() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        sections = tmp / "sections.txt"
+        gtpin_csv = tmp / "gtpin-bbl-source.csv"
+        sections.write_text("[12] .debug_line PROGBITS\n", encoding="utf-8")
+        gtpin_csv.write_text(
+            "Source Line,Source File,Source File Path,Source Computing Task,Sample Count,Sample Kind,Source Attribution Mode,Source Attribution Status,sample_count,kernel\n"
+            "/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp:7233,mmvq.cpp,/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp,mxfp4_pair_glu_xmx_tiled,720,gtpin-bbl-instruction-exec-count,gtpin-bbl-line,gtpin_bbl_runtime_cost,720,mxfp4_pair_glu_xmx_tiled\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(CHECKER),
+                "--readelf-sections",
+                str(sections),
+                "--gtpin-bbl-source-lines-csv",
+                str(gtpin_csv),
+                "--allow-gtpin-bbl-runtime-cost",
+                "--require-kernel",
+                "mxfp4_pair_glu_xmx_tiled",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout
+        assert "source_line.non_unknown_rows 0" in result.stdout
+        assert "source_line.vtune_sampled_non_unknown_rows 0" in result.stdout
+        assert "source_line.gtpin_bbl_source_line_rows 1" in result.stdout
+        assert "source_line.allow_gtpin_bbl_runtime_cost 1" in result.stdout
+        assert "source_line.gtpin_bbl_top_source_line /Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp:7233" in result.stdout
+        assert "source_line.gtpin_bbl_top_sample_count 720" in result.stdout
+        assert "source_line.source_attribution_mode gtpin-bbl-line" in result.stdout
+        assert "source_line.status gtpin-bbl-runtime-cost" in result.stdout
+
+
+def test_checker_requires_explicit_allow_for_gtpin_bbl_runtime_cost() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        sections = tmp / "sections.txt"
+        vtune_csv = tmp / "vtune.csv"
+        gtpin_csv = tmp / "gtpin-bbl-source.csv"
+        sections.write_text("[12] .debug_line PROGBITS\n", encoding="utf-8")
+        vtune_csv.write_text("Source Line\tSource Computing Task\n[Unknown]\tmxfp4_pair_glu_xmx_tiled\n", encoding="utf-8")
+        gtpin_csv.write_text(
+            "Source Line,Source File,Source File Path,Source Computing Task,Sample Count,Sample Kind,Source Attribution Mode,Source Attribution Status,sample_count,kernel\n"
+            "/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp:7233,mmvq.cpp,/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp,mxfp4_pair_glu_xmx_tiled,720,gtpin-bbl-instruction-exec-count,gtpin-bbl-line,gtpin_bbl_runtime_cost,720,mxfp4_pair_glu_xmx_tiled\n",
+            encoding="utf-8",
+        )
+        result = run_checker(
+            sections,
+            vtune_csv,
+            "--gtpin-bbl-source-lines-csv",
+            str(gtpin_csv),
+            "--require-kernel",
+            "mxfp4_pair_glu_xmx_tiled",
+        )
+        assert result.returncode == 2
+        assert "source_line.gtpin_bbl_source_line_rows 1" in result.stdout
+        assert "source_line.allow_gtpin_bbl_runtime_cost 0" in result.stdout
+        assert "source_line.source_attribution_mode none" in result.stdout
+        assert "source_line.status fail" in result.stdout
+
+
+def test_checker_does_not_promote_gtpin_bbl_csv_to_vtune_pass() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        sections = tmp / "sections.txt"
+        csv = tmp / "source.csv"
+        sections.write_text("[12] .debug_line PROGBITS\n", encoding="utf-8")
+        csv.write_text(
+            "Source Line,Source Computing Task,Source Attribution Mode,Source Attribution Status\n"
+            "mmvq.cpp:7233,mxfp4_pair_glu_xmx_tiled,gtpin-bbl-line,gtpin_bbl_runtime_cost\n",
+            encoding="utf-8",
+        )
+        result = run_checker(sections, csv, "--require-kernel", "mxfp4_pair_glu_xmx_tiled")
+        assert result.returncode == 2
+        assert "source_line.non_unknown_rows 0" in result.stdout
+        assert "source_line.source_attribution_mode none" in result.stdout
+        assert "source_line.status fail" in result.stdout
+
+
 def test_checker_accepts_sampled_pc_line_cost_from_positive_samples() -> None:
     with tempfile.TemporaryDirectory() as tmp_raw:
         tmp = pathlib.Path(tmp_raw)

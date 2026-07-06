@@ -5,6 +5,8 @@ EXECUTE=0
 ACK=0
 OUT_ROOT="pc-sampling-capability"
 DEVICE_SELECTOR=""
+VTUNE_GTPIN="/opt/intel/oneapi/vtune/2025.10/bin64/gma/GTPin/Profilers/Bin/gtpin"
+VTUNE_MEMORYTRACE="/opt/intel/oneapi/vtune/2025.10/bin64/gma/GTPin/Profilers/Examples/intel64/memorytrace.so"
 
 usage() {
     printf 'usage: %s [--dry-run|--execute] [--i-understand-this-probes-intel-gpu-pc-sampling] [--out-root DIR] [--device-selector SELECTOR]\n' "$0"
@@ -41,8 +43,10 @@ print_probe_commands() {
     cat <<'EOF'
 vtune -help collect gpu-hotspots >"${OUT_ROOT}/vtune-gpu-hotspots-help.txt" 2>&1 || true
 vtune -help report gpu-source-line >"${OUT_ROOT}/vtune-gpu-source-line-help.txt" 2>&1 || true
-command -v gtpin64 || command -v gtpin || true
-if command -v gtpin64 >/dev/null 2>&1; then gtpin64 --help >"${OUT_ROOT}/gtpin-help.txt" 2>&1 || true; elif command -v gtpin >/dev/null 2>&1; then gtpin --help >"${OUT_ROOT}/gtpin-help.txt" 2>&1 || true; fi
+command -v gtpin64 || command -v gtpin || true  # PATH-only discovery; embedded VTune GTPin is checked below.
+{ command -v gtpin64 || true; command -v gtpin || true; for candidate in /opt/intel/oneapi/vtune/2025.10/bin64/gma/GTPin/Profilers/Bin/gtpin; do [[ -x "${candidate}" ]] && printf '%s\n' "${candidate}"; done; } >"${OUT_ROOT}/gtpin-path.txt"
+for candidate in $(cat "${OUT_ROOT}/gtpin-path.txt"); do "${candidate}" --help >"${OUT_ROOT}/gtpin-help.txt" 2>&1 && break || true; done
+for candidate in /opt/intel/oneapi/vtune/2025.10/bin64/gma/GTPin/Profilers/Examples/intel64/memorytrace.so; do [[ -f "${candidate}" ]] && printf '%s\n' "${candidate}"; done >"${OUT_ROOT}/gtpin-memorytrace-path.txt"
 find /opt/intel/oneapi -iname '*pti*' -o -iname 'libpti*' >"${OUT_ROOT}/pti-files.txt" 2>&1 || true
 ZET_ENABLE_METRICS="${ZET_ENABLE_METRICS:-1}" python3 - <<'PY' >"${OUT_ROOT}/level-zero-metric-groups.txt" 2>&1 || true
 import ctypes
@@ -241,6 +245,14 @@ level_zero_ip_metrics_found() {
     file_has_content "${path}" && grep -Eq '^ip_metric_count [1-9][0-9]*' "${path}"
 }
 
+gtpin_paths_found() {
+    file_has_content "${OUT_ROOT}/gtpin-path.txt"
+}
+
+gtpin_memorytrace_found() {
+    file_has_content "${OUT_ROOT}/gtpin-memorytrace-path.txt"
+}
+
 vtune_gpu_hotspots_supported() {
     local path="${OUT_ROOT}/vtune-gpu-hotspots-help.txt"
     file_has_content "${path}" && grep -Eiq 'gpu-hotspots|GPU Hotspots|hotspots' "${path}" && ! grep -Eiq 'command not found|not recognized' "${path}"
@@ -259,10 +271,17 @@ write_parse() {
         blockers+=("no_public_pc_sample_api_confirmed")
         blockers+=("vtune_source_rows_empty")
 
-        if ! file_has_content "${OUT_ROOT}/gtpin-path.txt"; then
+        if ! gtpin_paths_found; then
             blockers+=("gtpin_not_found")
         elif grep -Eiq 'unsupported|not supported' "${OUT_ROOT}/gtpin-help.txt" 2>/dev/null; then
             blockers+=("gtpin_unsupported")
+        else
+            metrics_evidence=1
+            if gtpin_memorytrace_found; then
+                blockers+=("gtpin_memorytrace_available_but_not_sampled_pc")
+            else
+                blockers+=("gtpin_framework_present_but_no_profiler_plugin")
+            fi
         fi
         if grep -Eiq 'register[ -]?pressure|spill' "${OUT_ROOT}/gtpin-help.txt" 2>/dev/null; then
             blockers+=("gtpin_register_pressure_failure")
@@ -299,7 +318,7 @@ write_parse() {
             printf 'pc_sampling.device_selector %s\n' "${DEVICE_SELECTOR}"
         fi
         printf 'pc_sampling.pc_samples_csv %s\n' "${pc_samples}"
-        printf 'pc_sampling.note Level Zero metric groups/properties are capability evidence only, not PC samples.\n'
+        printf 'pc_sampling.note Level Zero metric groups/properties and GTPin framework discovery are capability evidence only, not sampled PC rows.\n'
         local blocker
         local seen=""
         for blocker in "${blockers[@]}"; do
@@ -320,8 +339,22 @@ run_execute() {
 
     vtune -help collect gpu-hotspots >"${OUT_ROOT}/vtune-gpu-hotspots-help.txt" 2>&1 || true
     vtune -help report gpu-source-line >"${OUT_ROOT}/vtune-gpu-source-line-help.txt" 2>&1 || true
-    (command -v gtpin64 || command -v gtpin || true) >"${OUT_ROOT}/gtpin-path.txt"
-    if command -v gtpin64 >/dev/null 2>&1; then gtpin64 --help >"${OUT_ROOT}/gtpin-help.txt" 2>&1 || true; elif command -v gtpin >/dev/null 2>&1; then gtpin --help >"${OUT_ROOT}/gtpin-help.txt" 2>&1 || true; fi
+    {
+        command -v gtpin64 || true
+        command -v gtpin || true
+        if [[ -x "${VTUNE_GTPIN}" ]]; then
+            printf '%s\n' "${VTUNE_GTPIN}"
+        fi
+    } >"${OUT_ROOT}/gtpin-path.txt"
+    while IFS= read -r candidate; do
+        [[ -n "${candidate}" ]] || continue
+        "${candidate}" --help >"${OUT_ROOT}/gtpin-help.txt" 2>&1 && break || true
+    done <"${OUT_ROOT}/gtpin-path.txt"
+    if [[ -f "${VTUNE_MEMORYTRACE}" ]]; then
+        printf '%s\n' "${VTUNE_MEMORYTRACE}" >"${OUT_ROOT}/gtpin-memorytrace-path.txt"
+    else
+        : >"${OUT_ROOT}/gtpin-memorytrace-path.txt"
+    fi
     find /opt/intel/oneapi -iname '*pti*' -o -iname 'libpti*' >"${OUT_ROOT}/pti-files.txt" 2>&1 || true
     ZET_ENABLE_METRICS="${ZET_ENABLE_METRICS:-1}" python3 - <<'PY' >"${OUT_ROOT}/level-zero-metric-groups.txt" 2>&1 || true
 import ctypes

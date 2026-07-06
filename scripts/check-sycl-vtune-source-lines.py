@@ -15,6 +15,8 @@ ASM_ATTRIBUTION_MODE = "asm-line-static"
 ASM_ATTRIBUTION_STATUS = "asm_line_static_cost"
 SAMPLED_PC_ATTRIBUTION_MODE = "sampled-pc-line"
 SAMPLED_PC_ATTRIBUTION_STATUS = "sampled_line_cost"
+GTPIN_BBL_ATTRIBUTION_MODE = "gtpin-bbl-line"
+GTPIN_BBL_ATTRIBUTION_STATUS = "gtpin_bbl_runtime_cost"
 VTUNE_ATTRIBUTION_MODE = "vtune-sampled-exact"
 DEBUG_LINE_SECTION_RE = re.compile(r"(?m)^\s*\[\s*\d+\]\s+\.debug_line(?:\s|$)")
 NO_GPU_SIDE_TRACE_RE = re.compile(r"no GPU-side trace.{0,120}data was collected", re.IGNORECASE | re.DOTALL)
@@ -68,6 +70,7 @@ def row_is_dwarf_line_table(row: dict[str, str]) -> bool:
     return row_attribution_mode(row) == DWARF_ATTRIBUTION_MODE and row_attribution_status(row) not in {
         ASM_ATTRIBUTION_STATUS,
         SAMPLED_PC_ATTRIBUTION_STATUS,
+        GTPIN_BBL_ATTRIBUTION_STATUS,
     }
 
 
@@ -83,12 +86,17 @@ def row_is_sampled_pc_line(row: dict[str, str]) -> bool:
     return row_attribution_mode(row) == SAMPLED_PC_ATTRIBUTION_MODE and row_attribution_status(row) == SAMPLED_PC_ATTRIBUTION_STATUS
 
 
+def row_is_gtpin_bbl_line(row: dict[str, str]) -> bool:
+    return row_attribution_mode(row) == GTPIN_BBL_ATTRIBUTION_MODE and row_attribution_status(row) == GTPIN_BBL_ATTRIBUTION_STATUS
+
+
 def row_has_non_vtune_attribution_marker(row: dict[str, str]) -> bool:
     mode = row_attribution_mode(row)
     status = row_attribution_status(row)
-    return mode in {DWARF_ATTRIBUTION_MODE, ASM_ATTRIBUTION_MODE, SAMPLED_PC_ATTRIBUTION_MODE} or status in {
+    return mode in {DWARF_ATTRIBUTION_MODE, ASM_ATTRIBUTION_MODE, SAMPLED_PC_ATTRIBUTION_MODE, GTPIN_BBL_ATTRIBUTION_MODE} or status in {
         ASM_ATTRIBUTION_STATUS,
         SAMPLED_PC_ATTRIBUTION_STATUS,
+        GTPIN_BBL_ATTRIBUTION_STATUS,
     }
 
 
@@ -149,6 +157,17 @@ def sampled_pc_line_rows(rows: list[dict[str, str]], required_kernel: str | None
     ]
 
 
+def gtpin_bbl_line_rows(rows: list[dict[str, str]], required_kernel: str | None) -> list[dict[str, str]]:
+    return [
+        row
+        for row in rows
+        if row_matches_kernel(row, required_kernel)
+        and row_has_known_source_line(row)
+        and row_is_gtpin_bbl_line(row)
+        and (parse_int_field(row, "Sample Count") > 0 or parse_int_field(row, "sample_count") > 0)
+    ]
+
+
 def top_sampled_pc_line_row(rows: list[dict[str, str]]) -> dict[str, str] | None:
     if not rows:
         return None
@@ -201,6 +220,16 @@ def main(argv: list[str]) -> int:
         help="checker-compatible CSV generated from dynamic PC samples plus ZEBin DWARF line tables",
     )
     parser.add_argument(
+        "--gtpin-bbl-source-lines-csv",
+        type=pathlib.Path,
+        help="checker-compatible CSV generated from GTPin memorytrace BBL counts plus ZEBin DWARF line tables",
+    )
+    parser.add_argument(
+        "--allow-gtpin-bbl-runtime-cost",
+        action="store_true",
+        help="allow GTPin BBL runtime-count rows to pass with source_line.status gtpin-bbl-runtime-cost",
+    )
+    parser.add_argument(
         "--asm-source-lines-csv",
         type=pathlib.Path,
         help="checker-compatible CSV generated from ZEBin DWARF plus assembly instruction addresses",
@@ -216,11 +245,12 @@ def main(argv: list[str]) -> int:
 
     has_allowed_dwarf_only = args.allow_dwarf_line_table_only and args.dwarf_source_lines_csv is not None
     has_allowed_asm_static = args.allow_asm_line_static_cost and args.asm_source_lines_csv is not None
+    has_allowed_gtpin_bbl = args.allow_gtpin_bbl_runtime_cost and args.gtpin_bbl_source_lines_csv is not None
     has_sampled_pc_lines = args.sampled_source_lines_csv is not None
-    if args.vtune_csv is None and not (has_sampled_pc_lines or has_allowed_asm_static or has_allowed_dwarf_only):
+    if args.vtune_csv is None and not (has_sampled_pc_lines or has_allowed_gtpin_bbl or has_allowed_asm_static or has_allowed_dwarf_only):
         print(
             "failed to check source lines: --vtune-csv is required unless --sampled-source-lines-csv or an explicitly "
-            "allowed --asm-source-lines-csv or --dwarf-source-lines-csv fallback is provided"
+            "allowed --gtpin-bbl-source-lines-csv, --asm-source-lines-csv, or --dwarf-source-lines-csv fallback is provided"
         )
         return 2
 
@@ -275,6 +305,17 @@ def main(argv: list[str]) -> int:
             sampled_source_line_rows = len(sampled_rows)
             sampled_top_row = top_sampled_pc_line_row(sampled_rows)
 
+        gtpin_bbl_source_line_rows = 0
+        gtpin_bbl_top_row: dict[str, str] | None = None
+        if (
+            args.gtpin_bbl_source_lines_csv is not None
+            and args.gtpin_bbl_source_lines_csv.is_file()
+            and args.gtpin_bbl_source_lines_csv.stat().st_size > 0
+        ):
+            gtpin_rows = gtpin_bbl_line_rows(read_source_csv(args.gtpin_bbl_source_lines_csv), args.require_kernel)
+            gtpin_bbl_source_line_rows = len(gtpin_rows)
+            gtpin_bbl_top_row = top_sampled_pc_line_row(gtpin_rows)
+
         asm_source_line_rows = 0
         asm_top_row: dict[str, str] | None = None
         if args.asm_source_lines_csv is not None and args.asm_source_lines_csv.is_file() and args.asm_source_lines_csv.stat().st_size > 0:
@@ -303,6 +344,10 @@ def main(argv: list[str]) -> int:
         blocker = "none"
         status = "sampled-line-cost"
         source_attribution_mode = SAMPLED_PC_ATTRIBUTION_MODE
+    elif args.allow_gtpin_bbl_runtime_cost and gtpin_bbl_source_line_rows > 0:
+        blocker = "none"
+        status = "gtpin-bbl-runtime-cost"
+        source_attribution_mode = GTPIN_BBL_ATTRIBUTION_MODE
     elif args.allow_asm_line_static_cost and asm_source_line_rows > 0:
         blocker = "none"
         status = "asm-line-static-cost"
@@ -341,6 +386,15 @@ def main(argv: list[str]) -> int:
                 "source_line.sampled_top_sample_count "
                 f"{max(parse_int_field(sampled_top_row, 'Sample Count'), parse_int_field(sampled_top_row, 'sample_count'))}"
             )
+    if args.gtpin_bbl_source_lines_csv is not None:
+        print(f"source_line.gtpin_bbl_source_line_rows {gtpin_bbl_source_line_rows}")
+        print(f"source_line.allow_gtpin_bbl_runtime_cost {1 if args.allow_gtpin_bbl_runtime_cost else 0}")
+        if gtpin_bbl_top_row is not None:
+            print(f"source_line.gtpin_bbl_top_source_line {gtpin_bbl_top_row.get('Source Line', '')}")
+            print(
+                "source_line.gtpin_bbl_top_sample_count "
+                f"{max(parse_int_field(gtpin_bbl_top_row, 'Sample Count'), parse_int_field(gtpin_bbl_top_row, 'sample_count'))}"
+            )
     if args.asm_source_lines_csv is not None:
         print(f"source_line.asm_source_line_rows {asm_source_line_rows}")
         print(f"source_line.allow_asm_line_static_cost {1 if args.allow_asm_line_static_cost else 0}")
@@ -351,7 +405,7 @@ def main(argv: list[str]) -> int:
     print(f"source_line.source_attribution_mode {source_attribution_mode}")
     print(f"source_line.blocker {blocker}")
     print(f"source_line.status {status}")
-    return 0 if status in {"pass", "sampled-line-cost", "asm-line-static-cost", "dwarf-line-table-only"} else 2
+    return 0 if status in {"pass", "sampled-line-cost", "gtpin-bbl-runtime-cost", "asm-line-static-cost", "dwarf-line-table-only"} else 2
 
 
 if __name__ == "__main__":

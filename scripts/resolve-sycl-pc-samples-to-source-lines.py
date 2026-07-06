@@ -212,7 +212,12 @@ def open_output(output_path: pathlib.Path | None) -> Iterator[TextIO]:
         yield handle
 
 
-def row_to_csv(row: LineAggregate, source_computing_task: str) -> dict[str, str]:
+def row_to_csv(
+    row: LineAggregate,
+    source_computing_task: str,
+    attribution_mode: str,
+    attribution_status: str,
+) -> dict[str, str]:
     source_line = f"{row.file_path}:{row.line}"
     sample_count = str(row.sample_count)
     return {
@@ -222,8 +227,8 @@ def row_to_csv(row: LineAggregate, source_computing_task: str) -> dict[str, str]
         "Source Computing Task": source_computing_task,
         "Sample Count": sample_count,
         "Sample Kind": row.sample_kind,
-        "Source Attribution Mode": ATTRIBUTION_MODE,
-        "Source Attribution Status": ATTRIBUTION_STATUS,
+        "Source Attribution Mode": attribution_mode,
+        "Source Attribution Status": attribution_status,
         "source_file": row.file_path,
         "source_line": str(row.line),
         "sample_count": sample_count,
@@ -231,35 +236,47 @@ def row_to_csv(row: LineAggregate, source_computing_task: str) -> dict[str, str]
     }
 
 
-def write_csv(rows: list[LineAggregate], output_path: pathlib.Path | None, source_computing_task: str) -> None:
+def write_csv(
+    rows: list[LineAggregate],
+    output_path: pathlib.Path | None,
+    source_computing_task: str,
+    attribution_mode: str,
+    attribution_status: str,
+) -> None:
     with open_output(output_path) as handle:
         writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
         writer.writeheader()
         for row in rows:
-            writer.writerow(row_to_csv(row, source_computing_task))
+            writer.writerow(row_to_csv(row, source_computing_task, attribution_mode, attribution_status))
         handle.flush()
 
 
-def write_summary(rows: list[LineAggregate], summary_output: pathlib.Path | None, mapped: int, unmapped: int) -> None:
+def write_summary(
+    rows: list[LineAggregate],
+    summary_output: pathlib.Path | None,
+    mapped: int,
+    unmapped: int,
+    summary_prefix: str,
+) -> None:
     if summary_output is None:
         return
     lines = [
-        f"pc_sample_source.status {'ok' if rows else NO_MATCH_BLOCKER}",
-        f"pc_sample_source.mapped_sample_count {mapped}",
-        f"pc_sample_source.unmapped_sample_count {unmapped}",
-        f"pc_sample_source.source_line_rows {len(rows)}",
+        f"{summary_prefix}.status {'ok' if rows else NO_MATCH_BLOCKER}",
+        f"{summary_prefix}.mapped_sample_count {mapped}",
+        f"{summary_prefix}.unmapped_sample_count {unmapped}",
+        f"{summary_prefix}.source_line_rows {len(rows)}",
     ]
     if rows:
         top = rows[0]
         lines.extend(
             [
-                f"pc_sample_source.top_source_line {top.file_path}:{top.line}",
-                f"pc_sample_source.top_sample_count {top.sample_count}",
-                f"pc_sample_source.top_sample_kind {top.sample_kind}",
+                f"{summary_prefix}.top_source_line {top.file_path}:{top.line}",
+                f"{summary_prefix}.top_sample_count {top.sample_count}",
+                f"{summary_prefix}.top_sample_kind {top.sample_kind}",
             ]
         )
     else:
-        lines.append(f"pc_sample_source.blocker {NO_MATCH_BLOCKER}")
+        lines.append(f"{summary_prefix}.blocker {NO_MATCH_BLOCKER}")
     summary_output.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -277,14 +294,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--summary-output", type=pathlib.Path, help="optional parse-style summary output")
     parser.add_argument("--source-computing-task", required=True, help="required kernel/task name to write into output rows")
     parser.add_argument("--require-source-path", default="", help="optional source path suffix that mapped rows must match")
+    parser.add_argument(
+        "--attribution-mode",
+        default=ATTRIBUTION_MODE,
+        help="Source Attribution Mode label for output rows; default is sampled-pc-line",
+    )
+    parser.add_argument(
+        "--attribution-status",
+        default=ATTRIBUTION_STATUS,
+        help="Source Attribution Status label for output rows; default is sampled_line_cost",
+    )
+    parser.add_argument(
+        "--summary-prefix",
+        default="pc_sample_source",
+        help="prefix for parse-style summary keys; default is pc_sample_source",
+    )
     args = parser.parse_args(argv)
 
     try:
         source_rows = load_source_rows(args.dwarf_line_dump)
         samples = load_samples(args.pc_samples, args.source_computing_task)
         rows, mapped, unmapped = aggregate_rows(source_rows, samples, args.require_source_path)
-        write_csv(rows, args.output, args.source_computing_task)
-        write_summary(rows, args.summary_output, mapped, unmapped)
+        write_csv(rows, args.output, args.source_computing_task, args.attribution_mode, args.attribution_status)
+        write_summary(rows, args.summary_output, mapped, unmapped, args.summary_prefix)
         if mapped == 0:
             print(
                 f"failed to resolve SYCL PC sample source lines: no mapped PC sample source rows ({NO_MATCH_BLOCKER})",

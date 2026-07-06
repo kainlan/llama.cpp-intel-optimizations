@@ -84,7 +84,7 @@ def main(argv: list[str]) -> int:
 
         status = source_attribution_summary.get("source_attribution.status")
         source_line_status = source_line_summary.get("source_line.status")
-        if status not in {"exact_source_line", "source_region_plus_ablation", "sampled_line_cost", "asm_line_static_cost", "dwarf_line_table_only"}:
+        if status not in {"exact_source_line", "source_region_plus_ablation", "sampled_line_cost", "gtpin_bbl_runtime_cost", "asm_line_static_cost", "dwarf_line_table_only"}:
             print("coverage.layer_status source_attribution_incomplete")
             for line in source_attribution_rows:
                 print(line)
@@ -105,6 +105,14 @@ def main(argv: list[str]) -> int:
             for line in source_attribution_rows:
                 print(line)
             print("failed to merge staged ledger: sampled PC source attribution requires source_line.status sampled-line-cost")
+            return 2
+        if status == "gtpin_bbl_runtime_cost" and source_line_status != "gtpin-bbl-runtime-cost":
+            print("coverage.layer_status source_attribution_incomplete")
+            for line in source_line_rows:
+                print(line)
+            for line in source_attribution_rows:
+                print(line)
+            print("failed to merge staged ledger: GTPin BBL source attribution requires source_line.status gtpin-bbl-runtime-cost")
             return 2
         if status == "asm_line_static_cost" and source_line_status != "asm-line-static-cost":
             print("coverage.layer_status source_attribution_incomplete")

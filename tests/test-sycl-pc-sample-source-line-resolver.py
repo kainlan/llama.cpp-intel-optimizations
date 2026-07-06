@@ -93,6 +93,41 @@ def test_sample_resolver_keeps_bare_numeric_pc_decimal() -> None:
         assert rows[0]["Source Line"].endswith("mmvq.cpp:6800")
 
 
+def test_sample_resolver_allows_truthful_attribution_label_override() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        dwarf = write_dwarf(tmp)
+        samples = tmp / "pc-samples.csv"
+        samples.write_text(
+            "kernel,pc,sample_count,sample_kind\n"
+            "target_kernel,64,7,gtpin-bbl-instruction-exec-count\n",
+            encoding="utf-8",
+        )
+        summary = tmp / "summary.parse"
+        result = run_resolver(
+            "--dwarf-line-dump",
+            str(dwarf),
+            "--pc-samples",
+            str(samples),
+            "--source-computing-task",
+            "target_kernel",
+            "--attribution-mode",
+            "gtpin-bbl-line",
+            "--attribution-status",
+            "gtpin_bbl_runtime_cost",
+            "--summary-prefix",
+            "gtpin_bbl_source",
+            "--summary-output",
+            str(summary),
+        )
+        assert result.returncode == 0, result.stdout
+        rows = list(csv.DictReader(io.StringIO(result.stdout)))
+        assert rows[0]["Source Attribution Mode"] == "gtpin-bbl-line"
+        assert rows[0]["Source Attribution Status"] == "gtpin_bbl_runtime_cost"
+        assert rows[0]["Sample Kind"] == "gtpin-bbl-instruction-exec-count"
+        assert "gtpin_bbl_source.status ok" in summary.read_text(encoding="utf-8")
+
+
 def test_sample_resolver_requires_sample_schema() -> None:
     with tempfile.TemporaryDirectory() as tmp_raw:
         tmp = pathlib.Path(tmp_raw)

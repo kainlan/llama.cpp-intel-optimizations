@@ -40,15 +40,16 @@ Existing implementation artifacts are present:
 
 Result: `asm-line-static-cost` is a real validated static evidence level for both source-line probe artifacts and the MXFP4 pair-GLU source-line diagnostic target.
 
-## Runtime sampled line attribution
+## Runtime line attribution
 
-Status: **schema implemented; runtime PC sampling not available**.
+Status: **GTPin BBL runtime-count attribution is available; true sampled PC attribution remains unavailable**.
 
 Lead PC-sampling capability probe roots:
 
 ```text
 /tmp/sycl_intel_pc_sampling_capability_20260705_175719
 /tmp/sycl_pc_sampling_followup_capability_20260706_115208
+/tmp/sycl_pc_sampling_gtpin_discovery_20260706_144209
 ```
 
 Latest result:
@@ -57,10 +58,10 @@ Latest result:
 pc_sampling.status metrics_only
 pc_sampling.blocker no_public_pc_sample_api_confirmed
 pc_sampling.blocker vtune_source_rows_empty
-pc_sampling.blocker gtpin_not_found
 pc_sampling.blocker pti_files_found_but_no_pc_sample_producer
 pc_sampling.blocker level_zero_metrics_are_not_pc_samples
 pc_sampling.blocker no_level_zero_ip_metric_type_exposed
+pc_sampling.blocker gtpin_memorytrace_available_but_not_sampled_pc
 ```
 
 Latest metric-property evidence:
@@ -79,11 +80,71 @@ Existing implementation artifacts are present:
 - `scripts/check-sycl-vtune-source-lines.py`, `scripts/parse-sycl-source-attribution.py`, and `scripts/merge-sycl-staged-ledger.py` keep `sampled-line-cost` / `sampled_line_cost` distinct from VTune exact source rows.
 - `scripts/sycl-intel-pc-sampling-capability.sh` reports `available`, `metrics_only`, or `unavailable`, enumerates Level Zero metric properties including `ZET_METRIC_TYPE_IP`, and never synthesizes `pc-samples.csv`.
 
-No true sampled runtime source-line attribution is available from public/local tooling on this host yet. The installed PTI/Level Zero stack exposes metric counters, but no instruction-pointer metric source (`ip_metric_count 0`) and no producer for a positive-count `kernel,pc,sample_count` CSV.
+No true sampled runtime source-line attribution is available from Level Zero/PTI/VTune metric tooling on this host yet. The installed PTI/Level Zero stack exposes metric counters, but no instruction-pointer metric source (`ip_metric_count 0`).
+
+A separate runtime-count path is now validated through VTune's embedded GTPin
+`memorytrace.so` profiler. This produces positive runtime BBL execution counts
+for the profiled trace scope and maps them to instruction PCs via the generated
+GTPin ASM plus MAAT `app.report.json`, then to source through the existing DWARF
+line resolver. It is deliberately labeled **`gtpin_bbl_runtime_cost`**, not
+`sampled-line-cost`, because the producer is BBL execution counting rather than
+PC sampling.
+
+GTPin validation artifact root:
+
+```text
+/tmp/sycl_gtpin_bbl_runtime_line_20260706_143724
+```
+
+Runtime BBL/PC extraction:
+
+```text
+gtpin_bbl_pc.status ok
+gtpin_bbl_pc.trace_send_descriptor_u32_count 20
+gtpin_bbl_pc.profiled_thread_count 1
+gtpin_bbl_pc.bbl_header_count 53
+gtpin_bbl_pc.dynamic_bbl_records 231
+gtpin_bbl_pc.dynamic_instruction_count 63703
+gtpin_bbl_pc.pc_rows 1136
+gtpin_bbl_pc.send_pc_rows 63
+gtpin_bbl_pc.id_shift 1
+gtpin_bbl_pc.id_shift_send_matches 63
+gtpin_bbl_pc.sample_kind gtpin-bbl-instruction-exec-count
+```
+
+Runtime source-line resolution with `--require-source-path mmvq.cpp`:
+
+```text
+gtpin_bbl_source.status ok
+gtpin_bbl_source.mapped_sample_count 2910
+gtpin_bbl_source.unmapped_sample_count 60793
+gtpin_bbl_source.source_line_rows 31
+gtpin_bbl_source.top_source_line /tmp/sycl_mxfp4_source_line_device_tu_build_20260706_112515/ggml/src/ggml-sycl/mmvq.cpp:7233
+gtpin_bbl_source.top_sample_count 720
+gtpin_bbl_source.top_sample_kind gtpin-bbl-instruction-exec-count
+```
+
+Checker validation:
+
+```text
+/tmp/sycl_gtpin_bbl_runtime_line_20260706_143724/gtpin-bbl-source-line-feasibility.parse
+source_line.gtpin_bbl_source_line_rows 31
+source_line.gtpin_bbl_top_source_line /tmp/sycl_mxfp4_source_line_device_tu_build_20260706_112515/ggml/src/ggml-sycl/mmvq.cpp:7233
+source_line.gtpin_bbl_top_sample_count 720
+source_line.source_attribution_mode gtpin-bbl-line
+source_line.blocker none
+source_line.status gtpin-bbl-runtime-cost
+```
+
+Implementation artifacts:
+
+- `scripts/extract-sycl-gtpin-bbl-pc-counts.py` parses GTPin `memorytrace_compressed.bin` BBL traces, including the VTune 2025.10 20-u32 send descriptor ABI, and emits positive `kernel,pc,sample_count,sample_kind` rows with `sample_kind=gtpin-bbl-instruction-exec-count`.
+- `scripts/resolve-sycl-pc-samples-to-source-lines.py` now accepts explicit attribution labels/prefixes so this path can emit `gtpin-bbl-line` / `gtpin_bbl_runtime_cost` instead of falsely labeling BBL counts as `sampled_line_cost`.
+- `scripts/check-sycl-vtune-source-lines.py` accepts `--gtpin-bbl-source-lines-csv --allow-gtpin-bbl-runtime-cost` and emits `source_line.status gtpin-bbl-runtime-cost` for validated GTPin BBL runtime-count rows.
 
 ## Exact source-line attribution rule
 
-`source_attribution.status exact_source_line` remains reserved for `source_line.status pass` from VTune GPU source rows. Runtime sampled PC rows may produce `sampled-line-cost`; IGA rows may produce `asm-line-static-cost`; DWARF coverage may produce `dwarf-line-table-only`. None of those non-`pass` paths should be promoted to `exact_source_line`.
+`source_attribution.status exact_source_line` remains reserved for `source_line.status pass` from VTune GPU source rows. Runtime sampled PC rows may produce `sampled-line-cost`; GTPin memorytrace BBL counts may produce `gtpin_bbl_runtime_cost`; IGA rows may produce `asm-line-static-cost`; DWARF coverage may produce `dwarf-line-table-only`. None of those non-`pass` paths should be promoted to `exact_source_line`.
 
 ## Evidence levels
 
@@ -91,6 +152,7 @@ No true sampled runtime source-line attribution is available from public/local t
 |---|---:|---:|---|
 | VTune GPU source rows | yes | yes | `source_line.status pass` |
 | PC sample CSV mapped through DWARF | yes | yes | `source_line.status sampled-line-cost` |
+| GTPin memorytrace BBL execution counts mapped through DWARF | runtime counted, not sampled | yes | `source_line.status gtpin-bbl-runtime-cost` / row status `gtpin_bbl_runtime_cost` |
 | IGA PC static instruction rows mapped through DWARF | no | yes | `source_line.status asm-line-static-cost` |
 | DWARF line-table coverage only | no | no cost ranking | `source_line.status dwarf-line-table-only` |
 
@@ -99,9 +161,10 @@ No true sampled runtime source-line attribution is available from public/local t
 For TG optimization today, use:
 
 1. `pass` / `exact_source_line` if lead VTune source rows are available.
-2. `sampled-line-cost` only after a real positive-count `pc-samples.csv` is produced and mapped.
-3. `asm-line-static-cost` for artifacts whose IGA PC rows and DWARF line rows both validate; this is now true for the standalone probe and for the source-line-only MXFP4 pair-GLU diagnostic target.
-4. `dwarf-line-table-only` as coverage/fallback when cost-ranked source rows are not available.
+2. `sampled-line-cost` only after a real sampled positive-count `pc-samples.csv` is produced and mapped.
+3. `gtpin_bbl_runtime_cost` for profiled trace-scope runtime BBL execution counts; this is now available for the MXFP4 pair-GLU source-line diagnostic target.
+4. `asm-line-static-cost` for artifacts whose IGA PC rows and DWARF line rows both validate; this is now true for the standalone probe and for the source-line-only MXFP4 pair-GLU diagnostic target.
+5. `dwarf-line-table-only` as coverage/fallback when cost-ranked source rows are not available.
 
 Current MXFP4 state: task-to-ZEBin selection, IGA PC extraction, and static PC-to-source-row resolution work for the source-line-only pair-GLU diagnostic target. The normal benchmark/backend path remains unchanged and should not be relabeled as sampled exact source-line attribution.
 
