@@ -221,3 +221,82 @@ The next fix should make the MXFP4 selected compute ZEBin contain usable source-
 3. keep `sycl-mxfp4-source-line-probe` as the narrow execution harness once the device image itself can be reduced or made to preserve `.debug_line`.
 
 Label-only `ocloc` rows such as `L0:` are still not byte PC evidence and must not be promoted to `asm-line-static-cost`.
+
+## 2026-07-06 probe-only TU guard validation: still blocked
+
+Follow-up implementation for `llama.cpp-gml4` / `llama.cpp-qqux` added a target-only
+`SYCL_MXFP4_SOURCE_LINE_PROBE_ONLY=1` definition to `sycl-mxfp4-source-line-probe`
+and guarded unrelated MXFP4 benchmark families in
+`tools/sycl-kernel-bench/kernels/reference/mxfp4_inline_dot.cpp`. The normal
+`sycl-kernel-bench` target remains unguarded.
+
+Source/build gates:
+
+```text
+python3 -m pytest tests/test-sycl-mxfp4-source-line-probe-source.py tests/test-sycl-vtune-source-line-feasibility-script.py -q
+13 passed
+
+./scripts/sycl-build.sh sycl-mxfp4-source-line-probe
+Build succeeded
+```
+
+Lead-only real validation was rerun with oneAPI sourced via the required
+`set +u` / `setvars.sh` / `set -u` sequence. The old probe-matrix preflight
+artifact under `/tmp/sycl_source_line_iga_matrix_fix_20260705_192345` was no
+longer present, so the run was repeated without that stale preflight gate.
+
+Validation artifacts:
+
+```text
+OUT_ROOT=/tmp/sycl_mxfp4_source_line_probe_split_20260706_100913
+BUILD_DIR=/tmp/sycl_mxfp4_source_line_probe_split_build_20260706_100913
+```
+
+The diagnostic executable itself ran successfully under VTune:
+
+```json
+{"kernel":"mxfp4_pair_glu_xmx_tiled_packed_r8_m2_sparse32_bias","ok":true,"latency_us":1408.996940,"throughput_tps":709.724749,"throughput_tops":0.000000,"bandwidth_gbps":25.119118,"error":""}
+```
+
+However, the selected compute ZEBin still has no usable source-line DWARF:
+
+```text
+source_line.debug_line_present 0
+source_line.non_unknown_rows 0
+source_line.vtune_sampled_non_unknown_rows 0
+source_line.vtune_no_gpu_side_trace 1
+source_line.gtpin_no_kernels 0
+source_line.gtpin_register_pressure 1
+source_line.required_kernel mxfp4_pair_glu_xmx_tiled_packed_r8_m2_sparse32_bias
+source_line.dwarf_status error
+source_line.dwarf_error no source rows found
+source_line.dwarf_source_rows 0
+source_line.dwarf_required_path_present 0
+source_line.source_attribution_mode none
+source_line.blocker missing_debug_line
+source_line.status fail
+```
+
+The section-selection fallback still selected the intended kernel section:
+
+```text
+selected_task
+iga_section_match mxfp4_pair_glu_xmx_tiled_dpas_m2_kernelILi8ELi3ELb0ELb0E
+selected_zebin /tmp/sycl_mxfp4_source_line_probe_split_20260706_100913/vtune-source-line/archive/binaries/94dd41225bbcd53f.zebin/284d5e809b1039b5343acc7b68814267/94dd41225bbcd53f.zebin
+```
+
+IGA extraction still succeeds (`extract.status ok`) and `iga-pc-instructions.csv`
+is present, but both DWARF conversion and IGA PC source-line resolution fail with
+`no source rows found`. The profiling-debug build log continues to emit the
+known IGC blocker:
+
+```text
+warning: VCDebugInfo: only modules with one CU are supported at the moment, the debug information for Module will be dropped out.
+```
+
+Interpretation: guarding unrelated `mxfp4_inline_dot.cpp` benchmark families is
+safe and narrows the diagnostic target, but it is **not sufficient** to make the
+selected MXFP4 compute ZEBin retain `.debug_line`. The remaining source-row
+enablement likely has to reduce or isolate the linked SYCL device module that
+contains `mmvq.cpp` / `ggml_sycl_mxfp4_pair_glu_bench_launch`, not only the tool
+side host/benchmark wrapper. `llama.cpp-040b` remains open.

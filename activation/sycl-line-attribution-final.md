@@ -90,3 +90,46 @@ For TG optimization today, use:
 4. `dwarf-line-table-only` as coverage/fallback when cost-ranked source rows are not available.
 
 Current MXFP4 state: task-to-ZEBin selection and IGA PC extraction work for the full benchmark path, and the narrow probe target builds/runs, but cost-ranked source rows remain blocked by missing `.debug_line` / source-line DWARF in the selected compute ZEBin.
+
+## 2026-07-06 MXFP4 probe-only TU guard update
+
+A follow-up narrowing change for `sycl-mxfp4-source-line-probe` was implemented
+and validated:
+
+- target-only compile definition: `SYCL_MXFP4_SOURCE_LINE_PROBE_ONLY=1`;
+- `mxfp4_inline_dot.cpp` now excludes unrelated standalone/selected/layer/down
+  benchmark families for the source-line probe target while preserving the
+  normal `sycl-kernel-bench` target;
+- source tests now enforce that the guard applies only to the probe target.
+
+Validation:
+
+```text
+python3 -m pytest tests/test-sycl-mxfp4-source-line-probe-source.py tests/test-sycl-vtune-source-line-feasibility-script.py -q
+13 passed
+
+./scripts/sycl-build.sh sycl-mxfp4-source-line-probe
+Build succeeded
+```
+
+Real VTune/GPU feasibility rerun:
+
+```text
+OUT_ROOT=/tmp/sycl_mxfp4_source_line_probe_split_20260706_100913
+BUILD_DIR=/tmp/sycl_mxfp4_source_line_probe_split_build_20260706_100913
+```
+
+Result remains fail-closed for MXFP4 cost-ranked lines:
+
+```text
+source_line.debug_line_present 0
+source_line.dwarf_status error
+source_line.dwarf_error no source rows found
+source_line.blocker missing_debug_line
+source_line.status fail
+```
+
+The executable ran successfully and the intended `.text._ZTS39mxfp4_pair_glu_xmx_tiled_dpas_m2_kernelILi8ELi3ELb0ELb0EE`
+section was selected, but the selected ZEBin still lacks source rows. Therefore,
+`asm-line-static-cost` remains validated only for the standalone probe matrix,
+not for the MXFP4 target kernel.
