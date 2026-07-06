@@ -1,7 +1,7 @@
 # SYCL IGA PC Source-Line Attribution Validation
 
 Date: 2026-07-05
-Tracker issue: `llama.cpp-xame`
+Tracker issue: `llama.cpp-040b`
 Validation owner: lead
 
 ## Summary
@@ -14,7 +14,7 @@ source /opt/intel/oneapi/setvars.sh --force
 set -u
 ```
 
-Result: **`asm-line-static-cost` did not validate**. Both the probe matrix and MXFP4 run ended at `source_line.status dwarf-line-table-only`.
+Result: **IGA static attribution is now validated on the standalone probe, but still not validated for the MXFP4 target kernel.**
 
 Required semantics remain:
 
@@ -23,18 +23,37 @@ source_line.status asm-line-static-cost means exact static source-line cost from
 source_line.status pass remains the only sampled VTune exact status.
 ```
 
-## Probe matrix validation
+## Fixes validated in this round
+
+Two previously-open implementation gaps were closed:
+
+1. `scripts/parse-sycl-iga-pc-disasm.py` now parses real IGA JSON v2 output with top-level `elems` and instruction rows marked `kind: "I"`.
+2. `scripts/sycl-vtune-source-line-feasibility.sh` now selects the archived ZEBin containing the VTune-selected compute task section instead of using the first archived ZEBin.  Template task names such as:
+
+```text
+mxfp4_pair_glu_xmx_tiled_dpas_m2_kernel<(int)8, (int)3, (bool)0, (bool)0>
+```
+
+are converted to a mangled section substring:
+
+```text
+mxfp4_pair_glu_xmx_tiled_dpas_m2_kernelILi8ELi3ELb0ELb0E
+```
+
+The ZEBin lookup is pipefail-safe and records `iga-section-selection.parse`.
+
+## Probe matrix validation: passed static attribution
 
 Artifact root:
 
 ```text
-/tmp/sycl_source_line_iga_matrix_20260705_173448
+/tmp/sycl_source_line_iga_matrix_fix_20260705_192345
 ```
 
 Selected parse:
 
 ```text
-/tmp/sycl_source_line_iga_matrix_20260705_173448/build-matrix/debug_full/source-line-feasibility.parse
+/tmp/sycl_source_line_iga_matrix_fix_20260705_192345/build-matrix/debug_full/source-line-feasibility.parse
 ```
 
 Selected parse contents:
@@ -52,9 +71,14 @@ source_line.dwarf_source_rows 17
 source_line.dwarf_required_path_present 1
 source_line.dwarf_source_line_rows 17
 source_line.allow_dwarf_line_table_only 1
-source_line.source_attribution_mode dwarf-line-table
+source_line.asm_source_line_rows 2
+source_line.allow_asm_line_static_cost 1
+source_line.asm_top_source_line main.cpp:148
+source_line.asm_top_static_score 13
+source_line.asm_top_instruction_count 13
+source_line.source_attribution_mode asm-line-static
 source_line.blocker none
-source_line.status dwarf-line-table-only
+source_line.status asm-line-static-cost
 ```
 
 IGA manifest for selected row:
@@ -69,70 +93,91 @@ IGA manifest for selected row:
 }
 ```
 
-IGA PC parser output for selected row:
+IGA resolver summary:
 
 ```text
-kernel,pc,pc_hex,opcode,text,raw,send_comment,source
-iga_pc.status no_pc_rows
+asm_source.status ok
+asm_source.mapped_instruction_count 18
+asm_source.unmapped_instruction_count 29
+asm_source.source_line_rows 2
+asm_source.top_source_line main.cpp:148
+asm_source.top_static_score 13
+asm_source.top_instruction_count 13
 ```
 
-Interpretation: IGA text-section selection succeeded for the probe, but the IGA disassembly/parser path produced no PC instruction rows. The checker correctly rejected static attribution and accepted only DWARF coverage.
+Interpretation: the non-VTune IGA PC path is real for a narrow probe artifact. It maps numeric IGA PCs through DWARF line ranges and produces `source_line.status asm-line-static-cost` without sampled runtime timing.
 
-## MXFP4 feasibility validation
+## MXFP4 feasibility validation: still blocked
 
-Artifact roots:
+Latest artifact roots:
 
 ```text
-/tmp/sycl_mxfp4_iga_source_line_20260705_173611
-/tmp/sycl_mxfp4_iga_source_line_build_20260705_173611
+/tmp/sycl_mxfp4_iga_source_line_fix4_20260705_210052
+/tmp/sycl_mxfp4_iga_source_line_build_fix4_20260705_210052
 ```
 
-MXFP4 parse contents:
+Result:
 
 ```text
-source_line.debug_line_present 1
-source_line.non_unknown_rows 0
-source_line.vtune_sampled_non_unknown_rows 0
-source_line.vtune_no_gpu_side_trace 0
-source_line.gtpin_no_kernels 0
-source_line.gtpin_register_pressure 1
-source_line.required_kernel mxfp4_pair_glu_xmx_tiled_packed_r8_m2_sparse32_bias
-source_line.dwarf_status ok
-source_line.dwarf_source_rows 923
-source_line.dwarf_required_path_present 1
-source_line.dwarf_source_line_rows 923
-source_line.allow_dwarf_line_table_only 1
-source_line.source_attribution_mode dwarf-line-table
-source_line.blocker none
-source_line.status dwarf-line-table-only
+failed to check source lines: no source rows found
+```
+
+The runner now selects the VTune task and matching compute ZEBin correctly:
+
+```text
+selected_task mxfp4_pair_glu_xmx_tiled_dpas_m2_kernel<(int)8, (int)3, (bool)0, (bool)0>
+iga_section_match mxfp4_pair_glu_xmx_tiled_dpas_m2_kernelILi8ELi3ELb0ELb0E
+selected_zebin /tmp/sycl_mxfp4_iga_source_line_fix4_20260705_210052/vtune-source-line/archive/binaries/6553b51253c6c2a5.zebin/de3f60dd42e4af96a15eaccab47b0a38/6553b51253c6c2a5.zebin
 ```
 
 MXFP4 IGA manifest:
 
 ```json
 {
-  "extract.kernel_match": "mxfp4_pair_glu_xmx_tiled_packed_r8_m2_sparse32_bias",
+  "extract.kernel_match": "mxfp4_pair_glu_xmx_tiled_dpas_m2_kernelILi8ELi3ELb0ELb0E",
   "extract.platform": "xe2",
-  "extract.section": "",
-  "extract.section_addr": "",
-  "extract.status": "missing_kernel_text_section"
+  "extract.section": ".text._ZTS39mxfp4_pair_glu_xmx_tiled_dpas_m2_kernelILi8ELi3ELb0ELb0EE",
+  "extract.section_addr": "0x0",
+  "extract.status": "ok"
 }
 ```
 
-Interpretation: MXFP4 DWARF line coverage is present (`923` DWARF source rows), but IGA section selection failed because no `.text.*` section matched the required kernel name. VTune/GTPin also reported register pressure (`source_line.gtpin_register_pressure 1`). The run therefore did not produce static source-line cost rows.
+IGA parser output exists for the selected section:
+
+```text
+1583 /tmp/sycl_mxfp4_iga_source_line_fix4_20260705_210052/iga-pc-instructions.csv
+```
+
+However, the selected compute ZEBin has no usable DWARF source rows:
+
+```text
+failed to convert ZEBin line table: no source rows found
+failed to resolve ZEBin ASM source lines: no source rows found
+```
+
+Build logs also show the relevant Intel device debug-info warning:
+
+```text
+warning: VCDebugInfo: only modules with one CU are supported at the moment, the debug information for Module will be dropped out.
+```
+
+The latest run had 20 such warnings. A global `-g -fdebug-info-for-profiling -fsycl-instrument-device-code` experiment against the whole target failed the compiler backend (`gen compiler command failed with exit code 254`), so the runner was left at the safer `RelWithDebInfo` target-debug configuration.
+
+Interpretation: the remaining MXFP4 blocker is no longer IGA parsing or task-to-section selection. It is that the selected compute ZEBin lacks usable source-line DWARF, so numeric IGA PCs cannot be mapped to `mmvq.cpp` line rows.
 
 ## Final status
 
-- Static IGA line attribution: **blocked**.
-- Current accepted status: `source_line.status dwarf-line-table-only`.
-- `llama.cpp-040b` should remain open for a follow-up that can map the MXFP4 required kernel to the correct ZEBin `.text.*` section name and/or produce usable IGA PC rows.
+- Probe static IGA line attribution: **validated** as `source_line.status asm-line-static-cost`.
+- MXFP4 static IGA line attribution: **blocked** by missing/empty ZEBin DWARF source rows for the selected compute task.
+- Runtime sampled source-line attribution: still unavailable; VTune `pass` remains separate and future sampled PC CSV work remains separate.
+- `llama.cpp-040b` should remain open for MXFP4-specific source-row enablement.
 
 ## Follow-up blocker
 
-The next fix should address at least one of:
+The next fix should make the MXFP4 selected compute ZEBin contain usable source-line DWARF without breaking the compiler backend. Candidate directions:
 
-1. IGA disassembly/parser emits no PC rows for the probe even when section extraction succeeds.
-2. MXFP4 required kernel name does not match a `.text.*` section (`extract.status missing_kernel_text_section`).
-3. VTune sampled exact source rows remain unavailable and GTPin reports register pressure on MXFP4 kernels.
+1. isolate the MXFP4 source-line target so the device image has one compile unit, avoiding the `VCDebugInfo` multi-CU debug-info drop;
+2. investigate oneAPI device debug flags that preserve ZEBin line tables for this multi-kernel `sycl-kernel-bench` target;
+3. add a narrow source-line probe for the MXFP4 kernel shape if the full benchmark target cannot preserve device DWARF.
 
 Label-only `ocloc` rows such as `L0:` are still not byte PC evidence and must not be promoted to `asm-line-static-cost`.

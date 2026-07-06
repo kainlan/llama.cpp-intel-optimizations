@@ -1,38 +1,40 @@
 # SYCL line-attribution capability final report
 
 Date: 2026-07-05
-Tracker issue: `llama.cpp-y9qm`
+Tracker issue: `llama.cpp-040b`
 Validation owner: lead
 
 ## Static line attribution
 
-Status: **implemented but not validated as `asm-line-static-cost` on real artifacts**.
+Status: **validated for the standalone probe; still blocked for the MXFP4 target kernel.**
 
-Lead validation was executed after the source-only implementation landed:
+Latest lead validation artifacts:
 
-- Probe matrix root: `/tmp/sycl_source_line_iga_matrix_20260705_173448`
-- Selected matrix parse: `/tmp/sycl_source_line_iga_matrix_20260705_173448/build-matrix/debug_full/source-line-feasibility.parse`
-- MXFP4 root: `/tmp/sycl_mxfp4_iga_source_line_20260705_173611`
-- MXFP4 build root: `/tmp/sycl_mxfp4_iga_source_line_build_20260705_173611`
+- Fixed probe matrix root: `/tmp/sycl_source_line_iga_matrix_fix_20260705_192345`
+- Selected matrix parse: `/tmp/sycl_source_line_iga_matrix_fix_20260705_192345/build-matrix/debug_full/source-line-feasibility.parse`
+- Latest MXFP4 root: `/tmp/sycl_mxfp4_iga_source_line_fix4_20260705_210052`
+- Latest MXFP4 build root: `/tmp/sycl_mxfp4_iga_source_line_build_fix4_20260705_210052`
 
 Results:
 
-- Probe matrix selected row: `source_line.status dwarf-line-table-only`
-- MXFP4 feasibility: `source_line.status dwarf-line-table-only`
-- MXFP4 DWARF coverage: `source_line.dwarf_source_rows 923`
-- MXFP4 static IGA blocker: `extract.status missing_kernel_text_section`
-- MXFP4 sampled VTune/GTPin blocker: `source_line.gtpin_register_pressure 1`
+- Probe matrix selected row: `source_line.status asm-line-static-cost`
+- Probe static mapping: `asm_source.mapped_instruction_count 18`, `asm_source.source_line_rows 2`, top line `main.cpp:148`
+- MXFP4 task-to-ZEBin selection: fixed; selected task maps to `.text._ZTS39mxfp4_pair_glu_xmx_tiled_dpas_m2_kernelILi8ELi3ELb0ELb0EE`
+- MXFP4 IGA extraction: fixed; `extract.status ok`
+- MXFP4 IGA PC rows: present; `1583` CSV lines in `iga-pc-instructions.csv`
+- MXFP4 remaining blocker: selected compute ZEBin has no usable DWARF source rows (`failed to check source lines: no source rows found`)
 
 Detailed report: `activation/sycl-iga-pc-source-line-validation.md`.
 
 Existing implementation artifacts are present:
 
 - `scripts/prepare-sycl-iga-disasm-inputs.py` selects a `.text.*` ZEBin section and writes an IGA command manifest.
-- `scripts/parse-sycl-iga-pc-disasm.py` parses IGA JSON/text rows with explicit PCs.
+- `scripts/parse-sycl-iga-pc-disasm.py` parses IGA JSON/text rows with explicit PCs, including real JSON v2 `elems` / `kind: "I"` output.
 - `scripts/resolve-sycl-zebin-asm-source-lines.py --iga-instructions-csv --pc-base` maps kernel-matched IGA section-relative PCs through DWARF line ranges.
-- Matrix and MXFP4 runners are wired to prefer `iga-pc-instructions.csv` and fall back to `ocloc`/DWARF without fabricating static-cost evidence.
+- Matrix and MXFP4 runners prefer `iga-pc-instructions.csv` and fall back to `ocloc`/DWARF without fabricating static-cost evidence.
+- The MXFP4 runner now selects the ZEBin matching the VTune-selected compute task instead of trusting the first archived binary.
 
-Result: `asm-line-static-cost` remains the intended static evidence level only after a lead run produces and maps real kernel-matched IGA PC rows. Follow-up `llama.cpp-040b` remains open.
+Result: `asm-line-static-cost` is a real validated static evidence level for source-line probe artifacts. For MXFP4, follow-up `llama.cpp-040b` remains open because the selected compute ZEBin does not carry usable source-line DWARF for PC-to-line mapping.
 
 ## Runtime sampled line attribution
 
@@ -83,7 +85,7 @@ For TG optimization today, use:
 
 1. `pass` / `exact_source_line` if lead VTune source rows are available.
 2. `sampled-line-cost` only after a real positive-count `pc-samples.csv` is produced and mapped.
-3. `asm-line-static-cost` only after lead IGA PC validation maps kernel-matched rows through DWARF.
+3. `asm-line-static-cost` for artifacts whose IGA PC rows and DWARF line rows both validate; currently this is true for the standalone probe, not for the MXFP4 target ZEBin.
 4. `dwarf-line-table-only` as coverage/fallback when cost-ranked source rows are not available.
 
-Current validated state: source-line coverage exists (`dwarf-line-table-only`), but neither static-cost line ranking nor runtime sampled line ranking is available yet.
+Current MXFP4 state: task-to-ZEBin selection and IGA PC extraction work, but cost-ranked source rows remain blocked by missing source-line DWARF in the selected compute ZEBin.

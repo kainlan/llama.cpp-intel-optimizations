@@ -95,8 +95,10 @@ find_zebin_for_section_match() {
     local root="$1"
     local match="$2"
     local candidate
+    local sections
     while IFS= read -r candidate; do
-        if llvm-readelf --sections --wide "${candidate}" 2>/dev/null | grep -Fq "${match}"; then
+        sections="$(llvm-readelf --sections --wide "${candidate}" 2>/dev/null || true)"
+        if grep -Fq "${match}" <<<"${sections}"; then
             printf '%s\n' "${candidate}"
             return 0
         fi
@@ -104,8 +106,9 @@ find_zebin_for_section_match() {
     return 1
 }
 
-configure_cmd=(cmake -S . -B "${BUILD_DIR}" -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_SYCL=ON -DGGML_SYCL_TARGET=INTEL -DGGML_SYCL_F16=ON -DGGML_SYCL_PROFILING_DEBUG=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx)
-build_cmd=(cmake --build "${BUILD_DIR}" --config Release --target sycl-kernel-bench -j "${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc)}")
+PROFILE_BUILD_TYPE=RelWithDebInfo
+configure_cmd=(cmake -S . -B "${BUILD_DIR}" -G Ninja -DCMAKE_BUILD_TYPE="${PROFILE_BUILD_TYPE}" -DGGML_SYCL=ON -DGGML_SYCL_TARGET=INTEL -DGGML_SYCL_F16=ON -DGGML_SYCL_PROFILING_DEBUG=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx)
+build_cmd=(cmake --build "${BUILD_DIR}" --config "${PROFILE_BUILD_TYPE}" --target sycl-kernel-bench -j "${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc)}")
 bench_cmd=("${BUILD_DIR}/bin/sycl-kernel-bench" --kernel="${TARGET_KERNEL}" --quant=MXFP4 --dim_m=2880 --dim_n=4 --dim_k=2880 --iterations=100 --warmup=10 --validate --output=json)
 vtune_dir="${OUT_ROOT}/vtune-source-line"
 
