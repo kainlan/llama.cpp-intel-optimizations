@@ -82,7 +82,9 @@ if (GGML_SYCL)
         "-fsycl"
         "-fsycl-device-code-split=per_kernel"
         "-Wl,--gc-sections")
-    target_compile_definitions(sycl-mxfp4-source-line-probe PRIVATE GGML_SYCL_WARP_SIZE=32)
+    target_compile_definitions(sycl-mxfp4-source-line-probe PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        SYCL_MXFP4_SOURCE_LINE_PROBE_ONLY=1)
 
     if (GGML_SYCL_PROFILING_DEBUG)
         target_compile_options(sycl-mxfp4-source-line-probe PRIVATE

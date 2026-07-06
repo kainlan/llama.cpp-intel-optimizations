@@ -498,6 +498,8 @@ static bool validate_q8_1_soa_from_f32_rows(const std::vector<float> &   src,
     return true;
 }
 
+#ifndef SYCL_MXFP4_SOURCE_LINE_PROBE_ONLY
+// Source-line probe excludes unrelated standalone/selected MXFP4 benchmark paths.
 static bool validate_inline_dot(const GeneratedWeights &     weights,
                                 const GeneratedActivations & activations,
                                 const std::vector<float> &   actual,
@@ -1102,6 +1104,8 @@ bool run_mxfp4_selected_kmajor(const GeneratedWeights &     weights,
     cleanup();
     return true;
 }
+
+#endif  // !SYCL_MXFP4_SOURCE_LINE_PROBE_ONLY
 
 bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
                         const GeneratedActivations & activations,
@@ -1752,6 +1756,8 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     return true;
 }
 
+#ifndef SYCL_MXFP4_SOURCE_LINE_PROBE_ONLY
+// Source-line probe keeps only the pair-GLU launch path after this point.
 bool run_mxfp4_layer_glu_down(const GeneratedWeights &     weights,
                               const GeneratedActivations & activations,
                               int64_t                      m,
@@ -5812,5 +5818,7 @@ bool run_mxfp4_mmv_id_xmx_tiled(const GeneratedWeights &     weights,
     cleanup();
     return true;
 }
+
+#endif  // !SYCL_MXFP4_SOURCE_LINE_PROBE_ONLY
 
 }  // namespace sycl_bench
