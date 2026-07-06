@@ -18,7 +18,7 @@ def test_source_line_feasibility_script_is_dry_run_by_default() -> None:
     assert result.returncode == 0, result.stdout
     assert "DRY RUN" in result.stdout
     assert "-DGGML_SYCL_PROFILING_DEBUG=ON" in result.stdout
-    assert "sycl-kernel-bench" in result.stdout
+    assert "sycl-mxfp4-source-line-probe" in result.stdout
     assert "gpu-profiling-mode=source-analysis" in result.stdout
     assert "source-analysis=mem-latency" in result.stdout
     assert "dump-compute-task-binaries=true" in result.stdout
@@ -101,7 +101,7 @@ def test_source_line_feasibility_script_handles_absolute_build_dir_in_dry_run(tm
         check=False,
     )
     assert result.returncode == 0, result.stdout
-    expected_bench = build_dir / "bin" / "sycl-kernel-bench"
+    expected_bench = build_dir / "bin" / "sycl-mxfp4-source-line-probe"
     assert str(expected_bench).replace(" ", "\\ ") in result.stdout
     assert ".//tmp" not in result.stdout
 
@@ -163,6 +163,8 @@ def test_source_line_feasibility_execute_branch_selects_zebin_by_vtune_task_sect
     assert "selected_task_from_parse" in text
     assert "iga_section_match_from_task" in text
     assert "find_zebin_for_section_match" in text
+    assert "fallback_iga_section_match_from_target" in text
+    assert "mxfp4_pair_glu_xmx_tiled_dpas_m2_kernelILi8ELi3ELb0ELb0E" in text
     assert "selected_zebin" in text
     assert "iga-section-selection.parse" in text
     assert "--kernel-match \"${iga_section_match}\"" in text

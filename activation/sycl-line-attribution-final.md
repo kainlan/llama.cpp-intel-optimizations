@@ -22,7 +22,7 @@ Results:
 - MXFP4 task-to-ZEBin selection: fixed; selected task maps to `.text._ZTS39mxfp4_pair_glu_xmx_tiled_dpas_m2_kernelILi8ELi3ELb0ELb0EE`
 - MXFP4 IGA extraction: fixed; `extract.status ok`
 - MXFP4 IGA PC rows: present; `1583` CSV lines in `iga-pc-instructions.csv`
-- MXFP4 remaining blocker: selected compute ZEBin has no `.debug_line` / usable DWARF source rows (`source_line.debug_line_present 0`, `source_line.status fail` on structured replay)
+- MXFP4 remaining blocker: selected compute ZEBin has no `.debug_line` / usable DWARF source rows (`source_line.debug_line_present 0`, `source_line.status fail` on structured replay and on the narrow `sycl-mxfp4-source-line-probe` attempt)
 
 Detailed report: `activation/sycl-iga-pc-source-line-validation.md`.
 
@@ -32,7 +32,8 @@ Existing implementation artifacts are present:
 - `scripts/parse-sycl-iga-pc-disasm.py` parses IGA JSON/text rows with explicit PCs, including real JSON v2 `elems` / `kind: "I"` output.
 - `scripts/resolve-sycl-zebin-asm-source-lines.py --iga-instructions-csv --pc-base` maps kernel-matched IGA section-relative PCs through DWARF line ranges.
 - Matrix and MXFP4 runners prefer `iga-pc-instructions.csv` and fall back to `ocloc`/DWARF without fabricating static-cost evidence.
-- The MXFP4 runner now selects the ZEBin matching the VTune-selected compute task instead of trusting the first archived binary.
+- The MXFP4 runner now selects the ZEBin matching the VTune-selected compute task instead of trusting the first archived binary; if VTune task export is empty, it uses an explicit fallback section substring for the default MXFP4 registry kernel.
+- `sycl-mxfp4-source-line-probe` builds as a narrower diagnostic executable, but it still compiles the large `mxfp4_inline_dot.cpp` device image and therefore did not restore `.debug_line` in validation root `/tmp/sycl_mxfp4_source_line_probe_gpu_20260705_222039`.
 
 Result: `asm-line-static-cost` is a real validated static evidence level for source-line probe artifacts. For MXFP4, follow-up `llama.cpp-040b` remains open because the selected compute ZEBin does not carry `.debug_line` / usable source-line DWARF for PC-to-line mapping.
 
@@ -88,4 +89,4 @@ For TG optimization today, use:
 3. `asm-line-static-cost` for artifacts whose IGA PC rows and DWARF line rows both validate; currently this is true for the standalone probe, not for the MXFP4 target ZEBin.
 4. `dwarf-line-table-only` as coverage/fallback when cost-ranked source rows are not available.
 
-Current MXFP4 state: task-to-ZEBin selection and IGA PC extraction work, but cost-ranked source rows remain blocked by missing `.debug_line` / source-line DWARF in the selected compute ZEBin.
+Current MXFP4 state: task-to-ZEBin selection and IGA PC extraction work for the full benchmark path, and the narrow probe target builds/runs, but cost-ranked source rows remain blocked by missing `.debug_line` / source-line DWARF in the selected compute ZEBin.

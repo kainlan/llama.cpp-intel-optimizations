@@ -106,10 +106,24 @@ find_zebin_for_section_match() {
     return 1
 }
 
+fallback_iga_section_match_from_target() {
+    local target="$1"
+    local fallback="$2"
+    case "${target}" in
+        mxfp4_pair_glu_xmx_tiled_packed_r8_m2_sparse32_bias)
+            printf '%s\n' "mxfp4_pair_glu_xmx_tiled_dpas_m2_kernelILi8ELi3ELb0ELb0E"
+            ;;
+        *)
+            printf '%s\n' "${fallback}"
+            ;;
+    esac
+}
+
 PROFILE_BUILD_TYPE=RelWithDebInfo
+PROFILE_TARGET=sycl-mxfp4-source-line-probe
 configure_cmd=(cmake -S . -B "${BUILD_DIR}" -G Ninja -DCMAKE_BUILD_TYPE="${PROFILE_BUILD_TYPE}" -DGGML_SYCL=ON -DGGML_SYCL_TARGET=INTEL -DGGML_SYCL_F16=ON -DGGML_SYCL_PROFILING_DEBUG=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx)
-build_cmd=(cmake --build "${BUILD_DIR}" --config "${PROFILE_BUILD_TYPE}" --target sycl-kernel-bench -j "${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc)}")
-bench_cmd=("${BUILD_DIR}/bin/sycl-kernel-bench" --kernel="${TARGET_KERNEL}" --quant=MXFP4 --dim_m=2880 --dim_n=4 --dim_k=2880 --iterations=100 --warmup=10 --validate --output=json)
+build_cmd=(cmake --build "${BUILD_DIR}" --config "${PROFILE_BUILD_TYPE}" --target "${PROFILE_TARGET}" -j "${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc)}")
+bench_cmd=("${BUILD_DIR}/bin/${PROFILE_TARGET}" --kernel="${TARGET_KERNEL}" --quant=MXFP4 --dim_m=2880 --dim_n=4 --dim_k=2880 --iterations=100 --warmup=10 --validate --output=json)
 vtune_dir="${OUT_ROOT}/vtune-source-line"
 
 print_plan() {
@@ -195,7 +209,11 @@ if ! python3 scripts/parse-sycl-vtune-tasks.py "${OUT_ROOT}/vtune-computing-task
     printf 'warning: failed to parse VTune computing tasks for match %s\n' "${TASK_MATCH}" >&2
 fi
 selected_task="$(selected_task_from_parse "${OUT_ROOT}/vtune-task.parse" || true)"
-iga_section_match="$(iga_section_match_from_task "${selected_task:-${TASK_MATCH}}")"
+if [[ -n "${selected_task}" ]]; then
+    iga_section_match="$(iga_section_match_from_task "${selected_task}")"
+else
+    iga_section_match="$(fallback_iga_section_match_from_target "${TARGET_KERNEL}" "${TASK_MATCH}")"
+fi
 first_zebin="$(find_zebin_for_section_match "${vtune_dir}" "${iga_section_match}" || true)"
 if [[ -z "${first_zebin}" ]]; then
     printf 'warning: no .zebin section matched %s; falling back to first archived ZEBin\n' "${iga_section_match}" >&2

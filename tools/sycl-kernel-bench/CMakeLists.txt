@@ -61,6 +61,44 @@ if (GGML_SYCL)
     endif()
 endif()
 
+if (GGML_SYCL)
+    add_executable(sycl-mxfp4-source-line-probe
+        mxfp4_source_line_probe.cpp
+        kernels/reference/mxfp4_inline_dot.cpp
+    )
+    target_link_libraries(sycl-mxfp4-source-line-probe PRIVATE llama-common ggml)
+    target_compile_features(sycl-mxfp4-source-line-probe PRIVATE cxx_std_17)
+    target_include_directories(sycl-mxfp4-source-line-probe PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/include
+        ${PROJECT_SOURCE_DIR}/ggml/src
+    )
+    target_compile_options(sycl-mxfp4-source-line-probe PRIVATE
+        "-fsycl"
+        "-Wno-narrowing"
+        "-fsycl-device-code-split=per_kernel"
+        "-ffunction-sections"
+        "-fdata-sections")
+    target_link_options(sycl-mxfp4-source-line-probe PRIVATE
+        "-fsycl"
+        "-fsycl-device-code-split=per_kernel"
+        "-Wl,--gc-sections")
+    target_compile_definitions(sycl-mxfp4-source-line-probe PRIVATE GGML_SYCL_WARP_SIZE=32)
+
+    if (GGML_SYCL_PROFILING_DEBUG)
+        target_compile_options(sycl-mxfp4-source-line-probe PRIVATE
+            "-g"
+            "-gline-tables-only"
+            "-fdebug-info-for-profiling"
+            "-fsycl-instrument-device-code")
+        target_link_options(sycl-mxfp4-source-line-probe PRIVATE "-fsycl-instrument-device-code")
+    endif()
+
+    if (GGML_SYCL_TARGET STREQUAL "INTEL")
+        target_link_libraries(sycl-mxfp4-source-line-probe PRIVATE DNNL::dnnl)
+        target_compile_definitions(sycl-mxfp4-source-line-probe PRIVATE GGML_SYCL_DNNL=1)
+    endif()
+endif()
+
 if (LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET} RUNTIME)
 endif()

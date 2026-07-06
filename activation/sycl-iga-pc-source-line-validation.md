@@ -181,7 +181,27 @@ Build logs also show the relevant Intel device debug-info warning:
 warning: VCDebugInfo: only modules with one CU are supported at the moment, the debug information for Module will be dropped out.
 ```
 
-The latest run had 20 such warnings. A global `-g -fdebug-info-for-profiling -fsycl-instrument-device-code` experiment against the whole target failed the compiler backend (`gen compiler command failed with exit code 254`), so the runner was left at the safer `RelWithDebInfo` target-debug configuration.
+The latest full-benchmark run had 20 such warnings. A global `-g -fdebug-info-for-profiling -fsycl-instrument-device-code` experiment against the whole target failed the compiler backend (`gen compiler command failed with exit code 254`), so the runner was left at the safer `RelWithDebInfo` target-debug configuration.
+
+A narrower diagnostic executable, `sycl-mxfp4-source-line-probe`, was added and built successfully. It links only `mxfp4_source_line_probe.cpp` plus `kernels/reference/mxfp4_inline_dot.cpp`, uses `sycl::gpu_selector_v`, and reuses the same pair-GLU launcher. Validation root:
+
+```text
+/tmp/sycl_mxfp4_source_line_probe_gpu_20260705_222039
+```
+
+That attempt also failed to produce source-line DWARF:
+
+```text
+source_line.debug_line_present 0
+source_line.vtune_no_gpu_side_trace 1
+source_line.gtpin_register_pressure 1
+source_line.dwarf_status error
+source_line.dwarf_error no source rows found
+source_line.blocker missing_debug_line
+source_line.status fail
+```
+
+The narrow target still compiles the large `mxfp4_inline_dot.cpp` device image, so it archives all MXFP4 sections and does not by itself solve the missing `.debug_line` problem. The runner now has an explicit fallback section match for the default registry kernel so an empty VTune computing-task report does not degrade to an ambiguous broad section match.
 
 Interpretation: the remaining MXFP4 blocker is no longer IGA parsing or task-to-section selection. It is that the selected compute ZEBin lacks `.debug_line` / usable source-line DWARF, so numeric IGA PCs cannot be mapped to `mmvq.cpp` line rows.
 
@@ -196,8 +216,8 @@ Interpretation: the remaining MXFP4 blocker is no longer IGA parsing or task-to-
 
 The next fix should make the MXFP4 selected compute ZEBin contain usable source-line DWARF without breaking the compiler backend. Candidate directions:
 
-1. isolate the MXFP4 source-line target so the device image has one compile unit, avoiding the `VCDebugInfo` multi-CU debug-info drop;
+1. split or guard `mxfp4_inline_dot.cpp` so the source-line target compiles only the needed pair-GLU kernel family, not the whole multi-kernel device image;
 2. investigate oneAPI device debug flags that preserve ZEBin line tables for this multi-kernel `sycl-kernel-bench` target;
-3. add a narrow source-line probe for the MXFP4 kernel shape if the full benchmark target cannot preserve device DWARF.
+3. keep `sycl-mxfp4-source-line-probe` as the narrow execution harness once the device image itself can be reduced or made to preserve `.debug_line`.
 
 Label-only `ocloc` rows such as `L0:` are still not byte PC evidence and must not be promoted to `asm-line-static-cost`.
