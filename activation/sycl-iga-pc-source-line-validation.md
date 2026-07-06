@@ -14,7 +14,7 @@ source /opt/intel/oneapi/setvars.sh --force
 set -u
 ```
 
-Result: **IGA static attribution is now validated on the standalone probe, but still not validated for the MXFP4 target kernel.**
+Result: **IGA static attribution is now validated for the standalone probe and, after source-line-only device TU isolation, for the MXFP4 pair-GLU target kernel.**
 
 Required semantics remain:
 
@@ -208,9 +208,9 @@ Interpretation: the remaining MXFP4 blocker is no longer IGA parsing or task-to-
 ## Final status
 
 - Probe static IGA line attribution: **validated** as `source_line.status asm-line-static-cost`.
-- MXFP4 static IGA line attribution: **blocked** by missing `.debug_line` / ZEBin DWARF source rows for the selected compute task.
+- MXFP4 static IGA line attribution: **validated** after isolating the source-line probe's pair-GLU device TU.
 - Runtime sampled source-line attribution: still unavailable; VTune `pass` remains separate and future sampled PC CSV work remains separate.
-- `llama.cpp-040b` should remain open for MXFP4-specific source-row enablement.
+- `llama.cpp-040b` can now be closed for MXFP4 static source-row enablement once the final validation/reporting commit lands.
 
 ## Follow-up blocker
 
@@ -299,4 +299,113 @@ safe and narrows the diagnostic target, but it is **not sufficient** to make the
 selected MXFP4 compute ZEBin retain `.debug_line`. The remaining source-row
 enablement likely has to reduce or isolate the linked SYCL device module that
 contains `mmvq.cpp` / `ggml_sycl_mxfp4_pair_glu_bench_launch`, not only the tool
-side host/benchmark wrapper. `llama.cpp-040b` remains open.
+side host/benchmark wrapper.
+
+## 2026-07-06 source-line-only device TU validation: passed static attribution
+
+Follow-up implementation for `llama.cpp-f0z3` added a minimal source-line-only
+SYCL device TU for `sycl-mxfp4-source-line-probe`:
+
+```text
+tools/sycl-kernel-bench/kernels/reference/mxfp4_pair_glu_source_line_device.cpp
+```
+
+The normal backend and normal `sycl-kernel-bench` target remain unchanged; the
+minimal TU is linked only into `sycl-mxfp4-source-line-probe`. It isolates the
+packed-r8, m2, sparse32, bias pair-GLU launcher path and avoids linking the full
+`ggml/src/ggml-sycl/mmvq.cpp` device image into the source-line probe.
+
+Lead source/build gates:
+
+```text
+python3 -m pytest tests/test-sycl-mxfp4-source-line-probe-source.py tests/test-sycl-vtune-source-line-feasibility-script.py -q
+15 passed
+
+git diff --check
+passed
+
+bash -n scripts/sycl-vtune-source-line-feasibility.sh
+passed
+
+./scripts/sycl-build.sh sycl-mxfp4-source-line-probe
+Build succeeded
+```
+
+Lead-only real validation was rerun on B50 with oneAPI sourced via the required
+`set +u` / `setvars.sh` / `set -u` sequence.
+
+Validation artifacts:
+
+```text
+OUT_ROOT=/tmp/sycl_mxfp4_source_line_device_tu_20260706_112515
+BUILD_DIR=/tmp/sycl_mxfp4_source_line_device_tu_build_20260706_112515
+```
+
+The diagnostic executable ran successfully under VTune:
+
+```json
+{"kernel":"mxfp4_pair_glu_xmx_tiled_packed_r8_m2_sparse32_bias","ok":true,"latency_us":1306.713100,"throughput_tps":765.278928,"throughput_tops":0.000000,"bandwidth_gbps":27.085333,"error":""}
+```
+
+The selected compute ZEBin now contains usable source-line DWARF and the IGA PC
+resolver maps static instruction PCs to source rows:
+
+```text
+source_line.debug_line_present 1
+source_line.non_unknown_rows 0
+source_line.vtune_sampled_non_unknown_rows 0
+source_line.vtune_no_gpu_side_trace 1
+source_line.gtpin_no_kernels 0
+source_line.gtpin_register_pressure 0
+source_line.required_kernel mxfp4_pair_glu_xmx_tiled_packed_r8_m2_sparse32_bias
+source_line.dwarf_status ok
+source_line.dwarf_source_rows 1194
+source_line.dwarf_required_path_present 1
+source_line.dwarf_source_line_rows 1194
+source_line.allow_dwarf_line_table_only 1
+source_line.asm_source_line_rows 65
+source_line.allow_asm_line_static_cost 1
+source_line.asm_top_source_line /tmp/sycl_mxfp4_source_line_device_tu_build_20260706_112515/ggml/src/ggml-sycl/mmvq.cpp:7114
+source_line.asm_top_static_score 112
+source_line.asm_top_instruction_count 112
+source_line.source_attribution_mode asm-line-static
+source_line.blocker none
+source_line.status asm-line-static-cost
+```
+
+Section selection and IGA extraction stayed on the intended pair-GLU compute
+section:
+
+```text
+selected_task
+iga_section_match mxfp4_pair_glu_xmx_tiled_dpas_m2_kernelILi8ELi3ELb0ELb0E
+selected_zebin /tmp/sycl_mxfp4_source_line_device_tu_20260706_112515/vtune-source-line/archive/binaries/1b397d0a5a29ad3f.zebin/3a66db6e48a577b392dae0880bd818db/1b397d0a5a29ad3f.zebin
+```
+
+```json
+{
+  "extract.kernel_match": "mxfp4_pair_glu_xmx_tiled_dpas_m2_kernelILi8ELi3ELb0ELb0E",
+  "extract.platform": "xe2",
+  "extract.section": ".text._ZTS39mxfp4_pair_glu_xmx_tiled_dpas_m2_kernelILi8ELi3ELb0ELb0EE",
+  "extract.section_addr": "0x0",
+  "extract.status": "ok"
+}
+```
+
+IGA resolver summary:
+
+```text
+asm_source.status ok
+asm_source.mapped_instruction_count 733
+asm_source.unmapped_instruction_count 849
+asm_source.source_line_rows 65
+asm_source.top_source_line /tmp/sycl_mxfp4_source_line_device_tu_build_20260706_112515/ggml/src/ggml-sycl/mmvq.cpp:7114
+asm_source.top_static_score 112
+asm_source.top_instruction_count 112
+```
+
+Interpretation: MXFP4 static source-line attribution is now validated as
+`source_line.status asm-line-static-cost`. VTune sampled exact source-line rows
+remain unavailable in this environment (`source_line.vtune_no_gpu_side_trace 1`),
+so `source_line.status pass` / `source_attribution.status exact_source_line`
+remain reserved for a future sampled VTune or sampled-PC producer.
