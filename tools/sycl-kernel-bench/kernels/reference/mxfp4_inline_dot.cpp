@@ -237,6 +237,11 @@ static bool select_mxfp4_xmx_tiles_n(sycl::queue & queue, int requested, int & t
         return false;
     }
 
+#ifdef SYCL_MXFP4_SOURCE_LINE_PROBE_ONLY
+    (void) queue;
+    tiles_n = requested != 0 ? requested : 1;
+    return true;
+#else
     const int    device_id = ggml_sycl_get_device_id_from_queue(queue);
     const auto & caps      = ggml_sycl_info().devices[device_id].xmx_caps;
     if (!xmx_capabilities_match_int8_tile(caps, GGML_SYCL_MXFP4_MOE_XMX_M, GGML_SYCL_MXFP4_MOE_XMX_N,
@@ -267,6 +272,7 @@ static bool select_mxfp4_xmx_tiles_n(sycl::queue & queue, int requested, int & t
         return false;
     }
     return true;
+#endif
 }
 
 static inline float mxfp4_e8m0_to_fp32_device(uint8_t x) {
@@ -492,6 +498,129 @@ static bool validate_q8_1_soa_from_f32_rows(const std::vector<float> &   src,
                               actual_sum, expected_s, max_d_diff, max_sum_diff);
                 error = msg;
                 return false;
+            }
+        }
+    }
+    return true;
+}
+
+static inline float mxfp4_source_line_e8m0_to_fp32(uint8_t e) {
+    uint32_t bits;
+    if (e < 2) {
+        bits = e == 0 ? 0x00200000u : 0x00400000u;
+    } else {
+        bits = static_cast<uint32_t>(e - 1) << 23;
+    }
+    float result;
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+static inline float q8_1_soa_scale_host(const uint8_t * q8_row, int64_t k, int64_t block) {
+    const uint8_t * scale_ptr = q8_row + static_cast<size_t>(k) + static_cast<size_t>(block) * sizeof(sycl::half2);
+    sycl::half2     ds_vals;
+    std::memcpy(&ds_vals, scale_ptr, sizeof(ds_vals));
+    return static_cast<float>(ds_vals.x());
+}
+
+static bool validate_pair_glu_cpu_reference(const std::vector<uint8_t> & expert_layout,
+                                            const std::vector<uint8_t> & activations_q8_1,
+                                            const std::vector<int32_t> & host_ids,
+                                            const std::vector<float> &   host_gate_bias,
+                                            const std::vector<float> &   host_up_bias,
+                                            const std::vector<float> &   actual,
+                                            int64_t                      m,
+                                            int64_t                      n_selected,
+                                            int64_t                      k,
+                                            int64_t                      n_tokens,
+                                            int64_t                      q8_row_bytes,
+                                            int                          scale_stride_blocks,
+                                            size_t                       expert_slots,
+                                            float                        alpha,
+                                            float                        limit,
+                                            std::string &                error) {
+    if (m <= 0 || n_selected <= 0 || k <= 0 || n_tokens <= 0 || q8_row_bytes <= 0 || (k % QK_MXFP4) != 0 ||
+        (k % QK8_1) != 0) {
+        error = "mxfp4_pair_glu CPU validation received invalid dimensions.";
+        return false;
+    }
+    const int64_t blocks_per_row = k / QK_MXFP4;
+    if (scale_stride_blocks < blocks_per_row) {
+        error = "mxfp4_pair_glu CPU validation received an invalid scale stride.";
+        return false;
+    }
+
+    const size_t selected_count = static_cast<size_t>(n_selected);
+    const size_t token_count    = static_cast<size_t>(n_tokens);
+    const size_t rows           = static_cast<size_t>(m);
+    const size_t ids_count      = selected_count * token_count;
+    const size_t out_count      = ids_count * rows;
+    const size_t qs_bytes       = rows * static_cast<size_t>(blocks_per_row) * (QK_MXFP4 / 2);
+    const size_t scale_bytes    = rows * static_cast<size_t>(scale_stride_blocks);
+    if (expert_layout.size() < qs_bytes + scale_bytes ||
+        activations_q8_1.size() < token_count * static_cast<size_t>(q8_row_bytes) || host_ids.size() < ids_count ||
+        actual.size() < out_count) {
+        error = "mxfp4_pair_glu CPU validation received undersized buffers.";
+        return false;
+    }
+
+    double max_err = 0.0;
+    double sum_err = 0.0;
+    size_t checked = 0;
+    for (size_t token = 0; token < token_count; ++token) {
+        const uint8_t * q8_row = activations_q8_1.data() + token * static_cast<size_t>(q8_row_bytes);
+        for (size_t sel = 0; sel < selected_count; ++sel) {
+            const int32_t expert_id = host_ids[token * selected_count + sel];
+            if (expert_id < 0 || static_cast<size_t>(expert_id) >= expert_slots) {
+                error = "mxfp4_pair_glu CPU validation received an out-of-range expert id.";
+                return false;
+            }
+            for (size_t row = 0; row < rows; ++row) {
+                float dot = 0.0f;
+                for (int64_t block = 0; block < blocks_per_row; ++block) {
+                    const size_t    block_idx = row * static_cast<size_t>(blocks_per_row) + static_cast<size_t>(block);
+                    const uint8_t * qs        = expert_layout.data() + block_idx * (QK_MXFP4 / 2);
+                    const uint8_t   e     = expert_layout[qs_bytes + row * static_cast<size_t>(scale_stride_blocks) +
+                                                    static_cast<size_t>(block)];
+                    const float     scale = mxfp4_source_line_e8m0_to_fp32(e) * q8_1_soa_scale_host(q8_row, k, block);
+                    const int8_t *  q8_qs =
+                        reinterpret_cast<const int8_t *>(q8_row) + static_cast<size_t>(block) * QK8_1;
+                    for (int i = 0; i < QK_MXFP4 / 2; ++i) {
+                        const uint8_t packed = qs[i];
+                        dot += scale * static_cast<float>(mxfp4_code_value(packed & 0x0f)) *
+                               static_cast<float>(q8_qs[static_cast<size_t>(i)]);
+                        dot += scale * static_cast<float>(mxfp4_code_value(packed >> 4)) *
+                               static_cast<float>(q8_qs[static_cast<size_t>(i + QK_MXFP4 / 2)]);
+                    }
+                }
+
+                float gate = dot;
+                float up   = dot;
+                if (!host_gate_bias.empty()) {
+                    gate += host_gate_bias[static_cast<size_t>(expert_id) * rows + row];
+                }
+                if (!host_up_bias.empty()) {
+                    up += host_up_bias[static_cast<size_t>(expert_id) * rows + row];
+                }
+                const float  gate_limited = std::fmin(gate, limit);
+                const float  up_limited   = std::fmax(std::fmin(up, limit), -limit);
+                const float  expected = (gate_limited / (1.0f + std::exp(-gate_limited * alpha))) * (1.0f + up_limited);
+                const size_t idx      = token * selected_count * rows + sel * rows + row;
+                const double diff     = std::fabs(static_cast<double>(actual[idx]) - static_cast<double>(expected));
+                max_err               = std::max(max_err, diff);
+                sum_err += diff;
+                ++checked;
+                const double tol = 1e-2 + 1e-2 * std::fabs(static_cast<double>(expected));
+                if (!std::isfinite(actual[idx]) || diff > tol) {
+                    char msg[320];
+                    std::snprintf(msg, sizeof(msg),
+                                  "mxfp4_pair_glu CPU validation failed at %zu: actual=%.6f expected=%.6f "
+                                  "diff=%.6f tol=%.6f max=%.6f mean=%.6f.",
+                                  idx, static_cast<double>(actual[idx]), static_cast<double>(expected), diff, tol,
+                                  max_err, sum_err / static_cast<double>(checked));
+                    error = msg;
+                    return false;
+                }
             }
         }
     }
@@ -1307,12 +1436,16 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
         std::copy(launch_layout.begin(), launch_layout.end(), up_slices.begin() + slot * expert_bytes);
     }
 
-    uint8_t *        d_gate            = sycl::malloc_device<uint8_t>(weight_bytes, queue);
-    uint8_t *        d_up              = sycl::malloc_device<uint8_t>(weight_bytes, queue);
-    const uint8_t ** d_gate_ptrs       = sycl::malloc_device<const uint8_t *>(expert_slots, queue);
-    const uint8_t ** d_up_ptrs         = sycl::malloc_device<const uint8_t *>(expert_slots, queue);
-    const bool       needs_ref_weights = predecoded_i8 || xmx_tiled;
-    uint8_t *        d_ref_gate =
+    uint8_t *        d_gate      = sycl::malloc_device<uint8_t>(weight_bytes, queue);
+    uint8_t *        d_up        = sycl::malloc_device<uint8_t>(weight_bytes, queue);
+    const uint8_t ** d_gate_ptrs = sycl::malloc_device<const uint8_t *>(expert_slots, queue);
+    const uint8_t ** d_up_ptrs   = sycl::malloc_device<const uint8_t *>(expert_slots, queue);
+#ifdef SYCL_MXFP4_SOURCE_LINE_PROBE_ONLY
+    const bool needs_ref_weights = false;
+#else
+    const bool needs_ref_weights = predecoded_i8 || xmx_tiled;
+#endif
+    uint8_t * d_ref_gate =
         needs_ref_weights ? sycl::malloc_device<uint8_t>(expert_layout.size() * expert_slots, queue) : nullptr;
     uint8_t * d_ref_up =
         needs_ref_weights ? sycl::malloc_device<uint8_t>(expert_layout.size() * expert_slots, queue) : nullptr;
@@ -1332,8 +1465,12 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     float *   d_up_bias            = use_bias ? sycl::malloc_device<float>(bias_count, queue) : nullptr;
     uint8_t * d_fused_down_q8 =
         validate_fused_down_q8 ? sycl::malloc_device<uint8_t>(fused_down_q8_bytes, queue) : nullptr;
+#ifdef SYCL_MXFP4_SOURCE_LINE_PROBE_ONLY
+    const bool need_ref_out = false;
+#else
     const bool need_ref_out =
         validate && (direct_xmx || xmx_tiled || xmx_tiled_grouped || split_gate_up || vector_qs_load);
+#endif
     float *  d_ref_out  = need_ref_out ? sycl::malloc_device<float>(out_count, queue) : nullptr;
     float *  d_gate_tmp = split_gate_up ? sycl::malloc_device<float>(out_count, queue) : nullptr;
     float *  d_up_tmp   = split_gate_up ? sycl::malloc_device<float>(out_count, queue) : nullptr;
@@ -1683,6 +1820,14 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
                 return false;
             }
         }
+#ifdef SYCL_MXFP4_SOURCE_LINE_PROBE_ONLY
+        if (!validate_pair_glu_cpu_reference(expert_layout, activations.q8_1, host_ids, host_gate_bias, host_up_bias,
+                                             actual, m, n_selected, k, n_tokens, q8_row_bytes, scale_stride,
+                                             expert_slots, args.alpha, args.limit, error)) {
+            cleanup();
+            return false;
+        }
+#else
         if (need_ref_out) {
             queue.memset(d_ref_out, 0, out_bytes).wait();
             ggml_sycl::mxfp4_pair_glu_bench_args ref_args = args;
@@ -1750,6 +1895,7 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
                 }
             }
         }
+#endif
     }
 
     cleanup();

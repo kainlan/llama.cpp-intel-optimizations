@@ -65,8 +65,9 @@ if (GGML_SYCL)
     add_executable(sycl-mxfp4-source-line-probe
         mxfp4_source_line_probe.cpp
         kernels/reference/mxfp4_inline_dot.cpp
+        kernels/reference/mxfp4_pair_glu_source_line_device.cpp
     )
-    target_link_libraries(sycl-mxfp4-source-line-probe PRIVATE llama-common ggml)
+    target_link_libraries(sycl-mxfp4-source-line-probe PRIVATE ggml-base)
     target_compile_features(sycl-mxfp4-source-line-probe PRIVATE cxx_std_17)
     target_include_directories(sycl-mxfp4-source-line-probe PRIVATE
         ${PROJECT_SOURCE_DIR}/ggml/include
@@ -95,10 +96,6 @@ if (GGML_SYCL)
         target_link_options(sycl-mxfp4-source-line-probe PRIVATE "-fsycl-instrument-device-code")
     endif()
 
-    if (GGML_SYCL_TARGET STREQUAL "INTEL")
-        target_link_libraries(sycl-mxfp4-source-line-probe PRIVATE DNNL::dnnl)
-        target_compile_definitions(sycl-mxfp4-source-line-probe PRIVATE GGML_SYCL_DNNL=1)
-    endif()
 endif()
 
 if (LLAMA_TOOLS_INSTALL)
