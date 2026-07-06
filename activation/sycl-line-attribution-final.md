@@ -80,7 +80,16 @@ Existing implementation artifacts are present:
 - `scripts/check-sycl-vtune-source-lines.py`, `scripts/parse-sycl-source-attribution.py`, and `scripts/merge-sycl-staged-ledger.py` keep `sampled-line-cost` / `sampled_line_cost` distinct from VTune exact source rows.
 - `scripts/sycl-intel-pc-sampling-capability.sh` reports `available`, `metrics_only`, or `unavailable`, enumerates Level Zero metric properties including `ZET_METRIC_TYPE_IP`, and never synthesizes `pc-samples.csv`.
 
-No true sampled runtime source-line attribution is available from Level Zero/PTI/VTune metric tooling on this host yet. The installed PTI/Level Zero stack exposes metric counters, but no instruction-pointer metric source (`ip_metric_count 0`).
+No true sampled runtime source-line attribution is available from Level Zero/PTI/VTune metric tooling on this host yet. The installed PTI/Level Zero stack exposes metric counters, but no instruction-pointer metric source (`ip_metric_count 0`). A follow-up targeted VTune `stall-sampling` probe also failed to configure on both B50 (`target-gpu=0:7:0.0`) and B580 (`target-gpu=0:3:0.0`), while a targeted B50 `mem-latency` rerun still produced empty `gpu-source-line`/`computing-task` reports and zero sampled/source execution rows in `dicer.db`.
+
+Latest negative sampled-PC probe artifacts:
+
+```text
+/tmp/sycl_cpne_stall_sampling_probe_20260706_163026
+/tmp/sycl_cpne_stall_sampling_b50_20260706_163051
+/tmp/sycl_cpne_stall_sampling_b580_20260706_163117
+/tmp/sycl_cpne_memlatency_b50_targeted_20260706_163227
+```
 
 A separate runtime-count path is now validated through VTune's embedded GTPin
 `memorytrace.so` profiler. This produces positive runtime BBL execution counts

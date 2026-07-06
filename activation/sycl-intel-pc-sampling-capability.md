@@ -238,3 +238,61 @@ renamed to `sampled-line-cost`: it is a GTPin memorytrace BBL execution-count
 profile for the profiled trace scope. The accepted status for this evidence is
 `gtpin_bbl_runtime_cost`; `sampled-line-cost` remains reserved for sampled PC
 rows from a true sampling producer.
+
+## 2026-07-06 follow-up: targeted VTune stall-sampling probe
+
+Follow-up tracker: `llama.cpp-cpne`
+
+After GTPin BBL runtime-count attribution was integrated, lead ran narrow
+VTune source-analysis probes on the standalone
+`sycl-mxfp4-source-line-probe` binary to check whether VTune's hardware
+`stall-sampling` mode can provide a true sampled-PC producer on this host.
+All runs used the required oneAPI sourcing sequence and did not access models or
+`/Storage`.
+
+Artifacts:
+
+```text
+/tmp/sycl_cpne_stall_sampling_probe_20260706_163026
+/tmp/sycl_cpne_stall_sampling_b50_20260706_163051
+/tmp/sycl_cpne_stall_sampling_b580_20260706_163117
+/tmp/sycl_cpne_memlatency_b50_targeted_20260706_163227
+```
+
+Results:
+
+```text
+# default VTune target (iGPU)
+vtune: Error: Unable to run GPU hardware sampling for the GPU adapter: '0:0:2.0'.
+
+# explicit B50 target-gpu=0:7:0.0
+vtune: Error: Cannot configure the collection for the requested devices.
+vtune: Collection failed.
+vtune: Internal Error
+
+# explicit B580 target-gpu=0:3:0.0
+vtune: Error: Cannot configure the collection for the requested devices.
+vtune: Collection failed.
+vtune: Internal Error
+```
+
+A targeted B50 `source-analysis=mem-latency` rerun did execute the probe, but it
+still produced no sampled GPU source rows or sampled-PC-like database tables:
+
+```text
+gpu-source-line.csv size 0
+computing-tasks.csv size 0
+VTune summary: "no GPU-side trace data was collected"
+dd_gpu_execution_stats 0
+dd_compute_task_type 0
+dd_compute_task 0
+dd_compute_sample 0
+dd_sample 0
+```
+
+Installed VTune grouping definitions confirm that the CLI `gpu-source-line`
+grouping is backed by non-empty `gsim_stall_data`, `gpu_sampling_data`, or
+`gpu_gtpin_data`; none of those tables appear in the tested result databases.
+Therefore local VTune stall-sampling and source-analysis modes still do not
+provide a `kernel,pc,sample_count` producer. `sampled-line-cost` remains
+unvalidated.
