@@ -26,6 +26,9 @@ def test_pc_sampling_probe_is_dry_run_by_default(tmp_path: pathlib.Path) -> None
     assert "command -v gtpin64 || command -v gtpin" in result.stdout
     assert "find /opt/intel/oneapi" in result.stdout
     assert "zetMetricGroupGet" in result.stdout
+    assert "zetMetricGetProperties" in result.stdout
+    assert "ZET_ENABLE_METRICS" in result.stdout
+    assert "ip_metric_count" in result.stdout
     assert "level zero metric" in result.stdout.lower()
     assert "pc_sampling.status" in result.stdout
     assert not (tmp_path / "out" / "level-zero-metric-groups.txt").exists()
@@ -36,6 +39,15 @@ def test_pc_sampling_probe_never_synthesizes_pc_sample_csv() -> None:
     assert "pc-samples.csv" in text
     assert ">\"${OUT_ROOT}/pc-samples.csv\"" not in text
     assert "> ${OUT_ROOT}/pc-samples.csv" not in text
+
+
+def test_pc_sampling_probe_distinguishes_ip_metric_capability_from_samples() -> None:
+    text = script_text()
+    assert "ZET_METRIC_TYPE_IP" in text
+    assert "no_level_zero_ip_metric_type_exposed" in text
+    assert "level_zero_ip_metrics_found_but_no_pc_sample_producer" in text
+    assert "level_zero_metrics_are_not_pc_samples" in text
+    assert "status=\"available\"" in text
 
 
 def test_pc_sampling_probe_refuses_execute_without_ack(tmp_path: pathlib.Path) -> None:

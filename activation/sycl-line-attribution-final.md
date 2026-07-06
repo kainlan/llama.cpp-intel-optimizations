@@ -44,13 +44,14 @@ Result: `asm-line-static-cost` is a real validated static evidence level for bot
 
 Status: **schema implemented; runtime PC sampling not available**.
 
-Lead PC-sampling capability probe root:
+Lead PC-sampling capability probe roots:
 
 ```text
 /tmp/sycl_intel_pc_sampling_capability_20260705_175719
+/tmp/sycl_pc_sampling_followup_capability_20260706_115208
 ```
 
-Result:
+Latest result:
 
 ```text
 pc_sampling.status metrics_only
@@ -58,6 +59,16 @@ pc_sampling.blocker no_public_pc_sample_api_confirmed
 pc_sampling.blocker vtune_source_rows_empty
 pc_sampling.blocker gtpin_not_found
 pc_sampling.blocker pti_files_found_but_no_pc_sample_producer
+pc_sampling.blocker level_zero_metrics_are_not_pc_samples
+pc_sampling.blocker no_level_zero_ip_metric_type_exposed
+```
+
+Latest metric-property evidence:
+
+```text
+metric_property_group_count 58
+metric_property_metric_count 2893
+ip_metric_count 0
 ```
 
 Detailed report: `activation/sycl-intel-pc-sampling-capability.md`.
@@ -66,9 +77,9 @@ Existing implementation artifacts are present:
 
 - `scripts/resolve-sycl-pc-samples-to-source-lines.py` maps real `kernel,pc,sample_count,sample_kind` rows to DWARF source lines.
 - `scripts/check-sycl-vtune-source-lines.py`, `scripts/parse-sycl-source-attribution.py`, and `scripts/merge-sycl-staged-ledger.py` keep `sampled-line-cost` / `sampled_line_cost` distinct from VTune exact source rows.
-- `scripts/sycl-intel-pc-sampling-capability.sh` reports `available`, `metrics_only`, or `unavailable`, and never synthesizes `pc-samples.csv`.
+- `scripts/sycl-intel-pc-sampling-capability.sh` reports `available`, `metrics_only`, or `unavailable`, enumerates Level Zero metric properties including `ZET_METRIC_TYPE_IP`, and never synthesizes `pc-samples.csv`.
 
-No true sampled runtime source-line attribution is available from public/local tooling on this host yet.
+No true sampled runtime source-line attribution is available from public/local tooling on this host yet. The installed PTI/Level Zero stack exposes metric counters, but no instruction-pointer metric source (`ip_metric_count 0`) and no producer for a positive-count `kernel,pc,sample_count` CSV.
 
 ## Exact source-line attribution rule
 
