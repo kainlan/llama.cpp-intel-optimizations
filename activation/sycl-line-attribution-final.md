@@ -22,7 +22,7 @@ Results:
 - MXFP4 task-to-ZEBin selection: fixed; selected task maps to `.text._ZTS39mxfp4_pair_glu_xmx_tiled_dpas_m2_kernelILi8ELi3ELb0ELb0EE`
 - MXFP4 IGA extraction: fixed; `extract.status ok`
 - MXFP4 IGA PC rows: present; `1583` CSV lines in `iga-pc-instructions.csv`
-- MXFP4 remaining blocker: selected compute ZEBin has no usable DWARF source rows (`failed to check source lines: no source rows found`)
+- MXFP4 remaining blocker: selected compute ZEBin has no `.debug_line` / usable DWARF source rows (`source_line.debug_line_present 0`, `source_line.status fail` on structured replay)
 
 Detailed report: `activation/sycl-iga-pc-source-line-validation.md`.
 
@@ -34,7 +34,7 @@ Existing implementation artifacts are present:
 - Matrix and MXFP4 runners prefer `iga-pc-instructions.csv` and fall back to `ocloc`/DWARF without fabricating static-cost evidence.
 - The MXFP4 runner now selects the ZEBin matching the VTune-selected compute task instead of trusting the first archived binary.
 
-Result: `asm-line-static-cost` is a real validated static evidence level for source-line probe artifacts. For MXFP4, follow-up `llama.cpp-040b` remains open because the selected compute ZEBin does not carry usable source-line DWARF for PC-to-line mapping.
+Result: `asm-line-static-cost` is a real validated static evidence level for source-line probe artifacts. For MXFP4, follow-up `llama.cpp-040b` remains open because the selected compute ZEBin does not carry `.debug_line` / usable source-line DWARF for PC-to-line mapping.
 
 ## Runtime sampled line attribution
 
@@ -88,4 +88,4 @@ For TG optimization today, use:
 3. `asm-line-static-cost` for artifacts whose IGA PC rows and DWARF line rows both validate; currently this is true for the standalone probe, not for the MXFP4 target ZEBin.
 4. `dwarf-line-table-only` as coverage/fallback when cost-ranked source rows are not available.
 
-Current MXFP4 state: task-to-ZEBin selection and IGA PC extraction work, but cost-ranked source rows remain blocked by missing source-line DWARF in the selected compute ZEBin.
+Current MXFP4 state: task-to-ZEBin selection and IGA PC extraction work, but cost-ranked source rows remain blocked by missing `.debug_line` / source-line DWARF in the selected compute ZEBin.

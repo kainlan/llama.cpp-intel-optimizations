@@ -230,7 +230,10 @@ def test_checker_reports_empty_dwarf_line_dump_without_traceback() -> None:
             "ggml/src/ggml-sycl/mmvq.cpp",
         )
         assert result.returncode == 2
-        assert "failed to check source lines: no source rows found" in result.stdout
+        assert "source_line.dwarf_status error" in result.stdout
+        assert "source_line.dwarf_error no source rows found" in result.stdout
+        assert "source_line.blocker dwarf_no_source_rows_found" in result.stdout
+        assert "source_line.status fail" in result.stdout
         assert "Traceback" not in result.stdout
 
 

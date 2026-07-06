@@ -116,10 +116,29 @@ Latest artifact roots:
 /tmp/sycl_mxfp4_iga_source_line_build_fix4_20260705_210052
 ```
 
-Result:
+Original run result before structured checker replay:
 
 ```text
 failed to check source lines: no source rows found
+```
+
+Structured checker replay after the fail-closed parser improvement:
+
+```text
+source_line.debug_line_present 0
+source_line.non_unknown_rows 0
+source_line.vtune_sampled_non_unknown_rows 0
+source_line.vtune_no_gpu_side_trace 0
+source_line.gtpin_no_kernels 0
+source_line.gtpin_register_pressure 1
+source_line.required_kernel mxfp4_pair_glu_xmx_tiled_packed_r8_m2_sparse32_bias
+source_line.dwarf_status error
+source_line.dwarf_error no source rows found
+source_line.dwarf_source_rows 0
+source_line.dwarf_required_path_present 0
+source_line.source_attribution_mode none
+source_line.blocker missing_debug_line
+source_line.status fail
 ```
 
 The runner now selects the VTune task and matching compute ZEBin correctly:
@@ -148,9 +167,10 @@ IGA parser output exists for the selected section:
 1583 /tmp/sycl_mxfp4_iga_source_line_fix4_20260705_210052/iga-pc-instructions.csv
 ```
 
-However, the selected compute ZEBin has no usable DWARF source rows:
+However, the selected compute ZEBin has no `.debug_line` section / usable DWARF source rows:
 
 ```text
+source_line.debug_line_present 0
 failed to convert ZEBin line table: no source rows found
 failed to resolve ZEBin ASM source lines: no source rows found
 ```
@@ -163,12 +183,12 @@ warning: VCDebugInfo: only modules with one CU are supported at the moment, the 
 
 The latest run had 20 such warnings. A global `-g -fdebug-info-for-profiling -fsycl-instrument-device-code` experiment against the whole target failed the compiler backend (`gen compiler command failed with exit code 254`), so the runner was left at the safer `RelWithDebInfo` target-debug configuration.
 
-Interpretation: the remaining MXFP4 blocker is no longer IGA parsing or task-to-section selection. It is that the selected compute ZEBin lacks usable source-line DWARF, so numeric IGA PCs cannot be mapped to `mmvq.cpp` line rows.
+Interpretation: the remaining MXFP4 blocker is no longer IGA parsing or task-to-section selection. It is that the selected compute ZEBin lacks `.debug_line` / usable source-line DWARF, so numeric IGA PCs cannot be mapped to `mmvq.cpp` line rows.
 
 ## Final status
 
 - Probe static IGA line attribution: **validated** as `source_line.status asm-line-static-cost`.
-- MXFP4 static IGA line attribution: **blocked** by missing/empty ZEBin DWARF source rows for the selected compute task.
+- MXFP4 static IGA line attribution: **blocked** by missing `.debug_line` / ZEBin DWARF source rows for the selected compute task.
 - Runtime sampled source-line attribution: still unavailable; VTune `pass` remains separate and future sampled PC CSV work remains separate.
 - `llama.cpp-040b` should remain open for MXFP4-specific source-row enablement.
 

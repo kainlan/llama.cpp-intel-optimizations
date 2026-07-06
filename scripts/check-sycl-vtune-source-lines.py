@@ -237,18 +237,25 @@ def main(argv: list[str]) -> int:
             non_unknown_rows = count_vtune_sampled_known_rows(vtune_rows, args.require_kernel)
 
         dwarf_status = "not_checked"
+        dwarf_error = ""
         dwarf_source_rows = 0
         dwarf_required_path_present = True
         if args.dwarf_line_dump is not None:
             module = load_line_table_parser()
-            parsed = parse_dwarf_line_table(
-                module,
-                args.dwarf_line_dump.read_text(encoding="utf-8", errors="replace"),
-                args.require_source_path,
-            )
-            dwarf_status = str(parsed["status"])
-            dwarf_source_rows = int(parsed["source_rows"])
-            dwarf_required_path_present = True if args.require_source_path is None else bool(parsed["required_path_present"])
+            try:
+                parsed = parse_dwarf_line_table(
+                    module,
+                    args.dwarf_line_dump.read_text(encoding="utf-8", errors="replace"),
+                    args.require_source_path,
+                )
+            except ValueError as exc:
+                dwarf_status = "error"
+                dwarf_error = str(exc)
+                dwarf_required_path_present = args.require_source_path is None
+            else:
+                dwarf_status = str(parsed["status"])
+                dwarf_source_rows = int(parsed["source_rows"])
+                dwarf_required_path_present = True if args.require_source_path is None else bool(parsed["required_path_present"])
 
         dwarf_source_line_rows = 0
         if args.dwarf_source_lines_csv is not None:
@@ -282,6 +289,10 @@ def main(argv: list[str]) -> int:
     status = "fail"
     if not debug_line_present:
         blocker = "missing_debug_line"
+    elif args.dwarf_line_dump is not None and dwarf_status == "error":
+        blocker = "dwarf_" + re.sub(r"[^a-z0-9]+", "_", dwarf_error.lower()).strip("_")
+        if blocker == "dwarf_":
+            blocker = "dwarf_parse_error"
     elif args.dwarf_line_dump is not None and not dwarf_required_path_present:
         blocker = "missing_dwarf_source_path"
     elif non_unknown_rows > 0:
@@ -315,6 +326,8 @@ def main(argv: list[str]) -> int:
         print(f"source_line.required_kernel {args.require_kernel}")
     if args.dwarf_line_dump is not None:
         print(f"source_line.dwarf_status {dwarf_status}")
+        if dwarf_error:
+            print(f"source_line.dwarf_error {dwarf_error}")
         print(f"source_line.dwarf_source_rows {dwarf_source_rows}")
         print(f"source_line.dwarf_required_path_present {1 if dwarf_required_path_present else 0}")
     if args.dwarf_source_lines_csv is not None:
