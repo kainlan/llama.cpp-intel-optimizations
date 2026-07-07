@@ -610,3 +610,54 @@ This gives a usable line-number cost attribution route for targeted kernels and
 for future staged ledgers, but it remains explicitly **runtime instruction-count
 attribution**, not exact VTune sampled source-line attribution and not sampled PC
 line cost.
+
+## 2026-07-06 final current-stack sampled-PC sweep and E2E runtime integration
+
+Final no-model current-stack capability sweep:
+
+```text
+/tmp/sycl_cpne_final_sampled_pc_sweep_20260706_223803
+pc_sampling.status metrics_only
+pc_sampling.blocker no_public_pc_sample_api_confirmed
+pc_sampling.blocker vtune_source_rows_empty
+pc_sampling.blocker gtpin_memorytrace_available_but_not_sampled_pc
+pc_sampling.blocker pti_files_found_but_no_pc_sample_producer
+pc_sampling.blocker level_zero_metrics_are_not_pc_samples
+pc_sampling.blocker no_level_zero_ip_metric_type_exposed
+metric_property_group_count 58
+metric_property_metric_count 2893
+ip_metric_count 0
+```
+
+This confirms the strict sampled-PC path is exhausted on the current B50/B580
+software stack unless a newer VTune/driver/runtime or supported hardware exposes
+source-correlated sampled IP rows. `sampled-line-cost`, `pass`, and
+`exact_source_line` remain unclaimed.
+
+The practical path is now wired into the E2E scripts. Both staged and full
+profiling runners accept checker-compatible runtime source-line CSVs:
+
+```text
+scripts/sycl-gptoss-staged-attribution-profile.sh \
+  --gtpin-bbl-source-lines-csv <gtpin-source-lines.csv> \
+  --pti-instcount-source-lines-csv <pti-source-lines.csv> \
+  --source-kernel mxfp4_pair_glu_xmx_tiled
+
+scripts/sycl-gptoss-full-attribution-profile.sh \
+  --gtpin-bbl-source-lines-csv <gtpin-source-lines.csv> \
+  --pti-instcount-source-lines-csv <pti-source-lines.csv> \
+  --source-kernel mxfp4_pair_glu_xmx_tiled
+```
+
+These flags call `check-sycl-vtune-source-lines.py` with explicit allow flags and
+produce only the non-exact statuses:
+
+```text
+source_line.status gtpin-bbl-runtime-cost
+source_line.status pti-instcount-runtime-cost
+source_attribution.status gtpin_bbl_runtime_cost
+source_attribution.status pti_instcount_runtime_cost
+```
+
+They do not promote runtime-count rows to `sampled-line-cost` or
+`exact_source_line`.

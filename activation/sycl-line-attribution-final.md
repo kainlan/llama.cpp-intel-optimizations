@@ -132,6 +132,22 @@ correlation rows (`dd_compute_task`, `dd_compute_sample`, `dd_source_file`, and
 `dd_assembly` all remained `0`). Strict `pass` / `exact_source_line` is therefore
 still unavailable on this local B50/B580 stack.
 
+Final current-stack capability sweep:
+
+```text
+/tmp/sycl_cpne_final_sampled_pc_sweep_20260706_223803
+pc_sampling.status metrics_only
+metric_property_group_count 58
+metric_property_metric_count 2893
+ip_metric_count 0
+```
+
+This confirms that the installed Level Zero/PTI/VTune/GTPin stack still exposes
+capability evidence and runtime instrumentation paths, but no public positive
+sampled-PC producer. The strict path remains blocked until a newer
+hardware/driver/VTune stack exposes source-correlated sampled IP rows or a real
+`kernel,pc,sample_count` producer.
+
 A separate runtime-count path is now validated through VTune's embedded GTPin
 `memorytrace.so` profiler. This produces positive runtime BBL execution counts
 for the profiled trace scope and maps them to instruction PCs via the generated
@@ -254,8 +270,10 @@ This is accepted only as `pti_instcount_runtime_cost`, separate from
 Implementation artifacts:
 
 - `scripts/extract-sycl-gtpin-bbl-pc-counts.py` parses GTPin `memorytrace_compressed.bin` BBL traces, including the VTune 2025.10 20-u32 send descriptor ABI, and emits positive `kernel,pc,sample_count,sample_kind` rows with `sample_kind=gtpin-bbl-instruction-exec-count`.
-- `scripts/resolve-sycl-pc-samples-to-source-lines.py` now accepts explicit attribution labels/prefixes so this path can emit `gtpin-bbl-line` / `gtpin_bbl_runtime_cost` instead of falsely labeling BBL counts as `sampled_line_cost`.
-- `scripts/check-sycl-vtune-source-lines.py` accepts `--gtpin-bbl-source-lines-csv --allow-gtpin-bbl-runtime-cost` and emits `source_line.status gtpin-bbl-runtime-cost` for validated GTPin BBL runtime-count rows.
+- `scripts/extract-sycl-pti-instcount-pc-counts.py` converts PTI `instcount` JSON into the same resolver schema with `sample_kind=pti-instcount-instruction-exec-count`.
+- `scripts/resolve-sycl-pc-samples-to-source-lines.py` accepts explicit attribution labels/prefixes so runtime-count paths can emit `gtpin-bbl-line` / `gtpin_bbl_runtime_cost` or `pti-instcount-line` / `pti_instcount_runtime_cost` instead of falsely labeling counts as `sampled_line_cost`.
+- `scripts/check-sycl-vtune-source-lines.py` accepts `--gtpin-bbl-source-lines-csv --allow-gtpin-bbl-runtime-cost` and `--pti-instcount-source-lines-csv --allow-pti-instcount-runtime-cost` and emits the corresponding runtime-count `source_line.status`.
+- `scripts/sycl-gptoss-staged-attribution-profile.sh` and `scripts/sycl-gptoss-full-attribution-profile.sh` accept `--gtpin-bbl-source-lines-csv`, `--pti-instcount-source-lines-csv`, and `--source-kernel` so full/staged E2E ledgers can consume checked runtime-count source-line CSVs as non-exact attribution layers.
 
 ## Exact source-line attribution rule
 

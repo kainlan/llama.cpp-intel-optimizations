@@ -11,12 +11,14 @@ PROMPT_TOKENS="512"
 GEN_TOKENS="128"
 REPEAT="1"
 SOURCE_KERNEL="mxfp4_pair_glu_xmx_tiled"
+GTPIN_BBL_SOURCE_LINES_CSV=""
+PTI_INSTCOUNT_SOURCE_LINES_CSV=""
 IGA_PLATFORM="${SYCL_IGA_PLATFORM:-xe2}"
 
 usage() {
     printf 'usage: %s [--dry-run|--execute] [--i-understand-this-runs-gpu-models-and-profilers] [options]\n' "$0"
     printf 'default mode is dry-run; real execution requires --execute --i-understand-this-runs-gpu-models-and-profilers\n'
-    printf 'options: --out-root DIR --device-selector SELECTOR --model GGUF --bench PATH --prompt-tokens N --gen-tokens N --repeat N --source-kernel NAME --iga-platform PLATFORM\n'
+    printf 'options: --out-root DIR --device-selector SELECTOR --model GGUF --bench PATH --prompt-tokens N --gen-tokens N --repeat N --source-kernel NAME --gtpin-bbl-source-lines-csv CSV --pti-instcount-source-lines-csv CSV --iga-platform PLATFORM\n'
 }
 
 require_value() {
@@ -79,6 +81,16 @@ while [[ $# -gt 0 ]]; do
             SOURCE_KERNEL="$2"
             shift
             ;;
+        --gtpin-bbl-source-lines-csv)
+            require_value "$1" "${2-}"
+            GTPIN_BBL_SOURCE_LINES_CSV="$2"
+            shift
+            ;;
+        --pti-instcount-source-lines-csv)
+            require_value "$1" "${2-}"
+            PTI_INSTCOUNT_SOURCE_LINES_CSV="$2"
+            shift
+            ;;
         --iga-platform)
             require_value "$1" "${2-}"
             IGA_PLATFORM="$2"
@@ -130,6 +142,19 @@ source_line_iga_csv=${source_line_case}/iga-pc-instructions.csv
 source_line_vtune_csv=${source_line_case}/vtune-gpu-source-line.csv
 source_region_map=activation/sycl-source-region-map.json
 source_line_probe_kernel=sycl_source_line_probe
+
+runtime_source_enabled() {
+    [[ -n "${GTPIN_BBL_SOURCE_LINES_CSV}" || -n "${PTI_INSTCOUNT_SOURCE_LINES_CSV}" ]]
+}
+
+append_runtime_checker_dry_run_flags() {
+    if [[ -n "${GTPIN_BBL_SOURCE_LINES_CSV}" ]]; then
+        printf ' --gtpin-bbl-source-lines-csv %q --allow-gtpin-bbl-runtime-cost' "${GTPIN_BBL_SOURCE_LINES_CSV}"
+    fi
+    if [[ -n "${PTI_INSTCOUNT_SOURCE_LINES_CSV}" ]]; then
+        printf ' --pti-instcount-source-lines-csv %q --allow-pti-instcount-runtime-cost' "${PTI_INSTCOUNT_SOURCE_LINES_CSV}"
+    fi
+}
 
 env_args=(
     "ONEAPI_DEVICE_SELECTOR=${DEVICE_SELECTOR}"
@@ -189,7 +214,15 @@ print_parse_plan() {
     printf '# source-line matrix ASM selection: first_asm="$(find %q -type f -name '\''*%s*.asm'\'' -print -quit)"\n' "${source_line_case}/zebin-disasm" "${source_line_probe_kernel}"
     printf '# source-line matrix ASM fallback: if [[ -z "${first_asm}" ]]; then first_asm="$(find %q -type f -name '\''*.asm'\'' -print -quit)"; fi  # resolver rejects unmarked or mismatched ASM\n' "${source_line_case}/zebin-disasm"
     printf '# source-line matrix ASM resolver: python3 %q --dwarf-line-dump %q --asm "${first_asm}" --output %q --summary-output %q --source-computing-task %q\n' "scripts/resolve-sycl-zebin-asm-source-lines.py" "${source_line_dwarf_dump}" "${source_line_asm_csv}" "${source_line_asm_summary}" "${source_line_probe_kernel}"
-    printf 'python3 %q --readelf-sections %q --vtune-csv %q --require-kernel %q --asm-source-lines-csv %q --allow-asm-line-static-cost --dwarf-line-dump %q --dwarf-source-lines-csv %q --allow-dwarf-line-table-only --vtune-stdout %q --vtune-stderr %q >%q\n' "scripts/check-sycl-vtune-source-lines.py" "${source_line_sections}" "${source_line_vtune_csv}" "${source_line_probe_kernel}" "${source_line_asm_csv}" "${source_line_dwarf_dump}" "${source_line_dwarf_csv}" "${source_line_case}/probe.stdout" "${source_line_case}/probe.stderr" "${parsed_dir}/source-line.parse"
+    if runtime_source_enabled; then
+        printf '# runtime source-line integration: checker-compatible PTI/GTPin source CSVs are accepted only as non-sampled runtime-count evidence.\n'
+        printf 'python3 %q --readelf-sections %q --require-kernel %q' "scripts/check-sycl-vtune-source-lines.py" "${source_line_sections}" "${SOURCE_KERNEL}"
+        append_runtime_checker_dry_run_flags
+        printf ' >%q\n' "${parsed_dir}/source-line.parse"
+        printf '# runtime statuses: source_line.status gtpin-bbl-runtime-cost or source_line.status pti-instcount-runtime-cost; never pass/exact_source_line/sampled-line-cost.\n'
+    else
+        printf 'python3 %q --readelf-sections %q --vtune-csv %q --require-kernel %q --asm-source-lines-csv %q --allow-asm-line-static-cost --dwarf-line-dump %q --dwarf-source-lines-csv %q --allow-dwarf-line-table-only --vtune-stdout %q --vtune-stderr %q >%q\n' "scripts/check-sycl-vtune-source-lines.py" "${source_line_sections}" "${source_line_vtune_csv}" "${source_line_probe_kernel}" "${source_line_asm_csv}" "${source_line_dwarf_dump}" "${source_line_dwarf_csv}" "${source_line_case}/probe.stdout" "${source_line_case}/probe.stderr" "${parsed_dir}/source-line.parse"
+    fi
     printf 'if [[ -f %q && -f %q ]]; then python3 %q --cost-ranking %q --source-line %q --region-map %q >%q; else printf "source_attribution.status missing_parser\\nsource_attribution.blocker missing_parse_sycl_source_attribution_or_region_map\\n" >%q; fi\n' "scripts/parse-sycl-source-attribution.py" "${source_region_map}" "scripts/parse-sycl-source-attribution.py" "${parsed_dir}/kernel-cost.parse" "${parsed_dir}/source-line.parse" "${source_region_map}" "${parsed_dir}/source-attribution.parse" "${parsed_dir}/source-attribution.parse"
 }
 
@@ -270,17 +303,41 @@ python3 scripts/parse-sycl-layer-ledger.py \
     --ur-summary "${parsed_dir}/ur.parse" \
     --vtune-summary "${parsed_dir}/vtune.parse" \
     --bench-stderr "${OUT_ROOT}/bench.stderr" >"${parsed_dir}/layer-ledger.parse"
-python3 scripts/check-sycl-vtune-source-lines.py \
-    --readelf-sections "${source_line_sections}" \
-    --vtune-csv "${source_line_vtune_csv}" \
-    --require-kernel "${source_line_probe_kernel}" \
-    --asm-source-lines-csv "${source_line_asm_csv}" \
-    --allow-asm-line-static-cost \
-    --dwarf-line-dump "${source_line_dwarf_dump}" \
-    --dwarf-source-lines-csv "${source_line_dwarf_csv}" \
-    --allow-dwarf-line-table-only \
-    --vtune-stdout "${source_line_case}/probe.stdout" \
-    --vtune-stderr "${source_line_case}/probe.stderr" >"${parsed_dir}/source-line.parse"
+source_line_required_kernel="${source_line_probe_kernel}"
+source_line_checker_args=(
+    --readelf-sections "${source_line_sections}"
+    --vtune-csv "${source_line_vtune_csv}"
+    --require-kernel "${source_line_required_kernel}"
+    --asm-source-lines-csv "${source_line_asm_csv}"
+    --allow-asm-line-static-cost
+    --dwarf-line-dump "${source_line_dwarf_dump}"
+    --dwarf-source-lines-csv "${source_line_dwarf_csv}"
+    --allow-dwarf-line-table-only
+    --vtune-stdout "${source_line_case}/probe.stdout"
+    --vtune-stderr "${source_line_case}/probe.stderr"
+)
+if runtime_source_enabled; then
+    source_line_required_kernel="${SOURCE_KERNEL}"
+    source_line_checker_args=(
+        --readelf-sections "${source_line_sections}"
+        --require-kernel "${source_line_required_kernel}"
+    )
+    if [[ -n "${GTPIN_BBL_SOURCE_LINES_CSV}" ]]; then
+        if [[ ! -s "${GTPIN_BBL_SOURCE_LINES_CSV}" ]]; then
+            printf 'error: --gtpin-bbl-source-lines-csv is missing or empty: %s\n' "${GTPIN_BBL_SOURCE_LINES_CSV}" >&2
+            exit 2
+        fi
+        source_line_checker_args+=(--gtpin-bbl-source-lines-csv "${GTPIN_BBL_SOURCE_LINES_CSV}" --allow-gtpin-bbl-runtime-cost)
+    fi
+    if [[ -n "${PTI_INSTCOUNT_SOURCE_LINES_CSV}" ]]; then
+        if [[ ! -s "${PTI_INSTCOUNT_SOURCE_LINES_CSV}" ]]; then
+            printf 'error: --pti-instcount-source-lines-csv is missing or empty: %s\n' "${PTI_INSTCOUNT_SOURCE_LINES_CSV}" >&2
+            exit 2
+        fi
+        source_line_checker_args+=(--pti-instcount-source-lines-csv "${PTI_INSTCOUNT_SOURCE_LINES_CSV}" --allow-pti-instcount-runtime-cost)
+    fi
+fi
+python3 scripts/check-sycl-vtune-source-lines.py "${source_line_checker_args[@]}" >"${parsed_dir}/source-line.parse"
 if [[ -f scripts/parse-sycl-source-attribution.py && -f "${source_region_map}" ]]; then
     python3 scripts/parse-sycl-source-attribution.py \
         --cost-ranking "${parsed_dir}/kernel-cost.parse" \

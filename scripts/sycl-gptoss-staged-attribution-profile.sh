@@ -14,6 +14,9 @@ BENCH="./build/bin/llama-bench"
 SOURCE_REGION_MAP="activation/sycl-source-region-map.json"
 ABLATION_ROUTE="prepack"
 ABLATION_KERNEL="mxfp4.gateup.xmx_tiled_dpas_m2"
+SOURCE_KERNEL="mxfp4_pair_glu_xmx_tiled"
+GTPIN_BBL_SOURCE_LINES_CSV=""
+PTI_INSTCOUNT_SOURCE_LINES_CSV=""
 IGA_PLATFORM="${SYCL_IGA_PLATFORM:-xe2}"
 
 usage() {
@@ -25,6 +28,9 @@ usage() {
     printf '  --device-selector SELECTOR\n'
     printf '  --model GGUF\n'
     printf '  --prompt-tokens N --gen-tokens N --repeat N\n'
+    printf '  --source-kernel NAME\n'
+    printf '  --gtpin-bbl-source-lines-csv CSV\n'
+    printf '  --pti-instcount-source-lines-csv CSV\n'
     printf '  --iga-platform PLATFORM\n'
 }
 
@@ -83,6 +89,21 @@ while [[ $# -gt 0 ]]; do
             REPEAT="$2"
             shift
             ;;
+        --source-kernel)
+            require_value "$1" "${2-}"
+            SOURCE_KERNEL="$2"
+            shift
+            ;;
+        --gtpin-bbl-source-lines-csv)
+            require_value "$1" "${2-}"
+            GTPIN_BBL_SOURCE_LINES_CSV="$2"
+            shift
+            ;;
+        --pti-instcount-source-lines-csv)
+            require_value "$1" "${2-}"
+            PTI_INSTCOUNT_SOURCE_LINES_CSV="$2"
+            shift
+            ;;
         --iga-platform)
             require_value "$1" "${2-}"
             IGA_PLATFORM="$2"
@@ -121,6 +142,19 @@ l0_root() { printf '%s/l0' "${OUT_ROOT}"; }
 vtune_source_root() { printf '%s/vtune-source' "${OUT_ROOT}"; }
 ablation_root() { printf '%s/ablation' "${OUT_ROOT}"; }
 merged_root() { printf '%s/merged' "${OUT_ROOT}"; }
+
+runtime_source_enabled() {
+    [[ -n "${GTPIN_BBL_SOURCE_LINES_CSV}" || -n "${PTI_INSTCOUNT_SOURCE_LINES_CSV}" ]]
+}
+
+append_runtime_checker_dry_run_flags() {
+    if [[ -n "${GTPIN_BBL_SOURCE_LINES_CSV}" ]]; then
+        printf ' --gtpin-bbl-source-lines-csv %q --allow-gtpin-bbl-runtime-cost' "${GTPIN_BBL_SOURCE_LINES_CSV}"
+    fi
+    if [[ -n "${PTI_INSTCOUNT_SOURCE_LINES_CSV}" ]]; then
+        printf ' --pti-instcount-source-lines-csv %q --allow-pti-instcount-runtime-cost' "${PTI_INSTCOUNT_SOURCE_LINES_CSV}"
+    fi
+}
 
 safe_env_args=(
     "ONEAPI_DEVICE_SELECTOR=${DEVICE_SELECTOR}"
@@ -336,8 +370,19 @@ run_vtune_source_stage() {
         printf '#   matrix ASM fallback: if [[ -z "${first_asm}" ]]; then first_asm="$(find %q -type f -name '\''*.asm'\'' -print -quit)"; fi  # resolver rejects unmarked or mismatched ASM\n' "${root}/source-line-matrix/build-matrix/debug_full/zebin-disasm"
         printf '#   matrix ASM resolver: python3 %q --dwarf-line-dump %q --asm "${first_asm}" --output %q --summary-output %q --source-computing-task %q\n' "scripts/resolve-sycl-zebin-asm-source-lines.py" "${root}/source-line-matrix/build-matrix/debug_full/zebin-debug-line.txt" "${root}/source-line-matrix/build-matrix/debug_full/asm-source-lines.csv" "${root}/source-line-matrix/build-matrix/debug_full/asm-source-lines.parse" "sycl_source_line_probe"
         printf '#   matrix checker: python3 %q --asm-source-lines-csv %q --allow-asm-line-static-cost --dwarf-source-lines-csv %q --allow-dwarf-line-table-only\n' "scripts/check-sycl-vtune-source-lines.py" "${root}/source-line-matrix/build-matrix/debug_full/asm-source-lines.csv" "${root}/source-line-matrix/build-matrix/debug_full/dwarf-source-lines.csv"
-        printf '#   selection: prefer source_line.status pass (VTune sampled exact); else source_line.status asm-line-static-cost (ASM static source-line cost); else source_line.status dwarf-line-table-only (DWARF line-table fallback); else source_line.blocker vtune_no_gpu_side_trace or vtune_unknown_source; else first source-line-feasibility.parse\n'
-        printf 'cp %q %q\n' "${root}/source-line-matrix/build-matrix/<selected-case>/source-line-feasibility.parse" "${root}/source-line.parse"
+        if runtime_source_enabled; then
+            printf '#   runtime source-line integration: checker-compatible PTI/GTPin source CSVs are accepted only as non-sampled runtime-count evidence.\n'
+            printf 'python3 %q --readelf-sections %q --require-kernel %q' "scripts/check-sycl-vtune-source-lines.py" "${root}/source-line-matrix/build-matrix/<selected-case>/zebin-debug-sections.txt" "${SOURCE_KERNEL}"
+            append_runtime_checker_dry_run_flags
+            printf ' >%q\n' "${root}/runtime-source-line.parse"
+            printf '#   runtime statuses: source_line.status gtpin-bbl-runtime-cost or source_line.status pti-instcount-runtime-cost; never pass/exact_source_line/sampled-line-cost.\n'
+        fi
+        printf '#   selection: prefer source_line.status pass (VTune sampled exact); else source_line.status gtpin-bbl-runtime-cost or pti-instcount-runtime-cost when runtime CSVs are supplied; else source_line.status asm-line-static-cost (ASM static source-line cost); else source_line.status dwarf-line-table-only (DWARF line-table fallback); else source_line.blocker vtune_no_gpu_side_trace or vtune_unknown_source; else first source-line-feasibility.parse\n'
+        if runtime_source_enabled; then
+            printf 'cp %q %q\n' "${root}/runtime-source-line.parse" "${root}/source-line.parse"
+        else
+            printf 'cp %q %q\n' "${root}/source-line-matrix/build-matrix/<selected-case>/source-line-feasibility.parse" "${root}/source-line.parse"
+        fi
         printf 'python3 %q --source-csv %q >%q\n' "scripts/parse-sycl-vtune-exports.py" "${root}/source-line-matrix/build-matrix/<selected-case>/vtune-gpu-source-line.csv" "${root}/vtune.parse"
         return 0
     fi
@@ -409,7 +454,30 @@ run_vtune_source_stage() {
         printf 'error: vtune-source stage selected %s but missing %s\n' "${selected_parse}" "${selected_source_csv}" >&2
         return 2
     fi
-    cp "${selected_parse}" "${root}/source-line.parse"
+    if runtime_source_enabled; then
+        local -a runtime_checker_args=(
+            --readelf-sections "${selected_dir}/zebin-debug-sections.txt"
+            --require-kernel "${SOURCE_KERNEL}"
+        )
+        if [[ -n "${GTPIN_BBL_SOURCE_LINES_CSV}" ]]; then
+            if [[ ! -s "${GTPIN_BBL_SOURCE_LINES_CSV}" ]]; then
+                printf 'error: --gtpin-bbl-source-lines-csv is missing or empty: %s\n' "${GTPIN_BBL_SOURCE_LINES_CSV}" >&2
+                return 2
+            fi
+            runtime_checker_args+=(--gtpin-bbl-source-lines-csv "${GTPIN_BBL_SOURCE_LINES_CSV}" --allow-gtpin-bbl-runtime-cost)
+        fi
+        if [[ -n "${PTI_INSTCOUNT_SOURCE_LINES_CSV}" ]]; then
+            if [[ ! -s "${PTI_INSTCOUNT_SOURCE_LINES_CSV}" ]]; then
+                printf 'error: --pti-instcount-source-lines-csv is missing or empty: %s\n' "${PTI_INSTCOUNT_SOURCE_LINES_CSV}" >&2
+                return 2
+            fi
+            runtime_checker_args+=(--pti-instcount-source-lines-csv "${PTI_INSTCOUNT_SOURCE_LINES_CSV}" --allow-pti-instcount-runtime-cost)
+        fi
+        python3 scripts/check-sycl-vtune-source-lines.py "${runtime_checker_args[@]}" >"${root}/runtime-source-line.parse"
+        cp "${root}/runtime-source-line.parse" "${root}/source-line.parse"
+    else
+        cp "${selected_parse}" "${root}/source-line.parse"
+    fi
     python3 scripts/parse-sycl-vtune-exports.py \
         --source-csv "${selected_source_csv}" >"${root}/vtune.parse"
     write_manifest vtune-source "${root}" source_line "${root}/source-line.parse"

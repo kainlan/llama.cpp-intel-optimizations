@@ -30,6 +30,53 @@ def test_staged_runner_is_dry_run_by_default(tmp_path: Path) -> None:
     assert not out_root.exists()
 
 
+def test_staged_vtune_source_dry_run_accepts_pti_runtime_source_csv(tmp_path: Path) -> None:
+    out_root = tmp_path / "staged-runtime"
+    pti_csv = tmp_path / "pti source lines.csv"
+    result = run_script(
+        "--stage",
+        "vtune-source",
+        "--out-root",
+        str(out_root),
+        "--pti-instcount-source-lines-csv",
+        str(pti_csv),
+        "--source-kernel",
+        "mxfp4_pair_glu_xmx_tiled",
+        out_root=tmp_path / "ignored",
+    )
+    assert result.returncode == 0, result.stdout
+    assert "runtime source-line integration" in result.stdout
+    assert "--pti-instcount-source-lines-csv" in result.stdout
+    assert "--allow-pti-instcount-runtime-cost" in result.stdout
+    assert "--require-kernel mxfp4_pair_glu_xmx_tiled" in result.stdout
+    assert "source_line.status pti-instcount-runtime-cost" in result.stdout
+    assert "never pass/exact_source_line/sampled-line-cost" in result.stdout
+    assert not out_root.exists()
+
+
+def test_staged_vtune_source_dry_run_accepts_gtpin_runtime_source_csv(tmp_path: Path) -> None:
+    out_root = tmp_path / "staged-runtime-gtpin"
+    gtpin_csv = tmp_path / "gtpin-source-lines.csv"
+    result = run_script(
+        "--stage",
+        "vtune-source",
+        "--out-root",
+        str(out_root),
+        "--gtpin-bbl-source-lines-csv",
+        str(gtpin_csv),
+        "--source-kernel",
+        "mxfp4_pair_glu_xmx_tiled",
+        out_root=tmp_path / "ignored",
+    )
+    assert result.returncode == 0, result.stdout
+    assert "runtime source-line integration" in result.stdout
+    assert "--gtpin-bbl-source-lines-csv" in result.stdout
+    assert "--allow-gtpin-bbl-runtime-cost" in result.stdout
+    assert "source_line.status gtpin-bbl-runtime-cost" in result.stdout
+    assert "never pass/exact_source_line/sampled-line-cost" in result.stdout
+    assert not out_root.exists()
+
+
 def test_staged_runner_refuses_execute_without_ack(tmp_path: Path) -> None:
     result = run_script("--execute", out_root=tmp_path / "staged")
     assert result.returncode == 2
@@ -109,6 +156,23 @@ def test_vtune_source_dry_run_quotes_asm_paths_with_spaces(tmp_path: Path) -> No
     assert any(f'first_asm="$(find {escaped_asm_dir} -type f -name' in line for line in asm_lines)
     assert any('--asm "${first_asm}"' in line for line in asm_lines)
     assert not out_root.exists()
+
+
+def test_vtune_source_execute_branch_wires_runtime_source_checker_options() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    for required in (
+        "GTPIN_BBL_SOURCE_LINES_CSV",
+        "PTI_INSTCOUNT_SOURCE_LINES_CSV",
+        "runtime_source_enabled",
+        "runtime_checker_args=(",
+        "--require-kernel \"${SOURCE_KERNEL}\"",
+        "--gtpin-bbl-source-lines-csv \"${GTPIN_BBL_SOURCE_LINES_CSV}\" --allow-gtpin-bbl-runtime-cost",
+        "--pti-instcount-source-lines-csv \"${PTI_INSTCOUNT_SOURCE_LINES_CSV}\" --allow-pti-instcount-runtime-cost",
+        "runtime-source-line.parse",
+        "--gtpin-bbl-source-lines-csv is missing or empty",
+        "--pti-instcount-source-lines-csv is missing or empty",
+    ):
+        assert required in text
 
 
 def test_vtune_source_execute_branch_consumes_matrix_artifacts() -> None:

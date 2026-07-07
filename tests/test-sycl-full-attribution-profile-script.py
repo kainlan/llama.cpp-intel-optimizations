@@ -101,14 +101,15 @@ EXECUTE_BRANCH_STRINGS = [
     "python3 scripts/parse-sycl-ur-trace.py \"${ur_dir}/sycl-ur-trace.log\" >\"${parsed_dir}/ur.parse\"",
     "python3 scripts/parse-sycl-vtune-exports.py \\",
     "python3 scripts/parse-sycl-layer-ledger.py \\",
-    "python3 scripts/check-sycl-vtune-source-lines.py \\",
-    "--asm-source-lines-csv \"${source_line_asm_csv}\" \\",
-    "--allow-asm-line-static-cost \\",
-    "--dwarf-line-dump \"${source_line_dwarf_dump}\" \\",
-    "--dwarf-source-lines-csv \"${source_line_dwarf_csv}\" \\",
-    "--allow-dwarf-line-table-only \\",
-    "--vtune-stdout \"${source_line_case}/probe.stdout\" \\",
-    "--vtune-stderr \"${source_line_case}/probe.stderr\" >\"${parsed_dir}/source-line.parse\"",
+    "source_line_checker_args=(",
+    "--asm-source-lines-csv \"${source_line_asm_csv}\"",
+    "--allow-asm-line-static-cost",
+    "--dwarf-line-dump \"${source_line_dwarf_dump}\"",
+    "--dwarf-source-lines-csv \"${source_line_dwarf_csv}\"",
+    "--allow-dwarf-line-table-only",
+    "--vtune-stdout \"${source_line_case}/probe.stdout\"",
+    "--vtune-stderr \"${source_line_case}/probe.stderr\"",
+    "python3 scripts/check-sycl-vtune-source-lines.py \"${source_line_checker_args[@]}\" >\"${parsed_dir}/source-line.parse\"",
     "if [[ -f scripts/parse-sycl-source-attribution.py && -f \"${source_region_map}\" ]]; then",
     "python3 scripts/parse-sycl-source-attribution.py \\",
     "source_attribution.status missing_parser",
@@ -145,6 +146,45 @@ def test_full_attribution_profile_script_defaults_to_dry_run(tmp_path: Path) -> 
         assert required in result.stdout
 
 
+def test_full_attribution_profile_dry_run_accepts_pti_runtime_source_csv(tmp_path: Path) -> None:
+    out_dir = tmp_path / "dry-run-runtime"
+    pti_csv = tmp_path / "pti source lines.csv"
+    result = _run_script(
+        "--pti-instcount-source-lines-csv",
+        str(pti_csv),
+        "--source-kernel",
+        "mxfp4_pair_glu_xmx_tiled",
+        out_dir=out_dir,
+    )
+    assert result.returncode == 0, result.stdout
+    assert "runtime source-line integration" in result.stdout
+    assert "--pti-instcount-source-lines-csv" in result.stdout
+    assert "--allow-pti-instcount-runtime-cost" in result.stdout
+    assert "--require-kernel mxfp4_pair_glu_xmx_tiled" in result.stdout
+    assert "source_line.status pti-instcount-runtime-cost" in result.stdout
+    assert "never pass/exact_source_line/sampled-line-cost" in result.stdout
+    assert not out_dir.exists()
+
+
+def test_full_attribution_profile_dry_run_accepts_gtpin_runtime_source_csv(tmp_path: Path) -> None:
+    out_dir = tmp_path / "dry-run-runtime-gtpin"
+    gtpin_csv = tmp_path / "gtpin-source-lines.csv"
+    result = _run_script(
+        "--gtpin-bbl-source-lines-csv",
+        str(gtpin_csv),
+        "--source-kernel",
+        "mxfp4_pair_glu_xmx_tiled",
+        out_dir=out_dir,
+    )
+    assert result.returncode == 0, result.stdout
+    assert "runtime source-line integration" in result.stdout
+    assert "--gtpin-bbl-source-lines-csv" in result.stdout
+    assert "--allow-gtpin-bbl-runtime-cost" in result.stdout
+    assert "source_line.status gtpin-bbl-runtime-cost" in result.stdout
+    assert "never pass/exact_source_line/sampled-line-cost" in result.stdout
+    assert not out_dir.exists()
+
+
 def test_full_attribution_profile_script_refuses_execute_without_full_ack(tmp_path: Path) -> None:
     result = _run_script("--execute", out_dir=tmp_path / "execute-output")
     assert result.returncode == 2
@@ -168,6 +208,21 @@ def test_execute_branch_wires_full_artifact_layout_and_parsers() -> None:
     execute_branch = text[text.index(execute_start) :]
     for required in EXECUTE_BRANCH_STRINGS:
         assert required in execute_branch
+
+
+def test_execute_branch_wires_runtime_source_checker_options() -> None:
+    text = _script_text()
+    for required in [
+        "GTPIN_BBL_SOURCE_LINES_CSV",
+        "PTI_INSTCOUNT_SOURCE_LINES_CSV",
+        "runtime_source_enabled",
+        "source_line_required_kernel=\"${SOURCE_KERNEL}\"",
+        "--gtpin-bbl-source-lines-csv \"${GTPIN_BBL_SOURCE_LINES_CSV}\" --allow-gtpin-bbl-runtime-cost",
+        "--pti-instcount-source-lines-csv \"${PTI_INSTCOUNT_SOURCE_LINES_CSV}\" --allow-pti-instcount-runtime-cost",
+        "--gtpin-bbl-source-lines-csv is missing or empty",
+        "--pti-instcount-source-lines-csv is missing or empty",
+    ]:
+        assert required in text
 
 
 def test_execute_branch_sets_required_profile_envs_and_fa_on() -> None:
