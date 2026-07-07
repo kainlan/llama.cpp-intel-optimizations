@@ -1422,14 +1422,19 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                 const bool ignore_weight_scale = config.kernel_name.find("_noscale") != std::string::npos;
                 const int  scale_stride_blocks = parse_moe_scale_stride_blocks(config.kernel_name, k);
                 const int  subgroup_size       = parse_moe_subgroup_size(config.kernel_name);
+                const int  down_q8_dpas_tile_rows =
+                    config.kernel_name.find("_q8_dpas_tile4") != std::string::npos ? 4 :
+                    config.kernel_name.find("_q8_dpas_tile2") != std::string::npos ? 2 :
+                                                                                     0;
                 const bool sparse_expert_slots = config.kernel_name.find("_sparse32") != std::string::npos;
                 const bool use_bias            = config.kernel_name.find("_bias") != std::string::npos;
                 if (!run_mxfp4_layer_glu_down(weights, activations, m, selected_count, k, token_rows, rows_per_wg,
                                               cache_y, xmx_tiled_gate_up, xmx_tiled_grouped, xmx_tiled_pack_q8,
                                               xmx_tiled_prefetch, xmx_tiled_m_tiles, xmx_tiles_n, vector_qs_load,
                                               ignore_weight_scale, scale_stride_blocks, subgroup_size,
-                                              sparse_expert_slots, use_bias, config.validate, config.warmup_iterations,
-                                              config.measure_iterations, queue, metrics, error)) {
+                                              down_q8_dpas_tile_rows, sparse_expert_slots, use_bias, config.validate,
+                                              config.warmup_iterations, config.measure_iterations, queue, metrics,
+                                              error)) {
                     out.error = error;
                     return false;
                 }

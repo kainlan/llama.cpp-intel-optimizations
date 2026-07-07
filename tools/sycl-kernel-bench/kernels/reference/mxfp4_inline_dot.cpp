@@ -1930,6 +1930,7 @@ bool run_mxfp4_layer_glu_down(const GeneratedWeights &     weights,
                               bool                         ignore_weight_scale,
                               int                          scale_stride_blocks,
                               int                          subgroup_size,
+                              int                          down_q8_dpas_tile_rows,
                               bool                         sparse_expert_slots,
                               bool                         use_bias,
                               bool                         validate,
@@ -1953,6 +1954,10 @@ bool run_mxfp4_layer_glu_down(const GeneratedWeights &     weights,
     }
     if (subgroup_size != 16 && subgroup_size != 32) {
         error = "mxfp4_layer_glu_down subgroup_size must be 16 or 32.";
+        return false;
+    }
+    if (down_q8_dpas_tile_rows != 0 && down_q8_dpas_tile_rows != 2 && down_q8_dpas_tile_rows != 4) {
+        error = "mxfp4_layer_glu_down down Q8 DPAS tile rows must be 0, 2, or 4.";
         return false;
     }
     if (xmx_tiled_grouped && (!xmx_tiled_gate_up || rows_per_wg != 8)) {
@@ -2300,6 +2305,7 @@ bool run_mxfp4_layer_glu_down(const GeneratedWeights &     weights,
     args.ignore_weight_scale    = ignore_weight_scale;
     args.scale_stride_blocks    = scale_stride_blocks;
     args.subgroup_size          = subgroup_size;
+    args.down_q8_dpas_tile_rows = down_q8_dpas_tile_rows;
     args.grouped_expert_ids     = d_grouped_experts;
     args.grouped_offsets        = d_grouped_offsets;
     args.grouped_row_slots      = d_grouped_rows;

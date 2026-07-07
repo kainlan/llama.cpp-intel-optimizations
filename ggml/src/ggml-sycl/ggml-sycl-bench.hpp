@@ -175,12 +175,13 @@ struct mxfp4_layer_glu_down_bench_args {
     int   xmx_tiles_n         = 1;
     bool  vector_qs_load      = false;
     bool  ignore_weight_scale = false;
-    int   scale_stride_blocks = 0;
-    int   subgroup_size       = 32;
-    int   grouped_n_chunks    = 0;
-    int   glu_op              = 0;
-    float alpha               = 1.702f;
-    float limit               = 7.0f;
+    int   scale_stride_blocks    = 0;
+    int   subgroup_size          = 32;
+    int   down_q8_dpas_tile_rows = 0;
+    int   grouped_n_chunks       = 0;
+    int   glu_op                 = 0;
+    float alpha                  = 1.702f;
+    float limit                  = 7.0f;
 
     const int32_t * grouped_expert_ids = nullptr;
     const int32_t * grouped_offsets    = nullptr;
@@ -218,12 +219,13 @@ struct mxfp4_mmv_id_bench_args {
     int64_t dst_nb1 = 0;
     int64_t dst_nb2 = 0;
 
-    int  rows_per_wg         = 4;
-    bool cache_y             = false;
-    bool vector_qs_load      = false;
-    bool ignore_weight_scale = false;
-    int  scale_stride_blocks = 0;
-    int  subgroup_size       = 32;
+    int   rows_per_wg             = 4;
+    bool  cache_y                 = false;
+    bool  vector_qs_load          = false;
+    bool  ignore_weight_scale     = false;
+    int   scale_stride_blocks     = 0;
+    int   subgroup_size           = 32;
+    int   down_q8_dpas_tile_rows  = 0;
 };
 
 bool ggml_sycl_mxfp4_mmv_id_bench_launch(const mxfp4_mmv_id_bench_args & args);

@@ -22580,6 +22580,10 @@ bool ggml_sycl_mxfp4_layer_glu_down_bench_launch(const mxfp4_layer_glu_down_benc
     if (args.subgroup_size != 16 && args.subgroup_size != 32) {
         return false;
     }
+    if (args.down_q8_dpas_tile_rows != 0 && args.down_q8_dpas_tile_rows != 2 &&
+        args.down_q8_dpas_tile_rows != 4) {
+        return false;
+    }
     if (args.xmx_tiled_grouped &&
         (!args.xmx_tiled_gate_up || args.rows_per_wg != 8 || !args.grouped_expert_ids || !args.grouped_offsets ||
          !args.grouped_row_slots || !args.grouped_chunks || !args.grouped_row_starts || args.grouped_n_chunks <= 0)) {
@@ -22698,8 +22702,9 @@ bool ggml_sycl_mxfp4_layer_glu_down_bench_launch(const mxfp4_layer_glu_down_benc
     down_args.cache_y             = args.cache_y;
     down_args.vector_qs_load      = args.vector_qs_load;
     down_args.ignore_weight_scale = args.ignore_weight_scale;
-    down_args.scale_stride_blocks = args.scale_stride_blocks;
-    down_args.subgroup_size       = args.subgroup_size;
+    down_args.scale_stride_blocks    = args.scale_stride_blocks;
+    down_args.subgroup_size          = args.subgroup_size;
+    down_args.down_q8_dpas_tile_rows = args.down_q8_dpas_tile_rows;
     return ggml_sycl_mxfp4_mmv_id_bench_launch(down_args);
 }
 
@@ -22720,6 +22725,10 @@ bool ggml_sycl_mxfp4_mmv_id_bench_launch(const mxfp4_mmv_id_bench_args & args) {
         return false;
     }
     if (args.subgroup_size != 16 && args.subgroup_size != 32) {
+        return false;
+    }
+    if (args.down_q8_dpas_tile_rows != 0 && args.down_q8_dpas_tile_rows != 2 &&
+        args.down_q8_dpas_tile_rows != 4) {
         return false;
     }
 

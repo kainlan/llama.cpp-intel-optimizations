@@ -219,6 +219,8 @@ inline const std::vector<KernelInfo> & kernel_list() {
         { "mxfp4_layer_glu_down_soa_r4_vecq",                          GGML_LAYOUT_SOA,       KernelKind::MXFP4_LAYER_GLU_DOWN    },
         { "mxfp4_layer_glu_down_soa_r1_sg16",                          GGML_LAYOUT_SOA,       KernelKind::MXFP4_LAYER_GLU_DOWN    },
         { "mxfp4_layer_glu_down_soa_r4_sg16",                          GGML_LAYOUT_SOA,       KernelKind::MXFP4_LAYER_GLU_DOWN    },
+        { "mxfp4_layer_glu_down_q8_dpas_tile2",                        GGML_LAYOUT_SOA,       KernelKind::MXFP4_LAYER_GLU_DOWN    },
+        { "mxfp4_layer_glu_down_q8_dpas_tile4",                        GGML_LAYOUT_SOA,       KernelKind::MXFP4_LAYER_GLU_DOWN    },
         { "mxfp4_layer_glu_down_xmx_tiled_r8_t512",                    GGML_LAYOUT_SOA,       KernelKind::MXFP4_LAYER_GLU_DOWN    },
         { "mxfp4_layer_glu_down_xmx_tiled_packed_r8_m2_t512",          GGML_LAYOUT_SOA,       KernelKind::MXFP4_LAYER_GLU_DOWN    },
         { "mxfp4_layer_glu_down_xmx_tiled_packed_r8_m4_t512",          GGML_LAYOUT_SOA,       KernelKind::MXFP4_LAYER_GLU_DOWN    },

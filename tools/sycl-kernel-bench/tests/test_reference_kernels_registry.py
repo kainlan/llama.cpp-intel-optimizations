@@ -31,3 +31,12 @@ def test_mxfp4_pair_glu_loadv2_variants_registered():
         "mxfp4_pair_glu_xmx_tiled_packed_r8_m2_loadv2_bias",
     ]:
         assert name in names, f"{name} not registered as an exact kernel_registry.hpp entry"
+
+
+def test_mxfp4_layer_glu_down_dpas_tile_variants_registered():
+    names = registered_kernel_names()
+    for name in [
+        "mxfp4_layer_glu_down_q8_dpas_tile2",
+        "mxfp4_layer_glu_down_q8_dpas_tile4",
+    ]:
+        assert name in names, f"{name} not registered as an exact kernel_registry.hpp entry"
