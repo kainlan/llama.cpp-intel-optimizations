@@ -44,10 +44,31 @@ Intel(R) VTune(TM) Profiler 2026.2.0 (build 632324)
 The APT simulation showed only `intel-oneapi-vtune` plus oneAPI common
 vars/licensing packages; it did not pull GPU driver, compute-runtime, Level Zero,
 compiler, or OpenCL/SYCL runtime packages. The optional VTune `vtsspp` kernel
-driver failed to build against kernel `7.1.2-070102-generic` due to
+driver initially failed to build against kernel `7.1.2-070102-generic` due to
 `KTIME_MONOTONIC_RES` being undeclared, but package installation completed,
 `apt-get check` passed, and the user-mode/GPU Hotspots path used here works from
 `/opt/intel/oneapi/vtune/latest`.
+
+The `vtsspp` build failure was then fixed locally by patching VTune's SEP driver
+source to use the current kernel API `ktime_get_resolution_ns()` when
+`KTIME_MONOTONIC_RES` is unavailable. The applied local patch is recorded in:
+
+```text
+activation/vtune-2026.2-vtsspp-kernel-7.1.2.patch
+```
+
+Local build results after patch:
+
+```text
+/opt/intel/oneapi/vtune/2026.2/sepdk/src/vtsspp/vtsspp.ko
+/opt/intel/oneapi/vtune/2026.2/sepdk/src/vtsspp/vtsspp-x32_64-7.1.2-070102-genericsmp.ko
+vermagic: 7.1.2-070102-generic SMP preempt mod_unload modversions
+```
+
+`sep5.service` was already enabled and active after the package install, with
+`sep5`, `pax`, and `socwatch2_16` loaded. `vtsspp` was not manually loaded during
+this fix; loading kernel sampling modules is a separate risk decision from fixing
+the build.
 
 ## Evidence artifacts
 

@@ -1,0 +1,22 @@
+--- a/opt/intel/oneapi/vtune/2026.2/sepdk/src/vtsspp/modcfg.c
++++ b/opt/intel/oneapi/vtune/2026.2/sepdk/src/vtsspp/modcfg.c
+@@ -39,6 +39,7 @@
+ #include <linux/module.h>
+ #include <linux/cpufreq.h>
+ #include <linux/wait.h>
++#include <linux/timekeeping.h>
+ 
+ /* trace format information to enable forward compatibility */
+ vtss_fmtcfg_t vtss_fmtcfg[2];
+@@ -209,7 +210,11 @@
+ 	memset(&vtss_hardcfg, 0, sizeof(vtss_hardcfg_t));
+ 	/* global variable vtss_time_source affects result of vtss_time_real() */
+ 	vtss_time_source = VTSS_TIME_SOURCE_SYS;
++#ifdef KTIME_MONOTONIC_RES
+ 	if (vtss_ktime_equal(KTIME_MONOTONIC_RES, KTIME_LOW_RES)) {
++#else
++	if (ktime_get_resolution_ns() == KTIME_LOW_RES) {
++#endif
+ 		vtss_pr_warning("SYS timer is not accurate");
+ 		vtss_time_source = VTSS_TIME_SOURCE_TSC;
+ 	}
