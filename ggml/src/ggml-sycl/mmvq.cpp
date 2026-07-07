@@ -19220,6 +19220,7 @@ template <int ROWS_PER_GROUP> class mxfp4_down_sum_q8_soa_row_group_kernel;
 class mxfp4_down_sum_q8_soa_atomic_kernel;
 class mxfp4_down_sum_zero_kernel;
 class mxfp4_down_sum_weighted_tmp_reduce_kernel;
+class mxfp4_layer_glu_down_bench_pair_ready_marker;
 
 static sycl::event mxfp4_down_sum_zero_sycl(sycl::queue &                    queue,
                                             float *                          dst,
@@ -22803,39 +22804,75 @@ bool ggml_sycl_mxfp4_layer_glu_down_bench_launch(const mxfp4_layer_glu_down_benc
         return false;
     }
 
+    const bool  down_q8_tile_requested = args.down_q8_dpas_tile_rows == 2 || args.down_q8_dpas_tile_rows == 4;
+    sycl::event down_q8_ready_event;
+    if (down_q8_tile_requested) {
+        down_q8_ready_event = ggml_sycl_submit_marker<mxfp4_layer_glu_down_bench_pair_ready_marker>(*args.stream);
+    }
     const bool down_q8_fused = pair_args.down_q8_soa != nullptr;
     if (!down_q8_fused) {
-        quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(args.glu_f32, static_cast<char *>(args.down_q8_soa),
-                                                              args.intermediate_cols, total_batches, ne0_padded,
-                                                              args.stream);
+        if (down_q8_tile_requested) {
+            std::vector<sycl::event> quant_deps  = { down_q8_ready_event };
+            sycl::event              quant_event = quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
+                args.glu_f32, static_cast<char *>(args.down_q8_soa), args.intermediate_cols, total_batches, ne0_padded,
+                args.stream, &quant_deps);
+            down_q8_ready_event = quant_event;
+        } else {
+            quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(args.glu_f32, static_cast<char *>(args.down_q8_soa),
+                                                                  args.intermediate_cols, total_batches, ne0_padded,
+                                                                  args.stream);
+        }
+    }
+
+    if (down_q8_tile_requested) {
+        std::vector<sycl::event> tile_deps          = { down_q8_ready_event };
+        const int64_t            final_token_stride = args.output_nb2;
+        if (args.down_q8_dpas_tile_rows == 2) {
+            mxfp4_down_q8_dpas_tile_sycl<2>(*args.stream, reinterpret_cast<const uint8_t * const *>(args.down_ptrs),
+                                            args.down_q8_soa, args.output, args.ids,
+                                            /*weights=*/nullptr, /*bias=*/nullptr, args.intermediate_cols,
+                                            args.intermediate_cols, args.output_rows_per_expert, args.n_ids,
+                                            args.n_tokens, args.ids_nb0, args.ids_nb1, args.down_q8_nb11,
+                                            args.down_q8_nb12, /*weights_nb1=*/0, /*weights_nb2=*/0, /*bias_nb1=*/0,
+                                            final_token_stride, /*deps=*/&tile_deps);
+            return true;
+        }
+        mxfp4_down_q8_dpas_tile_sycl<4>(*args.stream, reinterpret_cast<const uint8_t * const *>(args.down_ptrs),
+                                        args.down_q8_soa, args.output, args.ids,
+                                        /*weights=*/nullptr, /*bias=*/nullptr, args.intermediate_cols,
+                                        args.intermediate_cols, args.output_rows_per_expert, args.n_ids, args.n_tokens,
+                                        args.ids_nb0, args.ids_nb1, args.down_q8_nb11, args.down_q8_nb12,
+                                        /*weights_nb1=*/0, /*weights_nb2=*/0, /*bias_nb1=*/0, final_token_stride,
+                                        /*deps=*/&tile_deps);
+        return true;
     }
 
     mxfp4_mmv_id_bench_args down_args{};
-    down_args.stream              = args.stream;
-    down_args.expert_ptrs         = args.down_ptrs;
-    down_args.activations_q8_soa  = args.down_q8_soa;
-    down_args.output              = args.output;
-    down_args.ids                 = args.ids;
-    down_args.ncols               = args.intermediate_cols;
-    down_args.ncols_y             = args.intermediate_cols;
-    down_args.nrows_per_expert    = args.output_rows_per_expert;
-    down_args.num_experts         = args.num_experts;
-    down_args.n_ids               = args.n_ids;
-    down_args.n_tokens            = args.n_tokens;
-    down_args.ne11                = args.ne11;
-    down_args.ids_nb0             = args.ids_nb0;
-    down_args.ids_nb1             = args.ids_nb1;
-    down_args.nb11                = args.down_q8_nb11;
-    down_args.nb12                = args.down_q8_nb12;
-    down_args.dst_nb1             = args.output_nb1;
-    down_args.dst_nb2             = args.output_nb2;
-    down_args.rows_per_wg         = args.rows_per_wg;
-    down_args.cache_y             = args.cache_y;
-    down_args.vector_qs_load      = args.vector_qs_load;
-    down_args.ignore_weight_scale = args.ignore_weight_scale;
+    down_args.stream                 = args.stream;
+    down_args.expert_ptrs            = args.down_ptrs;
+    down_args.activations_q8_soa     = args.down_q8_soa;
+    down_args.output                 = args.output;
+    down_args.ids                    = args.ids;
+    down_args.ncols                  = args.intermediate_cols;
+    down_args.ncols_y                = args.intermediate_cols;
+    down_args.nrows_per_expert       = args.output_rows_per_expert;
+    down_args.num_experts            = args.num_experts;
+    down_args.n_ids                  = args.n_ids;
+    down_args.n_tokens               = args.n_tokens;
+    down_args.ne11                   = args.ne11;
+    down_args.ids_nb0                = args.ids_nb0;
+    down_args.ids_nb1                = args.ids_nb1;
+    down_args.nb11                   = args.down_q8_nb11;
+    down_args.nb12                   = args.down_q8_nb12;
+    down_args.dst_nb1                = args.output_nb1;
+    down_args.dst_nb2                = args.output_nb2;
+    down_args.rows_per_wg            = args.rows_per_wg;
+    down_args.cache_y                = args.cache_y;
+    down_args.vector_qs_load         = args.vector_qs_load;
+    down_args.ignore_weight_scale    = args.ignore_weight_scale;
     down_args.scale_stride_blocks    = args.scale_stride_blocks;
     down_args.subgroup_size          = args.subgroup_size;
-    down_args.down_q8_dpas_tile_rows = args.down_q8_dpas_tile_rows;
+    down_args.down_q8_dpas_tile_rows = 0;
     return ggml_sycl_mxfp4_mmv_id_bench_launch(down_args);
 }
 
@@ -22858,27 +22895,8 @@ bool ggml_sycl_mxfp4_mmv_id_bench_launch(const mxfp4_mmv_id_bench_args & args) {
     if (args.subgroup_size != 16 && args.subgroup_size != 32) {
         return false;
     }
-    if (args.down_q8_dpas_tile_rows != 0 && args.down_q8_dpas_tile_rows != 2 &&
-        args.down_q8_dpas_tile_rows != 4) {
+    if (args.down_q8_dpas_tile_rows != 0) {
         return false;
-    }
-    if (args.down_q8_dpas_tile_rows == 2) {
-        mxfp4_down_q8_dpas_tile_sycl<2>(*args.stream, reinterpret_cast<const uint8_t * const *>(args.expert_ptrs),
-                                        args.activations_q8_soa, args.output, args.ids,
-                                        /*weights=*/nullptr, /*bias=*/nullptr, args.ncols, args.ncols_y,
-                                        args.nrows_per_expert, args.n_ids, args.n_tokens, args.ids_nb0, args.ids_nb1,
-                                        args.nb11, args.nb12, /*weights_nb1=*/0, /*weights_nb2=*/0, /*bias_nb1=*/0,
-                                        args.dst_nb2, /*deps=*/nullptr);
-        return true;
-    }
-    if (args.down_q8_dpas_tile_rows == 4) {
-        mxfp4_down_q8_dpas_tile_sycl<4>(*args.stream, reinterpret_cast<const uint8_t * const *>(args.expert_ptrs),
-                                        args.activations_q8_soa, args.output, args.ids,
-                                        /*weights=*/nullptr, /*bias=*/nullptr, args.ncols, args.ncols_y,
-                                        args.nrows_per_expert, args.n_ids, args.n_tokens, args.ids_nb0, args.ids_nb1,
-                                        args.nb11, args.nb12, /*weights_nb1=*/0, /*weights_nb2=*/0, /*bias_nb1=*/0,
-                                        args.dst_nb2, /*deps=*/nullptr);
-        return true;
     }
 
     const int total_batches = args.n_ids * args.n_tokens;

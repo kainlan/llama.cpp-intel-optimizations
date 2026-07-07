@@ -221,3 +221,40 @@ def test_down_q8_dpas_tile_kernel_is_default_off_and_uses_named_labels() -> None
     assert "mxfp4_down_q8_dpas_tile_sycl<2>" in down_region
     assert "mxfp4_down_q8_dpas_tile_sycl<4>" in down_region
     assert ".wait(" not in down_region
+
+
+def test_layer_glu_down_tile_bench_depends_on_q8_producer_event() -> None:
+    mmvq = MMVQ.read_text(encoding="utf-8")
+    layer_body = slice_between(
+        mmvq,
+        "bool ggml_sycl_mxfp4_layer_glu_down_bench_launch",
+        "bool ggml_sycl_mxfp4_mmv_id_bench_launch",
+    )
+    assert "down_q8_tile_requested = args.down_q8_dpas_tile_rows == 2 || args.down_q8_dpas_tile_rows == 4" in layer_body
+    assert "ggml_sycl_submit_marker<mxfp4_layer_glu_down_bench_pair_ready_marker>" in layer_body
+    assert "sycl::event down_q8_ready_event" in layer_body
+    assert "std::vector<sycl::event> quant_deps" in layer_body
+    assert "{ down_q8_ready_event }" in layer_body
+    assert "quant_event = quantize_row_q8_1_sycl" in layer_body
+    assert "down_q8_ready_event = quant_event" in layer_body
+    assert "std::vector<sycl::event> tile_deps" in layer_body
+    assert "{ down_q8_ready_event }" in layer_body
+    assert "mxfp4_down_q8_dpas_tile_sycl<2>" in layer_body
+    assert "mxfp4_down_q8_dpas_tile_sycl<4>" in layer_body
+    assert "/*deps=*/&tile_deps" in layer_body
+    assert layer_body.index("down_q8_ready_event = quant_event") < layer_body.index(
+        "mxfp4_down_q8_dpas_tile_sycl<2>"
+    )
+    assert ".wait(" not in layer_body
+
+
+def test_mmv_id_bench_rejects_down_q8_dpas_tile_rows_to_preserve_output_contract() -> None:
+    mmvq = MMVQ.read_text(encoding="utf-8")
+    mmv_id_body = slice_between(
+        mmvq,
+        "bool ggml_sycl_mxfp4_mmv_id_bench_launch",
+        "bool ggml_sycl_mxfp4_mmv_id_predecoded_bench_launch",
+    )
+    assert "if (args.down_q8_dpas_tile_rows != 0)" in mmv_id_body
+    assert "mxfp4_down_q8_dpas_tile_sycl" not in mmv_id_body
+    assert "/*weights=*/nullptr" not in mmv_id_body
