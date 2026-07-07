@@ -9,24 +9,21 @@ Related VTune-version tracker: `llama.cpp-n4l6`
 
 Use **Intel VTune Profiler 2026.2** for Xe/Battlemage GPU characterization work going forward.
 
-The installed system `latest` VTune is 2025.10:
+At the start of the profiling ladder, installed system `latest` VTune was
+2025.10:
 
 ```text
 /opt/intel/oneapi/vtune/latest -> /opt/intel/oneapi/vtune/2025.10
 Intel(R) VTune(TM) Profiler 2025.10.0 (build 631693)
 ```
 
-Intel's current VTune release page lists VTune 2026.2, and the Intel oneAPI APT
-repo contains `intel-oneapi-vtune 2026.2.0-178`. The repo source exists locally
-but is disabled:
+Intel's current VTune release page lists VTune 2026.2 as the newest release, and
+the Intel oneAPI APT repo contains no newer `intel-oneapi-vtune` than
+`2026.2.0-178`.
 
-```text
-/etc/apt/sources.list.d/oneAPI.list.disabled
-```
-
-To avoid changing the system profiler installation or touching the patched GPU
-runtime stack, the 2026.2 `.deb` was downloaded and extracted read-only under
-`/tmp`:
+For the first validation pass, the 2026.2 `.deb` was downloaded and extracted
+read-only under `/tmp` to avoid changing the system profiler installation or the
+patched GPU runtime stack:
 
 ```text
 /tmp/intel-oneapi-vtune-2026.2.0-178_amd64.deb
@@ -34,9 +31,23 @@ runtime stack, the 2026.2 `.deb` was downloaded and extracted read-only under
 Intel(R) VTune(TM) Profiler 2026.2.0 (build 632324)
 ```
 
-The package dependency check showed only oneAPI common vars/licensing packages,
-not driver or compute-runtime packages, but the isolated extract is safer for now.
-If this version remains stable, a later system install can use the Intel APT repo.
+After validation and user approval, VTune 2026.2 was installed system-wide via
+the Intel oneAPI APT repo:
+
+```text
+/etc/apt/sources.list.d/oneAPI.list
+dpkg: intel-oneapi-vtune 2026.2.0-178
+/opt/intel/oneapi/vtune/latest -> /opt/intel/oneapi/vtune/2026.2
+Intel(R) VTune(TM) Profiler 2026.2.0 (build 632324)
+```
+
+The APT simulation showed only `intel-oneapi-vtune` plus oneAPI common
+vars/licensing packages; it did not pull GPU driver, compute-runtime, Level Zero,
+compiler, or OpenCL/SYCL runtime packages. The optional VTune `vtsspp` kernel
+driver failed to build against kernel `7.1.2-070102-generic` due to
+`KTIME_MONOTONIC_RES` being undeclared, but package installation completed,
+`apt-get check` passed, and the user-mode/GPU Hotspots path used here works from
+`/opt/intel/oneapi/vtune/latest`.
 
 ## Evidence artifacts
 
