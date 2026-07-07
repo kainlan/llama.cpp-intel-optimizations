@@ -296,3 +296,207 @@ grouping is backed by non-empty `gsim_stall_data`, `gpu_sampling_data`, or
 Therefore local VTune stall-sampling and source-analysis modes still do not
 provide a `kernel,pc,sample_count` producer. `sampled-line-cost` remains
 unvalidated.
+
+## 2026-07-06 follow-up: explicit stall-sampling environment and Linux setup audit
+
+Follow-up tracker: `llama.cpp-cpne`
+
+Code Scout web research found Intel's documented CLI recipe for hardware-assisted
+stall sampling:
+
+```text
+AMPLXE_EXPERIMENTAL=gpu-stall-sampling
+vtune -collect gpu-hotspots -knob profiling-mode=source-analysis -knob source-analysis=stall-sampling -- <app>
+```
+
+VTune 2025.10 warns that `profiling-mode` is deprecated, so lead also tried the
+current spelling:
+
+```text
+-knob gpu-profiling-mode=source-analysis
+```
+
+All probe commands used the standalone `sycl-mxfp4-source-line-probe`, did not
+access models or `/Storage`, and used the required oneAPI sourcing sequence.
+
+Artifacts without changing system profiling permissions:
+
+```text
+/tmp/sycl_cpne_stall_sampling_explicit_20260706_214423
+/tmp/sycl_cpne_stall_sampling_gpu_mode_20260706_214458
+```
+
+Results with the explicit `AMPLXE_EXPERIMENTAL=gpu-stall-sampling` environment
+were still configuration failures on both discrete GPUs while the kernel
+profiling sysctls remained restrictive:
+
+```text
+# B50 target-gpu=0:7:0.0
+vtune: Error: Cannot configure the collection for the requested devices.
+vtune: Collection failed.
+vtune: Internal Error
+
+# B580 target-gpu=0:3:0.0
+vtune: Error: Cannot configure the collection for the requested devices.
+vtune: Collection failed.
+vtune: Internal Error
+```
+
+Linux setup audit artifact:
+
+```text
+/tmp/sycl_cpne_gpu_profiling_setup_audit_20260706_214609
+```
+
+Audit summary:
+
+```text
+group.render present
+group.video present
+intel-metrics-discovery installed
+prepare-gpu-hardware-metrics.sh present
+dev.xe.observation_paranoid=1
+dev.i915.perf_stream_paranoid=1
+/sys/kernel/debug mounted but not readable/writable by the user
+/sys/kernel/tracing not readable/writable by the user
+CONFIG_DRM_I915_LOW_LEVEL_TRACEPOINTS is not set
+```
+
+The VTune helper documents that it sets both `dev.i915.perf_stream_paranoid` and
+`dev.xe.observation_paranoid` to zero. Lead therefore temporarily set only those
+two sysctls to `0`, reran the same standalone probes, and restored both values to
+`1` afterward.
+
+Artifacts with temporary sysctl opening:
+
+```text
+/tmp/sycl_cpne_stall_sampling_sysctl0_20260706_214707
+/tmp/sycl_cpne_stall_sampling_sysctl0_long_20260706_214936
+```
+
+This changed the failure mode: VTune collection now starts, runs, finalizes, and
+loads `stallreasons_*.lzm` for both B50 and B580. However, VTune still reports
+that the GPU Compute/Media Hotspots viewpoint is unavailable and that no GPU-side
+trace data was collected. The result databases contain aggregate stall/sample
+rows but no compute-task, source, or assembly correlation:
+
+```text
+# short run, B50
+dd_sample 7160
+gpu_sampling_data_agg_band 716
+gpu_sampling_data_agg_data 7160
+dd_compute_task 0
+dd_compute_task_type 0
+dd_compute_sample 0
+dd_gpu_execution_stats 0
+dd_source_file 0
+dd_assembly 0
+
+# long run, B50
+dd_sample 10380
+dd_compute_task 0
+dd_compute_task_type 0
+dd_compute_sample 0
+dd_gpu_execution_stats 0
+dd_source_file 0
+dd_assembly 0
+
+# long run, B580
+dd_sample 10230
+dd_compute_task 0
+dd_compute_task_type 0
+dd_compute_sample 0
+dd_gpu_execution_stats 0
+dd_source_file 0
+dd_assembly 0
+```
+
+The `dd_sample.ip` values are instruction-aligned and the event taxonomy includes
+`%GPUActive`, `%GPUPipeStall`, `%GPUSend`, `%GPUSbid`, `%GPUSync`,
+`%GPUInstructionFetch`, and other stall reason names. They are still not accepted
+as `sampled-line-cost`: VTune does not provide kernel names, module/base mapping,
+source rows, or assembly rows for these samples in the tested results, and many
+candidate base offsets can map them into the dense IGA PC range. A truthful
+`sampled-line-cost` producer still requires validated `kernel,pc,sample_count`
+rows with a non-ambiguous kernel/base correlation.
+
+Updated conclusion: the earlier hard configuration failure was caused at least in
+part by Linux profiling permission knobs. Opening those knobs enables aggregate
+VTune stall-sampling collection, but on this B50/B580 stack it still does not
+produce usable sampled source-line attribution. `source_line.status pass` and
+`source_attribution.status exact_source_line` remain unavailable, and
+`sampled-line-cost` remains unvalidated.
+
+## 2026-07-06 follow-up: PTI `instcount` dynamic instruction counts
+
+Follow-up tracker: `llama.cpp-cpne`
+
+Intel's PTI `instcount` tool is not installed by the local oneAPI PTI package,
+but the upstream `intel/pti-gpu` source builds cleanly in `/tmp` and downloads
+its matching GTPin package during CMake configure.
+
+Artifacts:
+
+```text
+/tmp/sycl_cpne_pti_instcount_20260706_215023
+/tmp/sycl_cpne_pti_instcount_run2_20260706_215133
+```
+
+Build result:
+
+```text
+cmake.exit 0
+build.exit 0
+built: build-instcount/instcount
+built: build-instcount/libinstcount_tool.so
+```
+
+Narrow validation on `sycl-mxfp4-source-line-probe` succeeded on both B50 and
+B580 with `--disable-simd --json-output`. The tool writes its JSON profile to
+stderr and the application output to stdout. It instruments kernel instructions;
+this is runtime instruction execution counting, not statistical PC sampling.
+
+Pair-GLU kernel summary on both B50 and B580:
+
+```text
+kernel _ZTS39mxfp4_pair_glu_xmx_tiled_dpas_m2_kernelILi8ELi3ELb0ELb0EE
+runs 4
+results_num 1562
+positive_offsets 1562
+total_instruction_count 200448000
+```
+
+A CSV adapter converted the PTI offsets to `kernel,pc,sample_count,sample_kind`
+rows with:
+
+```text
+sample_kind=pti-instcount-instruction-exec-count
+```
+
+and mapped them through the existing DWARF resolver using explicit non-sampled
+labels:
+
+```text
+--attribution-mode pti-instcount-line
+--attribution-status pti_instcount_runtime_cost
+--summary-prefix pti_instcount_source
+--require-source-path mmvq.cpp
+```
+
+Mapping result on both B50 and B580:
+
+```text
+pti_instcount_source.status ok
+pti_instcount_source.mapped_sample_count 11571840
+pti_instcount_source.unmapped_sample_count 188876160
+pti_instcount_source.source_line_rows 65
+pti_instcount_source.top_source_line /tmp/sycl_mxfp4_source_line_device_tu_build_20260706_112515/ggml/src/ggml-sycl/mmvq.cpp:7233
+pti_instcount_source.top_sample_count 2073600
+pti_instcount_source.top_sample_kind pti-instcount-instruction-exec-count
+```
+
+This provides a second validated runtime-count attribution path alongside GTPin
+`memorytrace.so`, but it must stay labeled separately as
+`pti_instcount_runtime_cost`. It is not VTune exact source-line attribution, and
+it is not `sampled-line-cost` because the producer instruments/counts
+instructions rather than sampling PCs.

@@ -80,16 +80,42 @@ Existing implementation artifacts are present:
 - `scripts/check-sycl-vtune-source-lines.py`, `scripts/parse-sycl-source-attribution.py`, and `scripts/merge-sycl-staged-ledger.py` keep `sampled-line-cost` / `sampled_line_cost` distinct from VTune exact source rows.
 - `scripts/sycl-intel-pc-sampling-capability.sh` reports `available`, `metrics_only`, or `unavailable`, enumerates Level Zero metric properties including `ZET_METRIC_TYPE_IP`, and never synthesizes `pc-samples.csv`.
 
-No true sampled runtime source-line attribution is available from Level Zero/PTI/VTune metric tooling on this host yet. The installed PTI/Level Zero stack exposes metric counters, but no instruction-pointer metric source (`ip_metric_count 0`). A follow-up targeted VTune `stall-sampling` probe also failed to configure on both B50 (`target-gpu=0:7:0.0`) and B580 (`target-gpu=0:3:0.0`), while a targeted B50 `mem-latency` rerun still produced empty `gpu-source-line`/`computing-task` reports and zero sampled/source execution rows in `dicer.db`.
+No true sampled runtime source-line attribution is available from Level Zero/PTI/VTune metric tooling on this host yet. The installed PTI/Level Zero stack exposes metric counters, but no instruction-pointer metric source (`ip_metric_count 0`). A follow-up targeted VTune `stall-sampling` probe initially failed to configure on both B50 (`target-gpu=0:7:0.0`) and B580 (`target-gpu=0:3:0.0`), while a targeted B50 `mem-latency` rerun still produced empty `gpu-source-line`/`computing-task` reports and zero sampled/source execution rows in `dicer.db`.
 
-Latest negative sampled-PC probe artifacts:
+Latest negative sampled-PC / source-row probe artifacts:
 
 ```text
 /tmp/sycl_cpne_stall_sampling_probe_20260706_163026
 /tmp/sycl_cpne_stall_sampling_b50_20260706_163051
 /tmp/sycl_cpne_stall_sampling_b580_20260706_163117
 /tmp/sycl_cpne_memlatency_b50_targeted_20260706_163227
+/tmp/sycl_cpne_stall_sampling_explicit_20260706_214423
+/tmp/sycl_cpne_stall_sampling_gpu_mode_20260706_214458
+/tmp/sycl_cpne_gpu_profiling_setup_audit_20260706_214609
+/tmp/sycl_cpne_stall_sampling_sysctl0_20260706_214707
+/tmp/sycl_cpne_stall_sampling_sysctl0_long_20260706_214936
 ```
+
+The setup audit found `render`/`video` groups and Metrics Discovery installed,
+but the documented profiling sysctls were restrictive:
+`dev.xe.observation_paranoid=1` and `dev.i915.perf_stream_paranoid=1`. With only
+those sysctls temporarily set to `0`, VTune `stall-sampling` collection starts
+and loads `stallreasons_*.lzm` on both B50 and B580. However, the resulting
+VTune databases still contain no compute-task, source, or assembly correlation:
+
+```text
+dd_sample > 0
+gpu_sampling_data_agg_data > 0
+dd_compute_task 0
+dd_compute_sample 0
+dd_gpu_execution_stats 0
+dd_source_file 0
+dd_assembly 0
+```
+
+The raw `dd_sample.ip` values are therefore not promoted to `sampled-line-cost`:
+there is no validated kernel/base/source correlation and no generated
+`kernel,pc,sample_count` evidence file.
 
 A separate runtime-count path is now validated through VTune's embedded GTPin
 `memorytrace.so` profiler. This produces positive runtime BBL execution counts
@@ -145,6 +171,50 @@ source_line.blocker none
 source_line.status gtpin-bbl-runtime-cost
 ```
 
+A second runtime-count path was validated through Intel PTI `instcount` from the
+upstream `intel/pti-gpu` source tree. This tool instruments GPU instructions and
+reports dynamic instruction execution counts plus SIMD active lanes; it is not a
+statistical PC sampler.
+
+PTI `instcount` artifacts:
+
+```text
+/tmp/sycl_cpne_pti_instcount_20260706_215023
+/tmp/sycl_cpne_pti_instcount_run2_20260706_215133
+```
+
+Pair-GLU kernel validation on both B50 and B580:
+
+```text
+runs 4
+results_num 1562
+positive_offsets 1562
+total_instruction_count 200448000
+```
+
+Using explicit labels:
+
+```text
+--attribution-mode pti-instcount-line
+--attribution-status pti_instcount_runtime_cost
+--summary-prefix pti_instcount_source
+```
+
+the existing DWARF resolver maps PTI instruction-count offsets to source lines:
+
+```text
+pti_instcount_source.status ok
+pti_instcount_source.mapped_sample_count 11571840
+pti_instcount_source.unmapped_sample_count 188876160
+pti_instcount_source.source_line_rows 65
+pti_instcount_source.top_source_line /tmp/sycl_mxfp4_source_line_device_tu_build_20260706_112515/ggml/src/ggml-sycl/mmvq.cpp:7233
+pti_instcount_source.top_sample_count 2073600
+pti_instcount_source.top_sample_kind pti-instcount-instruction-exec-count
+```
+
+This is accepted only as `pti_instcount_runtime_cost`, separate from
+`gtpin_bbl_runtime_cost` and separate from `sampled-line-cost`.
+
 Implementation artifacts:
 
 - `scripts/extract-sycl-gtpin-bbl-pc-counts.py` parses GTPin `memorytrace_compressed.bin` BBL traces, including the VTune 2025.10 20-u32 send descriptor ABI, and emits positive `kernel,pc,sample_count,sample_kind` rows with `sample_kind=gtpin-bbl-instruction-exec-count`.
@@ -162,6 +232,7 @@ Implementation artifacts:
 | VTune GPU source rows | yes | yes | `source_line.status pass` |
 | PC sample CSV mapped through DWARF | yes | yes | `source_line.status sampled-line-cost` |
 | GTPin memorytrace BBL execution counts mapped through DWARF | runtime counted, not sampled | yes | `source_line.status gtpin-bbl-runtime-cost` / row status `gtpin_bbl_runtime_cost` |
+| PTI `instcount` instruction execution counts mapped through DWARF | runtime counted, not sampled | yes | row status `pti_instcount_runtime_cost` |
 | IGA PC static instruction rows mapped through DWARF | no | yes | `source_line.status asm-line-static-cost` |
 | DWARF line-table coverage only | no | no cost ranking | `source_line.status dwarf-line-table-only` |
 
@@ -172,8 +243,9 @@ For TG optimization today, use:
 1. `pass` / `exact_source_line` if lead VTune source rows are available.
 2. `sampled-line-cost` only after a real sampled positive-count `pc-samples.csv` is produced and mapped.
 3. `gtpin_bbl_runtime_cost` for profiled trace-scope runtime BBL execution counts; this is now available for the MXFP4 pair-GLU source-line diagnostic target.
-4. `asm-line-static-cost` for artifacts whose IGA PC rows and DWARF line rows both validate; this is now true for the standalone probe and for the source-line-only MXFP4 pair-GLU diagnostic target.
-5. `dwarf-line-table-only` as coverage/fallback when cost-ranked source rows are not available.
+4. `pti_instcount_runtime_cost` for PTI/GTPin instrumented dynamic instruction execution counts; this is validated for the MXFP4 pair-GLU source-line diagnostic target but remains separate from sampled PC evidence.
+5. `asm-line-static-cost` for artifacts whose IGA PC rows and DWARF line rows both validate; this is now true for the standalone probe and for the source-line-only MXFP4 pair-GLU diagnostic target.
+6. `dwarf-line-table-only` as coverage/fallback when cost-ranked source rows are not available.
 
 Current MXFP4 state: task-to-ZEBin selection, IGA PC extraction, and static PC-to-source-row resolution work for the source-line-only pair-GLU diagnostic target. The normal benchmark/backend path remains unchanged and should not be relabeled as sampled exact source-line attribution.
 
