@@ -43,7 +43,7 @@ Model-free layer-glu/down latency favored tile2 (`935.122 us`) over the current 
 
 - Do not promote `GGML_SYCL_MOE_DOWN_Q8_DPAS_TILE=tile2` or `tile4` to default-on.
 - Keep both values available only as experimental/default-off diagnostics.
-- Do not document either opt-in as recommended for performance. If a follow-up needs a tile comparison, `tile4` is the least disruptive measured tile candidate, but it still trails baseline and failed promotion.
+- Do not present either opt-in as a performance win; this validation does not prefer `tile2` or `tile4`.
 - Do not add the Task 6 `GGML_SYCL_MOE_GATEUP_M2_LOADV2` runtime dispatch in this pass; the lead skipped it because there was no approved loadv2 gate/up evidence.
 - Next optimization target: gate/up load-path evidence around the runtime-count lines and/or launch consolidation/graphlet overhead, with the same canonical correctness, PP, TG, fatal-marker, and named-kernel gates.
 - Tracker action: update `llama.cpp-ghuz` with this rejection decision and tested commands; no default-on follow-up is authorized by this validation.
