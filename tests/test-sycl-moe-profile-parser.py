@@ -639,7 +639,13 @@ def test_down_q8_dpas_tile_gate_dry_run_contains_count_and_profile_commands() ->
     assert "./build/bin/llama-bench" in out
     assert "GGML_SYCL_MOE_DOWN_Q8_DPAS_TILE=tile2" in out
     assert "GGML_SYCL_MOE_DOWN_Q8_DPAS_TILE=tile4" in out
-    assert "-u GGML_SYCL_MOE_DOWN_Q8_DPAS_TILE" in out
+    for env in [
+        "GGML_SYCL_MOE_DOWN_Q8_DPAS_TILE",
+        "GGML_SYCL_MOE_DECODE_DOWN_I8_SELECTED",
+        "GGML_SYCL_SELECTED_DPAS_MATERIALIZE",
+    ]:
+        assert f"-u {env}" in out
+        assert f"{env}=1" not in out
     assert "-p 64 -n 32 -fa 1" in out
     for env in [
         "GGML_SYCL_MOE_PHASE_MATERIALIZE=1",

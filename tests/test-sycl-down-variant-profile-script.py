@@ -38,6 +38,11 @@ HARNESS_OVERRIDE_ENVS = [
     "SYCL_DOWN_VARIANT_PROFILE_OUT",
 ]
 
+DIRECT_FINAL_LEAK_ENVS = [
+    "GGML_SYCL_MOE_DECODE_DOWN_I8_SELECTED",
+    "GGML_SYCL_SELECTED_DPAS_MATERIALIZE",
+]
+
 VARIANT_CLEAR_ENVS = [
     "GGML_SYCL_MOE_DOWN_SUM_DIRECT",
     "GGML_SYCL_MOE_DOWN_SUM_Q8_SOA_TG_VARIANT",
@@ -48,6 +53,7 @@ VARIANT_CLEAR_ENVS = [
     "GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL",
     "GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL_I8",
     "GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL_DPAS",
+    *DIRECT_FINAL_LEAK_ENVS,
     "GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL_RANK_PARALLEL_ATOMIC",
     "GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL_SCRATCH_REDUCE",
     "GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL_SAME_EXPERT_GROUPED",
@@ -139,6 +145,21 @@ def test_dry_run_clears_inherited_variant_knobs_per_command(tmp_path: Path) -> N
     for name in VARIANT_CLEAR_ENVS:
         assert f"-u {name}" in baseline
         assert f"{name}=tainted" not in out
+
+
+def test_known_direct_final_envs_are_cleared_even_when_tainted(tmp_path: Path) -> None:
+    completed = _run_script(
+        "--dry-run",
+        out_dir=tmp_path / "dry-run",
+        extra_env={name: "tainted" for name in DIRECT_FINAL_LEAK_ENVS},
+    )
+    out = _combined_output(completed)
+    assert completed.returncode == 0, out
+    for section_name in VARIANTS:
+        section = _section(out, section_name)
+        for name in DIRECT_FINAL_LEAK_ENVS:
+            assert f"-u {name}" in section
+            assert f"{name}=tainted" not in out
 
 
 def test_dry_run_lists_all_variants_in_order(tmp_path: Path) -> None:
