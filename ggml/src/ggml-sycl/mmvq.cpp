@@ -239,6 +239,77 @@ static int mxfp4_moe_down_sum_q8_soa_tg_active_rows_per_group(bool is_down_role,
     return mxfp4_moe_down_sum_q8_soa_tg_rows_per_group();
 }
 
+int ggml_sycl_moe_down_q8_dpas_tile_from_env(const char * env) {
+    if (!env || env[0] == '\0') {
+        return 0;
+    }
+    if (std::strcmp(env, "tile2") == 0) {
+        return 2;
+    }
+    if (std::strcmp(env, "tile4") == 0) {
+        return 4;
+    }
+    return 0;
+}
+
+int ggml_sycl_moe_down_q8_dpas_tile_active_from_env(const char * env,
+                                                    bool         is_down_role,
+                                                    ggml_layout_mode down_layout,
+                                                    int64_t      n_tokens) {
+    if (!is_down_role || down_layout != GGML_LAYOUT_SOA || n_tokens != 1) {
+        return 0;
+    }
+    return ggml_sycl_moe_down_q8_dpas_tile_from_env(env);
+}
+
+const char * ggml_sycl_moe_down_q8_dpas_tile_label(int tile_rows) {
+    switch (tile_rows) {
+        case 2:
+            return "down-q8-dpas-tile2";
+        case 4:
+            return "down-q8-dpas-tile4";
+        default:
+            return nullptr;
+    }
+}
+
+static const char * mxfp4_moe_down_q8_dpas_tile_profile_label(int tile_rows) {
+    switch (tile_rows) {
+        case 2:
+            return "mxfp4.down.q8_dpas_tile2";
+        case 4:
+            return "mxfp4.down.q8_dpas_tile4";
+        default:
+            return nullptr;
+    }
+}
+
+static const char * mxfp4_moe_down_q8_dpas_tile_profile_metadata(int tile_rows) {
+    switch (tile_rows) {
+        case 2:
+            return "path=q8-soa;role=down;variant=dpas-tile2";
+        case 4:
+            return "path=q8-soa;role=down;variant=dpas-tile4";
+        default:
+            return nullptr;
+    }
+}
+
+static int mxfp4_moe_down_q8_dpas_tile_rows() {
+    static const int tile_rows = []() {
+        const char * env = std::getenv("GGML_SYCL_MOE_DOWN_Q8_DPAS_TILE");
+        return ggml_sycl_moe_down_q8_dpas_tile_from_env(env);
+    }();
+    return tile_rows;
+}
+
+static int mxfp4_moe_down_q8_dpas_tile_active(bool is_down_role, ggml_layout_mode down_layout, int64_t n_tokens) {
+    if (!is_down_role || down_layout != GGML_LAYOUT_SOA || n_tokens != 1) {
+        return 0;
+    }
+    return mxfp4_moe_down_q8_dpas_tile_rows();
+}
+
 int ggml_sycl_moe_down_cached_q8_soa_tg_variant_from_env(const char * env) {
     if (!env || env[0] == '\0') {
         return 0;
@@ -19771,6 +19842,12 @@ bool mmvq_moe_batched_dispatch_down_sum_from_cached_q8_mxfp4(
                 ids_nb1, q8_row_size, ne11 * q8_row_size, moe_weights->nb[1], moe_weights->nb[2],
                 down_bias ? down_bias->nb[1] : 0, final_token_stride, dispatch_deps_ptr);
         } else {
+            // Task 1 reserves the default-off down Q8 DPAS tile policy source contract for Task 3.
+            // Runtime dispatch remains on the serial SOA fallback until the tiled kernel exists.
+            // Dispatch order after row-group variants:
+            //   mxfp4_moe_down_q8_dpas_tile_active(/*is_down_role=*/true, GGML_LAYOUT_SOA, n_tokens)
+            //   mxfp4_down_q8_dpas_tile_sycl<2>
+            //   mxfp4_down_q8_dpas_tile_sycl<4>
             event = mxfp4_down_sum_q8_soa_sycl(*stream, reinterpret_cast<const uint8_t * const *>(down_ptrs_device),
                                                q8_buffer, dst_d, ids_device, weights_d, bias_d, static_cast<int>(ncols),
                                                static_cast<int>(ncols_y), static_cast<int>(nrows_per_expert),

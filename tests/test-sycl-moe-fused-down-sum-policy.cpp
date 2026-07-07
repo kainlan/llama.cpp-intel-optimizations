@@ -317,6 +317,44 @@ static int test_cached_down_q8_soa_tg_variant_parser_labels_and_scope() {
     return 0;
 }
 
+static int test_down_q8_dpas_tile_variant_parser_labels_and_scope() {
+    CHECK(ggml_sycl_moe_down_q8_dpas_tile_from_env(nullptr) == 0,
+          "missing down Q8 DPAS tile env must default off");
+    CHECK(ggml_sycl_moe_down_q8_dpas_tile_from_env("") == 0,
+          "empty down Q8 DPAS tile env must default off");
+    CHECK(ggml_sycl_moe_down_q8_dpas_tile_from_env("0") == 0,
+          "numeric down Q8 DPAS tile aliases must fail closed");
+    CHECK(ggml_sycl_moe_down_q8_dpas_tile_from_env("1") == 0,
+          "numeric down Q8 DPAS tile aliases must fail closed");
+    CHECK(ggml_sycl_moe_down_q8_dpas_tile_from_env("bogus") == 0,
+          "unknown down Q8 DPAS tile env must fail closed");
+    CHECK(ggml_sycl_moe_down_q8_dpas_tile_from_env("direct-final") == 0,
+          "down Q8 DPAS tile env must not accept direct-final");
+    CHECK(ggml_sycl_moe_down_q8_dpas_tile_from_env("tile2") == 2,
+          "tile2 down Q8 DPAS tile env must parse");
+    CHECK(ggml_sycl_moe_down_q8_dpas_tile_from_env("tile4") == 4,
+          "tile4 down Q8 DPAS tile env must parse");
+
+    CHECK(ggml_sycl_moe_down_q8_dpas_tile_active_from_env("tile2", false, GGML_LAYOUT_SOA, 1) == 0,
+          "down Q8 DPAS tile must not affect non-DOWN roles");
+    CHECK(ggml_sycl_moe_down_q8_dpas_tile_active_from_env("tile2", true, GGML_LAYOUT_AOS, 1) == 0,
+          "down Q8 DPAS tile must require SOA down layout");
+    CHECK(ggml_sycl_moe_down_q8_dpas_tile_active_from_env("tile2", true, GGML_LAYOUT_SOA, 2) == 0,
+          "down Q8 DPAS tile must not affect prompt or multi-token batches");
+    CHECK(ggml_sycl_moe_down_q8_dpas_tile_active_from_env("tile2", true, GGML_LAYOUT_SOA, 1) == 2,
+          "tile2 down Q8 DPAS tile must be active for SOA DOWN decode only");
+    CHECK(ggml_sycl_moe_down_q8_dpas_tile_active_from_env("tile4", true, GGML_LAYOUT_SOA, 1) == 4,
+          "tile4 down Q8 DPAS tile must be active for SOA DOWN decode only");
+
+    CHECK(ggml_sycl_moe_down_q8_dpas_tile_label(0) == nullptr,
+          "disabled down Q8 DPAS tile route must not emit a profile label");
+    CHECK(std::strcmp(ggml_sycl_moe_down_q8_dpas_tile_label(2), "down-q8-dpas-tile2") == 0,
+          "tile2 down Q8 DPAS route label must be stable");
+    CHECK(std::strcmp(ggml_sycl_moe_down_q8_dpas_tile_label(4), "down-q8-dpas-tile4") == 0,
+          "tile4 down Q8 DPAS route label must be stable");
+    return 0;
+}
+
 static int test_down_q8_soa_variants_do_not_enable_direct_final() {
     const std::string mmvq = read_required_file("ggml/src/ggml-sycl/mmvq.cpp");
     CHECK(contains(mmvq, "GGML_SYCL_MOE_DOWN_SUM_XMX_DIRECT_FINAL"),
@@ -449,6 +487,9 @@ int main() {
         return 1;
     }
     if (test_cached_down_q8_soa_tg_variant_parser_labels_and_scope() != 0) {
+        return 1;
+    }
+    if (test_down_q8_dpas_tile_variant_parser_labels_and_scope() != 0) {
         return 1;
     }
     if (test_down_q8_soa_variants_do_not_enable_direct_final() != 0) {

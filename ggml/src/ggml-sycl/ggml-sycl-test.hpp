@@ -458,6 +458,13 @@ struct test_sycl_info_override_guard {
 
 }  // namespace ggml_sycl
 
+int         ggml_sycl_moe_down_q8_dpas_tile_from_env(const char * env);
+int         ggml_sycl_moe_down_q8_dpas_tile_active_from_env(const char * env,
+                                                            bool         is_down_role,
+                                                            ggml_layout_mode down_layout,
+                                                            int64_t      n_tokens);
+const char * ggml_sycl_moe_down_q8_dpas_tile_label(int tile_rows);
+
 // =============================================================================
 // Blind preload threshold functions (for testing)
 // =============================================================================

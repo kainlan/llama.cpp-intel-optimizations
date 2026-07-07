@@ -121,6 +121,8 @@ def test_mmvq_active_blind_spots_have_named_profile_labels() -> None:
         "mxfp4.down.q8_soa",
         "mxfp4.down.q8_soa_atomic",
         "mxfp4.down.q8_soa_row_group",
+        "mxfp4.down.q8_dpas_tile2",
+        "mxfp4.down.q8_dpas_tile4",
         "mxfp4.down.weighted_tmp_reduce",
     ]:
         assert label in mmvq
@@ -159,6 +161,11 @@ def test_mmvq_active_direct_q8_soa_down_honors_row_group_variants() -> None:
     assert "mxfp4_down_sum_q8_soa_row_group_sycl<2>" in direct_body
     assert "mxfp4_down_sum_q8_soa_row_group_sycl<4>" in direct_body
     assert "mxfp4_down_sum_q8_soa_sycl" in direct_body
+    assert "GGML_SYCL_MOE_DOWN_Q8_DPAS_TILE" in mmvq
+    assert "mxfp4_moe_down_q8_dpas_tile_active" in direct_body
+    assert "mxfp4_down_q8_dpas_tile_sycl<2>" in direct_body
+    assert "mxfp4_down_q8_dpas_tile_sycl<4>" in direct_body
+    assert direct_body.index("mxfp4_moe_down_q8_dpas_tile_active") < direct_body.index("mxfp4_down_sum_q8_soa_sycl")
     assert direct_body.index("mxfp4_down_sum_q8_soa_atomic_sycl") < direct_body.index(
         "mxfp4_moe_down_sum_q8_soa_tg_active_rows_per_group"
     )
