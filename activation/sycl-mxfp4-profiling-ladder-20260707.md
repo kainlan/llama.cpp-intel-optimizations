@@ -66,9 +66,47 @@ vermagic: 7.1.2-070102-generic SMP preempt mod_unload modversions
 ```
 
 `sep5.service` was already enabled and active after the package install, with
-`sep5`, `pax`, and `socwatch2_16` loaded. `vtsspp` was not manually loaded during
-this fix; loading kernel sampling modules is a separate risk decision from fixing
-the build.
+`sep5`, `pax`, and `socwatch2_16` loaded. After user approval, `vtsspp` was also
+loaded and verified:
+
+```text
+lsmod: vtsspp 573440 0
+/proc/vtsspp/.control: root:vtune 660
+insmod-vtsspp -q: vtsspp driver is loaded and owned by group "vtune" with file permissions "660".
+```
+
+Two line-attribution checks were then run:
+
+```text
+CPU source-line test: /tmp/vtune_cpu_line_test_20260707_164914
+GPU/SYCL source-line test: /tmp/sycl_vtune_source_line_after_vtsspp_20260707_164947
+```
+
+CPU line-by-line profiling works on a debug-built CPU test binary: VTune exported
+`source-line.csv` rows for `line_test.cpp:8`, `line_test.cpp:9`,
+`line_test.cpp:10`, etc. That collection used `Driverless Perf per-process
+sampling`, so it proves CPU source-line reporting works on the host, but it does
+not prove the `vtsspp` module fixes GPU source-line sampling.
+
+GPU/SYCL exact sampled source-line attribution remains unavailable after loading
+`vtsspp`:
+
+```text
+source_line.debug_line_present 1
+source_line.non_unknown_rows 0
+source_line.vtune_sampled_non_unknown_rows 0
+source_line.dwarf_status ok
+source_line.dwarf_source_line_rows 1194
+source_line.asm_source_line_rows 65
+source_line.asm_top_source_line /Apps/llama.cpp/build-vtune-line/ggml/src/ggml-sycl/mmvq.cpp:7114
+source_line.source_attribution_mode asm-line-static
+source_line.status asm-line-static-cost
+```
+
+So the `vtsspp` driver issue is fixed and the module is loaded, but the strict
+GPU/SYCL answer is still: no exact VTune sampled source-line rows yet. Use
+`asm-line-static-cost`, `dwarf-line-table-only`, PTI/GTPin runtime-count evidence,
+and named-kernel timing with their existing labels.
 
 ## Evidence artifacts
 
