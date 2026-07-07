@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import pathlib
+import re
 
 import pytest
 
@@ -71,6 +72,11 @@ def strip_cpp_comments(source: str) -> str:
 def read_e2e_plan_text() -> str:
     assert E2E_PLAN.exists(), f"missing local E2E evidence plan: {E2E_PLAN}"
     return E2E_PLAN.read_text(encoding="utf-8")
+
+
+def registered_kernel_names() -> set[str]:
+    registry = KERNEL_REGISTRY.read_text(encoding="utf-8")
+    return set(re.findall(r'\{\s*"([^"]+)"\s*,', registry))
 
 
 def test_dpas_repeat_count_limit_blocks_repeat16_role_fusion() -> None:
@@ -155,8 +161,10 @@ def test_runtime_dispatch_is_default_off_and_records_route() -> None:
 
 def test_gateup_loadv2_runtime_branch_is_not_default_on() -> None:
     mmvq = MMVQ.read_text(encoding="utf-8")
+    names = registered_kernel_names()
     assert "GGML_SYCL_MOE_GATEUP_M2_LOADV2" not in mmvq
-    assert "mxfp4_pair_glu_xmx_tiled_packed_r8_m2_loadv2" in KERNEL_REGISTRY.read_text(encoding="utf-8")
+    assert "mxfp4_pair_glu_xmx_tiled_packed_r8_m2_loadv2" in names
+    assert "mxfp4_pair_glu_xmx_tiled_packed_r8_m2_loadv2_bias" in names
 
 
 def test_gateup_loadv2_bench_path_reuses_xmx_tiled_layout_without_bundle4() -> None:
