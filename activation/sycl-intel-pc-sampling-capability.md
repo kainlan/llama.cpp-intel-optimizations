@@ -500,3 +500,113 @@ This provides a second validated runtime-count attribution path alongside GTPin
 `pti_instcount_runtime_cost`. It is not VTune exact source-line attribution, and
 it is not `sampled-line-cost` because the producer instruments/counts
 instructions rather than sampling PCs.
+
+## 2026-07-06 follow-up: try both strict VTune and practical PTI paths
+
+Follow-up tracker: `llama.cpp-cpne`
+
+Lead tried both paths requested after the initial web/setup conclusion.
+
+### Strict VTune exact/source-row path
+
+Additional strict VTune artifacts:
+
+```text
+/tmp/sycl_cpne_try_both_strict_vtune_20260706_221909
+/tmp/sycl_cpne_try_both_tracefs_vtune_20260706_222013
+/tmp/sycl_cpne_try_both_root_vtune_20260706_222058
+```
+
+The first run invoked VTune's debugfs/GPU metrics helpers and exported `hotspots`
+reports grouped by `computing-task`, `source-line`, and
+`computing-task,source-line`. `prepare-debugfs.sh` could not fully configure
+this kernel's split tracefs/debugfs layout:
+
+```text
+chgrp: changing group of '/sys/kernel/debug/tracing': Operation not permitted
+Failed to change group ownership
+```
+
+A second run temporarily opened `/sys/kernel/tracing` directly, verified that
+`available_events` was readable and `tracing_on` was writable, and restored
+tracefs permissions afterward. A third run repeated the probe as root with
+sysctls and tracefs open, matching Intel's recommendation that GPU profiling is
+typically run with administrator privileges.
+
+All three runs still produced no VTune compute-task/source/assembly correlation:
+
+```text
+hotspots-computing-task.csv size 0
+hotspots-source-line.csv size 0
+hotspots-computing-source-line.csv size 0
+dd_compute_task 0
+dd_compute_sample 0
+dd_gpu_execution_stats 0
+dd_source_file 0
+dd_assembly 0
+dd_sample > 0
+```
+
+Conclusion for strict path: permissions explain the original hard
+"Cannot configure" failure, but even with sysctls, tracefs, and root execution,
+VTune on this B50 stack only provides aggregate stall-sampling rows. It still
+does not provide exact VTune source rows or validated sampled `kernel,pc` rows.
+Therefore `source_line.status pass`, `source_attribution.status
+exact_source_line`, and `sampled-line-cost` remain unavailable.
+
+### Practical PTI runtime-count path
+
+The PTI `instcount` path is now first-class and reproducible in repo scripts.
+New extractor:
+
+```text
+scripts/extract-sycl-pti-instcount-pc-counts.py
+```
+
+It converts PTI `instcount` JSON to the shared resolver schema:
+
+```text
+kernel,pc,sample_count,sample_kind
+sample_kind=pti-instcount-instruction-exec-count
+```
+
+The checker/parser/merger now accept the explicit non-sampled runtime-count
+status:
+
+```text
+source_line.status pti-instcount-runtime-cost
+source_attribution.status pti_instcount_runtime_cost
+```
+
+Real validation artifact:
+
+```text
+/tmp/sycl_cpne_try_both_pti_pipeline_20260706_222720
+```
+
+Pipeline result from the real B50 `instcount` artifact:
+
+```text
+pti_instcount.status ok
+pti_instcount.pc_rows 1562
+pti_instcount.total_instruction_count 200448000
+pti_instcount.top_pc 0x5a90
+pti_instcount.top_sample_count 552960
+
+pti_instcount_source.status ok
+pti_instcount_source.mapped_sample_count 11571840
+pti_instcount_source.unmapped_sample_count 188876160
+pti_instcount_source.source_line_rows 65
+pti_instcount_source.top_source_line /tmp/sycl_mxfp4_source_line_device_tu_build_20260706_112515/ggml/src/ggml-sycl/mmvq.cpp:7233
+pti_instcount_source.top_sample_count 2073600
+
+source_line.status pti-instcount-runtime-cost
+source_attribution.status pti_instcount_runtime_cost
+source_attribution.pti_instcount_top_source_line /tmp/sycl_mxfp4_source_line_device_tu_build_20260706_112515/ggml/src/ggml-sycl/mmvq.cpp:7233
+source_attribution.pti_instcount_top_sample_count 2073600
+```
+
+This gives a usable line-number cost attribution route for targeted kernels and
+for future staged ledgers, but it remains explicitly **runtime instruction-count
+attribution**, not exact VTune sampled source-line attribution and not sampled PC
+line cost.

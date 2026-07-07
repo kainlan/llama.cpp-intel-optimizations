@@ -109,7 +109,15 @@ def main(argv: list[str]) -> int:
         source_status = source_rows.get("source_line.status", "")
         if not source_status:
             raise SourceAttributionError("missing source_line.status")
-        if source_status not in {"pass", "fail", "sampled-line-cost", "gtpin-bbl-runtime-cost", "asm-line-static-cost", "dwarf-line-table-only"}:
+        if source_status not in {
+            "pass",
+            "fail",
+            "sampled-line-cost",
+            "gtpin-bbl-runtime-cost",
+            "pti-instcount-runtime-cost",
+            "asm-line-static-cost",
+            "dwarf-line-table-only",
+        }:
             raise SourceAttributionError(f"invalid source_line.status {source_status}")
         source_line_kernel = source_rows.get("source_line.required_kernel", "")
         source_line_matches_top_kernel = source_line_kernel_matches(source_line_kernel, top_kernel)
@@ -117,11 +125,13 @@ def main(argv: list[str]) -> int:
         exact_pass = source_status == "pass" and source_line_matches_top_kernel
         sampled_line_cost = source_status == "sampled-line-cost" and sampled_line_matches_top_kernel
         gtpin_bbl_runtime_cost = source_status == "gtpin-bbl-runtime-cost" and sampled_line_matches_top_kernel
+        pti_instcount_runtime_cost = source_status == "pti-instcount-runtime-cost" and sampled_line_matches_top_kernel
         asm_line_static_cost = source_status == "asm-line-static-cost" and source_line_matches_top_kernel
         dwarf_line_table_only = source_status == "dwarf-line-table-only" and source_line_matches_top_kernel
         exact_blocker = source_rows.get("source_line.blocker", "unknown")
         if (source_status in {"pass", "asm-line-static-cost", "dwarf-line-table-only"} and not source_line_matches_top_kernel) or (
-            source_status in {"sampled-line-cost", "gtpin-bbl-runtime-cost"} and not sampled_line_matches_top_kernel
+            source_status in {"sampled-line-cost", "gtpin-bbl-runtime-cost", "pti-instcount-runtime-cost"}
+            and not sampled_line_matches_top_kernel
         ):
             exact_blocker = f"source_line_kernel_mismatch:{source_line_kernel}"
 
@@ -136,6 +146,8 @@ def main(argv: list[str]) -> int:
             status = "sampled_line_cost"
         elif gtpin_bbl_runtime_cost:
             status = "gtpin_bbl_runtime_cost"
+        elif pti_instcount_runtime_cost:
+            status = "pti_instcount_runtime_cost"
         elif asm_line_static_cost:
             status = "asm_line_static_cost"
         elif dwarf_line_table_only:
@@ -165,6 +177,14 @@ def main(argv: list[str]) -> int:
                 print(f"source_attribution.gtpin_bbl_top_source_line {gtpin_bbl_top_source_line}")
             if gtpin_bbl_top_sample_count:
                 print(f"source_attribution.gtpin_bbl_top_sample_count {gtpin_bbl_top_sample_count}")
+        if pti_instcount_runtime_cost:
+            print("source_attribution.source_line_status pti-instcount-runtime-cost")
+            pti_instcount_top_source_line = source_rows.get("source_line.pti_instcount_top_source_line", "")
+            pti_instcount_top_sample_count = source_rows.get("source_line.pti_instcount_top_sample_count", "")
+            if pti_instcount_top_source_line:
+                print(f"source_attribution.pti_instcount_top_source_line {pti_instcount_top_source_line}")
+            if pti_instcount_top_sample_count:
+                print(f"source_attribution.pti_instcount_top_sample_count {pti_instcount_top_sample_count}")
         if asm_line_static_cost:
             print("source_attribution.source_line_status asm-line-static-cost")
             asm_top_source_line = source_rows.get("source_line.asm_top_source_line", "")
@@ -180,7 +200,14 @@ def main(argv: list[str]) -> int:
             print(f"source_attribution.line_start {region['line_start']}")
             print(f"source_attribution.line_end {region['line_end']}")
             print(f"source_attribution.label_line {region['label_line']}")
-        if not exact_pass and not sampled_line_cost and not gtpin_bbl_runtime_cost and not asm_line_static_cost and not dwarf_line_table_only:
+        if (
+            not exact_pass
+            and not sampled_line_cost
+            and not gtpin_bbl_runtime_cost
+            and not pti_instcount_runtime_cost
+            and not asm_line_static_cost
+            and not dwarf_line_table_only
+        ):
             print(f"source_attribution.exact_line_blocker {exact_blocker}")
         if delta is not None:
             print(f"source_attribution.ablation_delta_ms_x1000 {delta}")

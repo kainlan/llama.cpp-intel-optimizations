@@ -614,6 +614,72 @@ def test_checker_accepts_gtpin_bbl_runtime_cost_with_explicit_flag() -> None:
         assert "source_line.status gtpin-bbl-runtime-cost" in result.stdout
 
 
+def test_checker_accepts_pti_instcount_runtime_cost_with_explicit_flag() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        sections = tmp / "sections.txt"
+        pti_csv = tmp / "pti-instcount-source.csv"
+        sections.write_text("[12] .debug_line PROGBITS\n", encoding="utf-8")
+        pti_csv.write_text(
+            "Source Line,Source File,Source File Path,Source Computing Task,Sample Count,Sample Kind,Source Attribution Mode,Source Attribution Status,sample_count,kernel\n"
+            "/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp:7233,mmvq.cpp,/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp,mxfp4_pair_glu_xmx_tiled,2073600,pti-instcount-instruction-exec-count,pti-instcount-line,pti_instcount_runtime_cost,2073600,mxfp4_pair_glu_xmx_tiled\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(CHECKER),
+                "--readelf-sections",
+                str(sections),
+                "--pti-instcount-source-lines-csv",
+                str(pti_csv),
+                "--allow-pti-instcount-runtime-cost",
+                "--require-kernel",
+                "mxfp4_pair_glu_xmx_tiled",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout
+        assert "source_line.non_unknown_rows 0" in result.stdout
+        assert "source_line.pti_instcount_source_line_rows 1" in result.stdout
+        assert "source_line.allow_pti_instcount_runtime_cost 1" in result.stdout
+        assert "source_line.pti_instcount_top_source_line /Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp:7233" in result.stdout
+        assert "source_line.pti_instcount_top_sample_count 2073600" in result.stdout
+        assert "source_line.source_attribution_mode pti-instcount-line" in result.stdout
+        assert "source_line.status pti-instcount-runtime-cost" in result.stdout
+
+
+def test_checker_requires_explicit_allow_for_pti_instcount_runtime_cost() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        sections = tmp / "sections.txt"
+        vtune_csv = tmp / "vtune.csv"
+        pti_csv = tmp / "pti-instcount-source.csv"
+        sections.write_text("[12] .debug_line PROGBITS\n", encoding="utf-8")
+        vtune_csv.write_text("Source Line\tSource Computing Task\n[Unknown]\tmxfp4_pair_glu_xmx_tiled\n", encoding="utf-8")
+        pti_csv.write_text(
+            "Source Line,Source File,Source File Path,Source Computing Task,Sample Count,Sample Kind,Source Attribution Mode,Source Attribution Status,sample_count,kernel\n"
+            "/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp:7233,mmvq.cpp,/Apps/llama.cpp/ggml/src/ggml-sycl/mmvq.cpp,mxfp4_pair_glu_xmx_tiled,2073600,pti-instcount-instruction-exec-count,pti-instcount-line,pti_instcount_runtime_cost,2073600,mxfp4_pair_glu_xmx_tiled\n",
+            encoding="utf-8",
+        )
+        result = run_checker(
+            sections,
+            vtune_csv,
+            "--pti-instcount-source-lines-csv",
+            str(pti_csv),
+            "--require-kernel",
+            "mxfp4_pair_glu_xmx_tiled",
+        )
+        assert result.returncode == 2
+        assert "source_line.pti_instcount_source_line_rows 1" in result.stdout
+        assert "source_line.allow_pti_instcount_runtime_cost 0" in result.stdout
+        assert "source_line.source_attribution_mode none" in result.stdout
+        assert "source_line.status fail" in result.stdout
+
+
 def test_checker_requires_explicit_allow_for_gtpin_bbl_runtime_cost() -> None:
     with tempfile.TemporaryDirectory() as tmp_raw:
         tmp = pathlib.Path(tmp_raw)

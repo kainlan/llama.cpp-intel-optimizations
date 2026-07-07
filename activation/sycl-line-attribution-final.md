@@ -117,6 +117,21 @@ The raw `dd_sample.ip` values are therefore not promoted to `sampled-line-cost`:
 there is no validated kernel/base/source correlation and no generated
 `kernel,pc,sample_count` evidence file.
 
+A stricter follow-up also tried VTune's debugfs/GPU metrics helper, explicit
+tracefs permission opening, and root execution:
+
+```text
+/tmp/sycl_cpne_try_both_strict_vtune_20260706_221909
+/tmp/sycl_cpne_try_both_tracefs_vtune_20260706_222013
+/tmp/sycl_cpne_try_both_root_vtune_20260706_222058
+```
+
+Even with sysctls at `0`, tracefs readable/writable, and root execution, VTune
+still emitted empty `hotspots` source/task CSV exports and zero compute/source
+correlation rows (`dd_compute_task`, `dd_compute_sample`, `dd_source_file`, and
+`dd_assembly` all remained `0`). Strict `pass` / `exact_source_line` is therefore
+still unavailable on this local B50/B580 stack.
+
 A separate runtime-count path is now validated through VTune's embedded GTPin
 `memorytrace.so` profiler. This produces positive runtime BBL execution counts
 for the profiled trace scope and maps them to instruction PCs via the generated
@@ -181,6 +196,7 @@ PTI `instcount` artifacts:
 ```text
 /tmp/sycl_cpne_pti_instcount_20260706_215023
 /tmp/sycl_cpne_pti_instcount_run2_20260706_215133
+/tmp/sycl_cpne_try_both_pti_pipeline_20260706_222720
 ```
 
 Pair-GLU kernel validation on both B50 and B580:
@@ -192,24 +208,44 @@ positive_offsets 1562
 total_instruction_count 200448000
 ```
 
-Using explicit labels:
+The PTI path is now first-class in repo scripts:
 
 ```text
---attribution-mode pti-instcount-line
---attribution-status pti_instcount_runtime_cost
---summary-prefix pti_instcount_source
+scripts/extract-sycl-pti-instcount-pc-counts.py
+scripts/resolve-sycl-pc-samples-to-source-lines.py --attribution-mode pti-instcount-line --attribution-status pti_instcount_runtime_cost
+scripts/check-sycl-vtune-source-lines.py --pti-instcount-source-lines-csv --allow-pti-instcount-runtime-cost
+scripts/parse-sycl-source-attribution.py
+scripts/merge-sycl-staged-ledger.py
 ```
 
-the existing DWARF resolver maps PTI instruction-count offsets to source lines:
+The extractor converts PTI JSON to the shared `kernel,pc,sample_count,sample_kind`
+schema with:
 
 ```text
+sample_kind=pti-instcount-instruction-exec-count
+```
+
+and the checker/parser/merger preserve explicit non-sampled status labels:
+
+```text
+source_line.status pti-instcount-runtime-cost
+source_attribution.status pti_instcount_runtime_cost
+```
+
+Real first-class pipeline result:
+
+```text
+pti_instcount.status ok
+pti_instcount.pc_rows 1562
+pti_instcount.total_instruction_count 200448000
 pti_instcount_source.status ok
 pti_instcount_source.mapped_sample_count 11571840
 pti_instcount_source.unmapped_sample_count 188876160
 pti_instcount_source.source_line_rows 65
 pti_instcount_source.top_source_line /tmp/sycl_mxfp4_source_line_device_tu_build_20260706_112515/ggml/src/ggml-sycl/mmvq.cpp:7233
 pti_instcount_source.top_sample_count 2073600
-pti_instcount_source.top_sample_kind pti-instcount-instruction-exec-count
+source_line.status pti-instcount-runtime-cost
+source_attribution.status pti_instcount_runtime_cost
 ```
 
 This is accepted only as `pti_instcount_runtime_cost`, separate from
