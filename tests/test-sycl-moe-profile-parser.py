@@ -628,6 +628,28 @@ def test_down_dpas_direct_final_dry_run_contains_envs_and_forbidden_paths() -> N
         assert "--forbid-diag-path grouped-packed-q8-m2-device" in out
 
 
+def test_down_q8_dpas_tile_gate_dry_run_contains_count_and_profile_commands() -> None:
+    out = run_harness_dry_run("down-q8-dpas-tile")
+    tile2_count = out.index("[down_q8_dpas_tile2_count]")
+    tile2_profile = out.index("[down_q8_dpas_tile2_profile]")
+    tile4_count = out.index("[down_q8_dpas_tile4_count]")
+    tile4_profile = out.index("[down_q8_dpas_tile4_profile]")
+    assert tile2_count < tile2_profile < tile4_count < tile4_profile
+    assert "./build/bin/llama-cli" in out
+    assert "./build/bin/llama-bench" in out
+    assert "GGML_SYCL_MOE_DOWN_Q8_DPAS_TILE=tile2" in out
+    assert "GGML_SYCL_MOE_DOWN_Q8_DPAS_TILE=tile4" in out
+    assert "-u GGML_SYCL_MOE_DOWN_Q8_DPAS_TILE" in out
+    assert "-p 64 -n 32 -fa 1" in out
+    for env in [
+        "GGML_SYCL_MOE_PHASE_MATERIALIZE=1",
+        "GGML_SYCL_MOE_PHASE_BULK_XMX=1",
+        "GGML_SYCL_MOE_DOWN_SUM_DIRECT=1",
+        "GGML_SYCL_MXFP4_TG_PROFILE=1",
+    ]:
+        assert env in out
+
+
 def test_harness_dry_run_prints_kernel_runtime_metadata_capture_without_executing() -> None:
     with tempfile.TemporaryDirectory() as tmp_raw:
         logdir = pathlib.Path(tmp_raw) / "logs"

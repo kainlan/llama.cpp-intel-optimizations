@@ -23,7 +23,7 @@ Lead-only B50 GPT-OSS MoE correctness/performance gates. Workers must use
 --dry-run only. The script never probes devices with sycl-ls or DRM/fdinfo.
 
 Options:
-  --mode default|safe-optin|sequence-graphlet|profile|b50-profile-matrix|b50-aggressive-tg|aggressive-suite|down-dpas-direct-final|down-dpas-rank-parallel-atomic|down-dpas-scratch-reduce|down-dpas-same-expert-grouped|b50-pp-materialize-tg-safe|single-xmx-gateup|b50-default-candidate|b580-default-candidate|promotion-candidate|promotion-suite|all
+  --mode default|safe-optin|sequence-graphlet|profile|b50-profile-matrix|b50-aggressive-tg|aggressive-suite|down-dpas-direct-final|down-q8-dpas-tile|down-dpas-rank-parallel-atomic|down-dpas-scratch-reduce|down-dpas-same-expert-grouped|b50-pp-materialize-tg-safe|single-xmx-gateup|b50-default-candidate|b580-default-candidate|promotion-candidate|promotion-suite|all
       default                Run default canonical B50 GPT-OSS count + PP512/TG128 bench
       safe-optin             Run safe phase/down-XMX weighted-reduce B50 count + bench
       sequence-graphlet      Run active sequence graphlets (explicit unsafe replay+record gates) B50 count + bench
@@ -32,6 +32,7 @@ Options:
       b50-aggressive-tg      Run B50 aggressive TG count/diag/perf gates with TG128>=45 and PP regression check
       aggressive-suite       Run B50 aggressive TG gates plus B580/Mistral aggressive count and no-regression checks
       down-dpas-direct-final Run B50 diagnostic down DPAS direct-final short profile and parser evidence check
+      down-q8-dpas-tile    Run B50 down Q8 DPAS tile2/tile4 count gates and short profile benches
       down-dpas-rank-parallel-atomic
                               Run B50 diagnostic down DPAS rank-parallel atomic short profile and parser evidence check
       down-dpas-scratch-reduce
@@ -519,7 +520,7 @@ parse_args() {
     done
 
     case "$MODE" in
-        default|safe-optin|sequence-graphlet|profile|b50-profile-matrix|b50-aggressive-tg|aggressive-suite|down-dpas-direct-final|down-dpas-rank-parallel-atomic|down-dpas-scratch-reduce|down-dpas-same-expert-grouped|b50-pp-materialize-tg-safe|single-xmx-gateup|b50-default-candidate|b580-default-candidate|promotion-candidate|promotion-suite|all) ;;
+        default|safe-optin|sequence-graphlet|profile|b50-profile-matrix|b50-aggressive-tg|aggressive-suite|down-dpas-direct-final|down-q8-dpas-tile|down-dpas-rank-parallel-atomic|down-dpas-scratch-reduce|down-dpas-same-expert-grouped|b50-pp-materialize-tg-safe|single-xmx-gateup|b50-default-candidate|b580-default-candidate|promotion-candidate|promotion-suite|all) ;;
         *)
             echo "bad mode: $MODE" >&2
             usage >&2
@@ -608,6 +609,34 @@ main() {
     local -a down_dpas_same_expert_grouped_env=(
         "${down_dpas_direct_final_env[@]}"
         GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL_SAME_EXPERT_GROUPED=1
+    )
+    local -a down_q8_dpas_tile_clear_env=(
+        -u GGML_SYCL_MOE_DOWN_SUM_DIRECT
+        -u GGML_SYCL_MOE_DOWN_SUM_Q8_SOA_TG_VARIANT
+        -u GGML_SYCL_MOE_DOWN_CACHED_Q8_SOA_TG_VARIANT
+        -u GGML_SYCL_MOE_DOWN_SUM_DIRECT_ATOMIC
+        -u GGML_SYCL_MOE_DOWN_Q8_DPAS_TILE
+        -u GGML_SYCL_MOE_DOWN_SUM_XMX_DIRECT_FINAL
+        -u GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL
+        -u GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL_I8
+        -u GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL_DPAS
+        -u GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL_RANK_PARALLEL_ATOMIC
+        -u GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL_SCRATCH_REDUCE
+        -u GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL_SAME_EXPERT_GROUPED
+    )
+    local -a down_q8_dpas_tile_base_env=(
+        "${down_q8_dpas_tile_clear_env[@]}"
+        GGML_SYCL_MOE_PHASE_MATERIALIZE=1
+        GGML_SYCL_MOE_PHASE_BULK_XMX=1
+        GGML_SYCL_MOE_DOWN_SUM_DIRECT=1
+        GGML_SYCL_MXFP4_TG_PROFILE=1
+        GGML_SYCL_MOE_PROFILE=1
+    )
+    local -a down_q8_dpas_tile_profile_env=(
+        GGML_SYCL_KERNEL_PROFILE=1
+        GGML_SYCL_KERNEL_PROFILE_FORMAT=both
+        GGML_SYCL_KERNEL_PROFILE_TOP_N=80
+        GGML_SYCL_MXFP4_PP_PROFILE=1
     )
     local -a kernel_profile_env=(
         GGML_SYCL_MOE_PROFILE=1
@@ -727,6 +756,21 @@ main() {
     if [[ "$MODE" == "down-dpas-direct-final" ]]; then
         run_b50_gptoss_aggressive_diag_bench down_dpas_direct_final_diag "${down_dpas_direct_final_env[@]}"
         run_down_dpas_direct_final_path_check down_dpas_direct_final_path_check down_dpas_direct_final_diag
+    fi
+
+    if [[ "$MODE" == "down-q8-dpas-tile" ]]; then
+        local -a down_q8_dpas_tile2_env=(
+            "${down_q8_dpas_tile_base_env[@]}"
+            GGML_SYCL_MOE_DOWN_Q8_DPAS_TILE=tile2
+        )
+        local -a down_q8_dpas_tile4_env=(
+            "${down_q8_dpas_tile_base_env[@]}"
+            GGML_SYCL_MOE_DOWN_Q8_DPAS_TILE=tile4
+        )
+        run_b50_count_gate down_q8_dpas_tile2_count "${down_q8_dpas_tile2_env[@]}"
+        run_b50_gptoss_diag_bench down_q8_dpas_tile2_profile "${down_q8_dpas_tile2_env[@]}" "${down_q8_dpas_tile_profile_env[@]}"
+        run_b50_count_gate down_q8_dpas_tile4_count "${down_q8_dpas_tile4_env[@]}"
+        run_b50_gptoss_diag_bench down_q8_dpas_tile4_profile "${down_q8_dpas_tile4_env[@]}" "${down_q8_dpas_tile_profile_env[@]}"
     fi
 
     if [[ "$MODE" == "down-dpas-rank-parallel-atomic" ]]; then

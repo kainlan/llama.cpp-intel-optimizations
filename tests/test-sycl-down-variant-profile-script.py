@@ -14,6 +14,8 @@ VARIANTS = [
     "row2",
     "row4",
     "atomic",
+    "down-dpas-tile2",
+    "down-dpas-tile4",
     "cached-vector-qs",
     "cached-cache-y",
     "cached-vector-qs-cache-y",
@@ -41,6 +43,7 @@ VARIANT_CLEAR_ENVS = [
     "GGML_SYCL_MOE_DOWN_SUM_Q8_SOA_TG_VARIANT",
     "GGML_SYCL_MOE_DOWN_CACHED_Q8_SOA_TG_VARIANT",
     "GGML_SYCL_MOE_DOWN_SUM_DIRECT_ATOMIC",
+    "GGML_SYCL_MOE_DOWN_Q8_DPAS_TILE",
     "GGML_SYCL_MOE_DOWN_SUM_XMX_DIRECT_FINAL",
     "GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL",
     "GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL_I8",
@@ -160,6 +163,22 @@ def test_baseline_row_group_and_atomic_rows_include_fa_on_baseline_envs(tmp_path
         assert " -fa 1 " in section
         for env in BASELINE_ENVS:
             assert env in section
+
+
+def test_down_dpas_tile_variants_are_default_off_and_isolated(tmp_path: Path) -> None:
+    completed = _run_script("--dry-run", out_dir=tmp_path / "dry-run")
+    out = _combined_output(completed)
+    assert completed.returncode == 0, out
+    tile2 = _section(out, "down-dpas-tile2")
+    tile4 = _section(out, "down-dpas-tile4")
+    assert "GGML_SYCL_MOE_DOWN_Q8_DPAS_TILE=tile2" in tile2
+    assert "GGML_SYCL_MOE_DOWN_Q8_DPAS_TILE=tile4" in tile4
+    for section in [tile2, tile4]:
+        assert "GGML_SYCL_MOE_DOWN_SUM_DIRECT=1" in section
+        assert " -fa 1 " in section
+        assert "-u GGML_SYCL_MOE_DOWN_Q8_DPAS_TILE" in section
+        assert "GGML_SYCL_MOE_DOWN_SUM_DIRECT_ATOMIC=1" not in section
+        assert "GGML_SYCL_MOE_DOWN_SUM_Q8_SOA_TG_VARIANT=row" not in section
 
 
 def test_cached_rows_explicitly_override_direct_sum_and_use_per_command_env(tmp_path: Path) -> None:
