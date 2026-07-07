@@ -1249,6 +1249,7 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
                         bool                         xmx_tiled_grouped,
                         bool                         xmx_tiled_pack_q8,
                         bool                         xmx_tiled_prefetch,
+                        bool                         xmx_tiled_loadv2,
                         int                          xmx_tiled_m_tiles,
                         bool                         xmx_tiled_v2,
                         int                          xmx_tiled_v2_group_bytes,
@@ -1322,6 +1323,11 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     }
     if (xmx_tiled_prefetch && xmx_tiled_m_tiles != 2) {
         error = "mxfp4_pair_glu prefetch variant is only implemented for M2.";
+        return false;
+    }
+    if (xmx_tiled_loadv2 && (!xmx_tiled || !xmx_tiled_pack_q8 || xmx_tiled_grouped || xmx_tiled_prefetch ||
+                             xmx_tiled_m_tiles != 2 || rows_per_wg != 8 || xmx_tiled_v2 || xmx_tiled_bundle4)) {
+        error = "mxfp4_pair_glu loadv2 bench variant requires existing packed XMX_TILED r8 m2 layout.";
         return false;
     }
     if (xmx_tiled_m_tiles != 1 && xmx_tiled_m_tiles != 2 && xmx_tiled_m_tiles != 4) {
@@ -1735,6 +1741,7 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
     args.xmx_tiled_grouped        = xmx_tiled_grouped;
     args.xmx_tiled_pack_q8        = xmx_tiled_pack_q8;
     args.xmx_tiled_prefetch       = xmx_tiled_prefetch;
+    args.xmx_tiled_loadv2         = xmx_tiled_loadv2;
     args.xmx_tiled_m_tiles        = xmx_tiled_m_tiles;
     args.xmx_tiled_v2                  = xmx_tiled_v2;
     args.xmx_tiled_v2_group_bytes      = xmx_tiled_v2_group_bytes;
@@ -1841,6 +1848,7 @@ bool run_mxfp4_pair_glu(const GeneratedWeights &     weights,
             ref_args.xmx_tiled_grouped        = false;
             ref_args.xmx_tiled_pack_q8        = false;
             ref_args.xmx_tiled_prefetch       = false;
+            ref_args.xmx_tiled_loadv2         = false;
             ref_args.xmx_tiled_m_tiles        = 1;
             ref_args.xmx_tiled_v2                  = false;
             ref_args.xmx_tiled_v2_group_bytes      = 320;

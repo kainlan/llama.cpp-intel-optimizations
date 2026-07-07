@@ -15,3 +15,13 @@ def test_reference_kernels_registered():
         "roofline_compute",
     ]:
         assert name in text, f"{name} not registered in kernel_registry.hpp"
+
+
+def test_mxfp4_pair_glu_loadv2_variants_registered():
+    with open(REGISTRY, "r", encoding="utf-8") as f:
+        text = f.read()
+    for name in [
+        "mxfp4_pair_glu_xmx_tiled_packed_r8_m2_loadv2",
+        "mxfp4_pair_glu_xmx_tiled_packed_r8_m2_loadv2_bias",
+    ]:
+        assert name in text, f"{name} not registered in kernel_registry.hpp"

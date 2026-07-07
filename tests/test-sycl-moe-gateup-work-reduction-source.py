@@ -8,6 +8,9 @@ import pytest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 MMVQ = ROOT / "ggml" / "src" / "ggml-sycl" / "mmvq.cpp"
 BENCH_HPP = ROOT / "ggml" / "src" / "ggml-sycl" / "ggml-sycl-bench.hpp"
+KERNEL_REGISTRY = ROOT / "tools" / "sycl-kernel-bench" / "kernel_registry.hpp"
+BENCHMARK_HARNESS = ROOT / "tools" / "sycl-kernel-bench" / "benchmark_harness.hpp"
+REFERENCE_INLINE_DOT = ROOT / "tools" / "sycl-kernel-bench" / "kernels" / "reference" / "mxfp4_inline_dot.cpp"
 E2E_PLAN_REL = pathlib.Path("docs/plans/2026-06-30-sycl-gptoss-mxfp4-e2e-decode-profiling.md")
 E2E_PLAN = ROOT / E2E_PLAN_REL
 DPAS_HPP = pathlib.Path("/opt/intel/oneapi/compiler/2025.3/include/sycl/ext/intel/esimd/xmx/dpas.hpp")
@@ -116,7 +119,8 @@ def test_singlecol_candidate_has_its_own_kernel_not_prepack_only() -> None:
 def test_bench_args_expose_singlecol_without_runtime_default() -> None:
     bench = BENCH_HPP.read_text(encoding="utf-8")
     assert "bool  single_column_gateup" in bench
-    assert "single_column_gateup = false" in bench
+    singlecol_start = bench.index("single_column_gateup")
+    assert "= false" in bench[singlecol_start : singlecol_start + 80]
 
 
 def test_e2e_evidence_names_moe_as_dominant_bucket() -> None:
@@ -147,3 +151,29 @@ def test_runtime_dispatch_is_default_off_and_records_route() -> None:
     profile_call_start = dispatch.index("mmvq_moe_tg_profile_record", branch_end)
     profile_call_end = dispatch.index(";", profile_call_start)
     assert "profile_layout" in dispatch[profile_call_start:profile_call_end]
+
+
+def test_gateup_loadv2_runtime_branch_is_not_default_on() -> None:
+    mmvq = MMVQ.read_text(encoding="utf-8")
+    assert "GGML_SYCL_MOE_GATEUP_M2_LOADV2" not in mmvq
+    assert "mxfp4_pair_glu_xmx_tiled_packed_r8_m2_loadv2" in KERNEL_REGISTRY.read_text(encoding="utf-8")
+
+
+def test_gateup_loadv2_bench_path_reuses_xmx_tiled_layout_without_bundle4() -> None:
+    bench = BENCH_HPP.read_text(encoding="utf-8")
+    harness = BENCHMARK_HARNESS.read_text(encoding="utf-8")
+    reference = REFERENCE_INLINE_DOT.read_text(encoding="utf-8")
+    assert "bool  xmx_tiled_loadv2" in bench
+    assert "xmx_tiled_loadv2         = false" in bench
+    assert "xmx_tiled_loadv2" in harness
+    assert 'config.kernel_name.find("_loadv2") != std::string::npos' in harness
+    assert harness.index("xmx_tiled_prefetch") < harness.index("xmx_tiled_loadv2, xmx_tiled_m_tiles")
+    assert "bool                         xmx_tiled_loadv2," in reference
+    assert "args.xmx_tiled_loadv2" in reference
+    assert "if (xmx_tiled_loadv2 &&" in reference
+    loadv2_validation_start = reference.index("if (xmx_tiled_loadv2 &&")
+    loadv2_validation_end = reference.index("if (xmx_tiled_m_tiles != 1", loadv2_validation_start)
+    loadv2_validation = reference[loadv2_validation_start:loadv2_validation_end]
+    assert "xmx_tiled_bundle4" in loadv2_validation
+    assert "make_xmx_tiled_bundle4_payload_layout" not in loadv2_validation
+    assert "make_xmx_tiled_loadv2" not in reference

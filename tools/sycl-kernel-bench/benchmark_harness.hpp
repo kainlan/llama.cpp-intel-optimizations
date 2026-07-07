@@ -1220,6 +1220,7 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                 const bool xmx_tiled_grouped        = config.kernel_name.find("_grouped") != std::string::npos;
                 const bool xmx_tiled_pack_q8        = config.kernel_name.find("_packed") != std::string::npos;
                 const bool xmx_tiled_prefetch       = config.kernel_name.find("_prefetch") != std::string::npos;
+                const bool xmx_tiled_loadv2         = config.kernel_name.find("_loadv2") != std::string::npos;
                 const int  xmx_tiled_m_tiles        = config.kernel_name.find("_m4") != std::string::npos ? 4 :
                                                       config.kernel_name.find("_m2") != std::string::npos ? 2 :
                                                                                                             1;
@@ -1242,7 +1243,7 @@ inline bool BenchmarkHarness::run_reference(const BenchmarkConfig & config,
                 const bool use_bias                 = config.kernel_name.find("_bias") != std::string::npos;
                 if (!run_mxfp4_pair_glu(weights, activations, m, selected_count, k, token_rows, rows_per_wg, cache_y,
                                         direct_xmx, xmx_tiled, xmx_tiled_grouped, xmx_tiled_pack_q8, xmx_tiled_prefetch,
-                                        xmx_tiled_m_tiles, xmx_tiled_v2, xmx_tiled_v2_group_bytes,
+                                        xmx_tiled_loadv2, xmx_tiled_m_tiles, xmx_tiled_v2, xmx_tiled_v2_group_bytes,
                                         xmx_tiled_bundle4, xmx_tiled_bundle4_group_bytes, split_gate_up,
                                         single_column_gateup, multi_rhs_gateup, multi_rhs_cols, predecoded_i8,
                                         xmx_tiles_n, vector_qs_load, ignore_weight_scale, scale_stride_blocks,
