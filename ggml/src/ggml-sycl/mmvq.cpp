@@ -19842,12 +19842,6 @@ bool mmvq_moe_batched_dispatch_down_sum_from_cached_q8_mxfp4(
                 ids_nb1, q8_row_size, ne11 * q8_row_size, moe_weights->nb[1], moe_weights->nb[2],
                 down_bias ? down_bias->nb[1] : 0, final_token_stride, dispatch_deps_ptr);
         } else {
-            // Task 1 reserves the default-off down Q8 DPAS tile policy source contract for Task 3.
-            // Runtime dispatch remains on the serial SOA fallback until the tiled kernel exists.
-            // Dispatch order after row-group variants:
-            //   mxfp4_moe_down_q8_dpas_tile_active(/*is_down_role=*/true, GGML_LAYOUT_SOA, n_tokens)
-            //   mxfp4_down_q8_dpas_tile_sycl<2>
-            //   mxfp4_down_q8_dpas_tile_sycl<4>
             event = mxfp4_down_sum_q8_soa_sycl(*stream, reinterpret_cast<const uint8_t * const *>(down_ptrs_device),
                                                q8_buffer, dst_d, ids_device, weights_d, bias_d, static_cast<int>(ncols),
                                                static_cast<int>(ncols_y), static_cast<int>(nrows_per_expert),

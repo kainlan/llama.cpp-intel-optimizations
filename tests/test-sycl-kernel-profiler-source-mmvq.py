@@ -121,8 +121,6 @@ def test_mmvq_active_blind_spots_have_named_profile_labels() -> None:
         "mxfp4.down.q8_soa",
         "mxfp4.down.q8_soa_atomic",
         "mxfp4.down.q8_soa_row_group",
-        "mxfp4.down.q8_dpas_tile2",
-        "mxfp4.down.q8_dpas_tile4",
         "mxfp4.down.weighted_tmp_reduce",
     ]:
         assert label in mmvq
@@ -146,6 +144,35 @@ def test_mmvq_active_blind_spots_have_named_profile_labels() -> None:
     assert ".wait(" not in down_body
 
 
+def test_mmvq_down_q8_dpas_tile_policy_helpers_have_stable_labels_and_metadata() -> None:
+    mmvq = MMVQ.read_text(encoding="utf-8")
+    policy_body = slice_between(
+        mmvq,
+        "int ggml_sycl_moe_down_q8_dpas_tile_from_env",
+        "int ggml_sycl_moe_down_cached_q8_soa_tg_variant_from_env",
+    )
+    assert 'std::getenv("GGML_SYCL_MOE_DOWN_Q8_DPAS_TILE")' in policy_body
+    assert "down_layout != GGML_LAYOUT_SOA" in policy_body
+    assert "n_tokens != 1" in policy_body
+    assert "mxfp4_moe_down_q8_dpas_tile_profile_label" in policy_body
+    assert "mxfp4_moe_down_q8_dpas_tile_profile_metadata" in policy_body
+    for label in [
+        "mxfp4.down.q8_dpas_tile2",
+        "mxfp4.down.q8_dpas_tile4",
+        "down-q8-dpas-tile2",
+        "down-q8-dpas-tile4",
+    ]:
+        assert label in policy_body
+    for metadata in [
+        "path=q8-soa;role=down;variant=dpas-tile2",
+        "path=q8-soa;role=down;variant=dpas-tile4",
+    ]:
+        assert metadata in policy_body
+    assert "mxfp4.down.q8_soa_row_group" not in policy_body
+    assert "mxfp4.down.q8_soa_atomic" not in policy_body
+    assert "direct-final" not in policy_body
+
+
 def test_mmvq_active_direct_q8_soa_down_honors_row_group_variants() -> None:
     mmvq = MMVQ.read_text(encoding="utf-8")
     direct_body = slice_between(
@@ -161,11 +188,8 @@ def test_mmvq_active_direct_q8_soa_down_honors_row_group_variants() -> None:
     assert "mxfp4_down_sum_q8_soa_row_group_sycl<2>" in direct_body
     assert "mxfp4_down_sum_q8_soa_row_group_sycl<4>" in direct_body
     assert "mxfp4_down_sum_q8_soa_sycl" in direct_body
-    assert "GGML_SYCL_MOE_DOWN_Q8_DPAS_TILE" in mmvq
-    assert "mxfp4_moe_down_q8_dpas_tile_active" in direct_body
-    assert "mxfp4_down_q8_dpas_tile_sycl<2>" in direct_body
-    assert "mxfp4_down_q8_dpas_tile_sycl<4>" in direct_body
-    assert direct_body.index("mxfp4_moe_down_q8_dpas_tile_active") < direct_body.index("mxfp4_down_sum_q8_soa_sycl")
+    assert "mxfp4_moe_down_q8_dpas_tile_active" not in direct_body
+    assert "mxfp4_down_q8_dpas_tile_sycl" not in direct_body
     assert direct_body.index("mxfp4_down_sum_q8_soa_atomic_sycl") < direct_body.index(
         "mxfp4_moe_down_sum_q8_soa_tg_active_rows_per_group"
     )
