@@ -121,6 +121,8 @@ def test_mmvq_active_blind_spots_have_named_profile_labels() -> None:
         "mxfp4.down.q8_soa",
         "mxfp4.down.q8_soa_atomic",
         "mxfp4.down.q8_soa_row_group",
+        "mxfp4.down.q8_dpas_tile2",
+        "mxfp4.down.q8_dpas_tile4",
         "mxfp4.down.weighted_tmp_reduce",
     ]:
         assert label in mmvq
@@ -187,12 +189,35 @@ def test_mmvq_active_direct_q8_soa_down_honors_row_group_variants() -> None:
     assert "/*is_down_role=*/true, n_tokens" in direct_body
     assert "mxfp4_down_sum_q8_soa_row_group_sycl<2>" in direct_body
     assert "mxfp4_down_sum_q8_soa_row_group_sycl<4>" in direct_body
+    assert "GGML_SYCL_MOE_DOWN_Q8_DPAS_TILE" in mmvq
+    assert "mxfp4_moe_down_q8_dpas_tile_active" in direct_body
+    assert "mxfp4_down_q8_dpas_tile_sycl<2>" in direct_body
+    assert "mxfp4_down_q8_dpas_tile_sycl<4>" in direct_body
     assert "mxfp4_down_sum_q8_soa_sycl" in direct_body
-    assert "mxfp4_moe_down_q8_dpas_tile_active" not in direct_body
-    assert "mxfp4_down_q8_dpas_tile_sycl" not in direct_body
     assert direct_body.index("mxfp4_down_sum_q8_soa_atomic_sycl") < direct_body.index(
         "mxfp4_moe_down_sum_q8_soa_tg_active_rows_per_group"
     )
     assert direct_body.index("mxfp4_down_sum_q8_soa_row_group_sycl<2>") < direct_body.index(
+        "mxfp4_moe_down_q8_dpas_tile_active"
+    )
+    assert direct_body.index("mxfp4_moe_down_q8_dpas_tile_active") < direct_body.index(
         "mxfp4_down_sum_q8_soa_sycl"
     )
+
+
+def test_down_q8_dpas_tile_kernel_is_default_off_and_uses_named_labels() -> None:
+    mmvq = MMVQ.read_text(encoding="utf-8")
+    down_region = slice_between(
+        mmvq,
+        "static sycl::event mxfp4_down_sum_q8_soa_sycl",
+        "bool mmvq_moe_batched_dispatch_down_sum_from_cached_q8_mxfp4",
+    )
+    assert "template <int TILE_ROWS>" in down_region
+    assert "mxfp4_down_q8_dpas_tile_sycl" in down_region
+    assert "mxfp4.down.q8_dpas_tile2" in down_region
+    assert "mxfp4.down.q8_dpas_tile4" in down_region
+    assert "mxfp4_moe_down_q8_dpas_tile_active" in down_region
+    assert "GGML_SYCL_MOE_DOWN_Q8_DPAS_TILE" in mmvq
+    assert "mxfp4_down_q8_dpas_tile_sycl<2>" in down_region
+    assert "mxfp4_down_q8_dpas_tile_sycl<4>" in down_region
+    assert ".wait(" not in down_region
