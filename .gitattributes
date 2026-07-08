@@ -1,3 +1,10 @@
 
 # Use bd merge for beads JSONL files
 .beads/issues.jsonl merge=beads
+
+# Windows batch scripts must be checked out with CRLF line endings, otherwise
+# cmd.exe mis-parses multi-line IF (...) blocks (LF-only .bat broke the
+# windows-latest-sycl CI: `IF NOT "fp32"=="fp32"` wrongly entered the error
+# branch). Repo stays LF-normalized; checkout converts to CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
