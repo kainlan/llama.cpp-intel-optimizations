@@ -1,9 +1,14 @@
 #include "llama-kv-cache.h"
 
+#include "ggml-backend.h"
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+
+#ifdef GGML_USE_SYCL
+#include "ggml-sycl.h"
+#endif
 
 #include <algorithm>
 #include <cassert>
@@ -12,6 +17,17 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+
+#ifdef GGML_USE_SYCL
+static bool llama_kv_cache_sycl_hooks_enabled() {
+    return !ggml_backend_device_backends_disabled();
+}
+
+static bool llama_kv_cache_dev_is_sycl(ggml_backend_dev_t dev) {
+    return llama_kv_cache_sycl_hooks_enabled() && dev != nullptr &&
+           ggml_backend_dev_backend_reg(dev) == ggml_backend_sycl_reg();
+}
+#endif
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -106,6 +122,9 @@ llama_kv_cache::llama_kv_cache(
         }
     };
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+#ifdef GGML_USE_SYCL
+    std::map<ggml_backend_buffer_type_t, std::vector<uint8_t>, ggml_backend_buft_comparator> sycl_kv_layer_masks;
+#endif
 
     // create a context for each buffer type
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
@@ -213,7 +232,15 @@ llama_kv_cache::llama_kv_cache(
 
         if (offload) {
             auto * dev = model.dev_layer(il);
+#ifdef GGML_USE_SYCL
+            if (llama_kv_cache_dev_is_sycl(dev)) {
+                buft = ggml_backend_sycl_kv_buffer_type_from_dev(dev);
+            } else {
+                buft = ggml_backend_dev_buffer_type(dev);
+            }
+#else
             buft = ggml_backend_dev_buffer_type(dev);
+#endif
 
             dev_name = ggml_backend_dev_name(dev);
         }
@@ -224,6 +251,19 @@ llama_kv_cache::llama_kv_cache(
         if (!ctx) {
             throw std::runtime_error("failed to create ggml context for kv cache");
         }
+
+#ifdef GGML_USE_SYCL
+        ggml_backend_dev_t buft_dev = ggml_backend_buft_get_device(buft);
+        if (llama_kv_cache_dev_is_sycl(buft_dev)) {
+            auto & mask = sycl_kv_layer_masks[buft];
+            if (mask.empty()) {
+                mask.assign(hparams.n_layer(), 0);
+            }
+            if (il < mask.size()) {
+                mask[il] = 1;
+            }
+        }
+#endif
 
         const bool has_k = true;
         const bool has_v = !is_mla;
@@ -280,6 +320,15 @@ llama_kv_cache::llama_kv_cache(
                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
             }
         } else {
+#ifdef GGML_USE_SYCL
+            ggml_backend_dev_t buft_dev = ggml_backend_buft_get_device(buft);
+            auto               mask_it  = sycl_kv_layer_masks.find(buft);
+            if (llama_kv_cache_dev_is_sycl(buft_dev) && mask_it != sycl_kv_layer_masks.end() &&
+                !mask_it->second.empty()) {
+                ggml_backend_sycl_push_kv_layer_mask_from_dev(buft_dev, mask_it->second.data(),
+                                                              static_cast<uint32_t>(mask_it->second.size()));
+            }
+#endif
             buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
         }
         if (!buf) {

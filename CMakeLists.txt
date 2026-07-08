@@ -182,6 +182,12 @@ if (LLAMA_USE_SYSTEM_GGML)
     add_library(ggml ALIAS ggml::ggml)
 endif()
 
+if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TESTS AND NOT CMAKE_JS_VERSION)
+    # Enable CTest before adding ggml so backend add_test() entries are visible
+    # in a fresh top-level ctest run.
+    include(CTest)
+endif()
+
 if (NOT TARGET ggml AND NOT LLAMA_USE_SYSTEM_GGML)
     set(GGML_BUILD_NUMBER ${LLAMA_BUILD_NUMBER})
     set(GGML_BUILD_COMMIT ${LLAMA_BUILD_COMMIT})
@@ -205,7 +211,6 @@ if (LLAMA_BUILD_COMMON)
 endif()
 
 if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TESTS AND NOT CMAKE_JS_VERSION)
-    include(CTest)
     add_subdirectory(tests)
 endif()
 

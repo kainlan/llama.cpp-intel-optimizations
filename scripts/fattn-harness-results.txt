@@ -1,0 +1,10 @@
+Build: 829623aaf
+GPU: level_zero:0
+Model: /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf
+Build dir: /Apps/llama.cpp/build
+
+=== Correctness Tests (ordered continuation '6, 7, 8, 9, 10') ===
+
+  \033[0;32mPASS\033[0m: Mistral-7B Q4 (FA-on): ordered continuation '6, 7, 8, 9, 10' found
+  \033[0;32mPASS\033[0m: Mistral-7B Q4 (non-FA): ordered continuation '6, 7, 8, 9, 10' found
+Full log: /Apps/llama.cpp/scripts/fattn-harness-results.txt

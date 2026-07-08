@@ -29,7 +29,7 @@ namespace ggml_sycl_reordered {
 // [qs0, qs1, qs2, ..., qsN]  [d0, d1, d2, ..., dN]
 //
 // Notes: out-of-bounds qs will run into d values
-// Alignment relies on the allocated size of qs
+// Aligment relies on the allocated size of qs
 
 template <ggml_type type> struct block_q_t;
 
@@ -52,7 +52,12 @@ template <> struct block_q_t<GGML_TYPE_Q4_0> {
     }
 
     static constexpr std::pair<int, int> get_d_offset(int nrows, int ncols, const int block_index) {
-        return { (ncols / QR4_0 * nrows) + block_index * sizeof(ggml_half), 0 };
+        // Q4_0: 32 4-bit quants = 16 bytes per block
+        // Memory layout: [qs: nblocks * 16 bytes][d: nblocks * 2 bytes]
+        auto nblocks = (nrows * (ncols / traits::qk));  // nrows * (ncols / 32)
+        auto total_qs_bytes = nblocks * (traits::qk / 2);  // nblocks * 16
+        auto d_offset = total_qs_bytes + block_index * sizeof(ggml_half);
+        return { d_offset, 0 };
     }
 
     static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }
@@ -112,16 +117,15 @@ template <> struct block_q_t<GGML_TYPE_Q5_K> {
         static constexpr uint32_t vdr_mmvq = 2;
     };
 
-    // Reordered layout: [qs (QK_K/2 per block)] [qh (QK_K/8 per block)] [scales] [dm]
     static constexpr std::pair<int, int> get_block_offset(const int block_index, const int n_blocks) {
-        auto qs_offset = block_index * (QK_K / 2);
-        auto qh_offset = n_blocks * (QK_K / 2) + block_index * (QK_K / 8);
+        const auto qs_offset = block_index * (QK_K / 2);
+        const auto qh_offset = n_blocks * (QK_K / 2) + block_index * (QK_K / 8);
         return { qs_offset, qh_offset };
     }
 
     static constexpr std::pair<int, int> get_d_offset(int nrows, int ncols, const int block_index) {
-        auto nblocks        = (nrows * (ncols / QK_K));
-        auto total_qs_bytes = nblocks * (QK_K / 2) + nblocks * (QK_K / 8);
+        const auto nblocks        = (nrows * (ncols / QK_K));
+        const auto total_qs_bytes = nblocks * (QK_K / 2) + nblocks * (QK_K / 8);
         return { total_qs_bytes + block_index * K_SCALE_SIZE,
                  total_qs_bytes + nblocks * K_SCALE_SIZE + block_index * sizeof(ggml_half2) };
     }
@@ -155,25 +159,55 @@ template <> struct block_q_t<GGML_TYPE_Q6_K> {
     static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }
 };
 
+// Q8_0: 32 int8 quants (32 bytes) + fp16 scale (2 bytes) = 34 bytes per block
+// Reordered: [qs0..qsN] [d0..dN] - all quants contiguous, then all scales
 template <> struct block_q_t<GGML_TYPE_Q8_0> {
     struct traits {
-        static constexpr uint32_t qk       = QK8_0;      // 32
-        static constexpr uint32_t qi       = QI8_0;      // 8
-        static constexpr uint32_t qr       = QR8_0;      // 1
-        static constexpr uint32_t vdr_mmvq = 4;
+        static constexpr uint32_t qk       = QK8_0;
+        static constexpr uint32_t qi       = QI8_0;
+        static constexpr uint32_t qr       = QR8_0;
+        static constexpr uint32_t vdr_mmvq = 2;
     };
 
-    // Q8_0 reorder layout: [qs0|qs1|...|qsN][d0|d1|...|dN]
-    // Each block has 32 int8 weights (32 bytes) followed by all scales
+    // Block offset: each block contributes QK8_0 bytes of quants
     static constexpr std::pair<int, int> get_block_offset(const int block_index, const int /* nblocks */) {
         return { block_index * QK8_0, 0 };
     }
 
+    // Scale offset: after all quants
     static constexpr std::pair<int, int> get_d_offset(int nrows, int ncols, const int block_index) {
-        return { (ncols * nrows) + block_index * sizeof(ggml_half), 0 };
+        // Q8_0: 32 int8 quants = 32 bytes per block
+        // Memory layout: [qs: nblocks * 32 bytes][d: nblocks * 2 bytes]
+        auto nblocks = (nrows * (ncols / traits::qk));  // nrows * (ncols / 32)
+        auto total_qs_bytes = nblocks * traits::qk;  // nblocks * 32
+        auto d_offset = total_qs_bytes + block_index * sizeof(ggml_half);
+        return { d_offset, 0 };
     }
 
-    static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }  // 1
+    static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }
+};
+
+// MXFP4: 32 4-bit elements packed in 16 bytes + 1 byte E8M0 exponent = 17 bytes per block
+// Reordered: [qs0..qsN] [scale0..scaleN] - all quants contiguous, then all scales
+template <> struct block_q_t<GGML_TYPE_MXFP4> {
+    struct traits {
+        static constexpr uint32_t qk       = QK_MXFP4;
+        static constexpr uint32_t qi       = QI_MXFP4;
+        static constexpr uint32_t qr       = QR_MXFP4;
+        static constexpr uint32_t vdr_mmvq = 2;
+    };
+
+    // Block offset: each block contributes QK_MXFP4/2 bytes of quants (4-bit packed)
+    static constexpr std::pair<int, int> get_block_offset(const int block_index, const int /* nblocks */) {
+        return { block_index * (QK_MXFP4 / 2), 0 };
+    }
+
+    // Scale offset: after all quants (ncols/2 bytes per row), scales are 1 byte each
+    static constexpr std::pair<int, int> get_d_offset(int nrows, int ncols, const int block_index) {
+        return { (ncols / 2 * nrows) + block_index * sizeof(uint8_t), 0 };
+    }
+
+    static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }
 };
 
 }  // namespace ggml_sycl_reordered

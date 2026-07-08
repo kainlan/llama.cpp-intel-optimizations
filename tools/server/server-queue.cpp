@@ -4,6 +4,8 @@
 #include "log.h"
 
 #include <chrono>
+#include <exception>
+#include <memory>
 
 #define QUE_INF(fmt, ...) LOG_INF("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define QUE_WRN(fmt, ...) LOG_WRN("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -404,7 +406,18 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()> 
                 // update the generation state if needed
                 const size_t idx = result->index;
                 GGML_ASSERT(idx < states.size());
-                result->update(states[idx]);
+                try {
+                    result->update(states[idx]);
+                } catch (const std::exception & e) {
+                    stop(); // cancel remaining work for this reader before returning the error
+                    auto err      = std::make_unique<server_task_result_error>();
+                    err->id       = result->id;
+                    err->id_slot  = result->id_slot;
+                    err->index    = result->index;
+                    err->err_type = ERROR_TYPE_SERVER;
+                    err->err_msg  = std::string("Failed to update streamed response: ") + e.what();
+                    return err;
+                }
             }
             if (result->is_stop()) {
                 received_count++;

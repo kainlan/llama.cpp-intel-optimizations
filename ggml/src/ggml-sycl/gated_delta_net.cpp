@@ -191,7 +191,7 @@ static void launch_gated_delta_net(const float *   q_d,
                                    int             K,
                                    dpct::queue_ptr stream) {
     //TODO: Add chunked kernel for even faster pre-fill
-    const int warp_size = ggml_sycl_info().devices[ggml_sycl_get_device()].warp_size;
+    const int warp_size = ggml_sycl_get_physical_warp_size();
 
     const int num_warps = 4;
     dpct::dim3 grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);

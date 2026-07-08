@@ -219,6 +219,19 @@
 #define GGML_QNT_VERSION        2    // bump this on quantization format changes
 #define GGML_QNT_VERSION_FACTOR 1000 // do not change this
 
+// ABI guard for downstream tensor layout extensions.
+#define GGML_TENSOR_STRUCT_VERSION 2
+
+#if defined(GGML_TENSOR_STRUCT_VERSION_EXPECTED)
+#    if defined(__cplusplus) && __cplusplus >= 201103L
+static_assert(GGML_TENSOR_STRUCT_VERSION == GGML_TENSOR_STRUCT_VERSION_EXPECTED,
+              "ggml_tensor ABI mismatch: update GGML_TENSOR_STRUCT_VERSION_EXPECTED");
+#    elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+_Static_assert(GGML_TENSOR_STRUCT_VERSION == GGML_TENSOR_STRUCT_VERSION_EXPECTED,
+               "ggml_tensor ABI mismatch: update GGML_TENSOR_STRUCT_VERSION_EXPECTED");
+#    endif
+#endif
+
 #define GGML_MAX_DIMS           4
 #define GGML_MAX_PARAMS         2048
 #define GGML_MAX_SRC            10
@@ -525,6 +538,7 @@ extern "C" {
         GGML_OP_GET_ROWS,
         GGML_OP_GET_ROWS_BACK,
         GGML_OP_SET_ROWS,
+        GGML_OP_SET_ROWS_PAGED,
         GGML_OP_DIAG,
         GGML_OP_DIAG_MASK_INF,
         GGML_OP_DIAG_MASK_ZERO,
@@ -585,6 +599,8 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+
+        GGML_OP_ALL_REDUCE_SUM,
 
         GGML_OP_COUNT,
     };
@@ -665,6 +681,51 @@ extern "C" {
         bool   no_alloc;   // don't allocate memory for the tensor data
     };
 
+    // Tensor Parallelism Info
+    //
+    // Metadata for tensors that participate in tensor parallelism. Backends use
+    // this to track how a full tensor is sharded across multiple devices.
+    struct ggml_tensor_tp_info {
+        bool    is_tp_sharded;
+        int     tp_world_size;
+        int     tp_dim;
+        int64_t global_ne[GGML_MAX_DIMS];
+    };
+
+    // Backend-specific tensor layouts used by downstream backends.
+    enum ggml_layout_mode {
+        GGML_LAYOUT_AOS = 0,
+        GGML_LAYOUT_SOA,
+        GGML_LAYOUT_COALESCED,
+        GGML_LAYOUT_MXFP4_I8,
+        GGML_LAYOUT_XMX_TILED,
+        GGML_LAYOUT_XMX_TILED_BUNDLE4,
+        GGML_LAYOUT_XMX_GEMM_TILED,
+        GGML_LAYOUT_ONEDNN_PACKED,
+        GGML_LAYOUT_ONEDNN_WOQ,
+        GGML_LAYOUT_MXFP4_DPAS,
+    };
+
+    struct ggml_tensor_layout {
+        enum ggml_layout_mode mode;
+        void *                data_ptr;
+        size_t                size;
+        bool                  owns_memory;
+        int                   device_id;
+
+        enum ggml_type qtype;
+        int64_t        n_elements;
+        int64_t        n_experts;
+
+        int64_t onednn_pack_m;
+
+        struct {
+            int64_t tile_n;
+            int64_t tile_k;
+            int64_t n_tile_groups;
+        } xmx_info;
+    };
+
     // n-dimensional tensor
     struct ggml_tensor {
         enum ggml_type type;
@@ -690,14 +751,16 @@ extern "C" {
         // source tensor and offset for views
         struct ggml_tensor * view_src;
         size_t               view_offs;
+        size_t               buffer_offs;
 
         void * data;
 
         char name[GGML_MAX_NAME];
 
-        void * extra; // extra things e.g. for ggml-cuda.cu
+        void *                      extra; // extra things e.g. for ggml-cuda.cu
+        struct ggml_tensor_layout * layout;
 
-        char padding[8];
+        char padding[GGML_MEM_ALIGN + sizeof(size_t)];
     };
 
     static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);
@@ -862,6 +925,7 @@ extern "C" {
     GGML_API enum ggml_glu_op ggml_get_glu_op(const struct ggml_tensor * tensor);
 
     GGML_API void *  ggml_get_data    (const struct ggml_tensor * tensor);
+    GGML_API void *  ggml_tensor_get_layout_ptr(const struct ggml_tensor * tensor);
     GGML_API float * ggml_get_data_f32(const struct ggml_tensor * tensor);
 
     GGML_API const char *         ggml_get_name   (const struct ggml_tensor * tensor);
@@ -1688,6 +1752,15 @@ extern "C" {
             struct ggml_tensor  * b,  // source
             struct ggml_tensor  * c); // row indices
 
+    GGML_API struct ggml_tensor * ggml_set_rows_paged(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * dst,
+            struct ggml_tensor  * src,
+            struct ggml_tensor  * indices,
+            struct ggml_tensor  * block_table,
+            int                   block_size,
+            int                   seq_idx);
+
     GGML_API struct ggml_tensor * ggml_diag(
         struct ggml_context     * ctx,
         struct ggml_tensor      * a);
@@ -2429,6 +2502,11 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // Mark flash attention to use paged KV cache layout.
+    GGML_API void ggml_flash_attn_ext_set_paged_layout(
+            struct ggml_tensor * a,
+            bool                 use_paged_layout);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
@@ -2686,6 +2764,10 @@ extern "C" {
         struct ggml_tensor *  a,
         struct ggml_tensor *  grad,
         struct ggml_tensor *  sgd_params); // alpha, weight decay
+
+    GGML_API struct ggml_tensor * ggml_all_reduce_sum(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
 
     // build forward multiple tensors and select one of them for computing
     // this is useful for creating graphs that have constant topology but compute different things based on the input

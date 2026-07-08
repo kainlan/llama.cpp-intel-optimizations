@@ -14,7 +14,6 @@
 #define GGML_SYCL_DEQUANTIZE_HPP
 
 #include "common.hpp"
-#include "convert.hpp"
 
 typedef void (*dequantize_kernel_t)(const void * vx, const int64_t ib, const int iqs, dfloat2 & v);
 typedef void (*dequantize_kernel_t_reorder)(const void *d, const int64_t ib, const void *qs,
@@ -631,22 +630,6 @@ static __dpct_inline__ void dequantize_q5_1(const void *vx, const int64_t ib,
 #endif // GGML_SYCL_F16
 }
 
-static __dpct_inline__ void dequantize_q8_0_reorder(const void *d_ptr, const int64_t ib, const void *qs,
-                                            const int iqs, dfloat2 &v) {
-    const dfloat d = (const dfloat)*((const sycl::half*)d_ptr + ib);
-
-    v.x() = ((const int8_t *)qs)[iqs + 0];
-    v.y() = ((const int8_t *)qs)[iqs + 1];
-
-#ifdef GGML_SYCL_F16
-    v.s0() *= d;
-    v.s1() *= d;
-#else
-    v.x() *= d;
-    v.y() *= d;
-#endif // GGML_SYCL_F16
-}
-
 static __dpct_inline__ void dequantize_q8_0(const void *vx, const int64_t ib,
                                             const int iqs, dfloat2 &v) {
     const block_q8_0 * x = (const block_q8_0 *) vx;
@@ -658,6 +641,29 @@ static __dpct_inline__ void dequantize_q8_0(const void *vx, const int64_t ib,
 
 #ifdef GGML_SYCL_F16
     // v = v * {d, d};
+    v.s0() *= d;
+    v.s1() *= d;
+#else
+    v.x() *= d;
+    v.y() *= d;
+#endif // GGML_SYCL_F16
+}
+
+// Q8_0 SoA (Structure of Arrays) dequantization
+// In SoA layout: all qs values first (nblocks * 32 bytes), then all d values (nblocks * 2 bytes)
+// d_ptr: pointer to the start of d values section
+// qs: pointer to the qs values for this block (already offset)
+// ib: block index (used to index into d values)
+// iqs: index within the block's qs array (0 to 30, stepping by 2)
+static __dpct_inline__ void dequantize_q8_0_reorder(const void *d_ptr, const int64_t ib, const void *qs,
+                                            const int iqs, dfloat2 &v) {
+    const dfloat d = (const dfloat)*((const sycl::half*)d_ptr + ib);
+
+    const int8_t* qs_ptr = (const int8_t*)qs;
+    v.x() = qs_ptr[iqs + 0];
+    v.y() = qs_ptr[iqs + 1];
+
+#ifdef GGML_SYCL_F16
     v.s0() *= d;
     v.s1() *= d;
 #else
@@ -726,32 +732,209 @@ static void dequantize_block_q4_0_reorder(const void * __restrict__ vx, dst_t * 
 
 }
 
-// Dequantize Q8_0 from reorder layout: [all qs (k bytes)][all d values]
-// Each thread handles one block of QK8_0 elements.
+// COALESCED layout dequant: word-major interleaved within tiles of WARP_SIZE blocks.
+// Quant bytes for block b in tile t:
+//   word w at offset: tile_base + w * WARP_SIZE * 4 + block_in_tile * 4
+// Scale (d) values are contiguous after ALL quant bytes (same as SOA).
 template<typename dst_t>
-static void dequantize_block_q8_0_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t k,
+static void dequantize_block_q4_0_coalesced(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t nb32,
                                   const sycl::nd_item<3> &item_ct1) {
 
     const int64_t i = item_ct1.get_group(2);
+    auto k = nb32;
+    // assume 32 threads
     const int64_t tid = item_ct1.get_local_id(2);
     const int lane_ib = i * WARP_SIZE + tid;
 
-    if (lane_ib >= k / QK8_0) {
+    if (lane_ib >= k / QK4_0) {
         return;
     }
 
-    dst_t * y_ptr = yy + lane_ib * QK8_0;
+    dst_t * y_ptr = yy + lane_ib * QK4_0;
 
-    auto qs = (const int8_t*)vx + lane_ib * QK8_0;
-    auto s_ptr = (const sycl::half*)((const uint8_t*)vx + k) + lane_ib;
-
+    // Scale: same position as SOA (contiguous after all quants)
+    auto s_ptr = (const sycl::half *)((const uint8_t *) vx + k / 2) + lane_ib;
     const float d = float(*s_ptr);
 
+    // COALESCED qs addressing: tile-interleaved word-major layout
+    constexpr int TILE_BLOCKS     = WARP_SIZE;  // 32 blocks per tile
+    constexpr int BYTES_PER_BLOCK = QK4_0 / 2;  // 16 bytes per block
+    constexpr int WORDS_PER_BLOCK = BYTES_PER_BLOCK / 4;  // 4 words of 4 bytes
+    constexpr int WORD_PLANE_STRIDE = TILE_BLOCKS * 4;  // 128 bytes between word planes
+
+    const int tile          = lane_ib / TILE_BLOCKS;
+    const int block_in_tile = lane_ib % TILE_BLOCKS;
+    // Row-based addressing: blocks_per_row = k / QK4_0 (total blocks / nrows, but
+    // dequant sees a flattened 1D array of k elements, so row_qs_bytes = k/2 for the
+    // full tensor). Tile base within the quant region:
+    const int tile_base = tile * (TILE_BLOCKS * BYTES_PER_BLOCK);
+
+    // Read 16 bytes (4 words x 4 bytes) from tile-interleaved positions
+    uint8_t qs_buf[BYTES_PER_BLOCK];
 #pragma unroll
-    for (int l = 0; l < QK8_0; ++l) {
-        y_ptr[l] = d * qs[l];
+    for (int w = 0; w < WORDS_PER_BLOCK; w++) {
+        const uint8_t * src = (const uint8_t *) vx + tile_base + w * WORD_PLANE_STRIDE + block_in_tile * 4;
+#pragma unroll
+        for (int b = 0; b < 4; b++) {
+            qs_buf[w * 4 + b] = src[b];
+        }
     }
 
+#pragma unroll
+    for (int l = 0; l < QK4_0 / 2; ++l) {
+        int vq = qs_buf[l];
+        y_ptr[l + 0]  = d * ((vq & 0xF) - 8);
+        y_ptr[l + 16] = d * ((vq >> 4) - 8);
+    }
+}
+
+// COALESCED→row-major FP16 dequant for oneDNN PP path.
+// Uses 2D grid [nrows, tiles_per_row * WARP_SIZE] so each work-group handles one
+// tile of one row. Output is written in true row-major order: row r, column c
+// goes to y[r * ncols + c].
+template<typename dst_t>
+static void dequantize_block_q4_0_coalesced_rowmajor(const void * __restrict__ vx, dst_t * __restrict__ yy,
+                                                     const int blocks_per_row, const int nrows,
+                                                     const sycl::nd_item<2> & item) {
+    constexpr int TILE_BLOCKS      = WARP_SIZE;  // 32 blocks per tile
+    constexpr int BYTES_PER_BLOCK  = QK4_0 / 2;  // 16 bytes of qs per block
+    constexpr int WORDS_PER_BLOCK  = BYTES_PER_BLOCK / 4;  // 4 words of 4 bytes
+    constexpr int WORD_PLANE_STRIDE = TILE_BLOCKS * 4;  // 128 bytes between word planes
+    constexpr int QS_BYTES_PER_TILE = TILE_BLOCKS * BYTES_PER_BLOCK;  // 512
+
+    const int row           = item.get_global_id(0);
+    const int block_in_tile = item.get_local_id(1);
+    const int tile          = item.get_group(1);
+
+    if (row >= nrows) {
+        return;
+    }
+
+    const int block_idx = tile * TILE_BLOCKS + block_in_tile;
+    if (block_idx >= blocks_per_row) {
+        return;
+    }
+
+    // --- Quant bytes: per-row, tile-interleaved word-major ---
+    const int64_t row_quants_bytes   = (int64_t) blocks_per_row * BYTES_PER_BLOCK;
+    const int64_t total_quants_bytes = (int64_t) nrows * row_quants_bytes;
+    const int64_t tile_qs_base       = (int64_t) row * row_quants_bytes + (int64_t) tile * QS_BYTES_PER_TILE;
+
+    // Vectorized qs load: 4 × uint32_t reads (4 bytes each = 16 bytes total per block)
+    uint32_t qs_words[WORDS_PER_BLOCK];
+#pragma unroll
+    for (int w = 0; w < WORDS_PER_BLOCK; w++) {
+        const int64_t src_offset = tile_qs_base + w * WORD_PLANE_STRIDE + block_in_tile * 4;
+        qs_words[w] = *reinterpret_cast<const uint32_t *>((const uint8_t *) vx + src_offset);
+    }
+
+    // --- Scale: contiguous after ALL quants, in global block order ---
+    const int64_t global_block = (int64_t) row * blocks_per_row + block_idx;
+    const auto *  s_ptr        = (const sycl::half *) ((const uint8_t *) vx + total_quants_bytes) + global_block;
+    const sycl::half d_h       = *s_ptr;
+    const float      d         = float(d_h);
+    const float      dm        = d * -8.0f;  // bias: d * (nibble - 8) = d*nibble + dm
+
+    // --- Output: row-major FP16 via half8 stores ---
+    dst_t * y_ptr = yy + (int64_t) row * blocks_per_row * QK4_0 + block_idx * QK4_0;
+
+    // Each uint32_t holds 4 nibble-pairs: low nibbles → y[0..15], high nibbles → y[16..31]
+    // Use FMA: d * nibble + dm  to avoid integer subtraction (compiler can fuse with float ops)
+#pragma unroll
+    for (int w = 0; w < 2; w++) {
+        const uint32_t wa = qs_words[w * 2 + 0];
+        const uint32_t wb = qs_words[w * 2 + 1];
+        // Low nibbles from wa/wb → y[w*8 .. w*8+7]
+        sycl::vec<float, 8> lo_f(
+            sycl::fma(d, float( wa        & 0xF), dm),
+            sycl::fma(d, float((wa >>  8) & 0xF), dm),
+            sycl::fma(d, float((wa >> 16) & 0xF), dm),
+            sycl::fma(d, float((wa >> 24) & 0xF), dm),
+            sycl::fma(d, float( wb        & 0xF), dm),
+            sycl::fma(d, float((wb >>  8) & 0xF), dm),
+            sycl::fma(d, float((wb >> 16) & 0xF), dm),
+            sycl::fma(d, float((wb >> 24) & 0xF), dm)
+        );
+        // High nibbles from wa/wb → y[16+w*8 .. 16+w*8+7]
+        sycl::vec<float, 8> hi_f(
+            sycl::fma(d, float((wa >>  4) & 0xF), dm),
+            sycl::fma(d, float((wa >> 12) & 0xF), dm),
+            sycl::fma(d, float((wa >> 20) & 0xF), dm),
+            sycl::fma(d, float((wa >> 28) & 0xF), dm),
+            sycl::fma(d, float((wb >>  4) & 0xF), dm),
+            sycl::fma(d, float((wb >> 12) & 0xF), dm),
+            sycl::fma(d, float((wb >> 20) & 0xF), dm),
+            sycl::fma(d, float((wb >> 28) & 0xF), dm)
+        );
+        auto lo_h = lo_f.convert<sycl::half, sycl::rounding_mode::automatic>();
+        auto hi_h = hi_f.convert<sycl::half, sycl::rounding_mode::automatic>();
+        *reinterpret_cast<sycl::vec<sycl::half, 8> *>(y_ptr + w * 8)      = lo_h;
+        *reinterpret_cast<sycl::vec<sycl::half, 8> *>(y_ptr + 16 + w * 8) = hi_h;
+    }
+}
+
+// SOA→row-major FP16 dequant for oneDNN PP path.
+// SOA layout: [all qs bytes contiguous][all d values contiguous]
+// qs for block b: vx + b * (QK4_0/2)
+// d  for block b: vx + total_qs_bytes + b * sizeof(half)
+// Output: row-major FP16 (row r, col c → y[r * cols + c])
+template<typename dst_t>
+static void dequantize_block_q4_0_soa_rowmajor(const void * __restrict__ vx, dst_t * __restrict__ yy,
+                                                const int blocks_per_row, const int nrows,
+                                                const sycl::nd_item<3> & item) {
+    const int     global_id    = item.get_global_id(2);
+    const int64_t total_blocks = (int64_t) nrows * blocks_per_row;
+
+    if (global_id >= total_blocks) {
+        return;
+    }
+
+    const int row       = global_id / blocks_per_row;
+    const int block_idx = global_id % blocks_per_row;
+
+    // SOA: qs are sequential per block
+    const auto * qs = (const uint8_t *) vx + (int64_t) global_id * (QK4_0 / 2);
+
+    // SOA: scales after ALL qs bytes
+    const int64_t total_qs_bytes = total_blocks * (QK4_0 / 2);
+    const auto *  s_ptr = (const sycl::half *) ((const uint8_t *) vx + total_qs_bytes) + global_id;
+    const float   d     = float(*s_ptr);
+    const float   dm    = d * -8.0f;  // bias: d * (nibble - 8) = d*nibble + dm
+
+    // Output: row-major
+    dst_t * y_ptr = yy + (int64_t) row * blocks_per_row * QK4_0 + block_idx * QK4_0;
+
+    // Vectorized: 4 × uint32_t loads + 4 × half8 stores (2 lo + 2 hi, 8 halves each)
+    const uint32_t * qs32 = reinterpret_cast<const uint32_t *>(qs);
+#pragma unroll
+    for (int w = 0; w < 2; w++) {
+        const uint32_t wa = qs32[w * 2 + 0];
+        const uint32_t wb = qs32[w * 2 + 1];
+        sycl::vec<float, 8> lo_f(
+            sycl::fma(d, float( wa        & 0xF), dm),
+            sycl::fma(d, float((wa >>  8) & 0xF), dm),
+            sycl::fma(d, float((wa >> 16) & 0xF), dm),
+            sycl::fma(d, float((wa >> 24) & 0xF), dm),
+            sycl::fma(d, float( wb        & 0xF), dm),
+            sycl::fma(d, float((wb >>  8) & 0xF), dm),
+            sycl::fma(d, float((wb >> 16) & 0xF), dm),
+            sycl::fma(d, float((wb >> 24) & 0xF), dm)
+        );
+        sycl::vec<float, 8> hi_f(
+            sycl::fma(d, float((wa >>  4) & 0xF), dm),
+            sycl::fma(d, float((wa >> 12) & 0xF), dm),
+            sycl::fma(d, float((wa >> 20) & 0xF), dm),
+            sycl::fma(d, float((wa >> 28) & 0xF), dm),
+            sycl::fma(d, float((wb >>  4) & 0xF), dm),
+            sycl::fma(d, float((wb >> 12) & 0xF), dm),
+            sycl::fma(d, float((wb >> 20) & 0xF), dm),
+            sycl::fma(d, float((wb >> 28) & 0xF), dm)
+        );
+        auto lo_h = lo_f.convert<sycl::half, sycl::rounding_mode::automatic>();
+        auto hi_h = hi_f.convert<sycl::half, sycl::rounding_mode::automatic>();
+        *reinterpret_cast<sycl::vec<sycl::half, 8> *>(y_ptr + w * 8)      = lo_h;
+        *reinterpret_cast<sycl::vec<sycl::half, 8> *>(y_ptr + 16 + w * 8) = hi_h;
+    }
 }
 
 template<typename dst_t>
@@ -1078,63 +1261,6 @@ static void dequantize_block_q5_K(const void * __restrict__ vx, dst_t * __restri
     dst_t * y = yy + i*QK_K + tid;
     y[ 0] = d * x[i].scales[is+0] * ((q & 0xF) - ((h >> 0) & 1 ? 0 : 16));
     y[32] = d * x[i].scales[is+2] * ((q >>  4) - ((h >> 4) & 1 ? 0 : 16));
-#endif
-}
-
-template <typename dst_t>
-static void dequantize_block_q5_K_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy,
-                                          uint8_t * scales_local, const sycl::nd_item<3> & item_ct1, int64_t n_blocks) {
-    const int64_t ib = item_ct1.get_group(2);
-
-#if QK_K == 256
-    // assume 64 threads
-    const int64_t tid = item_ct1.get_local_id(2);
-    const int64_t il  = tid / 16;   // 0...3
-    const int64_t ir  = tid % 16;   // 0...15
-    const int64_t is  = 2 * il;
-
-    dst_t * y = yy + ib * QK_K + 64 * il + 2 * ir;
-
-    const uint8_t * base = static_cast<const uint8_t *>(vx);
-
-    // Reordered layout: [qs (QK_K/2 per block)] [qh (QK_K/8 per block)] [scales (K_SCALE_SIZE per block)] [dm (half2 per block)]
-    const size_t qs_offset     = ib * (QK_K / 2);
-    const size_t qh_offset     = n_blocks * (QK_K / 2) + ib * (QK_K / 8);
-    const size_t scales_offset = n_blocks * (QK_K / 2) + n_blocks * (QK_K / 8) + ib * K_SCALE_SIZE;
-    const size_t dm_offset     = n_blocks * (QK_K / 2) + n_blocks * (QK_K / 8) + n_blocks * K_SCALE_SIZE + ib * sizeof(ggml_half2);
-
-    const uint8_t *  qs_ptr     = base + qs_offset;
-    const uint8_t *  qh_ptr     = base + qh_offset;
-    const uint8_t *  scales_ptr = base + scales_offset;
-    const ggml_half2 dm_values  = *reinterpret_cast<const ggml_half2 *>(base + dm_offset);
-
-    const float dall = dm_values.x();
-    const float dmin = dm_values.y();
-
-    const uint8_t * ql = qs_ptr + 32 * il + 2 * ir;
-    const uint8_t * qh = qh_ptr + 2 * ir;
-
-    if (tid < K_SCALE_SIZE) {
-        scales_local[tid] = scales_ptr[tid];
-    }
-
-    item_ct1.barrier(sycl::access::fence_space::local_space);
-
-    uint8_t sc, m;
-    get_scale_min_k4(is + 0, scales_local, sc, m);
-    const float d1 = dall * sc; const float m1 = dmin * m;
-    get_scale_min_k4(is + 1, scales_local, sc, m);
-    const float d2 = dall * sc; const float m2 = dmin * m;
-
-    uint8_t hm  = 1 << (2 * il);
-    y[ 0] = d1 * ((ql[ 0] & 0xF) + (qh[ 0] & hm ? 16 : 0)) - m1;
-    y[ 1] = d1 * ((ql[ 1] & 0xF) + (qh[ 1] & hm ? 16 : 0)) - m1;
-    hm <<= 1;
-    y[32] = d2 * ((ql[ 0] >>  4) + (qh[ 0] & hm ? 16 : 0)) - m2;
-    y[33] = d2 * ((ql[ 1] >>  4) + (qh[ 1] & hm ? 16 : 0)) - m2;
-#else
-    GGML_UNUSED(ib); GGML_UNUSED(tid); GGML_UNUSED(yy); GGML_UNUSED(scales_local); GGML_UNUSED(n_blocks);
-    GGML_ABORT("Q5_K reorder dequantize not supported for QK_K != 256");
 #endif
 }
 
@@ -1465,10 +1591,10 @@ dequantize_block_iq4_xs(const void *__restrict__ vx, dst_t *__restrict__ yy,
     }
 }
 
+// Block dequantization kernel for MXFP4
 template<typename dst_t>
 static void dequantize_block_mxfp4(const void * __restrict__ vx, dst_t * __restrict__ yy,
                                    const sycl::nd_item<3> &item_ct1) {
-    // auto                item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int64_t       i        = item_ct1.get_group(2);
     const block_mxfp4 * x = (const block_mxfp4 *) vx + i*(QK_K/QK_MXFP4);
 
@@ -1483,37 +1609,5 @@ static void dequantize_block_mxfp4(const void * __restrict__ vx, dst_t * __restr
         y[j+16] = d * kvalues_mxfp4[q4[j] >>  4]*0.5f;
     }
 }
-
-
-template <typename dst_t>
-static void dequantize_block_nvfp4(
-        const void * __restrict__ vx,
-        dst_t * __restrict__ yy,
-        const int64_t ne) {
-    auto          item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    const int64_t i        = item_ct1.get_group(2);
-    const int     tid      = item_ct1.get_local_id(2);
-
-    const int64_t base = i * QK_NVFP4;
-    if (base >= ne) {
-        return;
-    }
-
-    const block_nvfp4 * x = (const block_nvfp4 *) vx;
-    const block_nvfp4 & xb = x[i];
-
-    const int sub = tid / (QK_NVFP4_SUB / 2);
-    const int j = tid % (QK_NVFP4_SUB / 2);
-
-    const float d = ggml_sycl_ue4m3_to_fp32(xb.d[sub]);
-    const uint8_t q = xb.qs[sub * (QK_NVFP4_SUB / 2) + j];
-
-    const int64_t y0 = base + sub * QK_NVFP4_SUB + j;
-    const int64_t y1 = y0 + QK_NVFP4_SUB / 2;
-
-    yy[y0] = ggml_sycl_cast<dst_t>(d * kvalues_mxfp4[q & 0x0F]);
-    yy[y1] = ggml_sycl_cast<dst_t>(d * kvalues_mxfp4[q >> 4]);
-}
-
 
 #endif // GGML_SYCL_DEQUANTIZE_HPP

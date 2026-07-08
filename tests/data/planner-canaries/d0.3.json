@@ -1,0 +1,15 @@
+{
+  "canary_id": "D0.3",
+  "result": "PASS",
+  "summary": "op_id ordering identical across 5 graph_reserve calls; plan.ops can safely key on op_id for single-device graph ops",
+  "recommendation": "C2 can use op_id keying for executable graph ops. Multi-device transfer edges must use the separate D0.3a scheduler-copy-edge contract.",
+  "evidence": {
+    "runs": "5",
+    "nodes_per_run": "1031",
+    "backend": "CPU (ONEAPI_DEVICE_SELECTOR=opencl:cpu sidesteps m09zb)",
+    "model_path": "/Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf",
+    "n_ctx": "1024",
+    "n_ubatch": "512",
+    "plan_section": "docs/plans/2026-04-24-planner-validation-phases.md Task 1"
+  }
+}

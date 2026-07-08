@@ -1,5 +1,6 @@
 #include "solve_tri.hpp"
 #include "common.hpp"
+#include "mem-ops.hpp"
 #include <oneapi/mkl/blas.hpp>
 
 template <int n_template, int k_template>
@@ -135,7 +136,11 @@ inline void ggml_sycl_op_solve_tri(ggml_backend_sycl_context & ctx, ggml_tensor 
 
     if (X_d != B_d) {
         const int64_t total_elements = (int64_t)n * k * ne02 * ne03;
-        stream->memcpy(X_d, B_d, total_elements * sizeof(float));
+        ggml_sycl::mem_handle dst_handle =
+            ggml_sycl::mem_handle::from_chunk_ptr(X_d, ctx.device, GGML_LAYOUT_AOS, true);
+        ggml_sycl::mem_handle src_handle =
+            ggml_sycl::mem_handle::from_chunk_ptr(const_cast<float *>(B_d), ctx.device, GGML_LAYOUT_AOS, true);
+        (void) ggml_sycl::mem_copy_async(dst_handle, src_handle, total_elements * sizeof(float), *stream);
     }
 
     const int64_t nb02 = src0->nb[2];

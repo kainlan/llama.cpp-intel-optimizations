@@ -19,6 +19,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <map>
 #include <nlohmann/json.hpp>
 #include <set>
 #include <stdexcept>
@@ -5736,6 +5737,8 @@ static void test_template_generation_prompt() {
         std::vector<common_chat_msg> messages;
         bool                         add_generation_prompt  = true;
         common_chat_continuation     continue_final_message = COMMON_CHAT_CONTINUATION_NONE;
+        bool                         enable_thinking        = true;
+        std::map<std::string, std::string> chat_template_kwargs;
     };
 
     auto basic = [&]() {
@@ -5767,6 +5770,8 @@ static void test_template_generation_prompt() {
         inputs.messages               = opts.messages;
         inputs.add_generation_prompt  = opts.add_generation_prompt;
         inputs.continue_final_message = opts.continue_final_message;
+        inputs.enable_thinking        = opts.enable_thinking;
+        inputs.chat_template_kwargs   = opts.chat_template_kwargs;
 
         auto params = common_chat_templates_apply(tmpls.get(), inputs);
 
@@ -5786,6 +5791,21 @@ static void test_template_generation_prompt() {
     {
         auto tmpls = read_templates("models/templates/openai-gpt-oss-120b.jinja");
         check(tmpls, basic(),                  "<|start|>assistant");
+        {
+            common_chat_templates_inputs inputs;
+            inputs.messages = basic().messages;
+            auto params = common_chat_templates_apply(tmpls.get(), inputs);
+            assert_equals(std::string("<|start|>assistant"), params.thinking_start_tag);
+            assert_equals(std::string("<|channel|>final<|message|>"), params.thinking_end_tag);
+        }
+        auto no_thinking = basic();
+        no_thinking.enable_thinking = false;
+        no_thinking.chat_template_kwargs = {
+            { "enable_thinking",           "false"      },
+            { "llama_force_final_channel", "true"       },
+            { "reasoning_effort",          "\"medium\"" },
+        };
+        check(tmpls, no_thinking,             "<|start|>assistant<|channel|>final<|message|>");
         check(tmpls, continuation_content(),   "<|start|>assistant<|channel|>analysis<|message|>I'm thinking<|end|><|start|>assistant<|channel|>final<|message|>Hello, ");
         check(tmpls, continuation_reasoning(), "<|start|>assistant<|channel|>analysis<|message|>I'm");
     }

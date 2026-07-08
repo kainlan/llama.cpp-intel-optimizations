@@ -1,0 +1,17 @@
+# Task5 — PASS
+
+**Summary**: Mini-context (no_alloc=true) produces byte-identical buffer sizes + FA verdict to a real context — A3a approach validated
+
+**Recommendation**: A3a can size unified-cache zones from a throwaway mini-context; A3b's FA auto-detect can run there too
+
+## Evidence
+
+- **model_path**: /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf
+- **n_ctx**: 1024
+- **n_ubatch**: 512
+- **fa_type**: AUTO
+- **backend**: cpu (ONEAPI_DEVICE_SELECTOR=opencl:cpu sidesteps zhzbp on GPU)
+- **real_A_signals**: fa=enabled; CPU=  398.38 MiB
+- **real_B_signals**: fa=enabled; CPU=  398.38 MiB
+- **mini_signals**: fa=enabled; CPU=  398.38 MiB
+- **real_A_eq_real_B**: yes (graph_reserve is deterministic across two real contexts)

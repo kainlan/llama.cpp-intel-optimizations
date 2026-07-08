@@ -1,8 +1,8 @@
-message(STATUS  "GGML_SYCL_TARGET=${GGML_SYCL_TARGET}")
-
-if (NOT GGML_SYCL_TARGET MATCHES "^(INTEL)$")
-    message(FATAL_ERROR "GGML_SYCL_TARGET: Invalid target, the supported options are [INTEL]")
+if (NOT DEFINED GGML_SYCL_TARGET)
+    set(GGML_SYCL_TARGET "INTEL")
 endif()
+
+message(STATUS  "GGML_SYCL_TARGET=${GGML_SYCL_TARGET}")
 
 check_cxx_compiler_flag("-fsycl" SUPPORTS_SYCL)
 
@@ -18,19 +18,80 @@ endif()
 message(STATUS "SYCL found")
 #todo: AOT
 
+if (CMAKE_GENERATOR STREQUAL "Ninja" AND CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+    # Intel's SYCL link step records transient icpx/ocloc objects in the linker
+    # depfile. Those files are deleted after linking, so Ninja considers
+    # libggml-sycl dirty on every build and repeats the expensive device link.
+    set(CMAKE_CXX_LINK_DEPENDS_USE_LINKER FALSE)
+endif()
+
 ggml_add_backend_library(ggml-sycl
                          ggml-sycl.cpp
+                         kv-tier-manager.cpp
                          ../../include/ggml-sycl.h
                         )
 
 file(GLOB   GGML_HEADERS_SYCL "*.hpp")
+option(GGML_SYCL_MMQ_XMX "Enable experimental XMX MMQ kernels for SYCL backend" OFF)
+option(GGML_SYCL_XMX_GEMM "Enable experimental XMX GEMM for quantized matmul (known to be slower)" OFF)
+option(GGML_SYCL_DEBUG_SOA_LAYOUT "Enable SoA layout verification debug checks" OFF)
+option(GGML_SYCL_QUANTIZER_DEBUG "Enable quantizer kernel debug output" OFF)
+option(GGML_SYCL_ASAN_PARTIAL "Enable ASan for ggml-sycl.cpp and unified-cache.cpp only" OFF)
+option(GGML_SYCL_PROFILING_DEBUG "Enable SYCL device debug info for VTune profiling" OFF)
+
 file(GLOB   GGML_SOURCES_SYCL "*.cpp")
-file(GLOB   SRCS "template-instances/fattn-tile*.cpp")
-list(APPEND GGML_SOURCES_SYCL ${SRCS})
-file(GLOB   SRCS "template-instances/fattn-vec*.cpp")
-list(APPEND GGML_SOURCES_SYCL ${SRCS})
+list(FILTER GGML_SOURCES_SYCL EXCLUDE REGEX "test_joint_matrix.*\\.cpp$")
+list(FILTER GGML_SOURCES_SYCL EXCLUDE REGEX "test_tensor_parallel\\.cpp$")
+
+if (GGML_SYCL_MMQ_XMX)
+    message(STATUS "Compiling with experimental GGML_SYCL_MMQ_XMX kernels.")
+    target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_MMQ_XMX)
+    list(APPEND GGML_SOURCES_SYCL mmq_xmx.cpp)
+    list(APPEND GGML_HEADERS_SYCL mmq_xmx.hpp)
+endif()
+
+if (GGML_SYCL_DEBUG_SOA_LAYOUT)
+    message(STATUS "Compiling with GGML_SYCL_DEBUG_SOA_LAYOUT enabled - will verify SoA layout at runtime.")
+    add_compile_definitions(GGML_SYCL_DEBUG_SOA_LAYOUT=1)
+endif()
+
+if (GGML_SYCL_QUANTIZER_DEBUG)
+    message(STATUS "Compiling with GGML_SYCL_QUANTIZER_DEBUG enabled - will print quantizer d values.")
+    add_compile_definitions(GGML_SYCL_QUANTIZER_DEBUG=1)
+endif()
 
 target_sources(ggml-sycl PRIVATE ${GGML_HEADERS_SYCL} ${GGML_SOURCES_SYCL})
+
+# Enable AVX2 + VNNI for CPU vec_dot kernels in tensor split / CPU offload.
+# Applied ONLY to cpu-dispatch.cpp to avoid affecting SYCL device code compilation.
+# Note: Arrow Lake does NOT support AVX-512 (removed from consumer chips).
+# AVX-VNNI (_mm256_dpbusd_epi32, unsigned x signed) and AVX-VNNIINT8 (_mm256_dpbssd_epi32,
+# signed x signed) are available and used for Q4_0/MXFP4 fast-paths.
+if (GGML_SYCL_TARGET STREQUAL "INTEL" AND NOT WIN32)
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag("-mavx2" HAS_AVX2)
+    check_cxx_compiler_flag("-mavxvnni" HAS_AVXVNNI)
+    check_cxx_compiler_flag("-mavxvnniint8" HAS_AVXVNNIINT8)
+    if (HAS_AVX2)
+        set(_CPU_DISPATCH_AVX_FLAGS "-mavx2;-mfma")
+        if (HAS_AVXVNNI)
+            list(APPEND _CPU_DISPATCH_AVX_FLAGS "-mavxvnni")
+        endif()
+        if (HAS_AVXVNNIINT8)
+            list(APPEND _CPU_DISPATCH_AVX_FLAGS "-mavxvnniint8")
+        endif()
+        set_source_files_properties(cpu-dispatch.cpp PROPERTIES
+            COMPILE_OPTIONS "${_CPU_DISPATCH_AVX_FLAGS}")
+        message(STATUS "cpu-dispatch.cpp AVX flags: ${_CPU_DISPATCH_AVX_FLAGS}")
+    endif()
+endif()
+
+if (GGML_SYCL_ASAN_PARTIAL)
+    message(STATUS "GGML_SYCL_ASAN_PARTIAL: enabling ASan for ggml-sycl.cpp + unified-cache.cpp")
+    set_source_files_properties(ggml-sycl.cpp unified-cache.cpp
+        PROPERTIES COMPILE_OPTIONS "-fsanitize=address;-fno-omit-frame-pointer")
+    target_link_options(ggml-sycl PRIVATE "-fsanitize=address")
+endif()
 
 if (WIN32)
     # To generate a Visual Studio solution, using Intel C++ Compiler for ggml-sycl is mandatory
@@ -39,61 +100,9 @@ if (WIN32)
         set(CMAKE_CXX_COMPILER "icx")
         set(CMAKE_CXX_COMPILER_ID "IntelLLVM")
     endif()
-    # Level Zero SDK path for Windows (only when GGML_SYCL_SUPPORT_LEVEL_ZERO_API is enabled)
-    if(GGML_SYCL_SUPPORT_LEVEL_ZERO_API)
-        if(DEFINED ENV{LEVEL_ZERO_V1_SDK_PATH})
-            set(LEVEL_ZERO_V1_SDK_PATH $ENV{LEVEL_ZERO_V1_SDK_PATH})
-            if(EXISTS "${LEVEL_ZERO_V1_SDK_PATH}")
-                target_include_directories(ggml-sycl PRIVATE "${LEVEL_ZERO_V1_SDK_PATH}/include")
-                set(LEVEL_ZERO_V1_SDK_LIB_PATH "${LEVEL_ZERO_V1_SDK_PATH}/lib")
-            else()
-                message(WARNING "LEVEL_ZERO_V1_SDK_PATH set but folder not found: ${LEVEL_ZERO_V1_SDK_PATH}")
-            endif()
-        endif()
-    endif()
 endif()
 
-macro(detect_and_find_package package_name)
-    set(test_source "
-    cmake_minimum_required(VERSION ${CMAKE_VERSION})
-    project(check_package LANGUAGES CXX)
-    find_package(${package_name} QUIET)
-    ")
-
-    set(test_dir "${CMAKE_CURRENT_BINARY_DIR}/check_package_${package_name}")
-    file(WRITE "${test_dir}/CMakeLists.txt" "${test_source}")
-
-    set(cmake_args "")
-    if(CMAKE_GENERATOR)
-        list(APPEND cmake_args "-G" "${CMAKE_GENERATOR}")
-    endif()
-    if(CMAKE_GENERATOR_PLATFORM)
-        list(APPEND cmake_args "-A" "${CMAKE_GENERATOR_PLATFORM}")
-    endif()
-    if(CMAKE_GENERATOR_TOOLSET)
-        list(APPEND cmake_args "-T" "${CMAKE_GENERATOR_TOOLSET}")
-    endif()
-    if(CMAKE_CXX_COMPILER)
-        list(APPEND cmake_args "-DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}")
-    endif()
-
-    execute_process(
-        COMMAND ${CMAKE_COMMAND} ${cmake_args} .
-        WORKING_DIRECTORY "${test_dir}"
-        RESULT_VARIABLE result
-        OUTPUT_QUIET
-        ERROR_QUIET
-    )
-
-    if(result EQUAL 0)
-        find_package(${package_name} ${ARGN})
-    else()
-        message(WARNING "Detection of ${package_name} failed. The package might be broken or incompatible.")
-        set(${package_name}_FOUND FALSE)
-    endif()
-endmacro()
-
-detect_and_find_package(IntelSYCL)
+find_package(IntelSYCL)
 if (IntelSYCL_FOUND)
     # Use oneAPI CMake when possible
     target_link_libraries(ggml-sycl PRIVATE IntelSYCL::SYCL_CXX)
@@ -103,105 +112,1214 @@ else()
     target_link_options(ggml-sycl PRIVATE "-fsycl")
 endif()
 
-target_compile_options(ggml-sycl PRIVATE "-Wno-narrowing")
-
-message(STATUS "GGML_SYCL_SUPPORT_LEVEL_ZERO_API ${GGML_SYCL_SUPPORT_LEVEL_ZERO_API}")
-if (GGML_SYCL_SUPPORT_LEVEL_ZERO_API)
-    # Link against Level Zero loader for direct device memory allocation.
-    # Avoids sycl::malloc_device triggering DMA-buf/TTM system RAM staging
-    # in the xe kernel driver during multi-GPU inference.
-    find_path(LEVEL_ZERO_INCLUDE_DIR level_zero/ze_api.h HINTS ${ONEAPI_ROOT}/include ${LEVEL_ZERO_V1_SDK_PATH}/include)
-    find_library(ZE_LOADER_LIB ze_loader HINTS ${ONEAPI_ROOT}/lib ${LEVEL_ZERO_V1_SDK_LIB_PATH} ENV LD_LIBRARY_PATH)
-    if(ZE_LOADER_LIB AND LEVEL_ZERO_INCLUDE_DIR)
-        target_link_libraries(ggml-sycl PRIVATE ${ZE_LOADER_LIB})
-        target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_SUPPORT_LEVEL_ZERO_API)
-        message(STATUS "Level Zero loader found: ${ZE_LOADER_LIB}")
-        message(STATUS "Level Zero headers found: ${LEVEL_ZERO_INCLUDE_DIR}")
-    else()
-        message(WARNING "Level Zero loader or headers not found, Level Zero support disabled")
-    endif()
+# Add profiling-friendly compiler flags for VTune kernel name visibility
+if (GGML_SYCL_PROFILING_DEBUG)
+    message(STATUS "GGML_SYCL_PROFILING_DEBUG: enabling SYCL profiling debug flags")
+    # -fsycl-instrument-device-code: enables profiling tools to map GPU activities to kernel function names
+    # -fdebug-info-for-profiling: generates debug info optimized for profilers (line tables, etc.)
+    # -gline-tables-only: required for accurate source attribution in VTune
+    # Per-kernel device code split improves VTune kernel name mapping when debug info is present.
+    target_compile_options(ggml-sycl PRIVATE "-Wno-narrowing" "-g" "-fsycl-device-code-split=per_kernel"
+                           "-fsycl-instrument-device-code" "-fdebug-info-for-profiling" "-gline-tables-only")
+    target_link_options(ggml-sycl PRIVATE "-fsycl-instrument-device-code")
+else()
+    target_compile_options(ggml-sycl PRIVATE "-Wno-narrowing")
 endif()
 
-# Link against oneDNN
+# Enable SPIR-V split barrier extension for cooperative ESIMD kernels on Arc GPUs
+# Split barriers allow non-blocking arrival + deferred wait, improving performance
+# over monolithic esimd::barrier() by overlapping compute with synchronization.
+# Required for: __spirv_ControlBarrierArriveINTEL / __spirv_ControlBarrierWaitINTEL
+# Note: Must specify both targets since we use -fsycl-targets=intel_gpu_bmg_g21,spir64
+target_link_options(ggml-sycl PRIVATE
+    "SHELL:-Xspirv-translator=intel_gpu_bmg_g21 -spirv-ext=+SPV_INTEL_split_barrier"
+    "SHELL:-Xspirv-translator=spir64 -spirv-ext=+SPV_INTEL_split_barrier")
+
+# Link against oneDNN (primary math backend for Intel targets)
 set(GGML_SYCL_DNNL 0)
-if(GGML_SYCL_DNN)
-    find_package(DNNL)
+set(GGML_SYCL_MKL_FALLBACK_ENABLED 0)
+
+# Deprecation warning for old GGML_SYCL_DNN flag
+if(DEFINED GGML_SYCL_DNN)
+    message(DEPRECATION "GGML_SYCL_DNN is deprecated. oneDNN is now the primary backend for Intel targets.")
+endif()
+
+# New option for MKL fallback
+option(GGML_SYCL_USE_MKL_FALLBACK "Enable oneMKL as optional fallback math backend" OFF)
+
+if (GGML_SYCL_TARGET STREQUAL "INTEL")
+    # oneDNN is REQUIRED for Intel targets (primary math backend)
+    find_package(DNNL REQUIRED)
     if(DNNL_FOUND)
         if (NOT DEFINED DNNL_GPU_VENDOR)
-            # default to intel target
             set(DNNL_GPU_VENDOR "INTEL")
-            if(NOT "${GGML_SYCL_TARGET}" STREQUAL "INTEL")
-                message(WARNING "oneDNN builds bundled with oneapi release only support INTEL target")
-            endif()
         endif()
 
-        # Verify oneDNN was compiled for the same target as llama
         if("${GGML_SYCL_TARGET}" STREQUAL "${DNNL_GPU_VENDOR}")
             target_link_libraries(ggml-sycl PRIVATE DNNL::dnnl)
             set(GGML_SYCL_DNNL 1)
             get_target_property(CONFIGS DNNL::dnnl IMPORTED_CONFIGURATIONS)
             foreach(CONFIG ${CONFIGS})
                 get_target_property(DNNL_LIB DNNL::dnnl IMPORTED_LOCATION_${CONFIG})
-                message(STATUS "Found oneDNN: ${DNNL_LIB}")
+                message(STATUS "Found oneDNN (primary): ${DNNL_LIB}")
             endforeach()
         else()
-            message(WARNING
-                "oneDNN must be compiled for the same target as llama.cpp.
-                 llama.cpp: ${GGML_SYCL_TARGET}, oneDNN: ${DNNL_GPU_VENDOR}.
-                 Disabling oneDNN support.")
+            message(FATAL_ERROR
+                "oneDNN must be compiled for INTEL target.
+                 llama.cpp: ${GGML_SYCL_TARGET}, oneDNN: ${DNNL_GPU_VENDOR}")
         endif()
+    endif()
+
+    # Link TBB when available. cpu-dispatch.cpp uses oneapi::tbb::parallel_for
+    # under a __has_include gate, so if the headers are visible at compile time
+    # the library must be visible at link time or BFD fails the shared-object
+    # link with undefined-reference errors on the tbb::detail::r1 runtime.
+    find_package(TBB QUIET)
+    if(TBB_FOUND)
+        target_link_libraries(ggml-sycl PRIVATE TBB::tbb)
+        message(STATUS "Found TBB for ggml-sycl CPU dispatch: ${TBB_DIR}")
+    endif()
+
+    # solve_tri.cpp calls oneMKL BLAS directly for batched TRSM, so Intel SYCL
+    # builds must link the SYCL BLAS component even when other math paths use oneDNN.
+    find_package(MKL REQUIRED)
+    target_link_libraries(ggml-sycl PRIVATE MKL::MKL_SYCL::BLAS)
+    set(GGML_SYCL_MKL_FALLBACK_ENABLED 1)
+    message(STATUS "Found oneMKL BLAS for SYCL solve_tri")
+else()
+    # For NVIDIA/AMD: oneDNN is optional (they use oneMath with cuBLAS/rocBLAS)
+    find_package(DNNL QUIET)
+    if(DNNL_FOUND)
+        if (NOT DEFINED DNNL_GPU_VENDOR)
+            set(DNNL_GPU_VENDOR "INTEL")
+        endif()
+        if("${GGML_SYCL_TARGET}" STREQUAL "${DNNL_GPU_VENDOR}")
+            target_link_libraries(ggml-sycl PRIVATE DNNL::dnnl)
+            set(GGML_SYCL_DNNL 1)
+            message(STATUS "Found oneDNN for ${GGML_SYCL_TARGET}")
+        endif()
+    endif()
+endif()
+
+# Enable SYCL queue profiling to activate L0 counter-based events.
+# The enable_profiling queue property is the SYCL API-correct way to request
+# profiling-capable event pools.  On the L0 backend this triggers counter-based
+# events (ZE_experimental_event_pool_counter_based) which use GPU hardware
+# counters instead of signal-based synchronization, eliminating CPU busy-wait
+# in oneDNN's after_exec_hook.  Result: ~15% TG improvement on Arc B580.
+# Users can also set UR_L0_USE_DRIVER_COUNTER_BASED_EVENTS=1 before launch.
+target_compile_definitions(ggml-sycl PRIVATE DPCT_PROFILING_ENABLED)
+
+target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_DNNL=${GGML_SYCL_DNNL})
+target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_MKL_FALLBACK=${GGML_SYCL_MKL_FALLBACK_ENABLED})
+if (GGML_SYCL_XMX_GEMM)
+    target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_XMX_GEMM)
+    message(STATUS "XMX GEMM enabled (experimental, known to be 5-11x slower for quantized models)")
+endif()
+
+# Link against oneCCL for tensor parallelism collective operations
+set(GGML_SYCL_CCL 0)
+option(GGML_SYCL_ONECCL "Enable oneCCL for tensor parallelism collectives" ON)
+if(GGML_SYCL_ONECCL)
+    find_package(oneCCL QUIET)
+    if(oneCCL_FOUND)
+        if (TARGET oneCCL)
+            target_link_libraries(ggml-sycl PRIVATE oneCCL)
+        elseif (TARGET ccl)
+            target_link_libraries(ggml-sycl PRIVATE ccl)
+        else()
+            message(FATAL_ERROR "oneCCL was found but neither imported target 'oneCCL' nor 'ccl' is available")
+        endif()
+        set(GGML_SYCL_CCL 1)
+        message(STATUS "Found oneCCL: enabled for tensor parallelism")
     else()
-        message(STATUS "oneDNN not found, disabling oneDNN support")
+        message(STATUS "oneCCL not found, tensor parallelism will use manual ALL_REDUCE")
     endif()
 else()
-    message(STATUS "oneDNN support disabled by the user")
+    message(STATUS "oneCCL support disabled by the user")
 endif()
-target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_DNNL=${GGML_SYCL_DNNL})
+target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_CCL=${GGML_SYCL_CCL})
 
 if (GGML_SYCL_F16)
+    if (GGML_SYCL_TARGET STREQUAL "AMD")
+        message(WARNING "AMD target does not entirely support FP16 in the SYCL backend.")
+    endif()
+    # The directory-scoped add_compile_definitions reaches ggml-sycl's own TUs
+    # (this CMakeLists builds the ggml-sycl backend library). The target-scoped
+    # PUBLIC definition on `ggml` propagates the flag to every consumer that
+    # links ggml — notably src/llama-graph.cpp, which needs it to cast Q at
+    # graph-build time via GGML_SYCL_FATTN_Q_TYPE (declared in ggml-sycl.h).
+    # Both are required: the first scope serves ggml-sycl code, the second
+    # scope serves llama code. They are not redundant.
     add_compile_definitions(GGML_SYCL_F16)
+    target_compile_definitions(ggml PUBLIC GGML_SYCL_F16)
 endif()
 
 if (GGML_SYCL_TARGET STREQUAL "INTEL")
-    add_compile_definitions(GGML_SYCL_WARP_SIZE=16)
-    if (NOT GGML_SYCL_DEVICE_ARCH)
-        target_link_options(ggml-sycl PRIVATE -Xs -ze-intel-greater-than-4GB-buffer-required)
-    else()
-        message(STATUS "Skipping -ze-intel-greater-than-4GB-buffer-required for spir64_gen AOT")
-    endif()
+    # Enable AOT for Battlemage (B580/G21) and JIT fallback (spir64)
+    # This prevents runtime JIT compilation overhead
+    target_compile_options(ggml-sycl PRIVATE "-fsycl-targets=intel_gpu_bmg_g21,spir64")
+    target_link_options(ggml-sycl PRIVATE "-fsycl-targets=intel_gpu_bmg_g21,spir64")
 
-    # Link against Intel oneMKL
-    if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-        set(SYCL_COMPILER ON)
-    endif()
-    find_package(MKL REQUIRED)
-    target_link_libraries(ggml-sycl PRIVATE MKL::MKL_SYCL::BLAS)
+    # Force WARP_SIZE=32 for Intel to match MMQ tile sizes (32) and fix division-by-zero
+    # issues in load_tiles_q4_0. Intel hardware supports subgroup size 32.
+    add_compile_definitions(GGML_SYCL_WARP_SIZE=32)
+    # Enable stateless addressing for >4GB device allocations (required for VRAM arena).
+    # Without this, kernels use 32-bit offsets and hang when reading beyond 4GB.
+    # See: https://github.com/intel/compute-runtime/blob/master/programmers-guide/ALLOCATIONS_GREATER_THAN_4GB.md
+    target_link_options(ggml-sycl PRIVATE  -Xs   "-cl-intel-greater-than-4GB-buffer-required")
+elseif (GGML_SYCL_TARGET STREQUAL "NVIDIA")
+    add_compile_definitions(GGML_SYCL_WARP_SIZE=32)
+elseif (GGML_SYCL_TARGET STREQUAL "AMD")
+    # INFO: Allowed Sub_group_sizes are not consistent through all
+    # hip targets. For example, 64 is used for certain models, but the backend
+    # does not support it.
+    # Target archs tested working: gfx1030, gfx1031, (Only tested sub_group_size = 32)
+    add_compile_definitions(GGML_SYCL_WARP_SIZE=32)
 else()
     # default for other target
-    message(FATAL_ERROR "GGML_SYCL_TARGET is not supported")
     add_compile_definitions(GGML_SYCL_WARP_SIZE=32)
 endif()
 
 if (GGML_SYCL_GRAPH)
-    message(STATUS "find GGML_SYCL_GRAPH")
     target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_GRAPH)
 endif()
 
-if (GGML_SYCL_HOST_MEM_FALLBACK)
-    message(STATUS "find GGML_SYCL_HOST_MEM_FALLBACK")
-    target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_HOST_MEM_FALLBACK)
+# Optional VTune ITT API profiling support
+option(GGML_SYCL_PROFILE "Enable VTune ITT API profiling instrumentation" OFF)
+if (GGML_SYCL_PROFILE)
+    # Find ITT library from oneAPI installation
+    if (DEFINED ENV{ONEAPI_ROOT})
+        set(ITT_ROOT "$ENV{ONEAPI_ROOT}/vtune/latest" CACHE PATH "Path to VTune installation")
+    else()
+        set(ITT_ROOT "/opt/intel/oneapi/vtune/latest" CACHE PATH "Path to VTune installation")
+    endif()
+
+    find_path(ITT_INCLUDE_DIR ittnotify.h
+        PATHS ${ITT_ROOT}/sdk/include ${ITT_ROOT}/include
+        NO_DEFAULT_PATH)
+    find_library(ITT_LIBRARY NAMES ittnotify
+        PATHS ${ITT_ROOT}/sdk/lib64 ${ITT_ROOT}/lib64
+        NO_DEFAULT_PATH)
+
+    if (ITT_INCLUDE_DIR AND ITT_LIBRARY)
+        target_include_directories(ggml-sycl PRIVATE ${ITT_INCLUDE_DIR})
+        target_link_libraries(ggml-sycl PRIVATE ${ITT_LIBRARY})
+        target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_PROFILE)
+        message(STATUS "VTune ITT profiling enabled: ${ITT_LIBRARY}")
+    else()
+        message(WARNING "VTune ITT library not found. Profiling disabled.
+            ITT_INCLUDE_DIR=${ITT_INCLUDE_DIR}
+            ITT_LIBRARY=${ITT_LIBRARY}
+            Set ITT_ROOT to your VTune installation path.")
+    endif()
+endif()
+
+# Link against oneMath for NVIDIA/AMD (Intel uses oneDNN as primary)
+if (GGML_SYCL_TARGET STREQUAL "INTEL")
+    # Intel uses oneDNN as primary math backend (configured above)
+    # MKL is only used if GGML_SYCL_USE_MKL_FALLBACK=ON
+    if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        set(SYCL_COMPILER ON)
+    endif()
+    if(GGML_SYCL_MKL_FALLBACK_ENABLED)
+        target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_USE_INTEL_ONEMKL)
+    endif()
+    message(STATUS "Intel SYCL backend: oneDNN primary, MKL fallback=${GGML_SYCL_MKL_FALLBACK_ENABLED}")
+
+else()
+    find_package(oneMath QUIET)
+    if (NOT oneMath_FOUND)
+        message(STATUS "oneMath not found: oneMath will be automatically downloaded")
+        # Use FetchContent to automatically pull and build oneMath
+        include(FetchContent)
+        set(BUILD_FUNCTIONAL_TESTS False)
+        set(BUILD_EXAMPLES False)
+        set(TARGET_DOMAINS blas)
+        if (GGML_SYCL_TARGET STREQUAL "NVIDIA")
+            set(ENABLE_MKLCPU_BACKEND False)
+            set(ENABLE_MKLGPU_BACKEND False)
+            set(ENABLE_CUBLAS_BACKEND True)
+        elseif (GGML_SYCL_TARGET STREQUAL "AMD")
+            set(ENABLE_MKLCPU_BACKEND False)
+            set(ENABLE_MKLGPU_BACKEND False)
+            set(ENABLE_ROCBLAS_BACKEND True)
+            # Ensure setting a string variable here is not overriden by oneMath CACHE variables
+            cmake_policy(SET CMP0126 NEW)
+            # Setting the device architecture is only needed and useful for AMD devices in oneMath
+            set(HIP_TARGETS ${GGML_SYCL_DEVICE_ARCH} CACHE STRING "oneMath HIP target" FORCE)
+        endif()
+        FetchContent_Declare(
+            ONEMATH
+            GIT_REPOSITORY https://github.com/uxlfoundation/oneMath.git
+            GIT_TAG 8efe85f5aaebb37f1d8c503b7af66315feabf142
+        )
+        FetchContent_MakeAvailable(ONEMATH)
+        # Create alias to match with find_package targets name
+        function(onemath_alias target)
+            if (TARGET ${target}_obj)
+                # Silence verbose warnings from external libraries
+                target_compile_options(${target}_obj PRIVATE -w)
+            endif()
+            if (TARGET ${target})
+                add_library(ONEMATH::${target} ALIAS ${target})
+            endif()
+        endfunction()
+        onemath_alias(onemath)
+        onemath_alias(onemath_blas_mklcpu)
+        onemath_alias(onemath_blas_mklgpu)
+        onemath_alias(onemath_blas_cublas)
+        onemath_alias(onemath_blas_rocblas)
+    endif()
+
+    # Below oneMath compile-time dispatching is used for better performance
+    if (GGML_SYCL_TARGET STREQUAL "NVIDIA")
+        target_link_libraries(ggml-sycl PRIVATE ONEMATH::onemath_blas_cublas)
+        target_compile_options(ggml-sycl PRIVATE "-fsycl-targets=nvptx64-nvidia-cuda")
+        target_link_options(ggml-sycl PRIVATE "-fsycl-targets=nvptx64-nvidia-cuda")
+        target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_NVIDIA)
+    elseif (GGML_SYCL_TARGET STREQUAL "AMD")
+        if (NOT GGML_SYCL_DEVICE_ARCH)
+            message(FATAL_ERROR "Can't enable SYCL hip backend, GGML_SYCL_DEVICE_ARCH has not been set.")
+        endif()
+        target_link_libraries(ggml-sycl PRIVATE ONEMATH::onemath_blas_rocblas)
+        target_compile_options(ggml-sycl PRIVATE "-fsycl-targets=amdgcn-amd-amdhsa")
+        target_link_options(ggml-sycl PRIVATE "-fsycl-targets=amdgcn-amd-amdhsa")
+        target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_AMD)
+    else()
+        # Fallback to oneMath runtime dispatcher
+        target_link_libraries(ggml-sycl PRIVATE ONEMATH::onemath)
+        target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_GENERIC)
+    endif()
 endif()
 
 if (GGML_SYCL_DEVICE_ARCH)
-    message(STATUS "GGML_SYCL_DEVICE_ARCH=${GGML_SYCL_DEVICE_ARCH} (AOT via spir64_gen)")
-    target_compile_options(
-        ggml-sycl PRIVATE
-        -fsycl-targets=spir64_gen
-        "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${GGML_SYCL_DEVICE_ARCH}\""
+    target_compile_options(ggml-sycl PRIVATE -Xsycl-target-backend --offload-arch=${GGML_SYCL_DEVICE_ARCH})
+    target_link_options(ggml-sycl PRIVATE -Xsycl-target-backend --offload-arch=${GGML_SYCL_DEVICE_ARCH})
+endif()
+
+# =============================================================================
+# XMX ESIMD Tests
+# =============================================================================
+option(GGML_SYCL_BUILD_XMX_TESTS "Build XMX ESIMD unit tests" OFF)
+
+if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
+    message(STATUS "Building XMX ESIMD unit tests")
+
+    # Common SYCL compile/link options for tests
+    set(XMX_TEST_SYCL_OPTIONS
+        "-fsycl"
+        "-fsycl-targets=intel_gpu_bmg_g21,spir64"
+        "-Wno-narrowing"
     )
-    target_link_options(
-        ggml-sycl PRIVATE
-        -fsycl-targets=spir64_gen
-        "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${GGML_SYCL_DEVICE_ARCH}\""
+
+    # Test 1: XMX Hardware Detection Tests
+    # This test is standalone and only needs xmx-esimd-common.hpp
+    add_executable(test-xmx-hardware-detect
+        tests/test-xmx-hardware-detect.cpp
     )
+    target_include_directories(test-xmx-hardware-detect PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    )
+    target_compile_options(test-xmx-hardware-detect PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_link_options(test-xmx-hardware-detect PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_compile_definitions(test-xmx-hardware-detect PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+        XMX_TEST_STANDALONE=1
+    )
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-xmx-hardware-detect PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+
+    # Test 2: XMX ESIMD Basic Operations Tests
+    # This test is standalone and only needs xmx-esimd-common.hpp
+    add_executable(test-xmx-esimd-basic
+        tests/test-xmx-esimd-basic.cpp
+    )
+    target_include_directories(test-xmx-esimd-basic PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    )
+    target_compile_options(test-xmx-esimd-basic PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_link_options(test-xmx-esimd-basic PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_compile_definitions(test-xmx-esimd-basic PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+        XMX_TEST_STANDALONE=1
+    )
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-xmx-esimd-basic PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+
+    # Test 3: XMX ESIMD Q8_0 GEMM Kernel Tests - DISABLED (API mismatch)
+    # Tests the ESIMD-based Q8_0 GEMM kernel with dynamic hardware detection
+    # add_executable(test-xmx-esimd-q8-gemm
+    #     tests/test-xmx-esimd-q8-gemm.cpp
+    # )
+    # target_include_directories(test-xmx-esimd-q8-gemm PRIVATE
+    #     ${CMAKE_CURRENT_SOURCE_DIR}
+    #     ${CMAKE_CURRENT_SOURCE_DIR}/..
+    #     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    # )
+    # target_compile_options(test-xmx-esimd-q8-gemm PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    # target_link_options(test-xmx-esimd-q8-gemm PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    # target_compile_definitions(test-xmx-esimd-q8-gemm PRIVATE
+    #     GGML_SYCL_WARP_SIZE=32
+    #     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    #     XMX_TEST_STANDALONE=1
+    # )
+    # if (IntelSYCL_FOUND)
+    #     target_link_libraries(test-xmx-esimd-q8-gemm PRIVATE IntelSYCL::SYCL_CXX)
+    # endif()
+
+    # Test 4: XMX DPAS Basic Infrastructure Tests (DISABLED - uses old XMXDpasConfig API)
+    # Superseded by unified-kernel.hpp joint_matrix approach
+    # TODO(llama.cpp-6hp): Update or remove when XMX kernel optimization resumes
+    # add_executable(test-xmx-dpas-basic
+    #     tests/test-xmx-dpas-basic.cpp
+    # )
+    # target_include_directories(test-xmx-dpas-basic PRIVATE
+    #     ${CMAKE_CURRENT_SOURCE_DIR}
+    #     ${CMAKE_CURRENT_SOURCE_DIR}/..
+    #     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    # )
+    # target_compile_options(test-xmx-dpas-basic PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    # target_link_options(test-xmx-dpas-basic PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    # target_compile_definitions(test-xmx-dpas-basic PRIVATE
+    #     GGML_SYCL_WARP_SIZE=32
+    #     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    #     XMX_TEST_STANDALONE=1
+    # )
+    # if (IntelSYCL_FOUND)
+    #     target_link_libraries(test-xmx-dpas-basic PRIVATE IntelSYCL::SYCL_CXX)
+    # endif()
+
+    # Test 5: XMX ESIMD Q4_0 GEMM Kernel Tests (DISABLED - uses old XMXDpasConfig API)
+    # Superseded by unified-kernel.hpp joint_matrix approach
+    # TODO(llama.cpp-6hp): Update or remove when XMX kernel optimization resumes
+    # add_executable(test-xmx-esimd-q4-gemm
+    #     tests/test-xmx-esimd-q4-gemm.cpp
+    # )
+    # target_include_directories(test-xmx-esimd-q4-gemm PRIVATE
+    #     ${CMAKE_CURRENT_SOURCE_DIR}
+    #     ${CMAKE_CURRENT_SOURCE_DIR}/..
+    #     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    # )
+    # target_compile_options(test-xmx-esimd-q4-gemm PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    # target_link_options(test-xmx-esimd-q4-gemm PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    # target_compile_definitions(test-xmx-esimd-q4-gemm PRIVATE
+    #     GGML_SYCL_WARP_SIZE=32
+    #     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    #     XMX_TEST_STANDALONE=1
+    # )
+    # if (IntelSYCL_FOUND)
+    #     target_link_libraries(test-xmx-esimd-q4-gemm PRIVATE IntelSYCL::SYCL_CXX)
+    # endif()
+
+    # Test 6: XMX MoE MXFP4 Fused Kernel Tests
+    # Tests the fused MXFP4 MoE GEMM kernel with E8M0 exponents and kvalues LUT
+    add_executable(test-xmx-moe-mxfp4
+        tests/test-xmx-moe-mxfp4.cpp
+    )
+    target_include_directories(test-xmx-moe-mxfp4 PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    )
+    target_compile_options(test-xmx-moe-mxfp4 PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_link_options(test-xmx-moe-mxfp4 PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_compile_definitions(test-xmx-moe-mxfp4 PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+        XMX_TEST_STANDALONE=1
+    )
+    target_link_libraries(test-xmx-moe-mxfp4 PRIVATE ggml-base ggml ggml-sycl)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-xmx-moe-mxfp4 PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+
+    # Register tests with CTest
+    include(CTest)
+    add_test(NAME xmx-hardware-detect COMMAND test-xmx-hardware-detect)
+    add_test(NAME xmx-esimd-basic COMMAND test-xmx-esimd-basic)
+    # add_test(NAME xmx-esimd-q8-gemm COMMAND test-xmx-esimd-q8-gemm)  # DISABLED
+    # add_test(NAME xmx-dpas-basic COMMAND test-xmx-dpas-basic)  # DISABLED - old API
+    # add_test(NAME xmx-esimd-q4-gemm COMMAND test-xmx-esimd-q4-gemm)  # DISABLED - old API
+    add_test(NAME xmx-moe-mxfp4 COMMAND test-xmx-moe-mxfp4)
+
+    # Test: MoE MXFP4 DP4A vs Scalar Correctness
+    # Verifies that DP4A-accelerated MXFP4 dot product matches scalar FP32 reference
+    # within Q8_1 quantization tolerance bounds
+    add_executable(test-moe-mxfp4-dp4a
+        tests/test-moe-mxfp4-dp4a.cpp
+    )
+    target_include_directories(test-moe-mxfp4-dp4a PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    )
+    target_compile_options(test-moe-mxfp4-dp4a PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_link_options(test-moe-mxfp4-dp4a PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_compile_definitions(test-moe-mxfp4-dp4a PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-moe-mxfp4-dp4a PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME moe-mxfp4-dp4a COMMAND test-moe-mxfp4-dp4a)
+
+    # Test: MXFP4 vectorized per-block dequant equivalence (Track A Task 1)
+    # Host-only: compares dequant_mxfp4_block_half8 to the scalar
+    # dequant_mxfp4_half byte-exact across 256 qs patterns x 8 exponents.
+    add_executable(test-mxfp4-vector-dequant
+        tests/test-mxfp4-vector-dequant.cpp
+    )
+    target_include_directories(test-mxfp4-vector-dequant PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    )
+    target_compile_options(test-mxfp4-vector-dequant PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_link_options(test-mxfp4-vector-dequant PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_compile_definitions(test-mxfp4-vector-dequant PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+        XMX_TEST_STANDALONE=1
+    )
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-mxfp4-vector-dequant PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME mxfp4-vector-dequant COMMAND test-mxfp4-vector-dequant)
+
+    # Set test properties
+    set_tests_properties(xmx-hardware-detect xmx-esimd-basic xmx-moe-mxfp4 moe-mxfp4-dp4a mxfp4-vector-dequant PROPERTIES
+        LABELS "sycl;xmx"
+        TIMEOUT 120
+    )
+
+    # MoE MXFP4 tests need longer timeout for large matrix tests
+    set_tests_properties(xmx-moe-mxfp4 PROPERTIES
+        TIMEOUT 300
+    )
+
+    # Test 7: MMQ XMX Dispatch Integration Tests
+    # Verifies dispatch logic, thresholds, and edge cases (empty batch, non-aligned dims)
+    add_executable(test-mmq-xmx-dispatch
+        tests/test-mmq-xmx-dispatch.cpp
+    )
+    target_include_directories(test-mmq-xmx-dispatch PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    )
+    target_compile_options(test-mmq-xmx-dispatch PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_link_options(test-mmq-xmx-dispatch PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_compile_definitions(test-mmq-xmx-dispatch PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+        XMX_TEST_STANDALONE=1
+    )
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-mmq-xmx-dispatch PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME mmq-xmx-dispatch COMMAND test-mmq-xmx-dispatch)
+    set_tests_properties(mmq-xmx-dispatch PROPERTIES
+        LABELS "sycl;xmx;dispatch"
+        TIMEOUT 120
+    )
+
+    # Test 8: Unified Kernel Tests
+    # Tests the unified matmul kernel architecture with Q4_0 support
+    add_executable(test-unified-kernel
+        tests/test-unified-kernel.cpp
+        unified-kernel.cpp
+    )
+    target_include_directories(test-unified-kernel PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    )
+    target_compile_options(test-unified-kernel PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_link_options(test-unified-kernel PRIVATE
+        ${XMX_TEST_SYCL_OPTIONS}
+        "SHELL:-Xspirv-translator=intel_gpu_bmg_g21 -spirv-ext=+SPV_INTEL_split_barrier"
+        "SHELL:-Xspirv-translator=spir64 -spirv-ext=+SPV_INTEL_split_barrier"
+    )
+    target_compile_definitions(test-unified-kernel PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+        UNIFIED_KERNEL_TEST_STANDALONE=1
+    )
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-unified-kernel PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME unified-kernel COMMAND test-unified-kernel)
+    set_tests_properties(unified-kernel PROPERTIES
+        LABELS "sycl;unified;matmul"
+        TIMEOUT 180
+    )
+
+    # Test 9: XMX Compute Path Tests
+    # Tests the XMX dpas compute path using joint_matrix extensions
+    add_executable(test-xmx-compute
+        tests/test-xmx-compute.cpp
+        unified-kernel.cpp
+    )
+    target_include_directories(test-xmx-compute PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    )
+    target_compile_options(test-xmx-compute PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_link_options(test-xmx-compute PRIVATE
+        ${XMX_TEST_SYCL_OPTIONS}
+        "SHELL:-Xspirv-translator=intel_gpu_bmg_g21 -spirv-ext=+SPV_INTEL_split_barrier"
+        "SHELL:-Xspirv-translator=spir64 -spirv-ext=+SPV_INTEL_split_barrier"
+    )
+    target_compile_definitions(test-xmx-compute PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+        UNIFIED_KERNEL_TEST_STANDALONE=1
+    )
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-xmx-compute PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME xmx-compute COMMAND test-xmx-compute)
+    set_tests_properties(xmx-compute PROPERTIES
+        LABELS "sycl;xmx;unified;matmul"
+        TIMEOUT 300
+    )
+
+    # Test 10: XMX Default Enable Tests
+    # Tests that XMX is enabled by default and uses XMXCapabilities
+    add_executable(test-xmx-default-enable
+        tests/test-xmx-default-enable.cpp
+        unified-kernel.cpp
+    )
+    target_include_directories(test-xmx-default-enable PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    )
+    target_compile_options(test-xmx-default-enable PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_link_options(test-xmx-default-enable PRIVATE
+        ${XMX_TEST_SYCL_OPTIONS}
+        "SHELL:-Xspirv-translator=intel_gpu_bmg_g21 -spirv-ext=+SPV_INTEL_split_barrier"
+        "SHELL:-Xspirv-translator=spir64 -spirv-ext=+SPV_INTEL_split_barrier"
+    )
+    target_compile_definitions(test-xmx-default-enable PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+        UNIFIED_KERNEL_TEST_STANDALONE=1
+    )
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-xmx-default-enable PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME xmx-default-enable COMMAND test-xmx-default-enable)
+    set_tests_properties(xmx-default-enable PROPERTIES
+        LABELS "sycl;xmx;unified;default"
+        TIMEOUT 120
+    )
+
+    # Test 11: XMX Optimization Tests (TDD)
+    # Tests double-buffering optimization for XMX kernel
+    add_executable(test-xmx-optimization
+        tests/test-xmx-optimization.cpp
+        unified-kernel.cpp
+    )
+    target_include_directories(test-xmx-optimization PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    )
+    target_compile_options(test-xmx-optimization PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_link_options(test-xmx-optimization PRIVATE
+        ${XMX_TEST_SYCL_OPTIONS}
+        "SHELL:-Xspirv-translator=intel_gpu_bmg_g21 -spirv-ext=+SPV_INTEL_split_barrier"
+        "SHELL:-Xspirv-translator=spir64 -spirv-ext=+SPV_INTEL_split_barrier"
+    )
+    target_compile_definitions(test-xmx-optimization PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+        UNIFIED_KERNEL_TEST_STANDALONE=1
+    )
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-xmx-optimization PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME xmx-optimization COMMAND test-xmx-optimization)
+    set_tests_properties(xmx-optimization PROPERTIES
+        LABELS "sycl;xmx;unified;optimization;tdd"
+        TIMEOUT 300
+    )
+
+    # Test 12: XMXConfig struct unit tests
+    # Tests hardware-queried dimensions for ESIMD dpas kernel configuration
+    add_executable(test-xmx-config
+        tests/test-xmx-config.cpp
+        unified-kernel.cpp
+    )
+    target_include_directories(test-xmx-config PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    )
+    target_compile_options(test-xmx-config PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_link_options(test-xmx-config PRIVATE
+        ${XMX_TEST_SYCL_OPTIONS}
+        "SHELL:-Xspirv-translator=intel_gpu_bmg_g21 -spirv-ext=+SPV_INTEL_split_barrier"
+        "SHELL:-Xspirv-translator=spir64 -spirv-ext=+SPV_INTEL_split_barrier"
+    )
+    target_compile_definitions(test-xmx-config PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-xmx-config PRIVATE ggml-sycl ggml-base ggml)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-xmx-config PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME xmx-config COMMAND test-xmx-config)
+    set_tests_properties(xmx-config PROPERTIES
+        LABELS "sycl;xmx;unified;config"
+        TIMEOUT 60
+    )
+
+    # Test 13: ESIMD Vectorized Dequantization Tests
+    # Tests vectorized Q4_0 and Q8_0 dequantization for ESIMD dpas kernels
+    add_executable(test-esimd-vectorized-dequant
+        tests/test-esimd-vectorized-dequant.cpp
+    )
+    target_include_directories(test-esimd-vectorized-dequant PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    )
+    target_compile_options(test-esimd-vectorized-dequant PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_link_options(test-esimd-vectorized-dequant PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_compile_definitions(test-esimd-vectorized-dequant PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+        XMX_TEST_STANDALONE=1
+    )
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-esimd-vectorized-dequant PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME esimd-vectorized-dequant COMMAND test-esimd-vectorized-dequant)
+    set_tests_properties(esimd-vectorized-dequant PROPERTIES
+        LABELS "sycl;xmx;esimd;dequant"
+        TIMEOUT 120
+    )
+
+    # Test 14: Kernel Dispatch Tests (Batch-Size Gating)
+    # Tests the ESIMD batch-size gating logic for intelligent dispatch
+    # NOTE: This is a pure CPU test - no GPU calls, just dispatch logic testing
+    add_executable(test-kernel-dispatch
+        tests/test-kernel-dispatch.cpp
+    )
+    target_include_directories(test-kernel-dispatch PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    )
+    # No SYCL compile/link options needed - this test is pure C++
+    target_compile_definitions(test-kernel-dispatch PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    add_test(NAME kernel-dispatch COMMAND test-kernel-dispatch)
+    set_tests_properties(kernel-dispatch PROPERTIES
+        LABELS "sycl;xmx;dispatch;gating"
+        TIMEOUT 60
+    )
+
+    # Test 15: Dispatch tuning mapping tests
+    # Verifies unified_matmul winners map to orchestrator entrypoint
+    add_executable(test-sycl-dispatch-tuning
+        tests/test-dispatch-tuning.cpp
+        dispatch-tuning.cpp
+    )
+    target_include_directories(test-sycl-dispatch-tuning PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    )
+    target_link_libraries(test-sycl-dispatch-tuning PRIVATE ggml)
+    add_test(NAME sycl-dispatch-tuning COMMAND test-sycl-dispatch-tuning)
+    set_tests_properties(sycl-dispatch-tuning PROPERTIES
+        LABELS "sycl;dispatch;tuning"
+        TIMEOUT 60
+    )
+
+    # Test 16: ESIMD SLM Prefetch Optimization Tests (Task llama.cpp-attk)
+    # Tests LSC prefetch with cache hints for memory/compute overlap
+    add_executable(test-esimd-prefetch
+        tests/test-esimd-prefetch.cpp
+        unified-kernel.cpp
+    )
+    target_include_directories(test-esimd-prefetch PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    )
+    target_compile_options(test-esimd-prefetch PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_link_options(test-esimd-prefetch PRIVATE
+        ${XMX_TEST_SYCL_OPTIONS}
+        "SHELL:-Xspirv-translator=intel_gpu_bmg_g21 -spirv-ext=+SPV_INTEL_split_barrier"
+        "SHELL:-Xspirv-translator=spir64 -spirv-ext=+SPV_INTEL_split_barrier"
+    )
+    target_compile_definitions(test-esimd-prefetch PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+        XMX_TEST_STANDALONE=1
+        UNIFIED_KERNEL_TEST_STANDALONE=1
+    )
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-esimd-prefetch PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME esimd-prefetch COMMAND test-esimd-prefetch)
+    set_tests_properties(esimd-prefetch PROPERTIES
+        LABELS "sycl;xmx;esimd;prefetch;lsc"
+        TIMEOUT 180
+    )
+
+    # Test 17: Unified Cache Fast Path Tests (TDD)
+    # Tests reader-writer lock optimization for cache hit fast path
+    add_executable(test-unified-cache-fast-path
+        tests/test-unified-cache-fast-path.cpp
+        unified-cache.cpp
+        pinned-pool.cpp
+    )
+    target_include_directories(test-unified-cache-fast-path PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    )
+    target_compile_options(test-unified-cache-fast-path PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_link_options(test-unified-cache-fast-path PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_compile_definitions(test-unified-cache-fast-path PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-unified-cache-fast-path PRIVATE ggml-base ggml)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-unified-cache-fast-path PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME unified-cache-fast-path COMMAND test-unified-cache-fast-path)
+    set_tests_properties(unified-cache-fast-path PROPERTIES
+        LABELS "sycl;cache;fast-path;tdd"
+        TIMEOUT 120
+    )
+
+    add_executable(test-unified-cache-bugs
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-unified-cache-bugs.cpp
+    )
+    target_include_directories(test-unified-cache-bugs PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
+    )
+    target_compile_options(test-unified-cache-bugs PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_link_options(test-unified-cache-bugs PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_compile_definitions(test-unified-cache-bugs PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-unified-cache-bugs PRIVATE ggml-base ggml ggml-sycl)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-unified-cache-bugs PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME unified-cache-bugs COMMAND test-unified-cache-bugs)
+    set_tests_properties(unified-cache-bugs PROPERTIES
+        LABELS "sycl;cache;bugfix;tdd"
+        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        TIMEOUT 180
+    )
+
+    # Test: unified-cache layout and multi-device placement choices
+    add_executable(test-sycl-layout-choice
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-layout-choice.cpp
+    )
+    target_include_directories(test-sycl-layout-choice PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
+    )
+    target_compile_options(test-sycl-layout-choice PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_link_options(test-sycl-layout-choice PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_compile_definitions(test-sycl-layout-choice PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-sycl-layout-choice PRIVATE ggml-base ggml ggml-sycl)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-sycl-layout-choice PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME sycl-layout-choice COMMAND test-sycl-layout-choice)
+    set_tests_properties(sycl-layout-choice PROPERTIES
+        LABELS "sycl;cache;layout;planner;tdd"
+        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        TIMEOUT 180
+    )
+
+    # Test: synthetic KV/view pointer resolution and handle publication
+    add_executable(test-sycl-kv-view-resolution
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-kv-view-resolution.cpp
+    )
+    target_include_directories(test-sycl-kv-view-resolution PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
+    )
+    target_compile_options(test-sycl-kv-view-resolution PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_link_options(test-sycl-kv-view-resolution PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_compile_definitions(test-sycl-kv-view-resolution PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-sycl-kv-view-resolution PRIVATE ggml-base ggml ggml-sycl)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-sycl-kv-view-resolution PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME sycl-kv-view-resolution COMMAND test-sycl-kv-view-resolution)
+    set_tests_properties(sycl-kv-view-resolution PROPERTIES
+        LABELS "sycl;kv;view;mem-handle;tdd"
+        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH};GGML_SYCL_TEST_KV_VIEW_RUNTIME=0"
+        TIMEOUT 120
+    )
+
+    # mem_handle eviction-lifecycle tests (RESEARCH-A4, llama.cpp-2jmzn)
+    # Verifies cache_generation bumps + entry removal across sync and async
+    # eviction paths. Companion to llama.cpp-goegc.1.
+    add_executable(test-mem-handle-eviction
+        tests/test-mem-handle-eviction.cpp
+        unified-cache.cpp
+        pinned-pool.cpp
+        mem-handle.cpp
+    )
+    target_include_directories(test-mem-handle-eviction PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    )
+    target_compile_options(test-mem-handle-eviction PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_link_options(test-mem-handle-eviction PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_compile_definitions(test-mem-handle-eviction PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-mem-handle-eviction PRIVATE ggml-base ggml)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-mem-handle-eviction PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME mem-handle-eviction COMMAND test-mem-handle-eviction)
+    set_tests_properties(mem-handle-eviction PROPERTIES
+        LABELS "sycl;cache;mem-handle;eviction;tdd"
+        TIMEOUT 120
+    )
+
+    # Test: mem_handle device identity and wrong-device resolution (llama.cpp-32dg8.15.11)
+    # Single-GPU: tests 1–4 run; multi-device tests skip gracefully.
+    add_executable(test-mem-handle-wrong-device
+        tests/test-mem-handle-wrong-device.cpp
+    )
+    target_include_directories(test-mem-handle-wrong-device PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
+    )
+    target_compile_definitions(test-mem-handle-wrong-device PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-mem-handle-wrong-device PRIVATE ggml-base ggml ggml-sycl)
+    add_test(NAME mem-handle-wrong-device COMMAND test-mem-handle-wrong-device)
+    set_tests_properties(mem-handle-wrong-device PROPERTIES
+        LABELS "sycl;cache;mem-handle;device-identity;tdd"
+        # setvars.sh puts compiler/lib before redist/lib on this workstation,
+        # but the backend-visible Level Zero devices are exposed via redist/lib.
+        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        TIMEOUT 120
+    )
+
+    # Test: canonical event-returning mem_handle memory operations (llama.cpp-32dg8.15.13)
+    add_executable(test-mem-ops
+        tests/test-mem-ops.cpp
+    )
+    target_include_directories(test-mem-ops PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
+    )
+    target_compile_definitions(test-mem-ops PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-mem-ops PRIVATE ggml-base ggml ggml-sycl)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-mem-ops PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME mem-ops COMMAND test-mem-ops)
+    set_tests_properties(mem-ops PROPERTIES
+        LABELS "sycl;cache;mem-handle;memory-ops;tdd"
+        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        TIMEOUT 120
+    )
+
+    # Test 18: UnifiedKernel Operation Tests (TDD)
+    # Tests RMS norm and SiLU mul operations for persistent kernel
+    add_executable(test-sycl-runtime-alloc
+        tests/test-unified-runtime-alloc.cpp
+        unified-cache.cpp
+        pinned-pool.cpp
+    )
+    target_include_directories(test-sycl-runtime-alloc PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    )
+    target_compile_options(test-sycl-runtime-alloc PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_link_options(test-sycl-runtime-alloc PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_compile_definitions(test-sycl-runtime-alloc PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-sycl-runtime-alloc PRIVATE ggml-base ggml)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-sycl-runtime-alloc PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME sycl-runtime-alloc COMMAND test-sycl-runtime-alloc)
+    set_tests_properties(sycl-runtime-alloc PROPERTIES
+        LABELS "sycl;allocator;runtime;tdd"
+        TIMEOUT 180
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:$ENV{LD_LIBRARY_PATH}"
+    )
+
+    # Test 18: UnifiedKernel Operation Tests (TDD)
+    # Tests RMS norm and SiLU mul operations for persistent kernel
+    add_executable(test-unified-kernel-ops
+        tests/test-unified-kernel-ops.cpp
+        unified-kernel.cpp
+    )
+    target_include_directories(test-unified-kernel-ops PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    )
+    target_compile_options(test-unified-kernel-ops PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_link_options(test-unified-kernel-ops PRIVATE
+        ${XMX_TEST_SYCL_OPTIONS}
+        "SHELL:-Xspirv-translator=intel_gpu_bmg_g21 -spirv-ext=+SPV_INTEL_split_barrier"
+        "SHELL:-Xspirv-translator=spir64 -spirv-ext=+SPV_INTEL_split_barrier"
+    )
+    target_compile_definitions(test-unified-kernel-ops PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+        UNIFIED_KERNEL_TEST_STANDALONE=1
+    )
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-unified-kernel-ops PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME unified-kernel-ops COMMAND test-unified-kernel-ops)
+    set_tests_properties(unified-kernel-ops PROPERTIES
+        LABELS "sycl;unified;ops;tdd"
+        TIMEOUT 180
+    )
+
+    # Test 19: UnifiedKernel Persistent Execution Integration Tests
+    # Tests the persistent plan-build-execute workflow
+    add_executable(test-unified-kernel-persistent
+        tests/test-unified-kernel-persistent.cpp
+        unified-kernel.cpp
+    )
+    target_include_directories(test-unified-kernel-persistent PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    )
+    target_compile_options(test-unified-kernel-persistent PRIVATE ${XMX_TEST_SYCL_OPTIONS})
+    target_link_options(test-unified-kernel-persistent PRIVATE
+        ${XMX_TEST_SYCL_OPTIONS}
+        "SHELL:-Xspirv-translator=intel_gpu_bmg_g21 -spirv-ext=+SPV_INTEL_split_barrier"
+        "SHELL:-Xspirv-translator=spir64 -spirv-ext=+SPV_INTEL_split_barrier"
+    )
+    target_compile_definitions(test-unified-kernel-persistent PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+        UNIFIED_KERNEL_TEST_STANDALONE=1
+    )
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-unified-kernel-persistent PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME unified-kernel-persistent COMMAND test-unified-kernel-persistent)
+    set_tests_properties(unified-kernel-persistent PROPERTIES
+        LABELS "sycl;unified;persistent;tdd"
+        TIMEOUT 300
+    )
+endif()
+
+set(RESIDENCY_TEST_SYCL_OPTIONS
+    "-fsycl"
+    "-Wno-narrowing"
+)
+foreach(_residency_test
+    test-sycl-mem-handle-lifetime
+    test-sycl-residency-reservation
+    test-sycl-descriptor-retention
+    test-sycl-moe-residency-preflight
+    test-sycl-residency-diagnostics
+    test-sycl-moe-fused-down-sum-policy
+    test-sycl-moe-token-major-metadata
+    test-sycl-moe-direct-final-token-major-bridge
+    test-sycl-moe-direct-final-scratch-plan
+    test-sycl-moe-same-expert-grouping
+    test-sycl-moe-glu-q8-artifact-policy
+    test-sycl-moe-glu-q8-fused-store-policy
+    test-sycl-moe-gateup-prepack-policy
+    test-sycl-moe-gateup-prepack-scratch
+    test-sycl-moe-xmx-tiled-single-layout-policy
+    test-sycl-moe-xmx-tiled-single-layout-planner
+    test-sycl-moe-xmx-tiled-materialization
+    test-sycl-moe-fusion-noactivation
+    test-sycl-moe-sequence-graphlet-policy
+)
+    add_executable(${_residency_test}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/${_residency_test}.cpp
+    )
+    target_include_directories(${_residency_test} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
+    )
+    target_compile_options(${_residency_test} PRIVATE ${RESIDENCY_TEST_SYCL_OPTIONS})
+    target_link_options(${_residency_test} PRIVATE ${RESIDENCY_TEST_SYCL_OPTIONS})
+    target_compile_definitions(${_residency_test} PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(${_residency_test} PRIVATE ggml-base ggml ggml-sycl)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(${_residency_test} PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME ${_residency_test} COMMAND ${_residency_test})
+    set_tests_properties(${_residency_test} PROPERTIES
+        LABELS "sycl;cache;residency;mem-handle;tdd"
+        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        TIMEOUT 120
+    )
+endforeach()
+
+add_executable(test-sycl-e2e-profile
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-e2e-profile.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/e2e-profile.cpp
+)
+target_include_directories(test-sycl-e2e-profile PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+add_test(NAME test-sycl-e2e-profile COMMAND test-sycl-e2e-profile)
+set_tests_properties(test-sycl-e2e-profile PROPERTIES
+    LABELS "sycl;profile;tdd"
+    TIMEOUT 120
+)
+
+add_executable(test-sycl-timeline
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-timeline.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/sycl-timeline.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/sycl-itt.cpp
+)
+target_include_directories(test-sycl-timeline PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+add_test(NAME test-sycl-timeline COMMAND test-sycl-timeline)
+set_tests_properties(test-sycl-timeline PROPERTIES
+    LABELS "sycl;profile;timeline;tdd"
+    TIMEOUT 120
+)
+
+add_executable(test-sycl-esimd-float-atomic-compile
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-esimd-float-atomic-compile.cpp
+)
+target_compile_options(test-sycl-esimd-float-atomic-compile PRIVATE -fsycl -Wno-narrowing)
+target_link_options(test-sycl-esimd-float-atomic-compile PRIVATE -fsycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-esimd-float-atomic-compile PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-esimd-float-atomic-compile COMMAND test-sycl-esimd-float-atomic-compile)
+set_tests_properties(test-sycl-esimd-float-atomic-compile PROPERTIES LABELS "sycl;esimd;compile;tdd" TIMEOUT 120)
+
+find_library(LEVEL_ZERO_LOADER ze_loader REQUIRED)
+add_executable(test-sycl-level-zero-vmem-feasibility
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-level-zero-vmem-feasibility.cpp
+)
+target_link_libraries(test-sycl-level-zero-vmem-feasibility PRIVATE ${LEVEL_ZERO_LOADER})
+add_test(NAME test-sycl-level-zero-vmem-feasibility COMMAND test-sycl-level-zero-vmem-feasibility)
+set_tests_properties(test-sycl-level-zero-vmem-feasibility PROPERTIES
+    LABELS "sycl;level-zero;vmem;tdd"
+    TIMEOUT 120
+)
+
+set(ONEDNN_MXFP4_FEASIBILITY_SYCL_OPTIONS
+    "-fsycl"
+    "-Wno-narrowing"
+)
+add_executable(test-sycl-onednn-mxfp4-feasibility
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-onednn-mxfp4-feasibility.cpp
+)
+target_include_directories(test-sycl-onednn-mxfp4-feasibility PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-onednn-mxfp4-feasibility PRIVATE ${ONEDNN_MXFP4_FEASIBILITY_SYCL_OPTIONS})
+target_link_options(test-sycl-onednn-mxfp4-feasibility PRIVATE ${ONEDNN_MXFP4_FEASIBILITY_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-onednn-mxfp4-feasibility PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+if (GGML_SYCL_DNNL)
+    target_link_libraries(test-sycl-onednn-mxfp4-feasibility PRIVATE DNNL::dnnl)
+endif()
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-onednn-mxfp4-feasibility PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-onednn-mxfp4-feasibility COMMAND test-sycl-onednn-mxfp4-feasibility)
+set_tests_properties(test-sycl-onednn-mxfp4-feasibility PROPERTIES
+    LABELS "sycl;onednn;mxfp4;tdd"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+# Standalone oneDNN vs SYCL kernel microbenchmark
+if (GGML_SYCL_DNNL)
+    add_executable(bench-dnnl-ops
+        tests/bench-dnnl-ops.cpp
+    )
+    target_include_directories(bench-dnnl-ops PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    )
+    target_compile_options(bench-dnnl-ops PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(bench-dnnl-ops PRIVATE "-fsycl")
+    target_compile_definitions(bench-dnnl-ops PRIVATE
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(bench-dnnl-ops PRIVATE DNNL::dnnl)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(bench-dnnl-ops PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
 endif()

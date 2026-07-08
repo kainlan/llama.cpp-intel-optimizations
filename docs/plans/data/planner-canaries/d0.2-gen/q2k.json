@@ -1,0 +1,18 @@
+{
+  "canary_id": "D0.2",
+  "result": "PASS",
+  "summary": "PP and TG produce identical op sets across tested models; single-shape reserve suffices",
+  "recommendation": "A3a can size from a single shape",
+  "evidence": {
+    "/Storage/GenAI/models/mistral-7b-v0.1.Q2_K.gguf:pp_ask_calls": "32",
+    "/Storage/GenAI/models/mistral-7b-v0.1.Q2_K.gguf:tg_ask_calls": "32",
+    "/Storage/GenAI/models/mistral-7b-v0.1.Q2_K.gguf:pp_ops_count": "13",
+    "/Storage/GenAI/models/mistral-7b-v0.1.Q2_K.gguf:tg_ops_count": "13",
+    "/Storage/GenAI/models/mistral-7b-v0.1.Q2_K.gguf:pp_ops": "ADD,CPY,FLASH_ATTN_EXT,GET_ROWS,GLU,MUL,MUL_MAT,PERMUTE,RESHAPE,RMS_NORM,ROPE,SET_ROWS,VIEW",
+    "/Storage/GenAI/models/mistral-7b-v0.1.Q2_K.gguf:tg_ops": "ADD,CPY,FLASH_ATTN_EXT,GET_ROWS,GLU,MUL,MUL_MAT,PERMUTE,RESHAPE,RMS_NORM,ROPE,SET_ROWS,VIEW",
+    "/Storage/GenAI/models/mistral-7b-v0.1.Q2_K.gguf:pp_only_ops": "",
+    "/Storage/GenAI/models/mistral-7b-v0.1.Q2_K.gguf:tg_only_ops": "",
+    "/Storage/GenAI/models/mistral-7b-v0.1.Q2_K.gguf:pp_decode_crash_sig": "6",
+    "/Storage/GenAI/models/mistral-7b-v0.1.Q2_K.gguf:tg_decode_crash_sig": "6"
+  }
+}

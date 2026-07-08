@@ -1,0 +1,887 @@
+// Unit tests for unified cache bug fixes (evict accounting, realloc failure handling, unaligned hash)
+//
+// Usage:
+//   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-unified-cache-bugs
+
+#include "ggml-backend.h"
+#include "ggml-sycl.h"
+#include "ggml-sycl/ggml-sycl-test.hpp"
+#include "ggml-sycl/unified-cache.hpp"
+#include "ggml.h"
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
+#include <sycl/sycl.hpp>
+#include <utility>
+#include <vector>
+
+#if !defined(GGML_USE_SYCL)
+int main() {
+    fprintf(stderr, "GGML_USE_SYCL not enabled; skipping test.\n");
+    return 0;
+}
+#else
+
+static bool test_evict_returns_bytes(sycl::queue & q) {
+    printf("\n=== Test: evict() returns bytes freed ===\n");
+
+    ggml_sycl::unified_cache cache(q, 4 * 1024);
+    std::vector<uint8_t>     data_a(512, 0x11);
+    std::vector<uint8_t>     data_b(512, 0x22);
+    ggml_sycl_cache_id       key_a = ggml_sycl::test_make_cache_id(data_a.data());
+    ggml_sycl_cache_id       key_b = ggml_sycl::test_make_cache_id(data_b.data());
+
+    bool   needs_fill = false;
+    void * ptr_a      = cache.ensure_cached_alloc(key_a, data_a.data(), data_a.size(), data_a.size(),
+                                                  ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS, false,
+                                                  &needs_fill);
+    void * ptr_b      = cache.ensure_cached_alloc(key_b, data_b.data(), data_b.size(), data_b.size(),
+                                                  ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS, false,
+                                                  &needs_fill);
+
+    if (!ptr_a || !ptr_b) {
+        fprintf(stderr, "Failed to allocate cache entries for evict test\n");
+        return false;
+    }
+
+    size_t freed = cache.evict(data_a.size());
+    if (freed == 0) {
+        fprintf(stderr, "evict() returned 0 bytes freed\n");
+        return false;
+    }
+
+    printf("evict() freed %zu bytes\n", freed);
+    return true;
+}
+
+static bool test_realloc_failure_keeps_entry(sycl::queue & q) {
+    printf("\n=== Test: realloc failure preserves existing entry ===\n");
+
+    const size_t             budget = 1ULL << 41;  // 2 TB budget to avoid budget gating
+    ggml_sycl::unified_cache cache(q, budget);
+
+    std::vector<uint8_t> data(256, 0x33);
+    ggml_sycl_cache_id   key       = ggml_sycl::test_make_cache_id(data.data());
+    const size_t         orig_size = data.size();
+
+    bool   needs_fill = false;
+    void * ptr =
+        cache.ensure_cached_alloc(key, data.data(), orig_size, orig_size, ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1,
+                                  -1, GGML_LAYOUT_AOS, false, &needs_fill);
+    if (!ptr) {
+        fprintf(stderr, "Failed to allocate initial cache entry\n");
+        return false;
+    }
+
+    const size_t used_before = cache.used();
+    const size_t huge_alloc  = 1ULL << 40;  // 1 TB, should fail on all current devices
+
+    void * realloc_ptr =
+        cache.ensure_cached_alloc(key, data.data(), orig_size, huge_alloc, ggml_sycl::cache_entry_type::DENSE_WEIGHT,
+                                  -1, -1, GGML_LAYOUT_AOS, false, &needs_fill);
+    if (realloc_ptr) {
+        fprintf(stderr, "Unexpectedly succeeded in huge realloc\n");
+        return false;
+    }
+
+    if (!cache.is_cached(key, GGML_LAYOUT_AOS)) {
+        fprintf(stderr, "Existing entry was dropped after realloc failure\n");
+        return false;
+    }
+
+    if (cache.used() != used_before) {
+        fprintf(stderr, "Cache used() changed after realloc failure (before=%zu after=%zu)\n", used_before,
+                cache.used());
+        return false;
+    }
+
+    return true;
+}
+
+static bool test_realloc_eviction_failure_keeps_entry(sycl::queue & q) {
+    printf("\n=== Test: realloc eviction failure preserves existing entry ===\n");
+
+    ggml_sycl::unified_cache cache(q, 1024);
+    std::vector<uint8_t>     data(512, 0x44);
+    ggml_sycl_cache_id       key = ggml_sycl::test_make_cache_id(data.data());
+
+    bool   needs_fill = false;
+    void * ptr =
+        cache.ensure_cached_alloc(key, data.data(), data.size(), data.size(), ggml_sycl::cache_entry_type::DENSE_WEIGHT,
+                                  -1, -1, GGML_LAYOUT_AOS, false, &needs_fill);
+    if (!ptr) {
+        fprintf(stderr, "Failed to allocate initial cache entry for eviction test\n");
+        return false;
+    }
+
+    cache.pin(key, GGML_LAYOUT_AOS);
+    const size_t used_before = cache.used();
+
+    void * realloc_ptr =
+        cache.ensure_cached_alloc(key, data.data(), data.size(), 2048, ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1,
+                                  -1, GGML_LAYOUT_AOS, false, &needs_fill);
+
+    if (realloc_ptr) {
+        fprintf(stderr, "Unexpectedly succeeded in realloc with eviction failure\n");
+        return false;
+    }
+
+    if (!cache.is_cached(key, GGML_LAYOUT_AOS)) {
+        fprintf(stderr, "Entry dropped after eviction failure during realloc\n");
+        return false;
+    }
+
+    if (cache.used() != used_before) {
+        fprintf(stderr, "Cache used() changed after eviction failure (before=%zu after=%zu)\n", used_before,
+                cache.used());
+        return false;
+    }
+
+    return true;
+}
+
+static bool test_direct_stage_weight_basic(sycl::queue & q) {
+    printf("\n=== Test: direct_stage_weight basic ===\n");
+
+    ggml_sycl::unified_cache cache(q, 4096);
+    std::vector<uint8_t>     data(128, 0xad);
+
+    ggml_sycl_cache_id key = ggml_sycl::test_make_cache_id(data.data());
+
+    auto result =
+        cache.direct_stage_weight(key, data.data(), data.size(), data.size(), GGML_LAYOUT_AOS, nullptr, nullptr, &q);
+    if (!result.ok || !result.ptr) {
+        fprintf(stderr, "direct_stage_weight failed\n");
+        return false;
+    }
+    result.event.wait();
+
+    const auto * entry = cache.lookup_weight(key);
+    if (!entry || !entry->ptr) {
+        fprintf(stderr, "lookup_weight failed after staging\n");
+        return false;
+    }
+    if (entry->size != data.size()) {
+        fprintf(stderr, "lookup_weight size mismatch (got %zu, expected %zu)\n", entry->size, data.size());
+        return false;
+    }
+
+    return true;
+}
+
+static bool test_direct_stage_expert_basic(sycl::queue & q) {
+    printf("\n=== Test: direct_stage_expert basic ===\n");
+
+    ggml_sycl::unified_cache cache(q, 4096);
+    std::vector<uint8_t>     data(128, 0xbe);
+
+    ggml_sycl_cache_id key = ggml_sycl::test_make_cache_id(data.data());
+    key.aux_id             = 42;  // expert_id
+
+    auto result =
+        cache.direct_stage_expert(key, data.data(), data.size(), data.size(), GGML_LAYOUT_AOS, nullptr, nullptr, &q);
+    if (!result.ok || !result.ptr) {
+        fprintf(stderr, "direct_stage_expert failed\n");
+        return false;
+    }
+    result.event.wait();
+
+    const auto * entry = cache.lookup_expert(key);
+    if (!entry || !entry->ptr) {
+        fprintf(stderr, "lookup_expert failed after staging\n");
+        return false;
+    }
+    if (!entry->handle) {
+        fprintf(stderr, "direct expert mirror did not retain a mem_handle lease\n");
+        return false;
+    }
+
+    return true;
+}
+
+static bool test_multi_layout_id_mapping_survives_drop(sycl::queue & q) {
+    printf("\n=== Test: multi-layout id mapping survives layout drop ===\n");
+
+    ggml_sycl::unified_cache cache(q, 64 * 1024);
+    std::vector<uint8_t>     data(128, 0x8d);
+
+    ggml_sycl_cache_id key = ggml_sycl::test_make_cache_id(data.data());
+    key.aux_id             = 17;
+
+    auto soa =
+        cache.direct_stage_expert(key, data.data(), data.size(), data.size(), GGML_LAYOUT_SOA, nullptr, nullptr, &q);
+    if (!soa.ok || !soa.ptr) {
+        fprintf(stderr, "direct_stage_expert failed for SOA layout\n");
+        return false;
+    }
+    soa.event.wait();
+
+    auto i8 = cache.direct_stage_expert(key, data.data(), data.size(), data.size(), GGML_LAYOUT_MXFP4_I8, nullptr,
+                                        nullptr, &q);
+    if (!i8.ok || !i8.ptr) {
+        fprintf(stderr, "direct_stage_expert failed for MXFP4_I8 layout\n");
+        return false;
+    }
+    i8.event.wait();
+
+    if (!cache.is_cached(key, GGML_LAYOUT_SOA) || !cache.is_cached(key, GGML_LAYOUT_MXFP4_I8)) {
+        fprintf(stderr, "Expected both SOA and MXFP4_I8 entries to be cached before drop\n");
+        return false;
+    }
+    if (!cache.lookup_device_only(key, GGML_LAYOUT_SOA) || !cache.lookup_device_only(key, GGML_LAYOUT_MXFP4_I8)) {
+        fprintf(stderr, "Expected exact-layout device lookups for both cached layouts\n");
+        return false;
+    }
+    if (!cache.validate()) {
+        fprintf(stderr, "Cache validation rejected valid multi-layout entries before drop\n");
+        return false;
+    }
+
+    const size_t dropped_i8 =
+        cache.drop_expert_entries_for_tensor_layout({ key }, GGML_LAYOUT_MXFP4_I8, "unit-test-drop-i8");
+    if (dropped_i8 != 1) {
+        fprintf(stderr, "Expected to drop one MXFP4_I8 entry, dropped %zu\n", dropped_i8);
+        return false;
+    }
+    if (!cache.is_cached_any(key) || !cache.is_cached(key, GGML_LAYOUT_SOA) ||
+        !cache.lookup_device_only(key, GGML_LAYOUT_SOA) || cache.is_cached(key, GGML_LAYOUT_MXFP4_I8)) {
+        fprintf(stderr, "SOA entry was not preserved after dropping mapped MXFP4_I8 entry\n");
+        return false;
+    }
+    if (!cache.validate()) {
+        fprintf(stderr, "Cache validation rejected SOA survivor after MXFP4_I8 drop\n");
+        return false;
+    }
+
+    i8 = cache.direct_stage_expert(key, data.data(), data.size(), data.size(), GGML_LAYOUT_MXFP4_I8, nullptr, nullptr,
+                                   &q);
+    if (!i8.ok || !i8.ptr) {
+        fprintf(stderr, "direct_stage_expert failed restaging MXFP4_I8 layout\n");
+        return false;
+    }
+    i8.event.wait();
+
+    const size_t dropped_soa =
+        cache.drop_expert_entries_for_tensor_layout({ key }, GGML_LAYOUT_SOA, "unit-test-drop-soa");
+    if (dropped_soa != 1) {
+        fprintf(stderr, "Expected to drop one SOA entry, dropped %zu\n", dropped_soa);
+        return false;
+    }
+    if (!cache.is_cached_any(key) || !cache.is_cached(key, GGML_LAYOUT_MXFP4_I8) ||
+        !cache.lookup_device_only(key, GGML_LAYOUT_MXFP4_I8) || cache.is_cached(key, GGML_LAYOUT_SOA)) {
+        fprintf(stderr, "MXFP4_I8 entry was not preserved after dropping SOA alternate\n");
+        return false;
+    }
+    if (!cache.validate()) {
+        fprintf(stderr, "Cache validation rejected MXFP4_I8 survivor after SOA drop\n");
+        return false;
+    }
+
+    return true;
+}
+
+static bool test_planned_materialization_guard(sycl::queue & q) {
+    printf("\n=== Test: planned materialization guard ===\n");
+
+    ggml_sycl::unified_cache  cache(q, 4096);
+    ggml_sycl::placement_plan plan{};
+    plan.build_index();
+    cache.set_placement_plan(std::move(plan));
+
+    std::vector<uint8_t> data(128, 0xcd);
+    ggml_sycl_cache_id   key = ggml_sycl::test_make_cache_id(data.data());
+
+    auto rejected =
+        cache.direct_stage_weight(key, data.data(), data.size(), data.size(), GGML_LAYOUT_AOS, nullptr, nullptr, &q);
+    if (rejected.ok || rejected.ptr || cache.lookup_weight(key) != nullptr) {
+        fprintf(stderr, "direct_stage_weight mutated planned cache without materialization token\n");
+        return false;
+    }
+
+    if (cache.planned_materialization_active()) {
+        fprintf(stderr, "planned materialization unexpectedly active before scope\n");
+        return false;
+    }
+
+    std::vector<uint8_t> host_data(64, 0xef);
+    ggml_sycl_cache_id   host_key = ggml_sycl::test_make_cache_id(host_data.data());
+    host_key.aux_id               = 7;
+
+    cache.register_host_expert(host_key, host_data.data(), host_data.size(), GGML_LAYOUT_AOS);
+    if (cache.lookup_expert(host_key) != nullptr) {
+        fprintf(stderr, "register_host_expert mutated planned cache without materialization token\n");
+        return false;
+    }
+
+    {
+        ggml_sycl::scoped_planned_materialization materialize(&cache, "unit-test-host");
+        if (!cache.planned_materialization_active()) {
+            fprintf(stderr, "planned materialization not active inside scope\n");
+            return false;
+        }
+        cache.register_host_expert(host_key, host_data.data(), host_data.size(), GGML_LAYOUT_AOS);
+    }
+
+    if (cache.planned_materialization_active()) {
+        fprintf(stderr, "planned materialization unexpectedly active after scope\n");
+        return false;
+    }
+
+    if (cache.lookup_expert(host_key) == nullptr) {
+        fprintf(stderr, "register_host_expert failed under materialization token\n");
+        return false;
+    }
+    if (!cache.lookup_expert(host_key)->handle) {
+        fprintf(stderr, "host expert mirror did not retain a mem_handle lease\n");
+        return false;
+    }
+
+    return true;
+}
+
+static bool alloc_tensor_buffer(ggml_backend_buffer_type_t           buft,
+                                ggml_tensor *                        tensor,
+                                ggml_backend_buffer_usage            usage,
+                                std::vector<ggml_backend_buffer_t> & buffers) {
+    if (tensor->view_src) {
+        return ggml_backend_view_init(tensor) == GGML_STATUS_SUCCESS;
+    }
+    const size_t          size   = ggml_backend_buft_get_alloc_size(buft, tensor);
+    ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, size);
+    if (!buffer) {
+        return false;
+    }
+    ggml_backend_buffer_set_usage(buffer, usage);
+    ggml_backend_tensor_alloc(buffer, tensor, ggml_backend_buffer_get_base(buffer));
+    buffers.push_back(buffer);
+    return true;
+}
+
+static bool test_graph_pins_host_weights() {
+    printf("\n=== Test: graph pins host MoE weights ===\n");
+
+#    if !defined(GGML_SYCL_GRAPH)
+    printf("SKIP: GGML_SYCL_GRAPH not enabled\n");
+    return true;
+#    else
+    const char * run_graph_test = std::getenv("GGML_SYCL_TEST_UNIFIED_CACHE_GRAPH");
+    if (!run_graph_test || std::atoi(run_graph_test) == 0) {
+        printf("SKIP: set GGML_SYCL_TEST_UNIFIED_CACHE_GRAPH=1 to run graph/BCS host-weight pinning test\n");
+        return true;
+    }
+
+    setenv("GGML_SYCL_DISABLE_GRAPH", "0", 1);
+
+    ggml_backend_t sycl_backend = ggml_backend_sycl_init(0);
+    if (!sycl_backend) {
+        printf("SKIP: Could not initialize SYCL backend\n");
+        return true;
+    }
+
+    if (!ggml_sycl::test_backend_supports_graphs(sycl_backend)) {
+        printf("SKIP: SYCL graphs not supported on this device\n");
+        ggml_backend_free(sycl_backend);
+        return true;
+    }
+
+    if (ggml_sycl::test_backend_graphs_disabled(sycl_backend)) {
+        printf("SKIP: SYCL graphs disabled in backend\n");
+        ggml_backend_free(sycl_backend);
+        return true;
+    }
+
+    const ggml_init_params params = {
+        64 * 1024 * 1024,
+        nullptr,
+        true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        ggml_backend_free(sycl_backend);
+        return false;
+    }
+
+    const int vocab     = 64;
+    const int n_embd    = 256;
+    const int n_tokens  = 4;
+    const int n_used    = 4;
+    const int n_experts = 8;
+    const int out_dim   = 128;
+
+    ggml_tensor * tok_embd = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, vocab);
+    ggml_set_name(tok_embd, "tok_embd.weight");
+    ggml_tensor * token_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(token_ids, "token_ids");
+    ggml_tensor * embd = ggml_get_rows(ctx, tok_embd, token_ids);
+    ggml_set_name(embd, "embd");
+    ggml_tensor * norm = ggml_rms_norm(ctx, embd, 1e-5f);
+    ggml_set_name(norm, "rms_norm");
+    ggml_tensor * norm3d = ggml_reshape_3d(ctx, norm, n_embd, 1, n_tokens);
+    ggml_set_name(norm3d, "rms_norm_3d");
+    ggml_tensor * moe_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
+    ggml_set_name(moe_ids, "moe_ids");
+    ggml_tensor * moe_w = ggml_new_tensor_3d(ctx, GGML_TYPE_Q8_0, n_embd, out_dim, n_experts);
+    ggml_set_name(moe_w, "moe_weights");
+    ggml_tensor * moe_out = ggml_mul_mat_id(ctx, moe_w, norm3d, moe_ids);
+    ggml_set_name(moe_out, "moe_out");
+
+    ggml_tensor * add1  = ggml_add(ctx, moe_out, moe_out);
+    ggml_tensor * add2  = ggml_add(ctx, add1, moe_out);
+    ggml_tensor * scale = ggml_scale(ctx, add2, 0.5f);
+    ggml_tensor * silu  = ggml_silu(ctx, scale);
+    ggml_tensor * add3  = ggml_add(ctx, silu, scale);
+    ggml_tensor * out   = ggml_cont(ctx, add3);
+
+    ggml_backend_buffer_type_t dev_buft  = ggml_backend_get_default_buffer_type(sycl_backend);
+    ggml_backend_buffer_type_t host_buft = ggml_backend_sycl_host_buffer_type();
+
+    std::vector<ggml_backend_buffer_t> buffers;
+    if (!alloc_tensor_buffer(host_buft, tok_embd, GGML_BACKEND_BUFFER_USAGE_WEIGHTS, buffers) ||
+        !alloc_tensor_buffer(dev_buft, token_ids, GGML_BACKEND_BUFFER_USAGE_COMPUTE, buffers) ||
+        !alloc_tensor_buffer(dev_buft, embd, GGML_BACKEND_BUFFER_USAGE_COMPUTE, buffers) ||
+        !alloc_tensor_buffer(dev_buft, norm, GGML_BACKEND_BUFFER_USAGE_COMPUTE, buffers) ||
+        !alloc_tensor_buffer(dev_buft, norm3d, GGML_BACKEND_BUFFER_USAGE_COMPUTE, buffers) ||
+        !alloc_tensor_buffer(dev_buft, moe_ids, GGML_BACKEND_BUFFER_USAGE_COMPUTE, buffers) ||
+        !alloc_tensor_buffer(host_buft, moe_w, GGML_BACKEND_BUFFER_USAGE_WEIGHTS, buffers) ||
+        !alloc_tensor_buffer(dev_buft, moe_out, GGML_BACKEND_BUFFER_USAGE_COMPUTE, buffers) ||
+        !alloc_tensor_buffer(dev_buft, add1, GGML_BACKEND_BUFFER_USAGE_COMPUTE, buffers) ||
+        !alloc_tensor_buffer(dev_buft, add2, GGML_BACKEND_BUFFER_USAGE_COMPUTE, buffers) ||
+        !alloc_tensor_buffer(dev_buft, scale, GGML_BACKEND_BUFFER_USAGE_COMPUTE, buffers) ||
+        !alloc_tensor_buffer(dev_buft, silu, GGML_BACKEND_BUFFER_USAGE_COMPUTE, buffers) ||
+        !alloc_tensor_buffer(dev_buft, add3, GGML_BACKEND_BUFFER_USAGE_COMPUTE, buffers) ||
+        !alloc_tensor_buffer(dev_buft, out, GGML_BACKEND_BUFFER_USAGE_COMPUTE, buffers)) {
+        for (ggml_backend_buffer_t buf : buffers) {
+            ggml_backend_buffer_free(buf);
+        }
+        ggml_free(ctx);
+        ggml_backend_free(sycl_backend);
+        return false;
+    }
+
+    ggml_backend_dev_t dev = ggml_backend_get_device(sycl_backend);
+    if (dev) {
+        ggml_backend_sycl_register_host_weight_tensor(dev, tok_embd);
+        ggml_backend_sycl_register_host_weight_tensor(dev, moe_w);
+    }
+
+    std::vector<float>   tok_embd_data(static_cast<size_t>(vocab) * n_embd, 0.25f);
+    std::vector<int32_t> token_ids_data(n_tokens);
+    for (int i = 0; i < n_tokens; ++i) {
+        token_ids_data[i] = i % vocab;
+    }
+    std::vector<int32_t> moe_ids_data(static_cast<size_t>(n_used) * n_tokens);
+    for (int t = 0; t < n_tokens; ++t) {
+        for (int i = 0; i < n_used; ++i) {
+            moe_ids_data[t * n_used + i] = (t + i) % n_experts;
+        }
+    }
+    std::vector<uint8_t> moe_w_data(ggml_nbytes(moe_w), 0x11);
+
+    ggml_backend_tensor_set(tok_embd, tok_embd_data.data(), 0, tok_embd_data.size() * sizeof(float));
+    ggml_backend_tensor_set(token_ids, token_ids_data.data(), 0, token_ids_data.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(moe_ids, moe_ids_data.data(), 0, moe_ids_data.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(moe_w, moe_w_data.data(), 0, moe_w_data.size());
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, out);
+
+    ggml_status status = ggml_backend_graph_compute(sycl_backend, graph);
+    if (status != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "FAIL: graph compute failed\n");
+        for (ggml_backend_buffer_t buf : buffers) {
+            ggml_backend_buffer_free(buf);
+        }
+        ggml_free(ctx);
+        ggml_backend_free(sycl_backend);
+        return false;
+    }
+
+    const size_t pinned = ggml_sycl::test_graph_pinned_entry_count(sycl_backend);
+    if (pinned == 0) {
+        fprintf(stderr, "FAIL: graph pinned entries empty (expected > 0)\n");
+        for (ggml_backend_buffer_t buf : buffers) {
+            ggml_backend_buffer_free(buf);
+        }
+        ggml_free(ctx);
+        ggml_backend_free(sycl_backend);
+        return false;
+    }
+
+    for (ggml_backend_buffer_t buf : buffers) {
+        ggml_backend_buffer_free(buf);
+    }
+    ggml_free(ctx);
+    ggml_backend_free(sycl_backend);
+    return true;
+#    endif
+}
+
+class stream_dma_noop_kernel;
+
+static sycl::event stream_dma_noop(sycl::queue & q,
+                                   void *,
+                                   size_t,
+                                   size_t,
+                                   const void *,
+                                   const std::vector<sycl::event> & deps) {
+    return q.submit([&](sycl::handler & cgh) {
+        cgh.depends_on(deps);
+        cgh.single_task<stream_dma_noop_kernel>([]() {});
+    });
+}
+
+static bool test_stream_dma_mmap_fail(sycl::queue & q) {
+    printf("\n=== Test: stream_dma mmap failure flag ===\n");
+
+    ggml_sycl::unified_cache cache(q, 1024 * 1024);
+    std::vector<uint8_t>     data(256, 0x5a);
+
+    ggml_sycl::cache_ptr_view view{};
+    view.ptr      = data.data();
+    view.size     = data.size();
+    view.layout   = GGML_LAYOUT_AOS;
+    view.type     = ggml_sycl::cache_entry_type::DENSE_WEIGHT;
+    view.location = ggml_sycl::cache_location::HOST_MMAP;
+
+    setenv("GGML_SYCL_TEST_DMA_FAIL", "1", 1);
+    auto result = cache.stream_dma(view, data.size(), 64, 1, stream_dma_noop, nullptr, {});
+    unsetenv("GGML_SYCL_TEST_DMA_FAIL");
+
+    if (result.ok) {
+        fprintf(stderr, "Expected DMA failure but result.ok was true\n");
+        return false;
+    }
+    if (!result.used_mmap_direct || !result.mmap_direct_failed) {
+        fprintf(stderr, "Expected mmap failure flags (used=%d failed=%d)\n", result.used_mmap_direct ? 1 : 0,
+                result.mmap_direct_failed ? 1 : 0);
+        return false;
+    }
+
+    return true;
+}
+
+static bool test_all_pinned_eviction_failure_new_entry(sycl::queue & q) {
+    printf("\n=== Test: all-pinned eviction failure on new entry ===\n");
+
+    ggml_sycl::unified_cache cache(q, 1024);
+    std::vector<uint8_t>     data_a(512, 0x55);
+    std::vector<uint8_t>     data_b(512, 0x66);
+    std::vector<uint8_t>     data_c(512, 0x77);
+
+    bool   needs_fill = false;
+    void * ptr_a = cache.ensure_cached_alloc(ggml_sycl::test_make_cache_id(data_a.data()), data_a.data(), data_a.size(),
+                                             data_a.size(), ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1,
+                                             GGML_LAYOUT_AOS, false, &needs_fill);
+    void * ptr_b = cache.ensure_cached_alloc(ggml_sycl::test_make_cache_id(data_b.data()), data_b.data(), data_b.size(),
+                                             data_b.size(), ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1,
+                                             GGML_LAYOUT_AOS, false, &needs_fill);
+
+    if (!ptr_a || !ptr_b) {
+        fprintf(stderr, "Failed to allocate pinned entries for eviction test\n");
+        return false;
+    }
+
+    cache.pin(ggml_sycl::test_make_cache_id(data_a.data()), GGML_LAYOUT_AOS);
+    cache.pin(ggml_sycl::test_make_cache_id(data_b.data()), GGML_LAYOUT_AOS);
+    const size_t used_before = cache.used();
+
+    void * ptr_c = cache.ensure_cached_alloc(ggml_sycl::test_make_cache_id(data_c.data()), data_c.data(), data_c.size(),
+                                             data_c.size(), ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1,
+                                             GGML_LAYOUT_AOS, false, &needs_fill);
+
+    if (ptr_c) {
+        fprintf(stderr, "Unexpectedly succeeded allocating with all entries pinned\n");
+        return false;
+    }
+
+    if (!cache.is_cached(ggml_sycl::test_make_cache_id(data_a.data()), GGML_LAYOUT_AOS) ||
+        !cache.is_cached(ggml_sycl::test_make_cache_id(data_b.data()), GGML_LAYOUT_AOS)) {
+        fprintf(stderr, "Pinned entries were evicted unexpectedly\n");
+        return false;
+    }
+
+    if (cache.used() != used_before) {
+        fprintf(stderr, "Cache used() changed after all-pinned eviction failure (before=%zu after=%zu)\n", used_before,
+                cache.used());
+        return false;
+    }
+
+    return true;
+}
+
+static bool test_partial_eviction_insufficient(sycl::queue & q) {
+    printf("\n=== Test: partial eviction insufficient for new entry ===\n");
+
+    ggml_sycl::unified_cache cache(q, 1024);
+    std::vector<uint8_t>     data_a(512, 0x88);
+    std::vector<uint8_t>     data_b(512, 0x99);
+    std::vector<uint8_t>     data_c(1024, 0xaa);
+
+    bool   needs_fill = false;
+    void * ptr_a = cache.ensure_cached_alloc(ggml_sycl::test_make_cache_id(data_a.data()), data_a.data(), data_a.size(),
+                                             data_a.size(), ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1,
+                                             GGML_LAYOUT_AOS, false, &needs_fill);
+    void * ptr_b = cache.ensure_cached_alloc(ggml_sycl::test_make_cache_id(data_b.data()), data_b.data(), data_b.size(),
+                                             data_b.size(), ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1,
+                                             GGML_LAYOUT_AOS, false, &needs_fill);
+
+    if (!ptr_a || !ptr_b) {
+        fprintf(stderr, "Failed to allocate initial entries for partial eviction test\n");
+        return false;
+    }
+
+    cache.pin(ggml_sycl::test_make_cache_id(data_a.data()), GGML_LAYOUT_AOS);
+    const size_t used_before = cache.used();
+
+    void * ptr_c = cache.ensure_cached_alloc(ggml_sycl::test_make_cache_id(data_c.data()), data_c.data(), data_c.size(),
+                                             data_c.size(), ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1,
+                                             GGML_LAYOUT_AOS, false, &needs_fill);
+
+    if (ptr_c) {
+        fprintf(stderr, "Unexpectedly succeeded allocating with insufficient eviction\n");
+        return false;
+    }
+
+    if (!cache.is_cached(ggml_sycl::test_make_cache_id(data_a.data()), GGML_LAYOUT_AOS)) {
+        fprintf(stderr, "Pinned entry was evicted during partial eviction test\n");
+        return false;
+    }
+
+    // Eviction is deferred; drain the queue and process deferred frees before checking accounting.
+    q.wait();
+    cache.evict(0);
+
+    if (cache.used() >= used_before) {
+        fprintf(stderr, "Cache used() did not drop after partial eviction (before=%zu after=%zu)\n", used_before,
+                cache.used());
+        return false;
+    }
+
+    return true;
+}
+
+static bool test_allocation_failure_new_entry(sycl::queue & q) {
+    printf("\n=== Test: allocation failure on new entry ===\n");
+
+    const size_t             budget = std::numeric_limits<size_t>::max() / 2;
+    ggml_sycl::unified_cache cache(q, budget);
+
+    std::vector<uint8_t> data(256, 0xbb);
+    const size_t         huge_alloc = 1ULL << 40;
+
+    bool   needs_fill = false;
+    void * ptr        = cache.ensure_cached_alloc(ggml_sycl::test_make_cache_id(data.data()), data.data(), data.size(),
+                                                  huge_alloc, ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1,
+                                                  GGML_LAYOUT_AOS, false, &needs_fill);
+
+    if (ptr) {
+        fprintf(stderr, "Unexpectedly succeeded allocating huge entry\n");
+        return false;
+    }
+
+    if (cache.is_cached(ggml_sycl::test_make_cache_id(data.data()), GGML_LAYOUT_AOS)) {
+        fprintf(stderr, "Cache entry created despite allocation failure\n");
+        return false;
+    }
+
+    if (cache.used() != 0) {
+        fprintf(stderr, "Cache used() changed after allocation failure (used=%zu)\n", cache.used());
+        return false;
+    }
+
+    return true;
+}
+
+static bool test_deferred_free_stress(sycl::queue & q) {
+    printf("\n=== Test: deferred free stress ===\n");
+
+    ggml_sycl::unified_cache          cache(q, 64 * 1024);
+    std::vector<std::vector<uint8_t>> payloads(32, std::vector<uint8_t>(512, 0xcc));
+
+    bool needs_fill = false;
+    for (auto & payload : payloads) {
+        void * ptr = cache.ensure_cached_alloc(
+            ggml_sycl::test_make_cache_id(payload.data()), payload.data(), payload.size(), payload.size(),
+            ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS, false, &needs_fill);
+        if (!ptr) {
+            fprintf(stderr, "Failed to allocate entry during deferred free stress\n");
+            return false;
+        }
+    }
+
+    for (auto & payload : payloads) {
+        cache.remove(ggml_sycl::test_make_cache_id(payload.data()), ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1,
+                     GGML_LAYOUT_AOS);
+    }
+
+    q.wait();
+    cache.evict(0);
+
+    if (cache.used() != 0 || cache.dense_count() != 0) {
+        fprintf(stderr, "Cache not fully freed after deferred free stress (used=%zu count=%zu)\n", cache.used(),
+                cache.dense_count());
+        return false;
+    }
+
+    return true;
+}
+
+static bool test_unaligned_hash(sycl::queue & q) {
+    printf("\n=== Test: unaligned hash input ===\n");
+
+    ggml_sycl::unified_cache cache(q, 2 * 1024 * 1024);
+
+    std::vector<uint8_t> raw(129, 0x5a);
+    uint8_t *            misaligned = raw.data() + 1;
+    const size_t         size       = 127;
+
+    void * ptr = cache.ensure_cached(ggml_sycl::test_make_cache_id(misaligned), misaligned, size,
+                                     ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS, true);
+
+    if (!ptr) {
+        fprintf(stderr, "ensure_cached failed for misaligned input\n");
+        return false;
+    }
+
+    if (!cache.is_cached(ggml_sycl::test_make_cache_id(misaligned), GGML_LAYOUT_AOS)) {
+        fprintf(stderr, "Cache entry missing for misaligned input\n");
+        return false;
+    }
+
+    return true;
+}
+
+static bool test_unpin_experts(sycl::queue & q) {
+    printf("\n=== Test: unpin_experts only affects MoE entries ===\n");
+
+    ggml_sycl::unified_cache cache(q, 2048);
+    std::vector<uint8_t>     dense(128, 0x5b);
+    std::vector<uint8_t>     expert(128, 0x6c);
+
+    bool needs_fill = false;
+    if (!cache.ensure_cached_alloc(ggml_sycl::test_make_cache_id(dense.data()), dense.data(), dense.size(),
+                                   dense.size(), ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS,
+                                   false, &needs_fill)) {
+        fprintf(stderr, "Failed to allocate dense entry for unpin test\n");
+        return false;
+    }
+    if (!cache.ensure_cached_alloc(ggml_sycl::test_make_cache_id(expert.data()), expert.data(), expert.size(),
+                                   expert.size(), ggml_sycl::cache_entry_type::MOE_EXPERT, 0, 0, GGML_LAYOUT_AOS, false,
+                                   &needs_fill)) {
+        fprintf(stderr, "Failed to allocate expert entry for unpin test\n");
+        return false;
+    }
+
+    const ggml_sycl_cache_id dense_key  = ggml_sycl::test_make_cache_id(dense.data());
+    const ggml_sycl_cache_id expert_key = ggml_sycl::test_make_cache_id(expert.data());
+    cache.pin(dense_key, GGML_LAYOUT_AOS);
+    cache.pin(expert_key, GGML_LAYOUT_AOS);
+    cache.unpin_experts();
+
+    if (!cache.is_pinned(dense_key, GGML_LAYOUT_AOS)) {
+        fprintf(stderr, "Dense entry was unpinned unexpectedly\n");
+        return false;
+    }
+    if (cache.is_pinned(expert_key, GGML_LAYOUT_AOS)) {
+        fprintf(stderr, "Expert entry remained pinned after unpin_experts\n");
+        return false;
+    }
+
+    return true;
+}
+
+static bool test_direct_stage_expert_distinct_keys(sycl::queue & q) {
+    printf("\n=== Test: direct_stage_expert distinct keys ===\n");
+
+    ggml_sycl::unified_cache cache(q, 4096);
+
+    std::vector<uint8_t> data_a(128, 0x1a);
+    std::vector<uint8_t> data_b(128, 0x2b);
+
+    ggml_sycl_cache_id key_a = ggml_sycl::test_make_cache_id(data_a.data());
+    key_a.aux_id             = 0;
+    ggml_sycl_cache_id key_b = ggml_sycl::test_make_cache_id(data_b.data());
+    key_b.aux_id             = 1;
+
+    auto ra = cache.direct_stage_expert(key_a, data_a.data(), data_a.size(), data_a.size(), GGML_LAYOUT_AOS, nullptr,
+                                        nullptr, &q);
+    auto rb = cache.direct_stage_expert(key_b, data_b.data(), data_b.size(), data_b.size(), GGML_LAYOUT_AOS, nullptr,
+                                        nullptr, &q);
+    if (!ra.ok || !rb.ok) {
+        fprintf(stderr, "direct_stage_expert failed for distinct keys\n");
+        return false;
+    }
+    ra.event.wait();
+    rb.event.wait();
+
+    const auto * ea = cache.lookup_expert(key_a);
+    const auto * eb = cache.lookup_expert(key_b);
+    if (!ea || !eb) {
+        fprintf(stderr, "lookup_expert failed for one or both keys\n");
+        return false;
+    }
+    if (ea->ptr == eb->ptr) {
+        fprintf(stderr, "Two distinct experts got same pointer (hash collision?)\n");
+        return false;
+    }
+
+    return true;
+}
+
+static bool test_direct_stage_weight_lookup_miss(sycl::queue & q) {
+    printf("\n=== Test: direct_stage_weight lookup miss ===\n");
+
+    ggml_sycl::unified_cache cache(q, 4096);
+
+    std::vector<uint8_t> data(128, 0x7a);
+    ggml_sycl_cache_id   key = ggml_sycl::test_make_cache_id(data.data());
+
+    // Lookup before staging should return nullptr
+    const auto * entry = cache.lookup_weight(key);
+    if (entry != nullptr) {
+        fprintf(stderr, "lookup_weight returned non-null for unstaged key\n");
+        return false;
+    }
+
+    return true;
+}
+
+int main() {
+    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
+        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
+    }
+
+    sycl::queue q;
+    try {
+        printf("Using device: %s\n", q.get_device().get_info<sycl::info::device::name>().c_str());
+    } catch (const sycl::exception & e) {
+        fprintf(stderr, "SYCL error: %s\n", e.what());
+        return 1;
+    }
+
+    bool ok = true;
+    ok &= test_evict_returns_bytes(q);
+    ok &= test_realloc_failure_keeps_entry(q);
+    ok &= test_realloc_eviction_failure_keeps_entry(q);
+    ok &= test_direct_stage_weight_basic(q);
+    ok &= test_direct_stage_expert_basic(q);
+    ok &= test_multi_layout_id_mapping_survives_drop(q);
+    ok &= test_planned_materialization_guard(q);
+    ok &= test_graph_pins_host_weights();
+    ok &= test_stream_dma_mmap_fail(q);
+    ok &= test_all_pinned_eviction_failure_new_entry(q);
+    ok &= test_partial_eviction_insufficient(q);
+    ok &= test_allocation_failure_new_entry(q);
+    ok &= test_deferred_free_stress(q);
+    ok &= test_unaligned_hash(q);
+    ok &= test_unpin_experts(q);
+    ok &= test_direct_stage_expert_distinct_keys(q);
+    ok &= test_direct_stage_weight_lookup_miss(q);
+
+    printf("\nUnified cache bug tests: %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+#endif

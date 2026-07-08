@@ -4,6 +4,11 @@ llama.cpp binaries can automatically fit the projected memory use of a model to 
 this is controlled using the CLI arguments starting with `-fit`/`--fit`.
 Internally the code is calling `llama_params_fit` to adjust the `llama_model_params` and `llama_context_params` structs.
 `llama-fit-params` is a simple utility that prints the CLI arguments corresponding to these adjustments to stdout.
+
+SYCL builds disable this fit path. The SYCL backend uses the unified cache as
+the memory placement authority, so `-fit`/`--fit-target`/`--fit-ctx` do not
+rewrite layer placement or tensor buffer overrides for SYCL.
+
 Example usage:
 
 ``` bash

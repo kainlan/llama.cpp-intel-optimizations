@@ -1034,6 +1034,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GET_ROWS",
     "GET_ROWS_BACK",
     "SET_ROWS",
+    "SET_ROWS_PAGED",
     "DIAG",
     "DIAG_MASK_INF",
     "DIAG_MASK_ZERO",
@@ -1094,9 +1095,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "ALL_REDUCE_SUM",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1145,6 +1148,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "get_rows(x)",
     "get_rows_back(x)",
     "set_rows(x)",
+    "set_rows_paged(x)",
     "diag(x)",
     "diag_mask_inf(x)",
     "diag_mask_zero(x)",
@@ -1205,9 +1209,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "all_reduce_sum(x)",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1796,9 +1802,11 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.src          =*/ { NULL },
         /*.view_src     =*/ view_src,
         /*.view_offs    =*/ view_offs,
+        /*.buffer_offs  =*/ view_src != NULL ? view_src->buffer_offs + view_offs : 0,
         /*.data         =*/ obj_alloc_size > 0 ? (void *)(result + 1) : data,
         /*.name         =*/ { 0 },
         /*.extra        =*/ NULL,
+        /*.layout       =*/ NULL,
         /*.padding      =*/ { 0 },
     };
 
@@ -1900,6 +1908,16 @@ void ggml_unravel_index(const struct ggml_tensor * tensor, int64_t i, int64_t * 
 }
 
 void * ggml_get_data(const struct ggml_tensor * tensor) {
+    return tensor->data;
+}
+
+void * ggml_tensor_get_layout_ptr(const struct ggml_tensor * tensor) {
+    if (tensor == NULL) {
+        return NULL;
+    }
+    if (tensor->layout != NULL && tensor->layout->data_ptr != NULL) {
+        return tensor->layout->data_ptr;
+    }
     return tensor->data;
 }
 
@@ -3942,6 +3960,47 @@ struct ggml_tensor * ggml_set_rows(
     return result;
 }
 
+
+// ggml_set_rows_paged
+
+struct ggml_tensor * ggml_set_rows_paged(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * dst,
+        struct ggml_tensor  * src,
+        struct ggml_tensor  * indices,
+        struct ggml_tensor  * block_table,
+        int                   block_size,
+        int                   seq_idx) {
+    GGML_ASSERT(ggml_n_dims(dst) == 4);
+    GGML_ASSERT(ggml_n_dims(src) >= 1 && ggml_n_dims(src) <= 2);
+    GGML_ASSERT(ggml_n_dims(indices) == 1);
+    GGML_ASSERT(ggml_n_dims(block_table) >= 1 && ggml_n_dims(block_table) <= 2);
+
+    const int64_t D       = dst->ne[0];
+    const int64_t n_heads = dst->ne[2];
+    GGML_ASSERT(src->ne[0] == D * n_heads);
+
+    const int64_t n_tokens = src->ne[1];
+    GGML_ASSERT(indices->ne[0] == n_tokens);
+    GGML_ASSERT(indices->type == GGML_TYPE_I32 || indices->type == GGML_TYPE_I64);
+    GGML_ASSERT(block_table->type == GGML_TYPE_I32);
+    GGML_ASSERT(seq_idx >= 0 && seq_idx < block_table->ne[1]);
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, dst);
+
+    result->op     = GGML_OP_SET_ROWS_PAGED;
+    result->src[0] = src;
+    result->src[1] = indices;
+    result->src[2] = block_table;
+    result->src[3] = dst;
+
+    ggml_set_op_params_i32(result, 0, block_size);
+    ggml_set_op_params_i32(result, 1, seq_idx);
+    ggml_set_op_params_i32(result, 2, 1);
+
+    return result;
+}
+
 // ggml_diag
 
 struct ggml_tensor * ggml_diag(
@@ -5458,6 +5517,26 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
+
+void ggml_flash_attn_ext_set_paged_layout(
+        struct ggml_tensor * a,
+        bool                 use_paged_layout) {
+    while (a && a->op != GGML_OP_FLASH_ATTN_EXT) {
+        if (a->op == GGML_OP_VIEW || a->op == GGML_OP_RESHAPE || a->op == GGML_OP_PERMUTE ||
+            a->op == GGML_OP_TRANSPOSE) {
+            a = a->src[0];
+        } else {
+            break;
+        }
+    }
+
+    if (a == NULL || a->op != GGML_OP_FLASH_ATTN_EXT) {
+        return;
+    }
+
+    ggml_set_op_params_i32(a, 4, use_paged_layout ? 1 : 0);
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(
@@ -6191,6 +6270,20 @@ struct ggml_tensor * ggml_opt_step_sgd(
     result->src[0] = a;
     result->src[1] = grad;
     result->src[2] = params;
+
+    return result;
+}
+
+
+// ggml_all_reduce_sum
+
+struct ggml_tensor * ggml_all_reduce_sum(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a) {
+    struct ggml_tensor * result = ggml_new_tensor(ctx, a->type, GGML_MAX_DIMS, a->ne);
+
+    result->op     = GGML_OP_ALL_REDUCE_SUM;
+    result->src[0] = a;
 
     return result;
 }

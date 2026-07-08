@@ -8,6 +8,7 @@
 
 #include <array>
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cfloat>
 #include <chrono>
@@ -17,6 +18,7 @@
 #include <ctime>
 #include <numeric>
 #include <random>
+#include <string>
 #include <unordered_map>
 #include <stdexcept>
 
@@ -803,6 +805,116 @@ struct llama_sampler * llama_sampler_chain_init(struct llama_sampler_chain_param
     );
 }
 
+static bool llama_sampler_logits_trace_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("LLAMA_LOGITS_TRACE");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static int llama_sampler_logits_trace_limit() {
+    static const int limit = [] {
+        const char * env = std::getenv("LLAMA_LOGITS_TRACE_LIMIT");
+        return env && *env ? std::max(0, std::atoi(env)) : 8;
+    }();
+    return limit;
+}
+
+static int llama_sampler_logits_trace_topn() {
+    static const int topn = [] {
+        const char * env = std::getenv("LLAMA_LOGITS_TRACE_TOPN");
+        return env && *env ? std::max(1, std::atoi(env)) : 10;
+    }();
+    return topn;
+}
+
+static int llama_sampler_logits_trace_next_sample() {
+    static std::atomic<int> sample{ 0 };
+    return sample.fetch_add(1, std::memory_order_relaxed);
+}
+
+static std::string llama_sampler_logits_trace_piece(const llama_vocab * vocab, llama_token token) {
+    char buf[256];
+    int  n = llama_token_to_piece(vocab, token, buf, sizeof(buf) - 1, 0, true);
+    if (n < 0) {
+        return "<piece-too-long>";
+    }
+    if (n <= 0) {
+        return "";
+    }
+    n      = std::min<int>(n, sizeof(buf) - 1);
+    buf[n] = '\0';
+
+    std::string out;
+    out.reserve((size_t) n);
+    for (int i = 0; i < n; ++i) {
+        const unsigned char c = (unsigned char) buf[i];
+        if (c == '\n') {
+            out += "\\n";
+        } else if (c == '\r') {
+            out += "\\r";
+        } else if (c == '\t') {
+            out += "\\t";
+        } else if (c < 32) {
+            out += '?';
+        } else {
+            out.push_back((char) c);
+        }
+    }
+    return out;
+}
+
+static void llama_sampler_logits_trace_dump(
+        const char * phase, int sample, int32_t idx, const llama_vocab * vocab, const llama_token_data_array & cur_p) {
+    const int limit = llama_sampler_logits_trace_limit();
+    if (sample < 0 || sample >= limit || !cur_p.data || cur_p.size == 0) {
+        return;
+    }
+
+    const int topn = std::min<int>(llama_sampler_logits_trace_topn(), (int) cur_p.size);
+    std::vector<llama_token_data> top;
+    top.reserve((size_t) topn);
+
+    size_t nonfinite = 0;
+    for (size_t i = 0; i < cur_p.size; ++i) {
+        const llama_token_data & candidate = cur_p.data[i];
+        if (!std::isfinite(candidate.logit)) {
+            ++nonfinite;
+            continue;
+        }
+        if ((int) top.size() < topn) {
+            top.push_back(candidate);
+            std::sort(top.begin(), top.end(), [](const llama_token_data & a, const llama_token_data & b) {
+                return a.logit > b.logit;
+            });
+            continue;
+        }
+        if (candidate.logit > top.back().logit) {
+            top.back() = candidate;
+            std::sort(top.begin(), top.end(), [](const llama_token_data & a, const llama_token_data & b) {
+                return a.logit > b.logit;
+            });
+        }
+    }
+
+    fprintf(stderr,
+            "[LOGITS-TRACE] sample=%d idx=%d phase=%s size=%zu selected=%lld sorted=%d nonfinite=%zu topn=%d\n",
+            sample, idx, phase, cur_p.size, (long long) cur_p.selected, cur_p.sorted ? 1 : 0, nonfinite, topn);
+    for (int i = 0; i < (int) top.size(); ++i) {
+        const std::string piece = llama_sampler_logits_trace_piece(vocab, top[i].id);
+        fprintf(stderr, "[LOGITS-TRACE]   rank=%d token=%d logit=%g p=%g piece=\"%s\"%s\n", i + 1, top[i].id,
+                top[i].logit, top[i].p, piece.c_str(),
+                cur_p.selected >= 0 && top[i].id == cur_p.data[cur_p.selected].id ? " selected" : "");
+    }
+    if (cur_p.selected >= 0 && cur_p.selected < (int32_t) cur_p.size) {
+        const llama_token_data & selected = cur_p.data[cur_p.selected];
+        const std::string        piece    = llama_sampler_logits_trace_piece(vocab, selected.id);
+        fprintf(stderr, "[LOGITS-TRACE]   selected token=%d logit=%g p=%g piece=\"%s\"\n", selected.id,
+                selected.logit, selected.p, piece.c_str());
+    }
+}
+
 llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_context * ctx, int32_t idx) {
     const llama_token   sampled_token  = llama_get_sampled_token_ith     (ctx, idx);
     const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
@@ -861,7 +973,12 @@ llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_conte
         /* .sorted     = */ false,
     };
 
+    const int logits_trace_sample = llama_sampler_logits_trace_enabled() ? llama_sampler_logits_trace_next_sample() : -1;
+    llama_sampler_logits_trace_dump("raw", logits_trace_sample, idx, vocab, cur_p);
+
     llama_sampler_apply(smpl, &cur_p);
+
+    llama_sampler_logits_trace_dump("post", logits_trace_sample, idx, vocab, cur_p);
 
     GGML_ASSERT(cur_p.selected >= 0 && cur_p.selected < (int32_t) cur_p.size);
 

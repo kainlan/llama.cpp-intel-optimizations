@@ -20,6 +20,7 @@
 #pragma once
 
 #include <sycl/nd_item.hpp>
+#include <vector>
 
 #include "ggml-sycl/dpct/helper.hpp"
 
@@ -55,6 +56,34 @@ __dpct_inline__ static void quantize_q8_1_impl(const float * __restrict__ x,
     d = amax == 0 ? 0 : d;
 }
 
+template <int ElementsPerWI>
+__dpct_inline__ static void quantize_q8_0_impl(const float * __restrict__ x,
+                                               sycl::vec<int8_t, ElementsPerWI> & quantized_values, float & d,
+                                               const sycl::nd_item<1> & it) {
+    auto subgroup_id = it.get_group(0);
+    auto wi_id       = it.get_local_id(0);
+
+    sycl::vec<float, ElementsPerWI> wi_f32_vals;
+    auto float_ptr_offset = subgroup_id * QK8_0 + ElementsPerWI * wi_id;
+    wi_f32_vals = *reinterpret_cast<const sycl::vec<float, ElementsPerWI> *>(x + float_ptr_offset);
+
+    float amax = 0.0f;
+
+#pragma unroll(ElementsPerWI)
+    for (int i = 0; i < ElementsPerWI; i++) {
+        amax = sycl::fmax(amax, sycl::fabs(wi_f32_vals[i]));
+        quantized_values[i] = 0;
+    }
+    amax = sycl::reduce_over_group(it.get_sub_group(), amax, sycl::maximum<float>());
+    d    = amax == 0 ? 0.0f : amax / 127.0f;
+    const float id = d == 0.0f ? 0.0f : 1.0f / d;
+
+#pragma unroll(ElementsPerWI)
+    for (int i = 0; i < ElementsPerWI; i++) {
+        quantized_values[i] = sycl::round(wi_f32_vals[i] * id);
+    }
+}
+
 // No op to control codepath in ggml_sycl_op_mul_mat
 template <int ElementsPerWI> struct no_quantize_q8_1 {
     void operator()(const float *, void *, int, int, const sycl::nd_item<1> &) const {}
@@ -84,7 +113,10 @@ template <int ElementsPerWI> struct quantize_and_reorder_q8_1_soa {
         auto quant_ptr = (int8_t *) ((char *) reordered_q8_tensor + row_offset + col_offset);
         *reinterpret_cast<sycl::vec<int8_t, ElementsPerWI> *>(quant_ptr) = quantized_values;
 
-        auto ds_ptr = (sycl::half2 *) ((char *) reordered_q8_tensor + row_offset + kx + col * sizeof(sycl::half2));
+        // ds at: row_offset + kx + col * sizeof(half2)
+        // For SoA: qs are at [0, kx) per row, ds are at [kx, kx + blocks*4) per row
+        const size_t ds_byte_offset = row_offset + kx + col * sizeof(sycl::half2);
+        auto ds_ptr = (sycl::half2 *) ((char *) reordered_q8_tensor + ds_byte_offset);
         if (wi_id == 0) {
             *ds_ptr = sycl::half2(sycl::half(d), sycl::half(sum));
         }
@@ -117,17 +149,67 @@ template <int ElementsPerWI> struct quantize_q8_1 {
     }
 };
 
+template <int ElementsPerWI> struct quantize_q8_0 {
+    __dpct_inline__ void operator()(const float * __restrict__ x, void * q8_tensor, const int kx, const int kx_padded,
+                                    const sycl::nd_item<1> & it) const {
+        auto subgroup_id = it.get_group(0);
+        auto wi_id       = it.get_local_id(0);
+
+        const int num_blocks_per_row = kx / QK8_0;
+        auto      row                = subgroup_id / num_blocks_per_row;
+        const int pitch              = kx_padded / QK8_0;
+
+        sycl::vec<int8_t, ElementsPerWI> quantized_values;
+        float d = 0.0f;
+        quantize_q8_0_impl<ElementsPerWI>(x, quantized_values, d, it);
+
+        block_q8_0 * quant_ptr = (block_q8_0 *) q8_tensor;
+        auto         block_id  = subgroup_id % num_blocks_per_row + row * pitch;
+
+        int8_t * qs = &(quant_ptr[block_id].qs[wi_id * ElementsPerWI]);
+        *reinterpret_cast<sycl::vec<int8_t, ElementsPerWI> *>(qs) = quantized_values;
+        if (wi_id == 0) {
+            quant_ptr[block_id].d = sycl::half(d);
+        }
+    }
+};
+
 template <template <int> typename quantize_f>
-void quantize_row_q8_1_sycl(const float * x, void * vy, const int kx, const int ky, const int kx_padded,
-                            dpct::queue_ptr stream) {
+sycl::event quantize_row_q8_1_sycl(const float * x, void * vy, const int kx, const int ky, const int kx_padded,
+                                   dpct::queue_ptr stream, const std::vector<sycl::event> * deps = nullptr) {
     static_assert(QK8_1 % WARP_SIZE == 0);
     auto local_range      = std::size_t(WARP_SIZE);
     auto num_quant_blocks = ky * (kx / QK8_1);
     auto global_range     = num_quant_blocks * local_range;
     dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
 
-    stream->parallel_for(sycl::nd_range<1>({ global_range }, { local_range }),
+    return stream->submit([&](sycl::handler & cgh) {
+        if (deps && !deps->empty()) {
+            cgh.depends_on(*deps);
+        }
+        cgh.parallel_for(sycl::nd_range<1>({ global_range }, { local_range }),
                          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                              quantize_f<QK8_1 / WARP_SIZE>()(x, vy, kx, kx_padded, it);
                          });
+    });
+}
+
+inline sycl::event quantize_row_q8_0_sycl(const float * x, void * vy, const int kx, const int ky, const int kx_padded,
+                                         dpct::queue_ptr stream,
+                                         const std::vector<sycl::event> * deps = nullptr) {
+    static_assert(QK8_0 % WARP_SIZE == 0);
+    auto local_range      = std::size_t(WARP_SIZE);
+    auto num_quant_blocks = ky * (kx / QK8_0);
+    auto global_range     = num_quant_blocks * local_range;
+    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+
+    return stream->submit([&](sycl::handler & cgh) {
+        if (deps && !deps->empty()) {
+            cgh.depends_on(*deps);
+        }
+        cgh.parallel_for(sycl::nd_range<1>({ global_range }, { local_range }),
+                         [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             quantize_q8_0<QK8_0 / WARP_SIZE>()(x, vy, kx, kx_padded, it);
+                         });
+    });
 }

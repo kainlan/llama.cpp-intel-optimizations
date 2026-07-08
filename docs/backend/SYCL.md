@@ -5,12 +5,12 @@
 - [News](#news)
 - [OS](#os)
 - [Hardware](#hardware)
-- [Performance Reference](#performance-reference)
 - [Docker](#docker)
 - [Linux](#linux)
-- [Windows](#windows-1)
+- [Windows](#windows)
 - [Environment Variable](#environment-variable)
-- [Design Rule](#design-rule)
+- [Memory placement](#memory-placement)
+- [Cross-device KV placement contract](#cross-device-kv-placement-contract)
 - [Known Issue](#known-issues)
 - [Q&A](#qa)
 - [TODO](#todo)
@@ -24,44 +24,25 @@
 - **DPCPP** *(Data Parallel C++)*: The primary oneAPI SYCL implementation, which includes the icpx/icx Compilers.
 - **oneAPI Libraries**: A set of highly optimized libraries targeting multiple domains *(e.g. Intel oneMKL, oneMath and oneDNN)*.
 - **oneAPI LevelZero**: A high performance low level interface for fine-grained control over Intel iGPUs and dGPUs.
+- **Nvidia & AMD Plugins**: These are plugins extending oneAPI's DPCPP support to SYCL on Nvidia and AMD GPU targets.
 
 ### Llama.cpp + SYCL
 
 The llama.cpp SYCL backend is primarily designed for **Intel GPUs**.
-SYCL cross-platform capabilities enable support for other vendor GPUs as well.
+SYCL cross-platform capabilities enable support for Nvidia GPUs as well, with limited support for AMD.
 
 ## Recommended Release
-
-### Windows
 
 The following releases are verified and recommended:
 
 |Commit ID|Tag|Release|Verified  Platform| Update date|
 |-|-|-|-|-|
-|24e86cae7219b0f3ede1d5abdf5bf3ad515cccb8|b5377 |[llama-b5377-bin-win-sycl-x64.zip](https://github.com/ggml-org/llama.cpp/releases/download/b5377/llama-b5377-bin-win-sycl-x64.zip) |Arc B580/Linux/oneAPI 2025.1<br>LNL Arc GPU/Windows 11/oneAPI 2025.1.1|2025-05-15|
-|3bcd40b3c593d14261fb2abfabad3c0fb5b9e318|b4040 |[llama-b4040-bin-win-sycl-x64.zip](https://github.com/ggml-org/llama.cpp/releases/download/b4040/llama-b4040-bin-win-sycl-x64.zip) |Arc A770/Linux/oneAPI 2024.1<br>MTL Arc GPU/Windows 11/oneAPI 2024.1| 2024-11-19|
-|fb76ec31a9914b7761c1727303ab30380fd4f05c|b3038 |[llama-b3038-bin-win-sycl-x64.zip](https://github.com/ggml-org/llama.cpp/releases/download/b3038/llama-b3038-bin-win-sycl-x64.zip) |Arc A770/Linux/oneAPI 2024.1<br>MTL Arc GPU/Windows 11/oneAPI 2024.1||
+|24e86cae7219b0f3ede1d5abdf5bf3ad515cccb8|b5377 |[llama-b5377-bin-win-sycl-x64.zip](https://github.com/ggml-org/llama.cpp/releases/download/b5377/llama-b5377-bin-win-sycl-x64.zip) |ArcB580/Linux/oneAPI 2025.1<br>LNL Arc GPU/Windows 11/oneAPI 2025.1.1|2025-05-15|
+|3bcd40b3c593d14261fb2abfabad3c0fb5b9e318|b4040 |[llama-b4040-bin-win-sycl-x64.zip](https://github.com/ggml-org/llama.cpp/releases/download/b4040/llama-b4040-bin-win-sycl-x64.zip) |Arc770/Linux/oneAPI 2024.1<br>MTL Arc GPU/Windows 11/oneAPI 2024.1| 2024-11-19|
+|fb76ec31a9914b7761c1727303ab30380fd4f05c|b3038 |[llama-b3038-bin-win-sycl-x64.zip](https://github.com/ggml-org/llama.cpp/releases/download/b3038/llama-b3038-bin-win-sycl-x64.zip) |Arc770/Linux/oneAPI 2024.1<br>MTL Arc GPU/Windows 11/oneAPI 2024.1||
 
-### Ubuntu 24.04
-
-The release packages for Ubuntu 24.04 x64 (FP32/FP16) only include the binary files of the llama.cpp SYCL backend. They require the target machine to have pre-installed Intel GPU drivers and oneAPI packages that are the same version as the build package. To get the version and installation info, refer to [.github/workflows/release.yml#L713](../../.github/workflows/release.yml#L713): ubuntu-24-sycl -> Download & Install oneAPI.
-
-It is recommended to use them with [Intel Docker](https://hub.docker.com/r/intel/deep-learning-essentials).
-
-The packages for FP32 and FP16 would have different accuracy and performance on LLMs. Please choose it according to the test result.
 
 ## News
-
-- 2026.04-05
-  - Optimize mul_mat by reorder feature for data type: Q4_K, Q5_K, Q6_K, Q8_0.
-  - Fused MoE.
-  - Upgrate CI and built package for oneAPI 2025.3.3, support Ubuntu 24.04 built package.
-
-- 2026.03
-  - Support Flash-Attention: less memory usage, performance impact depends on LLM.
-
-- 2026.02
-  - Remove support for Nvidia & AMD GPU, because the oneAPI plugin for Nvidia & AMD GPU is unavailable: download/installation channels are out of work. User can't build up the software for Nvidia & AMD GPU.
 
 - 2025.11
   - Support malloc memory on device more than 4GB.
@@ -72,18 +53,18 @@ The packages for FP32 and FP16 would have different accuracy and performance on 
     |-|-|-|-|
     |PVC 1550|39|73|+87%|
     |Flex 170|39|50|+28%|
-    |Arc A770|42|55|+30%|
+    |Arc770|42|55|+30%|
     |MTL|13|16|+23%|
     |ARL-H|14|17|+21%|
 
 - 2024.11
-  - Use syclcompat to improve the performance on some platforms. This requires to use oneAPI 2025.0 or newer.
+  - Use syclcompat to improve the performance on some platforms. This requires to use oneAPI 2025.0 or newer (tested with 2025.3.1).
 
 - 2024.8
   - Use oneDNN as the default GEMM library, improve the compatibility for new Intel GPUs.
 
 - 2024.5
-  - Performance is increased: 34 -> 37 tokens/s of llama-2-7b.Q4_0 on Arc A770.
+  - Performance is increased: 34 -> 37 tokens/s of llama-2-7b.Q4_0 on Arc770.
   - Arch Linux is verified successfully.
 
 - 2024.4
@@ -132,15 +113,14 @@ On older Intel GPUs, you may try [OpenCL](/docs/backend/OPENCL.md) although the 
 |-------------------------------|---------|---------------------------------------|
 | Intel Data Center Max Series  | Support | Max 1550, 1100                        |
 | Intel Data Center Flex Series | Support | Flex 170                              |
-| Intel Arc A-Series            | Support | Arc A770, Arc A730M, Arc A750         |
-| Intel Arc B-Series            | Support | Arc B580                              |
+| Intel Arc Series              | Support | Arc 770, 730M, Arc A750, B580         |
 | Intel built-in Arc GPU        | Support | built-in Arc GPU in Meteor Lake, Arrow Lake, Lunar Lake |
 | Intel iGPU                    | Support | iGPU in 13700k, 13400, i5-1250P, i7-1260P, i7-1165G7  |
 
 *Notes:*
 
 - **Memory**
-  - The device memory is a limitation when running a large model. The loaded model size, *`llm_load_tensors: buffer_size`*, is displayed in the log when running `./bin/llama-completion`.
+  - The device memory is a limitation when running a large model. The loaded model size, *`llm_load_tensors: buffer_size`*, is displayed in the log when running `./bin/llama-cli`.
   - Please make sure the GPU shared memory from the host is large enough to account for the model's size. For e.g. the *llama-2-7b.Q4_0* requires at least 8.0GB for integrated GPU and 4.0GB for discrete GPU.
 
 - **Execution Unit (EU)**
@@ -148,76 +128,52 @@ On older Intel GPUs, you may try [OpenCL](/docs/backend/OPENCL.md) although the 
 
 ### Other Vendor GPU
 
-NA
+**Verified devices**
 
-## Performance Reference
+| Nvidia GPU               | Status    | Verified Model |
+|--------------------------|-----------|----------------|
+| Ampere Series            | Supported | A100, A4000    |
+| Ampere Series *(Mobile)* | Supported | RTX 40 Series  |
 
+| AMD GPU                  | Status       | Verified Model |
+|--------------------------|--------------|----------------|
+| Radeon Pro               | Experimental | W6800          |
+| Radeon RX                | Experimental | 6700 XT        |
 
-To get the supported LLMs, GPUs, and performance reference, please check [Performance of llama.cpp on Intel GPU with SYCL backend](https://github.com/ggml-org/llama.cpp/discussions/23313).
-
-You could update your test result in it directly.
+Note: AMD GPU support is highly experimental and is incompatible with F16.
+Additionally, it only supports GPUs with a sub_group_size (warp size) of 32.
 
 ## Docker
 
-Please refer to [Docker with SYCL](../docker.md#docker-with-sycl) for details.
+The docker build option is currently limited to *Intel GPU* targets.
 
-## Quick Development WOW
+### Build image
 
-This chapter is for quick development & try with SYCL backend on Intel GPU.
+```sh
+# Using FP16
+docker build -t llama-cpp-sycl --build-arg="GGML_SYCL_F16=ON" --target light -f .devops/intel.Dockerfile .
 
-You need to install following sofeware before development:
-   - Intel GPU driver
-   - oneAPI package
-   - other development tools.
-
-Please refer to [Linux](#linux) or [Windows](#windows-1) for above installation and resolve the trouble in usage. There are the detailed guide.
-
-- Linux
-
-```
-## build from source code
-./examples/sycl/build.sh
-
-## run CONV_2D_DW unit test cases
-./build/bin/test-backend-ops -b SYCL0 -o CONV_2D_DW
-
-## run all unit test cases
-./build/bin/test-backend-ops -b SYCL0
-
-## run with LLM on the first GPU
-./examples/sycl/test.sh -mg 0 -m xxxx.gguf
-
-## run service with LLM on the first GPU
-export ONEAPI_DEVICE_SELECTOR="level_zero:0"
-./examples/sycl/start-svr.sh -m xxxx.gguf
-
-## update the docs/ops.md for new/update OPs
-./examples/sycl/update-ops-doc.sh
+# Using FP32
+docker build -t llama-cpp-sycl --build-arg="GGML_SYCL_F16=OFF" --target light -f .devops/intel.Dockerfile .
 ```
 
-- Windows
+*Notes*:
 
-```
-## build from source code
-examples\sycl\win-build-sycl.bat
+You can also use the `.devops/llama-server-intel.Dockerfile`, which builds the *"server"* alternative.
+Check the [documentation for Docker](../docker.md) to see the available images.
 
-## run CONV_2D_DW unit test cases
-build\bin\test-backend-ops.exe -b SYCL0 -o CONV_2D_DW
+### Run container
 
-## run all unit test cases
-build\bin\test-backend-ops.exe -b SYCL0
-
-## run LLM on the first GPU
-examples\sycl\win-test.bat -mg 0 -m xxxx.gguf
-
-## run service with LLM on the first GPU
-set ONEAPI_DEVICE_SELECTOR="level_zero:0"
-examples\sycl\win-start-svr.bat -m xxxx.gguf
-
-## update the docs/ops.md for new/update OPs
-examples\sycl\win-update-ops-doc.bat
+```sh
+# First, find all the DRI cards
+ls -la /dev/dri
+# Then, pick the card that you want to use (here for e.g. /dev/dri/card1).
+docker run -it --rm -v "/path/to/models:/models" --device /dev/dri/renderD128:/dev/dri/renderD128 --device /dev/dri/card0:/dev/dri/card0 llama-cpp-sycl -m /models/7B/ggml-model-q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 400 -e -ngl 33 -c 4096 -s 0
 ```
 
+*Notes:*
+- Docker has been tested successfully on native Linux. WSL support has not been verified yet.
+- You may need to install Intel GPU driver on the **host** machine *(Please refer to the [Linux configuration](#linux) for details)*.
 
 ## Linux
 
@@ -227,7 +183,7 @@ examples\sycl\win-update-ops-doc.bat
 
   - **Intel GPU**
 
-Intel data center GPUs drivers installation guide and download page can be found here: [Get Intel dGPU Drivers](https://dgpu-docs.intel.com/driver/installation.html#ubuntu-install-steps).
+Intel data center GPUs drivers installation guide and download page can be found here: [Get intel dGPU Drivers](https://dgpu-docs.intel.com/driver/installation.html#ubuntu-install-steps).
 
 *Note*: for client GPUs *(iGPU & Arc A-Series)*, please refer to the [client iGPU driver installation](https://dgpu-docs.intel.com/driver/client/overview.html).
 
@@ -257,6 +213,14 @@ Platform #0: Intel(R) OpenCL HD Graphics
  `-- Device #0: Intel(R) Iris(R) Xe Graphics [0x9a49]
 ```
 
+- **Nvidia GPU**
+
+In order to target Nvidia GPUs through SYCL, please make sure the CUDA/CUBLAS native requirements *-found [here](README.md#cuda)-* are installed.
+
+- **AMD GPU**
+
+To target AMD GPUs with SYCL, the ROCm stack must be installed first.
+
 2. **Install Intel® oneAPI Base toolkit**
 
 SYCL backend depends on:
@@ -277,14 +241,31 @@ Please follow the instructions for downloading and installing the Toolkit for Li
 
 Following guidelines/code snippets assume the default installation values. Otherwise, please make sure the necessary changes are reflected where applicable.
 
-Upon a successful installation, SYCL is enabled for the available Intel devices, along with relevant libraries such as oneAPI oneDNN for Intel GPUs.
+Upon a successful installation, SYCL is enabled for the available intel devices, along with relevant libraries such as oneAPI oneDNN for Intel GPUs.
 
 |Verified release|
 |-|
-|2025.3.3 |
+|2025.3.1|
 |2025.2.1|
 |2025.1|
 |2024.1|
+
+- **Adding support to Nvidia GPUs**
+
+**oneAPI Plugin**: In order to enable SYCL support on Nvidia GPUs, please install the [Codeplay oneAPI Plugin for Nvidia GPUs](https://developer.codeplay.com/products/oneapi/nvidia/download). User should also make sure the plugin version matches the installed base toolkit one *(previous step)* for a seamless "oneAPI on Nvidia GPU" setup.
+
+**oneDNN**: The current oneDNN releases *(shipped with the oneAPI base-toolkit)* do not include the NVIDIA backend. Therefore, oneDNN must be compiled from source to enable the NVIDIA target:
+
+```sh
+git clone https://github.com/oneapi-src/oneDNN.git
+cd oneDNN
+cmake -GNinja -Bbuild-nvidia -DDNNL_CPU_RUNTIME=DPCPP -DDNNL_GPU_RUNTIME=DPCPP -DDNNL_GPU_VENDOR=NVIDIA -DONEDNN_BUILD_GRAPH=OFF -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
+cmake --build build-nvidia --config Release
+```
+
+- **Adding support to AMD GPUs**
+
+**oneAPI Plugin**: In order to enable SYCL support on AMD GPUs, please install the [Codeplay oneAPI Plugin for AMD GPUs](https://developer.codeplay.com/products/oneapi/amd/download). As with Nvidia GPUs, the user should also make sure the plugin version matches the installed base toolkit.
 
 3. **Verify installation and environment**
 
@@ -306,12 +287,30 @@ When targeting an intel GPU, the user should expect one or more devices among th
 [opencl:gpu][opencl:2] Intel(R) OpenCL Graphics, Intel(R) UHD Graphics 730 OpenCL 3.0 NEO  [24.39.31294]
 ```
 
+- **Nvidia GPU**
+
+Similarly, user targeting Nvidia GPUs should expect at least one SYCL-CUDA device [`cuda:gpu`] as below:
+
+```
+[opencl:acc][opencl:0] Intel(R) FPGA Emulation Platform for OpenCL(TM), Intel(R) FPGA Emulation Device OpenCL 1.2  [2023.16.12.0.12_195853.xmain-hotfix]
+[opencl:cpu][opencl:1] Intel(R) OpenCL, Intel(R) Xeon(R) Gold 6326 CPU @ 2.90GHz OpenCL 3.0 (Build 0) [2023.16.12.0.12_195853.xmain-hotfix]
+[cuda:gpu][cuda:0] NVIDIA CUDA BACKEND, NVIDIA A100-PCIE-40GB 8.0 [CUDA 12.5]
+```
+
+- **AMD GPU**
+
+For AMD GPUs we should expect at least one SYCL-HIP device [`hip:gpu`]:
+
+```
+[opencl:cpu][opencl:0] Intel(R) OpenCL, 12th Gen Intel(R) Core(TM) i9-12900K OpenCL 3.0 (Build 0) [2024.18.6.0.02_160000]
+[hip:gpu][hip:0] AMD HIP BACKEND, AMD Radeon PRO W6800 gfx1030 [HIP 60140.9]
+```
+
 ### II. Build llama.cpp
 
 #### Intel GPU
 
 ```sh
-# Uses FP32, consider using FP16 for better performance in most cases
 ./examples/sycl/build.sh
 ```
 
@@ -321,11 +320,11 @@ or
 # Export relevant ENV variables
 source /opt/intel/oneapi/setvars.sh
 
-# Option 1: Use FP16 (recommended for better performance in most cases)
-cmake -B build -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DGGML_SYCL_F16=ON
-
-# Option 2: Use FP32
+# Option 1: Use FP32 (recommended for better performance in most cases)
 cmake -B build -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
+
+# Option 2: Use FP16
+cmake -B build -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DGGML_SYCL_F16=ON
 
 # build all binary
 cmake --build build --config Release -j -v
@@ -335,11 +334,52 @@ It is possible to come across some precision issues when running tests that stem
 instructions, which can be circumvented by setting the environment variable `SYCL_PROGRAM_COMPILE_OPTIONS`
 as `-cl-fp32-correctly-rounded-divide-sqrt`
 
+#### Nvidia GPU
+
+The SYCL backend depends on [oneMath](https://github.com/uxlfoundation/oneMath) for Nvidia and AMD devices.
+By default it is automatically built along with the project. A specific build can be provided by setting the CMake flag `-DoneMath_DIR=/path/to/oneMath/install/lib/cmake/oneMath`.
+
+```sh
+# Build LLAMA with Nvidia BLAS acceleration through SYCL
+# Setting GGML_SYCL_DEVICE_ARCH is optional but can improve performance
+GGML_SYCL_DEVICE_ARCH=sm_80 # Example architecture
+
+# Option 1: Use FP32 (recommended for better performance in most cases)
+cmake -B build -DGGML_SYCL=ON -DGGML_SYCL_TARGET=NVIDIA -DGGML_SYCL_DEVICE_ARCH=${GGML_SYCL_DEVICE_ARCH} -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DDNNL_DIR=/path/to/oneDNN/build-nvidia/install/lib/cmake/dnnl
+
+# Option 2: Use FP16
+cmake -B build -DGGML_SYCL=ON -DGGML_SYCL_TARGET=NVIDIA -DGGML_SYCL_DEVICE_ARCH=${GGML_SYCL_DEVICE_ARCH} -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DGGML_SYCL_F16=ON -DDNNL_DIR=/path/to/oneDNN/build-nvidia/install/lib/cmake/dnnl
+
+# build all binary
+cmake --build build --config Release -j -v
+```
+
+It is possible to come across some precision issues when running tests that stem from using faster
+instructions, which can be circumvented by passing the `-fno-fast-math` flag to the compiler.
+
+#### AMD GPU
+
+The SYCL backend depends on [oneMath](https://github.com/uxlfoundation/oneMath) for Nvidia and AMD devices.
+By default it is automatically built along with the project. A specific build can be provided by setting the CMake flag `-DoneMath_DIR=/path/to/oneMath/install/lib/cmake/oneMath`.
+
+```sh
+# Build LLAMA with rocBLAS acceleration through SYCL
+
+## AMD
+# Use FP32, FP16 is not supported
+# Find your GGML_SYCL_DEVICE_ARCH with rocminfo, under the key 'Name:'
+GGML_SYCL_DEVICE_ARCH=gfx90a # Example architecture
+cmake -B build -DGGML_SYCL=ON -DGGML_SYCL_TARGET=AMD -DGGML_SYCL_DEVICE_ARCH=${GGML_SYCL_DEVICE_ARCH} -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
+
+# build all binary
+cmake --build build --config Release -j -v
+```
+
 ### III. Run the inference
 
 #### Retrieve and prepare model
 
-You can refer to the general [*Obtaining and quantizing models*](../../README.md#obtaining-and-quantizing-models) guide for model preparation, or download an already quantized model like [llama-2-7b.Q4_0.gguf](https://huggingface.co/TheBloke/Llama-2-7B-GGUF/resolve/main/llama-2-7b.Q4_0.gguf?download=true) or [Meta-Llama-3-8B-Instruct-Q4_0.gguf](https://huggingface.co/aptha/Meta-Llama-3-8B-Instruct-Q4_0-GGUF/resolve/main/Meta-Llama-3-8B-Instruct-Q4_0.gguf).
+You can refer to the general [*Prepare and Quantize*](README.md#prepare-and-quantize) guide for model preparation, or download an already quantized model like [llama-2-7b.Q4_0.gguf](https://huggingface.co/TheBloke/Llama-2-7B-GGUF/resolve/main/llama-2-7b.Q4_0.gguf?download=true) or [Meta-Llama-3-8B-Instruct-Q4_0.gguf](https://huggingface.co/aptha/Meta-Llama-3-8B-Instruct-Q4_0-GGUF/resolve/main/Meta-Llama-3-8B-Instruct-Q4_0.gguf).
 
 ##### Check device
 
@@ -357,7 +397,7 @@ Similar to the native `sycl-ls`, available SYCL devices can be queried as follow
 ./build/bin/llama-ls-sycl-device
 ```
 
-This command will only display the selected backend that is supported by SYCL. The default backend is level_zero. For example, in a system with 2 *Intel GPU* it would look like the following:
+This command will only display the selected backend that is supported by SYCL. The default backend is level_zero. For example, in a system with 2 *intel GPU* it would look like the following:
 ```
 found 2 SYCL devices:
 
@@ -370,11 +410,17 @@ found 2 SYCL devices:
 
 #### Choose level-zero devices
 
+`ONEAPI_DEVICE_SELECTOR` uses the `backend:devices` syntax. The device list is
+comma-separated; semicolons separate independent filters/backends. The
+`[level_zero:gpu:0]` strings printed by `llama-ls-sycl-device` are display IDs,
+not valid `ONEAPI_DEVICE_SELECTOR` values.
+
 |Chosen Device ID|Setting|
 |-|-|
 |0|`export ONEAPI_DEVICE_SELECTOR="level_zero:0"` or no action|
 |1|`export ONEAPI_DEVICE_SELECTOR="level_zero:1"`|
-|0 & 1|`export ONEAPI_DEVICE_SELECTOR="level_zero:0;level_zero:1"`|
+|All level-zero GPUs|`export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"`|
+|0 & 1|`export ONEAPI_DEVICE_SELECTOR="level_zero:0,1"`|
 
 #### Execute
 
@@ -385,18 +431,16 @@ Choose one of following methods to run.
 - Use device 0:
 
 ```sh
-./examples/sycl/test.sh -mg 0
+./examples/sycl/run-llama2.sh 0
+# OR
+./examples/sycl/run-llama3.sh 0
 ```
 - Use multiple devices:
 
 ```sh
-./examples/sycl/test.sh
-```
-
-- Run llama-server:
-
-```sh
-./examples/sycl/start-svr.sh -m PATH/MODEL_FILE
+./examples/sycl/run-llama2.sh
+# OR
+./examples/sycl/run-llama3.sh
 ```
 
 2. Command line
@@ -413,28 +457,19 @@ In two device selection modes, the default SYCL backend is level_zero, you can c
 |------------------|----------------------------------------|
 | Single device    | --split-mode none --main-gpu DEVICE_ID |
 | Multiple devices | --split-mode layer (default)           |
-| Multiple devices | --split-mode tensor (tensor parallelism) |
-
-`--split-mode tensor` (tensor parallelism) shards each layer across the selected
-GPUs. It requires flash attention, which is auto-enabled when `--flash-attn` is
-left at its default `auto`, so `--split-mode tensor` works out of the box.
-Passing `--flash-attn off` together with `--split-mode tensor` is rejected at
-context creation. The default `f16` KV cache is recommended. Tensor parallelism
-is currently optimized for 2 GPUs; other device counts fall back to a generic
-all-reduce.
 
 Examples:
 
 - Use device 0:
 
 ```sh
-ZES_ENABLE_SYSMAN=1 ./build/bin/llama-completion -no-cnv -m models/llama-2-7b.Q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 400 -e -ngl 99 -sm none -mg 0 --mmap
+ZES_ENABLE_SYSMAN=1 ./build/bin/llama-cli -no-cnv -m models/llama-2-7b.Q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 400 -e -ngl 99 -sm none -mg 0
 ```
 
 - Use multiple devices:
 
 ```sh
-ZES_ENABLE_SYSMAN=1 ./build/bin/llama-completion -no-cnv -m models/llama-2-7b.Q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 400 -e -ngl 99 -sm layer --mmap
+ZES_ENABLE_SYSMAN=1 ./build/bin/llama-cli -no-cnv -m models/llama-2-7b.Q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 400 -e -ngl 99 -sm layer
 ```
 
 *Notes:*
@@ -451,27 +486,17 @@ use 1 SYCL GPUs: [0] with Max compute units:512
 
 ## Windows
 
-### Install GPU driver
+### I. Setup Environment
+
+1. Install GPU driver
 
 Intel GPU drivers instructions guide and download page can be found here: [Get Intel GPU Drivers](https://www.intel.com/content/www/us/en/products/docs/discrete-gpus/arc/software/drivers.html).
 
-### Option 1: download the binary package directly
-
-Download the binary package for Windows from: https://github.com/ggml-org/llama.cpp/releases.
-
-Extract the package to local folder, run the llama tools directly. Refer to [Run the inference](#iii-run-the-inference-1).
-
-Note, the package includes the SYCL running time and all depended dll files, no need to install oneAPI package and activte them.
-
-### Option 2: build locally from the source code.
-
-#### I. Setup environment
-
-1. Install Visual Studio
+2. Install Visual Studio
 
 If you already have a recent version of Microsoft Visual Studio, you can skip this step. Otherwise, please refer to the official download page for [Microsoft Visual Studio](https://visualstudio.microsoft.com/).
 
-2. Install Intel® oneAPI Base toolkit
+3. Install Intel® oneAPI Base toolkit
 
 SYCL backend depends on:
   - Intel® oneAPI DPC++/C++ compiler/running-time.
@@ -512,7 +537,7 @@ In the oneAPI command line, run the following to print the available SYCL device
 sycl-ls.exe
 ```
 
-There should be one or more *level-zero* GPU devices displayed as **[ext_oneapi_level_zero:gpu]**. Below is example of such output detecting an *Intel Iris Xe* GPU as a Level-zero SYCL device:
+There should be one or more *level-zero* GPU devices displayed as **[ext_oneapi_level_zero:gpu]**. Below is example of such output detecting an *intel Iris Xe* GPU as a Level-zero SYCL device:
 
 Output (example):
 ```
@@ -522,37 +547,36 @@ Output (example):
 [ext_oneapi_level_zero:gpu:0] Intel(R) Level-Zero, Intel(R) Iris(R) Xe Graphics 1.3 [1.3.28044]
 ```
 
-3. Install build tools
+4. Install build tools
 
 a. Download & install cmake for Windows: https://cmake.org/download/ (CMake can also be installed from Visual Studio Installer)
 b. The new Visual Studio will install Ninja as default. (If not, please install it manually: https://ninja-build.org/)
 
 
-#### II. Build llama.cpp
+### II. Build llama.cpp
 
 You could download the release package for Windows directly, which including binary files and depended oneAPI dll files.
 
 Choose one of following methods to build from source code.
 
-##### Option 1: Script
+#### 1. Script
 
 ```sh
-# Uses FP32, consider using FP16 for better performance in most cases
 .\examples\sycl\win-build-sycl.bat
 ```
 
-##### Option 2: CMake
+#### 2. CMake
 
 On the oneAPI command line window, step into the llama.cpp main directory and run the following:
 
 ```
 @call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 --force
 
-# Option 1: Use FP16 (recommended for better performance in most cases)
-cmake -B build -G "Ninja" -DGGML_SYCL=ON -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=icx -DCMAKE_BUILD_TYPE=Release -DGGML_SYCL_F16=ON
+# Option 1: Use FP32 (recommended for better performance in most cases)
+cmake -B build -G "Ninja" -DGGML_SYCL=ON -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=icx  -DCMAKE_BUILD_TYPE=Release
 
-# Option 2: Or FP32
-cmake -B build -G "Ninja" -DGGML_SYCL=ON -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=icx -DCMAKE_BUILD_TYPE=Release
+# Option 2: Or FP16
+cmake -B build -G "Ninja" -DGGML_SYCL=ON -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=icx  -DCMAKE_BUILD_TYPE=Release -DGGML_SYCL_F16=ON
 
 cmake --build build --config Release -j
 ```
@@ -560,17 +584,17 @@ cmake --build build --config Release -j
 Or, use CMake presets to build:
 
 ```sh
-cmake -DGGML_SYCL_F16=ON --preset x64-windows-sycl-release
-cmake --build build-x64-windows-sycl-release -j --target llama-completion
-
 cmake --preset x64-windows-sycl-release
-cmake --build build-x64-windows-sycl-release -j --target llama-completion
+cmake --build build-x64-windows-sycl-release -j --target llama-cli
+
+cmake -DGGML_SYCL_F16=ON --preset x64-windows-sycl-release
+cmake --build build-x64-windows-sycl-release -j --target llama-cli
 
 cmake --preset x64-windows-sycl-debug
-cmake --build build-x64-windows-sycl-debug -j --target llama-completion
+cmake --build build-x64-windows-sycl-debug -j --target llama-cli
 ```
 
-##### Option 3: Visual Studio
+#### 3. Visual Studio
 
 You have two options to use Visual Studio to build llama.cpp:
 - As CMake Project using CMake presets.
@@ -580,7 +604,7 @@ You have two options to use Visual Studio to build llama.cpp:
 
 All following commands are executed in PowerShell.
 
-###### - Open as a CMake Project
+##### - Open as a CMake Project
 
 You can use Visual Studio to open the `llama.cpp` folder directly as a CMake project. Before compiling, select one of the SYCL CMake presets:
 
@@ -592,10 +616,10 @@ You can use Visual Studio to open the `llama.cpp` folder directly as a CMake pro
 - For a minimal experimental setup, you can build only the inference executable using:
 
     ```Powershell
-    cmake --build build --config Release -j --target llama-completion
+    cmake --build build --config Release -j --target llama-cli
     ```
 
-###### - Generating a Visual Studio Solution
+##### - Generating a Visual Studio Solution
 
 You can use Visual Studio solution to build and work on llama.cpp on Windows. You need to convert the CMake Project into a `.sln` file.
 
@@ -647,13 +671,13 @@ Once it is completed, final results will be in **build/Release/bin**
 
     - `SYCL_LIBRARY_DIR_HINT`
 
-- Above instruction has been tested with Visual Studio 17 Community edition and oneAPI 2025.0. We expect them to work also with future version if the instructions are adapted accordingly.
+- Above instruction has been tested with Visual Studio 17 Community edition and oneAPI 2025.3.1. We expect them to work also with future version if the instructions are adapted accordingly.
 
 ### III. Run the inference
 
 #### Retrieve and prepare model
 
-You can refer to the general [*Obtaining and quantizing models*](../../README.md#obtaining-and-quantizing-models) guide for model preparation, or download an already quantized model like [llama-2-7b.Q4_0.gguf](https://huggingface.co/TheBloke/Llama-2-7B-GGUF/blob/main/llama-2-7b.Q4_0.gguf) or [Meta-Llama-3-8B-Instruct-Q4_0.gguf](https://huggingface.co/aptha/Meta-Llama-3-8B-Instruct-Q4_0-GGUF/resolve/main/Meta-Llama-3-8B-Instruct-Q4_0.gguf).
+You can refer to the general [*Prepare and Quantize*](README.md#prepare-and-quantize) guide for model preparation, or download an already quantized model like [llama-2-7b.Q4_0.gguf](https://huggingface.co/TheBloke/Llama-2-7B-GGUF/blob/main/llama-2-7b.Q4_0.gguf) or [Meta-Llama-3-8B-Instruct-Q4_0.gguf](https://huggingface.co/aptha/Meta-Llama-3-8B-Instruct-Q4_0-GGUF/resolve/main/Meta-Llama-3-8B-Instruct-Q4_0.gguf).
 
 ##### Check device
 
@@ -683,30 +707,34 @@ found 2 SYCL devices:
 
 ```
 
-##### Choose level-zero devices
+#### Choose level-zero devices
+
+`ONEAPI_DEVICE_SELECTOR` uses the `backend:devices` syntax. The device list is
+comma-separated; semicolons separate independent filters/backends. The
+`[level_zero:gpu:0]` strings printed by `llama-ls-sycl-device` are display IDs,
+not valid `ONEAPI_DEVICE_SELECTOR` values.
 
 |Chosen Device ID|Setting|
 |-|-|
 |0|Default option. You may also want to `set ONEAPI_DEVICE_SELECTOR="level_zero:0"`|
 |1|`set ONEAPI_DEVICE_SELECTOR="level_zero:1"`|
-|0 & 1|`set ONEAPI_DEVICE_SELECTOR="level_zero:0;level_zero:1"` or `set ONEAPI_DEVICE_SELECTOR="level_zero:*"`|
+|All level-zero GPUs|`set ONEAPI_DEVICE_SELECTOR="level_zero:gpu"`|
+|0 & 1|`set ONEAPI_DEVICE_SELECTOR="level_zero:0,1"`|
 
-##### Execute
+#### Execute
 
 Choose one of following methods to run.
 
 1. Script
 
-- Run test:
-
 ```
-examples\sycl\win-test.bat
+examples\sycl\win-run-llama-2.bat
 ```
 
-- Run llama-server:
+or
 
 ```
-examples\sycl\win-start-svr.bat -m PATH\MODEL_FILE
+examples\sycl\win-run-llama-3.bat
 ```
 
 2. Command line
@@ -724,28 +752,19 @@ In two device selection modes, the default SYCL backend is level_zero, you can c
 |------------------|----------------------------------------|
 | Single device    | --split-mode none --main-gpu DEVICE_ID |
 | Multiple devices | --split-mode layer (default)           |
-| Multiple devices | --split-mode tensor (tensor parallelism) |
-
-`--split-mode tensor` (tensor parallelism) shards each layer across the selected
-GPUs. It requires flash attention, which is auto-enabled when `--flash-attn` is
-left at its default `auto`, so `--split-mode tensor` works out of the box.
-Passing `--flash-attn off` together with `--split-mode tensor` is rejected at
-context creation. The default `f16` KV cache is recommended. Tensor parallelism
-is currently optimized for 2 GPUs; other device counts fall back to a generic
-all-reduce.
 
 Examples:
 
 - Use device 0:
 
 ```
-build\bin\llama-completion.exe -no-cnv -m models\llama-2-7b.Q4_0.gguf -p "Building a website can be done in 10 simple steps:\nStep 1:" -n 400 -e -ngl 99 -sm none -mg 0 --mmap
+build\bin\llama-cli.exe -no-cnv -m models\llama-2-7b.Q4_0.gguf -p "Building a website can be done in 10 simple steps:\nStep 1:" -n 400 -e -ngl 99 -sm none -mg 0
 ```
 
 - Use multiple devices:
 
 ```
-build\bin\llama-completion.exe -no-cnv -m models\llama-2-7b.Q4_0.gguf -p "Building a website can be done in 10 simple steps:\nStep 1:" -n 400 -e -ngl 99 -sm layer --mmap
+build\bin\llama-cli.exe -no-cnv -m models\llama-2-7b.Q4_0.gguf -p "Building a website can be done in 10 simple steps:\nStep 1:" -n 400 -e -ngl 99 -sm layer
 ```
 
 
@@ -766,80 +785,316 @@ use 1 SYCL GPUs: [0] with Max compute units:512
 
 ## Environment Variable
 
-### Build
+#### Build
 
 | Name               | Value                                 | Function                                    |
 |--------------------|---------------------------------------|---------------------------------------------|
 | GGML_SYCL          | ON (mandatory)                        | Enable build with SYCL code path.           |
-| GGML_SYCL_TARGET   | INTEL *(default)*                     | Set the SYCL target device type.            |
-| GGML_SYCL_DEVICE_ARCH | Optional                           | Set the SYCL device architecture. Setting the device architecture can improve the performance. See the table [--offload-arch](https://github.com/intel/llvm/blob/sycl/sycl/doc/design/OffloadDesign.md#--offload-arch) for a list of valid architectures. |
+| GGML_SYCL_TARGET   | INTEL *(default)* \| NVIDIA \| AMD    | Set the SYCL target device type.            |
+| GGML_SYCL_DEVICE_ARCH | Optional (except for AMD)             | Set the SYCL device architecture, optional except for AMD. Setting the device architecture can improve the performance. See the table [--offload-arch](https://github.com/intel/llvm/blob/sycl/sycl/doc/design/OffloadDesign.md#--offload-arch) for a list of valid architectures. |
 | GGML_SYCL_F16      | OFF *(default)* \|ON *(optional)*     | Enable FP16 build with SYCL code path. (1.) |
 | GGML_SYCL_GRAPH    | ON *(default)* \|OFF *(Optional)*     | Enable build with [SYCL Graph extension](https://github.com/intel/llvm/blob/sycl/sycl/doc/extensions/experimental/sycl_ext_oneapi_graph.asciidoc). |
 | GGML_SYCL_DNN      | ON *(default)* \|OFF *(Optional)*     | Enable build with oneDNN.                   |
-| GGML_SYCL_HOST_MEM_FALLBACK | ON *(default)* \|OFF *(Optional)* | Allow host memory fallback when device memory is full during quantized weight reorder. Enables inference to continue at reduced speed (reading over PCIe) instead of failing. Requires Linux kernel 6.8+. |
-| GGML_SYCL_SUPPORT_LEVEL_ZERO_API | ON *(default)* \|OFF *(Optional)* | Support to use Level Zero API for device memory allocation. Requires Level Zero headers/library at build time and Intel GPU driver (Level Zero runtime) at run time. Reduces system RAM usage during multi-GPU inference. SYCL backend always runs on Level Zero running time even if it's set as OFF (The SYCL api will be usage for memory allocation).|
 | CMAKE_C_COMPILER   | `icx` *(Linux)*, `icx/cl` *(Windows)* | Set `icx` compiler for SYCL code path.      |
 | CMAKE_CXX_COMPILER | `icpx` *(Linux)*, `icx` *(Windows)*   | Set `icpx/icx` compiler for SYCL code path. |
 
-1. FP32 or FP16 have different performance impact to LLM. Recommended to test them for better prompt processing performance on your models. You need to rebuild the code after change `GGML_SYCL_F16=OFF/ON`.
+1. FP16 is recommended for better prompt processing performance on quantized models. Performance is equivalent in text generation but set `GGML_SYCL_F16=OFF` if you are experiencing issues with FP16 builds.
 
-### Runtime
+#### Runtime
 
 | Name              | Value            | Function                                                                                                                  |
 |-------------------|------------------|---------------------------------------------------------------------------------------------------------------------------|
 | GGML_SYCL_DEBUG   | 0 (default) or 1 | Enable log function by macro: GGML_SYCL_DEBUG                                                                             |
-| GGML_SYCL_DEV2DEV_MEMCPY | 0 (default) or 1 | Choose the SYCL or L0 API in dev2dev memory copy.<br>Value: <br>*  0: SYCL API (default)<br>* 1: L0 API -- L0 API is found to lead to abnormal crash in some case. This debug flag is used to check the issue.|
-| GGML_SYCL_ENABLE_FLASH_ATTN | 1 (default) or 0| Enable Flash-Attention. It can reduce memory usage. The performance impact depends on the LLM.|
-| GGML_SYCL_ENABLE_OPT | 0 or 1 (default)| Enable optimize features for Intel GPUs. (Recommended to 0 for Intel devices older than Gen 10) |
-| GGML_SYCL_ENABLE_GRAPH | 0 (default) or 1 | Enable running computations through SYCL Graphs feature. Disabled by default because SYCL Graph is still on development, no better performance. |
-| GGML_SYCL_USE_LEVEL_ZERO_API | 1 (default) or 0 | Use Level Zero API for device memory allocation instead of SYCL. Reduces system RAM usage on Intel dGPUs by avoiding DMA-buf/TTM host memory staging. Requires GGML_SYCL_SUPPORT_LEVEL_ZERO_API=ON at build time. SYCL backend always runs on Level Zero running time even if it's set as OFF (The SYCL api will be usage for memory allocation).|
-| GGML_SYCL_ENABLE_DNN | 0 or 1 (default)| Enable running computations through oneDNN and always use oneMKL. |
-| GGML_SYCL_ENABLE_VMM | 0 or 1 (default) | Enable the virtual-memory device pool. |
+| GGML_SYCL_DISABLE_GRAPH | 0 or 1 (default) | Disable running computations through SYCL Graphs feature. Disabled by default because graph performance isn't yet better than non-graph performance. |
+| GGML_SYCL_DISABLE_DNN | 0 (default) or 1 | Disable running computations through oneDNN and always use oneMKL. |
+| GGML_SYCL_CPU_OFFLOAD | 0 (default) or 1 | Enable CPU offload dispatch for host-resident layers when a SYCL CPU device is available. |
+| GGML_SYCL_CPU_OFFLOAD_ASYNC | 1 (default) or 0 | CPU offload staging sync policy: `1` waits at staging-bank reuse/boundaries, `0` uses eager per-op draining. |
+| GGML_SYCL_CPU_DEVICE_SELECTOR | e.g. `opencl:cpu` | Optional override for CPU offload queue selection when `ONEAPI_DEVICE_SELECTOR` does not expose a CPU device. |
+| GGML_SYCL_CPU_BATCH_THRESHOLD | integer | Legacy global CPU batch threshold (applies to both PP and TG when set). |
+| GGML_SYCL_CPU_BATCH_THRESHOLD_PP | 4 (default) | CPU offload batch threshold for prompt-processing phase. |
+| GGML_SYCL_CPU_BATCH_THRESHOLD_TG | 16 (default) | CPU offload batch threshold for decode/token-generation phase. |
+| GGML_SYCL_HOST_COMPUTE | 0 (default) or 1 | Use host-pinned compute buffers for CPU-offload activation tensors. Keep `0` for best/stable mixed L0+OpenCL offload throughput; `1` is opt-in for debugging/experiments. |
+| GGML_SYCL_CPU_STAGING_GROW_GRANULARITY_KB | 256 (default) | CPU offload staging growth granularity in KiB (larger value reduces realloc churn at the cost of extra headroom). |
+| GGML_SYCL_CPU_OFFLOAD_VECDOT_MIN_WORK | 512 (default) | Minimum vec_dot output work (`N*M`) required before enabling TBB parallelization in CPU offload `MUL_MAT`. |
+| GGML_SYCL_CPU_OFFLOAD_VECDOT_MIN_ROWS_PER_TASK | 4 (default) | Minimum rows-per-task grain for TBB partitioning in CPU offload vec_dot path. |
+| GGML_SYCL_CPU_OFFLOAD_VECDOT_TASKS_PER_THREAD | 2 (default) | Target number of TBB vec_dot tasks per CPU thread in the offload path. |
+| GGML_SYCL_OFFLOAD_STATS | 0 (default) or 1 | Emit per-graph offload summary counters (`wait_count`, alloc counts, pool hit/miss, transfer counts/bytes, CPU/GPU dispatch counts, transition wait/elide counts). |
+| GGML_SYCL_OFFLOAD_LOCALITY | 1 (default) or 0 | Enable locality smoothing for CPU/GPU offload planning to reduce ping-pong segments. |
+| GGML_SYCL_OFFLOAD_HYSTERESIS | phase-aware default (PP=3, TG=2) | Minimum segment length before flipping domain in locality smoothing. |
+| GGML_SYCL_OFFLOAD_CROSS_COST | phase-aware default (PP=2, TG=1) | Additional penalty for short CPU segments when locality smoothing is enabled. |
+| GGML_SYCL_OFFLOAD_BOUNDARY_WAIT_BYTES | 1048576 (default) | In async offload mode, only force GPU→CPU boundary queue wait when tracked boundary bytes are at least this threshold. |
+| GGML_SYCL_OFFLOAD_PLAN_DUMP | 0 (default) or 1 | Dump CPU/GPU segment plan, boundary count, and estimated boundary bytes for each graph. |
+| GGML_SYCL_MOE_GATEUP_SINGLE_XMX | 0 (default) or 1 | Experimental GPT-OSS MXFP4 gate/up proof mode. Requires gate/up experts to use one persistent `GGML_LAYOUT_XMX_TILED` VRAM layout consumed by both PP and TG. No persistent SOA gate/up duplicate and no per-token gate/up prepack are allowed. Parser validation must include `--require-single-xmx-gateup --forbid-gateup-soa-fallback`. Lead-only non-dry-run B50/B580/model validation is required before promotion; workers must use dry-run-only gates. |
+| GGML_SYCL_MOE_GATEUP_M2_TG1_INDEX | 0 (default) or 1 | Default-off GPT-OSS MXFP4 decode-only proof knob for the packed-Q8 M2 gate/up route. When enabled, it specializes `mxfp4.gateup.xmx_tiled_dpas_m2` indexing for `n_tokens == 1`; it must not affect prompt processing or authorize V2, bundle4, M4, prefetch, direct-q8, or default-on behavior without lead-owned correctness and throughput evidence. |
+| GGML_SYCL_MOE_DOWN_Q8_DPAS_TILE | unset (default is OFF), `tile2`, or `tile4` | Experimental/default-off GPT-OSS MXFP4 decode-only down Q8 DPAS tile candidate. Task 7 validation rejected default-on promotion: count gates passed, but neither tile met end-to-end TG or named-kernel performance criteria. |
+| GGML_SYCL_DMA_SLICE_MB | 1024 (default) | Unified-cache DMA streaming slice size in MB (aligned to row size). |
+| GGML_SYCL_DMA_BUFFERS | 2 (default) | Unified-cache DMA streaming buffer count (staging buffers). Alias: `GGML_SYCL_DMA_SLICES`. |
+| GGML_SYCL_DMA_RESERVE_MB | (auto) | VRAM headroom reserved for DMA staging buffers; overrides slice/buffer-derived default. |
+| GGML_SYCL_SET_TENSOR_STREAM_FENCE | 0 (default) or 1 | In `set_tensor`, wait only on the current stream before host copy (safer than no fence, cheaper than global drain). |
+| GGML_SYCL_SET_TENSOR_GLOBAL_DRAIN | 0 (default) or 1 | In `set_tensor`, force legacy global queue drain before host copy. Mainly for debugging/bisecting. |
+| GGML_SYCL_COPY_TO_DEVICE_SYNC | 0 (default) or 1 | Force legacy synchronous `copy_to_device_async` behavior for bringup/debug. |
 | ZES_ENABLE_SYSMAN | 0 (default) or 1 | Support to get free memory of GPU by sycl::aspect::ext_intel_free_memory.<br>Recommended to use when --split-mode = layer |
-| UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS | 0 (default) or 1 | Allow SYCL/Unified Runtime Level Zero device allocations larger than 4 GiB. llama.cpp's direct Level Zero allocation path requests the relaxed maximum-size limit itself when GGML_SYCL_ENABLE_LEVEL_ZERO=1. |
-| GGML_SYCL_USM_SYSTEM | 0 (default) or 1 | Enable experimental support for [USM system allocations](https://github.khronos.org/SYCL_Reference/iface/usm_basic_concept.html#system-allocations) for large GPU buffers. This requires enough host memory for model weights and caches, an Intel Xe2+ GPU such as BMG or newer and supported on Linux only, with CONFIG_DRM_XE_GPUSVM enabled. |
+| UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS | 0 (default) or 1 | Support malloc device memory more than 4GB.|
 
-## Compile-time Flags
+### MXFP4 MoE TG Microbench Suite
 
-Pass these via `CXXFLAGS` or add a one-off `#define` to enable a flag on the spot.
+`sycl-mxfp4-moe-bench` is a synthetic research tool for B50 GPT-OSS MXFP4 token-generation route screening. It does not change llama runtime dispatch and is worker-safe only when used in `--dry-run` mode.
 
-| Name            | Function                                                                         |
-|-----------------|----------------------------------------------------------------------------------|
-| DEBUG_SYCL_POOL | Enable device memory pool logging on teardown. Useful for profiling allocations. |
-| DEBUG_SYCL_MALLOC | Enable verbose per-call logging of device pool alloc/free operations. |
-| GGML_SYCL_SUPPORT_VMM | Support to building with VMM code. Default is Yes. |
+Worker-safe smoke commands:
 
-## Design Rule
+```bash
+./scripts/sycl-build.sh sycl-mxfp4-moe-bench
+python3 scripts/run-sycl-mxfp4-tg-microbenches.py --dry-run --out-dir /tmp/mxfp4_tg_dryrun
+python3 scripts/parse-sycl-mxfp4-tg-bench.py /tmp/mxfp4_tg_dryrun/baseline.jsonl --require-route baseline
+```
 
-- Open to all contributors.
+Lead-only non-dry-run and model validation are documented in activation/mxfp4-tg-microbench-lead-validation.md.
 
-- All code change should be useful to user:
-    - Fix bug.
-    - Add new function.
-    - Improve the performance/usage.
-    - Make code be easy to maintain.
-    - ...
+## Memory placement
 
-- Don't accept the codes of following cases:
-    - Break legacy function.
-    - Reduce the performance of legacy case in default.
-    - Not completed work/the functionality cannot be demonstrated.
+SYCL builds use the unified cache as the memory placement authority. Model
+weights, KV cache, pinned host memory, and backend-visible SYCL buffers must be
+placed by the unified cache planner or by SYCL buffer types that delegate to it.
 
-- Encourage to use environment variable to control features to be opened/closed.
-    - User can evaluate the feature without rebuild the code.
-    - Recommend the best features to user by setting them be opened as default.
+The generic llama.cpp fit path (`-fit`, `--fit-target`, and `--fit-ctx`) is
+disabled for SYCL builds. That path rewrites `n_gpu_layers`, tensor split, and
+tensor buffer overrides before model loading, which duplicates and can conflict
+with unified cache placement. In SYCL builds, common initialization ignores
+`-fit on`, `llama-bench` ignores `--fit-target`/`--fit-ctx`, and direct calls to
+`common_fit_params()` return without modifying placement parameters.
 
-- Design the code based on the published official releases of oneAPI packages: compiler, library, driver, OS kernel.
+#### Flash Attention oneDNN Layout Policy
 
-- Developers need to maintain the code they submit.
+The SYCL flash-attention oneDNN path uses the oneDNN Graph SDPA pattern
+`MatMul(Q,K^T) -> Divide(scale) -> Add(mask) -> SoftMax -> MatMul(V)`.
+The direct path is enabled only when tensor metadata can be represented safely
+as oneDNN strided logical tensors:
+
+- MHA uses 4-D logical tensors `(batch, heads, seq, head_dim)`.
+- GQA/MQA uses 5-D logical tensors `(batch, kv_heads, head_repetition, seq, head_dim)`.
+- Q/K/V must be f16, mask must be f16 or f32, `head_dim <= 512`, no attention sinks,
+  no logit softcap, no FP8 KV, no multi-sequence batch, tensor batch must be the
+  proven batch-1 descriptor class, K/V must not use paged layouts, and prompt
+  batch must meet `GGML_SYCL_FA_ONEDNN_MIN_NCOLS` (default `8`).
+- Direct GQA/MQA additionally requires the physical K/V token stride to match
+  `head_dim`. If `nc_stride != head_dim`, the planner marks the shape as
+  `MATERIALIZE_REQUIRED` and repacks K/V into dense f16 device buffers before
+  oneDNN execute. Allocation or repack failure still falls back to native FA.
+- oneDNN's GQA example (`/opt/intel/oneapi/dnnl/2025.3/share/doc/dnnl/examples/gqa.cpp`)
+  defines 5-D GQA as Q/output `(mb, kv_heads, head_rep, seq, head_size)`,
+  K/V `(mb, kv_heads, 1, seq, head_size)`, score
+  `(mb, kv_heads, head_rep, seq, seq)`, and mask `(mb, 1, 1, 1, seq)`.
+  The SYCL backend follows that rank/order while using explicit strides for
+  GGML storage.
+
+`GGML_SYCL_FA_FORCE_PATH=onednn` is diagnostic for unsupported layouts: it prints
+the planner reason and falls back instead of bypassing safety. For proven
+MATERIALIZE_REQUIRED GQA/MQA shapes it exercises the materialized oneDNN path.
+`GGML_SYCL_FA_ONEDNN_ALLOW` does not override the layout planner.
+
+Token-generation decode uses a separate native FA policy. The conservative
+safe-decode fallback remains available, but the default now bypasses it for
+single-query f16 descriptor classes with an integral Q-head/KV-head ratio. The
+ESIMD f16 decode kernel implements stateless attention modifiers directly:
+attention sinks, logit softcap, and ALiBi bias may use the fast path. FP8 KV,
+paged K/V, multi-sequence routing/IDs, and multi-token decode remain on the
+conservative path until those address/ownership variants have separate proof.
+`GGML_SYCL_FA_SAFE_DECODE=1` forces the fallback for debugging, and
+`GGML_SYCL_FA_SAFE_DECODE=0` disables the safe-decode gate entirely for A/B
+testing. `GGML_SYCL_FA_DISPATCH_DEBUG=1` prints the selected decode kernel
+(`esimd_f16`, `vec_f16`, `tile_f16`, `xmx_*`, or `onednn`) and the fast-decode
+eligibility bit.
+
+On B580 with Mistral 7B Q4_0, build `5b206c499-dirty`, the fixed default
+`-fa 1` policy measured PP512 `2173.92 +/- 10.01` tok/s and TG128
+`88.42 +/- 0.47` tok/s. The deterministic completion gate also produced the
+expected `1, 2, 3, ..., 10` sequence while default decode selected `esimd_f16`.
+Logs for that validation were `/tmp/kkxtv7.7-default-fa-completion.log` and
+`/tmp/kkxtv7.7-default-fa-pp512-tg128.log`.
+
+On B50 with GPT-OSS 20B MXFP4, build `5b206c499-dirty`, a decode-focused
+`-p 1 -n 16 -fa 1` run selected `esimd_f16` with `fast_esimd_safe=1` for the
+sinks+softcap decode path and measured TG16 `14.65 +/- 0.05` tok/s. The full
+PP512/TG128 GPT-OSS B50 benchmark is currently blocked before decode by a
+separate MoE CPU expert host-zone allocation abort in `MUL_MAT_ID`; see
+`/tmp/kkxtv7.7-gptoss20b-b50-fa-op-relax-pp512-tg128.log`.
+
+`GGML_SYCL_MOE_GATEUP_SINGLECOL=1` is an experimental GPT-OSS MXFP4 TG-only
+gate/up candidate. It remains default-off: JD32 synthetic proof on B50 showed
+`singlecol` rows were numerically exact but slower than the packed-Q8 M2
+synthetic baseline, so full-model promotion was skipped. Promotion would still
+require exact count correctness, `fatal.total 0`, `PP512 >= 1200`, `TG128 >=
+45`, `singlecol-gateup` route evidence, and gate/up profile `<= 4.2 ms`. This
+flag does not authorize prompt XMX or persistent duplicate gate/up layouts.
+
+A same-expert multi-RHS MXFP4 gate/up benchmark-only candidate was also
+rejected before runtime wiring. B50 synthetic rows validated exactly, but
+`mxfp4_pair_glu_xmx_tiled_multirhs_n2_r8` measured `605.034755 us` and
+`mxfp4_pair_glu_xmx_tiled_multirhs_n4_r8` measured `1323.299220 us` versus the
+packed-Q8 M2 baseline at `235.588515 us`. No production
+`GGML_SYCL_MOE_GATEUP_MULTIRHS` route is authorized or wired; the benchmark
+result does not authorize role-column gate/up fusion or persistent duplicate
+gate/up layouts.
+
+The benchmark-only `XMX_TILED_V2` aligned-payload MXFP4 gate/up layout candidate
+was rejected before runtime wiring. On B50, `/tmp/v2_gateup_synth.jsonl` showed
+the current packed-Q8 M2 synthetic baseline at `237.084865 us` with
+`max_abs_error=0.000000`, while
+`mxfp4_pair_glu_xmx_tiled_v2_packed_r8_m2_sparse32_bias` validated exactly but
+measured `251.179255 us` with `max_abs_error=0.000000`, missing the `<= 188.47
+us` continue gate. Launch-timing diagnostics then showed non-device launch/drain
+overhead at only `3.19%` of raw summed gate/up time, and host-only expert
+histogram diagnostics produced no histogram lines in the canonical single-stream
+B50 run because `ids_host` was not available. No V2 runtime route, graphlet
+promotion, grouped-reuse route, or persistent duplicate gate/up layout is
+authorized by this evidence.
+
+The benchmark-only `bundle4` MXFP4 gate/up layout candidate was also rejected
+for runtime follow-up after lead-owned synthetic and VTune checks in
+`/tmp/sycl_mxfp4_gateup_bundle4_20260701_152716`. It was exact, but only
+`1.14%` faster than the refreshed packed-Q8 M2 baseline: baseline
+`274.483888 us`, V2 `282.588609 us`, and bundle4 `271.363688 us`, all with
+`max_abs_error=0.000000`. VTune instruction-count mode reported baseline
+`100224000` GPU instructions and bundle4 `101151360`; both had spill memory
+`0`, `SIMD Utilization(%)=91.3`, `dpas.8x8=4`, and `send.ugm=65` from ocloc
+assembly summaries. VTune stdout labeled the GPU as `Battlemage G21 [Arc B580]`
+despite the process running with `ONEAPI_DEVICE_SELECTOR=level_zero:1`, so this
+record uses the VTune data only for relative instruction/disassembly evidence
+and does not make B50-specific absolute VTune claims. Decision:
+`bundle4-rejected`; no runtime route, default-on behavior, production promotion,
+graphlet route, or persistent duplicate gate/up layout is authorized by this
+evidence.
+
+A follow-up benchmark-only bundle4 opportunity pass added a non-bias route,
+full-group A loads, and vectorized full-tile bias/output stores, then recorded
+lead-owned evidence in
+`/tmp/sycl_mxfp4_bundle4_opportunities_20260701_221449`. All synthetic rows were
+exact, but the fastest route still missed the `10%` runtime-followup gate:
+packed-Q8 M2 sparse/bias baseline `272.495794 us`, non-bias bundle4
+`249.225306 us` (`9.34%` faster), and sparse/bias bundle4 `251.723551 us`
+(`8.25%` faster), all with `max_abs_error=0.000000`. VTune compute-extended
+active-kernel rows reported XMX-active / read-bandwidth values of `0.0%` /
+`0.0 GB/s` for baseline, `0.0%` / `0.0 GB/s` for non-bias bundle4, and `6.9%`
+/ `224.411295 GB/s` for sparse/bias bundle4; the zeroed baseline/non-bias rows
+are retained as collected evidence but are not overinterpreted. VTune
+mem-latency reported active-kernel read latency / estimated GPU cycles of
+`318 cycles` / `469561326` for baseline, `526 cycles` / `479885090` for
+non-bias bundle4, and `471 cycles` / `432343346` for sparse/bias bundle4. ocloc
+assembly summaries kept `dpas.8x8=4` and spill memory `0`; baseline had
+`send.ugm=65`, `16` scalar store comments, and no vector-store comments, while
+optimized bundle4 had `send.ugm=75`, `16` scalar store comments from the
+retained tail fallback, and `2` vector-store comments for the full-tile path.
+VTune summaries again labeled
+the target as `Battlemage G21 [Arc B580]` despite
+`ONEAPI_DEVICE_SELECTOR=level_zero:1` and `target-gpu=0:7:0.0`, so these numbers
+are relative benchmark evidence and not B50-specific absolute VTune claims.
+Decision: `bundle4-opportunity-rejected`; no runtime route, default-on behavior,
+production promotion, graphlet route, or persistent duplicate gate/up layout is
+authorized by this evidence.
+
+The planner-owned materialization contract is implemented separately from the
+oneDNN execute gate:
+
+- Source K/V are f16 GGML flash-attention views with dimensions
+  `[head_dim, kv_tokens, kv_heads, batch]` and byte strides carried by
+  `fattn_params`; the executable materialized path is currently limited to
+  `batch == 1`.
+- Target K/V are dense f16 device buffers on the planned SYCL device with token
+  stride `head_dim * sizeof(f16)` and head stride
+  `kv_tokens * head_dim * sizeof(f16)`.
+- Target allocation ownership is through the unified-cache allocation policy and
+  exposed to users as smart `mem_handle` objects. Private FA caches and raw
+  untracked cross-device buffers are not valid ownership.
+- Materialization is not attempted during SYCL graph recording or for paged K/V;
+  native FA handles those cases.
+- End-to-end oneDNN consumption of materialized GQA/MQA K/V is enabled only for
+  the proven f16 descriptor class above. The output logical tensor is not dense
+  `(batch, heads, seq, head_dim)` storage: it writes directly to GGML dst layout
+  `[head_dim, heads, seq, batch]`, so the required output strides are
+  4-D `{heads * seq * head_dim, head_dim, heads * head_dim, 1}` and 5-D
+  `{heads * seq * head_dim, head_rep * head_dim, head_dim, heads * head_dim, 1}`.
+  The old dense output descriptor is rejected by the synthetic descriptor test
+  because it permutes query/head output and reproduces deterministic corruption.
+
+#### CPU Offload Bench + VTune Harness
+
+Use the helper script to run PP/TG separately with unified-cache CPU offload and optional VTune collection:
+
+```bash
+./scripts/sycl-cpu-offload-bench-vtune.sh \
+  --model /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
+  --profile nonstream-cpuoffload
+```
+
+Defaults used by the script:
+- `ONEAPI_DEVICE_SELECTOR='level_zero:0;opencl:cpu'`
+- Unified cache is mandatory; no enable flag is required.
+- `GGML_SYCL_CPU_OFFLOAD=1`
+- `GGML_SYCL_CPU_OFFLOAD_ASYNC=1`
+- `GGML_SYCL_CPU_BATCH_THRESHOLD_PP=4`
+- `GGML_SYCL_CPU_BATCH_THRESHOLD_TG=16`
+- `GGML_SYCL_VRAM_BUDGET_PCT=25`
+
+The harness reports PP/TG separately and can enforce metric gates:
+- `zeMemAllocHost` call count
+- `zeEventHostSynchronize` call count
+- `ggml_backend_sycl_buffer_set_tensor` CPU time
+
+## Cross-device KV placement contract
+
+This contract applies to hidden-device multi-GPU runs where the SYCL backend may
+expose fewer scheduler devices than physical Level Zero GPUs. For example, the
+runtime can expose `device_count == 1` to the ggml scheduler while still keeping
+`total_gpu_count > device_count` physical GPUs available to the unified cache for
+expert, weight, KV, or activation ownership.
+
+The planner is the source of truth for ownership. The `kv_device` and `layer_device` fields have distinct meanings: `layer_device` identifies the
+device that should execute a layer's dense work, and `kv_device` identifies the
+device that owns that layer's KV roots. A non-negative `kv_device` is a physical
+SYCL device ordinal in the unified-cache device namespace, even when that ordinal
+is greater than or equal to scheduler-visible `device_count`. Host KV is valid
+only when the planner explicitly chooses host placement, an explicit KV-host mode
+is enabled, or a documented fail-fast allocation error is being reported.
+
+`SYCL_KV_Tiered` must materialize `cache_k_l*` and `cache_v_l*` root tensors on
+the planned owner. Remote device-planned KV must never be represented as ordinary host-pinned fallback. A tensor planned for physical device 1 remains device-owned
+by device 1; it is not a host tensor merely because the scheduler currently runs
+the graph on device 0.
+
+Smart handles carry this ownership across roots, views, and staging decisions.
+The KV root tensor must have an `extra_gpu` smart handle for the planned owner,
+and views of that root must resolve through root plus `view_offs` for the
+requested device. A view-local raw pointer or stale direct handle is not allowed
+to override the root smart-handle owner. If execution needs data on another GPU,
+the routing layer must either execute on the KV owner or explicitly stage/migrate
+through unified-cache handles.
+
+CPU fallback is invalid for device-planned F16 attention and KV. When F16 attention consumes device-planned KV, code should fail fast with ownership
+diagnostics or route the operation to a GPU owner. It must not silently recover
+by running CPU attention over host-pinned copies of KV that the planner assigned
+to a GPU.
+
+The safe default for hidden-device multi-GPU MoE is expert-mode execution, and hybrid/layer placement remains explicit until cross-device KV routing is implemented. In expert mode, dense activations and KV stay local to the
+scheduler-visible GPU while experts use the unified cache across physical GPUs.
+Hybrid/layer can assign KV to a hidden physical device and therefore requires
+the full ownership and routing contract described here.
+
+Diagnostics for future cross-device KV tasks must report, at minimum, the planned device, materialized owner, buffer type, root extra/smart-handle status, and routing decision for each affected KV layer or F16 attention operation.
 
 ## Known Issues
 
-- `Split-mode:[row]` is not supported.
+## Runtime Allocation Policy
 
-- Missed the AOT (Ahead-of-Time) in building.
-  - Good: Builds quickly, smaller size of binary file.
-  - Bad: The startup is slow (JIT) in first time, but subsequent performance is unaffected.
+- Managed runtime allocations must go through unified allocator APIs in `unified-cache.cpp`.
+- Do not add new direct `sycl::malloc_device`, `sycl::malloc_host`, or `sycl::malloc_shared` calls in managed runtime paths.
+- Use `./scripts/check-sycl-alloc-usage.sh` to validate policy compliance locally.
+- Allowed managed placement tiers are:
+  - device VRAM (`malloc_device`)
+  - host pinned (`malloc_host`)
+  - mmap tracked reservations (budget accounting only)
+- Shared USM (`malloc_shared`) is not allowed for managed CPU-offload/host-compute paths.
+
+- `Split-mode:[row]` is not supported.
 
 ## Q&A
 
@@ -852,7 +1107,7 @@ Pass these via `CXXFLAGS` or add a one-off `#define` to enable a flag on the spo
 
   - Remove **build** folder or try a clean-build.
 
-- I can **not** see `[ext_oneapi_level_zero:gpu]` after installing the GPU driver on Linux.
+- I can **not** see `[ext_oneapi_level_zero:gpu]` afer installing the GPU driver on Linux.
 
   Please double-check with `sudo sycl-ls`.
 
@@ -868,7 +1123,7 @@ Pass these via `CXXFLAGS` or add a one-off `#define` to enable a flag on the spo
 
   No. We can't support Ollama issue directly, because we aren't familiar with Ollama.
 
-  Suggest reproducing on llama.cpp and report similar issue to llama.cpp. We will support it.
+  Sugguest reproducing on llama.cpp and report similar issue to llama.cpp. We will surpport it.
 
   It's same for other projects including llama.cpp SYCL backend.
 
@@ -883,14 +1138,304 @@ Pass these via `CXXFLAGS` or add a one-off `#define` to enable a flag on the spo
 
 - `ggml_backend_sycl_buffer_type_alloc_buffer: can't allocate 5000000000 Bytes of memory on device`
 
-  With the default `GGML_SYCL_ENABLE_LEVEL_ZERO=1`, llama.cpp requests Level Zero's relaxed maximum-size allocation limit directly. If Level Zero support is disabled at build time or runtime and the allocation goes through SYCL/Unified Runtime instead, enable support for allocations larger than 4 GiB by:
+  You need to enable to support 4GB memory malloc by:
   ```
     export UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1
     set UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1
   ```
 
 ### **GitHub contribution**:
-Please add the `[SYCL]` prefix/tag in issues/PRs titles to help the SYCL contributors to check/address them without delay.
+Please add the `SYCL :` prefix/tag in issues/PRs titles to help the SYCL contributors to check/address them without delay.
+
+### Named SYCL kernel event profiler
+
+Set `GGML_SYCL_KERNEL_PROFILE=1` to enable the backend-wide named kernel profiler. The profiler records SYCL event profiling timestamps under human labels assigned by llama.cpp, not VTune task names. VTune computing-task attribution is not the source of truth for this route; SYCL event profiling timestamps are.
+
+Useful variables:
+
+| Variable | Effect |
+|---|---|
+| `GGML_SYCL_KERNEL_PROFILE=1` | Enable named event collection. |
+| `GGML_SYCL_KERNEL_PROFILE_OUTPUT=/tmp/sycl-kernels` | Write scriptable artifacts. `.csv` and/or `.json` suffixes are added for `both`. |
+| `GGML_SYCL_KERNEL_PROFILE_FORMAT=csv,json,both` | Select artifact format. |
+| `GGML_SYCL_KERNEL_PROFILE_TOP_N=40` | Number of rows in the stderr top-k summary. |
+| `GGML_SYCL_KERNEL_PROFILE_FLUSH=final,window,none` | `final` harvests at explicit teardown/tool flushes, `window` waits at requested profiler flush points, and `none` records opportunistically without forcing completeness. |
+| `GGML_SYCL_KERNEL_PROFILE_RAW=1` | Include raw per-event rows when supported. |
+
+Model-free smoke command:
+
+```bash
+set +u; source /opt/intel/oneapi/setvars.sh --force; set -u
+ONEAPI_DEVICE_SELECTOR=level_zero:1 \
+GGML_SYCL_KERNEL_PROFILE=1 \
+GGML_SYCL_KERNEL_PROFILE_OUTPUT=/tmp/sycl-kernels \
+GGML_SYCL_KERNEL_PROFILE_FORMAT=both \
+GGML_SYCL_KERNEL_PROFILE_FLUSH=window \
+./build/bin/sycl-kernel-bench \
+  --kernel=mxfp4_pair_glu_xmx_tiled_packed_r8_m2 \
+  --quant=MXFP4 --dim_m=2880 --dim_n=4 --dim_k=2880 \
+  --iterations=10 --warmup=2 --output=json
+
+python3 scripts/parse-sycl-kernel-profile.py \
+  --require-kernel mxfp4.gateup.xmx_tiled_dpas_m2 \
+  /tmp/sycl-kernels.csv
+```
+
+### MXFP4 down-variant named profile matrix
+
+`scripts/sycl-gptoss-down-variant-profile-matrix.sh` is a lead-only helper for comparing default-off GPT-OSS MXFP4 decode down variants with the named SYCL event profiler. It is dry-run by default and must not launch real model work unless the lead passes `--execute`.
+
+The baseline, row-group, and atomic rows use the valid FA-on B50 GPT-OSS baseline environment: `-fa 1`, `GGML_SYCL_MOE_PHASE_MATERIALIZE=1`, `GGML_SYCL_MOE_PHASE_BULK_XMX=1`, and `GGML_SYCL_MOE_DOWN_SUM_DIRECT=1`. Cached q8-SOA rows are diagnostic only and explicitly set `GGML_SYCL_MOE_DOWN_SUM_DIRECT=0`; they are not promotion candidates for the current FA-on direct-sum baseline.
+
+MXFP4 direct-final down remains default-off. Existing `GGML_SYCL_MOE_DOWN_SUM_*_DIRECT_FINAL*` knobs are proof/debug controls only, and direct-final promotion requires a separate approved plan plus lead-owned GPT-OSS correctness, PP preservation, and TG throughput gates.
+
+### GPT-OSS MXFP4 end-to-end TG profile ledger
+
+`GGML_SYCL_E2E_TG_PROFILE=1` enables a default-off decode ledger for GPT-OSS MXFP4 token generation. The ledger complements `[MXFP4-MOE-TG-PROFILE]` by reporting full decode stage evidence rather than MoE-only timing.
+
+The summary line is:
+
+```text
+[SYCL-E2E-TG-PROFILE] tokens=1 ops=512 moe_calls=72 total_host=18.250 ms total_device=7.125 ms
+```
+
+Stage rows are:
+
+```text
+[SYCL-E2E-TG-STAGE] stage=moe calls=72 host=0.900 ms device=6.500 ms bytes=0 last_path=packed-q8-m2
+[SYCL-E2E-TG-STAGE] stage=attention calls=32 host=0.450 ms device=0.500 ms bytes=1048576 last_path=xmx_v2_f16_pp_ncols32
+```
+
+Parse logs with:
+
+```bash
+python3 scripts/parse-sycl-moe-profile.py \
+  --require-no-fatal-markers \
+  --require-mxfp4-profile-evidence \
+  --require-e2e-profile-evidence \
+  --require-e2e-stage moe \
+  --require-e2e-stage attention \
+  /tmp/sycl_gptoss_e2e_profile_lead_20260630_000000/baseline/bench.stdout \
+  /tmp/sycl_gptoss_e2e_profile_lead_20260630_000000/baseline/bench.stderr
+```
+
+For command generation, use dry-run mode first:
+
+```bash
+bash scripts/sycl-gptoss-e2e-profile-matrix.sh --dry-run
+```
+
+Real model validation is lead-owned and validates the explicitly selected device.
+The harness defaults to `ONEAPI_DEVICE_SELECTOR=level_zero:1` (B50 on this
+workstation); use `--device-selector level_zero:0` for B580 or another explicit
+selector. Real execution requires:
+
+```bash
+bash scripts/sycl-gptoss-e2e-profile-matrix.sh --run --i-understand-this-runs-gpu-models
+```
+
+Do not use this ledger to bypass existing safety gates. Runtime optimization remains default-off until the canonical GPT-OSS correctness gate, fatal-marker parser gates, PP preservation, and TG improvement are all proven on lead-owned hardware.
+
+### SYCL decode timeline profiler
+
+`GGML_SYCL_TIMELINE` enables the decode timeline profiler for host-side attribution around SYCL graph-compute work. Use it with the existing FA-on GPT-OSS baseline guidance above; the timeline is diagnostic evidence and does not make no-FA profiling a valid replacement for the canonical GPT-OSS correctness, fatal-marker, PP-preservation, and TG-throughput gates.
+
+Runtime knobs:
+
+| Variable | Effect |
+|---|---|
+| `GGML_SYCL_TIMELINE=summary` | Enable the profiler configuration without recording Chrome Trace spans. This is useful for confirming the code path is active with minimal artifact volume. |
+| `GGML_SYCL_TIMELINE=timeline` | Record host spans to the timeline artifact. |
+| `GGML_SYCL_TIMELINE=timeline+events` | Record host spans plus GPU `sycl.event` profiling spans harvested from named SYCL events. |
+| `GGML_SYCL_TIMELINE_OUTPUT=/tmp/sycl-decode-timeline.json` | Write the Chrome Trace JSON artifact at profiler flush. |
+| `GGML_SYCL_TIMELINE_TOKEN_START=N` | Start recording at graph-compute invocation index `N`. This limit is enforced. |
+| `GGML_SYCL_TIMELINE_TOKEN_COUNT=N` | Record at most `N` graph-compute invocations after the start index. This limit is enforced; `0` means unbounded. |
+| `GGML_SYCL_TIMELINE_MAX_EVENTS=N` | Cap buffered timeline events; use a large enough value for the selected token window. |
+
+`GGML_SYCL_TIMELINE_TOKEN_START` and `GGML_SYCL_TIMELINE_TOKEN_COUNT` count graph-compute invocations, not text tokens. Prefill also consumes graph-compute indices, so set `GGML_SYCL_TIMELINE_TOKEN_START` past the prefill graph-compute count when you need to isolate pure decode.
+
+Parse the artifact with `scripts/parse-sycl-timeline.py`:
+
+```bash
+python3 scripts/parse-sycl-timeline.py \
+  --wall-ms 1000 \
+  --top-callsites 40 \
+  /tmp/sycl-decode-timeline.json
+```
+
+The parser reports `category.*` host totals, `callsite.*` host-side file:line attribution, GPU event coverage, and reconstructed `gap.*` metrics. `--top-callsites` is supported for limiting host callsite rows.
+
+`timeline.gaps.parse` is the first artifact to inspect when `timeline.unattributed_ms_x1000` is large. Generate it with `scripts/parse-sycl-timeline.py --top-gaps 20 --top-host-gap-overlaps 40`. The `gap_transition.*` rows show adjacent named SYCL events that bound device-timestamp gaps. The `host_gap_overlap.*` rows show host `compute_forward_node` ops that overlap gaps between adjacent submit spans. A residual `gap.device*` total is not by itself proof of GPU idle; it may be unprofiled kernels, runtime queue scheduling, graph replay work, or host-side dispatch between named events.
+
+Open the same JSON in Perfetto for visual inspection. Host spans are the visual timeline. GPU `sycl.event` spans are anchored at `ts=0` because their timestamps use device profiling clocks; the device nanosecond fields are carried in event args (`device_submit_ns`, `device_start_ns`, `device_end_ns`) and do not visually interleave with host spans. Use `scripts/parse-sycl-timeline.py` for GPU gap metrics because it reconstructs `gap.*` from that event metadata.
+
+Default attribution is host-side file:line callsites plus named GPU kernel labels. `scripts/sycl-gptoss-decode-timeline-profile.sh` now writes `cost-ranking.parse` and `wall-ledger.parse` in addition to `timeline.parse`, `timeline.gaps.parse`, and `kernels.parse`. Use `cost-ranking.parse` for the ranked named-kernel table, and use `wall-ledger.parse` to compare timeline `sycl.event` coverage against the kernel-profile total. If `ledger.coverage_status` is `coverage_mismatch`, keep `sycl-kernels.csv/json` authoritative for named GPU cost and treat `ledger.unknown_wall_residual_ms_x1000` as unknown time, not proof of GPU idle.
+
+### VTune GPU source-line attribution enablement
+
+VTune GPU source-line attribution is an optional deep dive only, not a prerequisite for using the decode timeline profiler and not the source of truth for default host callsite attribution. Exact GPU source-line profiling is enabled only when three independent evidence layers agree:
+
+1. **ZEBin DWARF line table** evidence: the dumped `.zebin` contains a usable DWARF `.debug_line` section for the selected kernel. `.debug_line` is necessary but not sufficient, because VTune can still report unknown source rows if it cannot map samples back through the compute task.
+2. **VTune computing-task selection** evidence: the VTune computing-task report identifies the intended kernel/task, and any `computing-tasks-of-interest` filter matches that task instead of accidentally profiling a neighboring SYCL kernel.
+3. **VTune `gpu-source-line`** evidence: the exported VTune `gpu-source-line` CSV contains non-`[Unknown]` rows for the target kernel. The final parser must report `source_line.status pass`; otherwise keep exact-line attribution blocked and use the existing named-kernel and host-callsite evidence. If VTune reports that "no GPU-side trace data was collected", the checker records `source_line.blocker vtune_no_gpu_side_trace`; this is lower-level than generic `[Unknown]` source rows and points at VTune/GTPin/API-trace collection rather than missing DWARF.
+
+Probe-first order is mandatory: the `sycl-source-line-probe` matrix must produce an accepted source-line status before MXFP4 source-line feasibility runs. Use `scripts/sycl-source-line-debug-matrix.sh` to prove the debug flag/build/VTune/DWARF workflow on the tiny probe first, then use `scripts/sycl-vtune-source-line-feasibility.sh` for the MXFP4 microbench only after the matrix artifact contains `source_line.status pass`, `source_line.status asm-line-static-cost`, or `source_line.status dwarf-line-table-only`.
+
+Safe dry-run command for the probe matrix:
+
+```bash
+bash scripts/sycl-source-line-debug-matrix.sh \
+  --dry-run \
+  --out-root /tmp/sycl_source_line_matrix_dryrun \
+  --device-selector level_zero:1
+```
+
+Lead-only execute command for the probe matrix. Keep the oneAPI wrapper exactly around the environment source step so `set -u` shells do not fail inside Intel's setup script:
+
+```bash
+set +u
+source /opt/intel/oneapi/setvars.sh --force
+set -u
+bash scripts/sycl-source-line-debug-matrix.sh \
+  --execute \
+  --i-understand-this-runs-gpu-source-probe \
+  --out-root /tmp/sycl_source_line_matrix_$(date +%Y%m%d_%H%M%S) \
+  --device-selector level_zero:1
+```
+
+On multi-GPU hosts, add a VTune target such as `--vtune-target-gpu 0:7:0.0` only after confirming it is the same physical device selected by `ONEAPI_DEVICE_SELECTOR`. Do not hard-code target GPU values across hosts or boots; bus/function IDs and VTune ordering can change.
+
+After a passing probe matrix, dry-run the MXFP4 feasibility gate with the matrix parse file wired in explicitly:
+
+```bash
+bash scripts/sycl-vtune-source-line-feasibility.sh \
+  --dry-run \
+  --out-root /tmp/sycl_vtune_source_line_mxfp4_dryrun \
+  --device-selector level_zero:1 \
+  --require-matrix-pass /tmp/sycl_source_line_matrix_20260705_120000/build-matrix/debug_full/source-line-feasibility.parse
+```
+
+Lead-owned MXFP4 execution changes `--dry-run` to `--execute` and must add `--i-understand-this-runs-gpu-microbenchmarks`. Workers must not run GPU/model/profiler commands, VTune collection, `sycl-source-line-probe`, `sycl-kernel-bench`, MXFP4 feasibility execution, or any `--execute` runner; workers may update these docs and run doc-only tests.
+
+### Non-VTUNE source-line row statuses
+
+The SYCL source-line tooling keeps VTune exact source rows, runtime sampled PC rows, static assembly rows, and DWARF coverage as separate evidence levels. Source Attribution Mode `asm-line-static` is static assembly/source evidence, not sampled VTune exact timing.
+
+| Evidence | Runtime sampled? | Source-line ranked? | Accepted status |
+|---|---:|---:|---|
+| VTune GPU source rows | yes | yes | `source_line.status pass` |
+| PC sample CSV mapped through DWARF | yes | yes | `source_line.status sampled-line-cost` |
+| IGA PC static instruction rows mapped through DWARF | no | yes | `source_line.status asm-line-static-cost` |
+| DWARF line-table coverage only | no | no cost ranking | `source_line.status dwarf-line-table-only` |
+
+- `source_line.status pass` = VTune sampled GPU source-line rows; only status that may become `source_attribution.status exact_source_line`.
+- `source_line.status sampled-line-cost` = real runtime PC sample rows from a `pc-samples.csv` producer mapped through DWARF; sampled and line-ranked, but still distinct from VTune exact source rows and does not become `exact_source_line`.
+- `source_line.status asm-line-static-cost` = ZEBin DWARF line-table rows joined with EU assembly instruction addresses and aggregated by source line; exact static source-line cost rows, but not sampled VTune exact timing.
+- `source_line.status dwarf-line-table-only` = decoded line-table coverage without instruction-level or sampled cost rows.
+
+When VTune/GTPin cannot provide gpu-source-line rows, prefer `sampled-line-cost` if a real positive-count PC sample CSV exists; otherwise prefer `asm-line-static-cost` for line-ranked optimization and keep `pass` reserved for VTune exact source rows.
+
+`asm-line-static-cost` should be produced from IGA PC rows when available. The runner extracts or selects one kernel `.text.*` section, runs Intel IGA with `-Xprint-json -Xprint-pc`, parses the resulting instruction PCs, applies the section base address, and joins those PCs to ZEBin DWARF line-table ranges. This is an exact static source-line cost from kernel-matched IGA PC rows, not sampled VTune exact timing. Label-only `ocloc` assembly such as `L0:` is not address evidence and must remain a blocker or fallback path rather than being reported as static line cost.
+
+### Full layered SYCL profiling closure
+
+`scripts/sycl-gptoss-full-attribution-profile.sh` is the lead-owned runner for closing GPT-OSS MXFP4 SYCL decode attribution across application spans, SYCL event profiling, Level Zero, Unified Runtime, VTune, and source-attribution fallback evidence. It is dry-run by default and prints the artifact root plus every real model/profiler command before anything is executed.
+
+Dry-run command:
+
+```bash
+bash scripts/sycl-gptoss-full-attribution-profile.sh \
+  --dry-run \
+  --out-root /tmp/sycl_gptoss_full_attribution_dryrun
+```
+
+Lead-only real command. Keep the oneAPI wrapper exactly around the environment source step so `set -u` shells do not fail inside Intel's setup script:
+
+```bash
+set +u
+source /opt/intel/oneapi/setvars.sh --force
+set -u
+bash scripts/sycl-gptoss-full-attribution-profile.sh \
+  --execute \
+  --i-understand-this-runs-gpu-models-and-profilers \
+  --out-root /tmp/sycl_gptoss_full_attribution_$(date +%Y%m%d_%H%M%S)
+```
+
+Artifact root defaults to `$SYCL_GPTOSS_FULL_ATTRIBUTION_OUT` or `/tmp/sycl_gptoss_full_attribution_<timestamp>`. The runner writes raw artifacts, profiler exports, and parsed summaries under that root:
+
+| Path under artifact root | Contents | Primary parser output |
+|---|---|---|
+| `raw/` | llama-bench stdout/stderr-adjacent timeline and named SYCL kernel profiler outputs (`raw/timeline/sycl-timeline.json`, `raw/kernel/sycl-kernels.csv/json`). | `parsed/timeline.parse`, `parsed/kernel-cost.parse` |
+| `pti/` | Level Zero API trace, normally `pti/level-zero-api.jsonl`. The runner enables the external trace hook with `ZE_ENABLE_TRACING_LAYER=1` and advertises `PTI_L0_TRACE_OUTPUT`; if the active PTI/Level Zero tracing layer does not produce the JSONL file, execute mode fails closed before ledger parsing. | `parsed/l0.parse` |
+| `ur/` | Unified Runtime trace log, normally `ur/sycl-ur-trace.log`. The runner enables `SYCL_UR_TRACE=2`, captures `UR_TRACE` rows from stderr when a separate log file is not produced, and fails closed if no UR trace evidence remains. | `parsed/ur.parse` |
+| `vtune/` | VTune result directory and exported kernel/source CSVs. | `parsed/vtune.parse` |
+| `source-line/` | Source-line debug matrix probe, dumped ZEBin section list, and VTune GPU source-line CSV. | `parsed/source-line.parse` |
+| `parsed/` | Consolidated parser summaries and final attribution rows. | `parsed/layer-ledger.parse`, `parsed/source-attribution.parse` |
+
+The main closure evidence is `parsed/layer-ledger.parse` plus `parsed/source-line.parse` and `parsed/source-attribution.parse`. Interpret status rows as follows:
+
+| Status row | PASS / accepted value | Failure or blocked value | Meaning |
+|---|---|---|---|
+| `coverage.layer_status` | `ok` | `missing_layers`; treat any future `coverage_mismatch` or `unknown_wall_residual` row as incomplete until the numeric reason rows are reviewed. | `ok` means required raw timeline/kernel, Level Zero, Unified Runtime, and VTune parse inputs were present for the wall-time ledger. Missing layers mean the run is not full-attribution evidence. |
+| `source_line.status` | `pass`, `sampled-line-cost`, `asm-line-static-cost`, or `dwarf-line-table-only` | `fail` with `source_line.blocker` such as `missing_debug_line` or `vtune_unknown_source`. | `pass` is sampled VTune exact source-line evidence. `sampled-line-cost` is runtime sampled PC evidence mapped through DWARF, but not VTune exact source rows. `asm-line-static-cost` is non-sampled static source-line cost from DWARF plus addressed assembly. `dwarf-line-table-only` is line-table coverage without sampled or static instruction cost rows. |
+| `source_attribution.status` | `exact_source_line`, `sampled_line_cost`, `asm_line_static_cost`, `dwarf_line_table_only`, or `source_region_plus_ablation` | `source_region`, `missing_parser`, or parse failure. | `exact_source_line` is preferred and requires `source_line.status pass`. `sampled_line_cost` requires `source_line.status sampled-line-cost` and a kernel match. `asm_line_static_cost` requires `source_line.status asm-line-static-cost`; `dwarf_line_table_only` requires `source_line.status dwarf-line-table-only`. The fallback `source_region_plus_ablation` is accepted when exact/sampled/static/DWARF source-line evidence is unavailable and the region map plus ablation delta identify the hot kernel region. Plain `source_region` is useful triage but is not closure-quality evidence by itself. |
+
+Real model/GPU validation is lead-owned. Under delegated documentation/source-test work, workers must not run this runner with `--execute`, real model/GPU validation, llama-bench, sycl-kernel-bench, VTune, sycl-ls, DRM, lsof, or P2P probes. Workers may run documentation/source-only tests such as pytest checks for this section.
+
+### Staged layered SYCL profiling closure
+
+`scripts/sycl-gptoss-staged-attribution-profile.sh` is the preferred closure pipeline when the monolithic full runner cannot collect stable all-in-one VTune, Unified Runtime, Level Zero, timeline, kernel, and ablation evidence. It keeps profiling perturbation low by collecting independent stages, writing a `stage-manifest.json` for each stage, and then merging only metadata-matched evidence with `scripts/merge-sycl-staged-ledger.py`. It is dry-run by default; real execution requires both `--execute --i-understand-this-runs-staged-gpu-profiling` and lead ownership.
+
+Dry-run command:
+
+```bash
+bash scripts/sycl-gptoss-staged-attribution-profile.sh \
+  --dry-run \
+  --out-root /tmp/sycl_gptoss_staged_attribution_dryrun
+```
+
+Lead-only real command. Keep the oneAPI wrapper exactly around the environment source step so `set -u` shells do not fail inside Intel's setup script:
+
+```bash
+set +u
+source /opt/intel/oneapi/setvars.sh --force
+set -u
+bash scripts/sycl-gptoss-staged-attribution-profile.sh \
+  --execute \
+  --i-understand-this-runs-staged-gpu-profiling \
+  --out-root /tmp/sycl_gptoss_staged_attribution_$(date +%Y%m%d_%H%M%S)
+```
+
+Use the canonical GPT-OSS FA-on staged knobs for this closure path: `-fa 1`, `GGML_SYCL_MOE_PHASE_MATERIALIZE=1`, `GGML_SYCL_MOE_PHASE_BULK_XMX=1`, and `GGML_SYCL_MOE_DOWN_SUM_DIRECT=1`. PP/TG measurements collected by the staged runner are guardrails only; this workflow closes attribution evidence and does not optimize TG performance.
+
+Each stage writes its own root plus manifest, and the merger rejects cross-run evidence unless all stage manifests metadata-match on build/model/device/FA/MoE/prompt/gen/repeat:
+
+| Stage directory | Evidence role |
+|---|---|
+| `base/` | Baseline timeline, named SYCL kernel profiler output, E2E stderr, and `base/stage-manifest.json`. |
+| `l0/` | Level Zero API trace conversion plus `l0/stage-manifest.json`. |
+| `ur/` | Unified Runtime trace conversion plus `ur/stage-manifest.json`. |
+| `vtune-source/` | VTune/source-line feasibility matrix verdict, exact-line blocker if any, and `vtune-source/stage-manifest.json`. |
+| `ablation/` | MXFP4 source-region ablation deltas and `ablation/stage-manifest.json`. |
+| `merged/` | Strict ledger emitted by `merge-sycl-staged-ledger.py` after manifest and source-attribution checks. |
+
+Strict staged closure is accepted only when the merged ledger reports all required layers and one closure-quality source-attribution path:
+
+| Status or metric | Accepted value | Meaning |
+|---|---|---|
+| `coverage.layer_status` | `ok` | All required staged layers have real observed evidence after manifest metadata matching. |
+| `layer.unknown_wall_ms_x1000` | Present integer metric | Residual wall time remains explicit in the ledger instead of being hidden or treated as success by omission. |
+| Exact sampled source-line attribution | `source_line.status pass` with `source_attribution.status exact_source_line` | Preferred closure path when VTune sampled source-line evidence can name concrete GPU source lines. |
+| Runtime sampled PC source-line cost | `source_line.status sampled-line-cost` with `source_attribution.status sampled_line_cost` | Accepted sampled PC path only when a real positive-count `pc-samples.csv` is mapped through DWARF for the required kernel. This is line-ranked sampled cost, but `exact_source_line` remains reserved for VTune `pass`. |
+| ASM static source-line attribution | `source_line.status asm-line-static-cost` with `source_attribution.status asm_line_static_cost` | Accepted non-VTUNE path when DWARF line-table rows join to addressed EU assembly rows. This is static instruction/source evidence, not sampled timing. |
+| DWARF line-table source coverage | `source_line.status dwarf-line-table-only` with `source_attribution.status dwarf_line_table_only` | Accepted fallback when line-table rows identify source coverage but neither sampled VTune rows nor addressable ASM static-cost rows are available. |
+| Source-region fallback | `source_line.status fail`, a recorded `source_line.blocker`, `source_attribution.status source_region_plus_ablation`, and `source_attribution.ablation_delta_ms_x1000` | Accepted only when exact/static/DWARF source-line paths are unavailable for a documented blocker and the fallback reaches source-region-plus-ablation evidence with a measured ablation delta. |
+| `metadata_mismatch` | Reject | One or more stage manifests differ; rerun or recollect matching stages rather than merging mixed evidence. |
+| `source_attribution_incomplete` | Reject | No accepted source-attribution path was reached: exact sampled VTune source lines, runtime sampled PC source-line cost, ASM static source lines, DWARF line-table-only source coverage, or source-region-plus-ablation with `source_attribution.ablation_delta_ms_x1000`. |
+
+Exact sampled VTune source lines may fail or be unavailable when the blocker is recorded in the source-line verdict and an accepted fallback path is present. `sampled_line_cost` requires real runtime PC samples and stays distinct from `exact_source_line`; `asm_line_static_cost` and `dwarf_line_table_only` keep their non-sampled semantics; plain source-region mapping is triage evidence, not closure. All stage manifests must metadata-match before interpreting `coverage.layer_status ok` as a staged closure result.
+
+Worker safety: workers must not run staged profiling with `--execute`, real model/GPU validation, `/Storage` models, llama-bench, sycl-kernel-bench, VTune, sycl-ls, `/dev/dri` or other DRM probes, lsof, P2P probes, or any real harness execution. Workers may run source/doc assertions and script dry-runs only; lead validation owns the real oneAPI/GPU execution.
 
 ## TODO
 

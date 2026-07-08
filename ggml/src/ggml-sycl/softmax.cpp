@@ -1,4 +1,6 @@
 #include "softmax.hpp"
+#include "dnnl-ops.hpp"
+#include "sycl-kernel-profiler.hpp"
 #include <cstdint>
 #include <utility>
 #include <cmath>
@@ -37,7 +39,7 @@ struct soft_max_params {
 };
 
 // When ncols_template == 0 the bounds for the loops in this function are not known and can't be unrolled.
-// As we want to keep pragma unroll for all other cases we suppress the clang transformation warning here.
+// As we want to keep pragma unroll for all other cases we supress the clang transformation warning here.
 #ifdef __clang__
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
@@ -56,7 +58,6 @@ static void soft_max_f32(const float *         x,
                                : block_size_template;
     const int nthreads = block_size;
     const int nwarps = nthreads / WARP_SIZE;
-    const size_t nreduce = nwarps / WARP_SIZE;
 
     const int tid = item_ct1.get_local_id(2);
 
@@ -78,9 +79,6 @@ static void soft_max_f32(const float *         x,
     mask += (i11*p.nb11 + i12*p.nb12 + i13*p.nb13) / sizeof(T) * (mask != nullptr);
     dst  += int64_t(rowx)*ncols;
 
-    const int warp_id = item_ct1.get_local_id(2) / WARP_SIZE;
-    const int lane_id = item_ct1.get_local_id(2) % WARP_SIZE;
-
     const float slope = get_alibi_slope(p.max_bias, i02, p.n_head_log2, p.m0, p.m1);
 
     float * buf_iw = (float *) dpct_local;
@@ -88,6 +86,7 @@ static void soft_max_f32(const float *         x,
     // shared memory buffer to cache values between iterations:
     float *vals = use_shared ? buf_iw + sycl::max(nwarps, WARP_SIZE) : dst;
     float max_val = sinks ? sinks[i02] : -INFINITY;
+
 #pragma unroll
     for (int col0 = 0; col0 < ncols; col0 += block_size) {
         const int col = col0 + tid;
@@ -101,21 +100,10 @@ static void soft_max_f32(const float *         x,
         vals[col] = val;
         max_val   = sycl::max(max_val, val);
     }
-    // find the max value in the block
-    max_val = warp_reduce_max<WARP_SIZE>(max_val);
 
-    if (block_size > WARP_SIZE) {
-        if (lane_id == 0) {
-            buf_iw[warp_id] = max_val;
-        }
-        item_ct1.barrier();
-
-        max_val = -INFINITY;
-        for (int i = lane_id; i < nwarps; i += WARP_SIZE) {
-            max_val = sycl::max(max_val, buf_iw[i]);
-        }
-        max_val = warp_reduce_max<WARP_SIZE>(max_val);
-    }
+    // find the max value in the block using work-group reduce
+    // This replaces the barrier-based SLM pattern with a single efficient operation
+    max_val = sycl::reduce_over_group(item_ct1.get_group(), max_val, sycl::maximum<float>());
     float tmp = 0.0f; // partial sum
 
 #pragma unroll
@@ -126,35 +114,17 @@ static void soft_max_f32(const float *         x,
             break;
         }
 
-        const float val = sycl::native::exp(sycl::max(vals[col] - max_val, -80.0f));
+        // Use IEEE-compliant exp instead of native::exp for determinism
+        const float val = sycl::exp(vals[col] - max_val);
         tmp += val;
         vals[col] = val;
     }
-    // find the sum of exps in the block
-    tmp = warp_reduce_sum<WARP_SIZE>(tmp);
-    if (block_size > WARP_SIZE) {
-        item_ct1.barrier();
-        if (warp_id == 0) {
-            buf_iw[lane_id] = 0.0f;
-            for (size_t i = 1; i < nreduce; i += 1) {
-                buf_iw[lane_id + i * WARP_SIZE] = 0.f;
-            }
-        }
-        item_ct1.barrier();
-
-        if (lane_id == 0) {
-            buf_iw[warp_id] = tmp;
-        }
-        item_ct1.barrier();
-
-        tmp = buf_iw[lane_id];
-        for (size_t i = 1; i < nreduce; i += 1) {
-            tmp += buf_iw[lane_id + i * WARP_SIZE];
-        }
-        tmp = warp_reduce_sum<WARP_SIZE>(tmp);
-    }
+    // find the sum of exps in the block using work-group reduce
+    // This replaces the barrier-based SLM pattern with a single efficient operation
+    tmp = sycl::reduce_over_group(item_ct1.get_group(), tmp, sycl::plus<float>());
     if (sinks) {
-        tmp += sycl::native::exp(sycl::max(sinks[i02] - max_val, -80.0f));
+        // Use IEEE-compliant exp instead of native::exp for determinism
+        tmp += sycl::exp(sinks[i02] - max_val);
     }
     const float inv_sum = 1.0f / tmp;
 
@@ -189,7 +159,7 @@ static void soft_max_back_f32(const float *grad, const float *dstf, float *dst,
         dgf_dot += dstf[col]*grad[col];
     }
 
-    dgf_dot = warp_reduce_sum<WARP_SIZE>(dgf_dot);
+    dgf_dot = warp_reduce_sum(dgf_dot);
 
     for (int col = tid; col < ncols; col += WARP_SIZE) {
         dst[col] = scale * (grad[col] - dgf_dot) * dstf[col];
@@ -197,36 +167,43 @@ static void soft_max_back_f32(const float *grad, const float *dstf, float *dst,
 }
 
 template <int... Ns, typename T>
-static void launch_soft_max_kernels(const float *           x,
-                                    const T *               mask,
-                                    const float *           sinks,
-                                    float *                 dst,
-                                    const soft_max_params & p,
-                                    dpct::queue_ptr         stream,
-                                    dpct::dim3              block_dims,
-                                    dpct::dim3              block_nums,
-                                    size_t                  nbytes_shared)
+static sycl::event launch_soft_max_kernels(const float *                   x,
+                                           const T *                       mask,
+                                           const float *                   sinks,
+                                           float *                         dst,
+                                           const soft_max_params &         p,
+                                           dpct::queue_ptr                 stream,
+                                           dpct::dim3                      block_dims,
+                                           dpct::dim3                      block_nums,
+                                           size_t                          nbytes_shared,
+                                           const ggml_sycl_profile_label & profile_label,
+                                           const char *                    file     = __builtin_FILE(),
+                                           int                             line     = __builtin_LINE(),
+                                           const char *                    function = __builtin_FUNCTION())
 {
-    auto launch_kernel = [=](auto I) -> bool {
+    sycl::event event;
+    auto launch_kernel = [&](auto I) -> bool {
         constexpr int ncols = decltype(I)::value;
         constexpr int block = (ncols > 1024 ? 1024 : ncols);
         if (p.ncols == ncols) {
-            stream->submit([&](sycl::handler &cgh) {
-                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-                    sycl::range<1>(nbytes_shared), cgh);
+            event = ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+                return profiled_queue.submit([&](sycl::handler &cgh) {
+                    sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                        sycl::range<1>(nbytes_shared), cgh);
 
-                cgh.parallel_for(
-                    sycl::nd_range<3>(block_nums * block_dims, block_dims),
-                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
-                        WARP_SIZE)]] {
-                        soft_max_f32<true, ncols, block>(
-                            x, mask, sinks, dst, p,
-                            dpct_local_acc_ct1
-                                .get_multi_ptr<sycl::access::decorated::no>()
-                                .get());
-                        GGML_UNUSED(item_ct1);
-                    });
-            });
+                    cgh.parallel_for(
+                        sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                            WARP_SIZE)]] {
+                            soft_max_f32<true, ncols, block>(
+                                x, mask, sinks, dst, p,
+                                dpct_local_acc_ct1
+                                    .get_multi_ptr<sycl::access::decorated::no>()
+                                    .get());
+                            GGML_UNUSED(item_ct1);
+                        });
+                });
+            }, file, line, function);
             return true;
         }
         return false;
@@ -234,32 +211,42 @@ static void launch_soft_max_kernels(const float *           x,
 
     // unary fold over launch_kernel
     if ((launch_kernel(std::integral_constant<int, Ns>{}) || ...)) {
-        return;
+        return event;
     }
 
-    stream->submit([&](sycl::handler &cgh) {
-        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-            sycl::range<1>(nbytes_shared), cgh);
+    return ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler &cgh) {
+            sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                sycl::range<1>(nbytes_shared), cgh);
 
-        cgh.parallel_for(
-            sycl::nd_range<3>(block_nums * block_dims, block_dims),
-            [=](sycl::nd_item<3> item_ct1)
-                [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                    soft_max_f32<true, 0, 0>(
-                        x, mask, sinks, dst, p,
-                        dpct_local_acc_ct1
-                            .get_multi_ptr<sycl::access::decorated::no>()
-                            .get());
-                    GGML_UNUSED(item_ct1);
-                });
-    });
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                        soft_max_f32<true, 0, 0>(
+                            x, mask, sinks, dst, p,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                        GGML_UNUSED(item_ct1);
+                    });
+        });
+    }, file, line, function);
 }
 
 template <typename T>
-static void soft_max_f32_sycl(const float *x, const T *mask,
-                              const float *sinks, float *dst,
-                              const soft_max_params &params,
-                              dpct::queue_ptr stream, int device) {
+static sycl::event soft_max_f32_sycl(const float *                   x,
+                                     const T *                       mask,
+                                     const float *                   sinks,
+                                     float *                         dst,
+                                     const soft_max_params &         params,
+                                     dpct::queue_ptr                 stream,
+                                     int                             device,
+                                     const ggml_sycl_profile_label & profile_label,
+                                     const char *                    file     = __builtin_FILE(),
+                                     int                             line     = __builtin_LINE(),
+                                     const char *                    function = __builtin_FUNCTION()) {
+    GGML_SYCL_KTRACE("soft_max_f32", " ncols=%lld nrows=%lld", (long long)params.ncols, (long long)params.nrows_x);
     int nth = WARP_SIZE;
     int max_block_size = ggml_sycl_info().max_work_group_sizes[device];
     const int64_t ncols_x = params.ncols;
@@ -276,89 +263,97 @@ static void soft_max_f32_sycl(const float *x, const T *mask,
     const size_t smpbo = ggml_sycl_info().devices[id].smpbo;
 
     if (nbytes_shared <= smpbo && ncols_x <= max_block_size) {
-        launch_soft_max_kernels<32, 64, 128, 256, 512, 1024, 2048, 4096>(
+        return launch_soft_max_kernels<32, 64, 128, 256, 512, 1024, 2048, 4096>(
             x, mask, sinks, dst, params, stream, block_dims, block_nums,
-            nbytes_shared);
+            nbytes_shared, profile_label, file, line, function);
     } else {
         const size_t nbytes_shared_low = WARP_SIZE * sizeof(float);
 
-        stream->submit([&](sycl::handler &cgh) {
-            sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-                sycl::range<1>(nbytes_shared_low), cgh);
+        return ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+            return profiled_queue.submit([&](sycl::handler &cgh) {
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range<1>(nbytes_shared_low), cgh);
 
-            cgh.parallel_for(
-                sycl::nd_range<3>(block_nums * block_dims, block_dims),
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                    soft_max_f32<false, 0, 0>(
-                        x, mask, sinks, dst, params,
-                        dpct_local_acc_ct1
-                            .get_multi_ptr<sycl::access::decorated::no>()
-                            .get());
-                    GGML_UNUSED(item_ct1);
-                });
-        });
+                cgh.parallel_for(
+                    sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                    [=](sycl::nd_item<3> item_ct1) {
+                        soft_max_f32<false, 0, 0>(
+                            x, mask, sinks, dst, params,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                        GGML_UNUSED(item_ct1);
+                    });
+            });
+        }, file, line, function);
     }
 }
 
-static void soft_max_back_f32_sycl(const float *   grad,
-                                   const float *   dstf,
-                                   float *         dst,
-                                   const int       ncols,
-                                   const int       nrows,
-                                   const float     scale,
-                                   dpct::queue_ptr stream) {
+static sycl::event soft_max_back_f32_sycl(const float *                   grad,
+                                          const float *                   dstf,
+                                          float *                         dst,
+                                          const int                       ncols,
+                                          const int                       nrows,
+                                          const float                     scale,
+                                          dpct::queue_ptr                 stream,
+                                          const ggml_sycl_profile_label & profile_label,
+                                          const char *                    file     = __builtin_FILE(),
+                                          int                             line     = __builtin_LINE(),
+                                          const char *                    function = __builtin_FUNCTION()) {
     const dpct::dim3 block_dims(WARP_SIZE, 1, 1);
     const dpct::dim3 block_nums(nrows, 1, 1);
 
-    stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
-                         [=](sycl::nd_item<3> item_ct1) {
-                             soft_max_back_f32(grad, dstf, dst, ncols, scale);
-                             GGML_UNUSED(item_ct1);
-                         });
+    return ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                                           [=](sycl::nd_item<3> item_ct1) {
+                                               soft_max_back_f32(grad, dstf, dst, ncols, scale);
+                                               GGML_UNUSED(item_ct1);
+                                           });
+    }, file, line, function);
 }
 
-void ggml_sycl_op_soft_max(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
-    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
+void ggml_sycl_op_soft_max(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
+    scope_op_debug_print scope_dbg_print(__func__, dst.raw(), /*num_src=*/2);
 
-    const ggml_tensor * src0 = dst->src[0];
-    const ggml_tensor * src1 = dst->src[1];
-    const ggml_tensor * src2 = dst->src[2];
+    auto src0 = dst.src(0);
+    auto src1 = dst.src(1);
+    auto src2 = dst.src(2);
 
-    const float * src0_d = (const float *) src0->data;
-    const void  * src1_d = src1 ? (const void *) src1->data : nullptr;
-    const void  * src2_d = src2 ? (const void *) src2->data : nullptr;
-    float       *  dst_d = (float *) dst->data;
+    const float * src0_d = src0.resolve_as<const float>();
+    const void  * src1_d = src1 ? src1.resolve_ptr() : nullptr;
+    const void  * src2_d = src2 ? src2.resolve_ptr() : nullptr;
+    float       * dst_d  = dst.resolve_as<float>();
 
     dpct::queue_ptr stream = ctx.stream();
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
-    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0.type() == GGML_TYPE_F32);
+    GGML_ASSERT(dst.type() == GGML_TYPE_F32);
 
     // src1 contains mask and it is optional
-    GGML_ASSERT(!src1 || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(!src1 || src1.type() == GGML_TYPE_F16 || src1.type() == GGML_TYPE_F32);
 
-    const int64_t nrows_x = ggml_nrows(src0);
-    const int64_t nrows_y = src0->ne[1];
+    const int64_t nrows_x = ggml_nrows(src0.raw());
+    const int64_t nrows_y = src0.ne(1);
 
-    const int64_t ne00 = src0->ne[0];
+    const int64_t ne00 = src0.ne(0);
 
     float scale    = 1.0f;
     float max_bias = 0.0f;
 
-    memcpy(&scale,    (const float *) dst->op_params + 0, sizeof(float));
-    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+    const float * op_params = static_cast<const float *>(dst.op_params());
+    memcpy(&scale,    op_params + 0, sizeof(float));
+    memcpy(&max_bias, op_params + 1, sizeof(float));
 
-    const bool use_f16 = (src1 && src1->type == GGML_TYPE_F16);
+    const bool use_f16 = (src1 && src1.type() == GGML_TYPE_F16);
 
-    const int64_t nb11 = src1 ? src1->nb[1] : 1;
-    const int64_t nb12 = src1 ? src1->nb[2] : 1;
-    const int64_t nb13 = src1 ? src1->nb[3] : 1;
+    const int64_t nb11 = src1 ? src1.nb(1) : 1;
+    const int64_t nb12 = src1 ? src1.nb(2) : 1;
+    const int64_t nb13 = src1 ? src1.nb(3) : 1;
 
-    const int64_t ne12 = src1 ? src1->ne[2] : 1;
-    const int64_t ne13 = src1 ? src1->ne[3] : 1;
+    const int64_t ne12 = src1 ? src1.ne(2) : 1;
+    const int64_t ne13 = src1 ? src1.ne(3) : 1;
 
-    const uint32_t n_head      = src0->ne[2];
+    const uint32_t n_head      = src0.ne(2);
     const uint32_t n_head_log2 = 1u << (uint32_t) floorf(log2f((float) n_head));
 
     const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
@@ -366,15 +361,15 @@ void ggml_sycl_op_soft_max(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
 
 
     soft_max_params params = {};
-    params.nheads = src0->ne[2];
+    params.nheads = src0.ne(2);
     params.n_head_log2 = n_head_log2;
     params.ncols = ne00;
     params.nrows_x = nrows_x;
     params.nrows_y = nrows_y;
-    params.ne00 = src0->ne[0];
-    params.ne01 = src0->ne[1];
-    params.ne02 = src0->ne[2];
-    params.ne03 = src0->ne[3];
+    params.ne00 = src0.ne(0);
+    params.ne01 = src0.ne(1);
+    params.ne02 = src0.ne(2);
+    params.ne03 = src0.ne(3);
     params.nb11 = nb11;
     params.nb12 = nb12;
     params.nb13 = nb13;
@@ -385,41 +380,79 @@ void ggml_sycl_op_soft_max(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     params.m0 = m0;
     params.m1 = m1;
 
+    ggml_sycl_profile_label profile_label{};
+    profile_label.name       = "sycl.softmax.forward";
+    profile_label.category   = "softmax";
+    profile_label.queue_kind = "compute";
+    profile_label.metadata   = "role=softmax;direction=forward";
+    profile_label.device     = ctx.device;
+    profile_label.bytes      = static_cast<size_t>(ggml_nbytes(dst.raw()));
+
+    // oneDNN fast path: pure softmax without mask or ALiBi, opt-in via env var
+    static const bool use_dnnl_softmax = [] {
+        const char * env = getenv("GGML_SYCL_ONEDNN_SOFTMAX");
+        return env != nullptr && std::string(env) == "1";
+    }();
+
+#if GGML_SYCL_DNNL
+    if (use_dnnl_softmax && !src1_d && max_bias == 0.0f && nrows_x >= 128 && !g_ggml_sycl_graph_recording) {
+        DnnlSoftmaxWrapper::softmax(
+            ctx, src0_d, dst_d,
+            nrows_x,                              // batch = total rows
+            ne00,                                 // features = softmax axis
+            scale,                                // pre-softmax scale (e.g. 1/sqrt(d_head))
+            DnnlSoftmaxWrapper::to_dt<float>(),
+            stream);
+        return;
+    }
+#else
+    (void) use_dnnl_softmax;
+#endif
+
     if (use_f16) {
         soft_max_f32_sycl(src0_d, (const sycl::half *)src1_d,
                           (const float *)src2_d, dst_d, params, stream,
-                          ctx.device);
+                          ctx.device, profile_label);
     } else {
         soft_max_f32_sycl(src0_d, (const float *)src1_d, (const float *)src2_d,
-                          dst_d, params, stream, ctx.device);
+                          dst_d, params, stream, ctx.device, profile_label);
     }
 }
 
-void ggml_sycl_op_soft_max_back(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
-    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
-    const ggml_tensor * src0 = dst->src[0]; // grad
-    const ggml_tensor * src1 = dst->src[1]; // forward pass output
+void ggml_sycl_op_soft_max_back(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
+    scope_op_debug_print scope_dbg_print(__func__, dst.raw(), /*num_src=*/2);
+    auto src0 = dst.src(0);
+    auto src1 = dst.src(1);
 
-    const float * src0_d = (const float *) src0->data;
-    const float * src1_d = (const float *) src1->data;
-    float       * dst_d  = (float       *) dst->data;
+    const float * src0_d = src0.resolve_as<const float>();
+    const float * src1_d = src1.resolve_as<const float>();
+    float       * dst_d  = dst.resolve_as<float>();
 
     dpct::queue_ptr stream = ctx.stream();
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
-    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0.type() == GGML_TYPE_F32);
+    GGML_ASSERT(src1.type() == GGML_TYPE_F32);
+    GGML_ASSERT(dst.type() == GGML_TYPE_F32);
 
-    const int64_t ncols = src0->ne[0];
-    const int64_t nrows = ggml_nrows(src0);
+    const int64_t ncols = src0.ne(0);
+    const int64_t nrows = ggml_nrows(src0.raw());
 
     float scale    = 1.0f;
     float max_bias = 0.0f;
 
-    memcpy(&scale,    (const float *) dst->op_params + 0, sizeof(float));
-    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+    const float * op_params = static_cast<const float *>(dst.op_params());
+    memcpy(&scale,    op_params + 0, sizeof(float));
+    memcpy(&max_bias, op_params + 1, sizeof(float));
 
     GGML_ASSERT(max_bias == 0.0f);
 
-    soft_max_back_f32_sycl(src0_d, src1_d, dst_d, ncols, nrows, scale, stream);
+    ggml_sycl_profile_label profile_label{};
+    profile_label.name       = "sycl.softmax.backward";
+    profile_label.category   = "softmax";
+    profile_label.queue_kind = "compute";
+    profile_label.metadata   = "role=softmax;direction=backward";
+    profile_label.device     = ctx.device;
+    profile_label.bytes      = static_cast<size_t>(ggml_nbytes(dst.raw()));
+
+    soft_max_back_f32_sycl(src0_d, src1_d, dst_d, ncols, nrows, scale, stream, profile_label);
 }

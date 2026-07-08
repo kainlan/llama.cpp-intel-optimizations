@@ -1,0 +1,24 @@
+# Ignore compiled test binaries (no extension, not .cpp/.hpp source files)
+test-graph-replay
+test-graph-replay-chain
+test-dispatch-tuning
+test-esimd-prefetch
+test-esimd-vectorized-dequant
+test-kernel-dispatch
+test-mmq-xmx-dispatch
+test-moe-mxfp4-dp4a
+test-unified-cache-fast-path
+test-unified-kernel
+test-unified-kernel-ops
+test-unified-kernel-persistent
+test-unified-runtime-alloc
+test-xmx-compute
+test-xmx-config
+test-xmx-default-enable
+test-xmx-dpas-basic
+test-xmx-esimd-basic
+test-xmx-esimd-q4-gemm
+test-xmx-hardware-detect
+test-xmx-moe-mxfp4
+test-xmx-optimization
+bench-dnnl-ops

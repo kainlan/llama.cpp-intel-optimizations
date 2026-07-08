@@ -1,0 +1,149 @@
+#pragma once
+
+#include "sycl-timeline.hpp"
+
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <sycl/sycl.hpp>
+
+enum class ggml_sycl_kernel_profile_output_format : uint8_t {
+    STDERR = 0,
+    CSV    = 1,
+    JSON   = 2,
+    BOTH   = 3,
+};
+
+enum class ggml_sycl_kernel_profile_flush_mode : uint8_t {
+    FINAL  = 0,
+    WINDOW = 1,
+    NONE   = 2,
+};
+
+struct ggml_sycl_kernel_profile_config {
+    bool                                   enabled       = false;
+    ggml_sycl_kernel_profile_output_format output_format = ggml_sycl_kernel_profile_output_format::CSV;
+    ggml_sycl_kernel_profile_flush_mode    flush_mode    = ggml_sycl_kernel_profile_flush_mode::FINAL;
+    int                                    top_n         = 40;
+    bool                                   raw_events    = false;
+    std::string                            output_path;
+};
+
+struct ggml_sycl_profile_label {
+    const char * name       = "unknown";
+    const char * category   = "unknown";
+    const char * queue_kind = "unknown";
+    const char * metadata   = "";
+    int          device     = -1;
+    size_t       bytes      = 0;
+};
+
+struct ggml_sycl_kernel_profile_node_context {
+    bool               active     = false;
+    int64_t            step       = -1;
+    int                node_idx   = -1;
+    int                node_count = 0;
+    std::string        op;
+    std::string        tensor;
+};
+
+void ggml_sycl_kernel_profile_set_node_context(const ggml_sycl_kernel_profile_node_context & ctx);
+void ggml_sycl_kernel_profile_clear_node_context();
+
+class ggml_sycl_kernel_profile_node_scope {
+  public:
+    ggml_sycl_kernel_profile_node_scope(int64_t      step,
+                                        int          node_idx,
+                                        int          node_count,
+                                        const char * op,
+                                        const char * tensor);
+    ~ggml_sycl_kernel_profile_node_scope();
+
+    ggml_sycl_kernel_profile_node_scope(const ggml_sycl_kernel_profile_node_scope &)             = delete;
+    ggml_sycl_kernel_profile_node_scope & operator=(const ggml_sycl_kernel_profile_node_scope &) = delete;
+
+  private:
+    ggml_sycl_kernel_profile_node_context previous_;
+};
+
+bool                            ggml_sycl_kernel_profile_enabled();
+ggml_sycl_kernel_profile_config ggml_sycl_kernel_profile_config_from_env();
+void                            ggml_sycl_kernel_profile_record_event(const ggml_sycl_profile_label &   label,
+                                                                      const sycl::event &               event,
+                                                                      ggml_sycl::sycl_timeline_callsite callsite = {},
+                                                                      uint64_t                          host_submit_begin_us = 0,
+                                                                      uint64_t                          host_submit_end_us = 0);
+void                            ggml_sycl_kernel_profile_flush(bool wait_for_events, const char * reason);
+
+void ggml_sycl_kernel_profile_reset_for_test();
+void ggml_sycl_kernel_profile_set_config_for_test(const ggml_sycl_kernel_profile_config & cfg);
+void ggml_sycl_kernel_profile_add_sample_for_test(const ggml_sycl_profile_label & label, uint64_t duration_ns);
+void ggml_sycl_kernel_profile_add_failed_timestamp_for_test(const ggml_sycl_profile_label & label, bool graph_recorded);
+void ggml_sycl_kernel_profile_add_raw_event_for_test(const ggml_sycl_profile_label & label,
+                                                     uint64_t                        event_id,
+                                                     uint64_t                        host_submit_begin_us,
+                                                     uint64_t                        host_submit_end_us,
+                                                     uint64_t                        device_submit_ns,
+                                                     uint64_t                        device_start_ns,
+                                                     uint64_t                        device_end_ns,
+                                                     const char *                    timestamp_status,
+                                                     const char *                    file,
+                                                     int                             line,
+                                                     const char *                    function,
+                                                     bool                            graph_recorded);
+std::string ggml_sycl_kernel_profile_format_csv_for_test();
+std::string ggml_sycl_kernel_profile_format_json_for_test();
+std::string ggml_sycl_kernel_profile_format_summary_for_test(int top_n);
+bool        ggml_sycl_kernel_profile_effective_wait_for_test(bool requested_wait);
+
+template <typename SubmitFn>
+inline sycl::event ggml_sycl_profile_submit_impl(sycl::queue &                     q,
+                                                 const ggml_sycl_profile_label &   label,
+                                                 SubmitFn &&                       submit_fn,
+                                                 ggml_sycl::sycl_timeline_callsite callsite) {
+    const bool     profile_enabled = ggml_sycl_kernel_profile_enabled();
+    const uint64_t host_submit_begin_us =
+        profile_enabled ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                    std::chrono::steady_clock::now().time_since_epoch())
+                                                    .count()) :
+                          0;
+    sycl::event event = submit_fn(q);
+    if (profile_enabled) {
+        const uint64_t host_submit_end_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        ggml_sycl_kernel_profile_record_event(label, event, callsite, host_submit_begin_us, host_submit_end_us);
+    }
+    return event;
+}
+
+template <typename SubmitFn>
+inline sycl::event ggml_sycl_profile_submit(sycl::queue &                   q,
+                                            const ggml_sycl_profile_label & label,
+                                            SubmitFn &&                     submit_fn,
+                                            const char *                    file     = __builtin_FILE(),
+                                            int                             line     = __builtin_LINE(),
+                                            const char *                    function = __builtin_FUNCTION()) {
+    return ggml_sycl_profile_submit_impl(q, label, static_cast<SubmitFn &&>(submit_fn),
+                                         ggml_sycl::sycl_timeline_callsite{ file, line, function });
+}
+
+// Test-only helper used by `tests/test-sycl-kernel-profiler.cpp` to verify wrapper semantics without
+// requiring a live SYCL queue or event profiling timestamps.
+template <typename Fn>
+inline auto ggml_sycl_profile_submit_for_test(const ggml_sycl_profile_label & label, Fn && fn) -> decltype(fn()) {
+    auto value = fn();
+    if (ggml_sycl_kernel_profile_enabled()) {
+        ggml_sycl_kernel_profile_add_sample_for_test(label, 1);
+    }
+    return value;
+}
+
+inline sycl::event ggml_sycl_profile_record_returned_event(const ggml_sycl_profile_label & label,
+                                                           const sycl::event &             event) {
+    if (ggml_sycl_kernel_profile_enabled()) {
+        ggml_sycl_kernel_profile_record_event(label, event);
+    }
+    return event;
+}

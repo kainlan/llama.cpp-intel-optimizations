@@ -251,6 +251,7 @@ option(GGML_SYCL_GRAPH                      "ggml: enable graphs in the SYCL bac
 option(GGML_SYCL_HOST_MEM_FALLBACK          "ggml: allow host memory fallback in SYCL reorder (requires kernel 6.8+)" ON)
 option(GGML_SYCL_SUPPORT_LEVEL_ZERO_API     "ggml: use Level Zero API in SYCL backend"  ON)
 option(GGML_SYCL_DNN                        "ggml: enable oneDNN in the SYCL backend"         ON)
+option(GGML_SYCL_OUT_OF_ORDER               "ggml: use out-of-order queues (experimental)"    OFF)
 set   (GGML_SYCL_TARGET "INTEL" CACHE STRING
                                             "ggml: sycl target device")
 set   (GGML_SYCL_DEVICE_ARCH "" CACHE STRING
@@ -297,14 +298,20 @@ include(GNUInstallDirs)
 # build the library
 #
 
+# Enable CTest before backend subdirectories call add_test().  The top-level
+# llama.cpp build includes CTest before adding ggml; keep this path for
+# standalone ggml builds that request tests directly.
+if (BUILD_TESTING OR GGML_BUILD_TESTS OR GGML_SYCL_BUILD_XMX_TESTS)
+    enable_testing()
+endif ()
+
 add_subdirectory(src)
 
 #
 # tests and examples
 #
 
-if (GGML_BUILD_TESTS)
-    enable_testing()
+if (GGML_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
     add_subdirectory(tests)
 endif ()
 

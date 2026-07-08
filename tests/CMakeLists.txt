@@ -234,6 +234,29 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 
 llama_build_and_test(test-arg-parser.cpp)
 
+if (NOT WIN32)
+    llama_test_cmd(
+        bash
+        NAME test-sycl-alloc-policy
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-alloc-policy.sh
+    )
+endif()
+
+if (GGML_SYCL)
+    llama_build(test-sycl-kernel-profiler.cpp)
+    target_include_directories(test-sycl-kernel-profiler PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    target_link_libraries(test-sycl-kernel-profiler PRIVATE ggml-sycl)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-kernel-profiler PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-sycl-kernel-profiler PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-sycl-kernel-profiler PRIVATE "-fsycl")
+        target_link_options(test-sycl-kernel-profiler PRIVATE "-fsycl")
+    endif()
+    llama_test(test-sycl-kernel-profiler LABEL "main")
+endif()
+
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)
