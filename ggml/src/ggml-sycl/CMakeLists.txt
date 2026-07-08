@@ -126,14 +126,44 @@ else()
     target_compile_options(ggml-sycl PRIVATE "-Wno-narrowing")
 endif()
 
+# Battlemage (B580/G21) AOT avoids first-run JIT overhead, but requires Intel's
+# offline compiler (ocloc). GGML_SYCL_BMG_AOT=AUTO (default) enables AOT when
+# ocloc is present (dev hosts with the GPU compute runtime) and falls back to
+# JIT-only (spir64) otherwise, so compiler-only environments such as the SYCL CI
+# runners (which ship icpx but not ocloc) still link. Set ON/OFF to force.
+set(GGML_SYCL_BMG_AOT "AUTO" CACHE STRING "Battlemage AOT: ON, OFF, or AUTO (detect ocloc)")
+if (GGML_SYCL_BMG_AOT STREQUAL "AUTO")
+    find_program(GGML_SYCL_OCLOC ocloc)
+    if (GGML_SYCL_OCLOC)
+        set(GGML_SYCL_BMG_AOT_ENABLED ON)
+    else()
+        set(GGML_SYCL_BMG_AOT_ENABLED OFF)
+    endif()
+elseif (GGML_SYCL_BMG_AOT)
+    set(GGML_SYCL_BMG_AOT_ENABLED ON)
+else()
+    set(GGML_SYCL_BMG_AOT_ENABLED OFF)
+endif()
+if (GGML_SYCL_BMG_AOT_ENABLED)
+    message(STATUS "ggml-sycl: Battlemage AOT enabled (-fsycl-targets=intel_gpu_bmg_g21,spir64)")
+    set(GGML_SYCL_INTEL_TARGETS "intel_gpu_bmg_g21,spir64")
+else()
+    message(STATUS "ggml-sycl: Battlemage AOT disabled; JIT only (-fsycl-targets=spir64) [ocloc not found or GGML_SYCL_BMG_AOT=OFF]")
+    set(GGML_SYCL_INTEL_TARGETS "spir64")
+endif()
+
 # Enable SPIR-V split barrier extension for cooperative ESIMD kernels on Arc GPUs
 # Split barriers allow non-blocking arrival + deferred wait, improving performance
 # over monolithic esimd::barrier() by overlapping compute with synchronization.
 # Required for: __spirv_ControlBarrierArriveINTEL / __spirv_ControlBarrierWaitINTEL
-# Note: Must specify both targets since we use -fsycl-targets=intel_gpu_bmg_g21,spir64
+# The BMG per-target translator opts are added only when AOT is enabled (the
+# intel_gpu_bmg_g21 target only exists in -fsycl-targets in that case).
 target_link_options(ggml-sycl PRIVATE
-    "SHELL:-Xspirv-translator=intel_gpu_bmg_g21 -spirv-ext=+SPV_INTEL_split_barrier"
     "SHELL:-Xspirv-translator=spir64 -spirv-ext=+SPV_INTEL_split_barrier")
+if (GGML_SYCL_BMG_AOT_ENABLED)
+    target_link_options(ggml-sycl PRIVATE
+        "SHELL:-Xspirv-translator=intel_gpu_bmg_g21 -spirv-ext=+SPV_INTEL_split_barrier")
+endif()
 
 # Link against oneDNN (primary math backend for Intel targets)
 set(GGML_SYCL_DNNL 0)
@@ -256,10 +286,11 @@ if (GGML_SYCL_F16)
 endif()
 
 if (GGML_SYCL_TARGET STREQUAL "INTEL")
-    # Enable AOT for Battlemage (B580/G21) and JIT fallback (spir64)
-    # This prevents runtime JIT compilation overhead
-    target_compile_options(ggml-sycl PRIVATE "-fsycl-targets=intel_gpu_bmg_g21,spir64")
-    target_link_options(ggml-sycl PRIVATE "-fsycl-targets=intel_gpu_bmg_g21,spir64")
+    # AOT (Battlemage) + JIT fallback, or JIT-only, per the GGML_SYCL_BMG_AOT
+    # decision computed above (GGML_SYCL_INTEL_TARGETS). AOT avoids runtime JIT
+    # overhead but needs ocloc; JIT-only keeps compiler-only environments building.
+    target_compile_options(ggml-sycl PRIVATE "-fsycl-targets=${GGML_SYCL_INTEL_TARGETS}")
+    target_link_options(ggml-sycl PRIVATE "-fsycl-targets=${GGML_SYCL_INTEL_TARGETS}")
 
     # Force WARP_SIZE=32 for Intel to match MMQ tile sizes (32) and fix division-by-zero
     # issues in load_tiles_q4_0. Intel hardware supports subgroup size 32.
