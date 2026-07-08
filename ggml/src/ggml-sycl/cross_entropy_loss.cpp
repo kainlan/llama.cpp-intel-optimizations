@@ -1,7 +1,9 @@
 #include "cross_entropy_loss.hpp"
 
-#include <cstdint>
+#include "mem-ops.hpp"
+
 #include <cmath>
+#include <cstdint>
 
 template <bool has_shared>
 static __dpct_inline__ void cross_entropy_loss_f32_kernel(
@@ -97,21 +99,31 @@ static __dpct_inline__ void cross_entropy_loss_back_f32_kernel(
     }
 }
 
+// Device-to-device copy routed through the unified-cache-owned mem_copy API
+// (raw sycl queue memcpy is forbidden by the SYCL alloc-ownership policy).
+static void cross_entropy_reduce_copy(ggml_backend_sycl_context & ctx, void * dst, const void * src, size_t bytes) {
+    auto dst_handle = ggml_sycl_memcpy_handle_for_raw_ptr(dst, ctx.device, GGML_LAYOUT_AOS,
+                                                          /*fallback_on_device=*/true,
+                                                          /*fallback_unknown=*/true);
+    auto src_handle = ggml_sycl_memcpy_handle_for_raw_ptr(src, ctx.device, GGML_LAYOUT_AOS,
+                                                          /*fallback_on_device=*/true,
+                                                          /*fallback_unknown=*/true);
+    ggml_sycl::mem_copy(dst_handle, src_handle, bytes, *ctx.stream());
+}
+
 static void cross_entropy_reduce_rows(
         ggml_backend_sycl_context & ctx,
         const float * row_loss,
         float * dst,
         const int64_t nrows) {
     if (nrows == 1) {
-        SYCL_CHECK(CHECK_TRY_ERROR(
-            ctx.stream()->memcpy(dst, row_loss, sizeof(float))));
+        cross_entropy_reduce_copy(ctx, dst, row_loss, sizeof(float));
         return;
     }
 
     ggml_sycl_pool_alloc<float> tmp_alloc(ctx.pool(), nrows);
     float * tmp = tmp_alloc.get();
-    SYCL_CHECK(CHECK_TRY_ERROR(
-        ctx.stream()->memcpy(tmp, row_loss, nrows * sizeof(float))));
+    cross_entropy_reduce_copy(ctx, tmp, row_loss, nrows * sizeof(float));
 
     int64_t cur = nrows;
     while (cur > 1) {
@@ -133,8 +145,7 @@ static void cross_entropy_reduce_rows(
         cur = out;
     }
 
-    SYCL_CHECK(CHECK_TRY_ERROR(
-        ctx.stream()->memcpy(dst, tmp, sizeof(float))));
+    cross_entropy_reduce_copy(ctx, dst, tmp, sizeof(float));
 }
 
 void ggml_sycl_cross_entropy_loss(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {

@@ -4,15 +4,6 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CHECKER="$ROOT_DIR/scripts/check-sycl-alloc-usage.sh"
 
-# The policy checker relies on ripgrep (rg). Where rg is unavailable (e.g. the
-# generic CPU CI runners), skip the test rather than fail it — the SYCL source
-# policy is still enforced on hosts that have rg (dev machines, SYCL CI).
-# Exit code 77 is registered as the ctest SKIP_RETURN_CODE in tests/CMakeLists.txt.
-if ! command -v rg >/dev/null 2>&1; then
-    echo "test-sycl-alloc-policy: ripgrep (rg) not available; skipping" >&2
-    exit 77
-fi
-
 "$CHECKER" "$ROOT_DIR/tests/sycl-alloc-policy-fixtures/good"
 "$CHECKER" "$ROOT_DIR/ggml/src/ggml-sycl"
 

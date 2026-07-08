@@ -7,9 +7,58 @@ if [[ "$SCAN_ROOT" = "$ROOT_DIR"* ]]; then
     SCAN_ROOT="${SCAN_ROOT#$ROOT_DIR/}"
 fi
 
+# This checker was written against ripgrep, but the generic CI runners do not
+# ship it. When rg is unavailable, provide a GNU-grep shim covering the three
+# invocation forms this script uses, so the SYCL alloc-policy check still runs
+# everywhere. Requires GNU grep (\s and \b extensions, PCRE -P for the
+# multiline patterns, -r, --include/--exclude-dir), which is present on the CI
+# images and dev hosts. When a real rg binary exists it is used unchanged.
 if ! command -v rg >/dev/null 2>&1; then
-    echo "error: ripgrep (rg) is required" >&2
-    exit 2
+    rg() {
+        # Form 1: quiet match on stdin -> rg -q PATTERN
+        if [[ "${1:-}" == "-q" ]]; then
+            grep -Eq -- "$2"
+            return
+        fi
+        # Form 3: multiline scan -> rg -U "${RG_ARGS[@]}" PATTERN PATH
+        local multiline=0
+        if [[ "${1:-}" == "-U" ]]; then
+            multiline=1
+            shift
+        fi
+        # Form 2: recursive scan -> rg "${RG_ARGS[@]}" PATTERN PATH
+        # RG_ARGS = -n --no-heading --with-filename --glob '*.ext'... --glob '!**/dir/**'
+        local includes=() excludes=() positional=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --glob)
+                    shift
+                    local g="$1"
+                    if [[ "$g" == '!'* ]]; then
+                        g="${g#!}"; g="${g#\*\*/}"; g="${g%/\*\*}"
+                        excludes+=("--exclude-dir=$g")
+                    else
+                        includes+=("--include=$g")
+                    fi
+                    ;;
+                -n|--no-heading|--with-filename) ;;  # implied by grep -Hn
+                *) positional+=("$1") ;;
+            esac
+            shift
+        done
+        if [[ "$multiline" == 1 ]]; then
+            # -U/--multiline: treat each file as one NUL record (-z) so patterns
+            # with embedded \n match across lines; -P (PCRE) honors \n in classes.
+            # -l lists matching files -> non-empty output signals a match, which
+            # is all the -U call sites test.
+            grep -rPlz "${includes[@]}" "${excludes[@]}" -e "${positional[0]}" "${positional[1]}"
+        else
+            # grep -Hn output "path:line:text" matches rg --with-filename --no-heading -n.
+            # -e keeps the (long, regex-heavy) pattern from being read as a path.
+            # grep exits 1 on no matches; callers wrap with `|| true`.
+            grep -rHnE "${includes[@]}" "${excludes[@]}" -e "${positional[0]}" "${positional[1]}"
+        fi
+    }
 fi
 
 PATTERN='sycl::malloc_(device|host|shared)\s*\(|sycl_aligned_malloc_device\s*\(|sycl::free\s*\(|zeMemAlloc[^[:space:]]*\s*\(|zeMemFree\s*\(|ggml_sycl_(malloc|free)_device_raw\s*\(|unified_cache_raw_(malloc_(device|host)|free_device)\s*\('
