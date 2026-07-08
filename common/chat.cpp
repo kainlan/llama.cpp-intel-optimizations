@@ -1147,6 +1147,8 @@ static common_chat_params common_chat_params_init_gpt_oss(const common_chat_temp
 
     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.supports_thinking = true;
+    data.thinking_start_tag = "<|start|>assistant";
+    data.thinking_end_tag   = "<|channel|>final<|message|>";
 
     // These special tokens are required to parse properly, so we include them
     // even if parse_tool_calls is false.
