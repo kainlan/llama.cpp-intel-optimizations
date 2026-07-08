@@ -10,9 +10,10 @@ fi
 # This checker was written against ripgrep, but the generic CI runners do not
 # ship it. When rg is unavailable, provide a GNU-grep shim covering the three
 # invocation forms this script uses, so the SYCL alloc-policy check still runs
-# everywhere. Requires GNU grep (\s and \b extensions, PCRE -P for the
-# multiline patterns, -r, --include/--exclude-dir), which is present on the CI
-# images and dev hosts. When a real rg binary exists it is used unchanged.
+# everywhere. Requires GNU grep (\s and \b extensions, -z multiline, -r,
+# --include/--exclude-dir), which is present on the CI images and dev hosts.
+# When a real rg binary exists it is used unchanged. (test-sycl-alloc-policy.sh
+# skips where neither rg nor GNU grep is available, e.g. macOS BSD grep.)
 if ! command -v rg >/dev/null 2>&1; then
     rg() {
         # Form 1: quiet match on stdin -> rg -q PATTERN
@@ -47,11 +48,11 @@ if ! command -v rg >/dev/null 2>&1; then
             shift
         done
         if [[ "$multiline" == 1 ]]; then
-            # -U/--multiline: treat each file as one NUL record (-z) so patterns
-            # with embedded \n match across lines; -P (PCRE) honors \n in classes.
-            # -l lists matching files -> non-empty output signals a match, which
-            # is all the -U call sites test.
-            grep -rPlz "${includes[@]}" "${excludes[@]}" -e "${positional[0]}" "${positional[1]}"
+            # -U/--multiline: treat each file as one NUL record (-z) so the
+            # [[:space:]] classes (which include newline in GNU grep) match
+            # across lines. -l lists matching files -> non-empty output signals
+            # a match, which is all the -U call sites test.
+            grep -rlzE "${includes[@]}" "${excludes[@]}" -e "${positional[0]}" "${positional[1]}"
         else
             # grep -Hn output "path:line:text" matches rg --with-filename --no-heading -n.
             # -e keeps the (long, regex-heavy) pattern from being read as a path.

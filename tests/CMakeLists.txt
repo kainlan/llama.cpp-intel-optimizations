@@ -241,6 +241,9 @@ if (NOT WIN32)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-alloc-policy.sh
     )
+    # The script exits 77 (skip) when neither ripgrep nor GNU grep is available
+    # (e.g. macOS BSD grep runners); treat that as a skip, not a failure.
+    set_tests_properties(test-sycl-alloc-policy PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 if (GGML_SYCL)

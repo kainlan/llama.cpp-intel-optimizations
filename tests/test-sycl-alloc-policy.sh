@@ -4,6 +4,15 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CHECKER="$ROOT_DIR/scripts/check-sycl-alloc-usage.sh"
 
+# The checker needs ripgrep or GNU grep (the patterns rely on \s/\b and
+# multiline scanning). Where neither is available (e.g. macOS BSD grep runners),
+# skip: the SYCL source policy only matters on Linux/SYCL builds and is still
+# enforced wherever rg or GNU grep exists. Exit 77 = ctest SKIP_RETURN_CODE.
+if ! command -v rg >/dev/null 2>&1 && ! printf 'a b' | grep -Eq 'a\sb' 2>/dev/null; then
+    echo "test-sycl-alloc-policy: no ripgrep and no GNU grep; skipping" >&2
+    exit 77
+fi
+
 "$CHECKER" "$ROOT_DIR/tests/sycl-alloc-policy-fixtures/good"
 "$CHECKER" "$ROOT_DIR/ggml/src/ggml-sycl"
 
