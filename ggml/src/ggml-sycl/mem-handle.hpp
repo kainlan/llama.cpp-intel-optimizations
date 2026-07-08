@@ -2,7 +2,7 @@
 // Handles cache pointer resolution with generation-based staleness detection.
 // P10 of the unified memory manager epic.
 //
-// See docs/smart-handle-design.md for architecture details.
+// See docs/backend/sycl-memory-design.md for architecture details.
 
 #pragma once
 
