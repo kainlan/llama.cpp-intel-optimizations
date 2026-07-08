@@ -1106,6 +1106,31 @@ static common_chat_params common_chat_params_init_ministral_3(const common_chat_
     return data;
 }
 
+// Interpret a chat_template_kwargs / extra_context entry as a boolean, accepting
+// native booleans, "true"/"1" strings, and non-zero integers.
+static bool common_chat_extra_context_true(const json & extra_context, const std::string & key) {
+    if (!extra_context.is_object()) {
+        return false;
+    }
+
+    auto it = extra_context.find(key);
+    if (it == extra_context.end()) {
+        return false;
+    }
+
+    if (it->is_boolean()) {
+        return it->get<bool>();
+    }
+    if (it->is_string()) {
+        const auto value = it->get<std::string>();
+        return value == "true" || value == "1";
+    }
+    if (it->is_number_integer()) {
+        return it->get<int>() != 0;
+    }
+    return false;
+}
+
 static common_chat_params common_chat_params_init_gpt_oss(const common_chat_template &    tmpl,
                                                           const autoparser::generation_params & inputs) {
     common_chat_params data;
@@ -1137,6 +1162,21 @@ static common_chat_params common_chat_params_init_gpt_oss(const common_chat_temp
 
     data.prompt            = prompt;
     data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs, /* messages_override= */ adjusted_messages);
+
+    // When the caller forces the final channel (e.g. reasoning disabled), append
+    // the Harmony final-channel marker so generation starts directly in the final
+    // channel instead of the model choosing analysis first.
+    if (inputs.add_generation_prompt &&
+        common_chat_extra_context_true(inputs.extra_context, "llama_force_final_channel")) {
+        static constexpr std::string_view final_channel = "<|channel|>final<|message|>";
+        if (!string_ends_with(data.generation_prompt, final_channel)) {
+            data.generation_prompt += final_channel;
+        }
+        if (!string_ends_with(data.prompt, final_channel)) {
+            data.prompt += final_channel;
+        }
+    }
+
     data.message_delimiters = {
         { COMMON_CHAT_ROLE_ASSISTANT, "<|start|>assistant" },
         { COMMON_CHAT_ROLE_USER,      "<|start|>user"      },
