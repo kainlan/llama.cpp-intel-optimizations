@@ -5128,6 +5128,111 @@ void ggml_compute_forward_set_rows(
     }
 }
 
+// ggml_compute_forward_set_rows_paged
+
+// Element conversion helpers for the paged KV write (F32/F16 in both directions).
+template <typename T> static inline float ggml_srp_to_f32(T v);
+
+template <> inline float ggml_srp_to_f32<float>(float v) {
+    return v;
+}
+
+template <> inline float ggml_srp_to_f32<ggml_fp16_t>(ggml_fp16_t v) {
+    return GGML_CPU_FP16_TO_FP32(v);
+}
+
+template <typename T> static inline T ggml_srp_from_f32(float v);
+
+template <> inline float ggml_srp_from_f32<float>(float v) {
+    return v;
+}
+
+template <> inline ggml_fp16_t ggml_srp_from_f32<ggml_fp16_t>(float v) {
+    return GGML_CPU_FP32_TO_FP16(v);
+}
+
+template <typename TIn, typename TOut, typename IdxT>
+static void ggml_compute_forward_set_rows_paged_impl(const ggml_compute_params * params, ggml_tensor * dst) {
+    // Single-device CPU port of the SYCL block-addressed KV write
+    // (see ggml/src/ggml-sycl/set_rows_paged.hpp). Scatters contiguous KV
+    // source data into a 4D paged destination via an optional block table.
+    if (params->ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * src      = dst->src[0];  // [D * n_heads, n_tokens]
+    const ggml_tensor * indices  = dst->src[1];  // [n_tokens]
+    const ggml_tensor * btable   = dst->src[2];  // [max_blocks_per_seq, n_seqs]
+    ggml_tensor *       dst_orig = dst->src[3];  // [D, block_size, n_heads, num_blocks]
+
+    const int32_t * op_params    = (const int32_t *) dst->op_params;
+    const int32_t   block_size   = op_params[0];
+    const int32_t   seq_idx      = op_params[1];
+    const int32_t   use_identity = op_params[2];
+
+    const int64_t D                  = dst_orig->ne[0];
+    const int64_t n_heads            = dst_orig->ne[2];
+    const int64_t n_tokens           = src->ne[1];
+    const int64_t max_blocks_per_seq = btable->ne[0];
+
+    const TIn *     src_d    = (const TIn *) src->data;
+    TOut *          dst_d    = (TOut *) dst_orig->data;
+    const IdxT *    idx_d    = (const IdxT *) indices->data;
+    const int32_t * btable_d = use_identity ? NULL : (const int32_t *) btable->data;
+
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        const int32_t logical_pos     = (int32_t) idx_d[token];
+        const int32_t logical_block   = logical_pos / block_size;
+        const int32_t offset_in_block = logical_pos % block_size;
+        const int32_t physical_block =
+            btable_d ? btable_d[seq_idx * max_blocks_per_seq + logical_block] : logical_block;
+
+        for (int64_t head = 0; head < n_heads; ++head) {
+            for (int64_t d = 0; d < D; ++d) {
+                const int64_t src_off = token * (D * n_heads) + head * D + d;
+                const int64_t dst_off =
+                    physical_block * (n_heads * block_size * D) + head * (block_size * D) + offset_in_block * D + d;
+                dst_d[dst_off] = ggml_srp_from_f32<TOut>(ggml_srp_to_f32<TIn>(src_d[src_off]));
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_set_rows_paged(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src      = dst->src[0];
+    const ggml_tensor * indices  = dst->src[1];
+    const ggml_tensor * dst_orig = dst->src[3];
+
+    const bool i64 = indices->type == GGML_TYPE_I64;
+
+    if (src->type == GGML_TYPE_F32 && dst_orig->type == GGML_TYPE_F32) {
+        i64 ? ggml_compute_forward_set_rows_paged_impl<float, float, int64_t>(params, dst) :
+              ggml_compute_forward_set_rows_paged_impl<float, float, int32_t>(params, dst);
+    } else if (src->type == GGML_TYPE_F32 && dst_orig->type == GGML_TYPE_F16) {
+        i64 ? ggml_compute_forward_set_rows_paged_impl<float, ggml_fp16_t, int64_t>(params, dst) :
+              ggml_compute_forward_set_rows_paged_impl<float, ggml_fp16_t, int32_t>(params, dst);
+    } else if (src->type == GGML_TYPE_F16 && dst_orig->type == GGML_TYPE_F16) {
+        i64 ? ggml_compute_forward_set_rows_paged_impl<ggml_fp16_t, ggml_fp16_t, int64_t>(params, dst) :
+              ggml_compute_forward_set_rows_paged_impl<ggml_fp16_t, ggml_fp16_t, int32_t>(params, dst);
+    } else if (src->type == GGML_TYPE_F16 && dst_orig->type == GGML_TYPE_F32) {
+        i64 ? ggml_compute_forward_set_rows_paged_impl<ggml_fp16_t, float, int64_t>(params, dst) :
+              ggml_compute_forward_set_rows_paged_impl<ggml_fp16_t, float, int32_t>(params, dst);
+    } else {
+        GGML_ABORT("%s: unsupported type combination src=%s dst=%s\n", __func__, ggml_type_name(src->type),
+                   ggml_type_name(dst_orig->type));
+    }
+}
+
+// ggml_compute_forward_all_reduce_sum
+
+void ggml_compute_forward_all_reduce_sum(const ggml_compute_params * params, ggml_tensor * dst) {
+    // On the CPU backend there are no peer shards to reduce against, so an
+    // all-reduce-sum degenerates to the identity: pass the local input through
+    // unchanged. Cross-device summation is performed by the accelerator
+    // backends that participate in tensor parallelism.
+    ggml_compute_forward_dup(params, dst);
+}
+
 // ggml_compute_forward_get_rows_back
 
 static void ggml_compute_forward_get_rows_back_f32_f16(

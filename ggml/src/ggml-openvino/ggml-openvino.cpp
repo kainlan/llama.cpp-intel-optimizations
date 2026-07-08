@@ -420,6 +420,7 @@ static const ggml_backend_buffer_i ggml_backend_openvino_buffer_interface = {
     /* .cpy_tensor      = */ ggml_backend_openvino_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_openvino_buffer_clear,
     /* .reset           = */ NULL,
+    /* .get_caps         = */ NULL,
 };
 
 // Buffer type interface functions
@@ -479,6 +480,7 @@ static const ggml_backend_buffer_type_i ggml_backend_openvino_buffer_type_interf
     /* .get_max_size     = */ ggml_backend_openvino_buffer_type_get_max_size,
     /* .get_alloc_size   = */ ggml_backend_openvino_buffer_type_get_alloc_size,
     /* .is_host          = */ nullptr,
+    /* .get_caps         = */ nullptr,
 };
 
 // Get buffer type for a specific device
@@ -534,6 +536,7 @@ static const ggml_backend_buffer_type_i ggml_backend_openvino_host_buffer_type_i
     /* .get_max_size     = */ ggml_backend_openvino_buffer_type_get_max_size,
     /* .get_alloc_size   = */ ggml_backend_openvino_buffer_type_get_alloc_size,
     /* .is_host          = */ ggml_backend_openvino_host_buffer_type_is_host,
+    /* .get_caps         = */ nullptr,
 };
 
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_openvino_host_buffer_type(int device) {

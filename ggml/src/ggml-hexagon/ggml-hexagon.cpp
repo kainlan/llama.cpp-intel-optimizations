@@ -981,6 +981,7 @@ static ggml_backend_buffer_i ggml_backend_hexagon_buffer_interface = {
     /* .cpy_tensor      = */ ggml_backend_hexagon_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_hexagon_buffer_clear,
     /* .reset           = */ NULL,
+    /* .get_caps         = */ NULL,
 };
 
 // ** backend buffer type
@@ -1053,6 +1054,7 @@ static ggml_backend_buffer_type_i ggml_backend_hexagon_buffer_type_interface = {
     /* .get_max_size     = */ ggml_backend_hexagon_buffer_type_get_max_size,
     /* .get_alloc_size   = */ ggml_backend_hexagon_buffer_type_get_alloc_size,
     /* .is_host          = */ ggml_backend_hexagon_buffer_type_is_host,
+    /* .get_caps         = */ NULL,
 };
 
 static ggml_backend_buffer_type_i ggml_backend_hexagon_repack_buffer_type_interface = {
@@ -1062,6 +1064,7 @@ static ggml_backend_buffer_type_i ggml_backend_hexagon_repack_buffer_type_interf
     /* .get_max_size     = */ ggml_backend_hexagon_buffer_type_get_max_size,
     /* .get_alloc_size   = */ ggml_backend_hexagon_buffer_type_get_alloc_size,
     /* .is_host          = */ ggml_backend_hexagon_repack_buffer_type_is_host,
+    /* .get_caps         = */ NULL,
 };
 
 static bool ggml_backend_buffer_is_hexagon(const struct ggml_backend_buffer * b) {

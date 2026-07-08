@@ -1469,6 +1469,7 @@ static const ggml_backend_buffer_i ggml_backend_riscv64_spacemit_buffer_i = {
     /* .cpy_tensor      = */ nullptr,
     /* .clear           = */ ggml_backend_riscv64_spacemit_buffer_clear,
     /* .reset           = */ nullptr,
+    /* .get_caps         = */ nullptr,
 };
 
 static const char * ggml_backend_cpu_riscv64_spacemit_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
@@ -1646,7 +1647,7 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
 
 ggml_backend_buffer_type_t ggml_backend_cpu_riscv64_spacemit_buffer_type(void) {
     static ggml_backend_buffer_type ggml_backend_cpu_buffer_type_riscv64_spacemit = {
-  /* .iface    = */
+        /* .iface    = */
         {
          /* .get_name         = */ ggml_backend_cpu_riscv64_spacemit_buffer_type_get_name,
          /* .alloc_buffer     = */ ggml_backend_cpu_riscv64_spacemit_buffer_type_alloc_buffer,
@@ -1654,10 +1655,11 @@ ggml_backend_buffer_type_t ggml_backend_cpu_riscv64_spacemit_buffer_type(void) {
          /* .get_max_size     = */ nullptr,
          /* .get_alloc_size   = */ ggml_backend_cpu_riscv64_spacemit_nbytes,
          /* .is_host          = */ nullptr,
+         /* .get_caps         = */ nullptr,
          },
- /* .device  = */
+        /* .device  = */
         ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
- /* .context = */
+        /* .context = */
         new ggml::cpu::riscv64_spacemit::extra_buffer_type(),
     };
 

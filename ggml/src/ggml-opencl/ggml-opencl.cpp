@@ -9707,6 +9707,7 @@ static ggml_backend_buffer_i ggml_backend_opencl_buffer_interface = {
     /* .cpy_tensor      = */ NULL,
     /* .clear           = */ ggml_backend_opencl_buffer_clear,
     /* .reset           = */ ggml_backend_opencl_buffer_reset,
+    /* .get_caps         = */ NULL,
 };
 
 //
@@ -9770,6 +9771,7 @@ static ggml_backend_buffer_type_i ggml_backend_opencl_buffer_type_interface = {
     /* .get_max_size     = */ ggml_backend_opencl_buffer_type_get_max_size,
     /* .get_alloc_size   = */ NULL,
     /* .is_host          = */ NULL,
+    /* .get_caps         = */ NULL,
 };
 
 //

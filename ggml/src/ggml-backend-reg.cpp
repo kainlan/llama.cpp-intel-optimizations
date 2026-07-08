@@ -126,7 +126,9 @@ struct ggml_backend_registry {
     std::vector<ggml_backend_dev_t> devices;
 
     ggml_backend_registry() {
-        const bool disable_device_backends = ggml_backend_device_backends_disabled();
+        // Only referenced inside the per-backend GGML_USE_* blocks below, so it
+        // is unused in a CPU-only build.
+        [[maybe_unused]] const bool disable_device_backends = ggml_backend_device_backends_disabled();
 
 #ifdef GGML_USE_CUDA
         if (!disable_device_backends) {

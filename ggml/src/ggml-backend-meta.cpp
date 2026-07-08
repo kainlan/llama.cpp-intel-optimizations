@@ -335,6 +335,7 @@ static const struct ggml_backend_buffer_type_i ggml_backend_meta_buffer_type_ifa
     /* .get_max_size     = */ ggml_backend_meta_buffer_type_get_max_size,
     /* .get_alloc_size   = */ ggml_backend_meta_buffer_type_get_alloc_size,
     /* .is_host          = */ ggml_backend_meta_buffer_type_is_host,
+    /* .get_caps         = */ nullptr,
 };
 
 bool ggml_backend_buft_is_meta(ggml_backend_buffer_type_t buft) {
@@ -1481,7 +1482,7 @@ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
     /* .free_buffer     = */ ggml_backend_meta_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_meta_buffer_get_base,
     /* .init_tensor     = */ ggml_backend_meta_buffer_init_tensor,
-    /* .memset_tensor   = */ nullptr, // TODO implement
+    /* .memset_tensor   = */ nullptr,  // TODO implement
     /* .set_tensor      = */ ggml_backend_meta_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_meta_buffer_get_tensor,
     /* .set_tensor_2d   = */ nullptr,
@@ -1489,6 +1490,7 @@ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
     /* .cpy_tensor      = */ nullptr,
     /* .clear           = */ ggml_backend_meta_buffer_clear,
     /* .reset           = */ ggml_backend_meta_buffer_reset,
+    /* .get_caps         = */ nullptr,
 };
 
 bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf) {

@@ -539,6 +539,7 @@ static ggml_backend_buffer_i ggml_backend_rpc_buffer_interface = {
     /* .cpy_tensor      = */ ggml_backend_rpc_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_rpc_buffer_clear,
     /* .reset           = */ NULL,
+    /* .get_caps         = */ NULL,
 };
 
 static const char * ggml_backend_rpc_buffer_type_name(ggml_backend_buffer_type_t buft) {
@@ -635,6 +636,7 @@ static ggml_backend_buffer_type_i ggml_backend_rpc_buffer_type_interface = {
     /* .get_max_size     = */ ggml_backend_rpc_get_max_size,
     /* .get_alloc_size   = */ ggml_backend_rpc_buffer_type_get_alloc_size,
     /* .is_host          = */ NULL,
+    /* .get_caps         = */ NULL,
 };
 
 static const char * ggml_backend_rpc_name(ggml_backend_t backend) {

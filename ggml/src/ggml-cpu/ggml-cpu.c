@@ -1873,6 +1873,16 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_set_rows(params, tensor);
             } break;
+        case GGML_OP_SET_ROWS_PAGED:
+            {
+                ggml_compute_forward_set_rows_paged(params, tensor);
+            }
+            break;
+        case GGML_OP_ALL_REDUCE_SUM:
+            {
+                ggml_compute_forward_all_reduce_sum(params, tensor);
+            }
+            break;
         case GGML_OP_DIAG:
             {
                 ggml_compute_forward_diag(params, tensor);
@@ -2316,6 +2326,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             } break;
         case GGML_OP_GET_ROWS:
         case GGML_OP_SET_ROWS:
+        case GGML_OP_SET_ROWS_PAGED:
+        case GGML_OP_ALL_REDUCE_SUM:
             {
                 // FIXME: get_rows can use additional threads, but the cost of launching additional threads
                 // decreases performance with GPU offloading

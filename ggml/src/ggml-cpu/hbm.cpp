@@ -44,10 +44,12 @@ ggml_backend_buffer_type_t ggml_backend_cpu_hbm_buffer_type(void) {
                            /* .alloc_buffer     = */ ggml_backend_cpu_hbm_buffer_type_alloc_buffer,
                            /* .get_alignment    = */ ggml_backend_cpu_buffer_type_get_alignment,
                            /* .get_max_size     = */ nullptr,  // defaults to SIZE_MAX
-                           /* .get_alloc_size   = */ nullptr,  // defaults to ggml_nbytes
-                           /* .is_host          = */ ggml_backend_cpu_buffer_type_is_host,
+            /* .get_alloc_size   = */ nullptr,  // defaults to ggml_nbytes
+            /* .is_host          = */ ggml_backend_cpu_buffer_type_is_host,
+                           /* .get_caps         = */ nullptr,
                            },
-        /* .context  = */ nullptr,
+        /* .context  = */
+        nullptr,
     };
 
     return &ggml_backend_cpu_buffer_type_hbm;
