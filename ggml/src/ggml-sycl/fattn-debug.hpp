@@ -11,6 +11,9 @@
 #include "mem-ops.hpp"
 
 #include <sys/stat.h>
+#ifdef _WIN32
+#    include <direct.h>
+#endif
 
 #include <algorithm>
 #include <cfloat>
@@ -53,7 +56,11 @@ inline int fattn_debug_level() {
         level            = env ? atoi(env) : 0;
         if (level > 0) {
             // Create debug directory
+#ifdef _WIN32
+            _mkdir("/tmp/fa_debug");
+#else
             mkdir("/tmp/fa_debug", 0755);
+#endif
             fprintf(stderr, "[FA-DEBUG] Debug level %d enabled, output to /tmp/fa_debug/\n", level);
         }
     }

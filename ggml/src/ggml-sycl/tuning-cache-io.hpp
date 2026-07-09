@@ -24,8 +24,21 @@
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
+#ifdef _WIN32
+#    include <direct.h>
+#endif
 
 namespace ggml_sycl_tuning {
+
+// Portable single-directory create (POSIX mkdir takes a mode; Windows _mkdir
+// does not). Errors (e.g. already-exists) are ignored by the callers.
+inline int sycl_tuning_mkdir(const char * path) {
+#ifdef _WIN32
+    return _mkdir(path);
+#else
+    return mkdir(path, 0755);
+#endif
+}
 
 // =============================================================================
 // Cache Version: Increment when format changes (for migration support)
@@ -78,12 +91,12 @@ inline bool create_dir_recursive(const std::string& path) {
         current += path[i];
         if (path[i] == '/' && i > 0) {
             // Create intermediate directory
-            mkdir(current.c_str(), 0755);
+            sycl_tuning_mkdir(current.c_str());
         }
     }
     // Create final directory
     if (!current.empty() && current.back() != '/') {
-        mkdir(current.c_str(), 0755);
+        sycl_tuning_mkdir(current.c_str());
     }
     return true;
 }

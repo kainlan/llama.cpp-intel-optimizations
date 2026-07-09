@@ -99,6 +99,12 @@ jobs:
   windows-latest-sycl:
     runs-on: windows-2022
 
+    # Windows SYCL is best-effort: the backend's memory core uses POSIX mmap
+    # (dpct/helper.hpp, unified-cache.hpp) with no ported Windows equivalent, so
+    # this leg is not expected to build yet. Keep it reporting but non-blocking,
+    # matching ubuntu-24-sycl above.
+    continue-on-error: true
+
     defaults:
       run:
         shell: bash
