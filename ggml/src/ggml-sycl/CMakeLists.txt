@@ -1291,7 +1291,16 @@ endif()
 add_test(NAME test-sycl-esimd-float-atomic-compile COMMAND test-sycl-esimd-float-atomic-compile)
 set_tests_properties(test-sycl-esimd-float-atomic-compile PROPERTIES LABELS "sycl;esimd;compile;tdd" TIMEOUT 120)
 
-find_library(LEVEL_ZERO_LOADER ze_loader REQUIRED)
+# On Linux libze_loader.so is on the default search path; on Windows the loader
+# import lib (ze_loader.lib) ships in the Level Zero SDK the CI installs, so hint
+# find_library with the SDK path env vars set by the workflow.
+find_library(LEVEL_ZERO_LOADER
+    NAMES ze_loader
+    HINTS
+        ENV LEVEL_ZERO_V1_SDK_PATH
+        ENV LEVEL_ZERO_SDK_PATH
+    PATH_SUFFIXES lib lib/x64
+    REQUIRED)
 add_executable(test-sycl-level-zero-vmem-feasibility
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-level-zero-vmem-feasibility.cpp
 )
