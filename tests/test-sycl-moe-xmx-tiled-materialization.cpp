@@ -1,6 +1,7 @@
 #include "ggml-sycl/ggml-sycl-test.hpp"
 
 #include <cstdio>
+#include <string>
 
 #define CHECK(cond, msg)                                                        \
     do {                                                                        \
@@ -76,6 +77,69 @@ static int test_no_soa_release_until_success() {
     return 0;
 }
 
+static int test_phase_xmx_auto_policy() {
+    ggml_sycl::test_moe_phase_xmx_auto_policy_input in{};
+    in.has_placement_plan = true;
+    in.pp_soa_promoted    = true;
+    in.xmx_supported      = true;
+    in.xmx_int8_supported = true;
+
+    auto out = ggml_sycl::test_moe_phase_xmx_auto_policy(in);
+    CHECK(out.materialization_enabled, "planner-promoted XMX decode must auto-enable phase materialization");
+    CHECK(out.bulk_xmx_enabled, "planner-promoted XMX decode must auto-enable transactional bulk materialization");
+    CHECK(std::string(out.reason) == "auto-capability", "automatic selection must report capability reason");
+
+    in.has_placement_plan = false;
+    out                   = ggml_sycl::test_moe_phase_xmx_auto_policy(in);
+    CHECK(!out.materialization_enabled && !out.bulk_xmx_enabled,
+          "automatic selection must reject without a placement plan");
+
+    in.has_placement_plan = true;
+    in.pp_soa_promoted    = false;
+    out                   = ggml_sycl::test_moe_phase_xmx_auto_policy(in);
+    CHECK(!out.materialization_enabled && !out.bulk_xmx_enabled,
+          "automatic selection must reject a plan without PP-safe SOA promotion");
+
+    in.pp_soa_promoted = true;
+    in.xmx_supported   = false;
+    out                = ggml_sycl::test_moe_phase_xmx_auto_policy(in);
+    CHECK(!out.materialization_enabled && !out.bulk_xmx_enabled,
+          "automatic selection must reject a device without XMX");
+
+    in.xmx_supported      = true;
+    in.xmx_int8_supported = false;
+    out                   = ggml_sycl::test_moe_phase_xmx_auto_policy(in);
+    CHECK(!out.materialization_enabled && !out.bulk_xmx_enabled,
+          "automatic selection must reject XMX without INT8 support");
+
+    in.xmx_int8_supported    = true;
+    in.phase_materialize_env = "0";
+    in.bulk_xmx_env          = nullptr;
+    out                      = ggml_sycl::test_moe_phase_xmx_auto_policy(in);
+    CHECK(!out.materialization_enabled && out.bulk_xmx_enabled,
+          "phase disable must override automatic execution without changing the unused bulk policy");
+    CHECK(std::string(out.reason) == "phase-disabled", "phase disable must report a stable reason");
+
+    in.phase_materialize_env = nullptr;
+    in.bulk_xmx_env          = "0";
+    out                      = ggml_sycl::test_moe_phase_xmx_auto_policy(in);
+    CHECK(out.materialization_enabled && !out.bulk_xmx_enabled,
+          "bulk disable must preserve automatic phase selection and choose the per-expert fallback");
+    CHECK(std::string(out.reason) == "bulk-disabled", "bulk disable must report a stable reason");
+
+    in.has_placement_plan    = false;
+    in.pp_soa_promoted       = false;
+    in.xmx_supported         = false;
+    in.xmx_int8_supported    = false;
+    in.phase_materialize_env = "1";
+    in.bulk_xmx_env          = "1";
+    out                      = ggml_sycl::test_moe_phase_xmx_auto_policy(in);
+    CHECK(out.materialization_enabled && out.bulk_xmx_enabled,
+          "explicit diagnostic enables must remain available without automatic eligibility");
+    CHECK(std::string(out.reason) == "diagnostic-override", "explicit opt-in must report diagnostic reason");
+    return 0;
+}
+
 static int test_chunked_fallback_policy() {
     CHECK(
         ggml_sycl::test_moe_single_xmx_chunked_fallback_policy("1", "blk.3.ffn_gate_exps.weight", GGML_LAYOUT_XMX_TILED,
@@ -113,6 +177,9 @@ int main() {
         return 1;
     }
     if (test_chunked_fallback_policy() != 0) {
+        return 1;
+    }
+    if (test_phase_xmx_auto_policy() != 0) {
         return 1;
     }
     std::puts("single-layout XMX_TILED materialization invariant tests passed");

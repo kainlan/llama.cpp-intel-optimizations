@@ -105,6 +105,24 @@ struct test_moe_xmx_tiled_materialization_result {
 
 test_moe_xmx_tiled_materialization_result test_moe_xmx_tiled_materialization_invariants(
     const test_moe_xmx_tiled_materialization_input & in);
+
+struct test_moe_phase_xmx_auto_policy_input {
+    const char * phase_materialize_env = nullptr;
+    const char * bulk_xmx_env          = nullptr;
+    bool         has_placement_plan    = false;
+    bool         pp_soa_promoted       = false;
+    bool         xmx_supported         = false;
+    bool         xmx_int8_supported    = false;
+};
+
+struct test_moe_phase_xmx_auto_policy_result {
+    bool         materialization_enabled = false;
+    bool         bulk_xmx_enabled        = false;
+    const char * reason                  = "capability";
+};
+
+test_moe_phase_xmx_auto_policy_result test_moe_phase_xmx_auto_policy(const test_moe_phase_xmx_auto_policy_input & in);
+
 bool test_moe_single_xmx_chunked_fallback_policy(const char *     env_value,
                                                  const char *     tensor_name,
                                                  ggml_layout_mode target_layout,
