@@ -10,7 +10,7 @@
 
 **Test Infrastructure:** `tests/test-sycl-layout-choice.cpp` for pure planner policy, a new CTest-registered Bash source-contract test for the large executor, existing `test-sycl-moe-handle-resolution` host-pinned route coverage, canonical B50 GPT-OSS correctness/benchmark gates, and the B580 Mistral regression guard.
 
-**Tracker:** Parent task `llama.cpp-yyxp3.1`. Create one child tracker issue for each implementation task before editing code; make Tasks 2 and 3 depend on Task 1.
+**Tracker:** Parent task `llama.cpp-yyxp3.1`. The concrete task IDs and dependency edges are recorded below; implementation must claim the ready child task rather than the parent.
 
 **Research basis:**
 
@@ -57,7 +57,7 @@ For the GPT-OSS layer-0 shape, one FP16 expert matrix is `2880 * 2880 * 2 = 15.8
 |---|---|---|
 | A | 1, 2 | Admission primitive/unified-cache enforcement, then executor fail-closed wiring |
 | B | 3 | Canonical contract documentation after the admission API lands |
-| Lead | End-to-End Validation | Fresh-boot serialized B50/B580 correctness, spill, reset, and performance gates |
+| Lead | 4 | Fresh-boot serialized B50/B580 correctness, spill, reset, and performance gates |
 
 ### Dependency Graph
 
@@ -67,13 +67,24 @@ digraph dependencies {
     1 [label="Task 1: Hard-cap admission API"];
     2 [label="Task 2: Fail-closed executor"];
     3 [label="Task 3: Canonical contract"];
-    E2E [label="Lead: Fresh-boot E2E"];
+    4 [label="Task 4: Fresh-boot E2E"];
     1 -> 2;
     1 -> 3;
-    2 -> E2E;
-    3 -> E2E;
+    2 -> 4;
+    3 -> 4;
 }
 ```
+
+### Tracker Task Breakdown
+
+| Plan Task | Tracker ID | Type/Priority | Depends on | Done condition |
+|---|---|---|---|---|
+| 1. Hard-cap admission API | `llama.cpp-qn05` | Bug/P0 | None | Pure cap tests pass and unified cache rejects before its scratch lock/allocation |
+| 2. Fail-closed batched executor | `llama.cpp-qu0k` | Bug/P0 | `llama.cpp-qn05` | No runtime enlargement/temp fallback; executor source-contract and non-GPU gates pass |
+| 3. Canonical memory contract | `llama.cpp-cg4k` | Task/P1 | `llama.cpp-qn05` | Documentation assertion passes and intentional host-expert residency is explicit |
+| 4. Fresh-boot end-to-end proof | `llama.cpp-g8m4` | Task/P0 | `llama.cpp-qu0k`, `llama.cpp-cg4k` | B50 cap/host-row/correctness/perf and B580 regression/reset gates are recorded |
+
+`llama.cpp-yyxp3.1` depends on Task 4, so the parent cannot close before the real-machine proof. Task 1 starts first; Tasks 2 and 3 then run concurrently; Task 4 is lead-owned after both close.
 
 ### File Ownership Map
 
@@ -86,6 +97,7 @@ digraph dependencies {
 | `tests/test-sycl-pp-moe-scratch-contract.sh` | 2 | New file |
 | `tests/CMakeLists.txt` | 2 | Coordinate with unrelated test-registration changes before commit |
 | `docs/design/sycl-canonical-memory-architecture.md` | 3 | None |
+| `/tmp/b50-pp-moe-scratch-cap-*` logs and tracker evidence | 4 | Lead-owned after implementation; no source edits |
 
 ---
 
@@ -722,6 +734,22 @@ git commit -m "docs(sycl): define planned scratch admission invariant"
 ---
 
 ## End-to-End Validation on the User's Machine
+
+### Task 4: Fresh-Boot Scratch-Cap, Host-Route, and Regression Proof
+
+**Track:** Lead
+
+**Depends on:** Tasks 2 and 3
+
+**Tracker:** `llama.cpp-g8m4`
+
+**File scope:**
+
+- Create runtime evidence only: `/tmp/b50-pp-moe-scratch-cap-*`
+- Update tracker comments: `llama.cpp-g8m4` and parent `llama.cpp-yyxp3.1`
+- Do not modify source files to make a gate pass.
+
+**Done condition:** One clean boot proves the exact 32-expert cap rejection, actual host-row execution under constrained VRAM, canonical correctness, same-build B50/B580 no-regression thresholds, and no xe reset.
 
 > Run only after Tasks 1-3 and all non-GPU tests pass. The lead owns these steps. The current boot is invalid because the B50 CCS engine reset at 2026-07-09 21:08:44 local time; reboot is mandatory before validation.
 
