@@ -6,6 +6,7 @@
 
 #include "vmem-kv.hpp"
 
+#include <atomic>
 #include <cstdlib>
 #include <dlfcn.h>
 
