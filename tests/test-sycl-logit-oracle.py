@@ -8,6 +8,7 @@ Run with the system interpreter (the conda python has a broken numpy):
 import argparse
 import array
 import json
+import os
 import pathlib
 import struct
 import subprocess
@@ -243,6 +244,96 @@ def test_kld_header_pads_an_odd_vocabulary_to_even():
     assert oracle.KldHeader(n_ctx=4, n_vocab=5, n_chunk=1, tokens=[]).nv == 10
 
 
+def test_kld_header_expected_size_matches_the_fixture():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _fixture(tmp)
+        header = oracle.open_kld(path)
+        assert header.expected_bytes == path.stat().st_size
+        assert header.header_bytes == 8 + 12 + 4 * 6
+        assert header.row_bytes == header.nv * 2
+
+
+def test_open_kld_rejects_trailing_bytes():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pathlib.Path(tmp) / "long.kld"
+        path.write_bytes(_kld_bytes(6, 4, 1, FIXTURE_ROWS) + b"\x00" * 32)
+        try:
+            oracle.open_kld(path)
+        except ValueError as exc:
+            assert "expected" in str(exc) and "drifted" in str(exc)
+            return
+        raise AssertionError("expected ValueError for a file with trailing bytes")
+
+
+def test_open_kld_rejects_a_file_short_of_its_rows():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pathlib.Path(tmp) / "short-rows.kld"
+        # Complete header, but only one of the two rows the header promises.
+        path.write_bytes(_kld_bytes(6, 4, 1, FIXTURE_ROWS[:1]))
+        try:
+            oracle.open_kld(path)
+        except ValueError as exc:
+            assert "expected" in str(exc)
+            return
+        raise AssertionError("expected ValueError for a file missing rows")
+
+
+def test_open_kld_rejects_a_plausible_header_with_a_drifted_row_size():
+    # Simulates a future perplexity.cpp that changes the row layout without
+    # touching the magic: header parses fine, rows are the wrong width.
+    with tempfile.TemporaryDirectory() as tmp:
+        nv = 2 * ((4 + 1) // 2) + 4
+        drifted = bytearray(b"_logits_")
+        drifted += struct.pack("<3i", 6, 4, 1)
+        drifted += struct.pack("<6i", *range(6))
+        drifted += bytes((nv + 2) * 2 * 2)  # two rows, each two uint16 too wide
+        path = pathlib.Path(tmp) / "drifted.kld"
+        path.write_bytes(bytes(drifted))
+        try:
+            oracle.open_kld(path)
+        except ValueError as exc:
+            assert "drifted" in str(exc)
+            return
+        raise AssertionError("expected ValueError for a drifted row layout")
+
+
+def test_entries_from_kld_refuses_a_size_mismatch():
+    # The size check must guard the entry path, not just the header helper.
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pathlib.Path(tmp) / "long.kld"
+        path.write_bytes(_kld_bytes(6, 4, 1, FIXTURE_ROWS) + b"\x00" * 16)
+        try:
+            oracle.entries_from_kld(path, top_k=2)
+        except ValueError:
+            return
+        raise AssertionError("expected entries_from_kld to reject a size mismatch")
+
+
+def test_read_kld_header_rejects_implausibly_large_fields():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pathlib.Path(tmp) / "huge.kld"
+        path.write_bytes(b"_logits_" + struct.pack("<3i", 1 << 23, 1 << 25, 1 << 21))
+        with open(path, "rb") as fh:
+            try:
+                oracle.read_kld_header(fh)
+            except ValueError as exc:
+                assert "implausibly large" in str(exc)
+                return
+        raise AssertionError("expected ValueError for implausibly large header fields")
+
+
+def test_read_kld_header_accepts_a_real_scale_vocabulary():
+    # A Mistral-sized header must stay comfortably under the sanity ceilings.
+    header = _kld_bytes(64, 32000, 2, [], tokens=[0] * 128)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pathlib.Path(tmp) / "real.kld"
+        path.write_bytes(header)
+        with open(path, "rb") as fh:
+            parsed = oracle.read_kld_header(fh)
+        assert (parsed.n_ctx, parsed.n_vocab, parsed.n_chunk) == (64, 32000, 2)
+        assert parsed.n_rows == 62
+
+
 def test_read_kld_header_rejects_a_bad_magic():
     with tempfile.TemporaryDirectory() as tmp:
         path = pathlib.Path(tmp) / "bad.kld"
@@ -291,6 +382,13 @@ def test_iter_kld_rows_rejects_a_truncated_row():
             assert "truncated" in str(exc)
             return
         raise AssertionError("expected ValueError for a truncated row")
+
+
+def test_iter_kld_rows_reads_a_well_formed_file():
+    with tempfile.TemporaryDirectory() as tmp:
+        rows = list(oracle.iter_kld_rows(_fixture(tmp)))
+        assert [row[0] for row in rows] == [0, 1]
+        assert list(rows[0][3]) == [65535, 100, 0, 7]
 
 
 def test_decode_kld_row_splits_scale_min_and_quantized_values():
@@ -604,6 +702,24 @@ def test_cli_compare_rejects_a_mode_mismatch():
         proc = _run_cli("compare", str(a), str(b))
         assert proc.returncode == 2
         assert "modes differ" in (proc.stdout + proc.stderr)
+
+
+def test_env_with_device_sets_the_selector():
+    env = oracle._env_with_device("level_zero:1")
+    assert env["ONEAPI_DEVICE_SELECTOR"] == "level_zero:1"
+    assert "PATH" in env  # inherits the process environment
+
+
+def test_env_with_device_leaves_the_selector_alone_when_unset():
+    env = oracle._env_with_device(None)
+    assert env.get("ONEAPI_DEVICE_SELECTOR") == os.environ.get("ONEAPI_DEVICE_SELECTOR")
+
+
+def test_tol_help_mentions_the_quantization_floor():
+    proc = _run_cli("compare", "--help")
+    assert proc.returncode == 0
+    help_text = proc.stdout.replace("\n", " ")
+    assert "3e-4" in help_text and "quantization" in help_text
 
 
 def test_capture_defaults_to_logits_mode():

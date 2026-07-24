@@ -30,7 +30,7 @@ The binary layout, read off the writer in `tools/perplexity/perplexity.cpp`
 :521, the row count at :614)::
 
     "_logits_"                        8 bytes, ASCII magic
-    n_ctx                             uint32   (per-chunk context, not params.n_ctx)
+    n_ctx                             int32    (per-chunk context, not params.n_ctx)
     n_vocab                           int32
     n_chunk                           int32
     tokens[n_chunk * n_ctx]           int32 each, the evaluated token ids
@@ -52,6 +52,17 @@ tolerates a single-step wobble.
 
 Written natively, so the file is little-endian on this host and the parser
 assumes that.
+
+The format carries an 8-byte magic and **no version field**, which is upstream's
+design. If a future `perplexity.cpp` change altered the row layout without
+touching the magic, a parser that trusted the magic alone would misparse rather
+than fail -- and a silently wrong "no divergence" verdict is the worst thing
+this tool could produce, since it would green-light exactly the class of broken
+optimization the oracle exists to catch. The mitigation is `open_kld`, which
+computes the exact file size the header implies and refuses anything else. That
+converts most drift into a loud error, but it cannot catch a change that
+preserves the total size (say, reordering fields within a row). If the layout
+ever changes, this parser must be updated deliberately.
 
 **`--mode tokens` (secondary fallback).** Records the greedy token id sequence
 at `--temp 0 --seed 42`: `llama-completion` generates, `llama-tokenize --ids`
@@ -134,6 +145,12 @@ DEFAULT_CHUNKS = 2
 
 # Magic at the head of a llama-perplexity --kl-divergence-base file.
 KLD_MAGIC = b"_logits_"
+
+# Sanity ceilings on the .kld header. These are far above any real model, and
+# exist only so a corrupted-but-plausible header cannot drive an enormous read.
+MAX_KLD_N_CTX = 1 << 22
+MAX_KLD_N_VOCAB = 1 << 24
+MAX_KLD_N_CHUNK = 1 << 20
 
 # Metadata keys that must agree for a comparison to be meaningful.
 META_KEYS_COMPARED = ("model", "prompt", "n_predict", "seed", "temp", "n_ctx", "n_vocab", "top_k")
@@ -285,6 +302,19 @@ class KldHeader:
     def n_rows(self) -> int:
         return self.n_chunk * self.rows_per_chunk
 
+    @property
+    def row_bytes(self) -> int:
+        return self.nv * 2
+
+    @property
+    def header_bytes(self) -> int:
+        return len(KLD_MAGIC) + 12 + 4 * self.n_chunk * self.n_ctx
+
+    @property
+    def expected_bytes(self) -> int:
+        """Exact size the file must have if it matches the layout this parser knows."""
+        return self.header_bytes + self.n_rows * self.row_bytes
+
 
 def read_kld_header(fh) -> KldHeader:
     """Read and validate the header of an open binary `.kld` stream."""
@@ -295,9 +325,15 @@ def read_kld_header(fh) -> KldHeader:
     fields = fh.read(12)
     if len(fields) != 12:
         raise ValueError("truncated logits file: header ends before n_ctx/n_vocab/n_chunk")
-    n_ctx, n_vocab, n_chunk = struct.unpack("<Iii", fields)
+    n_ctx, n_vocab, n_chunk = struct.unpack("<3i", fields)
     if n_ctx <= 0 or n_vocab <= 0 or n_chunk <= 0:
         raise ValueError(f"implausible logits header: n_ctx={n_ctx} n_vocab={n_vocab} n_chunk={n_chunk}")
+    if n_ctx > MAX_KLD_N_CTX or n_vocab > MAX_KLD_N_VOCAB or n_chunk > MAX_KLD_N_CHUNK:
+        raise ValueError(
+            f"implausibly large logits header: n_ctx={n_ctx} n_vocab={n_vocab} n_chunk={n_chunk} "
+            f"(ceilings {MAX_KLD_N_CTX}/{MAX_KLD_N_VOCAB}/{MAX_KLD_N_CHUNK}); the file is corrupt "
+            "or is not a llama-perplexity logits file"
+        )
 
     n_tokens = n_chunk * n_ctx
     raw = fh.read(n_tokens * 4)
@@ -306,6 +342,31 @@ def read_kld_header(fh) -> KldHeader:
     tokens = list(struct.unpack(f"<{n_tokens}i", raw))
 
     return KldHeader(n_ctx=n_ctx, n_vocab=n_vocab, n_chunk=n_chunk, tokens=tokens)
+
+
+def open_kld(path: pathlib.Path | str) -> KldHeader:
+    """Read a `.kld` header and require the file to be exactly the size it implies.
+
+    The format carries no version field, only an 8-byte magic, so a future
+    change to the row layout in perplexity.cpp would otherwise be misparsed
+    silently. A silently wrong "no divergence" verdict is the worst failure this
+    tool can produce -- it would green-light a broken optimization -- so an
+    unexpected size is a hard error, not a warning.
+    """
+    path = pathlib.Path(path)
+    with open(path, "rb") as fh:
+        header = read_kld_header(fh)
+
+    actual = path.stat().st_size
+    if actual != header.expected_bytes:
+        raise ValueError(
+            f"{path}: expected {header.expected_bytes} bytes for n_ctx={header.n_ctx} "
+            f"n_vocab={header.n_vocab} n_chunk={header.n_chunk} "
+            f"({header.header_bytes} header + {header.n_rows} rows x {header.row_bytes}), "
+            f"but the file is {actual}. The file is truncated or corrupt, or the layout in "
+            "tools/perplexity/perplexity.cpp has drifted from what this parser expects"
+        )
+    return header
 
 
 def decode_kld_row(raw: bytes, n_vocab: int) -> tuple[float, float, array.array]:
@@ -338,12 +399,12 @@ def top_k_from_kld_row(scale: float, min_log_prob: float, quantized: array.array
 
 def iter_kld_rows(path: pathlib.Path | str) -> Iterator[tuple[int, float, float, array.array]]:
     """Yield `(row_index, scale, min_log_prob, quantized)` for each row in a `.kld` file."""
+    header = open_kld(path)
     with open(path, "rb") as fh:
-        header = read_kld_header(fh)
-        row_bytes = header.nv * 2
+        fh.seek(header.header_bytes)
         for row in range(header.n_rows):
-            raw = fh.read(row_bytes)
-            if len(raw) != row_bytes:
+            raw = fh.read(header.row_bytes)
+            if len(raw) != header.row_bytes:
                 raise ValueError(f"{path}: truncated at row {row} of {header.n_rows}")
             yield (row, *decode_kld_row(raw, header.n_vocab))
 
@@ -359,8 +420,7 @@ def entries_from_kld(
     32k vocabulary, which is far too much to carry in a JSON artifact, and a
     divergence large enough to matter shows up in the leading entries.
     """
-    with open(path, "rb") as fh:
-        header = read_kld_header(fh)
+    header = open_kld(path)
 
     # Row r of chunk c scores the token at position `first + 1 + r` of that chunk.
     first = header.n_ctx // 2
@@ -400,6 +460,14 @@ def parse_token_ids(text: str) -> list[int]:
     return [int(tok) for tok in re.findall(r"-?\d+", match.group(0))]
 
 
+def _env_with_device(device: str | None) -> dict[str, str]:
+    """Process environment, with ONEAPI_DEVICE_SELECTOR set when a device was asked for."""
+    env = dict(os.environ)
+    if device:
+        env["ONEAPI_DEVICE_SELECTOR"] = device
+    return env
+
+
 def run_completion(
     binary: pathlib.Path,
     model: pathlib.Path,
@@ -426,11 +494,8 @@ def run_completion(
         cmd += ["-ngl", str(n_gpu_layers)]
     cmd += extra_args
 
-    env = dict(os.environ)
-    if device:
-        env["ONEAPI_DEVICE_SELECTOR"] = device
-
-    proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=timeout, check=False)
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=_env_with_device(device),
+                          timeout=timeout, check=False)
     if proc.returncode != 0:
         raise RuntimeError(f"llama-completion failed ({proc.returncode}):\n{proc.stderr}")
     return proc.stdout
@@ -486,11 +551,8 @@ def run_perplexity(
         cmd += ["-ngl", str(n_gpu_layers)]
     cmd += extra_args
 
-    env = dict(os.environ)
-    if device:
-        env["ONEAPI_DEVICE_SELECTOR"] = device
-
-    proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=timeout, check=False)
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=_env_with_device(device),
+                          timeout=timeout, check=False)
     if proc.returncode != 0:
         raise RuntimeError(f"llama-perplexity failed ({proc.returncode}):\n{proc.stderr}")
     if not kld_out.exists() or kld_out.stat().st_size == 0:
@@ -681,7 +743,10 @@ def build_parser() -> argparse.ArgumentParser:
     cmp_ = sub.add_parser("compare", help="compare two capture JSON files")
     cmp_.add_argument("a", help="reference capture JSON")
     cmp_.add_argument("b", help="candidate capture JSON")
-    cmp_.add_argument("--tol", type=float, default=DEFAULT_TOL, help=f"absolute tolerance (default {DEFAULT_TOL})")
+    cmp_.add_argument("--tol", type=float, default=DEFAULT_TOL,
+                      help=f"absolute tolerance (default {DEFAULT_TOL}, which demands an exact match). "
+                           "The .kld quantization step is up to ~2.4e-4, so use --tol 3e-4 to allow a "
+                           "one-step wobble when comparing real hardware runs")
     cmp_.add_argument("--json", action="store_true", help="emit the result as JSON")
     cmp_.set_defaults(func=cmd_compare)
 
