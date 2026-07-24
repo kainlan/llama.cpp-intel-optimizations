@@ -16,6 +16,7 @@
 #include "gpu-arch.hpp"
 
 #include <cstdio>
+#include <cstring>
 
 // The build is -DNDEBUG (Release), so assert() would compile away and the
 // test would pass vacuously. Use an explicit check that always runs.
@@ -89,6 +90,29 @@ int main() {
     CHECK(ggml_sycl::family_from_name("NVIDIA GeForce RTX 4090") == sycl_gpu_family::UNKNOWN,
           "non-Intel name must map to UNKNOWN");
     CHECK(ggml_sycl::family_from_name(nullptr) == sycl_gpu_family::UNKNOWN, "null name must map to UNKNOWN");
+    // The empty string takes a different path than the nullptr guard: it
+    // reaches every name_contains call and must match none of them.
+    CHECK(ggml_sycl::family_from_name("") == sycl_gpu_family::UNKNOWN, "empty name must map to UNKNOWN");
+
+    // Matching is case-insensitive; the fixtures above are all correctly cased,
+    // so exercise name_contains's lowering through the public API explicitly.
+    CHECK(ggml_sycl::family_from_name("intel(r) arc(tm) pro b70 graphics") == sycl_gpu_family::ARC_BATTLEMAGE,
+          "lowercase B70 name must still map to ARC_BATTLEMAGE");
+    CHECK(ggml_sycl::family_from_name("INTEL(R) ARC(TM) PRO B70 GRAPHICS") == sycl_gpu_family::ARC_BATTLEMAGE,
+          "uppercase B70 name must still map to ARC_BATTLEMAGE");
+    CHECK(ggml_sycl::family_from_name("intel(r) data center gpu max 1100") == sycl_gpu_family::DATA_CENTER_MAX,
+          "lowercase Data Center GPU Max name must still map to DATA_CENTER_MAX");
+
+    // RESIDUAL RISK, pinned deliberately: a generic/truncated name with no
+    // model number hits the broad ("Arc" && "Graphics") catch-all and is
+    // classified Alchemist — the same failure shape as the B70 bug, for a
+    // different device shape. This is NOT fixable from the name alone (there
+    // is no correct answer without a model number, and guessing Battlemage
+    // would enable ESIMD dpas on parts that cannot run it); the architecture
+    // query is the real answer. This assertion exists so that changing the
+    // ordering or the catch-all is a deliberate act, not a silent one.
+    CHECK(ggml_sycl::family_from_name("Intel(R) Arc(TM) Graphics") == sycl_gpu_family::ARC_ALCHEMIST,
+          "generic Arc Graphics name is classified Alchemist by the catch-all (known residual gap)");
 
     // ---- ESIMD dpas capability ------------------------------------------
     // Battlemage and PVC run ESIMD dpas at ExecutionSize=16; Alchemist does not.
@@ -103,15 +127,17 @@ int main() {
           "unknown family must not support ESIMD dpas");
 
     // ---- Human-readable names -------------------------------------------
-    CHECK(std::string("Arc Battlemage") == ggml_sycl::family_name(sycl_gpu_family::ARC_BATTLEMAGE),
+    // strcmp rather than std::string: gpu-arch.hpp deliberately does not pull
+    // in <string>, and this test is the guard that it stays that way.
+    CHECK(std::strcmp("Arc Battlemage", ggml_sycl::family_name(sycl_gpu_family::ARC_BATTLEMAGE)) == 0,
           "family_name(ARC_BATTLEMAGE)");
-    CHECK(std::string("Arc Alchemist") == ggml_sycl::family_name(sycl_gpu_family::ARC_ALCHEMIST),
+    CHECK(std::strcmp("Arc Alchemist", ggml_sycl::family_name(sycl_gpu_family::ARC_ALCHEMIST)) == 0,
           "family_name(ARC_ALCHEMIST)");
-    CHECK(std::string("Data Center GPU Max") == ggml_sycl::family_name(sycl_gpu_family::DATA_CENTER_MAX),
+    CHECK(std::strcmp("Data Center GPU Max", ggml_sycl::family_name(sycl_gpu_family::DATA_CENTER_MAX)) == 0,
           "family_name(DATA_CENTER_MAX)");
-    CHECK(std::string("Data Center GPU Flex") == ggml_sycl::family_name(sycl_gpu_family::DATA_CENTER_FLEX),
+    CHECK(std::strcmp("Data Center GPU Flex", ggml_sycl::family_name(sycl_gpu_family::DATA_CENTER_FLEX)) == 0,
           "family_name(DATA_CENTER_FLEX)");
-    CHECK(std::string("Unknown") == ggml_sycl::family_name(sycl_gpu_family::UNKNOWN), "family_name(UNKNOWN)");
+    CHECK(std::strcmp("Unknown", ggml_sycl::family_name(sycl_gpu_family::UNKNOWN)) == 0, "family_name(UNKNOWN)");
 
     std::printf("=== All gpu-arch tests passed ===\n");
     return 0;

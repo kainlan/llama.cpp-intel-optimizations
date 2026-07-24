@@ -1384,6 +1384,12 @@ target_include_directories(test-gpu-arch PRIVATE
 )
 target_compile_options(test-gpu-arch PRIVATE ${GPU_ARCH_TEST_SYCL_OPTIONS})
 target_link_options(test-gpu-arch PRIVATE ${GPU_ARCH_TEST_SYCL_OPTIONS})
+# gpu-arch.cpp logs its name-heuristic fallback through GGML_SYCL_DEBUG, whose
+# g_ggml_sycl_debug globals are defined in a libggml-sycl TU. This test does not
+# link that library (deliberately — it stays host-only and builds in seconds),
+# so the macro is stubbed out here, mirroring unified-kernel.cpp's
+# XMX_TEST_STANDALONE pattern. Production builds get the real logging.
+target_compile_definitions(test-gpu-arch PRIVATE GGML_SYCL_GPU_ARCH_STANDALONE=1)
 if (IntelSYCL_FOUND)
     target_link_libraries(test-gpu-arch PRIVATE IntelSYCL::SYCL_CXX)
 endif()
