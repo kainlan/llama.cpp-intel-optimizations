@@ -19,7 +19,11 @@
 #include <optional>
 #include <sycl/half_type.hpp>
 #include <sycl/sycl.hpp>
-#include <syclcompat/math.hpp>
+// syclcompat was removed in oneAPI 2026.x; the backend never referenced any
+// syclcompat:: symbol, so include it only where it still exists.
+#if __has_include(<syclcompat/math.hpp>)
+#    include <syclcompat/math.hpp>
+#endif
 
 // Math library includes for BLAS operations
 // Intel: Uses oneDNN as primary, MKL optional fallback via GGML_SYCL_USE_INTEL_ONEMKL
