@@ -253,10 +253,15 @@ Models are stored in `/Storage/GenAI/models/`:
 ```bash
 source /opt/intel/oneapi/setvars.sh --force
 
-# Mistral completion gate — deterministic; output must end:
-#   6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+# Mistral completion gate — deterministic; output must start:
+#   1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+# `-n 15` caps generation at 15 NEW tokens; reaching "15" would take ~20 under
+# Mistral's tokenizer, so the run stops at 10 on EOS. (Matches AGENTS.md:232-236
+# and every observed run. An older note here claimed the output ends
+# "...11, 12, 13, 14, 15" — that string is unreachable at -n 15 and made a
+# passing gate read as a failure.)
 # Any other output (###..., repetition, <unk>) = broken path; fix before commit.
-ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
+ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion \
   -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 
@@ -301,8 +306,15 @@ PR 930 USM compression fix. Stock `1.14.37020` is preserved alongside for
 rollback. Reverting to stock without restoring the old allocation check can
 reintroduce silent oversized-allocation hangs (the m09zb `event.wait()` hang).
 
-**Durable rule — B580↔B50 have no direct P2P.** Direct device-to-device USM copy
-fails (`OUT_OF_DEVICE_MEMORY`) and importing a B580 allocation on the B50 returns
+**Durable rule — B580↔B50 had no direct P2P.** ⚠️ This was measured on the
+**B580**, which has since been replaced by the B70 in the same slot
+(`0000:03:00.0`). **B70↔B50 P2P has NOT been re-tested.** The finding below was a
+PCI-topology restriction, so it plausibly still holds for any card in that slot —
+but "plausibly" is not "verified". Re-confirm on the live hardware before either
+relying on it or assuming it was lifted. Keep peer-copy paths disabled until then.
+
+Direct device-to-device USM copy
+failed (`OUT_OF_DEVICE_MEMORY`) and importing a B580 allocation on the B50 returned
 `INVALID_ARGUMENT`; the kernel refuses P2PDMA because the cards share no upstream
 bridge. This is a PCI topology restriction, not a selector bug. Keep direct
 peer-copy / shared-context paths disabled unless a runtime check confirms them safe
@@ -316,11 +328,35 @@ Install history, rollback commands, and loader-path notes:
 Use `ONEAPI_DEVICE_SELECTOR` (syntax `backend:devices`): `level_zero:0` for one
 device, `level_zero:0,1` for a numeric multi-device set, `level_zero:gpu` for all
 GPUs. The `level_zero:gpu:0` strings some tools print are display IDs, not valid
-selector values. This system: Arc B580 (device 0), Arc Pro B50 (device 1), iGPU
-(device 2). Single-GPU B50 validation runs with `level_zero:1`.
+selector values. This system (as of 2026-07-24): **Arc Pro B70** (device 0,
+Battlemage G31, 256 CU, ~32.6 GB), **Arc Pro B50** (device 1, Battlemage G21,
+128 CU, ~16 GB), iGPU (device 2, Arrow Lake-S). Single-GPU B50 validation runs
+with `level_zero:1`.
+
+The B580 that earlier notes reference has been **replaced by the B70** — it is
+no longer in this machine. Treat any B580 figure as historical.
+
+PCI / DRM mapping, because the numbering is not intuitive and the logs do not
+disambiguate it:
+
+| selector | card | PCI | render node |
+|----------|------|-----|-------------|
+| `level_zero:0` | Arc Pro B70 (G31) | `0000:03:00.0` | `renderD128` |
+| `level_zero:1` | Arc Pro B50 (G21) | `0000:07:00.0` | `renderD130` |
+| — | Arrow Lake-S iGPU | `0000:00:02.0` | `renderD129` |
+
+DRM `cardN` numbering and `renderDN` numbering are **independent** — do not infer
+one from the other. The `device=N` printed in SYCL logs is the in-process index
+*after* `ONEAPI_DEVICE_SELECTOR` filtering, not the physical card: a B50-only run
+and a B70-only run both print `device=0`. Key off the selector, never the log id.
+
+Before trusting any B70 benchmark, check the reported free VRAM in the startup
+log. Other workloads (e.g. ComfyUI) can hold tens of GB on that card; a run that
+sees ~13.8 GB free instead of ~32.6 GB is measuring under memory pressure and its
+numbers are not comparable.
 
 ```bash
-ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench ...   # B580
+ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench ...   # B70
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench ...   # B50
 ONEAPI_DEVICE_SELECTOR=level_zero:0,1 ./build/bin/llama-bench ... # host-bounce paths required
 ```
@@ -341,15 +377,19 @@ Rules:
   canonical gated inference command for cross-build comparisons after a fresh
   reboot, and avoid DRM fdinfo checks while a SYCL process is hung.
 
-Current-boot B580/B50 P2P topology warnings are diagnostic only. Frigate
-QSV/OpenVINO jobs on the iGPU render node are not B580/B50 consumers.
+Current-boot B70/B50 P2P topology warnings are diagnostic only. Frigate
+QSV/OpenVINO jobs on the iGPU render node are not B70/B50 consumers.
 
 ### Performance Expectations
 
-Full throughput tables (B580 / B50 Mistral levels, persistent-TG modes,
-GPT-OSS MXFP4) live in `docs/backend/sycl-perf-baselines.md`. Rough top-line
-targets for orientation: **B580 Mistral 7B Q4_0** ~1700 PP512 / ~81 TG128 (all
-VRAM); **B50 GPT-OSS 20B MXFP4** ~926 PP512 / ~48 TG128 (target >1100 / ~50+).
+Full throughput tables (persistent-TG modes, GPT-OSS MXFP4) live in
+`docs/backend/sycl-perf-baselines.md`. Rough top-line targets for orientation:
+**B50 GPT-OSS 20B MXFP4** ~926 PP512 / ~48 TG128 (target >1100 / ~50+).
+
+The **B580 Mistral** figures previously quoted here (~1700 PP512 / ~81 TG128) are
+**superseded — that card is no longer installed.** B70 Mistral targets have not
+been established yet; do not substitute the B580 numbers for the B70. Measuring a
+B70 against a B580 target makes a healthy run look like a catastrophic regression.
 
 Do not use `GGML_SYCL_FA_ONEDNN_ALLOW=1` to restore Mistral PP numbers — it can
 raise PP throughput, but the deterministic completion gate produces incorrect
@@ -362,10 +402,16 @@ tasks `llama.cpp-aqzz3.1`, `llama.cpp-po3nd.2.45/.46`, `llama.cpp-ix58x`):
 
 - **B50 GPT-OSS20B MXFP4 FA-on:** ≥1100 PP512, ~50+ TG128 (restored-fast-path
   evidence: ~1255 PP512 / 52 TG128), count gate passing.
-- **B580 Mistral 7B Q4_0 FA-on:** >2000 PP512, >85 TG128 (`docs/backend/SYCL.md`
-  records `5b206c499-dirty` at 2173.92 PP512 / 88.42 TG128), count gate correct.
+- ~~**B580 Mistral 7B Q4_0 FA-on:** >2000 PP512, >85 TG128~~ — **SUPERSEDED, not
+  a gate.** The B580 was replaced by the Arc Pro B70 and is no longer installed.
+  The figure `docs/backend/SYCL.md` records (`5b206c499-dirty`, 2173.92 PP512 /
+  88.42 TG128) remains valid history *for that card only*. **Do not gate on it.**
+  A B70 measured against it will look catastrophically regressed when it is
+  merely different hardware. B70 guardrails are still to be established — see
+  codescout task `llama.cpp-fuo6` (B70 profiling) and `llama.cpp-ey6x` (baselines
+  refresh). Until then the B50 GPT-OSS gate above is the only hard numeric guard.
 
-Keep these opt-in until same-build B50 GPT-OSS + B580 Mistral gates pass on a
+Keep these opt-in until same-build B50 GPT-OSS + B70 Mistral gates pass on a
 clean boot: `GGML_SYCL_MOE_BLOCK_GRAPHLETS`, `GGML_SYCL_XMX_MOE_PP` /
 `GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP`, `GGML_SYCL_PP_PIPELINE` (the last has shown
 GPT-OSS chat correctness failures).
