@@ -1,0 +1,118 @@
+//
+// Test: architecture-derived GPU family detection
+//
+// Guards the B70/G31 regression: "Intel(R) Arc(TM) Pro B70 Graphics"
+// matched the broad ("Arc" && "Graphics") Alchemist heuristic and was
+// classified XeHPG, disabling ESIMD dpas on a Xe2 part.
+//
+// Host-only: family_from_architecture / family_from_name / family_name /
+// family_supports_esimd_dpas are pure functions, so no GPU is required.
+//
+// MIT license
+// Copyright (C) 2024-2026 Intel Corporation
+// SPDX-License-Identifier: MIT
+//
+
+#include "gpu-arch.hpp"
+
+#include <cstdio>
+
+// The build is -DNDEBUG (Release), so assert() would compile away and the
+// test would pass vacuously. Use an explicit check that always runs.
+#define CHECK(cond, msg)                                                        \
+    do {                                                                        \
+        if (!(cond)) {                                                          \
+            std::fprintf(stderr, "FAIL: %s:%d: %s\n", __FILE__, __LINE__, msg); \
+            return 1;                                                           \
+        }                                                                       \
+    } while (0)
+
+namespace syclex = sycl::ext::oneapi::experimental;
+
+using ggml_sycl::sycl_gpu_family;
+
+int main() {
+    // ---- Architecture-derived mapping ------------------------------------
+    // Battlemage (Xe2). G31 is the Arc Pro B70, G21 the B580/B50.
+    CHECK(
+        ggml_sycl::family_from_architecture(syclex::architecture::intel_gpu_bmg_g21) == sycl_gpu_family::ARC_BATTLEMAGE,
+        "bmg_g21 must map to ARC_BATTLEMAGE");
+    CHECK(
+        ggml_sycl::family_from_architecture(syclex::architecture::intel_gpu_bmg_g31) == sycl_gpu_family::ARC_BATTLEMAGE,
+        "bmg_g31 must map to ARC_BATTLEMAGE");
+
+    // Alchemist (XeHPG).
+    CHECK(
+        ggml_sycl::family_from_architecture(syclex::architecture::intel_gpu_acm_g10) == sycl_gpu_family::ARC_ALCHEMIST,
+        "acm_g10 must map to ARC_ALCHEMIST");
+    CHECK(
+        ggml_sycl::family_from_architecture(syclex::architecture::intel_gpu_acm_g11) == sycl_gpu_family::ARC_ALCHEMIST,
+        "acm_g11 must map to ARC_ALCHEMIST");
+    CHECK(
+        ggml_sycl::family_from_architecture(syclex::architecture::intel_gpu_acm_g12) == sycl_gpu_family::ARC_ALCHEMIST,
+        "acm_g12 must map to ARC_ALCHEMIST");
+
+    // Data Center GPU Max (PVC).
+    CHECK(ggml_sycl::family_from_architecture(syclex::architecture::intel_gpu_pvc) == sycl_gpu_family::DATA_CENTER_MAX,
+          "pvc must map to DATA_CENTER_MAX");
+    CHECK(
+        ggml_sycl::family_from_architecture(syclex::architecture::intel_gpu_pvc_vg) == sycl_gpu_family::DATA_CENTER_MAX,
+        "pvc_vg must map to DATA_CENTER_MAX");
+
+    // Architectures we deliberately do not classify fall through to UNKNOWN
+    // so family_from_device can try the name heuristic.
+    CHECK(ggml_sycl::family_from_architecture(syclex::architecture::intel_gpu_mtl_u) == sycl_gpu_family::UNKNOWN,
+          "unmapped architecture must yield UNKNOWN, not a guess");
+
+    // The architecture enum's underlying type is 64-bit and the low 32 bits
+    // alias between architectures (bmg_g31 is 0x0000000500800000, which
+    // truncates to 0x00800000). Anything that narrows to int would collide;
+    // assert the two Battlemage parts are still distinct enum values.
+    CHECK(syclex::architecture::intel_gpu_bmg_g21 != syclex::architecture::intel_gpu_bmg_g31,
+          "bmg_g21 and bmg_g31 must be distinct architecture values");
+
+    // ---- Name fallback ---------------------------------------------------
+    // The B70 regression that motivated this task: "Arc" + "Graphics"
+    // previously matched the Alchemist branch.
+    CHECK(ggml_sycl::family_from_name("Intel(R) Arc(TM) Pro B70 Graphics") == sycl_gpu_family::ARC_BATTLEMAGE,
+          "B70 name must fall back to ARC_BATTLEMAGE, not ARC_ALCHEMIST");
+    CHECK(ggml_sycl::family_from_name("Intel(R) Arc(TM) Pro B50 Graphics") == sycl_gpu_family::ARC_BATTLEMAGE,
+          "B50 name must fall back to ARC_BATTLEMAGE, not ARC_ALCHEMIST");
+    CHECK(ggml_sycl::family_from_name("Intel(R) Arc(TM) B580 Graphics") == sycl_gpu_family::ARC_BATTLEMAGE,
+          "B580 name must fall back to ARC_BATTLEMAGE");
+    CHECK(ggml_sycl::family_from_name("Intel(R) Arc(TM) A770 Graphics") == sycl_gpu_family::ARC_ALCHEMIST,
+          "A770 name must remain ARC_ALCHEMIST");
+    CHECK(ggml_sycl::family_from_name("Intel(R) Data Center GPU Max 1100") == sycl_gpu_family::DATA_CENTER_MAX,
+          "Data Center GPU Max name must map to DATA_CENTER_MAX");
+    CHECK(ggml_sycl::family_from_name("Intel(R) Data Center GPU Flex 170") == sycl_gpu_family::DATA_CENTER_FLEX,
+          "Data Center GPU Flex name must map to DATA_CENTER_FLEX");
+    CHECK(ggml_sycl::family_from_name("NVIDIA GeForce RTX 4090") == sycl_gpu_family::UNKNOWN,
+          "non-Intel name must map to UNKNOWN");
+    CHECK(ggml_sycl::family_from_name(nullptr) == sycl_gpu_family::UNKNOWN, "null name must map to UNKNOWN");
+
+    // ---- ESIMD dpas capability ------------------------------------------
+    // Battlemage and PVC run ESIMD dpas at ExecutionSize=16; Alchemist does not.
+    CHECK(ggml_sycl::family_supports_esimd_dpas(sycl_gpu_family::ARC_BATTLEMAGE), "Battlemage must support ESIMD dpas");
+    CHECK(ggml_sycl::family_supports_esimd_dpas(sycl_gpu_family::DATA_CENTER_MAX),
+          "Data Center GPU Max must support ESIMD dpas");
+    CHECK(!ggml_sycl::family_supports_esimd_dpas(sycl_gpu_family::ARC_ALCHEMIST),
+          "Alchemist must not support ESIMD dpas");
+    CHECK(!ggml_sycl::family_supports_esimd_dpas(sycl_gpu_family::DATA_CENTER_FLEX),
+          "Data Center GPU Flex must not support ESIMD dpas");
+    CHECK(!ggml_sycl::family_supports_esimd_dpas(sycl_gpu_family::UNKNOWN),
+          "unknown family must not support ESIMD dpas");
+
+    // ---- Human-readable names -------------------------------------------
+    CHECK(std::string("Arc Battlemage") == ggml_sycl::family_name(sycl_gpu_family::ARC_BATTLEMAGE),
+          "family_name(ARC_BATTLEMAGE)");
+    CHECK(std::string("Arc Alchemist") == ggml_sycl::family_name(sycl_gpu_family::ARC_ALCHEMIST),
+          "family_name(ARC_ALCHEMIST)");
+    CHECK(std::string("Data Center GPU Max") == ggml_sycl::family_name(sycl_gpu_family::DATA_CENTER_MAX),
+          "family_name(DATA_CENTER_MAX)");
+    CHECK(std::string("Data Center GPU Flex") == ggml_sycl::family_name(sycl_gpu_family::DATA_CENTER_FLEX),
+          "family_name(DATA_CENTER_FLEX)");
+    CHECK(std::string("Unknown") == ggml_sycl::family_name(sycl_gpu_family::UNKNOWN), "family_name(UNKNOWN)");
+
+    std::printf("=== All gpu-arch tests passed ===\n");
+    return 0;
+}

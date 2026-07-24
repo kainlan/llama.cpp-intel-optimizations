@@ -1363,3 +1363,32 @@ if (GGML_SYCL_DNNL)
         target_link_libraries(bench-dnnl-ops PRIVATE IntelSYCL::SYCL_CXX)
     endif()
 endif()
+
+# Test: architecture-derived GPU family detection (B70/G31 regression).
+# Host-only — family_from_architecture / family_from_name are pure functions,
+# so no GPU and no AOT target are needed. Registered outside the
+# GGML_SYCL_BUILD_XMX_TESTS guard (which defaults OFF) so it always runs, and
+# compiled against gpu-arch.cpp directly so it does not pull in libggml-sycl.
+set(GPU_ARCH_TEST_SYCL_OPTIONS
+    "-fsycl"
+    "-Wno-narrowing"
+)
+add_executable(test-gpu-arch
+    tests/test-gpu-arch.cpp
+    gpu-arch.cpp
+)
+target_include_directories(test-gpu-arch PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_compile_options(test-gpu-arch PRIVATE ${GPU_ARCH_TEST_SYCL_OPTIONS})
+target_link_options(test-gpu-arch PRIVATE ${GPU_ARCH_TEST_SYCL_OPTIONS})
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-gpu-arch PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME gpu-arch COMMAND test-gpu-arch)
+set_tests_properties(gpu-arch PROPERTIES
+    LABELS "sycl;arch;capability;tdd"
+    TIMEOUT 60
+)
