@@ -31,10 +31,15 @@ namespace ggml_sycl {
 // GPU Family enumeration
 // ============================================================================
 
+// A narrowed view of ggml_sycl::sycl_gpu_family (gpu-arch.hpp), which is the
+// canonical enum. Only the families this module has tile heuristics for are
+// named here; everything else (PVC, Flex) maps to UNKNOWN and takes the
+// conservative path. Add a value here only alongside a tuned entry in
+// derive_initial_config — an unnamed family is safer than an untuned one.
 enum class GPUFamily {
-    UNKNOWN,         // Unknown or unsupported GPU
+    UNKNOWN,         // Unknown, unsupported, or untuned GPU
     ARC_ALCHEMIST,   // Intel Arc Alchemist (A-series: A770, A750, A580, A380, etc.)
-    ARC_BATTLEMAGE,  // Intel Arc Battlemage (B-series: B580, B570, etc.)
+    ARC_BATTLEMAGE,  // Intel Arc Battlemage (B-series: B580, B570, B50/B70 Pro, etc.)
 };
 
 // ============================================================================
@@ -97,8 +102,8 @@ GPUCapabilities detect_gpu_capabilities(sycl::device & dev);
 /**
  * Detect GPU family from capabilities.
  *
- * Identifies the GPU architecture family based on device name and
- * hardware characteristics.
+ * Delegates to ggml_sycl::family_from_name() (gpu-arch.hpp) and narrows the
+ * result to the families this module tunes for; the rest become UNKNOWN.
  *
  * @param caps GPU capabilities (must have device_name populated)
  * @return GPUFamily enum value

@@ -10,54 +10,37 @@
 
 #include "cold-start.hpp"
 
-#include <algorithm>
-#include <cctype>
+// The canonical family detection. This include is unguarded even though
+// cold-start.hpp guards its own <sycl/sycl.hpp> on SYCL_LANGUAGE_VERSION:
+// gpu-arch.hpp needs SYCL unconditionally, and this .cpp is only ever built as
+// part of the ggml-sycl backend (or the host-only test-gpu-arch target), both
+// of which compile with -fsycl. The header keeps its guard so non-SYCL TUs can
+// still include cold-start.hpp for the plain structs.
+#include "gpu-arch.hpp"
 
 namespace ggml_sycl {
-
-// ============================================================================
-// Helper functions
-// ============================================================================
-
-// Check if device name contains a substring (case-insensitive)
-static bool name_contains(const std::string & name, const char * substr) {
-    std::string lower_name   = name;
-    std::string lower_substr = substr;
-
-    // Convert to lowercase for case-insensitive comparison
-    for (char & c : lower_name) {
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    for (char & c : lower_substr) {
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-
-    return lower_name.find(lower_substr) != std::string::npos;
-}
 
 // ============================================================================
 // GPU Family detection
 // ============================================================================
 
+// Delegates to the shared helper rather than carrying a second copy of the
+// name heuristic. The duplicate was how "Intel(R) Arc(TM) Pro B70 Graphics"
+// ended up classified Alchemist here — and therefore given the Alchemist tile
+// heuristic below — long after the same bug was understood elsewhere.
+//
+// The shared enum has five families; this local one has three. PVC and Flex
+// collapse to UNKNOWN, which yields the conservative tiles and leaves dpas off
+// — the correct answer for a device whose tuning was never characterized here.
 GPUFamily detect_gpu_family(const GPUCapabilities & caps) {
-    const std::string & name = caps.device_name;
-
-    // Check for Arc Battlemage (B-series)
-    // B580, B570, B50 Pro, etc.
-    if (name_contains(name, "B580") || name_contains(name, "B570") || name_contains(name, "B50") ||
-        (name_contains(name, "Arc") && name_contains(name, "Battlemage"))) {
-        return GPUFamily::ARC_BATTLEMAGE;
+    switch (family_from_name(caps.device_name.c_str())) {
+        case sycl_gpu_family::ARC_BATTLEMAGE:
+            return GPUFamily::ARC_BATTLEMAGE;
+        case sycl_gpu_family::ARC_ALCHEMIST:
+            return GPUFamily::ARC_ALCHEMIST;
+        default:
+            return GPUFamily::UNKNOWN;
     }
-
-    // Check for Arc Alchemist (A-series)
-    // A770, A750, A580, A380, A310, etc.
-    if (name_contains(name, "A770") || name_contains(name, "A750") || name_contains(name, "A580") ||
-        name_contains(name, "A380") || name_contains(name, "A310") ||
-        (name_contains(name, "Arc") && name_contains(name, "Graphics"))) {
-        return GPUFamily::ARC_ALCHEMIST;
-    }
-
-    return GPUFamily::UNKNOWN;
 }
 
 const char * gpu_family_name(GPUFamily family) {

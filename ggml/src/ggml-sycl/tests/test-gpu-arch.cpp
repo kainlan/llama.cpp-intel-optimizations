@@ -15,6 +15,12 @@
 
 #include "gpu-arch.hpp"
 
+// cold-start.hpp is here for the derive_initial_config coverage below. Note it
+// pulls in <string>; the strcmp use in the family_name checks stays deliberate
+// (gpu-arch.hpp itself must not need <string>), it is just no longer enforced
+// by this TU alone.
+#include "cold-start.hpp"
+
 #include <cstdio>
 #include <cstring>
 
@@ -138,6 +144,57 @@ int main() {
     CHECK(std::strcmp("Data Center GPU Flex", ggml_sycl::family_name(sycl_gpu_family::DATA_CENTER_FLEX)) == 0,
           "family_name(DATA_CENTER_FLEX)");
     CHECK(std::strcmp("Unknown", ggml_sycl::family_name(sycl_gpu_family::UNKNOWN)) == 0, "family_name(UNKNOWN)");
+
+    // ---- cold-start heuristics ------------------------------------------
+    // cold-start.cpp used to carry a second, independent copy of the name
+    // heuristic, so the B70 regression hit twice: misdetected as Alchemist it
+    // also fell to the conservative 16x16 tiles instead of Battlemage's 64x64.
+    // These assertions pin cold-start to the shared helper.
+    {
+        ggml_sycl::GPUCapabilities caps;
+        caps.device_name = "Intel(R) Arc(TM) Pro B70 Graphics";
+        caps.eu_count    = 256;
+        caps.has_dpas    = true;
+
+        CHECK(ggml_sycl::detect_gpu_family(caps) == ggml_sycl::GPUFamily::ARC_BATTLEMAGE,
+              "cold-start must classify the B70 as ARC_BATTLEMAGE");
+
+        const ggml_sycl::KernelConfig cfg = ggml_sycl::derive_initial_config(caps);
+        CHECK(cfg.tile_m == 64, "B70 must get Battlemage tile_m=64, not the conservative 16");
+        CHECK(cfg.tile_n == 64, "B70 must get Battlemage tile_n=64, not the conservative 16");
+        CHECK(cfg.use_dpas, "B70 must enable dpas");
+    }
+
+    // The shared enum has five values, cold-start's local one has three. The
+    // extras must collapse to UNKNOWN (conservative tiles, no dpas) rather
+    // than being smuggled into the public 3-value header.
+    {
+        ggml_sycl::GPUCapabilities caps;
+        caps.device_name = "Intel(R) Data Center GPU Max 1100";
+        caps.eu_count    = 512;
+        caps.has_dpas    = true;
+
+        CHECK(ggml_sycl::detect_gpu_family(caps) == ggml_sycl::GPUFamily::UNKNOWN,
+              "families absent from cold-start's 3-value enum must collapse to UNKNOWN");
+
+        const ggml_sycl::KernelConfig cfg = ggml_sycl::derive_initial_config(caps);
+        CHECK(cfg.tile_m == 16 && cfg.tile_n == 16, "UNKNOWN family keeps the conservative tiles");
+        CHECK(!cfg.use_dpas, "UNKNOWN family must not enable dpas");
+    }
+
+    // Alchemist must still take its EU-count-driven branch, unchanged.
+    {
+        ggml_sycl::GPUCapabilities caps;
+        caps.device_name = "Intel(R) Arc(TM) A770 Graphics";
+        caps.eu_count    = 512;
+        caps.has_dpas    = true;
+
+        CHECK(ggml_sycl::detect_gpu_family(caps) == ggml_sycl::GPUFamily::ARC_ALCHEMIST,
+              "A770 must remain ARC_ALCHEMIST in cold-start");
+
+        const ggml_sycl::KernelConfig cfg = ggml_sycl::derive_initial_config(caps);
+        CHECK(cfg.tile_m == 64 && cfg.tile_n == 64, "A770 (512 EUs) keeps its 64x64 tiles");
+    }
 
     std::printf("=== All gpu-arch tests passed ===\n");
     return 0;

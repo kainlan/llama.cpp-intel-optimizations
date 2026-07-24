@@ -1369,6 +1369,9 @@ endif()
 # so no GPU and no AOT target are needed. Registered outside the
 # GGML_SYCL_BUILD_XMX_TESTS guard (which defaults OFF) so it always runs, and
 # compiled against gpu-arch.cpp directly so it does not pull in libggml-sycl.
+# cold-start.cpp joins it for the same reason: derive_initial_config is a pure
+# function whose tile choice depends on the family helper, and compiling the
+# one TU is far cheaper than linking the backend.
 set(GPU_ARCH_TEST_SYCL_OPTIONS
     "-fsycl"
     "-Wno-narrowing"
@@ -1376,6 +1379,7 @@ set(GPU_ARCH_TEST_SYCL_OPTIONS
 add_executable(test-gpu-arch
     tests/test-gpu-arch.cpp
     gpu-arch.cpp
+    cold-start.cpp
 )
 target_include_directories(test-gpu-arch PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
