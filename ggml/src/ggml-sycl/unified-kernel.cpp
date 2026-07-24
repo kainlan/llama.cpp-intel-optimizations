@@ -21,6 +21,7 @@
 
 #include "unified-kernel.hpp"
 
+#include "gpu-arch.hpp"
 #include "mmvq.hpp"
 #include "quantize.hpp"
 #include "sycl-kernel-profiler.hpp"
@@ -95,80 +96,25 @@ const ggml_sycl_info_stub & ggml_sycl_info() {
 namespace ggml_sycl_unified {
 
 // =============================================================================
-// GPU Family Detection Helper
+// GPU Family Capabilities
 // =============================================================================
-// Case-insensitive substring search for device name matching
-
-static bool name_contains(const char * name, const char * substr) {
-    if (!name || !substr) {
-        return false;
-    }
-
-    // Convert both to lowercase and search
-    std::string lower_name   = name;
-    std::string lower_substr = substr;
-    for (char & c : lower_name) {
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    for (char & c : lower_substr) {
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    return lower_name.find(lower_substr) != std::string::npos;
-}
-
-// GPU family enumeration for hardware capability detection
-enum class GPUFamily {
-    UNKNOWN,
-    ARC_ALCHEMIST,    // A-series (A770, A750, A580, A380, A310)
-    ARC_BATTLEMAGE,   // B-series (B580, B570)
-    DATA_CENTER_MAX,  // PVC (Ponte Vecchio)
-    DATA_CENTER_FLEX  // Arctic Sound (Flex series)
-};
-
-// Detect GPU family from device name
-static GPUFamily detect_gpu_family_from_name(const char * name) {
-    if (!name) {
-        return GPUFamily::UNKNOWN;
-    }
-
-    // Arc Battlemage (B-series): B580, B570, etc.
-    if (name_contains(name, "B580") || name_contains(name, "B570") || name_contains(name, "B50") ||
-        (name_contains(name, "Arc") && name_contains(name, "Battlemage"))) {
-        return GPUFamily::ARC_BATTLEMAGE;
-    }
-
-    // Arc Alchemist (A-series): A770, A750, A580, A380, A310, etc.
-    if (name_contains(name, "A770") || name_contains(name, "A750") || name_contains(name, "A580") ||
-        name_contains(name, "A380") || name_contains(name, "A310") ||
-        (name_contains(name, "Arc") && name_contains(name, "Graphics"))) {
-        return GPUFamily::ARC_ALCHEMIST;
-    }
-
-    // Data Center GPU Max (PVC/Ponte Vecchio)
-    if (name_contains(name, "Max") || name_contains(name, "PVC") || name_contains(name, "Ponte")) {
-        return GPUFamily::DATA_CENTER_MAX;
-    }
-
-    // Data Center GPU Flex (Arctic Sound)
-    if (name_contains(name, "Flex") || name_contains(name, "Arctic")) {
-        return GPUFamily::DATA_CENTER_FLEX;
-    }
-
-    return GPUFamily::UNKNOWN;
-}
+// Family detection itself lives in gpu-arch.hpp/.cpp, which resolves the SYCL
+// architecture enum and only falls back to the device-name heuristic when the
+// architecture is unavailable. The helpers below map that shared family onto
+// the ESIMD launch limits this kernel needs.
 
 // Determine max ESIMD work-group size from GPU family
 // ESIMD has stricter limits than regular SYCL kernels:
 // - Arc (Alchemist/Battlemage): max 64 work-items
 // - PVC (Ponte Vecchio/Data Center Max): up to 1024 work-items
-static int get_max_esimd_workgroup(GPUFamily family) {
+static int get_max_esimd_workgroup(ggml_sycl::sycl_gpu_family family) {
     switch (family) {
-        case GPUFamily::DATA_CENTER_MAX:
+        case ggml_sycl::sycl_gpu_family::DATA_CENTER_MAX:
             return 1024;  // Xe-HPC architecture
-        case GPUFamily::ARC_ALCHEMIST:
-        case GPUFamily::ARC_BATTLEMAGE:
-        case GPUFamily::DATA_CENTER_FLEX:
-        case GPUFamily::UNKNOWN:
+        case ggml_sycl::sycl_gpu_family::ARC_ALCHEMIST:
+        case ggml_sycl::sycl_gpu_family::ARC_BATTLEMAGE:
+        case ggml_sycl::sycl_gpu_family::DATA_CENTER_FLEX:
+        case ggml_sycl::sycl_gpu_family::UNKNOWN:
         default:
             return 64;  // Conservative default
     }
@@ -178,32 +124,9 @@ static int get_max_esimd_workgroup(GPUFamily family) {
 // Named barriers are advanced ESIMD features for fine-grained synchronization.
 // Only available on PVC (Xe-HPC), NOT on Arc (XeLPG/XeHPG).
 // NOTE: This is now informational only - kernels use SPIR-V split barriers for Arc compatibility.
-static bool supports_named_barriers(GPUFamily family) {
+static bool supports_named_barriers(ggml_sycl::sycl_gpu_family family) {
     // Only Data Center Max (PVC) supports named barriers
-    return family == GPUFamily::DATA_CENTER_MAX;
-}
-
-// Check if GPU family supports ESIMD xmx::dpas intrinsics with ExecutionSize=16
-//
-// According to Intel Graphics Compiler documentation (documentation/visa/instructions/DPAS.md):
-//   - Pre-PVC (XeHP/XeHPG/Arc Alchemist): ExecutionSize = 8 only
-//   - PVC and later (Xe-HPC, Xe2/Battlemage): ExecutionSize = 16
-//
-// Our ESIMD kernels use ESIMD_EXEC_SIZE=16, so they require PVC or Xe2 class hardware.
-//
-// NOTE: XeLPG (Meteor Lake iGPU) does NOT have XMX hardware at all - that's a different
-// architecture from Arc discrete GPUs. The "XeLPG" error message is misleading.
-static bool gpu_family_supports_esimd_dpas(GPUFamily family) {
-    switch (family) {
-        case GPUFamily::DATA_CENTER_MAX:   // PVC (Xe-HPC) - ExecutionSize=16 supported
-        case GPUFamily::ARC_BATTLEMAGE:    // Xe2 (B580, B570) - ExecutionSize=16 supported
-            return true;
-        case GPUFamily::ARC_ALCHEMIST:     // XeHPG (A770, A750) - ExecutionSize=8 only
-        case GPUFamily::DATA_CENTER_FLEX:  // XeHPG-based - ExecutionSize=8 only
-        case GPUFamily::UNKNOWN:
-        default:
-            return false;
-    }
+    return family == ggml_sycl::sycl_gpu_family::DATA_CENTER_MAX;
 }
 
 // =============================================================================
@@ -244,8 +167,12 @@ XMXConfig XMXConfig::from_device(int device_id) {
     // Edge case: slm_size = 0 should use default
     cfg.slm_size = xmx.slm_size > 0 ? xmx.slm_size : 65536;
 
-    // Detect GPU family for hardware capability settings
-    GPUFamily family = detect_gpu_family_from_name(dev.device_name);
+    // Detect GPU family for hardware capability settings.
+    // Resolved from the SYCL architecture enum (name is only a fallback), so
+    // Battlemage parts the name heuristic does not know still classify right.
+    // `dev` above is the ggml device-info record; this is the live SYCL device.
+    const sycl::device               sycl_dev = ggml_sycl_get_device(device_id);
+    const ggml_sycl::sycl_gpu_family family   = ggml_sycl::family_from_device(sycl_dev);
 
     // Query max work-group size for ESIMD kernels using device family
     // ESIMD kernels have stricter limits than regular SYCL kernels:
@@ -259,7 +186,7 @@ XMXConfig XMXConfig::from_device(int device_id) {
 
     // ESIMD dpas intrinsics with ExecutionSize=16 work on PVC and Xe2 (Battlemage)
     // Arc Alchemist (XeHPG) only supports ExecutionSize=8, requiring different kernel config
-    cfg.supports_esimd_dpas = gpu_family_supports_esimd_dpas(family);
+    cfg.supports_esimd_dpas = ggml_sycl::family_supports_esimd_dpas(family);
 
     // Edge case: M/N/K = 0 should use fallback defaults
     // XMX dimensions: Use queried values if valid, otherwise defaults
