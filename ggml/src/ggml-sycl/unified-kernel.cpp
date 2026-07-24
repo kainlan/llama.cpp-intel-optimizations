@@ -107,6 +107,11 @@ namespace ggml_sycl_unified {
 // ESIMD has stricter limits than regular SYCL kernels:
 // - Arc (Alchemist/Battlemage): max 64 work-items
 // - PVC (Ponte Vecchio/Data Center Max): up to 1024 work-items
+// The switch below deliberately has no `default:` label. Every enumerator is
+// listed, so adding a sixth architecture to sycl_gpu_family raises -Wswitch
+// here instead of being silently absorbed by a fallback. Do not "tidy" a
+// default back in. The trailing return satisfies -Wreturn-type: a value
+// outside the enum's range is legal in C++.
 static int get_max_esimd_workgroup(ggml_sycl::sycl_gpu_family family) {
     switch (family) {
         case ggml_sycl::sycl_gpu_family::DATA_CENTER_MAX:
@@ -115,9 +120,9 @@ static int get_max_esimd_workgroup(ggml_sycl::sycl_gpu_family family) {
         case ggml_sycl::sycl_gpu_family::ARC_BATTLEMAGE:
         case ggml_sycl::sycl_gpu_family::DATA_CENTER_FLEX:
         case ggml_sycl::sycl_gpu_family::UNKNOWN:
-        default:
             return 64;  // Conservative default
     }
+    return 64;          // family outside the enum range
 }
 
 // Check if GPU family supports named barriers (nbarrier intrinsics)
