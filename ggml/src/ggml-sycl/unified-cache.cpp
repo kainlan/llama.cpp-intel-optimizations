@@ -16275,6 +16275,36 @@ static void maybe_upgrade_multi_moe_primary_layouts(placement_plan & plan,
     }
 }
 
+static bool planner_moe_layout_debug_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_MOE_LAYOUT_DEBUG");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// Reports the layout the expert entries of `role` actually ended up with on
+// `device_id`: the shared layout name when they agree, "mixed" when they do
+// not, "none" when the plan holds no such entries. Read-only.
+static const char * planner_moe_granted_layout_name(const placement_plan & plan,
+                                                    expert_tensor_role     role,
+                                                    int                    device_id) {
+    bool             seen   = false;
+    ggml_layout_mode common = GGML_LAYOUT_AOS;
+    for (const placement_entry & entry : plan.entries) {
+        if (entry.expert_id < 0 || entry.expert_role != role || entry.target_device != device_id) {
+            continue;
+        }
+        if (!seen) {
+            common = entry.layout;
+            seen   = true;
+        } else if (entry.layout != common) {
+            return "mixed";
+        }
+    }
+    return seen ? scratch_layout_name(common) : "none";
+}
+
 static size_t maybe_upgrade_moe_down_layouts_to_i8(placement_plan & plan,
                                                    size_t &         remaining,
                                                    int              device_id,
@@ -16458,6 +16488,32 @@ static size_t maybe_upgrade_moe_down_layouts_to_i8(placement_plan & plan,
             "[PLACEMENT-MOE] layout upgrades: mxfp4_i8_down skipped entries=%zu device=%d "
             "reason=executor-layout-not-supported\n",
             skip_executor, device_id);
+    }
+
+    // Observability only: the pass above declines silently, so the reason the
+    // down projection stays on SOA is invisible. Report the decision on demand,
+    // and unconditionally when every candidate was declined.
+    {
+        const bool silent_decline = (upgraded_entries == 0 && considered > 0);
+        if (planner_moe_layout_debug_enabled() || silent_decline) {
+            GGML_LOG_INFO(
+                "[MOE-LAYOUT] down-i8 device=%d n_experts=%d considered=%zu candidates=%zu upgraded_tensors=%zu "
+                "upgraded_entries=%zu preserved_soa=%zu skip_not_down=%zu skip_already_i8=%zu skip_not_device=%zu "
+                "skip_wrong_dev=%zu skip_executor=%zu skip_unsupported=%zu requested=%s granted=%s "
+                "remaining=%.1f MB\n",
+                device_id, n_experts, considered, candidates.size(), upgraded_tensors, upgraded_entries, preserved_soa,
+                skip_not_down, skip_already_i8, skip_not_device, skip_wrong_dev, skip_executor, skip_unsupported,
+                scratch_layout_name(GGML_LAYOUT_MXFP4_I8),
+                planner_moe_granted_layout_name(plan, expert_tensor_role::DOWN, device_id),
+                remaining / (1024.0 * 1024.0));
+            if (silent_decline) {
+                GGML_LOG_INFO(
+                    "[MOE-LAYOUT] down-i8 declined for ALL %zu candidates -- down stays on SOA. "
+                    "skip_executor>0 means the down-sum executor reported no I8 support "
+                    "(see GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL{,_I8}).\n",
+                    considered);
+            }
+        }
     }
     return charged_bytes;
 }
