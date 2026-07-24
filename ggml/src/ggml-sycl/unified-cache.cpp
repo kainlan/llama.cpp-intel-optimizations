@@ -16329,6 +16329,7 @@ static size_t maybe_upgrade_moe_down_layouts_to_i8(placement_plan & plan,
                                                 !planner_moe_prompt_down_specialized_layouts_enabled();
 
     std::map<std::string, down_candidate> by_tensor;
+    // considered spans all expert roles; skip_not_down is role-filter bookkeeping, not a rejection.
     size_t                                considered       = 0;
     size_t                                skip_not_down    = 0;
     size_t                                skip_already_i8  = 0;
@@ -16492,10 +16493,15 @@ static size_t maybe_upgrade_moe_down_layouts_to_i8(placement_plan & plan,
 
     // Observability only: the pass above declines silently, so the reason the
     // down projection stays on SOA is invisible. Report the decision on demand,
-    // and unconditionally when every candidate was declined.
+    // and unconditionally on ANY decline. A partial upgrade is exactly as
+    // invisible as a total one -- nobody sets the debug env var unless they
+    // already suspect a problem -- and this line is the primary evidence for
+    // the MoE layout work, so it must not depend on remembering that var to
+    // reveal that most layers stayed on SOA.
     {
-        const bool silent_decline = (upgraded_entries == 0 && considered > 0);
-        if (planner_moe_layout_debug_enabled() || silent_decline) {
+        const bool declined_all  = (upgraded_entries == 0 && considered > 0);
+        const bool declined_some = (upgraded_tensors < candidates.size());
+        if (planner_moe_layout_debug_enabled() || declined_all || declined_some) {
             GGML_LOG_INFO(
                 "[MOE-LAYOUT] down-i8 device=%d n_experts=%d considered=%zu candidates=%zu upgraded_tensors=%zu "
                 "upgraded_entries=%zu preserved_soa=%zu skip_not_down=%zu skip_already_i8=%zu skip_not_device=%zu "
@@ -16506,12 +16512,19 @@ static size_t maybe_upgrade_moe_down_layouts_to_i8(placement_plan & plan,
                 scratch_layout_name(GGML_LAYOUT_MXFP4_I8),
                 planner_moe_granted_layout_name(plan, expert_tensor_role::DOWN, device_id),
                 remaining / (1024.0 * 1024.0));
-            if (silent_decline) {
+            if (declined_all) {
                 GGML_LOG_INFO(
-                    "[MOE-LAYOUT] down-i8 declined for ALL %zu candidates -- down stays on SOA. "
-                    "skip_executor>0 means the down-sum executor reported no I8 support "
-                    "(see GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL{,_I8}).\n",
-                    considered);
+                    "[MOE-LAYOUT] down-i8 declined for ALL %zu eligible candidates -- down stays on SOA. "
+                    "candidates=0 means no down tensor passed eligibility; skip_executor>0 means the down-sum "
+                    "executor reported no I8 support (see GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL{,_I8}).\n",
+                    candidates.size());
+            } else if (declined_some) {
+                GGML_LOG_INFO(
+                    "[MOE-LAYOUT] down-i8 upgraded only %zu of %zu candidates -- the other %zu stay on SOA. "
+                    "With every skip counter zero this is the VRAM headroom guard (%.1f MB left, %.1f MB reserve), "
+                    "not an eligibility failure.\n",
+                    upgraded_tensors, candidates.size(), candidates.size() - upgraded_tensors,
+                    remaining / (1024.0 * 1024.0), k_layout_upgrade_guard / (1024.0 * 1024.0));
             }
         }
     }
