@@ -27,10 +27,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <future>
+#include <initializer_list>
 #include <limits>
 #include <stdexcept>
 #include <thread>
 #include <unordered_set>
+#include <utility>
 
 #if defined(_WIN32)
 #    include <windows.h>
@@ -16305,6 +16307,66 @@ static const char * planner_moe_granted_layout_name(const placement_plan & plan,
     return seen ? scratch_layout_name(common) : "none";
 }
 
+// Renders as "name=count ..." only the skip counters that are actually nonzero,
+// and returns an empty string when every one of them is zero. The decline
+// diagnostics below use it so they name the causes they observed instead of
+// listing every cause that could have applied.
+static std::string planner_moe_nonzero_skips(std::initializer_list<std::pair<const char *, size_t>> counters) {
+    std::string observed;
+    for (const std::pair<const char *, size_t> & counter : counters) {
+        if (counter.second == 0) {
+            continue;
+        }
+        if (!observed.empty()) {
+            observed += ' ';
+        }
+        observed += counter.first;
+        observed += '=';
+        observed += std::to_string(counter.second);
+    }
+    return observed;
+}
+
+// Reports the layout each expert role actually ended up with on `device_id`
+// once the I8 upgrade passes have run -- the one line that makes "gate/up got
+// one layout, down got another" visible without reading a kernel profile.
+//
+// The counts apply an `!on_device` filter that planner_moe_granted_layout_name
+// deliberately does not: a role with planned-but-not-resident entries therefore
+// reports a count smaller than the population its layout name was derived from.
+// Entry counts are reported per role rather than per tensor, so a role that is
+// "mixed" is mixed across entries, not across layers only.
+static void planner_log_moe_granted_layout_summary(const placement_plan & plan, int device_id) {
+    size_t n_gate = 0;
+    size_t n_up   = 0;
+    size_t n_down = 0;
+    for (const placement_entry & entry : plan.entries) {
+        if (entry.expert_id < 0 || entry.target_device != device_id || !entry.on_device) {
+            continue;
+        }
+        switch (entry.expert_role) {
+            case expert_tensor_role::GATE:
+                n_gate++;
+                break;
+            case expert_tensor_role::UP:
+                n_up++;
+                break;
+            case expert_tensor_role::DOWN:
+                n_down++;
+                break;
+            default:
+                break;
+        }
+    }
+    if (n_gate == 0 && n_up == 0 && n_down == 0) {
+        return;
+    }
+    GGML_LOG_INFO("[MOE-LAYOUT] summary device=%d gate=%s(%zu) up=%s(%zu) down=%s(%zu)\n", device_id,
+                  planner_moe_granted_layout_name(plan, expert_tensor_role::GATE, device_id), n_gate,
+                  planner_moe_granted_layout_name(plan, expert_tensor_role::UP, device_id), n_up,
+                  planner_moe_granted_layout_name(plan, expert_tensor_role::DOWN, device_id), n_down);
+}
+
 static size_t maybe_upgrade_moe_down_layouts_to_i8(placement_plan & plan,
                                                    size_t &         remaining,
                                                    int              device_id,
@@ -16519,11 +16581,43 @@ static size_t maybe_upgrade_moe_down_layouts_to_i8(placement_plan & plan,
                 scratch_layout_name(GGML_LAYOUT_MXFP4_I8),
                 planner_moe_granted_layout_name(plan, expert_tensor_role::DOWN, device_id), remaining_mb);
             if (declined_all) {
-                GGML_LOG_INFO(
-                    "[MOE-LAYOUT] down-i8 declined for ALL %zu eligible candidates -- down stays on SOA. "
-                    "candidates=0 means no down tensor passed eligibility; skip_executor>0 means the down-sum "
-                    "executor reported no I8 support (see GGML_SYCL_MOE_DOWN_SUM_DPAS_DIRECT_FINAL{,_I8}).\n",
-                    candidates.size());
+                // Name a cause only where it is observed or provable. Once a
+                // candidate exists, the VRAM guard at the top of the upgrade
+                // loop is the ONLY remaining continue -- every other rejection
+                // already happened during candidate construction -- so it is
+                // definitively the cause. With no candidates the cause is
+                // eligibility instead, and only the counters that actually
+                // fired are reported. skip_not_down is excluded: it is
+                // role-filter bookkeeping and is nonzero on every MoE model.
+                const std::string observed = planner_moe_nonzero_skips({
+                    { "skip_already_i8",  skip_already_i8  },
+                    { "skip_not_device",  skip_not_device  },
+                    { "skip_wrong_dev",   skip_wrong_dev   },
+                    { "skip_executor",    skip_executor    },
+                    { "skip_unsupported", skip_unsupported },
+                });
+                if (!candidates.empty()) {
+                    GGML_LOG_INFO(
+                        "[MOE-LAYOUT] down-i8 declined ALL %zu candidates -- down stays on SOA. These "
+                        "candidates passed every eligibility check, so this is the VRAM headroom guard "
+                        "(%.1f MB left, %.1f MB reserve), not an eligibility failure.\n",
+                        candidates.size(), remaining_mb, k_layout_upgrade_guard / (1024.0 * 1024.0));
+                } else if (!by_tensor.empty()) {
+                    GGML_LOG_INFO(
+                        "[MOE-LAYOUT] down-i8 declined every down tensor -- down stays on SOA. No candidate "
+                        "reached the upgrade loop, so the cause is eligibility, not VRAM headroom: %zu down "
+                        "tensors passed the entry filters and all were dropped while building candidates "
+                        "(incomplete expert set, no I8 size gain, no SOA coverage, or zero extra charge). "
+                        "Entry-level rejections: %s.\n",
+                        by_tensor.size(), observed.empty() ? "none" : observed.c_str());
+                } else {
+                    GGML_LOG_INFO(
+                        "[MOE-LAYOUT] down-i8 declined every down tensor -- down stays on SOA. No down entry "
+                        "passed the entry filters, so nothing reached candidate construction (considered=%zu "
+                        "expert entries, of which skip_not_down=%zu were gate/up). Entry-level rejections: "
+                        "%s.\n",
+                        considered, skip_not_down, observed.empty() ? "none" : observed.c_str());
+                }
             } else if (declined_some) {
                 GGML_LOG_INFO(
                     "[MOE-LAYOUT] down-i8 upgraded only %zu of %zu candidates -- the other %zu stay on SOA. "
@@ -16551,17 +16645,44 @@ static size_t maybe_upgrade_moe_gate_up_layouts_to_i8(placement_plan & plan,
     };
 
     std::map<int, gate_up_candidate> by_layer;
-    size_t                           considered    = 0;
-    size_t                           skip_executor = 0;
+    // Denominator differs from the down pass on purpose: the role filter runs
+    // BEFORE this counter, so `considered` spans gate/up entries only, and
+    // skip_not_gate_up (role-filter bookkeeping, not a rejection) is counted
+    // separately rather than being part of it.
+    size_t                           considered              = 0;
+    size_t                           skip_not_gate_up        = 0;
+    size_t                           skip_already_i8         = 0;
+    size_t                           skip_not_device         = 0;
+    size_t                           skip_wrong_dev          = 0;
+    size_t                           skip_unsupported        = 0;
+    size_t                           skip_executor           = 0;
+    size_t                           skip_partial_expert_set = 0;
+    size_t                           skip_incomplete         = 0;
+    size_t                           skip_zero_charge        = 0;
     for (size_t i = 0; i < plan.entries.size(); ++i) {
         const placement_entry & entry = plan.entries[i];
         if (entry.expert_id < 0 ||
             (entry.expert_role != expert_tensor_role::GATE && entry.expert_role != expert_tensor_role::UP)) {
+            if (entry.expert_id >= 0) {
+                skip_not_gate_up++;
+            }
             continue;
         }
         considered++;
         if (entry.layout == GGML_LAYOUT_MXFP4_I8 || !entry.on_device || entry.target_device != device_id ||
             !planner_mxfp4_i8_supported(entry, device_id)) {
+            // Counting only -- the composite condition above is unchanged. The
+            // rejection is attributed to the first sub-condition that held,
+            // matching that condition's short-circuit order.
+            if (entry.layout == GGML_LAYOUT_MXFP4_I8) {
+                skip_already_i8++;
+            } else if (!entry.on_device) {
+                skip_not_device++;
+            } else if (entry.target_device != device_id) {
+                skip_wrong_dev++;
+            } else {
+                skip_unsupported++;
+            }
             continue;
         }
         if (!planner_moe_primary_executor_supports_layout_on_device(entry, GGML_LAYOUT_MXFP4_I8, device_id)) {
@@ -16584,6 +16705,7 @@ static size_t maybe_upgrade_moe_gate_up_layouts_to_i8(placement_plan & plan,
         gate_up_candidate & candidate = item.second;
         if (n_experts > 0 && (candidate.gate_indices.size() != static_cast<size_t>(n_experts) ||
                               candidate.up_indices.size() != static_cast<size_t>(n_experts))) {
+            skip_partial_expert_set++;
             continue;
         }
 
@@ -16610,6 +16732,13 @@ static size_t maybe_upgrade_moe_gate_up_layouts_to_i8(placement_plan & plan,
             add_role(candidate.up_indices);
         }
         if (!complete || extra_charge == 0) {
+            // Counting only. `complete` is cleared when a layer is missing one
+            // of the two roles or an entry gains no bytes from I8.
+            if (!complete) {
+                skip_incomplete++;
+            } else {
+                skip_zero_charge++;
+            }
             continue;
         }
 
@@ -16659,6 +16788,78 @@ static size_t maybe_upgrade_moe_gate_up_layouts_to_i8(placement_plan & plan,
                 "reason=primary-executor-layout-unsupported\n",
                 device_id, considered, skip_executor);
     }
+
+    // Observability only, mirroring the down-i8 pass: this pass also declines
+    // silently, so report the decision on demand and unconditionally on ANY
+    // decline. A partial upgrade is exactly as invisible as a total one, and
+    // nobody sets the debug env var unless they already suspect a problem.
+    {
+        // The two triggers use different populations, as in the down pass.
+        // declined_all is computed over `considered` (entry-level) so it still
+        // fires when candidate construction rejected everything and candidates
+        // is empty; declined_some is computed over candidates.size()
+        // (layer-level survivors), the only population the upgrade loop
+        // iterates. Together they cover any decline.
+        const bool   declined_all  = (upgraded_entries == 0 && considered > 0);
+        const bool   declined_some = (upgraded_layers < candidates.size());
+        const double remaining_mb  = remaining / (1024.0 * 1024.0);
+        if (planner_moe_layout_debug_enabled() || declined_all || declined_some) {
+            GGML_LOG_INFO(
+                "[MOE-LAYOUT] gateup-i8 device=%d n_experts=%d considered=%zu candidates=%zu upgraded_layers=%zu "
+                "upgraded_entries=%zu skip_not_gate_up=%zu skip_already_i8=%zu skip_not_device=%zu "
+                "skip_wrong_dev=%zu skip_unsupported=%zu skip_executor=%zu skip_partial_expert_set=%zu "
+                "skip_incomplete=%zu skip_zero_charge=%zu requested=%s granted_gate=%s granted_up=%s "
+                "remaining=%.1f MB\n",
+                device_id, n_experts, considered, candidates.size(), upgraded_layers, upgraded_entries,
+                skip_not_gate_up, skip_already_i8, skip_not_device, skip_wrong_dev, skip_unsupported, skip_executor,
+                skip_partial_expert_set, skip_incomplete, skip_zero_charge, scratch_layout_name(GGML_LAYOUT_MXFP4_I8),
+                planner_moe_granted_layout_name(plan, expert_tensor_role::GATE, device_id),
+                planner_moe_granted_layout_name(plan, expert_tensor_role::UP, device_id), remaining_mb);
+            if (declined_all) {
+                if (!candidates.empty()) {
+                    // The VRAM guard is the only continue left in the upgrade
+                    // loop once a candidate exists; every other rejection was
+                    // applied during candidate construction above.
+                    GGML_LOG_INFO(
+                        "[MOE-LAYOUT] gateup-i8 declined ALL %zu candidates -- gate/up keep their current "
+                        "layout. These candidates passed every eligibility check, so this is the VRAM headroom "
+                        "guard (%.1f MB left, %.1f MB reserve), not an eligibility failure.\n",
+                        candidates.size(), remaining_mb, k_layout_upgrade_guard / (1024.0 * 1024.0));
+                } else {
+                    // No candidate reached the loop, so the cause is
+                    // eligibility. Report only the counters that fired;
+                    // skip_not_gate_up is excluded as role-filter bookkeeping.
+                    const std::string observed = planner_moe_nonzero_skips({
+                        { "skip_already_i8",         skip_already_i8         },
+                        { "skip_not_device",         skip_not_device         },
+                        { "skip_wrong_dev",          skip_wrong_dev          },
+                        { "skip_unsupported",        skip_unsupported        },
+                        { "skip_executor",           skip_executor           },
+                        { "skip_partial_expert_set", skip_partial_expert_set },
+                        { "skip_incomplete",         skip_incomplete         },
+                        { "skip_zero_charge",        skip_zero_charge        },
+                    });
+                    GGML_LOG_INFO(
+                        "[MOE-LAYOUT] gateup-i8 declined every gate/up layer -- gate/up keep their current "
+                        "layout. No candidate reached the upgrade loop, so the cause is eligibility, not VRAM "
+                        "headroom. Rejections: %s.\n",
+                        observed.empty() ? "none" : observed.c_str());
+                }
+            } else if (declined_some) {
+                GGML_LOG_INFO(
+                    "[MOE-LAYOUT] gateup-i8 upgraded only %zu of %zu candidates -- the other %zu keep their "
+                    "current layout. These candidates passed every eligibility check, so this is the VRAM "
+                    "headroom guard (%.1f MB left, %.1f MB reserve), not an eligibility failure.\n",
+                    upgraded_layers, candidates.size(), candidates.size() - upgraded_layers, remaining_mb,
+                    k_layout_upgrade_guard / (1024.0 * 1024.0));
+            }
+        }
+    }
+
+    // Both I8 upgrade passes are done for this device by the time the gate/up
+    // pass returns, so this is where the per-role granted layouts are final.
+    // Multi-device plans do not run this pass and therefore emit no summary.
+    planner_log_moe_granted_layout_summary(plan, device_id);
     return charged_bytes;
 }
 
