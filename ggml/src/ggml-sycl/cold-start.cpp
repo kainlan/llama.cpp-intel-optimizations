@@ -32,15 +32,26 @@ namespace ggml_sycl {
 // The shared enum has five families; this local one has three. PVC and Flex
 // collapse to UNKNOWN, which yields the conservative tiles and leaves dpas off
 // — the correct answer for a device whose tuning was never characterized here.
+//
+// Every enumerator is listed and there is deliberately NO `default:` label:
+// -Wswitch (on via -Wall) only warns about unhandled enumerators when a switch
+// has no default, so the omission is what makes a sixth family added to
+// sycl_gpu_family a compiler warning here instead of a silent UNKNOWN. This
+// plan exists because a new GPU was misclassified unnoticed for months; do not
+// "tidy" the default back in. The trailing return covers a value outside the
+// enum's range and does not suppress the diagnostic.
 GPUFamily detect_gpu_family(const GPUCapabilities & caps) {
     switch (family_from_name(caps.device_name.c_str())) {
         case sycl_gpu_family::ARC_BATTLEMAGE:
             return GPUFamily::ARC_BATTLEMAGE;
         case sycl_gpu_family::ARC_ALCHEMIST:
             return GPUFamily::ARC_ALCHEMIST;
-        default:
+        case sycl_gpu_family::DATA_CENTER_MAX:
+        case sycl_gpu_family::DATA_CENTER_FLEX:
+        case sycl_gpu_family::UNKNOWN:
             return GPUFamily::UNKNOWN;
     }
+    return GPUFamily::UNKNOWN;
 }
 
 const char * gpu_family_name(GPUFamily family) {
