@@ -754,35 +754,50 @@ ONEAPI_DEVICE_SELECTOR=level_zero:1 GGML_SYCL_MOE_LAYOUT_DEBUG=1 \
 Expected BEFORE: no output.
 Expected AFTER: a line showing `gate=xmx_tiled up=xmx_tiled down=soa` (the current, wrong state).
 
-2. **Implement** the gate/up counter block mirroring Task 6, then add the summary after both passes complete:
+2. **Implement** the gate/up counter block mirroring Task 6, then add the summary after both passes complete.
+
+> **DO NOT hand-roll the layout lookup.** Task 6 added a read-only helper
+> `planner_moe_granted_layout_name(plan, role, device_id)` (`unified-cache.cpp` ~16287-16306).
+> **Reuse it.** It returns `"mixed"` as soon as it sees two differing layouts for a role.
+>
+> An earlier draft of this task sketched a `l_by_role[r] = e.layout` loop. That is
+> **last-write-wins and cannot detect a mixed state** — it would have reported
+> `down=soa` (the final layer's layout) and silently hidden the real, measured
+> condition: `blk.0`–`blk.4` on `mxfp4_i8` and `blk.5`–`blk.23` on `soa`. Hiding that
+> would erase the central finding of Track B. The helper exists precisely to prevent this.
+
+The summary must report, per expert role, the granted layout name from the helper **and** an
+entry count. The helper returns only the name, so count separately in the same pass:
 
 ```cpp
     {
-        int    n_by_role[4]   = { 0, 0, 0, 0 };
-        ggml_layout_mode l_by_role[4] = { GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS };
+        size_t n_gate = 0, n_up = 0, n_down = 0;
         for (const placement_entry & e : plan.entries) {
-            if (e.expert_id < 0 || e.target_device != device_id) {
+            if (e.expert_id < 0 || e.target_device != device_id || !e.on_device) {
                 continue;
             }
-            const int r = static_cast<int>(e.expert_role);
-            if (r < 0 || r >= 4) {
-                continue;
+            switch (e.expert_role) {
+                case expert_tensor_role::GATE: n_gate++; break;
+                case expert_tensor_role::UP:   n_up++;   break;
+                case expert_tensor_role::DOWN: n_down++; break;
+                default: break;
             }
-            n_by_role[r]++;
-            l_by_role[r] = e.layout;
         }
-        GGML_LOG_INFO("[MOE-LAYOUT] summary device=%d gate=%s(%d) up=%s(%d) down=%s(%d)\n",
+        GGML_LOG_INFO("[MOE-LAYOUT] summary device=%d gate=%s(%zu) up=%s(%zu) down=%s(%zu)\n",
                       device_id,
-                      ggml_layout_mode_name(l_by_role[static_cast<int>(expert_tensor_role::GATE)]),
-                      n_by_role[static_cast<int>(expert_tensor_role::GATE)],
-                      ggml_layout_mode_name(l_by_role[static_cast<int>(expert_tensor_role::UP)]),
-                      n_by_role[static_cast<int>(expert_tensor_role::UP)],
-                      ggml_layout_mode_name(l_by_role[static_cast<int>(expert_tensor_role::DOWN)]),
-                      n_by_role[static_cast<int>(expert_tensor_role::DOWN)]);
+                      planner_moe_granted_layout_name(plan, expert_tensor_role::GATE, device_id), n_gate,
+                      planner_moe_granted_layout_name(plan, expert_tensor_role::UP,   device_id), n_up,
+                      planner_moe_granted_layout_name(plan, expert_tensor_role::DOWN, device_id), n_down);
     }
 ```
 
-Run: rebuild, then step 1's command. Expected: the summary line appears.
+Note the `!e.on_device` filter: the helper does **not** apply it, so if a role has
+planned-but-not-yet-resident entries the count and the layout name could disagree. Keep the
+filter here and say so in a comment.
+
+Run: rebuild, then step 1's command. Expected: the summary line appears, and with the current
+tree it must report `down=mixed` — not `down=soa` and not `down=mxfp4_i8`. If it reports either
+pure layout, the mixed detection is broken; that is a hard failure, not a cosmetic one.
 
 **Commit:**
 ```bash
