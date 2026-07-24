@@ -13,8 +13,101 @@ from collections import Counter
 from typing import Any
 
 
+MXFP4_BLOCK_ELEMS = 32
+MXFP4_BLOCK_BYTES = 17  # one shared E8M0 scale byte + 32 packed 4-bit elements
+
+# Model geometry needed to turn a kernel's wall time into achieved bandwidth.
+# Keys are the `--geometry` choices.
+GEOMETRY_PRESETS: dict[str, dict[str, Any]] = {
+    "gpt-oss-20b": {
+        "layers": 24,
+        "experts": 32,
+        "experts_active": 4,  # top-4 routing
+        "expert_ncols": 2880,
+        "expert_nrows": 2880,
+        # Expert matrices streamed per kernel call, by role.
+        #
+        # CRITICAL: gate and up are TWO separate 2880x2880 expert matrices, so
+        # the fused gate/up kernel streams 2 x top_k = 8 matrices = 33.6 MiB
+        # per call. The down projection is ONE matrix per expert, so it streams
+        # top_k = 4 matrices = 16.8 MiB -- half the traffic. Swapping these two
+        # inverts the roofline verdict (the gate/up kernel is the fast one).
+        "role_matrices": {
+            "gateup": 2,
+            "down": 1,
+        },
+        # Kernel-name substring -> role, checked in order; first match wins.
+        # In the GPT-OSS TG capture the fused gate/up takes the packed-q8 XMX
+        # path, which leaves the SOA batched matvec (`role=matvec` in its
+        # profiler metadata) carrying the down projection.
+        "role_rules": [
+            ("gateup", "gateup"),
+            ("down", "down"),
+            ("soa.batched", "down"),
+        ],
+    },
+}
+
+
 def metric_name(raw: str) -> str:
     return raw.replace(" ", "_")
+
+
+def mxfp4_bytes(ncols: int, nrows: int) -> int:
+    """Stored size of an `ncols` x `nrows` MXFP4 tensor.
+
+    MXFP4 packs 32 elements plus one shared scale into 17 bytes. A trailing
+    partial block still occupies a whole block.
+    """
+
+    elems = ncols * nrows
+    blocks = (elems + MXFP4_BLOCK_ELEMS - 1) // MXFP4_BLOCK_ELEMS
+    return blocks * MXFP4_BLOCK_BYTES
+
+
+def achieved_gbs(bytes_moved: float, seconds: float) -> float:
+    """Achieved bandwidth in GB/s (decimal 10^9, matching vendor peak figures)."""
+
+    if seconds <= 0:
+        return 0.0
+    return bytes_moved / seconds / 1e9
+
+
+def percent_of_peak(achieved: float, peak: float) -> float:
+    if peak <= 0:
+        return 0.0
+    return 100.0 * achieved / peak
+
+
+def geometry_preset(name: str) -> dict[str, Any]:
+    preset = GEOMETRY_PRESETS.get(name)
+    if preset is None:
+        raise ValueError(f"unknown geometry preset: {name}")
+    return preset
+
+
+def geometry_expert_matrix_bytes(name: str) -> int:
+    preset = geometry_preset(name)
+    return mxfp4_bytes(preset["expert_ncols"], preset["expert_nrows"])
+
+
+def geometry_role(name: str, kernel: str) -> str | None:
+    preset = geometry_preset(name)
+    for needle, role in preset["role_rules"]:
+        if needle in kernel:
+            return role
+    return None
+
+
+def geometry_kernel_bytes(name: str, kernel: str) -> int | None:
+    """Weight bytes one call of `kernel` streams, or None if the preset has no rule."""
+
+    role = geometry_role(name, kernel)
+    if role is None:
+        return None
+    preset = geometry_preset(name)
+    matrices = preset["role_matrices"][role]
+    return matrices * preset["experts_active"] * geometry_expert_matrix_bytes(name)
 
 
 def load_rows(path: pathlib.Path) -> list[dict[str, Any]]:
@@ -80,6 +173,16 @@ def parse_kernel_bytes(raw: str) -> tuple[str, int]:
     return name, bytes_per_event
 
 
+def parse_peak_gbs(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid peak bandwidth: {raw}") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError("--peak-gbs must be finite and greater than zero")
+    return value
+
+
 def parse_top_n(raw: str) -> int:
     try:
         value = int(raw)
@@ -123,6 +226,16 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--wall-ms", type=parse_wall_ms)
     parser.add_argument("--kernel-bytes", action="append", type=parse_kernel_bytes, default=[])
     parser.add_argument("--top-kernels", type=parse_top_n)
+    parser.add_argument(
+        "--geometry",
+        choices=sorted(GEOMETRY_PRESETS),
+        help="derive per-kernel bytes from a named model geometry preset",
+    )
+    parser.add_argument(
+        "--peak-gbs",
+        type=parse_peak_gbs,
+        help="device peak bandwidth in GB/s; reports each kernel's percentage of it",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -156,6 +269,22 @@ def main(argv: list[str]) -> int:
             print(f"missing bytes kernel: {name}")
             ok = False
 
+    if args.geometry is not None:
+        preset = geometry_preset(args.geometry)
+        matrix_bytes = geometry_expert_matrix_bytes(args.geometry)
+        print(f"geometry.{args.geometry}.layers {preset['layers']}")
+        print(f"geometry.{args.geometry}.experts {preset['experts']}")
+        print(f"geometry.{args.geometry}.experts_active {preset['experts_active']}")
+        print(f"geometry.{args.geometry}.expert_matrix_bytes {matrix_bytes}")
+        moe_bytes_per_token = 0
+        for role, matrices in sorted(preset["role_matrices"].items()):
+            role_bytes = matrices * preset["experts_active"] * matrix_bytes
+            moe_bytes_per_token += role_bytes
+            print(f"geometry.{args.geometry}.role.{role}.bytes_per_call {role_bytes}")
+        print(f"geometry.{args.geometry}.moe_bytes_per_token {preset['layers'] * moe_bytes_per_token}")
+    if args.peak_gbs is not None:
+        print(f"profile.peak_gbs_x1000 {int(round(args.peak_gbs * 1000.0))}")
+
     kernel_sum_total_ns = sum(totals["total_ns"] for totals in kernel_totals.values())
     print(f"profile.kernel_sum_total_ms_x1000 {ns_to_ms_x1000(kernel_sum_total_ns)}")
     ranked_kernels = sorted(kernel_totals.items(), key=lambda item: (-item[1]["total_ns"], item[0]))
@@ -178,15 +307,21 @@ def main(argv: list[str]) -> int:
         print(f"kernel.{metric}.count {totals['count']}")
         print(f"kernel.{metric}.total_ms_x1000 {ns_to_ms_x1000(totals['total_ns'])}")
         print(f"kernel.{metric}.failed_timestamps {totals['failed_timestamps']}")
-        if name in kernel_bytes:
-            total_ns = totals["total_ns"]
-            # `--kernel-bytes` is bytes per profiler event. Achieved GB/s is
-            # (bytes_per_event * event_count) / total_ns because bytes/ns has
-            # the same 10^9 scale as GB/s; the printed metric is x1000 scaled.
-            achieved_gbps_x1000 = (
-                0 if total_ns == 0 else int(round(1000.0 * kernel_bytes[name] * totals["count"] / total_ns))
-            )
-            print(f"kernel.{metric}.achieved_gbps_x1000 {achieved_gbps_x1000}")
+        # Bytes per profiler event: an explicit `--kernel-bytes` always wins
+        # over the `--geometry` preset so a capture can be corrected by hand.
+        bytes_per_event = kernel_bytes.get(name)
+        if bytes_per_event is None and args.geometry is not None:
+            bytes_per_event = geometry_kernel_bytes(args.geometry, name)
+            if bytes_per_event is not None:
+                print(f"kernel.{metric}.geometry_bytes_per_call {bytes_per_event}")
+        if bytes_per_event is not None:
+            # Achieved GB/s is (bytes_per_event * event_count) / total_seconds;
+            # the printed metric is x1000 scaled.
+            achieved = achieved_gbs(bytes_per_event * totals["count"], totals["total_ns"] / 1e9)
+            print(f"kernel.{metric}.achieved_gbps_x1000 {int(round(1000.0 * achieved))}")
+            if args.peak_gbs is not None:
+                pct = percent_of_peak(achieved, args.peak_gbs)
+                print(f"kernel.{metric}.pct_of_peak_x1000 {int(round(1000.0 * pct))}")
 
     for category, total_ns in sorted(category_totals.items()):
         print(f"category.{category}.total_ms_x1000 {ns_to_ms_x1000(total_ns)}")
