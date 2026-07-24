@@ -79,11 +79,32 @@ def percent_of_peak(achieved: float, peak: float) -> float:
     return 100.0 * achieved / peak
 
 
+def validate_geometry_preset(name: str, preset: dict[str, Any]) -> None:
+    """Reject a preset whose `role_rules` name a role `role_matrices` lacks.
+
+    Adding a preset is meant to be a pure data edit, so the one mistake such an
+    edit makes silently -- a typo'd role key -- is raised as the same ValueError
+    the rest of this script uses, instead of surfacing later as a bare KeyError
+    traceback out of `geometry_kernel_bytes`.
+    """
+
+    missing = {role for _, role in preset["role_rules"]} - set(preset["role_matrices"])
+    if missing:
+        raise ValueError(f"geometry preset {name}: role_rules roles with no role_matrices entry: {sorted(missing)}")
+
+
 def geometry_preset(name: str) -> dict[str, Any]:
     preset = GEOMETRY_PRESETS.get(name)
     if preset is None:
         raise ValueError(f"unknown geometry preset: {name}")
+    validate_geometry_preset(name, preset)
     return preset
+
+
+# A malformed preset is a data-edit mistake, so surface it at import time
+# rather than only when a capture happens to name the affected kernel.
+for _preset_name, _preset in GEOMETRY_PRESETS.items():
+    validate_geometry_preset(_preset_name, _preset)
 
 
 def geometry_expert_matrix_bytes(name: str) -> int:

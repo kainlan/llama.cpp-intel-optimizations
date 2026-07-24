@@ -13,6 +13,8 @@ import subprocess
 import sys
 from importlib.machinery import SourceFileLoader
 
+import pytest
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PARSER = ROOT / "scripts" / "parse-sycl-kernel-profile.py"
 
@@ -124,6 +126,41 @@ def test_gateup_moves_two_matrices_down_moves_one():
 
 def test_unmapped_kernel_has_no_geometry_bytes():
     assert mod.geometry_kernel_bytes("gpt-oss-20b", "sycl.rope") is None
+
+
+def test_unknown_preset_raises_value_error():
+    # argparse `choices` guards the CLI, but the lookup is a library entry
+    # point too, so it must reject an unknown name on its own.
+    with pytest.raises(ValueError, match="unknown geometry preset"):
+        mod.geometry_preset("bogus")
+
+
+def test_role_rule_without_role_matrices_entry_raises_value_error():
+    # Adding a preset is a pure data edit; a role key typo must not reach
+    # `geometry_kernel_bytes` and die there on a bare KeyError.
+    broken = {
+        "layers": 1,
+        "experts": 2,
+        "experts_active": 1,
+        "expert_ncols": 32,
+        "expert_nrows": 32,
+        "role_matrices": {"gateup": 2},
+        "role_rules": [("gateup", "gateup"), ("down", "dwon")],
+    }
+    with pytest.raises(ValueError, match="role_matrices"):
+        mod.validate_geometry_preset("broken", broken)
+
+    mod.GEOMETRY_PRESETS["broken"] = broken
+    try:
+        with pytest.raises(ValueError, match="role_matrices"):
+            mod.geometry_kernel_bytes("broken", "some.down.kernel")
+    finally:
+        del mod.GEOMETRY_PRESETS["broken"]
+
+
+def test_shipped_presets_are_self_consistent():
+    for name, preset in mod.GEOMETRY_PRESETS.items():
+        mod.validate_geometry_preset(name, preset)
 
 
 # --- CLI ------------------------------------------------------------------
