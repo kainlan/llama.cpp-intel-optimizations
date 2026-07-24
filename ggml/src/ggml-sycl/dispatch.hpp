@@ -19,16 +19,25 @@
 
 #pragma once
 
-#include "unified-kernel.hpp"
-#include "tuning-engine.hpp"
-#include "tuning-engine-impl.hpp"
 #include "cold-start.hpp"
+#include "gpu-arch.hpp"
 #include "op-context.hpp"
 #include "persistent-tg-kernel.hpp"
+#include "tuning-engine-impl.hpp"
+#include "tuning-engine.hpp"
+#include "unified-kernel.hpp"
 
-#include <cstdlib>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+
+// Declared in common.hpp, defined in common.cpp (external linkage), and
+// redeclared here rather than pulling common.hpp in: dispatch.hpp is included
+// widely, and by TUs that do not have common.hpp at all
+// (tests/test-unified-dispatch-integration.cpp), so it has to stay light.
+// dpct::dev_mgr — the other half of common.hpp's ggml_sycl_get_device() — is
+// already visible transitively through unified-kernel.hpp -> unified-cache.hpp.
+int ggml_sycl_map_device_id(int device);
 
 namespace ggml_sycl {
 
@@ -96,6 +105,63 @@ inline bool is_unified_kernel_enabled() {
 }
 
 /**
+ * Report, once, why the unified kernel was disabled for a device.
+ *
+ * The B70 ran the legacy mul_mat path for an unknown period because it was
+ * misclassified as Alchemist, and the message here said only THAT the unified
+ * kernel was off — never which device, which family, or where that family came
+ * from. Print what was actually observed so the next misdetection is
+ * diagnosable from one run.
+ *
+ * @param device_id Device the unified kernel was disabled for
+ */
+inline void log_unified_kernel_disabled(int device_id) {
+    const unsigned int dpct_id = static_cast<unsigned int>(ggml_sycl_map_device_id(device_id));
+
+    // XMXConfig::from_device() returns its default (supports_esimd_dpas=false)
+    // config for an out-of-range device_id without inspecting any device, so
+    // this path is reachable with an id dev_mgr cannot resolve. Report that
+    // instead of naming a family for a device that was never queried.
+    if (device_id < 0 || dpct_id >= dpct::dev_mgr::instance().device_count()) {
+        fprintf(stderr,
+                "[unified-dispatch] Unified kernel disabled: device %d is out of range "
+                "(%u SYCL device(s) present), so no ESIMD dpas capability was queried\n",
+                device_id, dpct::dev_mgr::instance().device_count());
+        fprintf(stderr, "[unified-dispatch] Using legacy mul_mat kernels\n");
+        fflush(stderr);
+        return;
+    }
+
+    // Same resolution common.hpp's ggml_sycl_get_device() performs.
+    // dpct::device_ext derives publicly from sycl::device.
+    const sycl::device &  dev    = dpct::dev_mgr::instance().get_device(dpct_id);
+    const sycl_gpu_family family = family_from_device(dev);
+
+    // family_from_device() takes the architecture query first and falls back to
+    // the device-name heuristic only when that query yields UNKNOWN or throws,
+    // so re-running the architecture leg here reports which leg produced the
+    // family printed above it.
+    const char * source = "device-name heuristic; the architecture query threw";
+    try {
+        const auto arch = dev.get_info<sycl::ext::oneapi::experimental::info::device::architecture>();
+        source          = family_from_architecture(arch) != sycl_gpu_family::UNKNOWN ?
+                              "SYCL architecture query" :
+                              "device-name heuristic; the architecture is not one this backend maps";
+    } catch (const sycl::exception &) {
+        // Keep the initial text — the throw is the observation.
+    }
+
+    fprintf(stderr,
+            "[unified-dispatch] Unified kernel disabled: device %d (%s) family=%s (%s) "
+            "lacks ESIMD dpas (ExecutionSize=16)\n",
+            device_id, dev.get_info<sycl::info::device::name>().c_str(), family_name(family), source);
+    fprintf(stderr,
+            "[unified-dispatch] Using legacy mul_mat kernels. If this device is Xe2/Battlemage or "
+            "PVC class, the family detection is wrong -- see ggml/src/ggml-sycl/gpu-arch.cpp\n");
+    fflush(stderr);
+}
+
+/**
  * Check if unified kernel should be used on this device.
  *
  * The unified kernel requires ESIMD dpas support for optimal performance.
@@ -128,9 +194,7 @@ inline bool is_unified_kernel_enabled_for_device(int device_id = 0) {
         static bool logged = false;
         if (!logged) {
             logged = true;
-            fprintf(stderr, "[unified-dispatch] Unified kernel disabled: device %d does not support ESIMD dpas\n", device_id);
-            fprintf(stderr, "[unified-dispatch] Using legacy mul_mat kernels for better performance\n");
-            fflush(stderr);
+            log_unified_kernel_disabled(device_id);
         }
         return false;
     }

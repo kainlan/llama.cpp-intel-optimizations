@@ -1402,3 +1402,37 @@ set_tests_properties(gpu-arch PROPERTIES
     LABELS "sycl;arch;capability;tdd"
     TIMEOUT 60
 )
+
+# Test: a Battlemage device is never gated onto the legacy mul_mat path.
+# Guards the gate dispatch.hpp reads (family -> supports_esimd_dpas), which is
+# what silently demoted the B70. Host-only for the same reason test-gpu-arch is
+# — the classifier and the capability predicate are pure functions — so it is
+# registered outside the GGML_SYCL_BUILD_XMX_TESTS guard (which defaults OFF)
+# and compiled against gpu-arch.cpp directly instead of linking libggml-sycl.
+set(ESIMD_DPAS_GATE_TEST_SYCL_OPTIONS
+    "-fsycl"
+    "-Wno-narrowing"
+)
+add_executable(test-esimd-dpas-gate
+    tests/test-esimd-dpas-gate.cpp
+    gpu-arch.cpp
+)
+target_include_directories(test-esimd-dpas-gate PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_compile_options(test-esimd-dpas-gate PRIVATE ${ESIMD_DPAS_GATE_TEST_SYCL_OPTIONS})
+target_link_options(test-esimd-dpas-gate PRIVATE ${ESIMD_DPAS_GATE_TEST_SYCL_OPTIONS})
+# gpu-arch.cpp's GGML_SYCL_DEBUG fallback logging resolves to globals defined in
+# a libggml-sycl TU, which this test deliberately does not link. Same stub as
+# test-gpu-arch uses.
+target_compile_definitions(test-esimd-dpas-gate PRIVATE GGML_SYCL_GPU_ARCH_STANDALONE=1)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-esimd-dpas-gate PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME esimd-dpas-gate COMMAND test-esimd-dpas-gate)
+set_tests_properties(esimd-dpas-gate PROPERTIES
+    LABELS "sycl;arch;dispatch;tdd"
+    TIMEOUT 60
+)
