@@ -16332,8 +16332,13 @@ static std::string planner_moe_nonzero_skips(std::initializer_list<std::pair<con
 // one layout, down got another" visible without reading a kernel profile.
 //
 // The counts apply an `!on_device` filter that planner_moe_granted_layout_name
-// deliberately does not: a role with planned-but-not-resident entries therefore
-// reports a count smaller than the population its layout name was derived from.
+// deliberately does not, so in principle a role with planned-but-not-resident
+// entries would report a count smaller than the population its layout name was
+// derived from. That cannot happen today: every site that assigns on_device
+// keeps `on_device == (target_device >= 0)`, so `target_device == device_id`
+// already implies on_device and the two populations are always identical. The
+// filter is defensive -- kept because it is correct and cheap if that invariant
+// ever changes -- not a live discrepancy to go looking for.
 // Entry counts are reported per role rather than per tensor, so a role that is
 // "mixed" is mixed across entries, not across layers only.
 static void planner_log_moe_granted_layout_summary(const placement_plan & plan, int device_id) {
