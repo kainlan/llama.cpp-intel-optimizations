@@ -489,7 +489,8 @@ struct placement_plan {
     // 0 when model has no MoE layers.
     size_t   moe_vram_runtime_bytes              = 0;  // Zone: RUNTIME (device VRAM)
     // DMA staging pool: device-resident double-buffer for host→device weight streaming.
-    // Sized as max_tensor_bytes × k_dma_pipeline_depth (2 buffers). 0 when streaming disabled.
+    // Sized as k_dma_pipeline_depth (2 buffers) x the largest DMA-streamed tensor
+    // (see zone-sizing.hpp). 0 when streaming disabled.
     size_t   dma_staging_pool_bytes              = 0;  // Zone: RUNTIME (device VRAM)
     // oneDNN scratchpad: workspace for matmul weight reorder (weights) + activation buffer.
     // Sized as 2 x the largest oneDNN-eligible tensor (see zone-sizing.hpp).

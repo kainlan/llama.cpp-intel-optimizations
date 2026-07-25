@@ -17194,16 +17194,18 @@ static void populate_host_zone_sizing(placement_plan &                          
     plan.moe_vram_runtime_bytes = plan.moe_expert_ptrs_bytes;
 
     // 7. DMA staging pool: device-resident double-buffer for host→device weight streaming.
-    //    Two slices, each sized to the largest weight tensor (conservative — actual slice size
-    //    defaults to 1 GB but may be smaller than max_tensor_bytes for small models).
+    //    Two slices, each sized to the largest tensor the weight stream can actually carry.
+    //    The vocab embedding and the LM head are resident, never streamed as layer weights,
+    //    so this is sized from the largest DMA-streamed tensor rather than the largest in the
+    //    model (see zone-sizing.hpp).
     //    Only relevant when weight streaming is active; 0 otherwise (streaming not pre-enabled).
     //    GGML_SYCL_FORCE_STREAMING enables streaming; planner uses a conservative per-model estimate.
     {
         constexpr size_t k_dma_pipeline_depth = 2;  // Double-buffer (matches resolve_dma_defaults)
-        plan.dma_staging_pool_bytes           = plan.max_tensor_bytes * k_dma_pipeline_depth;
-        GGML_LOG_INFO("[SYCL-PLAN] DMA staging pool: %.1f MB (%zu x max_tensor %.1f MB)\n",
+        plan.dma_staging_pool_bytes           = zone_maxima.dma_streamed * k_dma_pipeline_depth;
+        GGML_LOG_INFO("[SYCL-PLAN] DMA staging pool: %.1f MB (%zu x dma_streamed %.1f MB; global max %.1f MB)\n",
                       plan.dma_staging_pool_bytes / (1024.0 * 1024.0), k_dma_pipeline_depth,
-                      plan.max_tensor_bytes / (1024.0 * 1024.0));
+                      zone_maxima.dma_streamed / (1024.0 * 1024.0), plan.max_tensor_bytes / (1024.0 * 1024.0));
     }
 
     // 8. oneDNN scratchpad: ONEDNN zone workspace for weight reorder + activation buffer.
