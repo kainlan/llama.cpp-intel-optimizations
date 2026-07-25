@@ -1,8 +1,23 @@
 # AGENTS.md
 
-Agent-facing workstation guidance for this repository. This file mirrors the
-current machine-specific facts in `CLAUDE.md`; when the two conflict,
-`CLAUDE.md` is the source of truth and `AGENTS.md` should be updated.
+Agent-facing workstation guidance for this repository. **`CLAUDE.md` is the
+source of truth.** When the two conflict, `CLAUDE.md` wins and this file is
+wrong.
+
+> **Do not read the following from this file — go to `CLAUDE.md`:**
+> installed hardware, throughput figures, regression guardrails, correctness-gate
+> expected output, and the environment-variable table. Those are the volatile
+> facts, and this file has drifted on every one of them before.
+>
+> This mirror sat five weeks behind between 2026-06-20 and 2026-07-25, during
+> which it described an **Arc B580 as device 0** — a card that had been replaced
+> by an **Arc Pro B70** — and carried a GPT-OSS row of `~66 PP512 / ~17 TG128`
+> for that slot against an actual ~1400 / ~44. A reader trusting it would have
+> "confirmed" a figure off by 21×. Duplicated numbers rot; pointers don't.
+>
+> What this file is *for*: the material that is **not** in `CLAUDE.md` —
+> GGTT/PPGTT memory architecture, profiling, engineering standards, and the
+> session-completion checklist.
 
 ## Build Commands (Intel SYCL)
 
@@ -235,8 +250,13 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion \
   -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 
-# GPT-OSS B50 chat correctness gate. Expected output starts:
-# : 1, 2, 3, 4, 5
+# GPT-OSS B50 chat correctness gate. With --no-display-prompt the prompt echo
+# lands on the "> " line and the model's ANSWER is the next line, alone:
+#   > Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5
+#   1, 2, 3, 4, 5
+# The gate is the digit sequence. (An older note here said the output starts
+# ": 1, 2, 3, 4, 5" — that colon was the tail of the echoed PROMPT. Grepping for
+# it makes a passing gate read as a failure.)
 # Use the GGUF tokenizer.chat_template metadata. Do not force
 # `--chat-template gpt-oss`; that selects the older native formatter.
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-cli \
@@ -254,6 +274,29 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
 # Backend operations after modifying ggml operators
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-backend-ops
 ```
+
+#### Traps that silently void the commands above
+
+Repeated here rather than pointed at, because each one makes a command on this
+page fail in a way that looks like a *result*. Full list in `CLAUDE.md`.
+
+- **`llama-bench` needs `-v` for any log output.** It installs a null log
+  callback, so every `GGML_LOG_INFO` — all `[SYCL-PLAN]`, `[UNIFIED-CACHE]`,
+  `[VRAM-ARENA]`, `[HOST-ARENA]`, `[MOE-LAYOUT]` lines — is discarded without it.
+  A grep then returns nothing, indistinguishable from "my change had no effect".
+  Confirm a baseline capture is non-empty *before* changing code.
+- **One model per `llama-bench` process.** Two `-m` flags abort at the model
+  switch on a leaked model-weight `mem_handle` lease. Loop the shell, not the flag.
+- **`-p 0` does no prompt processing**, so PP-only code paths show zero activity.
+  Use `-p 512` when you need them.
+- **`dmesg` is privilege-denied here.** Use
+  `journalctl -k --since "1 hour ago" --no-pager | grep -iE 'GT reset|guc_id|GPU hang'`.
+  A silent `dmesg` failure looks exactly like a clean log.
+- **`test-backend-ops` above is manual-only** — never in a subagent or background
+  task; its TTM shmem backing grows to 50–224 GB and the process is OOM-killed.
+- **Check for competing load before any throughput run** (`uptime`,
+  `pgrep -af 'codescout|ninja|icpx|ffmpeg'`). Interleaved paired A/Bs survive
+  sustained load; absolute numbers taken under it are depressed.
 
 ### GPT-OSS Prompt Template Rule
 
@@ -328,7 +371,16 @@ ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-cli \
   -n 48 --seed 42 --temp 0
 ```
 
-Expected output starts with `: 1, 2, 3, 4, 5`. The leading colon is normal for
+**CORRECTION (2026-07-25): the leading colon is NOT part of the model's output.**
+The prompt string itself ends `...Answer with only: 1, 2, 3, 4, 5`, and an early
+capture recorded the tail of the *echoed prompt* as though it were the answer.
+With `--no-display-prompt` the echo lands on the interactive `> ` line and the
+model's answer is the next line, on its own: `1, 2, 3, 4, 5`. **The gate is the
+digit sequence.** Grepping for the colon form makes a passing gate read as a
+failure. The paragraph below is retained only to explain where the colon came
+from; see `CLAUDE.md` for the authoritative gate.
+
+The obsolete note read: expected output starts with `: 1, 2, 3, 4, 5`, the leading colon being normal for
 this CLI/Harmony rendering. `llama-bench` is valid for PP/TG throughput, but it
 does not prove chat-template correctness; use the gate above before trusting
 GPT-OSS performance numbers.
@@ -347,8 +399,17 @@ device, `level_zero:0,1` for a numeric multi-device set, or `level_zero:gpu` for
 all Level Zero GPU devices. The `level_zero:gpu:0` strings printed by some tools
 are display IDs, not valid selector values.
 
-This workstation has 3 GPUs: Arc B580 device 0, Arc Pro B50 device 1, and iGPU
-device 2.
+This workstation has 3 GPUs: **Arc Pro B70** device 0 (Battlemage G31, 256 CU,
+~32.6 GB, PCI `0000:03:00.0`, `renderD128`), **Arc Pro B50** device 1 (G21,
+128 CU, ~16 GB, PCI `0000:07:00.0`, `renderD130`), and the Arrow Lake-S iGPU
+device 2 (PCI `0000:00:02.0`, `renderD129`).
+
+The **B580 that older notes in this file describe was removed** and replaced by
+the B70 in the same slot. Treat every B580 figure below as history for a card
+that is not installed. DRM `cardN` and `renderDN` numbering are independent — do
+not infer one from the other — and the `device=N` printed in SYCL logs is the
+in-process index *after* `ONEAPI_DEVICE_SELECTOR` filtering, so a B50-only run
+and a B70-only run both print `device=0`. Key off the selector, never the log id.
 
 As of 2026-06-07 after a fresh reboot and removal of repo-side selector guards,
 single-GPU B50 validation can run with `ONEAPI_DEVICE_SELECTOR=level_zero:1`.
@@ -380,10 +441,16 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0,1 ./build/bin/llama-bench ... # host-bounce 
 `GGML_SYCL_VISIBLE_DEVICES=0` is not sufficient for the unified cache. Use
 `ONEAPI_DEVICE_SELECTOR`.
 
-Current-boot B580/B50 P2P topology warnings are diagnostic only; direct
-peer-copy paths must stay disabled unless probed safe, but host-bounce
-validation may continue. Frigate QSV/OpenVINO jobs on the iGPU render node are
-not B580/B50 consumers.
+Current-boot P2P topology warnings are diagnostic only; direct peer-copy paths
+must stay disabled unless probed safe, but host-bounce validation may continue.
+Frigate QSV/OpenVINO jobs on the iGPU render node are not B70/B50 consumers.
+
+⚠️ **The "no direct P2P" finding was measured on the B580, which has since been
+replaced by the B70 in the same slot (`0000:03:00.0`). B70↔B50 P2P has NOT been
+re-tested.** It was a PCI-topology restriction — the cards share no upstream
+bridge — so it plausibly still holds for any card in that slot, but "plausibly"
+is not "verified". Keep peer-copy paths disabled until someone re-confirms on
+the live hardware.
 
 ### Patched compute-runtime
 
@@ -419,15 +486,19 @@ processes resolve `libze_loader.so.1.27.0` ahead of the packaged
 `/usr/local/lib`; `ldconfig -p` should resolve them from
 `/usr/lib/x86_64-linux-gnu`.
 
-Validation on 2026-05-30: `sycl-ls` historically reported the B580 and B50
-Level Zero devices on driver `1.15.38646`, and a full GPT-OSS multi-GPU
-llama.cpp bench ran through the isolated/host-bounce path. Do not use
-`sycl-ls` for B50 probing now; see the 2026-06-07 B50 safety note above. Raw
-SYCL and Level Zero direct
-device-to-device USM copy between B580 and B50 still fails
-(`UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` / `ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY`),
-and importing a B580 device allocation on the B50 returns
-`ZE_RESULT_ERROR_INVALID_ARGUMENT`. Kernel logs report:
+**Historical, measured on the B580 (2026-05-30) — that card is gone, see the
+warning above.** `sycl-ls` then reported the B580 and B50 Level Zero devices on
+driver `1.15.38646`, and a full GPT-OSS multi-GPU llama.cpp bench ran through
+the isolated/host-bounce path.
+
+⚠️ **NEVER run `sycl-ls` on this host.** It has wedged the machine in
+`ttm_resource_manager_usage -> drm_ioctl -> xe_drm_ioctl` after a reset/oops,
+requiring a reboot. It is not a "non-preferred" probe, it is a hang hazard.
+
+Raw SYCL and Level Zero direct device-to-device USM copy between B580 and B50
+failed (`UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` /
+`ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY`), and importing a B580 device allocation
+on the B50 returned `ZE_RESULT_ERROR_INVALID_ARGUMENT`. Kernel logs report:
 
 ```text
 xe 0000:03:00.0: cannot be used for peer-to-peer DMA as the client and provider (0000:07:00.0) do not share an upstream bridge or whitelisted host bridge
@@ -438,71 +509,41 @@ bug. Do not enable direct peer-copy/shared-context transfer paths by default
 unless a runtime probe proves they are safe on the active hardware, kernel, and
 driver.
 
-### Performance Expectations
+### Performance Expectations And Regression Baselines
 
-Mistral 7B Q4_0 on Arc B580:
+**Deliberately not duplicated here.** See `CLAUDE.md` → *Performance
+Expectations* / *Regression Baselines*, whose figures in turn come from
+`docs/backend/sycl-perf-baselines.md` (the numeric gate, with run counts and
+spreads).
 
-| Metric | Expected tok/s | Notes |
-|--------|----------------|-------|
-| PP512, all VRAM | ~1700 | default no-FA bench path |
-| TG128, all VRAM | ~81 | MMVQ fast path, SOA layout, graph replay |
-| TG128, no graph | ~70 | MMVQ fast path alone |
-| PP512, Level 3 30% budget | ~269 | partial GPU offload |
-| TG128, Level 3 30% budget | ~14 | CPU offload |
-| PP512 legacy | ~159 | `GGML_SYCL_UNIFIED_FORCE_LEGACY=1` |
-| TG128 3-device | ~27 | `GGML_SYCL_SPLIT_RATIO="60,32,8"` |
+Every throughput table this file used to carry was wrong by 2026-07-25:
 
-Historical Mistral 7B Q4_0 on Arc Pro B50 with ECC disabled:
+- Mistral figures were for an **Arc B580** that is no longer installed.
+- The GPT-OSS row for `level_zero:0` read `~66 PP512 / ~17 TG128`; the **Arc Pro
+  B70** now in that slot measures ~1400 / ~44 — a 21× error.
+- The `>1100 PP512, ~50+ TG128` B50 GPT-OSS guardrail predates the 26.27 driver.
+  A healthy B50 runs ~894–902 PP512, so that figure reads as an ~18%
+  catastrophe and caused three false-regression scares in one session.
+- The `B580 Mistral >2000 PP512 / >85 TG128` guardrail is retired with the card.
 
-| Metric | Expected tok/s | Notes |
-|--------|----------------|-------|
-| PP512, all VRAM | ~1197 | B50 ECC disabled, default no-FA bench path |
-| TG128, all VRAM | ~44 | Coalesced/SOA MMVQ, 70 W power cap |
+The one durable rule: **do not accept lower post-merge or post-debug numbers as
+new baselines**, and gate against `docs/backend/sycl-perf-baselines.md` rather
+than any figure remembered from an older card or driver.
 
 Do not use `GGML_SYCL_FA_ONEDNN_ALLOW=1` to restore Mistral PP numbers. It can
 raise PP throughput, but the deterministic completion gate produces incorrect
 output with the current nc!=D contiguity bypass.
 
-GPT-OSS 20B MXFP4:
+Keep these opt-in until same-build B50 GPT-OSS + B70 Mistral gates pass on a
+clean boot: `GGML_SYCL_MOE_BLOCK_GRAPHLETS`, `GGML_SYCL_XMX_MOE_PP` /
+`GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP`, and `GGML_SYCL_PP_PIPELINE` (the last has
+shown GPT-OSS chat correctness failures).
 
-| Device selector | PP512 tok/s | TG128 tok/s | Notes |
-|-----------------|------------:|------------:|-------|
-| `level_zero:1` B50 ECC-off | current ~926; target >1100 | current ~48; target ~50+ | Fresh-boot B50 smoke passes; PP target still unmet |
-| `level_zero:0` B580 | ~66 | ~17 | Smaller VRAM budget causes more pressure |
-| `level_zero:0,1` | TBD | TBD | Use isolated/host-bounce transfer paths; direct P2P is not available |
-
-### Current Regression Baselines And Suspect Delta
-
-Do not accept lower post-merge or post-debug numbers as new baselines. Beads
-`llama.cpp-aqzz3.1`, `llama.cpp-po3nd.2.45`, `llama.cpp-po3nd.2.46`, and
-`llama.cpp-ix58x` record the hard guardrails:
-
-- B50 GPT-OSS20B MXFP4 FA-on should restore/maintain >1100 PP512 and about
-  50+ TG128; older restored-fast-path evidence was about 1255 PP512 / 52
-  TG128, with the canonical GGUF chat-template count gate passing.
-- B580 Mistral 7B Q4_0 FA-on should restore/maintain >2000 PP512 and >85
-  TG128. `docs/backend/SYCL.md` records build `5b206c499-dirty` at PP512
-  `2173.92 +/- 10.01` and TG128 `88.42 +/- 0.47`, with the deterministic
-  count gate correct.
-
-For the latest regression hunt, use `581babb476b726665a03345feb1a9ebcabe630db`
-as the close pre-regression comparison point. The first-parent delta to
-`f7a332578` is:
-
-- `06f8887a6` restore unified-cache prompt headroom
-- `a42a4c9a3` harden unified-cache view ownership
-- `129a04fcb` tighten gpu performance gates
-- `feae906b4` restore default MoE block graphlets
-- `f7a332578` prefer MoE block graphlets for decode
-
-The most suspicious default-on change in that small delta is the MoE block
-command-graphlet path. It must stay opt-in via
-`GGML_SYCL_MOE_BLOCK_GRAPHLETS=1` until same-build B50 GPT-OSS and B580
-Mistral correctness/performance gates pass on a clean boot. Prompt XMX MoE PP
-is also unsafe as a default; keep `GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP` /
-`GGML_SYCL_XMX_MOE_PP` opt-in only. `GGML_SYCL_PP_PIPELINE=1` remains a
-diagnostic proof knob, not a default, because it has shown GPT-OSS chat
-correctness failures.
+Active regression-hunt state — commit deltas, suspect changes, bisect results —
+belongs in the **codescout task tracker** (`task_list`, `task_show`), not here.
+A suspect-delta list written into a document goes stale the moment the hunt
+closes, and this file carried one naming `f7a332578` long after the fact.
+(Beads was retired 2026-07-01; ignore any "Beads" reference in this file.)
 
 ## SYCL Environment Variables
 
