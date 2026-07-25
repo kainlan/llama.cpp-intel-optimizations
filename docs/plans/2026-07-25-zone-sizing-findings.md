@@ -380,10 +380,15 @@ applied to `max_tensor_bytes` = 586.8 MB, and both are corroborated by the two
 | B70 | weight | 29578.1 MB | 30482.9 MB | **+904.8 MB** |
 
 **Conservation check reproduced, three independent ways.** The arena weight zone
-grows by exactly what the ONEDNN zone gives up, on both cards — this is the proof
-the VRAM reclaim is real and not a dropped budget term. A third confirmation
-comes from the B70 `[MOE-LAYOUT] gateup-i8 … remaining=` figure, which moves
-11752.8 → 12657.5 MB, again **+904.7 MB**.
+grows by what the ONEDNN zone gives up, on both cards — this is the proof the
+VRAM reclaim is real and not a dropped budget term. It is **exact on the B50**
+(−904.7 / +904.7). The B70 row reads −904.7 against **+904.8**: that 0.1 MB is
+the same rounded-MB artifact explained under "On 452.3 vs 452.4" below — the two
+zones' MB figures are each rounded independently before being differenced, so a
+0.1 MB residual is expected and is not a budget leak. A third confirmation comes
+from the B70 `[MOE-LAYOUT] gateup-i8 … remaining=` figure, which moves
+11752.8 → 12657.5 MB, again **+904.7 MB** — an independent counter on the same
+card that lands on the B50's exact value.
 
 The proof line for the zone change is
 `[VRAM-ARENA] Rebuilding unused early arena for planned zones: scratch
@@ -528,6 +533,96 @@ cost of this plan's sizing change; the B70 control alone already shows the sizin
 change carries no pp512 penalty where the layout is held fixed. A dedicated
 "is down-i8 worth it at the margin on the B50?" experiment — one that pins tensor
 identity and varies only the layout — is worth filing to close the question.
+
+#### Raw per-pair measurements
+
+Every `avg_ts` behind the t-tests above, embedded here rather than referenced by
+path. Task 1's artifacts went to `/tmp/zone-sizing/` and were destroyed by a
+mid-plan reboot — `/tmp` is tmpfs on this host — so a path would be a pointer
+that dangles and would leave the statistics permanently unverifiable. The data is
+small, so it goes in the committed record instead, on the same principle that put
+the log lines in the zone sections: **every t and p below is recomputable from
+this document alone, by anyone, without the machine.**
+
+Each row is one interleaved pair. `first arm` is the arm that ran first in that
+pair — it alternates by construction, so drift within a pair loads both arms
+equally over the set. Units are tok/s; each figure is a single
+`llama-bench -p 512 -n 128 -r 1 -o csv` process.
+
+**B50 / GPT-OSS 20B**
+
+| pair | first arm | pp512 before | pp512 after | tg128 before | tg128 after |
+|---:|---|---:|---:|---:|---:|
+| 1 | after | 903.51 | 891.90 | 36.27 | 34.91 |
+| 2 | before | 905.59 | 890.43 | 35.95 | 34.89 |
+| 3 | after | 903.99 | 894.09 | 35.95 | 36.17 |
+| 4 | before | 901.51 | 886.75 | 35.33 | 34.83 |
+| 5 | after | 891.26 | 886.37 | 35.63 | 36.30 |
+| 6 | before | 894.99 | 886.91 | 34.79 | 35.87 |
+| 7 | after | 898.67 | 891.79 | 35.47 | 36.10 |
+| 8 | before | 887.80 | 886.44 | 34.01 | 36.00 |
+
+**B70 / GPT-OSS 20B**
+
+| pair | first arm | pp512 before | pp512 after | tg128 before | tg128 after |
+|---:|---|---:|---:|---:|---:|
+| 1 | after | 1363.28 | 1360.24 | 47.46 | 48.40 |
+| 2 | before | 1338.55 | 1370.44 | 45.24 | 49.08 |
+| 3 | after | 1355.42 | 1365.58 | 47.19 | 49.05 |
+| 4 | before | 1360.70 | 1358.02 | 48.97 | 48.23 |
+| 5 | after | 1383.42 | 1355.94 | 48.21 | 47.59 |
+| 6 | before | 1383.35 | 1377.64 | 50.65 | 51.30 |
+| 7 | after | 1369.50 | 1368.75 | 48.68 | 48.16 |
+| 8 | before | 1390.13 | 1373.48 | 51.24 | 51.36 |
+
+**B50 / Mistral 7B**
+
+| pair | first arm | pp512 before | pp512 after | tg128 before | tg128 after |
+|---:|---|---:|---:|---:|---:|
+| 1 | after | 1196.13 | 1213.87 | 47.02 | 47.15 |
+| 2 | before | 1222.52 | 1216.12 | 46.98 | 47.03 |
+| 3 | after | 1196.04 | 1218.38 | 46.95 | 46.73 |
+| 4 | before | 1226.44 | 1188.16 | 46.98 | 46.77 |
+| 5 | after | 1187.19 | 1226.21 | 46.96 | 46.98 |
+| 6 | before | 1219.98 | 1202.35 | 46.74 | 47.04 |
+| 7 | after | 1204.27 | 1201.40 | 47.06 | 46.89 |
+| 8 | before | 1204.90 | 1212.18 | 46.99 | 46.87 |
+
+**B70 / Mistral 7B**
+
+| pair | first arm | pp512 before | pp512 after | tg128 before | tg128 after |
+|---:|---|---:|---:|---:|---:|
+| 1 | after | 2508.37 | 2439.38 | 110.84 | 109.27 |
+| 2 | before | 2507.81 | 2669.40 | 107.04 | 110.50 |
+| 3 | after | 2413.81 | 2355.21 | 107.82 | 109.96 |
+| 4 | before | 2571.91 | 2677.14 | 110.81 | 110.06 |
+| 5 | after | 2566.57 | 2582.57 | 111.16 | 110.89 |
+| 6 | before | 2661.64 | 2542.20 | 109.49 | 110.99 |
+| 7 | after | 2608.34 | 2600.89 | 110.40 | 107.74 |
+| 8 | before | 2500.43 | 2528.75 | 109.40 | 110.17 |
+
+**B50 / GPT-OSS 20B — down-i8 count matched at 6/24** (after arm carries
+`GGML_SYCL_VRAM_ARENA_EXTERNAL_HEADROOM_MB=1795`)
+
+| pair | first arm | pp512 before | pp512 after | tg128 before | tg128 after |
+|---:|---|---:|---:|---:|---:|
+| 1 | after | 903.15 | 908.32 | 36.29 | 36.64 |
+| 2 | before | 903.85 | 907.80 | 35.45 | 36.49 |
+| 3 | after | 902.53 | 906.46 | 35.42 | 36.72 |
+| 4 | before | 898.07 | 902.48 | 35.78 | 36.69 |
+| 5 | after | 900.68 | 905.40 | 35.35 | 36.61 |
+| 6 | before | 895.43 | 902.78 | 36.00 | 35.96 |
+
+The reported statistic is a two-sided paired t-test on the per-pair differences
+(after − before), df = pairs − 1; the ± figures in the summary tables are sample
+standard deviations, not standard errors.
+
+Recomputing all ten t-tests from the tables above reproduces the summary tables.
+The figures here are rounded to 2 dp for the record while the summary statistics
+were computed at full `avg_ts` precision, so a recomputation drifts in the last
+digit — the largest divergence across all ten is p = 0.6197 → 0.6166 (B50
+GPT-OSS tg128, null either way). No sign, no significance verdict, and no delta
+percentage to 2 dp changes.
 
 ### Gates
 
