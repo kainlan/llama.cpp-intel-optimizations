@@ -246,6 +246,43 @@ if (NOT WIN32)
     set_tests_properties(test-sycl-alloc-policy PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
+if (NOT WIN32)
+    # Python source-assertion test for the decode-timeline profiling pipeline.
+    # Registered because tasks that modify sycl-gptoss-decode-timeline-profile.sh
+    # or parse-sycl-timeline.py need a gate the lead can run; tests/ holds ~90
+    # .py tests and this is the first one wired to ctest (see llama.cpp-t5a2).
+    #
+    # The file is pytest-style (module-level test_* functions, no __main__), so
+    # it must run under pytest -- `python3 <file>` would define the functions,
+    # call none of them, and exit 0 for any state of the script under test.
+    find_package(Python3 COMPONENTS Interpreter)
+    if (Python3_Interpreter_FOUND)
+        execute_process(
+            COMMAND ${Python3_EXECUTABLE} -m pytest --version
+            RESULT_VARIABLE LLAMA_PYTEST_RESULT
+            OUTPUT_QUIET
+            ERROR_QUIET
+        )
+    else()
+        set(LLAMA_PYTEST_RESULT "no-python3")
+    endif()
+
+    if (LLAMA_PYTEST_RESULT EQUAL 0)
+        llama_test_cmd(
+            ${Python3_EXECUTABLE}
+            NAME test-sycl-decode-timeline-profile-script
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+            ARGS -m pytest -q ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-decode-timeline-profile-script.py
+        )
+        set_tests_properties(test-sycl-decode-timeline-profile-script PROPERTIES
+            LABELS "sycl;profiling;tdd"
+            TIMEOUT 120
+        )
+    else()
+        message(STATUS "python3 -m pytest unavailable - skipping test-sycl-decode-timeline-profile-script registration")
+    endif()
+endif()
+
 if (GGML_SYCL)
     llama_build(test-sycl-kernel-profiler.cpp)
     target_include_directories(test-sycl-kernel-profiler PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
