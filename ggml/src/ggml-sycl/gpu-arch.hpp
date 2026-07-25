@@ -13,9 +13,9 @@
 
 #pragma once
 
-// Keep this header light: Task 5 includes it from dispatch.hpp, which is
-// included widely. Nothing here needs <string> — family_from_name takes a
-// const char * and family_name returns one.
+// Keep this header light: dispatch.hpp includes it, and dispatch.hpp is
+// included by ggml-sycl.cpp — the core backend TU. Nothing here needs <string>
+// — family_from_name takes a const char * and family_name returns one.
 #include <sycl/sycl.hpp>
 
 namespace ggml_sycl {

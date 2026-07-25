@@ -1405,10 +1405,20 @@ set_tests_properties(gpu-arch PROPERTIES
 
 # Test: a Battlemage device is never gated onto the legacy mul_mat path.
 # Guards the gate dispatch.hpp reads (family -> supports_esimd_dpas), which is
-# what silently demoted the B70. Host-only for the same reason test-gpu-arch is
-# — the classifier and the capability predicate are pure functions — so it is
-# registered outside the GGML_SYCL_BUILD_XMX_TESTS guard (which defaults OFF)
-# and compiled against gpu-arch.cpp directly instead of linking libggml-sycl.
+# what silently demoted the B70, and calls is_unified_kernel_enabled_for_device
+# itself so the disable diagnostic is covered by a run rather than by reading.
+# Registered outside the GGML_SYCL_BUILD_XMX_TESTS guard (which defaults OFF)
+# and compiled against gpu-arch.cpp directly instead of linking libggml-sycl:
+# the backend library would bring in dpct::dev_mgr, whose first use enumerates
+# every SYCL device on the machine. The test supplies its own definitions of
+# the two backend symbols dispatch.hpp's gate needs (see the link-seam comment
+# in the test), so it stays host-only and needs no GPU.
+#
+# ggml-base is linked for one reason: dpct::dev_mgr's constructor references
+# ggml_abort. That code is never executed here — the negative-device-id path
+# returns before any dev_mgr use — but it is emitted, and at -O0 nothing folds
+# it away. Linking ggml-base makes the test build at any optimization level
+# instead of depending on the optimizer to delete an unreachable branch.
 set(ESIMD_DPAS_GATE_TEST_SYCL_OPTIONS
     "-fsycl"
     "-Wno-narrowing"
@@ -1428,6 +1438,7 @@ target_link_options(test-esimd-dpas-gate PRIVATE ${ESIMD_DPAS_GATE_TEST_SYCL_OPT
 # a libggml-sycl TU, which this test deliberately does not link. Same stub as
 # test-gpu-arch uses.
 target_compile_definitions(test-esimd-dpas-gate PRIVATE GGML_SYCL_GPU_ARCH_STANDALONE=1)
+target_link_libraries(test-esimd-dpas-gate PRIVATE ggml-base)
 if (IntelSYCL_FOUND)
     target_link_libraries(test-esimd-dpas-gate PRIVATE IntelSYCL::SYCL_CXX)
 endif()

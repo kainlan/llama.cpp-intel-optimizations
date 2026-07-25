@@ -32,11 +32,19 @@
 #include <cstring>
 
 // Declared in common.hpp, defined in common.cpp (external linkage), and
-// redeclared here rather than pulling common.hpp in: dispatch.hpp is included
-// widely, and by TUs that do not have common.hpp at all
-// (tests/test-unified-dispatch-integration.cpp), so it has to stay light.
+// redeclared here rather than pulling common.hpp in.
+//
+// dispatch.hpp has exactly three includers: ggml-sycl.cpp (line 286, via the
+// path-prefixed "ggml-sycl/dispatch.hpp"), tools/sycl-kernel-bench/
+// benchmark_harness.hpp, and tests/test-unified-dispatch-integration.cpp —
+// the last of which does not include common.hpp at all, so pulling it in here
+// would end that test's independence from the backend library. The weight of
+// this header matters because one of those three is the core backend TU, not
+// because the list is long.
+//
 // dpct::dev_mgr — the other half of common.hpp's ggml_sycl_get_device() — is
 // already visible transitively through unified-kernel.hpp -> unified-cache.hpp.
+// common.hpp carries a pointer back to this redeclaration.
 int ggml_sycl_map_device_id(int device);
 
 namespace ggml_sycl {
@@ -116,13 +124,28 @@ inline bool is_unified_kernel_enabled() {
  * @param device_id Device the unified kernel was disabled for
  */
 inline void log_unified_kernel_disabled(int device_id) {
-    const unsigned int dpct_id = static_cast<unsigned int>(ggml_sycl_map_device_id(device_id));
-
     // XMXConfig::from_device() returns its default (supports_esimd_dpas=false)
     // config for an out-of-range device_id without inspecting any device, so
-    // this path is reachable with an id dev_mgr cannot resolve. Report that
-    // instead of naming a family for a device that was never queried.
-    if (device_id < 0 || dpct_id >= dpct::dev_mgr::instance().device_count()) {
+    // this path is reachable with an id no device manager can resolve. Report
+    // that instead of naming a family for a device that was never queried.
+    //
+    // A negative id is answered without touching dpct::dev_mgr on purpose:
+    // dev_mgr::instance() enumerates every SYCL device on first use, which is
+    // far too much to do just to print a count next to an id that was already
+    // invalid on its face. It also keeps this branch reachable from a
+    // host-only test (see tests/test-esimd-dpas-gate.cpp).
+    if (device_id < 0) {
+        fprintf(stderr,
+                "[unified-dispatch] Unified kernel disabled: device id %d is negative, "
+                "so no ESIMD dpas capability was queried\n",
+                device_id);
+        fprintf(stderr, "[unified-dispatch] Using legacy mul_mat kernels\n");
+        fflush(stderr);
+        return;
+    }
+
+    const unsigned int dpct_id = static_cast<unsigned int>(ggml_sycl_map_device_id(device_id));
+    if (dpct_id >= dpct::dev_mgr::instance().device_count()) {
         fprintf(stderr,
                 "[unified-dispatch] Unified kernel disabled: device %d is out of range "
                 "(%u SYCL device(s) present), so no ESIMD dpas capability was queried\n",
@@ -141,6 +164,10 @@ inline void log_unified_kernel_disabled(int device_id) {
     // the device-name heuristic only when that query yields UNKNOWN or throws,
     // so re-running the architecture leg here reports which leg produced the
     // family printed above it.
+    //
+    // Standing follow-up llama.cpp-ajg9: have XMXConfig carry the family it
+    // already computed, plus how it derived it. That removes this second query,
+    // the device lookup above, and the ggml_sycl_map_device_id redeclaration.
     const char * source = "device-name heuristic; the architecture query threw";
     try {
         const auto arch = dev.get_info<sycl::ext::oneapi::experimental::info::device::architecture>();

@@ -566,6 +566,11 @@ static size_t g_scratch_offset = 0;
 }
 
 int  get_current_device_id();
+// dispatch.hpp carries a matching redeclaration of ggml_sycl_map_device_id so
+// it can resolve a device without including this header. Change the signature
+// here and that one has to change with it — every TU that sees both will fail
+// to compile until it does, but the sycl-kernel-bench and unified-dispatch
+// test TUs see only one of the two.
 int  ggml_sycl_map_device_id(int device);
 void ggml_sycl_set_device_map(const int * device_ids, int device_count);
 
