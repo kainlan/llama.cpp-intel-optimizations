@@ -17114,9 +17114,16 @@ static void populate_host_zone_sizing(placement_plan &                          
     }
 
     // 4. CPU quantization temp buffers: 3 pre-allocated slots (cpu_dispatch_buffers) each
-    //    sized conservatively to max_tensor_bytes to cover any weight's row/col dimensions.
+    //    sized to cover the row/col dimensions of any weight the CPU quantization path
+    //    processes. That path never sees the vocab embedding or the LM head, so the slots
+    //    are sized from the largest quant-eligible tensor rather than the largest in the
+    //    model. This field is not folded into host_zone_scratch_bytes; it is a plan-level
+    //    figure for the host system-heap budget only.
     constexpr size_t k_cpu_quant_slots = 3;
-    plan.cpu_quant_buffer_bytes        = k_cpu_quant_slots * plan.max_tensor_bytes;
+    plan.cpu_quant_buffer_bytes        = k_cpu_quant_slots * zone_maxima.cpu_quant_eligible;
+    GGML_LOG_INFO("[SYCL-PLAN] CPU quant buffers: %.1f MB (%zu x cpu_quant_eligible %.1f MB; global max %.1f MB)\n",
+                  plan.cpu_quant_buffer_bytes / (1024.0 * 1024.0), k_cpu_quant_slots,
+                  zone_maxima.cpu_quant_eligible / (1024.0 * 1024.0), plan.max_tensor_bytes / (1024.0 * 1024.0));
 
     // 5. Graph metadata: layer classification vectors + MoE routing tables.
     //    Fixed 4 MB base + per-expert int entries per layer.
