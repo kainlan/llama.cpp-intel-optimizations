@@ -400,8 +400,19 @@ MB` (after).
 The SCRATCH delta decomposes exactly into the two consumers that feed
 `host_zone_scratch_bytes` (`unified-cache.cpp`, the `plan.host_zone_scratch_bytes
 = std::max(...)` sum): `onednn_reorder` −452.3 MB + `dma_staging_pool` −904.7 MB
-= −1357.0 MB, versus −1357.1 MB measured (rounding). This reconciles T3's 452.4
-MB and T5's 904.7 MB into one measured host-side figure.
+= −1357.0 MB, versus −1357.1 MB measured (rounding). This reconciles T3's
+oneDNN-reorder reclaim and T5's DMA-staging reclaim into one measured host-side
+figure.
+
+**On 452.3 vs 452.4.** T3 records the oneDNN-reorder reclaim as 452.4 MB; the
+table above says 452.3 MB. **These are the same quantity**, differing only in
+where the rounding happens. Subtracting the two already-rounded MB figures gives
+586.8 − 134.5 = **452.3**. Subtracting in bytes and rounding once gives
+615,329,280 − 141,004,800 = 474,324,480 B = **452.4** MiB. (The tensors:
+`output.weight` at Q8_0, 579,133,440 elements ÷ 32 × 34 B; `blk.*.ffn_*_exps.weight`
+at MXFP4, 2880 × 2880 × 32 = 265,420,800 elements ÷ 32 × 17 B.) The byte-exact
+452.4 is the more accurate figure; 452.3 is used in the table above for internal
+consistency with the rounded MB columns it is derived from. Neither is an error.
 
 ### Zone figures — Mistral 7B v0.1 Q4_0
 
@@ -475,29 +486,48 @@ Seven of the eight comparisons are indistinguishable from zero. **One is not: B5
 GPT-OSS pp512 is 1.01 % slower after the plan, p = 0.0010.** Reported rather than
 rounded away.
 
-#### Attribution of the −1.01 %: it is the extra MoE layers, not the sizing
+#### Isolating the layout change from the sizing change
 
-The B50 is the only configuration whose *MoE layout changes* between the arms
-(6 → 10 down-i8 tensors). On the B70, where the layout is byte-identical in both
-arms and only the zone sizes differ, there is no pp512 effect at all (−0.13 %,
-p = 0.78). That already points away from the sizing arithmetic.
+Two pieces of evidence, strongest first. Neither is a proof; together they make
+the extra MoE layers — not the sizing arithmetic — the leading explanation.
 
-Confirmed directly. Re-running the **after** build with
+**1. The B70 control (structurally strongest, and mechanism-independent).** The
+B50 is the only configuration whose *MoE layout changes* between the arms
+(6 → 10 down-i8 tensors). The B70 grants all 24 down tensors in both arms, so
+there the *only* difference between the builds is the zone sizes — and there is
+no pp512 effect at all: **−0.13 %, p = 0.78**, over the same 8 interleaved pairs.
+This is a genuine control: it does not depend on any forced configuration, and it
+says the sizing change on its own has no measurable pp512 cost.
+
+**2. A forced-headroom experiment on the B50 (corroborating, not conclusive).**
+Re-running the **after** build with
 `GGML_SYCL_VRAM_ARENA_EXTERNAL_HEADROOM_MB=1795` shrinks the arena until the
-down-i8 pass grants exactly **6** tensors — the same layout the before build
-gets — and the comparison inverts:
+down-i8 pass grants **6** tensors, the same count the before build gets. The
+comparison then inverts:
 
-| B50 / GPT-OSS, layout matched at 6/24 | before | after | paired delta | t (df=5) | p |
+| B50 / GPT-OSS, down-i8 count matched at 6/24 | before | after | paired delta | t (df=5) | p |
 |---|---:|---:|---:|---:|---:|
 | pp512 | 900.62 ± 3.29 | 905.54 ± 2.48 | **+4.92 ± 1.28 (+0.55 %)** | +9.41 | 0.0002 |
 | tg128 | 35.72 ± 0.38 | 36.52 ± 0.29 | **+0.80 ± 0.54 (+2.25 %)** | +3.66 | 0.0146 |
 
-With the MoE layout held equal, path-scoped zone sizing is **faster** on both
-axes. The −1.01 % in the default comparison is therefore the cost of the four
-extra down-i8 tensors the reclaimed VRAM buys, not a cost of this plan's sizing
-change. (The two experiments are separately paired against the same before build,
-so this is strong evidence rather than a single paired proof; a dedicated
-"is down-i8 worth it at the margin on the B50?" experiment is worth filing.)
+**What this experiment does not establish.** Three limits, stated so the result
+is not cited beyond its strength:
+
+- it matches the down-i8 **count** (6), not per-tensor **identity** — the two
+  builds are not verified to have upgraded the *same* six tensors;
+- forcing external arena headroom is a **different mechanism** from the before
+  build's genuinely larger ONEDNN zone, so the two configurations are not
+  identical in the way a true controlled swap would be;
+- the two B50 experiments are separately paired against the same before build
+  rather than being one paired design, so the comparison between them is
+  quasi-experimental.
+
+**Conclusion at the strength the evidence supports.** The −1.01 % is most likely
+the cost of the four extra down-i8 tensors the reclaimed VRAM buys, rather than a
+cost of this plan's sizing change; the B70 control alone already shows the sizing
+change carries no pp512 penalty where the layout is held fixed. A dedicated
+"is down-i8 worth it at the margin on the B50?" experiment — one that pins tensor
+identity and varies only the layout — is worth filing to close the question.
 
 ### Gates
 
@@ -564,9 +594,13 @@ MOE LAYERS GRANTED: B50 GPT-OSS down-i8  6/24 -> 10/24  (+4 layers, 261.05 MB ea
                     B70 GPT-OSS down-i8  24/24 -> 24/24 (already full; +904.7 MB idle headroom)
                     Mistral: no MoE path
 THROUGHPUT:        7 of 8 interleaved paired comparisons null. B50 GPT-OSS pp512
-                   -1.01% (p=0.0010) -- attributed to the 4 extra down-i8 tensors,
-                   not to the sizing: with the layout matched at 6/24 the after
-                   build is +0.55% pp512 (p=0.0002) and +2.25% tg128 (p=0.0146).
+                   -1.01% (p=0.0010) -- most likely the cost of the 4 extra
+                   down-i8 tensors rather than the sizing. Evidence: the B70,
+                   where the layout is identical in both arms, shows no pp512
+                   effect (-0.13%, p=0.78); and a forced-headroom B50 run with
+                   the down-i8 count matched at 6/24 inverts the sign (+0.55%
+                   pp512 p=0.0002, +2.25% tg128 p=0.0146). Not conclusive -- see
+                   "Isolating the layout change from the sizing change".
 GATES:             4/4 PASS (Mistral completion + GPT-OSS count, both cards).
                    Perf gated on docs/backend/sycl-perf-baselines.md, not CLAUDE.md.
 UNDERESTIMATES:    0 observed. But GPT-OSS records 0 observations (structurally
