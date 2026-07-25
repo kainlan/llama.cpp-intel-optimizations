@@ -294,6 +294,24 @@ sys.exit(pytest.main(['-q', sys.argv[1]]))
         SKIP_RETURN_CODE 77
         TIMEOUT 120
     )
+
+    # Conservation gate for parse-sycl-timeline.py's three-way gap-class split,
+    # driven by the checked-in synthetic trace next to it (never live hardware).
+    #
+    # Unlike its sibling above this file is a plain script (def main() + a
+    # __main__ guard), so it needs python3 only -- deliberately NOT registered
+    # under a pytest probe, which would make a test that has no pytest
+    # dependency silently vanish on a machine that merely lacks pytest.
+    llama_test_cmd(
+        ${LLAMA_PYTHON3}
+        NAME test-sycl-timeline-gap-class-conservation
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-timeline-gap-class-conservation.py
+    )
+    set_tests_properties(test-sycl-timeline-gap-class-conservation PROPERTIES
+        LABELS "sycl;profiling;tdd"
+        TIMEOUT 120
+    )
 endif()
 
 if (GGML_SYCL)

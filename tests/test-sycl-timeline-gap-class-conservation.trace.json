@@ -1,0 +1,115 @@
+{
+  "_comment": [
+    "Synthetic Chrome Trace fixture for test-sycl-timeline-gap-class-conservation.py.",
+    "Hand-built, never captured from hardware. The device timestamps are chosen so",
+    "that the device0/compute queue produces exactly one gap of each class, and so",
+    "that per-gap rounding disagrees with whole-queue rounding by a non-zero amount:",
+    "each gap is N000.5 us, which parse-sycl-timeline.py rounds down per gap but",
+    "sums to 6001.5 us -> 6002 for the queue total. That makes rounding_delta 2,",
+    "so the metric under test is provably observing something.",
+    "The device0/copy queue is a clean second queue (rounding_delta 0)."
+  ],
+  "traceEvents": [
+    {
+      "ph": "X",
+      "cat": "ggml.op",
+      "name": "compute_forward_node",
+      "ts": 100,
+      "dur": 1400,
+      "args": { "metadata": "op=MUL_MAT" }
+    },
+    {
+      "ph": "X",
+      "cat": "sycl.event",
+      "name": "k1",
+      "ts": 50,
+      "dur": 50,
+      "args": {
+        "device": 0,
+        "queue_kind": "compute",
+        "event_id": 1,
+        "device_start_ns": 1000000,
+        "device_end_ns": 2000000,
+        "host_submit_begin_us": 50,
+        "host_submit_end_us": 100
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "sycl.event",
+      "name": "k2",
+      "ts": 2000,
+      "dur": 50,
+      "args": {
+        "device": 0,
+        "queue_kind": "compute",
+        "event_id": 2,
+        "device_start_ns": 3000500,
+        "device_end_ns": 4000000,
+        "host_submit_begin_us": 2000,
+        "host_submit_end_us": 2050
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "sycl.event",
+      "name": "k3",
+      "ts": 2100,
+      "dur": 50,
+      "args": {
+        "device": 0,
+        "queue_kind": "compute",
+        "event_id": 3,
+        "depends_on": 2,
+        "device_start_ns": 6000500,
+        "device_end_ns": 7000000,
+        "host_submit_begin_us": 2100,
+        "host_submit_end_us": 2150
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "sycl.event",
+      "name": "k4",
+      "ts": 4200,
+      "dur": 50,
+      "args": {
+        "device": 0,
+        "queue_kind": "compute",
+        "event_id": 4,
+        "device_start_ns": 10000500,
+        "device_end_ns": 11000000,
+        "host_submit_begin_us": 4200,
+        "host_submit_end_us": 4250
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "sycl.event",
+      "name": "c1",
+      "ts": 60,
+      "dur": 20,
+      "args": {
+        "device": 0,
+        "queue_kind": "copy",
+        "event_id": 11,
+        "device_start_ns": 1000000,
+        "device_end_ns": 2000000
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "sycl.event",
+      "name": "c2",
+      "ts": 5000,
+      "dur": 20,
+      "args": {
+        "device": 0,
+        "queue_kind": "copy",
+        "event_id": 12,
+        "device_start_ns": 5000000,
+        "device_end_ns": 6000000
+      }
+    }
+  ]
+}

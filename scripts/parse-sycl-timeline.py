@@ -552,6 +552,10 @@ def main(argv: list[str]) -> int:
             gap_class_totals[adjustment_class] += rounding_delta
         for gap_class in GAP_CLASS_NAMES:
             print(f"gap_class.device{device}.{queue_kind}.{gap_class}.total_ms_x1000 {gap_class_totals[gap_class]}")
+        # Magnitude of the correction above, i.e. how much gap time the class
+        # split failed to explain and had to be folded into a class.  Reported
+        # pre-correction so a rounding artifact can be told apart from signal.
+        print(f"gap_class.device{device}.{queue_kind}.rounding_delta_ms_x1000 {rounding_delta}")
 
     if args.top_gaps > 0:
         for (device, queue_kind), transitions in sorted(queue_gap_transitions.items()):
