@@ -89,6 +89,47 @@ Validation step 5 — "no predicate underestimates observed" — is the experime
 it.** Do not pre-emptively widen the predicate, and do not add a name check to special-case
 the LM head; let the instrumentation answer it.
 
+## Amendment 2 (2026-07-25, post-Task-1) — the threshold is the constant `4`
+
+**Supersedes the `max(2, n_layer / 2)` rule in Amendment 1, and cancels the `n_layer`
+signature change it assigned to Task 3.** `populate_host_zone_sizing` keeps its existing
+signature; `zone_scoped_maxima(inventory)` takes one argument.
+
+Task 1 measured the distributions:
+
+```
+GPT-OSS 20B (459 tensors, 11 groups):  2x1  24x5  48x2  72x1  73x1  96x1
+Mistral 7B  (291 tensors,  7 groups):  1x2  32x1  64x3  65x1
+```
+
+Both models show two cleanly separated populations, `{1,2}` against `{24…96}` and
+`{32…65}`. A constant threshold of `4` sits inside a 2→24 gap and a 1→32 gap respectively.
+
+The constant is not merely cheaper than `n_layer / 2` — it is **safer**:
+
+- `n_layer / 2` yields a threshold of 12 (GPT-OSS) or 16 (Mistral). A weight family present
+  in only a *subset* of blocks — SWA-only tensors, or a dense-then-MoE model whose experts
+  appear in a subset of layers — falls below that and is wrongly **excluded**, under-sizing
+  the zone. A threshold of `4` includes it. Uncertainty must resolve toward inclusion:
+  over-inclusion costs today's over-provision, under-inclusion costs a runtime grow that
+  Task 7 flags as a defect.
+- The threshold must be **≥ 3**. On GPT-OSS, `output.weight` and `token_embd.weight` share
+  both type (Q8_0) and shape (2880 × 201088) and therefore collapse into a *single group of
+  cardinality 2*. A `>= 2` rule would admit them and reclaim nothing.
+- `n_layer` cannot be safely recovered from the histogram anyway. GPT-OSS's dominant bucket
+  is 24 (`n_layer = 24`, matching), but Mistral's is 64 against `n_layer = 32`, because
+  same-shaped families merge (`attn_q` + `attn_o`). Deriving it from the mode is wrong.
+
+Task 1 also established two binding constraints on any implementation:
+
+- **`!has_shape()` must be treated as "not a per-layer weight", explicitly.** A shapeless
+  entry has `ne = {0,0,0,0}` and would otherwise group with every other shapeless entry of
+  the same type, forming a large spurious family. Both measured models had 100 % valid
+  shapes — an observation about two models, not a guarantee.
+- **Never compute a magnitude from `ne[]`.** The expert tensors are 3-D
+  (`ne[2] = 32` experts); `ne[0] × ne[1]` understates them by 32×.
+  `placement_tensor_info::size` is the authoritative byte size. `ne` is for *grouping only*.
+
 ---
 
 ## Team Topology
@@ -167,6 +208,21 @@ From `CLAUDE.md` and `docs/design/sycl-canonical-memory-architecture.md`. A task
 - **Check `dmesg` for GT resets** before believing any measurement.
 - **Never `git revert`.** Fix forward.
 - **`./scripts/sycl-build.sh -r`** is required after adding any new `.cpp` — `ggml/src/ggml-sycl/CMakeLists.txt:42` globs `*.cpp`, and a glob is only re-evaluated at configure time.
+- **Pass `-v` to `llama-bench`, always.** It installs a null log callback, so *every*
+  `GGML_LOG_INFO` — including all `[SYCL-PLAN]`, `[UNIFIED-CACHE]` and `[MOE-LAYOUT]`
+  lines — is silently discarded without it. **Every capture command written in this plan
+  omits `-v` and will return zero lines**, which is indistinguishable from "the log line
+  was never added" or "the zone did not change". Add `-v` before the `2>&1`, and confirm
+  each RED capture is *non-empty* before changing any code; an empty baseline voids the
+  before/after comparison rather than proving anything. (Found in Task 1.)
+- **`dmesg` is privilege-denied on this host**, so the GT-reset check cannot be run as
+  written. Use `journalctl -k --since "1 hour ago" --no-pager | grep -iE 'GT reset|guc_id|GPU hang|xe.*reset'`,
+  which works unprivileged.
+- **`/tmp` is tmpfs and does not survive a reboot.** Task 1's `/tmp/zone-sizing/`
+  artifacts were lost to a restart mid-plan. Evidence that a later task depends on
+  belongs in the committed findings document; an empty or missing `/tmp/zone-sizing`
+  means *not verified*, never "nothing observed" — note that End-to-End Validation step 5
+  greps exactly that directory and would otherwise pass vacuously.
 
 ---
 
