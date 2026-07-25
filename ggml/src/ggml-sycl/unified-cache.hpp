@@ -2241,9 +2241,8 @@ class unified_cache {
 
     // Reserve scratch buffers for oneDNN FP16 path.
     // Called lazily during inference from the mul_mat dispatch path, sized for the
-    // matmul at hand — NOT once at model load, despite what this comment used to
-    // claim. The timing is load-bearing: by then the VRAM arena is active with live
-    // weight leases, so ensure_planned_arena_zones() cannot rebuild it (its
+    // matmul at hand. The timing is load-bearing: by then the VRAM arena is active
+    // with live weight leases, so ensure_planned_arena_zones() cannot rebuild it (its
     // live-lease refusal correctly blocks that, and forcing eviction is forbidden).
     // weights_size: max(N*K*2) across all layers (usually FFN down: 14336*4096*2)
     // activations_size: max(M*K*2) where M=max_batch, K=max_dim

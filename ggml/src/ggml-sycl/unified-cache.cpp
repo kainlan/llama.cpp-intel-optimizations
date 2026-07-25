@@ -10266,10 +10266,12 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         size  = 0;
     };
 
-    // Set when the planned ONEDNN zone is too small for this request and the
-    // arena could not be re-planned to fit it. The reservation then grows
-    // through the unified-cache allocation path instead of failing.
-    bool arena_zone_exhausted = false;
+    // Set when the ONEDNN zone could not serve this request; the reservation then
+    // grows through the unified-cache allocation path instead of failing.
+    // arena_grow_cause records WHY, because the two causes are not equivalent — see
+    // where they are set below.
+    bool         arena_zone_exhausted = false;
+    const char * arena_grow_cause     = "";
 
     auto allocate_direct_scratch = [&](size_t size, const char * label, mem_handle & owner) -> void * {
         alloc_request req{};
@@ -10321,8 +10323,8 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
                 "[UNIFIED-CACHE] oneDNN scratch request %.1f MB (weights %.1f MB + activations %.1f MB) exceeds the "
                 "planned ONEDNN zone %.1f MB: a path-scoped sizing predicate under-estimated the oneDNN scratchpad; "
                 "growing through the unified cache\n",
-                total_needed / (1024.0 * 1024.0), weights_size / (1024.0 * 1024.0),
-                activations_size / (1024.0 * 1024.0), zone_cap / (1024.0 * 1024.0));
+                total_needed / (1024.0f * 1024.0f), weights_size / (1024.0f * 1024.0f),
+                activations_size / (1024.0f * 1024.0f), zone_cap / (1024.0f * 1024.0f));
 
             // Raise the planned zone size and ask the arena to re-plan its zones. This is
             // the same growth mechanism ensure_planned_arena_zones() already implements,
@@ -10377,17 +10379,38 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
             // Reset zone on partial failure.
             zone_reset(vram_zone_id::ONEDNN);
         }
-        // The zone cannot hold this request and could not be grown in place (live
-        // allocations prevent an arena rebuild, which ensure_planned_arena_zones()
-        // logs). Grow through the unified-cache allocation path below rather than
-        // failing the reservation: the planned size has already been raised, so a
-        // later rebuild sizes the zone correctly.
+        // Two distinct causes reach this point and they must not be conflated:
+        //
+        //   * total_needed > zone_cap — the planned zone is genuinely too small, i.e.
+        //     a path-scoped sizing predicate under-estimated. Warned about above, and
+        //     the in-place re-plan was attempted and refused (ensure_planned_arena_zones()
+        //     logs the live allocations that blocked the rebuild).
+        //   * total_needed <= zone_cap — the zone was large enough but zone_alloc could
+        //     not hand out both buffers, so the partial allocation was reset above. That
+        //     is fragmentation or allocator rounding, NOT a sizing miss, and no re-plan
+        //     was attempted for it. Counting it as an under-estimate would blame the
+        //     predicate for an allocator condition.
+        //
+        // Either way, grow through the unified-cache allocation path below rather than
+        // failing the reservation.
+        const bool zone_undersized = total_needed > zone_cap;
+        if (!zone_undersized) {
+            GGML_LOG_WARN(
+                "[UNIFIED-CACHE] oneDNN scratch sub-allocation failed with sufficient ONEDNN zone capacity "
+                "(need %.1f MB, zone %.1f MB): the zone is fragmented, not under-sized; "
+                "growing through the unified cache\n",
+                total_needed / (1024.0f * 1024.0f), zone_cap / (1024.0f * 1024.0f));
+        }
+        arena_grow_cause     = zone_undersized ? "planned zone under-estimated" : "zone fragmented";
         arena_zone_exhausted = true;
     }
     direct_attempt = true;
 
-    // Sub-allocate from the arena zone unless the zone is known to be too small for
-    // this request; on the growth path every buffer comes from unified_alloc().
+    // Precondition of the zone_alloc branches below. It is in fact always false as the
+    // code stands: an active arena either returns above after sub-allocating, or sets
+    // arena_zone_exhausted. Stated explicitly so those branches carry their own
+    // precondition instead of depending on that reachability argument, and so every
+    // buffer allocated below is visibly a unified_alloc() one.
     const bool use_arena_zone = arena_active() && !arena_zone_exhausted;
 
     // Free existing if resizing — subtract old sizes from budget first.
@@ -10478,9 +10501,9 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
 
     if (arena_zone_exhausted) {
         GGML_LOG_INFO(
-            "[UNIFIED-CACHE] oneDNN scratch grown outside the ONEDNN zone: weights=%.1f MB, "
+            "[UNIFIED-CACHE] oneDNN scratch grown outside the ONEDNN zone (%s): weights=%.1f MB, "
             "activations=%.1f MB\n",
-            weights_size / (1024.0f * 1024.0f), activations_size / (1024.0f * 1024.0f));
+            arena_grow_cause, weights_size / (1024.0f * 1024.0f), activations_size / (1024.0f * 1024.0f));
     }
     GGML_SYCL_DEBUG("[UNIFIED-CACHE] Reserved oneDNN scratch: weights=%.1f MB, activations=%.1f MB\n",
                     weights_size / (1024.0f * 1024.0f), activations_size / (1024.0f * 1024.0f));
