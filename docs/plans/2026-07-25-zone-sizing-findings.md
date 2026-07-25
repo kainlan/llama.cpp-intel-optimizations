@@ -4,6 +4,11 @@ Ground-truth measurements produced by the tasks in
 `docs/plans/2026-07-25-sycl-path-scoped-zone-sizing.md`. No task in that plan may
 quote a byte figure that does not appear in this document.
 
+**Units:** every figure labelled `MB` here is binary — bytes ÷ 1024², i.e. a MiB.
+The label matches the `[SYCL-PLAN]` log lines it is quoted from and the `MB`
+convention used throughout `ggml/src/ggml-sycl/unified-cache.cpp`; the few places
+that spell it `MiB` are the same unit, not a different one.
+
 ---
 
 ## Task 1 — Inventory

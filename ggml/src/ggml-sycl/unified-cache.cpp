@@ -16889,17 +16889,15 @@ static void populate_host_zone_sizing(placement_plan &                          
     // reach the paths being sized. One line, at plan time only.
     {
         std::vector<const placement_tensor_info *> ranked;
+        size_t                                     inventory_total = 0;
         ranked.reserve(tensor_inventory.size());
         for (const auto & item : tensor_inventory) {
             ranked.push_back(&item);
+            inventory_total += item.size;
         }
         std::partial_sort(
             ranked.begin(), ranked.begin() + std::min<size_t>(8, ranked.size()), ranked.end(),
             [](const placement_tensor_info * a, const placement_tensor_info * b) { return a->size > b->size; });
-        size_t inventory_total = 0;
-        for (const auto & item : tensor_inventory) {
-            inventory_total += item.size;
-        }
         std::string top;
         for (size_t i = 0; i < std::min<size_t>(8, ranked.size()); ++i) {
             char entry[256];
@@ -16938,6 +16936,16 @@ static void populate_host_zone_sizing(placement_plan &                          
         std::sort(by_key.begin(), by_key.end(), key_less);
 
         // Sorted, so a run of entries that do not compare less than each other is one group.
+        //
+        // The 4 in the `card >= 4` bucket below is NOT a free diagnostic choice: it is the
+        // per-layer-family threshold finalized for the structural predicate in
+        // docs/plans/2026-07-25-sycl-path-scoped-zone-sizing.md (Amendment 2), from the measured
+        // distributions in docs/plans/2026-07-25-zone-sizing-findings.md. The `card <= 2` bucket is
+        // its complement, sized to keep an untied, identically shaped embd/output pair (which
+        // collapses into one group of cardinality 2) on the vocab side. This histogram is exactly
+        // what that predicate gets validated against, so the two must move together: if the
+        // predicate's threshold changes, change these cutoffs with it, or this line keeps reporting
+        // against a threshold the code no longer uses and the validation silently means nothing.
         std::vector<size_t>           cardinalities;
         const placement_tensor_info * largest_rare        = nullptr;  // cardinality <= 2: vocab candidates
         size_t                        largest_rare_card   = 0;
