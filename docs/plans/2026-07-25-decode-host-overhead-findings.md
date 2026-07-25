@@ -220,3 +220,282 @@ VERDICT: Task 6 quotes against the profiled baseline of 46.88 tok/s
 >    the series). The 2.8 % overhead ratio is *not* provisional.
 > 2. **The graph-on `wall_ms` derivation is superseded** — Task 5 measures its own
 >    baseline with replay off (`llama.cpp-3rzr`).
+
+---
+
+## Task 5 — Trace capture
+
+**Outcome: the capture FAILED its span assertion, in both arms, for a reason
+neither the plan nor the tracker overrides anticipated.** No attribution is
+presented below, because none is supportable from these artifacts. What *is*
+presented is the root cause, the measurements that survive, and a corrected
+per-token budget derived from a different instrument that did work.
+
+### Configuration
+
+| item | value |
+|---|---|
+| Card | Arc Pro B70, `level_zero:0`, PCI `0000:03:00.0` |
+| Model | `/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf` |
+| Binary under test | **`baaf652e1` (build 12145)** — identical for all runs |
+| Repo HEAD at capture | `f8ec00b93` (binary is one commit behind; `f8ec00b93` touched only `scripts/parse-sycl-timeline.py` and a test, and the parser runs from the working tree, so it is current) |
+| Free VRAM | **32600.7 MB** on every capture run, 32598.5 MB on the two `-p 0` baseline runs — matches the ~32.6 GB expectation |
+| Load (1 min) | 8.5 – 10.1 across the series (Frigate ffmpeg only; no ninja/icpx) |
+| Guards | `GGML_SYCL_OP_TIMEOUT_MS=180000`, `timeout` on every GPU command |
+
+Run artifacts: `/tmp/decode-attrib/` (not committed; tmpfs, will not survive a reboot).
+
+**Kernel log, before and after.** `journalctl -k` (`dmesg` is privilege-denied).
+Before: resets at 18:19 and 19:24, both on `0000:07:00.0` (the **B50**) —
+`class=ccs guc_id=10` attributed to `codescout.real`, each followed by a benign
+`bcs guc_id=0 in no process [-1]` that reported `reset done`. After (first GPU run
+19:45, last 19:50): **no new reset of any kind, and none ever on `0000:03:00.0`**.
+The B70 numbers are valid.
+
+### The assertion, verbatim, on both captures
+
+Run with the lead's script against `traceEvents` (Chrome format — a parse keyed on
+`events` returns 0 and looks identical to an empty capture):
+
+```
+primary   (GGML_SYCL_DISABLE_GRAPH=1)     graph_compute_impl: 1 | compute_forward: 460 | total: 3417
+secondary (GGML_SYCL_DISABLE_GRAPH unset) graph_compute_impl: 1 | compute_forward: 460 | total: 3417
+```
+
+Expected for the primary: ≈129 spans (128 decode steps + 1 warmup). Observed: 1.
+**Per the tracker override, this is a failed capture, not a result.**
+
+The two arms are **identical to the event** — same span count, same op count, same
+total. `GGML_SYCL_DISABLE_GRAPH` changed the artifact by exactly nothing. The
+startup log confirms the variable was applied and differed between them
+(`GGML_SYCL_DISABLE_GRAPH: 1` vs `GGML_SYCL_DISABLE_GRAPH: 0`), and the trap in the
+tracker was respected — the secondary ran under `env -u GGML_SYCL_DISABLE_GRAPH`,
+never `=0`, so `fattn.cpp:3649`'s presence-based read stayed off.
+
+### Root cause: the flush is one-shot, and it fires on the first decode step
+
+Graph replay is **not** the limiting mechanism. `sycl_timeline_flush`
+(`ggml/src/ggml-sycl/sycl-timeline.cpp:461-486`) writes the file at most once —
+`if (... || state.successful_file_flushes > 0) { return; }` — and it is called at
+`ggml/src/ggml-sycl/ggml-sycl.cpp:92600-92606`:
+
+```cpp
+if (cached_is_decode && !g_ggml_sycl_graph_recording) {
+    ...
+    if (ggml_sycl::sycl_timeline_enabled()) {
+        ggml_sycl::sycl_timeline_flush("decode-teardown");
+    }
+}
+```
+
+So the file is written at the end of the **first non-recording decode step** and
+never again. Spans keep accumulating in memory for every later step —
+`sycl_timeline_record_span_for_step` has no flush guard — but nothing ever writes
+them. The artifact is structurally incapable of holding more than one decode step,
+under any value of `GGML_SYCL_DISABLE_GRAPH`.
+
+The trace's own shape confirms this exactly. In `primary-decode`:
+
+| window | contents |
+|---|---|
+| 5.550 s before the graph span | 1959 `sycl.submit`, 2 `sycl.wait` (weight staging during load) |
+| the single graph span (`dur` 440633 µs, `nodes=1374`) | 1 `ggml.graph`, 920 `ggml.op`, 532 `sycl.submit`, 3 `sycl.wait` |
+| after the graph span | **nothing — 0 events** |
+
+The last event in the file ends 57 µs *before* the graph span ends. That is the
+flush firing inside the step, just ahead of the scope destructor at `:78660` — which
+is also why the one captured step is the 440 ms first-token step (first-use weight
+materialization), not a steady-state ~20 ms one.
+
+**Correction to the tracker's diagnosis.** Comment `c-4or8` reasoned from
+`graphs reused = 384` to "SYCL graph replay bypassed the instrumented path". That
+counter is llama.cpp's own ggml-graph reuse, not SYCL command-graph replay: this
+session's `-p 0 -n 128` run reports `graphs reused = 128` **with
+`GGML_SYCL_DISABLE_GRAPH=1` set**. The reasoning in `c-duci` about replay bypassing
+`compute_impl` is correct as code description, but it is not what caps these traces.
+The de-risking step ("this approach will actually work") did not hold, and the
+assertion the same comment mandated is what caught it.
+
+### A second, independent failure: zero device events on the decode path
+
+```
+timeline.wall_ms_x1000              5990322
+timeline.gpu_event_total_ms_x1000         0
+timeline.gpu_event_coverage_pct_x1000     0
+timeline.unattributed_ms_x1000      5990322
+```
+
+(`primary-decode`; `secondary-decode` is the same with wall 6019827.) The decode
+traces contain **no `sycl.event` entries at all**, so the profiler explains 0.00 %
+of the wall and `unattributed` is trivially 100 %. This is not the ~15.2 % coverage
+the plan expected. Device events do appear on the prompt path — the `-p 512` run
+below has 1353 of them, 64.198 ms of device busy — so the emitters exist but none of
+them are on the decode path.
+
+`--wall-ms` was set to each trace's **own host-clock envelope** (5990.322 ms /
+6019.827 ms), which is the only value that describes the population actually
+present: 5.5 s of load-time staging plus one 440 ms first-token step. It is
+deliberately **not** derived from tok/s — the trace holds neither 128 tokens nor
+any steady-state token, so `128 / R × 1000` would have described a population that
+is not in the file. That is the same class of error the tracker override caught in
+the plan, one level down.
+
+**Also note for whoever fixes the parser:** the parser's fallback envelope
+(`parse-sycl-timeline.py:532`, used when `--wall-ms` is omitted) spans *all* events
+including `sycl.event`, whose timestamps are on the device clock, a different epoch.
+On the `-p 512` trace that yields `timeline.wall_ms_x1000 32493029089` — a 9-hour
+"wall time" for a 6-second run. Always pass `--wall-ms` explicitly. Track A is
+closed, so this is recorded, not fixed.
+
+### Why the script could not be used as written
+
+`scripts/sycl-gptoss-decode-timeline-profile.sh` benches `-p 512 -n 128`. The
+prompt test runs first, so the one-shot flush fires on the *first token of the tg
+test* and the file ends there. The script run (`/tmp/decode-attrib/primary/`)
+produced 2 `graph_compute_impl` spans, both from the pp512 phase, and 1534
+`compute_forward` — a trace of prompt processing, filed as a decode trace.
+
+The script's bench args are hardcoded and this task may not modify it, and its
+hardcoded `GGML_SYCL_TIMELINE_TOKEN_START=1` cannot be overridden from the
+environment (the script's own `env` assignment wins), so windowing to decode was
+not available either. The decode captures were therefore run by invoking
+`llama-bench` directly with the script's **exact** env block and `-p 0 -n 128 -r 1
+-v` — the same command Task 4 measured. `GGML_SYCL_TIMELINE_MAX_EVENTS=4000000` was
+added because the 200000 default would truncate a full 129-step decode; it turned
+out not to bind, since the flush stops the file long before.
+
+### Commands (exact)
+
+Primary (`GGML_SYCL_DISABLE_GRAPH=1`); the secondary is identical with
+`env -u GGML_SYCL_DISABLE_GRAPH` in place of the `=1`:
+
+```bash
+source /opt/intel/oneapi/setvars.sh --force
+timeout 1800 env GGML_SYCL_OP_TIMEOUT_MS=180000 \
+  ONEAPI_DEVICE_SELECTOR=level_zero:0 \
+  GGML_SYCL_DISABLE_GRAPH=1 \
+  GGML_SYCL_TIMELINE=timeline+events \
+  GGML_SYCL_TIMELINE_OUTPUT=/tmp/decode-attrib/primary-decode/sycl-timeline.json \
+  GGML_SYCL_TIMELINE_TOKEN_START=1 \
+  GGML_SYCL_TIMELINE_MAX_EVENTS=4000000 \
+  GGML_SYCL_KERNEL_PROFILE=1 \
+  GGML_SYCL_KERNEL_PROFILE_OUTPUT=/tmp/decode-attrib/primary-decode/sycl-kernels \
+  GGML_SYCL_KERNEL_PROFILE_FORMAT=both GGML_SYCL_KERNEL_PROFILE_RAW=1 \
+  GGML_SYCL_KERNEL_PROFILE_TOP_N=80 GGML_SYCL_KERNEL_PROFILE_FLUSH=window \
+  GGML_SYCL_MOE_PHASE_MATERIALIZE=1 GGML_SYCL_MOE_PHASE_BULK_XMX=1 GGML_SYCL_MOE_DOWN_SUM_DIRECT=1 \
+  ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+    -ngl 99 -fa 1 -p 0 -n 128 -r 1 -v \
+  >/tmp/decode-attrib/primary-decode/bench.stdout \
+  2>/tmp/decode-attrib/primary-decode/bench.stderr
+
+# parses (W = that trace's own host-clock envelope)
+python3 scripts/parse-sycl-timeline.py --wall-ms 5990.322 \
+  /tmp/decode-attrib/primary-decode/sycl-timeline.json \
+  >/tmp/decode-attrib/primary-decode/timeline.parse
+python3 scripts/parse-sycl-timeline.py --top-gaps 20 --top-host-gap-overlaps 40 \
+  --wall-ms 5990.322 /tmp/decode-attrib/primary-decode/sycl-timeline.json \
+  >/tmp/decode-attrib/primary-decode/timeline.gaps.parse
+python3 scripts/parse-sycl-kernel-profile.py \
+  /tmp/decode-attrib/primary-decode/sycl-kernels.csv \
+  >/tmp/decode-attrib/primary-decode/kernels.parse
+```
+
+Artifacts: `/tmp/decode-attrib/{primary-decode,secondary-decode,primary}/` —
+`sycl-timeline.json`, `timeline.parse`, `timeline.gaps.parse`, `sycl-kernels.csv`,
+`kernels.parse`, `cost-ranking.parse`, `bench.std{out,err}`.
+
+### Re-measured baselines (B70, `-p 0 -n 128`, `-r 3`, no profiler)
+
+Both arms re-measured on the capture binary. Task 4's 46.88 tok/s is **not** reused
+anywhere below.
+
+| arm | tg128 tok/s | sd | ms/token | free VRAM |
+|---|---:|---:|---:|---:|
+| graph replay ON (`env -u`, log `GGML_SYCL_DISABLE_GRAPH: 0`) | **48.3799** | 0.0655 | 20.670 | 32598.5 MB |
+| graph replay OFF (`=1`, log `GGML_SYCL_DISABLE_GRAPH: 1`) | **48.8345** | 0.2426 | 20.477 | 32598.5 MB |
+
+Disabling graph replay costs **−0.94 %** on TG here (it is nominally *faster*, well
+inside the spread). At `-p 512 -n 128 -r 3`: 1434.73 / 49.18 with replay on,
+1418.41 / 49.01 with it off. The graph-off path is not a materially different
+performance regime on this model, which is consistent with the plan's original
+32.48-vs-32.81 observation — but, as established above, it is also not a different
+*observability* regime, which is what this task needed.
+
+**Profiler overhead is far larger here than Task 4's 2.84 %**: the profiled capture
+runs measured 43.30 (graph off) and 42.59 (graph on) tok/s, i.e. **11.3 % / 12.0 %**
+below their clean arms. Task 4's profiled arm set `GGML_SYCL_TIMELINE` only; these
+runs also carry the script's `GGML_SYCL_KERNEL_PROFILE=1` block, which forces
+per-kernel device profiling. Task 4's 2.84 % figure does not cover this
+configuration and must not be applied to it.
+
+### Corrected per-token budget and Amdahl ceiling
+
+The timeline could not supply this, but the **kernel profiler is not subject to the
+one-shot flush** and did cover the whole decode: its counts are exactly
+129 × per-step (e.g. `mxfp4.gateup.xmx_tiled_dpas_m2` count 3096 = 24 layers ×
+129 steps). Summing `total_ns` over all 12 kernels:
+
+| capture | device busy total | per step |
+|---|---:|---:|
+| primary-decode (graph off) | 662.587 ms | **5.136 ms** |
+| secondary-decode (graph on) | 662.679 ms | **5.137 ms** |
+
+Agreement to 0.02 % across the two arms — further evidence replay changes nothing
+about the device-side work.
+
+Against the clean **shipping** path (graph replay ON, 20.670 ms/token):
+
+| quantity | plan's premise | **measured** |
+|---|---|---|
+| total token time | (implied ~26 ms) | **20.670 ms** |
+| device-busy | — | **5.136 ms** |
+| non-kernel | ~22 ms | **15.533 ms** |
+| non-kernel share | ~84 % | **75.2 %** |
+
+The plan's ~22 ms is not reachable: it exceeds the whole 20.7 ms token. As the
+tracker override anticipated, the figure most likely came from a `-p 512 -n 128`
+token (~22.9 ms at 43.6 tok/s) with the non-kernel share taken as the residual of
+~15 % device coverage. Even on that basis it would be ~17.8 ms and ~78 %, not 22 ms
+and 84 %.
+
+**Restated Amdahl ceiling**, from the measured 5.136 ms device floor:
+
+- Eliminating **all** host time: 194.7 tok/s = **4.02×**. Unreachable, and it is a
+  bound on the whole class of work, not a target.
+- Eliminating **half** the non-kernel budget: 77.5 tok/s = **1.60×**.
+- The plan's **+19 %** target needs 3.300 ms/token removed — **21.2 %** of the
+  non-kernel budget.
+
+So the headroom is real and large, and +19 % is not an unreasonable ask of it. What
+is *not* established is where inside the 15.533 ms it sits: that was this task's
+question, and these artifacts cannot answer it.
+
+⚠ **The 5.136 ms device figure comes from the profiled runs.** If per-kernel
+profiling inflates kernel durations, kernel time is overstated and the non-kernel
+budget is correspondingly *understated* — 75.2 % is a conservative floor, not a
+ceiling. It is also a sum over per-kernel `total_ns` on a single in-order compute
+queue; it would overcount if work were concurrent across queues.
+
+### What Task 6 must not do
+
+1. **Do not attribute anything from these traces.** The primary failed its span
+   assertion, device coverage is 0 %, and the one step actually captured is the
+   440 ms first-token step — the least representative step in the run.
+2. **Do not carry `~22 ms` or `~84 %` forward.** Use 15.533 ms / 75.2 %, or restate
+   from measurement.
+3. **The `host_overlap` caveat from the tracker still stands, and is stronger than
+   stated.** It was argued from graph replay skipping the per-op host path. That
+   argument is wrong in its mechanism (see above), but the conclusion is unchanged
+   for a different reason: there is no decode-path gap-class measurement here at
+   all, in either arm.
+
+**To make this measurable**, one of the following has to change first — all are
+source changes, out of scope for Task 5 and for closed Track A:
+
+- make `sycl_timeline_flush` re-entrant, or move the decode-teardown flush to
+  process/context teardown so the buffer is written once at the end rather than
+  once at the beginning;
+- and emit `sycl.event` device events on the decode path, without which coverage is
+  0 % however many steps are captured;
+- optionally, honour `GGML_SYCL_TIMELINE_TOKEN_START`/`_COUNT` as a decode-step
+  window so a steady-state slice can be isolated without buffering all 128 steps.
