@@ -273,14 +273,34 @@ the original over-provision, but so is reinstating it.
 
 ### Known limits (load-bearing — read before changing any of this)
 
-1. **The 256 MB ONEDNN floor is currently masking a real under-estimate of up to
-   ~2×.** `llama.cpp-2wgg` records Mistral 7B Q4_0 planning 63.0 MB against
-   observed reservation requests of 112.0 / 112.4 MB, with nothing firing because
-   the floor absorbs it. The root cause is the multiplier, not the classifier:
-   the oneDNN weights reorder holds a **dequantized f16 copy**, so
-   `2 × onednn_eligible` ignores format expansion — 112.0 / 31.5 = 3.5556 is
-   exactly Q4_0's 4.5 bits/weight going to f16's 16. **Do not lower the floor
-   until 2wgg is fixed.**
+1. **The 256 MB ONEDNN floor is currently masking a real under-estimate.** Three
+   different ratios are in play here and they are not the same quantity — keep
+   them apart:
+
+   - **How much the floor can hide is `256 MB / planned`, so it is
+     model-dependent, not a fixed factor.** On Mistral (planned 63.0 MB) the
+     floor covers requests up to roughly **4×** the plan. On GPT-OSS the planned
+     268.9 MB already exceeds the floor, so the zone is *raised* above it and the
+     floor hides nothing at the planned size; the **~2×** figure recorded during
+     T6 comes from that task's forced-halving experiment, where a plan cut to
+     134.5 MB still sits under the 256 MB floor and the error stays invisible.
+   - **The measured error today is ~1.78×** — `llama.cpp-2wgg` records Mistral 7B
+     Q4_0 planning 63.0 MB against observed reservation requests of 112.0 /
+     112.4 MB. Nothing fires, because the floor absorbs it.
+   - **The root cause is a 3.5556× format expansion**, which is why this is a
+     wrong *multiplier shape* rather than a wrong tensor choice. The oneDNN
+     weights reorder holds a **dequantized f16 copy**, so the weights half alone
+     needs 112.0 / 31.5 = 3.5556× the stored size — exactly Q4_0's 4.5
+     bits/weight going to f16's 16. The plan's `2 × onednn_eligible` covers part
+     of that (3.5556 / 2 = 1.78, the measured error), but the 2× was meant to buy
+     weights *plus* an activations buffer, so it is not a coincidence to be tuned
+     away. **3.5556× is the expansion, not the error magnitude — do not quote it
+     as the size of the miss.**
+
+   The classifier picks the right tensor; the multiplier applied to it ignores
+   format expansion. **Do not lower the floor until 2wgg is fixed** — while it
+   stands, `zone_sizing_underestimate_count("onednn") == 0` is uninformative
+   about this defect and will stay zero even after it is confirmed.
 2. **GPT-OSS never enters `reserve_onednn_scratch`** (observations = 0 on every
    run, including prompt processing) — its MoE work goes through a separate
    PP-MoE oneDNN ring. The grow path and its counters are exercised only by dense
