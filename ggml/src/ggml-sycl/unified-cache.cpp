@@ -16882,6 +16882,36 @@ static void populate_host_zone_sizing(placement_plan &                          
     for (const auto & item : tensor_inventory) {
         plan.max_tensor_bytes = std::max(plan.max_tensor_bytes, item.size);
     }
+
+    // Every zone below is sized from a maximum over this inventory, so which
+    // tensors win those maxima is load-bearing. Nothing reported it before, and
+    // the sizing was assumed to be dominated by tensors that in fact never
+    // reach the paths being sized. One line, at plan time only.
+    {
+        std::vector<const placement_tensor_info *> ranked;
+        ranked.reserve(tensor_inventory.size());
+        for (const auto & item : tensor_inventory) {
+            ranked.push_back(&item);
+        }
+        std::partial_sort(
+            ranked.begin(), ranked.begin() + std::min<size_t>(8, ranked.size()), ranked.end(),
+            [](const placement_tensor_info * a, const placement_tensor_info * b) { return a->size > b->size; });
+        size_t inventory_total = 0;
+        for (const auto & item : tensor_inventory) {
+            inventory_total += item.size;
+        }
+        std::string top;
+        for (size_t i = 0; i < std::min<size_t>(8, ranked.size()); ++i) {
+            char entry[256];
+            std::snprintf(entry, sizeof(entry), "%s%s=%.1fMB(t%d,%lldx%lld)", i ? " " : "", ranked[i]->name.c_str(),
+                          ranked[i]->size / (1024.0 * 1024.0), static_cast<int>(ranked[i]->type),
+                          static_cast<long long>(ranked[i]->ne[0]), static_cast<long long>(ranked[i]->ne[1]));
+            top += entry;
+        }
+        GGML_LOG_INFO("[SYCL-PLAN] inventory top-8 of %zu tensors (total %.1f MB): %s\n", tensor_inventory.size(),
+                      inventory_total / (1024.0 * 1024.0), top.c_str());
+    }
+
     for (const auto & entry : plan.entries) {
         plan.max_staging_pair_bytes =
             std::max(plan.max_staging_pair_bytes, entry.src_size + std::max(entry.dst_size, entry.src_size));
