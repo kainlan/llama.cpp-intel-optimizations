@@ -14,72 +14,113 @@ showed no GT reset, GuC error, or engine fault before, during, or after the sess
 ## 1. Bottom line
 
 **The B70's measured improvement is fully explained by VRAM headroom. The T3/T4 capability
-fix contributed nothing measurable to it, and by mechanism it could not have.**
+fix contributed nothing measurable to GPT-OSS decode.**
 
-Two independent lines of evidence agree:
+Three independent lines of evidence agree:
 
-1. **Direct experiment.** Reproducing the confounded VRAM budget on the *current* binary
+1. **VRAM reproduction.** Reproducing the confounded VRAM budget on the *current* binary
    (`GGML_SYCL_VRAM_BUDGET_PCT=42`) drops the B70 to **pp512 594.69 / tg128 15.65** — *below*
    the historical pre-fix confounded baseline of 803.93 / 19.79. The VRAM mechanism alone
    spans a larger range than the entire observed gain, leaving no residual for the
    capability fix to explain.
 
-2. **Mechanism.** The capability fix changes `XMXConfig`, which is consumed only by the
-   unified kernel. The unified kernel **never executes** for this model — it appears in
-   neither the decode nor the prompt-processing kernel profile, despite being instrumented
-   at 32 sites. The kernel that dominates decode lives in `mmvq.cpp`, which contains **zero**
-   references to `XMXConfig`, `supports_esimd_dpas`, or GPU family.
+2. **Reversing the fix's own gate changes nothing.** `GGML_SYCL_UNIFIED_KERNEL=0` forces
+   `is_unified_kernel_enabled_for_device()` false at all three of its production call sites —
+   exactly the state T3 changed. Throughput does not move: **tg128 36.87 ± 2.86 vs
+   37.69 ± 2.89**, pp512 within the same overlap. This is a direct test of the fix's effect,
+   and it is null.
 
-The separate and more useful finding is **what actually limits the B70**: GPU kernel
-execution is only ~15–19% of a decode token. The B70 completes its MoE kernel work
-**2.32x faster** than the B50 yet delivers only **1.20x** the decode throughput, because
-both cards carry a per-token cost of roughly 22 ms that is not kernel execution.
-Kernel-level tuning — tile shapes, occupancy, the 256-CU hypothesis — is optimizing the
-small end of the token.
+3. **Mechanism.** The capability fix changes `XMXConfig`, consumed only by the unified
+   kernel. The unified kernel **never executes** for this model — it appears in neither the
+   decode nor the prompt-processing profile despite being instrumented at 14
+   `ggml_sycl_profile_submit` sites. The kernel that dominates decode lives in `mmvq.cpp`,
+   which contains **zero** references to `XMXConfig`, `supports_esimd_dpas`, or GPU family
+   (verified against the live 23,216-line file, not the index — see §2.0).
+
+**What actually limits the B70:** GPU kernel execution is only ~15–19% of a decode token.
+The B70 completes its MoE kernel work **2.32x faster** than the B50 yet delivers only
+**1.20x** the decode throughput, because both cards carry a per-token cost of roughly 22 ms
+that is not kernel execution. Kernel-level tuning — tile shapes, occupancy, the 256-CU
+hypothesis — is optimizing the small end of the token.
+
+**A separate, actionable finding (§4.4): `GGML_SYCL_UNIFIED_FORCE_LEGACY=1` is worth
++21.8% tg128 on the B70**, with both correctness gates passing and run-to-run variance
+collapsing 9x. It buys this **without changing GPU kernel time at all** (662.56 vs 663.87 ms
+captured) — the entire saving comes out of the ~22 ms/token non-kernel cost above. That is
+independent of the capability fix, does not reproduce on the B50, and is the most valuable
+lead this task produced.
 
 ---
 
-## 2. Method corrections (read before reusing the documented knobs)
+## 2. Tooling caveat and knob semantics
 
-### 2.1 `GGML_SYCL_UNIFIED_FORCE_LEGACY` does not exist
+### 2.0 The codescout index under-reports inside the large SYCL files — verify with `grep`
 
-It is documented in four places — `CLAUDE.md:432`, `docs/backend/sycl-env-vars.md:22`,
-`docs/backend/sycl-perf-baselines.md:17`, `AGENTS.md:449` and `:514` — but **there is no
-`getenv` site anywhere in the tree**. The only source occurrence is a comment in
-`ggml/src/ggml-sycl/l144i-probe.hpp:12`. Setting it does nothing. The
-`docs/backend/sycl-perf-baselines.md:17` row that attributes "PP512 (legacy) ~159" to it is
-therefore unreproducible as written.
+**An earlier revision of this document asserted that `GGML_SYCL_UNIFIED_FORCE_LEGACY` had no
+`getenv` site and that `is_unified_kernel_enabled_for_device()` had no production callers.
+Both were false.** They came from `search_text` / `find_references`, which silently returned
+zero hits inside `ggml-sycl.cpp` (94,013 lines) — a file that in fact contains two
+`FORCE_LEGACY` hits and three calls to that gate. The same trap has now caught several
+readers of this backend independently.
 
-### 2.2 Its nearest real equivalent is also inert in production
+**Rule: any "X does not exist" or "X has no callers" claim about `ggml-sycl.cpp` (94k lines)
+or `mmvq.cpp` (23k lines) must be verified with `cat <file> | grep -n` against the live
+file, or `strings` against the built object, before it is written down.** The index is fine
+for finding *where* something is; it is not trustworthy for proving absence. Note also that
+the include is path-prefixed (`#include "ggml-sycl/dispatch.hpp"`), so bare-filename
+searches miss it.
 
-`GGML_SYCL_UNIFIED_KERNEL` is read at exactly one place, `dispatch.hpp:109`, inside
-`is_unified_kernel_enabled()`. That function's only caller is
-`is_unified_kernel_enabled_for_device()` (`dispatch.hpp:210`), whose only callers in the
-whole repository are two tests (`ggml/src/ggml-sycl/tests/test-esimd-dpas-gate.cpp`,
-`tests/test-dispatch.cpp`). **The entire `dispatch.hpp` gate is dead code at runtime.**
+Every absence claim remaining in this document has been re-verified that way.
 
-This matters beyond the missing knob: the gate that T3 fixed — `cfg.supports_esimd_dpas`
-reaching `is_unified_kernel_enabled_for_device()` — is not on the live dispatch path. The
-framing in the task description and in `dispatch.hpp`'s own comment block ("we disable the
-unified kernel entirely on hardware that doesn't support ESIMD dpas") does not describe
-what the running code does.
+### 2.1 `GGML_SYCL_UNIFIED_FORCE_LEGACY` — live, and the strongest lever found
 
-The A/B was run anyway before this was established, and serves as a **control**:
+`ggml/src/ggml-sycl/ggml-sycl.cpp:51353-51354`, inside the MUL_MAT body:
+
+```c
+// Set GGML_SYCL_UNIFIED_FORCE_LEGACY=1 to bypass unified kernel entirely.
+static bool force_legacy = (std::getenv("GGML_SYCL_UNIFIED_FORCE_LEGACY") != nullptr);
+```
+
+**Semantics discrepancy worth knowing:** the test is `!= nullptr`, so *any* value enables the
+bypass — including `GGML_SYCL_UNIFIED_FORCE_LEGACY=0`. The docs' `=1` spelling implies a
+value check that does not exist. Anyone exporting it as `0` to disable it will get the
+opposite of what they intend. See §4.4 for what this flag is worth.
+
+### 2.2 `GGML_SYCL_UNIFIED_KERNEL` — live, and the direct test of T3's fix
+
+Read at exactly one place, `dispatch.hpp:109`, inside `is_unified_kernel_enabled()`, which
+feeds `is_unified_kernel_enabled_for_device()` (`dispatch.hpp:210`). That gate has **three
+production call sites** in live dispatch logic:
+
+| site | context |
+|---|---|
+| `ggml-sycl.cpp:48185` | `(unified_type_candidate && is_unified_kernel_enabled_for_device(device)) \|\| onednn_pp_candidate` |
+| `ggml-sycl.cpp:48513` | `unified_enabled = allow_unified && ... && is_unified_kernel_enabled_for_device(ctx_.device) && should_use_unified(...)` |
+| `ggml-sycl.cpp:51704` | ESIMD unified path, gated together with the non-COALESCED layout check |
+
+`GGML_SYCL_UNIFIED_KERNEL=0` therefore forces exactly the state T3's fix moved the B70 out
+of, which makes the A/B below **a real experiment, not a control** — and its null result is
+positive evidence for this document's conclusion:
 
 | B70, clean card, 4 runs x 5 reps each | pp512 mean | tg128 mean |
 |---|---:|---:|
-| default | 1396.82 ± 41.46 | 37.69 ± 2.89 |
-| `GGML_SYCL_UNIFIED_KERNEL=0` | 1310.66 ± 55.20 | 36.87 ± 2.86 |
+| default (unified path enabled by T3's fix) | 1396.82 ± 41.46 | 37.69 ± 2.89 |
+| `GGML_SYCL_UNIFIED_KERNEL=0` (fix's effect reversed) | 1310.66 ± 55.20 | 36.87 ± 2.86 |
 
-The distributions overlap, as the code requires. A normalized diff of the full `-v` logs
-shows zero structural difference between the two configurations — identical layout tallies,
-identical 24/24 `down=mxfp4_i8`, identical cache and KV placement.
+The distributions overlap on both axes. A normalized diff of the full `-v` logs shows zero
+structural difference — identical layout tallies, identical 24/24 `down=mxfp4_i8`, identical
+cache and KV placement.
 
-### 2.3 The knob that does work
+**T3's fix is live and was verified on hardware** (its gate's diagnostic printed once on the
+pre-fix B70 and went 1 -> 0 after). It is simply worth nothing measurable on this workload.
+Note that this knob and `FORCE_LEGACY` are *not* equivalent: §4.4 shows they act at
+different points and produce very different results.
 
-`GGML_SYCL_VRAM_BUDGET_PCT` is live (`unified-cache.cpp:8083`, `:9747`, `:9903`) and prints
-a verifiable `[UNIFIED-CACHE] Budget override via GGML_SYCL_VRAM_BUDGET_PCT=N%` line. All
-budget results below were confirmed against that line plus the reported free-VRAM figure.
+### 2.3 `GGML_SYCL_VRAM_BUDGET_PCT`
+
+Live (`unified-cache.cpp:8083`, `:9747`, `:9903`), and prints a verifiable
+`[UNIFIED-CACHE] Budget override via GGML_SYCL_VRAM_BUDGET_PCT=N%` line. All budget results
+below were confirmed against that line plus the reported free-VRAM figure.
 
 ---
 
@@ -159,26 +200,80 @@ crossing of the host-spill cliff**, with a modest additional contribution from (
 **There is no residual gain left to attribute to the capability fix.** Its contribution is
 not distinguishable from zero by this experiment.
 
-### 4.3 Why it could not have contributed — mechanism
+### 4.3 Why it did not contribute — mechanism
 
 The capability fix (`f03af88fc`, "derive GPU family from architecture in XMXConfig") changes
-`XMXConfig::from_device()`. Two facts close the question:
+`XMXConfig::from_device()`. The fix is live and was verified on hardware — its gate's
+diagnostic printed on the pre-fix B70 and stopped after. But it does not reach the work that
+matters here:
 
 - **`mmvq.cpp` — which owns the dominant decode kernel — has zero references to
   `XMXConfig`, `supports_esimd_dpas`, `family_from_device`, or `sycl_gpu_family`.** The MoE
   ESIMD kernels there select their path without consulting the family classification at all.
-- **The unified kernel never runs.** It is instrumented at 32 `ggml_sycl_profile_label` /
-  `ggml_sycl_profile_submit` sites in `unified-kernel.cpp`, yet **no unified-kernel entry
-  appears in either the decode or the prompt-processing profile**. Its absence is a real
-  observation, not an instrumentation gap.
+  (Verified with `cat mmvq.cpp | grep -n` over all 23,216 lines, per §2.0.)
+- **The unified kernel never runs.** It is instrumented at 14 `ggml_sycl_profile_submit`
+  sites in `unified-kernel.cpp`, yet **no unified-kernel entry appears in either the decode
+  or the prompt-processing profile**. Its absence is a real observation, not an
+  instrumentation gap.
+- **Reversing the gate directly changes nothing** (§2.2): `GGML_SYCL_UNIFIED_KERNEL=0`
+  restores the pre-fix gate state and moves tg128 by less than the run-to-run noise.
 
 Of the 10 commits in `f03af88fc^..HEAD`, only `f03af88fc` is functionally significant; the
 others are refactors, diagnostics, and docs. So the code axis between the historical
-baseline and this build is essentially just that one commit — which the above shows cannot
-reach either hot path.
+baseline and this build is essentially just that one commit.
 
 This confirms the lead's revised hypothesis in tracker comment `c-aagr`, and by a stronger
 route than expected: the unified-kernel MUL_MAT share of decode is not ~10%, it is **0%**.
+
+### 4.4 `GGML_SYCL_UNIFIED_FORCE_LEGACY=1` is worth +21.8% tg128 on the B70
+
+This is a different bypass point from §2.2's knob — `ggml-sycl.cpp:51354` skips the entire
+unified MUL_MAT block, *including the oneDNN FP16 matmul path and the
+COALESCED->SOA->AOS layout-resolution logic nested inside it*, where
+`GGML_SYCL_UNIFIED_KERNEL=0` only turns off the unified-kernel gate. They are not
+interchangeable, and they do not produce the same result.
+
+| B70, clean card, 5 reps per run | pp512 | tg128 |
+|---|---:|---:|
+| default (8 runs) | 1353.74 ± 64.52 | 37.27 ± 2.70 |
+| `GGML_SYCL_UNIFIED_FORCE_LEGACY=1` (3 runs) | **1416.62 ± 0.66** | **45.41 ± 0.30** |
+| | **+4.6%** | **+21.8%** |
+
+**Correctness verified** — this is a throughput claim, so both canonical gates were run:
+
+- GPT-OSS 20B chat gate with the flag set: `1, 2, 3, 4, 5`. Passes.
+- Mistral 7B Q4_0 completion gate (Q4_0 is the other `should_use_unified` type, so it
+  exercises the bypassed path hardest): output is **byte-identical** with and without the
+  flag.
+
+**It buys this without changing GPU kernel time at all.** A decode profile with the flag set
+is indistinguishable from the default one — same kernels, same call counts, 662.56 ms
+captured vs 663.87 ms (−0.20%) — while profiled tg128 rises 29.51 -> 39.20, i.e. 33.89 ->
+25.51 ms/token. **All 8.4 ms/token of the saving comes out of the non-kernel cost
+identified in §5.3.** The unified block was being entered, doing layout-resolution and
+eligibility work per call, and then falling through to legacy dispatch anyway — pure host
+overhead for a kernel that never ran. That is also why the profiler could not see it (§5.4:
+oneDNN and host-side work are uninstrumented).
+
+**Two things this is not:**
+
+- It is **not** a capability-fix effect. Reversing the fix's own gate (§2.2) does not
+  reproduce it; only the broader block bypass does.
+- It **does not reproduce on the B50**, which is unexplained. Both cards are Battlemage and
+  both pass the same gate, so the asymmetry is real and not understood. The B50 numbers:
+
+| B50, 2 runs x 5 reps | pp512 | tg128 |
+|---|---:|---:|
+| default | 897.79 ± 2.53 | 33.22 ± 0.01 |
+| `GGML_SYCL_UNIFIED_FORCE_LEGACY=1` | 893.72 ± 3.31 | 33.14 ± 0.45 |
+
+**The variance collapse is a finding in its own right.** B70 default tg128 has sd 2.70
+across runs (range 32.58–41.11); with the flag it is sd **0.30** (range 45.07–45.65) — a 9x
+reduction, and in line with the B50's inherent sd of 0.01–0.45. **The B70's notorious
+run-to-run instability is caused by the unified MUL_MAT block, not by the card.** That
+alone would justify pursuing this, independently of the throughput.
+
+Do **not** flip this default on the strength of one workload — see the recommendation in §7.
 
 ---
 
@@ -321,8 +416,19 @@ State these alongside any number quoted from this document.
    The measured achievable figure (529.6 GB/s) is the reliable number.
 5. **The +15% attributed to (b2)** rests on points whose spreads are ±4–6; the *mechanism*
    (elimination of the `soa.batched` pass) is certain, the magnitude is not.
-6. **Between-run spread is large** (pp512 14.2%, tg128 22.9%). Differences below ~15% on
-   pp512 or ~25% on tg128 between single runs are not evidence of anything.
+6. **Between-run spread is large in the default configuration** (pp512 14.2%, tg128 22.9%).
+   Differences below ~15% on pp512 or ~25% on tg128 between single default runs are not
+   evidence of anything. Note this does **not** apply under `FORCE_LEGACY` (§4.4), where sd
+   falls to 0.30 on tg128 — the spread is a property of the code path, not the card.
+7. **§4.4 rests on 3 runs against 8**, on one model and one card. The effect size (+21.8%,
+   non-overlapping ranges 45.07–45.65 vs 32.58–41.11) is far outside the noise and both
+   correctness gates pass, but it has not been tested on Mistral, on the B580, or on
+   prompt-heavy workloads that use the oneDNN PP path the flag also bypasses.
+8. **An earlier revision of this document contained two false claims** (§2.0) about missing
+   `getenv` sites and dead callers, both produced by trusting the codescout index for
+   absence inside `ggml-sycl.cpp`. They are corrected here, and the conclusions they were
+   offered in support of turned out to hold on other evidence — but the episode is the
+   reason §2.0 exists.
 
 ---
 
@@ -330,27 +436,41 @@ State these alongside any number quoted from this document.
 
 No code changes were made in this task. In priority order:
 
-1. **Retire the 256-CU / tile-shape / occupancy line of investigation as the primary lever.**
-   It targets at most 19% of a decode token, and the unified kernel it would tune does not
-   execute for this model. §5.3 is the reason, not a preference.
-2. **Investigate the ~22 ms/token non-kernel decode cost.** It is the single largest term in
-   decode on both cards, it is card-independent, and nothing in this plan has examined it.
-   Start by instrumenting the decode path's host side and by confirming whether SYCL graph
-   replay is actually active during `llama-bench` decode — ~48 µs per kernel launch across
-   ~461 launches is the shape of un-batched submission.
-3. **Close the decode flash-attention instrumentation gap.** A profile that captures 15% of
-   the token cannot answer "what is slow", and the missing attention kernel is a known hole.
-4. **Fix the docs for `GGML_SYCL_UNIFIED_FORCE_LEGACY`** (four files, §2.1) and decide the
-   fate of the dead `dispatch.hpp` gate (§2.2) — either wire
-   `is_unified_kernel_enabled_for_device()` into dispatch or delete it. Right now a fix
-   landed against a gate nothing calls, and two tests assert on behavior that never runs.
-5. **Extend the `gpt-oss-20b` geometry preset** to model the fused-down case, or every future
+1. **Chase down the unified MUL_MAT block's host-side cost (§4.4).** This is now the highest-
+   value lead: +21.8% tg128 and a 9x variance reduction on the B70, correctness-verified on
+   both gates, costing zero GPU kernel time. Find out *what* in the block at
+   `ggml-sycl.cpp:51354` costs ~8 ms/token when the kernel it guards never runs — the
+   per-call `ggml_sycl_resolve` layout walk and the oneDNN FP16 eligibility checks are the
+   obvious suspects — and fix it properly rather than by flipping the flag's default.
+   **Do not change the default on this evidence alone:** it is one model on one card, the
+   B50 shows no effect, and `FORCE_LEGACY` also bypasses the oneDNN PP path that other
+   workloads (notably Mistral PP) may depend on. Benchmark Mistral and the B580 before
+   touching a default.
+2. **Explain the B50/B70 asymmetry in §4.4.** Both are Battlemage and both pass the same
+   gate, yet only the B70 pays this cost. Whatever the reason, it likely points straight at
+   the mechanism.
+3. **Investigate the rest of the ~22 ms/token non-kernel decode cost.** §4.4 recovers ~8 ms
+   of it; ~14 ms remains, it is card-independent, and it is still the largest single term in
+   decode. Confirm whether SYCL graph replay is actually active during `llama-bench` decode —
+   ~48 µs per launch across ~461 launches/token is the shape of un-batched submission.
+4. **Retire the 256-CU / tile-shape / occupancy line as the primary lever.** It targets at
+   most 19% of a decode token, and the unified kernel it would tune does not execute for this
+   model. §5.3 is the reason, not a preference.
+5. **Close the decode flash-attention instrumentation gap.** A profile that captures 15% of
+   the token cannot answer "what is slow", and the missing attention kernel is a known hole —
+   §4.4 is a concrete case where the profiler was blind to an 8 ms/token effect.
+6. **Fix `GGML_SYCL_UNIFIED_FORCE_LEGACY`'s value handling or its docs** (§2.1). The code
+   tests `!= nullptr`, so `=0` *enables* the bypass; four docs spell it `=1` and imply
+   otherwise.
+7. **Extend the `gpt-oss-20b` geometry preset** to model the fused-down case, or every future
    B70 roofline reads ~18 points low (§5.2).
-6. **The B50 down-i8 double-charge fix remains worth doing** — §5.2 shows it removes an entire
+8. **The B50 down-i8 double-charge fix remains worth doing** — §5.2 shows it removes an entire
    kernel pass (2322 calls/128 tokens), which is a cleaner justification than the throughput
    delta.
-7. **Record free VRAM beside every future GPU measurement.** Every run in this document did
+9. **Record free VRAM beside every future GPU measurement.** Every run in this document did
    so; it is what made the confound self-evident rather than a three-task detour.
+10. **Adopt the §2.0 verification rule.** Absence claims about the large SYCL files must be
+    confirmed with `grep` against the live file, never from the index.
 
 ---
 
@@ -367,6 +487,12 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_OP_TIMEOUT_MS=180000 \
 # Reproduce the confounded budget on a clean card
 ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_OP_TIMEOUT_MS=180000 \
   GGML_SYCL_VRAM_BUDGET_PCT=42 \
+  ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+  -p 512 -n 128 -r 5 -v
+
+# The +21.8% tg128 result of section 4.4 (any value enables it -- the code tests != nullptr)
+ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_OP_TIMEOUT_MS=180000 \
+  GGML_SYCL_UNIFIED_FORCE_LEGACY=1 \
   ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
   -p 512 -n 128 -r 5 -v
 
