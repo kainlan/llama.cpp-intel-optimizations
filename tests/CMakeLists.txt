@@ -249,8 +249,9 @@ endif()
 if (NOT WIN32)
     # Python source-assertion test for the decode-timeline profiling pipeline.
     # Registered because tasks that modify sycl-gptoss-decode-timeline-profile.sh
-    # or parse-sycl-timeline.py need a gate the lead can run; tests/ holds ~90
-    # .py tests and this is the first one wired to ctest (see llama.cpp-t5a2).
+    # or parse-sycl-timeline.py need a gate the lead can run; tests/ holds dozens
+    # of unregistered .py tests and this is the first one wired to ctest (see
+    # llama.cpp-t5a2).
     #
     # The file is pytest-style (module-level test_* functions, no __main__), so
     # it must run under pytest -- `python3 <file>` would define the functions,
