@@ -9769,11 +9769,21 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     const ggml_sycl::path_scoped_maxima inventory_maxima =
         ggml_sycl::zone_scoped_maxima(ggml_sycl::unified_cache_adapt_zone_inventory(g_tensor_inventory_detail));
     GGML_ASSERT(inventory_maxima.any_tensor == max_tensor_bytes);
-    g_tensor_inventory_onednn_scratchpad_bytes = inventory_maxima.onednn_eligible * 2;
+    // Weights half expanded, activations half a placeholder -- this MUST stay
+    // identical to the formula in populate_host_zone_sizing (unified-cache.cpp,
+    // "8. oneDNN scratchpad"), where the reasoning for the two units is written
+    // out in full. The two sites size the same zone from the same maxima and
+    // will disagree silently if only one is changed: this one sets the real
+    // arena zone, the other only reports. Sizing the weights half from the
+    // stored bytes under-provisioned the zone by the quantization ratio
+    // (llama.cpp-2wgg).
+    g_tensor_inventory_onednn_scratchpad_bytes = inventory_maxima.onednn_reorder + inventory_maxima.onednn_eligible;
     GGML_LOG_INFO(
-        "[SYCL-PLAN] inventory oneDNN scratchpad: %.1f MB (2 x onednn_eligible %.1f MB; global max %.1f MB)\n",
+        "[SYCL-PLAN] inventory oneDNN scratchpad: %.1f MB (onednn_reorder %.1f MB + onednn_eligible %.1f MB; global "
+        "max %.1f MB)\n",
         g_tensor_inventory_onednn_scratchpad_bytes / (1024.0 * 1024.0),
-        inventory_maxima.onednn_eligible / (1024.0 * 1024.0), max_tensor_bytes / (1024.0 * 1024.0));
+        inventory_maxima.onednn_reorder / (1024.0 * 1024.0), inventory_maxima.onednn_eligible / (1024.0 * 1024.0),
+        max_tensor_bytes / (1024.0 * 1024.0));
     ggml_sycl::unified_cache_set_planned_onednn_scratchpad_bytes(ctx->device,
                                                                  g_tensor_inventory_onednn_scratchpad_bytes);
     {

@@ -45,8 +45,17 @@ using ggml_sycl::zone_tensor_desc;
 // will cast them (zone-sizing.hpp deliberately does not include ggml.h).
 static const int TYPE_Q4_0  = 2;
 static const int TYPE_Q8_0  = 8;
+static const int TYPE_Q4_K  = 12;
 static const int TYPE_Q6_K  = 14;
 static const int TYPE_MXFP4 = 39;
+
+// The oneDNN matmul weights reorder holds a DEQUANTIZED f16 copy, so its size
+// is the element count times 2 regardless of how the weight is stored. This
+// mirrors what unified_cache_adapt_zone_inventory() computes in production and
+// what acquire_onednn_pp_scratch()'s callers actually request; the fixtures
+// below carry it so the expanded maximum is exercised by every case rather
+// than only by the ones written for it.
+static const size_t F16_BYTES = 2;
 
 // Measured byte sizes from the Task 1 inventory. The MB figures in the
 // comments are binary (bytes / 1024^2), matching the findings document.
@@ -59,14 +68,16 @@ static const size_t MISTRAL_FFN_BYTES    = 33030144;   //  31.5 MB, Q4_0  4096 x
 static zone_tensor_desc
 desc(const std::string & name, size_t size, int type, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3) {
     zone_tensor_desc d;
-    d.name      = name;
-    d.size      = size;
-    d.type      = type;
-    d.ne[0]     = ne0;
-    d.ne[1]     = ne1;
-    d.ne[2]     = ne2;
-    d.ne[3]     = ne3;
-    d.has_shape = true;
+    d.name         = name;
+    d.size         = size;
+    d.type         = type;
+    d.ne[0]        = ne0;
+    d.ne[1]        = ne1;
+    d.ne[2]        = ne2;
+    d.ne[3]        = ne3;
+    d.has_shape    = true;
+    d.reorder_size = static_cast<size_t>(ne0) * static_cast<size_t>(ne1) * static_cast<size_t>(ne2) *
+                     static_cast<size_t>(ne3) * F16_BYTES;
     return d;
 }
 
@@ -83,6 +94,12 @@ static zone_tensor_desc shapeless_desc(const std::string & name, size_t size, in
 }
 
 // Acceptance: a predicate can only ever narrow.
+//
+// onednn_reorder is deliberately NOT checked here. It is a DEQUANTIZED size,
+// not a selection from the inventory, so it is not bounded by any_tensor and
+// legitimately exceeds it on Mistral 7B Q4_0 (112.0 MB reorder vs a 102.5 MB
+// largest tensor) -- Case 2 asserts exactly that. Adding it to this predicate
+// would make the real production layout fail.
 static bool is_monotonic(const path_scoped_maxima & m) {
     return m.onednn_eligible <= m.any_tensor && m.cpu_quant_eligible <= m.any_tensor && m.dma_streamed <= m.any_tensor;
 }
@@ -111,6 +128,16 @@ int main() {
         CHECK(maxima.dma_streamed == GPT_OSS_EXPERT_BYTES,
               "gpt-oss dma_streamed must fall to the expert family (134.5 MB)");
         CHECK(is_monotonic(maxima), "gpt-oss maxima must all be <= any_tensor");
+
+        // All four dimensions expand, ne[2] = 32 experts included: 2880 x 2880
+        // x 32 x 2 B = 506.2 MB. Dropping ne[2] would yield 15.8 MB, a 32x
+        // under-size -- the same trap the "never derive a size from ne" rule in
+        // zone-sizing.hpp guards, which is why the adapter and not the
+        // classifier computes this.
+        CHECK(maxima.onednn_reorder == 2880ull * 2880ull * 32ull * F16_BYTES,
+              "gpt-oss onednn_reorder must expand all four dimensions of the expert family (506.2 MB)");
+        CHECK(maxima.onednn_reorder > maxima.onednn_eligible,
+              "gpt-oss onednn_reorder must exceed the stored maximum -- MXFP4 expands 3.76x into f16");
     }
 
     // ---- Case 2: the real Mistral 7B Q4_0 layout ----------------------------
@@ -135,6 +162,59 @@ int main() {
               "mistral cpu_quant_eligible must fall to the FFN family (31.5 MB)");
         CHECK(maxima.dma_streamed == MISTRAL_FFN_BYTES, "mistral dma_streamed must fall to the FFN family (31.5 MB)");
         CHECK(is_monotonic(maxima), "mistral maxima must all be <= any_tensor");
+
+        // The measured defect in llama.cpp-2wgg, pinned. The FFN weight is
+        // 31.5 MB stored and 112.0 MB once dequantized to f16 (4096 x 14336 x
+        // 2 B) -- exactly Q4_0's 4.5 bits/weight going to 16, a 3.5556x
+        // expansion. Sizing the ONEDNN zone's weights half from the stored
+        // 31.5 MB planned 63.0 MB against a measured 126.0 MB peak.
+        CHECK(maxima.onednn_reorder == 4096ull * 14336ull * F16_BYTES,
+              "mistral onednn_reorder must be the f16 expansion of the FFN family (112.0 MB)");
+        CHECK(maxima.onednn_reorder * 9 == maxima.onednn_eligible * 32,
+              "mistral Q4_0 expansion must be exactly 32/9 = 3.5556x (16 bits / 4.5 bits)");
+
+        // The property that breaks naive assertions: a dequantized reorder
+        // buffer can be LARGER than the biggest tensor in the model. Here the
+        // Q6_K LM head is the largest stored tensor at 102.5 MB and the reorder
+        // needs 112.0 MB. Any `onednn_reorder <= any_tensor` check -- in an
+        // assert, a zone-budget calculation, or a future collapse detector --
+        // would fire on a healthy Mistral.
+        CHECK(maxima.onednn_reorder > maxima.any_tensor,
+              "mistral onednn_reorder must be allowed to exceed the global max (112.0 > 102.5 MB)");
+    }
+
+    // ---- Case 2b: mixed quantization, where the two winners diverge ---------
+    // The reason onednn_reorder is its own accumulator rather than
+    // onednn_eligible scaled by a factor at the call site.
+    //
+    // Expansion is per type, so on a mixed-quantization model the largest
+    // STORED eligible tensor and the largest EXPANDED one can be different
+    // tensors. Two per-layer families, both above the cardinality threshold:
+    //
+    //   A: Q6_K 4096 x 11008 -> stored 36988800 B (35.3 MB), reorder  86.0 MB
+    //   B: Q4_K 4096 x 14336 -> stored 33030144 B (31.5 MB), reorder 112.0 MB
+    //
+    // A is bigger stored; B is bigger expanded. Scaling the stored winner by
+    // its own Q6_K factor (256 x 2 / 210 = 2.438x) gives 86.0 MB and under-sizes
+    // the real 112.0 MB requirement by 23%. Taking the maximum over the
+    // expanded sizes is the only formulation that survives this.
+    {
+        const size_t A_STORED = 36988800;  // 4096 x 11008 / 256 x 210
+        const size_t B_STORED = 33030144;  // 4096 x 14336 / 256 x 144
+
+        std::vector<zone_tensor_desc> inventory;
+        for (int i = 0; i < 32; i++) {
+            inventory.push_back(desc("blk." + std::to_string(i) + ".a", A_STORED, TYPE_Q6_K, 4096, 11008, 1, 1));
+            inventory.push_back(desc("blk." + std::to_string(i) + ".b", B_STORED, TYPE_Q4_K, 4096, 14336, 1, 1));
+        }
+
+        const path_scoped_maxima maxima = zone_scoped_maxima(inventory);
+
+        CHECK(maxima.onednn_eligible == A_STORED, "mixed-quant onednn_eligible must pick the larger STORED family (A)");
+        CHECK(maxima.onednn_reorder == 4096ull * 14336ull * F16_BYTES,
+              "mixed-quant onednn_reorder must pick the larger EXPANDED family (B, 112.0 MB)");
+        CHECK(maxima.onednn_reorder > A_STORED * 256ull * F16_BYTES / 210ull,
+              "expanding the stored winner by its own factor must under-size the real requirement");
     }
 
     // ---- Case 3: the threshold boundary -------------------------------------
@@ -208,6 +288,11 @@ int main() {
         CHECK(maxima.any_tensor == 800u * 1024u * 1024u, "shapeless entries must still count toward any_tensor");
         CHECK(maxima.onednn_eligible == 50u * 1024u * 1024u, "shapeless entries must never form a per-layer family");
         CHECK(is_monotonic(maxima), "shapeless maxima must all be <= any_tensor");
+        // A shapeless entry has no reorder size either (the adapter returns 0
+        // when has_shape() is false), so it cannot inflate the expanded maximum
+        // any more than it can the stored one.
+        CHECK(maxima.onednn_reorder == 256ull * 256ull * F16_BYTES,
+              "shapeless entries must never inflate onednn_reorder");
 
         // Shapeless-only: nothing can be classified, so every scoped max is 0.
         std::vector<zone_tensor_desc> only_shapeless;
@@ -222,6 +307,7 @@ int main() {
         CHECK(shapeless_maxima.onednn_eligible == 0, "shapeless-only onednn_eligible must be 0");
         CHECK(shapeless_maxima.cpu_quant_eligible == 0, "shapeless-only cpu_quant_eligible must be 0");
         CHECK(shapeless_maxima.dma_streamed == 0, "shapeless-only dma_streamed must be 0");
+        CHECK(shapeless_maxima.onednn_reorder == 0, "shapeless-only onednn_reorder must be 0");
         CHECK(is_monotonic(shapeless_maxima), "shapeless-only maxima must all be <= any_tensor");
     }
 

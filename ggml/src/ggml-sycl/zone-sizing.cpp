@@ -150,6 +150,11 @@ path_scoped_maxima zone_scoped_maxima(const std::vector<zone_tensor_desc> & inve
 
         if (zone_is_onednn_reorder_eligible(tensor, cardinality)) {
             maxima.onednn_eligible = std::max(maxima.onednn_eligible, tensor.size);
+            // Maxed independently of onednn_eligible, over the SAME eligible
+            // set. The two winners need not be the same tensor: expansion is
+            // per type, so the largest stored weight and the largest
+            // dequantized reorder buffer diverge on a mixed-quantization model.
+            maxima.onednn_reorder  = std::max(maxima.onednn_reorder, tensor.reorder_size);
         }
         if (zone_is_cpu_quant_eligible(tensor, cardinality)) {
             maxima.cpu_quant_eligible = std::max(maxima.cpu_quant_eligible, tensor.size);

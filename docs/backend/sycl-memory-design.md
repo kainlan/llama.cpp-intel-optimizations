@@ -181,9 +181,34 @@ in `zone-sizing.hpp`; read it there rather than restating it here.
 | field | meaning |
 |---|---|
 | `any_tensor` | the legacy global maximum; use only when the path genuinely accepts any tensor |
-| `onednn_eligible` | largest tensor that can be a oneDNN matmul reorder subject |
+| `onednn_eligible` | largest tensor that can be a oneDNN matmul reorder subject, **as stored** |
+| `onednn_reorder` | largest oneDNN reorder buffer, i.e. that same eligible set **dequantized to f16** |
 | `cpu_quant_eligible` | largest tensor the CPU quantization slots can hold |
 | `dma_streamed` | largest tensor the host→device weight stream carries |
+
+**`onednn_reorder` is not `onednn_eligible` times a constant, and it is not
+bounded by `any_tensor`.** Both surprises are load-bearing:
+
+- The oneDNN matmul weights reorder holds a **dequantized f16 copy**, so its size
+  is the element count × 2 — a per-type expansion (Q4_0 3.56×, Q8_0 1.88×,
+  MXFP4 3.76×), not one factor. Across a mixed-quantization model the largest
+  *stored* eligible tensor and the largest *expanded* one are different tensors,
+  so the maximum must be taken over the expanded sizes. Scaling the stored
+  winner by its own factor under-sizes whenever a lower-bit-rate tensor with
+  more elements exists — a worked case is Case 2b in
+  `ggml/src/ggml-sycl/tests/test-zone-sizing.cpp` (23% under).
+- It **legitimately exceeds `any_tensor`**. On Mistral 7B Q4_0 the largest tensor
+  in the model is 102.5 MB and the largest reorder buffer is 112.0 MB. Do not
+  add an `onednn_reorder <= any_tensor` assertion, budget clamp, or collapse
+  check — it would fire on a healthy model. `is_monotonic` in the unit test
+  deliberately omits it and says so.
+
+The expansion is computed in `unified_cache_adapt_zone_inventory`, the only
+party with ggml's type traits, and carried as `zone_tensor_desc::reorder_size`.
+The classifier TU never derives it — that is the same rule that keeps it from
+deriving a size from `ne`, and it matters for the same reason: `ne[2]` is the
+expert count on MoE weights, so a 2-D-only product under-states a 3-D tensor
+by 32×.
 
 **Rule for adding a consumer:** pick the maximum matching your path. Reach for
 `any_tensor` only when the path really does accept anything, and say why in a
@@ -211,9 +236,18 @@ This is the trap most likely to waste a future change:
   reads when it lays out the arena.
 
 Both now narrow through the same `unified_cache_adapt_zone_inventory` +
-`zone_scoped_maxima` pair. **A future consumer that narrows only one of the two
-will appear to work and reclaim nothing** — the plan figure shrinks in the log
-while the zone stays exactly as large as it was.
+`zone_scoped_maxima` pair, and both compute the identical
+`onednn_reorder + onednn_eligible` sum. **A future consumer that changes only
+one of the two will appear to work and change nothing** — the plan figure moves
+in the log while the zone stays exactly as large as it was. Note the second site
+lives in `ggml-sycl.cpp`, where codescout's index is blind; `search_text` for a
+symbol there returns the `unified-cache.cpp` occurrences and silently omits it.
+Verify with `cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -n '<pattern>'`.
+
+`plan.onednn_reorder_bytes` is a third consumer of the same maxima — it is the
+reorder buffer alone (no activations half) and feeds the minimum-zone-size sum
+in `populate_host_zone_sizing`. It takes `onednn_reorder` for the same reason
+the weights half does.
 
 ### What the narrowing actually reclaimed
 
@@ -273,40 +307,52 @@ the original over-provision, but so is reinstating it.
 
 ### Known limits (load-bearing — read before changing any of this)
 
-1. **The 256 MB ONEDNN floor is currently masking a real under-estimate.** Three
-   different ratios are in play here and they are not the same quantity — keep
-   them apart:
+1. **The ONEDNN scratchpad's two halves are in different units, deliberately.**
+   The formula is `onednn_reorder + onednn_eligible` — expanded weights plus a
+   *stored-bytes placeholder* for the activations. That asymmetry is the current
+   state of knowledge, not drift:
 
-   - **How much the floor can hide is `256 MB / planned`, so it is
-     model-dependent, not a fixed factor.** On Mistral (planned 63.0 MB) the
-     floor covers requests up to roughly **4×** the plan. On GPT-OSS the planned
-     268.9 MB already exceeds the floor, so the zone is *raised* above it and the
-     floor hides nothing at the planned size; the **~2×** figure comes from
-     Task 6's forced-halving experiment
-     (`docs/plans/2026-07-25-sycl-path-scoped-zone-sizing.md`), where a plan cut
-     to 134.5 MB still sits under the 256 MB floor and the error stays invisible.
-   - **The measured error today is ~1.78×** — `llama.cpp-2wgg` records Mistral 7B
-     Q4_0 planning 63.0 MB against observed reservation requests of 32.0 / 112.0
-     / 112.4 MB. Those three are the three separate `reserve_onednn_scratch`
-     calls the run makes — they are exactly the `observations=3` the coverage
-     line reports for Mistral at `-p 512`. The ratio is quoted from the 112.x
-     pair because **only they exceed the 63.0 MB plan**; the 32.0 MB request fits
-     inside it and is not an under-estimate at all. Nothing fires for any of the
-     three, because the floor absorbs them.
-   - **The root cause is a 3.5556× format expansion**, which is why this is a
-     wrong *multiplier shape* rather than a wrong tensor choice. The oneDNN
-     weights reorder holds a **dequantized f16 copy**, so the weights half alone
-     needs 112.0 / 31.5 = 3.5556× the stored size — exactly Q4_0's 4.5
-     bits/weight going to f16's 16. The plan's `2 × onednn_eligible` covers part
-     of that (3.5556 / 2 = 1.78, the measured error), but the 2× was meant to buy
-     weights *plus* an activations buffer, so it is not a coincidence to be tuned
-     away. **3.5556× is the expansion, not the error magnitude — do not quote it
-     as the size of the miss.**
+   - **The weights half is exact.** It is the f16 reorder buffer, and the size
+     matches what the consumers request to the byte.
+   - **The activations half is a placeholder that happens to cover.** The real
+     buffer is `batch_tokens × K × sizeof(f16)` — measured 14.0 MB on Mistral 7B
+     Q4_0 at `-p 512`, against the 31.5 MB `onednn_eligible` reserves for it.
+     Sizing it properly needs a batch bound the planner does not have at that
+     point: `planner_n_ctx` is the context length, not `n_ubatch`, and using it
+     would inflate this half to the weights half's size for no gain. **If you
+     revisit it, find a real bound — do not substitute `onednn_reorder`**, which
+     would over-provision ~78% and start pushing models past the floor.
 
-   The classifier picks the right tensor; the multiplier applied to it ignores
-   format expansion. **Do not lower the floor until 2wgg is fixed** — while it
-   stands, `zone_sizing_underestimate_count("onednn") == 0` is uninformative
-   about this defect and will stay zero even after it is confirmed.
+   This replaces the earlier defect (`llama.cpp-2wgg`, fixed): the weights half
+   used to read `onednn_eligible`, sizing a dequantized buffer from a quantized
+   byte count. Mistral 7B Q4_0 planned **63.0 MB against a measured 126.0 MB
+   peak** — exactly 2.00× under — and only the 256 MB floor kept it working.
+   The classifier was picking the right tensor throughout; the multiplier
+   applied to it ignored format expansion.
+
+   **Three ratios were in play in the original report and they are not the same
+   quantity.** If you find them quoted elsewhere, keep them apart: the *expansion*
+   is 3.5556× (Q4_0's 4.5 bits/weight → f16's 16); the *sizing error* was 2.00×
+   (126.0 / 63.0, weights and activations being live simultaneously — an earlier
+   ~1.78× figure compared a single 112.x MB request against the plan and
+   understated it); and *how much the floor can hide* is `256 MB / planned`, so
+   it is model-dependent rather than a fixed factor.
+
+   **The floor is no longer masking a known defect, but it is still a floor.**
+   Mistral now plans 143.5 MB, still under 256 MB, so `underestimate_count`
+   remains an insensitive instrument for this path on that model. Compare
+   planned-vs-observed in the logs — `[SYCL-PLAN] oneDNN scratchpad` against
+   `[UNIFIED-CACHE] Runtime breakdown … ONEDNN_ZONE` — rather than reading the
+   counter. Reproduce with:
+
+   ```bash
+   ONEAPI_DEVICE_SELECTOR=level_zero:1 GGML_SYCL_DEBUG=1 GGML_SYCL_ARENA_PP_PROFILE=1 \
+     ./build/bin/llama-bench -m …/mistral-7b-v0.1.Q4_0.gguf -p 512 -n 0 -r 1 -v
+   ```
+
+   `GGML_SYCL_ARENA_PP_PROFILE=1` adds `[ARENA-PP-ONEDNN] … reserve_req_mb=W/A`,
+   the summed weights/activations requests — the only log that reports what was
+   actually asked for.
 2. **GPT-OSS never enters `reserve_onednn_scratch`** (observations = 0 on every
    run, including prompt processing) — its MoE work goes through a separate
    PP-MoE oneDNN ring. The grow path and its counters are exercised only by dense

@@ -52,18 +52,52 @@ namespace ggml_sycl {
 // depends on nothing. The value is only ever compared for equality when
 // grouping, so the enum's identity is not needed here; the call site casts.
 struct zone_tensor_desc {
-    size_t      size      = 0;      // THE byte size. Authoritative for every magnitude comparison.
+    size_t      size      = 0;      // THE byte size AS STORED. Authoritative for every magnitude comparison.
     int         type      = -1;     // ggml_type mirror; grouping input only.
     int64_t     ne[4]     = {};     // shape; GROUPING ONLY — never derive a size from it.
     bool        has_shape = false;  // when false, ne is meaningless and must not group.
     std::string name;               // DIAGNOSTIC ONLY — never a decision input.
+
+    // Bytes this tensor occupies once oneDNN has DEQUANTIZED it into the type
+    // its matmul reorder consumes. A second authoritative magnitude, not a
+    // multiple of `size`: a quantized weight expands on the way into the
+    // reorder buffer, so `size` describes what the model file holds and this
+    // describes what the ONEDNN zone must hold. Both are supplied by the
+    // adapter, which is the only party that knows ggml's type traits — this TU
+    // must never compute one from the other, nor from `ne`.
+    //
+    // Zero when the adapter could not establish it (no shape). A zero here
+    // narrows nothing and can only under-size, so an adapter that stops
+    // populating it degrades the same way a dropped `type` does — see the
+    // classifier-collapse section below.
+    size_t reorder_size = 0;
 };
 
 struct path_scoped_maxima {
     size_t any_tensor         = 0;  // the legacy global max; consumers not yet repointed use this
-    size_t onednn_eligible    = 0;  // largest tensor that can be a oneDNN matmul reorder subject
+    size_t onednn_eligible    = 0;  // largest tensor that can be a oneDNN matmul reorder subject, AS STORED
     size_t cpu_quant_eligible = 0;  // largest tensor the CPU quantization slots can hold
     size_t dma_streamed       = 0;  // largest tensor the host->device weight stream can carry
+
+    // Largest DEQUANTIZED oneDNN reorder buffer, i.e. the max over the eligible
+    // set of `reorder_size`. This is what the ONEDNN zone actually has to hold.
+    //
+    // Two properties surprise people, and both are correct:
+    //
+    // 1. It may EXCEED `any_tensor`. Measured on Mistral 7B Q4_0: the largest
+    //    tensor in the model is 102.5 MB, and the largest reorder buffer is
+    //    112.0 MB. Dequantization can make a per-layer weight outgrow the
+    //    model's biggest stored tensor. Do not assert `<= any_tensor` on it.
+    //
+    // 2. It is NOT `onednn_eligible` times a constant. The expansion factor is
+    //    per type (Q4_0 3.56x, Q8_0 1.88x, MXFP4 3.76x), so across a
+    //    mixed-quantization model the largest STORED eligible tensor and the
+    //    largest EXPANDED one can be different tensors. Scaling
+    //    `onednn_eligible` by the winner's factor therefore under-sizes
+    //    whenever a lower-bit-rate tensor with more elements exists. The
+    //    maximum has to be taken over the expanded sizes, which is why this is
+    //    its own accumulator rather than a multiplier at the call site.
+    size_t onednn_reorder = 0;
 };
 
 // A (type, ne) group must have at least this many members to be a per-layer

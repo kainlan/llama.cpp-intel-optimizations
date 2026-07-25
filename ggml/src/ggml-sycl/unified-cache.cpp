@@ -16977,6 +16977,43 @@ static size_t maybe_upgrade_moe_gate_up_layouts_to_i8(placement_plan & plan,
     return charged_bytes;
 }
 
+// Bytes a oneDNN matmul weights reorder needs for this tensor.
+//
+// The reorder buffer holds a DEQUANTIZED f16 copy, so it is the element count
+// times sizeof(f16) -- NOT the stored size, and not a fixed multiple of it. The
+// consumers compute exactly this: acquire_onednn_pp_scratch() is called with
+// `row_diff * ne00 * sizeof(sycl::half)` at both of its call sites in
+// ggml-sycl.cpp, and the scratch is handed back as `sycl::half *`. f16 is
+// therefore established from what the callers allocate and cast, which is
+// firmer ground than the oneDNN primitive descriptor -- if a future primitive
+// reorders to f32, those call sites change first and this must follow them.
+//
+// Sizing the buffer from the stored size instead under-provisioned the ONEDNN
+// zone by exactly the quantization ratio (llama.cpp-2wgg): Mistral 7B Q4_0
+// planned 63.0 MB against a measured 126.0 MB peak, masked only by the 256 MB
+// zone floor.
+//
+// All four dimensions participate. ne[2] is the expert count on MoE weights, so
+// dropping it would understate a 3-D tensor by 32x -- the same trap the
+// "never derive a size from ne" rule in zone-sizing.hpp exists to prevent. That
+// rule binds the pure classifier TU, which has no type traits; here in the
+// adapter the traits are available and the result is passed on as its own
+// authoritative field rather than recomputed downstream. Unset trailing
+// dimensions are 0 rather than 1 (placement_tensor_info::has_shape only
+// requires ne[0] and ne[1]), so they are skipped rather than multiplied in.
+static size_t zone_onednn_reorder_bytes(const placement_tensor_info & item) {
+    if (!item.has_shape()) {
+        return 0;
+    }
+    size_t elements = 1;
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        if (item.ne[d] > 0) {
+            elements *= static_cast<size_t>(item.ne[d]);
+        }
+    }
+    return elements * sizeof(sycl::half);
+}
+
 std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vector<placement_tensor_info> & inventory) {
     std::vector<zone_tensor_desc> zone_inventory;
     zone_inventory.reserve(inventory.size());
@@ -16988,7 +17025,8 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
         for (int d = 0; d < GGML_MAX_DIMS && d < 4; ++d) {
             desc.ne[d] = item.ne[d];
         }
-        desc.name = item.name;
+        desc.name         = item.name;
+        desc.reorder_size = zone_onednn_reorder_bytes(item);
         zone_inventory.push_back(std::move(desc));
     }
     return zone_inventory;
@@ -17161,7 +17199,10 @@ static void populate_host_zone_sizing(placement_plan &                          
     // 1. oneDNN reorder: one temp buffer reused per layer, sized from the oneDNN-eligible
     //    maximum rather than the global one -- it only ever holds a matmul weight reorder,
     //    which the vocabulary embedding and the LM head never reach.
-    plan.onednn_reorder_bytes = zone_maxima.onednn_eligible;
+    //    The buffer holds the weight DEQUANTIZED to f16, so it is sized from the expanded
+    //    maximum, not the stored one. Note this can exceed plan.max_tensor_bytes and that
+    //    is correct -- see path_scoped_maxima::onednn_reorder in zone-sizing.hpp.
+    plan.onednn_reorder_bytes = zone_maxima.onednn_reorder;
 
     // 2. MoE Q8_1 workspace: n_expert_used activation rows quantized to Q8_1 for batched dispatch.
     //    Coarse heuristic: estimate Q8_1 workspace from weight tensor size.
@@ -17334,15 +17375,33 @@ static void populate_host_zone_sizing(placement_plan &                          
     }
 
     // 8. oneDNN scratchpad: ONEDNN zone workspace for weight reorder + activation buffer.
-    //    reserve_onednn_scratch(weights_size, activations_size) sub-allocates from this zone.
-    //    Conservative estimate: one oneDNN-eligible tensor for the weights reorder plus one
-    //    for the activations. Neither can be the vocab embedding or the LM head, so this is
-    //    sized from the largest oneDNN-eligible tensor rather than the largest in the model.
-    //    The ONEDNN zone is pre-sized at 256 MB; this estimate validates the zone is adequate.
-    plan.onednn_scratchpad_bytes = zone_maxima.onednn_eligible * 2;
-    GGML_LOG_INFO("[SYCL-PLAN] oneDNN scratchpad: %.1f MB (2 x onednn_eligible %.1f MB; global max %.1f MB)\n",
-                  plan.onednn_scratchpad_bytes / (1024.0 * 1024.0), zone_maxima.onednn_eligible / (1024.0 * 1024.0),
-                  plan.max_tensor_bytes / (1024.0 * 1024.0));
+    //    reserve_onednn_scratch(weights_size, activations_size) sub-allocates from this zone,
+    //    and BOTH buffers are live at once, so the zone must hold their sum.
+    //    Neither can be the vocab embedding or the LM head, so both halves are scoped to the
+    //    oneDNN-eligible set rather than the largest tensor in the model.
+    //
+    //    The two halves are deliberately in DIFFERENT units and that is not drift:
+    //
+    //    - weights: the reorder holds a dequantized f16 copy, so it is the EXPANDED maximum.
+    //      This half used to read onednn_eligible (stored bytes) and under-sized the zone by
+    //      the whole quantization ratio -- llama.cpp-2wgg.
+    //    - activations: onednn_eligible is a PLACEHOLDER, not a measurement. The real buffer
+    //      is batch_tokens x K x sizeof(f16) (measured 14.0 MB on Mistral 7B Q4_0 at -p 512,
+    //      against the 31.5 MB this reserves). Sizing it properly needs a batch bound the
+    //      planner does not have here -- planner_n_ctx is the context length, not n_ubatch,
+    //      and using it would inflate this half to the weights half's size for no gain.
+    //      It over-covers on both reference models; revisit it with a real bound, not by
+    //      swapping in the expanded maximum, which would over-provision ~78%.
+    //
+    //    Measured against this formula: Mistral 7B Q4_0 plans 143.5 MB (112.0 + 31.5) for a
+    //    126.0 MB peak. The ONEDNN zone has a 256 MB floor, so this estimate is what
+    //    validates the floor is adequate -- do not lower the floor without re-measuring.
+    plan.onednn_scratchpad_bytes = zone_maxima.onednn_reorder + zone_maxima.onednn_eligible;
+    GGML_LOG_INFO(
+        "[SYCL-PLAN] oneDNN scratchpad: %.1f MB (onednn_reorder %.1f MB + onednn_eligible %.1f MB; global max %.1f "
+        "MB)\n",
+        plan.onednn_scratchpad_bytes / (1024.0 * 1024.0), zone_maxima.onednn_reorder / (1024.0 * 1024.0),
+        zone_maxima.onednn_eligible / (1024.0 * 1024.0), plan.max_tensor_bytes / (1024.0 * 1024.0));
 
     // 9. PP pipeline scratch: double-buffered FP16 weight staging for prompt-processing
     //    dequant prefetch. This is computed exactly at inventory collection time and
