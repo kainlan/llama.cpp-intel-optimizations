@@ -134,6 +134,166 @@ is the short form; this is the why):
   host-pinned pointer to a GPU kernel is slower (measured 1.6–2.6×) *and* breaks
   the tier abstraction. Let `resolve()` report residency and route accordingly.
 
+## Path-scoped zone sizing
+
+`populate_host_zone_sizing` (`ggml/src/ggml-sycl/unified-cache.cpp`) once sized
+every arena zone from a single global `max_tensor_bytes` — the largest tensor in
+the model. Several consumers can never hold that tensor: the oneDNN matmul
+scratchpad, its per-layer reorder buffer, the CPU quantization slots and the DMA
+weight-stream staging pool all operate on per-layer weights, while the global
+maximum is the vocabulary embedding or the LM head. Each consumer was therefore
+over-provisioned by the difference, and two of those figures are summed a second
+time into `host_zone_scratch_bytes`.
+
+Measured (`docs/plans/2026-07-25-zone-sizing-findings.md`, Task 1): on GPT-OSS
+20B MXFP4 the global maximum is `output.weight` at **586.8 MB** while the
+largest per-layer weight is **134.5 MB**; on Mistral 7B Q4_0 it is
+`output.weight` at **102.5 MB** against **31.5 MB**.
+
+### The classifier is structural, never by name
+
+`zone-sizing.hpp` classifies a tensor by how often its `(type, ne[0..3])` key
+repeats in the inventory:
+
+```
+key  = (type, ne[0], ne[1], ne[2], ne[3])
+is_per_layer_weight(t)  <=>  t.has_shape && freq[key(t)] >= k_zone_per_layer_min_group   // 4
+```
+
+A per-layer weight family repeats once per block; the embedding and the LM head
+are singletons, or a pair when they happen to share type and shape. **Names are
+a diagnostic field only — no decision path may branch on one.** Tensor names are
+a GGUF convention, not a guarantee, and a name predicate that matches nothing
+fails *silently*: every maximum degrades back to the global one, which looks
+exactly like the reclaim genuinely being zero. Task 1 made that concrete —
+**there is no `lm_head` tensor in either reference model** (llama.cpp names the
+LM head `output.weight`), so the originally-planned `lm_head` clause would have
+matched nothing and nobody would have noticed.
+
+The threshold, the histograms it was chosen from, and the `zone_*` (pure) versus
+`zone_sizing_*` (global state or log output) naming contract are all documented
+in `zone-sizing.hpp`; read it there rather than restating it here.
+
+### The maxima
+
+`zone_scoped_maxima(inventory)` returns:
+
+| field | meaning |
+|---|---|
+| `any_tensor` | the legacy global maximum; use only when the path genuinely accepts any tensor |
+| `onednn_eligible` | largest tensor that can be a oneDNN matmul reorder subject |
+| `cpu_quant_eligible` | largest tensor the CPU quantization slots can hold |
+| `dma_streamed` | largest tensor the host→device weight stream carries |
+
+**Rule for adding a consumer:** pick the maximum matching your path. Reach for
+`any_tensor` only when the path really does accept anything, and say why in a
+comment — an unjustified `any_tensor` reintroduces exactly the over-provision
+this exists to remove.
+
+Two consumers are deliberately left on `any_tensor`, and both comments say why:
+`moe_q8_workspace_bytes` is derived as `max_tensor_bytes / n_experts` and is
+therefore already a per-expert figure, and `s1_per_inflight_bytes` backs the S1
+preload, which streams *every* tensor including the embeddings. Narrowing that
+second one would be this bug in reverse.
+
+### There are TWO oneDNN sizing sites, not one
+
+This is the trap most likely to waste a future change:
+
+- `plan.onednn_scratchpad_bytes`, set in `populate_host_zone_sizing`, is the
+  plan-level figure and the one the `[SYCL-PLAN]` line reports. **It does not
+  size the VRAM ONEDNN zone.**
+- `g_tensor_inventory_onednn_scratchpad_bytes`, set in
+  `populate_inventory_globals` (`ggml/src/ggml-sycl/ggml-sycl.cpp`), is what
+  actually sizes it: it flows through
+  `unified_cache_set_planned_onednn_scratchpad_bytes` into
+  `g_planned_onednn_scratchpad_bytes[device]`, which `ensure_planned_arena_zones`
+  reads when it lays out the arena.
+
+Both now narrow through the same `unified_cache_adapt_zone_inventory` +
+`zone_scoped_maxima` pair. **A future consumer that narrows only one of the two
+will appear to work and reclaim nothing** — the plan figure shrinks in the log
+while the zone stays exactly as large as it was.
+
+### What the narrowing actually reclaimed
+
+Measured before/after (`57db1e693` → `b36bb603b`), Task 8. **VRAM and host are
+separate budgets; never sum them.**
+
+| budget | model | before | after |
+|---|---|---:|---:|
+| VRAM ONEDNN zone (both cards) | GPT-OSS 20B | 1173.6 MB | 268.9 MB |
+| VRAM arena weight zone, B50 | GPT-OSS 20B | 13348.4 MB | 14253.1 MB |
+| VRAM arena weight zone, B70 | GPT-OSS 20B | 29578.1 MB | 30482.9 MB |
+| host SCRATCH zone | GPT-OSS 20B | 2644.1 MB | 1287.0 MB |
+| host SCRATCH zone | Mistral 7B | 442.2 MB | 229.0 MB |
+
+**Only the VRAM half converts into granted MoE layers.** The 904.7 MB the ONEDNN
+zone gives up is picked up exactly by the arena weight zone, and on the B50 the
+MoE down-i8 layout pass turns it into **4 more granted layers, 6/24 → 10/24** at
+~261 MB per tensor. The B70 already granted all 24 in both builds, so there the
+same 904.7 MB is idle headroom. The host SCRATCH reclaim (−1357.1 MB on GPT-OSS,
+−213.2 MB on Mistral) is host memory and moves no VRAM budget at all.
+
+`cpu_quant_buffer_bytes` shrinks too, but it has **no reader anywhere** — it is a
+diagnostic figure, not a provision. Do not add it to a reclaim total.
+
+Mistral reclaims **zero VRAM**, and that is the floor working rather than a
+failure: both the before estimate (205.1 MB) and the after estimate (63.0 MB)
+sit under the 256 MB ONEDNN zone floor, so the zone is 256 MB either way.
+
+### When a predicate under-estimates
+
+A request larger than the planned zone grows it **through the unified cache** —
+never a direct allocation — and the existing refusal to rebuild the arena while
+live leases are held is preserved, not routed around. A wrong predicate
+therefore costs a reallocation, not a crash.
+
+`reserve_onednn_scratch` reaches its growth path for two causes that are logged
+distinctly and **must not be conflated**:
+
+- `planned zone under-estimated` — the request exceeded the planned zone. This
+  is a sizing defect, and the only case
+  `zone_sizing_record_underestimate("onednn", …)` counts.
+- `zone fragmented` — the zone was large enough but the sub-allocation failed
+  anyway. An allocator condition; counting it would blame the predicate for
+  something it did not do.
+
+`GGML_SYCL_DEBUG=1` prints `[SYCL-PLAN] zone sizing coverage: onednn
+observations=N underestimates=M` once per plan. The *observation* count is what
+distinguishes "the path was never entered" from "the path was entered and the
+predicate held" — both leave the under-estimate count at zero and they mean
+opposite things.
+
+**What to do when the warning fires:** identify the tensor whose structure
+defeated the predicate, correct the predicate in `zone-sizing.cpp`, and add the
+case to `ggml/src/ggml-sycl/tests/test-zone-sizing.cpp`. **Do not raise the
+estimate back to `any_tensor` to silence it** — persistent growth is worse than
+the original over-provision, but so is reinstating it.
+
+### Known limits (load-bearing — read before changing any of this)
+
+1. **The 256 MB ONEDNN floor is currently masking a real under-estimate of up to
+   ~2×.** `llama.cpp-2wgg` records Mistral 7B Q4_0 planning 63.0 MB against
+   observed reservation requests of 112.0 / 112.4 MB, with nothing firing because
+   the floor absorbs it. The root cause is the multiplier, not the classifier:
+   the oneDNN weights reorder holds a **dequantized f16 copy**, so
+   `2 × onednn_eligible` ignores format expansion — 112.0 / 31.5 = 3.5556 is
+   exactly Q4_0's 4.5 bits/weight going to f16's 16. **Do not lower the floor
+   until 2wgg is fixed.**
+2. **GPT-OSS never enters `reserve_onednn_scratch`** (observations = 0 on every
+   run, including prompt processing) — its MoE work goes through a separate
+   PP-MoE oneDNN ring. The grow path and its counters are exercised only by dense
+   models, so a clean GPT-OSS run is not evidence the oneDNN predicate is right.
+3. **`llama-bench` needs `-v`.** It installs a null log callback, so every
+   `GGML_LOG_INFO` — all `[SYCL-PLAN]`, `[VRAM-ARENA]`, `[HOST-ARENA]` and
+   `[MOE-LAYOUT]` lines — is silently discarded without it. An empty capture is
+   indistinguishable from "the zone did not change"; this voided captures
+   repeatedly while the work was being measured.
+4. **`-p 0 -n 4` yields observations = 0 on every model and card.** A capture
+   without prompt processing cannot detect an under-estimate at all. Use it for
+   zone figures, never for coverage.
+
 ## See also
 
 - [`docs/design/sycl-canonical-memory-architecture.md`](../design/sycl-canonical-memory-architecture.md)
@@ -142,3 +302,7 @@ is the short form; this is the why):
 - Source: `ggml/src/ggml-sycl/unified-cache.hpp` (allocator + planner types),
   `ggml/src/ggml-sycl/mem-handle.hpp` (handle kinds, resolution, lease
   semantics — the header comments are the primary spec).
+- `ggml/src/ggml-sycl/zone-sizing.hpp` — the path-scoped sizing predicates,
+  their threshold, and the `zone_*` / `zone_sizing_*` naming contract.
+- `docs/plans/2026-07-25-zone-sizing-findings.md` — the measurements every byte
+  figure in "Path-scoped zone sizing" above is quoted from.
