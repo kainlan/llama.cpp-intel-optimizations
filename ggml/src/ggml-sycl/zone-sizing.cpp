@@ -79,7 +79,7 @@ bool zone_is_per_layer_weight(const zone_tensor_desc & tensor, size_t group_card
     if (!tensor.has_shape) {
         return false;
     }
-    return group_cardinality >= ZONE_PER_LAYER_MIN_GROUP;
+    return group_cardinality >= k_zone_per_layer_min_group;
 }
 
 // KNOWN, INSTRUMENTED RISK — do not "fix" here.

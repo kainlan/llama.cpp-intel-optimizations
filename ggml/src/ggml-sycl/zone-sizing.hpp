@@ -67,7 +67,7 @@ struct path_scoped_maxima {
 // wrongly excluded, under-sizing the zone. Uncertainty resolves toward
 // inclusion — over-inclusion costs today's over-provision, under-inclusion
 // costs a runtime grow.
-const size_t ZONE_PER_LAYER_MIN_GROUP = 4;
+constexpr size_t k_zone_per_layer_min_group = 4;
 
 // True when the tensor is one member of a repeated per-layer weight family.
 // `group_cardinality` is how many inventory entries share its (type, ne) key.
