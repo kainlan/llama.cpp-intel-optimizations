@@ -1403,6 +1403,31 @@ set_tests_properties(gpu-arch PROPERTIES
     TIMEOUT 60
 )
 
+# Test: structural path-scoped arena zone maxima.
+# Host-only — zone_scoped_maxima and its predicates are pure functions over a
+# vector of descriptors, so no GPU, no AOT target, and no libggml-sycl link.
+# Mirrors the test-gpu-arch pattern above for the same reason: the production
+# consumer (populate_host_zone_sizing) is static inside a ~94k-line SYCL TU.
+# Unlike test-gpu-arch this target deliberately takes NO -fsycl: zone-sizing.cpp
+# includes no SYCL header, and staying SYCL-free is what makes it build in
+# seconds. (The same file is also globbed into libggml-sycl at :42, where it is
+# compiled with -fsycl like every other backend TU; that is the production
+# build, this target is the host-only one.)
+add_executable(test-zone-sizing
+    tests/test-zone-sizing.cpp
+    zone-sizing.cpp
+)
+target_include_directories(test-zone-sizing PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+add_test(NAME zone-sizing COMMAND test-zone-sizing)
+set_tests_properties(zone-sizing PROPERTIES
+    LABELS "sycl;memory;planner;tdd"
+    TIMEOUT 60
+)
+
 # Test: a Battlemage device is never gated onto the legacy mul_mat path.
 # Guards the gate dispatch.hpp reads (family -> supports_esimd_dpas), which is
 # what silently demoted the B70, and calls is_unified_kernel_enabled_for_device
