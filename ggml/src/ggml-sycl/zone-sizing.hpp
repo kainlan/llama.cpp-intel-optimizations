@@ -29,6 +29,20 @@
 
 namespace ggml_sycl {
 
+// NAMING. The two function prefixes below are a contract, not drift:
+//
+//   zone_*        pure. No global state, no output, same answer for the same
+//                 arguments. Free to call from anywhere, including a hot path.
+//   zone_sizing_* touches the process-global accounting table (under a mutex)
+//                 or emits log output.
+//
+// zone_detect_collapse and zone_sizing_warn_if_collapsed are the pattern in
+// miniature: a pure detector and its logging wrapper, deliberately named on
+// opposite sides of the line. Put a new function on the side its behaviour
+// puts it, and do not rename across the line for prefix uniformity — the
+// prefix is how a call site knows, without reading the body, whether it is
+// calling something free or something that takes a mutex and writes to a log.
+
 // Minimal descriptor: deliberately NOT placement_tensor_info, so this header
 // stays free of unified-cache.hpp (which pulls in SYCL and the whole backend).
 // populate_host_zone_sizing adapts its inventory into these at the call site.

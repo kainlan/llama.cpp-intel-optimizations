@@ -362,6 +362,53 @@ int main() {
               "an empty inventory must not signal collapse");
     }
 
+    // ---- Case 11: the collapse detector's boolean shape ---------------------
+    // This case deliberately does NOT call zone_scoped_maxima, and must not be
+    // "simplified" to do so.
+    //
+    // All three path predicates currently delegate to zone_is_per_layer_weight
+    // with the same arguments, so every maxima struct zone_scoped_maxima can
+    // produce has onednn_eligible == cpu_quant_eligible == dma_streamed. Over
+    // three pairwise-identical comparisons `a && b && c` is logically the same
+    // as `a || b || c`, which makes the detector's "every path" conditions
+    // indistinguishable from "any path" through any fixture built that way --
+    // mutating && to || passes every other case in this file. Constructing
+    // path_scoped_maxima by hand is the only way to reach the diverged inputs
+    // that zone-sizing.hpp promises the predicates will eventually produce, and
+    // it pins the shape before divergence makes the bug reachable. Routing this
+    // back through zone_scoped_maxima would silently delete the coverage while
+    // leaving the case looking like it still tests something.
+    //
+    // What the wrong shape would cost: `||` fires NO_FAMILY on a healthy model
+    // as soon as any single path legitimately classifies nothing -- a false
+    // positive on the one diagnostic whose entire value is staying silent.
+    {
+        // Only the entry count is read from the inventory here; the maxima are
+        // supplied directly. It just has to clear the minimum-size guard.
+        const std::vector<zone_tensor_desc> big(ggml_sycl::k_zone_collapse_min_inventory,
+                                                desc("entry", MISTRAL_FFN_BYTES, TYPE_Q4_0, 4096, 14336, 1, 1));
+
+        // One path classified nothing; the other two narrowed. Not a collapse.
+        path_scoped_maxima one_path_unclassified;
+        one_path_unclassified.any_tensor         = MISTRAL_OUTPUT_BYTES;
+        one_path_unclassified.onednn_eligible    = 0;
+        one_path_unclassified.cpu_quant_eligible = MISTRAL_FFN_BYTES;
+        one_path_unclassified.dma_streamed       = MISTRAL_FFN_BYTES;
+        CHECK(ggml_sycl::zone_detect_collapse(big, one_path_unclassified) == ggml_sycl::zone_collapse_signal::NONE,
+              "one path classifying nothing while the others narrow is not a collapse");
+
+        // One path reached the global max; the other two narrowed. Also not a
+        // collapse -- that path's largest eligible tensor is simply the largest
+        // tensor in the model.
+        path_scoped_maxima one_path_unnarrowed;
+        one_path_unnarrowed.any_tensor         = MISTRAL_OUTPUT_BYTES;
+        one_path_unnarrowed.onednn_eligible    = MISTRAL_OUTPUT_BYTES;
+        one_path_unnarrowed.cpu_quant_eligible = MISTRAL_FFN_BYTES;
+        one_path_unnarrowed.dma_streamed       = MISTRAL_FFN_BYTES;
+        CHECK(ggml_sycl::zone_detect_collapse(big, one_path_unnarrowed) == ggml_sycl::zone_collapse_signal::NONE,
+              "one path reaching the global max while the others narrow is not a collapse");
+    }
+
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
     return 0;
 }
