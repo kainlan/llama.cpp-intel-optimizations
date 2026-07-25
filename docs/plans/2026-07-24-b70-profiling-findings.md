@@ -2,7 +2,12 @@
 
 **Date:** 2026-07-24
 **Task:** codescout `llama.cpp-fuo6` (B70 plan, T12)
-**Build:** `f7d59875f` (branch `feature/sycl-b70-capability`), llama-bench reports `b12095-1cd23b843`
+**Build:** `b12095-1cd23b843` as self-reported by llama-bench — the binary was built at 19:31,
+so it predates `f7d59875f` (committed 20:11). An earlier revision of this header wrongly
+named `f7d59875f` as the build. `f7d59875f`'s only functional change is an early return for a
+negative device id in a diagnostic, so the difference does not affect any measurement here,
+but the runs were **not** taken on branch HEAD.
+**Branch:** `feature/sycl-b70-capability`
 **Hardware:** Arc Pro B70 (Battlemage G31, `8086:e223`, 32.6 GB, 256 CU) = `level_zero:0`;
 Arc Pro B50 (Battlemage G21, `8086:e212`, 16.3 GB, 128 CU) = `level_zero:1`
 **Model:** `gpt-oss-20b-mxfp4.gguf` (11.27 GiB, 20.91 B) throughout
@@ -43,12 +48,14 @@ The B70 completes its MoE kernel work **2.32x faster** than the B50 yet delivers
 that is not kernel execution. Kernel-level tuning — tile shapes, occupancy, the 256-CU
 hypothesis — is optimizing the small end of the token.
 
-**A separate, actionable finding (§4.4): `GGML_SYCL_UNIFIED_FORCE_LEGACY=1` is worth
-+21.8% tg128 on the B70**, with both correctness gates passing and run-to-run variance
-collapsing 9x. It buys this **without changing GPU kernel time at all** (662.56 vs 663.87 ms
-captured) — the entire saving comes out of the ~22 ms/token non-kernel cost above. That is
-independent of the capability fix, does not reproduce on the B50, and is the most valuable
-lead this task produced.
+> **RETRACTED — see §4.4.** An earlier revision of this document claimed
+> `GGML_SYCL_UNIFIED_FORCE_LEGACY=1` was worth **+21.8% tg128** on the B70. **It is not.**
+> An interleaved replication (`llama.cpp-ey6x`, commit `519d1f146`) measured **+2.3%,
+> t = 0.72 on 5 df — not significant**, with a confidence interval that excludes an effect
+> of the size I claimed. My runs were **sequentially blocked**, so they could not separate
+> the flag from session drift. The accompanying "9x variance collapse" claim does not
+> survive either. What survives is the *mechanism*: the flag changes no GPU kernel time,
+> which the replication independently confirmed by routing trace.
 
 ---
 
@@ -72,7 +79,7 @@ searches miss it.
 
 Every absence claim remaining in this document has been re-verified that way.
 
-### 2.1 `GGML_SYCL_UNIFIED_FORCE_LEGACY` — live, and the strongest lever found
+### 2.1 `GGML_SYCL_UNIFIED_FORCE_LEGACY` — live, but measures null (see §4.4)
 
 `ggml/src/ggml-sycl/ggml-sycl.cpp:51353-51354`, inside the MUL_MAT body:
 
@@ -84,7 +91,9 @@ static bool force_legacy = (std::getenv("GGML_SYCL_UNIFIED_FORCE_LEGACY") != nul
 **Semantics discrepancy worth knowing:** the test is `!= nullptr`, so *any* value enables the
 bypass — including `GGML_SYCL_UNIFIED_FORCE_LEGACY=0`. The docs' `=1` spelling implies a
 value check that does not exist. Anyone exporting it as `0` to disable it will get the
-opposite of what they intend. See §4.4 for what this flag is worth.
+opposite of what they intend, and any control arm must use `env -u` rather than `=0`. It is
+also `static`, so it latches on first evaluation. See §4.4: measured against an interleaved
+control, this flag's throughput effect is **not significant**.
 
 ### 2.2 `GGML_SYCL_UNIFIED_KERNEL` — live, and the direct test of T3's fix
 
@@ -225,55 +234,86 @@ baseline and this build is essentially just that one commit.
 This confirms the lead's revised hypothesis in tracker comment `c-aagr`, and by a stronger
 route than expected: the unified-kernel MUL_MAT share of decode is not ~10%, it is **0%**.
 
-### 4.4 `GGML_SYCL_UNIFIED_FORCE_LEGACY=1` is worth +21.8% tg128 on the B70
+### 4.4 RETRACTED: `GGML_SYCL_UNIFIED_FORCE_LEGACY=1` is **not** worth +21.8% tg128
 
-This is a different bypass point from §2.2's knob — `ggml-sycl.cpp:51354` skips the entire
-unified MUL_MAT block, *including the oneDNN FP16 matmul path and the
-COALESCED->SOA->AOS layout-resolution logic nested inside it*, where
-`GGML_SYCL_UNIFIED_KERNEL=0` only turns off the unified-kernel gate. They are not
-interchangeable, and they do not produce the same result.
+**An earlier revision of this document reported +21.8% tg128 on the B70 from this flag. That
+result does not replicate and is withdrawn.** It was superseded by an interleaved
+replication in `llama.cpp-ey6x` (commit `519d1f146`), which is the measurement to trust.
 
-| B70, clean card, 5 reps per run | pp512 | tg128 |
-|---|---:|---:|
-| default (8 runs) | 1353.74 ± 64.52 | 37.27 ± 2.70 |
-| `GGML_SYCL_UNIFIED_FORCE_LEGACY=1` (3 runs) | **1416.62 ± 0.66** | **45.41 ± 0.30** |
-| | **+4.6%** | **+21.8%** |
+#### What the replication found
 
-**Correctness verified** — this is a throughput claim, so both canonical gates were run:
+| B70, interleaved, 6 pairs | paired tg128 diff (legacy − default) |
+|---|---:|
+| mean | **+1.02** |
+| sd / sem | 3.48 / 1.42 |
+| per-pair | −0.31, +6.04, −3.18, +4.23, −1.36, +0.69 |
+| t (5 df) | **0.72** (needs \|t\| > 2.57 at p = 0.05) |
+| verdict | **+2.3%, not significant** |
 
-- GPT-OSS 20B chat gate with the flag set: `1, 2, 3, 4, 5`. Passes.
-- Mistral 7B Q4_0 completion gate (Q4_0 is the other `should_use_unified` type, so it
-  exercises the bypassed path hardest): output is **byte-identical** with and without the
-  flag.
+Its 95% CI is roughly [−2.6, +4.7] tok/s, which **excludes** the ~+8 tok/s effect I claimed.
 
-**It buys this without changing GPU kernel time at all.** A decode profile with the flag set
-is indistinguishable from the default one — same kernels, same call counts, 662.56 ms
-captured vs 663.87 ms (−0.20%) — while profiled tg128 rises 29.51 -> 39.20, i.e. 33.89 ->
-25.51 ms/token. **All 8.4 ms/token of the saving comes out of the non-kernel cost
-identified in §5.3.** The unified block was being entered, doing layout-resolution and
-eligibility work per call, and then falling through to legacy dispatch anyway — pure host
-overhead for a kernel that never ran. That is also why the profiler could not see it (§5.4:
-oneDNN and host-side work are uninstrumented).
+#### Why my number was wrong
 
-**Two things this is not:**
+My design was **sequentially blocked, not interleaved**, and the blocks were far apart in
+time:
 
-- It is **not** a capability-fix effect. Reversing the fix's own gate (§2.2) does not
-  reproduce it; only the broader block bypass does.
-- It **does not reproduce on the B50**, which is unexplained. Both cards are Battlemage and
-  both pass the same gate, so the asymmetry is real and not understood. The B50 numbers:
+| block | wall-clock window |
+|---|---|
+| all 8 default-configuration runs | 20:21:47 – 20:29:39 |
+| all 3 `FORCE_LEGACY` runs | **20:45:26 – 20:46:37** |
 
-| B50, 2 runs x 5 reps | pp512 | tg128 |
-|---|---:|---:|
-| default | 897.79 ± 2.53 | 33.22 ± 0.01 |
-| `GGML_SYCL_UNIFIED_FORCE_LEGACY=1` | 893.72 ± 3.31 | 33.14 ± 0.45 |
+Sixteen minutes and a great deal of unrelated GPU work separate them — the budget sweep
+(including host-spilling runs), two profiling captures, and three correctness gates. Any
+session-level drift maps exactly onto the treatment boundary, and a blocked design cannot
+separate the two. The replication demonstrated drift of ~7% *within a single unchanged
+configuration* on the B50 (31.00 → 31.44 → 33.20 → 33.22 → 32.95), and per-pair scatter of
+up to 6 tok/s **in both directions** — enough to manufacture an apparent effect of this size.
 
-**The variance collapse is a finding in its own right.** B70 default tg128 has sd 2.70
-across runs (range 32.58–41.11); with the flag it is sd **0.30** (range 45.07–45.65) — a 9x
-reduction, and in line with the B50's inherent sd of 0.01–0.45. **The B70's notorious
-run-to-run instability is caused by the unified MUL_MAT block, not by the card.** That
-alone would justify pursuing this, independently of the throughput.
+The three `FORCE_LEGACY` runs' tight sd of 0.30 is not evidence of stability under the flag;
+it is an artifact of sampling a 90-second window. The "9x variance collapse" claim is
+withdrawn with the rest. Interleaved, the replication measured **sd 2.19 in both arms**, and
+pooled over 11 runs per arm the legacy arm was the *noisier* one (2.55 vs 1.83).
 
-Do **not** flip this default on the strength of one workload — see the recommendation in §7.
+#### The anomaly is in my default arm, not my legacy arm
+
+| arm | tg128 |
+|---|---|
+| my default (8 runs) | 37.27 ± 2.70 [32.58–41.11] |
+| my `FORCE_LEGACY` (3 runs) | 45.41 ± 0.30 [45.07–45.65] |
+| replication default (11 runs) | **43.40 ± 1.83 [40.18–46.09]** |
+
+My *legacy* figure sits close to the replication's *default*. The parsimonious reading is
+that my early block was anomalously slow — not that the flag made anything fast. What
+depressed it is unidentified; the session log shows continuous container churn
+(`runc:[2:INIT]` every ~2 s) throughout, but that is a hypothesis, not a measurement, and it
+is recorded here as unexplained rather than guessed at.
+
+#### What survives
+
+The **mechanism** claim stands, and the replication confirmed it by a better method than
+mine. With `GGML_SYCL_MUL_MAT_ROUTE_TRACE=1` the routing is byte-identical in both arms
+(`backend=legacy kernel=MMQ_COALESCED` x36, `ONEDNN_AOS` x6): **MUL_MAT already routes to
+legacy by default on GPT-OSS**, and the flag only strips host-side preamble ahead of the
+same fall-through. That is consistent with my profile observation that captured kernel time
+is unchanged between arms (662.56 vs 663.87 ms, −0.20%) — but note that comparison was drawn
+from two single profiled runs which were *also* sequentially blocked, so treat the kernel-time
+equality as corroborated by the routing trace, not by my timing.
+
+Correctness results stand and are unaffected by the retraction: with the flag set, the
+GPT-OSS gate returns `1, 2, 3, 4, 5` and the Mistral Q4_0 completion is byte-identical with
+and without.
+
+The B50 null also replicates. **My "unexplained B50/B70 asymmetry" dissolves** — in the
+interleaved data *both* cards are null, so there is no asymmetry left to explain.
+
+#### Trap for the next person
+
+`llama-bench`'s reported ± is a **within-process** statistic. On this card the
+**between-process** spread is several times larger and drifts over a session. Any A/B on
+this backend must be **interleaved and paired**, with a paired t-test; sequential blocks
+will produce confident nonsense. This document's §3 baseline advice ("a single run is not a
+baseline") was right but did not go far enough — repetition alone does not help if all the
+repetitions of one arm sit in the same time window.
 
 ---
 
@@ -418,12 +458,13 @@ State these alongside any number quoted from this document.
    (elimination of the `soa.batched` pass) is certain, the magnitude is not.
 6. **Between-run spread is large in the default configuration** (pp512 14.2%, tg128 22.9%).
    Differences below ~15% on pp512 or ~25% on tg128 between single default runs are not
-   evidence of anything. Note this does **not** apply under `FORCE_LEGACY` (§4.4), where sd
-   falls to 0.30 on tg128 — the spread is a property of the code path, not the card.
-7. **§4.4 rests on 3 runs against 8**, on one model and one card. The effect size (+21.8%,
-   non-overlapping ranges 45.07–45.65 vs 32.58–41.11) is far outside the noise and both
-   correctness gates pass, but it has not been tested on Mistral, on the B580, or on
-   prompt-heavy workloads that use the oneDNN PP path the flag also bypasses.
+   evidence of anything. **This understates the problem** — see §4.4's closing note. The
+   spread is not just large, it *drifts* across a session, so repetition within one time
+   window does not control for it. A/Bs on this backend must be interleaved and paired.
+7. **§4.4 is retracted.** Its +21.8% figure came from a sequentially-blocked design and did
+   not replicate under interleaving (+2.3%, t = 0.72, n.s.). The retraction is the honest
+   record of a claim this document previously made with too much confidence, on 3 runs
+   against 8 taken 16 minutes apart.
 8. **An earlier revision of this document contained two false claims** (§2.0) about missing
    `getenv` sites and dead callers, both produced by trusting the codescout index for
    absence inside `ggml-sycl.cpp`. They are corrected here, and the conclusions they were
@@ -436,22 +477,18 @@ State these alongside any number quoted from this document.
 
 No code changes were made in this task. In priority order:
 
-1. **Chase down the unified MUL_MAT block's host-side cost (§4.4).** This is now the highest-
-   value lead: +21.8% tg128 and a 9x variance reduction on the B70, correctness-verified on
-   both gates, costing zero GPU kernel time. Find out *what* in the block at
-   `ggml-sycl.cpp:51354` costs ~8 ms/token when the kernel it guards never runs — the
-   per-call `ggml_sycl_resolve` layout walk and the oneDNN FP16 eligibility checks are the
-   obvious suspects — and fix it properly rather than by flipping the flag's default.
-   **Do not change the default on this evidence alone:** it is one model on one card, the
-   B50 shows no effect, and `FORCE_LEGACY` also bypasses the oneDNN PP path that other
-   workloads (notably Mistral PP) may depend on. Benchmark Mistral and the B580 before
-   touching a default.
-2. **Explain the B50/B70 asymmetry in §4.4.** Both are Battlemage and both pass the same
-   gate, yet only the B70 pays this cost. Whatever the reason, it likely points straight at
-   the mechanism.
-3. **Investigate the rest of the ~22 ms/token non-kernel decode cost.** §4.4 recovers ~8 ms
-   of it; ~14 ms remains, it is card-independent, and it is still the largest single term in
-   decode. Confirm whether SYCL graph replay is actually active during `llama-bench` decode —
+1. **Use an interleaved, paired design for every throughput A/B on this backend.** This is
+   the durable lesson of §4.4: `llama-bench`'s ± is within-process, the between-process
+   spread is several times larger, and it drifts over a session. Sequential blocks produce
+   confident nonsense. Pair the arms, alternate them, and report a paired t-test.
+   **Do not flip `GGML_SYCL_UNIFIED_FORCE_LEGACY`'s default** — the effect that motivated
+   the idea is not there.
+2. ~~Explain the B50/B70 asymmetry.~~ **Dissolved.** Under interleaving both cards are null,
+   so there is no asymmetry to explain.
+3. **Investigate the ~22 ms/token non-kernel decode cost.** It is card-independent and the
+   largest single term in decode. Note the ~8 ms/token that §4.4 once claimed to recover is
+   *not* established, so the whole ~22 ms remains open, not ~14 ms of it.
+   Confirm whether SYCL graph replay is actually active during `llama-bench` decode —
    ~48 µs per launch across ~461 launches/token is the shape of un-batched submission.
 4. **Retire the 256-CU / tile-shape / occupancy line as the primary lever.** It targets at
    most 19% of a decode token, and the unified kernel it would tune does not execute for this
@@ -490,11 +527,17 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_OP_TIMEOUT_MS=180000 \
   ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
   -p 512 -n 128 -r 5 -v
 
-# The +21.8% tg128 result of section 4.4 (any value enables it -- the code tests != nullptr)
-ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_OP_TIMEOUT_MS=180000 \
-  GGML_SYCL_UNIFIED_FORCE_LEGACY=1 \
-  ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
-  -p 512 -n 128 -r 5 -v
+# Any A/B on this backend must be INTERLEAVED and paired -- see section 4.4. Blocked runs
+# (all of arm A, then all of arm B) produced a false +21.8% here. Note the flag tests
+# != nullptr, so use `env -u` for the control arm; setting it to 0 ENABLES the bypass.
+for i in 1 2 3 4 5 6; do
+  for arm in default legacy; do
+    if [ "$arm" = legacy ]; then FL=(GGML_SYCL_UNIFIED_FORCE_LEGACY=1); else FL=(); fi
+    env ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_OP_TIMEOUT_MS=180000 "${FL[@]}" \
+      ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+      -p 512 -n 128 -r 5 -v
+  done
+done   # then paired t-test on the per-pair differences
 
 # Decode kernel profile
 ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_OP_TIMEOUT_MS=180000 \
