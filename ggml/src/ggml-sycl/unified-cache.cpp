@@ -17199,6 +17199,12 @@ static void populate_host_zone_sizing(placement_plan &                          
     //    so this is sized from the largest DMA-streamed tensor rather than the largest in the
     //    model (see zone-sizing.hpp).
     //    Only relevant when weight streaming is active; 0 otherwise (streaming not pre-enabled).
+    //    NOTE: the "0 otherwise" above states INTENDED behaviour, not actual. The assignment
+    //    below is unconditional — the braces are a bare scope for the constexpr, not a streaming
+    //    guard — so the pool is sized on every model whether or not streaming ever engages.
+    //    Do not "fix" this by adding a guard without first establishing whether streaming can
+    //    engage after planning: over-provisioning is safe, an unsized pool would not be. See
+    //    llama.cpp-iaqm.
     //    GGML_SYCL_FORCE_STREAMING enables streaming; planner uses a conservative per-model estimate.
     {
         constexpr size_t k_dma_pipeline_depth = 2;  // Double-buffer (matches resolve_dma_defaults)
