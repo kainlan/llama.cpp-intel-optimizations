@@ -19,6 +19,8 @@ meaningless until this is fixed.
 | Card | Arc Pro B70, `level_zero:0`, PCI `0000:03:00.0` |
 | Model | `/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf` |
 | Command | `llama-bench -p 0 -n 128 -r 3 -v -o csv` |
+| **Clean arm env** | *(no timeline variable set)* |
+| **Profiled arm env** | `GGML_SYCL_TIMELINE=timeline+events`, `GGML_SYCL_TIMELINE_OUTPUT=/tmp/hostoverhead/t_<pair>.json` |
 | Guards | `GGML_SYCL_OP_TIMEOUT_MS=180000`, `timeout 900` per run |
 | Binary under test | **`38c6c52cc` (build 12135)** — identical for all 12 runs |
 | Repo HEAD at capture | `ba6cec314` |
@@ -58,7 +60,9 @@ before each run.
 ### Summary statistics
 
 Computed **across runs**. `llama-bench`'s own `±` is within-process and is
-deliberately not reported here.
+deliberately not reported here. **All standard deviations in this document are
+sample sd (n−1 denominator)**, as is the sd of the per-pair overhead percentages;
+the figures do not reproduce under a population (n) denominator.
 
 | arm | mean | sd | range | cv |
 |---|---:|---:|---|---:|
@@ -82,9 +86,16 @@ The sign is consistent: clean beat profiled in **6 of 6** pairs.
 
 Run with profiling **ON**, so the gate covers the instrumented path.
 
-Deviation from the plan: run on `level_zero:0` (**B70**) rather than the plan's
-`level_zero:1`. The B70 is the card under measurement and the one Task 5 will
-trace, and it is the card demonstrably free of the 18:19 reset. Verbatim:
+Deviation from the plan: invoked with `ONEAPI_DEVICE_SELECTOR=level_zero:0`
+(**B70**) rather than the plan's `level_zero:1`. The B70 is the card under
+measurement and the one Task 5 will trace, and it is the card demonstrably free of
+the 18:19 reset.
+
+**Caveat on that claim:** the gate transcript prints no device-identifying line, so
+the card is *not* independently verifiable from the artifact alone — it rests on the
+selector passed at invocation. `gate.json`'s `device=0` does not settle it either:
+that index is assigned after selector filtering, so a B50-only and a B70-only run
+both log `device=0` (CLAUDE.md, "SYCL Device Selection"). Verbatim:
 
 ```
 > Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5
@@ -106,9 +117,13 @@ The cause is identified: Frigate ffmpeg plus a **concurrent CMake/ninja rebuild 
 another implementer**, which relinked `build/bin/` at 18:46. The interleaved paired
 design is exactly what protects against this, and it did: the *ratio* (2.84 %) is
 sound, and the load spike at pair 4 shows up as that pair's outlying 6.28 % rather
-than as a systematic bias. The *absolute* 48.26 tok/s should be treated as
-provisional and re-confirmed on a quiet machine before being used as a durable
-baseline.
+than as a systematic bias.
+
+**Both absolute means are provisional — the clean 48.26 tok/s and the profiled
+46.88 tok/s alike.** They come from the same 12 runs, and 46.88 is the number the
+VERDICT hands to Tasks 5 and 6, so it inherits this caveat in full. Re-confirm both
+on a quiet machine before either is used as a durable baseline. What is *not*
+provisional is the 2.84 % ratio between them.
 
 **2. The binary changed mid-session, but not mid-series.** All 12 runs report
 `build_commit=38c6c52cc (12135)`; `llama-bench` re-run after the 18:46 relink
@@ -153,14 +168,25 @@ binds here. The cause is **SYCL graph replay** — the same run reports
 graph-recording step enters the instrumented per-op path; the 384 replay steps that
 constitute the overwhelming majority of decode emit no spans at all.
 
+The mechanism, traced to the code: `ggml_backend_sycl_graph_compute`
+(`ggml/src/ggml-sycl/ggml-sycl.cpp:90561`) wraps the instrumented implementation in a
+`compute_impl` lambda (`:90770-90779`), and the timeline scope sits unconditionally at
+the top of that implementation (`:78660`). A replayed step never calls the lambda, so
+neither the `ggml.graph` span nor the per-op `compute_forward` / per-node scopes
+(`:71641`, `:80195`) are ever entered — which is exactly the event profile observed.
+
 Consequence: the trace samples the graph-**recording** step, not the graph-**replay**
 steps. Task 5 must not assume `timeline.unattributed_ms` divided by token count is a
 per-token cost of steady-state decode, and Task 6's attribution of "the ~22 ms/token"
 must state which of the two populations it actually describes. Resolving this is
 outside Task 4's scope, but proceeding without accounting for it would attribute the
 wrong thing. Re-running under `GGML_SYCL_DISABLE_GRAPH=1` would instrument every
-step at the cost of changing the very path being measured — a tradeoff for Task 5 to
-decide, not a fix to apply blindly.
+step at the cost of changing the very path being measured.
+
+> **Decided after this section was written.** That tradeoff is no longer open: the
+> owner approved the re-capture, and **Task 5 will re-capture with graph replay off
+> and re-measure its own baseline** on that path. Decision recorded on tracker task
+> `llama.cpp-3rzr`. The text above stands as the reasoning that prompted it.
 
 ### Which baseline Task 6 quotes against
 
@@ -171,10 +197,26 @@ inflate the residual. Task 6 therefore quotes against the **profiled** baseline,
 converts to real-world impact by discounting 2.84 % — small enough that it cannot
 change which gap class dominates under the plan's >50 % decision rule.
 
-For Task 5's arithmetic: 128 tokens ÷ 46.88 tok/s × 1000 = **2730 ms**. Recompute
-for the actual token count the profile script uses; do not reuse this number blindly.
+**46.88 tok/s carries the same provisional-absolute caveat as Caveat 1** — it comes
+from the identical load-contaminated 12-run series (it is `48.2551 × (1 − 0.0284)`),
+measured with load running 11.75 → 27.07. Re-confirm it alongside the clean baseline
+before treating it as durable. The 2.84 % **ratio** is unaffected: that is what the
+interleaved paired design protects, and it is the part of this result that is settled.
+
+~~For Task 5's arithmetic: 128 tokens ÷ 46.88 tok/s × 1000 = **2730 ms**.~~
+**SUPERSEDED — do not use.** Per the decision on tracker task `llama.cpp-3rzr`
+(see Caveat 4), Task 5 re-captures with graph replay **off** and measures its own
+baseline on that path. A `--wall-ms` derived from the graph-**on** baseline above and
+applied to a graph-**off** trace is a population mismatch that would silently corrupt
+every percentage downstream. The derivation is kept visible as history only.
 
 ```
 VERDICT: Task 6 quotes against the profiled baseline of 46.88 tok/s
 (profiling overhead measured at 2.8% ± 2.0, t=3.54 on 5 df, significant).
 ```
+
+> **Read the VERDICT with two riders**, both above and neither optional:
+> 1. **46.88 tok/s is a provisional absolute** (Caveat 1 — load varied ~130 % across
+>    the series). The 2.8 % overhead ratio is *not* provisional.
+> 2. **The graph-on `wall_ms` derivation is superseded** — Task 5 measures its own
+>    baseline with replay off (`llama.cpp-3rzr`).
