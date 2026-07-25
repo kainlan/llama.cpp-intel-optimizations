@@ -491,6 +491,8 @@ struct placement_plan {
     // DMA staging pool: device-resident double-buffer for host→device weight streaming.
     // Sized as k_dma_pipeline_depth (2 buffers) x the largest DMA-streamed tensor
     // (see zone-sizing.hpp). 0 when streaming disabled.
+    // NOTE: "0 when streaming disabled" is intended, not actual — the assignment is
+    // unconditional. See the NOTE in populate_host_zone_sizing and llama.cpp-iaqm.
     size_t   dma_staging_pool_bytes              = 0;  // Zone: RUNTIME (device VRAM)
     // oneDNN scratchpad: workspace for matmul weight reorder (weights) + activation buffer.
     // Sized as 2 x the largest oneDNN-eligible tensor (see zone-sizing.hpp).
