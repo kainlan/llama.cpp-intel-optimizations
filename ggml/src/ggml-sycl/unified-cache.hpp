@@ -2240,15 +2240,19 @@ class unified_cache {
     };
 
     // Reserve scratch buffers for oneDNN FP16 path.
-    // Call once during model load with max dimensions.
+    // Called lazily during inference from the mul_mat dispatch path, sized for the
+    // matmul at hand — NOT once at model load, despite what this comment used to
+    // claim. The timing is load-bearing: by then the VRAM arena is active with live
+    // weight leases, so ensure_planned_arena_zones() cannot rebuild it (its
+    // live-lease refusal correctly blocks that, and forcing eviction is forbidden).
     // weights_size: max(N*K*2) across all layers (usually FFN down: 14336*4096*2)
     // activations_size: max(M*K*2) where M=max_batch, K=max_dim
-    // When the request exceeds the planned ONEDNN arena zone (a path-scoped sizing
-    // predicate under-estimated for this model), the reservation grows through the
-    // unified-cache allocation path instead of failing: the planned zone size is
-    // raised, an arena re-plan is attempted (which keeps its refusal to rebuild
-    // while allocations are live), and the buffers otherwise come from
-    // unified_alloc() under mem_handle ownership.
+    // So when the request exceeds the planned ONEDNN arena zone (a path-scoped
+    // sizing predicate under-estimated for this model), the reservation grows
+    // instead of failing: the planned zone size is raised and an arena re-plan is
+    // attempted for the rare case where the arena is still empty, but the buffers
+    // normally come from unified_alloc() outside the zone, under mem_handle
+    // ownership.
     bool reserve_onednn_scratch(size_t weights_size, size_t activations_size);
 
     // Get scratch buffers. Returns false if not reserved or sizes exceed reserved.
