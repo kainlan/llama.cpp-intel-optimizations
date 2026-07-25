@@ -65,6 +65,7 @@ Each rule below cost a round of discarded measurements.
    sign. Neither number is the "real" one at 3–4%; the point is that a blocked
    design's output is not a measurement of the flag at all. Pair the arms and
    report the paired statistic.
+
 6. **B70 runs require `GGML_SYCL_OP_TIMEOUT_MS=180000`.** Its cold prestage
    exceeds the 30 s default watchdog. That is not a hang.
 
