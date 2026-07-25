@@ -157,7 +157,7 @@ repeats in the inventory:
 
 ```
 key  = (type, ne[0], ne[1], ne[2], ne[3])
-is_per_layer_weight(t)  <=>  t.has_shape && freq[key(t)] >= k_zone_per_layer_min_group   // 4
+zone_is_per_layer_weight(t)  <=>  t.has_shape && freq[key(t)] >= k_zone_per_layer_min_group   // 4
 ```
 
 A per-layer weight family repeats once per block; the embedding and the LM head
@@ -281,12 +281,18 @@ the original over-provision, but so is reinstating it.
      model-dependent, not a fixed factor.** On Mistral (planned 63.0 MB) the
      floor covers requests up to roughly **4×** the plan. On GPT-OSS the planned
      268.9 MB already exceeds the floor, so the zone is *raised* above it and the
-     floor hides nothing at the planned size; the **~2×** figure recorded during
-     T6 comes from that task's forced-halving experiment, where a plan cut to
-     134.5 MB still sits under the 256 MB floor and the error stays invisible.
+     floor hides nothing at the planned size; the **~2×** figure comes from
+     Task 6's forced-halving experiment
+     (`docs/plans/2026-07-25-sycl-path-scoped-zone-sizing.md`), where a plan cut
+     to 134.5 MB still sits under the 256 MB floor and the error stays invisible.
    - **The measured error today is ~1.78×** — `llama.cpp-2wgg` records Mistral 7B
-     Q4_0 planning 63.0 MB against observed reservation requests of 112.0 /
-     112.4 MB. Nothing fires, because the floor absorbs it.
+     Q4_0 planning 63.0 MB against observed reservation requests of 32.0 / 112.0
+     / 112.4 MB. Those three are the three separate `reserve_onednn_scratch`
+     calls the run makes — they are exactly the `observations=3` the coverage
+     line reports for Mistral at `-p 512`. The ratio is quoted from the 112.x
+     pair because **only they exceed the 63.0 MB plan**; the 32.0 MB request fits
+     inside it and is not an under-estimate at all. Nothing fires for any of the
+     three, because the floor absorbs them.
    - **The root cause is a 3.5556× format expansion**, which is why this is a
      wrong *multiplier shape* rather than a wrong tensor choice. The oneDNN
      weights reorder holds a **dequantized f16 copy**, so the weights half alone
@@ -325,4 +331,6 @@ the original over-provision, but so is reinstating it.
 - `ggml/src/ggml-sycl/zone-sizing.hpp` — the path-scoped sizing predicates,
   their threshold, and the `zone_*` / `zone_sizing_*` naming contract.
 - `docs/plans/2026-07-25-zone-sizing-findings.md` — the measurements every byte
-  figure in "Path-scoped zone sizing" above is quoted from.
+  figure in "Path-scoped zone sizing" above is quoted from (Tasks 1 and 8).
+- `docs/plans/2026-07-25-sycl-path-scoped-zone-sizing.md` — the plan those tasks
+  belong to; read its Amendments 1 and 2 first, as they supersede the body.
