@@ -121,10 +121,39 @@ constexpr size_t k_zone_per_layer_min_group = 4;
 // `group_cardinality` is how many inventory entries share its (type, ne) key.
 bool zone_is_per_layer_weight(const zone_tensor_desc & tensor, size_t group_cardinality);
 
-// The three path predicates are intentionally identical today. They stay
-// separate functions so each consumer's maximum can be narrowed independently
-// once its real constraint is known — do not collapse them into one.
+// True when the tensor is a stack of per-expert matrices rather than a single
+// matmul operand. ne[2] carries the expert count on a MoE weight (32 on
+// GPT-OSS) and is 1 — or unset — on a dense one, so this is structural, like
+// everything else here, and needs no name.
+bool zone_is_moe_expert_tensor(const zone_tensor_desc & tensor);
+
+// The three path predicates are NO LONGER identical: the oneDNN one excludes
+// MoE expert tensors, the other two do not. That divergence is the whole reason
+// they were kept as separate functions — do not re-collapse them.
+//
+// Expert weights are consumed by a separate PP-MoE oneDNN ring with its own
+// sizing (plan.pp_moe_onednn_*), never by reserve_onednn_scratch. Measured, on
+// GPT-OSS 20B MXFP4 at -p 512: `zone sizing coverage: onednn observations=0`
+// and `[ARENA-PP-ONEDNN] reserve_calls=0 get_calls=0`. The path is not merely
+// cold on that model, it is unreachable.
+//
+// Including them cost real VRAM rather than only tidiness. The expert family
+// dominates the eligible set, so it set the zone size for a zone the model
+// never touches: 640.7 MB of ONEDNN zone on GPT-OSS, taken straight out of the
+// arena weight zone, which the MoE down-i8 layout pass then could not spend on
+// granted layers at ~261 MB each.
+//
+// KNOWN, INSTRUMENTED RISK, and the same shape as the LM-head note below. If
+// some future primitive does route an expert tensor through
+// reserve_onednn_scratch, this under-estimates. That is survivable by
+// construction — the zone grows on demand and zone_sizing_record_underestimate
+// counts it — whereas over-inclusion is silent and permanent. Uncertainty
+// resolves toward exclusion HERE, opposite to the per-layer threshold, because
+// here the error is instrumented and there it is not.
 bool zone_is_onednn_reorder_eligible(const zone_tensor_desc & tensor, size_t group_cardinality);
+
+// These two keep expert tensors: the CPU quantization slots and the host->device
+// weight stream both genuinely carry them.
 bool zone_is_cpu_quant_eligible(const zone_tensor_desc & tensor, size_t group_cardinality);
 bool zone_is_dma_streamed(const zone_tensor_desc & tensor, size_t group_cardinality);
 

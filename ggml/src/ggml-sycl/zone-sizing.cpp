@@ -122,7 +122,23 @@ bool zone_is_per_layer_weight(const zone_tensor_desc & tensor, size_t group_card
 // settles it. Do not pre-emptively widen the predicate, and above all do not
 // add a name check to special-case the LM head — a name predicate is exactly
 // what this unit exists to replace.
+bool zone_is_moe_expert_tensor(const zone_tensor_desc & tensor) {
+    // Without a shape there is no evidence either way, and the zeros must not
+    // be allowed to vote — same rule as zone_is_per_layer_weight. Returning
+    // false here means a shapeless entry is not excluded on THIS ground; it is
+    // already excluded by the per-layer predicate below.
+    if (!tensor.has_shape) {
+        return false;
+    }
+    return tensor.ne[2] > 1 || tensor.ne[3] > 1;
+}
+
 bool zone_is_onednn_reorder_eligible(const zone_tensor_desc & tensor, size_t group_cardinality) {
+    // See the header: expert weights go through the PP-MoE oneDNN ring, and
+    // reserve_onednn_scratch is measurably unreachable on a MoE model.
+    if (zone_is_moe_expert_tensor(tensor)) {
+        return false;
+    }
     return zone_is_per_layer_weight(tensor, group_cardinality);
 }
 

@@ -61,6 +61,7 @@ static const size_t F16_BYTES = 2;
 // comments are binary (bytes / 1024^2), matching the findings document.
 static const size_t GPT_OSS_VOCAB_BYTES  = 615329280;  // 586.8 MB, Q8_0  2880 x 201088
 static const size_t GPT_OSS_EXPERT_BYTES = 140988600;  // 134.5 MB, MXFP4 2880 x 2880 x 32
+static const size_t GPT_OSS_ATTN_BYTES   = 8812800;    //   8.4 MB, Q8_0  2880 x 2880 (dense, per-layer)
 static const size_t MISTRAL_OUTPUT_BYTES = 107520000;  // 102.5 MB, Q6_K  4096 x 32000
 static const size_t MISTRAL_EMBD_BYTES   = 73728000;   //  70.3 MB, Q4_0  4096 x 32000
 static const size_t MISTRAL_FFN_BYTES    = 33030144;   //  31.5 MB, Q4_0  4096 x 14336
@@ -115,29 +116,67 @@ int main() {
             inventory.push_back(
                 desc("token_embd.weight." + std::to_string(i), GPT_OSS_EXPERT_BYTES, TYPE_MXFP4, 2880, 2880, 32, 1));
         }
+        // A dense per-layer attention family, 24 blocks. The real model has
+        // several; one is enough to give the oneDNN path something to fall to
+        // once the expert family is excluded from it. Without this the fixture
+        // could not tell "correctly narrowed" from "narrowed to nothing".
+        for (int i = 0; i < 24; i++) {
+            inventory.push_back(
+                desc("blk." + std::to_string(i) + ".attn_out", GPT_OSS_ATTN_BYTES, TYPE_Q8_0, 2880, 2880, 1, 1));
+        }
         inventory.push_back(desc("blk.99.some_weight", GPT_OSS_VOCAB_BYTES, TYPE_Q8_0, 2880, 201088, 1, 1));
         inventory.push_back(desc("blk.98.some_weight", GPT_OSS_VOCAB_BYTES, TYPE_Q8_0, 2880, 201088, 1, 1));
 
         const path_scoped_maxima maxima = zone_scoped_maxima(inventory);
 
         CHECK(maxima.any_tensor == GPT_OSS_VOCAB_BYTES, "gpt-oss any_tensor must equal the global max (586.8 MB)");
-        CHECK(maxima.onednn_eligible == GPT_OSS_EXPERT_BYTES,
-              "gpt-oss onednn_eligible must fall to the expert family (134.5 MB)");
         CHECK(maxima.cpu_quant_eligible == GPT_OSS_EXPERT_BYTES,
               "gpt-oss cpu_quant_eligible must fall to the expert family (134.5 MB)");
         CHECK(maxima.dma_streamed == GPT_OSS_EXPERT_BYTES,
               "gpt-oss dma_streamed must fall to the expert family (134.5 MB)");
         CHECK(is_monotonic(maxima), "gpt-oss maxima must all be <= any_tensor");
 
-        // All four dimensions expand, ne[2] = 32 experts included: 2880 x 2880
-        // x 32 x 2 B = 506.2 MB. Dropping ne[2] would yield 15.8 MB, a 32x
-        // under-size -- the same trap the "never derive a size from ne" rule in
-        // zone-sizing.hpp guards, which is why the adapter and not the
-        // classifier computes this.
-        CHECK(maxima.onednn_reorder == 2880ull * 2880ull * 32ull * F16_BYTES,
-              "gpt-oss onednn_reorder must expand all four dimensions of the expert family (506.2 MB)");
-        CHECK(maxima.onednn_reorder > maxima.onednn_eligible,
-              "gpt-oss onednn_reorder must exceed the stored maximum -- MXFP4 expands 3.76x into f16");
+        // THE DIVERGENCE. The oneDNN path excludes expert tensors -- they are
+        // consumed by the PP-MoE ring, and reserve_onednn_scratch is measurably
+        // unreachable on this model (observations=0 at -p 512). The other two
+        // paths keep them. This is the first time the three predicates disagree
+        // and it is the point of their being separate functions.
+        CHECK(maxima.onednn_eligible == GPT_OSS_ATTN_BYTES,
+              "gpt-oss onednn_eligible must skip the expert family and fall to the dense attention family");
+        CHECK(maxima.onednn_eligible < maxima.cpu_quant_eligible,
+              "the oneDNN path must narrow strictly further than the paths that do carry expert tensors");
+        CHECK(maxima.onednn_reorder == 2880ull * 2880ull * F16_BYTES,
+              "gpt-oss onednn_reorder must expand the DENSE family (15.8 MB), not the expert stack");
+
+        // Regression guard with the measured cost attached, so a future change
+        // that re-admits expert tensors fails here with the reason in hand.
+        // Including them sized the zone from 2880 x 2880 x 32 x 2 B = 506.2 MB,
+        // which produced a 640.7 MB ONEDNN zone on a model that issues zero
+        // reserve calls -- 384.7 MB taken out of the arena weight zone, roughly
+        // 1.5 granted down-i8 layers at ~261 MB each.
+        CHECK(maxima.onednn_reorder != 2880ull * 2880ull * 32ull * F16_BYTES,
+              "expert stack must NOT size the oneDNN reorder: that cost 384.7 MB of weight zone on GPT-OSS");
+    }
+
+    // ---- Case 1b: the expert predicate itself ------------------------------
+    // ne[2] is the expert count. Pinned directly because the whole exclusion
+    // rests on it and a shape convention change would otherwise fail silently
+    // by simply not excluding anything.
+    {
+        const zone_tensor_desc expert = desc("e", GPT_OSS_EXPERT_BYTES, TYPE_MXFP4, 2880, 2880, 32, 1);
+        const zone_tensor_desc dense  = desc("d", GPT_OSS_ATTN_BYTES, TYPE_Q8_0, 2880, 2880, 1, 1);
+
+        CHECK(ggml_sycl::zone_is_moe_expert_tensor(expert), "ne[2]=32 must read as an expert stack");
+        CHECK(!ggml_sycl::zone_is_moe_expert_tensor(dense), "ne[2]=1 must read as a dense operand");
+        CHECK(!ggml_sycl::zone_is_moe_expert_tensor(shapeless_desc("s", 1024, TYPE_Q8_0)),
+              "a shapeless entry must not be classified an expert stack on zeroed dimensions");
+
+        // Cardinality is high enough to clear the per-layer threshold in both
+        // cases, so the only thing separating them here is the expert test.
+        CHECK(!ggml_sycl::zone_is_onednn_reorder_eligible(expert, 72),
+              "an expert tensor must be oneDNN-ineligible however many siblings it has");
+        CHECK(ggml_sycl::zone_is_cpu_quant_eligible(expert, 72), "the CPU quant path must still accept expert tensors");
+        CHECK(ggml_sycl::zone_is_dma_streamed(expert, 72), "the DMA stream path must still accept expert tensors");
     }
 
     // ---- Case 2: the real Mistral 7B Q4_0 layout ----------------------------
