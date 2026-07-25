@@ -16912,6 +16912,87 @@ static void populate_host_zone_sizing(placement_plan &                          
                       inventory_total / (1024.0 * 1024.0), top.c_str());
     }
 
+    // Path-scoped sizing classifies per-layer weights structurally rather than by
+    // name, because GGUF names vary between models: a per-layer weight family
+    // repeats once per block, while the vocab embedding and the LM head are a
+    // singleton or a pair. Report the raw (type, shape) group cardinality
+    // distribution so that separation can be verified against real models instead
+    // of assumed. One line, at plan time only.
+    {
+        std::vector<const placement_tensor_info *> by_key;
+        by_key.reserve(tensor_inventory.size());
+        for (const auto & item : tensor_inventory) {
+            by_key.push_back(&item);
+        }
+        const auto key_less = [](const placement_tensor_info * a, const placement_tensor_info * b) {
+            if (a->type != b->type) {
+                return a->type < b->type;
+            }
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                if (a->ne[d] != b->ne[d]) {
+                    return a->ne[d] < b->ne[d];
+                }
+            }
+            return false;
+        };
+        std::sort(by_key.begin(), by_key.end(), key_less);
+
+        // Sorted, so a run of entries that do not compare less than each other is one group.
+        std::vector<size_t>           cardinalities;
+        const placement_tensor_info * largest_rare        = nullptr;  // cardinality <= 2: vocab candidates
+        size_t                        largest_rare_card   = 0;
+        const placement_tensor_info * largest_family      = nullptr;  // cardinality >= 4: per-layer candidates
+        size_t                        largest_family_card = 0;
+        for (size_t begin = 0; begin < by_key.size();) {
+            size_t end = begin + 1;
+            while (end < by_key.size() && !key_less(by_key[begin], by_key[end])) {
+                ++end;
+            }
+            const size_t card = end - begin;
+            cardinalities.push_back(card);
+            for (size_t i = begin; i < end; ++i) {
+                if (card <= 2 && (largest_rare == nullptr || by_key[i]->size > largest_rare->size)) {
+                    largest_rare      = by_key[i];
+                    largest_rare_card = card;
+                }
+                if (card >= 4 && (largest_family == nullptr || by_key[i]->size > largest_family->size)) {
+                    largest_family      = by_key[i];
+                    largest_family_card = card;
+                }
+            }
+            begin = end;
+        }
+
+        const size_t group_count = cardinalities.size();
+        std::sort(cardinalities.begin(), cardinalities.end());
+        std::string hist;
+        for (size_t begin = 0; begin < cardinalities.size();) {
+            size_t end = begin;
+            while (end < cardinalities.size() && cardinalities[end] == cardinalities[begin]) {
+                ++end;
+            }
+            char bucket[64];
+            std::snprintf(bucket, sizeof(bucket), "%s%zux%zu", begin ? " " : "", cardinalities[begin], end - begin);
+            hist += bucket;
+            begin = end;
+        }
+
+        char rare[192] = "none";
+        if (largest_rare != nullptr) {
+            std::snprintf(rare, sizeof(rare), "%s %.1fMB (card=%zu)", largest_rare->name.c_str(),
+                          largest_rare->size / (1024.0 * 1024.0), largest_rare_card);
+        }
+        char family[192] = "none";
+        if (largest_family != nullptr) {
+            std::snprintf(family, sizeof(family), "%s %.1fMB (card=%zu)", largest_family->name.c_str(),
+                          largest_family->size / (1024.0 * 1024.0), largest_family_card);
+        }
+        GGML_LOG_INFO(
+            "[SYCL-PLAN] inventory groups: %zu distinct (type,ne) groups over %zu tensors; cardinality histogram: %s; "
+            "largest card>=4: %s; largest card<=2: %s\n",
+            group_count, tensor_inventory.size(), hist.c_str(), family, rare);
+    }
+
     for (const auto & entry : plan.entries) {
         plan.max_staging_pair_bytes =
             std::max(plan.max_staging_pair_bytes, entry.src_size + std::max(entry.dst_size, entry.src_size));
