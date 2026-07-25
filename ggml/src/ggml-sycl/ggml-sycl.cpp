@@ -9758,7 +9758,22 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
             max_tensor_bytes = std::max(max_tensor_bytes, inventory->tensors[i].size);
         }
     }
-    g_tensor_inventory_onednn_scratchpad_bytes = max_tensor_bytes * 2;
+    // This — not plan.onednn_scratchpad_bytes — is what actually sizes the VRAM
+    // ONEDNN zone: it lands in g_planned_onednn_scratchpad_bytes[device] and is
+    // read back by ensure_planned_arena_zones. So it must be narrowed by the
+    // same structural classifier the plan uses, or the zone keeps paying for the
+    // vocabulary embedding / LM head, which no oneDNN matmul reorder ever sees.
+    // g_tensor_inventory_detail carries type and ne under the same validity
+    // condition zone-sizing's has_shape() tests, so the classifier applies to it
+    // directly.
+    const ggml_sycl::path_scoped_maxima inventory_maxima =
+        ggml_sycl::zone_scoped_maxima(ggml_sycl::unified_cache_adapt_zone_inventory(g_tensor_inventory_detail));
+    GGML_ASSERT(inventory_maxima.any_tensor == max_tensor_bytes);
+    g_tensor_inventory_onednn_scratchpad_bytes = inventory_maxima.onednn_eligible * 2;
+    GGML_LOG_INFO(
+        "[SYCL-PLAN] inventory oneDNN scratchpad: %.1f MB (2 x onednn_eligible %.1f MB; global max %.1f MB)\n",
+        g_tensor_inventory_onednn_scratchpad_bytes / (1024.0 * 1024.0),
+        inventory_maxima.onednn_eligible / (1024.0 * 1024.0), max_tensor_bytes / (1024.0 * 1024.0));
     ggml_sycl::unified_cache_set_planned_onednn_scratchpad_bytes(ctx->device,
                                                                  g_tensor_inventory_onednn_scratchpad_bytes);
     {

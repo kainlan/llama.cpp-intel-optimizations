@@ -15,6 +15,7 @@
 #include "residency-plan.hpp"
 #include "tlsf-allocator.hpp"
 #include "unified-cache-key.hpp"
+#include "zone-sizing.hpp"
 
 #include <array>
 #include <atomic>
@@ -358,6 +359,17 @@ struct placement_tensor_info {
 
     bool has_shape() const { return type >= 0 && type < GGML_TYPE_COUNT && ne[0] > 0 && ne[1] > 0; }
 };
+
+// Adapt a placement inventory into the dependency-free descriptors that the
+// structural zone classifier consumes (see zone-sizing.hpp). Two independent
+// sites size zones from a maximum over an inventory — populate_host_zone_sizing
+// and the tensor-inventory registration in ggml-sycl.cpp — and both must feed
+// the classifier the SAME fields. An adapter that dropped type/ne/has_shape
+// would put every tensor in its own group, classify nothing as a per-layer
+// weight family, and silently collapse every maximum back to the global one,
+// which is indistinguishable from the reclaim genuinely being zero. Shared so
+// there is one place for that to be right.
+std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vector<placement_tensor_info> & inventory);
 
 // Per-device VRAM budget for multi-GPU placement planning.
 struct device_budget {

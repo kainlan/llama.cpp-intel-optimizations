@@ -16869,6 +16869,23 @@ static size_t maybe_upgrade_moe_gate_up_layouts_to_i8(placement_plan & plan,
     return charged_bytes;
 }
 
+std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vector<placement_tensor_info> & inventory) {
+    std::vector<zone_tensor_desc> zone_inventory;
+    zone_inventory.reserve(inventory.size());
+    for (const auto & item : inventory) {
+        zone_tensor_desc desc;
+        desc.size      = item.size;  // authoritative magnitude; never recomputed from ne
+        desc.type      = static_cast<int>(item.type);
+        desc.has_shape = item.has_shape();
+        for (int d = 0; d < GGML_MAX_DIMS && d < 4; ++d) {
+            desc.ne[d] = item.ne[d];
+        }
+        desc.name = item.name;
+        zone_inventory.push_back(std::move(desc));
+    }
+    return zone_inventory;
+}
+
 static void populate_host_zone_sizing(placement_plan &                           plan,
                                       const std::vector<placement_tensor_info> & tensor_inventory,
                                       int                                        n_experts,
@@ -16887,24 +16904,9 @@ static void populate_host_zone_sizing(placement_plan &                          
     // Path-scoped maxima: "the largest tensor MY path can reach", per consumer,
     // instead of one global maximum handed to every zone. The classifier is
     // structural (see zone-sizing.hpp) and lives in its own dependency-free TU,
-    // so the inventory is adapted into its descriptor here. Carry type, ne and
-    // has_shape as well as size: the grouping keys on (type, ne), and an adapter
-    // that copied only name and size would put every tensor in its own group,
-    // classify nothing as a per-layer weight, and silently collapse every
-    // maximum back to the global one.
-    std::vector<ggml_sycl::zone_tensor_desc> zone_inventory;
-    zone_inventory.reserve(tensor_inventory.size());
-    for (const auto & item : tensor_inventory) {
-        ggml_sycl::zone_tensor_desc desc;
-        desc.size      = item.size;  // authoritative magnitude; never recomputed from ne
-        desc.type      = static_cast<int>(item.type);
-        desc.has_shape = item.has_shape();
-        for (int d = 0; d < GGML_MAX_DIMS && d < 4; ++d) {
-            desc.ne[d] = item.ne[d];
-        }
-        desc.name = item.name;
-        zone_inventory.push_back(std::move(desc));
-    }
+    // so the inventory is adapted into its descriptor first.
+    const std::vector<ggml_sycl::zone_tensor_desc> zone_inventory =
+        ggml_sycl::unified_cache_adapt_zone_inventory(tensor_inventory);
     const ggml_sycl::path_scoped_maxima zone_maxima = ggml_sycl::zone_scoped_maxima(zone_inventory);
 
     // Non-destructiveness guard: every consumer not yet repointed still reads
