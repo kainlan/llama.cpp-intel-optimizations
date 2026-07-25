@@ -480,8 +480,19 @@ clean boot: `GGML_SYCL_MOE_BLOCK_GRAPHLETS`, `GGML_SYCL_XMX_MOE_PP` /
 `GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP`, `GGML_SYCL_PP_PIPELINE` (the last has shown
 GPT-OSS chat correctness failures).
 
+⚠️ **The stale guardrail above is also baked into the tracker**, where the doc
+pass could not reach it. `llama.cpp-po3nd.2` (epic, 42 dependents) carries both
+dead figures in its **acceptance criteria**, and a June "gate audit" propagated
+them into every open child (`.2.13`, `.2.21`, `.2.27`, `.2.30`, `.2.38`, `.2.45`,
+`.2.46`) plus `llama.cpp-ix58x` and `llama.cpp-aqzz3`. Both conditions are now
+unreachable — B50 ≥1100 PP512 exceeds a healthy card, and the B580 gate names
+hardware that is no longer installed — so those tasks cannot be closed as
+written. See the 2026-07-25 comment on `llama.cpp-po3nd.2`. Re-read the gate from
+`docs/backend/sycl-perf-baselines.md`, never from a task's acceptance criteria.
+
 Active regression-hunt state (commit deltas, suspect changes) lives in the
-codescout task tracker — see `llama.cpp-p92r`.
+codescout task tracker. Find it with `task_search` (pass `semantic=false` — the
+semantic path times out on this store); there is no single standing task id.
 
 ### SYCL Environment Variables
 
