@@ -108,3 +108,24 @@ GGML_SYCL_PERSISTENT_TG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
 | `GGML_SYCL_GRAPH_RERECORD=1` | Use graph re-record instead of replay (very slow, diagnostic only) |
 | `GGML_SYCL_OP_TIMEOUT_MS=<N>` | Abort with diagnostic if no inference progress for N ms (default 30000, set to 0 to disable). Fires before the xe driver's 10s GT reset cascade. Effective detection latency is `timeout + ~500 ms`. |
 | `GGML_SYCL_SAFE_MODE=1` | Drain the SYCL queue after every op submit so a fault surfaces at the op that caused it (2-3x slowdown, implies `GGML_SYCL_DISABLE_GRAPH=1`). Useful for CI canaries and correlating intermittent hangs 1:1 with their triggering op. |
+| `GGML_SYCL_MOE_LAYOUT_DEBUG=1` | Emit the `[MOE-LAYOUT]` per-pass summary unconditionally. The down-i8 / gateup-i8 lines already fire on ANY decline without this; the variable adds the lines a fully-successful pass would otherwise not print. |
+| `GGML_SYCL_MOE_DOWN_I8_MAX_TENSORS=<N>` | Hard cap on how many down tensors the MoE I8 layout pass upgrades. Unset (or negative) = no cap, the shipping behaviour; `0` disables the upgrade. **Diagnostic only — do not set in production.** See the measured cost below. |
+| `GGML_SYCL_ARENA_PP_PROFILE=1` | Emit `[ARENA-PP-*]` counters, including `[ARENA-PP-ONEDNN] … reserve_req_mb=W/A` — the summed oneDNN weights/activations reservation requests. This is the **only** log that reports what was actually asked for, as opposed to what was planned. |
+
+### `GGML_SYCL_MOE_DOWN_I8_MAX_TENSORS` — what it costs to cap
+
+Measured on GPT-OSS 20B MXFP4, B50, `-p 512 -n 128 -fa 1`, 6 interleaved rounds
+per level (`docs/plans/2026-07-25-moe-down-i8-dose-response-findings.md`):
+
+| granted | pp512 | tg128 |
+|--------:|------:|------:|
+| 0 | 605.51 | 34.14 |
+| 2 | 913.50 | 35.13 |
+| 5 | 907.13 | 35.56 |
+
+**Setting this to 0 costs 33.7% of pp512.** The layout upgrade is load-bearing
+for the ~894 pp512 baseline, not a marginal tuning knob. Beyond 2 layers the
+trade is small and roughly symmetric: −0.70% pp512 for +1.24% tg128 going 2→5.
+The variable exists to isolate the layout from the VRAM reclaim that pays for
+it; `GGML_SYCL_VRAM_ARENA_EXTERNAL_HEADROOM_MB` cannot do that job because it
+moves the arena, the zones and the resident set at the same time.
