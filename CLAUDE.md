@@ -216,14 +216,25 @@ Confirmed lessons from prior work on this fork. Treat them as defaults.
 
 ### Communication & Workflow
 - **The user reads Discord, not the terminal.** CLI output is invisible to them. Any question, confirmation, decision prompt, or status update intended for the user MUST go through the Discord reply tool (the harness supplies the channel id each session). Terminal text is logging only — never "await a reply" there.
-- **Work in-place on the active feature branch** (currently `feature/sycl-coalescing`); skip git worktrees. A worktree forces a fresh `build/` and loses the ~10-min ccache-warm hit rate. When reviewing diffs, bound by BASE_SHA/HEAD_SHA, not "everything on the branch."
+- **Work in-place on the active feature branch** (`git branch --show-current` — do not trust a branch name written down here); skip git worktrees. A worktree forces a fresh `build/` and loses the ~10-min ccache-warm hit rate. When reviewing diffs, bound by BASE_SHA/HEAD_SHA, not "everything on the branch."
+- **`git merge-base HEAD master` is usually the WRONG before-point for a measurement.** On a long-lived feature branch it can sit dozens of commits behind the work you are attributing, silently crediting your change with everything in between. Use the commit immediately before your own first commit.
 - **Fix-forward, never revert.** If a build or correctness test fails mid-implementation, diagnose and fix in a new commit. Don't `git revert` or `git checkout --` to undo progress.
 - **Verify correctness before claiming any perf win.** `llama-bench` measures tok/s only — a change can boost throughput by silently skipping or mis-staging work and still emit garbage tokens. Before committing any change to kernel dispatch, weight staging, graph replay, or allocation routing, run the canonical Mistral completion gate (see "Verification Commands & Correctness Gates") and confirm the output. A fake +19.6% PP "win" shipped this way once and had to be reverted.
 
 ### Safety (these have hung or exhausted memory on this host)
 - **Never run `test-backend-ops` in a subagent or background task.** It allocates hundreds of GPU BOs whose TTM shmem backing grows to 50–224 GB and exhausts memory, so the kernel out-of-memory handler stops the process (two hangs on 2026-04-06). For automated GPU testing use only `llama-bench`, `llama-completion`, or a targeted `ctest -R <name>`. Run `test-backend-ops` manually, with monitoring, only.
 - **Always `timeout 60` GPT-OSS 20B test runs.** The historical host-MoE-routing hang (GuC `guc_id=6`, unrecoverable, requires reboot) was closed by commit `ec7f04ac4`, but keep the timeout as a guard. Distinguish the userspace hang (`guc_id=6`, attributed `in <llama-bench>`, unrecoverable) from the benign environmental XE timeout (`guc_id=0`, `in no process [-1]`, auto-recovers).
-- **Benchmark numbers are invalid after any crash or forced stop on that card** (xe GT reset cascades) — check `dmesg` first. `SAFE_MODE`/op-timing diagnostics can themselves stall cards.
+- **Benchmark numbers are invalid after any crash or forced stop on that card** (xe GT reset cascades) — check the kernel log first. `SAFE_MODE`/op-timing diagnostics can themselves stall cards.
+- **`dmesg` is privilege-denied for this user** (`read kernel buffer failed: Operation not permitted`). Every "check dmesg" instruction in this repo's docs must be run as:
+  ```bash
+  journalctl -k --since "1 hour ago" --no-pager | grep -iE 'GT reset|guc_id|GPU hang|xe.*reset'
+  ```
+  which works unprivileged. A silent `dmesg` failure looks identical to a clean log.
+- **Check for competing load before any throughput measurement.** `uptime` plus `pgrep -af 'codescout|ninja|icpx|ffmpeg'`. A codescout re-index has been observed holding 600–1430% CPU for hours; Frigate ffmpeg adds ~250%. Interleaved paired A/Bs survive sustained load, but **absolute** numbers taken under it are depressed and must not become baselines.
+
+### Tooling
+- **codescout's index is BLIND inside `ggml/src/ggml-sycl/ggml-sycl.cpp`** (~60k lines). `search_text` and `find_references` return matches tagged `source: index` and silently omit real occurrences in that file — despite `search_text` being documented as an exhaustive live grep. This is not theoretical: an entire implementation plan was written on the false premise that a field had no other writers, because the one call site that mattered was missed. It cost a task to discover empirically. **In that file, verify with `cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -n '<pattern>'`** — a downstream pipe grep is permitted by the search hook; only command-position in-repo search is redirected. Never conclude "no other uses" there from codescout alone.
+- **`/tmp` is tmpfs and does not survive a reboot.** Anything a later step depends on belongs in the committed artifact (a findings doc, a commit message), not in `/tmp`. A mid-session reboot has already destroyed capture artifacts here. An empty or missing artifact directory means *not verified*, never "nothing observed" — a `grep` over it passes vacuously.
 
 ### Architecture
 - **The unified cache owns all GPU/host memory** (decision Feb 9, 2026). Weight placement, eviction (device→pinned host→mmap), and budget tracking all flow through it.
@@ -265,8 +276,15 @@ ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion \
   -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 
-# GPT-OSS B50 chat correctness gate. Expected output starts:
-# : 1, 2, 3, 4, 5
+# GPT-OSS B50 chat correctness gate. With --no-display-prompt the prompt echo
+# lands on the interactive "> " line and the model's ANSWER is the next line,
+# on its own:
+#   > Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5
+#   1, 2, 3, 4, 5
+# The gate is the digit sequence. (An older note here said the output starts
+# ": 1, 2, 3, 4, 5" — that colon was the tail of the echoed PROMPT, which itself
+# ends "...only: 1, 2, 3, 4, 5", captured in a pre-`--no-display-prompt` form.
+# Grepping for the colon form makes a passing gate read as a failure.)
 # Use the GGUF tokenizer.chat_template metadata. Do not force
 # `--chat-template gpt-oss`; that selects the older native formatter.
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-cli \
@@ -284,6 +302,30 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
 # Test backend operations (after modifying ggml operators)
 ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-backend-ops
 ```
+
+#### `llama-bench` traps (both cost real time)
+
+**1. `-v` is MANDATORY when you want log output.** `llama-bench` installs a null
+log callback (`tools/llama-bench/llama-bench.cpp`, `if (!params.verbose)
+{ llama_log_set(llama_null_log_callback, NULL); }`), so **every** `GGML_LOG_INFO`
+— all `[SYCL-PLAN]`, `[UNIFIED-CACHE]`, `[VRAM-ARENA]`, `[HOST-ARENA]`,
+`[MOE-LAYOUT]` lines — is silently discarded without it. A grep then returns
+nothing, which is indistinguishable from "my change had no effect" or "that zone
+never got sized". **Always confirm a RED capture is non-empty before changing
+code**; an empty baseline proves nothing and voids the before/after.
+
+```bash
+timeout 900 env ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-bench \
+  -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -p 0 -n 4 -r 1 -v 2>&1 | grep ...
+```
+
+Note `-p 0 -n 4` triggers planning but does **no prompt processing**, so paths
+reached only during PP will show zero activity. Use `-p 512` when you need them.
+
+**2. ONE model per process.** Passing two `-m` flags to a single `llama-bench`
+aborts at the model switch on a leaked model-weight `mem_handle` lease
+(`unified-cache.cpp`, `reset_model_weight_entries: leaked model-weight
+mem_handle lease`). Loop the shell, don't loop the flag.
 
 ### GPT-OSS Prompt Template Rule
 
@@ -382,14 +424,27 @@ QSV/OpenVINO jobs on the iGPU render node are not B70/B50 consumers.
 
 ### Performance Expectations
 
-Full throughput tables (persistent-TG modes, GPT-OSS MXFP4) live in
-`docs/backend/sycl-perf-baselines.md`. Rough top-line targets for orientation:
-**B50 GPT-OSS 20B MXFP4** ~926 PP512 / ~48 TG128 (target >1100 / ~50+).
+Full tables, run counts and spreads live in `docs/backend/sycl-perf-baselines.md`.
+**Gate against that document, not this one.** Orientation figures, `-p 512 -n 128`,
+driver 26.27:
 
-The **B580 Mistral** figures previously quoted here (~1700 PP512 / ~81 TG128) are
-**superseded — that card is no longer installed.** B70 Mistral targets have not
-been established yet; do not substitute the B580 numbers for the B70. Measuring a
-B70 against a B580 target makes a healthy run look like a catastrophic regression.
+| card | model | PP512 | TG128 |
+|------|-------|------:|------:|
+| Arc Pro B70 (`level_zero:0`) | GPT-OSS 20B MXFP4 | ~1415 | ~44 |
+| Arc Pro B70 (`level_zero:0`) | Mistral 7B Q4_0 | ~2495 | ~108 |
+| Arc Pro B50 (`level_zero:1`) | GPT-OSS 20B MXFP4 | ~894 | ~32 |
+| Arc Pro B50 (`level_zero:1`) | Mistral 7B Q4_0 | ~1188 | ~47 |
+
+Re-measured 2026-07-25 at `79ae63559` (machine under load): B70 1397.55/47.79 and
+2513.76/108.94; B50 902.26/36.55 and 1200.21/46.94. Seven of eight at or above
+baseline, so the table above is current.
+
+**B70 tg128 is the noisy axis** — cv 3.3% over 21 runs, range 40.18–46.27. Ignore
+B70 tg differences below ~10% between single runs. The B50 is steady (cv 0.7% tg,
+0.3% pp), so a B50 move of a few percent is real.
+
+Any **B580** figure in older notes is history — that card was replaced by the B70.
+Measuring a B70 against a B580 target makes a healthy run look catastrophic.
 
 Do not use `GGML_SYCL_FA_ONEDNN_ALLOW=1` to restore Mistral PP numbers — it can
 raise PP throughput, but the deterministic completion gate produces incorrect
@@ -400,16 +455,25 @@ output with the current nc!=D contiguity fast-path.
 Do not accept lower post-merge/post-debug numbers as new baselines (codescout
 tasks `llama.cpp-aqzz3.1`, `llama.cpp-po3nd.2.45/.46`, `llama.cpp-ix58x`):
 
-- **B50 GPT-OSS20B MXFP4 FA-on:** ≥1100 PP512, ~50+ TG128 (restored-fast-path
-  evidence: ~1255 PP512 / 52 TG128), count gate passing.
+**Gate against the rows in `docs/backend/sycl-perf-baselines.md`** (reproduced in
+Performance Expectations above), never against a number remembered from an older
+card or an older driver. Allow the stated spread: B70 tg is noisy (±10% between
+single runs means nothing), the B50 is steady.
+
+- **B50 GPT-OSS 20B MXFP4 FA-on:** ~894 PP512 / ~32 TG128, count gate passing.
+- **B70 GPT-OSS 20B MXFP4 FA-on:** ~1415 PP512 / ~44 TG128, count gate passing.
+- **B50 / B70 Mistral 7B Q4_0:** ~1188 / ~2495 PP512, ~47 / ~108 TG128.
+
+⚠️ **A `≥1100 PP512, ~50+ TG128` B50 GPT-OSS guardrail appeared here until
+2026-07-25 and was wrong** — it predates the 26.27 driver. Against it a healthy
+B50 (~894–902 PP512) reads as an ~18% catastrophe. That stale figure triggered
+three separate false-regression scares in one session. If you find it quoted
+anywhere else, it is wrong there too.
+
 - ~~**B580 Mistral 7B Q4_0 FA-on:** >2000 PP512, >85 TG128~~ — **SUPERSEDED, not
   a gate.** The B580 was replaced by the Arc Pro B70 and is no longer installed.
   The figure `docs/backend/SYCL.md` records (`5b206c499-dirty`, 2173.92 PP512 /
   88.42 TG128) remains valid history *for that card only*. **Do not gate on it.**
-  A B70 measured against it will look catastrophically regressed when it is
-  merely different hardware. B70 guardrails are still to be established — see
-  codescout task `llama.cpp-fuo6` (B70 profiling) and `llama.cpp-ey6x` (baselines
-  refresh). Until then the B50 GPT-OSS gate above is the only hard numeric guard.
 
 Keep these opt-in until same-build B50 GPT-OSS + B70 Mistral gates pass on a
 clean boot: `GGML_SYCL_MOE_BLOCK_GRAPHLETS`, `GGML_SYCL_XMX_MOE_PP` /
@@ -457,12 +521,11 @@ Add `ggml-ci` to commit message to trigger extended CI workloads.
 
 - **Build Details**: `docs/build.md`
 - **Backend SYCL**: `docs/backend/SYCL.md`
-- **SYCL memory design (unified cache + mem_handle)**: `docs/backend/sycl-memory-design.md`
+- **SYCL memory design (unified cache + mem_handle)**: `docs/backend/sycl-memory-design.md` — includes **Path-scoped zone sizing**: how arena zones are sized from a structural `(type, ne)` classifier rather than one global max, the rule for adding a consumer, and the two separate oneDNN sizing sites
 - **SYCL canonical memory contract (enforceable)**: `docs/design/sycl-canonical-memory-architecture.md`
 - **SYCL env-var catalog (fork tuning)**: `docs/backend/sycl-env-vars.md`
-- **SYCL perf baselines (fork)**: `docs/backend/sycl-perf-baselines.md`
+- **SYCL perf baselines (fork)**: `docs/backend/sycl-perf-baselines.md` — **the numeric gate; prefer it over any figure in this file**
 - **GPT-OSS testing rationale**: `docs/backend/gpt-oss-testing.md`
 - **Patched compute-runtime & P2P**: `docs/backend/compute-runtime.md`
 - **Add New Model**: `docs/development/HOWTO-add-model.md`
 - **Contributing**: `CONTRIBUTING.md` (coding/naming guidelines, PR process)
-- **Copilot Instructions**: `.github/copilot-instructions.md` (cross-platform build/test patterns)
