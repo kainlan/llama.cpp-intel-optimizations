@@ -86,14 +86,47 @@ before, during, or after.
 range 40.18–46.09. The B50 is inherently steady (cv 0.7% tg, 0.3% pp). Treat
 B70 tg differences below ~10% between single runs as nothing.
 
+## Current baselines — Mistral 7B Q4_0, FA-on
+
+Same build and method, 5 runs per device (the default arm of the interleaved
+Mistral A/B below). All **MEASURED**:
+
+| Device (selector) | Runs | Free VRAM | PP512 tok/s | TG128 tok/s |
+|---|---:|---|---:|---:|
+| Arc Pro B70 (`level_zero:0`) | 5 | 32602 MiB | **2495.42 ± 62.88** <br>[2425.24–2594.58] | **107.66 ± 1.06** <br>[106.57–109.15] |
+| Arc Pro B50 (`level_zero:1`) | 5 | 16250 MiB | **1187.83 ± 18.79** <br>[1165.35–1211.57] | **46.53 ± 0.19** <br>[46.27–46.78] |
+
+Two things worth noting:
+
+- **The B70 comfortably clears the retired B580 Mistral guardrail** (>2000 PP512,
+  >85 TG128): it measures ~2495 / ~108 against the B580's ~2174 / ~88. So the
+  hardware change was an upgrade on this workload, and the old guardrail — while
+  still not the right gate for a different card — is not a level the B70
+  struggles to reach.
+- **The B50 Mistral figures reproduce their historical values** (~1197 PP512,
+  ~44 TG128 → measured 1187.83 / 46.53). Unlike the B50's GPT-OSS numbers, there
+  is **no regression here**, which localises that regression to the GPT-OSS path
+  rather than to the card or the driver generally.
+
+Mistral is also far steadier than GPT-OSS on the B70 (tg cv 1.0% vs 3.3%), so it
+is the better workload for detecting small changes on that card.
+
 ### Correctness gates — all PASS on both devices
 
-Same build, both selectors:
+Same build, both selectors, **both configurations** — 8 of 8 pass:
 
-| Gate | B70 (`level_zero:0`) | B50 (`level_zero:1`) |
-|---|---|---|
-| Mistral 7B Q4_0 deterministic completion | PASS — `1, 2, 3, 4, 5, 6, 7, 8, 9, 10` | PASS — `1, 2, 3, 4, 5, 6, 7, 8, 9, 10` |
-| GPT-OSS 20B MXFP4 count gate | PASS — `1, 2, 3, 4, 5` | PASS — `1, 2, 3, 4, 5` |
+| Gate | config | B70 (`level_zero:0`) | B50 (`level_zero:1`) |
+|---|---|---|---|
+| Mistral 7B Q4_0 deterministic completion | default | PASS — `1, 2, 3, 4, 5, 6, 7, 8, 9, 10` | PASS — `1, 2, 3, 4, 5, 6, 7, 8, 9, 10` |
+| Mistral 7B Q4_0 deterministic completion | `FORCE_LEGACY` | PASS — identical output | PASS — identical output |
+| GPT-OSS 20B MXFP4 count gate | default | PASS — `1, 2, 3, 4, 5` | PASS — `1, 2, 3, 4, 5` |
+| GPT-OSS 20B MXFP4 count gate | `FORCE_LEGACY` | PASS — identical output | PASS — identical output |
+
+Generated text is **identical** between the default and `FORCE_LEGACY` arms on
+both devices for both models — so the flag's large Mistral PP cost documented
+below is a pure throughput loss, not a correctness difference. Gate both arms of
+any dispatch A/B: a routing change that produced correct tokens on one model and
+garbage on another would otherwise be invisible.
 
 The Mistral gate output **starts** `1, 2, …, 10` and stops there on EOS. An older
 note claimed it must *end* `…14, 15`; that string is unreachable at `-n 15` and
@@ -161,8 +194,44 @@ the disagreement is purely about magnitude.
 > `static`, so it latches on first evaluation — per-process only.
 
 **Do not change any default on the strength of this.** Two independent sessions
-disagree about the effect's sign and size, and the flag additionally bypasses the
-oneDNN PP path other workloads rely on.
+disagree about the effect's sign and size on GPT-OSS — and on Mistral the flag is
+catastrophic, as the next section measures.
+
+### On Mistral the same flag costs ~⅔ of prompt processing
+
+The GPT-OSS null result is **workload-specific and must not be generalised.**
+Interleaved, 5 pairs per device, Mistral 7B Q4_0 FA-on, same build:
+
+| device | metric | default | `FORCE_LEGACY` | paired change |
+|---|---|---:|---:|---:|
+| B70 | PP512 | 2495.42 ± 62.88 | **835.67 ± 3.43** | **−66.5%** (t = −58.9) |
+| B70 | TG128 | 107.66 ± 1.06 | 105.36 ± 1.50 | −2.1% (t = −2.6) |
+| B50 | PP512 | 1187.83 ± 18.79 | **357.26 ± 0.66** | **−69.9%** (t = −100.1) |
+| B50 | TG128 | 46.53 ± 0.19 | 46.43 ± 0.11 | −0.2% (t = −1.3, ns) |
+
+The arms do not overlap at all. Token generation is untouched; the entire loss is
+in prompt processing, on both cards.
+
+**Why GPT-OSS showed nothing and Mistral collapses** — route tallies, not
+inference:
+
+```
+Mistral, default :  794 backend=unified kernel=MMQ_AOS        (400 unified-block traces)
+Mistral, legacy  : 1191 backend=legacy  kernel=MMQ_COALESCED  (  0 unified-block traces)
+
+GPT-OSS, default :   36 backend=legacy  kernel=MMQ_COALESCED  (  0 unified-block traces)
+GPT-OSS, legacy  :   36 backend=legacy  kernel=MMQ_COALESCED  (  0 unified-block traces)
+```
+
+On GPT-OSS MXFP4 the flag is a **no-op** — MUL_MAT already routes to legacy, so
+there is no oneDNN path left to lose, which is exactly why its A/B came back
+null. On Mistral Q4_0 the default genuinely routes `backend=unified`, and the
+flag diverts it to `backend=legacy`, forfeiting the oneDNN prompt-processing
+path. A null result on one model is not evidence the flag is inert.
+
+This is the measured basis for the recommendation above. Earlier revisions of
+this document asserted the oneDNN-PP downside on plausibility; it is now
+quantified.
 
 ### The unresolved part — stated rather than smoothed over
 
@@ -201,9 +270,20 @@ Setting a guardrail now would encode one session's conditions as a correctness
 criterion. The prerequisite is explaining the session-to-session tg shift above,
 not collecting more runs.
 
-For orientation only — **not gates** — this build on clean cards delivers
-**B70 ≈ 1410 PP512 / ≈ 43 TG128** and **B50 ≈ 894 PP512 / ≈ 32 TG128** on
-GPT-OSS 20B MXFP4 FA-on.
+**Mistral is the better guardrail candidate for the B70** — its spread is far
+tighter (PP cv 2.5%, TG cv 1.0%, versus GPT-OSS's 3.3% TG and a 16% cross-session
+disagreement), and its B50 values reproduce their historical figures, which
+GPT-OSS's do not. What it still lacks is a **second independent session**: these
+are 5 runs from one sitting, and the whole point of the GPT-OSS failure above is
+that one sitting can mislead. Re-measure Mistral on a separate boot before
+proposing a number.
+
+For orientation only — **not gates** — this build on clean cards delivers:
+
+| model | B70 | B50 |
+|---|---|---|
+| GPT-OSS 20B MXFP4 | ≈ 1410 PP512 / ≈ 43 TG128 | ≈ 894 PP512 / ≈ 32 TG128 |
+| Mistral 7B Q4_0 | ≈ 2495 PP512 / ≈ 108 TG128 | ≈ 1188 PP512 / ≈ 47 TG128 |
 
 ### Open regression: the B50 is far below its documented guardrail
 
@@ -218,6 +298,14 @@ That is **3.5% below the previously documented ~926 PP512**, **18.7% below the
 **36% below the ~50+ TG128 guardrail**. An earlier task
 independently measured 895.47 PP512 / 31.02–33.22 TG128 on the same card, so this
 is reproducible and not an artifact of this session.
+
+**The regression is specific to GPT-OSS, not to the card.** The same B50 on the
+same build reproduces its historical Mistral figures (~1197 → 1187.83 PP512,
+~44 → 46.53 TG128). So the card, the driver install and the general SYCL path
+are all delivering expected throughput; whatever regressed lives on the GPT-OSS
+/ MoE path. A partial contributor is on record: driver 26.27 costs ~8.6% TG and
+~1.4% PP versus 26.22 on this exact card and model. That accounts for the TG
+side and **almost none** of the PP gap from ≥1100 down to ~894.
 
 **These numbers are reported as a regression, not adopted as the new B50
 baseline.** Per `CLAUDE.md`'s regression rule, the documented guardrails stand.
