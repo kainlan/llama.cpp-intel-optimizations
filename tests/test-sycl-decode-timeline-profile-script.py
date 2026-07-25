@@ -86,6 +86,17 @@ def _script_text() -> str:
     return SCRIPT.read_text(encoding="utf-8")
 
 
+def _run_usage(flag: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", str(SCRIPT), flag],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+
+
 def test_timeline_profile_script_is_dry_run_by_default() -> None:
     result = subprocess.run(
         ["bash", str(SCRIPT)],
@@ -191,8 +202,18 @@ def test_timeline_profile_script_rejects_non_numeric_wall_ms_value() -> None:
     assert "unknown argument" not in result.stderr, result.stderr
 
 
-def test_timeline_profile_script_documents_wall_ms_in_usage() -> None:
-    assert "--wall-ms N" in _script_text()
+def test_timeline_profile_script_long_help_documents_wall_ms() -> None:
+    result = _run_usage("--help")
+    assert result.returncode == 0, result.stdout
+    assert "invalid option" not in result.stdout, result.stdout
+    assert "--wall-ms N" in result.stdout, result.stdout
+
+
+def test_timeline_profile_script_short_help_matches_long_help() -> None:
+    result = _run_usage("-h")
+    assert result.returncode == 0, result.stdout
+    assert "invalid option" not in result.stdout, result.stdout
+    assert result.stdout == _run_usage("--help").stdout, result.stdout
 
 
 def test_decode_timeline_profiler_documents_supported_parser_callsite_option() -> None:

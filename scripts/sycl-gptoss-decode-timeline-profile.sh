@@ -14,7 +14,7 @@ usage() {
     printf 'usage: %s [--dry-run|--execute] [--i-understand-this-runs-gpu-models] [options]\n' "$0"
     printf 'default mode is dry-run; real execution requires --execute and --i-understand-this-runs-gpu-models\n'
     printf 'options: --out-root DIR --device-selector SELECTOR --model GGUF --token-start N --wall-ms N\n'
-    printf '--wall-ms N normalizes the timeline gap/coverage figures against N ms of measured decode wall time\n'
+    printf '%s\n' '--wall-ms N normalizes the timeline gap/coverage figures against N ms of measured decode wall time'
 }
 
 require_value() {
@@ -82,7 +82,8 @@ fi
 
 # WALL_MS_ARGS stays empty unless --wall-ms was given, so the default run passes
 # nothing extra to parse-sycl-timeline.py. WALL_MS_DRY carries the same flag as
-# display text (with its trailing separator) for the dry-run transcript.
+# display text (with its trailing separator) for the dry-run transcript; keep the
+# two in sync so the transcript stays a faithful copy of the real invocation.
 WALL_MS_ARGS=()
 WALL_MS_DRY=""
 if [[ -n "${WALL_MS}" ]]; then
