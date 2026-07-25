@@ -257,30 +257,42 @@ if (NOT WIN32)
     # call none of them, and exit 0 for any state of the script under test.
     find_package(Python3 COMPONENTS Interpreter)
     if (Python3_Interpreter_FOUND)
-        execute_process(
-            COMMAND ${Python3_EXECUTABLE} -m pytest --version
-            RESULT_VARIABLE LLAMA_PYTEST_RESULT
-            OUTPUT_QUIET
-            ERROR_QUIET
-        )
+        set(LLAMA_PYTHON3 ${Python3_EXECUTABLE})
     else()
-        set(LLAMA_PYTEST_RESULT "no-python3")
+        # Register anyway. A configure-time bail-out would leave `ctest -N`
+        # reporting "Total Tests: 0", which is byte-identical to the test never
+        # having been registered at all -- the failure this whole block exists
+        # to prevent. Fall back to PATH and let a genuinely missing python3
+        # fail loudly at run time, as test-sycl-alloc-policy above would if
+        # bash were missing.
+        set(LLAMA_PYTHON3 python3)
     endif()
 
-    if (LLAMA_PYTEST_RESULT EQUAL 0)
-        llama_test_cmd(
-            ${Python3_EXECUTABLE}
-            NAME test-sycl-decode-timeline-profile-script
-            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-            ARGS -m pytest -q ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-decode-timeline-profile-script.py
-        )
-        set_tests_properties(test-sycl-decode-timeline-profile-script PROPERTIES
-            LABELS "sycl;profiling;tdd"
-            TIMEOUT 120
-        )
-    else()
-        message(STATUS "python3 -m pytest unavailable - skipping test-sycl-decode-timeline-profile-script registration")
-    endif()
+    llama_test_cmd(
+        ${LLAMA_PYTHON3}
+        NAME test-sycl-decode-timeline-profile-script
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        # Exit 77 (skip) when pytest is not installed, then hand the file to
+        # pytest. Probing at run time rather than at configure time keeps the
+        # test registered on every machine, so a missing pytest surfaces as
+        # ctest "Skipped" -- distinguishable from both "not registered" and
+        # "Passed".
+        ARGS
+            -c [=[
+import importlib.util
+import sys
+if importlib.util.find_spec('pytest') is None:
+    sys.exit(77)
+import pytest
+sys.exit(pytest.main(['-q', sys.argv[1]]))
+]=]
+            ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-decode-timeline-profile-script.py
+    )
+    set_tests_properties(test-sycl-decode-timeline-profile-script PROPERTIES
+        LABELS "sycl;profiling;tdd"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 120
+    )
 endif()
 
 if (GGML_SYCL)
