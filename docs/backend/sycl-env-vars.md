@@ -43,6 +43,7 @@ grep -rhoE 'getenv\("GGML_SYCL[A-Z_]*"' ggml/src/ggml-sycl/ | sort -u
 | `GGML_SYCL_ONEDNN_MUL=1` | Enable oneDNN for element-wise MUL (default OFF, SYCL kernel is 2.3x faster) |
 | `GGML_SYCL_BATCH_EXPERTS=0` | Disable batched expert kernel launches (default ON) |
 | `GGML_SYCL_ESIMD_DEQUANT=1` | Opt-in retest hatch for ESIMD small-block dequant (measured 1.9x slower on Arc B580 + oneAPI 2025.3; standard SYCL is the default) |
+| `GGML_SYCL_LAYOUT_OVERRIDE=<mode>` | Force a weight layout: `aos`, `soa`, `coalesced`, or `xmx_tiled`. Overrides the layout policy's own choice — use for A/B isolation, not as a default. (Migrated from AGENTS.md 2026-07-25, which was its only documentation.) |
 
 ## Persistent TG kernel (experimental, opt-in)
 
