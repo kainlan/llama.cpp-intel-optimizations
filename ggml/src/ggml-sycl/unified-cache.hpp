@@ -458,7 +458,8 @@ struct placement_plan {
     size_t                       max_staging_pair_bytes   = 0;
 
     // --- Inference memory categories (computed by populate_host_zone_sizing) ---
-    // oneDNN reorder: one temp buffer (max weight tensor size) reused per layer.
+    // oneDNN reorder: one temp buffer reused per layer, sized to the largest
+    // oneDNN-eligible tensor (see zone-sizing.hpp), not the largest in the model.
     size_t   onednn_reorder_bytes                = 0;  // Zone: SCRATCH (device VRAM)
     // MoE Q8_1 workspace: quantized activations for batched expert dispatch.
     size_t   moe_q8_workspace_bytes              = 0;  // Zone: SCRATCH (device VRAM)
@@ -479,7 +480,8 @@ struct placement_plan {
     // Sized as max_tensor_bytes × k_dma_pipeline_depth (2 buffers). 0 when streaming disabled.
     size_t   dma_staging_pool_bytes              = 0;  // Zone: RUNTIME (device VRAM)
     // oneDNN scratchpad: workspace for matmul weight reorder (weights) + activation buffer.
-    // Sized as max_tensor_bytes × 2. Must fit within the ONEDNN zone (default 256 MB).
+    // Sized as 2 x the largest oneDNN-eligible tensor (see zone-sizing.hpp).
+    // Must fit within the ONEDNN zone (default 256 MB).
     size_t   onednn_scratchpad_bytes             = 0;  // Zone: ONEDNN (device VRAM)
     // PP pipeline scratch: double-buffered FP16 weight staging for prompt-processing
     // dequant prefetch. Computed from the largest quantized weight tensor as

@@ -17,6 +17,7 @@
 #include "kv-tier-manager.hpp"
 #include "mem-handle.hpp"
 #include "mem-ops.hpp"
+#include "zone-sizing.hpp"
 
 #include <algorithm>
 #include <array>
@@ -16883,6 +16884,33 @@ static void populate_host_zone_sizing(placement_plan &                          
         plan.max_tensor_bytes = std::max(plan.max_tensor_bytes, item.size);
     }
 
+    // Path-scoped maxima: "the largest tensor MY path can reach", per consumer,
+    // instead of one global maximum handed to every zone. The classifier is
+    // structural (see zone-sizing.hpp) and lives in its own dependency-free TU,
+    // so the inventory is adapted into its descriptor here. Carry type, ne and
+    // has_shape as well as size: the grouping keys on (type, ne), and an adapter
+    // that copied only name and size would put every tensor in its own group,
+    // classify nothing as a per-layer weight, and silently collapse every
+    // maximum back to the global one.
+    std::vector<ggml_sycl::zone_tensor_desc> zone_inventory;
+    zone_inventory.reserve(tensor_inventory.size());
+    for (const auto & item : tensor_inventory) {
+        ggml_sycl::zone_tensor_desc desc;
+        desc.size      = item.size;  // authoritative magnitude; never recomputed from ne
+        desc.type      = static_cast<int>(item.type);
+        desc.has_shape = item.has_shape();
+        for (int d = 0; d < GGML_MAX_DIMS && d < 4; ++d) {
+            desc.ne[d] = item.ne[d];
+        }
+        desc.name = item.name;
+        zone_inventory.push_back(std::move(desc));
+    }
+    const ggml_sycl::path_scoped_maxima zone_maxima = ggml_sycl::zone_scoped_maxima(zone_inventory);
+
+    // Non-destructiveness guard: every consumer not yet repointed still reads
+    // plan.max_tensor_bytes, so the refactor must not have moved it.
+    GGML_ASSERT(zone_maxima.any_tensor == plan.max_tensor_bytes);
+
     // Every zone below is sized from a maximum over this inventory, so which
     // tensors win those maxima is load-bearing. Nothing reported it before, and
     // the sizing was assumed to be dominated by tensors that in fact never
@@ -17009,8 +17037,10 @@ static void populate_host_zone_sizing(placement_plan &                          
     // --- Inference memory category sizing ---
     // Computed first so zone sizing below can include these costs.
 
-    // 1. oneDNN reorder: one temp buffer sized to the largest weight tensor, reused per layer.
-    plan.onednn_reorder_bytes = plan.max_tensor_bytes;
+    // 1. oneDNN reorder: one temp buffer reused per layer, sized from the oneDNN-eligible
+    //    maximum rather than the global one -- it only ever holds a matmul weight reorder,
+    //    which the vocabulary embedding and the LM head never reach.
+    plan.onednn_reorder_bytes = zone_maxima.onednn_eligible;
 
     // 2. MoE Q8_1 workspace: n_expert_used activation rows quantized to Q8_1 for batched dispatch.
     //    Coarse heuristic: estimate Q8_1 workspace from weight tensor size.
@@ -17168,9 +17198,14 @@ static void populate_host_zone_sizing(placement_plan &                          
 
     // 8. oneDNN scratchpad: ONEDNN zone workspace for weight reorder + activation buffer.
     //    reserve_onednn_scratch(weights_size, activations_size) sub-allocates from this zone.
-    //    Conservative estimate: max_tensor_bytes for weights reorder + max_tensor_bytes for activations.
+    //    Conservative estimate: one oneDNN-eligible tensor for the weights reorder plus one
+    //    for the activations. Neither can be the vocab embedding or the LM head, so this is
+    //    sized from the largest oneDNN-eligible tensor rather than the largest in the model.
     //    The ONEDNN zone is pre-sized at 256 MB; this estimate validates the zone is adequate.
-    plan.onednn_scratchpad_bytes = plan.max_tensor_bytes * 2;
+    plan.onednn_scratchpad_bytes = zone_maxima.onednn_eligible * 2;
+    GGML_LOG_INFO("[SYCL-PLAN] oneDNN scratchpad: %.1f MB (2 x onednn_eligible %.1f MB; global max %.1f MB)\n",
+                  plan.onednn_scratchpad_bytes / (1024.0 * 1024.0), zone_maxima.onednn_eligible / (1024.0 * 1024.0),
+                  plan.max_tensor_bytes / (1024.0 * 1024.0));
 
     // 9. PP pipeline scratch: double-buffered FP16 weight staging for prompt-processing
     //    dequant prefetch. This is computed exactly at inventory collection time and
