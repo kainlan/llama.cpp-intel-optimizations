@@ -39,6 +39,58 @@ Six consumers read `max_tensor_bytes`. This plan repoints four and leaves two, f
 
 ---
 
+## Amendment 1 (2026-07-25) — predicates are structural, not name-based
+
+**This supersedes every name-matching predicate below.** Wherever this plan writes
+`zone_is_vocab_tensor(name)`, `token_embd`, `lm_head` or `output.weight` as a *decision*,
+read the structural rule in this section instead. The original code blocks in Tasks 2 and
+7 are retained as illustration of the surrounding structure (header layout, test harness,
+CMake registration) and remain accurate for everything except the classification itself.
+
+**Why the change.** Tensor names are a GGUF convention, not a guarantee — they can differ
+for every model and every converter. Worse, the failure mode is silent: a predicate that
+matches nothing degrades each maximum straight back to the global max, so a broken
+predicate presents as "this plan reclaimed nothing" rather than as an error. That is
+indistinguishable from the predicate being correct and the reclaim genuinely being zero.
+
+**What replaces it.** `placement_tensor_info` (`unified-cache.hpp:347-360`) already carries
+`type` and `ne[GGML_MAX_DIMS]`; the original `zone_tensor_desc` discarded them. Keep them
+and classify by repetition:
+
+```
+key  = (type, ne[0], ne[1], ne[2], ne[3])
+freq = number of inventory tensors sharing that key
+is_per_layer_weight(t)  <=>  freq[key(t)] >= max(2, n_layer / 2)
+```
+
+A per-layer weight family repeats once per block (~24-80 entries); the vocab embedding and
+LM head are singletons, or a *pair* when untied and identically shaped. The `n_layer / 2`
+term is load-bearing — a bare `>= 2` threshold would wrongly admit an untied embd/output
+pair. Names survive in `zone_tensor_desc` as a **diagnostic field only**; no decision path
+may branch on one.
+
+**n_layer plumbing.** `populate_host_zone_sizing` does not currently receive `n_layer`.
+Both call sites (`:17544`, `:19520`) have `kv_info` in scope and
+`placement_kv_info::n_layer` exists (`unified-cache.hpp:380`), so Task 3 adds the parameter
+and passes `kv_info.n_layer`. **`n_layer == 0` must not narrow anything** — every
+path-scoped maximum falls back to `any_tensor`, logged once. Narrowing on an unknown layer
+count would reintroduce exactly the silent degradation this amendment removes.
+
+**Known, instrumented risk.** The structural rule classifies the **LM head as not a
+per-layer weight**, excluding it from `onednn_eligible`. But the LM head is consumed by
+`MUL_MAT` and may be a genuine oneDNN reorder subject — unlike the token embedding, which
+is a `GET_ROWS` lookup and legitimately never reaches that path. The original name-based
+predicate bundled these two together and so could not see the distinction at all.
+
+If the LM head does reach oneDNN, this predicate under-estimates. That is survivable by
+construction: Task 6 grows the zone on demand and Task 7 counts the underestimate, so it
+surfaces as a loud warning rather than a crash or a silent slowdown. **End-to-End
+Validation step 5 — "no predicate underestimates observed" — is the experiment that settles
+it.** Do not pre-emptively widen the predicate, and do not add a name check to special-case
+the LM head; let the instrumentation answer it.
+
+---
+
 ## Team Topology
 
 **Recommended implementers:** 2 concurrent (based on 2 parallel tracks — execution spawns one ephemeral implementer PER TASK)
@@ -246,6 +298,12 @@ git commit -m "feat(sycl): log the planner tensor inventory top-8 at plan time"
 ---
 
 ### Task 2: Path-scoped maxima with host-only tests
+
+> **AMENDED — see "Amendment 1" above before implementing.** The predicates and the test
+> fixture in this section match on tensor *names*; that approach is superseded by the
+> structural `(type, ne)` group-frequency rule. The header layout, the `CHECK` macro, the
+> CMake registration and the host-only reasoning below all still stand. The tracker task
+> `llama.cpp-mv5c` carries the amended spec in full.
 
 **Track:** B
 **Depends on:** Task 1
