@@ -65,10 +65,11 @@ EXECUTE_BRANCH_STRINGS = [
     "mkdir -p \"${OUT_ROOT}\"",
     "print_cmd >\"${OUT_ROOT}/command.txt\"",
     "env \"${env_args[@]}\" \"${bench_args[@]}\" >\"${OUT_ROOT}/bench.stdout\" 2>\"${OUT_ROOT}/bench.stderr\"",
-    "python3 scripts/parse-sycl-timeline.py \"${OUT_ROOT}/sycl-timeline.json\" >\"${OUT_ROOT}/timeline.parse\"",
+    "python3 scripts/parse-sycl-timeline.py \"${WALL_MS_ARGS[@]}\" \"${OUT_ROOT}/sycl-timeline.json\" >\"${OUT_ROOT}/timeline.parse\"",
     "python3 scripts/parse-sycl-timeline.py \\",
     "--top-gaps 20 \\",
     "--top-host-gap-overlaps 40 \\",
+    "\"${WALL_MS_ARGS[@]}\" \\",
     "\"${OUT_ROOT}/sycl-timeline.json\" >\"${timeline_gaps_parse}\"",
     "python3 scripts/parse-sycl-kernel-profile.py \"${OUT_ROOT}/sycl-kernels.csv\" >\"${OUT_ROOT}/kernels.parse\"",
     "python3 scripts/parse-sycl-kernel-profile.py --top-kernels 30 \"${OUT_ROOT}/sycl-kernels.csv\" >\"${OUT_ROOT}/cost-ranking.parse\"",
@@ -135,6 +136,63 @@ def test_decode_timeline_profiler_section_follows_e2e_tg_ledger() -> None:
     assert ledger in text
     assert timeline in text
     assert text.index(ledger) < text.index(timeline)
+
+
+def test_timeline_profile_script_forwards_wall_ms_to_both_timeline_parses() -> None:
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--dry-run", "--wall-ms", "1234"],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout
+    assert result.stdout.count("--wall-ms 1234") == 2, result.stdout
+
+
+def test_timeline_profile_script_omits_wall_ms_when_not_requested() -> None:
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--dry-run"],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout
+    assert "--wall-ms" not in result.stdout, result.stdout
+
+
+def test_timeline_profile_script_rejects_missing_wall_ms_value() -> None:
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--dry-run", "--wall-ms"],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 2, result.stdout
+    assert "--wall-ms requires a value" in result.stderr, result.stderr
+
+
+def test_timeline_profile_script_rejects_non_numeric_wall_ms_value() -> None:
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--dry-run", "--wall-ms", "abc"],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 2, result.stdout
+    assert "--wall-ms" in result.stderr, result.stderr
+    assert "unknown argument" not in result.stderr, result.stderr
+
+
+def test_timeline_profile_script_documents_wall_ms_in_usage() -> None:
+    assert "--wall-ms N" in _script_text()
 
 
 def test_decode_timeline_profiler_documents_supported_parser_callsite_option() -> None:

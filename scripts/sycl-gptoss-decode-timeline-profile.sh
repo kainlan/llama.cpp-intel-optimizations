@@ -7,12 +7,14 @@ OUT_ROOT="/tmp/sycl_decode_timeline_$(date +%Y%m%d_%H%M%S)"
 DEVICE_SELECTOR="level_zero:1"
 MODEL="/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf"
 TOKEN_START="1"
+WALL_MS=""
 BENCH="./build/bin/llama-bench"
 
 usage() {
     printf 'usage: %s [--dry-run|--execute] [--i-understand-this-runs-gpu-models] [options]\n' "$0"
     printf 'default mode is dry-run; real execution requires --execute and --i-understand-this-runs-gpu-models\n'
-    printf 'options: --out-root DIR --device-selector SELECTOR --model GGUF --token-start N\n'
+    printf 'options: --out-root DIR --device-selector SELECTOR --model GGUF --token-start N --wall-ms N\n'
+    printf '--wall-ms N normalizes the timeline gap/coverage figures against N ms of measured decode wall time\n'
 }
 
 require_value() {
@@ -55,6 +57,11 @@ while [[ $# -gt 0 ]]; do
             TOKEN_START="$2"
             shift
             ;;
+        --wall-ms)
+            require_value "$1" "${2-}"
+            WALL_MS="$2"
+            shift
+            ;;
         --help|-h)
             usage
             exit 0
@@ -71,6 +78,20 @@ done
 if [[ "${EXECUTE}" -eq 1 && "${ACK}" -ne 1 ]]; then
     printf 'error: --execute requires --i-understand-this-runs-gpu-models\n' >&2
     exit 2
+fi
+
+# WALL_MS_ARGS stays empty unless --wall-ms was given, so the default run passes
+# nothing extra to parse-sycl-timeline.py. WALL_MS_DRY carries the same flag as
+# display text (with its trailing separator) for the dry-run transcript.
+WALL_MS_ARGS=()
+WALL_MS_DRY=""
+if [[ -n "${WALL_MS}" ]]; then
+    if ! [[ "${WALL_MS}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        printf 'error: --wall-ms requires a non-negative number, got %s\n' "${WALL_MS}" >&2
+        exit 2
+    fi
+    WALL_MS_ARGS=(--wall-ms "${WALL_MS}")
+    WALL_MS_DRY="--wall-ms ${WALL_MS} "
 fi
 
 env_args=(
@@ -119,8 +140,8 @@ if [[ "${EXECUTE}" -ne 1 ]]; then
     printf '# output root: %s\n' "${OUT_ROOT}"
     print_cmd
     printf ' >%q 2>%q\n' "${OUT_ROOT}/bench.stdout" "${OUT_ROOT}/bench.stderr"
-    printf 'python3 %q %q >%q\n' "scripts/parse-sycl-timeline.py" "${OUT_ROOT}/sycl-timeline.json" "${OUT_ROOT}/timeline.parse"
-    printf 'python3 %q --top-gaps 20 --top-host-gap-overlaps 40 %q >%q\n' "scripts/parse-sycl-timeline.py" "${OUT_ROOT}/sycl-timeline.json" "${timeline_gaps_parse}"
+    printf 'python3 %q %s%q >%q\n' "scripts/parse-sycl-timeline.py" "${WALL_MS_DRY}" "${OUT_ROOT}/sycl-timeline.json" "${OUT_ROOT}/timeline.parse"
+    printf 'python3 %q --top-gaps 20 --top-host-gap-overlaps 40 %s%q >%q\n' "scripts/parse-sycl-timeline.py" "${WALL_MS_DRY}" "${OUT_ROOT}/sycl-timeline.json" "${timeline_gaps_parse}"
     printf 'python3 %q %q >%q\n' "scripts/parse-sycl-kernel-profile.py" "${OUT_ROOT}/sycl-kernels.csv" "${OUT_ROOT}/kernels.parse"
     printf 'python3 %q --top-kernels 30 %q >%q\n' "scripts/parse-sycl-kernel-profile.py" "${OUT_ROOT}/sycl-kernels.csv" "${cost_ranking_parse}"
     printf 'python3 %q %q %q >%q\n' "scripts/parse-sycl-profile-ledger.py" "${OUT_ROOT}/sycl-timeline.json" "${OUT_ROOT}/sycl-kernels.csv" "${wall_ledger_parse}"
@@ -131,10 +152,11 @@ mkdir -p "${OUT_ROOT}"
 print_cmd >"${OUT_ROOT}/command.txt"
 printf ' >%q 2>%q\n' "${OUT_ROOT}/bench.stdout" "${OUT_ROOT}/bench.stderr" >>"${OUT_ROOT}/command.txt"
 env "${env_args[@]}" "${bench_args[@]}" >"${OUT_ROOT}/bench.stdout" 2>"${OUT_ROOT}/bench.stderr"
-python3 scripts/parse-sycl-timeline.py "${OUT_ROOT}/sycl-timeline.json" >"${OUT_ROOT}/timeline.parse"
+python3 scripts/parse-sycl-timeline.py "${WALL_MS_ARGS[@]}" "${OUT_ROOT}/sycl-timeline.json" >"${OUT_ROOT}/timeline.parse"
 python3 scripts/parse-sycl-timeline.py \
     --top-gaps 20 \
     --top-host-gap-overlaps 40 \
+    "${WALL_MS_ARGS[@]}" \
     "${OUT_ROOT}/sycl-timeline.json" >"${timeline_gaps_parse}"
 python3 scripts/parse-sycl-kernel-profile.py "${OUT_ROOT}/sycl-kernels.csv" >"${OUT_ROOT}/kernels.parse"
 python3 scripts/parse-sycl-kernel-profile.py --top-kernels 30 "${OUT_ROOT}/sycl-kernels.csv" >"${OUT_ROOT}/cost-ranking.parse"
