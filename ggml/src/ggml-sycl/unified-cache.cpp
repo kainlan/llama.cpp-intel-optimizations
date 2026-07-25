@@ -17117,8 +17117,9 @@ static void populate_host_zone_sizing(placement_plan &                          
     //    sized to cover the row/col dimensions of any weight the CPU quantization path
     //    processes. That path never sees the vocab embedding or the LM head, so the slots
     //    are sized from the largest quant-eligible tensor rather than the largest in the
-    //    model. This field is not folded into host_zone_scratch_bytes; it is a plan-level
-    //    figure for the host system-heap budget only.
+    //    model. This field is diagnostic only: nothing outside this log line reads
+    //    plan.cpu_quant_buffer_bytes, and no allocation is sized from it. In particular
+    //    it is not folded into host_zone_scratch_bytes, so changing it moves no zone.
     constexpr size_t k_cpu_quant_slots = 3;
     plan.cpu_quant_buffer_bytes        = k_cpu_quant_slots * zone_maxima.cpu_quant_eligible;
     GGML_LOG_INFO("[SYCL-PLAN] CPU quant buffers: %.1f MB (%zu x cpu_quant_eligible %.1f MB; global max %.1f MB)\n",
