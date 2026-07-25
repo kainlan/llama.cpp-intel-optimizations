@@ -10266,6 +10266,11 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         size  = 0;
     };
 
+    // Set when the planned ONEDNN zone is too small for this request and the
+    // arena could not be re-planned to fit it. The reservation then grows
+    // through the unified-cache allocation path instead of failing.
+    bool arena_zone_exhausted = false;
+
     auto allocate_direct_scratch = [&](size_t size, const char * label, mem_handle & owner) -> void * {
         alloc_request req{};
         req.queue                               = &queue_;
@@ -10275,7 +10280,11 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         req.intent.category                     = runtime_category::COMPUTE;
         req.intent.cohort_id                    = label;
         req.intent.constraints.must_device      = true;
-        req.intent.constraints.prefer_vram_zone = vram_zone_id::ONEDNN;
+        // Route through the ONEDNN zone normally. On the growth path the zone is
+        // already known to be too small for the pair, so bypass it: a partial
+        // zone allocation would be reclaimed underneath its owning mem_handle by
+        // the zone_reset() that the arena sub-allocation path performs.
+        req.intent.constraints.prefer_vram_zone = arena_zone_exhausted ? vram_zone_id::COUNT : vram_zone_id::ONEDNN;
         owner                                   = {};
         alloc_handle handle{};
         if (!unified_alloc(req, &handle) || handle.ptr == nullptr) {
@@ -10302,6 +10311,33 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         arena_attempt             = true;
         const size_t total_needed = weights_size + activations_size;
         size_t       zone_cap     = zone_capacity(vram_zone_id::ONEDNN);
+        if (total_needed > zone_cap) {
+            // The ONEDNN zone is sized from a path-scoped predicate over the tensor
+            // inventory (the largest oneDNN-eligible tensor; see zone-sizing.hpp), so a
+            // request larger than the zone means that predicate under-estimated for this
+            // model. Equality is the normal steady state — only a strictly larger request
+            // grows, otherwise every run would re-plan the arena.
+            GGML_LOG_WARN(
+                "[UNIFIED-CACHE] oneDNN scratch request %.1f MB (weights %.1f MB + activations %.1f MB) exceeds the "
+                "planned ONEDNN zone %.1f MB: a path-scoped sizing predicate under-estimated the oneDNN scratchpad; "
+                "growing through the unified cache\n",
+                total_needed / (1024.0 * 1024.0), weights_size / (1024.0 * 1024.0),
+                activations_size / (1024.0 * 1024.0), zone_cap / (1024.0 * 1024.0));
+
+            // Raise the planned zone size and ask the arena to re-plan its zones. This is
+            // the same growth mechanism ensure_planned_arena_zones() already implements,
+            // including its refusal to rebuild while any allocation is still live — the
+            // refusal is deliberately preserved, nothing here force-evicts or resets a
+            // zone to make room. Once weights are resident the rebuild is (correctly)
+            // refused, and the request is instead satisfied below through
+            // allocate_direct_scratch(), i.e. unified_alloc() with mem_handle ownership.
+            const int dev_id = ggml_sycl_get_device_id_from_queue(queue_);
+            if (dev_id >= 0 && unified_cache_get_planned_onednn_scratchpad_bytes(dev_id) < total_needed) {
+                unified_cache_set_planned_onednn_scratchpad_bytes(dev_id, total_needed);
+            }
+            (void) ensure_planned_arena_zones();
+            zone_cap = zone_capacity(vram_zone_id::ONEDNN);
+        }
         if (total_needed <= zone_cap) {
             // Reset the oneDNN zone to reclaim any previous allocation.
             zone_reset(vram_zone_id::ONEDNN);
@@ -10341,16 +10377,24 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
             // Reset zone on partial failure.
             zone_reset(vram_zone_id::ONEDNN);
         }
-        GGML_LOG_ERROR(
-            "[UNIFIED-CACHE] oneDNN scratch arena zone too small (need %.1f MB, have %.1f MB), "
-            "refusing direct fallback because arena planning is authoritative\n",
-            total_needed / (1024.0f * 1024.0f), zone_cap / (1024.0f * 1024.0f));
-        return finish(false);
+        // The zone cannot hold this request and could not be grown in place (live
+        // allocations prevent an arena rebuild, which ensure_planned_arena_zones()
+        // logs). Grow through the unified-cache allocation path below rather than
+        // failing the reservation: the planned size has already been raised, so a
+        // later rebuild sizes the zone correctly.
+        arena_zone_exhausted = true;
     }
     direct_attempt = true;
 
-    // Free existing if resizing — subtract old sizes from budget first
-    const size_t old_total = onednn_weights_scratch_size_ + onednn_activations_scratch_size_;
+    // Sub-allocate from the arena zone unless the zone is known to be too small for
+    // this request; on the growth path every buffer comes from unified_alloc().
+    const bool use_arena_zone = arena_active() && !arena_zone_exhausted;
+
+    // Free existing if resizing — subtract old sizes from budget first.
+    // Only unified_alloc()-owned (non-arena) buffers were charged to used_.
+    const size_t old_total =
+        (onednn_weights_scratch_ && !vram_owns(onednn_weights_scratch_) ? onednn_weights_scratch_size_ : 0) +
+        (onednn_activations_scratch_ && !vram_owns(onednn_activations_scratch_) ? onednn_activations_scratch_size_ : 0);
     if (onednn_weights_scratch_ && !vram_owns(onednn_weights_scratch_)) {
         release_direct_scratch(onednn_weights_scratch_owner_, onednn_weights_scratch_, onednn_weights_scratch_size_,
                                "weights");
@@ -10367,7 +10411,7 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         onednn_activations_scratch_       = nullptr;
         onednn_activations_scratch_size_  = 0;
     }
-    if (old_total > 0 && !arena_active()) {
+    if (old_total > 0) {
         saturating_sub_used(old_total);
     }
 
@@ -10383,7 +10427,7 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
                     total_needed / (1024.0f * 1024.0f), available() / (1024.0f * 1024.0f));
 
     // Allocate weights scratch
-    if (arena_active()) {
+    if (use_arena_zone) {
         onednn_weights_scratch_ = zone_alloc(vram_zone_id::ONEDNN, weights_size);
         if (!onednn_weights_scratch_) {
             GGML_LOG_WARN("[UNIFIED-CACHE] Arena ONEDNN zone full for weights scratch (%.1f MB)\n",
@@ -10403,7 +10447,7 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
     }
 
     // Allocate activations scratch
-    if (arena_active()) {
+    if (use_arena_zone) {
         onednn_activations_scratch_ = zone_alloc(vram_zone_id::ONEDNN, activations_size);
         if (!onednn_activations_scratch_) {
             GGML_LOG_WARN("[UNIFIED-CACHE] Arena ONEDNN zone full for activations scratch (%.1f MB)\n",
@@ -10428,10 +10472,16 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
     }
 
     // Track in budget (skip when arena-backed — budget already charged at arena reservation)
-    if (!arena_active()) {
+    if (!use_arena_zone) {
         used_.fetch_add(total_needed, std::memory_order_relaxed);
     }
 
+    if (arena_zone_exhausted) {
+        GGML_LOG_INFO(
+            "[UNIFIED-CACHE] oneDNN scratch grown outside the ONEDNN zone: weights=%.1f MB, "
+            "activations=%.1f MB\n",
+            weights_size / (1024.0f * 1024.0f), activations_size / (1024.0f * 1024.0f));
+    }
     GGML_SYCL_DEBUG("[UNIFIED-CACHE] Reserved oneDNN scratch: weights=%.1f MB, activations=%.1f MB\n",
                     weights_size / (1024.0f * 1024.0f), activations_size / (1024.0f * 1024.0f));
     return finish(true);

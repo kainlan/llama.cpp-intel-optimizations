@@ -2243,6 +2243,12 @@ class unified_cache {
     // Call once during model load with max dimensions.
     // weights_size: max(N*K*2) across all layers (usually FFN down: 14336*4096*2)
     // activations_size: max(M*K*2) where M=max_batch, K=max_dim
+    // When the request exceeds the planned ONEDNN arena zone (a path-scoped sizing
+    // predicate under-estimated for this model), the reservation grows through the
+    // unified-cache allocation path instead of failing: the planned zone size is
+    // raised, an arena re-plan is attempted (which keeps its refusal to rebuild
+    // while allocations are live), and the buffers otherwise come from
+    // unified_alloc() under mem_handle ownership.
     bool reserve_onednn_scratch(size_t weights_size, size_t activations_size);
 
     // Get scratch buffers. Returns false if not reserved or sizes exceed reserved.
