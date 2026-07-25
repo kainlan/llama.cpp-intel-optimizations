@@ -16394,6 +16394,40 @@ static bool planner_moe_layout_debug_enabled() {
     return enabled;
 }
 
+// DIAGNOSTIC ONLY. Hard cap on how many down tensors the I8 upgrade pass may
+// take. Unset (or negative) means no cap, which is the shipping behaviour;
+// 0 disables the upgrade entirely.
+//
+// This exists to answer whether the extra granted layers a VRAM reclaim buys
+// actually pay for themselves (llama.cpp-nzu4). The only other way to move the
+// granted count is to starve the arena via
+// GGML_SYCL_VRAM_ARENA_EXTERNAL_HEADROOM_MB, but that changes the arena size,
+// the zone layout and the resident tensor set all at once, so a throughput
+// difference between two such runs cannot be attributed to the layout. This
+// knob changes the layout and NOTHING else: same budget, same arena, same
+// zones, same candidate set.
+//
+// The granted set is a prefix. Candidates are sorted by (layer_id, name)
+// below, and on a uniform-shape MoE model every candidate carries the same
+// extra_charge, so capping at N grants layers 0..N-1 -- the same tensors the
+// headroom guard would have granted at that count. That is what makes a capped
+// arm comparable to an uncapped one rather than merely equinumerous. Verify it
+// per model from the per-tensor [MOE-LAYOUT] lines rather than assuming it.
+static size_t planner_moe_down_i8_max_tensors() {
+    static const size_t cap = []() {
+        const char * env = std::getenv("GGML_SYCL_MOE_DOWN_I8_MAX_TENSORS");
+        if (env == nullptr) {
+            return std::numeric_limits<size_t>::max();
+        }
+        const int value = std::atoi(env);
+        if (value < 0) {
+            return std::numeric_limits<size_t>::max();
+        }
+        return static_cast<size_t>(value);
+    }();
+    return cap;
+}
+
 // Reports the layout the expert entries of `role` actually ended up with on
 // `device_id`: the shared layout name when they agree, "mixed" when they do
 // not, "none" when the plan holds no such entries. Read-only.
@@ -16604,7 +16638,20 @@ static size_t maybe_upgrade_moe_down_layouts_to_i8(placement_plan & plan,
     size_t upgraded_entries = 0;
     size_t preserved_soa    = 0;
     size_t charged_bytes    = 0;
+
+    // Deliberately a `break`, not a `continue`. The decline diagnostics below
+    // reason that the VRAM guard is the ONLY continue in this loop and is
+    // therefore definitively the cause of any partial upgrade -- a second
+    // continue would silently make that claim false, which is exactly the
+    // defect llama.cpp-r5ib had to fix once already. Breaking out keeps the
+    // invariant, and cap_limited carries the alternative cause explicitly.
+    const size_t down_i8_cap = planner_moe_down_i8_max_tensors();
+    bool         cap_limited = false;
     for (const down_candidate & candidate : candidates) {
+        if (upgraded_tensors >= down_i8_cap) {
+            cap_limited = true;
+            break;
+        }
         if (remaining <= k_layout_upgrade_guard || candidate.extra_charge > remaining - k_layout_upgrade_guard) {
             continue;
         }
@@ -16710,7 +16757,13 @@ static size_t maybe_upgrade_moe_down_layouts_to_i8(placement_plan & plan,
                     { "skip_executor",    skip_executor    },
                     { "skip_unsupported", skip_unsupported },
                 });
-                if (!candidates.empty()) {
+                if (cap_limited) {
+                    GGML_LOG_INFO(
+                        "[MOE-LAYOUT] down-i8 declined ALL %zu candidates -- down stays on SOA. This is the "
+                        "GGML_SYCL_MOE_DOWN_I8_MAX_TENSORS=%zu diagnostic cap, NOT VRAM headroom (%.1f MB "
+                        "left) and NOT eligibility. Unset that variable to restore shipping behaviour.\n",
+                        candidates.size(), down_i8_cap, remaining_mb);
+                } else if (!candidates.empty()) {
                     GGML_LOG_INFO(
                         "[MOE-LAYOUT] down-i8 declined ALL %zu candidates -- down stays on SOA. These "
                         "candidates passed every eligibility check, so this is the VRAM headroom guard "
@@ -16732,6 +16785,21 @@ static size_t maybe_upgrade_moe_down_layouts_to_i8(placement_plan & plan,
                         "%s.\n",
                         considered, skip_not_down, observed.empty() ? "none" : observed.c_str());
                 }
+            } else if (declined_some && cap_limited) {
+                // The cap fired BEFORE the guard could, so headroom is not the
+                // cause here and must not be named as one. remaining is still
+                // printed because it is what tells you whether the uncapped run
+                // would have granted more -- if it is comfortably above the
+                // 64 MB reserve, this cap is genuinely binding rather than
+                // coinciding with a headroom limit that would have stopped at
+                // the same count anyway.
+                GGML_LOG_INFO(
+                    "[MOE-LAYOUT] down-i8 upgraded only %zu of %zu candidates -- the other %zu stay on SOA. "
+                    "This is the GGML_SYCL_MOE_DOWN_I8_MAX_TENSORS=%zu diagnostic cap, NOT the VRAM headroom "
+                    "guard (%.1f MB left, %.1f MB reserve). Unset that variable to restore shipping "
+                    "behaviour.\n",
+                    upgraded_tensors, candidates.size(), candidates.size() - upgraded_tensors, down_i8_cap,
+                    remaining_mb, k_layout_upgrade_guard / (1024.0 * 1024.0));
             } else if (declined_some) {
                 GGML_LOG_INFO(
                     "[MOE-LAYOUT] down-i8 upgraded only %zu of %zu candidates -- the other %zu stay on SOA. "
