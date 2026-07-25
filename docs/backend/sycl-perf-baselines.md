@@ -52,6 +52,19 @@ Each rule below cost a round of discarded measurements.
    identical runs — a 7% climb *within one configuration*, comparable to the
    effect sizes people try to measure. Sequential blocks cannot separate a flag
    effect from drift; alternate the arms.
+
+   **The sharpest evidence is a sign flip within a single session.** The same
+   flag, same build, same card, same day, measured two ways:
+
+   | design | B70 tg128 result |
+   |---|---:|
+   | sequential blocks (default block, then legacy block) | **−3.6%** |
+   | interleaved, 6 pairs | **+2.3%** (t = 0.72, ns) |
+
+   Blocked designs here do not merely inflate an effect — they can invert its
+   sign. Neither number is the "real" one at 3–4%; the point is that a blocked
+   design's output is not a measurement of the flag at all. Pair the arms and
+   report the paired statistic.
 6. **B70 runs require `GGML_SYCL_OP_TIMEOUT_MS=180000`.** Its cold prestage
    exceeds the 30 s default watchdog. That is not a hang.
 
@@ -73,7 +86,7 @@ All figures **MEASURED**, mean ± sd across independent processes:
 
 | # | Device (selector) | Config | Runs | Free VRAM | PP512 tok/s | TG128 tok/s |
 |---|---|---|---:|---|---:|---:|
-| A | Arc Pro B70 (`level_zero:0`) | default | 11 | 32602 MiB | **1412.34 ± 14.63** <br>[1384.81–1434.14] | **43.40 ± 1.83** <br>[40.18–46.09] |
+| A | Arc Pro B70 (`level_zero:0`) | default | **21** | 32602 MiB | **1414.62 ± 11.13** <br>[1384.81–1434.14] | **43.57 ± 1.46** <br>[40.18–46.27] |
 | B | Arc Pro B50 (`level_zero:1`) | default | 5 | 16250 MiB | **893.77 ± 2.32** <br>[891.65–897.06] | **32.06 ± 0.22** <br>[31.81–32.35] |
 | C | Arc Pro B70 (`level_zero:0`) | `GGML_SYCL_UNIFIED_FORCE_LEGACY=1` | 11 | 32602 MiB | 1414.67 ± 17.07 <br>[1393.69–1450.30] | 43.25 ± 2.55 <br>[40.65–48.80] |
 | D | Arc Pro B50 (`level_zero:1`) | `GGML_SYCL_UNIFIED_FORCE_LEGACY=1` | 5 | 16250 MiB | 893.43 ± 4.39 <br>[887.03–897.81] | 32.36 ± 1.06 <br>[31.00–33.22] |
@@ -82,8 +95,19 @@ Free VRAM was identical on all 32 runs (32602 MiB / 16250 MiB), 32 independent
 holder sweeps were clean, and the kernel log showed **no GT resets or GPU hangs**
 before, during, or after.
 
-**Spread.** The B70's token generation is the noisy axis: cv 4.2% across 11 runs,
-range 40.18–46.09. The B50 is inherently steady (cv 0.7% tg, 0.3% pp). Treat
+**Why row A pools 21 runs across three designs.** Its runs come from a sequential
+block (5), the interleaved A/B's default arm (6), and a thermal probe (10). All
+21 are the *same configuration* on the same build with the same free VRAM, so
+they are 21 samples of one quantity; the designs differ only in what other work
+surrounded them, which is exactly the session-to-session variation a baseline
+should span rather than exclude. The three designs agree closely — tg means
+42.69 / 43.99 / 43.76, pp means 1409.00 / 1415.13 / 1417.13 — so pooling is not
+hiding a disagreement. (An earlier revision quoted the 11-run subset as
+1412.34 ± 14.63 / 43.40 ± 1.83; the pooled figure supersedes it and is tighter.)
+Rows C and D remain unpooled at their stated run counts.
+
+**Spread.** The B70's token generation is the noisy axis: cv 3.3% across 21 runs,
+range 40.18–46.27. The B50 is inherently steady (cv 0.7% tg, 0.3% pp). Treat
 B70 tg differences below ~10% between single runs as nothing.
 
 ## Current baselines — Mistral 7B Q4_0, FA-on
@@ -118,9 +142,9 @@ Same build, both selectors, **both configurations** — 8 of 8 pass:
 | Gate | config | B70 (`level_zero:0`) | B50 (`level_zero:1`) |
 |---|---|---|---|
 | Mistral 7B Q4_0 deterministic completion | default | PASS — `1, 2, 3, 4, 5, 6, 7, 8, 9, 10` | PASS — `1, 2, 3, 4, 5, 6, 7, 8, 9, 10` |
-| Mistral 7B Q4_0 deterministic completion | `FORCE_LEGACY` | PASS — identical output | PASS — identical output |
+| Mistral 7B Q4_0 deterministic completion | `FORCE_LEGACY` | PASS — `1, 2, 3, 4, 5, 6, 7, 8, 9, 10` | PASS — `1, 2, 3, 4, 5, 6, 7, 8, 9, 10` |
 | GPT-OSS 20B MXFP4 count gate | default | PASS — `1, 2, 3, 4, 5` | PASS — `1, 2, 3, 4, 5` |
-| GPT-OSS 20B MXFP4 count gate | `FORCE_LEGACY` | PASS — identical output | PASS — identical output |
+| GPT-OSS 20B MXFP4 count gate | `FORCE_LEGACY` | PASS — `1, 2, 3, 4, 5` | PASS — `1, 2, 3, 4, 5` |
 
 Generated text is **identical** between the default and `FORCE_LEGACY` arms on
 both devices for both models — so the flag's large Mistral PP cost documented
@@ -158,7 +182,9 @@ not +21.8%.** PP512: +0.8%, sem 9.33 — also nothing.
 **The variance-collapse claim does not replicate either.** The earlier result
 reported legacy sd 0.30 against default sd 2.70 and concluded "the B70's
 run-to-run instability is caused by that code path." Interleaved, both arms have
-**sd 2.19**; pooled over 11 runs each, legacy is the *noisier* arm (2.55 vs 1.83).
+**sd 2.19**; pooled over the matched 11-run subsets, legacy is the *noisier* arm
+(2.55 vs 1.83), and against the full 21-run default sample the gap widens
+(2.55 vs 1.46).
 
 **On the B50 the flag does nothing** — 32.06 → 32.36 tg, inside noise. That half
 of the earlier finding replicates.
@@ -229,6 +255,30 @@ null. On Mistral Q4_0 the default genuinely routes `backend=unified`, and the
 flag diverts it to `backend=legacy`, forfeiting the oneDNN prompt-processing
 path. A null result on one model is not evidence the flag is inert.
 
+**The whole caveat in one line:** the flag's cost depends entirely on *which
+routing decision that model's MUL_MAT would otherwise have made*. Same flag,
+opposite consequences.
+
+> ### Do not read the GPT-OSS null as "the flag is harmless"
+> Setting `GGML_SYCL_UNIFIED_FORCE_LEGACY` globally on the strength of a null
+> GPT-OSS result destroys Mistral prompt processing by a factor of three.
+
+**This was already on record and had been missed.** The superseded B580 table
+further down this document has always carried:
+
+```
+| PP512 (Level 0, all VRAM) | ~1700 | default no-FA bench path |
+| PP512 (legacy)            | ~159  | GGML_SYCL_UNIFIED_FORCE_LEGACY set |
+```
+
+A ~10x Mistral PP collapse under this flag, recorded on B580-era hardware with no
+build SHA, date, or rep count. It is **not** a figure this session measured, and
+its magnitude is unverified on current hardware — the measured collapse here is
+~3x (B70) and ~3.3x (B50), not ~10x, so treat ~159 as directionally
+corroborating and numerically historical. What matters is that the *mechanism*
+was documented long before this session and the plan still spent a full task
+treating the oneDNN-PP downside as speculative.
+
 This is the measured basis for the recommendation above. Earlier revisions of
 this document asserted the oneDNN-PP downside on plausibility; it is now
 quantified.
@@ -240,7 +290,7 @@ The two sessions disagree on **both arms**, in opposite directions:
 | | default tg128 | `FORCE_LEGACY` tg128 |
 |---|---:|---:|
 | earlier session (sequential blocks) | 37.27 ± 2.70 [32.58–41.11] | 45.41 ± 0.30 |
-| this session (11 runs each) | 43.40 ± 1.83 [40.18–46.09] | 43.25 ± 2.55 |
+| this session (default 21 runs, legacy 11) | 43.57 ± 1.46 [40.18–46.27] | 43.25 ± 2.55 |
 
 This session's *default* arm lands near the earlier session's *FORCE_LEGACY* arm.
 **Ruled out as the cause:** the build. The only code commit between the two
@@ -258,7 +308,7 @@ for reasons not yet identified, and do not build a tight guardrail on it.
 **No numeric B70 guardrail is being set by this document**, and the reason is
 the spread, not the effort:
 
-- **PP512 is stable enough** (cv 1.0% over 11 runs, min 1384.81) — but the
+- **PP512 is stable enough** (cv 0.8% over 21 runs, min 1384.81) — but the
   earlier session saw 1353.74 ± 64.52 with a min of **1233.51**. Across sessions
   the honest floor is ~1200, which is so far below the working mean that it
   would catch only catastrophic failures.
@@ -303,14 +353,28 @@ is reproducible and not an artifact of this session.
 same build reproduces its historical Mistral figures (~1197 → 1187.83 PP512,
 ~44 → 46.53 TG128). So the card, the driver install and the general SYCL path
 are all delivering expected throughput; whatever regressed lives on the GPT-OSS
-/ MoE path. A partial contributor is on record: driver 26.27 costs ~8.6% TG and
-~1.4% PP versus 26.22 on this exact card and model. That accounts for the TG
-side and **almost none** of the PP gap from ≥1100 down to ~894.
+/ MoE path.
+
+**Split the shortfall into what is attributed and what is not**, so a bisect
+starts in the right place:
+
+| component | status | evidence |
+|---|---|---|
+| **TG**, ~50+ → ~32 | **partly attributed to the driver** | 26.27 costs ~8.6% TG vs 26.22 on this exact card and model (26.22: 899.40 PP / 32.81 TG → 26.27: 884–893 PP / 29.5–30.7 TG). Measured with the *same binary* either side of the driver change |
+| **PP**, ≥1100 → ~894 | **UNATTRIBUTED** | the driver costs only ~1.4% PP, so it explains essentially none of this gap. Measured 893.77 sits squarely inside the 26.27 band |
+
+So the driver is a real but **partial** contributor on the TG axis and a
+non-explanation on the PP axis. **The PP gap is where a bisect should start** —
+against the build that produced 1255/52 — not the TG one.
+
+> **Driver rollback is not available via `apt`.** The PPA carries only the newest
+> build and the upgrade deleted the prior `.so`. Snapshot the `.deb` before any
+> future driver change; treat the driver as a pinned, tuned dependency rather
+> than something to keep current.
 
 **These numbers are reported as a regression, not adopted as the new B50
 baseline.** Per `CLAUDE.md`'s regression rule, the documented guardrails stand.
-The cause is unattributed — it may well predate this plan — and needs a bisect
-against the build that produced 1255/52. Do not "fix" the discrepancy by
+The residual cause may predate this plan. Do not "fix" the discrepancy by
 lowering the guardrail.
 
 ---
@@ -329,7 +393,7 @@ Mistral 7B Q4_0, Arc B580:
 | TG128 (no graph) | ~70 | MMVQ fast-path alone (graph adds ~13%) |
 | PP512 (Level 3, 30% budget) | ~269 | 15/33 GPU layers, rest on CPU |
 | TG128 (Level 3, 30% budget) | ~14 | CPU offload via fit_params |
-| PP512 (legacy) | ~159 | `GGML_SYCL_UNIFIED_FORCE_LEGACY` set |
+| PP512 (legacy) | ~159 | `GGML_SYCL_UNIFIED_FORCE_LEGACY` set — a ~10x PP collapse; see the Mistral FORCE_LEGACY section, where the same mechanism is measured on current hardware |
 | TG128 3-device (B580+B50+CPU) | ~27 | `GGML_SYCL_SPLIT_RATIO="60,32,8"` tensor split |
 | TG128 (persistent TG, phase) | ~30 | `GGML_SYCL_PERSISTENT_TG=1` (experimental) |
 | TG128 (persistent TG, DAG) | ~19 | `GGML_SYCL_PERSISTENT_TG=1` + `PHASE=0 DAG=1` |
