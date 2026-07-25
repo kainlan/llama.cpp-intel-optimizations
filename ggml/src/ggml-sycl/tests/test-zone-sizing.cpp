@@ -225,6 +225,143 @@ int main() {
         CHECK(is_monotonic(shapeless_maxima), "shapeless-only maxima must all be <= any_tensor");
     }
 
+    // ---- Case 7: mispredict accounting --------------------------------------
+    // The counters are the plan's own regression detector: a predicate that is
+    // wrong for some future model degrades into "grow every time", which is
+    // slower than the over-provision this sizing removed and looks exactly like
+    // an unrelated regression unless it is counted.
+    {
+        ggml_sycl::zone_sizing_reset_underestimates();
+        CHECK(ggml_sycl::zone_sizing_underestimate_count("onednn") == 0, "counter must start at zero");
+
+        ggml_sycl::zone_sizing_record_underestimate("onednn", 300u * 1024u * 1024u, 160u * 1024u * 1024u);
+        ggml_sycl::zone_sizing_record_underestimate("onednn", 200u * 1024u * 1024u, 160u * 1024u * 1024u);
+        CHECK(ggml_sycl::zone_sizing_underestimate_count("onednn") == 2, "two records must count as two");
+        CHECK(ggml_sycl::zone_sizing_underestimate_count("dma") == 0, "unrelated path must stay at zero");
+
+        // The worst overshoot is what sizes the fix, so it must be retained.
+        CHECK(ggml_sycl::zone_sizing_max_underestimate_bytes("onednn") == 300u * 1024u * 1024u,
+              "max underestimate must track the largest request, not the last");
+
+        ggml_sycl::zone_sizing_reset_underestimates();
+        CHECK(ggml_sycl::zone_sizing_underestimate_count("onednn") == 0, "reset must clear counters");
+        CHECK(ggml_sycl::zone_sizing_max_underestimate_bytes("onednn") == 0, "reset must clear the maximum too");
+    }
+
+    // ---- Case 8: the summary is silent on a clean run -----------------------
+    // Acceptance criterion, not a nicety: a warning that also fires when
+    // nothing is wrong carries no information. The return value is what makes
+    // that testable host-only — it is true only when something was reported.
+    {
+        ggml_sycl::zone_sizing_reset_underestimates();
+        CHECK(!ggml_sycl::zone_sizing_log_underestimate_summary(), "an all-zero table must report nothing");
+
+        // Observations alone are not a defect, so they must not break silence.
+        ggml_sycl::zone_sizing_record_observation("onednn");
+        ggml_sycl::zone_sizing_record_observation("onednn");
+        CHECK(!ggml_sycl::zone_sizing_log_underestimate_summary(),
+              "observations without an under-estimate must stay silent");
+
+        ggml_sycl::zone_sizing_record_underestimate("onednn", 4096, 2048);
+        CHECK(ggml_sycl::zone_sizing_log_underestimate_summary(), "a non-zero counter must be reported");
+
+        ggml_sycl::zone_sizing_reset_underestimates();
+        CHECK(!ggml_sycl::zone_sizing_log_underestimate_summary(), "reset must restore silence");
+    }
+
+    // ---- Case 9: observations separate "never entered" from "never wrong" ----
+    // Both leave the under-estimate counter at zero and they mean opposite
+    // things. GPT-OSS 20B never enters reserve_onednn_scratch at all (its MoE
+    // work uses a separate PP-MoE oneDNN ring), so a zero there says nothing
+    // about whether the oneDNN predicate is correct for that model.
+    {
+        ggml_sycl::zone_sizing_reset_underestimates();
+        CHECK(ggml_sycl::zone_sizing_observation_count("onednn") == 0, "observations must start at zero");
+
+        ggml_sycl::zone_sizing_record_observation("onednn");
+        ggml_sycl::zone_sizing_record_observation("onednn");
+        ggml_sycl::zone_sizing_record_observation("onednn");
+        CHECK(ggml_sycl::zone_sizing_observation_count("onednn") == 3, "three observations must count as three");
+        CHECK(ggml_sycl::zone_sizing_underestimate_count("onednn") == 0,
+              "an observed path with no miss must still report zero under-estimates");
+        CHECK(ggml_sycl::zone_sizing_observation_count("dma") == 0, "an unentered path must report zero observations");
+
+        ggml_sycl::zone_sizing_reset_underestimates();
+        CHECK(ggml_sycl::zone_sizing_observation_count("onednn") == 0, "reset must clear observations too");
+    }
+
+    // ---- Case 10: classifier collapse ---------------------------------------
+    // The failure mode no assert can catch. If the inventory adapter ever
+    // stopped carrying type / ne / has_shape into zone_tensor_desc, every
+    // tensor would key uniquely, no group would clear the threshold, every
+    // path-scoped maximum would stop narrowing, and the zones would revert to
+    // the global-max sizing this unit exists to remove — with every existing
+    // check, both correctness gates and this whole test file still passing.
+    // This tests zone_scoped_maxima's OUTPUT, which is why it is testable here
+    // while the adapter itself (placement_tensor_info lives in the SYCL-side
+    // unified-cache.hpp) is not.
+    {
+        // Healthy: both reference layouts narrow, so neither may signal.
+        std::vector<zone_tensor_desc> healthy;
+        for (int i = 0; i < 64; i++) {
+            healthy.push_back(desc("family." + std::to_string(i), MISTRAL_FFN_BYTES, TYPE_Q4_0, 4096, 14336, 1, 1));
+        }
+        healthy.push_back(desc("singleton.0", MISTRAL_OUTPUT_BYTES, TYPE_Q6_K, 4096, 32000, 1, 1));
+
+        CHECK(ggml_sycl::zone_detect_collapse(healthy, zone_scoped_maxima(healthy)) ==
+                  ggml_sycl::zone_collapse_signal::NONE,
+              "a healthy per-layer layout must not signal collapse");
+
+        // Adapter dropped has_shape: nothing can be grouped at all.
+        std::vector<zone_tensor_desc> shapeless;
+        for (int i = 0; i < 64; i++) {
+            shapeless.push_back(shapeless_desc("family." + std::to_string(i), MISTRAL_FFN_BYTES, TYPE_Q4_0));
+        }
+        CHECK(ggml_sycl::zone_detect_collapse(shapeless, zone_scoped_maxima(shapeless)) ==
+                  ggml_sycl::zone_collapse_signal::NO_FAMILY,
+              "an inventory with no usable shape must signal NO_FAMILY");
+
+        // Adapter dropped ne: every entry keys uniquely, so every group is a
+        // singleton and no maximum survives the threshold.
+        std::vector<zone_tensor_desc> all_distinct;
+        for (int i = 0; i < 64; i++) {
+            all_distinct.push_back(
+                desc("distinct." + std::to_string(i), MISTRAL_FFN_BYTES, TYPE_Q4_0, 4096, 1024 + i, 1, 1));
+        }
+        CHECK(ggml_sycl::zone_detect_collapse(all_distinct, zone_scoped_maxima(all_distinct)) ==
+                  ggml_sycl::zone_collapse_signal::NO_FAMILY,
+              "an inventory of all-distinct shapes must signal NO_FAMILY");
+
+        // Adapter zeroed ne but left has_shape true: every entry of a type keys
+        // identically, one spurious family swallows the inventory, and every
+        // maximum equals the global one — narrowing nothing.
+        std::vector<zone_tensor_desc> degenerate;
+        for (int i = 0; i < 64; i++) {
+            degenerate.push_back(desc("degenerate." + std::to_string(i), MISTRAL_FFN_BYTES, TYPE_Q4_0, 1, 1, 1, 1));
+        }
+        const path_scoped_maxima degenerate_maxima = zone_scoped_maxima(degenerate);
+        CHECK(degenerate_maxima.onednn_eligible == degenerate_maxima.any_tensor,
+              "the degenerate fixture must in fact narrow nothing");
+        CHECK(ggml_sycl::zone_detect_collapse(degenerate, degenerate_maxima) ==
+                  ggml_sycl::zone_collapse_signal::NO_NARROWING,
+              "an inventory that narrows nothing must signal NO_NARROWING");
+
+        // A genuinely small model of singletons is legitimate and must stay
+        // quiet: below the minimum inventory size there is no evidence either
+        // way, and this diagnostic must never fire on a model it cannot judge.
+        std::vector<zone_tensor_desc> too_small;
+        for (size_t i = 0; i < ggml_sycl::k_zone_collapse_min_inventory - 1; i++) {
+            too_small.push_back(desc("small." + std::to_string(i), MISTRAL_FFN_BYTES, TYPE_Q4_0, 4096, 1024 + i, 1, 1));
+        }
+        CHECK(ggml_sycl::zone_detect_collapse(too_small, zone_scoped_maxima(too_small)) ==
+                  ggml_sycl::zone_collapse_signal::NONE,
+              "an inventory too small to contain a family must not signal collapse");
+
+        CHECK(ggml_sycl::zone_detect_collapse(std::vector<zone_tensor_desc>(), path_scoped_maxima()) ==
+                  ggml_sycl::zone_collapse_signal::NONE,
+              "an empty inventory must not signal collapse");
+    }
+
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
     return 0;
 }

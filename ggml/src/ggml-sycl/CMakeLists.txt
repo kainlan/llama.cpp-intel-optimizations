@@ -1422,6 +1422,13 @@ target_include_directories(test-zone-sizing PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/..
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
 )
+# zone-sizing.cpp reports predicate under-estimates and classifier collapse
+# through GGML_LOG_WARN, which lives in ggml-impl.h and resolves to a symbol in
+# ggml-base. This test deliberately links neither (that is what keeps it
+# host-only and building in seconds), so the log macro is stubbed out here --
+# the same arrangement test-gpu-arch uses for GGML_SYCL_DEBUG above. Production
+# builds get the real logging.
+target_compile_definitions(test-zone-sizing PRIVATE ZONE_SIZING_STANDALONE=1)
 add_test(NAME zone-sizing COMMAND test-zone-sizing)
 set_tests_properties(zone-sizing PROPERTIES
     LABELS "sycl;memory;planner;tdd"

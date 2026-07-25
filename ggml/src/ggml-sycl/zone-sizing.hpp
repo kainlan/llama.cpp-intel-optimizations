@@ -82,4 +82,84 @@ bool zone_is_dma_streamed(const zone_tensor_desc & tensor, size_t group_cardinal
 
 path_scoped_maxima zone_scoped_maxima(const std::vector<zone_tensor_desc> & inventory);
 
+// ---------------------------------------------------------------------------
+// Mispredict accounting
+// ---------------------------------------------------------------------------
+//
+// A zone sized from a path predicate grows on demand rather than failing when
+// the predicate under-estimates. That makes a wrong predicate survivable; it
+// also makes it invisible. Without a counter, a predicate that mispredicts on
+// some future model degrades silently into "grow every time" — slower than the
+// over-provision this sizing removed, and indistinguishable from an unrelated
+// regression. These counters are this unit's own regression detector.
+//
+// ONLY a genuine sizing miss belongs here. The growth path in
+// reserve_onednn_scratch is reached by two causes that must not be conflated:
+// a request larger than the planned zone (a predicate defect — record it) and
+// a sub-allocation that failed while the zone was large enough (allocator
+// fragmentation — do NOT record it, the predicate was right).
+//
+// The state is process-global and is reached from the multi-threaded SYCL
+// backend, so every entry point below takes a mutex.
+void   zone_sizing_record_underestimate(const char * path, size_t requested_bytes, size_t planned_bytes);
+size_t zone_sizing_underestimate_count(const char * path);
+size_t zone_sizing_max_underestimate_bytes(const char * path);
+
+// Records that a path consulted its planned zone, whether or not the zone was
+// big enough. This is what separates "the path was never entered" from "the
+// path was entered and never under-estimated": both leave the under-estimate
+// counter at zero and they mean opposite things. Concretely, a GPT-OSS run
+// never enters reserve_onednn_scratch at all (its MoE work goes through a
+// separate PP-MoE oneDNN ring), so a zero under-estimate count on that model
+// is not evidence that the oneDNN predicate is correct — it is evidence that
+// nothing tested it. Observations alone are not a defect and never break the
+// summary's silence.
+void   zone_sizing_record_observation(const char * path);
+size_t zone_sizing_observation_count(const char * path);
+
+void zone_sizing_reset_underestimates();
+
+// Reports every path with a non-zero under-estimate count. Returns true when
+// anything was reported. NOTHING is emitted, and false is returned, when all
+// counters are zero: a clean run must stay silent or the warning stops meaning
+// anything. The return value is what makes that property testable host-only.
+bool zone_sizing_log_underestimate_summary();
+
+// ---------------------------------------------------------------------------
+// Classifier collapse
+// ---------------------------------------------------------------------------
+//
+// The descriptors above are copied out of the backend's own tensor inventory
+// by an adapter this TU cannot see and cannot unit-test. If that adapter ever
+// stopped carrying `type` / `ne` / `has_shape` — someone "simplifies" it, or a
+// new call site writes its own loop copying only name and size — then every
+// tensor keys uniquely, no group clears the threshold, and every path-scoped
+// maximum stops narrowing anything. The zones revert to the global-max sizing
+// this unit exists to remove, and NOTHING notices: the maxima stay internally
+// consistent, so every existing assert, both correctness gates and the unit
+// tests all keep passing while the plan reclaims nothing.
+//
+// The under-estimate counters above cannot catch it either — a collapse makes
+// zones LARGER, so no request ever exceeds one. Hence a separate signal.
+enum class zone_collapse_signal {
+    NONE,          // at least one path-scoped maximum strictly narrowed
+    NO_FAMILY,     // no group cleared the threshold: every scoped maximum is 0
+    NO_NARROWING,  // every scoped maximum equals any_tensor: grouping is degenerate
+};
+
+// An inventory smaller than this cannot be expected to contain a per-layer
+// family, so its lack of one is not evidence of anything. Four times the
+// per-layer threshold: both reference models are an order of magnitude above
+// it (GPT-OSS 459 tensors, Mistral 291), so a healthy run never approaches it.
+constexpr size_t k_zone_collapse_min_inventory = 4 * k_zone_per_layer_min_group;
+
+zone_collapse_signal zone_detect_collapse(const std::vector<zone_tensor_desc> & inventory,
+                                          const path_scoped_maxima &            maxima);
+
+// Emits one warning naming the likely cause when zone_detect_collapse fires,
+// and nothing otherwise. Deliberately a warning and NOT an assert: a model
+// that genuinely consists of singletons is legitimate, and so is one whose
+// largest tensor is itself a per-layer weight.
+void zone_sizing_warn_if_collapsed(const std::vector<zone_tensor_desc> & inventory, const path_scoped_maxima & maxima);
+
 }  // namespace ggml_sycl

@@ -9,7 +9,33 @@
 #include "zone-sizing.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <map>
+#include <mutex>
+#include <string>
+
+// This TU deliberately depends on nothing: that is what lets the host-only
+// test target link it without libggml-sycl and build in seconds. The
+// diagnostics below still have to reach the backend's log in a production
+// build, so the log macro is switched here rather than the header being
+// included unconditionally — the same split gpu-arch.cpp uses for
+// GGML_SYCL_GPU_ARCH_STANDALONE, and for the same reason.
+#if defined(ZONE_SIZING_STANDALONE)
+// The stub must still COMPILE its arguments, not discard them: a macro that
+// swallowed __VA_ARGS__ would let a bad format specifier survive the test build
+// and only break the library build. Guarding a real fprintf with `if (false)`
+// keeps -Wformat checking while the optimizer drops the call, and keeps the
+// unit test's output clean.
+#    define ZONE_SIZING_LOG_WARN(...)              \
+        do {                                       \
+            if (false) {                           \
+                std::fprintf(stderr, __VA_ARGS__); \
+            }                                      \
+        } while (0)
+#else
+#    include "ggml-impl.h"
+#    define ZONE_SIZING_LOG_WARN(...) GGML_LOG_WARN(__VA_ARGS__)
+#endif
 
 namespace ggml_sycl {
 
@@ -133,6 +159,169 @@ path_scoped_maxima zone_scoped_maxima(const std::vector<zone_tensor_desc> & inve
         }
     }
     return maxima;
+}
+
+namespace {
+
+struct underestimate_record {
+    size_t count = 0;  // genuine sizing misses only; never fragmentation
+
+    // The worst overshoot is what sizes the fix, so the largest request is
+    // retained rather than the most recent one. planned_at_max is the zone
+    // size that request was measured against — kept as a pair so the two
+    // numbers in the report describe the same event; a "last planned" field
+    // could pair the largest request with an unrelated zone size.
+    size_t max_requested  = 0;
+    size_t planned_at_max = 0;
+
+    // Reservations that consulted this path's planned zone at all. Zero here
+    // means the path was never entered, which is NOT the same as the predicate
+    // being right — see the header.
+    size_t observations = 0;
+};
+
+std::mutex g_underestimate_mutex;
+
+std::map<std::string, underestimate_record> & underestimates() {
+    static std::map<std::string, underestimate_record> table;
+    return table;
+}
+
+const char * path_key(const char * path) {
+    return path ? path : "unknown";
+}
+
+size_t underestimate_field(const char * path, size_t underestimate_record::* field) {
+    std::lock_guard<std::mutex>                                 lock(g_underestimate_mutex);
+    std::map<std::string, underestimate_record>::const_iterator it = underestimates().find(path_key(path));
+    return it == underestimates().end() ? 0 : it->second.*field;
+}
+
+}  // namespace
+
+void zone_sizing_record_underestimate(const char * path, size_t requested_bytes, size_t planned_bytes) {
+    std::lock_guard<std::mutex> lock(g_underestimate_mutex);
+    underestimate_record &      record = underestimates()[path_key(path)];
+    record.count += 1;
+    if (requested_bytes > record.max_requested) {
+        record.max_requested  = requested_bytes;
+        record.planned_at_max = planned_bytes;
+    }
+}
+
+size_t zone_sizing_underestimate_count(const char * path) {
+    return underestimate_field(path, &underestimate_record::count);
+}
+
+size_t zone_sizing_max_underestimate_bytes(const char * path) {
+    return underestimate_field(path, &underestimate_record::max_requested);
+}
+
+void zone_sizing_record_observation(const char * path) {
+    std::lock_guard<std::mutex> lock(g_underestimate_mutex);
+    underestimates()[path_key(path)].observations += 1;
+}
+
+size_t zone_sizing_observation_count(const char * path) {
+    return underestimate_field(path, &underestimate_record::observations);
+}
+
+void zone_sizing_reset_underestimates() {
+    std::lock_guard<std::mutex> lock(g_underestimate_mutex);
+    underestimates().clear();
+}
+
+bool zone_sizing_log_underestimate_summary() {
+    // Snapshot under the lock, report outside it: the log callback is backend
+    // code that must not run while this unit's mutex is held.
+    std::map<std::string, underestimate_record> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(g_underestimate_mutex);
+        snapshot = underestimates();
+    }
+
+    bool reported = false;
+    for (std::map<std::string, underestimate_record>::const_iterator it = snapshot.begin(); it != snapshot.end();
+         ++it) {
+        // Observations alone are the healthy case and say nothing worth a
+        // warning. Only a recorded miss breaks the silence.
+        if (it->second.count == 0) {
+            continue;
+        }
+        reported = true;
+        ZONE_SIZING_LOG_WARN(
+            "[SYCL-PLAN] zone sizing under-estimated the '%s' path %zu time(s) out of %zu reservation(s): largest "
+            "request %.1f MB against a planned %.1f MB. The zone grew at runtime each time, so this is a slowdown "
+            "rather than a failure -- re-check that path's predicate in zone-sizing.hpp against this model.\n",
+            it->first.c_str(), it->second.count, it->second.observations, it->second.max_requested / (1024.0 * 1024.0),
+            it->second.planned_at_max / (1024.0 * 1024.0));
+    }
+    return reported;
+}
+
+zone_collapse_signal zone_detect_collapse(const std::vector<zone_tensor_desc> & inventory,
+                                          const path_scoped_maxima &            maxima) {
+    // Too few tensors to expect a per-layer family at all: absence of one is
+    // not evidence of anything, and a diagnostic that fires where it cannot
+    // judge is worse than none.
+    if (inventory.size() < k_zone_collapse_min_inventory) {
+        return zone_collapse_signal::NONE;
+    }
+
+    // Every path is checked, not just one. The predicates are identical today
+    // but are documented to diverge, and a collapse in the shared grouping
+    // input takes all of them down together — one path narrowing while the
+    // others do not is a predicate difference, not a classifier failure.
+    const bool none_classified =
+        maxima.onednn_eligible == 0 && maxima.cpu_quant_eligible == 0 && maxima.dma_streamed == 0;
+    if (none_classified) {
+        return zone_collapse_signal::NO_FAMILY;
+    }
+
+    const bool none_narrowed = maxima.onednn_eligible == maxima.any_tensor &&
+                               maxima.cpu_quant_eligible == maxima.any_tensor &&
+                               maxima.dma_streamed == maxima.any_tensor;
+    if (none_narrowed) {
+        return zone_collapse_signal::NO_NARROWING;
+    }
+
+    return zone_collapse_signal::NONE;
+}
+
+void zone_sizing_warn_if_collapsed(const std::vector<zone_tensor_desc> & inventory, const path_scoped_maxima & maxima) {
+    const zone_collapse_signal signal = zone_detect_collapse(inventory, maxima);
+    if (signal == zone_collapse_signal::NONE) {
+        return;
+    }
+
+    // Recomputed rather than plumbed through: this runs once per plan, only on
+    // the already-degraded path, and the counts are what make the warning
+    // actionable instead of merely alarming.
+    const std::map<zone_group_key, size_t> freq = zone_group_frequencies(inventory);
+
+    size_t shapeless = 0;
+    for (size_t i = 0; i < inventory.size(); i++) {
+        if (!inventory[i].has_shape) {
+            shapeless++;
+        }
+    }
+
+    if (signal == zone_collapse_signal::NO_FAMILY) {
+        ZONE_SIZING_LOG_WARN(
+            "[SYCL-PLAN] zone sizing found no repeated (type, ne) group in %zu inventory entries (%zu distinct "
+            "groups, %zu without a shape): every path-scoped maximum collapsed to zero and each zone falls back to "
+            "the global %.1f MB maximum, reclaiming nothing. If this model really is all singletons that is "
+            "legitimate; otherwise the inventory adapter is not carrying type/ne/has_shape into zone_tensor_desc.\n",
+            inventory.size(), freq.size(), shapeless, maxima.any_tensor / (1024.0 * 1024.0));
+        return;
+    }
+
+    ZONE_SIZING_LOG_WARN(
+        "[SYCL-PLAN] zone sizing narrowed nothing: every path-scoped maximum equals the global %.1f MB maximum over "
+        "%zu inventory entries in %zu distinct (type, ne) groups. Legitimate when the largest tensor is itself a "
+        "per-layer weight; otherwise the inventory adapter is losing shape or type detail, so unrelated tensors are "
+        "grouping together.\n",
+        maxima.any_tensor / (1024.0 * 1024.0), inventory.size(), freq.size());
 }
 
 }  // namespace ggml_sycl

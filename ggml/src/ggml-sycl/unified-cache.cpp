@@ -1867,6 +1867,23 @@ bool unified_cache::ensure_planned_arena_zones() {
 }
 
 unified_cache::~unified_cache() {
+    // Mispredict accounting, reported here because this is the last point at
+    // which the cache is guaranteed to run any code. It is placed ahead of the
+    // shutdown early-return below so a teardown that skips resource cleanup
+    // still reports; the summary touches no SYCL state, only this process's
+    // counters. It prints nothing at all unless a path-scoped sizing predicate
+    // actually under-estimated, so a healthy run stays silent.
+    //
+    // The coverage line is the companion the summary cannot carry: on a clean
+    // run the summary is (correctly) absent, and observations=0 versus
+    // observations=N distinguishes "this path was never entered" from "this
+    // path was entered and the predicate held" -- opposite conclusions that
+    // both leave the under-estimate count at zero.
+    GGML_SYCL_DEBUG("[SYCL-PLAN] zone sizing coverage: onednn observations=%zu underestimates=%zu\n",
+                    ggml_sycl::zone_sizing_observation_count("onednn"),
+                    ggml_sycl::zone_sizing_underestimate_count("onednn"));
+    (void) ggml_sycl::zone_sizing_log_underestimate_summary();
+
     // Stop the prefetch worker thread first (before any resource cleanup).
     // This is safe even if the SYCL runtime is shutting down since the worker
     // only does cache lookups and pinning, not SYCL memory operations.
@@ -10313,12 +10330,30 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         arena_attempt             = true;
         const size_t total_needed = weights_size + activations_size;
         size_t       zone_cap     = zone_capacity(vram_zone_id::ONEDNN);
+
+        // The planned ONEDNN zone is about to be measured against a real
+        // request. Recorded whether or not it turns out to be big enough,
+        // because a zero under-estimate count means nothing without it: a
+        // GPT-OSS run never reaches here at all (its MoE work goes through a
+        // separate PP-MoE oneDNN ring and this reservation stays arena-lazy),
+        // and "never entered" must not read as "predicate confirmed".
+        ggml_sycl::zone_sizing_record_observation("onednn");
+
         if (total_needed > zone_cap) {
             // The ONEDNN zone is sized from a path-scoped predicate over the tensor
             // inventory (the largest oneDNN-eligible tensor; see zone-sizing.hpp), so a
             // request larger than the zone means that predicate under-estimated for this
             // model. Equality is the normal steady state — only a strictly larger request
             // grows, otherwise every run would re-plan the arena.
+            //
+            // This branch, and ONLY this branch, is a predicate defect: it is entered
+            // exactly when the request exceeds the planned zone. The other route to the
+            // growth path below (zone_alloc failing while total_needed <= zone_cap) is
+            // allocator fragmentation and is deliberately not recorded here — counting it
+            // would blame the predicate for an allocator condition and make this counter
+            // produce confidently wrong diagnostics.
+            ggml_sycl::zone_sizing_record_underestimate("onednn", total_needed, zone_cap);
+
             GGML_LOG_WARN(
                 "[UNIFIED-CACHE] oneDNN scratch request %.1f MB (weights %.1f MB + activations %.1f MB) exceeds the "
                 "planned ONEDNN zone %.1f MB: a path-scoped sizing predicate under-estimated the oneDNN scratchpad; "
@@ -16985,6 +17020,17 @@ static void populate_host_zone_sizing(placement_plan &                          
     // Non-destructiveness guard: every consumer not yet repointed still reads
     // plan.max_tensor_bytes, so the refactor must not have moved it.
     GGML_ASSERT(zone_maxima.any_tensor == plan.max_tensor_bytes);
+
+    // The assert above compares a max over `size` against a max over `size`, so
+    // it can only catch a dropped or miscounted tensor. It cannot catch the
+    // classifier losing its grouping inputs: if the adapter above ever stopped
+    // carrying type/ne/has_shape, every path-scoped maximum would stop
+    // narrowing, the zones would revert to the global-max sizing, and that
+    // assert -- along with both correctness gates and every test -- would still
+    // pass while the plan reclaimed nothing. This is the only check that would
+    // notice. It warns rather than aborts: a model of genuine singletons is
+    // legitimate, and it stays silent on both reference models.
+    ggml_sycl::zone_sizing_warn_if_collapsed(zone_inventory, zone_maxima);
 
     // Every zone below is sized from a maximum over this inventory, so which
     // tensors win those maxima is load-bearing. Nothing reported it before, and
