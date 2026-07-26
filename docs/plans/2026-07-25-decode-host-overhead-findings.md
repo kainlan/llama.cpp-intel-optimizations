@@ -999,3 +999,115 @@ the 968 on the prompt-path trace where it was observed at 0.0034 % of the queue
 total. Recompute the percentage per queue rather than assuming it stays
 negligible — the point of the metric is that the assumption no longer has to be
 made.
+
+---
+
+## Task 8 (`llama.cpp-sacs`) — the decode capture works; the blocker is cleared
+
+Commits `4457a87c2` (fix) and `7d3374553` (test). Both defects the plan recorded
+turned out to be **one defect with two faces**, as the tracker's root-cause
+comment `c-hxfe` diagnosed: `sycl_timeline_flush()` is one-shot, and it was being
+called from `ggml_backend_sycl_graph_compute()`, which runs **once per decode
+step**. That made it first-step-wins. It also locked out the flush in
+`ggml_backend_sycl_free()`, which is the only one ordered *after*
+`ggml_sycl_kernel_profile_flush()` — the drain that creates the device
+(`sycl.event`) spans in the first place. So the zero device events were not a
+missing emitter; they were the guaranteed content of a flush that ran before the
+drain. The fix removes the per-step call. `e2e_tg_profile_force_flush()` keeps its
+per-step site: separate instrument, its own repeat-safe flush.
+
+### Result of the re-run
+
+B70 (`level_zero:0`), GPT-OSS 20B MXFP4, `-p 0 -n 128 -r 1 -v`, the "Commands
+(exact)" env block above with the output prefix moved to `/tmp/sacs-decode/`.
+Card had the full 32600.7 MB free; no GT reset on `0000:03:00.0` before or after.
+
+| check | before | after |
+|---|---:|---:|
+| `graph_compute_impl` spans | 1 | **129** (= the decode step count) |
+| `sycl.event` entries | 0 | **59,541** |
+| `gap_class.*` lines in `timeline.gaps.parse` | 0 | **8** (the pp512 reference count) |
+| trace size | ~40 MB | 100 MB |
+
+Full category census after the fix: `ggml.op` 118,680 · `sycl.submit` 61,500 ·
+`sycl.event` 59,541 · `sycl.wait` 645 · `ggml.graph` 129 — 240,495 events.
+
+**Independent cross-check.** The trace's `timeline.gpu_event_total_ms_x1000
+662688` (662.688 ms) reproduces the kernel profiler's separately measured
+662.587 ms device-busy total to within 0.02 %. Two instruments, two flush paths,
+same number — the device spans now in the timeline are the real ones.
+
+### The gap-class split, first time on decode
+
+```
+gap_class.device0.compute.host_overlap.total_ms_x1000        1371574
+gap_class.device0.compute.queue_serialization.total_ms_x1000      67
+gap_class.device0.compute.runtime_idle.total_ms_x1000        1378763
+gap_class.device0.compute.rounding_delta_ms_x1000                432
+gap_class.device0.copy.host_overlap.total_ms_x1000           2497988
+gap_class.device0.copy.queue_serialization.total_ms_x1000          0
+gap_class.device0.copy.runtime_idle.total_ms_x1000            890327
+gap_class.device0.copy.rounding_delta_ms_x1000                   -34
+```
+
+The rounding-delta rule the previous section left "ready and waiting" now has its
+first decode measurement, and it **passes**: 432 µs against a 2750.4 ms compute
+gap total is 0.016 %, and −34 µs against 3388.3 ms of copy gap is 0.001 %. Both
+are far under the 5 % `LOW CONFIDENCE` threshold, so this split is usable. As
+predicted, the delta grew with gap count (0.0034 % → 0.016 %) and still has ample
+margin.
+
+**Do not read attribution conclusions off these eight numbers yet.** They are
+whole-capture totals over a 9202.215 ms host envelope that includes model load and
+weight materialization, not a steady-state decode window — `wall_ms` was set from
+the trace's own host-clock envelope because `--wall-ms` must still be passed
+explicitly (defect 3, unfixed). Against the graph-span envelope alone (3456.345 ms)
+the same 662.688 ms of device time is 19.2 % coverage rather than the 7.2 % the
+parse prints. Isolating a steady-state slice is the next unit of work, not this
+one.
+
+### What was changed in the test file, and why
+
+`tests/test-sycl-timeline-flush-source.py` contained a test asserting the buggy
+call site **must exist** — added by `da9a7ceb5`, the commit that introduced the
+bug. It was replaced by `test_decode_teardown_does_not_flush_the_timeline`, which
+asserts the inverse while still requiring the `e2e_tg_profile_force_flush()` site.
+The backend-free test was left exactly as it was, and still passes.
+
+The actual regression guard is new:
+`test_one_shot_timeline_flush_is_reachable_only_from_backend_teardown`. Both
+original tests passed throughout the bug's lifetime because each call site is
+individually correct — **the composition is what was broken, and nothing covered
+it.** The new test brace-matches the two function bodies and asserts no
+`sycl_timeline_flush(` inside `ggml_backend_sycl_graph_compute()` and every call
+inside `ggml_backend_sycl_free()`. It also asserts the one-shot guard still exists
+in `sycl-timeline.cpp`, so making the flush re-entrant fails loudly rather than
+quietly invalidating the placement rule. Comments are blanked before scanning;
+without that, the comment now documenting the removal reads as a call and the
+guard goes vacuous in precisely the direction that hides a regression.
+
+Verified RED before GREEN by checking out the pre-fix `ggml-sycl.cpp`: 2 failed,
+1 passed. On the fix: 3 passed.
+
+The file was also **unregistered in ctest**, which is why it never ran. It is now
+registered via `llama_test_pytest()`; `ctest -N` goes 86 → 87.
+
+### Gates
+
+- `ctest -R 'decode-timeline|timeline-gap|timeline-flush'`: 3/3 Passed, none Skipped.
+- Mistral completion gate: `1, 2, 3, 4, 5, 6, 7, 8, 9, 10`. Run on the **B70**, not
+  the B50 — a `codescout.real` process (pid 3781131, the same one the 21:36 B50 GT
+  reset was attributed to) held all three render nodes and left the B50 with
+  320.0 MB free, so the run aborted in `[SYCL-PLAN] failed to size VRAM arena
+  zones`. Environmental, reproduced twice, unrelated to this change.
+- GPT-OSS `-cnv` gate: `1, 2, 3, 4, 5`.
+- Throughput, B70 `-p 0 -n 128 -r 3`, graph replay ON, no profiler:
+  **48.8096 ± 0.3743 tok/s** against the 48.3799 reference, +0.89 % — inside the
+  B70's 3.3 % tg noise band. Machine was loaded (load average 8–14, Frigate
+  ffmpeg), so treat this as a no-regression check, not a new baseline.
+
+### Still open after this fix
+
+Defect 3 of `llama.cpp-sacs` is **not fixed**: `parse-sycl-timeline.py:532` still
+computes its fallback envelope across `sycl.event` timestamps, which are on the
+device clock. Keep passing `--wall-ms` explicitly.
