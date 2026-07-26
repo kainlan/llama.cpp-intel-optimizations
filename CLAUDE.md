@@ -261,6 +261,27 @@ Models are stored in `/Storage/GenAI/models/`:
 - `gpt-oss-120b-mxfp4-*.gguf` (60G total, 3-part split) - Full model
 
 ### Verification Commands & Correctness Gates
+
+⚠️ **The gates below check TOKENS, not which backend produced them.** A CPU-only
+build passes every one of them — CPU inference emits the identical digits, just
+~13x slower. This is not hypothetical: a reconfigure silently reset `GGML_SYCL`
+to OFF on 2026-07-25, the build succeeded, and the Mistral gate passed green at
+**8.38 tok/s** instead of ~108 with the SYCL backend absent from the binary. The
+gates were designed to catch a broken kernel emitting garbage; a *missing*
+backend is not a wrong answer, so they are blind to it.
+
+**Run this first, before trusting any gate result or benchmark**, whenever
+anything has touched `CMakeCache.txt` (a reconfigure, a `-D` probe, a cache edit):
+
+```bash
+grep -E '^GGML_SYCL:' build/CMakeCache.txt                        # want BOOL=ON
+ldd build/bin/llama-completion | grep -cE 'libggml-sycl|libsycl'  # want >= 2
+```
+
+A run reporting single-digit tok/s on Mistral Q4_0 is a CPU fallback, not a
+regression to investigate. Recovery is cheap: delete **only** `CMakeCache.txt`
+and re-run `./scripts/sycl-build.sh` — ccache absorbs most of it, no `-c` needed.
+
 ```bash
 source /opt/intel/oneapi/setvars.sh --force
 
