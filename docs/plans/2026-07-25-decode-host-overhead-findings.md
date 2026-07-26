@@ -1551,3 +1551,99 @@ of the submit path, not of this machine's load.
 - **Still true:** both captures are profiled runs (~12.9 % observer effect in
   this configuration). The **shares** are the robust output; absolute per-step
   milliseconds remain inflated, and this task does not change that.
+
+## Task 12 — The inter-graph window is empty of ggml-sycl work
+
+Plan phase 2's Task 2: attribute the ~1.7 ms host window between graphs, which
+Cluster A's 2.324 ms/step device bubble sits inside.
+
+Measured **inside the timeline trace**, not from the kernel profiler's
+`raw_events`. Both carry host-submit times, but they are separate drains written
+to separate files, and mixing their epochs is exactly the bug behind parser
+defect 3 (a 9-hour "wall time" for a 6-second run). The timeline carries
+`ggml.graph`, `sycl.submit`, `ggml.op` and `sycl.wait` in one host clock.
+
+### Result: 0.5 % coverage, and it reproduces
+
+99 inter-graph windows. Coverage by every instrumented span type, merged so
+overlaps count once:
+
+| capture | window total | `sycl.submit` | `ggml.op` | `sycl.wait` | **all three** |
+|---|---:|---:|---:|---:|---:|
+| Task 11 (load 6.50) | 171.952 ms · 1.737 ms/step | 0.27 % | **0.00 %** | 0.26 % | **0.53 %** |
+| Task 9 (load 18.68) | 170.071 ms · 1.718 ms/step | 0.28 % | **0.00 %** | 0.23 % | **0.51 %** |
+
+Everything that appears in the window at all, identical in both captures:
+
+| ms (99 windows) | n | event |
+|---:|---:|---|
+| 0.461 | 99 | `sycl.submit` / `sycl.memcpy.mem_ops` |
+| 0.306 | 99 | `sycl.wait` / `bcs_queue_drain` |
+| 0.147 | 99 | `sycl.wait` / `dma_queue_drain` |
+
+**`ggml.op` coverage is exactly zero.** Not small — zero. The host executes no
+ggml operation between graphs, submits one small memcpy, and waits ~4.6 µs on
+queue drains. ~99.5 % of the window is host time that ggml-sycl's instrumentation
+cannot see at all.
+
+### Verdict, under the plan's own gate
+
+Task 2's gate required a ranked callsite table covering **≥80 %** of the window,
+and said to report coverage honestly below that rather than present a partial
+table as complete. Coverage is **0.5 %**. There is no table to present, and one
+built from three events totalling 0.9 ms would misrepresent a 172 ms window.
+
+Applying Task 3's decision rule — *"No callsite > 20 % and coverage < 80 % →
+Write no fix plan; the window is unattributed, say so"* — **no Cluster A fix plan
+is written.**
+
+But the result is **stronger than "unattributed"**, and this distinction matters
+as much as it did in Task 6:
+
+| | what the data says | what it licenses |
+|---|---|---|
+| *unattributed* | we failed to measure the window | nothing |
+| **this case** | we measured it exhaustively; ggml-sycl activity is **positively absent** | **relocates the cluster** |
+
+**Cluster A is not a ggml-sycl launch-count problem, and no change to launch
+count, batching, or graphlets can address it.** The window lies above the
+backend, in llama.cpp's decode path.
+
+### What the window actually contains — and the harness caveat
+
+`llama-bench`'s generation loop (`tools/llama-bench/llama-bench.cpp:2130-2138`)
+is:
+
+```cpp
+llama_decode(ctx, llama_batch_get_one(&token, 1));
+llama_synchronize(ctx);
+token = std::rand() % n_vocab;
+```
+
+**There is no sampling.** The next token is `std::rand()`, not a function of the
+logits. So the 1.737 ms/step is *not* sampling cost — it is `llama_synchronize`'s
+return path plus `llama_decode`'s host work for the next token (batch setup, KV
+slot allocation, output buffers, graph reuse checks).
+
+⚠️ **This qualifies Cluster A, and the qualification is load-bearing.**
+`llama_synchronize` blocks until the device drains on *every* iteration, so
+graph N+1's host setup cannot overlap graph N's execution **by construction of
+the benchmark harness**. Part of the 2.324 ms/step bubble is therefore a property
+of how `llama-bench` drives decode, not purely of the backend.
+
+It does not vanish in real inference — autoregressive decode has a genuine
+logits→sample→next-token dependency, and `llama-cli`/`llama-server` are also
+synchronous. But their inter-token work is *different* work, and a real loop has
+setup that does **not** depend on the sampled token and could in principle be
+overlapped, which `llama-bench` can never reveal because its token is random.
+
+**Any Cluster A fix must be scoped from a real decode path**
+(`llama-cli`/`llama-server`), never from a `llama-bench` trace. Scoping it from
+this capture would be optimizing the benchmark.
+
+### What would close this
+
+Host-side instrumentation inside `llama_decode` / `llama_synchronize` — a
+different instrument, above ggml-sycl, on a real decode loop. That is a new
+measurement task, not a finer setting on this one. Cluster B is untouched by all
+of this and remains the actionable ggml-sycl target.

@@ -4,6 +4,8 @@
 
 **Goal:** Reduce the **9.602 ms/step** of `truly_idle` decode time on GPT-OSS 20B / Arc Pro B70 — device time explained by neither ggml-sycl host work nor a declared dependency — by attacking the two clusters it actually sits in, established by measurement rather than by intuition.
 
+> **Status 2026-07-25:** Tasks 1, 2 and 6 are done. Task 2 **relocated Cluster A above this backend** (its 2.324 ms/step window is 0.5 % covered by ggml-sycl instrumentation), so Task 3 correctly wrote no fix plan. **The remaining in-scope target is Cluster B, ~6.37 ms/step**, via Tasks 4 → 5, with Task 7 for its residual.
+
 **Selected by:** Plan A's decision table, applied to Task 9's `DOMINANT CLASS: runtime_idle at 56.3%` → *"reduce launch count (batching, graphlets); per-op caching buys nothing."* Task 10 then re-analysed the same capture class-first and narrowed *which* launches.
 
 **Tech Stack:** C++17 / SYCL (Intel oneAPI DPC++ 2026.1), Python 3, CMake/CTest, Arc Pro B70 (`level_zero:0`).
@@ -23,7 +25,7 @@ Everything below comes from **one** capture (`/tmp/steady-slice2/`, B70, graph r
 | Actionable idle (`truly_idle`) | **9.602 ms/step**, 99.8 % of `runtime_idle`, **invariant** to the coverage policy |
 | Instrument is sound | 100 % of 46,100 device events resolve a submit span; `no_submit_span` = 0 |
 | Coverage policy | Resolved to `"union"`; split 52.9 / 47.6, **same branch selected**. Both splits recorded in the findings doc |
-| Cluster A — inter-token bubble | 2.324 ms/step, **n=99** vs 99 inter-graph transitions |
+| Cluster A — inter-token bubble | 2.324 ms/step, **n=99** vs 99 inter-graph transitions. ⛔ **Relocated above the backend by Task 2** — the host window is 0.5 % covered by ggml-sycl instrumentation and `ggml.op` is exactly 0.00 %. Not a launch-count target |
 | Cluster B — per-layer attention stalls | ~6.37 ms/step, 23–24×/step over 24 layers |
 | `sycl.binbcast.event` is an **empty `single_task`** | 72/step, 0.0382 ms/step device, followed by 5.503 ms/step idle |
 
@@ -160,7 +162,11 @@ Parse with `--wall-ms` set to the window's **own** envelope (parser defect 3 is 
 
 ---
 
-### Task 2: Attribute the host inter-graph window (Cluster A)
+### Task 2: Attribute the host inter-graph window — ✅ **DONE 2026-07-25** (findings doc, Task 12)
+
+Coverage **0.5 %** on both captures; `ggml.op` exactly 0.00 %. The window is empty of ggml-sycl work, which relocates Cluster A above the backend and fires Task 3's no-fix-plan row. Method below kept for the record.
+
+### Task 2 (completed): method
 
 **Why:** The device is idle ~2.24 ms between graphs while the host is between `graph_compute` calls for ~1.65 ms of it. Autoregressive decode has a genuine serial dependency there — logits → sampling → next embedding — but that is normally microseconds, not 1.65 ms. Until we know what the 1.65 ms *is*, no fix can be scoped.
 
@@ -172,7 +178,17 @@ Parse with `--wall-ms` set to the window's **own** envelope (parser defect 3 is 
 
 ---
 
-### Task 3: Cluster A fix — write the plan, then implement
+### Task 3: Cluster A fix — ⛔ **NO FIX PLAN WRITTEN** (rule applied, 2026-07-25)
+
+Task 2 measured the window at **0.5 % coverage**, so the rule row *"No callsite > 20 % and coverage < 80 % → Write no fix plan; the window is unattributed, say so"* fires. See findings doc Task 12.
+
+The outcome is stronger than "unattributed": ggml-sycl activity in the window is **positively absent** (`ggml.op` coverage exactly 0.00 %, reproduced on both captures). **Cluster A is not a launch-count problem and no ggml-sycl change can address it** — the window is `llama_synchronize` + `llama_decode` host work, above the backend.
+
+⚠️ It also cannot be scoped from `llama-bench` at all: its tg loop feeds `std::rand()` with no sampling and calls `llama_synchronize` every iteration, so part of the bubble is a harness property. A real fix needs host-side instrumentation on `llama-cli`/`llama-server`. **Cluster B is unaffected and is now the only actionable ggml-sycl target.**
+
+The original rule table is kept below for the record.
+
+### Task 3 (superseded): Cluster A fix — write the plan, then implement
 
 **Entry:** Task 2's table. **Blocked on Task 1 for any absolute speedup claim.**
 
