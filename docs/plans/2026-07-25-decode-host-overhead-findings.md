@@ -526,3 +526,208 @@ source changes, out of scope for Task 5 and for closed Track A:
   0 % however many steps are captured;
 - optionally, honour `GGML_SYCL_TIMELINE_TOKEN_START`/`_COUNT` as a decode-step
   window so a steady-state slice can be isolated without buffering all 128 steps.
+
+---
+
+## Task 6 — Attribution
+
+**Outcome: the attribution could not be performed, and no class share is stated
+below.** Task 6 exists to split the per-token non-kernel cost across
+`host_overlap` / `queue_serialization` / `runtime_idle` and name a dominant
+class. Task 5's capture cannot support that split — not weakly, not
+provisionally, not "indicatively". This section records the corrected budget
+that *is* supported, states the verdict as *not determined*, and points at the
+ticket that has to land before anyone tries again.
+
+This task ran **no GPU work**: it is analysis of Task 5's artifacts in
+`/tmp/decode-attrib/` plus the sections above.
+
+### Why there is nothing to attribute
+
+Three independent facts, each sufficient on its own.
+
+**1. The decode traces contain no gap-class metrics at all.** Not small ones —
+none. Both decode parses emit exactly four `timeline.*` lines and zero
+`gap.*` / `gap_class.*` lines:
+
+```
+$ grep -c '^gap_class\.' /tmp/decode-attrib/primary-decode/timeline.gaps.parse    -> 0
+$ grep -c '^gap_class\.' /tmp/decode-attrib/secondary-decode/timeline.gaps.parse  -> 0
+```
+
+The plan's Task 6 step 1 (`grep -E '^gap_class\.' ... | sort`) returns an empty
+set on both arms. There is no queue total to take a percentage of, no three-way
+split to check for exhaustiveness, and no callsite / gap-transition / category
+ranking to produce. Steps 2 and 3 of the implementation guide have no input.
+
+**2. Device-event coverage on the decode path is 0.00 %.** Verbatim from
+`primary-decode` (`secondary-decode` identical but for wall `6019827`):
+
+```
+timeline.wall_ms_x1000              5990322
+timeline.gpu_event_total_ms_x1000         0
+timeline.gpu_event_coverage_pct_x1000     0
+timeline.unattributed_ms_x1000      5990322
+```
+
+`unattributed` equals `wall` to the digit because the profiler explains nothing.
+The gap classifier derives gaps *between device events*; with zero `sycl.event`
+entries there are no gaps, which is precisely why fact 1 holds. Expressing
+anything "as a percentage of `timeline.unattributed_ms_x1000`" would be dividing
+into a quantity that is 100 % residual by construction.
+
+**3. One decode step was captured, and it is the worst possible one.** Both
+arms, to the event:
+
+```
+primary   (GGML_SYCL_DISABLE_GRAPH=1)     graph_compute_impl: 1 | compute_forward: 460 | total: 3417
+secondary (GGML_SYCL_DISABLE_GRAPH unset) graph_compute_impl: 1 | compute_forward: 460 | total: 3417
+```
+
+Expected for the primary: ≈129 spans (128 decode steps + 1 warmup). Observed: 1.
+Per the tracker override on `llama.cpp-3rzr`, a 1-span capture is a **failed
+capture, not a result**. The one step present is the ~440 ms first-token step
+(`dur` 440633 µs), which pays first-use weight materialization and is the least
+representative step in a 20.670 ms/token run — roughly 21× a steady-state token.
+Any share computed from it would describe first-token materialization while
+being labelled steady-state decode.
+
+**No class share has been computed from these traces, in any form.** Not for the
+primary arm, not for the secondary, not "for orientation". Facts 1–3 are the
+whole of what the decode artifacts support.
+
+### Verdict
+
+```
+DOMINANT CLASS: NOT DETERMINED — no dominant class was identified and no class
+share was computed. 0.0% of timeline.unattributed_ms_x1000 is attributed
+(0.000 ms/token of the 15.533 ms/token non-kernel budget measured, out of
+20.670 ms/token total). The decode capture emitted zero gap_class.* metrics on
+zero queues at 0.00% device-event coverage, over 1 of ~129 decode steps. This
+is a failed measurement, not a finding of "no dominant class in the data".
+CONFIDENCE: LOW — and strictly weaker than LOW: there is no classification to
+rate. The rounding_delta >5% rule could not be applied, because no
+gap_class.*.rounding_delta_ms_x1000 line exists for the decode path. Task 7
+must take its LOW CONFIDENCE branch (write no fix plan; re-run the Task 5
+capture) on the strength of the missing measurement, not of a weak one.
+```
+
+The `LOW` token is kept deliberately so Task 7's decision table matches without
+interpretation; read the second sentence for what it actually means.
+
+### The budget that does survive, carried forward unchanged from Task 5
+
+These figures are **not** recomputed or re-derived here — they are Task 5's, from
+the kernel profiler, which is not subject to the one-shot flush and covered all
+129 steps. Measured against the clean **shipping** path (graph replay ON,
+48.3799 tok/s):
+
+| quantity | value |
+|---|---:|
+| total token time | **20.670 ms** |
+| device-busy | **5.136 ms** |
+| non-kernel | **15.533 ms** |
+| non-kernel share | **75.2 %** |
+
+Restated Amdahl ceiling from the 5.136 ms device floor:
+
+- Eliminating **all** host time: 194.7 tok/s = **4.02×** — a bound on the whole
+  class of work, not a target, and unreachable.
+- Eliminating **half** the non-kernel budget: 77.5 tok/s = **1.60×**.
+- The plan's **+19 %** target needs 3.300 ms/token removed = **21.2 %** of the
+  non-kernel budget.
+
+Both caveats travel with the numbers and are not optional:
+
+⚠ **75.2 % is a conservative floor, not a ceiling.** The 5.136 ms device figure
+comes from the *profiled* runs. If per-kernel profiling inflates kernel
+durations, kernel time is overstated and the non-kernel budget is correspondingly
+*understated*.
+
+⚠ **It is a sum over per-kernel `total_ns` on a single in-order compute queue.**
+It would overcount device busy — and therefore further understate the non-kernel
+share — if work were concurrent across queues.
+
+So the headroom is real and large, and +19 % is not an unreasonable ask of it.
+**Where inside the 15.533 ms it sits remains unknown**, and that is exactly the
+question Task 6 was opened to answer.
+
+### Retired: the plan's `~22 ms` / `~84 %` premise
+
+**Do not carry `~22 ms/token` or `~84 %` forward. Both are dead.** `~22 ms`
+exceeds a whole 20.670 ms token, so it cannot be the non-kernel *part* of one;
+it is arithmetically impossible on this path, not merely imprecise. The
+replacements are **15.533 ms** and **75.2 %** above.
+
+As Task 5 established, the original figure most plausibly came from a
+`-p 512 -n 128` token (~22.9 ms at 43.6 tok/s) with the non-kernel share taken
+as the residual of ~15 % device coverage — and even on that basis it would be
+~17.8 ms and ~78 %, not 22 ms and 84 %. Any downstream document, task, or
+acceptance criterion still quoting `~22 ms` or `~84 %` is quoting a superseded
+premise.
+
+### The rounding-delta rule: enforceable, unexercised, and its scaling hazard
+
+Per the lead's comment `c-xhk3` on `llama.cpp-rn3e`, Task 3 (commit `f8ec00b93`)
+added `gap_class.device{N}.{queue}.rounding_delta_ms_x1000` — the
+**pre-correction** magnitude of the time the three-way split failed to explain,
+which the parser then folds into `runtime_idle` to force the classes to sum to
+the queue total. `runtime_idle` as printed is therefore inflated by exactly that
+delta, and `runtime_idle` is the class the plan treats as the smoking gun for the
+L0/UR submit path. The plan's rule — *any `rounding_delta` above 5 % of its
+queue's gap total ⇒ `LOW CONFIDENCE`* — is now enforceable, where before the
+magnitude was not observable at all.
+
+**It could not be exercised here.** There is no `rounding_delta` line on the
+decode path, because there is no gap-class data on the decode path (fact 1). The
+rule is ready for whoever re-runs this capture; it simply had nothing to be
+applied to.
+
+**Carry the scaling hazard `c-xhk3` flagged.** The delta accumulates one
+sub-microsecond rounding *per gap*, so its size tracks gap count. On Task 3's
+2-gap synthetic fixture it is 2 (`_x1000` units, i.e. 0.002 ms). The only real
+trace in this session's artifacts that carries the metric is the **prompt-path**
+`-p 512` trace (`/tmp/decode-attrib/primary/`), where it reads:
+
+| queue | gap count | `rounding_delta_ms_x1000` | queue gap total `_x1000` | delta as % of queue total |
+|---|---:|---:|---:|---:|
+| `device0.compute` | 968 | 52 | 1518482 | 0.0034 % |
+| `device0.copy` | 382 | 5 | 1579085 | 0.0003 % |
+
+Read that table for one thing only: **the metric is live and its observed
+magnitude on a ~1000-gap real trace is three orders of magnitude below the 5 %
+threshold.** No class share is read from that trace here — it is a prompt trace,
+not decode, and it is not an attribution. A full-length decode trace will carry
+many more gaps than 968, so recompute the percentage per queue rather than
+assuming it stays negligible; the point of the metric is that the assumption no
+longer has to be made.
+
+### What has to land first: `llama.cpp-sacs`
+
+The two source-level defects that made this measurement impossible are tracked
+together as **`llama.cpp-sacs`**. Task 5 described them; this is the tracker id
+that owns the fix, which the Task 5 write-up did not name:
+
+1. **The timeline flush is one-shot.** `sycl_timeline_flush`
+   (`ggml/src/ggml-sycl/sycl-timeline.cpp:461`) returns early once
+   `state.successful_file_flushes > 0`, and is called at
+   `ggml/src/ggml-sycl/ggml-sycl.cpp:92600-92606` under
+   `if (cached_is_decode && !g_ggml_sycl_graph_recording)` — the end of the
+   **first** non-recording decode step. Spans keep accumulating
+   (`sycl_timeline_record_span_for_step` has no flush guard) but nothing writes
+   them. A decode artifact is structurally incapable of holding more than one
+   step, under any value of `GGML_SYCL_DISABLE_GRAPH`.
+2. **The decode path emits zero `sycl.event` device events.** Fixing (1) alone
+   would still attribute nothing: coverage would remain 0.00 % over 129 steps
+   instead of over 1.
+
+Both are source changes, out of scope for closed Track A. Until `llama.cpp-sacs`
+is resolved, **re-running the Task 5 capture unchanged will reproduce this same
+non-result** — the failure is in the instrument, not in the run.
+
+The re-run, when it happens, needs: the flush made re-entrant or moved to
+context/process teardown; `sycl.event` emission on the decode path; and
+optionally `GGML_SYCL_TIMELINE_TOKEN_START`/`_COUNT` honoured as a decode-step
+window so a steady-state slice can be isolated without buffering 128 steps. It
+should also skip the first-token step explicitly — that step is 21× a
+steady-state token and would dominate any unwindowed average.
