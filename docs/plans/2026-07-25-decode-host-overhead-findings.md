@@ -1111,3 +1111,111 @@ registered via `llama_test_pytest()`; `ctest -N` goes 86 → 87.
 Defect 3 of `llama.cpp-sacs` is **not fixed**: `parse-sycl-timeline.py:532` still
 computes its fallback envelope across `sycl.event` timestamps, which are on the
 device clock. Keep passing `--wall-ms` explicitly.
+
+## Task 9 — Steady-state attribution (the question Plan A opened with)
+
+**This is the attribution Plan A set out to produce.** It is possible now because
+`llama.cpp-sacs` fixed the one-shot flush; the remaining obstacle — an envelope
+polluted by model load — is removed here by windowing the capture to a
+steady-state slice rather than by fixing parser defect 3.
+
+### Method: window the capture, don't post-hoc filter it
+
+`GGML_SYCL_TIMELINE_TOKEN_START=15 GGML_SYCL_TIMELINE_TOKEN_COUNT=100` on a
+`-p 0 -n 128 -r 1 -v` B70 run. That skips warmup and the ~440 ms first-token
+weight-materialization step, and captures 100 steady-state decode steps. This
+was untestable before `sacs` — the trace never held more than one step, so a
+window was meaningless.
+
+The window bound exactly: **100** `graph_compute_impl` spans, per-step duration
+min 18.43 / p50 19.84 / max 24.84 ms. No first-token outlier. `--wall-ms` is the
+window's **own** envelope (2332.624 ms), which is the only figure describing the
+population actually in the trace.
+
+⚠️ First attempt captured 100 clean steps but **zero** `sycl.event` entries:
+`GGML_SYCL_TIMELINE=timeline+events` alone is not sufficient — device events come
+from the kernel profiler's drain, so `GGML_SYCL_KERNEL_PROFILE=1` and its block
+are required. Re-captured with it.
+
+### Configuration
+
+| item | value |
+|---|---|
+| Card | Arc Pro B70, `level_zero:0`, PCI `0000:03:00.0` |
+| Graph replay | **ON** — `GGML_SYCL_DISABLE_GRAPH: 0`, `graphs reused = 128`. This is the shipping path. |
+| Binary | `850ca064b` (12153) |
+| Window | steps 15–114, 100 steps, 2332.624 ms |
+| Launches | 461 `sycl.event`/step — matches the plan's "~461 launches/token" grounding |
+
+### Result
+
+```
+timeline.wall_ms_x1000                2332624
+timeline.gpu_event_total_ms_x1000      512845     (22.0 % device coverage)
+timeline.unattributed_ms_x1000        1819779
+```
+
+Compute queue, 41094 gaps totalling 1828.277 ms:
+
+| class | ms/step | % of compute gap | % of unattributed |
+|---|---:|---:|---:|
+| **`runtime_idle`** | **10.242** | **56.0 %** | **56.3 %** |
+| `host_overlap` | 8.040 | 44.0 % | 44.2 % |
+| `queue_serialization` | 0.0006 | 0.003 % | 0.003 % |
+
+`rounding_delta` 0.250 ms = **0.014 %** of the queue total — far under the 5 %
+`LOW CONFIDENCE` threshold, so the classification is trustworthy. The metric
+added by `llama.cpp-7v8i` is doing exactly the job it was built for.
+
+Device busy 5.128 ms/step reproduces the independently measured 5.136 ms
+(kernel profiler, separate code path) to **0.16 %**.
+
+```
+DOMINANT CLASS: runtime_idle at 56.3% of timeline.unattributed_ms_x1000
+(10.242 ms/step of the 18.283 ms/step compute-queue gap, on a 23.326 ms/step
+profiled token).
+CONFIDENCE: HIGH — rounding_delta 0.014% of queue total, well under the 5% rule.
+```
+
+### What this means, and what it does not
+
+Per Plan A's Task 7 decision table, `runtime_idle` dominant ⇒ **reduce launch
+count (batching, graphlets); per-op caching buys nothing.**
+
+Plan A's Task 6 gotcha anticipated this outcome and warned it would be misread:
+a dominant `runtime_idle` "is the *least* actionable outcome for ggml-sycl code
+and the most likely to be misread as 'our code is slow.' It means the opposite."
+At 461 launches/step and 10.242 ms of `runtime_idle`, that is **~22 µs of gap per
+launch** — time explained by neither our host work nor a dependency.
+
+**`queue_serialization` at 0.003 % is a clean negative.** The dependency graph is
+not the bottleneck. One of the three candidate causes is eliminated outright.
+
+Largest single compute-queue gap transition:
+
+| transition | ms (100 steps) | % of compute gap |
+|---|---:|---:|
+| `mxfp4.gateup.xmx_tiled_dpas_m2` → `sycl.binbcast.mul` | 504.150 | 27.6 % |
+| `sycl.binbcast.event` → `sycl.get_rows.marker` | 232.370 | 12.7 % |
+| `sycl.set_rows.generic` → `sycl.binbcast.mul` | 208.363 | 11.4 % |
+| `sycl.softmax.forward` → `mxfp4.quantize.activation_q8_soa` | 206.997 | 11.3 % |
+
+Top host overlap is the same leading transition, under `MUL_MAT_ID` (636.429 ms).
+So the largest gap sits immediately after the MoE gate/up XMX matmul.
+
+The copy queue's 2323.797 ms total is **not** decode work — in steady-state decode
+that queue is essentially idle, and its gap total tracks the wall clock. Do not
+read it as cost.
+
+### Caveats
+
+- **Profiled run.** 23.326 ms/step here vs ~20.67 ms/step clean — roughly 12.9 %
+  observer effect in this configuration (`TIMELINE` + `KERNEL_PROFILE`), not the
+  2.84 % Task 4 measured for `TIMELINE` alone. **The class *shares* are the robust
+  output; the absolute per-step milliseconds are inflated.** Which class the
+  overhead inflates more is not established — do not assume it cancels.
+- Parser defect 3 (`--wall-ms` epoch mixing) remains **unfixed**. Passing
+  `--wall-ms` explicitly is still mandatory; this capture derives it from the
+  window's own envelope for that reason.
+- Single capture, not a repeated-measures design. The class shares are large and
+  the rounding delta is negligible, but a second capture would strengthen it.
