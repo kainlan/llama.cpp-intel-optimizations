@@ -209,9 +209,20 @@ The original rule table is kept below for the record.
 
 **Why:** 72 empty `single_task` submissions per token, 0.0382 ms/step of device time, followed by 5.503 ms/step of `truly_idle` — on an in-order queue that already guarantees the ordering the marker exists to provide. If causal, this is the single largest actionable item in the capture. If not, Cluster B's budget must be re-attributed and the marker left alone.
 
-**Do:** `GGML_SYCL_BINBCAST_EVENT_MODE` (`binbcast.cpp:77`) is **not** sufficient — both `safe` and `barrier` still submit something. Add a third mode that returns **no submission at all** when the queue is in-order, reusing the existing reasoning at `unified-cache.cpp:7677` ("In-order queues already serialize submissions"). Keep it **opt-in** and default-off for this task.
+⚠️ **The caller survey below was done first (2026-07-25) and it CORRECTS this task's original instruction.** That instruction — "add a mode that returns no submission at all" — is **unsafe and must not be implemented.**
 
-Then determine what the returned `sycl::event` is actually used for. It is a real return value with real callers — if any caller needs a concrete event to wait on or chain, a no-submission mode must give it something valid or the change is a correctness bug, not an optimization. **Establish this before measuring, and record the callers.**
+**The two consumers of the returned `sycl::event`** (`ggml_sycl_submit_binbcast_event` is `static`, and both call sites are in `binbcast.cpp`; there are no others):
+
+| # | site | consumer | load-bearing? |
+|---|---|---|---|
+| 1 | `binbcast.cpp:896` | `ggml_sycl_set_tensor_ready_event(dst, …)`, only for `GGML_OP_MUL` and only when not graph-recording | **No.** The catch block at `:898-900` calls it "a diagnostic synchronization aid" and deliberately tolerates failure |
+| 2 | `binbcast.cpp:917` | `cache->unpin_on_event(key, layout, done_event)` | **YES** |
+
+Consumer 2 is a **weight-cache lease release gated on GPU completion**. `unified_cache::unpin_on_event` (`unified-cache.cpp:7454`) parks the event in `inflight_unpins_` and later polls `event_complete(entry.event)` to decide when the pin may drop. Return no event and the cache either unpins early — evicting a weight the GPU is still reading, i.e. `DEVICE_LOST` or silent corruption — or leaks the pin. Either is a violation of the ownership contract in `docs/design/sycl-canonical-memory-architecture.md`, and the first would show up as a *speedup*.
+
+**Do instead:** stop *manufacturing* an event with an empty kernel and **reuse the binbcast kernel's own event**. On an in-order queue it carries the identical completion guarantee for both consumers, and it is the pattern already applied at `unified-cache.cpp:7677`. This requires plumbing the event out of the `op()` dispatch above (which currently discards it), so it is a larger change than the original instruction assumed — but it is the only one that keeps consumer 2 correct.
+
+`GGML_SYCL_BINBCAST_EVENT_MODE` (`binbcast.cpp:77`) remains insufficient on its own: both `safe` and `barrier` still submit. Keep the new path **opt-in and default-off** for this task.
 
 **Gate:**
 - Mistral completion gate **and** the GPT-OSS B50 chat gate pass with the new mode on. Correctness first — a marker removal that corrupts ordering will still look fast.

@@ -1647,3 +1647,49 @@ Host-side instrumentation inside `llama_decode` / `llama_synchronize` — a
 different instrument, above ggml-sycl, on a real decode loop. That is a new
 measurement task, not a finer setting on this one. Cluster B is untouched by all
 of this and remains the actionable ggml-sycl target.
+
+## Task 13 — What the `binbcast.event` marker's event is for (read-only)
+
+Plan phase 2 Task 4's mandatory first step, done before any code change.
+**It corrects that task's own instruction.**
+
+`ggml_sycl_submit_binbcast_event` is `static` and has exactly two call sites,
+both in `binbcast.cpp` (`:888` and `:912`, behind one `ensure_done_event()`
+lambda). Nothing outside the file can reach it. The returned `sycl::event` has
+two consumers:
+
+| # | site | consumer | load-bearing? |
+|---|---|---|---|
+| 1 | `:896` | `ggml_sycl_set_tensor_ready_event(dst, device, …)` — only `GGML_OP_MUL`, only when not graph-recording | **No** — the catch at `:898-900` calls it "a diagnostic synchronization aid" and tolerates failure by design |
+| 2 | `:917` | `cache->unpin_on_event(pins[i].key, pins[i].layout, done_event)` | **YES** |
+
+`unified_cache::unpin_on_event` (`unified-cache.cpp:7454`) stores the event in
+`inflight_unpins_` and polls `event_complete(entry.event)` to decide when the
+weight-cache pin may drop. That is a **lease release gated on GPU completion** —
+the ref-counted `mem_handle` discipline this fork is built on.
+
+**So the plan's original instruction — "add a mode that returns no submission at
+all" — is unsafe and must not be implemented.** With no event, the cache either
+unpins early, evicting a weight the GPU is still reading (`DEVICE_LOST` or
+silent corruption), or leaks the pin. The first failure mode would present as a
+**speedup**, which is precisely the trap the fork's "verify correctness before
+claiming any perf win" rule exists for.
+
+**The correct change is different in kind.** Do not *manufacture* an event with
+an empty kernel — **reuse the binbcast kernel's own event**, which the `op()`
+dispatch at `:840-882` currently discards. On an in-order queue that event
+carries the identical completion guarantee for both consumers, and this is
+already the established pattern at `unified-cache.cpp:7677`:
+
+```
+// In-order queues already serialize submissions; avoid ext_oneapi_submit_barrier.
+result.event = all_events.back();
+```
+
+That is a larger change than the plan assumed (it means plumbing an event out of
+the type-dispatch chain), but it is the only shape that keeps consumer 2 correct
+while removing the 72 submissions/token.
+
+**Still not established:** causation. Nothing here shows the 5.503 ms/step of
+idle *following* these markers is *caused* by them — that still needs the
+measurement, and it now needs the harder change to get it.
