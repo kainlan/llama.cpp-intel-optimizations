@@ -1219,3 +1219,194 @@ read it as cost.
   window's own envelope for that reason.
 - Single capture, not a repeated-measures design. The class shares are large and
   the rounding delta is negligible, but a second capture would strengthen it.
+
+## Task 10 — Class-first re-analysis: the verdict holds, the phase-2 target does not
+
+Task 9 is a single capture, and its own last caveat asks for a second one. This
+task strengthens it a different way: by **re-analysing the same trace** rather
+than re-running it. That is deliberate. A confirming capture taken at load 18.68
+would confound the very class under test — `runtime_idle` is exactly the
+signature a descheduled submitting thread produces — whereas the questions below
+are about whether the classifier can be *believed at all*, which the artifact on
+disk already answers.
+
+Reproduced with `scripts/parse-sycl-gap-causes.py`, which loads
+`parse-sycl-timeline.py` by path and reuses its classifier verbatim, so the two
+cannot drift. It reproduces Task 9's split exactly (`host_overlap` 803989,
+`runtime_idle` 1023981 in `_ms_x1000`), which is what licenses everything below.
+
+```
+python3 scripts/parse-sycl-gap-causes.py /tmp/steady-slice2/sycl-timeline.json \
+  --queue compute --steps 100 --top-transitions 6
+```
+
+### The verdict survives both of its structural failure modes
+
+`runtime_idle` is the classifier's `else` branch (`parse-sycl-timeline.py:392`).
+It absorbs genuine runtime latency *and* every gap the first two tests merely
+failed to prove something about. A dominant `runtime_idle` is therefore not a
+finding until the residual is separated from the signal. Splitting it:
+
+| cause | ms/step | % of `runtime_idle` | n |
+|---|---:|---:|---:|
+| **`truly_idle`** | **9.602** | **93.8 %** | 18840 |
+| `sum_covers_max_does_not` | 0.619 | 6.05 % | 3755 |
+| `submit_pipelined_ahead` | 0.019 | 0.19 % | 264 |
+| `no_submit_span` | **0.000** | **0.00 %** | **0** |
+
+**The dangerous hypothesis is dead.** With graph replay ON, submits are recorded
+at graph *record* time, so a replay window could plausibly contain no submit
+spans at all — which would make `host_overlap` untestable and the verdict a
+tautology. It does not: **all 46,100 device events resolve a submit span
+(100.0 %)**, via `sycl.submit` records and the `host_submit_*_us` fallback at
+`parse-sycl-timeline.py:312`. `no_submit_span` is zero, not small.
+
+**The real defect is small.** `max_host_node_overlap_us` requires one *single*
+host op to cover half the gap; a host busy with many short ops fails that bar
+even when its spans together cover the window. That misfiles 0.619 ms/step.
+Correcting it moves the split from 56.0 / 44.0 to roughly **52.6 / 47.4** —
+`runtime_idle` still dominant, still above the decision table's 50 % threshold.
+**The phase-2 branch is unchanged.** A `union_host_node_overlap_us` helper and a
+`HOST_OVERLAP_COVERAGE` policy constant are staged in the parser for this; the
+dispatch is deliberately not yet wired, because flipping it changes a published
+number and that is a call to make explicitly rather than in passing.
+
+⚠️ Note what `rounding_delta` does and does not certify. Task 9 cites
+`rounding_delta 0.014 %` as grounds for `CONFIDENCE: HIGH`. That metric is an
+*arithmetic* check that the three class totals sum to the queue total — and
+`parse-sycl-timeline.py:547` force-balances them, as
+`test-sycl-timeline-gap-class-conservation.py`'s own docstring says. It is
+silent on whether each gap was classified *correctly*. The table above is the
+first evidence for that, and `test-sycl-gap-causes.py` now gates it.
+
+### The transition table in Task 9 pools all three classes — do not scope from it
+
+This is the correction that matters. Task 9's largest-transition table, and the
+handoff drawn from it, name `mxfp4.gateup.xmx_tiled_dpas_m2 → sycl.binbcast.mul`
+at 27.6 % of compute gap as the leading phase-2 candidate. Split by class:
+
+| class | ms (100 steps) | share of that transition |
+|---|---:|---:|
+| `host_overlap` | **502.660** | **99.7 %** |
+| `runtime_idle` | 1.490 | 0.3 % |
+
+**That transition is host-busy time, not idle time.** The host is doing ggml work
+across it and overlap is working as intended. It is 0.16 % of the actionable
+class. Reducing launch count around it buys nothing — the pooled ranking put a
+well-overlapped transition at the top of a list used to choose a launch-count
+fix, because `host_overlap` and `runtime_idle` demand opposite responses and were
+being ranked together. **Rank within a class, never across classes.**
+
+### Where the actionable 9.602 ms/step actually is
+
+Two clusters, needing different fixes. Per-gap spread across all `truly_idle`
+gaps: p50 29.6 µs, p90 81.2 µs, p99 258.8 µs, max 4823.5 µs.
+
+**Cluster A — the inter-token bubble. 2.324 ms/step, 24.2 %, one gap per step.**
+
+| transition | ms/step | n/step | µs/gap |
+|---|---:|---:|---:|
+| `sycl.binbcast.event → sycl.get_rows.marker` | 2.324 | 0.99 | 2347.2 |
+
+Verified as the step boundary, not inferred: the trace holds 100 `ggml.graph`
+spans and this gap occurs **n=99**, exactly the number of inter-graph
+transitions. Host inter-graph gap is p50 1646 µs / mean 1718 µs, so the host is
+provably between `graph_compute` calls for ~1.65 ms of the ~2.24 ms the device
+spends idle. On a 20.670 ms clean token that is **~11 % of every token**.
+Launch count inside the graph is irrelevant to it.
+
+**Cluster B — per-layer attention-path stalls. ~6.37 ms/step, 66 %.** Every row
+recurs 23–24 times per step and GPT-OSS 20B has 24 layers, so these are
+per-layer:
+
+| transition | ms/step | n/step | µs/gap |
+|---|---:|---:|---:|
+| `sycl.binbcast.event → sycl.rope` | 1.766 | 23.0 | 76.8 |
+| `sycl.set_rows.generic → sycl.binbcast.mul` | 1.708 | 20.2 | 84.6 |
+| `sycl.binbcast.event → sycl.softmax.forward` | 1.399 | 23.9 | 58.6 |
+| `sycl.rope → sycl.set_rows.generic` | 0.863 | 24.0 | 36.0 |
+| `sycl.rope → sycl.rope` | 0.632 | 24.0 | 26.3 |
+
+This is the KV/attention path — rope, set_rows, softmax, binbcast — **not** the
+MoE matmul path. `sycl.binbcast.event` is the source side of 57 % of the
+actionable idle, which is the single strongest structural hint in the capture.
+
+### What this does and does not establish
+
+- **Does:** the `runtime_idle` verdict is not an instrument artifact; it survives
+  its worst known defect with the same branch selected; and the phase-2 scope is
+  two named clusters rather than the MoE boundary.
+- **Does not:** run-to-run reproducibility. This is re-analysis of the Task 9
+  capture, so a second capture is still owed. Nothing above depends on the
+  absolute milliseconds — only on shares, counts and the n=99 coincidence — which
+  are the outputs Task 9's own caveat identifies as robust to observer effect.
+- **Does not:** rule out host load as a contributor to `truly_idle`. A capture on
+  a quiet machine is the test, and it has not been run.
+
+### Gates
+
+`scripts/parse-sycl-gap-causes.py` (new) and `tests/test-sycl-gap-causes.py`
+(new, registered in ctest as `test-sycl-gap-causes`, driven by a checked-in
+synthetic trace). The test gates conservation — the four causes must sum to the
+`runtime_idle` class in both time and count, which nothing force-balances — and
+non-vacuity, requiring every cause to be observed at least once so a defect
+cannot report as a zero. The fixture builds exactly one gap per cause. Both it
+and `test-sycl-timeline-gap-class-conservation` pass.
+
+**What these gates cannot catch:** they run on a synthetic trace, so they prove
+the split is self-consistent and live, never that the *causes are the right
+partition* of why a real gap is idle, and never that a real capture is free of
+host-load contamination. A machine at load 18.68 would still produce
+`truly_idle` that these gates would happily conserve.
+
+### Amendment: what `sycl.binbcast.event` is, and why `queue_serialization ≈ 0` is not the clean negative Task 9 called it
+
+`sycl.binbcast.event` is the source side of 57 % of the actionable idle, so what
+it *is* decides how Cluster B is read. It is not a compute kernel.
+`ggml_sycl_submit_binbcast_event` (`ggml/src/ggml-sycl/binbcast.cpp:93`) submits
+either an `ext_oneapi_submit_barrier()` or, in `SAFE` mode, an **empty
+`single_task`**. Mode defaults to `BARRIER`, but lines 101–103 downgrade
+`BARRIER` to `SAFE` whenever the queue is in-order — and ggml-sycl GPU queues
+always are: `default_queue_properties()` (`common.hpp:5954`) returns
+`{in_order, enable_profiling}`, and `dpct`'s `default_queue()`
+(`dpct/helper.hpp:776`) returns the in-order queue, with a comment keeping it
+that way deliberately for an Arc L0 driver issue.
+
+Confirmed against the trace rather than inferred from the code path: **all
+14,400 `sycl.binbcast.event` records carry `mode=kernel;event_mode=safe`**, and
+all are owned by `node_op=MUL` (`attn_norm`, `attn_post_norm`,
+`ffn_moe_weighted` — three per layer × 24 layers).
+
+| quantity | per step |
+|---|---:|
+| launches | **72.0** |
+| device time | 0.0382 ms (p50 0.521 µs — it is a no-op) |
+| host submit time | 0.2519 ms (p50 3.000 µs) |
+| **`truly_idle` in the gaps that follow them** | **≈5.503 ms (57.3 % of the actionable 9.602)** |
+
+So 72 empty kernels per token, costing almost nothing themselves, are followed by
+5.5 ms/step of device idle — **on a queue whose in-order property already
+guarantees the ordering they exist to provide.** The same reasoning is already
+applied elsewhere in this backend: `unified-cache.cpp:7677` skips
+`ext_oneapi_submit_barrier` with the comment "In-order queues already serialize
+submissions".
+
+⚠️ **This is correlation, not causation.** The gap *follows* the no-op; that does
+not prove the no-op causes it. Establishing that is phase 2's first job, and
+`GGML_SYCL_BINBCAST_EVENT_MODE` (`binbcast.cpp:77`) is not sufficient to test it
+— both of its values still submit something.
+
+**The correction this forces.** Task 9 reads `queue_serialization` at 0.003 % as
+"the dependency graph is not the bottleneck — one of three candidate causes is
+eliminated outright", and the handoff repeats it. That over-reads the metric.
+`device_gap_has_dependency` (`parse-sycl-timeline.py:342`) detects a dependency
+only through explicit `depends_on` event ids. **An in-order queue serializes
+implicitly, declaring no such edge**, so in-order serialization is invisible to
+that test and falls through to `runtime_idle` — the `else` branch — by
+construction. On this backend, where every GPU queue is in-order,
+`queue_serialization` is close to unreachable whatever the truth is.
+
+`queue_serialization ≈ 0` is therefore a clean negative for *explicitly declared*
+dependencies only. It is **not** evidence that serialization is absent, and the
+dependency hypothesis is **not** eliminated. Some unknown share of `truly_idle`
+may be exactly that, wearing the residual class's name.

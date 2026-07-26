@@ -1,0 +1,133 @@
+{
+  "_comment": [
+    "Synthetic Chrome Trace fixture for test-sycl-gap-causes.py. Hand-built,",
+    "never captured from hardware.",
+    "",
+    "The device0/compute queue produces exactly four gaps, one per runtime_idle",
+    "cause that parse-sycl-gap-causes.py distinguishes. Every gap is 2,000,000 ns",
+    "(2.000 ms), so HOST_OVERLAP_MIN_FRACTION=0.5 demands 1000 us of host-node",
+    "coverage to classify as host_overlap. All four must miss that bar for a",
+    "different reason, or the cause split is not being observed:",
+    "",
+    "  k1->k2  truly_idle             submit window [100,1000) is 900 us wide, so",
+    "                                 neither max nor sum can reach 1000 us.",
+    "  k2->k3  sum_covers_max_does_not submit window [1100,3000) holds three 400 us",
+    "                                 nodes: sum 1200 >= 1000, max 400 < 1000.",
+    "  k3->k4  submit_pipelined_ahead  k4 submit begins at 3050, before k3's submit",
+    "                                 ends at 3100, so the overlap test short-",
+    "                                 circuits before any node is considered.",
+    "  k4->k5  no_submit_span          k5 carries no host_submit_* args and has no",
+    "                                 sycl.submit event, so no span resolves.",
+    "",
+    "None of the four may fall to queue_serialization: each gap is far above the",
+    "1000 ns epsilon and no event declares depends_on.",
+    "",
+    "The three ggml.op nodes sit at [1200,1600), [1700,2100) and [2200,2600) --",
+    "entirely inside the k2->k3 window and outside every other one, so moving or",
+    "resizing any of them changes exactly one expected cause."
+  ],
+  "traceEvents": [
+    {
+      "ph": "X",
+      "cat": "ggml.op",
+      "name": "compute_forward_node",
+      "ts": 1200,
+      "dur": 400,
+      "args": { "metadata": "op=MUL_MAT" }
+    },
+    {
+      "ph": "X",
+      "cat": "ggml.op",
+      "name": "compute_forward_node",
+      "ts": 1700,
+      "dur": 400,
+      "args": { "metadata": "op=MUL_MAT" }
+    },
+    {
+      "ph": "X",
+      "cat": "ggml.op",
+      "name": "compute_forward_node",
+      "ts": 2200,
+      "dur": 400,
+      "args": { "metadata": "op=MUL_MAT" }
+    },
+    {
+      "ph": "X",
+      "cat": "sycl.event",
+      "name": "k1",
+      "ts": 50,
+      "dur": 50,
+      "args": {
+        "device": 0,
+        "queue_kind": "compute",
+        "event_id": 1,
+        "device_start_ns": 1000000,
+        "device_end_ns": 2000000,
+        "host_submit_begin_us": 50,
+        "host_submit_end_us": 100
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "sycl.event",
+      "name": "k2",
+      "ts": 1000,
+      "dur": 100,
+      "args": {
+        "device": 0,
+        "queue_kind": "compute",
+        "event_id": 2,
+        "device_start_ns": 4000000,
+        "device_end_ns": 5000000,
+        "host_submit_begin_us": 1000,
+        "host_submit_end_us": 1100
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "sycl.event",
+      "name": "k3",
+      "ts": 3000,
+      "dur": 100,
+      "args": {
+        "device": 0,
+        "queue_kind": "compute",
+        "event_id": 3,
+        "device_start_ns": 7000000,
+        "device_end_ns": 8000000,
+        "host_submit_begin_us": 3000,
+        "host_submit_end_us": 3100
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "sycl.event",
+      "name": "k4",
+      "ts": 3050,
+      "dur": 150,
+      "args": {
+        "device": 0,
+        "queue_kind": "compute",
+        "event_id": 4,
+        "device_start_ns": 10000000,
+        "device_end_ns": 11000000,
+        "host_submit_begin_us": 3050,
+        "host_submit_end_us": 3200
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "sycl.event",
+      "name": "k5",
+      "ts": 3300,
+      "dur": 50,
+      "args": {
+        "device": 0,
+        "queue_kind": "compute",
+        "event_id": 5,
+        "device_start_ns": 13000000,
+        "device_end_ns": 14000000
+      }
+    }
+  ]
+}

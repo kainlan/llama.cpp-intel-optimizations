@@ -377,6 +377,22 @@ if (NOT WIN32)
         LABELS "sycl;profiling;tdd"
         TIMEOUT 120
     )
+
+    # Conservation + non-vacuity gate for parse-sycl-gap-causes.py's split of
+    # runtime_idle into its four causes. The sibling gate above proves the three
+    # gap *classes* balance; it cannot see whether runtime_idle -- the
+    # classifier's else branch -- is signal or residual, which is the number
+    # phase-2 scoping is drawn from. Same plain-script rationale as above.
+    llama_test_cmd(
+        ${LLAMA_PYTHON3}
+        NAME test-sycl-gap-causes
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-gap-causes.py
+    )
+    set_tests_properties(test-sycl-gap-causes PROPERTIES
+        LABELS "sycl;profiling;tdd"
+        TIMEOUT 120
+    )
 endif()
 
 if (GGML_SYCL)

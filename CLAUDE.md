@@ -45,13 +45,51 @@ The script always uses Ninja (`-G Ninja`). Reasons:
 If a `build/` was created with a different generator, run `./scripts/sycl-build.sh -c` to wipe and reconfigure.
 
 ### Running Tests
+
+⚠️ **`-j $(nproc)` on the full suite OOM-kills this host.** This is not a
+theoretical hazard — it happened twice on 2026-07-25, each time taking down the
+Claude Code CLI along with `dbus-broker` and `xdg-document-portal`:
+
+```
+oom-kill: constraint=CONSTRAINT_NONE ... global_oom, task=test-llama-arch
+Out of memory: Killed process 468242 (test-llama-arch)
+```
+
+Cause: tests **#1–#19** are the SYCL mem-handle / MoE-residency family, they all
+allocate GPU buffer objects whose TTM shmem backing grows the same way
+`test-backend-ops` does (see Hard-Won Rules), and they sit at the *front* of the
+list — so `-j 20` on this 20-core box starts all 19 at once. `test-llama-arch`
+was a victim of the global OOM (anon-rss 636 kB), not the cause. The specific
+binary that consumed the ~230 GB was not isolated, and isolating it is not worth
+another OOM.
+
+The command that used to be documented here was `-j $(nproc)`, which is exactly
+the hazard. Prefer, in order:
+
 ```bash
 source /opt/intel/oneapi/setvars.sh --force
-ctest --test-dir build --output-on-failure -j $(nproc)
+
+# 1. BEST: run only what your change actually gates. Almost always sufficient.
+ctest --test-dir build -R <name-or-regex> --output-on-failure
+
+# 2. Full suite, throttled, GPU-allocating family excluded. Check `uptime`
+#    first -- never on a loaded machine.
+ctest --test-dir build --output-on-failure -j 4 -LE 'residency|mem-handle|cache'
+
+# 3. The excluded family, serially, with monitoring. Manually only -- never in
+#    a subagent or background task.
+ctest --test-dir build -L residency --output-on-failure -j 1
 
 # Run a single test by name
 ctest --test-dir build -R <test-name> -V
 ```
+
+Pure-Python gates (`test-sycl-gap-causes`,
+`test-sycl-timeline-gap-class-conservation`, `test-jinja-py`) allocate nothing
+and are always safe at any parallelism.
+
+After any OOM or forced stop, **check the GPU before trusting a benchmark** —
+`journalctl -k --since "1 hour ago" --no-pager | grep -iE 'GT reset|guc_id|CAT error'`.
 
 ### Code Formatting
 ```bash
