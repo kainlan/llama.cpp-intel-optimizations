@@ -239,7 +239,7 @@ per-token budget derived from a different instrument that did work.
 | Model | `/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf` |
 | Binary under test | **`baaf652e1` (build 12145)** — identical for all runs |
 | Repo HEAD at capture | `f8ec00b93` (binary is one commit behind; `f8ec00b93` touched only `scripts/parse-sycl-timeline.py` and a test, and the parser runs from the working tree, so it is current) |
-| Free VRAM | **32600.7 MB** on every capture run, 32598.5 MB on the two `-p 0` baseline runs — matches the ~32.6 GB expectation |
+| Free VRAM | **32600.7 MB** on every capture run and on the `baseline_*` round; **32598.5 MB** on the `dec_*` round — both match the ~32.6 GB expectation (see "Which artifact prefix is which" below) |
 | Load (1 min) | 8.5 – 10.1 across the series (Frigate ffmpeg only; no ninja/icpx) |
 | Guards | `GGML_SYCL_OP_TIMEOUT_MS=180000`, `timeout` on every GPU command |
 
@@ -302,8 +302,16 @@ The trace's own shape confirms this exactly. In `primary-decode`:
 | the single graph span (`dur` 440633 µs, `nodes=1374`) | 1 `ggml.graph`, 920 `ggml.op`, 532 `sycl.submit`, 3 `sycl.wait` |
 | after the graph span | **nothing — 0 events** |
 
-The last event in the file ends 57 µs *before* the graph span ends. That is the
-flush firing inside the step, just ahead of the scope destructor at `:78660` — which
+The last event in the file ends **4 µs** *before* the graph span ends. Arithmetic,
+from the raw JSON: the graph span is `ts=32585790537 dur=440633`, so it ends at
+`32586231170`; the latest-ending event other than the span itself is a
+`compute_forward` at `ts=32586231093 dur=73`, ending at `32586231166`;
+`32586231170 − 32586231166 = 4`. The `secondary-decode` trace gives the same 4 µs
+(last inner event `compute_forward_node`). Compare against the *end* (`ts+dur`) of
+the last inner event, not its `ts` — comparing against `ts` gives 57 µs, which is
+just that event's duration plus the gap and is not the quantity meant here. That
+4 µs is the flush firing inside the step, just ahead of the scope destructor at
+`:78660` — which
 is also why the one captured step is the 440 ms first-token step (first-use weight
 materialization), not a steady-state ~20 ms one.
 
@@ -404,15 +412,34 @@ Artifacts: `/tmp/decode-attrib/{primary-decode,secondary-decode,primary}/` —
 `sycl-timeline.json`, `timeline.parse`, `timeline.gaps.parse`, `sycl-kernels.csv`,
 `kernels.parse`, `cost-ranking.parse`, `bench.std{out,err}`.
 
+#### Which artifact prefix is which
+
+`/tmp/decode-attrib/` also holds two flat rounds of throughput runs, both real and
+both cited in this document. They are easy to confuse, because `llama-bench`'s CSV
+writes the tg row as `n_prompt=0, n_gen=128` in **both** — so a `0,128` row does not
+tell you which command produced it. Distinguish them by prefix:
+
+| prefix | command | free VRAM | cited as |
+|---|---|---:|---|
+| `baseline_{graphon,nograph}.{csv,log}` | `-p 512 -n 128 -r 3` | 32600.7 MB | the `-p 512 -n 128 -r 3` figures (1434.73 / 49.18 and 1418.41 / 49.01) in "Re-measured baselines" |
+| `dec_{graphon,nograph}.{csv,log}` | `-p 0 -n 128 -r 3` | 32598.5 MB | the **48.3799 / 48.8345** pair in the "Re-measured baselines" table — the numbers the budget below is built on |
+
+Neither round is a discarded attempt. The `baseline_*` round was run first, at the
+profile script's own bench args, while the script was still the intended capture
+vehicle; it is retained because it is the only clean `-p 512 -n 128` measurement of
+the two graph arms on this binary. The `dec_*` round matches the capture command
+(`-p 0 -n 128`) and is therefore the pair the per-token budget uses. The 2.2 MB VRAM
+difference between the rounds is noise on a 32.6 GB card.
+
 ### Re-measured baselines (B70, `-p 0 -n 128`, `-r 3`, no profiler)
 
 Both arms re-measured on the capture binary. Task 4's 46.88 tok/s is **not** reused
 anywhere below.
 
-| arm | tg128 tok/s | sd | ms/token | free VRAM |
-|---|---:|---:|---:|---:|
-| graph replay ON (`env -u`, log `GGML_SYCL_DISABLE_GRAPH: 0`) | **48.3799** | 0.0655 | 20.670 | 32598.5 MB |
-| graph replay OFF (`=1`, log `GGML_SYCL_DISABLE_GRAPH: 1`) | **48.8345** | 0.2426 | 20.477 | 32598.5 MB |
+| arm | tg128 tok/s | sd | ms/token | free VRAM | artifact |
+|---|---:|---:|---:|---:|---|
+| graph replay ON (`env -u`, log `GGML_SYCL_DISABLE_GRAPH: 0`) | **48.3799** | 0.0655 | 20.670 | 32598.5 MB | `dec_graphon.{csv,log}` |
+| graph replay OFF (`=1`, log `GGML_SYCL_DISABLE_GRAPH: 1`) | **48.8345** | 0.2426 | 20.477 | 32598.5 MB | `dec_nograph.{csv,log}` |
 
 Disabling graph replay costs **−0.94 %** on TG here (it is nominally *faster*, well
 inside the spread). At `-p 512 -n 128 -r 3`: 1434.73 / 49.18 with replay on,
