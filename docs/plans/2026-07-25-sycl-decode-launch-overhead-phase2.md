@@ -20,9 +20,9 @@ Everything below comes from **one** capture (`/tmp/steady-slice2/`, B70, graph r
 
 | fact | value |
 |---|---|
-| Actionable idle (`truly_idle`) | 9.602 ms/step, 93.8 % of `runtime_idle` |
+| Actionable idle (`truly_idle`) | **9.602 ms/step**, 99.8 % of `runtime_idle`, **invariant** to the coverage policy |
 | Instrument is sound | 100 % of 46,100 device events resolve a submit span; `no_submit_span` = 0 |
-| Worst known parser defect | 0.619 ms/step; corrected split 52.6 / 47.4, **same branch selected** |
+| Coverage policy | Resolved to `"union"`; split 52.9 / 47.6, **same branch selected**. Both splits recorded in the findings doc |
 | Cluster A — inter-token bubble | 2.324 ms/step, **n=99** vs 99 inter-graph transitions |
 | Cluster B — per-layer attention stalls | ~6.37 ms/step, 23–24×/step over 24 layers |
 | `sycl.binbcast.event` is an **empty `single_task`** | 72/step, 0.0382 ms/step device, followed by 5.503 ms/step idle |
@@ -196,11 +196,13 @@ Then determine what the returned `sycl::event` is actually used for. It is a rea
 
 ---
 
-### Task 6: Wire `HOST_OVERLAP_COVERAGE` (no GPU)
+### Task 6: Wire `HOST_OVERLAP_COVERAGE` — ✅ **DONE 2026-07-25**
 
-`union_host_node_overlap_us` and the `HOST_OVERLAP_COVERAGE` constant are staged in `parse-sycl-timeline.py`; the dispatch in `device_gap_has_host_overlap` is marked `TODO(decision pending)` because flipping it changes a published number. **This task is blocked on the maintainer's choice of semantics**, recorded at that constant.
+Resolved to `"union"`. `device_gap_has_host_overlap` now dispatches through `host_node_coverage_us`, which rejects an unknown policy loudly rather than defaulting. Both splits are recorded side by side in the findings doc ("Coverage policy resolved"); Task 9's 56.3 % is **not** retracted, since it was correct under the rule then in force.
 
-**Gate:** `test-sycl-gap-causes` and `test-sycl-timeline-gap-class-conservation` pass. Add a fixture case pinning the chosen semantics. If `union` is chosen, re-run Task 9's parse and record both splits side by side in the findings doc — never silently restate the number.
+`truly_idle` — the budget every task below is scoped from — is **identical** under both rules (960153, 9.602 ms/step, n=18840, same transition ranking to the digit). The reclassified gaps were never part of it. Nothing in this plan changes as a result.
+
+`tests/test-sycl-gap-causes.py` pins the policy via a fixture gap that classifies differently under each rule, so a future flip cannot silently restate a published number. Tracker: `llama.cpp-nceh`.
 
 ---
 

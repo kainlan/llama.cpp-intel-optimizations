@@ -23,8 +23,14 @@ that split:
     can never fire is indistinguishable from a cause that is simply absent from
     the capture, and would let a real instrument defect report as zero.
 
-Driven by a checked-in synthetic trace (never live hardware) built so each of
-the four causes occurs exactly once; see that file's `_comment` for how each gap
+  * **The coverage policy.**  `HOST_OVERLAP_COVERAGE` decides whether
+    `host_overlap` needs one contiguous host op to cover the gap ("max") or
+    merged coverage ("union").  The fixture is built so the two answers differ,
+    so flipping the policy fails here rather than silently restating a published
+    split.
+
+Driven by a checked-in synthetic trace (never live hardware) built so each
+reachable cause occurs exactly once; see that file's `_comment` for how each gap
 is constructed.  cause_partition_failures() is additionally run against a
 deliberately corrupted copy of the metrics and must reject it, so a test that
 stopped checking anything cannot pass.
@@ -33,6 +39,7 @@ Plain script, not pytest: run with `python3 tests/<this file>`.
 """
 from __future__ import annotations
 
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
@@ -42,17 +49,37 @@ ROOT = HERE.parent
 PARSER = ROOT / "scripts" / "parse-sycl-gap-causes.py"
 TRACE = HERE / "test-sycl-gap-causes.trace.json"
 
-# Keep in sync with GAP_CAUSE_NAMES in scripts/parse-sycl-gap-causes.py.
-GAP_CAUSES = (
-    "no_submit_span",
-    "submit_pipelined_ahead",
-    "sum_covers_max_does_not",
-    "truly_idle",
-)
 
-# The queue the fixture builds all four causes on.  Keep in sync with the
-# fixture's device/queue_kind args.
+def load_module(path: Path, name: str):
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"FAIL: cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# Read the cause schema and the active coverage policy from the parser itself
+# rather than restating them, so the two cannot drift.
+CAUSES_MODULE = load_module(PARSER, "parse_sycl_gap_causes")
+TIMELINE = CAUSES_MODULE.load_timeline_parser()
+COVERAGE = TIMELINE.HOST_OVERLAP_COVERAGE
+GAP_CAUSES = CAUSES_MODULE.gap_cause_names(COVERAGE)
+
+# The queue the fixture builds its gaps on.  Keep in sync with the fixture's
+# device/queue_kind args.
 FIXTURE_QUEUE = "device0.compute"
+
+# The fixture's k2->k3 gap is spanned by three 400 us nodes: sum/union 1200 us,
+# max 400 us, against a 1000 us bar.  So it classifies as host_overlap under
+# "union" and as runtime_idle/sum_covers_max_does_not under "max" -- which makes
+# the fixture a *policy gate*, not just a conservation check.  Flipping
+# HOST_OVERLAP_COVERAGE without updating this table fails the test loudly
+# instead of silently restating a published number.
+EXPECTED_BY_COVERAGE = {
+    "union": {"host_overlap_count": 1, "runtime_idle_count": 3},
+    "max": {"host_overlap_count": 0, "runtime_idle_count": 4},
+}
 
 CLASS_PREFIX = f"gap_cause.{FIXTURE_QUEUE}.class.runtime_idle"
 CAUSE_PREFIX = f"gap_cause.{FIXTURE_QUEUE}.runtime_idle"
@@ -132,6 +159,24 @@ def main() -> int:
             print(f"FAIL: {failure}")
         return 1
 
+    # Pin the coverage policy.  The fixture is built so the two policies give
+    # different class counts, so this catches a flip of HOST_OVERLAP_COVERAGE
+    # that was not accompanied by a deliberate re-statement of the published
+    # split in the findings doc.
+    expected = EXPECTED_BY_COVERAGE.get(COVERAGE)
+    if expected is None:
+        print(f"FAIL: unknown HOST_OVERLAP_COVERAGE {COVERAGE!r}; expected one of {sorted(EXPECTED_BY_COVERAGE)}")
+        return 1
+    observed_overlap = metrics.get(f"gap_cause.{FIXTURE_QUEUE}.class.host_overlap.count")
+    observed_idle = metrics.get(f"{CLASS_PREFIX}.count")
+    if observed_overlap != expected["host_overlap_count"] or observed_idle != expected["runtime_idle_count"]:
+        print(
+            f"FAIL: coverage policy {COVERAGE!r} gave host_overlap={observed_overlap} "
+            f"runtime_idle={observed_idle}, expected {expected['host_overlap_count']} "
+            f"and {expected['runtime_idle_count']}"
+        )
+        return 1
+
     # A checker that has stopped checking would pass the block above on any
     # input.  Move one cause's time without moving the class total and require a
     # complaint, so the assertions are proven live rather than merely satisfied.
@@ -155,7 +200,7 @@ def main() -> int:
         return 1
 
     observed = ", ".join(f"{cause}={metrics[f'{CAUSE_PREFIX}.{cause}.count']}" for cause in GAP_CAUSES)
-    print(f"PASS: runtime_idle cause split conserves and is non-vacuous ({observed})")
+    print(f"PASS: coverage={COVERAGE}; runtime_idle cause split conserves and is non-vacuous ({observed})")
     return 0
 
 

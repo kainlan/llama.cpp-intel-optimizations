@@ -57,30 +57,51 @@ def load_timeline_parser(path: pathlib.Path = _TIMELINE_PARSER_PATH) -> Any:
     return module
 
 
-# Why a gap landed in `runtime_idle`.  Only `truly_idle` is a finding; the other
-# three are instrument artifacts and must be subtracted before any fix is scoped
-# from the class total.
-GAP_CAUSE_NAMES = (
-    # No `sycl.submit` record for one or both events, so `host_overlap` could
-    # not be tested at all.  A large share here means the class total is an
-    # artifact of missing instrumentation, not a measurement -- treat the whole
-    # verdict as void until it is explained.
-    "no_submit_span",
-    # The next op's submit began before the previous op's submit ended, i.e. the
-    # host ran ahead and batched submissions.  `device_gap_has_host_overlap`
-    # returns early here, so these never get an overlap test.
-    "submit_pipelined_ahead",
-    # Host work *does* cover at least half the gap, but only when the covering
-    # `compute_forward_node` spans are summed -- no single span clears the bar
-    # that `max_host_node_overlap_us` actually applies.  These are arguably
-    # `host_overlap` misfiled as `runtime_idle`; see `--help` and the module
-    # docstring of parse-sycl-timeline.py.
-    "sum_covers_max_does_not",
-    # Submits are present and ordered, and host `compute_forward_node` work does
-    # not cover the gap under *either* semantics.  This is the real residual:
-    # time explained by neither our host work nor a dependency.
-    "truly_idle",
-)
+# Why a gap landed in `runtime_idle`.  Only `truly_idle` is a finding; the rest
+# are instrument artifacts and must be subtracted before any fix is scoped from
+# the class total.
+#
+# No `sycl.submit` record for one or both events, so `host_overlap` could not be
+# tested at all.  A large share here means the class total is an artifact of
+# missing instrumentation, not a measurement -- treat the whole verdict as void
+# until it is explained.
+CAUSE_NO_SUBMIT_SPAN = "no_submit_span"
+
+# The next op's submit began before the previous op's submit ended, i.e. the
+# host ran ahead and batched submissions.  `device_gap_has_host_overlap` returns
+# early here, so these never get an overlap test.
+CAUSE_SUBMIT_PIPELINED_AHEAD = "submit_pipelined_ahead"
+
+# Host work *does* cover at least half the gap once the covering spans are
+# summed, but no single span clears the bar.  Only meaningful under the "max"
+# coverage policy, and only as a diagnostic *of that policy's defect*: these are
+# `host_overlap` misfiled as `runtime_idle`.  Retired under "union", which
+# already counts merged coverage -- there is no broader metric left to appeal
+# to, and a plain sum would only differ by double-counting overlapping spans,
+# which is an error rather than a reclassification.
+CAUSE_SUM_COVERS_MAX_DOES_NOT = "sum_covers_max_does_not"
+
+# Submits are present and ordered, and host `compute_forward_node` work does not
+# cover the gap.  The real residual: time explained by neither our host work nor
+# a declared dependency.
+CAUSE_TRULY_IDLE = "truly_idle"
+
+
+def gap_cause_names(coverage: str) -> tuple[str, ...]:
+    """Causes reachable under a given `HOST_OVERLAP_COVERAGE` policy.
+
+    Kept policy-dependent rather than fixed so a retired cause reports as
+    *absent from the schema* instead of as a hard zero -- a zero would be
+    indistinguishable from a real instrument defect that never fired.
+    """
+    if coverage == "max":
+        return (
+            CAUSE_NO_SUBMIT_SPAN,
+            CAUSE_SUBMIT_PIPELINED_AHEAD,
+            CAUSE_SUM_COVERS_MAX_DOES_NOT,
+            CAUSE_TRULY_IDLE,
+        )
+    return (CAUSE_NO_SUBMIT_SPAN, CAUSE_SUBMIT_PIPELINED_AHEAD, CAUSE_TRULY_IDLE)
 
 
 def sum_host_node_overlap_us(nodes: list[tuple[float, float, str]], start_us: float, end_us: float) -> float:
@@ -120,13 +141,15 @@ def classify_runtime_idle_cause(
     previous_submit = timeline.submit_span_for_event(previous_event, submits_by_event_id)
     next_submit = timeline.submit_span_for_event(next_event, submits_by_event_id)
     if previous_submit is None or next_submit is None:
-        return "no_submit_span"
+        return CAUSE_NO_SUBMIT_SPAN
     if next_submit[0] <= previous_submit[1]:
-        return "submit_pipelined_ahead"
+        return CAUSE_SUBMIT_PIPELINED_AHEAD
     required_overlap_us = (gap_ns / 1000.0) * timeline.HOST_OVERLAP_MIN_FRACTION
-    if sum_host_node_overlap_us(nodes, previous_submit[1], next_submit[0]) >= required_overlap_us:
-        return "sum_covers_max_does_not"
-    return "truly_idle"
+    if timeline.HOST_OVERLAP_COVERAGE == "max" and (
+        sum_host_node_overlap_us(nodes, previous_submit[1], next_submit[0]) >= required_overlap_us
+    ):
+        return CAUSE_SUM_COVERS_MAX_DOES_NOT
+    return CAUSE_TRULY_IDLE
 
 
 def summarize_gap_causes(
@@ -249,7 +272,8 @@ def main(argv: list[str]) -> int:
         for gap_class in timeline.GAP_CLASS_NAMES:
             print(f"{prefix}.class.{gap_class}.total_ms_x1000 {summary['class_total'][gap_class]}")
             print(f"{prefix}.class.{gap_class}.count {summary['class_count'][gap_class]}")
-        for cause in GAP_CAUSE_NAMES:
+        print(f"{prefix}.host_overlap_coverage {timeline.HOST_OVERLAP_COVERAGE}")
+        for cause in gap_cause_names(timeline.HOST_OVERLAP_COVERAGE):
             print(f"{prefix}.runtime_idle.{cause}.total_ms_x1000 {summary['cause_total'][cause]}")
             print(f"{prefix}.runtime_idle.{cause}.count {summary['cause_count'][cause]}")
             if args.steps > 0:

@@ -1410,3 +1410,62 @@ construction. On this backend, where every GPU queue is in-order,
 dependencies only. It is **not** evidence that serialization is absent, and the
 dependency hypothesis is **not** eliminated. Some unknown share of `truly_idle`
 may be exactly that, wearing the residual class's name.
+
+### Coverage policy resolved: `HOST_OVERLAP_COVERAGE = "union"`, and both splits recorded
+
+The decision left open above was taken on 2026-07-25: `device_gap_has_host_overlap`
+now measures **merged** host-node coverage (`union_host_node_overlap_us`) rather
+than the single longest covering span. Under the old `"max"` rule a 2 ms gap
+covered by twenty 90 µs ops back to back — 1.8 ms of real host work, and the
+shape of a decode step submitting ~461 launches — scored 90 µs and was filed as
+idle.
+
+Both splits, same capture, same `--wall-ms 2332.624`. **Neither is a re-run**;
+this is the identical trace parsed under each rule:
+
+| metric (`_ms_x1000`) | `"max"` (Task 9, published) | `"union"` (in force) |
+|---|---:|---:|
+| `host_overlap` | 803989 · 8.040 ms/step | **865888 · 8.659 ms/step** |
+| `runtime_idle` | 1023981 · 10.240 ms/step | **962332 · 9.623 ms/step** |
+| `queue_serialization` | 57 | 57 |
+| `rounding_delta` | 250 (0.014 %) | 250 (0.014 %) |
+| `runtime_idle` % of `unattributed` | 56.3 % | **52.9 %** |
+
+```
+DOMINANT CLASS: runtime_idle at 52.9% of timeline.unattributed_ms_x1000
+CONFIDENCE: HIGH — rounding_delta 0.014% of queue total, well under the 5% rule.
+```
+
+**The verdict and the phase-2 branch are unchanged** — `runtime_idle` remains
+dominant and remains above the decision table's 50 % bar. Task 9's 56.3 % is not
+retracted; it was correct under the rule in force when it was written, and is
+kept above for exactly that reason.
+
+**The result that matters is what did *not* move.** `truly_idle` is
+**identical** under both rules — 960153, 9.602 ms/step, n=18840, and the same
+transition ranking to the digit. The reclassified gaps were precisely the
+`sum_covers_max_does_not` ones, which were never part of `truly_idle` to begin
+with. So **the actionable budget every phase-2 task is scoped from is invariant
+to this decision**, which is why the switch was safe to make after the plan was
+written rather than before.
+
+What improves is the residual's purity:
+
+| | `"max"` | `"union"` |
+|---|---:|---:|
+| `truly_idle` share of `runtime_idle` | 93.8 % | **99.8 %** |
+| `submit_pipelined_ahead` | 0.19 % | 0.20 % |
+| `sum_covers_max_does_not` | 6.05 % | **retired** |
+| `no_submit_span` | 0.00 % | 0.00 % |
+
+`sum_covers_max_does_not` is retired rather than reported as zero: it was a
+diagnostic *of the `"max"` rule's defect*, and `gap_cause_names()` drops it from
+the schema under `"union"` so a retired cause cannot be mistaken for a real
+instrument defect that never fired. Note `union ≥ max` always, so widening can
+only move gaps *into* `host_overlap`, never out.
+
+`tests/test-sycl-gap-causes.py` now pins the policy: its fixture's `k2→k3` gap
+(three 400 µs nodes, merged 1200 µs, longest 400 µs, against a 1000 µs bar)
+classifies differently under each rule, so flipping `HOST_OVERLAP_COVERAGE`
+without deliberately re-stating the published split fails the gate loudly.
+`test-sycl-timeline-gap-class-conservation` is unaffected and still passes.

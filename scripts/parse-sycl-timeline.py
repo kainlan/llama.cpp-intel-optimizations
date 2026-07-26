@@ -328,20 +328,40 @@ def union_host_node_overlap_us(nodes: list[tuple[float, float, str]], start_us: 
 
 # Which coverage question `device_gap_has_host_overlap` asks of a gap.
 #
-# TODO(decision pending): choose the semantics.  This constant is currently
-# "max", which preserves the classification Task 9 published (runtime_idle
-# 56.3%).  Switching it to "union" moves ~0.619 ms/step of the B70 GPT-OSS
-# decode capture from runtime_idle to host_overlap, giving roughly 52.6 / 47.4
-# -- runtime_idle still dominant and still over the decision table's 50% bar, so
-# the phase-2 branch does not change either way.
+#   "union" -- merged host-op coverage must clear HOST_OVERLAP_MIN_FRACTION of
+#              the gap.  Measures "was the host inside a ggml op", which is what
+#              the host_overlap class name claims, and is bounded by the window
+#              width.
+#   "max"   -- one *single* host op must clear the same bar.  Conservative:
+#              never claims overlap that isn't one contiguous op, but reads a
+#              host busy with many short ops as idle.
 #
-#   "max"   -- one host op must cover HOST_OVERLAP_MIN_FRACTION of the gap.
-#              Conservative: never claims overlap that isn't contiguous, but
-#              reads a host busy with many short ops as idle.
-#   "union" -- merged host-op coverage must clear the same bar.  Measures "was
-#              the host inside a ggml op", which is the question the class name
-#              implies, and is bounded by the window width.
-HOST_OVERLAP_COVERAGE = "max"
+# "union" since 2026-07-25.  Under "max" a 2 ms gap covered by twenty 90 us ops
+# back to back -- 1.8 ms of real host work, and the shape of a decode step
+# submitting ~461 launches -- scored 90 us and was filed as runtime_idle.  That
+# misfiled 3,755 gaps (0.619 ms/step) on the B70 GPT-OSS capture.  The switch
+# moves that time to host_overlap, taking the split from 56.0/44.0 to 52.6/47.4;
+# runtime_idle stays dominant and stays over the decision table's 50% bar, so
+# the phase-2 selection is unchanged.  Both splits are recorded side by side in
+# docs/plans/2026-07-25-decode-host-overhead-findings.md, Task 10.
+#
+# Note union >= max always, so widening to "union" can only ever move gaps
+# *into* host_overlap, never out of it.
+HOST_OVERLAP_COVERAGE = "union"
+
+
+def host_node_coverage_us(
+    nodes: list[tuple[float, float, str]],
+    start_us: float,
+    end_us: float,
+    coverage: str = HOST_OVERLAP_COVERAGE,
+) -> float:
+    """Host-node coverage of [start_us, end_us) under the configured policy."""
+    if coverage == "union":
+        return union_host_node_overlap_us(nodes, start_us, end_us)
+    if coverage == "max":
+        return max_host_node_overlap_us(nodes, start_us, end_us)
+    raise ValueError(f"unknown HOST_OVERLAP_COVERAGE {coverage!r}; expected 'union' or 'max'")
 
 
 def summarize_host_gap_overlaps(events: list[dict[str, Any]]) -> Counter[tuple[str, str, str]]:
@@ -391,11 +411,7 @@ def device_gap_has_host_overlap(
     if next_start_us <= previous_end_us:
         return False
     required_overlap_us = (gap_ns / 1000.0) * HOST_OVERLAP_MIN_FRACTION
-    # TODO(decision pending): honour HOST_OVERLAP_COVERAGE here -- dispatch to
-    # union_host_node_overlap_us when it is "union", keeping the max call for
-    # "max", and reject any other value loudly rather than silently defaulting.
-    # See the constant's definition for what each choice does to the verdict.
-    return max_host_node_overlap_us(nodes, previous_end_us, next_start_us) >= required_overlap_us
+    return host_node_coverage_us(nodes, previous_end_us, next_start_us) >= required_overlap_us
 
 
 def device_gap_has_dependency(
