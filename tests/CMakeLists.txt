@@ -74,6 +74,80 @@ function(llama_test_cmd target)
     set_property(TEST ${TEST_NAME} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
+# Runs a pytest-style Python test file (module-level test_* functions, no
+# __main__ guard) under the interpreter given as `target`.
+#
+# Such a file MUST be handed to pytest: `python3 <file>` would define the test
+# functions, call none of them, and exit 0 for any state of the code under
+# test. A plain script with a __main__ guard does NOT belong here -- register
+# those with llama_test_cmd so they still run on a machine lacking pytest.
+#
+# Required args:
+# - SCRIPT: path to the .py file
+# Optional args:
+# - NAME: name of the test (defaults to the script file name without extension)
+# - LABEL: label(s) for the test (defaults to main)
+# - TIMEOUT: per-test timeout in seconds (defaults to ctest's own default)
+# - WORKING_DIRECTORY
+function(llama_test_pytest target)
+    include(CMakeParseArguments)
+    set(options)
+    set(oneValueArgs NAME SCRIPT TIMEOUT WORKING_DIRECTORY)
+    # LABEL is multi-valued so a ";"-joined list survives: ARGN flattens it into
+    # separate arguments, and a one-value LABEL would silently keep only the
+    # first and drop the rest into UNPARSED_ARGUMENTS.
+    set(multiValueArgs LABEL)
+    cmake_parse_arguments(LLAMA_TEST "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
+
+    if (NOT DEFINED LLAMA_TEST_SCRIPT)
+        message(FATAL_ERROR "llama_test_pytest: SCRIPT is required")
+    endif()
+    if (LLAMA_TEST_UNPARSED_ARGUMENTS)
+        message(FATAL_ERROR "llama_test_pytest: unexpected arguments: ${LLAMA_TEST_UNPARSED_ARGUMENTS}")
+    endif()
+    if (NOT DEFINED LLAMA_TEST_LABEL)
+        set(LLAMA_TEST_LABEL "main")
+    endif()
+    if (NOT DEFINED LLAMA_TEST_WORKING_DIRECTORY)
+        set(LLAMA_TEST_WORKING_DIRECTORY .)
+    endif()
+    if (DEFINED LLAMA_TEST_NAME)
+        set(TEST_NAME ${LLAMA_TEST_NAME})
+    else()
+        get_filename_component(TEST_NAME ${LLAMA_TEST_SCRIPT} NAME_WE)
+    endif()
+
+    # Exit 77 (skip) when pytest is not installed, then hand the file to
+    # pytest. Probing at run time rather than at configure time keeps the test
+    # registered on every machine, so a missing pytest surfaces as ctest
+    # "Skipped" -- distinguishable from both "not registered" and "Passed".
+    # A configure-time bail-out would instead leave `ctest -N` reporting
+    # "Total Tests: 0", byte-identical to the test never having been added.
+    #
+    # pytest.main's exit code 5 ("no tests collected") is deliberately left as
+    # a failure, so a file that stops collecting tests cannot pass vacuously.
+    add_test(
+        NAME ${TEST_NAME}
+        WORKING_DIRECTORY ${LLAMA_TEST_WORKING_DIRECTORY}
+        COMMAND ${target}
+            -c [=[
+import importlib.util
+import sys
+if importlib.util.find_spec('pytest') is None:
+    sys.exit(77)
+import pytest
+sys.exit(pytest.main(['-q', sys.argv[1]]))
+]=]
+            ${LLAMA_TEST_SCRIPT})
+
+    set_tests_properties(${TEST_NAME} PROPERTIES
+        LABELS "${LLAMA_TEST_LABEL}"
+        SKIP_RETURN_CODE 77)
+    if (DEFINED LLAMA_TEST_TIMEOUT)
+        set_tests_properties(${TEST_NAME} PROPERTIES TIMEOUT ${LLAMA_TEST_TIMEOUT})
+    endif()
+endfunction()
+
 # Builds and runs a test source file.
 # Optional args:
 # - NAME: name of the executable & test target (defaults to the source file name without extension)
@@ -252,10 +326,6 @@ if (NOT WIN32)
     # or parse-sycl-timeline.py need a gate the lead can run; tests/ holds dozens
     # of unregistered .py tests and this is the first one wired to ctest (see
     # llama.cpp-t5a2).
-    #
-    # The file is pytest-style (module-level test_* functions, no __main__), so
-    # it must run under pytest -- `python3 <file>` would define the functions,
-    # call none of them, and exit 0 for any state of the script under test.
     find_package(Python3 COMPONENTS Interpreter)
     if (Python3_Interpreter_FOUND)
         set(LLAMA_PYTHON3 ${Python3_EXECUTABLE})
@@ -269,29 +339,12 @@ if (NOT WIN32)
         set(LLAMA_PYTHON3 python3)
     endif()
 
-    llama_test_cmd(
+    llama_test_pytest(
         ${LLAMA_PYTHON3}
         NAME test-sycl-decode-timeline-profile-script
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-decode-timeline-profile-script.py
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        # Exit 77 (skip) when pytest is not installed, then hand the file to
-        # pytest. Probing at run time rather than at configure time keeps the
-        # test registered on every machine, so a missing pytest surfaces as
-        # ctest "Skipped" -- distinguishable from both "not registered" and
-        # "Passed".
-        ARGS
-            -c [=[
-import importlib.util
-import sys
-if importlib.util.find_spec('pytest') is None:
-    sys.exit(77)
-import pytest
-sys.exit(pytest.main(['-q', sys.argv[1]]))
-]=]
-            ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-decode-timeline-profile-script.py
-    )
-    set_tests_properties(test-sycl-decode-timeline-profile-script PROPERTIES
-        LABELS "sycl;profiling;tdd"
-        SKIP_RETURN_CODE 77
+        LABEL "sycl;profiling;tdd"
         TIMEOUT 120
     )
 
