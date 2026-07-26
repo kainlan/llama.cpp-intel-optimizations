@@ -92601,9 +92601,13 @@ normal_dispatch:
         if (ggml_sycl::e2e_tg_profile_enabled()) {
             ggml_sycl::e2e_tg_profile_force_flush(stderr);
         }
-        if (ggml_sycl::sycl_timeline_enabled()) {
-            ggml_sycl::sycl_timeline_flush("decode-teardown");
-        }
+        // Deliberately NO timeline flush here. ggml_backend_sycl_graph_compute()
+        // runs once per decode STEP, while the timeline flush is one-shot: it
+        // locks the output file on the first successful non-empty write. A flush
+        // here therefore captures step 1 alone -- and locks out the only
+        // correctly ordered flush site, in ggml_backend_sycl_free(), which drains
+        // the kernel profiler first so device (sycl.event) spans exist to write.
+        // Draining here instead would not help; it would still be first-step-wins.
     }
     if (phase_timing) {
         const double exit_wait_ms =
