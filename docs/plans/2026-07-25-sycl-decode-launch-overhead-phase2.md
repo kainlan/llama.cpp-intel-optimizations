@@ -29,10 +29,12 @@ Everything below comes from **one** capture (`/tmp/steady-slice2/`, B70, graph r
 
 **NOT established — do not build on these without the named task closing them first:**
 
-1. **Run-to-run reproducibility.** Single capture. The class *shares* are robust to observer effect; the absolute milliseconds (23.326 ms/step profiled vs ~20.670 clean, ~12.9 % overhead) are not. **Task 1.**
-2. **Host load is not a contributor.** `truly_idle` is precisely the signature a descheduled submitting thread produces, and the machine has run at load 18.68–56. **Task 1.**
+1. ~~**Run-to-run reproducibility.**~~ ✅ **CLOSED by Task 1** (findings doc, Task 11). Second capture on the same binary: gap count identical (41094), device busy agrees to 0.005 %, `runtime_idle` share 52.9 % → 52.5 %, every cluster transition within ±2.4 %, n=99 exact.
+2. ~~**Host load is not a contributor.**~~ ✅ **CLOSED by Task 1.** Load fell 2.9× (18.68 → 6.50) with codescout off the GPUs entirely, and `truly_idle` went *up* 0.9 %. Descheduling is not driving it.
 3. **Causation for the `binbcast.event` no-op.** The idle *follows* the marker; nothing yet shows it is *caused* by it. **Task 4.**
 4. **What consumes the ~1.65 ms host inter-graph window.** Sampling is normally microseconds. Unattributed. **Task 2.**
+
+**Still true regardless:** both captures are profiled runs (~12.9 % observer effect). The class **shares** are the robust output; absolute per-step milliseconds are inflated.
 
 ⚠️ **`queue_serialization ≈ 0` does NOT eliminate the dependency hypothesis.** `device_gap_has_dependency` sees only explicit `depends_on` edges; ggml-sycl GPU queues are all in-order (`common.hpp:5954`) and serialize *implicitly*, declaring no edge. That class is near-unreachable on this backend by construction, so an unknown share of `truly_idle` may be serialization wearing the residual class's name. Task 9's "one of three candidate causes is eliminated outright" is withdrawn.
 
@@ -114,18 +116,38 @@ Carried forward from Plan A unchanged — these have hung or OOM-killed this hos
 
 ## Tasks
 
-### Task 1: Confirming capture on a quiet host
+### Task 1: Confirming capture — ✅ **DONE 2026-07-25** (findings doc, Task 11)
+
+Reproduced on the same binary `850ca064b`, paired on load rather than waiting for quiet. Both open questions it gated are discharged: the finding reproduces, and the host-load confound is refuted. The method below is kept because Tasks 2, 4 and 7 all re-capture with it.
 
 **Why:** Task 9 is a single capture and Task 10 is a re-analysis of it, so nothing yet establishes reproducibility, and nothing separates `truly_idle` from host descheduling. Both are prerequisites for any *absolute* claim, and for attributing a later speedup to a change rather than to a quieter machine.
 
-**Do:** Wait for `uptime` 1-minute load below ~4 with no `codescout`/`ninja`/`icpx` in `pgrep`. Re-run the Task 9 capture **verbatim** — same env block, same window, same card:
+**Do:** Re-run the Task 9 capture **verbatim** — same env block, same window, same card.
+
+⚠️ **Load below ~4 is not reachable on this host** and waiting for it is a trap. Its floor is ~6–9, all of it Frigate `ffmpeg` (30 processes) on the **iGPU** (`renderD128` → `0000:00:02.0`) — a security system, not something to stop for a benchmark. Neither the B70 nor the B50 is a Frigate consumer.
+
+Prefer a **paired design over a quiet one**: capture at a load *deliberately different* from Task 9's 18.68 and compare shares. Reproduction across a load ratio is direct evidence against the host-load confound; a single quiet run only shows the shares once and cannot separate the two hypotheses at all. Do stop `codescout` first (`codescout daemon --stop` — drains; never SIGKILL): it is a real GPU consumer on the benchmark cards (`llama.cpp-2rkc`), unlike Frigate.
+
+⚠️ **The output-path variables are load-bearing.** Without `GGML_SYCL_TIMELINE_OUTPUT` and `GGML_SYCL_KERNEL_PROFILE_OUTPUT` the run completes, reports tok/s, and writes **no trace at all** — indistinguishable from a capture that produced nothing. Env block below is the one `scripts/sycl-gptoss-decode-timeline-profile.sh:98-112` uses, with the window vars added; note that script's own bench args are `-p 512`, so it is not a drop-in for this capture.
 
 ```bash
-GGML_SYCL_TIMELINE=timeline+events GGML_SYCL_TIMELINE_TOKEN_START=15 \
-GGML_SYCL_TIMELINE_TOKEN_COUNT=100 GGML_SYCL_TIMELINE_MAX_EVENTS=4000000 \
-GGML_SYCL_KERNEL_PROFILE=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
-timeout 900 ./build/bin/llama-bench -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
-  -p 0 -n 128 -r 1 -v
+OUT=/tmp/steady-sliceN; mkdir -p "$OUT"; uptime > "$OUT/load.before"
+source /opt/intel/oneapi/setvars.sh --force
+env ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_OP_TIMEOUT_MS=180000 \
+  GGML_SYCL_TIMELINE=timeline+events \
+  GGML_SYCL_TIMELINE_OUTPUT="$OUT/sycl-timeline.json" \
+  GGML_SYCL_TIMELINE_TOKEN_START=15 GGML_SYCL_TIMELINE_TOKEN_COUNT=100 \
+  GGML_SYCL_TIMELINE_MAX_EVENTS=4000000 \
+  GGML_SYCL_KERNEL_PROFILE=1 GGML_SYCL_KERNEL_PROFILE_OUTPUT="$OUT/sycl-kernels" \
+  GGML_SYCL_KERNEL_PROFILE_FORMAT=both GGML_SYCL_KERNEL_PROFILE_RAW=1 \
+  GGML_SYCL_KERNEL_PROFILE_TOP_N=80 GGML_SYCL_KERNEL_PROFILE_FLUSH=window \
+  GGML_SYCL_MOE_PHASE_MATERIALIZE=1 GGML_SYCL_MOE_PHASE_BULK_XMX=1 \
+  GGML_SYCL_MOE_DOWN_SUM_DIRECT=1 \
+  timeout 900 ./build/bin/llama-bench \
+    -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf \
+    -ngl 99 -fa 1 -p 0 -n 128 -r 1 -v \
+  > "$OUT/bench.stdout" 2> "$OUT/bench.stderr"
+uptime > "$OUT/load.after"
 ```
 
 Parse with `--wall-ms` set to the window's **own** envelope (parser defect 3 is still unfixed — never let it derive one). Then run `parse-sycl-gap-causes.py --steps 100`.

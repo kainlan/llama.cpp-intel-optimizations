@@ -1469,3 +1469,85 @@ only move gaps *into* `host_overlap`, never out.
 classifies differently under each rule, so flipping `HOST_OVERLAP_COVERAGE`
 without deliberately re-stating the published split fails the gate loudly.
 `test-sycl-timeline-gap-class-conservation` is unaffected and still passes.
+
+## Task 11 — Confirming capture: reproduces, and the host-load confound is refuted
+
+Plan phase 2's Task 1. Second capture, **same binary** (`850ca064b` (12153) — the
+work since Task 9 touched only Python, docs and CMake, so the measured code is
+byte-identical), same window, same card, same env block.
+
+### Design: paired on load, not quiet
+
+The plan originally asked for a quiet host (load < 4). **That bar is unreachable
+here** — this machine's floor is ~6–9, all of it Frigate `ffmpeg` (30 processes)
+on the **iGPU** (`renderD128` → `0000:00:02.0`), which is a security system and
+not a B70/B50 consumer. Waiting for it would have meant waiting forever.
+
+A paired design is also strictly better. A single quiet run shows the shares
+once and cannot separate "reproducible" from "load-driven". Capturing at a load
+*deliberately different* from the first tests both at once. `codescout` — which
+unlike Frigate genuinely does consume the benchmark GPUs (`llama.cpp-2rkc`) —
+had died on a B50 CAT error and was left down, so it is absent from this run.
+
+| | Task 9 capture | Task 11 capture |
+|---|---|---|
+| load (1-min) | **18.68** ⚠️ *not recorded at capture time; nearest reading 12 min later* | **6.50** before → **7.84** after (recorded) |
+| codescout on the GPUs | yes | **no** (daemon dead) |
+| B70 free VRAM | — | 32600 MiB (no pressure) |
+| tg128 (profiled) | ~42.9 | 42.80 |
+
+### Result: reproduces
+
+| metric (`_ms_x1000`, union) | Task 9 | Task 11 | Δ |
+|---|---:|---:|---:|
+| `gap.device0.compute.count` | 41094 | **41094** | **0** |
+| `gpu_event_total` (device busy) | 512845 | 512871 | **+0.005 %** |
+| `host_overlap` | 865888 | 887955 | +2.5 % |
+| `runtime_idle` | 962332 | 970479 | +0.8 % |
+| `queue_serialization` | 57 | 58 | — |
+| `rounding_delta` | 250 (0.014 %) | 231 (0.012 %) | — |
+| **`runtime_idle` % of `unattributed`** | **52.9 %** | **52.5 %** | **−0.4 pp** |
+| `truly_idle` | 960153 · 9.602 ms/step | 969134 · **9.691 ms/step** | +0.9 % |
+| `truly_idle` share of `runtime_idle` | 99.8 % | **99.9 %** | — |
+| `no_submit_span` | 0 | **0** | — |
+
+Device coverage 461.0 events/step and 100 `ggml.graph` spans in both. Two
+independent captures agree on device-busy time to **5 parts in 100,000**.
+
+Every Cluster A/B transition reproduces within ±2.4 %, with counts unchanged:
+
+| transition | Task 9 | Task 11 | Δ | n (T9 → T11) |
+|---|---:|---:|---:|---|
+| `binbcast.event → get_rows.marker` | 232370 | 234551 | +0.9 % | **99 → 99** |
+| `binbcast.event → rope` | 176615 | 178940 | +1.3 % | 2300 → 2300 |
+| `set_rows.generic → binbcast.mul` | 170795 | 167892 | −1.7 % | 2019 → 1968 |
+| `binbcast.event → softmax.forward` | 139903 | 142105 | +1.6 % | 2389 → 2390 |
+| `rope → set_rows.generic` | 86315 | 88357 | +2.4 % | 2398 → 2399 |
+| `rope → rope` | 63151 | 63959 | +1.3 % | 2399 → 2399 |
+
+**n=99 reproduces exactly** — 99 inter-graph transitions across 100 graph spans,
+confirming the inter-token bubble identification independently.
+
+### The host-load confound is refuted
+
+This was the sharpest open threat: `truly_idle` is by construction the signature
+a descheduled submitting thread produces, so host load could have manufactured
+the entire finding.
+
+**Load fell 2.9× (18.68 → 6.50) and `truly_idle` went *up* 0.9 %.** If host
+descheduling were driving it, cutting competing load by nearly two-thirds — and
+removing a genuine GPU consumer from the benchmark cards entirely — would have
+moved it materially downward. It did not move at all. The residual is a property
+of the submit path, not of this machine's load.
+
+### What is now closed, and what is not
+
+- **Closed:** run-to-run reproducibility, and the host-load hypothesis. Plan
+  phase 2's "NOT established" items 1 and 2 are discharged. The 9.602–9.691
+  ms/step actionable budget and both cluster scopes stand.
+- **Still open:** `binbcast.event` causation (plan Task 4) and what consumes the
+  ~1.65 ms host inter-graph window (plan Task 2). Neither is touched by this
+  capture.
+- **Still true:** both captures are profiled runs (~12.9 % observer effect in
+  this configuration). The **shares** are the robust output; absolute per-step
+  milliseconds remain inflated, and this task does not change that.
