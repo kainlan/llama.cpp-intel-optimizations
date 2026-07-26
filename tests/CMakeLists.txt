@@ -348,6 +348,18 @@ if (NOT WIN32)
         TIMEOUT 120
     )
 
+    # Placement gate for the one-shot SYCL timeline flush. Unregistered until
+    # llama.cpp-sacs, which is why the first-step-wins decode capture shipped:
+    # both call sites were individually asserted here, their composition was
+    # not, and nothing ran the file at all.
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-timeline-flush-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;profiling;tdd"
+        TIMEOUT 120
+    )
+
     # Conservation gate for parse-sycl-timeline.py's three-way gap-class split,
     # driven by the checked-in synthetic trace next to it (never live hardware).
     #
