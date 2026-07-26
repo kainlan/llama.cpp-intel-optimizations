@@ -731,3 +731,188 @@ optionally `GGML_SYCL_TIMELINE_TOKEN_START`/`_COUNT` honoured as a decode-step
 window so a steady-state slice can be isolated without buffering 128 steps. It
 should also skip the first-token step explicitly — that step is 21× a
 steady-state token and would dominate any unwindowed average.
+
+---
+
+## Task 7 — Phase-2 selection
+
+**Outcome: no phase-2 plan was written, and none should be.** Task 7's design is
+that the branch is chosen by a rule fixed *in advance* in the plan's decision
+table, applied verbatim to Task 6's `DOMINANT CLASS:` line, so the choice cannot
+be rationalized after seeing results. The rule is applied below. It selects the
+no-fix-plan branch, and it does so twice over.
+
+This task ran no GPU work, no build, and touched no source, script, or test.
+
+### The selection
+
+```
+PHASE-2 SELECTION: none — Task 6 is marked CONFIDENCE: LOW and states DOMINANT
+CLASS: NOT DETERMINED, so the decision table's LOW CONFIDENCE row applies and no
+fix plan is written. The Task 5 capture must be re-run first, which is blocked on
+llama.cpp-sacs.
+RULE APPLIED: "| Task 6 marked `LOW CONFIDENCE` | **Write no fix plan.** Re-run
+Task 5 capture first; record why. | — |" (decision table,
+docs/plans/2026-07-25-sycl-decode-host-overhead-attribution.md, "### Task 7" step
+1). The adjacent row "| No class > 50% | **Write no fix plan.** ... | — |" leads
+to the same outcome, so the selection does not depend on which reading of the
+verdict is taken.
+SCOPE SOURCE: none — no fix scope was drawn, because the branch taken writes no
+fix plan. The verdict itself was read from Task 6's "### Verdict" block
+(DOMINANT CLASS / CONFIDENCE lines) in this document; the underlying artifacts
+are the Task 5 decode parses under /tmp/decode-attrib/{primary,secondary}-decode/,
+which emit zero gap_class.* metrics.
+```
+
+### Which row matched, and why the decision is robust
+
+Task 6's verdict, quoted from its `### Verdict` block above:
+
+```
+DOMINANT CLASS: NOT DETERMINED — no dominant class was identified and no class
+share was computed. 0.0% of timeline.unattributed_ms_x1000 is attributed
+[...] This is a failed measurement, not a finding of "no dominant class in the
+data".
+CONFIDENCE: LOW — and strictly weaker than LOW: there is no classification to
+rate.
+```
+
+Two rows of the decision table can be reached from that text, and **both point to
+the same branch**:
+
+| row, quoted verbatim from the plan | matches because |
+|---|---|
+| `Task 6 marked LOW CONFIDENCE` → **Write no fix plan.** Re-run Task 5 capture first; record why. | The literal token `CONFIDENCE: LOW` is present. Task 6 retained that token deliberately so this table matches without interpretation. |
+| `No class > 50%` → **Write no fix plan.** Instead append a `## No dominant class` section recommending a finer capture (per-op `GGML_SYCL_KERNEL_PROFILE_RAW=1` host-submit spans) as the next attribution step. | No class exceeds 50 %; no class has any share at all. |
+
+The three `> 50%` rows (`host_overlap`, `runtime_idle`, `queue_serialization`)
+are each unreachable: every measured share is absent, not merely below threshold.
+
+**No phase-2 plan document exists for any branch** — not
+`...-phase2-per-op-memoization.md`, not `...-phase2-launch-count-reduction.md`,
+not `...-phase2-dependency-overlap.md`, and not a provisional or skeleton form of
+any of them. The plan's own gotcha is explicit that writing plans which then get
+thrown away is the waste this scope boundary exists to prevent, and here there is
+no measurement to scope one from in the first place.
+
+The plan's step-1 branch for `No class > 50%` also asks for a `## No dominant
+class` section recommending a finer capture. That recommendation is **not**
+adopted as written: a finer capture (`GGML_SYCL_KERNEL_PROFILE_RAW=1` host-submit
+spans) presumes the existing capture produced a coarse-but-real attribution to
+refine. It did not. The correct next step is repairing the instrument
+(`llama.cpp-sacs`) and re-running the *same* capture, which is what the
+`LOW CONFIDENCE` row prescribes — see "What must happen before this question can
+be re-asked" below.
+
+### The distinction that matters most for whoever picks this up
+
+**This is a failed measurement, not a finding that the non-kernel cost is
+diffuse.** The two route to the same branch of the decision table and mean
+opposite things:
+
+| | what the data would say | what it licenses |
+|---|---|---|
+| *cost is diffuse* (a real finding) | every class was measured; none reached 50 % | broad optimization is justified — attack several classes, or find a finer decomposition |
+| *measurement failed* (**this case**) | no class was measured; coverage was 0.00 % over 1 of ~129 steps | **nothing**. The cost may well be concentrated in a single class. We do not know. |
+
+A reader who concludes "the cost is spread evenly, so optimize broadly" is acting
+on a false premise. So is a reader who concludes any class *isn't* dominant.
+Nothing was ruled in and nothing was ruled out. The three-way split remains
+entirely open, and the 15.533 ms/token it would divide is real and large.
+
+### What must happen before this question can be re-asked
+
+In order. Skipping any step reproduces the same non-result.
+
+1. **Resolve `llama.cpp-sacs` — both defects, not just the first.**
+   - *Defect 1:* the timeline flush is one-shot. `sycl_timeline_flush`
+     (`ggml/src/ggml-sycl/sycl-timeline.cpp:461`) returns early once
+     `state.successful_file_flushes > 0`, called at
+     `ggml/src/ggml-sycl/ggml-sycl.cpp:92600-92606` at the end of the **first**
+     non-recording decode step. A decode artifact is structurally incapable of
+     holding more than one step.
+   - *Defect 2:* the decode path emits zero `sycl.event` device events.
+     **Fixing only defect 1 still attributes nothing** — coverage stays at
+     0.00 %, just over 129 steps instead of 1. The gap classifier derives gaps
+     *between device events*; with none, `queue_gaps` is empty and the parser
+     emits no `gap_class.*` lines at all. That causal chain is verified, not
+     assumed.
+   - Optional but wanted: honour `GGML_SYCL_TIMELINE_TOKEN_START`/`_COUNT` as a
+     real decode-step window, so a steady-state slice can be isolated without
+     buffering 128 steps. Note the profile script hardcodes
+     `GGML_SYCL_TIMELINE_TOKEN_START=1` in its own `env` block, which the
+     caller's environment cannot override.
+2. **Re-run the Task 5 capture** on the repaired instrument, and **skip the
+   first-token step explicitly** — it is ~440 ms, roughly 21× a steady-state
+   token, and would dominate any unwindowed average.
+3. **Re-run Task 6's attribution** against that capture, including the
+   rounding-delta check (below), which was never exercisable on decode.
+
+Until step 1 lands, re-running the capture unchanged reproduces this same
+non-result: **the failure is in the instrument, not in the run.**
+
+### What phase 1 established anyway
+
+The plan did not come away empty. Two things are settled and outlive it.
+
+**1. The corrected per-token budget** (carried forward verbatim from Task 6,
+which carried it verbatim from Task 5 — not recomputed here). Measured against
+the clean **shipping** path, graph replay ON, 48.3799 tok/s, B70, GPT-OSS 20B
+MXFP4, `-p 0 -n 128`:
+
+| quantity | value |
+|---|---:|
+| total token time | **20.670 ms** |
+| device-busy | **5.136 ms** |
+| non-kernel | **15.533 ms** |
+| non-kernel share | **75.2 %** |
+
+Both caveats travel with these numbers and are not optional:
+
+⚠ **75.2 % is a conservative floor, not a ceiling.** The 5.136 ms device figure
+comes from the *profiled* runs. If per-kernel profiling inflates kernel
+durations, kernel time is overstated and the non-kernel budget is correspondingly
+*understated*.
+
+⚠ **It is a sum over per-kernel `total_ns` on a single in-order compute queue.**
+It would overcount device busy — and therefore further understate the non-kernel
+share — if work were concurrent across queues.
+
+**2. The restated Amdahl ceiling**, from the 5.136 ms device floor:
+
+- Eliminating **all** host time: 194.7 tok/s = **4.02×** — a bound on the whole
+  class of work, not a target, and unreachable.
+- Eliminating **half** the non-kernel budget: 77.5 tok/s = **1.60×**.
+- The plan's **+19 %** target needs 3.300 ms/token removed = **21.2 %** of the
+  non-kernel budget.
+
+So the headroom is real and large, and +19 % is not an unreasonable ask of it —
+conditioned entirely on *where* inside the 15.533 ms the time sits, which is the
+question that remains unanswered.
+
+**3. The plan's `~22 ms` / `~84 %` premise is retired.** `~22 ms` exceeds a whole
+20.670 ms token, so it cannot be the non-kernel *part* of one — arithmetically
+impossible on this path, not merely imprecise. Any downstream document, task, or
+acceptance criterion still quoting `~22 ms` or `~84 %` is quoting a superseded
+premise; the replacements are **15.533 ms** and **75.2 %**.
+
+### State of the instrumentation
+
+Track A is closed and final. It delivered three working pieces that outlive this
+plan; whoever re-runs the capture inherits all of them.
+
+| piece | commit(s) | state |
+|---|---|---|
+| The decode-timeline script test, registered in ctest (`test-sycl-decode-timeline-profile-script`) | `9125985a1`, `3845dcd62`, `51d4dd489` | Live. Previously `ctest -N -R decode-timeline` reported `Total Tests: 0`; the assertions existed but nothing ran them. |
+| `--wall-ms` forwarding from `scripts/sycl-gptoss-decode-timeline-profile.sh` to both `parse-sycl-timeline.py` invocations | `3f2dbb54f`, `baaf652e1` | Live, and load-bearing: the parser's fallback envelope mixes host- and device-clock epochs (`parse-sycl-timeline.py:532`), reporting a 9-hour wall for a 6-second run. **Always pass `--wall-ms` explicitly** until that is fixed (defect 3 of `llama.cpp-sacs`). |
+| `gap_class.device{N}.{queue}.rounding_delta_ms_x1000` plus its conservation test (`test-sycl-timeline-gap-class-conservation`) | `f8ec00b93` | Live. Makes the plan's *"any `rounding_delta` above 5 % of its queue's gap total ⇒ `LOW CONFIDENCE`"* rule **enforceable** where the magnitude was previously not observable at all. |
+
+**The rounding-delta rule was never exercised on decode** — there is no
+`rounding_delta` line on the decode path, because there is no gap-class data on
+the decode path. It is ready and waiting for the re-run. Carry its scaling
+hazard: the delta accumulates one sub-microsecond rounding *per gap*, so its size
+tracks gap count, and a full-length decode trace will carry far more gaps than
+the 968 on the prompt-path trace where it was observed at 0.0034 % of the queue
+total. Recompute the percentage per queue rather than assuming it stays
+negligible — the point of the metric is that the assumption no longer has to be
+made.
