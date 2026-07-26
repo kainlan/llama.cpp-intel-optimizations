@@ -835,7 +835,11 @@ captured alongside the failed timeline traces and is sitting in the same
 directory, unread.
 
 `/tmp/decode-attrib/primary-decode/sycl-kernels.json` has two top-level keys,
-`kernels` and **`raw_events`**. The latter, verified directly from the artifact:
+`kernels` and **`raw_events`**. ⚠ **`/tmp` is tmpfs and is not guaranteed to
+survive a reboot** — if that directory is gone, re-run the capture commands under
+"Commands (exact)" above, which reproduce it with no source change and no
+`llama.cpp-sacs` fix. The `raw_events` figures below, verified directly from the
+artifact:
 
 | property | value |
 |---|---|
@@ -892,9 +896,11 @@ today, on artifacts already captured, without `llama.cpp-sacs` being fixed first
 answer different questions and can proceed in parallel.
 
 **Path A — callsite-level host attribution (open now, no blocker).** Analyse
-`raw_events` as described above. Requires no source change, no new GPU run, and
-no `llama.cpp-sacs` fix. It bounds and localizes host *submit* work by source
-line. It cannot produce the three-way gap classification.
+`raw_events` as described above. Requires no source change and no
+`llama.cpp-sacs` fix. It bounds and localizes host *submit* work by source line.
+It cannot produce the three-way gap classification. No new GPU run is needed
+**while the artifact exists** — `/tmp` is tmpfs, so if it has been lost to a
+reboot the capture must be re-run first (same commands, still no source change).
 
 **Path B — the three-way gap classification (blocked).** This is the question
 Task 6 was opened to answer, and it needs the timeline. In order; skipping any
