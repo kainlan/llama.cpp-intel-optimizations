@@ -123,6 +123,16 @@ def test_one_shot_timeline_flush_is_reachable_only_from_backend_teardown() -> No
     step 1, writing a single-step trace with no device spans (the drain has not
     run yet) and permanently locking out the backend-free site. That is the
     whole defect, and it lives only in the composition.
+
+    Reach, stated so nobody has to infer it: this is a lexical check over
+    source text. It catches a direct re-introduction of the call, which is the
+    realistic accident. It does NOT catch an indirect one -- a macro expanding
+    to the flush, or a wrapper such as flush_decode_timeline() invoked from
+    ggml_backend_sycl_graph_compute() -- because no literal call appears at the
+    call site and the test keeps passing while the race is back. Closing that
+    would take an AST or call-graph tool this project does not use in tests, so
+    it stays an accepted residual risk. Renames and reformatting are safe by
+    contrast: function_body_span() raises at collection time.
     """
     timeline_src = strip_comments(SYCL_TIMELINE.read_text(encoding="utf-8"))
     # The premise. If the flush ever becomes re-entrant this assertion fails
