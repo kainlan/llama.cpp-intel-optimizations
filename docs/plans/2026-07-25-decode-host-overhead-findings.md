@@ -749,8 +749,10 @@ This task ran no GPU work, no build, and touched no source, script, or test.
 ```
 PHASE-2 SELECTION: none — Task 6 is marked CONFIDENCE: LOW and states DOMINANT
 CLASS: NOT DETERMINED, so the decision table's LOW CONFIDENCE row applies and no
-fix plan is written. The Task 5 capture must be re-run first, which is blocked on
-llama.cpp-sacs.
+fix plan is written. The Task 5 *timeline* capture must be re-run first, which is
+blocked on llama.cpp-sacs; a separate callsite-level host attribution from the
+kernel profiler's raw_events is NOT blocked and can proceed now (see "The
+raw_events path is already open"). Neither changes the selection.
 RULE APPLIED: "| Task 6 marked `LOW CONFIDENCE` | **Write no fix plan.** Re-run
 Task 5 capture first; record why. | — |" (decision table,
 docs/plans/2026-07-25-sycl-decode-host-overhead-attribution.md, "### Task 7" step
@@ -793,16 +795,19 @@ are each unreachable: every measured share is absent, not merely below threshold
 not `...-phase2-dependency-overlap.md`, and not a provisional or skeleton form of
 any of them. The plan's own gotcha is explicit that writing plans which then get
 thrown away is the waste this scope boundary exists to prevent, and here there is
-no measurement to scope one from in the first place.
+no gap-class measurement to scope one from in the first place. Note that the
+`raw_events` data described below does **not** close this: each fix branch is
+scoped from a different Task 6 output (the callsite table, the launch count, the
+`gap_transition` table), and a submit-time-by-callsite ranking does not select
+among the three.
 
 The plan's step-1 branch for `No class > 50%` also asks for a `## No dominant
-class` section recommending a finer capture. That recommendation is **not**
-adopted as written: a finer capture (`GGML_SYCL_KERNEL_PROFILE_RAW=1` host-submit
-spans) presumes the existing capture produced a coarse-but-real attribution to
-refine. It did not. The correct next step is repairing the instrument
-(`llama.cpp-sacs`) and re-running the *same* capture, which is what the
-`LOW CONFIDENCE` row prescribes — see "What must happen before this question can
-be re-asked" below.
+class` section recommending a finer capture — per-op
+`GGML_SYCL_KERNEL_PROFILE_RAW=1` host-submit spans. **That recommendation is
+adopted**, and it turns out to be stronger than "finer": see
+"The `raw_events` path is already open" below. It is a *different instrument*,
+not a finer setting on the broken one, and the data it produces is already on
+disk.
 
 ### The distinction that matters most for whoever picks this up
 
@@ -820,9 +825,80 @@ on a false premise. So is a reader who concludes any class *isn't* dominant.
 Nothing was ruled in and nothing was ruled out. The three-way split remains
 entirely open, and the 15.533 ms/token it would divide is real and large.
 
+### The `raw_events` path is already open
+
+**`llama.cpp-sacs` is not a hard prerequisite for all further attribution.** The
+kernel profiler is a separate instrument from the timeline, and — as Task 5
+established when it salvaged the 5.136 ms device figure — **it is not subject to
+the one-shot flush**. It covered all 129 steps. Its raw per-event output was
+captured alongside the failed timeline traces and is sitting in the same
+directory, unread.
+
+`/tmp/decode-attrib/primary-decode/sycl-kernels.json` has two top-level keys,
+`kernels` and **`raw_events`**. The latter, verified directly from the artifact:
+
+| property | value |
+|---|---|
+| records | **61,500** = **476.7 per step** across 129 steps — the whole decode, not one step |
+| host-submit span | 8.948 s — the whole run |
+| usable timestamps | `timestamp_status: ok` on **59,541 of 61,500 = 96.8 %** |
+| the 1,959 failures | all `sycl.memcpy.mem_ops` on the **copy** queue, all in the load-time staging window (host-submit begin 32580.2–32585.8 s, entirely before the first `ok` event at 32585.8 s) — i.e. weight staging, not decode |
+| per-event fields | `host_submit_begin_us`, `host_submit_end_us`, `device_submit_ns`, `device_start_ns`, `device_end_ns`, `duration_ns`, `queue_kind`, `category`, `graph_recorded`, and **`file` / `line` / `function`** |
+| total host-submit time | **312.429 ms = 2.422 ms/step**, resolved across **14 distinct callsites** |
+
+The ranked callsites, per step:
+
+| count | per step | callsite |
+|---:|---:|---|
+| 9288 | 72.0 | `binbcast.cpp:972 ggml_sycl_op_mul` |
+| 9288 | 72.0 | `binbcast.cpp:888 operator()` |
+| 9288 | 72.0 | `binbcast.cpp:962 ggml_sycl_op_add` |
+| 6192 | 48.0 | `rope.cpp:640 ggml_sycl_op_rope` |
+| 6192 | 48.0 | `set_rows.cpp:728 set_rows_sycl` |
+| 3398 | 26.3 | `mem-ops.cpp:356 mem_copy_submit` |
+| 3225 | 25.0 | `mem-ops.cpp:454 mem_fill_submit` |
+| 3096 | 24.0 | `softmax.cpp:417 ggml_sycl_op_soft_max` |
+| 3096 | 24.0 | `mmvq.cpp:17473 mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa` |
+| 3096 | 24.0 | `mmvq.cpp:6849 mxfp4_dpas_pack_q8_single_col_groups_sycl` |
+| 3096 | 24.0 | `mmvq.cpp:9841 mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl` |
+| 1729 | 13.4 | `mem-ops.cpp:391 mem_copy_submit` |
+| 387 | 3.0 | `getrows.cpp:2898 ggml_sycl_op_get_rows` |
+| 129 | 1.0 | `mem-ops.cpp:382 mem_copy_submit` |
+
+So a per-op, whole-decode, **source-attributed** host-side measurement exists
+today, on artifacts already captured, without `llama.cpp-sacs` being fixed first.
+
+**Three limits on it, none optional:**
+
+1. **This is not Task 6's decomposition.** It does **not** reproduce the
+   `host_overlap` / `queue_serialization` / `runtime_idle` three-way gap
+   classification. It is a different cut — submit-call *duration* per op, with
+   source location — and it does not satisfy Task 6 or change its verdict. The
+   gap classification still requires the timeline, and the timeline still
+   requires `llama.cpp-sacs`.
+2. **These numbers come from a profiled run.** Profiler overhead in this capture
+   configuration (`GGML_SYCL_TIMELINE` **and** `GGML_SYCL_KERNEL_PROFILE`) is
+   **11.3–12.0 %** per Task 5 — *not* Task 4's 2.84 %, which covered
+   `GGML_SYCL_TIMELINE` alone and must not be applied here.
+3. **2.422 ms/step is host *submit* time specifically.** It is a component of the
+   15.533 ms non-kernel budget, **not** the whole of it. **What fraction of the
+   remaining ~13.1 ms it explains has not been established, and must not be
+   claimed.** Submit time is not the same quantity as the gap between device
+   events, and the two cannot be equated without the measurement that is missing.
+
 ### What must happen before this question can be re-asked
 
-In order. Skipping any step reproduces the same non-result.
+**Two paths. One is blocked on the instrument fix; one is open now.** They
+answer different questions and can proceed in parallel.
+
+**Path A — callsite-level host attribution (open now, no blocker).** Analyse
+`raw_events` as described above. Requires no source change, no new GPU run, and
+no `llama.cpp-sacs` fix. It bounds and localizes host *submit* work by source
+line. It cannot produce the three-way gap classification.
+
+**Path B — the three-way gap classification (blocked).** This is the question
+Task 6 was opened to answer, and it needs the timeline. In order; skipping any
+step reproduces the same non-result.
 
 1. **Resolve `llama.cpp-sacs` — both defects, not just the first.**
    - *Defect 1:* the timeline flush is one-shot. `sycl_timeline_flush`
@@ -848,8 +924,9 @@ In order. Skipping any step reproduces the same non-result.
 3. **Re-run Task 6's attribution** against that capture, including the
    rounding-delta check (below), which was never exercisable on decode.
 
-Until step 1 lands, re-running the capture unchanged reproduces this same
-non-result: **the failure is in the instrument, not in the run.**
+Until step 1 lands, re-running the *timeline* capture unchanged reproduces this
+same non-result: **the failure is in the instrument, not in the run.** That is a
+statement about path B only — it does not block path A.
 
 ### What phase 1 established anyway
 
