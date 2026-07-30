@@ -91,6 +91,14 @@ TRULY_IDLE = CAUSES_MODULE.CAUSE_TRULY_IDLE
 # cannot drift, with the literal as a fallback purely so a parser that does not
 # implement it yet fails on the *classification* assertions below rather than on
 # an AttributeError at import time.
+#
+# That fallback looks like dead code once the parser defines the constant, and
+# has already been flagged as such once.  It is not: it is what lets this file
+# run against a parser PREDATING the cause it tests.  That is how the RED step
+# was demonstrated, how the spec review independently reproduced it, and what
+# keeps a `git bisect` across the commit that added the cause reporting a
+# readable classification failure instead of dying at import.  Do not "simplify"
+# it to a plain attribute read.
 IMPLICIT_CAUSE = getattr(CAUSES_MODULE, "CAUSE_IMPLICIT_QUEUE_SERIALIZATION", "implicit_queue_serialization")
 
 # The queue the checked-in fixture builds its gaps on.  Keep in sync with the
