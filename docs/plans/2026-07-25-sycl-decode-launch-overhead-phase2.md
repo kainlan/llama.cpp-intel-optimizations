@@ -320,11 +320,50 @@ Resolved to `"union"`. `device_gap_has_host_overlap` now dispatches through `hos
 
 `truly_idle` — the budget every task below is scoped from — is **identical** under both rules (960153, 9.602 ms/step, n=18840, same transition ranking to the digit). The reclassified gaps were never part of it. Nothing in this plan changes as a result.
 
+> ⚠️ **The 9.602 ms/step figure above is NOT host idle time.** Task 7 (`llama.cpp-hzgc`, closed
+> 2026-07-30) established that 78–85 % of the Cluster B portion is **device execution the kernel
+> profiler never records** — `ggml_sycl_profile_label` is opt-in per site, and `sycl-kernels.json`
+> lists only **11 kernels for the entire run**, so the attention Q/K/V/O projections, the MoE router,
+> the MoE down-proj and the 201088-row output head are all unlabelled. Every `truly_idle` number in
+> this plan and in the findings doc is therefore a **device/host mixture in an unknown ratio**, and
+> the `host_overlap` vs `truly_idle` split is partly decided by instrumentation coverage rather than
+> by physics. The coverage-policy conclusion in this section still stands — both rules give the same
+> number — but what that number *means* changed. Do not scope new work off it without reading
+> findings-doc Task 15 first. Falsification tests: `llama.cpp-ejjq`.
+>
+> This caveat is repeated here because the findings doc is append-only, so it can only live at the
+> *end* of that file — where a reader who stops at Task 6 will never reach it.
+
 `tests/test-sycl-gap-causes.py` pins the policy via a fixture gap that classifies differently under each rule, so a future flip cannot silently restate a published number. Tracker: `llama.cpp-nceh`.
 
 ---
 
-### Task 7: Attribute the residual per-layer stalls (no GPU)
+### Task 7: Attribute the residual per-layer stalls (no GPU) — ✅ **DONE 2026-07-30** (`llama.cpp-hzgc`, findings doc Task 15, commit `27779134f`)
+
+**Verdict — neither of the two mechanisms this task was written to choose between.** The task asked
+whether implicit in-order queue serialization or genuine launch overhead dominates. The answer is
+**neither: 78–85 % of Cluster B's 5.306 ms/step is device execution the kernel profiler never
+records.** `ggml_sycl_profile_label` is opt-in per site, and `sycl-kernels.json` — the profiler's own
+table — lists **11 kernels for the entire run**; the attention Q/K/V/O projections, the MoE router,
+the MoE down-proj and the 201088-row output head carry no label, so their device time lands in the
+gaps. Genuine host dispatch latency separates out at **~3.1–4.0 ms/step** across ~48 gaps/step.
+
+Three independent evidence lines, all reproduced exactly by a second reviewer:
+1. **Data dependency, not adjacency** — endpoints pinned via `node_tensor` on both sides.
+2. **Device-clock A/B split** (new tool, `scripts/parse-sycl-gap-device-split.py`) — B is 0.35–0.72 µs
+   with no intervening node, but **30.42 µs** on `binbcast.mul --to-- softmax.forward` (30.83 in RED).
+   The floor is what makes the 30.42 meaningful.
+3. **Roofline** — 1724 MB/step read by kernels with no trace event, at the capture's own measured
+   196.7 GB/s = 7.0–8.8 ms/step.
+
+Implicit in-order queue serialization was **ruled out** explicitly, as the task demanded rather than
+inferred from `queue_serialization ≈ 0`: 0.000 ms/step in both arms at 100 % `device_submit_ns`
+coverage (46100/46100).
+
+⚠️ **Consequence with the widest reach:** every `truly_idle` figure in this plan and the findings doc
+is a device/host mixture in an unknown ratio — see the warning under Task 6. The verdict rests on one
+capture pair; `llama.cpp-ejjq` carries the falsification tests, with the ablation's predicted numbers
+recorded **before** the run.
 
 **Why:** If Task 4 shows the marker is causal, ~0.87 ms/step of Cluster B still sits in transitions it does not touch — `rope → set_rows.generic` (0.863), `rope → rope` (0.632), `set_rows.generic → binbcast.mul` (1.708, partly). These are 24×/step, so they are per-layer, and they are the KV-cache write path.
 
