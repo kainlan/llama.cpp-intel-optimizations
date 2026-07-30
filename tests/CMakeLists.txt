@@ -393,6 +393,31 @@ if (NOT WIN32)
         LABELS "sycl;profiling;tdd"
         TIMEOUT 120
     )
+
+    # Regression + arithmetic gate for parse-sycl-gap-device-split.py, the
+    # device-clock A/B decomposition the Cluster B verdict rests on. Registered
+    # because that script shipped with a reproducible ZeroDivisionError: its
+    # aggregate percentage divided by a gap total that is 0.0 whenever no gap
+    # between consecutive device events is ever recorded -- a single device
+    # event, or a pair where the second is fully contained in the first. Neither
+    # input is malformed, and the adjacent "no device events at all" case was
+    # already guarded, so this was the same failure one step later. The zero-gap
+    # cases here are that regression test.
+    #
+    # It also pins the numbers, not just the exit code: the A/B split and the
+    # equal-node_idx floor-calibration case are asserted against hand-computed
+    # totals, because the floor is what makes the measured 30.42 us meaningful.
+    # Same plain-script rationale as its two siblings above.
+    llama_test_cmd(
+        ${LLAMA_PYTHON3}
+        NAME test-sycl-gap-device-split
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-gap-device-split.py
+    )
+    set_tests_properties(test-sycl-gap-device-split PROPERTIES
+        LABELS "sycl;profiling;tdd"
+        TIMEOUT 120
+    )
 endif()
 
 if (GGML_SYCL)
