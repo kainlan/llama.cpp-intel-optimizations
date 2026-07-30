@@ -1693,3 +1693,296 @@ while removing the 72 submissions/token.
 **Still not established:** causation. Nothing here shows the 5.503 ms/step of
 idle *following* these markers is *caused* by them — that still needs the
 measurement, and it now needs the harder change to get it.
+
+## Task 14 (`llama.cpp-kjj9`) — The `binbcast.event` marker is NOT causal: the gap survives its alleged cause
+
+**Verdict: NOT CAUSAL.** Removing the 72 markers/step removes **0.293 ms/step**
+of the idle that follows them — their own submission cost — and leaves the
+remaining ~5.3 ms/step of `truly_idle` intact, in the same gaps, with the same
+counts, merely re-labelled to a different predecessor. Cluster B's 5.503 ms/step
+budget must be re-attributed. `binbcast.cpp` should be left alone on the strength
+of this measurement (Task 5's "not causal" row).
+
+Binary: **`aa135af89`** for every capture and every A/B arm below (`llama-bench`
+self-reports `build: c2549fb19` — that is the stale baked-in build-info string
+from the last configure, not the commit the objects were compiled at; HEAD was
+verified with `git rev-parse` into `HEAD.sha` in each capture directory).
+Backend presence confirmed before the first capture: `GGML_SYCL:BOOL=ON`,
+`ldd build/bin/llama-bench | grep -cE 'libggml-sycl|libsycl'` = 2.
+
+### Durable capture paths
+
+`/tmp` is not used anywhere in this task. All artifacts are on ext4 outside the
+git worktree and survive a reboot:
+
+| directory | contents |
+|---|---|
+| `/Apps/llama.cpp-captures/2026-07-30-red-barrier-s1/` | RED baseline: `sycl-timeline.json` (77.4 MB), `sycl-kernels.json` (33.6 MB), `sycl-kernels.csv`, `bench.stdout/stderr`, `gap-causes.txt`, `load.before/after`, `HEAD.sha` |
+| `/Apps/llama.cpp-captures/2026-07-30-green-reuse-s1/` | GREEN (`reuse`): same file set, `sycl-timeline.json` 70.2 MB |
+| `/Apps/llama.cpp-captures/2026-07-30-ab-interleaved/` | 20 `llama-bench` runs (10 pairs × 2 arms), stdout + stderr each, `load.before/after/after2`, `HEAD.sha` |
+
+Both trace directories were confirmed non-empty and parseable **before** any
+analysis. Env block copied verbatim from the plan's Task 1 (all 12 variables),
+`GGML_SYCL_KERNEL_PROFILE=1` set, `GGML_SYCL_TIMELINE=timeline+events`, window
+`TOKEN_START=15 TOKEN_COUNT=100`.
+
+Conditions: B70 (`level_zero:0`), **32600.8 MB free VRAM** in both captures'
+startup logs (no memory pressure — the ~13.8 GB failure mode did not occur).
+Load average 9.31 → 9.36 (RED), 9.95 → 10.72 (GREEN), 9.3 → 15.4 → 8.2 → 14.4
+across the A/B session. `journalctl -k` GPU-error grep: **0 hits** before and
+after. No crash or forced stop occurred.
+
+### Step 1 — The graph-replay paradox: resolved, and it is NOT `llama.cpp-fvcx`
+
+`graph_recorded` split over `sycl.binbcast.event` device events, RED capture:
+
+| | n | share |
+|---|---:|---:|
+| `graph_recorded=0` | 7200 | **100.00 %** |
+| `graph_recorded=1` | 0 | 0.00 % |
+
+**We are in the `graph_recorded=0` branch.** The markers are submitted eagerly
+every step; they are not recorded graph nodes being replayed. The launch-count
+frame holds and the A/B measures what the plan assumed.
+
+Comment `c-5s6u` correctly warned that a uniform 0 across *all* events should
+make one suspect the instrument rather than the answer — and it **is** uniform:
+all 46100 `sycl.event` records in the capture carry `graph_recorded=0`, not just
+the markers. That caution is discharged by a direct log line rather than by
+inference. From `bench.stderr`:
+
+```
+[SYCL] MoE decode graph topology is direct-dispatch dominated; using direct TG
+       executor instead of segmented graph replay
+[SYCL-GRAPH] Decode graph contains FLASH_ATTN_EXT; keeping attention nodes out of
+       SYCL command graphs by default
+```
+
+**Graph replay is not in use on this path at all.** GPT-OSS 20B decode on the
+B70 runs the direct TG executor, so every one of the 461 device events per step
+is an eager host submission and `graph_recorded=0` is the correct, expected
+answer for all of them. There was never a paradox to reconcile: the premise
+"this capture runs with graph replay ON" was wrong for this model and executor.
+
+Consequently **`llama.cpp-fvcx` is not needed to explain the observation** and is
+not confirmed by it. The raw-`thread_local`-vs-`ggml_sycl_graph_recording_active()`
+discrepancy at binbcast.cpp's 11 gates may still be a latent correctness bug
+worth fixing on its own merits, but this capture provides no evidence for it, and
+no evidence against it either — the recording path is simply never taken here.
+That task should not cite this capture as support.
+
+### Step 2 — `device_submit_ns` coverage: complete, so the serialization classifier IS applicable
+
+| | n | `device_submit_ns != 0` | field absent |
+|---|---:|---:|---:|
+| `graph_recorded=0` (all events) | 46100 | 46100 (**100.00 %**) | 0 |
+| `sycl.binbcast.event` only | 7200 | 7200 (**100.00 %**) | 0 |
+
+`timestamp_status=ok` on 46100/46100. There is no `graph_recorded=1` stratum to
+report because none exists in the capture (see Step 1).
+
+Coverage is total, so `implicit_queue_serialization` from
+`parse-sycl-gap-causes.py` can be read as a measurement rather than as an
+instrument artefact. It is genuinely near-zero: **0.042 ms total, 6 gaps** in
+RED (0.000 ms/step) and **0.000 ms, 0 gaps** in GREEN.
+
+Carrying forward `c-1l2e`'s caveat verbatim: this figure is a **LOWER BOUND** on
+serialization within `runtime_idle`, because gaps already classified
+`no_submit_span` or `submit_pipelined_ahead` are not re-examined. On these
+captures that is near-free — `no_submit_span` = 0 gaps in both arms, and
+`submit_pipelined_ahead` is 0.713 ms / 240 gaps (RED) and 0.658 ms / 175 gaps
+(GREEN), i.e. **~99.9 % of `runtime_idle` time is reachable** by the classifier.
+So "serialization is absent" is a fair reading here, with that caveat stated.
+
+One incidental confirmation: the *only* explicit `queue_serialization` in the
+entire RED capture is the marker itself — 95 gaps, 0.056 ms total, every one of
+them the `sycl.binbcast.mul --to-- sycl.binbcast.event` transition. In GREEN the
+class is empty (0 gaps). The marker was the sole source of detected explicit
+queue serialization in the decode window, and it amounted to 0.001 ms/step.
+
+### Step 3 — The marker-count model is confirmed exactly
+
+| observation | value |
+|---|---|
+| `sycl.binbcast.event` device events | 7200 over steps 15–114 |
+| per-step count | **72 on every one of the 100 steps** (no other value occurs) |
+| `node_op` on every marker | `MUL` (7200/7200) |
+| `sycl.binbcast.mul` ops with `node_op=MUL` | 7200 (72.0/step) — **1:1 with the markers** |
+| `sycl.binbcast.add` ops | 7200 (72.0/step), `node_op=ADD`, **zero markers** |
+| distinct `node_tensor` | 72: `attn_post_norm-{0..23}` (24), `ffn_moe_weighted-{0..23}` (24), `attn_norm-{1..23}` (23), `result_norm` (1) |
+| marker device time | 3.849 ms total, **0.0385 ms/step**, mean 535 ns |
+
+The MUL-only model from `c-0ukh` is **confirmed**, not assumed: markers appear on
+exactly the set of binbcast ops whose `dst->op == GGML_OP_MUL`, one each, and on
+no `ADD` op. There is no third route to the marker. (`attn_norm-0` is absent from
+the tensor list, which is why the count is 72 and not 24×3+1=73; the layer-0
+`attn_norm` MUL does not reach this path. Immaterial to the result.)
+
+**The mode label needs stating precisely, because the baseline is not what the
+task named it.** `ggml_sycl_get_binbcast_event_mode()` defaults to `BARRIER`, but
+`ggml_sycl_submit_binbcast_event()` downgrades `BARRIER → SAFE` on an in-order
+queue (binbcast.cpp:158-160). Every marker in the RED capture is therefore
+tagged `event_mode=safe;mode=kernel` — an **empty `single_task`
+(`ggml_sycl_binbcast_unpin_event_kernel`)**, not a queue barrier. The RED arm is
+the empty-marker-kernel path the plan describes; "default `barrier`" is the
+configured mode, `safe` is the executed one.
+
+Both markers' consumers are as `c-0ukh` established: **`pin_count == 0` in this
+configuration**, so `cache->unpin_on_event` never fires and every one of the 7200
+markers exists solely for consumer 1, `ggml_sycl_set_tensor_ready_event` — the
+site its own catch block at binbcast.cpp:995-999 calls "a diagnostic
+synchronization aid".
+
+### The `reuse` mode does take effect — verified structurally, not assumed
+
+| | RED (`safe` marker) | GREEN (`reuse`) | Δ |
+|---|---:|---:|---:|
+| `sycl.event` device records | 46100 | 38900 | **−7200** |
+| `sycl.submit` records | 46100 | 38900 | −7200 |
+| `sycl.binbcast.event` events | 7200 | **0** | −7200 |
+| sum of device busy time | 512.601 ms | 508.448 ms | −4.153 ms (−0.0415 ms/step) |
+| window envelope | 2369.100 ms | 2318.355 ms | −50.745 ms (−0.507 ms/step) |
+
+Exactly 7200 submissions removed, exactly the marker population, and the device
+busy-time drop (0.0415 ms/step) matches the markers' own measured device time
+(0.0385 ms/step). This is the check that a `reuse` run which silently fell back
+to `SUBMISSION` would fail, and it passes.
+
+### The decisive evidence: the gap survives the removal of its alleged cause
+
+`parse-sycl-gap-causes.py --steps 100`, `--wall-ms` left at each trace's own
+envelope (RED 2369.100 ms, GREEN 2318.355 ms — parser defect 3 respected, no
+derived window):
+
+| class / cause | RED ms/step | GREEN ms/step | Δ ms/step |
+|---|---:|---:|---:|
+| `runtime_idle` (total) | 9.731 | 9.478 | −0.253 |
+| → `truly_idle` | **9.723** | **9.472** | **−0.251** |
+| → `submit_pipelined_ahead` | 0.007 | 0.007 | 0.000 |
+| → `implicit_queue_serialization` | 0.000 | 0.000 | 0.000 |
+| → `no_submit_span` | 0.000 | 0.000 | 0.000 |
+| `host_overlap` | 8.912 | 8.702 | −0.210 |
+| `queue_serialization` | 0.001 | 0.000 | −0.001 |
+
+`truly_idle` **did fall** — by 0.251 ms/step (2.6 %), n 18979 → 18096. But the
+whole 5.5 ms did not, and the reason is visible in the transition table. The
+three `truly_idle` transitions that constitute Cluster B's 5.503 ms/step do not
+disappear; their *predecessor label* shifts from the deleted marker to the
+`binbcast.mul` that preceded it, with the gap counts preserved event-for-event:
+
+| transition (RED → GREEN successor) | RED ms/step | RED n | GREEN ms/step | GREEN n | Δ ms/step |
+|---|---:|---:|---:|---:|---:|
+| `binbcast.event` → `get_rows.marker` **becomes** `binbcast.mul` → `get_rows.marker` | 2.336 | 99 | 2.306 | **99** | −0.030 |
+| `binbcast.event` → `rope` **becomes** `binbcast.mul` → `rope` | 1.840 | 2300 | 1.670 | **2300** | −0.170 |
+| `binbcast.event` → `softmax.forward` **becomes** `binbcast.mul` → `softmax.forward` | 1.423 | 2388 | 1.330 | 2389 | −0.093 |
+| **sum** | **5.599** | | **5.306** | | **−0.293** |
+
+This is "following is not causing" demonstrated directly rather than argued. The
+gap population is identical — 99, 2300, 2388/2389 — and the n=99 inter-graph
+coincidence from Task 9/11 reproduces exactly in both arms. Delete the marker and
+the same 4787 gaps across the 100-step window (≈47.9/step) are still there,
+0.293 ms/step shorter in aggregate,
+which is **the marker's own cost and nothing else**: 0.0385 ms/step of device
+time plus ~0.25 ms/step of per-submission host and queue turnaround for 72
+submissions (~3.5 µs each, a plausible submission cost on this stack).
+
+The RED baseline also reproduces the published attribution, so this is a
+comparison against a sound before-point rather than a fresh number floating free:
+`truly_idle` 9.723 ms/step here vs **9.602 ms/step** published in Task 6
+(n=18979 vs 18840), and the marker-following idle 5.599 vs **5.503 ms/step**.
+
+### A/B: interleaved, 10 paired runs, unprofiled
+
+`llama-bench -m gpt-oss-20b-mxfp4.gguf -ngl 99 -fa 1 -p 0 -n 128 -r 3`, B70, one
+model per process, no profiling env set. **Alternating within one session**, and
+the within-pair order was counterbalanced: pairs 1–5 ran A-then-B, pairs 6–10
+B-then-A.
+
+| pair | order | A = default (`safe` marker) | B = `reuse` | Δ (B−A) |
+|---:|---|---:|---:|---:|
+| 1 | A,B | 48.04 ± 0.16 | 45.79 ± **3.70** | **−2.25** |
+| 2 | A,B | 46.61 ± 1.77 | 48.17 ± 0.02 | +1.56 |
+| 3 | A,B | 47.40 ± 0.54 | 48.01 ± 0.78 | +0.61 |
+| 4 | A,B | 47.46 ± 0.62 | 47.95 ± 0.78 | +0.49 |
+| 5 | A,B | 48.34 ± 0.14 | 48.53 ± 0.11 | +0.19 |
+| 6 | B,A | 47.96 ± 0.58 | 48.51 ± 0.57 | +0.55 |
+| 7 | B,A | 48.25 ± 0.20 | 48.32 ± 0.60 | +0.07 |
+| 8 | B,A | 48.61 ± 0.42 | 48.87 ± 0.12 | +0.26 |
+| 9 | B,A | 48.55 ± 0.15 | 48.97 ± 0.03 | +0.42 |
+| 10 | B,A | 47.76 ± **2.10** | 48.30 ± 1.14 | +0.54 |
+
+Spread, not just means:
+
+| | mean | median | sd | range |
+|---|---:|---:|---:|---:|
+| A (default) | 47.898 | 48.00 | 0.614 | 46.61 – 48.61 |
+| B (`reuse`) | 48.142 | 48.31 | 0.891 | 45.79 – 48.97 |
+| Δ paired | **+0.244** (+0.51 %) | +0.455 | 0.966 | −2.25 – +1.56 |
+
+- All 10 pairs: mean Δ **+0.244 t/s (+0.51 %)**, SEM 0.305, t = 0.80, 95 % CI
+  **−0.45 … +0.94 t/s — includes zero.** Not significant.
+- Direction is consistent: **9 of 10 pairs positive** (two-sided sign test
+  p = 0.022).
+- The single negative pair is pair 1, whose B run carries a within-process
+  ± 3.70 — an order of magnitude above every other run and the largest spread in
+  the set. Excluding it: mean Δ +0.521 t/s (**+1.09 %**), SEM 0.143, t = 3.63,
+  9/9 positive. Reported as a sensitivity check, **not** as the headline; a
+  post-hoc exclusion cannot carry the claim on its own.
+
+Converting means to step time: 20.878 ms (A) → 20.772 ms (B), an implied
+**0.106 ms/step**. That is the same sign and order as the trace's 0.251 ms/step
+but smaller, and the noise band comfortably spans both. The profiled captures'
+apparent gain is larger still (42.66 → 43.52 t/s, +2.0 %, envelope −0.507
+ms/step) because instrumentation adds cost to each of the 72 removed
+submissions — **the profiled arms overstate the win and must not be quoted as the
+throughput figure.** The honest statement is: a real effect of roughly
+0.1–0.3 ms/step, i.e. **~0.5–1.4 % of TG**, at or just below what the B70's
+documented tg noise (cv 3.3 %) can resolve. Load rose from ~9 to ~15 mid-session,
+which is exactly the drift the interleaved design neutralises and a blocked
+design would have converted into a fake effect.
+
+### Correctness
+
+Mistral completion gate on the **B70** (`level_zero:0`, deliberately staying off
+device 1 where a reviewer may be running `ctest -R unpin-event`), both modes,
+byte-identical and correct:
+
+```
+=== mode=default ===   1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+=== mode=reuse   ===   1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+```
+
+⚠️ **The weight-cache unpin consumer is NOT exercised by anything above.** With
+`pin_count == 0` in every configuration measured here (`llama.cpp-g6iw`,
+`c-0ukh`), `cache->unpin_on_event` is never reached, so **these passing gates do
+not demonstrate that the `reuse` path is safe for the weight-cache lease
+release.** That path is correct by inspection of
+`ggml_sycl_binbcast_resolve_event_source` (REUSE falls back to a real submission
+when no kernel event was captured, so a default-constructed already-complete
+event can never release a pin) and by a host-only policy assertion — not by
+execution. Anyone acting on this section, in particular `llama.cpp-79m7` if it
+considers flipping the default, must treat the unpin path as untested at runtime.
+
+### What this means for Cluster B and Task 5
+
+- **Task 5 takes its "Not causal" row.** Leave `binbcast.cpp` alone on
+  performance grounds; do not make `reuse` the default to chase the 5.5 ms,
+  because the 5.5 ms is not there to be had. If `reuse` is adopted it should be
+  argued as a small, structurally cleaner change (7200 fewer submissions/step,
+  one fewer manufactured event, the only detected explicit queue serialization
+  in the window eliminated) worth ~0.1–0.3 ms/step — and only after the unpin
+  path is exercised for real.
+- **Cluster B's 5.503 ms/step must be re-attributed.** It is not launch overhead
+  from the marker. The gaps persist unchanged with the marker gone, so the cause
+  lies in whatever the host is doing between the `binbcast.mul` that ends one
+  unit of work and the `rope` / `softmax.forward` / `get_rows.marker` that starts
+  the next — the same per-layer host-side question Task 7 / `llama.cpp-hzgc`
+  owns. The `implicit_queue_serialization` classifier, now known to be applicable
+  at 100 % `device_submit_ns` coverage, rules out in-order queue serialization as
+  the mechanism (0.000 ms/step in both arms), which narrows that hunt.
+- **A methodological note worth keeping.** The marker looked causal because it
+  was the last event before the largest idle gaps in the capture, and a
+  transition table keyed on predecessor name made that adjacency look like
+  structure. Removing it moved the label and left the gap. Any future
+  attribution built on `X --to-- Y` transition rankings should be tested the same
+  way — by deleting X — before a budget is assigned to it.
