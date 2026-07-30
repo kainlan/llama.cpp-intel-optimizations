@@ -318,10 +318,6 @@ using ggml_sycl::moe_route_phase;
 
 static bool g_sycl_loaded          = false;
 int         g_ggml_sycl_debug      = 0;
-// Strict handle mode: surface data_handle/data_device divergence as a warning in
-// normal runs (the mismatch warnings are otherwise gated on g_ggml_sycl_debug,
-// which defaults to 0, so divergence is invisible in production). =1 warns.
-int         g_ggml_sycl_handle_strict = 0;
 int         g_ggml_sycl_debug_sync = 0;
 
 int g_ggml_sycl_tp_debug         = 0;  // Tensor Parallelism debug output (GGML_SYCL_TP_DEBUG env var)
@@ -331,6 +327,10 @@ int g_ggml_sycl_disable_graph    = 0;
 // queue so errors surface synchronously at the op that caused them. Opt-in
 // via GGML_SYCL_SAFE_MODE=1; expect 2-3x slowdown. Implies disable_graph.
 int g_ggml_sycl_safe_mode        = 0;
+// Strict handle mode: surface data_handle/data_device divergence as a warning in
+// normal runs (the mismatch warnings are otherwise gated on g_ggml_sycl_debug,
+// which defaults to 0, so divergence is invisible in production). =1 warns.
+int g_ggml_sycl_handle_strict    = 0;
 int g_ggml_sycl_disable_dnn      = 0;
 int g_ggml_sycl_prioritize_dmmv  = 0;
 int g_ggml_sycl_use_async_mem_op = 0;
@@ -16544,6 +16544,14 @@ static void ggml_check_sycl() try {
             GGML_LOG_INFO(
                 "[SYCL] Safe mode enabled — queue drained after every op "
                 "(expect 2-3x slowdown, graph replay disabled).\n");
+        }
+        // Confirm the flag reached the backend. Without this line a run that
+        // emits no mismatch warnings is ambiguous: "no divergence occurred" and
+        // "the env var never arrived" look identical.
+        if (g_ggml_sycl_handle_strict) {
+            GGML_LOG_INFO(
+                "[SYCL] Handle strict mode enabled — data_handle/data_device divergence "
+                "reported as warnings (diagnostic only, no behavior change).\n");
         }
 #if GGML_SYCL_DNNL
         GGML_LOG_INFO("  GGML_SYCL_DISABLE_DNN: %d\n", g_ggml_sycl_disable_dnn);
