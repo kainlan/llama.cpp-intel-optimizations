@@ -924,7 +924,7 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
     }
 
     // The binbcast kernel's own event.  Under GGML_SYCL_BINBCAST_EVENT_MODE=reuse it
-    // IS the completion event handed to the post-op consumers, which is why the flag
+    // IS the completion event handed to the post-op consumers, which is why validity
     // is tracked separately: an unset event must never reach them.
     sycl::event kernel_event;
     bool        kernel_event_valid = false;
@@ -934,36 +934,40 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
                             ne10, ne11, ne12, ne13, ne0, ne1, ne2, ne3, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13,
                             nb0, nb1, nb2, nb3, ggml_is_contiguous(src0), ggml_is_contiguous(src1),
                             ggml_is_contiguous(dst), main_stream, file, line, function);
-        kernel_event_valid = true;
     } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
         kernel_event = op()((const sycl::half *) src0_d, (const sycl::half *) src1_d, (sycl::half *) dst_d, ne00, ne01,
                             ne02, ne03, ne10, ne11, ne12, ne13, ne0, ne1, ne2, ne3, nb00, nb01, nb02, nb03, nb10, nb11,
                             nb12, nb13, nb0, nb1, nb2, nb3, ggml_is_contiguous(src0), ggml_is_contiguous(src1),
                             ggml_is_contiguous(dst), main_stream, file, line, function);
-        kernel_event_valid = true;
     } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) {
         kernel_event = op()((const sycl::half *) src0_d, (const float *) src1_d, (sycl::half *) dst_d, ne00, ne01, ne02,
                             ne03, ne10, ne11, ne12, ne13, ne0, ne1, ne2, ne3, nb00, nb01, nb02, nb03, nb10, nb11, nb12,
                             nb13, nb0, nb1, nb2, nb3, ggml_is_contiguous(src0), ggml_is_contiguous(src1),
                             ggml_is_contiguous(dst), main_stream, file, line, function);
-        kernel_event_valid = true;
     } else if (src0->type == GGML_TYPE_I32 && src1->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32) {
         kernel_event = op()((const int32_t *) src0_d, (const int32_t *) src1_d, (int32_t *) dst_d, ne00, ne01, ne02,
                             ne03, ne10, ne11, ne12, ne13, ne0, ne1, ne2, ne3, nb00, nb01, nb02, nb03, nb10, nb11, nb12,
                             nb13, nb0, nb1, nb2, nb3, ggml_is_contiguous(src0), ggml_is_contiguous(src1),
                             ggml_is_contiguous(dst), main_stream, file, line, function);
-        kernel_event_valid = true;
     } else if (src0->type == GGML_TYPE_I16 && src1->type == GGML_TYPE_I16 && dst->type == GGML_TYPE_I16) {
         kernel_event = op()((const int16_t *) src0_d, (const int16_t *) src1_d, (int16_t *) dst_d, ne00, ne01, ne02,
                             ne03, ne10, ne11, ne12, ne13, ne0, ne1, ne2, ne3, nb00, nb01, nb02, nb03, nb10, nb11, nb12,
                             nb13, nb0, nb1, nb2, nb3, ggml_is_contiguous(src0), ggml_is_contiguous(src1),
                             ggml_is_contiguous(dst), main_stream, file, line, function);
-        kernel_event_valid = true;
     } else {
         fprintf(stderr, "%s: unsupported types: dst: %s, src0: %s, src1: %s\n", __func__, ggml_type_name(dst->type),
                 ggml_type_name(src0->type), ggml_type_name(src1->type));
         GGML_ABORT("fatal error");
     }
+
+    // Set ONCE here rather than in each branch above, so no branch can mark an
+    // unassigned event valid -- the direction that would release a weight-cache
+    // pin early.  This is sound only because the chain's trailing `else` ends in
+    // GGML_ABORT, which is GGML_NORETURN (`[[noreturn]]` under C++, ggml.h:293)
+    // via ggml_abort (ggml.h:368): reaching this line therefore implies one of
+    // the five op() branches ran and assigned `kernel_event`.  If ggml_abort ever
+    // loses noreturn, move this back into the branches -- do not just reorder it.
+    kernel_event_valid = true;
 
     // The ONE site that decides where the post-op completion event comes from.
     // Every consumer goes through here, so none of them can be handed a

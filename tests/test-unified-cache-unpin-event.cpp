@@ -241,11 +241,10 @@ static bool run_binbcast_stress(event_mode mode, int iters) {
     for (int i = 0; i < iters; ++i) {
         // Re-upload `input` every iteration. `ggml_gallocr` allocates `out`
         // IN-PLACE over `input` (same shape and type, and the mul is input's only
-        // consumer), so without this each compute multiplies the PREVIOUS
-        // result again and the tensor ends up holding input*weight^iters --
-        // which no fixed expected value can check. Resetting it makes every
-        // iteration's result
-        // exactly input*weight while still driving `iters` pin/unpin cycles.
+        // consumer), so without this each compute multiplies the PREVIOUS result
+        // again and the tensor ends up holding input*weight^iters, which no fixed
+        // expected value can check. Resetting it makes every iteration's result
+        // exactly input*weight while still driving `iters` compute cycles.
         ggml_backend_tensor_set(input, input_data.data(), 0, input_data.size() * sizeof(float));
 
         const ggml_status status = ggml_backend_graph_compute(backend, graph);
