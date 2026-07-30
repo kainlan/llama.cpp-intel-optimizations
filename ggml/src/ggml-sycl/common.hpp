@@ -2858,7 +2858,8 @@ struct ggml_tensor_extra_gpu {
             if (resolved) {
                 if (data_device[dev] != nullptr && data_device[dev] != resolved.ptr) {
                     static std::atomic<int> stale_raw_warns{ 0 };
-                    if (g_ggml_sycl_debug && stale_raw_warns.fetch_add(1, std::memory_order_relaxed) < 16) {
+                    if ((g_ggml_sycl_debug || g_ggml_sycl_handle_strict) &&
+                        stale_raw_warns.fetch_add(1, std::memory_order_relaxed) < 16) {
                         GGML_LOG_WARN(
                             "[SYCL] extra data_handle/raw pointer mismatch dev=%d handle=%p raw=%p; "
                             "using mem_handle\n",
@@ -2968,7 +2969,8 @@ struct ggml_tensor_extra_gpu {
                 installed_source_handle = true;
             } else {
                 static std::atomic<int> mismatch_warns{ 0 };
-                if (g_ggml_sycl_debug && mismatch_warns.fetch_add(1, std::memory_order_relaxed) < 16) {
+                if ((g_ggml_sycl_debug || g_ggml_sycl_handle_strict) &&
+                    mismatch_warns.fetch_add(1, std::memory_order_relaxed) < 16) {
                     GGML_LOG_WARN(
                         "[SYCL] direct slice source handle mismatch dev=%d handle=%p slice=%p; "
                         "using direct handle\n",
