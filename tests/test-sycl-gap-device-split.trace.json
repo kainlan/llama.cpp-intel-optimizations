@@ -1,0 +1,58 @@
+{
+  "_comment": [
+    "Synthetic Chrome Trace fixture for test-sycl-gap-device-split.py. Hand-built,",
+    "never captured from hardware.",
+    "",
+    "Three device0/compute events, k1 -> k2 -> k3, producing exactly two gaps:",
+    "",
+    "  k1->k2  node_idx is EQUAL (1 -> 1).  This is the dispatch-latency floor",
+    "          calibration case the verdict's B floor rests on: dnode_median must",
+    "          come out 0.  gap=3,000,000 ns, submit(k2)=4,500,000 puts A at",
+    "          2,500,000 (clamped inside the gap) and B at the remaining 500,000.",
+    "  k2->k3  node_idx differs (1 -> 5, dnode=4).  gap=3,000,000 ns,",
+    "          submit(k3)=8,700,000 puts A at 2,700,000 and B at 300,000.",
+    "",
+    "Expected metrics (--format metrics --queue compute):",
+    "  gap_device_split.compute.transition.k1--to--k2.{n,gap_ms_x1000,a_ms_x1000,",
+    "    b_ms_x1000,b_pct_x10,dnode_median} = 1, 3000, 2500, 500, 167, 0",
+    "  gap_device_split.compute.transition.k2--to--k3.{...} = 1, 3000, 2700, 300, 100, 4",
+    "  gap_device_split.compute.total.{n,gap_ms_x1000,a_ms_x1000,b_ms_x1000,",
+    "    b_pct_x10,busy_ms_x1000,events} = 2, 6000, 5200, 800, 133, 3000, 3",
+    "",
+    "No sycl.submit events and no ggml.op nodes are included -- hostn stays 0 on",
+    "both transitions, which is deliberate: this fixture is only about the A/B",
+    "device-clock split, not the host-clock columns."
+  ],
+  "traceEvents": [
+    {
+      "ph": "X",
+      "cat": "sycl.event",
+      "name": "k1",
+      "ts": 50,
+      "dur": 50,
+      "args": {
+        "metadata": "device_start_ns=1000000;device_end_ns=2000000;device_submit_ns=900000;queue_kind=compute;node_idx=1;submit_id=s1;node_tensor=t1"
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "sycl.event",
+      "name": "k2",
+      "ts": 1000,
+      "dur": 100,
+      "args": {
+        "metadata": "device_start_ns=5000000;device_end_ns=6000000;device_submit_ns=4500000;queue_kind=compute;node_idx=1;submit_id=s2;node_tensor=t2"
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "sycl.event",
+      "name": "k3",
+      "ts": 2000,
+      "dur": 100,
+      "args": {
+        "metadata": "device_start_ns=9000000;device_end_ns=10000000;device_submit_ns=8700000;queue_kind=compute;node_idx=5;submit_id=s3;node_tensor=t3"
+      }
+    }
+  ]
+}

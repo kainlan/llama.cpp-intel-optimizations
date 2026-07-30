@@ -61,6 +61,28 @@ from collections import defaultdict
 from typing import Any
 
 
+def ns_to_ms_x1000(value_ns: float) -> int:
+    """Same convention (and formula) as parse-sycl-timeline.py's helper of the
+    same name: nanoseconds -> microseconds, which is the "ms x1000" integer
+    scale the sibling parsers use for every greppable metric. Duplicated
+    locally rather than imported, matching this file's existing standalone
+    style (metadata_fields / load_trace_events are already self-contained
+    reimplementations, not imports of the sibling modules)."""
+    return int(round(value_ns / 1000.0))
+
+
+def sanitize_metric_token(value: str) -> str:
+    """Matches parse-sycl-timeline.py's helper of the same name, so a
+    transition token stays a single space-free `key value` token."""
+    result = []
+    for ch in value:
+        if ch.isalnum() or ch in "._-":
+            result.append(ch)
+        else:
+            result.append("_")
+    return "".join(result) if result else "unknown"
+
+
 def metadata_fields(event: dict[str, Any]) -> dict[str, str]:
     """The profiler packs its per-event fields into one `;`-separated string."""
     args = event.get("args")
@@ -93,8 +115,17 @@ def collect_submit_spans(events: list[dict[str, Any]]) -> dict[str, tuple[float,
         event_id = metadata_fields(event).get("event_id")
         if event_id is None or event_id in spans:
             continue
-        start = float(event["ts"])
-        spans[event_id] = (start, start + float(event["dur"]))
+        # Same field-presence discipline as collect_device_events: a submit
+        # span missing ts/dur is skipped, not a crash -- one convention for
+        # malformed events across the file rather than two.
+        ts, dur = event.get("ts"), event.get("dur")
+        if ts in (None, "") or dur in (None, ""):
+            continue
+        try:
+            start = float(ts)
+            spans[event_id] = (start, start + float(dur))
+        except (TypeError, ValueError):
+            continue
     return spans
 
 
@@ -105,8 +136,14 @@ def collect_host_nodes(events: list[dict[str, Any]]) -> list[tuple[float, float]
             continue
         if event.get("name") != "compute_forward_node":
             continue
-        start = float(event["ts"])
-        nodes.append((start, start + float(event["dur"])))
+        ts, dur = event.get("ts"), event.get("dur")
+        if ts in (None, "") or dur in (None, ""):
+            continue
+        try:
+            start = float(ts)
+            nodes.append((start, start + float(dur)))
+        except (TypeError, ValueError):
+            continue
     nodes.sort()
     return nodes
 
@@ -161,6 +198,14 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--queue", default="compute", help="queue kind to report; 'all' for every queue")
     parser.add_argument("--steps", type=int, default=0, help="decode steps in the window; >0 prints per-step figures")
     parser.add_argument("--top-transitions", type=int, default=22, help="rows to print, ranked by total gap")
+    parser.add_argument(
+        "--format",
+        choices=("table", "metrics"),
+        default="table",
+        help="'table' (default, unchanged) prints the human-readable columns the findings doc cites; "
+        "'metrics' prints greppable 'key value' lines in the sibling parsers' _ms_x1000 style, "
+        "for scripted before/after comparison (see llama.cpp-ejjq)",
+    )
     args = parser.parse_args(argv)
 
     if args.steps < 0:
@@ -206,33 +251,79 @@ def main(argv: list[str]) -> int:
 
     divisor = args.steps if args.steps > 0 else 1
     unit = "ms/step" if args.steps > 0 else "ms"
-    print(
-        f'{"transition":58} {"n":>8} {"gap " + unit:>11} {"mean_us":>8} {"A_us":>8} {"B_us":>8} '
-        f'{"B%":>5} {"hostint_us":>10} {"hostcov_us":>10} {"dnodes":>6}'
-    )
     ranked = sorted(rows.items(), key=lambda item: -item[1]["gap"])
-    for (previous_name, next_name), row in ranked[: args.top_transitions or None]:
-        count = row["n"]
-        host_interval = row["hostint"] / row["hostn"] if row["hostn"] else float("nan")
-        host_coverage = row["hostcov"] / row["hostn"] if row["hostn"] else float("nan")
+    selected = ranked[: args.top_transitions or None]
+
+    if args.format == "table":
         print(
-            f'{previous_name + " -> " + next_name:58} {count / divisor:8.2f} {row["gap"] / divisor / 1e6:11.3f} '
-            f'{row["gap"] / count / 1e3:8.2f} {row["a"] / count / 1e3:8.2f} {row["b"] / count / 1e3:8.2f} '
-            f'{100 * row["b"] / row["gap"]:5.1f} {host_interval:10.2f} {host_coverage:10.2f} '
-            f'{statistics.median(row["dnode"]):6.0f}'
+            f'{"transition":58} {"n":>8} {"gap " + unit:>11} {"mean_us":>8} {"A_us":>8} {"B_us":>8} '
+            f'{"B%":>5} {"hostint_us":>10} {"hostcov_us":>10} {"dnodes":>6}'
         )
+        for (previous_name, next_name), row in selected:
+            count = row["n"]
+            host_interval = row["hostint"] / row["hostn"] if row["hostn"] else float("nan")
+            host_coverage = row["hostcov"] / row["hostn"] if row["hostn"] else float("nan")
+            print(
+                f'{previous_name + " -> " + next_name:58} {count / divisor:8.2f} {row["gap"] / divisor / 1e6:11.3f} '
+                f'{row["gap"] / count / 1e3:8.2f} {row["a"] / count / 1e3:8.2f} {row["b"] / count / 1e3:8.2f} '
+                f'{100 * row["b"] / row["gap"]:5.1f} {host_interval:10.2f} {host_coverage:10.2f} '
+                f'{statistics.median(row["dnode"]):6.0f}'
+            )
+    else:
+        for (previous_name, next_name), row in selected:
+            token = f"{sanitize_metric_token(previous_name)}--to--{sanitize_metric_token(next_name)}"
+            prefix = f"gap_device_split.{args.queue}.transition.{token}"
+            print(f"{prefix}.n {row['n']}")
+            print(f"{prefix}.gap_ms_x1000 {ns_to_ms_x1000(row['gap'])}")
+            print(f"{prefix}.a_ms_x1000 {ns_to_ms_x1000(row['a'])}")
+            print(f"{prefix}.b_ms_x1000 {ns_to_ms_x1000(row['b'])}")
+            print(f"{prefix}.b_pct_x10 {round(1000 * row['b'] / row['gap'])}")
+            print(f"{prefix}.hostn {row['hostn']}")
+            print(f"{prefix}.hostint_ms_x1000 {int(round(row['hostint'])) if row['hostn'] else 0}")
+            print(f"{prefix}.hostcov_ms_x1000 {int(round(row['hostcov'])) if row['hostn'] else 0}")
+            print(f"{prefix}.dnode_median {int(round(statistics.median(row['dnode'])))}")
 
     gap_total = sum(row["gap"] for _, row in ranked)
     a_total = sum(row["a"] for _, row in ranked)
     b_total = sum(row["b"] for _, row in ranked)
     count_total = sum(row["n"] for _, row in ranked)
-    print(
-        f"\nall gaps on queue {args.queue!r}: {gap_total / divisor / 1e6:.3f} {unit}   "
-        f"A={a_total / divisor / 1e6:.3f}  B={b_total / divisor / 1e6:.3f} ({100 * b_total / gap_total:.1f} % B)   "
-        f"n={count_total / divisor:.1f}"
-    )
+
+    # A trace can have device events on this queue but NO gap between any of
+    # them -- one event total, or a run of events each fully contained in its
+    # predecessor (`current[0] > previous[1]` never fires). `rows` is then
+    # empty and gap_total is 0.0: the percentage below would divide by zero.
+    # Same shape as the "no device events at all" guard above: clean message,
+    # return 2, one convention for "nothing to report" rather than two.
+    if gap_total == 0:
+        print(
+            f"no device gaps found on queue {args.queue!r} "
+            f"({len(device_events)} device event(s), all back-to-back or singular)"
+        )
+        return 2
+
     busy_total = sum(end - start for start, end, _, _, _, _ in device_events)
-    print(f"device busy on that queue: {busy_total / divisor / 1e6:.3f} {unit} over {len(device_events) / divisor:.1f} events")
+
+    if args.format == "table":
+        print(
+            f"\nall gaps on queue {args.queue!r}: {gap_total / divisor / 1e6:.3f} {unit}   "
+            f"A={a_total / divisor / 1e6:.3f}  B={b_total / divisor / 1e6:.3f} ({100 * b_total / gap_total:.1f} % B)   "
+            f"n={count_total / divisor:.1f}"
+        )
+        print(f"device busy on that queue: {busy_total / divisor / 1e6:.3f} {unit} over {len(device_events) / divisor:.1f} events")
+    else:
+        prefix = f"gap_device_split.{args.queue}.total"
+        print(f"{prefix}.n {count_total}")
+        print(f"{prefix}.gap_ms_x1000 {ns_to_ms_x1000(gap_total)}")
+        print(f"{prefix}.a_ms_x1000 {ns_to_ms_x1000(a_total)}")
+        print(f"{prefix}.b_ms_x1000 {ns_to_ms_x1000(b_total)}")
+        print(f"{prefix}.b_pct_x10 {round(1000 * b_total / gap_total)}")
+        print(f"{prefix}.busy_ms_x1000 {ns_to_ms_x1000(busy_total)}")
+        print(f"{prefix}.events {len(device_events)}")
+        if args.steps > 0:
+            print(f"{prefix}.gap_per_step_ms_x1000 {ns_to_ms_x1000(gap_total / args.steps)}")
+            print(f"{prefix}.a_per_step_ms_x1000 {ns_to_ms_x1000(a_total / args.steps)}")
+            print(f"{prefix}.b_per_step_ms_x1000 {ns_to_ms_x1000(b_total / args.steps)}")
+            print(f"{prefix}.busy_per_step_ms_x1000 {ns_to_ms_x1000(busy_total / args.steps)}")
     return 0
 
 
