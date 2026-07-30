@@ -7074,6 +7074,8 @@ void unified_cache::process_deferred_frees() {
     while (pin_it != inflight_unpins_.end()) {
         const bool ready = !pin_it->has_event || event_complete(pin_it->event);
         if (g_ggml_sycl_debug) {
+            // Wording asserted on by tests/test-unified-cache-unpin-event.cpp -- keep
+            // the key names ("model=", "name_hash=", "layout=", "has_event=", "ready=") stable.
             GGML_SYCL_DEBUG("[UNIFIED-CACHE] unpin check model=%llu name_hash=0x%llx layout=%d has_event=%d ready=%d\n",
                             (unsigned long long) pin_it->key.model_id, (unsigned long long) pin_it->key.name_hash,
                             (int) pin_it->layout, pin_it->has_event ? 1 : 0, ready ? 1 : 0);
@@ -7109,6 +7111,8 @@ void unified_cache::process_deferred_frees() {
                     }
                 } else {
                     entry_it->second.pinned = false;
+                    // Wording asserted on by tests/test-unified-cache-unpin-event.cpp --
+                    // keep the key names ("model=", "name_hash=", "layout=") stable.
                     GGML_SYCL_DEBUG("[UNIFIED-CACHE] in-flight unpin model=%llu name_hash=0x%llx layout=%d\n",
                                     (unsigned long long) pin_it->key.model_id,
                                     (unsigned long long) pin_it->key.name_hash, (int) pin_it->layout);
@@ -7466,6 +7470,8 @@ void unified_cache::unpin_on_event(const ggml_sycl_cache_id & key_id,
     inflight_unpins_.push_back(entry);
     if (g_ggml_sycl_debug) {
         const bool ready = entry.has_event ? event_complete(entry.event) : true;
+        // Wording asserted on by tests/test-unified-cache-unpin-event.cpp -- keep
+        // the key names ("model=", "name_hash=", "layout=", "ready=") stable.
         GGML_SYCL_DEBUG("[UNIFIED-CACHE] in-flight pin model=%llu name_hash=0x%llx layout=%d ready=%d\n",
                         (unsigned long long) key_id.model_id, (unsigned long long) key_id.name_hash, (int) layout,
                         ready ? 1 : 0);

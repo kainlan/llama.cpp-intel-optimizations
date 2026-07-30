@@ -1004,6 +1004,8 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
                 const auto mode = ggml_sycl_get_binbcast_event_mode();
                 // `source` distinguishes a configured `reuse` from one that actually
                 // took effect; a reuse run that fell back still shows submission.
+                // Wording asserted on by tests/test-unified-cache-unpin-event.cpp --
+                // keep the key names ("mode=", "source=", "pins=") stable.
                 GGML_LOG_INFO("[SYCL-BINBCAST] unpin event mode=%s source=%s pins=%d\n",
                               ggml_sycl_binbcast_event_mode_name(mode),
                               ggml_sycl_binbcast_event_source_name(

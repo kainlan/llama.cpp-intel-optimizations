@@ -1550,6 +1550,13 @@ class unified_cache {
     void * lookup_device_only(const ggml_sycl_cache_id & key, ggml_layout_mode layout);
 
     // --- DMA queue for cache operations (separate from compute) ---
+    // tests/test-unified-cache-unpin-event.cpp depends on this queue staying
+    // NON-profiling: every backend stream is created with both `in_order` and
+    // `enable_profiling` via default_queue_properties(), and on a profiling-enabled
+    // queue the bare command_execution_status query in event_complete() BLOCKS
+    // instead of polling. dma_queue_ is in_order only, no profiling -- it is the
+    // one queue where "released only after completion" is actually observable.
+    // Adding enable_profiling here would silently destroy that coverage.
     sycl::queue & get_dma_queue();
 
     // --- BCS queue for copy-only H2D transfers (targets copy engine) ---
@@ -2180,6 +2187,9 @@ class unified_cache {
     void clear_hot_experts(int layer_id);
 
     // Track cache entries pinned for in-flight kernels.
+    // tests/test-unified-cache-unpin-event.cpp drives this directly on the
+    // cache's dma_queue_, bypassing a real binbcast op, to observe the
+    // released-only-after-completion property (see get_dma_queue()).
     void unpin_on_event(const ggml_sycl_cache_id & key, ggml_layout_mode layout, const sycl::event & event);
 
     using dma_stream_slice_fn = sycl::event (*)(sycl::queue &                    queue,
