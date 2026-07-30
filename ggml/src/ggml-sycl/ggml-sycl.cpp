@@ -318,6 +318,10 @@ using ggml_sycl::moe_route_phase;
 
 static bool g_sycl_loaded          = false;
 int         g_ggml_sycl_debug      = 0;
+// Strict handle mode: surface data_handle/data_device divergence as a warning in
+// normal runs (the mismatch warnings are otherwise gated on g_ggml_sycl_debug,
+// which defaults to 0, so divergence is invisible in production). =1 warns.
+int         g_ggml_sycl_handle_strict = 0;
 int         g_ggml_sycl_debug_sync = 0;
 
 int g_ggml_sycl_tp_debug         = 0;  // Tensor Parallelism debug output (GGML_SYCL_TP_DEBUG env var)
@@ -16507,6 +16511,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_tp_debug      = get_sycl_env("GGML_SYCL_TP_DEBUG", 0);
         g_ggml_sycl_disable_graph = get_sycl_env("GGML_SYCL_DISABLE_GRAPH", 0);
         g_ggml_sycl_safe_mode     = get_sycl_env("GGML_SYCL_SAFE_MODE", 0);
+        g_ggml_sycl_handle_strict = get_sycl_env("GGML_SYCL_HANDLE_STRICT", 0);
         // Safe mode forces per-op queue drains (see ggml_sycl_compute_forward),
         // which makes graph replay meaningless — the graph is submitted as a
         // single unit and a "drain after every op" promise cannot be honored.

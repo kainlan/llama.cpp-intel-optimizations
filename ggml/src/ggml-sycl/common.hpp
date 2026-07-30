@@ -142,6 +142,7 @@ void ggml_sycl_layout_ptr_stats_dump();
 
 extern int               g_ggml_sycl_debug;
 extern int               g_ggml_sycl_debug_sync;
+extern int               g_ggml_sycl_handle_strict;
 extern int               g_ggml_sycl_tp_debug;  // Tensor Parallelism debug output
 extern int               g_ggml_sycl_prioritize_dmmv;
 extern std::atomic<bool> g_ggml_sycl_debug_forced_off;
