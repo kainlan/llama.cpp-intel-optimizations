@@ -321,6 +321,20 @@ if (NOT WIN32)
 endif()
 
 if (NOT WIN32)
+    llama_test_cmd(
+        bash
+        NAME test-sycl-handle-policy
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-handle-policy.sh
+    )
+    set_tests_properties(test-sycl-handle-policy PROPERTIES
+        LABELS "sycl;policy"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 120
+    )
+endif()
+
+if (NOT WIN32)
     # Python source-assertion test for the decode-timeline profiling pipeline.
     # Registered because tasks that modify sycl-gptoss-decode-timeline-profile.sh
     # or parse-sycl-timeline.py need a gate the lead can run; tests/ holds dozens

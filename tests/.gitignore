@@ -8,6 +8,8 @@ ggml-common.h
 !sycl-canary
 !sycl-alloc-policy-fixtures
 !sycl-alloc-policy-fixtures/**
+!sycl-handle-policy-fixtures
+!sycl-handle-policy-fixtures/**
 !e1-rca
 !data
 !data/planner-canaries
