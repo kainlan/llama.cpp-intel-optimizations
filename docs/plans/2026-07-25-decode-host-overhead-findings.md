@@ -1720,6 +1720,7 @@ git worktree and survive a reboot:
 | `/Apps/llama.cpp-captures/2026-07-30-red-barrier-s1/` | RED baseline: `sycl-timeline.json` (77.4 MB), `sycl-kernels.json` (33.6 MB), `sycl-kernels.csv`, `bench.stdout/stderr`, `gap-causes.txt`, `load.before/after`, `HEAD.sha` |
 | `/Apps/llama.cpp-captures/2026-07-30-green-reuse-s1/` | GREEN (`reuse`): same file set, `sycl-timeline.json` 70.2 MB |
 | `/Apps/llama.cpp-captures/2026-07-30-ab-interleaved/` | 20 `llama-bench` runs (10 pairs × 2 arms), stdout + stderr each, `load.before/after/after2`, `HEAD.sha` |
+| `/Apps/llama.cpp-captures/2026-07-30-correctness-gates/` | Mistral gate, both modes: `mistral-{default,reuse}.txt` + `.stderr`, `load.before/after`, `HEAD.sha` (see Correctness below) |
 
 Both trace directories were confirmed non-empty and parseable **before** any
 analysis. Env block copied verbatim from the plan's Task 1 (all 12 variables),
@@ -1850,9 +1851,34 @@ to `SUBMISSION` would fail, and it passes.
 
 ### The decisive evidence: the gap survives the removal of its alleged cause
 
-`parse-sycl-gap-causes.py --steps 100`, `--wall-ms` left at each trace's own
-envelope (RED 2369.100 ms, GREEN 2318.355 ms — parser defect 3 respected, no
-derived window):
+Both arms parsed with the exact same invocation:
+
+```bash
+python3 scripts/parse-sycl-gap-causes.py --steps 100 --top-transitions 12 <trace>
+```
+
+**No `--wall-ms` was passed, because `parse-sycl-gap-causes.py` has no such
+flag** — its parser exposes only `trace`, `--queue`, `--top-transitions` and
+`--steps` (`scripts/parse-sycl-gap-causes.py:331-354`). The flag belongs to the
+sibling `parse-sycl-timeline.py`, which this script loads as a module without a
+wall-ms passthrough; earlier Task sections in this doc invoke that script
+directly, which is where the phrasing "`--wall-ms` set to the window's own
+envelope" comes from. It does not apply here.
+
+**Parser defect 3 cannot affect these figures at all**, which is a stronger
+statement than "respected". This script never uses a wall-clock window: gaps are
+computed between consecutive events' own `device_start_ns` / `device_end_ns`
+(`:163`, same device clock as `device_submit_ns`), and the only divisor is
+`--steps`, applied as `total / args.steps` (`:381`, `:401`). There is no derived
+window for it to get wrong. `--steps 100` matches
+`GGML_SYCL_TIMELINE_TOKEN_COUNT=100`, verified against the capture: markers span
+`node_step` 15–114 inclusive, exactly 100 distinct steps.
+
+The envelope figures quoted below and in the table above (RED 2369.100 ms, GREEN
+2318.355 ms) were **not** fed to the parser. They are computed separately from
+each trace's own device timestamps — `max(device_end_ns) − min(device_start_ns)`
+over all `sycl.event` records — and are reported only to document the window's
+size:
 
 | class / cause | RED ms/step | GREEN ms/step | Δ ms/step |
 |---|---:|---:|---:|
@@ -1945,12 +1971,35 @@ design would have converted into a fake effect.
 
 Mistral completion gate on the **B70** (`level_zero:0`, deliberately staying off
 device 1 where a reviewer may be running `ctest -R unpin-event`), both modes,
-byte-identical and correct:
+byte-identical and correct. **Durable artifacts:**
+`/Apps/llama.cpp-captures/2026-07-30-correctness-gates/` — `mistral-default.txt`,
+`mistral-reuse.txt`, the matching `.stderr` for each, `HEAD.sha`,
+`load.before/after`.
 
 ```
-=== mode=default ===   1, 2, 3, 4, 5, 6, 7, 8, 9, 10
-=== mode=reuse   ===   1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+$ cat mistral-default.txt
+ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+
+$ cat mistral-reuse.txt
+ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+
+$ cmp mistral-default.txt mistral-reuse.txt   # → identical, 32 bytes each
 ```
+
+Run with `timeout 300` and `GGML_SYCL_OP_TIMEOUT_MS=180000`; both exited 0.
+Backend confirmed present per run, not merely assumed: each `.stderr` carries
+`[SYCL] GGML_SYCL_F16 build: attention Q/accumulators are f16`, and TG measured
+**64.03 t/s** (default) / **63.51 t/s** (`reuse`) — an order of magnitude above
+the ~8 t/s that a CPU fallback produces on this model, which is the failure the
+digit gate is blind to.
+
+These two runs were taken at `051a86ba6`, a **docs-only** commit on top of the
+`aa135af89` that produced every measurement above:
+`git diff --name-only aa135af89..051a86ba6` lists this findings document and
+nothing else, 0 files under `ggml/`, `src/`, `common/` or `tools/`, and
+`build/bin/libggml-sycl.so.0.15.3` and `build/bin/llama-completion` both still
+carry their 00:42 build timestamps. The gated binary is therefore the same one
+the captures and the A/B ran on.
 
 ⚠️ **The weight-cache unpin consumer is NOT exercised by anything above.** With
 `pin_count == 0` in every configuration measured here (`llama.cpp-g6iw`,
