@@ -6,6 +6,27 @@
 
 > **Status 2026-07-25:** Tasks 1, 2 and 6 are done. Task 2 **relocated Cluster A above this backend** (its 2.324 ms/step window is 0.5 % covered by ggml-sycl instrumentation), so Task 3 correctly wrote no fix plan. **The remaining in-scope target is Cluster B, ~6.37 ms/step**, via Tasks 4 → 5, with Task 7 for its residual.
 
+> ⚠️ **Update 2026-07-29 — the captures are GONE, and it changes the task graph.**
+> `/tmp/steady-slice*` did not survive the reboot at **2026-07-27 15:36** (verified: nothing
+> under `/tmp`, `/var/tmp`, or the repo; no `sycl-timeline*.json` anywhere). This is the
+> tmpfs hazard `CLAUDE.md` records, for the second time on this host.
+>
+> Consequences, both load-bearing:
+>
+> 1. **Task 7 can no longer "re-analyse the Task 1 capture"** — that input does not exist.
+>    It must re-analyse a *fresh* capture, which makes it depend on Task 4's capture instead
+>    of being the independent no-GPU track the topology below claims.
+> 2. **Task 4 cannot diff against the old baseline.** It needs a fresh RED capture of its
+>    own. The *shares* published in the findings doc remain usable as a sanity reference;
+>    the absolute per-step milliseconds are not comparable across the reboot.
+>
+> The published numbers themselves are unaffected — they live in the findings doc as text,
+> not in the wiped directory. What is lost is the ability to re-query the raw events.
+>
+> **All future captures must be written outside `/tmp`.** An empty or missing artifact
+> directory means *not verified*, never "nothing observed" — a `grep` over it passes
+> vacuously.
+
 **Selected by:** Plan A's decision table, applied to Task 9's `DOMINANT CLASS: runtime_idle at 56.3%` → *"reduce launch count (batching, graphlets); per-op caching buys nothing."* Task 10 then re-analysed the same capture class-first and narrowed *which* launches.
 
 **Tech Stack:** C++17 / SYCL (Intel oneAPI DPC++ 2026.1), Python 3, CMake/CTest, Arc Pro B70 (`level_zero:0`).
@@ -65,6 +86,21 @@ This is the same discipline Plan A's scope boundary applied, and for the same re
 | A | 2, 3 | Inter-token bubble: attribute the host window, then fix |
 | B | 4, 5 | `binbcast.event` no-op: establish causation, then remove |
 | C | 6, 7 | Parser semantics + residual per-layer attribution (independent, no GPU) |
+
+**Revised execution, 2026-07-29** (tracker `llama.cpp-zc8v`, `-tme0`, `-kjj9`, `-hzgc`,
+`-79m7`). With the capture wiped, Task 7 is no longer GPU-independent, so the remaining
+work splits differently — by *what needs the card* rather than by cluster:
+
+| id | was | what it is | needs B70? |
+|----|-----|------------|-----------|
+| `llama.cpp-zc8v` | T4 code half | plumb the kernel's own event out; `reuse` mode, opt-in, default off | no (B50 gates only) |
+| `llama.cpp-tme0` | T7 parser half | classify **implicit** in-order serialization, which `device_gap_has_dependency` cannot see | no (pure Python) |
+| `llama.cpp-kjj9` | T4 measurement half | fresh paired capture + interleaved A/B + causation verdict | **yes** |
+| `llama.cpp-hzgc` | T7 verdict half | residual per-layer attribution, from `-kjj9`'s capture | no (re-analysis) |
+| `llama.cpp-79m7` | T5 | default flip, or written no-fix row | yes, only if flipping |
+
+`-zc8v` and `-tme0` are genuinely parallel (disjoint files, disjoint hardware). Everything
+after them serialises on the single B70.
 
 ### Dependency Graph
 
@@ -259,7 +295,13 @@ Resolved to `"union"`. `device_gap_has_host_overlap` now dispatches through `hos
 
 **Why:** If Task 4 shows the marker is causal, ~0.87 ms/step of Cluster B still sits in transitions it does not touch — `rope → set_rows.generic` (0.863), `rope → rope` (0.632), `set_rows.generic → binbcast.mul` (1.708, partly). These are 24×/step, so they are per-layer, and they are the KV-cache write path.
 
-**Do:** Re-analyse the Task 1 capture for these transitions specifically. Given the `queue_serialization` correction above, explicitly test whether in-order queue serialization — invisible to `device_gap_has_dependency` — explains them, before concluding launch overhead does.
+⛔ **"No GPU" no longer holds, and neither does the input.** The Task 1 capture this task was
+written to re-analyse was destroyed by the 2026-07-27 reboot (see the status note at the top).
+This task now depends on the fresh capture taken by `llama.cpp-kjj9`, and is split in two:
+`llama.cpp-tme0` builds the classifier it needs (no GPU, parallelisable), `llama.cpp-hzgc`
+writes the verdict from `-kjj9`'s capture.
+
+**Do:** Re-analyse the capture from `llama.cpp-kjj9` for these transitions specifically. Given the `queue_serialization` correction above, explicitly test whether in-order queue serialization — invisible to `device_gap_has_dependency` — explains them, before concluding launch overhead does. That test needs a classifier that can *see* implicit serialization; building it is `llama.cpp-tme0`, and this task must not hand-wave it from `queue_serialization ≈ 0`, which the plan already withdrew as evidence.
 
 **Gate:** A written verdict naming which mechanism dominates, appended to the findings doc, with the evidence that distinguishes the two. "Unclear" is an acceptable verdict; a guess is not.
 
