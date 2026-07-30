@@ -2092,3 +2092,356 @@ Scope: this is a claim about predecessor-keyed transition rankings, not about th
 gap classifier itself. The class totals (`host_overlap` / `queue_serialization` /
 `runtime_idle`) are computed per gap and do not depend on which event's name the
 gap is filed under.
+
+## Task 15 (`llama.cpp-hzgc`) — Cluster B is not idle: it is device work the kernel profiler never records
+
+**Verdict: the dominant mechanism is unrecorded device execution, not launch
+overhead and not idleness.** Between **78 % and 85 %** of Cluster B's
+5.306 ms/step is occupied by ggml-sycl kernels that must run in those windows and
+that the kernel profiler does not label, so the gap classifier cannot see them
+and files them under `truly_idle` by construction. The residual — roughly
+**0.8–1.2 ms/step inside the trio** — is genuine host-side dispatch latency.
+
+The instrument is not broken; it is *narrower than the taxonomy built on top of
+it*. `ggml_sycl_profile_label` is opt-in per submission site, and on this decode
+path exactly **11** kernels carry one. Every dense matmul in the step — the
+attention Q/K/V/O projections, the MoE router, the MoE down projection, and the
+201088-row output head — is unlabelled. A "gap" between two labelled kernels is
+therefore not evidence that the device was idle, and `truly_idle` on this capture
+is better read as *unattributed*, which is where Task 14 correctly left it.
+
+This section re-attributes it. No new capture and no GPU work: it re-analyses the
+same two durable captures Task 14 took, at the same `aa135af89` binary.
+
+Where this lands relative to Task 14: Task 14 showed the marker is not the cause
+and warned that `binbcast.mul` is only the new neighbour. That warning holds —
+`binbcast.mul` is *not* the cause here either. What sits in these gaps is the op
+that consumes `binbcast.mul`'s output, which is a data-dependency argument, not an
+adjacency one (see *Why this is not the adjacency mistake again* below).
+
+### Method, and the two numbers that close the books
+
+Everything below is derived from the GREEN (`reuse`) capture
+`/Apps/llama.cpp-captures/2026-07-30-green-reuse-s1/sycl-timeline.json` and
+cross-checked against RED. Three device-clock fields are used and no cross-clock
+comparison is made anywhere: `device_submit_ns`, `device_start_ns`,
+`device_end_ns`. `host_submit_*_us` is used only for host-to-host intervals,
+never against a device timestamp — the trap `llama.cpp-tme0` guarded.
+
+The re-derivation reproduces the published class totals exactly, which is the
+check that the analysis is looking at the same gaps:
+
+| quantity, GREEN compute queue | this section | published (Task 14 / `gap-causes.txt`) |
+|---|---:|---:|
+| device busy | 4.993 ms/step | — |
+| all gaps | 18.180 ms/step | 8.702 `host_overlap` + 9.478 `runtime_idle` = **18.180** |
+| busy + gaps = window envelope | 23.173 ms/step | 2318.355 ms / 100 = **23.184** |
+| `binbcast.mul --to-- rope` | 1.670 ms/step, n 2300 | **1.670**, n 2300 |
+| `binbcast.mul --to-- get_rows.marker` | 2.306 ms/step, n 99 | **2.306**, n 99 |
+
+So nothing is missing from the accounting of the *timeline*. What is missing is
+missing from the *instrumentation*.
+
+New script, read-only, added by this task:
+**`scripts/parse-sycl-gap-device-split.py`**. It adds one column the sibling
+parsers do not have and reclassifies nothing. `parse-sycl-gap-causes.py` and
+`parse-sycl-timeline.py` are untouched.
+
+```bash
+python3 scripts/parse-sycl-gap-device-split.py --steps 100 --top-transitions 22 \
+    /Apps/llama.cpp-captures/2026-07-30-green-reuse-s1/sycl-timeline.json
+```
+
+### Step 1 — The profiler labels 11 kernels; the step's dense matmuls are not among them
+
+`sycl-kernels.json` is definitive, because it is the profiler's own kernel table
+rather than a view of it: **11 distinct kernels for the entire run**, from 11
+distinct submission functions across 52212 `raw_events`.
+
+| labelled kernel | submitting function | per decode step |
+|---|---|---:|
+| `sycl.binbcast.mul` / `.add` | `ggml_sycl_op_mul` / `_add` | 72 / 72 |
+| `sycl.rope` | `ggml_sycl_op_rope` | 48 |
+| `sycl.set_rows.generic` | `set_rows_sycl` | 48 |
+| `sycl.softmax.forward` | `ggml_sycl_op_soft_max` | 24 |
+| `mxfp4.quantize.activation_q8_soa` / `.pack_q8` / `.gateup` | `mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa` and friends | 24 each |
+| `sycl.get_rows.marker` | `ggml_sycl_op_get_rows` | 3 |
+| `sycl.memcpy.mem_ops` / `.mem_fill` | `mem_copy_submit` / `mem_fill_submit` | 50 (copy queue) |
+
+That is 339 compute-queue events per step. The graph has **1374 nodes**, of which
+**460** open a `ggml.op compute_forward_node` span
+(`ggml/src/ggml-sycl/ggml-sycl.cpp:80273`). Two separate coverage holes therefore
+exist, and they compound:
+
+1. **Ops with a host node span but no device event at all**: `FLASH_ATTN_EXT`
+   (24/step), `ADD_ID` (72/step), `GLU` (24/step), `CPY` (24/step), `MUL_MAT`
+   (1/step, `result_output`), `GET_ROWS` (24 of 27/step). Their kernels are
+   submitted from unlabelled sites.
+2. **Ops absent from the host node stream too**, because the node loop (from
+   `ggml-sycl.cpp:79358`) `continue`s past the timeline scope on its fusion
+   fast-paths — `fused_nodes.count(node)` at `:79384`, the RMS_NORM+quantize
+   fusion that marks "MUL and all MUL_MAT consumers as fused" at `:79512-79517`,
+   the precomputed-`MUL_MAT_ID` early skip at `:80223`. `RMS_NORM` never appears
+   once, and neither does any attention-projection `MUL_MAT`.
+
+Host-side node op census, per step, for the record: `MUL` 72, `ADD_ID` 72,
+`ADD` 72, `ROPE` 48, `SET_ROWS` 48, `GET_ROWS` 27, `CPY` 24, `FLASH_ATTN_EXT` 24,
+`SOFT_MAX` 24, `MUL_MAT_ID` 24, `GLU` 24, `MUL_MAT` 1.
+
+⚠️ **Consequence for every figure in this document derived from
+`compute_forward_node` coverage.** `host_overlap` vs `truly_idle` on this capture
+is decided in large part by whether the nodes that fill a gap happen to open that
+scope. The clearest demonstration is a matched pair, both containing an
+unlabelled dense matmul, differing only in instrumentation:
+
+| gap | mean gap | host interval | inside an instrumented node | class |
+|---|---:|---:|---:|---|
+| `gateup --to-- binbcast.mul` (contains MoE **down** proj, plus `ADD_ID`/`GLU` nodes, which *are* scoped) | 212.97 µs | 388.82 µs | 381.57 µs (98 %) | `host_overlap` |
+| `binbcast.mul --to-- rope` (contains **Q** proj, whose nodes are `continue`d past the scope) | 72.62 µs | 63.17 µs | 5.86 µs (9 %) | `truly_idle` |
+
+Both are unrecorded matmuls. One reads as the host working, the other as nobody
+working. `hostint − hostcov` is *not* idle host time; it is uninstrumented host
+time.
+
+### Step 2 — What must execute inside each Cluster B gap, from data dependency alone
+
+This is the step that makes the attribution a dependency claim rather than an
+adjacency claim. Every ggml-sycl GPU queue is in-order, so an op that **consumes**
+a labelled kernel's output and **produces** the next labelled kernel's input can
+only execute between them. The endpoints identify themselves: the events carry
+`node_tensor`.
+
+| transition | endpoints (verified, n) | what is pinned inside, and why |
+|---|---|---|
+| `binbcast.mul --to-- rope` | `attn_norm-N` → `Qcur-N`, N = 1..23, 100/100 steps each | `Qcur-N = attn_q × attn_norm-N`. Consumes the `mul`'s output, produces the `rope`'s input. |
+| `rope --to-- rope` | `Qcur-N` → `Kcur-N` | K projection. |
+| `rope --to-- set_rows` | `Kcur-N` → `cache_k_lN` | V projection (graph nodes 68–71 of the layer's 57-node stride). |
+| `set_rows --to-- binbcast.mul` | `cache_v_lN` → `attn_post_norm-N` | `FLASH_ATTN_EXT` (no compute-queue event) **and** the O projection. |
+| `binbcast.mul --to-- softmax.forward` | `attn_post_norm-N` → the router logits | `ffn_gate_inp` matmul + top-k. The softmax operates on its output. |
+| `binbcast.mul --to-- get_rows.marker` | `result_norm` (node **1372**) → next step's `embd` (node 0), n=99 | node **1373** = `result_output`, the only node in the window. |
+
+The `binbcast.mul` predecessor cannot itself be the cause of any of these: it is
+2.5 µs of device time on a 2880-element tensor. It is the *producer of the input*
+to the op that fills the gap.
+
+### Step 3 — Decomposing every gap on the device clock
+
+For each gap, on the device profiling clock:
+
+- **A** = `clamp(device_submit_ns(next) − device_end_ns(prev), 0, gap)` — the
+  successor was not yet submitted.
+- **B** = `gap − A` — the successor **was** submitted and still did not start.
+  On an in-order queue that is earlier queued work still executing, plus the bare
+  dispatch latency.
+
+The dispatch-latency floor is calibrated from transitions with **no** intervening
+graph node (equal `node_idx`, i.e. successive kernels of one fused dispatch):
+`quantize --to-- pack_q8` B = 0.35 µs, `pack_q8 --to-- gateup` B = 0.44 µs,
+`binbcast.add --to-- binbcast.add` B = 0.72 µs. So B ≳ 1 µs is queued work, and
+B of tens of microseconds is unrecorded device execution.
+
+GREEN, per step, ranked by gap; RED in brackets where it differs:
+
+| transition | n/step | gap ms/step | mean µs | A µs | B µs | B % |
+|---|---:|---:|---:|---:|---:|---:|
+| `gateup --to-- binbcast.mul` | 24 | 5.111 | 212.97 | 212.88 | 0.09 | 0.0 |
+| `set_rows --to-- binbcast.mul` | 23 | 2.323 | 101.00 | 99.78 | 1.23 | 1.2 |
+| `binbcast.mul --to-- get_rows.marker` | 0.99 | 2.306 | 2329.42 | 2329.20 | 0.23 | 0.0 |
+| `softmax --to-- quantize` | 24 | 2.124 | 88.49 | 88.40 | 0.10 | 0.1 |
+| `binbcast.mul --to-- rope` | 23 | 1.670 | 72.62 | 67.65 | 4.97 | 6.8 |
+| **`binbcast.mul --to-- softmax.forward`** | 24 | 1.372 | 57.15 | 26.73 | **30.42** | **53.2** [30.83 RED] |
+| `rope --to-- set_rows` | 24 | 0.866 | 36.07 | 34.59 | 1.48 | 4.1 |
+| `rope --to-- rope` | 24 | 0.637 | 26.56 | 25.24 | 1.32 | 5.0 |
+| **all compute-queue gaps** | 339 | **18.180** | | **17.120** | **1.060** | 5.8 |
+
+**The `softmax` row is a direct measurement, not an inference: 0.730 ms/step
+(24 × 30.42 µs) of already-submitted work that the in-order compute queue would
+not start**, 42–87× the dispatch floor, reproduced in RED at 30.83 µs. Nothing
+labelled was running. That is unrecorded device work, and it also settles that
+these unlabelled kernels share the in-order compute queue rather than running on
+a second queue.
+
+B is *not* the total unrecorded device time — it only catches work still running
+at the instant the successor is submitted. A gap can be fully device-busy with
+B ≈ 0 whenever the host submits the successor after the unrecorded kernel has
+drained, which is the normal case here. So B is a floor, and the next step is
+needed to reach the rest.
+
+### Step 4 — Roofline: the bytes have to move, and there is only one place they can move
+
+Weight bytes read per decode step, from the GGUF tensor table
+(`/Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf`, 24 layers, 32 experts, 4 used;
+experts MXFP4 = 17 B per 32 weights, attention and both embedding matrices Q8_0 =
+34 B per 32):
+
+| tensor | per step | labelled kernel? |
+|---|---:|---|
+| `ffn_gate_exps` + `ffn_up_exps`, 4/32 | 846.0 MB | **yes** — `mxfp4.gateup`, 4.302 ms/step |
+| `output.weight` (201088 × 2880, Q8_0) | 615.3 MB | no |
+| `ffn_down_exps`, 4/32 | 423.0 MB | no |
+| `attn_q` | 300.8 MB | no |
+| `attn_output` | 300.8 MB | no |
+| `attn_k` + `attn_v` | 75.2 MB | no |
+| `ffn_gate_inp` (f32 router) | 8.8 MB | no |
+| **unlabelled total** | **1724.0 MB** | |
+
+KV-cache traffic is negligible in this window (context ≈ 115 tokens) and is
+ignored throughout.
+
+Two bandwidth anchors, both taken from the capture itself rather than from a
+datasheet:
+
+- **Anchor 1, measured:** `mxfp4.gateup` moves 846.0 MB in 4.302 ms/step →
+  **196.7 GB/s**. The only kernel in the capture whose bytes *and* time are both
+  known. It is MXFP4 with in-kernel dequant, so it may be partly compute-bound,
+  which makes it a conservative (slow) yardstick for the Q8_0 paths.
+- **Anchor 2, implied floor for Q8_0:** `output.weight`'s 615.3 MB must fit
+  inside its own 2.306 ms window, so the Q8_0 path achieves **≥ 266.8 GB/s**.
+  Using this for the Q8_0 tensors is the conservative choice — it *shrinks* every
+  attention-projection estimate below.
+
+At those anchors the unlabelled work is **7.0–8.8 ms/step of device time**, i.e.
+**39–48 % of the 18.180 ms/step that the classifier calls "gap"**. Sanity check
+in the other direction: labelled busy 4.993 + unlabelled ~7.0 = ~12.0 ms of a
+20.8 ms unprofiled step, which is the shape a memory-bound decode should have.
+
+### The verdict, per transition
+
+Cluster B, the three transitions in Task 14's table, using the parser's own
+`runtime_idle` totals:
+
+| transition | ms/step | pinned inside | device floor | attributed |
+|---|---:|---|---:|---:|
+| `binbcast.mul(result_norm) --to-- get_rows.marker(embd)` | 2.306 | `result_output`, 615.3 MB | ≥ 2.306 (window-limited) | **100 %** |
+| `binbcast.mul(attn_norm-N) --to-- rope(Qcur-N)` | 1.670 | `attn_q` × 23 = 288.3 MB | 1.081 (anchor 2) – 1.466 (anchor 1) | **65–88 %** |
+| `binbcast.mul(attn_post_norm-N) --to-- softmax.forward` | 1.330 | router matmul + top-k | 0.730 (measured B) | **≥ 55 %** |
+| **total** | **5.306** | | **4.12–4.50** | **78–85 %** |
+
+At anchor 1 the output head needs 3.129 ms and its window is 2.306 ms — it
+*over*-subscribes, which is exactly why anchor 2 exists. Either way that window
+is device-bound end to end.
+
+The router row is the one where roofline is useless (8.8 MB is 0.045 ms) and the
+measurement carries it instead: a 2880 × 32 GEMV plus a top-k is latency- and
+occupancy-bound, not bandwidth-bound, and B says 30.4 µs of it per layer.
+
+**Residual: 0.80–1.19 ms/step, and it has a name.** It is host dispatch latency
+inside the uninstrumented fusion fast-paths — visible as the host's own hole
+between the instrumented node spans that bracket each gap: 57.32 µs mean for
+`MUL --to-- ROPE` (n=23/step), against a 72.62 µs device gap whose device floor
+is 47–64 µs. Host and device are near-balanced and concurrent there; the device
+work is the hard floor, so at most 12–35 % of that transition is recoverable by
+making the host faster.
+
+### The n=99 inter-token transition: Task 12's measurement stands, its reading does not
+
+The lead's brief asked for this to be called out explicitly, and there **is** new
+evidence, so the "out of scope" answer does not survive.
+
+Task 12 measured 0.5 % ggml-sycl coverage of the inter-graph window and `ggml.op`
+at exactly 0.00 %, and concluded the window is "empty of ggml-sycl work". The
+measurement reproduces here — `hostcov` is 94.64 µs of a 2326.38 µs host interval,
+4 % — and the `result_output` node's host span is only 63.94 µs, consistent with
+it. But the window is **not empty of ggml-sycl work**: node 1373 is
+`result_output`, the 615.3 MB Q8_0 output head, it is the only node between the
+two endpoints, and it cannot execute anywhere else. Its host dispatch is 64 µs;
+its device execution is ~2.3 ms.
+
+What Task 12 measured is that the **host** is not doing ggml-sycl work there. It
+is not: it is blocked in `llama_synchronize` waiting for logits it cannot read
+until the head completes, and only then samples and submits the next step —
+which is also why B ≈ 0.23 µs on this transition, the queue having drained by
+then. Both facts are true. The window is host-idle and device-busy.
+
+So this transition is **not** host overhead above the backend, and it is not the
+inter-token boundary cost the plan's Task 2/12 relocated. It is one unlabelled
+matmul. Its fix is a faster output head (or a smaller one — 201088 rows at 11 %
+of the whole step is the single largest unlabelled item), not anything in
+`llama_decode`.
+
+### What genuinely is launch overhead — and it is not in the Cluster B trio
+
+The transitions where the roofline floor is *small* relative to the gap are the
+real host-side dispatch cost, and Plan phase 2 Task 7's original spec had already
+named two of them before Cluster B was scoped from the transition table:
+
+| transition | ms/step | pinned inside | device floor | host-bound residual |
+|---|---:|---|---:|---:|
+| `rope(Kcur) --to-- set_rows(cache_k)` | 0.850 | V projection, 37.6 MB | 0.141–0.191 | **0.66–0.71** |
+| `rope(Qcur) --to-- rope(Kcur)` | 0.636 | K projection, 37.6 MB | 0.141–0.191 | **0.45–0.50** |
+| `set_rows(cache_v) --to-- binbcast.mul` | 1.856 | O projection 288.3 MB + flash attn | ≥ 1.081–1.466 | 0.39–0.78 |
+| `binbcast.add --to-- binbcast.{mul,add}` and other short hops | ~0.44 | nothing large | ~0 | ~0.44 |
+
+Summing the device floor over every `runtime_idle` row — output head 2.306,
+Q projection 1.081–1.466, router 0.730 (measured B), O projection 1.081–1.466,
+V 0.141–0.191, K 0.141–0.191, layer-0 Q 0.047–0.064 = **5.53–6.41 ms/step** — the
+host-side dispatch latency in that class is 9.478 minus that, i.e. **~3.1–4.0
+ms/step**. It is an *upper* bound: `FLASH_ATTN_EXT`'s device time is counted
+nowhere in the floor (it streams almost no weight bytes, so roofline says nothing
+about it, and it has no event at all). That is a real target
+and it is roughly what an Amdahl-style launch-overhead story would want — but it
+is spread across ~48 gaps/step at 5–35 µs each, not concentrated in one 5.5 ms
+hotspot. Any fix is "submit more per host step" (batching, graphs, fewer
+dispatches), not a change to one op.
+
+### Why this is not the adjacency mistake again
+
+Task 14's warning is the reason this section is built the way it is.
+`binbcast.mul` is named nowhere in the verdict as a cause. The claims are:
+
+1. **Dependency, not adjacency.** Each attributed op consumes the predecessor's
+   output tensor and produces the successor's input tensor, verified from
+   `node_tensor` on both endpoints across all 100 steps. Deleting `binbcast.mul`
+   would move the label and leave the gap, exactly as deleting the marker did —
+   the attribution does not rest on which name the gap is filed under.
+2. **A measurement the transition table cannot produce.** The 0.730 ms/step of
+   B on the softmax transition is queue-observable regardless of labels.
+3. **A conservation argument.** 1724 MB/step of weights are read by kernels that
+   have no event in the trace at all. That is true independently of every
+   transition ranking in this document.
+
+### How to falsify this
+
+Cheapest first. All are GPU runs and were out of scope for this task.
+
+1. **Instrumentation ablation — the direct analogue of Task 14's marker
+   deletion, run in reverse.** Add `ggml_sycl_profile_label` to the unlabelled
+   submission sites: the generic (non-MXFP4) mmvq / unified-matmul path, `fattn`,
+   `ADD_ID`, `GLU`, `CPY`, non-marker `GET_ROWS`. Re-capture with the identical
+   env block. **Prediction:** compute-queue device busy rises from 4.993 to
+   ~12 ms/step; `truly_idle` falls by ≥ 3.5 ms/step; and the three Cluster B
+   transitions *vanish from the transition table entirely*, because
+   `binbcast.mul` stops being adjacent to `rope` / `softmax` / `get_rows.marker`.
+   **Refuted if** `truly_idle` stays near 9.5 ms/step with the new events merely
+   inserted around the existing gaps.
+2. **`GGML_SYCL_OP_TIMING=1`.** Drains the queue per op, so it reports device
+   time for `MUL_MAT`/`FLASH_ATTN_EXT`/`ADD_ID` directly, without new labels.
+   It destroys pipelining and inflates totals, so read only the *per-op* figures.
+   **Prediction:** `result_output` ≈ 1.5–2.3 ms, each `attn_q`/`attn_output`
+   ≈ 1.1–1.5 ms per step aggregate. **Refuted if** the head comes in at tens of
+   microseconds.
+3. **A B50 capture.** The B50 has half the bandwidth. A bandwidth-bound
+   attribution predicts the three Cluster B gaps scale with bandwidth; a
+   launch-overhead attribution predicts they barely move, host dispatch cost
+   being device-independent. This is the cleanest discriminator of the two
+   candidate mechanisms and it needs no code change at all.
+
+### What this means for the plan
+
+- **Cluster B is closed as a launch-overhead target.** ~78–85 % of it is device
+  execution that cannot be launched away. `binbcast.cpp` was already exonerated
+  by Task 14; nothing else in that trio is a dispatch-side fix either.
+- **The plan's phase-2 premise needs re-scoping, not re-pointing.** The
+  actionable host-side launch overhead is ~2.5–3.5 ms/step spread across ~48
+  gaps/step — a batching problem, and one whose ceiling is well below the 5.5 ms
+  Cluster B appeared to offer.
+- **The largest single unlabelled item is the output head**, 615.3 MB and ~2.3 ms
+  of every 20.8 ms step (11 %). It has never appeared in any budget in this
+  document because it has no event in the trace.
+- **Before any further gap-class attribution on this backend, close the
+  instrumentation hole (falsification test 1).** Every `truly_idle` figure in
+  this document — 9.602 ms/step in Task 6, 9.723/9.472 in Task 14 — is a mixture
+  of device work and host latency in an unknown ratio, and no amount of
+  transition-table analysis can separate them. This section separates ~40 % of it
+  by a roofline argument; labelling the remaining kernels would separate all of
+  it by measurement.
