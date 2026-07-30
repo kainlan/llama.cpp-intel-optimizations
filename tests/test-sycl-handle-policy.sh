@@ -18,4 +18,18 @@ if "$CHECKER" "$ROOT_DIR/tests/sycl-handle-policy-fixtures/bad-unchecked" >/dev/
     exit 1
 fi
 
+# Each false-negative case gets its OWN directory and its own assertion. Sharing
+# one bad-* directory would let a regression hide: the directory keeps failing
+# on the other violation, so the gate stays green while the case it was meant to
+# lock in has silently stopped being detected.
+if "$CHECKER" "$ROOT_DIR/tests/sycl-handle-policy-fixtures/bad-comment-before" >/dev/null 2>&1; then
+    echo "expected comment-before-assignment fixture to fail policy check" >&2
+    exit 1
+fi
+
+if "$CHECKER" "$ROOT_DIR/tests/sycl-handle-policy-fixtures/bad-comment-after" >/dev/null 2>&1; then
+    echo "expected comment-after-assignment fixture to fail policy check" >&2
+    exit 1
+fi
+
 "$CHECKER" "$ROOT_DIR/ggml/src/ggml-sycl"

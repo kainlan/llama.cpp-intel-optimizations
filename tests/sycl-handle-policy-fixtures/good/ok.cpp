@@ -37,3 +37,8 @@ void use_preceding_guard(const fake_extra * extra, int id) {
     }
     (void) gate_ptr;
 }
+
+// Regression: a violation quoted inside an ordinary explanatory comment is NOT
+// a dereference. This file and the backend both comment heavily, so a checker
+// that reads comments breaks the gate on unrelated changes.
+// Example: char * src_ptr = (char *) extra->data_device_ptr(id);
