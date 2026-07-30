@@ -4,15 +4,44 @@ Full catalog of `GGML_SYCL_*` tuning/debug variables for this fork's SYCL
 backend. `CLAUDE.md` keeps only the handful of load-bearing performance
 opt-outs; everything else lives here.
 
-There are 240+ `GGML_SYCL_*` variables in the tree. To find any not listed
-here, search the source:
+There are **~600** `GGML_SYCL_*` variables in the tree (599 distinct quoted
+names under `ggml/src/ggml-sycl/` as of 2026-07-30); this file documents 48 of
+them. The header used to claim "240+", which is low by more than half.
+
+⚠️ **The recipe this section used to give was unsound and silently
+under-reported.** It was:
 
 ```bash
-# codescout (preferred in this repo):
-#   search_text  getenv\("GGML_SYCL[A-Z_]*"   scope=ggml/src/ggml-sycl/
-# or shell:
 grep -rhoE 'getenv\("GGML_SYCL[A-Z_]*"' ggml/src/ggml-sycl/ | sort -u
 ```
+
+It finds 488 of 599 — missing ~111 (19%) while looking like it succeeded. Two
+independent defects:
+
+1. **`getenv\("` misses the wrappers.** This backend reads env through ~35
+   distinct accessors, not one: `get_sycl_env`, `mix_env`, `parse_env_int`,
+   `parse_env_mb_value`, `ggml_sycl_env_is_set`, the `ggml_sycl_dump_*_path`
+   family, and more. Vars read *only* via a wrapper are invisible — including
+   `GGML_SYCL_DISABLE_GRAPH` and `GGML_SYCL_DISABLE_DNN`, which `CLAUDE.md`
+   lists as load-bearing.
+2. **`[A-Z_]*` excludes digits**, so a name containing one never even reaches
+   the closing quote and is dropped entirely: `GGML_SYCL_FA_XMX_V1`,
+   `GGML_SYCL_DMMV_USE_Q8`, `GGML_SYCL_B50_LOCAL_AGG`,
+   `GGML_SYCL_DEBUG_SET_TENSOR_I32`, ...
+
+Match the **name**, not the accessor, and allow digits:
+
+```bash
+# Every GGML_SYCL_* string literal, whatever reads it.
+{ cat ggml/src/ggml-sycl/*.cpp ggml/src/ggml-sycl/*.hpp; } \
+  | grep -oE '"GGML_SYCL[A-Z0-9_]*"' | sort -u
+```
+
+Note the `cat ... | grep` form is deliberate: codescout's index **silently
+skips `ggml-sycl.cpp` as oversize** (it reports `skipped: {reason: "oversize"}`),
+and that file holds most of the env reads — so `search_text` alone will miss
+them. A command-position in-repo grep is redirected by a hook; a downstream
+pipe grep is not.
 
 ## Performance-critical (all default ON, opt-out)
 
@@ -42,7 +71,7 @@ grep -rhoE 'getenv\("GGML_SYCL[A-Z_]*"' ggml/src/ggml-sycl/ | sort -u
 | `GGML_SYCL_ONEDNN_PP_MIN_BATCH=N` | Min batch for oneDNN PP path |
 | `GGML_SYCL_ONEDNN_MUL=1` | Enable oneDNN for element-wise MUL (default OFF, SYCL kernel is 2.3x faster) |
 | `GGML_SYCL_BATCH_EXPERTS=0` | Disable batched expert kernel launches (default ON) |
-| `GGML_SYCL_ESIMD_DEQUANT=1` | Opt-in retest hatch for ESIMD small-block dequant (measured 1.9x slower on Arc B580 + oneAPI 2025.3; standard SYCL is the default) |
+| `GGML_SYCL_ESIMD_DEQUANT=1` | Opt-in retest hatch for ESIMD small-block dequant; standard SYCL is the default. ⚠️ The 1.9x-slower figure behind that default was measured on an **Arc B580 + oneAPI 2025.3** — that card is no longer in this machine (replaced by the B70) and the toolchain has moved on, so treat it as *historical justification*, not a current measurement. The conclusion is still believed to hold (block granularity too small to amortize LSC loads), but it has not been re-measured on Battlemage G31. Same caveat applies to the copy of this claim in `CLAUDE.md`. |
 | `GGML_SYCL_LAYOUT_OVERRIDE=<mode>` | Force a weight layout: `aos`, `soa`, `coalesced`, or `xmx_tiled`. Overrides the layout policy's own choice — use for A/B isolation, not as a default. (Migrated from AGENTS.md 2026-07-25, which was its only documentation.) |
 
 ## Binbcast completion event
@@ -107,7 +136,10 @@ GGML_SYCL_PERSISTENT_TG=1 GGML_SYCL_PERSISTENT_TG_PHASE=0 GGML_SYCL_PERSISTENT_T
   ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-bench -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf -n 128
 
-# Correctness check — must pass the Mistral completion gate (ends 6..15)
+# Correctness check — must pass the Mistral completion gate.
+# Output is "1, 2, 3, 4, 5, 6, 7, 8, 9, 10" and STOPS at 10 (EOS).
+# This line used to say "ends 6..15" -- unreachable at -n 15, so a passing
+# gate reads as a failure and sends you hunting a nonexistent TG bug.
 GGML_SYCL_PERSISTENT_TG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
   ./build/bin/llama-completion -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
@@ -123,7 +155,7 @@ GGML_SYCL_PERSISTENT_TG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
 | `GGML_SYCL_KV_HOT_PCT=N` | auto | Hot window as % of total KV buffer |
 | `GGML_SYCL_FORCE_STREAMING=1` | OFF | Enable GPU weight streaming (Level 5, last resort) |
 | `GGML_SYCL_HOST_COMPUTE=1` | OFF | Use host-pinned compute buffers (eliminates staging for CPU-dispatched layers) |
-| `GGML_SYCL_PIPELINE_MOE=1` | OFF | Pipeline multi-GPU MoE: overlap B50 expert compute with GPU0 attention via background scatter thread |
+| ~~`GGML_SYCL_PIPELINE_MOE=1`~~ | — | ⚠️ **DEAD — does nothing.** No code reads this name (comments only), and its gate `ggml_sycl_pipeline_moe_enabled()` (`ggml-sycl.cpp:14178`) is a hardcoded `return false;`. Added `ae5eae507`, getenv removed `3cf9b5fdf` (2026-05-09, listed under "Removed (hardcoded to defaults)"), then **this row was created `f3c36987f` two months after the removal** — it was never accurate. Setting it measures nothing; do not conclude multi-GPU MoE overlap "doesn't help" from it. `GGML_SYCL_PIPELINE_CPU` below **is** live. |
 | `GGML_SYCL_PIPELINE_CPU=1` | OFF | Pipeline CPU expert compute with GPU attention across MoE layers: CPU experts from layer N run during layer N+1 attention |
 
 ## Cache and memory
