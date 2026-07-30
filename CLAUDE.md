@@ -108,6 +108,28 @@ Adding `LABELS "cache"` to that registration would also fix it, but it is
 upstream code that a rebase would silently revert, and the failure mode of
 losing the fix is an OOM. Excluding by name is the safer belt.
 
+⚠️ **`test-backend-ops` is not the only unlabelled member of that family.**
+`test-llama-archs` also carries only `main`, and **looping it exhausts host
+memory the same way**. Measured 2026-07-30: two separate global OOMs
+(12:00:25 and 12:49:57), each during a 6-run loop of
+
+```bash
+ctest --test-dir build -R '^test-llama-archs$' --output-on-failure   # ~36 s, fine ONCE
+```
+
+Both show the TTM-shmem signature this file documents for `test-backend-ops`:
+`shmem:238266228` kB ≈ **227 GB** of 255 GB total, `inactive_anon` 227.8 GB (the
+same pages — GPU BO shmem backing sits on the anon LRU, so reading only `anon`
+makes it look like a runaway process instead of driver-backed allocations). The
+kills took out the desktop session, Xwayland, `systemd --user`, and the 12 GB
+`ws2022ci` qemu VM eight times over. No test binary was itself killed and the
+GPU stayed clean (no GT reset / `guc_id` / CAT error), so results from such a
+run are still valid — but the host is not.
+
+A single run is fine. **Do not loop it unattended**, and treat any repeated
+GPU-allocating test the same way. The general lesson: `main` is the *default*
+label, so "only `main`" means "nobody classified this", not "this is safe".
+
 Pure-Python gates (`test-sycl-gap-causes`,
 `test-sycl-timeline-gap-class-conservation`, `test-jinja-py`) allocate nothing
 and are always safe at any parallelism.
