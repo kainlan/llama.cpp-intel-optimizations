@@ -15,9 +15,18 @@
 #include <sycl/sycl.hpp>
 #include <vector>
 
+// How the completion event handed to the binbcast post-op consumers is obtained.
+//
+// BARRIER / SAFE both *manufacture* an event with an extra submission (a queue
+// barrier, or an empty `single_task` marker).  REUSE instead returns the
+// binbcast kernel's own event, which carries the identical completion guarantee
+// for both consumers -- dst readiness publication and the weight-cache pin
+// release -- without adding a submission.  Opt-in via
+// `GGML_SYCL_BINBCAST_EVENT_MODE=reuse`.
 enum class ggml_sycl_binbcast_event_mode {
     BARRIER,
     SAFE,
+    REUSE,
 };
 
 static ggml_sycl::mem_handle ggml_sycl_binbcast_copy_handle_for_raw_ptr(void * ptr, int fallback_device) {
@@ -49,6 +58,8 @@ static const char * ggml_sycl_binbcast_event_mode_name(ggml_sycl_binbcast_event_
             return "barrier";
         case ggml_sycl_binbcast_event_mode::SAFE:
             return "safe";
+        case ggml_sycl_binbcast_event_mode::REUSE:
+            return "reuse";
         default:
             return "unknown";
     }
@@ -85,7 +96,54 @@ static ggml_sycl_binbcast_event_mode ggml_sycl_get_binbcast_event_mode() {
     if (std::strcmp(env, "barrier") == 0) {
         return ggml_sycl_binbcast_event_mode::BARRIER;
     }
+    if (std::strcmp(env, "reuse") == 0) {
+        return ggml_sycl_binbcast_event_mode::REUSE;
+    }
     return ggml_sycl_binbcast_event_mode::BARRIER;
+}
+
+// Where the completion event handed to the binbcast post-op consumers comes from.
+// There is deliberately no "none": both consumers -- dst readiness publication and
+// the weight-cache pin release -- must receive a real completion event.
+enum class ggml_sycl_binbcast_event_source {
+    KERNEL,      // the binbcast kernel's own submission event
+    SUBMISSION,  // a manufactured event (queue barrier, or an empty marker kernel)
+};
+
+static const char * ggml_sycl_binbcast_event_source_name(ggml_sycl_binbcast_event_source source) {
+    switch (source) {
+        case ggml_sycl_binbcast_event_source::KERNEL:
+            return "kernel";
+        case ggml_sycl_binbcast_event_source::SUBMISSION:
+            return "submission";
+        default:
+            return "unknown";
+    }
+}
+
+// The single policy decision behind the completion event.  REUSE is the only mode
+// that can take the kernel's event, and only when one was actually captured: a
+// mode of REUSE with no kernel event still has to manufacture a real one, because
+// a default-constructed sycl::event reads as ALREADY COMPLETE and would release a
+// weight-cache pin while the GPU is still reading the weight.
+static ggml_sycl_binbcast_event_source ggml_sycl_binbcast_resolve_event_source(ggml_sycl_binbcast_event_mode mode,
+                                                                               bool kernel_event_valid) {
+    if (mode == ggml_sycl_binbcast_event_mode::REUSE && kernel_event_valid) {
+        return ggml_sycl_binbcast_event_source::KERNEL;
+    }
+    return ggml_sycl_binbcast_event_source::SUBMISSION;
+}
+
+// Test hooks (tests/test-unified-cache-unpin-event.cpp).  They resolve the mode
+// from GGML_SYCL_BINBCAST_EVENT_MODE through the same parser and the same policy
+// function the op path uses, so the test gates the real decision.
+const char * ggml_sycl_test_binbcast_event_mode_name() {
+    return ggml_sycl_binbcast_event_mode_name(ggml_sycl_get_binbcast_event_mode());
+}
+
+const char * ggml_sycl_test_binbcast_event_source_name(bool kernel_event_valid) {
+    return ggml_sycl_binbcast_event_source_name(
+        ggml_sycl_binbcast_resolve_event_source(ggml_sycl_get_binbcast_event_mode(), kernel_event_valid));
 }
 
 struct ggml_sycl_binbcast_unpin_event_kernel;
@@ -99,6 +157,13 @@ static sycl::event ggml_sycl_submit_binbcast_event(sycl::queue &                
         g_sycl_extra_submit_count_during_recording.fetch_add(1, std::memory_order_relaxed);
     }
     if (mode == ggml_sycl_binbcast_event_mode::BARRIER && q.has_property<sycl::property::queue::in_order>()) {
+        mode = ggml_sycl_binbcast_event_mode::SAFE;
+    }
+    // REUSE is resolved by the caller, which returns the kernel's own event and
+    // never reaches here.  Arriving with it means no kernel event was captured,
+    // so fall back to a real submission -- the weight-cache pin release polls
+    // this event, and an empty `sycl::event` reads as already complete.
+    if (mode == ggml_sycl_binbcast_event_mode::REUSE) {
         mode = ggml_sycl_binbcast_event_mode::SAFE;
     }
 
@@ -438,41 +503,48 @@ static void k_bin_bcast_unravel(const src0_t *           src0,
 }
 
 template <float (*bin_op)(const float, const float)> struct bin_bcast_sycl {
+    // Returns the submitted kernel's event.  `ggml_sycl_op_bin_bcast` hands it to
+    // the post-op consumers under `GGML_SYCL_BINBCAST_EVENT_MODE=reuse` instead of
+    // manufacturing a second event with an empty marker kernel.
     template <typename src0_t, typename src1_t, typename dst_t>
-    void operator()(const src0_t * src0_dd,
-                    const src1_t * src1_dd,
-                    dst_t *        dst_dd,
-                    const int64_t  ne00,
-                    const int64_t  ne01,
-                    const int64_t  ne02,
-                    const int64_t  ne03,
-                    const int64_t  ne10,
-                    const int64_t  ne11,
-                    const int64_t  ne12,
-                    const int64_t  ne13,
-                    const int64_t  ne0,
-                    const int64_t  ne1,
-                    const int64_t  ne2,
-                    const int64_t  ne3,
-                    const size_t   nb00,
-                    const size_t   nb01,
-                    const size_t   nb02,
-                    const size_t   nb03,
-                    const size_t   nb10,
-                    const size_t   nb11,
-                    const size_t   nb12,
-                    const size_t   nb13,
-                    const size_t   nb0,
-                    const size_t   nb1,
-                    const size_t   nb2,
-                    const size_t   nb3,
-                    const bool     src0_is_contiguous,
-                    const bool     src1_is_contiguous,
-                    const bool     dst_is_contiguous,
-                    queue_ptr      stream,
-                    const char *   file     = __builtin_FILE(),
-                    int            line     = __builtin_LINE(),
-                    const char *   function = __builtin_FUNCTION()) {
+    sycl::event operator()(const src0_t * src0_dd,
+                           const src1_t * src1_dd,
+                           dst_t *        dst_dd,
+                           const int64_t  ne00,
+                           const int64_t  ne01,
+                           const int64_t  ne02,
+                           const int64_t  ne03,
+                           const int64_t  ne10,
+                           const int64_t  ne11,
+                           const int64_t  ne12,
+                           const int64_t  ne13,
+                           const int64_t  ne0,
+                           const int64_t  ne1,
+                           const int64_t  ne2,
+                           const int64_t  ne3,
+                           const size_t   nb00,
+                           const size_t   nb01,
+                           const size_t   nb02,
+                           const size_t   nb03,
+                           const size_t   nb10,
+                           const size_t   nb11,
+                           const size_t   nb12,
+                           const size_t   nb13,
+                           const size_t   nb0,
+                           const size_t   nb1,
+                           const size_t   nb2,
+                           const size_t   nb3,
+                           const bool     src0_is_contiguous,
+                           const bool     src1_is_contiguous,
+                           const bool     dst_is_contiguous,
+                           queue_ptr      stream,
+                           const char *   file     = __builtin_FILE(),
+                           int            line     = __builtin_LINE(),
+                           const char *   function = __builtin_FUNCTION()) {
+        // Exactly one of the two submission sites below runs, and each yields a
+        // real submission event, so this is never returned default-constructed.
+        sycl::event kernel_event;
+
         int nr0 = ne10 / ne0;
         int nr1 = ne11 / ne1;
         int nr2 = ne12 / ne2;
@@ -597,10 +669,9 @@ template <float (*bin_op)(const float, const float)> struct bin_bcast_sycl {
                 {
                     dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
 
-                    ggml_sycl_submit_binbcast_kernel(
+                    kernel_event = ggml_sycl_submit_binbcast_kernel(
                         *stream, ggml_sycl_binbcast_kernel_profile_name<bin_op>(),
-                        ggml_sycl_binbcast_kernel_profile_metadata<bin_op>(
-                            ggml_sycl_binbcast_kernel_variant::UNRAVEL),
+                        ggml_sycl_binbcast_kernel_profile_metadata<bin_op>(ggml_sycl_binbcast_kernel_variant::UNRAVEL),
                         [&](sycl::queue & profiled_queue) {
                             return profiled_queue.parallel_for(
                                 sycl::nd_range<3>(sycl::range<3>(1, 1, block_num) * sycl::range<3>(1, 1, block_size),
@@ -622,7 +693,7 @@ template <float (*bin_op)(const float, const float)> struct bin_bcast_sycl {
                 */
                 dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
 
-                ggml_sycl_submit_binbcast_kernel(
+                kernel_event = ggml_sycl_submit_binbcast_kernel(
                     *stream, ggml_sycl_binbcast_kernel_profile_name<bin_op>(),
                     ggml_sycl_binbcast_kernel_profile_metadata<bin_op>(ggml_sycl_binbcast_kernel_variant::ND),
                     [&](sycl::queue & profiled_queue) {
@@ -635,6 +706,8 @@ template <float (*bin_op)(const float, const float)> struct bin_bcast_sycl {
                     file, line, function);
             }
         }
+
+        return kernel_event;
     }
 };
 
@@ -850,42 +923,62 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
         maybe_pin_cached(src1);
     }
 
+    // The binbcast kernel's own event.  Under GGML_SYCL_BINBCAST_EVENT_MODE=reuse it
+    // IS the completion event handed to the post-op consumers, which is why the flag
+    // is tracked separately: an unset event must never reach them.
+    sycl::event kernel_event;
+    bool        kernel_event_valid = false;
+
     if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-        op()((const float *) src0_d, (const float *) src1_d, (float *) dst_d, ne00, ne01, ne02, ne03, ne10, ne11, ne12,
-             ne13, ne0, ne1, ne2, ne3, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13, nb0, nb1, nb2, nb3,
-             ggml_is_contiguous(src0), ggml_is_contiguous(src1), ggml_is_contiguous(dst), main_stream, file, line,
-             function);
+        kernel_event = op()((const float *) src0_d, (const float *) src1_d, (float *) dst_d, ne00, ne01, ne02, ne03,
+                            ne10, ne11, ne12, ne13, ne0, ne1, ne2, ne3, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13,
+                            nb0, nb1, nb2, nb3, ggml_is_contiguous(src0), ggml_is_contiguous(src1),
+                            ggml_is_contiguous(dst), main_stream, file, line, function);
+        kernel_event_valid = true;
     } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
-        op()((const sycl::half *) src0_d, (const sycl::half *) src1_d, (sycl::half *) dst_d, ne00, ne01, ne02, ne03,
-             ne10, ne11, ne12, ne13, ne0, ne1, ne2, ne3, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13, nb0, nb1, nb2,
-             nb3, ggml_is_contiguous(src0), ggml_is_contiguous(src1), ggml_is_contiguous(dst), main_stream, file, line,
-             function);
+        kernel_event = op()((const sycl::half *) src0_d, (const sycl::half *) src1_d, (sycl::half *) dst_d, ne00, ne01,
+                            ne02, ne03, ne10, ne11, ne12, ne13, ne0, ne1, ne2, ne3, nb00, nb01, nb02, nb03, nb10, nb11,
+                            nb12, nb13, nb0, nb1, nb2, nb3, ggml_is_contiguous(src0), ggml_is_contiguous(src1),
+                            ggml_is_contiguous(dst), main_stream, file, line, function);
+        kernel_event_valid = true;
     } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) {
-        op()((const sycl::half *) src0_d, (const float *) src1_d, (sycl::half *) dst_d, ne00, ne01, ne02, ne03, ne10,
-             ne11, ne12, ne13, ne0, ne1, ne2, ne3, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13, nb0, nb1, nb2, nb3,
-             ggml_is_contiguous(src0), ggml_is_contiguous(src1), ggml_is_contiguous(dst), main_stream, file, line,
-             function);
+        kernel_event = op()((const sycl::half *) src0_d, (const float *) src1_d, (sycl::half *) dst_d, ne00, ne01, ne02,
+                            ne03, ne10, ne11, ne12, ne13, ne0, ne1, ne2, ne3, nb00, nb01, nb02, nb03, nb10, nb11, nb12,
+                            nb13, nb0, nb1, nb2, nb3, ggml_is_contiguous(src0), ggml_is_contiguous(src1),
+                            ggml_is_contiguous(dst), main_stream, file, line, function);
+        kernel_event_valid = true;
     } else if (src0->type == GGML_TYPE_I32 && src1->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32) {
-        op()((const int32_t *) src0_d, (const int32_t *) src1_d, (int32_t *) dst_d, ne00, ne01, ne02, ne03, ne10, ne11,
-             ne12, ne13, ne0, ne1, ne2, ne3, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13, nb0, nb1, nb2, nb3,
-             ggml_is_contiguous(src0), ggml_is_contiguous(src1), ggml_is_contiguous(dst), main_stream, file, line,
-             function);
+        kernel_event = op()((const int32_t *) src0_d, (const int32_t *) src1_d, (int32_t *) dst_d, ne00, ne01, ne02,
+                            ne03, ne10, ne11, ne12, ne13, ne0, ne1, ne2, ne3, nb00, nb01, nb02, nb03, nb10, nb11, nb12,
+                            nb13, nb0, nb1, nb2, nb3, ggml_is_contiguous(src0), ggml_is_contiguous(src1),
+                            ggml_is_contiguous(dst), main_stream, file, line, function);
+        kernel_event_valid = true;
     } else if (src0->type == GGML_TYPE_I16 && src1->type == GGML_TYPE_I16 && dst->type == GGML_TYPE_I16) {
-        op()((const int16_t *) src0_d, (const int16_t *) src1_d, (int16_t *) dst_d, ne00, ne01, ne02, ne03, ne10, ne11,
-             ne12, ne13, ne0, ne1, ne2, ne3, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13, nb0, nb1, nb2, nb3,
-             ggml_is_contiguous(src0), ggml_is_contiguous(src1), ggml_is_contiguous(dst), main_stream, file, line,
-             function);
+        kernel_event = op()((const int16_t *) src0_d, (const int16_t *) src1_d, (int16_t *) dst_d, ne00, ne01, ne02,
+                            ne03, ne10, ne11, ne12, ne13, ne0, ne1, ne2, ne3, nb00, nb01, nb02, nb03, nb10, nb11, nb12,
+                            nb13, nb0, nb1, nb2, nb3, ggml_is_contiguous(src0), ggml_is_contiguous(src1),
+                            ggml_is_contiguous(dst), main_stream, file, line, function);
+        kernel_event_valid = true;
     } else {
         fprintf(stderr, "%s: unsupported types: dst: %s, src0: %s, src1: %s\n", __func__, ggml_type_name(dst->type),
                 ggml_type_name(src0->type), ggml_type_name(src1->type));
         GGML_ABORT("fatal error");
     }
 
+    // The ONE site that decides where the post-op completion event comes from.
+    // Every consumer goes through here, so none of them can be handed a
+    // default-constructed (already-complete) event.
     sycl::event done_event;
     bool        done_event_set    = false;
     auto        ensure_done_event = [&]() -> sycl::event {
         if (!done_event_set) {
-            done_event     = ggml_sycl_submit_binbcast_event(*main_stream, ggml_sycl_get_binbcast_event_mode());
+            const auto mode   = ggml_sycl_get_binbcast_event_mode();
+            const auto source = ggml_sycl_binbcast_resolve_event_source(mode, kernel_event_valid);
+            if (source == ggml_sycl_binbcast_event_source::KERNEL) {
+                done_event = kernel_event;
+            } else {
+                done_event = ggml_sycl_submit_binbcast_event(*main_stream, mode);
+            }
             done_event_set = true;
         }
         return done_event;
@@ -903,18 +996,20 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
 
     if (pin_count > 0 && cache) {
         try {
-            const auto mode = ggml_sycl_get_binbcast_event_mode();
             if (g_ggml_sycl_debug) {
-                GGML_LOG_INFO("[SYCL-BINBCAST] unpin event mode=%s pins=%d\n", ggml_sycl_binbcast_event_mode_name(mode),
+                const auto mode = ggml_sycl_get_binbcast_event_mode();
+                // `source` distinguishes a configured `reuse` from one that actually
+                // took effect; a reuse run that fell back still shows submission.
+                GGML_LOG_INFO("[SYCL-BINBCAST] unpin event mode=%s source=%s pins=%d\n",
+                              ggml_sycl_binbcast_event_mode_name(mode),
+                              ggml_sycl_binbcast_event_source_name(
+                                  ggml_sycl_binbcast_resolve_event_source(mode, kernel_event_valid)),
                               pin_count);
             }
-            if (!done_event_set) {
-                done_event     = ggml_sycl_submit_binbcast_event(*main_stream, mode);
-                done_event_set = true;
-            }
+            const sycl::event unpin_event = ensure_done_event();
             for (int i = 0; i < pin_count; ++i) {
                 if (!pins[i].keep_pinned) {
-                    cache->unpin_on_event(pins[i].key, pins[i].layout, done_event);
+                    cache->unpin_on_event(pins[i].key, pins[i].layout, unpin_event);
                 }
             }
         } catch (...) {

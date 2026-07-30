@@ -45,6 +45,44 @@ grep -rhoE 'getenv\("GGML_SYCL[A-Z_]*"' ggml/src/ggml-sycl/ | sort -u
 | `GGML_SYCL_ESIMD_DEQUANT=1` | Opt-in retest hatch for ESIMD small-block dequant (measured 1.9x slower on Arc B580 + oneAPI 2025.3; standard SYCL is the default) |
 | `GGML_SYCL_LAYOUT_OVERRIDE=<mode>` | Force a weight layout: `aos`, `soa`, `coalesced`, or `xmx_tiled`. Overrides the layout policy's own choice — use for A/B isolation, not as a default. (Migrated from AGENTS.md 2026-07-25, which was its only documentation.) |
 
+## Binbcast completion event
+
+`ggml_sycl_op_bin_bcast` (ADD / SUB / MUL / DIV / REPEAT) publishes one completion
+event to two consumers: `ggml_sycl_set_tensor_ready_event(dst, ...)` for
+`GGML_OP_MUL`, and `unified_cache::unpin_on_event`, which parks the weight-cache
+lease release on it. `GGML_SYCL_BINBCAST_EVENT_MODE` selects where that event
+comes from.
+
+| Value | Default | Effect |
+|-------|---------|--------|
+| `barrier` | **yes** (also the fallback for any unrecognised value) | Manufacture the event with `ext_oneapi_submit_barrier()`. On an in-order queue this is silently promoted to `safe`. |
+| `safe` | | Manufacture the event with an empty `single_task` marker kernel. |
+| `reuse` | | Return the binbcast kernel's own submission event — no extra submission. Falls back to a real `safe` submission if no kernel event was captured. |
+
+`reuse` exists to remove the empty marker submissions from the decode path (72 per
+token on GPT-OSS 20B). The kernel event carries the same guarantee both consumers
+need: the kernel is what writes `dst` and what reads the pinned weights, so its
+completion means `dst` is ready and the pins are safe to release.
+
+⚠️ **There is no "no event" option, and adding one is not an optimisation.** A
+default-constructed `sycl::event` reads as **already complete**, so handing one to
+`unpin_on_event` releases the weight-cache lease while the GPU is still reading the
+weight — `DEVICE_LOST` or silent corruption. That failure mode presents as a
+**speedup**, so a faster run is not evidence that it is correct. Every mode, on
+every path, must yield a real completion event.
+
+Debug: with `GGML_SYCL_DEBUG=1` the unpin path logs
+`[SYCL-BINBCAST] unpin event mode=<mode> source=<kernel|submission> pins=<n>`.
+`source` is what actually happened — a configured `reuse` that fell back still
+reports `submission`. `GGML_SYCL_BINBCAST_TRACE=1` adds `[BINBCAST]` staging and
+launch traces from the same file.
+
+Gate (all three modes, plus the host-only event-source policy check):
+
+```bash
+ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-unified-cache-unpin-event --mode=compare
+```
+
 ## Persistent TG kernel (experimental, opt-in)
 
 | Variable | Default | Effect |
