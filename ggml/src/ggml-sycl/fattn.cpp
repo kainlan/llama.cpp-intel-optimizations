@@ -2597,11 +2597,21 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
 
 #if GGML_SYCL_DNNL
     // oneDNN graph SDPA path: fused MatMul→Divide→Add→SoftMax→MatMul on Xe2.
-    // Retired by default for Mistral-like GQA shapes (nc≠D) since oneDNN's
-    // 4-D strided layout cannot represent non-contiguous nc-D K planes.
-    // Eligible for non-GQA and nc==D shapes.
-    // GGML_SYCL_FA_ONEDNN_ALLOW intentionally does not bypass the nc==D gate:
-    // Mistral-like GQA layouts produced deterministic completion corruption.
+    // Eligible for non-GQA and nc==D shapes DIRECTly.  Mistral-like GQA (nc≠D)
+    // is NOT retired: oneDNN's 4-D strided layout cannot represent
+    // non-contiguous nc-D K planes, so the planner returns MATERIALIZE_REQUIRED
+    // (fattn-onednn.cpp) and a unified-cache-backed materializer builds dense
+    // f16 K/V first -- the accepted plan kinds below are DIRECT *and*
+    // MATERIALIZE_REQUIRED.  Verified live on Mistral Q4_0: 32 dispatches per
+    // generation, "oneDNN MATERIALIZED D=128 ne01=16 ne11=256 H_q=32 H_kv=8",
+    // completion gate correct.  Disabling the path (GGML_SYCL_FA_ONEDNN=0)
+    // costs ~39% of pp512 on the B50.
+    //
+    // Historical note: an earlier revision retired GQA here outright and gated
+    // re-entry behind GGML_SYCL_FA_ONEDNN_ALLOW, because the pre-materializer
+    // direct path corrupted Mistral completions.  That getenv was removed in
+    // 3c8f296fd and the materializer landed in 16a241dd1; the variable no
+    // longer exists anywhere, so do not reintroduce it as a "safety" switch.
     // Other eligibility: no sinks, no softcap, f16 KV, D ≤ 512, not multi-
     // seq, not paged-v2, not safe_decode. The paged-v2 block layout stores
     // K/V as [D, block_size, n_blocks] rather than the contiguous [D, n_kv]

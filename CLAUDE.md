@@ -593,9 +593,43 @@ B70 tg differences below ~10% between single runs. The B50 is steady (cv 0.7% tg
 Any **B580** figure in older notes is history — that card was replaced by the B70.
 Measuring a B70 against a B580 target makes a healthy run look catastrophic.
 
-Do not use `GGML_SYCL_FA_ONEDNN_ALLOW=1` to restore Mistral PP numbers — it can
-raise PP throughput, but the deterministic completion gate produces incorrect
-output with the current nc!=D contiguity fast-path.
+⚠️ **`GGML_SYCL_FA_ONEDNN_ALLOW` does not exist, and the warning that used to
+stand here was wrong in both directions.** It read: *"Do not use
+`GGML_SYCL_FA_ONEDNN_ALLOW=1` to restore Mistral PP numbers — it can raise PP
+throughput, but the deterministic completion gate produces incorrect output with
+the current nc!=D contiguity fast-path."* Corrected 2026-07-30. Every clause of
+that is now false:
+
+1. **No such variable.** Commit `3c8f296fd` (2026-05-15) *removed* the
+   `getenv("GGML_SYCL_FA_ONEDNN_ALLOW")` bypass **and added that warning in the
+   same commit** — it documented a footgun it had just deleted. Setting it today
+   is a no-op; verified, the Mistral gate emits the identical correct
+   `1, 2, 3, 4, 5, 6, 7, 8, 9, 10` with and without it. The name survives only in
+   a stale comment at `fattn.cpp` and here.
+2. **oneDNN SDPA is not retired for Mistral — it is ON by default and Mistral
+   uses it.** `16a241dd1` (2026-05-30) added the `MATERIALIZE_REQUIRED` path, so
+   nc≠D GQA is no longer rejected: the planner
+   (`fattn-onednn.cpp:140`) asks a unified-cache-backed materializer for dense
+   f16 K/V, and `fattn.cpp:2618` accepts that plan alongside `DIRECT`. Confirmed
+   live with `GGML_SYCL_FA_DISPATCH_DEBUG=1` — 32 dispatches per generation:
+   `oneDNN MATERIALIZED D=128 ne01=16 ne11=256 H_q=32 H_kv=8` (H_q≠H_kv **is**
+   the GQA shape the old note claimed corrupts).
+3. **There is no correctness penalty, and disabling it is expensive.**
+   Interleaved paired A/B, Mistral Q4_0 pp512 on the B50:
+
+   | pair | default (oneDNN on) | `GGML_SYCL_FA_ONEDNN=0` |
+   |------|--------------------:|------------------------:|
+   | 1 | 1142.76 | 695.31 |
+   | 2 | 1145.14 | 697.12 |
+   | 3 | 1113.92 | 697.23 |
+
+   **Turning oneDNN FA off costs ~39% of PP512** (1.63x slower). Taken under
+   load 38 — absolute values are depressed and are not baselines, but the
+   interleaved pairing makes the *ratio* sound, and the spreads are tight
+   (off: cv 0.15%).
+
+The real variable is **`GGML_SYCL_FA_ONEDNN`** (default ON; `=0` disables).
+Leave it alone unless you are deliberately bisecting the attention path.
 
 ### Regression Baselines (hard guardrails)
 
