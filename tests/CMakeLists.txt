@@ -407,6 +407,34 @@ if (GGML_SYCL)
         target_link_options(test-sycl-kernel-profiler PRIVATE "-fsycl")
     endif()
     llama_test(test-sycl-kernel-profiler LABEL "main")
+
+    # Stress gate for unified_cache::unpin_on_event -- the weight-cache lease
+    # release that binbcast's post-op event gates. Registered 2026-07-29; the
+    # file had been in-tree and UNREGISTERED, so it was never compiled by this
+    # build at all and `ctest -R unpin-event` reported "No tests were found",
+    # which reads identically to a passing selection. (An `add_test` for it does
+    # exist in the stale `build-tests-sycl/` tree from an older configure --
+    # do not mistake that for coverage here.)
+    #
+    # Labelled `cache;mem-handle` deliberately: it allocates GPU buffer objects,
+    # so it must be EXCLUDED from the throttled full-suite run
+    # (`ctest -LE 'residency|mem-handle|cache'`, see CLAUDE.md) whose parallelism
+    # has OOM-killed this host. An explicit `-R` still selects it.
+    llama_build(test-unified-cache-unpin-event.cpp)
+    target_include_directories(test-unified-cache-unpin-event PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    target_link_libraries(test-unified-cache-unpin-event PRIVATE ggml-sycl)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-unified-cache-unpin-event PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-unified-cache-unpin-event PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-unified-cache-unpin-event PRIVATE "-fsycl")
+        target_link_options(test-unified-cache-unpin-event PRIVATE "-fsycl")
+    endif()
+    llama_test(test-unified-cache-unpin-event LABEL "main" ARGS --mode=compare --iters=50)
+    set_tests_properties(test-unified-cache-unpin-event PROPERTIES
+        LABELS "sycl;cache;mem-handle"
+        TIMEOUT 600
+    )
 endif()
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
