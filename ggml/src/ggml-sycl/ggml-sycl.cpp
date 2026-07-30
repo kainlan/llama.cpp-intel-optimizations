@@ -29099,7 +29099,7 @@ static enum ggml_status ggml_backend_sycl_tp_buffer_init_tensor(ggml_backend_buf
                 }
             }
             // tensor->data now points to main device's view location
-            tensor->data  = extra->data_device_ptr(main_device);
+            tensor->data  = extra->data_device_ptr_checked(main_device, __func__);
             tensor->extra = extra;
             ggml_sycl_init_layout_info(extra, tensor, main_device, true);
 
@@ -29258,7 +29258,7 @@ static enum ggml_status ggml_backend_sycl_tp_buffer_init_tensor(ggml_backend_buf
                     (long long) tensor->ne[0], (long long) tensor->ne[1], is_multiprocess_tp);
         }
         // tensor->data points to main device's shard
-        tensor->data = extra->data_device_ptr(main_device);
+        tensor->data = extra->data_device_ptr_checked(main_device, __func__);
     } else {
         // Non-sharded tensor: DUPLICATE on all TP devices for fast access
         // Intel Arc GPUs don't support P2P, and host memory is 32x slower for kernel access
@@ -29344,7 +29344,7 @@ static enum ggml_status ggml_backend_sycl_tp_buffer_init_tensor(ggml_backend_buf
             }
         }
         // tensor->data points to main device's copy
-        tensor->data = extra->data_device_ptr(main_device);
+        tensor->data = extra->data_device_ptr_checked(main_device, __func__);
     }
 
     ggml_sycl_init_layout_info(extra, tensor, main_device, true);
@@ -29481,7 +29481,7 @@ static void ggml_backend_sycl_tp_buffer_set_tensor(ggml_backend_buffer_t buffer,
                     uint8_t    qs[16];
                 } blk0, blk1, blk38, blk100;
 
-                void * dev_ptr          = extra->data_device_ptr(device);
+                void * dev_ptr          = extra->data_device_ptr_checked(device, __func__);
                 size_t blk_row_size     = (4096 / 32) * 18;  // 128 blocks * 18 bytes = 2304 bytes/row
                 auto   read_debug_block = [&](auto & block, size_t byte_offset) {
                     ggml_sycl::mem_handle read_dst = ggml_sycl_copy_handle_for_raw_ptr(&block, GGML_LAYOUT_AOS, device);
@@ -33404,7 +33404,7 @@ static dpct::err0 ggml_sycl_cpy_tensor_2d(void *                     dst,
         int                     id;
         SYCL_CHECK(CHECK_TRY_ERROR(id = get_current_device_id()));
         // GGML_SYCL_DEBUG("current device index %d\n", id);
-        src_ptr = (char *) extra->data_device_ptr(id);
+        src_ptr = (char *) extra->data_device_ptr_checked(id, __func__);
     } else if (ggml_backend_buffer_is_sycl_tp(src->buffer)) {
         // TP (Tensor Parallelism) buffer - similar to split buffer
         // Data is stored in device-specific locations within extra
@@ -33414,7 +33414,7 @@ static dpct::err0 ggml_sycl_cpy_tensor_2d(void *                     dst,
         int                     id;
         SYCL_CHECK(CHECK_TRY_ERROR(id = get_current_device_id()));
 
-        src_ptr = (char *) extra->data_device_ptr(id);
+        src_ptr = (char *) extra->data_device_ptr_checked(id, __func__);
         GGML_SYCL_DEBUG("[CPY_TENSOR_2D] TP buffer: device=%d src_ptr=%p dst=%p (tensor=%s) stream_dev=%s\n", id,
                         (void *) src_ptr, dst, src->name,
 
@@ -34484,7 +34484,7 @@ static bool ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
 
             if (ggml_backend_buffer_is_sycl_tp(src0->buffer)) {
                 ggml_tensor_extra_gpu * extra  = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
-                dev[i].src0_dd                 = (char *) extra->data_device_ptr(i);
+                dev[i].src0_dd                 = (char *) extra->data_device_ptr_checked(i, __func__);
                 dev[i].src0_ptr_origin         = "tp_data_device";
                 dev[i].src0_layout_ptr_source  = "n/a";
                 exc_ctx.dev[i].src0_dd         = dev[i].src0_dd;
