@@ -901,7 +901,13 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
 # Target: PP512 >= 1300, TG128 >= 68
 
 # 5. Unit tests
-ctest --test-dir build --output-on-failure -j $(nproc)
+#    ⚠️ NOT `-j $(nproc)` -- that OOM-kills this host. Tests #1-#19 are the SYCL
+#    mem-handle / MoE-residency family, all GPU-buffer allocators whose TTM shmem
+#    backing grows without bound, and they sit at the FRONT of the list, so -j 20
+#    on this 20-core box starts all nineteen at once. Took the host down twice on
+#    2026-07-25. See CLAUDE.md "Running Tests" for the throttled forms.
+ctest --test-dir build --output-on-failure -j 4 -LE 'residency|mem-handle|cache'
+ctest --test-dir build -L residency --output-on-failure -j 1   # manually only
 ```
 
 **Commit:**
@@ -926,6 +932,7 @@ git commit -m "test: add MoE expert parallelism integration tests"
 source /opt/intel/oneapi/setvars.sh --force
 cmake -B build -G Ninja -DGGML_SYCL=ON -DGGML_SYCL_TARGET=INTEL \
   -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
-ninja -C build -j $(nproc)
-ctest --test-dir build --output-on-failure -j $(nproc)
+ninja -C build -j $(nproc)          # fine -- compile jobs, not GPU allocators
+# ⚠️ ctest is NOT safe at -j $(nproc) here; see the note at the Unit tests step above.
+ctest --test-dir build --output-on-failure -j 4 -LE 'residency|mem-handle|cache'
 ```
