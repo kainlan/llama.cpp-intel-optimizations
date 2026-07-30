@@ -60,7 +60,39 @@ device for the same tensor** (`:28684-28716`).
 
 **Collapsing `data_handle[]` to one `mem_handle` would make `--split-mode row`
 silently produce wrong results** -- it would keep only the last device's shard.
-Not a crash. This is the hard constraint on the whole plan.
+Not a crash.
+
+> ⚠️ **CORRECTED 2026-07-30 by the HS0-T6 spike (`llama.cpp-i018`). This was
+> stated as "the hard constraint on the whole plan". It is not, on this host.**
+>
+> The buffer type is genuinely *requested* -- `src/llama-model.cpp:1222` looks up
+> `ggml_backend_split_buffer_type` under `LLAMA_SPLIT_MODE_ROW`, exactly as
+> described above. But the fork's scheduler then **disables the placement**:
+> `ggml-sycl.cpp:16074` logs *"Scheduler multi-GPU dense/KV placement is disabled
+> by default"*, citing DEVICE_LOST on compute-runtime 26.x
+> (intel/compute-runtime#916, #921). Mistral is dense, so a
+> `--split-mode row` run on this host does **not** actually split -- measured
+> directly: two GPUs visible, correct tokens, and no evidence of per-device
+> placement in the log.
+>
+> The only live multi-device path here is **MoE-only**, gated at
+> `ggml-sycl.cpp:6275` by `multi_gpu_on = multi_gpu_requested && plan_known &&
+> plan_needs_secondary` -- i.e. it needs BOTH the `GGML_SYCL_MOE_MULTI_GPU`
+> opt-in (`:6269`) AND a plan that genuinely requires a second device. GPT-OSS
+> 20B is 12 GB and fits on the B70 alone, so `plan_needs_secondary` was almost
+> certainly false even when both devices were visible.
+>
+> **Consequence for Stage 2.** The per-device array's justification is weaker
+> than this document originally claimed. It is not "row-split needs it today";
+> it is "row-split *would* need it if the scheduler re-enabled dense multi-GPU
+> placement, and MoE multi-GPU needs it when opted in with a model too large for
+> one card". Neither was exercised. **Do not treat the array as load-bearing on
+> the strength of Finding 1 alone** -- establish which multi-device path is
+> actually reachable in the target configuration first. See `llama.cpp-nguy`.
+>
+> This does not license collapsing the array either: unexercised is not the same
+> as unreachable, and the split-buffer code genuinely does write different row
+> ranges per device when it runs.
 
 ### Finding 2 -- Tensor Parallelism is NOT reachable from llama core
 
