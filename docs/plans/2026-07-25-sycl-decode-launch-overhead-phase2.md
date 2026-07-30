@@ -404,7 +404,15 @@ ONEAPI_DEVICE_SELECTOR=level_zero:1 timeout 300 ./build/bin/llama-completion \
 #    host twice on 2026-07-25, each time killing the Claude Code CLI along
 #    with dbus-broker and xdg-document-portal. A plan step marked MANDATORY
 #    must not be the step that reboots the machine.
-ctest --test-dir build --output-on-failure -j 4 -LE 'residency|mem-handle|cache'
+#
+#    ⚠️ The `-E` is NOT redundant with the `-LE`. `test-backend-ops` is
+#    registered at tests/CMakeLists.txt:494 with NO labels, so it carries only
+#    the default `main` and the label denylist cannot reach it -- it ran as
+#    test #73 of this "safe" sweep until 2026-07-30. That is the one binary
+#    CLAUDE.md forbids running unattended (50-224 GB TTM shmem). Confirm with
+#    `ctest -N -LE ... | grep backend-ops` printing nothing before running.
+ctest --test-dir build --output-on-failure -j 4 \
+      -LE 'residency|mem-handle|cache' -E '^test-backend-ops$'
 
 #    The excluded family, serially, MANUALLY only -- never in a subagent or a
 #    background task. Check `uptime` first; skip it on a loaded machine.
