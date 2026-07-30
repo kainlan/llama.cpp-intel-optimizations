@@ -237,8 +237,29 @@ if (NOT WIN32)
 endif()
 ```
 
-Run: `cmake -S . -B build -G Ninja >/dev/null && ctest --test-dir build -N -R test-sycl-handle-policy`
-Expected: lists `Test #NN: test-sycl-handle-policy`, `Total Tests: 1`.
+⚠️ **Do NOT run a bare `cmake -S . -B build -G Ninja`.** This plan said exactly that
+until 2026-07-30 and it is a trap: without oneAPI sourced, `icx`/`icpx` are not on
+PATH, so cmake performs a cache-invalidating reconfigure and **`GGML_SYCL` silently
+disappears from `build/CMakeCache.txt`** — the CPU-fallback trap CLAUDE.md documents,
+where every token gate still passes at ~8 tok/s. It happened during execution of this
+very task. Source oneAPI and use the project's own configure instead, which carries the
+canonical flag set:
+
+```bash
+source /opt/intel/oneapi/setvars.sh --force
+./scripts/sycl-build.sh                      # reconfigures + builds; a CMakeLists-only
+                                             # change makes this nearly a no-op
+ctest --test-dir build -N -R test-sycl-handle-policy
+```
+
+Then **verify the backend survived** before trusting anything downstream:
+
+```bash
+grep -E '^GGML_SYCL:' build/CMakeCache.txt                        # want BOOL=ON
+ldd build/bin/llama-completion | grep -cE 'libggml-sycl|libsycl'  # want >= 2
+```
+
+Expected: `Test #NN: test-sycl-handle-policy`, `Total Tests: 1`, `GGML_SYCL:BOOL=ON`, `2`.
 
 **Commit:**
 
