@@ -2882,6 +2882,22 @@ struct ggml_tensor_extra_gpu {
         return nullptr;
     }
 
+    // Checked form of data_device_ptr().  data_device_ptr() returns nullptr when
+    // the legacy fallback finds a DEVICE allocation registered to a different
+    // device; callers that skip the null check then do pointer arithmetic on it
+    // and fault inside a device memcpy.  Prefer this at every dereference site.
+    void * data_device_ptr_checked(int dev, const char * caller) const {
+        void * ptr = data_device_ptr(dev);
+        if (ptr == nullptr) {
+            GGML_LOG_ERROR(
+                "[SYCL] %s: no usable device pointer for dev=%d "
+                "(handle_dev=%d raw=%p size=%zu)\n",
+                caller ? caller : "?", dev, data_handle[dev].device(), data_device[dev], data_device_size[dev]);
+            GGML_ABORT("data_device_ptr_checked: no usable device pointer");
+        }
+        return ptr;
+    }
+
     // Set data pointer for a device.  Updates both legacy data_device and the
     // smart handle.  Device pointers must go through the chunk-aware bridge so
     // arena-backed runtime storage is leased by the handle instead of being
