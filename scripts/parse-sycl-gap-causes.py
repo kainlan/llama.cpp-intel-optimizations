@@ -169,6 +169,18 @@ def device_submit_ns(timeline: Any, event: dict[str, Any]) -> float | None:
     profiler's 0 sentinel.  A present-but-non-numeric value is left to raise, as
     every other numeric arg in this parser does: a broken instrument should be
     loud rather than silently reported as "no serialization observed".
+
+    **A zero `implicit_queue_serialization` is not a negative result until you
+    have checked this field's coverage.**  The profiler writes 0 whenever the
+    runtime supplied no submit timestamp, and under **graph replay** submits are
+    recorded at graph-*record* time, so a replayed decode path may carry poor or
+    absent `device_submit_ns` coverage -- and the captures this classifier was
+    built for run with graph replay ON, which makes that the likely case rather
+    than a hypothetical one.  Every such event returns None here and falls
+    through to `CAUSE_TRULY_IDLE`, so a broken or unpopulated instrument and a
+    genuinely unserialized queue produce the identical hard zero.  Count how many
+    `sycl.event` records resolve a non-zero `device_submit_ns` before reading a
+    zero count as "serialization is absent".
     """
     raw = timeline.arg_or_metadata_field(event, "device_submit_ns")
     if raw in (None, ""):
