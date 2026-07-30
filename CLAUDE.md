@@ -452,16 +452,39 @@ no longer in this machine. Treat any B580 figure as historical.
 PCI / DRM mapping, because the numbering is not intuitive and the logs do not
 disambiguate it:
 
-| selector | card | PCI | render node |
-|----------|------|-----|-------------|
-| `level_zero:0` | Arc Pro B70 (G31) | `0000:03:00.0` | `renderD128` |
-| `level_zero:1` | Arc Pro B50 (G21) | `0000:07:00.0` | `renderD130` |
-| — | Arrow Lake-S iGPU | `0000:00:02.0` | `renderD129` |
+| selector | card | PCI | render node | DRM card |
+|----------|------|-----|-------------|----------|
+| `level_zero:0` | Arc Pro B70 (G31) | `0000:03:00.0` | `renderD129` | `card0` |
+| `level_zero:1` | Arc Pro B50 (G21) | `0000:07:00.0` | `renderD130` | `card2` |
+| — | Arrow Lake-S iGPU | `0000:00:02.0` | `renderD128` | `card1` |
+
+⚠️ **This table had `renderD128` and `renderD129` SWAPPED until 2026-07-30** — it
+listed the B70 as `renderD128`, which is actually the iGPU. Verified against the
+live sysfs links (below) plus `lspci`: `0000:03:00.0` is Battlemage G31 (B70) and
+`0000:00:02.0` is Arrow Lake-S. The swap is not cosmetic — Frigate's QSV jobs run
+on `renderD128`, so with the old table any `pgrep -af ffmpeg` showing
+`-qsv_device /dev/dri/renderD128` read as **"Frigate is contending on the B70"**,
+which would make a healthy benchmark look invalid and send you hunting for
+contention that isn't there. It is the reverse of the ~1100 PP512 stale-guardrail
+trap: a false *invalidation* rather than a false regression.
+
+**Derive it live rather than trusting the table** — this numbering can move across
+boots, and the whole point of the entry below is that you cannot infer it:
+
+```bash
+for n in /sys/class/drm/renderD*; do
+  printf '%s -> ' "$(basename $n)"
+  readlink -f $n/device | grep -oE '[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9]' | tail -1
+done
+# then name each PCI id:  lspci -s 03:00.0   ->  Battlemage G31 = B70
+```
 
 DRM `cardN` numbering and `renderDN` numbering are **independent** — do not infer
-one from the other. The `device=N` printed in SYCL logs is the in-process index
-*after* `ONEAPI_DEVICE_SELECTOR` filtering, not the physical card: a B50-only run
-and a B70-only run both print `device=0`. Key off the selector, never the log id.
+one from the other (note `card0` is the B70 while `renderD128` is the iGPU: the
+two sequences do not even agree on which device comes first). The `device=N`
+printed in SYCL logs is the in-process index *after* `ONEAPI_DEVICE_SELECTOR`
+filtering, not the physical card: a B50-only run and a B70-only run both print
+`device=0`. Key off the selector, never the log id.
 
 Before trusting any B70 benchmark, check the reported free VRAM in the startup
 log. Other workloads (e.g. ComfyUI) can hold tens of GB on that card; a run that
@@ -491,7 +514,14 @@ Rules:
   reboot, and avoid DRM fdinfo checks while a SYCL process is hung.
 
 Current-boot B70/B50 P2P topology warnings are diagnostic only. Frigate
-QSV/OpenVINO jobs on the iGPU render node are not B70/B50 consumers.
+QSV/OpenVINO jobs on the iGPU render node are not B70/B50 consumers — **re-verified
+2026-07-30**: all 7 QSV-decoding `ffmpeg` processes pass
+`-qsv_device /dev/dri/renderD128`, and `renderD128` is `0000:00:02.0`, the iGPU.
+This conclusion was right while the table above was wrong, which is the worst
+combination: the prose said "not a B70 consumer" and the table said `renderD128` was
+the B70, so checking one against the other manufactured a contradiction. Frigate
+does cost ~250 % CPU (30 `ffmpeg` processes here), so it still depresses *absolute*
+throughput numbers via CPU contention — just not via the B70's execution units.
 
 ### Performance Expectations
 
