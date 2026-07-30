@@ -16,3 +16,24 @@ void use_explicit_null_check(const fake_extra * extra, int id) {
     }
     (void) (src_ptr + 16);
 }
+
+// Regression: the idiomatic truthiness check. The checker MUST accept this --
+// `if (ptr)` is the most common null check in the SYCL backend, and flagging it
+// forces needless edits to code that is already safe (ggml-sycl.cpp:5034).
+void use_truthiness_check(const fake_extra * extra, int id) {
+    void * dev_ptr = extra->data_device_ptr(id);
+    if (dev_ptr) {
+        (void) dev_ptr;
+    }
+}
+
+// Regression: the guard sits on the PRECEDING line, wrapping the assignment, so
+// a forward-only scan cannot see it. The checker MUST accept this
+// (ggml-sycl.cpp:6964-6965).
+void use_preceding_guard(const fake_extra * extra, int id) {
+    void * gate_ptr = nullptr;
+    if (extra && extra->data_device_ptr(id)) {
+        gate_ptr = extra->data_device_ptr(id);
+    }
+    (void) gate_ptr;
+}
