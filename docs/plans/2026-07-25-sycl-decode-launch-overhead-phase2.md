@@ -241,7 +241,21 @@ The original rule table is kept below for the record.
 
 ---
 
-### Task 4: Establish whether the `binbcast.event` no-op is causal (Cluster B)
+### Task 4: Establish whether the `binbcast.event` no-op is causal (Cluster B) — ✅ **DONE 2026-07-30: NOT CAUSAL** (`llama.cpp-kjj9`, findings doc Task 14, commits `051a86ba6` / `046fdbc5f`)
+
+**Verdict:** deleting all 72 markers/step recovers **0.293 ms/step — their own cost, nothing more.**
+The three Cluster B transitions keep their gap counts **event-for-event** (99 / 2300 / 2388→2389)
+and merely re-label their predecessor from `binbcast.event` to `binbcast.mul`. Unprofiled
+interleaved A/B over 10 order-counterbalanced pairs: **+0.244 t/s (+0.51 %), 95 % CI −0.45…+0.94 —
+spans zero**; 9/10 pairs positive (sign test p = 0.022), so the direction is likely real while the
+magnitude is not resolvable against documented B70 tg noise (cv 3.3 %). Honest effect size
+**0.1–0.3 ms/step, ~0.5–1.4 % of TG.** The "Not causal" row of Task 5's decision table fires; see
+`docs/plans/2026-07-30-cluster-b-decision.md`.
+
+**The transferable lesson, because it cost this plan five task-sections:** a predecessor-keyed
+transition table turns mere *adjacency* into apparent structure. Cluster B's entire 5.5 ms/step
+budget rested on one such ranking. **Test an `X --to-- Y` attribution by deleting X before
+assigning it a budget.**
 
 **Why:** 72 empty `single_task` submissions per token, 0.0382 ms/step of device time, followed by 5.503 ms/step of `truly_idle` — on an in-order queue that already guarantees the ordering the marker exists to provide. If causal, this is the single largest actionable item in the capture. If not, Cluster B's budget must be re-attributed and the marker left alone.
 
@@ -342,13 +356,41 @@ ONEAPI_DEVICE_SELECTOR=level_zero:1 timeout 300 ./build/bin/llama-completion \
   -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 
-# 2. ctest
-ctest --test-dir build --output-on-failure -j $(nproc)
+# 2. ctest — THROTTLED, and with the GPU-allocating family excluded.
+#    ⚠️ This step read `-j $(nproc)` until 2026-07-30. That command is the
+#    OOM hazard CLAUDE.md documents: tests #1-#19 are the SYCL mem-handle /
+#    MoE-residency family, they all allocate GPU buffer objects whose TTM
+#    shmem backing grows without bound, and they sit at the FRONT of the list,
+#    so `-j 20` on this 20-core box starts all 19 at once. It took down the
+#    host twice on 2026-07-25, each time killing the Claude Code CLI along
+#    with dbus-broker and xdg-document-portal. A plan step marked MANDATORY
+#    must not be the step that reboots the machine.
+ctest --test-dir build --output-on-failure -j 4 -LE 'residency|mem-handle|cache'
+
+#    The excluded family, serially, MANUALLY only -- never in a subagent or a
+#    background task. Check `uptime` first; skip it on a loaded machine.
+ctest --test-dir build -L residency --output-on-failure -j 1
+
+#    NOTE: `test-unified-cache-unpin-event` carries LABELS "sycl;cache;mem-handle",
+#    so the throttled run above SKIPS it by design. Run it explicitly:
+ctest --test-dir build -R unpin-event --output-on-failure
 
 # 3. B70 throughput vs docs/backend/sycl-perf-baselines.md (~1415 PP512 / ~44 TG128)
+#    Check for competing load first -- an absolute number taken under load is
+#    depressed and must not become a baseline.
+uptime; pgrep -af 'codescout|ninja|icpx|ffmpeg'
 ONEAPI_DEVICE_SELECTOR=level_zero:0 GGML_SYCL_OP_TIMEOUT_MS=180000 \
   timeout 900 ./build/bin/llama-bench \
   -m /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf -p 512 -n 128
+
+# 4. After ANY crash, forced stop, or OOM above, the GPU state is suspect and
+#    every number from step 3 is invalid until this is clean:
+journalctl -k --since "1 hour ago" --no-pager | grep -iE 'GT reset|guc_id|GPU hang|xe.*reset'
 ```
+
+⚠️ **A single-digit tok/s figure on Mistral Q4_0 is a CPU fallback, not a regression** — that is
+what step 0 exists to catch, and it is why step 0 comes before the gates rather than after. The
+digit gates in steps 1–2 check *tokens*, not which backend produced them, so a build with
+`GGML_SYCL=OFF` passes all of them at ~8 tok/s instead of ~108.
 
 **B70 tg128 is the noisy axis** (cv 3.3 %, range 40.18–46.27 over 21 runs) — ignore single-run differences below ~10 %. The B50 is steady (cv 0.7 % tg) and is the better card for detecting a small real move.
