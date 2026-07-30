@@ -2851,7 +2851,14 @@ struct ggml_tensor_extra_gpu {
 
     // Compatibility shim: resolve data_handle if set, else fall back to raw data_device.
     // Use this instead of data_device[dev] directly for incremental migration.
+    // An out-of-range dev returns nullptr like any other "no usable pointer for
+    // this device" case, so the ~60 call sites that already null-check need no
+    // change; without it the very first statement below reads past the end of
+    // data_handle[].
     void * data_device_ptr(int dev) const {
+        if (dev < 0 || dev >= GGML_SYCL_MAX_DEVICES) {
+            return nullptr;
+        }
         const auto & handle = data_handle[dev];
         if (handle.device() == dev || handle.device() == ggml_sycl::mem_handle::HOST_DEVICE) {
             auto resolved = handle.resolve(dev);
@@ -2887,7 +2894,16 @@ struct ggml_tensor_extra_gpu {
     // the legacy fallback finds a DEVICE allocation registered to a different
     // device; callers that skip the null check then do pointer arithmetic on it
     // and fault inside a device memcpy.  Prefer this at every dereference site.
+    // An out-of-range dev is reported here rather than delegated: data_device_ptr()
+    // indexes data_handle[dev] on entry, and the diagnostic below indexes all three
+    // per-device arrays, so both would read out of bounds before this could report
+    // anything.
     void * data_device_ptr_checked(int dev, const char * caller) const {
+        if (dev < 0 || dev >= GGML_SYCL_MAX_DEVICES) {
+            GGML_LOG_ERROR("[SYCL] %s: device index out of range: dev=%d (valid 0..%d)\n", caller ? caller : "?", dev,
+                           GGML_SYCL_MAX_DEVICES - 1);
+            GGML_ABORT("data_device_ptr_checked: device index out of range");
+        }
         void * ptr = data_device_ptr(dev);
         if (ptr == nullptr) {
             GGML_LOG_ERROR(
