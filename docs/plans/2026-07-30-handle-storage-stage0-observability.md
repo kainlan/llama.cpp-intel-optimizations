@@ -43,7 +43,7 @@ digraph dependencies {
     2 [label="T2: data_device_ptr_checked()"];
     3 [label="T3: HANDLE_STRICT global+env"];
     4 [label="T4: warnings honor strict"];
-    5 [label="T5: substitute 6 call sites"];
+    5 [label="T5: substitute 7 call sites"];
     6 [label="T6: SPIKE - measure divergence"];
     7 [label="T7: document env var"];
     2 -> 5;
@@ -93,7 +93,7 @@ prefers zero risk, run Task 3 before Task 2 and keep track A strictly after it.
 
 **Description:**
 
-Adds a checker that flags any assignment from `data_device_ptr(...)` that is not immediately followed by a null check, and a ctest gate asserting the checker passes on a good fixture and fails on a bad one. This gate is the RED for Task 5 — it must FAIL against the current `ggml-sycl.cpp` (which has 6 unchecked sites) and go green once Task 5 lands.
+Adds a checker that flags any assignment from `data_device_ptr(...)` that is not immediately followed by a null check, and a ctest gate asserting the checker passes on a good fixture and fails on a bad one. This gate is the RED for Task 5 — it must FAIL against the current `ggml-sycl.cpp` and go green once Task 5 lands. **The verified count is 7, not the 6 this plan originally claimed** (see Task 5), and the checker itself found the discrepancy.
 
 **Acceptance Criteria:**
 
@@ -489,7 +489,13 @@ git commit -m "feat(sycl): surface handle/raw divergence under HANDLE_STRICT"
 
 **Description:**
 
-Replaces the six unchecked `data_device_ptr()` dereferences with `data_device_ptr_checked()`. `:33394` is on the **live** `--split-mode row` path; the rest are on TP branches that are currently unreachable from llama core but share the identical shape. This turns Task 1's gate green.
+Replaces the **seven** unchecked `data_device_ptr()` dereferences with `data_device_ptr_checked()`. The live `--split-mode row` site (`:33394` at plan time, `:33399` after T3's edit) is the only one reachable from llama core; the rest are on TP branches that share the identical shape. This turns Task 1's gate green.
+
+⚠️ **This plan originally said six.** Task 1's checker found a seventh — `:29476`, an unchecked deref inside a `g_ggml_sycl_tp_debug` block — which the audit behind the plan had missed, while the audit had also wrongly classified `:6960` as unchecked. Use the checker's list, not this document's, and re-locate every line number immediately before editing:
+
+```bash
+bash scripts/check-sycl-handle-usage.sh ggml/src/ggml-sycl
+```
 
 **Acceptance Criteria:**
 
