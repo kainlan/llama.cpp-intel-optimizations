@@ -430,9 +430,33 @@ if (GGML_SYCL)
         target_compile_options(test-unified-cache-unpin-event PRIVATE "-fsycl")
         target_link_options(test-unified-cache-unpin-event PRIVATE "-fsycl")
     endif()
+    #
+    # ENVIRONMENT pins the card, and it is load-bearing because the test's OWN
+    # default is silently ineffective. main() opens with
+    #     if (!getenv("ONEAPI_DEVICE_SELECTOR")) setenv(..., "level_zero:0", 1);
+    # but by then the SYCL runtime has already enumerated devices, so the setenv
+    # changes nothing. Measured 2026-07-30: run with the selector unset, the test
+    # prints BOTH GPUs (B70 at level_zero:gpu:0, B50 at gpu:1) and selects logical
+    # device 0 -- the Arc Pro B70. So an unqualified `ctest -R unpin-event` lands on
+    # the BENCHMARK/measurement card and can perturb a concurrent capture. It does
+    # NOT abort, and it does not honour its own level_zero:0 intent either; it just
+    # takes whatever device 0 happens to be.
+    #
+    # Pinned to level_zero:1 (Arc Pro B50, the validation card) so a bare ctest run
+    # is both self-consistent and off the measurement card. Device numbering is
+    # machine-specific -- see CLAUDE.md's selector table before changing this; the
+    # `device=N` in SYCL logs is the post-filter in-process index, not the physical
+    # card.
+    #
+    # SEPARATE PREREQUISITE, do not conflate the two: oneAPI must be sourced
+    # (`source /opt/intel/oneapi/setvars.sh --force`) or the runtime finds no
+    # platform at all and the test aborts with "no devices found on any platform"
+    # at dpct/helper.hpp. That is a missing runtime environment, not a selector
+    # problem, and ENVIRONMENT here cannot fix it.
     llama_test(test-unified-cache-unpin-event LABEL "main" ARGS --mode=compare --iters=50)
     set_tests_properties(test-unified-cache-unpin-event PROPERTIES
         LABELS "sycl;cache;mem-handle"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
         TIMEOUT 600
     )
 endif()
