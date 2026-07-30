@@ -10,7 +10,16 @@ follow-up questions that decide whether a dominant `runtime_idle` is actionable:
    of the classifier, so it absorbs both genuine runtime latency and every gap
    the first two tests merely failed to *prove* something about.  A verdict of
    "`runtime_idle` dominates" is only actionable once the residual is separated
-   from the signal.  See `GAP_CAUSE_NAMES` for the split.
+   from the signal.  See `gap_cause_names` for the split.
+
+   One of those causes is not an instrument artifact but a second mechanism.
+   `device_gap_has_dependency` recognises a dependency only through an explicit
+   `depends_on` event id, and ggml-sycl's GPU queues are all in-order (see the
+   queue construction in `ggml/src/ggml-sycl/common.hpp`), so they serialize
+   *implicitly*, declaring no edge at all.  `queue_serialization` is therefore
+   close to unreachable on this backend whatever the truth is, and an unknown
+   share of the residual may be serialization wearing the residual's name.
+   `implicit_queue_serialization` separates it out.
 
 2. **Which transitions** carry a given class?  `parse-sycl-timeline.py`'s
    `--top-gaps` ranks transitions with all three classes pooled together.  That
@@ -81,10 +90,26 @@ CAUSE_SUBMIT_PIPELINED_AHEAD = "submit_pipelined_ahead"
 # which is an error rather than a reclassification.
 CAUSE_SUM_COVERS_MAX_DOES_NOT = "sum_covers_max_does_not"
 
-# Submits are present and ordered, and host `compute_forward_node` work does not
-# cover the gap.  The real residual: time explained by neither our host work nor
-# a declared dependency.
+# The successor was already handed to the queue when the predecessor finished,
+# so the in-order queue -- not the host, and not any declared dependency -- is
+# what held it back.  This is the class `device_gap_has_dependency` cannot see:
+# an in-order queue serializes without declaring a `depends_on` edge, so these
+# gaps fall through to `runtime_idle` by construction.  Not an instrument
+# artifact; a second mechanism, and the one that has to be excluded before a
+# residual gap can be read as launch overhead.
+CAUSE_IMPLICIT_QUEUE_SERIALIZATION = "implicit_queue_serialization"
+
+# Submits are present and ordered, host `compute_forward_node` work does not
+# cover the gap, and the successor was not yet queued when the predecessor
+# finished.  The real residual: time explained by neither our host work, nor a
+# declared dependency, nor the queue's own ordering.
 CAUSE_TRULY_IDLE = "truly_idle"
+
+# `sycl-kernel-profiler.cpp` emits `device_submit_ns=0` when the runtime gave it
+# no submit timestamp, so 0 means "unavailable", not "submitted at time zero".
+# Taken at face value it precedes every predecessor's completion and would make
+# every such gap read as implicit serialization.
+DEVICE_SUBMIT_UNAVAILABLE_NS = 0.0
 
 
 def gap_cause_names(coverage: str) -> tuple[str, ...]:
@@ -99,9 +124,15 @@ def gap_cause_names(coverage: str) -> tuple[str, ...]:
             CAUSE_NO_SUBMIT_SPAN,
             CAUSE_SUBMIT_PIPELINED_AHEAD,
             CAUSE_SUM_COVERS_MAX_DOES_NOT,
+            CAUSE_IMPLICIT_QUEUE_SERIALIZATION,
             CAUSE_TRULY_IDLE,
         )
-    return (CAUSE_NO_SUBMIT_SPAN, CAUSE_SUBMIT_PIPELINED_AHEAD, CAUSE_TRULY_IDLE)
+    return (
+        CAUSE_NO_SUBMIT_SPAN,
+        CAUSE_SUBMIT_PIPELINED_AHEAD,
+        CAUSE_IMPLICIT_QUEUE_SERIALIZATION,
+        CAUSE_TRULY_IDLE,
+    )
 
 
 def sum_host_node_overlap_us(nodes: list[tuple[float, float, str]], start_us: float, end_us: float) -> float:
@@ -125,18 +156,74 @@ def sum_host_node_overlap_us(nodes: list[tuple[float, float, str]], start_us: fl
     return total
 
 
+def device_submit_ns(timeline: Any, event: dict[str, Any]) -> float | None:
+    """The successor's submit timestamp on the *device* profiling clock.
+
+    `sycl-kernel-profiler.cpp` writes `device_submit_ns` into the `sycl.event`
+    metadata alongside `device_start_ns` / `device_end_ns`, all three on the same
+    device clock -- which is what makes them comparable.  `host_submit_*_us` is
+    on the host steady clock and is *not* comparable with a device timestamp, so
+    it cannot answer this question.
+
+    Returns None when the field is absent (an older capture) or carries the
+    profiler's 0 sentinel.  A present-but-non-numeric value is left to raise, as
+    every other numeric arg in this parser does: a broken instrument should be
+    loud rather than silently reported as "no serialization observed".
+    """
+    raw = timeline.arg_or_metadata_field(event, "device_submit_ns")
+    if raw in (None, ""):
+        return None
+    value = timeline.numeric_arg_field(event, "device_submit_ns")
+    if value <= DEVICE_SUBMIT_UNAVAILABLE_NS:
+        return None
+    return value
+
+
+def device_gap_has_implicit_serialization(
+    timeline: Any,
+    next_event: dict[str, Any],
+    gap_start_ns: float,
+) -> bool:
+    """Was the successor already queued when the predecessor finished?
+
+    Callers form gaps per (device, queue_kind), so `next_event` is on the same
+    queue as the predecessor whose completion is `gap_start_ns`, and every
+    ggml-sycl GPU queue is in-order.  A successor submitted before that
+    completion could therefore not have started any earlier however idle the
+    device looked -- the queue's own ordering held it, and the gap is
+    serialization rather than idleness.
+
+    Strict `<`: a submit landing exactly at the predecessor's completion is not
+    proof the queue held anything.
+    """
+    submit_ns = device_submit_ns(timeline, next_event)
+    if submit_ns is None:
+        return False
+    return submit_ns < gap_start_ns
+
+
 def classify_runtime_idle_cause(
     timeline: Any,
     previous_event: dict[str, Any],
     next_event: dict[str, Any],
+    gap_start_ns: float,
     gap_ns: float,
     submits_by_event_id: dict[str, tuple[float, float, str, dict[str, Any], str | None]],
     nodes: list[tuple[float, float, str]],
 ) -> str:
     """Explain why one already-`runtime_idle` gap failed the `host_overlap` test.
 
-    Mirrors `device_gap_has_host_overlap`'s early returns in order, so each cause
-    corresponds to exactly one branch of that function.
+    The first three causes mirror `device_gap_has_host_overlap`'s early returns
+    in order, so each corresponds to exactly one branch of that function.
+    `CAUSE_IMPLICIT_QUEUE_SERIALIZATION` is then tested last, immediately before
+    the residual, so it carves out of `CAUSE_TRULY_IDLE` and nothing else --
+    every other cause keeps the meaning and the value it had before it existed.
+
+    Consequence worth stating: the reported implicit-serialization figure is a
+    **lower bound**.  Gaps already attributed to `no_submit_span` or
+    `submit_pipelined_ahead` are not re-examined, and some of them may be
+    serialization too.  Re-testing them here would double-count, which is why
+    the partition is ordered rather than overlapping.
     """
     previous_submit = timeline.submit_span_for_event(previous_event, submits_by_event_id)
     next_submit = timeline.submit_span_for_event(next_event, submits_by_event_id)
@@ -149,6 +236,8 @@ def classify_runtime_idle_cause(
         sum_host_node_overlap_us(nodes, previous_submit[1], next_submit[0]) >= required_overlap_us
     ):
         return CAUSE_SUM_COVERS_MAX_DOES_NOT
+    if device_gap_has_implicit_serialization(timeline, next_event, gap_start_ns):
+        return CAUSE_IMPLICIT_QUEUE_SERIALIZATION
     return CAUSE_TRULY_IDLE
 
 
@@ -203,7 +292,7 @@ def summarize_gap_causes(
                 else:
                     gap_class = "runtime_idle"
                     cause = classify_runtime_idle_cause(
-                        timeline, previous_event, event, gap_ns, submits_by_event_id, nodes
+                        timeline, previous_event, event, previous_end, gap_ns, submits_by_event_id, nodes
                     )
                     cause_total[cause] += gap_total
                     cause_count[cause] += 1
