@@ -269,7 +269,26 @@ Consumer 2 is a **weight-cache lease release gated on GPU completion**. `unified
 
 ---
 
-### Task 5: Cluster B fix — make it the default, or re-attribute
+### Task 5: Cluster B fix — ⛔ **NO FIX PLAN WRITTEN** ("Not causal" row fired, 2026-07-30)
+
+Task 4 (`llama.cpp-kjj9`, findings doc Task 14) returned **NOT CAUSAL**: deleting all
+72 markers/step recovered 0.293 ms/step — their own cost — while the three Cluster B
+transitions kept their gap counts event-for-event (99 / 2300 / 2388→2389) and merely
+re-labelled their predecessor. So the third row of the table below fires.
+
+**Decision record: `docs/plans/2026-07-30-cluster-b-decision.md`** (`llama.cpp-79m7`).
+Default stays `barrier`; `reuse` remains opt-in and documented; `binbcast.cpp` is left
+alone on performance grounds. **Cluster B's ~5.3 ms/step is now unattributed** and its
+re-attribution is Task 7 (`llama.cpp-hzgc`).
+
+⚠️ Do not flip the default later without closing `llama.cpp-g6iw` first — the
+weight-cache lease consumer is never reached in any measured configuration, so the
+passing gates do not show `reuse` is safe for it, and its failure mode presents as a
+speedup.
+
+The original decision table is kept below for the record.
+
+### Task 5 (superseded): Cluster B fix — make it the default, or re-attribute
 
 **Entry:** Task 4's verdict.
 
