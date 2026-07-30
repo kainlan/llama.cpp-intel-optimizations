@@ -92,9 +92,21 @@ After any OOM or forced stop, **check the GPU before trusting a benchmark** —
 `journalctl -k --since "1 hour ago" --no-pager | grep -iE 'GT reset|guc_id|CAT error'`.
 
 ### Code Formatting
+
+⚠️ **`git clang-format` does not exist on this machine** — it exits 1. Git resolves
+`git <sub>` by looking for `git-<sub>` in `PATH`, and only the *versioned*
+`git-clang-format-19` is installed (`/usr/bin/git-clang-format-19`); there is no
+unversioned `git-clang-format`. This file recommended the broken form as
+**preferred** until 2026-07-30, so the one step labelled preferred was the one that
+failed. Use either spelling below — both verified working:
+
 ```bash
 # Preferred: format only staged changes (uses .clang-format)
-git clang-format
+git-clang-format-19          # direct
+git clang-format-19          # identical; git dispatches to the same binary
+
+# Check without writing (operates on the staged tree)
+git-clang-format-19 --diff --staged   # "clang-format did not modify any files" = clean
 
 # Format specific files
 clang-format-19 -i <file.cpp>
@@ -577,7 +589,8 @@ var not documented: search `getenv("GGML_SYCL` under `ggml/src/ggml-sycl/`
 ## CI and Validation
 
 ### Before Submitting PRs
-1. Format code: `git clang-format` (preferred) or `clang-format-19 -i <files>`
+1. Format code: `git-clang-format-19` (preferred — **not** `git clang-format`, which does
+   not exist here; see "Code Formatting") or `clang-format-19 -i <files>`
 2. Build: `./scripts/sycl-build.sh`
 3. Test: `ctest --test-dir build --output-on-failure`
 4. For ggml changes: Run `test-backend-ops` on multiple backends — **manually only, never in a subagent/background task (memory-exhaustion hazard, see Hard-Won Rules)**
