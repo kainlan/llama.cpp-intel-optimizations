@@ -1701,7 +1701,23 @@ of the idle that follows them — their own submission cost — and leaves the
 remaining ~5.3 ms/step of `truly_idle` intact, in the same gaps, with the same
 counts, merely re-labelled to a different predecessor. Cluster B's 5.503 ms/step
 budget must be re-attributed. `binbcast.cpp` should be left alone on the strength
-of this measurement (Task 5's "not causal" row).
+of this measurement — the "Not causal" row of the **Plan phase 2 Task 5**
+decision table (`docs/plans/2026-07-25-sycl-decode-launch-overhead-phase2.md`,
+`### Task 5 (superseded)`, currently `:291-299`). That row has since fired:
+`llama.cpp-79m7` recorded the outcome at `### Task 5: Cluster B fix — ⛔ NO FIX
+PLAN WRITTEN` (currently `:272-282`), with the decision record in
+`docs/plans/2026-07-30-cluster-b-decision.md`. Line numbers in that plan are
+drifting as it is amended, so the headings above are the durable locators.
+
+> **Reference convention in this section.** Bare "Task *N*" always means a section
+> of **this** findings document. Every reference to the phase-2 plan is written
+> **"Plan phase 2 Task *N*"** with a line cite, following the convention Task 9
+> (`:1182`, `:1185` — "Plan A's Task 7 decision table", "Plan A's Task 6 gotcha")
+> and Task 13 (`:1653` — "Plan phase 2 Task 4") already use. The numbering
+> collides — this
+> document's Task 5 is a trace capture, the plan's Task 5 is the Cluster B
+> decision table — so an unqualified reference lands a reader in the wrong place
+> inside the same file.
 
 Binary: **`aa135af89`** for every capture and every A/B arm below (`llama-bench`
 self-reports `build: c2549fb19` — that is the stale baked-in build-info string
@@ -1905,7 +1921,8 @@ disappear; their *predecessor label* shifts from the deleted marker to the
 
 This is "following is not causing" demonstrated directly rather than argued. The
 gap population is identical — 99, 2300, 2388/2389 — and the n=99 inter-graph
-coincidence from Task 9/11 reproduces exactly in both arms. Delete the marker and
+coincidence first stated in Task 10 (`:1312`) and reproduced in Task 11 (`:1528`)
+reproduces exactly in both arms here too. Delete the marker and
 the same 4787 gaps across the 100-step window (≈47.9/step) are still there,
 0.293 ms/step shorter in aggregate,
 which is **the marker's own cost and nothing else**: 0.0385 ms/step of device
@@ -1913,9 +1930,23 @@ time plus ~0.25 ms/step of per-submission host and queue turnaround for 72
 submissions (~3.5 µs each, a plausible submission cost on this stack).
 
 The RED baseline also reproduces the published attribution, so this is a
-comparison against a sound before-point rather than a fresh number floating free:
-`truly_idle` 9.723 ms/step here vs **9.602 ms/step** published in Task 6
-(n=18979 vs 18840), and the marker-following idle 5.599 vs **5.503 ms/step**.
+comparison against a sound before-point rather than a fresh number floating free.
+Both figures I compare against originate in **Task 10**, not Task 6:
+
+| this capture | published | where that number actually lives |
+|---|---|---|
+| `truly_idle` 9.723 ms/step, n=18979 | **9.602 ms/step**, n=18840 | Task 10, `:1252` — the class-first re-analysis table. Derived from Task 9's raw `runtime_idle` = 10.242 ms/step (`:1162`). Restated in Task 10's coverage-policy note (`:1445`) as invariant under both `HOST_OVERLAP_COVERAGE` rules, and re-measured 9.691 ms/step by Task 11 (`:1510`) |
+| marker-following idle 5.599 ms/step | **5.503 ms/step** | Task 10, `:1385` — "57.3 % of the actionable 9.602" |
+
+⚠️ **An earlier revision of this section cited "Task 6" for the 9.602 figure.
+That was wrong twice over** and is corrected here: the number is not in Task 6,
+and Task 6 (`:532`) states in its own first line that *"the attribution could not
+be performed, and no class share is stated below"* — so it publishes no
+`truly_idle` value at all to be compared with. (The 15.533 ms / 75.2 %
+non-kernel-share figures at `:479-480` are what Task 6 does carry, and they
+answer a different question.) A reader chasing the old citation to check this
+baseline's lineage — which is precisely what makes the before-point sound — would
+have landed in a section that disclaims having the number.
 
 ### A/B: interleaved, 10 paired runs, unprofiled
 
@@ -2012,10 +2043,10 @@ event can never release a pin) and by a host-only policy assertion — not by
 execution. Anyone acting on this section, in particular `llama.cpp-79m7` if it
 considers flipping the default, must treat the unpin path as untested at runtime.
 
-### What this means for Cluster B and Task 5
+### What this means for Cluster B and Plan phase 2 Task 5
 
-- **Task 5 takes its "Not causal" row.** Leave `binbcast.cpp` alone on
-  performance grounds; do not make `reuse` the default to chase the 5.5 ms,
+- **Plan phase 2 Task 5 takes its "Not causal" row.** Leave `binbcast.cpp` alone
+  on performance grounds; do not make `reuse` the default to chase the 5.5 ms,
   because the 5.5 ms is not there to be had. If `reuse` is adopted it should be
   argued as a small, structurally cleaner change (7200 fewer submissions/step,
   one fewer manufactured event, the only detected explicit queue serialization
@@ -2025,13 +2056,39 @@ considers flipping the default, must treat the unpin path as untested at runtime
   from the marker. The gaps persist unchanged with the marker gone, so the cause
   lies in whatever the host is doing between the `binbcast.mul` that ends one
   unit of work and the `rope` / `softmax.forward` / `get_rows.marker` that starts
-  the next — the same per-layer host-side question Task 7 / `llama.cpp-hzgc`
-  owns. The `implicit_queue_serialization` classifier, now known to be applicable
-  at 100 % `device_submit_ns` coverage, rules out in-order queue serialization as
-  the mechanism (0.000 ms/step in both arms), which narrows that hunt.
-- **A methodological note worth keeping.** The marker looked causal because it
-  was the last event before the largest idle gaps in the capture, and a
-  transition table keyed on predecessor name made that adjacency look like
-  structure. Removing it moved the label and left the gap. Any future
-  attribution built on `X --to-- Y` transition rankings should be tested the same
-  way — by deleting X — before a budget is assigned to it.
+  the next — the same per-layer host-side question **Plan phase 2 Task 7**
+  (`llama.cpp-hzgc`) owns; note that this document's own Task 7 (`:737`) is the
+  unrelated phase-2 selection section. The `implicit_queue_serialization`
+  classifier, now known to be applicable at 100 % `device_submit_ns` coverage,
+  rules out in-order queue serialization as the mechanism (0.000 ms/step in both
+  arms), which narrows that hunt.
+
+### Adjacency is not structure: test an `X --to-- Y` attribution by deleting X
+
+The most transferable result of this task is not the verdict, it is how the
+verdict was reachable at all.
+
+The marker looked causal because it was the last event before the largest idle
+gaps in the capture, and a transition table **keyed on predecessor name** made
+that adjacency look like structure. Deleting it moved the label and left the gap:
+the same 4787 gaps, the same 99 / 2300 / 2388 counts, now reading
+`binbcast.mul --to-- X` instead of `binbcast.event --to-- X`. A predecessor-keyed
+ranking cannot distinguish "X causes this gap" from "X is merely what happened
+last", and it will present both identically and confidently.
+
+**So: before assigning a budget to any `X --to-- Y` transition, delete X and
+re-measure.** If the gap survives, X is a neighbour, not a cause. This is cheap
+here because the transition tables are the primary attribution instrument in this
+document, and Cluster B's entire 5.503 ms/step budget rested on one such ranking
+for five task-sections before anyone tried removing X.
+
+⚠️ **The corollary bites immediately, and applies to whoever re-attributes
+Cluster B.** In the GREEN capture `binbcast.mul` now precedes those same gaps —
+**only because the marker was deleted.** It is the new neighbour, not a new
+suspect, and it must not inherit the marker's budget by the same adjacency
+mistake that assigned it to the marker.
+
+Scope: this is a claim about predecessor-keyed transition rankings, not about the
+gap classifier itself. The class totals (`host_overlap` / `queue_serialization` /
+`runtime_idle`) are computed per gap and do not depend on which event's name the
+gap is filed under.
