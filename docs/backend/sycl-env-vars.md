@@ -149,7 +149,7 @@ GGML_SYCL_PERSISTENT_TG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `GGML_SYCL_VRAM_BUDGET_PCT=N` | 90 | VRAM budget as % of total (triggers CPU offload when model exceeds) |
+| `GGML_SYCL_VRAM_BUDGET_PCT=N` | **100** | VRAM budget as % of total (triggers CPU offload when model exceeds). ⚠️ This row said **90** until 2026-07-30; that was correct when written but went stale at `9b0fe06aa` (2026-04-02, *"budget = actual free VRAM, default 100% — remove artificial headroom"*), which moved the two load-bearing defaults to 100 and removed the 256 MB/10% headroom deduction. 100% is **not** an unconditional whole-card guarantee: the budget is still capped to actual free VRAM at cache init, plus a structural runtime-slack reservation. Two further copies of this literal (`unified-cache.cpp:9770`, `:9926`) were missed by that commit and still read 90 — see `llama.cpp-ytr7`; one is log-only, the other a pre-init fallback. |
 | `GGML_SYCL_KV_HOST=1` | OFF | Force KV cache to host pinned memory (Level 1 offload) |
 | `GGML_SYCL_KV_HOT_LAYERS=N` | auto | Hot layer count for per-layer KV hot/cold tiering |
 | `GGML_SYCL_KV_HOT_PCT=N` | auto | Hot window as % of total KV buffer |
