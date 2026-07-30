@@ -73,8 +73,9 @@ source /opt/intel/oneapi/setvars.sh --force
 ctest --test-dir build -R <name-or-regex> --output-on-failure
 
 # 2. Full suite, throttled, GPU-allocating family excluded. Check `uptime`
-#    first -- never on a loaded machine.
-ctest --test-dir build --output-on-failure -j 4 -LE 'residency|mem-handle|cache'
+#    first -- never on a loaded machine. The `-E` is NOT optional: see below.
+ctest --test-dir build --output-on-failure -j 4 \
+      -LE 'residency|mem-handle|cache' -E '^test-backend-ops$'
 
 # 3. The excluded family, serially, with monitoring. Manually only -- never in
 #    a subagent or background task.
@@ -83,6 +84,29 @@ ctest --test-dir build -L residency --output-on-failure -j 1
 # Run a single test by name
 ctest --test-dir build -R <test-name> -V
 ```
+
+⚠️ **`-LE 'residency|mem-handle|cache'` does NOT exclude `test-backend-ops`** —
+which is why form 2 above must also carry `-E '^test-backend-ops$'`. Until
+2026-07-30 it did not, so the command this file prescribed as the *safe* one ran
+the single binary this file separately forbids running unattended (see Hard-Won
+Rules: 50–224 GB of TTM shmem, two OOM kills). At `-j 4` it would have started
+alongside three other tests.
+
+The cause is structural, not a typo: `tests/CMakeLists.txt:494` registers it as
+a bare `llama_build_and_test(test-backend-ops.cpp)` with **no labels**, so it
+inherits only the default `main` and no label denylist can reach it. Verify
+rather than assume — a label filter is silently permissive toward anything
+nobody remembered to tag, so it fails *open*:
+
+```bash
+# Always confirm what a filtered sweep will actually run before running it.
+ctest --test-dir build -N -LE 'residency|mem-handle|cache' | grep backend-ops
+# ^ must print NOTHING once -E is added; if it prints a line, do not run the sweep.
+```
+
+Adding `LABELS "cache"` to that registration would also fix it, but it is
+upstream code that a rebase would silently revert, and the failure mode of
+losing the fix is an OOM. Excluding by name is the safer belt.
 
 Pure-Python gates (`test-sycl-gap-causes`,
 `test-sycl-timeline-gap-class-conservation`, `test-jinja-py`) allocate nothing
@@ -622,7 +646,10 @@ var not documented: search `getenv("GGML_SYCL` under `ggml/src/ggml-sycl/`
 1. Format code: `git-clang-format-19` (preferred — **not** `git clang-format`, which does
    not exist here; see "Code Formatting") or `clang-format-19 -i <files>`
 2. Build: `./scripts/sycl-build.sh`
-3. Test: `ctest --test-dir build --output-on-failure`
+3. Test: use a form from "Running Tests" above — **not** a bare
+   `ctest --test-dir build --output-on-failure`, which runs `test-backend-ops`
+   and so contradicts step 4. Prefer `-R <what your change gates>`; for a full
+   sweep use the throttled form with `-E '^test-backend-ops$'`.
 4. For ggml changes: Run `test-backend-ops` on multiple backends — **manually only, never in a subagent/background task (memory-exhaustion hazard, see Hard-Won Rules)**
 5. Verify correctness: run the canonical completion gate (Hard-Won Rules) — tokens must be right, not just fast
 6. Verify performance: `llama-bench` and `llama-perplexity` should not regress
