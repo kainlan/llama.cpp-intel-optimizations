@@ -114,7 +114,31 @@ ggml_sycl_onednn_fa_layout_plan ggml_sycl_flash_attn_ext_onednn_plan(const fattn
     // not: it pre-scales Q by 1/sqrt(n_embd_head) in the graph and hands
     // build_attn a kq_scale of 1.0 (src/models/phi2.cpp), so oneDNN would divide
     // by sqrt(D) a SECOND time. Reject here and let dispatch fall back to a
-    // native kernel — every one of those reads params.scale at runtime.
+    // native kernel — every one of those reads params.scale at runtime, and none
+    // of them bakes in a scale (there is no sqrt anywhere in the native FA
+    // kernels; the only ones in this backend are in THIS file).
+    //
+    // This is not a phi2 quirk. SEVEN in-tree archs pre-scale Q and pass a
+    // kq_scale of 1.0: phi2, gemma2, gemma3, gemma-embedding, gemma3n, gemma4,
+    // gemma4-assistant. All but phi2 sit after it in test-llama-archs' sweep and
+    // had never been reached. Do not "fix" this by special-casing phi2.
+    //
+    // ---- Why the check sits HERE, and not earlier ----------------------------
+    // Both reasons are invisible from the call site, so moving this block for
+    // tidiness silently reintroduces a bug:
+    //
+    //   * It must stay AFTER the softcap check. ggml_sycl_flash_attn_ext does
+    //     `scale /= logit_softcap` when a softcap is set (fattn.cpp, where
+    //     params.scale is filled in), so a softcap model's params.scale is
+    //     ALREADY divided by the time it gets here. Screening softcap out first
+    //     means this gate only ever sees an undivided scale; ahead of it, the
+    //     comparison below would be against a value that was never meant to
+    //     equal 1/sqrt(D), and every softcap model would reject for the wrong
+    //     reason.
+    //   * It must stay AFTER the D range check. It reads params.ne00, and
+    //     ordering it first would report SCALE_UNSUPPORTED for an out-of-range D
+    //     whose scale is perfectly fine — which is both a misleading diagnostic
+    //     and a test failure (test_planner_rejects_unsupported_d).
     //
     // ggml_sycl_flash_attn_ext_onednn asserts this same invariant at execute
     // time; that assertion is the backstop and must stay. This gate is what
