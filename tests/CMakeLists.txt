@@ -354,6 +354,34 @@ if (NOT WIN32)
 endif()
 
 if (NOT WIN32)
+    # Source assertion for the ggml_tensor_extra_gpu device-index invariant. A
+    # member added without a bounds check compiles, links and passes every
+    # runtime gate -- nothing executes the out-of-range path -- so only the
+    # source can be interrogated.
+    llama_test_cmd(
+        bash
+        NAME test-sycl-device-index-policy
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-device-index-policy.sh
+    )
+    # Labels deliberately match the siblings: neither "sycl" nor "policy" is in
+    # the residency|mem-handle|cache denylist, so this stays inside the throttled
+    # sweep that is the only suite routinely running it. A test can be correctly
+    # registered and still never execute.
+    #
+    # The script's own skip condition is `command -v awk`, NOT the siblings'
+    # "no ripgrep and no GNU grep". That is deliberate: those scripts depend on
+    # GNU-specific regex behavior and this one does not, being POSIX awk plus a
+    # plain grep -c. Copying their wider condition would skip on machines where
+    # the check runs fine -- a vacuous pass in the opposite direction.
+    set_tests_properties(test-sycl-device-index-policy PROPERTIES
+        LABELS "sycl;policy"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 120
+    )
+endif()
+
+if (NOT WIN32)
     # Python source-assertion test for the decode-timeline profiling pipeline.
     # Registered because tasks that modify sycl-gptoss-decode-timeline-profile.sh
     # or parse-sycl-timeline.py need a gate the lead can run; tests/ holds dozens
