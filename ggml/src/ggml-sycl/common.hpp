@@ -2840,6 +2840,17 @@ template <typename T> struct ggml_sycl_pool_alloc {
 
 // backend interface
 
+// Bounds check for the fixed-size per-device arrays below (data_device[],
+// data_handle[], the xmx tiling handles, the MoE pointer tables).  Every device
+// id that reaches those accessors today comes from get_current_device_id(),
+// main_device, or a loop bounded by the live device count, so an out-of-range
+// value is a caller bug rather than a runtime condition -- but the array is
+// indexed on entry, before anything downstream could notice, so each accessor
+// checks first.  One compare against a compile-time constant.
+static inline bool ggml_sycl_valid_device_index(int dev) {
+    return dev >= 0 && dev < GGML_SYCL_MAX_DEVICES;
+}
+
 struct ggml_tensor_extra_gpu {
     std::atomic<int>      refcount{ 1 };
     uint64_t              cache_uuid = 0;                                   // Monotonic cache identity for weights
@@ -2856,7 +2867,7 @@ struct ggml_tensor_extra_gpu {
     // change; without it the very first statement below reads past the end of
     // data_handle[].
     void * data_device_ptr(int dev) const {
-        if (dev < 0 || dev >= GGML_SYCL_MAX_DEVICES) {
+        if (!ggml_sycl_valid_device_index(dev)) {
             return nullptr;
         }
         const auto & handle = data_handle[dev];
@@ -2899,7 +2910,7 @@ struct ggml_tensor_extra_gpu {
     // per-device arrays, so both would read out of bounds before this could report
     // anything.
     void * data_device_ptr_checked(int dev, const char * caller) const {
-        if (dev < 0 || dev >= GGML_SYCL_MAX_DEVICES) {
+        if (!ggml_sycl_valid_device_index(dev)) {
             GGML_LOG_ERROR("[SYCL] %s: device index out of range: dev=%d (valid 0..%d)\n", caller ? caller : "?", dev,
                            GGML_SYCL_MAX_DEVICES - 1);
             GGML_ABORT("data_device_ptr_checked: device index out of range");
@@ -2919,7 +2930,17 @@ struct ggml_tensor_extra_gpu {
     // smart handle.  Device pointers must go through the chunk-aware bridge so
     // arena-backed runtime storage is leased by the handle instead of being
     // cached as an unowned raw pointer.
+    // An out-of-range dev aborts rather than being ignored.  There is no
+    // sentinel to return, and dropping the write would leave the tensor with no
+    // storage authority on that device -- the symptom would then surface far
+    // away as a null pointer or a wrong result, which is the failure mode this
+    // guard exists to prevent.  Same shape as data_device_ptr_checked().
     void set_data_device(int dev, void * ptr, ggml_layout_mode layout = GGML_LAYOUT_AOS, bool on_device = true) {
+        if (!ggml_sycl_valid_device_index(dev)) {
+            GGML_LOG_ERROR("[SYCL] set_data_device: device index out of range: dev=%d (valid 0..%d)\n", dev,
+                           GGML_SYCL_MAX_DEVICES - 1);
+            GGML_ABORT("set_data_device: device index out of range");
+        }
         data_device[dev] = ptr;
         if (ptr) {
             data_handle[dev] = ggml_sycl::mem_handle::from_chunk_ptr(ptr, dev, layout, on_device);
@@ -2932,6 +2953,15 @@ struct ggml_tensor_extra_gpu {
                                ggml_sycl::alloc_handle owner,
                                size_t                  bytes,
                                ggml_layout_mode        layout = GGML_LAYOUT_AOS) {
+        // Aborts rather than returning false: `false` here already means "the
+        // owner is not usable, fall back", a recoverable condition callers
+        // handle.  Reusing it for an out-of-range dev would hide a caller bug
+        // behind a plausible fallback path.
+        if (!ggml_sycl_valid_device_index(dev)) {
+            GGML_LOG_ERROR("[SYCL] set_owned_data_device: device index out of range: dev=%d (valid 0..%d)\n", dev,
+                           GGML_SYCL_MAX_DEVICES - 1);
+            GGML_ABORT("set_owned_data_device: device index out of range");
+        }
         data_device[dev]      = nullptr;
         data_handle[dev]      = ggml_sycl::mem_handle{};
         data_device_size[dev] = 0;
@@ -2972,6 +3002,16 @@ struct ggml_tensor_extra_gpu {
                                       ggml_layout_mode              storage_layout = GGML_LAYOUT_AOS,
                                       bool                          on_device      = true,
                                       const ggml_sycl::mem_handle * source_handle  = nullptr) {
+        // Checked before clear_data_authority() so a bad index cannot drop the
+        // existing storage authority on the way to failing.  Aborts for the
+        // same reason as set_data_device(): void return, no sentinel, and a
+        // skipped install surfaces only much later.
+        if (!ggml_sycl_valid_device_index(dev)) {
+            GGML_LOG_ERROR("[SYCL] install_direct_slice_storage: device index out of range: dev=%d (valid 0..%d)\n",
+                           dev, GGML_SYCL_MAX_DEVICES - 1);
+            GGML_ABORT("install_direct_slice_storage: device index out of range");
+        }
+
         clear_data_authority();
 
         data_device[dev]      = ptr;
@@ -3009,13 +3049,21 @@ struct ggml_tensor_extra_gpu {
     }
 
     // Accessor: resolve xmx_mxfp4_tiled through its owning smart handle.
+    // An out-of-range dev returns nullptr, matching data_device_ptr() and the
+    // "no usable pointer for this device" contract every caller already checks.
     void * xmx_tiled_ptr(int dev) const {
+        if (!ggml_sycl_valid_device_index(dev)) {
+            return nullptr;
+        }
         auto resolved = xmx_mxfp4_tiled_handle[dev].resolve(dev);
         return resolved.ptr;
     }
 
     // Accessor: resolve xmx_mxfp4_tiled_aos_staging through its owning smart handle.
     void * xmx_staging_ptr(int dev) const {
+        if (!ggml_sycl_valid_device_index(dev)) {
+            return nullptr;
+        }
         auto resolved = xmx_mxfp4_tiled_aos_staging_handle[dev].resolve(dev);
         return resolved.ptr;
     }
@@ -3023,6 +3071,9 @@ struct ggml_tensor_extra_gpu {
     // Raw accessor: resolves the underlying pointer-table handle regardless of validity.
     // Only use this inside ensure_moe_ptr_table for allocation lifecycle checks.
     void * moe_ptrs_ptr_raw(int dev) const {
+        if (!ggml_sycl_valid_device_index(dev)) {
+            return nullptr;
+        }
         auto resolved = moe_expert_ptrs_handle[dev].resolve(dev);
         return resolved.ptr;
     }
@@ -3030,7 +3081,12 @@ struct ggml_tensor_extra_gpu {
     // Accessor: resolve the active pointer-table handle.
     // Returns nullptr when the device table is marked stale (host-only mode was active on the
     // last update_moe_ptr_table call) — prevents GPU kernels from reading evicted pointers.
+    // Checked here rather than delegated: moe_device_table_valid[dev] is read
+    // before moe_ptrs_ptr_raw() could report anything.
     void * moe_ptrs_ptr(int dev) const {
+        if (!ggml_sycl_valid_device_index(dev)) {
+            return nullptr;
+        }
         if (!moe_device_table_valid[dev]) {
             return nullptr;
         }
@@ -3045,7 +3101,7 @@ struct ggml_tensor_extra_gpu {
                                             bool                  require_layout = false,
                                             ggml_layout_mode      layout         = GGML_LAYOUT_AOS) const {
         payload.clear();
-        if (dev < 0 || dev >= GGML_SYCL_MAX_DEVICES) {
+        if (!ggml_sycl_valid_device_index(dev)) {
             return false;
         }
         const auto & handles = moe_expert_handles[dev];
