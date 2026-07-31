@@ -11,6 +11,7 @@
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstddef>
@@ -40,11 +41,47 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     return mse_a_b / mse_a_0;
 }
 
+// Collect the distinct token positions (rows of n_vocab logits) that contain at least one
+// non-finite value, formatted for a log line. A count alone cannot distinguish "the whole
+// output collapsed" from "two specific positions did", and those have completely different
+// causes -- the latter points at a boundary condition (first/last position of a ubatch, a
+// particular routing decision), which is the single most useful thing to know before
+// touching any code.
+static std::string nonfinite_rows(const std::vector<float> & v, const size_t n_row) {
+    if (n_row == 0 || v.size() % n_row != 0) {
+        return "?";
+    }
+    const size_t n_col = v.size() / n_row;
+
+    std::vector<size_t> rows;
+    for (size_t i = 0; i < n_row; i++) {
+        for (size_t j = 0; j < n_col; j++) {
+            if (!std::isfinite(v[i*n_col + j])) {
+                rows.push_back(i);
+                break;
+            }
+        }
+    }
+    if (rows.empty()) {
+        return "none";
+    }
+
+    const size_t n_show = std::min<size_t>(rows.size(), 16);
+    std::string  ret;
+    for (size_t i = 0; i < n_show; i++) {
+        ret += (i == 0 ? "" : ",") + std::to_string(rows[i]);
+    }
+    if (rows.size() > n_show) {
+        ret += ",... (" + std::to_string(rows.size()) + " rows total)";
+    }
+    return ret;
+}
+
 // A non-finite NMSE means the comparison itself degenerated, not that the result is "slightly off".
 // The two causes need different fixes and must not be confused, so say which one it was:
 //   - non-finite values in the logits => the backend produced NaN/Inf output;
 //   - zero reference energy           => the CPU reference is all-zero, so mse_a_0 is 0 and the ratio is 0/0.
-static std::string nmse_diagnosis(const std::vector<float> & a, const std::vector<float> & b) {
+static std::string nmse_diagnosis(const std::vector<float> & a, const std::vector<float> & b, const size_t n_row) {
     size_t   nonfinite_a = 0;
     size_t   nonfinite_b = 0;
     double   energy_a    = 0.0;
@@ -59,7 +96,14 @@ static std::string nmse_diagnosis(const std::vector<float> & a, const std::vecto
     snprintf(buf, sizeof(buf),
         "n=%zu, non-finite CPU logits=%zu, non-finite device logits=%zu, CPU reference energy=%g",
         a.size(), nonfinite_a, nonfinite_b, energy_a);
-    return std::string(buf);
+    std::string ret(buf);
+    if (nonfinite_a > 0) {
+        ret += "\n  CPU    non-finite token positions: " + nonfinite_rows(a, n_row);
+    }
+    if (nonfinite_b > 0) {
+        ret += "\n  device non-finite token positions: " + nonfinite_rows(b, n_row);
+    }
+    return ret;
 }
 
 static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
@@ -86,7 +130,8 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--nan-trace]\n", argv[0]);
+    printf("  --nan-trace  CPU backend only: name the first graph tensors that go non-finite (needs -a)\n");
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -277,7 +322,8 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false) {
+        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
+        ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -290,6 +336,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.n_ctx = 0;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
+    ctx_params.cb_eval           = cb_eval;
+    ctx_params.cb_eval_user_data = cb_eval_user_data;
     if (!encode) {
         ctx_params.n_ubatch = 64;
     }
@@ -447,6 +495,98 @@ static bool arch_supported(const llm_arch arch) {
 #endif // GGML_USE_WEBGPU
 
     return true;
+}
+
+// --- NaN origin tracing ---------------------------------------------------------------------
+//
+// A non-finite logit only says that something upstream degenerated; it does not say where. This
+// walks the graph in execution order and names the FIRST tensors holding a non-finite value.
+// Execution order is topological, so the first tensor named is where the non-finiteness was
+// created rather than merely propagated -- its sources are printed so that can be confirmed.
+//
+// Deliberately CPU-only: it needs no device, so it can be iterated without a GPU and without
+// the memory hazard of a full sweep.
+struct nan_trace_state {
+    size_t n_reported = 0;
+    size_t n_scanned  = 0;
+    size_t max_report = 12;
+};
+
+static bool nan_trace_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    nan_trace_state * st = (nan_trace_state *) user_data;
+
+    if (ask) {
+        // only contiguous float tensors can be scanned as a flat array
+        return (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16) && ggml_is_contiguous(t);
+    }
+    if (st->n_reported >= st->max_report) {
+        return true;
+    }
+
+    std::vector<uint8_t> buf(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
+    st->n_scanned++;
+
+    const int64_t ne          = ggml_nelements(t);
+    int64_t       n_nonfinite = 0;
+    int64_t       first_idx   = -1;
+    for (int64_t i = 0; i < ne; i++) {
+        const float v = t->type == GGML_TYPE_F32 ?
+            ((const float *) buf.data())[i] : ggml_fp16_to_fp32(((const ggml_fp16_t *) buf.data())[i]);
+        if (!std::isfinite(v)) {
+            n_nonfinite++;
+            if (first_idx < 0) {
+                first_idx = i;
+            }
+        }
+    }
+    if (n_nonfinite == 0) {
+        return true;
+    }
+
+    st->n_reported++;
+    fprintf(stderr, "nan-trace: %-28s op=%-10s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]"
+        " non-finite=%" PRId64 "/%" PRId64 " first=[%" PRId64 ",%" PRId64 ",%" PRId64 "]",
+        t->name, ggml_op_name(t->op), t->ne[0], t->ne[1], t->ne[2], t->ne[3], n_nonfinite, ne,
+        first_idx % t->ne[0], (first_idx / t->ne[0]) % t->ne[1], first_idx / (t->ne[0]*t->ne[1]));
+    for (int i = 0; i < GGML_MAX_SRC && t->src[i] != nullptr; i++) {
+        fprintf(stderr, " src%d=%s", i, t->src[i]->name);
+    }
+    fprintf(stderr, "\n");
+    return true;
+}
+
+static int trace_nan(const llm_arch target_arch, const size_t seed) {
+    if (target_arch == LLM_ARCH_UNKNOWN) {
+        fprintf(stderr, "%s: --nan-trace requires -a/--arch\n", __func__);
+        return 1;
+    }
+
+    const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
+    const bool encode = target_arch == LLM_ARCH_T5 || target_arch == LLM_ARCH_DREAM ||
+        target_arch == LLM_ARCH_LLADA || target_arch == LLM_ARCH_LLADA_MOE || target_arch == LLM_ARCH_RND1;
+
+    for (bool moe : {false, true}) {
+        if (moe && !moe_implemented(target_arch)) {
+            continue;
+        }
+        if (!moe && moe_mandatory(target_arch)) {
+            continue;
+        }
+        fprintf(stderr, "nan-trace: %s (%s), seed %zu, CPU backend only\n",
+            llm_arch_name(target_arch), moe ? "MoE" : "Dense", seed);
+
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(target_arch, moe);
+        nan_trace_state  st;
+        auto model_and_ctx = get_model_and_ctx(
+            gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode, nan_trace_eval_cb, &st);
+        const std::vector<float> logits = get_logits(
+            model_and_ctx.first.get(), model_and_ctx.second.get(), tokens, encode);
+
+        fprintf(stderr, "nan-trace: %zu tensors reported of %zu scanned; non-finite logit rows: %s\n",
+            st.n_reported, st.n_scanned, nonfinite_rows(logits, tokens.size()).c_str());
+    }
+    return 0;
 }
 
 static int save_models(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level, const std::string & dir) {
@@ -659,7 +799,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                             status_nmse = "\033[1;31mFAIL\033[0m";
                             fprintf(stderr, "\n%s (%s, %s): non-finite NMSE: %s\n",
                                 llm_arch_name(arch), dc.label.c_str(), config_name.c_str(),
-                                nmse_diagnosis(logits_cpu, logits_dev).c_str());
+                                nmse_diagnosis(logits_cpu, logits_dev, tokens.size()).c_str());
                         } else {
                             snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
                             if (nmse_val > 1e-4) {
@@ -714,6 +854,7 @@ int main(int argc, char ** argv) {
     size_t seed = rd();
     ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
+    bool nan_trace = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
@@ -741,6 +882,10 @@ int main(int argc, char ** argv) {
             log_level = GGML_LOG_LEVEL_INFO;
             continue;
         }
+        if (strcmp(argv[i], "--nan-trace") == 0) {
+            nan_trace = true;
+            continue;
+        }
         if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--out") == 0) {
             if (i + 1 < argc) {
                 out = argv[++i];
@@ -753,6 +898,9 @@ int main(int argc, char ** argv) {
     printf("%s: using seed %zu\n", __func__, seed);
 
     try {
+        if (nan_trace) {
+            return trace_nan(arch, seed);
+        }
         if (!out.empty()) {
             return save_models(arch, seed, log_level, out);
         }
