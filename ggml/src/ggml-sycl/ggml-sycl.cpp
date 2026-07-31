@@ -29154,7 +29154,7 @@ static enum ggml_status ggml_backend_sycl_tp_buffer_init_tensor(ggml_backend_buf
                 }
             }
             // tensor->data now points to main device's view location
-            tensor->data  = extra->data_device_ptr_checked(main_device, __func__);
+            tensor->data  = extra->data_device_ptr_checked(main_device, "tp_buffer_init_tensor/view");
             tensor->extra = extra;
             ggml_sycl_init_layout_info(extra, tensor, main_device, true);
 
@@ -29313,7 +29313,7 @@ static enum ggml_status ggml_backend_sycl_tp_buffer_init_tensor(ggml_backend_buf
                     (long long) tensor->ne[0], (long long) tensor->ne[1], is_multiprocess_tp);
         }
         // tensor->data points to main device's shard
-        tensor->data = extra->data_device_ptr_checked(main_device, __func__);
+        tensor->data = extra->data_device_ptr_checked(main_device, "tp_buffer_init_tensor/sharded");
     } else {
         // Non-sharded tensor: DUPLICATE on all TP devices for fast access
         // Intel Arc GPUs don't support P2P, and host memory is 32x slower for kernel access
@@ -29399,7 +29399,7 @@ static enum ggml_status ggml_backend_sycl_tp_buffer_init_tensor(ggml_backend_buf
             }
         }
         // tensor->data points to main device's copy
-        tensor->data = extra->data_device_ptr_checked(main_device, __func__);
+        tensor->data = extra->data_device_ptr_checked(main_device, "tp_buffer_init_tensor/duplicated");
     }
 
     ggml_sycl_init_layout_info(extra, tensor, main_device, true);
@@ -29536,30 +29536,40 @@ static void ggml_backend_sycl_tp_buffer_set_tensor(ggml_backend_buffer_t buffer,
                     uint8_t    qs[16];
                 } blk0, blk1, blk38, blk100;
 
-                void * dev_ptr          = extra->data_device_ptr_checked(device, __func__);
-                size_t blk_row_size     = (4096 / 32) * 18;  // 128 blocks * 18 bytes = 2304 bytes/row
-                auto   read_debug_block = [&](auto & block, size_t byte_offset) {
-                    ggml_sycl::mem_handle read_dst = ggml_sycl_copy_handle_for_raw_ptr(&block, GGML_LAYOUT_AOS, device);
-                    ggml_sycl::mem_handle read_src{};
-                    size_t                read_src_offset = 0;
-                    if (extra->data_handle[device].valid()) {
-                        read_src        = extra->data_handle[device];
-                        read_src_offset = byte_offset;
-                    } else {
-                        read_src = ggml_sycl_copy_handle_for_raw_ptr(static_cast<char *>(dev_ptr) + byte_offset,
-                                                                       GGML_LAYOUT_AOS, device);
-                    }
-                    ggml_sycl::mem_copy(read_dst, 0, read_src, read_src_offset, sizeof(block), *stream);
-                };
-                read_debug_block(blk0, 0);
-                read_debug_block(blk1, 1 * blk_row_size);
-                read_debug_block(blk38, 38 * blk_row_size);
-                read_debug_block(blk100, 100 * blk_row_size);
-                fprintf(stderr, "TP DEBUG COPY VERIFY device=%d: tok0.d=%f, tok1.d=%f, tok38.d=%f, tok100.d=%f\n",
-                        device, (float) blk0.d, (float) blk1.d, (float) blk38.d, (float) blk100.d);
-                fprintf(stderr, "TP DEBUG COPY VERIFY device=%d: tok38.qs=0x%02x%02x, tok100.qs=0x%02x%02x\n", device,
-
-                        blk38.qs[0], blk38.qs[1], blk100.qs[0], blk100.qs[1]);
+                void * dev_ptr = extra->data_device_ptr(device);
+                if (dev_ptr == nullptr) {
+                    // Read-back is pure instrumentation: its only product is the print
+                    // below. Warn and skip rather than aborting a process someone is
+                    // mid-way through debugging -- losing a debug line costs nothing.
+                    GGML_LOG_WARN(
+                        "[SYCL] tp_buffer_set_tensor/tok_embd_readback: no usable device pointer for dev=%d "
+                        "(tensor=%s); skipping debug read-back\n",
+                        device, tensor->name);
+                } else {
+                    size_t blk_row_size     = (4096 / 32) * 18;  // 128 blocks * 18 bytes = 2304 bytes/row
+                    auto   read_debug_block = [&](auto & block, size_t byte_offset) {
+                        ggml_sycl::mem_handle read_dst =
+                            ggml_sycl_copy_handle_for_raw_ptr(&block, GGML_LAYOUT_AOS, device);
+                        ggml_sycl::mem_handle read_src{};
+                        size_t                read_src_offset = 0;
+                        if (extra->data_handle[device].valid()) {
+                            read_src        = extra->data_handle[device];
+                            read_src_offset = byte_offset;
+                        } else {
+                            read_src = ggml_sycl_copy_handle_for_raw_ptr(static_cast<char *>(dev_ptr) + byte_offset,
+                                                                           GGML_LAYOUT_AOS, device);
+                        }
+                        ggml_sycl::mem_copy(read_dst, 0, read_src, read_src_offset, sizeof(block), *stream);
+                    };
+                    read_debug_block(blk0, 0);
+                    read_debug_block(blk1, 1 * blk_row_size);
+                    read_debug_block(blk38, 38 * blk_row_size);
+                    read_debug_block(blk100, 100 * blk_row_size);
+                    fprintf(stderr, "TP DEBUG COPY VERIFY device=%d: tok0.d=%f, tok1.d=%f, tok38.d=%f, tok100.d=%f\n",
+                            device, (float) blk0.d, (float) blk1.d, (float) blk38.d, (float) blk100.d);
+                    fprintf(stderr, "TP DEBUG COPY VERIFY device=%d: tok38.qs=0x%02x%02x, tok100.qs=0x%02x%02x\n",
+                            device, blk38.qs[0], blk38.qs[1], blk100.qs[0], blk100.qs[1]);
+                }
             }
         }
     }
@@ -33459,7 +33469,7 @@ static dpct::err0 ggml_sycl_cpy_tensor_2d(void *                     dst,
         int                     id;
         SYCL_CHECK(CHECK_TRY_ERROR(id = get_current_device_id()));
         // GGML_SYCL_DEBUG("current device index %d\n", id);
-        src_ptr = (char *) extra->data_device_ptr_checked(id, __func__);
+        src_ptr = (char *) extra->data_device_ptr_checked(id, "cpy_tensor_2d/split");
     } else if (ggml_backend_buffer_is_sycl_tp(src->buffer)) {
         // TP (Tensor Parallelism) buffer - similar to split buffer
         // Data is stored in device-specific locations within extra
@@ -33469,7 +33479,7 @@ static dpct::err0 ggml_sycl_cpy_tensor_2d(void *                     dst,
         int                     id;
         SYCL_CHECK(CHECK_TRY_ERROR(id = get_current_device_id()));
 
-        src_ptr = (char *) extra->data_device_ptr_checked(id, __func__);
+        src_ptr = (char *) extra->data_device_ptr_checked(id, "cpy_tensor_2d/tp");
         GGML_SYCL_DEBUG("[CPY_TENSOR_2D] TP buffer: device=%d src_ptr=%p dst=%p (tensor=%s) stream_dev=%s\n", id,
                         (void *) src_ptr, dst, src->name,
 
@@ -34539,7 +34549,7 @@ static bool ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
 
             if (ggml_backend_buffer_is_sycl_tp(src0->buffer)) {
                 ggml_tensor_extra_gpu * extra  = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
-                dev[i].src0_dd                 = (char *) extra->data_device_ptr_checked(i, __func__);
+                dev[i].src0_dd                 = (char *) extra->data_device_ptr_checked(i, "op_mul_mat/tp_src0");
                 dev[i].src0_ptr_origin         = "tp_data_device";
                 dev[i].src0_layout_ptr_source  = "n/a";
                 exc_ctx.dev[i].src0_dd         = dev[i].src0_dd;
