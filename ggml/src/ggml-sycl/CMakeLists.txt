@@ -914,67 +914,10 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
     # subsystem this fork's core design constraint governs had no running tests
     # at all.  They are registered after the endif now; see llama.cpp-5exz.
 
-    # Test 18: UnifiedKernel Operation Tests (TDD)
-    # Tests RMS norm and SiLU mul operations for persistent kernel
-    add_executable(test-unified-kernel-ops
-        tests/test-unified-kernel-ops.cpp
-        unified-kernel.cpp
-    )
-    target_include_directories(test-unified-kernel-ops PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/..
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-    )
-    target_compile_options(test-unified-kernel-ops PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    target_link_options(test-unified-kernel-ops PRIVATE
-        ${XMX_TEST_SYCL_OPTIONS}
-        "SHELL:-Xspirv-translator=intel_gpu_bmg_g21 -spirv-ext=+SPV_INTEL_split_barrier"
-        "SHELL:-Xspirv-translator=spir64 -spirv-ext=+SPV_INTEL_split_barrier"
-    )
-    target_compile_definitions(test-unified-kernel-ops PRIVATE
-        GGML_SYCL_WARP_SIZE=32
-        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-        UNIFIED_KERNEL_TEST_STANDALONE=1
-    )
-    if (IntelSYCL_FOUND)
-        target_link_libraries(test-unified-kernel-ops PRIVATE IntelSYCL::SYCL_CXX)
-    endif()
-    add_test(NAME unified-kernel-ops COMMAND test-unified-kernel-ops)
-    set_tests_properties(unified-kernel-ops PROPERTIES
-        LABELS "sycl;unified;ops;tdd"
-        TIMEOUT 180
-    )
-
-    # Test 19: UnifiedKernel Persistent Execution Integration Tests
-    # Tests the persistent plan-build-execute workflow
-    add_executable(test-unified-kernel-persistent
-        tests/test-unified-kernel-persistent.cpp
-        unified-kernel.cpp
-    )
-    target_include_directories(test-unified-kernel-persistent PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/..
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-    )
-    target_compile_options(test-unified-kernel-persistent PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    target_link_options(test-unified-kernel-persistent PRIVATE
-        ${XMX_TEST_SYCL_OPTIONS}
-        "SHELL:-Xspirv-translator=intel_gpu_bmg_g21 -spirv-ext=+SPV_INTEL_split_barrier"
-        "SHELL:-Xspirv-translator=spir64 -spirv-ext=+SPV_INTEL_split_barrier"
-    )
-    target_compile_definitions(test-unified-kernel-persistent PRIVATE
-        GGML_SYCL_WARP_SIZE=32
-        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-        UNIFIED_KERNEL_TEST_STANDALONE=1
-    )
-    if (IntelSYCL_FOUND)
-        target_link_libraries(test-unified-kernel-persistent PRIVATE IntelSYCL::SYCL_CXX)
-    endif()
-    add_test(NAME unified-kernel-persistent COMMAND test-unified-kernel-persistent)
-    set_tests_properties(unified-kernel-persistent PROPERTIES
-        LABELS "sycl;unified;persistent;tdd"
-        TIMEOUT 300
-    )
+    # NOTE: Test 18 (unified-kernel-ops) and Test 19 (unified-kernel-persistent)
+    # used to be registered here.  Both were moved outside this guard -- see the
+    # un-guarded section after the endif, where the JIT-vs-AOT tradeoff that
+    # made them the hard case is written up.
 endif()
 
 # =============================================================================
@@ -1012,6 +955,31 @@ endif()
 # =============================================================================
 
 set(SYCL_LINK_ONLY_TEST_OPTIONS
+    "-fsycl"
+    "-Wno-narrowing"
+)
+
+# The two unified-kernel tests are the exception to rule 1 above, and they are
+# here deliberately rather than by oversight.  Unlike the nine link-only tests
+# they DO compile device kernel code: each builds unified-kernel.cpp (12,742
+# lines of SYCL) as its own TU under UNIFIED_KERNEL_TEST_STANDALONE.  By rule 1
+# that would put them inside the guard.
+#
+# They are out here anyway because the unified kernel is under active
+# modification, and leaving its own device tests unbuilt means those changes
+# land untested -- which is the condition that produced this backlog.
+#
+# The cost is contained by dropping the AOT target list: these use JIT (plain
+# -fsycl) rather than -fsycl-targets=intel_gpu_bmg_g21,spir64, so no ocloc
+# device compile happens at build time.  The kernels are compiled at first run
+# instead.  The split-barrier SPIR-V extension is still requested, but only for
+# spir64 -- there is no bmg_g21 image to translate without the AOT target.
+#
+# If a future change makes these tests need AOT (e.g. measuring codegen rather
+# than behaviour), move them back inside the guard rather than adding the AOT
+# flags here: the whole reason this is affordable is that no device compile
+# occurs during the build.
+set(SYCL_JIT_DEVICE_TEST_OPTIONS
     "-fsycl"
     "-Wno-narrowing"
 )
@@ -1248,6 +1216,68 @@ set_tests_properties(sycl-runtime-alloc PROPERTIES
     LABELS "sycl;allocator;runtime;tdd"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 180
+)
+
+# RMS norm and SiLU mul operations for the persistent kernel (TDD).
+# Compiles unified-kernel.cpp as its own TU -- see SYCL_JIT_DEVICE_TEST_OPTIONS
+# above for why this is out here despite having device code.
+add_executable(test-unified-kernel-ops
+    tests/test-unified-kernel-ops.cpp
+    unified-kernel.cpp
+)
+target_include_directories(test-unified-kernel-ops PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_compile_options(test-unified-kernel-ops PRIVATE ${SYCL_JIT_DEVICE_TEST_OPTIONS})
+target_link_options(test-unified-kernel-ops PRIVATE
+    ${SYCL_JIT_DEVICE_TEST_OPTIONS}
+    "SHELL:-Xspirv-translator=spir64 -spirv-ext=+SPV_INTEL_split_barrier"
+)
+target_compile_definitions(test-unified-kernel-ops PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    UNIFIED_KERNEL_TEST_STANDALONE=1
+)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-unified-kernel-ops PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME unified-kernel-ops COMMAND test-unified-kernel-ops)
+set_tests_properties(unified-kernel-ops PROPERTIES
+    LABELS "sycl;unified;ops;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 180
+)
+
+# The persistent plan-build-execute workflow. Same JIT arrangement as above.
+add_executable(test-unified-kernel-persistent
+    tests/test-unified-kernel-persistent.cpp
+    unified-kernel.cpp
+)
+target_include_directories(test-unified-kernel-persistent PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_compile_options(test-unified-kernel-persistent PRIVATE ${SYCL_JIT_DEVICE_TEST_OPTIONS})
+target_link_options(test-unified-kernel-persistent PRIVATE
+    ${SYCL_JIT_DEVICE_TEST_OPTIONS}
+    "SHELL:-Xspirv-translator=spir64 -spirv-ext=+SPV_INTEL_split_barrier"
+)
+target_compile_definitions(test-unified-kernel-persistent PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    UNIFIED_KERNEL_TEST_STANDALONE=1
+)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-unified-kernel-persistent PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME unified-kernel-persistent COMMAND test-unified-kernel-persistent)
+set_tests_properties(unified-kernel-persistent PROPERTIES
+    LABELS "sycl;unified;persistent;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 300
 )
 
 # Test: unified-cache layout and multi-device placement choices, plus the
