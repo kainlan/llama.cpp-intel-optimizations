@@ -1249,6 +1249,43 @@ foreach(_residency_test
     )
 endforeach()
 
+# Test: reset_model_weight_entries() must preserve entries still leased by a
+# live model at a model-load boundary instead of aborting (llama.cpp-ljb9,
+# commit acdb192d4), and must keep id_to_key_ pointed at a surviving layout
+# sibling rather than dangling. Registered outside the GGML_SYCL_BUILD_XMX_TESTS
+# guard (which defaults OFF) so it always runs -- mirrors the _residency_test
+# loop above: no device kernel code of its own, so it only needs -fsycl to
+# link against the prebuilt ggml-sycl library, not the full XMX AOT target list.
+set(RESET_MODEL_WEIGHT_TEST_SYCL_OPTIONS
+    "-fsycl"
+    "-Wno-narrowing"
+)
+add_executable(test-sycl-reset-model-weight-lease-preserve
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-reset-model-weight-lease-preserve.cpp
+)
+target_include_directories(test-sycl-reset-model-weight-lease-preserve PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-reset-model-weight-lease-preserve PRIVATE ${RESET_MODEL_WEIGHT_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-reset-model-weight-lease-preserve PRIVATE ${RESET_MODEL_WEIGHT_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-reset-model-weight-lease-preserve PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-reset-model-weight-lease-preserve PRIVATE ggml-base ggml ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-reset-model-weight-lease-preserve PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME sycl-reset-model-weight-lease-preserve COMMAND test-sycl-reset-model-weight-lease-preserve)
+set_tests_properties(sycl-reset-model-weight-lease-preserve PROPERTIES
+    LABELS "sycl;lease;bugfix;ljb9"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
 add_executable(test-sycl-e2e-profile
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-e2e-profile.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/e2e-profile.cpp
