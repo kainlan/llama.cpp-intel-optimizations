@@ -130,6 +130,31 @@ A single run is fine. **Do not loop it unattended**, and treat any repeated
 GPU-allocating test the same way. The general lesson: `main` is the *default*
 label, so "only `main`" means "nobody classified this", not "this is safe".
 
+⚠️ **A post-run `free -g` sampled too early manufactures a FALSE OOM scare — let the
+process settle, and read `Shmem`, not `free`.** Measured 2026-07-31: immediately after a
+`test-llama-archs` single-arch run, `free -g` reported **14 GB free**, down from 166 —
+below the 100 GB floor above and a dead ringer for the ~227 GB TTM-shmem signature. Five
+seconds later the same host read **182 GB free / 210 GB available, `Shmem` 3.9 GB**, with
+no process alive. `free` had run in the same command as the exiting process, before its
+page cache and GPU BO backing were released.
+
+The reflex a low reading triggers is "stop, the host is dying", which is expensive when
+wrong — the agent that hit this correctly halted a verification mid-sequence. So:
+
+```bash
+# wrong: samples the instant the process is still tearing down
+./build/bin/test-llama-archs -a <arch>; free -g
+
+# right: let it settle, and read the number that actually tracks the hazard
+./build/bin/test-llama-archs -a <arch>
+sleep 5; grep -E '^(Shmem|MemAvailable):' /proc/meminfo
+```
+
+`Shmem` is the figure that goes to ~227 GB in a real event; `free` conflates it with
+reclaimable cache. This is the mirror image of the stale-guardrail trap recorded under
+Regression Baselines — a false **alarm** rather than a false **all-clear** — and it has
+the same root: a clean answer about the wrong instant.
+
 Pure-Python gates (`test-sycl-gap-causes`,
 `test-sycl-timeline-gap-class-conservation`, `test-jinja-py`) allocate nothing
 and are always safe at any parallelism.
