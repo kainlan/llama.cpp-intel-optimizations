@@ -498,6 +498,34 @@ if (GGML_SYCL)
         ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
         TIMEOUT 600
     )
+
+    # Runtime gate for the SYCL settings self-report (llama.cpp-5bd8). Drives a
+    # real registry -> ggml_backend_dev_init -> ggml_check_sycl() init and
+    # asserts the report reaches the log callback. A source assertion would not
+    # do: the reporting code was present and correct for months while its output
+    # went nowhere, because upstream 67b2b7f2f pushed backend GGML_LOG_INFO above
+    # the default log threshold.
+    #
+    # Labels deliberately exclude `cache`, `mem-handle` and `residency` -- the
+    # throttled full-suite sweep in CLAUDE.md runs
+    # `ctest -LE 'residency|mem-handle|cache'`, and a gate carrying one of those
+    # would never run there.
+    #
+    # ENVIRONMENT pins the B50 (the validation card) rather than the B70, so a
+    # bare `ctest` cannot perturb a concurrent measurement -- same reasoning as
+    # test-unified-cache-unpin-event above, and the same caveat applies: device
+    # numbering is machine-specific, see CLAUDE.md's selector table. oneAPI must
+    # be sourced or the runtime finds no platform and the test aborts rather
+    # than skipping.
+    llama_build(test-sycl-env-report.cpp)
+    target_link_libraries(test-sycl-env-report PRIVATE ggml-sycl)
+    llama_test(test-sycl-env-report LABEL "main")
+    set_tests_properties(test-sycl-env-report PROPERTIES
+        LABELS "sycl;env"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300
+    )
 endif()
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)

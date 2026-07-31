@@ -16529,6 +16529,61 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_xmx_threshold = get_sycl_env("GGML_SYCL_XMX_THRESHOLD", 64);
 #endif
         GGML_SYCL_DEBUG("[SYCL] call ggml_check_sycl\n");
+
+        // Visible report of the settings this function actually PARSED.
+        //
+        // The GGML_LOG_INFO table below it is invisible at default verbosity,
+        // and has been since upstream 67b2b7f2f ("logs : reduce", #23021):
+        // common_get_verbosity() in common/log.cpp maps GGML_LOG_LEVEL_INFO to
+        // LOG_LEVEL_TRACE (4), which is above the default
+        // common_log_verbosity_thold of LOG_LEVEL_INFO (3), so
+        // common_log_default_callback drops every backend INFO line -- this
+        // table, "Found N SYCL devices:", and llama.cpp's own model info alike.
+        // Only `-v` (or an explicit --verbosity) brings them back. That left a
+        // user who sets a GGML_SYCL_* flag with no way to tell "the flag did
+        // nothing" apart from "the flag never reached the backend" (llama.cpp-5bd8).
+        //
+        // WARN clears the default threshold, so this line survives. It is
+        // deliberately NOT a second copy of the table: only values that differ
+        // from their default are listed, so a stock run prints nothing extra
+        // and benchmark output is unchanged. The values are read back from the
+        // parsed globals rather than from getenv(), so what is reported is what
+        // the backend believes -- a misspelled variable name is correctly
+        // absent instead of being echoed back as if it had taken effect.
+        {
+            std::string overrides;
+            auto        add = [&overrides](const char * name, int value, int default_value) {
+                if (value == default_value) {
+                    return;
+                }
+                if (!overrides.empty()) {
+                    overrides += ' ';
+                }
+                overrides += name;
+                overrides += '=';
+                overrides += std::to_string(value);
+            };
+
+            add("GGML_SYCL_DEBUG", g_ggml_sycl_debug, 0);
+            add("GGML_SYCL_DEBUG_SYNC", g_ggml_sycl_debug_sync, 0);
+            add("GGML_SYCL_TP_DEBUG", g_ggml_sycl_tp_debug, 0);
+            add("GGML_SYCL_DISABLE_GRAPH", g_ggml_sycl_disable_graph, 0);
+            add("GGML_SYCL_SAFE_MODE", g_ggml_sycl_safe_mode, 0);
+            add("GGML_SYCL_HANDLE_STRICT", g_ggml_sycl_handle_strict, 0);
+            add("GGML_SYCL_DISABLE_DNN", g_ggml_sycl_disable_dnn, 0);
+            add("GGML_SYCL_PRIORITIZE_DMMV", g_ggml_sycl_prioritize_dmmv, 0);
+            add("GGML_SYCL_KQV_FORCE_SIMPLE", g_ggml_sycl_kqv_force_simple, 0);
+            add("GGML_SYCL_KQV_DISABLE_FP16", g_ggml_sycl_kqv_disable_fp16, 0);
+#ifdef GGML_SYCL_XMX_GEMM
+            add("GGML_SYCL_USE_XMX_GEMM", g_ggml_sycl_use_xmx_gemm, 0);
+            add("GGML_SYCL_XMX_THRESHOLD", g_ggml_sycl_xmx_threshold, 64);
+#endif
+
+            if (!overrides.empty()) {
+                GGML_LOG_WARN("[SYCL] non-default settings in effect: %s\n", overrides.c_str());
+            }
+        }
+
         GGML_LOG_INFO("Running with Environment Variables:\n");
         GGML_LOG_INFO("  GGML_SYCL_DEBUG: %d\n", g_ggml_sycl_debug);
         GGML_LOG_INFO("  GGML_SYCL_DEBUG_SYNC: %d\n", g_ggml_sycl_debug_sync);
