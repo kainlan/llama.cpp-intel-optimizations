@@ -382,6 +382,37 @@ if (NOT WIN32)
 endif()
 
 if (NOT WIN32)
+    # Source assertion for the oneDNN SDPA scale invariant (llama.cpp-4jlv).
+    # Guards the half a unit test structurally cannot: a suite is green both
+    # when the execute-time GGML_ASSERT is present-and-unreached and when
+    # somebody deletes it. Only the source distinguishes those two.
+    #
+    # Registered HERE rather than in ggml/src/ggml-sycl/CMakeLists.txt, which is
+    # what the requesting task asked for so that it would run in a non-SYCL
+    # configure. That placement would not have achieved it: the SYCL
+    # CMakeLists is only add_subdirectory'd when the backend is enabled, so a
+    # test registered anywhere in that file -- inside the XMX guard or outside
+    # it -- does not exist in a non-SYCL build. tests/CMakeLists.txt is always
+    # processed, so this is the location that delivers the stated intent.
+    #
+    # The script lives under scripts/ with the other check-sycl-*.sh gates
+    # rather than in tests/ like the three siblings above; the ARGS path differs
+    # accordingly. Labels match the siblings: neither "sycl" nor "policy" is in
+    # the throttled sweep's -LE 'residency|mem-handle|cache' denylist.
+    llama_test_cmd(
+        bash
+        NAME test-sycl-fattn-onednn-scale-gate
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_SOURCE_DIR}/scripts/check-sycl-fattn-onednn-scale-gate.sh
+    )
+    set_tests_properties(test-sycl-fattn-onednn-scale-gate PROPERTIES
+        LABELS "sycl;policy"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 120
+    )
+endif()
+
+if (NOT WIN32)
     # Python source-assertion test for the decode-timeline profiling pipeline.
     # Registered because tasks that modify sycl-gptoss-decode-timeline-profile.sh
     # or parse-sycl-timeline.py need a gate the lead can run; tests/ holds dozens
@@ -616,6 +647,62 @@ if (GGML_SYCL)
         LABELS "sycl;lease;bugfix"
         ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
         TIMEOUT 300
+    )
+endif()
+
+# test-sycl-fattn-onednn-gates: oneDNN SDPA must reject unsafe FA layouts.
+#
+# RESTORED, not newly written.  This registration existed at
+# 3c8f296fd:tests/CMakeLists.txt:990, built, ran and PASSED -- the proof is
+# committed in this repo at artifacts/kkxtv7-5/ctest-materialization.log
+# ("Test #100: test-sycl-fattn-onednn-gates ... Passed 0.11 sec").  At the next
+# commit touching this file, d3dce4e0a, the file is upstream's 262-line version
+# and its add_test count has gone 147 -> 3.  141 registrations disappeared at
+# once; three have been rebuilt since, one at a time, by tasks that each
+# happened to notice one missing test.  The test sources survived in the tree
+# with nothing pointing at them, so passing tests became fossils: committed
+# logs of runs that can no longer happen.
+#
+# HOW they were removed is NOT established, and this comment deliberately does
+# not guess.  d3dce4e0a is a single-parent commit, so it was not a merge
+# resolution there; a rebase onto upstream, a merge resolved in upstream's
+# favour earlier in the chain, and a manual overwrite are all still open.  The
+# counts are facts, the mechanism is not, and this backlog is largely made of
+# plausible stories that hardened into repeated fact.
+#
+# That is a fourth failure mode distinct from the guard (llama.cpp-5exz),
+# from never-registered sources (llama.cpp-0igs), and from a denylisted label.
+# Those three are static states of the tree that a grep can find.  This one is
+# a loss event, invisible in the current tree, detectable only by noticing that
+# evidence of a passing test has no registration behind it.
+#
+# The block below is the ORIGINAL, verbatim apart from the added LABELS: it is
+# known to have built and run, which a fresh guess would not be.  Note it links
+# ggml + ggml-cpu and inherits ggml-sycl's COMPILE_DEFINITIONS through a
+# TARGET_PROPERTY generator expression rather than linking the SYCL library --
+# the test is host-only, allocates nothing and touches no device, so it needs
+# no device pinning and no OOM-hazard label.
+#
+# LABELS are new.  The original had none, which meant it inherited only the
+# default and no label denylist could reach it -- survivable here, but "only
+# main" means "nobody classified this", not "this is safe" (CLAUDE.md).  None
+# of these matches the throttled sweep's -LE 'residency|mem-handle|cache', so
+# the sweep runs it, which is the entire point of restoring it.
+if(GGML_SYCL)
+    add_executable(test-sycl-fattn-onednn-gates test-sycl-fattn-onednn-gates.cpp)
+    target_link_libraries(test-sycl-fattn-onednn-gates PRIVATE ggml ggml-cpu)
+    target_include_directories(test-sycl-fattn-onednn-gates PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/include
+        ${PROJECT_SOURCE_DIR}/ggml/src)
+    target_compile_definitions(test-sycl-fattn-onednn-gates PRIVATE
+        $<TARGET_PROPERTY:ggml-sycl,COMPILE_DEFINITIONS>)
+    target_compile_options(test-sycl-fattn-onednn-gates PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-sycl-fattn-onednn-gates PRIVATE "-fsycl")
+    install(TARGETS test-sycl-fattn-onednn-gates RUNTIME)
+    add_test(NAME test-sycl-fattn-onednn-gates COMMAND $<TARGET_FILE:test-sycl-fattn-onednn-gates>)
+    set_tests_properties(test-sycl-fattn-onednn-gates PROPERTIES
+        LABELS "sycl;fattn;onednn;gates"
+        TIMEOUT 120
     )
 endif()
 

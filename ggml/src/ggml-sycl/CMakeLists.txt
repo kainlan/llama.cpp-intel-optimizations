@@ -868,45 +868,10 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         TIMEOUT 120
     )
 
-    # Test 14: Kernel Dispatch Tests (Batch-Size Gating)
-    # Tests the ESIMD batch-size gating logic for intelligent dispatch
-    # NOTE: This is a pure CPU test - no GPU calls, just dispatch logic testing
-    add_executable(test-kernel-dispatch
-        tests/test-kernel-dispatch.cpp
-    )
-    target_include_directories(test-kernel-dispatch PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/..
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-    )
-    # No SYCL compile/link options needed - this test is pure C++
-    target_compile_definitions(test-kernel-dispatch PRIVATE
-        GGML_SYCL_WARP_SIZE=32
-        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-    )
-    add_test(NAME kernel-dispatch COMMAND test-kernel-dispatch)
-    set_tests_properties(kernel-dispatch PROPERTIES
-        LABELS "sycl;xmx;dispatch;gating"
-        TIMEOUT 60
-    )
-
-    # Test 15: Dispatch tuning mapping tests
-    # Verifies unified_matmul winners map to orchestrator entrypoint
-    add_executable(test-sycl-dispatch-tuning
-        tests/test-dispatch-tuning.cpp
-        dispatch-tuning.cpp
-    )
-    target_include_directories(test-sycl-dispatch-tuning PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/..
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-    )
-    target_link_libraries(test-sycl-dispatch-tuning PRIVATE ggml)
-    add_test(NAME sycl-dispatch-tuning COMMAND test-sycl-dispatch-tuning)
-    set_tests_properties(sycl-dispatch-tuning PROPERTIES
-        LABELS "sycl;dispatch;tuning"
-        TIMEOUT 60
-    )
+    # NOTE: Test 14 (kernel-dispatch) and Test 15 (sycl-dispatch-tuning) used to
+    # be registered here.  Both were moved outside this guard (see the
+    # "un-guarded" section after the endif) because GGML_SYCL_BUILD_XMX_TESTS
+    # defaults OFF, so neither ever built -- llama.cpp-5exz.
 
     # Test 16: ESIMD SLM Prefetch Optimization Tests (Task llama.cpp-attk)
     # Tests LSC prefetch with cache hints for memory/compute overlap
@@ -940,199 +905,14 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         TIMEOUT 180
     )
 
-    # Test 17: Unified Cache Fast Path Tests (TDD)
-    # Tests reader-writer lock optimization for cache hit fast path
-    add_executable(test-unified-cache-fast-path
-        tests/test-unified-cache-fast-path.cpp
-        unified-cache.cpp
-        pinned-pool.cpp
-    )
-    target_include_directories(test-unified-cache-fast-path PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/..
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-    )
-    target_compile_options(test-unified-cache-fast-path PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    target_link_options(test-unified-cache-fast-path PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    target_compile_definitions(test-unified-cache-fast-path PRIVATE
-        GGML_SYCL_WARP_SIZE=32
-        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-    )
-    target_link_libraries(test-unified-cache-fast-path PRIVATE ggml-base ggml)
-    if (IntelSYCL_FOUND)
-        target_link_libraries(test-unified-cache-fast-path PRIVATE IntelSYCL::SYCL_CXX)
-    endif()
-    add_test(NAME unified-cache-fast-path COMMAND test-unified-cache-fast-path)
-    set_tests_properties(unified-cache-fast-path PROPERTIES
-        LABELS "sycl;cache;fast-path;tdd"
-        TIMEOUT 120
-    )
-
-    add_executable(test-unified-cache-bugs
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-unified-cache-bugs.cpp
-    )
-    target_include_directories(test-unified-cache-bugs PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/..
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-        ${SYCL_INCLUDE_DIR}
-    )
-    target_compile_options(test-unified-cache-bugs PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    target_link_options(test-unified-cache-bugs PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    target_compile_definitions(test-unified-cache-bugs PRIVATE
-        GGML_SYCL_WARP_SIZE=32
-        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-    )
-    target_link_libraries(test-unified-cache-bugs PRIVATE ggml-base ggml ggml-sycl)
-    if (IntelSYCL_FOUND)
-        target_link_libraries(test-unified-cache-bugs PRIVATE IntelSYCL::SYCL_CXX)
-    endif()
-    add_test(NAME unified-cache-bugs COMMAND test-unified-cache-bugs)
-    set_tests_properties(unified-cache-bugs PROPERTIES
-        LABELS "sycl;cache;bugfix;tdd"
-        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
-        TIMEOUT 180
-    )
-
-    # NOTE: test-sycl-layout-choice used to be registered here.  It was moved
-    # outside this guard (see below, after the endif) because
-    # GGML_SYCL_BUILD_XMX_TESTS defaults OFF, so it never built -- llama.cpp-5exz.
-
-    # Test: synthetic KV/view pointer resolution and handle publication
-    add_executable(test-sycl-kv-view-resolution
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-kv-view-resolution.cpp
-    )
-    target_include_directories(test-sycl-kv-view-resolution PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/..
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-        ${SYCL_INCLUDE_DIR}
-    )
-    target_compile_options(test-sycl-kv-view-resolution PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    target_link_options(test-sycl-kv-view-resolution PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    target_compile_definitions(test-sycl-kv-view-resolution PRIVATE
-        GGML_SYCL_WARP_SIZE=32
-        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-    )
-    target_link_libraries(test-sycl-kv-view-resolution PRIVATE ggml-base ggml ggml-sycl)
-    if (IntelSYCL_FOUND)
-        target_link_libraries(test-sycl-kv-view-resolution PRIVATE IntelSYCL::SYCL_CXX)
-    endif()
-    add_test(NAME sycl-kv-view-resolution COMMAND test-sycl-kv-view-resolution)
-    set_tests_properties(sycl-kv-view-resolution PROPERTIES
-        LABELS "sycl;kv;view;mem-handle;tdd"
-        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH};GGML_SYCL_TEST_KV_VIEW_RUNTIME=0"
-        TIMEOUT 120
-    )
-
-    # mem_handle eviction-lifecycle tests (RESEARCH-A4, llama.cpp-2jmzn)
-    # Verifies cache_generation bumps + entry removal across sync and async
-    # eviction paths. Companion to llama.cpp-goegc.1.
-    add_executable(test-mem-handle-eviction
-        tests/test-mem-handle-eviction.cpp
-        unified-cache.cpp
-        pinned-pool.cpp
-        mem-handle.cpp
-    )
-    target_include_directories(test-mem-handle-eviction PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/..
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-    )
-    target_compile_options(test-mem-handle-eviction PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    target_link_options(test-mem-handle-eviction PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    target_compile_definitions(test-mem-handle-eviction PRIVATE
-        GGML_SYCL_WARP_SIZE=32
-        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-    )
-    target_link_libraries(test-mem-handle-eviction PRIVATE ggml-base ggml)
-    if (IntelSYCL_FOUND)
-        target_link_libraries(test-mem-handle-eviction PRIVATE IntelSYCL::SYCL_CXX)
-    endif()
-    add_test(NAME mem-handle-eviction COMMAND test-mem-handle-eviction)
-    set_tests_properties(mem-handle-eviction PROPERTIES
-        LABELS "sycl;cache;mem-handle;eviction;tdd"
-        TIMEOUT 120
-    )
-
-    # Test: mem_handle device identity and wrong-device resolution (llama.cpp-32dg8.15.11)
-    # Single-GPU: tests 1–4 run; multi-device tests skip gracefully.
-    add_executable(test-mem-handle-wrong-device
-        tests/test-mem-handle-wrong-device.cpp
-    )
-    target_include_directories(test-mem-handle-wrong-device PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/..
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-        ${SYCL_INCLUDE_DIR}
-    )
-    target_compile_definitions(test-mem-handle-wrong-device PRIVATE
-        GGML_SYCL_WARP_SIZE=32
-        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-    )
-    target_link_libraries(test-mem-handle-wrong-device PRIVATE ggml-base ggml ggml-sycl)
-    add_test(NAME mem-handle-wrong-device COMMAND test-mem-handle-wrong-device)
-    set_tests_properties(mem-handle-wrong-device PROPERTIES
-        LABELS "sycl;cache;mem-handle;device-identity;tdd"
-        # setvars.sh puts compiler/lib before redist/lib on this workstation,
-        # but the backend-visible Level Zero devices are exposed via redist/lib.
-        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
-        TIMEOUT 120
-    )
-
-    # Test: canonical event-returning mem_handle memory operations (llama.cpp-32dg8.15.13)
-    add_executable(test-mem-ops
-        tests/test-mem-ops.cpp
-    )
-    target_include_directories(test-mem-ops PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/..
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-        ${SYCL_INCLUDE_DIR}
-    )
-    target_compile_definitions(test-mem-ops PRIVATE
-        GGML_SYCL_WARP_SIZE=32
-        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-    )
-    target_link_libraries(test-mem-ops PRIVATE ggml-base ggml ggml-sycl)
-    if (IntelSYCL_FOUND)
-        target_link_libraries(test-mem-ops PRIVATE IntelSYCL::SYCL_CXX)
-    endif()
-    add_test(NAME mem-ops COMMAND test-mem-ops)
-    set_tests_properties(mem-ops PROPERTIES
-        LABELS "sycl;cache;mem-handle;memory-ops;tdd"
-        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
-        TIMEOUT 120
-    )
-
-    # Test 18: UnifiedKernel Operation Tests (TDD)
-    # Tests RMS norm and SiLU mul operations for persistent kernel
-    add_executable(test-sycl-runtime-alloc
-        tests/test-unified-runtime-alloc.cpp
-        unified-cache.cpp
-        pinned-pool.cpp
-    )
-    target_include_directories(test-sycl-runtime-alloc PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/..
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-    )
-    target_compile_options(test-sycl-runtime-alloc PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    target_link_options(test-sycl-runtime-alloc PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    target_compile_definitions(test-sycl-runtime-alloc PRIVATE
-        GGML_SYCL_WARP_SIZE=32
-        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-    )
-    target_link_libraries(test-sycl-runtime-alloc PRIVATE ggml-base ggml)
-    if (IntelSYCL_FOUND)
-        target_link_libraries(test-sycl-runtime-alloc PRIVATE IntelSYCL::SYCL_CXX)
-    endif()
-    add_test(NAME sycl-runtime-alloc COMMAND test-sycl-runtime-alloc)
-    set_tests_properties(sycl-runtime-alloc PROPERTIES
-        LABELS "sycl;allocator;runtime;tdd"
-        TIMEOUT 180
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:$ENV{LD_LIBRARY_PATH}"
-    )
+    # NOTE: the unified-cache / mem_handle / allocator suite used to be
+    # registered here -- unified-cache-fast-path, unified-cache-bugs,
+    # sycl-layout-choice, sycl-kv-view-resolution, mem-handle-eviction,
+    # mem-handle-wrong-device, mem-ops and sycl-runtime-alloc.  None of them is
+    # an XMX or ESIMD test and none compiles device-kernel code of its own, yet
+    # all sat behind GGML_SYCL_BUILD_XMX_TESTS, which defaults OFF -- so the one
+    # subsystem this fork's core design constraint governs had no running tests
+    # at all.  They are registered after the endif now; see llama.cpp-5exz.
 
     # Test 18: UnifiedKernel Operation Tests (TDD)
     # Tests RMS norm and SiLU mul operations for persistent kernel
@@ -1196,6 +976,279 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         TIMEOUT 300
     )
 endif()
+
+# =============================================================================
+# Un-guarded SYCL tests
+#
+# Everything below this point is registered OUTSIDE the
+# GGML_SYCL_BUILD_XMX_TESTS guard above, which defaults OFF.  A test registered
+# inside that guard is not merely skipped -- its target is never created, so it
+# does not appear in the ctest registry at all, and `ctest -R <name>` reports
+# success because it matched zero tests.  That is llama.cpp-5exz.
+#
+# Two rules for anything added here.
+#
+# 1. Compile options.  XMX_TEST_SYCL_OPTIONS is defined INSIDE the guard and is
+#    unavailable here.  A test with no device kernel code of its own needs only
+#    `-fsycl -Wno-narrowing` to link against the prebuilt ggml-sycl library --
+#    not the AOT target list -- so use SYCL_LINK_ONLY_TEST_OPTIONS below.  A
+#    test that really does compile device kernels (i.e. that pulls in
+#    unified-kernel.cpp) belongs inside the guard.
+#
+# 2. LABELS.  CLAUDE.md's throttled sweep runs
+#    `-LE 'residency|mem-handle|cache'`, and -LE is a SUBSTRING regex over the
+#    labels.  A label containing any of those three words excludes the test
+#    from the only sweep that would run it -- guarded out of the build, then
+#    filtered out of the run, two independent layers of invisibility.  So a
+#    label here must avoid those substrings unless the test is genuinely a
+#    member of the GPU-allocating OOM-hazard family (note "unified-cache"
+#    contains "cache" and would be excluded; use "unified").
+#
+# ENVIRONMENT pins ONEAPI_DEVICE_SELECTOR=level_zero:1 (the B50 validation
+# card) on every test here that touches a device.  This is load-bearing, not
+# decoration: test-unified-cache-bugs setenv()s itself to level_zero:0 -- the
+# B70 benchmark card -- when nothing is set, so an unpinned `ctest` would
+# perturb a benchmark in progress.
+# =============================================================================
+
+set(SYCL_LINK_ONLY_TEST_OPTIONS
+    "-fsycl"
+    "-Wno-narrowing"
+)
+
+# Batch-size gating logic for ESIMD dispatch. Pure C++: no SYCL headers, no
+# device, no GPU allocation -- hence no compile options at all.
+add_executable(test-kernel-dispatch
+    tests/test-kernel-dispatch.cpp
+)
+target_include_directories(test-kernel-dispatch PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_compile_definitions(test-kernel-dispatch PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+add_test(NAME kernel-dispatch COMMAND test-kernel-dispatch)
+set_tests_properties(kernel-dispatch PROPERTIES
+    LABELS "sycl;xmx;dispatch;gating"
+    TIMEOUT 60
+)
+
+# unified_matmul winners map to the orchestrator entrypoint. Host-only.
+add_executable(test-sycl-dispatch-tuning
+    tests/test-dispatch-tuning.cpp
+    dispatch-tuning.cpp
+)
+target_include_directories(test-sycl-dispatch-tuning PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_link_libraries(test-sycl-dispatch-tuning PRIVATE ggml)
+add_test(NAME sycl-dispatch-tuning COMMAND test-sycl-dispatch-tuning)
+set_tests_properties(sycl-dispatch-tuning PROPERTIES
+    LABELS "sycl;dispatch;tuning"
+    TIMEOUT 60
+)
+
+# Reader-writer lock optimization on the cache-hit fast path (TDD).
+# LABELS drop the old "cache" -- see rule 2 above.
+add_executable(test-unified-cache-fast-path
+    tests/test-unified-cache-fast-path.cpp
+    unified-cache.cpp
+    pinned-pool.cpp
+)
+target_include_directories(test-unified-cache-fast-path PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_compile_options(test-unified-cache-fast-path PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-unified-cache-fast-path PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_compile_definitions(test-unified-cache-fast-path PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-unified-cache-fast-path PRIVATE ggml-base ggml)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-unified-cache-fast-path PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME unified-cache-fast-path COMMAND test-unified-cache-fast-path)
+set_tests_properties(unified-cache-fast-path PROPERTIES
+    LABELS "sycl;unified;fast-path;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+# Evict accounting, realloc failure handling, unaligned hash.
+# LABELS drop the old "cache" -- see rule 2 above.
+add_executable(test-unified-cache-bugs
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-unified-cache-bugs.cpp
+)
+target_include_directories(test-unified-cache-bugs PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-unified-cache-bugs PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-unified-cache-bugs PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_compile_definitions(test-unified-cache-bugs PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-unified-cache-bugs PRIVATE ggml-base ggml ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-unified-cache-bugs PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME unified-cache-bugs COMMAND test-unified-cache-bugs)
+set_tests_properties(unified-cache-bugs PROPERTIES
+    LABELS "sycl;unified;bugfix;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 180
+)
+
+# Synthetic KV/view pointer resolution and handle publication.
+# LABELS drop the old "mem-handle" -- see rule 2 above.
+add_executable(test-sycl-kv-view-resolution
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-kv-view-resolution.cpp
+)
+target_include_directories(test-sycl-kv-view-resolution PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-kv-view-resolution PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-sycl-kv-view-resolution PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_compile_definitions(test-sycl-kv-view-resolution PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-kv-view-resolution PRIVATE ggml-base ggml ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-kv-view-resolution PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME sycl-kv-view-resolution COMMAND test-sycl-kv-view-resolution)
+set_tests_properties(sycl-kv-view-resolution PROPERTIES
+    LABELS "sycl;kv;view;handle;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH};GGML_SYCL_TEST_KV_VIEW_RUNTIME=0"
+    TIMEOUT 120
+)
+
+# mem_handle eviction lifecycle (RESEARCH-A4, llama.cpp-2jmzn): cache_generation
+# bumps + entry removal across the sync and async eviction paths.
+# LABELS drop the old "cache" and "mem-handle" -- see rule 2 above.
+add_executable(test-mem-handle-eviction
+    tests/test-mem-handle-eviction.cpp
+    unified-cache.cpp
+    pinned-pool.cpp
+    mem-handle.cpp
+)
+target_include_directories(test-mem-handle-eviction PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_compile_options(test-mem-handle-eviction PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-mem-handle-eviction PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_compile_definitions(test-mem-handle-eviction PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-mem-handle-eviction PRIVATE ggml-base ggml)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-mem-handle-eviction PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME mem-handle-eviction COMMAND test-mem-handle-eviction)
+set_tests_properties(mem-handle-eviction PROPERTIES
+    LABELS "sycl;handle;eviction;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+# mem_handle device identity and wrong-device resolution (llama.cpp-32dg8.15.11).
+# Single-GPU: tests 1-4 run; multi-device tests skip gracefully.
+# LABELS drop the old "cache" and "mem-handle" -- see rule 2 above.
+add_executable(test-mem-handle-wrong-device
+    tests/test-mem-handle-wrong-device.cpp
+)
+target_include_directories(test-mem-handle-wrong-device PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_definitions(test-mem-handle-wrong-device PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-mem-handle-wrong-device PRIVATE ggml-base ggml ggml-sycl)
+add_test(NAME mem-handle-wrong-device COMMAND test-mem-handle-wrong-device)
+set_tests_properties(mem-handle-wrong-device PROPERTIES
+    LABELS "sycl;handle;device-identity;tdd"
+    # setvars.sh puts compiler/lib before redist/lib on this workstation, but the
+    # backend-visible Level Zero devices are exposed via redist/lib.
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+# Canonical event-returning mem_handle memory operations (llama.cpp-32dg8.15.13).
+# LABELS drop the old "cache" and "mem-handle" -- see rule 2 above.
+add_executable(test-mem-ops
+    tests/test-mem-ops.cpp
+)
+target_include_directories(test-mem-ops PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_definitions(test-mem-ops PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-mem-ops PRIVATE ggml-base ggml ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-mem-ops PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME mem-ops COMMAND test-mem-ops)
+set_tests_properties(mem-ops PROPERTIES
+    LABELS "sycl;handle;memory-ops;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+# Runtime allocation policy: reserve/allocate/rollback, tier selection, scoped
+# unified_alloc lifetime, offload-pool hit/miss accounting.
+add_executable(test-sycl-runtime-alloc
+    tests/test-unified-runtime-alloc.cpp
+    unified-cache.cpp
+    pinned-pool.cpp
+)
+target_include_directories(test-sycl-runtime-alloc PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_compile_options(test-sycl-runtime-alloc PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-sycl-runtime-alloc PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_compile_definitions(test-sycl-runtime-alloc PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-runtime-alloc PRIVATE ggml-base ggml)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-runtime-alloc PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME sycl-runtime-alloc COMMAND test-sycl-runtime-alloc)
+set_tests_properties(sycl-runtime-alloc PROPERTIES
+    LABELS "sycl;allocator;runtime;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 180
+)
 
 # Test: unified-cache layout and multi-device placement choices, plus the
 # fused-gate_up expert-tensor classifier regression guard (llama.cpp-zozu).
