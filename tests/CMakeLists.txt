@@ -545,6 +545,50 @@ if (GGML_SYCL)
         SKIP_RETURN_CODE 77
         TIMEOUT 300
     )
+
+    # Gate for llama.cpp-fz2u: host_zone_reset() / zone_reset() must REFUSE to
+    # reset a zone that still holds a live registered allocation, instead of
+    # aborting (9a0670712) or purging the registry and resetting anyway (the
+    # behaviour before it, which recycled addresses still owned by live handles).
+    #
+    # The test asserts BOTH halves, and the second is the one that is easy to
+    # lose: that a later reset SUCCEEDS once the owner releases. The refusal is
+    # only safe because unified_free() drops the registry record for every zone,
+    # including the reset-only SCRATCH/STAGING host zones that take no per-block
+    # free -- if that erase ever becomes conditional, the zone would never reset
+    # again for the process lifetime, silently. The refusal half alone still
+    # passes in that broken world.
+    #
+    # Labels deliberately exclude `cache`, `mem-handle` and `residency`. Those
+    # three are the CLAUDE.md throttled-sweep denylist
+    # (`ctest -LE 'residency|mem-handle|cache'`), and the denylist is about
+    # MEMORY-EXHAUSTION HAZARD, not subject matter -- carrying one would keep
+    # this gate out of the only sweep that routinely runs it. Measured before
+    # choosing: `free -g` available moved 0 GB across a run (see the fz2u task),
+    # so it does not belong in the hazard family. Re-measure before adding a
+    # label here; do not copy test-unified-cache-unpin-event's, which are
+    # correct for it because it allocates GPU buffer objects in a loop.
+    #
+    # ENVIRONMENT pins the B50 (validation card) so a bare ctest cannot perturb a
+    # measurement on the B70 -- same reasoning as the two gates above, and the
+    # same caveat: device numbering is machine-specific, see CLAUDE.md's selector
+    # table. oneAPI must be sourced or the SYCL runtime finds no platform.
+    llama_build(test-sycl-zone-reset-live-refusal.cpp)
+    target_include_directories(test-sycl-zone-reset-live-refusal PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    target_link_libraries(test-sycl-zone-reset-live-refusal PRIVATE ggml-sycl)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-zone-reset-live-refusal PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-sycl-zone-reset-live-refusal PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-sycl-zone-reset-live-refusal PRIVATE "-fsycl")
+        target_link_options(test-sycl-zone-reset-live-refusal PRIVATE "-fsycl")
+    endif()
+    llama_test(test-sycl-zone-reset-live-refusal LABEL "main")
+    set_tests_properties(test-sycl-zone-reset-live-refusal PROPERTIES
+        LABELS "sycl;lease;bugfix"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
+        TIMEOUT 300
+    )
 endif()
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
