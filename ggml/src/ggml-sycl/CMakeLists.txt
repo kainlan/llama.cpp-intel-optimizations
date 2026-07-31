@@ -39,6 +39,29 @@ option(GGML_SYCL_QUANTIZER_DEBUG "Enable quantizer kernel debug output" OFF)
 option(GGML_SYCL_ASAN_PARTIAL "Enable ASan for ggml-sycl.cpp and unified-cache.cpp only" OFF)
 option(GGML_SYCL_PROFILING_DEBUG "Enable SYCL device debug info for VTune profiling" OFF)
 
+# GGML_SYCL_XMX_GEMM and GGML_SYCL_MMQ_XMX read as two independent options but
+# are not separable: the XMX GEMM dispatch sites in ggml-sycl.cpp call
+# ggml_sycl_xmx_available() / ggml_sycl_xmx_supports_type(), which are declared
+# in mmq_xmx.hpp -- and ggml-sycl.cpp includes that header only under
+# GGML_SYCL_MMQ_XMX. Enabling just the first is a hard compile failure whose
+# four undeclared-identifier errors name nothing that hints at the missing
+# option, so it reads as "the XMX path is broken" rather than "the configure
+# line is incomplete". Fail here instead, naming the flag. See llama.cpp-d6d6.
+#
+# This is a hard error rather than an implicit force-ON because a forced
+# `set(... CACHE BOOL ... FORCE)` would rewrite the caller's cache behind their
+# back and leave GGML_SYCL_MMQ_XMX stuck ON after GGML_SYCL_XMX_GEMM is turned
+# back off. ggml-sycl.cpp carries the same condition as an #error, so a direct
+# -DGGML_SYCL_XMX_GEMM that bypasses CMake still gets a named diagnostic.
+if (GGML_SYCL_XMX_GEMM AND NOT GGML_SYCL_MMQ_XMX)
+    message(FATAL_ERROR
+        "GGML_SYCL_XMX_GEMM=ON requires GGML_SYCL_MMQ_XMX=ON.\n"
+        "The XMX GEMM dispatch calls ggml_sycl_xmx_available() and "
+        "ggml_sycl_xmx_supports_type(), declared in mmq_xmx.hpp, which "
+        "ggml-sycl.cpp includes only under GGML_SYCL_MMQ_XMX.\n"
+        "Re-run with both, e.g. -DGGML_SYCL_XMX_GEMM=ON -DGGML_SYCL_MMQ_XMX=ON")
+endif()
+
 file(GLOB   GGML_SOURCES_SYCL "*.cpp")
 list(FILTER GGML_SOURCES_SYCL EXCLUDE REGEX "test_joint_matrix.*\\.cpp$")
 list(FILTER GGML_SOURCES_SYCL EXCLUDE REGEX "test_tensor_parallel\\.cpp$")
