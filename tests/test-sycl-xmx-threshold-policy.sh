@@ -102,9 +102,12 @@ EOF
 expect_status 1 "a commented-out table row shadowed by prose" "$TMP/shadow-table-row.cpp"
 
 # --- S2: same shape for the initializer, via a TRAILING comment --------------
-# The nastier of the two: the live declaration says 1024 -- a byte-for-byte
-# reintroduction of llama.cpp-d5h0 -- and the checker read "= 0;" out of the
+# The nastier of the two. IN THIS FIXTURE the uncommented declaration says 1024 --
+# the shape of a d5h0 reintroduction -- and the checker read "= 0;" out of the
 # comment beside it. Measured against the checker at eca9214c9: exit 0.
+#
+# The fixture is synthesized. The real ggml-sycl.cpp:367 has always read `= 0`,
+# so this describes what the gate WOULD have missed, not something it did miss.
 cat > "$TMP/shadow-initializer.cpp" <<EOF
 $TABLE_ROW
 int g_ggml_sycl_xmx_threshold = 1024;  // was = 0; raised for broader XMX usage

@@ -25,15 +25,26 @@
 # ---- COMMENTS ARE STRIPPED BEFORE EVERY MATCH, and that is load-bearing -------
 # Both checks below run against a comment-stripped view of the source, not the
 # raw file. Until llama.cpp-x54y they ran against the raw file, and that gave
-# this script TWO false-PASS holes, both reproduced against the shipping code:
+# this script TWO false-PASS holes. Both were demonstrated by driving the
+# then-current checker against SYNTHESIZED FIXTURES -- see S1 and S2 in
+# tests/test-sycl-xmx-threshold-policy.sh, which are those fixtures:
 #
 #   * The table row commented out while a comment above it quotes the row
 #     verbatim ("we removed { "GGML_SYCL_XMX_THRESHOLD", &g_..., 64 } for now")
-#     -> check 1 matched the prose. Exit 0 on a real regression.
+#     -> check 1 matched the prose, and the fixture exits 0.
 #   * `int g_ggml_sycl_xmx_threshold = 1024;  // was = 0; raised for broader XMX`
-#     -> check 2 read the initializer out of the TRAILING COMMENT. Exit 0 on a
-#     byte-for-byte reintroduction of llama.cpp-d5h0 -- this script's entire
-#     reason for existing, waved through by this script.
+#     -> check 2 read the initializer out of the TRAILING COMMENT, and the
+#     fixture exits 0. So the gate could not have caught a d5h0 reintroduction
+#     written that way: this script's entire reason for existing, defeated by a
+#     comment.
+#
+# ⚠️ NEITHER WAS A LIVE REGRESSION, and the distinction is the point of saying so
+# here. ggml-sycl.cpp:367 reads `int g_ggml_sycl_xmx_threshold = 0;` at HEAD and
+# read the same at eca9214c9; the table row is present; the gate passes. What was
+# broken was the GATE'S ABILITY TO NOTICE, not the code it guards. Do not read
+# the fixtures above as evidence the threshold was ever wrong in-tree -- someone
+# acting on that would open a P1 for a regression that does not exist, or "fix" a
+# value that is already correct.
 #
 # The precondition is not hypothetical here: the declaration at ggml-sycl.cpp:367
 # carries a fifteen-line comment that names GGML_SYCL_XMX_THRESHOLD, the
