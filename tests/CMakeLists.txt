@@ -1,5 +1,19 @@
 llama_add_compile_flags()
 
+# Intel's SYCL link step records transient icpx/ocloc objects (written under
+# $TMPDIR) in the linker depfile and then deletes them. Ninja sees a dependency
+# that no longer exists and relinks the target on every build, forever. Same
+# remedy as ggml/src/ggml-sycl/CMakeLists.txt and tools/CMakeLists.txt; it is a
+# directory-scoped variable, so each directory holding an icpx-linked target
+# needs its own copy. Four targets here link with -fsycl and were permanently
+# dirty: test-sycl-fattn-onednn-gates, test-sycl-kernel-profiler,
+# test-unified-cache-unpin-event, test-sycl-zone-reset-live-refusal.
+# test-sycl-link-depends-coverage.py is the gate that keeps this from being
+# forgotten in a fifth directory. See llama.cpp-9ubg.
+if (CMAKE_GENERATOR STREQUAL "Ninja" AND CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+    set(CMAKE_CXX_LINK_DEPENDS_USE_LINKER FALSE)
+endif()
+
 function(llama_build source)
     set(TEST_SOURCES ${source} ${ARGN})
 
@@ -493,6 +507,25 @@ if (NOT WIN32)
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-timeline-flush-source.py
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         LABEL "sycl;profiling;tdd"
+        TIMEOUT 120
+    )
+
+    # Coverage gate for CMAKE_CXX_LINK_DEPENDS_USE_LINKER. The variable is
+    # directory-scoped, so every directory holding an icpx-linked target needs
+    # its own copy; for a long time only ggml/src/ggml-sycl/ had one and nine
+    # targets across four other directories were relinked on every build,
+    # silently -- nothing failed and nothing warned, builds were merely never
+    # incremental (llama.cpp-9ubg). This asserts directory five fails loudly.
+    #
+    # Registered rather than left to pytest-by-hand for the reason this file's
+    # own llama_test_pytest doc comment gives: an unregistered pytest-style
+    # file exits 0 for any state of the code under test, which would make a
+    # gate against vacuous passes itself a vacuous pass.
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-link-depends-coverage.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;build;policy"
         TIMEOUT 120
     )
 

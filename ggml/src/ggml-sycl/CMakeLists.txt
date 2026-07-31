@@ -22,6 +22,14 @@ if (CMAKE_GENERATOR STREQUAL "Ninja" AND CMAKE_CXX_COMPILER_ID STREQUAL "IntelLL
     # Intel's SYCL link step records transient icpx/ocloc objects in the linker
     # depfile. Those files are deleted after linking, so Ninja considers
     # libggml-sycl dirty on every build and repeats the expensive device link.
+    #
+    # This `set()` is directory-scoped, so it reaches only this directory's
+    # targets. Every OTHER directory holding a target that links with icpx
+    # needs the same line: tools/CMakeLists.txt carries it for the tools.
+    # tests/CMakeLists.txt still does not, so the four SYCL-linking tests
+    # (test-sycl-fattn-onednn-gates, test-sycl-kernel-profiler,
+    # test-unified-cache-unpin-event, test-sycl-zone-reset-live-refusal) are
+    # still relinked on every build. See llama.cpp-9ubg.
     set(CMAKE_CXX_LINK_DEPENDS_USE_LINKER FALSE)
 endif()
 

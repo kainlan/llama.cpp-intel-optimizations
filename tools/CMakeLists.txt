@@ -10,6 +10,19 @@ find_package(Threads REQUIRED)
 
 llama_add_compile_flags()
 
+# Intel's SYCL link step records transient icpx/ocloc objects (written under
+# $TMPDIR) in the linker depfile and then deletes them. Ninja sees a dependency
+# that no longer exists and relinks the target on every build, forever, so the
+# tree never reaches a no-op build. Same remedy as
+# ggml/src/ggml-sycl/CMakeLists.txt:21-26, set here at directory scope so it is
+# inherited by every tool subdirectory added below -- sycl-source-line-probe,
+# sycl-kernel-bench (which also builds sycl-mxfp4-source-line-probe),
+# sycl-mxfp4-moe-bench and onednn-woq-repro all link with icpx and were all
+# permanently dirty. See llama.cpp-9ubg.
+if (CMAKE_GENERATOR STREQUAL "Ninja" AND CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+    set(CMAKE_CXX_LINK_DEPENDS_USE_LINKER FALSE)
+endif()
+
 # tools
 
 if (EMSCRIPTEN)

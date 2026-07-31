@@ -69,11 +69,42 @@ else()
     set(LLAMA_UI_EMBED_EXE "$<TARGET_FILE:llama-ui-embed>")
 endif()
 
-# Run the provisioning script every build so source changes in tools/ui/ are
-# always picked up. The script uses copy_if_different for ui.cpp/ui.h, so the
-# library only recompiles when contents actually change.
-add_custom_target(llama-ui-assets ALL
-    BYPRODUCTS ${UI_CPP} ${UI_H}
+# Inputs that make the provisioning script's answer change. This is the same
+# list the script itself globs in npm_build_should_skip(), read from the same
+# file, so the two cannot drift apart.
+set(UI_ASSET_DEPENDS "${PROJECT_SOURCE_DIR}/scripts/ui-assets.cmake")
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/sources.cmake")
+    include("${CMAKE_CURRENT_SOURCE_DIR}/sources.cmake")
+    list(APPEND UI_ASSET_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/sources.cmake")
+    set(UI_ASSET_GLOBS "")
+    foreach(glob ${UI_SOURCE_GLOBS})
+        list(APPEND UI_ASSET_GLOBS "${CMAKE_CURRENT_SOURCE_DIR}/${glob}")
+    endforeach()
+    file(GLOB_RECURSE UI_ASSET_GLOBBED ${UI_ASSET_GLOBS})
+    list(APPEND UI_ASSET_DEPENDS ${UI_ASSET_GLOBBED})
+    foreach(file ${UI_SOURCE_FILES})
+        if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${file}")
+            list(APPEND UI_ASSET_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${file}")
+        endif()
+    endforeach()
+endif()
+
+# Provision UI assets. This used to be an `add_custom_target(... ALL ...)`,
+# which CMake emits with an output file it never creates -- so Ninja found it
+# dirty on every build and the tree had no no-op build at all (llama.cpp-9ubg).
+# Driving it from a real OUTPUT stamp keeps the same behaviour where it matters
+# (a changed tools/ui/ source still re-provisions, via UI_ASSET_DEPENDS) while
+# letting an untouched tree settle. ui.cpp/ui.h are declared outputs rather than
+# BYPRODUCTS; the script writes them with copy_if_different and CMake marks the
+# rule `restat`, so the library still only recompiles when contents change.
+#
+# The glob above is evaluated at configure time, like the file(GLOB) in
+# ggml/src/ggml-sycl/CMakeLists.txt: editing an existing UI source is picked up
+# by the build, but ADDING one needs a reconfigure.
+set(UI_ASSETS_STAMP "${CMAKE_CURRENT_BINARY_DIR}/ui-assets.stamp")
+
+add_custom_command(
+    OUTPUT  "${UI_ASSETS_STAMP}" ${UI_CPP} ${UI_H}
     COMMAND ${CMAKE_COMMAND}
         "-DUI_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
         "-DUI_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}"
@@ -86,9 +117,13 @@ add_custom_target(llama-ui-assets ALL
         "-DLLAMA_UI_EMBED=${LLAMA_UI_EMBED_EXE}"
         "-DLLAMA_UI_GZIP=${LLAMA_UI_GZIP}"
         -P "${PROJECT_SOURCE_DIR}/scripts/ui-assets.cmake"
+    COMMAND ${CMAKE_COMMAND} -E touch "${UI_ASSETS_STAMP}"
+    DEPENDS ${UI_ASSET_DEPENDS} "${LLAMA_UI_EMBED_EXE}"
     COMMENT "Provisioning UI assets"
     VERBATIM
 )
+
+add_custom_target(llama-ui-assets ALL DEPENDS "${UI_ASSETS_STAMP}")
 
 add_dependencies(llama-ui-assets llama-ui-embed)
 
