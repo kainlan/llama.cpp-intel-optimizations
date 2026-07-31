@@ -4360,8 +4360,20 @@ inline bool ggml_sycl_planner_authoritative_residency_active(int device) {
 // consults to decide whether the weight's current residency permits GPU
 // dispatch, overriding any host-routed placement *policy* when the bytes
 // are in fact in VRAM.
+//
+// The device guard is the full range check, not the `device < 0` half that
+// stood here: the asymmetry was not inert.  This function never subscripts a
+// per-device array itself, so it was never an out-of-bounds read -- but in
+// GLOBAL unified-cache mode (what AUTO resolves to whenever a single GPU is
+// visible, i.e. every single-GPU gate run on this machine) an out-of-range
+// device produced a wrong ANSWER, not a rejected one.  Two independent folds
+// conspire: get_unified_cache_for_device() maps any device id to 0 in GLOBAL
+// mode, and ggml_backend_sycl_get_weight_cache_key() ignores its device
+// argument entirely.  A VRAM-resident weight therefore reported `true` for a
+// device that does not exist.  No caller passes one today; the point is that
+// the half guard read as complete while delegating a bound nobody enforced.
 inline bool ggml_sycl_weight_is_currently_device_resident(const ggml_tensor * tensor, int device) {
-    if (!tensor || device < 0 || !ggml_sycl_tensor_is_weight(tensor)) {
+    if (!tensor || !ggml_sycl_valid_device_index(device) || !ggml_sycl_tensor_is_weight(tensor)) {
         return false;
     }
     auto resolved = ggml_sycl_resolve(tensor, device);
