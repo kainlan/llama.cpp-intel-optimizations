@@ -8612,8 +8612,20 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const int iv3 = iq3 / rv3;
         const int iv2 = iq2 / rv2;
 
-        const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
-        q_to_vec_dot(pq, Q_q, DK);
+        // Q does not have to be F32. A backend can ask for a different Q type at graph-build
+        // time (ggml-sycl.h's GGML_SYCL_FATTN_Q_TYPE casts it to F16), and the resulting graph
+        // is still handed to the CPU backend -- for a CPU-only context in that build, or for
+        // any layer the scheduler places here. Loading such a row through q_to_vec_dot, whose
+        // input is F32, reads DK floats out of a row that holds DK halfs: double the stride,
+        // wrong values on every row, and an overread past the tensor on the last one.
+        const char * pq = (const char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3);
+        if (q->type == k_vec_dot_type) {
+            // already in the form kq_vec_dot consumes - take the row as it is
+            memcpy(Q_q, pq, ggml_row_size(k_vec_dot_type, DK));
+        } else {
+            GGML_ASSERT(q->type == GGML_TYPE_F32 && "fattn: unsupported Q-type");
+            q_to_vec_dot((const float *) pq, Q_q, DK);
+        }
 
         // online softmax / attention
         // loop over n_kv and n_head_kv
