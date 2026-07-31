@@ -16507,11 +16507,55 @@ static void ggml_check_sycl() try {
         }
         g_ggml_sycl_debug = debug_value;
         g_ggml_sycl_debug_forced_off.store(debug_env_forced_off, std::memory_order_release);
-        g_ggml_sycl_debug_sync    = get_sycl_env("GGML_SYCL_DEBUG_SYNC", 0);
-        g_ggml_sycl_tp_debug      = get_sycl_env("GGML_SYCL_TP_DEBUG", 0);
-        g_ggml_sycl_disable_graph = get_sycl_env("GGML_SYCL_DISABLE_GRAPH", 0);
-        g_ggml_sycl_safe_mode     = get_sycl_env("GGML_SYCL_SAFE_MODE", 0);
-        g_ggml_sycl_handle_strict = get_sycl_env("GGML_SYCL_HANDLE_STRICT", 0);
+
+        // Every plain int setting this function parses, as {name, destination,
+        // default} triples. The table is the single source of truth for both
+        // the parse loop below and the non-default settings report further
+        // down, so each default is written exactly ONCE. A default written
+        // twice drifts sooner or later (llama.cpp-ytr7: one commit updated 2 of
+        // 4 copies of a literal and nobody noticed for months), and a settings
+        // report that lies about what is in effect is worse than no report at
+        // all -- it would either go silent on a real override or fire on a
+        // stock value.
+        //
+        // GGML_SYCL_DEBUG is deliberately not in the table: it resolves from
+        // three sources (GGML_SYCL_DEBUG, GGML_BACKEND_DEBUG, the runtime
+        // override) and is scrubbed from the environment above, so it is parsed
+        // there and handed to the report explicitly.
+        struct sycl_env_setting {
+            const char * name;
+            int *        dest;
+            int          default_value;
+        };
+
+        const sycl_env_setting sycl_env_settings[] = {
+            { "GGML_SYCL_DEBUG_SYNC",       &g_ggml_sycl_debug_sync,       0  },
+            { "GGML_SYCL_TP_DEBUG",         &g_ggml_sycl_tp_debug,         0  },
+            { "GGML_SYCL_DISABLE_GRAPH",    &g_ggml_sycl_disable_graph,    0  },
+            { "GGML_SYCL_SAFE_MODE",        &g_ggml_sycl_safe_mode,        0  },
+            { "GGML_SYCL_HANDLE_STRICT",    &g_ggml_sycl_handle_strict,    0  },
+            { "GGML_SYCL_DISABLE_DNN",      &g_ggml_sycl_disable_dnn,      0  },
+            { "GGML_SYCL_PRIORITIZE_DMMV",  &g_ggml_sycl_prioritize_dmmv,  0  },
+            { "GGML_SYCL_KQV_FORCE_SIMPLE", &g_ggml_sycl_kqv_force_simple, 0  },
+            { "GGML_SYCL_KQV_DISABLE_FP16", &g_ggml_sycl_kqv_disable_fp16, 0  },
+#ifdef GGML_SYCL_XMX_GEMM
+            { "GGML_SYCL_USE_XMX_GEMM",     &g_ggml_sycl_use_xmx_gemm,     0  },
+            { "GGML_SYCL_XMX_THRESHOLD",    &g_ggml_sycl_xmx_threshold,    64 },
+#endif
+#if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
+            // Async malloc / free is only used when graphs are enabled AND the
+            // graph is actually used, so it defaults to OFF to avoid issues
+            // with models that never build one (MoE). The device-aspect veto
+            // below can still clear it -- which is why that veto now runs
+            // before the report rather than after it.
+            { "GGML_SYCL_ASYNC_MEM",        &g_ggml_sycl_use_async_mem_op, 0  },
+#endif
+        };
+
+        for (const sycl_env_setting & setting : sycl_env_settings) {
+            *setting.dest = get_sycl_env(setting.name, setting.default_value);
+        }
+
         // Safe mode forces per-op queue drains (see ggml_sycl_compute_forward),
         // which makes graph replay meaningless — the graph is submitted as a
         // single unit and a "drain after every op" promise cannot be honored.
@@ -16520,14 +16564,36 @@ static void ggml_check_sycl() try {
         if (g_ggml_sycl_safe_mode && !g_ggml_sycl_disable_graph) {
             g_ggml_sycl_disable_graph = 1;
         }
-        g_ggml_sycl_disable_dnn      = get_sycl_env("GGML_SYCL_DISABLE_DNN", 0);
-        g_ggml_sycl_prioritize_dmmv  = get_sycl_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
-        g_ggml_sycl_kqv_force_simple = get_sycl_env("GGML_SYCL_KQV_FORCE_SIMPLE", 0);
-        g_ggml_sycl_kqv_disable_fp16 = get_sycl_env("GGML_SYCL_KQV_DISABLE_FP16", 0);
-#ifdef GGML_SYCL_XMX_GEMM
-        g_ggml_sycl_use_xmx_gemm  = get_sycl_env("GGML_SYCL_USE_XMX_GEMM", 0);
-        g_ggml_sycl_xmx_threshold = get_sycl_env("GGML_SYCL_XMX_THRESHOLD", 64);
+        // A device that cannot honour GGML_SYCL_ASYNC_MEM vetoes it. This runs
+        // before the report below so that what is reported is what the backend
+        // will actually do, and it says so out loud: a silently downgraded flag
+        // is the same "did my setting arrive?" ambiguity this report exists to
+        // remove.
+#if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
+        if (g_ggml_sycl_use_async_mem_op) {
+            for (unsigned int i = 0; i < dpct::dev_mgr::instance().device_count(); ++i) {
+                if (!ggml_sycl_get_device(i).has(sycl::aspect::ext_oneapi_async_memory_alloc)) {
+                    g_ggml_sycl_use_async_mem_op = 0;
+                    GGML_LOG_WARN(
+                        "[SYCL] GGML_SYCL_ASYNC_MEM ignored: device %u does not support "
+                        "ext_oneapi_async_memory_alloc\n",
+                        i);
+                    break;
+                }
+            }
+        }
+#else
+        // Nothing parsed it in this build, so no global exists to read back and
+        // the report cannot mention it -- which would leave "the flag did
+        // nothing" and "this build cannot honour the flag" looking identical.
+        // getenv() is the right source here for exactly that reason.
+        if (getenv("GGML_SYCL_ASYNC_MEM") != nullptr) {
+            GGML_LOG_WARN(
+                "[SYCL] GGML_SYCL_ASYNC_MEM ignored: this build has no SYCL graph / async memory "
+                "allocation support\n");
+        }
 #endif
+
         GGML_SYCL_DEBUG("[SYCL] call ggml_check_sycl\n");
 
         // Visible report of the settings this function actually PARSED.
@@ -16544,8 +16610,8 @@ static void ggml_check_sycl() try {
         // nothing" apart from "the flag never reached the backend" (llama.cpp-5bd8).
         //
         // WARN clears the default threshold, so this line survives. It is
-        // deliberately NOT a second copy of the table: only values that differ
-        // from their default are listed, so a stock run prints nothing extra
+        // deliberately NOT a second copy of the INFO table: only values that
+        // differ from their default are listed, so a stock run prints nothing extra
         // and benchmark output is unchanged. The values are read back from the
         // parsed globals rather than from getenv(), so what is reported is what
         // the backend believes -- a misspelled variable name is correctly
@@ -16565,19 +16631,9 @@ static void ggml_check_sycl() try {
             };
 
             add("GGML_SYCL_DEBUG", g_ggml_sycl_debug, 0);
-            add("GGML_SYCL_DEBUG_SYNC", g_ggml_sycl_debug_sync, 0);
-            add("GGML_SYCL_TP_DEBUG", g_ggml_sycl_tp_debug, 0);
-            add("GGML_SYCL_DISABLE_GRAPH", g_ggml_sycl_disable_graph, 0);
-            add("GGML_SYCL_SAFE_MODE", g_ggml_sycl_safe_mode, 0);
-            add("GGML_SYCL_HANDLE_STRICT", g_ggml_sycl_handle_strict, 0);
-            add("GGML_SYCL_DISABLE_DNN", g_ggml_sycl_disable_dnn, 0);
-            add("GGML_SYCL_PRIORITIZE_DMMV", g_ggml_sycl_prioritize_dmmv, 0);
-            add("GGML_SYCL_KQV_FORCE_SIMPLE", g_ggml_sycl_kqv_force_simple, 0);
-            add("GGML_SYCL_KQV_DISABLE_FP16", g_ggml_sycl_kqv_disable_fp16, 0);
-#ifdef GGML_SYCL_XMX_GEMM
-            add("GGML_SYCL_USE_XMX_GEMM", g_ggml_sycl_use_xmx_gemm, 0);
-            add("GGML_SYCL_XMX_THRESHOLD", g_ggml_sycl_xmx_threshold, 64);
-#endif
+            for (const sycl_env_setting & setting : sycl_env_settings) {
+                add(setting.name, *setting.dest, setting.default_value);
+            }
 
             if (!overrides.empty()) {
                 GGML_LOG_WARN("[SYCL] non-default settings in effect: %s\n", overrides.c_str());
@@ -16594,6 +16650,11 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_DISABLE_GRAPH: %d\n", g_ggml_sycl_disable_graph);
 #else
         GGML_LOG_INFO("  GGML_SYCL_DISABLE_GRAPH: graph disabled by compile flag\n");
+#endif
+#if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
+        GGML_LOG_INFO("  GGML_SYCL_ASYNC_MEM: %d\n", g_ggml_sycl_use_async_mem_op);
+#else
+        GGML_LOG_INFO("  GGML_SYCL_ASYNC_MEM: async memory allocation disabled by compile flag\n");
 #endif
         if (g_ggml_sycl_safe_mode) {
             GGML_LOG_INFO(
@@ -16641,21 +16702,8 @@ static void ggml_check_sycl() try {
 #endif
 */
 
-        // Currently, we only use async malloc / free when graphs are enabled AND the graph is actually used.
-        // async_mem_op is now controlled separately via GGML_SYCL_ASYNC_MEM environment variable,
-        // defaulting to OFF to avoid issues with models that don't use SYCL graphs (like MoE models).
-#if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
-        // Default to disabled - only enable if explicitly requested
-        g_ggml_sycl_use_async_mem_op = get_sycl_env("GGML_SYCL_ASYNC_MEM", 0);
-        if (g_ggml_sycl_use_async_mem_op) {
-            for (unsigned int i = 0; i < dpct::dev_mgr::instance().device_count(); ++i) {
-                if (!ggml_sycl_get_device(i).has(sycl::aspect::ext_oneapi_async_memory_alloc)) {
-                    g_ggml_sycl_use_async_mem_op = 0;
-                    break;
-                }
-            }
-        }
-#endif
+        // GGML_SYCL_ASYNC_MEM is parsed with the rest of the settings above, so
+        // that the report can name it; the device-aspect veto lives there too.
         if (CHECK_TRY_ERROR(g_all_sycl_device_count = dpct::dev_mgr::instance().device_count()) != 0) {
             initialized   = true;
             g_sycl_loaded = false;

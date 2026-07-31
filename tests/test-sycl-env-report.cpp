@@ -75,6 +75,13 @@ int main() {
     // genuinely unset, and ctest inherits the caller's environment.
     clear_env_var("GGML_SYCL_KQV_FORCE_SIMPLE");
 
+    // GGML_SYCL_ASYNC_MEM was parsed AFTER the report was emitted until
+    // llama.cpp-hhw6, so setting it produced no self-report at all -- the exact
+    // ambiguity this report exists to remove. Only backend init runs here, no
+    // graph is ever built, so requesting async allocation changes nothing that
+    // this process goes on to do.
+    set_env_var("GGML_SYCL_ASYNC_MEM", "1");
+
     // Must be installed before the first backend init: ggml_check_sycl() runs
     // once per process behind a static guard, so there is no second chance.
     ggml_log_set(capture_log, nullptr);
@@ -105,6 +112,20 @@ int main() {
 
     CHECK(contains(report, "GGML_SYCL_HANDLE_STRICT=1"), "settings report omitted the variable that was set");
     CHECK(!contains(report, "GGML_SYCL_KQV_FORCE_SIMPLE"), "settings report listed a variable left at its default");
+
+    // GGML_SYCL_ASYNC_MEM cannot be asserted the same way, because whether the
+    // backend can honour it is not a property of this test: it is compiled out
+    // unless the build has both SYCL graphs and the async-alloc extension, and
+    // even then a device lacking ext_oneapi_async_memory_alloc vetoes it at
+    // init. Asserting it appears in the report would make this gate fail on
+    // perfectly correct builds. What IS invariant is that the request must be
+    // ACCOUNTED FOR -- either the report names it, or the backend said why it
+    // did not. The pre-hhw6 binary emits neither, so this still discriminates.
+    const bool async_reported = contains(report, "GGML_SYCL_ASYNC_MEM=1");
+    const bool async_declined = contains(g_log, "GGML_SYCL_ASYNC_MEM ignored");
+    CHECK(async_reported || async_declined, "GGML_SYCL_ASYNC_MEM=1 was neither reported nor explained");
+    std::fprintf(stderr, "INFO: GGML_SYCL_ASYNC_MEM=1 %s\n",
+                 async_reported ? "reported in effect" : "declined with a reason");
 
     ggml_backend_free(backend);
 
