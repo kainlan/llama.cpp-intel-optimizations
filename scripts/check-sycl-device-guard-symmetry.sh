@@ -139,12 +139,17 @@ function strip(s) {
 
         if (ident ~ /[Dd][Ee][Vv]/ && prev != "." && prev != ">" && prev !~ /[A-Za-z0-9_]/) {
             # BUFFERED, not printed here. If a positive control below fails, this
-            # run proves nothing and its findings must not be emitted: the wrapper
-            # matches FATAL only at the START of the report, so a violation line
-            # printed first would bury the FATAL and downgrade "the check could not
-            # run" (exit 2) to "your code is wrong" (exit 1). Caught by the
-            # helper-renamed control -- which is the whole reason that control
+            # run proves nothing and its findings must not be emitted: a violation
+            # line printed first would bury the FATAL and downgrade "the check
+            # could not run" (exit 2) to "your code is wrong" (exit 1). Caught by
+            # the helper-renamed control -- which is the whole reason that control
             # exists, and it found the flaw in the checker rather than in the code.
+            #
+            # The dispatch below now also matches FATAL anywhere in the report
+            # rather than only at its start (llama.cpp-n68j), so the two are
+            # independent belts. Keep the buffering anyway: the report is read by
+            # humans as well as by grep, and a findings-first report tells the
+            # reader to go fix code when the real news is that nothing was checked.
             nbad++
             findings[nbad] = sprintf("%s:%d: `%s < 0` guards the lower bound only -- use ggml_sycl_valid_device_index(%s)",
                                      FILENAME, FNR, ident, ident)
@@ -164,12 +169,20 @@ END {
 }
 ' "$TARGET")
 
-case "$report" in
-    FATAL:*)
-        echo "check-sycl-device-guard-symmetry.sh: ${report#FATAL: }" >&2
-        exit 2
-        ;;
-esac
+# FATAL is matched ANYWHERE in the report, not only at its start (llama.cpp-n68j).
+# The awk above already buffers findings so a FATAL always leads, which is what
+# makes this correct today -- but that left the property resting on every future
+# author noticing that print order in an END block is load-bearing. Matching
+# line-anchored-anywhere removes the dependency rather than documenting it.
+# Plain grep into a herestring, first line taken by parameter expansion: no
+# early-exiting grep and no pipeline, so there is nothing for the SIGPIPE race of
+# llama.cpp-x54y to act on. Matches the sibling's classify_report().
+fatals="$(grep '^FATAL: ' <<< "$report" || true)"
+fatal="${fatals%%$'\n'*}"
+if [ -n "$fatal" ]; then
+    echo "check-sycl-device-guard-symmetry.sh: ${fatal#FATAL: }" >&2
+    exit 2
+fi
 
 violations=$(printf '%s\n' "$report" | grep -c 'lower bound only' || true)
 if [ "$violations" -ne 0 ]; then

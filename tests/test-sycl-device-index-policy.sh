@@ -145,5 +145,75 @@ emit_struct "$TMP/no-indexing.cpp" '
     }'
 expect_status 2 "no member subscripts a per-device array" "$TMP/no-indexing.cpp"
 
+# --- report classification, driven directly (llama.cpp-n68j) ----------------
+# The checker printed findings AS IT DISCOVERED THEM, interleaved with any FATAL
+# line, while its dispatch matched FATAL only at the START of the report. A
+# finding landing ahead of the FATAL therefore downgraded "the check could not
+# run" (exit 2) to "your code is wrong" (exit 1) -- sending a reader after real
+# code on the strength of a checker that had already established it could not
+# answer. Found by the SIBLING script's helper-renamed control, which exists to
+# prove a checker fails loudly when its own premise is destroyed, and which found
+# a bug in the checker rather than in the code under test.
+#
+# WHY THIS IS DRIVEN THROUGH --classify-report RATHER THAN A FIXTURE: the defect
+# is unreachable through the front door. Every FATAL condition in the awk implies
+# zero findings (no struct, no arrays, no members, or nothing indexing -- each
+# leaves the finding loop with nothing to emit), so no input file can produce the
+# interleaving. That is exactly why it was filed as LATENT and why it needs a
+# seam: a defect that is one edit away from reachable, with no way to test it,
+# comes back silently. Judged against the dispatch at eca9214c9 these four cases
+# read 2 / 1 / 0 / **1** -- the last is the bug.
+classify() {
+    local want="$1" what="$2" report="$3" rc=0
+    printf '%s\n' "$report" | "$CHECKER" --classify-report >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -ne "$want" ]; then
+        echo "expected $what to exit $want, got $rc" >&2
+        exit 1
+    fi
+}
+
+FINDING='common.hpp:12: f() subscripts data_device[] with no bounds check -- guard with ggml_sycl_valid_device_index(dev)'
+FATAL='FATAL: struct ggml_tensor_extra_gpu not found -- renamed or moved; this check no longer describes the code'
+
+classify 2 "a leading FATAL"                    "$FATAL"
+classify 1 "findings with no FATAL"             "$FINDING
+OK 31 arrays, 21 members, 15 indexing, 1 unguarded"
+classify 0 "a clean inventory"                  "OK 31 arrays, 21 members, 15 indexing, 0 unguarded"
+
+# THE CASE. A FATAL that does not lead must still win: cannot-check outranks a
+# finding, whatever order they were emitted in.
+classify 2 "a FATAL preceded by a finding"      "$FINDING
+$FATAL"
+
+# A report with none of the three markers is a broken premise, not a pass. This
+# used to exit 1 silently -- `printf ... | grep '^OK '` failing under `set -e`.
+classify 2 "a report with no marker at all"     ""
+
+# --- determinism -------------------------------------------------------------
+# This checker has no piped early-exiting grep and never had the SIGPIPE flake of
+# llama.cpp-x54y, so this loop is a guard against reintroducing one rather than a
+# reproduction of anything. It is cheap here (~10 ms/run) because the checker
+# parses one header, unlike the xmx sibling.
+det_first=""
+det_bad=0
+for _ in $(seq 30); do
+    det_rc=0
+    "$CHECKER" "$TARGET" >/dev/null 2>&1 || det_rc=$?
+    if [ -z "$det_first" ]; then
+        det_first="$det_rc"
+    elif [ "$det_rc" != "$det_first" ]; then
+        det_bad=1
+    fi
+done
+if [ "$det_bad" -ne 0 ] || [ "$det_first" != "0" ]; then
+    echo "the checker is not deterministic over an unchanged tree" >&2
+    echo "(first status $det_first, and at least one run disagreed)." >&2
+    echo "Do NOT re-run until it goes green -- that is the habit this case exists" >&2
+    echo "to prevent. Suspect a pipeline under 'set -o pipefail': grep -q/-l/-m" >&2
+    echo "exits early, its writer takes SIGPIPE, and a successful match is" >&2
+    echo "reported as a failure. Use grep pattern <<< \"\$VAR\"." >&2
+    exit 1
+fi
+
 # Only now, against the real header.
 "$CHECKER" "$TARGET"

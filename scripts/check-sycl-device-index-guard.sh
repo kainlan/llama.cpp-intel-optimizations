@@ -23,6 +23,11 @@
 # two more -- each ended in a completeness claim and two were wrong. Follows the
 # existing check-sycl-handle-usage.sh / test-sycl-handle-policy.sh pair.
 #
+# Exit statuses: 0 clean, 1 an unguarded member, 2 the check could not run. The
+# 1-vs-2 distinction is the point of classify_report() below and of llama.cpp-n68j
+# -- read its comment before touching the awk END block's print order, and note
+# the `--classify-report` seam it documents exists for the control suite.
+#
 # KEYED ON THE ARRAY NAMES, NOT THE INDEX SPELLING. This is the whole point. The
 # sweep that missed forget_/take_moe_storage_handle_on_device matched [dev] and
 # [device], which cannot match [owner_device] however carefully it is re-run --
@@ -32,7 +37,63 @@
 # array added tomorrow is covered without editing this script.
 set -euo pipefail
 
-TARGET="${1:?usage: check-sycl-device-index-guard.sh <file>}"
+TARGET="${1:?usage: check-sycl-device-index-guard.sh [--classify-report] <file>}"
+
+# Turn the awk report into an exit status. Factored out of the tail of this
+# script for llama.cpp-n68j, for two reasons that are worth keeping separate:
+#
+#   * FATAL is matched ANYWHERE in the report, not only at its start. The awk
+#     above now buffers findings so a FATAL always leads, and that alone fixes
+#     the defect -- but it leaves the property resting on every future author
+#     noticing that the print order in an END block is load-bearing. Matching
+#     line-anchored-anywhere removes the dependency instead of documenting it.
+#     Belt and braces, as the ticket asked.
+#   * It is reachable as `--classify-report` so the control suite can drive it
+#     with a synthesized report. That seam exists because the ordering bug is
+#     currently UNREACHABLE through the front door: every FATAL condition here
+#     implies zero findings, so no fixture can produce the interleaving. A
+#     latent defect with no way to test it is one edit away from coming back
+#     silently, which is exactly what n68j was filed about.
+#
+# Plain grep into a herestring, then the first line by parameter expansion. Not
+# `grep -m1`, which is an early-exiting grep and a GNU/BSD extension rather than
+# POSIX; and not a pipeline into one, which would reintroduce the
+# SIGPIPE-under-pipefail race of llama.cpp-x54y. Plain grep reads to EOF, so
+# there is no signal to race even if someone reinstates the pipe. See
+# tests/test-sycl-xmx-threshold-policy.sh for the measured rates.
+classify_report() {
+    local report="$1" fatals fatal violations
+    fatals="$(grep '^FATAL: ' <<< "$report" || true)"
+    fatal="${fatals%%$'\n'*}"
+    if [ -n "$fatal" ]; then
+        echo "check-sycl-device-index-guard.sh: ${fatal#FATAL: }" >&2
+        return 2
+    fi
+
+    violations=$(grep -c 'no bounds check' <<< "$report" || true)
+    if [ "$violations" -ne 0 ]; then
+        grep 'no bounds check' <<< "$report" >&2
+        return 1
+    fi
+
+    # Print the inventory on success rather than passing silently. The counts are
+    # what a reader wants and what a hand-written comment gets wrong: this makes
+    # the script the live source of them, so nothing has to be maintained by hand
+    # and a regex that has quietly stopped matching shows up as a number that
+    # moved. A report with neither a FATAL, a finding nor an OK line is itself a
+    # broken premise, so grep's failure here must not be swallowed.
+    if ! grep '^OK ' <<< "$report"; then
+        echo "check-sycl-device-index-guard.sh: the report carries no FATAL, no finding and no OK line -- awk produced nothing usable" >&2
+        return 2
+    fi
+    return 0
+}
+
+if [ "$TARGET" = "--classify-report" ]; then
+    rc=0
+    classify_report "$(cat)" || rc=$?
+    exit "$rc"
+fi
 
 if [ ! -e "$TARGET" ]; then
     echo "check-sycl-device-index-guard.sh: no such file or directory: $TARGET" >&2
@@ -139,35 +200,26 @@ END {
         if (hit == "") { continue }
         nindexing++
         if (fbodies[i] !~ /ggml_sycl_valid_device_index\(/ && fbodies[i] !~ /<[[:space:]]*GGML_SYCL_MAX_DEVICES/) {
-            printf "%s:%d: %s() subscripts %s[] with no bounds check -- guard with ggml_sycl_valid_device_index(dev)\n", FILENAME, flines[i], fnames[i], hit
+            # BUFFERED, not printed here (llama.cpp-n68j). A finding emitted
+            # before the FATAL checks below would land ahead of the FATAL line in
+            # the report and downgrade "the check could not run" (exit 2) to
+            # "your code is wrong" (exit 1) -- pointing a reader at the source
+            # instead of at the broken premise, which is the worst direction for
+            # a diagnostic to be wrong in. Judging the premises first means a run
+            # that proves nothing reports exactly that and nothing else.
             nbad++
+            findings[nbad] = sprintf("%s:%d: %s() subscripts %s[] with no bounds check -- guard with ggml_sycl_valid_device_index(dev)", FILENAME, flines[i], fnames[i], hit)
         }
     }
     if (instruct == 0)  { print "FATAL: struct ggml_tensor_extra_gpu not found -- renamed or moved; this check no longer describes the code"; exit 0 }
     if (narrays == 0)   { print "FATAL: no [GGML_SYCL_MAX_DEVICES] members found in ggml_tensor_extra_gpu -- pattern stopped matching"; exit 0 }
     if (nfuncs == 0)    { print "FATAL: no member functions parsed out of ggml_tensor_extra_gpu -- pattern stopped matching"; exit 0 }
     if (nindexing == 0) { print "FATAL: no member subscripts a per-device array -- pattern stopped matching"; exit 0 }
+    for (i = 1; i <= nbad; i++) { print findings[i] }
     printf "OK %d arrays, %d members, %d indexing, %d unguarded\n", narrays, nfuncs, nindexing, nbad
 }
 ' "$TARGET")
 
-case "$report" in
-    FATAL:*)
-        echo "check-sycl-device-index-guard.sh: ${report#FATAL: }" >&2
-        exit 2
-        ;;
-esac
-
-violations=$(printf '%s\n' "$report" | grep -c 'no bounds check' || true)
-if [ "$violations" -ne 0 ]; then
-    printf '%s\n' "$report" | grep 'no bounds check' >&2
-    exit 1
-fi
-
-# Print the inventory on success rather than passing silently. The counts are
-# what a reader wants and what a hand-written comment gets wrong: this makes the
-# script the live source of them, so nothing has to be maintained by hand and a
-# regex that has quietly stopped matching shows up as a number that moved.
-printf '%s\n' "$report" | grep '^OK '
-
-exit 0
+rc=0
+classify_report "$report" || rc=$?
+exit "$rc"
