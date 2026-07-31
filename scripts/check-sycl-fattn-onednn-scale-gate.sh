@@ -27,18 +27,49 @@
 # Textual check on source: no compilation, no GPU, no oneDNN. That matters --
 # the code it guards sits inside #if GGML_SYCL_DNNL, so a build without oneDNN
 # compiles none of it and would check nothing.
+#
+# ---- COMMENTS ARE STRIPPED BEFORE EVERY MATCH, and that is load-bearing -------
+# All three checks below run against a comment-stripped view of the source, not
+# the raw file. Without that, this script has a false-PASS hole with its name on
+# it: the code it guards is documented by a long comment block that names
+# SCALE_UNSUPPORTED and GGML_ASSERT explicitly. Comment out the real reject or
+# the real assertion, leave that prose in place, and every check below would
+# still match -- a regression reported as green. The richer the explanation, the
+# likelier it shadows the code it explains. `check-sycl-handle-usage.sh` states
+# the same failure mode ("a comment merely mentioning ... silently whitelists a
+# real defect"), and check-sycl-device-guard-symmetry.sh notes a checker that
+# matches its own rationale fails the moment it succeeds. The strip() below is
+# borrowed from check-sycl-device-index-guard.sh rather than reinvented.
+#
+# LIMITATION of that stripper, stated because a silent one is worse: it is
+# LINE-BASED. It removes whole-line // and /* comments, single-line /* */ pairs,
+# and trailing //, but it does not track a /* */ block opened mid-line and closed
+# on a later line, and it does not know about string literals -- a "//" inside a
+# string is treated as a comment. For the three fixed symbols matched here none
+# of those cases arises, so the gap is theoretical today. REMEDY if it ever
+# stops being theoretical: this check has outgrown grep, and the answer is a
+# compiler-backed query (clang-query / a libTooling matcher) rather than a
+# cleverer regex. Do not extend the regex to chase C++ syntax.
+#
+# ANTI-VACUOUS CONTROL: an assertion about stripped text passes cleanly when the
+# stripper malfunctions and returns nothing, which is indistinguishable from a
+# real pass. So each stripped view must still contain a token that is always
+# present in a healthy file; if it does not, that is exit 2 (cannot check), not
+# a pass.
 set -euo pipefail
 
 PLAN_FILE="${1:-ggml/src/ggml-sycl/fattn-onednn.cpp}"
 ENUM_FILE="${2:-ggml/src/ggml-sycl/fattn.hpp}"
 
-# A missing grep is a SKIP (77); a missing target file is a FAILURE. "This
+# A missing tool is a SKIP (77); a missing target file is a FAILURE. "This
 # runner cannot check" and "the thing being checked has moved" must not report
 # the same way, or a rename silently retires the gate.
-if ! command -v grep >/dev/null 2>&1; then
-    echo "check-sycl-fattn-onednn-scale-gate.sh: no grep available; skipping" >&2
-    exit 77
-fi
+for tool in grep awk; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "check-sycl-fattn-onednn-scale-gate.sh: no $tool available; skipping" >&2
+        exit 77
+    fi
+done
 
 for f in "$PLAN_FILE" "$ENUM_FILE"; do
     if [ ! -f "$f" ]; then
@@ -47,11 +78,51 @@ for f in "$PLAN_FILE" "$ENUM_FILE"; do
     fi
 done
 
+# Comment-stripped view of a source file. strip() is the idiom from
+# check-sycl-device-index-guard.sh; see LIMITATION above for what it does not do.
+strip_comments() {
+    awk '
+    function strip(s) {
+        if (s ~ /^[[:space:]]*(\/\/|\/\*)/ || s ~ /^[[:space:]]*\*([[:space:]]|$)/) { return "" }
+        gsub(/\/\*[^*]*\*\//, " ", s)
+        sub(/\/\/.*/, "", s)
+        return s
+    }
+    { print strip($0) }
+    ' "$1"
+}
+
+PLAN_SRC="$(strip_comments "$PLAN_FILE")"
+ENUM_SRC="$(strip_comments "$ENUM_FILE")"
+
+# Positive controls. These are NOT the invariant -- they establish that the
+# stripped views still contain the code being interrogated, so that a "not
+# found" below means "the guard is gone" rather than "the stripper ate the file"
+# or "this is the wrong file".
+#
+# -w (whole word) is deliberate and was found the hard way: a plain substring
+# grep for the planner's name still matches a RENAMED symbol that merely keeps
+# the old name as a prefix (..._plan_RENAMED), so the control passed on a file
+# where the thing it was proving present had in fact been renamed away. The
+# control suite's C5 case pins this.
+if ! printf '%s\n' "$PLAN_SRC" | grep -qw 'ggml_sycl_flash_attn_ext_onednn_plan'; then
+    echo "FATAL: ggml_sycl_flash_attn_ext_onednn_plan not found in the stripped view of" >&2
+    echo "       $PLAN_FILE. Either the planner was renamed/moved, this is the wrong" >&2
+    echo "       file, or strip_comments is broken. Any of those makes the checks below" >&2
+    echo "       meaningless -- they would pass vacuously. Fix this before reading them." >&2
+    exit 2
+fi
+if ! printf '%s\n' "$ENUM_SRC" | grep -qw 'ggml_sycl_onednn_fa_layout_reason'; then
+    echo "FATAL: enum ggml_sycl_onednn_fa_layout_reason not found in the stripped view of" >&2
+    echo "       $ENUM_FILE. Renamed, moved, or strip_comments is broken." >&2
+    exit 2
+fi
+
 status=0
 
 # 1a. The reject reason must exist as an enum value. Matched on the symbol, not
 #     on the enum's formatting, so clang-format cannot trip it.
-if ! grep -q 'SCALE_UNSUPPORTED' "$ENUM_FILE"; then
+if ! printf '%s\n' "$ENUM_SRC" | grep -q 'SCALE_UNSUPPORTED'; then
     echo "FAIL: no SCALE_UNSUPPORTED in ggml_sycl_onednn_fa_layout_reason ($ENUM_FILE)." >&2
     echo "      The planner has no way left to name a scale rejection. If the" >&2
     echo "      reason was renamed, update this check; if it was removed, the" >&2
@@ -63,7 +134,7 @@ fi
 #     symbol rather than for the comparison's spelling: the tolerance, the
 #     fabs/sqrtf call and the line wrapping are all free to change, but a
 #     planner that rejects on scale has to name the reason.
-if ! grep -q 'ggml_sycl_onednn_fa_layout_reason::SCALE_UNSUPPORTED' "$PLAN_FILE"; then
+if ! printf '%s\n' "$PLAN_SRC" | grep -q 'ggml_sycl_onednn_fa_layout_reason::SCALE_UNSUPPORTED'; then
     echo "FAIL: the oneDNN FA planner in $PLAN_FILE never rejects on scale." >&2
     echo "      ggml_sycl_flash_attn_ext_onednn_plan must return" >&2
     echo "      SCALE_UNSUPPORTED when params.scale deviates from 1/sqrt(D)," >&2
@@ -75,7 +146,7 @@ fi
 # 2. The execute-time backstop must still be an assertion. Matched on the
 #    identifier the comparison is stored in -- deleting the assert deletes the
 #    variable with it, and a widened tolerance still has to compare something.
-if ! grep -q 'GGML_ASSERT(scale_diff' "$PLAN_FILE"; then
+if ! printf '%s\n' "$PLAN_SRC" | grep -q 'GGML_ASSERT(scale_diff'; then
     echo "FAIL: the execute-time GGML_ASSERT on scale_diff is gone from $PLAN_FILE." >&2
     echo "      Do not remove or downgrade it. The oneDNN partition's divisor is" >&2
     echo "      fixed at compile time from D; without this assertion a shape the" >&2
