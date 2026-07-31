@@ -2848,19 +2848,24 @@ template <typename T> struct ggml_sycl_pool_alloc {
 // indexed on entry, before anything downstream could notice, so each accessor
 // checks first.  One compare against a compile-time constant.
 //
-// Inventory, so the next auditor does not have to re-derive it.
-// ggml_tensor_extra_gpu has 14 members taking a device index, all guarded:
-//   - 12 call this helper.
-//   - 2 predate it and still carry the equivalent inline literal --
-//     forget_moe_storage_handle_on_device and take_moe_storage_handle_on_device,
-//     which subscript moe_expert_handles[owner_device] and friends behind their
-//     own checks.  Guarded, just not collapsed onto this helper.
-// Six further copies of the literal live outside the struct and are untouched.
+// THE RULE: every member of ggml_tensor_extra_gpu that subscripts a
+// [GGML_SYCL_MAX_DEVICES] array must bounds-check the index first -- via this
+// helper, which is the canonical form.  Two members predate it and still carry
+// an equivalent inline literal (forget_/take_moe_storage_handle_on_device);
+// they are guarded, just not collapsed onto the helper yet, and llama.cpp-uc7s
+// tracks that along with the copies outside this struct.
 //
-// The count is spelled out because it was twice reported wrong. Both misses came
-// from the same place: a sweep regex matching only [dev]/[device], which cannot
-// match [owner_device] however carefully it is run.  Grep the array names, not
-// the index spelling.
+// ENFORCEMENT: scripts/check-sycl-device-index-guard.sh, run by
+// tests/test-sycl-device-index-policy.sh.  It discovers the per-device arrays
+// from this struct rather than from a list, so a member or array added later is
+// covered without editing anything, and it prints its own inventory -- ask the
+// script for the counts instead of trusting a number written here, which is
+// exactly what went stale before.
+//
+// The rule is stated rather than tallied because the tally was twice reported
+// wrong, both times from one cause: a sweep regex matching only [dev]/[device],
+// which cannot match [owner_device] however carefully it is re-run.  The blind
+// spot was inside the check.  Key on the array names, never the index spelling.
 static inline bool ggml_sycl_valid_device_index(int dev) {
     return dev >= 0 && dev < GGML_SYCL_MAX_DEVICES;
 }
