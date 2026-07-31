@@ -7,7 +7,12 @@ FIXTURES="$ROOT_DIR/tests/sycl-handle-policy-fixtures"
 
 # Same portability guard as test-sycl-alloc-policy.sh: the patterns rely on
 # GNU/rg regex behavior. Exit 77 = ctest SKIP_RETURN_CODE.
-if ! command -v rg >/dev/null 2>&1 && ! printf 'a b' | grep -Eq 'a\sb' 2>/dev/null; then
+#
+# Herestring, not a pipeline into `grep -Eq` -- see the sibling for why (a false
+# negative here does not fail the gate, it SKIPS it, and a skipped gate reads as
+# green). Unreachable at this probe's size; converted because the form is the
+# defect, not the rate (llama.cpp-x54y).
+if ! command -v rg >/dev/null 2>&1 && ! grep -Eq 'a\sb' <<< 'a b' 2>/dev/null; then
     echo "test-sycl-handle-policy: no ripgrep and no GNU grep; skipping" >&2
     exit 77
 fi

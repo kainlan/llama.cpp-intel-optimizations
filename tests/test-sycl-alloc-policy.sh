@@ -8,7 +8,15 @@ CHECKER="$ROOT_DIR/scripts/check-sycl-alloc-usage.sh"
 # multiline scanning). Where neither is available (e.g. macOS BSD grep runners),
 # skip: the SYCL source policy only matters on Linux/SYCL builds and is still
 # enforced wherever rg or GNU grep exists. Exit 77 = ctest SKIP_RETURN_CODE.
-if ! command -v rg >/dev/null 2>&1 && ! printf 'a b' | grep -Eq 'a\sb' 2>/dev/null; then
+#
+# Herestring, not `printf 'a b' | grep -Eq ...` (llama.cpp-x54y): -q is an
+# early-exiting grep, and under the `set -o pipefail` above a pipeline into one
+# can report a SUCCESSFUL match as a failure when its writer takes SIGPIPE. The
+# probe's 3 bytes make that unreachable here -- the writer always finishes into
+# the 64 KiB pipe buffer first, measured 0/200 -- but the direction of harm at
+# THIS site is the bad one: a false negative silently turns the whole gate into a
+# ctest SKIP, and a skipped gate looks green.
+if ! command -v rg >/dev/null 2>&1 && ! grep -Eq 'a\sb' <<< 'a b' 2>/dev/null; then
     echo "test-sycl-alloc-policy: no ripgrep and no GNU grep; skipping" >&2
     exit 77
 fi
