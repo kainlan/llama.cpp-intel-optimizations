@@ -88,11 +88,27 @@ at all — setting them measures nothing.
 ⚠️ **`-DGGML_SYCL_XMX_GEMM` alone does not compile.** The GEMM blocks call
 `ggml_sycl_xmx_available()` and `ggml_sycl_xmx_supports_type()`, declared in
 `mmq_xmx.hpp`, which `ggml-sycl.cpp` includes only under `GGML_SYCL_MMQ_XMX` — a
-second, independently-defaulted CMake option. Enabling just the first yields four
-undeclared-identifier errors with nothing naming the missing flag. **Configure
-both**, e.g. `-DGGML_SYCL_XMX_GEMM=ON -DGGML_SYCL_MMQ_XMX=ON`. Tracked as
-`llama.cpp-d6d6`; if CMake later grows an implication or a `FATAL_ERROR`, "both
-must be on" remains the requirement either way.
+second, independently-defaulted CMake option. **Configure both**, e.g.
+`-DGGML_SYCL_XMX_GEMM=ON -DGGML_SYCL_MMQ_XMX=ON`.
+
+The requirement is now enforced in two places (`llama.cpp-d6d6`, fixed
+2026-07-31), because one of them cannot cover the other:
+
+- `ggml/src/ggml-sycl/CMakeLists.txt` fails the configure with a
+  `message(FATAL_ERROR)` naming `GGML_SYCL_MMQ_XMX`. It is a hard error rather
+  than an implicit force-ON so that nothing rewrites your cache behind your
+  back — `-DGGML_SYCL_XMX_GEMM=ON` will *not* silently turn the other option on
+  for you, and `GGML_SYCL_MMQ_XMX` in `CMakeCache.txt` always means what it says.
+- `ggml-sycl.cpp` carries the same condition as an `#error` next to the
+  conditional include, because the original reproducer was a direct
+  `icpx -fsyntax-only -DGGML_SYCL_XMX_GEMM` that never runs CMake at all.
+
+⚠️ **The four undeclared-identifier errors still appear** — the `#error` is the
+*first* diagnostic and names the missing flag, but clang does not stop at
+`#error`, so it goes on to hit the two dispatch sites and re-emit the old
+cascade below it. Read the top of the output, not the bottom: a compile that
+ends in `use of undeclared identifier 'ggml_sycl_xmx_available'` is still the
+missing-option failure, not a broken XMX path.
 
 **Where the threshold's default comes from — read this before quoting a number.**
 The authoritative default is the `GGML_SYCL_XMX_THRESHOLD` row of the
