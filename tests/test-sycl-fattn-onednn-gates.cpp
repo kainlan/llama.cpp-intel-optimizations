@@ -7,12 +7,24 @@
 //  1. It WAS registered, in 3c8f296fd (tests/CMakeLists.txt:990-1002), and it
 //     built and passed -- artifacts/kkxtv7-5/ctest-materialization.log records
 //     "Test #100: test-sycl-fattn-onednn-gates ... Passed 0.11 sec". The
-//     registration then vanished during upstream integration: the first commit
-//     in 3c8f296fd..HEAD whose tests/CMakeLists.txt lacks it is d3dce4e0a, an
-//     upstream commit whose author date (2026-01-04) PREDATES the registration
-//     -- the signature of a merge that took upstream's copy of the file whole
-//     rather than of anyone deciding to drop the test. Nothing announced it;
-//     the passing log was left behind as a fossil.
+//     registration is present at 3c8f296fd and absent at HEAD, and nothing
+//     announced its removal; the passing log was left behind as a fossil.
+//
+//     What is NOT established is HOW it was lost, and an earlier version of
+//     this comment overstated it. Naming a culprit commit by "first commit in
+//     3c8f296fd..HEAD whose tests/CMakeLists.txt lacks the string" does not
+//     work: that traversal is topological, so on an integrated upstream line
+//     it returns the first upstream commit to TOUCH the file, not one that
+//     removed anything. It yields d3dce4e0a -- but d3dce4e0a's parent
+//     4974bf53c does not have the registration either, so d3dce4e0a plainly
+//     did not drop it, and it is a single-parent commit rather than the merge
+//     the earlier text claimed. The loss is a consequence of integrating an
+//     upstream line whose copy of this file never carried the fork's
+//     registration; rebase vs merge-resolution vs manual overwrite is not
+//     distinguished, and does not change the remedy.
+//
+//     (Recorded because the wrong version was a clean answer about the wrong
+//     thing -- the same defect class this file's own gate exists to catch.)
 //
 //  2. Registration alone would NOT have caught the phi2 abort. Every case here
 //     inherited `params.scale = 1.0f / 11.313708f` from mistral_like_params --
