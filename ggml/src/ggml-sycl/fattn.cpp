@@ -2273,6 +2273,8 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
                 return "v-type-unsupported";
             case ggml_sycl_onednn_fa_layout_reason::MASK_TYPE_UNSUPPORTED:
                 return "mask-type-unsupported";
+            case ggml_sycl_onednn_fa_layout_reason::SCALE_UNSUPPORTED:
+                return "scale-not-inv-sqrt-d";
         }
         return "unknown";
     };

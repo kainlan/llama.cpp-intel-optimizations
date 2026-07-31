@@ -1,5 +1,6 @@
 #include "ggml-sycl/fattn.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 
@@ -123,6 +124,89 @@ static bool test_planner_mqa_mismatch_requires_materialization() {
     return true;
 }
 
+// phi2 pre-scales Q by 1/sqrt(n_embd_head) inside the graph and then hands
+// build_attn a kq_scale of 1.0 (src/models/phi2.cpp), so params.scale is 1.0
+// rather than 1/sqrt(D). D=80 is phi2's head dim (n_embd 2560 / n_head 32).
+static fattn_params phi2_like_params() {
+    fattn_params params = mha_like_params();
+    params.ne00         = 80;
+    params.ne10         = 80;
+    params.nb01         = params.ne00 * (int) sizeof(sycl::half);
+    params.nb02         = params.nb01 * params.ne01;
+    params.nb03         = params.nb02 * params.ne02;
+    params.nb11         = params.ne10 * (int) sizeof(sycl::half);
+    params.nb12         = params.nb11 * params.ne11;
+    params.nb13         = (int64_t) params.nb12 * params.ne12;
+    params.nb21         = params.ne10 * (int) sizeof(sycl::half);
+    params.nb22         = params.nb21 * params.ne11;
+    params.nb23         = (int64_t) params.nb22 * params.ne12;
+    params.scale        = 1.0f;  // NOT 1/sqrt(80) — the whole point of the arch
+    return params;
+}
+
+// The oneDNN partition bakes sqrt(D) in as the softmax divisor, so a model whose
+// scale is not 1/sqrt(D) must never reach it. The execute path asserts this; the
+// planner has to reject first or that assert aborts the process.
+static bool test_planner_rejects_scale_not_inv_sqrt_d() {
+    fattn_params params = phi2_like_params();
+    const auto   plan   = ggml_sycl_flash_attn_ext_onednn_plan(params, params.ne02, params.ne12, params.kv_is_fp8,
+                                                               /*multi_seq=*/false);
+
+    TEST_ASSERT(plan.kind == ggml_sycl_onednn_fa_layout_kind::REJECT,
+                "params.scale != 1/sqrt(D) (phi2) must reject oneDNN, not abort at execute time");
+    TEST_ASSERT(plan.reason == ggml_sycl_onednn_fa_layout_reason::SCALE_UNSUPPORTED,
+                "scale reject reason should be explicit");
+    return true;
+}
+
+// Same shape family, but GQA with a non-dense K/V stride — the plan kind that
+// would otherwise be MATERIALIZE_REQUIRED. The scale gate must win over it,
+// because the execute-time assert sits AFTER materialization.
+static bool test_planner_rejects_scale_before_materialization() {
+    fattn_params params = phi2_like_params();
+    params.ne12         = 8;                                           // GQA
+    params.nb11         = 4 * params.ne10 * (int) sizeof(sycl::half);  // nc_stride != D
+    params.nb12         = params.nb11 * params.ne11;
+    params.nb13         = (int64_t) params.nb12 * params.ne12;
+    params.nb22         = params.nb21 * params.ne11;
+    params.nb23         = (int64_t) params.nb22 * params.ne12;
+    const auto plan     = ggml_sycl_flash_attn_ext_onednn_plan(params, params.ne02, params.ne12, params.kv_is_fp8,
+                                                               /*multi_seq=*/false);
+
+    TEST_ASSERT(plan.kind == ggml_sycl_onednn_fa_layout_kind::REJECT,
+                "a bad scale must reject even on the materialization path");
+    TEST_ASSERT(plan.reason == ggml_sycl_onednn_fa_layout_reason::SCALE_UNSUPPORTED,
+                "scale gate must win over KV_NC_STRIDE_MISMATCH");
+    return true;
+}
+
+// Guard the other direction: the scale gate must not reject a legitimate
+// 1/sqrt(D) at a D the existing cases do not cover, or it silently costs
+// throughput on every such model.
+static bool test_planner_accepts_inv_sqrt_d_at_odd_d() {
+    fattn_params params = phi2_like_params();
+    params.scale        = 1.0f / std::sqrt(80.0f);
+    const auto plan     = ggml_sycl_flash_attn_ext_onednn_plan(params, params.ne02, params.ne12, params.kv_is_fp8,
+                                                               /*multi_seq=*/false);
+
+    TEST_ASSERT(plan.kind == ggml_sycl_onednn_fa_layout_kind::DIRECT,
+                "a legitimate 1/sqrt(D) scale at D=80 must still reach oneDNN");
+    TEST_ASSERT(plan.reason == ggml_sycl_onednn_fa_layout_reason::OK, "1/sqrt(D) at D=80 should have OK reason");
+    return true;
+}
+
+// The materialization descriptor is a second entry point into the planner; a
+// rejected plan must not hand back a descriptor that invites the caller in.
+static bool test_materialization_descriptor_rejects_bad_scale() {
+    fattn_params                             params = phi2_like_params();
+    ggml_sycl_onednn_fa_materialization_desc desc{};
+    const bool ok = ggml_sycl_flash_attn_ext_onednn_materialization_desc(params, params.ne02, params.ne12,
+                                                                         /*target_device=*/0, &desc);
+
+    TEST_ASSERT(!ok, "materializer must refuse a shape the planner rejected on scale");
+    return true;
+}
+
 static bool test_planner_rejects_unsupported_d() {
     fattn_params params = mha_like_params();
     params.ne00         = 1024;
@@ -227,6 +311,10 @@ int main() {
     ok &= test_planner_rejects_unsupported_d();
     ok &= test_planner_rejects_unproven_batch();
     ok &= test_planner_rejects_paged_layout();
+    ok &= test_planner_rejects_scale_not_inv_sqrt_d();
+    ok &= test_planner_rejects_scale_before_materialization();
+    ok &= test_planner_accepts_inv_sqrt_d_at_odd_d();
+    ok &= test_materialization_descriptor_rejects_bad_scale();
     std::printf("SYCL fattn oneDNN gate tests: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

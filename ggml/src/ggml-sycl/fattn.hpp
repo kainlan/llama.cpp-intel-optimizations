@@ -257,6 +257,7 @@ enum class ggml_sycl_onednn_fa_layout_reason {
     K_TYPE_UNSUPPORTED,
     V_TYPE_UNSUPPORTED,
     MASK_TYPE_UNSUPPORTED,
+    SCALE_UNSUPPORTED,
 };
 
 struct ggml_sycl_onednn_fa_layout_plan {

@@ -108,6 +108,24 @@ ggml_sycl_onednn_fa_layout_plan ggml_sycl_flash_attn_ext_onednn_plan(const fattn
     if (params.ne00 > 512) {
         return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::UNSUPPORTED_D);
     }
+    // The compiled partition bakes the softmax divisor into a per-shape scalar
+    // derived from D alone (`sqrt(D)`, see build_and_compile_sdpa), so the graph
+    // is only valid for models that supply params.scale == 1/sqrt(D). phi2 does
+    // not: it pre-scales Q by 1/sqrt(n_embd_head) in the graph and hands
+    // build_attn a kq_scale of 1.0 (src/models/phi2.cpp), so oneDNN would divide
+    // by sqrt(D) a SECOND time. Reject here and let dispatch fall back to a
+    // native kernel — every one of those reads params.scale at runtime.
+    //
+    // ggml_sycl_flash_attn_ext_onednn asserts this same invariant at execute
+    // time; that assertion is the backstop and must stay. This gate is what
+    // keeps it unreached, and its predicate is deliberately identical (accept
+    // iff |1/scale - sqrt(D)| < 1e-3f) so a plan this function accepts can never
+    // trip it. Tolerance rationale is documented at that assertion: reciprocal
+    // rounding for a legitimate 1/sqrt(D) drifts ~1e-6 at D=64/128/256, while a
+    // different formula differs macroscopically (1.0 vs 8.94 at phi2's D=80).
+    if (params.scale == 0.0f || std::fabs(1.0f / params.scale - sqrtf(static_cast<float>(params.ne00))) >= 1e-3f) {
+        return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::SCALE_UNSUPPORTED);
+    }
     if (params.ne11 <= 0) {
         return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::EMPTY_KV);
     }
