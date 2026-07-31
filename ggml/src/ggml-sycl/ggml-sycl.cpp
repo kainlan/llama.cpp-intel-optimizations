@@ -110,6 +110,17 @@
 #include "ggml-sycl/sycl_hw.hpp"
 
 #include <sycl/half_type.hpp>
+// The XMX GEMM dispatch sites below call ggml_sycl_xmx_available() and
+// ggml_sycl_xmx_supports_type(), which are declared in mmq_xmx.hpp -- included
+// here only under GGML_SYCL_MMQ_XMX. GGML_SYCL_XMX_GEMM and GGML_SYCL_MMQ_XMX
+// are separate CMake options, so they read as independent and are not. Without
+// this guard, enabling only the first yields four undeclared-identifier errors
+// that name nothing pointing at the missing option. CMake rejects the same
+// combination; this catches a direct -D that bypasses it. See llama.cpp-d6d6.
+#if defined(GGML_SYCL_XMX_GEMM) && !defined(GGML_SYCL_MMQ_XMX)
+#    error \
+        "GGML_SYCL_XMX_GEMM requires GGML_SYCL_MMQ_XMX: the XMX GEMM dispatch calls ggml_sycl_xmx_available()/ggml_sycl_xmx_supports_type(), declared in mmq_xmx.hpp, which is included only under GGML_SYCL_MMQ_XMX. Configure with both: -DGGML_SYCL_XMX_GEMM=ON -DGGML_SYCL_MMQ_XMX=ON"
+#endif
 #ifdef GGML_SYCL_MMQ_XMX
 #    include "ggml-sycl/mmq_xmx.hpp"
 #endif
