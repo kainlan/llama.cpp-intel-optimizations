@@ -2847,6 +2847,20 @@ template <typename T> struct ggml_sycl_pool_alloc {
 // value is a caller bug rather than a runtime condition -- but the array is
 // indexed on entry, before anything downstream could notice, so each accessor
 // checks first.  One compare against a compile-time constant.
+//
+// Inventory, so the next auditor does not have to re-derive it.
+// ggml_tensor_extra_gpu has 14 members taking a device index, all guarded:
+//   - 12 call this helper.
+//   - 2 predate it and still carry the equivalent inline literal --
+//     forget_moe_storage_handle_on_device and take_moe_storage_handle_on_device,
+//     which subscript moe_expert_handles[owner_device] and friends behind their
+//     own checks.  Guarded, just not collapsed onto this helper.
+// Six further copies of the literal live outside the struct and are untouched.
+//
+// The count is spelled out because it was twice reported wrong. Both misses came
+// from the same place: a sweep regex matching only [dev]/[device], which cannot
+// match [owner_device] however carefully it is run.  Grep the array names, not
+// the index spelling.
 static inline bool ggml_sycl_valid_device_index(int dev) {
     return dev >= 0 && dev < GGML_SYCL_MAX_DEVICES;
 }
