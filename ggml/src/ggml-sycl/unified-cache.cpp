@@ -14733,6 +14733,15 @@ static placement_priority tensor_to_placement_priority(tensor_usage usage, const
             if (name && strstr(name, "ffn_up_exps")) {
                 return placement_priority::MOE_UP;
             }
+            // The FUSED gate+up tensor carries the up projection as well as the
+            // gate, and is twice the size of either, so ranking it with UP is
+            // strictly more accurate than letting it fall through to
+            // MOE_GATE_PROJ ("least impactful") and be demoted to host first
+            // under VRAM pressure.  Only fused names reach this branch, so
+            // split-trio archs are unaffected.
+            if (name && strstr(name, "ffn_gate_up_exps")) {
+                return placement_priority::MOE_UP;
+            }
             // ffn_gate_exps or unknown expert pattern
             return placement_priority::MOE_GATE_PROJ;
         case tensor_usage::MOE_INTERMEDIATE:
@@ -14797,12 +14806,21 @@ static uint8_t moe_role_bit(expert_tensor_role role) {
             return 1u << 1;
         case expert_tensor_role::DOWN:
             return 1u << 2;
+        case expert_tensor_role::GATE_UP:
+            return 1u << 3;
         case expert_tensor_role::UNKNOWN:
         default:
             return 0;
     }
 }
 
+// A FUSED-gate_up arch never forms a complete triplet: it has gate_up+down, not
+// gate+up+down.  GATE_UP therefore gets its own bit rather than reusing GATE's,
+// so it can never make a group look half-complete.  The consequence is
+// deliberate and conservative -- fused layers are skipped by the triplet
+// consumers (cross-device replication and multi_gpu_mode::EXPERT layer
+// targeting, both opt-in) and are simply placed by the ordinary per-entry path.
+// Single-device placement, which is what the arch test exercises, is unaffected.
 static bool moe_triplet_complete(const moe_triplet_group & group) {
     constexpr uint8_t all_roles = (1u << 0) | (1u << 1) | (1u << 2);
     return (group.role_mask & all_roles) == all_roles;
@@ -14876,6 +14894,7 @@ static std::vector<moe_triplet_group> build_moe_triplet_groups(const placement_p
 static int moe_materialization_role_order(expert_tensor_role role) {
     switch (role) {
         case expert_tensor_role::GATE:
+        case expert_tensor_role::GATE_UP:  // fused gate+up materializes where gate would
             return 0;
         case expert_tensor_role::UP:
             return 1;
@@ -15017,10 +15036,11 @@ static void log_moe_placement_diagnostics(const char * tag, const placement_plan
     const auto summary = plan.summarize_expert_placements(observed_layers, n_experts);
     GGML_LOG_INFO("[%s] expected=%zu planned=%zu unclassified=%zu duplicates=%zu missing=%zu\n", tag, summary.expected,
                   summary.planned, summary.unclassified, summary.duplicates, summary.missing);
-    GGML_LOG_INFO("[%s] roles: gate=%zu up=%zu down=%zu unknown=%zu\n", tag,
+    GGML_LOG_INFO("[%s] roles: gate=%zu up=%zu down=%zu gate_up=%zu unknown=%zu\n", tag,
                   summary.role_counts[static_cast<size_t>(expert_tensor_role::GATE)],
                   summary.role_counts[static_cast<size_t>(expert_tensor_role::UP)],
                   summary.role_counts[static_cast<size_t>(expert_tensor_role::DOWN)],
+                  summary.role_counts[static_cast<size_t>(expert_tensor_role::GATE_UP)],
                   summary.role_counts[static_cast<size_t>(expert_tensor_role::UNKNOWN)]);
 
     std::vector<int> targets;
@@ -15037,7 +15057,14 @@ static void log_moe_placement_diagnostics(const char * tag, const placement_plan
     }
 
     if (observed_layers > 8 && n_experts > 30) {
-        for (expert_tensor_role role : { expert_tensor_role::GATE, expert_tensor_role::UP, expert_tensor_role::DOWN }) {
+        for (expert_tensor_role role : { expert_tensor_role::GATE, expert_tensor_role::UP, expert_tensor_role::DOWN,
+                                         expert_tensor_role::GATE_UP }) {
+            // Skip roles this model does not use, so a split-trio arch does not
+            // report gate_up as MISSING (and a fused arch does not report
+            // gate/up as MISSING).
+            if (summary.role_counts[static_cast<size_t>(role)] == 0) {
+                continue;
+            }
             const auto placement = plan.lookup_expert_placement(8, 30, role);
             char       target_buf[32];
             GGML_LOG_INFO("[%s] sample blk.8 expert 30 %s: %s\n", tag, expert_tensor_role_name(role),
@@ -16622,9 +16649,10 @@ static std::string planner_moe_nonzero_skips(std::initializer_list<std::pair<con
 // Entry counts are reported per role rather than per tensor, so a role that is
 // "mixed" is mixed across entries, not across layers only.
 static void planner_log_moe_granted_layout_summary(const placement_plan & plan, int device_id) {
-    size_t n_gate = 0;
-    size_t n_up   = 0;
-    size_t n_down = 0;
+    size_t n_gate    = 0;
+    size_t n_up      = 0;
+    size_t n_down    = 0;
+    size_t n_gate_up = 0;
     for (const placement_entry & entry : plan.entries) {
         if (entry.expert_id < 0 || entry.target_device != device_id || !entry.on_device) {
             continue;
@@ -16639,17 +16667,24 @@ static void planner_log_moe_granted_layout_summary(const placement_plan & plan, 
             case expert_tensor_role::DOWN:
                 n_down++;
                 break;
+            case expert_tensor_role::GATE_UP:
+                n_gate_up++;
+                break;
             default:
                 break;
         }
     }
-    if (n_gate == 0 && n_up == 0 && n_down == 0) {
+    // n_gate_up must be part of this test: a fused arch has zero gate/up
+    // entries, so without it the whole summary went silent for exactly the
+    // models most likely to need it.
+    if (n_gate == 0 && n_up == 0 && n_down == 0 && n_gate_up == 0) {
         return;
     }
-    GGML_LOG_INFO("[MOE-LAYOUT] summary device=%d gate=%s(%zu) up=%s(%zu) down=%s(%zu)\n", device_id,
+    GGML_LOG_INFO("[MOE-LAYOUT] summary device=%d gate=%s(%zu) up=%s(%zu) down=%s(%zu) gate_up=%s(%zu)\n", device_id,
                   planner_moe_granted_layout_name(plan, expert_tensor_role::GATE, device_id), n_gate,
                   planner_moe_granted_layout_name(plan, expert_tensor_role::UP, device_id), n_up,
-                  planner_moe_granted_layout_name(plan, expert_tensor_role::DOWN, device_id), n_down);
+                  planner_moe_granted_layout_name(plan, expert_tensor_role::DOWN, device_id), n_down,
+                  planner_moe_granted_layout_name(plan, expert_tensor_role::GATE_UP, device_id), n_gate_up);
 }
 
 static size_t maybe_upgrade_moe_down_layouts_to_i8(placement_plan & plan,

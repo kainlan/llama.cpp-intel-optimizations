@@ -1351,8 +1351,15 @@ inline tensor_usage infer_tensor_usage(const char * name) {
     // the same ffn_*_exps prefix but are separate small tensors; treating them
     // as per-expert weights duplicates the planner's semantic
     // (layer, expert, role) entries.
-    const bool moe_exps_name =
-        strstr(name, "ffn_gate_exps") || strstr(name, "ffn_up_exps") || strstr(name, "ffn_down_exps");
+    // "ffn_gate_up_exps" is the FUSED gate+up expert tensor and contains
+    // neither "ffn_gate_exps" nor "ffn_up_exps", so it needs its own literal.
+    // Omitting it made the planner treat the whole fused tensor as ONE dense
+    // weight (expert_id = -1), which left every per-expert placement entry
+    // unbuilt and aborted MUL_MAT_ID with "[MOE-ROUTE] unresolved planner
+    // expert ... plan_missing=1".  Keep this list in sync with
+    // expert_tensor_role_from_tensor_name() in unified-cache.hpp.
+    const bool moe_exps_name = strstr(name, "ffn_gate_exps") || strstr(name, "ffn_up_exps") ||
+                               strstr(name, "ffn_down_exps") || strstr(name, "ffn_gate_up_exps");
     if (moe_exps_name && !strstr(name, ".bias")) {
         return tensor_usage::MOE_EXPERT_WEIGHT;
     }

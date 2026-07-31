@@ -994,32 +994,9 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         TIMEOUT 180
     )
 
-    # Test: unified-cache layout and multi-device placement choices
-    add_executable(test-sycl-layout-choice
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-layout-choice.cpp
-    )
-    target_include_directories(test-sycl-layout-choice PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/..
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-        ${SYCL_INCLUDE_DIR}
-    )
-    target_compile_options(test-sycl-layout-choice PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    target_link_options(test-sycl-layout-choice PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    target_compile_definitions(test-sycl-layout-choice PRIVATE
-        GGML_SYCL_WARP_SIZE=32
-        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-    )
-    target_link_libraries(test-sycl-layout-choice PRIVATE ggml-base ggml ggml-sycl)
-    if (IntelSYCL_FOUND)
-        target_link_libraries(test-sycl-layout-choice PRIVATE IntelSYCL::SYCL_CXX)
-    endif()
-    add_test(NAME sycl-layout-choice COMMAND test-sycl-layout-choice)
-    set_tests_properties(sycl-layout-choice PROPERTIES
-        LABELS "sycl;cache;layout;planner;tdd"
-        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
-        TIMEOUT 180
-    )
+    # NOTE: test-sycl-layout-choice used to be registered here.  It was moved
+    # outside this guard (see below, after the endif) because
+    # GGML_SYCL_BUILD_XMX_TESTS defaults OFF, so it never built -- llama.cpp-5exz.
 
     # Test: synthetic KV/view pointer resolution and handle publication
     add_executable(test-sycl-kv-view-resolution
@@ -1219,6 +1196,59 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         TIMEOUT 300
     )
 endif()
+
+# Test: unified-cache layout and multi-device placement choices, plus the
+# fused-gate_up expert-tensor classifier regression guard (llama.cpp-zozu).
+#
+# Registered OUTSIDE the GGML_SYCL_BUILD_XMX_TESTS guard (which defaults OFF)
+# so it always builds -- it spent its life inside that guard and therefore
+# never compiled, which is llama.cpp-5exz.  Mirrors the _residency_test loop
+# and test-sycl-reset-model-weight-lease-preserve below: this test has no
+# device kernel code of its own, so it only needs -fsycl to link against the
+# prebuilt ggml-sycl library, not the full XMX AOT target list
+# (XMX_TEST_SYCL_OPTIONS is defined inside the guard and is unavailable here).
+#
+# It needs no GPU by default: main() runs the fused-role guard and then a block
+# driven by make_mock_sycl_info() via test_sycl_info_override_guard, and the
+# backend section SKIPs unless GGML_SYCL_TEST_LAYOUT_CHOICE_BACKEND=1.
+#
+# LABELS deliberately DROP the old "cache" label.  CLAUDE.md's throttled sweep
+# runs `-LE 'residency|mem-handle|cache'`, so keeping "cache" would have left
+# this test excluded from the very sweep it was just un-hidden for -- guarded
+# out of the build, then filtered out of the run.  It allocates no GPU memory
+# in the default path, so it does not belong in that hazard denylist.
+# ENVIRONMENT pins the B50 rather than the B70 benchmark card, matching
+# test-sycl-reset-model-weight-lease-preserve, so that if anything does touch a
+# device it cannot perturb a benchmark in progress.
+set(LAYOUT_CHOICE_TEST_SYCL_OPTIONS
+    "-fsycl"
+    "-Wno-narrowing"
+)
+add_executable(test-sycl-layout-choice
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-layout-choice.cpp
+)
+target_include_directories(test-sycl-layout-choice PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-layout-choice PRIVATE ${LAYOUT_CHOICE_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-layout-choice PRIVATE ${LAYOUT_CHOICE_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-layout-choice PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-layout-choice PRIVATE ggml-base ggml ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-layout-choice PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME sycl-layout-choice COMMAND test-sycl-layout-choice)
+set_tests_properties(sycl-layout-choice PROPERTIES
+    LABELS "sycl;layout;planner;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 180
+)
 
 set(RESIDENCY_TEST_SYCL_OPTIONS
     "-fsycl"

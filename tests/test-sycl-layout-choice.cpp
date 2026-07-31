@@ -1411,7 +1411,96 @@ static bool run_layout_choice_test() {
     return true;
 }
 
+// Regression guard for llama.cpp-zozu.
+//
+// The FUSED gate+up expert tensor "blk.N.ffn_gate_up_exps.weight" contains
+// neither "ffn_gate_exps" nor "ffn_up_exps", so both name classifiers returned
+// UNKNOWN.  build_index() drops UNKNOWN roles from expert_placement_index_, so
+// lookup_expert_placement() missed, the route resolver set plan_missing=1, and
+// MUL_MAT_ID aborted with "[MOE-ROUTE] unresolved planner expert".  This test
+// pins the exact failing call: lookup BY NAME, which is what the resolver does.
+static bool run_fused_gate_up_role_test() {
+    // Wall 1: infer_tensor_usage() in common.hpp.  Returning anything but
+    // MOE_EXPERT_WEIGHT makes the planner take the "dense weight,
+    // expert_id = -1" branch and build no per-expert entries at all.
+    if (infer_tensor_usage("blk.0.ffn_gate_up_exps.weight") != tensor_usage::MOE_EXPERT_WEIGHT) {
+        printf("FAIL: fused ffn_gate_up_exps must infer as MOE_EXPERT_WEIGHT\n");
+        return false;
+    }
+    // The matching .bias is a small per-expert vector, not a weight -- it must
+    // stay MOE_INTERMEDIATE exactly like the split roles' biases.
+    if (infer_tensor_usage("blk.0.ffn_gate_up_exps.bias") != tensor_usage::MOE_INTERMEDIATE) {
+        printf("FAIL: fused ffn_gate_up_exps.bias must infer as MOE_INTERMEDIATE\n");
+        return false;
+    }
+    // The split trio must still classify as before.
+    if (infer_tensor_usage("blk.0.ffn_gate_exps.weight") != tensor_usage::MOE_EXPERT_WEIGHT ||
+        infer_tensor_usage("blk.0.ffn_down_exps.weight") != tensor_usage::MOE_EXPERT_WEIGHT) {
+        printf("FAIL: split expert usage classification regressed\n");
+        return false;
+    }
+
+    // Wall 2: expert_tensor_role_from_tensor_name() in unified-cache.hpp.
+    if (ggml_sycl::expert_tensor_role_from_tensor_name("blk.3.ffn_gate_up_exps.weight") !=
+        ggml_sycl::expert_tensor_role::GATE_UP) {
+        printf("FAIL: fused ffn_gate_up_exps must classify as GATE_UP\n");
+        return false;
+    }
+    // The split trio must be unchanged -- a fused-first match order must not
+    // swallow them.
+    if (ggml_sycl::expert_tensor_role_from_tensor_name("blk.3.ffn_gate_exps.weight") !=
+            ggml_sycl::expert_tensor_role::GATE ||
+        ggml_sycl::expert_tensor_role_from_tensor_name("blk.3.ffn_up_exps.weight") !=
+            ggml_sycl::expert_tensor_role::UP ||
+        ggml_sycl::expert_tensor_role_from_tensor_name("blk.3.ffn_down_exps.weight") !=
+            ggml_sycl::expert_tensor_role::DOWN) {
+        printf("FAIL: split gate/up/down roles regressed\n");
+        return false;
+    }
+
+    // A fused layer is gate_up + down (2 roles), not gate + up + down (3).
+    ggml_sycl::placement_plan fused;
+    const int                 n_experts = 4;
+    for (int e = 0; e < n_experts; ++e) {
+        fused.entries.push_back({ "blk.0.ffn_gate_up_exps.weight", 2048, 2048, 0, ggml_sycl::placement_priority::MOE_UP,
+                                  0, e, ggml_sycl::expert_tensor_role::GATE_UP, true, 0 });
+        fused.entries.push_back({ "blk.0.ffn_down_exps.weight", 1024, 1024, 0, ggml_sycl::placement_priority::MOE_DOWN,
+                                  0, e, ggml_sycl::expert_tensor_role::DOWN, true, 0 });
+    }
+    fused.build_index();
+
+    for (int e = 0; e < n_experts; ++e) {
+        // This is the exact call ggml_sycl_resolve_moe_expert_route() makes.
+        const auto by_name = fused.lookup_expert_placement("blk.0.ffn_gate_up_exps.weight", e);
+        if (!by_name.found() || !by_name.on_device || by_name.target_device != 0) {
+            printf("FAIL: fused gate_up expert %d not resolvable by name (found=%d)\n", e, by_name.found() ? 1 : 0);
+            return false;
+        }
+        if (by_name.role != ggml_sycl::expert_tensor_role::GATE_UP) {
+            printf("FAIL: fused gate_up expert %d resolved with role %d\n", e, static_cast<int>(by_name.role));
+            return false;
+        }
+    }
+
+    const auto summary = fused.summarize_expert_placements(1, n_experts);
+    if (summary.unclassified != 0) {
+        printf("FAIL: fused entries counted as unclassified (%zu)\n", summary.unclassified);
+        return false;
+    }
+    // 2 roles per layer, not 3 -- a hardcoded 3 reports a spurious `missing`.
+    if (summary.expected != static_cast<size_t>(n_experts) * 2u || summary.missing != 0) {
+        printf("FAIL: fused expected/missing wrong (expected=%zu missing=%zu)\n", summary.expected, summary.missing);
+        return false;
+    }
+
+    printf("PASS: fused ffn_gate_up_exps classifies as GATE_UP and resolves by name\n");
+    return true;
+}
+
 int main() {
+    if (!run_fused_gate_up_role_test()) {
+        return 1;
+    }
     {
         const ggml_sycl_device_info              mock_info = make_mock_sycl_info();
         ggml_sycl::test_sycl_info_override_guard info_guard(mock_info);

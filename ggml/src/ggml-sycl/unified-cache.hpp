@@ -107,12 +107,22 @@ enum class placement_priority : uint8_t {
     COUNT         = 7,
 };
 
+// Roles a per-expert MoE weight can play.  GATE/UP/DOWN are the classic split
+// trio.  GATE_UP is the FUSED gate+up tensor (`blk.N.ffn_gate_up_exps.weight`,
+// ne[1] == n_ff * 2) that upstream added in b68d75165 (#19139) and that
+// qwen3next / qwen35moe / cohere2moe / deepseek2 / deepseek2ocr / gemma4 use in
+// preference to the split pair.  It is a role of its own on purpose: it must
+// NOT be aliased onto GATE, because the gate<->up pairing logic
+// (mxfp4_moe_gateup_role, maybe_upgrade_moe_gate_up_layouts_to_i8,
+// moe_triplet_complete) looks for a matching partner entry that a fused tensor
+// does not have.  Those sites exclude GATE_UP rather than half-matching it.
 enum class expert_tensor_role : uint8_t {
     UNKNOWN = 0,
     GATE    = 1,
     UP      = 2,
     DOWN    = 3,
-    COUNT   = 4,
+    GATE_UP = 4,  // fused gate+up (ffn_gate_up_exps); has no partner entry
+    COUNT   = 5,
 };
 
 inline const char * expert_tensor_role_name(expert_tensor_role role) {
@@ -123,6 +133,8 @@ inline const char * expert_tensor_role_name(expert_tensor_role role) {
             return "up";
         case expert_tensor_role::DOWN:
             return "down";
+        case expert_tensor_role::GATE_UP:
+            return "gate_up";
         case expert_tensor_role::UNKNOWN:
         default:
             return "unknown";
@@ -132,6 +144,14 @@ inline const char * expert_tensor_role_name(expert_tensor_role role) {
 inline expert_tensor_role expert_tensor_role_from_tensor_name(const char * name) {
     if (!name) {
         return expert_tensor_role::UNKNOWN;
+    }
+    // Must be tested before the split names.  "ffn_gate_up_exps" happens to
+    // contain neither "ffn_gate_exps" nor "ffn_up_exps" today, so the order is
+    // not load-bearing yet -- but it becomes load-bearing the moment anyone
+    // loosens one of those literals, and getting it wrong classifies a fused
+    // tensor as half a pair.
+    if (std::strstr(name, "ffn_gate_up_exps")) {
+        return expert_tensor_role::GATE_UP;
     }
     if (std::strstr(name, "ffn_gate_exps")) {
         return expert_tensor_role::GATE;
@@ -174,6 +194,11 @@ static inline bool mxfp4_moe_single_gateup_layout_env_enabled(const char * env_v
     return env_value != nullptr && std::atoi(env_value) != 0;
 }
 
+// Deliberately EXCLUDES expert_tensor_role::GATE_UP.  This policy pairs a GATE
+// entry with the matching UP entry of the same (layer, expert); a fused
+// gate_up tensor is a single entry with no partner, so admitting it here would
+// have it stand in as half a pair.  Fused tensors fall through to the ordinary
+// SOA/AOS path instead.
 static inline bool mxfp4_moe_gateup_role(expert_tensor_role role) {
     return role == expert_tensor_role::GATE || role == expert_tensor_role::UP;
 }
@@ -762,7 +787,24 @@ struct placement_plan {
         }
 
         if (expected_layers > 0 && expected_experts > 0) {
-            summary.expected = static_cast<size_t>(expected_layers) * static_cast<size_t>(expected_experts) * 3u;
+            // Roles per layer is NOT always 3.  A split-trio arch has
+            // gate+up+down; a fused arch (ffn_gate_up_exps) has gate_up+down,
+            // i.e. 2.  Hardcoding 3 reported a spurious `missing` count of
+            // layers*experts for every fused arch, so derive it from the roles
+            // actually observed and fall back to 3 only when nothing is
+            // classified yet.
+            size_t roles_per_layer = 0;
+            for (expert_tensor_role role : { expert_tensor_role::GATE, expert_tensor_role::UP, expert_tensor_role::DOWN,
+                                             expert_tensor_role::GATE_UP }) {
+                if (summary.role_counts[static_cast<size_t>(role)] > 0) {
+                    roles_per_layer++;
+                }
+            }
+            if (roles_per_layer == 0) {
+                roles_per_layer = 3;
+            }
+            summary.expected =
+                static_cast<size_t>(expected_layers) * static_cast<size_t>(expected_experts) * roles_per_layer;
         } else {
             summary.expected = summary.planned + summary.unclassified + summary.duplicates;
         }

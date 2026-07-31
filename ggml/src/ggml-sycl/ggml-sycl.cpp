@@ -4842,12 +4842,34 @@ static void ggml_sycl_abort_unresolved_device_expert(const ggml_tensor *      sr
     if (route.plan_found && route.planned_device_residency && route.planned_device != current_device) {
         return;
     }
+    // Name the LIKELY CAUSE, not just the state.  `plan_missing=1` with an
+    // unclassified role means the planner built a plan that has no entry for
+    // this (layer, expert, role) -- and by far the most common reason is that
+    // the tensor's name matched none of the expert-tensor name patterns, so the
+    // planner never treated it as MoE at all while the runtime still routes it
+    // as MoE (MUL_MAT_ID src0 is structural, not name-based).  That exact
+    // mismatch cost hours to diagnose once (llama.cpp-zozu: the fused
+    // `ffn_gate_up_exps` tensor was missing from both classifiers), so the
+    // abort now points at the two places that have to agree.
+    const char *             name       = src0 && src0->name ? src0->name : "?";
+    const expert_tensor_role diag_role  = expert_tensor_role_from_tensor_name(name);
+    const int                diag_layer = expert_layer_from_tensor_name(name);
+    const bool name_unclassified = route.plan_missing && (diag_role == expert_tensor_role::UNKNOWN || diag_layer < 0);
     GGML_ABORT(
         "[MOE-ROUTE] unresolved planner expert tensor=%s expert=%d requested_layout=%d "
-        "planned_layout=%d planned_device=%d planned_on_device=%d current_device=%d plan_missing=%d reason=%s tier=%s",
-        src0 && src0->name ? src0->name : "?", expert_id, (int) route.requested_layout, (int) route.planned_layout,
-        route.planned_device, route.planned_device_residency ? 1 : 0, current_device, route.plan_missing ? 1 : 0,
-        ggml_sycl_expert_resolve_reason_name(route.reason), ggml_sycl_expert_tier_name(route.tier));
+        "planned_layout=%d planned_device=%d planned_on_device=%d current_device=%d plan_missing=%d reason=%s "
+        "tier=%s parsed_layer=%d parsed_role=%s%s",
+        name, expert_id, (int) route.requested_layout, (int) route.planned_layout, route.planned_device,
+        route.planned_device_residency ? 1 : 0, current_device, route.plan_missing ? 1 : 0,
+        ggml_sycl_expert_resolve_reason_name(route.reason), ggml_sycl_expert_tier_name(route.tier), diag_layer,
+        expert_tensor_role_name(diag_role),
+        name_unclassified ?
+            " | LIKELY CAUSE: this tensor name matches no known expert-tensor pattern, so the placement planner "
+            "never created per-expert entries for it while MUL_MAT_ID still routes it as MoE. Teach BOTH "
+            "classifiers: infer_tensor_usage() in ggml-sycl/common.hpp (must return MOE_EXPERT_WEIGHT) and "
+            "expert_tensor_role_from_tensor_name() in ggml-sycl/unified-cache.hpp (must return a non-UNKNOWN role; "
+            "build_index() drops UNKNOWN roles from the placement index)." :
+            "");
 }
 
 static bool ggml_sycl_moe_route_is_layout_miss(const moe_expert_route & route) {
