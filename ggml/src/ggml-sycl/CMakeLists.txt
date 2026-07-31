@@ -920,11 +920,11 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
     # ⚠️ These two are the ONLY tests of the twelve named in llama.cpp-5exz that
     # are still here, and it is a measured result rather than a judgement call.
     # They were moved outside the guard in 7881f453d and the build FAILED, so
-    # they were moved back in b0e4f6b8f.  For these two the guard was load
+    # they were moved back in de1c62fa0.  For these two the guard was load
     # bearing -- it was hiding code that does not compile, which is exactly what
     # was assumed about all ~25 and was false for the other nine.
     #
-    # TWO independent breakages, neither caused by the move (see llama.cpp-cxub):
+    # TWO independent breakages, neither caused by the move (see llama.cpp-9c0s):
     #
     #   1. test-unified-kernel-persistent.cpp has rotted against the production
     #      API: "no member named 'type_size' in 'StridedCopyMeta'", plus five
@@ -942,7 +942,7 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
     # Breakage 2 means turning GGML_SYCL_BUILD_XMX_TESTS=ON fails today for the
     # same reason, so this is NOT a working configuration being preserved -- it
     # is a known-broken one being kept out of everyone's default build until
-    # llama.cpp-cxub fixes the stub.  Move them back out once it does; the
+    # llama.cpp-9c0s fixes the stub.  Move them back out once it does; the
     # JIT-only options (plain -fsycl, no AOT target list) are the right shape and
     # are recorded in 7881f453d.
     add_executable(test-unified-kernel-ops
