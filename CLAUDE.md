@@ -159,6 +159,29 @@ clang-format-19 -i <file.cpp>
 clang-format-19 --dry-run -Werror <file.cpp>  # dry-run check
 ```
 
+⚠️ **`clang-format-19 -i` on a whole file is actively destructive here, which is the
+real reason the staged-only form is "preferred".** These files carry a lot of
+pre-existing drift, so `-i` reformats code nobody touched: measured 2026-07-31, a
+single `-i` on `ggml/src/ggml-sycl/common.hpp` rewrote **~180 lines** of unrelated
+code — ternary realignment, lambda wrapping, struct-field alignment — none of it near
+the actual edit.
+
+Two consequences, and the second is worse:
+
+- The diff stops being reviewable. 180 lines of noise around a 5-line change means a
+  reviewer either reads all of it or trusts none of it.
+- **In a shared checkout it is a collision generator.** Those 180 lines overlap
+  whatever anyone else is editing in the same file, and the conflict does not present
+  as a merge conflict — it presents as someone else's work silently reformatted
+  underneath them.
+
+If you have already run it, the recovery is what worked: revert the file to HEAD, redo
+the edit by hand, and use `git-clang-format-19 --staged` (changed lines only). Do not
+try to hand-prune a 180-line reformat.
+
+`clang-format-19 --dry-run -Werror <file>` is safe and useful — it reports without
+writing. Just do not act on its whole-file findings as part of an unrelated change.
+
 ## Project Architecture
 
 ### Core Directories
