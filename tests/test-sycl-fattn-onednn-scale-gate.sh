@@ -136,6 +136,39 @@ expect_status 2 "a renamed planner" "$TMP/renamed.cpp" "$TMP/ok.hpp"
 
 expect_status 2 "a missing plan file" "$TMP/nonexistent.cpp" "$TMP/ok.hpp"
 
+# --- C8: DETERMINISM ---------------------------------------------------------
+# The checker was intermittently wrong once, and every case above would have
+# passed on a lucky run. `printf ... | grep -q` races: grep -q exits on first
+# match, printf takes SIGPIPE and exits 141, and `set -o pipefail` promotes that
+# to the pipeline's status -- so a SUCCESSFUL match reads as a failure. Measured
+# at roughly 1-in-12 over an unchanged, correct tree, yielding both a false FAIL
+# and a false cannot-check.
+#
+# A single-shot assertion cannot see this: it is exactly the bug that hides from
+# the check that would catch it. So run the real invariant repeatedly and require
+# every status to be identical. 30 iterations of a ~10 ms script costs ~0.3 s and
+# would have caught the original defect with probability ~0.93.
+det_first=""
+det_bad=0
+for _ in $(seq 30); do
+    det_rc=0
+    "$CHECKER" "$REAL_PLAN" "$REAL_ENUM" >/dev/null 2>&1 || det_rc=$?
+    if [ -z "$det_first" ]; then
+        det_first="$det_rc"
+    elif [ "$det_rc" != "$det_first" ]; then
+        det_bad=1
+    fi
+done
+if [ "$det_bad" -ne 0 ] || [ "$det_first" != "0" ]; then
+    echo "FAIL: the checker is not deterministic over an unchanged tree" >&2
+    echo "      (first status $det_first, and at least one run disagreed)." >&2
+    echo "      Do NOT re-run until it goes green -- that is the habit this case" >&2
+    echo "      exists to prevent. Suspect a pipeline under 'set -o pipefail':" >&2
+    echo "      grep -q exits early, its writer takes SIGPIPE, and a successful" >&2
+    echo "      match is reported as a failure. Use grep pattern <<< \"\$VAR\"." >&2
+    fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "test-sycl-fattn-onednn-scale-gate: FAILED" >&2
     exit 1

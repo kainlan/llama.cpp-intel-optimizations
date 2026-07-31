@@ -56,6 +56,26 @@
 # real pass. So each stripped view must still contain a token that is always
 # present in a healthy file; if it does not, that is exit 2 (cannot check), not
 # a pass.
+#
+# ⚠️ MATCH WITH `grep pattern <<< "$VAR"`, NEVER `printf ... | grep -q pattern`.
+# The pipeline form makes this script INTERMITTENTLY FAIL, and it is a nasty one
+# because it looks correct and passes almost every time. `grep -q` exits the
+# instant it matches; `printf` is then still writing and takes SIGPIPE, exiting
+# 141; `set -o pipefail` (above) promotes that 141 to the pipeline's status, so
+# `if ! ...` reads a SUCCESSFUL match as a failure. Whether the race is lost
+# depends on how early in a ~38 KB stream the match sits and on scheduling, so it
+# is data-dependent and machine-dependent.
+#
+# Measured before the fix: 25 consecutive runs over an unchanged, correct tree
+# gave exit codes 0,0,0,0,0,0,0,0,0,0,0,1,2,0,0,... -- a false FAIL and a false
+# cannot-check, from a script whose inputs never changed. A flaky gate is worse
+# than no gate: it trains people to re-run until green, which is exactly the
+# habit that lets a real regression through. After the fix, 300 checker runs and
+# 40 wrapper runs (8 fixtures each) were all deterministic.
+#
+# The original version of this script grepped the FILES directly, which has no
+# pipeline and so never had this bug; it was introduced by switching to a
+# stripped-text variable. Herestrings keep the variable and drop the pipeline.
 set -euo pipefail
 
 PLAN_FILE="${1:-ggml/src/ggml-sycl/fattn-onednn.cpp}"
@@ -105,14 +125,14 @@ ENUM_SRC="$(strip_comments "$ENUM_FILE")"
 # the old name as a prefix (..._plan_RENAMED), so the control passed on a file
 # where the thing it was proving present had in fact been renamed away. The
 # control suite's C5 case pins this.
-if ! printf '%s\n' "$PLAN_SRC" | grep -qw 'ggml_sycl_flash_attn_ext_onednn_plan'; then
+if ! grep -qw 'ggml_sycl_flash_attn_ext_onednn_plan' <<< "$PLAN_SRC"; then
     echo "FATAL: ggml_sycl_flash_attn_ext_onednn_plan not found in the stripped view of" >&2
     echo "       $PLAN_FILE. Either the planner was renamed/moved, this is the wrong" >&2
     echo "       file, or strip_comments is broken. Any of those makes the checks below" >&2
     echo "       meaningless -- they would pass vacuously. Fix this before reading them." >&2
     exit 2
 fi
-if ! printf '%s\n' "$ENUM_SRC" | grep -qw 'ggml_sycl_onednn_fa_layout_reason'; then
+if ! grep -qw 'ggml_sycl_onednn_fa_layout_reason' <<< "$ENUM_SRC"; then
     echo "FATAL: enum ggml_sycl_onednn_fa_layout_reason not found in the stripped view of" >&2
     echo "       $ENUM_FILE. Renamed, moved, or strip_comments is broken." >&2
     exit 2
@@ -122,7 +142,7 @@ status=0
 
 # 1a. The reject reason must exist as an enum value. Matched on the symbol, not
 #     on the enum's formatting, so clang-format cannot trip it.
-if ! printf '%s\n' "$ENUM_SRC" | grep -q 'SCALE_UNSUPPORTED'; then
+if ! grep -q 'SCALE_UNSUPPORTED' <<< "$ENUM_SRC"; then
     echo "FAIL: no SCALE_UNSUPPORTED in ggml_sycl_onednn_fa_layout_reason ($ENUM_FILE)." >&2
     echo "      The planner has no way left to name a scale rejection. If the" >&2
     echo "      reason was renamed, update this check; if it was removed, the" >&2
@@ -134,7 +154,7 @@ fi
 #     symbol rather than for the comparison's spelling: the tolerance, the
 #     fabs/sqrtf call and the line wrapping are all free to change, but a
 #     planner that rejects on scale has to name the reason.
-if ! printf '%s\n' "$PLAN_SRC" | grep -q 'ggml_sycl_onednn_fa_layout_reason::SCALE_UNSUPPORTED'; then
+if ! grep -q 'ggml_sycl_onednn_fa_layout_reason::SCALE_UNSUPPORTED' <<< "$PLAN_SRC"; then
     echo "FAIL: the oneDNN FA planner in $PLAN_FILE never rejects on scale." >&2
     echo "      ggml_sycl_flash_attn_ext_onednn_plan must return" >&2
     echo "      SCALE_UNSUPPORTED when params.scale deviates from 1/sqrt(D)," >&2
@@ -146,7 +166,7 @@ fi
 # 2. The execute-time backstop must still be an assertion. Matched on the
 #    identifier the comparison is stored in -- deleting the assert deletes the
 #    variable with it, and a widened tolerance still has to compare something.
-if ! printf '%s\n' "$PLAN_SRC" | grep -q 'GGML_ASSERT(scale_diff'; then
+if ! grep -q 'GGML_ASSERT(scale_diff' <<< "$PLAN_SRC"; then
     echo "FAIL: the execute-time GGML_ASSERT on scale_diff is gone from $PLAN_FILE." >&2
     echo "      Do not remove or downgrade it. The oneDNN partition's divisor is" >&2
     echo "      fixed at compile time from D; without this assertion a shape the" >&2
