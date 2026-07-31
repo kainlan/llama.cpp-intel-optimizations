@@ -526,19 +526,56 @@ PR 930 USM compression fix. Stock `1.14.37020` is preserved alongside for
 rollback. Reverting to stock without restoring the old allocation check can
 reintroduce silent oversized-allocation hangs (the m09zb `event.wait()` hang).
 
-**Durable rule — B580↔B50 had no direct P2P.** ⚠️ This was measured on the
-**B580**, which has since been replaced by the B70 in the same slot
-(`0000:03:00.0`). **B70↔B50 P2P has NOT been re-tested.** The finding below was a
-PCI-topology restriction, so it plausibly still holds for any card in that slot —
-but "plausibly" is not "verified". Re-confirm on the live hardware before either
-relying on it or assuming it was lifted. Keep peer-copy paths disabled until then.
+**Durable rule — there is NO direct P2P between the two discrete cards.
+Re-verified on the B70 on 2026-07-31; the earlier "not re-tested" hedge is retired.**
 
-Direct device-to-device USM copy
-failed (`OUT_OF_DEVICE_MEMORY`) and importing a B580 allocation on the B50 returned
-`INVALID_ARGUMENT`; the kernel refuses P2PDMA because the cards share no upstream
-bridge. This is a PCI topology restriction, not a selector bug. Keep direct
-peer-copy / shared-context paths disabled unless a runtime check confirms them safe
-on the live hardware; host-bounce (`level_zero:0,1`) validation may continue.
+Keep direct peer-copy / shared-context paths disabled. Host-bounce
+(`level_zero:0,1`) validation may continue.
+
+The restriction is **PCI topology, not a property of either card**, which is why
+swapping the B580 for the B70 in the same slot changed nothing:
+
+```
+$ lspci -tv
++-06.0-[01-04]--...--[03]----00.0  Battlemage G31  <- B70, 0000:03:00.0
++-06.3-[05-08]--...--[07]----00.0  Battlemage G21  <- B50, 0000:07:00.0
+```
+
+Different CPU root ports (`00:06.0` vs `00:06.3`), no shared PCIe switch — they meet
+only at the root complex. The kernel says so outright:
+
+```
+xe 0000:07:00.0: cannot be used for peer-to-peer DMA as the client and provider
+(0000:03:00.0) do not share an upstream bridge or whitelisted host bridge
+```
+
+Measured behaviour, identical on B580 (historical) and B70 (2026-07-31): a 256 KiB
+direct device-to-device USM copy fails **both directions** with
+`UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` (error 39), on a card with 31.89 GiB free.
+`can_access_peer` returns **false** both directions for both `access_supported` and
+`atomics_supported`.
+
+⚠️ **`ext_oneapi_enable_peer_access()` returns OK on hardware that has no P2P.** No
+throw, no warning, both directions. Code that treats a successful `enable_peer_access`
+as proof P2P is available will conclude the exact opposite of the truth, then fail at
+the first copy with a *memory* error that sends you hunting for a VRAM budget bug.
+**`can_access_peer` is the honest query; `enable_peer_access` is not a capability
+check.** This is why `OUT_OF_DEVICE_MEMORY` above is so misleading — it is a P2P
+refusal wearing a memory error's name.
+
+Probe and log: `p2p-probe.cpp` / `nguy-p2p-run1.log` (session scratchpad; not a
+committed artifact — lift anything load-bearing into a ticket). Caveat stated by the
+measurer: separate per-device contexts were used, mirroring the backend's isolated
+per-device queues and the historical B580 test. The single-context variant was
+deliberately **not** run, because that is the multi-GPU Level Zero context this file
+records as triggering DEVICE_LOST on compute-runtime 26.x. The verdict does not rest
+on context scoping — `can_access_peer` is a device-level query and the kernel refusal
+is a fact about the two BDFs.
+
+**Consequence for multi-GPU work:** `GGML_SYCL_MOE_MULTI_GPU` must stay opt-in. The
+MoE multi-device path would be moving expert data between two cards that cannot DMA to
+each other, so any traffic host-bounces — which is also why an earlier two-GPU run
+halving throughput (32.11 → 15.81 tok/s) reads as expected rather than anomalous.
 
 Install history, rollback commands, and loader-path notes:
 `docs/backend/compute-runtime.md`.
