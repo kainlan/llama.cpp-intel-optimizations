@@ -5,9 +5,16 @@
 #   bound-check the index it uses.
 #
 # Accepted guards are ggml_sycl_valid_device_index(dev) -- the canonical form --
-# or a comparison against GGML_SYCL_MAX_DEVICES, which covers both the two
-# members still carrying the pre-helper inline literal (llama.cpp-uc7s) and
-# clear_data_authority()'s loop bound.
+# or a comparison against GGML_SYCL_MAX_DEVICES. That second form used to cover
+# two things; a3a390f39 (llama.cpp-uc7s) collapsed the two members carrying the
+# pre-helper inline literal, so clear_data_authority()'s full-range loop bound is
+# now the only reason it is still accepted. Accepted it must stay: tightening
+# this to demand the helper everywhere would fail on correct code.
+#
+# So the script enforces "guarded", not "collapsed". Only a human reviewer
+# enforces "collapsed" -- see the comment above ggml_sycl_valid_device_index in
+# common.hpp, which is the paragraph that carries that rule. Do not read a green
+# run here as evidence the inline literal is gone from the struct.
 #
 # Why a source assertion rather than a unit test: the failure is a member added
 # without a guard, which compiles, links and passes every runtime gate. Nothing
