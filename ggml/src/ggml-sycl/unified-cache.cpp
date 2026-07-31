@@ -7281,6 +7281,21 @@ void unified_cache::reset_model_weight_entries() {
     }
     {
         std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+        // A model load is NOT a quiescent point for other models.  Several
+        // llama_model objects may be loaded at once -- tests/test-thread-safety.cpp
+        // loads one per GPU plus a CPU copy and only then runs them concurrently --
+        // and every live model's tensors legitimately hold weight leases through
+        // ggml_tensor_extra_gpu::data_handle.  So a live lease here means "another
+        // model is still using this weight", not "somebody leaked a handle": erasing
+        // it would free VRAM out from under a running model.  Preserve those entries
+        // and reclaim only the unreferenced ones.
+        bool                                any_preserved = false;
+        for (const auto & pair : entries_) {
+            if (pair.second.in_use_count.load() != 0) {
+                any_preserved = true;
+                break;
+            }
+        }
         for (auto it = entries_.begin(); it != entries_.end();) {
             unified_cache_entry & entry = it->second;
             const uint32_t        live  = entry.in_use_count.load();
@@ -7291,12 +7306,13 @@ void unified_cache::reset_model_weight_entries() {
                 residency_diagnostics_record_reject_for_test(residency_reject_reason::LIVE_LEASE_PRESSURE, entry.size,
                                                              zone_available(vram_zone_id::WEIGHT),
                                                              zone_largest_free(vram_zone_id::WEIGHT));
-                GGML_LOG_ERROR(
-                    "[UNIFIED-CACHE] reset_model_weight_entries found stale model weight with live mem_handle leases "
+                GGML_SYCL_DEBUG(
+                    "[UNIFIED-CACHE] reset_model_weight_entries preserving leased model weight "
                     "model=%llu name_hash=0x%llx layout=%d leases=%u\n",
                     (unsigned long long) it->first.id.model_id, (unsigned long long) it->first.id.name_hash,
                     (int) entry.layout, live);
-                GGML_ABORT("unified_cache reset_model_weight_entries: leaked model-weight mem_handle lease");
+                ++it;
+                continue;
             }
             if (entry.device_ptr && !entry.storage_owner) {
                 to_free.push_back(
@@ -7305,9 +7321,27 @@ void unified_cache::reset_model_weight_entries() {
             if (entry.device_ptr) {
                 bytes_erased += entry.size;
             }
-            id_to_key_.erase(it->first.id);
+            // id_to_key_ is keyed by identity alone while entries_ is keyed by
+            // identity + layout, so one id can name several entries (the same weight
+            // in AOS and in a packed layout).  Once anything survives this reset, a
+            // flat erase would orphan a preserved sibling and turn its next lookup
+            // into a silent miss; remap_or_erase_id_mapping_locked() repoints the
+            // mapping at a surviving sibling and erases only when none is left.
+            // With nothing preserved no sibling can survive, so keep the direct erase.
+            if (any_preserved) {
+                remap_or_erase_id_mapping_locked(it->first.id, it->first);
+            } else {
+                id_to_key_.erase(it->first.id);
+            }
             it = entries_.erase(it);
             entries_erased++;
+        }
+        if (entries_preserved > 0) {
+            // Expected when more than one model is loaded; a leaked owner otherwise.
+            GGML_LOG_WARN(
+                "[UNIFIED-CACHE] reset_model_weight_entries preserved %zu of %zu weight entries still leased by a "
+                "live model (erased %zu)\n",
+                entries_preserved, entries_seen, entries_erased);
         }
         layer_ready_.clear();
         layer_weights_.clear();
