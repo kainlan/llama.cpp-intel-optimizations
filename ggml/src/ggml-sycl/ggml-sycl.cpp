@@ -337,8 +337,23 @@ int g_ggml_sycl_use_async_mem_op = 0;
 int g_ggml_sycl_kqv_force_simple = 0;
 int g_ggml_sycl_kqv_disable_fp16 = 0;
 #ifdef GGML_SYCL_XMX_GEMM
-int g_ggml_sycl_use_xmx_gemm  = 0;     // Enable XMX-accelerated GEMM (experimental, 5-11x slower)
-int g_ggml_sycl_xmx_threshold = 1024;  // Max batch size for XMX (XMX faster for N < threshold)
+int g_ggml_sycl_use_xmx_gemm  = 0;  // Enable XMX-accelerated GEMM (experimental, 5-11x slower)
+// Max batch size for XMX (XMX is used for 1 <= N < threshold).
+//
+// The DEFAULT is NOT here. It is the GGML_SYCL_XMX_THRESHOLD row of the
+// sycl_env_settings table in ggml_check_sycl(), which overwrites this
+// unconditionally at backend init, before any mul_mat dispatch can read it.
+// This initializer therefore only covers the window before that parse, and is
+// deliberately fail-closed (0 makes `batch < threshold` false, i.e. no XMX)
+// rather than a second copy of the default.
+//
+// It used to read 1024 and lose to the table's 64 on every run: 05519d18f
+// ("Increase XMX threshold to 1024 (was 64) for broader XMX usage") changed
+// this line and not the parse default, so the increase it announced never took
+// effect -- the threshold has been 64 the whole time, including in that
+// commit's own measurements. Raising the effective default is a benchmarked
+// decision to make in the table, not a cleanup to make here (llama.cpp-d5h0).
+int g_ggml_sycl_xmx_threshold = 0;
 #endif
 // Unified dispatch: Set GGML_SYCL_UNIFIED_DISPATCH=1 to use the unified kernel dispatch path
 static std::atomic<int> g_ggml_sycl_unified_dispatch{ -1 };   // -1 = not initialized, 0 = disabled, 1 = enabled
@@ -16540,6 +16555,9 @@ static void ggml_check_sycl() try {
             { "GGML_SYCL_KQV_DISABLE_FP16", &g_ggml_sycl_kqv_disable_fp16, 0  },
 #ifdef GGML_SYCL_XMX_GEMM
             { "GGML_SYCL_USE_XMX_GEMM",     &g_ggml_sycl_use_xmx_gemm,     0  },
+            // 64 is the ONLY statement of the XMX batch threshold's default;
+            // the global's initializer is a fail-closed 0 that this overwrites
+            // (see the comment at its declaration for why it is not 1024).
             { "GGML_SYCL_XMX_THRESHOLD",    &g_ggml_sycl_xmx_threshold,    64 },
 #endif
 #if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
