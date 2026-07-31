@@ -426,7 +426,37 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-backend-ops
 log callback (`tools/llama-bench/llama-bench.cpp`, `if (!params.verbose)
 { llama_log_set(llama_null_log_callback, NULL); }`), so **every** `GGML_LOG_INFO`
 — all `[SYCL-PLAN]`, `[UNIFIED-CACHE]`, `[VRAM-ARENA]`, `[HOST-ARENA]`,
-`[MOE-LAYOUT]` lines — is silently discarded without it. A grep then returns
+`[MOE-LAYOUT]` lines — is silently discarded without it.
+
+⚠️ **There is a SECOND, broader mechanism, and this section described only the
+first until 2026-07-30.** `GGML_LOG_INFO` is dropped at default verbosity in
+**every** tool, not just `llama-bench` — `llama-cli`, `llama-completion`, the
+lot. Upstream `67b2b7f2f` ("logs : reduce", #23021) maps `GGML_LOG_LEVEL_INFO`
+to `LOG_LEVEL_TRACE` (4) in `common_get_verbosity()` (`common/log.cpp:444`),
+while `common_log_verbosity_thold` defaults to `LOG_DEFAULT_LLAMA` =
+`LOG_LEVEL_INFO` (3) (`common/log.cpp:29`, `common/log.h:24-32`). The gate at
+`common/log.cpp:456` is `verbosity <= thold`, so `4 <= 3` is false and the line
+never reaches the sink.
+
+Consequences worth knowing before you debug the wrong thing:
+
+- **This is not a SYCL bug.** It silently affects every backend's init output.
+  "My backend prints nothing at startup" on CUDA, Vulkan or Metal is the same
+  mechanism.
+- A default `llama-completion` run emits **no** `llama_model_loader:`, no
+  `print_info:`, no `Found N SYCL devices:` — measured: ~58 s of model loading
+  with zero library output.
+- `llama-bench -v` fixes only the *first* mechanism (it suppresses that tool's
+  null callback); it does **not** raise `common_log_verbosity_thold`. Two
+  different levers.
+- A line that *does* appear at default verbosity is either `GGML_LOG_WARN`/
+  `ERROR` or a raw `fprintf(stderr)` bypassing the log system — e.g.
+  `[SYCL] GGML_SYCL_F16 build:` (`fattn.cpp`), which is why it survives when the
+  banner around it does not. A missing timestamp prefix is the tell.
+- If you need a diagnostic visible in a normal run, emit it at **WARN**, not
+  INFO. `ggml_check_sycl()`'s non-default-settings line does exactly this
+  (`e7e2667bc`), and `tests/test-sycl-env-report.cpp` gates that it keeps
+  reaching the callback. A grep then returns
 nothing, which is indistinguishable from "my change had no effect" or "that zone
 never got sized". **Always confirm a RED capture is non-empty before changing
 code**; an empty baseline proves nothing and voids the before/after.
