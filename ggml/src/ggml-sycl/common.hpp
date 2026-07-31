@@ -3418,12 +3418,19 @@ struct ggml_tensor_extra_gpu {
     bool                  moe_expert_ptrs_missing_from_prealloc[GGML_SYCL_MAX_DEVICES] = { false };
     ggml_sycl::mem_handle moe_expert_ptrs_missing_handle[GGML_SYCL_MAX_DEVICES];
 
+    // Read accessors: nullptr on an out-of-range dev, as elsewhere in this struct.
     void * moe_compact_ptr(int dev) const {
+        if (!ggml_sycl_valid_device_index(dev)) {
+            return nullptr;
+        }
         auto resolved = moe_expert_ptrs_compact_handle[dev].resolve(dev);
         return resolved.ptr;
     }
 
     int * moe_compact_missing_ptr(int dev) const {
+        if (!ggml_sycl_valid_device_index(dev)) {
+            return nullptr;
+        }
         auto resolved = moe_expert_ptrs_missing_handle[dev].resolve(dev);
         return static_cast<int *>(resolved.ptr);
     }
