@@ -1,3 +1,30 @@
+// Host-only gate tests for the oneDNN SDPA layout planner. No GPU, no
+// allocation, no oneDNN runtime -- it calls the planner directly.
+//
+// This file has been lost once, and its coverage failed once. Both are worth
+// knowing before adding to it (llama.cpp-4jlv):
+//
+//  1. It WAS registered, in 3c8f296fd (tests/CMakeLists.txt:990-1002), and it
+//     built and passed -- artifacts/kkxtv7-5/ctest-materialization.log records
+//     "Test #100: test-sycl-fattn-onednn-gates ... Passed 0.11 sec". The
+//     registration then vanished during upstream integration: the first commit
+//     in 3c8f296fd..HEAD whose tests/CMakeLists.txt lacks it is d3dce4e0a, an
+//     upstream commit whose author date (2026-01-04) PREDATES the registration
+//     -- the signature of a merge that took upstream's copy of the file whole
+//     rather than of anyone deciding to drop the test. Nothing announced it;
+//     the passing log was left behind as a fossil.
+//
+//  2. Registration alone would NOT have caught the phi2 abort. Every case here
+//     inherited `params.scale = 1.0f / 11.313708f` from mistral_like_params --
+//     that is 1/sqrt(128), a CONFORMING scale -- and no case varied it. So all
+//     11 cases passed on 2026-05-15 while the phi2 dispatch bug had already
+//     been present since be45709a9 (2026-04-21). The planner had a test, the
+//     test ran, and the scale axis simply was not in it.
+//
+// The lesson for anyone extending this file: a planner gate is only covered if
+// some case makes the guarded quantity WRONG. A suite of cases that all supply
+// well-formed inputs proves the accept path and nothing else.
+
 #include "ggml-sycl/fattn.hpp"
 
 #include <cmath>
