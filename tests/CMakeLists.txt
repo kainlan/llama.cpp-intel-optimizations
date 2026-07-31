@@ -413,6 +413,41 @@ if (NOT WIN32)
 endif()
 
 if (NOT WIN32)
+    # Source assertion for the device-index guard SYMMETRY invariant
+    # (llama.cpp-vvcq). Sibling of test-sycl-device-index-policy, which asks a
+    # different question: that one asks "is this subscript bound-checked at
+    # all", this one asks "does this guard check BOTH ends". A guard that
+    # checks only the lower bound compiles, links and passes every runtime
+    # gate -- and is not merely cosmetic: the instance this was written for
+    # answered TRUE for a device that does not exist, in GLOBAL unified-cache
+    # mode, which is what AUTO resolves to on every single-GPU gate run.
+    #
+    # The registered script is the tests/ wrapper, not scripts/check-sycl-
+    # device-guard-symmetry.sh directly. They are not duplicates: the wrapper
+    # invokes the checker and asserts an EXACT exit status, because this is an
+    # assertion of ABSENCE and such a check passes cleanly against an empty or
+    # restructured file. "Non-zero" and "zero" are each reachable for the wrong
+    # reason here, so both are pinned.
+    #
+    # SKIP_RETURN_CODE matches the script's own narrow `command -v awk` guard,
+    # not the wider "no ripgrep and no GNU grep" condition two of its siblings
+    # use -- this one is POSIX awk plus a plain grep, so the wider condition
+    # would skip on machines where it runs fine, a vacuous pass in the opposite
+    # direction. Labels match the siblings and are denylist-safe.
+    llama_test_cmd(
+        bash
+        NAME test-sycl-device-guard-symmetry-policy
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-device-guard-symmetry-policy.sh
+    )
+    set_tests_properties(test-sycl-device-guard-symmetry-policy PROPERTIES
+        LABELS "sycl;policy"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 120
+    )
+endif()
+
+if (NOT WIN32)
     # Python source-assertion test for the decode-timeline profiling pipeline.
     # Registered because tasks that modify sycl-gptoss-decode-timeline-profile.sh
     # or parse-sycl-timeline.py need a gate the lead can run; tests/ holds dozens
