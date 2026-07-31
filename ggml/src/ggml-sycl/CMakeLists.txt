@@ -1047,7 +1047,6 @@ set(SYCL_LINK_ONLY_TEST_OPTIONS
     "-Wno-narrowing"
 )
 
-
 # Batch-size gating logic for ESIMD dispatch. Pure C++: no SYCL headers, no
 # device, no GPU allocation -- hence no compile options at all.
 add_executable(test-kernel-dispatch
@@ -1204,6 +1203,18 @@ set_tests_properties(mem-handle-eviction PROPERTIES
 # mem_handle device identity and wrong-device resolution (llama.cpp-32dg8.15.11).
 # Single-GPU: tests 1-4 run; multi-device tests skip gracefully.
 # LABELS drop the old "cache" and "mem-handle" -- see rule 2 above.
+#
+# ⚠️ DELIBERATE EXCEPTION to rule 1: this target and test-mem-ops below set no
+# target_compile_options/target_link_options at all, unlike their five siblings
+# in this section which use SYCL_LINK_ONLY_TEST_OPTIONS. That is inherited
+# verbatim from the original guarded registration -- neither had those calls
+# even inside the guard with XMX_TEST_SYCL_OPTIONS. It was left alone when the
+# tests were relocated (llama.cpp-5exz) rather than normalised, because
+# silently "tidying" code while moving it turns a mechanical change into an
+# unreviewed behavioural one. Both compile and pass without the options; they
+# link ggml-sycl rather than compiling SYCL of their own. Do not add the
+# options as a cleanup -- if they are ever needed it will be because something
+# real changed, and that deserves its own commit.
 add_executable(test-mem-handle-wrong-device
     tests/test-mem-handle-wrong-device.cpp
 )
@@ -1229,6 +1240,8 @@ set_tests_properties(mem-handle-wrong-device PROPERTIES
 
 # Canonical event-returning mem_handle memory operations (llama.cpp-32dg8.15.13).
 # LABELS drop the old "cache" and "mem-handle" -- see rule 2 above.
+# Sets no compile/link options, same deliberate exception to rule 1 as
+# test-mem-handle-wrong-device above; the reasoning is written up there.
 add_executable(test-mem-ops
     tests/test-mem-ops.cpp
 )
