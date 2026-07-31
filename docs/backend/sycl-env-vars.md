@@ -5,7 +5,7 @@ backend. `CLAUDE.md` keeps only the handful of load-bearing performance
 opt-outs; everything else lives here.
 
 There are **~600** `GGML_SYCL_*` variables in the tree (599 distinct quoted
-names under `ggml/src/ggml-sycl/` as of 2026-07-30); this file documents 48 of
+names under `ggml/src/ggml-sycl/` as of 2026-07-30); this file documents 50 of
 them. The header used to claim "240+", which is low by more than half.
 
 ⚠️ **The recipe this section used to give was unsound and silently
@@ -73,6 +73,73 @@ pipe grep is not.
 | `GGML_SYCL_BATCH_EXPERTS=0` | Disable batched expert kernel launches (default ON) |
 | `GGML_SYCL_ESIMD_DEQUANT=1` | Opt-in retest hatch for ESIMD small-block dequant; standard SYCL is the default. ⚠️ The 1.9x-slower figure behind that default was measured on an **Arc B580 + oneAPI 2025.3** — that card is no longer in this machine (replaced by the B70) and the toolchain has moved on, so treat it as *historical justification*, not a current measurement. The conclusion is still believed to hold (block granularity too small to amortize LSC loads), but it has not been re-measured on Battlemage G31. Same caveat applies to the copy of this claim in `CLAUDE.md`. |
 | `GGML_SYCL_LAYOUT_OVERRIDE=<mode>` | Force a weight layout: `aos`, `soa`, `coalesced`, or `xmx_tiled`. Overrides the layout policy's own choice — use for A/B isolation, not as a default. (Migrated from AGENTS.md 2026-07-25, which was its only documentation.) |
+| `GGML_SYCL_USE_XMX_GEMM=1` | Route quantized MUL_MAT through the experimental XMX GEMM kernels (measured 5–11x **slower** for quantized models). Needs a build carrying **both** `GGML_SYCL_XMX_GEMM` and `GGML_SYCL_MMQ_XMX`; in a default build it does nothing. ⚠️ On one of the two dispatch paths, *presence* of the variable enables it — `=0` does not disable. See below. |
+| `GGML_SYCL_XMX_THRESHOLD=N` | Upper batch bound for the XMX GEMM path; the gate is `batch >= 1 && batch < N`. Default **64**, stated only by the settings table in `ggml_check_sycl()` — not by the global's initializer. Same build requirement as above. See below. |
+
+### `GGML_SYCL_USE_XMX_GEMM` / `GGML_SYCL_XMX_THRESHOLD` — the XMX GEMM path
+
+**Both are compile-gated.** The globals `g_ggml_sycl_use_xmx_gemm` and
+`g_ggml_sycl_xmx_threshold`, their `sycl_env_settings` rows in
+`ggml_check_sycl()`, and both dispatch sites all sit inside
+`#ifdef GGML_SYCL_XMX_GEMM`, which is `option(... OFF)` in
+`ggml/src/ggml-sycl/CMakeLists.txt`. In a stock build the variables are not read
+at all — setting them measures nothing.
+
+⚠️ **`-DGGML_SYCL_XMX_GEMM` alone does not compile.** The GEMM blocks call
+`ggml_sycl_xmx_available()` and `ggml_sycl_xmx_supports_type()`, declared in
+`mmq_xmx.hpp`, which `ggml-sycl.cpp` includes only under `GGML_SYCL_MMQ_XMX` — a
+second, independently-defaulted CMake option. Enabling just the first yields four
+undeclared-identifier errors with nothing naming the missing flag. **Configure
+both**, e.g. `-DGGML_SYCL_XMX_GEMM=ON -DGGML_SYCL_MMQ_XMX=ON`. Tracked as
+`llama.cpp-d6d6`; if CMake later grows an implication or a `FATAL_ERROR`, "both
+must be on" remains the requirement either way.
+
+**Where the threshold's default comes from — read this before quoting a number.**
+The authoritative default is the `GGML_SYCL_XMX_THRESHOLD` row of the
+`sycl_env_settings` table in `ggml_check_sycl()`, currently **64**. That parse
+writes the global *unconditionally* at backend init, before any `mul_mat`
+dispatch can read it, so it wins in every run. Do **not** take the default from
+the declaration of `g_ggml_sycl_xmx_threshold`: that initializer is a deliberate
+fail-closed `0` covering only the pre-parse window, and
+`scripts/check-sycl-xmx-threshold-default.sh` (ctest
+`test-sycl-xmx-threshold-policy`) enforces that it stays `0` so a second,
+competing literal cannot reappear.
+
+That guard exists because the two literals disagreed for months. `a0ede18b3`
+introduced both as `64`; `05519d18f` (*"Increase XMX threshold to 1024 (was 64)
+for broader XMX usage"*) changed **only** the initializer, so the increase never
+took effect. `43d04b327` made the table row the single source
+(`llama.cpp-d5h0`).
+
+⚠️ **So 64 is the value that has always been *effective*, not the value that won
+a measurement.** The 1024 hypothesis was never evaluated — the code silently
+ignored it, including in that commit's own B50 numbers, which were taken at 64.
+`llama.cpp-eju9` is open to actually measure 64 vs 1024 (interleaved paired A/B,
+both cards, plus the Mistral completion gate, since a threshold change reroutes
+kernel dispatch). If you are tuning this you are in unmeasured territory, not
+second-guessing a benchmarked choice.
+
+**The gate**, identical in `ggml_sycl_select_preferred_kernel` and
+`ggml_sycl_mul_mat`:
+
+```c
+use_xmx = batch >= 1 && batch < g_ggml_sycl_xmx_threshold;
+```
+
+so `GGML_SYCL_XMX_THRESHOLD=0` or `=1` disables the XMX path outright, and
+"XMX for every batch" is only reachable by naming a large `N`.
+
+⚠️ **`GGML_SYCL_USE_XMX_GEMM` is read two different ways, and one of them ignores
+the value.** `ggml_sycl_mul_mat` tests the parsed global, so `=0` disables there.
+`ggml_sycl_select_preferred_kernel` tests
+`std::getenv("GGML_SYCL_USE_XMX_GEMM") != nullptr` **or** the global — so on that
+path merely *setting* the variable enables XMX regardless of its value, and
+`GGML_SYCL_USE_XMX_GEMM=0` still turns it on. To disable, leave the variable
+unset; do not set it to `0`.
+
+`ggml_check_sycl()` reports the threshold only when the enable flag is on, and
+that report is `GGML_LOG_INFO` — see CLAUDE.md on why those lines need raised
+verbosity to appear at all.
 
 ## Binbcast completion event
 

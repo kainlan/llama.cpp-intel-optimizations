@@ -258,8 +258,23 @@ static bool test_xmx_dispatch_threshold_batch_size(sycl::queue &            q,
         return true;
     }
 
-    // The XMX GEMM threshold is controlled by GGML_SYCL_XMX_THRESHOLD env var
-    // Default: batch < 8 uses XMX, batch >= 8 uses MMQ SoA
+    // The XMX GEMM threshold is controlled by the GGML_SYCL_XMX_THRESHOLD env
+    // var. The real gate, identical at both dispatch sites
+    // (ggml_sycl_select_preferred_kernel and ggml_sycl_mul_mat), is:
+    //
+    //     use_xmx = batch >= 1 && batch < g_ggml_sycl_xmx_threshold;
+    //
+    // Default threshold: 64. That number is stated in exactly one place -- the
+    // GGML_SYCL_XMX_THRESHOLD row of the sycl_env_settings table in
+    // ggml_check_sycl(), which overwrites the global unconditionally at backend
+    // init. The global's own initializer is a fail-closed 0 and is NOT the
+    // default (llama.cpp-d5h0 / 43d04b327; guarded by
+    // scripts/check-sycl-xmx-threshold-default.sh).
+    //
+    // This comment claimed "batch < 8 uses XMX, batch >= 8 uses MMQ SoA" until
+    // 2026-07-31 -- stale on both counts (no lower bound, wrong threshold). The
+    // literal 8 in the loop below is an illustrative constant local to this
+    // test's printout; it corresponds to no dispatch site.
 
     // Test various batch sizes
     const int test_batches[] = { 1, 4, 8, 16, 32, 128 };
