@@ -1280,9 +1280,21 @@ if (IntelSYCL_FOUND)
     target_link_libraries(test-sycl-reset-model-weight-lease-preserve PRIVATE IntelSYCL::SYCL_CXX)
 endif()
 add_test(NAME sycl-reset-model-weight-lease-preserve COMMAND test-sycl-reset-model-weight-lease-preserve)
+# ENVIRONMENT pins the B50 (the validation card) rather than the B70, and it is
+# load-bearing: the test's own source falls back to level_zero:0 -- the B70, i.e.
+# the benchmark card -- when nothing is set, so a bare `ctest -R` or the throttled
+# full sweep would otherwise land it there and perturb a run in progress.  Matches
+# test-sycl-zone-reset-live-refusal / unpin-event / env-report in tests/CMakeLists.txt.
+# The surrounding tests in THIS file predate that convention and pin nothing; do not
+# take their silence as the local rule.
+#
+# LABELS deliberately omit a task id.  Neither "sycl" nor "lease" nor "bugfix" is in
+# CLAUDE.md's `-LE 'residency|mem-handle|cache'` denylist, so the throttled sweep runs
+# this test -- which is the point.  Measured before dropping the hazard labels:
+# free -g flat at 210 GB, peak RSS 317 MB, against a family that reaches ~227 GB.
 set_tests_properties(sycl-reset-model-weight-lease-preserve PROPERTIES
-    LABELS "sycl;lease;bugfix;ljb9"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    LABELS "sycl;lease;bugfix"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
 

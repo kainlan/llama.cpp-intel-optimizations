@@ -7289,6 +7289,16 @@ void unified_cache::reset_model_weight_entries() {
         // model is still using this weight", not "somebody leaked a handle": erasing
         // it would free VRAM out from under a running model.  Preserve those entries
         // and reclaim only the unreferenced ones.
+        //
+        // INCOMPLETE -- see llama.cpp-0qlw.  Preserving only *leased* entries is not
+        // sufficient: in_use_count == 0 means "nobody is resolving this at this
+        // instant", not "no live model owns it".  Leases are taken and released around
+        // each compute, so a very-much-alive model's IDLE weights read zero between
+        // graphs and are still freed here.  That is the cause of the test-thread-safety
+        // SIGSEGV.  The fix needs a model-teardown hook (which does not exist --
+        // ggml_backend_sycl_set_model_loading is load-only) before this reset can be
+        // split by call-site purpose; doing the split first strands the pinned weight
+        // set, because evict_one() skips pinned entries and teardown never unpins.
         bool                                any_preserved = false;
         for (const auto & pair : entries_) {
             if (pair.second.in_use_count.load() != 0) {
