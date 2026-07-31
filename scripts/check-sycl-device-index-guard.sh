@@ -70,6 +70,27 @@ classify_report() {
         return 2
     fi
 
+    # ⚠️ THE HERESTRINGS ON THESE TWO GREPS ARE NOT A RULE, and the sibling's
+    # piped form is not an oversight. Both are correct, and the difference is
+    # worth a sentence because a reader who sees two idioms for the same job
+    # cannot tell which one is intentional.
+    #
+    # `grep -c` and plain `grep` read to EOF, so they never close the pipe early
+    # and the SIGPIPE-under-pipefail race of llama.cpp-x54y cannot occur with
+    # either spelling. Only an EARLY-EXITING grep (-q/-l/-m) is at risk; see
+    # llama.cpp-x54y comment c-7rn2, which says in as many words not to convert
+    # the safe ones, because churn on correct code is a cost with no benefit.
+    #
+    # These two are herestrings only because they MOVED INTO THIS FUNCTION when
+    # classify_report() was extracted, and matching the FATAL grep three lines up
+    # was cheaper than mixing two idioms inside one twenty-line function. That is
+    # a local consistency argument, not a correctness one.
+    #
+    # check-sycl-device-guard-symmetry.sh keeps `printf '%s\n' "$report" | grep`
+    # at the equivalent spot, deliberately untouched. Do not "align" it. If you
+    # are here because the divergence looked like a bug: it is not, and the
+    # cheapest resolution is this comment rather than a commit that rewrites
+    # working code in another file.
     violations=$(grep -c 'no bounds check' <<< "$report" || true)
     if [ "$violations" -ne 0 ]; then
         grep 'no bounds check' <<< "$report" >&2
