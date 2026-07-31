@@ -4341,8 +4341,16 @@ inline bool ggml_sycl_weight_is_planned_on_device(const ggml_tensor * tensor, in
     return ggml_sycl_get_planned_weight_residency(tensor, device) == ggml_sycl_planned_weight_residency::DEVICE;
 }
 
+// Full range check for the same reason as
+// ggml_sycl_weight_is_currently_device_resident() below, and by the same
+// mechanism: the `device < 0` half that stood here delegated its upper bound to
+// get_unified_cache_for_device(), which in GLOBAL mode folds any device id to 0
+// BEFORE applying its own bound check.  An out-of-range device therefore got
+// device 0's cache and reported device 0's placement plan as its own.  Never an
+// out-of-bounds read -- this function subscripts nothing -- just an answer about
+// a device that does not exist.
 inline bool ggml_sycl_planner_authoritative_residency_active(int device) {
-    if (device < 0) {
+    if (!ggml_sycl_valid_device_index(device)) {
         return false;
     }
 
