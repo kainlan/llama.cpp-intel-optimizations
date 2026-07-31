@@ -395,15 +395,24 @@ if (NOT WIN32)
     # it -- does not exist in a non-SYCL build. tests/CMakeLists.txt is always
     # processed, so this is the location that delivers the stated intent.
     #
-    # The script lives under scripts/ with the other check-sycl-*.sh gates
-    # rather than in tests/ like the three siblings above; the ARGS path differs
-    # accordingly. Labels match the siblings: neither "sycl" nor "policy" is in
-    # the throttled sweep's -LE 'residency|mem-handle|cache' denylist.
+    # The registered script is the tests/ WRAPPER, not
+    # scripts/check-sycl-fattn-onednn-scale-gate.sh directly -- same arrangement
+    # as test-sycl-device-guard-symmetry-policy below, and for a sharper reason
+    # here. The wrapper's controls include a case that runs the real invariant
+    # 30x and requires identical statuses, which exists because the checker had
+    # an INTERMITTENT defect a single-shot assertion structurally cannot see:
+    # `printf '%s\n' "$VAR" | grep -q PAT` under `set -o pipefail` lets grep -q
+    # exit early, printf takes SIGPIPE (141), and pipefail promotes that -- so a
+    # MATCH intermittently read as a FAILURE. Registering the checker directly
+    # would enforce the invariant but never exercise those controls.
+    #
+    # Labels match the siblings: neither "sycl" nor "policy" is in the throttled
+    # sweep's -LE 'residency|mem-handle|cache' denylist.
     llama_test_cmd(
         bash
         NAME test-sycl-fattn-onednn-scale-gate
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        ARGS ${CMAKE_SOURCE_DIR}/scripts/check-sycl-fattn-onednn-scale-gate.sh
+        ARGS ${CMAKE_SOURCE_DIR}/tests/test-sycl-fattn-onednn-scale-gate.sh
     )
     set_tests_properties(test-sycl-fattn-onednn-scale-gate PROPERTIES
         LABELS "sycl;policy"
