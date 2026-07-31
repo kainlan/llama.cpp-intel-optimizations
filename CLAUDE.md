@@ -240,6 +240,37 @@ Do not add forced eviction, forced reap, or zone-reset logic to reclaim memory
 that still has a live handle; a live allocation at cleanup means a leaked
 reference or stale owner that must be fixed.
 
+⚠️ **"At cleanup" is load-bearing, and was being read too broadly.** A live lease
+is a defect only when its **owner is gone**. Several `llama_model` objects may be
+loaded at once — that is supported public API, and `tests/test-thread-safety.cpp`
+exists to exercise it (it loads one model per GPU plus a CPU copy, then runs them
+concurrently). So **another live model's lease is correct, not leaked**, and a
+*new model's load* is not a quiescent point for anybody else's weights.
+
+Getting this backwards cost real time. `9a0670712` ("sycl: checkpoint unified
+memory ownership work") replaced `reset_model_weight_entries`'s preserve-and-
+continue with `GGML_ABORT`, plus the same in `host_zone_reset` and `zone_reset`.
+That made `test-llama-archs` and `test-thread-safety` — both `main`-labelled —
+fail deterministically, and each abort masked whatever came after it, so nobody
+connected the failures back. Restored in `acdb192d4`; the zone-reset siblings are
+tracked in `llama.cpp-fz2u`.
+
+Two things this does **not** license:
+
+- **It is a scoped exception, not a general loosening.** `mem_handle`'s destructor
+  is still the sole release point, and reclaiming memory that still has a live
+  handle is still forbidden. `acdb192d4` *refuses to reclaim* — the opposite of a
+  forced reap.
+- **It costs leak detection at that site, knowingly.** That scan can no longer
+  distinguish "another live model owns this" from "something leaked it"; both now
+  warn and preserve. A future real leak will surface as a growing
+  `entries_preserved` count and eventual VRAM pressure, not a loud abort. Scoping
+  the reset per model would have kept both properties but is structurally
+  impossible: `unified-cache-key.hpp` deliberately excludes `model_id` from
+  `cache_id_equal` for GGUF weights, and the primary call site
+  (`ggml_backend_sycl_set_model_loading`) runs before any tensor of the incoming
+  model exists. See `llama.cpp-ljb9`.
+
 Raw pointers are not ownership tokens and must not model allocation state. They
 are only transient ABI views resolved from `mem_handle` for immediate kernel
 submission, oneDNN primitive calls, or tightly scoped CPU access. Do not store
