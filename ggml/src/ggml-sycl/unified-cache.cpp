@@ -11888,20 +11888,43 @@ void unified_cache::host_zone_reset(host_zone_id zone) {
     // catches genuinely retained handles/leases in the reset zone.
     (void) offload_buffer_pool_trim_host_zone(zone);
 
-    // Purge registry entries that belong to this host zone.  Without this,
-    // zone_reset() recycles TLSF addresses while the registry still maps them,
-    // causing duplicate-pointer rejection on retry.
+    // Refuse the reset while anything in this zone is still live.  Callers reach
+    // here on a new context ("same model, new context" in arena_reserve), but with
+    // several models loaded the previous ones are still running and still own host
+    // allocations in this zone -- a live record here means another owner, not a leak.
+    //
+    // Refusing is the only safe answer: zone_reset() hands the whole zone back to
+    // the allocator at once, so there is no way to keep one live allocation across
+    // it the way entries_ lets reset_model_weight_entries() keep one entry. Nor may
+    // we purge the registry and reset anyway (what this did before 9a0670712) --
+    // that recycles addresses still owned by live handles. Skipping leaves TLSF's
+    // free list intact, so already-freed blocks stay reusable; only the bulk
+    // reclaim is forgone. This matches zone_reset()'s existing refusals for the
+    // WEIGHT zone and for KV in a shared KV+WEIGHT arena.
     {
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-        bool                        live_allocations = false;
+        static std::atomic<int>     refusal_logs{ 0 };
+        // The per-allocation dump names the owner, which is the diagnostic that
+        // matters -- but it is one stderr line each and this path now returns
+        // instead of aborting, so keep it only for the first few refusals.
+        const bool                  log_detail       = refusal_logs.load(std::memory_order_relaxed) < 4;
+        size_t                      live_allocations = 0;
         for (auto it = g_runtime_alloc_registry.begin(); it != g_runtime_alloc_registry.end(); ++it) {
             if (it->second.handle.host_zone == zone) {
-                runtime_reset_reclaimed_log_live_locked(it->second, "host-zone-reset");
-                live_allocations = true;
+                if (log_detail) {
+                    runtime_reset_reclaimed_log_live_locked(it->second, "host-zone-reset");
+                }
+                live_allocations++;
             }
         }
-        if (live_allocations) {
-            GGML_ABORT("unified_cache host_zone_reset: live registered allocations in reset zone");
+        if (live_allocations > 0) {
+            if (refusal_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+                GGML_LOG_WARN(
+                    "[UNIFIED-CACHE] refusing %s host zone_reset with %zu live registered allocations; owners must "
+                    "release their mem_handles instead of resetting the shared allocator\n",
+                    host_zone_name(zone), live_allocations);
+            }
+            return;
         }
     }
 
@@ -14128,21 +14151,40 @@ void unified_cache::zone_reset(vram_zone_id zone) {
     // KV/ONEDNN/RUNTIME/SCRATCH all live in a SINGLE physical chunk (the tail
     // chunk in N-chunk mode, or the only chunk in single-chunk mode), so the
     // zone's address range is one contiguous span starting at offset_to_ptr(z.start).
+    //
+    // A live record in this range means another still-loaded model or context owns
+    // that memory, which is correct rather than leaked once several models can be
+    // live at once.  Refuse the reset in that case -- resetting the allocator would
+    // recycle addresses out from under those owners, and there is no partial reset
+    // that could keep them.  This is the same answer the WEIGHT and shared-KV cases
+    // above already give; only the bulk reclaim is lost, TLSF's free list is intact.
     if (arena_base_ && z.size > 0) {
         std::lock_guard<std::mutex> reg_lock(g_runtime_alloc_mutex);
+        static std::atomic<int>     refusal_logs{ 0 };
         const auto                  base             = reinterpret_cast<uintptr_t>(offset_to_ptr(z.start));
         const uintptr_t             zone_lo          = base;
         const uintptr_t             zone_hi          = base + z.size;
-        bool                        live_allocations = false;
+        // One stderr line per live allocation, and this path returns rather than
+        // aborting now, so identify owners only for the first few refusals.
+        const bool                  log_detail       = refusal_logs.load(std::memory_order_relaxed) < 4;
+        size_t                      live_allocations = 0;
         for (auto it = g_runtime_alloc_registry.begin(); it != g_runtime_alloc_registry.end(); ++it) {
             const uintptr_t p = reinterpret_cast<uintptr_t>(it->first);
             if (p >= zone_lo && p < zone_hi) {
-                runtime_reset_reclaimed_log_live_locked(it->second, "device-zone-reset");
-                live_allocations = true;
+                if (log_detail) {
+                    runtime_reset_reclaimed_log_live_locked(it->second, "device-zone-reset");
+                }
+                live_allocations++;
             }
         }
-        if (live_allocations) {
-            GGML_ABORT("unified_cache zone_reset: live registered allocations in reset zone");
+        if (live_allocations > 0) {
+            if (refusal_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+                GGML_LOG_WARN(
+                    "[UNIFIED-CACHE] refusing zone_reset of VRAM zone %d with %zu live registered allocations; owners "
+                    "must release their mem_handles instead of resetting the shared allocator\n",
+                    (int) zone, live_allocations);
+            }
+            return;
         }
     }
 
