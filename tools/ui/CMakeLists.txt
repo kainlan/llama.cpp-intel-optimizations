@@ -69,10 +69,49 @@ else()
     set(LLAMA_UI_EMBED_EXE "$<TARGET_FILE:llama-ui-embed>")
 endif()
 
-# Inputs that make the provisioning script's answer change. This is the same
-# list the script itself globs in npm_build_should_skip(), read from the same
-# file, so the two cannot drift apart.
+# Inputs that make the provisioning script's answer change.
+#
+# The bulk of this comes from sources.cmake -- the same list the script itself
+# globs in npm_build_should_skip(), read from the same file so the two cannot
+# drift apart. Note that is a claim about DIVERGENCE, not about CORRECTNESS:
+# single-sourcing means this list inherits whatever sources.cmake gets wrong,
+# and it currently gets things wrong in both directions (a listed file that no
+# longer exists, real inputs that are unlisted). Tracked as llama.cpp-3658.
 set(UI_ASSET_DEPENDS "${PROJECT_SOURCE_DIR}/scripts/ui-assets.cmake")
+
+# Priority 1 in scripts/ui-assets.cmake is pre-built assets dropped into
+# tools/ui/dist -- the documented recovery path for disconnected builds, and
+# NOT covered by sources.cmake's globs (src/*, static/*). Without this the
+# stamp is never invalidated by them and manually supplied assets are silently
+# ignored for as long as the stamp stays fresh.
+#
+# The EXISTS guard is required in BOTH directions, and the second one is the
+# one that bites. A declared input with no rule to make it is a hard ninja
+# error, and dist/ is absent in a normal checkout -- but CMake's regeneration
+# keys on CMakeLists.txt, not on that file, so a dist/ that is present at
+# configure time and DELETED afterwards leaves the declaration behind and
+# breaks the build outright:
+#
+#   ninja: error: '.../tools/ui/dist/index.html', needed by
+#          'tools/ui/ui-assets.stamp', missing and no known rule to make it
+#
+# Measured, not theorised. So the directory itself goes in CMAKE_CONFIGURE_DEPENDS:
+# creating or removing dist/ changes tools/ui's mtime, which re-runs CMake and
+# re-evaluates the guard. That closes both directions -- a dist/ extracted into
+# an already-configured tree is picked up, and a deleted one stops being
+# declared instead of failing the build.
+#
+# This is deliberately a directory dependency, not file(GLOB ... CONFIGURE_DEPENDS).
+# The latter would also work, but CMake implements it with a glob
+# re-verification step in the regeneration check, which risks reintroducing the
+# always-out-of-date edge this file exists to remove. Trading a never-rebuild
+# bug for an always-rebuild one is the worst move available; a plain directory
+# dependency adds no such edge (verified: the tree still reaches `no work to do`).
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}")
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/dist/index.html")
+    list(APPEND UI_ASSET_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/dist/index.html")
+endif()
+
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/sources.cmake")
     include("${CMAKE_CURRENT_SOURCE_DIR}/sources.cmake")
     list(APPEND UI_ASSET_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/sources.cmake")

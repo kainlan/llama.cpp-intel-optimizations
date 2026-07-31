@@ -65,28 +65,48 @@ def _sets_the_variable(path: Path) -> bool:
     return SETTING in path.read_text(encoding="utf-8", errors="replace")
 
 
+# Directories that no ancestor add_subdirectory()s, so CMake never processes
+# them: they contribute no targets and cannot be dirty. This is an explicit
+# allowlist rather than an inference, because the inference fails OPEN -- see
+# _status(). test_not_in_build_entries_are_really_not_in_build keeps it honest.
+NOT_IN_BUILD: set[str] = set()
+
+
 def _status(path: Path) -> str:
-    """One of: covered, uncovered, unreachable.
+    """One of: covered, uncovered, not-in-build.
 
     The variable is directory-scoped and inherited by subdirectories, so a
-    directory is covered when it sets it itself or when some ancestor that
-    add_subdirectory()s it does. A directory no ancestor adds is `unreachable`:
-    CMake never processes it, it contributes no targets, and it cannot be dirty
-    -- flagging it would be a false positive (tools/onednn-f4-probe is such a
-    directory today).
+    directory is covered when it sets it itself, or when some ancestor that
+    add_subdirectory()s it does.
+
+    This walk FAILS CLOSED, and the first version of it did not. It matches
+    only a literal `add_subdirectory(<name>)`, but ggml/src/CMakeLists.txt:321
+    adds every backend as `add_subdirectory(${backend_target})` -- a variable
+    expansion no text match can follow. Treating an unmatched parent as "not
+    built, skip it" therefore turns an *unanalysable* edge into a *silent
+    exemption*: a future icpx-linking backend added through that same loop
+    without self-declaring would be waved through by the very gate meant to
+    catch it. A checker whose failure mode is a confident green is worse than
+    no checker, which is the defect this whole file exists to prevent -- so an
+    unmatched parent is `uncovered` unless it is explicitly allowlisted.
+
+    ggml-sycl does not hit this today only because it self-declares on the
+    first line below, an accident test_ggml_sycl_self_declares now pins.
     """
     if _sets_the_variable(path):
         return "covered"
+    if str(path.relative_to(ROOT)) in NOT_IN_BUILD:
+        return "not-in-build"
     directory = path.parent
     while directory != ROOT:
         child = directory.name
         directory = directory.parent
         parent_cmake = directory / "CMakeLists.txt"
         if not parent_cmake.exists():
-            return "unreachable"
+            return "uncovered"
         parent_text = parent_cmake.read_text(encoding="utf-8", errors="replace")
         if f"add_subdirectory({child})" not in parent_text:
-            return "unreachable"
+            return "uncovered"
         if SETTING in parent_text:
             return "covered"
     return "uncovered"
@@ -118,6 +138,32 @@ def test_every_icpx_linking_directory_disables_linker_depfiles() -> None:
         "CMakeLists.txt (guarded on Ninja + IntelLLVM), or to a parent that "
         "add_subdirectory()s it. See llama.cpp-9ubg."
     )
+
+
+def test_ggml_sycl_self_declares() -> None:
+    # ggml/src/ggml-sycl is reached through `add_subdirectory(${backend_target})`
+    # (ggml/src/CMakeLists.txt:321), a variable expansion _status() cannot
+    # follow. It is classified correctly today only because it sets the variable
+    # itself and never reaches the walk. Pin that, so the accident is an
+    # asserted invariant: if someone hoists the setting to a shared parent, this
+    # fails and points at the walk rather than leaving it silently unexercised.
+    assert _sets_the_variable(ROOT / "ggml/src/ggml-sycl/CMakeLists.txt")
+
+
+def test_not_in_build_entries_are_really_not_in_build() -> None:
+    # NOT_IN_BUILD is the one way to escape the fail-closed walk, so each entry
+    # must keep earning it. Empty today; kept as the mechanism for a directory
+    # that genuinely is not added.
+    for entry in sorted(NOT_IN_BUILD):
+        path = ROOT / entry
+        assert path.exists(), f"NOT_IN_BUILD names a file that no longer exists: {entry}"
+        child = path.parent.name
+        parent = path.parent.parent / "CMakeLists.txt"
+        if parent.exists():
+            text = parent.read_text(encoding="utf-8", errors="replace")
+            assert f"add_subdirectory({child})" not in text, (
+                f"{entry} IS added by {parent}; remove it from NOT_IN_BUILD."
+            )
 
 
 def test_pending_entries_retire_themselves() -> None:
