@@ -9355,6 +9355,16 @@ bool unified_free_ptr(void * ptr, int expected_device) {
         return false;
     }
 
+    // This erase must stay UNCONDITIONAL on zone.  host_zone_reset() and
+    // zone_reset() refuse to reset while this registry still lists a live
+    // allocation in the target zone, and they rely on that refusal being
+    // temporary: the registry drains as owners release, and the next reset then
+    // succeeds and reclaims everything accumulated meanwhile.  Reset-only zones
+    // (SCRATCH/STAGING, see unified_free_record) legitimately take no per-block
+    // free above -- but their record must still be dropped here.  Making this
+    // erase conditional on zone would convert that bounded retention into a
+    // permanent latch: the zone would never reset again for the process
+    // lifetime, silently and with no abort to point at it.
     std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
     auto                        it = g_runtime_alloc_registry.find(ptr);
     if (it != g_runtime_alloc_registry.end() && it->second.handle.alloc_id == rec.handle.alloc_id) {
@@ -11903,22 +11913,31 @@ void unified_cache::host_zone_reset(host_zone_id zone) {
     // WEIGHT zone and for KV in a shared KV+WEIGHT arena.
     {
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-        static std::atomic<int>     refusal_logs{ 0 };
+        // Budget the logging PER ZONE, not per function.  A shared counter lets a
+        // busy zone spend the whole budget and then permanently silence a quieter
+        // zone's first-ever refusal -- and a first occurrence is exactly what has
+        // to be visible.  Not hypothetical: STAGING alone reaches 7 refusals in one
+        // multi-model run, so it would exhaust a shared budget by itself.
+        static std::atomic<int>     refusal_logs[static_cast<int>(host_zone_id::COUNT)]{};
+        std::atomic<int> &          zone_logs        = refusal_logs[static_cast<int>(zone)];
         // The per-allocation dump names the owner, which is the diagnostic that
         // matters -- but it is one stderr line each and this path now returns
-        // instead of aborting, so keep it only for the first few refusals.
-        const bool                  log_detail       = refusal_logs.load(std::memory_order_relaxed) < 4;
+        // instead of aborting, so keep it only for the first few refusals, and
+        // bound it within a single refusal too.
+        const bool                  log_detail       = zone_logs.load(std::memory_order_relaxed) < 4;
+        size_t                      detail_lines     = 0;
         size_t                      live_allocations = 0;
         for (auto it = g_runtime_alloc_registry.begin(); it != g_runtime_alloc_registry.end(); ++it) {
             if (it->second.handle.host_zone == zone) {
-                if (log_detail) {
+                if (log_detail && detail_lines < 8) {
                     runtime_reset_reclaimed_log_live_locked(it->second, "host-zone-reset");
+                    detail_lines++;
                 }
                 live_allocations++;
             }
         }
         if (live_allocations > 0) {
-            if (refusal_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+            if (zone_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
                 GGML_LOG_WARN(
                     "[UNIFIED-CACHE] refusing %s host zone_reset with %zu live registered allocations; owners must "
                     "release their mem_handles instead of resetting the shared allocator\n",
@@ -14104,6 +14123,26 @@ void * unified_cache::zone_alloc(vram_zone_id zone, size_t size, size_t align) {
     return nullptr;
 }
 
+// Mirror of host_zone_name() for the VRAM zones.  File-local: the only consumer
+// is the refusal warning below, and keeping it here avoids touching a shared
+// header.  Promote it to unified-cache.hpp if a second caller appears.
+static const char * vram_zone_name(vram_zone_id zone) {
+    switch (zone) {
+        case vram_zone_id::KV:
+            return "KV";
+        case vram_zone_id::WEIGHT:
+            return "WEIGHT";
+        case vram_zone_id::ONEDNN:
+            return "ONEDNN";
+        case vram_zone_id::RUNTIME:
+            return "RUNTIME";
+        case vram_zone_id::SCRATCH:
+            return "SCRATCH";
+        default:
+            return "?";
+    }
+}
+
 void unified_cache::zone_reset(vram_zone_id zone) {
     if (zone == vram_zone_id::WEIGHT) {
         GGML_LOG_WARN(
@@ -14160,29 +14199,35 @@ void unified_cache::zone_reset(vram_zone_id zone) {
     // above already give; only the bulk reclaim is lost, TLSF's free list is intact.
     if (arena_base_ && z.size > 0) {
         std::lock_guard<std::mutex> reg_lock(g_runtime_alloc_mutex);
-        static std::atomic<int>     refusal_logs{ 0 };
+        // Per-zone budgets -- see the matching note in host_zone_reset(): a shared
+        // counter lets one busy zone silence another zone's first-ever refusal.
+        static std::atomic<int>     refusal_logs[static_cast<int>(vram_zone_id::COUNT)]{};
+        std::atomic<int> &          zone_logs        = refusal_logs[static_cast<int>(zone)];
         const auto                  base             = reinterpret_cast<uintptr_t>(offset_to_ptr(z.start));
         const uintptr_t             zone_lo          = base;
         const uintptr_t             zone_hi          = base + z.size;
         // One stderr line per live allocation, and this path returns rather than
-        // aborting now, so identify owners only for the first few refusals.
-        const bool                  log_detail       = refusal_logs.load(std::memory_order_relaxed) < 4;
+        // aborting now, so identify owners only for the first few refusals, and
+        // bound the dump within a single refusal too.
+        const bool                  log_detail       = zone_logs.load(std::memory_order_relaxed) < 4;
+        size_t                      detail_lines     = 0;
         size_t                      live_allocations = 0;
         for (auto it = g_runtime_alloc_registry.begin(); it != g_runtime_alloc_registry.end(); ++it) {
             const uintptr_t p = reinterpret_cast<uintptr_t>(it->first);
             if (p >= zone_lo && p < zone_hi) {
-                if (log_detail) {
+                if (log_detail && detail_lines < 8) {
                     runtime_reset_reclaimed_log_live_locked(it->second, "device-zone-reset");
+                    detail_lines++;
                 }
                 live_allocations++;
             }
         }
         if (live_allocations > 0) {
-            if (refusal_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+            if (zone_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
                 GGML_LOG_WARN(
-                    "[UNIFIED-CACHE] refusing zone_reset of VRAM zone %d with %zu live registered allocations; owners "
+                    "[UNIFIED-CACHE] refusing zone_reset of VRAM zone %s with %zu live registered allocations; owners "
                     "must release their mem_handles instead of resetting the shared allocator\n",
-                    (int) zone, live_allocations);
+                    vram_zone_name(zone), live_allocations);
             }
             return;
         }
