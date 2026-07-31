@@ -12,6 +12,7 @@
 #include "../src/llama-model-saver.h"
 
 #include <cinttypes>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -37,6 +38,28 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     }
 
     return mse_a_b / mse_a_0;
+}
+
+// A non-finite NMSE means the comparison itself degenerated, not that the result is "slightly off".
+// The two causes need different fixes and must not be confused, so say which one it was:
+//   - non-finite values in the logits => the backend produced NaN/Inf output;
+//   - zero reference energy           => the CPU reference is all-zero, so mse_a_0 is 0 and the ratio is 0/0.
+static std::string nmse_diagnosis(const std::vector<float> & a, const std::vector<float> & b) {
+    size_t   nonfinite_a = 0;
+    size_t   nonfinite_b = 0;
+    double   energy_a    = 0.0;
+
+    for (size_t i = 0; i < a.size(); i++) {
+        nonfinite_a += !std::isfinite(a[i]);
+        nonfinite_b += !std::isfinite(b[i]);
+        energy_a    += double(a[i]) * double(a[i]);
+    }
+
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "n=%zu, non-finite CPU logits=%zu, non-finite device logits=%zu, CPU reference energy=%g",
+        a.size(), nonfinite_a, nonfinite_b, energy_a);
+    return std::string(buf);
 }
 
 static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
@@ -624,11 +647,25 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                         model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode);
                         logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
                         const double nmse_val = nmse(logits_cpu, logits_dev);
-                        snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
                         status_nmse = "\033[1;32mOK\033[0m";
-                        if (nmse_val > 1e-4) {
+                        if (!std::isfinite(nmse_val)) {
+                            // NaN > 1e-4 is false, so a threshold test alone reports total numerical
+                            // collapse -- the worst outcome -- as a pass. Reject non-finite explicitly and
+                            // label it distinctly from a large finite NMSE: NaN means the output degenerated,
+                            // a large finite value means the kernel is wrong but alive.
+                            snprintf(nmse_str, sizeof(nmse_str), "(%s)",
+                                std::isnan(nmse_val) ? "nan" : (nmse_val > 0.0 ? "+inf" : "-inf"));
                             all_ok = false;
                             status_nmse = "\033[1;31mFAIL\033[0m";
+                            fprintf(stderr, "\n%s (%s, %s): non-finite NMSE: %s\n",
+                                llm_arch_name(arch), dc.label.c_str(), config_name.c_str(),
+                                nmse_diagnosis(logits_cpu, logits_dev).c_str());
+                        } else {
+                            snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
+                            if (nmse_val > 1e-4) {
+                                all_ok = false;
+                                status_nmse = "\033[1;31mFAIL\033[0m";
+                            }
                         }
                     }
 
