@@ -2850,22 +2850,35 @@ template <typename T> struct ggml_sycl_pool_alloc {
 //
 // THE RULE: every member of ggml_tensor_extra_gpu that subscripts a
 // [GGML_SYCL_MAX_DEVICES] array must bounds-check the index first -- via this
-// helper, which is the canonical form.  Two members predate it and still carry
-// an equivalent inline literal (forget_/take_moe_storage_handle_on_device);
-// they are guarded, just not collapsed onto the helper yet, and llama.cpp-uc7s
-// tracks that along with the copies outside this struct.
+// helper, which is the canonical form.  As of llama.cpp-uc7s it is the ONLY
+// form: this function body is the single place in this file that spells the
+// bound out, both inside the struct and outside it.  A hand-written
+// `d >= 0 && d < GGML_SYCL_MAX_DEVICES` reappearing anywhere else is a
+// regression to collapse, not a style choice.  The other surviving mentions of
+// GGML_SYCL_MAX_DEVICES here are array declarations, two full-range `for` loop
+// bounds, a clamp, and log-message text -- none of them guards.
 //
 // ENFORCEMENT: scripts/check-sycl-device-index-guard.sh, run by
 // tests/test-sycl-device-index-policy.sh.  It discovers the per-device arrays
 // from this struct rather than from a list, so a member or array added later is
 // covered without editing anything, and it prints its own inventory -- ask the
 // script for the counts instead of trusting a number written here, which is
-// exactly what went stale before.
+// exactly what went stale before.  Note the script deliberately still ACCEPTS
+// the inline-literal form: that kept it green while the copies were being
+// collapsed, and clear_data_authority()'s loop bound needs it.  So the script
+// enforces "guarded", not "collapsed"; the paragraph above is what enforces
+// "collapsed", and only a reader does.
 //
-// The rule is stated rather than tallied because the tally was twice reported
-// wrong, both times from one cause: a sweep regex matching only [dev]/[device],
-// which cannot match [owner_device] however carefully it is re-run.  The blind
-// spot was inside the check.  Key on the array names, never the index spelling.
+// The rule is stated rather than tallied because the tally was reported wrong
+// three times, every time from one cause: a sweep keyed on how the guard was
+// SPELLED.  A regex matching [dev]/[device] cannot match [owner_device]; one
+// matching a single line cannot match the guard clang-format wrapped across
+// two; one matching `d >= 0 && d < MAX` cannot match the negated early-return
+// `d < 0 || d >= MAX`.  Each re-run returned the same wrong answer with the
+// same confidence, because the blind spot was inside the check.  Key on the
+// array names -- a fixed vocabulary -- never on the index spelling or the
+// guard's shape.  Note this class of miss fails CLOSED: it under-reports, so
+// the gap it leaves looks exactly like completed coverage.
 static inline bool ggml_sycl_valid_device_index(int dev) {
     return dev >= 0 && dev < GGML_SYCL_MAX_DEVICES;
 }
@@ -3302,7 +3315,7 @@ struct ggml_tensor_extra_gpu {
             }
         }
 
-        if (owner_device >= 0 && owner_device < GGML_SYCL_MAX_DEVICES) {
+        if (ggml_sycl_valid_device_index(owner_device)) {
             const size_t slot = static_cast<size_t>(expert_id);
             if (slot < moe_expert_handles[owner_device].size()) {
                 ggml_sycl::mem_handle table_handle = moe_expert_handles[owner_device][slot];
@@ -3354,7 +3367,7 @@ struct ggml_tensor_extra_gpu {
             moe_expert_storage_handles.erase(it);
         }
 
-        if (owner_device >= 0 && owner_device < GGML_SYCL_MAX_DEVICES) {
+        if (ggml_sycl_valid_device_index(owner_device)) {
             const size_t slot = static_cast<size_t>(expert_id);
             if (slot < moe_expert_handles[owner_device].size()) {
                 ggml_sycl::mem_handle table_handle = moe_expert_handles[owner_device][slot];
@@ -3634,7 +3647,7 @@ inline void * ggml_sycl_get_data_ptr(const ggml_tensor * tensor, int device) {
         bool   base_on_device       = false;
         bool   base_owned_elsewhere = false;
 
-        if (base->extra != nullptr && device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
+        if (base->extra != nullptr && ggml_sycl_valid_device_index(device)) {
             auto *       base_extra = static_cast<ggml_tensor_extra_gpu *>(base->extra);
             const auto & handle     = base_extra->data_handle[device];
             if (handle.device() == device || handle.device() == ggml_sycl::mem_handle::HOST_DEVICE) {
@@ -3694,7 +3707,7 @@ inline void * ggml_sycl_get_data_ptr(const ggml_tensor * tensor, int device) {
 
         if (base_ptr != nullptr) {
             void * ptr = static_cast<char *>(base_ptr) + view_offs;
-            if (tensor->extra != nullptr && device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
+            if (tensor->extra != nullptr && ggml_sycl_valid_device_index(device)) {
                 auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
                 extra->set_data_device(device, ptr, GGML_LAYOUT_AOS, base_on_device);
             }
@@ -3754,7 +3767,7 @@ inline void * ggml_sycl_resolve_tensor_ptr(const ggml_tensor * tensor, int devic
     // Fast path: smart handle resolve.  data_handle is populated during
     // S1-PRELOAD (weights via from_cache_id) and set_data_device (non-weights
     // via from_direct).  resolve() checks a generation counter in ~3ns.
-    if (tensor->view_src == nullptr && tensor->extra != nullptr && device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
+    if (tensor->view_src == nullptr && tensor->extra != nullptr && ggml_sycl_valid_device_index(device)) {
         auto * extra    = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
         auto   resolved = extra->data_handle[device].resolve(device);
         if (resolved) {
@@ -3849,7 +3862,7 @@ inline void * ggml_sycl_get_layout_ptr_impl(const ggml_tensor * tensor, int devi
     // Fast path: return cached resolved pointer if still valid.
     // This avoids all string hashing, mutex locks, and hash map lookups
     // on the hot path (every weight tensor, every op, every token).
-    if (tensor->extra != nullptr && device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
+    if (tensor->extra != nullptr && ggml_sycl_valid_device_index(device)) {
         auto *   extra       = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
         uint32_t current_gen = ggml_sycl_resolve_generation().load(std::memory_order_acquire);
         if (extra->resolved_ptr[device] != nullptr && extra->resolved_gen[device] == current_gen) {
@@ -3892,7 +3905,7 @@ inline void * ggml_sycl_get_layout_ptr_impl(const ggml_tensor * tensor, int devi
 
     // Helper: cache the resolved pointer on extra before returning.
     auto cache_and_return = [&](void * ptr) -> void * {
-        if (ptr && tensor->extra && device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
+        if (ptr && tensor->extra && ggml_sycl_valid_device_index(device)) {
             auto * extra = static_cast<ggml_tensor_extra_gpu *>(const_cast<ggml_tensor *>(tensor)->extra);
             extra->resolved_ptr[device] = ptr;
             extra->resolved_gen[device] = ggml_sycl_resolve_generation().load(std::memory_order_acquire);
@@ -4001,8 +4014,7 @@ inline ggml_sycl::resolved_ptr ggml_sycl_resolve(const ggml_tensor * tensor, int
     }
 
     const bool is_weight = ggml_sycl_tensor_is_weight(tensor);
-    if (!is_weight && tensor->view_src == nullptr && tensor->extra != nullptr && device >= 0 &&
-        device < GGML_SYCL_MAX_DEVICES) {
+    if (!is_weight && tensor->view_src == nullptr && tensor->extra != nullptr && ggml_sycl_valid_device_index(device)) {
         auto *       extra  = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
         const auto & handle = extra->data_handle[device];
         if (handle.device() == device || handle.device() == ggml_sycl::mem_handle::HOST_DEVICE) {
@@ -4020,7 +4032,7 @@ inline ggml_sycl::resolved_ptr ggml_sycl_resolve(const ggml_tensor * tensor, int
         // or as a DIRECT handle by set_data_device() for non-weight init paths.
         // The WEIGHT handle's resolve(device) compares cached generation vs global and
         // returns the cached pointer without any hash map lookup (~3 ns hot path).
-        if (tensor->extra != nullptr && device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
+        if (tensor->extra != nullptr && ggml_sycl_valid_device_index(device)) {
             auto *       extra  = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
             const auto & handle = extra->data_handle[device];
             if (const char * trace = std::getenv("GGML_SYCL_HANDLE_TRACE"); trace && std::atoi(trace) != 0) {
@@ -4119,7 +4131,7 @@ inline ggml_sycl::resolved_ptr ggml_sycl_resolve(const ggml_tensor * tensor, int
 // falls through to ggml_sycl_get_data_ptr_slow(), which may allocate and copy.
 inline ggml_sycl::resolved_ptr ggml_sycl_resolve_no_materialize(const ggml_tensor * tensor, int device) {
     ggml_sycl::resolved_ptr result{};
-    if (!tensor || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+    if (!tensor || !ggml_sycl_valid_device_index(device)) {
         return result;
     }
 
@@ -4224,7 +4236,7 @@ inline void ggml_sycl_chain_source_ready_events_if_needed(sycl::queue & q, const
 }
 
 inline void ggml_sycl_set_tensor_ready_event(ggml_tensor * tensor, int device, const sycl::event & event) {
-    if (!tensor || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+    if (!tensor || !ggml_sycl_valid_device_index(device)) {
         return;
     }
     ggml_tensor * cur = tensor;
