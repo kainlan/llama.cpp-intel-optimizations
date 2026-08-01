@@ -107,7 +107,19 @@ set(UI_ASSET_DEPENDS "${PROJECT_SOURCE_DIR}/scripts/ui-assets.cmake")
 # always-out-of-date edge this file exists to remove. Trading a never-rebuild
 # bug for an always-rebuild one is the worst move available; a plain directory
 # dependency adds no such edge (verified: the tree still reaches `no work to do`).
+# The watch has to be TWO levels, because POSIX updates a directory's mtime
+# only when entries change in THAT directory:
+#
+#   rm -rf dist              -> changes tools/ui's mtime       (caught by #1)
+#   rm dist/index.html       -> changes tools/ui/dist's mtime  (caught by #2)
+#
+# Watching only tools/ui leaves the second case declaring a file that no longer
+# exists, which is the same hard ninja error. Measured -- it reproduces exactly.
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}")
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/dist")
+    set_property(DIRECTORY APPEND PROPERTY
+        CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/dist")
+endif()
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/dist/index.html")
     list(APPEND UI_ASSET_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/dist/index.html")
 endif()
