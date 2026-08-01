@@ -198,29 +198,76 @@ static bool test_reset_preserves_leased_entry_and_remaps_id(sycl::queue & q) {
     return true;
 }
 
-// Stage one weight and leave the cache in the state a COMPLETED model load
-// leaves it in: the entry carries slot 0's ownership bit, live_model_mask_
-// carries it too, and no lease is outstanding -- in_use_count == 0.
+// ⚠️ Expected noise, not a failure: every unified_cache built after the first
+// in this process logs
 //
-// That last property is the whole subject of llama.cpp-0qlw. It is not a
-// contrivance to make the test convenient: it is the steady state of every
-// loaded model between graphs, because leases are taken and released around
-// each compute. Reading only in_use_count is what freed a live model's
-// weights, and staging-without-leasing is exactly how that state is reached.
-static bool stage_idle_owned_weight(ggml_sycl::unified_cache & cache,
-                                    sycl::queue &              q,
-                                    const ggml_sycl_cache_id & key,
-                                    std::vector<uint8_t> &     data,
-                                    const char *               what) {
-    auto staged =
-        cache.direct_stage_weight(key, data.data(), data.size(), data.size(), GGML_LAYOUT_SOA, nullptr, nullptr, &q);
-    if (!staged.ok || !staged.ptr) {
-        fprintf(stderr, "direct_stage_weight failed for %s\n", what);
+//   [VRAM-ARENA] Insufficient budget for single-chunk arena: 0.0 MB < tail ...
+//   [VRAM-ARENA] Failed on device 0, falling back to per-entry allocation
+//
+// The first cache reserves the arena and later ones see no budget left, so they
+// fall back to per-entry allocation. Each test below builds its own cache
+// deliberately -- sharing one would let note_model_load_end() tag a previous
+// test's entries and couple the results -- so the fallback is unavoidable here.
+//
+// It does not affect anything these tests assert. Every assertion is entries_
+// membership via is_cached(), and the reclaim decision in
+// weight_entry_reclaimable() reads only in_use_count, owner_mask and
+// owner_tagged; it never consults location, pool_allocated or pinned, which are
+// the fields the fallback changes. Staging still succeeds on the fallback path.
+// Recorded so a later reader does not chase it when some other assertion fails.
+
+// Produce a cache entry that is cached but IDLE -- in_use_count == 0 -- which
+// is the state llama.cpp-0qlw is entirely about: the steady state of every
+// loaded model's weights between graphs, because leases are taken and released
+// around each compute.
+//
+// ⚠️ Getting this right is harder than it looks, and getting it WRONG is what
+// made the first version of these tests vacuous. A freshly staged entry is NOT
+// idle. direct_stage_weight() calls make_direct_entry_handle(), which bumps
+// in_use_count and parks the resulting mem_handle in direct_weight_entries_,
+// so the entry reads in_use_count == 1 and the LEASE veto in
+// weight_entry_reclaimable() fires FIRST -- preserving the entry before
+// ownership is ever consulted. A live_mask mutation against such an entry
+// changes nothing, because live_mask is not what is doing the preserving.
+//
+// The way out, and there is no public API for it: direct_weight_entries_ is
+// keyed by IDENTITY ALONE, while entries_ is keyed by identity + layout. So
+// staging a SECOND layout under the same id overwrites the registry row,
+// destroys the first layout's handle and drops its lease -- leaving the FIRST
+// layout's entry cached and idle. These tests therefore assert on the AOS
+// sibling; the SOA sibling stays leased, which is also the realistic shape (a
+// hot layout in use alongside a cold one).
+//
+// This is the same displacement the lease-preserve test above already depends
+// on to get its AOS sibling reclaimed -- there it is incidental, here it is
+// load-bearing, so it is written down. If direct_weight_entries_ ever becomes
+// layout-keyed, these tests will start reporting leased=N and preserving for
+// the wrong reason. Re-derive the idle state then; do NOT relax the assertions
+// to match, because a test that preserves for the wrong reason still passes.
+static bool stage_with_idle_aos_sibling(ggml_sycl::unified_cache & cache,
+                                        sycl::queue &              q,
+                                        const ggml_sycl_cache_id & key,
+                                        std::vector<uint8_t> &     data,
+                                        const char *               what) {
+    auto aos =
+        cache.direct_stage_weight(key, data.data(), data.size(), data.size(), GGML_LAYOUT_AOS, nullptr, nullptr, &q);
+    if (!aos.ok || !aos.ptr) {
+        fprintf(stderr, "direct_stage_weight(AOS) failed for %s\n", what);
         return false;
     }
-    staged.event.wait();
-    if (!cache.is_cached(key, GGML_LAYOUT_SOA)) {
-        fprintf(stderr, "%s was not cached after direct_stage_weight\n", what);
+    aos.event.wait();
+
+    // Displaces the AOS registry row, dropping AOS's lease.
+    auto soa =
+        cache.direct_stage_weight(key, data.data(), data.size(), data.size(), GGML_LAYOUT_SOA, nullptr, nullptr, &q);
+    if (!soa.ok || !soa.ptr) {
+        fprintf(stderr, "direct_stage_weight(SOA) failed for %s\n", what);
+        return false;
+    }
+    soa.event.wait();
+
+    if (!cache.is_cached(key, GGML_LAYOUT_AOS) || !cache.is_cached(key, GGML_LAYOUT_SOA)) {
+        fprintf(stderr, "%s: expected both layout siblings cached before the reset\n", what);
         return false;
     }
     return true;
@@ -267,7 +314,7 @@ static bool test_live_model_idle_weights_survive_load_boundary(sycl::queue & q) 
     std::vector<uint8_t>     data(128, 0x5a);
     ggml_sycl_cache_id       key = ggml_sycl::test_make_cache_id(data.data());
 
-    if (!stage_idle_owned_weight(cache, q, key, data, "the live model's weight")) {
+    if (!stage_with_idle_aos_sibling(cache, q, key, data, "the live model's weight")) {
         return false;
     }
 
@@ -278,8 +325,8 @@ static bool test_live_model_idle_weights_survive_load_boundary(sycl::queue & q) 
                 cache.live_model_mask());
         return false;
     }
-    if (cache.owner_tagged_entry_count() != 1) {
-        fprintf(stderr, "expected exactly 1 owner-tagged entry after load end, got %zu\n",
+    if (cache.owner_tagged_entry_count() != 2) {
+        fprintf(stderr, "expected both layout siblings owner-tagged after load end, got %zu\n",
                 cache.owner_tagged_entry_count());
         return false;
     }
@@ -287,7 +334,10 @@ static bool test_live_model_idle_weights_survive_load_boundary(sycl::queue & q) 
     // --- GREEN: the load boundary for a second model ---
     cache.reset_model_weight_entries(ggml_sycl::weight_reclaim_mode::LOAD_BOUNDARY);
 
-    if (!cache.is_cached(key, GGML_LAYOUT_SOA)) {
+    // The AOS sibling is the idle one (see stage_with_idle_aos_sibling): no
+    // lease, so ONLY owner_mask can be preserving it. That is what makes this
+    // assertion about the fix rather than about the lease veto.
+    if (!cache.is_cached(key, GGML_LAYOUT_AOS)) {
         fprintf(stderr,
                 "FAIL: a live model's IDLE weight was freed at another model's load boundary.\n"
                 "      This is llama.cpp-0qlw: in_use_count == 0 means 'nobody is resolving\n"
@@ -316,12 +366,14 @@ static bool test_live_model_idle_weights_survive_load_boundary(sycl::queue & q) 
 
     cache.reset_model_weight_entries(ggml_sycl::weight_reclaim_mode::LOAD_BOUNDARY);
 
-    if (cache.is_cached(key, GGML_LAYOUT_SOA)) {
+    if (cache.is_cached(key, GGML_LAYOUT_AOS)) {
         fprintf(stderr,
                 "FAIL (mutation control): the entry ALSO survived with live_mask == 0, so no\n"
                 "      live model owned it and nothing held a lease. The preserve above is\n"
                 "      therefore not evidence of anything -- the reclaim path is a no-op on\n"
-                "      this input and the GREEN phase would pass against a deleted predicate.\n");
+                "      this input and the GREEN phase would pass against a deleted predicate.\n"
+                "      If the teardown line reports leased=1 for this entry, the setup failed\n"
+                "      to make it idle -- see stage_with_idle_aos_sibling.\n");
         return false;
     }
     if (!cache.validate()) {
@@ -356,28 +408,30 @@ static bool test_replan_frees_own_staging_but_spares_a_live_model(sycl::queue & 
     ggml_sycl_cache_id       key_live    = ggml_sycl::test_make_cache_id(data_live.data());
     ggml_sycl_cache_id       key_loading = ggml_sycl::test_make_cache_id(data_loading.data());
 
-    // Model A loads and completes -- its entry becomes owned and tagged.
-    if (!stage_idle_owned_weight(cache, q, key_live, data_live, "the live model's weight")) {
+    // Model A loads and completes -- its entries become owned and tagged.
+    if (!stage_with_idle_aos_sibling(cache, q, key_live, data_live, "the live model's weight")) {
         return false;
     }
     cache.note_model_load_end(0);
 
-    // Model B is MID-LOAD: it stages after A's load end, so its entry is
+    // Model B is MID-LOAD: it stages after A's load end, so its entries are
     // untagged. This ordering is load-bearing -- note_model_load_end() claims
     // every entry present when it runs, so staging B first would tag it too.
-    if (!stage_idle_owned_weight(cache, q, key_loading, data_loading, "the loading model's staging")) {
+    if (!stage_with_idle_aos_sibling(cache, q, key_loading, data_loading, "the loading model's staging")) {
         return false;
     }
 
     cache.reset_model_weight_entries(ggml_sycl::weight_reclaim_mode::MID_LOAD_REPLAN);
 
-    if (!cache.is_cached(key_live, GGML_LAYOUT_SOA)) {
+    // Both assertions are on the IDLE AOS siblings, so neither outcome can be
+    // explained by the lease veto -- ownership is the only thing separating them.
+    if (!cache.is_cached(key_live, GGML_LAYOUT_AOS)) {
         fprintf(stderr,
-                "FAIL: a replan freed a LIVE model's weight. Ownership must veto reclaim in\n"
-                "      every mode; only UNATTRIBUTED entries are the replan's to free.\n");
+                "FAIL: a replan freed a LIVE model's IDLE weight. Ownership must veto reclaim\n"
+                "      in every mode; only UNATTRIBUTED entries are the replan's to free.\n");
         return false;
     }
-    if (cache.is_cached(key_loading, GGML_LAYOUT_SOA)) {
+    if (cache.is_cached(key_loading, GGML_LAYOUT_AOS)) {
         fprintf(stderr,
                 "FAIL: the replan did NOT free the in-flight load's own unattributed staging.\n"
                 "      That is this call site's entire purpose -- keeping these entries and\n"
@@ -410,21 +464,21 @@ static bool test_load_boundary_keeps_unattributed_while_a_model_is_live(sycl::qu
     ggml_sycl_cache_id       key_live    = ggml_sycl::test_make_cache_id(data_live.data());
     ggml_sycl_cache_id       key_runtime = ggml_sycl::test_make_cache_id(data_runtime.data());
 
-    if (!stage_idle_owned_weight(cache, q, key_live, data_live, "the live model's weight")) {
+    if (!stage_with_idle_aos_sibling(cache, q, key_live, data_live, "the live model's weight")) {
         return false;
     }
     cache.note_model_load_end(0);
-    if (!stage_idle_owned_weight(cache, q, key_runtime, data_runtime, "the runtime-materialized entry")) {
+    if (!stage_with_idle_aos_sibling(cache, q, key_runtime, data_runtime, "the runtime-materialized entry")) {
         return false;
     }
 
     cache.reset_model_weight_entries(ggml_sycl::weight_reclaim_mode::LOAD_BOUNDARY);
 
-    if (!cache.is_cached(key_live, GGML_LAYOUT_SOA)) {
-        fprintf(stderr, "FAIL: the live model's owned weight was freed at a load boundary\n");
+    if (!cache.is_cached(key_live, GGML_LAYOUT_AOS)) {
+        fprintf(stderr, "FAIL: the live model's owned IDLE weight was freed at a load boundary\n");
         return false;
     }
-    if (!cache.is_cached(key_runtime, GGML_LAYOUT_SOA)) {
+    if (!cache.is_cached(key_runtime, GGML_LAYOUT_AOS)) {
         fprintf(stderr,
                 "FAIL: an unattributed entry was freed at a load boundary while a model is\n"
                 "      still live. Unattributed means 'cannot be attributed', not 'unowned';\n"
@@ -441,7 +495,7 @@ static bool test_load_boundary_keeps_unattributed_while_a_model_is_live(sycl::qu
     // reclaimable. Without this the assertion above is satisfied by a no-op.
     cache.set_live_model_mask(0);
     cache.reset_model_weight_entries(ggml_sycl::weight_reclaim_mode::LOAD_BOUNDARY);
-    if (cache.is_cached(key_runtime, GGML_LAYOUT_SOA)) {
+    if (cache.is_cached(key_runtime, GGML_LAYOUT_AOS)) {
         fprintf(stderr,
                 "FAIL (control): the unattributed entry survived with NO model live, so it is\n"
                 "      retained unconditionally rather than for the reason claimed.\n");
