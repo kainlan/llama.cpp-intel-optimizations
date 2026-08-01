@@ -78739,6 +78739,10 @@ static void ggml_sycl_check_graph_scratch_headroom(int device) {
     constexpr size_t non_arena_min_external_headroom = 512ull * 1024ull * 1024ull;
     constexpr size_t arena_min_external_headroom     = 256ull * 1024ull * 1024ull;
     constexpr size_t arena_min_scratch_capacity      = 512ull * 1024ull * 1024ull;
+    // Bounded wait for a concurrent context's SCRATCH-zone holder to release --
+    // see the comment at the retry loop below. 400 * 5ms = 2s max.
+    constexpr int                       scratch_wait_attempts           = 400;
+    constexpr std::chrono::milliseconds scratch_wait_step{ 5 };
 
     size_t free_vram  = 0;
     size_t total_vram = 0;
@@ -78747,7 +78751,7 @@ static void ggml_sycl_check_graph_scratch_headroom(int device) {
     auto * cache = ggml_sycl::get_unified_cache_for_device(device);
     if (cache && cache->arena_active()) {
         const size_t scratch_capacity  = cache->compute_arena_capacity();
-        const size_t scratch_available = cache->zone_available(ggml_sycl::vram_zone_id::SCRATCH);
+        size_t       scratch_available = cache->zone_available(ggml_sycl::vram_zone_id::SCRATCH);
         GGML_SYCL_DEBUG("[GRAPH-COMPUTE] device %d arena scratch=%.1f/%.1f MB external_free=%.1f MB / total=%.1f MB\n",
                         device, scratch_available / (1024.0 * 1024.0), scratch_capacity / (1024.0 * 1024.0),
                         free_vram / (1024.0 * 1024.0), total_vram / (1024.0 * 1024.0));
@@ -78759,10 +78763,40 @@ static void ggml_sycl_check_graph_scratch_headroom(int device) {
             GGML_ABORT("[GRAPH-COMPUTE] insufficient arena scratch capacity before graph launch");
         }
         if (scratch_available < arena_min_scratch_capacity) {
+            // A concurrent context on this same physical device can legitimately
+            // hold live SCRATCH-zone allocations here -- e.g. get_rows's scoped
+            // device-temp allocation (getrows.cpp, cohort "get_rows:seq_device")
+            // -- while THIS context's graph launch reaches its boundary reset.
+            // zone_reset() (called via unified_cache_arena_reset() above) correctly
+            // *refuses* to reclaim a zone that still has live registered
+            // allocations rather than resetting the shared allocator out from
+            // under that owner (see CLAUDE.md "SYCL Memory Ownership"), so seeing
+            // this short is not by itself evidence of a leak. test-thread-safety
+            // runs several contexts per device concurrently, so this refusal is
+            // reachable in ordinary, correct operation -- not just when memory is
+            // actually stuck. Give the other holder a bounded window to finish its
+            // op and release its handle (its per-allocation zone_free() runs
+            // independently of this loop, via the retained-handle drain worker),
+            // and keep re-attempting the same refusal-respecting reset in case it
+            // succeeds once that holder is gone. Never widen this to forcing the
+            // reset, downgrading the refusal to a warning, or reclaiming a live
+            // handle -- that would reintroduce the use-after-free the refusal
+            // exists to prevent.
+            for (int attempt = 0; attempt < scratch_wait_attempts && scratch_available < arena_min_scratch_capacity;
+                 attempt++) {
+                std::this_thread::sleep_for(scratch_wait_step);
+                ggml_sycl::unified_cache_arena_reset(device);
+                scratch_available = cache->zone_available(ggml_sycl::vram_zone_id::SCRATCH);
+            }
+        }
+        if (scratch_available < arena_min_scratch_capacity) {
             GGML_LOG_WARN(
-                "[GRAPH-COMPUTE] device %d arena scratch zone not reset: available=%.1f MB target=%.1f MB. "
-                "Aborting before graph launch; scratch ownership must be released before reset.\n",
-                device, scratch_available / (1024.0 * 1024.0), arena_min_scratch_capacity / (1024.0 * 1024.0));
+                "[GRAPH-COMPUTE] device %d arena scratch zone not reset after waiting up to %lld ms: available=%.1f "
+                "MB target=%.1f MB. Aborting before graph launch; scratch ownership must be released before "
+                "reset.\n",
+                device,
+                static_cast<long long>(scratch_wait_attempts) * static_cast<long long>(scratch_wait_step.count()),
+                scratch_available / (1024.0 * 1024.0), arena_min_scratch_capacity / (1024.0 * 1024.0));
             ggml_sycl::unified_cache_dump_live_zone_allocations(device, ggml_sycl::vram_zone_id::SCRATCH,
                                                                 "graph-scratch-headroom");
             GGML_ABORT("[GRAPH-COMPUTE] arena scratch unavailable before graph launch");
