@@ -529,6 +529,24 @@ if (NOT WIN32)
         TIMEOUT 120
     )
 
+    # Coverage gate for src/CMakeLists.txt's add_library(llama ...) source
+    # list: every tracked top-level src/*.cpp must appear in it (src/models/
+    # is exempted -- it is covered by a `file(GLOB ...)`, checked separately
+    # by the same script). llama.cpp-habh: an upstream-merge conflict
+    # resolution (ff333a570) silently dropped four fork-local modules from
+    # this list -- they kept compiling into stale build trees for months
+    # (build-13qq, build_no_f16) while HEAD's own build silently linked
+    # without them. A source present on disk but absent from the build fails
+    # at LINK time in whatever *test* happens to need its symbols, which
+    # names the wrong culprit -- see this script's module docstring.
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-src-cmake-coverage.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "build;policy"
+        TIMEOUT 60
+    )
+
     # Gate for the single _gzip exclusion predicate in tools/ui/CMakeLists.txt,
     # which is consumed by both list(FILTER ... REGEX) and if(... MATCHES). It
     # was two hand-written patterns and they drifted, so a real directory merely
@@ -1450,26 +1468,17 @@ set_tests_properties(test-sycl-model-shapes PROPERTIES LABELS "main;sycl;shapes"
 # The golden files are the assertion -- without them the test has nothing to
 # compare against -- and both are present in tests/golden/.
 #
-# src/llama-tensor-class.cpp is compiled INTO the test target, which the
-# original block did not need to do. It is needed now because that translation
-# unit is no longer built into the llama library at all: 3c8f296fd's
-# src/CMakeLists.txt listed `llama-tensor-class.cpp` (line 37) and HEAD's does
-# not, so the restored test failed to link on llama_tensor_classify,
-# llama_tensor_class_name, llama_tensor_priority_name and
-# llama_tensor_priority_for. Compiling the source into the test is the same
-# arrangement 3c8f296fd used for test-kv-block, so it is in-idiom rather than a
-# workaround, and it keeps this restoration self-contained.
-#
-# ⚠️ It does NOT fix the underlying gap, and that gap is wider than this test:
-# llama-tensor-class.cpp, llama-kv-block.cpp, llama-moe-profile.cpp and
-# llama-pp-scheduler.cpp are ALL absent from HEAD's src/CMakeLists.txt while
-# still present and tracked in src/. Stale build trees (build-13qq,
-# build_no_f16) still contain objects for three of them, which is the evidence
-# they used to be compiled. So the classifier this test now covers is, at HEAD,
-# dead code that nothing in the library links -- the test proves the module
-# still behaves, not that anything uses it. Tracked separately; src/ is not
-# this ticket's path.
-llama_build_and_test(test-tensor-class.cpp ${PROJECT_SOURCE_DIR}/src/llama-tensor-class.cpp
+# llama.cpp-habh fixed the underlying gap this comment used to describe:
+# llama-tensor-class.cpp, llama-kv-block.cpp, llama-pp-scheduler.cpp and
+# llama-moe-profile.cpp are back in src/CMakeLists.txt's add_library(llama ...)
+# list (dropped by ff333a570's upstream-merge conflict resolution on the first
+# three; never added at all for the fourth). test-tensor-class now links the
+# classifier from libllama like every other test, instead of separately
+# compiling src/llama-tensor-class.cpp into the test binary -- keeping that
+# workaround after the fix landed would risk two definitions of
+# llama_tensor_classify et al. reaching the same executable.
+# tests/test-src-cmake-coverage.py guards against this regressing again.
+llama_build_and_test(test-tensor-class.cpp
     ARGS ${CMAKE_CURRENT_SOURCE_DIR}/golden/place2-mistral7b.txt
          ${CMAKE_CURRENT_SOURCE_DIR}/golden/place2-gpt-oss-20b.txt)
 target_include_directories(test-tensor-class PRIVATE ${PROJECT_SOURCE_DIR}/src)

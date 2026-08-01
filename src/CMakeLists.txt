@@ -26,16 +26,20 @@ add_library(llama
             llama-kv-cache-iswa.cpp
             llama-kv-cache-dsa.cpp
             llama-kv-cache-dsv4.cpp
+            llama-kv-block.cpp
             llama-memory.cpp
             llama-memory-hybrid.cpp
             llama-memory-hybrid-iswa.cpp
             llama-memory-recurrent.cpp
+            llama-pp-scheduler.cpp
             llama-mmap.cpp
             llama-model-loader.cpp
             llama-model-saver.cpp
             llama-model.cpp
+            llama-moe-profile.cpp
             llama-quant.cpp
             llama-sampler.cpp
+            llama-tensor-class.cpp
             llama-vocab.cpp
             unicode-data.cpp
             unicode.cpp

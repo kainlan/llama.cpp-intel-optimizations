@@ -298,7 +298,7 @@ void llama_moe_profiler::init(const struct llama_hparams & hparams) {
         return;
     }
 
-    profile.init(hparams.n_layer, hparams.n_expert, hparams.n_expert_used);
+    profile.init(hparams.n_layer(), hparams.n_expert, hparams.n_expert_used);
     read_buffer.reserve(4096 * hparams.n_expert_used); // pre-allocate for typical batch
 }
 
