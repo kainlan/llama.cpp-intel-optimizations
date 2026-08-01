@@ -1550,10 +1550,6 @@ static void unified_cache_atexit_handler() {
     g_sycl_shutting_down.store(true, std::memory_order_release);
 }
 
-// Forward declarations needed by unified_cache constructor (defined later in file)
-static size_t get_total_system_memory_bytes();
-static size_t get_available_system_memory_bytes();
-
 bool ggml_sycl_is_shutting_down() {
     return g_sycl_shutting_down.load(std::memory_order_acquire);
 }
@@ -1672,8 +1668,8 @@ unified_cache::unified_cache(sycl::queue & queue,
         size_t available_mem   = 0;
         size_t os_reserve      = 0;
         if (host_mem_budget == 0) {
-            total_mem     = get_total_system_memory_bytes();
-            available_mem = get_available_system_memory_bytes();
+            total_mem     = ggml_sycl_get_total_system_memory_bytes();
+            available_mem = ggml_sycl_get_available_system_memory_bytes();
             int pct       = g_unified_cache_host_budget_pct;
             if (pct < 1) {
                 pct = 1;
@@ -2275,56 +2271,10 @@ static uint64_t compute_content_hash(const void * data, size_t size) {
     return hash;
 }
 
-static size_t get_total_system_memory_bytes() {
-#if defined(_WIN32)
-    MEMORYSTATUSEX status;
-    status.dwLength = sizeof(status);
-    if (GlobalMemoryStatusEx(&status)) {
-        return static_cast<size_t>(status.ullTotalPhys);
-    }
-    return 0;
-#else
-    long pages     = sysconf(_SC_PHYS_PAGES);
-    long page_size = sysconf(_SC_PAGE_SIZE);
-    if (pages <= 0 || page_size <= 0) {
-        return 0;
-    }
-    return static_cast<size_t>(pages) * static_cast<size_t>(page_size);
-#endif
-}
-
-static size_t get_available_system_memory_bytes() {
-#if defined(_WIN32)
-    MEMORYSTATUSEX status;
-    status.dwLength = sizeof(status);
-    if (GlobalMemoryStatusEx(&status)) {
-        return static_cast<size_t>(status.ullAvailPhys);
-    }
-    return 0;
-#else
-    FILE * f = std::fopen("/proc/meminfo", "r");
-    if (f) {
-        char               key[64]  = {};
-        char               unit[32] = {};
-        unsigned long long value_kb = 0;
-        while (std::fscanf(f, "%63s %llu %31s", key, &value_kb, unit) == 3) {
-            if (std::strcmp(key, "MemAvailable:") == 0) {
-                std::fclose(f);
-                return static_cast<size_t>(value_kb) * 1024ULL;
-            }
-        }
-        std::fclose(f);
-    }
-#    ifdef _SC_AVPHYS_PAGES
-    long pages     = sysconf(_SC_AVPHYS_PAGES);
-    long page_size = sysconf(_SC_PAGE_SIZE);
-    if (pages > 0 && page_size > 0) {
-        return static_cast<size_t>(pages) * static_cast<size_t>(page_size);
-    }
-#    endif
-    return 0;
-#endif
-}
+// get_total_system_memory_bytes() / get_available_system_memory_bytes() moved
+// to ggml_sycl_get_total_system_memory_bytes() / ggml_sycl_get_available_system_memory_bytes()
+// in common.cpp so ggml-sycl.cpp's placement-plan budget path can share the
+// same implementation (see llama.cpp-403s).
 
 static bool is_host_accessible_ptr(const void * ptr, const sycl::queue & queue) {
     if (!ptr) {
@@ -8547,6 +8497,18 @@ static unified_cache * create_cache_for_device(int                     device_id
         if (base_mem == 0) {
             base_mem = total_mem > 0 ? total_mem : free_mem;
         }
+
+        // Host-unified (integrated) GPUs report system RAM as their
+        // "global memory" -- taking a percentage of that for the VRAM arena
+        // reservation below claims memory the host needs too (llama.cpp-403s:
+        // an Arrow Lake-S iGPU reporting 231.7 GB drove a ~180 GB single-chunk
+        // arena malloc, landing in TTM shmem, for a 19 MB model). Query the
+        // device directly rather than via ggml_sycl_info() -- this path can
+        // run during ggml_sycl_info()'s own static initialization (see the
+        // query_device_memory_no_info() comment above), so touching that
+        // global here would risk the same reentrant deadlock it avoids.
+        const bool host_unified = ggml_sycl_device_is_host_unified(queue.get_device());
+        base_mem                = ggml_sycl_vram_budget_base_mem(host_unified, base_mem);
 
         int          pct     = g_unified_cache_budget_pct;
         // Allow env var override for testing host fallback paths
