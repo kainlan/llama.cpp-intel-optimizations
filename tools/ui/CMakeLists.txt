@@ -135,7 +135,20 @@ if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/dist/index.html")
     # always-dirty defect this file exists to remove. Measured: the run that
     # first creates _gzip does move dist/'s mtime and costs one extra
     # reconfigure; that is bounded and acceptable, a per-build rebuild is not.
-    list(FILTER UI_DIST_FILES EXCLUDE REGEX "/dist/_gzip/")
+    #
+    # ONE pattern, used at BOTH exclusion sites below. It was two patterns in
+    # two syntaxes ("/dist/_gzip/" for the file filter, "/dist/_gzip" for the
+    # directory guard) and they drifted: `MATCHES` is an unanchored substring
+    # test, so the directory guard also dropped any real directory merely
+    # BEGINNING "_gzip" -- dist/_gzipfoo/ was silently unwatched while its
+    # files stayed declared, reopening both the content and the hard-failure
+    # axes at once. `(/|$)` makes one expression correct for both: it matches
+    # a file under _gzip/, and the _gzip directory itself, and neither for
+    # _gzipfoo. Verified by driving both sites with the same six inputs
+    # (cmake -P); do not re-split it.
+    set(UI_DIST_GZIP_EXCLUDE "/dist/_gzip(/|$)")
+
+    list(FILTER UI_DIST_FILES EXCLUDE REGEX "${UI_DIST_GZIP_EXCLUDE}")
     list(APPEND UI_ASSET_DEPENDS ${UI_DIST_FILES})
 
     # Watching only dist/ catches entries added or removed directly in dist/,
@@ -153,20 +166,48 @@ if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/dist/index.html")
     file(GLOB_RECURSE UI_DIST_ENTRIES LIST_DIRECTORIES true
          "${CMAKE_CURRENT_SOURCE_DIR}/dist/*")
     foreach(entry ${UI_DIST_ENTRIES})
-        if (IS_DIRECTORY "${entry}" AND NOT entry MATCHES "/dist/_gzip")
+        if (IS_DIRECTORY "${entry}" AND NOT entry MATCHES "${UI_DIST_GZIP_EXCLUDE}")
             set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${entry}")
         endif()
     endforeach()
 endif()
 
-# Axes closed, and the ones knowingly left open. Four rounds of this fix each
-# closed the axis in front of it and left the next one narrow, so the inventory
-# is written down rather than remembered:
+# Axis inventory. Six rounds of this fix each closed the axis in front of it
+# and left the next one narrow, so it is written down rather than remembered.
 #
-#   CLOSED  direction        create vs delete of dist/        (CONFIGURE_DEPENDS on tools/ui)
-#   CLOSED  granularity      dist/ vs a file inside it        (CONFIGURE_DEPENDS on dist/)
-#   CLOSED  content          every embedded asset, not just index.html (GLOB_RECURSE)
-#   CLOSED  depth            add/remove at any depth under dist/       (per-directory watch)
+# Round six was a row of THIS TABLE asserting a closure that had never been
+# tested ("depth ... at any depth"), which is worse than no inventory: it tells
+# the next reader not to check the one thing that is broken. So every CLOSED
+# row below names the test that was actually run. A row whose evidence is
+# "reasoned about it" is not CLOSED and does not belong in that half.
+#
+#   CLOSED  direction     create vs delete of dist/
+#           mechanism     CONFIGURE_DEPENDS on tools/ui
+#           test          create dist/ -> "Re-running CMake"; rm -rf dist/ -> same
+#
+#   CLOSED  granularity   dist/ itself vs a file inside it
+#           mechanism     CONFIGURE_DEPENDS on dist/
+#           test          rm dist/index.html (dist/ left in place) -> "Re-running CMake"
+#
+#   CLOSED  content       every embedded asset, not only index.html
+#           mechanism     GLOB_RECURSE into UI_ASSET_DEPENDS
+#           test          touch dist/_app/immutable/bundle.CD8EIUIV.js -> stamp
+#                         rescheduled 0 -> 1, and ninja explain NAMES that file
+#
+#   CLOSED  depth         add/remove below the first level under dist/,
+#                         EXCEPT inside dist/_gzip, which is deliberately
+#                         excluded as generated output (see above)
+#           mechanism     per-directory CONFIGURE_DEPENDS over dist/**
+#           test          add a file two levels down -> "Re-running CMake",
+#                         declared after; remove it -> same, undeclared, no
+#                         "missing and no known rule" error
+#
+#   CLOSED  exclusion     the _gzip exclusion matches _gzip and not _gzipfoo,
+#                         identically at both sites
+#           mechanism     single UI_DIST_GZIP_EXCLUDE pattern, used twice
+#           test          cmake -P driving BOTH sites with the same six inputs
+#                         (file and dir x _gzip/_gzipfoo/_app); RED reproduced
+#                         the drift first, GREEN is 0 failures
 #
 #   OPEN    npm cold start   a first-ever `node_modules` install could create a
 #                            top-level entry under tools/ui and fire one extra
