@@ -511,29 +511,35 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
     # arrangement in which these tests test the shipped code.
 
     # Options for the eight targets that compile unified-kernel.cpp as their own
-    # TU. Identical to XMX_TEST_SYCL_OPTIONS except that the AOT target list is
-    # dropped: plain -fsycl, so no ocloc device compile happens at build time
-    # and the kernels are compiled at first run instead. That containment is
-    # what makes GGML_SYCL_BUILD_XMX_TESTS=ON affordable to turn on at all --
-    # unified-kernel.cpp is ~12,700 lines of SYCL and AOT-compiling it eight
-    # times dominates the entire build. The shape is 7881f453d's, worked out
-    # for the two tests it relocated; it applies for the same reason here.
+    # TU. This is XMX_TEST_SYCL_OPTIONS plus the two split-barrier translator
+    # requests, collected so the eight stay identical.
     #
-    # The split-barrier SPIR-V extension is still requested, but only for
-    # spir64: without the AOT target there is no bmg_g21 image to translate,
-    # and passing -Xspirv-translator=intel_gpu_bmg_g21 alongside it names a
-    # target that no longer exists in -fsycl-targets.
+    # ⚠️ AOT IS REQUIRED HERE. Do not "contain the cost" by dropping the target
+    # list, however tempting the arithmetic is -- unified-kernel.cpp is ~12,700
+    # lines of SYCL and ocloc-compiling it eight times really does dominate the
+    # build. It was tried, and it produces a test binary that builds, links and
+    # then dies at run time:
     #
-    # If a future change makes one of these tests need AOT (measuring codegen
-    # rather than behaviour), give that ONE target XMX_TEST_SYCL_OPTIONS back
-    # rather than changing this variable -- no-device-compile-at-build-time is
-    # the whole reason the option is usable.
-    set(SYCL_JIT_DEVICE_TEST_OPTIONS
-        "-fsycl"
-        "-Wno-narrowing"
-    )
-    set(SYCL_JIT_DEVICE_TEST_LINK_OPTIONS
-        ${SYCL_JIT_DEVICE_TEST_OPTIONS}
+    #   test-esimd-prefetch, test_slm_capacity_max_tile:
+    #   sycl::exception: No device image found for external symbol
+    #   ggml_sycl_unified::unified_matmul_xmx_kernel_impl<8,16,32>
+    #   (thrown from launch_unified_matmul; SIGABRT, core dumped)
+    #
+    # Measured 2026-08-01 on the B50, JIT vs AOT, same sources and the same
+    # libggml-sycl.so: JIT aborts at test 6 of 8; AOT passes 8 of 8. The cause
+    # is the mismatch, not JIT as such. These targets link libggml-sycl, whose
+    # device images are AOT, while their own would be JIT -- and a device symbol
+    # defined in one image is not resolvable from the other. Every target here
+    # links that library, so the whole set has to match it.
+    #
+    # This is also a live hazard in 7881f453d, which relocated two of these
+    # tests JIT-only and recorded "NOT YET VERIFIED: neither target has been
+    # compiled in this configuration and neither has been run". The
+    # configuration does not work.
+    set(SYCL_UNIFIED_KERNEL_TEST_OPTIONS ${XMX_TEST_SYCL_OPTIONS})
+    set(SYCL_UNIFIED_KERNEL_TEST_LINK_OPTIONS
+        ${XMX_TEST_SYCL_OPTIONS}
+        "SHELL:-Xspirv-translator=intel_gpu_bmg_g21 -spirv-ext=+SPV_INTEL_split_barrier"
         "SHELL:-Xspirv-translator=spir64 -spirv-ext=+SPV_INTEL_split_barrier"
     )
 
@@ -768,8 +774,8 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         ${CMAKE_CURRENT_SOURCE_DIR}/..
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     )
-    target_compile_options(test-unified-kernel PRIVATE ${SYCL_JIT_DEVICE_TEST_OPTIONS})
-    target_link_options(test-unified-kernel PRIVATE ${SYCL_JIT_DEVICE_TEST_LINK_OPTIONS})
+    target_compile_options(test-unified-kernel PRIVATE ${SYCL_UNIFIED_KERNEL_TEST_OPTIONS})
+    target_link_options(test-unified-kernel PRIVATE ${SYCL_UNIFIED_KERNEL_TEST_LINK_OPTIONS})
     target_compile_definitions(test-unified-kernel PRIVATE
         GGML_SYCL_WARP_SIZE=32
         GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
@@ -795,8 +801,8 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         ${CMAKE_CURRENT_SOURCE_DIR}/..
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     )
-    target_compile_options(test-xmx-compute PRIVATE ${SYCL_JIT_DEVICE_TEST_OPTIONS})
-    target_link_options(test-xmx-compute PRIVATE ${SYCL_JIT_DEVICE_TEST_LINK_OPTIONS})
+    target_compile_options(test-xmx-compute PRIVATE ${SYCL_UNIFIED_KERNEL_TEST_OPTIONS})
+    target_link_options(test-xmx-compute PRIVATE ${SYCL_UNIFIED_KERNEL_TEST_LINK_OPTIONS})
     target_compile_definitions(test-xmx-compute PRIVATE
         GGML_SYCL_WARP_SIZE=32
         GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
@@ -822,8 +828,8 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         ${CMAKE_CURRENT_SOURCE_DIR}/..
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     )
-    target_compile_options(test-xmx-default-enable PRIVATE ${SYCL_JIT_DEVICE_TEST_OPTIONS})
-    target_link_options(test-xmx-default-enable PRIVATE ${SYCL_JIT_DEVICE_TEST_LINK_OPTIONS})
+    target_compile_options(test-xmx-default-enable PRIVATE ${SYCL_UNIFIED_KERNEL_TEST_OPTIONS})
+    target_link_options(test-xmx-default-enable PRIVATE ${SYCL_UNIFIED_KERNEL_TEST_LINK_OPTIONS})
     target_compile_definitions(test-xmx-default-enable PRIVATE
         GGML_SYCL_WARP_SIZE=32
         GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
@@ -849,8 +855,8 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         ${CMAKE_CURRENT_SOURCE_DIR}/..
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     )
-    target_compile_options(test-xmx-optimization PRIVATE ${SYCL_JIT_DEVICE_TEST_OPTIONS})
-    target_link_options(test-xmx-optimization PRIVATE ${SYCL_JIT_DEVICE_TEST_LINK_OPTIONS})
+    target_compile_options(test-xmx-optimization PRIVATE ${SYCL_UNIFIED_KERNEL_TEST_OPTIONS})
+    target_link_options(test-xmx-optimization PRIVATE ${SYCL_UNIFIED_KERNEL_TEST_LINK_OPTIONS})
     target_compile_definitions(test-xmx-optimization PRIVATE
         GGML_SYCL_WARP_SIZE=32
         GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
@@ -876,8 +882,8 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         ${CMAKE_CURRENT_SOURCE_DIR}/..
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     )
-    target_compile_options(test-xmx-config PRIVATE ${SYCL_JIT_DEVICE_TEST_OPTIONS})
-    target_link_options(test-xmx-config PRIVATE ${SYCL_JIT_DEVICE_TEST_LINK_OPTIONS})
+    target_compile_options(test-xmx-config PRIVATE ${SYCL_UNIFIED_KERNEL_TEST_OPTIONS})
+    target_link_options(test-xmx-config PRIVATE ${SYCL_UNIFIED_KERNEL_TEST_LINK_OPTIONS})
     target_compile_definitions(test-xmx-config PRIVATE
         GGML_SYCL_WARP_SIZE=32
         GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
@@ -934,8 +940,8 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         ${CMAKE_CURRENT_SOURCE_DIR}/..
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     )
-    target_compile_options(test-esimd-prefetch PRIVATE ${SYCL_JIT_DEVICE_TEST_OPTIONS})
-    target_link_options(test-esimd-prefetch PRIVATE ${SYCL_JIT_DEVICE_TEST_LINK_OPTIONS})
+    target_compile_options(test-esimd-prefetch PRIVATE ${SYCL_UNIFIED_KERNEL_TEST_OPTIONS})
+    target_link_options(test-esimd-prefetch PRIVATE ${SYCL_UNIFIED_KERNEL_TEST_LINK_OPTIONS})
     # XMX_TEST_STANDALONE stays: that one is xmx-esimd-common.hpp's own switch
     # and is unrelated to the retired UNIFIED_KERNEL_TEST_STANDALONE.
     target_compile_definitions(test-esimd-prefetch PRIVATE
@@ -1006,8 +1012,8 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         ${CMAKE_CURRENT_SOURCE_DIR}/..
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     )
-    target_compile_options(test-unified-kernel-ops PRIVATE ${SYCL_JIT_DEVICE_TEST_OPTIONS})
-    target_link_options(test-unified-kernel-ops PRIVATE ${SYCL_JIT_DEVICE_TEST_LINK_OPTIONS})
+    target_compile_options(test-unified-kernel-ops PRIVATE ${SYCL_UNIFIED_KERNEL_TEST_OPTIONS})
+    target_link_options(test-unified-kernel-ops PRIVATE ${SYCL_UNIFIED_KERNEL_TEST_LINK_OPTIONS})
     target_compile_definitions(test-unified-kernel-ops PRIVATE
         GGML_SYCL_WARP_SIZE=32
         GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
@@ -1034,8 +1040,8 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         ${CMAKE_CURRENT_SOURCE_DIR}/..
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     )
-    target_compile_options(test-unified-kernel-persistent PRIVATE ${SYCL_JIT_DEVICE_TEST_OPTIONS})
-    target_link_options(test-unified-kernel-persistent PRIVATE ${SYCL_JIT_DEVICE_TEST_LINK_OPTIONS})
+    target_compile_options(test-unified-kernel-persistent PRIVATE ${SYCL_UNIFIED_KERNEL_TEST_OPTIONS})
+    target_link_options(test-unified-kernel-persistent PRIVATE ${SYCL_UNIFIED_KERNEL_TEST_LINK_OPTIONS})
     target_compile_definitions(test-unified-kernel-persistent PRIVATE
         GGML_SYCL_WARP_SIZE=32
         GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
