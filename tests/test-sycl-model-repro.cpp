@@ -60,8 +60,21 @@ int main(int argc, char ** argv) {
 
     const char * model_path = pick_model_path(argc, argv);
     if (!model_path || !std::filesystem::exists(model_path)) {
-        std::fprintf(stderr, "SKIP: model not found (set LLAMA_SYCL_TEST_MODEL or pass --model).\n");
-        return 0;
+        // 77 (ctest SKIP_RETURN_CODE), not 0. A missing model is a genuine
+        // environmental absence, but reporting it as success made a bare
+        // registration of this test a guaranteed green -- it would load nothing,
+        // run nothing, and pass. See llama.cpp-k208.
+        //
+        // 77 is preferred here over pinning LLAMA_SYCL_TEST_MODEL in an
+        // ENVIRONMENT property: that would only paper over the exit code on hosts
+        // where the path happens to resolve, and it bakes a machine-specific model
+        // path into CMake. This works anywhere and needs no registration change.
+        // Note pick_model_path() already falls back to a hardcoded
+        // /Storage/GenAI/models path, so on this host the skip does not fire.
+        std::fprintf(stderr,
+                     "SKIP: model not found (set LLAMA_SYCL_TEST_MODEL or pass --model) "
+                     "-- NO MODEL WAS LOADED AND NOTHING WAS VERIFIED.\n");
+        return 77;
     }
 
     llama_backend_init();
