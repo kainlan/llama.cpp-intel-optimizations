@@ -8,6 +8,7 @@
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
+#include "test-skip.h"
 
 #include <array>
 #include <atomic>
@@ -37,11 +38,7 @@ int main(int argc, char ** argv) {
     if (!argv_has_model_arg(argc, argv)) {
         const char * env_model = std::getenv("LLAMACPP_TEST_MODELFILE");
         if (!env_model || std::strlen(env_model) == 0) {
-            fprintf(
-                stderr,
-                "\033[33mWARNING: No model file provided. Skipping this test. "
-                "Set LLAMACPP_TEST_MODELFILE=<gguf_model_path> to silence this warning and run this test.\n\033[0m");
-            return 0;
+            test_skip_no_model();
         }
         env_model_arg = env_model;
         argv_owned.reserve(argc + 2);
