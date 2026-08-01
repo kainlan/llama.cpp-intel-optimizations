@@ -1484,6 +1484,14 @@ struct unified_cache_entry {
     // always shows exactly one outstanding lease (in_use_count == 1); resolve
     // the address with addr2line/dladdr against the built libggml-sycl.so.
     const void *          debug_last_lease_caller = nullptr;
+    // Debug-only (llama.cpp-2wv5): companion to debug_last_lease_caller for the
+    // ~16 sites that bump in_use_count DIRECTLY instead of going through
+    // acquire_entry_lease().  Those sites leave debug_last_lease_caller null --
+    // which is how we learned the leaked leases never touch the lease API -- so
+    // each one stamps a distinct string literal here instead.  A literal beats a
+    // return address: it needs no addr2line, and it survives inlining.
+    // Static storage duration, never freed; overwritten on every acquisition.
+    const char *          debug_last_lease_site   = nullptr;
     // NOTE: Reorder state is tracked in tensor->extra->optimized_feature, not here
 };
 

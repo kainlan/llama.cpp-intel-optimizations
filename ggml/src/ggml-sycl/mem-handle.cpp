@@ -743,6 +743,9 @@ mem_handle::mem_handle(const mem_handle & other) :
     // the entry alive.  fetch_add on copyable_atomic_u32 is lock-free.
     if (leased_entry_) {
         leased_entry_->in_use_count.fetch_add(1);
+        // llama.cpp-2wv5: a copy takes its own lease, so it -- not whoever
+        // acquired the original -- is the site that must release it.
+        leased_entry_->debug_last_lease_site = "mem_handle/copy-ctor";
     }
     // llama.cpp-dyhdl: independently acquire a chunk lease for the copy.
     bump_chunk_lease_for_copy(chunk_source_, chunk_device_, cached_.ptr, host_chunk_handle_, vram_chunk_idx_);
@@ -807,6 +810,7 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
     vram_chunk_idx_    = -1;
     if (leased_entry_) {
         leased_entry_->in_use_count.fetch_add(1);
+        leased_entry_->debug_last_lease_site = "mem_handle/copy-assign";  // llama.cpp-2wv5
     }
     bump_chunk_lease_for_copy(chunk_source_, chunk_device_, cached_.ptr, host_chunk_handle_, vram_chunk_idx_);
     if (chunk_source_ == 1 && host_chunk_handle_ == UINT64_MAX) {
