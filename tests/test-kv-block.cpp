@@ -17,8 +17,13 @@
 // test-fattn-mask, whose assertions turn RED once live, all 178 here pass on
 // clean source.
 //
-// Must precede <cassert>, which binds assert at include time. llama-kv-block.h
-// includes <cassert> itself, so this must precede that include too.
+// <cassert> is specified WITHOUT an include guard: assert() is rebound at every
+// inclusion, according to the NDEBUG state in effect at that point. So the
+// invariant is not the order of the includes below -- it is that NDEBUG is
+// undefined at every inclusion of <cassert> this file reaches, direct or
+// transitive (llama-kv-block.h pulls it in too). Being the first directive in
+// the file, with nothing redefining NDEBUG afterwards, satisfies that
+// unconditionally. Reordering or merging the includes below is therefore safe.
 #undef NDEBUG
 #include <cassert>
 
