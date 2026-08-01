@@ -24,7 +24,10 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <csignal>
+#include <cstdarg>
 #include <cstdio>
+#include <map>
 #include <cstdlib>
 #include <cstring>
 #include <future>
@@ -1270,6 +1273,446 @@ bool arena_pp_profile_enabled() {
 bool arena_pp_profile_active() {
     return t_arena_pp_profile.active;
 }
+
+// ============================================================================
+// Zone-reset escape audit (GGML_SYCL_ZONE_RESET_AUDIT) -- contract in the header
+// ============================================================================
+//
+// Phase 0 of the "retire zone reset" epic.  Every reset site reports what is
+// still live in its zone, so each escape can be fixed BEFORE the reset that
+// hides it is deleted.  This is instrumentation only: it does not delete or
+// weaken any reset and does not weaken any `refusing ...` guard.
+//
+// Why the existing dumps are not enough: both the VRAM and the host reset
+// already log live records, but only for the first 4 refusals per zone and only
+// 8 lines within each.  A long run therefore shows at most 32 lines per zone and
+// tells you nothing about which cohorts recur, at what sizes, or how often.
+// The deliverable of this task is an inventory, so the audit must be uncapped in
+// what it *aggregates* even while it stays bounded in what it *prints*.
+
+namespace {
+
+struct zone_audit_cohort_size_stats {
+    uint64_t                     occurrences = 0;  // times this (cohort,size) was live at this site
+    uint64_t                     graphs_seen = 0;  // distinct graph ids it appeared in
+    uint64_t                     last_graph  = UINT64_MAX;
+    std::unordered_set<uint64_t> alloc_ids;        // distinct allocations behind it
+    int                          role     = -1;
+    int                          category = -1;
+    int                          tier     = -1;
+};
+
+struct zone_audit_site_stats {
+    int                        device             = -1;
+    uint64_t                   visits             = 0;
+    uint64_t                   visits_with_live   = 0;
+    uint64_t                   live_total         = 0;
+    uint64_t                   live_max           = 0;
+    size_t                     largest_free_first = 0;
+    size_t                     largest_free_last  = 0;
+    size_t                     largest_free_min   = SIZE_MAX;
+    bool                       largest_free_valid = false;
+    uint64_t                   first_graph        = 0;
+    uint64_t                   last_graph         = 0;
+    std::map<size_t, uint64_t> size_histogram;
+    std::map<std::string, std::map<size_t, zone_audit_cohort_size_stats>> cross_tab;
+};
+
+// Alloc/free cost per zone.  The pre-registered decision rule (llama.cpp-iiff
+// c-c1n3) closes the allocator question outright if this is noise against graph
+// execution, so it has to be measured rather than argued.
+struct zone_audit_zone_timing {
+    std::atomic<uint64_t> alloc_calls{ 0 };
+    std::atomic<uint64_t> alloc_fail{ 0 };
+    std::atomic<uint64_t> alloc_bytes{ 0 };
+    std::atomic<uint64_t> alloc_ns{ 0 };
+    std::atomic<uint64_t> free_calls{ 0 };
+    std::atomic<uint64_t> free_ns{ 0 };
+    // Per-graph allocation counts: hundreds vs thousands decides whether O(n)
+    // individual frees can even matter against millisecond-scale graphs.
+    std::atomic<uint64_t> allocs_this_graph{ 0 };
+    std::atomic<uint64_t> graph_allocs_max{ 0 };
+    std::atomic<uint64_t> graph_allocs_sum{ 0 };
+    std::atomic<uint64_t> graphs_counted{ 0 };
+};
+
+struct zone_audit_state {
+    std::mutex                                                            mutex;
+    std::map<std::string, zone_audit_site_stats>                          sites;
+    std::array<zone_audit_zone_timing, (size_t) vram_zone_id::COUNT>      vram;
+    std::array<zone_audit_zone_timing, (size_t) host_zone_id::COUNT>      host;
+    std::atomic<uint64_t>                                                 graph_id{ 0 };
+    std::atomic<uint64_t>                                                 visits_since_report{ 0 };
+    std::atomic<bool>                                                     atexit_installed{ false };
+};
+
+// Deliberately leaked.  The report runs from atexit and, more importantly, from
+// crash-adjacent paths in runs that are expected to abort (test-thread-safety),
+// so this state must outlive every static destructor.
+zone_audit_state & zone_audit() {
+    static zone_audit_state * s = new zone_audit_state();
+    return *s;
+}
+
+int zone_reset_audit_level() {
+    static const int level = [] {
+        const char * e = std::getenv("GGML_SYCL_ZONE_RESET_AUDIT");
+        if (!e || e[0] == '\0') {
+            return 0;
+        }
+        return std::atoi(e);
+    }();
+    return level;
+}
+
+// Emit a full report every this many site visits, so a run that dies before exit
+// still leaves an inventory behind.  This is not hypothetical and 4096 was too
+// coarse: measured 2026-08-01, test-llama-archs hit the SYCL watchdog's
+// std::_Exit(1) after ~272 graphs (~1400 visits) and produced NO summary at all.
+// test-thread-safety segfaults, which is the same problem.  Both are now also
+// covered directly -- the watchdog calls zone_reset_audit_report() before
+// _Exit, and a fatal-signal handler flushes on SIGSEGV/SIGABRT -- but a short
+// interval is the belt to those braces.
+constexpr uint64_t k_zone_audit_report_interval = 256;
+
+struct zone_audit_live_entry {
+    uint64_t    alloc_id = 0;
+    size_t      size     = 0;
+    int         role     = -1;
+    int         category = -1;
+    int         tier     = -1;
+    std::string cohort;
+};
+
+void zone_audit_emit(const std::string & line) {
+    // WARN plus a raw stderr copy.  GGML_LOG_INFO is dropped at default
+    // verbosity in EVERY tool (common_get_verbosity maps INFO to TRACE=4 against
+    // a threshold of 3), so an INFO-level audit line yields an empty capture --
+    // indistinguishable from "no escapes found".
+    GGML_LOG_WARN("%s", line.c_str());
+    fputs(line.c_str(), stderr);
+    fflush(stderr);
+}
+
+std::string zone_audit_format(const char * fmt, ...) {
+    char    buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    return std::string(buf);
+}
+
+void zone_audit_report_locked(const char * where);
+void zone_audit_install_atexit();
+
+// Record one visit to a reset site.  `live` is what the site found still
+// registered in its zone; empty means the zone was clean at that visit.
+void zone_audit_record_site(const char *                               scope,
+                            const char *                               zone_name,
+                            int                                        device,
+                            size_t                                     largest_free,
+                            bool                                       largest_free_valid,
+                            const std::vector<zone_audit_live_entry> & live) {
+    zone_audit_install_atexit();
+    zone_audit_state & st  = zone_audit();
+    const uint64_t     gid = st.graph_id.load(std::memory_order_relaxed);
+
+    std::string site = std::string(scope) + "/" + zone_name;
+    if (device >= 0) {
+        site += ":dev" + std::to_string(device);
+    }
+
+    std::vector<std::string> new_combos;
+
+    {
+        std::lock_guard<std::mutex> lock(st.mutex);
+        zone_audit_site_stats &     s = st.sites[site];
+        if (s.visits == 0) {
+            s.first_graph        = gid;
+            s.largest_free_first = largest_free;
+        }
+        s.device     = device;
+        s.last_graph = gid;
+        s.visits++;
+        if (largest_free_valid) {
+            s.largest_free_valid = true;
+            s.largest_free_last  = largest_free;
+            s.largest_free_min   = std::min(s.largest_free_min, largest_free);
+        }
+        if (!live.empty()) {
+            s.visits_with_live++;
+            s.live_total += live.size();
+            s.live_max = std::max<uint64_t>(s.live_max, live.size());
+        }
+
+        for (const auto & e : live) {
+            const std::string cohort = e.cohort.empty() ? std::string("(none)") : e.cohort;
+            s.size_histogram[e.size]++;
+            auto & cs = s.cross_tab[cohort][e.size];
+            if (cs.occurrences == 0) {
+                cs.role     = e.role;
+                cs.category = e.category;
+                cs.tier     = e.tier;
+                // First sighting of this (site, cohort, size).  This is the
+                // inventory line; it is never budgeted away.
+                new_combos.push_back(zone_audit_format(
+                    "[ZONE-RESET-AUDIT] NEW-ESCAPE site=%s graph=%llu alloc_id=%llu size=%zu role=%d category=%d "
+                    "tier=%d cohort=%s\n",
+                    site.c_str(), (unsigned long long) gid, (unsigned long long) e.alloc_id, e.size, e.role, e.category,
+                    e.tier, cohort.c_str()));
+            }
+            cs.occurrences++;
+            if (cs.last_graph != gid) {
+                cs.last_graph = gid;
+                cs.graphs_seen++;
+            }
+            if (cs.alloc_ids.size() < 4096) {
+                cs.alloc_ids.insert(e.alloc_id);
+            }
+        }
+    }
+
+    for (const auto & line : new_combos) {
+        zone_audit_emit(line);
+    }
+
+    if (st.visits_since_report.fetch_add(1, std::memory_order_relaxed) + 1 >= k_zone_audit_report_interval) {
+        st.visits_since_report.store(0, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lock(st.mutex);
+        zone_audit_report_locked("periodic");
+    }
+}
+
+void zone_audit_report_timing_locked(const char *                    kind,
+                                     const char *                    zone_name,
+                                     const zone_audit_zone_timing &  t) {
+    const uint64_t ac = t.alloc_calls.load(std::memory_order_relaxed);
+    const uint64_t fc = t.free_calls.load(std::memory_order_relaxed);
+    if (ac == 0 && fc == 0) {
+        return;
+    }
+    const uint64_t graphs = t.graphs_counted.load(std::memory_order_relaxed);
+    zone_audit_emit(zone_audit_format(
+        "[ZONE-RESET-AUDIT]   timing %s/%s alloc_calls=%llu alloc_MB=%.1f alloc_ms=%.3f "
+        "free_calls=%llu free_ms=%.3f allocs_per_graph_max=%llu allocs_per_graph_mean=%.1f graphs=%llu\n",
+        kind, zone_name, (unsigned long long) ac,
+        t.alloc_bytes.load(std::memory_order_relaxed) / (1024.0 * 1024.0),
+        t.alloc_ns.load(std::memory_order_relaxed) / 1.0e6, (unsigned long long) fc,
+        t.free_ns.load(std::memory_order_relaxed) / 1.0e6,
+        (unsigned long long) t.graph_allocs_max.load(std::memory_order_relaxed),
+        graphs ? (double) t.graph_allocs_sum.load(std::memory_order_relaxed) / (double) graphs : 0.0,
+        (unsigned long long) graphs));
+}
+
+void zone_audit_report_locked(const char * where) {
+    zone_audit_state & st = zone_audit();
+
+    zone_audit_emit(zone_audit_format("[ZONE-RESET-AUDIT] ==== escape inventory (%s) graphs=%llu ====\n",
+                                      where ? where : "report",
+                                      (unsigned long long) st.graph_id.load(std::memory_order_relaxed)));
+
+    if (st.sites.empty()) {
+        // An empty audit is NOT evidence of zero escapes; it is evidence the
+        // audit did not run.  Say so, so a capture cannot be misread as clean.
+        zone_audit_emit(std::string("[ZONE-RESET-AUDIT] NO RESET SITE WAS VISITED -- this run proves NOTHING about "
+                                    "escapes; the audit did not reach any reset site\n"));
+    }
+
+    for (const auto & site_kv : st.sites) {
+        const zone_audit_site_stats & s = site_kv.second;
+        zone_audit_emit(zone_audit_format(
+            "[ZONE-RESET-AUDIT] site=%s visits=%llu visits_with_live=%llu live_max=%llu live_total=%llu "
+            "distinct_sizes=%zu distinct_cohorts=%zu graphs=[%llu..%llu]\n",
+            site_kv.first.c_str(), (unsigned long long) s.visits, (unsigned long long) s.visits_with_live,
+            (unsigned long long) s.live_max, (unsigned long long) s.live_total, s.size_histogram.size(),
+            s.cross_tab.size(), (unsigned long long) s.first_graph, (unsigned long long) s.last_graph));
+
+        if (s.largest_free_valid) {
+            // Fragmentation check: the one genuine argument for retaining a bulk
+            // operation is coalescing failing to keep up.  Measured, not assumed.
+            zone_audit_emit(zone_audit_format(
+                "[ZONE-RESET-AUDIT]   largest_free first=%.2f MB last=%.2f MB min=%.2f MB\n",
+                s.largest_free_first / (1024.0 * 1024.0), s.largest_free_last / (1024.0 * 1024.0),
+                (s.largest_free_min == SIZE_MAX ? 0 : s.largest_free_min) / (1024.0 * 1024.0)));
+        }
+
+        for (const auto & cohort_kv : s.cross_tab) {
+            for (const auto & size_kv : cohort_kv.second) {
+                const zone_audit_cohort_size_stats & cs = size_kv.second;
+                // Same cohort, same size, every graph, with a NEW alloc_id each
+                // time = reallocated per graph = retention candidate (c-c1n3:
+                // the fastest allocation is the one not made).  Same alloc_id
+                // recurring instead means the allocation is already retained and
+                // the escape is purely a lifetime/ownership bug.
+                const double per_graph = cs.graphs_seen ? (double) cs.occurrences / (double) cs.graphs_seen : 0.0;
+                const char * verdict   = "single-shot";
+                if (cs.graphs_seen > 1) {
+                    verdict = (cs.alloc_ids.size() > cs.graphs_seen) ? "REALLOC-EVERY-GRAPH (retention candidate)"
+                                                                     : "RETAINED (lifetime bug only)";
+                }
+                zone_audit_emit(zone_audit_format(
+                    "[ZONE-RESET-AUDIT]   cohort=%s size=%zu occurrences=%llu graphs=%llu per_graph=%.2f "
+                    "distinct_alloc_ids=%zu role=%d category=%d tier=%d -> %s\n",
+                    cohort_kv.first.c_str(), size_kv.first, (unsigned long long) cs.occurrences,
+                    (unsigned long long) cs.graphs_seen, per_graph, cs.alloc_ids.size(), cs.role, cs.category, cs.tier,
+                    verdict));
+            }
+        }
+
+        // Size histogram, capped in what it prints; distinct_sizes above is exact.
+        size_t printed = 0;
+        for (const auto & h : s.size_histogram) {
+            if (printed++ >= 32) {
+                zone_audit_emit(zone_audit_format("[ZONE-RESET-AUDIT]   size-histogram ... %zu more distinct sizes\n",
+                                                  s.size_histogram.size() - 32));
+                break;
+            }
+            zone_audit_emit(zone_audit_format("[ZONE-RESET-AUDIT]   size-histogram %zu x%llu\n", h.first,
+                                              (unsigned long long) h.second));
+        }
+    }
+
+    for (size_t i = 0; i < (size_t) vram_zone_id::COUNT; i++) {
+        zone_audit_report_timing_locked("vram", arena_zone_name((vram_zone_id) i), st.vram[i]);
+    }
+    for (size_t i = 0; i < (size_t) host_zone_id::COUNT; i++) {
+        zone_audit_report_timing_locked("host", host_zone_name((host_zone_id) i), st.host[i]);
+    }
+
+    zone_audit_emit(std::string("[ZONE-RESET-AUDIT] ==== end inventory ====\n"));
+}
+
+// Flush on abnormal termination.  Not async-signal-safe (it takes a mutex and
+// calls stdio), which would be unacceptable in production code -- but this runs
+// only under an opt-in diagnostic flag, on a process that is already dying, and
+// the alternative is losing the inventory for precisely the runs that crash.
+// Those are the runs with the confirmed escapes.
+void zone_audit_fatal_signal_handler(int sig) {
+    zone_audit_state & st = zone_audit();
+    // Do not block: if the crash happened while the audit lock was held, a
+    // blocking acquire here would hang the process instead of dumping.
+    if (st.mutex.try_lock()) {
+        zone_audit_report_locked(sig == SIGSEGV ? "SIGSEGV" : "fatal-signal");
+        st.mutex.unlock();
+    } else {
+        fputs("[ZONE-RESET-AUDIT] fatal signal with audit lock held; inventory NOT flushed -- use the "
+              "NEW-ESCAPE lines above, which are emitted unbudgeted at first sighting\n",
+              stderr);
+        fflush(stderr);
+    }
+    std::signal(sig, SIG_DFL);
+    std::raise(sig);
+}
+
+void zone_audit_install_atexit() {
+    zone_audit_state & st       = zone_audit();
+    bool               expected = false;
+    if (st.atexit_installed.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+        std::atexit([] {
+            zone_audit_state &          st2 = zone_audit();
+            std::lock_guard<std::mutex> lock(st2.mutex);
+            zone_audit_report_locked("process-exit");
+        });
+        std::signal(SIGSEGV, zone_audit_fatal_signal_handler);
+        std::signal(SIGABRT, zone_audit_fatal_signal_handler);
+    }
+}
+
+// Times one zone alloc/free without disturbing the existing arena profiler.
+struct zone_audit_timer {
+    zone_audit_zone_timing *        t       = nullptr;
+    bool                            is_free = false;
+    size_t                          bytes   = 0;
+    arena_profile_clock::time_point t0;
+
+    zone_audit_timer(zone_audit_zone_timing * timing, bool free_op, size_t nbytes = 0) :
+        t(timing),
+        is_free(free_op),
+        bytes(nbytes) {
+        if (t) {
+            t0 = arena_profile_clock::now();
+        }
+    }
+
+    ~zone_audit_timer() {
+        if (!t) {
+            return;
+        }
+        const uint64_t ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                arena_profile_clock::now() - t0)
+                                .count();
+        if (is_free) {
+            t->free_calls.fetch_add(1, std::memory_order_relaxed);
+            t->free_ns.fetch_add(ns, std::memory_order_relaxed);
+        } else {
+            t->alloc_calls.fetch_add(1, std::memory_order_relaxed);
+            t->alloc_ns.fetch_add(ns, std::memory_order_relaxed);
+            t->allocs_this_graph.fetch_add(1, std::memory_order_relaxed);
+            t->alloc_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        }
+    }
+};
+
+zone_audit_zone_timing * zone_audit_vram_timing(vram_zone_id zone) {
+    if (zone_reset_audit_level() <= 0) {
+        return nullptr;
+    }
+    return &zone_audit().vram[(size_t) zone];
+}
+
+zone_audit_zone_timing * zone_audit_host_timing(host_zone_id zone) {
+    if (zone_reset_audit_level() <= 0) {
+        return nullptr;
+    }
+    return &zone_audit().host[(size_t) zone];
+}
+
+}  // namespace
+
+bool zone_reset_audit_enabled() {
+    return zone_reset_audit_level() > 0;
+}
+
+bool zone_reset_audit_suppresses_reset() {
+    return zone_reset_audit_level() >= 2;
+}
+
+void zone_reset_audit_begin_graph(int device) {
+    if (zone_reset_audit_level() <= 0) {
+        return;
+    }
+    (void) device;
+    zone_audit_install_atexit();
+    zone_audit_state & st = zone_audit();
+    st.graph_id.fetch_add(1, std::memory_order_relaxed);
+    for (auto & t : st.vram) {
+        const uint64_t n = t.allocs_this_graph.exchange(0, std::memory_order_relaxed);
+        t.graph_allocs_sum.fetch_add(n, std::memory_order_relaxed);
+        t.graphs_counted.fetch_add(1, std::memory_order_relaxed);
+        uint64_t prev = t.graph_allocs_max.load(std::memory_order_relaxed);
+        while (n > prev && !t.graph_allocs_max.compare_exchange_weak(prev, n, std::memory_order_relaxed)) {
+        }
+    }
+    for (auto & t : st.host) {
+        const uint64_t n = t.allocs_this_graph.exchange(0, std::memory_order_relaxed);
+        t.graph_allocs_sum.fetch_add(n, std::memory_order_relaxed);
+        t.graphs_counted.fetch_add(1, std::memory_order_relaxed);
+        uint64_t prev = t.graph_allocs_max.load(std::memory_order_relaxed);
+        while (n > prev && !t.graph_allocs_max.compare_exchange_weak(prev, n, std::memory_order_relaxed)) {
+        }
+    }
+}
+
+void zone_reset_audit_report(const char * where) {
+    if (zone_reset_audit_level() <= 0) {
+        return;
+    }
+    zone_audit_state &          st = zone_audit();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    zone_audit_report_locked(where);
+}
+
 
 bool arena_pp_profile_begin(int device, bool is_prompt_phase) {
     t_arena_pp_profile = {};
@@ -7591,6 +8034,12 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
     drain_retained_handles(true);
 
     std::vector<stale_weight_alloc> to_free;
+    // Weight reclaim is a reset site too, and its escape cohort is the largest
+    // one confirmed so far (llama.cpp-2wv5: 291 of 516 entries preserved at an
+    // ordinary single-model teardown).  The counts are already logged; what the
+    // inventory needs is the per-entry size/attribution breakdown.
+    std::vector<zone_audit_live_entry> audit_preserved;
+    const bool                         audit_weights = zone_reset_audit_enabled();
     const bool                      trace_reset           = moe_direct_trace_enabled();
     const size_t                    weight_used_before    = zone_used(vram_zone_id::WEIGHT);
     const size_t                    weight_avail_before   = zone_available(vram_zone_id::WEIGHT);
@@ -7672,6 +8121,19 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
 
             if (!weight_entry_reclaimable(entry, mode, live_mask)) {
                 entries_preserved++;
+                if (audit_weights) {
+                    // Cohort splits the three reasons an entry survives, because
+                    // they are three different tickets: a lease with no live
+                    // owner is a leak, a live owner is correct, and an untagged
+                    // entry is an attribution gap.
+                    const char * why = (live != 0 && !owned_by_live && !unattributed) ? "weight:leaked_lease" :
+                                       (live != 0)                                    ? "weight:leased" :
+                                       owned_by_live                                  ? "weight:owned_by_live_model" :
+                                                                                        "weight:unattributed";
+                    audit_preserved.push_back({ (uint64_t) it->first.id.name_hash, entry.size,
+                                                static_cast<int>(entry.layout), (int) live, (int) entry.location,
+                                                std::string(why) });
+                }
                 if (live != 0) {
                     // llama.cpp-ltzq: with ownership tracked, "another live model
                     // owns this" and "somebody leaked a handle" are finally
@@ -7743,6 +8205,11 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
         layer_ready_.clear();
         layer_weights_.clear();
         layer_layouts_.clear();
+    }
+    if (audit_weights) {
+        zone_audit_record_site("weight-reclaim", weight_reclaim_mode_name(mode),
+                               ggml_sycl_get_device_id_from_queue(queue_), zone_largest_free(vram_zone_id::WEIGHT),
+                               true, audit_preserved);
     }
     free_stale_weight_allocs(to_free);
     // llama.cpp-ltzq: restore the escalation acdb192d4 traded away, without
@@ -12323,6 +12790,11 @@ void unified_cache::host_zone_reset(host_zone_id zone) {
     // free list intact, so already-freed blocks stay reusable; only the bulk
     // reclaim is forgone. This matches zone_reset()'s existing refusals for the
     // WEIGHT zone and for KV in a shared KV+WEIGHT arena.
+    // Queried before taking the registry lock: zone_largest_free_block() takes
+    // the pinned pool's own mutex, and there is no reason to nest the two.
+    const bool   audit_on            = zone_reset_audit_enabled();
+    const size_t audit_largest_free  = audit_on ? host_arena_->zone_largest_free_block(zone) : 0;
+
     {
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
         // Budget the logging PER ZONE, not per function.  A shared counter lets a
@@ -12339,14 +12811,25 @@ void unified_cache::host_zone_reset(host_zone_id zone) {
         const bool                  log_detail       = zone_logs.load(std::memory_order_relaxed) < 4;
         size_t                      detail_lines     = 0;
         size_t                      live_allocations = 0;
+        // See the matching note in zone_reset(): the audit is uncapped in what it
+        // aggregates because the refusal dump above cannot produce an inventory.
+        std::vector<zone_audit_live_entry> audit_live;
         for (auto it = g_runtime_alloc_registry.begin(); it != g_runtime_alloc_registry.end(); ++it) {
             if (it->second.handle.host_zone == zone) {
                 if (log_detail && detail_lines < 8) {
                     runtime_reset_reclaimed_log_live_locked(it->second, "host-zone-reset");
                     detail_lines++;
                 }
+                if (audit_on) {
+                    const alloc_handle & h = it->second.handle;
+                    audit_live.push_back({ h.alloc_id, h.size, static_cast<int>(h.role), static_cast<int>(h.category),
+                                           static_cast<int>(h.tier), it->second.cohort_id });
+                }
                 live_allocations++;
             }
+        }
+        if (audit_on) {
+            zone_audit_record_site("host-zone-reset", host_zone_name(zone), -1, audit_largest_free, true, audit_live);
         }
         if (live_allocations > 0) {
             if (zone_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
@@ -12359,6 +12842,14 @@ void unified_cache::host_zone_reset(host_zone_id zone) {
         }
     }
 
+    // GGML_SYCL_ZONE_RESET_AUDIT=2: report-only.  Host SCRATCH/STAGING
+    // allocations are reset-only by design (never individually freed), so this
+    // IS the unbounded growth the epic warns about -- deliberately, and for
+    // bounded diagnostic runs only.
+    if (zone_reset_audit_suppresses_reset()) {
+        return;
+    }
+
     host_arena_->zone_reset(zone);
 }
 
@@ -12366,6 +12857,7 @@ void unified_cache::host_zone_free(host_zone_id zone, void * ptr) {
     if (!host_arena_ || !ptr) {
         return;
     }
+    const zone_audit_timer audit_timer(zone_audit_host_timing(zone), true);
     host_arena_->zone_free(zone, ptr);
 }
 
@@ -12483,6 +12975,7 @@ void * unified_cache::host_zone_alloc(host_zone_id zone, size_t size, size_t ali
     if (!host_arena_) {
         return nullptr;
     }
+    const zone_audit_timer audit_timer(zone_audit_host_timing(zone), false, size);
     if (!host_arena_->zones_configured()) {
         segmented_buffer buf = host_arena_->allocate_segmented(size, alignment);
         if (buf.segments.empty()) {
@@ -13013,6 +13506,23 @@ void unified_cache::return_scratch(void * ptr, size_t size) {
 }
 
 void unified_cache::reset_scratch_pool() {
+    if (zone_reset_audit_enabled()) {
+        // The scratch pool is a bump allocator with no per-allocation free
+        // (return_scratch() is a no-op), so there is no registry and "which
+        // allocations escaped" is not a well-formed question here.  What the
+        // audit CAN report is how much the pool is carrying at each reset --
+        // which is what a per-handle model would have to hold instead.
+        const size_t                       off = scratch_pool_off_.load(std::memory_order_relaxed);
+        std::vector<zone_audit_live_entry> live;
+        if (off > 0) {
+            live.push_back({ 0, off, -1, -1, -1, std::string("scratch_pool:bump_in_use") });
+        }
+        zone_audit_record_site("scratch-pool-reset", "bump", ggml_sycl_get_device_id_from_queue(queue_),
+                               scratch_pool_size_ > off ? scratch_pool_size_ - off : 0, scratch_pool_size_ > 0, live);
+        if (zone_reset_audit_suppresses_reset()) {
+            return;
+        }
+    }
     scratch_pool_off_.store(0, std::memory_order_relaxed);
 }
 
@@ -14430,6 +14940,11 @@ void * unified_cache::zone_alloc(vram_zone_id zone, size_t size, size_t align) {
         return nullptr;
     }
 
+    // Audit-only: measure whether alloc/free time is even visible against graph
+    // execution.  Per the pre-registered rule (llama.cpp-iiff c-c1n3), if it is
+    // noise the allocator question closes itself.
+    const zone_audit_timer audit_timer(zone_audit_vram_timing(zone), false, size);
+
     const bool profile_active = arena_pp_profile_active();
     const auto t0             = profile_active ? arena_profile_clock::now() : arena_profile_clock::time_point{};
 
@@ -14657,6 +15172,12 @@ void unified_cache::zone_reset(vram_zone_id zone) {
         const bool                  log_detail       = zone_logs.load(std::memory_order_relaxed) < 4;
         size_t                      detail_lines     = 0;
         size_t                      live_allocations = 0;
+        // Audit collects EVERY live record, uncapped -- the refusal dump above is
+        // capped at 4 refusals x 8 lines per zone, which cannot produce an
+        // inventory.  Collected here rather than in a second pass so it sees
+        // exactly what the refusal saw, under the same lock.
+        std::vector<zone_audit_live_entry> audit_live;
+        const bool                         audit_on = zone_reset_audit_enabled();
         for (auto it = g_runtime_alloc_registry.begin(); it != g_runtime_alloc_registry.end(); ++it) {
             const uintptr_t p = reinterpret_cast<uintptr_t>(it->first);
             if (p >= zone_lo && p < zone_hi) {
@@ -14664,8 +15185,18 @@ void unified_cache::zone_reset(vram_zone_id zone) {
                     runtime_reset_reclaimed_log_live_locked(it->second, "device-zone-reset");
                     detail_lines++;
                 }
+                if (audit_on) {
+                    const alloc_handle & h = it->second.handle;
+                    audit_live.push_back({ h.alloc_id, h.size, static_cast<int>(h.role), static_cast<int>(h.category),
+                                           static_cast<int>(h.tier), it->second.cohort_id });
+                }
                 live_allocations++;
             }
+        }
+        if (audit_on) {
+            zone_audit_record_site("device-zone-reset", vram_zone_name(zone),
+                                   ggml_sycl_get_device_id_from_queue(queue_), zone_largest_free(zone), true,
+                                   audit_live);
         }
         if (live_allocations > 0) {
             if (zone_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
@@ -14676,6 +15207,14 @@ void unified_cache::zone_reset(vram_zone_id zone) {
             }
             return;
         }
+    }
+
+    // GGML_SYCL_ZONE_RESET_AUDIT=2: report-only.  Reaching here means the zone
+    // was clean, so suppressing the reset costs nothing in correctness -- but it
+    // does forgo the bulk reclaim, which for reset-only allocations is unbounded
+    // growth.  That is why =2 is opt-in on top of =1 and not the default.
+    if (zone_reset_audit_suppresses_reset()) {
+        return;
     }
 
     if (z.allocator) {
@@ -14693,6 +15232,8 @@ void unified_cache::zone_free(vram_zone_id zone, void * ptr) {
     if (!ptr || !arena_base_) {
         return;
     }
+
+    const zone_audit_timer audit_timer(zone_audit_vram_timing(zone), true);
 
     const bool profile_active = arena_pp_profile_active();
     const auto t0             = profile_active ? arena_profile_clock::now() : arena_profile_clock::time_point{};
