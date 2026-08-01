@@ -474,6 +474,11 @@ static sycl::queue make_queue_or_fail(const sycl::device & dev) {
         return sycl::queue(dev);
     } catch (const sycl::exception & e) {
         fprintf(stderr, "FAILED: could not create a SYCL queue on the GPU: %s\n", e.what());
+        // Deliberate divergence from the `return 1` that every sibling test in this
+        // directory uses for a setup failure: this helper returns the queue itself,
+        // so it has nowhere to hand a failure code back to main()'s flow. Nothing
+        // non-trivial is live here to skip destructing. Do not "fix" it into a
+        // sentinel queue -- constructing one is the very thing this avoids.
         exit(1);
     }
 }
