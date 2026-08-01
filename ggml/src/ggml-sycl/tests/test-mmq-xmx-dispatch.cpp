@@ -27,6 +27,11 @@
 // Include XMX ESIMD common header (provides XMXCapabilities, query_xmx_capabilities)
 #include "../xmx-esimd-common.hpp"
 
+// The batch gate the two dispatch sites in ggml-sycl.cpp actually call. Test 3
+// asserts against THIS, not against a local copy of the rule -- see the comment
+// on the function and llama.cpp-cwev.
+#include "../xmx-dispatch-gate.hpp"
+
 // =============================================================================
 // Q4_0 and Q8_1 Block Definitions (match ggml-common.h)
 // =============================================================================
@@ -248,48 +253,108 @@ static bool test_xmx_dispatch_fallback_for_non_xmx_device(sycl::queue &         
 // =============================================================================
 // Test 3: Batch Size Threshold
 // Bug caught: Wrong kernel for large batches (MMQ should be used for large batches)
+//
+// ⚠️ THIS TEST USED TO PASS UNCONDITIONALLY (llama.cpp-cwev). Its body called no
+// dispatch function: it recomputed `batch < 8` -- a hardcoded literal matching no
+// dispatch site -- into a local, fprintf'd it, and called TEST_PASS(). It could
+// not fail, while its name and banner advertised exactly the coverage an auditor
+// of "is XMX dispatch tested?" would search for.
+//
+// It now asserts against ggml_sycl_xmx_batch_in_range(), the function BOTH
+// dispatch sites in ggml-sycl.cpp call. That is what makes it more than a
+// restatement: the assertions bind to the shipped rule, not to a copy of it.
+//
+// What is asserted is BOUNDARY BEHAVIOUR and STRUCTURE, deliberately not the
+// formula. Re-deriving `batch >= 1 && batch < threshold` in the expectation
+// would be the original vacuity in a new dress -- it would pass against any
+// implementation, including a wrong one, because both sides would be the same
+// mistake. Each property below is a statement someone could have gotten wrong:
+//
+//   P1  batch 0 must NOT take XMX          (empty batch; test 5's premise)
+//   P2  batch 1 MUST take XMX              (the path claims batch >= 1)
+//   P3  the last accepted batch is exactly threshold-1, and threshold itself is
+//       rejected                            (off-by-one: `<` vs `<=`)
+//   P4  acceptance is ONE CONTIGUOUS interval, no holes and no second run
+//   P5  a negative batch must NOT take XMX
+//   P6  threshold 0 accepts NOTHING         (the global's fail-closed
+//       initializer depends on this -- llama.cpp-d5h0)
+//   P7  threshold 1 accepts NOTHING         (empty half-open range [1,1))
+//
+// NOT asserted here: that the default threshold is 64. That number lives in one
+// place, the GGML_SYCL_XMX_THRESHOLD row of the sycl_env_settings table in
+// ggml_check_sycl(), and is guarded by
+// scripts/check-sycl-xmx-threshold-default.sh. Copying it into this file would
+// be the duplicated-default bug (llama.cpp-d5h0) all over again, in the test.
+//
+// Also gone: the stale literal 8. It was real once -- at 05519d18f the gate read
+// `batch >= 8 && batch < threshold` -- and survived here as a printout constant
+// after the dispatch bound was relaxed to `>= 1`.
 // =============================================================================
 static bool test_xmx_dispatch_threshold_batch_size(sycl::queue &            q,
                                                     const XMXCapabilities & caps) {
     TEST_BEGIN("test_xmx_dispatch_threshold_batch_size");
 
-    if (!caps.supported) {
-        TEST_SKIP("XMX not supported");
-        return true;
+    // NOTE: no caps.supported early-SKIP. The gate under test is pure integer
+    // logic with no hardware input, so skipping on non-XMX hardware would have
+    // been a second way for this test to report success without checking
+    // anything. Tests 1 and 4 skip because they assert on caps; this does not.
+
+    const int thresholds[] = { 0, 1, 2, 8, 64, 1024 };
+
+    for (int threshold : thresholds) {
+        // P1 / P5 / P2
+        TEST_ASSERT(!ggml_sycl_xmx_batch_in_range(0, threshold), "batch 0 must never select XMX");
+        TEST_ASSERT(!ggml_sycl_xmx_batch_in_range(-1, threshold), "negative batch must never select XMX");
+        TEST_ASSERT(!ggml_sycl_xmx_batch_in_range(-1024, threshold), "negative batch must never select XMX");
+
+        // Sweep well past the threshold so a missing upper bound is caught.
+        const int64_t sweep_end  = static_cast<int64_t>(threshold) + 64;
+        int64_t       first_true = -1;
+        int64_t       last_true  = -1;
+        int64_t       runs       = 0;  // number of maximal contiguous accepted runs
+        bool          prev       = false;
+
+        for (int64_t batch = 0; batch <= sweep_end; batch++) {
+            const bool now = ggml_sycl_xmx_batch_in_range(batch, threshold);
+            if (now && !prev) {
+                runs++;
+                if (first_true < 0) {
+                    first_true = batch;
+                }
+            }
+            if (now) {
+                last_true = batch;
+            }
+            prev = now;
+        }
+
+        // P6 / P7: a threshold that cannot admit anything must admit nothing.
+        if (threshold <= 1) {
+            TEST_ASSERT(runs == 0, "threshold <= 1 must accept no batch at all");
+            fprintf(stderr, "\n  threshold=%d: accepts nothing (fail-closed) ", threshold);
+            continue;
+        }
+
+        // P4: exactly one contiguous accepted interval.
+        TEST_ASSERT(runs == 1, "XMX acceptance must be one contiguous batch interval");
+
+        // P2: the interval starts at 1, so batch 1 is accepted.
+        TEST_ASSERT(first_true == 1, "the accepted interval must begin at batch 1");
+        TEST_ASSERT(ggml_sycl_xmx_batch_in_range(1, threshold), "batch 1 must select XMX below the threshold");
+
+        // P3: it ends one short of the threshold, and the threshold is out.
+        TEST_ASSERT(last_true == static_cast<int64_t>(threshold) - 1, "the last accepted batch must be threshold-1");
+        TEST_ASSERT(!ggml_sycl_xmx_batch_in_range(threshold, threshold), "batch == threshold must fall through to MMQ");
+        TEST_ASSERT(!ggml_sycl_xmx_batch_in_range(static_cast<int64_t>(threshold) + 1, threshold),
+                    "batch > threshold must fall through to MMQ");
+
+        fprintf(stderr, "\n  threshold=%d: accepts [%ld, %ld], rejects %d and above ", threshold, (long) first_true,
+                (long) last_true, threshold);
     }
 
-    // The XMX GEMM threshold is controlled by the GGML_SYCL_XMX_THRESHOLD env
-    // var. The real gate, identical at both dispatch sites
-    // (ggml_sycl_select_preferred_kernel and ggml_sycl_mul_mat), is:
-    //
-    //     use_xmx = batch >= 1 && batch < g_ggml_sycl_xmx_threshold;
-    //
-    // Default threshold: 64. That number is stated in exactly one place -- the
-    // GGML_SYCL_XMX_THRESHOLD row of the sycl_env_settings table in
-    // ggml_check_sycl(), which overwrites the global unconditionally at backend
-    // init. The global's own initializer is a fail-closed 0 and is NOT the
-    // default (llama.cpp-d5h0 / 43d04b327; guarded by
-    // scripts/check-sycl-xmx-threshold-default.sh).
-    //
-    // This comment claimed "batch < 8 uses XMX, batch >= 8 uses MMQ SoA" until
-    // 2026-07-31 -- stale on both counts (no lower bound, wrong threshold). The
-    // literal 8 in the loop below is an illustrative constant local to this
-    // test's printout; it corresponds to no dispatch site.
-
-    // Test various batch sizes
-    const int test_batches[] = { 1, 4, 8, 16, 32, 128 };
-
-    for (int batch : test_batches) {
-        // Verify the threshold logic conceptually
-        // batch < threshold => XMX path
-        // batch >= threshold => MMQ SoA path
-
-        // The actual threshold is configurable, so we just verify
-        // the caps structure supports both paths
-        bool would_use_xmx = (batch < 8) && caps.supported && caps.supports_int8;
-
-        fprintf(stderr, "\n  batch=%d: would_use_xmx=%s ", batch, would_use_xmx ? "yes" : "no");
-    }
+    // A 64-bit batch must not be truncated into range by an int-width gate.
+    TEST_ASSERT(!ggml_sycl_xmx_batch_in_range(INT64_C(0x100000001), 64),
+                "a batch above INT_MAX must not wrap into the accepted range");
 
     fprintf(stderr, "\n");
     TEST_PASS();

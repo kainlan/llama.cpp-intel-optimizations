@@ -73,7 +73,7 @@ pipe grep is not.
 | `GGML_SYCL_BATCH_EXPERTS=0` | Disable batched expert kernel launches (default ON) |
 | `GGML_SYCL_ESIMD_DEQUANT=1` | Opt-in retest hatch for ESIMD small-block dequant; standard SYCL is the default. ⚠️ The 1.9x-slower figure behind that default was measured on an **Arc B580 + oneAPI 2025.3** — that card is no longer in this machine (replaced by the B70) and the toolchain has moved on, so treat it as *historical justification*, not a current measurement. The conclusion is still believed to hold (block granularity too small to amortize LSC loads), but it has not been re-measured on Battlemage G31. Same caveat applies to the copy of this claim in `CLAUDE.md`. |
 | `GGML_SYCL_LAYOUT_OVERRIDE=<mode>` | Force a weight layout: `aos`, `soa`, `coalesced`, or `xmx_tiled`. Overrides the layout policy's own choice — use for A/B isolation, not as a default. (Migrated from AGENTS.md 2026-07-25, which was its only documentation.) |
-| `GGML_SYCL_USE_XMX_GEMM=1` | Route quantized MUL_MAT through the experimental XMX GEMM kernels (measured 5–11x **slower** for quantized models). Needs a build carrying **both** `GGML_SYCL_XMX_GEMM` and `GGML_SYCL_MMQ_XMX`; in a default build it does nothing. ⚠️ On one of the two dispatch paths, *presence* of the variable enables it — `=0` does not disable. See below. |
+| `GGML_SYCL_USE_XMX_GEMM=1` | Route quantized MUL_MAT through the experimental XMX GEMM kernels (measured 5–11x **slower** for quantized models). Needs a build carrying **both** `GGML_SYCL_XMX_GEMM` and `GGML_SYCL_MMQ_XMX`; in a default build it does nothing. `=0` disables it on both dispatch paths (it did not until `llama.cpp-wvbw`; see below). |
 | `GGML_SYCL_XMX_THRESHOLD=N` | Upper batch bound for the XMX GEMM path; the gate is `batch >= 1 && batch < N`. Default **64**, stated only by the settings table in `ggml_check_sycl()` — not by the global's initializer. Same build requirement as above. See below. |
 
 ### `GGML_SYCL_USE_XMX_GEMM` / `GGML_SYCL_XMX_THRESHOLD` — the XMX GEMM path
@@ -145,13 +145,27 @@ use_xmx = batch >= 1 && batch < g_ggml_sycl_xmx_threshold;
 so `GGML_SYCL_XMX_THRESHOLD=0` or `=1` disables the XMX path outright, and
 "XMX for every batch" is only reachable by naming a large `N`.
 
-⚠️ **`GGML_SYCL_USE_XMX_GEMM` is read two different ways, and one of them ignores
-the value.** `ggml_sycl_mul_mat` tests the parsed global, so `=0` disables there.
-`ggml_sycl_select_preferred_kernel` tests
-`std::getenv("GGML_SYCL_USE_XMX_GEMM") != nullptr` **or** the global — so on that
-path merely *setting* the variable enables XMX regardless of its value, and
-`GGML_SYCL_USE_XMX_GEMM=0` still turns it on. To disable, leave the variable
-unset; do not set it to `0`.
+✅ **`GGML_SYCL_USE_XMX_GEMM=0` disables XMX everywhere** — fixed 2026-08-01,
+`llama.cpp-wvbw`. Both dispatch sites now read the parsed global
+`g_ggml_sycl_use_xmx_gemm`, so the value is honoured and the startup report
+cannot disagree with the behaviour.
+
+⚠️ **The advice this section carried until then was a workaround for a bug, and
+if you find it repeated anywhere else it is now wrong.** It read: *"one of them
+ignores the value … `ggml_sycl_select_preferred_kernel` tests
+`std::getenv(…) != nullptr` **or** the global … To disable, leave the variable
+unset; do not set it to `0`."* That was accurate at the time —
+`select_preferred_kernel` tested mere *presence*, so `=0` enabled XMX there while
+`ggml_sycl_mul_mat` read the same `0` as disabled, giving one process two
+opposite dispatch configurations and a report that printed `0` regardless. The
+presence form had been copied from the `GGML_SYCL_FORCE_MMQ` /
+`GGML_SYCL_FORCE_DMMV` idiom directly below it, where set-to-anything *is* the
+intent because those have no settings row, no global and no report line.
+
+Regression gate: `scripts/check-sycl-xmx-enable-single-source.sh` (textual — the
+block is `#ifdef GGML_SYCL_XMX_GEMM`, so an ordinary green build compiles zero
+lines of it and certifies nothing). It carries its own fixture suite:
+`scripts/check-sycl-xmx-enable-single-source.sh --self-test`.
 
 `ggml_check_sycl()` reports the threshold only when the enable flag is on, and
 that report is `GGML_LOG_INFO` — see CLAUDE.md on why those lines need raised
