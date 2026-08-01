@@ -198,6 +198,37 @@ and are always safe at any parallelism.
 After any OOM or forced stop, **check the GPU before trusting a benchmark** —
 `journalctl -k --since "1 hour ago" --no-pager | grep -iE 'GT reset|guc_id|CAT error'`.
 
+⚠️ **GPU/model-loading work is SERIALISED THROUGH THE LEAD SESSION. Subagents
+write code; they do not run it on the GPU.**
+
+This generalises the long-standing "never `test-backend-ops` in a subagent" rule
+to the whole family, and it exists because lock-passing between agents provably
+does not prevent overlap. On 2026-08-01 three GPU workloads ran concurrently and
+OOM'd the host while every party believed it was following the protocol — one
+agent held `GPU.lock` legitimately, a second polled for it correctly, and a third
+was launched by a sweep whose own documentation called it safe. No single actor
+misbehaved; the failure was in the seam between them.
+
+Locks cannot close that seam, for a reason recorded above: **`GPU.lock`
+serialises access, not memory recovery.** Lock release is synchronous and TTM
+shmem release is not, so a correct handoff can still hand the next holder a 25 GB
+baseline. Adding more protocol to a mechanism with that property does not
+converge.
+
+The workable division of labour:
+
+- **Subagents:** read, analyse, edit, build, and run non-GPU tests (pure-Python
+  gates, CPU-only unit tests). They report what they need verified.
+- **The lead session:** runs every `llama-bench`, `llama-cli`/`llama-completion`
+  gate, `test-llama-archs`, `test-thread-safety`, `test-backend-ops`, and any
+  `ctest` sweep — one at a time, sampling `Shmem`/`MemAvailable` before and ~5 s
+  after, never overlapping two.
+
+This costs nothing in throughput. GPU verification is *already* serial — the
+memory does not fit two model-loading tests concurrently — so making the serial
+point explicit removes the coordination failure without removing parallelism that
+ever existed. What parallelises is the code work, and that stays parallel.
+
 ### Code Formatting
 
 ⚠️ **`git clang-format` does not exist on this machine** — it exits 1. Git resolves
