@@ -68,9 +68,16 @@ static bool llama_model_dev_is_sycl(ggml_backend_dev_t dev) {
 }
 
 struct llama_model_sycl_loading_guard {
-    bool active = false;
+    bool       active   = false;
+    uint32_t * out_slot = nullptr;
 
-    explicit llama_model_sycl_loading_guard(bool enabled) : active(enabled && llama_model_sycl_hooks_enabled()) {
+    // `out_slot`, when given, receives the backend's ownership slot for the model
+    // whose load this guard brackets (llama.cpp-0qlw).  Only the OUTERMOST guard
+    // should pass it: the nested load_all_data guard does not end a model load,
+    // so no slot is published when it finishes.
+    explicit llama_model_sycl_loading_guard(bool enabled, uint32_t * out_slot = nullptr) :
+        active(enabled && llama_model_sycl_hooks_enabled()),
+        out_slot(out_slot) {
         if (active) {
             ggml_backend_sycl_set_model_loading(true);
         }
@@ -81,6 +88,9 @@ struct llama_model_sycl_loading_guard {
     void finish() {
         if (active) {
             ggml_backend_sycl_set_model_loading(false);
+            if (out_slot) {
+                *out_slot = ggml_backend_sycl_model_slot_current();
+            }
             active = false;
         }
     }
@@ -1323,6 +1333,26 @@ llama_model::~llama_model() {
     for (auto * lora : loras) {
         delete lora;
     }
+#ifdef GGML_USE_SYCL
+    // Model teardown is the SYCL backend's only chance to reclaim this model's
+    // cached weights (llama.cpp-0qlw).  Nothing else can: preload pins every
+    // dense weight and eviction skips pinned entries, so without this hook a
+    // dead model's VRAM was reachable only by another model's load boundary --
+    // which is exactly the sweep that could not tell a dead model's weights from
+    // a live one's idle ones.
+    //
+    // pimpl owns the ggml contexts and buffers, so it must be destroyed FIRST:
+    // the hook reports any surviving weight lease as a leak, and this model's own
+    // tensors hold leases until their extras go.
+    if (sycl_model_slot != GGML_SYCL_MODEL_SLOT_NONE) {
+        const uint32_t slot = sycl_model_slot;
+        sycl_model_slot     = GGML_SYCL_MODEL_SLOT_NONE;
+        pimpl.reset();
+        if (llama_model_sycl_hooks_enabled()) {
+            ggml_backend_sycl_model_unloaded(slot);
+        }
+    }
+#endif
 }
 
 void llama_model_base::load_stats(llama_model_loader & ml) {
@@ -1520,7 +1550,7 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
 
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
 #ifdef GGML_USE_SYCL
-    llama_model_sycl_loading_guard sycl_model_loading_guard(true);
+    llama_model_sycl_loading_guard sycl_model_loading_guard(true, &sycl_model_slot);
     llama_model_sycl_compute_early_plan(ml, hparams, __func__);
 #endif
 

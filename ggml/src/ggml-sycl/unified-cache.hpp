@@ -1388,6 +1388,39 @@ struct copyable_atomic_u32 {
 struct alloc_handle;
 struct alloc_request;
 
+// Slot identifying one live llama_model to the backend (llama.cpp-0qlw).
+// Ownership is a bitmask over slots, so at most 32 models can be attributed at
+// once; beyond that a model gets NONE and its entries stay unattributed, which
+// the reclaim paths treat conservatively (never freed while any model lives).
+constexpr uint32_t MODEL_SLOT_NONE  = 0xFFFFFFFFu;
+constexpr uint32_t MODEL_SLOT_COUNT = 32;
+
+// Why weight entries are being reclaimed.  The two model-load call sites want
+// opposite behaviour and a single predicate cannot serve both (llama.cpp-0qlw).
+enum class weight_reclaim_mode {
+    // ggml_backend_sycl_set_model_loading(true): ANOTHER model may be live.
+    // Reclaim nothing a live model owns -- including its currently IDLE weights,
+    // which read in_use_count == 0 between graphs.
+    LOAD_BOUNDARY,
+    // ggml_sycl_preload_model_weights(): inside ONE model's own load, dropping
+    // that same load's earlier plan.  Keeps the pre-0qlw behaviour, because the
+    // entries being freed were created moments earlier by this very load and
+    // keeping them fragments the TLSF arena (see the call site's comment).
+    MID_LOAD_REPLAN,
+    // ggml_backend_sycl_model_unloaded(): one model died.  Drop its ownership
+    // bit and reclaim -- unpinning first -- every entry no live model owns.
+    MODEL_TEARDOWN,
+};
+
+// An allocation detached from entries_ and freed after rw_mutex_ is dropped.
+struct stale_weight_alloc {
+    void *         ptr            = nullptr;
+    size_t         size           = 0;
+    cache_location location       = cache_location::UNKNOWN;
+    bool           host_resident  = false;
+    bool           pool_allocated = false;
+};
+
 // Metadata for a cached entry
 struct unified_cache_entry {
     void *                device_ptr;       // GPU memory pointer (or host memory if host_resident)
@@ -1433,6 +1466,16 @@ struct unified_cache_entry {
     // replace a just-erased / never-existed key; any attempt to overwrite a
     // leased entry would be a bug, asserted separately in eviction paths).
     copyable_atomic_u32   in_use_count;
+    // Model ownership (llama.cpp-0qlw), a SECOND lifetime independent of both
+    // in_use_count and `pinned`.  Bit i is set while the live model holding slot
+    // i can still resolve this weight.  `in_use_count` answers "is anybody
+    // resolving this right now", which is zero for a live model's idle weights;
+    // owner_mask answers "does anybody still own this", which is what reclaim
+    // decisions actually need.  owner_tagged distinguishes "no owner left"
+    // (reclaimable) from "never attributed to any model" (e.g. materialized at
+    // runtime, outside a load) -- the latter is kept while any model is live.
+    uint32_t              owner_mask   = 0;
+    bool                  owner_tagged = false;
     // NOTE: Reorder state is tracked in tensor->extra->optimized_feature, not here
 };
 
@@ -2218,7 +2261,32 @@ class unified_cache {
     // Called at the start of a new model load.  Model-load IDs are deliberately
     // unique, so stale direct/model weight entries from a previous load cannot
     // be resolved by the new graph and must not keep occupying the WEIGHT arena.
-    void reset_model_weight_entries();
+    //
+    // `mode` is the discriminator, NOT in_use_count: the two call sites want
+    // opposite behaviour (llama.cpp-0qlw).  The default keeps the safer of the
+    // two for callers that have not stated a purpose.
+    void reset_model_weight_entries(weight_reclaim_mode mode = weight_reclaim_mode::LOAD_BOUNDARY);
+
+    // === Model lifetime (llama.cpp-0qlw) ===
+    // Publish which model slots are currently live.  Reclaim paths never free an
+    // entry a live slot owns.
+    void set_live_model_mask(uint32_t mask);
+
+    // A model's load has finished: claim every entry it can now resolve.  Called
+    // after S1-PRELOAD, so it covers both what this load staged and anything it
+    // reused from an earlier model (identical GGUF weights dedupe to one entry).
+    void note_model_load_end(uint32_t slot);
+
+    // A model has been destroyed: drop its ownership bit, then UNPIN and reclaim
+    // every entry no live model owns.  The unpin is load-bearing -- evict_one()
+    // skips pinned entries and ggml_sycl_preload_model_weights() pins every dense
+    // weight it caches, so without it a dead model's weights are unreachable by
+    // LRU and this is the only reclaimer left.  Returns entries reclaimed.
+    size_t release_model_slot(uint32_t slot);
+
+    // Diagnostics / tests.
+    uint32_t live_model_mask() const;
+    size_t   owner_tagged_entry_count() const;
 
     void reset_stats();
     // Debug/testing helper: verify internal maps are consistent.
@@ -2665,6 +2733,19 @@ class unified_cache {
         entries_;
     std::unordered_map<ggml_sycl_cache_id, unified_cache_key, detail::cache_id_hash, detail::cache_id_equal_fn>
         id_to_key_;
+
+    // Slots held by llama_model objects that are still alive (llama.cpp-0qlw).
+    // Guarded by rw_mutex_ like entries_, so a reclaim decision and the liveness
+    // it is based on cannot disagree.
+    uint32_t live_model_mask_ = 0;
+
+    // The single reclaim loop behind reset_model_weight_entries() and
+    // release_model_slot().  `slot` is meaningful only for MODEL_TEARDOWN.
+    // Returns the number of entries erased.
+    size_t reclaim_weight_entries(weight_reclaim_mode mode, uint32_t slot);
+
+    // Free allocations detached from entries_, after rw_mutex_ has been dropped.
+    void free_stale_weight_allocs(const std::vector<stale_weight_alloc> & to_free);
 
     // Layout pool: consolidates many individual layout allocations into
     // a few large contiguous chunks to reduce GPU TLB pressure.
@@ -3868,7 +3949,12 @@ void unified_cache_zone_free(int device_id, vram_zone_id zone, void * ptr);
 
 // Reset a VRAM zone (TLSF coalescing reset — all sub-allocations become free).
 void   unified_cache_zone_reset(int device_id, vram_zone_id zone);
-void   unified_cache_reset_model_weight_entries(int device_id);
+void   unified_cache_reset_model_weight_entries(int                 device_id,
+                                                weight_reclaim_mode mode = weight_reclaim_mode::LOAD_BOUNDARY);
+// Model lifetime fan-out over every device's cache (llama.cpp-0qlw).
+void   unified_cache_set_live_model_mask(uint32_t mask);
+void   unified_cache_note_model_load_end(uint32_t slot);
+size_t unified_cache_release_model_slot(uint32_t slot);
 size_t unified_cache_host_zone_used(host_zone_id zone);
 size_t unified_cache_host_zone_capacity(host_zone_id zone);
 size_t unified_cache_host_zone_largest_free_block(host_zone_id zone);

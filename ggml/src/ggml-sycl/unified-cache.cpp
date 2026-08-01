@@ -7433,7 +7433,147 @@ void unified_cache::reset_stats() {
     misses_ = 0;
 }
 
-void unified_cache::reset_model_weight_entries() {
+static const char * weight_reclaim_mode_name(weight_reclaim_mode mode) {
+    switch (mode) {
+        case weight_reclaim_mode::LOAD_BOUNDARY:
+            return "load-boundary";
+        case weight_reclaim_mode::MID_LOAD_REPLAN:
+            return "mid-load-replan";
+        case weight_reclaim_mode::MODEL_TEARDOWN:
+            return "model-teardown";
+    }
+    return "unknown";
+}
+
+// GGML_SYCL_STRICT_LEASES=1 turns a proven leak (a lease with no live owner)
+// back into an abort.  Opt-in, for the gates -- llama.cpp-ltzq option 3.
+static bool strict_lease_checks_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_STRICT_LEASES");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// Decide whether ONE weight entry may be reclaimed.  Three lifetimes are in
+// play and each is an independent veto (llama.cpp-0qlw):
+//
+//   in_use_count  -- somebody is resolving it AT THIS INSTANT.  Note what this
+//                    does NOT mean: leases are taken and released around every
+//                    compute, so a very-much-alive model's IDLE weights read
+//                    zero between graphs.  Reading only this counter is what
+//                    freed a live model's weights out from under it.
+//   owner_mask    -- a live model can still resolve it.  This is the lifetime
+//                    that actually governs reclaimability, and the one every
+//                    previous attempt reasoned past.
+//   owner_tagged  -- whether the entry was ever attributed to a model at all.
+//                    Untagged entries (materialized at runtime, outside a load)
+//                    cannot be attributed, so they are kept while ANY model is
+//                    live and reclaimed only once none is.
+//
+// A live model's ownership vetoes reclaim in EVERY mode, including the replan.
+// The replan differs only in what it does with UNATTRIBUTED entries: those are
+// the ones its own in-flight load just staged (tagging happens at load end), and
+// freeing them is the whole point of that call site.  With no other model live
+// both modes reduce exactly to the pre-0qlw behaviour.
+static bool weight_entry_reclaimable(const unified_cache_entry & entry, weight_reclaim_mode mode, uint32_t live_mask) {
+    if (entry.in_use_count.load() != 0) {
+        return false;
+    }
+    if ((entry.owner_mask & live_mask) != 0) {
+        return false;
+    }
+    if (mode == weight_reclaim_mode::MID_LOAD_REPLAN) {
+        return true;
+    }
+    if (!entry.owner_tagged && live_mask != 0) {
+        return false;
+    }
+    return true;
+}
+
+void unified_cache::free_stale_weight_allocs(const std::vector<stale_weight_alloc> & to_free) {
+    for (const stale_weight_alloc & alloc : to_free) {
+        if (!alloc.ptr) {
+            continue;
+        }
+        if (alloc.host_resident || alloc.location == cache_location::HOST_PINNED) {
+            if (host_zones_configured()) {
+                host_zone_free(host_zone_id::WEIGHT, alloc.ptr);
+            } else {
+                host_pool_free(alloc.ptr, alloc.size);
+            }
+            continue;
+        }
+        if (vram_owns(alloc.ptr)) {
+            zone_free(vram_zone_id::WEIGHT, alloc.ptr);
+        } else if (layout_pool_ && layout_pool_->owns(alloc.ptr)) {
+            saturating_sub_used(alloc.size);
+        } else {
+            enqueue_deferred_free(alloc.ptr, alloc.size);
+        }
+    }
+}
+
+void unified_cache::set_live_model_mask(uint32_t mask) {
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+    live_model_mask_ = mask;
+}
+
+uint32_t unified_cache::live_model_mask() const {
+    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+    return live_model_mask_;
+}
+
+size_t unified_cache::owner_tagged_entry_count() const {
+    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+    size_t                              n = 0;
+    for (const auto & pair : entries_) {
+        if (pair.second.owner_tagged) {
+            n++;
+        }
+    }
+    return n;
+}
+
+void unified_cache::note_model_load_end(uint32_t slot) {
+    if (slot >= MODEL_SLOT_COUNT) {
+        // No slot was available (more than 32 concurrent models).  Leaving the
+        // entries untagged is the safe outcome: weight_entry_reclaimable() keeps
+        // untagged entries while any model is live, so we over-retain rather
+        // than free something we cannot attribute.
+        GGML_LOG_WARN("[UNIFIED-CACHE] model load finished with no ownership slot; weights left unattributed\n");
+        return;
+    }
+    const uint32_t                      bit = 1u << slot;
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+    live_model_mask_ |= bit;
+    size_t tagged = 0;
+    // Claim everything this model can now resolve, which is more than what it
+    // staged: two llama_models over the same GGUF dedupe to one entry (model_id
+    // is deliberately excluded from cache_id_equal for GGUF weights), so an
+    // entry an earlier model created must gain this model's bit too.
+    for (auto & pair : entries_) {
+        pair.second.owner_mask |= bit;
+        pair.second.owner_tagged = true;
+        tagged++;
+    }
+    GGML_SYCL_DEBUG("[UNIFIED-CACHE] model slot %u claimed %zu weight entries (live mask 0x%08x)\n", slot, tagged,
+                    live_model_mask_);
+}
+
+size_t unified_cache::release_model_slot(uint32_t slot) {
+    if (slot >= MODEL_SLOT_COUNT) {
+        return 0;
+    }
+    return reclaim_weight_entries(weight_reclaim_mode::MODEL_TEARDOWN, slot);
+}
+
+void unified_cache::reset_model_weight_entries(weight_reclaim_mode mode) {
+    reclaim_weight_entries(mode, MODEL_SLOT_NONE);
+}
+
+size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t slot) {
     // Model load is a quiescent boundary for inference. Drain cache queues so
     // direct-entry metadata cannot be cleared while an S1 copy/reorder from the
     // previous model is still in flight.
@@ -7446,29 +7586,27 @@ void unified_cache::reset_model_weight_entries() {
             bcs_queue_->wait();
         }
     } catch (const sycl::exception & e) {
-        GGML_LOG_WARN("[UNIFIED-CACHE] reset_model_weight_entries queue drain failed: %s\n", e.what());
+        GGML_LOG_WARN("[UNIFIED-CACHE] reclaim_weight_entries queue drain failed: %s\n", e.what());
     }
     drain_retained_handles(true);
 
-    struct stale_alloc {
-        void *         ptr            = nullptr;
-        size_t         size           = 0;
-        cache_location location       = cache_location::UNKNOWN;
-        bool           host_resident  = false;
-        bool           pool_allocated = false;
-    };
-
-    std::vector<stale_alloc> to_free;
-    const bool               trace_reset           = moe_direct_trace_enabled();
-    const size_t             weight_used_before    = zone_used(vram_zone_id::WEIGHT);
-    const size_t             weight_avail_before   = zone_available(vram_zone_id::WEIGHT);
-    const size_t             weight_largest_before = zone_largest_free(vram_zone_id::WEIGHT);
-    size_t                   entries_seen          = 0;
-    size_t                   entries_erased        = 0;
-    size_t                   entries_preserved     = 0;
-    size_t                   bytes_erased          = 0;
-    size_t                   direct_weights_before = 0;
-    size_t                   direct_experts_before = 0;
+    std::vector<stale_weight_alloc> to_free;
+    const bool                      trace_reset           = moe_direct_trace_enabled();
+    const size_t                    weight_used_before    = zone_used(vram_zone_id::WEIGHT);
+    const size_t                    weight_avail_before   = zone_available(vram_zone_id::WEIGHT);
+    const size_t                    weight_largest_before = zone_largest_free(vram_zone_id::WEIGHT);
+    size_t                          entries_seen          = 0;
+    size_t                          entries_erased        = 0;
+    size_t                          entries_preserved     = 0;
+    size_t                          entries_owned         = 0;
+    size_t                          entries_untagged      = 0;
+    size_t                          entries_leaked        = 0;
+    size_t                          entries_unpinned      = 0;
+    size_t                          bytes_erased          = 0;
+    size_t                          direct_weights_before = 0;
+    size_t                          direct_experts_before = 0;
+    bool                            keep_direct_tables    = false;
+    std::unordered_set<ggml_sycl_cache_id, detail::cache_id_hash, detail::cache_id_equal_fn> surviving_ids;
     {
         std::shared_lock<std::shared_mutex> lock(direct_stage_mutex_);
         direct_weights_before = direct_weight_entries_.size();
@@ -7480,44 +7618,90 @@ void unified_cache::reset_model_weight_entries() {
         // llama_model objects may be loaded at once -- tests/test-thread-safety.cpp
         // loads one per GPU plus a CPU copy and only then runs them concurrently --
         // and every live model's tensors legitimately hold weight leases through
-        // ggml_tensor_extra_gpu::data_handle.  So a live lease here means "another
-        // model is still using this weight", not "somebody leaked a handle": erasing
-        // it would free VRAM out from under a running model.  Preserve those entries
-        // and reclaim only the unreferenced ones.
+        // ggml_tensor_extra_gpu::data_handle.
         //
-        // INCOMPLETE -- see llama.cpp-0qlw.  Preserving only *leased* entries is not
-        // sufficient: in_use_count == 0 means "nobody is resolving this at this
-        // instant", not "no live model owns it".  Leases are taken and released around
-        // each compute, so a very-much-alive model's IDLE weights read zero between
-        // graphs and are still freed here.  That is the cause of the test-thread-safety
-        // SIGSEGV.  The fix needs a model-teardown hook (which does not exist --
-        // ggml_backend_sycl_set_model_loading is load-only) before this reset can be
-        // split by call-site purpose; doing the split first strands the pinned weight
-        // set, because evict_one() skips pinned entries and teardown never unpins.
-        bool                                any_preserved = false;
-        for (const auto & pair : entries_) {
-            if (pair.second.in_use_count.load() != 0) {
+        // The discriminator is the CALL SITE'S PURPOSE plus MODEL OWNERSHIP, never
+        // in_use_count on its own (llama.cpp-0qlw): a live model's idle weights read
+        // zero leases between graphs, so a lease-only test still frees them.  See
+        // weight_entry_reclaimable() for the three lifetimes involved.
+        const uint32_t bit = (mode == weight_reclaim_mode::MODEL_TEARDOWN && slot < MODEL_SLOT_COUNT) ? (1u << slot) : 0u;
+        if (bit != 0) {
+            live_model_mask_ &= ~bit;
+        }
+        const uint32_t live_mask = live_model_mask_;
+
+        // Pass 1: drop the dying model's ownership bit and find out whether
+        // anything at all survives -- the id_to_key_ remap rule below depends on
+        // it, and it must be decided with the SAME predicate pass 2 uses.
+        bool any_preserved = false;
+        for (auto & pair : entries_) {
+            if (bit != 0) {
+                pair.second.owner_mask &= ~bit;
+            }
+            if (!weight_entry_reclaimable(pair.second, mode, live_mask)) {
                 any_preserved = true;
-                break;
+            }
+            if ((pair.second.owner_mask & live_mask) != 0) {
+                // Only OWNERSHIP keeps the direct lookup tables alive.  A merely
+                // leased entry is not enough: with one model this is the state
+                // every replan is in, and clearing the tables there is what drops
+                // those leases -- keeping them would change single-model
+                // behaviour and reintroduce the fragmentation the replan avoids.
+                keep_direct_tables = true;
             }
         }
+
         for (auto it = entries_.begin(); it != entries_.end();) {
-            unified_cache_entry & entry = it->second;
-            const uint32_t        live  = entry.in_use_count.load();
+            unified_cache_entry & entry         = it->second;
+            const uint32_t        live          = entry.in_use_count.load();
+            const bool            owned_by_live = (entry.owner_mask & live_mask) != 0;
+            const bool            unattributed  = !entry.owner_tagged;
             entries_seen++;
-            if (live != 0) {
+
+            // Teardown unpins everything the dying model owned but nobody else
+            // does, whether or not it can be erased right now.  This is the piece
+            // with no substitute: evict_one() skips pinned entries and
+            // ggml_sycl_preload_model_weights() pins every dense weight it caches,
+            // so a pinned entry that survives here is unreachable by LRU forever.
+            // Unpinning is not reclaiming -- a still-leased entry keeps its
+            // allocation and merely becomes eligible for LRU once the lease drops.
+            if (mode == weight_reclaim_mode::MODEL_TEARDOWN && !owned_by_live && !unattributed && entry.pinned) {
+                entry.pinned = false;
+                entries_unpinned++;
+            }
+
+            if (!weight_entry_reclaimable(entry, mode, live_mask)) {
                 entries_preserved++;
-                residency_diagnostics_record_live_handle_for_test("reset_model_weight_entries", "WEIGHT", entry.size);
-                residency_diagnostics_record_reject_for_test(residency_reject_reason::LIVE_LEASE_PRESSURE, entry.size,
-                                                             zone_available(vram_zone_id::WEIGHT),
-                                                             zone_largest_free(vram_zone_id::WEIGHT));
-                GGML_SYCL_DEBUG(
-                    "[UNIFIED-CACHE] reset_model_weight_entries preserving leased model weight "
-                    "model=%llu name_hash=0x%llx layout=%d leases=%u\n",
-                    (unsigned long long) it->first.id.model_id, (unsigned long long) it->first.id.name_hash,
-                    (int) entry.layout, live);
+                if (live != 0) {
+                    // llama.cpp-ltzq: with ownership tracked, "another live model
+                    // owns this" and "somebody leaked a handle" are finally
+                    // distinguishable.  A lease on an entry NO live model owns,
+                    // and which was attributed to a model at some point, is the
+                    // leak the pre-acdb192d4 abort used to catch.
+                    if (mode != weight_reclaim_mode::MID_LOAD_REPLAN && !owned_by_live && !unattributed) {
+                        entries_leaked++;
+                    }
+                    residency_diagnostics_record_live_handle_for_test("reset_model_weight_entries", "WEIGHT",
+                                                                      entry.size);
+                    residency_diagnostics_record_reject_for_test(residency_reject_reason::LIVE_LEASE_PRESSURE,
+                                                                 entry.size, zone_available(vram_zone_id::WEIGHT),
+                                                                 zone_largest_free(vram_zone_id::WEIGHT));
+                    GGML_SYCL_DEBUG(
+                        "[UNIFIED-CACHE] reclaim_weight_entries preserving leased model weight "
+                        "model=%llu name_hash=0x%llx layout=%d leases=%u owners=0x%08x\n",
+                        (unsigned long long) it->first.id.model_id, (unsigned long long) it->first.id.name_hash,
+                        (int) entry.layout, live, entry.owner_mask);
+                } else if (owned_by_live) {
+                    entries_owned++;
+                } else {
+                    entries_untagged++;
+                }
                 ++it;
                 continue;
+            }
+            if (entry.pinned) {
+                entry.pinned = false;
+                entries_unpinned++;
             }
             if (entry.device_ptr && !entry.storage_owner) {
                 to_free.push_back(
@@ -7542,34 +7726,37 @@ void unified_cache::reset_model_weight_entries() {
             entries_erased++;
         }
         if (entries_preserved > 0) {
-            // Expected when more than one model is loaded; a leaked owner otherwise.
             GGML_LOG_WARN(
-                "[UNIFIED-CACHE] reset_model_weight_entries preserved %zu of %zu weight entries still leased by a "
-                "live model (erased %zu)\n",
-                entries_preserved, entries_seen, entries_erased);
+                "[UNIFIED-CACHE] reclaim_weight_entries(%s) preserved %zu of %zu weight entries "
+                "(leased=%zu owned-by-live-model=%zu unattributed=%zu leaked=%zu erased=%zu unpinned=%zu "
+                "live_mask=0x%08x)\n",
+                weight_reclaim_mode_name(mode), entries_preserved, entries_seen,
+                entries_preserved - entries_owned - entries_untagged, entries_owned, entries_untagged, entries_leaked,
+                entries_erased, entries_unpinned, live_mask);
+        }
+        if (keep_direct_tables) {
+            surviving_ids.reserve(id_to_key_.size());
+            for (const auto & pair : id_to_key_) {
+                surviving_ids.insert(pair.first);
+            }
         }
         layer_ready_.clear();
         layer_weights_.clear();
         layer_layouts_.clear();
     }
-    for (const stale_alloc & alloc : to_free) {
-        if (!alloc.ptr) {
-            continue;
-        }
-        if (alloc.host_resident || alloc.location == cache_location::HOST_PINNED) {
-            if (host_zones_configured()) {
-                host_zone_free(host_zone_id::WEIGHT, alloc.ptr);
-            } else {
-                host_pool_free(alloc.ptr, alloc.size);
-            }
-            continue;
-        }
-        if (vram_owns(alloc.ptr)) {
-            zone_free(vram_zone_id::WEIGHT, alloc.ptr);
-        } else if (layout_pool_ && layout_pool_->owns(alloc.ptr)) {
-            saturating_sub_used(alloc.size);
-        } else {
-            enqueue_deferred_free(alloc.ptr, alloc.size);
+    free_stale_weight_allocs(to_free);
+    // llama.cpp-ltzq: restore the escalation acdb192d4 traded away, without
+    // reintroducing its abort.  A lease held on an entry no live model owns is
+    // a leak by construction, not legitimate concurrency, so it is worth saying
+    // so loudly -- and worth failing on in the gates, which is where a
+    // reintroduced leak would actually show up.
+    if (entries_leaked > 0) {
+        GGML_LOG_WARN(
+            "[UNIFIED-CACHE] %zu weight entr%s still leased with NO live model owning them -- this is a leaked "
+            "mem_handle, not concurrent model use (set GGML_SYCL_STRICT_LEASES=1 to abort here)\n",
+            entries_leaked, entries_leaked == 1 ? "y is" : "ies are");
+        if (strict_lease_checks_enabled()) {
+            GGML_ABORT("[UNIFIED-CACHE] leaked model-weight mem_handle lease (GGML_SYCL_STRICT_LEASES=1)");
         }
     }
     if (entries_erased > 0 || bytes_erased > 0 || direct_weights_before > 0 || direct_experts_before > 0) {
@@ -7577,24 +7764,44 @@ void unified_cache::reset_model_weight_entries() {
     }
     {
         std::unique_lock<std::shared_mutex> lock(direct_stage_mutex_);
-        direct_weight_entries_.clear();
-        direct_expert_entries_.clear();
+        if (!keep_direct_tables) {
+            direct_weight_entries_.clear();
+            direct_expert_entries_.clear();
+        } else {
+            // Something survived because a live model still owns it.  Clearing
+            // these tables wholesale would drop that model's inference-time
+            // lookup rows (and the mem_handles they hold) along with the dead
+            // model's, so drop only the rows whose backing entry is gone.
+            // `surviving_ids` was snapshotted under rw_mutex_ above: taking
+            // rw_mutex_ here, while holding direct_stage_mutex_, would invert the
+            // lock order used by the direct staging paths.
+            for (auto it = direct_weight_entries_.begin(); it != direct_weight_entries_.end();) {
+                it = (surviving_ids.find(it->first) == surviving_ids.end()) ? direct_weight_entries_.erase(it)
+                                                                           : std::next(it);
+            }
+            for (auto it = direct_expert_entries_.begin(); it != direct_expert_entries_.end();) {
+                it = (surviving_ids.find(it->first) == surviving_ids.end()) ? direct_expert_entries_.erase(it)
+                                                                           : std::next(it);
+            }
+        }
     }
 
     has_evictions_.store(false, std::memory_order_relaxed);
     evictions_in_flight_.store(0, std::memory_order_relaxed);
     if (trace_reset) {
         GGML_LOG_INFO(
-            "[UNIFIED-CACHE] reset model weight entries: entries seen=%zu erased=%zu preserved_live=%zu "
+            "[UNIFIED-CACHE] reclaim weight entries(%s): entries seen=%zu erased=%zu preserved_live=%zu "
             "queued_free=%.1f MB direct_before weight=%zu expert=%zu "
             "weight_zone used %.1f->%.1f MB avail %.1f->%.1f MB largest %.1f->%.1f MB\n",
-            entries_seen, entries_erased, entries_preserved, bytes_erased / (1024.0 * 1024.0), direct_weights_before,
-            direct_experts_before, weight_used_before / (1024.0 * 1024.0),
-            zone_used(vram_zone_id::WEIGHT) / (1024.0 * 1024.0), weight_avail_before / (1024.0 * 1024.0),
-            zone_available(vram_zone_id::WEIGHT) / (1024.0 * 1024.0), weight_largest_before / (1024.0 * 1024.0),
-            zone_largest_free(vram_zone_id::WEIGHT) / (1024.0 * 1024.0));
+            weight_reclaim_mode_name(mode), entries_seen, entries_erased, entries_preserved,
+            bytes_erased / (1024.0 * 1024.0), direct_weights_before, direct_experts_before,
+            weight_used_before / (1024.0 * 1024.0), zone_used(vram_zone_id::WEIGHT) / (1024.0 * 1024.0),
+            weight_avail_before / (1024.0 * 1024.0), zone_available(vram_zone_id::WEIGHT) / (1024.0 * 1024.0),
+            weight_largest_before / (1024.0 * 1024.0), zone_largest_free(vram_zone_id::WEIGHT) / (1024.0 * 1024.0));
     }
-    GGML_SYCL_DEBUG("[UNIFIED-CACHE] reset model weight entries\n");
+    GGML_SYCL_DEBUG("[UNIFIED-CACHE] reclaim weight entries(%s): erased %zu unpinned %zu\n",
+                    weight_reclaim_mode_name(mode), entries_erased, entries_unpinned);
+    return entries_erased;
 }
 
 bool unified_cache::validate() const {
@@ -13416,11 +13623,44 @@ void unified_cache_zone_reset(int device_id, vram_zone_id zone) {
     }
 }
 
-void unified_cache_reset_model_weight_entries(int device_id) {
+void unified_cache_reset_model_weight_entries(int device_id, weight_reclaim_mode mode) {
     auto * cache = get_unified_cache_for_device(device_id);
     if (cache) {
-        cache->reset_model_weight_entries();
+        cache->reset_model_weight_entries(mode);
     }
+}
+
+// Model lifetime fans out over every device: one llama_model can own weights on
+// more than one card, and the ownership bit means the same thing on each.
+// Iterate the caches that EXIST -- get_unified_cache_for_device() creates one
+// (and reserves its VRAM arena) on miss, which model teardown must never do.
+void unified_cache_set_live_model_mask(uint32_t mask) {
+    std::shared_lock<std::shared_mutex> read_lock(g_cache_rw_mutex);
+    for (auto & [device_id, cache] : g_device_caches) {
+        if (cache) {
+            cache->set_live_model_mask(mask);
+        }
+    }
+}
+
+void unified_cache_note_model_load_end(uint32_t slot) {
+    std::shared_lock<std::shared_mutex> read_lock(g_cache_rw_mutex);
+    for (auto & [device_id, cache] : g_device_caches) {
+        if (cache) {
+            cache->note_model_load_end(slot);
+        }
+    }
+}
+
+size_t unified_cache_release_model_slot(uint32_t slot) {
+    size_t                              reclaimed = 0;
+    std::shared_lock<std::shared_mutex> read_lock(g_cache_rw_mutex);
+    for (auto & [device_id, cache] : g_device_caches) {
+        if (cache) {
+            reclaimed += cache->release_model_slot(slot);
+        }
+    }
+    return reclaimed;
 }
 
 void unified_cache_zone_free(int device_id, vram_zone_id zone, void * ptr) {

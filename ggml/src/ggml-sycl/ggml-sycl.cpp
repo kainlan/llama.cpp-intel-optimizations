@@ -8394,6 +8394,10 @@ static std::atomic<int> g_sycl_backend_refcount{ 0 };
 struct sycl_host_weight_extra_entry {
     ggml_tensor *           tensor = nullptr;  // cleanup/preload metadata only
     ggml_tensor_extra_gpu * extra  = nullptr;
+    // Model slot that registered this row (llama.cpp-0qlw).  The registry holds
+    // an extra ref, and through it a weight lease, so model teardown must drop
+    // exactly its own rows -- otherwise the leases it left behind read as leaks.
+    uint32_t                owner_slot = GGML_SYCL_MODEL_SLOT_NONE;
 };
 
 static std::mutex                                                    g_sycl_host_weight_extras_mutex;
@@ -8991,6 +8995,88 @@ static uint64_t ggml_sycl_named_weight_cache_uuid_locked(const std::string & nam
     return uuid;
 }
 
+// --- Model ownership slots (llama.cpp-0qlw) ---
+// Each live llama_model holds one bit.  This is the discriminator the unified
+// cache needs and model_id cannot supply: unified-cache-key.hpp deliberately
+// excludes model_id from cache_id_equal for GGUF weights, and the load-boundary
+// reset runs before any tensor of the incoming model exists.  A slot is bound to
+// the llama_model object instead, which does exist at both ends of its life.
+static std::mutex g_sycl_model_slot_mutex;
+static uint32_t   g_sycl_model_slot_allocated      = 0;  // reserved: loading or live
+static uint32_t   g_sycl_model_slot_live           = 0;  // load finished, model alive
+static uint32_t   g_sycl_model_slot_loading        = GGML_SYCL_MODEL_SLOT_NONE;
+static uint32_t   g_sycl_model_slot_last_completed = GGML_SYCL_MODEL_SLOT_NONE;
+
+static uint32_t ggml_sycl_model_slot_acquire() {
+    std::lock_guard<std::mutex> lock(g_sycl_model_slot_mutex);
+    for (uint32_t s = 0; s < ggml_sycl::MODEL_SLOT_COUNT; ++s) {
+        const uint32_t bit = 1u << s;
+        if ((g_sycl_model_slot_allocated & bit) == 0) {
+            g_sycl_model_slot_allocated |= bit;
+            return s;
+        }
+    }
+    // Out of slots: the model stays unattributed.  Its weights are then treated
+    // conservatively (kept while any model is live), which over-retains rather
+    // than freeing something we cannot prove is dead.
+    GGML_LOG_WARN("[SYCL] no free model ownership slot (%u concurrent models); weights left unattributed\n",
+                  ggml_sycl::MODEL_SLOT_COUNT);
+    return GGML_SYCL_MODEL_SLOT_NONE;
+}
+
+// Drop the registry rows registered by one model slot, releasing the registry's
+// extra refs.  Unlike the load-boundary sweep this does not touch other models'
+// rows.  Returns rows released.
+static size_t ggml_sycl_release_host_weight_extras_for_slot(uint32_t slot) {
+    size_t                      released = 0;
+    std::lock_guard<std::mutex> lock(g_sycl_host_weight_extras_mutex);
+    for (auto it = g_sycl_host_weight_extras.begin(); it != g_sycl_host_weight_extras.end();) {
+        if (it->second.owner_slot != slot) {
+            ++it;
+            continue;
+        }
+        if (it->second.extra) {
+            release_extra_gpu(it->second.extra);
+            released++;
+        }
+        it = g_sycl_host_weight_extras.erase(it);
+    }
+    return released;
+}
+
+uint32_t ggml_backend_sycl_model_slot_current(void) {
+    std::lock_guard<std::mutex> lock(g_sycl_model_slot_mutex);
+    return g_sycl_model_slot_last_completed;
+}
+
+void ggml_backend_sycl_model_unloaded(uint32_t slot) {
+    if (slot >= ggml_sycl::MODEL_SLOT_COUNT) {
+        return;
+    }
+    const uint32_t bit = 1u << slot;
+    uint32_t       live_after;
+    {
+        std::lock_guard<std::mutex> lock(g_sycl_model_slot_mutex);
+        g_sycl_model_slot_live &= ~bit;
+        g_sycl_model_slot_allocated &= ~bit;
+        if (g_sycl_model_slot_last_completed == slot) {
+            g_sycl_model_slot_last_completed = GGML_SYCL_MODEL_SLOT_NONE;
+        }
+        live_after = g_sycl_model_slot_live;
+    }
+
+    // Order matters: the registry's own refs must go before the cache is asked
+    // whether anything still holds a lease, or every weight of the most recently
+    // loaded model reads as leaked.
+    const size_t rows = ggml_sycl_release_host_weight_extras_for_slot(slot);
+
+    ggml_sycl::unified_cache_set_live_model_mask(live_after);
+    const size_t reclaimed = ggml_sycl::unified_cache_release_model_slot(slot);
+
+    GGML_LOG_INFO("[SYCL] model slot %u released: %zu registry rows, %zu cache entries reclaimed (live mask 0x%08x)\n",
+                  slot, rows, reclaimed, live_after);
+}
+
 void ggml_backend_sycl_set_model_loading(bool loading) {
     // Depth counter tracks nesting of load_tensors → load_all_data.
     // S1 mode: only clear registry at outermost entry, only preload at outermost exit.
@@ -9017,14 +9103,29 @@ void ggml_backend_sycl_set_model_loading(bool loading) {
             // planned device experts to host.
             ggml_sycl_release_host_weight_extras(ggml_sycl_host_weight_release_mode::release_registry_refs);
 
+            // Claim an ownership slot for the incoming model.  It is reserved
+            // now (so nothing else can take it) but not published as live until
+            // the load finishes -- it owns no entry yet.
+            g_sycl_model_slot_loading = ggml_sycl_model_slot_acquire();
+
             // Eager arena reservation: create the unified cache (and its VRAM arena)
             // BEFORE any KV/compute buffer allocations can steal VRAM.  The cache
             // constructor reserves the arena when vram_arena_enabled().
             const int total_gpus = ggml_sycl_info().total_gpu_count;
+            uint32_t  live_mask;
+            {
+                std::lock_guard<std::mutex> lock(g_sycl_model_slot_mutex);
+                live_mask = g_sycl_model_slot_live;
+            }
             for (int d = 0; d < total_gpus && d < GGML_SYCL_MAX_DEVICES; d++) {
                 auto * cache = ggml_sycl::get_unified_cache_for_device(d);
                 if (cache) {
-                    cache->reset_model_weight_entries();
+                    // Publish liveness before the reset consults it: this is a
+                    // LOAD boundary, so any other model's weights -- including
+                    // the ones sitting idle at zero leases between graphs -- must
+                    // survive it (llama.cpp-0qlw).
+                    cache->set_live_model_mask(live_mask);
+                    cache->reset_model_weight_entries(ggml_sycl::weight_reclaim_mode::LOAD_BOUNDARY);
                 }
             }
         }
@@ -9062,6 +9163,24 @@ void ggml_backend_sycl_set_model_loading(bool loading) {
         }
 
         ggml_sycl_preload_model_weights();
+
+        // The load is complete: claim every entry this model can now resolve.
+        // This runs AFTER preload deliberately -- it must cover both what this
+        // load staged and anything it reused from an already-loaded model, since
+        // identical GGUF weights dedupe to a single cache entry.
+        uint32_t slot;
+        {
+            std::lock_guard<std::mutex> lock(g_sycl_model_slot_mutex);
+            slot                             = g_sycl_model_slot_loading;
+            g_sycl_model_slot_loading        = GGML_SYCL_MODEL_SLOT_NONE;
+            g_sycl_model_slot_last_completed = slot;
+            if (slot < ggml_sycl::MODEL_SLOT_COUNT) {
+                g_sycl_model_slot_live |= 1u << slot;
+            }
+        }
+        if (slot < ggml_sycl::MODEL_SLOT_COUNT) {
+            ggml_sycl::unified_cache_note_model_load_end(slot);
+        }
     }
 }
 
@@ -9288,7 +9407,12 @@ void ggml_backend_sycl_register_host_weight_tensor(ggml_backend_dev_t dev, ggml_
             GGML_LOG_WARN("[SYCL] host weight registry skipped unnamed tensor with no stable cache UUID\n");
             return;
         }
-        sycl_host_weight_extra_entry new_entry{ tensor, extra };
+        uint32_t owner_slot;
+        {
+            std::lock_guard<std::mutex> slot_lock(g_sycl_model_slot_mutex);
+            owner_slot = g_sycl_model_slot_loading;
+        }
+        sycl_host_weight_extra_entry new_entry{ tensor, extra, owner_slot };
         auto                         insert = g_sycl_host_weight_extras.emplace(key, new_entry);
         if (!insert.second) {
             sycl_host_weight_extra_entry & existing = insert.first->second;
@@ -23664,7 +23788,12 @@ static void ggml_sycl_preload_model_weights() {
             // planned experts even when total free bytes are sufficient.
             GGML_LOG_INFO("[S1-PRELOAD] Resetting weight materialization before applying latest plan\n");
             ggml_sycl_release_stale_materialization_handles(weights, device);
-            cache->reset_model_weight_entries();
+            // MID_LOAD_REPLAN, not LOAD_BOUNDARY: this runs inside ONE model's own
+            // load and drops that same load's earlier plan, so the entries it frees
+            // were created moments ago by this very load.  Applying the load-boundary
+            // ownership rule here would keep them and reintroduce the TLSF
+            // fragmentation the comment above warns about (llama.cpp-0qlw).
+            cache->reset_model_weight_entries(ggml_sycl::weight_reclaim_mode::MID_LOAD_REPLAN);
             if (g_has_placement_plan) {
                 cache->set_placement_plan(ggml_sycl::placement_plan(g_placement_plan));
             }

@@ -748,6 +748,32 @@ GGML_BACKEND_API void ggml_backend_sycl_wait_barrier(ggml_backend_t backend);
 // Use this to bracket model loading to prevent cache allocation during load
 GGML_BACKEND_API void ggml_backend_sycl_set_model_loading(bool loading);
 
+// === Model ownership (llama.cpp-0qlw) ===
+// The backend caches, pins and evicts weights on behalf of a llama_model, but
+// had no way to learn that one had gone away: set_model_loading() is load-only.
+// Without that, "is this weight still owned" could only be approximated by
+// in_use_count, which is zero for a LIVE model's idle weights between graphs --
+// so the model-load boundary freed them and inference faulted on the stale
+// handle.  A slot is the model-lifetime token that answers it directly.
+#define GGML_SYCL_MODEL_SLOT_NONE 0xFFFFFFFFu
+
+// Slot assigned to the model whose load has just completed.  Read it right after
+// the matching ggml_backend_sycl_set_model_loading(false) and store it with the
+// model; it is the token ggml_backend_sycl_model_unloaded() expects.  Returns
+// GGML_SYCL_MODEL_SLOT_NONE when no slot was available (>32 concurrent models),
+// in which case that model's weights stay unattributed and are simply retained
+// for longer.
+GGML_BACKEND_API uint32_t ggml_backend_sycl_model_slot_current(void);
+
+// The model owning `slot` has been destroyed.  Releases the model's host weight
+// extras, then UNPINS and reclaims every cached weight that no live model owns.
+// The unpin is the load-bearing half: eviction skips pinned entries and model
+// preload pins every dense weight it caches, so without it a dead model's
+// weights are unreachable by LRU for the process lifetime.
+// Call AFTER the model's tensors and buffers are gone, so its weight leases have
+// already been dropped; a lease surviving this call is reported as a leak.
+GGML_BACKEND_API void ggml_backend_sycl_model_unloaded(uint32_t slot);
+
 // Release all host-backed weight extras (layout metadata, accessors, etc.)
 // Call this when unloading a model to free SYCL resources associated with tensors.
 // This is safe to call multiple times. Tensor->extra pointers are cleared before

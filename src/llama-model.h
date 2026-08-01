@@ -687,6 +687,13 @@ protected:
 
     struct impl;
     std::unique_ptr<impl> pimpl;
+
+    // SYCL model-ownership slot (llama.cpp-0qlw).  Names this model to the SYCL
+    // backend so its cached weights can be attributed: another model's load must
+    // not reclaim them, and this model's destruction must.  Assigned when
+    // load_tensors() completes; the sentinel mirrors GGML_SYCL_MODEL_SLOT_NONE,
+    // spelled literally so this header stays backend-agnostic.
+    uint32_t sycl_model_slot = 0xFFFFFFFFu;
 };
 
 llama_model * llama_model_create(llm_arch arch, const llama_model_params & params);
