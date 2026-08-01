@@ -15,18 +15,44 @@
 // symptom was a SIGSEGV inside mem_handle::resolve() itself, reached from
 // ggml_sycl_tensor_metadata_owner -> ggml_sycl_find_tensor_device_owner.
 //
-// Both tests below are CPU-only: they construct DIRECT/WEIGHT handles by hand
-// and never touch a device, a queue, or the unified cache.  They can be run
-// anywhere, including on a machine with no GPU.
+// The three tests below cover the two failure modes separately, because they do
+// NOT fail the same way:
+//
+//   1. test_resolve_never_observes_a_half_written_state -- the LOUD one.  A
+//      resolve reading cached_ while another thread writes it corrupts the
+//      shared_ptr inside resolved_ptr::ready_event, which faults inside
+//      resolve() and aborts the allocator.
+//   2. test_lease_is_released_exactly_once -- the SILENT one, and the more
+//      dangerous.  A lease released twice drives unified_cache_entry::
+//      in_use_count below the number of live references, so the evictor is free
+//      to free an allocation still in use.  Nothing reports it.
+//   3. test_concurrent_resolve_under_generation_churn -- the mirror of (2):
+//      resolve_slow()'s early exit for a non-cache device dropped the lease
+//      pointer WITHOUT decrementing, leaking the entry instead of releasing it.
+//
+// All three are CPU-only: they construct DIRECT/WEIGHT handles and a stack
+// unified_cache_entry by hand and never touch a device, a queue, or the unified
+// cache.  They can be run anywhere, including on a machine with no GPU.
 //
 // Usage:
-//   ./build/bin/test-sycl-mem-handle-concurrent-resolve
+//   ./build/bin/test-sycl-mem-handle-concurrent-resolve            # all three
+//   ./build/bin/test-sycl-mem-handle-concurrent-resolve mixed-state
+//   ./build/bin/test-sycl-mem-handle-concurrent-resolve lease-once
+//   ./build/bin/test-sycl-mem-handle-concurrent-resolve gen-churn
+//
+// The selector exists because test 1's pre-fix failure mode is an ABORT
+// (allocator corruption), which would stop the process before tests 2 and 3
+// ever ran.  Without it, the two lease tests could not be shown failing on an
+// unfixed build -- and a regression test whose RED cannot be demonstrated is
+// exactly the shape this file exists to avoid.
 
 #include "mem-handle.hpp"
+#include "unified-cache.hpp"
 
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <thread>
 #include <vector>
 
@@ -36,7 +62,23 @@ namespace {
 // unsynchronised publish is observed essentially every run.  The pre-fix
 // failure mode is a torn read within the first few thousand iterations.
 constexpr int  kReaderThreads = 4;
+constexpr int  kWriterThreads = 3;
 constexpr long kIterations    = 400000;
+
+// A handle key that is distinct per test but otherwise inert: nothing here ever
+// reaches the unified cache, so only the key's identity matters.
+ggml_sycl::unified_cache_key make_key(uint64_t tag) {
+    ggml_sycl::unified_cache_key key = {};
+    key.type                         = ggml_sycl::cache_entry_type::DENSE_WEIGHT;
+    key.layer_id                     = -1;
+    key.expert_id                    = -1;
+    key.id.name_hash                 = tag;
+    return key;
+}
+
+uint32_t lease_count(const ggml_sycl::unified_cache_entry & entry) {
+    return entry.in_use_count.v.load(std::memory_order_acquire);
+}
 
 // A resolve concurrent with a state change must observe one WHOLE published
 // state, never a mixture of the old and the new.  The two states below differ
@@ -89,56 +131,181 @@ int test_resolve_never_observes_a_half_written_state() {
     return 0;
 }
 
+// THE LEASE-ACCOUNTING TEST, and the one that matters most.
+//
+// The mixed-state race above crashes loudly.  This one corrupts a refcount
+// SILENTLY: mem_handle's lease on a unified_cache_entry is what stops the
+// evictor freeing an allocation that is still in use, so a lease released twice
+// drives in_use_count below the number of live references and makes an in-use
+// entry evictable.  Nothing reports that; the damage surfaces later as freed
+// memory being read.
+//
+// The pre-fix defect: every transition (operator=, dtor, resolve_slow) called
+// release_lease(), which read leased_entry_, decremented it, then nulled it.
+// Two threads reaching that on the SAME handle both saw the non-null pointer and
+// both decremented -- one lease, two releases.
+//
+// Device-free by construction: unified_cache_entry is a plain struct, and
+// from_weight_lease() skips its chunk-lease cache lookup at HOST_DEVICE
+// (mem-handle.cpp gates it on valid_cache_device_id), so no cache, queue or
+// device is ever touched.  Only the refcount arithmetic is under test.
+int test_lease_is_released_exactly_once() {
+    alignas(64) std::uint8_t buf_a[64] = {};
+    alignas(64) std::uint8_t buf_b[64] = {};
+
+    ggml_sycl::unified_cache_entry entry_a = {};
+    ggml_sycl::unified_cache_entry entry_b = {};
+
+    // Each template handle owns one lease -- from_weight_lease() takes ownership
+    // of a bump the caller is expected to have already made.
+    entry_a.in_use_count.v.store(1, std::memory_order_release);
+    entry_b.in_use_count.v.store(1, std::memory_order_release);
+
+    const ggml_sycl::mem_handle lease_a = ggml_sycl::mem_handle::from_weight_lease(
+        make_key(0xa11a), ggml_sycl::mem_handle::HOST_DEVICE, buf_a, GGML_LAYOUT_AOS, false, &entry_a);
+    const ggml_sycl::mem_handle lease_b = ggml_sycl::mem_handle::from_weight_lease(
+        make_key(0xb22b), ggml_sycl::mem_handle::HOST_DEVICE, buf_b, GGML_LAYOUT_SOA, true, &entry_b);
+
+    {
+        ggml_sycl::mem_handle shared = lease_a;  // +1 on entry_a
+
+        std::atomic<bool> stop{ false };
+
+        std::vector<std::thread> readers;
+        readers.reserve(kReaderThreads);
+        for (int t = 0; t < kReaderThreads; ++t) {
+            readers.emplace_back([&]() {
+                while (!stop.load(std::memory_order_relaxed)) {
+                    const ggml_sycl::resolved_ptr r = shared.resolve();
+                    (void) r;
+                    (void) shared.valid();
+                }
+            });
+        }
+
+        // Several writers, because ONE writer cannot double-release: the race
+        // needs two threads inside a lease transition on the same handle.
+        std::vector<std::thread> writers;
+        writers.reserve(kWriterThreads);
+        for (int w = 0; w < kWriterThreads; ++w) {
+            writers.emplace_back([&, w]() {
+                for (long i = 0; i < kIterations; ++i) {
+                    shared = ((i + w) & 1) ? lease_b : lease_a;
+                }
+            });
+        }
+
+        for (auto & th : writers) {
+            th.join();
+        }
+        stop.store(true, std::memory_order_relaxed);
+        for (auto & th : readers) {
+            th.join();
+        }
+        // `shared` releases its one remaining lease here.
+    }
+
+    // Exactly the two template handles remain, one lease each.  Anything else
+    // means releases and acquisitions did not pair up.
+    const uint32_t count_a = lease_count(entry_a);
+    const uint32_t count_b = lease_count(entry_b);
+    if (count_a != 1 || count_b != 1) {
+        std::fprintf(stderr,
+                     "FAIL: lease refcounts drifted: entry_a=%u entry_b=%u (expected 1 and 1)\n"
+                     "      a count below 1 is a double release -- an in-use entry the evictor may now free;\n"
+                     "      a count above 1 is a leaked lease -- an entry that can never be reclaimed\n",
+                     count_a, count_b);
+        return 1;
+    }
+    std::puts("PASS: concurrent lease transitions release exactly once");
+    return 0;
+}
+
 // The production shape: many threads resolving ONE shared handle while the
 // global cache generation churns, which is what invalidates every handle at
-// once and drives them all into the mutating slow path simultaneously.  Before
-// the fix this raced on cached_'s sycl::event refcount and on leased_entry_;
-// the assertion here is simply that it completes without corrupting memory.
+// once and drives them all into the mutating slow path simultaneously.
+//
+// This covers a SECOND lease defect, distinct from the double-release above.
+// resolve_slow()'s early exit for a non-cache device used to drop the lease by
+// writing `leased_entry_ = nullptr` WITHOUT decrementing -- the mirror image:
+// not a double release but no release at all, leaving in_use_count permanently
+// above zero so the entry could never be evicted.  The handle is seeded with a
+// lease here so the leak is observable as a count that never reaches 0.
 int test_concurrent_resolve_under_generation_churn() {
-    ggml_sycl::unified_cache_key key = {};
-    key.type                         = ggml_sycl::cache_entry_type::DENSE_WEIGHT;
-    key.layer_id                     = -1;
-    key.expert_id                    = -1;
+    alignas(64) std::uint8_t buf[64] = {};
 
-    // HOST_DEVICE keeps resolve_slow() out of the unified cache entirely, so
-    // this exercises the handle's own state machine with no device present.
-    const ggml_sycl::mem_handle shared = ggml_sycl::mem_handle::from_weight(key, ggml_sycl::mem_handle::HOST_DEVICE);
+    ggml_sycl::unified_cache_entry entry = {};
+    entry.in_use_count.v.store(1, std::memory_order_release);
 
-    std::atomic<bool> stop{ false };
+    {
+        // HOST_DEVICE keeps resolve_slow() out of the unified cache entirely, so
+        // this exercises the handle's own state machine with no device present.
+        const ggml_sycl::mem_handle shared = ggml_sycl::mem_handle::from_weight_lease(
+            make_key(0xc33c), ggml_sycl::mem_handle::HOST_DEVICE, buf, GGML_LAYOUT_AOS, false, &entry);
 
-    std::vector<std::thread> readers;
-    readers.reserve(kReaderThreads);
-    for (int t = 0; t < kReaderThreads; ++t) {
-        readers.emplace_back([&]() {
-            while (!stop.load(std::memory_order_relaxed)) {
-                const ggml_sycl::resolved_ptr r = shared.resolve();
-                (void) r;
-                (void) shared.valid();
-                (void) shared.stable_identity_hash();
-            }
-        });
+        std::atomic<bool> stop{ false };
+
+        std::vector<std::thread> readers;
+        readers.reserve(kReaderThreads);
+        for (int t = 0; t < kReaderThreads; ++t) {
+            readers.emplace_back([&]() {
+                while (!stop.load(std::memory_order_relaxed)) {
+                    const ggml_sycl::resolved_ptr r = shared.resolve();
+                    (void) r;
+                    (void) shared.valid();
+                    (void) shared.stable_identity_hash();
+                }
+            });
+        }
+
+        for (long i = 0; i < kIterations; ++i) {
+            ggml_sycl::cache_generation_bump();
+        }
+        stop.store(true, std::memory_order_relaxed);
+        for (auto & th : readers) {
+            th.join();
+        }
     }
 
-    for (long i = 0; i < kIterations; ++i) {
-        ggml_sycl::cache_generation_bump();
+    const uint32_t count = lease_count(entry);
+    if (count != 0) {
+        std::fprintf(stderr,
+                     "FAIL: lease still held after the handle was destroyed: in_use_count=%u (expected 0)\n"
+                     "      resolve_slow()'s early exit dropped leased_entry_ without releasing it\n",
+                     count);
+        return 1;
     }
-    stop.store(true, std::memory_order_relaxed);
-    for (auto & th : readers) {
-        th.join();
-    }
-
-    std::puts("PASS: concurrent resolve() under generation churn is memory-safe");
+    std::puts("PASS: concurrent resolve() under generation churn releases its lease");
     return 0;
 }
 
 }  // namespace
 
-int main() {
-    if (int rc = test_resolve_never_observes_a_half_written_state()) {
-        return rc;
+int main(int argc, char ** argv) {
+    const char * only     = argc > 1 ? argv[1] : nullptr;
+    auto         selected = [only](const char * name) {
+        return !only || std::strcmp(only, name) == 0;
+    };
+
+    if (only && !selected("mixed-state") && !selected("lease-once") && !selected("gen-churn")) {
+        std::fprintf(stderr, "unknown test '%s' (mixed-state | lease-once | gen-churn)\n", only);
+        return 2;
     }
-    if (int rc = test_concurrent_resolve_under_generation_churn()) {
-        return rc;
+
+    if (selected("mixed-state")) {
+        if (int rc = test_resolve_never_observes_a_half_written_state()) {
+            return rc;
+        }
+    }
+    if (selected("lease-once")) {
+        if (int rc = test_lease_is_released_exactly_once()) {
+            return rc;
+        }
+    }
+    if (selected("gen-churn")) {
+        if (int rc = test_concurrent_resolve_under_generation_churn()) {
+            return rc;
+        }
     }
     std::puts("PASS: mem_handle concurrent resolve");
     return 0;

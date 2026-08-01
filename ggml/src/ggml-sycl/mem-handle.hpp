@@ -85,12 +85,17 @@ struct mem_handle_debug_info;
 // two of them corrupt the shared_ptr inside cached_.ready_event and
 // double-release a single cache-entry lease.
 //
-// CONTRACT: this lock is NEVER held across a call into unified_cache.  Every
-// critical section is a short, allocation-free field copy, so the lock adds no
-// edge to the global lock order and cannot deadlock against the cache's
-// rw_mutex_.  Slow-path work (acquiring leases, releasing leases) runs unlocked;
-// the result is published under the lock, and a resolve that loses the publish
-// race releases the lease it acquired rather than leaking it.
+// CONTRACT: this lock is NEVER held across a call into unified_cache.  Slow-path
+// work (acquiring leases, releasing leases) runs unlocked; the result is
+// published under the lock, and a resolve that loses the publish race releases
+// the lease it acquired rather than leaking it.  That is what keeps the lock off
+// the global lock order, so it cannot deadlock against the cache's rw_mutex_.
+//
+// The critical sections are short but NOT allocation-free: assigning cached_
+// destroys the outgoing resolved_ptr's sycl::event, and that refcount drop can
+// deallocate a control block.  It is a handful of instructions in the common
+// case and touches no cache lock, so it is safe here — but do not add work to a
+// critical section on the belief that nothing under this lock can allocate.
 class mem_handle_spin_lock {
   public:
     mem_handle_spin_lock() = default;
@@ -371,8 +376,14 @@ class mem_handle {
 
     // Mutable because resolve() is logically const (returns the current
     // pointer) but updates the cache as a side effect.
-    mutable uint64_t     gen_    = 0;
-    mutable resolved_ptr cached_ = {};
+    //
+    // The seven fields tagged GUARDED below are the ones resolve() rewrites, and
+    // every read or write of them must hold lock_.  They are not contiguous
+    // (owned_alloc_ and debug_owner_tag_ sit among them), so the tag — not the
+    // position — is what marks membership.  A new mutable field belongs in this
+    // set unless you can say why it does not.
+    mutable uint64_t     gen_    = 0;   // GUARDED by lock_
+    mutable resolved_ptr cached_ = {};  // GUARDED by lock_
 
     // Optional runtime allocation owner.  DIRECT handles that wrap scratch,
     // staging, or runtime allocations can carry this shared owner so copies are
@@ -390,7 +401,7 @@ class mem_handle {
     // only invalidates pointers to the erased element.  Eviction paths
     // MUST NOT erase entries with in_use_count > 0, which is the contract
     // enforced in unified_cache::evict_one / remove / evict_and_flush.
-    mutable unified_cache_entry * leased_entry_ = nullptr;
+    mutable unified_cache_entry * leased_entry_ = nullptr;  // GUARDED by lock_
 
     // llama.cpp-dyhdl: chunk-level lease backref.  Defense-in-depth beneath
     // the cache_entry refcount: this stops the underlying arena chunk from
@@ -408,10 +419,10 @@ class mem_handle {
     //
     // A CHUNK_LEASE-kind handle stores its protected raw ptr in cached_.ptr;
     // resolve() returns cached_ directly (never re-queries the cache).
-    mutable uint8_t  chunk_source_      = 0;
-    mutable uint64_t host_chunk_handle_ = UINT64_MAX;  // pinned_chunk_pool::INVALID_CHUNK_HANDLE
-    mutable int32_t  vram_chunk_idx_    = -1;
-    mutable int32_t  chunk_device_      = -1;
+    mutable uint8_t  chunk_source_      = 0;           // GUARDED by lock_
+    mutable uint64_t host_chunk_handle_ = UINT64_MAX;  // GUARDED (pinned_chunk_pool::INVALID_CHUNK_HANDLE)
+    mutable int32_t  vram_chunk_idx_    = -1;          // GUARDED by lock_
+    mutable int32_t  chunk_device_      = -1;          // GUARDED by lock_
 
     const char * debug_owner_tag_ = "";
 };
