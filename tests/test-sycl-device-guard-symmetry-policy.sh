@@ -142,5 +142,83 @@ expect_status 2 "helper never called, with a violation present" "$TMP/no-helper.
 printf 'inline bool f() {\n    return ggml_sycl_valid_device_index(0);\n}\n' > "$TMP/no-device-param.cpp"
 expect_status 2 "no function takes a device parameter" "$TMP/no-device-param.cpp"
 
+# --- report classification, driven directly (llama.cpp-n68j) ----------------
+# ⚠️ THE no-helper CASE ABOVE IS NOT COVERAGE FOR THIS, though it looks like it.
+# Its report is a LONE FATAL line: nhelper hits 0, the FATAL is emitted, and awk
+# exits before any buffered finding is printed. "FATAL at start" and "FATAL
+# anywhere" agree on that input, so it passed before the fix and would still pass
+# with the fix reverted. The 35-line FATAL-anywhere change to the checker had
+# nothing pinning it at all until these cases -- not wrong, UNFALSIFIABLE, which
+# is the property that let every defect this wave fixed survive as long as it
+# did. Found by qual-x54y-r1.
+#
+# Driven through --classify-report because the interleaving cannot be produced
+# from a file: both FATAL conditions (nhelper==0, nparams==0) are evaluated
+# before any finding is emitted, so no fixture reaches the shape.
+classify() {
+    local want="$1" what="$2" report="$3" rc=0
+    printf '%s\n' "$report" | "$CHECKER" --classify-report >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -ne "$want" ]; then
+        echo "expected $what to exit $want, got $rc" >&2
+        exit 1
+    fi
+}
+
+# The backticks are literal -- this string reproduces the checker's real finding
+# format byte for byte, so the fixture cannot drift from what it stands in for.
+# shellcheck disable=SC2016
+FINDING='common.hpp:1229: `device < 0` guards the lower bound only -- use ggml_sycl_valid_device_index(device)'
+FATAL='FATAL: ggml_sycl_valid_device_index() is never called in this file -- renamed, moved, or the wrong file was passed; an absence check here would pass vacuously'
+
+classify 2 "a leading FATAL"        "$FATAL"
+classify 1 "findings with no FATAL" "$FINDING
+OK 26 helper calls, 98 device params, 1 half-guards"
+classify 0 "a clean inventory"      "OK 26 helper calls, 98 device params, 0 half-guards"
+
+# THE CASE THAT PINS THE FIX. Revert the checker's FATAL-anywhere dispatch and
+# this one goes to 1: cannot-check silently downgraded to "your code is wrong".
+classify 2 "a FATAL preceded by a finding" "$FINDING
+$FATAL"
+
+# A report with none of the three markers. This used to exit 1 SILENTLY --
+# `printf ... | grep '^OK '` failing under `set -e` -- which is the same wrong
+# direction arrived at without any ordering involved.
+classify 2 "a report with no marker at all" ""
+
+# A file literally named --classify-report must still be readable as a file.
+# The flag shares the positional slot with the target path, so `--` ends option
+# parsing. Cheap to pin now; expensive to discover once the seam is in N scripts.
+printf 'inline bool f(int device) {\n    return ggml_sycl_valid_device_index(device);\n}\n' > "$TMP/--classify-report"
+rc=0
+( cd "$TMP" && "$CHECKER" -- ./--classify-report ) >/dev/null 2>&1 || rc=$?
+if [ "$rc" -ne 0 ]; then
+    echo "expected '-- ./--classify-report' to be read as a FILE (exit 0), got $rc" >&2
+    exit 1
+fi
+
+# --- determinism -------------------------------------------------------------
+# Matches the sibling's guard. This checker has no piped early-exiting grep and
+# never had the SIGPIPE flake of llama.cpp-x54y, so this protects against
+# reintroducing one rather than reproducing anything.
+det_first=""
+det_bad=0
+for _ in $(seq 30); do
+    det_rc=0
+    "$CHECKER" "$TARGET" >/dev/null 2>&1 || det_rc=$?
+    if [ -z "$det_first" ]; then
+        det_first="$det_rc"
+    elif [ "$det_rc" != "$det_first" ]; then
+        det_bad=1
+    fi
+done
+if [ "$det_bad" -ne 0 ] || [ "$det_first" != "0" ]; then
+    echo "the checker is not deterministic over an unchanged tree" >&2
+    echo "(first status $det_first, and at least one run disagreed)." >&2
+    echo "Do NOT re-run until it goes green. Suspect a pipeline under" >&2
+    echo "'set -o pipefail': grep -q/-l/-m exits early, its writer takes" >&2
+    echo "SIGPIPE, and a successful match is reported as a failure." >&2
+    exit 1
+fi
+
 # Only now, against the real header.
 "$CHECKER" "$TARGET"

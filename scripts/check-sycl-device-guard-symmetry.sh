@@ -90,7 +90,32 @@
 # patterns have stopped describing the code and this reports that instead.
 set -euo pipefail
 
-TARGET="${1:?usage: check-sycl-device-guard-symmetry.sh <file>}"
+# Option parsing. `--classify-report` reads a report on stdin and runs only the
+# dispatch below, so the exit-status contract can be driven directly by
+# tests/test-sycl-device-guard-symmetry-policy.sh. `--` is the end-of-options
+# marker, so a file genuinely named `--classify-report` stays reachable as
+# `check-sycl-device-guard-symmetry.sh -- --classify-report`.
+#
+# The seam is here because the FATAL-anywhere fix below had NOTHING pinning it
+# otherwise, and that is this family's own defect class one level up: the fix was
+# not wrong, it was UNFALSIFIABLE. The adjacent no-helper fixture in the wrapper
+# looks like coverage and is not -- its report is a lone FATAL line, on which
+# "FATAL at start" and "FATAL anywhere" agree, so it passed before the fix and
+# would still pass with the fix reverted. Caught by qual-x54y-r1; see
+# llama.cpp-n68j.
+CLASSIFY_ONLY=0
+if [ "${1:-}" = "--" ]; then
+    shift
+elif [ "${1:-}" = "--classify-report" ]; then
+    CLASSIFY_ONLY=1
+    shift
+fi
+
+if [ "$CLASSIFY_ONLY" -eq 1 ]; then
+    report="$(cat)"
+else
+
+TARGET="${1:?usage: check-sycl-device-guard-symmetry.sh [--classify-report | [--] <file>]}"
 
 if [ ! -e "$TARGET" ]; then
     echo "check-sycl-device-guard-symmetry.sh: no such file or directory: $TARGET" >&2
@@ -169,6 +194,8 @@ END {
 }
 ' "$TARGET")
 
+fi
+
 # FATAL is matched ANYWHERE in the report, not only at its start (llama.cpp-n68j).
 # The awk above already buffers findings so a FATAL always leads, which is what
 # makes this correct today -- but that left the property resting on every future
@@ -194,6 +221,16 @@ fi
 # the counts are the live evidence that the patterns still match anything, so a
 # regex that has quietly stopped matching shows up as a number that moved rather
 # than as a green run.
-printf '%s\n' "$report" | grep '^OK '
+#
+# A report with no FATAL, no finding and no OK line is a broken premise, not a
+# pass. This grep's failure used to fall through to `set -e`, which exited 1 with
+# no output at all -- "awk produced nothing usable" reported as "your code is
+# wrong", the same wrong direction llama.cpp-n68j is about, reached without any
+# ordering involved. Unreachable from a file (awk always emits one of the three)
+# and reachable through --classify-report, which is what made it testable.
+if ! printf '%s\n' "$report" | grep '^OK '; then
+    echo "check-sycl-device-guard-symmetry.sh: the report carries no FATAL, no finding and no OK line -- awk produced nothing usable" >&2
+    exit 2
+fi
 
 exit 0

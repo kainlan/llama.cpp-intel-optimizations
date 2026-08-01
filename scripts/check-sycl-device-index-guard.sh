@@ -37,7 +37,25 @@
 # array added tomorrow is covered without editing this script.
 set -euo pipefail
 
-TARGET="${1:?usage: check-sycl-device-index-guard.sh [--classify-report] <file>}"
+# Option parsing, such as it is. `--classify-report` shares the positional slot
+# with the target path, so `--` is honoured as the end-of-options marker and a
+# file genuinely named `--classify-report` stays reachable:
+#
+#     check-sycl-device-index-guard.sh -- --classify-report
+#
+# Vanishingly unlikely on its own. Done because the seam now exists in TWO
+# scripts, and four lines settled once is cheaper than the same caveat explained
+# per script -- which is the point at which "unlikely" stops being the relevant
+# axis. An env var would also have worked and was rejected: an exported
+# CHECK_SYCL_* left over from a debugging session would silently redirect EVERY
+# gate to stdin, which is a worse failure than a file nobody will ever create.
+CLASSIFY_ONLY=0
+if [ "${1:-}" = "--" ]; then
+    shift
+elif [ "${1:-}" = "--classify-report" ]; then
+    CLASSIFY_ONLY=1
+    shift
+fi
 
 # Turn the awk report into an exit status. Factored out of the tail of this
 # script for llama.cpp-n68j, for two reasons that are worth keeping separate:
@@ -110,11 +128,13 @@ classify_report() {
     return 0
 }
 
-if [ "$TARGET" = "--classify-report" ]; then
+if [ "$CLASSIFY_ONLY" -eq 1 ]; then
     rc=0
     classify_report "$(cat)" || rc=$?
     exit "$rc"
 fi
+
+TARGET="${1:?usage: check-sycl-device-index-guard.sh [--classify-report | [--] <file>]}"
 
 if [ ! -e "$TARGET" ]; then
     echo "check-sycl-device-index-guard.sh: no such file or directory: $TARGET" >&2
