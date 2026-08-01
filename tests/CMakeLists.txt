@@ -201,7 +201,15 @@ function(llama_build_and_test source)
         COMMAND $<TARGET_FILE:${TEST_TARGET}>
         ${LLAMA_TEST_ARGS})
 
-    set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
+    # Exit 77 is the skip status, matching llama_test_pytest above and the
+    # test-sycl-*-policy.sh family. Without it a test that skips at run time --
+    # the model-requiring ones via test_skip_no_model() in tests/test-skip.h --
+    # would be reported "Passed", indistinguishable from a run that did the
+    # work. Set here rather than per-registration so no future model-requiring
+    # test can be added without it (llama.cpp-nwip).
+    set_tests_properties(${TEST_TARGET} PROPERTIES
+        LABELS "${LLAMA_TEST_LABEL}"
+        SKIP_RETURN_CODE 77)
 endfunction()
 
 # build test-tokenizer-0 target once and add many tests
