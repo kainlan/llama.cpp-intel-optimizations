@@ -1,0 +1,110 @@
+0.00.009.594 I llama_completion: llama backend init
+0.00.248.127 I llama_completion: load the model and apply lora adapter, if any
+[SYCL] GGML_SYCL_F16 build: attention Q/accumulators are f16
+0.38.632.876 I llama_completion: llama threadpool init, n_threads = 4
+0.38.632.901 I 
+0.38.632.964 I system_info: n_threads = 4 (n_threads_batch = 4) / 20 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX_VNNI = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.38.632.966 I 
+0.38.633.004 I sampler seed: 42
+0.38.633.011 I sampler params: 
+	repeat_last_n = 64, repeat_penalty = 1.000, frequency_penalty = 0.000, presence_penalty = 0.000
+	dry_multiplier = 0.000, dry_base = 1.750, dry_allowed_length = 2, dry_penalty_last_n = -1
+	top_k = 40, top_p = 0.950, min_p = 0.050, xtc_probability = 0.000, xtc_threshold = 0.100, typical_p = 1.000, top_n_sigma = -1.000, temp = 0.000
+	mirostat = 0, mirostat_lr = 0.100, mirostat_ent = 5.000, adaptive_target = -1.000, adaptive_decay = 0.900
+0.38.633.019 I sampler chain: logits -> ?penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> temp-ext -> dist 
+0.38.633.019 I generate: n_ctx = 32768, n_batch = 2048, n_predict = 15, n_keep = 1
+0.38.633.019 I 
+0.39.405.314 I common_perf_print:    sampling time =       0.92 ms
+0.39.405.315 I common_perf_print:    samplers time =       0.33 ms /    31 tokens
+0.39.405.316 I common_perf_print:        load time =   38365.08 ms
+0.39.405.317 I common_perf_print: prompt eval time =     384.75 ms /    16 tokens (   24.05 ms per token,    41.59 tokens per second)
+0.39.405.319 I common_perf_print:        eval time =     386.27 ms /    14 runs   (   27.59 ms per token,    36.24 tokens per second)
+0.39.405.319 I common_perf_print:       total time =     772.44 ms /    30 tokens
+0.39.405.319 I common_perf_print: unaccounted time =       0.51 ms /   0.1 %      (total - sampling - prompt eval - eval) / (total)
+0.39.405.320 I common_perf_print:    graphs reused =         13
+0.39.456.174 W [UNIFIED-CACHE] reclaim_weight_entries(model-teardown) preserved 291 of 516 weight entries (leased=291 owned-by-live-model=0 unattributed=0 leaked=291 erased=225 unpinned=516 live_mask=0x00000000)
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/model-teardown:dev0 graph=16 alloc_id=8654063367539930075 size=38535168 role=8 category=1 tier=0 cohort=weight:leaked_lease
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/model-teardown:dev0 graph=16 alloc_id=9716352549236027385 size=2752512 role=8 category=1 tier=0 cohort=weight:leaked_lease
+0.39.456.211 W [ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/model-teardown:dev0 graph=16 alloc_id=8654063367539930075 size=38535168 role=8 category=1 tier=0 cohort=weight:leaked_lease
+0.39.456.222 W [ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/model-teardown:dev0 graph=16 alloc_id=9716352549236027385 size=2752512 role=8 category=1 tier=0 cohort=weight:leaked_lease
+0.39.456.223 W [ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/model-teardown:dev0 graph=16 alloc_id=14434623565294318152 size=16384 role=0 category=1 tier=0 cohort=weight:leaked_lease
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/model-teardown:dev0 graph=16 alloc_id=14434623565294318152 size=16384 role=0 category=1 tier=0 cohort=weight:leaked_lease
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/model-teardown:dev0 graph=16 alloc_id=3844530196933985500 size=11010048 role=8 category=1 tier=0 cohort=weight:leaked_lease
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/model-teardown:dev0 graph=16 alloc_id=4298024497130574304 size=107520000 role=1 category=1 tier=0 cohort=weight:leaked_lease
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/model-teardown:dev0 graph=16 alloc_id=12467192014320699603 size=86016000 role=8 category=1 tier=0 cohort=weight:leaked_lease
+0.39.456.232 W [ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/model-teardown:dev0 graph=16 alloc_id=3844530196933985500 size=11010048 role=8 category=1 tier=0 cohort=weight:leaked_lease
+0.39.456.234 W [ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/model-teardown:dev0 graph=16 alloc_id=4298024497130574304 size=107520000 role=1 category=1 tier=0 cohort=weight:leaked_lease
+0.39.456.234 W [ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/model-teardown:dev0 graph=16 alloc_id=12467192014320699603 size=86016000 role=8 category=1 tier=0 cohort=weight:leaked_lease
+0.39.456.285 W [UNIFIED-CACHE] 291 weight entries are still leased with NO live model owning them -- this is a leaked mem_handle, not concurrent model use (set GGML_SYCL_STRICT_LEASES=1 to abort here)
+[ZONE-RESET-AUDIT] ==== escape inventory (process-exit) graphs=16 ====
+0.39.467.864 W [ZONE-RESET-AUDIT] ==== escape inventory (process-exit) graphs=16 ====
+[ZONE-RESET-AUDIT] site=device-zone-reset/ONEDNN:dev0 visits=3 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[2..2]
+0.39.467.877 W [ZONE-RESET-AUDIT] site=device-zone-reset/ONEDNN:dev0 visits=3 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[2..2]
+[ZONE-RESET-AUDIT]   largest_free first=256.00 MB last=143.88 MB min=143.88 MB
+[ZONE-RESET-AUDIT] site=device-zone-reset/SCRATCH:dev0 visits=16 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[0..15]
+0.39.467.889 W [ZONE-RESET-AUDIT]   largest_free first=256.00 MB last=143.88 MB min=143.88 MB
+0.39.467.891 W [ZONE-RESET-AUDIT] site=device-zone-reset/SCRATCH:dev0 visits=16 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[0..15]
+0.39.467.892 W [ZONE-RESET-AUDIT]   largest_free first=512.00 MB last=512.00 MB min=512.00 MB
+[ZONE-RESET-AUDIT] site=host-zone-reset/SCRATCH visits=16 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[1..16]
+[ZONE-RESET-AUDIT]   largest_free first=512.00 MB last=512.00 MB min=512.00 MB
+[ZONE-RESET-AUDIT]   largest_free first=309.54 MB last=309.54 MB min=309.54 MB
+[ZONE-RESET-AUDIT] site=host-zone-reset/STAGING visits=16 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[1..16]
+[ZONE-RESET-AUDIT]   largest_free first=223.08 MB last=223.08 MB min=223.08 MB
+[ZONE-RESET-AUDIT] site=scratch-pool-reset/bump:dev0 visits=16 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[1..16]
+[ZONE-RESET-AUDIT] site=weight-reclaim/load-boundary:dev0 visits=1 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[0..0]
+0.39.467.899 W [ZONE-RESET-AUDIT] site=host-zone-reset/SCRATCH visits=16 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[1..16]
+0.39.467.900 W [ZONE-RESET-AUDIT]   largest_free first=309.54 MB last=309.54 MB min=309.54 MB
+0.39.467.902 W [ZONE-RESET-AUDIT] site=host-zone-reset/STAGING visits=16 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[1..16]
+0.39.467.903 W [ZONE-RESET-AUDIT]   largest_free first=223.08 MB last=223.08 MB min=223.08 MB
+[ZONE-RESET-AUDIT]   largest_free first=13738.00 MB last=13738.00 MB min=13738.00 MB
+[ZONE-RESET-AUDIT] site=weight-reclaim/mid-load-replan:dev0 visits=1 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[0..0]
+0.39.467.904 W [ZONE-RESET-AUDIT] site=scratch-pool-reset/bump:dev0 visits=16 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[1..16]
+0.39.467.905 W [ZONE-RESET-AUDIT] site=weight-reclaim/load-boundary:dev0 visits=1 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[0..0]
+0.39.467.906 W [ZONE-RESET-AUDIT]   largest_free first=13738.00 MB last=13738.00 MB min=13738.00 MB
+0.39.467.913 W [ZONE-RESET-AUDIT] site=weight-reclaim/mid-load-replan:dev0 visits=1 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[0..0]
+[ZONE-RESET-AUDIT]   largest_free first=13738.00 MB last=13738.00 MB min=13738.00 MB
+[ZONE-RESET-AUDIT] site=weight-reclaim/model-teardown:dev0 visits=1 visits_with_live=1 live_max=291 live_total=291 distinct_sizes=6 distinct_cohorts=1 graphs=[16..16]
+0.39.467.914 W [ZONE-RESET-AUDIT]   largest_free first=13738.00 MB last=13738.00 MB min=13738.00 MB
+0.39.467.921 W [ZONE-RESET-AUDIT] site=weight-reclaim/model-teardown:dev0 visits=1 visits_with_live=1 live_max=291 live_total=291 distinct_sizes=6 distinct_cohorts=1 graphs=[16..16]
+0.39.467.922 W [ZONE-RESET-AUDIT]   largest_free first=5370.10 MB last=5370.10 MB min=5370.10 MB
+[ZONE-RESET-AUDIT]   cohort=weight:leaked_lease size=16384 occurrences=65 graphs=1 per_graph=65.00 distinct_alloc_ids=65 role=0 category=1 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   cohort=weight:leaked_lease size=2752512 occurrences=64 graphs=1 per_graph=64.00 distinct_alloc_ids=64 role=8 category=1 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   largest_free first=5370.10 MB last=5370.10 MB min=5370.10 MB
+0.39.467.937 W [ZONE-RESET-AUDIT]   cohort=weight:leaked_lease size=16384 occurrences=65 graphs=1 per_graph=65.00 distinct_alloc_ids=65 role=0 category=1 tier=0 -> single-shot
+0.39.467.938 W [ZONE-RESET-AUDIT]   cohort=weight:leaked_lease size=2752512 occurrences=64 graphs=1 per_graph=64.00 distinct_alloc_ids=64 role=8 category=1 tier=0 -> single-shot
+0.39.467.939 W [ZONE-RESET-AUDIT]   cohort=weight:leaked_lease size=11010048 occurrences=64 graphs=1 per_graph=64.00 distinct_alloc_ids=64 role=8 category=1 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   cohort=weight:leaked_lease size=11010048 occurrences=64 graphs=1 per_graph=64.00 distinct_alloc_ids=64 role=8 category=1 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   cohort=weight:leaked_lease size=38535168 occurrences=96 graphs=1 per_graph=96.00 distinct_alloc_ids=96 role=8 category=1 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   cohort=weight:leaked_lease size=86016000 occurrences=1 graphs=1 per_graph=1.00 distinct_alloc_ids=1 role=8 category=1 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   cohort=weight:leaked_lease size=107520000 occurrences=1 graphs=1 per_graph=1.00 distinct_alloc_ids=1 role=1 category=1 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   size-histogram 16384 x65
+[ZONE-RESET-AUDIT]   size-histogram 2752512 x64
+[ZONE-RESET-AUDIT]   size-histogram 11010048 x64
+[ZONE-RESET-AUDIT]   size-histogram 38535168 x96
+[ZONE-RESET-AUDIT]   size-histogram 86016000 x1
+0.39.467.947 W [ZONE-RESET-AUDIT]   cohort=weight:leaked_lease size=38535168 occurrences=96 graphs=1 per_graph=96.00 distinct_alloc_ids=96 role=8 category=1 tier=0 -> single-shot
+0.39.467.949 W [ZONE-RESET-AUDIT]   cohort=weight:leaked_lease size=86016000 occurrences=1 graphs=1 per_graph=1.00 distinct_alloc_ids=1 role=8 category=1 tier=0 -> single-shot
+0.39.467.950 W [ZONE-RESET-AUDIT]   cohort=weight:leaked_lease size=107520000 occurrences=1 graphs=1 per_graph=1.00 distinct_alloc_ids=1 role=1 category=1 tier=0 -> single-shot
+0.39.467.950 W [ZONE-RESET-AUDIT]   size-histogram 16384 x65
+0.39.467.951 W [ZONE-RESET-AUDIT]   size-histogram 2752512 x64
+0.39.467.953 W [ZONE-RESET-AUDIT]   size-histogram 11010048 x64
+0.39.467.953 W [ZONE-RESET-AUDIT]   size-histogram 38535168 x96
+0.39.467.954 W [ZONE-RESET-AUDIT]   size-histogram 86016000 x1
+0.39.467.954 W [ZONE-RESET-AUDIT]   size-histogram 107520000 x1
+[ZONE-RESET-AUDIT]   size-histogram 107520000 x1
+[ZONE-RESET-AUDIT]   timing vram/kv alloc_calls=32 alloc_MB=4096.0 alloc_ms=0.078 free_calls=32 free_ms=0.009 allocs_per_graph_max=32 allocs_per_graph_mean=2.0 graphs=16
+[ZONE-RESET-AUDIT]   timing vram/weight alloc_calls=519 alloc_MB=8374.9 alloc_ms=0.673 free_calls=228 free_ms=0.047 allocs_per_graph_max=517 allocs_per_graph_mean=32.4 graphs=16
+0.39.467.970 W [ZONE-RESET-AUDIT]   timing vram/kv alloc_calls=32 alloc_MB=4096.0 alloc_ms=0.078 free_calls=32 free_ms=0.009 allocs_per_graph_max=32 allocs_per_graph_mean=2.0 graphs=16
+0.39.467.972 W [ZONE-RESET-AUDIT]   timing vram/weight alloc_calls=519 alloc_MB=8374.9 alloc_ms=0.673 free_calls=228 free_ms=0.047 allocs_per_graph_max=517 allocs_per_graph_mean=32.4 graphs=16
+0.39.467.974 W [ZONE-RESET-AUDIT]   timing vram/onednn alloc_calls=6 alloc_MB=256.7 alloc_ms=0.002 free_calls=0 free_ms=0.000 allocs_per_graph_max=6 allocs_per_graph_mean=0.4 graphs=16
+[ZONE-RESET-AUDIT]   timing vram/onednn alloc_calls=6 alloc_MB=256.7 alloc_ms=0.002 free_calls=0 free_ms=0.000 allocs_per_graph_max=6 allocs_per_graph_mean=0.4 graphs=16
+[ZONE-RESET-AUDIT]   timing vram/runtime alloc_calls=67 alloc_MB=144.0 alloc_ms=0.020 free_calls=67 free_ms=0.036 allocs_per_graph_max=65 allocs_per_graph_mean=4.2 graphs=16
+0.39.467.984 W [ZONE-RESET-AUDIT]   timing vram/runtime alloc_calls=67 alloc_MB=144.0 alloc_ms=0.020 free_calls=67 free_ms=0.036 allocs_per_graph_max=65 allocs_per_graph_mean=4.2 graphs=16
+[ZONE-RESET-AUDIT]   timing host/WEIGHT alloc_calls=3 alloc_MB=40.3 alloc_ms=0.003 free_calls=2 free_ms=0.003 allocs_per_graph_max=3 allocs_per_graph_mean=0.2 graphs=16
+[ZONE-RESET-AUDIT]   timing host/STAGING alloc_calls=49 alloc_MB=102.5 alloc_ms=0.016 free_calls=1 free_ms=0.002 allocs_per_graph_max=3 allocs_per_graph_mean=2.9 graphs=16
+0.39.467.986 W [ZONE-RESET-AUDIT]   timing host/SCRATCH alloc_calls=1269 alloc_MB=4517.5 alloc_ms=1.650 free_calls=1269 free_ms=1.894 allocs_per_graph_max=741 allocs_per_graph_mean=77.2 graphs=16
+[ZONE-RESET-AUDIT] ==== end inventory ====
+[ZONE-RESET-AUDIT]   timing host/WEIGHT alloc_calls=3 alloc_MB=40.3 alloc_ms=0.003 free_calls=2 free_ms=0.003 allocs_per_graph_max=3 allocs_per_graph_mean=0.2 graphs=16
+0.39.467.988 W [ZONE-RESET-AUDIT]   timing host/STAGING alloc_calls=49 alloc_MB=102.5 alloc_ms=0.016 free_calls=1 free_ms=0.002 allocs_per_graph_max=3 allocs_per_graph_mean=2.9 graphs=16
+0.39.467.990 W [ZONE-RESET-AUDIT]   timing host/SCRATCH alloc_calls=1269 alloc_MB=4517.5 alloc_ms=1.650 free_calls=1269 free_ms=1.894 allocs_per_graph_max=741 allocs_per_graph_mean=77.2 graphs=16
+0.39.467.991 W [ZONE-RESET-AUDIT] ==== end inventory ====

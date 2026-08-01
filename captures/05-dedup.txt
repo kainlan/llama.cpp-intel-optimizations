@@ -1,0 +1,75 @@
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/load-boundary:dev0 graph=0 alloc_id=11363547264880712818 size=145152 role=8 category=1 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/load-boundary:dev0 graph=0 alloc_id=1177121191718051043 size=46656 role=1 category=0 tier=0 cohort=weight:owned_by_live_model
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/load-boundary:dev0 graph=0 alloc_id=15912406255868731290 size=54432 role=8 category=1 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/load-boundary:dev0 graph=0 alloc_id=5459728280455358557 size=124416 role=1 category=0 tier=0 cohort=weight:owned_by_live_model
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/load-boundary:dev0 graph=0 alloc_id=12467192014320699603 size=6048000 role=8 category=1 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/load-boundary:dev0 graph=0 alloc_id=1528975410750657241 size=1152 role=0 category=1 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/load-boundary:dev0 graph=0 alloc_id=4298024497130574304 size=9792000 role=1 category=1 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/load-boundary:dev0 graph=0 alloc_id=12467192014320699603 size=5184000 role=0 category=0 tier=0 cohort=weight:owned_by_live_model
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/mid-load-replan:dev0 graph=0 alloc_id=11363547264880712818 size=145152 role=8 category=1 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/mid-load-replan:dev0 graph=0 alloc_id=1177121191718051043 size=46656 role=1 category=0 tier=0 cohort=weight:owned_by_live_model
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/mid-load-replan:dev0 graph=0 alloc_id=15912406255868731290 size=54432 role=8 category=1 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/mid-load-replan:dev0 graph=0 alloc_id=5459728280455358557 size=124416 role=1 category=0 tier=0 cohort=weight:owned_by_live_model
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/mid-load-replan:dev0 graph=0 alloc_id=12467192014320699603 size=6048000 role=8 category=1 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/mid-load-replan:dev0 graph=0 alloc_id=1528975410750657241 size=1152 role=0 category=1 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/mid-load-replan:dev0 graph=0 alloc_id=4298024497130574304 size=9792000 role=1 category=1 tier=0 cohort=weight:leased
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=weight-reclaim/mid-load-replan:dev0 graph=0 alloc_id=12467192014320699603 size=5184000 role=0 category=0 tier=0 cohort=weight:owned_by_live_model
+[ZONE-RESET-AUDIT] NEW-ESCAPE site=host-zone-reset/STAGING graph=2 alloc_id=172 size=24 role=3 category=2 tier=1 cohort=get_rows_indices_small_host
+[ZONE-RESET-AUDIT] ==== escape inventory (SIGSEGV) graphs=2 ====
+[ZONE-RESET-AUDIT] site=device-zone-reset/SCRATCH:dev0 visits=2 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[0..1]
+[ZONE-RESET-AUDIT]   largest_free first=512.00 MB last=512.00 MB min=512.00 MB
+[ZONE-RESET-AUDIT] site=device-zone-reset/SCRATCH:dev1 visits=2 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[0..1]
+[ZONE-RESET-AUDIT] site=device-zone-reset/SCRATCH:dev2 visits=2 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[0..1]
+[ZONE-RESET-AUDIT] site=host-zone-reset/SCRATCH visits=2 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[1..2]
+[ZONE-RESET-AUDIT]   largest_free first=64.00 MB last=64.00 MB min=64.00 MB
+[ZONE-RESET-AUDIT] site=host-zone-reset/STAGING visits=2 visits_with_live=1 live_max=1 live_total=1 distinct_sizes=1 distinct_cohorts=1 graphs=[1..2]
+[ZONE-RESET-AUDIT]   cohort=get_rows_indices_small_host size=24 occurrences=1 graphs=1 per_graph=1.00 distinct_alloc_ids=1 role=3 category=2 tier=1 -> single-shot
+[ZONE-RESET-AUDIT]   size-histogram 24 x1
+[ZONE-RESET-AUDIT] site=scratch-pool-reset/bump:dev0 visits=2 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[1..2]
+[ZONE-RESET-AUDIT] site=weight-reclaim/load-boundary:dev0 visits=3 visits_with_live=2 live_max=100 live_total=200 distinct_sizes=8 distinct_cohorts=2 graphs=[0..0]
+[ZONE-RESET-AUDIT]   largest_free first=29472.04 MB last=29445.03 MB min=29445.03 MB
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=1152 occurrences=26 graphs=1 per_graph=26.00 distinct_alloc_ids=13 role=0 category=1 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=54432 occurrences=48 graphs=1 per_graph=48.00 distinct_alloc_ids=24 role=8 category=1 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=145152 occurrences=36 graphs=1 per_graph=36.00 distinct_alloc_ids=18 role=8 category=1 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=6048000 occurrences=2 graphs=1 per_graph=2.00 distinct_alloc_ids=1 role=8 category=1 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=9792000 occurrences=2 graphs=1 per_graph=2.00 distinct_alloc_ids=1 role=1 category=1 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   cohort=weight:owned_by_live_model size=46656 occurrences=48 graphs=1 per_graph=48.00 distinct_alloc_ids=24 role=1 category=0 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   cohort=weight:owned_by_live_model size=124416 occurrences=36 graphs=1 per_graph=36.00 distinct_alloc_ids=18 role=1 category=0 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   cohort=weight:owned_by_live_model size=5184000 occurrences=2 graphs=1 per_graph=2.00 distinct_alloc_ids=1 role=0 category=0 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   size-histogram 1152 x26
+[ZONE-RESET-AUDIT]   size-histogram 46656 x48
+[ZONE-RESET-AUDIT]   size-histogram 54432 x48
+[ZONE-RESET-AUDIT]   size-histogram 124416 x36
+[ZONE-RESET-AUDIT]   size-histogram 145152 x36
+[ZONE-RESET-AUDIT]   size-histogram 5184000 x2
+[ZONE-RESET-AUDIT]   size-histogram 6048000 x2
+[ZONE-RESET-AUDIT]   size-histogram 9792000 x2
+[ZONE-RESET-AUDIT] site=weight-reclaim/load-boundary:dev1 visits=3 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[0..0]
+[ZONE-RESET-AUDIT]   largest_free first=13736.00 MB last=13736.00 MB min=13736.00 MB
+[ZONE-RESET-AUDIT] site=weight-reclaim/load-boundary:dev2 visits=3 visits_with_live=0 live_max=0 live_total=0 distinct_sizes=0 distinct_cohorts=0 graphs=[0..0]
+[ZONE-RESET-AUDIT]   largest_free first=3891.19 MB last=3891.19 MB min=3891.19 MB
+[ZONE-RESET-AUDIT] site=weight-reclaim/mid-load-replan:dev0 visits=2 visits_with_live=1 live_max=100 live_total=100 distinct_sizes=8 distinct_cohorts=2 graphs=[0..0]
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=1152 occurrences=13 graphs=1 per_graph=13.00 distinct_alloc_ids=13 role=0 category=1 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=54432 occurrences=24 graphs=1 per_graph=24.00 distinct_alloc_ids=24 role=8 category=1 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=145152 occurrences=18 graphs=1 per_graph=18.00 distinct_alloc_ids=18 role=8 category=1 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=6048000 occurrences=1 graphs=1 per_graph=1.00 distinct_alloc_ids=1 role=8 category=1 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   cohort=weight:leased size=9792000 occurrences=1 graphs=1 per_graph=1.00 distinct_alloc_ids=1 role=1 category=1 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   cohort=weight:owned_by_live_model size=46656 occurrences=24 graphs=1 per_graph=24.00 distinct_alloc_ids=24 role=1 category=0 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   cohort=weight:owned_by_live_model size=124416 occurrences=18 graphs=1 per_graph=18.00 distinct_alloc_ids=18 role=1 category=0 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   cohort=weight:owned_by_live_model size=5184000 occurrences=1 graphs=1 per_graph=1.00 distinct_alloc_ids=1 role=0 category=0 tier=0 -> single-shot
+[ZONE-RESET-AUDIT]   size-histogram 1152 x13
+[ZONE-RESET-AUDIT]   size-histogram 46656 x24
+[ZONE-RESET-AUDIT]   size-histogram 54432 x24
+[ZONE-RESET-AUDIT]   size-histogram 124416 x18
+[ZONE-RESET-AUDIT]   size-histogram 145152 x18
+[ZONE-RESET-AUDIT]   size-histogram 5184000 x1
+[ZONE-RESET-AUDIT]   size-histogram 6048000 x1
+[ZONE-RESET-AUDIT]   size-histogram 9792000 x1
+[ZONE-RESET-AUDIT]   timing vram/kv alloc_calls=12 alloc_MB=3.4 alloc_ms=0.004 free_calls=0 free_ms=0.000 allocs_per_graph_max=12 allocs_per_graph_mean=6.0 graphs=2
+[ZONE-RESET-AUDIT]   timing vram/weight alloc_calls=101 alloc_MB=27.3 alloc_ms=0.048 free_calls=0 free_ms=0.000 allocs_per_graph_max=101 allocs_per_graph_mean=50.5 graphs=2
+[ZONE-RESET-AUDIT]   timing vram/runtime alloc_calls=2 alloc_MB=7.9 alloc_ms=0.003 free_calls=0 free_ms=0.000 allocs_per_graph_max=2 allocs_per_graph_mean=1.0 graphs=2
+[ZONE-RESET-AUDIT]   timing vram/scratch alloc_calls=1 alloc_MB=0.8 alloc_ms=0.001 free_calls=1 free_ms=0.002 allocs_per_graph_max=0 allocs_per_graph_mean=0.0 graphs=2
+[ZONE-RESET-AUDIT]   timing host/WEIGHT alloc_calls=7 alloc_MB=40.3 alloc_ms=0.014 free_calls=0 free_ms=0.000 allocs_per_graph_max=6 allocs_per_graph_mean=3.0 graphs=2
+[ZONE-RESET-AUDIT]   timing host/STAGING alloc_calls=4 alloc_MB=10.1 alloc_ms=0.006 free_calls=1 free_ms=0.002 allocs_per_graph_max=1 allocs_per_graph_mean=1.0 graphs=2
+[ZONE-RESET-AUDIT]   timing host/SCRATCH alloc_calls=145 alloc_MB=15.3 alloc_ms=0.040 free_calls=145 free_ms=0.062 allocs_per_graph_max=143 allocs_per_graph_mean=71.5 graphs=2
+[ZONE-RESET-AUDIT] ==== end inventory ====

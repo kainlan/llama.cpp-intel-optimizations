@@ -1,0 +1,33 @@
+
+
+Loading model... 
+
+▄▄ ▄▄
+██ ██
+██ ██  ▀▀█▄ ███▄███▄  ▀▀█▄    ▄████ ████▄ ████▄
+██ ██ ▄█▀██ ██ ██ ██ ▄█▀██    ██    ██ ██ ██ ██
+██ ██ ▀█▄██ ██ ██ ██ ▀█▄██ ██ ▀████ ████▀ ████▀
+                                    ██    ██
+                                    ▀▀    ▀▀
+
+build      : b12302-f26c5edb5
+model      : /Storage/GenAI/models/gpt-oss-20b-mxfp4.gguf
+ftype      : MXFP4 MoE
+modalities : text
+
+available commands:
+  /exit or Ctrl+C     stop or exit
+  /regen              regenerate the last response
+  /clear              clear the chat history
+  /read <file>        add a text file
+  /glob <pattern>     add text files using globbing pattern
+
+
+
+> Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5
+1, 2, 3, 4, 5
+
+[ Prompt: 71.8 t/s | Generation: 4.0 t/s ]
+
+
+Exiting...
