@@ -9055,6 +9055,13 @@ uint32_t ggml_backend_sycl_model_slot_current(void) {
     return g_sycl_model_slot_last_completed;
 }
 
+// Forward declaration: defined later in this TU, right after
+// sycl_exec_graph_clear_active() which it reuses (graph replay machinery).
+// See the call site in ggml_backend_sycl_model_unloaded() below for why this
+// must run at MODEL teardown rather than backend-context teardown
+// (llama.cpp-2wv5).
+static void ggml_sycl_release_graph_replay_leases_all_devices();
+
 void ggml_backend_sycl_model_unloaded(uint32_t slot) {
     if (slot >= ggml_sycl::MODEL_SLOT_COUNT) {
         return;
@@ -9075,6 +9082,23 @@ void ggml_backend_sycl_model_unloaded(uint32_t slot) {
     // whether anything still holds a lease, or every weight of the most recently
     // loaded model reads as leaked.
     const size_t rows = ggml_sycl_release_host_weight_extras_for_slot(slot);
+
+    // graph_preload_weights()/graph_preload_moe_experts() retain COPIES of
+    // weight/MoE-expert mem_handle leases in each backend context's
+    // graph_weight_leases/graph_moe_expert_leases so a recorded SYCL graph's
+    // cache-slot pointers stay stable across replay (see
+    // ggml_backend_sycl_context). Those copies are normally dropped when the
+    // NEXT graph is preloaded or when the active graph is invalidated
+    // (sycl_exec_graph_clear_active()) -- neither of which necessarily
+    // happens before THIS model's own teardown scan runs below, so a graph
+    // recorded against the dying model's weights can still be holding them
+    // live at that instant. ~ggml_backend_sycl_context() also releases these,
+    // but that destructor fires at backend-context teardown, which -- since
+    // the context is effectively a long-lived per-device object (see
+    // g_backend_context_by_device) -- is far later than model teardown, too
+    // late to keep the reclaim scan below from reporting a leak
+    // (llama.cpp-2wv5). Must run before unified_cache_release_model_slot().
+    ggml_sycl_release_graph_replay_leases_all_devices();
 
     ggml_sycl::unified_cache_set_live_model_mask(live_after);
     const size_t reclaimed = ggml_sycl::unified_cache_release_model_slot(slot);
@@ -32665,9 +32689,14 @@ ggml_backend_sycl_context::~ggml_backend_sycl_context() {
     // context and are still counted as live by
     // unified_cache::reclaim_weight_entries() at model teardown (leaked_lease,
     // llama.cpp-2wv5). Mirror sycl_exec_graph_clear_active()'s cleanup so the
-    // leases this context still owns are dropped before it is gone.
-    graph_unpin_moe_experts(this);
+    // leases this context still owns are dropped before it is gone. Order
+    // matches sycl_exec_graph_clear_active() (release_pool_retained, then
+    // unpin_moe_experts, then unpin_weights): each call clears a disjoint
+    // member (graph_retained_handles / pools vs. graph_moe_expert_leases vs.
+    // graph_weight_leases), so there is no observed dependency between them,
+    // but matching the known-good order removes any doubt.
     sycl_exec_graph_release_pool_retained(this);
+    graph_unpin_moe_experts(this);
     graph_unpin_weights(this);
 
     {
@@ -85205,6 +85234,36 @@ static void sycl_exec_graph_clear_active(ggml_backend_sycl_context * ctx, const 
     graph_unpin_weights(ctx);
     ctx->invalidate_moe_segments();
     ctx->invalidate_moe_block_graphs();
+}
+
+// Drop graph-replay state (recorded exec graph, plus the weight/MoE-expert
+// mem_handle lease copies graph_preload_weights()/graph_preload_moe_experts()
+// retain for the duration of a recorded graph's replay) on every device that
+// has a live backend context. Called from ggml_backend_sycl_model_unloaded()
+// right before the per-device weight-entry reclaim scan, so a graph recorded
+// against the dying model's weights cannot still be holding them live when
+// that scan runs (llama.cpp-2wv5).
+//
+// This is intentionally NOT scoped to the dying model's slot: graph_weight_
+// leases/active_exec_graph carry no per-model attribution today (they are
+// plain mem_handle copies keyed only by device), so a precise per-slot
+// release isn't possible without adding new bookkeeping to tag them. The
+// consequence of the imprecise version is a forced re-record of the exec
+// graph for any OTHER model that happens to have a live, valid recorded graph
+// on the SAME device at the moment this model tears down -- a one-time
+// performance cost, never a correctness issue, since a live model's own
+// persistent weight leases (ggml_tensor_extra_gpu::data_handle) and
+// owner_mask/live_mask bookkeeping are untouched by this. The current
+// multi-model test coverage (test-thread-safety.cpp) puts one model per GPU,
+// so this never fires against another model's live graph in practice today.
+static void ggml_sycl_release_graph_replay_leases_all_devices() {
+    for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+        ggml_backend_sycl_context * ctx = ggml_sycl_get_backend_context_for_device(d);
+        if (!ctx) {
+            continue;
+        }
+        sycl_exec_graph_clear_active(ctx, "model-teardown");
+    }
 }
 
 // =============================================================================
