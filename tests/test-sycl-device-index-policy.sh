@@ -189,6 +189,31 @@ $FATAL"
 # used to exit 1 silently -- `printf ... | grep '^OK '` failing under `set -e`.
 classify 2 "a report with no marker at all"     ""
 
+# A file literally named --classify-report must still be readable as a file.
+# The flag shares the positional slot with the target path, so `--` ends option
+# parsing. Ported from the symmetry sibling under qual-x54y-r2: 564c12974 added
+# identical `--` handling to BOTH scripts and pinned it in only one, so the fix
+# for an unfalsifiable change was itself partly unfalsifiable in the mirror-image
+# file. Sibling files pull attention to the one being reasoned about; the
+# identical edit to the other rides along unexamined BECAUSE it is identical.
+emit_struct "$TMP/--classify-report" '
+    void *                data_device[GGML_SYCL_MAX_DEVICES];
+    void * data_device_ptr(int dev) const {
+        if (!ggml_sycl_valid_device_index(dev)) {
+            return nullptr;
+        }
+        return data_device[dev];
+    }'
+rc=0
+( cd "$TMP" && "$CHECKER" -- ./--classify-report ) >/dev/null 2>&1 || rc=$?
+if [ "$rc" -ne 0 ]; then
+    echo "expected '-- ./--classify-report' to be read as a FILE (exit 0), got $rc" >&2
+    echo "The end-of-options marker is gone or broken: the path was consumed as" >&2
+    echo "the --classify-report flag, so the checker read a report from stdin" >&2
+    echo "instead of checking the file it was handed." >&2
+    exit 1
+fi
+
 # --- determinism -------------------------------------------------------------
 # This checker has no piped early-exiting grep and never had the SIGPIPE flake of
 # llama.cpp-x54y, so this loop is a guard against reintroducing one rather than a
