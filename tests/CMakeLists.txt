@@ -529,6 +529,30 @@ if (NOT WIN32)
         TIMEOUT 120
     )
 
+    # Gate for the single _gzip exclusion predicate in tools/ui/CMakeLists.txt,
+    # which is consumed by both list(FILTER ... REGEX) and if(... MATCHES). It
+    # was two hand-written patterns and they drifted, so a real directory merely
+    # beginning "_gzip" was silently dropped from the watch while its files
+    # stayed declared -- see llama.cpp-9ubg.
+    #
+    # Driven with cmake -P rather than pytest because the property under test is
+    # CMake's own regex behaviour under those two operators; Python's `re` is a
+    # different engine and would agree only by luck. Needs no build and no
+    # dist/ fixture -- it reads the pattern out of the file and runs it against
+    # a synthetic path list, including a negative control that re-runs the same
+    # cases against the known-bad pattern and requires them to be rejected.
+    llama_test_cmd(
+        ${CMAKE_COMMAND}
+        NAME test-ui-gzip-exclude
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS -DUI_CMAKE=${PROJECT_SOURCE_DIR}/tools/ui/CMakeLists.txt
+             -P ${CMAKE_CURRENT_SOURCE_DIR}/test-ui-gzip-exclude.cmake
+    )
+    set_tests_properties(test-ui-gzip-exclude PROPERTIES
+        LABELS "build;policy"
+        TIMEOUT 60
+    )
+
     # Conservation gate for parse-sycl-timeline.py's three-way gap-class split,
     # driven by the checked-in synthetic trace next to it (never live hardware).
     #

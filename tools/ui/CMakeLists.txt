@@ -85,36 +85,20 @@ set(UI_ASSET_DEPENDS "${PROJECT_SOURCE_DIR}/scripts/ui-assets.cmake")
 # stamp is never invalidated by them and manually supplied assets are silently
 # ignored for as long as the stamp stays fresh.
 #
-# The EXISTS guard is required in BOTH directions, and the second one is the
-# one that bites. A declared input with no rule to make it is a hard ninja
-# error, and dist/ is absent in a normal checkout -- but CMake's regeneration
-# keys on CMakeLists.txt, not on that file, so a dist/ that is present at
-# configure time and DELETED afterwards leaves the declaration behind and
-# breaks the build outright:
+# The EXISTS guard needs a reconfigure trigger, because CMake's regeneration
+# keys on CMakeLists.txt rather than on the guarded path: a declaration left
+# behind by a deleted dist/ is a hard build failure, not merely a stale one.
+# Hence CMAKE_CONFIGURE_DEPENDS on the directory, at TWO levels -- POSIX moves a
+# directory's mtime only for entries changing in THAT directory, so tools/ui
+# catches dist/ appearing and vanishing, and dist/ catches entries within it.
 #
-#   ninja: error: '.../tools/ui/dist/index.html', needed by
-#          'tools/ui/ui-assets.stamp', missing and no known rule to make it
+# Deliberately a directory dependency, NOT file(GLOB ... CONFIGURE_DEPENDS):
+# CMake implements the latter with a glob re-verification step in the
+# regeneration check, which risks reintroducing the always-out-of-date edge this
+# file exists to remove. Trading a never-rebuild bug for an always-rebuild one
+# is the worst move available. A plain directory dependency adds no such edge.
 #
-# Measured, not theorised. So the directory itself goes in CMAKE_CONFIGURE_DEPENDS:
-# creating or removing dist/ changes tools/ui's mtime, which re-runs CMake and
-# re-evaluates the guard. That closes both directions -- a dist/ extracted into
-# an already-configured tree is picked up, and a deleted one stops being
-# declared instead of failing the build.
-#
-# This is deliberately a directory dependency, not file(GLOB ... CONFIGURE_DEPENDS).
-# The latter would also work, but CMake implements it with a glob
-# re-verification step in the regeneration check, which risks reintroducing the
-# always-out-of-date edge this file exists to remove. Trading a never-rebuild
-# bug for an always-rebuild one is the worst move available; a plain directory
-# dependency adds no such edge (verified: the tree still reaches `no work to do`).
-# The watch has to be TWO levels, because POSIX updates a directory's mtime
-# only when entries change in THAT directory:
-#
-#   rm -rf dist              -> changes tools/ui's mtime       (caught by #1)
-#   rm dist/index.html       -> changes tools/ui/dist's mtime  (caught by #2)
-#
-# Watching only tools/ui leaves the second case declaring a file that no longer
-# exists, which is the same hard ninja error. Measured -- it reproduces exactly.
+# Repro commands and exact error text for every case: the axis inventory below.
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}")
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/dist")
     set_property(DIRECTORY APPEND PROPERTY
@@ -129,40 +113,33 @@ if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/dist/index.html")
     file(GLOB_RECURSE UI_DIST_FILES "${CMAKE_CURRENT_SOURCE_DIR}/dist/*")
 
     # dist/_gzip is OUTPUT, not input. ui-assets.cmake REMOVE_RECURSEs and
-    # regenerates it INSIDE dist/ on every provisioning run, so listing its
-    # files as dependencies would leave the stamp's own inputs newer than the
-    # stamp after each run -- provisioning on every build, i.e. precisely the
-    # always-dirty defect this file exists to remove. Measured: the run that
-    # first creates _gzip does move dist/'s mtime and costs one extra
-    # reconfigure; that is bounded and acceptable, a per-build rebuild is not.
+    # regenerates it INSIDE dist/ on every provisioning run, so declaring its
+    # files would leave the stamp's own inputs newer than the stamp after each
+    # run -- provisioning on every build, precisely the always-dirty defect this
+    # file exists to remove.
     #
-    # ONE pattern, used at BOTH exclusion sites below. It was two patterns in
-    # two syntaxes ("/dist/_gzip/" for the file filter, "/dist/_gzip" for the
-    # directory guard) and they drifted: `MATCHES` is an unanchored substring
-    # test, so the directory guard also dropped any real directory merely
-    # BEGINNING "_gzip" -- dist/_gzipfoo/ was silently unwatched while its
-    # files stayed declared, reopening both the content and the hard-failure
-    # axes at once. `(/|$)` makes one expression correct for both: it matches
-    # a file under _gzip/, and the _gzip directory itself, and neither for
-    # _gzipfoo. Verified by driving both sites with the same six inputs
-    # (cmake -P); do not re-split it.
+    # ONE pattern, used at BOTH exclusion sites below, and it must stay one:
+    # they were two patterns in two syntaxes and drifted, because `MATCHES` is
+    # an unanchored substring test where the FILTER pattern was bounded.
+    # `(/|$)` is correct under both operators. Do not re-split it.
+    #
+    # tests/test-ui-gzip-exclude.cmake gates exactly this, including the
+    # re-splitting: it reads the pattern out of this file, drives both
+    # operators, and rejects the known-bad pattern as a negative control.
     set(UI_DIST_GZIP_EXCLUDE "/dist/_gzip(/|$)")
 
     list(FILTER UI_DIST_FILES EXCLUDE REGEX "${UI_DIST_GZIP_EXCLUDE}")
     list(APPEND UI_ASSET_DEPENDS ${UI_DIST_FILES})
 
-    # Watching only dist/ catches entries added or removed directly in dist/,
-    # but POSIX mtime rules apply at every depth: deleting
-    # dist/_app/immutable/bundle.js moves dist/_app/immutable's mtime, not
-    # dist/'s. Since the glob above now DECLARES those deep files, a deletion
-    # without a reconfigure is not merely stale -- it is the hard
-    # "missing and no known rule to make it" build failure that
-    # 0629fee9e fixed one level up. So every directory under dist/ is watched.
+    # The same POSIX mtime rule applies at every depth, so every directory under
+    # dist/ is watched, not just dist/ itself -- the glob above DECLARES deep
+    # files, and a declared file deleted without a reconfigure is the hard build
+    # failure, not a stale one.
     #
-    # This is finite and self-maintaining, not an infinite regress: the set is
+    # Finite and self-maintaining rather than an infinite regress: the set is
     # enumerated at configure time, and a NEW subdirectory always changes its
-    # parent's mtime, and the parent is watched -- so it triggers a reconfigure
-    # that then enumerates it.
+    # parent's mtime, and the parent is watched -- so it triggers the
+    # reconfigure that enumerates it.
     file(GLOB_RECURSE UI_DIST_ENTRIES LIST_DIRECTORIES true
          "${CMAKE_CURRENT_SOURCE_DIR}/dist/*")
     foreach(entry ${UI_DIST_ENTRIES})
@@ -205,9 +182,14 @@ endif()
 #   CLOSED  exclusion     the _gzip exclusion matches _gzip and not _gzipfoo,
 #                         identically at both sites
 #           mechanism     single UI_DIST_GZIP_EXCLUDE pattern, used twice
-#           test          cmake -P driving BOTH sites with the same six inputs
-#                         (file and dir x _gzip/_gzipfoo/_app); RED reproduced
-#                         the drift first, GREEN is 0 failures
+#           test          tests/test-ui-gzip-exclude.cmake -- COMMITTED and
+#                         registered (ctest: test-ui-gzip-exclude), not a
+#                         command someone once ran. Reads the pattern out of
+#                         this file, drives both operators over 9 paths, and
+#                         re-runs them against the known-bad pattern as a
+#                         negative control. Mutation-checked: it fails if the
+#                         round-six pattern returns, if the two sites are
+#                         re-split into literals, or if the variable is renamed
 #
 #   CLOSED  dotfiles      hidden assets (.nojekyll and friends, ordinary in a
 #                         static-site dist/) are declared, not skipped
