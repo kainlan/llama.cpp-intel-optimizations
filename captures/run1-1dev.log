@@ -1,0 +1,7 @@
+[meminfo] start                        Shmem=2.28 GB  MemAvailable=214.98 GB
+found 1 level-zero GPU device(s) visible
+  dev0: Intel(R) Arc(TM) Pro B70 Graphics
+[meminfo] before dev0 init             Shmem=2.28 GB  MemAvailable=214.96 GB
+[meminfo] after dev0 init              Shmem=2.28 GB  MemAvailable=214.96 GB
+[meminfo] all devices initialized, holding Shmem=2.28 GB  MemAvailable=214.96 GB
+[meminfo] after queues destroyed       Shmem=2.28 GB  MemAvailable=214.96 GB

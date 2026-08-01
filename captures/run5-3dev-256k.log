@@ -1,0 +1,57 @@
+[meminfo] start                        Shmem=2.32 GB  MemAvailable=214.38 GB
+  dev0: Intel(R) Arc(TM) Pro B70 Graphics
+  dev1: Intel(R) Arc(TM) Pro B50 Graphics
+  dev2: Intel(R) Graphics
+[meminfo] dev0: 0 kernels              Shmem=2.33 GB  MemAvailable=214.36 GB
+[meminfo] dev0: 16 kernels             Shmem=2.33 GB  MemAvailable=214.36 GB
+[meminfo] dev0: 32 kernels             Shmem=2.33 GB  MemAvailable=214.36 GB
+[meminfo] dev0: 48 kernels             Shmem=2.33 GB  MemAvailable=214.36 GB
+[meminfo] dev0: 64 kernels             Shmem=2.33 GB  MemAvailable=214.36 GB
+[meminfo] dev0: 80 kernels             Shmem=2.33 GB  MemAvailable=214.36 GB
+[meminfo] dev0: 96 kernels             Shmem=2.33 GB  MemAvailable=214.36 GB
+[meminfo] dev0: 112 kernels            Shmem=2.33 GB  MemAvailable=214.36 GB
+[meminfo] dev0: 128 kernels            Shmem=2.33 GB  MemAvailable=214.36 GB
+[meminfo] dev0: 144 kernels            Shmem=2.33 GB  MemAvailable=214.36 GB
+[meminfo] dev0: 160 kernels            Shmem=2.33 GB  MemAvailable=214.36 GB
+[meminfo] dev0: 176 kernels            Shmem=2.33 GB  MemAvailable=214.36 GB
+[meminfo] dev0: 192 kernels            Shmem=2.33 GB  MemAvailable=214.36 GB
+[meminfo] dev0: 208 kernels            Shmem=2.33 GB  MemAvailable=214.36 GB
+[meminfo] dev0: 224 kernels            Shmem=2.33 GB  MemAvailable=214.36 GB
+[meminfo] dev0: 240 kernels            Shmem=2.33 GB  MemAvailable=214.36 GB
+[meminfo] dev0: 256 kernels            Shmem=2.33 GB  MemAvailable=214.36 GB
+[meminfo] dev1: 0 kernels              Shmem=2.33 GB  MemAvailable=214.36 GB
+[meminfo] dev1: 16 kernels             Shmem=2.33 GB  MemAvailable=214.23 GB
+[meminfo] dev1: 32 kernels             Shmem=2.33 GB  MemAvailable=214.23 GB
+[meminfo] dev1: 48 kernels             Shmem=2.33 GB  MemAvailable=214.23 GB
+[meminfo] dev1: 64 kernels             Shmem=2.33 GB  MemAvailable=214.23 GB
+[meminfo] dev1: 80 kernels             Shmem=2.33 GB  MemAvailable=214.23 GB
+[meminfo] dev1: 96 kernels             Shmem=2.33 GB  MemAvailable=214.23 GB
+[meminfo] dev1: 112 kernels            Shmem=2.33 GB  MemAvailable=214.23 GB
+[meminfo] dev1: 128 kernels            Shmem=2.33 GB  MemAvailable=214.23 GB
+[meminfo] dev1: 144 kernels            Shmem=2.33 GB  MemAvailable=214.23 GB
+[meminfo] dev1: 160 kernels            Shmem=2.33 GB  MemAvailable=214.23 GB
+[meminfo] dev1: 176 kernels            Shmem=2.33 GB  MemAvailable=214.23 GB
+[meminfo] dev1: 192 kernels            Shmem=2.33 GB  MemAvailable=214.23 GB
+[meminfo] dev1: 208 kernels            Shmem=2.33 GB  MemAvailable=214.23 GB
+[meminfo] dev1: 224 kernels            Shmem=2.33 GB  MemAvailable=214.23 GB
+[meminfo] dev1: 240 kernels            Shmem=2.33 GB  MemAvailable=214.23 GB
+[meminfo] dev1: 256 kernels            Shmem=2.33 GB  MemAvailable=214.23 GB
+[meminfo] dev2: 0 kernels              Shmem=2.33 GB  MemAvailable=214.23 GB
+[meminfo] dev2: 16 kernels             Shmem=2.36 GB  MemAvailable=214.21 GB
+[meminfo] dev2: 32 kernels             Shmem=2.36 GB  MemAvailable=214.21 GB
+[meminfo] dev2: 48 kernels             Shmem=2.36 GB  MemAvailable=214.21 GB
+[meminfo] dev2: 64 kernels             Shmem=2.36 GB  MemAvailable=214.21 GB
+[meminfo] dev2: 80 kernels             Shmem=2.36 GB  MemAvailable=214.21 GB
+[meminfo] dev2: 96 kernels             Shmem=2.36 GB  MemAvailable=214.21 GB
+[meminfo] dev2: 112 kernels            Shmem=2.36 GB  MemAvailable=214.21 GB
+[meminfo] dev2: 128 kernels            Shmem=2.36 GB  MemAvailable=214.21 GB
+[meminfo] dev2: 144 kernels            Shmem=2.36 GB  MemAvailable=214.21 GB
+[meminfo] dev2: 160 kernels            Shmem=2.36 GB  MemAvailable=214.21 GB
+[meminfo] dev2: 176 kernels            Shmem=2.36 GB  MemAvailable=214.21 GB
+[meminfo] dev2: 192 kernels            Shmem=2.36 GB  MemAvailable=214.21 GB
+[meminfo] dev2: 208 kernels            Shmem=2.36 GB  MemAvailable=214.21 GB
+[meminfo] dev2: 224 kernels            Shmem=2.36 GB  MemAvailable=214.21 GB
+[meminfo] dev2: 240 kernels            Shmem=2.36 GB  MemAvailable=214.21 GB
+[meminfo] dev2: 256 kernels            Shmem=2.36 GB  MemAvailable=214.21 GB
+[meminfo] all done, holding            Shmem=2.36 GB  MemAvailable=214.21 GB
+[meminfo] after queues destroyed       Shmem=2.36 GB  MemAvailable=214.21 GB

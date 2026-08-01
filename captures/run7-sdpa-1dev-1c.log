@@ -1,0 +1,5 @@
+[meminfo] start                            Shmem=2.41 GB  MemAvailable=213.75 GB
+[meminfo] dev0: before any compile         Shmem=2.42 GB  MemAvailable=213.71 GB
+[meminfo] dev0: after compile 0 (ne11=16)  Shmem=2.35 GB  MemAvailable=213.70 GB
+[meminfo] all done, holding compiled partitions Shmem=2.35 GB  MemAvailable=213.70 GB
+[meminfo] after partitions destroyed       Shmem=2.35 GB  MemAvailable=213.70 GB

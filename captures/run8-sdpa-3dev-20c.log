@@ -1,0 +1,66 @@
+[meminfo] start                            Shmem=2.39 GB  MemAvailable=213.95 GB
+[meminfo] dev0: before any compile         Shmem=2.39 GB  MemAvailable=213.93 GB
+[meminfo] dev0: after compile 0 (ne11=16)  Shmem=2.39 GB  MemAvailable=213.91 GB
+[meminfo] dev0: after compile 1 (ne11=32)  Shmem=2.39 GB  MemAvailable=213.88 GB
+[meminfo] dev0: after compile 2 (ne11=48)  Shmem=2.39 GB  MemAvailable=213.88 GB
+[meminfo] dev0: after compile 3 (ne11=64)  Shmem=2.39 GB  MemAvailable=213.88 GB
+[meminfo] dev0: after compile 4 (ne11=80)  Shmem=2.39 GB  MemAvailable=213.87 GB
+[meminfo] dev0: after compile 5 (ne11=96)  Shmem=2.40 GB  MemAvailable=213.87 GB
+[meminfo] dev0: after compile 6 (ne11=112) Shmem=2.40 GB  MemAvailable=213.88 GB
+[meminfo] dev0: after compile 7 (ne11=128) Shmem=2.40 GB  MemAvailable=213.89 GB
+[meminfo] dev0: after compile 8 (ne11=144) Shmem=2.40 GB  MemAvailable=213.88 GB
+[meminfo] dev0: after compile 9 (ne11=160) Shmem=2.40 GB  MemAvailable=213.87 GB
+[meminfo] dev0: after compile 10 (ne11=176) Shmem=2.40 GB  MemAvailable=213.87 GB
+[meminfo] dev0: after compile 11 (ne11=192) Shmem=2.40 GB  MemAvailable=213.85 GB
+[meminfo] dev0: after compile 12 (ne11=208) Shmem=2.40 GB  MemAvailable=213.86 GB
+[meminfo] dev0: after compile 13 (ne11=224) Shmem=2.40 GB  MemAvailable=213.86 GB
+[meminfo] dev0: after compile 14 (ne11=240) Shmem=2.41 GB  MemAvailable=213.86 GB
+[meminfo] dev0: after compile 15 (ne11=256) Shmem=2.41 GB  MemAvailable=213.86 GB
+[meminfo] dev0: after compile 16 (ne11=272) Shmem=2.41 GB  MemAvailable=213.86 GB
+[meminfo] dev0: after compile 17 (ne11=288) Shmem=2.41 GB  MemAvailable=213.86 GB
+[meminfo] dev0: after compile 18 (ne11=304) Shmem=2.41 GB  MemAvailable=213.88 GB
+[meminfo] dev0: after compile 19 (ne11=320) Shmem=2.41 GB  MemAvailable=213.89 GB
+[meminfo] dev1: before any compile         Shmem=2.41 GB  MemAvailable=213.88 GB
+[meminfo] dev1: after compile 0 (ne11=16)  Shmem=2.41 GB  MemAvailable=213.88 GB
+[meminfo] dev1: after compile 1 (ne11=32)  Shmem=2.42 GB  MemAvailable=213.85 GB
+[meminfo] dev1: after compile 2 (ne11=48)  Shmem=2.42 GB  MemAvailable=213.89 GB
+[meminfo] dev1: after compile 3 (ne11=64)  Shmem=2.41 GB  MemAvailable=213.79 GB
+[meminfo] dev1: after compile 4 (ne11=80)  Shmem=2.35 GB  MemAvailable=213.90 GB
+[meminfo] dev1: after compile 5 (ne11=96)  Shmem=2.35 GB  MemAvailable=213.92 GB
+[meminfo] dev1: after compile 6 (ne11=112) Shmem=2.35 GB  MemAvailable=213.92 GB
+[meminfo] dev1: after compile 7 (ne11=128) Shmem=2.35 GB  MemAvailable=213.92 GB
+[meminfo] dev1: after compile 8 (ne11=144) Shmem=2.35 GB  MemAvailable=213.91 GB
+[meminfo] dev1: after compile 9 (ne11=160) Shmem=2.35 GB  MemAvailable=213.92 GB
+[meminfo] dev1: after compile 10 (ne11=176) Shmem=2.36 GB  MemAvailable=213.91 GB
+[meminfo] dev1: after compile 11 (ne11=192) Shmem=2.36 GB  MemAvailable=213.91 GB
+[meminfo] dev1: after compile 12 (ne11=208) Shmem=2.36 GB  MemAvailable=213.93 GB
+[meminfo] dev1: after compile 13 (ne11=224) Shmem=2.36 GB  MemAvailable=213.93 GB
+[meminfo] dev1: after compile 14 (ne11=240) Shmem=2.36 GB  MemAvailable=213.93 GB
+[meminfo] dev1: after compile 15 (ne11=256) Shmem=2.36 GB  MemAvailable=213.93 GB
+[meminfo] dev1: after compile 16 (ne11=272) Shmem=2.36 GB  MemAvailable=213.93 GB
+[meminfo] dev1: after compile 17 (ne11=288) Shmem=2.37 GB  MemAvailable=213.94 GB
+[meminfo] dev1: after compile 18 (ne11=304) Shmem=2.37 GB  MemAvailable=213.94 GB
+[meminfo] dev1: after compile 19 (ne11=320) Shmem=2.37 GB  MemAvailable=213.94 GB
+[meminfo] dev2: before any compile         Shmem=2.37 GB  MemAvailable=213.94 GB
+[meminfo] dev2: after compile 0 (ne11=16)  Shmem=2.37 GB  MemAvailable=213.78 GB
+[meminfo] dev2: after compile 1 (ne11=32)  Shmem=2.37 GB  MemAvailable=213.78 GB
+[meminfo] dev2: after compile 2 (ne11=48)  Shmem=2.37 GB  MemAvailable=213.80 GB
+[meminfo] dev2: after compile 3 (ne11=64)  Shmem=2.37 GB  MemAvailable=213.80 GB
+[meminfo] dev2: after compile 4 (ne11=80)  Shmem=2.38 GB  MemAvailable=213.68 GB
+[meminfo] dev2: after compile 5 (ne11=96)  Shmem=2.38 GB  MemAvailable=213.68 GB
+[meminfo] dev2: after compile 6 (ne11=112) Shmem=2.38 GB  MemAvailable=213.68 GB
+[meminfo] dev2: after compile 7 (ne11=128) Shmem=2.38 GB  MemAvailable=213.67 GB
+[meminfo] dev2: after compile 8 (ne11=144) Shmem=2.38 GB  MemAvailable=213.70 GB
+[meminfo] dev2: after compile 9 (ne11=160) Shmem=2.38 GB  MemAvailable=213.70 GB
+[meminfo] dev2: after compile 10 (ne11=176) Shmem=2.38 GB  MemAvailable=213.69 GB
+[meminfo] dev2: after compile 11 (ne11=192) Shmem=2.38 GB  MemAvailable=213.69 GB
+[meminfo] dev2: after compile 12 (ne11=208) Shmem=2.38 GB  MemAvailable=213.67 GB
+[meminfo] dev2: after compile 13 (ne11=224) Shmem=2.39 GB  MemAvailable=213.64 GB
+[meminfo] dev2: after compile 14 (ne11=240) Shmem=2.38 GB  MemAvailable=213.66 GB
+[meminfo] dev2: after compile 15 (ne11=256) Shmem=2.37 GB  MemAvailable=213.69 GB
+[meminfo] dev2: after compile 16 (ne11=272) Shmem=2.37 GB  MemAvailable=213.69 GB
+[meminfo] dev2: after compile 17 (ne11=288) Shmem=2.37 GB  MemAvailable=213.69 GB
+[meminfo] dev2: after compile 18 (ne11=304) Shmem=2.37 GB  MemAvailable=213.68 GB
+[meminfo] dev2: after compile 19 (ne11=320) Shmem=2.37 GB  MemAvailable=213.68 GB
+[meminfo] all done, holding compiled partitions Shmem=2.37 GB  MemAvailable=213.68 GB
+[meminfo] after partitions destroyed       Shmem=2.37 GB  MemAvailable=213.68 GB

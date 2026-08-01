@@ -1,0 +1,7 @@
+[meminfo] start                        Shmem=2.32 GB  MemAvailable=214.34 GB
+  dev0: Intel(R) Arc(TM) Pro B70 Graphics
+[meminfo] dev0: 0 kernels              Shmem=2.32 GB  MemAvailable=214.34 GB
+[meminfo] dev0: 16 kernels             Shmem=2.33 GB  MemAvailable=214.20 GB
+[meminfo] dev0: 32 kernels             Shmem=2.33 GB  MemAvailable=214.20 GB
+[meminfo] all done, holding            Shmem=2.33 GB  MemAvailable=214.20 GB
+[meminfo] after queues destroyed       Shmem=2.33 GB  MemAvailable=214.20 GB
