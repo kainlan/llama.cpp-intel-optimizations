@@ -10037,7 +10037,17 @@ static void compute_vram_budget_for_plan(ggml_backend_sycl_context * ctx,
                                          size_t &                    free_mem_out) {
     size_t free_mem = 0, total_mem = 0;
     ggml_backend_sycl_get_device_memory(ctx->device, &free_mem, &total_mem);
-    const size_t base_mem      = total_mem > 0 ? total_mem : free_mem;
+    const size_t raw_base_mem = total_mem > 0 ? total_mem : free_mem;
+    // Host-unified (integrated) GPUs report system RAM as "global memory" --
+    // see llama.cpp-403s and the matching adjustment in unified-cache.cpp's
+    // create_cache_for_device(), which is where the actual VRAM-arena malloc
+    // this budget feeds into happens. This call is safe here (unlike in that
+    // deadlock-sensitive path): placement-plan computation only runs during
+    // model load, well after ggml_sycl_info()'s static init has completed.
+    const bool   host_unified =
+        (ctx->device >= 0 && ctx->device < GGML_SYCL_MAX_DEVICES) &&
+        ggml_sycl_info().devices[ctx->device].host_unified_memory;
+    const size_t base_mem      = ggml_sycl_vram_budget_base_mem(host_unified, raw_base_mem);
     const size_t base_headroom = 0;
 
     int          budget_pct     = 100;
@@ -16305,6 +16315,13 @@ static ggml_sycl_device_info ggml_sycl_init() {
         info.devices[i].total_vram           = device_vram;
         info.devices[i].max_alloc_size       = std::min(prop.get_max_mem_alloc_size(), device_vram);
         info.max_work_group_sizes[i]         = prop.get_max_work_group_size();
+        // Integrated GPUs report system RAM as "global memory" -- see
+        // ggml_sycl_vram_budget_base_mem() (common.cpp) and llama.cpp-403s.
+        // Cached here (rather than queried live at every budget computation)
+        // so paths that must avoid ggml_sycl_info() reentry during static
+        // init use ggml_sycl_device_is_host_unified() directly instead; this
+        // cached copy is for the (safe, post-init) placement-plan path.
+        info.devices[i].host_unified_memory  = ggml_sycl_device_is_host_unified(device);
 
         // Store device name for GPU family detection (used for ESIMD limits)
         std::string name = device.get_info<sycl::info::device::name>();
@@ -16363,10 +16380,16 @@ static ggml_sycl_device_info ggml_sycl_init() {
         size_t       safe_alloc    = (size_t) std::floor((double) probe_upper * safety_margin);
 
         info.devices[i].safe_max_alloc_size = safe_alloc;
-        GGML_LOG_INFO("[SYCL] Device %d alloc caps: raw=%.1f MB, safe=%.1f MB\n", i,
+        // WARN, not INFO: GGML_LOG_INFO is dropped at default verbosity in
+        // every tool (common_get_verbosity() maps INFO to TRACE against a
+        // threshold that excludes it -- see llama.cpp-403s), so an INFO line
+        // here would be invisible in exactly the runs where someone is
+        // wondering where their RAM went. This is a one-time per-device
+        // startup line, not per-op, so promoting it to WARN is not spam.
+        GGML_LOG_WARN("[SYCL] Device %d alloc caps: raw=%.1f MB, safe=%.1f MB, host_unified=%s\n", i,
                       info.devices[i].max_alloc_size / (1024.0 * 1024.0),
-
-                      info.devices[i].safe_max_alloc_size / (1024.0 * 1024.0));
+                      info.devices[i].safe_max_alloc_size / (1024.0 * 1024.0),
+                      info.devices[i].host_unified_memory ? "yes" : "no");
         // Query XMX (Intel matrix engine) capabilities
         info.devices[i].xmx_caps = query_xmx_capabilities(device);
         const auto & caps        = info.devices[i].xmx_caps;

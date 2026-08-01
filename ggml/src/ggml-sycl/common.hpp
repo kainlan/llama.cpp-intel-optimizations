@@ -1077,6 +1077,13 @@ struct sycl_device_info {
     size_t          max_alloc_size;       // device-reported max allocation size
     size_t          safe_max_alloc_size;  // probed safe allocation size
     //sycl_hw_info hw_info;     \\ device id and aarch, currently not used
+    // Integrated GPU: `global_mem_size` reports the SAME physical RAM the
+    // host and every other allocator on the box use, not dedicated VRAM
+    // (see llama.cpp-403s: an Arrow Lake-S iGPU reporting 231.7 GB of
+    // "global memory" drove a ~180 GB TTM-shmem arena reservation for a
+    // 19 MB model). Budget computations must consult this before taking a
+    // percentage of `total_vram`/`global_mem_size` for such a device.
+    bool            host_unified_memory  = false;
     bool            supports_soa_reorder = false;  // Device capability: can use SoA weight layout
     XMXCapabilities xmx_caps;                      // XMX matrix engine capabilities (queried at init)
     char            device_name[256] = { 0 };      // Device name for GPU family detection
@@ -5867,6 +5874,42 @@ bool gpu_has_xmx(sycl::device & dev);
 
 // XMXCapabilities struct and query_xmx_capabilities() declaration
 // moved to line ~487 so sycl_device_info can include xmx_caps as a member
+
+// Direct SYCL query for sycl::info::device::host_unified_memory, bypassing
+// ggml_sycl_info(). Safe to call from paths that may run during
+// ggml_sycl_info()'s own static initialization (mirrors the constraint on
+// query_device_memory_no_info() in unified-cache.cpp: dereferencing
+// ggml_sycl_info() there can deadlock). Returns false (i.e. "treat as
+// discrete") if the query throws.
+bool ggml_sycl_device_is_host_unified(const sycl::device & dev);
+
+// Portable (non-SYCL) queries of total/available system RAM in bytes.
+// Returns 0 if detection fails. Used to size VRAM budgets for host-unified
+// (integrated) GPUs, whose "global memory" is backed by this same RAM --
+// see ggml_sycl_vram_budget_base_mem() below.
+size_t ggml_sycl_get_total_system_memory_bytes();
+size_t ggml_sycl_get_available_system_memory_bytes();
+
+// Adjusts a raw device memory total for VRAM-budget purposes (see
+// llama.cpp-403s). Host-unified (integrated) GPUs report system RAM as
+// "global memory" -- an Arrow Lake-S iGPU reporting 231.7 GB drove a
+// single-chunk VRAM-arena reservation of nearly the same size, landing
+// entirely in TTM shmem (system RAM) backing, for a 19 MB model. Taking a
+// raw percentage of that number budgets against memory the host and every
+// other allocator on the box need too.
+//
+// For host-unified devices, returns min(raw_total_mem, a small fixed
+// absolute cap, further tightened by a fraction of *currently available*
+// system RAM on small machines). A flat PERCENTAGE of raw_total_mem was
+// tried first and rejected: on a big-RAM host it can still exceed a real
+// discrete card's dedicated VRAM (measured: 25% of ~211 GB available gave
+// an integrated GPU a 53 GB arena against the B70's 31.9 GB), so the cap
+// must not scale with host RAM. For discrete devices (the common case),
+// returns raw_total_mem unchanged: this is a no-op on the existing,
+// documented-correct `min(total*pct, free_at_init)` discrete-GPU budget
+// path, and GGML_SYCL_VRAM_BUDGET_PCT continues to apply (by both call
+// sites, unchanged) on top of whatever this function returns.
+size_t ggml_sycl_vram_budget_base_mem(bool host_unified, size_t raw_total_mem);
 
 template <int N, class T> std::string debug_get_array_str(const std::string & prefix, const T array[N]) {
     if (LIKELY(!g_ggml_sycl_debug)) {
