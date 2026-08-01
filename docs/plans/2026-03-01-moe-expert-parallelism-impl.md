@@ -905,8 +905,14 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
 #    mem-handle / MoE-residency family, all GPU-buffer allocators whose TTM shmem
 #    backing grows without bound, and they sit at the FRONT of the list, so -j 20
 #    on this 20-core box starts all nineteen at once. Took the host down twice on
-#    2026-07-25. See CLAUDE.md "Running Tests" for the throttled forms.
-ctest --test-dir build --output-on-failure -j 4 -LE 'residency|mem-handle|cache'
+#    2026-07-25. See CLAUDE.md "Running Tests" for the current forms.
+#    ⚠️ `-j 4` is NOT safe either, and this line said `-j 4` until 2026-08-01,
+#    when it caused a global OOM. `-j` multiplies MEMORY, not CPU:
+#    test-llama-archs and test-thread-safety both survive -LE (label `main`
+#    only), and one test-llama-archs run alone peaks at 195-206 GB of 255 GB.
+#    ⚠️ `-E` is also mandatory -- -LE cannot exclude test-backend-ops (no labels).
+ctest --test-dir build --output-on-failure -j 1 \
+      -LE 'residency|mem-handle|cache' -E '^test-backend-ops$'
 ctest --test-dir build -L residency --output-on-failure -j 1   # manually only
 ```
 
@@ -933,6 +939,7 @@ source /opt/intel/oneapi/setvars.sh --force
 cmake -B build -G Ninja -DGGML_SYCL=ON -DGGML_SYCL_TARGET=INTEL \
   -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
 ninja -C build -j $(nproc)          # fine -- compile jobs, not GPU allocators
-# ⚠️ ctest is NOT safe at -j $(nproc) here; see the note at the Unit tests step above.
-ctest --test-dir build --output-on-failure -j 4 -LE 'residency|mem-handle|cache'
+# ⚠️ ctest is NOT safe at ANY -j > 1 here; see the note at the Unit tests step above.
+ctest --test-dir build --output-on-failure -j 1 \
+      -LE 'residency|mem-handle|cache' -E '^test-backend-ops$'
 ```

@@ -961,15 +961,25 @@ ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion \
   -m /Storage/GenAI/models/mistral-7b-v0.1.Q4_0.gguf \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 
-# 3. The race, three times — one green run is not evidence
-for i in 1 2 3; do ctest --test-dir build -R '^test-thread-safety$' || echo "FAILED run $i"; done
+# 3. The race — ONE run. It loads 3 models across GPUs; a loop drove Shmem
+#    84.9 -> 206 GB in 20 seconds on 2026-08-01. Criterion withdrawn: this
+#    line used to read `for i in 1 2 3`. If one run is genuinely not enough
+#    evidence for a race, build a narrower in-process reproducer -- do not
+#    repeat a model-loading binary.
+ctest --test-dir build -R '^test-thread-safety$' --output-on-failure
 
 # 4. Arch sweep — ONE run. Never loop.
 ctest --test-dir build -R '^test-llama-archs$' --output-on-failure
 
-# 5. Throttled suite. The -E is NOT optional: -LE cannot exclude test-backend-ops (no labels).
+# 5. Full suite. BOTH guards are mandatory and neither is optional:
+#      -j 1  because -j is a MEMORY multiplier, not a CPU throttle. test-llama-archs
+#            and test-thread-safety both survive -LE (label `main` only), and one
+#            test-llama-archs run alone peaks at 195-206 GB of 255 GB. `-j 4` here
+#            caused a global OOM on 2026-08-01 that took out the desktop session,
+#            a qemu VM, and left an unkillable D-state process holding ~208 GB.
+#      -E    because -LE cannot exclude test-backend-ops (it carries no labels).
 ctest --test-dir build -N -LE 'residency|mem-handle|cache' | grep backend-ops   # MUST print nothing
-ctest --test-dir build --output-on-failure -j 4 -LE 'residency|mem-handle|cache' -E '^test-backend-ops$'
+ctest --test-dir build --output-on-failure -j 1 -LE 'residency|mem-handle|cache' -E '^test-backend-ops$'
 
 # 6. GPT-OSS chat correctness
 timeout 120 env ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-cli \

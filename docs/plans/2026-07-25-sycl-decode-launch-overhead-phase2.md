@@ -411,7 +411,15 @@ ONEAPI_DEVICE_SELECTOR=level_zero:1 timeout 300 ./build/bin/llama-completion \
 #    test #73 of this "safe" sweep until 2026-07-30. That is the one binary
 #    CLAUDE.md forbids running unattended (50-224 GB TTM shmem). Confirm with
 #    `ctest -N -LE ... | grep backend-ops` printing nothing before running.
-ctest --test-dir build --output-on-failure -j 4 \
+#
+#    ⚠️ AND the `-j` must be 1. This step read `-j 4` until 2026-08-01, when it
+#    caused a global OOM -- the second time this one step took the host down.
+#    `-j` was sized against CPU (20 cores, so 4 is "gentle"); the scarce
+#    resource is TTM shmem and `-j` multiplies that. test-llama-archs and
+#    test-thread-safety BOTH survive the -LE (label `main` only), and one
+#    test-llama-archs run alone peaks at 195-206 GB of 255 GB, so two together
+#    cannot fit. The blast radius included the desktop session and a qemu VM.
+ctest --test-dir build --output-on-failure -j 1 \
       -LE 'residency|mem-handle|cache' -E '^test-backend-ops$'
 
 #    The excluded family, serially, MANUALLY only -- never in a subagent or a

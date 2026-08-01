@@ -72,9 +72,9 @@ source /opt/intel/oneapi/setvars.sh --force
 # 1. BEST: run only what your change actually gates. Almost always sufficient.
 ctest --test-dir build -R <name-or-regex> --output-on-failure
 
-# 2. Full suite, throttled, GPU-allocating family excluded. Check `uptime`
-#    first -- never on a loaded machine. The `-E` is NOT optional: see below.
-ctest --test-dir build --output-on-failure -j 4 \
+# 2. Full suite. `-j 1` is NOT a typo and NOT negotiable -- see below.
+#    Check `uptime` first; never on a loaded machine.
+ctest --test-dir build --output-on-failure -j 1 \
       -LE 'residency|mem-handle|cache' -E '^test-backend-ops$'
 
 # 3. The excluded family, serially, with monitoring. Manually only -- never in
@@ -85,12 +85,48 @@ ctest --test-dir build -L residency --output-on-failure -j 1
 ctest --test-dir build -R <test-name> -V
 ```
 
+⚠️ **`-j N` IS A MEMORY MULTIPLIER, NOT A CPU THROTTLE. This file prescribed
+`-j 4` as the *safe* form until 2026-08-01, and it caused a global OOM.**
+
+The reasoning that produced `-j 4` was "20 cores, so 4 is gentle" — sizing the
+flag against the *abundant* resource. The scarce resource is TTM shmem, and `-j`
+multiplies that just as readily. The arithmetic was already recorded elsewhere in
+this very file and simply never applied here: **a single `test-llama-archs` run
+peaks at 195–206 GB of 255 GB.** Two model-loading tests concurrently do not
+fit — there is no gradual approach, the first overlap is fatal.
+
+Verified 2026-08-01, and this is the whole proof — both survive the denylist
+carrying only the default `main` label, so `-j 4` starts them together:
+
+```bash
+ctest --test-dir build -N -LE 'residency|mem-handle|cache' \
+  | grep -E ' (test-llama-archs|test-thread-safety)$'   # both print. Both load models.
+```
+
+The blast radius was not just the test run: the kernel killed `pipewire`,
+`dbus-broker`, both user `systemd` instances, `(sd-pam)`, two `ssh-agent`s,
+`ffmpeg`, **and a 12 GB qemu VM**, then left `test-unified-cache-fast-path`
+unkillable in D state on `drm_exec_lock_obj` holding ~208 GB. Only a reboot
+cleared it.
+
+**Why the answer is `-j 1` and not a better filter:** you cannot construct a
+trustworthy filtered-concurrent sweep here, because *both* classifiers fail open.
+Labels fail open (`main` means "nobody classified this", not "safe" — see below).
+Names fail open too: matching `test-sycl-` against the suite returns ~88 tests,
+almost all of which are pure-Python parser gates that allocate nothing, so a
+name-based denylist is both too broad to use and too narrow to trust. `-j 1` needs
+neither classifier to be correct — if a model-loading test slips through any
+filter, it runs alone, which is the case this file already documents as safe.
+
+Form 1 (`-R <what your change gates>`) remains the recommendation. Reach for the
+full sweep rarely, and accept that it is slow.
+
 ⚠️ **`-LE 'residency|mem-handle|cache'` does NOT exclude `test-backend-ops`** —
 which is why form 2 above must also carry `-E '^test-backend-ops$'`. Until
 2026-07-30 it did not, so the command this file prescribed as the *safe* one ran
 the single binary this file separately forbids running unattended (see Hard-Won
-Rules: 50–224 GB of TTM shmem, two OOM kills). At `-j 4` it would have started
-alongside three other tests.
+Rules: 50–224 GB of TTM shmem, two OOM kills). At the `-j 4` this file then
+prescribed, it would have started alongside three other tests.
 
 The cause is structural, not a typo: `tests/CMakeLists.txt:494` registers it as
 a bare `llama_build_and_test(test-backend-ops.cpp)` with **no labels**, so it
@@ -943,7 +979,8 @@ var not documented: search `getenv("GGML_SYCL` under `ggml/src/ggml-sycl/`
 3. Test: use a form from "Running Tests" above — **not** a bare
    `ctest --test-dir build --output-on-failure`, which runs `test-backend-ops`
    and so contradicts step 4. Prefer `-R <what your change gates>`; for a full
-   sweep use the throttled form with `-E '^test-backend-ops$'`.
+   sweep use form 2 verbatim — `-j 1` **and** `-E '^test-backend-ops$'`. Do not
+   raise `-j` to save time; it is a memory multiplier and has OOM'd this host.
 4. For ggml changes: Run `test-backend-ops` on multiple backends — **manually only, never in a subagent/background task (memory-exhaustion hazard, see Hard-Won Rules)**
 5. Verify correctness: run the canonical completion gate (Hard-Won Rules) — tokens must be right, not just fast
 6. Verify performance: `llama-bench` and `llama-perplexity` should not regress
