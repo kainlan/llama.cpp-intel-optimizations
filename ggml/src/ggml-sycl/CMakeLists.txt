@@ -1479,7 +1479,19 @@ endforeach()
 # Test: reset_model_weight_entries() must preserve entries still leased by a
 # live model at a model-load boundary instead of aborting (llama.cpp-ljb9,
 # commit acdb192d4), and must keep id_to_key_ pointed at a surviving layout
-# sibling rather than dangling. Registered outside the GGML_SYCL_BUILD_XMX_TESTS
+# sibling rather than dangling.
+#
+# It also carries the model-OWNERSHIP tests for llama.cpp-0qlw / 9f3a2e0f0: a
+# live model's IDLE weights (in_use_count == 0 between graphs) must survive
+# another model's load boundary, and the two reclaim modes must keep their
+# opposite treatment of unattributed entries. Each preserve assertion is paired
+# with a mutation control that forces live_model_mask_ to 0 and requires the
+# same entry to be reclaimed -- without which "preserved N of N" is equally
+# what a no-op prints. This file is the affordable instrument for that claim:
+# test-thread-safety needs 156-180 GB of Shmem and currently SEGFAULTs for two
+# unrelated reasons, while this test measured peak RSS 317 MB (see below).
+#
+# Registered outside the GGML_SYCL_BUILD_XMX_TESTS
 # guard (which defaults OFF) so it always runs -- mirrors the _residency_test
 # loop above: no device kernel code of its own, so it only needs -fsycl to
 # link against the prebuilt ggml-sycl library, not the full XMX AOT target list.
@@ -1522,6 +1534,10 @@ add_test(NAME sycl-reset-model-weight-lease-preserve COMMAND test-sycl-reset-mod
 set_tests_properties(sycl-reset-model-weight-lease-preserve PROPERTIES
     LABELS "sycl;lease;bugfix"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    # The test exits 77 when no GPU is present, and when built without the SYCL
+    # backend at all. Without this, ctest renders 77 as FAILED rather than the
+    # intended Skipped. Matches mmq-xmx-dispatch (0f48c5352, llama.cpp-k208).
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 
