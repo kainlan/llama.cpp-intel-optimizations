@@ -110,6 +110,12 @@
 #include "ggml-sycl/sycl_hw.hpp"
 
 #include <sycl/half_type.hpp>
+
+// Unconditional: header-only, no ggml dependencies, and the standalone test in
+// ggml-sycl/tests/ includes the same file so its assertions bind to the gate
+// this file actually dispatches on (llama.cpp-cwev).
+#include "ggml-sycl/xmx-dispatch-gate.hpp"
+
 // The XMX GEMM dispatch sites below call ggml_sycl_xmx_available() and
 // ggml_sycl_xmx_supports_type(), which are declared in mmq_xmx.hpp -- included
 // here only under GGML_SYCL_MMQ_XMX. GGML_SYCL_XMX_GEMM and GGML_SYCL_MMQ_XMX
@@ -48252,7 +48258,7 @@ std::optional<ggml_sycl_mul_mat_kernel> ggml_sycl_select_preferred_kernel(
     }
     if (use_xmx) {
         int64_t batch = src1->ne[1];
-        use_xmx       = batch >= 1 && batch < g_ggml_sycl_xmx_threshold;
+        use_xmx       = ggml_sycl_xmx_batch_in_range(batch, g_ggml_sycl_xmx_threshold);
     }
 #endif
 
@@ -51331,8 +51337,9 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
     }
     if (use_xmx_gemm) {
         int64_t batch = src1->ne[1];
-        // XMX is beneficial for batch >= 1 and < threshold (DEBUG)
-        use_xmx_gemm  = batch >= 1 && batch < g_ggml_sycl_xmx_threshold;
+        // Same gate as ggml_sycl_select_preferred_kernel -- now the same
+        // function, so "same" is enforced rather than asserted in a comment.
+        use_xmx_gemm  = ggml_sycl_xmx_batch_in_range(batch, g_ggml_sycl_xmx_threshold);
     }
 #else
     bool use_xmx_gemm = false;
