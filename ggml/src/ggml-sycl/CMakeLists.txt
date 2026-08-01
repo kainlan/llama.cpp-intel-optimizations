@@ -1123,9 +1123,11 @@ set_tests_properties(sycl-dispatch-tuning PROPERTIES
 # that define is pure host-side device-info queries (dev.get_info<...>()) --
 # no parallel_for/submit/joint_matrix of its own -- so per rule 1 above it
 # needs only SYCL_LINK_ONLY_TEST_OPTIONS, not the AOT target list. It needs a
-# GPU: main() calls sycl::device::get_devices(gpu) and returns 1 (not 77) if
-# none is found, same as it did inside the guard -- unchanged here, since
-# fixing that is outside this move.
+# GPU: main() calls sycl::device::get_devices(gpu) and exits 77 if none is
+# found, so SKIP_RETURN_CODE 77 below is what makes ctest render that as
+# *skipped*. It returned 1 until llama.cpp-k208 -- a hard FAILURE on a
+# CPU-only runner, which is the mirror image of the exit-0 vacuous pass that
+# ticket is named for.
 add_executable(test-mmq-xmx-dispatch
     tests/test-mmq-xmx-dispatch.cpp
 )
@@ -1148,6 +1150,9 @@ add_test(NAME mmq-xmx-dispatch COMMAND test-mmq-xmx-dispatch)
 set_tests_properties(mmq-xmx-dispatch PROPERTIES
     LABELS "sycl;xmx;dispatch"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    # The test exits 77 when no GPU is present. Without this, ctest renders that
+    # as FAILED rather than the intended Skipped.
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 

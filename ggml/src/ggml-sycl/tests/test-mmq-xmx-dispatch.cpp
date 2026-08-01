@@ -465,26 +465,71 @@ static bool test_xmx_dispatch_empty_batch_returns_immediately(sycl::queue &     
 // =============================================================================
 // Main
 // =============================================================================
+
+// Build a queue on a device we already know exists. Wrapped in a function because
+// the queue has to outlive the try block and sycl::queue has no default state we
+// are willing to construct -- see the comment in main() on the default selector.
+static sycl::queue make_queue_or_fail(const sycl::device & dev) {
+    try {
+        return sycl::queue(dev);
+    } catch (const sycl::exception & e) {
+        fprintf(stderr, "FAILED: could not create a SYCL queue on the GPU: %s\n", e.what());
+        exit(1);
+    }
+}
+
 int main(int argc, char ** argv) {
     (void) argc;
     (void) argv;
 
     fprintf(stderr, "=== MMQ XMX Dispatch Integration Tests ===\n");
 
-    // Create SYCL queue
-    sycl::queue q;
+    // Enumerate BEFORE constructing any queue.
+    //
+    // ⚠️ This ordering is load-bearing. `sycl::queue q;` default-constructs through
+    // the default selector, which THROWS when the runtime exposes no device at all
+    // -- and it used to sit here, OUTSIDE the try below. So on a device-less host
+    // the process died with
+    //
+    //     terminate called after throwing an instance of 'sycl::_V1::exception'
+    //     what(): No device of requested type available
+    //     Aborted (core dumped)          <- exit 134
+    //
+    // without ever reaching the no-device check ten lines further down. Measured
+    // 2026-08-01 with ONEAPI_DEVICE_SELECTOR=level_zero:99. An abort is a louder
+    // form of exactly the defect the skip below exists to fix, so the queue must be
+    // built from a device already known to exist, never default-constructed.
+    std::vector<sycl::device> devices;
     try {
-        // Try to get a GPU device
-        auto devices = sycl::device::get_devices(sycl::info::device_type::gpu);
-        if (devices.empty()) {
-            fprintf(stderr, "No GPU devices found\n");
-            return 1;
-        }
-        q = sycl::queue(devices[0]);
+        devices = sycl::device::get_devices(sycl::info::device_type::gpu);
     } catch (const sycl::exception & e) {
-        fprintf(stderr, "SYCL exception: %s\n", e.what());
-        return 1;
+        // Enumeration itself failing means no device work is possible either --
+        // same skip, but say which of the two happened rather than flattening them.
+        fprintf(stderr, "SYCL exception while enumerating GPU devices: %s\n", e.what());
+        devices.clear();
     }
+
+    if (devices.empty()) {
+        // Exit 77, not 1. "No device" is not a test result in either direction:
+        // returning 1 renders a legitimately CPU-only runner as a hard FAILURE,
+        // which is the mirror image of the exit-0 vacuous pass this family is named
+        // for (llama.cpp-k208) -- same root confusion, opposite symptom. 77 is
+        // ctest's SKIP_RETURN_CODE, so ctest reports *skipped* rather than passed or
+        // failed, and a bare shell run still gets a non-zero status. The point is to
+        // make the skip visible AS a skip, never to forbid skipping: a CPU-only
+        // runner still legitimately lands here. The registration in
+        // ggml/src/ggml-sycl/CMakeLists.txt carries the matching SKIP_RETURN_CODE 77;
+        // without it ctest renders 77 as FAILED.
+        fprintf(stderr,
+                "SKIP: no SYCL GPU devices available; this run proves NOTHING "
+                "about XMX dispatch. Source oneAPI and re-run to actually test it.\n"
+                "      (source /opt/intel/oneapi/setvars.sh --force)\n");
+        return 77;  // ctest SKIP_RETURN_CODE -- a skip must be visible AS a skip
+    }
+
+    // devices[0] exists, so this cannot hit the default-selector throw described
+    // above. A failure here is a real one and stays a failure.
+    sycl::queue q = make_queue_or_fail(devices[0]);
 
     auto dev = q.get_device();
     fprintf(stderr, "Using GPU: %s\n", dev.get_info<sycl::info::device::name>().c_str());
