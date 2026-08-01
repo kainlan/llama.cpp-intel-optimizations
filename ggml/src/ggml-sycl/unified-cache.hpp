@@ -1529,14 +1529,22 @@ class unified_cache {
 
     // Layout-agnostic weight pointer lookup that ALSO pins the lease refcount
     // on the underlying cache entry.  Returns entry pointer in `entry` for the
-    // caller (mem_handle) to release on destruction.  The caller MUST release
+    // caller to release on destruction.  The caller MUST release
     // by calling `entry->in_use_count.fetch_sub(1)` exactly once — otherwise
     // the entry cannot be evicted, memory pressure will grow, and eviction
     // will start failing.  If the result is falsy (ptr == nullptr), no lease
     // was acquired and `entry == nullptr`.
-    //
-    // This is the refcount-safe entry point for mem_handle::resolve_slow().
     // See llama.cpp-vtf7f rootcause for the lifetime contract.
+    //
+    // ⚠️ This is NOT the entry point for mem_handle::resolve_slow(), despite
+    // what this comment claimed until 2026-08-01.  resolve_slow() calls
+    // acquire_entry_lease() directly (mem-handle.cpp:476).  acquire_weight_lease()
+    // has exactly two callers, both on the DNNL host-pointer path
+    // (cpu-dispatch.cpp:2620 and :2657).  The distinction matters: this function
+    // resolves a wider key space than acquire_entry_lease(), which is plain
+    // exact-match, so improvements here do NOT reach the mem_handle ownership
+    // path.  The comment above the definition in unified-cache.cpp documents the
+    // latent gap that leaves.
     struct weight_ptr_lease_result {
         void *                ptr             = nullptr;
         ggml_layout_mode      layout          = GGML_LAYOUT_AOS;

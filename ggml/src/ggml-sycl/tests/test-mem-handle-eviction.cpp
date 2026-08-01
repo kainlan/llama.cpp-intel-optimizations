@@ -186,10 +186,17 @@ static bool test_get_weight_ptr_resolves_direct_staged_entry(sycl::queue & q) {
 
 // =============================================================================
 // Test 1c: get_weight_ptr() and acquire_weight_lease() must resolve the same
-// key space.  The lease variant is the refcount-safe entry point used by
-// mem_handle::resolve_slow(), so a narrower key space there means an OWNING
-// handle fails to resolve a weight that the non-owning accessor returns —
-// llama.cpp-gzea one level down, on the ownership path.
+// key space.  A narrower key space in the lease variant means a caller that
+// takes ownership fails to resolve a weight the non-owning accessor returns —
+// llama.cpp-gzea one level down.
+//
+// NOTE: an earlier version of this comment said the lease variant is "the
+// refcount-safe entry point used by mem_handle::resolve_slow()".  That is
+// false.  resolve_slow() calls acquire_entry_lease() directly
+// (mem-handle.cpp:476); acquire_weight_lease()'s only callers are
+// cpu-dispatch.cpp:2620 and :2657, on the DNNL host-pointer path.  See the
+// comment above acquire_weight_lease() in unified-cache.cpp for the latent gap
+// that leaves in resolve_slow().
 // =============================================================================
 static bool test_lease_and_plain_lookup_agree(sycl::queue & q) {
     TEST_BEGIN("lease_and_plain_lookup_agree");
@@ -203,8 +210,25 @@ static bool test_lease_and_plain_lookup_agree(sycl::queue & q) {
     std::memset(src_host, 0x2D, entry_bytes);
     ggml_sycl_cache_id key = make_test_cache_id(800, 1, entry_bytes);
 
-    void * ptr = cache.ensure_cached(key, src_host, entry_bytes, ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1,
-                                     GGML_LAYOUT_AOS, false);
+    // These ids must NOT be (-1, -1), and that is the whole point of the test.
+    //
+    // ensure_cached() files under {DENSE_WEIGHT, id, layer_id, expert_id}.  With
+    // (-1, -1) the entry lands on exactly the key acquire_weight_lease() tries
+    // second — `unified_cache_key{DENSE_WEIGHT, key, -1, -1}` — so the lookup
+    // succeeds there and returns before the id_to_key_ fallback is reached.  The
+    // fallback is also guarded by `!(mapped == ckey)`, which that same key fails.
+    // A (-1, -1) version of this test therefore passes identically whether or not
+    // the fallback exists: it would assert nothing about the code it was written
+    // for.  Non-(-1, -1) ids make the direct-stage sweep and the {-1, -1} key both
+    // miss, leaving id_to_key_ as the only route.
+    //
+    // Verified to discriminate: with the id_to_key_ fallback removed from
+    // acquire_weight_lease(), the assertion below fails.
+    constexpr int layer_id  = 3;
+    constexpr int expert_id = 7;
+
+    void * ptr = cache.ensure_cached(key, src_host, entry_bytes, ggml_sycl::cache_entry_type::DENSE_WEIGHT, layer_id,
+                                     expert_id, GGML_LAYOUT_AOS, false);
     TEST_ASSERT(ptr != nullptr, "ensure_cached should succeed");
     q.wait();
     (void) cache.get(key, GGML_LAYOUT_AOS);  // drive state → READY
@@ -214,13 +238,16 @@ static bool test_lease_and_plain_lookup_agree(sycl::queue & q) {
 
     auto lease = cache.acquire_weight_lease(key);
     TEST_ASSERT(lease.ptr != nullptr, "acquire_weight_lease must resolve whatever get_weight_ptr resolves");
-    TEST_ASSERT(lease.ptr == plain.ptr, "lease and plain lookup must agree on the pointer");
     TEST_ASSERT(lease.entry != nullptr, "a successful lease must carry the entry to release against");
 
     // Release exactly once, per the contract documented on the declaration in
-    // unified-cache.hpp.  Holding it would block the eviction the other tests
-    // in this binary rely on.
+    // unified-cache.hpp, and do it BEFORE the remaining assertion: TEST_ASSERT
+    // returns early on failure, which would otherwise skip the release and leave
+    // in_use_count pinned on an entry the later tests expect to be evictable.
+    void * leased_ptr = lease.ptr;
     lease.entry->in_use_count.fetch_sub(1);
+
+    TEST_ASSERT(leased_ptr == plain.ptr, "lease and plain lookup must agree on the pointer");
 
     sycl::free(src_host, q);
     TEST_PASS();

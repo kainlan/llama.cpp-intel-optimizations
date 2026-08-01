@@ -4697,6 +4697,18 @@ void * unified_cache::try_get_cached_with_event(const ggml_sycl_cache_id & key_i
     const unified_cache_key direct_key = make_direct_stage_key(cache_entry_type::DENSE_WEIGHT, key_id, layout);
     auto                    entry_it   = entries_.find(direct_key);
     if (entry_it == entries_.end()) {
+        // Same MOE_EXPERT direct-stage probe as get(), try_get_cached_fast() and
+        // lookup_device_only().  This function has NO callers today — it is a
+        // declared-but-unused public method — so this is not fixing a live bug.
+        // It is fixed anyway because without it the method silently carries the
+        // llama.cpp-5pvn defect: direct_stage_expert() files under a MOE_EXPERT
+        // direct-stage key and overwrites id_to_key_ on every staging, so only
+        // the last-staged layout of an expert would resolve here.  A correctly
+        // declared public method that is quietly wrong invites the first caller
+        // to inherit the bug with no warning.
+        entry_it = entries_.find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, key_id, layout));
+    }
+    if (entry_it == entries_.end()) {
         auto id_it = id_to_key_.find(key_id);
         if (id_it == id_to_key_.end()) {
             return nullptr;
