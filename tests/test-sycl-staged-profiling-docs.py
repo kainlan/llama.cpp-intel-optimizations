@@ -49,7 +49,12 @@ def test_staged_profiling_docs_describe_strict_merge_contract() -> None:
 def test_staged_profiling_docs_define_success_and_fallback_requirements() -> None:
     section = staged_profiling_section()
     for required in (
-        "Exact source-line attribution",
+        # ca3bbca3e ("docs(sycl): align source-line closure statuses") inserted
+        # "sampled" here, distinguishing exact SAMPLED VTune source lines from
+        # the static/DWARF paths added alongside it. The rename is the point of
+        # that commit, so the literal is re-synced rather than loosened -- this
+        # row must keep naming the sampled path specifically.
+        "Exact sampled source-line attribution",
         "source_line.status pass",
         "source_attribution.status exact_source_line",
         "source_line.status fail",

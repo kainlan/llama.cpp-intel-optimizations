@@ -11,15 +11,31 @@ REGISTRY = ROOT / "tools" / "sycl-kernel-bench" / "kernel_registry.hpp"
 REFERENCE = ROOT / "tools" / "sycl-kernel-bench" / "kernels" / "reference" / "mxfp4_inline_dot.cpp"
 
 
+# Assertions below are matched against WHITESPACE-COLLAPSED text.
+#
+# These files use vertical alignment, which CLAUDE.md mandates as a house
+# convention -- `bool  multi_rhs_gateup         = false;`. Matching the raw
+# text made this gate red whenever a neighbouring field was renamed and the
+# alignment column moved, which says nothing about the invariant under test.
+# Three assertions here failed for exactly that reason while the fields they
+# name were present and correct.
+#
+# Collapsing runs of whitespace to a single space removes the alignment
+# sensitivity and NOTHING ELSE: token order, spelling and adjacency are still
+# required, so a genuinely missing or renamed field still fails.
+def _ws(text: str) -> str:
+    return " ".join(text.split())
+
+
 def test_multirhs_bench_cli_scaffolding_exists() -> None:
     bench = BENCH_HPP.read_text(encoding="utf-8")
     harness = HARNESS.read_text(encoding="utf-8")
     registry = REGISTRY.read_text(encoding="utf-8")
     main = (ROOT / "tools" / "sycl-kernel-bench" / "main.cpp").read_text(encoding="utf-8")
-    assert "bool  multi_rhs_gateup" in bench
-    assert "int   multi_rhs_cols" in bench
-    assert "multi_rhs_gateup = false" in bench
-    assert "multi_rhs_cols = 1" in bench
+    assert _ws("bool multi_rhs_gateup") in _ws(bench)
+    assert _ws("int multi_rhs_cols") in _ws(bench)
+    assert _ws("multi_rhs_gateup = false") in _ws(bench)
+    assert _ws("multi_rhs_cols = 1") in _ws(bench)
     assert "_multirhs" in harness
     assert "parse_moe_multirhs_cols" in harness
     assert "mxfp4_pair_glu_xmx_tiled_multirhs_n2_r8" in registry
@@ -30,10 +46,10 @@ def test_multirhs_bench_cli_scaffolding_exists() -> None:
 
 def test_multirhs_bench_args_default_off() -> None:
     bench = BENCH_HPP.read_text(encoding="utf-8")
-    assert "bool  multi_rhs_gateup" in bench
-    assert "int   multi_rhs_cols" in bench
-    assert "multi_rhs_gateup = false" in bench
-    assert "multi_rhs_cols = 1" in bench
+    assert _ws("bool multi_rhs_gateup") in _ws(bench)
+    assert _ws("int multi_rhs_cols") in _ws(bench)
+    assert _ws("multi_rhs_gateup = false") in _ws(bench)
+    assert _ws("multi_rhs_cols = 1") in _ws(bench)
 
 
 def test_multirhs_reference_path_bounds_group_columns() -> None:
@@ -68,8 +84,8 @@ def test_multirhs_validation_reference_disables_candidate_mode() -> None:
     start = reference.index("ggml_sycl::mxfp4_pair_glu_bench_args ref_args = args")
     end = reference.index("if (!ggml_sycl::ggml_sycl_mxfp4_pair_glu_bench_launch(ref_args))", start)
     ref_setup = reference[start:end]
-    assert "ref_args.multi_rhs_gateup    = false" in ref_setup
-    assert "ref_args.multi_rhs_cols      = 1" in ref_setup
+    assert _ws("ref_args.multi_rhs_gateup = false") in _ws(ref_setup)
+    assert _ws("ref_args.multi_rhs_cols = 1") in _ws(ref_setup)
 
 
 def test_multirhs_benchmark_kernel_uses_rhs_columns_not_role_columns() -> None:
