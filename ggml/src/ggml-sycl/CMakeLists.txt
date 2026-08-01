@@ -585,71 +585,6 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         target_link_libraries(test-xmx-esimd-basic PRIVATE IntelSYCL::SYCL_CXX)
     endif()
 
-    # Test 3: XMX ESIMD Q8_0 GEMM Kernel Tests - DISABLED (API mismatch)
-    # Tests the ESIMD-based Q8_0 GEMM kernel with dynamic hardware detection
-    # add_executable(test-xmx-esimd-q8-gemm
-    #     tests/test-xmx-esimd-q8-gemm.cpp
-    # )
-    # target_include_directories(test-xmx-esimd-q8-gemm PRIVATE
-    #     ${CMAKE_CURRENT_SOURCE_DIR}
-    #     ${CMAKE_CURRENT_SOURCE_DIR}/..
-    #     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-    # )
-    # target_compile_options(test-xmx-esimd-q8-gemm PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    # target_link_options(test-xmx-esimd-q8-gemm PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    # target_compile_definitions(test-xmx-esimd-q8-gemm PRIVATE
-    #     GGML_SYCL_WARP_SIZE=32
-    #     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-    #     XMX_TEST_STANDALONE=1
-    # )
-    # if (IntelSYCL_FOUND)
-    #     target_link_libraries(test-xmx-esimd-q8-gemm PRIVATE IntelSYCL::SYCL_CXX)
-    # endif()
-
-    # Test 4: XMX DPAS Basic Infrastructure Tests (DISABLED - uses old XMXDpasConfig API)
-    # Superseded by unified-kernel.hpp joint_matrix approach
-    # TODO(llama.cpp-6hp): Update or remove when XMX kernel optimization resumes
-    # add_executable(test-xmx-dpas-basic
-    #     tests/test-xmx-dpas-basic.cpp
-    # )
-    # target_include_directories(test-xmx-dpas-basic PRIVATE
-    #     ${CMAKE_CURRENT_SOURCE_DIR}
-    #     ${CMAKE_CURRENT_SOURCE_DIR}/..
-    #     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-    # )
-    # target_compile_options(test-xmx-dpas-basic PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    # target_link_options(test-xmx-dpas-basic PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    # target_compile_definitions(test-xmx-dpas-basic PRIVATE
-    #     GGML_SYCL_WARP_SIZE=32
-    #     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-    #     XMX_TEST_STANDALONE=1
-    # )
-    # if (IntelSYCL_FOUND)
-    #     target_link_libraries(test-xmx-dpas-basic PRIVATE IntelSYCL::SYCL_CXX)
-    # endif()
-
-    # Test 5: XMX ESIMD Q4_0 GEMM Kernel Tests (DISABLED - uses old XMXDpasConfig API)
-    # Superseded by unified-kernel.hpp joint_matrix approach
-    # TODO(llama.cpp-6hp): Update or remove when XMX kernel optimization resumes
-    # add_executable(test-xmx-esimd-q4-gemm
-    #     tests/test-xmx-esimd-q4-gemm.cpp
-    # )
-    # target_include_directories(test-xmx-esimd-q4-gemm PRIVATE
-    #     ${CMAKE_CURRENT_SOURCE_DIR}
-    #     ${CMAKE_CURRENT_SOURCE_DIR}/..
-    #     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-    # )
-    # target_compile_options(test-xmx-esimd-q4-gemm PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    # target_link_options(test-xmx-esimd-q4-gemm PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    # target_compile_definitions(test-xmx-esimd-q4-gemm PRIVATE
-    #     GGML_SYCL_WARP_SIZE=32
-    #     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-    #     XMX_TEST_STANDALONE=1
-    # )
-    # if (IntelSYCL_FOUND)
-    #     target_link_libraries(test-xmx-esimd-q4-gemm PRIVATE IntelSYCL::SYCL_CXX)
-    # endif()
-
     # Test 6: XMX MoE MXFP4 Fused Kernel Tests
     # Tests the fused MXFP4 MoE GEMM kernel with E8M0 exponents and kvalues LUT
     add_executable(test-xmx-moe-mxfp4
@@ -676,9 +611,6 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
     include(CTest)
     add_test(NAME xmx-hardware-detect COMMAND test-xmx-hardware-detect)
     add_test(NAME xmx-esimd-basic COMMAND test-xmx-esimd-basic)
-    # add_test(NAME xmx-esimd-q8-gemm COMMAND test-xmx-esimd-q8-gemm)  # DISABLED
-    # add_test(NAME xmx-dpas-basic COMMAND test-xmx-dpas-basic)  # DISABLED - old API
-    # add_test(NAME xmx-esimd-q4-gemm COMMAND test-xmx-esimd-q4-gemm)  # DISABLED - old API
     add_test(NAME xmx-moe-mxfp4 COMMAND test-xmx-moe-mxfp4)
 
     # Test: MoE MXFP4 DP4A vs Scalar Correctness

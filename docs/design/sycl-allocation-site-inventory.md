@@ -416,6 +416,14 @@ All allocations in `tests/` are permanently exempt per §8 of the contract. They
 
 Total test sites: **296** (allowlisted permanently, §8).
 
+⚠️ **Two rows above name files that no longer exist.**
+`tests/test-xmx-esimd-q4-gemm.cpp` (12 sites) and `tests/test-xmx-dpas-basic.cpp`
+(21 sites) were deleted on 2026-08-01 (`llama.cpp-50le`) — they had been
+commented out of `CMakeLists.txt` for months and no longer compiled. The counts
+above are left as measured so the 545-hit arithmetic in the summary and in
+Appendix A stays internally consistent; a re-measure would drop the test total to
+**263**. Do not treat either row as evidence that the file is present.
+
 ---
 
 ## Allowlist summary with deletion criteria
