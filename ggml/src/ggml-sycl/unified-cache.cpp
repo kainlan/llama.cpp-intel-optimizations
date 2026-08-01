@@ -7730,6 +7730,11 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
                 // every replan is in, and clearing the tables there is what drops
                 // those leases -- keeping them would change single-model
                 // behaviour and reintroduce the fragmentation the replan avoids.
+                //
+                // llama.cpp-2wv5: a SECOND copy of this same ownership test lives
+                // in the MODEL_TEARDOWN pre-scan block above (`owned_by_survivor`),
+                // which drops the mirror rows before the scan reads in_use_count.
+                // The two must agree -- change both or neither.
                 keep_direct_tables = true;
             }
         }
