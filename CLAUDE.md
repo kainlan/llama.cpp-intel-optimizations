@@ -424,6 +424,22 @@ Confirmed lessons from prior work on this fork. Treat them as defaults.
   repetition. Label filters do NOT protect you (`test-backend-ops` carries no labels), and a
   healthy-looking `free` reading does not either.
 
+  ⚠️ **The rule is not about accumulation, and that misreading is why it gets broken.** Measured
+  2026-08-01 across two independent events: **a single `test-llama-archs` run peaks at
+  195–206 GB of 255 GB** — ~80 % of host RAM — then releases cleanly. So a second run starting
+  before the first has released does not slowly accumulate toward a limit; **it simply does not
+  fit.** The first overlap is fatal and there is no gradual approach to warn you.
+  A correct single run leaves only ~20 GB of margin, which is why a memory watchdog fires on
+  entirely healthy work here.
+
+  ⚠️ **`GPU.lock` (or any device lock) serialises ACCESS, not MEMORY RECOVERY.** Lock release is
+  synchronous; TTM shmem release is not. Observed 2026-08-01: one run sat at `Shmem` 204 GB /
+  `MemAvailable` 25 GB while another agent polled `until mkdir GPU.lock` every 15 s, ready to
+  launch from a 25 GB baseline the instant it freed — **both parties obeying the protocol
+  exactly, and still an OOM.** After acquiring the lock and *before* touching the device, wait
+  for `Shmem < 30 GB` **and** `MemAvailable > 150 GB`; if it has not settled in ~10 minutes,
+  release the lock and escalate rather than proceeding or holding it while you wait.
+
   Known members (**not** an exhaustive list — apply the property):
   - **`test-backend-ops`** — never in a subagent or background task. Hundreds of GPU BOs, TTM
     shmem 50–224 GB, two hangs on 2026-04-06. Run manually, with monitoring, only.
