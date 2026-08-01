@@ -457,6 +457,47 @@ A run reporting single-digit tok/s on Mistral Q4_0 is a CPU fallback, not a
 regression to investigate. Recovery is cheap: delete **only** `CMakeCache.txt`
 and re-run `./scripts/sycl-build.sh` — ccache absorbs most of it, no `-c` needed.
 
+⚠️ **The same blindness in test form: a SYCL test binary run WITHOUT sourcing
+`setvars.sh` prints `SKIP` and exits 0.** Verified 2026-08-01:
+
+```
+$ ./build/bin/test-mem-ops
+SKIP: no SYCL GPU devices available
+$ echo $?
+0
+```
+
+**Exit 0. Green. It proves nothing** — the device test found no device and
+reported success. Under `ctest` it passes for real, because the registration's
+`ENVIRONMENT` property supplies `LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib`;
+this bites only someone invoking a binary **directly**, which is exactly what
+you do when iterating on one failing test. Nothing in the output distinguishes
+"the device path ran and was correct" from "there was no device". So:
+
+- **Source oneAPI first**, every time, even for a single binary.
+- **Treat an implausibly short runtime as a signal.** This was caught only
+  because a 0.4 s GPU test was not believed.
+- **A `SKIP` line with status 0 is not a pass.** Where a test has been fixed it
+  now exits **77** (ctest's `SKIP_RETURN_CODE`, already used by the
+  `test-sycl-*-policy.sh` family), so ctest reports *skipped* and a bare shell
+  run gets a non-zero status. The goal is to make a skip **visible as a skip**,
+  not to forbid skipping — a CPU-only runner still legitimately skips.
+
+⚠️ **`test-llama-archs -a <arch>` had the same shape and it is the one that
+matters most**, because the whole point of `-a` is to answer "is this
+architecture correct?". Several archs are excluded by the harness itself
+(`gemma4`, `gemma4-assistant`, `eagle3`, `dflash` emit **no row at all**;
+`gemma-embedding`, the BERT family and RWKV are `arch_supported() == false` and
+emit an all-`SKIP` table). Every one of those used to print an empty or all-SKIP
+table and **exit 0**, which reads as "verified". They now exit 77 with an
+explicit "this run proves NOTHING about it". A full sweep (no `-a`) is
+unaffected.
+
+This is the third member of one family, and all three are clean answers about
+the wrong thing: the CPU-fallback gate above (right tokens, wrong backend), the
+`free -g` pre-run check (right number, wrong instant — see Running Tests), and
+this (right status, no work done).
+
 ```bash
 source /opt/intel/oneapi/setvars.sh --force
 
