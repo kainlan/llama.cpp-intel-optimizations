@@ -1356,6 +1356,28 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)
     llama_build_and_test(test-col2im-1d.cpp)
+
+    # RESTORED (llama.cpp-0igs): 3c8f296fd:258 had this immediately above
+    # test-rope, inside this same NOT GGML_BACKEND_DL guard -- it uses the
+    # backend vec_dot directly, so the guard is load-bearing, not decoration.
+    # Put back in its original position rather than appended somewhere
+    # convenient, so the reason it is guarded stays legible.
+    llama_build_and_test(test-q4-0-q8-0-vec-dot-regression.cpp)
+    # NB: llama_build_and_test's LABEL is a oneValueArgs, so a ";"-joined list
+    # does NOT survive it -- ARGN flattens it and every element after the first
+    # falls into UNPARSED_ARGUMENTS, which this helper appends to TEST_SOURCES.
+    # `LABEL "main;quant"` therefore fails configure with `Cannot find source
+    # file: quant`. Only llama_test_pytest takes a multi-valued LABEL. Set
+    # multi-labels through the test property instead.
+    set_tests_properties(test-q4-0-q8-0-vec-dot-regression PROPERTIES LABELS "main;quant")
+    # The 3c8f296fd block was a bare llama_build_and_test with no include dirs
+    # and it no longer compiles: the source includes ggml-cpu/quants.h, which
+    # opens with #include "ggml-common.h", and ggml/src is not on this target's
+    # include path today. The test source is BYTE-IDENTICAL to 3c8f296fd, so
+    # this is the include path regressing underneath an unchanged test, not the
+    # test drifting -- which is exactly why a restored block has to be built
+    # and not just pasted back. Same remedy as test-alloc below.
+    target_include_directories(test-q4-0-q8-0-vec-dot-regression PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 endif()
 
 # libmtmd
@@ -1392,6 +1414,91 @@ target_link_libraries(${TEST_TARGET} PRIVATE llama)
 
 llama_build_and_test(test-alloc.cpp)
 target_include_directories(test-alloc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
+# -------------------------------------------------------------------------
+# RESTORED COVERAGE, batch 3/N (llama.cpp-0igs): the host-only C++ tests.
+#
+# These five had known-good llama_build_and_test blocks in
+# 3c8f296fd:tests/CMakeLists.txt (lines 196, 197, 274, 513, 516) and are the
+# subset that needs NO SYCL device link -- they build and run in a plain host
+# configure, so restoring them costs a normal compile rather than an ~15-minute
+# ocloc link. Verified built and run before landing.
+#
+# Each was checked for a real failure path first, not just for compiling.
+# That check is the point of this ticket and it disqualified others: this
+# build is Release, CMAKE_CXX_FLAGS_RELEASE is `-O3 -DNDEBUG`, so a test whose
+# only failure signal is bare assert() compiles to a program whose sole exit
+# path is `return 0`. These five signal through `return failed > 0 ? 1 : 0`,
+# `return 1`, or GGML_ASSERT, all of which survive NDEBUG.
+#
+# LABELS are new -- the originals had none, and "only main" means "nobody
+# classified this", not "this is safe" (CLAUDE.md). None matches the throttled
+# sweep's -LE 'residency|mem-handle|cache' denylist, so the sweep runs them.
+llama_build_and_test(test-tensor-data.cpp)
+set_tests_properties(test-tensor-data       PROPERTIES LABELS "main;tensor")
+llama_build_and_test(test-q8-0-soa.cpp)
+set_tests_properties(test-q8-0-soa          PROPERTIES LABELS "main;quant;soa")
+llama_build_and_test(test-mmq-soa-q4-0.cpp)
+set_tests_properties(test-mmq-soa-q4-0      PROPERTIES LABELS "main;quant;soa")
+
+# Self-contained: builds its own temporary GGUF with mkstemps and parses it
+# back, so it needs no model fixture and no network.
+llama_build_and_test(test-sycl-model-shapes.cpp)
+set_tests_properties(test-sycl-model-shapes PROPERTIES LABELS "main;sycl;shapes")
+
+# ARGS and the ENVIRONMENT property are restored verbatim from 3c8f296fd:197.
+# The golden files are the assertion -- without them the test has nothing to
+# compare against -- and both are present in tests/golden/.
+#
+# src/llama-tensor-class.cpp is compiled INTO the test target, which the
+# original block did not need to do. It is needed now because that translation
+# unit is no longer built into the llama library at all: 3c8f296fd's
+# src/CMakeLists.txt listed `llama-tensor-class.cpp` (line 37) and HEAD's does
+# not, so the restored test failed to link on llama_tensor_classify,
+# llama_tensor_class_name, llama_tensor_priority_name and
+# llama_tensor_priority_for. Compiling the source into the test is the same
+# arrangement 3c8f296fd used for test-kv-block, so it is in-idiom rather than a
+# workaround, and it keeps this restoration self-contained.
+#
+# ⚠️ It does NOT fix the underlying gap, and that gap is wider than this test:
+# llama-tensor-class.cpp, llama-kv-block.cpp, llama-moe-profile.cpp and
+# llama-pp-scheduler.cpp are ALL absent from HEAD's src/CMakeLists.txt while
+# still present and tracked in src/. Stale build trees (build-13qq,
+# build_no_f16) still contain objects for three of them, which is the evidence
+# they used to be compiled. So the classifier this test now covers is, at HEAD,
+# dead code that nothing in the library links -- the test proves the module
+# still behaves, not that anything uses it. Tracked separately; src/ is not
+# this ticket's path.
+llama_build_and_test(test-tensor-class.cpp ${PROJECT_SOURCE_DIR}/src/llama-tensor-class.cpp
+    ARGS ${CMAKE_CURRENT_SOURCE_DIR}/golden/place2-mistral7b.txt
+         ${CMAKE_CURRENT_SOURCE_DIR}/golden/place2-gpt-oss-20b.txt)
+target_include_directories(test-tensor-class PRIVATE ${PROJECT_SOURCE_DIR}/src)
+set_tests_properties(test-tensor-class      PROPERTIES LABELS "main;tensor")
+set_property(TEST test-tensor-class PROPERTY
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:$ENV{LD_LIBRARY_PATH}")
+
+# DECLINED in this batch, with reasons (llama.cpp-0igs):
+#
+#   test-fattn-determinism.cpp (20 asserts), test-fattn-mask.cpp (19)
+#       VACUOUS under this build's own flags. Measured, not inferred: compiled
+#       with -O3 -DNDEBUG and then REBUILT with every assert condition forced
+#       false, both still exit 0. The same all-false mutants built WITHOUT
+#       -DNDEBUG abort with 134, which is the control proving the mutation is
+#       real and that NDEBUG is what erases the test. Neither file carries
+#       `#undef NDEBUG`. Registering them would add two permanently-green lines
+#       that cannot fail. One line each (`#undef NDEBUG` after the includes)
+#       makes them real; that is a tests/*.cpp change and is tracked separately.
+#       Six more restorable sources are in the same state, the largest being
+#       test-kv-block.cpp at 178 asserts -- restoring it would read as
+#       recovering 178 assertions and recover none.
+#
+#   test-sycl-model-repro.cpp
+#       On a missing model it prints "SKIP:" and returns 0, not 77, so
+#       registered bare it is a guaranteed green on any machine without
+#       LLAMA_SYCL_TEST_MODEL set. It needs either an ENVIRONMENT pinning a
+#       real model -- which makes it a GPU test, not a host one, and moves it
+#       out of this batch -- or a source change to return 77 so ctest can tell
+#       "skipped" from "passed".
 
 llama_build(test-export-graph-ops.cpp)
 target_include_directories(test-export-graph-ops PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
