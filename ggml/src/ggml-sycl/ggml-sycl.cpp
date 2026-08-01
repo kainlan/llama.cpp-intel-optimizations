@@ -48221,8 +48221,16 @@ std::optional<ggml_sycl_mul_mat_kernel> ggml_sycl_select_preferred_kernel(
     // XMX eligibility (extensive checks from current code)
     bool use_xmx = false;
 #ifdef GGML_SYCL_XMX_GEMM
-    static const bool xmx_env = (std::getenv("GGML_SYCL_USE_XMX_GEMM") != nullptr);
-    use_xmx                   = xmx_env || (g_ggml_sycl_use_xmx_gemm != 0);
+    // Read the PARSED global, never getenv("GGML_SYCL_USE_XMX_GEMM") directly.
+    // This site used to OR in a presence test, so GGML_SYCL_USE_XMX_GEMM=0 left
+    // XMX on here while ggml_sycl_mul_mat -- which has always read the global --
+    // turned it off: one process, two opposite configurations, and a startup
+    // report that printed 0 while XMX was live (llama.cpp-wvbw). The presence
+    // form was copied from the FORCE_MMQ/FORCE_DMMV idiom just below, where a
+    // bare set-to-anything switch is the intent; it is not the intent here,
+    // because this variable has a sycl_env_settings row and is reported.
+    // Guarded by scripts/check-sycl-xmx-enable-single-source.sh.
+    use_xmx = (g_ggml_sycl_use_xmx_gemm != 0);
     if (use_xmx) {
         use_xmx = ggml_sycl_xmx_available() && ggml_sycl_xmx_supports_type(src0->type);
     }
