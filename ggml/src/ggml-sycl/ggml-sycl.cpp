@@ -48220,7 +48220,14 @@ std::optional<ggml_sycl_mul_mat_kernel> ggml_sycl_select_preferred_kernel(
 
     // XMX eligibility (extensive checks from current code)
     bool use_xmx = false;
-#ifdef GGML_SYCL_XMX_GEMM
+    // Both flags, not just GGML_SYCL_XMX_GEMM: this block calls
+    // ggml_sycl_xmx_available()/ggml_sycl_xmx_supports_type(), declared in
+    // mmq_xmx.hpp, included only under GGML_SYCL_MMQ_XMX. The #error at the top
+    // of this file names the missing option, but clang does not halt on #error
+    // -- it keeps preprocessing and would re-emit two undeclared-identifier
+    // errors from here underneath it. Matches the other guards around XMX code
+    // (llama.cpp-44gm).
+#if defined(GGML_SYCL_XMX_GEMM) && defined(GGML_SYCL_MMQ_XMX)
     // Read the PARSED global, never getenv("GGML_SYCL_USE_XMX_GEMM") directly.
     // This site used to OR in a presence test, so GGML_SYCL_USE_XMX_GEMM=0 left
     // XMX on here while ggml_sycl_mul_mat -- which has always read the global --
@@ -51298,7 +51305,9 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
     if (force_dmmv && use_dequantize_mul_mat_vec) {
         use_mul_mat_vec_q = false;  // DMMV takes priority over MMVQ for batch=1
     }
-#ifdef GGML_SYCL_XMX_GEMM
+// Both flags -- see the matching guard in ggml_sycl_select_preferred_kernel and
+// the #error at the top of this file (llama.cpp-44gm).
+#if defined(GGML_SYCL_XMX_GEMM) && defined(GGML_SYCL_MMQ_XMX)
 
     // XMX GEMM path (experimental, known to be 5-11x slower for quantized models)
     bool use_xmx_gemm = g_ggml_sycl_use_xmx_gemm ? true : false;
