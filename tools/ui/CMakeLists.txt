@@ -121,8 +121,64 @@ if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/dist")
         CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/dist")
 endif()
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/dist/index.html")
-    list(APPEND UI_ASSET_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/dist/index.html")
+    # EVERY file under dist/ is an input, not just index.html: embed.cpp
+    # "recursively embeds every regular file under <asset_dir>", so a changed
+    # hashed bundle at dist/_app/immutable/bundle.HASH.js is embedded verbatim.
+    # Depending on index.html alone let every other asset go stale silently --
+    # the same defect this block was added to close, one file across.
+    file(GLOB_RECURSE UI_DIST_FILES "${CMAKE_CURRENT_SOURCE_DIR}/dist/*")
+
+    # dist/_gzip is OUTPUT, not input. ui-assets.cmake REMOVE_RECURSEs and
+    # regenerates it INSIDE dist/ on every provisioning run, so listing its
+    # files as dependencies would leave the stamp's own inputs newer than the
+    # stamp after each run -- provisioning on every build, i.e. precisely the
+    # always-dirty defect this file exists to remove. Measured: the run that
+    # first creates _gzip does move dist/'s mtime and costs one extra
+    # reconfigure; that is bounded and acceptable, a per-build rebuild is not.
+    list(FILTER UI_DIST_FILES EXCLUDE REGEX "/dist/_gzip/")
+    list(APPEND UI_ASSET_DEPENDS ${UI_DIST_FILES})
+
+    # Watching only dist/ catches entries added or removed directly in dist/,
+    # but POSIX mtime rules apply at every depth: deleting
+    # dist/_app/immutable/bundle.js moves dist/_app/immutable's mtime, not
+    # dist/'s. Since the glob above now DECLARES those deep files, a deletion
+    # without a reconfigure is not merely stale -- it is the hard
+    # "missing and no known rule to make it" build failure that
+    # 0629fee9e fixed one level up. So every directory under dist/ is watched.
+    #
+    # This is finite and self-maintaining, not an infinite regress: the set is
+    # enumerated at configure time, and a NEW subdirectory always changes its
+    # parent's mtime, and the parent is watched -- so it triggers a reconfigure
+    # that then enumerates it.
+    file(GLOB_RECURSE UI_DIST_ENTRIES LIST_DIRECTORIES true
+         "${CMAKE_CURRENT_SOURCE_DIR}/dist/*")
+    foreach(entry ${UI_DIST_ENTRIES})
+        if (IS_DIRECTORY "${entry}" AND NOT entry MATCHES "/dist/_gzip")
+            set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${entry}")
+        endif()
+    endforeach()
 endif()
+
+# Axes closed, and the ones knowingly left open. Four rounds of this fix each
+# closed the axis in front of it and left the next one narrow, so the inventory
+# is written down rather than remembered:
+#
+#   CLOSED  direction        create vs delete of dist/        (CONFIGURE_DEPENDS on tools/ui)
+#   CLOSED  granularity      dist/ vs a file inside it        (CONFIGURE_DEPENDS on dist/)
+#   CLOSED  content          every embedded asset, not just index.html (GLOB_RECURSE)
+#   CLOSED  depth            add/remove at any depth under dist/       (per-directory watch)
+#
+#   OPEN    npm cold start   a first-ever `node_modules` install could create a
+#                            top-level entry under tools/ui and fire one extra
+#                            reconfigure. Correct behaviour, bounded to once,
+#                            never observed here (this tree is always warm).
+#   OPEN    sources.cmake    UI_SOURCE_GLOBS is stale in both directions -- it
+#                            names a file that no longer exists and omits real
+#                            inputs (the vite plugins). Inherited by everything
+#                            above that reads it. llama.cpp-3658.
+#   OPEN    race             a file changed while provisioning is mid-run is not
+#                            re-detected until the next build. Inherent to a
+#                            stamp; not worth closing.
 
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/sources.cmake")
     include("${CMAKE_CURRENT_SOURCE_DIR}/sources.cmake")

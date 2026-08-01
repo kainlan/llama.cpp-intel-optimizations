@@ -25,11 +25,14 @@ if (CMAKE_GENERATOR STREQUAL "Ninja" AND CMAKE_CXX_COMPILER_ID STREQUAL "IntelLL
     #
     # This `set()` is directory-scoped, so it reaches only this directory's
     # targets. Every OTHER directory holding a target that links with icpx
-    # needs the same line: tools/CMakeLists.txt carries it for the tools.
-    # tests/CMakeLists.txt still does not, so the four SYCL-linking tests
+    # needs its own copy: tools/CMakeLists.txt carries it for the tools, and
+    # tests/CMakeLists.txt for the four SYCL-linking tests
     # (test-sycl-fattn-onednn-gates, test-sycl-kernel-profiler,
-    # test-unified-cache-unpin-event, test-sycl-zone-reset-live-refusal) are
-    # still relinked on every build. See llama.cpp-9ubg.
+    # test-unified-cache-unpin-event, test-sycl-zone-reset-live-refusal).
+    # For a long time only this site had it and those nine targets were
+    # relinked on every build, silently. tests/test-sycl-link-depends-coverage.py
+    # is the gate that keeps a fifth directory from repeating it.
+    # See llama.cpp-9ubg.
     set(CMAKE_CXX_LINK_DEPENDS_USE_LINKER FALSE)
 endif()
 
