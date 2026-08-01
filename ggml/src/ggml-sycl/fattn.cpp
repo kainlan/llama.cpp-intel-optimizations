@@ -2120,8 +2120,17 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
         std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG") && dispatch_debug_counter <= debug_limit;
     auto dispatch_debug_kernel = [&](const char * kernel) {
         if (dispatch_debug_enabled) {
-            fprintf(stderr, "[SYCL] fattn selected [%d/%d] %s D=%d ne01=%d safe_decode=%d fast_esimd_safe=%d\n",
-                    dispatch_debug_counter, debug_limit, kernel, D, ne01, (int) safe_decode,
+            // ne11 (KV length) and the mask extents are the shape terms that
+            // actually bound the kernels' KV loops; without them a "selected"
+            // line cannot distinguish a correct dispatch from one handed an
+            // absurd loop bound. Cheap to print, and only under the env gate.
+            fprintf(stderr,
+                    "[SYCL] fattn selected [%d/%d] %s D=%d ne01=%d ne11=%d ne02=%d ne12=%d "
+                    "mask=%d ne30=%d ne31=%d ne32=%d ne33=%d nb31=%d softcap=%.6g n_seqs=%d "
+                    "safe_decode=%d fast_esimd_safe=%d\n",
+                    dispatch_debug_counter, debug_limit, kernel, D, ne01, params.ne11, params.ne02, params.ne12,
+                    (int) (params.mask != nullptr), params.ne30, params.ne31, params.ne32, params.ne33, params.nb31,
+                    params.logit_softcap, params.n_seqs, (int) safe_decode,
                     (int) fast_decode_policy.fast_esimd_safe);
         }
         if (ggml_sycl::e2e_tg_profile_enabled()) {
