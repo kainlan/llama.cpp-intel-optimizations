@@ -5794,6 +5794,38 @@ cache_ptr_view unified_cache::get_view(const ggml_sycl_cache_id & key_id, ggml_l
     return view;
 }
 
+// ---------------------------------------------------------------------------
+// OPEN QUESTION, deliberately not fixed here: can this reach a direct-staged
+// DENSE_WEIGHT layout at all?  Documented rather than changed because the answer
+// is not established, and because a wrong "fix" to a removal path frees memory
+// somebody may still hold.  There is no ticket for this — the tracker was down
+// when it was found — so this comment is the record.
+//
+// The lookup below builds the literal key {type, key_id, layer_id, expert_id}.
+// Its two DENSE_WEIGHT call sites (ggml-sycl.cpp:23185 and the sibling drop
+// path) pass layer_id=-1, expert_id=-1, giving {DENSE_WEIGHT, key_id, -1, -1}.
+// A direct-staged entry is NOT filed under that key: make_direct_stage_key()
+// sets expert_id = -1000 - layout as a sentinel, so entries_.find() misses and
+// this function returns having done nothing.
+//
+// Consequence today is cosmetic but misleading: the caller has already emitted
+// "[UNIFIED-CACHE] drop layout=… " before calling, so the log claims a drop that
+// never happened, for an entry that remains and is pinned.  Treat that log line
+// as a SYMPTOM, not the bug — the bug, if there is one, is that a direct-staged
+// DENSE_WEIGHT layout may have no working removal path, which would mean layout
+// alternates (TG plus oneDNN WOQ, say) accumulate and are reclaimed only by
+// eviction.  Whether that is true, and whether it predates the surrounding
+// work, is exactly what is unestablished.
+//
+// The MOE_EXPERT call site is not exposed: ggml_sycl_layout_specific_moe_expert_cache_key
+// folds the layout into a distinct key_id, so its key matches what was filed.
+//
+// Note this is INDEPENDENT of the is_pinned() gap fixed above.  They mask each
+// other at the same call sites — is_pinned() wrongly said "not pinned, drop it"
+// and remove() then quietly declined to drop.  Fixing is_pinned() alone does not
+// make remove() start reclaiming these entries; it only stops the keep/drop
+// decision being made on a wrong answer.
+// ---------------------------------------------------------------------------
 void unified_cache::remove(const ggml_sycl_cache_id & key_id,
                            cache_entry_type           type,
                            int                        layer_id,
@@ -5946,7 +5978,37 @@ bool unified_cache::is_pinned(const ggml_sycl_cache_id & key_id, ggml_layout_mod
         return false;
     }
     std::unique_lock<std::shared_mutex> lock(rw_mutex_);
-    auto                                id_it = id_to_key_.find(key_id);
+    // Probe both direct-stage keys before id_to_key_, exactly as is_cached(),
+    // get(), try_get_cached_fast() and lookup_device_only() do.
+    //
+    // This is consulted as a PAIR with is_cached() at three call sites in
+    // ggml-sycl.cpp (:23175, :23206, :23254): "is this layout cached, and if so
+    // is it pinned?" decides keep-vs-drop.  make_direct_stage_key() exists
+    // precisely so several DENSE_WEIGHT layouts of one key_id can coexist (see
+    // its comment: "TG layout plus oneDNN WOQ"), and direct staging sets
+    // entry.pinned = true.  Following only id_to_key_ — which is last-write-wins
+    // — therefore answered for whichever layout was staged most recently, and
+    // reported a genuinely pinned layout as unpinned.
+    //
+    // Note this got MORE reachable, not less, when is_cached() gained its
+    // MOE_EXPERT probe: the pair short-circuited on is_cached() returning false
+    // before it could reach a question is_pinned() cannot answer.  Now
+    // is_cached() answers correctly, so is_pinned() is actually asked — and on
+    // the id_to_key_ path a layout it cannot match trips the GGML_LOG_ERROR
+    // below (and GGML_ABORT under cache_assert_enabled()).
+    const unified_cache_key direct_weight_key = make_direct_stage_key(cache_entry_type::DENSE_WEIGHT, key_id, layout);
+    const unified_cache_key direct_expert_key = make_direct_stage_key(cache_entry_type::MOE_EXPERT, key_id, layout);
+    auto                    direct_weight_it  = entries_.find(direct_weight_key);
+    if (direct_weight_it != entries_.end() && direct_weight_it->second.layout == layout &&
+        !direct_weight_it->second.retired) {
+        return direct_weight_it->second.pinned;
+    }
+    auto direct_expert_it = entries_.find(direct_expert_key);
+    if (direct_expert_it != entries_.end() && direct_expert_it->second.layout == layout &&
+        !direct_expert_it->second.retired) {
+        return direct_expert_it->second.pinned;
+    }
+    auto id_it = id_to_key_.find(key_id);
     if (id_it == id_to_key_.end()) {
         return false;
     }
