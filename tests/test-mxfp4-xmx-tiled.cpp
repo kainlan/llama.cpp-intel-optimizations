@@ -75,8 +75,10 @@ int main() {
 
     const auto & info = ggml_sycl_info();
     if (info.device_count <= 0) {
-        fprintf(stderr, "No SYCL devices available; skipping test.\n");
-        return 0;
+        // 77 (ctest SKIP_RETURN_CODE), not 0: nothing was verified, so this must not
+        // report success. See llama.cpp-k208.
+        fprintf(stderr, "SKIP: no SYCL devices available -- NO DEVICE WORK WAS PERFORMED.\n");
+        return 77;
     }
 
     const int device_id = 0;

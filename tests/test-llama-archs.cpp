@@ -702,6 +702,13 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
     const std::string template_row_res = "%15s %10s|%20s|\n";
 
     bool all_ok = true;
+    // Rows that produced an actual NMSE comparison. A targeted `-a <arch>` run that
+    // measures nothing must not report success: the harness excludes several archs
+    // outright (the `continue`s below emit no row at all) and arch_supported() turns
+    // others into an all-SKIP table, and in both cases the process used to exit 0.
+    // `test-llama-archs -a gemma4` printed a header, zero rows, and returned 0, which
+    // reads as "gemma4 verified" to anything checking the status. See llama.cpp-k208.
+    size_t n_measured = 0;
     common_log_flush(common_log_main());
     printf(template_header.c_str(), "Model arch.", "Device", "Config", "NMSE vs. CPU", "Roundtrip");
     printf("|");
@@ -787,6 +794,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                         model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode);
                         logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
                         const double nmse_val = nmse(logits_cpu, logits_dev);
+                        n_measured++;
                         status_nmse = "\033[1;32mOK\033[0m";
                         if (!std::isfinite(nmse_val)) {
                             // NaN > 1e-4 is false, so a threshold test alone reports total numerical
@@ -842,6 +850,21 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         }
     }
     llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+    if (target_arch != LLM_ARCH_UNKNOWN && n_measured == 0) {
+        // Exit 77 (the project's SKIP_RETURN_CODE) rather than 0: the caller asked for
+        // one architecture and this harness compared nothing, so there is no result to
+        // report either way. 77 is unreachable from the registered `test-llama-archs`
+        // invocation, which passes no `-a` and always measures something.
+        fprintf(stderr,
+                "\n%s: no NMSE comparison was performed for '%s' -- this harness cannot "
+                "measure that architecture, so this run proves NOTHING about it.\n"
+                "  Reasons this happens: the arch is excluded outright by test_backends() "
+                "(gemma4, gemma4-assistant, eagle3, dflash emit no row at all), or "
+                "arch_supported() returns false for it (gemma-embedding, the BERT family, "
+                "RWKV, ...) and every row is SKIP.\n",
+                __func__, llm_arch_name(target_arch));
+        return 77;
+    }
     return all_ok ? 0 : 1;
 }
 

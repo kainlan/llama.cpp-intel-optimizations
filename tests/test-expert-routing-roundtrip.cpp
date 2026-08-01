@@ -41,8 +41,12 @@ int main() {
     }
 
     if (gpus.size() < 2) {
-        printf("SKIP: Need 2 L0 GPUs, found %zu\n", gpus.size());
-        return 1;
+        // This is the inverse of the llama.cpp-k208 defect: a genuine skip reported with
+        // a FAILURE status. On any single-GPU machine the test can do nothing, and
+        // exit 1 makes that read as a broken multi-GPU path. 77 is the project's
+        // SKIP_RETURN_CODE.
+        printf("SKIP: need 2 Level Zero GPUs, found %zu -- NO DEVICE WORK WAS PERFORMED.\n", gpus.size());
+        return 77;
     }
 
     sycl::context ctx({gpus[0], gpus[1]});

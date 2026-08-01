@@ -21,8 +21,21 @@ static bool check_bytes(const uint8_t * data, size_t size, uint8_t expected, con
 int main() {
     std::vector<sycl::device> gpus = sycl::device::get_devices(sycl::info::device_type::gpu);
     if (gpus.empty()) {
-        std::printf("SKIP: no SYCL GPU devices available\n");
-        return 0;
+        // Exit 77, not 0. A device test that cannot reach a device has verified NOTHING,
+        // and returning 0 made that indistinguishable from a pass -- run this binary
+        // directly in a shell where setvars.sh was never sourced and it printed one line
+        // and exited green in 0.4 s. 77 is ctest's SKIP_RETURN_CODE, so ctest reports
+        // *skipped* rather than *passed*, and a bare shell run gets a non-zero status.
+        // The point is to make the skip visible as a skip, not to forbid skipping: a
+        // CPU-only runner still legitimately lands here. See llama.cpp-k208.
+        //
+        // ⚠️ 77 only reads as "skipped" once this test's registration carries
+        // SKIP_RETURN_CODE 77; ggml/src/ggml-sycl/CMakeLists.txt:1274 does not yet.
+        std::fprintf(stderr,
+                     "SKIP: no SYCL GPU devices available -- NO DEVICE WORK WAS PERFORMED.\n"
+                     "      On a machine that has a GPU this means the oneAPI runtime was not on the\n"
+                     "      library path: source /opt/intel/oneapi/setvars.sh --force and re-run.\n");
+        return 77;
     }
 
     sycl::queue      q(gpus.front(), sycl::property::queue::in_order{});

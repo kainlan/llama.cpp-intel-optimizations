@@ -28,8 +28,11 @@ static sycl::queue make_test_queue() {
     try {
         return sycl::queue(sycl::gpu_selector_v);
     } catch (...) {
-        printf("SKIP: No GPU device found\n");
-        exit(0);
+        // 77 (ctest SKIP_RETURN_CODE), not 0. exit(0) here made "no GPU" look identical
+        // to "every prefetch check passed", from inside a helper that every test calls.
+        // See llama.cpp-k208.
+        fprintf(stderr, "SKIP: no GPU device found -- NO DEVICE WORK WAS PERFORMED.\n");
+        exit(77);
     }
 }
 
