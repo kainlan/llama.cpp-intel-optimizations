@@ -79376,6 +79376,16 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     }();
     // Also disable fusion when TP is enabled - fused ops don't handle TP buffers
     bool disable_fusion = disable_fusion_env || (g_sycl_tp_config.enabled && g_sycl_tp_config.world_size > 1);
+    // Diagnostic (llama.cpp-81gx): per-site fusion bitmask so an incorrect result can be
+    // bisected to ONE fusion site without rebuilding between probes. Bit set = site enabled.
+    // Default (unset) leaves every site enabled, so this is inert unless asked for.
+    //   bit0 MUL_MAT/tg   bit1 RMS_NORM+MUL+ADD   bit2 per-projection   bit3 RMS_NORM+MUL+MUL_MAT
+    //   bit4 RMS_NORM+MUL bit5 ADD+RMS_NORM       bit6 MUL+ADD          bit7 FFN/GLU
+    static const unsigned fusion_site_mask = [] {
+        const char * env = getenv("GGML_SYCL_FUSION_MASK");
+        return env ? (unsigned) strtoul(env, nullptr, 0) : ~0u;
+    }();
+    const auto fusion_site_on = [&](unsigned bit) { return !disable_fusion && (fusion_site_mask & (1u << bit)); };
     // Track nodes that have been executed via fusion (to skip later)
 
     std::unordered_set<const ggml_tensor *> fused_nodes;
@@ -79758,7 +79768,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                             disable_fusion ? 1 : 0);
                 }
             }
-            if (!disable_fusion && node->op == GGML_OP_MUL_MAT) {
+            if (fusion_site_on(0) && node->op == GGML_OP_MUL_MAT) {
                 int router_extra_skip = 0;
                 if (ggml_sycl_try_fuse_tg_router_f32_add_argsort(*sycl_ctx, cgraph, i, &router_extra_skip)) {
                     gpu_queue_dirty = true;
@@ -79807,7 +79817,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 #endif
             if (!disable_fusion && node->op == GGML_OP_RMS_NORM) {
                 // Try 3-way kernel fusion: RMS_NORM + MUL + ADD
-                if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, { i + 2 }) &&
+                if (fusion_site_on(1) &&
+                    ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, { i + 2 }) &&
                     ggml_sycl_check_fusion_types(cgraph, i, 3) && ggml_is_contiguous(cgraph->nodes[i + 2]) &&
                     ggml_sycl_fusion_chain_accessible_on_device(cgraph, i, 3, sycl_ctx->device)) {
                     ggml_tensor * mul_node = cgraph->nodes[i + 1];
@@ -79824,7 +79835,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 // 3. Reuses the quantized result for all projections (Q, K, V or gate, up)
                 // This bypasses the ggml_can_fuse_subgraph limitation where shared intermediates fail.
                 // Note: Only triggers for batch size >= 8 to avoid overhead during token generation
-                if (i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL) {
+                if (fusion_site_on(2) && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL) {
                     ggml_tensor * mul_node = cgraph->nodes[i + 1];
                     // Check if MUL uses RMS_NORM output
                     if (mul_node->src[0] == node || mul_node->src[1] == node) {
@@ -79855,7 +79866,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 // NOTE: This often fails because in transformers, the MUL output (normalized tensor)
                 // is shared by multiple projections (Q, K, V), so the use-count check fails.
                 // The per-projection fusion above handles those cases.
-                if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL_MAT }, { i + 2 })) {
+                if (fusion_site_on(3) &&
+                    ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL_MAT }, { i + 2 })) {
                     ggml_tensor * mul_node    = cgraph->nodes[i + 1];
                     ggml_tensor * mulmat_node = cgraph->nodes[i + 2];
 
@@ -79876,7 +79888,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                     }
                 }
                 // Try 2-way kernel fusion: RMS_NORM + MUL
-                if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, { i + 1 }) &&
+                if (fusion_site_on(4) &&
+                    ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, { i + 1 }) &&
                     ggml_sycl_check_fusion_types(cgraph, i, 2) &&
                     ggml_sycl_fusion_chain_accessible_on_device(cgraph, i, 2, sycl_ctx->device)) {
                     ggml_tensor * mul_node = cgraph->nodes[i + 1];
@@ -79890,7 +79903,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             // Pattern: residual + hidden_states -> RMS_NORM (common in transformer decoder blocks)
             // The kernel writes BOTH outputs: the ADD result (for other consumers like next residual)
             // AND the RMS_NORM result. This allows fusion even when ADD has multiple consumers.
-            if (!disable_fusion && node->op == GGML_OP_ADD) {
+            if (fusion_site_on(5) && node->op == GGML_OP_ADD) {
                 if (i + 1 < cgraph->n_nodes) {
                     ggml_tensor * next = cgraph->nodes[i + 1];
                     // Check: next op is RMS_NORM and it uses this ADD's output as input
@@ -79907,7 +79920,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             // Try 2-way kernel fusion: MUL + ADD
             // Pattern: x * scale + bias (common scale+bias pattern in normalization)
             // Fuses element-wise multiply and add into single kernel pass
-            if (!disable_fusion && node->op == GGML_OP_MUL) {
+            if (fusion_site_on(6) && node->op == GGML_OP_MUL) {
                 if (i + 1 < cgraph->n_nodes) {
                     ggml_tensor * next = cgraph->nodes[i + 1];
                     // Check: next op is ADD and uses this MUL's output
@@ -79979,7 +79992,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             static bool ffn_fusion_enabled = ffn_fusion_requested;
 #endif
             static int ffn_debug_trace = 0;
-            if (!disable_fusion && ffn_fusion_enabled && node->op == GGML_OP_MUL_MAT) {
+            if (fusion_site_on(7) && ffn_fusion_enabled && node->op == GGML_OP_MUL_MAT) {
                 // Check if this MUL_MAT feeds into a GLU
                 auto glu_info = find_glu_consumer(cgraph, node, i + 1);
                 if (ffn_debug_trace++ < 5) {

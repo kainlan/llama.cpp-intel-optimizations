@@ -167,6 +167,12 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_head = 1;
         n_ff   = 96;
         n_layer = 22; // hparams.n_layer_kv_from_start = 20 is hardcoded
+        // Diagnostic (llama.cpp-81gx): with n_layer <= 20 no layer reaches the
+        // `il >= n_layer_kv_from_start` KV-reuse branch, so this isolates the
+        // reuse mechanism from the rest of the arch.
+        if (const char * ov = getenv("LLAMA_ARCHS_GEMMA3N_NLAYER")) {
+            n_layer = (uint32_t) atoi(ov);
+        }
     } else if (arch == LLM_ARCH_DEEPSEEK2
             || arch == LLM_ARCH_DEEPSEEK32
             || arch == LLM_ARCH_GLM_DSA
@@ -556,6 +562,38 @@ static bool nan_trace_eval_cb(struct ggml_tensor * t, bool ask, void * user_data
     return true;
 }
 
+// --- Per-node checksum dump (diagnostic, llama.cpp-81gx) ----------------------------------
+//
+// A wrong final logit says nothing about WHICH op diverged. This walks the graph in execution
+// order and prints one checksum line per node, so the same run on CPU and on a device can be
+// diffed to name the FIRST node whose value differs. Enabled with LLAMA_ARCHS_DUMP_NODES=1.
+struct node_dump_state {
+    size_t idx = 0;
+};
+
+static bool node_dump_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    node_dump_state * st = (node_dump_state *) user_data;
+
+    if (ask) {
+        return (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16) && ggml_is_contiguous(t);
+    }
+
+    std::vector<uint8_t> buf(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
+
+    const int64_t ne = ggml_nelements(t);
+    double sum = 0.0, sumsq = 0.0;
+    for (int64_t i = 0; i < ne; i++) {
+        const double v = t->type == GGML_TYPE_F32 ?
+            ((const float *) buf.data())[i] : ggml_fp16_to_fp32(((const ggml_fp16_t *) buf.data())[i]);
+        sum   += v;
+        sumsq += v*v;
+    }
+    fprintf(stderr, "[NODE] %5zu %-32s op=%-12s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] sum=%.9g sumsq=%.9g\n",
+        st->idx++, t->name, ggml_op_name(t->op), t->ne[0], t->ne[1], t->ne[2], t->ne[3], sum, sumsq);
+    return true;
+}
+
 static int trace_nan(const llm_arch target_arch, const size_t seed) {
     if (target_arch == LLM_ARCH_UNKNOWN) {
         fprintf(stderr, "%s: --nan-trace requires -a/--arch\n", __func__);
@@ -787,13 +825,41 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
 #endif  // GGML_USE_SYCL
                 if (!skip) {
                     if (logits_cpu.empty()) {
-                        model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
+                        node_dump_state nd_cpu;
+                        const bool dump_nodes = getenv("LLAMA_ARCHS_DUMP_NODES") != nullptr;
+                        if (dump_nodes) {
+                            fprintf(stderr, "\n===== NODE DUMP: CPU =====\n");
+                        }
+                        model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode,
+                            dump_nodes ? node_dump_eval_cb : nullptr, dump_nodes ? (void *) &nd_cpu : nullptr);
                         logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
-                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode);
+                        node_dump_state nd_dev;
+                        const bool dump_nodes_dev = getenv("LLAMA_ARCHS_DUMP_NODES") != nullptr;
+                        if (dump_nodes_dev) {
+                            fprintf(stderr, "\n===== NODE DUMP: %s =====\n", dc.label.c_str());
+                        }
+                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode,
+                            dump_nodes_dev ? node_dump_eval_cb : nullptr, dump_nodes_dev ? (void *) &nd_dev : nullptr);
                         logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
                         const double nmse_val = nmse(logits_cpu, logits_dev);
+                        // Diagnostic (llama.cpp-81gx): an NMSE near 1.0 is ambiguous between
+                        // "device output is uncorrelated" and "device output is ~zero" -- those
+                        // have completely different causes. Print both energies when asked.
+                        if (getenv("LLAMA_ARCHS_DUMP_ENERGY")) {
+                            double e_cpu = 0.0, e_dev = 0.0, dot = 0.0;
+                            for (size_t i = 0; i < logits_cpu.size(); i++) {
+                                e_cpu += double(logits_cpu[i]) * double(logits_cpu[i]);
+                                e_dev += double(logits_dev[i]) * double(logits_dev[i]);
+                                dot   += double(logits_cpu[i]) * double(logits_dev[i]);
+                            }
+                            fprintf(stderr,
+                                "\n[ENERGY] %s %s n=%zu E_cpu=%g E_dev=%g ratio=%g cos=%g nmse=%g\n",
+                                llm_arch_name(arch), dc.label.c_str(), logits_cpu.size(),
+                                e_cpu, e_dev, e_cpu > 0 ? e_dev / e_cpu : 0.0,
+                                (e_cpu > 0 && e_dev > 0) ? dot / sqrt(e_cpu * e_dev) : 0.0, nmse_val);
+                        }
                         n_measured++;
                         status_nmse = "\033[1;32mOK\033[0m";
                         if (!std::isfinite(nmse_val)) {
