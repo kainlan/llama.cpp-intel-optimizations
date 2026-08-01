@@ -737,31 +737,10 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         TIMEOUT 300
     )
 
-    # Test 7: MMQ XMX Dispatch Integration Tests
-    # Verifies dispatch logic, thresholds, and edge cases (empty batch, non-aligned dims)
-    add_executable(test-mmq-xmx-dispatch
-        tests/test-mmq-xmx-dispatch.cpp
-    )
-    target_include_directories(test-mmq-xmx-dispatch PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/..
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-    )
-    target_compile_options(test-mmq-xmx-dispatch PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    target_link_options(test-mmq-xmx-dispatch PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    target_compile_definitions(test-mmq-xmx-dispatch PRIVATE
-        GGML_SYCL_WARP_SIZE=32
-        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-        XMX_TEST_STANDALONE=1
-    )
-    if (IntelSYCL_FOUND)
-        target_link_libraries(test-mmq-xmx-dispatch PRIVATE IntelSYCL::SYCL_CXX)
-    endif()
-    add_test(NAME mmq-xmx-dispatch COMMAND test-mmq-xmx-dispatch)
-    set_tests_properties(mmq-xmx-dispatch PROPERTIES
-        LABELS "sycl;xmx;dispatch"
-        TIMEOUT 120
-    )
+    # Test 7 (MMQ XMX Dispatch Integration) used to be registered here. Moved
+    # outside this guard (see the "un-guarded" section after the endif) because
+    # GGML_SYCL_BUILD_XMX_TESTS defaults OFF, so it never built -- same pattern
+    # as Test 14/15 above and llama.cpp-5exz generally (llama.cpp-9c0s).
 
     # Test 8: Unified Kernel Tests
     # Tests the unified matmul kernel architecture with Q4_0 support
@@ -1132,6 +1111,44 @@ add_test(NAME sycl-dispatch-tuning COMMAND test-sycl-dispatch-tuning)
 set_tests_properties(sycl-dispatch-tuning PROPERTIES
     LABELS "sycl;dispatch;tuning"
     TIMEOUT 60
+)
+
+# MMQ XMX dispatch integration: XMX-path selection, MMQ fallback, and edge
+# cases (empty batch, non-aligned dims). Moved outside the guard
+# (llama.cpp-9c0s) -- it spent its life behind GGML_SYCL_BUILD_XMX_TESTS
+# (defaults OFF) and so never built, same as test-kernel-dispatch and
+# test-sycl-dispatch-tuning above (llama.cpp-5exz).
+#
+# It compiles xmx-esimd-common.hpp in XMX_TEST_STANDALONE mode, which under
+# that define is pure host-side device-info queries (dev.get_info<...>()) --
+# no parallel_for/submit/joint_matrix of its own -- so per rule 1 above it
+# needs only SYCL_LINK_ONLY_TEST_OPTIONS, not the AOT target list. It needs a
+# GPU: main() calls sycl::device::get_devices(gpu) and returns 1 (not 77) if
+# none is found, same as it did inside the guard -- unchanged here, since
+# fixing that is outside this move.
+add_executable(test-mmq-xmx-dispatch
+    tests/test-mmq-xmx-dispatch.cpp
+)
+target_include_directories(test-mmq-xmx-dispatch PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_compile_options(test-mmq-xmx-dispatch PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-mmq-xmx-dispatch PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_compile_definitions(test-mmq-xmx-dispatch PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    XMX_TEST_STANDALONE=1
+)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-mmq-xmx-dispatch PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME mmq-xmx-dispatch COMMAND test-mmq-xmx-dispatch)
+set_tests_properties(mmq-xmx-dispatch PROPERTIES
+    LABELS "sycl;xmx;dispatch"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
 )
 
 # Reader-writer lock optimization on the cache-hit fast path (TDD).
