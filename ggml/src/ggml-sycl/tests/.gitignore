@@ -15,9 +15,7 @@ test-unified-runtime-alloc
 test-xmx-compute
 test-xmx-config
 test-xmx-default-enable
-test-xmx-dpas-basic
 test-xmx-esimd-basic
-test-xmx-esimd-q4-gemm
 test-xmx-hardware-detect
 test-xmx-moe-mxfp4
 test-xmx-optimization
