@@ -478,6 +478,65 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         "-Wno-narrowing"
     )
 
+    # ⚠️ UNIFIED_KERNEL_TEST_STANDALONE IS RETIRED. Do not reintroduce it.
+    #
+    # Every target below that compiles unified-kernel.cpp used to define it, on
+    # the premise that the define made that TU self-contained -- it supplied
+    # stub definitions of g_ggml_sycl_debug, g_ggml_sycl_debug_forced_off and
+    # ggml_sycl_info() "for symbols normally provided by common.cpp", so a test
+    # need not link the backend library.
+    #
+    # That premise was false. unified-kernel.cpp:25 includes mmvq.hpp, and
+    # mmvq.hpp:16 includes common.hpp unconditionally -- sixteen lines BEFORE
+    # the #ifdef. common.hpp's real declarations are therefore always in scope,
+    # so the stubs were not stale copies that drifted; they were unconditional
+    # redefinitions, and no retyping could have made them legal. That is why
+    # GGML_SYCL_BUILD_XMX_TESTS=ON failed to configure-and-build at all
+    # (llama.cpp-9c0s): three hard errors in the production file, hit by every
+    # one of these targets regardless of its own source.
+    #
+    # The fix is to stop pretending and link the library: no define, and
+    # ggml-base + ggml + ggml-sycl on the link line. test-xmx-config below
+    # already had exactly this shape.
+    #
+    # The define was ALSO not just stubs, which is the part worth remembering.
+    # It selected different IMPLEMENTATIONS at five further sites --
+    # unified-kernel.cpp:7850/7859 used raw queue_.memcpy/memset where
+    # production uses mem_copy_async/mem_fill_async over mem_handle, and
+    # :9174/:9262 took a raw-pointer deferred-copy path instead of the
+    # handle-retaining one. So these tests, had they ever built, would have
+    # been exercising a memory path that production does not take, against the
+    # one subsystem this fork's canonical-memory contract governs. Linking the
+    # real library is not merely cheaper than maintaining stubs; it is the only
+    # arrangement in which these tests test the shipped code.
+
+    # Options for the eight targets that compile unified-kernel.cpp as their own
+    # TU. Identical to XMX_TEST_SYCL_OPTIONS except that the AOT target list is
+    # dropped: plain -fsycl, so no ocloc device compile happens at build time
+    # and the kernels are compiled at first run instead. That containment is
+    # what makes GGML_SYCL_BUILD_XMX_TESTS=ON affordable to turn on at all --
+    # unified-kernel.cpp is ~12,700 lines of SYCL and AOT-compiling it eight
+    # times dominates the entire build. The shape is 7881f453d's, worked out
+    # for the two tests it relocated; it applies for the same reason here.
+    #
+    # The split-barrier SPIR-V extension is still requested, but only for
+    # spir64: without the AOT target there is no bmg_g21 image to translate,
+    # and passing -Xspirv-translator=intel_gpu_bmg_g21 alongside it names a
+    # target that no longer exists in -fsycl-targets.
+    #
+    # If a future change makes one of these tests need AOT (measuring codegen
+    # rather than behaviour), give that ONE target XMX_TEST_SYCL_OPTIONS back
+    # rather than changing this variable -- no-device-compile-at-build-time is
+    # the whole reason the option is usable.
+    set(SYCL_JIT_DEVICE_TEST_OPTIONS
+        "-fsycl"
+        "-Wno-narrowing"
+    )
+    set(SYCL_JIT_DEVICE_TEST_LINK_OPTIONS
+        ${SYCL_JIT_DEVICE_TEST_OPTIONS}
+        "SHELL:-Xspirv-translator=spir64 -spirv-ext=+SPV_INTEL_split_barrier"
+    )
+
     # Test 1: XMX Hardware Detection Tests
     # This test is standalone and only needs xmx-esimd-common.hpp
     add_executable(test-xmx-hardware-detect
@@ -709,17 +768,13 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         ${CMAKE_CURRENT_SOURCE_DIR}/..
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     )
-    target_compile_options(test-unified-kernel PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    target_link_options(test-unified-kernel PRIVATE
-        ${XMX_TEST_SYCL_OPTIONS}
-        "SHELL:-Xspirv-translator=intel_gpu_bmg_g21 -spirv-ext=+SPV_INTEL_split_barrier"
-        "SHELL:-Xspirv-translator=spir64 -spirv-ext=+SPV_INTEL_split_barrier"
-    )
+    target_compile_options(test-unified-kernel PRIVATE ${SYCL_JIT_DEVICE_TEST_OPTIONS})
+    target_link_options(test-unified-kernel PRIVATE ${SYCL_JIT_DEVICE_TEST_LINK_OPTIONS})
     target_compile_definitions(test-unified-kernel PRIVATE
         GGML_SYCL_WARP_SIZE=32
         GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-        UNIFIED_KERNEL_TEST_STANDALONE=1
     )
+    target_link_libraries(test-unified-kernel PRIVATE ggml-base ggml ggml-sycl)
     if (IntelSYCL_FOUND)
         target_link_libraries(test-unified-kernel PRIVATE IntelSYCL::SYCL_CXX)
     endif()
@@ -740,17 +795,13 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         ${CMAKE_CURRENT_SOURCE_DIR}/..
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     )
-    target_compile_options(test-xmx-compute PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    target_link_options(test-xmx-compute PRIVATE
-        ${XMX_TEST_SYCL_OPTIONS}
-        "SHELL:-Xspirv-translator=intel_gpu_bmg_g21 -spirv-ext=+SPV_INTEL_split_barrier"
-        "SHELL:-Xspirv-translator=spir64 -spirv-ext=+SPV_INTEL_split_barrier"
-    )
+    target_compile_options(test-xmx-compute PRIVATE ${SYCL_JIT_DEVICE_TEST_OPTIONS})
+    target_link_options(test-xmx-compute PRIVATE ${SYCL_JIT_DEVICE_TEST_LINK_OPTIONS})
     target_compile_definitions(test-xmx-compute PRIVATE
         GGML_SYCL_WARP_SIZE=32
         GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-        UNIFIED_KERNEL_TEST_STANDALONE=1
     )
+    target_link_libraries(test-xmx-compute PRIVATE ggml-base ggml ggml-sycl)
     if (IntelSYCL_FOUND)
         target_link_libraries(test-xmx-compute PRIVATE IntelSYCL::SYCL_CXX)
     endif()
@@ -771,17 +822,13 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         ${CMAKE_CURRENT_SOURCE_DIR}/..
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     )
-    target_compile_options(test-xmx-default-enable PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    target_link_options(test-xmx-default-enable PRIVATE
-        ${XMX_TEST_SYCL_OPTIONS}
-        "SHELL:-Xspirv-translator=intel_gpu_bmg_g21 -spirv-ext=+SPV_INTEL_split_barrier"
-        "SHELL:-Xspirv-translator=spir64 -spirv-ext=+SPV_INTEL_split_barrier"
-    )
+    target_compile_options(test-xmx-default-enable PRIVATE ${SYCL_JIT_DEVICE_TEST_OPTIONS})
+    target_link_options(test-xmx-default-enable PRIVATE ${SYCL_JIT_DEVICE_TEST_LINK_OPTIONS})
     target_compile_definitions(test-xmx-default-enable PRIVATE
         GGML_SYCL_WARP_SIZE=32
         GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-        UNIFIED_KERNEL_TEST_STANDALONE=1
     )
+    target_link_libraries(test-xmx-default-enable PRIVATE ggml-base ggml ggml-sycl)
     if (IntelSYCL_FOUND)
         target_link_libraries(test-xmx-default-enable PRIVATE IntelSYCL::SYCL_CXX)
     endif()
@@ -802,17 +849,13 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         ${CMAKE_CURRENT_SOURCE_DIR}/..
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     )
-    target_compile_options(test-xmx-optimization PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    target_link_options(test-xmx-optimization PRIVATE
-        ${XMX_TEST_SYCL_OPTIONS}
-        "SHELL:-Xspirv-translator=intel_gpu_bmg_g21 -spirv-ext=+SPV_INTEL_split_barrier"
-        "SHELL:-Xspirv-translator=spir64 -spirv-ext=+SPV_INTEL_split_barrier"
-    )
+    target_compile_options(test-xmx-optimization PRIVATE ${SYCL_JIT_DEVICE_TEST_OPTIONS})
+    target_link_options(test-xmx-optimization PRIVATE ${SYCL_JIT_DEVICE_TEST_LINK_OPTIONS})
     target_compile_definitions(test-xmx-optimization PRIVATE
         GGML_SYCL_WARP_SIZE=32
         GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-        UNIFIED_KERNEL_TEST_STANDALONE=1
     )
+    target_link_libraries(test-xmx-optimization PRIVATE ggml-base ggml ggml-sycl)
     if (IntelSYCL_FOUND)
         target_link_libraries(test-xmx-optimization PRIVATE IntelSYCL::SYCL_CXX)
     endif()
@@ -833,12 +876,8 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         ${CMAKE_CURRENT_SOURCE_DIR}/..
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     )
-    target_compile_options(test-xmx-config PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    target_link_options(test-xmx-config PRIVATE
-        ${XMX_TEST_SYCL_OPTIONS}
-        "SHELL:-Xspirv-translator=intel_gpu_bmg_g21 -spirv-ext=+SPV_INTEL_split_barrier"
-        "SHELL:-Xspirv-translator=spir64 -spirv-ext=+SPV_INTEL_split_barrier"
-    )
+    target_compile_options(test-xmx-config PRIVATE ${SYCL_JIT_DEVICE_TEST_OPTIONS})
+    target_link_options(test-xmx-config PRIVATE ${SYCL_JIT_DEVICE_TEST_LINK_OPTIONS})
     target_compile_definitions(test-xmx-config PRIVATE
         GGML_SYCL_WARP_SIZE=32
         GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
@@ -895,18 +934,16 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         ${CMAKE_CURRENT_SOURCE_DIR}/..
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     )
-    target_compile_options(test-esimd-prefetch PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    target_link_options(test-esimd-prefetch PRIVATE
-        ${XMX_TEST_SYCL_OPTIONS}
-        "SHELL:-Xspirv-translator=intel_gpu_bmg_g21 -spirv-ext=+SPV_INTEL_split_barrier"
-        "SHELL:-Xspirv-translator=spir64 -spirv-ext=+SPV_INTEL_split_barrier"
-    )
+    target_compile_options(test-esimd-prefetch PRIVATE ${SYCL_JIT_DEVICE_TEST_OPTIONS})
+    target_link_options(test-esimd-prefetch PRIVATE ${SYCL_JIT_DEVICE_TEST_LINK_OPTIONS})
+    # XMX_TEST_STANDALONE stays: that one is xmx-esimd-common.hpp's own switch
+    # and is unrelated to the retired UNIFIED_KERNEL_TEST_STANDALONE.
     target_compile_definitions(test-esimd-prefetch PRIVATE
         GGML_SYCL_WARP_SIZE=32
         GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
         XMX_TEST_STANDALONE=1
-        UNIFIED_KERNEL_TEST_STANDALONE=1
     )
+    target_link_libraries(test-esimd-prefetch PRIVATE ggml-base ggml ggml-sycl)
     if (IntelSYCL_FOUND)
         target_link_libraries(test-esimd-prefetch PRIVATE IntelSYCL::SYCL_CXX)
     endif()
@@ -931,31 +968,35 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
     # ⚠️ These two are the ONLY tests of the twelve named in llama.cpp-5exz that
     # are still here, and it is a measured result rather than a judgement call.
     # They were moved outside the guard in 7881f453d and the build FAILED, so
-    # they were moved back in de1c62fa0.  For these two the guard was load
-    # bearing -- it was hiding code that does not compile, which is exactly what
-    # was assumed about all ~25 and was false for the other nine.
+    # they were moved back in de1c62fa0.
     #
-    # TWO independent breakages, neither caused by the move (see llama.cpp-9c0s):
+    # TWO independent breakages, neither caused by the move (llama.cpp-9c0s).
+    # ONE of them is now fixed:
     #
-    #   1. test-unified-kernel-persistent.cpp has rotted against the production
-    #      API: "no member named 'type_size' in 'StridedCopyMeta'", plus five
-    #      pointer-vs-const-reference mismatches on SetRowsMeta/StridedCopyMeta.
-    #      The structs changed and the test never tracked them.
+    #   1. FIXED.  unified-kernel.cpp could not be compiled standalone at all,
+    #      which broke every target here including those whose own source was
+    #      fine.  The cause was not stub drift but a false premise -- see the
+    #      UNIFIED_KERNEL_TEST_STANDALONE note at the top of this guard.  All
+    #      eight unified-kernel.cpp targets now link ggml-sycl instead.
     #
-    #   2. unified-kernel.cpp cannot be compiled standalone AT ALL any more --
-    #      this breaks BOTH targets, including the one whose own source is fine.
-    #      Its UNIFIED_KERNEL_TEST_STANDALONE stub block (unified-kernel.cpp:41)
-    #      still declares `bool g_ggml_sycl_debug` and
-    #      `bool g_ggml_sycl_debug_forced_off`, but the real declarations are now
-    #      `int` and `std::atomic<bool>`; ggml_sycl_info()'s stub return type
-    #      conflicts too.  That drift is in the production file, not the tests.
+    #   2. OPEN, and it blocks test-unified-kernel-persistent ONLY.
+    #      tests/test-unified-kernel-persistent.cpp has rotted against the
+    #      production API: "no member named 'type_size' in 'StridedCopyMeta'",
+    #      "no member named 'pad'", plus five pointer-vs-const-reference
+    #      mismatches where add_set_rows/add_strided_copy now take
+    #      `const SetRowsMeta &` / `const StridedCopyMeta &` and the test still
+    #      passes a device pointer.  Dereferencing that pointer host-side is NOT
+    #      the fix; the meta contract itself changed, so repairing this needs
+    #      someone who knows the current one.
     #
-    # Breakage 2 means turning GGML_SYCL_BUILD_XMX_TESTS=ON fails today for the
-    # same reason, so this is NOT a working configuration being preserved -- it
-    # is a known-broken one being kept out of everyone's default build until
-    # llama.cpp-9c0s fixes the stub.  Move them back out once it does; the
-    # JIT-only options (plain -fsycl, no AOT target list) are the right shape and
-    # are recorded in 7881f453d.
+    #      It also declares an EXTERNAL ggml_sycl_test_extract_layer_index in
+    #      its non-standalone branch, and no such symbol exists anywhere in the
+    #      tree -- so that branch has never been compiled either.
+    #
+    # So GGML_SYCL_BUILD_XMX_TESTS=ON still fails, on this one target and for a
+    # reason unrelated to the guard.  Twelve of the thirteen targets build.
+    # Do NOT "fix" this by commenting the target out: a test deleted to make a
+    # flag green is the exact failure mode llama.cpp-5exz documents.
     add_executable(test-unified-kernel-ops
         tests/test-unified-kernel-ops.cpp
         unified-kernel.cpp
@@ -965,17 +1006,13 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         ${CMAKE_CURRENT_SOURCE_DIR}/..
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     )
-    target_compile_options(test-unified-kernel-ops PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    target_link_options(test-unified-kernel-ops PRIVATE
-        ${XMX_TEST_SYCL_OPTIONS}
-        "SHELL:-Xspirv-translator=intel_gpu_bmg_g21 -spirv-ext=+SPV_INTEL_split_barrier"
-        "SHELL:-Xspirv-translator=spir64 -spirv-ext=+SPV_INTEL_split_barrier"
-    )
+    target_compile_options(test-unified-kernel-ops PRIVATE ${SYCL_JIT_DEVICE_TEST_OPTIONS})
+    target_link_options(test-unified-kernel-ops PRIVATE ${SYCL_JIT_DEVICE_TEST_LINK_OPTIONS})
     target_compile_definitions(test-unified-kernel-ops PRIVATE
         GGML_SYCL_WARP_SIZE=32
         GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-        UNIFIED_KERNEL_TEST_STANDALONE=1
     )
+    target_link_libraries(test-unified-kernel-ops PRIVATE ggml-base ggml ggml-sycl)
     if (IntelSYCL_FOUND)
         target_link_libraries(test-unified-kernel-ops PRIVATE IntelSYCL::SYCL_CXX)
     endif()
@@ -997,17 +1034,13 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL")
         ${CMAKE_CURRENT_SOURCE_DIR}/..
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     )
-    target_compile_options(test-unified-kernel-persistent PRIVATE ${XMX_TEST_SYCL_OPTIONS})
-    target_link_options(test-unified-kernel-persistent PRIVATE
-        ${XMX_TEST_SYCL_OPTIONS}
-        "SHELL:-Xspirv-translator=intel_gpu_bmg_g21 -spirv-ext=+SPV_INTEL_split_barrier"
-        "SHELL:-Xspirv-translator=spir64 -spirv-ext=+SPV_INTEL_split_barrier"
-    )
+    target_compile_options(test-unified-kernel-persistent PRIVATE ${SYCL_JIT_DEVICE_TEST_OPTIONS})
+    target_link_options(test-unified-kernel-persistent PRIVATE ${SYCL_JIT_DEVICE_TEST_LINK_OPTIONS})
     target_compile_definitions(test-unified-kernel-persistent PRIVATE
         GGML_SYCL_WARP_SIZE=32
         GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-        UNIFIED_KERNEL_TEST_STANDALONE=1
     )
+    target_link_libraries(test-unified-kernel-persistent PRIVATE ggml-base ggml ggml-sycl)
     if (IntelSYCL_FOUND)
         target_link_libraries(test-unified-kernel-persistent PRIVATE IntelSYCL::SYCL_CXX)
     endif()
