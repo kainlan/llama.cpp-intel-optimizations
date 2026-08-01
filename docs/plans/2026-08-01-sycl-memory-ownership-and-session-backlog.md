@@ -610,9 +610,32 @@ prevented.
 
 - [ ] `stream_ctx` holds a handle (or an owning object), not a bare pointer.
 - [ ] Under Task 7's audit, **neither** `get_rows:seq_device` **nor** `get_rows_indices_small_host`
-      appears live at a reset site. Both axes, or the task is not done.
-- [ ] `test-thread-safety` passes **3 consecutive times** — it is a race; one green run is not evidence.
+      appears live at a reset site. Both axes, or the task is not done. **This is the gate.**
 - [ ] Mistral gate passes; ONE `test-llama-archs` no worse than the recorded baseline.
+
+⚠️ **`test-thread-safety` is a DIAGNOSTIC here, NOT a pass/fail gate. Two rules, both learned
+the hard way on 2026-08-01:**
+
+**1. Never loop it.** An earlier version of this task required "passes 3 consecutive times — it
+is a race; one green run is not evidence." That reasoning is statistically sound and the
+criterion was still dangerous: it is a **loop of a GPU-allocating test**. Executing it drove
+`Shmem` from 84.9 GB to **206 GB in twenty seconds** and `MemAvailable` to **16.9 GB** — the
+process was killed roughly twenty seconds from a global OOM that has twice taken down this
+host's desktop session and a 12 GB VM. CLAUDE.md's never-loop rule names `test-backend-ops` and
+`test-llama-archs`; **it is not about those two binaries**, it is about anything that loads
+models onto a GPU. Run it ONCE, sample `/proc/meminfo` before and ~5 s after, and abort if
+`Shmem` climbs past ~100 GB.
+
+**2. Its exit status is meaningless until `llama.cpp-c48l` is fixed.** That is an unguarded
+SIGSEGV in `mem_handle::resolve()` (dangling `this`, via a weight tensor's device-owner lookup)
+— a **different bug family** from the zone-reset escapes. It will keep segfaulting after both
+`get_rows` axes are fixed. Assert on **cohort presence in the audit inventory**, never on exit
+status. Both misreadings are expensive: a continued segfault read as *Task 8 failing* sends
+someone to re-debug a correct fix; read as *known-broken, ignore* and a genuine Task 8
+regression hides behind it.
+
+For race confidence without the memory cost, use Task 7's audit — it reports live-allocation
+inventory directly and answers "did the escape recur" without re-running a three-model workload.
 
 **Gotchas:**
 - ⚠️ **Do not fix this by forcing the reset, downgrading the refusal to a warning, or reclaiming
