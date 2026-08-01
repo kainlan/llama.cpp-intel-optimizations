@@ -474,11 +474,23 @@ static sycl::queue make_queue_or_fail(const sycl::device & dev) {
         return sycl::queue(dev);
     } catch (const sycl::exception & e) {
         fprintf(stderr, "FAILED: could not create a SYCL queue on the GPU: %s\n", e.what());
-        // Deliberate divergence from the `return 1` that every sibling test in this
-        // directory uses for a setup failure: this helper returns the queue itself,
-        // so it has nowhere to hand a failure code back to main()'s flow. Nothing
-        // non-trivial is live here to skip destructing. Do not "fix" it into a
-        // sentinel queue -- constructing one is the very thing this avoids.
+        // Deliberate divergence from the `return 1` most sibling tests in this
+        // directory use for a setup failure. A value-returning helper has no
+        // natural channel for a failure code; std::optional<sycl::queue> would
+        // give it one, and is a legitimate alternative -- exit(1) is chosen only
+        // because this is genuinely unreachable once get_devices() has already
+        // reported a non-empty list, so the extra unwrapping buys nothing. Only
+        // `devices` is live, and skipping its destructor at process exit is
+        // harmless.
+        //
+        // What you must NOT do is "align" this with the surrounding convention.
+        // That convention is the bug this file was fixed for: 15 of the 30 tests
+        // here open with a bare `sycl::device dev;` outside their try block, and
+        // sycl::device's default ctor throws on a device-less host exactly as
+        // sycl::queue's does -- so the throw is uncaught and the `return 1` those
+        // tests wrote for this case never runs. Measured: test-mem-handle-eviction
+        // and test-unified-cache-fast-path exit 134 (SIGABRT, core dumped) where
+        // this file exits 77. Tracked as llama.cpp-ivin.
         exit(1);
     }
 }
