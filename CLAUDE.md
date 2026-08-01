@@ -521,11 +521,28 @@ Confirmed lessons from prior work on this fork. Treat them as defaults.
   ONEAPI_DEVICE_SELECTOR=level_zero:0,1 ctest --test-dir build -R '<name>' --output-on-failure
   ```
 
-  ⚠️ **This mitigation is verified for `llama-completion`. It is NOT yet verified for
-  `test-llama-archs` or `test-thread-safety`** — the mechanism is near-certainly the same
-  (neither pins a selector), but that has not been measured. **Do not relax the never-loop
-  rule for any binary on the strength of this note.** The rule below stands until someone
-  measures the specific binary with the selector pinned.
+  **Now measured on the two worst offenders, and both collapse to nothing:**
+
+  | binary | unpinned | pinned `level_zero:0,1` |
+  |--------|---------:|------------------------:|
+  | `llama-completion` (19 MB model) | 127.8 GB | **2.4 GB** |
+  | `test-llama-archs -a llama` | 195–206 GB | **2.2 GB** |
+  | `test-thread-safety` | 156–180 GB | **2.2 GB** |
+
+  Both pinned runs were confirmed to do **real work**, not skip: `test-llama-archs` emitted
+  its results table with numerical error magnitudes (`3.13e-11`, `0.00e+00`), and
+  `test-thread-safety` logged model load, `get_rows`, and KV-cache tensors. (It still
+  SIGSEGVs — that is `llama.cpp-oze0`, unrelated and unchanged by the selector.)
+
+  ⚠️ **This does NOT retire the never-loop rule; it gives it one documented escape.** An
+  *unpinned* run of either binary is exactly as dangerous as before, and unpinned is the
+  **default** — nothing in either binary's ctest registration sets a selector. So the burden
+  is entirely on whoever runs it. Two further limits: the full `test-llama-archs` sweep (no
+  `-a`) has not been measured pinned, only a single arch; and the property-based rule at the
+  top of this section still governs any binary nobody has measured.
+
+  Treat "pin the selector" as a precondition you must actively satisfy, not as a fact about
+  the tests.
 
   Known members (**not** an exhaustive list — apply the property):
   - **`test-backend-ops`** — never in a subagent or background task. Hundreds of GPU BOs, TTM
