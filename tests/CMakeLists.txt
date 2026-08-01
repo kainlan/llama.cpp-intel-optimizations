@@ -1486,6 +1486,33 @@ set_tests_properties(test-tensor-class      PROPERTIES LABELS "main;tensor")
 set_property(TEST test-tensor-class PROPERTY
     ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:$ENV{LD_LIBRARY_PATH}")
 
+# 178 assertions over the paged-KV block manager, block table, defragmentation
+# planner and prefix cache. Two things had to be true before this could be
+# registered honestly, and neither was assumed:
+#
+#   1. The header had to be reachable. It was not -- src/llama-kv-block.cpp was
+#      absent from src/CMakeLists.txt's add_library(llama ...) list, so the
+#      module compiled into nothing and "'llama-kv-block.h' file not found" was
+#      the symptom, not test rot. Fixed in 1fb188c15 (llama.cpp-habh); libllama
+#      now exports the llama_kv_block_manager symbols this test links against.
+#
+#   2. The assertions had to be able to FAIL, and then had to actually PASS.
+#      Under -O3 -DNDEBUG all 178 were compiled out; the test was green with
+#      every one of them forced false. tests/test-kv-block.cpp carries the
+#      `#undef NDEBUG` that restores the signal, and the mutation matrix in its
+#      header comment (A/B/C/D, run out-of-tree) is the evidence for both
+#      halves. Registering it before that would have added a permanently-green
+#      line claiming 178 assertions and carrying none.
+#
+# No SYCL device link, no model fixture, no network -- a plain host compile.
+#
+# LABELS deliberately avoid "cache" despite the prefix-caching coverage: the
+# throttled full-suite sweep is -LE 'residency|mem-handle|cache', so that word
+# would silently exclude this host-only test from every sweep that runs it.
+llama_build_and_test(test-kv-block.cpp)
+target_include_directories(test-kv-block PRIVATE ${PROJECT_SOURCE_DIR}/src)
+set_tests_properties(test-kv-block          PROPERTIES LABELS "main;kv;paged")
+
 # DECLINED in this batch, with reasons (llama.cpp-0igs):
 #
 #   test-fattn-determinism.cpp (20 asserts), test-fattn-mask.cpp (19)
@@ -1497,9 +1524,10 @@ set_property(TEST test-tensor-class PROPERTY
 #       `#undef NDEBUG`. Registering them would add two permanently-green lines
 #       that cannot fail. One line each (`#undef NDEBUG` after the includes)
 #       makes them real; that is a tests/*.cpp change and is tracked separately.
-#       Six more restorable sources are in the same state, the largest being
-#       test-kv-block.cpp at 178 asserts -- restoring it would read as
-#       recovering 178 assertions and recover none.
+#       Six more restorable sources were in the same state. The largest,
+#       test-kv-block.cpp at 178 asserts, has since been fixed and registered
+#       above (llama.cpp-4hvq) -- its assertions pass once live, which is what
+#       separates it from these two. The rest are still pending.
 #
 #   test-sycl-model-repro.cpp
 #       On a missing model it prints "SKIP:" and returns 0, not 77, so

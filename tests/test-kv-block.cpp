@@ -1,7 +1,30 @@
+// This test signals failure ONLY through bare assert(). The project builds
+// Release with CMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG", which compiles every
+// one of them out and leaves `return 0` as the sole exit path -- a program
+// that cannot fail. All 178 assertions here were in that state.
+//
+// VERIFIED by mutation, four cells built and run out-of-tree against
+// src/llama-kv-block.cpp (the header is stdlib-only, so no libllama link is
+// needed to reproduce this):
+//
+//     A  source as-is, -DNDEBUG ............................ exit 0
+//     B  all 178 assertions forced false, -DNDEBUG ......... exit 0   <- defect
+//     C  B plus #undef NDEBUG ............................. exit 134  <- signal restored
+//     D  clean source plus #undef NDEBUG ................... exit 0   <- assertions hold
+//
+// Cell B is the defect: every assertion false and the test still green. Cell D
+// is what makes this safe to register -- unlike test-fattn-determinism and
+// test-fattn-mask, whose assertions turn RED once live, all 178 here pass on
+// clean source.
+//
+// Must precede <cassert>, which binds assert at include time. llama-kv-block.h
+// includes <cassert> itself, so this must precede that include too.
+#undef NDEBUG
+#include <cassert>
+
 #include "llama-kv-block.h"
 
 #include <cstdio>
-#include <cassert>
 #include <vector>
 
 // Simple test framework
