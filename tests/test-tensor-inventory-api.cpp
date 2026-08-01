@@ -14,6 +14,18 @@
 #include <string>
 #include <vector>
 
+// This test signals failure ONLY through bare assert(). The project builds
+// Release with CMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG", which compiles every
+// one of them out and leaves `return 0` as the sole exit path -- a program
+// that cannot fail. Verified by mutation: with all assertions forced false,
+// the binary still exits 0 under -DNDEBUG and 134 without it.
+//
+// UNVERIFIED: not measured (GPU.lock contention). Only 2 assertions.
+//
+// Must precede <cassert>, which binds assert at include time.
+#undef NDEBUG
+#include <cassert>
+
 static void test_set_inventory() {
     // Create SYCL backend
     ggml_backend_t backend = ggml_backend_sycl_init(0);

@@ -19,6 +19,20 @@
 #include <cstdint>
 #include <limits>
 
+// This test signals failure ONLY through bare assert(). The project builds
+// Release with CMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG", which compiles every
+// one of them out and leaves `return 0` as the sole exit path -- a program
+// that cannot fail. Verified by mutation: with all assertions forced false,
+// the binary still exits 0 under -DNDEBUG and 134 without it.
+//
+// ⚠️ FAILS when enabled: test-fattn-mask.cpp:126 `qk_broken == qk`.
+//     Do NOT register this test until that is fixed -- registering it green
+//     requires the erasure this undoes.
+//
+// Must precede <cassert>, which binds assert at include time.
+#undef NDEBUG
+#include <cassert>
+
 // Replicate the ALiBi slope calculation from fattn-common.hpp
 static float get_alibi_slope(float max_bias, int head, int n_head_log2, float m0, float m1) {
     if (max_bias <= 0.0f) {

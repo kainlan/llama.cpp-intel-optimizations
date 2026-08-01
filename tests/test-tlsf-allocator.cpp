@@ -17,6 +17,18 @@
 #include <iostream>
 #include <vector>
 
+// This test signals failure ONLY through bare assert(). The project builds
+// Release with CMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG", which compiles every
+// one of them out and leaves `return 0` as the sole exit path -- a program
+// that cannot fail. Verified by mutation: with all assertions forced false,
+// the binary still exits 0 under -DNDEBUG and 134 without it.
+//
+// UNVERIFIED: not measured (GPU.lock contention). Only 1 assertion.
+//
+// Must precede <cassert>, which binds assert at include time.
+#undef NDEBUG
+#include <cassert>
+
 // Active test macro that works regardless of NDEBUG (assert() is compiled
 // away under NDEBUG, silently turning the entire test suite into a no-op).
 #define REQUIRE(cond)                                                                    \

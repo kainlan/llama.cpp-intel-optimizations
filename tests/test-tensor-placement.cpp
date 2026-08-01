@@ -2,6 +2,18 @@
 #include <cstring>
 #include <iostream>
 
+// This test signals failure ONLY through bare assert(). The project builds
+// Release with CMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG", which compiles every
+// one of them out and leaves `return 0` as the sole exit path -- a program
+// that cannot fail. Verified by mutation: with all assertions forced false,
+// the binary still exits 0 under -DNDEBUG and 134 without it.
+//
+// Verified clean: passes with assertions live (mutation matrix cell D, rc 0).
+//
+// Must precede <cassert>, which binds assert at include time.
+#undef NDEBUG
+#include <cassert>
+
 // Test that tensor placement logic routes correctly:
 // - Dense tensors: VRAM first, overflow to pinned
 // - Expert tensors: VRAM until full, then pinned

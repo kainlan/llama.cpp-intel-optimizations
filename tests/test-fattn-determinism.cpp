@@ -24,6 +24,20 @@
 #include <vector>
 #include <string>
 
+// This test signals failure ONLY through bare assert(). The project builds
+// Release with CMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG", which compiles every
+// one of them out and leaves `return 0` as the sole exit path -- a program
+// that cannot fail. Verified by mutation: with all assertions forced false,
+// the binary still exits 0 under -DNDEBUG and 134 without it.
+//
+// ⚠️ FAILS when enabled: test-fattn-determinism.cpp:113
+//     `std::abs(sim.KQ_sum[0] - 1.0f) < 0.001f`. Do NOT register this test until
+//     that is fixed -- registering it green requires the erasure this undoes.
+//
+// Must precede <cassert>, which binds assert at include time.
+#undef NDEBUG
+#include <cassert>
+
 // =============================================================================
 // Test Framework
 // =============================================================================
