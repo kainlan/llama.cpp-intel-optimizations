@@ -32606,6 +32606,14 @@ void ggml_sycl::SdpaCacheDeleter::operator()(void * ptr) const {
 #endif
 }
 
+// Forward declarations: defined later in this TU (graph replay machinery).
+// The destructor below must release this context's own retained graph-replay
+// leases -- see the matching, already-correct sycl_exec_graph_clear_active()
+// further down, which this destructor was missing (llama.cpp-2wv5).
+static void graph_unpin_moe_experts(ggml_backend_sycl_context * ctx);
+static void graph_unpin_weights(ggml_backend_sycl_context * ctx);
+static void sycl_exec_graph_release_pool_retained(ggml_backend_sycl_context * ctx);
+
 ggml_backend_sycl_context::~ggml_backend_sycl_context() {
     {
         std::lock_guard<std::mutex> lock(g_backend_context_by_device_mutex);
@@ -32644,6 +32652,23 @@ ggml_backend_sycl_context::~ggml_backend_sycl_context() {
     active_exec_graph.valid = false;
     invalidate_moe_segments();
 #endif
+
+    // graph_weight_leases / graph_moe_expert_leases / graph_retained_handles
+    // hold mem_handle copies that pin the last recorded graph's weight and
+    // MoE-expert cache entries (see graph_preload_weights()/
+    // graph_preload_moe_experts()). They are normally released the moment the
+    // NEXT graph is preloaded (graph_preload_weights() clears them first) or
+    // when the active exec graph is invalidated via
+    // sycl_exec_graph_clear_active(). Neither happens again once this backend
+    // context is going away -- there is no "next graph" -- so without an
+    // explicit release here, the very last graph's weight leases outlive this
+    // context and are still counted as live by
+    // unified_cache::reclaim_weight_entries() at model teardown (leaked_lease,
+    // llama.cpp-2wv5). Mirror sycl_exec_graph_clear_active()'s cleanup so the
+    // leases this context still owns are dropped before it is gone.
+    graph_unpin_moe_experts(this);
+    sycl_exec_graph_release_pool_retained(this);
+    graph_unpin_weights(this);
 
     {
         std::lock_guard<std::mutex> lock(control_host_allocs_mutex);
