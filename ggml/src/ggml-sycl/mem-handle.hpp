@@ -251,8 +251,17 @@ class mem_handle {
     mem_handle_debug_info debug_info() const;
 
   private:
+    // Shared body of resolve()/resolve(device_id): dispatches by kind and,
+    // on the slow path, forwards `caller` through to resolve_slow() so the
+    // acquired lease can be tagged with the TRUE external call site (debug
+    // diagnostics only, llama.cpp-2wv5). Each public overload captures its
+    // own __builtin_return_address(0) before calling this, since capturing it
+    // here would only ever see the other overload's internal call site.
+    resolved_ptr resolve_impl(const void * caller) const;
+
     // Slow path: re-query the unified cache for the current pointer.
-    resolved_ptr resolve_slow() const;
+    // debug_caller: see resolve_impl() above; purely diagnostic, safe to omit.
+    resolved_ptr resolve_slow(const void * debug_caller = nullptr) const;
 
     // Slow path for arena handles: resolve base + offset from arena.
     resolved_ptr resolve_arena() const;

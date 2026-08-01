@@ -4025,7 +4025,7 @@ expert_resolve_result unified_cache::resolve_expert(const expert_resolve_request
             make_direct_stage_key(cache_entry_type::MOE_EXPERT, req.key, req.requested_layout);
         lock.unlock();
 
-        auto lease = acquire_entry_lease(mirror_key);
+        auto lease = acquire_entry_lease(mirror_key, __builtin_return_address(0));
         if (lease) {
             result.ptr             = lease.ptr;
             result.size            = entry_size;
@@ -5613,16 +5613,17 @@ unified_cache::weight_ptr_result unified_cache::get_weight_ptr(const ggml_sycl_c
 // mem-handle.cpp and was out of scope for the commit that added this note.
 // ---------------------------------------------------------------------------
 unified_cache::weight_ptr_lease_result unified_cache::acquire_weight_lease(const ggml_sycl_cache_id & key) {
+    const void * const caller = __builtin_return_address(0);
     static const ggml_layout_mode try_layouts[] = { GGML_LAYOUT_COALESCED, GGML_LAYOUT_SOA, GGML_LAYOUT_AOS };
     for (auto layout : try_layouts) {
         unified_cache_key ckey  = make_direct_stage_key(cache_entry_type::DENSE_WEIGHT, key, layout);
-        auto              lease = acquire_entry_lease(ckey);
+        auto              lease = acquire_entry_lease(ckey, caller);
         if (lease) {
             return lease;
         }
     }
     unified_cache_key ckey{ cache_entry_type::DENSE_WEIGHT, key, -1, -1 };
-    auto              lease = acquire_entry_lease(ckey);
+    auto              lease = acquire_entry_lease(ckey, caller);
     if (lease) {
         return lease;
     }
@@ -5645,12 +5646,13 @@ unified_cache::weight_ptr_lease_result unified_cache::acquire_weight_lease(const
         }
     }
     if (have_mapped && !(mapped == ckey)) {
-        return acquire_entry_lease(mapped);
+        return acquire_entry_lease(mapped, caller);
     }
     return lease;
 }
 
-unified_cache::weight_ptr_lease_result unified_cache::acquire_entry_lease(const unified_cache_key & key) {
+unified_cache::weight_ptr_lease_result unified_cache::acquire_entry_lease(const unified_cache_key & key,
+                                                                          const void *              debug_caller) {
     weight_ptr_lease_result result{};
     if (!key.id.valid) {
         return result;
@@ -5682,6 +5684,7 @@ unified_cache::weight_ptr_lease_result unified_cache::acquire_entry_lease(const 
             // Bump the lease refcount under shared_lock.  Visible to any evictor
             // that later acquires the unique_lock (acq_rel ordering).
             entry.in_use_count.fetch_add(1);
+            entry.debug_last_lease_caller = debug_caller;  // debug-only, see llama.cpp-2wv5
             result.ptr       = entry.device_ptr;
             result.layout    = entry.layout;
             result.on_device = !entry.host_resident;
@@ -7688,9 +7691,9 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
                                                                  zone_largest_free(vram_zone_id::WEIGHT));
                     GGML_SYCL_DEBUG(
                         "[UNIFIED-CACHE] reclaim_weight_entries preserving leased model weight "
-                        "model=%llu name_hash=0x%llx layout=%d leases=%u owners=0x%08x\n",
+                        "model=%llu name_hash=0x%llx layout=%d leases=%u owners=0x%08x caller=%p\n",
                         (unsigned long long) it->first.id.model_id, (unsigned long long) it->first.id.name_hash,
-                        (int) entry.layout, live, entry.owner_mask);
+                        (int) entry.layout, live, entry.owner_mask, entry.debug_last_lease_caller);
                 } else if (owned_by_live) {
                     entries_owned++;
                 } else {

@@ -1476,6 +1476,14 @@ struct unified_cache_entry {
     // runtime, outside a load) -- the latter is kept while any model is live.
     uint32_t              owner_mask   = 0;
     bool                  owner_tagged = false;
+    // Debug-only (llama.cpp-2wv5): return address of whoever most recently
+    // acquired a lease on this entry via acquire_entry_lease(). Overwritten on
+    // every acquisition -- not a history, just "who holds the current lease".
+    // That is sufficient to diagnose reclaim_weight_entries()'s
+    // "preserving leased model weight" report, since a leaked entry there
+    // always shows exactly one outstanding lease (in_use_count == 1); resolve
+    // the address with addr2line/dladdr against the built libggml-sycl.so.
+    const void *          debug_last_lease_caller = nullptr;
     // NOTE: Reorder state is tracked in tensor->extra->optimized_feature, not here
 };
 
@@ -1600,7 +1608,11 @@ class unified_cache {
     };
 
     weight_ptr_lease_result acquire_weight_lease(const ggml_sycl_cache_id & key);
-    weight_ptr_lease_result acquire_entry_lease(const unified_cache_key & key);
+    // debug_caller (llama.cpp-2wv5): opaque return address recorded on the
+    // acquired entry as debug_last_lease_caller, purely for diagnosing which
+    // call site is holding a lease reclaim_weight_entries() reports as
+    // leaked. Not used for any decision -- safe to pass nullptr.
+    weight_ptr_lease_result acquire_entry_lease(const unified_cache_key & key, const void * debug_caller = nullptr);
 
     // --- Decomposed cache operations (no queue ops during inference) ---
 

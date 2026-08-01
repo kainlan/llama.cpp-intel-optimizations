@@ -386,7 +386,7 @@ void mem_handle::clear_ready_event() {
 
 // === resolve ===
 
-resolved_ptr mem_handle::resolve() const {
+resolved_ptr mem_handle::resolve_impl(const void * caller) const {
     // DIRECT and CHUNK_LEASE handles are never stale — they wrap a raw
     // pointer that is kept alive by either the caller's lifetime (DIRECT)
     // or by the chunk lease refcount (CHUNK_LEASE, dyhdl).
@@ -410,7 +410,11 @@ resolved_ptr mem_handle::resolve() const {
         return cached_;
     }
 
-    return resolve_slow();
+    return resolve_slow(caller);
+}
+
+resolved_ptr mem_handle::resolve() const {
+    return resolve_impl(__builtin_return_address(0));
 }
 
 // === resolve(device_id) — dispatch-device overload ===
@@ -420,7 +424,12 @@ resolved_ptr mem_handle::resolve() const {
 // owner used for re-resolution and cleanup.
 
 resolved_ptr mem_handle::resolve(int device_id) const {
-    resolved_ptr r = resolve();
+    // Captured here rather than in resolve_impl(): calling
+    // __builtin_return_address(0) inside resolve_impl() would only ever see
+    // resolve()'s or resolve(device_id)'s OWN internal call site, not the
+    // external caller. Each public overload must capture its own immediate
+    // caller (debug-only, llama.cpp-2wv5).
+    resolved_ptr r = resolve_impl(__builtin_return_address(0));
     if (!r.ptr || !r.on_device) {
         return r;
     }
@@ -446,7 +455,7 @@ resolved_ptr mem_handle::resolve(int device_id) const {
 // before acquiring a new one — otherwise two handles exist on the same
 // entry instance, and leak tracking breaks.
 
-resolved_ptr mem_handle::resolve_slow() const {
+resolved_ptr mem_handle::resolve_slow(const void * debug_caller) const {
     if (!valid_cache_device_id(device_)) {
         cached_       = {};
         gen_          = cache_generation();
@@ -473,7 +482,7 @@ resolved_ptr mem_handle::resolve_slow() const {
 
     // Acquire under shared_lock; visible to any future evictor via acq_rel
     // ordering on the in_use_count atomic.
-    auto result = cache->acquire_entry_lease(key_);
+    auto result = cache->acquire_entry_lease(key_, debug_caller);
     if (!result) {
         // No cache hit; leave handle unpinned.
         cached_       = {};
