@@ -555,6 +555,29 @@ if (NOT WIN32)
         TIMEOUT 60
     )
 
+    # Gate for the skip policy itself: a test that skips must exit 77, and
+    # llama_build_and_test() must keep SKIP_RETURN_CODE 77 so ctest scores that
+    # as "Skipped" rather than "Passed" (or, for a test that already exits 77
+    # deliberately like test-llama-archs, rather than "Failed"). llama.cpp-nwip:
+    # get_model_or_exit() exited EXIT_SUCCESS, so three model-requiring tests
+    # reported green in 0.18 s having loaded nothing. Both halves of the fix are
+    # one edit from gone -- tests/get-model.cpp is upstream code a rebase can
+    # revert, and the property is a single line here -- so this asserts the
+    # source text AND runs a binary to check the exit code. Needs no model and
+    # no GPU: the skip path returns before llama is touched.
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-skip-policy.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "build;policy"
+        TIMEOUT 180
+    )
+    # Resolved at generate time, so the target may be declared further down this
+    # file. Passing the path beats having the script guess a build directory --
+    # it cannot know which one ctest is running from.
+    set_property(TEST test-skip-policy PROPERTY
+        ENVIRONMENT "LLAMA_TEST_SKIP_BINARY=$<TARGET_FILE:test-autorelease>")
+
     # Gate for the single _gzip exclusion predicate in tools/ui/CMakeLists.txt,
     # which is consumed by both list(FILTER ... REGEX) and if(... MATCHES). It
     # was two hand-written patterns and they drifted, so a real directory merely

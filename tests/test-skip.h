@@ -20,7 +20,7 @@
 
 #define LLAMA_TEST_EXIT_SKIP 77
 
-[[noreturn]] static inline void test_skip_no_model() {
+[[noreturn]] inline void test_skip_no_model() {
     fprintf(stderr,
             "\033[33mWARNING: No model file provided. Skipping this test. "
             "Set LLAMACPP_TEST_MODELFILE=<gguf_model_path> to silence this warning and run this test.\n\033[0m");
