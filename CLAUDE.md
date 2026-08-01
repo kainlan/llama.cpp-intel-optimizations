@@ -391,13 +391,48 @@ Confirmed lessons from prior work on this fork. Treat them as defaults.
 
 ### Communication & Workflow
 - **The user reads Discord, not the terminal.** CLI output is invisible to them. Any question, confirmation, decision prompt, or status update intended for the user MUST go through the Discord reply tool (the harness supplies the channel id each session). Terminal text is logging only — never "await a reply" there.
-- **Work in-place on the active feature branch** (`git branch --show-current` — do not trust a branch name written down here); skip git worktrees. A worktree forces a fresh `build/` and loses the ~10-min ccache-warm hit rate. When reviewing diffs, bound by BASE_SHA/HEAD_SHA, not "everything on the branch."
+- **Work on the active feature branch** (`git branch --show-current` — do not trust a branch name written down here). When reviewing diffs, bound by BASE_SHA/HEAD_SHA, not "everything on the branch."
+- **Worktrees are allowed and are the right tool for build-heavy parallel work** (owner decision, 2026-08-01). This entry previously said *"skip git worktrees — a worktree forces a fresh `build/` and loses the ~10-min ccache-warm hit rate."* The cost is real but was overstated: **ccache is global (`~/.ccache`), not per-tree**, so a worktree build still gets its hits; only the `build/` object tree and CMake cache are fresh.
+  Measured 2026-08-01: with one shared `build/`, four agents serialised on a ~14-min build cycle and one track was starved **~2 hours**. Two worktree builds completed fine in the same session. Path-scoped commits prevent *file* conflicts; they do nothing about *build* contention, and that is what actually costs time.
+  Use a worktree when a track will build repeatedly. Stay in the shared checkout when the work is small, or when it must operate on the checked-out branch itself (git refuses to check out one branch in two trees — so a **merge into** the active branch must happen in the main checkout, though only the build needs isolating).
+  ⚠️ **Lock scope follows the build directory, not the act of building.** Shared checkout → take `/Apps/llama.cpp/BUILD.lock`. Own worktree → take nothing; nothing contends. `GPU.lock` is always global, from any tree, because the *devices* are shared.
+  ⚠️ **Delete an evidence worktree only after the finding it supports has been reviewed.** ~1.4 GB is cheap next to a disagreement about what was measured that can no longer be settled (happened 2026-08-01).
 - **`git merge-base HEAD master` is usually the WRONG before-point for a measurement.** On a long-lived feature branch it can sit dozens of commits behind the work you are attributing, silently crediting your change with everything in between. Use the commit immediately before your own first commit.
 - **Fix-forward, never revert.** If a build or correctness test fails mid-implementation, diagnose and fix in a new commit. Don't `git revert` or `git checkout --` to undo progress.
 - **Verify correctness before claiming any perf win.** `llama-bench` measures tok/s only — a change can boost throughput by silently skipping or mis-staging work and still emit garbage tokens. Before committing any change to kernel dispatch, weight staging, graph replay, or allocation routing, run the canonical Mistral completion gate (see "Verification Commands & Correctness Gates") and confirm the output. A fake +19.6% PP "win" shipped this way once and had to be reverted.
 
 ### Safety (these have hung or exhausted memory on this host)
-- **Never run `test-backend-ops` in a subagent or background task.** It allocates hundreds of GPU BOs whose TTM shmem backing grows to 50–224 GB and exhausts memory, so the kernel out-of-memory handler stops the process (two hangs on 2026-04-06). For automated GPU testing use only `llama-bench`, `llama-completion`, or a targeted `ctest -R <name>`. Run `test-backend-ops` manually, with monitoring, only.
+- ⚠️ **THE NEVER-LOOP RULE IS ABOUT A PROPERTY, NOT A LIST OF BINARIES.** Read this before the
+  examples below, because the examples are how it gets misapplied.
+
+  **The property: any test that loads models onto a GPU allocates GPU buffer objects whose TTM
+  shmem backing does not appear in ordinary RSS accounting.** Repeating such a test accumulates
+  that backing faster than it is released. Nothing in the test's name, labels, or output says so.
+
+  This rule used to be written purely through its two examples, so it read as a fact *about those
+  two binaries*. On 2026-08-01 that framing cost a near-miss: a task's acceptance criterion said
+  *"passes 3 consecutive times — it is a race; one green run is not evidence"* for
+  **`test-thread-safety`**, which was not on the list. Executing it drove `Shmem` from 84.9 GB to
+  **206 GB in twenty seconds** and `MemAvailable` to **16.9 GB** — killed roughly twenty seconds
+  short of a global OOM. The reasoning behind the criterion was statistically sound; the missing
+  step was asking what that binary *allocates*.
+
+  **Before writing "run it N times" into any script, gate, or acceptance criterion, ask whether
+  the binary loads a model onto a GPU.** If yes: run it ONCE, sample
+  `grep -E '^(MemAvailable|Shmem):' /proc/meminfo` before and ~5 s after, and abort if `Shmem`
+  climbs past ~100 GB. Prefer a narrower reproducer, or an instrumented single run, over
+  repetition. Label filters do NOT protect you (`test-backend-ops` carries no labels), and a
+  healthy-looking `free` reading does not either.
+
+  Known members (**not** an exhaustive list — apply the property):
+  - **`test-backend-ops`** — never in a subagent or background task. Hundreds of GPU BOs, TTM
+    shmem 50–224 GB, two hangs on 2026-04-06. Run manually, with monitoring, only.
+  - **`test-llama-archs`** — one run (~36 s) is fine; a 6-run loop OOM-killed this host twice.
+  - **`test-thread-safety`** — 3 models × 4 contexts; the 2026-08-01 near-miss above.
+  - **`test-unified-cache-bugs`** — peaks ~8.5 GB RSS; serial only.
+
+  For automated GPU testing prefer `llama-bench`, `llama-completion`, or a targeted
+  `ctest -R <name>` — single invocations, not loops.
 - **Always `timeout 60` GPT-OSS 20B test runs.** The historical host-MoE-routing hang (GuC `guc_id=6`, unrecoverable, requires reboot) was closed by commit `ec7f04ac4`, but keep the timeout as a guard. Distinguish the userspace hang (`guc_id=6`, attributed `in <llama-bench>`, unrecoverable) from the benign environmental XE timeout (`guc_id=0`, `in no process [-1]`, auto-recovers).
 - **Benchmark numbers are invalid after any crash or forced stop on that card** (xe GT reset cascades) — check the kernel log first. `SAFE_MODE`/op-timing diagnostics can themselves stall cards.
 - **`dmesg` is privilege-denied for this user** (`read kernel buffer failed: Operation not permitted`). Every "check dmesg" instruction in this repo's docs must be run as:

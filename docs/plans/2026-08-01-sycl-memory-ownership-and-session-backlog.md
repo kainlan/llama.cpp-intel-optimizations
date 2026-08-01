@@ -47,7 +47,7 @@ blast radius. Tracks A and B are chosen precisely because they never touch that 
 |-------|-------|-------------|------|
 | A | 1, 2, 3, 14 | Build integrity + weight-lease close-out | `src/CMakeLists.txt`, `tests/CMakeLists.txt`, `tests/test-thread-safety.cpp` |
 | B | 4, 5 | Attention correctness — gemma2 hang, gemma3n wrong answer | `src/models/gemma*.cpp`, `ggml/src/ggml-sycl/fattn*` |
-| C | 6 → 7 → 8 → 9 → 10 → 11 → 12 → 13 | Memory ownership + everything else needing `ggml-sycl.cpp` | `ggml-sycl.cpp`, `unified-cache.{cpp,hpp}`, `getrows.cpp` |
+| C | 6 → 7 → {8, 8b, 9, 9b} → 10 → 11 → 12 → 13 | Memory ownership + everything else needing `ggml-sycl.cpp` | `ggml-sycl.cpp`, `unified-cache.{cpp,hpp}`, `getrows.cpp`, `mem-handle.{cpp,hpp}` |
 
 ### Dependency Graph
 
@@ -61,7 +61,9 @@ digraph dependencies {
     5  [label="5: dqp2 — fix gemma2/gemma3n"];
     6  [label="6: merge w4/xmx-cluster FIRST"];
     7  [label="7: SPIKE — Phase 0 escape inventory"];
-    8  [label="8: fix get_rows escape"];
+    8  [label="8: fix BOTH get_rows escapes"];
+    8b [label="8b: 291-entry weight-lease leak"];
+    9b [label="9b: dangling mem_handle (c48l)"];
     9  [label="9: fix remaining escapes (N tickets)"];
     10 [label="10: delete drains + resets"];
     11 [label="11: assert-only zone guards"];
@@ -71,8 +73,8 @@ digraph dependencies {
     1 -> 2;
     4 -> 5;
     6 -> 7;
-    7 -> 8; 7 -> 9;
-    8 -> 10; 9 -> 10;
+    7 -> 8; 7 -> 8b; 7 -> 9; 7 -> 9b;
+    8 -> 10; 8b -> 10; 9 -> 10; 9b -> 10;
     10 -> 11;
     11 -> 12; 11 -> 13;
 }
@@ -646,6 +648,58 @@ inventory directly and answers "did the escape recur" without re-running a three
 
 ---
 
+### Task 8b: Fix the weight-lease leak — 291 of 516 entries (`llama.cpp-2wv5`)
+
+**Track:** C
+**Depends on:** Task 7
+**File scope:**
+- Modify: `ggml/src/ggml-sycl/unified-cache.{cpp,hpp}` (lease acquisition/release for weight entries)
+- Likely: `src/llama-model.cpp` (model teardown ordering)
+
+**Description:**
+
+**The largest confirmed escape in the system, and it needs no concurrency to reproduce.**
+Measured and independently reproduced 2026-08-01 on the canonical Mistral gate — single model,
+single process, ordinary exit:
+
+    reclaim_weight_entries(model-teardown) preserved 291 of 516 weight entries
+    (leased=291 owned-by-live-model=0 unattributed=0 leaked=291 erased=225 unpinned=516
+     live_mask=0x00000000)
+    291 weight entries are still leased with NO live model owning them -- this is a leaked
+    mem_handle, not concurrent model use (set GGML_SYCL_STRICT_LEASES=1 to abort here)
+
+`live_mask=0x00000000` with `owned-by-live-model=0` means this is **not** the supported
+multi-model case. No other model exists. The backend's own classifier calls it a leak.
+
+This is the failure CLAUDE.md predicted when `acdb192d4` traded the leak abort for
+preserve-and-continue: *"a future real leak will surface as a growing `entries_preserved` count
+and eventual VRAM pressure, not a loud abort."* `9f3a2e0f0` restored the ability to tell a leak
+from legitimate multi-model use; the warning has simply never been read, because it prints at
+teardown of a gate whose output everyone greps for digits.
+
+**Use the instrument that already exists.** `GGML_SYCL_STRICT_LEASES=1` turns the warning into
+an abort — so the *first* leaked lease aborts with a stack, instead of 291 accumulating into a
+summary line. That is a pre-built bisection tool; start there.
+
+**Acceptance Criteria:**
+
+- [ ] What distinguishes the 291 leaked entries from the 225 that erase cleanly is established.
+      That is a large, structured fraction — it is a category, not scattered noise.
+- [ ] The missing release is fixed at its owner.
+- [ ] `GGML_SYCL_STRICT_LEASES=1` on the Mistral gate completes **without aborting**.
+- [ ] The teardown line reports `leaked=0`.
+- [ ] Mistral gate still emits `1, 2, 3, 4, 5, 6, 7, 8, 9, 10`; ONE `test-llama-archs` no worse.
+
+**Gotchas:**
+- ⚠️ **Do NOT add a teardown sweep, forced eviction, or forced reap.** CLAUDE.md forbids
+  reclaiming memory that still has a live handle, and it would recreate the exact
+  scheduled-reclamation pattern this epic exists to remove. Fix the owner that fails to release.
+- This escape is why **Task 10's ordering is not negotiable**: those 291 entries are currently
+  reclaimed *only* because `reset_model_weight_entries` erases them (`erased=225`,
+  `unpinned=516`). Delete the resets with this leak unfixed and nothing frees them, ever.
+
+---
+
 ### Task 9: Fix the remaining escapes — one ticket per cohort (`llama.cpp-iiff` Phase 1)
 
 **Track:** C
@@ -655,7 +709,13 @@ inventory directly and answers "did the escape recur" without re-running a three
 **Description:**
 
 Task 7 produces the authoritative cohort list; each becomes its own ticket filed at the Task
-Detail Standard. Indicative candidates, derived from reading the eight drain steps — i.e. escapes
+Detail Standard.
+
+**Three cohorts are already CONFIRMED and have owning tasks — they are not waiting on the
+audit**: `get_rows:seq_device` and `get_rows_indices_small_host` (both Task 8), and the
+291-entry weight-lease leak (Task 8b). This task covers whatever the audit adds beyond those.
+
+Indicative further candidates, derived from reading the eight drain steps — i.e. escapes
 that already bit someone, **not** a substitute for the inventory:
 
 - staging-cache entries holding reset-zone pointers (`ggml_sycl_clear_staging_cache`)
@@ -671,10 +731,54 @@ that already bit someone, **not** a substitute for the inventory:
 
 ---
 
+### Task 9b: Fix the dangling `mem_handle` in the device-owner lookup (`llama.cpp-c48l`)
+
+**Track:** C
+**Depends on:** Task 7
+**File scope:**
+- Modify: `ggml/src/ggml-sycl/mem-handle.{cpp,hpp}` (`resolve()`, lifetime)
+- Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp` (`ggml_sycl_tensor_metadata_owner` →
+  `ggml_sycl_find_tensor_device_owner` → `ggml_sycl_plan_simple_consumer_device`)
+
+**Description:**
+
+A **different bug family** from the zone-reset escapes, included here because it blocks the
+epic's verification. Unguarded SIGSEGV in `ggml_sycl::mem_handle::resolve()`
+(`mem-handle.cpp:389`), faulting on its **first** field access (`kind_`) — so `this` is dangling,
+not a null pointer inside a valid handle. Reached through a weight tensor's device-owner lookup
+during dispatch, with 3 models × 4 contexts running. A `mem_handle` or its backing cache entry is
+being freed or recycled while another context is mid-resolve. Full backtrace in `llama.cpp-c48l`.
+
+**Why it is in this plan rather than deferred:** `test-thread-safety` is the natural verification
+vehicle for Tasks 8/8b/9, and it will keep segfaulting through *this* path no matter how well
+those are done. Until it is fixed, that binary is a **diagnostic, not a gate** — and a plan whose
+verification is permanently red is a plan nobody can close.
+
+**Acceptance Criteria:**
+
+- [ ] Which cache entry's `mem_handle` dangles, and which owner frees it early, is identified.
+      Leading hypothesis (from `c48l`): a model unload racing a concurrent context's dispatch.
+      Test it; do not assume it.
+- [ ] The lookup holds a handle for the duration of the resolve, or resolves from stable identity
+      rather than a pointer — per CLAUDE.md, raw pointers are transient ABI views, never
+      ownership tokens.
+- [ ] `test-thread-safety` no longer segfaults via this path. **ONE run** (see the never-loop
+      warning under Task 8).
+- [ ] The fix does not mask the fault with a null check — a guarded dangling `this` is still a
+      use-after-free, just a quieter one.
+
+**Gotchas:**
+- Relates to `llama.cpp-goegc.1` ("mem_handle identity/lifetime must prevent stale pointer reuse
+  after eviction or reset") — check whether that epic already owns part of this before starting.
+- Reproduce under gdb, not from logs: this crash emits **no abort text at all**, so a log-only
+  investigation will find nothing and conclude wrongly.
+
+---
+
 ### Task 10: Delete the drains, then the resets (`llama.cpp-iiff` Phase 2)
 
 **Track:** C
-**Depends on:** Tasks 8, 9
+**Depends on:** Tasks 8, 8b, 9, 9b
 **File scope:**
 - Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp` (13 `zone_reset` / `reset_scratch_pool` references)
 - Modify: `ggml/src/ggml-sycl/unified-cache.{cpp,hpp}`
