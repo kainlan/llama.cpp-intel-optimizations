@@ -1313,6 +1313,10 @@ add_test(NAME mem-ops COMMAND test-mem-ops)
 set_tests_properties(mem-ops PROPERTIES
     LABELS "sycl;handle;memory-ops;tdd"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    # The test exits 77 when no device is present. Without this, ctest renders
+    # that as FAILED rather than the intended Skipped -- honest but wrong, and
+    # only on a device-less machine, so this host cannot show the difference.
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 
@@ -1558,6 +1562,13 @@ target_link_libraries(test-sycl-level-zero-vmem-feasibility PRIVATE ${LEVEL_ZERO
 add_test(NAME test-sycl-level-zero-vmem-feasibility COMMAND test-sycl-level-zero-vmem-feasibility)
 set_tests_properties(test-sycl-level-zero-vmem-feasibility PROPERTIES
     LABELS "sycl;level-zero;vmem;tdd"
+    # 77 = genuine absence (no Level Zero, no driver, no device). The test used
+    # to route EVERY early exit through one skip helper returning 0, including
+    # "zeVirtualMemReserve failed" and "zeVirtualMemFree failed" -- which fire
+    # only when Level Zero IS present and a call that should have worked did
+    # not. That is precisely the result this test exists to find, and it was
+    # reported green. Those now exit 1; only real absences exit 77.
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 
