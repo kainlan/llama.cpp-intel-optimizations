@@ -4524,9 +4524,23 @@ bool unified_cache::is_cached(const ggml_sycl_cache_id & key_id, ggml_layout_mod
         return false;
     }
     std::shared_lock<std::shared_mutex> lock(rw_mutex_);
-    const unified_cache_key direct_key = make_direct_stage_key(cache_entry_type::DENSE_WEIGHT, key_id, layout);
-    auto                    direct_it  = entries_.find(direct_key);
-    if (direct_it != entries_.end() && direct_it->second.layout == layout && !direct_it->second.retired) {
+    // Probe BOTH direct-stage entry types, as lookup_device_only() does.
+    // direct_stage_expert() files under a MOE_EXPERT direct-stage key, so a
+    // DENSE_WEIGHT-only probe never matches an expert entry — and it also
+    // overwrites id_to_key_[key] on every staging, so the fallback below
+    // remembers only the layout staged LAST.  Together that made every earlier
+    // layout of a multi-layout expert invisible to this accessor even though
+    // its entry was still in entries_ (llama.cpp-5pvn).
+    const unified_cache_key direct_weight_key = make_direct_stage_key(cache_entry_type::DENSE_WEIGHT, key_id, layout);
+    const unified_cache_key direct_expert_key = make_direct_stage_key(cache_entry_type::MOE_EXPERT, key_id, layout);
+    auto                    direct_weight_it  = entries_.find(direct_weight_key);
+    if (direct_weight_it != entries_.end() && direct_weight_it->second.layout == layout &&
+        !direct_weight_it->second.retired) {
+        return true;
+    }
+    auto direct_expert_it = entries_.find(direct_expert_key);
+    if (direct_expert_it != entries_.end() && direct_expert_it->second.layout == layout &&
+        !direct_expert_it->second.retired) {
         return true;
     }
     auto id_it = id_to_key_.find(key_id);
@@ -4570,6 +4584,17 @@ void * unified_cache::get(const ggml_sycl_cache_id & key_id, ggml_layout_mode la
     const unified_cache_key direct_key = make_direct_stage_key(cache_entry_type::DENSE_WEIGHT, key_id, layout);
     auto                    entry_it   = entries_.find(direct_key);
     if (entry_it == entries_.end()) {
+        // Probe the MOE_EXPERT direct-stage key too, as lookup_device_only()
+        // does.  This matters more here than anywhere else: get() is the
+        // accessor that drives IN_PROGRESS -> READY, and every read-only
+        // accessor holds a shared_lock and so cannot.  Without this probe an
+        // expert layout that direct_stage_expert() staged before some later
+        // layout was reachable through no transitioning accessor at all, so it
+        // could never leave IN_PROGRESS and every device lookup of it failed
+        // even once its ready_event had completed (llama.cpp-5pvn).
+        entry_it = entries_.find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, key_id, layout));
+    }
+    if (entry_it == entries_.end()) {
         auto id_it = id_to_key_.find(key_id);
         if (id_it == id_to_key_.end()) {
             return nullptr;
@@ -4605,6 +4630,13 @@ void * unified_cache::try_get_cached_fast(const ggml_sycl_cache_id & key_id, ggm
     std::shared_lock<std::shared_mutex> lock(rw_mutex_);
     const unified_cache_key direct_key = make_direct_stage_key(cache_entry_type::DENSE_WEIGHT, key_id, layout);
     auto                    entry_it   = entries_.find(direct_key);
+    if (entry_it == entries_.end()) {
+        // Same MOE_EXPERT direct-stage probe get() and lookup_device_only()
+        // perform.  Keeping this shared_lock twin narrower than get() would put
+        // lookup() and get() back into disagreement about the same key — the
+        // defect class of llama.cpp-5pvn / llama.cpp-gzea.
+        entry_it = entries_.find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, key_id, layout));
+    }
     if (entry_it == entries_.end()) {
         auto id_it = id_to_key_.find(key_id);
         if (id_it != id_to_key_.end()) {
@@ -5450,25 +5482,24 @@ unified_cache::weight_ptr_result unified_cache::get_weight_ptr(const ggml_sycl_c
     // id_to_key_ happens to point at (which can be ONEDNN_PACKED from PP).
     static const ggml_layout_mode       try_layouts[] = { GGML_LAYOUT_COALESCED, GGML_LAYOUT_SOA, GGML_LAYOUT_AOS };
     std::shared_lock<std::shared_mutex> lock(rw_mutex_);
-    for (auto layout : try_layouts) {
-        // Build the full cache key with this layout
-        unified_cache_key ckey     = make_direct_stage_key(cache_entry_type::DENSE_WEIGHT, key, layout);
-        auto              entry_it = entries_.find(ckey);
+
+    auto try_entry = [&](const unified_cache_key & ckey) {
+        auto entry_it = entries_.find(ckey);
         if (entry_it == entries_.end()) {
-            continue;
+            return false;
         }
         const auto & entry = entry_it->second;
         if (entry.retired || entry.state != cache_entry_state::READY) {
-            continue;
+            return false;
         }
         if (!entry.device_ptr) {
-            continue;
+            return false;
         }
         // HOST_MMAP entries contain raw mmap pointers that are NOT GPU-accessible.
         // Returning them would cause CCS page faults when GPU kernels dereference
         // the pointer.  Only DEVICE and HOST_PINNED entries are safe.
         if (entry.location == cache_location::HOST_MMAP) {
-            continue;
+            return false;
         }
         result.ptr       = entry.device_ptr;
         result.layout    = entry.layout;
@@ -5477,6 +5508,32 @@ unified_cache::weight_ptr_result unified_cache::get_weight_ptr(const ggml_sycl_c
             result.has_ready_event = true;
             result.ready_event     = entry.ready_event;
         }
+        return true;
+    };
+
+    for (auto layout : try_layouts) {
+        // Build the full cache key with this layout
+        if (try_entry(make_direct_stage_key(cache_entry_type::DENSE_WEIGHT, key, layout))) {
+            return result;
+        }
+    }
+
+    // Direct-stage keys are not the only place a canonical entry can live.
+    // ensure_cached() files its entry under the plain identity key
+    // {type, id, layer_id, expert_id} and records that mapping in id_to_key_;
+    // it never builds a make_direct_stage_key() key.  Probing only the layouts
+    // above therefore missed every ensure_cached() entry, which is how get()
+    // and is_cached() could both report an entry this accessor called
+    // unresolvable (llama.cpp-gzea).  get(), is_cached() and
+    // lookup_device_only() all consult id_to_key_; so must this one, or the
+    // documented "tries the entry for this key regardless of layout" contract
+    // is false for an entire class of writers.
+    //
+    // Restricted to DENSE_WEIGHT: this is the dense-weight accessor, and
+    // id_to_key_ can also point at a MOE_EXPERT entry for the same identity.
+    // Expert entries are resolved through the expert paths, not here.
+    auto id_it = id_to_key_.find(key);
+    if (id_it != id_to_key_.end() && id_it->second.type == cache_entry_type::DENSE_WEIGHT && try_entry(id_it->second)) {
         return result;
     }
     lock.unlock();
@@ -5514,7 +5571,32 @@ unified_cache::weight_ptr_lease_result unified_cache::acquire_weight_lease(const
         }
     }
     unified_cache_key ckey{ cache_entry_type::DENSE_WEIGHT, key, -1, -1 };
-    return acquire_entry_lease(ckey);
+    auto              lease = acquire_entry_lease(ckey);
+    if (lease) {
+        return lease;
+    }
+    // Keep the lease variant's key space identical to get_weight_ptr's.  The
+    // {-1, -1} key above only covers ensure_cached() calls that passed no
+    // layer/expert id; id_to_key_ covers every ensure_cached() entry.  Leaving
+    // this out would mean a mem_handle failing to resolve a weight that the
+    // non-leasing get_weight_ptr resolves — the same accessor-disagreement
+    // defect as llama.cpp-gzea, one level down on the ownership path.
+    // acquire_entry_lease() takes the unique lock itself, so the mapping must
+    // be read and the lock dropped before calling it.
+    unified_cache_key mapped{};
+    bool              have_mapped = false;
+    {
+        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+        auto                                id_it = id_to_key_.find(key);
+        if (id_it != id_to_key_.end() && id_it->second.type == cache_entry_type::DENSE_WEIGHT) {
+            mapped      = id_it->second;
+            have_mapped = true;
+        }
+    }
+    if (have_mapped && !(mapped == ckey)) {
+        return acquire_entry_lease(mapped);
+    }
+    return lease;
 }
 
 unified_cache::weight_ptr_lease_result unified_cache::acquire_entry_lease(const unified_cache_key & key) {

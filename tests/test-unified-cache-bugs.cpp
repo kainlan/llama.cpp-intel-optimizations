@@ -226,12 +226,34 @@ static bool test_multi_layout_id_mapping_survives_drop(sycl::queue & q) {
     }
     i8.event.wait();
 
-    if (!cache.is_cached(key, GGML_LAYOUT_SOA) || !cache.is_cached(key, GGML_LAYOUT_MXFP4_I8)) {
-        fprintf(stderr, "Expected both SOA and MXFP4_I8 entries to be cached before drop\n");
+    // Checked separately, not as one `||`: which of the two is false is the
+    // whole diagnosis.  Only the most recently staged layout is reachable via
+    // id_to_key_ (last writer wins), so a single combined condition cannot
+    // distinguish "is_cached does not know this layout" from "the second
+    // staging displaced the first".
+    const bool cached_soa = cache.is_cached(key, GGML_LAYOUT_SOA);
+    const bool cached_i8  = cache.is_cached(key, GGML_LAYOUT_MXFP4_I8);
+    if (!cached_soa || !cached_i8) {
+        fprintf(stderr, "Expected both SOA and MXFP4_I8 entries to be cached before drop (SOA=%d MXFP4_I8=%d)\n",
+                (int) cached_soa, (int) cached_i8);
         return false;
     }
-    if (!cache.lookup_device_only(key, GGML_LAYOUT_SOA) || !cache.lookup_device_only(key, GGML_LAYOUT_MXFP4_I8)) {
-        fprintf(stderr, "Expected exact-layout device lookups for both cached layouts\n");
+    // Drive IN_PROGRESS -> READY for both layouts before asserting on the
+    // device-only lookups.  direct_stage_expert() publishes its entry as
+    // IN_PROGRESS carrying a ready_event; waiting that event does NOT by itself
+    // flip the state, because every read-only accessor holds a shared_lock and
+    // so cannot mutate the entry.  cache.get() is the accessor that performs
+    // the transition — production's MoE path does the equivalent via
+    // acquire_entry_lease() on the same MOE_EXPERT key.  This is the convention
+    // already documented in ggml/src/ggml-sycl/tests/test-mem-handle-eviction.cpp.
+    (void) cache.get(key, GGML_LAYOUT_SOA);
+    (void) cache.get(key, GGML_LAYOUT_MXFP4_I8);
+
+    const bool dev_soa = cache.lookup_device_only(key, GGML_LAYOUT_SOA) != nullptr;
+    const bool dev_i8  = cache.lookup_device_only(key, GGML_LAYOUT_MXFP4_I8) != nullptr;
+    if (!dev_soa || !dev_i8) {
+        fprintf(stderr, "Expected exact-layout device lookups for both cached layouts (SOA=%d MXFP4_I8=%d)\n",
+                (int) dev_soa, (int) dev_i8);
         return false;
     }
     if (!cache.validate()) {
@@ -262,6 +284,9 @@ static bool test_multi_layout_id_mapping_survives_drop(sycl::queue & q) {
         return false;
     }
     i8.event.wait();
+    // Restaging publishes a fresh IN_PROGRESS entry; drive it READY as above so
+    // the lookup_device_only() check below tests reachability, not staging state.
+    (void) cache.get(key, GGML_LAYOUT_MXFP4_I8);
 
     const size_t dropped_soa =
         cache.drop_expert_entries_for_tensor_layout({ key }, GGML_LAYOUT_SOA, "unit-test-drop-soa");
@@ -848,6 +873,86 @@ static bool test_direct_stage_weight_lookup_miss(sycl::queue & q) {
     return true;
 }
 
+// CONTROL for llama.cpp-5pvn.  Pins WHICH lookup path is_cached() is missing,
+// by contrasting three cases that differ only in the entry's cache_entry_type
+// and in how many layouts share one identity:
+//
+//   (a) dense weight, one layout  — hits the DENSE_WEIGHT direct-stage key
+//                                   is_cached() builds directly.
+//   (b) expert, one layout        — misses that key (the entry is MOE_EXPERT),
+//                                   but the single id_to_key_ mapping still
+//                                   points at it, so it resolves anyway.
+//   (c) expert, two layouts       — id_to_key_ points at the LAST staged layout
+//                                   only, and there is no MOE_EXPERT
+//                                   direct-stage probe to recover the first.
+//
+// The competing model — "is_cached() is simply broken for direct-staged
+// entries" — predicts (a) and (b) fail as well.  This test is written so that
+// such a model would show up as a failure here, not as three green checks.
+static bool test_is_cached_layout_coverage(sycl::queue & q) {
+    printf("\n=== Test: is_cached layout/type coverage ===\n");
+
+    std::vector<uint8_t> data(128, 0x3c);
+
+    bool dense_one_layout = false;
+    {
+        ggml_sycl::unified_cache cache(q, 64 * 1024);
+        ggml_sycl_cache_id       key = ggml_sycl::test_make_cache_id(data.data());
+        key.aux_id                   = 91;
+        auto r = cache.direct_stage_weight(key, data.data(), data.size(), data.size(), GGML_LAYOUT_SOA, nullptr,
+                                           nullptr, &q);
+        if (!r.ok || !r.ptr) {
+            fprintf(stderr, "direct_stage_weight failed in is_cached coverage control\n");
+            return false;
+        }
+        r.event.wait();
+        dense_one_layout = cache.is_cached(key, GGML_LAYOUT_SOA);
+    }
+
+    bool expert_one_layout = false;
+    {
+        ggml_sycl::unified_cache cache(q, 64 * 1024);
+        ggml_sycl_cache_id       key = ggml_sycl::test_make_cache_id(data.data());
+        key.aux_id                   = 92;
+        auto r = cache.direct_stage_expert(key, data.data(), data.size(), data.size(), GGML_LAYOUT_SOA, nullptr,
+                                           nullptr, &q);
+        if (!r.ok || !r.ptr) {
+            fprintf(stderr, "direct_stage_expert failed in is_cached coverage control\n");
+            return false;
+        }
+        r.event.wait();
+        expert_one_layout = cache.is_cached(key, GGML_LAYOUT_SOA);
+    }
+
+    bool expert_first_of_two = false;
+    {
+        ggml_sycl::unified_cache cache(q, 64 * 1024);
+        ggml_sycl_cache_id       key = ggml_sycl::test_make_cache_id(data.data());
+        key.aux_id                   = 93;
+        auto first  = cache.direct_stage_expert(key, data.data(), data.size(), data.size(), GGML_LAYOUT_SOA, nullptr,
+                                                nullptr, &q);
+        auto second = cache.direct_stage_expert(key, data.data(), data.size(), data.size(), GGML_LAYOUT_MXFP4_I8,
+                                                nullptr, nullptr, &q);
+        if (!first.ok || !second.ok) {
+            fprintf(stderr, "two-layout direct_stage_expert failed in is_cached coverage control\n");
+            return false;
+        }
+        first.event.wait();
+        second.event.wait();
+        expert_first_of_two = cache.is_cached(key, GGML_LAYOUT_SOA);
+    }
+
+    printf("  dense/1-layout=%d expert/1-layout=%d expert/first-of-2=%d\n", (int) dense_one_layout,
+           (int) expert_one_layout, (int) expert_first_of_two);
+
+    if (!dense_one_layout || !expert_one_layout || !expert_first_of_two) {
+        fprintf(stderr, "is_cached() failed to see a staged entry (dense/1=%d expert/1=%d expert/first-of-2=%d)\n",
+                (int) dense_one_layout, (int) expert_one_layout, (int) expert_first_of_two);
+        return false;
+    }
+    return true;
+}
+
 int main() {
     if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
         setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
@@ -867,6 +972,7 @@ int main() {
     ok &= test_realloc_eviction_failure_keeps_entry(q);
     ok &= test_direct_stage_weight_basic(q);
     ok &= test_direct_stage_expert_basic(q);
+    ok &= test_is_cached_layout_coverage(q);
     ok &= test_multi_layout_id_mapping_survives_drop(q);
     ok &= test_planned_materialization_guard(q);
     ok &= test_graph_pins_host_weights();

@@ -136,6 +136,98 @@ static bool test_direct_handle_stable_across_bumps() {
 }
 
 // =============================================================================
+// Test 1b: CONTROL for llama.cpp-gzea.  get_weight_ptr() must resolve an entry
+// that direct_stage_weight() published, at the SAME 16 MB budget test 2 uses.
+//
+// This exists to discriminate between two competing explanations of the
+// get_weight_ptr() miss in test 2:
+//
+//   (H1) key space — get_weight_ptr() probes only make_direct_stage_key()
+//        keys, while ensure_cached() files the entry under the plain
+//        {type, id, layer_id, expert_id} key reachable via id_to_key_.
+//   (H2) allocation class — get_weight_ptr() resolves only arena-backed
+//        entries, and the VRAM arena declines to reserve at a 16 MB budget
+//        (it logs "falling back to per-entry allocation").
+//
+// The budget here is identical to test 2's, so the arena declines identically;
+// the only thing that differs is WHICH key the writer files the entry under.
+// H1 predicts this test passes.  H2 predicts it fails.  It is deliberately
+// written so that a passing run refutes H2 rather than confirming H1.
+// =============================================================================
+static bool test_get_weight_ptr_resolves_direct_staged_entry(sycl::queue & q) {
+    TEST_BEGIN("get_weight_ptr_resolves_direct_staged_entry");
+
+    constexpr size_t         entry_bytes = 4 * 1024;
+    constexpr size_t         budget      = 16 * 1024 * 1024;  // same as test 2
+    ggml_sycl::unified_cache cache(q, budget);
+
+    void * src_host = sycl::malloc_host(entry_bytes, q);
+    TEST_ASSERT(src_host != nullptr, "malloc_host for src should succeed");
+    std::memset(src_host, 0x7E, entry_bytes);
+    ggml_sycl_cache_id key = make_test_cache_id(700, 1, entry_bytes);
+
+    auto staged =
+        cache.direct_stage_weight(key, src_host, entry_bytes, entry_bytes, GGML_LAYOUT_AOS, nullptr, nullptr, &q);
+    TEST_ASSERT(staged.ok && staged.ptr, "direct_stage_weight should succeed");
+    staged.event.wait();
+    // Same READY-driving step test 2 performs: get_weight_ptr() holds only a
+    // shared_lock and so cannot flip IN_PROGRESS -> READY itself.
+    void * drove = cache.get(key, GGML_LAYOUT_AOS);
+    TEST_ASSERT(drove == staged.ptr, "cache.get() should return the direct-staged ptr");
+
+    auto resolved = cache.get_weight_ptr(key);
+    TEST_ASSERT(static_cast<bool>(resolved), "get_weight_ptr must resolve a direct_stage_weight entry at 16 MB budget");
+    TEST_ASSERT(resolved.ptr == staged.ptr, "resolved ptr must match direct_stage_weight's");
+
+    sycl::free(src_host, q);
+    TEST_PASS();
+    return true;
+}
+
+// =============================================================================
+// Test 1c: get_weight_ptr() and acquire_weight_lease() must resolve the same
+// key space.  The lease variant is the refcount-safe entry point used by
+// mem_handle::resolve_slow(), so a narrower key space there means an OWNING
+// handle fails to resolve a weight that the non-owning accessor returns —
+// llama.cpp-gzea one level down, on the ownership path.
+// =============================================================================
+static bool test_lease_and_plain_lookup_agree(sycl::queue & q) {
+    TEST_BEGIN("lease_and_plain_lookup_agree");
+
+    constexpr size_t         entry_bytes = 4 * 1024;
+    constexpr size_t         budget      = 16 * 1024 * 1024;
+    ggml_sycl::unified_cache cache(q, budget);
+
+    void * src_host = sycl::malloc_host(entry_bytes, q);
+    TEST_ASSERT(src_host != nullptr, "malloc_host for src should succeed");
+    std::memset(src_host, 0x2D, entry_bytes);
+    ggml_sycl_cache_id key = make_test_cache_id(800, 1, entry_bytes);
+
+    void * ptr = cache.ensure_cached(key, src_host, entry_bytes, ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1,
+                                     GGML_LAYOUT_AOS, false);
+    TEST_ASSERT(ptr != nullptr, "ensure_cached should succeed");
+    q.wait();
+    (void) cache.get(key, GGML_LAYOUT_AOS);  // drive state → READY
+
+    auto plain = cache.get_weight_ptr(key);
+    TEST_ASSERT(static_cast<bool>(plain), "get_weight_ptr must resolve an ensure_cached entry");
+
+    auto lease = cache.acquire_weight_lease(key);
+    TEST_ASSERT(lease.ptr != nullptr, "acquire_weight_lease must resolve whatever get_weight_ptr resolves");
+    TEST_ASSERT(lease.ptr == plain.ptr, "lease and plain lookup must agree on the pointer");
+    TEST_ASSERT(lease.entry != nullptr, "a successful lease must carry the entry to release against");
+
+    // Release exactly once, per the contract documented on the declaration in
+    // unified-cache.hpp.  Holding it would block the eviction the other tests
+    // in this binary rely on.
+    lease.entry->in_use_count.fetch_sub(1);
+
+    sycl::free(src_host, q);
+    TEST_PASS();
+    return true;
+}
+
+// =============================================================================
 // Test 2: Explicit eviction removes the entry and bumps generation.
 //
 // Uses a budget large enough to avoid arena-minimum shenanigans, inserts two
@@ -164,6 +256,12 @@ static bool test_explicit_evict_bumps_gen_and_removes_entry(sycl::queue & q) {
     q.wait();
     void * drove_a = cache.get(key_a, GGML_LAYOUT_AOS);
     TEST_ASSERT(drove_a == ptr_a, "cache.get() should return the same ptr after event completes");
+
+    // Sibling accessors that DO consult id_to_key_ must agree with get().  If
+    // these hold while get_weight_ptr() below does not, the disagreement is a
+    // key-space gap in get_weight_ptr, not a property of the entry itself.
+    TEST_ASSERT(cache.is_cached(key_a, GGML_LAYOUT_AOS), "is_cached(A, AOS) must agree with get()");
+    TEST_ASSERT(cache.is_cached_any(key_a), "is_cached_any(A) must agree with get()");
 
     // Sanity: A is resolvable before eviction.
     auto result_a_before = cache.get_weight_ptr(key_a);
@@ -213,6 +311,13 @@ static bool test_reinsert_after_evict_recovers_lookup(sycl::queue & q) {
                                -1, -1, GGML_LAYOUT_AOS, false);
     q.wait();
     (void) cache.get(key_a, GGML_LAYOUT_AOS);  // drive state → READY
+
+    // Positive precondition.  Without it the "A should be evicted" assertion
+    // below passes whenever get_weight_ptr() resolves NOTHING — it would then
+    // be certifying llama.cpp-gzea as the expected behaviour rather than
+    // catching it.  Asserting resolvable-then-unresolvable makes the pair fail
+    // both when the accessor is blind and when it is over-permissive.
+    TEST_ASSERT(cache.get_weight_ptr(key_a), "A must be resolvable before it is evicted");
 
     (void) cache.evict(entry_bytes * 2);
     const uint64_t gen_after_evict = ggml_sycl::cache_generation();
@@ -269,6 +374,14 @@ static bool test_async_eviction_finalize_bumps_gen(sycl::queue & q) {
     q.wait();
     (void) cache.get(key_a, GGML_LAYOUT_SOA);  // drive state → READY
 
+    // Positive precondition — see the identical note in test 3.  The
+    // "A must be unreachable after evict + finalize" assertion at the end of
+    // this test passed for the wrong reason while llama.cpp-gzea was open:
+    // get_weight_ptr() could not resolve this entry at any point, so the
+    // post-eviction check was vacuously true and the test stayed green
+    // throughout the defect it was meant to cover.
+    TEST_ASSERT(cache.get_weight_ptr(key_a), "A must be resolvable before evict + finalize");
+
     const uint64_t gen_before = ggml_sycl::cache_generation();
 
     // Evict.  SOA layout is the qualifying condition for async_evict in evict_one
@@ -324,6 +437,8 @@ int main(int argc, char ** argv) {
 
     bool all_passed = true;
     all_passed &= test_direct_handle_stable_across_bumps();
+    all_passed &= test_get_weight_ptr_resolves_direct_staged_entry(q);
+    all_passed &= test_lease_and_plain_lookup_agree(q);
     all_passed &= test_explicit_evict_bumps_gen_and_removes_entry(q);
     all_passed &= test_reinsert_after_evict_recovers_lookup(q);
     all_passed &= test_async_eviction_finalize_bumps_gen(q);
