@@ -4585,12 +4585,18 @@ void * unified_cache::get(const ggml_sycl_cache_id & key_id, ggml_layout_mode la
     auto                    entry_it   = entries_.find(direct_key);
     if (entry_it == entries_.end()) {
         // Probe the MOE_EXPERT direct-stage key too, as lookup_device_only()
-        // does.  This matters more here than anywhere else: get() is the
-        // accessor that drives IN_PROGRESS -> READY, and every read-only
-        // accessor holds a shared_lock and so cannot.  Without this probe an
-        // expert layout that direct_stage_expert() staged before some later
-        // layout was reachable through no transitioning accessor at all, so it
-        // could never leave IN_PROGRESS and every device lookup of it failed
+        // does.  This matters more here than anywhere else: get() is one of
+        // only two accessors that drive IN_PROGRESS -> READY (the other is
+        // acquire_entry_lease(), which takes the unique lock itself); every
+        // read-only accessor holds a shared_lock and so cannot transition.
+        // acquire_entry_lease() is exact-match, so reaching an expert entry
+        // through it requires already holding that entry's MOE_EXPERT key --
+        // which the MoE materialization path does have (see the mirror_key
+        // built for it around the acquire_entry_lease call in this file), but
+        // which a caller holding only a ggml_sycl_cache_id does not.  For such
+        // a caller, get() was the only route, and without this probe an expert
+        // layout staged before some later layout could not be reached by it,
+        // so it never left IN_PROGRESS and every device lookup of it failed
         // even once its ready_event had completed (llama.cpp-5pvn).
         entry_it = entries_.find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, key_id, layout));
     }
@@ -5560,7 +5566,40 @@ unified_cache::weight_ptr_result unified_cache::get_weight_ptr(const ggml_sycl_c
 // Lease-acquiring variant of get_weight_ptr — bumps in_use_count on the resolved
 // canonical entry while holding shared_lock.  Eviction paths take the unique
 // lock (writer), so the increment is safely visible to a subsequent eviction
-// scan.  Caller (mem_handle) MUST release via entry->in_use_count.fetch_sub(1).
+// scan.  Caller MUST release via entry->in_use_count.fetch_sub(1).
+//
+// ---------------------------------------------------------------------------
+// WHO CALLS THIS, and the gap it does NOT close.  Read before assuming the
+// mem_handle ownership path shares this function's key coverage — it does not.
+//
+// Callers of acquire_weight_lease(), repo-wide, are exactly two, both on the
+// DNNL host-pointer path: cpu-dispatch.cpp:2620 and :2657.
+//
+// mem_handle::resolve_slow() does NOT come through here.  It calls
+// acquire_entry_lease(key_) directly (mem-handle.cpp:476), and that primitive
+// is a plain exact-match `entries_.find(key)` with NO id_to_key_ fallback and
+// no layout sweep.  So the id_to_key_ fallback added below (llama.cpp-gzea)
+// does not reach resolve_slow(), and therefore does not reach
+// layer_weight_handles::from_weight_set() — the path every ordinary per-layer
+// weight uses (q/k/v/o proj, gate/up/down proj; mem-handle.cpp:921-941).
+//
+// That leaves a LATENT gap.  ensure_cached() files its entry under
+// {type, id, layer_id, expert_id}.  If it is ever called with real layer/expert
+// ids for a weight that a mem_handle tracks, resolve_slow() will look up the
+// handle's key_ — which mem_handle::from_cache_id() hardcodes to
+// {DENSE_WEIGHT, id, -1, -1} (mem-handle.cpp:230-237) — miss the entry filed
+// under {.., layer, expert}, and report the weight unresolvable while get()
+// and is_cached() still find it.  That is precisely the llama.cpp-gzea
+// symptom, reproduced on the ownership path.
+//
+// It is unreachable TODAY only because the sole production ensure_cached()
+// call site (ggml-sycl.cpp:84658) passes layer_id=-1, expert_id=-1, an exact
+// match for the key from_cache_id() builds.  That call site's -1, -1 is what
+// makes this safe — changing it, or adding a second call site that passes real
+// ids, is what would make it unsafe.  Fixing it properly means giving
+// resolve_slow() the same id_to_key_ fallback, which is a change to
+// mem-handle.cpp and was out of scope for the commit that added this note.
+// ---------------------------------------------------------------------------
 unified_cache::weight_ptr_lease_result unified_cache::acquire_weight_lease(const ggml_sycl_cache_id & key) {
     static const ggml_layout_mode try_layouts[] = { GGML_LAYOUT_COALESCED, GGML_LAYOUT_SOA, GGML_LAYOUT_AOS };
     for (auto layout : try_layouts) {
