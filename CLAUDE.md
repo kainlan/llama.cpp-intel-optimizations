@@ -507,6 +507,26 @@ Confirmed lessons from prior work on this fork. Treat them as defaults.
   for `Shmem < 30 GB` **and** `MemAvailable > 150 GB`; if it has not settled in ~10 minutes,
   release the lock and escalate rather than proceeding or holding it while you wait.
 
+  ⚠️ **THE CAUSE IS NOW KNOWN, AND THERE IS A ONE-LINE MITIGATION** (`llama.cpp-403s`,
+  2026-08-01). It is not model size and not concurrency — it is the **iGPU**, which reports
+  231.7 GB of "VRAM" that is actually system RAM, against a budget defaulting to 100 % (see
+  the VRAM-budget entry under Architecture). Every binary in the list below enumerates all
+  devices because none of them pins a selector.
+
+  **Pinning the selector to the discrete cards holds `Shmem` flat.** Measured on a full model
+  load: `level_zero:0` → 2.4 GB, `level_zero:0,1` → 2.4 GB, unset → 127.8 GB.
+
+  ```bash
+  # Prefer this for ANY local test run that does not specifically need the iGPU:
+  ONEAPI_DEVICE_SELECTOR=level_zero:0,1 ctest --test-dir build -R '<name>' --output-on-failure
+  ```
+
+  ⚠️ **This mitigation is verified for `llama-completion`. It is NOT yet verified for
+  `test-llama-archs` or `test-thread-safety`** — the mechanism is near-certainly the same
+  (neither pins a selector), but that has not been measured. **Do not relax the never-loop
+  rule for any binary on the strength of this note.** The rule below stands until someone
+  measures the specific binary with the selector pinned.
+
   Known members (**not** an exhaustive list — apply the property):
   - **`test-backend-ops`** — never in a subagent or background task. Hundreds of GPU BOs, TTM
     shmem 50–224 GB, two hangs on 2026-04-06. Run manually, with monitoring, only.
@@ -533,7 +553,10 @@ Confirmed lessons from prior work on this fork. Treat them as defaults.
 - **The unified cache owns all GPU/host memory** (decision Feb 9, 2026). Weight placement, eviction (device→pinned host→mmap), and budget tracking all flow through it.
 - **Use smart handles, never hold a raw `void*` from the cache.** A raw VRAM pointer becomes dangling the moment the cache evicts to host → DEVICE_LOST errors or corrupted results. Handles must resolve location on dereference so the cache can move data between tiers transparently.
 - **Host-resident weights → CPU dispatch, not GPU PCIe "zero-copy."** Measured CPU AOS = 18–30 GB/s vs GPU zero-copy = 11.3 GB/s (1.6–2.6x slower). Parallelize CPU work with GPU via `sycl::depends_on` (~9.7 µs cross-device latency). Never feed a host-pinned pointer to a GPU kernel as "zero-copy."
-- **The VRAM budget calc is correct by design** (`min(total*pct, free_at_init)`). Low free VRAM is a system problem (other GPUs active, driver overhead), not an app bug to "fix" by ignoring free VRAM — fix the root cause at the system level.
+- **The VRAM budget calc is correct by design for DISCRETE cards** (`min(total*pct, free_at_init)`). Low free VRAM is a system problem (other GPUs active, driver overhead), not an app bug to "fix" by ignoring free VRAM — fix the root cause at the system level.
+  ⚠️ **It is catastrophically wrong for an INTEGRATED GPU, and that is the cause of this host's OOM history** (`llama.cpp-403s`, measured 2026-08-01). The Arrow Lake-S iGPU reports `global_mem_size` = **231.7 GB** — 94 % of the host's 246.9 GB — because for an integrated GPU "VRAM" *is* system RAM. `ggml-sycl.cpp:10043-10049` feeds that into the same budget path as a discrete card at a **default of 100 %**, and neither `ggml-sycl.cpp` nor `unified-cache.cpp` contains a single occurrence of `host_unified` or `is_integrated`. So the backend claims the machine.
+  Isolated with one variable — same 19 MB model, same single-threaded `llama-completion`, only the selector changed: `level_zero:0` → peak `Shmem` **2.4 GB**; `level_zero:0,1` → **2.4 GB**; selector unset (adds the iGPU) → **127.8 GB**.
+  For an integrated device, "free VRAM" and "free host RAM" are the same pool, so taking 100 % of it is not a conservative reading of available memory — it is claiming memory the host needs. `sycl::info::device::host_unified_memory` is queryable and `caps.global_mem_size` is already captured at `common.cpp:716`; the information is present and simply never consulted.
 - **Small-block dequant (Q4_0/Q8_0/Q4_K) belongs on standard SYCL, not ESIMD.** ESIMD measured 1.9x SLOWER on Arc B580 + oneAPI 2025.3 (block granularity too small to amortize LSC loads). The real dequant lever is structural — fuse dequant into the matmul. Opt-in retest hatch: `GGML_SYCL_ESIMD_DEQUANT=1`.
 
 > Live debugging state (active bug investigations, bisect results, perf-regression hunts) lives in the **codescout task tracker** (`task_ready`, `task_list`), not here. This section is for settled rules only.
