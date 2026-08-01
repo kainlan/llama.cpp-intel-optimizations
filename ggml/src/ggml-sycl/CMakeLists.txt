@@ -1356,6 +1356,49 @@ set_tests_properties(sycl-layout-choice PROPERTIES
     TIMEOUT 180
 )
 
+# Test: mem_handle::resolve() is a MUTATING operation on shared state
+# (llama.cpp-c48l).  extra->data_handle[dev] is resolved concurrently by every
+# context thread of a model, so a handle that publishes cached_/leased_entry_
+# without synchronisation corrupts a sycl::event refcount and double-releases a
+# cache-entry lease -- observed as a SIGSEGV inside resolve() itself.
+#
+# CPU-only by construction: it builds DIRECT/WEIGHT handles by hand and never
+# touches a device, a queue, or the unified cache.  It is therefore registered
+# OUTSIDE the _residency_test loop below, whose "cache;residency;mem-handle"
+# labels are exactly what CLAUDE.md's throttled sweep excludes
+# (-LE 'residency|mem-handle|cache').  Putting a GPU-free test behind that
+# filter would hide it from the sweep it belongs in; the labels here
+# deliberately avoid every word in that pattern.
+set(MEM_HANDLE_CONCURRENCY_TEST_SYCL_OPTIONS
+    "-fsycl"
+    "-Wno-narrowing"
+)
+add_executable(test-sycl-mem-handle-concurrent-resolve
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-mem-handle-concurrent-resolve.cpp
+)
+target_include_directories(test-sycl-mem-handle-concurrent-resolve PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-mem-handle-concurrent-resolve PRIVATE ${MEM_HANDLE_CONCURRENCY_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-mem-handle-concurrent-resolve PRIVATE ${MEM_HANDLE_CONCURRENCY_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-mem-handle-concurrent-resolve PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-mem-handle-concurrent-resolve PRIVATE ggml-base ggml ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-mem-handle-concurrent-resolve PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-mem-handle-concurrent-resolve COMMAND test-sycl-mem-handle-concurrent-resolve)
+set_tests_properties(test-sycl-mem-handle-concurrent-resolve PROPERTIES
+    LABELS "sycl;handle;concurrency;tdd"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
 set(RESIDENCY_TEST_SYCL_OPTIONS
     "-fsycl"
     "-Wno-narrowing"

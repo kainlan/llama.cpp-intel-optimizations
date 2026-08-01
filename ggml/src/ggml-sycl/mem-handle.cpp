@@ -375,11 +375,13 @@ mem_handle mem_handle::slice(size_t byte_offset, size_t byte_size) const {
 }
 
 void mem_handle::set_ready_event(const sycl::event & event) {
+    mem_handle_lock_guard g(lock_);
     cached_.has_ready_event = true;
     cached_.ready_event     = event;
 }
 
 void mem_handle::clear_ready_event() {
+    mem_handle_lock_guard g(lock_);
     cached_.has_ready_event = false;
     cached_.ready_event     = {};
 }
@@ -387,27 +389,39 @@ void mem_handle::clear_ready_event() {
 // === resolve ===
 
 resolved_ptr mem_handle::resolve() const {
-    // DIRECT and CHUNK_LEASE handles are never stale — they wrap a raw
-    // pointer that is kept alive by either the caller's lifetime (DIRECT)
-    // or by the chunk lease refcount (CHUNK_LEASE, dyhdl).
-    if (kind_ == mem_handle_kind::DIRECT || kind_ == mem_handle_kind::CHUNK_LEASE) {
-        return cached_;
-    }
+    // Fast path under the handle lock.  The copy of `cached_` made here is what
+    // used to race: resolved_ptr carries a sycl::event, i.e. a shared_ptr, so a
+    // concurrent resolve_slow() rewriting cached_ turned this copy into a
+    // refcount operation on a freed control block — a SIGSEGV inside resolve()
+    // itself, which is exactly where llama.cpp-c48l lands.  The lock is dropped
+    // before any slow path so it is never held across a unified_cache call.
+    {
+        mem_handle_lock_guard g(lock_);
 
-    // Arena handles: check arena generation, then resolve base + offset.
-    if (kind_ >= mem_handle_kind::ARENA_RUNTIME && kind_ <= mem_handle_kind::ARENA_ONEDNN) {
-        // If we have a cached pointer and the generation hasn't changed,
-        // return immediately.
-        if (cached_.ptr != nullptr && gen_ == arena_gen_) {
+        // DIRECT and CHUNK_LEASE handles are never stale — they wrap a raw
+        // pointer that is kept alive by either the caller's lifetime (DIRECT)
+        // or by the chunk lease refcount (CHUNK_LEASE, dyhdl).
+        if (kind_ == mem_handle_kind::DIRECT || kind_ == mem_handle_kind::CHUNK_LEASE) {
             return cached_;
         }
-        return resolve_arena();
+
+        // Arena handles: check arena generation, then resolve base + offset.
+        if (kind_ >= mem_handle_kind::ARENA_RUNTIME && kind_ <= mem_handle_kind::ARENA_ONEDNN) {
+            // If we have a cached pointer and the generation hasn't changed,
+            // return immediately.
+            if (cached_.ptr != nullptr && gen_ == arena_gen_) {
+                return cached_;
+            }
+        } else {
+            // WEIGHT handle: compare cached generation against global.
+            if (gen_ == cache_generation() && cached_.ptr != nullptr) {
+                return cached_;
+            }
+        }
     }
 
-    // WEIGHT handle: compare cached generation against global.
-    const uint64_t current_gen = cache_generation();
-    if (gen_ == current_gen && cached_.ptr != nullptr) {
-        return cached_;
+    if (kind_ >= mem_handle_kind::ARENA_RUNTIME && kind_ <= mem_handle_kind::ARENA_ONEDNN) {
+        return resolve_arena();
     }
 
     return resolve_slow();
@@ -447,10 +461,26 @@ resolved_ptr mem_handle::resolve(int device_id) const {
 // entry instance, and leak tracking breaks.
 
 resolved_ptr mem_handle::resolve_slow() const {
+    // Two threads resolving the SAME shared handle both land here (a generation
+    // bump invalidates every handle at once).  The old code released the lease
+    // in place before re-acquiring, so both threads decremented the one lease
+    // that was held: in_use_count fell below the number of live references and
+    // the evictor was free to free an entry still in use.
+    //
+    // Instead: detach the current lease under the lock, acquire a fresh one
+    // OUTSIDE the lock, then publish.  Each thread releases exactly what it
+    // detached, so every acquire is matched by exactly one release and a
+    // resolve that loses the publish race releases its own lease rather than
+    // leaking it.
     if (!valid_cache_device_id(device_)) {
-        cached_       = {};
-        gen_          = cache_generation();
-        leased_entry_ = nullptr;
+        lease_state stale;
+        {
+            mem_handle_lock_guard g(lock_);
+            stale   = take_lease_state_locked();
+            cached_ = {};
+            gen_    = cache_generation();
+        }
+        release_lease_state(stale);
         return {};
     }
 
@@ -459,59 +489,117 @@ resolved_ptr mem_handle::resolve_slow() const {
         return {};
     }
 
-    // Release any prior lease on the old entry — after an eviction, the old
-    // entry is already gone from entries_, but our leased_entry_ pointer
-    // would be dangling (the evictor wouldn't have erased it because we held
-    // the lease; but on regen-bump-by-different-reason — e.g. promote_to_device —
-    // the old entry could legitimately be gone).  Releasing is safe: we
-    // decrement and then forget the pointer.  If the pointer is stale, the
-    // fetch_sub still operates on a valid atomic (our lease kept the entry
-    // alive), and subsequent eviction will see count=0 and erase it.
-    //
-    // release_lease is idempotent and handles the nullptr case.
-    const_cast<mem_handle *>(this)->release_lease();
-
     // Acquire under shared_lock; visible to any future evictor via acq_rel
-    // ordering on the in_use_count atomic.
+    // ordering on the in_use_count atomic.  Done with the handle lock dropped:
+    // the handle lock must never be held across a unified_cache call.
     auto result = cache->acquire_entry_lease(key_);
     if (!result) {
         // No cache hit; leave handle unpinned.
-        cached_       = {};
-        gen_          = cache_generation();
-        leased_entry_ = nullptr;
+        lease_state stale;
+        {
+            mem_handle_lock_guard g(lock_);
+            stale   = take_lease_state_locked();
+            cached_ = {};
+            gen_    = cache_generation();
+        }
+        release_lease_state(stale);
         return {};
     }
 
-    cached_ = { result.ptr, result.layout, result.on_device };
+    resolved_ptr resolved = { result.ptr, result.layout, result.on_device };
     if (result.has_ready_event) {
-        cached_.has_ready_event = true;
-        cached_.ready_event     = result.ready_event;
+        resolved.has_ready_event = true;
+        resolved.ready_event     = result.ready_event;
     }
-    gen_          = cache_generation();
-    leased_entry_ = result.entry;  // may be nullptr for S1-PRELOAD direct entries
+
+    lease_state fresh;
+    fresh.entry = result.entry;  // may be nullptr for S1-PRELOAD direct entries
 
     // llama.cpp-dyhdl: also pin the underlying arena chunk.  Belt + suspenders
     // alongside the cache_entry lease: entry refcount prevents cache-layer
     // eviction, chunk refcount prevents arena-layer munmap.  If the resolved
     // ptr is not in any known arena (e.g. mmap-backed S1-PRELOAD direct
-    // entries), chunk_source_ stays 0 and dtor is a no-op.
-    const int vram_idx = cache->arena_acquire_chunk_lease(cached_.ptr);
+    // entries), chunk_source stays 0 and release is a no-op.
+    const int vram_idx = cache->arena_acquire_chunk_lease(resolved.ptr);
     if (vram_idx >= 0) {
-        chunk_source_      = 2;
-        chunk_device_      = device_;
-        vram_chunk_idx_    = vram_idx;
-        host_chunk_handle_ = UINT64_MAX;
+        fresh.chunk_source      = 2;
+        fresh.chunk_device      = device_;
+        fresh.vram_chunk_idx    = vram_idx;
+        fresh.host_chunk_handle = UINT64_MAX;
     } else {
-        const uint64_t host_handle = cache->host_acquire_chunk_lease(cached_.ptr);
+        const uint64_t host_handle = cache->host_acquire_chunk_lease(resolved.ptr);
         if (host_handle != pinned_chunk_pool::INVALID_CHUNK_HANDLE) {
-            chunk_source_      = 1;
-            chunk_device_      = device_;
-            host_chunk_handle_ = host_handle;
-            vram_chunk_idx_    = -1;
+            fresh.chunk_source      = 1;
+            fresh.chunk_device      = device_;
+            fresh.host_chunk_handle = host_handle;
+            fresh.vram_chunk_idx    = -1;
         }
     }
 
-    return cached_;
+    lease_state stale;
+    {
+        mem_handle_lock_guard g(lock_);
+        stale = take_lease_state_locked();
+        store_lease_state_locked(fresh);
+        cached_ = resolved;
+        gen_    = cache_generation();
+    }
+    release_lease_state(stale);
+
+    return resolved;
+}
+
+// === lease_state helpers ===
+
+mem_handle::lease_state mem_handle::take_lease_state_locked() const {
+    lease_state state;
+    state.entry             = leased_entry_;
+    state.chunk_source      = chunk_source_;
+    state.host_chunk_handle = host_chunk_handle_;
+    state.vram_chunk_idx    = vram_chunk_idx_;
+    state.chunk_device      = chunk_device_;
+
+    leased_entry_      = nullptr;
+    chunk_source_      = 0;
+    host_chunk_handle_ = UINT64_MAX;  // pinned_chunk_pool::INVALID_CHUNK_HANDLE
+    vram_chunk_idx_    = -1;
+    chunk_device_      = -1;
+
+    return state;
+}
+
+void mem_handle::store_lease_state_locked(const lease_state & state) const {
+    leased_entry_      = state.entry;
+    chunk_source_      = state.chunk_source;
+    host_chunk_handle_ = state.host_chunk_handle;
+    vram_chunk_idx_    = state.vram_chunk_idx;
+    chunk_device_      = state.chunk_device;
+}
+
+void mem_handle::release_lease_state(const lease_state & state) noexcept {
+    if (state.entry) {
+        // fetch_sub on copyable_atomic_u32::v.  The entry is guaranteed to
+        // still exist (this lease held it); after this decrement the entry
+        // may be evicted, but we never dereference the pointer again.
+        state.entry->in_use_count.fetch_sub(1);
+    }
+
+    // llama.cpp-dyhdl: release chunk-level lease if held.  Chunk leases are
+    // orthogonal to cache_entry leases — a WEIGHT handle may hold both
+    // (cache_entry + its backing arena chunk), a CHUNK_LEASE handle holds
+    // only the chunk.
+    if (state.chunk_source != 0 && state.chunk_device >= 0) {
+        unified_cache * cache = valid_cache_device_id(state.chunk_device) ?
+                                    get_existing_unified_cache_for_device(state.chunk_device) :
+                                    nullptr;
+        if (cache) {
+            if (state.chunk_source == 1) {
+                cache->host_release_chunk_lease(state.host_chunk_handle);
+            } else if (state.chunk_source == 2) {
+                cache->arena_release_chunk_lease(state.vram_chunk_idx);
+            }
+        }
+    }
 }
 
 // === release_lease ===
@@ -520,33 +608,17 @@ resolved_ptr mem_handle::resolve_slow() const {
 // leased_entry_ is nulled so the dtor / next release is idempotent.
 
 void mem_handle::release_lease() noexcept {
-    if (leased_entry_) {
-        // fetch_sub on copyable_atomic_u32::v.  The entry is guaranteed to
-        // still exist (our lease held it); after this decrement the entry
-        // may be evicted, but we never dereference the pointer again.
-        leased_entry_->in_use_count.fetch_sub(1);
-        leased_entry_ = nullptr;
+    // Detach under the lock, release outside it: release_lease_state() calls
+    // into unified_cache, and the handle lock must never be held across such a
+    // call.  Detaching first also makes concurrent releases exactly-once —
+    // whichever caller wins the swap owns the decrement, the loser sees a null
+    // state and does nothing.
+    lease_state state;
+    {
+        mem_handle_lock_guard g(lock_);
+        state = take_lease_state_locked();
     }
-
-    // llama.cpp-dyhdl: release chunk-level lease if held.  Chunk leases are
-    // orthogonal to cache_entry leases — a WEIGHT handle may hold both
-    // (cache_entry + its backing arena chunk), a CHUNK_LEASE handle holds
-    // only the chunk.
-    if (chunk_source_ != 0 && chunk_device_ >= 0) {
-        unified_cache * cache =
-            valid_cache_device_id(chunk_device_) ? get_existing_unified_cache_for_device(chunk_device_) : nullptr;
-        if (cache) {
-            if (chunk_source_ == 1) {
-                cache->host_release_chunk_lease(host_chunk_handle_);
-            } else if (chunk_source_ == 2) {
-                cache->arena_release_chunk_lease(vram_chunk_idx_);
-            }
-        }
-        chunk_source_      = 0;
-        host_chunk_handle_ = UINT64_MAX;  // pinned_chunk_pool::INVALID_CHUNK_HANDLE
-        vram_chunk_idx_    = -1;
-        chunk_device_      = -1;
-    }
+    release_lease_state(state);
 }
 
 bool mem_handle::operator==(const mem_handle & other) const {
@@ -583,6 +655,11 @@ size_t mem_handle::hash() const {
 }
 
 size_t mem_handle::stable_identity_hash() const {
+    mem_handle_lock_guard g(lock_);
+    return stable_identity_hash_locked();
+}
+
+size_t mem_handle::stable_identity_hash_locked() const {
     size_t h = 0;
     h        = mem_handle_hash_combine(h, std::hash<int>()(static_cast<int>(kind_)));
     h        = mem_handle_hash_combine(h, std::hash<int>()(device_));
@@ -632,10 +709,34 @@ bool mem_handle::stable_identity_equal(const mem_handle & other) const {
                arena_gen_ == other.arena_gen_;
     }
 
+    // The remaining branches read mutable state on BOTH handles.  Snapshot each
+    // side under its own lock rather than holding two locks at once — there is
+    // no lock order between two arbitrary handles.
+    struct identity_snapshot {
+        const void * ptr               = nullptr;
+        uint8_t      chunk_source      = 0;
+        uint64_t     host_chunk_handle = UINT64_MAX;
+        int32_t      vram_chunk_idx    = -1;
+        int          chunk_device      = -1;
+    };
+
+    auto snapshot = [](const mem_handle & h) {
+        mem_handle_lock_guard g(h.lock_);
+        identity_snapshot     s;
+        s.ptr               = h.cached_.ptr;
+        s.chunk_source      = h.chunk_source_;
+        s.host_chunk_handle = h.host_chunk_handle_;
+        s.vram_chunk_idx    = h.vram_chunk_idx_;
+        s.chunk_device      = h.chunk_device_;
+        return s;
+    };
+    const identity_snapshot self   = snapshot(*this);
+    const identity_snapshot theirs = snapshot(other);
+
     if (kind_ == mem_handle_kind::CHUNK_LEASE) {
-        return chunk_device_ == other.chunk_device_ && chunk_source_ == other.chunk_source_ &&
-               host_chunk_handle_ == other.host_chunk_handle_ && vram_chunk_idx_ == other.vram_chunk_idx_ &&
-               cached_.ptr == other.cached_.ptr && size_ == other.size_;
+        return self.chunk_device == theirs.chunk_device && self.chunk_source == theirs.chunk_source &&
+               self.host_chunk_handle == theirs.host_chunk_handle && self.vram_chunk_idx == theirs.vram_chunk_idx &&
+               self.ptr == theirs.ptr && size_ == other.size_;
     }
 
     if (owned_alloc_ || other.owned_alloc_) {
@@ -646,7 +747,7 @@ bool mem_handle::stable_identity_equal(const mem_handle & other) const {
                offset_ == other.offset_ && size_ == other.size_;
     }
 
-    return cached_.ptr == other.cached_.ptr && size_ == other.size_;
+    return self.ptr == theirs.ptr && size_ == other.size_;
 }
 
 bool mem_handle::has_stable_owner_identity() const {
@@ -659,17 +760,22 @@ void mem_handle::set_debug_owner(const char * owner_tag) {
 
 mem_handle_debug_info mem_handle::debug_info() const {
     mem_handle_debug_info info;
-    info.valid                = valid();
-    info.kind                 = kind_;
-    info.device               = device_;
-    info.zone_id              = zone_id_;
-    info.offset               = offset_;
-    info.size                 = size_;
-    info.generation           = arena_gen_;
-    info.stable_identity_hash = stable_identity_hash();
-    info.has_stable_identity  = has_stable_owner_identity();
+    info.kind                = kind_;
+    info.device              = device_;
+    info.zone_id             = zone_id_;
+    info.offset              = offset_;
+    info.size                = size_;
+    info.generation          = arena_gen_;
+    info.has_stable_identity = has_stable_owner_identity();
+    info.owner_tag           = debug_owner_tag_ ? debug_owner_tag_ : "";
+
+    // One critical section for every mutable field: valid() and
+    // stable_identity_hash() each take the lock, and the spinlock is not
+    // recursive, so use the *_locked form here.
+    mem_handle_lock_guard g(lock_);
+    info.valid                = cached_.ptr != nullptr;
     info.has_ready_event      = cached_.has_ready_event;
-    info.owner_tag            = debug_owner_tag_ ? debug_owner_tag_ : "";
+    info.stable_identity_hash = stable_identity_hash_locked();
     return info;
 }
 
@@ -713,6 +819,11 @@ static void bump_chunk_lease_for_copy(uint8_t      chunk_source,
     }
 }
 
+// Copying a handle that another thread is concurrently resolving is legitimate:
+// ggml_tensor_extra_gpu::data_handle[] entries are handed out as copies while
+// other contexts resolve them.  So the copy reads the source's mutable state
+// under the SOURCE's lock, then finishes (chunk lease, publish) with no handle
+// lock held — bump_chunk_lease_for_copy() calls into unified_cache.
 mem_handle::mem_handle(const mem_handle & other) :
     kind_(other.kind_),
     device_(other.device_),
@@ -721,21 +832,27 @@ mem_handle::mem_handle(const mem_handle & other) :
     offset_(other.offset_),
     size_(other.size_),
     arena_gen_(other.arena_gen_),
-    gen_(other.gen_),
-    cached_(other.cached_),
     owned_alloc_(other.owned_alloc_),
-    leased_entry_(other.leased_entry_),
-    chunk_source_(other.chunk_source_),
     host_chunk_handle_(UINT64_MAX),
     vram_chunk_idx_(-1),
-    chunk_device_(other.chunk_device_),
     debug_owner_tag_(other.debug_owner_tag_) {
-    // Bump the cache_entry lease refcount so each handle independently keeps
-    // the entry alive.  fetch_add on copyable_atomic_u32 is lock-free.
-    if (leased_entry_) {
-        leased_entry_->in_use_count.fetch_add(1);
+    {
+        // Read `other`'s mutable resolve state under its lock, and bump the
+        // cache_entry lease refcount there too so each handle independently
+        // keeps the entry alive.  fetch_add on copyable_atomic_u32 is lock-free
+        // and touches no cache lock, so it is safe inside the critical section.
+        mem_handle_lock_guard g(other.lock_);
+        gen_          = other.gen_;
+        cached_       = other.cached_;
+        leased_entry_ = other.leased_entry_;
+        chunk_source_ = other.chunk_source_;
+        chunk_device_ = other.chunk_device_;
+        if (leased_entry_) {
+            leased_entry_->in_use_count.fetch_add(1);
+        }
     }
-    // llama.cpp-dyhdl: independently acquire a chunk lease for the copy.
+    // llama.cpp-dyhdl: independently acquire a chunk lease for the copy.  This
+    // calls into unified_cache, so it runs with both handle locks dropped.
     bump_chunk_lease_for_copy(chunk_source_, chunk_device_, cached_.ptr, host_chunk_handle_, vram_chunk_idx_);
     if (chunk_source_ == 1 && host_chunk_handle_ == UINT64_MAX) {
         chunk_source_ = 0;
@@ -755,59 +872,86 @@ mem_handle::mem_handle(mem_handle && other) noexcept :
     offset_(other.offset_),
     size_(other.size_),
     arena_gen_(other.arena_gen_),
-    gen_(other.gen_),
-    cached_(other.cached_),
     owned_alloc_(std::move(other.owned_alloc_)),
-    leased_entry_(other.leased_entry_),
-    chunk_source_(other.chunk_source_),
-    host_chunk_handle_(other.host_chunk_handle_),
-    vram_chunk_idx_(other.vram_chunk_idx_),
-    chunk_device_(other.chunk_device_),
     debug_owner_tag_(other.debug_owner_tag_) {
-    // Transfer ownership — no refcount change.  Null `other` so its dtor
-    // does not release our leases.
-    other.leased_entry_      = nullptr;
-    other.chunk_source_      = 0;
-    other.host_chunk_handle_ = UINT64_MAX;
-    other.vram_chunk_idx_    = -1;
-    other.chunk_device_      = -1;
+    // Transfer ownership — no refcount change.  `other` is left with no leases
+    // so its dtor does not release ours.  Held under `other`'s lock so a
+    // concurrent resolve() on it cannot observe or write a half-moved state.
+    mem_handle_lock_guard g(other.lock_);
+    gen_                 = other.gen_;
+    cached_              = other.cached_;
+    const lease_state st = other.take_lease_state_locked();
+    leased_entry_        = st.entry;
+    chunk_source_        = st.chunk_source;
+    host_chunk_handle_   = st.host_chunk_handle;
+    vram_chunk_idx_      = st.vram_chunk_idx;
+    chunk_device_        = st.chunk_device;
 }
 
 mem_handle & mem_handle::operator=(const mem_handle & other) {
     if (this == &other) {
         return *this;
     }
-    // Decrement old leases (entry + chunk) before we adopt the new target.
-    release_lease();
 
-    kind_              = other.kind_;
-    device_            = other.device_;
-    key_               = other.key_;
-    zone_id_           = other.zone_id_;
-    offset_            = other.offset_;
-    size_              = other.size_;
-    arena_gen_         = other.arena_gen_;
-    gen_               = other.gen_;
-    cached_            = other.cached_;
-    owned_alloc_       = other.owned_alloc_;
-    leased_entry_      = other.leased_entry_;
-    chunk_source_      = other.chunk_source_;
-    chunk_device_      = other.chunk_device_;
-    debug_owner_tag_   = other.debug_owner_tag_;
-    host_chunk_handle_ = UINT64_MAX;
-    vram_chunk_idx_    = -1;
-    if (leased_entry_) {
-        leased_entry_->in_use_count.fetch_add(1);
+    // 1. Snapshot the source under ITS lock and take our own entry lease.
+    resolved_ptr          new_cached;
+    uint64_t              new_gen          = 0;
+    unified_cache_entry * new_entry        = nullptr;
+    uint8_t               new_chunk_source = 0;
+    int                   new_chunk_device = -1;
+    {
+        mem_handle_lock_guard g(other.lock_);
+        new_gen          = other.gen_;
+        new_cached       = other.cached_;
+        new_entry        = other.leased_entry_;
+        new_chunk_source = other.chunk_source_;
+        new_chunk_device = other.chunk_device_;
+        if (new_entry) {
+            new_entry->in_use_count.fetch_add(1);
+        }
     }
-    bump_chunk_lease_for_copy(chunk_source_, chunk_device_, cached_.ptr, host_chunk_handle_, vram_chunk_idx_);
-    if (chunk_source_ == 1 && host_chunk_handle_ == UINT64_MAX) {
-        chunk_source_ = 0;
-        chunk_device_ = -1;
+
+    // 2. Acquire our own chunk lease with no handle lock held.
+    uint64_t new_host_chunk_handle = UINT64_MAX;
+    int32_t  new_vram_chunk_idx    = -1;
+    bump_chunk_lease_for_copy(new_chunk_source, new_chunk_device, new_cached.ptr, new_host_chunk_handle,
+                              new_vram_chunk_idx);
+    if (new_chunk_source == 1 && new_host_chunk_handle == UINT64_MAX) {
+        new_chunk_source = 0;
+        new_chunk_device = -1;
     }
-    if (chunk_source_ == 2 && vram_chunk_idx_ < 0) {
-        chunk_source_ = 0;
-        chunk_device_ = -1;
+    if (new_chunk_source == 2 && new_vram_chunk_idx < 0) {
+        new_chunk_source = 0;
+        new_chunk_device = -1;
     }
+
+    // 3. Publish, detaching the leases we are dropping.
+    lease_state stale;
+    {
+        mem_handle_lock_guard g(lock_);
+        stale            = take_lease_state_locked();
+        kind_            = other.kind_;
+        device_          = other.device_;
+        key_             = other.key_;
+        zone_id_         = other.zone_id_;
+        offset_          = other.offset_;
+        size_            = other.size_;
+        arena_gen_       = other.arena_gen_;
+        owned_alloc_     = other.owned_alloc_;
+        debug_owner_tag_ = other.debug_owner_tag_;
+        gen_             = new_gen;
+        cached_          = new_cached;
+        lease_state fresh;
+        fresh.entry             = new_entry;
+        fresh.chunk_source      = new_chunk_source;
+        fresh.host_chunk_handle = new_host_chunk_handle;
+        fresh.vram_chunk_idx    = new_vram_chunk_idx;
+        fresh.chunk_device      = new_chunk_device;
+        store_lease_state_locked(fresh);
+    }
+
+    // 4. Release the old leases outside the lock.
+    release_lease_state(stale);
     return *this;
 }
 
@@ -815,29 +959,36 @@ mem_handle & mem_handle::operator=(mem_handle && other) noexcept {
     if (this == &other) {
         return *this;
     }
-    release_lease();
 
-    kind_                    = other.kind_;
-    device_                  = other.device_;
-    key_                     = other.key_;
-    zone_id_                 = other.zone_id_;
-    offset_                  = other.offset_;
-    size_                    = other.size_;
-    arena_gen_               = other.arena_gen_;
-    gen_                     = other.gen_;
-    cached_                  = other.cached_;
-    owned_alloc_             = std::move(other.owned_alloc_);
-    leased_entry_            = other.leased_entry_;
-    chunk_source_            = other.chunk_source_;
-    host_chunk_handle_       = other.host_chunk_handle_;
-    vram_chunk_idx_          = other.vram_chunk_idx_;
-    chunk_device_            = other.chunk_device_;
-    debug_owner_tag_         = other.debug_owner_tag_;
-    other.leased_entry_      = nullptr;
-    other.chunk_source_      = 0;
-    other.host_chunk_handle_ = UINT64_MAX;
-    other.vram_chunk_idx_    = -1;
-    other.chunk_device_      = -1;
+    resolved_ptr new_cached;
+    uint64_t     new_gen = 0;
+    lease_state  fresh;
+    {
+        mem_handle_lock_guard g(other.lock_);
+        new_gen    = other.gen_;
+        new_cached = other.cached_;
+        fresh      = other.take_lease_state_locked();
+    }
+
+    lease_state stale;
+    {
+        mem_handle_lock_guard g(lock_);
+        stale            = take_lease_state_locked();
+        kind_            = other.kind_;
+        device_          = other.device_;
+        key_             = other.key_;
+        zone_id_         = other.zone_id_;
+        offset_          = other.offset_;
+        size_            = other.size_;
+        arena_gen_       = other.arena_gen_;
+        owned_alloc_     = std::move(other.owned_alloc_);
+        debug_owner_tag_ = other.debug_owner_tag_;
+        gen_             = new_gen;
+        cached_          = new_cached;
+        store_lease_state_locked(fresh);
+    }
+
+    release_lease_state(stale);
     return *this;
 }
 
@@ -877,9 +1028,14 @@ resolved_ptr mem_handle::resolve_arena() const {
 
     // Cache the resolved pointer.  Arena handles are always on-device with
     // AOS layout (arena zones hold raw allocations, not cache-managed weights).
-    cached_ = { ptr, GGML_LAYOUT_AOS, true };
-    gen_    = arena_gen_;
-    return cached_;
+    // Published under the lock; the cache queries above ran without it.
+    const resolved_ptr resolved = { ptr, GGML_LAYOUT_AOS, true };
+    {
+        mem_handle_lock_guard g(lock_);
+        cached_ = resolved;
+        gen_    = arena_gen_;
+    }
+    return resolved;
 }
 
 // === layer_weight_handles ===
