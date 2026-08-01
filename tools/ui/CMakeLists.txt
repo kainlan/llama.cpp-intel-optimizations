@@ -209,6 +209,27 @@ endif()
 #                         (file and dir x _gzip/_gzipfoo/_app); RED reproduced
 #                         the drift first, GREEN is 0 failures
 #
+#   CLOSED  dotfiles      hidden assets (.nojekyll and friends, ordinary in a
+#                         static-site dist/) are declared, not skipped
+#           mechanism     file(GLOB_RECURSE) does match leading-dot names --
+#                         checked because the opposite is widely assumed and
+#                         would be this bug's exact shape: an asset embed.cpp
+#                         embeds but nothing declares
+#           test          cmake -P over a scratch dist/ containing .nojekyll
+#                         and sub/.hidden -> both listed
+#
+#   CLOSED  symlinks      a symlinked directory under dist/ is not a source of
+#                         embedded-but-undeclared assets
+#           mechanism     agreement, not coverage: file(GLOB_RECURSE) does not
+#                         descend into a symlinked directory, and neither does
+#                         embed.cpp -- std::filesystem::recursive_directory_
+#                         iterator without follow_directory_symlink. What is
+#                         embedded and what is declared match, which is the
+#                         property that matters; both descending or neither is
+#                         fine, one of each is not
+#           test          cmake -P scratch tree with a dir symlink (not
+#                         descended) + embed.cpp:160 read for its iterator flags
+#
 #   OPEN    npm cold start   a first-ever `node_modules` install could create a
 #                            top-level entry under tools/ui and fire one extra
 #                            reconfigure. Correct behaviour, bounded to once,
