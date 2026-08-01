@@ -566,18 +566,35 @@ git commit -m "instr(sycl): audit-only zone reset mode to enumerate handle escap
 
 ---
 
-### Task 8: Fix the `get_rows` scratch escape (`llama.cpp-oze0`)
+### Task 8: Fix BOTH `get_rows` escapes — device scratch AND host-pinned indices (`llama.cpp-oze0`)
 
 **Track:** C
 **Depends on:** Task 7
 **File scope:**
-- Modify: `ggml/src/ggml-sycl/getrows.cpp:2481-2540`
+- Modify: `ggml/src/ggml-sycl/getrows.cpp:2481-2540` (device scratch)
+- Modify: `ggml/src/ggml-sycl/getrows.cpp` (host-pinned indices — locate via the
+  `get_rows_indices_small_host` cohort tag)
 
 **Description:**
 
-The one escape already confirmed. `getrows.cpp:2481-2484` allocates via the scoped RAII temp
+⚠️ **Scope widened 2026-08-01. `getrows.cpp` is the escape hotspot on TWO independent axes, and
+an earlier version of this task covered only one of them.** Fixing the device escape alone would
+ship, and Task 7's audit would simply re-find the host escape.
+
+**Axis 1 — device scratch (VRAM).** `getrows.cpp:2481-2484` allocates via the scoped RAII temp
 `ggml_sycl_get_rows_device_temp<int32_t> seq_device_alloc`, then `:2540` publishes the raw
-pointer into `stream_ctx.seq_device`, where it outlives the handle.
+pointer into `stream_ctx.seq_device`, where it outlives the handle. Confirmed by the
+`test-thread-safety` segfault at HEAD: 4 × `cohort=get_rows:seq_device`, 828504 B each,
+`vram_zone=4`.
+
+**Axis 2 — host-pinned indices.** Confirmed independently from a pre-`9f3a2e0f0` control build
+(`/Apps/llama.cpp-worktrees/oze0-preflight` at `2dd269773`): 4 × `cohort=get_rows_indices_small_host`,
+**24 B** each, `tier=host_pinned`, `host_zone=2`, live at a `host-zone-reset`. Same disease,
+different zone. Full evidence in `llama.cpp-h8s1` comment `c-otsa`.
+
+Note the size gap — **24 B versus 828 KB in the same subsystem, 4.6 orders of magnitude apart.**
+Do not let the device axis's uniform 828504-byte allocations shape your mental model of what
+`get_rows` allocates; that uniformity is not representative, and this is the counter-example.
 
 CLAUDE.md is explicit: raw pointers are transient ABI views, never ownership tokens, and must
 not outlive their owning handle. Fix by extending the handle's lifetime to cover the real use —
@@ -592,7 +609,8 @@ prevented.
 **Acceptance Criteria:**
 
 - [ ] `stream_ctx` holds a handle (or an owning object), not a bare pointer.
-- [ ] Under Task 7's audit, the `get_rows:seq_device` cohort no longer appears live at a reset site.
+- [ ] Under Task 7's audit, **neither** `get_rows:seq_device` **nor** `get_rows_indices_small_host`
+      appears live at a reset site. Both axes, or the task is not done.
 - [ ] `test-thread-safety` passes **3 consecutive times** — it is a race; one green run is not evidence.
 - [ ] Mistral gate passes; ONE `test-llama-archs` no worse than the recorded baseline.
 
