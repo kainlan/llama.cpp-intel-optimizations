@@ -8,6 +8,7 @@
 
 #include "unified-cache-key.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -69,6 +70,62 @@ enum class mem_handle_kind : uint8_t {
 };
 
 struct mem_handle_debug_info;
+
+// === mem_handle_spin_lock ===
+// Per-handle lock guarding the state resolve() mutates (llama.cpp-c48l).
+//
+// resolve() is declared const but is a *mutating* operation: it rewrites
+// cached_, gen_, leased_entry_ and the chunk-lease fields.  A mem_handle that
+// lives in shared model state — above all ggml_tensor_extra_gpu::data_handle[],
+// which every weight tensor carries — is resolved concurrently by every context
+// thread decoding on that model.  llama.cpp supports many contexts per model
+// (tests/test-thread-safety.cpp), and ggml_backend_sycl_graph_compute drops the
+// process-wide graph mutex before dispatch on nearly every path
+// (compute_impl_unlocked), so those resolves genuinely overlap.  Unsynchronised,
+// two of them corrupt the shared_ptr inside cached_.ready_event and
+// double-release a single cache-entry lease.
+//
+// CONTRACT: this lock is NEVER held across a call into unified_cache.  Every
+// critical section is a short, allocation-free field copy, so the lock adds no
+// edge to the global lock order and cannot deadlock against the cache's
+// rw_mutex_.  Slow-path work (acquiring leases, releasing leases) runs unlocked;
+// the result is published under the lock, and a resolve that loses the publish
+// race releases the lease it acquired rather than leaking it.
+class mem_handle_spin_lock {
+  public:
+    mem_handle_spin_lock() = default;
+
+    // Copies/moves of a mem_handle produce an independent, unlocked handle.
+    mem_handle_spin_lock(const mem_handle_spin_lock &) {}
+
+    mem_handle_spin_lock & operator=(const mem_handle_spin_lock &) { return *this; }
+
+    void lock() const {
+        while (flag_.exchange(true, std::memory_order_acquire)) {
+            while (flag_.load(std::memory_order_relaxed)) {
+                // Critical sections are a few dozen nanoseconds; spin.
+            }
+        }
+    }
+
+    void unlock() const { flag_.store(false, std::memory_order_release); }
+
+  private:
+    mutable std::atomic<bool> flag_{ false };
+};
+
+class mem_handle_lock_guard {
+  public:
+    explicit mem_handle_lock_guard(const mem_handle_spin_lock & lock) : lock_(lock) { lock_.lock(); }
+
+    ~mem_handle_lock_guard() { lock_.unlock(); }
+
+    mem_handle_lock_guard(const mem_handle_lock_guard &)             = delete;
+    mem_handle_lock_guard & operator=(const mem_handle_lock_guard &) = delete;
+
+  private:
+    const mem_handle_spin_lock & lock_;
+};
 
 class mem_handle {
   public:
@@ -191,7 +248,14 @@ class mem_handle {
     // included to allow DIRECT handles with nullptr but DIRECT handles must always
     // have an explicit non-null pointer, so the kind check was incorrect for
     // default-constructed handles (kind_==DIRECT, ptr==nullptr → falsely valid).
-    bool valid() const { return cached_.ptr != nullptr; }
+    //
+    // Reads cached_, so it takes the handle lock: the overwhelmingly common
+    // caller shape is `if (h.valid()) h.resolve(dev)` on a shared
+    // extra->data_handle[], concurrently with another thread's resolve().
+    bool valid() const {
+        mem_handle_lock_guard g(lock_);
+        return cached_.ptr != nullptr;
+    }
 
     // Access the cache key (only meaningful for WEIGHT handles).
     const unified_cache_key & key() const { return key_; }
@@ -261,6 +325,39 @@ class mem_handle {
     // copy-assign, and move-assign before transitioning to a new state.
     // No-op if no lease is held.
     void release_lease() noexcept;
+
+    // === lease_state ===
+    // The releasable half of a handle's resolve state.  Releasing a lease calls
+    // into unified_cache (host_release_chunk_lease / arena_release_chunk_lease),
+    // which must not happen under the handle lock — so every transition takes
+    // the current lease_state out under the lock and releases it afterwards.
+    struct lease_state {
+        unified_cache_entry * entry             = nullptr;
+        uint8_t               chunk_source      = 0;
+        uint64_t              host_chunk_handle = UINT64_MAX;
+        int32_t               vram_chunk_idx    = -1;
+        int                   chunk_device      = -1;
+    };
+
+    // Detach this handle's lease state (caller holds lock_).  The handle no
+    // longer owns the returned leases; the caller must release them.
+    lease_state take_lease_state_locked() const;
+
+    // Adopt an already-acquired lease state (caller holds lock_).
+    void store_lease_state_locked(const lease_state & state) const;
+
+    // Drop the references described by `state`.  Never call under lock_.
+    static void release_lease_state(const lease_state & state) noexcept;
+
+    // stable_identity_hash() body, for callers that already hold lock_.
+    size_t stable_identity_hash_locked() const;
+
+    // Guards the mutable resolve state below (cached_, gen_, leased_entry_,
+    // chunk_source_, host_chunk_handle_, vram_chunk_idx_, chunk_device_).
+    // The immutable-after-construction fields are not covered: reassigning or
+    // destroying a handle that another thread is resolving is out of contract
+    // and no production path does it.
+    mutable mem_handle_spin_lock lock_;
 
     mem_handle_kind   kind_   = mem_handle_kind::DIRECT;
     int               device_ = HOST_DEVICE;
