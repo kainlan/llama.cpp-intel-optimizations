@@ -1,0 +1,50 @@
+test-thread-safety's model fixture: already automated, and why it still went missing
+====================================================================================
+llama.cpp-oze0, 2026-08-01
+
+WHAT HAPPENED
+
+The lead had to hand-stage build/tinyllamas/stories15M-q4_0.gguf into this
+worktree (sha256 66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739)
+before test-thread-safety would run. It was missing.
+
+IT IS NOT MISSING FROM THE BUILD -- IT IS BYPASSED BY DIRECT INVOCATION
+
+tests/CMakeLists.txt:312-329 already provisions it, with the same hash:
+
+    set(MODEL_NAME "tinyllamas/stories15M-q4_0.gguf")
+    set(MODEL_HASH "SHA256=66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739")
+    add_test(NAME test-download-model COMMAND ${CMAKE_COMMAND} ... -P cmake/download-models.cmake)
+    set_tests_properties(test-download-model PROPERTIES FIXTURES_SETUP test-download-model)
+    ...
+    set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
+
+So `ctest -R '^test-thread-safety$'` pulls the model down automatically. Running
+`./build/bin/test-thread-safety -m build/tinyllamas/...` does NOT: invoking the
+binary directly bypasses the ctest registration, and the fixture is part of the
+registration, not the binary.
+
+This is the same shape as the trap CLAUDE.md already records for
+LD_LIBRARY_PATH -- a SYCL test binary run directly misses the ENVIRONMENT
+property its ctest registration supplies and reports "SKIP ... exit 0". Same
+cause, different property: **what the registration provides, direct invocation
+does not.** Anyone reaching for the binary directly (which is exactly what you
+do when iterating on one failing test) loses it silently.
+
+CONSEQUENCE FOR THIS WORKTREE
+
+build/ is gitignored (.gitignore:47, `/build*`), so the staged copy does NOT
+survive `./scripts/sycl-build.sh -c` (which does `rm -rf build/`). An
+incremental build keeps it.
+
+RECOVERY -- prefer the first
+
+    # 1. Let ctest do it. Also runs the GPU test, so LEAD-ONLY (see CLAUDE.md).
+    ctest --test-dir build -R '^test-thread-safety$' --output-on-failure
+
+    # 2. Fixture only, no GPU work -- safe for anyone, and what you want if you
+    #    are going to invoke the binary directly afterwards.
+    ctest --test-dir build -R '^test-download-model$'
+
+Do not commit the .gguf; it is 19 MB of generated fixture with an authoritative
+hash already recorded in tests/CMakeLists.txt.

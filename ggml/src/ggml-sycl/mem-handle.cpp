@@ -58,6 +58,36 @@ retained_handle_state *                g_retained_handles_state = new retained_h
 std::once_flag                         g_retained_drain_worker_once;
 thread_local std::vector<mem_handle> * g_graph_retained_handle_sink = nullptr;
 
+// Whether THIS thread's retained handles belong to a command graph.
+//
+// Deliberately narrower than ggml_sycl_graph_recording_active() (common.hpp),
+// which is true whenever *any* thread is recording -- the depth counter is a
+// process-global counter while g_ggml_sycl_graph_recording is thread_local.
+// The wide predicate is right for "may I emit a memcpy node?", a conservative
+// process-wide constraint. It is the wrong question for "who owns this handle's
+// release?", because the sink it selects (g_graph_retained_handle_sink) is
+// thread_local: a thread that is not itself recording has no sink, so every
+// handle it retains falls through to the process-global graph_unwaitable list.
+// That list is one drain_retained_handles() deliberately does not wait on, and
+// only a graph invalidation on some other context ever clears it.
+//
+// Two consequences, both observed in test-thread-safety (llama.cpp-oze0):
+//   * transient scratch (get_rows:seq_device in VRAM SCRATCH,
+//     get_rows_indices_small_host in host STAGING) stays live for as long as any
+//     other context keeps recording, so the next graph boundary's zone reset is
+//     correctly refused and graph launch aborts;
+//   * release_graph_retained_handles() then drops those handles from whichever
+//     context next invalidates its graph, not from the one whose work still
+//     depends on them.
+//
+// A non-recording thread's event is a real, waitable event, so the normal
+// event-bound path releases it naturally. If that turns out to be a recorded
+// event after all, the drain worker's "command graph" catch below parks it in
+// graph_unwaitable anyway -- so this narrowing fails safe.
+bool graph_lifetime_retention_active() {
+    return g_graph_retained_handle_sink != nullptr || g_ggml_sycl_graph_recording;
+}
+
 void retain_handles_for_current_graph(std::vector<mem_handle> handles) {
     if (handles.empty()) {
         return;
@@ -1128,6 +1158,12 @@ void drain_retained_handles(bool wait_all) {
     state.cv.wait(lock, [&state] { return state.queue.empty() && state.active == 0; });
 }
 
+size_t graph_retained_handle_count() {
+    auto &                      state = *g_retained_handles_state;
+    std::lock_guard<std::mutex> lock(state.mutex);
+    return state.graph_unwaitable.size();
+}
+
 void release_graph_retained_handles() {
     auto &                      state = *g_retained_handles_state;
     std::lock_guard<std::mutex> lock(state.mutex);
@@ -1141,7 +1177,7 @@ void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event eve
         return;
     }
 
-    if (ggml_sycl_graph_recording_active()) {
+    if (graph_lifetime_retention_active()) {
         retain_handles_for_current_graph(std::move(handles));
         return;
     }

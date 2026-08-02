@@ -1399,6 +1399,52 @@ set_tests_properties(test-sycl-mem-handle-concurrent-resolve PROPERTIES
     TIMEOUT 120
 )
 
+# Test: retain_handles_until_event() must route a handle by THIS thread's
+# recording state (llama.cpp-oze0).  Its guard was
+# ggml_sycl_graph_recording_active(), true whenever ANY thread records, while
+# the sink that guard selects is thread_local -- so a non-recording thread fell
+# through to the process-global graph_unwaitable list, which
+# drain_retained_handles() does not wait on.  get_rows' two staging cohorts
+# (get_rows:seq_device in VRAM SCRATCH, get_rows_indices_small_host in host
+# STAGING) then stayed live across a graph boundary and the zone reset was
+# correctly refused, aborting graph launch in test-thread-safety.
+#
+# CPU-only by construction: DIRECT handle views over stack buffers plus
+# default-constructed (already complete) events -- no device, queue or cache.
+# Registered outside the _residency_test loop below and labelled to avoid every
+# word in CLAUDE.md's throttled-sweep denylist (-LE 'residency|mem-handle|cache'),
+# which is about memory-exhaustion hazard rather than subject matter; a GPU-free
+# gate carrying one of those words would be hidden from the sweep it belongs in.
+set(GRAPH_RETENTION_TEST_SYCL_OPTIONS
+    "-fsycl"
+    "-Wno-narrowing"
+)
+add_executable(test-sycl-graph-retention-scope
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-graph-retention-scope.cpp
+)
+target_include_directories(test-sycl-graph-retention-scope PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-graph-retention-scope PRIVATE ${GRAPH_RETENTION_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-graph-retention-scope PRIVATE ${GRAPH_RETENTION_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-graph-retention-scope PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-graph-retention-scope PRIVATE ggml-base ggml ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-graph-retention-scope PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-graph-retention-scope COMMAND test-sycl-graph-retention-scope)
+set_tests_properties(test-sycl-graph-retention-scope PROPERTIES
+    LABELS "sycl;handle;concurrency;tdd"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
 set(RESIDENCY_TEST_SYCL_OPTIONS
     "-fsycl"
     "-Wno-narrowing"

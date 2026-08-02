@@ -250,6 +250,23 @@ inline sycl::event ggml_sycl_graph_safe_memcpy(sycl::queue & q, void * dst, cons
                                                    ggml_sycl::mem_copy_async(dst_handle, src_handle, nbytes, q));
 }
 
+// Is ANY thread currently recording a command graph?
+//
+// PROCESS-WIDE by design: g_ggml_sycl_graph_recording_depth is a global counter, so this is
+// true on threads that are not themselves recording. That is correct for conservative
+// submission constraints -- "may I emit a memcpy node?", "must this allocation have a stable
+// host USM base?" -- where over-applying the restriction is safe.
+//
+// ⚠️ Do NOT use it to decide who OWNS a thread_local resource's release. Such a decision
+// selects a per-thread sink, so a non-recording thread takes the graph-lifetime branch and
+// finds no sink of its own. MEASURED in llama.cpp-oze0: transient scratch stayed live in the
+// shared SCRATCH/STAGING zones until some unrelated context invalidated its graph, so the next
+// graph boundary's zone reset was correctly refused and launch aborted. Use
+// graph_lifetime_retention_active() (mem-handle.cpp) for that question -- it is deliberately
+// narrower, and the asymmetry is the fix, not an inconsistency to tidy away.
+//
+// Those stranded handles are then freed by whichever context clears a graph next, which is
+// ANALYSED as a cross-context use-after-free in llama.cpp-mhyw -- suspected, not yet measured.
 inline bool ggml_sycl_graph_recording_active() {
     return g_ggml_sycl_graph_recording || g_ggml_sycl_graph_recording_depth.load(std::memory_order_acquire) > 0;
 }
