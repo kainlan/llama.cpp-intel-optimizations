@@ -1536,6 +1536,154 @@ set_tests_properties(test-sycl-transient-alloc-intent-scope PROPERTIES
     TIMEOUT 120
 )
 
+# Test: infer_tensor_usage() (common.hpp) and expert_tensor_role_from_tensor_name()
+# (unified-cache.hpp) must classify MoE expert tensors correctly by name,
+# including grovemoe's chunked "_chexps" family (llama.cpp-u2mz). This test
+# previously existed only as a self-contained mock that reimplemented (and
+# diverged from) the real classifiers, so it never observed the real bug: the
+# real infer_tensor_usage() did not recognize "_chexps" tensors as expert
+# weights, which aborted MUL_MAT_ID with "unresolved planner expert" and was
+# only found by a SIGABRT in an unrelated sweep. This version calls the real
+# classifiers.
+#
+# CPU-only by construction: both functions under test are pure string
+# classifiers over a tensor name -- no device, queue, or cache is touched.
+set(TENSOR_PLACEMENT_TEST_SYCL_OPTIONS
+    "-fsycl"
+    "-Wno-narrowing"
+)
+add_executable(test-sycl-tensor-placement
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-tensor-placement.cpp
+)
+target_include_directories(test-sycl-tensor-placement PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-tensor-placement PRIVATE ${TENSOR_PLACEMENT_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-tensor-placement PRIVATE ${TENSOR_PLACEMENT_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-tensor-placement PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-tensor-placement PRIVATE ggml-base ggml ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-tensor-placement PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-tensor-placement COMMAND test-sycl-tensor-placement)
+set_tests_properties(test-sycl-tensor-placement PROPERTIES
+    LABELS "sycl;moe;tensor-placement;tdd"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+# Test: ggml_sycl_get_tensor_usage() (ggml-sycl.cpp) -- the production entry
+# point wrapping infer_tensor_usage() with a name->usage cache -- must
+# classify real ggml_tensor objects (via ggml_new_tensor_2d + ggml_set_name)
+# the same way the pure name classifier does. Registered at 3c8f296fd, lost
+# with the rest of the tests/CMakeLists.txt registrations (llama.cpp-0igs);
+# restored here as it directly complements test-sycl-tensor-placement above.
+#
+# CPU-only by construction: creates tensors through the CPU backend and never
+# touches a SYCL device or queue.
+add_executable(test-sycl-tensor-usage
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-tensor-usage.cpp
+)
+target_include_directories(test-sycl-tensor-usage PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-tensor-usage PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-tensor-usage PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-tensor-usage PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-tensor-usage PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-tensor-usage PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-tensor-usage COMMAND test-sycl-tensor-usage)
+set_tests_properties(test-sycl-tensor-usage PROPERTIES
+    LABELS "sycl;moe;tensor-placement;tdd"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+# Cross-model state-leak regression (llama.cpp-k7b0): g_sycl_weight_usages
+# (ggml-sycl.cpp) is name-keyed and previously never cleared between model
+# loads, so a name one architecture's tied-weight detection forced to
+# UNKNOWN could poison a later, unrelated architecture's first (and only)
+# registration of that same name. Exercises the REAL load boundary,
+# ggml_backend_sycl_set_model_loading(), not a mock -- see the file header
+# for the full defect writeup and the one-line mutation that makes this
+# fail specifically. Loads no model and touches no VRAM beyond what
+# ggml_sycl_info() enumerates, but the load-boundary reset path this test
+# exercises still expects a real device (mirrors test-layout-cache.cpp's
+# SKIP_RETURN_CODE convention below).
+add_executable(test-cross-model-weight-usage
+    tests/test-cross-model-weight-usage.cpp
+)
+target_include_directories(test-cross-model-weight-usage PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-cross-model-weight-usage PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-cross-model-weight-usage PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_compile_definitions(test-cross-model-weight-usage PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-cross-model-weight-usage PRIVATE ggml-base ggml ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-cross-model-weight-usage PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME cross-model-weight-usage COMMAND test-cross-model-weight-usage)
+set_tests_properties(cross-model-weight-usage PROPERTIES
+    LABELS "sycl;moe;tensor-placement;cross-model;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 120
+)
+
+# Test: ggml_sycl_classify_tensor() (ggml-sycl.cpp) -- the dense/expert/other
+# classifier used for tiered-memory buffer-type routing, distinct from
+# tensor_usage/expert_tensor_role above. Registered at 3c8f296fd with bare
+# assert() only, which -O3 -DNDEBUG (this project's Release flags) compiles
+# out entirely, leaving `return 0` as the sole exit path (llama.cpp-0igs).
+# 50723136a already added the `#undef NDEBUG` fix to the source; only the
+# registration itself was missing.
+add_executable(test-tensor-placement
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-tensor-placement.cpp
+)
+target_include_directories(test-tensor-placement PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-tensor-placement PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-tensor-placement PRIVATE "-fsycl")
+target_compile_definitions(test-tensor-placement PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-tensor-placement PRIVATE ggml-base ggml ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-tensor-placement PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-tensor-placement COMMAND test-tensor-placement)
+set_tests_properties(test-tensor-placement PROPERTIES
+    LABELS "sycl;moe;tensor-placement;tdd"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
 set(RESIDENCY_TEST_SYCL_OPTIONS
     "-fsycl"
     "-Wno-narrowing"

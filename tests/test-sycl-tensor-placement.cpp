@@ -1,77 +1,113 @@
-// Test: verify tensor name pattern matching identifies expert vs non-expert tensors
-// This mirrors the logic in llama-model.cpp load_tensors for MoE expert host-pinned routing
+// Test: infer_tensor_usage() (ggml-sycl/common.hpp) and
+// expert_tensor_role_from_tensor_name() (ggml-sycl/unified-cache.hpp) correctly
+// classify expert vs non-expert tensors by name, including grovemoe's chunked
+// "_chexps" family.
+//
+// This replaced a self-contained mock (llama.cpp-u2mz): the original test
+// defined its own tensor_type enum and its own is_expert_tensor(), then
+// asserted that reimplementation against itself. It never called either real
+// classifier, so it stayed green the whole time the real infer_tensor_usage()
+// did not recognize grovemoe's ffn_*_chexps tensors as expert weights --
+// exactly the property this test's name claims to cover. That bug was found
+// by a SIGABRT in an unrelated sweep, months later. A mutation that removes
+// the "_chexps" handling from either real classifier must fail this test;
+// removing it from the OLD mock proved nothing, because nothing here called
+// production code.
+//
+// CPU-only by construction: both functions under test are pure string
+// classifiers (strstr/strcmp over a tensor name) -- no device, queue, or
+// cache is touched.
+
+#include "common.hpp"
 
 #include <cstdio>
 #include <cstring>
-#include <cstdlib>
 
-// Simplified tensor type enum matching LLM_TENSOR values used in llama-model.cpp
-enum test_tensor_type {
-    TEST_TENSOR_ATTN_Q,
-    TEST_TENSOR_ATTN_K,
-    TEST_TENSOR_ATTN_V,
-    TEST_TENSOR_ATTN_OUTPUT,
-    TEST_TENSOR_FFN_NORM,
-    TEST_TENSOR_OUTPUT_NORM,
-    TEST_TENSOR_TOKEN_EMBD,
-    TEST_TENSOR_FFN_GATE_INP,    // router gate — NOT expert
-    TEST_TENSOR_FFN_GATE_EXPS,   // expert
-    TEST_TENSOR_FFN_DOWN_EXPS,   // expert
-    TEST_TENSOR_FFN_UP_EXPS,     // expert
-    TEST_TENSOR_FFN_NORM_EXPS,   // expert
-    TEST_TENSOR_FFN_GATE_CHEXPS, // expert (chunked)
-    TEST_TENSOR_FFN_DOWN_CHEXPS, // expert (chunked)
-    TEST_TENSOR_FFN_UP_CHEXPS,   // expert (chunked)
-};
+namespace {
 
-// This matches the is_expert_tensor logic in llama-model.cpp:load_tensors
-static bool is_expert_tensor(test_tensor_type t) {
-    return t == TEST_TENSOR_FFN_GATE_EXPS || t == TEST_TENSOR_FFN_DOWN_EXPS ||
-           t == TEST_TENSOR_FFN_UP_EXPS   || t == TEST_TENSOR_FFN_NORM_EXPS ||
-           t == TEST_TENSOR_FFN_GATE_CHEXPS ||
-           t == TEST_TENSOR_FFN_DOWN_CHEXPS || t == TEST_TENSOR_FFN_UP_CHEXPS;
+int n_pass = 0;
+int n_fail = 0;
+
+void check_usage(const char * name, tensor_usage expected) {
+    const tensor_usage got = infer_tensor_usage(name);
+    if (got == expected) {
+        n_pass++;
+    } else {
+        printf("FAIL usage(%s): expected %d, got %d\n", name, (int) expected, (int) got);
+        n_fail++;
+    }
 }
 
-struct test_case {
-    const char *     name;
-    test_tensor_type type;
-    bool             expected_expert;
-};
+void check_role(const char * name, expert_tensor_role expected) {
+    const expert_tensor_role got = expert_tensor_role_from_tensor_name(name);
+    if (got == expected) {
+        n_pass++;
+    } else {
+        printf("FAIL role(%s): expected %s, got %s\n", name, expert_tensor_role_name(expected),
+               expert_tensor_role_name(got));
+        n_fail++;
+    }
+}
+
+}  // namespace
 
 int main() {
-    int n_pass = 0;
-    int n_fail = 0;
+    // Non-expert tensors -- must NOT classify as MOE_EXPERT_WEIGHT / a routed role.
+    check_usage("blk.0.attn_q.weight", tensor_usage::ATTENTION_WEIGHT);
+    check_usage("blk.0.attn_k.weight", tensor_usage::ATTENTION_WEIGHT);
+    check_usage("blk.0.attn_v.weight", tensor_usage::ATTENTION_WEIGHT);
+    check_usage("blk.0.attn_output.weight", tensor_usage::ATTENTION_WEIGHT);
+    check_usage("blk.0.ffn_norm.weight", tensor_usage::NORM);
+    check_usage("output_norm.weight", tensor_usage::NORM);
+    check_usage("token_embd.weight", tensor_usage::EMBEDDING);
+    // Router gate is NOT an expert weight -- it must not collapse onto the
+    // "_exps" family it routes to.
+    check_usage("blk.0.ffn_gate_inp.weight", tensor_usage::MOE_GATE);
 
-    test_case cases[] = {
-        // Non-expert tensors — must stay on device
-        {"attn_q",       TEST_TENSOR_ATTN_Q,         false},
-        {"attn_k",       TEST_TENSOR_ATTN_K,         false},
-        {"attn_v",       TEST_TENSOR_ATTN_V,         false},
-        {"attn_output",  TEST_TENSOR_ATTN_OUTPUT,     false},
-        {"ffn_norm",     TEST_TENSOR_FFN_NORM,        false},
-        {"output_norm",  TEST_TENSOR_OUTPUT_NORM,      false},
-        {"token_embd",   TEST_TENSOR_TOKEN_EMBD,       false},
-        {"ffn_gate_inp", TEST_TENSOR_FFN_GATE_INP,     false},  // router gate, NOT expert
+    check_role("blk.0.attn_q.weight", expert_tensor_role::UNKNOWN);
+    check_role("blk.0.ffn_gate_inp.weight", expert_tensor_role::UNKNOWN);
 
-        // Expert tensors — should go to host-pinned
-        {"ffn_gate_exps",   TEST_TENSOR_FFN_GATE_EXPS,   true},
-        {"ffn_down_exps",   TEST_TENSOR_FFN_DOWN_EXPS,   true},
-        {"ffn_up_exps",     TEST_TENSOR_FFN_UP_EXPS,     true},
-        {"ffn_norm_exps",   TEST_TENSOR_FFN_NORM_EXPS,   true},
-        {"ffn_gate_chexps", TEST_TENSOR_FFN_GATE_CHEXPS, true},
-        {"ffn_down_chexps", TEST_TENSOR_FFN_DOWN_CHEXPS, true},
-        {"ffn_up_chexps",   TEST_TENSOR_FFN_UP_CHEXPS,   true},
-    };
+    // Plain MoE expert trio -- must classify as expert weights with distinct roles.
+    check_usage("blk.0.ffn_gate_exps.weight", tensor_usage::MOE_EXPERT_WEIGHT);
+    check_usage("blk.0.ffn_down_exps.weight", tensor_usage::MOE_EXPERT_WEIGHT);
+    check_usage("blk.0.ffn_up_exps.weight", tensor_usage::MOE_EXPERT_WEIGHT);
+    check_role("blk.0.ffn_gate_exps.weight", expert_tensor_role::GATE);
+    check_role("blk.0.ffn_down_exps.weight", expert_tensor_role::DOWN);
+    check_role("blk.0.ffn_up_exps.weight", expert_tensor_role::UP);
 
-    for (const auto & tc : cases) {
-        bool result = is_expert_tensor(tc.type);
-        if (result == tc.expected_expert) {
-            n_pass++;
-        } else {
-            printf("FAIL: %s — expected expert=%d, got %d\n", tc.name, tc.expected_expert, result);
-            n_fail++;
-        }
-    }
+    // Fused gate+up expert tensor -- has its own literal (does not contain
+    // "ffn_gate_exps" or "ffn_up_exps").
+    check_usage("blk.0.ffn_gate_up_exps.weight", tensor_usage::MOE_EXPERT_WEIGHT);
+    check_role("blk.0.ffn_gate_up_exps.weight", expert_tensor_role::GATE_UP);
+
+    // grovemoe's chunked-expert trio -- the property that broke in production.
+    // "ffn_gate_chexps" contains neither "ffn_gate_exps" nor a bare "_exps"
+    // substring, so it needs its own literal in BOTH classifiers.
+    check_usage("blk.0.ffn_gate_chexps.weight", tensor_usage::MOE_EXPERT_WEIGHT);
+    check_usage("blk.0.ffn_down_chexps.weight", tensor_usage::MOE_EXPERT_WEIGHT);
+    check_usage("blk.0.ffn_up_chexps.weight", tensor_usage::MOE_EXPERT_WEIGHT);
+    check_role("blk.0.ffn_gate_chexps.weight", expert_tensor_role::CHUNK_GATE);
+    check_role("blk.0.ffn_down_chexps.weight", expert_tensor_role::CHUNK_DOWN);
+    check_role("blk.0.ffn_up_chexps.weight", expert_tensor_role::CHUNK_UP);
+
+    // arctic's ffn_norm_exps is a 1D norm consumed by build_norm, NOT a routed
+    // expert weight -- must not be swept up by a bare "_exps" substring match
+    // into MOE_EXPERT_WEIGHT (it is not one of the specific "_exps"/"_chexps"
+    // literals either classifier matches on, so it falls through to the
+    // ordinary "_norm" rule).
+    check_usage("blk.0.ffn_norm_exps.weight", tensor_usage::NORM);
+    check_role("blk.0.ffn_norm_exps.weight", expert_tensor_role::UNKNOWN);
+
+    // Plain (non-MoE) dense FFN weight -- the ordinary MUL_MAT path.
+    check_usage("blk.0.ffn_gate.weight", tensor_usage::FFN_WEIGHT);
+    check_usage("blk.0.ffn_up.weight", tensor_usage::FFN_WEIGHT);
+    check_usage("blk.0.ffn_down.weight", tensor_usage::FFN_WEIGHT);
+
+    // The dense shared-expert FFN ("_shexp") goes through ordinary MUL_MAT,
+    // not MUL_MAT_ID -- must not be swept up by a bare "exps"/"gate" substring
+    // match into either the plain-FFN or expert classification.
+    check_usage("blk.0.ffn_gate_shexp.weight", tensor_usage::UNKNOWN);
+    check_role("blk.0.ffn_gate_shexp.weight", expert_tensor_role::UNKNOWN);
 
     printf("\n%d/%d tests passed\n", n_pass, n_pass + n_fail);
     if (n_fail > 0) {

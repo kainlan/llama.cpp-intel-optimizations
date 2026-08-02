@@ -2,10 +2,15 @@
 // Test for XMXConfig struct in unified-kernel.hpp
 // Tests hardware-queried dimensions for ESIMD dpas kernel configuration
 //
+// The project builds Release with CMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG",
+// which compiles every bare assert() below out and leaves a program that
+// cannot fail (llama.cpp-u2mz). Must precede <cassert>, which binds assert
+// at include time.
 
 #include "../common.hpp"
 #include "../unified-kernel.hpp"
 
+#undef NDEBUG
 #include <cassert>
 #include <cstdlib>
 #include <iostream>
