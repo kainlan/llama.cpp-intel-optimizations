@@ -330,6 +330,55 @@ static void test_slice_size_invariants() {
 }
 
 // ---------------------------------------------------------------------------
+// 10. THE CONTRACT BOUNDARY.  The slice size must depend on the slice and
+//     nothing else — not on the model layer count, not on how many layers the
+//     plan claims are on device, not on plan.kv_per_layer.
+//
+// This is deliberately the assertion that does NOT depend on the planner being
+// correct.  The KV-bearing layer count is computed upstream in
+// unified-cache.cpp, from weight entries classified by substring on tensor
+// names (`attn_q|attn_k|attn_v|attn_output`), and that answers a different
+// question than "does this layer hold KV": kimi-linear's *recurrent* layer owns
+// a tensor named `attn_output` (its KDA o_proj) so it is counted as attention,
+// while lfm2's recurrent layer owns no attn_* names and is not.  That bug lives
+// outside this file.
+//
+// What this test pins is the half of the contract that is ours: given a count,
+// the arithmetic honours it.  If the count is a lie, the slice is wrong — but
+// it is wrong in exactly one place, traceable to one caller, instead of being
+// re-derived from a different wrong number at four sites.
+// ---------------------------------------------------------------------------
+static void test_sizing_depends_only_on_the_slice() {
+    printf("10. slice size is independent of the model layer count and of the plan\n");
+
+    const size_t total_bytes = 294912;
+    const auto   slice       = ggml_sycl::kv_slice_size::from_layer_mask(total_bytes, /*n_kv_layers=*/1);
+
+    // Same slice, wildly different model layer counts and plan claims.
+    for (uint32_t n_layers : { 1u, 2u, 8u, 64u }) {
+        std::vector<uint32_t> all;
+        for (uint32_t l = 0; l < n_layers; ++l) {
+            all.push_back(l);
+        }
+        // plan.kv_per_layer is deliberately a wrong, plausible-looking value.
+        ggml_sycl::placement_plan  plan = make_plan(n_layers, all, 0, total_bytes / n_layers);
+        ggml_sycl::kv_tier_manager mgr;
+        mgr.configure_from_plan(0, plan, n_layers, slice);
+        check_eq("slice unchanged by n_layers", mgr.kv_per_layer(), total_bytes);
+        check_eq("layer 0 size unchanged by n_layers", mgr.kv_layer_size(0), total_bytes);
+    }
+
+    // Same again through the weight-aware path, which has no plan at all.
+    for (uint32_t n_layers : { 1u, 2u, 8u, 64u }) {
+        g_stub_layer_vram_bytes.assign(n_layers, 1024);
+        ggml_sycl::kv_tier_manager mgr;
+        mgr.configure_with_weights(0, n_layers, total_bytes, slice);
+        check_eq("weight-aware slice unchanged by n_layers", mgr.kv_per_layer(), total_bytes);
+    }
+    g_stub_layer_vram_bytes = {};
+}
+
+// ---------------------------------------------------------------------------
 // 9. get_kv_tier_manager() hands out one instance per device.
 // ---------------------------------------------------------------------------
 static void test_per_device_singletons() {
@@ -365,6 +414,7 @@ int main() {
     test_actual_placement_preserves_slice();
     test_weight_aware_path();
     test_slice_size_invariants();
+    test_sizing_depends_only_on_the_slice();
     test_per_device_singletons();
 
     printf("=== %d checks, %d failures ===\n", g_checks, g_failures);
