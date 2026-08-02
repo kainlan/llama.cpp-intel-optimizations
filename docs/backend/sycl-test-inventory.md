@@ -404,6 +404,42 @@ a preceding `#undef NDEBUG` or a gtest include. 28 files matched; triage:
 | `tests/test-quantize-stats.cpp` | 1 | registered via `llama_build` only (no `llama_test`/`add_test` found for it — may not even run as a test); general, not SYCL, not re-verified |
 | 17 remaining files (`test-ab-validation`, `test-crossover-discovery`, `test-dense-scheduler`, `test-edge-cases`, `test-expert-cache.cpp`, `test-ggml-flash-attn-ext`, `test-kv-cache-coordinator`, `test-pinned-chunk-pool`, `test-prefetch-scheduler`, `test-q6k-56block-debug`, `test-q6k-variable-reorder`, `test-sycl-prestage-routed-experts`, `test-tensor-classification`, `test-tile-decomposition`, `test-transfer-learning`, `test-vram-pool`, `test-xmx-unified-kernel`) | 1–77 | **unregistered anywhere** (confirmed against both `CMakeLists.txt` files) — part of `llama.cpp-0igs`'s 186-file dead-source population. Several are clearly SYCL/MoE-backend tests despite lacking a `sycl-` prefix (`tile-decomposition`, `vram-pool`, `pinned-chunk-pool`, `xmx-unified-kernel`, `test-sycl-prestage-routed-experts` itself). Would need **both** registration and the same `#undef NDEBUG` fix if restored — noting this so `llama.cpp-0igs` doesn't rediscover the NDEBUG half of the problem file-by-file the way `llama.cpp-4jlv`/`c17b010af`/`d4cccba5e`/`d4608ec7e` each rediscovered the registration half in isolation |
 
+## Two more ctest/grep traps, found during `llama.cpp-0igs` restoration batches
+
+Extending the trap list already in this doc (`ctest -R` on zero matches,
+`--output-on-failure` hiding a passing test's output, `SKIP` needing exit 77)
+with two more hit while restoring registrations:
+
+- **`ctest -N` prints test names, not labels — grepping it for a label
+  returns 0 no matter what.** The lead's own first proof attempt for batch 1
+  was `ctest -N | grep -c '0igs-batch1'`, which came back 0 and nearly read
+  as "all 13 excluded." The actual selector is `-L <label>`
+  (`ctest -N -L 0igs-batch1`). Same failure shape as the other two: a clean,
+  wrong-question answer that looks like evidence.
+- **A registration grep must carry guard context, not just the line.**
+  `test-expert-cache.cpp` looked like a genuine `3c8f296fd` restoration
+  candidate — `grep -c "^\s*add_executable(test-expert-cache "` returned 1 —
+  but that one line sat inside an `if(FALSE) ... endif()` block with the
+  comment *"DISABLED: expert-cache.hpp removed (replaced by unified cache +
+  placement table)"*. It was disabled **before** the registration wipe, for a
+  real architectural reason (the header it includes no longer exists —
+  confirmed by `-fsyntax-only`), not a casualty of it. A line-level match is
+  not the same claim as "this target builds when CMake processes this file."
+
+Also caught, and fixed before it became a live problem rather than after:
+**9 of batch 1's 13 restored tests carried `LABELS` containing the bare
+words `cache` or `mem-handle`**, which collide with CLAUDE.md's
+throttled-sweep denylist (`-LE 'residency|mem-handle|cache'`) — a host-only
+test (no `gpu_selector`/`malloc_device`/`queue.submit`/`parallel_for`, hence
+none of the GPU-memory hazard the denylist exists for) inheriting an
+exclusion it doesn't deserve, purely because its subsystem name happens to
+be a hazard word. This is the exact failure mode `llama.cpp-0igs` itself
+documents (`impl-5exz`: 5 of 9 un-guarded tests similarly affected) — batch
+1's rate was worse, 9 of 13, until caught and fixed
+(`32a70dcf3`: `cache`→`cache-hostonly`, `mem-handle`→`mem-handle-hostonly`).
+Batch 2's 28 tests got non-colliding labels from the start and were verified
+before commit instead of after.
+
 ## What this pass did NOT cover
 
 Being explicit rather than implying completeness: this pass verified the two
