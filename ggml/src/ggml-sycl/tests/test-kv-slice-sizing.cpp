@@ -379,6 +379,107 @@ static void test_sizing_depends_only_on_the_slice() {
 }
 
 // ---------------------------------------------------------------------------
+// 11. SINGLETON REUSE ACROSS MODELS.  Reconfiguring one manager for a second
+//     model must leave none of the first model's per-layer sizes behind.
+//
+// This is the property that was actually broken, and it is invisible to every
+// other case here because they each use a fresh manager.  `g_kv_tier_managers`
+// is a file-scope array that is never cleared, and configure_from_plan() used
+// `per_layer_kv_bytes_.resize(n_layers, kv_per_layer_)` -- resize NEVER
+// modifies existing elements, it only truncates or appends.  So in a multi-arch
+// sweep in one process, kv_layer_size() returned the PREVIOUS architecture's
+// size, compute_region_layout() sized the allocation from it, and init_tensor()
+// overflowed.  The correct idiom (`assign`) was on the line directly above.
+//
+// This explains the isolated-vs-sweep asymmetry recorded in llama.cpp-2120:
+// falcon-h1 had 0 overflow lines run alone and 8 in a sweep, and its la.size
+// differed (147456 vs 262144) for the same fixture and the same 294912 B
+// tensor.  Run alone there is no previous model, the vector starts empty, and
+// resize() and assign() behave identically.
+//
+// Note case 9 checks the adjacent, weaker property -- that the per-device
+// instances are distinct.  Distinct instances are still individually dirty.
+// ---------------------------------------------------------------------------
+static void test_singleton_reuse_across_models() {
+    printf("11. one manager reconfigured for a second model keeps nothing from the first\n");
+
+    // (a) Second model has FEWER layers -> resize() truncates, keeping the
+    //     first model's values for every remaining layer.
+    {
+        ggml_sycl::kv_tier_manager mgr;
+        const uint32_t             a_layers = 32;
+        const size_t               a_slice  = 131072;
+        std::vector<uint32_t>      a_all;
+        for (uint32_t l = 0; l < a_layers; ++l) {
+            a_all.push_back(l);
+        }
+        mgr.configure_from_plan(0, make_plan(a_layers, a_all, 0, a_slice), a_layers,
+                                ggml_sycl::kv_slice_size::from_layer_mask(a_slice * a_layers, a_layers));
+        check_eq("model A layer 0", mgr.kv_layer_size(0), a_slice);
+
+        // Model B: kimi-linear geometry, 1 KV layer of 2.
+        mgr.configure_from_plan(0, make_plan(2, { 0, 1 }, 0, 147456), 2,
+                                ggml_sycl::kv_slice_size::from_layer_mask(294912, 1));
+        check_eq("model B layer 0 (shrink)", mgr.kv_layer_size(0), 294912u);
+        check_eq("model B layer 1 (shrink)", mgr.kv_layer_size(1), 294912u);
+        const auto layout = mgr.compute_region_layout(294912);
+        check_eq("model B layout entries", layout.size(), 2u);
+        check_true("model B region 0 fits", !layout.empty() && layout[0].size >= 294912);
+    }
+
+    // (b) Second model has MORE layers -> resize() appends, so the first
+    //     model's values survive in the low layers and only the tail is right.
+    {
+        ggml_sycl::kv_tier_manager mgr;
+        mgr.configure_from_plan(0, make_plan(2, { 0, 1 }, 0, 131072), 2,
+                                ggml_sycl::kv_slice_size::from_layer_mask(262144, 2));
+        check_eq("model A layer 0 (grow case)", mgr.kv_layer_size(0), 131072u);
+
+        const uint32_t        b_layers = 8;
+        const size_t          b_slice  = 65536;
+        std::vector<uint32_t> b_all;
+        for (uint32_t l = 0; l < b_layers; ++l) {
+            b_all.push_back(l);
+        }
+        mgr.configure_from_plan(0, make_plan(b_layers, b_all, 0, b_slice), b_layers,
+                                ggml_sycl::kv_slice_size::from_layer_mask(b_slice * b_layers, b_layers));
+        for (uint32_t l = 0; l < b_layers; ++l) {
+            check_eq("model B layer size (grow)", mgr.kv_layer_size(l), b_slice);
+        }
+    }
+
+    // (c) The nastiest variant: first model has SWA, second does not.  The
+    //     heterogeneous overwrite is gated on plan.kv_per_swa_layer > 0, so it
+    //     is skipped for model B and cannot repair a stale vector.
+    {
+        ggml_sycl::kv_tier_manager mgr;
+        ggml_sycl::placement_plan  swa_plan = make_plan(4, { 0, 1, 2, 3 }, 0, 65536);
+        swa_plan.kv_per_swa_layer           = 16384;
+        swa_plan.swa_layer_mask             = { false, true, false, true };
+        mgr.configure_from_plan(0, swa_plan, 4, ggml_sycl::kv_slice_size::from_planner_bytes(262144, 65536, 2));
+        check_eq("model A swa layer 1", mgr.kv_layer_size(1), 16384u);
+
+        mgr.configure_from_plan(0, make_plan(4, { 0, 1, 2, 3 }, 0, 65536), 4,
+                                ggml_sycl::kv_slice_size::from_layer_mask(262144, 4));
+        for (uint32_t l = 0; l < 4; ++l) {
+            check_eq("model B uniform after SWA model", mgr.kv_layer_size(l), 65536u);
+        }
+    }
+
+    // (d) Through the real per-device singleton, which is what a sweep reuses.
+    //     Device 2 so this cannot interact with case 9.
+    {
+        ggml_sycl::get_kv_tier_manager(2).configure_from_plan(2, make_plan(4, { 0, 1, 2, 3 }, 2, 65536), 4,
+                                                              ggml_sycl::kv_slice_size::from_layer_mask(262144, 4));
+        check_eq("singleton model A", ggml_sycl::get_kv_tier_manager(2).kv_layer_size(0), 65536u);
+
+        ggml_sycl::get_kv_tier_manager(2).configure_from_plan(2, make_plan(2, { 0, 1 }, 2, 147456), 2,
+                                                              ggml_sycl::kv_slice_size::from_layer_mask(294912, 1));
+        check_eq("singleton model B", ggml_sycl::get_kv_tier_manager(2).kv_layer_size(0), 294912u);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 9. get_kv_tier_manager() hands out one instance per device.
 // ---------------------------------------------------------------------------
 static void test_per_device_singletons() {
@@ -415,6 +516,7 @@ int main() {
     test_weight_aware_path();
     test_slice_size_invariants();
     test_sizing_depends_only_on_the_slice();
+    test_singleton_reuse_across_models();
     test_per_device_singletons();
 
     printf("=== %d checks, %d failures ===\n", g_checks, g_failures);
