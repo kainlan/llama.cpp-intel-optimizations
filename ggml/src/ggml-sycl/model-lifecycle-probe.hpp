@@ -56,8 +56,10 @@ struct ggml_backend_sycl_model_lifecycle_probe {
     uint64_t release_slot_last_reclaimed;
 };
 
-// Snapshot the counters.  Safe to call from any thread at any time; the snapshot
-// is not atomic as a whole, which is fine for its single-threaded test use.
+// Read the counters.  NOT THREAD-SAFE: the fields are loaded one at a time, so a
+// concurrent writer can land between two loads and yield a new call count beside
+// a stale slot.  This is for single-threaded test use only -- do not build a
+// concurrency check on it without giving it real ordering first.
 GGML_BACKEND_API void ggml_backend_sycl_model_lifecycle_probe_read(
     struct ggml_backend_sycl_model_lifecycle_probe * out);
 

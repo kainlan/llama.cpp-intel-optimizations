@@ -9476,13 +9476,14 @@ void ggml_backend_sycl_model_lifecycle_probe_read(struct ggml_backend_sycl_model
     if (!out) {
         return;
     }
-    // Deliberately relaxed: this probe is NOT THREAD-SAFE and is used only by
-    // a single-run integration test after the lifecycle boundary completes.
+    // NOT thread-safe, and deliberately not pretending otherwise. Five separate
+    // relaxed loads cannot produce one coherent snapshot. The sole consumer is
+    // a single-threaded integration test after each lifecycle boundary.
+    out->load_end_calls              = g_sycl_lifecycle_load_end_calls.load(std::memory_order_relaxed);
+    out->release_slot_calls          = g_sycl_lifecycle_release_slot_calls.load(std::memory_order_relaxed);
     out->load_end_last_slot          = g_sycl_lifecycle_load_end_last_slot.load(std::memory_order_relaxed);
     out->release_slot_last_slot      = g_sycl_lifecycle_release_slot_last_slot.load(std::memory_order_relaxed);
     out->release_slot_last_reclaimed = g_sycl_lifecycle_release_slot_last_reclaimed.load(std::memory_order_relaxed);
-    out->load_end_calls              = g_sycl_lifecycle_load_end_calls.load(std::memory_order_relaxed);
-    out->release_slot_calls          = g_sycl_lifecycle_release_slot_calls.load(std::memory_order_relaxed);
 }
 
 uint32_t ggml_backend_sycl_model_slot_current(void) {

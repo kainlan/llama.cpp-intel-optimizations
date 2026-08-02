@@ -225,6 +225,12 @@ int main(int argc, char ** argv) {
     ggml_backend_sycl_model_lifecycle_probe_read(&before);
 
     printf("\n[1] baseline: the counters must be untouched before any model exists\n");
+    // Observed values precede every verdict in this file, including here. A
+    // surprise in the baseline or the negative control is the most informative
+    // failure in the test -- it says the probe itself is not measuring what it
+    // claims -- so it must be the most legible, not the least.
+    printf("  [info] load_end_calls = %llu, release_slot_calls = %llu\n", (unsigned long long) before.load_end_calls,
+           (unsigned long long) before.release_slot_calls);
     check(before.load_end_calls == 0, "note_model_load_end has not been called",
           "a counter that is already nonzero before a model is loaded makes every\n"
           "        later delta meaningless -- it would be bumped by static init,\n"
@@ -239,6 +245,9 @@ int main(int argc, char ** argv) {
     // satisfiable without the cache ever being touched.
     ggml_backend_sycl_model_unloaded(GGML_SYCL_MODEL_SLOT_NONE);
     ggml_backend_sycl_model_lifecycle_probe_read(&rejected);
+    printf("  [info] release_slot_calls = %llu (was %llu), release_slot_last_slot = %u\n",
+           (unsigned long long) rejected.release_slot_calls, (unsigned long long) before.release_slot_calls,
+           rejected.release_slot_last_slot);
     check(rejected.release_slot_calls == 0, "ggml_backend_sycl_model_unloaded(SLOT_NONE) bumped nothing",
           "the counter tracks entry to the function, not a slot release that reached\n"
           "        the cache.  Everything this test asserts afterwards would then be\n"

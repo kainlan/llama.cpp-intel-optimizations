@@ -1476,20 +1476,28 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     # rather than an assumption.
     #
     # EVIDENCE, with its date and conditions, because a threshold outlives the
-    # hardware it was measured on and this file has been wrong that way before:
+    # hardware it was measured on and this file has been wrong that way before.
+    # Measured on THIS binary, under the selector this registration pins:
     #
-    #   2026-08-01, llama.cpp-403s, ONEAPI_DEVICE_SELECTOR=level_zero:0,1:
-    #   a full load of this exact 19 MB model peaked at ~2.2 GB of Shmem.
-    #   Before that fix landed the SAME load cost ~127.8 GB, at which point it
-    #   would have belonged in the denylist. The label is a consequence of that
-    #   commit, not a property of the test.
+    #   2026-08-01, ONEAPI_DEVICE_SELECTOR=level_zero:1 (the pin below):
+    #     Shmem   2.3 GB before load -> 2.3 GB after load -> 2.3 GB after free
+    #     peak RSS 564.5 MB
+    #   Shmem delta: ZERO. Not "small" -- nothing measurable.
     #
-    # That measurement is of another binary doing the same load, so the test
-    # prints its OWN Shmem/MemAvailable before load, after load and after free.
-    # Every run re-checks the figure rather than trusting this comment; if a run
-    # shows a large delta, move it into the denylist and record the new number
-    # and date here. Note ~2.2 GB holds for ONE load: this test loads once and
-    # never loops, which is the never-loop rule, not an exception to it.
+    # An earlier draft of this comment justified the label by inference from
+    # llama.cpp-403s (~2.2 GB, measured under level_zero:0,1 on a different
+    # binary). That figure was for a DUAL-GPU load and did not describe this
+    # test; the number above replaces it. Retained only for the direction it
+    # establishes: before llama.cpp-403s the same load cost ~127.8 GB, which
+    # WOULD have belonged in the denylist -- so this label is a consequence of
+    # that commit, not an intrinsic property of loading a model here.
+    #
+    # The test prints its own Shmem/MemAvailable before load, after load and
+    # after free, so every run re-checks this rather than trusting the comment.
+    # If a run shows a real delta, move it into the denylist and record the new
+    # number, date and selector here. Note this holds for ONE load: the test
+    # loads once and never loops, which is the never-loop rule, not an
+    # exception to it.
     llama_build(test-sycl-model-lifecycle-hooks.cpp)
     target_include_directories(test-sycl-model-lifecycle-hooks PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
     target_link_libraries(test-sycl-model-lifecycle-hooks PRIVATE ggml-sycl)
